@@ -2,8 +2,8 @@ package scripts_test
 
 import (
 	"fmt"
-	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -31,6 +31,10 @@ var (
 	lockHashes         = regexp.MustCompile(`(?s)\bhashes\s*=\s*\[(.*?)\]`)
 	lockH1             = regexp.MustCompile(`"(h1:[^"]+)"`)
 	lockComment        = regexp.MustCompile(`#|//|/\*`)
+	// lockString is a quoted string, which the comment check and the word count
+	// look past: an h1 checksum is base64, whose alphabet holds '/', so one can
+	// read "//" and is no comment.
+	lockString = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
 )
 
 // lockPreamble is the comment terraform writes at the top of every lock, the
@@ -80,12 +84,28 @@ func lockProviders(body string) []lockProvider {
 func TestEveryTerraformLockRecordsEveryPlatformsChecksum(t *testing.T) {
 	t.Parallel()
 
-	locks, missing, err := moduleLocks("../terraform/modules")
+	// THE MODULES CI'S TERRAFORM GATES WALK, from the Makefile that names them,
+	// not a second discovery that could disagree with it.
+	cmd := exec.CommandContext(t.Context(), "make", "-s", "tf-modules-check")
+	cmd.Dir = ".."
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("make tf-modules-check: %v", err)
 	}
+
+	listed, found := strings.CutPrefix(strings.TrimSpace(string(out)), "terraform modules:")
+	if !found {
+		t.Fatalf("make tf-modules-check printed %q, want the module list", out)
+	}
+
+	var modules []string
+	for _, m := range strings.Fields(listed) {
+		modules = append(modules, filepath.Join("..", m))
+	}
+
+	locks, missing := moduleLocks(modules)
 	if len(locks)+len(missing) == 0 {
-		t.Fatal("no terraform modules found under terraform/modules")
+		t.Fatalf("no module read from make tf-modules-check's %q, so nothing was checked", out)
 	}
 
 	for _, m := range missing {
@@ -104,51 +124,22 @@ func TestEveryTerraformLockRecordsEveryPlatformsChecksum(t *testing.T) {
 	}
 }
 
-// moduleLocks finds every module under root as the Makefile's TF_MODULES does
-// (each directory directly under root with a .tf file anywhere beneath it, a
-// .terraform directory aside), and returns the locks they have and the modules
-// with none: one committed without a lock would pass a glob of the locks that
-// exist, while each init of it downloaded afresh.
-func moduleLocks(root string) ([]string, []string, error) {
-	modules := map[string]bool{}
-
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() && d.Name() == ".terraform" {
-			return filepath.SkipDir
-		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".tf") {
-			return nil
-		}
-
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		if top, _, nested := strings.Cut(rel, string(filepath.Separator)); nested {
-			modules[filepath.Join(root, top)] = true
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
+// moduleLocks returns the locks the modules have and the modules with none: one
+// committed without a lock would pass a glob of the locks that exist, while
+// each init of it downloaded afresh.
+func moduleLocks(modules []string) ([]string, []string) {
 	var locks, missing []string
 
-	for _, m := range slices.Sorted(maps.Keys(modules)) {
+	for _, m := range modules {
 		lock := filepath.Join(m, ".terraform.lock.hcl")
-		if _, err := os.Stat(lock); err != nil {
+		if info, err := os.Stat(lock); err != nil || !info.Mode().IsRegular() {
 			missing = append(missing, m)
 			continue
 		}
 		locks = append(locks, lock)
 	}
 
-	return locks, missing, nil
+	return locks, missing
 }
 
 // lockProblems is what a lock file fails of the rule above, one line each.
@@ -161,14 +152,14 @@ func lockProblems(body string) []string {
 
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if lockComment.MatchString(line) && !slices.Contains(lockPreamble, line) {
+		if lockComment.MatchString(lockString.ReplaceAllString(line, `""`)) && !slices.Contains(lockPreamble, line) {
 			problems = append(problems, fmt.Sprintf("carries a comment terraform does not write, %q; "+
 				"regenerate it with terraform providers lock", strings.TrimSpace(line)))
 		}
 	}
 
 	providers := lockProviders(body)
-	if words := len(lockProviderWord.FindAllString(body, -1)); words != len(providers) {
+	if words := len(lockProviderWord.FindAllString(lockString.ReplaceAllString(body, `""`), -1)); words != len(providers) {
 		problems = append(problems, fmt.Sprintf("names provider %d time(s) but %d block(s) were read; "+
 			"regenerate it with terraform providers lock", words, len(providers)))
 	}
@@ -191,46 +182,32 @@ func lockProblems(body string) []string {
 	return problems
 }
 
-// A MODULE WITHOUT A LOCK IS FOUND, AND ONE WITH A LOCK IS NOT REPORTED.
+// A MODULE WITHOUT A LOCK IS FOUND, AND ONE WITH A LOCK IS NOT REPORTED: nor
+// one whose lock is a directory.
 func TestAModuleWithoutALockIsFound(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	for name, files := range map[string][]string{
-		"locked":                                {"main.tf", ".terraform.lock.hcl"},
-		"unlocked":                              {"main.tf", "variables.tf"},
-		"notes":                                 {"README.md"},
-		"json-root":                             {"main.tf.json"},
-		"json-root/modules/child":               {"main.tf"},
-		"locked/.terraform/modules/fetched":     {"main.tf"},
-		"stray/.terraform/modules/fetched":      {"main.tf"},
-		"locked/modules/child-without-own-lock": {"main.tf"},
-	} {
-		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+	for _, path := range []string{"locked/main.tf", "locked/.terraform.lock.hcl", "unlocked/main.tf"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, path)), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		for _, f := range files {
-			if err := os.WriteFile(filepath.Join(root, name, f), nil, 0o644); err != nil {
-				t.Fatal(err)
-			}
+		if err := os.WriteFile(filepath.Join(root, path), nil, 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
-
-	// A .tf FILE DIRECTLY UNDER THE ROOT is no module's, as TF_MODULES has it.
-	if err := os.WriteFile(filepath.Join(root, "stray.tf"), nil, 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, "odd", ".terraform.lock.hcl"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	locks, missing, err := moduleLocks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	modules := []string{filepath.Join(root, "locked"), filepath.Join(root, "unlocked"), filepath.Join(root, "odd")}
+	locks, missing := moduleLocks(modules)
 
 	if want := []string{filepath.Join(root, "locked", ".terraform.lock.hcl")}; !slices.Equal(locks, want) {
 		t.Errorf("locks %q, want %q", locks, want)
 	}
-	if want := []string{filepath.Join(root, "json-root"), filepath.Join(root, "unlocked")}; !slices.Equal(missing, want) {
-		t.Errorf("modules without a lock %q, want %q, once each", missing, want)
+	if want := []string{filepath.Join(root, "unlocked"), filepath.Join(root, "odd")}; !slices.Equal(missing, want) {
+		t.Errorf("modules without a lock %q, want %q", missing, want)
 	}
 }
 
@@ -304,6 +281,9 @@ func TestTheLockReaderReadsEveryProviderBlockOnItsOwn(t *testing.T) {
 			"    \"h1:a=\",\n    /* ] */\n    \"h1:b=\",\n    \"h1:c=\",\n    \"h1:d=\",\n  ]\n}\n",
 			"carries a comment terraform does not write"},
 		"terraform's preamble": {preamble + healthy, ""},
+		"a checksum holding // and a string holding provider": {preamble +
+			"provider \"registry.terraform.io/acme/provider\" {\n  version = \"1.0.0\"\n  hashes = [\n" +
+			"    \"h1:ab//cd=\",\n    \"h1:b=\",\n    \"h1:c=\",\n    \"h1:d=\",\n  ]\n}\n", ""},
 	} {
 		problems := lockProblems(tc.body)
 		switch {
