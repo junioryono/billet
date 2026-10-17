@@ -668,12 +668,62 @@ func TestTheAddressRecordedIsTheOneAtTheWrite(t *testing.T) {
 
 	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
 	remember := rememberer(slog.New(&records{}), ctl, nic{"eno2np1", "2", testMAC, "boot-a"})
+	recorded := func() string {
+		t.Helper()
 
-	setAddress(t, "eno2np1", "02:00:00:aa:bb:cc")
+		l, found, err := readLearned()
+		if err != nil || !found {
+			t.Fatalf("no record read (%v, %v)", found, err)
+		}
+
+		return l.Addr
+	}
+
+	// EACH WRITE READS IT AGAIN, while the name still has the run's index.
+	setIndex(t, "eno2np1", "2")
+	for _, mac := range []string{"02:00:00:aa:bb:cc", "02:00:00:dd:ee:ff"} {
+		setAddress(t, "eno2np1", mac)
+		remember(120, 80)
+		if got := recorded(); got != mac {
+			t.Errorf("recorded the address %q, want the %q eno2np1 has at this write", got, mac)
+		}
+	}
+
+	// ANOTHER DEVICE UNDER THE NAME, by its index, or the name gone: the last
+	// address this device had stays beside its rates.
+	setIndex(t, "eno2np1", "7")
+	setAddress(t, "eno2np1", "02:00:00:11:22:33")
 	remember(120, 80)
+	if got := recorded(); got != "02:00:00:dd:ee:ff" {
+		t.Errorf("recorded %q beside this device's rates, the address of the device that took its name", got)
+	}
 
-	if l, found, err := readLearned(); err != nil || !found || l.Addr != "02:00:00:aa:bb:cc" {
-		t.Errorf("recorded the address %q (%v, %v), want the one eno2np1 has now", l.Addr, found, err)
+	if err := os.RemoveAll(filepath.Join(sysNet, "eno2np1")); err != nil {
+		t.Fatal(err)
+	}
+	remember(120, 80)
+	if got := recorded(); got != "02:00:00:dd:ee:ff" {
+		t.Errorf("recorded %q once the interface was gone, want the last address it had", got)
+	}
+
+	// AND ITS ADDRESS UNREADABLE UNDER THE RUN'S OWN INDEX: nothing is not an
+	// address, and the last one stays.
+	setIndex(t, "eno2np1", "2")
+	remember(120, 80)
+	if got := recorded(); got != "02:00:00:dd:ee:ff" {
+		t.Errorf("recorded %q when its address could not be read, want the last address it had", got)
+	}
+}
+
+// setIndex gives iface the kernel index index in the fake sysfs.
+func setIndex(t *testing.T, iface, index string) {
+	t.Helper()
+
+	if err := os.MkdirAll(filepath.Join(sysNet, iface), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysNet, iface, "ifindex"), []byte(index+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

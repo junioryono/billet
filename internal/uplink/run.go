@@ -240,12 +240,18 @@ func gatewayLabel(gateway string) string {
 // rememberer records the rates CAKE was set to, for the next run, or the next
 // boot's, to resume; a write that fails is said once and changes nothing about
 // the shaping. THE ADDRESS IS READ AT EACH WRITE, not once at the start, so a
-// MAC set while the shaper runs is the one the next boot compares.
+// MAC set while the shaper runs is the one the next boot compares; but only
+// while the name still has the run's index, so a device that took the name, or
+// none, never puts its address, or nothing, beside this device's rates.
 func rememberer(log *slog.Logger, ctl *Controller, at nic) func(upMbit, downMbit float64) {
-	told := false
+	told, addr := false, at.addr
 
 	return func(upMbit, downMbit float64) {
-		err := writeLearned(learned{Iface: at.iface, Index: at.index, Addr: ifaddr(at.iface), Boot: at.boot,
+		if now := ifaddr(at.iface); now != "" && (at.index == "" || ifindex(at.iface) == at.index) {
+			addr = now
+		}
+
+		err := writeLearned(learned{Iface: at.iface, Index: at.index, Addr: addr, Boot: at.boot,
 			At:   time.Now(),
 			Up:   learnedRate{Max: ctl.Up.Max, Rate: upMbit},
 			Down: learnedRate{Max: ctl.Down.Max, Rate: downMbit}})
