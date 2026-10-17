@@ -411,7 +411,9 @@ func TestTheRepairsRefusalNamesTheRemedyThatReachesTheUnit(t *testing.T) {
 		{"a runtime unit", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "FragmentPath", "/run/systemd/system/billet-node.service")
-		}, "is loaded from /run/systemd/system/billet-node.service", []string{stopFirst}, []string{pkg}},
+		}, "is loaded from /run/systemd/system/billet-node.service",
+			[]string{stopFirst, "whose unit under /etc/systemd/system outranks that one"},
+			[]string{pkg, "renders that unit afresh"}},
 		{"the role's unit in another shape", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "RuntimeDirectory", "billet/locks billet/other")
@@ -433,7 +435,8 @@ func TestTheRepairsRefusalNamesTheRemedyThatReachesTheUnit(t *testing.T) {
 		{"the role's file not root's", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			repairUnitOwned = func(os.FileInfo) error { return errors.New(f.unitPath + " is not owned by root") }
-		}, "is not owned by root", []string{stopFirst}, []string{pkg}},
+		}, "is not owned by root", []string{stopFirst, "renders that unit afresh"},
+			[]string{pkg, "outranks that one"}},
 		{"the role's file in another line shape", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			writeFile(t, f.unitPath, strings.Replace(f.legacy, "RuntimeDirectory=billet/locks\n",
