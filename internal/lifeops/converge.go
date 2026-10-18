@@ -756,22 +756,20 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 
 	for _, d := range []struct {
 		what, configured, declared, root string
+		// named is a ReadWritePaths answer, read for the lock directory alone.
+		named string
+		lock  bool
 	}{
-		{"state_dir", spec.stateDir, s.StateDirectory, stateRoot},
-		{"lock_dir", spec.lockDir, s.RuntimeDirectory, runtimeRoot},
+		{what: "state_dir", configured: spec.stateDir, declared: s.StateDirectory, root: stateRoot},
+		// THE LOCK DIRECTORY IS NAMED, NOT DECLARED, by this release's node
+		// unit: a RuntimeDirectory is removed at the unit's stop under a lock
+		// another process holds in it (#175), so billet-tmpfiles.conf creates
+		// /run/billet/locks and the unit names it in ReadWritePaths. A unit from
+		// before that still declares it, and is admitted too: its node starts.
+		{what: "lock_dir", configured: spec.lockDir, declared: s.RuntimeDirectory, root: runtimeRoot,
+			named: s.ReadWritePaths, lock: true},
 	} {
 		if d.configured == "" {
-			continue
-		}
-
-		if d.declared == "" {
-			refusals = append(refusals, Refusal{
-				What: fmt.Sprintf("%s declares no directory for %s, so billet cannot tell whether "+
-					"%s is writable by it", s.Name, d.what, d.configured),
-				Remedy: "restore the packaged unit, which declares the directories systemd creates " +
-					"and makes writable",
-			})
-
 			continue
 		}
 
@@ -781,6 +779,33 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 		var wants []string
 		for _, entry := range strings.Fields(d.declared) {
 			wants = append(wants, filepath.Join(d.root, entry))
+		}
+
+		// ONLY THE SHIPPED LOCK DIRECTORY, declared by a unit from before or
+		// named, required, by this release's: the unit's other directories
+		// (the registration record's, removed at every stop; its credentials;
+		// the jailer) are not where a lock belongs, and an optional entry
+		// starts a node that cannot create the directory under the read-only
+		// /run.
+		if d.lock {
+			lockWritable := slices.Contains(wants, deploy.NodeLockDir) ||
+				slices.Contains(strings.Fields(d.named), deploy.NodeLockDir)
+
+			wants = nil
+			if lockWritable {
+				wants = []string{deploy.NodeLockDir}
+			}
+		}
+
+		if len(wants) == 0 {
+			refusals = append(refusals, Refusal{
+				What: fmt.Sprintf("%s declares no directory for %s, so billet cannot tell whether "+
+					"%s is writable by it", s.Name, d.what, d.configured),
+				Remedy: "restore the packaged unit, which declares the directories systemd creates " +
+					"and makes writable",
+			})
+
+			continue
 		}
 
 		if !slices.Contains(wants, filepath.Clean(d.configured)) {

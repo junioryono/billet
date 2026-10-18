@@ -135,6 +135,21 @@
   loop: "{{ billet_common_directories + billet_server_directories + billet_node_directories }}"
   become: true
 
+# THE HOST LOCK DIRECTORY OUTLIVES EVERY UNIT (#175). The task above makes
+# /run/billet/locks now, and this entry has systemd-tmpfiles make it again at
+# every boot, before any billet unit starts; no unit's stop removes it under a
+# lock another process holds: the node names it in ReadWritePaths, and the image
+# refresh declares it preserved. The package installs the same bytes under
+# /usr/lib/tmpfiles.d, which a file of this name in /etc/tmpfiles.d overrides.
+- name: Keep the host lock directory across unit stops and reboots
+  ansible.builtin.template:
+    src: billet-tmpfiles.conf.j2
+    dest: /etc/tmpfiles.d/billet.conf
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
 # THE BINARY CHANGE WAS DECIDED, AND ITS CANDIDATE STAGED, BEFORE THE HOLD, in
 # stage-candidate.yml (imported by prepare-exclusion.yml): the candidate's
 # digest, the downgrade refusal, the PostgreSQL refusal, the capability floor,

@@ -696,12 +696,21 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	// rather than a sweep of whatever happened to be there — which could not be made
 	// safe, because the provider deliberately reports jails with no owner marker and
 	// those are indistinguishable from a real node launch caught mid-creation.
+	//
+	// ONLY AS THE HOLDER: a probe by this name may be another verification's
+	// live one when the lock's name has moved (#175). Nothing guards the
+	// record below: the report the verdict rests on is authenticated by this
+	// run's own secret, so a verdict that passed is this run's guest's boot.
+	if err := lock.hold(); err != nil {
+		return err
+	}
+
 	if err := destroyProbe(ctx, prov, provider.InstanceName(lease)); err != nil {
 		return err
 	}
 
 	if err := verifyGuestImage(ctx, env, prov, cfg.Node.Firecracker.Bridge,
-		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait); err != nil {
+		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait, lock.hold); err != nil {
 		return err
 	}
 
@@ -811,10 +820,29 @@ func verifyDisk(cfg *config.Config, override config.ByteSize) config.ByteSize {
 }
 
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
+// hold makes sure this run holds the verification lock, and is asked
+// before the launch and before each destroy of the probe; nil asks nothing.
 func verifyGuestImage(
 	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
-	image, lease string, disk config.ByteSize, wait time.Duration,
+	image, lease string, disk config.ByteSize, wait time.Duration, hold func() error,
 ) error {
+	if hold == nil {
+		hold = func() error { return nil }
+	}
+
+	// A PROBE IS DESTROYED ONLY BY ITS HOLDER. The name is the same on every run,
+	// so after the lock's name moved (#175) it may be another verification's
+	// live microVM; it is left in place, and the next verification's pre-launch
+	// cleanup collects it.
+	destroy := func(name string) error {
+		if err := hold(); err != nil {
+			return fmt.Errorf("%w; the probe %s was left in place for the next verification's "+
+				"cleanup", err, name)
+		}
+
+		return destroyProbe(ctx, prov, name)
+	}
+
 	// A LISTENER ON THIS MACHINE, because the assertion has to be made BY THE GUEST.
 	// Anything the host can check on its own was already green for an image that ran
 	// no job at all.
@@ -843,6 +871,10 @@ func verifyGuestImage(
 
 	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
 
+	if err := hold(); err != nil {
+		return err
+	}
+
 	if _, err := prov.Launch(ctx, spec); err != nil {
 		// A LAUNCH ERROR IS NOT PROOF THAT NOTHING STARTED, which the provider says
 		// in as many words: a cancelled context can kill this process after the work
@@ -851,7 +883,7 @@ func verifyGuestImage(
 		// also a leaked uid, device name and cloned disk.
 		return errors.Join(
 			fmt.Errorf("billet images verify: %s did not launch: %w", image, err),
-			destroyProbe(ctx, prov, name),
+			destroy(name),
 		)
 	}
 
@@ -861,7 +893,7 @@ func verifyGuestImage(
 	// printed a line and returned success, so the weekly job would announce a
 	// verified image while probes accumulated — each holding a uid, a device name
 	// and a cloned disk, and each invisible to the node's sweep by design.
-	return errors.Join(verdict, destroyProbe(ctx, prov, name))
+	return errors.Join(verdict, destroy(name))
 }
 
 // probeSpec is the launch a verification makes: a trusted microVM whose command
