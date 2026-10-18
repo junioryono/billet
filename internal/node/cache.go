@@ -121,6 +121,9 @@ type cacheSession struct {
 	// unprovenUntil is when an unproven answer stops standing, under
 	// authorityMu, so a job that cannot be proved asks at most that often.
 	unprovenUntil time.Time
+	// bindingWaited is whether a call has already waited out the plane's
+	// binding of the job, under authorityMu, so it is waited for only once.
+	bindingWaited bool
 	// hosts are the content-addressed cache volumes the node mounted for this
 	// session, and casAdmit bounds their concurrent transfers.
 	hosts    map[config.CacheKind]*hostVolume
