@@ -38,8 +38,8 @@ type offeredQueueTime struct {
 // fleet received on 2026-10-18 under v0.17.0 had queueTime 0001-01-01 while both
 // assignment times were set. Whether the offer and the assignment carry it is
 // NOT yet measured; the counts this returns are logged so the fleet can answer.
-// The latest time seen wins: a redelivery carries the same one, and a re-run
-// attempt of the same job is queued again.
+// The newest time wins: a redelivery carries the same one, and a re-run attempt
+// of the same job is queued again, later.
 //
 // Held in memory only, so a restart between a job's offer and its start leaves
 // that job's wait unknown. Entries past the retention are dropped at most once
@@ -69,7 +69,12 @@ func (l *Listener) rememberQueueTimes(available, assigned []dispatch.Job) (int, 
 				continue
 			}
 			id := offeredJob{job: job.JobID, run: job.RunID}
-			if _, ok := l.queued[id]; ok || len(l.queued) < queueTimeLimit {
+			prior, ok := l.queued[id]
+			switch {
+			case ok && prior.queued.After(job.QueuedAt):
+				prior.seen = now
+				l.queued[id] = prior
+			case ok || len(l.queued) < queueTimeLimit:
 				l.queued[id] = offeredQueueTime{queued: job.QueuedAt, seen: now}
 			}
 		}
@@ -83,9 +88,11 @@ func (l *Listener) rememberQueueTimes(available, assigned []dispatch.Job) (int, 
 //
 // ONLY A START TAKES IT, with the job id and run the message itself named: the
 // start is the runner-to-job binding, while a completion's run may be filled
-// from the lease's launch, which can be another run. And it is never consumed,
-// because a write the ledger's write-once filter skips still returns nil: the
-// entry stays for a redelivered start and expires with the rest.
+// from the lease's launch, which can be another run. A time after the start's
+// own hand-over to the scale set belongs to a later attempt and is not taken.
+// And it is never consumed, because a write the ledger's write-once filter
+// skips still returns nil: the entry stays for a redelivered start and expires
+// with the rest.
 func (l *Listener) withOfferedQueueTime(job dispatch.Job) dispatch.Job {
 	if !job.QueuedAt.IsZero() {
 		return job
@@ -93,7 +100,8 @@ func (l *Listener) withOfferedQueueTime(job dispatch.Job) dispatch.Job {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if q, ok := l.queued[offeredJob{job: job.JobID, run: job.RunID}]; ok {
+	q, ok := l.queued[offeredJob{job: job.JobID, run: job.RunID}]
+	if ok && (job.ScaleSetAssignedAt.IsZero() || !q.queued.After(job.ScaleSetAssignedAt)) {
 		job.QueuedAt = q.queued
 	}
 	return job

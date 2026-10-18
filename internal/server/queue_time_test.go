@@ -14,11 +14,11 @@ import (
 func stamp(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.000000000Z07:00") }
 
 // A START THAT CARRIES NO QUEUE TIME TAKES THE ONE ITS OFFER OR ASSIGNMENT
-// CARRIED, which is what GitHub sends: queueTime 0001-01-01 on every JobStarted
-// and JobCompleted the reference fleet received on 2026-10-18. Driven through
-// handle for both message kinds that carry it, with the start on a runner
-// launched for another job, so the time is keyed by the job that ran and not by
-// the lease.
+// CARRIED. A start carrying none is measured (every JobStarted and JobCompleted
+// the reference fleet received on 2026-10-18); an offer or assignment carrying
+// one is this test's assumption. Driven through handle for both kinds, with
+// the start on a runner launched for another job, so the time is keyed by the
+// job that ran and not by the lease.
 func TestAStartTakesTheQueueTimeItsJobWasOfferedWith(t *testing.T) {
 	t.Parallel()
 
@@ -70,8 +70,9 @@ func TestAStartTakesTheQueueTimeItsJobWasOfferedWith(t *testing.T) {
 	}
 }
 
-// AN OFFER'S QUEUE TIME BELONGS TO ONE RUN OF ONE JOB, the latest offer of it
-// wins, a time the message carried is its own, each kind's timed jobs are
+// AN OFFER'S QUEUE TIME BELONGS TO ONE RUN OF ONE JOB, the newest offer of it
+// wins, a time after the start's hand-over is not taken, a time the message
+// carried is its own, each kind's timed jobs are
 // counted, and offers are forgotten past their retention and kept to a limit,
 // so a listener that runs for months does not keep every job it was offered.
 func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
@@ -94,9 +95,21 @@ func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	requeued := offered
 	requeued.QueuedAt = queued
 	l.rememberQueueTimes(nil, []dispatch.Job{requeued})
+	l.rememberQueueTimes([]dispatch.Job{offered}, nil)
 
 	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.Equal(queued) {
-		t.Errorf("the start took %s, want its own run's latest offer, %s", got, queued)
+		t.Errorf("the start took %s, want its own run's newest offer, %s, over an older redelivery", got, queued)
+	}
+	earlier := job11
+	earlier.ScaleSetAssignedAt = queued.Add(-time.Second)
+	if got := l.withOfferedQueueTime(earlier).QueuedAt; !got.IsZero() {
+		t.Errorf("a start handed to the scale set at %s took %s, a queue time after it",
+			earlier.ScaleSetAssignedAt, got)
+	}
+	handed := job11
+	handed.ScaleSetAssignedAt = queued
+	if got := l.withOfferedQueueTime(handed).QueuedAt; !got.Equal(queued) {
+		t.Errorf("a start handed over at its own queue time took %s, want %s", got, queued)
 	}
 	other := dispatch.Job{JobID: job11.JobID, RunID: 999}
 	if got := l.withOfferedQueueTime(other).QueuedAt; !got.Equal(otherRun.QueuedAt) {
