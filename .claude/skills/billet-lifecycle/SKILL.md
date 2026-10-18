@@ -16,6 +16,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### systemd and the package: [references/systemd.md](references/systemd.md)
 
 - **The units are load-bearing and each line was found by installing a package.**
+- **The host lock directory is the tmpfiles entry's, and no unit's stop removes it.**
 - **The package enables and starts nothing.**
 - **needrestart must never restart a billet service, and the package seeds the exclusion.**
 - **`systemctl show` hides the privilege prefix.**

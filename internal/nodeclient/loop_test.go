@@ -96,6 +96,31 @@ type fakeCompute struct {
 	recoverGate    chan struct{}
 	recoverStarted chan struct{}
 	recoverOnce    sync.Once
+
+	// handOvers counts HandOver calls, and onHandOver runs inside each, so a
+	// test can look at the world at that moment.
+	handOvers  int
+	onHandOver func()
+}
+
+// HandOver records that the loop asked for what is known of the jobs to be
+// kept for the next process.
+func (f *fakeCompute) HandOver(context.Context) {
+	f.mu.Lock()
+	f.handOvers++
+	hook := f.onHandOver
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+}
+
+func (f *fakeCompute) handOverCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.handOvers
 }
 
 // Instances is what this fake says it is running, which the loop sends at

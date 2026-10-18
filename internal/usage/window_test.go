@@ -99,7 +99,7 @@ func TestAGapInTheSeriesIsUncovered(t *testing.T) {
 	t.Parallel()
 
 	tl := steadySeries(append(secondsTo(0, 5), secondsTo(15, 20)...)...)
-	tl.Points[6].AfterGap = true
+	tl.Points[6].Gap = GapMissedTick
 	w := tl.Window(at(3000), at(17_000))
 	if w.Complete() || w.Span != 14*time.Second || w.Covered != 4*time.Second {
 		t.Errorf("across a gap: span %s covered %s, want 4s of 14s", w.Span, w.Covered)
@@ -113,7 +113,7 @@ func TestAGapInTheSeriesIsUncovered(t *testing.T) {
 
 	// ONE MARKED TICK IS A GAP however close its neighbours are.
 	short := steadySeries(secondsTo(0, 5)...)
-	short.Points[3].AfterGap = true
+	short.Points[3].Gap = GapMissedTick
 	if w := short.Window(at(1000), at(4000)); w.Covered != 2*time.Second {
 		t.Errorf("a marked one-second interval: covered %s of %s, want 2s", w.Covered, w.Span)
 	}
@@ -183,7 +183,7 @@ func TestSamplesAtOneOffsetLoseNothing(t *testing.T) {
 		t.Errorf("the interval ending at the duplicate got %dµs, want both samples' 200", w.CPUMicros)
 	}
 
-	tl.Points[1].AfterGap = true
+	tl.Points[1].Gap = GapMissedTick
 	if w := tl.Window(at(0), at(1000)); w.Covered != 0 {
 		t.Errorf("a gap mark on the earlier duplicate was lost: covered %s", w.Covered)
 	}

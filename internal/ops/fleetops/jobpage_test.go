@@ -104,7 +104,7 @@ func exampleSeries() []usage.Point {
 		cum.NetTx += int64(phase.sent * span)
 		cum.EnergyActive += int64(phase.cores * span * 11e6)
 	}
-	points[60].AfterGap = true
+	points[60].Gap = usage.GapFailedRead
 
 	return points
 }
@@ -217,17 +217,17 @@ func seedPageJob(t *testing.T, stateDir string, job alloc.HistoryJob, measured *
 	return lease.ID
 }
 
-// clockedSeriesOf encodes points as the series a node of wire 26 or later
+// clockedSeriesOf encodes points as the series a node of wire 30 or later
 // sends, starting at pageStart.
 func clockedSeriesOf(t *testing.T, points []usage.Point) *alloc.UsageSeries {
 	t.Helper()
 
-	data, _, err := usage.EncodeSeriesAt(points, pageStart, alloc.MaxUsageSeriesBytes)
+	data, _, err := usage.EncodeSeriesGaps(points, pageStart, alloc.MaxUsageSeriesBytes)
 	if err != nil {
-		t.Fatalf("EncodeSeriesAt: %v", err)
+		t.Fatalf("EncodeSeriesGaps: %v", err)
 	}
 
-	return &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: data}
+	return &alloc.UsageSeries{Codec: usage.SeriesCodecGaps, Data: data}
 }
 
 // showHTML runs `billet jobs show --html` as the CLI does and returns the page.
@@ -630,7 +630,7 @@ func TestTheJobPageOfAJobWithNoSteps(t *testing.T) {
 			if strings.Contains(page, "data-key=") || strings.Contains(page, "<rect class=\"band") {
 				t.Errorf("a job with no steps shows a step")
 			}
-			if strings.Count(page, "<svg data-chart") != 4 {
+			if measurementCharts(page) != 4 {
 				t.Errorf("a job with no steps did not draw its four charts")
 			}
 		})
@@ -662,7 +662,7 @@ func TestTheJobPageSaysWhyTheStepsCouldNotBeRead(t *testing.T) {
 	if strings.Contains(page, "installation-secret") {
 		t.Errorf("the page carries the installation token")
 	}
-	if strings.Count(page, "<svg data-chart") != 4 || !strings.Contains(page, "140.82.112.4") ||
+	if measurementCharts(page) != 4 || !strings.Contains(page, "140.82.112.4") ||
 		!strings.Contains(page, "<h1>build (ubuntu, go 1.26)</h1>") {
 		t.Errorf("a failed GitHub read took the rest of the page with it")
 	}
@@ -703,7 +703,10 @@ func largestSeries(t *testing.T) *usage.Timeline {
 		cum.NetRx += rng.Int64N(50 << 20)
 		cum.NetTx += rng.Int64N(50 << 20)
 		cum.EnergyActive += rng.Int64N(30_000_000)
-		cum.AfterGap = rng.IntN(500) == 0
+		cum.Gap = usage.GapNone
+		if rng.IntN(500) == 0 {
+			cum.Gap = usage.GapMissedTick
+		}
 		points[i] = cum
 	}
 	data, stride, err := usage.EncodeSeriesAt(points, pageStart, alloc.MaxUsageSeriesBytes)
@@ -904,7 +907,7 @@ func TestARateIsNotDrawnAcrossAWindowCoveredInPart(t *testing.T) {
 	tl := usage.Timeline{First: pageStart}
 	for s := range int64(maxChartWindows + 2) {
 		tl.Points = append(tl.Points, usage.Point{OffsetMillis: s * 1000, CPUUsage: s * 500_000,
-			DiskRead: s << 20, DiskWrite: s << 20, NetRx: s << 20, NetTx: s << 20, AfterGap: s == 1})
+			DiskRead: s << 20, DiskWrite: s << 20, NetRx: s << 20, NetTx: s << 20, Gap: map[bool]usage.GapCause{true: usage.GapSlowRead}[s == 1]})
 	}
 	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(tl.Points)}
 	charts := buildCharts(&tl, "", alloc.JobRecord{}, measured, nil)
@@ -1001,7 +1004,10 @@ func TestWindowOfIsWindow(t *testing.T) {
 			cum.CPUUsage, cum.DiskRead, cum.DiskWrite = step(cum.CPUUsage), step(cum.DiskRead), step(cum.DiskWrite)
 			cum.NetRx, cum.NetTx, cum.EnergyActive = step(cum.NetRx), step(cum.NetTx), step(cum.EnergyActive)
 			cum.MemoryCurrent = int64(rng.IntN(1 << 20))
-			cum.AfterGap = rng.IntN(8) == 0
+			cum.Gap = usage.GapNone
+			if rng.IntN(8) == 0 {
+				cum.Gap = usage.GapFailedRead
+			}
 			tl.Points = append(tl.Points, cum)
 		}
 		span := cum.OffsetMillis

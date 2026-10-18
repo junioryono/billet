@@ -118,7 +118,8 @@ func (lc *Lifecycle) Escalate(signals <-chan os.Signal, exit func(int)) {
 	fmt.Fprintln(lc.stderr, "billet: second signal; no longer waiting for the jobs "+
 		"still running here. They are LEFT RUNNING — their capacity stays charged "+
 		"until the compute is proved gone, and they are re-adopted when the billet "+
-		"process responsible for them returns. Nothing here destroys them.")
+		"process responsible for them returns. Nothing here destroys them; a guest "+
+		"still being launched is cancelled, and what its launch had made is removed.")
 	lc.Rush()
 
 	<-signals

@@ -21,6 +21,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A ledger writer reaches no network.**
 - **Three open modes, and what each may do.**
 - **An open's own startup budget is a deadline, and a caller can tell it from its own.**
+- **The integrity scan has its own bound, the startup budget pauses for it, and systemd is asked for the time a cold one takes.**
 - **Unreachability is a property of the ERROR, never of the step that produced it, and its rule is MEASURED.**
 - **`OpenPostgresCompletion` writes one row and is not a control plane.**
 
@@ -34,6 +35,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Locks and fences are four different things.**
 - **The release watermark refuses a proved downgrade at every open, and only the control plane raises it.**
 - **A controller's retirement is one row the two controllers contend for, and a `done` row is never deleted.**
+- **A migration says what it moved until a claim records the release, and only a stop is a stop.**
 
 ### Migrations and the query set: [references/migrations-and-queries.md](references/migrations-and-queries.md)
 
@@ -64,7 +66,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 - `internal/state/migrationfreeze_test.go` (`migrationsAreFrozen`, `TestNoShippedMigrationHasBeenEdited`), `migrationfiles_test.go`, `pgmigrations_test.go` (`TestEveryPostgresMigrationIsItsSQLiteTwinTranslated`, `TestMigrationVersionsAreDenseFromOne`).
 - `internal/state/queryset_test.go` (prepares every query, claims each by exactly one half, `BIGINT`, ASCII, no wildcard), `rawsqlallowlist_test.go`, `faultdriver_test.go`.
 - `internal/state/deploymentlock_process_test.go` (a real second process), `controller_test.go`, `postgresbackend_test.go` (gated by `BILLET_TEST_POSTGRES_DSN`).
-- `cmd/billet/standbystop_test.go`, `adminlock_test.go`; `internal/app/claim_test.go`, `proofs_test.go`, `leadershipwiring_test.go`.
+- `cmd/billet/standbystop_test.go`, `serverstop_test.go`, `adminlock_test.go`; `internal/state/schemamoved_test.go`; `internal/app/claim_test.go`, `proofs_test.go`, `leadershipwiring_test.go`.
 
 ## Related skills
 

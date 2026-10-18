@@ -18,7 +18,6 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -871,6 +870,15 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		ack.accept()
 
 		return nil
+	}
+
+	// WHAT THE CANDIDATE NEEDS OF THE NODE UNIT, judged only when something is to
+	// be installed, and before the claim and before the node is told the job was
+	// taken (#168): a rollout installs no units, and a refusal after acceptance
+	// would leave the rollout waiting on a host that never moves. A host already
+	// on the target installs nothing, so it settles above whatever its unit lacks.
+	if err := refuseUnmetUnitRequirements(ctx, env, cfg, manifest.Version); err != nil {
+		return err
 	}
 
 	dir, err := stageClaim()
@@ -2361,10 +2369,13 @@ func (h *ledgerHost) ProbeReady(ctx context.Context) error {
 }
 
 // candidateProbeDeadline bounds a candidate that neither reports ready nor
-// exits. Both probes open a ledger and build an allocator or a provider, which
-// has never taken more than seconds; what the bound is for is a wedged candidate,
-// which would otherwise hold the transaction with the services already stopped.
-// A variable so a test can shorten it.
+// exits. Both probes open a ledger and build an allocator or a provider, and the
+// ledger's open may take state.StartupBound when its scan reads cold, as it does
+// with the services stopped (55 seconds measured on the reference controller,
+// 2026-10-17); what the bound is for beyond that is a wedged candidate, which
+// would otherwise hold the transaction with the services already stopped
+// (TestTheCandidateProbeOutlastsAColdLedgerOpen). A variable so a test can
+// shorten it.
 var candidateProbeDeadline = 3 * time.Minute
 
 // probeStopGrace is how long a legacy candidate is given to leave on SIGTERM
@@ -2860,7 +2871,7 @@ func (h *systemdHost) StartServices(ctx context.Context) error {
 		}
 
 		// UNDER THE UNIT'S OWN START BOUND, as `local up` starts one.
-		startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+		startCtx, cancelStart := context.WithTimeout(ctx, unitStartDeadline(unit))
 		_, err := h.converge.StartAndProve(startCtx, unit)
 		cancelStart()
 

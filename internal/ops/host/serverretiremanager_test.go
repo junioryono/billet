@@ -18,6 +18,12 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv(repairStandinEnv) == "1" {
+		os.Exit(runRepairStandin())
+	}
+	if os.Getenv(repairGuardStandinEnv) == "1" && runRepairGuardStandin(os.Args[1:]) {
+		os.Exit(0)
+	}
 	if os.Getenv("BILLET_RETIRE_MANAGER_FAKE") == "1" {
 		name := filepath.Base(os.Args[0])
 		if name == "systemctl" || name == "busctl" || name == "busctl-execution" {
@@ -41,6 +47,14 @@ func TestMain(m *testing.M) {
 	// lifecycle commands' tests drive a recording converger with no systemd
 	// behind it, and the tests of the checks install their own.
 	nodeEndings = func() nodeEndingChecks { return provedNodeEndings{} }
+	// THE HOST'S OWN systemd IS NOT ASKED BY A CHECK: runCheck's lock directory
+	// report answers from a node unit nothing installed, and its own tests stand
+	// in their answers.
+	checkUnitProperties = func(context.Context) func(string, ...string) (map[string][]string, error) {
+		return func(string, ...string) (map[string][]string, error) {
+			return map[string][]string{"LoadState": {"not-found"}}, nil
+		}
+	}
 
 	code := m.Run()
 	_ = os.RemoveAll(dir)

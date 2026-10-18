@@ -14,23 +14,35 @@ import (
 // put back to `<-ctx.Done()` would leave them green and the fleet hanging at the
 // probe step again, which is the outage this guards. The call site cannot be
 // reached from a unit test without a ledger and a GitHub, so the source is
-// asserted: exactly two upgrade-probe branches, each calling host.HoldProbe with the
-// hold flag itself as the third argument and one of the two constant lines in
-// the fourth, neither printing nor receiving from a channel on its own.
+// asserted: exactly two upgrade-probe branches that wait, each calling
+// host.HoldProbe with the hold flag itself as the third argument and one of the
+// two constant lines in the fourth, neither printing nor receiving from a
+// channel on its own. Every other upgrade-probe branch is runServer's, which
+// returns the probe's verdict and does nothing else.
 func TestBothUpgradeProbesHandTheWaitToHoldProbe(t *testing.T) {
 	fset := token.NewFileSet()
 
-	file, err := parser.ParseFile(fset, "main.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
+	var files []*ast.File
+
+	for _, name := range []string{"main.go", "server.go"} {
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		files = append(files, file)
 	}
 
 	branches := 0
 
-	ast.Inspect(file, func(n ast.Node) bool {
+	inspect := func(n ast.Node) bool {
 		stmt, ok := n.(*ast.IfStmt)
 		if !ok || !isUpgradeProbeCondition(stmt.Cond) {
 			return true
+		}
+
+		if isVerdictBranch(stmt) {
+			return false
 		}
 
 		branches++
@@ -74,23 +86,49 @@ func TestBothUpgradeProbesHandTheWaitToHoldProbe(t *testing.T) {
 		}
 
 		return false
-	})
+	}
+
+	for _, file := range files {
+		ast.Inspect(file, inspect)
+	}
 
 	if branches != 2 {
-		t.Fatalf("found %d upgrade-probe branches in main.go, want 2 (server and node)", branches)
+		t.Fatalf("found %d upgrade-probe branches that wait, want 2 (server and node)", branches)
 	}
 }
 
-// isUpgradeProbeCondition recognises `if upgradeProbe {` and `if *upgradeProbe {`.
+// isUpgradeProbeCondition recognises `if upgradeProbe {`, `if *upgradeProbe {`
+// and `if run.probe {`.
 func isUpgradeProbeCondition(cond ast.Expr) bool {
-	return isFlagRef(cond, "upgradeProbe")
+	return isFlagRef(cond, "upgradeProbe") || isFlagRef(cond, "probe")
 }
 
-// isFlagRef recognises `name` and `*name`.
+// isVerdictBranch recognises runServer's `if upgradeProbe { return err }`: the
+// probe's exit status is its verdict, returned as it is.
+func isVerdictBranch(stmt *ast.IfStmt) bool {
+	if len(stmt.Body.List) != 1 {
+		return false
+	}
+
+	ret, ok := stmt.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return false
+	}
+
+	_, isName := ret.Results[0].(*ast.Ident)
+
+	return isName
+}
+
+// isFlagRef recognises `name`, `*name` and `run.name`.
 func isFlagRef(e ast.Expr, name string) bool {
 	switch v := e.(type) {
 	case *ast.Ident:
 		return v.Name == name
+	case *ast.SelectorExpr:
+		recv, ok := v.X.(*ast.Ident)
+
+		return ok && recv.Name == "run" && v.Sel.Name == name
 	case *ast.StarExpr:
 		id, ok := v.X.(*ast.Ident)
 
@@ -108,7 +146,7 @@ func isHoldProbeCall(call *ast.CallExpr) bool {
 		return false
 	}
 
-	if !isFlagRef(call.Args[2], "holdProbeFlag") {
+	if !isFlagRef(call.Args[2], "holdProbeFlag") && !isFlagRef(call.Args[2], "holdProbe") {
 		return false
 	}
 

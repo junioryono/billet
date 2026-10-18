@@ -13,9 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"runtime/debug"
-	"syscall"
 
 	"github.com/junioryono/billet/internal/ops/host"
 
@@ -32,8 +30,6 @@ import (
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/hostauthority"
-	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
 
@@ -163,139 +159,6 @@ func cmdServer(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []strin
 	return runServer(ctx, env, lc, cfg, *dryRun, *upgradeProbe, *holdProbeFlag)
 }
 
-// runServer starts the control plane and blocks until it is told to stop.
-//
-// THE ORDER IS THE TYPES': internal/app's control plane hands out a Controller
-// only from BecomeController, and the node wire only to a controller that has
-// forgotten the fleet and adopted the authority, so a step moved above the claim
-// does not compile. What stays here is how the process was invoked: the
-// scale-set clients, the probe's hold, the signals, and what exit status a stop
-// earns.
-func runServer(
-	ctx context.Context, env cli.Env,
-	lc *cli.Lifecycle,
-	cfg *config.Config,
-	dryRun, upgradeProbe, holdProbeFlag bool,
-) error {
-	// Built by the SHARED constructor, one client per target, so the server and
-	// teardown authenticate identically. Two near-identical constructions is how
-	// one of them ends up pointed at a different owner than the other.
-	targets, err := app.NewScaleSetClients(ctx, cfg)
-	if err != nil {
-		return err
-	}
-
-	cp, err := app.OpenControlPlane(ctx, cfg, serverHost(env), targets,
-		app.ControlPlaneOptions{Probe: upgradeProbe})
-	if err != nil {
-		return err
-	}
-
-	defer cp.Close()
-
-	if upgradeProbe {
-		if err := host.NotifyReady(env); err != nil {
-			return fmt.Errorf("server upgrade-probe readiness: %w", err)
-		}
-		host.HoldProbe(ctx, env, holdProbeFlag, host.ServerProbeReadyLine)
-
-		return nil
-	}
-
-	// AFTER THE PROBE, which runs beside the service that holds the port, and
-	// BEFORE THE CLAIM, so a standby can be scraped while it waits.
-	served, err := app.ServeMetrics(ctx, "server", cfg.Server.Metrics, cp.LedgerMetrics())
-	if err != nil {
-		return err
-	}
-
-	defer served.Close(ctx)
-
-	// Ctrl-C and SIGTERM stop the listeners through the context, which is what
-	// releases escrowed capacity — see the listener's deferred release. A hard
-	// kill skips that and leaves the reaper to expire it.
-	//
-	// AND IT IS INSTALLED BEFORE THE CLAIM, because a standby may wait there for
-	// days and an operator stopping one must not have to kill it.
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// THE CONTROLLER CLAIM, BEFORE ANYTHING POLLS GITHUB OR DISPATCHES A NODE.
-	//
-	// A STOP WHILE THIS HOST IS STILL TRYING IS A STOP, NOT A FAILURE. See
-	// stoppedBeforeTheClaim: exiting non-zero here left systemd holding a failed
-	// unit for a standby that was asked to stop, and `billet server retire`
-	// refuses to act against one.
-	ctl, err := cp.BecomeController(ctx, stop)
-	if err != nil {
-		// THE FENCE IS READ AFTER THE ATTEMPT, not beside it: the claim's own
-		// write is one a successor can refuse.
-		return stoppedBeforeTheClaim(ctx, env, cp.LeadershipLost(), err)
-	}
-
-	// THE LOOPS ARE JOINED BEFORE THE LEDGER CLOSES: this runs ahead of cp.Close.
-	defer ctl.Close()
-
-	adopted, err := ctl.AdoptAuthority(ctx)
-	if err != nil {
-		return err
-	}
-
-	fleet, err := ctl.ForgetFleet(ctx)
-	if err != nil {
-		return err
-	}
-
-	wire, err := ctl.ServeWire(ctx, fleet, adopted)
-	if err != nil {
-		return err
-	}
-
-	defer wire.Stop()
-
-	published, err := ctl.PublishAuthority(ctx, wire)
-	if err != nil {
-		return err
-	}
-
-	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: lc.Hurry(), DryRun: dryRun})
-	if err != nil {
-		return err
-	}
-
-	err = scheduler.Run(ctx)
-
-	// A FENCED CONTROLLER'S ERROR IS ITS OWN, never a GitHub access problem to
-	// explain: Run already says what happened and what a restart does. ASKED OF
-	// THE ERROR, not of the ledger again: Run read the fence once, after the
-	// plane stopped, and a second read here could see a fence latched since and
-	// still return the nil Run answered before it.
-	if errors.Is(err, state.ErrLeadershipLost) {
-		return err
-	}
-
-	if err != nil {
-		return host.ExplainGitHubAccess(ctx, cfg, err)
-	}
-
-	fmt.Fprintln(env.Stdout, "billet server: stopped")
-
-	return nil
-}
-
-// serverHost is what the control plane takes from this process and machine:
-// the identity exclusions the host authority provides, the service manager's
-// notifications, and stdout for the lines an operator reads.
-func serverHost(env cli.Env) app.Host {
-	return app.Host{
-		ServerAccess:  hostauthority.ServerWireAccess,
-		AuthorityLock: fleetops.AuthorityLockAccess,
-		Ready:         func() error { return host.NotifyReady(env) },
-		Status:        func(text string) error { return host.NotifyStatus(env, text) },
-		Out:           env.Stdout,
-	}
-}
-
 func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string) error {
 	// THE NODE'S OWN SUBCOMMANDS, before the role's flags: the endpoint
 	// migration and the receipt are commands about the node this host runs,
@@ -304,6 +167,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 		switch args[0] {
 		case "migrate-endpoint":
 			return host.NodeMigrate(ctx, env, args[1:])
+		case "repair-unit":
+			return host.NodeRepairUnit(ctx, env, args[1:])
 		case "receipt":
 			return host.NodeReceipt(ctx, env, args[1:])
 		case "ending":
@@ -388,7 +253,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	}
 
 	// AFTER THE PROBE, which runs beside the service that holds the port.
-	served, err := app.ServeMetrics(ctx, "node", cfg.Node.Metrics)
+	served, err := app.ServeMetrics(ctx, "node", cfg.Node.Metrics, n.UsageMetrics(), n.KernelMappingMetrics())
 	if err != nil {
 		return err
 	}

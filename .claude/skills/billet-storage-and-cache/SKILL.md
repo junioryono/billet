@@ -28,6 +28,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Every cache image carries object-map, and every command that changes one keeps the kernel client (#394).**
 - **Storage background work yields to jobs (#394).**
 - **An intact orphan volume is reclaimed by an operator, on proof, through the trash (#301).**
+- **A kernel mapping no job accounts for is unmapped on proof, never forced, and counted (#494).**
 
 ### The Actions cache, the kill switch and publication: [references/actions-cache-and-publication.md](references/actions-cache-and-publication.md)
 

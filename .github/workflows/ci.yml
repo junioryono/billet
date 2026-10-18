@@ -951,7 +951,7 @@ jobs:
           fi
           retirement_postgres_address=$(docker port "$retirement_postgres" 5432/tcp)
           cd internal/lifeops
-          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^(TestRealSystemdRetirementOperationEffects|TestRealSystemdHostLockDirectoryOutlivesTheNodeStop)$'
           cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
 
@@ -1011,13 +1011,16 @@ jobs:
     # satisfied on the next version bump.
     name: terraform (${{ matrix.label }})
     runs-on: billet-2vcpu-ubuntu-2404
-    # THE JOB IS BOUND BY THE NETWORK, not the CPU: one leg moves about 1.3 GiB
-    # from the internet (the Go cache restore, an AWS provider download for each
-    # module and each generated hybrid root, the Go modules for the hybrid
-    # check's build). It took 9 to 14 minutes when the pool's line was idle,
-    # and on 2026-10-17, with the pool's internet share shaped to 150 Mbit/s and
-    # every concurrent job pulling through it, three attempts in a row were
-    # cancelled at 15 with nothing failed.
+    # THE JOB IS BOUND BY THE NETWORK, not the CPU. On 2026-10-17, with the
+    # pool's internet share shaped to 150 Mbit/s and every concurrent job pulling
+    # through it, three attempts in a row were cancelled at 15 minutes with
+    # nothing failed: each leg downloaded a 194 MB AWS provider for every module
+    # and every hybrid root. The provider cache below shares what the modules
+    # download, and the first hybrid root's lock serves the other three; when a
+    # cache main saved for these same lock files is restored, only the first
+    # hybrid root's providers come from the internet, which it authenticates
+    # (the Go cache is restored from the node). A leg with nothing cached still
+    # took 14 minutes on a saturated line, so the limit keeps that room.
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -1056,22 +1059,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # ONE DOWNLOAD OF EACH PROVIDER, NOT ONE PER INIT. Every module is initialised
-      # here and every hybrid root below, and with no plugin cache each init
-      # fetched its providers afresh: the aws provider is 194 MB, fetched about
-      # seven times a leg and three legs a run, over the one line the whole site's
-      # CI shares. On 2026-10-17 every leg of two pull requests passed each step it
-      # reached and was cancelled at the limit, the module's validate taking up to
-      # five minutes against 55 s on a quiet line. The cache is shared by the
-      # job's inits and carried between runs by the Actions cache, which a billet
-      # runner serves from its own node: main saves it, a release branch whose
-      # locks differ from main's saves its own, and a pull request restores its
-      # base's or main's. Terraform takes a cached provider only when the lock
-      # file holds this platform's h1 checksum, and checks it against that
-      # (measured with 1.14.0, 1.14.1 and 1.15.9), which is why
-      # each lock records all four platforms and a test in scripts/ says so; the
-      # hybrid roots have no lock, so the first of them downloads and
-      # authenticates the newest aws provider in every leg, and
+      # PROVIDERS ARE SHARED, NOT DOWNLOADED AT EVERY INIT. Every module is
+      # initialised here and every hybrid root below, and with no plugin cache
+      # each init fetched its providers afresh: the aws provider is 194 MB,
+      # fetched about seven times a leg and three legs a run, over the one line
+      # the whole site's CI shares. On 2026-10-17 every leg of two pull requests
+      # passed each step it reached and was cancelled at the limit, the module's
+      # validate taking up to five minutes against 55 s on a quiet line. The
+      # cache is shared by the job's inits and carried between runs by the
+      # Actions cache, which a billet runner serves from its own node: main
+      # saves it, a release branch whose locks differ from main's saves its own,
+      # and a pull request restores its base's or main's. Terraform takes a
+      # cached provider only when the lock file holds this platform's h1
+      # checksum, and checks it against that (measured with 1.14.0, 1.14.1 and
+      # 1.15.9), which is why each lock records all four platforms and a test in
+      # scripts/ says so; the hybrid roots have no lock, so the first of them
+      # downloads and authenticates the newest aws provider in every leg, and
       # scripts/hybrid-root-check.sh hands its lock to the other three.
       - name: Share one provider cache across the job's inits
         run: |

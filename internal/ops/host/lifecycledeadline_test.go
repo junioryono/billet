@@ -10,6 +10,7 @@ import (
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // EVERY STOP AND START RUNS UNDER THE UNIT'S OWN BOUND: lifeops gives a stop
@@ -46,8 +47,11 @@ func TestUpStartsEachUnitUnderItsOwnStartBound(t *testing.T) {
 		t.Fatalf("a prepared host was refused: %v", err)
 	}
 
+	// THE SERVER'S BOUND CARRIES THE EXTENSION it asks systemd for before it
+	// opens the ledger (unitStartDeadline); the node's is the unit's own.
 	for _, unit := range []string{deploy.ServerUnitName, deploy.NodeUnitName} {
-		deadlineWithin(t, "the start of "+unit, f.deadlines["start "+unit], deploy.UnitStartTimeout)
+		deadlineWithin(t, "the start of "+unit, f.deadlines["start "+unit],
+			unitStartDeadline(unit)-lifecycleDeadlineMargin)
 	}
 }
 
@@ -68,6 +72,37 @@ func TestDownStopsEachUnitUnderItsOwnStopBound(t *testing.T) {
 	for _, unit := range []string{deploy.ServerUnitName, deploy.NodeUnitName} {
 		deadlineWithin(t, "the stop of "+unit, f.deadlines["stop "+unit], deploy.UnitStopTimeout)
 	}
+}
+
+// THE TRANSACTION'S SERVER START WAITS AS LONG AS SYSTEMD DOES, which with the
+// extension the server asks for is longer than the unit's own bound: a start
+// cut off sooner would roll a slow, healthy upgrade back. A case of its own,
+// because /usr/bin/false fails the server's start before the node's is reached.
+func TestTheTransactionWaitsTheServersExtendedStart(t *testing.T) {
+	seen := map[string]time.Time{}
+
+	prev := newHostInspector
+	newHostInspector = func() *lifeops.Inspector {
+		return lifeops.NewInspector(
+			lifeops.WithSystemctl("/usr/bin/false"),
+			lifeops.WithObserver(func(ctx context.Context, args []string) {
+				if d, ok := ctx.Deadline(); ok {
+					seen[args[0]+" "+args[len(args)-1]] = d
+				}
+			}))
+	}
+
+	t.Cleanup(func() { newHostInspector = prev })
+
+	cfg := &config.Config{Server: &config.ServerConfig{}}
+	h := newSystemdHost(processEnv(), cfg, "/etc/billet/billet.yaml", "/tmp/staged", nil)
+
+	if err := h.StartServices(t.Context()); err == nil || !strings.Contains(err.Error(), "starting") {
+		t.Fatalf("a start through /usr/bin/false: %v", err)
+	}
+
+	deadlineWithin(t, "the transaction's server start", seen["start "+serverUnit],
+		deploy.UnitStartTimeout+state.StartupBound()+deploy.UnitStartTimeout)
 }
 
 // THE TRANSACTION: its starts under the start bound, observed through the

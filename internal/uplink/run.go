@@ -23,8 +23,8 @@ const Tick = 500 * time.Millisecond
 // in one tick. Over two seconds the lumps average out.
 const rateWindow = 2 * time.Second
 
-// fallbackSpeed is the starting rate for an interface whose speed the kernel
-// does not report, in Mbit/s: high enough to hold nothing back on any line.
+// fallbackSpeed is the ceiling for an interface whose speed the kernel does
+// not report, in Mbit/s: high enough to hold nothing back on any line.
 const fallbackSpeed = 10000
 
 // Options are what Run shapes and how.
@@ -33,18 +33,20 @@ type Options struct {
 	Iface      string
 	Reflectors []string
 	// MaxUp and MaxDown are the most each direction is ever let through, in
-	// Mbit/s; zero is the interface's speed. Learning the line from latency
-	// alone left a gateway that drops before it queues unprotected: from
-	// 02:05 to 05:15 UTC on 2026-10-14 the reference node cut nothing while it
-	// sent up to 888 Mbit/s and a laptop behind the same gateway lost its
-	// connections (shared-uplink record).
+	// Mbit/s; zero is the interface's speed. Optional: the shaper finds the
+	// line without them (the package comment).
 	MaxUp, MaxDown float64
-	Params         Params
-	Log            *slog.Logger
+	// Gateway is the first hop asked each round beside the reflectors; empty
+	// asks the default route's, unless NoGateway. A host beside the reference
+	// node saw the gateway stall while the reflectors saw little (2026-10-14).
+	Gateway   string
+	NoGateway bool
+	Params    Params
+	Log       *slog.Logger
 }
 
-// Ceiling is the rate a direction starts at and never exceeds: the configured
-// maximum when there is one below the interface's speed, else that speed.
+// Ceiling is the rate a direction never exceeds: the configured maximum when
+// there is one below the interface's speed, else that speed.
 func Ceiling(speed, configured float64) float64 {
 	if configured > 0 && configured < speed {
 		return configured
@@ -53,11 +55,17 @@ func Ceiling(speed, configured float64) float64 {
 	return speed
 }
 
-// newRunController is the controller a run starts with, each direction at its
-// ceiling.
+// newRunController is the controller a run starts with, each direction at
+// Start under its ceiling, as one with nothing learned starts.
 func newRunController(speed float64, opts Options) *Controller {
-	return &Controller{Params: opts.Params, Up: NewDirection(Ceiling(speed, opts.MaxUp)),
+	c := &Controller{Params: opts.Params, Up: NewDirection(Ceiling(speed, opts.MaxUp)),
 		Down: NewDirection(Ceiling(speed, opts.MaxDown))}
+
+	for _, d := range []*Direction{&c.Up, &c.Down} {
+		d.Rate = clamp(opts.Params.Start, d.Max)
+	}
+
+	return c
 }
 
 // Run shapes the uplink until ctx ends, and removes the shaping as it returns.
@@ -86,7 +94,9 @@ func Run(ctx context.Context, opts Options) error {
 		reflectors = DefaultReflectors
 	}
 
-	pinger, err := NewPinger(ctx, reflectors)
+	gateway := runGateway(opts, iface)
+
+	pinger, err := NewPinger(ctx, reflectors, gateway)
 	if err != nil {
 		return err
 	}
@@ -116,21 +126,41 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("shape %s: %w", iface, err)
 	}
 
-	index := ifindex(iface)
-	if err := writeRecord(Record{Iface: iface, Index: index, IFB: shaper.IFB()}); err != nil {
+	at := thisNIC(iface)
+	if err := writeRecord(Record{Iface: iface, Index: at.index, IFB: shaper.IFB()}); err != nil {
 		return err
 	}
+
+	// WHAT AN EARLIER RUN LEARNED, BEFORE ANYTHING IS INSTALLED, so the line is
+	// held where it was from the first packet rather than relearned after every
+	// restart.
+	resumeLearned(opts.Log, ctl, at)
 
 	if err := shaper.Install(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
 		return fmt.Errorf("install CAKE on %s: %w", iface, err)
 	}
 
-	opts.Log.Info("shaping the uplink; each direction starts at its ceiling and is cut "+
-		"only when its own traffic raises the latency to the reflectors or makes the line drop their probes",
-		"interface", iface, "interface_mbit", speed, "up_ceiling_mbit", ctl.Up.Max,
-		"down_ceiling_mbit", ctl.Down.Max, "reflectors", pinger.Reflectors(), "bloat", opts.Params.Bloat)
+	remember := rememberer(opts.Log, ctl, at)
+	remember(ctl.Up.Rate, ctl.Down.Rate)
 
-	err = loop(ctx, opts.Log, iface, index, pinger, ctl, shaper)
+	opts.Log.Info("shaping the uplink; each direction starts at the rate an earlier run learned, or low with "+
+		"nothing learned, climbs while the line stays clear, slowly near where the line was last found full, "+
+		"and is cut when its own traffic raises the latency to the reflectors or the gateway, or makes the "+
+		"line drop the reflectors' probes",
+		"interface", iface, "interface_mbit", speed, "up_ceiling_mbit", ctl.Up.Max,
+		"down_ceiling_mbit", ctl.Down.Max, "up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),
+		"up_limit_mbit", round(ctl.Up.Limit), "down_limit_mbit", round(ctl.Down.Limit),
+		"reflectors", pinger.Reflectors(), "gateway", gatewayLabel(pinger.Gateway()), "bloat", opts.Params.Bloat)
+
+	// THE DEFAULT ROUTE'S GATEWAY IS FOLLOWED, one the operator named is not: a
+	// route that moves to another gateway on the same interface would otherwise
+	// have the shaper ask the old one, whose stalls are no longer this line's.
+	var follow func() (string, error)
+	if !opts.NoGateway && opts.Gateway == "" {
+		follow = func() (string, error) { return DefaultGateway(iface) }
+	}
+
+	err = loop(ctx, opts.Log, iface, at.index, pinger, ctl, shaper, remember, follow)
 
 	// REMOVED ON EVERY WAY OUT, by the record, so an interface renamed while it
 	// ran is still cleared; a removal that failed is an error, and the unit's
@@ -143,6 +173,102 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	return errors.Join(err, clearErr)
+}
+
+// runGateway is the first hop a run asks: the one named, none when NoGateway,
+// else the default route's by iface. A lookup that fails is logged and asks
+// none, because the gateway adds a signal and the shaping does without it.
+func runGateway(opts Options, iface string) string {
+	if opts.NoGateway {
+		return ""
+	}
+
+	if opts.Gateway != "" {
+		return opts.Gateway
+	}
+
+	gateway, err := DefaultGateway(iface)
+	if err != nil {
+		opts.Log.Warn("not asking the gateway: its address could not be read", "interface", iface, "error", err)
+
+		return ""
+	}
+
+	return gateway
+}
+
+// gatewaySetter is what followGateway moves: the Pinger.
+type gatewaySetter interface {
+	Gateway() string
+	setGateway(gateway string) (bool, error)
+}
+
+// followGateway asks the gateway lookup names now, when it has changed, and
+// starts its baseline and every cut's evidence of it afresh: a new device's
+// round trip is no measure against the old one's. A lookup that could not tell
+// keeps the gateway asked now.
+func followGateway(log *slog.Logger, lookup func() (string, error), pinger gatewaySetter, st *stepper,
+	ctl *Controller,
+) {
+	gateway, err := lookup()
+	if err != nil {
+		return
+	}
+
+	changed, err := pinger.setGateway(gateway)
+	if err != nil {
+		log.Warn("the default route's gateway changed to one that cannot be asked; asking the old one",
+			"gateway", gateway, "error", err)
+
+		return
+	}
+
+	if !changed {
+		return
+	}
+
+	st.gateway = Delays{}
+	ctl.forgetGateway()
+
+	log.Info("the default route's gateway changed; asking the new one", "gateway", gatewayLabel(pinger.Gateway()))
+}
+
+// gatewayLabel is the gateway as logged.
+func gatewayLabel(gateway string) string {
+	if gateway == "" {
+		return "none"
+	}
+
+	return gateway
+}
+
+// rememberer records the rates CAKE was set to, for the next run, or the next
+// boot's, to resume; a write that fails is said once and changes nothing about
+// the shaping. THE ADDRESS IS READ AT EACH WRITE, not once at the start, so a
+// MAC set while the shaper runs is the one the next boot compares; but only
+// while the name still has the run's index, so a device that took the name, or
+// none, never puts its address, or nothing, beside this device's rates; a run
+// that could not read its index at the start keeps the address it started
+// with, having nothing to tell its own device by.
+func rememberer(log *slog.Logger, ctl *Controller, at nic) func(upMbit, downMbit float64) {
+	told, addr := false, at.addr
+
+	return func(upMbit, downMbit float64) {
+		if now := ifaddr(at.iface); now != "" && at.index != "" && ifindex(at.iface) == at.index {
+			addr = now
+		}
+
+		err := writeLearned(learned{Format: learnedFormat, Iface: at.iface, Index: at.index, Addr: addr,
+			Boot: at.boot,
+			At:   time.Now(),
+			Up:   learnedRate{Max: ctl.Up.Max, Rate: upMbit, Limit: ctl.Up.Limit},
+			Down: learnedRate{Max: ctl.Down.Max, Rate: downMbit, Limit: ctl.Down.Limit}})
+		if err != nil && !told {
+			told = true
+			log.Warn("could not record the rates for the next run to resume; it will start as one with nothing "+
+				"learned does", "error", err)
+		}
+	}
 }
 
 // Lock takes the one claim on this host's shaping, held by a shaper for its
@@ -171,7 +297,7 @@ func Lock() (func(), error) {
 }
 
 func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pinger, ctl *Controller,
-	shaper *Shaper,
+	shaper *Shaper, remember func(upMbit, downMbit float64), follow func() (string, error),
 ) error {
 	read := func() (Counters, error) { return ReadCounters(iface) }
 	set := func(ctx context.Context, upMbit, downMbit float64) error {
@@ -186,6 +312,13 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 	if err != nil {
 		return err
 	}
+	st.remember = remember
+
+	// AND THE RATES IN FORCE ARE RECORDED AGAIN EVERY MINUTE AND AS THE LOOP
+	// ENDS, though they have not changed, with each direction's Limit as it is
+	// then, so a crash or a reboot loses at most a minute of what was found.
+	// What CAKE was given (applied), never a rise too small to apply.
+	defer st.record()
 
 	exe := currentExecutable()
 	exeCheckedAt := time.Now()
@@ -210,6 +343,11 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 
 		if time.Since(exeCheckedAt) >= time.Minute {
 			exeCheckedAt = time.Now()
+			st.record()
+
+			if follow != nil {
+				followGateway(log, follow, pinger, st, ctl)
+			}
 
 			if exe.replaced() {
 				log.Info("the installed billet was replaced; stopping so the unit restarts onto it")

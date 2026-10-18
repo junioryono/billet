@@ -54,7 +54,9 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/upgrade-rollback.yml / Durably publish the rollback commit before opening administration | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/endpoint-decision.yml / Observe the node unit on a host with no billet | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/endpoint-decision.yml / Compare the endpoints without an executable to ask | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
-| tasks/endpoint-decision.yml / Ask for the endpoint migration's dry run | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
+| tasks/endpoint-dry-run.yml / Ask for the endpoint migration's dry run | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
+| tasks/node-repair.yml / Ask whether the runtime-unit repair is admitted | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
+| tasks/node-repair.yml / Run the runtime-unit repair | parity:ordinary converge only; refused inside a retained retirement before it runs (Refuse a runtime-unit repair inside a retained retirement) |
 | tasks/node-environment.yml / Inspect the installed node environment | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/node-environment.yml / Prove the retained environment files are readable or optionally absent | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/node-environment.yml / Inspect the node environment again before replacement | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
@@ -77,6 +79,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/account.yml / Create or adopt the billet service account | parity:verified retained account disables account creation and adoption |
 | tasks/account.yml / Install billet host dependencies | parity:package installation and maintainer scripts are the ordinary node-host operation, outside path admission (R7.7) |
 | tasks/account.yml / Create billet directories | loop:billet_common_directories; loop:billet_server_directories; loop:billet_node_directories |
+| tasks/account.yml / Keep the host lock directory across unit stops and reboots | const:/etc/tmpfiles.d/billet.conf |
 | tasks/account.yml / Reload systemd before inspecting host-upgrade service overlays | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Inspect billet service drop-ins before the upgrade transaction | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Preserve configuration and units before replacing them | parity:binary transaction only; retained binary changes refuse before ordinary work |
@@ -197,6 +200,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/services.yml / Validate and migrate with the new billet binary as the only ledger writer | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Return the migrated ledger to the control-plane account before restart | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Start the quiescent upgraded server readiness probe | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
+| tasks/services.yml / Make the host lock directory before the upgraded node starts | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Start the quiescent upgraded node readiness probe | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Inspect upgraded readiness-probe stability baseline | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Observe upgraded readiness probes across the restart interval | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
@@ -216,6 +220,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/endpoint-migration.yml / Write the registration's confirmation | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
 | tasks/endpoint-migration.yml / Write the migration's receipt | parity:shared migration/receipt command owns its runtime footprint and is followed by strict closing (R7.2) |
 | tasks/endpoint-migration.yml / Remove the migration's temporary files | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
+| tasks/services.yml / Make the host lock directory before the node starts | loop:billet_host_lock_directories |
 | tasks/node-restart.yml / Record the billet node's main process before its restart | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/node-restart.yml / Request the billet node's restart without waiting for its drain | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
 | tasks/node-restart.yml / Poll the billet node until a new main process runs | parity:read-only observation or node validation; exact full module arguments and definitions are bound |

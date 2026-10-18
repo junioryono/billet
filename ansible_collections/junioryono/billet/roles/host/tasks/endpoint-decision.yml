@@ -133,37 +133,22 @@
         billet_endpoint_compat: true
       when: billet_endpoint_compat_change is not skipped
 
-    # THE DRY RUN, through the answerer, with or without an installed
-    # configuration (the command reports `config: absent` and judges the unit
-    # and its process against the rendering). Bounded by the judgement's
-    # attempts, each an opening observation, the record wait, the two
-    # observations of a bracket that outlives it, the closing observation
-    # and the pre-R probe a node without a record may need, plus the guard's
-    # bound as the margin, `-k 10` so a hang is killed after the grace
-    # period.
-    - name: Ask for the endpoint migration's dry run
-      ansible.builtin.command:
-        argv: >-
-          {{ ['timeout', '-k', '10', ((billet_migration_judgement_attempts | int) * ((billet_migration_record_wait | int) + 4 * (billet_migration_observation_bound | int) + (billet_migration_probe_bound | int)) + (billet_guard_timeout | int)) | string,
-              billet_endpoint_answerer, 'node', 'migrate-endpoint', '--config', '/etc/billet/billet.yaml',
-              '--desired', '-', '--wait', (billet_migration_record_wait | string) ~ 's', '--dry-run', '--json'] }}
-        stdin: "{{ billet_endpoint_rendering }}"
-        expand_argument_vars: false
-      register: billet_endpoint_dry
-      changed_when: false
-      failed_when: false
-      check_mode: false
-      become: true
-      no_log: true
+    # THE DRY RUN, through the answerer (endpoint-dry-run.yml).
+    - name: Ask for and judge the endpoint migration's dry run
+      ansible.builtin.import_tasks: endpoint-dry-run.yml
       when: billet_endpoint_answerer | length > 0
 
-    - name: Judge the endpoint migration's dry run
-      ansible.builtin.import_tasks: endpoint-answer.yml
-      vars:
-        billet_endpoint_raw: "{{ billet_endpoint_dry }}"
-        billet_endpoint_call: decision
-        billet_endpoint_answered_by: "{{ billet_endpoint_answerer }}"
-      when: billet_endpoint_answerer | length > 0
+    # A NODE UNIT THAT CANNOT HOLD THE REGISTRATION RECORD (#168): a rollout
+    # moved the binary past the unit an older collection rendered, so the
+    # running node publishes no record and its effective endpoint is unknown.
+    # The repair makes it known (node-repair.yml), and the decision is then
+    # asked again from scratch; nothing below reads the answer that named it.
+    - name: Repair a node unit that cannot hold its registration record
+      ansible.builtin.include_tasks: node-repair.yml
+      when:
+        - billet_endpoint_answerer | length > 0
+        - billet_endpoint_answer.outcome == 'reported'
+        - billet_endpoint_answer.record == 'unit-cannot-hold'
 
     # A refusal or a could-not-tell ends the converge here, before the
     # transaction's first stop and before the render: a node found stopping,

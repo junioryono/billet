@@ -41,6 +41,9 @@ type Host struct {
 	Ready func() error
 	// Status replaces the service manager's one-line status (STATUS=).
 	Status func(string) error
+	// ExtendStart tells the service manager the ledger open about to run may
+	// take up to the duration given (EXTEND_TIMEOUT_USEC). Nil asks nothing.
+	ExtendStart func(time.Duration) error
 	// Out is where the lines an operator reads go.
 	Out io.Writer
 }
@@ -160,12 +163,30 @@ func OpenControlPlane(
 		mode = LedgerStandby
 	}
 
+	// THE SERVICE MANAGER IS TOLD BEFORE A SQLITE OPEN THAT IT MAY BE LONG. The
+	// open's scan may take its whole bound on a cold cache, and the identity
+	// access before it and the authority steps after it count against the same
+	// Type=notify start bound, so the extension gives the open its bound and
+	// what follows the unit's whole start bound again. A PostgreSQL ledger is
+	// not scanned and asks for nothing. A failure to ask is said and decides
+	// nothing, because the open may well be fast.
+	if host.ExtendStart != nil && scansAtOpen(cfg) {
+		if err := host.ExtendStart(state.StartupBound()); err != nil {
+			fmt.Fprintf(host.Out, "could not ask the service manager for time to open the ledger: %v\n", err)
+		}
+	}
+
 	db, err := OpenLedger(ctx, cfg, mode)
 
 	// THE ACCESS ENDS WITH THE OPEN, whatever the open said: what follows waits
 	// on the claim, and nothing waits on a lock while it does.
+	//
+	// AND EVERY FAILURE FROM HERE TO THE CLAIM CARRIES WHAT THE OPEN MIGRATED: a
+	// failed open joins it itself, and these are the refusals after a successful
+	// one. A config refused after an upgrade's migration is the case where an
+	// operator's next step, going back to the older binary, depends on knowing.
 	if err := errors.Join(err, release()); err != nil {
-		return nil, errors.Join(fmt.Errorf("server state: %w", err), closeIfOpen(db))
+		return nil, errors.Join(fmt.Errorf("server state: %w", err), unclaimedMoveOf(db), closeIfOpen(db))
 	}
 
 	// BUILT BEFORE THE CLAIM, DELIBERATELY, because it validates the CONFIG and
@@ -177,7 +198,7 @@ func OpenControlPlane(
 	allocator, err := alloc.New(db, allocatorLimits(cfg), cfg.Tiers,
 		append([]alloc.Option{alloc.WithPlacement(cfg.Server.Placement)}, steering.Allocator...)...)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("capacity allocator: %w", err), db.Close())
+		return nil, errors.Join(fmt.Errorf("capacity allocator: %w", err), db.UnclaimedMove(), db.Close())
 	}
 
 	// Everything billet.yaml says about the control plane, assembled in one place
@@ -186,7 +207,7 @@ func OpenControlPlane(
 	// INVOKED, not about the file.
 	serverOpts, err := server.OptionsFromConfig(cfg)
 	if err != nil {
-		return nil, errors.Join(err, db.Close())
+		return nil, errors.Join(err, db.UnclaimedMove(), db.Close())
 	}
 
 	cp := &ControlPlane{
@@ -212,6 +233,11 @@ func (cp *ControlPlane) Close() error { return cp.db.Close() }
 // LeadershipLost reports whether this control plane's ledger has refused a
 // write because another controller took the deployment.
 func (cp *ControlPlane) LeadershipLost() bool { return cp.db.LeadershipLost() }
+
+// UnclaimedMove is the schema this control plane's open migrated while no
+// claim has yet recorded its release, as an error to join to a failure between
+// the open and the claim, or nil. See state.SchemaMoved.
+func (cp *ControlPlane) UnclaimedMove() error { return cp.db.UnclaimedMove() }
 
 // BecomeController takes this deployment's controller claim, waiting for it on
 // a standby, and starts the fence that ends the process through stop the
@@ -641,14 +667,34 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// stops through a CANCELLED CONTEXT here, which Run reports as a clean stop.
 	// Returning nil would exit 0 — a control plane that was fenced out of its own
 	// deployment reporting a successful shutdown, and systemd leaving it stopped.
+	//
+	// AND WHAT THE PLANE ITSELF RETURNED IS KEPT BESIDE IT: the refused write
+	// says which ledger record moved, and a fault of the plane's own is still a
+	// fault.
 	if s.db.LeadershipLost() {
-		return fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
+		return errors.Join(fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
 			"handed back; the controller that replaced this one adopts both. If that "+
 			"replacement was itself transient, restarting is how this host takes the "+
-			"deployment back", state.ErrLeadershipLost)
+			"deployment back", state.ErrLeadershipLost), err)
 	}
 
 	return err
+}
+
+// unclaimedMoveOf is what a handle an open may or may not have produced
+// migrated and no claim has recorded, or nil.
+func unclaimedMoveOf(db *state.DB) error {
+	if db == nil {
+		return nil
+	}
+
+	return db.UnclaimedMove()
+}
+
+// scansAtOpen reports whether opening this config's ledger reads the whole
+// file first: a SQLite ledger does, and a PostgreSQL one is not scanned.
+func scansAtOpen(cfg *config.Config) bool {
+	return cfg.Server.LedgerBackend() != config.StatePostgres
 }
 
 // closeIfOpen closes a handle an open may or may not have produced.

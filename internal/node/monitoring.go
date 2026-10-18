@@ -2,14 +2,23 @@ package node
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
+	"log/slog"
 	"math"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/usage"
 	"github.com/junioryono/billet/internal/usage/flows"
 )
@@ -17,8 +26,23 @@ import (
 // JobMonitor samples running jobs. *usage.Monitor is the real one.
 type JobMonitor interface {
 	Start(key string, target usage.Target, vcpus int)
+	// Resume measures a job this process adopted, continuing its series from
+	// the checkpoint the process that handed it over wrote, when there is one
+	// that continues it; the error says why one was not used.
+	Resume(key string, target usage.Target, vcpus int, from *usage.Checkpoint) error
+	// Checkpoint is what is known of a job, for the next process.
+	Checkpoint(key string) (usage.Checkpoint, bool)
+	// Measuring reports whether the job is measured already.
+	Measuring(key string) bool
 	Final(key string) (usage.Summary, bool)
 	Forget(key string)
+}
+
+// WithUsageCheckpoints keeps, under dir, what the sampler knew of each job a
+// handover leaves running, for the next node process to continue measuring
+// it from (#384). Without it a handed-over job is measured from its adoption.
+func WithUsageCheckpoints(dir string) Option {
+	return func(r *Runner) { r.checkpoints = dir }
 }
 
 // UsageRecorder is where a job's usage is reported: the allocator in process,
@@ -85,15 +109,213 @@ func (r *Runner) startMonitoring(ctx context.Context, lease *alloc.Lease, inst *
 			"runner", inst.Name, "error", err)
 		return
 	}
-	r.monitor.Start(inst.Name, usage.Target{
+	r.monitor.Start(inst.Name, usageTargetOf(target), lease.VCPU)
+
+	r.startFlows(inst.Name, target, launchedAt)
+}
+
+// usageTargetOf is where the sampler reads an instance's counters, as the
+// backend said.
+func usageTargetOf(target provider.UsageTarget) usage.Target {
+	return usage.Target{
 		CgroupDir: target.CgroupDir, PID: target.PID, PIDStart: target.PIDStart,
 		VCPUThreadPrefix: target.VCPUThreadPrefix,
 		NetDevice:        target.NetDevice, NetHostView: target.NetHostView,
 		NetNamespace: target.NetNamespace,
 		Process:      target.Process,
-	}, lease.VCPU)
+	}
+}
 
-	r.startFlows(inst.Name, target, launchedAt)
+// resumeMonitoring begins measuring a job this process adopted and did not
+// launch, continuing its series from the checkpoint the process that handed it
+// over left, when one was left and continues it (#384). Off the job's path,
+// as startMonitoring is. Its traffic by destination is not followed: what it
+// sent before this process looked is in no tracker this process reads.
+//
+// THE CHECKPOINT IS TAKEN ONLY ONCE THE COUNTERS ARE FOUND: a lookup that
+// fails leaves it for the next recovery, which tries again, since the entry
+// still owes its report and the sampler does not yet measure the job.
+func (r *Runner) resumeMonitoring(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) {
+	src, ok := r.provider.(provider.UsageSource)
+	if r.monitor == nil || !ok {
+		r.takeCheckpoint(inst.Name)
+		return
+	}
+	if r.monitor.Measuring(inst.Name) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReportLimit)
+	defer cancel()
+
+	target, err := src.UsageTarget(ctx, inst.ID)
+	if err != nil {
+		r.log.Warn("could not find where an adopted job's host counters are; the next recovery tries "+
+			"again", "runner", inst.Name, "error", err)
+		return
+	}
+	cp := r.takeCheckpoint(inst.Name)
+	err = r.monitor.Resume(inst.Name, usageTargetOf(target), lease.VCPU, cp)
+
+	// A SERIES NOBODY WILL END IS FORGOTTEN AT ONCE: the entry may have settled
+	// its report, or been released, while the counters were being found, and
+	// nothing else would ever forget a series started after that.
+	if !r.owesReport(lease.ID, inst.Name) {
+		r.forgetMonitoring(inst.Name)
+
+		return
+	}
+	if err != nil {
+		r.log.Warn("measuring an adopted job from its adoption", "runner", inst.Name, "error", err)
+
+		return
+	}
+	r.log.Info("measuring an adopted job", "runner", inst.Name, "continued", cp != nil)
+}
+
+// owesReport reports whether a custody entry for the instance still owes its
+// usage report.
+func (r *Runner) owesReport(leaseID, name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	c, ok := r.custody[leaseID]
+
+	return ok && c.name == name && c.measured.Load()
+}
+
+// checkpointFile is where a job's checkpoint is kept, for an instance name
+// billet assigned, or false for any other.
+func (r *Runner) checkpointFile(name string) (string, bool) {
+	if r.checkpoints == "" || name == "" || name != filepath.Base(name) || strings.HasPrefix(name, ".") {
+		return "", false
+	}
+	if _, ours := provider.LeaseOf(name); !ours {
+		return "", false
+	}
+
+	return filepath.Join(r.checkpoints, name+checkpointSuffix), true
+}
+
+// checkpointSuffix ends every checkpoint file's name.
+const checkpointSuffix = ".usage.json"
+
+// takeCheckpoint reads and removes the checkpoint a handover left for an
+// instance, nil when there is none or it cannot be read. Removed either way,
+// so one is used at most once and none outlives the job it describes.
+func (r *Runner) takeCheckpoint(name string) *usage.Checkpoint {
+	path, ok := r.checkpointFile(name)
+	if !ok {
+		return nil
+	}
+	data, err := regularfile.ReadFile(path, usage.MaxCheckpointBytes, regularfile.Options{NoFollow: true})
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+		r.log.Warn("could not remove a used handover checkpoint", "path", path, "error", rmErr)
+	}
+	if err != nil {
+		r.log.Warn("could not read what the previous node process measured of a job; measuring it from "+
+			"its adoption", "runner", name, "error", err)
+		return nil
+	}
+	cp, err := usage.ReadCheckpoint(data)
+	if err != nil {
+		r.log.Warn("could not read what the previous node process measured of a job; measuring it from "+
+			"its adoption", "runner", name, "error", err)
+		return nil
+	}
+
+	return &cp
+}
+
+// HandOver keeps what the sampler knows of every job this process measures,
+// for the next node process to continue (#384). Called once a handoff's
+// withdrawal has landed, as the process leaves its compute running. Best
+// effort: a job it cannot keep is measured from its adoption, and nothing
+// here can fail the stop.
+func (r *Runner) HandOver(context.Context) {
+	if r.monitor == nil || r.checkpoints == "" {
+		return
+	}
+	installer := durablefile.Installer{}
+	if err := installer.MkdirAll(r.checkpoints, 0o700); err != nil {
+		r.log.Warn("could not keep what this process measured of its jobs for the next one; they are "+
+			"measured from their adoption", "dir", r.checkpoints, "error", err)
+		return
+	}
+	kept := 0
+	for _, name := range r.measuredNames() {
+		cp, ok := r.monitor.Checkpoint(name)
+		path, named := r.checkpointFile(name)
+		if !ok || !named {
+			continue
+		}
+		data, err := json.Marshal(cp)
+		if err == nil {
+			_, err = installer.Install(r.checkpoints, filepath.Base(path), 0o600, func(w io.Writer) error {
+				_, err := w.Write(data)
+				return err
+			})
+		}
+		if err != nil {
+			r.log.Warn("could not keep what this process measured of a job for the next one; it is "+
+				"measured from its adoption", "runner", name, "error", err)
+			continue
+		}
+		kept++
+	}
+	r.log.Info("kept what this process measured of the jobs it hands over", "jobs", kept)
+}
+
+// measuredNames is every instance this process measures: its running jobs and
+// the adopted ones in its custody.
+func (r *Runner) measuredNames() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var names []string
+	for _, inst := range r.running {
+		if inst != nil {
+			names = append(names, inst.Name)
+		}
+	}
+	for _, c := range r.custody {
+		if c.measured.Load() {
+			names = append(names, c.name)
+		}
+	}
+
+	return names
+}
+
+// pruneCheckpoints removes the checkpoints of instances the provider no longer
+// lists, which no adoption will read. Only after a List that succeeded: an
+// instance it could not see may still be there.
+func (r *Runner) pruneCheckpoints(instances []*provider.Instance) {
+	if r.checkpoints == "" {
+		return
+	}
+	entries, err := os.ReadDir(r.checkpoints)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			r.log.Warn("could not look for stale handover checkpoints", "dir", r.checkpoints, "error", err)
+		}
+		return
+	}
+	listed := make(map[string]bool, len(instances))
+	for _, inst := range instances {
+		listed[inst.Name+checkpointSuffix] = true
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if listed[name] || !strings.HasSuffix(name, checkpointSuffix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(r.checkpoints, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			r.log.Warn("could not remove a stale handover checkpoint", "file", name, "error", err)
+		}
+	}
 }
 
 // startFlows begins following a guest's connections, when flows are measured
@@ -266,6 +488,7 @@ func (r *Runner) reportUsage(ctx context.Context, lease *alloc.Lease, name strin
 	}
 	report, series := jobUsageOf(sum)
 	report.Destinations = destinations
+	logGaps(r.log, lease.ID, name, sum)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReportLimit)
 	defer cancel()
 
@@ -273,6 +496,71 @@ func (r *Runner) reportUsage(ctx context.Context, lease *alloc.Lease, name strin
 		r.log.Warn("could not report what a job did to the host; the job is unaffected",
 			"runner", name, "lease", lease.ID, "error", err)
 	}
+}
+
+// logGaps says in the node's log how much of a job's series the sampler did not
+// see, by cause, beside the report that carries it: the series says which
+// intervals, and this is what an operator searching the node's journal for a
+// lease finds (#495). A series it saw whole says nothing.
+func logGaps(log *slog.Logger, leaseID, name string, sum usage.Summary) {
+	gaps := usage.Timeline{First: sum.First, Points: sum.Points}.Gaps()
+	if len(gaps) == 0 {
+		return
+	}
+	unseen := map[usage.GapCause]time.Duration{}
+	var total time.Duration
+	for _, g := range gaps {
+		unseen[g.Cause] += g.Length()
+		total += g.Length()
+	}
+	attrs := []any{"runner", name, "lease", leaseID, "gaps", len(gaps), "unseen", total.Round(time.Millisecond)}
+	for _, c := range usage.GapCauses() {
+		if d, ok := unseen[c]; ok {
+			attrs = append(attrs, c.String(), d.Round(time.Millisecond))
+		}
+	}
+	log.Info("a job's series has intervals the sampler did not see", attrs...)
+}
+
+// heldUsage is an adopted job's last sample, taken before its compute goes,
+// and when it was taken.
+type heldUsage struct {
+	sum usage.Summary
+	has bool
+	at  time.Time
+}
+
+// heldFinal takes the last sample of an adopted job in custody, before its
+// compute is destroyed or as it is found gone; nothing for an entry that owes
+// no report.
+func (r *Runner) heldFinal(c *custody) heldUsage {
+	if !c.measured.Load() {
+		return heldUsage{}
+	}
+	sum, has := r.finalUsage(c.name)
+
+	return heldUsage{sum: sum, has: has, at: time.Now()}
+}
+
+// settleHeldUsage reports, once, what an adopted job in custody did and what
+// its guest said, as its compute goes and while its lease is still held
+// (#384): the path that ends an adopted job used to report neither, so a job
+// that ran across a handover, or was adopted again when its own node
+// re-registered, had no usage at all. current says the entry's epoch is the
+// ledger's; a lease that has gone takes no report. Either way the job stops
+// being measured.
+func (r *Runner) settleHeldUsage(ctx context.Context, c *custody, h heldUsage, current bool) {
+	if !c.measured.CompareAndSwap(true, false) {
+		return
+	}
+	if current {
+		lease := &alloc.Lease{ID: c.leaseID, Epoch: c.epoch.Load()}
+		if h.has {
+			r.reportUsage(ctx, lease, c.name, h.sum, r.finalFlows(ctx, c.name, h.at, h.sum, h.has))
+		}
+		r.reportGuest(ctx, lease, c.name)
+	}
+	r.forgetMonitoring(c.name)
 }
 
 // reportGuest sends what a job's guest told the node to the ledger, fenced on the
@@ -352,12 +640,13 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 		return u, nil
 	}
 	// CLOCKED WHENEVER THE SAMPLER SAYS WHEN IT BEGAN, which is what lets an
-	// operator place a step's window on the series; the node client re-encodes
-	// it without the clock for a plane too old to keep one.
+	// operator place a step's window on the series, and with each unseen
+	// interval's cause; the node client re-encodes it without the causes, or
+	// without the clock, for a plane too old to keep them.
 	if !sum.First.IsZero() {
-		data, _, err := usage.EncodeSeriesAt(sum.Points, sum.First, alloc.MaxUsageSeriesBytes)
+		data, _, err := usage.EncodeSeriesGaps(sum.Points, sum.First, alloc.MaxUsageSeriesBytes)
 		if err == nil {
-			return u, &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: data}
+			return u, &alloc.UsageSeries{Codec: usage.SeriesCodecGaps, Data: data}
 		}
 	}
 	data, _, err := usage.EncodeSeries(sum.Points, alloc.MaxUsageSeriesBytes)

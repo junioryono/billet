@@ -208,22 +208,26 @@ func TestHardwareCountersReachOnlyAPlaneThatKnowsThem(t *testing.T) {
 	}
 }
 
-// A PLANE TOO OLD FOR THE CLOCKED SERIES IS SENT THE SAME POINTS WITHOUT THE
-// CLOCK, in the codec it keeps, rather than a series its validation refuses
-// and takes the report down with; a plane at the version gets the clocked
-// series as it was. The caller's series is not changed either way.
-func TestAClockedSeriesReachesOnlyAPlaneThatKeepsIt(t *testing.T) {
+// EACH PLANE IS SENT THE SERIES IT KEEPS: one too old for the clock gets the
+// same points without it, one too old for the causes the same points with
+// marks alone, rather than a series its validation refuses and takes the
+// report down with; a plane at the version gets the series as it was. The
+// caller's series is not changed either way.
+func TestASeriesReachesEachPlaneInTheCodecItKeeps(t *testing.T) {
 	t.Parallel()
 
-	points := []usage.Point{{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 5, AfterGap: true}}
-	data, _, err := usage.EncodeSeriesAt(points, time.Now(), alloc.MaxUsageSeriesBytes)
+	points := []usage.Point{{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 5, Gap: usage.GapFailedRead},
+		{OffsetMillis: 2000, CPUUsage: 9}}
+	start := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	data, _, err := usage.EncodeSeriesGaps(points, start, alloc.MaxUsageSeriesBytes)
 	if err != nil {
-		t.Fatalf("EncodeSeriesAt: %v", err)
+		t.Fatalf("EncodeSeriesGaps: %v", err)
 	}
-	clocked := &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: slices.Clone(data)}
-	report := alloc.JobUsage{Source: alloc.UsageSourceHost, Samples: 2, IntervalMillis: 1000}
+	caused := &alloc.UsageSeries{Codec: usage.SeriesCodecGaps, Data: slices.Clone(data)}
+	report := alloc.JobUsage{Source: alloc.UsageSourceHost, Samples: 3, IntervalMillis: 1000}
 
-	for _, version := range []int{nodeapi.VersionSeriesClock - 1, nodeapi.VersionSeriesClock} {
+	for _, version := range []int{nodeapi.VersionSeriesClock - 1, nodeapi.VersionSeriesClock,
+		nodeapi.VersionSeriesGaps - 1, nodeapi.VersionSeriesGaps} {
 		plane := &usageRecordingPlane{version: version}
 		srv := httptest.NewServer(plane)
 		t.Cleanup(srv.Close)
@@ -234,7 +238,7 @@ func TestAClockedSeriesReachesOnlyAPlaneThatKeepsIt(t *testing.T) {
 		if err := c.Register(t.Context(), testRegistration()); err != nil {
 			t.Fatalf("register: %v", err)
 		}
-		if err := c.RecordLeaseUsage(t.Context(), "l1", 1, report, clocked); err != nil {
+		if err := c.RecordLeaseUsage(t.Context(), "l1", 1, report, caused); err != nil {
 			t.Fatalf("RecordLeaseUsage on wire %d: %v", version, err)
 		}
 		plane.mu.Lock()
@@ -243,23 +247,34 @@ func TestAClockedSeriesReachesOnlyAPlaneThatKeepsIt(t *testing.T) {
 		if got == nil || got.Series == nil {
 			t.Fatalf("no series reached the wire-%d plane", version)
 		}
-		if version == nodeapi.VersionSeriesClock {
-			if got.Series.Codec != usage.SeriesCodecClocked || !bytes.Equal(got.Series.Data, data) {
-				t.Errorf("a wire-%d plane was sent codec %d, not the clocked series", version, got.Series.Codec)
+		switch {
+		case version >= nodeapi.VersionSeriesGaps:
+			if got.Series.Codec != usage.SeriesCodecGaps || !bytes.Equal(got.Series.Data, data) {
+				t.Errorf("a wire-%d plane was sent codec %d, not the series with causes", version, got.Series.Codec)
 			}
-			continue
-		}
-		if got.Series.Codec != usage.SeriesCodec {
-			t.Fatalf("a wire-%d plane was sent codec %d, want %d", version, got.Series.Codec, usage.SeriesCodec)
-		}
-		decoded, err := usage.DecodeSeries(got.Series.Data)
-		want := []usage.Point{{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 5}}
-		if err != nil || !slices.Equal(decoded, want) {
-			t.Errorf("a wire-%d plane was sent %v (%v), want the same points without the clock", version,
-				decoded, err)
+		case version >= nodeapi.VersionSeriesClock:
+			tl, err := usage.TimelineOf(got.Series.Codec, got.Series.Data)
+			want := slices.Clone(points)
+			want[1].Gap = usage.GapUnspecified
+			if got.Series.Codec != usage.SeriesCodecClocked || err != nil || !tl.First.Equal(start) ||
+				!slices.Equal(tl.Points, want) {
+				t.Errorf("a wire-%d plane was sent codec %d (%v): %+v, want the same points and clock, marked "+
+					"without causes", version, got.Series.Codec, err, tl)
+			}
+		default:
+			if got.Series.Codec != usage.SeriesCodec {
+				t.Fatalf("a wire-%d plane was sent codec %d, want %d", version, got.Series.Codec, usage.SeriesCodec)
+			}
+			decoded, err := usage.DecodeSeries(got.Series.Data)
+			want := slices.Clone(points)
+			want[1].Gap = usage.GapNone
+			if err != nil || !slices.Equal(decoded, want) {
+				t.Errorf("a wire-%d plane was sent %v (%v), want the same points without the clock", version,
+					decoded, err)
+			}
 		}
 	}
-	if clocked.Codec != usage.SeriesCodecClocked || !bytes.Equal(clocked.Data, data) {
+	if caused.Codec != usage.SeriesCodecGaps || !bytes.Equal(caused.Data, data) {
 		t.Error("the downgrade changed the caller's series")
 	}
 }

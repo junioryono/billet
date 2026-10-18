@@ -689,6 +689,22 @@ func TestTheMigrationFixturesAreTheCommandsOwn(t *testing.T) {
 
 			return f.migrate(t, f.rendering(endpointB), "--dry-run")
 		},
+		"reported-unit-cannot-hold": func(t *testing.T, f *endpointFixture) endpointOut {
+			t.Helper()
+			f.rBinary(t)
+			f.legacyRuntimeDirectory(t)
+			mustOK(t, os.Remove(f.recordPath))
+
+			return f.migrate(t, f.rendering(endpointA), "--dry-run")
+		},
+		"refused-repair-required": func(t *testing.T, f *endpointFixture) endpointOut {
+			t.Helper()
+			f.rBinary(t)
+			f.legacyRuntimeDirectory(t)
+			mustOK(t, os.Remove(f.recordPath))
+
+			return f.migrate(t, f.rendering(endpointA))
+		},
 		"unknown-record-pre-r": func(t *testing.T, f *endpointFixture) endpointOut {
 			t.Helper()
 			f.preRBinary(t)

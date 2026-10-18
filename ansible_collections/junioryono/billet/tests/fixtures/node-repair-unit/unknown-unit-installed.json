@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "unproved",
+  "why": "the repaired unit is installed and the node's start was not proved: start billet-node.service: /var/lib/billet-fixture/bin/systemctl start -- billet-node.service: exit status 1: ",
+  "next": "inspect billet-node.service, then converge again",
+  "state": "unit-installed"
+}

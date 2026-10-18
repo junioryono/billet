@@ -14,7 +14,7 @@ import (
 // renamed there fails here rather than reading as zero on the host.
 func TestTheRecordsAreReadAsJobsShowWritesThem(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"measured", "partial", "no-report", "measured-window"} {
+	for _, name := range []string{"measured", "partial", "no-report", "measured-window", "gapped-window"} {
 		body, err := os.ReadFile(filepath.Join("testdata", "jobs-show", name+".json"))
 		if err != nil {
 			t.Fatal(err)
@@ -82,6 +82,25 @@ func TestTheRecordsAreReadAsJobsShowWritesThem(t *testing.T) {
 		w.Outer.Usage.DiskWriteBytes == nil || *w.Outer.Usage.DiskWriteBytes != 2_151_000_000 ||
 		w.Outer.From != "2026-10-09T10:00:29.4Z" {
 		t.Errorf("bounds = %+v", w)
+	}
+
+	if w := windowed.Window; w == nil || w.Gaps == nil || len(w.Gaps) != 0 {
+		t.Errorf("a window covered whole did not list its gaps as none: %+v", w)
+	}
+
+	// A WINDOW SHORT BY A GAP NAMES IT, so the verdict can (#495).
+	gapped, err := loadRecord(dir, "gapped-window")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := gapped.Window; w == nil || w.Usage == nil || w.Usage.CoveredMillis != 59_002 || len(w.Gaps) != 1 ||
+		w.Gaps[0] != (windowGap{From: "2026-10-09T10:01:05.293Z", To: "2026-10-09T10:01:07.291Z", Millis: 1998,
+			Cause: "failed_read"}) {
+		t.Errorf("the gapped window = %+v", w)
+	}
+	if said := gapsSaid(gapped.Window); said != "; the sampler did not see 2026-10-09T10:01:05.293Z to "+
+		"2026-10-09T10:01:07.291Z (1998 ms, failed_read)" {
+		t.Errorf("the gap is said as %q", said)
 	}
 
 	none, err := loadRecord(dir, "no-report")

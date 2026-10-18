@@ -7,11 +7,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/retirement"
 )
 
@@ -233,10 +235,11 @@ func TestRetirementNodeConfigAdmitsPackagedServiceDirectories(t *testing.T) {
 	}
 	server, err := retireOperationInspector().UnitProperties(t.Context(), serverUnit, "StateDirectory", "RuntimeDirectory")
 	mustOK(t, err)
-	node, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "StateDirectory", "RuntimeDirectory")
+	node, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "StateDirectory", "RuntimeDirectory", "ReadWritePaths")
 	mustOK(t, err)
 	if firstProp(server, "StateDirectory") != "billet/server" || firstProp(server, "RuntimeDirectory") != "" ||
-		firstProp(node, "StateDirectory") != "billet/node" || firstProp(node, "RuntimeDirectory") != "billet/locks billet/registration" {
+		firstProp(node, "StateDirectory") != "billet/node" || firstProp(node, "RuntimeDirectory") != "billet/registration" ||
+		!slices.Contains(strings.Fields(firstProp(node, "ReadWritePaths")), deploy.NodeLockDir) {
 		t.Fatal("control lost the shipped directory declarations")
 	}
 	// The archive stays in the fixture; its old location models the packaged

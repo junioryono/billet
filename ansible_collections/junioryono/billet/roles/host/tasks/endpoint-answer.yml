@@ -85,8 +85,10 @@
         ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or (billet_endpoint_a.node_removed | default('x') is sameas true) or (billet_endpoint_a.node_removed | default('x') is sameas false) }}"
       - name: config
         ok: "{{ billet_endpoint_outcome != 'reported' or billet_endpoint_a.config | default('') in ['present', 'absent'] }}"
+      # `unit-cannot-hold` is the dry run's alone: the action refuses that
+      # node rather than answering unchanged over it.
       - name: record
-        ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or billet_endpoint_a.record | default('') in ['current', 'none', 'absent-pre-r', 'unread'] }}"
+        ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or billet_endpoint_a.record | default('') in ['current', 'none', 'absent-pre-r', 'unread'] or (billet_endpoint_outcome == 'reported' and billet_endpoint_a.record | default('') == 'unit-cannot-hold') }}"
       - name: to
         ok: "{{ billet_endpoint_outcome != 'reported' or ((billet_endpoint_a.to | default('x')) is string and (billet_endpoint_a.to | default('')) | length > 0) or ((billet_endpoint_a.to | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true)) }}"
       - name: effective

@@ -579,9 +579,9 @@ func startUnits(ctx context.Context, env cli.Env, c converger, req lifeops.UpReq
 			// printing "ready" for both would tell a Mac operator something
 			// nothing checked.
 			// UNDER THE UNIT'S OWN START BOUND: the start runs under the
-			// caller's context and the unit's TimeoutStartSec is what
-			// systemd gives it, so that plus a margin is the deadline.
-			startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+			// caller's context and what systemd gives it, with the server's
+			// extension, plus a margin is the deadline.
+			startCtx, cancelStart := context.WithTimeout(ctx, unitStartDeadline(unit.Name))
 			proof, err := c.StartAndProve(startCtx, unit.Name)
 			cancelStart()
 
@@ -756,6 +756,24 @@ func orDefaultDetail(unit lifeops.UnitPlan) string {
 // beyond the unit's own bound, so systemd's own timeout is what ends a slow
 // operation and the deadline here catches only a manager that never answered.
 const lifecycleDeadlineMargin = 30 * time.Second
+
+// unitStartDeadline is how long billet waits for a start of unit before it
+// presumes the service manager silent: the unit's own start bound and the
+// margin, and for the server the start extension it asks for before opening
+// the ledger (NotifyExtendStart), which systemd grants on top of the time the
+// start had already taken, up to the unit's whole bound. Giving up sooner
+// would call a slow, healthy start a failed one while systemd still waits. A
+// server that asks for no extension (a PostgreSQL ledger) is ended by systemd at
+// the unit's own bound, so the longer wait never outlives it.
+func unitStartDeadline(unit string) time.Duration {
+	deadline := deploy.UnitStartTimeout + lifecycleDeadlineMargin
+
+	if unit == deploy.ServerUnitName {
+		deadline += state.StartupBound() + deploy.UnitStartTimeout
+	}
+
+	return deadline
+}
 
 func liveFor(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), rollbackGrace)
