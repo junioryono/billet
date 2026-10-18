@@ -15,32 +15,25 @@ import (
 	"github.com/junioryono/billet/internal/durablefile"
 )
 
-// learnedHalfLife is how fast a resumed rate returns toward its ceiling with
-// the time the shaper was down: a restart of seconds keeps what was learned,
-// one of an hour keeps half of the cut, and one of a day keeps nothing.
-//
-// A RATE WAS LEARNED FROM THE LINE AS IT WAS. A shaper that runs does not let
-// it rise without the line proving it can carry more, so while it runs it never
-// decays; the longer one was down, the less its last word says about the line
-// now, and the ceiling is what a run with nothing learned starts at.
-const learnedHalfLife = time.Hour
-
-// learned is the rates a run of the shaper last set, kept under the unit's
-// StateDirectory: a restart of the unit, which every upgrade causes, finds it,
-// and so does the next boot, the decay counting the time the host was down.
-// Before it, every restart started each direction at the ceiling again, and a
-// gateway that drops rather than queues went unprotected until the line was
-// cut back down (#493). Boot is the kernel's boot ID when they were set, which
-// says whether the interface's index is still comparable; Addr is its hardware
-// address, which a boot does not renumber.
+// learned is the rates a run of the shaper last set and the lines it found,
+// kept under the unit's StateDirectory: a restart of the unit, which every
+// upgrade causes, finds it, and so does the next boot. Before it, every restart
+// started each direction at the ceiling again, and a gateway that drops rather
+// than queues went unprotected until the line was cut back down (#493). Boot is
+// the kernel's boot ID when they were set, which says whether the interface's
+// index is still comparable; Addr is its hardware address, which a boot does not
+// renumber. At is when they were set, said in the log; how long ago changes
+// nothing, since a line that has changed since is found again as any is.
+// Format is learnedFormat in every record this shaper writes.
 type learned struct {
-	Iface string      `json:"interface"`
-	Index string      `json:"index,omitempty"`
-	Addr  string      `json:"address,omitempty"`
-	Boot  string      `json:"boot,omitempty"`
-	Up    learnedRate `json:"up"`
-	Down  learnedRate `json:"down"`
-	At    time.Time   `json:"at"`
+	Format int         `json:"format"`
+	Iface  string      `json:"interface"`
+	Index  string      `json:"index,omitempty"`
+	Addr   string      `json:"address,omitempty"`
+	Boot   string      `json:"boot,omitempty"`
+	Up     learnedRate `json:"up"`
+	Down   learnedRate `json:"down"`
+	At     time.Time   `json:"at"`
 }
 
 // nic is the interface a run shapes, as a record is matched against it: its
@@ -55,10 +48,21 @@ func thisNIC(iface string) nic {
 	return nic{iface: iface, index: ifindex(iface), addr: ifaddr(iface), boot: bootID()}
 }
 
-// learnedRate is one direction's rate and the ceiling it was learned under.
+// learnedFormat is the record's format: the rates CAKE was given and each
+// direction's Limit. A record without it was written by the shaper before the
+// Limit, which started each run at its ceiling, the interface's speed unless one
+// was set, recorded that before it had measured anything, and returned a rate
+// toward it for every hour it was down: its rates say nothing of the line, and
+// resumed they would install CAKE holding nothing back, under which a line that
+// queues from the first round gives each reflector its queue as the baseline.
+const learnedFormat = 1
+
+// learnedRate is one direction's rate, the ceiling it was learned under, and its
+// Limit, zero when no cut had found the line.
 type learnedRate struct {
-	Max  float64 `json:"max_mbit"`
-	Rate float64 `json:"rate_mbit"`
+	Max   float64 `json:"max_mbit"`
+	Rate  float64 `json:"rate_mbit"`
+	Limit float64 `json:"limit_mbit,omitempty"`
 }
 
 // LearnedFile is where the rates are kept: under the unit's StateDirectory,
@@ -72,11 +76,6 @@ var LearnedFile = defaultLearnedFile
 const defaultLearnedFile = "/var/lib/billet-uplink/learned"
 
 func learnedFile() string { return LearnedFile }
-
-// legacyLearnedFile is where a shaper before the rates moved kept them, beside
-// the interface record, read once when the new file is absent so the upgrade
-// that moves them does not start the line at the ceiling.
-func legacyLearnedFile() string { return filepath.Join(filepath.Dir(StateFile), "learned") }
 
 // bootIDFile is the kernel's identity for this boot, which changes at every
 // boot and at no other time.
@@ -122,18 +121,12 @@ func writeLearned(l learned) error {
 }
 
 // readLearned reads the rates: absent is false and no error, and anything it
-// cannot read or decode is an error, which the caller answers by starting at
-// the ceiling, as a run with nothing learned does. Only an absent file falls
-// back to the legacy one; one that cannot be read is an answer of its own.
+// cannot read or decode is an error, which the caller answers by starting as a
+// run with nothing learned does.
 func readLearned() (learned, bool, error) {
 	path := learnedFile()
 
 	body, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		path = legacyLearnedFile()
-		body, err = os.ReadFile(path)
-	}
-
 	if errors.Is(err, os.ErrNotExist) {
 		return learned{}, false, nil
 	}
@@ -151,8 +144,7 @@ func readLearned() (learned, bool, error) {
 }
 
 // resumes reports whether the rates were learned on this interface, and when
-// not, why: a record of another interface describes another line, and one from
-// a clock ahead of this one cannot say how long the shaper was down.
+// not, why: a record of another interface describes another line.
 //
 // THE INDEX IS COMPARED ONLY WITHIN ONE BOOT. Within it, an index that changed
 // under the same name is another device, and a rename keeps the index; but a
@@ -161,7 +153,7 @@ func readLearned() (learned, bool, error) {
 // while the host was off does not share. A boot ID unknown on either side
 // leaves the index compared and the name too, since then nothing says the
 // index is of this boot.
-func (l learned) resumes(at nic, now time.Time) (bool, string) {
+func (l learned) resumes(at nic) (bool, string) {
 	known := l.Boot != "" && at.boot != ""
 	rebooted := known && l.Boot != at.boot
 
@@ -179,36 +171,39 @@ func (l learned) resumes(at nic, now time.Time) (bool, string) {
 	case (l.Index == "" || at.index == "") && l.Addr != "" && at.addr != "" && l.Addr != at.addr:
 		return false, fmt.Sprintf("they were learned on the device with address %s, not %s's %s",
 			l.Addr, at.iface, at.addr)
-	case l.At.IsZero() || l.At.After(now):
-		return false, "they carry no time this clock has reached"
 	}
 
 	return true, ""
 }
 
-// resume is the rate a direction starts at after the shaper was down for down,
-// under ceiling: what was learned, returning toward the ceiling with
-// learnedHalfLife, and never above the ceiling or below the floor. A rate at
-// the ceiling it was learned under is nothing learned, so a raised ceiling
-// starts at itself.
-func (r learnedRate) resume(ceiling float64, down time.Duration) float64 {
-	if !(r.Rate > 0) || !(r.Max > 0) || math.IsInf(r.Rate, 0) || r.Rate >= r.Max {
-		return ceiling
+// resume starts d where r left it: the rate as it was, under the ceiling now in
+// force and over the floor, and the Limit as it was. Anything that is not a
+// positive, finite number is nothing learned and leaves d as it was.
+//
+// NO HIGHER THAN NEAR OF THE LINE FOUND: a run stopped while it probed past the
+// line recorded a rate over it, and resumed there it would overrun the line
+// from its first round until the loss showed; from Near the rate creeps back as
+// any rate near its line does.
+func (r learnedRate) resume(d *Direction, near float64) {
+	if usable(r.Rate) {
+		d.Rate = clamp(r.Rate, d.Max)
 	}
 
-	return clamp(ceiling-(ceiling-r.Rate)*math.Exp2(-down.Hours()/learnedHalfLife.Hours()), ceiling)
+	if usable(r.Limit) {
+		d.Limit = r.Limit
+		d.Rate = clamp(min(d.Rate, near*r.Limit), d.Max)
+	}
 }
 
+func usable(mbit float64) bool { return mbit > 0 && !math.IsInf(mbit, 0) }
+
 // resumeLearned starts ctl's directions at what an earlier run learned on this
-// interface, and says so; a record it cannot use leaves them at their ceilings,
-// and says why. A record from a clock ahead of this one, as on a host booted
-// before its clock is set, is refused and the run starts at the ceilings; the
-// first record this run writes replaces it, because holding it would hold back
-// every later one with it.
-func resumeLearned(log *slog.Logger, ctl *Controller, at nic, now time.Time) {
+// interface, and says so; a record it cannot use leaves them as a run with
+// nothing learned starts, and says why.
+func resumeLearned(log *slog.Logger, ctl *Controller, at nic) {
 	l, found, err := readLearned()
 	if err != nil {
-		log.Warn("starting each direction at its ceiling: the rates an earlier run learned could not be read",
+		log.Warn("starting as a run with nothing learned does: the rates an earlier run learned could not be read",
 			"error", err)
 
 		return
@@ -218,19 +213,25 @@ func resumeLearned(log *slog.Logger, ctl *Controller, at nic, now time.Time) {
 		return
 	}
 
-	if ok, why := l.resumes(at, now); !ok {
-		log.Info("starting each direction at its ceiling rather than at the rates an earlier run learned: "+why,
-			"interface", at.iface)
+	if l.Format != learnedFormat {
+		log.Info("starting as a run with nothing learned does: the rates an earlier run recorded are in a "+
+			"format this shaper does not resume", "format", l.Format, "want", learnedFormat)
 
 		return
 	}
 
-	down := now.Sub(l.At)
-	ctl.Up.Rate = l.Up.resume(ctl.Up.Max, down)
-	ctl.Down.Rate = l.Down.resume(ctl.Down.Max, down)
+	if ok, why := l.resumes(at); !ok {
+		log.Info("starting as a run with nothing learned does rather than at the rates an earlier run learned: "+
+			why, "interface", at.iface)
 
-	log.Info("resuming the rates an earlier run learned, returned toward the ceiling for the time it was down",
+		return
+	}
+
+	l.Up.resume(&ctl.Up, ctl.Params.Near)
+	l.Down.resume(&ctl.Down, ctl.Params.Near)
+
+	log.Info("resuming the rates an earlier run learned, and where it found the line full",
 		"up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),
-		"learned_up_mbit", round(l.Up.Rate), "learned_down_mbit", round(l.Down.Rate),
-		"down_for", down.Round(time.Second))
+		"up_limit_mbit", round(ctl.Up.Limit), "down_limit_mbit", round(ctl.Down.Limit),
+		"learned_at", l.At.UTC().Format(time.RFC3339))
 }

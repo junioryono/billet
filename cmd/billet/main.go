@@ -245,7 +245,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	}
 
 	// AFTER THE PROBE, which runs beside the service that holds the port.
-	served, err := app.ServeMetrics(ctx, "node", cfg.Node.Metrics, n.UsageMetrics())
+	served, err := app.ServeMetrics(ctx, "node", cfg.Node.Metrics, n.UsageMetrics(), n.KernelMappingMetrics())
 	if err != nil {
 		return err
 	}

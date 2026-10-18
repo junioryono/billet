@@ -23,8 +23,8 @@ const Tick = 500 * time.Millisecond
 // in one tick. Over two seconds the lumps average out.
 const rateWindow = 2 * time.Second
 
-// fallbackSpeed is the starting rate for an interface whose speed the kernel
-// does not report, in Mbit/s: high enough to hold nothing back on any line.
+// fallbackSpeed is the ceiling for an interface whose speed the kernel does
+// not report, in Mbit/s: high enough to hold nothing back on any line.
 const fallbackSpeed = 10000
 
 // Options are what Run shapes and how.
@@ -33,11 +33,8 @@ type Options struct {
 	Iface      string
 	Reflectors []string
 	// MaxUp and MaxDown are the most each direction is ever let through, in
-	// Mbit/s; zero is the interface's speed. Learning the line from latency
-	// alone left a gateway that drops before it queues unprotected: from
-	// 02:05 to 05:15 UTC on 2026-10-14 the reference node cut nothing while it
-	// sent up to 888 Mbit/s and a laptop behind the same gateway lost its
-	// connections (shared-uplink record).
+	// Mbit/s; zero is the interface's speed. Optional: the shaper finds the
+	// line without them (the package comment).
 	MaxUp, MaxDown float64
 	// Gateway is the first hop asked each round beside the reflectors; empty
 	// asks the default route's, unless NoGateway. A host beside the reference
@@ -48,8 +45,8 @@ type Options struct {
 	Log       *slog.Logger
 }
 
-// Ceiling is the rate a direction starts at and never exceeds: the configured
-// maximum when there is one below the interface's speed, else that speed.
+// Ceiling is the rate a direction never exceeds: the configured maximum when
+// there is one below the interface's speed, else that speed.
 func Ceiling(speed, configured float64) float64 {
 	if configured > 0 && configured < speed {
 		return configured
@@ -58,11 +55,17 @@ func Ceiling(speed, configured float64) float64 {
 	return speed
 }
 
-// newRunController is the controller a run starts with, each direction at its
-// ceiling.
+// newRunController is the controller a run starts with, each direction at
+// Start under its ceiling, as one with nothing learned starts.
 func newRunController(speed float64, opts Options) *Controller {
-	return &Controller{Params: opts.Params, Up: NewDirection(Ceiling(speed, opts.MaxUp)),
+	c := &Controller{Params: opts.Params, Up: NewDirection(Ceiling(speed, opts.MaxUp)),
 		Down: NewDirection(Ceiling(speed, opts.MaxDown))}
+
+	for _, d := range []*Direction{&c.Up, &c.Down} {
+		d.Rate = clamp(opts.Params.Start, d.Max)
+	}
+
+	return c
 }
 
 // Run shapes the uplink until ctx ends, and removes the shaping as it returns.
@@ -129,9 +132,9 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	// WHAT AN EARLIER RUN LEARNED, BEFORE ANYTHING IS INSTALLED, so the line is
-	// held where it was from the first packet rather than relearned from the
-	// ceiling after every restart.
-	resumeLearned(opts.Log, ctl, at, time.Now())
+	// held where it was from the first packet rather than relearned after every
+	// restart.
+	resumeLearned(opts.Log, ctl, at)
 
 	if err := shaper.Install(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
 		return fmt.Errorf("install CAKE on %s: %w", iface, err)
@@ -140,11 +143,13 @@ func Run(ctx context.Context, opts Options) error {
 	remember := rememberer(opts.Log, ctl, at)
 	remember(ctl.Up.Rate, ctl.Down.Rate)
 
-	opts.Log.Info("shaping the uplink; each direction starts at its ceiling, or at the rate an earlier run "+
-		"learned, and is cut only when its own traffic raises the latency to the reflectors or the gateway, "+
-		"or makes the line drop the reflectors' probes",
+	opts.Log.Info("shaping the uplink; each direction starts at the rate an earlier run learned, or low with "+
+		"nothing learned, climbs while the line stays clear, slowly near where the line was last found full, "+
+		"and is cut when its own traffic raises the latency to the reflectors or the gateway, or makes the "+
+		"line drop the reflectors' probes",
 		"interface", iface, "interface_mbit", speed, "up_ceiling_mbit", ctl.Up.Max,
 		"down_ceiling_mbit", ctl.Down.Max, "up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),
+		"up_limit_mbit", round(ctl.Up.Limit), "down_limit_mbit", round(ctl.Down.Limit),
 		"reflectors", pinger.Reflectors(), "gateway", gatewayLabel(pinger.Gateway()), "bloat", opts.Params.Bloat)
 
 	// THE DEFAULT ROUTE'S GATEWAY IS FOLLOWED, one the operator named is not: a
@@ -253,14 +258,15 @@ func rememberer(log *slog.Logger, ctl *Controller, at nic) func(upMbit, downMbit
 			addr = now
 		}
 
-		err := writeLearned(learned{Iface: at.iface, Index: at.index, Addr: addr, Boot: at.boot,
+		err := writeLearned(learned{Format: learnedFormat, Iface: at.iface, Index: at.index, Addr: addr,
+			Boot: at.boot,
 			At:   time.Now(),
-			Up:   learnedRate{Max: ctl.Up.Max, Rate: upMbit},
-			Down: learnedRate{Max: ctl.Down.Max, Rate: downMbit}})
+			Up:   learnedRate{Max: ctl.Up.Max, Rate: upMbit, Limit: ctl.Up.Limit},
+			Down: learnedRate{Max: ctl.Down.Max, Rate: downMbit, Limit: ctl.Down.Limit}})
 		if err != nil && !told {
 			told = true
-			log.Warn("could not record the rates for the next run to resume; it will start at the ceiling",
-				"error", err)
+			log.Warn("could not record the rates for the next run to resume; it will start as one with nothing "+
+				"learned does", "error", err)
 		}
 	}
 }
@@ -309,11 +315,9 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 	st.remember = remember
 
 	// AND THE RATES IN FORCE ARE RECORDED AGAIN EVERY MINUTE AND AS THE LOOP
-	// ENDS, though they have not changed: the next run returns them toward the
-	// ceiling for the time since they were recorded, which must be the time the
-	// shaper was down, not the time since the line was last cut. A rate held for
-	// hours resumed after an upgrade's restart would otherwise come back near the
-	// ceiling. What CAKE was given (applied), never a rise too small to apply.
+	// ENDS, though they have not changed, with each direction's Limit as it is
+	// then, so a crash or a reboot loses at most a minute of what was found.
+	// What CAKE was given (applied), never a rise too small to apply.
 	defer st.record()
 
 	exe := currentExecutable()

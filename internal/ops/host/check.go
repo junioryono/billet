@@ -414,6 +414,8 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			if err := checkCephCluster(ctx, env, cfg.Node.Ceph); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
+
+			reportKernelMappings(ctx, env, cfg)
 		}
 
 		// AFTER THE STORAGE, because the storage belongs to the SITE and this belongs

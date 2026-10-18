@@ -23,26 +23,42 @@ func TestTheCeilingIsTheConfiguredMaximumBelowTheInterface(t *testing.T) {
 	}
 }
 
-// A RUN STARTS EACH DIRECTION AT ITS OWN CEILING, which is the rate CAKE is
-// installed with before the first measurement.
-func TestARunStartsEachDirectionAtItsCeiling(t *testing.T) {
+// A RUN WITH NOTHING LEARNED STARTS EACH DIRECTION LOW, at Start under its own
+// ceiling, which is the rate CAKE is installed with before the first
+// measurement: never at the interface's speed, which on 2026-10-14 let a node
+// send 888 Mbit/s into a 500 Mbit/s line before anything was measured.
+func TestARunStartsEachDirectionLowUnderItsCeiling(t *testing.T) {
 	t.Parallel()
 
-	c := newRunController(1000, Options{MaxUp: 400, MaxDown: 300, Params: DefaultParams()})
+	p := DefaultParams()
 
-	if c.Up.Rate != 400 || c.Up.Max != 400 || c.Down.Rate != 300 || c.Down.Max != 300 {
-		t.Fatalf("up starts at %.0f (max %.0f) and down at %.0f (max %.0f); want 400 and 300",
-			c.Up.Rate, c.Up.Max, c.Down.Rate, c.Down.Max)
+	c := newRunController(1000, Options{MaxUp: 400, MaxDown: 300, Params: p})
+	if c.Up.Rate != p.Start || c.Up.Max != 400 || c.Down.Rate != p.Start || c.Down.Max != 300 {
+		t.Fatalf("up starts at %.0f (max %.0f) and down at %.0f (max %.0f); want %.0f under 400 and 300",
+			c.Up.Rate, c.Up.Max, c.Down.Rate, c.Down.Max, p.Start)
 	}
 
-	if c.Params != DefaultParams() {
-		t.Fatal("the run's controller does not carry the options' parameters")
+	if c.Params != p || c.Up.Limit != 0 || c.Down.Limit != 0 {
+		t.Fatal("the run's controller does not carry the options' parameters, or starts with a line found")
 	}
 
-	c = newRunController(1000, Options{Params: DefaultParams()})
-	if c.Up.Rate != 1000 || c.Down.Rate != 1000 {
-		t.Fatalf("with no ceiling a run starts at %.0f up and %.0f down; want the interface's 1000",
-			c.Up.Rate, c.Down.Rate)
+	c = newRunController(1000, Options{Params: p})
+	if c.Up.Rate != p.Start || c.Down.Rate != p.Start || c.Up.Max != 1000 {
+		t.Fatalf("with no ceiling a run starts at %.0f up and %.0f down under %.0f; want %.0f under the "+
+			"interface's 1000", c.Up.Rate, c.Down.Rate, c.Up.Max, p.Start)
+	}
+
+	// A CEILING BELOW START IS THE START, and the floor holds under both: an
+	// interface that reports 5 Mbit/s starts at the floor.
+	c = newRunController(1000, Options{MaxUp: 15, Params: p})
+	if c.Up.Rate != 15 {
+		t.Fatalf("under a 15 Mbit/s ceiling the upload starts at %.1f", c.Up.Rate)
+	}
+
+	c = newRunController(5, Options{Params: p})
+	if c.Up.Rate != Floor || c.Down.Rate != Floor {
+		t.Fatalf("on a 5 Mbit/s interface the run starts at %.1f/%.1f, want the %.0f floor", c.Up.Rate,
+			c.Down.Rate, Floor)
 	}
 }
 

@@ -65,8 +65,10 @@ func uplinkShapeOptions(env cli.Env, args []string) (uplink.Options, error) {
 	iface := fs.String("interface", "", "the interface to shape; empty shapes the one the default route leaves by")
 	reflectors := fs.String("reflectors", strings.Join(uplink.DefaultReflectors, ","),
 		"IPv4 addresses whose round trip measures the line's queue, comma-separated")
-	maxUp := fs.Float64("max-up", 0, "the most this host sends, in Mbit/s; 0 is the interface's speed")
-	maxDown := fs.Float64("max-down", 0, "the most this host receives, in Mbit/s; 0 is the interface's speed")
+	maxUp := fs.Float64("max-up", 0, "the most this host ever sends, in Mbit/s; 0, the default, is the "+
+		"interface's speed, and the shaper finds the line under it without one")
+	maxDown := fs.Float64("max-down", 0, "the most this host ever receives, in Mbit/s; 0, the default, is the "+
+		"interface's speed, and the shaper finds the line under it without one")
 	gateway := fs.String("gateway", "", "the first hop to ask beside the reflectors, an IPv4 address, or none; "+
 		"empty asks the default route's gateway")
 	if err := cli.Parse(fs, args); err != nil {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
@@ -211,8 +212,14 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return err
 	}
 
+	// ONE ANSWER FOR THE WHOLE STOP: the node loop asks when its stop begins and
+	// the cache's stop asks after, and the two must agree on what kind of stop
+	// this is, or a request arriving between them has the cache wait a drain's
+	// bound out of a handover's leases.
+	drainRequested := latchedDrainRequest(host.DrainRequested)
+
 	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, n.deployment, n.client,
-		nodeCacheStopGrace(handOver))
+		nodeCacheSweepWaitFor(handOver, drainRequested), nodeCacheStopGrace(handOver))
 	if err != nil {
 		return err
 	}
@@ -306,7 +313,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		// THE GUEST CACHE ANSWERS ONCE THIS PROCESS IS REGISTERED AND RECOVERED;
 		// until then its connections wait in the listener's queue.
 		Ready:          serveCache,
-		DrainRequested: host.DrainRequested,
+		DrainRequested: drainRequested,
 		// The second signal, reaching the wait that honours it.
 		Hurry: host.Hurry,
 		// OVERLAPPING LAUNCHES ONLY WHERE THE PROVIDER WAS BUILT FOR THEM: Firecracker
@@ -318,6 +325,25 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		// Mac.
 		RegistrationRecordPath: host.RegistrationRecordPath,
 	})
+}
+
+// latchedDrainRequest answers what read answers the first time it is asked, and
+// that answer after. Nil stays nil, which the loop reads as never.
+func latchedDrainRequest(read func() bool) func() bool {
+	if read == nil {
+		return nil
+	}
+
+	var (
+		once   sync.Once
+		answer bool
+	)
+
+	return func() bool {
+		once.Do(func() { answer = read() })
+
+		return answer
+	}
 }
 
 // ClaimNodeDeployment reads this host's identity and takes the host-wide lock on
