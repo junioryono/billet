@@ -93,6 +93,14 @@ func TestAWindowThatIsNotTheLoadsIsUnmeasured(t *testing.T) {
 	partial := loadWindowOf(2048 * mib)
 	partial.Usage.Complete, partial.Usage.CoveredMillis = false, 15_000
 
+	// A WINDOW SHORT BY A GAP SAYS WHERE AND WHY (#495), as run 15's idle job's
+	// would have.
+	gapped := loadWindowOf(2048 * mib)
+	gapped.Usage.Complete, gapped.Usage.CoveredMillis = false, 19_000
+	gapped.Gaps = []windowGap{{From: "2026-10-13T15:57:05Z", To: "2026-10-13T15:57:07Z", Millis: 2000,
+		Cause: "failed_read"}}
+	gapped.GapsMore = 2
+
 	none := &recordWindow{From: "2026-10-13T15:57:00Z", To: "2026-10-13T15:57:21Z",
 		Unavailable: "no usage report was recorded"}
 
@@ -145,8 +153,11 @@ func TestAWindowThatIsNotTheLoadsIsUnmeasured(t *testing.T) {
 		win  *recordWindow
 		want string
 	}{
-		"another window":      {other, "collect it again"},
-		"partial":             {partial, "covers 15000 ms of the 21000 ms"},
+		"another window": {other, "collect it again"},
+		"partial":        {partial, "covers 15000 ms of the 21000 ms"},
+		"gapped": {gapped, "covers 19000 ms of the 21000 ms load window, so what it shows is not the load's " +
+			"whole; the sampler did not see 2026-10-13T15:57:05Z to 2026-10-13T15:57:07Z (2000 ms, failed_read), " +
+			"and 2 more"},
 		"unavailable":         {none, "no usage report was recorded"},
 		"undecided":           {undecided, "cannot decide"},
 		"uncounted":           {uncounted, "carries no disk_write_bytes"},

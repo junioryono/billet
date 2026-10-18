@@ -1,13 +1,11 @@
 package fleetops
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/usage"
 )
 
@@ -48,13 +46,16 @@ func parseWindow(s string) (window, error) {
 // Inner and Outer are what the series knows for certain, the whole sample
 // intervals inside the window and the whole ones overlapping it, so the true
 // figure lies between them; either is null when no such span of samples
-// exists.
+// exists. Gaps are the intervals inside the window the series did not see,
+// cut to it, which is what keeps Usage's covered_ms short of its span_ms.
 type windowJSON struct {
 	From        string           `json:"from"`
 	To          string           `json:"to"`
 	Usage       *windowUsageJSON `json:"usage"`
 	Inner       *windowSpanJSON  `json:"inner"`
 	Outer       *windowSpanJSON  `json:"outer"`
+	Gaps        []gapJSON        `json:"gaps"`
+	GapsMore    int              `json:"gaps_more"`
 	Unavailable string           `json:"unavailable,omitempty"`
 }
 
@@ -82,14 +83,11 @@ type windowUsageJSON struct {
 	MemoryPeakBytes int64 `json:"memory_peak_bytes"`
 }
 
-// windowJSONOf reads the lease's series from the ledger and integrates it over
-// w. It asks GitHub nothing.
-func windowJSONOf(ctx context.Context, a *alloc.Allocator, leaseID string, measured *alloc.RecordedUsage,
-	w window,
-) *windowJSON {
+// windowJSONOf integrates the lease's series over w, or says why it cannot
+// (why, when tl is nil). It asks GitHub nothing.
+func windowJSONOf(tl *usage.Timeline, why string, w window) *windowJSON {
 	out := &windowJSON{From: wallStamp(w.from), To: wallStamp(w.to)}
 
-	tl, why := jobTimeline(ctx, a, leaseID, measured)
 	if tl == nil {
 		out.Unavailable = why
 
@@ -98,6 +96,7 @@ func windowJSONOf(ctx context.Context, a *alloc.Allocator, leaseID string, measu
 
 	u := usageJSONOf(tl.Window(w.from, w.to))
 	out.Usage = &u
+	out.Gaps, out.GapsMore, _ = gapsJSONOf(gapsWithin(tl.Gaps(), w.from, w.to))
 
 	inner, outer := sampleSpans(*tl, w)
 	if inner != nil {
