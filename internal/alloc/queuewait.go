@@ -214,18 +214,29 @@ type AwaitingQueueTime struct {
 	// JobID is GitHub's workflow-job id, which the write presents so it can
 	// only complete the row of the job it names.
 	JobID string
+	// Cursor is where the page after this row begins.
+	Cursor QueueTimeCursor
+}
+
+// QueueTimeCursor is a position in the newest-first order of jobs awaiting a
+// queue time; the zero cursor is the newest.
+type QueueTimeCursor struct {
+	startedAt string
+	leaseID   string
 }
 
 // JobsAwaitingQueueTime reads at most limit jobs that started at or after
-// since and have no GitHub queue time, newest start first.
-func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, limit int,
+// since and have no GitHub queue time, newest start first, from after.
+func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, after QueueTimeCursor,
+	limit int,
 ) ([]AwaitingQueueTime, error) {
 	var out []AwaitingQueueTime
 
 	err := a.db.View(ctx, func(q querier) error {
 		rows, err := state.ReadQueries(q).ListJobsAwaitingQueueTime(ctx,
 			ledgerdb.ListJobsAwaitingQueueTimeParams{
-				Since: sql.NullString{String: ts(since), Valid: true}, MaxRows: int64(limit),
+				Since:         sql.NullString{String: ts(since), Valid: true},
+				BeforeStarted: after.startedAt, BeforeLease: after.leaseID, MaxRows: int64(limit),
 			})
 		if err != nil {
 			return fmt.Errorf("alloc: list jobs awaiting a queue time: %w", err)
@@ -235,7 +246,8 @@ func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, 
 		for i := range rows {
 			r := &rows[i]
 			out = append(out, AwaitingQueueTime{LeaseID: r.LeaseID, Tier: r.Tier,
-				Repository: r.Repo, RunID: r.RunID, JobID: r.GithubJobID})
+				Repository: r.Repo, RunID: r.RunID, JobID: r.GithubJobID,
+				Cursor: QueueTimeCursor{startedAt: r.StartedAt, leaseID: r.LeaseID}})
 		}
 
 		return nil

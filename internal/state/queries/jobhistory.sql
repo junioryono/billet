@@ -108,14 +108,21 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
 -- before the migration has, and a direct assignment's run_id names the job it
 -- ran. A run that is wrong finds no job on the runner, never another job's
 -- time, because the runner's name is unique.
+--
+-- PAGED FROM A CURSOR, (before_started, before_lease), the last row of the page
+-- before; an empty before_started is the newest. A reader that filters what it
+-- cannot use yet pages on rather than stopping at one page of it.
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       github_job_id
+       github_job_id, COALESCE(started_at, '') AS started_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= @since
    AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
+   AND (CAST(@before_started AS TEXT) = ''
+        OR started_at < CAST(@before_started AS TEXT)
+        OR (started_at = CAST(@before_started AS TEXT) AND lease_id < CAST(@before_lease AS TEXT)))
  ORDER BY started_at DESC, lease_id DESC
  LIMIT CAST(@max_rows AS BIGINT);
 

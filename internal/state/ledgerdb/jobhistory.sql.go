@@ -493,18 +493,23 @@ const listJobsAwaitingQueueTime = `-- name: ListJobsAwaitingQueueTime :many
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       github_job_id
+       github_job_id, COALESCE(started_at, '') AS started_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= $1
    AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
+   AND (CAST($2 AS TEXT) = ''
+        OR started_at < CAST($2 AS TEXT)
+        OR (started_at = CAST($2 AS TEXT) AND lease_id < CAST($3 AS TEXT)))
  ORDER BY started_at DESC, lease_id DESC
- LIMIT CAST($2 AS BIGINT)
+ LIMIT CAST($4 AS BIGINT)
 `
 
 type ListJobsAwaitingQueueTimeParams struct {
-	Since   sql.NullString
-	MaxRows int64
+	Since         sql.NullString
+	BeforeStarted string
+	BeforeLease   string
+	MaxRows       int64
 }
 
 type ListJobsAwaitingQueueTimeRow struct {
@@ -513,6 +518,7 @@ type ListJobsAwaitingQueueTimeRow struct {
 	Repo        string
 	RunID       int64
 	GithubJobID string
+	StartedAt   string
 }
 
 // The jobs that started since a moment and still have no GitHub queue time,
@@ -527,8 +533,17 @@ type ListJobsAwaitingQueueTimeRow struct {
 // before the migration has, and a direct assignment's run_id names the job it
 // ran. A run that is wrong finds no job on the runner, never another job's
 // time, because the runner's name is unique.
+//
+// PAGED FROM A CURSOR, (before_started, before_lease), the last row of the page
+// before; an empty before_started is the newest. A reader that filters what it
+// cannot use yet pages on rather than stopping at one page of it.
 func (q *Queries) ListJobsAwaitingQueueTime(ctx context.Context, arg ListJobsAwaitingQueueTimeParams) ([]ListJobsAwaitingQueueTimeRow, error) {
-	rows, err := q.db.QueryContext(ctx, listJobsAwaitingQueueTime, arg.Since, arg.MaxRows)
+	rows, err := q.db.QueryContext(ctx, listJobsAwaitingQueueTime,
+		arg.Since,
+		arg.BeforeStarted,
+		arg.BeforeLease,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -542,6 +557,7 @@ func (q *Queries) ListJobsAwaitingQueueTime(ctx context.Context, arg ListJobsAwa
 			&i.Repo,
 			&i.RunID,
 			&i.GithubJobID,
+			&i.StartedAt,
 		); err != nil {
 			return nil, err
 		}

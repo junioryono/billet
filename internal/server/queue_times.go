@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -38,21 +39,24 @@ const (
 	// queueTimeWindow is how far back it looks: a job older than this keeps an
 	// unknown wait rather than costing a request on every pass.
 	queueTimeWindow = 24 * time.Hour
-	// queueTimeRows bounds one pass's ledger read. It covers a day's starts
-	// several times over (the reference deployment's busiest day started under
-	// 3,000 jobs), so jobs waiting on a backoff cannot hide readable ones.
-	queueTimeRows = 20_000
-	// queueTimeRunsPerTarget is how many runs one pass reads per target. A run is
-	// a request per 25 of its jobs, and the GitHub client reads no run of more
-	// than 200, so a pass costs a target at most 24 requests of the installation's
-	// hourly budget, which the scale-set and runner-group calls share.
-	queueTimeRunsPerTarget = 3
+	// One pass reads the ledger a page of queueTimePageRows at a time, at most
+	// queueTimePages pages, and the next pass resumes where it stopped, so jobs
+	// it cannot read yet (backed off, paused, an unserved tier) never hide the
+	// ones it can.
+	queueTimePageRows = 2_000
+	queueTimePages    = 10
+	// queueTimeRunsPerInstallation is how many runs one pass reads through one
+	// App installation, whose hourly budget the scale-set, runner-group and
+	// cache-authority calls share. A run is a request per 25 of its jobs and the
+	// GitHub client reads no run of more than 200, so a pass costs an
+	// installation at most 24 requests.
+	queueTimeRunsPerInstallation = 3
 	// queueTimeRetryFirst is the wait after a run's read that left a job unfound
 	// or failed, doubled after each until queueTimeRetryMost.
 	queueTimeRetryFirst = time.Minute
 	queueTimeRetryMost  = time.Hour
-	// A target GitHub throttles waits queueTimeThrottled before its next read,
-	// and one it refuses waits queueTimeRefused.
+	// An installation GitHub throttles waits queueTimeThrottled before its next
+	// read, and one it refuses waits queueTimeRefused.
 	queueTimeThrottled = 15 * time.Minute
 	queueTimeRefused   = time.Hour
 )
@@ -71,14 +75,31 @@ type queueTimeRetry struct {
 }
 
 // queueTimeSweep is what the sweep remembers between passes: each run's
-// backoff, and each target paused by a throttle or a refusal.
+// backoff, each installation paused by a throttle or a refusal, and where in
+// the ledger the next pass begins.
 type queueTimeSweep struct {
 	retries map[queueTimeRun]queueTimeRetry
 	paused  map[string]time.Time
+	cursor  alloc.QueueTimeCursor
+	// pageRows and pages are queueTimePageRows and queueTimePages, smaller in a
+	// test.
+	pageRows, pages int
 }
 
 func newQueueTimeSweep() *queueTimeSweep {
-	return &queueTimeSweep{retries: map[queueTimeRun]queueTimeRetry{}, paused: map[string]time.Time{}}
+	return &queueTimeSweep{retries: map[queueTimeRun]queueTimeRetry{}, paused: map[string]time.Time{},
+		pageRows: queueTimePageRows, pages: queueTimePages}
+}
+
+// installationOf is what a target's REST requests are counted against: its App
+// installation, which several repository targets may share, or the target
+// itself where the configuration names none.
+func installationOf(target Target) string {
+	if target.Config.InstallationID > 0 {
+		return "installation " + strconv.FormatInt(target.Config.InstallationID, 10)
+	}
+
+	return "target " + target.Config.Name
 }
 
 // fillQueueTimes records GitHub's queue time for the jobs this deployment
@@ -100,6 +121,14 @@ func (s *Server) fillQueueTimes(ctx context.Context, targets map[string]Target) 
 	}
 }
 
+// queueTimeWork is one run a pass will read, and through what.
+type queueTimeWork struct {
+	run          queueTimeRun
+	installation string
+	reader       QueueTimes
+	jobs         []alloc.AwaitingQueueTime
+}
+
 // fillQueueTimesOnce is one pass at now.
 //
 // ONE READ OF A RUN SERVES EVERY JOB OF IT, so a run of forty jobs costs two
@@ -116,68 +145,93 @@ func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Targ
 		}
 	}
 
-	jobs, err := s.alloc.JobsAwaitingQueueTime(ctx, now.Add(-queueTimeWindow), queueTimeRows)
-	if err != nil {
-		s.log.Warn("could not list the jobs awaiting GitHub's queue time; trying again", "error", err)
+	work, ok := s.gatherQueueTimeWork(ctx, targets, sweep, now)
+	if !ok {
 		return
 	}
 
-	byRun := map[queueTimeRun][]alloc.AwaitingQueueTime{}
-	var order []queueTimeRun
-	readers := map[string]QueueTimes{}
-	for i := range jobs {
-		job := &jobs[i]
-		target := targets[job.Tier]
-		reader, ok := target.Provisioner.(QueueTimes)
-		if !ok {
-			continue
-		}
-		run := queueTimeRun{target: target.Config.Name, repository: job.Repository, run: job.RunID}
-		if retry, ok := sweep.retries[run]; ok && now.Before(retry.after) {
-			continue
-		}
-		if _, seen := byRun[run]; !seen {
-			order = append(order, run)
-		}
-		byRun[run] = append(byRun[run], *job)
-		readers[run.target] = reader
-	}
-
 	read := map[string]int{}
-	for _, run := range order {
+	for _, w := range work {
 		if ctx.Err() != nil {
 			return
 		}
-		if read[run.target] == queueTimeRunsPerTarget || now.Before(sweep.paused[run.target]) {
+		if read[w.installation] == queueTimeRunsPerInstallation || now.Before(sweep.paused[w.installation]) {
 			continue
 		}
-		read[run.target]++
-		missing, err := s.fillRunQueueTimes(ctx, readers[run.target], run, byRun[run])
+		read[w.installation]++
+		missing, err := s.fillRunQueueTimes(ctx, w.reader, w.run, w.jobs)
 		switch {
 		case errors.Is(err, ErrQueueTimesThrottled):
-			sweep.paused[run.target] = now.Add(queueTimeThrottled)
-			s.log.Warn("GitHub is rate-limiting this target's job records; reading queue times again later",
-				"target", run.target, "after", queueTimeThrottled, "error", err)
+			sweep.paused[w.installation] = now.Add(queueTimeThrottled)
+			s.log.Warn("GitHub is rate-limiting this App installation; reading queue times again later",
+				"target", w.run.target, "installation", w.installation, "after", queueTimeThrottled, "error", err)
 			continue
 		case errors.Is(err, ErrQueueTimesRefused):
-			sweep.paused[run.target] = now.Add(queueTimeRefused)
-			s.log.Warn("GitHub refused this target's App the job records, which needs the App's "+
+			sweep.paused[w.installation] = now.Add(queueTimeRefused)
+			s.log.Warn("GitHub refused this App installation the job records, which needs the App's "+
 				"`actions: read`; jobs keep an unknown queue time until it is granted",
-				"target", run.target, "after", queueTimeRefused, "error", err)
+				"target", w.run.target, "installation", w.installation, "after", queueTimeRefused, "error", err)
 			continue
 		case err != nil:
 			s.log.Warn("could not read GitHub's queue times for a run; trying again later",
-				"target", run.target, "repository", run.repository, "run", run.run, "error", err)
+				"target", w.run.target, "repository", w.run.repository, "run", w.run.run, "error", err)
 		}
 		if missing == 0 {
-			delete(sweep.retries, run)
+			delete(sweep.retries, w.run)
 			continue
 		}
-		retry := sweep.retries[run]
+		retry := sweep.retries[w.run]
 		retry.wait = min(max(2*retry.wait, queueTimeRetryFirst), queueTimeRetryMost)
 		retry.after = now.Add(retry.wait)
-		sweep.retries[run] = retry
+		sweep.retries[w.run] = retry
 	}
+}
+
+// gatherQueueTimeWork pages the jobs awaiting a queue time from the sweep's
+// cursor and groups those it may read now by run, newest first. The cursor
+// moves on to where it stopped, and back to the newest once a pass reaches
+// the oldest. False is a ledger read that failed.
+func (s *Server) gatherQueueTimeWork(ctx context.Context, targets map[string]Target, sweep *queueTimeSweep,
+	now time.Time,
+) ([]queueTimeWork, bool) {
+	index := map[queueTimeRun]int{}
+	var work []queueTimeWork
+
+	cursor := sweep.cursor
+	for range sweep.pages {
+		jobs, err := s.alloc.JobsAwaitingQueueTime(ctx, now.Add(-queueTimeWindow), cursor, sweep.pageRows)
+		if err != nil {
+			s.log.Warn("could not list the jobs awaiting GitHub's queue time; trying again", "error", err)
+			return nil, false
+		}
+		for i := range jobs {
+			job := &jobs[i]
+			target := targets[job.Tier]
+			reader, ok := target.Provisioner.(QueueTimes)
+			if !ok {
+				continue
+			}
+			run := queueTimeRun{target: target.Config.Name, repository: job.Repository, run: job.RunID}
+			if retry, ok := sweep.retries[run]; ok && now.Before(retry.after) {
+				continue
+			}
+			at, seen := index[run]
+			if !seen {
+				at = len(work)
+				index[run] = at
+				work = append(work, queueTimeWork{run: run, installation: installationOf(target), reader: reader})
+			}
+			work[at].jobs = append(work[at].jobs, *job)
+		}
+		if len(jobs) < sweep.pageRows {
+			sweep.cursor = alloc.QueueTimeCursor{}
+			return work, true
+		}
+		cursor = jobs[len(jobs)-1].Cursor
+	}
+	sweep.cursor = cursor
+
+	return work, true
 }
 
 // fillRunQueueTimes reads one run and records each job's queue time, and says

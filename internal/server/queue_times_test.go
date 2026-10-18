@@ -287,7 +287,7 @@ func TestAThrottledOrRefusedTargetPausesAndAPassReadsABoundedNumberOfRuns(t *tes
 		now := time.Now()
 
 		s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
-		want := queueTimeRunsPerTarget
+		want := queueTimeRunsPerInstallation
 		if tc.err != nil {
 			want = 1
 		}
@@ -297,7 +297,7 @@ func TestAThrottledOrRefusedTargetPausesAndAPassReadsABoundedNumberOfRuns(t *tes
 		if tc.err == nil {
 			continue
 		}
-		if got := sweep.paused["acme"]; !got.Equal(now.Add(tc.pause)) {
+		if got := sweep.paused["target acme"]; !got.Equal(now.Add(tc.pause)) {
 			t.Errorf("with %v the target is paused until %s, want %s later", tc.err, got, tc.pause)
 		}
 		s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(tc.pause-time.Second))
@@ -308,5 +308,98 @@ func TestAThrottledOrRefusedTargetPausesAndAPassReadsABoundedNumberOfRuns(t *tes
 		if got := len(reader.asked()); got != 2 {
 			t.Errorf("with %v the pass after the pause read %d runs in all, want one more", tc.err, got)
 		}
+	}
+}
+
+// TWO TARGETS OF ONE APP INSTALLATION SHARE ITS BUDGET AND ITS PAUSE, because
+// GitHub counts the installation's requests, not billet's targets.
+func TestTargetsOfOneInstallationShareItsBudgetAndItsPause(t *testing.T) {
+	t.Parallel()
+
+	shared := config.GitHubTarget{Name: "acme-api", InstallationID: 22}
+	other := config.GitHubTarget{Name: "acme-web", InstallationID: 22}
+	if a, b := installationOf(Target{Config: shared}), installationOf(Target{Config: other}); a != b {
+		t.Fatalf("two targets of installation 22 count against %q and %q", a, b)
+	}
+	if a, b := installationOf(Target{Config: config.GitHubTarget{Name: "x"}}),
+		installationOf(Target{Config: config.GitHubTarget{Name: "y"}}); a == b {
+		t.Errorf("two targets naming no installation share %q", a)
+	}
+
+	p := newRunnerlessPool(t, job11, job12, job13, dispatch.Job{RequestID: 14, RunID: 104, JobID: "job-14"})
+	var started []dispatch.Job
+	for i, request := range []int64{11, 12, 13, 14} {
+		runner, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, request)
+		if err != nil {
+			t.Fatalf("the runner launched for %d: %v", request, err)
+		}
+		started = append(started, dispatch.Job{RequestID: request, RunID: 800 + request, JobID: runner.LeaseID,
+			RunnerID: int64(90 + i), RunnerName: runner.RunnerName, Owner: "acme", Repository: "api"})
+	}
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: started,
+		Statistics: &Statistics{TotalAssignedJobs: len(started)}}); err != nil {
+		t.Fatalf("start four jobs of four runs: %v", err)
+	}
+
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, times: map[int64]map[string]time.Time{}}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	// The tier's target is one of the two; what the budget counts is the
+	// installation, which the second target would share.
+	targets := map[string]Target{p.l.tier: {Config: shared, Provisioner: reader}}
+	sweep := newQueueTimeSweep()
+	sweep.paused[installationOf(Target{Config: other})] = time.Now().Add(time.Hour)
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, time.Now())
+	if got := reader.asked(); len(got) != 0 {
+		t.Errorf("read runs %v while another target of the same installation is paused", got)
+	}
+}
+
+// THE LEDGER IS PAGED, AND A PASS THAT STOPS AT ITS LAST PAGE RESUMES THERE, so
+// jobs it cannot read yet never hide older ones it can, and once a pass reaches
+// the oldest the next begins at the newest again.
+func TestTheQueueTimeSweepPagesTheLedgerAndResumes(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11, job12, job13)
+	var started []dispatch.Job
+	for i, request := range []int64{11, 12, 13} {
+		runner, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, request)
+		if err != nil {
+			t.Fatalf("the runner launched for %d: %v", request, err)
+		}
+		started = append(started, dispatch.Job{RequestID: request, RunID: 900 + request, JobID: runner.LeaseID,
+			RunnerID: int64(95 + i), RunnerName: runner.RunnerName, Owner: "acme", Repository: "api"})
+	}
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: started,
+		Statistics: &Statistics{TotalAssignedJobs: len(started)}}); err != nil {
+		t.Fatalf("start three jobs of three runs: %v", err)
+	}
+
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, times: map[int64]map[string]time.Time{}}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+	sweep := newQueueTimeSweep()
+	sweep.pageRows, sweep.pages = 1, 2
+	now := time.Now()
+
+	// Two pages of one: two of the three runs, and the cursor stops there.
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
+	if got := reader.asked(); len(got) != 2 || sweep.cursor == (alloc.QueueTimeCursor{}) {
+		t.Fatalf("the first pass read runs %v and left cursor %+v; want two runs and a cursor", got,
+			sweep.cursor)
+	}
+	// Inside both runs' backoff, so only the page past the cursor is new work:
+	// the third run, the oldest, after which the next pass starts at the newest.
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(time.Second))
+	got := reader.asked()
+	seen := map[int64]bool{}
+	for _, run := range got {
+		seen[run] = true
+	}
+	if len(got) != 3 || !seen[911] || !seen[912] || !seen[913] {
+		t.Errorf("two passes read runs %v, want 911, 912 and 913 once each", got)
+	}
+	if sweep.cursor != (alloc.QueueTimeCursor{}) {
+		t.Error("a pass that reached the oldest job left the cursor where it stopped")
 	}
 }
