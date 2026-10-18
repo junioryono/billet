@@ -46,6 +46,8 @@ type stepper struct {
 	// told is whether that has been logged.
 	blind time.Time
 	told  bool
+	// report is what the rounds since the last report saw (report.go).
+	report lineReport
 }
 
 func newStepper(log *slog.Logger, prober Prober, ctl *Controller, read func() (Counters, error),
@@ -65,6 +67,7 @@ func newStepper(log *slog.Logger, prober Prober, ctl *Controller, read func() (C
 		history: []reading{{at: start, counters: first}},
 		applied: [2]float64{ctl.Up.Rate, ctl.Down.Rate},
 		blind:   start,
+		report:  lineReport{from: start},
 	}, nil
 }
 
@@ -108,6 +111,18 @@ func (s *stepper) tick(ctx context.Context) error {
 
 	s.notice(sample, at)
 
+	// EVERY ROUND IS REPORTED, whatever it goes on to change, and the report
+	// is logged after it, so a round that cut is in the report that says so.
+	seconds := interval.Seconds()
+	s.report.observe(s.ctl.Params, sample, gateway,
+		[2]float64{float64(sent) / seconds / 1e6, float64(received) / seconds / 1e6})
+
+	defer func() {
+		if s.report.due(at) {
+			s.report.log(ctx, s.log, at, s.applied, s.ctl, s.prober.Gateway() != "")
+		}
+	}()
+
 	ctl := s.ctl
 	if !ctl.Step(Observation{At: at, Interval: interval, SentBits: sent, ReceivedBits: received,
 		Sample: sample, Gateway: gateway}) {
@@ -143,6 +158,7 @@ func (s *stepper) tick(ctx context.Context) error {
 		}
 
 		s.log.LogAttrs(ctx, slog.LevelInfo, cutMessage(ctl.Cause), attrs...)
+		s.report.cuts++
 	}
 
 	s.applied = [2]float64{ctl.Up.Rate, ctl.Down.Rate}
