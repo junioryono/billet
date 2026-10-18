@@ -410,6 +410,8 @@ func openDir(
 	db.revalidate.Store(lock == nil)
 	db.standby.Store(mode.standby)
 
+	started := time.Now()
+
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
 
@@ -439,12 +441,36 @@ func openDir(
 	// the emergency one. A control plane opens the ledger once and is about to
 	// make scheduling decisions against it; a command is neither, and an
 	// inspection is not even that.
+	//
+	// THE SCAN HAS A BOUND OF ITS OWN, integrityScanBudget, because a cold read
+	// of a large ledger outlasts the startup budget on a healthy disk, and the
+	// startup budget is PAUSED for it rather than restarted: what the scan took
+	// is not charged to the rest of startup, and what came before it still is,
+	// so the whole open stays inside the scan's bound plus one startup budget. A
+	// backend that does not scan resumes with exactly what it had.
 	if !admin && !mode.inspect {
 		noteOpenSideEffect("integrity")
 
-		if err := db.backend.integrityCheck(startupCtx, db.w); err != nil {
+		spent := time.Since(started)
+
+		scanCtx, cancelScan := context.WithTimeout(ctx, integrityScanBudget)
+		err := db.backend.integrityCheck(scanCtx, db.w)
+		// NAMED ONLY WHEN IT WAS THE SCAN'S OWN BOUND that ended it, not the
+		// caller's deadline or cancellation.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err = fmt.Errorf("the whole-file read did not finish within its %s bound: %w",
+				integrityScanBudget, err)
+		}
+		cancelScan()
+
+		if err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
+
+		var cancelRest context.CancelFunc
+
+		startupCtx, cancelRest = context.WithTimeout(ctx, startupTimeout-spent)
+		defer cancelRest()
 	}
 
 	// MIGRATING IS AUTHORISED BY THE CONTROLLER EXCLUSION, AND THE DIRECTORY LOCK
@@ -606,12 +632,17 @@ func openDir(
 	return db, nil
 }
 
-// startupTimeout bounds the pragma verification, integrity check and migrations,
-// and a migration run at promotion takes the same bound for itself (see
-// migrate). Generous, because a first run creates the database and an integrity
-// check scans it; anything slower than this is a sick disk, not a slow one — or,
-// on PostgreSQL, another session holding a lock the migration is waiting for.
-var startupTimeout = 30 * time.Second
+// startupTimeout bounds an open's pragma verification and migrations together,
+// paused for the integrity scan (which has its own bound, integrityScanBudget),
+// and a migration run at promotion takes the same bound for itself (see migrate).
+// Generous, because a first run creates the database; anything slower than this
+// is a sick disk, not a slow one — or, on PostgreSQL, another session holding a
+// lock the migration is waiting for.
+var startupTimeout = defaultStartupTimeout
+
+// defaultStartupTimeout is startupTimeout's production value, named so a test
+// that shortens the variable can still check the bound a real start has.
+const defaultStartupTimeout = 30 * time.Second
 
 // PingContext proves the database is reachable AND configured as promised.
 //

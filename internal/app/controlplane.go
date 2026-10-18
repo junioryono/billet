@@ -41,6 +41,9 @@ type Host struct {
 	Ready func() error
 	// Status replaces the service manager's one-line status (STATUS=).
 	Status func(string) error
+	// ExtendStart tells the service manager the ledger open about to run may
+	// take up to the duration given (EXTEND_TIMEOUT_USEC). Nil asks nothing.
+	ExtendStart func(time.Duration) error
 	// Out is where the lines an operator reads go.
 	Out io.Writer
 }
@@ -158,6 +161,19 @@ func OpenControlPlane(
 		mode = LedgerMaintenance
 	case standby:
 		mode = LedgerStandby
+	}
+
+	// THE SERVICE MANAGER IS TOLD BEFORE A SQLITE OPEN THAT IT MAY BE LONG. The
+	// open's scan may take its whole bound on a cold cache, and the identity
+	// access before it and the authority steps after it count against the same
+	// Type=notify start bound, so the extension gives the open its bound and
+	// what follows the unit's whole start bound again. A PostgreSQL ledger is
+	// not scanned and asks for nothing. A failure to ask is said and decides
+	// nothing, because the open may well be fast.
+	if host.ExtendStart != nil && scansAtOpen(cfg) {
+		if err := host.ExtendStart(state.StartupBound()); err != nil {
+			fmt.Fprintf(host.Out, "could not ask the service manager for time to open the ledger: %v\n", err)
+		}
 	}
 
 	db, err := OpenLedger(ctx, cfg, mode)
@@ -649,6 +665,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// scansAtOpen reports whether opening this config's ledger reads the whole
+// file first: a SQLite ledger does, and a PostgreSQL one is not scanned.
+func scansAtOpen(cfg *config.Config) bool {
+	return cfg.Server.LedgerBackend() != config.StatePostgres
 }
 
 // closeIfOpen closes a handle an open may or may not have produced.
