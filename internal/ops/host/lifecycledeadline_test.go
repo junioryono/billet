@@ -116,16 +116,16 @@ func TestTheTransactionStartsUnderTheStartBoundAndStopsTheNodeUnbounded(t *testi
 	// observed before the failure. The gate before the start and the proof
 	// after the stop read the state through the same seam.
 	dir := t.TempDir()
-	state := filepath.Join(dir, "state")
+	unitState := filepath.Join(dir, "state")
 	systemctl := filepath.Join(dir, "systemctl")
 	writeFile(t, systemctl, `#!/bin/sh
 case "$1" in
-show) cat "`+state+`" ;;
-stop) printf 'ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n' >"`+state+`" ;;
+show) cat "`+unitState+`" ;;
+stop) printf 'ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n' >"`+unitState+`" ;;
 *) exit 1 ;;
 esac
 `, 0o755)
-	writeFile(t, state, "ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n", 0o644)
+	writeFile(t, unitState, "ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n", 0o644)
 
 	prev := newHostInspector
 	newHostInspector = func() *lifeops.Inspector {
@@ -151,7 +151,7 @@ esac
 
 	deadlineWithin(t, "the transaction's node start", seen["start "+nodeUnit], deploy.UnitStartTimeout)
 
-	writeFile(t, state, "ActiveState=active\nSubState=running\nResult=success\nMainPID=5\nJob=\n"+
+	writeFile(t, unitState, "ActiveState=active\nSubState=running\nResult=success\nMainPID=5\nJob=\n"+
 		"InvocationID=inv-1\n", 0o644)
 
 	if err := h.StopNode(t.Context()); err != nil {
