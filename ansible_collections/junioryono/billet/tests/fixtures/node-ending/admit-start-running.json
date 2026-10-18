@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "command": "admit-start",
+  "outcome": "proved",
+  "proof": "running",
+  "why": "the node is running, so a start starts nothing",
+  "unit": {
+    "active_state": "active",
+    "sub_state": "running",
+    "result": "success",
+    "main_pid": "41",
+    "job": "",
+    "invocation_id": "inv-1"
+  }
+}

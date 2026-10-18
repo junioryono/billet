@@ -170,6 +170,51 @@ else
     bad "the stop order is not node-then-server (node@$node_line server@$srv_line)"
 fi
 
+# A DOWN'S NODE STOP IS PROVED BY THE NODE'S OWN ENDING (#127): the record the
+# node keeps says the process the down stopped drained.
+"$BILLET" node ending show --config "$CFG" --json | grep -q '"ending": "drained"' &&
+    ok "the down's node stop is recorded drained" ||
+    bad "the node's ending record does not say the down's stop drained"
+
+say "a node killed at its stop is not started over until acknowledged"
+"$BILLET" local up --config "$CFG" 2>&1 | tail -4
+[ "${PIPESTATUS[0]}" -eq 0 ] && ok "local up started the node over a drained ending" ||
+    bad "local up did not start the node over a drained ending"
+
+invocation=$(systemctl show -p InvocationID --value billet-node.service)
+echo "node invocation: ${invocation:-<none>}"
+
+# KILLED, AND KEPT DOWN: SIGKILL ends the process without its ending, and the
+# stop that follows cancels the restart Restart=on-failure would queue.
+systemctl kill --kill-whom=main --signal=SIGKILL billet-node.service
+systemctl stop billet-node.service
+st=$(active billet-node.service)
+[ "$st" != active ] && ok "the killed node is down ($st)" || bad "the killed node is still active"
+
+up_out=$("$BILLET" local up --config "$CFG" 2>&1)
+up_status=$?
+echo "$up_out" | tail -6
+[ "$up_status" -ne 0 ] && [ "$(active billet-node.service)" != active ] &&
+    ok "local up refused to start the node over the killed process (exit $up_status)" ||
+    bad "local up started the node over a process killed without its ending"
+echo "$up_out" | grep -qF "acknowledge --invocation ${invocation}" &&
+    ok "the refusal names the acknowledgement" ||
+    bad "the refusal does not name acknowledge --invocation ${invocation}"
+
+"$BILLET" node ending acknowledge --config "$CFG" --invocation "$invocation" --json >/dev/null &&
+    ok "the killed stop was acknowledged" || bad "the acknowledgement was refused"
+
+"$BILLET" local up --config "$CFG" 2>&1 | tail -4
+[ "${PIPESTATUS[0]}" -eq 0 ] && [ "$(active billet-node.service)" = active ] &&
+    ok "local up started the node over the acknowledged stop" ||
+    bad "local up did not start the node over the acknowledged stop"
+
+down_out=$("$BILLET" local down --timeout 12m 2>&1)
+down_status=$?
+echo "$down_out" | tail -6
+[ "$down_status" -eq 0 ] && ok "local down drained and stopped the node again" ||
+    bad "local down did not succeed after the acknowledged start (exit $down_status)"
+
 say "result"
 if [ "$fail" -eq 0 ]; then
     echo "ALL ASSERTIONS PASSED"

@@ -5,7 +5,9 @@
     mode: "0600"
     content: >-
       {{ {'before': billet_gate_restart_case.before, 'before_rc': billet_gate_restart_case.before_rc | default(0),
-          'after': billet_gate_restart_case.after, 'restarted': false, 'polls': 0, 'calls': []} | to_json }}
+          'stopping': billet_gate_restart_case.stopping | default([{'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0'}]),
+          'after': billet_gate_restart_case.after, 'ending': billet_gate_restart_case.ending | default({}),
+          'stopped': false, 'started': false, 'polls': 0, 'stop_polls': 0, 'calls': []} | to_json }}
 
 - name: Forget the preceding case's outcome
   ansible.builtin.set_fact:
@@ -24,13 +26,23 @@
       vars:
         billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
         billet_node_restart_poll_interval: "{{ billet_gate_restart_case.interval | default(1) }}"
+        # The scripted billet needs no root, and this check has none to give.
+        billet_ending_become: false
+        # THE EXECUTABLE THAT ANSWERS, or none: a host whose answerer is from
+        # before the record, where systemd's account is the floor.
+        billet_exclusion_answerer: >-
+          {{ (billet_gate_restart_root.path ~ '/billet') if billet_gate_restart_case.ending is defined else '' }}
   rescue:
     - name: Record the refusal
       ansible.builtin.set_fact:
         billet_gate_restart_failed: true
-        billet_gate_restart_failure: "{{ ansible_failed_result.msg | default('') }}"
+        # A looped assert's message is its failed item's, not the task's.
+        billet_gate_restart_failure: >-
+          {{ ansible_failed_result.msg | default('') }}
+          {{ ansible_failed_result.results | default([]) | selectattr('failed', 'defined') | selectattr('failed')
+             | map(attribute='msg') | join(' ') }}
 
-- name: Read what the scripted systemctl was asked
+- name: Read what the scripted systemctl and billet were asked
   ansible.builtin.slurp:
     src: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
   register: billet_gate_restart_state_raw
@@ -38,22 +50,29 @@
 - name: Judge {{ billet_gate_restart_case.name }}
   vars:
     billet_gate_restart_state: "{{ billet_gate_restart_state_raw.content | b64decode | from_json }}"
-    billet_gate_restart_requests: "{{ billet_gate_restart_state.calls | select('contains', 'restart') | list }}"
+    billet_gate_restart_jobs: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^systemctl (stop|start|restart)') | list }}"
+    billet_gate_restart_endings: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^billet ') | list }}"
+    billet_gate_restart_want_jobs: >-
+      {{ (['systemctl stop --no-block billet-node.service'] * (billet_gate_restart_case.stops | default(1)))
+         + (['systemctl start --no-block billet-node.service'] * (billet_gate_restart_case.starts | default(1))) }}
   ansible.builtin.assert:
     that:
       - billet_gate_restart_failed == (not billet_gate_restart_case.succeeds)
-      # EXACTLY ONE RESTART, AND ONLY THE ONE THAT DOES NOT WAIT.
-      - >-
-        billet_gate_restart_requests ==
-        ([['restart', '--no-block', 'billet-node.service']] * (billet_gate_restart_case.restarts | default(1)))
+      # A STOP, THEN A START, EACH ONE THAT DOES NOT WAIT, AND NEVER A RESTART.
+      - billet_gate_restart_jobs == billet_gate_restart_want_jobs
+      - billet_gate_restart_case.endings is not defined or billet_gate_restart_endings == billet_gate_restart_case.endings
       - billet_gate_restart_case.calls is not defined or billet_gate_restart_state.calls | length == billet_gate_restart_case.calls
       - >-
         billet_gate_restart_case.polls is not defined or
         (billet_gate_restart_case.polls[0] <= billet_gate_restart_state.polls <= billet_gate_restart_case.polls[1])
+      - >-
+        billet_gate_restart_case.stop_polls is not defined or
+        (billet_gate_restart_case.stop_polls[0] <= billet_gate_restart_state.stop_polls <= billet_gate_restart_case.stop_polls[1])
       - billet_gate_restart_case.message | default([]) | reject('in', billet_gate_restart_failure) | list | length == 0
       - billet_gate_restart_case.absent | default([]) | select('in', billet_gate_restart_failure) | list | length == 0
       - "'unreachable' not in billet_gate_restart_failure | lower"
     fail_msg: >-
       {{ billet_gate_restart_case.name }}: failed={{ billet_gate_restart_failed }}
-      message={{ billet_gate_restart_failure }} calls={{ billet_gate_restart_state.calls }}
-      polls={{ billet_gate_restart_state.polls }}
+      message={{ billet_gate_restart_failure }} jobs={{ billet_gate_restart_jobs }}
+      endings={{ billet_gate_restart_endings }} polls={{ billet_gate_restart_state.polls }}
+      stop_polls={{ billet_gate_restart_state.stop_polls }}

@@ -145,7 +145,7 @@ func nodeUnitBody(active, sub string, pid int, invocation, killMode, result stri
 		strconv.Itoa(pid) + "\nInvocationID=" + invocation + "\nKillMode=" + killMode + "\nResult=" + result +
 		"\nStateChangeTimestamp=Tue 2026-09-09 12:00:00 UTC\nNeedDaemonReload=no\nExecMainStartTimestamp=\n" +
 		"NRestarts=0\nExecMainStartTimestampMonotonic=" + strconv.Itoa(pid*1000) + "\nEnvironmentFiles=\nEnvironment=\n" +
-		"RuntimeDirectory=billet/locks billet/registration\n"
+		"Job=\nRuntimeDirectory=billet/locks billet/registration\n"
 }
 
 // legacyRuntimeDirectory makes the node unit declare what a unit rendered
@@ -794,9 +794,10 @@ func TestMigrateStopsStartsAndWaitsForTheRecordUnderTheNewInvocation(t *testing.
 	}
 
 	// THE TRACE: the first observation, the bracket, the stop, StopAndProve's
-	// own observation, the command's post-stop observation, the start,
-	// StartAndProve's samples, the new invocation, the bracket around the
-	// record, the closing observation. Verbs in order.
+	// own observation, the command's post-stop observation, the ending
+	// judgement's own observation (#127), the start, StartAndProve's samples,
+	// the new invocation, the bracket around the record, the closing
+	// observation. Verbs in order.
 	var verbs []string
 
 	for _, c := range f.systemctlCalls(t) {
@@ -804,7 +805,7 @@ func TestMigrateStopsStartsAndWaitsForTheRecordUnderTheNewInvocation(t *testing.
 	}
 
 	joined := strings.Join(verbs, " ")
-	if !strings.Contains(joined, "show stop show show start show") || strings.Count(joined, "stop") != 1 ||
+	if !strings.Contains(joined, "show stop show show show start show") || strings.Count(joined, "stop") != 1 ||
 		strings.Count(joined, "start") != 1 {
 		t.Errorf("the trace: %s", joined)
 	}

@@ -73,7 +73,16 @@ An acknowledgement takes the node's own deployment lock, so it refuses while a n
 
 **A record that cannot be read** (corrupt, from a newer release, or writable by another user) is never overwritten, and every judgement reads it as could-not-tell. Once what the host runs is known, `sudo billet node ending acknowledge --config /etc/billet/billet.yaml --reset-unreadable --json` keeps it beside itself (`endings.json.unreadable-<time>`, a hard link) and replaces it in one rename with a new record that holds only the acknowledgement, so the host never has no record at all; a directory at that name cannot be linked, so it is moved aside after a marker (`endings.resetting`) is written, and a missing record with the marker present reads as could-not-tell until the reset is run again.
 
-These checks are Linux's. The record is written on a Mac too, but a launch agent's stop is not judged by it yet. The Ansible role's own node restarts read the same record once the collection adopts it.
+**Every other stop billet performs is proved the same way.**
+- `billet node migrate-endpoint`, `billet node repair-unit` and a controller retirement's restart of a retained node prove their stop by the stopped invocation's ending, as well as by systemd's clean triple, before they start the node again.
+- Removing the package (`apt remove`, `dnf remove`) refuses unless `billet node ending check --drain` proves the node drained, since nothing will start again to adopt what it left.
+- The Ansible role restarts the node as a polled stop, a proved ending, a gated start and a polled start.
+- The role's network change, its upgrade transaction and the transaction's recovery each require the stop to have drained before they change anything.
+- The role starts a node that is not already up only after `billet node ending admit-start`.
+
+A host whose `billet` is from before the record has no `node ending`. An older `billet node` refuses the word rather than running a node, and the role then judges systemd's clean triple itself, the stated floor.
+
+These checks are Linux's. The record is written on a Mac too, but a launch agent's stop is not judged by it yet.
 
 ## `billet local down` and `uninstall`
 

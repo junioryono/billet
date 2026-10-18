@@ -27,6 +27,9 @@ type requestFixture struct {
 	*retireFixture
 	unitsDir string
 	caPEM    string
+	// nodeState is the retained node's state directory, which holds its ending
+	// record; empty until retainANode.
+	nodeState string
 	// dsn is the ledger this fixture's host reaches, kept so a case can take
 	// it away and give it back.
 	dsn string
@@ -813,6 +816,11 @@ func (f *requestFixture) retainANode(t *testing.T) {
 
 	dir := t.TempDir()
 	nodeState := filepath.Join(dir, "node-state")
+
+	// A NODE THAT RAN KEEPS ITS STATE DIRECTORY, which holds the ending record
+	// its restart's stop is proved by (#127).
+	mustOK(t, os.MkdirAll(nodeState, 0o750))
+	f.nodeState = nodeState
 
 	// A REMOTE SERVER ADDRESS NEEDS A BUNDLE, because the control plane
 	// identifies a node by the name in its certificate; the bundle is this

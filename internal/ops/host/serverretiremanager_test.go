@@ -21,6 +21,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv(repairStandinEnv) == "1" {
 		os.Exit(runRepairStandin())
 	}
+	if mode := os.Getenv(endingStandinEnv); mode != "" {
+		os.Exit(runEndingStandin(mode))
+	}
 	if os.Getenv(repairGuardStandinEnv) == "1" && runRepairGuardStandin(os.Args[1:]) {
 		os.Exit(0)
 	}

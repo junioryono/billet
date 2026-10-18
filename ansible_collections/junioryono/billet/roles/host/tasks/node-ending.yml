@@ -1,0 +1,90 @@
+---
+# A NODE STOP IS PROVED BY THE STOPPED PROCESS'S OWN ENDING, AND A NODE STARTS
+# ONLY OVER A PROVED ONE (#127). systemd's exit is not a drain: the node exits 0
+# after a drain, a handoff, a drain a second signal cut short and a
+# supersession, and a stop killed at TimeoutStopSec leaves inactive/dead/success
+# after reset-failed (measured on systemd 255, 2026-10-17). So the role asks the
+# node's own record, through `billet node ending`, and goes on only on a proof.
+#
+# THE EXECUTABLE is the one that answers for this converge
+# (billet_exclusion_answerer). None, or a release from before the record that
+# refuses the word, can only mean a node from before the record, which kept
+# none: then systemd's account is the floor, judged here the older way and
+# said to be the weaker proof.
+#
+# Inputs: billet_ending_call ('check' or 'admit-start'); for a check,
+# billet_ending_invocation (the node's InvocationID read before its stop) and
+# billet_ending_drain (true where a drain was asked for); billet_ending_with,
+# where a caller names the executable (the transaction's candidate, the
+# committed binary) in place of this converge's answerer.
+
+- name: Name the executable that judges the node's ending
+  ansible.builtin.set_fact:
+    billet_ending_executable: "{{ billet_ending_with | default(billet_exclusion_answerer | default('', true), true) }}"
+
+- name: Ask the node's own record how its last process ended
+  ansible.builtin.command:
+    argv: >-
+      {{ ['timeout', '-k', '10', '180', billet_ending_executable, 'node', 'ending', billet_ending_call,
+          '--config', '/etc/billet/billet.yaml']
+         + ((['--invocation', billet_ending_invocation] + (['--drain'] if billet_ending_drain | default(false) | bool else []))
+            if billet_ending_call == 'check' else [])
+         + ['--json'] }}
+    expand_argument_vars: false
+  register: billet_ending_raw
+  # THE RECORD IS ROOT'S (0600), so the question is asked as root.
+  become: "{{ billet_ending_become | default(true) | bool }}"
+  changed_when: false
+  failed_when: false
+  when: billet_ending_executable | length > 0
+
+- name: Judge the node ending's answer
+  ansible.builtin.include_tasks: ending-answer.yml
+  vars:
+    billet_ending_answered_by: "{{ billet_ending_executable }}"
+  when: billet_ending_executable | length > 0
+
+# THE FLOOR, for a node from before the record: systemd's own account, read
+# now, with no process and no job, and for a stop the clean triple. An older
+# updater's check, which a handoff or a cut-short drain also passes.
+- name: Read systemd's account of a node from before the record
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=ActiveState, --property=SubState, --property=Result, --property=MainPID,
+           --property=Job, billet-node.service]
+  register: billet_ending_floor
+  changed_when: false
+  failed_when: false
+  when: billet_ending_executable | length == 0 or billet_ending_older | default(false) | bool
+
+- name: Prove a stop of a node from before the record by systemd's account
+  ansible.builtin.assert:
+    that:
+      - billet_ending_floor.rc | default(1) == 0
+      - "'ActiveState=inactive' in billet_ending_floor.stdout_lines"
+      - "'SubState=dead' in billet_ending_floor.stdout_lines"
+      - "'Result=success' in billet_ending_floor.stdout_lines"
+      - "'MainPID=0' in billet_ending_floor.stdout_lines"
+      - "'Job=' in billet_ending_floor.stdout_lines"
+    fail_msg: >-
+      billet-node.service runs a release from before the node's ending record,
+      so only systemd's account can speak for its
+      {{ 'stop' if billet_ending_call == 'check' else 'last stop' }}, and it reports
+      {{ billet_ending_floor.stdout_lines | default([]) | join(' ') }}, not inactive,
+      dead, success with no process and no job. The node is left as it is; read
+      `journalctl -u billet-node` for why, and converge again once it is.
+  when: billet_ending_executable | length == 0 or billet_ending_older | default(false) | bool
+
+- name: Refuse a node whose ending its record does not prove
+  ansible.builtin.assert:
+    that: billet_ending_answer.outcome == 'proved'
+    fail_msg: >-
+      {{ 'billet-node.service stopped, but its stop' if billet_ending_call == 'check' else 'billet-node.service is not started: its last stop' }}
+      is {{ billet_ending_answer.outcome }} by the node's own ending:
+      {{ billet_ending_answer.why }}.
+      {{ ('Once what it left is known, `billet node ending acknowledge --config /etc/billet/billet.yaml '
+          ~ billet_ending_answer.acknowledge ~ ' --json` permits a start, and nothing that needs a drain.')
+         if billet_ending_answer.acknowledge is defined else '' }}
+      The node is left as it is.
+  when:
+    - billet_ending_executable | length > 0
+    - not billet_ending_older | bool

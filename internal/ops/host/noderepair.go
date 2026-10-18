@@ -499,7 +499,7 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 			"wait for the stop to complete, then converge again", stateNothing)
 	}
 
-	stopped, r := proveNodeStopped(ctx, insp)
+	stopped, r := proveNodeStopped(ctx, insp, installed.cfg.Node, br.obs.InvocationID)
 	if r != nil {
 		return nil, r
 	}

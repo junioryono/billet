@@ -355,11 +355,43 @@
         not billet_node_should_run or
         (billet_candidate_config_compare.rc | default(2)) != 0
 
+    # THE INVOCATION BESIDE THE MAIN PROCESS, read before the stop because a
+    # clean stop clears it: the stop is proved by that invocation's ending.
+    - name: Record the billet node's invocation before the transaction's stop
+      ansible.builtin.command:
+        argv: [systemctl, show, --property=MainPID, --property=InvocationID, billet-node.service]
+      register: billet_transaction_node_before
+      changed_when: false
+      failed_when: >-
+        billet_transaction_node_before.rc != 0 or
+        billet_transaction_node_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
+        billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1
+      when: billet_service_state_before_upgrade.results[1].rc != 4
+
     - name: Gracefully stop the billet node before changing its guest contract
       ansible.builtin.systemd_service:
         name: billet-node.service
         state: stopped
       when: billet_service_state_before_upgrade.results[1].rc != 4
+
+    # A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN (#127). Judged by the staged
+    # candidate, which knows the node's ending whatever release the stopped node
+    # ran, against the installed configuration the stopped node wrote under; a
+    # drain is required where this transaction asked for one. An unproved stop
+    # fails the transaction before anything is installed, and the rollback
+    # starts nothing over it.
+    - name: Prove the transaction's node stop by the node's own ending
+      ansible.builtin.include_tasks: node-ending.yml
+      vars:
+        billet_ending_call: check
+        billet_ending_with: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+        billet_ending_invocation: >-
+          {{ (billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
+        billet_ending_drain: >-
+          {{ not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0 }}
+      when:
+        - billet_service_state_before_upgrade.results[1].rc != 4
+        - "'MainPID=0' not in billet_transaction_node_before.stdout_lines"
 
     # THE UPLINK SHAPER IS A BILLET PROCESS TOO, and the transaction waits for
     # every one to end before it hides the executable. Stopped here, while its
@@ -924,6 +956,29 @@
   become: true
   notify: billet unit files changed
 
+# A NODE STARTS ONLY OVER A PROVED ENDING (#127): one not already up is
+# admitted by its last process's ending, an acknowledgement or a reboot before
+# it is started. One already up starts nothing, and is not asked.
+- name: Inspect whether the billet node is up before its start
+  ansible.builtin.command:
+    argv: [systemctl, is-active, billet-node.service]
+  register: billet_node_before_start
+  changed_when: false
+  failed_when: billet_node_before_start.rc not in [0, 3, 4]
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+  become: true
+
+- name: Admit the billet node's start over its last ending
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: admit-start
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+    - billet_node_before_start.stdout | default('') not in ['active', 'activating', 'reloading']
+
 - name: Enable and start the billet node
   ansible.builtin.systemd_service:
     name: billet-node.service
@@ -979,6 +1034,21 @@
     - not ansible_check_mode
     - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
 
+- name: Record the invocation of a node that may not run here before its stop
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=MainPID, --property=InvocationID, billet-node.service]
+  register: billet_node_unwanted_before
+  changed_when: false
+  failed_when: >-
+    billet_node_unwanted_before.rc != 0 or
+    billet_node_unwanted_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
+    billet_node_unwanted_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+    - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
+  become: true
+
 - name: Stop and disable the billet node unless it may run here
   ansible.builtin.systemd_service:
     name: billet-node.service
@@ -989,6 +1059,21 @@
     - not ansible_check_mode
   become: true
   notify: billet unit files changed
+
+# A NODE THAT LEAVES MUST HAVE DRAINED (#127): nothing will start again to
+# adopt what it left, and systemd's account of its stop says nothing of that.
+- name: Prove the stop of a node that may not run here drained
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: check
+    billet_ending_invocation: >-
+      {{ (billet_node_unwanted_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
+    billet_ending_drain: true
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+    - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
+    - "'MainPID=0' not in billet_node_unwanted_before.stdout_lines"
 
 # EVERY OPERATION OF THIS CONVERGE THAT ASKED FOR A DRAIN IS DONE (#374): the
 # node is started or stopped as the converge leaves it, any restart was polled to

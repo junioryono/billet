@@ -201,6 +201,20 @@
       billet_finalization_service_probes.results[0].rc | default(1) == 0
   become: true
 
+# A NODE STARTS ONLY OVER A PROVED ENDING (#127), judged by the committed
+# binary: a readiness probe still up is a start that starts no compute, and a
+# node the transaction stopped is admitted by that stop's proved ending.
+- name: Admit the committed billet node's start over its last ending
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: admit-start
+    billet_ending_with: /usr/bin/billet
+  when:
+    - billet_finalization_services[1].should_run | bool
+    - >-
+      billet_finalization_service_activity.results[1].rc != 0 or
+      billet_finalization_service_probes.results[1].rc | default(1) == 0
+
 - name: Start the committed billet node after the control plane
   ansible.builtin.systemd_service:
     name: billet-node.service

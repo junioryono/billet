@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "command": "check",
+  "outcome": "proved",
+  "proof": "systemd",
+  "why": "invocation inv-old kept no ending record (a node from before the record), and systemd reports inactive/dead/success: the floor, which a handoff or a cut-short drain would also pass",
+  "invocation": "inv-old",
+  "unit": {
+    "active_state": "inactive",
+    "sub_state": "dead",
+    "result": "success",
+    "main_pid": "0",
+    "job": "",
+    "invocation_id": ""
+  },
+  "recorded": true
+}

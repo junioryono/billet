@@ -32,6 +32,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **cephadm.log has one rotation rule, ceph-common's.**
 - **A converge restarts services, so never drive one from a runner billet manages.**
 - **The ordinary node restart is requested, never awaited.**
+- **Every node stop the role performs is proved by the node's ending, and every node start is admitted.**
 - **The role's variables that must be supplied, never guessed.**
 - **The host role migrates a node's endpoint through billet's own commands, and infers nothing from the configurations.**
 - **The scenario tests are make targets, each one converging the role in a specific state.**

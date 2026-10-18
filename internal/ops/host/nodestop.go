@@ -3,8 +3,11 @@ package host
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/nodeending"
 )
 
 // The node stop the endpoint commands perform, shared so each proves it the
@@ -79,8 +82,32 @@ func admitNodeStop(ctx context.Context, insp *lifeops.Inspector, judged unitObse
 }
 
 // proveNodeStopped is the post-stop observation, the command's own: only
-// inactive, dead and success prove the process gone.
-func proveNodeStopped(ctx context.Context, insp *lifeops.Inspector) (migrateStopped, *endpointRefusal) {
+// inactive, dead and success prove the process gone, and only the stopped
+// invocation's own ending proves how it ended (#127): a handoff and a drain
+// pass, a node killed at the timeout or a drain cut short does not, whatever
+// systemd's triple says. No drain is required, since the command restarts the
+// node at once and the next process adopts what this one handed off.
+func proveNodeStopped(
+	ctx context.Context, insp *lifeops.Inspector, node *config.NodeConfig, invocation string,
+) (migrateStopped, *endpointRefusal) {
+	stopped, r := proveNodeStoppedTriple(ctx, insp)
+	if r != nil {
+		return stopped, r
+	}
+
+	j, _ := nodeending.JudgeStop(node.StateDir, invocation, false, node.Provider.RunsOnHost(),
+		func() nodeending.Unit { return observeNodeUnit(ctx, insp) }, nil)
+	if j.Verdict != nodeending.Proved {
+		return migrateStopped{}, endpointUnknown(endpointReasonUnproved, fmt.Sprintf("%s stopped, but its stop is "+
+			"%s by the node's own ending: %s", nodeUnit, j.Answer, j.Why), strings.TrimPrefix(acknowledgeRemedy(j),
+			". "), stateStopped)
+	}
+
+	return stopped, nil
+}
+
+// proveNodeStoppedTriple is systemd's half of the proof: the process gone.
+func proveNodeStoppedTriple(ctx context.Context, insp *lifeops.Inspector) (migrateStopped, *endpointRefusal) {
 	post, problem := observeUnit(ctx, insp, nodeUnit)
 	if problem != "" {
 		return migrateStopped{}, endpointUnknown(endpointReasonUnproved, "after the stop: "+problem, "", stateStopped)

@@ -65,6 +65,7 @@ Retiring a controller (`billet server retire`, the guard's retirement marker, th
 ### The Ansible transaction: [references/ansible-transaction.md](references/ansible-transaction.md)
 
 - **The Ansible host role is the second implementation of the transaction, and it runs inside the guard the role's preparation holds.**
+- **The transaction's node stop, its recovery's stop and finalize's start each go through the node's ending (#127).**
 - **The Ansible role gives way to the rollout.**
 
 ### Guest images

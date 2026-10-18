@@ -43,12 +43,54 @@
 - name: Make the stop before recovering the ledger a drain
   ansible.builtin.include_tasks: request-node-drain.yml
 
+# THE INVOCATION BESIDE THE MAIN PROCESS, read before the stop because a clean
+# stop clears it; a unit that is gone has none and no stop to prove.
+- name: Record the billet node's invocation before recovery stops it
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=LoadState, --property=MainPID, --property=InvocationID, billet-node.service]
+  register: billet_recovery_node_before
+  changed_when: false
+  failed_when: >-
+    billet_recovery_node_before.rc != 0 or
+    billet_recovery_node_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
+    billet_recovery_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1
+  become: true
+
+# A STOP THAT FAILED IS NOT ONE TO RECOVER OVER: the ledger is not recovered
+# under a node systemd could not stop.
 - name: Stop compute before recovering the authoritative ledger
   ansible.builtin.systemd_service:
     name: billet-node.service
     state: stopped
-  failed_when: false
+  when: "'LoadState=not-found' not in billet_recovery_node_before.stdout_lines"
   become: true
+
+- name: Find the executable that judges the recovered node's ending
+  ansible.builtin.stat:
+    path: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+    follow: false
+  register: billet_recovery_candidate
+  become: true
+
+# AND IT DRAINED (#127): recovery takes the ledger and the executable apart, and
+# a node killed at its stop timeout or cut short by a second signal leaves
+# guests no recovered node will know of. Judged by the staged candidate when
+# the transaction left one (it knows the ending whatever the stopped node ran),
+# otherwise by the previous release, which judges systemd's account the older
+# way when it predates the record. An unproved stop refuses the recovery.
+- name: Prove recovery's node stop drained by the node's own ending
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: check
+    billet_ending_with: >-
+      {{ billet_upgrade_recovery_dir ~ ('/billet.candidate' if billet_recovery_candidate.stat.isreg | default(false)
+         else '/billet.previous') }}
+    billet_ending_invocation: >-
+      {{ (billet_recovery_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
+    billet_ending_drain: true
+  when:
+    - "'LoadState=not-found' not in billet_recovery_node_before.stdout_lines"
+    - "'MainPID=0' not in billet_recovery_node_before.stdout_lines"
 
 - name: Stop the control plane before recovering its authoritative ledger
   ansible.builtin.systemd_service:

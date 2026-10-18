@@ -56,11 +56,37 @@ if [ -d /run/systemd/system ]; then
 
     for unit in billet-node billet-server; do
         if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+            # THE NODE'S INVOCATION, read before its stop because a clean stop
+            # clears it: the stop is proved by that process's own ending (#127).
+            invocation=""
+            if [ "${unit}" = billet-node ]; then
+                invocation=$(systemctl show -p InvocationID --value billet-node 2>/dev/null) || invocation=""
+            fi
+
             if ! systemctl stop "${unit}"; then
                 echo "billet: could not stop ${unit}. Refusing to remove the package" >&2
                 echo "        while it is still running: it holds leases and manages" >&2
                 echo "        containers that nothing else is tracking." >&2
                 exit 1
+            fi
+
+            # A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN. `systemctl stop`
+            # exits 0 after a stop killed at TimeoutStopSec too, and after a
+            # drain a second signal cut short; only the node's own ending says
+            # it drained. The verdict is the check's exit status, taken before
+            # anything reads its output.
+            if [ "${unit}" = billet-node ]; then
+                status=0
+                /usr/bin/billet node ending check --config /etc/billet/billet.yaml \
+                    --invocation "${invocation}" --drain --json >/dev/null 2>&1 || status=$?
+                if [ "${status}" -ne 0 ]; then
+                    echo "billet: billet-node stopped, but did not prove it drained (check exited ${status})." >&2
+                    echo "        Refusing to remove the package while it may have left guests running." >&2
+                    echo "        Run 'billet node ending check --config /etc/billet/billet.yaml" >&2
+                    echo "        --invocation ${invocation:-<unknown>} --drain --json' for why, and remove again" >&2
+                    echo "        once what it left is gone." >&2
+                    exit 1
+                fi
             fi
         fi
     done
