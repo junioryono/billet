@@ -521,8 +521,8 @@ func (s *CacheService) sessionActionsAuthority(
 		!strings.EqualFold(authority.Owner, session.cache.Owner) ||
 		!strings.EqualFold(authority.Repository, session.cache.Repository) {
 		// AN UNPROVEN ANSWER STANDS A LITTLE WHILE: a job that cannot be proved
-		// (a fork, a pull request) makes many cache calls, and each ask costs the
-		// control plane GitHub requests.
+		// (a fork's pull request, another repository's job) makes many cache calls,
+		// and each ask costs the control plane GitHub requests.
 		session.unprovenUntil = s.now().Add(actionsUnprovenFor)
 
 		return dispatch.CacheAuthority{}, false
