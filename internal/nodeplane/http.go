@@ -1576,9 +1576,10 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// COUNTERS AND DESTINATIONS ONLY FROM A WIRE THAT CARRIES THEM: a pairing
-	// that negotiated below VersionJobCounters or VersionJobDestinations has its
-	// report kept without them, as the node would have sent it.
+	// COUNTERS, DESTINATIONS AND CAUSES ONLY FROM A WIRE THAT CARRIES THEM: a
+	// pairing that negotiated below VersionJobCounters, VersionJobDestinations
+	// or VersionSeriesGaps has its report kept without them, the series whole,
+	// since the plane does not re-encode one.
 	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
 		r.Header.Get(nodeapi.HeaderIncarnation)); known {
 		if wire < nodeapi.VersionJobCounters {
@@ -1586,6 +1587,9 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 		}
 		if wire < nodeapi.VersionJobDestinations {
 			req.Usage.Destinations = nil
+		}
+		if wire < nodeapi.VersionSeriesGaps && req.Series != nil && req.Series.Codec == alloc.UsageSeriesCodecGaps {
+			req.Series = nil
 		}
 	}
 
@@ -2103,8 +2107,10 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 // DECIDED HERE, BY THE ONE FUNCTION, from the binding the ledger holds and
 // GitHub's record read fresh, and narrowed to the tier's namespace. A lease with
 // no binding yet (JobStarted not processed) or evidence that cannot be read
-// answers the unproven authority, which writes nothing: the node splices to
-// GitHub and asks again on the next call. Only a lease this node holds now is
+// answers the unproven authority, which writes nothing. THE UNBOUND ANSWER NAMES
+// NO JOB, and nodes rely on it: a node waits for a lease whose answer names none
+// to be bound before splicing its first call to GitHub, and splices at once for
+// a job the plane names and cannot prove. Only a lease this node holds now is
 // answered.
 func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 	leaseID := r.PathValue("lease")
@@ -2127,6 +2133,9 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 	if bindingErr != nil && !errors.Is(bindingErr, alloc.ErrLeaseNotFound) {
 		writeStoreErr(w, bindingErr)
 		return
+	}
+	if bindingErr == nil {
+		unproven.JobID, unproven.RunID = binding.JobID, binding.RunID
 	}
 	tier, ok := h.plane.tierFor(lease.Tier)
 	if !ok {

@@ -22,7 +22,10 @@ func markedPoints(n int, marked ...int) []Point {
 		total += 1 + (int64(i)*7919+int64(i*i))%104729
 		points[i] = Point{OffsetMillis: int64(i) * 1000, CPUUsage: total, MemoryCurrent: 1<<30 + total%4096,
 			DiskRead: total * 3, NetRx: total * 5, EnergyActive: total * 11,
-			AfterGap: slices.Contains(marked, i)}
+		}
+		if slices.Contains(marked, i) {
+			points[i].Gap = GapUnspecified
+		}
 	}
 
 	return points
@@ -58,7 +61,7 @@ func TestDownsamplingKeepsEveryGap(t *testing.T) {
 	kept := downsample(markedPoints(10, 3, 9), 4)
 	var marks []int64
 	for _, p := range kept {
-		if p.AfterGap {
+		if p.Gap != GapNone {
 			marks = append(marks, p.OffsetMillis)
 		}
 	}
@@ -80,7 +83,7 @@ func TestDownsamplingKeepsEveryGap(t *testing.T) {
 	}
 	marks = nil
 	for _, p := range tl.Points {
-		if p.AfterGap {
+		if p.Gap != GapNone {
 			marks = append(marks, p.OffsetMillis)
 		}
 	}
@@ -107,7 +110,7 @@ func TestDownsamplingKeepsEveryFall(t *testing.T) {
 	marks := func(points []Point) []int64 {
 		var out []int64
 		for _, p := range points {
-			if p.AfterGap {
+			if p.Gap != GapNone {
 				out = append(out, p.OffsetMillis)
 			}
 		}
@@ -138,7 +141,7 @@ func TestWithoutClockIsTheSameSeries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeSeriesAt: %v", err)
 	}
-	old, err := WithoutClock(data, 1<<20)
+	old, err := WithoutClock(SeriesCodecClocked, data, 1<<20)
 	if err != nil {
 		t.Fatalf("WithoutClock: %v", err)
 	}
@@ -146,7 +149,7 @@ func TestWithoutClockIsTheSameSeries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeSeries: %v", err)
 	}
-	points[4].AfterGap = false
+	points[4].Gap = GapNone
 	if !slices.Equal(got, points) {
 		t.Errorf("the old codec's points differ from the clocked series'")
 	}
@@ -161,7 +164,7 @@ func TestAHostileClockedSeriesIsRefused(t *testing.T) {
 
 	raw := func(start uint64, mark int64) []byte {
 		b := binary.AppendUvarint(nil, start)
-		b = binary.AppendUvarint(b, uint64(len(clockedColumns)))
+		b = binary.AppendUvarint(b, uint64(marked.columns()))
 		b = binary.AppendUvarint(b, 1)
 		for range SeriesColumns {
 			b = binary.AppendVarint(b, 0)
@@ -224,14 +227,14 @@ func TestTheSamplerMarksWhatItDidNotSee(t *testing.T) {
 	}
 	type mark struct {
 		offset int64
-		gap    bool
+		gap    GapCause
 	}
 	var got []mark
 	for _, p := range s.Points {
-		got = append(got, mark{p.OffsetMillis, p.AfterGap})
+		got = append(got, mark{p.OffsetMillis, p.Gap})
 	}
-	want := []mark{{0, false}, {1000, false}, {3000, true}, {4000, false}, {7000, true}, {8000, false},
-		{8000, false}}
+	want := []mark{{0, GapNone}, {1000, GapNone}, {3000, GapFailedRead}, {4000, GapNone},
+		{7000, GapMissedTick}, {8000, GapNone}, {8000, GapNone}}
 	if !slices.Equal(got, want) {
 		t.Errorf("points = %v,\nwant %v", got, want)
 	}
@@ -293,9 +296,9 @@ func TestAFailedFinalReadMarksTheLastInterval(t *testing.T) {
 	if !ok || len(s.Points) != 3 {
 		t.Fatalf("summary %v with %d points, want three", ok, len(s.Points))
 	}
-	if s.Points[1].AfterGap || !s.Points[2].AfterGap {
-		t.Errorf("marks = %v, %v; want only the final point's interval unseen", s.Points[1].AfterGap,
-			s.Points[2].AfterGap)
+	if s.Points[1].Gap != GapNone || s.Points[2].Gap != GapFailedRead {
+		t.Errorf("marks = %v, %v; want only the final point's interval unseen, for a failed read",
+			s.Points[1].Gap, s.Points[2].Gap)
 	}
 }
 
@@ -323,11 +326,11 @@ func TestAGroupReadLateLeavesNothingBeforeItSeen(t *testing.T) {
 	if !ok || !s.Measured.CPU {
 		t.Fatalf("summary %v, cpu measured %v", ok, s.Measured.CPU)
 	}
-	var marks []bool
+	var marks []GapCause
 	for _, p := range s.Points {
-		marks = append(marks, p.AfterGap)
+		marks = append(marks, p.Gap)
 	}
-	if want := []bool{false, true, true, true, false, false}; !slices.Equal(marks, want) {
+	if want := []GapCause{GapNone, GapLateFirstRead, GapLateFirstRead, GapLateFirstRead, GapNone, GapNone}; !slices.Equal(marks, want) {
 		t.Errorf("marks = %v, want every interval to the first cpu read unseen and none after: %v", marks, want)
 	}
 }
@@ -369,11 +372,11 @@ func TestAGroupFirstReadAtTheEndLeavesNothingBeforeItSeen(t *testing.T) {
 	if !ok || !s.Measured.CPU {
 		t.Fatalf("summary %v, cpu measured %v", ok, s.Measured.CPU)
 	}
-	var marks []bool
+	var marks []GapCause
 	for _, p := range s.Points {
-		marks = append(marks, p.AfterGap)
+		marks = append(marks, p.Gap)
 	}
-	if want := []bool{false, true, true}; !slices.Equal(marks, want) {
+	if want := []GapCause{GapNone, GapLateFirstRead, GapLateFirstRead}; !slices.Equal(marks, want) {
 		t.Errorf("marks = %v, want %v", marks, want)
 	}
 }
@@ -421,13 +424,13 @@ func TestAStalledReadIsNotBackdated(t *testing.T) {
 	}
 	type mark struct {
 		offset int64
-		gap    bool
+		gap    GapCause
 	}
 	var got []mark
 	for _, p := range s.Points {
-		got = append(got, mark{p.OffsetMillis, p.AfterGap})
+		got = append(got, mark{p.OffsetMillis, p.Gap})
 	}
-	if want := []mark{{0, false}, {1000, false}, {5000, true}, {6500, false}, {6500, false}}; !slices.Equal(got, want) {
+	if want := []mark{{0, GapNone}, {1000, GapNone}, {5000, GapSlowRead}, {6500, GapNone}, {6500, GapNone}}; !slices.Equal(got, want) {
 		t.Errorf("points = %v,\nwant %v", got, want)
 	}
 }
@@ -448,8 +451,12 @@ func TestTheFinalIntervalIsUnseenWhenEnergyComesFromThePackage(t *testing.T) {
 		if !ok || len(s.Points) != 3 {
 			t.Fatalf("rapl %v: summary %v with %d points", rapl, ok, len(s.Points))
 		}
-		if got := s.Points[2].AfterGap; got != rapl {
-			t.Errorf("rapl %v: the final interval unseen = %v", rapl, got)
+		want := GapNone
+		if rapl {
+			want = GapFinalEnergy
+		}
+		if got := s.Points[2].Gap; got != want {
+			t.Errorf("rapl %v: the final interval's mark = %v, want %v", rapl, got, want)
 		}
 	}
 }
@@ -515,8 +522,9 @@ func (c *queueClock) then(after ...time.Duration) {
 	}
 }
 
-// lastMark is whether the final point of a summary is marked unseen.
-func lastMark(t *testing.T, m *Monitor) bool {
+// lastMark is why the final point of a summary is marked unseen, GapNone when
+// it is not.
+func lastMark(t *testing.T, m *Monitor) GapCause {
 	t.Helper()
 
 	s, ok := m.Final("vm")
@@ -524,7 +532,7 @@ func lastMark(t *testing.T, m *Monitor) bool {
 		t.Fatalf("summary %v with %d points", ok, len(s.Points))
 	}
 
-	return s.Points[len(s.Points)-1].AfterGap
+	return s.Points[len(s.Points)-1].Gap
 }
 
 // THE START AND THE FINAL READ ARE DATED BY THEIR END, and one that takes a
@@ -539,7 +547,7 @@ func TestALifecycleReadThatStallsIsUnseen(t *testing.T) {
 	clock.then(time.Second, time.Second, time.Second)
 	m.Tick()
 	s, ok := m.Final("vm")
-	if !ok || !s.First.Equal(time.Date(2026, 10, 9, 12, 0, 2, 0, time.UTC)) || !s.Points[1].AfterGap {
+	if !ok || !s.First.Equal(time.Date(2026, 10, 9, 12, 0, 2, 0, time.UTC)) || s.Points[1].Gap != GapSlowRead {
 		t.Errorf("a stalled baseline: first %s, marks %v; want the read's end and the first interval unseen",
 			s.First, s.Points)
 	}
@@ -553,11 +561,11 @@ func TestALifecycleReadThatStallsIsUnseen(t *testing.T) {
 	// The read takes 1.2s, ending 1.7s after the last point: within the gap
 	// rule, so only the stall can mark it.
 	clock2.then(500*time.Millisecond, 1700*time.Millisecond)
-	if !lastMark(t, m2) {
-		t.Error("a final read that stalled for two intervals was not marked")
+	if got := lastMark(t, m2); got != GapSlowRead {
+		t.Errorf("a final read that stalled for two intervals was marked %v, want %v", got, GapSlowRead)
 	}
-	if !lastMark(t, m2) {
-		t.Error("the stalled final read was forgotten by the Final a failed destroy's retry asks for")
+	if got := lastMark(t, m2); got != GapSlowRead {
+		t.Errorf("the stalled final read was remembered as %v by the Final a failed destroy's retry asks for", got)
 	}
 }
 
@@ -565,11 +573,14 @@ func TestALifecycleReadThatStallsIsUnseen(t *testing.T) {
 // failed destroy's retry asks for still marks the interval, though that read
 // succeeds.
 func TestAFinalReadsEvidenceOutlivesItsSummary(t *testing.T) {
-	for name, spoil := range map[string]func(tree){
-		"a failed read": func(tr tree) { tr.remove(refCgroup + "/cpu.stat") },
-		"a counter fall": func(tr tree) {
+	for name, tc := range map[string]struct {
+		spoil func(tree)
+		cause GapCause
+	}{
+		"a failed read": {func(tr tree) { tr.remove(refCgroup + "/cpu.stat") }, GapFailedRead},
+		"a counter fall": {func(tr tree) {
 			tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 1", 1))
-		},
+		}, GapCounterFell},
 	} {
 		tr, target := referenceVM(t)
 		now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
@@ -577,15 +588,15 @@ func TestAFinalReadsEvidenceOutlivesItsSummary(t *testing.T) {
 		m.Start("vm", target, 8)
 		now = now.Add(time.Second)
 		m.Tick()
-		spoil(tr)
+		tc.spoil(tr)
 		now = now.Add(time.Second)
-		if !lastMark(t, m) {
-			t.Errorf("%s: the final interval was not marked", name)
+		if got := lastMark(t, m); got != tc.cause {
+			t.Errorf("%s: the final interval was marked %v, want %v", name, got, tc.cause)
 		}
 		tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 99999999", 1))
 		now = now.Add(time.Second)
-		if !lastMark(t, m) {
-			t.Errorf("%s: a retry's Final forgot the interval the first one could not see", name)
+		if got := lastMark(t, m); got != tc.cause {
+			t.Errorf("%s: a retry's Final remembered the interval the first one could not see as %v", name, got)
 		}
 	}
 }

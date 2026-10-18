@@ -1,0 +1,10 @@
+{
+  "epoch": 356363867,
+  "image_cache": "CacheObservationRequest.image_cache",
+  "cache_generation": "CacheObservationRequest.cache_generation",
+  "actions_cache": "CacheObservationRequest.actions_cache",
+  "sticky_cache": "CacheObservationRequest.sticky_cache",
+  "git_cache": "CacheObservationRequest.git_cache",
+  "bazel_cache": "CacheObservationRequest.bazel_cache",
+  "go_cache": "CacheObservationRequest.go_cache"
+}

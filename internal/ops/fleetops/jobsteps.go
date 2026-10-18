@@ -93,7 +93,7 @@ func jobTimeline(ctx context.Context, a *alloc.Allocator, leaseID string, measur
 	switch {
 	case errors.Is(err, usage.ErrNoClock):
 		return nil, "the series was recorded without its start on the host's clock (by a node, or for a " +
-			"control plane, older than wire 26), so no step can be placed on it"
+			"control plane, older than wire 28), so no step can be placed on it"
 	case err != nil:
 		return nil, "the usage series could not be decoded: " + strconv.Quote(err.Error())
 	}

@@ -143,6 +143,13 @@ type custody struct {
 	// since is when custody was taken, for the diagnostic that matters most: how
 	// long capacity has been held for something nobody is watching.
 	since time.Time
+
+	// measured says the entry holds an adopted job this process measures, whose
+	// usage and guest report it owes as the compute goes (#384); false once
+	// settled, and for every hold of compute whose job never ran or was already
+	// reported. ATOMIC FOR unconfirmed'S REASON: the tend settles it holding
+	// tending, and a handover and a supersession read and clear it holding mu.
+	measured atomic.Bool
 }
 
 // custodyEvidence carries the provider observations already made before an entry
@@ -161,9 +168,14 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 // adoptWithObservation records whether the caller has causal evidence that the
 // instance exists. Provider inventory supplies it everywhere; a successful
 // Launch supplies it only for a host backend whose runtime is locally consistent.
+//
+// THE JOB GOES ON BEING MEASURED, and the entry owes its usage report (#384),
+// unless it replaces an entry for the same compute that settled its report
+// already: a job is reported once, not once per adoption. It answers the new
+// entry and whether it owes one.
 func (r *Runner) adoptWithObservation(
 	lease *alloc.Lease, inst *provider.Instance, observed bool, recovery RunnerRecovery,
-) {
+) (*custody, bool) {
 	outcome := alloc.PhaseDone
 	discard := false
 	phase := alloc.PhaseCustody
@@ -201,6 +213,12 @@ func (r *Runner) adoptWithObservation(
 		}
 	}
 
+	// TENDING FIRST, then mu: a tend settling the entry this replaces holds
+	// it from its last sample to its release, and handing the report over in the
+	// middle of that left the old tend releasing the lease without reporting and
+	// the new entry with a lease that was gone.
+	r.tending.Lock()
+	defer r.tending.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -231,8 +249,19 @@ func (r *Runner) adoptWithObservation(
 	// instance gone, which is the ordinary way an adoption ends.
 	entry.unconfirmed.Store(true)
 
-	r.forgetRunningLocked(inst.Name)
+	// THE REPLACED ENTRY HANDS OVER WHAT IT OWES, and owes nothing after: a tend
+	// still holding it must not settle the report, or forget the series, that
+	// is now this entry's.
+	owes := true
+	if held, ok := r.custody[lease.ID]; ok && held.name == inst.Name {
+		owes = held.measured.Swap(false)
+	}
+	entry.measured.Store(owes)
+
+	r.dropRunningLocked(inst.Name)
 	r.custody[lease.ID] = entry
+
+	return entry, owes
 }
 
 // hold takes custody of a lease whose compute could not be confirmed gone.
@@ -575,6 +604,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			c.discard = true
 			c.outcome = alloc.PhaseFailed
 			c.unconfirmed.Store(false)
+			r.settleHeldUsage(ctx, c, heldUsage{}, false)
 			r.cleanupCache(ctx, c.name)
 
 			return r.finish(ctx, c)
@@ -721,6 +751,9 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			return fmt.Errorf("node: remove runner held for lease %s before settlement: %w",
 				c.leaseID, err)
 		}
+		// ITS USAGE IS REPORTED BEFORE THE LEASE IT IS FENCED ON IS RELEASED, and
+		// its last sample is a read of a cgroup that is gone, marked unseen.
+		r.settleHeldUsage(ctx, c, r.heldFinal(c), epochCurrent)
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
 
@@ -742,6 +775,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			return fmt.Errorf("node: remove runner held for lease %s before settlement: %w",
 				c.leaseID, err)
 		}
+		r.settleHeldUsage(ctx, c, r.heldFinal(c), epochCurrent)
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
 
@@ -759,10 +793,18 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			c.leaseID, err)
 	}
 
+	// THE LAST SAMPLE IS TAKEN BEFORE THE DESTROY, as for a running job: the
+	// cgroup and the VMM's threads it reads go with the compute.
+	last := r.heldFinal(c)
+
 	state, err := r.provider.Destroy(ctx, inst.ID)
 	if err != nil {
 		return fmt.Errorf("node: destroy %s held for lease %s: %w", c.name, c.leaseID, err)
 	}
+
+	// REPORTED WHETHER OR NOT THE TEARDOWN IS CONFIRMED, as a running job's is:
+	// the job is over either way, and the lease is held until it is released.
+	r.settleHeldUsage(ctx, c, last, epochCurrent)
 
 	// THE SAME TRAP AS THE LISTENER'S, ONE LAYER DOWN. finish releases the lease,
 	// and calling it on the strength of an unconfirmed teardown could free capacity
@@ -1064,6 +1106,15 @@ func (r *Runner) custodySnapshot() []*custody {
 func (r *Runner) Superseded() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// A SUPERSEDED PROCESS REPORTS NO USAGE: the plane answers it as another
+	// process now, so an adopted job it measures is let go unreported, as the
+	// running ones below are.
+	for _, c := range r.custody {
+		if c.measured.CompareAndSwap(true, false) {
+			r.forgetMonitoring(c.name)
+		}
+	}
 
 	for requestID, inst := range r.running {
 		lease, ok := r.runningLease[requestID]

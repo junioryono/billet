@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/junioryono/billet/internal/provider/tart"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
+	jobusage "github.com/junioryono/billet/internal/usage"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -45,6 +47,9 @@ type Node struct {
 	client     *nodeclient.Client
 	provider   provider.Provider
 	upgrader   node.ExecUpgrader
+	// sampled is what the job sampler reports to, set by UsageMetrics' source
+	// when the node serves metrics and nil, which reports nowhere, when not.
+	sampled jobusage.Observer
 }
 
 // OpenNode loads the certificate this node presents, claims the deployment
@@ -175,6 +180,10 @@ func (n *Node) Deployment() string { return n.deployment }
 // Close releases the host-wide deployment lock.
 func (n *Node) Close() error { return n.lock.Release() }
 
+// THE LOOP FINDS THE RUNNER'S HANDOVER BY ASSERTION, so a signature that
+// drifted would compile and keep nothing for the next process (#384).
+var _ nodeclient.HandingOver = (*node.Runner)(nil)
+
 // NodeHost is what the node takes from this process and machine.
 type NodeHost struct {
 	// Ready tells the service manager this process is serving.
@@ -219,7 +228,8 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
 	// the runner needs no idea it is remote: the interfaces it already took are
 	// the seam the network went through.
-	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody)}
+	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody),
+		node.WithUsageCheckpoints(filepath.Join(cfg.Node.StateDir, usageCheckpointDir))}
 	if cacheService != nil {
 		runnerOpts = append(runnerOpts, node.WithCacheService(cacheService))
 	}
@@ -240,7 +250,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// running and being measured until this command returns.
 	monitorCtx, stopMonitor := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopMonitor()
-	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p)
+	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p, n.sampled)
 	if err != nil {
 		return err
 	}

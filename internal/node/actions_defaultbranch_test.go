@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/dispatch"
@@ -77,6 +78,19 @@ func defaultBranchActions(
 	return service, service.byToken[credentials.Token]
 }
 
+// forkAuthority is the plane's answer about a job it has bound and cannot
+// prove: a fork's pull request, named by its job.
+func forkAuthority() dispatch.CacheAuthority {
+	return dispatch.CacheAuthority{LeaseID: scopedLease, JobID: "job-1", RunID: 31, Owner: "acme",
+		Repository: "api", Event: "pull_request"}
+}
+
+// unboundAnswer is the plane's answer about a lease whose job it has not yet
+// learned.
+func unboundAnswer() dispatch.CacheAuthority {
+	return dispatch.CacheAuthority{LeaseID: scopedLease}
+}
+
 func pullRequestAuthority() dispatch.CacheAuthority {
 	return dispatch.CacheAuthority{LeaseID: scopedLease, JobID: "job-1", RunID: 31, Owner: "acme",
 		Repository: "api", Event: "pull_request", Ref: "refs/pull/7/merge",
@@ -95,7 +109,7 @@ func twirp(t *testing.T, path, body string) *http.Request {
 func TestAnUnprovenJobIsAskedAboutAtMostEveryInterval(t *testing.T) {
 	t.Parallel()
 
-	authority := &fakeAuthority{authority: dispatch.CacheAuthority{LeaseID: scopedLease}}
+	authority := &fakeAuthority{authority: forkAuthority()}
 	service, session := defaultBranchActions(t, authority, &fakeCacheStore{})
 	now := time.Now()
 	service.now = func() time.Time { return now }
@@ -197,7 +211,7 @@ func TestAnUnprovenJobGoesToGitHubAndIsAskedAgain(t *testing.T) {
 		authority *fakeAuthority
 		asks      int
 	}{
-		"unproven":   {&fakeAuthority{authority: dispatch.CacheAuthority{LeaseID: scopedLease}}, 1},
+		"unproven":   {&fakeAuthority{authority: forkAuthority()}, 1},
 		"unreadable": {&fakeAuthority{err: errors.New("the plane is unreachable")}, 2},
 	} {
 		authority := tc.authority
@@ -223,4 +237,223 @@ func TestAnUnprovenJobGoesToGitHubAndIsAskedAgain(t *testing.T) {
 			}
 		})
 	}
+}
+
+// bindingAuthority is a plane that has not bound the job for its first
+// unboundAsks questions and names it afterwards; a negative count never binds
+// it. A failAsk above zero is the one question it fails instead.
+type bindingAuthority struct {
+	unboundAsks int
+	failAsk     int
+	job         dispatch.CacheAuthority
+	asked       int
+}
+
+func (b *bindingAuthority) CacheAuthority(context.Context, string) (dispatch.CacheAuthority, error) {
+	b.asked++
+	if b.asked == b.failAsk {
+		return dispatch.CacheAuthority{}, errors.New("the plane is unreachable")
+	}
+	if b.unboundAsks < 0 || b.asked <= b.unboundAsks {
+		return unboundAnswer(), nil
+	}
+
+	return b.job, nil
+}
+
+// lookup is one restore of key "npm": what it answered when it was served
+// here, or nil when it was spliced to GitHub.
+func lookup(t *testing.T, service *CacheService, session *cacheSession) map[string]any {
+	t.Helper()
+
+	response, handled, err := service.actionsResponse(
+		twirp(t, actionsDownloadPath, `{"key":"npm","restore_keys":[],"version":"v1"}`), session)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if !handled {
+		if response != nil {
+			response.Body.Close()
+		}
+
+		return nil
+	}
+
+	return responseJSON(t, response)
+}
+
+// A JOB THE PLANE HAS NOT BOUND YET IS WAITED FOR, AND RESTORED HERE. Its first
+// cache call, a restore, came before the plane had GitHub's JobStarted; spliced,
+// it would have fetched the whole archive from GitHub.
+func TestACallBeforeTheBindingWaitsForIt(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &bindingAuthority{unboundAsks: 3, job: pullRequestAuthority()}
+		store := &presentMatcher{fakeCacheStore: &fakeCacheStore{current: "g"},
+			present: map[string]string{refPrefix("refs/heads/main") + "npm": "g"}}
+		service, session := defaultBranchActions(t, nil, store)
+		service.SetAuthorityReader(plane)
+		start := time.Now()
+
+		found := lookup(t, service, session)
+		if found == nil || found["ok"] != true || found["matched_key"] != "npm" {
+			t.Fatalf("lookup = %v, want the default branch's archive restored here", found)
+		}
+		if plane.asked != 4 {
+			t.Fatalf("asked %d times, want 3 unbound answers and the bound one", plane.asked)
+		}
+		if waited := time.Since(start); waited != 3*actionsBindingPoll {
+			t.Fatalf("waited %v, want %v: three polls, and no longer once the job was named",
+				waited, 3*actionsBindingPoll)
+		}
+	})
+}
+
+// A JOB THE PLANE NEVER BINDS IS WAITED FOR ONCE, for actionsBindingWait, and
+// every call after it goes to GitHub at once as any unproven job's does: a
+// job's many calls must not each stand still for a minute.
+func TestAJobNeverBoundIsWaitedForOnce(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &bindingAuthority{unboundAsks: -1}
+		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
+		service.SetAuthorityReader(plane)
+		start := time.Now()
+
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("a job that was never bound was served here: %v", found)
+		}
+		if waited := time.Since(start); waited != actionsBindingWait {
+			t.Fatalf("the first call waited %v, want %v", waited, actionsBindingWait)
+		}
+
+		time.Sleep(actionsUnprovenFor)
+		asked, again := plane.asked, time.Now()
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("a job that was never bound was served here: %v", found)
+		}
+		if plane.asked != asked+1 || time.Since(again) != 0 {
+			t.Fatalf("the next call asked %d times over %v, want one ask and no wait",
+				plane.asked-asked, time.Since(again))
+		}
+	})
+}
+
+// A JOB THE PLANE KNOWS AND CANNOT PROVE IS NOT WAITED FOR: a fork's pull
+// request is named by its job, and waiting would only delay its splice.
+func TestAnUnprovableJobIsNotWaitedFor(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &fakeAuthority{authority: forkAuthority()}
+		service, session := defaultBranchActions(t, plane, &fakeCacheStore{})
+		start := time.Now()
+
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("an unprovable job was served here: %v", found)
+		}
+		if plane.asked != 1 || time.Since(start) != 0 {
+			t.Fatalf("asked %d times over %v, want one ask and no wait", plane.asked, time.Since(start))
+		}
+	})
+}
+
+// A CALLER THAT GIVES UP WHILE WAITING LEAVES THE WAIT TO ITS RETRY: nothing
+// was decided, so the retry is neither held off as unproven nor denied the
+// wait, and it is proven once the plane names the job.
+func TestARetryAfterAnAbandonedWaitWaitsAgain(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &bindingAuthority{unboundAsks: 10, job: pullRequestAuthority()}
+		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
+		service.SetAuthorityReader(plane)
+
+		patience := 5*actionsBindingPoll + actionsBindingPoll/2
+		ctx, cancel := context.WithTimeout(t.Context(), patience)
+		defer cancel()
+		start := time.Now()
+		if _, ok := service.sessionActionsAuthority(ctx, session); ok {
+			t.Fatal("an abandoned wait proved the job")
+		}
+		if plane.asked != 6 || time.Since(start) != patience {
+			t.Fatalf("the abandoned call asked %d times over %v, want 6 over %v",
+				plane.asked, time.Since(start), patience)
+		}
+
+		retried := time.Now()
+		if _, ok := service.sessionActionsAuthority(t.Context(), session); !ok {
+			t.Fatal("the retry was not proven once the plane named the job")
+		}
+		if plane.asked != 11 || time.Since(retried) != 4*actionsBindingPoll {
+			t.Fatalf("the retry brought the asks to %d over %v, want 11 over %v: it asked at once "+
+				"and waited until the job was named", plane.asked, time.Since(retried), 4*actionsBindingPoll)
+		}
+	})
+}
+
+// A PLANE THAT FAILS WHILE WAITED FOR ENDS THE JOB'S WAIT, as running out of
+// time does: the call goes to GitHub, and the next asks without waiting again.
+func TestAPlaneErrorEndsTheWait(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &bindingAuthority{unboundAsks: -1, failAsk: 4}
+		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
+		service.SetAuthorityReader(plane)
+		start := time.Now()
+
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("a call whose plane failed was served here: %v", found)
+		}
+		if plane.asked != 4 || time.Since(start) != 3*actionsBindingPoll {
+			t.Fatalf("the first call asked %d times over %v, want 4 over %v",
+				plane.asked, time.Since(start), 3*actionsBindingPoll)
+		}
+
+		again := time.Now()
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("an unbound job was served here: %v", found)
+		}
+		if plane.asked != 5 || time.Since(again) != 0 {
+			t.Fatalf("the next call asked %d times over %v, want one ask and no wait",
+				plane.asked-4, time.Since(again))
+		}
+	})
+}
+
+// A CALL QUEUED BEHIND ANOTHER'S WAIT KEEPS ITS OWN DEADLINE: it gives up when
+// its context does, not a minute later when the wait ahead of it ends. A plain
+// Lock fails this by hanging rather than by an assertion: a goroutine blocked
+// on a mutex is not durably blocked, so the bubble's clock never advances and
+// the test binary's timeout is what reports it.
+func TestACallQueuedBehindAWaitKeepsItsDeadline(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &bindingAuthority{unboundAsks: -1}
+		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
+		service.SetAuthorityReader(plane)
+
+		waiting := make(chan struct{})
+		go func() {
+			defer close(waiting)
+			service.sessionActionsAuthority(t.Context(), session)
+		}()
+		synctest.Wait()
+
+		patience := 2 * actionsBindingPoll
+		ctx, cancel := context.WithTimeout(t.Context(), patience)
+		defer cancel()
+		start := time.Now()
+		if _, ok := service.sessionActionsAuthority(ctx, session); ok {
+			t.Fatal("a queued call was proven while the plane had not bound the job")
+		}
+		if queued := time.Since(start); queued != patience {
+			t.Fatalf("the queued call returned after %v, want its own %v", queued, patience)
+		}
+		<-waiting
+	})
 }

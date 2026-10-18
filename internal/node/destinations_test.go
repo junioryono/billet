@@ -18,8 +18,11 @@ import (
 // nothing else.
 type netMonitor struct{}
 
-func (netMonitor) Start(string, usage.Target, int) {}
-func (netMonitor) Forget(string)                   {}
+func (netMonitor) Start(string, usage.Target, int)                           {}
+func (netMonitor) Forget(string)                                             {}
+func (netMonitor) Resume(string, usage.Target, int, *usage.Checkpoint) error { return nil }
+func (netMonitor) Checkpoint(string) (usage.Checkpoint, bool)                { return usage.Checkpoint{}, false }
+func (netMonitor) Measuring(string) bool                                     { return false }
 func (netMonitor) Final(string) (usage.Summary, bool) {
 	sum := usage.Summary{Samples: 3, Interval: time.Second, Window: 3 * time.Second}
 	sum.Measured.CPU, sum.Measured.Net = true, true

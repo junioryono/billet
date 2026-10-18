@@ -36,6 +36,9 @@ complete   yes
 tap        sent 3.4 MiB, received 394.2 MiB; tap minus attributed: sent +16.6 KiB, received +213.9 KiB
            (a comparison of two counters read a moment apart, not a measurement of what was missed)
 
+series     169 samples on the host's clock from 2026-10-09T12:00:00.000Z to 2026-10-09T12:02:47.500Z; 1 interval not seen, 1s in all, which no window counts
+           2026-10-09T12:00:59.000Z to 2026-10-09T12:01:00.000Z (1s): failed_read, a counter the sampler had read before could not be read
+
 steps      github job 7001 "test", attempt 2, on runner billet-6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64, steps listed: 6
            aligned to the second on two clocks, GitHub's for the steps and the host's for its samples, with no correction for skew between them; within one sample interval, usage is split by time
 step 1     "Set up job" "success", started 2026-10-09T12:00:00Z, took 4s
