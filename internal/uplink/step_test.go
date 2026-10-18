@@ -14,12 +14,17 @@ import (
 // Pinger's answers do.
 type fakeProber struct {
 	reflectors []string
-	rtt        func(round int) map[string]time.Duration
-	round      int
-	waits      []time.Duration
+	// gateway is the first hop asked beside them, empty for none; rtt answers
+	// for it as for a reflector.
+	gateway string
+	rtt     func(round int) map[string]time.Duration
+	round   int
+	waits   []time.Duration
 }
 
 func (f *fakeProber) Reflectors() []string { return f.reflectors }
+
+func (f *fakeProber) Gateway() string { return f.gateway }
 
 func (f *fakeProber) Round(_ context.Context, wait time.Duration) (map[string]time.Duration, error) {
 	f.waits = append(f.waits, wait)
