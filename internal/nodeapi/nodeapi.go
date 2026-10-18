@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 29
+	Version = 30
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -396,6 +396,20 @@ const (
 	// and sends anyway is refused rather than recorded as something its wire
 	// does not carry.
 	VersionGuestReport = 29
+
+	// VersionSeriesGaps is the version from which a usage report's series may
+	// be the codec that says why each unseen interval was not seen
+	// (lease.UsageSeriesCodecGaps), which is what lets `billet jobs show` say
+	// why a window is short rather than only that it is.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT,
+	// because an older plane validates the codec strictly and would refuse the
+	// whole report over it: below it the node re-encodes the series with marks
+	// and no causes, which says less and never something else. CHECKED WHERE IT
+	// IS READ too, so a pairing that negotiated below it and sends one anyway
+	// has the report kept without its series rather than recorded as something
+	// its wire does not carry.
+	VersionSeriesGaps = 30
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

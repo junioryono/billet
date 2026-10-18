@@ -35,6 +35,8 @@
       "pressure": true,
       "threads": true
     },
+    "series": null,
+    "series_unavailable": "the usage report came with no series",
     "source": "host",
     "samples": 95,
     "interval_ms": 1000,

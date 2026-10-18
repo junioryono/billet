@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -907,15 +908,127 @@ func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
 		t.Fatalf("ForceRelease: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	var logged bytes.Buffer
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, slog.New(slog.NewTextHandler(&logged, nil)))
+	destroyed := len(p.destroyed)
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if len(restarted.heldLeases()) != 0 {
 		t.Fatal("recovery retained custody after consuming the pending force release")
 	}
+	// NOT CALLED A JOB LEFT RUNNING WITH ITS CAPACITY HELD, which it is not.
+	log := logged.String()
+	reconciled := ""
+	for line := range strings.Lines(log) {
+		if strings.Contains(line, `msg="reconciled compute left by an earlier run"`) {
+			reconciled = line
+		}
+	}
+	if strings.Contains(log, "adopted a running job") || !slices.Contains(strings.Fields(reconciled), "adopted=0") {
+		t.Errorf("recovery logged a force-released job as adopted:\n%s", log)
+	}
+	// A FORCE RELEASE LETS GO OF THE LEASE, never of the compute.
+	if len(p.destroyed) != destroyed {
+		t.Errorf("settling the force release destroyed %d instances, want none", len(p.destroyed)-destroyed)
+	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
 		t.Fatalf("forced lease is still open after recovery: %v", err)
+	}
+}
+
+// A FORCE RELEASE RECOVERY CONSUMES REMOVES THE RUNNER FIRST, as a tend's
+// does, and one it cannot remove is left held for the tend that tries again:
+// the lease is released only once nothing at GitHub can still route the job's
+// runner work.
+func TestRecoveryRemovesAForceReleasedRunnerBeforeSettling(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	a, host := newAllocatorWithHost(t)
+	first := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 81, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := first.Destroy(t.Context(), 81); !errors.Is(err, dispatch.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	if err := first.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	jit := &durableFakeJIT{fakeJIT: &fakeJIT{setID: 7}, ensureErr: errors.New("github is unreachable")}
+	restarted := New(a, host, jit, p, nil)
+	destroyed := len(p.destroyed)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover = %v, want a runner it could not remove left to the tend", err)
+	}
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID}) || len(p.destroyed) != destroyed {
+		t.Fatalf("recovery tried to remove the runner %v and destroyed %d instances, want one removal "+
+			"and no destroy", jit.ensureCalls, len(p.destroyed)-destroyed)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil || len(restarted.heldLeases()) != 1 {
+		t.Fatalf("lease %v, held %v; want a runner not yet removed to keep its lease held", err,
+			restarted.heldLeases())
+	}
+
+	jit.ensureErr = nil
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the force release was not settled once its runner was removed: %v", err)
+	}
+	// THE TEND TRIED THE REMOVAL AGAIN, and settling destroyed nothing: a force
+	// release lets go of the lease, never of the compute.
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID, lease.ID}) || len(p.destroyed) != destroyed {
+		t.Errorf("removals %v and %d destroys after the tend, want the removal tried again and no destroy",
+			jit.ensureCalls, len(p.destroyed)-destroyed)
+	}
+}
+
+// A CUSTODY ASSUMED FOR A LOST LAUNCH REPORT SETTLES A FORCE RELEASE AT ONCE:
+// it adopts one job, so nothing waits behind the settlement, and no tend is
+// needed. DEFENSIVE: a lost report leaves the lease launching, which cannot be
+// force-released, and only this node's own tend moves it to custody, after
+// which the job is no longer the launch AssumeCustody looks for. The ledger is
+// advanced here directly, so what this proves is that the single adoption is
+// completed at once, whatever reached it.
+func TestAssumedCustodySettlesAForceReleaseAtOnce(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	jit := &durableFakeJIT{fakeJIT: &fakeJIT{setID: 7}}
+	r := New(a, host, jit, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	live, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Advance(t.Context(), lease.ID, live.Epoch, alloc.PhaseCustody); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	destroyed := len(p.destroyed)
+	if err := r.AssumeCustody(t.Context(), live, 11); err != nil {
+		t.Fatalf("AssumeCustody: %v", err)
+	}
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID}) || len(r.heldLeases()) != 0 {
+		t.Fatalf("removals %v, held %v; want the runner removed and the force release settled at once",
+			jit.ensureCalls, r.heldLeases())
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("the force-released lease is still open: %v", err)
+	}
+	if len(p.destroyed) != destroyed {
+		t.Errorf("settling the force release destroyed %d instances, want none", len(p.destroyed)-destroyed)
 	}
 }
 

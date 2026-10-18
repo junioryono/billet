@@ -10,7 +10,7 @@ This page is the operator's view: what each cache is, what a tier gets without a
 |---|---|---|
 | Docker image store | on | any backend with `node.cache` |
 | Sticky disks | on | any backend with `node.cache` |
-| Actions cache | on where its scope already holds (below) | a Linux Firecracker tier and a repository scope |
+| Actions cache | on where its scope already holds (below) | a Linux Firecracker tier and a repository scope, which an organization target's pool gets only by naming one ([An organization target](actions-cache.md#an-organization-target)) |
 | Git mirror | on | a Linux Firecracker tier |
 | Bazel and Buck2 | on where the tier can publish it (below) | a Linux Firecracker tier |
 | Go build cache | on where the tier can publish it (below) | a Linux Firecracker tier |

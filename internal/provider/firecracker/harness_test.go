@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
@@ -50,6 +53,21 @@ type fakeVMM struct {
 	// dieOnStart makes the VMM stop answering when it is told to start, which is
 	// the measured shape of a boot that fails after the jailer has already exited 0.
 	dieOnStart bool
+	// ignoreResumeFlag makes a snapshot load leave the guest running even when it
+	// was asked to load it paused, which is the shape a restore must refuse.
+	ignoreResumeFlag bool
+	// stayPausedOnResume makes a resume answer success and leave the guest paused.
+	stayPausedOnResume bool
+	// createTakes is how long writing a snapshot holds its call open.
+	createTakes time.Duration
+	// root is the jail root the VMM is chrooted in, where a snapshot it is asked to
+	// write lands, and onCreate runs after it has written one, so a test can do what
+	// a VMM that has been taken over could do to its own files.
+	root     string
+	onCreate func(root string)
+	// vcpus and memMiB are the guest shape it reports, as a loaded snapshot set it.
+	vcpus  int
+	memMiB int64
 
 	listener net.Listener
 	server   *http.Server
@@ -70,7 +88,8 @@ func startFakeVMM(t *testing.T, socket, id string) *fakeVMM {
 		t.Fatalf("make the socket directory: %v", err)
 	}
 
-	v := &fakeVMM{id: id, state: "Not started", refuse: map[string]string{}}
+	// THE SHAPE aSpec ASKS FOR, which is what a snapshot of one of its guests loads as.
+	v := &fakeVMM{id: id, state: "Not started", refuse: map[string]string{}, vcpus: 2, memMiB: 2048}
 
 	var lc net.ListenConfig
 
@@ -113,6 +132,13 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	if r.Method == http.MethodGet && r.URL.Path == "/machine-config" {
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, map[string]any{"vcpu_count": v.vcpus, "mem_size_mib": v.memMiB, "smt": false})
+
+		return
+	}
+
 	if r.Method == http.MethodGet && r.URL.Path == "/" {
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, map[string]string{
@@ -139,6 +165,45 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	v.puts = append(v.puts, recordedPut{method: r.Method, path: r.URL.Path, body: body})
 
+	// THE RUN STATE A REAL VMM KEEPS, measured on v1.16.1: a paused load reports
+	// Paused, PATCH /vm moves between Paused and Running, and GET / says which.
+	//
+	// LITERALS, NOT billet's CONSTANTS: a fake that shared them would agree with a
+	// wrong one. And only the method the real API takes for each path moves the state.
+	switch {
+	case r.Method == http.MethodPatch && r.URL.Path == "/vm":
+		switch body["state"] {
+		case "Paused":
+			v.state = "Paused"
+		case "Resumed":
+			if !v.stayPausedOnResume {
+				v.state = "Running"
+			}
+		}
+	case r.Method == http.MethodPut && r.URL.Path == "/snapshot/load":
+		if resume, isBool := body["resume_vm"].(bool); (isBool && resume) || v.ignoreResumeFlag {
+			v.state = "Running"
+		} else {
+			v.state = "Paused"
+		}
+	case r.Method == http.MethodPut && r.URL.Path == "/snapshot/create":
+		// THE WRITE HOLDS THE CALL, as Firecracker's does while it fsyncs memory.
+		if v.createTakes > 0 {
+			v.mu.Unlock()
+			time.Sleep(v.createTakes)
+			v.mu.Lock()
+		}
+
+		// AND LANDS IN THE CHROOT, at the paths it was given, as the jailed account.
+		if v.root != "" {
+			if err := v.writeSnapshot(body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+
+				return
+			}
+		}
+	}
+
 	if r.URL.Path == "/actions" {
 		action, isString := body["action_type"].(string)
 
@@ -154,6 +219,27 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// currentState is the run state the VMM would report now.
+func (v *fakeVMM) currentState() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	return v.state
+}
+
+// calls lists the calls in the order they arrived, as "METHOD /path".
+func (v *fakeVMM) calls() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	out := make([]string, 0, len(v.puts))
+	for _, p := range v.puts {
+		out = append(out, p.method+" "+p.path)
+	}
+
+	return out
 }
 
 // pathsPut lists the configuration calls in the order they arrived.
@@ -213,6 +299,9 @@ type fakeDisk struct {
 	// onClone runs inside CloneRoot, so a test can observe what the host looked
 	// like at the moment the disk was cloned rather than afterwards.
 	onClone func()
+	// onDiscard runs inside DiscardRoot, so a test can change the host between the
+	// discard and the releases a teardown makes after it.
+	onDiscard func()
 }
 
 // resolve stands in for the store turning `@verified` into a generation. The fake
@@ -271,6 +360,10 @@ func (d *fakeDisk) DiscardRoot(_ context.Context, name string) error {
 	defer d.mu.Unlock()
 
 	d.discarded = append(d.discarded, name)
+
+	if d.onDiscard != nil {
+		d.onDiscard()
+	}
 
 	return d.discardErr
 }
@@ -334,6 +427,56 @@ type harness struct {
 	refuse   func(bin string, args []string) error
 	// jailerErr makes the jailer fail.
 	jailerErr error
+	// chowned is every path billet asked to chown, in order.
+	chowned []string
+	// devices is the host's network devices by name, and the uid the kernel reports
+	// as each one's owner (-1 for a device that is not a tap). `ip tuntap add` and
+	// `ip link del` change it as they would change the kernel's, and a test puts a
+	// device billet did not make here to see what teardown does with it.
+	devices map[string]int
+	// ownerErr makes asking the kernel whose a device is fail.
+	ownerErr error
+}
+
+// tapOwner is the kernel's answer for the fake host.
+func (h *harness) tapOwner(tap string) (int, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.ownerErr != nil {
+		return 0, false, h.ownerErr
+	}
+
+	owner, ok := h.devices[tap]
+
+	return owner, ok, nil
+}
+
+// putDevice places a network device on the fake host, as something other than this
+// launch would.
+func (h *harness) putDevice(name string, owner int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.devices[name] = owner
+}
+
+// hasDevice reports whether the fake host still has a network device.
+func (h *harness) hasDevice(name string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	_, ok := h.devices[name]
+
+	return ok
+}
+
+// chownedPaths returns every path billet asked to chown.
+func (h *harness) chownedPaths() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]string(nil), h.chowned...)
 }
 
 // theLease is a lease id of the shape alloc mints: 32 hex characters.
@@ -381,7 +524,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		t.Fatalf("make the stub kernel readable: %v", err)
 	}
 
-	h := &harness{disk: &fakeDisk{device: "/dev/rbd0"}}
+	h := &harness{disk: &fakeDisk{device: "/dev/rbd0"}, devices: map[string]int{}}
 
 	cfg := config.FirecrackerConfig{
 		BinaryPath:   link,
@@ -398,6 +541,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		// its own success messages.
 		WithLogger(slog.New(slog.DiscardHandler)),
 		withRunner(h.record),
+		withTapOwner(h.tapOwner),
 		// mknod and chown need root and a real device; what matters for these tests
 		// is that they were CALLED with the right arguments, which the jail
 		// assertions check by the file the fake creates.
@@ -405,7 +549,22 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 			func(path, _ string, _, _ int) error {
 				return os.WriteFile(path, []byte("device node"), 0o600)
 			},
-			func(string, int, int) error { return nil },
+			// EVERY PATH IN THE TREE, as chownTree changes them, so a chown that
+			// reached a snapshot link is seen even when it named the directory.
+			func(path string, _, _ int) error {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+
+				return filepath.WalkDir(path, func(p string, _ fs.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+
+					h.chowned = append(h.chowned, p)
+
+					return nil
+				})
+			},
 		),
 		// GENEROUS, because no test here waits for it to expire: every fake VMM
 		// answers, and a failed start is asserted at the start action. At 2 seconds a
@@ -427,8 +586,54 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 	}
 	h.p.procMountsPath = mounts
 
+	// A HOST OF ITS OWN, so a snapshot's compatibility record has something fixed to
+	// match, and a test can stage a host it was not taken on.
+	cpuinfo := filepath.Join(t.TempDir(), "cpuinfo")
+	if err := os.WriteFile(cpuinfo, []byte(aCPUInfo), 0o600); err != nil {
+		t.Fatalf("write the stub cpuinfo: %v", err)
+	}
+
+	h.p.cpuinfoPath = cpuinfo
+	h.p.hostKernel = func() (string, error) { return "6.1.155 #1 SMP PREEMPT_DYNAMIC", nil }
+
+	// THE TEST RUNS AS ITSELF, not as a jail uid only root can create files as, so a
+	// file it writes into a jail stands in for one the VMM wrote. The real check is
+	// held by jailWritten's own test and by the real-host capture.
+	h.p.jailWrote = func(st unix.Stat_t, res resources) bool {
+		return int(st.Uid) == os.Geteuid() || jailWritten(st, res)
+	}
+
+	// AND IT ANSWERS AS THE TEST'S ACCOUNT, not a jail uid, so the uid check on its
+	// connections has its own test (vmmexe_linux_test.go).
+	h.p.apiAs = func(socket string, _ int) *vmmAPI { return h.p.apiFor(socket) }
+
+	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
+	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
+
 	return h
 }
+
+// aCPUInfo is two identical x86 cores, as /proc/cpuinfo lists them.
+const aCPUInfo = `processor	: 0
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 1
+model name	: AMD EPYC 7713 64-Core Processor
+stepping	: 1
+microcode	: 0xa0011d5
+cpu MHz		: 2000.000
+flags		: fpu vme de pse sse sse2 avx avx2
+
+processor	: 1
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 1
+model name	: AMD EPYC 7713 64-Core Processor
+stepping	: 1
+microcode	: 0xa0011d5
+cpu MHz		: 3100.000
+flags		: avx2 avx sse2 sse pse de vme fpu
+`
 
 // record is the runner seam: it captures the argv and, for the jailer, lets the
 // test decide what the VMM does next.
@@ -445,6 +650,12 @@ func (h *harness) record(_ context.Context, bin string, args []string) ([]byte, 
 	// cannot express them.
 	if refuse != nil {
 		if err := refuse(bin, args); err != nil {
+			return nil, err
+		}
+	}
+
+	if bin == ipBinary {
+		if err := h.changeDevices(args); err != nil {
 			return nil, err
 		}
 	}
@@ -468,6 +679,33 @@ func (h *harness) record(_ context.Context, bin string, args []string) ([]byte, 
 	}
 
 	return nil, nil
+}
+
+// changeDevices applies an `ip` command billet ran to the fake host's devices, and
+// refuses a name the host already has, as the kernel does.
+func (h *harness) changeDevices(args []string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	switch {
+	// tuntap add dev <name> mode tap user <uid>
+	case len(args) == 8 && args[0] == "tuntap" && args[1] == "add":
+		if _, taken := h.devices[args[3]]; taken {
+			return errors.New("ioctl(TUNSETIFF): Device or resource busy; RTNETLINK answers: File exists")
+		}
+
+		owner, err := strconv.Atoi(args[7])
+		if err != nil {
+			owner = -1
+		}
+
+		h.devices[args[3]] = owner
+	// link del dev <name>
+	case len(args) == 4 && args[0] == "link" && args[1] == "del":
+		delete(h.devices, args[3])
+	}
+
+	return nil
 }
 
 // writeExitedPID puts a pid that has certainly exited into a jail's pid file.
@@ -545,7 +783,13 @@ func (h *harness) everyArgument() string {
 func (h *harness) serveVMM(t *testing.T, id string) *fakeVMM {
 	t.Helper()
 
-	return startFakeVMM(t, h.p.jailFor(id).socket(), id)
+	v := startFakeVMM(t, h.p.jailFor(id).socket(), id)
+
+	v.mu.Lock()
+	v.root = h.p.jailFor(id).root()
+	v.mu.Unlock()
+
+	return v
 }
 
 // aSpec is a launch that should succeed.
@@ -582,4 +826,25 @@ func (h *harness) launch(t *testing.T) (*provider.Instance, *fakeVMM) {
 	}
 
 	return inst, vmm
+}
+
+// writeSnapshot writes what a snapshot/create body names, inside the VMM's chroot.
+// The caller holds v.mu.
+func (v *fakeVMM) writeSnapshot(body map[string]any) error {
+	for _, field := range []string{"snapshot_path", "mem_file_path"} {
+		name, ok := body[field].(string)
+		if !ok {
+			return errors.New("snapshot/create without " + field)
+		}
+
+		if err := os.WriteFile(filepath.Join(v.root, name), []byte("written by the VMM at "+name), 0o600); err != nil {
+			return err
+		}
+	}
+
+	if v.onCreate != nil {
+		v.onCreate(v.root)
+	}
+
+	return nil
 }

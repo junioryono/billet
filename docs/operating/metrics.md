@@ -45,6 +45,14 @@ The control plane also reads its ledger at every scrape, through the same report
 
 A standby serves these too: it reads the same ledger, and its gauges show what the active controller has recorded.
 
+A node with `node.monitoring` also counts how its job sampler keeps up, as the sampler does it. Without `node.monitoring` they stay at zero. No lease or job id is a label here either; a job's own gaps are in its series, which `billet jobs show` lists.
+
+| Metric | What it is |
+|---|---|
+| `billet_node_usage_tick_seconds` | how long each tick of the sampler took to read every job it measures (a histogram); a tick near the sampling interval is one about to miss the next |
+| `billet_node_usage_gaps_total{cause}` | intervals of a job's series the sampler did not see, by cause: `missed_tick`, `slow_read`, `failed_read`, `late_first_read`, `counter_fell`, `handover` and the rest the [configuration reference](../reference/configuration.md) lists, each reported from the start at zero. Counted as the sampler keeps the sample that ends one (a counter that fell and the catch-up after it among them) or marks earlier ones; a job's last interval, which its final read decides, is not counted |
+| `billet_node_usage_io_bounded_total` | reads of a job's disk written that writeback kept moving on every pass, recorded as a lower bound that the next read corrects rather than as a gap |
+
 A node with `node.ceph` also reads its kernel's RBD mappings at every scrape, with the same could-not-tell rule (`billet_scrape_up{source="rbd"}`). A node without `node.ceph` reports none.
 
 | Metric | What it is |
