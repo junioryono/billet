@@ -214,6 +214,9 @@ type AwaitingQueueTime struct {
 	// JobID is GitHub's workflow-job id, which the write presents so it can
 	// only complete the row of the job it names.
 	JobID string
+	// ScaleSetAssignedAt is when GitHub handed the job to the scale set, zero
+	// where no message carried it; a job is queued before that.
+	ScaleSetAssignedAt time.Time
 	// Cursor is where the page after this row begins.
 	Cursor QueueTimeCursor
 }
@@ -247,7 +250,8 @@ func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, 
 			r := &rows[i]
 			out = append(out, AwaitingQueueTime{LeaseID: r.LeaseID, Tier: r.Tier,
 				Repository: r.Repo, RunID: r.RunID, JobID: r.GithubJobID,
-				Cursor: QueueTimeCursor{startedAt: r.StartedAt, leaseID: r.LeaseID}})
+				ScaleSetAssignedAt: parseStamp(r.GithubScaleSetAssignedAt),
+				Cursor:             QueueTimeCursor{startedAt: r.StartedAt, leaseID: r.LeaseID}})
 		}
 
 		return nil

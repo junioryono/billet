@@ -115,7 +115,7 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       github_job_id, COALESCE(started_at, '') AS started_at
+       github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= @since
    AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''

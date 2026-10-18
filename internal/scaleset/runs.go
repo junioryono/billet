@@ -61,7 +61,7 @@ var _ server.QueueTimes = (*Client)(nil)
 // RunQueueTimes reads when GitHub queued each job of a run, by runner name,
 // through the target's App client. A throttle is server.ErrQueueTimesThrottled
 // and a refused credential or permission server.ErrQueueTimesRefused, which the
-// sweep pauses the whole target for rather than the one run.
+// sweep pauses the App installation for rather than the one run.
 func (c *Client) RunQueueTimes(
 	ctx context.Context, owner, repository string, runID int64,
 ) (map[string]time.Time, error) {

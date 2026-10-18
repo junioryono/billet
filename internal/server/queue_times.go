@@ -26,10 +26,11 @@ type QueueTimes interface {
 
 var (
 	// ErrQueueTimesThrottled is a QueueTimes read GitHub's rate limit refused.
-	ErrQueueTimesThrottled = errors.New("server: GitHub is rate-limiting this target")
-	// ErrQueueTimesRefused is a QueueTimes read GitHub refused the App, which
-	// is what an App without `actions: read` gets.
-	ErrQueueTimesRefused = errors.New("server: GitHub refused this target's App the job records")
+	ErrQueueTimesThrottled = errors.New("server: GitHub is rate-limiting this App installation")
+	// ErrQueueTimesRefused is a QueueTimes read GitHub refused the App with a
+	// 401 or 403: an App without `actions: read`, a revoked key or a suspended
+	// App.
+	ErrQueueTimesRefused = errors.New("server: GitHub refused this App installation the job records")
 )
 
 const (
@@ -49,7 +50,9 @@ const (
 	// App installation, whose hourly budget the scale-set, runner-group and
 	// cache-authority calls share. A run is a request per 25 of its jobs and the
 	// GitHub client reads no run of more than 200, so a pass costs an
-	// installation at most 24 requests.
+	// installation at most 24 requests, 1,440 an hour, against a budget of at
+	// least 5,000. It also caps what the sweep keeps up with: 180 runs an hour an
+	// installation, past which the oldest runs reach the window unread.
 	queueTimeRunsPerInstallation = 3
 	// queueTimeRetryFirst is the wait after a run's read that left a job unfound
 	// or failed, doubled after each until queueTimeRetryMost.
@@ -149,7 +152,14 @@ func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Targ
 	if !ok {
 		return
 	}
+	s.readQueueTimeWork(ctx, work, sweep, now)
+}
 
+// readQueueTimeWork reads work in order within each installation's budget for
+// the pass, and records each run's backoff and each installation's pause.
+func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sweep *queueTimeSweep,
+	now time.Time,
+) {
 	read := map[string]int{}
 	for _, w := range work {
 		if ctx.Err() != nil {
@@ -168,8 +178,9 @@ func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Targ
 			continue
 		case errors.Is(err, ErrQueueTimesRefused):
 			sweep.paused[w.installation] = now.Add(queueTimeRefused)
-			s.log.Warn("GitHub refused this App installation the job records, which needs the App's "+
-				"`actions: read`; jobs keep an unknown queue time until it is granted",
+			s.log.Warn("GitHub refused this App installation the job records; the App needs "+
+				"`actions: read`, and a revoked key or a suspended App is refused the same way; "+
+				"jobs keep an unknown queue time until it can read them",
 				"target", w.run.target, "installation", w.installation, "after", queueTimeRefused, "error", err)
 			continue
 		case err != nil:
@@ -280,6 +291,14 @@ func (s *Server) fillRunQueueTimes(ctx context.Context, reader QueueTimes, run q
 		job := &jobs[i]
 		queued, ok := times[provider.InstanceName(job.LeaseID)]
 		if !ok {
+			missing++
+			continue
+		}
+		// A JOB IS QUEUED BEFORE GITHUB HANDS IT TO THE SCALE SET, both on GitHub's
+		// clock; a record that says otherwise is not this attempt's, and the wait
+		// stays unknown rather than wrong. It is counted missing, so the run backs
+		// off rather than being read on every pass.
+		if !job.ScaleSetAssignedAt.IsZero() && queued.After(job.ScaleSetAssignedAt) {
 			missing++
 			continue
 		}

@@ -26,7 +26,7 @@ func (q queueTimesPolicy) RunQueueTimes(context.Context, string, string, int64) 
 }
 
 // GITHUB'S THROTTLE AND ITS REFUSAL REACH THE SWEEP AS THE SERVER'S OWN
-// SENTINELS, which pause the whole target; any other failure pauses only its
+// SENTINELS, which pause the App installation; any other failure pauses only its
 // run, and a client that cannot read queue times says so.
 func TestAQueueTimeReadsRefusalIsTheServersSentinel(t *testing.T) {
 	t.Parallel()
@@ -50,7 +50,7 @@ func TestAQueueTimeReadsRefusalIsTheServersSentinel(t *testing.T) {
 		case err == nil:
 			t.Errorf("%s: no error", tc.name)
 		case tc.want == nil && (throttled || refused):
-			t.Errorf("%s: %v pauses the whole target", tc.name, err)
+			t.Errorf("%s: %v pauses the whole installation", tc.name, err)
 		case tc.want != nil && !errors.Is(err, tc.want):
 			t.Errorf("%s: %v, want %v", tc.name, err, tc.want)
 		case !errors.Is(err, tc.err):

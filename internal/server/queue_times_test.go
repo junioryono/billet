@@ -199,6 +199,54 @@ func TestTheControlPlaneRunsTheQueueTimeSweep(t *testing.T) {
 	}
 }
 
+// A created_at AFTER THE JOB'S OWN HAND-OVER TO THE SCALE SET IS NOT WRITTEN,
+// because a job is queued before it is handed over and both are GitHub's
+// clock; the run backs off rather than being read on every pass.
+func TestAQueueTimeAfterTheHandOverIsNotWritten(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	runner := p.launchedFor11(t)
+	handed := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Millisecond)
+	start := job11
+	start.RunnerID, start.RunnerName = 77, runner.RunnerName
+	start.Owner, start.Repository = "acme", "api"
+	start.ScaleSetAssignedAt = handed
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{start},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("start job 11: %v", err)
+	}
+
+	for _, tc := range []struct {
+		created time.Time
+		want    string
+	}{
+		{handed.Add(time.Second), ""},
+		{handed.Add(-time.Second), stamp(handed.Add(-time.Second))},
+	} {
+		reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, times: map[int64]map[string]time.Time{
+			job11.RunID: {runner.RunnerName: tc.created},
+		}}
+		s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+		targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+		sweep := newQueueTimeSweep()
+		s.fillQueueTimesOnce(t.Context(), targets, sweep, time.Now())
+
+		got, err := p.a.Job(t.Context(), runner.LeaseID)
+		if err != nil {
+			t.Fatalf("Job: %v", err)
+		}
+		if got.GitHubQueuedAt != tc.want {
+			t.Errorf("created %s against a hand-over at %s wrote %q, want %q", tc.created, handed,
+				got.GitHubQueuedAt, tc.want)
+		}
+		_, backedOff := sweep.retries[queueTimeRun{target: "acme", repository: "acme/api", run: job11.RunID}]
+		if backedOff != (tc.want == "") {
+			t.Errorf("created %s: the run is backed off %t, want %t", tc.created, backedOff, tc.want == "")
+		}
+	}
+}
+
 // A RUN THAT CANNOT BE READ BACKS OFF, doubling up to its bound; a tier this
 // control plane does not serve, and a target that cannot read queue times, are
 // never asked.
@@ -248,9 +296,9 @@ func TestAQueueTimeReadThatFailsBacksOffAndAnUnservedTierIsNotAsked(t *testing.T
 	}
 }
 
-// A THROTTLE OR A REFUSAL PAUSES THE WHOLE TARGET, for fifteen minutes and an
-// hour, and each pass reads at most three runs of a target, so a burst of runs
-// or a missing permission costs the installation a bounded number of requests.
+// A THROTTLE OR A REFUSAL PAUSES THE APP INSTALLATION, for fifteen minutes and
+// an hour, and each pass reads at most three runs of an installation, so a
+// burst of runs or a missing permission costs it a bounded number of requests.
 func TestAThrottledOrRefusedTargetPausesAndAPassReadsABoundedNumberOfRuns(t *testing.T) {
 	t.Parallel()
 
@@ -351,6 +399,21 @@ func TestTargetsOfOneInstallationShareItsBudgetAndItsPause(t *testing.T) {
 	s.fillQueueTimesOnce(t.Context(), targets, sweep, time.Now())
 	if got := reader.asked(); len(got) != 0 {
 		t.Errorf("read runs %v while another target of the same installation is paused", got)
+	}
+
+	// And the budget: four runs, two on each target of the installation, are
+	// three reads in one pass, not three each.
+	var work []queueTimeWork
+	for i, target := range []config.GitHubTarget{shared, shared, other, other} {
+		work = append(work, queueTimeWork{
+			run:          queueTimeRun{target: target.Name, repository: "acme/api", run: int64(970 + i)},
+			installation: installationOf(Target{Config: target}), reader: reader,
+		})
+	}
+	s.readQueueTimeWork(t.Context(), work, newQueueTimeSweep(), time.Now())
+	if got := reader.asked(); len(got) != queueTimeRunsPerInstallation {
+		t.Errorf("two targets of one installation read runs %v in one pass, want %d in all", got,
+			queueTimeRunsPerInstallation)
 	}
 }
 

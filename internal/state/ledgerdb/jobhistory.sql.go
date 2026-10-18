@@ -493,7 +493,7 @@ const listJobsAwaitingQueueTime = `-- name: ListJobsAwaitingQueueTime :many
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       github_job_id, COALESCE(started_at, '') AS started_at
+       github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= $1
    AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
@@ -513,12 +513,13 @@ type ListJobsAwaitingQueueTimeParams struct {
 }
 
 type ListJobsAwaitingQueueTimeRow struct {
-	LeaseID     string
-	Tier        string
-	Repo        string
-	RunID       int64
-	GithubJobID string
-	StartedAt   string
+	LeaseID                  string
+	Tier                     string
+	Repo                     string
+	RunID                    int64
+	GithubJobID              string
+	StartedAt                string
+	GithubScaleSetAssignedAt string
 }
 
 // The jobs that started since a moment and still have no GitHub queue time,
@@ -558,6 +559,7 @@ func (q *Queries) ListJobsAwaitingQueueTime(ctx context.Context, arg ListJobsAwa
 			&i.RunID,
 			&i.GithubJobID,
 			&i.StartedAt,
+			&i.GithubScaleSetAssignedAt,
 		); err != nil {
 			return nil, err
 		}
