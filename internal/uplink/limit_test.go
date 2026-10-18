@@ -11,7 +11,7 @@ func TestACutFindsTheLineAtWhatWasMoving(t *testing.T) {
 	t.Parallel()
 
 	c := newController()
-	c.Down.Limit = 900
+	c.Down.Rate, c.Down.Limit = 400, 900
 
 	for n := range 3 {
 		c.Step(moving(n, 5, 378, 30*time.Millisecond))
@@ -132,5 +132,95 @@ func TestWithNoLineFoundARateClimbsOnlyWhileWhatFlowsFollows(t *testing.T) {
 	if rates := clearRounds(held, 0, 10, (p.Full+p.ProbeFull)/2); rates[len(rates)-1] != 100 {
 		t.Errorf("with no line found a rate whose traffic fell short of ProbeFull of it rose to %.2f",
 			rates[len(rates)-1])
+	}
+}
+
+// A DOWNLOAD THAT FILLS THE LINE CUTS THE UPLOAD TOO, both directions being cut
+// on one verdict, but the acknowledgements the upload carries are not its line:
+// taken as one, an upload moving 12 Mbit/s of them under a 400 Mbit/s rate was
+// held near 12 for many minutes after every busy download.
+func TestAnUploadOfAcknowledgementsKeepsTheLineItFound(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	c.Up.Rate, c.Up.Limit = 400, 450
+	c.Down.Rate, c.Down.Limit = 520, 500
+
+	for n := range 3 {
+		c.Step(moving(n, 12, 510, 30*time.Millisecond))
+	}
+
+	if c.Down.Rate >= 510 || c.Down.Limit != 510 {
+		t.Fatalf("a full queue under the download left it at %.1f with the line at %.1f, want a cut that "+
+			"finds the line at the 510 moving", c.Down.Rate, c.Down.Limit)
+	}
+	if c.Up.Rate >= 400 {
+		t.Fatalf("the upload, busy with its acknowledgements, was not cut (%.1f): the case this is about "+
+			"did not arise", c.Up.Rate)
+	}
+	if c.Up.Limit != 450 {
+		t.Errorf("the cut took the upload's acknowledgements as its line: %.1f, want the 450 it had found",
+			c.Up.Limit)
+	}
+
+	// AND WITH NO LINE FOUND, NONE IS FOUND FROM THEM.
+	fresh := newController()
+	fresh.Up.Rate, fresh.Down.Rate = 400, 520
+	for n := range 3 {
+		fresh.Step(moving(n, 12, 510, 30*time.Millisecond))
+	}
+	if fresh.Up.Limit != 0 || fresh.Down.Limit != 510 {
+		t.Errorf("with no line found the cut found the upload's at %.1f and the download's at %.1f, want 0 "+
+			"and 510", fresh.Up.Limit, fresh.Down.Limit)
+	}
+}
+
+// A RAISE NEAR THE LINE IS ONE CAKE IS GIVEN, through the real stepper and its
+// two-percent threshold for telling tc: what ProbeFull compares what flows with
+// is then what CAKE holds. With raises smaller than the threshold the
+// controller's rate ran ahead of CAKE's, and a host moving 90.5% of CAKE's rate
+// stopped climbing for good a step above its line. And a rise that comes to
+// rest at the ceiling, short of two percent, is applied all the same.
+func TestARaiseNearTheLineIsOneCAKEIsGiven(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		name     string
+		max      float64
+		wantPast float64
+	}{
+		{"with room above", 10000, 440},
+		{"under a ceiling just above", 410, 410},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRig(t, &fakeProber{reflectors: three, rtt: func(int) map[string]time.Duration { return idle() }}, 0)
+			r.controller.Down = Direction{Max: c.max, Rate: 400, Limit: 400}
+			r.st.applied[1] = 400
+
+			// WHAT FLOWS IS 90.5% OF WHAT CAKE WAS LAST GIVEN, read each round.
+			applied := func() float64 {
+				if len(r.sets) == 0 {
+					return 400
+				}
+
+				return r.sets[len(r.sets)-1][1]
+			}
+
+			for range 5 * minute {
+				r.downMbit = 0.905 * applied()
+				r.run(1)
+			}
+
+			if got := applied(); got < c.wantPast {
+				t.Errorf("five minutes near the line moving 90.5%% of CAKE's rate left CAKE at %.1f "+
+					"(the controller at %.1f), want at least %.0f", got, r.controller.Down.Rate, c.wantPast)
+			}
+			if r.controller.Down.Rate != applied() {
+				t.Errorf("the controller's rate %.2f is not what CAKE was given, %.2f",
+					r.controller.Down.Rate, applied())
+			}
+		})
 	}
 }

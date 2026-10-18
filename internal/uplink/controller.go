@@ -153,7 +153,10 @@ type Params struct {
 	// what holds the traffic back, and a rate the line itself stops short of
 	// is never raised further.
 	ProbeFull float64
-	// ProbeRaise and ProbeEvery are how a rate near or above its Limit grows.
+	// ProbeRaise and ProbeEvery are how a rate near or above its Limit grows:
+	// ProbeRaise at least the two percent a rise must reach to be applied
+	// (worthApplying), so what ProbeFull compares what flows with is what CAKE
+	// holds, never a raise it was not given.
 	ProbeRaise float64
 	ProbeEvery time.Duration
 	// PeakWindow is how long a direction's peak throughput is remembered.
@@ -184,8 +187,8 @@ func DefaultParams() Params {
 		Start:      25,
 		Near:       0.9,
 		ProbeFull:  0.9,
-		ProbeRaise: 1.01,
-		ProbeEvery: 5 * time.Second,
+		ProbeRaise: 1.02,
+		ProbeEvery: 10 * time.Second,
 		PeakWindow: time.Minute,
 	}
 }
@@ -193,6 +196,13 @@ func DefaultParams() Params {
 // Floor is the lowest rate either direction is ever cut to, in Mbit/s, so a
 // misread delay can slow the host but never cut it off.
 const Floor = 10.0
+
+// foundShare is the least share of its rate a direction must be moving at a
+// cut for what it moves to be taken as the line: half, well above a download's
+// acknowledgements and well under the three quarters a direction filling the
+// line moves at the least (Full), so a line that has slowed under a high rate is
+// still found.
+const foundShare = 0.5
 
 // improvement is the least a cut must shorten the queue by to count as having
 // helped, when a tenth of the delay is less.
@@ -811,15 +821,22 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 			cut = min(cut, p.DeepCut)
 		}
 
-		// CUT BELOW WHAT IS FLOWING, not below the old rate: an unshaped direction
-		// starts at the interface's speed, far above anything the line carries,
-		// and only what is actually moving says where the line is.
+		// CUT BELOW WHAT IS FLOWING, not below the old rate: a rate may stand far
+		// above anything the line carries, and only what is actually moving says
+		// where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*cut, d.Max)
 		d.lastCut, d.cutSince, d.episode = o.At, true, true
 		// WHAT FLOWED IS THE LINE, FOUND FULL: the rate climbs back to near it
 		// quickly and past it only slowly, so a gateway that drops rather than
-		// queues is overrun seldom and briefly rather than at every climb.
-		d.Limit = moving
+		// queues is overrun seldom and briefly rather than at every climb. BUT
+		// ONLY WHERE THIS DIRECTION WAS FILLING IT, moving a share of what it was
+		// let through: both directions are cut on one verdict, and an upload
+		// carrying a download's acknowledgements, 12 Mbit/s under a 400 Mbit/s
+		// rate, says nothing of the line, where taking it as one held the upload
+		// near 12 for many minutes after every busy download.
+		if moving >= foundShare*before {
+			d.Limit = moving
+		}
 		// ONLY A SOURCE THAT SHOWED THE QUEUE IS EVIDENCE OF IT: a reflector delay
 		// under Bloat that wanders from 12 ms to 8 ms says nothing of the gateway's
 		// stall the cut was taken on, and crediting it would keep cutting for a
@@ -890,6 +907,12 @@ func (c *Controller) raise(d *Direction, moving float64, at time.Time) {
 	}
 
 	d.lastRaise = at
+}
+
+// resting is whether d's rate has come to rest where a climb stops: its
+// ceiling, or Near of the line it found, where the fast climb ends exactly.
+func (c *Controller) resting(d *Direction) bool {
+	return d.Rate >= d.Max || d.Limit > 0 && d.Rate == c.Params.Near*d.Limit
 }
 
 // helped is whether the queue is shorter now than at the direction's last cut:

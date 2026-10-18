@@ -17,9 +17,11 @@ import (
 )
 
 // A RESUMED DIRECTION IS WHERE IT WAS LEFT: the rate as it was, never past the
-// ceiling now in force nor under the floor, and the line it found. A rate at a
-// ceiling since removed is resumed as it was, not at the interface's speed, and
-// anything that is not a positive, finite number leaves the start untouched.
+// ceiling now in force, Near of the line it found or under the floor, and the
+// line it found. A rate at its ceiling with no line found is nothing learned,
+// since a shaper before this one recorded its starting ceiling before measuring
+// anything, and anything that is not a positive, finite number leaves the start
+// untouched.
 func TestAResumedDirectionIsWhereItWasLeft(t *testing.T) {
 	t.Parallel()
 
@@ -31,7 +33,11 @@ func TestAResumedDirectionIsWhereItWasLeft(t *testing.T) {
 	}{
 		"a rate and its line":           {learnedRate{Max: 1000, Rate: 300, Limit: 340}, 1000, 25, 0, 300, 340},
 		"a ceiling lowered since":       {learnedRate{Max: 400, Rate: 300, Limit: 340}, 200, 25, 0, 200, 340},
-		"a ceiling removed since":       {learnedRate{Max: 150, Rate: 150}, 1000, 25, 0, 150, 0},
+		"at its ceiling, no line found": {learnedRate{Max: 1000, Rate: 1000}, 1000, 25, 0, 25, 0},
+		"at a ceiling since removed":    {learnedRate{Max: 150, Rate: 150}, 1000, 25, 0, 25, 0},
+		"at its ceiling, a line found":  {learnedRate{Max: 150, Rate: 150, Limit: 160}, 1000, 25, 0, 144, 160},
+		"past the line it found":        {learnedRate{Max: 1000, Rate: 520, Limit: 500}, 1000, 25, 0, 450, 500},
+		"a ceiling of no number":        {learnedRate{Max: math.NaN(), Rate: 300}, 1000, 25, 0, 25, 0},
 		"a record from before limits":   {learnedRate{Max: 400, Rate: 120}, 1000, 25, 0, 120, 0},
 		"a rate under the floor":        {learnedRate{Max: 400, Rate: 2}, 400, 25, 0, Floor, 0},
 		"no rate at all":                {learnedRate{}, 400, 25, 0, 25, 0},
@@ -41,7 +47,7 @@ func TestAResumedDirectionIsWhereItWasLeft(t *testing.T) {
 		"a limit that is below nothing": {learnedRate{Max: 400, Rate: 120, Limit: -3}, 400, 25, 0, 120, 0},
 	} {
 		d := Direction{Max: c.ceiling, Rate: c.rate, Limit: c.limit}
-		c.learned.resume(&d)
+		c.learned.resume(&d, DefaultParams().Near)
 
 		if d.Rate != c.wantRate || d.Limit != c.wantLm || d.Max != c.ceiling {
 			t.Errorf("%s: resumed at %.2f with the line at %.2f under %.0f, want %.2f with it at %.2f under %.0f",

@@ -69,7 +69,7 @@ func learnedFile() string { return LearnedFile }
 
 // legacyLearnedFile is where a shaper before the rates moved kept them, beside
 // the interface record, read once when the new file is absent so the upgrade
-// that moves them does not start the line at the ceiling.
+// that moves them does not start the line over.
 func legacyLearnedFile() string { return filepath.Join(filepath.Dir(StateFile), "learned") }
 
 // bootIDFile is the kernel's identity for this boot, which changes at every
@@ -178,17 +178,29 @@ func (l learned) resumes(at nic) (bool, string) {
 }
 
 // resume starts d where r left it: the rate as it was, under the ceiling now in
-// force and over the floor, and the Limit as it was. A rate at a ceiling since
-// raised or removed is resumed as it is, not at the new one: it ran clear, which
-// says nothing of more, and the climb from it finds the rest. Anything that is
-// not a positive, finite number is nothing learned and leaves d as it was.
-func (r learnedRate) resume(d *Direction) {
-	if usable(r.Rate) {
+// force and over the floor, and the Limit as it was. Anything that is not a
+// positive, finite number is nothing learned and leaves d as it was.
+//
+// NO HIGHER THAN NEAR OF THE LINE FOUND: a run stopped while it probed past the
+// line recorded a rate over it, and resumed there it would overrun the line
+// from its first round until the loss showed; from Near the rate creeps back as
+// any rate near its line does.
+//
+// A RATE AT ITS CEILING WITH NO LINE FOUND IS NOTHING LEARNED: a shaper before
+// this one started every run at the ceiling, the interface's speed unless one
+// was set, and recorded it before it had measured anything, so a host it never
+// cut says 1000 of 1000. Resumed, that installs CAKE holding nothing back, and
+// a line that queues under it from the first round gives each reflector its
+// queue as the idle baseline, which hides the queue for good. A run that climbed
+// to its ceiling itself climbs there again from Start within a minute.
+func (r learnedRate) resume(d *Direction, near float64) {
+	if usable(r.Rate) && (r.Rate < r.Max || usable(r.Limit)) {
 		d.Rate = clamp(r.Rate, d.Max)
 	}
 
 	if usable(r.Limit) {
 		d.Limit = r.Limit
+		d.Rate = clamp(min(d.Rate, near*r.Limit), d.Max)
 	}
 }
 
@@ -217,8 +229,8 @@ func resumeLearned(log *slog.Logger, ctl *Controller, at nic) {
 		return
 	}
 
-	l.Up.resume(&ctl.Up)
-	l.Down.resume(&ctl.Down)
+	l.Up.resume(&ctl.Up, ctl.Params.Near)
+	l.Down.resume(&ctl.Down, ctl.Params.Near)
 
 	log.Info("resuming the rates an earlier run learned, and where it found the line full",
 		"up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),

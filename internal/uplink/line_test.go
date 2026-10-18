@@ -36,13 +36,17 @@ func (r simRun) carriedShare() float64 { return r.carried / r.capacity }
 
 // drive steps c through rounds from..to of l, a trickle up and the download
 // wanting all it is let through, the probes read through the real Delays, and
-// tallies the rounds from tally on.
+// tallies the rounds from tally on. What the controller sees moving is the
+// average of the last rateWindow's rounds, as the stepper gives it, so a climb
+// is judged on throughput that lags it.
 func (l *simLine) drive(c *Controller, delays *Delays, from, to, tally int) simRun {
 	reflectors := []string{"a", "b", "c"}
 	idle := map[string]time.Duration{"a": 7 * time.Millisecond, "b": 9 * time.Millisecond,
 		"c": 12 * time.Millisecond}
 
 	var run simRun
+
+	var window []float64
 
 	for n := from; n < to; n++ {
 		capacity := l.capacity(n)
@@ -66,7 +70,13 @@ func (l *simLine) drive(c *Controller, delays *Delays, from, to, tally int) simR
 			}
 		}
 
-		c.Step(probed(n, 1, flowing, delays.Observe(reflectors, answered)))
+		window = lastRounds(append(window, flowing), int(rateWindow/Tick))
+		seen := 0.0
+		for _, f := range window {
+			seen += f / float64(len(window))
+		}
+
+		c.Step(probed(n, 1, seen, delays.Observe(reflectors, answered)))
 
 		if n >= tally {
 			run.rounds++
@@ -214,15 +224,27 @@ func TestALineThatChangesIsFoundAgain(t *testing.T) {
 }
 
 // A RESTARTED SHAPER STARTS WHERE THE LAST ONE LEFT THE LINE, not low again and
-// not at the interface's speed: with the rate and the line it found resumed, the
-// first minute after a restart overruns the line no more than any other.
+// not at the interface's speed, and no higher than Near of it: stopped while it
+// probed past the line, as here, the next run does not start overrunning it,
+// and the minutes after a restart overrun it no more than any others.
 func TestARestartedShaperStartsWhereTheLineWasLeft(t *testing.T) {
 	fakeRuntimeDir(t)
 
 	line := &simLine{capacity: steady(500), drops: true, dropShare: 0.1, quietShare: 0.002,
 		rng: rand.New(rand.NewPCG(7, 8))}
 	ctl := newRunController(1000, Options{Params: DefaultParams()})
-	line.drive(ctl, &Delays{}, 0, 10*minute, 0)
+	delays := &Delays{}
+	line.drive(ctl, delays, 0, 10*minute, 0)
+
+	// STOPPED PAST THE LINE, the case the cap is for.
+	stop := 10 * minute
+	for ; ctl.Down.Rate <= 500 && stop < 20*minute; stop++ {
+		line.drive(ctl, delays, stop, stop+1, stop+1)
+	}
+	if ctl.Down.Rate <= 500 || ctl.Down.Limit == 0 {
+		t.Fatalf("ten minutes more never probed past the line: rate %.1f, found at %.1f", ctl.Down.Rate,
+			ctl.Down.Limit)
+	}
 
 	at := nic{"eno2np1", "2", testMAC, "boot-a"}
 	rememberer(slog.New(&records{}), ctl, at)(ctl.Up.Rate, ctl.Down.Rate)
@@ -230,17 +252,26 @@ func TestARestartedShaperStartsWhereTheLineWasLeft(t *testing.T) {
 	next := newRunController(1000, Options{Params: DefaultParams()})
 	resumeLearned(slog.New(&records{}), next, at)
 
-	if next.Down.Rate != ctl.Down.Rate || next.Down.Limit != ctl.Down.Limit || next.Down.Limit == 0 {
-		t.Fatalf("the next run started at %.1f with the line at %.1f, want the %.1f and %.1f left",
-			next.Down.Rate, next.Down.Limit, ctl.Down.Rate, ctl.Down.Limit)
+	// WHERE THE RUN LEFT IT, BUT NO HIGHER THAN NEAR OF THE LINE: one stopped
+	// while it probed past the line would otherwise start the next overrunning.
+	want := min(ctl.Down.Rate, DefaultParams().Near*ctl.Down.Limit)
+	if next.Down.Rate != want || next.Down.Limit != ctl.Down.Limit || next.Down.Limit == 0 {
+		t.Fatalf("the next run started at %.1f with the line at %.1f, want %.1f and the %.1f left",
+			next.Down.Rate, next.Down.Limit, want, ctl.Down.Limit)
 	}
 
-	first := line.drive(next, &Delays{}, 10*minute, 11*minute, 10*minute)
-	if share := first.overrunShare(); share > 0.1 {
-		t.Errorf("the first minute after a restart overran the line in %.1f%% of the rounds", 100*share)
+	restarted := &Delays{}
+	if first := line.drive(next, restarted, stop, stop+20*int(time.Second/Tick), stop); first.overran != 0 {
+		t.Errorf("the first 20 s after a restart overran the line in %d rounds, so it resumed past it",
+			first.overran)
 	}
-	if share := first.carriedShare(); share < 0.75 {
-		t.Errorf("the first minute after a restart carried %.1f%% of the line, so it started low again",
+
+	after := line.drive(next, restarted, stop+20*int(time.Second/Tick), stop+5*minute, stop)
+	if share := after.overrunShare(); share > 0.1 {
+		t.Errorf("the five minutes after a restart overran the line in %.1f%% of the rounds", 100*share)
+	}
+	if share := after.carriedShare(); share < 0.8 {
+		t.Errorf("the five minutes after a restart carried %.1f%% of the line, so it started low again",
 			100*share)
 	}
 }

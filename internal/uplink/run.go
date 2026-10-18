@@ -23,8 +23,8 @@ const Tick = 500 * time.Millisecond
 // in one tick. Over two seconds the lumps average out.
 const rateWindow = 2 * time.Second
 
-// fallbackSpeed is the starting rate for an interface whose speed the kernel
-// does not report, in Mbit/s: high enough to hold nothing back on any line.
+// fallbackSpeed is the ceiling for an interface whose speed the kernel does
+// not report, in Mbit/s: high enough to hold nothing back on any line.
 const fallbackSpeed = 10000
 
 // Options are what Run shapes and how.
@@ -314,11 +314,9 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 	st.remember = remember
 
 	// AND THE RATES IN FORCE ARE RECORDED AGAIN EVERY MINUTE AND AS THE LOOP
-	// ENDS, though they have not changed: the next run returns them toward the
-	// ceiling for the time since they were recorded, which must be the time the
-	// shaper was down, not the time since the line was last cut. A rate held for
-	// hours resumed after an upgrade's restart would otherwise come back near the
-	// ceiling. What CAKE was given (applied), never a rise too small to apply.
+	// ENDS, though they have not changed, with each direction's Limit as it is
+	// then, so a crash or a reboot loses at most a minute of what was found.
+	// What CAKE was given (applied), never a rise too small to apply.
 	defer st.record()
 
 	exe := currentExecutable()

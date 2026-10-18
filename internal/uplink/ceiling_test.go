@@ -48,10 +48,17 @@ func TestARunStartsEachDirectionLowUnderItsCeiling(t *testing.T) {
 			"interface's 1000", c.Up.Rate, c.Down.Rate, c.Up.Max, p.Start)
 	}
 
-	// A CEILING BELOW START IS THE START, and the floor holds under both.
+	// A CEILING BELOW START IS THE START, and the floor holds under both: an
+	// interface that reports 5 Mbit/s starts at the floor.
 	c = newRunController(1000, Options{MaxUp: 15, Params: p})
 	if c.Up.Rate != 15 {
 		t.Fatalf("under a 15 Mbit/s ceiling the upload starts at %.1f", c.Up.Rate)
+	}
+
+	c = newRunController(5, Options{Params: p})
+	if c.Up.Rate != Floor || c.Down.Rate != Floor {
+		t.Fatalf("on a 5 Mbit/s interface the run starts at %.1f/%.1f, want the %.0f floor", c.Up.Rate,
+			c.Down.Rate, Floor)
 	}
 }
 
