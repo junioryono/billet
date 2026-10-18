@@ -17,8 +17,8 @@ const (
 	queueTimeLimit = 50_000
 )
 
-// offeredJob is the job an offer named: GitHub's job id AND its run, because a
-// job id alone has been seen in two runs (job_identity.go's rule).
+// offeredJob is the job an offer named: GitHub's job id and its run, the two
+// aliases sameActualJob refuses to let contradict each other.
 type offeredJob struct {
 	job string
 	run int64
@@ -30,19 +30,21 @@ type offeredQueueTime struct {
 	seen   time.Time
 }
 
-// rememberQueueTimes keeps GitHub's queue time from the jobs an offer or an
-// assignment names, for the job's start to record.
+// rememberQueueTimes keeps GitHub's queue time from the jobs an offer and an
+// assignment name, for the job's start to record, and says how many of each
+// carried one.
 //
 // THE START DOES NOT CARRY IT. Every JobStarted and JobCompleted the reference
 // fleet received on 2026-10-18 under v0.17.0 had queueTime 0001-01-01 while both
-// assignment times were set, and actions-runner-controller reads it from
-// JobAvailable for the same reason (its #4507). The first time seen wins: a
-// redelivered offer names the same job and the same time.
+// assignment times were set. Whether the offer and the assignment carry it is
+// NOT yet measured; the counts this returns are logged so the fleet can answer.
+// The latest time seen wins: a redelivery carries the same one, and a re-run
+// attempt of the same job is queued again.
 //
 // Held in memory only, so a restart between a job's offer and its start leaves
 // that job's wait unknown. Entries past the retention are dropped at most once
 // an hour, as messages arrive.
-func (l *Listener) rememberQueueTimes(batches ...[]dispatch.Job) {
+func (l *Listener) rememberQueueTimes(available, assigned []dispatch.Job) (int, int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -55,18 +57,25 @@ func (l *Listener) rememberQueueTimes(batches ...[]dispatch.Job) {
 		}
 		l.queuedPruned = now
 	}
-	for _, jobs := range batches {
+	remember := func(jobs []dispatch.Job) int {
+		timed := 0
 		for i := range jobs {
 			job := &jobs[i]
-			if job.JobID == "" || job.RunID == 0 || job.QueuedAt.IsZero() {
+			if job.QueuedAt.IsZero() {
+				continue
+			}
+			timed++
+			if job.JobID == "" || job.RunID == 0 {
 				continue
 			}
 			id := offeredJob{job: job.JobID, run: job.RunID}
-			if _, ok := l.queued[id]; !ok && len(l.queued) < queueTimeLimit {
+			if _, ok := l.queued[id]; ok || len(l.queued) < queueTimeLimit {
 				l.queued[id] = offeredQueueTime{queued: job.QueuedAt, seen: now}
 			}
 		}
+		return timed
 	}
+	return remember(available), remember(assigned)
 }
 
 // withOfferedQueueTime is a started job with the queue time its offer carried

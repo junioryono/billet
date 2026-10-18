@@ -70,10 +70,10 @@ func TestAStartTakesTheQueueTimeItsJobWasOfferedWith(t *testing.T) {
 	}
 }
 
-// AN OFFER'S QUEUE TIME BELONGS TO ONE RUN OF ONE JOB, the first offer of it
-// wins, a time the message carried is its own, and offers are forgotten past
-// their retention and kept to a limit, so a listener that runs for months does
-// not keep every job it was ever offered.
+// AN OFFER'S QUEUE TIME BELONGS TO ONE RUN OF ONE JOB, the latest offer of it
+// wins, a time the message carried is its own, each kind's timed jobs are
+// counted, and offers are forgotten past their retention and kept to a limit,
+// so a listener that runs for months does not keep every job it was offered.
 func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	t.Parallel()
 
@@ -83,27 +83,30 @@ func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 
 	queued := now.Add(-time.Minute)
 	offered := job11
-	offered.QueuedAt = queued
-	rerun := job11
-	rerun.RunID, rerun.QueuedAt = 999, queued.Add(-time.Hour)
-	l.rememberQueueTimes([]dispatch.Job{offered}, []dispatch.Job{rerun})
+	offered.QueuedAt = queued.Add(-2 * time.Hour)
+	otherRun := job11
+	otherRun.RunID, otherRun.QueuedAt = 999, queued.Add(-time.Hour)
+	untimed := job13
+	if a, b := l.rememberQueueTimes([]dispatch.Job{offered, untimed}, []dispatch.Job{otherRun}); a != 1 || b != 1 {
+		t.Errorf("counted %d offered and %d assigned jobs with a queue time, want 1 and 1", a, b)
+	}
 
-	redelivered := offered
-	redelivered.QueuedAt = queued.Add(time.Hour)
-	l.rememberQueueTimes(nil, []dispatch.Job{redelivered})
+	requeued := offered
+	requeued.QueuedAt = queued
+	l.rememberQueueTimes(nil, []dispatch.Job{requeued})
 
 	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.Equal(queued) {
-		t.Errorf("the start took %s, want its own run's first offer, %s", got, queued)
+		t.Errorf("the start took %s, want its own run's latest offer, %s", got, queued)
 	}
 	other := dispatch.Job{JobID: job11.JobID, RunID: 999}
-	if got := l.withOfferedQueueTime(other).QueuedAt; !got.Equal(rerun.QueuedAt) {
-		t.Errorf("the other run's start took %s, want its own %s", got, rerun.QueuedAt)
+	if got := l.withOfferedQueueTime(other).QueuedAt; !got.Equal(otherRun.QueuedAt) {
+		t.Errorf("the other run's start took %s, want its own %s", got, otherRun.QueuedAt)
 	}
 	if got := l.withOfferedQueueTime(dispatch.Job{JobID: job11.JobID}).QueuedAt; !got.IsZero() {
 		t.Errorf("a start naming no run took %s; a job id alone may name two runs", got)
 	}
 	runless := dispatch.Job{JobID: "job-14", QueuedAt: queued}
-	l.rememberQueueTimes([]dispatch.Job{runless})
+	l.rememberQueueTimes([]dispatch.Job{runless}, nil)
 	if got := l.withOfferedQueueTime(dispatch.Job{JobID: "job-14"}).QueuedAt; !got.IsZero() {
 		t.Errorf("a start took %s from an offer that named no run", got)
 	}
@@ -113,59 +116,73 @@ func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 		t.Errorf("a start carrying its own queue time took %s, want its own %s", got, carried.QueuedAt)
 	}
 
-	now = now.Add(queueTimeRetention + time.Hour)
-	l.rememberQueueTimes([]dispatch.Job{job12})
-	if len(l.queued) != 0 {
-		t.Errorf("%d offers kept past the retention, want none", len(l.queued))
+	now = now.Add(queueTimeRetention - time.Hour)
+	recent := job12
+	recent.QueuedAt = now
+	l.rememberQueueTimes([]dispatch.Job{recent}, nil)
+	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.Equal(queued) {
+		t.Errorf("an offer inside its retention was dropped: the start took %s, want %s", got, queued)
+	}
+
+	now = now.Add(2 * time.Hour)
+	l.rememberQueueTimes(nil, nil)
+	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.IsZero() {
+		t.Errorf("a start took %s from an offer past its retention", got)
+	}
+	if got := l.withOfferedQueueTime(job12).QueuedAt; !got.Equal(recent.QueuedAt) {
+		t.Errorf("an offer two hours old was dropped with the expired ones: the start took %s", got)
 	}
 
 	for i := range queueTimeLimit + 1 {
-		l.rememberQueueTimes([]dispatch.Job{{JobID: "job", RunID: int64(i + 1), QueuedAt: queued}})
+		l.rememberQueueTimes([]dispatch.Job{{JobID: "job", RunID: int64(i + 1), QueuedAt: queued}}, nil)
 	}
 	if len(l.queued) != queueTimeLimit {
 		t.Errorf("%d offers kept, want the limit, %d", len(l.queued), queueTimeLimit)
 	}
 }
 
-// A START WHOSE IDENTITY WRITE FAILED TAKES THE OFFER'S TIME WHEN IT IS
-// REDELIVERED, and an offer in the same message as its start is seen first.
-func TestAQueueTimeSurvivesAFailedWriteAndArrivesWithItsStart(t *testing.T) {
+// AN OFFER IN THE SAME MESSAGE AS ITS START IS SEEN FIRST, and a start whose
+// identity write failed takes the offer's time when it is redelivered.
+func TestAQueueTimeArrivesWithItsStartAndSurvivesAFailedWrite(t *testing.T) {
 	t.Parallel()
 
-	queued := time.Now().Add(-20 * time.Minute).UTC().Truncate(time.Millisecond)
-	p := newRunnerlessPool(t, job11)
-	runner := p.launchedFor11(t)
+	for _, failures := range []int{0, 1} {
+		queued := time.Now().Add(-20 * time.Minute).UTC().Truncate(time.Millisecond)
+		p := newRunnerlessPool(t, job11)
+		runner := p.launchedFor11(t)
 
-	failures := 1
-	p.l.writeJobIdentity = func(ctx context.Context, leaseID string, job alloc.HistoryJob) error {
+		left := failures
+		p.l.writeJobIdentity = func(ctx context.Context, leaseID string, job alloc.HistoryJob) error {
+			if left > 0 {
+				left--
+				return errors.New("injected: the ledger is busy")
+			}
+			return p.a.RecordJobIdentity(ctx, leaseID, job)
+		}
+
+		offered := job12
+		offered.QueuedAt = queued
+		started := job12
+		started.RunnerID, started.RunnerName = 77, runner.RunnerName
+		msgs := []*Message{{MessageID: 2, Available: []dispatch.Job{offered}, Started: []dispatch.Job{started}}}
 		if failures > 0 {
-			failures--
-			return errors.New("injected: the ledger is busy")
+			msgs = append(msgs, &Message{MessageID: 3, Started: []dispatch.Job{started}})
 		}
-		return p.a.RecordJobIdentity(ctx, leaseID, job)
-	}
-
-	offered := job12
-	offered.QueuedAt = queued
-	started := job12
-	started.RunnerID, started.RunnerName = 77, runner.RunnerName
-	for _, msg := range []*Message{
-		{MessageID: 2, Available: []dispatch.Job{offered}, Started: []dispatch.Job{started}},
-		{MessageID: 3, Started: []dispatch.Job{started}},
-	} {
-		msg.Statistics = &Statistics{TotalAssignedJobs: 1}
-		if err := p.l.handle(t.Context(), msg); err != nil {
-			t.Fatalf("start job 12 (message %d): %v", msg.MessageID, err)
+		for _, msg := range msgs {
+			msg.Statistics = &Statistics{TotalAssignedJobs: 1}
+			if err := p.l.handle(t.Context(), msg); err != nil {
+				t.Fatalf("start job 12 (message %d): %v", msg.MessageID, err)
+			}
 		}
-	}
 
-	got, err := p.a.Job(t.Context(), runner.LeaseID)
-	if err != nil {
-		t.Fatalf("Job: %v", err)
-	}
-	if failures != 0 || got.GitHubQueuedAt != stamp(queued) {
-		t.Errorf("after a failed write the redelivered start left queue time %q (%d failures unspent), "+
-			"want the offer's %s", got.GitHubQueuedAt, failures, stamp(queued))
+		got, err := p.a.Job(t.Context(), runner.LeaseID)
+		if err != nil {
+			t.Fatalf("Job: %v", err)
+		}
+		if left != 0 || got.GitHubQueuedAt != stamp(queued) {
+			t.Errorf("with %d failed writes the row's queue time is %q (%d failures unspent), want the offer's %s",
+				failures, got.GitHubQueuedAt, left, stamp(queued))
+		}
 	}
 }
 

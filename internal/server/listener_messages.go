@@ -44,7 +44,12 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	l.mu.Unlock()
 
 	// Before the starts, which may arrive in the same message as their offer.
-	l.rememberQueueTimes(msg.Available, msg.Assigned)
+	availableTimed, assignedTimed := l.rememberQueueTimes(msg.Available, msg.Assigned)
+	if len(msg.Available) > 0 || len(msg.Assigned) > 0 {
+		l.log.Info("github's queue time on the jobs offered and assigned", "tier", l.tier,
+			"available", len(msg.Available), "available_with_queue_time", availableTimed,
+			"assigned", len(msg.Assigned), "assigned_with_queue_time", assignedTimed)
+	}
 
 	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
 	// start is the authoritative runner-to-job binding; resolving the completion

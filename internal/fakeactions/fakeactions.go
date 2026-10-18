@@ -291,8 +291,9 @@ func JobJSON(messageType string, requestID int64, event string, labels ...string
 		labels = []string{}
 	}
 
-	// GitHub sets queueTime on the offer and the assignment and sends the zero
-	// time on a start or a completion (measured on 2026-10-18).
+	// GitHub sends the zero queueTime on a start and a completion (measured on
+	// 2026-10-18); that it sets one on the offer and the assignment is assumed
+	// until the fleet's log says so.
 	queued := time.Now().Format(time.RFC3339)
 	if messageType == "JobStarted" || messageType == "JobCompleted" {
 		queued = time.Time{}.Format(time.RFC3339)
