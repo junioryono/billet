@@ -78,9 +78,11 @@ const (
 	MaxRunJobs = 1000
 	// MaxJobSteps is the most steps the job may list.
 	MaxJobSteps = 1000
-	// maxRunJobPages is what MaxRunJobs takes at runJobsPerPage, so a server
-	// answering a few jobs a page cannot make the read one request per job.
-	maxRunJobPages = (MaxRunJobs + runJobsPerPage - 1) / runJobsPerPage
+	// MaxQueueTimeRunJobs is the most jobs RunQueueTimes reads of one run. It is
+	// read for every run the control plane starts a job of, from the same hourly
+	// budget the scale-set and runner-group calls draw on, so a larger run costs
+	// its first page and is refused rather than read whole.
+	MaxQueueTimeRunJobs = 200
 )
 
 // NewJobRecordsAt builds the job-record reader for one target on the REST API
@@ -135,7 +137,7 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 	}
 
 	var matches []WorkflowJob
-	err := c.listRunJobs(ctx, owner, repository, runID, func(record jobRecord, name string) error {
+	err := c.listRunJobs(ctx, owner, repository, runID, MaxRunJobs, func(record jobRecord, name string) error {
 		if name != runnerName {
 			return nil
 		}
@@ -179,7 +181,9 @@ func (c *runnerGroupPolicyClient) RunQueueTimes(
 
 	times := map[string]time.Time{}
 	shared := map[string]bool{}
-	err := c.listRunJobs(ctx, owner, repository, runID, func(record jobRecord, name string) error {
+	err := c.listRunJobs(ctx, owner, repository, runID, MaxQueueTimeRunJobs, func(record jobRecord,
+		name string,
+	) error {
 		if name == "" || shared[name] {
 			return nil
 		}
@@ -206,11 +210,11 @@ func (c *runnerGroupPolicyClient) RunQueueTimes(
 // listRunJobs hands visit every job of a run, across every attempt, with the
 // name of the runner it ran on (empty for none).
 //
-// THE WHOLE LIST OR AN ERROR: a list longer than MaxRunJobs, one whose count
+// THE WHOLE LIST OR AN ERROR: a list longer than maxJobs, one whose count
 // changes while it is read, or one that repeats a job is could-not-tell rather
-// than a prefix.
+// than a prefix. maxJobs is at most MaxRunJobs.
 func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, repository string,
-	runID int64, visit func(record jobRecord, runnerName string) error,
+	runID int64, maxJobs int, visit func(record jobRecord, runnerName string) error,
 ) error {
 	endpoint, err := repositoryEndpoint(c.base, owner, repository)
 	if err != nil {
@@ -218,12 +222,16 @@ func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, reposi
 	}
 	endpoint += "/actions/runs/" + strconv.FormatInt(runID, 10) + "/jobs"
 
+	// THE PAGES ARE BOUNDED BY WHAT maxJobs TAKES at runJobsPerPage, so a server
+	// answering a few jobs a page cannot make the read one request per job.
+	maxJobs = min(maxJobs, MaxRunJobs)
+	maxPages := (maxJobs + runJobsPerPage - 1) / runJobsPerPage
 	listed := map[int64]bool{}
 	total, read := -1, 0
 	for page := 1; total < 0 || read < total; page++ {
-		if page > maxRunJobPages {
+		if page > maxPages {
 			return fmt.Errorf("github: run %d's %d jobs did not arrive in %d pages",
-				runID, total, maxRunJobPages)
+				runID, total, maxPages)
 		}
 		query := url.Values{"filter": {"all"}, "per_page": {strconv.Itoa(runJobsPerPage)},
 			"page": {strconv.Itoa(page)}}
@@ -240,9 +248,9 @@ func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, reposi
 		switch {
 		case total < 0:
 			total = *body.TotalCount
-			if total > MaxRunJobs {
+			if total > maxJobs {
 				return fmt.Errorf("github: run %d lists %d jobs, more than the %d billet reads",
-					runID, total, MaxRunJobs)
+					runID, total, maxJobs)
 			}
 		case *body.TotalCount != total:
 			return fmt.Errorf("github: run %d's job count changed from %d to %d while it was read",

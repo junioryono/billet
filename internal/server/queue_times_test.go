@@ -91,9 +91,9 @@ func TestAStartedJobsQueueTimeComesFromItsRunsRecord(t *testing.T) {
 	}}
 	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
 	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
-	retries := map[queueTimeRun]queueTimeRetry{}
+	sweep := newQueueTimeSweep()
 
-	s.fillQueueTimesOnce(t.Context(), targets, retries, now)
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
 	if got := reader.asked(); len(got) != 1 || got[0] != ran {
 		t.Fatalf("the first pass read runs %v, want run %d once for both jobs", got, ran)
 	}
@@ -112,23 +112,29 @@ func TestAStartedJobsQueueTimeComesFromItsRunsRecord(t *testing.T) {
 		t.Errorf("runner B's row has queue time %q before its run listed it", got)
 	}
 
-	s.fillQueueTimesOnce(t.Context(), targets, retries, now.Add(30*time.Second))
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(30*time.Second))
 	if got := reader.asked(); len(got) != 1 {
 		t.Errorf("a pass inside the backoff read runs %v again", got[1:])
 	}
 
+	// THE BINDING THAT NAMED RUN 600 IS GONE BEFORE THE NEXT READ, as it is once
+	// a runner's compute is: the row's own record of the run that started is
+	// what the sweep reads.
+	if err := p.a.ForgetPoolRunner(t.Context(), runnerB.LeaseID); err != nil {
+		t.Fatalf("delete runner B's pool binding: %v", err)
+	}
 	reader.mu.Lock()
 	reader.times[ran][provider.InstanceName(runnerB.LeaseID)] = queuedB
 	reader.mu.Unlock()
-	s.fillQueueTimesOnce(t.Context(), targets, retries, now.Add(2*time.Minute))
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(2*time.Minute))
 	if got := rowOf(runnerB.LeaseID); got != stamp(queuedB) {
 		t.Errorf("runner B's row has queue time %q after the backoff, want %s", got, stamp(queuedB))
 	}
-	if _, ok := retries[queueTimeRun{target: "acme", repository: "acme/api", run: ran}]; ok {
+	if _, ok := sweep.retries[queueTimeRun{target: "acme", repository: "acme/api", run: ran}]; ok {
 		t.Error("a run whose jobs all have their time is still scheduled for a retry")
 	}
 
-	s.fillQueueTimesOnce(t.Context(), targets, retries, now.Add(3*time.Minute))
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(3*time.Minute))
 	if got := reader.asked(); len(got) != 2 {
 		t.Errorf("runs read %v; a pass with nothing awaiting a time asked GitHub anyway", got)
 	}
@@ -211,11 +217,11 @@ func TestAQueueTimeReadThatFailsBacksOffAndAnUnservedTierIsNotAsked(t *testing.T
 
 	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, err: errors.New("injected: GitHub is down")}
 	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
-	retries := map[queueTimeRun]queueTimeRetry{}
+	sweep := newQueueTimeSweep()
 	run := queueTimeRun{target: "acme", repository: "acme/api", run: job11.RunID}
 
-	s.fillQueueTimesOnce(t.Context(), map[string]Target{"another-tier": {Provisioner: reader}}, retries, time.Now())
-	s.fillQueueTimesOnce(t.Context(), map[string]Target{p.l.tier: {Provisioner: &fakeProvisioner{}}}, retries,
+	s.fillQueueTimesOnce(t.Context(), map[string]Target{"another-tier": {Provisioner: reader}}, sweep, time.Now())
+	s.fillQueueTimesOnce(t.Context(), map[string]Target{p.l.tier: {Provisioner: &fakeProvisioner{}}}, sweep,
 		time.Now())
 	if got := reader.asked(); len(got) != 0 {
 		t.Fatalf("asked for runs %v of a tier not served or a target that cannot read them", got)
@@ -225,8 +231,8 @@ func TestAQueueTimeReadThatFailsBacksOffAndAnUnservedTierIsNotAsked(t *testing.T
 	now := time.Now()
 	var waits []time.Duration
 	for range 9 {
-		s.fillQueueTimesOnce(t.Context(), targets, retries, now)
-		retry := retries[run]
+		s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
+		retry := sweep.retries[run]
 		waits = append(waits, retry.wait)
 		now = retry.after
 	}
@@ -239,5 +245,68 @@ func TestAQueueTimeReadThatFailsBacksOffAndAnUnservedTierIsNotAsked(t *testing.T
 	}
 	if got := len(reader.asked()); got != 9 {
 		t.Errorf("read the run %d times in 9 passes each at its retry, want 9", got)
+	}
+}
+
+// A THROTTLE OR A REFUSAL PAUSES THE WHOLE TARGET, for fifteen minutes and an
+// hour, and each pass reads at most three runs of a target, so a burst of runs
+// or a missing permission costs the installation a bounded number of requests.
+func TestAThrottledOrRefusedTargetPausesAndAPassReadsABoundedNumberOfRuns(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		err   error
+		pause time.Duration
+	}{
+		{nil, 0},
+		{ErrQueueTimesThrottled, queueTimeThrottled},
+		{ErrQueueTimesRefused, queueTimeRefused},
+	} {
+		p := newRunnerlessPool(t, job11, job12, job13,
+			dispatch.Job{RequestID: 14, RunID: 104, JobID: "job-14"})
+		var msgs []dispatch.Job
+		for i, request := range []int64{11, 12, 13, 14} {
+			runner, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, request)
+			if err != nil {
+				t.Fatalf("the runner launched for %d: %v", request, err)
+			}
+			job := dispatch.Job{RequestID: request, RunID: 700 + request, JobID: runner.LeaseID,
+				RunnerID: int64(80 + i), RunnerName: runner.RunnerName, Owner: "acme", Repository: "api"}
+			msgs = append(msgs, job)
+		}
+		if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: msgs,
+			Statistics: &Statistics{TotalAssignedJobs: len(msgs)}}); err != nil {
+			t.Fatalf("start four jobs of four runs: %v", err)
+		}
+
+		reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, err: tc.err,
+			times: map[int64]map[string]time.Time{}}
+		s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+		targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+		sweep := newQueueTimeSweep()
+		now := time.Now()
+
+		s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
+		want := queueTimeRunsPerTarget
+		if tc.err != nil {
+			want = 1
+		}
+		if got := len(reader.asked()); got != want {
+			t.Errorf("with %v the first pass read %d runs, want %d", tc.err, got, want)
+		}
+		if tc.err == nil {
+			continue
+		}
+		if got := sweep.paused["acme"]; !got.Equal(now.Add(tc.pause)) {
+			t.Errorf("with %v the target is paused until %s, want %s later", tc.err, got, tc.pause)
+		}
+		s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(tc.pause-time.Second))
+		if got := len(reader.asked()); got != 1 {
+			t.Errorf("with %v a pass inside the pause read %d runs in all, want only the first", tc.err, got)
+		}
+		s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(tc.pause))
+		if got := len(reader.asked()); got != 2 {
+			t.Errorf("with %v the pass after the pause read %d runs in all, want one more", tc.err, got)
+		}
 	}
 }

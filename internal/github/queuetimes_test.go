@@ -59,10 +59,39 @@ func TestARunsQueueTimesAreEachRunnersJobsCreatedAt(t *testing.T) {
 		t.Errorf("requests = %d, want a token and two pages", requests.Load())
 	}
 
-	short, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
-		fmt.Fprint(w, `{"total_count":2,"jobs":[`+job(1, `"billet-a"`, `"2026-10-18T21:37:09Z"`)+`]}`)
+	short, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, page int) {
+		if page == 1 {
+			fmt.Fprint(w, `{"total_count":2,"jobs":[`+job(1, `"billet-a"`, `"2026-10-18T21:37:09Z"`)+`]}`)
+			return
+		}
+		fmt.Fprint(w, `{"total_count":2,"jobs":[]}`)
 	})
-	if _, err := short.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil {
-		t.Error("a list that ended short of its count was read as an answer")
+	if _, err := short.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil ||
+		!strings.Contains(err.Error(), "ended after 1 of the 2") {
+		t.Errorf("a list that ended short of its count = %v, want refused for ending early", err)
+	}
+}
+
+// A RUN OF MORE THAN MaxQueueTimeRunJobs COSTS ONE PAGE AND IS REFUSED, because
+// the read is made for every run the control plane starts a job of, from the
+// installation's shared hourly budget; RunnerJob, read once per command, still
+// reads such a run whole.
+func TestAQueueTimeReadOfALargeRunCostsOnePage(t *testing.T) {
+	t.Parallel()
+
+	jobs := make([]string, 0, runJobsPerPage)
+	for i := range runJobsPerPage {
+		jobs = append(jobs, fmt.Sprintf(`{"id":%d,"name":"j","runner_name":"billet-%d","created_at":"2026-10-18T21:37:09Z","steps":[]}`,
+			i+1, i))
+	}
+	c, requests := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		fmt.Fprintf(w, `{"total_count":%d,"jobs":[%s]}`, MaxQueueTimeRunJobs+1, strings.Join(jobs, ","))
+	})
+	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil ||
+		!strings.Contains(err.Error(), fmt.Sprintf("more than the %d", MaxQueueTimeRunJobs)) {
+		t.Errorf("a run of %d jobs = %v, want refused", MaxQueueTimeRunJobs+1, err)
+	}
+	if requests.Load() != 2 {
+		t.Errorf("requests = %d, want a token and one page", requests.Load())
 	}
 }

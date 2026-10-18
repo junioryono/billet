@@ -421,6 +421,6 @@ func (l *Listener) identifyStarted(ctx context.Context, job dispatch.Job) (dispa
 		}
 		return dispatch.Job{}, fmt.Errorf("server: bind started runner %q: %w", job.RunnerName, err)
 	}
-	l.recordJobIdentity(ctx, leaseID, job)
+	l.recordJobIdentity(ctx, leaseID, job, job.RunID)
 	return identified, nil
 }

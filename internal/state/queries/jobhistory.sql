@@ -65,7 +65,9 @@ UPDATE job_history
                                ELSE github_scale_set_assigned_at END,
        github_runner_assigned_at = CASE WHEN github_runner_assigned_at = ''
                                THEN CAST(@github_runner_assigned_at AS TEXT)
-                               ELSE github_runner_assigned_at END
+                               ELSE github_runner_assigned_at END,
+       github_run_id = CASE WHEN github_run_id = 0 THEN CAST(@github_run_id AS BIGINT)
+                            ELSE github_run_id END
  WHERE lease_id = @lease_id
    AND (github_job_id = '' OR github_job_id = CAST(@github_job_id AS TEXT));
 
@@ -99,21 +101,22 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
 -- run and GitHub's job id (the lease names the runner). Newest start first,
 -- bounded, so a backlog is worked from the jobs an operator is looking at now.
 --
--- THE RUN IS THE POOL BINDING'S WHEN IT NAMES THIS JOB. A pooled runner's row
--- keeps the run of the job it was launched for, and GitHub may give the runner
--- a job of another run; the binding records the run that started, until the
--- compute is gone. A run that is wrong finds no job on the runner, never
--- another job's time, because the runner's name is unique.
-SELECT h.lease_id, h.tier, COALESCE(h.repo, '') AS repo,
-       CAST(CASE WHEN COALESCE(p.run_id, 0) > 0 THEN p.run_id ELSE COALESCE(h.run_id, 0) END
+-- THE RUN IS THE ONE THAT STARTED: github_run_id, which the JobStarted wrote
+-- (migration 62). A pooled runner's run_id is the run of the job it was
+-- launched for, and GitHub may give the runner a job of another run, so
+-- run_id is read only for a row with no github_run_id, which a row written
+-- before the migration has, and a direct assignment's run_id names the job it
+-- ran. A run that is wrong finds no job on the runner, never another job's
+-- time, because the runner's name is unique.
+SELECT lease_id, tier, COALESCE(repo, '') AS repo,
+       CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       h.github_job_id
-  FROM job_history h
-  LEFT JOIN pool_runners p ON p.lease_id = h.lease_id AND p.job_id = h.github_job_id
- WHERE h.started_at IS NOT NULL AND h.started_at >= @since
-   AND h.github_queued_at = '' AND h.github_job_id != '' AND COALESCE(h.repo, '') != ''
-   AND (COALESCE(p.run_id, 0) > 0 OR COALESCE(h.run_id, 0) > 0)
- ORDER BY h.started_at DESC, h.lease_id DESC
+       github_job_id
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= @since
+   AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
+   AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
+ ORDER BY started_at DESC, lease_id DESC
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListAttributedFailures :many
