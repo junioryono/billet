@@ -680,3 +680,31 @@ func TestThePendingListAsksForTheWholeError(t *testing.T) {
 		t.Fatalf("an outage joined with a cleanup failure was pending: %q", why)
 	}
 }
+
+// A SCHEMA MOVE BESIDE A PENDING CAUSE IS NOT PENDING. The tail opens through a
+// completion handle, which never migrates, so this is defensive: an open that
+// did migrate joins a state.SchemaMoved to whatever refused it, and that leaf
+// is not one of the closed list's causes. Asked of the whole error, the pair
+// refuses, and the refusal says both what refused the open and what moved.
+func TestARefusalAfterThisHostMigratedIsNotPending(t *testing.T) {
+	refused := fmt.Errorf("open the ledger: %w", state.ErrReleaseBehind)
+	if why := retirePendingReason(refused); why == "" {
+		t.Fatal("a release refusal alone was not pending")
+	}
+
+	moved := errors.Join(refused, &state.SchemaMoved{From: 59, To: 60})
+	if why := retirePendingReason(moved); why != "" {
+		t.Fatalf("a release refusal after this host migrated the ledger was pending: %q", why)
+	}
+
+	r := retireLedgerProblem(t.Context(), t.Context(), moved, "open the ledger", &retireTailAnswer{})
+	if r == nil {
+		t.Fatal("a release refusal beside a schema move was not refused")
+	}
+
+	for _, want := range []string{state.ErrReleaseBehind.Error(), "from schema 59 to schema 60"} {
+		if !strings.Contains(r.Why, want) {
+			t.Errorf("the refusal does not say %q: %s", want, r.Why)
+		}
+	}
+}

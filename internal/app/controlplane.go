@@ -180,8 +180,13 @@ func OpenControlPlane(
 
 	// THE ACCESS ENDS WITH THE OPEN, whatever the open said: what follows waits
 	// on the claim, and nothing waits on a lock while it does.
+	//
+	// AND EVERY FAILURE FROM HERE TO THE CLAIM CARRIES WHAT THE OPEN MIGRATED: a
+	// failed open joins it itself, and these are the refusals after a successful
+	// one. A config refused after an upgrade's migration is the case where an
+	// operator's next step, going back to the older binary, depends on knowing.
 	if err := errors.Join(err, release()); err != nil {
-		return nil, errors.Join(fmt.Errorf("server state: %w", err), closeIfOpen(db))
+		return nil, errors.Join(fmt.Errorf("server state: %w", err), unclaimedMoveOf(db), closeIfOpen(db))
 	}
 
 	// BUILT BEFORE THE CLAIM, DELIBERATELY, because it validates the CONFIG and
@@ -193,7 +198,7 @@ func OpenControlPlane(
 	allocator, err := alloc.New(db, allocatorLimits(cfg), cfg.Tiers,
 		append([]alloc.Option{alloc.WithPlacement(cfg.Server.Placement)}, steering.Allocator...)...)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("capacity allocator: %w", err), db.Close())
+		return nil, errors.Join(fmt.Errorf("capacity allocator: %w", err), db.UnclaimedMove(), db.Close())
 	}
 
 	// Everything billet.yaml says about the control plane, assembled in one place
@@ -202,7 +207,7 @@ func OpenControlPlane(
 	// INVOKED, not about the file.
 	serverOpts, err := server.OptionsFromConfig(cfg)
 	if err != nil {
-		return nil, errors.Join(err, db.Close())
+		return nil, errors.Join(err, db.UnclaimedMove(), db.Close())
 	}
 
 	cp := &ControlPlane{
@@ -228,6 +233,11 @@ func (cp *ControlPlane) Close() error { return cp.db.Close() }
 // LeadershipLost reports whether this control plane's ledger has refused a
 // write because another controller took the deployment.
 func (cp *ControlPlane) LeadershipLost() bool { return cp.db.LeadershipLost() }
+
+// UnclaimedMove is the schema this control plane's open migrated while no
+// claim has yet recorded its release, as an error to join to a failure between
+// the open and the claim, or nil. See state.SchemaMoved.
+func (cp *ControlPlane) UnclaimedMove() error { return cp.db.UnclaimedMove() }
 
 // BecomeController takes this deployment's controller claim, waiting for it on
 // a standby, and starts the fence that ends the process through stop the
@@ -657,14 +667,28 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// stops through a CANCELLED CONTEXT here, which Run reports as a clean stop.
 	// Returning nil would exit 0 — a control plane that was fenced out of its own
 	// deployment reporting a successful shutdown, and systemd leaving it stopped.
+	//
+	// AND WHAT THE PLANE ITSELF RETURNED IS KEPT BESIDE IT: the refused write
+	// says which ledger record moved, and a fault of the plane's own is still a
+	// fault.
 	if s.db.LeadershipLost() {
-		return fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
+		return errors.Join(fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
 			"handed back; the controller that replaced this one adopts both. If that "+
 			"replacement was itself transient, restarting is how this host takes the "+
-			"deployment back", state.ErrLeadershipLost)
+			"deployment back", state.ErrLeadershipLost), err)
 	}
 
 	return err
+}
+
+// unclaimedMoveOf is what a handle an open may or may not have produced
+// migrated and no claim has recorded, or nil.
+func unclaimedMoveOf(db *state.DB) error {
+	if db == nil {
+		return nil
+	}
+
+	return db.UnclaimedMove()
 }
 
 // scansAtOpen reports whether opening this config's ledger reads the whole
