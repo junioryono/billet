@@ -14,7 +14,7 @@ set -e
 #
 # To remove them, do it deliberately:
 #
-#   rm -rf /var/lib/billet /etc/billet
+#   rm -rf /var/lib/billet /var/lib/billet-uplink /etc/billet
 #   rm -f /etc/needrestart/conf.d/90-billet.conf
 #   userdel billet
 

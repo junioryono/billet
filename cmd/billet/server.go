@@ -216,6 +216,7 @@ func serverHost(env cli.Env) app.Host {
 		AuthorityLock: fleetops.AuthorityLockAccess,
 		Ready:         func() error { return host.NotifyReady(env) },
 		Status:        func(text string) error { return host.NotifyStatus(env, text) },
+		ExtendStart:   host.ExtendStartFor(env),
 		Out:           env.Stdout,
 	}
 }
