@@ -291,6 +291,13 @@ func JobJSON(messageType string, requestID int64, event string, labels ...string
 		labels = []string{}
 	}
 
+	// GitHub sets queueTime on the offer and the assignment and sends the zero
+	// time on a start or a completion (measured on 2026-10-18).
+	queued := time.Now().Format(time.RFC3339)
+	if messageType == "JobStarted" || messageType == "JobCompleted" {
+		queued = time.Time{}.Format(time.RFC3339)
+	}
+
 	return map[string]any{
 		"messageType":     messageType,
 		"runnerRequestId": requestID,
@@ -302,7 +309,7 @@ func JobJSON(messageType string, requestID int64, event string, labels ...string
 		"workflowRunId":   requestID,
 		"eventName":       event,
 		"requestLabels":   labels,
-		"queueTime":       time.Now().Format(time.RFC3339),
+		"queueTime":       queued,
 	}
 }
 
