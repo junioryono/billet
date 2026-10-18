@@ -404,6 +404,9 @@ type mappedDevice struct {
 	// Snap is the mapped snapshot's name, and `-` for an image's head
 	// (measured against 20.2.3 on 2026-10-13).
 	Snap string `json:"snap"`
+	// Namespace is the image's RADOS namespace, empty for the pool's default
+	// (measured against 20.2.3 on 2026-10-16).
+	Namespace string `json:"namespace"`
 }
 
 // mappedDevices lists the host devices a cache-pool image is mapped to.

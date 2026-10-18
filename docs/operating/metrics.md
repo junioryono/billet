@@ -53,6 +53,12 @@ A node with `node.monitoring` also counts how its job sampler keeps up, as the s
 | `billet_node_usage_gaps_total{cause}` | intervals of a job's series the sampler did not see, by cause: `missed_tick`, `slow_read`, `failed_read`, `late_first_read`, `counter_fell`, `handover` and the rest the [configuration reference](../reference/configuration.md) lists, each reported from the start at zero. Counted as the sampler keeps the sample that ends one (a counter that fell and the catch-up after it among them) or marks earlier ones; a job's last interval, which its final read decides, is not counted |
 | `billet_node_usage_io_bounded_total` | reads of a job's disk written that writeback kept moving on every pass, recorded as a lower bound that the next read corrects rather than as a gap |
 
+A node with `node.ceph` also reads its kernel's RBD mappings at every scrape, with the same could-not-tell rule (`billet_scrape_up{source="rbd"}`). A node without `node.ceph` reports none.
+
+| Metric | What it is |
+|---|---|
+| `billet_node_rbd_mappings{state}` | this host's kernel mappings of images in the site's pools, by what accounts for each: `root_disk` (a guest's root disk, which its microVM holds), `generation` (a read-only check of a cache generation), `session` (a cache volume a cache session on this node names), `recent` (a cache volume named less than six hours ago, whose custody record may not be written yet), `unaccounted` (a cache volume named longer ago that no cache session on this node names, held by no job of this node's; on a host that runs a second node identity, that one's volumes count here too), and `other` (anything else in those pools, such as a map an interrupted `billet images pull` left). The node's eviction pass, at start and every six hours, unmaps without force each `unaccounted` mapping that an earlier pass in the same process also found unaccounted, at least an hour before, and whose volume records this node as the one that mapped it, unless the kernel holds it open; a count that stays above zero is a mapping something on the host still has open, named in the node's `kept kernel mappings` warning |
+
 ## Reaching it from another host
 
 The endpoint has no authentication, and what it reports is the deployment's own business. So `listen` must be a literal loopback address, `127.0.0.1` or `[::1]`, unless `allow_remote: true` is set beside it. A name such as `localhost` is not accepted on its own, because the bind would resolve it again and a resolver could map it to another interface:
