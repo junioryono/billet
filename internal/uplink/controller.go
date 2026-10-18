@@ -209,7 +209,9 @@ const foundShare = 0.5
 // acknowledgements a download draws are about 2 to 3% of it, and a cut leaves
 // an upload carrying only them with a rate they fill, so no share of its own
 // rate tells them from a full upload; an upload filling its own 50 Mbit/s
-// beside a 600 Mbit/s download on a cable line is 8% of it.
+// beside a 600 Mbit/s download on a cable line is 8% of it. Under a twentieth
+// (a 1000/35 line) nothing tells them apart beside a busy download, so such an
+// upload's line is found while the download is quiet, and kept.
 const ackShare = 0.05
 
 // improvement is the least a cut must shorten the queue by to count as having
