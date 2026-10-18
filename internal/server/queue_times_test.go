@@ -417,3 +417,50 @@ func TestTheQueueTimeSweepPagesTheLedgerAndResumes(t *testing.T) {
 		t.Errorf("a pass with every run backed off read %d runs in all, want still 4", got)
 	}
 }
+
+// A JOB THE NEWEST PAGE AND THE BACKLOG BOTH READ IS GATHERED ONCE, so a second
+// copy's write cannot back off a run whose time the first recorded.
+func TestAJobBothScansReadIsGatheredOnce(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11, job12, job13)
+	var started []dispatch.Job
+	for _, request := range []int64{11, 12, 13} {
+		runner, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, request)
+		if err != nil {
+			t.Fatalf("the runner launched for %d: %v", request, err)
+		}
+		started = append(started, dispatch.Job{RequestID: request, RunID: 990, JobID: runner.LeaseID,
+			RunnerID: 60 + request, RunnerName: runner.RunnerName, Owner: "acme", Repository: "api"})
+	}
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: started,
+		Statistics: &Statistics{TotalAssignedJobs: 3}}); err != nil {
+		t.Fatalf("start three jobs of one run: %v", err)
+	}
+
+	now := time.Now()
+	newest, err := p.a.JobsAwaitingQueueTime(t.Context(), now.Add(-queueTimeWindow), alloc.QueueTimeCursor{}, 1)
+	if err != nil || len(newest) != 1 {
+		t.Fatalf("the newest job awaiting a queue time: %v, %v", newest, err)
+	}
+
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+	sweep := newQueueTimeSweep()
+	// Pages of two from a cursor one row in: the newest page holds the first two
+	// jobs and the backlog's the second and third, so the second is read twice.
+	sweep.pageRows, sweep.pages, sweep.cursor = 2, 2, newest[0].Cursor
+
+	work, ok := s.gatherQueueTimeWork(t.Context(), targets, sweep, now)
+	if !ok || len(work) != 1 {
+		t.Fatalf("gathered %d runs (%t), want the one", len(work), ok)
+	}
+	leases := map[string]int{}
+	for _, job := range work[0].jobs {
+		leases[job.LeaseID]++
+	}
+	if len(work[0].jobs) != 3 || len(leases) != 3 {
+		t.Errorf("gathered %d jobs of %d leases, want each of the three once", len(work[0].jobs), len(leases))
+	}
+}

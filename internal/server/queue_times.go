@@ -198,9 +198,10 @@ func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Targ
 func (s *Server) gatherQueueTimeWork(ctx context.Context, targets map[string]Target, sweep *queueTimeSweep,
 	now time.Time,
 ) ([]queueTimeWork, bool) {
-	// A job both scans read is gathered twice, which the write-once column makes
-	// one write that lands and one that changes nothing.
+	// A JOB BOTH SCANS READ IS GATHERED ONCE: a second copy's write could time
+	// out after the first landed and back off a run whose time is recorded.
 	index := map[queueTimeRun]int{}
+	gathered := map[string]bool{}
 	var work []queueTimeWork
 
 	// scan reads up to pages pages from from, and says where it stopped and
@@ -217,13 +218,14 @@ func (s *Server) gatherQueueTimeWork(ctx context.Context, targets map[string]Tar
 				job := &jobs[i]
 				target := targets[job.Tier]
 				reader, ok := target.Provisioner.(QueueTimes)
-				if !ok {
+				if !ok || gathered[job.LeaseID] {
 					continue
 				}
 				run := queueTimeRun{target: target.Config.Name, repository: job.Repository, run: job.RunID}
 				if retry, ok := sweep.retries[run]; ok && now.Before(retry.after) {
 					continue
 				}
+				gathered[job.LeaseID] = true
 				at, seen := index[run]
 				if !seen {
 					at = len(work)
