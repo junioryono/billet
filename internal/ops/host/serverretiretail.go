@@ -451,7 +451,11 @@ func retireLocatorDSN(env cli.Env, loc retirement.JournalLocator) (state.DSN, st
 // could-not-tell and refuses, because those say something about the ledger
 // rather than about this host's distance from it. It is asked of EVERY error
 // the tail's ledger work produces, not only of the open's, because an outage
-// that begins after the connection is established is the same outage.
+// that begins after the connection is established is the same outage. A
+// state.SchemaMoved beside any of them is an independent leaf the list does
+// not name, so that error is not pending: the tail's own open is a completion
+// open, which never migrates, so this is defensive, and it keeps a move this
+// host made from being handed away as somebody else's to finish.
 func retirePendingReason(err error) string {
 	// EVERY QUESTION BELOW IS ASKED OF THE WHOLE ERROR, and each the same way:
 	// an open that refuses joins its answer with its own cleanup, so a tree

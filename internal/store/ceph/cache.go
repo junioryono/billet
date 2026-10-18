@@ -404,6 +404,13 @@ func (c *Client) Create(
 		return storecontract.Volume{}, fmt.Errorf("ceph: create cache volume for %q: %w", key, err)
 	}
 
+	if err := c.markMapper(ctx, handle); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), MapTimeout)
+		defer cancel()
+
+		return storecontract.Volume{}, errors.Join(err, c.discardCacheVolume(cleanupCtx, handle))
+	}
+
 	device, err := c.mapCache(ctx, handle)
 	if err != nil {
 		// ON A CONTEXT OF ITS OWN: the map may have failed because the caller's
@@ -416,6 +423,21 @@ func (c *Client) Create(
 	}
 
 	return storecontract.Volume{Key: key, Handle: handle, Device: device}, nil
+}
+
+// mapperKey is the metadata a node's cache store writes on a writable volume
+// before it maps it: which node maps it, the proof SweepKernelMappings needs.
+const mapperKey = cacheMetaPrefix + "mapped_by"
+
+// markMapper records this client's owner on a writable volume it is about to
+// map, when it has one. ALWAYS AFTER THE CLONE, never inherited: a clone copies
+// its parent's metadata, and a generation's names the node that published it.
+func (c *Client) markMapper(ctx context.Context, handle string) error {
+	if c.owner == "" {
+		return nil
+	}
+
+	return c.metaSet(ctx, handle, mapperKey, c.owner)
 }
 
 func (c *Client) mapCache(ctx context.Context, handle string) (string, error) {
@@ -1048,6 +1070,9 @@ func (c *Client) Clone(
 			fmt.Errorf("ceph: materialize cache %q: %w", key, err))
 	}
 	if err := c.metaSet(ctx, handle, cacheMetaPrefix+"lineage", strconv.Itoa(cloneDepth)); err != nil {
+		return storecontract.Volume{}, c.cleanupCloneFailure(ctx, leaseID, handle, err)
+	}
+	if err := c.markMapper(ctx, handle); err != nil {
 		return storecontract.Volume{}, c.cleanupCloneFailure(ctx, leaseID, handle, err)
 	}
 

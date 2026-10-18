@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -71,6 +73,10 @@ func (p *Provider) addTap(ctx context.Context, tap, bridge string, uid int) erro
 // permissions failure or a busy device still fails loudly — a tap left attached to
 // a bridge is a device the next launch under the same lease will collide with.
 func (p *Provider) deleteTap(ctx context.Context, tap string) error {
+	if tap == "" {
+		return nil
+	}
+
 	if _, err := p.run(ctx, ipBinary, []string{"link", "del", "dev", tap}); err != nil {
 		if isNoSuchDevice(err) {
 			return nil
@@ -85,6 +91,57 @@ func (p *Provider) deleteTap(ctx context.Context, tap string) error {
 // errTapTaken marks a collision on the truncated tap name, so the unwind leaves the
 // device alone: it belongs to a microVM this launch did not start.
 var errTapTaken = errors.New("the network device name is already taken")
+
+// sysNetDir is where the kernel lists network devices.
+const sysNetDir = "/sys/class/net"
+
+// sysTapOwner reads the uid the kernel records as a tap's owner, and whether the
+// device exists at all.
+//
+// A DEVICE THAT IS NOT A TAP HAS NO OWNER FILE, and answers -1, which no jail uid is:
+// a bridge or a veth someone named into billet's range is somebody else's. A tap made
+// without an owner reads -1 as well. A device that went between the two reads is
+// absent, not ownerless.
+func sysTapOwner(tap string) (int, bool, error) {
+	return sysTapOwnerIn(sysNetDir, tap)
+}
+
+// sysTapOwnerIn is sysTapOwner against a device directory of the caller's choosing.
+func sysTapOwnerIn(root, tap string) (int, bool, error) {
+	if _, err := tapIndex(tap); err != nil {
+		return 0, false, fmt.Errorf("%s: %w", bounded(tap), err)
+	}
+
+	dev := filepath.Join(root, tap)
+
+	raw, err := os.ReadFile(filepath.Join(dev, "owner"))
+	if errors.Is(err, os.ErrNotExist) {
+		// NO OWNER FILE IS EITHER NO DEVICE OR A DEVICE THAT IS NOT A TAP, and only the
+		// device's own entry tells them apart; a look that failed some other way could
+		// not tell.
+		_, statErr := os.Lstat(dev)
+
+		switch {
+		case statErr == nil:
+			return -1, true, nil
+		case errors.Is(statErr, os.ErrNotExist):
+			return 0, false, nil
+		default:
+			return 0, false, statErr
+		}
+	}
+
+	if err != nil {
+		return 0, false, err
+	}
+
+	owner, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return 0, false, fmt.Errorf("the owner of %s reads %q: %w", tap, bounded(string(raw)), err)
+	}
+
+	return owner, true, nil
+}
 
 // ipBinary is iproute2, which every distribution billet targets installs.
 const ipBinary = "ip"

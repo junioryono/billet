@@ -63,6 +63,9 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 			strconv.Itoa(ec2.DefaultBuilderDiskGiB)+")")
 	arch := fs.String("arch", "x64", "runner build to install: x64 or arm64")
 	version := fs.String("runner-version", runnerrelease.Pinned(), "actions/runner release")
+	runnerSHA := fs.String("runner-sha256", "",
+		"sha256 of the actions/runner tarball for --arch, which the builder checks before "+
+			"unpacking it; required when --runner-version is not the pinned release")
 	name := fs.String("name", "", "name for the produced AMI (default: billet-runner-<timestamp>)")
 	caCert := fs.String("ca-cert", "",
 		"PEM file of CA(s) to trust in the image's host store — the cache endpoint's issuer")
@@ -78,19 +81,21 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	region := fs.String("region", "", "override the region from the config")
 	subnet := fs.String("subnet", "", "override the subnet from the config")
 	group := fs.String("security-group", "", "override the security group from the config")
-	// THE WHOLE BUILD: provisioning, CreateImage, and waiting for the image to
-	// become launchable. Timed on a real build of the full toolcache path:
+	// THE WHOLE BUILD: provisioning, CreateImage, waiting for the image to become
+	// launchable, and the verifier's boot. Timed on a real build in us-west-2 on
+	// 2026-10-17, with the parity toolcache:
 	//
-	//	3m23s  provisioning, including the whole toolcache
-	//	9m20s  snapshot and registration
-	//	12m43s total
+	//	13m50s  provisioning, including the whole toolcache
+	//	38m46s  snapshot to available
+	//	52m37s  launch to the verifier's launch
 	//
-	// The toolcache is the cheap half -- EC2's network pulls several GiB in about
-	// three minutes -- and the snapshot of a larger image is what grew. 20 minutes
-	// would have fitted this run with seven to spare, which is not enough margin
-	// for a slower region or a larger image, and the cost of a generous bound is
-	// nothing: it is a deadline, not a wait.
-	timeout := fs.Duration("timeout", 60*time.Minute, "how long to wait for the whole build")
+	// That run's own timeout ended it there, and `billet ami verify`, run on its
+	// own, then booted the image and stamped it in 6m13s, so a whole build is
+	// about 59 minutes by the sum of the two. The snapshot of a larger image is
+	// what grew: it was 9m20s when the image was smaller, and the default of 60
+	// minutes, chosen then with room, now leaves almost none. The cost of a
+	// generous bound is nothing: it is a deadline, not a wait.
+	timeout := fs.Duration("timeout", 90*time.Minute, "how long to wait for the whole build")
 	public := fs.Bool("public-ip", false,
 		"give the builder a public address, for a subnet with no NAT gateway")
 	// ON BY DEFAULT, AND THE DEFAULT IS THE WHOLE POINT. A gate nobody remembers to
@@ -126,6 +131,13 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 			"pinned declaration no longer compress into EC2's 16 KiB user data, so they " +
 			"are staged in S3 and fetched by a bootstrap. Any bucket the builder's region " +
 			"can reach will do; billet writes one object and deletes it when the build ends")
+	}
+
+	// RESOLVED BEFORE THE CONFIG IS READ OR ANYTHING IS BOUGHT, for the reason the
+	// bucket is: a build that cannot check its runner is refused, not discovered.
+	digest, err := runnerDigest(*version, *arch, *runnerSHA)
+	if err != nil {
+		return err
 	}
 
 	cfg, err := ec2ConfigFor(*cfgPath, *region, *subnet, *group)
@@ -189,6 +201,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		BuilderDiskGiB:     *disk,
 		Arch:               *arch,
 		RunnerVersion:      *version,
+		RunnerSHA256:       digest,
 		Name:               *name,
 		CACertPEM:          caCertPEM,
 		PayloadBucket:      *payloadBucket,
@@ -219,6 +232,66 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
 
 	return nil
+}
+
+// runnerDigest is the sha256 the build checks the runner tarball against.
+//
+// ONLY THE PINNED RELEASE HAS A DIGEST BILLET KNOWS, so --runner-version takes
+// another release only when the operator names that release's digest; otherwise
+// the build would install a runner nothing checked. On the pinned release a
+// supplied digest must agree with the pin, because two answers that differ mean
+// one is wrong and billet cannot tell which.
+func runnerDigest(version, arch, supplied string) (string, error) {
+	platform, err := ec2.RunnerPlatform(arch)
+	if err != nil {
+		return "", err
+	}
+
+	// THE VERSION FIRST, because the remedy for an unpinned release is a digest
+	// and no digest makes `v2.337.0` or an empty version a release.
+	if !ec2.IsRunnerVersion(version) {
+		return "", fmt.Errorf("--runner-version %q is not an actions/runner release version; "+
+			"it is three numbers, without the leading v, such as %s",
+			version, runnerrelease.Pinned())
+	}
+
+	tarball := "actions-runner-" + platform + "-" + version + ".tar.gz"
+
+	if supplied != "" && !ec2.IsRunnerSHA256(supplied) {
+		return "", fmt.Errorf("--runner-sha256 %q is not a sha256: 64 lowercase hex digits, as "+
+			"sha256sum prints for %s", supplied, tarball)
+	}
+
+	if version != runnerrelease.Pinned() {
+		if supplied == "" {
+			return "", fmt.Errorf("--runner-version %s is not the release billet pins (%s), so "+
+				"billet has no digest to check its runner against; pass --runner-sha256 with the "+
+				"sha256 of %s from that release's page, or build the pinned release",
+				version, runnerrelease.Pinned(), tarball)
+		}
+
+		return supplied, nil
+	}
+
+	// NO PIN FOR THIS ARCHITECTURE IS THE UNPINNED CASE, so the operator's digest
+	// is what decides it; unreachable while every mapped platform is pinned.
+	pinned, ok := ec2.PinnedRunnerSHA256(arch)
+	if !ok {
+		if supplied != "" {
+			return supplied, nil
+		}
+
+		return "", fmt.Errorf("billet pins no digest for %s; pass --runner-sha256 with the "+
+			"sha256 of %s", platform, tarball)
+	}
+
+	if supplied != "" && supplied != pinned {
+		return "", fmt.Errorf("--runner-sha256 %s is not the digest billet pins for %s (%s); "+
+			"one of them is wrong, so the build is refused rather than trusting either",
+			supplied, tarball, pinned)
+	}
+
+	return pinned, nil
 }
 
 // cmdAMIVerify boots an AMI that already exists and stamps it if it proves itself.

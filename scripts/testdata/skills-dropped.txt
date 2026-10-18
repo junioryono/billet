@@ -112,3 +112,5 @@ ea5dd02815a7 make check is the full gate and a session runs make verify (2026-10
 298aa03ea951 The node unit declares only billet/registration since #175; host-inspection.md now names RuntimeDirectory=billet/registration, the lock directory being the tmpfiles entry's.
 b79b507956a0 The node's writable paths gained the host lock directory (#175); systemd.md restates the list with it.
 2614b062c2dc The node unit's two-entry RuntimeDirectory is the shape before #175; the measured fact is restated as of then.
+697517353b3a #149 made check-module-sources.sh expect the tree's own ref (scripts/release-ref.sh), so a release branch is held at its tag; the sentence now says both.
+e51f6255d097 An adoption now drops the running entry without forgetting the job's measurement (#384); the sentence names dropRunningLocked beside forgetRunningLocked.

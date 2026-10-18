@@ -39,7 +39,7 @@ The guest authenticates its CONNECT request with the unguessable cache-session c
 
 ## Untrusted pools
 
-An untrusted pool is served under `cache.publish: default-branch`, which it gets by default with a repository scope, and never otherwise. Billet does not reproduce GitHub's fork and default-branch policy from incomplete evidence. On a job's first cache call the node asks the control plane for that job's authority, which the plane decides from the JobStarted binding and GitHub's record of the run. An unproven answer sends the call to GitHub and is asked again next time. A job whose repository is not the pool's scope is sent to GitHub too.
+An untrusted pool is served under `cache.publish: default-branch`, which it gets by default with a repository scope, and never otherwise. Billet does not reproduce GitHub's fork and default-branch policy from incomplete evidence. On a job's first cache call the node asks the control plane for that job's authority, which the plane decides from the JobStarted binding and GitHub's record of the run. GitHub's JobStarted message can reach the plane after the job's first cache call, as late as 51 seconds after GitHub started the job where it was measured, so a call made before the plane has bound the job waits for the binding, asking every second for up to a minute, once per job; spliced instead, a restore would fetch its whole archive from GitHub over the site's line instead of from the site's store. An unproven answer for a job the plane has bound sends the call to GitHub and is asked again after 30 seconds. A job whose repository is not the pool's scope is sent to GitHub too.
 
 A proven job's archives are keyed under a namespace of their own (`<namespace>.scoped/untrusted/<owner>/<repo>/<arch>/actions/<ref digest>/<version digest>/<key>`), which no trusted pool reads:
 
@@ -49,6 +49,25 @@ A proven job's archives are keyed under a namespace of their own (`<namespace>.s
 Proving the branch needs the App's `actions: read`, and without it every call goes to GitHub.
 
 Archives are limited to 10 GiB. A thin-provisioned upload volume reserves 22 GiB so a boundary staged-block upload can hold the 10 GiB block set and its 10 GiB assembled archive simultaneously with ext4 metadata and journal headroom. Billet deletes the staged files and trims their freed extents before snapshotting, so the published generation retains only the assembled archive rather than both copies. One job may hold at most 32 pending uploads and active downloads before additional requests fall back to GitHub. Uploads accept the Azure Block Blob single-request and staged-block shapes used by the official toolkit, assemble declared block order on a fresh host-mounted ext4 volume, unmount and verify that filesystem, snapshot it, and publish through the site's fenced generation CAS. Downloads clone the exact immutable generation, mount it read-only with journal replay disabled, and support the byte ranges used by the official client. Active clones remain under the existing cache lease and eviction rules.
+
+### An organization target
+
+A pool under an organization target has no repository scope of its own, so it gets no local Actions cache by default, and every `actions/cache` call goes to GitHub, as on a GitHub-hosted runner. The scope is static because a pooled runner joins the pool before GitHub chooses its job, so the cache's namespace cannot come from the job. To serve the pool locally, name one repository:
+
+```yaml
+tiers:
+  - label: org-4vcpu
+    target: default        # an organization target
+    trust: untrusted
+    cache_scope:
+      owner: acme
+      repository: platform
+    # provider, shape and image as for any tier
+```
+
+The pool then publishes from that repository's default branch and, on a Linux Firecracker tier, turns on the Actions, Go and Bazel caches with it. `cache_scope.owner` must be the target's organization; billet refuses any other. A job from another repository of the organization runs on the pool as before: its Actions cache calls go to GitHub, and it publishes nothing, and so does a fork's pull request or any job whose authority cannot be proved. It does read what the named repository's default branch published to the pool's Docker store, sticky disks, Go and Bazel caches, because those caches use the pool's static repository namespace rather than the running job's repository ([what a cache can leak](../concepts/trust-and-isolation.md#what-a-cache-can-leak-and-to-whom)). So a scope fits an organization whose pool serves one repository, or whose other repositories may read the named repository's build outputs. Otherwise give the repositories that need the cache a repository target of their own.
+
+Grant the organization's App `actions: read` before adding the scope. Publication is proved from GitHub's record of each run, and without the permission nothing publishes. The scope would then turn on Go and Bazel caches that stay cold, and `GOCACHEPROG` would replace the Go build cache the workflow restores itself, so the pool's Go builds would get slower, not faster. `billet check` fails a target whose tiers publish from a default branch while its App lacks the permission.
 
 ## Failure behavior
 

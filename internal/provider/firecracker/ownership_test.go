@@ -572,6 +572,10 @@ func TestOrphanCleanupLeavesATapAnotherLeaseHasTaken(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Both are billet's taps, owned by jail uids no lease holds now.
+	h.putDevice("bt-0", h.p.cfg.JailUIDMin)
+	h.putDevice("bt-1", h.p.cfg.JailUIDMin+1)
+
 	// The snapshot said bt-0 was ours; another lease has since taken it.
 	if err := h.p.releaseOrphaned(t.Context(), resources{Tap: "bt-0"}, theInstance); err != nil {
 		t.Fatalf("releaseOrphaned: %v", err)
@@ -601,6 +605,10 @@ func TestOrphanCleanupLeavesATapAnotherLeaseHasTaken(t *testing.T) {
 	}
 	if !deleted["bt-1"] {
 		t.Error("an orphan's cleanup left the tap it still held")
+	}
+	if h.hasDevice("bt-1") || !h.hasDevice("bt-0") {
+		t.Errorf("after an orphan's cleanup the host has bt-0 %v and bt-1 %v, want only bt-0",
+			h.hasDevice("bt-0"), h.hasDevice("bt-1"))
 	}
 
 	raw, err := os.ReadFile(filepath.Join(dir, "bt-0"))

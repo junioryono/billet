@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"testing"
@@ -91,6 +92,11 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 	if _, ok := storage.(storecontract.GenerationChecker); !ok {
 		t.Fatalf("the Firecracker node's cache store, a %T, cannot check a generation", storage)
 	}
+	// AND RELEASES THE KERNEL MAPPINGS NOTHING ACCOUNTS FOR (#494), which
+	// evictPass finds by asserting this same value.
+	if _, ok := storage.(kernelMappingSweeper); !ok {
+		t.Fatalf("the Firecracker node's cache store, a %T, cannot sweep the kernel's mappings", storage)
+	}
 
 	// AND ITS GENERATION MAPS ARE EXCLUDED HOST-WIDE through node.lock_dir: an
 	// eviction takes the lock before anything else, so it creates the file even
@@ -109,9 +115,25 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 	t.Parallel()
 
-	var withSessions, newWithOptions bool
+	var withSessions, newWithOptions, withOwner bool
 
 	ast.Inspect(nodeFunc(t, "nodecache.go", "nodeCacheStore"), func(n ast.Node) bool {
+		// AND THE NODE IT MAPS FOR, deployment and node name, among the options
+		// ceph.New is given: without it the sweep unmaps nothing, and with the
+		// deployment alone two nodes of one deployment on a host would judge each
+		// other's volumes.
+		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && isIdent(assign.Lhs[0], "options") {
+			if literal, ok := assign.Rhs[0].(*ast.CompositeLit); ok {
+				for _, element := range literal.Elts {
+					option, ok := element.(*ast.CallExpr)
+					if ok && namesSelector(option.Fun, "ceph", "WithMapOwner") && len(option.Args) == 1 &&
+						types.ExprString(option.Args[0]) == `deployment + "/" + cfg.Node.Name` {
+						withOwner = true
+					}
+				}
+			}
+		}
+
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -136,6 +158,10 @@ func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 		return true
 	})
 
+	if !withOwner {
+		t.Error(`nodeCacheStore builds its ceph store without ceph.WithMapOwner(deployment + "/" + cfg.Node.Name) ` +
+			"in the options it passes ceph.New")
+	}
 	if !withSessions || !newWithOptions {
 		t.Fatalf("nodeCacheStore builds its ceph store without ceph.WithCacheSessions(CacheSessionNames(cfg)) "+
 			"among the options it passes ceph.New (option %v, ceph.New(..., options...) %v)", withSessions, newWithOptions)
@@ -372,8 +398,17 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 	t.Parallel()
 
 	found := map[string]bool{}
+	latched := false
 
 	ast.Inspect(nodeFunc(t, "node.go", "Run"), func(n ast.Node) bool {
+		// THE DRAIN REQUEST IS THE HOST'S, LATCHED: the loop and the cache's stop
+		// read one answer (latchedDrainRequest).
+		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && isIdent(assign.Lhs[0], "drainRequested") {
+			call, ok := assign.Rhs[0].(*ast.CallExpr)
+			latched = latched || ok && isIdent(call.Fun, "latchedDrainRequest") && len(call.Args) == 1 &&
+				namesSelector(call.Args[0], "host", "DrainRequested")
+		}
+
 		literal, ok := n.(*ast.CompositeLit)
 		if !ok || !namesSelector(literal.Type, "nodeclient", "LoopOptions") {
 			return true
@@ -392,7 +427,11 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 				if value, ok := field.Value.(*ast.Ident); ok && value.Name == "handOver" {
 					found[key.Name] = true
 				}
-			case key.Name == "DrainRequested", key.Name == "Hurry":
+			case key.Name == "DrainRequested":
+				if isIdent(field.Value, "drainRequested") && latched {
+					found[key.Name] = true
+				}
+			case key.Name == "Hurry":
 				if namesSelector(field.Value, "host", key.Name) {
 					found[key.Name] = true
 				}

@@ -46,6 +46,9 @@ type pageCharts struct {
 	Charts                    []pageChart
 	// Bands are the steps on the charts' x axis, the same on every chart.
 	Bands []chartBand
+	// Gaps is the series' unseen intervals on the charts' x axis as one SVG
+	// path (gapStrip), empty when the sampler saw every interval.
+	Gaps string
 
 	// The series and the windows it was drawn from, so another chart can be
 	// drawn on the same axis.
@@ -130,6 +133,7 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 	}
 	out.tl, out.windows, out.used, out.sampled = tl, windows, used, sampled
 	x := out.x
+	out.Gaps = gapStrip(x, tl.Gaps())
 
 	cpu := pageChart{Title: "CPU (cores busy)"}
 	if !m.Measured(alloc.UsageCPU) {
@@ -196,6 +200,38 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 	}
 
 	return out
+}
+
+// gapStrip draws gaps on the charts' x axis as one path a chart high, at
+// the charts' resolution: a gap within one of maxChartWindows cells of the
+// band before it joins that band, so the strip holds at most maxChartWindows
+// bands whatever the series holds, and a gap narrower than one unit is still
+// drawn one wide.
+func gapStrip(x func(time.Time) int64, gaps []usage.Gap) string {
+	const cell = chartWidth / maxChartWindows
+	var b strings.Builder
+	var from, to int64
+	open := false
+	flush := func() {
+		if open {
+			fmt.Fprintf(&b, "M%d 0H%dV100H%dZ", from, to, from)
+		}
+	}
+	for _, g := range gaps {
+		lo, hi := max(x(g.From), 0), min(x(g.To), chartWidth)
+		if hi <= lo {
+			hi = lo + 1
+		}
+		if open && lo <= to+cell {
+			to = max(to, hi)
+			continue
+		}
+		flush()
+		from, to, open = lo, hi, true
+	}
+	flush()
+
+	return b.String()
 }
 
 // x is a wall time on the charts' x axis.

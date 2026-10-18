@@ -26,6 +26,9 @@ type MetricsSource struct {
 // declares and internal/metrics satisfies without either importing the other.
 var _ state.Observer = (*metrics.LedgerObserver)(nil)
 
+// And the queue waits through alloc.QueueWaitObserver, the same way.
+var _ alloc.QueueWaitObserver = (*metrics.QueueWaitObserver)(nil)
+
 // ledgerScrapeTimeout bounds one scrape's reads of the ledger.
 const ledgerScrapeTimeout = 5 * time.Second
 
@@ -83,7 +86,13 @@ func ledgerSource(a *alloc.Allocator, db *state.DB, tiers []config.Tier) Metrics
 				return err
 			}
 
+			waits, err := reg.QueueWaitObserver()
+			if err != nil {
+				return err
+			}
+
 			db.Observe(o)
+			a.ObserveQueueWaits(waits)
 
 			return nil
 		},

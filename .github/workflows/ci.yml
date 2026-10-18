@@ -3,9 +3,17 @@ name: CI
 # billet's own CI runs on GitHub-hosted runners for now. Dogfooding it on billet
 # is a goal, but a runner platform that can only be built by an already-working
 # copy of itself is a bootstrap trap — the hosted path stays supported forever.
+#
+# A RELEASE BRANCH'S TIP GETS A RUN OF ITS OWN. A carry's pull request is tested
+# as its merge ref, and the commit the merge leaves on release/vX.Y is a different
+# one; Cut Release cuts from that commit and its report shows CI on exactly it
+# (#145). The cut's own `Release vX.Y.Z` commit is pushed with GITHUB_TOKEN, which
+# starts no workflow, so it adds no run. A push reads the pushed branch's own copy
+# of this file, so a release branch cut before this trigger gets it only once it
+# is carried there.
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
 
 permissions:
@@ -85,7 +93,13 @@ jobs:
       BILLET_TEST_POSTGRES_ELSEWHERE: test-postgres
 
     steps:
+      # THE WHOLE HISTORY AND ITS TAGS, because the actions suite asks
+      # scripts/release-ref.sh which release this tree is, and on a release
+      # branch the answer is a tag a one-commit clone does not have. The resolver
+      # refuses a shallow clone rather than reading it as main. 25 MiB packed.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:
@@ -509,7 +523,10 @@ jobs:
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
+      # The whole history, for `make module-sources`: see the test job.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:
@@ -994,7 +1011,17 @@ jobs:
     # satisfied on the next version bump.
     name: terraform (${{ matrix.label }})
     runs-on: billet-2vcpu-ubuntu-2404
-    timeout-minutes: 15
+    # THE JOB IS BOUND BY THE NETWORK, not the CPU. On 2026-10-17, with the
+    # pool's internet share shaped to 150 Mbit/s and every concurrent job pulling
+    # through it, three attempts in a row were cancelled at 15 minutes with
+    # nothing failed: each leg downloaded a 194 MB AWS provider for every module
+    # and every hybrid root. The provider cache below shares what the modules
+    # download, and the first hybrid root's lock serves the other three; when a
+    # cache main saved for these same lock files is restored, only the first
+    # hybrid root's providers come from the internet, which it authenticates
+    # (the Go cache is restored from the node). A leg with nothing cached still
+    # took 14 minutes on a saturated line, so the limit keeps that room.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -1032,6 +1059,35 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # PROVIDERS ARE SHARED, NOT DOWNLOADED AT EVERY INIT. Every module is
+      # initialised here and every hybrid root below, and with no plugin cache
+      # each init fetched its providers afresh: the aws provider is 194 MB,
+      # fetched about seven times a leg and three legs a run, over the one line
+      # the whole site's CI shares. On 2026-10-17 every leg of two pull requests
+      # passed each step it reached and was cancelled at the limit, the module's
+      # validate taking up to five minutes against 55 s on a quiet line. The
+      # cache is shared by the job's inits and carried between runs by the
+      # Actions cache, which a billet runner serves from its own node: main
+      # saves it, a release branch whose locks differ from main's saves its own,
+      # and a pull request restores its base's or main's. Terraform takes a
+      # cached provider only when the lock file holds this platform's h1
+      # checksum, and checks it against that (measured with 1.14.0, 1.14.1 and
+      # 1.15.9), which is why each lock records all four platforms and a test in
+      # scripts/ says so; the hybrid roots have no lock, so the first of them
+      # downloads and authenticates the newest aws provider in every leg, and
+      # scripts/hybrid-root-check.sh hands its lock to the other three.
+      - name: Share one provider cache across the job's inits
+        run: |
+          mkdir -p "$RUNNER_TEMP/terraform-plugins"
+          echo "TF_PLUGIN_CACHE_DIR=$RUNNER_TEMP/terraform-plugins" >> "$GITHUB_ENV"
+
+      - name: Restore the provider cache
+        id: providers
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/terraform-plugins
+          key: terraform-providers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('terraform/modules/*/.terraform.lock.hcl') }}
+
       - name: Format, validate, and plan-test the module
         run: |
           make tf-fmt-check
@@ -1063,6 +1119,20 @@ jobs:
       # other passes every Go test and fails an operator's first init.
       - name: Prove the generated hybrid root validates against the module
         run: make hybrid-root-check
+
+      # ONLY A PUSH TO MAIN OR A RELEASE BRANCH SAVES, and only a job that passed:
+      # a pull request restores what its base branch saved, so it never writes an
+      # entry of its own for every push. The legs share the key, so the first to
+      # finish saves and the others are told it exists, which the action reports
+      # as a warning, not a failure.
+      - name: Save the provider cache
+        if: >-
+          github.event_name == 'push' && steps.providers.outputs.cache-hit != 'true' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/terraform-plugins
+          key: ${{ steps.providers.outputs.cache-primary-key }}
 
   # The module declares required_version >= 1.9 for CONSUMERS, whose init
   # never parses the child's tests/ — but this repo's module directory cannot

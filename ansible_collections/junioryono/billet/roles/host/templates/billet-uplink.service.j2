@@ -13,6 +13,9 @@ ExecStopPost=/usr/bin/billet uplink clear
 # it; a reboot empties it along with the shaping.
 RuntimeDirectory=billet-uplink
 RuntimeDirectoryPreserve=yes
+# The rates the shaper learned and where it found the line full, which the next
+# run resumes as they were, after a restart or a reboot alike.
+StateDirectory=billet-uplink
 Restart=on-failure
 RestartSec=30
 

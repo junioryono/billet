@@ -81,7 +81,7 @@ func (b *buildFake) console() string {
 func verifyingBuild() BuildSpec {
 	return BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 		Verify: true,
 	}
 }

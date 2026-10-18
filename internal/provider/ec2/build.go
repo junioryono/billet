@@ -17,6 +17,7 @@ import (
 
 	"github.com/junioryono/billet/internal/guestassets"
 	"github.com/junioryono/billet/internal/runnerimages"
+	"github.com/junioryono/billet/internal/runnerrelease"
 	"github.com/junioryono/billet/internal/version"
 )
 
@@ -185,6 +186,49 @@ var aptPackageName = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 // is outside it.
 var runnerVersionPattern = regexp.MustCompile(`^\d{1,6}\.\d{1,6}\.\d{1,6}([-+][0-9A-Za-z.-]{1,32})?$`)
 
+// runnerDigestPattern is what may be written into the script as the runner's
+// digest: exactly what sha256sum prints. Checked rather than quoted, for the
+// reason runnerVersionPattern gives, and lowercase because `sha256sum -c`
+// compares the text it is given.
+var runnerDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// IsRunnerVersion says whether v is a version a build will write into its script.
+func IsRunnerVersion(v string) bool { return runnerVersionPattern.MatchString(v) }
+
+// IsRunnerSHA256 says whether s is a digest a build will write into its script.
+func IsRunnerSHA256(s string) bool { return runnerDigestPattern.MatchString(s) }
+
+// RunnerPlatform is actions/runner's own asset name for an image architecture.
+//
+// MAPPED, NOT ASSEMBLED. runnerrelease keys its checksums by actions/runner's
+// spelling, and the rule there is that a caller maps its own concept onto it
+// explicitly: an architecture nobody mapped is refused here rather than turned
+// into a name no release publishes.
+func RunnerPlatform(arch string) (string, error) {
+	switch arch {
+	case "x64":
+		return "linux-x64", nil
+	case "arm64":
+		return "linux-arm64", nil
+	default:
+		return "", fmt.Errorf("ec2: runner architecture %q is not x64 or arm64", arch)
+	}
+}
+
+// PinnedRunnerSHA256 is the digest billet pins for the pinned runner release's
+// tarball on this architecture, and whether it pins one.
+//
+// READ FROM internal/runnerrelease's pinned.txt, the file the guest image build
+// verifies the same release against, so both backends check one answer.
+func PinnedRunnerSHA256(arch string) (string, bool) {
+	platform, err := RunnerPlatform(arch)
+	if err != nil {
+		return "", false
+	}
+
+	return runnerrelease.PinnedSHA256For(platform)
+}
+
 // BuildSpec describes an AMI to build.
 type BuildSpec struct {
 	// BaseImage is the AMI the builder starts from. It must be EBS-backed and
@@ -222,6 +266,12 @@ type BuildSpec struct {
 	Arch string
 	// RunnerVersion is the actions/runner release to install, without the "v".
 	RunnerVersion string
+	// RunnerSHA256 is the sha256 of that release's tarball for Arch, which the
+	// builder checks before it unpacks anything. Required: the runner it installs
+	// executes every job the image serves, so a download trusted on transport
+	// alone is a mirror or a redirect deciding what runs. PinnedRunnerSHA256 is
+	// the answer for the pinned release.
+	RunnerSHA256 string
 	// Name is the name given to the produced AMI. AWS requires it to be unique
 	// within the account and region.
 	Name string
@@ -1101,8 +1151,18 @@ func provisionScript(spec BuildSpec) (string, error) {
 			"version is accepted", spec.RunnerVersion)
 	}
 
-	if spec.Arch != "x64" && spec.Arch != "arm64" {
-		return "", fmt.Errorf("ec2: runner architecture %q is not x64 or arm64", spec.Arch)
+	platform, err := RunnerPlatform(spec.Arch)
+	if err != nil {
+		return "", err
+	}
+
+	// REFUSED BEFORE A BUILDER EXISTS. An empty digest would render a check that
+	// sha256sum rejects as malformed, so the build would fail closed, forty
+	// minutes and one paid builder later, naming nothing an operator set.
+	if !runnerDigestPattern.MatchString(spec.RunnerSHA256) {
+		return "", fmt.Errorf("ec2: the runner's sha256 %q is not 64 lowercase hex digits; the "+
+			"build checks the actions/runner tarball against it before unpacking, and "+
+			"refuses to install a runner it cannot check", spec.RunnerSHA256)
 	}
 
 	// VALIDATED AND RE-ENCODED BEFORE A PAID BUILDER EXISTS. provisionScript runs
@@ -1118,6 +1178,13 @@ func provisionScript(spec BuildSpec) (string, error) {
 
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\nset -eux\n")
+
+	// A HOME, BECAUSE CLOUD-INIT GIVES USER DATA NONE and the shared installers are
+	// written for a root shell, which the guest build always runs them from.
+	// Composer's installer refuses to run without HOME or COMPOSER_HOME, and since
+	// it joined the hosted tools every AMI build died there, before the runner was
+	// fetched (measured on a real builder, 2026-10-17).
+	b.WriteString("export HOME=/root\n")
 
 	// THE DISK IS THERE BEFORE ANYTHING TRIES TO USE IT.
 	//
@@ -1470,9 +1537,24 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("cd /opt/actions-runner\n")
 
 	release := "https://github.com/actions/runner/releases/download/v" + spec.RunnerVersion +
-		"/actions-runner-linux-" + spec.Arch + "-" + spec.RunnerVersion + ".tar.gz"
+		"/actions-runner-" + platform + "-" + spec.RunnerVersion + ".tar.gz"
 
 	b.WriteString("curl -fsSL -o runner.tar.gz " + strconv.Quote(release) + "\n")
+
+	// VERIFIED BEFORE IT IS UNPACKED, against the digest the guest build checks
+	// the same release with: this runner executes every job the image serves.
+	//
+	// AN `if` WITH ITS OWN `exit 1`, NOT AN `&&` CHAIN. Under `set -e` a failing
+	// `&&` list does not stop the script, so `curl && check && tar` would fail
+	// its check and carry on to the next line and eventually to poweroff, which
+	// billet reads as a finished build. This holds with or without `set -e`, and
+	// a download that failed has no file for the check to accept.
+	b.WriteString("if ! printf '%s  %s\\n' '" + spec.RunnerSHA256 + "' runner.tar.gz | " +
+		"sha256sum -c -; then\n")
+	b.WriteString("  echo 'the actions/runner tarball for " + platform + " " + spec.RunnerVersion +
+		" does not hash to " + spec.RunnerSHA256 + "; refusing to unpack it' >&2\n")
+	b.WriteString("  exit 1\n")
+	b.WriteString("fi\n")
 	b.WriteString("tar xzf runner.tar.gz\n")
 	b.WriteString("rm runner.tar.gz\n")
 	b.WriteString("cat > /opt/actions-runner/billet-runner-service <<'BILLETRUNNEREOF'\n")
