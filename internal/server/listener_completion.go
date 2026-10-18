@@ -268,8 +268,6 @@ func (l *Listener) recordJobResult(ctx context.Context, job dispatch.Job, leaseI
 	// them the wait is unknown, never another job's.
 	if job.RunnerName == "" {
 		job.QueuedAt, job.ScaleSetAssignedAt, job.RunnerAssignedAt = time.Time{}, time.Time{}, time.Time{}
-	} else {
-		job = l.withOfferedQueueTime(job)
 	}
 	l.recordJobIdentity(ctx, leaseID, job)
 }
@@ -298,12 +296,6 @@ func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job di
 		l.log.Warn("could not record which github job a lease ran; its history row "+
 			"will not name the repository, workflow or job",
 			"tier", l.tier, "lease", leaseID, "job", job.JobID, "error", err)
-		return
-	}
-	// Only once the row holds it: a failed write leaves the offer's time for a
-	// redelivered start or the completion.
-	if !job.QueuedAt.IsZero() {
-		l.forgetQueueTime(job)
 	}
 }
 

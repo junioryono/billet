@@ -31,7 +31,7 @@ type offeredQueueTime struct {
 }
 
 // rememberQueueTimes keeps GitHub's queue time from the jobs an offer or an
-// assignment names until the job's start records it.
+// assignment names, for the job's start to record.
 //
 // THE START DOES NOT CARRY IT. Every JobStarted and JobCompleted the reference
 // fleet received on 2026-10-18 under v0.17.0 had queueTime 0001-01-01 while both
@@ -69,11 +69,16 @@ func (l *Listener) rememberQueueTimes(batches ...[]dispatch.Job) {
 	}
 }
 
-// withOfferedQueueTime is job with the queue time its offer carried when the
-// message itself carried none. The entry stays until forgetQueueTime, so a
-// start whose identity write failed takes it again when it is redelivered.
+// withOfferedQueueTime is a started job with the queue time its offer carried
+// when the JobStarted itself carried none.
+//
+// ONLY A START TAKES IT, with the job id and run the message itself named: the
+// start is the runner-to-job binding, while a completion's run may be filled
+// from the lease's launch, which can be another run. And it is never consumed,
+// because a write the ledger's write-once filter skips still returns nil: the
+// entry stays for a redelivered start and expires with the rest.
 func (l *Listener) withOfferedQueueTime(job dispatch.Job) dispatch.Job {
-	if !job.QueuedAt.IsZero() || job.JobID == "" || job.RunID == 0 {
+	if !job.QueuedAt.IsZero() {
 		return job
 	}
 	l.mu.Lock()
@@ -83,12 +88,4 @@ func (l *Listener) withOfferedQueueTime(job dispatch.Job) dispatch.Job {
 		job.QueuedAt = q.queued
 	}
 	return job
-}
-
-// forgetQueueTime drops a job's offered queue time once its row holds one.
-func (l *Listener) forgetQueueTime(job dispatch.Job) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	delete(l.queued, offeredJob{job: job.JobID, run: job.RunID})
 }

@@ -241,8 +241,8 @@ type Listener struct {
 	// Resolved aliases retain consumed offer facts while the lease is running.
 	// A durable busy pool binding supersedes these intended-job facts.
 	runningJobs map[int64]actualJobIdentity
-	// GitHub's queue time for each job an offer or an assignment named, until its
-	// start records it; see rememberQueueTimes.
+	// GitHub's queue time for each job an offer or an assignment named, for its
+	// start to record; see rememberQueueTimes.
 	queued       map[offeredJob]offeredQueueTime
 	queuedPruned time.Time
 	// Restart-surviving runner leases held by the node rather than this

@@ -71,9 +71,9 @@ func TestAStartTakesTheQueueTimeItsJobWasOfferedWith(t *testing.T) {
 }
 
 // AN OFFER'S QUEUE TIME BELONGS TO ONE RUN OF ONE JOB, the first offer of it
-// wins, a time the message carried is its own, and an offer is forgotten once
-// its row holds the time or past its retention, so a listener that runs for
-// months does not keep every job it was ever offered.
+// wins, a time the message carried is its own, and offers are forgotten past
+// their retention and kept to a limit, so a listener that runs for months does
+// not keep every job it was ever offered.
 func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	t.Parallel()
 
@@ -102,15 +102,15 @@ func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	if got := l.withOfferedQueueTime(dispatch.Job{JobID: job11.JobID}).QueuedAt; !got.IsZero() {
 		t.Errorf("a start naming no run took %s; a job id alone may name two runs", got)
 	}
+	runless := dispatch.Job{JobID: "job-14", QueuedAt: queued}
+	l.rememberQueueTimes([]dispatch.Job{runless})
+	if got := l.withOfferedQueueTime(dispatch.Job{JobID: "job-14"}).QueuedAt; !got.IsZero() {
+		t.Errorf("a start took %s from an offer that named no run", got)
+	}
 	carried := job11
 	carried.QueuedAt = queued.Add(-time.Hour)
 	if got := l.withOfferedQueueTime(carried).QueuedAt; !got.Equal(carried.QueuedAt) {
 		t.Errorf("a start carrying its own queue time took %s, want its own %s", got, carried.QueuedAt)
-	}
-
-	l.forgetQueueTime(job11)
-	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.IsZero() {
-		t.Errorf("a start took %s from an offer its row already holds", got)
 	}
 
 	now = now.Add(queueTimeRetention + time.Hour)
@@ -167,16 +167,13 @@ func TestAQueueTimeSurvivesAFailedWriteAndArrivesWithItsStart(t *testing.T) {
 		t.Errorf("after a failed write the redelivered start left queue time %q (%d failures unspent), "+
 			"want the offer's %s", got.GitHubQueuedAt, failures, stamp(queued))
 	}
-	if len(p.l.queued) != 0 {
-		t.Errorf("%d offers kept after the row took its time, want none", len(p.l.queued))
-	}
 }
 
-// A COMPLETION THAT NAMES ITS RUNNER TAKES THE OFFER'S QUEUE TIME when no start
-// recorded it, and one that names no runner never does: the lease its request id
-// finds may be running another job, whose wait would be measured from this one's
-// queue time.
-func TestOnlyACompletionNamingItsRunnerTakesTheOffersQueueTime(t *testing.T) {
+// A COMPLETION NEVER TAKES AN OFFER'S QUEUE TIME, whether or not it names its
+// runner. Its run may be filled from the lease's launch, which can be another
+// run of the job, and one that names no runner may find a lease running another
+// job: either would measure a wait from someone else's queue time.
+func TestACompletionNeverTakesAnOffersQueueTime(t *testing.T) {
 	t.Parallel()
 
 	for _, named := range []bool{true, false} {
@@ -200,12 +197,9 @@ func TestOnlyACompletionNamingItsRunnerTakesTheOffersQueueTime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Job: %v", err)
 		}
-		if named && got.GitHubQueuedAt != stamp(queued) {
-			t.Errorf("a completion naming its runner left queue time %q, want the offer's %s",
-				got.GitHubQueuedAt, stamp(queued))
-		}
-		if !named && got.GitHubQueuedAt != "" {
-			t.Errorf("a runnerless completion recorded queue time %q, want none", got.GitHubQueuedAt)
+		if got.GitHubQueuedAt != "" {
+			t.Errorf("a completion (runner named: %t) recorded the offer's queue time %q, want none",
+				named, got.GitHubQueuedAt)
 		}
 	}
 }
