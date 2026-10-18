@@ -81,6 +81,14 @@ func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	l := NewListener(nil, "billet-4vcpu-a", &fakeSession{})
 	now := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
 	l.now = func() time.Time { return now }
+	// take is a start that carries its hand-over to the scale set, as every
+	// start the fleet received did.
+	take := func(job dispatch.Job) time.Time {
+		if job.ScaleSetAssignedAt.IsZero() {
+			job.ScaleSetAssignedAt = now
+		}
+		return l.withOfferedQueueTime(job).QueuedAt
+	}
 
 	queued := now.Add(-time.Minute)
 	offered := job11
@@ -97,35 +105,38 @@ func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	l.rememberQueueTimes(nil, []dispatch.Job{requeued})
 	l.rememberQueueTimes([]dispatch.Job{offered}, nil)
 
-	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.Equal(queued) {
+	if got := take(job11); !got.Equal(queued) {
 		t.Errorf("the start took %s, want its own run's newest offer, %s, over an older redelivery", got, queued)
 	}
 	earlier := job11
 	earlier.ScaleSetAssignedAt = queued.Add(-time.Second)
-	if got := l.withOfferedQueueTime(earlier).QueuedAt; !got.IsZero() {
+	if got := take(earlier); !got.IsZero() {
 		t.Errorf("a start handed to the scale set at %s took %s, a queue time after it",
 			earlier.ScaleSetAssignedAt, got)
 	}
 	handed := job11
 	handed.ScaleSetAssignedAt = queued
-	if got := l.withOfferedQueueTime(handed).QueuedAt; !got.Equal(queued) {
+	if got := take(handed); !got.Equal(queued) {
 		t.Errorf("a start handed over at its own queue time took %s, want %s", got, queued)
 	}
+	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.IsZero() {
+		t.Errorf("a start carrying no hand-over to the scale set took %s; nothing then says which attempt it is", got)
+	}
 	other := dispatch.Job{JobID: job11.JobID, RunID: 999}
-	if got := l.withOfferedQueueTime(other).QueuedAt; !got.Equal(otherRun.QueuedAt) {
+	if got := take(other); !got.Equal(otherRun.QueuedAt) {
 		t.Errorf("the other run's start took %s, want its own %s", got, otherRun.QueuedAt)
 	}
-	if got := l.withOfferedQueueTime(dispatch.Job{JobID: job11.JobID}).QueuedAt; !got.IsZero() {
+	if got := take(dispatch.Job{JobID: job11.JobID}); !got.IsZero() {
 		t.Errorf("a start naming no run took %s; a job id alone may name two runs", got)
 	}
 	runless := dispatch.Job{JobID: "job-14", QueuedAt: queued}
 	l.rememberQueueTimes([]dispatch.Job{runless}, nil)
-	if got := l.withOfferedQueueTime(dispatch.Job{JobID: "job-14"}).QueuedAt; !got.IsZero() {
+	if got := take(dispatch.Job{JobID: "job-14"}); !got.IsZero() {
 		t.Errorf("a start took %s from an offer that named no run", got)
 	}
 	carried := job11
 	carried.QueuedAt = queued.Add(-time.Hour)
-	if got := l.withOfferedQueueTime(carried).QueuedAt; !got.Equal(carried.QueuedAt) {
+	if got := take(carried); !got.Equal(carried.QueuedAt) {
 		t.Errorf("a start carrying its own queue time took %s, want its own %s", got, carried.QueuedAt)
 	}
 
@@ -133,16 +144,16 @@ func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	recent := job12
 	recent.QueuedAt = now
 	l.rememberQueueTimes([]dispatch.Job{recent}, nil)
-	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.Equal(queued) {
+	if got := take(job11); !got.Equal(queued) {
 		t.Errorf("an offer inside its retention was dropped: the start took %s, want %s", got, queued)
 	}
 
 	now = now.Add(2 * time.Hour)
 	l.rememberQueueTimes(nil, nil)
-	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.IsZero() {
+	if got := take(job11); !got.IsZero() {
 		t.Errorf("a start took %s from an offer past its retention", got)
 	}
-	if got := l.withOfferedQueueTime(job12).QueuedAt; !got.Equal(recent.QueuedAt) {
+	if got := take(job12); !got.Equal(recent.QueuedAt) {
 		t.Errorf("an offer two hours old was dropped with the expired ones: the start took %s", got)
 	}
 
@@ -177,6 +188,7 @@ func TestAQueueTimeArrivesWithItsStartAndSurvivesAFailedWrite(t *testing.T) {
 		offered.QueuedAt = queued
 		started := job12
 		started.RunnerID, started.RunnerName = 77, runner.RunnerName
+		started.ScaleSetAssignedAt = queued.Add(time.Second)
 		msgs := []*Message{{MessageID: 2, Available: []dispatch.Job{offered}, Started: []dispatch.Job{started}}}
 		if failures > 0 {
 			msgs = append(msgs, &Message{MessageID: 3, Started: []dispatch.Job{started}})
@@ -215,6 +227,7 @@ func TestACompletionNeverTakesAnOffersQueueTime(t *testing.T) {
 
 		completed := job11
 		completed.Result = "Succeeded"
+		completed.ScaleSetAssignedAt = queued.Add(time.Second)
 		if named {
 			completed.RunnerID, completed.RunnerName = 77, runner.RunnerName
 		}

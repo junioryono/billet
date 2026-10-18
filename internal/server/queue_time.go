@@ -88,9 +88,12 @@ func (l *Listener) rememberQueueTimes(available, assigned []dispatch.Job) (int, 
 //
 // ONLY A START TAKES IT, with the job id and run the message itself named: the
 // start is the runner-to-job binding, while a completion's run may be filled
-// from the lease's launch, which can be another run. A time after the start's
-// own hand-over to the scale set belongs to a later attempt and is not taken.
-// And it is never consumed, because a write the ledger's write-once filter
+// from the lease's launch, which can be another run. A start must carry its own
+// hand-over to the scale set, and a time after it belongs to a later attempt
+// and is not taken. That still assumes a job id and run name one attempt, as
+// job_identity.go measured (no job id started twice); an untimed message cannot
+// clear an entry, because it may be the same attempt's other kind. And it is
+// never consumed, because a write the ledger's write-once filter
 // skips still returns nil: the entry stays for a redelivered start and expires
 // with the rest.
 func (l *Listener) withOfferedQueueTime(job dispatch.Job) dispatch.Job {
@@ -101,7 +104,7 @@ func (l *Listener) withOfferedQueueTime(job dispatch.Job) dispatch.Job {
 	defer l.mu.Unlock()
 
 	q, ok := l.queued[offeredJob{job: job.JobID, run: job.RunID}]
-	if ok && (job.ScaleSetAssignedAt.IsZero() || !q.queued.After(job.ScaleSetAssignedAt)) {
+	if ok && !job.ScaleSetAssignedAt.IsZero() && !q.queued.After(job.ScaleSetAssignedAt) {
 		job.QueuedAt = q.queued
 	}
 	return job
