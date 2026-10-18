@@ -113,13 +113,16 @@ func (s *stepper) tick(ctx context.Context) error {
 
 	// EVERY ROUND IS REPORTED, whatever it goes on to change, and the report
 	// is logged after it, so a round that cut is in the report that says so.
-	seconds := interval.Seconds()
-	s.report.observe(s.ctl.Params, sample, gateway,
-		[2]float64{float64(sent) / seconds / 1e6, float64(received) / seconds / 1e6})
+	// Not one with no interval to measure throughput over, which the
+	// controller skips too.
+	if seconds := interval.Seconds(); seconds > 0 {
+		s.report.observe(s.ctl.Params, sample, s.prober.Gateway() != "", gateway,
+			[2]float64{float64(sent) / seconds / 1e6, float64(received) / seconds / 1e6})
+	}
 
 	defer func() {
 		if s.report.due(at) {
-			s.report.log(ctx, s.log, at, s.applied, s.ctl, s.prober.Gateway() != "")
+			s.report.log(ctx, s.log, at, s.applied, s.unsure, s.ctl)
 		}
 	}()
 

@@ -18,8 +18,11 @@ const reportEvery = 5 * time.Minute
 
 // lineReport is what a run saw since its last report: the rounds, what each
 // direction moved, and how many rounds showed a queue, lost a probe, saw the
-// gateway stall or measured nothing, with the cuts taken.
+// gateway stall or measured nothing, with the cuts taken. askedGateway is
+// whether any of them asked one, so the stalls it counted are reported though
+// the route has since lost it.
 type lineReport struct {
+	askedGateway                           bool
 	from                                   time.Time
 	rounds, delayed, lossy, stalled, blind int
 	cuts                                   int
@@ -27,10 +30,11 @@ type lineReport struct {
 	delays                                 []time.Duration
 }
 
-// observe adds one round: its probes, its gateway reading and what each
-// direction moved over the throughput window, up first.
-func (r *lineReport) observe(p Params, sample, gateway Sample, moving [2]float64) {
+// observe adds one round: its probes, whether it asked a gateway and what that
+// said, and what each direction moved over the throughput window, up first.
+func (r *lineReport) observe(p Params, sample Sample, asked bool, gateway Sample, moving [2]float64) {
 	r.rounds++
+	r.askedGateway = r.askedGateway || asked
 
 	for i, mbit := range moving {
 		r.peak[i] = max(r.peak[i], mbit)
@@ -62,8 +66,10 @@ func (r *lineReport) due(at time.Time) bool { return at.Sub(r.from) >= reportEve
 
 // log says what the rounds since the last report saw, beside the rates CAKE
 // holds (applied) and the lines ctl has found, and starts the next report at at.
-func (r *lineReport) log(ctx context.Context, log *slog.Logger, at time.Time, applied [2]float64, ctl *Controller,
-	gateway bool,
+// Unsure is a change tc refused partway, after which what CAKE holds is not
+// known, and is said as such rather than as the rates last applied.
+func (r *lineReport) log(ctx context.Context, log *slog.Logger, at time.Time, applied [2]float64, unsure bool,
+	ctl *Controller,
 ) {
 	mean := func(i int) float64 {
 		if r.rounds == 0 {
@@ -73,9 +79,17 @@ func (r *lineReport) log(ctx context.Context, log *slog.Logger, at time.Time, ap
 		return r.total[i] / float64(r.rounds)
 	}
 
+	held := func(key string, mbit float64) slog.Attr {
+		if unsure {
+			return slog.String(key, "unknown")
+		}
+
+		return slog.Float64(key, round(mbit))
+	}
+
 	attrs := []slog.Attr{
 		slog.Duration("over", at.Sub(r.from).Round(time.Second)),
-		slog.Float64("up_mbit", round(applied[0])), slog.Float64("down_mbit", round(applied[1])),
+		held("up_mbit", applied[0]), held("down_mbit", applied[1]),
 		slog.Float64("up_limit_mbit", round(ctl.Up.Limit)), slog.Float64("down_limit_mbit", round(ctl.Down.Limit)),
 		slog.Float64("up_peak_mbit", round(r.peak[0])), slog.Float64("down_peak_mbit", round(r.peak[1])),
 		slog.Float64("up_mean_mbit", round(mean(0))), slog.Float64("down_mean_mbit", round(mean(1))),
@@ -83,7 +97,7 @@ func (r *lineReport) log(ctx context.Context, log *slog.Logger, at time.Time, ap
 		slog.Int("blind_rounds", r.blind), slog.Int("cuts", r.cuts),
 		r.percentile("delay_p50", 50), r.percentile("delay_p95", 95),
 	}
-	if gateway {
+	if r.askedGateway {
 		attrs = append(attrs, slog.Int("gateway_stalled_rounds", r.stalled))
 	}
 
@@ -93,7 +107,9 @@ func (r *lineReport) log(ctx context.Context, log *slog.Logger, at time.Time, ap
 }
 
 // percentile is the reflectors' delay at the pth percentile of the rounds that
-// measured one, or that none did.
+// measured one, by nearest rank (the smallest delay at least p percent of them
+// reach, so the median of an even count is the lower middle one), or that none
+// did.
 func (r *lineReport) percentile(key string, p int) slog.Attr {
 	if len(r.delays) == 0 {
 		return slog.String(key, "unmeasured")
@@ -101,6 +117,7 @@ func (r *lineReport) percentile(key string, p int) slog.Attr {
 
 	sorted := slices.Clone(r.delays)
 	slices.Sort(sorted)
+	rank := max(1, (len(sorted)*p+99)/100)
 
-	return slog.Duration(key, sorted[min(len(sorted)-1, len(sorted)*p/100)].Round(100*time.Microsecond))
+	return slog.Duration(key, sorted[rank-1].Round(100*time.Microsecond))
 }
