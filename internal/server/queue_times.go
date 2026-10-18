@@ -187,47 +187,72 @@ func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Targ
 	}
 }
 
-// gatherQueueTimeWork pages the jobs awaiting a queue time from the sweep's
-// cursor and groups those it may read now by run, newest first. The cursor
-// moves on to where it stopped, and back to the newest once a pass reaches
-// the oldest. False is a ledger read that failed.
+// gatherQueueTimeWork groups the jobs awaiting a queue time that may be read
+// now by run, newest first. False is a ledger read that failed.
+//
+// THE NEWEST PAGE IS READ ON EVERY PASS, and the rest of the pass's pages
+// continue from the sweep's cursor, which moves on to where they stopped and
+// back to the newest once they reach the oldest. A backlog of jobs that cannot
+// be read yet therefore never hides older ones that can, and never makes a job
+// that just started wait for the backlog to be paged through.
 func (s *Server) gatherQueueTimeWork(ctx context.Context, targets map[string]Target, sweep *queueTimeSweep,
 	now time.Time,
 ) ([]queueTimeWork, bool) {
+	// A job both scans read is gathered twice, which the write-once column makes
+	// one write that lands and one that changes nothing.
 	index := map[queueTimeRun]int{}
 	var work []queueTimeWork
 
-	cursor := sweep.cursor
-	for range sweep.pages {
-		jobs, err := s.alloc.JobsAwaitingQueueTime(ctx, now.Add(-queueTimeWindow), cursor, sweep.pageRows)
-		if err != nil {
-			s.log.Warn("could not list the jobs awaiting GitHub's queue time; trying again", "error", err)
+	// scan reads up to pages pages from from, and says where it stopped and
+	// whether it reached the oldest job.
+	scan := func(from alloc.QueueTimeCursor, pages int) (alloc.QueueTimeCursor, bool, bool) {
+		cursor := from
+		for range pages {
+			jobs, err := s.alloc.JobsAwaitingQueueTime(ctx, now.Add(-queueTimeWindow), cursor, sweep.pageRows)
+			if err != nil {
+				s.log.Warn("could not list the jobs awaiting GitHub's queue time; trying again", "error", err)
+				return cursor, false, false
+			}
+			for i := range jobs {
+				job := &jobs[i]
+				target := targets[job.Tier]
+				reader, ok := target.Provisioner.(QueueTimes)
+				if !ok {
+					continue
+				}
+				run := queueTimeRun{target: target.Config.Name, repository: job.Repository, run: job.RunID}
+				if retry, ok := sweep.retries[run]; ok && now.Before(retry.after) {
+					continue
+				}
+				at, seen := index[run]
+				if !seen {
+					at = len(work)
+					index[run] = at
+					work = append(work, queueTimeWork{run: run, installation: installationOf(target), reader: reader})
+				}
+				work[at].jobs = append(work[at].jobs, *job)
+			}
+			if len(jobs) < sweep.pageRows {
+				return alloc.QueueTimeCursor{}, true, true
+			}
+			cursor = jobs[len(jobs)-1].Cursor
+		}
+		return cursor, false, true
+	}
+
+	pages := sweep.pages
+	if sweep.cursor != (alloc.QueueTimeCursor{}) {
+		if _, _, ok := scan(alloc.QueueTimeCursor{}, 1); !ok {
 			return nil, false
 		}
-		for i := range jobs {
-			job := &jobs[i]
-			target := targets[job.Tier]
-			reader, ok := target.Provisioner.(QueueTimes)
-			if !ok {
-				continue
-			}
-			run := queueTimeRun{target: target.Config.Name, repository: job.Repository, run: job.RunID}
-			if retry, ok := sweep.retries[run]; ok && now.Before(retry.after) {
-				continue
-			}
-			at, seen := index[run]
-			if !seen {
-				at = len(work)
-				index[run] = at
-				work = append(work, queueTimeWork{run: run, installation: installationOf(target), reader: reader})
-			}
-			work[at].jobs = append(work[at].jobs, *job)
-		}
-		if len(jobs) < sweep.pageRows {
-			sweep.cursor = alloc.QueueTimeCursor{}
-			return work, true
-		}
-		cursor = jobs[len(jobs)-1].Cursor
+		pages--
+	}
+	cursor, oldest, ok := scan(sweep.cursor, pages)
+	if !ok {
+		return nil, false
+	}
+	if oldest {
+		cursor = alloc.QueueTimeCursor{}
 	}
 	sweep.cursor = cursor
 

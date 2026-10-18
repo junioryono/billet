@@ -355,25 +355,30 @@ func TestTargetsOfOneInstallationShareItsBudgetAndItsPause(t *testing.T) {
 }
 
 // THE LEDGER IS PAGED, AND A PASS THAT STOPS AT ITS LAST PAGE RESUMES THERE, so
-// jobs it cannot read yet never hide older ones it can, and once a pass reaches
-// the oldest the next begins at the newest again.
+// jobs it cannot read yet never hide older ones it can; the newest page is read
+// on every pass, so a job that just started does not wait for the backlog; and
+// once a pass reaches the oldest the next begins at the newest again.
 func TestTheQueueTimeSweepPagesTheLedgerAndResumes(t *testing.T) {
 	t.Parallel()
 
-	p := newRunnerlessPool(t, job11, job12, job13)
-	var started []dispatch.Job
-	for i, request := range []int64{11, 12, 13} {
-		runner, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, request)
-		if err != nil {
-			t.Fatalf("the runner launched for %d: %v", request, err)
+	p := newRunnerlessPool(t, job11, job12, job13, dispatch.Job{RequestID: 14, RunID: 104, JobID: "job-14"})
+	start := func(id int64, requests ...int64) {
+		t.Helper()
+		var started []dispatch.Job
+		for _, request := range requests {
+			runner, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, request)
+			if err != nil {
+				t.Fatalf("the runner launched for %d: %v", request, err)
+			}
+			started = append(started, dispatch.Job{RequestID: request, RunID: 900 + request, JobID: runner.LeaseID,
+				RunnerID: 80 + request, RunnerName: runner.RunnerName, Owner: "acme", Repository: "api"})
 		}
-		started = append(started, dispatch.Job{RequestID: request, RunID: 900 + request, JobID: runner.LeaseID,
-			RunnerID: int64(95 + i), RunnerName: runner.RunnerName, Owner: "acme", Repository: "api"})
+		if err := p.l.handle(t.Context(), &Message{MessageID: id, Started: started,
+			Statistics: &Statistics{TotalAssignedJobs: 4}}); err != nil {
+			t.Fatalf("start jobs %v: %v", requests, err)
+		}
 	}
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: started,
-		Statistics: &Statistics{TotalAssignedJobs: len(started)}}); err != nil {
-		t.Fatalf("start three jobs of three runs: %v", err)
-	}
+	start(2, 11, 12, 13)
 
 	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, times: map[int64]map[string]time.Time{}}
 	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
@@ -388,18 +393,27 @@ func TestTheQueueTimeSweepPagesTheLedgerAndResumes(t *testing.T) {
 		t.Fatalf("the first pass read runs %v and left cursor %+v; want two runs and a cursor", got,
 			sweep.cursor)
 	}
-	// Inside both runs' backoff, so only the page past the cursor is new work:
-	// the third run, the oldest, after which the next pass starts at the newest.
+
+	// A job starts while the backlog is half read. The next pass reads the
+	// newest page, which is that job, and one page past the cursor, which is the
+	// third run: the two already read are inside their backoff.
+	start(3, 14)
 	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(time.Second))
 	got := reader.asked()
 	seen := map[int64]bool{}
 	for _, run := range got {
 		seen[run] = true
 	}
-	if len(got) != 3 || !seen[911] || !seen[912] || !seen[913] {
-		t.Errorf("two passes read runs %v, want 911, 912 and 913 once each", got)
+	if len(got) != 4 || !seen[911] || !seen[912] || !seen[913] || !seen[914] {
+		t.Fatalf("two passes read runs %v, want 911 to 914 once each, the newly started 914 among them", got)
 	}
+
+	// Past the oldest is an empty page, which sends the cursor back to the newest.
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(2*time.Second))
 	if sweep.cursor != (alloc.QueueTimeCursor{}) {
 		t.Error("a pass that reached the oldest job left the cursor where it stopped")
+	}
+	if got := len(reader.asked()); got != 4 {
+		t.Errorf("a pass with every run backed off read %d runs in all, want still 4", got)
 	}
 }
