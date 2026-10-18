@@ -77,6 +77,8 @@ func TestAStalledGatewayHoldsARate(t *testing.T) {
 	start := func() *Controller {
 		c := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 		c.Down.Rate = 50
+		// A LINE FOUND WELL ABOVE, so the climb is the fast one, under Full.
+		c.Down.Limit = 1000
 
 		return c
 	}
@@ -140,6 +142,8 @@ func TestAGatewayThatDoesNotAnswerChangesNothing(t *testing.T) {
 
 	c := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 	c.Down.Rate = 50
+	// A LINE FOUND WELL ABOVE, so the climb is the fast one, under Full.
+	c.Down.Limit = 1000
 	for n := range 6 {
 		c.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), silent))
 	}
@@ -268,6 +272,8 @@ func TestAGatewayAloneNeverCutsOrRaises(t *testing.T) {
 	// clean rounds climb, and that one, with the reflectors unmeasured, must not.
 	r := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 	r.Down.Rate = 50
+	// A LINE FOUND WELL ABOVE, so the climb is the fast one, under Full.
+	r.Down.Limit = 1000
 	for n := range 5 {
 		r.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), gatewayRose(time.Millisecond)))
 	}

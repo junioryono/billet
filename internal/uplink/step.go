@@ -155,9 +155,8 @@ func (s *stepper) tick(ctx context.Context) error {
 }
 
 // record tells remember the rates CAKE holds now, read when it runs: the run
-// calls it after every change, once a minute and as it ends, so the next run
-// counts only the time the shaper was down. Nothing when a failed set left
-// what CAKE holds unknown.
+// calls it after every change, once a minute and as it ends. Nothing when a
+// failed set left what CAKE holds unknown.
 func (s *stepper) record() {
 	if s.remember == nil || s.unsure {
 		return
@@ -233,10 +232,14 @@ type reading struct {
 }
 
 // worthApplying is whether the rates moved enough to tell tc: every cut, and a
-// rise only once it is two percent, so probing upward is not a command a tick.
+// rise once it is two percent, so probing upward is not a command a tick, or
+// once it has come to rest where the climb stops, its ceiling or Near of its
+// line: a rise held back there would never be applied, and the next raise would
+// be judged against a rate CAKE was never given.
 func worthApplying(applied [2]float64, ctl *Controller) bool {
-	for i, rate := range []float64{ctl.Up.Rate, ctl.Down.Rate} {
-		if rate < applied[i] || rate > applied[i]*1.02 {
+	for i, d := range []*Direction{&ctl.Up, &ctl.Down} {
+		rate := d.Rate
+		if rate < applied[i] || rate > applied[i]*1.02 || rate > applied[i] && ctl.resting(d) {
 			return true
 		}
 	}
