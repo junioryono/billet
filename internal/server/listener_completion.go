@@ -288,7 +288,11 @@ func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job di
 	}
 	ctx, cancel := context.WithTimeout(ctx, identityWriteLimit)
 	defer cancel()
-	if err := l.alloc.RecordJobIdentity(ctx, leaseID, historyJob(job)); err != nil {
+	write := l.writeJobIdentity
+	if write == nil {
+		write = l.alloc.RecordJobIdentity
+	}
+	if err := write(ctx, leaseID, historyJob(job)); err != nil {
 		l.log.Warn("could not record which github job a lease ran; its history row "+
 			"will not name the repository, workflow or job",
 			"tier", l.tier, "lease", leaseID, "job", job.JobID, "error", err)
