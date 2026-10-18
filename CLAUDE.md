@@ -125,7 +125,7 @@ Eleven directories carry a short `CLAUDE.md` of their own (`internal/state`, `in
 - **A lease before every runner, never one reserved for an idle tier; exactly one party renews a lease; a timer never authorises a teardown.**
 - **One of each**: one signer, one SQLite driver import site, one scale-set client, one query directory, one toolset file, one durable-install ordering, one answer to where kernels live. A second copy is one that is wrong.
 - **Assemble in tests the way the CLI does** (`internal/app`), and prove a mechanism is used, not only that it works.
-- **Learn from other projects' published designs; never copy them.** Their code, text, images and diagrams are theirs. Describe billet's design in billet's own words, cite in the decision record the source or the prior art it builds on, and name another product only for a factual comparison a reader can check, never in a way that implies an affiliation.
+- **Learn from other projects' published designs, and never take what is theirs without a license.** Open-source code billet uses under its license (GitHub's runner-images template, ADR-014; Moby's kernel checker) is vendored at a pinned commit with its license kept, and recorded where it is adopted. Anything else of another project's (its code, text, images and diagrams) is not copied at all: describe billet's design in billet's own words, cite the source or the prior art it builds on in its decision record or `docs/reference/upstream-references.md`, and name another product only for a factual comparison a reader can check, never in a way that implies an affiliation.
 
 ## Comments in Go
 
