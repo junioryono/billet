@@ -1,0 +1,243 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/provider"
+)
+
+// stamp is a time as job_history keeps it.
+func stamp(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.000000000Z07:00") }
+
+// queueTimeReader is a provisioner whose target answers GitHub's queue times
+// from a table, and keeps every run it was asked for.
+type queueTimeReader struct {
+	*fakeProvisioner
+
+	mu    sync.Mutex
+	runs  []int64
+	times map[int64]map[string]time.Time
+	err   error
+}
+
+func (r *queueTimeReader) RunQueueTimes(_ context.Context, owner, repository string, runID int64,
+) (map[string]time.Time, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if owner != "acme" || repository != "api" {
+		return nil, errors.New("asked for the wrong repository")
+	}
+	r.runs = append(r.runs, runID)
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.times[runID], nil
+}
+
+func (r *queueTimeReader) asked() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]int64(nil), r.runs...)
+}
+
+// GITHUB'S QUEUE TIME REACHES A STARTED JOB'S ROW FROM ITS RUN'S REST RECORD,
+// one read per run however many of its jobs wait, matched by the runner's name
+// and read from the run that actually started on a swapped runner, not the run
+// it was launched for. A job the run does not list yet is asked about again
+// after a backoff, not on every pass, and its wait is told once it is known.
+func TestAStartedJobsQueueTimeComesFromItsRunsRecord(t *testing.T) {
+	t.Parallel()
+
+	launchedFor11, launchedFor12 := job11, job12
+	p := newRunnerlessPool(t, launchedFor11, launchedFor12)
+	runnerA := p.launchedFor11(t)
+	runnerB, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, 12)
+	if err != nil {
+		t.Fatalf("the runner launched for 12: %v", err)
+	}
+
+	// Both runners start jobs of run 600, which neither was launched for.
+	const ran = 600
+	started := func(job dispatch.Job, runner alloc.PoolRunner, id int64) dispatch.Job {
+		job.RunID = ran
+		job.RunnerID, job.RunnerName = id, runner.RunnerName
+		job.Owner, job.Repository = "acme", "api"
+		return job
+	}
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Statistics: &Statistics{TotalAssignedJobs: 2},
+		Started: []dispatch.Job{started(job12, runnerA, 77), started(job13, runnerB, 78)}}); err != nil {
+		t.Fatalf("start jobs 12 and 13: %v", err)
+	}
+
+	told := &waitsTold{}
+	p.a.ObserveQueueWaits(told)
+
+	now := time.Now()
+	queuedA, queuedB := now.Add(-7*time.Minute).UTC().Truncate(time.Second), now.Add(-3*time.Minute).UTC().Truncate(time.Second)
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, times: map[int64]map[string]time.Time{
+		ran: {provider.InstanceName(runnerA.LeaseID): queuedA},
+	}}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+	retries := map[queueTimeRun]queueTimeRetry{}
+
+	s.fillQueueTimesOnce(t.Context(), targets, retries, now)
+	if got := reader.asked(); len(got) != 1 || got[0] != ran {
+		t.Fatalf("the first pass read runs %v, want run %d once for both jobs", got, ran)
+	}
+	rowOf := func(lease string) string {
+		t.Helper()
+		got, err := p.a.Job(t.Context(), lease)
+		if err != nil {
+			t.Fatalf("Job %s: %v", lease, err)
+		}
+		return got.GitHubQueuedAt
+	}
+	if got := rowOf(runnerA.LeaseID); got != stamp(queuedA) {
+		t.Errorf("runner A's row has queue time %q, want its job's created_at %s", got, stamp(queuedA))
+	}
+	if got := rowOf(runnerB.LeaseID); got != "" {
+		t.Errorf("runner B's row has queue time %q before its run listed it", got)
+	}
+
+	s.fillQueueTimesOnce(t.Context(), targets, retries, now.Add(30*time.Second))
+	if got := reader.asked(); len(got) != 1 {
+		t.Errorf("a pass inside the backoff read runs %v again", got[1:])
+	}
+
+	reader.mu.Lock()
+	reader.times[ran][provider.InstanceName(runnerB.LeaseID)] = queuedB
+	reader.mu.Unlock()
+	s.fillQueueTimesOnce(t.Context(), targets, retries, now.Add(2*time.Minute))
+	if got := rowOf(runnerB.LeaseID); got != stamp(queuedB) {
+		t.Errorf("runner B's row has queue time %q after the backoff, want %s", got, stamp(queuedB))
+	}
+	if _, ok := retries[queueTimeRun{target: "acme", repository: "acme/api", run: ran}]; ok {
+		t.Error("a run whose jobs all have their time is still scheduled for a retry")
+	}
+
+	s.fillQueueTimesOnce(t.Context(), targets, retries, now.Add(3*time.Minute))
+	if got := reader.asked(); len(got) != 2 {
+		t.Errorf("runs read %v; a pass with nothing awaiting a time asked GitHub anyway", got)
+	}
+	if _, waits := told.told(); len(waits) != 2 {
+		t.Errorf("told %d waits, want one for each job", len(waits))
+	}
+}
+
+// THE CONTROL PLANE RUNS THE SWEEP, as a background loop beside the listeners
+// and after reconciliation, which is what gives it each tier's target. The
+// sweep works in the tests above against a fake reader; what they cannot see is
+// a Run that never starts it, which records no queue time and reads healthy.
+func TestTheControlPlaneRunsTheQueueTimeSweep(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "server.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse server.go: %v", err)
+	}
+	var run *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "Run" && fd.Recv != nil {
+			run = fd
+		}
+	}
+	if run == nil {
+		t.Fatal("server.go no longer declares (*Server).Run")
+	}
+
+	var reconciled, swept token.Pos
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "reconcile":
+			reconciled = call.Pos()
+		case "Background":
+			ast.Inspect(call, func(m ast.Node) bool {
+				if inner, ok := m.(*ast.CallExpr); ok {
+					if s, ok := inner.Fun.(*ast.SelectorExpr); ok && s.Sel.Name == "fillQueueTimes" {
+						swept = call.Pos()
+					}
+				}
+				return true
+			})
+		}
+		return true
+	})
+	if !swept.IsValid() {
+		t.Fatal("(*Server).Run starts no background loop that calls fillQueueTimes")
+	}
+	if !reconciled.IsValid() || swept < reconciled {
+		t.Errorf("(*Server).Run starts the queue-time sweep at %s, before reconcile at %s, which supplies "+
+			"its targets", fset.Position(swept), fset.Position(reconciled))
+	}
+}
+
+// A RUN THAT CANNOT BE READ BACKS OFF, doubling up to its bound; a tier this
+// control plane does not serve, and a target that cannot read queue times, are
+// never asked.
+func TestAQueueTimeReadThatFailsBacksOffAndAnUnservedTierIsNotAsked(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	runner := p.launchedFor11(t)
+	start := job11
+	start.RunnerID, start.RunnerName = 77, runner.RunnerName
+	start.Owner, start.Repository = "acme", "api"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{start},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("start job 11: %v", err)
+	}
+
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, err: errors.New("injected: GitHub is down")}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	retries := map[queueTimeRun]queueTimeRetry{}
+	run := queueTimeRun{target: "acme", repository: "acme/api", run: job11.RunID}
+
+	s.fillQueueTimesOnce(t.Context(), map[string]Target{"another-tier": {Provisioner: reader}}, retries, time.Now())
+	s.fillQueueTimesOnce(t.Context(), map[string]Target{p.l.tier: {Provisioner: &fakeProvisioner{}}}, retries,
+		time.Now())
+	if got := reader.asked(); len(got) != 0 {
+		t.Fatalf("asked for runs %v of a tier not served or a target that cannot read them", got)
+	}
+
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+	now := time.Now()
+	var waits []time.Duration
+	for range 9 {
+		s.fillQueueTimesOnce(t.Context(), targets, retries, now)
+		retry := retries[run]
+		waits = append(waits, retry.wait)
+		now = retry.after
+	}
+	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute,
+		32 * time.Minute, time.Hour, time.Hour, time.Hour}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("the backoffs were %v, want %v", waits, want)
+		}
+	}
+	if got := len(reader.asked()); got != 9 {
+		t.Errorf("read the run %d times in 9 passes each at its retry, want 9", got)
+	}
+}

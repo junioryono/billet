@@ -93,6 +93,29 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
  ORDER BY started_at DESC, lease_id DESC
  LIMIT CAST(@max_rows AS BIGINT);
 
+-- name: ListJobsAwaitingQueueTime :many
+-- The jobs that started since a moment and still have no GitHub queue time,
+-- with what finds each in GitHub's REST record of its run: the repository, the
+-- run and GitHub's job id (the lease names the runner). Newest start first,
+-- bounded, so a backlog is worked from the jobs an operator is looking at now.
+--
+-- THE RUN IS THE POOL BINDING'S WHEN IT NAMES THIS JOB. A pooled runner's row
+-- keeps the run of the job it was launched for, and GitHub may give the runner
+-- a job of another run; the binding records the run that started, until the
+-- compute is gone. A run that is wrong finds no job on the runner, never
+-- another job's time, because the runner's name is unique.
+SELECT h.lease_id, h.tier, COALESCE(h.repo, '') AS repo,
+       CAST(CASE WHEN COALESCE(p.run_id, 0) > 0 THEN p.run_id ELSE COALESCE(h.run_id, 0) END
+            AS BIGINT) AS run_id,
+       h.github_job_id
+  FROM job_history h
+  LEFT JOIN pool_runners p ON p.lease_id = h.lease_id AND p.job_id = h.github_job_id
+ WHERE h.started_at IS NOT NULL AND h.started_at >= @since
+   AND h.github_queued_at = '' AND h.github_job_id != '' AND COALESCE(h.repo, '') != ''
+   AND (COALESCE(p.run_id, 0) > 0 OR COALESCE(h.run_id, 0) > 0)
+ ORDER BY h.started_at DESC, h.lease_id DESC
+ LIMIT CAST(@max_rows AS BIGINT);
+
 -- name: ListAttributedFailures :many
 -- Jobs that did not succeed while billet's own infrastructure was disrupted.
 --

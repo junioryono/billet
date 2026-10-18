@@ -442,6 +442,12 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 
+	// GITHUB'S QUEUE TIME COMES FROM ITS REST RECORD, after the start, beside
+	// the listeners and unable to stop them: it decides nothing.
+	group.Background("github queue times", func(ctx context.Context) {
+		s.fillQueueTimes(ctx, targets)
+	})
+
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for
 	// others — a state whose only symptom is jobs queueing forever on the tiers

@@ -489,6 +489,72 @@ func (q *Queries) ListJobWaits(ctx context.Context, arg ListJobWaitsParams) ([]L
 	return items, nil
 }
 
+const listJobsAwaitingQueueTime = `-- name: ListJobsAwaitingQueueTime :many
+SELECT h.lease_id, h.tier, COALESCE(h.repo, '') AS repo,
+       CAST(CASE WHEN COALESCE(p.run_id, 0) > 0 THEN p.run_id ELSE COALESCE(h.run_id, 0) END
+            AS BIGINT) AS run_id,
+       h.github_job_id
+  FROM job_history h
+  LEFT JOIN pool_runners p ON p.lease_id = h.lease_id AND p.job_id = h.github_job_id
+ WHERE h.started_at IS NOT NULL AND h.started_at >= $1
+   AND h.github_queued_at = '' AND h.github_job_id != '' AND COALESCE(h.repo, '') != ''
+   AND (COALESCE(p.run_id, 0) > 0 OR COALESCE(h.run_id, 0) > 0)
+ ORDER BY h.started_at DESC, h.lease_id DESC
+ LIMIT CAST($2 AS BIGINT)
+`
+
+type ListJobsAwaitingQueueTimeParams struct {
+	Since   sql.NullString
+	MaxRows int64
+}
+
+type ListJobsAwaitingQueueTimeRow struct {
+	LeaseID     string
+	Tier        string
+	Repo        string
+	RunID       int64
+	GithubJobID string
+}
+
+// The jobs that started since a moment and still have no GitHub queue time,
+// with what finds each in GitHub's REST record of its run: the repository, the
+// run and GitHub's job id (the lease names the runner). Newest start first,
+// bounded, so a backlog is worked from the jobs an operator is looking at now.
+//
+// THE RUN IS THE POOL BINDING'S WHEN IT NAMES THIS JOB. A pooled runner's row
+// keeps the run of the job it was launched for, and GitHub may give the runner
+// a job of another run; the binding records the run that started, until the
+// compute is gone. A run that is wrong finds no job on the runner, never
+// another job's time, because the runner's name is unique.
+func (q *Queries) ListJobsAwaitingQueueTime(ctx context.Context, arg ListJobsAwaitingQueueTimeParams) ([]ListJobsAwaitingQueueTimeRow, error) {
+	rows, err := q.db.QueryContext(ctx, listJobsAwaitingQueueTime, arg.Since, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListJobsAwaitingQueueTimeRow
+	for rows.Next() {
+		var i ListJobsAwaitingQueueTimeRow
+		if err := rows.Scan(
+			&i.LeaseID,
+			&i.Tier,
+			&i.Repo,
+			&i.RunID,
+			&i.GithubJobID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const readJob = `-- name: ReadJob :one
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
        COALESCE(request_id, 0) AS request_id, github_job_id,

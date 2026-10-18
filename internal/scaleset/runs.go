@@ -3,6 +3,7 @@ package scaleset
 import (
 	"context"
 	"fmt"
+	"time"
 
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/server"
@@ -51,6 +52,25 @@ func (c *Client) DefaultBranch(ctx context.Context, owner, repository string) (s
 	}
 
 	return branch, nil
+}
+
+var _ server.QueueTimes = (*Client)(nil)
+
+// RunQueueTimes reads when GitHub queued each job of a run, by runner name,
+// through the target's App client.
+func (c *Client) RunQueueTimes(
+	ctx context.Context, owner, repository string, runID int64,
+) (map[string]time.Time, error) {
+	reader, ok := c.policy.(billetgithub.QueueTimes)
+	if c.policy == nil || !ok {
+		return nil, billetgithub.ErrRunEvidenceUnavailable
+	}
+	times, err := reader.RunQueueTimes(ctx, owner, repository, runID)
+	if err != nil {
+		return nil, fmt.Errorf("scaleset: %w", err)
+	}
+
+	return times, nil
 }
 
 func (c *Client) runEvidence() (billetgithub.RunEvidence, error) {
