@@ -63,6 +63,13 @@ dpkg -l billet | tail -1
 ls -l /usr/lib/systemd/system/billet-server.service \
     /usr/lib/systemd/system/billet-node.service 2>/dev/null
 
+# THE HOST LOCK DIRECTORY IS THE PACKAGE'S TMPFILES ENTRY'S, made by postinstall
+# where systemd runs, and no unit's: a node unit naming it in ReadWritePaths
+# refuses to start without it (#175).
+lockdir=$(stat -c '%U:%G %a' /run/billet/locks 2>&1)
+[ "$lockdir" = "root:root 750" ] && ok "postinstall made /run/billet/locks root:root 0750" ||
+    bad "/run/billet/locks after the install: $lockdir"
+
 say "billet local up"
 "$BILLET" local up --config "$CFG" 2>&1 | tail -8
 [ "${PIPESTATUS[0]}" -eq 0 ] && ok "local up exited 0" || bad "local up did not exit 0"
@@ -143,6 +150,14 @@ for u in billet-node.service billet-server.service; do
     [ "$st" = active ] && bad "$u is still active after a successful down" ||
         ok "$u was stopped"
 done
+
+# THE NODE'S STOP LEAVES THE LOCK DIRECTORY AND WHAT IS IN IT (#175). The node
+# took its deployment lock there at its start; a unit that declared the
+# directory a RuntimeDirectory removed it at this stop, under any lock another
+# process held in it.
+[ -f "/run/billet/locks/deployment-$identity.lock" ] &&
+    ok "the node's stop left /run/billet/locks and its deployment lock in place" ||
+    bad "/run/billet/locks/deployment-$identity.lock is gone after the node's stop"
 
 # THE NODE STOPS BEFORE THE SERVER. A control plane that outlives its node has
 # nothing left to talk to, and stopping the server first strands the node's

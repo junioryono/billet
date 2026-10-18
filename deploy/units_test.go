@@ -3,7 +3,9 @@ package deploy_test
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -557,15 +559,15 @@ func TestRequiredPathsUnderPrivateTmpReadsTheUnitAsSystemdDoes(t *testing.T) {
 	}
 }
 
-// THE NODE DECLARES ITS TWO RUNTIME DIRECTORIES ONCE, IN [Service], AND THE
+// THE NODE DECLARES ITS REGISTRATION DIRECTORY ONCE, IN [Service], AND THE
 // SERVER DECLARES NONE. The registration record lives under
 // billet/registration; a second assignment or a later empty one would reset
 // the list, a placement under [Unit] would be ignored, a RuntimeDirectoryPreserve
 // other than no would keep a record across a restart (the empty directory at a
 // start is what the inspector's currency rule rests on), and a server unit
 // declaring the same directory would re-own and remove the node's record.
-func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *testing.T) {
-	const want = "RuntimeDirectory=billet/locks billet/registration"
+func TestTheNodeUnitDeclaresItsRegistrationDirectoryAndTheServerDeclaresNone(t *testing.T) {
+	const want = "RuntimeDirectory=billet/registration"
 
 	lines := strings.Split(deploy.NodeUnit, "\n")
 	section := ""
@@ -624,42 +626,168 @@ func TestTheShippedNodeUnitMeetsTheNodesRuntimeRequirements(t *testing.T) {
 	}
 }
 
-// A UNIT THAT TAKES THE HOST LOCK DECLARES THE DIRECTORY IT LIVES IN, AND ONLY
-// ITS OWNER MAY REMOVE IT.
-//
-// /run/billet/locks is the host-wide collision domain, and ProtectSystem=strict
-// leaves nothing under /run writable except a directory the unit itself
-// declares. The image refresh takes that lock to boot-verify a generation before
-// promoting it, so without the declaration a pull downloaded the image (about
-// 5.1 GiB of parts, 23.6 GB decompressed), imported the generation and then
-// failed on the lock, leaving the image unpromoted and @verified on the old one
-// (measured on a node 2026-09-22).
-//
-// The preserve is the other half. A unit removes the runtime directories it
-// declares when it stops, and a oneshot stops after every run, so a refresh
-// without RuntimeDirectoryPreserve=yes would take the running node's lock
-// directory with it. billet-node.service is the owner and must NOT preserve,
-// which the test above pins; every other unit that declares the directory must.
-func TestAUnitThatTakesTheHostLockDeclaresItWithoutTakingItAway(t *testing.T) {
-	for name, unit := range map[string]string{
+// NO UNIT'S STOP REMOVES THE HOST LOCK DIRECTORY. A unit removes the runtime
+// directories it declares when it stops, and a lock in /run/billet/locks is held
+// by processes that outlive a node restart: `billet images verify` holds its
+// probe lock for the minutes a boot verification takes. A stop that removed the
+// directory unlinked the lock's name under its holder, and the next verifier
+// locked a fresh file at the same path and destroyed the first one's live probe
+// (#175; measured on systemd 255.4, 2026-10-16: the second flock on the
+// recreated name was granted). A declaration of the directory's parent removes
+// it just the same, so billet itself and every prefix of the lock directory
+// count, and a unit may declare one only with RuntimeDirectoryPreserve=yes,
+// which the node cannot set (its registration record must not outlive it).
+func TestNoUnitDeclaresTheHostLockDirectory(t *testing.T) {
+	units := map[string]string{
+		deploy.ServerUnitName:        deploy.ServerUnit,
+		deploy.NodeUnitName:          deploy.NodeUnit,
+		deploy.BackupUnitName:        deploy.BackupUnit,
+		deploy.UpgradeUnitName:       deploy.UpgradeUnit,
 		deploy.ImagesRefreshUnitName: deploy.ImagesRefreshUnit,
+	}
+
+	lockDir := strings.TrimPrefix(deploy.NodeLockDir, "/run/")
+
+	for name, unit := range units {
+		preserved := slices.Equal(serviceAssignments(unit, "RuntimeDirectoryPreserve"), []string{"yes"})
+
+		for _, value := range serviceAssignments(unit, "RuntimeDirectory") {
+			for _, entry := range strings.Fields(value) {
+				covers := entry == lockDir || strings.HasPrefix(lockDir, entry+"/") || strings.HasPrefix(entry, lockDir+"/")
+				if covers && !preserved {
+					t.Errorf("%s declares RuntimeDirectory %q without RuntimeDirectoryPreserve=yes, so its stop "+
+						"removes %s under the locks other processes hold in it", name, entry, deploy.NodeLockDir)
+				}
+			}
+		}
+	}
+}
+
+// A UNIT THAT TAKES THE HOST LOCK CAN WRITE ITS DIRECTORY, AND NEITHER REMOVES IT.
+//
+// ProtectSystem=strict leaves nothing under /run writable that a unit does not
+// name. The node (the deployment lock) names it in ReadWritePaths, without a
+// leading '-': a host whose directory is missing then refuses the start with
+// 226/NAMESPACE naming the path, rather than starting a node that cannot lock
+// (measured on systemd 255.4, 2026-10-16). The image refresh (the probe lock a
+// promotion takes) declares it, 0750 like the tmpfiles entry so it re-owns
+// nothing, and preserves it: the declaration makes it where something removed
+// it, and the preserve keeps this oneshot's stop after every run from removing
+// it under a running node's lock (measured on a node 2026-09-22: without the
+// declaration the pull downloaded about 5.1 GiB, imported the generation and
+// then failed to verify it on the lock).
+func TestAUnitThatTakesTheHostLockCanWriteItsDirectory(t *testing.T) {
+	var entries []string
+	for _, value := range serviceAssignments(deploy.NodeUnit, "ReadWritePaths") {
+		entries = append(entries, strings.Fields(value)...)
+	}
+
+	if !slices.Contains(entries, deploy.NodeLockDir) {
+		t.Errorf("%s names ReadWritePaths %q, without %s as a required entry; under "+
+			"ProtectSystem=strict it cannot take the host lock there", deploy.NodeUnitName, entries, deploy.NodeLockDir)
+	}
+
+	// THE ROLE'S COPY IS READ BY THE SAME PARSER: it renders no variables, so
+	// the template is the unit, and unit-parity's line patterns cannot follow a
+	// continuation or a second [Service] the way systemd does.
+	role, err := os.ReadFile("../ansible_collections/junioryono/billet/roles/host/templates/billet-images-refresh.service.j2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The template is the unit only while Jinja has nothing to render in it.
+	for _, delimiter := range []string{"{{", "{%", "{#", "#jinja2:"} {
+		if strings.Contains(string(role), delimiter) {
+			t.Errorf("the role's refresh template carries the Jinja marker %q, so it is not the unit it renders",
+				delimiter)
+		}
+	}
+
+	for name, unit := range map[string]string{
+		deploy.ImagesRefreshUnitName:  deploy.ImagesRefreshUnit,
+		"the role's refresh template": string(role),
 	} {
-		if got := serviceAssignments(unit, "RuntimeDirectory"); !slices.Equal(got, []string{"billet/locks"}) {
-			t.Errorf("%s assigns RuntimeDirectory=%q; it takes the host lock, and under "+
-				"ProtectSystem=strict a directory it does not declare cannot be opened, so the "+
-				"pull it follows is wasted", name, got)
+		if err := plainUnit(unit); err != nil {
+			t.Errorf("%s: %v", name, err)
 		}
 
-		if got := serviceAssignments(unit, "RuntimeDirectoryPreserve"); !slices.Equal(got, []string{"yes"}) {
-			t.Errorf("%s assigns RuntimeDirectoryPreserve=%q; a unit removes the runtime "+
-				"directories it declares when it stops, and this one stops after every run, so "+
-				"anything but yes takes %s's lock directory with it", name, got, deploy.NodeUnitName)
+		for key, want := range map[string]string{
+			"RuntimeDirectory":         strings.TrimPrefix(deploy.NodeLockDir, "/run/"),
+			"RuntimeDirectoryMode":     "0750",
+			"RuntimeDirectoryPreserve": "yes",
+		} {
+			if got := serviceAssignments(unit, key); !slices.Equal(got, []string{want}) {
+				t.Errorf("%s assigns %s=%q, want exactly %q in [Service]", name, key, got, want)
+			}
+		}
+	}
+}
+
+// THE TMPFILES ENTRY MAKES THE LOCK DIRECTORY AS THE NODE UNIT USED TO, AND
+// NEVER AGES IT. root:root 0750 is what RuntimeDirectoryMode gave the
+// directory, so a host moving from the old units to this entry re-owns
+// nothing; an age field other than '-' would let systemd-tmpfiles --clean
+// remove a lock file a process holds, which is #175 again on a timer.
+func TestTheTmpfilesEntryMakesTheLockDirectoryAndNeverAgesIt(t *testing.T) {
+	var lines []string
+
+	for line := range strings.Lines(deploy.Tmpfiles) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
 
-		if got := serviceAssignments(unit, "RuntimeDirectoryMode"); !slices.Equal(got, []string{"0750"}) {
-			t.Errorf("%s assigns RuntimeDirectoryMode=%q; %s creates that directory 0750, and a "+
-				"different mode re-owns what the two units share", name, got, deploy.NodeUnitName)
+		lines = append(lines, strings.Join(strings.Fields(line), " "))
+	}
+
+	want := []string{
+		"d /run/billet 0755 root root -",
+		"d " + deploy.NodeLockDir + " 0750 root root -",
+	}
+
+	if !slices.Equal(lines, want) {
+		t.Errorf("billet-tmpfiles.conf declares %q, want exactly %q", lines, want)
+	}
+}
+
+// THE PACKAGE INSTALLS THE ENTRY WHERE postinstall CREATES IT FROM, AND THE
+// ROLE RENDERS THE SAME BYTES. A host converged by the role and one that
+// installed the package carry one directory with one owner and mode; the
+// role's template must carry no Jinja delimiter, or its render would differ
+// from its source.
+func TestThePackageAndTheRoleInstallOneTmpfilesEntry(t *testing.T) {
+	release, err := os.ReadFile("../.goreleaser.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(release), "- src: deploy/billet-tmpfiles.conf\n        dst: "+deploy.TmpfilesPath+"\n") {
+		t.Errorf(".goreleaser.yaml does not install deploy/billet-tmpfiles.conf at %s", deploy.TmpfilesPath)
+	}
+
+	role, err := os.ReadFile("../ansible_collections/junioryono/billet/roles/host/templates/billet-tmpfiles.conf.j2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(role) != deploy.Tmpfiles {
+		t.Errorf("the role's tmpfiles template differs from deploy/billet-tmpfiles.conf:\nrole:\n%s\npackage:\n%s",
+			role, deploy.Tmpfiles)
+	}
+
+	for _, delimiter := range []string{"{{", "{%", "{#"} {
+		if strings.Contains(string(role), delimiter) {
+			t.Errorf("the role's tmpfiles template carries the Jinja delimiter %q", delimiter)
 		}
+	}
+
+	account, err := os.ReadFile("../ansible_collections/junioryono/billet/roles/host/tasks/account.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(account), "src: billet-tmpfiles.conf.j2\n    dest: "+deploy.TmpfilesRolePath+"\n") {
+		t.Errorf("the role's account.yml does not render billet-tmpfiles.conf.j2 at %s", deploy.TmpfilesRolePath)
 	}
 }
 
@@ -670,33 +798,145 @@ func TestAUnitThatTakesTheHostLockDeclaresItWithoutTakingItAway(t *testing.T) {
 // PARSED RATHER THAN SEARCHED, because a directive named in a COMMENT satisfies
 // a substring search: the first version of the rule above passed against a unit
 // with the preserve deleted, on the strength of the comment that explains why it
-// has to be there.
+// has to be there. A lone carriage return ends a line and a trailing backslash
+// continues one, as systemd's parser reads them: a continuation folds the next
+// line into the assignment it ends, so a directive on that next line is no
+// directive.
+//
+// The line handling follows systemd 255's config_parse for the plain form
+// plainUnit admits: a comment line is skipped before any joining, a line
+// continues when it ends in an UNESCAPED backslash (counted over the line as
+// joined so far, before any trimming), the backslash becomes a space, the joined
+// line is trimmed before it is read as a section or an assignment, and a
+// continuation still open at the end of the file is read as it stands. Outside
+// that form systemd reads differently in ways this does not follow.
 func serviceAssignments(unit, key string) []string {
 	var out []string
 
 	section := ""
 
-	for line := range strings.Lines(unit) {
+	parse := func(line string) {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
+			return
 		}
 
 		if strings.HasPrefix(line, "[") {
 			section = line
 
-			continue
+			return
 		}
 
 		k, v, ok := strings.Cut(line, "=")
-		if !ok || section != "[Service]" || strings.TrimSpace(k) != key {
+		if ok && section == "[Service]" && strings.TrimSpace(k) == key {
+			out = append(out, strings.TrimSpace(v))
+		}
+	}
+
+	unit = strings.ReplaceAll(strings.ReplaceAll(unit, "\r\n", "\n"), "\r", "\n")
+
+	continuation, continued := "", false
+
+	for line := range strings.Lines(unit) {
+		line = strings.TrimSuffix(line, "\n")
+
+		// A COMMENT LINE IS SKIPPED BEFORE ANY JOINING, inside a continuation
+		// or not, so a backslash ending one continues nothing.
+		if lead := strings.TrimLeft(line, " \t"); strings.HasPrefix(lead, "#") || strings.HasPrefix(lead, ";") {
 			continue
 		}
 
-		out = append(out, strings.TrimSpace(v))
+		if continued {
+			line = continuation + line
+		}
+
+		escaped := false
+		for _, c := range line {
+			escaped = !escaped && c == '\\'
+		}
+
+		if escaped {
+			continuation, continued = line[:len(line)-1]+" ", true
+
+			continue
+		}
+
+		continuation, continued = "", false
+
+		parse(line)
+	}
+
+	if continued {
+		parse(continuation)
 	}
 
 	return out
+}
+
+// plainUnit refuses a unit outside the plain form both refresh copies are
+// written in, where serviceAssignments reads every line as systemd 255 does:
+// printable ASCII and newlines only (no carriage return, NUL, BOM, tab or
+// Unicode space, each of which systemd's reader and Go's trimming treat
+// differently), a final newline, no indented line, no line ending in a
+// backslash (a comment line included, since systemd joins what follows it), and
+// every line opening with '[' a bare section header. FAILING CLOSED, because
+// emulating each of systemd's line rules was measured to leave the next one
+// open: six review rounds each found another way to hide an override.
+func plainUnit(unit string) error {
+	if !strings.HasSuffix(unit, "\n") {
+		return errors.New("the unit does not end in a newline")
+	}
+
+	for i, line := range strings.Split(strings.TrimSuffix(unit, "\n"), "\n") {
+		// A comment line is skipped whole, so it may carry prose beyond ASCII;
+		// a control byte ends or splits a line anywhere.
+		comment := strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";")
+
+		for _, c := range []byte(line) {
+			if c < 0x20 || c == 0x7f || c > 0x7e && !comment {
+				return fmt.Errorf("line %d carries the byte %#x, outside printable ASCII", i+1, c)
+			}
+		}
+
+		switch {
+		case strings.HasPrefix(line, " "):
+			return fmt.Errorf("line %d is indented", i+1)
+		case strings.HasSuffix(strings.TrimRight(line, " "), `\`):
+			return fmt.Errorf("line %d ends in a backslash, which continues it", i+1)
+		case strings.HasPrefix(line, "[") && !sectionHeader.MatchString(line):
+			return fmt.Errorf("line %d opens with '[' and is not a bare section header: %q", i+1, line)
+		}
+	}
+
+	return nil
+}
+
+var sectionHeader = regexp.MustCompile(`^\[[A-Za-z]+\]$`)
+
+// THE PLAIN FORM REFUSES EVERY SHAPE THAT HID AN OVERRIDE FROM A READER.
+func TestPlainUnitRefusesWhatSystemdReadsDifferently(t *testing.T) {
+	for _, tc := range []struct{ name, unit string }{
+		{"a comment that continues", "[Service]\n# why \\\nRuntimeDirectoryPreserve\\\n=no\n"},
+		{"an escaped backslash", "[Service]\nX-Note=\\\\\nRuntimeDirectoryPreserve=no\n"},
+		{"a carriage return", "[Service]\nX=1\r[Install]\n"},
+		{"a NUL", "[Service]\n# note\x00RuntimeDirectoryPreserve=no\n"},
+		{"a byte-order mark", "[Service]\n\ufeffRuntimeDirectoryPreserve=no\n"},
+		{"a non-breaking space", "[Service]\nRuntimeDirectoryPreserve\u00a0=yes\n"},
+		{"a tab", "[Service]\nRuntimeDirectoryPreserve\t=yes\n"},
+		{"an indented line", "[Service]\n  RuntimeDirectoryPreserve = no\n"},
+		{"a header with a comment", "[Service] # why\nRuntimeDirectoryPreserve=yes\n"},
+		{"no final newline", "[Service]\nRuntimeDirectoryPreserve=yes"},
+		{"a byte-order mark before a comment", "[Service]\n\ufeff# why\nRuntimeDirectoryPreserve=yes\n"},
+		{"a NUL inside a comment", "[Service]\n# why\x00\nRuntimeDirectoryPreserve=yes\n"},
+	} {
+		if plainUnit(tc.unit) == nil {
+			t.Errorf("%s: admitted %q", tc.name, tc.unit)
+		}
+	}
+
+	if err := plainUnit("# a unit — with prose\n[Unit]\nDescription=x\n\n[Service]\nRuntimeDirectoryPreserve=yes\n"); err != nil {
+		t.Errorf("a plain unit was refused: %v", err)
+	}
 }
 
 // THE READER IS TESTED ON WHAT FOOLED ITS PREDECESSOR.
@@ -712,6 +952,20 @@ func TestServiceAssignmentsReadsAssignmentsAndNotProse(t *testing.T) {
 		{"back in [Service]", "[Unit]\nX=1\n[Service]\nRuntimeDirectoryPreserve=no\n", []string{"no"}},
 		{"every assignment, in order", "[Service]\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryPreserve=no\n", []string{"yes", "no"}},
 		{"a longer key is not this one", "[Service]\nRuntimeDirectoryPreserveMore=yes\n", nil},
+		{"indented, in a second [Service]", "[Service]\nRuntimeDirectoryPreserve=yes\n[Install]\n[Service]\n  RuntimeDirectoryPreserve = no\n",
+			[]string{"yes", "no"}},
+		{"folded into the line before", "[Service]\nEnvironment=A=1 \\\nRuntimeDirectoryPreserve=yes\n", nil},
+		{"a lone carriage return ends a line", "[Service]\nX=1\r[Install]\nRuntimeDirectoryPreserve=yes\n", nil},
+		{"a continuation ends", "[Service]\nEnvironment=A=1 \\\n  B=2\nRuntimeDirectoryPreserve=yes\n", []string{"yes"}},
+		{"an escaped backslash does not continue", "[Service]\nRuntimeDirectoryPreserve=yes\nX-Note=\\\\\nRuntimeDirectoryPreserve=no\n",
+			[]string{"yes", "no"}},
+		{"a space after the backslash does not continue", "[Service]\nX-Note=a\\ \nRuntimeDirectoryPreserve=no\n",
+			[]string{"no"}},
+		{"a joined line is trimmed before it is a section", "[Unit]\n\\\n[Service]\nRuntimeDirectoryPreserve=no\n",
+			[]string{"no"}},
+		{"a comment inside a continuation is skipped", "[Service]\nRuntimeDirectoryPreserve=\\\n# why\nno\n", []string{"no"}},
+		{"a continuation open at the end of the file", "[Service]\nRuntimeDirectoryPreserve=no\\", []string{"no"}},
+		{"a continuation open at the last newline", "[Service]\nRuntimeDirectoryPreserve=no\\\n", []string{"no"}},
 	} {
 		if got := serviceAssignments(tc.unit, "RuntimeDirectoryPreserve"); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)

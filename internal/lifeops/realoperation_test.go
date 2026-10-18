@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/deploy"
 )
 
 // Opt in only inside a disposable systemd host. Admission never submits a job;
@@ -287,6 +289,7 @@ func realRetirementSequence(t *testing.T, role bool, host string) {
 			}
 		}
 	}
+	realHostLockDir(t)
 	names := []string{"billet-server.service", "billet-node.service", "billet-backup.service", "billet-upgrade.service", "billet-backup.timer", "billet-upgrade.timer"}
 	if role && retained {
 		names = append(names, "billet-network.service", "billet-dnsmasq@.service")
@@ -337,7 +340,12 @@ print(template.render(
 		if err != nil {
 			t.Fatalf("read/render %s (python3 Jinja2 required): %v: %s", path, err, body)
 		}
-		text := strings.NewReplacer("billet-dnsmasq/", h.prefix+"/dnsmasq/", "billet-", h.prefix+"-", "billet/", h.prefix+"/", "/etc/billet", "/etc/"+h.prefix).Replace(string(body))
+		// THE HOST LOCK DIRECTORY KEEPS ITS NAME: the retained admission
+		// exempts exactly the directory billet-tmpfiles.conf makes, and a
+		// renamed one would be a sibling it rightly refuses. A pair earlier in
+		// the target wins, so this one matches before "billet/" can.
+		text := strings.NewReplacer(deploy.NodeLockDir, deploy.NodeLockDir,
+			"billet-dnsmasq/", h.prefix+"/dnsmasq/", "billet-", h.prefix+"-", "billet/", h.prefix+"/", "/etc/billet", "/etc/"+h.prefix).Replace(string(body))
 		text = strings.NewReplacer("FIXTURE_LEDGER_UNIT", ledgerUnit, "FIXTURE_LEDGER_PATH", ledgerPath).Replace(text)
 		var lines []string
 		nodeCommand := ""

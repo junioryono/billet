@@ -39,16 +39,14 @@ ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
 StateDirectory=billet/node
 StateDirectoryMode=0700
 
-# /run/billet/locks is the host-wide collision domain for node invocations that
-# carry one deployment identity. The server no longer takes this lock; its
-# authoritative state store serializes the control plane instead.
 # billet/registration holds the node's registration record (root-owned, written
-# after every accepted registration); a RuntimeDirectory is the one place under
-# /run that ProtectSystem=strict leaves writable, and it is the NODE'S ALONE: a
-# unit that declares a directory re-owns it recursively at a start where its
-# owner differs and removes it at its stop, so a server declaring the same name
-# would take the record with it (measured on systemd 255, 2026-09-09).
-RuntimeDirectory=billet/locks billet/registration
+# after every accepted registration). It is a RuntimeDirectory because the
+# record must not outlive the invocation that wrote it: systemd removes the
+# directory at the stop and creates it empty at the start. It is the NODE'S
+# ALONE: a unit that declares a directory re-owns it recursively at a start
+# where its owner differs and removes it at its stop, so a server declaring the
+# same name would take the record with it (measured on systemd 255, 2026-09-09).
+RuntimeDirectory=billet/registration
 RuntimeDirectoryMode=0750
 
 # Sized for billet's maximum configurable drain (24h) + teardown (~25m) + margin.
@@ -78,7 +76,18 @@ SystemCallArchitectures=native
 ReadOnlyPaths=/etc/billet
 # Certificate renewal installs a new key, leaf and CA bundle atomically while
 # the process is running. Keep the rest of /etc immutable to the node.
-ReadWritePaths=-/etc/billet/tls -/srv/jailer
+#
+# /run/billet/locks is the host-wide collision domain for node invocations that
+# carry one deployment identity, and the directory `billet images verify` takes
+# its probe lock in. billet-tmpfiles.conf creates it at boot, and it is NOT a
+# RuntimeDirectory: this unit's stop would remove it while another process
+# holds a lock in it, and the next locker would get a fresh file at the same
+# name (#175). ProtectSystem=strict leaves nothing under /run writable that a
+# unit does not name, so it is named here. WITHOUT a leading '-': a host whose
+# directory is missing refuses the start with 226/NAMESPACE naming the path,
+# rather than starting a node that cannot lock (measured on systemd 255.4,
+# 2026-10-16).
+ReadWritePaths=-/etc/billet/tls -/srv/jailer /run/billet/locks
 
 [Install]
 WantedBy=multi-user.target

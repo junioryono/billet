@@ -70,6 +70,7 @@ docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/bi
     ${APT} install --yes /tmp/billet.deb
     test -x /usr/bin/billet
     test -f /usr/lib/modules-load.d/billet-rbd.conf
+    test -f /usr/lib/tmpfiles.d/billet.conf
     cmp /usr/share/billet/needrestart.conf /etc/needrestart/conf.d/90-billet.conf
     test -f /etc/billet/billet.yaml
     test -d /var/lib/billet
@@ -79,6 +80,7 @@ docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/bi
     ${APT} remove --yes billet
     test ! -e /usr/bin/billet
     test ! -e /usr/lib/modules-load.d/billet-rbd.conf
+    test ! -e /usr/lib/tmpfiles.d/billet.conf
     test -f /etc/billet/billet.yaml
     test -f /etc/needrestart/conf.d/90-billet.conf
     test -f /var/lib/billet/package-lifecycle-state
@@ -89,6 +91,7 @@ docker run --rm --platform "linux/${package_arch}" --volume "${rpm_path}:/tmp/bi
     dnf install --assumeyes /tmp/billet.rpm
     test -x /usr/bin/billet
     test -f /usr/lib/modules-load.d/billet-rbd.conf
+    test -f /usr/lib/tmpfiles.d/billet.conf
     test ! -e /etc/needrestart
     test -f /etc/billet/billet.yaml
     test -d /var/lib/billet
@@ -98,6 +101,7 @@ docker run --rm --platform "linux/${package_arch}" --volume "${rpm_path}:/tmp/bi
     dnf remove --assumeyes billet
     test ! -e /usr/bin/billet
     test ! -e /usr/lib/modules-load.d/billet-rbd.conf
+    test ! -e /usr/lib/tmpfiles.d/billet.conf
     test -f /etc/billet/billet.yaml
     test -f /var/lib/billet/package-lifecycle-state
     test -f /srv/jailer/package-lifecycle-guest

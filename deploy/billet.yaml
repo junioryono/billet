@@ -106,8 +106,9 @@ github:
 #   # the control plane takes no lock. (It was `server.lock_dir` before that was
 #   # true, and billet will tell you so if it finds it there.)
 #   #
-#   # /run/billet is created by the units' RuntimeDirectory=. It is tmpfs, which
-#   # is correct: the lock is meaningful per boot.
+#   # /run/billet/locks is created at boot by the package's tmpfiles.d entry,
+#   # and no unit removes it at a stop. It is tmpfs, which is correct: the lock
+#   # is meaningful per boot.
 #   lock_dir: /run/billet/locks
 #
 #   # Measure each job from the host and report it to the control plane

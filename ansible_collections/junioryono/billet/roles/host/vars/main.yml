@@ -113,11 +113,20 @@ billet_server_directories: >-
   {{ [{'path': billet_configured_server_state_dir, 'owner': billet_service_user,
        'group': billet_service_group, 'mode': '0700'}]
      if billet_configured_server_state_dir | length > 0 else [] }}
+# THE HOST LOCK DIRECTORY AND ITS PARENT, as deploy/billet-tmpfiles.conf makes
+# them (#175): made with the node's directories, and again immediately before
+# every node start the role performs, because a node stopped while its
+# previous unit was still the loaded one lost the directory to that unit's
+# RuntimeDirectory removal.
+billet_host_lock_directories:
+  - { path: /run/billet, owner: root, group: root, mode: "0755" }
+  - { path: /run/billet/locks, owner: root, group: root, mode: "0750" }
 billet_node_directories: >-
   {{ [{'path': billet_candidate_node_state_dir, 'owner': 'root', 'group': 'root', 'mode': '0700'},
       {'path': '/var/lib/billet/health', 'owner': 'root', 'group': 'root', 'mode': '0750'},
       {'path': billet_firecracker_stage, 'owner': 'root', 'group': 'root', 'mode': '0700'},
       {'path': '/srv/jailer', 'owner': 'root', 'group': 'root', 'mode': '0755'},
       {'path': '/usr/local/libexec', 'owner': 'root', 'group': 'root', 'mode': '0755'}]
+     + billet_host_lock_directories
      + ([] if billet_retirement_node_ordinary | default(false) | bool else
         [{'path': '/var/lib/billet/upgrades', 'owner': 'root', 'group': 'root', 'mode': '0700'}]) }}
