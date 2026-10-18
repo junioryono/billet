@@ -161,7 +161,8 @@ const identityWriteLimit = 2 * time.Second
 // historyJob is what a message said about its job, as job_history keeps it.
 func historyJob(j dispatch.Job) alloc.HistoryJob {
 	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
-		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event}
+		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event, QueuedAt: j.QueuedAt,
+		ScaleSetAssignedAt: j.ScaleSetAssignedAt, RunnerAssignedAt: j.RunnerAssignedAt}
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -240,6 +241,10 @@ type Listener struct {
 	// Resolved aliases retain consumed offer facts while the lease is running.
 	// A durable busy pool binding supersedes these intended-job facts.
 	runningJobs map[int64]actualJobIdentity
+	// GitHub's queue time for each job an offer or an assignment named, for its
+	// start to record; see rememberQueueTimes.
+	queued       map[offeredJob]offeredQueueTime
+	queuedPruned time.Time
 	// Restart-surviving runner leases held by the node rather than this
 	// listener. They count in GitHub's total pool capacity but do not enter the
 	// listener's heartbeat or teardown ownership.
@@ -338,6 +343,9 @@ type Listener struct {
 	// writeJobResult isolates diagnostic write failures in tests. Nil uses the
 	// allocator directly; identity reads and completion settlement are unaffected.
 	writeJobResult func(context.Context, string, string, int64) error
+	// writeJobIdentity does the same for the identity write. Nil uses the
+	// allocator directly.
+	writeJobIdentity func(context.Context, string, alloc.HistoryJob) error
 
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
@@ -419,6 +427,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		session:       session,
 		log:           slog.Default(),
 		runningJobs:   make(map[int64]actualJobIdentity),
+		queued:        make(map[offeredJob]offeredQueueTime),
 		running:       make(map[int64]*alloc.Lease),
 		adopted:       make(map[string]bool),
 		acquiring:     make(map[int64]*promise),
@@ -1187,7 +1196,7 @@ func (l *Listener) Run(ctx context.Context) error {
 //
 // WHICH IS THE COST OF THIS ONE, AND THE REASON NOT TO REACH FOR IT MORE WIDELY.
 // It is a blanket collapse: a genuine storage fault racing a SIGTERM comes out of
-// here as a bare cancellation, and `onlyCancellation` then discards it. It is
+// here as a bare cancellation, and Run's `state.StoppedBy` then discards it. It is
 // used on the poll loop's paths, where a cancellation is the OVERWHELMING case
 // and the alternative is a drain that reports nothing. Adding it to a startup
 // path — which a round of this already tried — buys nothing the state layer does

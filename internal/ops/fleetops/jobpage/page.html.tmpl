@@ -54,6 +54,18 @@
 <p>The host's series from {{.Start}} to {{.End}} on its own clock ({{.Length}}). {{- if .Focusable}} <span id="focus">Showing the whole series.</span> <button type="button" id="whole" data-from="0" data-to="{{.Units}}" data-origin="{{.Origin}}" data-width="{{.Width}}">Show the whole series</button>{{end}}</p>
 <p class="note">{{.Drawn}}{{if .Focusable}} Choosing a step focuses every chart on its window; the vertical scale stays the whole series'.{{end}}</p>
 {{- $c := .}}
+{{- with .Gaps}}
+<figure class="chart">
+<figcaption>Not seen by the sampler</figcaption>
+<div class="plot strip">
+<svg data-chart="" viewBox="0 0 {{$c.Units}} 100" preserveAspectRatio="none" role="img" aria-label="Intervals the sampler did not see">
+<path class="gap" d="{{.}}"></path>
+</svg>
+<span class="x0">{{$c.X0}}</span><span class="x1">{{$c.X1}}</span>
+</div>
+<p class="note">Each mark is an interval the sampler did not see, listed with its cause under What the host measured; every chart's lines break there, and no step's usage counts it.</p>
+</figure>
+{{- end}}
 {{- range .Charts}}
 <figure class="chart">
 <figcaption>{{.Title}}
@@ -119,6 +131,19 @@
 <section id="usage">
 <h2>What the host measured</h2>
 <p>{{.Usage.Report}}</p>
+{{- with .Usage.Series}}
+<p>The series: {{.}}.</p>
+{{- end}}
+{{- if .Usage.SeriesGaps}}
+<ul class="gaps">
+{{- range .Usage.SeriesGaps}}
+<li>{{.}}</li>
+{{- end}}
+{{- with .Usage.SeriesMore}}
+<li>{{.}}</li>
+{{- end}}
+</ul>
+{{- end}}
 {{- if .Usage.Groups}}
 <dl class="fields">
 {{- range .Usage.Groups}}

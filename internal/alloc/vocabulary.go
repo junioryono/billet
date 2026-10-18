@@ -68,6 +68,7 @@ const (
 	UsageSourceHost         = lease.UsageSourceHost
 	UsageSeriesCodec        = lease.UsageSeriesCodec
 	UsageSeriesCodecClocked = lease.UsageSeriesCodecClocked
+	UsageSeriesCodecGaps    = lease.UsageSeriesCodecGaps
 	MaxUsageSeriesBytes     = lease.MaxUsageSeriesBytes
 	MaxJobDestinations      = lease.MaxJobDestinations
 	GuestReportCodec        = lease.GuestReportCodec

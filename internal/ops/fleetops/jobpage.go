@@ -83,6 +83,11 @@ type pageUsage struct {
 	Report   string
 	Groups   []pageField
 	Counters []pageField
+	// Series, SeriesGaps and SeriesMore are the series' account of its own
+	// sampling, worded as the text report's series section is.
+	Series     string
+	SeriesGaps []string
+	SeriesMore string
 }
 
 // pageSteps is the steps section: why there are none, or GitHub's job and
@@ -189,6 +194,9 @@ func jobPageOf(rec alloc.JobRecord, measured *alloc.RecordedUsage, steps jobStep
 	page.Identity = identityFields(rec)
 
 	page.Usage = usageSection(measured)
+	if v, ok := seriesViewOf(tl, unaligned, measured); ok {
+		page.Usage.Series, page.Usage.SeriesGaps, page.Usage.SeriesMore = v.head, v.gaps, v.more
+	}
 	var listed []github.JobStep
 	if steps.none == "" && steps.err == nil {
 		listed = steps.job.Steps
@@ -230,6 +238,8 @@ func identityFields(rec alloc.JobRecord) []pageField {
 		{Label: "assigned", Value: orNotRecorded(rec.AssignedAt)},
 		{Label: "started", Value: orNotRecorded(rec.StartedAt)},
 		{Label: "finished", Value: orNotRecorded(rec.FinishedAt)},
+		{Label: "github times", Value: githubTimes(rec, orNotRecorded)},
+		{Label: "waited", Value: waitedLine(rec)},
 		{Label: "tier", Value: orNotRecorded(rec.Tier)},
 		{Label: "node", Value: orNotRecorded(rec.Node)},
 		{Label: "provider", Value: orNotRecorded(rec.ChosenProvider)},

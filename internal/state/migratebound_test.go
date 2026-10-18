@@ -108,9 +108,15 @@ func TestAMigrationStoppedByItsDeadlineSaysSoOnSQLite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
-	err := db.migrate(ctx)
+	moved, err := db.migrate(ctx)
 	if err == nil {
 		t.Fatal("a migration whose BEGIN never returned reported success")
+	}
+
+	// NOTHING BEGAN, SO NOTHING MOVED: a report of a move here would send an
+	// operator looking for a schema change that never happened.
+	if moved != nil {
+		t.Errorf("a migration that never began reported %v", moved)
 	}
 
 	if !errors.Is(err, context.DeadlineExceeded) {

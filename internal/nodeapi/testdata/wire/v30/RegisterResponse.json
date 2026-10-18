@@ -1,0 +1,8 @@
+{
+  "version": 1665663327,
+  "min_version": 608058052,
+  "max_version": 1786793266,
+  "deployment": "RegisterResponse.deployment",
+  "lease_ttl_seconds": 1993459775,
+  "poll_seconds": 1204678581
+}

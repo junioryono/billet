@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
@@ -25,6 +27,7 @@ import (
 	"github.com/junioryono/billet/internal/provider/tart"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
+	jobusage "github.com/junioryono/billet/internal/usage"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -45,6 +48,9 @@ type Node struct {
 	client     *nodeclient.Client
 	provider   provider.Provider
 	upgrader   node.ExecUpgrader
+	// sampled is what the job sampler reports to, set by UsageMetrics' source
+	// when the node serves metrics and nil, which reports nowhere, when not.
+	sampled jobusage.Observer
 }
 
 // OpenNode loads the certificate this node presents, claims the deployment
@@ -175,6 +181,10 @@ func (n *Node) Deployment() string { return n.deployment }
 // Close releases the host-wide deployment lock.
 func (n *Node) Close() error { return n.lock.Release() }
 
+// THE LOOP FINDS THE RUNNER'S HANDOVER BY ASSERTION, so a signature that
+// drifted would compile and keep nothing for the next process (#384).
+var _ nodeclient.HandingOver = (*node.Runner)(nil)
+
 // NodeHost is what the node takes from this process and machine.
 type NodeHost struct {
 	// Ready tells the service manager this process is serving.
@@ -202,8 +212,14 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return err
 	}
 
+	// ONE ANSWER FOR THE WHOLE STOP: the node loop asks when its stop begins and
+	// the cache's stop asks after, and the two must agree on what kind of stop
+	// this is, or a request arriving between them has the cache wait a drain's
+	// bound out of a handover's leases.
+	drainRequested := latchedDrainRequest(host.DrainRequested)
+
 	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, n.deployment, n.client,
-		nodeCacheStopGrace(handOver))
+		nodeCacheSweepWaitFor(handOver, drainRequested), nodeCacheStopGrace(handOver))
 	if err != nil {
 		return err
 	}
@@ -219,7 +235,8 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
 	// the runner needs no idea it is remote: the interfaces it already took are
 	// the seam the network went through.
-	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody)}
+	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody),
+		node.WithUsageCheckpoints(filepath.Join(cfg.Node.StateDir, usageCheckpointDir))}
 	if cacheService != nil {
 		runnerOpts = append(runnerOpts, node.WithCacheService(cacheService))
 	}
@@ -240,7 +257,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// running and being measured until this command returns.
 	monitorCtx, stopMonitor := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopMonitor()
-	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p)
+	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p, n.sampled)
 	if err != nil {
 		return err
 	}
@@ -296,7 +313,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		// THE GUEST CACHE ANSWERS ONCE THIS PROCESS IS REGISTERED AND RECOVERED;
 		// until then its connections wait in the listener's queue.
 		Ready:          serveCache,
-		DrainRequested: host.DrainRequested,
+		DrainRequested: drainRequested,
 		// The second signal, reaching the wait that honours it.
 		Hurry: host.Hurry,
 		// OVERLAPPING LAUNCHES ONLY WHERE THE PROVIDER WAS BUILT FOR THEM: Firecracker
@@ -308,6 +325,25 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		// Mac.
 		RegistrationRecordPath: host.RegistrationRecordPath,
 	})
+}
+
+// latchedDrainRequest answers what read answers the first time it is asked, and
+// that answer after. Nil stays nil, which the loop reads as never.
+func latchedDrainRequest(read func() bool) func() bool {
+	if read == nil {
+		return nil
+	}
+
+	var (
+		once   sync.Once
+		answer bool
+	)
+
+	return func() bool {
+		once.Do(func() { answer = read() })
+
+		return answer
+	}
 }
 
 // ClaimNodeDeployment reads this host's identity and takes the host-wide lock on

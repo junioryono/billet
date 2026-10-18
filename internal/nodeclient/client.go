@@ -652,8 +652,11 @@ func (c *Client) RecordLeaseUsage(
 	if wire < nodeapi.VersionProcessUsage {
 		measured = beforeProcessUsage(measured)
 	}
-	if wire < nodeapi.VersionSeriesClock {
+	switch {
+	case wire < nodeapi.VersionSeriesClock:
 		series = beforeSeriesClock(series)
+	case wire < nodeapi.VersionSeriesGaps:
+		series = beforeSeriesGaps(series)
 	}
 	// AN OLDER PLANE GETS THE REST OF THE REPORT, whose strict decoder would
 	// refuse all of it for the counters or the destinations alone.
@@ -711,15 +714,32 @@ func (c *Client) RecordGuestReport(ctx context.Context, leaseID string, epoch in
 // with it. A series that cannot be re-encoded is not sent; the summary still
 // is. The caller's series is not changed.
 func beforeSeriesClock(series *alloc.UsageSeries) *alloc.UsageSeries {
-	if series == nil || series.Codec != usage.SeriesCodecClocked {
+	if series == nil || series.Codec != usage.SeriesCodecClocked && series.Codec != usage.SeriesCodecGaps {
 		return series
 	}
-	data, err := usage.WithoutClock(series.Data, alloc.MaxUsageSeriesBytes)
+	data, err := usage.WithoutClock(series.Codec, series.Data, alloc.MaxUsageSeriesBytes)
 	if err != nil {
 		return nil
 	}
 
 	return &alloc.UsageSeries{Codec: usage.SeriesCodec, Data: data}
+}
+
+// beforeSeriesGaps is the series a plane older than VersionSeriesGaps can
+// keep: one with causes re-encoded with marks alone, which that plane's
+// validation would refuse by codec, taking the whole report down with it. A
+// series that cannot be re-encoded is not sent; the summary still is. The
+// caller's series is not changed.
+func beforeSeriesGaps(series *alloc.UsageSeries) *alloc.UsageSeries {
+	if series == nil || series.Codec != usage.SeriesCodecGaps {
+		return series
+	}
+	data, err := usage.WithoutCauses(series.Data, alloc.MaxUsageSeriesBytes)
+	if err != nil {
+		return nil
+	}
+
+	return &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: data}
 }
 
 // beforeProcessUsage says what a report can say to a plane older than

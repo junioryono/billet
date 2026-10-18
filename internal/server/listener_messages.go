@@ -43,6 +43,14 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	}
 	l.mu.Unlock()
 
+	// Before the starts, which may arrive in the same message as their offer.
+	availableTimed, assignedTimed := l.rememberQueueTimes(msg.Available, msg.Assigned)
+	if len(msg.Available) > 0 || len(msg.Assigned) > 0 {
+		l.log.Info("github's queue time on the jobs offered and assigned", "tier", l.tier,
+			"available", len(msg.Available), "available_with_queue_time", availableTimed,
+			"assigned", len(msg.Assigned), "assigned_with_queue_time", assignedTimed)
+	}
+
 	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
 	// start is the authoritative runner-to-job binding; resolving the completion
 	// first would either settle the request that caused launch or mistake a busy
@@ -59,12 +67,17 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		// The identity is the message's own, which is the evidence a cache
 		// authority will be decided from; what each field holds per event is
-		// measured on the fleet from this line (#226).
+		// measured on the fleet from this line (#226), and so is which of
+		// GitHub's three times a JobStarted carries (#525).
 		l.log.Info("a pooled runner started a job", "tier", l.tier,
 			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID,
 			"run", msg.Started[i].RunID, "event", msg.Started[i].Event,
 			"owner", msg.Started[i].Owner, "repository", msg.Started[i].Repository,
-			"workflow_ref", msg.Started[i].WorkflowRef)
+			"workflow_ref", msg.Started[i].WorkflowRef,
+			"github_queued", msg.Started[i].QueuedAt,
+			"github_queued_offered", job.QueuedAt,
+			"github_scale_set_assigned", msg.Started[i].ScaleSetAssignedAt,
+			"github_runner_assigned", msg.Started[i].RunnerAssignedAt)
 	}
 
 	resolved, err := l.resolveMessage(ctx, msg)
@@ -417,6 +430,8 @@ func (l *Listener) identifyStarted(ctx context.Context, job dispatch.Job) (dispa
 		}
 		return dispatch.Job{}, fmt.Errorf("server: bind started runner %q: %w", job.RunnerName, err)
 	}
+	job = l.withOfferedQueueTime(job)
 	l.recordJobIdentity(ctx, leaseID, job)
+	identified.QueuedAt = job.QueuedAt
 	return identified, nil
 }

@@ -261,6 +261,14 @@ func (l *Listener) recordJobResult(ctx context.Context, job dispatch.Job, leaseI
 			"running it",
 			"tier", l.tier, "request", job.RequestID, "lease", leaseID, "error", err)
 	}
+	// GITHUB'S TIMES ONLY FROM A COMPLETION THAT NAMES ITS RUNNER. One that names
+	// none may be a job that ended with no runner, and the lease found for its
+	// request id the member launched for it, which GitHub can hand another job:
+	// that job's start would be measured from this one's queue time. Without
+	// them the wait is unknown, never another job's.
+	if job.RunnerName == "" {
+		job.QueuedAt, job.ScaleSetAssignedAt, job.RunnerAssignedAt = time.Time{}, time.Time{}, time.Time{}
+	}
 	l.recordJobIdentity(ctx, leaseID, job)
 }
 
@@ -280,7 +288,11 @@ func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job di
 	}
 	ctx, cancel := context.WithTimeout(ctx, identityWriteLimit)
 	defer cancel()
-	if err := l.alloc.RecordJobIdentity(ctx, leaseID, historyJob(job)); err != nil {
+	write := l.writeJobIdentity
+	if write == nil {
+		write = l.alloc.RecordJobIdentity
+	}
+	if err := write(ctx, leaseID, historyJob(job)); err != nil {
 		l.log.Warn("could not record which github job a lease ran; its history row "+
 			"will not name the repository, workflow or job",
 			"tier", l.tier, "lease", leaseID, "job", job.JobID, "error", err)

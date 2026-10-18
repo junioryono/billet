@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"runtime"
 	"strings"
 
@@ -19,7 +20,7 @@ import (
 func Uplink(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet uplink shape [--interface NAME] [--reflectors A,B,...] " +
-			"[--max-up MBIT] [--max-down MBIT], " +
+			"[--max-up MBIT] [--max-down MBIT] [--gateway ADDR|none], " +
 			"billet uplink check [--interface NAME], or billet uplink clear [--interface NAME]")
 	}
 
@@ -64,8 +65,12 @@ func uplinkShapeOptions(env cli.Env, args []string) (uplink.Options, error) {
 	iface := fs.String("interface", "", "the interface to shape; empty shapes the one the default route leaves by")
 	reflectors := fs.String("reflectors", strings.Join(uplink.DefaultReflectors, ","),
 		"IPv4 addresses whose round trip measures the line's queue, comma-separated")
-	maxUp := fs.Float64("max-up", 0, "the most this host sends, in Mbit/s; 0 is the interface's speed")
-	maxDown := fs.Float64("max-down", 0, "the most this host receives, in Mbit/s; 0 is the interface's speed")
+	maxUp := fs.Float64("max-up", 0, "the most this host ever sends, in Mbit/s; 0, the default, is the "+
+		"interface's speed, and the shaper finds the line under it without one")
+	maxDown := fs.Float64("max-down", 0, "the most this host ever receives, in Mbit/s; 0, the default, is the "+
+		"interface's speed, and the shaper finds the line under it without one")
+	gateway := fs.String("gateway", "", "the first hop to ask beside the reflectors, an IPv4 address, or none; "+
+		"empty asks the default route's gateway")
 	if err := cli.Parse(fs, args); err != nil {
 		return uplink.Options{}, err
 	}
@@ -76,14 +81,25 @@ func uplinkShapeOptions(env cli.Env, args []string) (uplink.Options, error) {
 		}
 	}
 
-	return uplink.Options{
+	opts := uplink.Options{
 		Iface:      *iface,
 		Reflectors: strings.Split(*reflectors, ","),
 		MaxUp:      *maxUp,
 		MaxDown:    *maxDown,
 		Params:     uplink.DefaultParams(),
 		Log:        slog.New(slog.NewTextHandler(env.Stderr, nil)),
-	}, nil
+	}
+
+	switch {
+	case *gateway == "none":
+		opts.NoGateway = true
+	case *gateway != "" && net.ParseIP(*gateway).To4() == nil:
+		return uplink.Options{}, fmt.Errorf("--gateway %q: want an IPv4 address, or none", *gateway)
+	default:
+		opts.Gateway = *gateway
+	}
+
+	return opts, nil
 }
 
 // uplinkCeiling refuses a ceiling the shaper could not hold: a negative or

@@ -275,7 +275,7 @@ func TestAStuckSamplerHoldsUpNoTeardownPastTheLimit(t *testing.T) {
 	}
 	// THE FINAL POINT WAS NOT READ, so the interval it ends is marked unseen
 	// rather than split as if the job did nothing in it.
-	if len(s.Points) == 0 || !s.Points[len(s.Points)-1].AfterGap {
+	if len(s.Points) == 0 || s.Points[len(s.Points)-1].Gap != GapSamplerStuck {
 		t.Errorf("Final(vm) answered from what was known and did not mark its last interval unseen: %+v",
 			s.Points)
 	}

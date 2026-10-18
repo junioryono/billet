@@ -113,7 +113,10 @@ func (c *Client) CloneRoot(
 	}
 
 	if err := c.growRoot(ctx, dst, capacity); err != nil {
-		if rmErr := c.removeClone(ctx, name); rmErr != nil {
+		// ON A CONTEXT OF ITS OWN, as the map failure's cleanup below: the usual
+		// reason sizing failed is that the caller's context ended, and a removal
+		// asked on it fails too (#393). Each rbd call keeps its own bound.
+		if rmErr := c.removeClone(context.WithoutCancel(ctx), name); rmErr != nil {
 			return "", fmt.Errorf("%w (and the clone it made could not be removed, so %s is "+
 				"holding pool space: %w)", err, dst, rmErr)
 		}
@@ -401,6 +404,9 @@ type mappedDevice struct {
 	// Snap is the mapped snapshot's name, and `-` for an image's head
 	// (measured against 20.2.3 on 2026-10-13).
 	Snap string `json:"snap"`
+	// Namespace is the image's RADOS namespace, empty for the pool's default
+	// (measured against 20.2.3 on 2026-10-16).
+	Namespace string `json:"namespace"`
 }
 
 // mappedDevices lists the host devices a cache-pool image is mapped to.

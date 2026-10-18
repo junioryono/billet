@@ -184,7 +184,7 @@ func TestAUsageReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 		t.Fatalf("a VM measured by its process was refused: %v", err)
 	}
 	for _, s := range []UsageSeries{
-		{Codec: UsageSeriesCodecClocked + 1, Data: []byte{1}},
+		{Codec: UsageSeriesCodecGaps + 1, Data: []byte{1}},
 		{Codec: 0, Data: []byte{1}},
 		{Codec: UsageSeriesCodec},
 		{Codec: UsageSeriesCodec, Data: make([]byte, MaxUsageSeriesBytes+1)},
@@ -193,7 +193,7 @@ func TestAUsageReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 			t.Errorf("series codec %d of %d bytes was accepted", s.Codec, len(s.Data))
 		}
 	}
-	for _, codec := range []int{UsageSeriesCodec, UsageSeriesCodecClocked} {
+	for _, codec := range []int{UsageSeriesCodec, UsageSeriesCodecClocked, UsageSeriesCodecGaps} {
 		if err := (UsageSeries{Codec: codec, Data: []byte{1}}).Validate(); err != nil {
 			t.Errorf("series codec %d was refused: %v", codec, err)
 		}

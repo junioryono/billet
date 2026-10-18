@@ -40,8 +40,24 @@ The control plane also reads its ledger at every scrape, through the same report
 | `billet_ledger_write_wait_seconds` | how long each write waited for the ledger's single writer slot (a histogram); a rising tail is scheduling queueing behind other writers |
 | `billet_ledger_write_held_seconds{outcome}` | how long each write held the slot, `committed` or `rolled_back` (a histogram) |
 | `billet_ledger_write_busy_retries_total` | each time a write found the slot taken and tried again |
+| `billet_job_queue_wait_seconds{tier}` | how long each job waited, from GitHub's queue time to billet recording its start (a histogram, buckets from 5 seconds to 6 hours), observed once a job when the ledger first holds both. The queue time is GitHub's clock and the start billet's, so a wait is only as exact as the two agree. A job with no GitHub queue time is not observed. The histogram counts what this process saw since it started; `billet jobs wait` reads the same waits from the ledger and splits them into their parts |
+| `billet_job_queue_wait_negative_total{tier}` | jobs whose start on billet's clock came before their queue time on GitHub's: the clocks disagreed by more than the wait. Counted here and kept out of the histogram, where it would read as no wait |
 
 A standby serves these too: it reads the same ledger, and its gauges show what the active controller has recorded.
+
+A node with `node.monitoring` also counts how its job sampler keeps up, as the sampler does it. Without `node.monitoring` they stay at zero. No lease or job id is a label here either; a job's own gaps are in its series, which `billet jobs show` lists.
+
+| Metric | What it is |
+|---|---|
+| `billet_node_usage_tick_seconds` | how long each tick of the sampler took to read every job it measures (a histogram); a tick near the sampling interval is one about to miss the next |
+| `billet_node_usage_gaps_total{cause}` | intervals of a job's series the sampler did not see, by cause: `missed_tick`, `slow_read`, `failed_read`, `late_first_read`, `counter_fell`, `handover` and the rest the [configuration reference](../reference/configuration.md) lists, each reported from the start at zero. Counted as the sampler keeps the sample that ends one (a counter that fell and the catch-up after it among them) or marks earlier ones; a job's last interval, which its final read decides, is not counted |
+| `billet_node_usage_io_bounded_total` | reads of a job's disk written that writeback kept moving on every pass, recorded as a lower bound that the next read corrects rather than as a gap |
+
+A node with `node.ceph` also reads its kernel's RBD mappings at every scrape, with the same could-not-tell rule (`billet_scrape_up{source="rbd"}`). A node without `node.ceph` reports none.
+
+| Metric | What it is |
+|---|---|
+| `billet_node_rbd_mappings{state}` | this host's kernel mappings of images in the site's pools, by what accounts for each: `root_disk` (a guest's root disk, which its microVM holds), `generation` (a read-only check of a cache generation), `session` (a cache volume a cache session on this node names), `recent` (a cache volume named less than six hours ago, whose custody record may not be written yet), `unaccounted` (a cache volume named longer ago that no cache session on this node names, held by no job of this node's; on a host that runs a second node identity, that one's volumes count here too), and `other` (anything else in those pools, such as a map an interrupted `billet images pull` left). The node's eviction pass, at start and every six hours, unmaps without force each `unaccounted` mapping that an earlier pass in the same process also found unaccounted, at least an hour before, and whose volume records this node as the one that mapped it, unless the kernel holds it open; a count that stays above zero is a mapping something on the host still has open, named in the node's `kept kernel mappings` warning |
 
 ## Reaching it from another host
 

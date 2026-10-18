@@ -58,6 +58,10 @@ const UsageSeriesCodec = 1
 // not see. A node sends it only on a wire that knows it.
 const UsageSeriesCodecClocked = 2
 
+// UsageSeriesCodecGaps is the clocked encoding with each unseen interval's
+// cause in place of its mark. A node sends it only on a wire that knows it.
+const UsageSeriesCodecGaps = 3
+
 // MaxUsageSeriesBytes bounds one lease's encoded series. It is below the node
 // wire's 1 MiB body limit once base64 is applied, so a report is always one
 // request; a node downsamples a longer series until it fits.
@@ -282,7 +286,7 @@ func (u JobUsage) groupFields() map[string][]int64 {
 // Validate refuses a series this build cannot read back or the wire could not
 // carry.
 func (s UsageSeries) Validate() error {
-	if s.Codec != UsageSeriesCodec && s.Codec != UsageSeriesCodecClocked {
+	if s.Codec != UsageSeriesCodec && s.Codec != UsageSeriesCodecClocked && s.Codec != UsageSeriesCodecGaps {
 		return fmt.Errorf("alloc: usage series codec %d is not one this control plane records", s.Codec)
 	}
 	if len(s.Data) == 0 || len(s.Data) > MaxUsageSeriesBytes {
