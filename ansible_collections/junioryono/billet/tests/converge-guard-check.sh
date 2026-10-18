@@ -3494,13 +3494,13 @@ f=$(ep_fixture e12f-parser node-repair-unit repaired.json)
 ep_corrupt "$f" invocation_id '"0123456789abcdef0123456789abcdef"'
 e e12f-parser "BILLET_GATE_ANSWER=$(ep_repair_answers e12f-parser "$f")"
 ep_case e12f-parser
-expect_refused e12f-parser "Judge the runtime-unit repair's answer" "answered with a member this role cannot read: new_invocation"
+expect_refused e12f-parser "Judge the repair's answer" "answered with a member this role cannot read: new_invocation"
 ep_plant_ordinary e12i-equal-digests $EP_A $EP_A
 f=$(ep_fixture e12i-equal-digests node-repair-unit repaired.json)
 ep_corrupt "$f" after_sha256 "$("$python" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["before_sha256"]))' "$f")"
 e e12i-equal-digests "BILLET_GATE_ANSWER=$(ep_repair_answers e12i-equal-digests "$f")"
 ep_case e12i-equal-digests
-expect_refused e12i-equal-digests "Judge the runtime-unit repair's answer" "answered with a member this role cannot read: digests"
+expect_refused e12i-equal-digests "Judge the repair's answer" "answered with a member this role cannot read: digests"
 echo "ok   E12: a unit that cannot hold the record is repaired and the decision asked again; an unproved repair, a dry run, the policy, an unchanged unit and an unreadable answer each stop the converge by name"
 sections_ran="$sections_ran, endpoint (E)"
 
