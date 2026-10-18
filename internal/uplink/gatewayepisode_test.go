@@ -72,6 +72,8 @@ func TestAGatewayThatGaveNoReadingIsNotAClearRound(t *testing.T) {
 
 	r := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 	r.Down.Rate = 50
+	// A LINE FOUND WELL ABOVE, so the climb is the fast one, under Full.
+	r.Down.Limit = 1000
 	r.Step(withGateway(moving(0, 1, 1, 2*time.Millisecond), gatewayRose(60*time.Millisecond)))
 	for n := 1; n < 7; n++ {
 		r.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), gatewayLost()))
@@ -85,6 +87,8 @@ func TestAGatewayThatGaveNoReadingIsNotAClearRound(t *testing.T) {
 	// every raise.
 	q := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 	q.Down.Rate = 50
+	// A LINE FOUND WELL ABOVE, so the climb is the fast one, under Full.
+	q.Down.Limit = 1000
 	for n := range 6 {
 		gateway := gatewayLost()
 		if n%2 == 0 {
@@ -102,6 +106,8 @@ func TestAGatewayThatGaveNoReadingIsNotAClearRound(t *testing.T) {
 	// measures still clears and climbs.
 	s := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 	s.Down.Rate = 50
+	// A LINE FOUND WELL ABOVE, so the climb is the fast one, under Full.
+	s.Down.Limit = 1000
 	for n := range 6 {
 		s.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), Sample{}))
 	}

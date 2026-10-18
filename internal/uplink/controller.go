@@ -15,9 +15,9 @@
 // (github.com/lynxthecat/cake-autorate), which has tuned them on routers for
 // years; no code is taken from it. Three things differ on purpose. Nothing about
 // the line has to be configured: cake-autorate needs a minimum, base and maximum
-// rate per direction, while this starts each direction at a ceiling (the
-// interface's speed unless one is set) and learns the line by cutting to below
-// what was flowing when the queue rose. The delay that counts as a queue is
+// rate per direction, while this starts each direction low, climbs while the
+// line stays clear, and learns the line by cutting to below what was flowing
+// when the queue rose or the line dropped. The delay that counts as a queue is
 // 15 ms, not 30, because a residential line measured 7 ms idle and 22 to 29 ms
 // full: at 30 the lag a game felt would never have been seen.
 //
@@ -72,17 +72,24 @@
 // went unanswered about 2% of the time with the line quiet, 2026-10-16), and
 // read as loss they would cut a busy host on every miss.
 //
-// A rate near the interface's speed is not a signal, with no ceiling set or any
-// other. The shaper cannot tell a line as fast as the interface, where such a
-// rule would throttle a healthy host for good, from a slower one, where a
-// gateway that drops shows as loss to the reflectors, which the loss rule reads.
-// A rule on rate alone would be a ceiling in disguise, and the ceiling is the
-// operator's to set (MaxUp, MaxDown).
+// A rate near the interface's speed is not a signal. The shaper cannot tell a
+// line as fast as the interface, where such a rule would throttle a healthy host
+// for good, from a slower one, where a gateway that drops shows as loss to the
+// reflectors, which the loss rule reads. What a configured ceiling once stood in
+// for is where the line was last found full, each direction's Limit: what it
+// was moving at its last cut. A rate climbs back to near it quickly and past it
+// only slowly, and near it or with none found only while CAKE is what holds the
+// traffic back, so a gateway that drops before its round trip rises is overrun
+// for the seconds the loss rule takes to see it, now and then, rather than at
+// every climb; and a run with nothing learned starts low (Params.Start), never
+// at the interface's speed, which on 2026-10-14 let a node send 888 Mbit/s into
+// a 500 Mbit/s line. A ceiling (MaxUp, MaxDown) remains for an operator who
+// wants one, and nothing needs it.
 //
-// And what a run learned outlives it: the rates CAKE was last set to are kept
-// beside the interface record, and the next run starts from them, returned
-// toward the ceiling with the time it was down (learned.go), where every restart,
-// and so every upgrade, used to start at the ceiling again.
+// And what a run learned outlives it: the rates CAKE was last set to, and each
+// direction's Limit, are kept under the unit's state directory, and the next run
+// starts from them as they were (learned.go), where every restart, and so every
+// upgrade, used to start at the ceiling again.
 package uplink
 
 import "time"
@@ -131,8 +138,24 @@ type Params struct {
 	// full queue, before its rate is raised: a rate is only probed upward while
 	// it is what holds the traffic back.
 	Full float64
-	// Raise is the factor a full direction's rate grows by each step.
+	// Raise is the factor a full direction's rate grows by each step, below
+	// Near of the line it found.
 	Raise float64
+	// Start is the rate, in Mbit/s, a direction a run has learned nothing for
+	// starts at, under its ceiling: low enough that a host never comes up
+	// filling the line it shares, and climbed from at Raise.
+	Start float64
+	// Near is the share of a direction's Limit from which its rate is probed
+	// upward slowly: ProbeRaise at most once every ProbeEvery.
+	Near float64
+	// ProbeFull is the share of the current rate a direction must be moving
+	// for a raise where the line has not been found or is near: CAKE is then
+	// what holds the traffic back, and a rate the line itself stops short of
+	// is never raised further.
+	ProbeFull float64
+	// ProbeRaise and ProbeEvery are how a rate near or above its Limit grows.
+	ProbeRaise float64
+	ProbeEvery time.Duration
 	// PeakWindow is how long a direction's peak throughput is remembered.
 	PeakWindow time.Duration
 }
@@ -158,6 +181,11 @@ func DefaultParams() Params {
 		Cooldown:   3 * time.Second,
 		Full:       0.75,
 		Raise:      1.04,
+		Start:      25,
+		Near:       0.9,
+		ProbeFull:  0.9,
+		ProbeRaise: 1.01,
+		ProbeEvery: 5 * time.Second,
 		PeakWindow: time.Minute,
 	}
 }
@@ -199,17 +227,20 @@ func (c Cause) String() string {
 
 // Direction is one direction's shaper.
 type Direction struct {
-	// Max is the rate the shaper starts at and never exceeds: the interface's
-	// own speed, at which CAKE holds nothing back, or the ceiling configured
-	// below it.
+	// Max is the rate the shaper never exceeds: the interface's own speed, at
+	// which CAKE holds nothing back, or the ceiling configured below it.
 	Max float64
 	// Rate is the rate CAKE is set to now, in Mbit/s.
 	Rate float64
+	// Limit is what this direction was moving, in Mbit/s, when its last cut was
+	// taken: the line as last found full, zero until a cut finds it.
+	Limit float64
 
-	peak     float64
-	peakAt   time.Time
-	lastCut  time.Time
-	cutSince bool
+	peak      float64
+	peakAt    time.Time
+	lastCut   time.Time
+	cutSince  bool
+	lastRaise time.Time
 	// episode is whether a cut has been taken since the queue last cleared;
 	// cutReflectors, cutGateway and cutTally are that cut's evidence, which the
 	// next cut in the same episode must improve on.
@@ -241,7 +272,8 @@ const (
 	gatewayShare    = 5
 )
 
-// NewDirection starts a direction at its ceiling.
+// NewDirection starts a direction at its ceiling; a run starts it at
+// Params.Start instead (newRunController).
 func NewDirection(maxMbit float64) Direction {
 	if maxMbit < Floor {
 		maxMbit = Floor
@@ -784,6 +816,10 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// and only what is actually moving says where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*cut, d.Max)
 		d.lastCut, d.cutSince, d.episode = o.At, true, true
+		// WHAT FLOWED IS THE LINE, FOUND FULL: the rate climbs back to near it
+		// quickly and past it only slowly, so a gateway that drops rather than
+		// queues is overrun seldom and briefly rather than at every climb.
+		d.Limit = moving
 		// ONLY A SOURCE THAT SHOWED THE QUEUE IS EVIDENCE OF IT: a reflector delay
 		// under Bloat that wanders from 12 ms to 8 ms says nothing of the gateway's
 		// stall the cut was taken on, and crediting it would keep cutting for a
@@ -799,8 +835,7 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		}
 
 		return d.Rate != before, true
-	case v.clear && moving >= p.Full*d.Rate && d.futile < p.Futile &&
-		(!d.cutSince || o.At.Sub(d.lastCut) >= p.Cooldown):
+	case v.clear && d.futile < p.Futile && (!d.cutSince || o.At.Sub(d.lastCut) >= p.Cooldown):
 		// PROBED UPWARD ONLY WHILE THE RATE IS WHAT HOLDS THE TRAFFIC BACK and this
 		// round measured no queue, so a rate climbs back toward the line's speed as
 		// fast as the line allows and no faster, and never on a round that could
@@ -809,10 +844,52 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// would undo the cut at once. NOR WHILE LATCHED: a raise could refill the
 		// queue with this host's own traffic, and a latched direction could not be
 		// cut for it; the latch lifts once the line has cleared.
-		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
+		c.raise(d, moving, o.At)
 	}
 
 	return d.Rate != before, false
+}
+
+// raise grows a clear direction's rate by how near it is to the line it found.
+//
+// BELOW NEAR OF THE LIMIT, the line has carried more, so the rate climbs back at
+// Raise each round, never past Near of it. FROM THERE ON, ProbeRaise at most
+// once every ProbeEvery: a line that drops rather than queues shows no rise in
+// the round trip before it is full, and is found only by overrunning it, so the
+// rate creeps toward and past what it carried last, where a climb at Raise would
+// overrun it at every recovery. WITH NO LIMIT, nothing found yet, at Raise from
+// Start.
+//
+// AND NEAR THE LINE OR WITH NONE FOUND, ONLY WHILE CAKE IS WHAT HOLDS THE
+// TRAFFIC BACK (ProbeFull): once the rate passes what the line itself carries,
+// what flows stops following it, and the raise stops a ninth above the line
+// rather than a third, as Full alone would let it.
+func (c *Controller) raise(d *Direction, moving float64, at time.Time) {
+	p := c.Params
+	near := p.Near * d.Limit
+
+	switch {
+	case d.Limit > 0 && d.Rate < near:
+		if moving < p.Full*d.Rate {
+			return
+		}
+
+		d.Rate = clamp(min(d.Rate*p.Raise+0.5, near), d.Max)
+	case d.Limit > 0:
+		if moving < p.ProbeFull*d.Rate || at.Sub(d.lastRaise) < p.ProbeEvery {
+			return
+		}
+
+		d.Rate = clamp(d.Rate*p.ProbeRaise+0.5, d.Max)
+	default:
+		if moving < p.ProbeFull*d.Rate {
+			return
+		}
+
+		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
+	}
+
+	d.lastRaise = at
 }
 
 // helped is whether the queue is shorter now than at the direction's last cut:

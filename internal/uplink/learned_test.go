@@ -16,39 +16,41 @@ import (
 	"time"
 )
 
-// A RESUMED RATE RETURNS TOWARD ITS CEILING WITH THE TIME THE SHAPER WAS DOWN:
-// a restart of seconds keeps the cut, an hour keeps half of it, a day nothing.
-// It never passes the ceiling now in force, never falls under the floor, and a
-// rate at the ceiling it was learned under is nothing learned.
-func TestAResumedRateReturnsTowardItsCeilingWithTheTimeDown(t *testing.T) {
+// A RESUMED DIRECTION IS WHERE IT WAS LEFT: the rate as it was, never past the
+// ceiling now in force nor under the floor, and the line it found. A rate at a
+// ceiling since removed is resumed as it was, not at the interface's speed, and
+// anything that is not a positive, finite number leaves the start untouched.
+func TestAResumedDirectionIsWhereItWasLeft(t *testing.T) {
 	t.Parallel()
 
-	near := func(got, want float64) bool { return math.Abs(got-want) < 0.01 }
-
 	for name, c := range map[string]struct {
-		learned learnedRate
-		ceiling float64
-		down    time.Duration
-		want    float64
+		learned          learnedRate
+		ceiling          float64
+		rate, limit      float64
+		wantRate, wantLm float64
 	}{
-		"a restart of seconds":           {learnedRate{Max: 400, Rate: 100}, 400, 5 * time.Second, 400 - 300*math.Exp2(-5.0/3600)},
-		"down for one half-life":         {learnedRate{Max: 400, Rate: 100}, 400, time.Hour, 250},
-		"down for a day":                 {learnedRate{Max: 400, Rate: 100}, 400, 24 * time.Hour, 400 - 300*math.Exp2(-24)},
-		"a ceiling lowered since":        {learnedRate{Max: 400, Rate: 300}, 200, 0, 200},
-		"a ceiling raised since":         {learnedRate{Max: 400, Rate: 100}, 1000, 0, 100},
-		"nothing learned under the last": {learnedRate{Max: 400, Rate: 400}, 1000, 0, 1000},
-		"a rate under the floor":         {learnedRate{Max: 400, Rate: 2}, 400, 0, Floor},
-		"no rate at all":                 {learnedRate{}, 400, 0, 400},
-		"a rate that is not a number":    {learnedRate{Max: 400, Rate: math.NaN()}, 400, 0, 400},
+		"a rate and its line":           {learnedRate{Max: 1000, Rate: 300, Limit: 340}, 1000, 25, 0, 300, 340},
+		"a ceiling lowered since":       {learnedRate{Max: 400, Rate: 300, Limit: 340}, 200, 25, 0, 200, 340},
+		"a ceiling removed since":       {learnedRate{Max: 150, Rate: 150}, 1000, 25, 0, 150, 0},
+		"a record from before limits":   {learnedRate{Max: 400, Rate: 120}, 1000, 25, 0, 120, 0},
+		"a rate under the floor":        {learnedRate{Max: 400, Rate: 2}, 400, 25, 0, Floor, 0},
+		"no rate at all":                {learnedRate{}, 400, 25, 0, 25, 0},
+		"a rate that is not a number":   {learnedRate{Max: 400, Rate: math.NaN()}, 400, 25, 0, 25, 0},
+		"a rate that is infinite":       {learnedRate{Max: 400, Rate: math.Inf(1)}, 400, 25, 0, 25, 0},
+		"a limit that is not a number":  {learnedRate{Max: 400, Rate: 120, Limit: math.NaN()}, 400, 25, 0, 120, 0},
+		"a limit that is below nothing": {learnedRate{Max: 400, Rate: 120, Limit: -3}, 400, 25, 0, 120, 0},
 	} {
-		if got := c.learned.resume(c.ceiling, c.down); !near(got, c.want) {
-			t.Errorf("%s: resumed at %.2f, want %.2f", name, got, c.want)
+		d := Direction{Max: c.ceiling, Rate: c.rate, Limit: c.limit}
+		c.learned.resume(&d)
+
+		if d.Rate != c.wantRate || d.Limit != c.wantLm || d.Max != c.ceiling {
+			t.Errorf("%s: resumed at %.2f with the line at %.2f under %.0f, want %.2f with it at %.2f under %.0f",
+				name, d.Rate, d.Limit, d.Max, c.wantRate, c.wantLm, c.ceiling)
 		}
 	}
 }
 
-// RATES LEARNED ON ANOTHER INTERFACE DESCRIBE ANOTHER LINE, and a record from a
-// clock ahead of this one cannot say how long the shaper was down. WITHIN ONE
+// RATES LEARNED ON ANOTHER INTERFACE DESCRIBE ANOTHER LINE. WITHIN ONE
 // BOOT the index decides, so another device under the name is refused; ACROSS A
 // REBOOT, which renumbers interfaces, the name and the hardware address do; and
 // a boot ID unknown on either side wants the name as well as the index.
@@ -86,20 +88,8 @@ func TestLearnedRatesResumeOnlyOnTheirInterface(t *testing.T) {
 		"no index then, another device":   {l("eno2np1", "", mac, "a"), nic{"eno2np1", "2", other, "a"}, false},
 		"no index, no address now":        {l("eno2np1", "", mac, "a"), nic{"eno2np1", "", "", "a"}, true},
 	} {
-		if ok, why := c.l.resumes(c.at, now); ok != c.want || (!ok && why == "") {
+		if ok, why := c.l.resumes(c.at); ok != c.want || (!ok && why == "") {
 			t.Errorf("%s: resumes %v (%q), want %v with a reason when not", name, ok, why, c.want)
-		}
-	}
-
-	// A CLOCK BEHIND THE RECORD, AND A RECORD WITH NO TIME, CANNOT SAY HOW LONG
-	// THE SHAPER WAS DOWN.
-	at := nic{"eno2np1", "2", mac, "a"}
-	for name, r := range map[string]learned{
-		"a time ahead of this clock": {Iface: "eno2np1", Index: "2", Boot: "a", At: now.Add(time.Minute)},
-		"no time":                    {Iface: "eno2np1", Index: "2", Boot: "a"},
-	} {
-		if ok, why := r.resumes(at, now); ok || why == "" {
-			t.Errorf("%s: resumes %v (%q), want refused with a reason", name, ok, why)
 		}
 	}
 }
@@ -142,6 +132,7 @@ func TestTheNextRunResumesWhatThisOneRecorded(t *testing.T) {
 
 	log := slog.New(&records{})
 	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
+	ctl.Up.Limit, ctl.Down.Limit = 135, 90
 
 	rememberer(log, ctl, nic{"eno2np1", "2", testMAC, "boot-a"})(120, 80)
 
@@ -154,10 +145,15 @@ func TestTheNextRunResumesWhatThisOneRecorded(t *testing.T) {
 
 	logs := &records{}
 	next := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(logs), next, nic{"eno2np1", "2", "7c:c2:55:e2:9d:6d", "boot-a"}, time.Now())
+	resumeLearned(slog.New(logs), next, nic{"eno2np1", "2", "7c:c2:55:e2:9d:6d", "boot-a"})
 
-	if math.Abs(next.Up.Rate-120) > 0.5 || math.Abs(next.Down.Rate-80) > 0.5 {
-		t.Errorf("the next run started at %.1f/%.1f, want about the 120/80 recorded", next.Up.Rate, next.Down.Rate)
+	if next.Up.Rate != 120 || next.Down.Rate != 80 {
+		t.Errorf("the next run started at %.1f/%.1f, want the 120/80 recorded", next.Up.Rate, next.Down.Rate)
+	}
+	// AND WHERE THE LINE WAS FOUND, which decides how fast the next run climbs.
+	if next.Up.Limit != 135 || next.Down.Limit != 90 {
+		t.Errorf("the next run found the line at %.1f/%.1f, want the 135/90 recorded", next.Up.Limit,
+			next.Down.Limit)
 	}
 	if next.Up.Max != 400 || next.Down.Max != 300 {
 		t.Errorf("resuming moved the ceilings to %.1f/%.1f", next.Up.Max, next.Down.Max)
@@ -169,47 +165,51 @@ func TestTheNextRunResumesWhatThisOneRecorded(t *testing.T) {
 	// AFTER A REBOOT THAT RENUMBERED THE INTERFACE, the same rates, by its name:
 	// the record says which boot set it.
 	rebooted := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(&records{}), rebooted, nic{"eno2np1", "3", "7c:c2:55:e2:9d:6d", "boot-b"}, time.Now())
-	if math.Abs(rebooted.Up.Rate-120) > 0.5 || math.Abs(rebooted.Down.Rate-80) > 0.5 {
-		t.Errorf("after a reboot renumbered eno2np1 the run started at %.1f/%.1f, want about the 120/80 recorded",
-			rebooted.Up.Rate, rebooted.Down.Rate)
+	resumeLearned(slog.New(&records{}), rebooted, nic{"eno2np1", "3", "7c:c2:55:e2:9d:6d", "boot-b"})
+	if rebooted.Up.Rate != 120 || rebooted.Down.Rate != 80 || rebooted.Up.Limit != 135 {
+		t.Errorf("after a reboot renumbered eno2np1 the run started at %.1f/%.1f (line %.1f), want the "+
+			"120/80 recorded and its line", rebooted.Up.Rate, rebooted.Down.Rate, rebooted.Up.Limit)
 	}
 
 	// BUT A REBOOT ONTO ANOTHER DEVICE UNDER THE NAME, by its hardware address,
-	// the ceiling: the record says which device set it.
+	// starts as nothing learned: the record says which device set it.
+	start := DefaultParams().Start
 	swapped := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(&records{}), swapped, nic{"eno2np1", "3", "7c:c2:55:e2:9d:6e", "boot-b"}, time.Now())
-	if swapped.Up.Rate != 400 || swapped.Down.Rate != 300 {
-		t.Errorf("a NIC swapped under eno2np1 across a reboot started at %.1f/%.1f, want the ceilings",
-			swapped.Up.Rate, swapped.Down.Rate)
+	resumeLearned(slog.New(&records{}), swapped, nic{"eno2np1", "3", "7c:c2:55:e2:9d:6e", "boot-b"})
+	if swapped.Up.Rate != start || swapped.Down.Rate != start || swapped.Up.Limit != 0 {
+		t.Errorf("a NIC swapped under eno2np1 across a reboot started at %.1f/%.1f (line %.1f), want %.0f "+
+			"with no line", swapped.Up.Rate, swapped.Down.Rate, swapped.Up.Limit, start)
 	}
 
-	// ON ANOTHER INTERFACE, THE CEILING.
+	// ON ANOTHER INTERFACE, AS NOTHING LEARNED.
 	other := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(&records{}), other, nic{"wlan0", "7", "", "boot-a"}, time.Now())
-	if other.Up.Rate != 400 || other.Down.Rate != 300 {
+	resumeLearned(slog.New(&records{}), other, nic{"wlan0", "7", "", "boot-a"})
+	if other.Up.Rate != start || other.Down.Rate != start || other.Down.Limit != 0 {
 		t.Errorf("rates learned on eno2np1 were resumed on wlan0: %.1f/%.1f", other.Up.Rate, other.Down.Rate)
 	}
 }
 
-// A RECORD THAT CANNOT BE READ STARTS AT THE CEILING AND SAYS SO, and none at
-// all starts there quietly.
-func TestUnreadableLearnedRatesStartAtTheCeiling(t *testing.T) {
+// A RECORD THAT CANNOT BE READ STARTS AS NOTHING LEARNED AND SAYS SO, and none
+// at all starts there quietly: low, never at the interface's speed.
+func TestUnreadableLearnedRatesStartAsNothingLearned(t *testing.T) {
 	fakeRuntimeDir(t)
 
+	start := DefaultParams().Start
+	logs := &records{}
 	ctl := newRunController(1000, Options{Params: DefaultParams()})
-	resumeLearned(slog.New(&records{}), ctl, nic{"eno2np1", "2", "", "boot-a"}, time.Now())
-	if ctl.Up.Rate != 1000 || ctl.Down.Rate != 1000 {
-		t.Fatalf("with nothing recorded the run started at %.1f/%.1f", ctl.Up.Rate, ctl.Down.Rate)
+	resumeLearned(slog.New(logs), ctl, nic{"eno2np1", "2", "", "boot-a"})
+	if ctl.Up.Rate != start || ctl.Down.Rate != start || len(logs.list) != 0 {
+		t.Fatalf("with nothing recorded the run started at %.1f/%.1f and said %d things, want %.0f quietly",
+			ctl.Up.Rate, ctl.Down.Rate, len(logs.list), start)
 	}
 
 	if err := os.WriteFile(learnedFile(), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	logs := &records{}
-	resumeLearned(slog.New(logs), ctl, nic{"eno2np1", "2", "", "boot-a"}, time.Now())
-	if ctl.Up.Rate != 1000 || ctl.Down.Rate != 1000 || logs.count("could not be read") != 1 {
+	logs = &records{}
+	resumeLearned(slog.New(logs), ctl, nic{"eno2np1", "2", "", "boot-a"})
+	if ctl.Up.Rate != start || ctl.Down.Rate != start || logs.count("could not be read") != 1 {
 		t.Errorf("an unreadable record started the run at %.1f/%.1f, said %d times",
 			ctl.Up.Rate, ctl.Down.Rate, logs.count("could not be read"))
 	}
@@ -360,7 +360,7 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 		switch fun := call.Fun.(type) {
 		case *ast.Ident:
 			switch {
-			case fun.Name == "resumeLearned" && len(call.Args) == 4 && isName(call.Args[1], "ctl") &&
+			case fun.Name == "resumeLearned" && len(call.Args) == 3 && isName(call.Args[1], "ctl") &&
 				isName(call.Args[2], "at"):
 				resumed = call.Pos()
 			case fun.Name == "rememberer" && len(call.Args) == 3 && isName(call.Args[2], "at"):
@@ -483,22 +483,35 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 	}
 }
 
-// A RUN THAT WAS DOWN AN HOUR RESUMES HALFWAY BACK TO ITS CEILING, through the
-// same path a start takes. Not parallel: StateFile is the package's.
-func TestAResumeCountsTheTimeTheShaperWasDown(t *testing.T) {
+// HOWEVER LONG THE SHAPER WAS DOWN, AND WHATEVER THE CLOCK SAYS, A RESUMED RATE
+// IS THE ONE LEARNED, through the same path a start takes. One that returned
+// toward the interface's speed with the time down started a host back from a day
+// off at a gigabit, on a line it had found full at a third of that; a line that
+// changed meanwhile is found again as any is. Not parallel: StateFile is the
+// package's.
+func TestAResumeKeepsTheRateHoweverLongTheShaperWasDown(t *testing.T) {
 	fakeRuntimeDir(t)
 
-	stopped := time.Date(2026, 10, 16, 20, 0, 0, 0, time.UTC)
-	if err := writeLearned(learned{Iface: "eno2np1", Index: "2", At: stopped,
-		Up: learnedRate{Max: 400, Rate: 100}, Down: learnedRate{Max: 400, Rate: 200}}); err != nil {
-		t.Fatal(err)
-	}
+	at := nic{"eno2np1", "2", testMAC, "boot-a"}
+	for name, stopped := range map[string]time.Time{
+		"a day ago":           time.Now().Add(-24 * time.Hour),
+		"a month ago":         time.Now().Add(-30 * 24 * time.Hour),
+		"ahead of this clock": time.Now().Add(time.Hour),
+		"at no time":          {},
+	} {
+		if err := writeLearned(learned{Iface: "eno2np1", Index: "2", Boot: "boot-a", At: stopped,
+			Up:   learnedRate{Max: 1000, Rate: 100, Limit: 120},
+			Down: learnedRate{Max: 1000, Rate: 200, Limit: 230}}); err != nil {
+			t.Fatal(err)
+		}
 
-	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 400})
-	resumeLearned(slog.New(&records{}), ctl, nic{"eno2np1", "2", "", "boot-a"}, stopped.Add(time.Hour))
+		ctl := newRunController(1000, Options{Params: DefaultParams()})
+		resumeLearned(slog.New(&records{}), ctl, at)
 
-	if math.Abs(ctl.Up.Rate-250) > 0.01 || math.Abs(ctl.Down.Rate-300) > 0.01 {
-		t.Errorf("an hour down resumed at %.2f/%.2f, want halfway back, 250/300", ctl.Up.Rate, ctl.Down.Rate)
+		if ctl.Up.Rate != 100 || ctl.Down.Rate != 200 || ctl.Up.Limit != 120 || ctl.Down.Limit != 230 {
+			t.Errorf("%s: resumed at %.2f/%.2f with the line at %.2f/%.2f, want 100/200 and 120/230",
+				name, ctl.Up.Rate, ctl.Down.Rate, ctl.Up.Limit, ctl.Down.Limit)
+		}
 	}
 }
 
@@ -559,9 +572,9 @@ func TestTheRatesKeptBeforeTheMoveAreResumedOnce(t *testing.T) {
 
 	at := nic{"eno2np1", "2", "", "boot-a"}
 	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(&records{}), ctl, at, time.Now())
-	if math.Abs(ctl.Up.Rate-120) > 0.5 || math.Abs(ctl.Down.Rate-80) > 0.5 {
-		t.Fatalf("with only the old record the run started at %.1f/%.1f, want about its 120/80",
+	resumeLearned(slog.New(&records{}), ctl, at)
+	if ctl.Up.Rate != 120 || ctl.Down.Rate != 80 {
+		t.Fatalf("with only the old record the run started at %.1f/%.1f, want its 120/80",
 			ctl.Up.Rate, ctl.Down.Rate)
 	}
 
@@ -575,8 +588,9 @@ func TestTheRatesKeptBeforeTheMoveAreResumedOnce(t *testing.T) {
 	}
 	logs := &records{}
 	over := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(logs), over, at, time.Now())
-	if over.Up.Rate != 400 || over.Down.Rate != 300 || logs.count("could not be read") != 1 {
+	start := DefaultParams().Start
+	resumeLearned(slog.New(logs), over, at)
+	if over.Up.Rate != start || over.Down.Rate != start || logs.count("could not be read") != 1 {
 		t.Errorf("an unreadable new record read the old one over it: %.1f/%.1f", over.Up.Rate, over.Down.Rate)
 	}
 
@@ -589,8 +603,8 @@ func TestTheRatesKeptBeforeTheMoveAreResumedOnce(t *testing.T) {
 	}
 	logs = &records{}
 	unreadable := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(logs), unreadable, at, time.Now())
-	if unreadable.Up.Rate != 400 || unreadable.Down.Rate != 300 || logs.count("could not be read") != 1 {
+	resumeLearned(slog.New(logs), unreadable, at)
+	if unreadable.Up.Rate != start || unreadable.Down.Rate != start || logs.count("could not be read") != 1 {
 		t.Errorf("a new record that could not be read had the old one read over it: %.1f/%.1f",
 			unreadable.Up.Rate, unreadable.Down.Rate)
 	}
@@ -636,32 +650,6 @@ func TestTheLearnedRatesAreInstalledDurably(t *testing.T) {
 		if calls[unsafe] {
 			t.Errorf("writeLearned calls %s, which installs nothing durably", unsafe)
 		}
-	}
-}
-
-// A RECORD FROM A CLOCK AHEAD OF THIS ONE STARTS THE RUN AT THE CEILINGS, and
-// the run's first record replaces it: a host booted before its clock is set
-// cannot weigh it, and holding it would hold back every record after it.
-func TestARecordFromAClockAheadStartsAtTheCeilingsAndIsReplaced(t *testing.T) {
-	fakeRuntimeDir(t)
-
-	at := nic{"eno2np1", "2", testMAC, "boot-a"}
-	if err := writeLearned(learned{Iface: "eno2np1", Index: "2", Boot: "boot-a", At: time.Now().Add(time.Hour),
-		Up: learnedRate{Max: 400, Rate: 120}, Down: learnedRate{Max: 300, Rate: 80}}); err != nil {
-		t.Fatal(err)
-	}
-
-	logs := &records{}
-	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(logs), ctl, at, time.Now())
-	if ctl.Up.Rate != 400 || ctl.Down.Rate != 300 || logs.count("carry no time this clock has reached") != 1 {
-		t.Fatalf("a record ahead of the clock started the run at %.1f/%.1f; want the ceilings, and said why",
-			ctl.Up.Rate, ctl.Down.Rate)
-	}
-
-	rememberer(slog.New(&records{}), ctl, at)(ctl.Up.Rate, ctl.Down.Rate)
-	if l, found, err := readLearned(); err != nil || !found || l.At.After(time.Now()) || l.Up.Rate != 400 {
-		t.Errorf("the run's first record did not replace the one ahead of the clock: %+v (%v, %v)", l, found, err)
 	}
 }
 

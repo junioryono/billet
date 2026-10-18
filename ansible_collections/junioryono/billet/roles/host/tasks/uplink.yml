@@ -1,10 +1,10 @@
 ---
 # A HOST THAT SHARES ITS SITE'S INTERNET LINE KEEPS ITS OWN TRAFFIC FROM FILLING
 # IT (shared-uplink record, 2026-10-08). `billet uplink shape` shapes the default
-# route's interface with CAKE, starting at the interface's own speed, and cuts a
-# direction only when its own traffic raises the latency to public reflectors,
-# so on a line nothing fills it changes nothing. On by default for that reason;
-# billet_uplink_shaping: false removes it.
+# route's interface with CAKE, finds the line by its own traffic's effect on the
+# latency to public reflectors and the gateway and on their probes' loss, and
+# keeps what it found across restarts, so nothing about the line is configured.
+# On by default for that reason; billet_uplink_shaping: false removes it.
 - name: Inspect the uplink shaping unit
   ansible.builtin.stat:
     path: /etc/systemd/system/billet-uplink.service
