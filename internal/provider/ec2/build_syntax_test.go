@@ -17,7 +17,7 @@ import (
 //
 // THE FAILURE IF IT IS WRONG IS THE EXPENSIVE SHAPE. A syntax error produces a
 // builder that boots, has cloud-init fail, never reaches `poweroff`, and burns
-// the whole 60-minute timeout on a paid instance before billet reports that the
+// the whole build timeout on a paid instance before billet reports that the
 // guest never stopped — which names neither the script nor the line.
 //
 // EVERY SHELL THAT MIGHT RUN IT. Ubuntu's /bin/sh is dash and this suite's is
@@ -177,5 +177,28 @@ func TestTheDockerDaemonIsRestartedAfterItsConfigIsWritten(t *testing.T) {
 	if driver <= restart {
 		t.Errorf("the driver is asserted at line %d and the daemon restarted at %d", driver,
 			restart)
+	}
+}
+
+// THE SCRIPT HAS A HOME BEFORE ANYTHING THAT NEEDS ONE RUNS. cloud-init runs user
+// data with no HOME, and Composer's installer, run by the shared toolcache
+// installers, refuses to start without one: every AMI build died there, before the
+// runner was fetched, until the script exported root's (measured on a real
+// builder, 2026-10-17).
+func TestTheProvisionScriptHasAHomeBeforeTheInstallers(t *testing.T) {
+	t.Parallel()
+
+	lines := strings.Split(mustScript(t), "\n")
+	home := firstLineOf(t, lines, "export HOME=/root")
+
+	for _, later := range []string{
+		"apt-get -o DPkg::Lock::Timeout=600 update",
+		"BILLET_TC_ROOT=\"\" \\",
+		"curl -fsSL -o runner.tar.gz ",
+	} {
+		if at := firstLineOf(t, lines, later); at <= home {
+			t.Errorf("%q is at line %d and HOME is exported at %d; it runs without a HOME",
+				later, at, home)
+		}
 	}
 }
