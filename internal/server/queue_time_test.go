@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/dispatch"
 )
 
@@ -67,10 +70,11 @@ func TestAStartTakesTheQueueTimeItsJobWasOfferedWith(t *testing.T) {
 	}
 }
 
-// AN OFFER'S QUEUE TIME IS USED ONCE AND FORGOTTEN after its retention, so a
-// listener that runs for months does not keep every job it was ever offered,
-// and a start never takes a time it has already given away.
-func TestAnOfferedQueueTimeIsUsedOnceAndForgottenAfterItsRetention(t *testing.T) {
+// AN OFFER'S QUEUE TIME BELONGS TO ONE RUN OF ONE JOB, the first offer of it
+// wins, a time the message carried is its own, and an offer is forgotten once
+// its row holds the time or past its retention, so a listener that runs for
+// months does not keep every job it was ever offered.
+func TestAnOfferedQueueTimeIsKeptPerRunAndForgotten(t *testing.T) {
 	t.Parallel()
 
 	l := NewListener(nil, "billet-4vcpu-a", &fakeSession{})
@@ -80,34 +84,91 @@ func TestAnOfferedQueueTimeIsUsedOnceAndForgottenAfterItsRetention(t *testing.T)
 	queued := now.Add(-time.Minute)
 	offered := job11
 	offered.QueuedAt = queued
-	l.rememberQueueTimes([]dispatch.Job{offered})
+	rerun := job11
+	rerun.RunID, rerun.QueuedAt = 999, queued.Add(-time.Hour)
+	l.rememberQueueTimes([]dispatch.Job{offered}, []dispatch.Job{rerun})
 
 	redelivered := offered
 	redelivered.QueuedAt = queued.Add(time.Hour)
 	l.rememberQueueTimes(nil, []dispatch.Job{redelivered})
 
 	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.Equal(queued) {
-		t.Errorf("the start took %s, want the first offer's %s", got, queued)
+		t.Errorf("the start took %s, want its own run's first offer, %s", got, queued)
 	}
-	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.IsZero() {
-		t.Errorf("a second start took %s from an offer already used", got)
+	other := dispatch.Job{JobID: job11.JobID, RunID: 999}
+	if got := l.withOfferedQueueTime(other).QueuedAt; !got.Equal(rerun.QueuedAt) {
+		t.Errorf("the other run's start took %s, want its own %s", got, rerun.QueuedAt)
 	}
-
+	if got := l.withOfferedQueueTime(dispatch.Job{JobID: job11.JobID}).QueuedAt; !got.IsZero() {
+		t.Errorf("a start naming no run took %s; a job id alone may name two runs", got)
+	}
 	carried := job11
 	carried.QueuedAt = queued.Add(-time.Hour)
-	l.rememberQueueTimes([]dispatch.Job{offered})
 	if got := l.withOfferedQueueTime(carried).QueuedAt; !got.Equal(carried.QueuedAt) {
 		t.Errorf("a start carrying its own queue time took %s, want its own %s", got, carried.QueuedAt)
 	}
 
-	l.rememberQueueTimes([]dispatch.Job{offered})
+	l.forgetQueueTime(job11)
+	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.IsZero() {
+		t.Errorf("a start took %s from an offer its row already holds", got)
+	}
+
 	now = now.Add(queueTimeRetention + time.Hour)
 	l.rememberQueueTimes([]dispatch.Job{job12})
-	if got := l.withOfferedQueueTime(job11).QueuedAt; !got.IsZero() {
-		t.Errorf("a start past the retention took %s from an offer that should be forgotten", got)
-	}
 	if len(l.queued) != 0 {
-		t.Errorf("%d offers kept, want none", len(l.queued))
+		t.Errorf("%d offers kept past the retention, want none", len(l.queued))
+	}
+
+	for i := range queueTimeLimit + 1 {
+		l.rememberQueueTimes([]dispatch.Job{{JobID: "job", RunID: int64(i + 1), QueuedAt: queued}})
+	}
+	if len(l.queued) != queueTimeLimit {
+		t.Errorf("%d offers kept, want the limit, %d", len(l.queued), queueTimeLimit)
+	}
+}
+
+// A START WHOSE IDENTITY WRITE FAILED TAKES THE OFFER'S TIME WHEN IT IS
+// REDELIVERED, and an offer in the same message as its start is seen first.
+func TestAQueueTimeSurvivesAFailedWriteAndArrivesWithItsStart(t *testing.T) {
+	t.Parallel()
+
+	queued := time.Now().Add(-20 * time.Minute).UTC().Truncate(time.Millisecond)
+	p := newRunnerlessPool(t, job11)
+	runner := p.launchedFor11(t)
+
+	failures := 1
+	p.l.writeJobIdentity = func(ctx context.Context, leaseID string, job alloc.HistoryJob) error {
+		if failures > 0 {
+			failures--
+			return errors.New("injected: the ledger is busy")
+		}
+		return p.a.RecordJobIdentity(ctx, leaseID, job)
+	}
+
+	offered := job12
+	offered.QueuedAt = queued
+	started := job12
+	started.RunnerID, started.RunnerName = 77, runner.RunnerName
+	for _, msg := range []*Message{
+		{MessageID: 2, Available: []dispatch.Job{offered}, Started: []dispatch.Job{started}},
+		{MessageID: 3, Started: []dispatch.Job{started}},
+	} {
+		msg.Statistics = &Statistics{TotalAssignedJobs: 1}
+		if err := p.l.handle(t.Context(), msg); err != nil {
+			t.Fatalf("start job 12 (message %d): %v", msg.MessageID, err)
+		}
+	}
+
+	got, err := p.a.Job(t.Context(), runner.LeaseID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if failures != 0 || got.GitHubQueuedAt != stamp(queued) {
+		t.Errorf("after a failed write the redelivered start left queue time %q (%d failures unspent), "+
+			"want the offer's %s", got.GitHubQueuedAt, failures, stamp(queued))
+	}
+	if len(p.l.queued) != 0 {
+		t.Errorf("%d offers kept after the row took its time, want none", len(p.l.queued))
 	}
 }
 

@@ -243,7 +243,7 @@ type Listener struct {
 	runningJobs map[int64]actualJobIdentity
 	// GitHub's queue time for each job an offer or an assignment named, until its
 	// start records it; see rememberQueueTimes.
-	queued       map[string]offeredQueueTime
+	queued       map[offeredJob]offeredQueueTime
 	queuedPruned time.Time
 	// Restart-surviving runner leases held by the node rather than this
 	// listener. They count in GitHub's total pool capacity but do not enter the
@@ -343,6 +343,9 @@ type Listener struct {
 	// writeJobResult isolates diagnostic write failures in tests. Nil uses the
 	// allocator directly; identity reads and completion settlement are unaffected.
 	writeJobResult func(context.Context, string, string, int64) error
+	// writeJobIdentity does the same for the identity write. Nil uses the
+	// allocator directly.
+	writeJobIdentity func(context.Context, string, alloc.HistoryJob) error
 
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
@@ -424,7 +427,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		session:       session,
 		log:           slog.Default(),
 		runningJobs:   make(map[int64]actualJobIdentity),
-		queued:        make(map[string]offeredQueueTime),
+		queued:        make(map[offeredJob]offeredQueueTime),
 		running:       make(map[int64]*alloc.Lease),
 		adopted:       make(map[string]bool),
 		acquiring:     make(map[int64]*promise),
