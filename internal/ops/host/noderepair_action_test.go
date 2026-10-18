@@ -44,7 +44,9 @@ func newRepairFixture(t *testing.T) *repairFixture {
 	f.rBinary(t)
 	mustOK(t, os.Remove(f.recordPath))
 
-	f.legacy = strings.Replace(deploy.NodeUnit, "RuntimeDirectory=billet/locks billet/registration\n",
+	// THE OLD COLLECTION'S UNIT: the lock directory as its only runtime
+	// directory, which the shipped unit no longer declares there (#175).
+	f.legacy = strings.Replace(deploy.NodeUnit, "RuntimeDirectory=billet/registration\n",
 		"RuntimeDirectory=billet/locks\n", 1)
 	if f.legacy == deploy.NodeUnit {
 		t.Fatal("the shipped node unit declares no RuntimeDirectory line to make legacy")
