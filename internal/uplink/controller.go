@@ -198,11 +198,19 @@ func DefaultParams() Params {
 const Floor = 10.0
 
 // foundShare is the least share of its rate a direction must be moving at a
-// cut for what it moves to be taken as the line: half, well above a download's
-// acknowledgements and well under the three quarters a direction filling the
-// line moves at the least (Full), so a line that has slowed under a high rate is
-// still found.
+// cut for what it moves to be taken as the line: half, well under the three
+// quarters a direction filling the line moves at the least (Full), so a line
+// that has slowed under a high rate is still found, while one moving a little
+// of a high rate is not.
 const foundShare = 0.5
+
+// ackShare is the least share of the other direction's throughput a direction
+// must be moving at a cut for what it moves to be taken as the line. The
+// acknowledgements a download draws are about 2 to 3% of it, and a cut leaves
+// an upload carrying only them with a rate they fill, so no share of its own
+// rate tells them from a full upload; an upload filling its own 50 Mbit/s
+// beside a 600 Mbit/s download on a cable line is 8% of it.
+const ackShare = 0.05
 
 // improvement is the least a cut must shorten the queue by to count as having
 // helped, when a tenth of the delay is less.
@@ -538,8 +546,9 @@ func (c *Controller) Step(o Observation) bool {
 	}
 
 	seconds := o.Interval.Seconds()
-	upChanged, upCut := c.step(&c.Up, float64(o.SentBits)/seconds/1e6, v, o)
-	downChanged, downCut := c.step(&c.Down, float64(o.ReceivedBits)/seconds/1e6, v, o)
+	sent, received := float64(o.SentBits)/seconds/1e6, float64(o.ReceivedBits)/seconds/1e6
+	upChanged, upCut := c.step(&c.Up, sent, received, v, o)
+	downChanged, downCut := c.step(&c.Down, received, sent, v, o)
 
 	// A CUT IS JUDGED ON FRESH EVIDENCE: the samples that caused it are
 	// forgotten, so the next cut needs the windows to fill with delays and
@@ -740,9 +749,9 @@ func (c *Controller) cutFactor(delay time.Duration) float64 {
 	return p.GentleCut - (p.GentleCut-p.DeepCut)*share
 }
 
-// step moves one direction's rate, and reports whether it changed and whether
-// that was a cut.
-func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation) (bool, bool) {
+// step moves one direction's rate, given what it and the other direction are
+// moving, and reports whether it changed and whether that was a cut.
+func (c *Controller) step(d *Direction, moving, other float64, v verdict, o Observation) (bool, bool) {
 	p := c.Params
 
 	if moving >= d.peak || o.At.Sub(d.peakAt) > p.PeakWindow {
@@ -830,11 +839,11 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// quickly and past it only slowly, so a gateway that drops rather than
 		// queues is overrun seldom and briefly rather than at every climb. BUT
 		// ONLY WHERE THIS DIRECTION WAS FILLING IT, moving a share of what it was
-		// let through: both directions are cut on one verdict, and an upload
-		// carrying a download's acknowledgements, 12 Mbit/s under a 400 Mbit/s
-		// rate, says nothing of the line, where taking it as one held the upload
-		// near 12 for many minutes after every busy download.
-		if moving >= foundShare*before {
+		// let through and more than the other direction's acknowledgements: both
+		// directions are cut on one verdict, and an upload carrying a download's,
+		// 12 Mbit/s beside 510, says nothing of the line, where taking it as one
+		// held the upload near 12 for many minutes after every busy download.
+		if moving >= foundShare*before && moving >= ackShare*other {
 			d.Limit = moving
 		}
 		// ONLY A SOURCE THAT SHOWED THE QUEUE IS EVIDENCE OF IT: a reflector delay

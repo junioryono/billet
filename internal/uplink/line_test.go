@@ -21,7 +21,14 @@ type simLine struct {
 	dropShare  float64
 	quietShare float64
 	rng        *rand.Rand
+	// window is what flowed in the last rateWindow's rounds, kept across drives
+	// as the stepper keeps it across ticks; restart empties it.
+	window []float64
 }
+
+// restart empties what the line remembers of a run, as a new one starts with
+// nothing measured.
+func (l *simLine) restart() { l.window = nil }
 
 // simRun is what a stretch of rounds did: how many overran the line, what
 // flowed against the capacity, and the highest rate against it.
@@ -46,8 +53,6 @@ func (l *simLine) drive(c *Controller, delays *Delays, from, to, tally int) simR
 
 	var run simRun
 
-	var window []float64
-
 	for n := from; n < to; n++ {
 		capacity := l.capacity(n)
 		overrun := c.Down.Rate > capacity
@@ -70,10 +75,10 @@ func (l *simLine) drive(c *Controller, delays *Delays, from, to, tally int) simR
 			}
 		}
 
-		window = lastRounds(append(window, flowing), int(rateWindow/Tick))
+		l.window = lastRounds(append(l.window, flowing), int(rateWindow/Tick))
 		seen := 0.0
-		for _, f := range window {
-			seen += f / float64(len(window))
+		for _, f := range l.window {
+			seen += f / float64(len(l.window))
 		}
 
 		c.Step(probed(n, 1, seen, delays.Observe(reflectors, answered)))
@@ -260,6 +265,7 @@ func TestARestartedShaperStartsWhereTheLineWasLeft(t *testing.T) {
 			next.Down.Rate, next.Down.Limit, want, ctl.Down.Limit)
 	}
 
+	line.restart()
 	restarted := &Delays{}
 	if first := line.drive(next, restarted, stop, stop+20*int(time.Second/Tick), stop); first.overran != 0 {
 		t.Errorf("the first 20 s after a restart overran the line in %d rounds, so it resumed past it",

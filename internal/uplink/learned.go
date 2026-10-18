@@ -24,14 +24,16 @@ import (
 // index is still comparable; Addr is its hardware address, which a boot does not
 // renumber. At is when they were set, said in the log; how long ago changes
 // nothing, since a line that has changed since is found again as any is.
+// Format is learnedFormat in every record this shaper writes.
 type learned struct {
-	Iface string      `json:"interface"`
-	Index string      `json:"index,omitempty"`
-	Addr  string      `json:"address,omitempty"`
-	Boot  string      `json:"boot,omitempty"`
-	Up    learnedRate `json:"up"`
-	Down  learnedRate `json:"down"`
-	At    time.Time   `json:"at"`
+	Format int         `json:"format"`
+	Iface  string      `json:"interface"`
+	Index  string      `json:"index,omitempty"`
+	Addr   string      `json:"address,omitempty"`
+	Boot   string      `json:"boot,omitempty"`
+	Up     learnedRate `json:"up"`
+	Down   learnedRate `json:"down"`
+	At     time.Time   `json:"at"`
 }
 
 // nic is the interface a run shapes, as a record is matched against it: its
@@ -46,9 +48,17 @@ func thisNIC(iface string) nic {
 	return nic{iface: iface, index: ifindex(iface), addr: ifaddr(iface), boot: bootID()}
 }
 
+// learnedFormat is the record's format: the rates CAKE was given and each
+// direction's Limit. A record without it was written by the shaper before the
+// Limit, which started each run at its ceiling, the interface's speed unless one
+// was set, recorded that before it had measured anything, and returned a rate
+// toward it for every hour it was down: its rates say nothing of the line, and
+// resumed they would install CAKE holding nothing back, under which a line that
+// queues from the first round gives each reflector its queue as the baseline.
+const learnedFormat = 1
+
 // learnedRate is one direction's rate, the ceiling it was learned under, and its
-// Limit, absent from a record a shaper before the Limit wrote and zero when no
-// cut had found the line.
+// Limit, zero when no cut had found the line.
 type learnedRate struct {
 	Max   float64 `json:"max_mbit"`
 	Rate  float64 `json:"rate_mbit"`
@@ -66,11 +76,6 @@ var LearnedFile = defaultLearnedFile
 const defaultLearnedFile = "/var/lib/billet-uplink/learned"
 
 func learnedFile() string { return LearnedFile }
-
-// legacyLearnedFile is where a shaper before the rates moved kept them, beside
-// the interface record, read once when the new file is absent so the upgrade
-// that moves them does not start the line over.
-func legacyLearnedFile() string { return filepath.Join(filepath.Dir(StateFile), "learned") }
 
 // bootIDFile is the kernel's identity for this boot, which changes at every
 // boot and at no other time.
@@ -117,17 +122,11 @@ func writeLearned(l learned) error {
 
 // readLearned reads the rates: absent is false and no error, and anything it
 // cannot read or decode is an error, which the caller answers by starting as a
-// run with nothing learned does. Only an absent file falls
-// back to the legacy one; one that cannot be read is an answer of its own.
+// run with nothing learned does.
 func readLearned() (learned, bool, error) {
 	path := learnedFile()
 
 	body, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		path = legacyLearnedFile()
-		body, err = os.ReadFile(path)
-	}
-
 	if errors.Is(err, os.ErrNotExist) {
 		return learned{}, false, nil
 	}
@@ -185,16 +184,8 @@ func (l learned) resumes(at nic) (bool, string) {
 // line recorded a rate over it, and resumed there it would overrun the line
 // from its first round until the loss showed; from Near the rate creeps back as
 // any rate near its line does.
-//
-// A RATE AT ITS CEILING WITH NO LINE FOUND IS NOTHING LEARNED: a shaper before
-// this one started every run at the ceiling, the interface's speed unless one
-// was set, and recorded it before it had measured anything, so a host it never
-// cut says 1000 of 1000. Resumed, that installs CAKE holding nothing back, and
-// a line that queues under it from the first round gives each reflector its
-// queue as the idle baseline, which hides the queue for good. A run that climbed
-// to its ceiling itself climbs there again from Start within a minute.
 func (r learnedRate) resume(d *Direction, near float64) {
-	if usable(r.Rate) && (r.Rate < r.Max || usable(r.Limit)) {
+	if usable(r.Rate) {
 		d.Rate = clamp(r.Rate, d.Max)
 	}
 
@@ -219,6 +210,13 @@ func resumeLearned(log *slog.Logger, ctl *Controller, at nic) {
 	}
 
 	if !found {
+		return
+	}
+
+	if l.Format != learnedFormat {
+		log.Info("starting as a run with nothing learned does: the rates an earlier run recorded are in a "+
+			"format this shaper does not resume", "format", l.Format, "want", learnedFormat)
+
 		return
 	}
 

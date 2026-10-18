@@ -258,7 +258,8 @@ func rememberer(log *slog.Logger, ctl *Controller, at nic) func(upMbit, downMbit
 			addr = now
 		}
 
-		err := writeLearned(learned{Iface: at.iface, Index: at.index, Addr: addr, Boot: at.boot,
+		err := writeLearned(learned{Format: learnedFormat, Iface: at.iface, Index: at.index, Addr: addr,
+			Boot: at.boot,
 			At:   time.Now(),
 			Up:   learnedRate{Max: ctl.Up.Max, Rate: upMbit, Limit: ctl.Up.Limit},
 			Down: learnedRate{Max: ctl.Down.Max, Rate: downMbit, Limit: ctl.Down.Limit}})

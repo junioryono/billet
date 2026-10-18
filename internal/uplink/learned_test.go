@@ -18,10 +18,9 @@ import (
 
 // A RESUMED DIRECTION IS WHERE IT WAS LEFT: the rate as it was, never past the
 // ceiling now in force, Near of the line it found or under the floor, and the
-// line it found. A rate at its ceiling with no line found is nothing learned,
-// since a shaper before this one recorded its starting ceiling before measuring
-// anything, and anything that is not a positive, finite number leaves the start
-// untouched.
+// line it found. A rate at a ceiling since removed is resumed as it was, not at
+// the interface's speed, and anything that is not a positive, finite number
+// leaves the start untouched.
 func TestAResumedDirectionIsWhereItWasLeft(t *testing.T) {
 	t.Parallel()
 
@@ -33,11 +32,10 @@ func TestAResumedDirectionIsWhereItWasLeft(t *testing.T) {
 	}{
 		"a rate and its line":           {learnedRate{Max: 1000, Rate: 300, Limit: 340}, 1000, 25, 0, 300, 340},
 		"a ceiling lowered since":       {learnedRate{Max: 400, Rate: 300, Limit: 340}, 200, 25, 0, 200, 340},
-		"at its ceiling, no line found": {learnedRate{Max: 1000, Rate: 1000}, 1000, 25, 0, 25, 0},
-		"at a ceiling since removed":    {learnedRate{Max: 150, Rate: 150}, 1000, 25, 0, 25, 0},
+		"at its ceiling, no line found": {learnedRate{Max: 1000, Rate: 1000}, 1000, 25, 0, 1000, 0},
+		"at a ceiling since removed":    {learnedRate{Max: 150, Rate: 150}, 1000, 25, 0, 150, 0},
 		"at its ceiling, a line found":  {learnedRate{Max: 150, Rate: 150, Limit: 160}, 1000, 25, 0, 144, 160},
 		"past the line it found":        {learnedRate{Max: 1000, Rate: 520, Limit: 500}, 1000, 25, 0, 450, 500},
-		"a ceiling of no number":        {learnedRate{Max: math.NaN(), Rate: 300}, 1000, 25, 0, 25, 0},
 		"a record from before limits":   {learnedRate{Max: 400, Rate: 120}, 1000, 25, 0, 120, 0},
 		"a rate under the floor":        {learnedRate{Max: 400, Rate: 2}, 400, 25, 0, Floor, 0},
 		"no rate at all":                {learnedRate{}, 400, 25, 0, 25, 0},
@@ -505,7 +503,7 @@ func TestAResumeKeepsTheRateHoweverLongTheShaperWasDown(t *testing.T) {
 		"ahead of this clock": time.Now().Add(time.Hour),
 		"at no time":          {},
 	} {
-		if err := writeLearned(learned{Iface: "eno2np1", Index: "2", Boot: "boot-a", At: stopped,
+		if err := writeLearned(learned{Format: learnedFormat, Iface: "eno2np1", Index: "2", Boot: "boot-a", At: stopped,
 			Up:   learnedRate{Max: 1000, Rate: 100, Limit: 120},
 			Down: learnedRate{Max: 1000, Rate: 200, Limit: 230}}); err != nil {
 			t.Fatal(err)
@@ -563,41 +561,50 @@ func TestTheBootIsTheKernelsBootID(t *testing.T) {
 	}
 }
 
-// THE UPGRADE THAT MOVES THE RATES KEEPS THEM: with nothing at the new path, the
-// rates a shaper before the move kept beside the interface record are resumed
-// once, and written to the new path; but a new file that cannot be read is an
-// answer of its own, and the old one is not read over it.
-func TestTheRatesKeptBeforeTheMoveAreResumedOnce(t *testing.T) {
+// A RECORD THE SHAPER BEFORE THE LIMIT WROTE IS NOTHING LEARNED, said once:
+// that shaper started each run at its ceiling and recorded it before measuring
+// anything, and returned a rate toward it for every hour it was down, so its
+// 894 of 1000 is a host three hours off after a cut to 150, and resumed it would
+// install CAKE holding nothing back. And a record that cannot be read, or
+// cannot be read at all, starts as nothing learned and says so.
+func TestARecordFromBeforeTheLimitIsNothingLearned(t *testing.T) {
 	fakeRuntimeDir(t)
 
-	if err := os.WriteFile(legacyLearnedFile(), []byte(`{"interface":"eno2np1","index":"2",`+
-		`"up":{"max_mbit":400,"rate_mbit":120},"down":{"max_mbit":300,"rate_mbit":80},"at":"`+
+	at := nic{"eno2np1", "2", testMAC, "boot-a"}
+	start := DefaultParams().Start
+
+	if err := os.WriteFile(LearnedFile, []byte(`{"interface":"eno2np1","index":"2","boot":"boot-a",`+
+		`"up":{"max_mbit":1000,"rate_mbit":893.75},"down":{"max_mbit":1000,"rate_mbit":1000},"at":"`+
 		time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano)+`"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	at := nic{"eno2np1", "2", "", "boot-a"}
-	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(&records{}), ctl, at)
-	if ctl.Up.Rate != 120 || ctl.Down.Rate != 80 {
-		t.Fatalf("with only the old record the run started at %.1f/%.1f, want its 120/80",
-			ctl.Up.Rate, ctl.Down.Rate)
+	logs := &records{}
+	old := newRunController(1000, Options{Params: DefaultParams()})
+	resumeLearned(slog.New(logs), old, at)
+	if old.Up.Rate != start || old.Down.Rate != start || logs.count("in a format this shaper does not resume") != 1 {
+		t.Fatalf("a record from before the Limit started the run at %.1f/%.1f, said %d times; want %.0f, said",
+			old.Up.Rate, old.Down.Rate, logs.count("in a format this shaper does not resume"), start)
 	}
 
-	rememberer(slog.New(&records{}), ctl, at)(ctl.Up.Rate, ctl.Down.Rate)
-	if _, err := os.Stat(LearnedFile); err != nil {
-		t.Fatalf("the resumed rates were not written to the new path: %v", err)
+	// AND WHAT THIS SHAPER WRITES IS IN ITS FORMAT, so the next run resumes it.
+	old.Up.Limit = 140
+	rememberer(slog.New(&records{}), old, at)(120, 80)
+	next := newRunController(1000, Options{Params: DefaultParams()})
+	resumeLearned(slog.New(&records{}), next, at)
+	if next.Up.Rate != 120 || next.Down.Rate != 80 || next.Up.Limit != 140 {
+		t.Fatalf("the record this shaper wrote resumed at %.1f/%.1f with the line at %.1f, want 120/80 and 140",
+			next.Up.Rate, next.Down.Rate, next.Up.Limit)
 	}
 
 	if err := os.WriteFile(LearnedFile, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	logs := &records{}
-	over := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	start := DefaultParams().Start
-	resumeLearned(slog.New(logs), over, at)
-	if over.Up.Rate != start || over.Down.Rate != start || logs.count("could not be read") != 1 {
-		t.Errorf("an unreadable new record read the old one over it: %.1f/%.1f", over.Up.Rate, over.Down.Rate)
+	logs = &records{}
+	garbled := newRunController(1000, Options{Params: DefaultParams()})
+	resumeLearned(slog.New(logs), garbled, at)
+	if garbled.Up.Rate != start || garbled.Down.Rate != start || logs.count("could not be read") != 1 {
+		t.Errorf("an undecodable record started the run at %.1f/%.1f", garbled.Up.Rate, garbled.Down.Rate)
 	}
 
 	// NOR ONE THAT CANNOT BE READ AT ALL, here a directory where the file goes.
@@ -608,10 +615,10 @@ func TestTheRatesKeptBeforeTheMoveAreResumedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs = &records{}
-	unreadable := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
+	unreadable := newRunController(1000, Options{Params: DefaultParams()})
 	resumeLearned(slog.New(logs), unreadable, at)
 	if unreadable.Up.Rate != start || unreadable.Down.Rate != start || logs.count("could not be read") != 1 {
-		t.Errorf("a new record that could not be read had the old one read over it: %.1f/%.1f",
+		t.Errorf("a record that could not be read started the run at %.1f/%.1f",
 			unreadable.Up.Rate, unreadable.Down.Rate)
 	}
 }

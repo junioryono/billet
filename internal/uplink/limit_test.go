@@ -163,6 +163,30 @@ func TestAnUploadOfAcknowledgementsKeepsTheLineItFound(t *testing.T) {
 			c.Up.Limit)
 	}
 
+	// AND THROUGH EVERY DOWNLOAD AFTER: the cut left the upload at a rate its
+	// acknowledgements fill, so by the next one they are most of its rate, and
+	// only the download's throughput says what they are.
+	for episode := range 3 {
+		base := 10 + episode*40
+		for n := base; n < base+30; n++ {
+			c.Step(moving(n, min(12, c.Up.Rate), 400, time.Millisecond))
+		}
+
+		upBefore := c.Up.Rate
+		for n := base + 30; n < base+33; n++ {
+			c.Step(moving(n, min(12, c.Up.Rate), 510, 30*time.Millisecond))
+		}
+
+		if c.Up.Rate >= upBefore || c.Down.Limit != 510 {
+			t.Fatalf("download %d did not cut both directions (upload %.1f from %.1f, download's line %.1f): "+
+				"the case this is about did not arise", episode+2, c.Up.Rate, upBefore, c.Down.Limit)
+		}
+		if c.Up.Limit != 450 {
+			t.Fatalf("download %d took the upload's acknowledgements as its line: %.1f, want the 450 it had "+
+				"found", episode+2, c.Up.Limit)
+		}
+	}
+
 	// AND WITH NO LINE FOUND, NONE IS FOUND FROM THEM.
 	fresh := newController()
 	fresh.Up.Rate, fresh.Down.Rate = 400, 520
@@ -187,22 +211,26 @@ func TestARaiseNearTheLineIsOneCAKEIsGiven(t *testing.T) {
 	for _, c := range []struct {
 		name     string
 		max      float64
+		rate     float64
 		wantPast float64
 	}{
-		{"with room above", 10000, 440},
-		{"under a ceiling just above", 410, 410},
+		{"with room above", 10000, 400, 440},
+		{"under a ceiling just above", 410, 400, 410},
+		// THE FAST CLIMB'S LAST STEP TO NEAR IS UNDER TWO PERCENT, and only
+		// resting gives it to CAKE.
+		{"climbing back to Near", 10000, 300, 361},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 
 			r := newRig(t, &fakeProber{reflectors: three, rtt: func(int) map[string]time.Duration { return idle() }}, 0)
-			r.controller.Down = Direction{Max: c.max, Rate: 400, Limit: 400}
-			r.st.applied[1] = 400
+			r.controller.Down = Direction{Max: c.max, Rate: c.rate, Limit: 400}
+			r.st.applied[1] = c.rate
 
 			// WHAT FLOWS IS 90.5% OF WHAT CAKE WAS LAST GIVEN, read each round.
 			applied := func() float64 {
 				if len(r.sets) == 0 {
-					return 400
+					return c.rate
 				}
 
 				return r.sets[len(r.sets)-1][1]
