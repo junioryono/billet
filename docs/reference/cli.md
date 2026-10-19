@@ -317,6 +317,6 @@ Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` 
 | `billet acceptance down --workspace <dir> [--wait 20m] [--keep-workspace]` | destroy exactly what the run made |
 | `billet acceptance sweep --workspace <dir>` | ask whether anything billable is left, destroying nothing |
 
-## `billet version`
+## `billet version [--notices]`
 
-Print the version and the Go version. A release names itself by its tag, `v0.9.2`, whichever way the build stamped it; releases through v0.9.1 printed `0.9.1`, and every guard that ordered releases read that as not a release.
+Print the version and the Go version. `--notices` prints instead the licenses of the third-party software the binary contains: every Go module it links, Go's own, and the upstream files it embeds. The release archives carry the same file as `THIRD_PARTY_NOTICES`, and the packages install it as `/usr/share/doc/billet/THIRD_PARTY_NOTICES`. A release names itself by its tag, `v0.9.2`, whichever way the build stamped it; releases through v0.9.1 printed `0.9.1`, and every guard that ordered releases read that as not a release.
