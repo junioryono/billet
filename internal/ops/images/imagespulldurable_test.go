@@ -837,7 +837,18 @@ func TestAPullRefusesAnImageThisBuildCannotCompleteBeforeStagingIt(t *testing.T)
 
 	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
 
-	err := fixture.pull(t)
+	// --keep-staging, BECAUSE THE PULL'S OWN CLEANUP WOULD ERASE THE EVIDENCE: a
+	// refusal that came after the copy would delete what it copied on the way out,
+	// and the empty staging directory below would prove nothing.
+	err := cmdImagesPull(t.Context(), processEnv(), []string{
+		"--config", fixture.cfgPath,
+		"--from", fixture.from,
+		"--staging-dir", fixture.staging,
+		"--kernel-dir", fixture.kernelDir,
+		"--skip-signature-verification",
+		"--keep-staging",
+		"ubuntu-2404-x64",
+	})
 	if err == nil || !strings.Contains(err.Error(), "leaves out google-chrome for each deployment "+
 		"to install") {
 		t.Fatalf("got %v, want the image refused as one this build cannot complete", err)
