@@ -284,7 +284,13 @@ func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 			path, initconfig.ServiceGroup)
 	}
 
-	if err := startUnits(ctx, env, c, req, plan); err != nil {
+	var admitNode func(context.Context) error
+	if req.WantNode && cli.HostOS == "linux" && cfg.Node != nil {
+		endings := nodeEndings()
+		admitNode = func(ctx context.Context) error { return endings.AdmitStart(ctx, cfg) }
+	}
+
+	if err := startUnits(ctx, env, c, req, plan, admitNode); err != nil {
 		return err
 	}
 
@@ -493,8 +499,10 @@ func upButSealed(env cli.Env, cause error) error {
 // startUnits starts, proves and enables each unit in order, and unwinds the
 // enablement this run performed if a later one fails.
 func startUnits(ctx context.Context, env cli.Env, c converger, req lifeops.UpRequest,
-	plan lifeops.UpPlan,
+	plan lifeops.UpPlan, admitNode func(context.Context) error,
 ) error {
+	_, nodeService := c.Services()
+
 	var enabled []string
 
 	// THE UNWINDING MUST OUTLIVE WHAT CAUSED IT. A context cancelled by the
@@ -540,6 +548,15 @@ func startUnits(ctx context.Context, env cli.Env, c converger, req lifeops.UpReq
 		}
 
 		if unit.Start {
+			// THE NODE STARTS ONLY OVER A PROVED ENDING (#127): its last stop's
+			// record, an acknowledgement, or a reboot since; a node killed at its
+			// stop's timeout left work this one would adopt blind.
+			if unit.Name == nodeService && admitNode != nil {
+				if err := admitNode(ctx); err != nil {
+					return rollback(err)
+				}
+			}
+
 			// WHAT ELSE IS RUNNING, BEFORE THIS START. A unit billet refused to
 			// let name the other one can still reach it at a remove — through
 			// something it pulls in — and no amount of property-reading models

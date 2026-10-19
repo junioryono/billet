@@ -338,6 +338,19 @@ linters:
           allow:
             - $gostd
 
+        # THE ENDING RECORD IS A LEAF. The node writes it and every command that
+        # stops or starts a node judges it, so whatever it imported the node and
+        # those commands would import. The standard library and the two file
+        # primitives it writes and reads through (#127).
+        nodeending:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/nodeending/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+
         # THE ASSEMBLY IS IMPORTED BY WHAT INVOKES IT, AND NOTHING IT ASSEMBLES.
         # internal/app builds the control plane and the node from a config, so a
         # package below it that imported it would import every role; the binary

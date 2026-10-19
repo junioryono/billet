@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,8 +18,10 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/codebuild"
 	"github.com/junioryono/billet/internal/provider/docker"
@@ -28,6 +31,7 @@ import (
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
 	jobusage "github.com/junioryono/billet/internal/usage"
+	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -36,6 +40,13 @@ type NodeOptions struct {
 	// Upgrader is how this process replaces itself when a rollout reaches it: a
 	// property of how the process was INSTALLED, which only the command knows.
 	Upgrader node.ExecUpgrader
+	// Probe is an upgrade's readiness probe, whose entry in the ending record no
+	// judgement reads.
+	Probe bool
+	// InvocationID is the service manager's invocation of this process
+	// (systemd's INVOCATION_ID), empty where there is none: what a stop's
+	// judgement binds this process's ending to.
+	InvocationID string
 }
 
 // Node is a compute host that holds this deployment's identity and has built
@@ -48,6 +59,8 @@ type Node struct {
 	client     *nodeclient.Client
 	provider   provider.Provider
 	upgrader   node.ExecUpgrader
+	ending     *nodeending.Handle
+	probe      bool
 	// sampled is what the job sampler reports to, set by UsageMetrics' source
 	// when the node serves metrics and nil, which reports nowhere, when not.
 	sampled jobusage.Observer
@@ -77,9 +90,26 @@ func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
 		return nil, err
 	}
 
-	n := &Node{cfg: cfg, deployment: deployment, lock: lock, upgrader: opts.Upgrader}
+	n := &Node{cfg: cfg, deployment: deployment, lock: lock, upgrader: opts.Upgrader, probe: opts.Probe}
+
+	// THE ENDING RECORD BEFORE THE PROVIDER (#127): no process touches compute
+	// without an entry, because a stop is later proved by this process's ending
+	// and an entry that was never written proves nothing. Under the lock, so two
+	// processes never record themselves as the one node.
+	ending, err := beginNodeEnding(cfg, opts)
+	if err != nil {
+		if rerr := lock.Release(); rerr != nil {
+			slog.Default().Warn("could not release the deployment lock", "error", rerr)
+		}
+
+		return nil, err
+	}
+
+	n.ending = ending
 
 	if err := n.open(bundle); err != nil {
+		n.endOnClose()
+
 		if rerr := lock.Release(); rerr != nil {
 			slog.Default().Warn("could not release the deployment lock", "error", rerr)
 		}
@@ -88,6 +118,64 @@ func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
 	}
 
 	return n, nil
+}
+
+// beginNodeEnding records this process as running in the node's ending record.
+func beginNodeEnding(cfg *config.Config, opts NodeOptions) (*nodeending.Handle, error) {
+	role := nodeending.RoleNode
+	if opts.Probe {
+		role = nodeending.RoleProbe
+	}
+
+	if err := (durablefile.Installer{}).MkdirAll(cfg.Node.StateDir, 0o750); err != nil {
+		return nil, fmt.Errorf("the node's state directory, which holds its ending record: %w", err)
+	}
+
+	h, err := nodeending.Begin(cfg.Node.StateDir, nodeending.Entry{
+		InvocationID: opts.InvocationID,
+		PID:          os.Getpid(),
+		BootID:       nodeending.BootID(),
+		Release:      version.Version(),
+		Role:         role,
+		RunsOnHost:   cfg.Node.Provider.RunsOnHost(),
+	}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("record this node process in its ending record, without which no stop of it "+
+			"can be proved: %w", err)
+	}
+
+	return h, nil
+}
+
+// endNode writes how this process's stop ended. A failed write is reported
+// and not returned: the stop already happened, and the next judgement reads an
+// entry still running as unproved, which is the safe direction.
+func (n *Node) endNode(ending nodeending.Ending, drainRequested bool) {
+	if n.ending == nil {
+		return
+	}
+
+	if err := n.ending.End(ending, drainRequested); err != nil {
+		slog.Default().Error("could not record how this node process ended; the next stop or start of "+
+			"this host will not be proved until it is acknowledged", "ending", ending, "error", err)
+	}
+}
+
+// endOnClose records an ending for a process that reached Close without one:
+// a probe that did its job is idle, and a node that never got as far as its
+// loop's own ending failed.
+func (n *Node) endOnClose() {
+	if n.ending == nil || n.ending.Ended() {
+		return
+	}
+
+	if n.probe {
+		n.endNode(nodeending.Idle, false)
+
+		return
+	}
+
+	n.endNode(nodeending.Failed, false)
 }
 
 // open builds what the node needs once it holds the identity.
@@ -178,8 +266,13 @@ func (n *Node) Name() string { return n.cfg.Node.Name }
 // Deployment is the deployment identity this node claimed.
 func (n *Node) Deployment() string { return n.deployment }
 
-// Close releases the host-wide deployment lock.
-func (n *Node) Close() error { return n.lock.Release() }
+// Close records an ending for a process that has none yet, then releases the
+// host-wide deployment lock.
+func (n *Node) Close() error {
+	n.endOnClose()
+
+	return n.lock.Release()
+}
 
 // THE LOOP FINDS THE RUNNER'S HANDOVER BY ASSERTION, so a signature that
 // drifted would compile and keep nothing for the next process (#384).
@@ -293,7 +386,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return fmt.Errorf("node readiness: %w", err)
 	}
 
-	return RunNodeLoop(ctx, n.client, runner, nodeclient.LoopOptions{
+	err = RunNodeLoop(ctx, n.client, runner, nodeclient.LoopOptions{
 		Provider:       cfg.Node.Provider,
 		Deployment:     n.deployment,
 		Site:           cfg.Node.Site,
@@ -324,7 +417,14 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		// registration, for the inspector to read: the one spelling, empty on a
 		// Mac.
 		RegistrationRecordPath: host.RegistrationRecordPath,
+		// How this process's stop ended, into the record a stop is proved by.
+		Ended: n.endNode,
 	})
+	if err != nil {
+		n.endNode(nodeending.Failed, host.DrainRequested != nil && host.DrainRequested())
+	}
+
+	return err
 }
 
 // latchedDrainRequest answers what read answers the first time it is asked, and
