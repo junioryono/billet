@@ -39,8 +39,18 @@ NAMES = ("LICENSE", "LICENCE", "NOTICE", "COPYING", "COPYRIGHT")
 AUDITED = "b38d2be4e9695eb6f143ec3b4dd4a4b800999adf9790c570dcd07dc50d9c4017"
 
 # (package that carries the copy, what was taken, where, license URL at the credited
-# revision, and the line its own license ends on when the file holds more).
+# revision, and the line its own license ends on when the file holds more). An entry
+# whose license is assembled from several texts names a list of (URL, the line it
+# starts on, the line it ends on) instead. The carrier is any package the lockfile
+# resolves, development packages included, because the bundler writes its own
+# runtime into the bundle.
 EMBEDDED = [
+    ("@vercel/ncc 0.38.4", "webpack 5.94.0",
+     "the module loader and runtime helpers the bundler emits around every module (ncc 0.38.4 bundles webpack 5.94.0)",
+     "https://raw.githubusercontent.com/webpack/webpack/eabf85d8580dfcb876b56957ba5488222a4f7873/LICENSE", None),
+    ("@vercel/ncc 0.38.4", "ncc",
+     "the __nccwpck_require__ wrapper ncc emits",
+     "https://raw.githubusercontent.com/vercel/ncc/e72d34d97e7cb2348af19993b6cdb6fec5374ac9/LICENSE", None),
     ("@actions/io 2.0.0", "ShellJS",
      "cp, which its comment says is based on ShellJS's src/cp.js at 9237f66c",
      "https://raw.githubusercontent.com/shelljs/shelljs/9237f66c52e5daa40458f94f9565e18e8132f5a6/LICENSE", None),
@@ -73,6 +83,13 @@ EMBEDDED = [
      "the token and header regular expressions lib/core/request.js lifted from Node's lib/_http_common.js, and the structuredClone fallback in lib/fetch/constants.js reproduced from Node's lib/internal/structured_clone.js at b27ae24d (Node's own license, as of v20.0.0)",
      "https://raw.githubusercontent.com/nodejs/node/e7618fb5a5fc25d76b6474e2a6607f04fd6f10e0/LICENSE",
      "maintained libraries."),
+    ("undici 5.29.0", "the WHATWG Fetch Standard",
+     "the Fetch Standard's algorithm steps, quoted throughout lib/fetch, lib/cache and lib/websocket; WHATWG licenses portions incorporated into source code under the BSD 3-Clause License, whose text follows its notice",
+     [("https://raw.githubusercontent.com/whatwg/fetch/e9460d1b22ead1c6a72eeac37fb2ec0dc01aeb1d/LICENSE",
+       None, "BSD 3-Clause License instead."),
+      ("https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/BSD-3-Clause.txt",
+       "Redistribution and use", None)],
+     None),
 ]
 
 
@@ -81,15 +98,20 @@ def fetch(url):
         return r.read()
 
 
-def text(raw, until=None):
+def text(raw, until=None, start=None):
     body = raw.decode("utf-8").replace("\r\n", "\n")
+    lines = body.split("\n")
+    if start is not None:
+        first = next((i for i, l in enumerate(lines) if l.startswith(start)), None)
+        if first is None:
+            raise ValueError(f"no line starts with {start!r}")
+        lines = lines[first:]
     if until is not None:
-        lines = body.split("\n")
         end = next((i for i, l in enumerate(lines) if l.endswith(until)), None)
         if end is None:
             raise ValueError(f"no line ends with {until!r}")
-        body = "\n".join(lines[:end + 1])
-    return body.rstrip("\n")
+        lines = lines[:end + 1]
+    return "\n".join(lines).strip("\n")
 
 
 def render(version, sha256, fetch):
@@ -104,10 +126,12 @@ def render(version, sha256, fetch):
     sections = []
     resolved = set()
     for key, pkg in sorted(lock["packages"].items()):
-        if not key.startswith("node_modules/") or pkg.get("dev") or pkg.get("link"):
+        if not key.startswith("node_modules/") or pkg.get("link"):
             continue
         name = key.rsplit("node_modules/", 1)[1]
         resolved.add(f"{name} {pkg['version']}")
+        if pkg.get("dev"):
+            continue
         data = fetch(pkg["resolved"])
         algo, want = pkg["integrity"].split("-", 1)
         if base64.b64encode(hashlib.new(algo, data).digest()).decode() != want:
@@ -134,16 +158,19 @@ def render(version, sha256, fetch):
             body.append(f"\n--- {path} ---\n\n{files[path]}")
         sections.append("\n".join(body))
 
-    for carrier, name, where, url, until in EMBEDDED:
+    for carrier, name, where, source, until in EMBEDDED:
         if carrier not in resolved:
             raise ValueError(f"EMBEDDED names {carrier}, which the lockfile does not resolve")
-        sections.append(f"{name}, embedded in {carrier}\nIn: {where}\nSource: {url}\n\n{text(fetch(url), until)}")
+        parts = source if isinstance(source, list) else [(source, None, until)]
+        urls = ", ".join(url for url, _, _ in parts)
+        body = "\n\n".join(text(fetch(url), last, first) for url, first, last in parts)
+        sections.append(f"{name}, embedded in {carrier}\nIn: {where}\nSource: {urls}\n\n{body}")
 
     head = [
         "Third-party notices for the container hook's bundle",
         f"Container hook version: {version}",
         f"Container hook bundle SHA-256: {sha256}",
-        f"/usr/local/lib/billet/container-hook/upstream.js is the index.js of actions/runner-container-hooks v{version} (the release asset internal/guestassets/container-hook.pin names by digest). @vercel/ncc built it as one file from that project's packages/docker and packages/hooklib, whose license is the LICENSE beside this file, and from the npm packages below, at the versions the tag's packages/docker/package-lock.json resolves. Each is reproduced as the license files in its npm tarball, read from a tarball that matched the lockfile's integrity hash, followed by the licenses of code those packages took from other projects. scripts/container-hook-notices.py writes this file.",
+        f"/usr/local/lib/billet/container-hook/upstream.js is the index.js of actions/runner-container-hooks v{version} (the release asset internal/guestassets/container-hook.pin names by digest). @vercel/ncc built it as one file from that project's packages/docker and packages/hooklib, whose license is the LICENSE beside this file, and from the npm packages below, at the versions the tag's packages/docker/package-lock.json resolves. Each is reproduced as the license files in its npm tarball, read from a tarball that matched the lockfile's integrity hash, followed by the licenses of the runtime the bundler writes around them and of code those packages took from other projects. scripts/container-hook-notices.py writes this file.",
         "The copyright comments the bundle keeps inline stay in upstream.js, which is installed unmodified.",
     ]
     rule = "\n" + "=" * 80 + "\n"
