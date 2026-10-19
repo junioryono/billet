@@ -547,12 +547,14 @@
 
 # DURABLE BEFORE THE RENDER IT GUARDS: a rename is atomic, not durable, so a
 # crash could otherwise keep the new configuration and lose the drain it owes.
+# Flushed whenever it is written, changed or not: a retry after a converge that
+# wrote it and failed before the flush finds it unchanged and still unflushed.
 - name: Flush the drain the billet node owes before its configuration changes
   ansible.builtin.command:
     argv: [sync, -f, "{{ billet_node_drain_owed_path }}"]
   changed_when: false
   become: true
-  when: billet_node_drain_owed_write is changed
+  when: billet_node_drain_owed_write is not skipped
 
 - name: Note the record whose drain this converge owes
   ansible.builtin.set_fact:

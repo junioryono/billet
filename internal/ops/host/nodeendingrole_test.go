@@ -28,10 +28,11 @@ func readRoleTaskMaps(t *testing.T, file string) []map[string]any {
 
 	var flat []map[string]any
 
-	var walk func([]map[string]any)
+	var walk func([]map[string]any, string)
 
-	walk = func(list []map[string]any) {
+	walk = func(list []map[string]any, inherited string) {
 		for _, task := range list {
+			task[inheritedWhen] = inherited
 			flat = append(flat, task)
 
 			if block, ok := task["block"].([]any); ok {
@@ -43,13 +44,22 @@ func readRoleTaskMaps(t *testing.T, file string) []map[string]any {
 					}
 				}
 
-				walk(inner)
+				walk(inner, strings.TrimSpace(inherited+"\n"+whenText(task)))
 			}
 		}
 	}
-	walk(tasks)
+	walk(tasks, "")
 
 	return flat
+}
+
+// inheritedWhen is the key under which a flattened task carries the conditions
+// of every block around it.
+const inheritedWhen = "billet-test-inherited-when"
+
+// effectiveWhen is a task's conditions with those of every block around it.
+func effectiveWhen(task map[string]any) string {
+	return strings.TrimSpace(fmt.Sprint(task[inheritedWhen]) + "\n" + whenText(task))
 }
 
 // taskNamed is the index of the task named, failing the test when it is absent.
@@ -537,7 +547,7 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	flush := taskNamed(t, "account.yml", account, "Flush the drain the billet node owes before its configuration changes")
 	if flush <= record || flush >= render || fmt.Sprint(account[flush]["ansible.builtin.command"]) !=
 		"map[argv:[sync -f {{ billet_node_drain_owed_path }}]]" ||
-		whenText(account[flush]) != "billet_node_drain_owed_write is changed" {
+		whenText(account[flush]) != "billet_node_drain_owed_write is not skipped" {
 		t.Errorf("account.yml flushes the owed drain at %d (record %d, render %d) as %v when %q", flush, record,
 			render, account[flush]["ansible.builtin.command"], whenText(account[flush]))
 	}
@@ -592,14 +602,16 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	} {
 		check, proof := taskNamed(t, file, tasks, pair.check), taskNamed(t, file, tasks, pair.proof)
 
-		guard := whenText(tasks[check])
+		// THE PROOF RUNS EXACTLY WHEN ITS CHECK DOES, block conditions and all.
+		guard := effectiveWhen(tasks[check])
 		if pair.guard != "" {
 			drain := strings.TrimSuffix(strings.TrimPrefix(normalized(varText(tasks[check], "billet_ending_drain")),
 				"{{ "), " }}")
-			guard = strings.ReplaceAll(pair.guard, "{{DRAIN}}", drain)
+			guard = strings.TrimSpace(fmt.Sprint(tasks[check][inheritedWhen]) + "\n" +
+				strings.ReplaceAll(pair.guard, "{{DRAIN}}", drain))
 		}
 
-		if proof != check+1 || proof >= forget || normalized(whenText(tasks[proof])) != normalized(guard) ||
+		if proof != check+1 || proof >= forget || normalized(effectiveWhen(tasks[proof])) != normalized(guard) ||
 			fmt.Sprint(tasks[proof]["ansible.builtin.set_fact"]) != "map[billet_node_drain_proved:true]" {
 			t.Errorf("%q at %d (check %d, forget %d) sets %v when %q, want proved right after its check, under %q",
 				pair.proof, proof, check, forget, tasks[proof]["ansible.builtin.set_fact"], whenText(tasks[proof]),
@@ -661,7 +673,7 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	txFlush := taskNamed(t, file, txTasks, "Flush the drain the billet node owes before the transaction's stop")
 	if txFlush <= txRecord || txFlush >= txStop || fmt.Sprint(txTasks[txFlush]["ansible.builtin.command"]) !=
 		"map[argv:[sync -f {{ billet_node_drain_owed_path }}]]" ||
-		whenText(txTasks[txFlush]) != "billet_transaction_drain_owed is changed" {
+		whenText(txTasks[txFlush]) != "billet_transaction_drain_owed is not skipped" {
 		t.Errorf("the transaction flushes its owed drain at %d (record %d, stop %d) as %v when %q", txFlush,
 			txRecord, txStop, txTasks[txFlush]["ansible.builtin.command"], whenText(txTasks[txFlush]))
 	}

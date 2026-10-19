@@ -391,7 +391,7 @@
       ansible.builtin.command:
         argv: [sync, -f, "{{ billet_node_drain_owed_path }}"]
       changed_when: false
-      when: billet_transaction_drain_owed is changed
+      when: billet_transaction_drain_owed is not skipped
 
     - name: Note the record whose drain the transaction owes
       ansible.builtin.set_fact:

@@ -1006,7 +1006,7 @@
       ]
     },
     "tasks/account.yml / Flush the drain the billet node owes before its configuration changes": {
-      "task": "{\"ansible.builtin.command\":{\"argv\":[\"sync\",\"-f\",\"{{ billet_node_drain_owed_path }}\"]},\"become\":true,\"changed_when\":false,\"name\":\"Flush the drain the billet node owes before its configuration changes\",\"when\":\"billet_node_drain_owed_write is changed\"}",
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"sync\",\"-f\",\"{{ billet_node_drain_owed_path }}\"]},\"become\":true,\"changed_when\":false,\"name\":\"Flush the drain the billet node owes before its configuration changes\",\"when\":\"billet_node_drain_owed_write is not skipped\"}",
       "contexts": [
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"account.yml\",\"name\":\"Configure billet account and files\"}}]"
       ],
@@ -1833,7 +1833,7 @@
       ]
     },
     "tasks/services.yml / Flush the drain the billet node owes before the transaction's stop": {
-      "task": "{\"ansible.builtin.command\":{\"argv\":[\"sync\",\"-f\",\"{{ billet_node_drain_owed_path }}\"]},\"changed_when\":false,\"name\":\"Flush the drain the billet node owes before the transaction's stop\",\"when\":\"billet_transaction_drain_owed is changed\"}",
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"sync\",\"-f\",\"{{ billet_node_drain_owed_path }}\"]},\"changed_when\":false,\"name\":\"Flush the drain the billet node owes before the transaction's stop\",\"when\":\"billet_transaction_drain_owed is not skipped\"}",
       "contexts": [
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"services.yml\",\"name\":\"Configure billet services\"}},{\"branch\":\"block\",\"file\":\"tasks/services.yml\",\"task\":{\"become\":true,\"name\":\"Upgrade billet as one recoverable host transaction\",\"when\":[\"billet_binary_upgrade | default(false)\",\"not ansible_check_mode\"]}}]"
       ],
