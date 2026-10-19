@@ -91,20 +91,28 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			names: "mentioned, not signed",
 		},
 		{
-			// A MERGE OF MAIN INTO THE BRANCH adds no authorship of its own, and
-			// main's commits are the base's, not the pull request's.
-			name:   "a merge of main inside the pull request",
+			// A SIGNED MERGE OF MAIN INTO THE BRANCH passes, and main's own
+			// commits are the base's, not the pull request's, so they are not asked.
+			name:   "a signed-off merge of main inside the pull request",
 			author: "ada",
 			commits: func(t *testing.T, repo string) {
 				t.Helper()
 
-				authored(t, repo, ada, "before the merge", adaSign)
-				fixtureGit(t, repo, "checkout", "--quiet", "main")
-				authored(t, repo, grace, "main moved, unsigned")
-				fixtureGit(t, repo, "checkout", "--quiet", "pr")
-				fixtureGit(t, repo, "merge", "--quiet", "--no-ff", "--no-edit", "main")
-				authored(t, repo, ada, "after the merge", adaSign)
+				mergeMainInto(t, repo, "--signoff")
 			},
+		},
+		{
+			// AN UNSIGNED ONE IS REFUSED: a merge can carry new code or a
+			// substantive conflict resolution, so it is a contribution too.
+			name:   "an unsigned merge of main inside the pull request",
+			author: "ada",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				mergeMainInto(t, repo)
+			},
+			code:  1,
+			names: "Merge branch 'main' into pr",
 		},
 		{
 			name:   "the repository owner's pull request",
@@ -189,7 +197,8 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 				fixtureGit(t, repo, "config", "trailer.sign.key", "Signed-off-by")
 				authored(t, repo, ada, "forged through a split ceiling", "sign: "+ada)
 			},
-			code: 2,
+			code:  2,
+			names: "holds a colon",
 		},
 		{
 			// A SIGNED COMMIT'S VERIFICATION REPORT IS NOT PART OF ITS MESSAGE:
@@ -409,6 +418,21 @@ func TestTheDCOJobChecksOutTheWholeHistory(t *testing.T) {
 	}
 }
 
+// mergeMainInto adds a signed commit to branch pr, moves main by a commit of its
+// own, and merges main into pr as ada, with the merge options given.
+func mergeMainInto(t *testing.T, repo string, opts ...string) {
+	t.Helper()
+
+	authored(t, repo, ada, "before the merge", adaSign)
+	fixtureGit(t, repo, "checkout", "--quiet", "main")
+	authored(t, repo, grace, "main moved, unsigned")
+	fixtureGit(t, repo, "checkout", "--quiet", "pr")
+	args := append([]string{"-c", "user.name=Ada Contributor", "-c", "user.email=ada@example.invalid",
+		"merge", "--quiet", "--no-ff", "--no-edit"}, opts...)
+	fixtureGit(t, repo, append(args, "main")...)
+	authored(t, repo, ada, "after the merge", adaSign)
+}
+
 // sshSigned makes repo sign every commit with a throwaway SSH key, the signing
 // format that needs no GPG installation.
 func sshSigned(t *testing.T, repo string) {
@@ -417,6 +441,10 @@ func sshSigned(t *testing.T, repo string) {
 	key := filepath.Join(t.TempDir(), "id")
 	gen := exec.CommandContext(t.Context(), "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key)
 	if out, err := gen.CombinedOutput(); err != nil {
+		// CI MUST RUN IT, or a green run would say nothing about signed commits.
+		if os.Getenv("CI") != "" {
+			t.Fatalf("ssh-keygen: %v\n%s", err, out)
+		}
 		t.Skipf("ssh-keygen is not usable here: %v\n%s", err, out)
 	}
 

@@ -15,9 +15,10 @@
 # (DCO_PR_AUTHOR), never a commit's author field, which anyone can set to any
 # name and address.
 #
-# WHAT IS CHECKED. Every commit the pull request adds and its base lacks, merges
-# excluded (a merge of main carries no new authorship), must carry a sign-off
-# naming that commit's own author. The checkout is GitHub's merge ref, whose
+# WHAT IS CHECKED. Every commit the pull request adds and its base lacks must
+# carry a sign-off naming that commit's own author, merges included: a merge can
+# carry new code or a substantive conflict resolution, so `git merge --signoff`.
+# GitHub's own merge ref is HEAD, outside the range, so it is never asked. The checkout is GitHub's merge ref, whose
 # first parent is the base and second the pull request's head, so HEAD^1..HEAD^2
 # is exactly what the merge would bring in; a HEAD of any other shape is refused,
 # because checking the wrong range would pass a commit nobody looked at. So is a
@@ -60,7 +61,7 @@ if [[ $parents -ne 3 ]]; then
 	exit 2
 fi
 
-if ! commits=$(git rev-list --no-merges HEAD^1..HEAD^2); then
+if ! commits=$(git rev-list HEAD^1..HEAD^2); then
 	echo "dco: listing the pull request's commits failed" >&2
 	exit 2
 fi
