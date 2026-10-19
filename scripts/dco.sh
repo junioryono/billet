@@ -118,17 +118,26 @@ for c in $commits; do
 done
 
 if [[ $missing -ne 0 ]]; then
+	# THE REPAIR NAMES BILLET'S REPOSITORY AND THIS PULL REQUEST'S BASE, never
+	# origin/main: a contributor's origin is usually their fork, whose main may be
+	# far behind, and squashing onto a stale base would make work main has since
+	# reverted look like the contributor's own and bring it back.
+	upstream=${DCO_UPSTREAM:-"<billet's repository URL>"}
+	base=${DCO_BASE_REF:-"<your pull request's base branch>"}
 	cat <<'EOF'
 dco: sign off each commit to certify you wrote it or may contribute it
-     (https://developercertificate.org). Commit with `git commit -s` and merge
-     main with `git merge --signoff`; GitHub's "Update branch" button and its
-     web conflict editor make unsigned merges. To repair this branch, which is
-     the one rewrite billet asks for, squash it into one signed-off commit (it
-     keeps your branch's contents exactly, merges included):
-       git fetch origin
-       git reset --soft "$(git merge-base HEAD origin/main)"
-       git commit -s && git push --force-with-lease
+dco: (https://developercertificate.org). Commit with `git commit -s`, and merge
+dco: main with `git merge --signoff`: GitHub's "Update branch" button and web
+dco: conflict editor make unsigned merges. To repair this branch, the one
+dco: rewrite billet asks for, squash it into one signed-off commit, which keeps
+dco: its contents exactly, merges included. On the branch, with nothing
+dco: uncommitted or staged (`git status --short` prints nothing), run these, and
+dco: stop if one fails:
 EOF
+	printf 'dco:   $ git fetch %q %q\n' "$upstream" "$base"
+	# shellcheck disable=SC2016 # printed for the contributor to run, unexpanded.
+	printf 'dco:   $ %s\n' 'git reset --soft "$(git merge-base HEAD FETCH_HEAD)"' \
+		'git commit -s' 'git push --force-with-lease'
 	exit 1
 fi
 

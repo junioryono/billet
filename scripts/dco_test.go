@@ -373,16 +373,17 @@ func TestTheDCOCheckRefusesAnIncompleteHistory(t *testing.T) {
 	})
 }
 
-// THE REPAIR IT PRINTS WORKS, and keeps the branch's contents. A branch with an
-// unsigned commit and an unsigned merge of main, behind a main that has moved
-// on, is squashed the way the refusal says, and then passes with its tree intact
-// and none of main's newer work undone.
+// THE REPAIR IT PRINTS WORKS, run exactly as printed, and changes nothing a
+// merge into billet would produce. The contributor works in a clone of their own
+// fork, whose main is stale; their branch has an unsigned commit and an unsigned
+// merge of billet's main that carries a conflict resolution of its own; and
+// billet's main then reverts a change the contributor merged in. A repair onto
+// the fork's stale main would bring that reverted change back.
 func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 	t.Parallel()
 
-	repo := newRepo(t)
-	asAda := []string{"-c", "user.name=Ada Contributor", "-c", "user.email=ada@example.invalid"}
-	write := func(name, body string) {
+	upstream := newRepo(t)
+	write := func(repo, name, body string) {
 		t.Helper()
 
 		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o600); err != nil {
@@ -391,48 +392,99 @@ func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 		fixtureGit(t, repo, "add", name)
 	}
 
-	write("base", "base\n")
-	fixtureGit(t, repo, "commit", "--quiet", "-m", "base")
-	fixtureGit(t, repo, "checkout", "--quiet", "-b", "pr")
-	write("feature", "ada's work\n")
-	fixtureGit(t, repo, append(asAda, "commit", "--quiet", "-m", "unsigned work")...)
-	fixtureGit(t, repo, "checkout", "--quiet", "main")
-	write("main-one", "main moved\n")
-	fixtureGit(t, repo, "commit", "--quiet", "-m", "main moved")
-	fixtureGit(t, repo, "checkout", "--quiet", "pr")
-	fixtureGit(t, repo, append(asAda, "merge", "--quiet", "--no-ff", "--no-edit", "main")...)
-	fixtureGit(t, repo, "checkout", "--quiet", "main")
-	write("main-two", "main moved again\n")
-	fixtureGit(t, repo, "commit", "--quiet", "-m", "main moved again")
+	write(upstream, "x", "0\n")
+	write(upstream, "c", "base\n")
+	fixtureGit(t, upstream, "commit", "--quiet", "-m", "base")
 
-	ref := func() string {
+	// THE FORK STAYS AT base, and the contributor's origin is the fork.
+	fork := filepath.Join(t.TempDir(), "fork.git")
+	fixtureGit(t, upstream, "clone", "--quiet", "--bare", "file://"+upstream, fork)
+	work := t.TempDir()
+	fixtureGit(t, work, "clone", "--quiet", "file://"+fork, ".")
+	fixtureGit(t, work, "config", "user.name", "Ada Contributor")
+	fixtureGit(t, work, "config", "user.email", "ada@example.invalid")
+
+	write(upstream, "x", "1\n")
+	write(upstream, "c", "main\n")
+	fixtureGit(t, upstream, "commit", "--quiet", "-m", "A: x to 1, c from main")
+
+	fixtureGit(t, work, "checkout", "--quiet", "-b", "pr")
+	write(work, "f", "ada's work\n")
+	write(work, "c", "ada\n")
+	fixtureGit(t, work, "commit", "--quiet", "-m", "unsigned work")
+
+	// THE MERGE CARRIES CONTENT OF ITS OWN: c conflicts, and its resolution is
+	// in no parent.
+	fixtureGit(t, work, "fetch", "--quiet", "file://"+upstream, "main")
+	merge := exec.CommandContext(t.Context(), "git", "merge", "--quiet", "--no-ff", "--no-edit", "FETCH_HEAD")
+	merge.Dir = work
+	merge.Env = fixtureGitEnv()
+	if out, err := merge.CombinedOutput(); err == nil {
+		t.Fatalf("the fixture's merge did not conflict:\n%s", out)
+	}
+	write(work, "c", "resolved by ada\n")
+	fixtureGit(t, work, "commit", "--quiet", "--no-edit")
+	fixtureGit(t, work, "push", "--quiet", "-u", "origin", "pr")
+
+	write(upstream, "x", "0\n")
+	fixtureGit(t, upstream, "commit", "--quiet", "-m", "B: revert x")
+
+	// integration is the merge ref GitHub would test: billet's main with the
+	// fork's pr merged in, and its tree.
+	integration := func() (string, string) {
 		t.Helper()
 
-		fixtureGit(t, repo, "checkout", "--quiet", "--detach", "main")
-		fixtureGit(t, repo, "merge", "--quiet", "--no-ff", "--no-edit", "pr")
+		ref := t.TempDir()
+		fixtureGit(t, ref, "clone", "--quiet", "file://"+upstream, ".")
+		fixtureGit(t, ref, "config", "user.name", "GitHub")
+		fixtureGit(t, ref, "config", "user.email", "noreply@example.invalid")
+		fixtureGit(t, ref, "fetch", "--quiet", "file://"+fork, "pr")
+		fixtureGit(t, ref, "checkout", "--quiet", "--detach", "origin/main")
+		fixtureGit(t, ref, "merge", "--quiet", "--no-ff", "--no-edit", "FETCH_HEAD")
 
-		return repo
+		return ref, strings.TrimSpace(gitOut(t, ref, "rev-parse", "HEAD^{tree}"))
 	}
 
-	if out, code := runDCO(t, ref(), "pull_request", "ada", dcoOwner); code != 1 {
+	ref, before := integration()
+	out, code := runDCO(t, ref, "pull_request", "ada", dcoOwner,
+		"DCO_UPSTREAM=file://"+upstream, "DCO_BASE_REF=main")
+	if code != 1 {
 		t.Fatalf("the unrepaired branch: dco.sh exited %d, want 1\n%s", code, out)
 	}
 
-	// THE PRINTED STEPS, with main standing in for origin/main.
-	fixtureGit(t, repo, "checkout", "--quiet", "pr")
-	tree := strings.TrimSpace(gitOut(t, repo, "rev-parse", "pr^{tree}"))
-	base := strings.TrimSpace(gitOut(t, repo, "merge-base", "HEAD", "main"))
-	fixtureGit(t, repo, "reset", "--quiet", "--soft", base)
-	fixtureGit(t, repo, append(asAda, "commit", "--quiet", "-s", "-m", "ada's work, signed")...)
+	var steps []string
+	for _, line := range strings.Split(out, "\n") {
+		if cmd, ok := strings.CutPrefix(line, "dco:   $ "); ok {
+			steps = append(steps, cmd)
+		}
+	}
+	if len(steps) == 0 {
+		t.Fatalf("the refusal printed no repair:\n%s", out)
+	}
 
-	if got := strings.TrimSpace(gitOut(t, repo, "rev-parse", "pr^{tree}")); got != tree {
-		t.Fatalf("the repair changed the branch's tree: %s, was %s", got, tree)
+	// THE PRINTED STEPS, verbatim, as the contributor would run them. The editor
+	// gives `git commit -s` a subject above the sign-off it wrote.
+	for _, step := range steps {
+		cmd := exec.CommandContext(t.Context(), "bash", "-c", step)
+		cmd.Dir = work
+		cmd.Env = append(fixtureGitEnv(), "GIT_EDITOR=sed -i.bak 1s/^/ada-work/")
+		if stepOut, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("the printed step %q failed: %v\n%s", step, err, stepOut)
+		}
 	}
-	if out, code := runDCO(t, ref(), "pull_request", "ada", dcoOwner); code != 0 {
-		t.Fatalf("the repaired branch: dco.sh exited %d, want 0\n%s", code, out)
+
+	ref, after := integration()
+	if after != before {
+		t.Errorf("merging the repaired branch into billet gives tree %s, and the original gave %s", after, before)
 	}
-	if out := gitOut(t, repo, "diff", "--name-only", "main", "HEAD"); out != "feature\n" {
-		t.Errorf("merging the repaired branch changes %q against main, want only ada's feature", out)
+	if got := gitOut(t, ref, "show", "HEAD:x"); got != "0\n" {
+		t.Errorf("after the repair the merge has x = %q; billet's revert of it was undone", got)
+	}
+	if got := gitOut(t, ref, "show", "HEAD:c"); got != "resolved by ada\n" {
+		t.Errorf("after the repair the merge has c = %q; the merge's own resolution was lost", got)
+	}
+	if out, code := runDCO(t, ref, "pull_request", "ada", dcoOwner); code != 0 {
+		t.Errorf("the repaired branch: dco.sh exited %d, want 0\n%s", code, out)
 	}
 }
 

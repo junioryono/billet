@@ -1268,6 +1268,10 @@ jobs:
           DCO_EVENT: ${{ github.event_name }}
           DCO_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           DCO_OWNER: ${{ github.repository_owner }}
+          # Named in the repair a refusal prints: billet's own repository and
+          # this pull request's base, never the contributor's origin.
+          DCO_UPSTREAM: ${{ github.server_url }}/${{ github.repository }}
+          DCO_BASE_REF: ${{ github.base_ref }}
         run: scripts/dco.sh
 
   # THE ONE CONTEXT BRANCH PROTECTION REQUIRES. Protection names a status check
