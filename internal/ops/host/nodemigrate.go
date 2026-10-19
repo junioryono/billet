@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/deploy"
@@ -290,53 +292,8 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 		return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
 	}
 
-	pre, problem := observeUnit(ctx, insp, nodeUnit)
-	if problem != "" {
-		return nil, endpointUnknown(endpointReasonUnit, "before the stop: "+problem, "", stateNothing)
-	}
-
-	if pre.ActiveState == "deactivating" {
-		return nil, endpointRefuse(endpointReasonStopping, fmt.Sprintf("%s began stopping under the judgement (since %s); "+
-			"wait or inspect the drain; nothing to do here", nodeUnit, orUnknownWord(pre.StateChangeTimestamp)),
-			"wait for the stop to complete, then check and approve afresh", stateNothing)
-	}
-
-	if _, running, problem := runningPID(pre); problem != "" || !running || processMoved(br.obs, pre) {
-		return nil, endpointUnknown(endpointReasonProcess, fmt.Sprintf("%s moved between the judgement and the stop (pid %s, "+
-			"invocation %s, %s now; pid %s, invocation %s when judged)", nodeUnit, pre.MainPID, pre.InvocationID,
-			pre.ActiveState, br.obs.MainPID, br.obs.InvocationID), "check and approve afresh", stateNothing)
-	}
-
-	// AN INCOMPLETE OBSERVATION IS COULD-NOT-TELL: a property systemd did not
-	// answer is not a disallowed value.
-	if pre.KillMode == "" {
-		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no KillMode for "+nodeUnit+", so the stop's "+
-			"premise cannot be judged", "check and approve afresh", stateNothing)
-	}
-
-	switch pre.KillMode {
-	case "mixed", "control-group":
-	default:
-		return nil, endpointRefuse(endpointReasonPolicy, fmt.Sprintf("%s has KillMode=%s, under which a stop proves nothing "+
-			"about the processes that remain; only mixed or control-group is migrated", nodeUnit, orUnknownWord(pre.KillMode)),
-			"", stateNothing)
-	}
-
-	if pre.LoadState == "" {
-		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no LoadState for "+nodeUnit+", so whether it can be "+
-			"started after the stop cannot be judged", "check and approve afresh", stateNothing)
-	}
-
-	if pre.LoadState != "loaded" {
-		return nil, endpointRefuse(endpointReasonUnit, fmt.Sprintf("%s has LoadState=%s, so it cannot be started after the "+
-			"stop", nodeUnit, orUnknownWord(pre.LoadState)), "", stateNothing)
-	}
-
-	// THE OBSERVATION IS COMPLETE: the post-stop judgement reads SubState and
-	// Result, and a unit that answers neither now would answer neither then.
-	if pre.SubState == "" || pre.Result == "" {
-		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no SubState or Result for "+nodeUnit+", so the "+
-			"observation is incomplete and the stop cannot be judged", "check and approve afresh", stateNothing)
+	if r := admitNodeStop(ctx, insp, br.obs, "migrated", nil, nil); r != nil {
+		return nil, r
 	}
 
 	// (12) THE STOP under the migration's own deadline: the context bounds
@@ -356,19 +313,9 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 	}
 
 	// (13) THE POST-STOP OBSERVATION, the command's own: the proof.
-	post, problem := observeUnit(ctx, insp, nodeUnit)
-	if problem != "" {
-		return nil, endpointUnknown(endpointReasonUnproved, "after the stop: "+problem, "", stateStopped)
-	}
-
-	stopped := migrateStopped{ActiveState: post.ActiveState, SubState: post.SubState, Result: post.Result}
-
-	if _, ok := post.raw["Result"]; !ok || stopped.ActiveState != "inactive" || stopped.SubState != "dead" ||
-		stopped.Result != "success" {
-		return nil, endpointUnknown(endpointReasonUnproved, fmt.Sprintf("the stop of %s is not proved: systemd reports "+
-			"ActiveState=%s SubState=%s Result=%s, and only inactive/dead/success proves the process gone", nodeUnit,
-			orUnknownWord(post.ActiveState), orUnknownWord(post.SubState), orUnknownWord(post.Result)),
-			"inspect the unit; check and approve afresh", stateStopped)
+	stopped, r := proveNodeStopped(ctx, insp)
+	if r != nil {
+		return nil, r
 	}
 
 	// THE CONFIGURATION AGAIN, before the start: a file replaced or modified
@@ -403,7 +350,7 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 
 	// (16) THE RECORD WAIT under the new invocation, naming the installed
 	// endpoint as effective.
-	newBr, elapsed, problem := waitForRecord(ctx, insp, nodeUnit, identity, m.wait)
+	newBr, elapsed, problem := waitForRecord(ctx, insp, identity, m.wait)
 	if problem != "" {
 		return nil, endpointUnknown(endpointReasonUnproved, "after the start: "+problem, "", stateStartedNoRecord)
 	}
@@ -539,7 +486,7 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 
 		br = bracketedRecord{obs: obs, running: running, class: recordAbsent}
 	} else {
-		br, elapsed, problem = waitForRecord(ctx, insp, nodeUnit, identity, m.wait)
+		br, elapsed, problem = waitForRecord(ctx, insp, identity, m.wait)
 		if problem != "" {
 			return judgedMigration{}, endpointUnknown(endpointReasonUnit, problem, "", stateNothing), false
 		}
@@ -576,8 +523,29 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 		// the guard, or could-not-tell.
 		pid, _, _ := runningPID(br.obs)
 
-		preR, why := preRProcess(ctx, pid)
-		if !preR {
+		vintage, why := processVintageOf(ctx, pid)
+		if vintage != vintagePreR {
+			// A UNIT THAT CANNOT HOLD THE RECORD (#168): a rollout moved the
+			// binary past the unit an older collection rendered, so the node runs
+			// and publishes nothing, and neither waiting nor a restart changes
+			// that. Proved only from a process positively of a release that
+			// publishes and from the loaded unit's own answer; a process that
+			// could not be identified, or an unanswered RuntimeDirectory, is the
+			// could-not-tell below.
+			if vintage == vintageR && unitCannotHoldRecord(br.obs) {
+				if !m.dryRun {
+					return judgedMigration{}, endpointRefuse(endpointReasonRepair, fmt.Sprintf("the running node cannot "+
+						"publish its registration record, because %s declares RuntimeDirectory=%s without %s; its "+
+						"effective endpoint is unknown until the unit is repaired", nodeUnit, br.obs.RuntimeDirectory,
+						deploy.NodeRegistrationDirectory), "billet node repair-unit --config "+installed.path+
+						" --run ID --json", stateNothing), false
+				}
+
+				recordKind = recordUnitCannotHold
+
+				break
+			}
+
 			return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the running node published no record within the wait ("+
 				why+"): an R process that has not registered, or whose record write failed; wait, or restart it",
 				"", stateNothing), false
@@ -736,6 +704,17 @@ func closeUnitObservation(ctx context.Context, insp *lifeops.Inspector, br brack
 	}
 
 	return nil, false
+}
+
+// unitCannotHoldRecord says whether the loaded node unit POSITIVELY declares no
+// directory for the registration record: systemd answered its RuntimeDirectory,
+// and the record's entry is not among them.
+func unitCannotHoldRecord(obs unitObservation) bool {
+	if _, ok := obs.raw["RuntimeDirectory"]; !ok {
+		return false
+	}
+
+	return !slices.Contains(strings.Fields(obs.RuntimeDirectory), deploy.NodeRegistrationDirectory)
 }
 
 // configObservationLite is a rendering: its bytes and its parse.

@@ -872,6 +872,15 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		return nil
 	}
 
+	// WHAT THE CANDIDATE NEEDS OF THE NODE UNIT, judged only when something is to
+	// be installed, and before the claim and before the node is told the job was
+	// taken (#168): a rollout installs no units, and a refusal after acceptance
+	// would leave the rollout waiting on a host that never moves. A host already
+	// on the target installs nothing, so it settles above whatever its unit lacks.
+	if err := refuseUnmetUnitRequirements(ctx, env, cfg, manifest.Version); err != nil {
+		return err
+	}
+
 	dir, err := stageClaim()
 	if err != nil {
 		return err

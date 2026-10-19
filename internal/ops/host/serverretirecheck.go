@@ -265,7 +265,7 @@ func observeRetireOrdinaryEntry(ctx context.Context, m retireMode, root *txLock)
 	if err != nil {
 		return j, "", retireUnknown(retireReasonGuard, err.Error(), "")
 	}
-	if r := judgeGuardShape(shape, m.run); r != nil {
+	if r := judgeGuardShape(shape, m.run, "a retirement"); r != nil {
 		return j, "", r
 	}
 	if shape.Guard.ID != m.expectedGuard || shape.Guard.Transition != nil {

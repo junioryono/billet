@@ -1,14 +1,17 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 
@@ -64,6 +67,11 @@ const (
 	endpointReasonTrust       = "trust"
 	endpointReasonUnbound     = "unbound"
 	endpointReasonUnexamined  = "unexamined"
+	endpointReasonRepair      = "repair-required"
+	endpointReasonShape       = "unit-shape"
+	endpointReasonGuard       = "guard"
+	endpointReasonLock        = "lock"
+	endpointReasonRetirement  = "retirement"
 
 	// The states a migration is left in, named on every refusal.
 	stateNothing         = "nothing"
@@ -76,6 +84,10 @@ const (
 	recordNone       = "none"
 	recordAbsentPreR = "absent-pre-r"
 	recordUnread     = "unread"
+	// recordUnitCannotHold is a running node with no record whose loaded unit
+	// declares no directory for one (#168): its effective endpoint is unknown,
+	// and `node repair-unit` is what makes it known.
+	recordUnitCannotHold = "unit-cannot-hold"
 
 	// maxRenderingBytes bounds the rendering read from stdin or a file.
 	maxRenderingBytes = 1 << 20
@@ -328,19 +340,23 @@ func nodeEndpointOf(cfg *config.Config) (endpoint.Endpoint, bool, error) {
 type unitObservation struct {
 	LoadState, ActiveState, SubState, Result, KillMode string
 	MainPID, InvocationID, StateChangeTimestamp        string
+	// RuntimeDirectory is systemd's rendering of the loaded unit's directive,
+	// its entries separated by spaces.
+	RuntimeDirectory string
 	// raw is the answer as read, for the missing-member rule: a property
 	// systemd did not answer is absent from it.
 	raw map[string][]string
 }
 
 var unitObservationNames = []string{"LoadState", "ActiveState", "SubState", "Result", "KillMode", "MainPID",
-	"InvocationID", "StateChangeTimestamp"}
+	"InvocationID", "StateChangeTimestamp", "RuntimeDirectory"}
 
 // observeUnit reads the node unit through the lifeops inspector (bounded by
 // its timeout). A failed read is could-not-tell; a zero exit without
-// ActiveState is could-not-tell too, never "not running".
-func observeUnit(ctx context.Context, insp *lifeops.Inspector, unit string) (unitObservation, string) {
-	props, err := insp.UnitProperties(ctx, unit, unitObservationNames...)
+// ActiveState is could-not-tell too, never "not running". Extra properties are
+// read in the same answer and kept in raw.
+func observeUnit(ctx context.Context, insp *lifeops.Inspector, unit string, extra ...string) (unitObservation, string) {
+	props, err := insp.UnitProperties(ctx, unit, append(slices.Clone(unitObservationNames), extra...)...)
 	if err != nil {
 		return unitObservation{}, fmt.Sprintf("ask systemd about %s: %v", unit, err)
 	}
@@ -349,7 +365,8 @@ func observeUnit(ctx context.Context, insp *lifeops.Inspector, unit string) (uni
 		LoadState: firstProp(props, "LoadState"), ActiveState: firstProp(props, "ActiveState"),
 		SubState: firstProp(props, "SubState"), Result: firstProp(props, "Result"), KillMode: firstProp(props, "KillMode"),
 		MainPID: firstProp(props, "MainPID"), InvocationID: firstProp(props, "InvocationID"),
-		StateChangeTimestamp: firstProp(props, "StateChangeTimestamp"), raw: props,
+		StateChangeTimestamp: firstProp(props, "StateChangeTimestamp"),
+		RuntimeDirectory:     firstProp(props, "RuntimeDirectory"), raw: props,
 	}
 
 	if _, ok := props["ActiveState"]; !ok || obs.ActiveState == "" {
@@ -536,10 +553,10 @@ func readRecordUnderBracket(ctx context.Context, insp *lifeops.Inspector, unit s
 	return bracketedRecord{}, fmt.Sprintf("the %s moved under every attempt to read its record", unit)
 }
 
-// waitForRecord polls readRecordUnderBracket until the record is usable, the
-// unit stops running, a foreign record refuses, or the wait elapses; the last
-// bracket is returned with elapsed=true on exhaustion.
-func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, identity registrationIdentity, wait time.Duration) (bracketedRecord, bool, string) {
+// waitForRecord polls readRecordUnderBracket on the node unit until the record
+// is usable, the unit stops running, a foreign record refuses, or the wait
+// elapses; the last bracket is returned with elapsed=true on exhaustion.
+func waitForRecord(ctx context.Context, insp *lifeops.Inspector, identity registrationIdentity, wait time.Duration) (bracketedRecord, bool, string) {
 	// NO BRACKET STARTS AFTER THE WAIT, and the sleep between brackets never
 	// outlasts it: a record that appears after the deadline is the next
 	// converge's. A bracket already running finishes under its own bounds
@@ -556,7 +573,7 @@ func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, id
 			return last, true, ""
 		}
 
-		br, problem := readRecordUnderBracket(ctx, insp, unit, identity, deadline)
+		br, problem := readRecordUnderBracket(ctx, insp, nodeUnit, identity, deadline)
 		if problem == recordWaitEndedUnderMove && last.obs.ActiveState != "" {
 			return last, true, ""
 		}
@@ -616,22 +633,41 @@ func endpointInspector() *lifeops.Inspector {
 		lifeops.WithWaitDelay(guardWaitDelay), managerRunnerOption())
 }
 
-// preRProcess says whether a running process is positively a release before
-// the guard: its image is the managed binary's bytes, and the managed binary
-// answers "unknown command" to the preparation's dry run.
-func preRProcess(ctx context.Context, pid int) (bool, string) {
+// processVintage is what a running node's image positively is, as far as the
+// endpoint commands need to know it.
+type processVintage int
+
+const (
+	// vintageUnknown is could-not-tell: an image or a binary that could not be
+	// read, an image that is not the managed binary's, a probe that did not
+	// complete. Never the premise of an act.
+	vintageUnknown processVintage = iota
+	// vintagePreR is positively a release before the guard, which publishes no
+	// registration record.
+	vintagePreR
+	// vintageR is positively a release that carries the guard, and so one that
+	// publishes its registration record where its unit lets it.
+	vintageR
+)
+
+// processVintageOf says what a running process positively is: its image must be
+// the managed binary's bytes, and the managed binary's answer to the
+// preparation's dry run decides (an unknown command is a release before the
+// guard; any completed answer is one that carries it). Anything else is
+// could-not-tell, with why.
+func processVintageOf(ctx context.Context, pid int) (processVintage, string) {
 	imageSum, _, err := hashImage(filepath.Join(procRoot, strconv.Itoa(pid), "exe"))
 	if err != nil {
-		return false, fmt.Sprintf("hash the process image of %d: %v", pid, err)
+		return vintageUnknown, fmt.Sprintf("hash the process image of %d: %v", pid, err)
 	}
 
 	managedSum, _, err := hashRegular(installedBinary, maxExecutableBytes)
 	if err != nil {
-		return false, fmt.Sprintf("hash the managed binary %s: %v", installedBinary, err)
+		return vintageUnknown, fmt.Sprintf("hash the managed binary %s: %v", installedBinary, err)
 	}
 
 	if imageSum != managedSum {
-		return false, "the running process is not the managed binary's image"
+		return vintageUnknown, "the running process is not the managed binary's image"
 	}
 
 	stdout, stderr, rc, err := runBounded(ctx, installedBinary, "converge-guard", "prepare", "--dry-run", "--json")
@@ -641,18 +677,50 @@ func preRProcess(ctx context.Context, pid int) (bool, string) {
 	// holding the words is not the diagnostic.
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		return false, "the managed binary did not answer the preparation's dry run within its bound"
+		return vintageUnknown, "the managed binary did not answer the preparation's dry run within its bound"
 	case errors.Is(err, errOutputOverflow):
-		return false, "the managed binary's answer to the preparation's dry run overflowed its bound"
+		return vintageUnknown, "the managed binary's answer to the preparation's dry run overflowed its bound"
 	case rc < 0:
-		return false, "the managed binary could not be run: " + err.Error()
+		return vintageUnknown, "the managed binary could not be run: " + err.Error()
 	}
 
 	if rc != 0 && unknownCommandPattern.Match(append(append([]byte{}, stdout...), stderr...)) {
-		return true, ""
+		return vintagePreR, ""
 	}
 
-	return false, "the managed binary answers the preparation, so the running process is a release that carries the guard"
+	// THE GUARD'S OWN ANSWER, recognised: a binary that crashed before its
+	// dispatch, or printed nothing, exits non-zero without naming an unknown
+	// command, and that is no evidence it carries the guard.
+	if !guardAnswered(rc, stdout) {
+		return vintageUnknown, fmt.Sprintf("the managed binary's answer to the preparation's dry run (exit %d) is not "+
+			"the preparation's", rc)
+	}
+
+	return vintageR, "the managed binary answers the preparation, so the running process is a release that carries the guard"
+}
+
+// guardAnswered says whether a completed run is the preparation's dry run
+// answering: its exit one the preparation answers with, and its standard output
+// one JSON object whose outcome is one of the preparation's.
+func guardAnswered(rc int, stdout []byte) bool {
+	if rc != 0 && rc != exitRefused && rc != exitUnknown {
+		return false
+	}
+
+	var answer struct {
+		Outcome *string `json:"outcome"`
+	}
+
+	if err := json.Unmarshal(bytes.TrimSpace(stdout), &answer); err != nil || answer.Outcome == nil {
+		return false
+	}
+
+	switch *answer.Outcome {
+	case outcomeReported, outcomeRefused, outcomeUnknown:
+		return true
+	}
+
+	return false
 }
 
 // answerObject prints one successful answer as JSON with exit 0.

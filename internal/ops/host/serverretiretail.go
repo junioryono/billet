@@ -560,7 +560,7 @@ func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.
 		return "", retireUnknown(retireReasonGuard, "read the guard's record before clearing the marker: "+err.Error(), "")
 	}
 
-	if r := judgeGuardShape(shape, m.run); r != nil {
+	if r := judgeGuardShape(shape, m.run, "a retirement"); r != nil {
 		return "", r
 	}
 

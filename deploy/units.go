@@ -58,6 +58,25 @@ var ServerUnit string
 //go:embed billet-node.service
 var NodeUnit string
 
+// NodeRuntimeRequirement is a RuntimeDirectory entry a node writes into, which
+// the unit that runs it must therefore declare, and the first release whose
+// node does.
+type NodeRuntimeRequirement struct {
+	Entry, Since string
+}
+
+// NodeRuntimeRequirements are every runtime directory a node release needs its
+// unit to declare (#168): the registration record's, since v0.11.0, the first
+// release that publishes the record. A host upgrade holds the loaded unit to
+// those of its candidate before it claims or stops anything, because a rollout
+// replaces the binary and never the units. A release that adds one adds it
+// here, with itself as Since.
+var NodeRuntimeRequirements = []NodeRuntimeRequirement{{Entry: NodeRegistrationDirectory, Since: "v0.11.0"}}
+
+// NodeRegistrationDirectory is the node's registration record's directory, as
+// a RuntimeDirectory entry names it (relative to /run).
+const NodeRegistrationDirectory = "billet/registration"
+
 // BackupUnit and BackupTimer are the scheduled backup this build ships.
 //
 //go:embed billet-backup.service

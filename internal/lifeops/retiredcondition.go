@@ -170,6 +170,12 @@ func (i *Inspector) PendingReloadUnits(ctx context.Context) ([]string, error) {
 
 // ReloadRetiredUnits is called only after journal-bound source reconciliation.
 func (i *Inspector) ReloadRetiredUnits(ctx context.Context) error {
+	return i.DaemonReload(ctx)
+}
+
+// DaemonReload has systemd read every unit file again, bounded by the
+// inspector's timeout.
+func (i *Inspector) DaemonReload(ctx context.Context) error {
 	ctx, cancel := i.bounded(ctx)
 	defer cancel()
 	_, err := i.exec(ctx, []string{"daemon-reload"})

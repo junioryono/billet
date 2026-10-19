@@ -1,0 +1,103 @@
+---
+# THE ONE PARSER OF A `node repair-unit` ANSWER, for its dry run and its
+# action alike. The answer is JSON on stdout, exit 0 for `reported`,
+# `unchanged` or `repaired`, 2 for a refusal, 3 for something the command
+# could not examine; a run the bound ended (124, 137, a negative status) did
+# not answer and is never read as an outcome. Every member is held to the
+# producer's shape (tests/fixtures/node-repair-unit, written by the Go test),
+# and a member outside the rules refuses naming it. A refusal or a
+# could-not-tell always names the state the host was left in (`nothing`,
+# `stopped`, `unit-installed`, `started`, `started-no-record`).
+#
+# Inputs: billet_repair_raw (the registered command result), billet_repair_call
+# ('dry-run' or 'action'), billet_repair_answered_by (the executable that
+# answered, for the diagnostics).
+
+- name: Refuse a repair call that did not answer
+  ansible.builtin.assert:
+    that:
+      - billet_repair_raw.rc is defined
+      - billet_repair_raw.rc >= 0
+      - billet_repair_raw.rc not in [124, 137]
+      - billet_repair_raw.stdout | default('') | trim | length > 0
+      - (billet_repair_raw.stdout | default('') | trim) is match('^\{')
+    fail_msg: >-
+      {{ billet_repair_answered_by }} did not answer the runtime-unit repair's
+      {{ billet_repair_call }} (exit {{ billet_repair_raw.rc | default('none') }},
+      {{ 'ended by the bound' if (billet_repair_raw.rc is not defined or billet_repair_raw.rc < 0 or billet_repair_raw.rc in [124, 137]) else 'no JSON answer' }}).
+      Whether the node was stopped or its unit changed cannot be established;
+      inspect billet-node.service and converge again{{ (': ' ~ (billet_repair_raw.stderr | default('') | trim)) if (billet_repair_raw.stderr | default('') | trim | length > 0) else '' }}.
+
+- name: Read the repair's answer
+  ansible.builtin.set_fact:
+    billet_repair_answer: "{{ billet_repair_raw.stdout | junioryono.billet.from_json_strict }}"
+  no_log: true
+
+- name: Judge the repair's answer
+  vars:
+    billet_repair_a: "{{ billet_repair_answer | default({}) }}"
+    billet_repair_outcome: "{{ billet_repair_a.outcome | default('') }}"
+    billet_repair_hex32: '^[0-9a-f]{32}\Z'
+    billet_repair_sha: '^[0-9a-f]{64}\Z'
+    billet_repair_failed: "{{ billet_repair_outcome in ['refused', 'unknown'] }}"
+    billet_repair_members:
+      reported: [schema, outcome, required, why, unit]
+      unchanged: [schema, outcome, why, unit]
+      repaired: [schema, outcome, node, deployment, endpoint, unit_path, before_sha256, after_sha256, from_invocation, invocation_id, incarnation, registered_at, stopped]
+      refused: [schema, outcome, reason, why, next, state]
+      unknown: [schema, outcome, reason, why, next, state]
+    billet_repair_required:
+      reported: [schema, outcome, required, why, unit]
+      unchanged: [schema, outcome, why, unit]
+      repaired: [schema, outcome, node, deployment, endpoint, unit_path, before_sha256, after_sha256, from_invocation, invocation_id, incarnation, registered_at, stopped]
+      refused: [schema, outcome, reason, why, state]
+      unknown: [schema, outcome, reason, why, state]
+    billet_repair_checks:
+      - name: outcome
+        ok: "{{ billet_repair_outcome in (['reported', 'refused', 'unknown'] if billet_repair_call == 'dry-run' else ['unchanged', 'repaired', 'refused', 'unknown']) }}"
+      - name: schema
+        ok: "{{ billet_repair_a.schema | default(0) is integer and billet_repair_a.schema | default(0) == 1 }}"
+      - name: exit
+        ok: "{{ (billet_repair_raw.rc | default(1)) == ({'refused': 2, 'unknown': 3}[billet_repair_outcome] if billet_repair_failed else 0) }}"
+      # THE MEMBER SET IS THE PRODUCER'S: nothing missing, nothing unknown.
+      - name: members
+        ok: "{{ billet_repair_outcome in billet_repair_members and (billet_repair_a.keys() | list | difference(billet_repair_members[billet_repair_outcome]) | length == 0) and (billet_repair_required[billet_repair_outcome] | difference(billet_repair_a.keys() | list) | length == 0) }}"
+      - name: reason
+        ok: "{{ not billet_repair_failed or (billet_repair_a.reason | default('') is string and billet_repair_a.reason | default('') | length > 0) }}"
+      - name: why
+        ok: "{{ billet_repair_outcome == 'repaired' or (billet_repair_a.why | default('x') is string and (billet_repair_a.why | default('')) | length > 0) }}"
+      - name: next
+        ok: "{{ ('next' not in billet_repair_a) or (billet_repair_a.next is string) }}"
+      - name: state
+        ok: "{{ not billet_repair_failed or (billet_repair_a.state | default('') in ['nothing', 'stopped', 'unit-installed', 'started', 'started-no-record']) }}"
+      - name: required
+        ok: "{{ billet_repair_outcome != 'reported' or (billet_repair_a.required | default('x') is sameas true) or (billet_repair_a.required | default('x') is sameas false) }}"
+      - name: unit
+        ok: "{{ billet_repair_outcome not in ['reported', 'unchanged'] or ((billet_repair_a.unit | default('x')) is mapping and (billet_repair_a.unit.keys() | list | sort) == ['fragment_path', 'load_state', 'runtime_directory'] and (billet_repair_a.unit.load_state is string) and (billet_repair_a.unit.fragment_path is string) and (billet_repair_a.unit.runtime_directory is string)) }}"
+      # THE REPAIRED ANSWER: every member a string of its shape, the unit the
+      # role renders, the stopped triple exactly inactive/dead/success, and a
+      # new invocation.
+      - name: repaired_strings
+        ok: "{{ billet_repair_outcome != 'repaired' or (['node', 'endpoint', 'registered_at'] | map('extract', billet_repair_a) | select('string') | reject('equalto', '') | list | length == 3) }}"
+      - name: unit_path
+        ok: "{{ billet_repair_outcome != 'repaired' or billet_repair_a.unit_path | default('') == '/etc/systemd/system/billet-node.service' }}"
+      - name: digests
+        ok: "{{ billet_repair_outcome != 'repaired' or ((billet_repair_a.before_sha256 | default('x')) is string and (billet_repair_a.before_sha256 | default('')) is match(billet_repair_sha) and (billet_repair_a.after_sha256 | default('x')) is string and (billet_repair_a.after_sha256 | default('')) is match(billet_repair_sha) and billet_repair_a.before_sha256 != billet_repair_a.after_sha256) }}"
+      - name: identities
+        ok: "{{ billet_repair_outcome != 'repaired' or (['deployment', 'from_invocation', 'invocation_id', 'incarnation'] | map('extract', billet_repair_a) | select('string') | select('match', billet_repair_hex32) | list | length == 4) }}"
+      - name: new_invocation
+        ok: "{{ billet_repair_outcome != 'repaired' or billet_repair_a.invocation_id | default('') != billet_repair_a.from_invocation | default('') }}"
+      - name: stopped
+        ok: "{{ billet_repair_outcome != 'repaired' or ((billet_repair_a.stopped | default('x')) is mapping and (billet_repair_a.stopped.keys() | list | sort) == ['active_state', 'result', 'sub_state'] and billet_repair_a.stopped.active_state | default('') == 'inactive' and billet_repair_a.stopped.sub_state | default('') == 'dead' and billet_repair_a.stopped.result | default('') == 'success') }}"
+  ansible.builtin.assert:
+    that:
+      - item.ok | bool
+    fail_msg: >-
+      The runtime-unit repair's {{ billet_repair_call }} through
+      {{ billet_repair_answered_by }} answered with a member this role cannot
+      read: {{ item.name }}.
+      {{ 'Nothing was stopped or changed.' if billet_repair_call == 'dry-run'
+         else 'Whether the node was stopped or its unit changed cannot be established from this answer; inspect billet-node.service and converge again.' }}
+  loop: "{{ billet_repair_checks }}"
+  loop_control:
+    label: "{{ item.name }}"

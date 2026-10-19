@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "required": false,
+  "why": "the unit already declares billet/registration",
+  "unit": {
+    "load_state": "loaded",
+    "fragment_path": "/etc/systemd/system/billet-node.service",
+    "runtime_directory": "billet/locks billet/registration"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "unproved",
+  "why": "the node was started and published no usable record within 200ms (no registration record at /run/billet/registration/current)",
+  "next": "wait for it to register, then converge again",
+  "state": "started-no-record"
+}
