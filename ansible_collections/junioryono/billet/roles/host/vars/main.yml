@@ -104,9 +104,10 @@ billet_retire_classify_bound: 180
 
 # Ordinary destinations are explicit operands; recovery keeps its manifest.
 billet_ordinary_config_path: /etc/billet/billet.yaml
-# Where a node this converge renders away keeps its ending record, until its
-# drain is proved (account.yml, services.yml).
-billet_node_leaving_path: /etc/billet/node-leaving
+# The record of a node whose drain is owed and not yet proved (#127): written
+# before anything that requires the drain changes the host, removed only by a
+# converge that proved it (node-drain-owed.yml, account.yml, services.yml).
+billet_node_drain_owed_path: /etc/billet/node-drain-owed
 billet_endpoint_temp_dir: /tmp
 billet_common_directories:
   - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }

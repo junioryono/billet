@@ -213,6 +213,34 @@
     - billet_finalization_service_probes.results[1].rc | default(1) == 0
   become: true
 
+# A DRAIN ASKED FOR OR OWED IS PROVED BEFORE THE START, as at the ordinary
+# start (services.yml): the transaction's own stop proved it already where it
+# needed one, and a node that had no process to stop is judged here.
+- name: Inspect whether a drain is still asked of the committed billet node
+  ansible.builtin.stat:
+    path: /var/run/billet-node-drain
+    get_checksum: false
+  register: billet_finalization_drain_request
+  when: billet_finalization_services[1].should_run | bool
+  become: true
+
+- name: Prove the committed billet node drained before its start where a drain is asked for
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: check
+    billet_ending_invocation: ""
+    billet_ending_drain: true
+    billet_ending_with:
+      - exe: /usr/bin/billet
+        config: /etc/billet/billet.yaml
+    billet_ending_state_dir: "{{ billet_node_drain_owed_dir | default('') }}"
+  when:
+    - billet_finalization_services[1].should_run | bool
+    - >-
+      billet_finalization_service_activity.results[1].rc != 0 or
+      billet_finalization_service_probes.results[1].rc | default(1) == 0
+    - billet_finalization_drain_request.stat.exists | default(true) or billet_node_drain_owed_dir | default('') | length > 0
+
 # A NODE STARTS ONLY OVER A PROVED ENDING (#127), judged by the committed
 # binary: the node the transaction stopped is admitted by that stop's proved
 # ending.

@@ -73,6 +73,7 @@ cat >/usr/bin/billet <<'EOF'
 #!/bin/sh
 printf 'billet %s\n' "$*" >>/calls
 printf '{"outcome":"stand-in"}\n'
+case " $* " in *" --state-dir "*) exit "${CHECK_EXIT_LEAVING:-0}" ;; esac
 exit "${CHECK_EXIT:-0}"
 EOF
 chmod 0755 /shim/systemctl /shim/timeout /usr/bin/billet
@@ -119,23 +120,29 @@ printf 'server:\n  listen: 127.0.0.1:7717\n' >/etc/billet/billet.yaml
 CHECK_EXIT=2 resume
 rm /etc/billet/billet.yaml
 [ "${status}" -eq 1 ] || { echo "a node-less configuration let an unproved record through: ${status}"; exit 1; }
+grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --drain --json' /calls ||
+    { echo 'a node-less configuration was not judged standing, under the bound:'; cat /calls; exit 1; }
 CHECK_EXIT=2 resume
 [ "${status}" -eq 1 ] || { echo "a stopped node's unproved record let the removal go on: ${status}"; exit 1; }
 grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --drain --json' /calls ||
     { echo 'the stopped node was not judged standing, under the bound:'; cat /calls; exit 1; }
 
-# A NODE THE ROLE REMOVED WHOSE DRAIN IS UNPROVED is judged where its marker
-# says, and a marker naming nothing refuses.
-printf '/srv/node-state\n' >/etc/billet/node-leaving
+# A DRAIN THE ROLE OWES AND NEVER PROVED is judged at the record it names, and
+# one naming nothing refuses.
+printf '/srv/node-state\n' >/etc/billet/node-drain-owed
 resume
-[ "${status}" -eq 0 ] || { echo "a proved leaving node refused the removal: ${status}"; cat /err; exit 1; }
+[ "${status}" -eq 0 ] || { echo "a proved owed drain refused the removal: ${status}"; cat /err; exit 1; }
 grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --state-dir /srv/node-state --drain --json' /calls ||
-    { echo 'the leaving node was not judged at its record:'; cat /calls; exit 1; }
-: >/etc/billet/node-leaving
+    { echo 'the owed drain was not judged at its record:'; cat /calls; exit 1; }
+CHECK_EXIT_LEAVING=2 resume
+[ "${status}" -eq 1 ] || { echo "an unproved owed drain let the removal go on: ${status}"; exit 1; }
+grep -qF 'did not prove it drained (check exited 2)' /err && grep -qF -- '--state-dir /srv/node-state' /err ||
+    { echo 'the owed drain refusal is not said'; cat /err; exit 1; }
+: >/etc/billet/node-drain-owed
 resume
 [ "${status}" -eq 1 ] || { echo "an empty marker let the removal go on: ${status}"; exit 1; }
 grep -qF 'names no node state directory' /err || { echo 'the empty marker is not said'; cat /err; exit 1; }
-rm /etc/billet/node-leaving
+rm /etc/billet/node-drain-owed
 
 # THE SERVER stops after the node is judged, and a failed stop refuses.
 SERVER=active run

@@ -63,10 +63,10 @@
       its ending. Nothing was stopped; converge again.
   when: billet_node_restart_before.stdout != '0'
 
-# A DRAIN WHERE ONE WAS ASKED FOR, by the request this converge wrote for a
-# changed configuration (services.yml) or one an earlier converge left when it
-# failed after writing it: the configuration is then already installed and
-# unchanged, but the obligation is not met. A node that handed its compute on
+# A DRAIN WHERE ONE WAS ASKED FOR OR IS OWED, by the request a changed
+# configuration writes before it is installed (account.yml) or the drain an
+# earlier converge recorded and never proved: the configuration is then
+# already installed and unchanged, but the obligation is not met. A node that handed its compute on
 # may not hand it to a process under another configuration.
 - name: Inspect whether a drain is asked of the node's stop
   ansible.builtin.stat:
@@ -77,7 +77,8 @@
 - name: Note whether the node's stop must have drained
   ansible.builtin.set_fact:
     billet_node_restart_drain: >-
-      {{ billet_config_install.changed | default(false) | bool or billet_node_restart_drain_request.stat.exists }}
+      {{ billet_config_install.changed | default(false) | bool or billet_node_restart_drain_request.stat.exists
+         or billet_node_drain_owed_dir | default('') | length > 0 }}
 
 # THE CONTROLLER'S CLOCK, which is the one every `until` below is evaluated on,
 # as epoch seconds: `now(utc=true)` is a naive datetime that `.timestamp()`
@@ -173,6 +174,11 @@
   when:
     - billet_node_restart_before.stdout == '0'
     - billet_node_restart_drain | bool
+
+- name: Note that the node's stop proved it drained
+  ansible.builtin.set_fact:
+    billet_node_drain_proved: true
+  when: billet_node_restart_drain | bool
 
 - name: Admit the node's start over its last ending
   ansible.builtin.include_tasks: node-ending.yml

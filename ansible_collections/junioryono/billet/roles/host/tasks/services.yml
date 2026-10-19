@@ -370,6 +370,27 @@
         ('MainPID=0' not in billet_transaction_node_before.stdout_lines and 'InvocationID=' in billet_transaction_node_before.stdout_lines)
       when: billet_service_state_before_upgrade.results[1].rc != 4
 
+    # THE DRAIN THIS TRANSACTION NEEDS IS OWED BEFORE ITS STOP, as a changed
+    # configuration's is in account.yml: it outlives a transaction that fails
+    # before the proof.
+    - name: Record the drain the billet node owes before the transaction's stop
+      ansible.builtin.copy:
+        content: "{{ billet_previous_node_state_dir }}\n"
+        dest: "{{ billet_node_drain_owed_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      register: billet_transaction_drain_owed
+      when:
+        - billet_service_state_before_upgrade.results[1].rc != 4
+        - billet_previous_config.get('node') is mapping
+        - not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0
+
+    - name: Note the record whose drain the transaction owes
+      ansible.builtin.set_fact:
+        billet_node_drain_owed_dir: "{{ billet_previous_node_state_dir }}"
+      when: billet_transaction_drain_owed is not skipped
+
     - name: Gracefully stop the billet node before changing its guest contract
       ansible.builtin.systemd_service:
         name: billet-node.service
@@ -380,9 +401,10 @@
     # the installed release, the stopped node's own, against the configuration
     # it ran under, then by the staged candidate, which knows the record
     # whatever release wrote it; a drain is required where this transaction
-    # asked for one, and a node that had no process to stop is judged by what
-    # its last process left. An unproved stop fails the transaction before
-    # anything is installed, and the rollback starts nothing over it.
+    # asked for one or one is owed, judged by the record that owes it, and a
+    # node that had no process to stop is judged by what its last process
+    # left. An unproved stop fails the transaction before anything is
+    # installed, and the rollback starts nothing over it.
     - name: Prove the transaction's node stop by the node's own ending
       ansible.builtin.include_tasks: node-ending.yml
       vars:
@@ -398,8 +420,19 @@
           {{ '' if 'MainPID=0' in billet_transaction_node_before.stdout_lines
              else (billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
         billet_ending_drain: >-
-          {{ not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0 }}
+          {{ not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0
+             or billet_node_drain_owed_dir | default('') | length > 0 }}
+        billet_ending_state_dir: "{{ billet_node_drain_owed_dir | default('') }}"
       when: billet_service_state_before_upgrade.results[1].rc != 4
+
+    - name: Note that the transaction's stop proved the node drained
+      ansible.builtin.set_fact:
+        billet_node_drain_proved: true
+      when:
+        - billet_service_state_before_upgrade.results[1].rc != 4
+        - >-
+          not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0
+          or billet_node_drain_owed_dir | default('') | length > 0
 
     # THE UPLINK SHAPER IS A BILLET PROCESS TOO, and the transaction waits for
     # every one to end before it hides the executable. Stopped here, while its
@@ -935,7 +968,10 @@
   ansible.builtin.import_tasks: endpoint-migration.yml
 
 # REQUESTED WITHOUT WAITING AND POLLED IN BOUNDED STEPS (node-restart.yml),
-# because the drain in front of the restart has no bound.
+# because the drain in front of the restart has no bound. A drain still owed
+# restarts the node too: a node that kept running when the converge that owed
+# it failed has not drained, and one that is stopped is judged before it
+# starts.
 - name: Restart the billet node after non-binary inputs change
   ansible.builtin.import_tasks: node-restart.yml
   when:
@@ -949,7 +985,8 @@
       billet_firecracker_links.changed | default(false) or
       (billet_server_environment | default({}) | length > 0 and
        billet_server_environment_install.changed | default(false)) or
-      (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0)
+      (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0) or
+      billet_node_drain_owed_dir | default('') | length > 0
   become: true
 
 - name: Enable and start the billet server
@@ -978,10 +1015,9 @@
     - not ansible_check_mode
   become: true
 
-# A DRAIN STILL ASKED FOR, by this converge or by one that failed before it
-# withdrew the request (a changed configuration writes it before it is
-# installed), is owed by a node that is not up: what its last process left must
-# be a drain before anything starts over it.
+# A DRAIN STILL ASKED FOR OR OWED, by this converge or by one that failed
+# before it proved it, is owed by a node that is not up: what its last process
+# left must be a drain before anything starts over it.
 - name: Inspect whether a drain is still asked of the billet node
   ansible.builtin.stat:
     path: /var/run/billet-node-drain
@@ -1002,7 +1038,16 @@
     - billet_node_should_run
     - not ansible_check_mode
     - billet_node_before_start.stdout | default('') not in ['active', 'activating', 'reloading']
-    - billet_node_start_drain_request.stat.exists | default(true)
+    - billet_node_start_drain_request.stat.exists | default(true) or billet_node_drain_owed_dir | default('') | length > 0
+
+- name: Note that the stopped node's last stop proved it drained
+  ansible.builtin.set_fact:
+    billet_node_drain_proved: true
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+    - billet_node_before_start.stdout | default('') not in ['active', 'activating', 'reloading']
+    - billet_node_start_drain_request.stat.exists | default(true) or billet_node_drain_owed_dir | default('') | length > 0
 
 - name: Admit the billet node's start over its last ending
   ansible.builtin.include_tasks: node-ending.yml
@@ -1095,10 +1140,13 @@
   become: true
   notify: billet unit files changed
 
-# WHERE A NODE THIS OR AN EARLIER CONVERGE RENDERED AWAY KEPT ITS RECORD
-# (account.yml), until its drain is proved.
-- name: Find where a node that may not run here kept its ending record
-  ansible.builtin.include_tasks: node-leaving.yml
+# WHERE A NODE THAT MAY NOT RUN HERE KEEPS ITS RECORD: the installed
+# configuration's while it names the node, the owed drain's once a converge
+# rendered it away (account.yml).
+- name: Resolve the ending record of a node that may not run here
+  ansible.builtin.set_fact:
+    billet_node_unwanted_state_dir: >-
+      {{ billet_previous_node_state_dir | default('', true) or billet_node_drain_owed_dir | default('') }}
   when:
     - not billet_node_should_run
     - not ansible_check_mode
@@ -1107,7 +1155,7 @@
 # adopt what it left, and systemd's account of its stop says nothing of that.
 # One already stopped when the node leaves is judged by what its last process
 # left. The record is read where the installed configuration kept it, or where
-# the marker says once the configuration names no node.
+# the owed drain says once the configuration names no node.
 - name: Prove the stop of a node that may not run here drained
   ansible.builtin.include_tasks: node-ending.yml
   vars:
@@ -1124,15 +1172,26 @@
     - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
       or billet_node_unwanted_state_dir | length > 0
 
-- name: Forget where a node whose drain is proved kept its ending record
-  ansible.builtin.file:
-    path: "{{ billet_node_leaving_path }}"
-    state: absent
-  become: true
+- name: Note that the stop of a node that may not run here proved it drained
+  ansible.builtin.set_fact:
+    billet_node_drain_proved: true
   when:
     - not billet_node_should_run
     - not ansible_check_mode
-    - billet_node_leaving.content is defined
+    - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
+      or billet_node_unwanted_state_dir | length > 0
+
+# THE OWED DRAIN IS DONE WITH ONLY ONCE THIS CONVERGE PROVED IT: by the
+# restart's, the start's, the transaction's or the leaving node's check.
+- name: Forget the drain the billet node owed once this converge proved it
+  ansible.builtin.file:
+    path: "{{ billet_node_drain_owed_path }}"
+    state: absent
+  become: true
+  when:
+    - not ansible_check_mode
+    - billet_node_drain_owed_dir | default('') | length > 0
+    - billet_node_drain_proved | default(false) | bool
 
 # EVERY OPERATION OF THIS CONVERGE THAT ASKED FOR A DRAIN IS DONE (#374): the
 # node is started or stopped as the converge leaves it, any restart was polled to

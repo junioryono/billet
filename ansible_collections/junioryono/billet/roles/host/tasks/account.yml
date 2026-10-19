@@ -479,48 +479,31 @@
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
 
-# A NODE AN EARLIER CONVERGE RENDERED AWAY, WHOSE DRAIN IS NOT PROVED YET
-# (#127), still names its record here. A node that returns at that record is
-# judged by it at its start, as any stopped node is, and the marker is done
-# with; one that returns anywhere else would leave that record, and whatever
-# compute it names, to nobody.
-- name: Read where a node an earlier converge removed kept its ending record
-  ansible.builtin.slurp:
-    src: "{{ billet_node_leaving_path }}"
-  register: billet_node_pending_leaving
-  failed_when: >-
-    billet_node_pending_leaving is failed and
-    'file not found' not in (billet_node_pending_leaving.msg | default('') | lower)
-  become: true
-  when: billet_effective_config.get('node') is mapping
+# A DRAIN THE NODE OWES (#127), from an earlier converge that recorded it and
+# never proved it, names the record that must prove it. A node configured under
+# any other state directory would leave that record, and whatever compute it
+# names, to nobody.
+- name: Read the drain the billet node owes before its configuration changes
+  ansible.builtin.include_tasks: node-drain-owed.yml
 
-- name: Refuse a node that returns elsewhere while the one removed is unproved
+- name: Refuse a node elsewhere than the record whose drain it owes
   ansible.builtin.assert:
     that:
-      - (billet_node_pending_leaving.content | b64decode | trim) == billet_candidate_node_state_dir
+      - billet_node_drain_owed_dir == billet_candidate_node_state_dir
     fail_msg: >-
-      A node this host ran under {{ billet_node_pending_leaving.content | b64decode | trim }}
-      was removed by an earlier converge whose drain was never proved
-      ({{ billet_node_leaving_path }}). Refusing to run a node under
-      {{ billet_candidate_node_state_dir }} beside it: converge the node back
-      under its own state directory so it adopts what it left, or prove that
-      nothing is left and remove {{ billet_node_leaving_path }}.
+      A node this host ran under {{ billet_node_drain_owed_dir }} owes a drain an
+      earlier converge never proved ({{ billet_node_drain_owed_path }}). Refusing
+      to run a node under {{ billet_candidate_node_state_dir }} beside it:
+      converge the node back under its own state directory, where its drain is
+      judged, or prove that nothing is left and remove
+      {{ billet_node_drain_owed_path }}.
   when:
     - billet_effective_config.get('node') is mapping
-    - billet_node_pending_leaving.content is defined
-
-- name: Forget a removed node's record once the node returns to it
-  ansible.builtin.file:
-    path: "{{ billet_node_leaving_path }}"
-    state: absent
-  become: true
-  when:
-    - billet_effective_config.get('node') is mapping
-    - billet_node_pending_leaving.content is defined
-    - not ansible_check_mode
+    - billet_node_drain_owed_dir | length > 0
 
 # A CHANGED CONFIGURATION'S DRAIN IS ASKED FOR BEFORE IT IS INSTALLED (#374,
-# #127): the request outlives a converge that fails after the install, and the
+# #127): the request makes the running node's next stop a drain, and the owed
+# drain outlives a converge that fails after the install, which the
 # configuration does not, since the next converge finds it unchanged. A
 # rendering previewed in check mode says whether it changes.
 - name: Preview whether this converge changes the billet configuration
@@ -545,22 +528,27 @@
     - not billet_binary_upgrade | default(false)
     - billet_config_preview.changed | default(false)
 
-# A NODE THIS CONVERGE RENDERS AWAY KEEPS ITS RECORD'S PATH (#127): its stop
-# must be proved drained (services.yml), and once the configuration no longer
-# names a node only this says where the record is, for this converge and for
-# any retry after one that failed before the proof. Removed once it is proved.
-- name: Remember where a node this converge removes keeps its ending record
+# A NODE THIS CONVERGE CHANGES OR RENDERS AWAY OWES ITS DRAIN, recorded where
+# the record is before the configuration changes: once it names no node, only
+# this says where that is.
+- name: Record the drain the billet node owes before its configuration changes
   ansible.builtin.copy:
     content: "{{ billet_previous_node_state_dir }}\n"
-    dest: "{{ billet_node_leaving_path }}"
+    dest: "{{ billet_node_drain_owed_path }}"
     owner: root
     group: root
     mode: "0600"
+  register: billet_node_drain_owed_write
   become: true
   when:
     - billet_previous_config.get('node') is mapping
-    - billet_effective_config.get('node') is not mapping
+    - billet_effective_config.get('node') is not mapping or billet_config_preview.changed | default(false)
     - not ansible_check_mode
+
+- name: Note the record whose drain this converge owes
+  ansible.builtin.set_fact:
+    billet_node_drain_owed_dir: "{{ billet_previous_node_state_dir }}"
+  when: billet_node_drain_owed_write is not skipped
 
 - name: Render billet configuration
   vars:

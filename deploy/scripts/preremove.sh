@@ -97,18 +97,17 @@ if [ -d /run/systemd/system ]; then
         check_node_ending
     fi
 
-    # A NODE THE HOST ROLE RENDERED AWAY whose drain it never proved names its
-    # record in /etc/billet/node-leaving, which the configuration no longer
-    # does; that record is judged too, and a marker that cannot be read
-    # refuses.
-    if [ -e /etc/billet/node-leaving ]; then
-        leaving=$(cat /etc/billet/node-leaving) || leaving=""
-        if [ -z "${leaving}" ]; then
-            echo "billet: /etc/billet/node-leaving names no node state directory. Refusing to remove the" >&2
-            echo "        package while a node the host role removed may have left guests running." >&2
+    # A DRAIN THE HOST ROLE OWES AND NEVER PROVED names its record in
+    # /etc/billet/node-drain-owed, which the configuration may no longer name;
+    # that record is judged too, and an owed drain naming no record refuses.
+    if [ -e /etc/billet/node-drain-owed ]; then
+        owed=$(cat /etc/billet/node-drain-owed) || owed=""
+        if [ -z "${owed}" ]; then
+            echo "billet: /etc/billet/node-drain-owed names no node state directory. Refusing to remove the" >&2
+            echo "        package while a node drain the host role owes may have left guests running." >&2
             exit 1
         fi
-        check_node_ending --state-dir "${leaving}"
+        check_node_ending --state-dir "${owed}"
     fi
 
     if systemctl is-active --quiet billet-server 2>/dev/null; then

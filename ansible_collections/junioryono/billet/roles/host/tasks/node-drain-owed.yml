@@ -1,0 +1,35 @@
+---
+# THE DRAIN THE NODE OWES (#127). A drain a converge needs (a changed
+# configuration, a node rendered away, a transaction's stop) is recorded here,
+# naming the node state directory whose record must prove it, before anything
+# that needs it changes the host, and is removed only by a converge that proved
+# it. It is outside /run, so a converge that fails, and a reboot, leave it: a
+# reboot ends a host-run provider's compute, which the record's judgement
+# already accounts for, and ends nothing a cloud provider runs. An owed drain
+# that is not there is none; one that cannot be read, or names no record,
+# refuses.
+#
+# Output: billet_node_drain_owed_dir, empty when no drain is owed.
+
+- name: Read the drain the billet node owes
+  ansible.builtin.slurp:
+    src: "{{ billet_node_drain_owed_path }}"
+  register: billet_node_drain_owed
+  failed_when: >-
+    billet_node_drain_owed is failed and
+    'file not found' not in (billet_node_drain_owed.msg | default('') | lower)
+  become: "{{ billet_ending_become | default(true) | bool }}"
+
+- name: Note the record whose drain the billet node owes
+  ansible.builtin.set_fact:
+    billet_node_drain_owed_dir: >-
+      {{ (billet_node_drain_owed.content | b64decode | trim) if billet_node_drain_owed.content is defined else '' }}
+
+- name: Refuse an owed drain that names no record
+  ansible.builtin.assert:
+    that: billet_node_drain_owed.content is not defined or billet_node_drain_owed_dir | length > 0
+    fail_msg: >-
+      {{ billet_node_drain_owed_path }} says a node drain is owed but names no
+      node state directory, so the record that must prove it cannot be found.
+      The host is left as it is; once whatever the node left is known to be
+      gone, remove {{ billet_node_drain_owed_path }} and converge again.

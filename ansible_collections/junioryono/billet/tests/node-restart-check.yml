@@ -296,41 +296,67 @@
         stops: 0
         starts: 0
         message: [cannot read, invocation]
-      # WHERE A LEAVING NODE'S RECORD IS: the installed configuration's while
-      # it names the node, the marker once it does not, none with neither, and
-      # a marker that cannot be read refuses.
-      - name: leaving-by-the-installed-configuration
-        leaving: {previous: /var/lib/billet/node-a, marker: /var/lib/billet/node-b}
+      # THE DRAIN THE NODE OWES: the record an earlier converge recorded,
+      # none when nothing is recorded, and a record that names nothing or
+      # cannot be read refuses.
+      - name: owed-drain-recorded
+        owed_file: {record: /srv/node-state}
         before: "{{ billet_gate_running }}"
         after: [{ActiveState: active, SubState: running, MainPID: "100"}]
         succeeds: true
         stops: 0
         starts: 0
-        resolves: /var/lib/billet/node-a
-      - name: leaving-by-the-marker
-        leaving: {marker: /var/lib/billet/node-b}
-        before: "{{ billet_gate_running }}"
-        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
-        succeeds: true
-        stops: 0
-        starts: 0
-        resolves: /var/lib/billet/node-b
-      - name: leaving-with-neither
-        leaving: {}
+        resolves: /srv/node-state
+      - name: owed-drain-none
+        owed_file: {}
         before: "{{ billet_gate_running }}"
         after: [{ActiveState: active, SubState: running, MainPID: "100"}]
         succeeds: true
         stops: 0
         starts: 0
         resolves: ""
-      - name: leaving-marker-unreadable
-        leaving: {unreadable: true}
+      - name: owed-drain-naming-nothing
+        owed_file: {record: ""}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: false
+        stops: 0
+        starts: 0
+        message: [names no node state directory]
+      - name: owed-drain-unreadable
+        owed_file: {unreadable: true}
         before: "{{ billet_gate_running }}"
         after: [{ActiveState: active, SubState: running, MainPID: "100"}]
         succeeds: false
         stops: 0
         starts: 0
         resolves: unresolved
+        message: [is a directory]
+      # A DRAIN AN EARLIER CONVERGE OWES makes the restart's stop a drain, and
+      # a stopped node's start wait on one.
+      - name: owed-drain-on-a-running-node
+        wait: 30
+        owed: /srv/node-state
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      - name: owed-drain-on-a-stopped-handoff
+        owed: /srv/node-state
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0", InvocationID: ""}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "300"}
+        ending:
+          check: {fixture: check-stopped-unproved, rc: 2}
+        succeeds: false
+        stops: 0
+        starts: 0
+        endings: ["{{ billet_gate_check_stopped }}"]
+        message: [had no process to stop, never adopted]
       # A MEMBER THE PARSER CANNOT READ, AND AN EXIT THAT DOES NOT MATCH THE
       # OUTCOME, end the restart with the node stopped.
       - name: answer-with-a-surprise

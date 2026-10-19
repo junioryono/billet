@@ -19,25 +19,28 @@
     billet_gate_restart_failure: ""
     billet_gate_restart_failed: false
 
-# THE MARKER a leaving case stands for: the path a converge that rendered the
-# node away wrote, absent, or something that cannot be read as one.
-- name: Leave the marker {{ billet_gate_restart_case.name }} stands for
+# THE OWED DRAIN an owed case stands for: a record an earlier converge
+# recorded, absent, empty, or something that cannot be read as one.
+- name: Leave the owed drain {{ billet_gate_restart_case.name }} stands for
   ansible.builtin.copy:
-    dest: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.leaving"
+    dest: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.owed"
     mode: "0600"
-    content: "{{ billet_gate_restart_case.leaving.marker }}\n"
-  when: billet_gate_restart_case.leaving.marker | default('') | length > 0
+    content: "{{ billet_gate_restart_case.owed_file.record }}\n"
+  when: billet_gate_restart_case.owed_file.record is defined
 
-- name: Leave an unreadable marker {{ billet_gate_restart_case.name }} stands for
+- name: Leave an unreadable owed drain {{ billet_gate_restart_case.name }} stands for
   ansible.builtin.file:
-    path: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.leaving"
+    path: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.owed"
     state: directory
     mode: "0700"
-  when: billet_gate_restart_case.leaving.unreadable | default(false)
+  when: billet_gate_restart_case.owed_file.unreadable | default(false)
 
-- name: Forget the preceding case's resolved record
+# A FACT, so it is set as account.yml sets it, and outranks the preceding
+# case's: unresolved until an owed case reads it.
+- name: Set the drain {{ billet_gate_restart_case.name }} owes
   ansible.builtin.set_fact:
-    billet_node_unwanted_state_dir: unresolved
+    billet_node_drain_owed_dir: >-
+      {{ 'unresolved' if billet_gate_restart_case.owed_file is defined else billet_gate_restart_case.owed | default('') }}
 
 # THE DRAIN REQUEST a case stands for, left by this converge or an earlier one.
 - name: Leave the drain request {{ billet_gate_restart_case.name }} stands for
@@ -72,7 +75,7 @@
       when:
         - billet_gate_restart_case.with is not defined
         - billet_gate_restart_case.direct is not defined
-        - billet_gate_restart_case.leaving is not defined
+        - billet_gate_restart_case.owed_file is not defined
 
     # A CASE THAT NAMES ITS EXECUTABLES, in the order they are tried, each
     # `exe` or `exe:config`.
@@ -101,15 +104,14 @@
         billet_ending_state_dir: "{{ billet_gate_restart_case.direct.state_dir | default('') }}"
       when: billet_gate_restart_case.direct is defined
 
-    # WHERE A LEAVING NODE'S RECORD IS, as services.yml asks it.
-    - name: Find a leaving node's record
+    # THE DRAIN THE NODE OWES, as account.yml reads it.
+    - name: Read the drain the node owes
       ansible.builtin.include_role:
         name: junioryono.billet.host
-        tasks_from: node-leaving
+        tasks_from: node-drain-owed
       vars:
-        billet_node_leaving_path: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.leaving"
-        billet_previous_node_state_dir: "{{ billet_gate_restart_case.leaving.previous | default('') }}"
-      when: billet_gate_restart_case.leaving is defined
+        billet_node_drain_owed_path: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.owed"
+      when: billet_gate_restart_case.owed_file is defined
   rescue:
     - name: Record the refusal
       ansible.builtin.set_fact:
@@ -141,7 +143,7 @@
       - billet_gate_restart_jobs == billet_gate_restart_want_jobs
       - billet_gate_restart_case.endings is not defined or billet_gate_restart_endings == billet_gate_restart_case.endings
       - billet_gate_restart_case.asked is not defined or billet_gate_restart_asked == billet_gate_restart_case.asked
-      - billet_gate_restart_case.resolves is not defined or billet_node_unwanted_state_dir == billet_gate_restart_case.resolves
+      - billet_gate_restart_case.resolves is not defined or billet_node_drain_owed_dir == billet_gate_restart_case.resolves
       - billet_gate_restart_case.calls is not defined or billet_gate_restart_state.calls | length == billet_gate_restart_case.calls
       - >-
         billet_gate_restart_case.polls is not defined or
@@ -155,5 +157,5 @@
     fail_msg: >-
       {{ billet_gate_restart_case.name }}: failed={{ billet_gate_restart_failed }}
       message={{ billet_gate_restart_failure }} jobs={{ billet_gate_restart_jobs }}
-      endings={{ billet_gate_restart_asked }} resolved={{ billet_node_unwanted_state_dir }} polls={{ billet_gate_restart_state.polls }}
+      endings={{ billet_gate_restart_asked }} owed={{ billet_node_drain_owed_dir }} polls={{ billet_gate_restart_state.polls }}
       stop_polls={{ billet_gate_restart_state.stop_polls }}
