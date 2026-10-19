@@ -373,6 +373,69 @@ func TestTheDCOCheckRefusesAnIncompleteHistory(t *testing.T) {
 	})
 }
 
+// THE REPAIR IT PRINTS WORKS, and keeps the branch's contents. A branch with an
+// unsigned commit and an unsigned merge of main, behind a main that has moved
+// on, is squashed the way the refusal says, and then passes with its tree intact
+// and none of main's newer work undone.
+func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
+	t.Parallel()
+
+	repo := newRepo(t)
+	asAda := []string{"-c", "user.name=Ada Contributor", "-c", "user.email=ada@example.invalid"}
+	write := func(name, body string) {
+		t.Helper()
+
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fixtureGit(t, repo, "add", name)
+	}
+
+	write("base", "base\n")
+	fixtureGit(t, repo, "commit", "--quiet", "-m", "base")
+	fixtureGit(t, repo, "checkout", "--quiet", "-b", "pr")
+	write("feature", "ada's work\n")
+	fixtureGit(t, repo, append(asAda, "commit", "--quiet", "-m", "unsigned work")...)
+	fixtureGit(t, repo, "checkout", "--quiet", "main")
+	write("main-one", "main moved\n")
+	fixtureGit(t, repo, "commit", "--quiet", "-m", "main moved")
+	fixtureGit(t, repo, "checkout", "--quiet", "pr")
+	fixtureGit(t, repo, append(asAda, "merge", "--quiet", "--no-ff", "--no-edit", "main")...)
+	fixtureGit(t, repo, "checkout", "--quiet", "main")
+	write("main-two", "main moved again\n")
+	fixtureGit(t, repo, "commit", "--quiet", "-m", "main moved again")
+
+	ref := func() string {
+		t.Helper()
+
+		fixtureGit(t, repo, "checkout", "--quiet", "--detach", "main")
+		fixtureGit(t, repo, "merge", "--quiet", "--no-ff", "--no-edit", "pr")
+
+		return repo
+	}
+
+	if out, code := runDCO(t, ref(), "pull_request", "ada", dcoOwner); code != 1 {
+		t.Fatalf("the unrepaired branch: dco.sh exited %d, want 1\n%s", code, out)
+	}
+
+	// THE PRINTED STEPS, with main standing in for origin/main.
+	fixtureGit(t, repo, "checkout", "--quiet", "pr")
+	tree := strings.TrimSpace(gitOut(t, repo, "rev-parse", "pr^{tree}"))
+	base := strings.TrimSpace(gitOut(t, repo, "merge-base", "HEAD", "main"))
+	fixtureGit(t, repo, "reset", "--quiet", "--soft", base)
+	fixtureGit(t, repo, append(asAda, "commit", "--quiet", "-s", "-m", "ada's work, signed")...)
+
+	if got := strings.TrimSpace(gitOut(t, repo, "rev-parse", "pr^{tree}")); got != tree {
+		t.Fatalf("the repair changed the branch's tree: %s, was %s", got, tree)
+	}
+	if out, code := runDCO(t, ref(), "pull_request", "ada", dcoOwner); code != 0 {
+		t.Fatalf("the repaired branch: dco.sh exited %d, want 0\n%s", code, out)
+	}
+	if out := gitOut(t, repo, "diff", "--name-only", "main", "HEAD"); out != "feature\n" {
+		t.Errorf("merging the repaired branch changes %q against main, want only ada's feature", out)
+	}
+}
+
 // THE JOB CHECKS OUT EVERY COMMIT. A depth that is not a literal 0 leaves the
 // range short (a bare 0 in an expression is falsy, so `&& 0 || 1` gives 1).
 func TestTheDCOJobChecksOutTheWholeHistory(t *testing.T) {
@@ -430,6 +493,13 @@ func mergeMainInto(t *testing.T, repo string, opts ...string) {
 	args := append([]string{"-c", "user.name=Ada Contributor", "-c", "user.email=ada@example.invalid",
 		"merge", "--quiet", "--no-ff", "--no-edit"}, opts...)
 	fixtureGit(t, repo, append(args, "main")...)
+
+	// THE PREMISE, CHECKED: the merge is Ada's, so the sign-off it is asked for
+	// is hers, and --signoff wrote it or did not as opts says.
+	if got := strings.TrimSpace(gitOut(t, repo, "show", "-s", "--format=%an <%ae>|%cn <%ce>", "HEAD")); got != ada+"|"+ada {
+		t.Fatalf("the merge's author and committer are %q, want Ada for both", got)
+	}
+
 	authored(t, repo, ada, "after the merge", adaSign)
 }
 

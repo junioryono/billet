@@ -120,9 +120,14 @@ done
 if [[ $missing -ne 0 ]]; then
 	cat <<'EOF'
 dco: sign off each commit to certify you wrote it or may contribute it
-     (https://developercertificate.org). Commit with `git commit -s`; for the
-     commits already on this branch, which is the one rewrite billet asks for:
-       git rebase --signoff origin/main && git push --force-with-lease
+     (https://developercertificate.org). Commit with `git commit -s` and merge
+     main with `git merge --signoff`; GitHub's "Update branch" button and its
+     web conflict editor make unsigned merges. To repair this branch, which is
+     the one rewrite billet asks for, squash it into one signed-off commit (it
+     keeps your branch's contents exactly, merges included):
+       git fetch origin
+       git reset --soft "$(git merge-base HEAD origin/main)"
+       git commit -s && git push --force-with-lease
 EOF
 	exit 1
 fi
