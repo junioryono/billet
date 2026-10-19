@@ -54,7 +54,7 @@ m.AUDITED = "audited"
 m.EMBEDDED = [
     ("a 1.0.0", "emb", "lib/emb.js", "https://e/LICENSE", "THE END."),
     ("devonly 9.9.9", "multi", "the runtime",
-     [("https://e/LICENSE", None, "line two"), ("https://e/BSD", "Redistribution", None)], None),
+     [("https://e/LICENSE", None, "line two"), "A statement.", ("https://e/BSD", "Redistribution", None)], None),
 ]
 out = {"render": m.render("1.2.3", "audited", fetch)}
 
@@ -108,7 +108,7 @@ func TestTheHookNoticesGeneratorReproducesEveryLicenseAndRefusesWhatItCannotVouc
 		"\n--- LICENSE.md ---\n\nlicense of c\n",
 		"emb, embedded in a 1.0.0\nIn: lib/emb.js\nSource: https://e/LICENSE\n\nembedded license\nline two\nTHE END.\n",
 		"multi, embedded in devonly 9.9.9\nIn: the runtime\nSource: https://e/LICENSE, https://e/BSD\n\n" +
-			"embedded license\nline two\n\nRedistribution and use is permitted.\n",
+			"embedded license\nline two\n\nA statement.\n\nRedistribution and use is permitted.\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the notice lacks %q:\n%s", want, got)

@@ -40,8 +40,8 @@ AUDITED = "b38d2be4e9695eb6f143ec3b4dd4a4b800999adf9790c570dcd07dc50d9c4017"
 
 # (package that carries the copy, what was taken, where, license URL at the credited
 # revision, and the line its own license ends on when the file holds more). An entry
-# whose license is assembled from several texts names a list of (URL, the line it
-# starts on, the line it ends on) instead. The carrier is any package the lockfile
+# whose license is assembled from several texts names a list instead, each part a
+# (URL, the line it starts on, the line it ends on) or a statement written here. The carrier is any package the lockfile
 # resolves, development packages included, because the bundler writes its own
 # runtime into the bundle.
 EMBEDDED = [
@@ -89,6 +89,16 @@ EMBEDDED = [
        None, "BSD 3-Clause License instead."),
       ("https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/BSD-3-Clause.txt",
        "Redistribution and use", None)],
+     None),
+    ("undici 5.29.0", "W3C specifications",
+     "the algorithm steps of the File API (lib/fetch/file.js, lib/fileapi), Service Workers (lib/cache) and Referrer Policy (lib/fetch/util.js) quoted in its comments",
+     ["This software includes material copied from or derived from File API "
+      "(https://w3c.github.io/FileAPI/), Service Workers (https://w3c.github.io/ServiceWorker/) "
+      "and Referrer Policy (https://w3c.github.io/webappsec-referrer-policy/). Each states, "
+      "as read on 2026-10-18: Copyright © 2026 World Wide Web Consortium. W3C® liability, "
+      "trademark and permissive document license rules apply.",
+      ("https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/W3C-20150513.txt",
+       None, None)],
      None),
 ]
 
@@ -162,8 +172,8 @@ def render(version, sha256, fetch):
         if carrier not in resolved:
             raise ValueError(f"EMBEDDED names {carrier}, which the lockfile does not resolve")
         parts = source if isinstance(source, list) else [(source, None, until)]
-        urls = ", ".join(url for url, _, _ in parts)
-        body = "\n\n".join(text(fetch(url), last, first) for url, first, last in parts)
+        urls = ", ".join(p[0] for p in parts if not isinstance(p, str))
+        body = "\n\n".join(p if isinstance(p, str) else text(fetch(p[0]), p[2], p[1]) for p in parts)
         sections.append(f"{name}, embedded in {carrier}\nIn: {where}\nSource: {urls}\n\n{body}")
 
     head = [
