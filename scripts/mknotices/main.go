@@ -227,7 +227,7 @@ func (w *writer) modules(modules []Module) error {
 		// directory or any above it, up to the module root, cannot be redistributed
 		// on any terms this file could reproduce, so it is refused rather than
 		// listed with nothing under it.
-		if len(root) == 0 {
+		if !slices.ContainsFunc(root, isGrant) {
 			if pkg, ok := uncovered(m.Dir, m.Packages, nested); ok {
 				return fmt.Errorf("%s, linked into billet, has no license file covering %s", m.Path, pkg)
 			}

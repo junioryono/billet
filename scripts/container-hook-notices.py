@@ -51,6 +51,9 @@ EMBEDDED = [
      "deps/streamsearch/sbmh.js, based on Hongli Lai's streaming Boyer-Moore-Horspool",
      "https://raw.githubusercontent.com/FooBarWidget/boyer-moore-horspool/10e25ed66f7184a982fbe9239a8f46ac4969643c/StreamBoyerMooreHorspool.h",
      " */"),
+    ("shlex 3.0.0", "CPython",
+     "the Shlexer and quote(), which its comment calls a port of CPython's shlex module, with that module's documentation (Python's license, as of v3.6.5)",
+     "https://raw.githubusercontent.com/python/cpython/f59c0932b4e160f279fb98de4cdad2f58269e0a5/LICENSE", None),
     ("undici 5.29.0", "llhttp 8.1.0",
      "lib/llhttp/llhttp-wasm.js and llhttp_simd-wasm.js, its WebAssembly build",
      "https://raw.githubusercontent.com/nodejs/llhttp/85dd446419966cafb5a7fdd5031e3113a0768e65/LICENSE-MIT", None),
@@ -64,7 +67,7 @@ EMBEDDED = [
      "isBlobLike in lib/core/util.js, based on fetch-blob's index.js at 8ab587d3",
      "https://raw.githubusercontent.com/node-fetch/fetch-blob/8ab587d34080de94140b54f07168451e7d0b655e/LICENSE", None),
     ("undici 5.29.0", "Node.js",
-     "the token and header regular expressions lib/core/request.js lifted from Node's lib/_http_common.js (Node's own license, as of v20.0.0)",
+     "the token and header regular expressions lib/core/request.js lifted from Node's lib/_http_common.js, and the structuredClone fallback in lib/fetch/constants.js reproduced from Node's lib/internal/structured_clone.js at b27ae24d (Node's own license, as of v20.0.0)",
      "https://raw.githubusercontent.com/nodejs/node/e7618fb5a5fc25d76b6474e2a6607f04fd6f10e0/LICENSE",
      "maintained libraries."),
 ]
@@ -136,6 +139,7 @@ def render(version, sha256, fetch):
     head = [
         "Third-party notices for the container hook's bundle",
         f"Container hook version: {version}",
+        f"Container hook bundle SHA-256: {sha256}",
         f"/usr/local/lib/billet/container-hook/upstream.js is the index.js of actions/runner-container-hooks v{version} (the release asset internal/guestassets/container-hook.pin names by digest). @vercel/ncc built it as one file from that project's packages/docker and packages/hooklib, whose license is the LICENSE beside this file, and from the npm packages below, at the versions the tag's packages/docker/package-lock.json resolves. Each is reproduced as the license files in its npm tarball, read from a tarball that matched the lockfile's integrity hash, followed by the licenses of code those packages took from other projects. scripts/container-hook-notices.py writes this file.",
         "The copyright comments the bundle keeps inline stay in upstream.js, which is installed unmodified.",
     ]

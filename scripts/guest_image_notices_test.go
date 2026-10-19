@@ -153,13 +153,24 @@ func TestTheHookNoticesNameThePinnedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "\nContainer hook version: " + fields[0] + "\n"; !strings.Contains(string(notice), want) {
-		t.Fatalf("container-hook.NOTICE does not say %q; run scripts/container-hook-notices.py", strings.TrimSpace(want))
+	for _, want := range []string{
+		"\nContainer hook version: " + fields[0] + "\n",
+		"\nContainer hook bundle SHA-256: " + fields[1] + "\n",
+	} {
+		if !strings.Contains(string(notice), want) {
+			t.Fatalf("container-hook.NOTICE does not say %q; run scripts/container-hook-notices.py", strings.TrimSpace(want))
+		}
+	}
+
+	// THE BUNDLE THE BUILD INSTALLS IS THE ONE THAT WAS READ. A checksum-only pin
+	// change would otherwise install a different index.js beside the old notices.
+	script := readScriptFile(t, "container-hook-notices.py")
+	if want := "\nAUDITED = \"" + fields[1] + "\"\n"; !strings.Contains(script, want) {
+		t.Fatalf("container-hook-notices.py was not audited against the pinned bundle %s; read the new bundle and update AUDITED and EMBEDDED", fields[1])
 	}
 
 	// Every component the script's EMBEDDED table names has its section, so a table
 	// entry added without regenerating the file is caught here.
-	script := readScriptFile(t, "container-hook-notices.py")
 	entries := regexp.MustCompile(`\("([^"]+ [0-9.]+)", "([^"]+)",\n`).FindAllStringSubmatch(script, -1)
 	if len(entries) == 0 {
 		t.Fatal("found no EMBEDDED entry in container-hook-notices.py, so this test proves nothing")
