@@ -165,9 +165,10 @@ fi
 # checksum is only true of its version. The zip carries one file, index.js, which
 # lands as upstream.js beside the wrapper the runner is pointed at.
 #
-# ITS MIT LICENSE LANDS BESIDE IT, because the image redistributes the hook and the
-# zip does not carry the license. internal/guestassets/container-hook.LICENSE is
-# that project's LICENSE at the pinned tag; a pin bump copies it again.
+# ITS NOTICES LAND BESIDE IT, because the image redistributes the hook and the zip
+# carries none. internal/guestassets/container-hook.LICENSE is that project's
+# LICENSE at the pinned tag, and container-hook.NOTICE reproduces the licenses of
+# the npm packages the bundle was built from; a pin bump rewrites both.
 install_container_hook() {
 	local rootfs=$1
 	local pin="$SCRIPT_DIR/../internal/guestassets/container-hook.pin"
@@ -190,6 +191,8 @@ install_container_hook() {
 	chmod 0644 "$rootfs/usr/local/lib/billet/container-hook/upstream.js"
 	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/container-hook.LICENSE" \
 		"$rootfs/usr/local/lib/billet/container-hook/LICENSE"
+	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/container-hook.NOTICE" \
+		"$rootfs/usr/local/lib/billet/container-hook/THIRD_PARTY_NOTICES"
 	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/container-hook.js" \
 		"$rootfs/usr/local/lib/billet/container-hook/index.js"
 	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"

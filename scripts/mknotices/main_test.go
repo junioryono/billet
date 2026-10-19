@@ -116,6 +116,55 @@ func TestAModuleWithNoLicenseFileIsRefused(t *testing.T) {
 	}
 }
 
+// A LICENSE BESIDE COPIED-IN CODE COVERS WHAT IS LINKED FROM BELOW IT, so a module's
+// notices are its root's and every one between the root and a linked package; one
+// beside code billet does not link is not billet's to reproduce.
+func TestALicenseAboveALinkedPackageIsIncludedAndOneBesideUnlinkedCodeIsNot(t *testing.T) {
+	dir := t.TempDir()
+	for p, body := range map[string]string{
+		"LICENSE":                          "root license\n",
+		"internal/upstream/LICENSE":        "upstream license\n",
+		"internal/upstream/pkg/pkg.go":     "package pkg\n",
+		"internal/upstream/pkg/NOTICE":     "package notice\n",
+		"internal/unlinked/LICENSE":        "unlinked license\n",
+		"internal/unlinked/other/other.go": "package other\n",
+	} {
+		full := filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var b bytes.Buffer
+	w := &writer{b: &b, first: map[string]string{}}
+	err := w.modules([]Module{{Path: "example.com/m", Dir: dir, Packages: []string{dir, filepath.Join(dir, "internal", "upstream", "pkg")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := b.String()
+	for _, want := range []string{
+		"--- LICENSE ---\n\nroot license\n",
+		"--- internal/upstream/LICENSE ---\n\nupstream license\n",
+		"--- internal/upstream/pkg/NOTICE ---\n\npackage notice\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the notices lack %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "unlinked license") {
+		t.Errorf("the notices carry a license beside code billet does not link:\n%s", got)
+	}
+
+	if _, err := NestedLicenseFiles(dir, []string{filepath.Dir(dir)}); err == nil ||
+		!strings.Contains(err.Error(), "is not under its module root") {
+		t.Errorf("a package outside its module root gave %v, want it refused", err)
+	}
+}
+
 func TestAnIdenticalTextIsPrintedOnceAndADifferentOneWhole(t *testing.T) {
 	var b bytes.Buffer
 	w := &writer{b: &b, first: map[string]string{}}
@@ -135,6 +184,20 @@ func TestAnIdenticalTextIsPrintedOnceAndADifferentOneWhole(t *testing.T) {
 	}
 	if !strings.Contains(got, "Copyright c") {
 		t.Errorf("a different text was folded:\n%s", got)
+	}
+}
+
+func TestALicenseWithCRLFEndingsIsWrittenWithLF(t *testing.T) {
+	var b bytes.Buffer
+	w := &writer{b: &b, first: map[string]string{}}
+	w.section("a", nil)
+	w.file("LICENSE", []byte("line one\r\nline two\r\n"))
+
+	if strings.Contains(b.String(), "\r") {
+		t.Fatalf("the notices carry a carriage return, which git's normalization would strip: %q", b.String())
+	}
+	if !strings.Contains(b.String(), "line one\nline two\n") {
+		t.Fatalf("the license text was not kept: %q", b.String())
 	}
 }
 

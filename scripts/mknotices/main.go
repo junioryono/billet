@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -61,6 +62,8 @@ type Copy struct {
 type Module struct {
 	Path string
 	Dir  string
+	// Packages are the directories of the module's packages that are linked.
+	Packages []string
 }
 
 // writer renders sections and files, printing each distinct license text once.
@@ -102,14 +105,24 @@ func Generate(ctx context.Context, root string) ([]byte, error) {
 		return nil, err
 	}
 
-	modules, err := LinkedModules(ctx, root)
+	modules, std, err := LinkedModules(ctx, root)
 	if err != nil {
 		return nil, err
 	}
 
-	goLicense, err := goRootLicense(ctx, root)
+	goroot, err := goRoot(ctx, root)
 	if err != nil {
 		return nil, err
+	}
+	goLicense, err := os.ReadFile(filepath.Join(goroot, "LICENSE"))
+	if err != nil {
+		return nil, fmt.Errorf("the Go toolchain's license: %w", err)
+	}
+	// The standard library vendors golang.org/x packages under src/vendor, each
+	// with its own LICENSE and PATENTS, and links them like any other package.
+	goNested, err := NestedLicenseFiles(filepath.Join(goroot, "src"), std)
+	if err != nil {
+		return nil, fmt.Errorf("the Go standard library: %w", err)
 	}
 
 	var b bytes.Buffer
@@ -126,6 +139,13 @@ func Generate(ctx context.Context, root string) ([]byte, error) {
 		"Ships in: the billet binary",
 	})
 	w.file("LICENSE", goLicense)
+	for _, f := range goNested {
+		text, err := os.ReadFile(filepath.Join(goroot, "src", f))
+		if err != nil {
+			return nil, fmt.Errorf("the Go standard library: %w", err)
+		}
+		w.file("src/"+f, text)
+	}
 
 	if err := w.copies(root, copies); err != nil {
 		return nil, err
@@ -148,7 +168,10 @@ func (w *writer) section(name string, lines []string) {
 }
 
 func (w *writer) file(name string, text []byte) {
-	body := string(bytes.TrimRight(text, "\n"))
+	// LF ONLY. Some modules ship a license with CRLF endings, git normalizes the
+	// committed file to LF, and a regenerated copy that kept the CR would never
+	// equal it.
+	body := strings.TrimRight(strings.ReplaceAll(string(text), "\r\n", "\n"), "\n")
 	if where, ok := w.first[body]; ok {
 		w.b.WriteString("\n--- " + name + ": the same text as " + where + " above ---\n")
 
@@ -189,17 +212,23 @@ func (w *writer) copies(root string, copies []Copy) error {
 
 // modules writes one section per linked module, with its license files.
 func (w *writer) modules(modules []Module) error {
-	for _, m := range modules {
-		files, err := LicenseFiles(m.Dir)
+	for i := range modules {
+		m := &modules[i]
+		root, err := LicenseFiles(m.Dir)
 		if err != nil {
 			return fmt.Errorf("%s: %w", m.Path, err)
 		}
 		// NO LICENSE FILE IS NOT "NO LICENSE". A module that ships none cannot be
 		// redistributed on any terms this file could reproduce, so it is refused
 		// rather than listed with nothing under it.
-		if len(files) == 0 {
+		if len(root) == 0 {
 			return fmt.Errorf("%s, linked into billet, has no license file in %s", m.Path, m.Dir)
 		}
+		nested, err := NestedLicenseFiles(m.Dir, m.Packages)
+		if err != nil {
+			return fmt.Errorf("%s: %w", m.Path, err)
+		}
+		files := slices.Concat(root, nested)
 		w.section(m.Path, []string{"Go module", "Ships in: the billet binary"})
 		for _, f := range files {
 			text, err := os.ReadFile(filepath.Join(m.Dir, f))
@@ -241,25 +270,30 @@ func ReadCopies(root string) ([]Copy, error) {
 }
 
 // LinkedModules lists every non-main module `./cmd/billet` links on any release
-// target, sorted by path.
-func LinkedModules(ctx context.Context, root string) ([]Module, error) {
+// target, sorted by path, and the directories of the standard library packages it
+// links.
+func LinkedModules(ctx context.Context, root string) ([]Module, []string, error) {
 	seen := map[string]string{}
+	packages := map[string]map[string]bool{}
+	std := map[string]bool{}
 
 	for _, t := range targets {
-		cmd := exec.CommandContext(ctx, "go", "list", "-deps", "-json=Module", "./cmd/billet")
+		cmd := exec.CommandContext(ctx, "go", "list", "-deps", "-json=Dir,Standard,Module", "./cmd/billet")
 		cmd.Dir = root
 		cmd.Env = append(os.Environ(), "GOOS="+t[0], "GOARCH="+t[1], "CGO_ENABLED=0")
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
 		if err != nil {
-			return nil, fmt.Errorf("go list for %s/%s: %w: %s", t[0], t[1], err, stderr.String())
+			return nil, nil, fmt.Errorf("go list for %s/%s: %w: %s", t[0], t[1], err, stderr.String())
 		}
 
 		dec := json.NewDecoder(bytes.NewReader(out))
 		for {
 			var pkg struct {
-				Module *struct {
+				Dir      string
+				Standard bool
+				Module   *struct {
 					Path string
 					Main bool
 					Dir  string
@@ -270,7 +304,12 @@ func LinkedModules(ctx context.Context, root string) ([]Module, error) {
 				break
 			}
 			if err != nil {
-				return nil, fmt.Errorf("go list for %s/%s: %w", t[0], t[1], err)
+				return nil, nil, fmt.Errorf("go list for %s/%s: %w", t[0], t[1], err)
+			}
+			if pkg.Standard {
+				std[pkg.Dir] = true
+
+				continue
 			}
 			if pkg.Module == nil || pkg.Module.Main {
 				continue
@@ -278,19 +317,34 @@ func LinkedModules(ctx context.Context, root string) ([]Module, error) {
 			// AN EMPTY DIR IS A MODULE THAT IS NOT DOWNLOADED, not one with no
 			// license: a notice cannot be read from nothing.
 			if pkg.Module.Dir == "" {
-				return nil, fmt.Errorf("%s is not in the module cache; run go mod download", pkg.Module.Path)
+				return nil, nil, fmt.Errorf("%s is not in the module cache; run go mod download", pkg.Module.Path)
 			}
 			seen[pkg.Module.Path] = pkg.Module.Dir
+			if packages[pkg.Module.Path] == nil {
+				packages[pkg.Module.Path] = map[string]bool{}
+			}
+			packages[pkg.Module.Path][pkg.Dir] = true
 		}
 	}
 
 	modules := make([]Module, 0, len(seen))
 	for p, d := range seen {
-		modules = append(modules, Module{Path: p, Dir: d})
+		dirs := make([]string, 0, len(packages[p]))
+		for dir := range packages[p] {
+			dirs = append(dirs, dir)
+		}
+		sort.Strings(dirs)
+		modules = append(modules, Module{Path: p, Dir: d, Packages: dirs})
 	}
 	sort.Slice(modules, func(i, j int) bool { return modules[i].Path < modules[j].Path })
 
-	return modules, nil
+	stdDirs := make([]string, 0, len(std))
+	for dir := range std {
+		stdDirs = append(stdDirs, dir)
+	}
+	sort.Strings(stdDirs)
+
+	return modules, stdDirs, nil
 }
 
 // IsLicenseName reports whether a file name is one a project uses for its license,
@@ -327,18 +381,48 @@ func LicenseFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
-func goRootLicense(ctx context.Context, root string) ([]byte, error) {
+// NestedLicenseFiles lists the license files below a module root that cover a
+// linked package: those in the package's own directory and in every directory
+// between it and the root. Each is named relative to the root, sorted.
+//
+// A MODULE ROOT'S LICENSE IS NOT ALWAYS THE WHOLE STORY. A module that copies in
+// another project's code keeps that project's license beside the copy, as
+// prometheus/client_golang does under internal/github.com/golang/gddo, and the
+// copy is linked under that notice, not the root's alone.
+func NestedLicenseFiles(root string, packages []string) ([]string, error) {
+	seen := map[string]bool{}
+	var files []string
+	for _, pkg := range packages {
+		rel, err := filepath.Rel(root, pkg)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("package directory %s is not under its module root %s", pkg, root)
+		}
+		for rel != "." {
+			if !seen[rel] {
+				seen[rel] = true
+				names, err := LicenseFiles(filepath.Join(root, rel))
+				if err != nil {
+					return nil, err
+				}
+				for _, n := range names {
+					files = append(files, filepath.ToSlash(filepath.Join(rel, n)))
+				}
+			}
+			rel = filepath.Dir(rel)
+		}
+	}
+	sort.Strings(files)
+
+	return files, nil
+}
+
+func goRoot(ctx context.Context, root string) (string, error) {
 	cmd := exec.CommandContext(ctx, "go", "env", "GOROOT")
 	cmd.Dir = root
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("go env GOROOT: %w", err)
+		return "", fmt.Errorf("go env GOROOT: %w", err)
 	}
 
-	text, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(out)), "LICENSE"))
-	if err != nil {
-		return nil, fmt.Errorf("the Go toolchain's license: %w", err)
-	}
-
-	return text, nil
+	return strings.TrimSpace(string(out)), nil
 }

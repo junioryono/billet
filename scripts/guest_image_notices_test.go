@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,34 +9,70 @@ import (
 	"testing"
 )
 
+// cutBlock returns the text of gate from the line after the one containing begin
+// through the first line that is exactly end, inclusive.
+func cutBlock(t *testing.T, gate, begin, end string) string {
+	t.Helper()
+
+	_, after, found := strings.Cut(gate, begin)
+	if !found {
+		t.Fatalf("check-guest-image.sh no longer has %q", begin)
+	}
+	_, after, _ = strings.Cut(after, "\n")
+	block, _, closed := strings.Cut(after, "\n"+end+"\n")
+	if !closed {
+		t.Fatalf("check-guest-image.sh has no %q after %q", end, begin)
+	}
+
+	return block + "\n" + end + "\n"
+}
+
 // THE IMAGE REDISTRIBUTES BILLET AND THE CONTAINER HOOK, so the publication gate
-// refuses an image that carries either without its notices. The block is run by
-// bash against a mounted-image fixture, never pattern-matched.
+// refuses an image that carries either without its notices. The block runs under the
+// gate's own shell options, failure accumulator and final verdict, so what is
+// asserted is the exit status that stops a publication, never pattern-matched.
 func TestThePublicationGateRefusesAnImageWithoutItsNotices(t *testing.T) {
 	t.Parallel()
 
 	gate := readScriptFile(t, "check-guest-image.sh")
-	const begin = "# THE IMAGE REDISTRIBUTES BILLET AND THE CONTAINER HOOK"
-	_, after, found := strings.Cut(gate, begin)
-	_, after, _ = strings.Cut(after, "\n")
-	block, _, closed := strings.Cut(after, "\nfi\n")
-	if !found || !closed {
-		t.Fatal("check-guest-image.sh no longer has the notices block")
+	block := cutBlock(t, gate, "# THE IMAGE REDISTRIBUTES BILLET AND THE CONTAINER HOOK", "fi")
+	failDef := "fail() {\n" + cutBlock(t, gate, "\nfail() {", "}")
+	verdict := "if [ \"$FAILED\" -ne 0 ]; then\n" + cutBlock(t, gate, "\nif [ \"$FAILED\" -ne 0 ]; then", "fi")
+	const passDef = `pass() { echo "  ok    $*"; }`
+	if !strings.Contains(gate, "\n"+passDef+"\n") || !strings.Contains(gate, "\nset -euo pipefail\n") ||
+		!strings.Contains(gate, "\nFAILED=0\n") {
+		t.Fatal("check-guest-image.sh no longer defines pass, its shell options or FAILED as this test runs them")
 	}
-	block += "\nfi\n"
 
 	notices := "opt/billet/THIRD_PARTY_NOTICES"
 	license := "usr/local/lib/billet/container-hook/LICENSE"
+	bundled := "usr/local/lib/billet/container-hook/THIRD_PARTY_NOTICES"
+	complete := map[string]string{notices: "notices\n", license: "MIT License\n", bundled: "undici\n"}
+	without := func(path string, body ...string) map[string]string {
+		files := map[string]string{}
+		for p, b := range complete {
+			if p != path {
+				files[p] = b
+			}
+		}
+		if len(body) > 0 {
+			files[path] = body[0]
+		}
+
+		return files
+	}
 
 	for _, tc := range []struct {
-		name    string
-		files   map[string]string
-		verdict string
+		name   string
+		files  map[string]string
+		status int
 	}{
-		{"both present", map[string]string{notices: "notices\n", license: "MIT License\n"}, "PASS"},
-		{"no notices", map[string]string{license: "MIT License\n"}, "FAIL"},
-		{"no hook license", map[string]string{notices: "notices\n"}, "FAIL"},
-		{"an empty hook license", map[string]string{notices: "notices\n", license: ""}, "FAIL"},
+		{"all present", complete, 0},
+		{"no billet notices", without(notices), 1},
+		{"no hook license", without(license), 1},
+		{"no bundled notices", without(bundled), 1},
+		{"an empty hook license", without(license, ""), 1},
+		{"empty bundled notices", without(bundled, ""), 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -51,19 +88,25 @@ func TestThePublicationGateRefusesAnImageWithoutItsNotices(t *testing.T) {
 				}
 			}
 
-			script := "pass() { echo PASS; }\nfail() { echo FAIL; }\nMNT=" + mnt + "\n" + block
+			script := "set -euo pipefail\n" + passDef + "\n" + failDef + "FAILED=0\nMNT=" + mnt + "\n" + block + verdict
 			out, err := exec.CommandContext(t.Context(), "bash", "-c", script).CombinedOutput()
-			if err != nil {
-				t.Fatalf("the block failed to run: %v: %s", err, out)
+			status := 0
+			if exit := (*exec.ExitError)(nil); errors.As(err, &exit) {
+				status = exit.ExitCode()
+			} else if err != nil {
+				t.Fatalf("the block did not run: %v: %s", err, out)
 			}
-			if got := strings.TrimSpace(string(out)); got != tc.verdict {
-				t.Fatalf("the gate said %q, want %s", got, tc.verdict)
+			if status != tc.status {
+				t.Fatalf("the gate exited %d, want %d:\n%s", status, tc.status, out)
+			}
+			if tc.status != 0 && !strings.Contains(string(out), "without its notices") {
+				t.Fatalf("the gate refused without naming the notices:\n%s", out)
 			}
 		})
 	}
 }
 
-// The build installs both notices from files this tree carries, so the gate above
+// The build installs every notice from files this tree carries, so the gate above
 // is checking for something the build really writes.
 func TestTheBuildInstallsTheNoticesTheGateChecks(t *testing.T) {
 	t.Parallel()
@@ -72,6 +115,7 @@ func TestTheBuildInstallsTheNoticesTheGateChecks(t *testing.T) {
 	for source, dest := range map[string]string{
 		"internal/notices/THIRD_PARTY_NOTICES":        `"$rootfs/opt/billet/THIRD_PARTY_NOTICES"`,
 		"internal/guestassets/container-hook.LICENSE": `"$rootfs/usr/local/lib/billet/container-hook/LICENSE"`,
+		"internal/guestassets/container-hook.NOTICE":  `"$rootfs/usr/local/lib/billet/container-hook/THIRD_PARTY_NOTICES"`,
 	} {
 		install := `install -m 0644 "$SCRIPT_DIR/../` + source + `" \` + "\n\t\t" + dest
 		if !strings.Contains(build, install) {
@@ -80,5 +124,29 @@ func TestTheBuildInstallsTheNoticesTheGateChecks(t *testing.T) {
 		if info, err := os.Stat(filepath.Join("..", source)); err != nil || info.Size() == 0 {
 			t.Errorf("%s, which the build installs, is missing or empty: %v", source, err)
 		}
+	}
+}
+
+// THE BUNDLED NOTICES ARE THOSE OF THE PINNED HOOK. They name the version they were
+// read for, so a pin bump that forgot to rewrite them, from the new tag's lockfile,
+// fails here rather than shipping one release's notices with another's bundle.
+func TestTheHookNoticesNameThePinnedVersion(t *testing.T) {
+	t.Parallel()
+
+	pin, err := os.ReadFile(filepath.Join("..", "internal", "guestassets", "container-hook.pin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(pin))
+	if len(fields) != 2 {
+		t.Fatalf("container-hook.pin is %q, want a version and a checksum", pin)
+	}
+
+	notice, err := os.ReadFile(filepath.Join("..", "internal", "guestassets", "container-hook.NOTICE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "\nContainer hook version: " + fields[0] + "\n"; !strings.Contains(string(notice), want) {
+		t.Fatalf("container-hook.NOTICE does not say %q; rewrite it from the lockfile of the pinned tag", strings.TrimSpace(want))
 	}
 }

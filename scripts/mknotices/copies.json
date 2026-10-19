@@ -31,8 +31,8 @@
     "source": "https://github.com/actions/runner-container-hooks",
     "pin": "v0.8.1, the release asset internal/guestassets/container-hook.pin names by digest",
     "license": "MIT",
-    "license_files": ["internal/guestassets/container-hook.LICENSE"],
-    "installs": ["/usr/local/lib/billet/container-hook/upstream.js and LICENSE in the guest image"],
+    "license_files": ["internal/guestassets/container-hook.LICENSE", "internal/guestassets/container-hook.NOTICE"],
+    "installs": ["/usr/local/lib/billet/container-hook/upstream.js, LICENSE and THIRD_PARTY_NOTICES (the bundled npm packages' licenses) in the guest image"],
     "ships_in": ["the guest image"]
   },
   {
