@@ -164,6 +164,10 @@ fi
 # THE PIN IS ONE LINE, VERSION AND SHA256, for the reason the runner's is: a
 # checksum is only true of its version. The zip carries one file, index.js, which
 # lands as upstream.js beside the wrapper the runner is pointed at.
+#
+# ITS MIT LICENSE LANDS BESIDE IT, because the image redistributes the hook and the
+# zip does not carry the license. internal/guestassets/container-hook.LICENSE is
+# that project's LICENSE at the pinned tag; a pin bump copies it again.
 install_container_hook() {
 	local rootfs=$1
 	local pin="$SCRIPT_DIR/../internal/guestassets/container-hook.pin"
@@ -184,6 +188,8 @@ install_container_hook() {
 	install -d -m 0755 "$rootfs/usr/local/lib/billet/container-hook"
 	unzip -p "$WORK/$zip" index.js >"$rootfs/usr/local/lib/billet/container-hook/upstream.js"
 	chmod 0644 "$rootfs/usr/local/lib/billet/container-hook/upstream.js"
+	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/container-hook.LICENSE" \
+		"$rootfs/usr/local/lib/billet/container-hook/LICENSE"
 	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/container-hook.js" \
 		"$rootfs/usr/local/lib/billet/container-hook/index.js"
 	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"
@@ -215,6 +221,10 @@ install_guest_billet() {
 		GOPATH="$WORK/go" GOCACHE="$WORK/go-build" \
 		"$go" -C "$SCRIPT_DIR/.." build -trimpath -o "$rootfs/opt/billet/bin/billet" ./cmd/billet
 	chmod 0755 "$rootfs/opt/billet/bin/billet"
+	# The image redistributes billet, so it carries billet's notices too: the
+	# binary embeds them (`billet version --notices`) and this is the same file.
+	install -m 0644 "$SCRIPT_DIR/../internal/notices/THIRD_PARTY_NOTICES" \
+		"$rootfs/opt/billet/THIRD_PARTY_NOTICES"
 	install -m 0755 /dev/stdin "$rootfs/opt/billet/bin/bazel-credential-helper" <<'HELPER'
 #!/bin/sh
 exec /opt/billet/bin/billet cache credential-helper "$@"

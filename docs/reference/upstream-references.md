@@ -108,6 +108,8 @@ For the EC2 AMI, what billet takes is exactly one file: `images/ubuntu/toolsets/
 
 **Refreshing the pin moves the guest's vendored template with it.** `scripts/runner-images/COMMIT` must equal the toolset's commit, so a bump re-vendors `scripts/runner-images/upstream/` at the new commit, regenerates `BLOBS`, `TREES` and `plan.json`, and reviews every entry of `differences.tsv` against the new plan (an entry naming a step the plan no longer has stops the build). For the declaration itself: re-download the file at the new commit, put its sha256 beside that commit in `pinned.txt`, and run the gates — `TestTheVendoredToolsetIsUpstreamAtThePinnedCommit` fetches the pinned commit and compares, which is the only check that can catch a copy that was transcribed rather than downloaded.
 
+**One install in the template is not pinned, and billet runs it as GitHub ships it.** `images/ubuntu/scripts/build/install-kubernetes-tools.sh` pipes Helm's installer from `helm/helm`'s `master` branch into bash, with no digest. The installer downloads a Helm release and, by default, checks it against the checksum that release publishes, so the binary is verified but the installer script is not. It is recorded here rather than changed, because a difference from the template is carried in `differences.tsv` only where the build cannot run the step as written.
+
 ## `moby/moby` at `b985e2313a8676e18072b442911fc8f64f17d440` (Apache-2.0) — a vendored check, not a dependency
 
 `scripts/kernel/check-config.sh` is vendored from that commit, and Moby's `LICENSE` and `NOTICE` are kept beside it in `scripts/kernel/`, verbatim from the same commit.
@@ -119,6 +121,18 @@ For the EC2 AMI, what billet takes is exactly one file: `images/ubuntu/toolsets/
 **Read at the pinned revision, that status is not purely a fact about the config**, which is why billet's own rule sits beside it rather than behind it. `check_flag` grades the config file, but `EXITCODE=1` is also set for a cgroup v1 hierarchy that is not properly mounted, for apparmor enabled without `apparmor_parser`, and for `/proc/sys/kernel/keys/root_maxkeys <= 10000`; `check_sysctl` runs `sysctl -n` under `set -e`, so a host without it aborts the script entirely. All are facts about the machine running the build. Measured on `ubuntu:24.04`: `root_maxkeys` is `1000000`, the cgroup hierarchy is v2, and billet's committed config exits 0. The gate requires 0 anyway — that is what preserving the real verdict means — and names those host-dependent lines when it fails so an operator can tell their build host from their kernel.
 
 **Where billet is stricter, and why it is one rule rather than a second copy of upstream's list.** `check_flag` accepts `=y` OR `=m`, and a microVM boots one kernel with no initramfs, so a module is the same as absent. Rather than restate moby's flags with a tighter rule attached — a second list that drifts on the next upstream edit — the gate requires every option in `scripts/kernel/required-builtins.txt` to be `=y` and refuses a config containing ANY `=m` line, which covers every flag moby grades at once. That file is also what `scripts/build-guest-kernel.sh` enables, so the list that is set and the list that is checked cannot diverge.
+
+## `sigstore/root-signing` at `c9bda74ad2221f938f7d2e0295ca3aad2da710a8` (Apache-2.0) — an embedded trust root
+
+`internal/imagesource/trustedroot/trusted_root.json` is `targets/trusted_root.json` from that commit, byte for byte, and the binary embeds it so a node verifies a guest image without reaching Sigstore's TUF repository. Its Apache-2.0 license is kept beside it as `LICENSE`. A refresh copies the file from a newer commit, checks that its git blob id matches that commit's, and moves the pin in `scripts/mknotices/copies.json` in the same change.
+
+## `actions/runner-container-hooks` v0.8.1 (MIT) — installed into the guest image
+
+The guest image carries the reference Docker container hook as `/usr/local/lib/billet/container-hook/upstream.js`, taken from the v0.8.1 release asset that `internal/guestassets/container-hook.pin` names by version and SHA-256. The pin is a release asset's digest rather than a commit, because the asset is a build output the repository does not contain. The release zip carries no license, so that project's `LICENSE` at the tag is kept as `internal/guestassets/container-hook.LICENSE` and installed beside the hook. A pin bump copies it again.
+
+## Third-party notices
+
+Billet's release redistributes everything its binary links, and MIT, BSD and Apache-2.0 each require their notices with the copy. `scripts/mknotices` writes `internal/notices/THIRD_PARTY_NOTICES` from every Go module the three release targets link, Go's own license, and every copy that `scripts/mknotices/copies.json` lists. A license text that is byte-identical to one already printed is printed once and pointed at, so every distinct copyright line and NOTICE is kept whole. The binary embeds the file (`billet version --notices`), the archives carry it, the packages install it under `/usr/share/doc/billet/`, and the guest image installs it beside billet at `/opt/billet/THIRD_PARTY_NOTICES`. Its tests fail when the committed file is not what the generator writes, and when a license file in the tree belongs to no listed copy, so a new dependency or a new vendored copy cannot ship without its notice. After a dependency change, run `go run ./scripts/mknotices` and commit the result.
 
 ## Others
 

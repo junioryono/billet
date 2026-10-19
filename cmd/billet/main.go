@@ -30,6 +30,7 @@ import (
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/notices"
 	"github.com/junioryono/billet/internal/version"
 )
 
@@ -276,8 +277,16 @@ func nodeHost(env cli.Env, lc *cli.Lifecycle, platform string) app.NodeHost {
 
 func cmdVersion(_ context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet version", env.Stdout)
+	showNotices := fs.Bool("notices", false,
+		"print the licenses of the third-party software this binary contains")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
+	}
+
+	if *showNotices {
+		fmt.Fprint(env.Stdout, notices.Text())
+
+		return nil
 	}
 
 	// The release version, not just the revision. This printed a bare commit sha,

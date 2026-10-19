@@ -1,0 +1,47 @@
+[
+  {
+    "name": "actions/runner-images",
+    "source": "https://github.com/actions/runner-images",
+    "pin": "e75633902841aa5479c759492b73409e6d317f12",
+    "license": "MIT",
+    "license_files": ["scripts/runner-images/LICENSE", "internal/runnerimages/LICENSE"],
+    "copies": ["scripts/runner-images/upstream", "internal/runnerimages/toolset-2404.json"],
+    "ships_in": ["the billet binary (toolset-2404.json)", "the guest image's build (the template it runs)"]
+  },
+  {
+    "name": "moby/moby contrib/check-config.sh",
+    "source": "https://github.com/moby/moby",
+    "pin": "b985e2313a8676e18072b442911fc8f64f17d440",
+    "license": "Apache-2.0",
+    "license_files": ["scripts/kernel/LICENSE", "scripts/kernel/NOTICE"],
+    "copies": ["scripts/kernel/check-config.sh"],
+    "ships_in": ["the guest kernel build's gate (not shipped)"]
+  },
+  {
+    "name": "sigstore/root-signing targets/trusted_root.json",
+    "source": "https://github.com/sigstore/root-signing",
+    "pin": "c9bda74ad2221f938f7d2e0295ca3aad2da710a8",
+    "license": "Apache-2.0",
+    "license_files": ["internal/imagesource/trustedroot/LICENSE"],
+    "copies": ["internal/imagesource/trustedroot/trusted_root.json"],
+    "ships_in": ["the billet binary"]
+  },
+  {
+    "name": "actions/runner-container-hooks",
+    "source": "https://github.com/actions/runner-container-hooks",
+    "pin": "v0.8.1, the release asset internal/guestassets/container-hook.pin names by digest",
+    "license": "MIT",
+    "license_files": ["internal/guestassets/container-hook.LICENSE"],
+    "installs": ["/usr/local/lib/billet/container-hook/upstream.js and LICENSE in the guest image"],
+    "ships_in": ["the guest image"]
+  },
+  {
+    "name": "readthedocs/sphinx_rtd_theme footer template",
+    "source": "https://github.com/readthedocs/sphinx_rtd_theme",
+    "pin": "3.0.2",
+    "license": "MIT",
+    "notice_in": "docs/_templates/footer.html",
+    "copies": ["docs/_templates/footer.html"],
+    "ships_in": ["the documentation site"]
+  }
+]

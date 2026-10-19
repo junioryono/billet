@@ -723,6 +723,17 @@ else
         unless the workflow names the adapter itself"
 fi
 
+# THE IMAGE REDISTRIBUTES BILLET AND THE CONTAINER HOOK, and both licenses require
+# their notices with the copy: billet's third-party notices beside its binary, and
+# the hook's MIT license beside upstream.js.
+if [ -s "$MNT/opt/billet/THIRD_PARTY_NOTICES" ] &&
+	[ -s "$MNT/usr/local/lib/billet/container-hook/LICENSE" ]; then
+	pass "billet's third-party notices and the container hook's license are in the image"
+else
+	fail "the image carries billet or the container hook without its notices
+        (/opt/billet/THIRD_PARTY_NOTICES, /usr/local/lib/billet/container-hook/LICENSE)"
+fi
+
 # THE CONTAINER HOOK PUTS THAT SHIM INSIDE A JOB CONTAINER. The reference hook is
 # vendored beside billet's wrapper, the runner is pointed at the wrapper, and the
 # job hook prepends the shim's directory to every step's PATH.
