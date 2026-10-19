@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -277,12 +278,82 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		}
 	})
 
-	t.Run("the invocation required", func(t *testing.T) {
+	// A NODE THAT HAD NO PROCESS TO STOP is judged by what its last process
+	// left, at the stop's standard: a retry does not pass what the first
+	// attempt refused.
+	t.Run("no invocation: a node already stopped", func(t *testing.T) {
 		f := newEndingFixture(t)
+		f.begin(t, "inv-0", nodeending.HandedOff)
 
-		o := f.run(t, "check")
-		if o.err == nil || !strings.Contains(o.err.Error(), "--invocation is required") {
-			t.Fatalf("check without an invocation returned %v, want the flag's refusal", o.err)
+		if o := f.run(t, "check", "--drain"); o.code != exitRefused || !strings.Contains(o.str("why"), "never adopted it") {
+			t.Fatalf("check --drain over a stopped handoff: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+
+		if o := f.run(t, "check"); o.code != 0 || o.str("invocation") != "" {
+			t.Fatalf("check over a stopped handoff, no drain: code %d invocation %q (%s), want proved and no "+
+				"invocation", o.code, o.str("invocation"), o.str("why"))
+		}
+
+		f.begin(t, "inv-1", nodeending.Running)
+
+		if o := f.run(t, "check"); o.code != exitRefused || !strings.Contains(o.str("why"), "killed or crashed") {
+			t.Fatalf("check over a stopped killed node: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+
+		f.unit(t, "active", "running", "success", "41", "inv-2")
+
+		if o := f.run(t, "check"); o.code != exitRefused || !strings.Contains(o.str("why"), "is active") {
+			t.Fatalf("check with no invocation over a running node: code %d (%s), want refused", o.code,
+				o.str("why"))
+		}
+	})
+
+	// THE RECORD A CONVERGE NAMES, under a configuration that no longer has a
+	// node: --state-dir; and a configuration with neither runs no node.
+	t.Run("a configuration without a node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		serverOnly := filepath.Join(t.TempDir(), "server-only.yaml")
+		dir := t.TempDir()
+		writeFile(t, serverOnly, "server:\n  listen: 127.0.0.1:7717\n  state_dir: "+dir+
+			"\n  max_vcpu: 8\n  max_memory: 32GiB\ngithub:\n  org: acme\n  app_id: 1\n  installation_id: 2\n"+
+			"  private_key_path: "+filepath.Join(dir, "app.pem")+"\ntiers:\n  - label: billet-2vcpu\n"+
+			"    provider: docker\n    vcpu: 2\n    memory: 8GiB\n    image: ubuntu:24.04\n", 0o600)
+
+		run := func(args ...string) endpointOut {
+			return runEndpoint(t, NodeEnding, "", append([]string{args[0], "--config", serverOnly}, args[1:]...)...)
+		}
+
+		if o := run("check", "--drain", "--state-dir", f.stateDir); o.code != exitRefused ||
+			!strings.Contains(o.str("why"), "killed or crashed") {
+			t.Fatalf("check --state-dir under a server-only configuration: code %d (%s; %v), want the record's "+
+				"refusal", o.code, o.str("why"), o.err)
+		}
+
+		if o := run("check", "--drain"); o.code != 0 || !strings.Contains(o.str("why"), "runs no node") {
+			t.Fatalf("check under a configuration that runs no node: code %d (%s), want proved", o.code,
+				o.str("why"))
+		}
+
+		if o := run("check", "--invocation", "inv-1"); o.err == nil || !strings.Contains(o.err.Error(), "no --state-dir") {
+			t.Fatalf("check of an invocation with no record to read returned %v, want refused", o.err)
+		}
+
+		// AN ACKNOWLEDGEMENT TAKES THE NODE'S OWN LOCK, which only a node
+		// section names: never a record another directory holds.
+		var usage bytes.Buffer
+
+		env := processEnv()
+		env.Stdout = &usage
+
+		if err := NodeEnding(t.Context(), env, []string{"acknowledge", "--config", serverOnly, "--unrecorded",
+			"--state-dir", f.stateDir, "--json"}); err == nil || !strings.Contains(err.Error(), "state-dir") {
+			t.Fatalf("acknowledge --state-dir returned %v, want the flag refused", err)
+		}
+
+		if o := run("acknowledge", "--unrecorded"); o.err == nil || !strings.Contains(o.err.Error(), "no node section") {
+			t.Fatalf("acknowledge under a configuration that runs no node returned %v, want refused", o.err)
 		}
 	})
 }

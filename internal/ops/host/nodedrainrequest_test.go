@@ -80,7 +80,7 @@ func TestEveryDrainRequestIsWrittenWhereTheNodeReadsItBeforeTheStop(t *testing.T
 	}
 
 	preremove := read("../../../deploy/scripts/preremove.sh")
-	before("preremove.sh", preremove, ">"+nodeDrainRequestPath+"; then", `systemctl stop "${unit}"`)
+	before("preremove.sh", preremove, ">"+nodeDrainRequestPath+"; then", "systemctl stop billet-node;")
 
 	localdown := read("localdown.go")
 	before("localdown.go", localdown, "requestNodeDrain(nodeDrainRequestFile)", "c.StopAndProve(")

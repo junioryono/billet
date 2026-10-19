@@ -19,7 +19,7 @@
     PATH: "{{ billet_gate_restart_root.path }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
     BILLET_GATE_RESTART_CASE: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
   block:
-    - name: Include the node restart
+    - name: Include the node restart, asking this converge's answerer
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: node-restart
@@ -32,6 +32,25 @@
         # before the record, where systemd's account is the floor.
         billet_exclusion_answerer: >-
           {{ (billet_gate_restart_root.path ~ '/billet') if billet_gate_restart_case.ending is defined else '' }}
+        billet_config_install:
+          changed: "{{ billet_gate_restart_case.config_changed | default(false) }}"
+      when: billet_gate_restart_case.with is not defined
+
+    # A CASE THAT NAMES ITS EXECUTABLES, in the order they are tried.
+    - name: Include the node restart, asking the case's executables in order
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: node-restart
+      vars:
+        billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
+        billet_node_restart_poll_interval: "{{ billet_gate_restart_case.interval | default(1) }}"
+        billet_ending_become: false
+        billet_exclusion_answerer: ""
+        billet_ending_with: >-
+          {% set pairs = [] %}{% for exe in billet_gate_restart_case.with %}{% set _ = pairs.append({'exe': billet_gate_restart_root.path ~ '/' ~ exe, 'config': '/etc/billet/billet.yaml'}) %}{% endfor %}{{ pairs }}
+        billet_config_install:
+          changed: "{{ billet_gate_restart_case.config_changed | default(false) }}"
+      when: billet_gate_restart_case.with is defined
   rescue:
     - name: Record the refusal
       ansible.builtin.set_fact:

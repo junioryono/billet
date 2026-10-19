@@ -61,7 +61,20 @@ if tool == 'billet':
     if 'stderr' in answer:
         sys.stderr.write(answer['stderr'])
     if 'fixture' in answer:
-        sys.stdout.write((fixtures / (answer['fixture'] + '.json')).read_text())
+        text = (fixtures / (answer['fixture'] + '.json')).read_text()
+        # A CHECK ANSWERS THE QUESTION ASKED: the fixture's invocation and drain
+        # become the ones on the command line, unless the case keeps them to
+        # stand for an answer to another question.
+        if call == 'check' and not answer.get('verbatim'):
+            doc = json.loads(text)
+            doc.pop('invocation', None)
+            doc.pop('drain', None)
+            if '--invocation' in args:
+                doc['invocation'] = args[args.index('--invocation') + 1]
+            if '--drain' in args:
+                doc['drain'] = True
+            text = json.dumps(doc, indent=2) + '\n'
+        sys.stdout.write(text)
     if 'raw' in answer:
         sys.stdout.write(answer['raw'])
     sys.exit(answer.get('rc', 0))

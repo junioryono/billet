@@ -21,6 +21,7 @@
     billet_gate_running: {ActiveState: active, SubState: running, MainPID: "100", InvocationID: 0123456789abcdef0123456789abcdef}
     billet_gate_check: billet node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --json
     billet_gate_admit: billet node ending admit-start --config /etc/billet/billet.yaml --json
+    billet_gate_check_drain: billet node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --drain --json
     billet_gate_restart_cases:
       - name: restarts
         wait: 30
@@ -77,6 +78,111 @@
         succeeds: false
         starts: 0
         message: [is not started, killed or crashed]
+      # A CHANGED CONFIGURATION ASKED FOR A DRAIN, so the stop must have drained.
+      - name: config-changed-requires-a-drain
+        wait: 30
+        config_changed: true
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      # AN ANSWER TO ANOTHER QUESTION: a proof of some other invocation, or of
+      # a drain nobody asked about, is not a proof of this stop.
+      - name: answer-about-another-invocation
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-floor, rc: 0, verbatim: true}
+        succeeds: false
+        starts: 0
+        message: [cannot read, invocation]
+      - name: answer-without-the-drain-asked
+        config_changed: true
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {raw: '{"schema":1,"command":"check","outcome":"proved","proof":"record","why":"x","invocation":"0123456789abcdef0123456789abcdef"}', rc: 0}
+        succeeds: false
+        starts: 0
+        message: [cannot read, drain]
+      # THE EXECUTABLES ARE TRIED IN ORDER: one from before the record defers
+      # to the next, the first that answers decides, and only when every one
+      # is from before the record is systemd's account the floor.
+      - name: older-then-newer
+        wait: 30
+        with: [older, billet]
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: inactive, SubState: dead, Result: timeout, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
+      - name: every-one-older
+        with: [older, older]
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: failed, SubState: failed, Result: timeout, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: false
+        starts: 0
+        message: [from before the node's ending record, Result=timeout]
+      - name: newer-fails-before-an-older
+        with: [billet, older]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {stderr: "boom\n", rc: 1}
+        succeeds: false
+        starts: 0
+        message: [did not answer, boom]
+        absent: [from before the node's ending record]
+      # ONE THAT CANNOT RUN DOES NOT DECIDE when a later one answers, and a
+      # later failure is not the floor an earlier older release would allow.
+      - name: unrunnable-then-newer
+        wait: 30
+        with: [missing, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
+      - name: older-then-a-failure
+        with: [older, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {stderr: "boom\n", rc: 1}
+        succeeds: false
+        starts: 0
+        message: [did not answer, boom]
+        absent: [from before the node's ending record]
+      - name: older-then-unproved
+        with: [older, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-unproved, rc: 2}
+        succeeds: false
+        starts: 0
+        message: [killed or crashed]
+        absent: [from before the node's ending record]
       # A MEMBER THE PARSER CANNOT READ, AND AN EXIT THAT DOES NOT MATCH THE
       # OUTCOME, end the restart with the node stopped.
       - name: answer-with-a-surprise
@@ -277,6 +383,16 @@
           #!/bin/sh
           exec '{{ ansible_playbook_python }}' '{{ playbook_dir }}/node-restart-systemctl.py' {{ item }} "$BILLET_GATE_RESTART_CASE" "$@"
       loop: [systemctl, billet]
+
+    # A RELEASE FROM BEFORE THE RECORD, which refuses the word as cmdNode does.
+    - name: Install a billet from before the node's ending record
+      ansible.builtin.copy:
+        dest: "{{ billet_gate_restart_root.path }}/older"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          echo 'billet node: unexpected argument "ending"' >&2
+          exit 1
 
     - name: Exercise each restart case
       ansible.builtin.include_tasks: node-restart-case.yml

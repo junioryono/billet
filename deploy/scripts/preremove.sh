@@ -54,42 +54,57 @@ if [ -d /run/systemd/system ]; then
         exit 1
     fi
 
-    for unit in billet-node billet-server; do
-        if systemctl is-active --quiet "${unit}" 2>/dev/null; then
-            # THE NODE'S INVOCATION, read before its stop because a clean stop
-            # clears it: the stop is proved by that process's own ending (#127).
-            invocation=""
-            if [ "${unit}" = billet-node ]; then
-                invocation=$(systemctl show -p InvocationID --value billet-node 2>/dev/null) || invocation=""
-            fi
-
-            if ! systemctl stop "${unit}"; then
-                echo "billet: could not stop ${unit}. Refusing to remove the package" >&2
-                echo "        while it is still running: it holds leases and manages" >&2
-                echo "        containers that nothing else is tracking." >&2
-                exit 1
-            fi
-
-            # A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN. `systemctl stop`
-            # exits 0 after a stop killed at TimeoutStopSec too, and after a
-            # drain a second signal cut short; only the node's own ending says
-            # it drained. The verdict is the check's exit status, taken before
-            # anything reads its output.
-            if [ "${unit}" = billet-node ]; then
-                status=0
-                /usr/bin/billet node ending check --config /etc/billet/billet.yaml \
-                    --invocation "${invocation}" --drain --json >/dev/null 2>&1 || status=$?
-                if [ "${status}" -ne 0 ]; then
-                    echo "billet: billet-node stopped, but did not prove it drained (check exited ${status})." >&2
-                    echo "        Refusing to remove the package while it may have left guests running." >&2
-                    echo "        Run 'billet node ending check --config /etc/billet/billet.yaml" >&2
-                    echo "        --invocation ${invocation:-<unknown>} --drain --json' for why, and remove again" >&2
-                    echo "        once what it left is gone." >&2
-                    exit 1
-                fi
-            fi
+    # A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN (#127). `systemctl stop`
+    # exits 0 after a stop killed at TimeoutStopSec too, and after a drain a
+    # second signal cut short; only the node's own ending says it drained. So a
+    # running node's stop is checked by the invocation read before it (a clean
+    # stop clears it), and a node already stopped by what its last process left:
+    # one killed earlier may have left guests this removal would orphan. A host
+    # with no configuration never ran the packaged node, which reads it. Each
+    # verdict is the check's exit status, bounded, taken before anything reads
+    # its output.
+    check_node_ending() {
+        status=0
+        timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml \
+            "$@" --drain --json >/dev/null 2>&1 || status=$?
+        if [ "${status}" -ne 0 ]; then
+            echo "billet: billet-node did not prove it drained (check exited ${status})." >&2
+            echo "        Refusing to remove the package while it may have left guests running." >&2
+            echo "        Run 'billet node ending check --config /etc/billet/billet.yaml $* --drain --json'" >&2
+            echo "        for why, and remove again once what it left is gone." >&2
+            exit 1
         fi
-    done
+    }
+
+    if systemctl is-active --quiet billet-node 2>/dev/null; then
+        invocation=$(systemctl show -p InvocationID --value billet-node 2>/dev/null) || invocation=""
+        if [ -z "${invocation}" ]; then
+            echo "billet: billet-node is running, but systemd names no invocation for it, so its" >&2
+            echo "        stop could not be proved by its ending. Refusing to remove the package;" >&2
+            echo "        nothing was stopped." >&2
+            exit 1
+        fi
+
+        if ! systemctl stop billet-node; then
+            echo "billet: could not stop billet-node. Refusing to remove the package" >&2
+            echo "        while it is still running: it holds leases and manages" >&2
+            echo "        containers that nothing else is tracking." >&2
+            exit 1
+        fi
+
+        check_node_ending --invocation "${invocation}"
+    elif [ -e /etc/billet/billet.yaml ]; then
+        check_node_ending
+    fi
+
+    if systemctl is-active --quiet billet-server 2>/dev/null; then
+        if ! systemctl stop billet-server; then
+            echo "billet: could not stop billet-server. Refusing to remove the package" >&2
+            echo "        while it is still running: it holds leases and manages" >&2
+            echo "        containers that nothing else is tracking." >&2
+            exit 1
+        fi
+    fi
 
     # THE UPLINK SHAPER, where the host role installed it, stops while the binary
     # its ExecStopPost clears with is still here: afterwards nothing could remove

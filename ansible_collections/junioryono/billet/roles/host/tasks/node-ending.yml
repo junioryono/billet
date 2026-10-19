@@ -6,47 +6,76 @@
 # after reset-failed (measured on systemd 255, 2026-10-17). So the role asks the
 # node's own record, through `billet node ending`, and goes on only on a proof.
 #
-# THE EXECUTABLE is the one that answers for this converge
-# (billet_exclusion_answerer). None, or a release from before the record that
-# refuses the word, can only mean a node from before the record, which kept
-# none: then systemd's account is the floor, judged here the older way and
-# said to be the weaker proof.
+# THE EXECUTABLES are tried in the order the caller names them
+# (billet_ending_with: each an executable and the configuration it reads, the
+# stopped node's own release first), by default this converge's answerer with
+# the installed configuration. The first that answers decides. A release from
+# before the record refuses the word (`unexpected argument "ending"`) and never
+# runs a node, so the next one is asked; when every one is from before the
+# record, and only then, the node can only have been one that kept none, and
+# systemd's account is the floor, judged here the older way and said to be the
+# weaker proof.
 #
 # Inputs: billet_ending_call ('check' or 'admit-start'); for a check,
-# billet_ending_invocation (the node's InvocationID read before its stop) and
-# billet_ending_drain (true where a drain was asked for); billet_ending_with,
-# where a caller names the executable (the transaction's candidate, the
-# committed binary) in place of this converge's answerer.
+# billet_ending_invocation (the node's InvocationID read before its stop, or ''
+# for a node that had no process to stop, judged by what its last process left)
+# and billet_ending_drain (true where a drain was asked for); billet_ending_with;
+# billet_ending_state_dir, where the record is not where the configuration says
+# (a converge that is rendering the node's configuration away).
 
-- name: Name the executable that judges the node's ending
+- name: Name the executables that judge the node's ending
   ansible.builtin.set_fact:
-    billet_ending_executable: "{{ billet_ending_with | default(billet_exclusion_answerer | default('', true), true) }}"
+    billet_ending_pairs: >-
+      {{ (billet_ending_with if billet_ending_with is defined
+          else [{'exe': billet_exclusion_answerer | default('', true), 'config': '/etc/billet/billet.yaml'}])
+         | selectattr('exe', 'truthy') | list }}
 
 - name: Ask the node's own record how its last process ended
   ansible.builtin.command:
     argv: >-
-      {{ ['timeout', '-k', '10', '180', billet_ending_executable, 'node', 'ending', billet_ending_call,
-          '--config', '/etc/billet/billet.yaml']
-         + ((['--invocation', billet_ending_invocation] + (['--drain'] if billet_ending_drain | default(false) | bool else []))
+      {{ ['timeout', '-k', '10', '180', item.exe, 'node', 'ending', billet_ending_call, '--config', item.config]
+         + (((['--invocation', billet_ending_invocation | string])
+              if (billet_ending_invocation | default('') | string | length > 0) else [])
+            + (['--drain'] if billet_ending_drain | default(false) | bool else [])
             if billet_ending_call == 'check' else [])
+         + ((['--state-dir', billet_ending_state_dir | string])
+            if (billet_ending_state_dir | default('') | string | length > 0) else [])
          + ['--json'] }}
     expand_argument_vars: false
-  register: billet_ending_raw
+  register: billet_ending_raws
+  loop: "{{ billet_ending_pairs }}"
+  loop_control:
+    label: "{{ item.exe }}"
   # THE RECORD IS ROOT'S (0600), so the question is asked as root.
   become: "{{ billet_ending_become | default(true) | bool }}"
   changed_when: false
   failed_when: false
-  when: billet_ending_executable | length > 0
+
+# AN ANSWER FROM ANY OF THEM DECIDES. With none, the first that is not from
+# before the record is the failure reported; only when every one is from
+# before the record does the parser read it as the floor.
+- name: Choose the answer that decides
+  vars:
+    billet_ending_results: "{{ billet_ending_raws.results | default([]) }}"
+    billet_ending_answered: >-
+      {{ billet_ending_results | selectattr('rc', 'defined') | selectattr('rc', 'in', [0, 2, 3])
+         | selectattr('stdout', 'match', '^\s*\{') | list }}
+    billet_ending_newer: >-
+      {{ billet_ending_results | rejectattr('stderr', 'search', 'unexpected argument "ending"') | list }}
+    billet_ending_chosen: >-
+      {{ (billet_ending_answered + billet_ending_newer + billet_ending_results) | first }}
+  ansible.builtin.set_fact:
+    billet_ending_raw: "{{ billet_ending_chosen }}"
+    billet_ending_answered_by: "{{ billet_ending_chosen.item.exe }}"
+  when: billet_ending_pairs | length > 0
 
 - name: Judge the node ending's answer
   ansible.builtin.include_tasks: ending-answer.yml
-  vars:
-    billet_ending_answered_by: "{{ billet_ending_executable }}"
-  when: billet_ending_executable | length > 0
+  when: billet_ending_pairs | length > 0
 
 # THE FLOOR, for a node from before the record: systemd's own account, read
-# now, with no process and no job, and for a stop the clean triple. An older
-# updater's check, which a handoff or a cut-short drain also passes.
+# now, with no process and no job, and the clean triple. An older updater's
+# check, which a handoff or a cut-short drain also passes.
 - name: Read systemd's account of a node from before the record
   ansible.builtin.command:
     argv: [systemctl, show, --property=ActiveState, --property=SubState, --property=Result, --property=MainPID,
@@ -54,7 +83,7 @@
   register: billet_ending_floor
   changed_when: false
   failed_when: false
-  when: billet_ending_executable | length == 0 or billet_ending_older | default(false) | bool
+  when: billet_ending_pairs | length == 0 or billet_ending_older | default(false) | bool
 
 - name: Prove a stop of a node from before the record by systemd's account
   ansible.builtin.assert:
@@ -71,14 +100,19 @@
       {{ 'stop' if billet_ending_call == 'check' else 'last stop' }}, and it reports
       {{ billet_ending_floor.stdout_lines | default([]) | join(' ') }}, not inactive,
       dead, success with no process and no job. The node is left as it is; read
-      `journalctl -u billet-node` for why, and converge again once it is.
-  when: billet_ending_executable | length == 0 or billet_ending_older | default(false) | bool
+      `journalctl -u billet-node` for why. Once whatever it left is known to be
+      gone, `systemctl reset-failed billet-node` clears systemd's account and the
+      next converge goes on.
+  when: billet_ending_pairs | length == 0 or billet_ending_older | default(false) | bool
 
 - name: Refuse a node whose ending its record does not prove
   ansible.builtin.assert:
     that: billet_ending_answer.outcome == 'proved'
     fail_msg: >-
-      {{ 'billet-node.service stopped, but its stop' if billet_ending_call == 'check' else 'billet-node.service is not started: its last stop' }}
+      {{ 'billet-node.service is not started: its last stop' if billet_ending_call == 'admit-start'
+         else ('billet-node.service stopped, but its stop'
+               if (billet_ending_invocation | default('') | string | length > 0)
+               else 'billet-node.service had no process to stop, and what its last process left') }}
       is {{ billet_ending_answer.outcome }} by the node's own ending:
       {{ billet_ending_answer.why }}.
       {{ ('Once what it left is known, `billet node ending acknowledge --config /etc/billet/billet.yaml '
@@ -86,5 +120,5 @@
          if billet_ending_answer.acknowledge is defined else '' }}
       The node is left as it is.
   when:
-    - billet_ending_executable | length > 0
+    - billet_ending_pairs | length > 0
     - not billet_ending_older | bool

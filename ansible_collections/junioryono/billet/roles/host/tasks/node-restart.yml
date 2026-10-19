@@ -139,12 +139,15 @@
           'MainPID=0' not in billet_node_restart_stop_poll.stdout_lines | default([]) or
           'Job=' not in billet_node_restart_stop_poll.stdout_lines | default([])
 
+    # A DRAIN WHERE ONE WAS ASKED FOR: a changed configuration wrote the
+    # request before this stop (services.yml), and a node that handed its
+    # compute on may not hand it to a process under another configuration.
     - name: Prove the node's stop by its own ending
       ansible.builtin.include_tasks: node-ending.yml
       vars:
         billet_ending_call: check
         billet_ending_invocation: "{{ billet_node_restart_invocation }}"
-        billet_ending_drain: false
+        billet_ending_drain: "{{ billet_config_install.changed | default(false) | bool }}"
 
 - name: Admit the node's start over its last ending
   ansible.builtin.include_tasks: node-ending.yml

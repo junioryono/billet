@@ -63,8 +63,17 @@
         ok: "{{ (billet_ending_a.proof | default('x') is string and billet_ending_a.proof | default('') in ['record', 'systemd', 'acknowledged', 'reboot', 'running']) if billet_ending_outcome == 'proved' else ('proof' not in billet_ending_a) }}"
       - name: acknowledge
         ok: "{{ ('acknowledge' not in billet_ending_a) or (billet_ending_outcome != 'proved' and billet_ending_a.acknowledge is string and billet_ending_a.acknowledge is match('^(--invocation [0-9A-Za-z-]+|--unrecorded|--reset-unreadable)\\Z')) }}"
+      # THE ANSWER IS TO THE QUESTION ASKED: the invocation named, or none for
+      # a node that had no process to stop, and the drain the caller required.
       - name: invocation
-        ok: "{{ ('invocation' in billet_ending_a and billet_ending_a.invocation is string) if billet_ending_call == 'check' else ('invocation' not in billet_ending_a) }}"
+        ok: >-
+          {{ (((billet_ending_invocation | default('') | string | length == 0) and 'invocation' not in billet_ending_a)
+              or (billet_ending_a.invocation | default(none) == (billet_ending_invocation | default('') | string)))
+             if billet_ending_call == 'check' else ('invocation' not in billet_ending_a) }}
+      - name: drain
+        ok: >-
+          {{ ((billet_ending_a.drain | default(false)) is sameas (billet_ending_drain | default(false) | bool))
+             if billet_ending_call == 'check' else ('drain' not in billet_ending_a) }}
       - name: recorded
         ok: "{{ ('recorded' not in billet_ending_a) or (billet_ending_call == 'check' and (billet_ending_a.recorded is sameas true or billet_ending_a.recorded is sameas false)) }}"
   ansible.builtin.assert:

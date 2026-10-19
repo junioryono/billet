@@ -39,6 +39,18 @@ func TestTheEndingFixturesAreTheCommandsOwn(t *testing.T) {
 
 			return f.run(t, "check", "--invocation", "inv-1")
 		},
+		"check-stopped-proved": func(t *testing.T, f *endingFixture) endpointOut {
+			t.Helper()
+			f.begin(t, "inv-1", nodeending.Drained)
+
+			return f.run(t, "check", "--drain")
+		},
+		"check-stopped-unproved": func(t *testing.T, f *endingFixture) endpointOut {
+			t.Helper()
+			f.begin(t, "inv-1", nodeending.HandedOff)
+
+			return f.run(t, "check", "--drain")
+		},
 		"admit-start-proved": func(t *testing.T, f *endingFixture) endpointOut {
 			t.Helper()
 			f.begin(t, "inv-1", nodeending.Drained)

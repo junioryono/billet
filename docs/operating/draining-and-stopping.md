@@ -75,12 +75,12 @@ An acknowledgement takes the node's own deployment lock, so it refuses while a n
 
 **Every other stop billet performs is proved the same way.**
 - `billet node migrate-endpoint`, `billet node repair-unit` and a controller retirement's restart of a retained node prove their stop by the stopped invocation's ending, as well as by systemd's clean triple, before they start the node again.
-- Removing the package (`apt remove`, `dnf remove`) refuses unless `billet node ending check --drain` proves the node drained, since nothing will start again to adopt what it left.
-- The Ansible role restarts the node as a polled stop, a proved ending, a gated start and a polled start.
-- The role's network change, its upgrade transaction and the transaction's recovery each require the stop to have drained before they change anything.
+- Removing the package (`apt remove`, `dnf remove`) refuses unless `billet node ending check --drain` proves the node drained, since nothing will start again to adopt what it left. A node already stopped is judged by what its last process left, so a removal retried after a refusal is refused again until that is proved.
+- The Ansible role restarts the node as a polled stop, a proved ending, a gated start and a polled start. A restart for a changed configuration requires the stop to have drained.
+- The role's network change, its upgrade transaction, the transaction's recovery and a converge that removes the node from a host each require the stop to have drained before they change anything, and a node with no process to stop to have drained when it last stopped.
 - The role starts a node that is not already up only after `billet node ending admit-start`.
 
-A host whose `billet` is from before the record has no `node ending`. An older `billet node` refuses the word rather than running a node, and the role then judges systemd's clean triple itself, the stated floor.
+A host whose `billet` is from before the record has no `node ending`. An older `billet node` refuses the word rather than running a node. The role asks each release that could have run the stopped node in turn (in a transaction, the installed one and then the staged candidate), and only when every one refuses the word does it judge systemd's clean triple itself, the stated floor. A floor refusal names `systemctl reset-failed billet-node`, once whatever the node left is known to be gone.
 
 These checks are Linux's. The record is written on a Mac too, but a launch agent's stop is not judged by it yet.
 

@@ -374,24 +374,30 @@
         state: stopped
       when: billet_service_state_before_upgrade.results[1].rc != 4
 
-    # A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN (#127). Judged by the staged
-    # candidate, which knows the node's ending whatever release the stopped node
-    # ran, against the installed configuration the stopped node wrote under; a
-    # drain is required where this transaction asked for one. An unproved stop
-    # fails the transaction before anything is installed, and the rollback
-    # starts nothing over it.
+    # A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN (#127). Judged first by
+    # the installed release, the stopped node's own, against the configuration
+    # it ran under, then by the staged candidate, which knows the record
+    # whatever release wrote it; a drain is required where this transaction
+    # asked for one, and a node that had no process to stop is judged by what
+    # its last process left. An unproved stop fails the transaction before
+    # anything is installed, and the rollback starts nothing over it.
     - name: Prove the transaction's node stop by the node's own ending
       ansible.builtin.include_tasks: node-ending.yml
       vars:
         billet_ending_call: check
-        billet_ending_with: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+        billet_ending_with:
+          - exe: /usr/bin/billet
+            config: /etc/billet/billet.yaml
+          - exe: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+            config: /etc/billet/billet.yaml
+          - exe: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+            config: "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
         billet_ending_invocation: >-
-          {{ (billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
+          {{ '' if 'MainPID=0' in billet_transaction_node_before.stdout_lines
+             else (billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
         billet_ending_drain: >-
           {{ not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0 }}
-      when:
-        - billet_service_state_before_upgrade.results[1].rc != 4
-        - "'MainPID=0' not in billet_transaction_node_before.stdout_lines"
+      when: billet_service_state_before_upgrade.results[1].rc != 4
 
     # THE UPLINK SHAPER IS A BILLET PROCESS TOO, and the transaction waits for
     # every one to end before it hides the executable. Stopped here, while its
@@ -1062,18 +1068,24 @@
 
 # A NODE THAT LEAVES MUST HAVE DRAINED (#127): nothing will start again to
 # adopt what it left, and systemd's account of its stop says nothing of that.
+# One already stopped when the node leaves is judged by what its last process
+# left. The record is read where the installed configuration kept it, since
+# the configuration this converge renders names no node.
 - name: Prove the stop of a node that may not run here drained
   ansible.builtin.include_tasks: node-ending.yml
   vars:
     billet_ending_call: check
     billet_ending_invocation: >-
-      {{ (billet_node_unwanted_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
+      {{ '' if (billet_node_unwanted_state.stdout | default('') in ['inactive', 'failed']
+                or 'MainPID=0' in billet_node_unwanted_before.stdout_lines)
+         else (billet_node_unwanted_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
     billet_ending_drain: true
+    billet_ending_state_dir: "{{ billet_previous_node_state_dir | default('') }}"
   when:
     - not billet_node_should_run
     - not ansible_check_mode
     - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
-    - "'MainPID=0' not in billet_node_unwanted_before.stdout_lines"
+      or billet_previous_node_state_dir | default('') | length > 0
 
 # EVERY OPERATION OF THIS CONVERGE THAT ASKED FOR A DRAIN IS DONE (#374): the
 # node is started or stopped as the converge leaves it, any restart was polled to

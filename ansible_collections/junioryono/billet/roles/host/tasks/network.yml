@@ -142,19 +142,21 @@
 # A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN (#127): a stop killed at
 # TimeoutStopSec, and a drain a second signal cut short, both end with the
 # unit stopped. Guest networking changes under running guests only after the
-# stopped invocation's own ending proves it drained.
+# stopped invocation's own ending proves it drained, and a node that had no
+# process to stop only after its last process's ending does: one an earlier
+# converge killed may have left them.
 - name: Prove the network drain by the node's own ending
   ansible.builtin.include_tasks: node-ending.yml
   vars:
     billet_ending_call: check
     billet_ending_invocation: >-
-      {{ (billet_network_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
+      {{ '' if 'MainPID=0' in billet_network_node_before.stdout_lines
+         else (billet_network_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
     billet_ending_drain: true
   when:
     - billet_network_requires_drain
     - billet_node_unit_load_state.stdout | trim != 'not-found'
     - not ansible_check_mode
-    - "'MainPID=0' not in billet_network_node_before.stdout_lines"
 
 - name: Enable IP forwarding for guest bridges
   ansible.posix.sysctl:

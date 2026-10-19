@@ -11,11 +11,13 @@ import (
 
 // A REMOVAL'S NODE STOP IS PROVED BY THE NODE'S OWN ENDING (#127): the package
 // reads the node's invocation before the stop, and after it asks
-// `billet node ending check --drain` about that invocation, refusing the
-// removal unless the check exits 0. A stop systemd calls successful (which a
-// stop killed at TimeoutStopSec is too), a check that refuses, a check that
-// cannot be run, and an invocation systemd did not name each refuse it; an
-// upgrade asks nothing. Stand-ins answer for systemctl and billet.
+// `billet node ending check --drain` about that invocation, under a bound,
+// refusing the removal unless the check exits 0; a node already stopped is
+// judged by what its last process left. A stop systemd calls successful (which
+// a stop killed at TimeoutStopSec is too), a check that refuses, cannot tell,
+// is ended by its bound or cannot be run, and a running node systemd names no
+// invocation for each refuse it; an upgrade asks nothing. Stand-ins answer for
+// systemctl, timeout and billet.
 func TestPackageRemovalRequiresTheNodesDrain(t *testing.T) {
 	t.Parallel()
 
@@ -44,9 +46,9 @@ func TestPackageRemovalRequiresTheNodesDrain(t *testing.T) {
 		"--name", name, "--mount", "type=bind,src="+script+",dst=/preremove.sh,readonly",
 		"-i", "ubuntu:24.04", "sh", "-eu")
 	cmd.Stdin = strings.NewReader(`
-mkdir /shim /run/systemd/system
-# systemctl: the node is active until stopped, the server never; the node's
-# invocation is $INVOCATION.
+mkdir -p /shim /run/systemd/system /etc/billet
+# systemctl: the node is active until stopped (/stopped), the server never; the
+# node's invocation is $INVOCATION.
 cat >/shim/systemctl <<'EOF'
 #!/bin/sh
 printf 'systemctl %s\n' "$*" >>/calls
@@ -57,6 +59,13 @@ case "$1 $2" in
 esac
 exit 0
 EOF
+# timeout: records the bound the check runs under, then runs it.
+cat >/shim/timeout <<'EOF'
+#!/bin/sh
+printf 'timeout %s\n' "$*" >>/calls
+shift 3
+exec "$@"
+EOF
 # billet: the ending check answers $CHECK_EXIT and records its argv.
 cat >/usr/bin/billet <<'EOF'
 #!/bin/sh
@@ -64,31 +73,55 @@ printf 'billet %s\n' "$*" >>/calls
 printf '{"outcome":"stand-in"}\n'
 exit "${CHECK_EXIT:-0}"
 EOF
-chmod 0755 /shim/systemctl /usr/bin/billet
+chmod 0755 /shim/systemctl /shim/timeout /usr/bin/billet
+: >/etc/billet/billet.yaml
 
-run() { rm -f /calls /stopped; status=0; PATH="/shim:${PATH}" sh /preremove.sh remove 2>/err || status=$?; }
+# run starts from a running node; resume from one already stopped.
+run() { rm -f /stopped; resume; }
+resume() { rm -f /calls; status=0; PATH="/shim:${PATH}" sh /preremove.sh remove 2>/err || status=$?; }
 
-# A DRAIN PROVED: the removal goes on, and the check was asked about the
-# invocation read before the stop, with a drain required.
+# A DRAIN PROVED: the removal goes on, and the check was asked, under its
+# bound, about the invocation read before the stop, with a drain required.
 run
 [ "${status}" -eq 0 ] || { echo "a proved drain refused the removal: ${status}"; cat /err; exit 1; }
-grep -qx 'billet node ending check --config /etc/billet/billet.yaml --invocation inv-1 --drain --json' /calls ||
-    { echo 'the check was not asked about the stopped invocation with a drain:'; cat /calls; exit 1; }
+grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --invocation inv-1 --drain --json' /calls ||
+    { echo 'the check was not asked, bounded, about the stopped invocation with a drain:'; cat /calls; exit 1; }
 show_at=$(grep -n '^systemctl show -p InvocationID --value billet-node$' /calls | cut -d: -f1)
 stop_at=$(grep -n '^systemctl stop billet-node$' /calls | cut -d: -f1)
 check_at=$(grep -n '^billet node ending check' /calls | cut -d: -f1)
 [ "${show_at}" -lt "${stop_at}" ] && [ "${stop_at}" -lt "${check_at}" ] ||
     { echo 'not invocation, then stop, then check:'; cat /calls; exit 1; }
 
-# AN UNPROVED STOP, A CHECK THAT CANNOT TELL, AND NO INVOCATION refuse it.
-for exit_code in 2 3; do
+# AN UNPROVED STOP, A CHECK THAT CANNOT TELL, AND ONE THE BOUND ENDED refuse it.
+for exit_code in 2 3 124; do
     CHECK_EXIT=${exit_code} run
     [ "${status}" -eq 1 ] || { echo "check exit ${exit_code} let the removal go on: ${status}"; exit 1; }
-    grep -qF 'did not prove it drained' /err || { echo "check exit ${exit_code}: no refusal said"; cat /err; exit 1; }
+    grep -qF "did not prove it drained (check exited ${exit_code})" /err ||
+        { echo "check exit ${exit_code}: no refusal said"; cat /err; exit 1; }
 done
-INVOCATION= CHECK_EXIT=2 run
+
+# A RETRY OVER THE STOP A REFUSED REMOVAL LEFT is judged by what the stopped
+# node's last process left, and refused again until that is proved.
+CHECK_EXIT=2 resume
+[ "${status}" -eq 1 ] || { echo "a retry over an unproved stop let the removal go on: ${status}"; exit 1; }
+grep -qx 'billet node ending check --config /etc/billet/billet.yaml --drain --json' /calls ||
+    { echo 'the retry did not judge the stopped node standing:'; cat /calls; exit 1; }
+! grep -q '^systemctl stop billet-node$' /calls || { echo 'the retry stopped a stopped node'; cat /calls; exit 1; }
+resume
+[ "${status}" -eq 0 ] || { echo "a retry over a proved stop refused the removal: ${status}"; cat /err; exit 1; }
+
+# A HOST WITH NO CONFIGURATION never ran the packaged node and asks nothing.
+mv /etc/billet/billet.yaml /etc/billet/billet.yaml.away
+CHECK_EXIT=2 resume
+mv /etc/billet/billet.yaml.away /etc/billet/billet.yaml
+[ "${status}" -eq 0 ] || { echo "an unconfigured host refused the removal: ${status}"; cat /err; exit 1; }
+! grep -q '^billet ' /calls || { echo 'an unconfigured host asked the check'; cat /calls; exit 1; }
+
+# A RUNNING NODE SYSTEMD NAMES NO INVOCATION FOR is refused before its stop.
+INVOCATION= run
 [ "${status}" -eq 1 ] || { echo "an unnamed invocation let the removal go on: ${status}"; exit 1; }
-grep -qF -- '--invocation <unknown>' /err || { echo 'the unnamed invocation is not said'; cat /err; exit 1; }
+grep -qF 'names no invocation' /err || { echo 'the unnamed invocation is not said'; cat /err; exit 1; }
+! grep -q '^systemctl stop billet-node$' /calls || { echo 'an unnamed invocation was stopped'; cat /calls; exit 1; }
 
 # A CHECK THAT CANNOT RUN refuses it too.
 mv /usr/bin/billet /usr/bin/billet.away
