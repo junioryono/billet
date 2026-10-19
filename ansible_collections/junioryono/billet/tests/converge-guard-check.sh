@@ -527,7 +527,7 @@ WRAP
 # always continue to the real backing binary.
 if [ -n "${BILLET_GATE_ROLE:-}" ] && [ "${1:-}" != converge-guard ]; then
   case "$cmd" in
-    retire-*|migrate-endpoint|receipt|registration|release|check|local)
+    retire-*|migrate-endpoint|receipt|registration|release|check|local|ending)
       printf 'backing=0 cmd=%s whole-role-adapter\n' "$cmd" >>"$priv"
       "${PYTHON:-python3}" "$BILLET_GATE_ROLE_HELPER" answer "$cmd" "$input" "$@"
       exit "$?" ;;
