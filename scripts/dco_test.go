@@ -31,6 +31,7 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		event   string
+		tmpdir  bool // TMPDIR inside the repository, where git could find its config
 		author  string
 		owner   string // the repository's owner; empty is dcoOwner
 		commits func(t *testing.T, repo string)
@@ -163,6 +164,33 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			names: "forged by an alias",
 		},
 		{
+			// NOR FROM A TMPDIR INSIDE THE CHECKOUT, where git would walk up into
+			// the repository and read the alias anyway.
+			name:   "an alias with the temporary directory inside the repository",
+			author: "ada",
+			tmpdir: true,
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				fixtureGit(t, repo, "config", "trailer.sign.key", "Signed-off-by")
+				authored(t, repo, ada, "forged from inside", "sign: "+ada)
+			},
+			code:  1,
+			names: "forged from inside",
+		},
+		{
+			// GIT'S OUTPUT ENCODING DOES NOT DECIDE IT EITHER: UTF-16 would put a
+			// NUL between every letter of a valid sign-off.
+			name:   "a clone that logs in UTF-16",
+			author: "ada",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				fixtureGit(t, repo, "config", "i18n.logOutputEncoding", "UTF-16LE")
+				authored(t, repo, ada, "signed, logged in UTF-16", adaSign)
+			},
+		},
+		{
 			// NOR HIDE ONE: mapped to another key, a real sign-off would vanish.
 			name:   "a clone whose alias renames the sign-off",
 			author: "ada",
@@ -212,7 +240,16 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 				owner = dcoOwner
 			}
 
-			out, code := runDCO(t, repo, event, tc.author, owner)
+			var env []string
+			if tc.tmpdir {
+				tmp := filepath.Join(repo, "tmp")
+				if err := os.Mkdir(tmp, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				env = append(env, "TMPDIR="+tmp)
+			}
+
+			out, code := runDCO(t, repo, event, tc.author, owner, env...)
 			if code != tc.code {
 				t.Fatalf("dco.sh exited %d, want %d\n%s", code, tc.code, out)
 			}
@@ -390,8 +427,8 @@ func authored(t *testing.T, repo, author, subject string, paragraphs ...string) 
 }
 
 // runDCO runs scripts/dco.sh in repo as a CI run of event, for a pull request
-// opened by author in a repository owned by owner.
-func runDCO(t *testing.T, repo, event, author, owner string) (string, int) {
+// opened by author in a repository owned by owner, with env added.
+func runDCO(t *testing.T, repo, event, author, owner string, env ...string) (string, int) {
 	t.Helper()
 
 	script, err := filepath.Abs("dco.sh")
@@ -402,6 +439,7 @@ func runDCO(t *testing.T, repo, event, author, owner string) (string, int) {
 	cmd := exec.CommandContext(t.Context(), script)
 	cmd.Dir = repo
 	cmd.Env = append(fixtureGitEnv(), "DCO_EVENT="+event, "DCO_PR_AUTHOR="+author, "DCO_OWNER="+owner)
+	cmd.Env = append(cmd.Env, env...)
 
 	var out bytes.Buffer
 	cmd.Stdout = &out

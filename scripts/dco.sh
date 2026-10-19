@@ -70,18 +70,29 @@ fi
 # file and the environment, and an alias can forge a sign-off out of another line
 # or hide a real one. So the parse runs in an empty directory no repository is
 # found above, with no global, system or environment configuration.
-iso=$(mktemp -d)
+#
+# THE CEILING IS THE PARENT OF WHERE THE PARSE RUNS. git stops before entering a
+# ceiling, not at one, so the parse runs in a child of the temporary directory
+# and the ceiling is that directory's physical path; a TMPDIR inside a checkout
+# would otherwise let git walk up into it. The template is explicit because BSD
+# mktemp -d ignores TMPDIR without one, and GNU mktemp honours it.
+iso=$(mktemp -d "${TMPDIR:-/tmp}/dco.XXXXXX")
 trap 'rm -rf "$iso"' EXIT
+iso=$(cd -P "$iso" && pwd -P)
+mkdir "$iso/parse"
 parse_trailers() {
-	(cd "$iso" && env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_DIR \
+	(cd "$iso/parse" && env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_DIR \
 		GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 		GIT_CEILING_DIRECTORIES="$iso" git -c trailer.separators=: interpret-trailers --parse)
 }
 
 missing=0
 for c in $commits; do
-	want="Signed-off-by: $(git show -s --format='%an <%ae>' "$c")"
-	if ! trailers=$(git show -s --format=%B "$c" | parse_trailers); then
+	# UTF-8 BOTH TIMES: i18n.logOutputEncoding would otherwise re-encode the name
+	# and the message, breaking a valid sign-off or transliterating two different
+	# names into one.
+	want="Signed-off-by: $(git show -s --encoding=UTF-8 --format='%an <%ae>' "$c")"
+	if ! trailers=$(git show -s --encoding=UTF-8 --format=%B "$c" | parse_trailers); then
 		echo "dco: reading $c's trailers failed" >&2
 		exit 2
 	fi
