@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
@@ -41,7 +42,7 @@ func NodeRegistrationRecordPath(platform string) string {
 		return ""
 	}
 
-	return "/run/billet/registration/current"
+	return "/run/" + deploy.NodeRegistrationDirectory + "/current"
 }
 
 // registrationRecordPath is the record's path for this host, a variable so a

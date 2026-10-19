@@ -634,7 +634,7 @@ func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs
 	// the lock: a preview that reported a request the guard would refuse
 	// would be a lie the role acts on. The guard DIRECTORY is held to the
 	// same trust too, which the mutating path gets from its own open.
-	if r := judgeGuardShape(shape, m.run); r != nil {
+	if r := judgeGuardShape(shape, m.run, "a retirement"); r != nil {
 		return nil, r
 	}
 

@@ -802,8 +802,9 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	}
 
 	// ONE SPELLING OF THE PATH, in cmd/billet, internal/ops/host, internal/app and
-	// here.
-	spellings := 0
+	// here: derived from the directory the node unit declares (#168), and never
+	// written out whole beside it.
+	spellings, literals := 0, 0
 
 	for _, dir := range []string{"../../cmd/billet", "../ops/host", "../app", "."} {
 		entries, err := os.ReadDir(dir)
@@ -821,12 +822,14 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			spellings += bytes.Count(body, []byte(`"/run/billet/registration/current"`))
+			spellings += bytes.Count(body, []byte(`"/run/" + deploy.NodeRegistrationDirectory + "/current"`))
+			literals += bytes.Count(body, []byte(`"/run/billet/registration/current"`))
 		}
 	}
 
-	if spellings != 1 {
-		t.Errorf("the record's path is spelled %d times in production code, want once", spellings)
+	if spellings != 1 || literals != 0 {
+		t.Errorf("the record's path is derived %d times and written out %d times in production code, want "+
+			"derived once and never written out", spellings, literals)
 	}
 
 	// THE WRITER INSTALLS THROUGH THE ZERO-VALUE INSTALLER, no seam set.

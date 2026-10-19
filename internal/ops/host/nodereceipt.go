@@ -334,7 +334,7 @@ func refreshReceipt(ctx context.Context, env cli.Env, m receiptMode) (any, *endp
 			"), so no receipt can be bound to a process", "", "")
 	}
 
-	br, elapsed, problem := waitForRecord(ctx, insp, nodeUnit, identity, m.wait)
+	br, elapsed, problem := waitForRecord(ctx, insp, identity, m.wait)
 	if problem != "" {
 		return nil, endpointUnknown(endpointReasonUnit, problem, "", "")
 	}

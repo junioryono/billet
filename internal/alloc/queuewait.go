@@ -203,6 +203,63 @@ func (a *Allocator) jobWaits(ctx context.Context, since time.Time, limit int) ([
 	return out, partial, err
 }
 
+// AwaitingQueueTime is a started job with no GitHub queue time on record, and
+// what finds it in GitHub's REST record of its run.
+type AwaitingQueueTime struct {
+	LeaseID string
+	Tier    string
+	// Repository is owner/name.
+	Repository string
+	RunID      int64
+	// JobID is GitHub's workflow-job id, which the write presents so it can
+	// only complete the row of the job it names.
+	JobID string
+	// ScaleSetAssignedAt is when GitHub handed the job to the scale set, zero
+	// where no message carried it; a job is queued before that.
+	ScaleSetAssignedAt time.Time
+	// Cursor is where the page after this row begins.
+	Cursor QueueTimeCursor
+}
+
+// QueueTimeCursor is a position in the newest-first order of jobs awaiting a
+// queue time; the zero cursor is the newest.
+type QueueTimeCursor struct {
+	startedAt string
+	leaseID   string
+}
+
+// JobsAwaitingQueueTime reads at most limit jobs that started at or after
+// since and have no GitHub queue time, newest start first, from after.
+func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, after QueueTimeCursor,
+	limit int,
+) ([]AwaitingQueueTime, error) {
+	var out []AwaitingQueueTime
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListJobsAwaitingQueueTime(ctx,
+			ledgerdb.ListJobsAwaitingQueueTimeParams{
+				Since:         sql.NullString{String: ts(since), Valid: true},
+				BeforeStarted: after.startedAt, BeforeLease: after.leaseID, MaxRows: int64(limit),
+			})
+		if err != nil {
+			return fmt.Errorf("alloc: list jobs awaiting a queue time: %w", err)
+		}
+
+		out = make([]AwaitingQueueTime, 0, len(rows))
+		for i := range rows {
+			r := &rows[i]
+			out = append(out, AwaitingQueueTime{LeaseID: r.LeaseID, Tier: r.Tier,
+				Repository: r.Repo, RunID: r.RunID, JobID: r.GithubJobID,
+				ScaleSetAssignedAt: parseStamp(r.GithubScaleSetAssignedAt),
+				Cursor:             QueueTimeCursor{startedAt: r.StartedAt, leaseID: r.LeaseID}})
+		}
+
+		return nil
+	})
+
+	return out, err
+}
+
 // WaitSummary is one distribution of waits. Every percentile is nearest rank
 // over the jobs the part could be computed for; Count is how many those were.
 type WaitSummary struct {

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "repair-required",
+  "why": "the running node cannot publish its registration record, because billet-node.service declares RuntimeDirectory=billet/locks without billet/registration; its effective endpoint is unknown until the unit is repaired",
+  "next": "billet node repair-unit --config /etc/billet/billet.yaml --run ID --json",
+  "state": "nothing"
+}
