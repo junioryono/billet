@@ -46,16 +46,18 @@ func TestPackageRemovalRequiresTheNodesDrain(t *testing.T) {
 		"--name", name, "--mount", "type=bind,src="+script+",dst=/preremove.sh,readonly",
 		"-i", "ubuntu:24.04", "sh", "-eu")
 	cmd.Stdin = strings.NewReader(`
-mkdir -p /shim /run/systemd/system /etc/billet
+mkdir -p /shim /run/systemd/system
 # systemctl: the node is active until stopped (/stopped), the server never; the
 # node's invocation is $INVOCATION.
 cat >/shim/systemctl <<'EOF'
 #!/bin/sh
 printf 'systemctl %s\n' "$*" >>/calls
 case "$1 $2" in
-"is-active --quiet") [ "$3" = billet-node ] && [ ! -e /stopped ] && exit 0; exit 3 ;;
+"is-active --quiet") [ "$3" = billet-node ] && [ ! -e /stopped ] && exit 0
+    [ "$3" = billet-server ] && [ "${SERVER:-}" = active ] && exit 0; exit 3 ;;
 "show -p") printf '%s\n' "${INVOCATION-inv-1}"; exit 0 ;;
 "stop billet-node") : >/stopped; exit 0 ;;
+"stop billet-server") exit "${SERVER_STOP:-0}" ;;
 esac
 exit 0
 EOF
@@ -74,7 +76,6 @@ printf '{"outcome":"stand-in"}\n'
 exit "${CHECK_EXIT:-0}"
 EOF
 chmod 0755 /shim/systemctl /shim/timeout /usr/bin/billet
-: >/etc/billet/billet.yaml
 
 # run starts from a running node; resume from one already stopped.
 run() { rm -f /stopped; resume; }
@@ -104,18 +105,29 @@ done
 # node's last process left, and refused again until that is proved.
 CHECK_EXIT=2 resume
 [ "${status}" -eq 1 ] || { echo "a retry over an unproved stop let the removal go on: ${status}"; exit 1; }
-grep -qx 'billet node ending check --config /etc/billet/billet.yaml --drain --json' /calls ||
-    { echo 'the retry did not judge the stopped node standing:'; cat /calls; exit 1; }
+grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --drain --json' /calls ||
+    { echo 'the retry did not judge the stopped node standing, under the bound:'; cat /calls; exit 1; }
 ! grep -q '^systemctl stop billet-node$' /calls || { echo 'the retry stopped a stopped node'; cat /calls; exit 1; }
 resume
 [ "${status}" -eq 0 ] || { echo "a retry over a proved stop refused the removal: ${status}"; cat /err; exit 1; }
 
-# A HOST WITH NO CONFIGURATION never ran the packaged node and asks nothing.
-mv /etc/billet/billet.yaml /etc/billet/billet.yaml.away
+# A NODE NEVER STARTED is judged by what the package's node left, like any
+# other stopped node: the check decides, not this script.
 CHECK_EXIT=2 resume
-mv /etc/billet/billet.yaml.away /etc/billet/billet.yaml
-[ "${status}" -eq 0 ] || { echo "an unconfigured host refused the removal: ${status}"; cat /err; exit 1; }
-! grep -q '^billet ' /calls || { echo 'an unconfigured host asked the check'; cat /calls; exit 1; }
+[ "${status}" -eq 1 ] || { echo "a stopped node's unproved record let the removal go on: ${status}"; exit 1; }
+grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --drain --json' /calls ||
+    { echo 'the stopped node was not judged standing, under the bound:'; cat /calls; exit 1; }
+
+# THE SERVER stops after the node is judged, and a failed stop refuses.
+SERVER=active run
+[ "${status}" -eq 0 ] || { echo "a running server refused the removal: ${status}"; cat /err; exit 1; }
+check_at=$(grep -n '^billet node ending check' /calls | cut -d: -f1)
+server_at=$(grep -n '^systemctl stop billet-server$' /calls | cut -d: -f1)
+[ -n "${server_at}" ] && [ "${check_at}" -lt "${server_at}" ] ||
+    { echo 'the server was not stopped after the node was judged:'; cat /calls; exit 1; }
+SERVER=active SERVER_STOP=1 run
+[ "${status}" -eq 1 ] || { echo "a server that would not stop let the removal go on: ${status}"; exit 1; }
+grep -qF 'could not stop billet-server' /err || { echo 'the server refusal is not said'; cat /err; exit 1; }
 
 # A RUNNING NODE SYSTEMD NAMES NO INVOCATION FOR is refused before its stop.
 INVOCATION= run
@@ -128,6 +140,7 @@ mv /usr/bin/billet /usr/bin/billet.away
 run
 mv /usr/bin/billet.away /usr/bin/billet
 [ "${status}" -eq 1 ] || { echo "a missing billet let the removal go on: ${status}"; exit 1; }
+grep -qF 'did not prove it drained (check exited 127)' /err || { echo 'the missing billet is not said'; cat /err; exit 1; }
 
 # AN UPGRADE stops and asks nothing.
 rm -f /calls

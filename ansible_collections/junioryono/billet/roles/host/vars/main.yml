@@ -104,6 +104,9 @@ billet_retire_classify_bound: 180
 
 # Ordinary destinations are explicit operands; recovery keeps its manifest.
 billet_ordinary_config_path: /etc/billet/billet.yaml
+# Where a node this converge renders away keeps its ending record, until its
+# drain is proved (account.yml, services.yml).
+billet_node_leaving_path: /etc/billet/node-leaving
 billet_endpoint_temp_dir: /tmp
 billet_common_directories:
   - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }

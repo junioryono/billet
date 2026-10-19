@@ -1,4 +1,9 @@
 ---
+- name: Name the executables {{ billet_gate_restart_case.name }} asks, in order
+  ansible.builtin.set_fact:
+    billet_gate_restart_pairs: >-
+      {% set pairs = [] %}{% for w in billet_gate_restart_case.with | default([]) %}{% set parts = w.split(':', 1) %}{% set _ = pairs.append({'exe': billet_gate_restart_root.path ~ '/' ~ parts[0], 'config': parts[1] if parts | length > 1 else '/etc/billet/billet.yaml'}) %}{% endfor %}{{ pairs }}
+
 - name: Seed the scripted node for {{ billet_gate_restart_case.name }}
   ansible.builtin.copy:
     dest: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
@@ -14,43 +19,66 @@
     billet_gate_restart_failure: ""
     billet_gate_restart_failed: false
 
+# THE DRAIN REQUEST a case stands for, left by this converge or an earlier one.
+- name: Leave the drain request {{ billet_gate_restart_case.name }} stands for
+  ansible.builtin.copy:
+    dest: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.drain"
+    mode: "0644"
+    content: "drain\n"
+  when: billet_gate_restart_case.drain_requested | default(false)
+
 - name: Restart the node through the production task file
   environment:
     PATH: "{{ billet_gate_restart_root.path }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
     BILLET_GATE_RESTART_CASE: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
+  vars:
+    billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
+    billet_node_restart_poll_interval: "{{ billet_gate_restart_case.interval | default(1) }}"
+    billet_node_drain_request: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.drain"
+    # The scripted billet needs no root, and this check has none to give.
+    billet_ending_become: false
+    billet_config_install:
+      changed: "{{ billet_gate_restart_case.config_changed | default(false) }}"
   block:
     - name: Include the node restart, asking this converge's answerer
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: node-restart
       vars:
-        billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
-        billet_node_restart_poll_interval: "{{ billet_gate_restart_case.interval | default(1) }}"
-        # The scripted billet needs no root, and this check has none to give.
-        billet_ending_become: false
         # THE EXECUTABLE THAT ANSWERS, or none: a host whose answerer is from
         # before the record, where systemd's account is the floor.
         billet_exclusion_answerer: >-
           {{ (billet_gate_restart_root.path ~ '/billet') if billet_gate_restart_case.ending is defined else '' }}
-        billet_config_install:
-          changed: "{{ billet_gate_restart_case.config_changed | default(false) }}"
-      when: billet_gate_restart_case.with is not defined
+      when:
+        - billet_gate_restart_case.with is not defined
+        - billet_gate_restart_case.direct is not defined
 
-    # A CASE THAT NAMES ITS EXECUTABLES, in the order they are tried.
+    # A CASE THAT NAMES ITS EXECUTABLES, in the order they are tried, each
+    # `exe` or `exe:config`.
     - name: Include the node restart, asking the case's executables in order
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: node-restart
       vars:
-        billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
-        billet_node_restart_poll_interval: "{{ billet_gate_restart_case.interval | default(1) }}"
-        billet_ending_become: false
         billet_exclusion_answerer: ""
-        billet_ending_with: >-
-          {% set pairs = [] %}{% for exe in billet_gate_restart_case.with %}{% set _ = pairs.append({'exe': billet_gate_restart_root.path ~ '/' ~ exe, 'config': '/etc/billet/billet.yaml'}) %}{% endfor %}{{ pairs }}
-        billet_config_install:
-          changed: "{{ billet_gate_restart_case.config_changed | default(false) }}"
-      when: billet_gate_restart_case.with is defined
+        billet_ending_with: "{{ billet_gate_restart_pairs }}"
+      when:
+        - billet_gate_restart_case.with is defined
+        - billet_gate_restart_case.direct is not defined
+
+    # A QUESTION NO RESTART ASKS: the shared task file itself, as the callers
+    # that judge a node with no process to stop include it.
+    - name: Ask the node's ending directly
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: node-ending
+      vars:
+        billet_exclusion_answerer: "{{ billet_gate_restart_root.path }}/billet"
+        billet_ending_call: "{{ billet_gate_restart_case.direct.call | default('check') }}"
+        billet_ending_invocation: "{{ billet_gate_restart_case.direct.invocation | default('') }}"
+        billet_ending_drain: "{{ billet_gate_restart_case.direct.drain | default(false) }}"
+        billet_ending_state_dir: "{{ billet_gate_restart_case.direct.state_dir | default('') }}"
+      when: billet_gate_restart_case.direct is defined
   rescue:
     - name: Record the refusal
       ansible.builtin.set_fact:
@@ -70,7 +98,7 @@
   vars:
     billet_gate_restart_state: "{{ billet_gate_restart_state_raw.content | b64decode | from_json }}"
     billet_gate_restart_jobs: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^systemctl (stop|start|restart)') | list }}"
-    billet_gate_restart_endings: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^billet ') | list }}"
+    billet_gate_restart_endings: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^(billet|candidate) ') | list }}"
     billet_gate_restart_want_jobs: >-
       {{ (['systemctl stop --no-block billet-node.service'] * (billet_gate_restart_case.stops | default(1)))
          + (['systemctl start --no-block billet-node.service'] * (billet_gate_restart_case.starts | default(1))) }}

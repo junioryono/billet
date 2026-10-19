@@ -41,7 +41,8 @@
       copy is missing or redirected. Refusing automatic recovery.
 
 # THE INVOCATION BESIDE THE MAIN PROCESS, read before the stop because a clean
-# stop clears it; a unit that is gone has none and no stop to prove.
+# stop clears it; a unit that is gone has none and no stop to prove, and a
+# running process systemd names none for is refused before its stop.
 - name: Record the billet node's invocation before recovery stops it
   ansible.builtin.command:
     argv: [systemctl, show, --property=LoadState, --property=MainPID, --property=InvocationID, billet-node.service]
@@ -50,7 +51,8 @@
   failed_when: >-
     billet_recovery_node_before.rc != 0 or
     billet_recovery_node_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
-    billet_recovery_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1
+    billet_recovery_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1 or
+    ('MainPID=0' not in billet_recovery_node_before.stdout_lines and 'InvocationID=' in billet_recovery_node_before.stdout_lines)
   become: true
 
 - name: Make the stop before recovering the ledger a drain

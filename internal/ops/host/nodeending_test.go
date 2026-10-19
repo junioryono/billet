@@ -309,10 +309,17 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 	})
 
 	// THE RECORD A CONVERGE NAMES, under a configuration that no longer has a
-	// node: --state-dir; and a configuration with neither runs no node.
+	// node: --state-dir; and a configuration with neither, or none at all, is
+	// judged by the packaged node's record, which a node it ran may have left.
 	t.Run("a configuration without a node", func(t *testing.T) {
 		f := newEndingFixture(t)
 		f.begin(t, "inv-1", nodeending.Running)
+
+		packaged := newEndingFixture(t)
+		prevPackaged := endingPackagedStateDir
+		endingPackagedStateDir = packaged.stateDir
+
+		t.Cleanup(func() { endingPackagedStateDir = prevPackaged })
 
 		serverOnly := filepath.Join(t.TempDir(), "server-only.yaml")
 		dir := t.TempDir()
@@ -321,9 +328,22 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 			"  private_key_path: "+filepath.Join(dir, "app.pem")+"\ntiers:\n  - label: billet-2vcpu\n"+
 			"    provider: docker\n    vcpu: 2\n    memory: 8GiB\n    image: ubuntu:24.04\n", 0o600)
 
-		run := func(args ...string) endpointOut {
-			return runEndpoint(t, NodeEnding, "", append([]string{args[0], "--config", serverOnly}, args[1:]...)...)
+		// THE PACKAGE'S TEMPLATE before it is filled in: no node, and App ids
+		// the loader as a whole refuses.
+		template, err := os.ReadFile("../../../deploy/billet.yaml")
+		if err != nil {
+			t.Fatal(err)
 		}
+
+		unfilled := filepath.Join(t.TempDir(), "billet.yaml")
+		writeFile(t, unfilled, string(template), 0o600)
+
+		absent := filepath.Join(t.TempDir(), "absent.yaml")
+
+		runWith := func(cfg string, args ...string) endpointOut {
+			return runEndpoint(t, NodeEnding, "", append([]string{args[0], "--config", cfg}, args[1:]...)...)
+		}
+		run := func(args ...string) endpointOut { return runWith(serverOnly, args...) }
 
 		if o := run("check", "--drain", "--state-dir", f.stateDir); o.code != exitRefused ||
 			!strings.Contains(o.str("why"), "killed or crashed") {
@@ -331,13 +351,40 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 				"refusal", o.code, o.str("why"), o.err)
 		}
 
-		if o := run("check", "--drain"); o.code != 0 || !strings.Contains(o.str("why"), "runs no node") {
-			t.Fatalf("check under a configuration that runs no node: code %d (%s), want proved", o.code,
-				o.str("why"))
+		for _, cfg := range []string{serverOnly, unfilled, absent} {
+			if o := runWith(cfg, "check", "--drain"); o.code != 0 || o.str("proof") != nodeending.ProofSystemd {
+				t.Fatalf("check under %s with no packaged record: code %d (%s; %v), want proved by systemd's "+
+					"account", cfg, o.code, o.str("why"), o.err)
+			}
 		}
 
-		if o := run("check", "--invocation", "inv-1"); o.err == nil || !strings.Contains(o.err.Error(), "no --state-dir") {
-			t.Fatalf("check of an invocation with no record to read returned %v, want refused", o.err)
+		packaged.begin(t, "inv-p", nodeending.Running)
+
+		for _, cfg := range []string{serverOnly, unfilled, absent} {
+			if o := runWith(cfg, "check", "--drain"); o.code != exitRefused || !strings.Contains(o.str("why"), "inv-p") {
+				t.Fatalf("check under %s over a killed packaged node: code %d (%s; %v), want its refusal", cfg,
+					o.code, o.str("why"), o.err)
+			}
+		}
+
+		// THE READERS NAME THE RECORD THE SAME WAY.
+		if o := run("admit-start", "--state-dir", f.stateDir); o.code != exitRefused ||
+			!strings.Contains(o.str("why"), "inv-1") {
+			t.Fatalf("admit-start --state-dir: code %d (%s; %v), want the named record's refusal", o.code,
+				o.str("why"), o.err)
+		}
+
+		if o := run("admit-start"); o.code != exitRefused || !strings.Contains(o.str("why"), "inv-p") {
+			t.Fatalf("admit-start with no node: code %d (%s; %v), want the packaged record's refusal", o.code,
+				o.str("why"), o.err)
+		}
+
+		if o := run("show", "--state-dir", f.stateDir); o.err != nil || !strings.Contains(o.raw, `"inv-1"`) {
+			t.Fatalf("show --state-dir: %v\n%s, want the named record's entry", o.err, o.raw)
+		}
+
+		if o := run("show"); o.err != nil || !strings.Contains(o.raw, `"inv-p"`) {
+			t.Fatalf("show with no node: %v\n%s, want the packaged record's entry", o.err, o.raw)
 		}
 
 		// AN ACKNOWLEDGEMENT TAKES THE NODE'S OWN LOCK, which only a node
@@ -348,12 +395,38 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		env.Stdout = &usage
 
 		if err := NodeEnding(t.Context(), env, []string{"acknowledge", "--config", serverOnly, "--unrecorded",
-			"--state-dir", f.stateDir, "--json"}); err == nil || !strings.Contains(err.Error(), "state-dir") {
+			"--state-dir", f.stateDir, "--json"}); err == nil ||
+			!strings.Contains(err.Error(), "flag provided but not defined: -state-dir") {
 			t.Fatalf("acknowledge --state-dir returned %v, want the flag refused", err)
 		}
 
 		if o := run("acknowledge", "--unrecorded"); o.err == nil || !strings.Contains(o.err.Error(), "no node section") {
 			t.Fatalf("acknowledge under a configuration that runs no node returned %v, want refused", o.err)
+		}
+	})
+
+	// --STATE-DIR NAMES THE RECORD OVER A CONFIGURED NODE'S OWN, and claims
+	// nothing of the configured provider for it.
+	t.Run("--state-dir over a configured node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Drained)
+
+		other := t.TempDir()
+
+		if o := f.run(t, "check", "--drain", "--state-dir", other, "--invocation", "inv-9"); o.code != 0 ||
+			!o.boolean("recorded") {
+			t.Fatalf("check --state-dir over a configured node: code %d recorded %v (%s), want the floor recorded "+
+				"in the named record", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		rec, _, err := nodeending.Read(other)
+		if err != nil || len(rec.Entries) != 1 || rec.Entries[0].InvocationID != "inv-9" || rec.Entries[0].RunsOnHost {
+			t.Fatalf("the named record holds %+v (%v), want inv-9's account and no claim it ran on the host",
+				rec.Entries, err)
+		}
+
+		if o := f.run(t, "check", "--drain", "--invocation", "inv-1"); o.code != 0 {
+			t.Fatalf("the configured record after the named one was written: code %d (%s)", o.code, o.str("why"))
 		}
 	})
 }

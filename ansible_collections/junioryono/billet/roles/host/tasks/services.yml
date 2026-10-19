@@ -356,7 +356,8 @@
         (billet_candidate_config_compare.rc | default(2)) != 0
 
     # THE INVOCATION BESIDE THE MAIN PROCESS, read before the stop because a
-    # clean stop clears it: the stop is proved by that invocation's ending.
+    # clean stop clears it: the stop is proved by that invocation's ending, so
+    # a running process systemd names none for is refused before its stop.
     - name: Record the billet node's invocation before the transaction's stop
       ansible.builtin.command:
         argv: [systemctl, show, --property=MainPID, --property=InvocationID, billet-node.service]
@@ -365,7 +366,8 @@
       failed_when: >-
         billet_transaction_node_before.rc != 0 or
         billet_transaction_node_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
-        billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1
+        billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1 or
+        ('MainPID=0' not in billet_transaction_node_before.stdout_lines and 'InvocationID=' in billet_transaction_node_before.stdout_lines)
       when: billet_service_state_before_upgrade.results[1].rc != 4
 
     - name: Gracefully stop the billet node before changing its guest contract
@@ -1048,7 +1050,8 @@
   failed_when: >-
     billet_node_unwanted_before.rc != 0 or
     billet_node_unwanted_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
-    billet_node_unwanted_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1
+    billet_node_unwanted_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1 or
+    ('MainPID=0' not in billet_node_unwanted_before.stdout_lines and 'InvocationID=' in billet_node_unwanted_before.stdout_lines)
   when:
     - not billet_node_should_run
     - not ansible_check_mode
@@ -1066,11 +1069,34 @@
   become: true
   notify: billet unit files changed
 
+# WHERE A NODE THIS OR AN EARLIER CONVERGE RENDERED AWAY KEPT ITS RECORD
+# (account.yml), until its drain is proved.
+- name: Read where a node that may not run here kept its ending record
+  ansible.builtin.slurp:
+    src: "{{ billet_node_leaving_path }}"
+  register: billet_node_leaving
+  failed_when: >-
+    billet_node_leaving is failed and
+    'file not found' not in (billet_node_leaving.msg | default('') | lower)
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+  become: true
+
+- name: Resolve the ending record of a node that may not run here
+  ansible.builtin.set_fact:
+    billet_node_unwanted_state_dir: >-
+      {{ billet_previous_node_state_dir | default('', true)
+         or ((billet_node_leaving.content | b64decode | trim) if billet_node_leaving.content is defined else '') }}
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+
 # A NODE THAT LEAVES MUST HAVE DRAINED (#127): nothing will start again to
 # adopt what it left, and systemd's account of its stop says nothing of that.
 # One already stopped when the node leaves is judged by what its last process
-# left. The record is read where the installed configuration kept it, since
-# the configuration this converge renders names no node.
+# left. The record is read where the installed configuration kept it, or where
+# the marker says once the configuration names no node.
 - name: Prove the stop of a node that may not run here drained
   ansible.builtin.include_tasks: node-ending.yml
   vars:
@@ -1080,12 +1106,22 @@
                 or 'MainPID=0' in billet_node_unwanted_before.stdout_lines)
          else (billet_node_unwanted_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
     billet_ending_drain: true
-    billet_ending_state_dir: "{{ billet_previous_node_state_dir | default('') }}"
+    billet_ending_state_dir: "{{ billet_node_unwanted_state_dir }}"
   when:
     - not billet_node_should_run
     - not ansible_check_mode
     - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
-      or billet_previous_node_state_dir | default('') | length > 0
+      or billet_node_unwanted_state_dir | length > 0
+
+- name: Forget where a node whose drain is proved kept its ending record
+  ansible.builtin.file:
+    path: "{{ billet_node_leaving_path }}"
+    state: absent
+  become: true
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+    - billet_node_leaving.content is defined
 
 # EVERY OPERATION OF THIS CONVERGE THAT ASKED FOR A DRAIN IS DONE (#374): the
 # node is started or stopped as the converge leaves it, any restart was polled to

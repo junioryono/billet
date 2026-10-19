@@ -113,7 +113,8 @@
     - not ansible_check_mode
 
 # THE INVOCATION BESIDE THE MAIN PROCESS, read before the stop because a clean
-# stop clears it: the drain is proved by that invocation's own ending.
+# stop clears it: the drain is proved by that invocation's own ending, so a
+# running process systemd names none for is refused before its stop.
 - name: Record the billet node's invocation before the network drain
   ansible.builtin.command:
     argv: [systemctl, show, --property=MainPID, --property=InvocationID, billet-node.service]
@@ -122,7 +123,8 @@
   failed_when: >-
     billet_network_node_before.rc != 0 or
     billet_network_node_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
-    billet_network_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1
+    billet_network_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1 or
+    ('MainPID=0' not in billet_network_node_before.stdout_lines and 'InvocationID=' in billet_network_node_before.stdout_lines)
   when:
     - billet_network_requires_drain
     - billet_node_unit_load_state.stdout | trim != 'not-found'

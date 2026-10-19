@@ -63,6 +63,22 @@
       its ending. Nothing was stopped; converge again.
   when: billet_node_restart_before.stdout != '0'
 
+# A DRAIN WHERE ONE WAS ASKED FOR, by the request this converge wrote for a
+# changed configuration (services.yml) or one an earlier converge left when it
+# failed after writing it: the configuration is then already installed and
+# unchanged, but the obligation is not met. A node that handed its compute on
+# may not hand it to a process under another configuration.
+- name: Inspect whether a drain is asked of the node's stop
+  ansible.builtin.stat:
+    path: "{{ billet_node_drain_request | default('/var/run/billet-node-drain') }}"
+    get_checksum: false
+  register: billet_node_restart_drain_request
+
+- name: Note whether the node's stop must have drained
+  ansible.builtin.set_fact:
+    billet_node_restart_drain: >-
+      {{ billet_config_install.changed | default(false) | bool or billet_node_restart_drain_request.stat.exists }}
+
 # THE CONTROLLER'S CLOCK, which is the one every `until` below is evaluated on,
 # as epoch seconds: `now(utc=true)` is a naive datetime that `.timestamp()`
 # reads as local time, which moves by an hour across a daylight-saving change.
@@ -139,15 +155,24 @@
           'MainPID=0' not in billet_node_restart_stop_poll.stdout_lines | default([]) or
           'Job=' not in billet_node_restart_stop_poll.stdout_lines | default([])
 
-    # A DRAIN WHERE ONE WAS ASKED FOR: a changed configuration wrote the
-    # request before this stop (services.yml), and a node that handed its
-    # compute on may not hand it to a process under another configuration.
     - name: Prove the node's stop by its own ending
       ansible.builtin.include_tasks: node-ending.yml
       vars:
         billet_ending_call: check
         billet_ending_invocation: "{{ billet_node_restart_invocation }}"
-        billet_ending_drain: "{{ billet_config_install.changed | default(false) | bool }}"
+        billet_ending_drain: "{{ billet_node_restart_drain }}"
+
+# A NODE WITH NO PROCESS TO STOP, where a drain is asked for, is judged by what
+# its last process left before anything starts over it.
+- name: Prove a stopped node drained before its start
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: check
+    billet_ending_invocation: ""
+    billet_ending_drain: true
+  when:
+    - billet_node_restart_before.stdout == '0'
+    - billet_node_restart_drain | bool
 
 - name: Admit the node's start over its last ending
   ansible.builtin.include_tasks: node-ending.yml

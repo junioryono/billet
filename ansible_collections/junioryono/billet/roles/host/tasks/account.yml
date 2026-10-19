@@ -479,6 +479,23 @@
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
 
+# A NODE THIS CONVERGE RENDERS AWAY KEEPS ITS RECORD'S PATH (#127): its stop
+# must be proved drained (services.yml), and once the configuration no longer
+# names a node only this says where the record is, for this converge and for
+# any retry after one that failed before the proof. Removed once it is proved.
+- name: Remember where a node this converge removes keeps its ending record
+  ansible.builtin.copy:
+    content: "{{ billet_previous_node_state_dir }}\n"
+    dest: "{{ billet_node_leaving_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when:
+    - billet_previous_config.get('node') is mapping
+    - billet_effective_config.get('node') is not mapping
+    - not ansible_check_mode
+
 - name: Render billet configuration
   vars:
     billet_config_document: "{{ billet_effective_config }}"

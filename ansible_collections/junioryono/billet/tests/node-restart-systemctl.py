@@ -51,29 +51,35 @@ def phase_unit():
     return state['before']
 
 
-if tool == 'billet':
-    # billet node ending <call> --config ... [--invocation I [--drain]] --json
+if tool in ('billet', 'candidate'):
+    # billet node ending <call> --config ... [--invocation I] [--drain]
+    # [--state-dir D] --json, answered for the executable asked: `ending` maps
+    # a call to its answer, or an executable to such a map.
     call = args[2] if args[:2] == ['node', 'ending'] and len(args) > 2 else ''
-    answer = state.get('ending', {}).get(call)
+    answers = state.get('ending', {})
+    answer = answers.get(tool, {}).get(call) if tool in answers else answers.get(call)
     save()
     if answer is None:
-        sys.exit('the node-restart billet fake does not answer ' + repr(args))
+        sys.exit('the node-restart ' + tool + ' fake does not answer ' + repr(args))
     if 'stderr' in answer:
         sys.stderr.write(answer['stderr'])
     if 'fixture' in answer:
         text = (fixtures / (answer['fixture'] + '.json')).read_text()
-        # A CHECK ANSWERS THE QUESTION ASKED: the fixture's invocation and drain
-        # become the ones on the command line, unless the case keeps them to
-        # stand for an answer to another question.
+        doc = json.loads(text)
+        # A CHECK ANSWERS THE QUESTION ASKED. The fixture's invocation becomes
+        # the one asked, everywhere it is named, unless the case keeps it to
+        # stand for an answer to another question; its drain is the CLI's own,
+        # and a fixture that answers another drain question is a case's
+        # mistake, refused here rather than rewritten.
         if call == 'check' and not answer.get('verbatim'):
-            doc = json.loads(text)
-            doc.pop('invocation', None)
-            doc.pop('drain', None)
-            if '--invocation' in args:
-                doc['invocation'] = args[args.index('--invocation') + 1]
-            if '--drain' in args:
-                doc['drain'] = True
-            text = json.dumps(doc, indent=2) + '\n'
+            if ('--drain' in args) != doc.get('drain', False):
+                sys.exit('fixture ' + answer['fixture'] + ' answers another drain question than ' + repr(args))
+            asked = args[args.index('--invocation') + 1] if '--invocation' in args else None
+            if (asked is None) != ('invocation' not in doc):
+                sys.exit('fixture ' + answer['fixture'] + ' answers another invocation question than ' + repr(args))
+            if asked is not None:
+                text = text.replace('"' + doc['invocation'] + '"', '"' + asked + '"').replace(
+                    '--invocation ' + doc['invocation'], '--invocation ' + asked)
         sys.stdout.write(text)
     if 'raw' in answer:
         sys.stdout.write(answer['raw'])

@@ -97,11 +97,19 @@ func NodeEnding(ctx context.Context, env cli.Env, args []string) error {
 type endingTarget struct {
 	cfg     *config.Config
 	cfgPath string
-	// stateDir is --state-dir, or the configuration's node.state_dir; empty
-	// when neither names one.
-	stateDir   string
+	// stateDir is --state-dir, the configuration's node.state_dir, or, where
+	// the configuration names no node, the packaged one.
+	stateDir string
+	// runsOnHost is the configured provider's, and only for its own record: a
+	// record named any other way says nothing of what compute survives a
+	// reboot, so it asserts none.
 	runsOnHost bool
 }
+
+// endingPackagedStateDir is the packaged configuration's node.state_dir, read
+// where a configuration names no node: a node the package ran under it may
+// have left a record there however the configuration has been edited since.
+var endingPackagedStateDir = "/var/lib/billet/node"
 
 // endingStateDirFlag adds --state-dir to a subcommand that reads a record
 // another configuration may have named.
@@ -112,7 +120,7 @@ func endingStateDirFlag(fs *flag.FlagSet) *string {
 }
 
 // endingFlags adds --config and --json to one subcommand's flag set, parses
-// it, and loads the configuration; stateDir is its --state-dir, or nil for a
+// it, and reads the configuration; stateDir is its --state-dir, or nil for a
 // subcommand that reads only the configuration's own record.
 func endingFlags(fs *flag.FlagSet, args []string, stateDir *string) (endingTarget, error) {
 	cfgPath := cli.AddConfigFlag(fs)
@@ -130,30 +138,39 @@ func endingFlags(fs *flag.FlagSet, args []string, stateDir *string) (endingTarge
 		return endingTarget{}, fmt.Errorf("%s answers as JSON; pass --json", fs.Name())
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := readEndingConfig(*cfgPath)
 	if err != nil {
 		return endingTarget{}, err
 	}
 
 	t := endingTarget{cfg: cfg, cfgPath: *cfgPath, stateDir: *stateDir}
-	if cfg.Node != nil {
-		if t.stateDir == "" {
-			t.stateDir = cfg.Node.StateDir
-		}
 
+	switch {
+	case cfg.Node != nil && (t.stateDir == "" || t.stateDir == cfg.Node.StateDir):
+		t.stateDir = cfg.Node.StateDir
 		t.runsOnHost = cfg.Node.Provider.RunsOnHost()
+	case cfg.Node == nil && t.stateDir == "":
+		t.stateDir = endingPackagedStateDir
 	}
 
 	return t, nil
 }
 
-// needStateDir refuses a subcommand that has no record to read.
-func (t endingTarget) needStateDir() error {
-	if t.stateDir == "" {
-		return fmt.Errorf("%s has no node section, and no --state-dir names the record to read", t.cfgPath)
+// readEndingConfig reads the node section alone: the record is judged on a
+// host whose configuration the loader as a whole would refuse (the package's
+// template before it is filled in, which a removal still has to judge), and
+// a configuration that is positively absent names no node.
+func readEndingConfig(path string) (*config.Config, error) {
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &config.Config{}, nil
 	}
 
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	return parseConfiguration(path, body, false)
 }
 
 func endingShow(env cli.Env, args []string) error {
@@ -161,10 +178,6 @@ func endingShow(env cli.Env, args []string) error {
 
 	target, err := endingFlags(fs, args, endingStateDirFlag(fs))
 	if err != nil {
-		return err
-	}
-
-	if err := target.needStateDir(); err != nil {
 		return err
 	}
 
@@ -209,25 +222,11 @@ func endingCheck(ctx context.Context, env cli.Env, args []string) error {
 
 	// A NODE THAT HAD NO PROCESS TO STOP, asked about by a retry or by an
 	// operation that found it already down: what its last process left
-	// decides, at the stop's own standard. A configuration with no node and no
-	// --state-dir names no record, and runs no node to have left anything.
+	// decides, at the stop's own standard.
 	if *invocation == "" {
-		var j nodeending.Judgement
-
-		switch target.stateDir {
-		case "":
-			j = nodeending.Judgement{Verdict: nodeending.Proved, Answer: nodeending.Proved.String(),
-				Proof: nodeending.ProofRecord, Why: target.cfgPath + " runs no node and no --state-dir names a " +
-					"record, so no node process here can have left anything"}
-		default:
-			j = nodeending.JudgeStanding(target.stateDir, *drain, sample)
-		}
+		j := nodeending.JudgeStanding(target.stateDir, *drain, sample)
 
 		return answerEnding(env, endingAnswer{Command: "check", Drain: *drain, Unit: observed, judgement: &j})
-	}
-
-	if err := target.needStateDir(); err != nil {
-		return err
 	}
 
 	j, recorded := nodeending.JudgeStop(target.stateDir, *invocation, *drain, target.runsOnHost, sample, nil)
@@ -246,10 +245,6 @@ func endingAdmitStart(ctx context.Context, env cli.Env, args []string) error {
 
 	target, err := endingFlags(fs, args, endingStateDirFlag(fs))
 	if err != nil {
-		return err
-	}
-
-	if err := target.needStateDir(); err != nil {
 		return err
 	}
 

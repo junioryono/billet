@@ -59,10 +59,10 @@ if [ -d /run/systemd/system ]; then
     # second signal cut short; only the node's own ending says it drained. So a
     # running node's stop is checked by the invocation read before it (a clean
     # stop clears it), and a node already stopped by what its last process left:
-    # one killed earlier may have left guests this removal would orphan. A host
-    # with no configuration never ran the packaged node, which reads it. Each
-    # verdict is the check's exit status, bounded, taken before anything reads
-    # its output.
+    # one killed earlier may have left guests this removal would orphan,
+    # whatever the configuration says now: one that names no node, or none at
+    # all, is judged by the packaged node's record. Each verdict is the check's
+    # exit status, bounded, taken before anything reads its output.
     check_node_ending() {
         status=0
         timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml \
@@ -93,7 +93,7 @@ if [ -d /run/systemd/system ]; then
         fi
 
         check_node_ending --invocation "${invocation}"
-    elif [ -e /etc/billet/billet.yaml ]; then
+    else
         check_node_ending
     fi
 

@@ -20,6 +20,12 @@ func TestTheEndingFixturesAreTheCommandsOwn(t *testing.T) {
 
 			return f.run(t, "check", "--invocation", "inv-1", "--drain")
 		},
+		"check-proved-handoff": func(t *testing.T, f *endingFixture) endpointOut {
+			t.Helper()
+			f.begin(t, "inv-1", nodeending.HandedOff)
+
+			return f.run(t, "check", "--invocation", "inv-1")
+		},
 		"check-proved-floor": func(t *testing.T, f *endingFixture) endpointOut {
 			t.Helper()
 

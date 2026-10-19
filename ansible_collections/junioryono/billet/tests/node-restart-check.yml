@@ -22,6 +22,7 @@
     billet_gate_check: billet node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --json
     billet_gate_admit: billet node ending admit-start --config /etc/billet/billet.yaml --json
     billet_gate_check_drain: billet node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --drain --json
+    billet_gate_check_stopped: billet node ending check --config /etc/billet/billet.yaml --drain --json
     billet_gate_restart_cases:
       - name: restarts
         wait: 30
@@ -43,7 +44,7 @@
         after:
           - {ActiveState: active, SubState: running, MainPID: "200"}
         ending:
-          check: {fixture: check-proved, rc: 0}
+          check: {fixture: check-proved-handoff, rc: 0}
           admit-start: {fixture: admit-start-proved, rc: 0}
         succeeds: true
         endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
@@ -58,7 +59,7 @@
         succeeds: false
         starts: 0
         endings: ["{{ billet_gate_check }}"]
-        message: [killed or crashed, "billet node ending acknowledge --config /etc/billet/billet.yaml --invocation inv-1 --json", The node is left as it is]
+        message: [killed or crashed, "billet node ending acknowledge --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --json", The node is left as it is]
       - name: stop-unknown
         before: "{{ billet_gate_running }}"
         after:
@@ -73,7 +74,7 @@
         after:
           - {ActiveState: active, SubState: running, MainPID: "200"}
         ending:
-          check: {fixture: check-proved, rc: 0}
+          check: {fixture: check-proved-handoff, rc: 0}
           admit-start: {fixture: admit-start-unproved, rc: 2}
         succeeds: false
         starts: 0
@@ -123,7 +124,7 @@
         after:
           - {ActiveState: active, SubState: running, MainPID: "200"}
         ending:
-          check: {fixture: check-proved, rc: 0}
+          check: {fixture: check-proved-handoff, rc: 0}
           admit-start: {fixture: admit-start-proved, rc: 0}
         succeeds: true
         endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
@@ -157,7 +158,7 @@
         after:
           - {ActiveState: active, SubState: running, MainPID: "200"}
         ending:
-          check: {fixture: check-proved, rc: 0}
+          check: {fixture: check-proved-handoff, rc: 0}
           admit-start: {fixture: admit-start-proved, rc: 0}
         succeeds: true
         endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
@@ -183,6 +184,116 @@
         starts: 0
         message: [killed or crashed]
         absent: [from before the node's ending record]
+      # THE FIRST ANSWER DECIDES, whatever a later one would have said: the
+      # stopped node's own release first, a candidate after it.
+      - name: first-answer-refuses
+        with: [billet, candidate]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          billet: {check: {fixture: check-unproved, rc: 2}}
+          candidate: {check: {fixture: check-proved-handoff, rc: 0}}
+        succeeds: false
+        starts: 0
+        endings: ["{{ billet_gate_check }}", "candidate {{ billet_gate_check[7:] }}"]
+        message: [killed or crashed]
+      - name: first-answer-proves
+        wait: 30
+        with: [candidate, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          billet: {check: {fixture: check-unproved, rc: 2}, admit-start: {fixture: admit-start-unproved, rc: 2}}
+          candidate: {check: {fixture: check-proved-handoff, rc: 0}, admit-start: {fixture: admit-start-proved, rc: 0}}
+        succeeds: true
+      # EACH EXECUTABLE READS THE CONFIGURATION IT IS PAIRED WITH.
+      - name: each-with-its-own-configuration
+        wait: 30
+        with: [older, "candidate:/var/lib/billet/recovery/billet.yaml.candidate"]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          candidate: {check: {fixture: check-proved-handoff, rc: 0}, admit-start: {fixture: admit-start-proved, rc: 0}}
+        succeeds: true
+        endings:
+          - candidate node ending check --config /var/lib/billet/recovery/billet.yaml.candidate --invocation 0123456789abcdef0123456789abcdef --json
+          - candidate node ending admit-start --config /var/lib/billet/recovery/billet.yaml.candidate --json
+      # A DRAIN ASKED FOR BY A REQUEST AN EARLIER CONVERGE LEFT, with the
+      # configuration already installed: the stop must still have drained.
+      - name: drain-request-left-behind
+        wait: 30
+        drain_requested: true
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      # A STOPPED NODE WHERE A DRAIN IS ASKED FOR is judged by what its last
+      # process left before anything starts over it: a handoff is not a drain.
+      - name: stopped-handoff-under-a-drain
+        drain_requested: true
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0", InvocationID: ""}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "300"}
+        ending:
+          check: {fixture: check-stopped-unproved, rc: 2}
+        succeeds: false
+        stops: 0
+        starts: 0
+        endings: ["{{ billet_gate_check_stopped }}"]
+        message: [had no process to stop, never adopted]
+      - name: stopped-drained-under-a-changed-configuration
+        wait: 30
+        config_changed: true
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0", InvocationID: ""}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "300"}
+        ending:
+          check: {fixture: check-stopped-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        stops: 0
+        endings: ["{{ billet_gate_check_stopped }}", "{{ billet_gate_admit }}"]
+      # THE SHARED TASK FILE ASKED AS THE CALLERS THAT JUDGE A NODE WITH NO
+      # PROCESS TO STOP ASK IT: no invocation, the drain, and the record a
+      # configuration no longer names.
+      - name: standing-proved
+        direct: {drain: true, state_dir: /var/lib/old-node}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        ending:
+          check: {fixture: check-stopped-proved, rc: 0}
+        succeeds: true
+        stops: 0
+        starts: 0
+        endings: [billet node ending check --config /etc/billet/billet.yaml --drain --state-dir /var/lib/old-node --json]
+      - name: standing-unproved
+        direct: {drain: true}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        ending:
+          check: {fixture: check-stopped-unproved, rc: 2}
+        succeeds: false
+        stops: 0
+        starts: 0
+        endings: ["{{ billet_gate_check_stopped }}"]
+        message: [had no process to stop, never adopted, "--invocation inv-1"]
+      - name: standing-answered-about-an-invocation
+        direct: {drain: true}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        ending:
+          check: {raw: '{"schema":1,"command":"check","outcome":"proved","proof":"record","why":"x","invocation":"inv-1","drain":true}', rc: 0}
+        succeeds: false
+        stops: 0
+        starts: 0
+        message: [cannot read, invocation]
       # A MEMBER THE PARSER CANNOT READ, AND AN EXIT THAT DOES NOT MATCH THE
       # OUTCOME, end the restart with the node stopped.
       - name: answer-with-a-surprise
@@ -382,7 +493,7 @@
         content: |
           #!/bin/sh
           exec '{{ ansible_playbook_python }}' '{{ playbook_dir }}/node-restart-systemctl.py' {{ item }} "$BILLET_GATE_RESTART_CASE" "$@"
-      loop: [systemctl, billet]
+      loop: [systemctl, billet, candidate]
 
     # A RELEASE FROM BEFORE THE RECORD, which refuses the word as cmdNode does.
     - name: Install a billet from before the node's ending record
