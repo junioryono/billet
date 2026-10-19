@@ -110,7 +110,10 @@ EMBEDDED = [
       ("https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-10.txt",
        "   Copyright (c) 2022 IETF Trust", "than English."),
       ("https://www.rfc-editor.org/rfc/rfc6265.txt",
-       "   Copyright (c) 2011 IETF Trust", "described in the Simplified BSD License.")],
+       "   Copyright (c) 2011 IETF Trust", "described in the Simplified BSD License."),
+      # The notice continues past a page break, so its second paragraph is its own cut.
+      ("https://www.rfc-editor.org/rfc/rfc6265.txt",
+       "   This document may contain material from IETF Documents or IETF", "than English.")],
      None),
 ]
 
@@ -184,7 +187,7 @@ def render(version, sha256, fetch):
         if carrier not in resolved:
             raise ValueError(f"EMBEDDED names {carrier}, which the lockfile does not resolve")
         parts = source if isinstance(source, list) else [(source, None, until)]
-        urls = ", ".join(p[0] for p in parts if not isinstance(p, str))
+        urls = ", ".join(dict.fromkeys(p[0] for p in parts if not isinstance(p, str)))
         body = "\n\n".join(p if isinstance(p, str) else text(fetch(p[0]), p[2], p[1]) for p in parts)
         sections.append(f"{name}, embedded in {carrier}\nIn: {where}\nSource: {urls}\n\n{body}")
 
