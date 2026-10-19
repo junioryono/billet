@@ -172,7 +172,7 @@ def require_observable_command(module, args, phase):
     if argv[0] == '/usr/bin/billet':
         require(argv[1:] in [['version'], ['--version']]
                 or argv[1:3] in [['release', 'inspect'], ['server', 'retire'], ['node', 'migrate-endpoint'],
-                                 ['node', 'receipt'], ['rollout', 'registration']],
+                                 ['node', 'receipt'], ['node', 'ending'], ['rollout', 'registration']],
                 'unmodeled billet command cannot prove protected-path inactivity')
         return  # Unknown subcommands are refused by the recording answerer.
     require(argv in [['ip', '-json', 'link', 'show'], ['networkctl', 'reload'],
