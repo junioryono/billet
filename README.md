@@ -128,7 +128,7 @@ billet is Apache-2.0 ([LICENSE](LICENSE)), with one exception:
 | Path | License |
 |---|---|
 | Everything outside `ee/` | [Apache License 2.0](LICENSE) |
-| [`ee/`](ee/) | [The billet Enterprise License](ee/LICENSE): free to read, modify and run for development and testing; production use needs a subscription |
+| [`ee/`](ee/) | [The billet Enterprise License](ee/LICENSE): free to read, and to modify and run to develop, test or evaluate it; any other use, including running it in your own CI, needs a subscription |
 | Third-party code billet carries | Its own license, kept beside it |
 
 Nothing outside `ee/` depends on it, so the Apache-licensed build is complete on its own. Copyright 2026 Junior Yono; [NOTICE](NOTICE) is the notice a redistribution carries. Apple Silicon support requires [Tart](https://tart.run), which is licensed FSL-1.1-ALv2 and is an external dependency you install yourself, like Docker or Ceph.

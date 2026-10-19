@@ -1,6 +1,6 @@
 # ee/
 
-billet's enterprise features live here, under [the billet Enterprise License](LICENSE) rather than the Apache License 2.0 that covers the rest of the repository. You may read, modify and run this code for development and testing without a subscription; using it in production needs one.
+billet's enterprise features live here, under [the billet Enterprise License](LICENSE) rather than the Apache License 2.0 that covers the rest of the repository. You may read this code, and modify and run it to develop, test or evaluate it, without a subscription. Any other use, including running it in your own CI, is production use and needs one.
 
 It is empty for now. Single sign-on (SAML, SCIM and role mapping), roles and permissions, audit logs and policies are the features planned for it.
 

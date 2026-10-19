@@ -68,7 +68,9 @@ fi
 missing=0
 for c in $commits; do
 	want="Signed-off-by: $(git show -s --format='%an <%ae>' "$c")"
-	if ! trailers=$(git show -s --format=%B "$c" | git interpret-trailers --parse); then
+	# THE COLON IS PINNED: a trailer.separators setting would otherwise stop git
+	# reading the line `git commit -s` writes as a trailer at all.
+	if ! trailers=$(git show -s --format=%B "$c" | git -c trailer.separators=: interpret-trailers --parse); then
 		echo "dco: reading $c's trailers failed" >&2
 		exit 2
 	fi

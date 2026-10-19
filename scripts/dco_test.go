@@ -137,6 +137,18 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			names: "claims to be the owner",
 		},
 		{
+			// GIT'S CONFIGURATION DOES NOT DECIDE WHAT A TRAILER IS: with "="
+			// as the only separator, git would not read `git commit -s`'s line.
+			name:   "a clone configured with another trailer separator",
+			author: "ada",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				fixtureGit(t, repo, "config", "trailer.separators", "=")
+				authored(t, repo, ada, "signed under odd configuration", adaSign)
+			},
+		},
+		{
 			// THE OWNER OF THIS REPOSITORY, not of some repository: in a fork or
 			// a repository another account owns, the same login is a contributor.
 			name:   "the usual owner in a repository someone else owns",
