@@ -701,6 +701,22 @@ func ParseManifest(data []byte) (*Manifest, error) {
 			"not a single document and this refuses to guess which part is authoritative")
 	}
 
+	// THE KEYS, NOT THE DECODED VALUES. `"components":[]` or `"completion_contract":
+	// null` decode to the zero value, so Validate cannot tell a document that
+	// carries the schema 3 fields empty from one that never named them.
+	if m.Schema != SchemaV3 {
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(data, &top); err != nil {
+			return nil, fmt.Errorf("imagesource: could not read the manifest: %w", err)
+		}
+		for _, key := range []string{"components", "completion_contract"} {
+			if _, found := top[key]; found {
+				return nil, fmt.Errorf("imagesource: a schema %d manifest carries %q, which only "+
+					"schema %d describes", m.Schema, key, SchemaV3)
+			}
+		}
+	}
+
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}

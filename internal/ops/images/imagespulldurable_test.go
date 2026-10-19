@@ -824,6 +824,48 @@ func pullWithin(t *testing.T, fixture *pullFixture, within time.Duration) error 
 	}
 }
 
+// AN IMAGE THAT LEAVES COMPONENTS OUT IS NEVER IMPORTED BY A BUILD THAT CANNOT
+// INSTALL THEM, and it is refused before its assets are copied into staging, the
+// sideloaded equivalent of a download.
+func TestAPullRefusesAnImageThisBuildCannotCompleteBeforeStagingIt(t *testing.T) {
+	fixture := newPullFixture(t, leavingOut)
+
+	// THE PART IS THERE TO COPY, so a refusal that came only after staging would
+	// leave it in staging rather than failing for its absence.
+	part := fixture.manifest.RootfsMultipart.Parts[0].Name
+	writeAsset(t, filepath.Join(fixture.from, part), []byte("a root filesystem, for the purposes of this test"))
+
+	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
+
+	err := fixture.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "leaves out google-chrome for each deployment "+
+		"to install") {
+		t.Fatalf("got %v, want the image refused as one this build cannot complete", err)
+	}
+
+	if got := fixture.publisher.calls(); got != 0 {
+		t.Fatalf("ImportGeneration was reached %d times for an image this build cannot complete", got)
+	}
+
+	var staged []string
+	walkErr := filepath.WalkDir(fixture.staging, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			staged = append(staged, path)
+		}
+
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) {
+		t.Fatalf("read the staging directory: %v", walkErr)
+	}
+	if len(staged) != 0 {
+		t.Fatalf("the refused image was staged anyway: %v", staged)
+	}
+}
+
 type fixtureOption func(*imagesource.Manifest)
 
 func builtDaysAgo(days int) fixtureOption {

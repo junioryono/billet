@@ -107,6 +107,25 @@ func TestAComponentIsRefusedUnlessWellFormed(t *testing.T) {
 	})
 }
 
+// The schema 3 keys are refused before schema 3 even when empty, which a struct
+// round trip cannot express: omitempty drops them.
+func TestAnEmptySchema3KeyIsRefusedBeforeSchema3(t *testing.T) {
+	base := string(mustJSON(t, validMultipartManifest()))
+	for _, extra := range []string{
+		`"components":[]`, `"components":null`, `"completion_contract":""`,
+		`"completion_contract":null`,
+	} {
+		t.Run(extra, func(t *testing.T) {
+			doc := strings.TrimSuffix(base, "}") + "," + extra + "}"
+
+			_, err := ParseManifest([]byte(doc))
+			if err == nil || !strings.Contains(err.Error(), "which only schema 3 describes") {
+				t.Fatalf("got %v, want the key refused under schema 2", err)
+			}
+		})
+	}
+}
+
 // A build that reads schema 3 but cannot complete an image refuses it as unusable,
 // naming what it leaves out, so a deployment is never moved onto an image without
 // what its tiers expect.

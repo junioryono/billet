@@ -175,7 +175,9 @@ Per-host policy, not a roster: `name`, `provider` (decides only whether an unpin
 
 `source` (empty means billet's own published images), `signing_identity` and `signing_issuer` (both required for a non-default source), and `accept`.
 
-`accept` names the components of GitHub's runner image whose licenses this deployment accepts: `android-sdk`, `codeql`, `firefox`, `google-chrome` and `microsoft-edge`. billet's published guest image leaves them out, because their licenses forbid billet redistributing them. A pull installs each accepted one from its vendor into the new image, inside a microVM, before the image is imported. A name that is not one of the five, or a name written twice, is refused. Empty is the default, and nothing is ever accepted on the operator's behalf.
+`accept` names the components of GitHub's runner image whose licenses this deployment accepts: `android-sdk`, `codeql`, `firefox`, `google-chrome` and `microsoft-edge`. A name that is not one of the five, or a name written twice, is refused. Empty is the default, and nothing is ever accepted on the operator's behalf.
+
+The five components' licenses forbid billet redistributing them. So billet's published guest image is to leave them out, and a pull is to install each accepted one from its vendor into the new image, inside a microVM, before importing it (#584). This release reads the setting but installs nothing. Today's published images still contain all five, and `billet images pull` and `billet images refresh` refuse an image that leaves any out, before downloading it, rather than import it without them.
 
 ## `release`
 

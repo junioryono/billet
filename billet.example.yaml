@@ -1244,10 +1244,15 @@ tiers:
 # ── images ───────────────────────────────────────────────────────────────────
 #
 # The guest image a Firecracker node pulls. billet publishes it built from
-# GitHub's own runner-image template, except for five components whose licenses
-# forbid billet redistributing them. A deployment that accepts a component's
-# license here has it installed from its vendor into every new image, inside a
-# microVM, before the image is used; one that accepts nothing runs without it.
+# GitHub's own runner-image template. Five of its components have licenses that
+# forbid billet redistributing them, so billet's published image is to leave them
+# out, and a deployment that accepts a component's license here is to have it
+# installed from its vendor into every new image, inside a microVM, before the
+# image is used (#584).
+#
+# NOT YET IN EFFECT. This release reads the setting and installs nothing: today's
+# published images still contain all five, and an image that leaves any out is
+# refused rather than imported without them.
 #
 #   android-sdk     the Android SDK, platforms, build tools and NDKs
 #                   (https://developer.android.com/studio/terms)
@@ -1255,6 +1260,7 @@ tiers:
 #                   Action downloads it per job
 #                   (https://github.com/github/codeql-cli-binaries/blob/main/LICENSE.md)
 #   firefox         Mozilla Firefox and geckodriver
+#                   (https://www.mozilla.org/en-US/about/legal/terms/firefox/)
 #   google-chrome   Google Chrome, ChromeDriver and Chromium
 #                   (https://www.google.com/chrome/terms/)
 #   microsoft-edge  Microsoft Edge and its WebDriver, under the terms Microsoft
