@@ -547,7 +547,8 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	flush := taskNamed(t, "account.yml", account, "Flush the drain the billet node owes before its configuration changes")
 	if flush <= record || flush >= render || fmt.Sprint(account[flush]["ansible.builtin.command"]) !=
 		"map[argv:[sync -f {{ billet_node_drain_owed_path }}]]" ||
-		whenText(account[flush]) != "billet_node_drain_owed_write is not skipped" {
+		whenText(account[flush]) != "billet_node_drain_owed_write is not skipped" ||
+		account[flush][inheritedWhen] != account[record][inheritedWhen] {
 		t.Errorf("account.yml flushes the owed drain at %d (record %d, render %d) as %v when %q", flush, record,
 			render, account[flush]["ansible.builtin.command"], whenText(account[flush]))
 	}
@@ -673,7 +674,8 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	txFlush := taskNamed(t, file, txTasks, "Flush the drain the billet node owes before the transaction's stop")
 	if txFlush <= txRecord || txFlush >= txStop || fmt.Sprint(txTasks[txFlush]["ansible.builtin.command"]) !=
 		"map[argv:[sync -f {{ billet_node_drain_owed_path }}]]" ||
-		whenText(txTasks[txFlush]) != "billet_transaction_drain_owed is not skipped" {
+		whenText(txTasks[txFlush]) != "billet_transaction_drain_owed is not skipped" ||
+		txTasks[txFlush][inheritedWhen] != txTasks[txRecord][inheritedWhen] {
 		t.Errorf("the transaction flushes its owed drain at %d (record %d, stop %d) as %v when %q", txFlush,
 			txRecord, txStop, txTasks[txFlush]["ansible.builtin.command"], whenText(txTasks[txFlush]))
 	}
