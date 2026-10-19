@@ -165,6 +165,43 @@ func TestALicenseAboveALinkedPackageIsIncludedAndOneBesideUnlinkedCodeIsNot(t *t
 	}
 }
 
+// A module with no root license is reproduced when a nested license covers every
+// package billet links from it, and refused, naming the package, when one is not.
+func TestAModuleWithOnlyANestedLicenseIsJudgedByWhatItLinks(t *testing.T) {
+	dir := t.TempDir()
+	for p, body := range map[string]string{
+		"covered/LICENSE":    "covered license\n",
+		"covered/pkg.go":     "package covered\n",
+		"covered/sub/sub.go": "package sub\n",
+		"bare/bare.go":       "package bare\n",
+	} {
+		full := filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	covered := []string{filepath.Join(dir, "covered"), filepath.Join(dir, "covered", "sub")}
+
+	var b bytes.Buffer
+	w := &writer{b: &b, first: map[string]string{}}
+	if err := w.modules([]Module{{Path: "example.com/m", Dir: dir, Packages: covered}}); err != nil {
+		t.Fatalf("a module whose linked packages a nested license covers was refused: %v", err)
+	}
+	if !strings.Contains(b.String(), "--- covered/LICENSE ---\n\ncovered license\n") {
+		t.Fatalf("the nested license was not reproduced:\n%s", b.String())
+	}
+
+	bare := filepath.Join(dir, "bare")
+	w = &writer{b: &bytes.Buffer{}, first: map[string]string{}}
+	err := w.modules([]Module{{Path: "example.com/m", Dir: dir, Packages: append(covered, bare)}})
+	if err == nil || !strings.Contains(err.Error(), "has no license file covering "+bare) {
+		t.Fatalf("got %v, want the uncovered package %s named", err, bare)
+	}
+}
+
 func TestAnIdenticalTextIsPrintedOnceAndADifferentOneWhole(t *testing.T) {
 	var b bytes.Buffer
 	w := &writer{b: &b, first: map[string]string{}}

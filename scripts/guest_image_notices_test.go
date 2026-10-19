@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,12 @@ func TestThePublicationGateRefusesAnImageWithoutItsNotices(t *testing.T) {
 	if !strings.Contains(gate, "\n"+passDef+"\n") || !strings.Contains(gate, "\nset -euo pipefail\n") ||
 		!strings.Contains(gate, "\nFAILED=0\n") {
 		t.Fatal("check-guest-image.sh no longer defines pass, its shell options or FAILED as this test runs them")
+	}
+	// THE VERDICT ABOVE IS THE ONE THE GATE REACHES only while nothing between the
+	// block and the end clears the accumulator, so FAILED is written in exactly two
+	// places: its initialisation and fail().
+	if n := strings.Count(gate, "FAILED="); n != 2 || !strings.Contains(failDef, "\tFAILED=1\n") {
+		t.Fatalf("check-guest-image.sh writes FAILED %d times, want only FAILED=0 at the start and FAILED=1 in fail()", n)
 	}
 
 	notices := "opt/billet/THIRD_PARTY_NOTICES"
@@ -147,6 +154,19 @@ func TestTheHookNoticesNameThePinnedVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if want := "\nContainer hook version: " + fields[0] + "\n"; !strings.Contains(string(notice), want) {
-		t.Fatalf("container-hook.NOTICE does not say %q; rewrite it from the lockfile of the pinned tag", strings.TrimSpace(want))
+		t.Fatalf("container-hook.NOTICE does not say %q; run scripts/container-hook-notices.py", strings.TrimSpace(want))
+	}
+
+	// Every component the script's EMBEDDED table names has its section, so a table
+	// entry added without regenerating the file is caught here.
+	script := readScriptFile(t, "container-hook-notices.py")
+	entries := regexp.MustCompile(`\("([0-9.]+)", "([^"]+)",\n`).FindAllStringSubmatch(script, -1)
+	if len(entries) == 0 {
+		t.Fatal("found no EMBEDDED entry in container-hook-notices.py, so this test proves nothing")
+	}
+	for _, e := range entries {
+		if want := "\n" + e[2] + ", embedded in undici " + e[1] + "\n"; !strings.Contains(string(notice), want) {
+			t.Errorf("container-hook.NOTICE has no section %q; run scripts/container-hook-notices.py", strings.TrimSpace(want))
+		}
 	}
 }

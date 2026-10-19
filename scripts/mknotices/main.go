@@ -29,6 +29,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -218,15 +219,18 @@ func (w *writer) modules(modules []Module) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", m.Path, err)
 		}
-		// NO LICENSE FILE IS NOT "NO LICENSE". A module that ships none cannot be
-		// redistributed on any terms this file could reproduce, so it is refused
-		// rather than listed with nothing under it.
-		if len(root) == 0 {
-			return fmt.Errorf("%s, linked into billet, has no license file in %s", m.Path, m.Dir)
-		}
 		nested, err := NestedLicenseFiles(m.Dir, m.Packages)
 		if err != nil {
 			return fmt.Errorf("%s: %w", m.Path, err)
+		}
+		// NO LICENSE FILE IS NOT "NO LICENSE". A linked package with none in its own
+		// directory or any above it, up to the module root, cannot be redistributed
+		// on any terms this file could reproduce, so it is refused rather than
+		// listed with nothing under it.
+		if len(root) == 0 {
+			if pkg, ok := uncovered(m.Dir, m.Packages, nested); ok {
+				return fmt.Errorf("%s, linked into billet, has no license file covering %s", m.Path, pkg)
+			}
 		}
 		files := slices.Concat(root, nested)
 		w.section(m.Path, []string{"Go module", "Ships in: the billet binary"})
@@ -414,6 +418,35 @@ func NestedLicenseFiles(root string, packages []string) ([]string, error) {
 	sort.Strings(files)
 
 	return files, nil
+}
+
+// uncovered returns a linked package, or the module root when none is named, that
+// no nested license file covers: none in its directory or a directory above it.
+func uncovered(root string, packages, nested []string) (string, bool) {
+	if len(packages) == 0 {
+		packages = []string{root}
+	}
+	for _, pkg := range packages {
+		rel, err := filepath.Rel(root, pkg)
+		if err != nil {
+			return pkg, true
+		}
+		rel = filepath.ToSlash(rel)
+		covered := false
+		for _, f := range nested {
+			dir := path.Dir(f)
+			if rel == dir || strings.HasPrefix(rel, dir+"/") {
+				covered = true
+
+				break
+			}
+		}
+		if !covered {
+			return pkg, true
+		}
+	}
+
+	return "", false
 }
 
 func goRoot(ctx context.Context, root string) (string, error) {
