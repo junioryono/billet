@@ -3,9 +3,9 @@ Copyright 2026 Junior Yono
 
 This license covers everything under the ee/ directory of the billet repository (the "Enterprise Software"). Junior Yono is its licensor. Everything else in the repository is licensed under the Apache License, Version 2.0, in the LICENSE file at the repository's root, except third-party code, which keeps the license its owner provides.
 
-1. Production use. "Production use" is any use of the Enterprise Software other than developing, testing or evaluating the Enterprise Software itself. Running it to build, test or deploy your own software, including as part of your continuous integration, is production use. You may make production use of the Enterprise Software only while you, and any entity you act for, hold a valid billet enterprise subscription or another written agreement with the licensor that covers that use, and only within the scope that subscription or agreement grants.
+1. Production use. "Production use" is any use of the Enterprise Software other than reading it, publishing patches to it, or developing, testing or evaluating the Enterprise Software itself. Running it to build, test or deploy your own software, including as part of your continuous integration, is production use. You may make production use of the Enterprise Software only while you, and any entity you act for, hold a valid billet enterprise subscription or another written agreement with the licensor that covers that use, and only within the scope that subscription or agreement grants.
 
-2. Development and testing. Without a subscription, you may copy, modify and run the Enterprise Software to develop, test or evaluate the Enterprise Software itself, but not for production use.
+2. Uses that need no subscription. Without a subscription, you may read the Enterprise Software, publish patches to it as section 3 allows, and copy, modify and run it to develop, test or evaluate the Enterprise Software itself, but not for production use.
 
 3. Modifications. You may modify the Enterprise Software and publish patches to it. The licensor and its licensors keep all right, title and interest in the Enterprise Software and in every modification or patch of it. A modified version or patch may be used as section 2 allows, and for production use only as section 1 allows.
 

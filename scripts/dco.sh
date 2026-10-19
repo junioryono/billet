@@ -65,12 +65,23 @@ if ! commits=$(git rev-list --no-merges HEAD^1..HEAD^2); then
 	exit 2
 fi
 
+# A PARSER NO CONFIGURATION REACHES. git reads trailer aliases
+# (trailer.<token>.key), separators and the comment character from every config
+# file and the environment, and an alias can forge a sign-off out of another line
+# or hide a real one. So the parse runs in an empty directory no repository is
+# found above, with no global, system or environment configuration.
+iso=$(mktemp -d)
+trap 'rm -rf "$iso"' EXIT
+parse_trailers() {
+	(cd "$iso" && env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_DIR \
+		GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+		GIT_CEILING_DIRECTORIES="$iso" git -c trailer.separators=: interpret-trailers --parse)
+}
+
 missing=0
 for c in $commits; do
 	want="Signed-off-by: $(git show -s --format='%an <%ae>' "$c")"
-	# THE COLON IS PINNED: a trailer.separators setting would otherwise stop git
-	# reading the line `git commit -s` writes as a trailer at all.
-	if ! trailers=$(git show -s --format=%B "$c" | git -c trailer.separators=: interpret-trailers --parse); then
+	if ! trailers=$(git show -s --format=%B "$c" | parse_trailers); then
 		echo "dco: reading $c's trailers failed" >&2
 		exit 2
 	fi

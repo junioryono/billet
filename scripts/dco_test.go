@@ -149,6 +149,31 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			},
 		},
 		{
+			// AN ALIAS CANNOT FORGE A SIGN-OFF: configured so, git would rewrite
+			// "sign: ..." into the exact line the check looks for.
+			name:   "a clone whose alias turns another line into a sign-off",
+			author: "ada",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				fixtureGit(t, repo, "config", "trailer.sign.key", "Signed-off-by")
+				authored(t, repo, ada, "forged by an alias", "sign: "+ada)
+			},
+			code:  1,
+			names: "forged by an alias",
+		},
+		{
+			// NOR HIDE ONE: mapped to another key, a real sign-off would vanish.
+			name:   "a clone whose alias renames the sign-off",
+			author: "ada",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				fixtureGit(t, repo, "config", "trailer.signed-off-by.key", "Approved-by")
+				authored(t, repo, ada, "renamed by an alias", adaSign)
+			},
+		},
+		{
 			// THE OWNER OF THIS REPOSITORY, not of some repository: in a fork or
 			// a repository another account owns, the same login is a contributor.
 			name:   "the usual owner in a repository someone else owns",
