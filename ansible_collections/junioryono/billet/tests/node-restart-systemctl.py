@@ -10,6 +10,7 @@ start included, so a regression to either fails the case rather than being
 answered.
 """
 import json
+import os
 import pathlib
 import sys
 
@@ -78,6 +79,9 @@ if tool in ('billet', 'candidate'):
         # and a fixture that answers another drain question is a case's
         # mistake, refused here rather than rewritten.
         if call == 'check' and not answer.get('verbatim'):
+            if ('--drain' in args and '--invocation' in args and doc.get('outcome') == 'proved'
+                    and not state.get('drain_asked')):
+                sys.exit('fixture ' + answer['fixture'] + ' proves a drain of a stop that was never asked to drain')
             if ('--drain' in args) != doc.get('drain', False):
                 sys.exit('fixture ' + answer['fixture'] + ' answers another drain question than ' + repr(args))
             asked = args[args.index('--invocation') + 1] if '--invocation' in args else None
@@ -99,6 +103,9 @@ if args == ['show', '--property=MainPID', '--property=InvocationID', 'billet-nod
     show(state['before'], properties)
 elif args == ['stop', '--no-block', 'billet-node.service']:
     state['stopped'] = True
+    # A NODE DRAINS ONLY WHEN ITS STOP WAS ASKED TO: whether the request was
+    # there when systemd was handed the stop.
+    state['drain_asked'] = os.path.exists(os.environ.get('BILLET_GATE_DRAIN_REQUEST', ''))
     save()
 elif args == ['start', '--no-block', 'billet-node.service']:
     state['started'] = True

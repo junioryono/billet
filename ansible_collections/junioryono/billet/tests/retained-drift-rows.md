@@ -93,6 +93,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/account.yml / Stage candidate configuration for the upgrade transaction | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Preview whether this converge changes the billet configuration | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/account.yml / Record the drain the billet node owes before its configuration changes | parity:node ending judgement (#127); the owed drain names the node state directory whose record must prove it, is written before what needs the drain changes the host, and is removed only after a proof |
+| tasks/account.yml / Flush the drain the billet node owes before its configuration changes | parity:node ending judgement (#127); the owed drain names the node state directory whose record must prove it, is written before what needs the drain changes the host, and is removed only after a proof |
 | tasks/account.yml / Render billet configuration | const:/etc/billet/billet.yaml; E:billet_effective_config |
 | tasks/cache-tls.yml / Create the EC2 cache TLS directories when absent | E:node.cache.tls_cert; E:node.cache.tls_key |
 | tasks/cache-tls.yml / Install the EC2 cache TLS certificate | E:node.cache.tls_cert; E:node.cache.tls_key |
@@ -262,9 +263,11 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/node-restart.yml / Record the billet node's main process and invocation before its restart | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/node-restart.yml / Request the billet node's start without waiting for it | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
 | tasks/node-restart.yml / Request the billet node's stop without waiting for its drain | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
+| tasks/node-restart.yml / Ask the node's stop to drain where it must have | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
 | tasks/services.yml / Inspect whether the billet node is up before its start | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/services.yml / Record the billet node's invocation before the transaction's stop | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/services.yml / Record the drain the billet node owes before the transaction's stop | parity:node ending judgement (#127); the owed drain names the node state directory whose record must prove it, is written before what needs the drain changes the host, and is removed only after a proof |
+| tasks/services.yml / Flush the drain the billet node owes before the transaction's stop | parity:node ending judgement (#127); the owed drain names the node state directory whose record must prove it, is written before what needs the drain changes the host, and is removed only after a proof |
 | tasks/services.yml / Record the invocation of a node that may not run here before its stop | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/services.yml / Forget the drain the billet node owed once this converge proved it | parity:node ending judgement (#127); the owed drain names the node state directory whose record must prove it, is written before what needs the drain changes the host, and is removed only after a proof |
 | tasks/upgrade-rollback.yml / Record the billet node's invocation before recovery stops it | parity:read-only observation or node validation; exact full module arguments and definitions are bound |

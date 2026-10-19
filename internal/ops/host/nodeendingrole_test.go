@@ -76,9 +76,11 @@ func whenText(task map[string]any) string {
 		}
 
 		return strings.Join(parts, "\n")
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(when)
 	}
-
-	return ""
 }
 
 // varValue is one of a task's vars, nil when it has none.
@@ -236,8 +238,7 @@ func TestTheTransactionsCheckRequiresTheDrainItsRequestAskedFor(t *testing.T) {
 		"Make the transaction's node stop a drain when the node will not run again or its config changes")]
 	check := tasks[taskNamed(t, "services.yml", tasks, "Prove the transaction's node stop by the node's own ending")]
 
-	if got, want := normalized(varText(check, "billet_ending_drain")), "{{ "+normalized(whenText(request))+
-		" or billet_node_drain_owed_dir | default('') | length > 0 }}"; got != want {
+	if got, want := normalized(varText(check, "billet_ending_drain")), "{{ "+normalized(whenText(request))+" }}"; got != want {
 		t.Errorf("the transaction's check requires drain %q, want %q", got, want)
 	}
 
@@ -526,8 +527,19 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 			whenText(account[record]))
 	}
 
-	if varText(account[note], "") != "" || whenText(account[note]) != "billet_node_drain_owed_write is not skipped" {
-		t.Errorf("account.yml notes the owed drain when %q", whenText(account[note]))
+	if got := fmt.Sprint(account[note]["ansible.builtin.set_fact"]); got != "map[billet_node_drain_owed_dir:{{ "+
+		"billet_previous_node_state_dir }} billet_node_drain_proved:false]" ||
+		whenText(account[note]) != "billet_node_drain_owed_write is not skipped" {
+		t.Errorf("account.yml notes the owed drain as %s when %q, want the recorded directory, unproved",
+			got, whenText(account[note]))
+	}
+
+	flush := taskNamed(t, "account.yml", account, "Flush the drain the billet node owes before its configuration changes")
+	if flush <= record || flush >= render || fmt.Sprint(account[flush]["ansible.builtin.command"]) !=
+		"map[argv:[sync -f {{ billet_node_drain_owed_path }}]]" ||
+		whenText(account[flush]) != "billet_node_drain_owed_write is changed" {
+		t.Errorf("account.yml flushes the owed drain at %d (record %d, render %d) as %v when %q", flush, record,
+			render, account[flush]["ansible.builtin.command"], whenText(account[flush]))
 	}
 
 	const file = "services.yml"
@@ -541,8 +553,8 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	if txRecord >= txStop || normalized(whenText(tasks[txRecord])) != normalized(strings.Join([]string{
 		"billet_service_state_before_upgrade.results[1].rc != 4",
 		"billet_previous_config.get('node') is mapping",
-		whenText(request),
-	}, "\n")) {
+		"not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0",
+	}, "\n")) || !strings.HasSuffix(normalized(whenText(request)), " or billet_node_drain_owed_dir | default('') | length > 0") {
 		t.Errorf("the transaction records its owed drain at %d (stop %d) when %q", txRecord, txStop,
 			whenText(tasks[txRecord]))
 	}
@@ -561,13 +573,37 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	forget := taskNamed(t, file, tasks, "Forget the drain the billet node owed once this converge proved it")
 	withdraw := taskNamed(t, file, tasks, "Withdraw the drain request now that the node is where this converge leaves it")
 
-	for _, proof := range []string{
-		"Note that the transaction's stop proved the node drained",
-		"Note that the stopped node's last stop proved it drained",
-		"Note that the stop of a node that may not run here proved it drained",
+	// EACH PROOF FOLLOWS ITS CHECK, UNDER ITS CHECK'S GUARD, and the owed drain
+	// is forgotten only after them.
+	for _, pair := range []struct{ check, proof, guard string }{
+		{
+			check: "Prove the transaction's node stop by the node's own ending",
+			proof: "Note that the transaction's stop proved the node drained",
+			guard: "billet_service_state_before_upgrade.results[1].rc != 4\n{{DRAIN}}",
+		},
+		{
+			check: "Prove a stopped node drained before its start where a drain is asked for",
+			proof: "Note that the stopped node's last stop proved it drained",
+		},
+		{
+			check: "Prove the stop of a node that may not run here drained",
+			proof: "Note that the stop of a node that may not run here proved it drained",
+		},
 	} {
-		if at := taskNamed(t, file, tasks, proof); at >= forget {
-			t.Errorf("%q at %d does not come before the owed drain is forgotten at %d", proof, at, forget)
+		check, proof := taskNamed(t, file, tasks, pair.check), taskNamed(t, file, tasks, pair.proof)
+
+		guard := whenText(tasks[check])
+		if pair.guard != "" {
+			drain := strings.TrimSuffix(strings.TrimPrefix(normalized(varText(tasks[check], "billet_ending_drain")),
+				"{{ "), " }}")
+			guard = strings.ReplaceAll(pair.guard, "{{DRAIN}}", drain)
+		}
+
+		if proof != check+1 || proof >= forget || normalized(whenText(tasks[proof])) != normalized(guard) ||
+			fmt.Sprint(tasks[proof]["ansible.builtin.set_fact"]) != "map[billet_node_drain_proved:true]" {
+			t.Errorf("%q at %d (check %d, forget %d) sets %v when %q, want proved right after its check, under %q",
+				pair.proof, proof, check, forget, tasks[proof]["ansible.builtin.set_fact"], whenText(tasks[proof]),
+				guard)
 		}
 	}
 
@@ -600,6 +636,46 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 	}
 
 	restartFile := readRoleTaskMaps(t, "node-restart.yml")
+	ask := restartFile[taskNamed(t, "node-restart.yml", restartFile, "Ask the node's stop to drain where it must have")]
+	asked, ok := ask["ansible.builtin.copy"].(map[string]any)
+	if !ok || asked["dest"] != "{{ billet_node_drain_request | default('"+nodeDrainRequestPath+"') }}" ||
+		normalized(whenText(ask)) != "billet_node_restart_drain | bool not billet_node_restart_drain_request.stat.exists" {
+		t.Errorf("the restart asks for its drain as %v when %q", asked, whenText(ask))
+	}
+
+	owedFile := readRoleTaskMaps(t, "node-drain-owed.yml")
+	if got := normalized(fmt.Sprint(owedFile[taskNamed(t, "node-drain-owed.yml", owedFile,
+		"Note the record whose drain the billet node owes")]["ansible.builtin.set_fact"])); !strings.HasSuffix(got,
+		" billet_node_drain_proved:false]") {
+		t.Errorf("reading the owed drain keeps a proof an earlier inclusion set: %s", got)
+	}
+
+	rollback := readRoleTaskMaps(t, "upgrade-rollback.yml")
+	if got := varText(rollback[taskNamed(t, "upgrade-rollback.yml", rollback,
+		"Prove recovery's node stop drained by the node's own ending")], "billet_ending_state_dir"); got !=
+		"{{ billet_node_drain_owed_dir | default('') }}" {
+		t.Errorf("recovery's check reads the record %q, not the owed drain's", got)
+	}
+
+	txTasks := readRoleTaskMaps(t, file)
+	txFlush := taskNamed(t, file, txTasks, "Flush the drain the billet node owes before the transaction's stop")
+	if txFlush <= txRecord || txFlush >= txStop || fmt.Sprint(txTasks[txFlush]["ansible.builtin.command"]) !=
+		"map[argv:[sync -f {{ billet_node_drain_owed_path }}]]" ||
+		whenText(txTasks[txFlush]) != "billet_transaction_drain_owed is changed" {
+		t.Errorf("the transaction flushes its owed drain at %d (record %d, stop %d) as %v when %q", txFlush,
+			txRecord, txStop, txTasks[txFlush]["ansible.builtin.command"], whenText(txTasks[txFlush]))
+	}
+
+	recovery := readRoleTaskMaps(t, "upgrade-recover.yml")
+	readOwed := taskNamed(t, "upgrade-recover.yml", recovery, "Read the drain the billet node owes before recovery")
+	finish := taskNamed(t, "upgrade-recover.yml", recovery, "Finish a committed host transaction without rolling it back")
+
+	if readOwed >= finish || recovery[readOwed]["ansible.builtin.include_tasks"] != "node-drain-owed.yml" ||
+		whenText(recovery[readOwed]) != "" {
+		t.Errorf("recovery reads the owed drain at %d (finish %d) as %v when %q", readOwed, finish,
+			recovery[readOwed]["ansible.builtin.include_tasks"], whenText(recovery[readOwed]))
+	}
+
 	note2 := restartFile[taskNamed(t, "node-restart.yml", restartFile, "Note whether the node's stop must have drained")]
 	if !strings.HasSuffix(normalized(fmt.Sprint(note2["ansible.builtin.set_fact"])), "or billet_node_drain_owed_dir | default('') | length > 0 }}]") {
 		t.Errorf("the restart's drain does not follow an owed drain: %v", note2["ansible.builtin.set_fact"])

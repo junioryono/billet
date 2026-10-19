@@ -54,6 +54,7 @@
   environment:
     PATH: "{{ billet_gate_restart_root.path }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
     BILLET_GATE_RESTART_CASE: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
+    BILLET_GATE_DRAIN_REQUEST: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.drain"
   vars:
     billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
     billet_node_restart_poll_interval: "{{ billet_gate_restart_case.interval | default(1) }}"

@@ -148,6 +148,12 @@
       record. Leave its fence and pointer intact for manual inspection.
   when: billet_upgrade_commit_state.stat.exists
 
+# THE DRAIN THE NODE OWES IS READ BEFORE RECOVERY STARTS OR STOPS ANYTHING:
+# a recovery after a reboot has no /run request, and the owed drain is the one
+# account of it that survived.
+- name: Read the drain the billet node owes before recovery
+  ansible.builtin.include_tasks: node-drain-owed.yml
+
 - name: Finish a committed host transaction without rolling it back
   ansible.builtin.include_tasks: upgrade-finalize.yml
   when: billet_upgrade_commit_state.stat.exists

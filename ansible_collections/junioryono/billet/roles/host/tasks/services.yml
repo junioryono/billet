@@ -353,7 +353,8 @@
       ansible.builtin.include_tasks: request-node-drain.yml
       when: >-
         not billet_node_should_run or
-        (billet_candidate_config_compare.rc | default(2)) != 0
+        (billet_candidate_config_compare.rc | default(2)) != 0 or
+        billet_node_drain_owed_dir | default('') | length > 0
 
     # THE INVOCATION BESIDE THE MAIN PROCESS, read before the stop because a
     # clean stop clears it: the stop is proved by that invocation's ending, so
@@ -386,9 +387,16 @@
         - billet_previous_config.get('node') is mapping
         - not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0
 
+    - name: Flush the drain the billet node owes before the transaction's stop
+      ansible.builtin.command:
+        argv: [sync, -f, "{{ billet_node_drain_owed_path }}"]
+      changed_when: false
+      when: billet_transaction_drain_owed is changed
+
     - name: Note the record whose drain the transaction owes
       ansible.builtin.set_fact:
         billet_node_drain_owed_dir: "{{ billet_previous_node_state_dir }}"
+        billet_node_drain_proved: false
       when: billet_transaction_drain_owed is not skipped
 
     - name: Gracefully stop the billet node before changing its guest contract
@@ -420,8 +428,8 @@
           {{ '' if 'MainPID=0' in billet_transaction_node_before.stdout_lines
              else (billet_transaction_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
         billet_ending_drain: >-
-          {{ not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0
-             or billet_node_drain_owed_dir | default('') | length > 0 }}
+          {{ not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0 or
+             billet_node_drain_owed_dir | default('') | length > 0 }}
         billet_ending_state_dir: "{{ billet_node_drain_owed_dir | default('') }}"
       when: billet_service_state_before_upgrade.results[1].rc != 4
 
@@ -431,8 +439,8 @@
       when:
         - billet_service_state_before_upgrade.results[1].rc != 4
         - >-
-          not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0
-          or billet_node_drain_owed_dir | default('') | length > 0
+          not billet_node_should_run or (billet_candidate_config_compare.rc | default(2)) != 0 or
+          billet_node_drain_owed_dir | default('') | length > 0
 
     # THE UPLINK SHAPER IS A BILLET PROCESS TOO, and the transaction waits for
     # every one to end before it hides the executable. Stopped here, while its

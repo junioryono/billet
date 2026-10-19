@@ -107,6 +107,7 @@
       {{ '' if 'MainPID=0' in billet_recovery_node_before.stdout_lines
          else (billet_recovery_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
     billet_ending_drain: true
+    billet_ending_state_dir: "{{ billet_node_drain_owed_dir | default('') }}"
   when: "'LoadState=not-found' not in billet_recovery_node_before.stdout_lines"
 
 - name: Stop the control plane before recovering its authoritative ledger

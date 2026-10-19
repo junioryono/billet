@@ -545,9 +545,19 @@
     - billet_effective_config.get('node') is not mapping or billet_config_preview.changed | default(false)
     - not ansible_check_mode
 
+# DURABLE BEFORE THE RENDER IT GUARDS: a rename is atomic, not durable, so a
+# crash could otherwise keep the new configuration and lose the drain it owes.
+- name: Flush the drain the billet node owes before its configuration changes
+  ansible.builtin.command:
+    argv: [sync, -f, "{{ billet_node_drain_owed_path }}"]
+  changed_when: false
+  become: true
+  when: billet_node_drain_owed_write is changed
+
 - name: Note the record whose drain this converge owes
   ansible.builtin.set_fact:
     billet_node_drain_owed_dir: "{{ billet_previous_node_state_dir }}"
+    billet_node_drain_proved: false
   when: billet_node_drain_owed_write is not skipped
 
 - name: Render billet configuration

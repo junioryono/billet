@@ -80,6 +80,19 @@
       {{ billet_config_install.changed | default(false) | bool or billet_node_restart_drain_request.stat.exists
          or billet_node_drain_owed_dir | default('') | length > 0 }}
 
+# AND THE STOP IS ASKED TO BE ONE: a drain owed by an earlier converge, or one
+# whose request a reboot cleared, would otherwise be required of a stop that
+# was never asked for it, and a node configured to hand off would hand off.
+- name: Ask the node's stop to drain where it must have
+  ansible.builtin.copy:
+    content: "drain\n"
+    dest: "{{ billet_node_drain_request | default('/var/run/billet-node-drain') }}"
+    mode: "0644"
+  become: "{{ billet_ending_become | default(true) | bool }}"
+  when:
+    - billet_node_restart_drain | bool
+    - not billet_node_restart_drain_request.stat.exists
+
 # THE CONTROLLER'S CLOCK, which is the one every `until` below is evaluated on,
 # as epoch seconds: `now(utc=true)` is a naive datetime that `.timestamp()`
 # reads as local time, which moves by an hour across a daylight-saving change.

@@ -20,10 +20,13 @@
     'file not found' not in (billet_node_drain_owed.msg | default('') | lower)
   become: "{{ billet_ending_become | default(true) | bool }}"
 
+# A PROOF IS THIS INCLUSION'S, of the drain it read: one an earlier inclusion
+# of the role set for another obligation discharges nothing here.
 - name: Note the record whose drain the billet node owes
   ansible.builtin.set_fact:
     billet_node_drain_owed_dir: >-
       {{ (billet_node_drain_owed.content | b64decode | trim) if billet_node_drain_owed.content is defined else '' }}
+    billet_node_drain_proved: false
 
 - name: Refuse an owed drain that names no record
   ansible.builtin.assert:
