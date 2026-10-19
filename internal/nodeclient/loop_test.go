@@ -305,6 +305,14 @@ func (f *fakeCompute) Recover(ctx context.Context) error {
 	return f.recoverErr
 }
 
+// recoverCount is how many Recover calls have started.
+func (f *fakeCompute) recoverCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.recovered
+}
+
 func (f *fakeCompute) Sweep(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

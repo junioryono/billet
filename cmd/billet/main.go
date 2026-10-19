@@ -30,6 +30,7 @@ import (
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/notices"
 	"github.com/junioryono/billet/internal/version"
 )
 
@@ -171,6 +172,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 			return host.NodeRepairUnit(ctx, env, args[1:])
 		case "receipt":
 			return host.NodeReceipt(ctx, env, args[1:])
+		case "ending":
+			return host.NodeEnding(ctx, env, args[1:])
 		}
 	}
 
@@ -226,7 +229,11 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	}
 
 	// THE IDENTITY, ITS LOCK AND THE PROVIDER, IN THAT ORDER: see app.OpenNode.
-	n, err := app.OpenNode(cfg, app.NodeOptions{Upgrader: upgrader})
+	n, err := app.OpenNode(cfg, app.NodeOptions{
+		Upgrader: upgrader, Probe: *upgradeProbe,
+		// systemd's name for this process, which its ending is recorded under.
+		InvocationID: env.Getenv("INVOCATION_ID"),
+	})
 	if err != nil {
 		return err
 	}
@@ -278,8 +285,16 @@ func nodeHost(env cli.Env, lc *cli.Lifecycle, platform string) app.NodeHost {
 
 func cmdVersion(_ context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet version", env.Stdout)
+	showNotices := fs.Bool("notices", false,
+		"print the licenses of the third-party software this binary contains")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
+	}
+
+	if *showNotices {
+		fmt.Fprint(env.Stdout, notices.Text())
+
+		return nil
 	}
 
 	// The release version, not just the revision. This printed a bare commit sha,

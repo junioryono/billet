@@ -1927,8 +1927,24 @@ const uplinkRestartBound = 3*time.Minute + lifecycleDeadlineMargin
 // jobs. Nothing in this command imposes a shorter one: the stop runs under the
 // transaction's own context, which carries no deadline, and lifeops applies
 // none of its own to a stop.
+//
+// PROVED BY THE NODE'S OWN ENDING (#127), not by systemd's exit: a stop a
+// TimeoutStopSec kill ended exits 0 too. A drain is required when an operation
+// asked for one. An unproved stop fails the step, so the transaction rolls back
+// with nothing installed and leaves the node stopped for an acknowledgement.
 func (h *systemdHost) StopNode(ctx context.Context) error {
-	return h.stop(ctx, nodeUnit)
+	if h.cfg == nil || h.cfg.Node == nil {
+		return h.stop(ctx, nodeUnit)
+	}
+
+	how, err := stopNodeProved(ctx, h.converge, h.inspect, h.cfg, drainRequestedAt(nodeDrainRequestFile))
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(h.env.Stdout, "  %s\n", how)
+
+	return nil
 }
 
 // StopServer stops the control plane, after the node's custody has settled.
@@ -2843,6 +2859,15 @@ func (h *systemdHost) StartServices(ctx context.Context) error {
 	for _, unit := range []string{serverUnit, nodeUnit} {
 		if !h.wanted(unit) {
 			continue
+		}
+
+		// THE NODE STARTS ONLY OVER A PROVED ENDING (#127): its last stop's
+		// record, an acknowledgement, or a reboot since. That covers a finish, a
+		// rollback and a resumed journal alike, whatever stopped the node.
+		if unit == nodeUnit && h.cfg != nil && h.cfg.Node != nil {
+			if err := admitNodeStart(ctx, h.inspect, h.cfg); err != nil {
+				return err
+			}
 		}
 
 		// UNDER THE UNIT'S OWN START BOUND, as `local up` starts one.
