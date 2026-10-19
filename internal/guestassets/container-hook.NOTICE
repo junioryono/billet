@@ -829,10 +829,10 @@ Redistribution and use in source and binary forms, with or without modification,
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ================================================================================
 W3C specifications, embedded in undici 5.29.0
-In: the algorithm steps of the File API (lib/fetch/file.js, lib/fileapi), Service Workers (lib/cache) and Referrer Policy (lib/fetch/util.js) quoted in its comments
+In: the algorithm steps of the File API (lib/fetch/file.js, lib/fileapi), Service Workers (lib/cache), Referrer Policy and Subresource Integrity (lib/fetch/util.js) quoted in its comments
 Source: https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/W3C-20150513.txt
 
-This software includes material copied from or derived from File API (https://w3c.github.io/FileAPI/), Service Workers (https://w3c.github.io/ServiceWorker/) and Referrer Policy (https://w3c.github.io/webappsec-referrer-policy/). Each states, as read on 2026-10-18: Copyright © 2026 World Wide Web Consortium. W3C® liability, trademark and permissive document license rules apply.
+This software includes material copied from or derived from File API (https://w3c.github.io/FileAPI/), Service Workers (https://w3c.github.io/ServiceWorker/), Referrer Policy (https://w3c.github.io/webappsec-referrer-policy/) and Subresource Integrity (https://w3c.github.io/webappsec-subresource-integrity/). Each states, as read on 2026-10-18: Copyright © 2026 World Wide Web Consortium. W3C® liability, trademark and permissive document license rules apply.
 
 This work is being provided by the copyright holders under the following license.
 
@@ -851,3 +851,46 @@ THIS WORK IS PROVIDED "AS IS," AND COPYRIGHT HOLDERS MAKE NO REPRESENTATIONS OR 
 COPYRIGHT HOLDERS WILL NOT BE LIABLE FOR ANY DIRECT, INDIRECT, SPECIAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF ANY USE OF THE SOFTWARE OR DOCUMENT.
 
 The name and trademarks of copyright holders may NOT be used in advertising or publicity pertaining to the work without specific, written prior permission. Title to copyright in this work will at all times remain with copyright holders.
+================================================================================
+IETF cookie specifications, embedded in undici 5.29.0
+In: the cookie parsing and attribute algorithms of lib/cookies, quoted from draft-ietf-httpbis-rfc6265bis-10 section 5.4 and RFC 6265; their copyright notices follow
+Source: https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-10.txt, https://www.rfc-editor.org/rfc/rfc6265.txt
+
+This software includes material copied from draft-ietf-httpbis-rfc6265bis-10, Cookies: HTTP State Management Mechanism (https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-10.txt), and from RFC 6265, HTTP State Management Mechanism (https://www.rfc-editor.org/rfc/rfc6265.txt).
+
+   Copyright (c) 2022 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.  Code Components
+   extracted from this document must include Revised BSD License text as
+   described in Section 4.e of the Trust Legal Provisions and are
+   provided without warranty as described in the Revised BSD License.
+
+   This document may contain material from IETF Documents or IETF
+   Contributions published or made publicly available before November
+   10, 2008.  The person(s) controlling the copyright in some of this
+   material may not have granted the IETF Trust the right to allow
+   modifications of such material outside the IETF Standards Process.
+   Without obtaining an adequate license from the person(s) controlling
+   the copyright in such materials, this document may not be modified
+   outside the IETF Standards Process, and derivative works of it may
+   not be created outside the IETF Standards Process, except to format
+   it for publication as an RFC or to translate it into languages other
+   than English.
+
+   Copyright (c) 2011 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.

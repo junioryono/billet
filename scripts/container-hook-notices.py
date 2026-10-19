@@ -91,14 +91,26 @@ EMBEDDED = [
        "Redistribution and use", None)],
      None),
     ("undici 5.29.0", "W3C specifications",
-     "the algorithm steps of the File API (lib/fetch/file.js, lib/fileapi), Service Workers (lib/cache) and Referrer Policy (lib/fetch/util.js) quoted in its comments",
+     "the algorithm steps of the File API (lib/fetch/file.js, lib/fileapi), Service Workers (lib/cache), Referrer Policy and Subresource Integrity (lib/fetch/util.js) quoted in its comments",
      ["This software includes material copied from or derived from File API "
-      "(https://w3c.github.io/FileAPI/), Service Workers (https://w3c.github.io/ServiceWorker/) "
-      "and Referrer Policy (https://w3c.github.io/webappsec-referrer-policy/). Each states, "
+      "(https://w3c.github.io/FileAPI/), Service Workers (https://w3c.github.io/ServiceWorker/), "
+      "Referrer Policy (https://w3c.github.io/webappsec-referrer-policy/) and Subresource "
+      "Integrity (https://w3c.github.io/webappsec-subresource-integrity/). Each states, "
       "as read on 2026-10-18: Copyright © 2026 World Wide Web Consortium. W3C® liability, "
       "trademark and permissive document license rules apply.",
       ("https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/W3C-20150513.txt",
        None, None)],
+     None),
+    ("undici 5.29.0", "IETF cookie specifications",
+     "the cookie parsing and attribute algorithms of lib/cookies, quoted from draft-ietf-httpbis-rfc6265bis-10 section 5.4 and RFC 6265; their copyright notices follow",
+     ["This software includes material copied from draft-ietf-httpbis-rfc6265bis-10, "
+      "Cookies: HTTP State Management Mechanism "
+      "(https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-10.txt), and from "
+      "RFC 6265, HTTP State Management Mechanism (https://www.rfc-editor.org/rfc/rfc6265.txt).",
+      ("https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-10.txt",
+       "   Copyright (c) 2022 IETF Trust", "than English."),
+      ("https://www.rfc-editor.org/rfc/rfc6265.txt",
+       "   Copyright (c) 2011 IETF Trust", "described in the Simplified BSD License.")],
      None),
 ]
 
