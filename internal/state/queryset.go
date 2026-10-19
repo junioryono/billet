@@ -146,6 +146,8 @@ type ReadOps interface {
 	ReadJob(ctx context.Context, leaseID string) (ledgerdb.ReadJobRow, error)
 	ReadJobWait(ctx context.Context, leaseID string) (ledgerdb.ReadJobWaitRow, error)
 	ListJobWaits(ctx context.Context, arg ledgerdb.ListJobWaitsParams) ([]ledgerdb.ListJobWaitsRow, error)
+	ListJobsAwaitingQueueTime(ctx context.Context,
+		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
 	ReadJobUsage(ctx context.Context, leaseID string) (ledgerdb.JobUsage, error)
 	ReadJobSeries(ctx context.Context, leaseID string) (ledgerdb.ReadJobSeriesRow, error)
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)

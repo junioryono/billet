@@ -27,6 +27,10 @@ type HistoryJob struct {
 	QueuedAt           time.Time
 	ScaleSetAssignedAt time.Time
 	RunnerAssignedAt   time.Time
+	// RunID is the workflow run of the job that started, which for a pooled
+	// runner may differ from the run its lease was assigned; zero is unknown.
+	// Only a JobStarted gives it.
+	RunID int64
 }
 
 // Repo is the job's repository as owner/name, or whichever half is known.
@@ -69,6 +73,7 @@ func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job H
 			GithubQueuedAt:           stamp(job.QueuedAt),
 			GithubScaleSetAssignedAt: stamp(job.ScaleSetAssignedAt),
 			GithubRunnerAssignedAt:   stamp(job.RunnerAssignedAt),
+			GithubRunID:              max(job.RunID, 0),
 			LeaseID:                  leaseID,
 		}); err != nil {
 			return fmt.Errorf("alloc: record the job lease %s ran: %w", leaseID, err)
