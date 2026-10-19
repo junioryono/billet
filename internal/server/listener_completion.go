@@ -269,7 +269,7 @@ func (l *Listener) recordJobResult(ctx context.Context, job dispatch.Job, leaseI
 	if job.RunnerName == "" {
 		job.QueuedAt, job.ScaleSetAssignedAt, job.RunnerAssignedAt = time.Time{}, time.Time{}, time.Time{}
 	}
-	l.recordJobIdentity(ctx, leaseID, job)
+	l.recordJobIdentity(ctx, leaseID, job, 0)
 }
 
 // recordJobIdentity writes which job a lease ran onto its history row. It is a
@@ -280,19 +280,20 @@ func (l *Listener) recordJobResult(ctx context.Context, job dispatch.Job, leaseI
 // GitHub may give that runner another; recorded there, the first write would win
 // and the job that actually ran could never be written.
 //
+// startedRun is the JobStarted's own run, and zero from a completion, whose run
+// may be filled from the lease's launch, which can be another run.
+//
 // BOUNDED ON ITS OWN, because the writer retries contention until its context
 // ends and the caller's context is the poll's.
-func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job dispatch.Job) {
+func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job dispatch.Job, startedRun int64) {
 	if l.alloc == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, identityWriteLimit)
 	defer cancel()
-	write := l.writeJobIdentity
-	if write == nil {
-		write = l.alloc.RecordJobIdentity
-	}
-	if err := write(ctx, leaseID, historyJob(job)); err != nil {
+	history := historyJob(job)
+	history.RunID = startedRun
+	if err := l.alloc.RecordJobIdentity(ctx, leaseID, history); err != nil {
 		l.log.Warn("could not record which github job a lease ran; its history row "+
 			"will not name the repository, workflow or job",
 			"tier", l.tier, "lease", leaseID, "job", job.JobID, "error", err)
