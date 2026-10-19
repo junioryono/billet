@@ -465,25 +465,10 @@ func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 		t.Fatalf("the unrepaired branch: dco.sh exited %d, want 1\n%s", code, out)
 	}
 
-	var steps []string
-	for _, line := range strings.Split(out, "\n") {
-		if cmd, ok := strings.CutPrefix(line, "dco:   $ "); ok {
-			steps = append(steps, cmd)
-		}
-	}
-	if len(steps) == 0 {
-		t.Fatalf("the refusal printed no repair:\n%s", out)
-	}
-
-	// THE PRINTED STEPS, verbatim, as the contributor would run them. The editor
-	// gives `git commit -s` a subject above the sign-off it wrote.
-	for _, step := range steps {
-		cmd := exec.CommandContext(t.Context(), "bash", "-c", step)
-		cmd.Dir = work
-		cmd.Env = append(fixtureGitEnv(), "GIT_EDITOR=sed -i.bak 1s/^/ada-work/")
-		if stepOut, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("the printed step %q failed: %v\n%s", step, err, stepOut)
-		}
+	// THE PRINTED STEPS, verbatim and in order, as the contributor would run them.
+	steps := repairSteps(t, out)
+	if failed := runSteps(t, work, steps); failed != len(steps) {
+		t.Fatalf("the printed step %q failed", steps[failed])
 	}
 
 	ref, after := integration()
@@ -504,63 +489,117 @@ func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 	}
 }
 
-// A CRISS-CROSS HISTORY STOPS THE REPAIR. With two merge bases, squashing onto
-// either one changes what a merge into billet gives, so the printed guard step
-// fails there, and passes where there is one base.
-func TestTheRepairStopsAtACrissCrossHistory(t *testing.T) {
+// THE REPAIR STOPS BEFORE IT CHANGES ANYTHING it cannot do safely: a branch
+// that is not the commit CI checked (a commit was added on GitHub or another
+// machine since), and a criss-cross history, where squashing onto either merge
+// base changes what a merge into billet gives. The printed steps run in order,
+// stopping at the first failure, and the branch, the index and the pull
+// request's head are as they were.
+func TestTheRepairStopsBeforeItChangesAnything(t *testing.T) {
 	t.Parallel()
 
-	out, code := runDCO(t, prMergeRef(t, func(t *testing.T, repo string) {
+	// refusal is the repair a refusal prints for base and head, against upstream.
+	refusal := func(t *testing.T, upstream, base, headRepo, headSHA string) []string {
 		t.Helper()
 
-		authored(t, repo, ada, "unsigned")
-	}), "pull_request", "ada", dcoOwner)
-	if code != 1 {
-		t.Fatalf("dco.sh exited %d, want 1\n%s", code, out)
-	}
-	var guard string
-	for _, line := range strings.Split(out, "\n") {
-		if cmd, ok := strings.CutPrefix(line, "dco:   $ "); ok && strings.Contains(cmd, "--all") {
-			guard = cmd
+		out, code := runDCO(t, prMergeRef(t, func(t *testing.T, repo string) {
+			t.Helper()
+
+			authored(t, repo, ada, "unsigned")
+		}), "pull_request", "ada", dcoOwner, "DCO_UPSTREAM=file://"+upstream, "DCO_BASE_REF="+base,
+			"DCO_HEAD_REPO="+headRepo, "DCO_HEAD_REF=pr", "DCO_HEAD_SHA="+headSHA)
+		if code != 1 {
+			t.Fatalf("dco.sh exited %d, want 1\n%s", code, out)
 		}
-	}
-	if guard == "" {
-		t.Fatalf("the refusal printed no merge-base guard:\n%s", out)
-	}
 
-	repo := newRepo(t)
-	authored(t, repo, grace, "base")
-	fixtureGit(t, repo, "branch", "other")
-	authored(t, repo, grace, "A on main")
-	fixtureGit(t, repo, "checkout", "--quiet", "other")
-	authored(t, repo, grace, "B on other")
-	fixtureGit(t, repo, "branch", "other-at-b")
-	fixtureGit(t, repo, "merge", "--quiet", "--no-edit", "main~0")
-	fixtureGit(t, repo, "checkout", "--quiet", "main")
-	fixtureGit(t, repo, "merge", "--quiet", "--no-edit", "other-at-b")
-
-	runGuard := func() error {
+		return repairSteps(t, out)
+	}
+	state := func(t *testing.T, repo string) string {
 		t.Helper()
 
-		cmd := exec.CommandContext(t.Context(), "bash", "-c", guard)
-		cmd.Dir = repo
-		cmd.Env = fixtureGitEnv()
-
-		return cmd.Run()
+		return gitOut(t, repo, "rev-parse", "HEAD") + gitOut(t, repo, "write-tree")
 	}
 
-	fixtureGit(t, repo, "fetch", "--quiet", ".", "other")
-	if bases := strings.Fields(gitOut(t, repo, "merge-base", "--all", "HEAD", "FETCH_HEAD")); len(bases) != 2 {
-		t.Fatalf("the fixture has %d merge bases, want 2", len(bases))
-	}
-	if err := runGuard(); err == nil {
-		t.Error("the guard passed a criss-cross history")
-	}
+	t.Run("a branch behind the pull request", func(t *testing.T) {
+		t.Parallel()
 
-	fixtureGit(t, repo, "fetch", "--quiet", ".", "other-at-b")
-	if err := runGuard(); err != nil {
-		t.Errorf("the guard refused a history with one merge base: %v", err)
-	}
+		upstream := newRepo(t)
+		authored(t, upstream, grace, "base")
+		fork := filepath.Join(t.TempDir(), "fork.git")
+		fixtureGit(t, upstream, "clone", "--quiet", "--bare", "file://"+upstream, fork)
+
+		work := t.TempDir()
+		fixtureGit(t, work, "clone", "--quiet", "file://"+fork, ".")
+		fixtureGit(t, work, "config", "user.name", "Ada Contributor")
+		fixtureGit(t, work, "config", "user.email", "ada@example.invalid")
+		fixtureGit(t, work, "checkout", "--quiet", "-b", "pr")
+		authored(t, work, ada, "pushed from here")
+		fixtureGit(t, work, "push", "--quiet", "origin", "pr")
+
+		// THE WEB EDITOR: another clone adds a commit the first never sees.
+		other := t.TempDir()
+		fixtureGit(t, other, "clone", "--quiet", "--branch", "pr", "file://"+fork, ".")
+		fixtureGit(t, other, "config", "user.name", "Ada Contributor")
+		fixtureGit(t, other, "config", "user.email", "ada@example.invalid")
+		authored(t, other, ada, "added on GitHub")
+		fixtureGit(t, other, "push", "--quiet", "origin", "pr")
+		remote := strings.TrimSpace(gitOut(t, fork, "rev-parse", "refs/heads/pr"))
+
+		steps := refusal(t, upstream, "main", fork, remote)
+		before := state(t, work)
+		if failed := runSteps(t, work, steps); failed != 0 {
+			t.Fatalf("the repair ran %d steps on a branch behind the pull request; the first should stop it", failed)
+		}
+		if after := state(t, work); after != before {
+			t.Errorf("the stopped repair changed the branch or its index")
+		}
+		if got := strings.TrimSpace(gitOut(t, fork, "rev-parse", "refs/heads/pr")); got != remote {
+			t.Errorf("the stopped repair moved the pull request's head to %s from %s", got, remote)
+		}
+	})
+
+	t.Run("a criss-cross history", func(t *testing.T) {
+		t.Parallel()
+
+		// main and other each merged the other's first commit: two merge bases.
+		repo := newRepo(t)
+		authored(t, repo, grace, "base")
+		fixtureGit(t, repo, "branch", "other")
+		authored(t, repo, grace, "A on main")
+		fixtureGit(t, repo, "checkout", "--quiet", "other")
+		authored(t, repo, grace, "B on other")
+		fixtureGit(t, repo, "branch", "other-at-b")
+		fixtureGit(t, repo, "merge", "--quiet", "--no-edit", "main~0")
+		fixtureGit(t, repo, "checkout", "--quiet", "main")
+		fixtureGit(t, repo, "merge", "--quiet", "--no-edit", "other-at-b")
+		if bases := strings.Fields(gitOut(t, repo, "merge-base", "--all", "main", "other")); len(bases) != 2 {
+			t.Fatalf("the fixture has %d merge bases, want 2", len(bases))
+		}
+
+		head := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+		guard := -1
+		steps := refusal(t, repo, "other", repo, head)
+		for i, step := range steps {
+			if strings.Contains(step, "merge-base --all") {
+				guard = i
+			}
+		}
+
+		before := state(t, repo)
+		if failed := runSteps(t, repo, steps); failed != guard {
+			t.Fatalf("the repair stopped at step %d in a criss-cross history, want the merge-base guard, step %d", failed, guard)
+		}
+		if after := state(t, repo); after != before {
+			t.Errorf("the repair changed the branch or its index before its guard stopped it")
+		}
+
+		// ONE BASE PASSES THE GUARD: the same steps against other's first commit
+		// get past it.
+		steps = refusal(t, repo, "other-at-b", repo, head)
+		if failed := runSteps(t, repo, steps[:guard+1]); failed != guard+1 {
+			t.Errorf("the repair stopped at step %d with one merge base, before passing its guard", failed)
+		}
+	})
 }
 
 // THE JOB CHECKS OUT EVERY COMMIT. A depth that is not a literal 0 leaves the
@@ -648,6 +687,41 @@ func sshSigned(t *testing.T, repo string) {
 	fixtureGit(t, repo, "config", "gpg.format", "ssh")
 	fixtureGit(t, repo, "config", "user.signingkey", key)
 	fixtureGit(t, repo, "config", "commit.gpgsign", "true")
+}
+
+// repairSteps is the repair a refusal printed: its command lines, in order.
+func repairSteps(t *testing.T, out string) []string {
+	t.Helper()
+
+	var steps []string
+	for _, line := range strings.Split(out, "\n") {
+		if cmd, ok := strings.CutPrefix(line, "dco:   $ "); ok {
+			steps = append(steps, cmd)
+		}
+	}
+	if len(steps) == 0 {
+		t.Fatalf("the refusal printed no repair:\n%s", out)
+	}
+
+	return steps
+}
+
+// runSteps runs steps in dir in order, as a contributor told to stop at the first
+// failure would, and returns the index of the step that failed, or len(steps).
+// The editor gives `git commit -s` a subject above the sign-off it wrote.
+func runSteps(t *testing.T, dir string, steps []string) int {
+	t.Helper()
+
+	for i, step := range steps {
+		cmd := exec.CommandContext(t.Context(), "bash", "-c", step)
+		cmd.Dir = dir
+		cmd.Env = append(fixtureGitEnv(), "GIT_EDITOR=sed -i.bak 1s/^/ada-work/")
+		if err := cmd.Run(); err != nil {
+			return i
+		}
+	}
+
+	return len(steps)
 }
 
 // gitOut is git's standard output in dir.

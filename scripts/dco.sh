@@ -140,10 +140,15 @@ dco: conflict editor make unsigned merges. To repair this branch, the one
 dco: rewrite billet asks for, squash it into one signed-off commit, which keeps
 dco: its contents exactly, merges included. On the branch, with nothing
 dco: uncommitted or staged (`git status --short` prints nothing), run these, and
-dco: stop if one fails. The second fails when the branch has more than one merge
-dco: base with billet's (a criss-cross history), where no single squash keeps what
-dco: a merge into billet would give; say so on the pull request instead.
+dco: stop if one fails. The first fails when your branch is not the commit this
+dco: run checked (a commit added on GitHub or another machine): pull it, then rerun
+dco: CI for current instructions. The third fails when the branch has more than
+dco: one merge base with billet's (a criss-cross history), where no single squash
+dco: keeps what a merge into billet would give; say so on the pull request instead.
 EOF
+	# THE BRANCH IS THE ONE CHECKED, or the squash covers less than the pull request
+	# holds and the exact lease, which the remote still satisfies, deletes the rest.
+	printf 'dco:   $ test "$(git rev-parse HEAD)" = %q\n' "$head_sha"
 	# FULLY QUALIFIED: a branch named +x would otherwise read as a forced fetch of x,
 	# and a short name can match a tag.
 	printf 'dco:   $ git fetch %q %q\n' "$upstream" "refs/heads/$base"
