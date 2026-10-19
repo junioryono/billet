@@ -115,4 +115,4 @@ billet is **pre-alpha**. Jobs run end to end through the Docker, Firecracker, Ta
 License
 -------
 
-Apache-2.0. See `LICENSE <https://github.com/junioryono/billet/blob/main/LICENSE>`_.
+Apache-2.0 (`LICENSE <https://github.com/junioryono/billet/blob/main/LICENSE>`_), except the ``ee/`` directory, which is under `the billet Enterprise License <https://github.com/junioryono/billet/blob/main/ee/LICENSE>`_: free to read, modify and run for development and testing, with production use needing a subscription. Nothing outside ``ee/`` depends on it.

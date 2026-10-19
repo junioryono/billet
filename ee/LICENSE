@@ -1,0 +1,16 @@
+The billet Enterprise License
+Copyright 2026 Junior Yono
+
+This license covers everything under the ee/ directory of the billet repository (the "Enterprise Software"). Junior Yono is its licensor. Everything else in the repository is licensed under the Apache License, Version 2.0, in the LICENSE file at the repository's root.
+
+1. Production use. You may use the Enterprise Software in production only while you, and any entity you act for, hold a valid billet enterprise subscription or another written agreement with the licensor that covers that use, and only within the scope that subscription or agreement grants.
+
+2. Development and testing. Without a subscription, you may copy, modify and run the Enterprise Software for development and testing, but not in production.
+
+3. Modifications. Subject to section 1, you may modify the Enterprise Software and publish patches to it. The licensor and its licensors keep all right, title and interest in the Enterprise Software and in every modification or patch of it, which may be used, copied, modified, displayed, distributed or otherwise exploited only under a subscription or agreement described in section 1.
+
+4. No other rights. Except as this license expressly allows, you may not copy, merge, publish, distribute, sublicense or sell the Enterprise Software. No other right is granted, including any right to the billet name or marks.
+
+5. Third-party components. A third-party component included in the Enterprise Software stays under the license its owner provides.
+
+THE ENTERPRISE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE ENTERPRISE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE ENTERPRISE SOFTWARE.
