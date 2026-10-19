@@ -1161,9 +1161,10 @@
 
 # A NODE THAT LEAVES MUST HAVE DRAINED (#127): nothing will start again to
 # adopt what it left, and systemd's account of its stop says nothing of that.
-# One already stopped when the node leaves is judged by what its last process
-# left. The record is read where the installed configuration kept it, or where
-# the owed drain says once the configuration names no node.
+# One already stopped is judged by what its last process left, whenever its
+# unit is there: the record is read where the installed configuration kept it,
+# where the owed drain says once the configuration names no node, or, with
+# neither, where the package's node kept it.
 - name: Prove the stop of a node that may not run here drained
   ansible.builtin.include_tasks: node-ending.yml
   vars:
@@ -1178,7 +1179,7 @@
     - not billet_node_should_run
     - not ansible_check_mode
     - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
-      or billet_node_unwanted_state_dir | length > 0
+      or billet_node_unwanted_state_dir | length > 0 or billet_node_unwanted_state.rc != 4
 
 - name: Note that the stop of a node that may not run here proved it drained
   ansible.builtin.set_fact:
@@ -1187,7 +1188,7 @@
     - not billet_node_should_run
     - not ansible_check_mode
     - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
-      or billet_node_unwanted_state_dir | length > 0
+      or billet_node_unwanted_state_dir | length > 0 or billet_node_unwanted_state.rc != 4
 
 # THE OWED DRAIN IS DONE WITH ONLY ONCE THIS CONVERGE PROVED IT: by the
 # restart's, the start's, the transaction's or the leaving node's check.

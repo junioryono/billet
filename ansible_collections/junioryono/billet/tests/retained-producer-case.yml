@@ -59,6 +59,8 @@
       - {kind: write, path: /etc/billet/billet.yaml}
       - {kind: write, path: /etc/tmpfiles.d/billet.conf}
       - {kind: delete, path: /etc/modules-load.d/billet-rbd.conf}
+      - {kind: write, path: /etc/billet/node-drain-owed}
+      - {kind: delete, path: /etc/billet/node-drain-owed}
       - {kind: write, path: /etc/systemd/system/billet-node.service}
       - {kind: mkdir, path: /tmp}
 

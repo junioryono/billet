@@ -173,7 +173,7 @@ func TestEveryDrainingStopTheRoleProvesIsJudgedByItsEnding(t *testing.T) {
 				"not billet_node_should_run",
 				"not ansible_check_mode",
 				"billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed'] or " +
-					"billet_node_unwanted_state_dir | length > 0",
+					"billet_node_unwanted_state_dir | length > 0 or billet_node_unwanted_state.rc != 4",
 			},
 		},
 		{
