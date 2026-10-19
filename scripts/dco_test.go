@@ -239,6 +239,17 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			},
 		},
 		{
+			// A MESSAGE IS NOT A PATCH: a Markdown rule (---) above the sign-off
+			// would otherwise end the message for git, and hide it.
+			name:   "a sign-off below a horizontal rule",
+			author: "ada",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				authored(t, repo, ada, "with a rule", "Notes", "---", "more notes", adaSign)
+			},
+		},
+		{
 			// THE OWNER OF THIS REPOSITORY, not of some repository: in a fork or
 			// a repository another account owns, the same login is a contributor.
 			name:   "the usual owner in a repository someone else owns",

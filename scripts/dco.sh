@@ -70,7 +70,9 @@ fi
 # (trailer.<token>.key), separators and the comment character from every config
 # file and the environment, and an alias can forge a sign-off out of another line
 # or hide a real one. So the parse runs in an empty directory no repository is
-# found above, with no global, system or environment configuration.
+# found above, with no global, system or environment configuration. And with no
+# divider: a commit message is not a patch, so a Markdown rule (---) in it must
+# not hide the trailers below it, as it would by default.
 #
 # THE CEILING IS THE PARENT OF WHERE THE PARSE RUNS. git stops before entering a
 # ceiling, not at one, so the parse runs in a child of the temporary directory
@@ -92,7 +94,7 @@ mkdir "$iso/parse"
 parse_trailers() {
 	(cd "$iso/parse" && env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_DIR \
 		GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-		GIT_CEILING_DIRECTORIES="$iso" git -c trailer.separators=: interpret-trailers --parse)
+		GIT_CEILING_DIRECTORIES="$iso" git -c trailer.separators=: interpret-trailers --parse --no-divider)
 }
 
 missing=0
