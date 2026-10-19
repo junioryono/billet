@@ -203,10 +203,6 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		defer cleanup()
 	}
 
-	if err := manifest.Usable(firecracker.GuestContract, hostArch()); err != nil {
-		return err
-	}
-
 	// REFUSED ONLY ON EVIDENCE THIS CAN ACTUALLY ESTABLISH. An image whose runner is
 	// past github's window produces microVMs that register and are never given work,
 	// which is a confusing failure to debug and a pointless one to import — so the
@@ -537,6 +533,10 @@ func stageImage(
 			return nil, "", nil, err
 		}
 
+		if err := manifest.Usable(firecracker.GuestContract, hostArch()); err != nil {
+			return nil, "", nil, err
+		}
+
 		// COPIED INTO PRIVATE STAGING WHILE BEING HASHED, rather than verified where
 		// they sit and read again later.
 		//
@@ -559,6 +559,13 @@ func stageImage(
 
 	manifest, client, err := resolveImageManifest(ctx, env, cfg, opts)
 	if err != nil {
+		return nil, "", nil, err
+	}
+
+	// REFUSED BEFORE A BYTE IS DOWNLOADED. An image this build cannot import --
+	// another guest contract, another architecture, components it cannot install
+	// -- is otherwise found out only after gigabytes, every day the timer runs.
+	if err := manifest.Usable(firecracker.GuestContract, hostArch()); err != nil {
 		return nil, "", nil, err
 	}
 

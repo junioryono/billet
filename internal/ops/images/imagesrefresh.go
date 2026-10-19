@@ -11,6 +11,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
@@ -148,6 +149,13 @@ func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Conf
 	manifest, err := fetchImageManifest(ctx, env, cfg)
 	if err != nil {
 		return err
+	}
+
+	// AN IMAGE THIS BUILD CANNOT IMPORT IS SAID SO HERE, once, rather than by a
+	// pull per configured image that each fail the same way.
+	if err := manifest.Usable(firecracker.GuestContract, hostArch()); err != nil {
+		return fmt.Errorf("billet images refresh: the channel's image cannot be imported "+
+			"by this billet: %w", err)
 	}
 
 	store, err := openRefreshStore(cfg)

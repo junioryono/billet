@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
@@ -27,9 +28,54 @@ func (s fakeRefreshStore) NewestGeneration(context.Context, string) (ceph.Genera
 
 // refreshRun stages the seams a refresh runs through and records what it did.
 type refreshRun struct {
-	pulled  []string
-	reaped  []string
-	pullErr error
+	pulled   []string
+	reaped   []string
+	pullErr  error
+	manifest *imagesource.Manifest
+}
+
+// refreshManifest is a channel image this build can import, built at builtAt.
+func refreshManifest(builtAt time.Time) *imagesource.Manifest {
+	return &imagesource.Manifest{
+		Schema:        imagesource.SchemaV1,
+		GuestContract: firecracker.GuestContract,
+		Arch:          hostArch(),
+		RunnerVersion: fixtureRunner,
+		BuiltAt:       builtAt,
+		Rootfs:        imagesource.Asset{Name: "rootfs.img", SHA256: strings.Repeat("a", 64), Size: 1},
+		Kernel: imagesource.Asset{Name: "vmlinux-billet", SHA256: strings.Repeat("b", 64), Size: 1,
+			Version: "6.1.155"},
+	}
+}
+
+// leavingOut turns a manifest into a schema 3 image that leaves components out.
+func leavingOut(m *imagesource.Manifest) {
+	m.Schema = imagesource.SchemaV3
+	m.RootfsMultipart = &imagesource.Multipart{
+		Name: m.Rootfs.Name, SHA256: m.Rootfs.SHA256, Size: m.Rootfs.Size,
+		Parts: []imagesource.Asset{{Name: m.Rootfs.Name + ".000", SHA256: m.Rootfs.SHA256,
+			Size: m.Rootfs.Size}},
+	}
+	m.Rootfs = imagesource.Asset{}
+	m.CompletionContract = "1"
+	m.Components = []imagesource.Component{{Name: "google-chrome", Space: 600 << 20}}
+}
+
+// AN IMAGE THIS BUILD CANNOT COMPLETE IS REFUSED BY THE REFRESH, once and by name,
+// and nothing is pulled.
+func TestARefreshRefusesAnImageThisBuildCannotComplete(t *testing.T) {
+	cfgPath := firecrackerRefreshConfig(t, "")
+	run := stageRefresh(t, fakeRefreshStore{}, time.Now().UTC().Truncate(time.Second))
+	leavingOut(run.manifest)
+
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", cfgPath})
+	if err == nil || !strings.Contains(err.Error(), "the channel's image cannot be imported by "+
+		"this billet") || !strings.Contains(err.Error(), "leaves out google-chrome") {
+		t.Fatalf("got %v, want the refresh to refuse the image as one it cannot complete", err)
+	}
+	if len(run.pulled) != 0 {
+		t.Fatalf("the refresh pulled %v", run.pulled)
+	}
 }
 
 // firecrackerRefreshConfig writes a config for a firecracker node with one tier
@@ -82,7 +128,7 @@ tiers:
 func stageRefresh(t *testing.T, store fakeRefreshStore, builtAt time.Time) *refreshRun {
 	t.Helper()
 
-	run := &refreshRun{}
+	run := &refreshRun{manifest: refreshManifest(builtAt)}
 
 	restoreStore, restoreFetch, restorePull, restoreReap :=
 		openRefreshStore, fetchImageManifest, refreshPull, refreshReap
@@ -94,7 +140,7 @@ func stageRefresh(t *testing.T, store fakeRefreshStore, builtAt time.Time) *refr
 
 	openRefreshStore = func(*config.Config) (refreshStore, error) { return store, nil }
 	fetchImageManifest = func(context.Context, cli.Env, *config.Config) (*imagesource.Manifest, error) {
-		return &imagesource.Manifest{BuiltAt: builtAt}, nil
+		return run.manifest, nil
 	}
 	refreshPull = func(_ context.Context, _ cli.Env, _, image string) error {
 		run.pulled = append(run.pulled, image)
