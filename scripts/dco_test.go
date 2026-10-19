@@ -31,7 +31,7 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		event   string
-		tmpdir  bool // TMPDIR inside the repository, where git could find its config
+		tmpdir  string // a TMPDIR of this name inside the repository, where git could find its config
 		author  string
 		owner   string // the repository's owner; empty is dcoOwner
 		commits func(t *testing.T, repo string)
@@ -168,7 +168,7 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			// the repository and read the alias anyway.
 			name:   "an alias with the temporary directory inside the repository",
 			author: "ada",
-			tmpdir: true,
+			tmpdir: "tmp",
 			commits: func(t *testing.T, repo string) {
 				t.Helper()
 
@@ -179,6 +179,32 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			names: "forged from inside",
 		},
 		{
+			// A COLON WOULD SPLIT THE CEILING, so such a TMPDIR is a refusal.
+			name:   "a temporary directory whose path holds a colon",
+			author: "ada",
+			tmpdir: "tmp:inside",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				fixtureGit(t, repo, "config", "trailer.sign.key", "Signed-off-by")
+				authored(t, repo, ada, "forged through a split ceiling", "sign: "+ada)
+			},
+			code: 2,
+		},
+		{
+			// A SIGNED COMMIT'S VERIFICATION REPORT IS NOT PART OF ITS MESSAGE:
+			// with log.showSignature, git show prints it ahead of either read.
+			name:   "a signed commit in a clone that shows signatures",
+			author: "ada",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				sshSigned(t, repo)
+				fixtureGit(t, repo, "config", "log.showSignature", "true")
+				authored(t, repo, ada, "signed twice over", adaSign)
+			},
+		},
+		{
 			// GIT'S OUTPUT ENCODING DOES NOT DECIDE IT EITHER: UTF-16 would put a
 			// NUL between every letter of a valid sign-off.
 			name:   "a clone that logs in UTF-16",
@@ -186,8 +212,10 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			commits: func(t *testing.T, repo string) {
 				t.Helper()
 
+				// NOT ASCII, so the NULs cannot fall out and leave the name intact.
+				jose := "José Contributor <jose@example.invalid>"
 				fixtureGit(t, repo, "config", "i18n.logOutputEncoding", "UTF-16LE")
-				authored(t, repo, ada, "signed, logged in UTF-16", adaSign)
+				authored(t, repo, jose, "signed, logged in UTF-16", "Signed-off-by: "+jose)
 			},
 		},
 		{
@@ -241,8 +269,8 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			}
 
 			var env []string
-			if tc.tmpdir {
-				tmp := filepath.Join(repo, "tmp")
+			if tc.tmpdir != "" {
+				tmp := filepath.Join(repo, tc.tmpdir)
 				if err := os.Mkdir(tmp, 0o700); err != nil {
 					t.Fatal(err)
 				}
@@ -379,6 +407,22 @@ func TestTheDCOJobChecksOutTheWholeHistory(t *testing.T) {
 	if !ran {
 		t.Error("the dco job does not run scripts/dco.sh after a checkout")
 	}
+}
+
+// sshSigned makes repo sign every commit with a throwaway SSH key, the signing
+// format that needs no GPG installation.
+func sshSigned(t *testing.T, repo string) {
+	t.Helper()
+
+	key := filepath.Join(t.TempDir(), "id")
+	gen := exec.CommandContext(t.Context(), "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key)
+	if out, err := gen.CombinedOutput(); err != nil {
+		t.Skipf("ssh-keygen is not usable here: %v\n%s", err, out)
+	}
+
+	fixtureGit(t, repo, "config", "gpg.format", "ssh")
+	fixtureGit(t, repo, "config", "user.signingkey", key)
+	fixtureGit(t, repo, "config", "commit.gpgsign", "true")
 }
 
 // gitOut is git's standard output in dir.

@@ -76,9 +76,17 @@ fi
 # and the ceiling is that directory's physical path; a TMPDIR inside a checkout
 # would otherwise let git walk up into it. The template is explicit because BSD
 # mktemp -d ignores TMPDIR without one, and GNU mktemp honours it.
-iso=$(mktemp -d "${TMPDIR:-/tmp}/dco.XXXXXX")
+if ! iso=$(mktemp -d "${TMPDIR:-/tmp}/dco.XXXXXX"); then
+	echo "dco: no temporary directory to parse trailers in" >&2
+	exit 2
+fi
 trap 'rm -rf "$iso"' EXIT
 iso=$(cd -P "$iso" && pwd -P)
+# A COLON SPLITS THE CEILING into two paths, neither of them this one.
+if [[ $iso == *:* ]]; then
+	echo "dco: the temporary directory $iso holds a colon, which GIT_CEILING_DIRECTORIES cannot name" >&2
+	exit 2
+fi
 mkdir "$iso/parse"
 parse_trailers() {
 	(cd "$iso/parse" && env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_DIR \
@@ -88,11 +96,17 @@ parse_trailers() {
 
 missing=0
 for c in $commits; do
-	# UTF-8 BOTH TIMES: i18n.logOutputEncoding would otherwise re-encode the name
-	# and the message, breaking a valid sign-off or transliterating two different
-	# names into one.
-	want="Signed-off-by: $(git show -s --encoding=UTF-8 --format='%an <%ae>' "$c")"
-	if ! trailers=$(git show -s --encoding=UTF-8 --format=%B "$c" | parse_trailers); then
+	# UTF-8 AND NO SIGNATURE REPORT, BOTH TIMES: i18n.logOutputEncoding would
+	# re-encode the name and the message, breaking a valid sign-off or
+	# transliterating two names into one, and log.showSignature would add a
+	# signed commit's verification lines to either.
+	author=$(git show -s --no-show-signature --encoding=UTF-8 --format='%an <%ae>' "$c")
+	if [[ $author == *$'\n'* ]]; then
+		echo "dco: $c's author read as more than one line" >&2
+		exit 2
+	fi
+	want="Signed-off-by: $author"
+	if ! trailers=$(git show -s --no-show-signature --encoding=UTF-8 --format=%B "$c" | parse_trailers); then
 		echo "dco: reading $c's trailers failed" >&2
 		exit 2
 	fi
