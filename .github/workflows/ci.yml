@@ -1272,6 +1272,9 @@ jobs:
           # this pull request's base, never the contributor's origin.
           DCO_UPSTREAM: ${{ github.server_url }}/${{ github.repository }}
           DCO_BASE_REF: ${{ github.base_ref }}
+          DCO_HEAD_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
+          DCO_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: scripts/dco.sh
 
   # THE ONE CONTEXT BRANCH PROTECTION REQUIRES. Protection names a status check

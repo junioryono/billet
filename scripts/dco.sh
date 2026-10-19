@@ -122,8 +122,16 @@ if [[ $missing -ne 0 ]]; then
 	# origin/main: a contributor's origin is usually their fork, whose main may be
 	# far behind, and squashing onto a stale base would make work main has since
 	# reverted look like the contributor's own and bring it back.
+	#
+	# AND IT NAMES WHERE THE PUSH GOES. A bare push follows push.default and the
+	# branch's tracking, which can update another branch or several; the job knows
+	# the pull request's head repository, branch and commit, so the push names all
+	# three, the commit as the lease.
 	upstream=${DCO_UPSTREAM:-"<billet's repository URL>"}
 	base=${DCO_BASE_REF:-"<your pull request's base branch>"}
+	head_repo=${DCO_HEAD_REPO:-"<your fork's URL>"}
+	head_ref=${DCO_HEAD_REF:-"<your branch>"}
+	head_sha=${DCO_HEAD_SHA:-"<your branch's commit>"}
 	cat <<'EOF'
 dco: sign off each commit to certify you wrote it or may contribute it
 dco: (https://developercertificate.org). Commit with `git commit -s`, and merge
@@ -132,12 +140,18 @@ dco: conflict editor make unsigned merges. To repair this branch, the one
 dco: rewrite billet asks for, squash it into one signed-off commit, which keeps
 dco: its contents exactly, merges included. On the branch, with nothing
 dco: uncommitted or staged (`git status --short` prints nothing), run these, and
-dco: stop if one fails:
+dco: stop if one fails. The second fails when the branch has more than one merge
+dco: base with billet's (a criss-cross history), where no single squash keeps what
+dco: a merge into billet would give; say so on the pull request instead.
 EOF
-	printf 'dco:   $ git fetch %q %q\n' "$upstream" "$base"
+	# FULLY QUALIFIED: a branch named +x would otherwise read as a forced fetch of x,
+	# and a short name can match a tag.
+	printf 'dco:   $ git fetch %q %q\n' "$upstream" "refs/heads/$base"
 	# shellcheck disable=SC2016 # printed for the contributor to run, unexpanded.
-	printf 'dco:   $ %s\n' 'git reset --soft "$(git merge-base HEAD FETCH_HEAD)"' \
-		'git commit -s' 'git push --force-with-lease'
+	printf 'dco:   $ %s\n' 'test -z "$(git merge-base --all HEAD FETCH_HEAD | sed 1d)"' \
+		'git reset --soft "$(git merge-base HEAD FETCH_HEAD)"' 'git commit -s'
+	printf 'dco:   $ git push %q %q %q\n' "--force-with-lease=refs/heads/$head_ref:$head_sha" \
+		"$head_repo" "HEAD:refs/heads/$head_ref"
 	exit 1
 fi
 

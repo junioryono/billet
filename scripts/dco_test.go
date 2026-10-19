@@ -424,7 +424,19 @@ func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 	}
 	write(work, "c", "resolved by ada\n")
 	fixtureGit(t, work, "commit", "--quiet", "--no-edit")
-	fixtureGit(t, work, "push", "--quiet", "-u", "origin", "pr")
+
+	// A PUSH THAT WOULD GO ELSEWHERE: pr tracks the fork's main, and with
+	// push.default=upstream a bare push would overwrite that main. The printed
+	// push must name its destination.
+	fixtureGit(t, work, "push", "--quiet", "origin", "pr")
+	fixtureGit(t, work, "branch", "--quiet", "--set-upstream-to=origin/main", "pr")
+	fixtureGit(t, work, "config", "push.default", "upstream")
+	forkMain := strings.TrimSpace(gitOut(t, fork, "rev-parse", "refs/heads/main"))
+
+	// A TAG NAMED LIKE THE BASE, on the stale commit: a short `main` resolves to
+	// the tag before the branch, so the printed fetch must name refs/heads/main.
+	fixtureGit(t, upstream, "tag", "main", "refs/heads/main~1")
+	headSHA := strings.TrimSpace(gitOut(t, work, "rev-parse", "pr"))
 
 	write(upstream, "x", "0\n")
 	fixtureGit(t, upstream, "commit", "--quiet", "-m", "B: revert x")
@@ -439,7 +451,7 @@ func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 		fixtureGit(t, ref, "config", "user.name", "GitHub")
 		fixtureGit(t, ref, "config", "user.email", "noreply@example.invalid")
 		fixtureGit(t, ref, "fetch", "--quiet", "file://"+fork, "pr")
-		fixtureGit(t, ref, "checkout", "--quiet", "--detach", "origin/main")
+		fixtureGit(t, ref, "checkout", "--quiet", "--detach", "refs/remotes/origin/main")
 		fixtureGit(t, ref, "merge", "--quiet", "--no-ff", "--no-edit", "FETCH_HEAD")
 
 		return ref, strings.TrimSpace(gitOut(t, ref, "rev-parse", "HEAD^{tree}"))
@@ -447,7 +459,8 @@ func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 
 	ref, before := integration()
 	out, code := runDCO(t, ref, "pull_request", "ada", dcoOwner,
-		"DCO_UPSTREAM=file://"+upstream, "DCO_BASE_REF=main")
+		"DCO_UPSTREAM=file://"+upstream, "DCO_BASE_REF=main",
+		"DCO_HEAD_REPO="+fork, "DCO_HEAD_REF=pr", "DCO_HEAD_SHA="+headSHA)
 	if code != 1 {
 		t.Fatalf("the unrepaired branch: dco.sh exited %d, want 1\n%s", code, out)
 	}
@@ -485,6 +498,68 @@ func TestTheRepairTheDCOCheckPrintsMakesTheBranchPass(t *testing.T) {
 	}
 	if out, code := runDCO(t, ref, "pull_request", "ada", dcoOwner); code != 0 {
 		t.Errorf("the repaired branch: dco.sh exited %d, want 0\n%s", code, out)
+	}
+	if got := strings.TrimSpace(gitOut(t, fork, "rev-parse", "refs/heads/main")); got != forkMain {
+		t.Errorf("the repair moved the fork's main to %s from %s; only pr was to be pushed", got, forkMain)
+	}
+}
+
+// A CRISS-CROSS HISTORY STOPS THE REPAIR. With two merge bases, squashing onto
+// either one changes what a merge into billet gives, so the printed guard step
+// fails there, and passes where there is one base.
+func TestTheRepairStopsAtACrissCrossHistory(t *testing.T) {
+	t.Parallel()
+
+	out, code := runDCO(t, prMergeRef(t, func(t *testing.T, repo string) {
+		t.Helper()
+
+		authored(t, repo, ada, "unsigned")
+	}), "pull_request", "ada", dcoOwner)
+	if code != 1 {
+		t.Fatalf("dco.sh exited %d, want 1\n%s", code, out)
+	}
+	var guard string
+	for _, line := range strings.Split(out, "\n") {
+		if cmd, ok := strings.CutPrefix(line, "dco:   $ "); ok && strings.Contains(cmd, "--all") {
+			guard = cmd
+		}
+	}
+	if guard == "" {
+		t.Fatalf("the refusal printed no merge-base guard:\n%s", out)
+	}
+
+	repo := newRepo(t)
+	authored(t, repo, grace, "base")
+	fixtureGit(t, repo, "branch", "other")
+	authored(t, repo, grace, "A on main")
+	fixtureGit(t, repo, "checkout", "--quiet", "other")
+	authored(t, repo, grace, "B on other")
+	fixtureGit(t, repo, "branch", "other-at-b")
+	fixtureGit(t, repo, "merge", "--quiet", "--no-edit", "main~0")
+	fixtureGit(t, repo, "checkout", "--quiet", "main")
+	fixtureGit(t, repo, "merge", "--quiet", "--no-edit", "other-at-b")
+
+	runGuard := func() error {
+		t.Helper()
+
+		cmd := exec.CommandContext(t.Context(), "bash", "-c", guard)
+		cmd.Dir = repo
+		cmd.Env = fixtureGitEnv()
+
+		return cmd.Run()
+	}
+
+	fixtureGit(t, repo, "fetch", "--quiet", ".", "other")
+	if bases := strings.Fields(gitOut(t, repo, "merge-base", "--all", "HEAD", "FETCH_HEAD")); len(bases) != 2 {
+		t.Fatalf("the fixture has %d merge bases, want 2", len(bases))
+	}
+	if err := runGuard(); err == nil {
+		t.Error("the guard passed a criss-cross history")
+	}
+
+	fixtureGit(t, repo, "fetch", "--quiet", ".", "other-at-b")
+	if err := runGuard(); err != nil {
+		t.Errorf("the guard refused a history with one merge base: %v", err)
 	}
 }
 
