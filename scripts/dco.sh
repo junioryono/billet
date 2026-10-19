@@ -20,7 +20,13 @@
 # naming that commit's own author. The checkout is GitHub's merge ref, whose
 # first parent is the base and second the pull request's head, so HEAD^1..HEAD^2
 # is exactly what the merge would bring in; a HEAD of any other shape is refused,
-# because checking the wrong range would pass a commit nobody looked at.
+# because checking the wrong range would pass a commit nobody looked at. So is a
+# shallow clone, whose range stops at the cut and hides the commits below it, and
+# a traversal that fails, whose partial list would read as all signed off.
+#
+# WHAT IT CANNOT HOLD. The job runs the pull request's own copy of this script
+# and workflow, as every pull_request check does, so a contributor's edit to
+# either is caught by the maintainer's review of the diff, not by the check.
 #
 # Environment: DCO_EVENT (github.event_name), DCO_PR_AUTHOR (the pull request
 # author's login), DCO_OWNER (github.repository_owner).
@@ -43,21 +49,34 @@ if [[ $author == "$owner" || $author == *'[bot]' ]]; then
 	exit 0
 fi
 
+if [[ $(git rev-parse --is-shallow-repository) != false ]]; then
+	echo "dco: the clone is shallow, so the pull request's commits below the cut are unseen" >&2
+	exit 2
+fi
+
 parents=$(git rev-list --parents -n 1 HEAD | wc -w)
 if [[ $parents -ne 3 ]]; then
 	echo "dco: HEAD is not a pull request's merge ref (it has $((parents - 1)) parents), so the commits to check are unknown" >&2
 	exit 2
 fi
 
+if ! commits=$(git rev-list --no-merges HEAD^1..HEAD^2); then
+	echo "dco: listing the pull request's commits failed" >&2
+	exit 2
+fi
+
 missing=0
-while read -r c; do
-	[[ -n $c ]] || continue
+for c in $commits; do
 	want="Signed-off-by: $(git show -s --format='%an <%ae>' "$c")"
-	if ! git show -s --format=%B "$c" | git interpret-trailers --parse | grep -qixF -- "$want"; then
+	if ! trailers=$(git show -s --format=%B "$c" | git interpret-trailers --parse); then
+		echo "dco: reading $c's trailers failed" >&2
+		exit 2
+	fi
+	if ! grep -ixF -- "$want" >/dev/null <<<"$trailers"; then
 		echo "dco: $(git show -s --format='%h %s' "$c") has no \"$want\""
 		missing=1
 	fi
-done < <(git rev-list --no-merges HEAD^1..HEAD^2)
+done
 
 if [[ $missing -ne 0 ]]; then
 	cat <<'EOF'

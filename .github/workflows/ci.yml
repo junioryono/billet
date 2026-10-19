@@ -1254,15 +1254,16 @@ jobs:
   # A CONTRIBUTOR'S COMMITS ARE SIGNED OFF under the Developer Certificate of
   # Origin (scripts/dco.sh). KEPT rather than a family: whether a commit is signed
   # off has nothing to do with the paths it touches. A push, and a pull request the
-  # owner or a bot opened, pass at once, so the job costs a checkout there.
+  # owner or a bot opened, pass at once, so the job costs only a clone there.
   dco:
     runs-on: billet-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
         with:
           # The merge ref and both its parents' full histories, so the range
-          # HEAD^1..HEAD^2 is every commit the pull request adds.
-          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+          # HEAD^1..HEAD^2 is every commit the pull request adds. A literal, never
+          # an expression: a bare 0 is falsy, so `&& 0 || 1` always gives 1.
+          fetch-depth: 0
       - env:
           DCO_EVENT: ${{ github.event_name }}
           DCO_PR_AUTHOR: ${{ github.event.pull_request.user.login }}

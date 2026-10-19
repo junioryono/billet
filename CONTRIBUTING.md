@@ -66,7 +66,7 @@ The body covers what changed and why, how it was verified beyond `make check` (a
 
 ## Signing off your commits
 
-Every commit in a pull request is signed off under the [Developer Certificate of Origin](https://developercertificate.org): by adding `Signed-off-by: Your Name <you@example.com>`, matching the commit's author, you certify that you wrote the change or otherwise have the right to contribute it under the project's license. `git commit -s` adds the line for you. CI's `dco` job refuses a pull request with a commit that lacks it, and names the commit; Adding it to commits you have already made rewrites them, which is the one exception to never rebasing or force-pushing: on your own branch, `git rebase --signoff origin/main` and then `git push --force-with-lease`.
+Every commit you author is signed off under the [Developer Certificate of Origin](https://developercertificate.org): by adding `Signed-off-by: Your Name <you@example.com>`, matching the commit's author, you certify that you wrote the change or otherwise have the right to contribute it under the project's license. `git commit -s` adds the line for you. CI's `dco` job checks every commit your pull request adds, merge commits aside, and names any that lacks it; Adding it to commits you have already made rewrites them, which is the one exception to never rebasing or force-pushing: on your own branch, `git rebase --signoff origin/main` and then `git push --force-with-lease`.
 
 Contributions outside `ee/` are accepted under the Apache License 2.0. `ee/` is under the billet Enterprise License, and takes outside contributions only under a written agreement with its licensor, so open an issue first.
 

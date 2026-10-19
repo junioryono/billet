@@ -3,10 +3,13 @@ package scripts_test
 import (
 	"bytes"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -29,6 +32,7 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 		name    string
 		event   string
 		author  string
+		owner   string // the repository's owner; empty is dcoOwner
 		commits func(t *testing.T, repo string)
 		code    int
 		names   string
@@ -133,6 +137,20 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 			names: "claims to be the owner",
 		},
 		{
+			// THE OWNER OF THIS REPOSITORY, not of some repository: in a fork or
+			// a repository another account owns, the same login is a contributor.
+			name:   "the usual owner in a repository someone else owns",
+			author: dcoOwner,
+			owner:  "acme-forks",
+			commits: func(t *testing.T, repo string) {
+				t.Helper()
+
+				authored(t, repo, ada, "unsigned in someone else's repository")
+			},
+			code:  1,
+			names: "unsigned in someone else's repository",
+		},
+		{
 			name:  "a push",
 			event: "push",
 			commits: func(t *testing.T, repo string) {
@@ -152,7 +170,12 @@ func TestAContributorsCommitsMustBeSignedOffByTheirAuthors(t *testing.T) {
 				event = "pull_request"
 			}
 
-			out, code := runDCO(t, repo, event, tc.author, dcoOwner)
+			owner := tc.owner
+			if owner == "" {
+				owner = dcoOwner
+			}
+
+			out, code := runDCO(t, repo, event, tc.author, owner)
 			if code != tc.code {
 				t.Fatalf("dco.sh exited %d, want %d\n%s", code, tc.code, out)
 			}
@@ -197,6 +220,107 @@ func TestTheDCOCheckRefusesWhatItCannotRead(t *testing.T) {
 			t.Errorf("dco.sh exited %d with no pull request author, want 2\n%s", code, out)
 		}
 	})
+}
+
+// A SHALLOW CLONE OR A BROKEN HISTORY IS A REFUSAL, never a pass over the
+// commits it happens to show. The shallow case is the one a depth-2 checkout
+// would make: a signed tip whose unsigned parent sits below the cut.
+func TestTheDCOCheckRefusesAnIncompleteHistory(t *testing.T) {
+	t.Parallel()
+
+	build := func(t *testing.T, repo string) {
+		t.Helper()
+
+		authored(t, repo, ada, "unsigned, below the cut")
+		authored(t, repo, ada, "signed tip", adaSign)
+	}
+
+	t.Run("a shallow clone", func(t *testing.T) {
+		t.Parallel()
+
+		full := prMergeRef(t, build)
+		shallow := t.TempDir()
+		fixtureGit(t, shallow, "clone", "--quiet", "--depth", "2", "file://"+full, ".")
+
+		if out, code := runDCO(t, shallow, "pull_request", "ada", dcoOwner); code != 2 {
+			t.Errorf("dco.sh exited %d on a depth-2 clone, want 2\n%s", code, out)
+		}
+	})
+
+	t.Run("a commit whose object is missing", func(t *testing.T) {
+		t.Parallel()
+
+		repo := prMergeRef(t, build)
+		unsigned := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD^2^"))
+		if err := os.Remove(filepath.Join(repo, ".git", "objects", unsigned[:2], unsigned[2:])); err != nil {
+			t.Fatalf("remove the unsigned commit's object: %v", err)
+		}
+
+		if out, code := runDCO(t, repo, "pull_request", "ada", dcoOwner); code != 2 {
+			t.Errorf("dco.sh exited %d over a missing commit, want 2\n%s", code, out)
+		}
+	})
+}
+
+// THE JOB CHECKS OUT EVERY COMMIT. A depth that is not a literal 0 leaves the
+// range short (a bare 0 in an expression is falsy, so `&& 0 || 1` gives 1).
+func TestTheDCOJobChecksOutTheWholeHistory(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wf struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string         `yaml:"uses"`
+				With map[string]any `yaml:"with"`
+				Run  string         `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		t.Fatal(err)
+	}
+
+	job, ok := wf.Jobs["dco"]
+	if !ok {
+		t.Fatal("ci.yml has no dco job")
+	}
+
+	checkedOut, ran := false, false
+	for _, s := range job.Steps {
+		if strings.HasPrefix(s.Uses, "actions/checkout@") {
+			checkedOut = true
+			if d, ok := s.With["fetch-depth"].(int); !ok || d != 0 {
+				t.Errorf("the dco job checks out with fetch-depth %#v, want the literal 0", s.With["fetch-depth"])
+			}
+		}
+		if s.Run == "scripts/dco.sh" {
+			ran = checkedOut
+		}
+	}
+	if !ran {
+		t.Error("the dco job does not run scripts/dco.sh after a checkout")
+	}
+}
+
+// gitOut is git's standard output in dir.
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "git", args...)
+	cmd.Dir = dir
+	cmd.Env = fixtureGitEnv()
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+
+	return string(out)
 }
 
 // prMergeRef is a repository whose HEAD is a pull request's merge ref: a base
