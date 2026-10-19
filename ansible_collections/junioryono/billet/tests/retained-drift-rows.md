@@ -91,6 +91,8 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/account.yml / Install the GitHub App private key without replacing an existing identity | parity:E removes github and targets; no credential copy is selected |
 | tasks/account.yml / Install the further targets' GitHub App private keys without replacing an existing identity | parity:E removes github and targets; no credential copy is selected |
 | tasks/account.yml / Stage candidate configuration for the upgrade transaction | parity:binary transaction only; retained binary changes refuse before ordinary work |
+| tasks/account.yml / Forget a removed node's record once the node returns to it | parity:node ending judgement (#127); the marker names a removed node's state directory, is written only when the node section is rendered away, and is removed once its drain is proved; a retained node keeps its node section |
+| tasks/account.yml / Preview whether this converge changes the billet configuration | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/account.yml / Remember where a node this converge removes keeps its ending record | parity:node ending judgement (#127); the marker names a removed node's state directory, is written only when the node section is rendered away, and is removed once its drain is proved; a retained node keeps its node section |
 | tasks/account.yml / Render billet configuration | const:/etc/billet/billet.yaml; E:billet_effective_config |
 | tasks/cache-tls.yml / Create the EC2 cache TLS directories when absent | E:node.cache.tls_cert; E:node.cache.tls_key |

@@ -978,6 +978,32 @@
     - not ansible_check_mode
   become: true
 
+# A DRAIN STILL ASKED FOR, by this converge or by one that failed before it
+# withdrew the request (a changed configuration writes it before it is
+# installed), is owed by a node that is not up: what its last process left must
+# be a drain before anything starts over it.
+- name: Inspect whether a drain is still asked of the billet node
+  ansible.builtin.stat:
+    path: /var/run/billet-node-drain
+    get_checksum: false
+  register: billet_node_start_drain_request
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+  become: true
+
+- name: Prove a stopped node drained before its start where a drain is asked for
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: check
+    billet_ending_invocation: ""
+    billet_ending_drain: true
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+    - billet_node_before_start.stdout | default('') not in ['active', 'activating', 'reloading']
+    - billet_node_start_drain_request.stat.exists | default(true)
+
 - name: Admit the billet node's start over its last ending
   ansible.builtin.include_tasks: node-ending.yml
   vars:
@@ -1071,23 +1097,8 @@
 
 # WHERE A NODE THIS OR AN EARLIER CONVERGE RENDERED AWAY KEPT ITS RECORD
 # (account.yml), until its drain is proved.
-- name: Read where a node that may not run here kept its ending record
-  ansible.builtin.slurp:
-    src: "{{ billet_node_leaving_path }}"
-  register: billet_node_leaving
-  failed_when: >-
-    billet_node_leaving is failed and
-    'file not found' not in (billet_node_leaving.msg | default('') | lower)
-  when:
-    - not billet_node_should_run
-    - not ansible_check_mode
-  become: true
-
-- name: Resolve the ending record of a node that may not run here
-  ansible.builtin.set_fact:
-    billet_node_unwanted_state_dir: >-
-      {{ billet_previous_node_state_dir | default('', true)
-         or ((billet_node_leaving.content | b64decode | trim) if billet_node_leaving.content is defined else '') }}
+- name: Find where a node that may not run here kept its ending record
+  ansible.builtin.include_tasks: node-leaving.yml
   when:
     - not billet_node_should_run
     - not ansible_check_mode

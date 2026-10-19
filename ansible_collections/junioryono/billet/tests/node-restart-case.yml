@@ -19,6 +19,26 @@
     billet_gate_restart_failure: ""
     billet_gate_restart_failed: false
 
+# THE MARKER a leaving case stands for: the path a converge that rendered the
+# node away wrote, absent, or something that cannot be read as one.
+- name: Leave the marker {{ billet_gate_restart_case.name }} stands for
+  ansible.builtin.copy:
+    dest: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.leaving"
+    mode: "0600"
+    content: "{{ billet_gate_restart_case.leaving.marker }}\n"
+  when: billet_gate_restart_case.leaving.marker | default('') | length > 0
+
+- name: Leave an unreadable marker {{ billet_gate_restart_case.name }} stands for
+  ansible.builtin.file:
+    path: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.leaving"
+    state: directory
+    mode: "0700"
+  when: billet_gate_restart_case.leaving.unreadable | default(false)
+
+- name: Forget the preceding case's resolved record
+  ansible.builtin.set_fact:
+    billet_node_unwanted_state_dir: unresolved
+
 # THE DRAIN REQUEST a case stands for, left by this converge or an earlier one.
 - name: Leave the drain request {{ billet_gate_restart_case.name }} stands for
   ansible.builtin.copy:
@@ -52,6 +72,7 @@
       when:
         - billet_gate_restart_case.with is not defined
         - billet_gate_restart_case.direct is not defined
+        - billet_gate_restart_case.leaving is not defined
 
     # A CASE THAT NAMES ITS EXECUTABLES, in the order they are tried, each
     # `exe` or `exe:config`.
@@ -79,6 +100,16 @@
         billet_ending_drain: "{{ billet_gate_restart_case.direct.drain | default(false) }}"
         billet_ending_state_dir: "{{ billet_gate_restart_case.direct.state_dir | default('') }}"
       when: billet_gate_restart_case.direct is defined
+
+    # WHERE A LEAVING NODE'S RECORD IS, as services.yml asks it.
+    - name: Find a leaving node's record
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: node-leaving
+      vars:
+        billet_node_leaving_path: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.leaving"
+        billet_previous_node_state_dir: "{{ billet_gate_restart_case.leaving.previous | default('') }}"
+      when: billet_gate_restart_case.leaving is defined
   rescue:
     - name: Record the refusal
       ansible.builtin.set_fact:
@@ -99,6 +130,7 @@
     billet_gate_restart_state: "{{ billet_gate_restart_state_raw.content | b64decode | from_json }}"
     billet_gate_restart_jobs: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^systemctl (stop|start|restart)') | list }}"
     billet_gate_restart_endings: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^(billet|candidate) ') | list }}"
+    billet_gate_restart_asked: "{{ billet_gate_restart_state.calls | map('join', ' ') | select('match', '^(billet|candidate|older) ') | list }}"
     billet_gate_restart_want_jobs: >-
       {{ (['systemctl stop --no-block billet-node.service'] * (billet_gate_restart_case.stops | default(1)))
          + (['systemctl start --no-block billet-node.service'] * (billet_gate_restart_case.starts | default(1))) }}
@@ -108,6 +140,8 @@
       # A STOP, THEN A START, EACH ONE THAT DOES NOT WAIT, AND NEVER A RESTART.
       - billet_gate_restart_jobs == billet_gate_restart_want_jobs
       - billet_gate_restart_case.endings is not defined or billet_gate_restart_endings == billet_gate_restart_case.endings
+      - billet_gate_restart_case.asked is not defined or billet_gate_restart_asked == billet_gate_restart_case.asked
+      - billet_gate_restart_case.resolves is not defined or billet_node_unwanted_state_dir == billet_gate_restart_case.resolves
       - billet_gate_restart_case.calls is not defined or billet_gate_restart_state.calls | length == billet_gate_restart_case.calls
       - >-
         billet_gate_restart_case.polls is not defined or
@@ -121,5 +155,5 @@
     fail_msg: >-
       {{ billet_gate_restart_case.name }}: failed={{ billet_gate_restart_failed }}
       message={{ billet_gate_restart_failure }} jobs={{ billet_gate_restart_jobs }}
-      endings={{ billet_gate_restart_endings }} polls={{ billet_gate_restart_state.polls }}
+      endings={{ billet_gate_restart_asked }} resolved={{ billet_node_unwanted_state_dir }} polls={{ billet_gate_restart_state.polls }}
       stop_polls={{ billet_gate_restart_state.stop_polls }}

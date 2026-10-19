@@ -51,6 +51,12 @@ def phase_unit():
     return state['before']
 
 
+if tool == 'older':
+    # A RELEASE FROM BEFORE THE RECORD, which refuses the word as cmdNode does.
+    save()
+    sys.stderr.write('billet node: unexpected argument "ending"\n')
+    sys.exit(1)
+
 if tool in ('billet', 'candidate'):
     # billet node ending <call> --config ... [--invocation I] [--drain]
     # [--state-dir D] --json, answered for the executable asked: `ending` maps

@@ -112,11 +112,30 @@ resume
 [ "${status}" -eq 0 ] || { echo "a retry over a proved stop refused the removal: ${status}"; cat /err; exit 1; }
 
 # A NODE NEVER STARTED is judged by what the package's node left, like any
-# other stopped node: the check decides, not this script.
+# other stopped node, under a configuration that names no node as under none:
+# the check decides, not this script.
+mkdir -p /etc/billet
+printf 'server:\n  listen: 127.0.0.1:7717\n' >/etc/billet/billet.yaml
+CHECK_EXIT=2 resume
+rm /etc/billet/billet.yaml
+[ "${status}" -eq 1 ] || { echo "a node-less configuration let an unproved record through: ${status}"; exit 1; }
 CHECK_EXIT=2 resume
 [ "${status}" -eq 1 ] || { echo "a stopped node's unproved record let the removal go on: ${status}"; exit 1; }
 grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --drain --json' /calls ||
     { echo 'the stopped node was not judged standing, under the bound:'; cat /calls; exit 1; }
+
+# A NODE THE ROLE REMOVED WHOSE DRAIN IS UNPROVED is judged where its marker
+# says, and a marker naming nothing refuses.
+printf '/srv/node-state\n' >/etc/billet/node-leaving
+resume
+[ "${status}" -eq 0 ] || { echo "a proved leaving node refused the removal: ${status}"; cat /err; exit 1; }
+grep -qx 'timeout -k 10 180 /usr/bin/billet node ending check --config /etc/billet/billet.yaml --state-dir /srv/node-state --drain --json' /calls ||
+    { echo 'the leaving node was not judged at its record:'; cat /calls; exit 1; }
+: >/etc/billet/node-leaving
+resume
+[ "${status}" -eq 1 ] || { echo "an empty marker let the removal go on: ${status}"; exit 1; }
+grep -qF 'names no node state directory' /err || { echo 'the empty marker is not said'; cat /err; exit 1; }
+rm /etc/billet/node-leaving
 
 # THE SERVER stops after the node is judged, and a failed stop refuses.
 SERVER=active run

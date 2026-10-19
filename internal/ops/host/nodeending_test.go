@@ -428,6 +428,32 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		if o := f.run(t, "check", "--drain", "--invocation", "inv-1"); o.code != 0 {
 			t.Fatalf("the configured record after the named one was written: code %d (%s)", o.code, o.str("why"))
 		}
+
+		// --STATE-DIR NAMING THE CONFIGURATION'S OWN RECORD keeps its provider's
+		// claim: the docker provider's compute ends with the host.
+		own := newEndingFixture(t)
+
+		if o := own.run(t, "check", "--drain", "--state-dir", own.stateDir, "--invocation", "inv-9"); o.code != 0 ||
+			!o.boolean("recorded") {
+			t.Fatalf("check --state-dir naming the configured record: code %d recorded %v (%s)", o.code,
+				o.boolean("recorded"), o.str("why"))
+		}
+
+		ownRec, _, err := nodeending.Read(own.stateDir)
+		if err != nil || len(ownRec.Entries) != 1 || !ownRec.Entries[0].RunsOnHost {
+			t.Fatalf("the configured record holds %+v (%v), want inv-9's account claiming it ran on the host",
+				ownRec.Entries, err)
+		}
+	})
+
+	// A CONFIGURATION THAT CANNOT BE READ IS NOT ONE THAT IS ABSENT.
+	t.Run("an unreadable configuration", func(t *testing.T) {
+		newEndingFixture(t)
+
+		o := runEndpoint(t, NodeEnding, "", "check", "--config", t.TempDir(), "--drain")
+		if o.err == nil || !strings.Contains(o.err.Error(), "read config") {
+			t.Fatalf("check under a configuration that is a directory returned %v, want it refused", o.err)
+		}
 	})
 }
 

@@ -218,8 +218,10 @@
         ending:
           candidate: {check: {fixture: check-proved-handoff, rc: 0}, admit-start: {fixture: admit-start-proved, rc: 0}}
         succeeds: true
-        endings:
+        asked:
+          - older node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --json
           - candidate node ending check --config /var/lib/billet/recovery/billet.yaml.candidate --invocation 0123456789abcdef0123456789abcdef --json
+          - older node ending admit-start --config /etc/billet/billet.yaml --json
           - candidate node ending admit-start --config /var/lib/billet/recovery/billet.yaml.candidate --json
       # A DRAIN ASKED FOR BY A REQUEST AN EARLIER CONVERGE LEFT, with the
       # configuration already installed: the stop must still have drained.
@@ -294,6 +296,41 @@
         stops: 0
         starts: 0
         message: [cannot read, invocation]
+      # WHERE A LEAVING NODE'S RECORD IS: the installed configuration's while
+      # it names the node, the marker once it does not, none with neither, and
+      # a marker that cannot be read refuses.
+      - name: leaving-by-the-installed-configuration
+        leaving: {previous: /var/lib/billet/node-a, marker: /var/lib/billet/node-b}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: true
+        stops: 0
+        starts: 0
+        resolves: /var/lib/billet/node-a
+      - name: leaving-by-the-marker
+        leaving: {marker: /var/lib/billet/node-b}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: true
+        stops: 0
+        starts: 0
+        resolves: /var/lib/billet/node-b
+      - name: leaving-with-neither
+        leaving: {}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: true
+        stops: 0
+        starts: 0
+        resolves: ""
+      - name: leaving-marker-unreadable
+        leaving: {unreadable: true}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: false
+        stops: 0
+        starts: 0
+        resolves: unresolved
       # A MEMBER THE PARSER CANNOT READ, AND AN EXIT THAT DOES NOT MATCH THE
       # OUTCOME, end the restart with the node stopped.
       - name: answer-with-a-surprise
@@ -493,17 +530,7 @@
         content: |
           #!/bin/sh
           exec '{{ ansible_playbook_python }}' '{{ playbook_dir }}/node-restart-systemctl.py' {{ item }} "$BILLET_GATE_RESTART_CASE" "$@"
-      loop: [systemctl, billet, candidate]
-
-    # A RELEASE FROM BEFORE THE RECORD, which refuses the word as cmdNode does.
-    - name: Install a billet from before the node's ending record
-      ansible.builtin.copy:
-        dest: "{{ billet_gate_restart_root.path }}/older"
-        mode: "0755"
-        content: |
-          #!/bin/sh
-          echo 'billet node: unexpected argument "ending"' >&2
-          exit 1
+      loop: [systemctl, billet, candidate, older]
 
     - name: Exercise each restart case
       ansible.builtin.include_tasks: node-restart-case.yml
