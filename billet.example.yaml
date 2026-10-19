@@ -1241,6 +1241,36 @@ tiers:
 #     memory: 16GiB
 #     image: ubuntu-2404-x64@g1
 
+# ── images ───────────────────────────────────────────────────────────────────
+#
+# The guest image a Firecracker node pulls. billet publishes it built from
+# GitHub's own runner-image template, except for five components whose licenses
+# forbid billet redistributing them. A deployment that accepts a component's
+# license here has it installed from its vendor into every new image, inside a
+# microVM, before the image is used; one that accepts nothing runs without it.
+#
+#   android-sdk     the Android SDK, platforms, build tools and NDKs
+#                   (https://developer.android.com/studio/terms)
+#   codeql          the CodeQL bundle in the toolcache; without it the CodeQL
+#                   Action downloads it per job
+#                   (https://github.com/github/codeql-cli-binaries/blob/main/LICENSE.md)
+#   firefox         Mozilla Firefox and geckodriver
+#   google-chrome   Google Chrome, ChromeDriver and Chromium
+#                   (https://www.google.com/chrome/terms/)
+#   microsoft-edge  Microsoft Edge and its WebDriver, under the terms Microsoft
+#                   ships with the package
+#                   (https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/eula)
+#
+# images:
+#   # Writing a name here is this deployment accepting that component's license.
+#   accept: [android-sdk, codeql, firefox, google-chrome, microsoft-edge]
+#
+#   # Where images are pulled from; empty means billet's own. A mirror needs both
+#   # of the next two, because billet's signing identity cannot vouch for it.
+#   # source: https://images.example.com/billet
+#   # signing_identity: '^https://github\.com/your-org/billet/\.github/workflows/guest-image\.yml@refs/heads/main$'
+#   # signing_issuer: https://token.actions.githubusercontent.com
+
 # ── release ──────────────────────────────────────────────────────────────────
 #
 # How this deployment learns about new billet releases. Every field is optional,

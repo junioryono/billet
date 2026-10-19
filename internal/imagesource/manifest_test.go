@@ -114,7 +114,7 @@ func TestParseManifestRefusesASchemaItDoesNotKnow(t *testing.T) {
 	// NOT `SchemaVersion + 1`. This build deliberately reads one schema further
 	// than it writes, so deriving the unknown one from the written version made
 	// this test refuse exactly the layout the reader had just learned.
-	for _, schema := range []int{0, SchemaV2 + 1, -1, 99} {
+	for _, schema := range []int{0, SchemaV3 + 1, -1, 99} {
 		m := validManifest()
 		m.Schema = schema
 
@@ -123,7 +123,10 @@ func TestParseManifestRefusesASchemaItDoesNotKnow(t *testing.T) {
 			t.Fatalf("schema %d was accepted", schema)
 		}
 
-		if !strings.Contains(err.Error(), "schema") {
+		// THE READER'S OWN REFUSAL, not a layout complaint that happens to name a
+		// schema: when schema 3 became readable, `SchemaV2 + 1` here went on passing
+		// on the single-asset layout check alone.
+		if !strings.Contains(err.Error(), "this build reads manifest schemas") {
 			t.Errorf("schema %d refused without saying why: %v", schema, err)
 		}
 	}
@@ -150,6 +153,11 @@ func TestTheReaderIsAheadOfTheWriter(t *testing.T) {
 	if !readableSchemas[SchemaV2] {
 		t.Error("schema 2 is not readable, so the fleet cannot be rolled forward before the " +
 			"writer moves")
+	}
+
+	if !readableSchemas[SchemaV3] {
+		t.Error("schema 3 is not readable, so the build cannot leave components out before " +
+			"the fleet can complete them (#584)")
 	}
 }
 

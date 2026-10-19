@@ -38,6 +38,14 @@ const (
 	// SchemaV2 publishes it as ordered parts, because GitHub caps a single
 	// release asset at 2 GiB and a parity-sized image packs to well past that.
 	SchemaV2 = 2
+
+	// SchemaV3 is the schema 2 layout for an image that leaves out components a
+	// deployment installs from their vendors before importing it (#584): it
+	// declares them, and the completion contract the image's completer speaks.
+	// A reader that cannot complete an image must refuse it rather than import it
+	// without what its tiers expect, which is why this is a new schema and not an
+	// optional field.
+	SchemaV3 = 3
 )
 
 // SchemaVersion is the layout this build WRITES.
@@ -56,6 +64,7 @@ const SchemaVersion = SchemaV1
 var readableSchemas = map[int]bool{
 	SchemaV1: true,
 	SchemaV2: true,
+	SchemaV3: true,
 }
 
 // MaxManifestBytes bounds what a reader will parse.
@@ -125,7 +134,42 @@ type Manifest struct {
 	// that does not come up, so the two travel in one manifest and are never
 	// resolved independently.
 	Kernel Asset `json:"kernel"`
+
+	// Components are the parts of GitHub's image this one leaves out, which a
+	// deployment that accepts them installs before importing it.
+	//
+	// SCHEMA 3 ONLY, and required there: an image that leaves something out says
+	// what, and an image that leaves nothing out is schema 2.
+	Components []Component `json:"components,omitempty"`
+
+	// CompletionContract is the protocol the image's completer speaks to the node
+	// that runs it: how it is invoked inside the completion microVM and what it
+	// reports. Compared for equality, as GuestContract is, and for its reason.
+	//
+	// SCHEMA 3 ONLY, and required there.
+	CompletionContract string `json:"completion_contract,omitempty"`
 }
+
+// Component is one part of GitHub's image a published image leaves out.
+type Component struct {
+	// Name is the component, as config.ImageComponent spells it. This package
+	// checks only its shape: whether this build can install it is the pull's
+	// question, because a newer image may declare one an older build does not know.
+	Name string `json:"name"`
+
+	// Space is how many bytes the root filesystem grows by to hold it, which the
+	// node adds to the image before the completer runs.
+	Space int64 `json:"space"`
+}
+
+// MaxComponentBytes bounds the space one component may ask for, at 64 GiB. The
+// largest, the Android SDK with its three NDKs, is about 12 GiB.
+const MaxComponentBytes int64 = 64 << 30
+
+// MaxComponents bounds how many components one manifest may declare.
+const MaxComponents = 16
+
+var componentPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
 // Asset is one downloadable file and the digest that proves it arrived intact.
 type Asset struct {
@@ -263,9 +307,9 @@ func (m *Manifest) Validate() error {
 	}
 
 	if !readableSchemas[m.Schema] {
-		return fmt.Errorf("imagesource: this build reads manifest schemas %d and %d, and the "+
+		return fmt.Errorf("imagesource: this build reads manifest schemas %d to %d, and the "+
 			"published one is schema %d; upgrade billet rather than importing an image "+
-			"it cannot describe", SchemaV1, SchemaV2, m.Schema)
+			"it cannot describe", SchemaV1, SchemaV3, m.Schema)
 	}
 
 	// CONSTRAINED, NOT MERELY NON-EMPTY. This value is interpolated into operator-
@@ -319,9 +363,9 @@ func (m *Manifest) Validate() error {
 			"single asset and as parts; nothing can tell which one is the image")
 	case !multipart && !single:
 		return fmt.Errorf("imagesource: the manifest describes no root filesystem")
-	case multipart && m.Schema != SchemaV2:
+	case multipart && m.Schema == SchemaV1:
 		return fmt.Errorf("imagesource: a schema %d manifest published the root filesystem as "+
-			"parts, which only schema %d describes", m.Schema, SchemaV2)
+			"parts, which only schemas %d and %d describe", m.Schema, SchemaV2, SchemaV3)
 	case single && m.Schema != SchemaV1:
 		return fmt.Errorf("imagesource: a schema %d manifest published the root filesystem as "+
 			"one asset, which is the schema %d layout; a document must match the schema it "+
@@ -329,6 +373,10 @@ func (m *Manifest) Validate() error {
 	}
 
 	if err := m.Kernel.validate("kernel"); err != nil {
+		return err
+	}
+
+	if err := m.validateComponents(); err != nil {
 		return err
 	}
 
@@ -362,6 +410,55 @@ func (m *Manifest) Validate() error {
 		}
 
 		staged[key] = name
+	}
+
+	return nil
+}
+
+// validateComponents holds the components and the completion contract to the
+// schema: required and well formed in schema 3, absent before it.
+//
+// ABSENT BEFORE SCHEMA 3, not ignored. A schema 2 document carrying components
+// would be imported whole by every reader older than this one, without what it
+// says it leaves out.
+func (m *Manifest) validateComponents() error {
+	if m.Schema != SchemaV3 {
+		if len(m.Components) > 0 || m.CompletionContract != "" {
+			return fmt.Errorf("imagesource: a schema %d manifest declares components or a "+
+				"completion contract, which only schema %d describes", m.Schema, SchemaV3)
+		}
+
+		return nil
+	}
+
+	if !contractPattern.MatchString(m.CompletionContract) {
+		return fmt.Errorf("imagesource: %q is not a completion contract version", m.CompletionContract)
+	}
+
+	if len(m.Components) == 0 {
+		return fmt.Errorf("imagesource: a schema %d manifest declares no components; an image "+
+			"that leaves nothing out is schema %d", SchemaV3, SchemaV2)
+	}
+
+	if len(m.Components) > MaxComponents {
+		return fmt.Errorf("imagesource: the manifest declares %d components, past the %d this reads",
+			len(m.Components), MaxComponents)
+	}
+
+	seen := map[string]bool{}
+	for _, c := range m.Components {
+		if !componentPattern.MatchString(c.Name) {
+			return fmt.Errorf("imagesource: %q is not a component name", c.Name)
+		}
+		if seen[c.Name] {
+			return fmt.Errorf("imagesource: the manifest declares component %s twice", c.Name)
+		}
+		seen[c.Name] = true
+
+		if c.Space <= 0 || c.Space > MaxComponentBytes {
+			return fmt.Errorf("imagesource: component %s asks for %d bytes; it must ask for more "+
+				"than none and at most %d", c.Name, c.Space, MaxComponentBytes)
+		}
 	}
 
 	return nil
@@ -626,6 +723,7 @@ var knownKeys = map[string]bool{
 	"rootfs_multipart": true, "parts": true,
 	"name": true, "sha256": true, "size": true,
 	"compression": true, "version": true,
+	"components": true, "completion_contract": true, "space": true,
 }
 
 // checkStrictKeys refuses duplicate or misspelled object keys anywhere in the
@@ -765,8 +863,27 @@ func (m *Manifest) Usable(contract, arch string) error {
 			m.Arch, arch)
 	}
 
+	// AN IMAGE THAT LEAVES SOMETHING OUT IS USABLE ONLY BY A BUILD THAT CAN PUT IT
+	// BACK. Imported as it is, every tier relying on what it lacks would lose it
+	// at the next refresh, with no error anywhere.
+	if m.Schema == SchemaV3 && !completionContracts[m.CompletionContract] {
+		names := make([]string, 0, len(m.Components))
+		for _, c := range m.Components {
+			names = append(names, c.Name)
+		}
+
+		return fmt.Errorf("imagesource: this image leaves out %s for each deployment to install, "+
+			"through completion contract %q, which this billet cannot run; upgrade billet "+
+			"rather than importing it without them", strings.Join(names, ", "), m.CompletionContract)
+	}
+
 	return nil
 }
+
+// completionContracts are the completion contracts this build can run. Empty
+// until the pull can complete an image: a reader that understands schema 3 but
+// cannot complete one must still refuse it.
+var completionContracts = map[string]bool{}
 
 // AgeNotice is when an image is old enough to be worth mentioning.
 //
