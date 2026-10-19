@@ -174,6 +174,8 @@ func TestAModuleWithOnlyANestedLicenseIsJudgedByWhatItLinks(t *testing.T) {
 		"covered/pkg.go":     "package covered\n",
 		"covered/sub/sub.go": "package sub\n",
 		"bare/bare.go":       "package bare\n",
+		"noticed/NOTICE":     "attribution only\n",
+		"noticed/noticed.go": "package noticed\n",
 	} {
 		full := filepath.Join(dir, p)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
@@ -199,6 +201,14 @@ func TestAModuleWithOnlyANestedLicenseIsJudgedByWhatItLinks(t *testing.T) {
 	err := w.modules([]Module{{Path: "example.com/m", Dir: dir, Packages: append(covered, bare)}})
 	if err == nil || !strings.Contains(err.Error(), "has no license file covering "+bare) {
 		t.Fatalf("got %v, want the uncovered package %s named", err, bare)
+	}
+
+	// A NOTICE is attribution, not a license, so it covers nothing.
+	noticed := filepath.Join(dir, "noticed")
+	w = &writer{b: &bytes.Buffer{}, first: map[string]string{}}
+	err = w.modules([]Module{{Path: "example.com/m", Dir: dir, Packages: []string{noticed}}})
+	if err == nil || !strings.Contains(err.Error(), "has no license file covering "+noticed) {
+		t.Fatalf("got %v, want the package with only a NOTICE refused", err)
 	}
 }
 

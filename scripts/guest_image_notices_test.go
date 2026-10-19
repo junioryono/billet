@@ -160,12 +160,12 @@ func TestTheHookNoticesNameThePinnedVersion(t *testing.T) {
 	// Every component the script's EMBEDDED table names has its section, so a table
 	// entry added without regenerating the file is caught here.
 	script := readScriptFile(t, "container-hook-notices.py")
-	entries := regexp.MustCompile(`\("([0-9.]+)", "([^"]+)",\n`).FindAllStringSubmatch(script, -1)
+	entries := regexp.MustCompile(`\("([^"]+ [0-9.]+)", "([^"]+)",\n`).FindAllStringSubmatch(script, -1)
 	if len(entries) == 0 {
 		t.Fatal("found no EMBEDDED entry in container-hook-notices.py, so this test proves nothing")
 	}
 	for _, e := range entries {
-		if want := "\n" + e[2] + ", embedded in undici " + e[1] + "\n"; !strings.Contains(string(notice), want) {
+		if want := "\n" + e[2] + ", embedded in " + e[1] + "\n"; !strings.Contains(string(notice), want) {
 			t.Errorf("container-hook.NOTICE has no section %q; run scripts/container-hook-notices.py", strings.TrimSpace(want))
 		}
 	}

@@ -2,9 +2,9 @@ Third-party notices for the container hook's bundle
 
 Container hook version: 0.8.1
 
-/usr/local/lib/billet/container-hook/upstream.js is the index.js of actions/runner-container-hooks v0.8.1 (the release asset internal/guestassets/container-hook.pin names by digest). @vercel/ncc built it as one file from that project's packages/docker and packages/hooklib, whose license is the LICENSE beside this file, and from the npm packages below, at the versions the tag's packages/docker/package-lock.json resolves. Each is reproduced as the license files in its npm tarball, read from a tarball that matched the lockfile's integrity hash, followed by the licenses of the code undici embeds. scripts/container-hook-notices.py writes this file.
+/usr/local/lib/billet/container-hook/upstream.js is the index.js of actions/runner-container-hooks v0.8.1 (the release asset internal/guestassets/container-hook.pin names by digest). @vercel/ncc built it as one file from that project's packages/docker and packages/hooklib, whose license is the LICENSE beside this file, and from the npm packages below, at the versions the tag's packages/docker/package-lock.json resolves. Each is reproduced as the license files in its npm tarball, read from a tarball that matched the lockfile's integrity hash, followed by the licenses of code those packages took from other projects. scripts/container-hook-notices.py writes this file.
 
-The copyright comments the bundle keeps inline, among them Node.js's, stay in upstream.js, which is installed unmodified.
+The copyright comments the bundle keeps inline stay in upstream.js, which is installed unmodified.
 
 ================================================================================
 @actions/core 2.0.2
@@ -235,8 +235,92 @@ The above copyright notice and this permission notice shall be included in all c
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ================================================================================
+ShellJS, embedded in @actions/io 2.0.0
+In: cp, which its comment says is based on ShellJS's src/cp.js at 9237f66c
+Source: https://raw.githubusercontent.com/shelljs/shelljs/9237f66c52e5daa40458f94f9565e18e8132f5a6/LICENSE
+
+Copyright (c) 2012, Artur Adib <arturadib@gmail.com>
+All rights reserved.
+
+You may use this project under the terms of the New BSD license as follows:
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of Artur Adib nor the
+      names of the contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" 
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE 
+ARE DISCLAIMED. IN NO EVENT SHALL ARTUR ADIB BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF 
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+================================================================================
+wrench-js, embedded in @actions/io 2.0.0
+In: the recursive copy, which ShellJS's cp.js adapted from wrench-js (Copyright (c) 2010 Ryan McGrath, 2012 Artur Adib)
+Source: https://raw.githubusercontent.com/ryanmcgrath/wrench-js/2cffe4e3f4219dc94a9e0e3d9307391c4c5e1619/LICENSE
+
+The MIT License
+
+Copyright (c) 2010 Ryan McGrath
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+================================================================================
+boyer-moore-horspool, embedded in @fastify/busboy 2.1.1
+In: deps/streamsearch/sbmh.js, based on Hongli Lai's streaming Boyer-Moore-Horspool
+Source: https://raw.githubusercontent.com/FooBarWidget/boyer-moore-horspool/10e25ed66f7184a982fbe9239a8f46ac4969643c/StreamBoyerMooreHorspool.h
+
+/*
+ * Copyright (c) 2010 Phusion v.o.f.
+ * https://github.com/FooBarWidget/boyer-moore-horspool
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+================================================================================
 llhttp 8.1.0, embedded in undici 5.29.0
-In: undici's lib/llhttp/llhttp-wasm.js and llhttp_simd-wasm.js, its WebAssembly build
+In: lib/llhttp/llhttp-wasm.js and llhttp_simd-wasm.js, its WebAssembly build
 Source: https://raw.githubusercontent.com/nodejs/llhttp/85dd446419966cafb5a7fdd5031e3113a0768e65/LICENSE-MIT
 
 This software is licensed under the MIT License.
@@ -263,7 +347,7 @@ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 ================================================================================
 ws, embedded in undici 5.29.0
-In: undici's lib/websocket, which its comments say was adapted from ws (its license at 8.12.0)
+In: lib/websocket, which its comments say was adapted from ws (its license at 8.12.0)
 Source: https://raw.githubusercontent.com/websockets/ws/a3214d31b63acee8e31065be9f5ce3dd89203055/LICENSE
 
 Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -288,7 +372,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ================================================================================
 formdata-polyfill, embedded in undici 5.29.0
-In: undici's lib/fetch/body.js, whose comment credits formdata-polyfill (its license at v4.0.10)
+In: lib/fetch/body.js, whose comment credits formdata-polyfill (its license at v4.0.10)
 Source: https://raw.githubusercontent.com/jimmywarting/FormData/fbb503396bfda85e255a2adb3711c44ff1544c7b/LICENSE
 
 MIT License
@@ -312,3 +396,84 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+================================================================================
+fetch-blob, embedded in undici 5.29.0
+In: isBlobLike in lib/core/util.js, based on fetch-blob's index.js at 8ab587d3
+Source: https://raw.githubusercontent.com/node-fetch/fetch-blob/8ab587d34080de94140b54f07168451e7d0b655e/LICENSE
+
+MIT License
+
+Copyright (c) 2019 David Frank
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+================================================================================
+Node.js, embedded in undici 5.29.0
+In: the token and header regular expressions lib/core/request.js lifted from Node's lib/_http_common.js (Node's own license, as of v20.0.0)
+Source: https://raw.githubusercontent.com/nodejs/node/e7618fb5a5fc25d76b6474e2a6607f04fd6f10e0/LICENSE
+
+Node.js is licensed for use as follows:
+
+"""
+Copyright Node.js contributors. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+"""
+
+This license applies to parts of Node.js originating from the
+https://github.com/joyent/node repository:
+
+"""
+Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+"""
+
+The Node.js license applies to all parts of Node.js that are not externally
+maintained libraries.

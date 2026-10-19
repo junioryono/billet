@@ -421,7 +421,10 @@ func NestedLicenseFiles(root string, packages []string) ([]string, error) {
 }
 
 // uncovered returns a linked package, or the module root when none is named, that
-// no nested license file covers: none in its directory or a directory above it.
+// no nested license covers: none in its directory or a directory above it.
+//
+// ONLY A LICENSE GRANTS. A NOTICE, COPYRIGHT or PATENTS file is reproduced for what
+// it says, but it is attribution, not permission to redistribute.
 func uncovered(root string, packages, nested []string) (string, bool) {
 	if len(packages) == 0 {
 		packages = []string{root}
@@ -434,6 +437,9 @@ func uncovered(root string, packages, nested []string) (string, bool) {
 		rel = filepath.ToSlash(rel)
 		covered := false
 		for _, f := range nested {
+			if !isGrant(path.Base(f)) {
+				continue
+			}
 			dir := path.Dir(f)
 			if rel == dir || strings.HasPrefix(rel, dir+"/") {
 				covered = true
@@ -447,6 +453,19 @@ func uncovered(root string, packages, nested []string) (string, bool) {
 	}
 
 	return "", false
+}
+
+// isGrant reports whether a license file name is one that carries the license
+// itself rather than a notice beside it.
+func isGrant(name string) bool {
+	upper := strings.ToUpper(name)
+	for _, word := range []string{"LICENSE", "LICENCE", "COPYING"} {
+		if strings.HasPrefix(upper, word) || strings.HasSuffix(upper, "."+word) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func goRoot(ctx context.Context, root string) (string, error) {
