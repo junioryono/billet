@@ -87,7 +87,13 @@ func (c *Client) ImportCompletionRoot(
 }
 
 // reserveCompletionRoot refuses a completion-root name that a snapshot or an owner
-// key already holds.
+// key already holds, and clears every owner key whose snapshot is not listed.
+//
+// ONLY UNDER THE PUBLISH LOCK. Every import writes its owner key and creates its
+// snapshot inside that lock, so while it is held no key without a snapshot is an
+// import in flight: it is one whose create failed and could not be reconciled, or
+// whose removal stopped before its metadata, and RemoveCompletionRoots, which runs
+// without the lock, leaves such keys alone.
 func (c *Client) reserveCompletionRoot(ctx context.Context, image, name string) error {
 	names, err := c.snapshotNames(ctx, image)
 	if err != nil {
@@ -102,6 +108,13 @@ func (c *Client) reserveCompletionRoot(ctx context.Context, image, name string) 
 	if _, owned := owners[name]; owned || slices.Contains(names, name) {
 		return fmt.Errorf("ceph: %s@%s is already taken; a completion root is named for the "+
 			"second it is made, so try again", image, name)
+	}
+
+	for snap := range owners {
+		if !slices.Contains(names, snap) {
+			c.removeGenerationMetadata(ctx, image, snap,
+				KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
+		}
 	}
 
 	return nil

@@ -319,6 +319,37 @@ func TestACompletionRootNameAlreadyTakenIsRefused(t *testing.T) {
 	}
 }
 
+// AN OWNER KEY WHOSE SNAPSHOT IS GONE IS CLEARED BY THE NEXT RESERVATION, whoever
+// owned it, because under the publish lock no import is between its key and its
+// snapshot; a key whose snapshot exists is kept.
+func TestAReservationClearsOwnerKeysWhoseSnapshotIsGone(t *testing.T) {
+	const live, mine, theirs = "c20260801000000", "c20260802000000", "c20260803000000"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:    device,
+		snapshots: []string{live},
+		metadata: "Key  Value\n" +
+			CompletionRootOwnerKey + "." + live + "  epyc-2\n" +
+			CompletionRootOwnerKey + "." + mine + "  epyc-1\n" +
+			CompletionRootOwnerKey + "." + theirs + "  epyc-3\n",
+	}
+
+	if _, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	for _, gone := range []string{mine, theirs} {
+		if !f.ranWith("image-meta", "remove", "ubuntu-2404-x64", CompletionRootOwnerKey+"."+gone) {
+			t.Errorf("the owner key of %s, whose snapshot is gone, was kept; billet ran %v", gone, f.calls)
+		}
+	}
+	if f.ranWith("image-meta", "remove", "ubuntu-2404-x64", CompletionRootOwnerKey+"."+live) {
+		t.Errorf("the owner key of %s, whose snapshot exists, was removed", live)
+	}
+}
+
 // A COMPLETION ROOT THAT COULD NOT BE WITHDRAWN KEEPS ITS METADATA, owner included:
 // its absence is confirmed on every snapshot, not on the generations, which leave
 // a completion root out and would have read it as gone.
