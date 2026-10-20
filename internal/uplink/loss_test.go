@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// atLine is a controller whose download runs a quarter above mbit, where a run
-// whose traffic moves mbit stands once a climb past it stops (ProbeFull): its
-// rate stands near what moves, as a run's does, rather than at newController's
-// 1000, and a rate at mbit itself would rise on every clear round.
+// atLine is a controller whose download runs a quarter above mbit: near what
+// moves, as a run's rate stands (a climb stops about a ninth above it, once what
+// flows falls under ProbeFull of the rate), rather than at newController's 1000,
+// and far enough above it that no clear round raises it, as a rate at mbit
+// itself would be on every one.
 func atLine(mbit float64) *Controller {
 	c := newController()
 	c.Down.Rate = 1.25 * mbit
