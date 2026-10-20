@@ -418,44 +418,59 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 }
 
 const (
-	// reinstatedRecheck is how long a member reinstated busy waits for the
-	// JobStarted GitHub's refusal promised before its removal is asked again: the
+	// reinstatedRecheck is how long a member busy with its job unknown waits for
+	// the JobStarted that would name it before its removal is asked again: the
 	// one measured arrived four minutes late (2026-10-20).
 	reinstatedRecheck = 10 * time.Minute
 	// reinstatedPerPass bounds how many such removals one reconciliation asks.
 	reinstatedPerPass = 2
 )
 
-// recheckReinstated asks again to remove a member reinstated busy whose job
-// never named itself, so a JobStarted and a completion that were both lost do
-// not hold its capacity, its pool slot and a drain for ever. THE REMOVAL IS
-// STILL THE PROOF and the clock only when it is asked: a refusal reinstates it
-// again, and only a removal GitHub carries out tears it down, as the retiring
-// retry did before members were reinstated.
+// recheckReinstated asks again to remove a member busy with its job unknown, so
+// a JobStarted and a completion that were both lost do not hold its capacity,
+// its pool slot and a drain for ever. Such a member is one GitHub refused to
+// remove because it was running a job, or one recovered busy after a restart.
+// THE REMOVAL IS STILL THE PROOF and the clock only when it is asked: a refusal
+// reinstates it again, and only a removal GitHub carries out tears it down, as
+// the retiring retry did before members were reinstated.
+//
+// EVERY SUCH MEMBER IS WATCHED FROM WHEN THIS LISTENER FIRST SEES IT, read
+// afresh from the pool's rows on each pass, so a restart that forgets the times
+// starts them again rather than forgetting the members, and a member whose row
+// is gone leaves the watch.
 func (l *Listener) recheckReinstated(ctx context.Context, runners []alloc.PoolRunner) {
 	now := l.clock()
-	asked := 0
+
+	l.mu.Lock()
+	watched := make(map[string]time.Time, len(l.reinstated))
+	var due []alloc.PoolRunner
 	for i := range runners {
 		member := runners[i]
-		l.mu.Lock()
-		since, waiting := l.reinstated[member.LeaseID]
-		if waiting && (member.JobID != "" || member.ActualRequestID != 0) {
-			delete(l.reinstated, member.LeaseID)
-			waiting = false
-		}
-		l.mu.Unlock()
-		if !waiting || member.Status != alloc.PoolRunnerBusy || now.Sub(since) < reinstatedRecheck ||
-			asked == reinstatedPerPass {
+		if member.Status != alloc.PoolRunnerBusy || member.ActualRequestID != 0 || member.RunID != 0 ||
+			member.JobID != "" {
 			continue
 		}
-		asked++
+		since, seen := l.reinstated[member.LeaseID]
+		if !seen {
+			since = now
+		}
+		watched[member.LeaseID] = since
+		if now.Sub(since) >= reinstatedRecheck && len(due) < reinstatedPerPass {
+			due = append(due, member)
+		}
+	}
+	l.reinstated = watched
+	l.mu.Unlock()
+
+	for i := range due {
+		member := &due[i]
 		if err := l.alloc.RetirePoolRunner(ctx, member.LeaseID); err != nil {
-			l.log.Error("could not claim a reinstated pool member to ask its removal again", "tier", l.tier,
-				"runner", member.RunnerName, "error", err)
+			l.log.Error("could not claim a pool member busy with an unknown job to ask its removal again",
+				"tier", l.tier, "runner", member.RunnerName, "error", err)
 			continue
 		}
 		member.Status = alloc.PoolRunnerRetiring
-		l.retirePoolMember(ctx, member)
+		l.retirePoolMember(ctx, *member)
 	}
 }
 

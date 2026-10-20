@@ -319,7 +319,11 @@ func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode 
 				if launched.ActualRequestID != 0 {
 					bound.requests = []int64{launched.ActualRequestID}
 				}
-				out.detached = (launched.ActualRequestID != 0 || launched.Status == alloc.PoolRunnerBusy) &&
+				// A completion naming the runner's own id is that runner's: it is not
+				// runner-less, whatever the runner is bound to.
+				own := job.RunnerID != 0 && job.RunnerID == launched.RunnerID
+				out.detached = !own &&
+					(launched.ActualRequestID != 0 || launched.Status == alloc.PoolRunnerBusy) &&
 					!sameActualJob(out.actual, bound)
 				// NOR IS AN UNBOUND ONE BY A CANCELLATION: it never ran the job, and
 				// GitHub may already have given it another whose JobStarted has not

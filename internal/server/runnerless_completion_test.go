@@ -459,3 +459,98 @@ func TestACancellationNamingOnlyARunnerIDStillSettles(t *testing.T) {
 		t.Errorf("recorded %v and destroyed %v; want the cancellation settled on its runner", p.results, p.destroyed)
 	}
 }
+
+// A MEMBER BUSY WITH ITS JOB UNKNOWN IS WATCHED FROM WHEN THIS LISTENER FIRST
+// SEES IT, so a restart that forgot when it was reinstated, or a runner recovered
+// busy, is still asked about again once the recheck has passed, and a member
+// whose row is gone leaves the watch.
+func TestAMemberBusyWithAnUnknownJobIsWatchedAcrossARestart(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	recovered := p.launchedFor11(t)
+	recovered.RunnerID = 77
+	if err := p.a.PreserveRecoveredBusyPoolRunner(t.Context(), recovered); err != nil {
+		t.Fatalf("recover the runner as busy: %v", err)
+	}
+	now := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
+	p.l.now = func() time.Time { return now }
+
+	reconcile := func(at time.Time) {
+		t.Helper()
+		now = at
+		if err := p.l.reconcilePool(t.Context(), 1); err != nil {
+			t.Fatalf("reconcile at %s: %v", at, err)
+		}
+	}
+
+	start := now
+	reconcile(start)
+	if slices.Contains(p.registry.names, recovered.RunnerName) {
+		t.Fatalf("removed %v on first sight, want the recheck waited for", p.registry.names)
+	}
+	reconcile(start.Add(reinstatedRecheck))
+	if !slices.Contains(p.registry.names, recovered.RunnerName) || !slices.Contains(p.destroyed, 11) {
+		t.Fatalf("removed %v and destroyed %v at the recheck; want GitHub asked and the member torn down",
+			p.registry.names, p.destroyed)
+	}
+}
+
+// A WATCHED MEMBER WHOSE ROW SETTLEMENT REMOVED, not the pool's own retirement,
+// leaves the watch on the next pass rather than staying in it for the life of
+// the listener.
+func TestAWatchedMemberWhoseRowIsGoneLeavesTheWatch(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	recovered := p.launchedFor11(t)
+	recovered.RunnerID = 77
+	if err := p.a.PreserveRecoveredBusyPoolRunner(t.Context(), recovered); err != nil {
+		t.Fatalf("recover the runner as busy: %v", err)
+	}
+	if err := p.l.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	watched := func() bool {
+		p.l.mu.Lock()
+		defer p.l.mu.Unlock()
+		_, ok := p.l.reinstated[recovered.LeaseID]
+		return ok
+	}
+	if !watched() {
+		t.Fatal("a member busy with its job unknown is not watched")
+	}
+
+	if err := p.a.ForgetPoolRunner(t.Context(), recovered.LeaseID); err != nil {
+		t.Fatalf("forget the settled member's row: %v", err)
+	}
+	if err := p.l.reconcilePool(t.Context(), 0); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if watched() {
+		t.Error("a member whose row is gone is still watched")
+	}
+}
+
+// A COMPLETION NAMING THE RUNNER'S OWN ID IS THAT RUNNER'S, though it names no
+// runner by name and the runner is busy with its job unknown: it settles it
+// rather than being detached and its result dropped.
+func TestACompletionNamingAPlaceholdersOwnRunnerIDSettlesIt(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	recovered := p.launchedFor11(t)
+	recovered.RunnerID = 77
+	if err := p.a.PreserveRecoveredBusyPoolRunner(t.Context(), recovered); err != nil {
+		t.Fatalf("recover the runner as busy: %v", err)
+	}
+
+	succeeded := job11
+	succeeded.Result, succeeded.RunnerID = "Succeeded", 77
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{succeeded}}); err != nil {
+		t.Fatalf("the completion was refused: %v", err)
+	}
+	if !slices.Contains(p.results, recordedResult{recovered.LeaseID, "Succeeded"}) || !slices.Contains(p.destroyed, 11) {
+		t.Errorf("recorded %v and destroyed %v; want the runner's own completion settled", p.results, p.destroyed)
+	}
+}
