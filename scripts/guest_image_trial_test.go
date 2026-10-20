@@ -52,15 +52,17 @@ func newTrialFixture(t *testing.T) trialFixture {
 		}
 		writeExecutable(t, filepath.Join(fx.fakes, file), body)
 	}
+	// THE DISK IS REWRITTEN AT ONCE, never truncated and refilled, as a real df
+	// never answers with nothing while the sampler reads it.
 	writeExecutable(t, filepath.Join(dir, "completer"), "#!/bin/sh\nname=$1\n"+
 		"grow=$(cat "+dir+"/grow-$name 2>/dev/null || echo 100000000)\n"+
-		"echo $(( $(cat "+fx.used+") + grow )) >"+fx.used+"\n"+
+		"echo $(( $(cat "+fx.used+") + grow )) >"+fx.used+".new && mv "+fx.used+".new "+fx.used+"\n"+
 		// HELD LONG ENOUGH FOR THE SAMPLER, as a real install's minutes are.
 		"sleep 1\n"+
 		"if [ -e "+dir+"/fail-$name ]; then echo \"failed=$name\" >\"$BILLET_COMPLETION_REPORT\"; "+
 		"else echo \"installed=$name 1.2.3\" >\"$BILLET_COMPLETION_REPORT\"; fi\n"+
 		// THE DISK SHRINKS AGAIN, as a completer cleaning up does: the peak is what counts.
-		"echo $(( $(cat "+fx.used+") - grow / 2 )) >"+fx.used+"\n")
+		"echo $(( $(cat "+fx.used+") - grow / 2 )) >"+fx.used+".new && mv "+fx.used+".new "+fx.used+"\n")
 	if err := os.WriteFile(fx.used, []byte("1000000000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +259,18 @@ func runWithFakes(t *testing.T, path string, fx trialFixture) (string, error) {
 	out, err := cmd.CombinedOutput()
 
 	return string(out), err
+}
+
+// THE TRIAL'S OVERLAY COPIES UP ONLY WHAT IS WRITTEN: without metacopy, the
+// completer's chmod of /opt copies the whole toolcache up and the trial measures
+// that (24 GiB for Firefox, 2026-10-20).
+func TestTheTrialsOverlayCopiesUpMetadataAlone(t *testing.T) {
+	t.Parallel()
+
+	trial := guestImageFunction(t, "trial_completion")
+	if !strings.Contains(trial, `-o "lowerdir=$dir/lower,upperdir=$dir/upper,workdir=$dir/work,metacopy=on" "$dir/merged"`) {
+		t.Fatal("the trial's overlay is mounted without metacopy=on")
+	}
 }
 
 // A GENERATION PUBLISHED STRAIGHT FROM THE BUILD IS RECORDED BEFORE IT EXISTS: a

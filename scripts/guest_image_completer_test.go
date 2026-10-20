@@ -288,6 +288,50 @@ func TestTheCompleterFailsEverythingWhenTheJobEnvironmentCannotBeWritten(t *test
 	}
 }
 
+// THE BROWSERS' PREREQUISITE IS INSTALLED BEFORE THEIR INSTALLER RUNS, because a
+// deployment may accept Chrome alone, without the Firefox that gives GitHub's
+// build the real libasound2; and a prerequisite that cannot be installed fails
+// the component without running its installer.
+func TestTheCompleterInstallsWhatGitHubsOrderGivesTheBrowsers(t *testing.T) {
+	t.Parallel()
+
+	fx := newCompleterFixture(t)
+	if output, err := fx.run(t, true, "google-chrome", "codeql"); err != nil {
+		t.Fatalf("the completer exited %v:\n%s", err, output)
+	}
+	calls, err := os.ReadFile(fx.calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := string(calls)
+	prerequisite := strings.Index(ran, "apt-get install -y --no-install-recommends libasound2t64\n")
+	installer := strings.Index(ran, "install-google-chrome.sh ")
+	if prerequisite < 0 || installer < 0 || prerequisite > installer {
+		t.Fatalf("libasound2t64 was not installed before Chrome's installer ran:\n%s", calls)
+	}
+	if strings.Count(string(calls), "libasound2t64") != 1 {
+		t.Fatalf("a component that needs no prerequisite was given one:\n%s", calls)
+	}
+
+	fx = newCompleterFixture(t)
+	if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-install"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := fx.run(t, true, "google-chrome", "codeql"); err != nil {
+		t.Fatalf("the completer exited %v:\n%s", err, output)
+	}
+	if got, want := fx.reportLines(t), []string{"failed=google-chrome", "installed=codeql 2.23.3"}; !slices.Equal(got, want) {
+		t.Fatalf("the report is %q, want %q", got, want)
+	}
+	calls, err = os.ReadFile(fx.calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "install-google-chrome.sh ") {
+		t.Fatalf("Chrome's installer ran without its prerequisite:\n%s", calls)
+	}
+}
+
 // A FINISH THAT FAILS FAILS EVERY COMPONENT, those already installed included:
 // the image is not the one GitHub's template leaves until it is finished.
 func TestTheCompleterFailsEverythingWhenTheFinishFails(t *testing.T) {

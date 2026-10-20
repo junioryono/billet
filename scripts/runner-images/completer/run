@@ -56,6 +56,22 @@ installer() {
 	esac
 }
 
+# prerequisites prints the packages COMPONENT's installer assumes are already
+# there because GitHub's template installs them first, in its order of steps.
+#
+# THE BROWSERS NEED THE REAL libasound2. Ubuntu 24.04's 64-bit time transition
+# made libasound2 a virtual package two packages provide, and with neither
+# installed apt resolves Chrome's dependency on it to liboss4-salsa-asound2, which
+# conflicts with it, and refuses the install (measured 2026-10-20, run
+# 39502269791, completing Chrome on its own). In GitHub's build Firefox has
+# installed libasound2t64 by the time Chrome runs; a deployment may accept Chrome
+# alone.
+prerequisites() {
+	case "$1" in
+	google-chrome | microsoft-edge) echo libasound2t64 ;;
+	esac
+}
+
 # step runs ARGV as a template step runs: /etc/environment as it stands now,
 # made plain by the build's own reader, then the step's variables on top.
 step() {
@@ -119,6 +135,9 @@ for name in "$@"; do
 		log "$name is not a component this image completes"
 	elif [ "$prepared" != 1 ]; then
 		log "$name: the run could not be prepared"
+	elif needs=$(prerequisites "$name") && [ -n "$needs" ] &&
+		! step apt-get install -y --no-install-recommends $needs; then
+		log "$name: its prerequisites ($needs) could not be installed"
 	elif ! log "installing $name with $script" || ! step "$here/scripts/build/$script"; then
 		log "$name: $script failed"
 	# THE CODEQL BUNDLE'S INSTALLER RUNS NO TESTS of its own; GitHub's toolset

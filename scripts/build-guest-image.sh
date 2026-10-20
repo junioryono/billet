@@ -348,8 +348,13 @@ trial_completion() {
 		# NOTHING IS MOUNTED HERE: the copy before was unmounted, and proved so.
 		rm -rf "$dir/upper" "$dir/work"
 		mkdir -p "$dir/upper" "$dir/work" "$dir/merged"
+		# metacopy=on, OR THE MEASUREMENT IS OF THE OVERLAY: the completer's last act
+		# is configure-system.sh's chmod -R of /opt and /usr/share, which without it
+		# copies every file of the toolcache up into the upper layer, and the first
+		# trials measured 24 GiB of that for Firefox (2026-10-20). On a node the
+		# completer changes the image's own inodes, which costs no space.
 		mount -t overlay overlay \
-			-o "lowerdir=$dir/lower,upperdir=$dir/upper,workdir=$dir/work" "$dir/merged"
+			-o "lowerdir=$dir/lower,upperdir=$dir/upper,workdir=$dir/work,metacopy=on" "$dir/merged"
 		for sub in proc sys dev dev/pts run; do
 			mount --bind "/$sub" "$dir/merged/$sub"
 		done
