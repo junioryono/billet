@@ -398,16 +398,24 @@ check_components_left_out() {
 
 # COMPLETER_FILES is the image's completer as build-guest-image.sh installs it: its
 # runner, the job environment's one writer and its reader, the toolset, and
-# GitHub's installers, helpers and tests for each component.
+# GitHub's installers, helpers and tests for each component. COMPLETER_EXECUTED
+# is what of it is executed rather than read or sourced, which must be executable;
+# GitHub's other helpers are sourced and are ordinary files in the template.
 COMPLETER_FILES=(
 	run write-image-env.sh pam-environment.awk installers/toolset.json
 	scripts/build/install-android-sdk.sh scripts/build/install-codeql-bundle.sh
 	scripts/build/install-firefox.sh scripts/build/install-google-chrome.sh
-	scripts/build/install-microsoft-edge.sh scripts/build/configure-apt-mock.sh
+	scripts/build/install-microsoft-edge.sh
 	scripts/helpers/install.sh scripts/helpers/etc-environment.sh scripts/helpers/os.sh
 	scripts/helpers/invoke-tests.sh scripts/helpers/Common.Helpers.psm1
 	scripts/tests/Helpers.psm1 scripts/tests/Android.Tests.ps1
 	scripts/tests/Browsers.Tests.ps1 scripts/tests/Toolset.Tests.ps1
+)
+COMPLETER_EXECUTED=(
+	run write-image-env.sh
+	scripts/build/install-android-sdk.sh scripts/build/install-codeql-bundle.sh
+	scripts/build/install-firefox.sh scripts/build/install-google-chrome.sh
+	scripts/build/install-microsoft-edge.sh scripts/helpers/invoke-tests.sh
 )
 
 # check_completer passes or fails the gate on the image mounted at $1 carrying the
@@ -418,14 +426,10 @@ check_completer() {
 	local completer="$1/opt/billet/complete" missing=() file status=0
 
 	for file in "${COMPLETER_FILES[@]}"; do
-		case "$file" in
-		run | *.sh)
-			[ -f "$completer/$file" ] && [ -x "$completer/$file" ] || missing+=("$file (executable)")
-			;;
-		*)
-			[ -f "$completer/$file" ] && [ -s "$completer/$file" ] || missing+=("$file")
-			;;
-		esac
+		[ -f "$completer/$file" ] && [ -s "$completer/$file" ] || missing+=("$file")
+	done
+	for file in "${COMPLETER_EXECUTED[@]}"; do
+		[ ! -f "$completer/$file" ] || [ -x "$completer/$file" ] || missing+=("$file (executable)")
 	done
 	if [ "${#missing[@]}" -gt 0 ]; then
 		fail "the completer at /opt/billet/complete lacks ${missing[*]}, so no deployment can install what this image leaves out"

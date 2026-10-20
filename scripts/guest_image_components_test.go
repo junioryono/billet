@@ -253,7 +253,7 @@ func gateRun(t *testing.T, call, root, manifest string, functions ...string) (st
 	}
 	script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\nGATE_DIR=" + here + "\nMANIFEST=" + manifest + "\n" +
 		"pass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
-		gateArray(t, "COMPLETER_FILES") + "\n"
+		gateArray(t, "COMPLETER_FILES") + "\n" + gateArray(t, "COMPLETER_EXECUTED") + "\n"
 	for _, name := range functions {
 		script += checkImageFunction(t, name) + "\n"
 	}
@@ -304,7 +304,7 @@ func TestTheGateRequiresTheCompleter(t *testing.T) {
 		for _, file := range []string{"run", "write-image-env.sh", "pam-environment.awk", "installers/toolset.json",
 			"scripts/build/install-android-sdk.sh", "scripts/build/install-codeql-bundle.sh",
 			"scripts/build/install-firefox.sh", "scripts/build/install-google-chrome.sh",
-			"scripts/build/install-microsoft-edge.sh", "scripts/build/configure-apt-mock.sh",
+			"scripts/build/install-microsoft-edge.sh",
 			"scripts/helpers/install.sh", "scripts/helpers/etc-environment.sh", "scripts/helpers/os.sh",
 			"scripts/helpers/invoke-tests.sh", "scripts/helpers/Common.Helpers.psm1",
 			"scripts/tests/Android.Tests.ps1", "scripts/tests/Browsers.Tests.ps1", "scripts/tests/Toolset.Tests.ps1"} {
@@ -323,7 +323,7 @@ func TestTheGateRequiresTheCompleter(t *testing.T) {
 	root := installed(t)
 	removeAll(t, filepath.Join(root, "opt", "billet", "complete", "scripts", "build", "install-firefox.sh"))
 	if out, failed := gateRun(t, "check_completer", root, "", "check_completer"); failed != "1" ||
-		!strings.Contains(out, "scripts/build/install-firefox.sh (executable)") {
+		!strings.Contains(out, "lacks scripts/build/install-firefox.sh") {
 		t.Errorf("a completer without Firefox's installer passed:\n%s", out)
 	}
 
@@ -342,6 +342,31 @@ func TestTheGateRequiresTheCompleter(t *testing.T) {
 	if out, failed := gateRun(t, "check_completer", root, "", "check_completer"); failed != "1" ||
 		!strings.Contains(out, "still reads the tests from /imagegeneration") {
 		t.Errorf("a completer reading the build's skipped tests passed:\n%s", out)
+	}
+}
+
+// THE COMPLETER THE BUILD INSTALLS IS ONE THE GATE PASSES, modes and all: GitHub's
+// sourced helpers are ordinary files in the template, and only what is executed
+// has to be executable.
+func TestTheGatePassesTheCompleterTheBuildInstalls(t *testing.T) {
+	t.Parallel()
+
+	here, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nCOMPONENTS='android-sdk codeql '\n" +
+		guestImageFunction(t, "install_completer") + "\ninstall_completer \"$1\"\n"
+	path := filepath.Join(t.TempDir(), "install.sh")
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.CommandContext(t.Context(), "bash", path, root).CombinedOutput(); err != nil {
+		t.Fatalf("install_completer: %v\n%s", err, out)
+	}
+	if out, failed := gateRun(t, "check_completer", root, "", "check_completer"); failed != "0" {
+		t.Errorf("the gate refuses the completer the build installs:\n%s", out)
 	}
 }
 

@@ -39,8 +39,27 @@ func newCompleterFixture(t *testing.T) completerFixture {
 		filepath.Join(fx.complete, "installers"), filepath.Join(dir, "etc"), fx.bin, filepath.Join(dir, "browsers"),
 		filepath.Join(fx.root, "usr", "local", "lib", "android", "sdk", "cmdline-tools", "latest"),
 		filepath.Join(fx.root, "opt", "hostedtoolcache", "CodeQL", "2.23.3", "x64", "codeql"),
+		filepath.Join(fx.root, "opt", "billet", "bin"), filepath.Join(fx.root, "opt", "google", "chrome"),
+		filepath.Join(fx.root, "usr", "share", "doc"), filepath.Join(fx.root, "var", "lib", "apt", "lists"),
+		filepath.Join(fx.root, "tmp"),
 	} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// RUBY'S TOOLCACHE DIRECTORIES CARRY THE STICKY BIT, as configure-system.sh
+	// leaves them; the leftovers are what cleanup.sh and the build remove.
+	ruby := filepath.Join(fx.root, "opt", "hostedtoolcache", "Ruby", "3.3.1", "x64")
+	if err := os.MkdirAll(ruby, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{ruby, filepath.Dir(ruby)} {
+		if err := os.Chmod(d, 0o1777); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, leftover := range []string{"var/lib/apt/lists/archive_ubuntu_dists", "tmp/download", "opt/billet/bin/billet"} {
+		if err := os.WriteFile(filepath.Join(fx.root, leftover), []byte("x\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -65,7 +84,7 @@ func newCompleterFixture(t *testing.T) completerFixture {
 		"install-microsoft-edge.sh": "EDGEWEBDRIVER=/usr/local/share/edge_driver",
 	} {
 		body := "#!/bin/sh\necho \"$(basename \"$0\") HELPER_SCRIPTS=$HELPER_SCRIPTS INSTALLER_SCRIPT_FOLDER=$INSTALLER_SCRIPT_FOLDER " +
-			"DEBIAN_FRONTEND=$DEBIAN_FRONTEND HOME=$HOME EARLIER=${EARLIER:-}\" >>" + fx.calls + "\n" +
+			"DEBIAN_FRONTEND=$DEBIAN_FRONTEND HOME=$HOME EARLIER=${EARLIER:-} REPORT=$(cat " + fx.report + " | tr '\\n' ,)\" >>" + fx.calls + "\n" +
 			"[ -e \"" + dir + "/fail-$(basename \"$0\")\" ] && exit 1\n"
 		if variable != "" {
 			body += "echo " + variable + " >>" + fx.environment + "\n"
@@ -80,6 +99,10 @@ func newCompleterFixture(t *testing.T) completerFixture {
 		t.Fatal(err)
 	}
 
+	apt := "#!/bin/sh\necho \"apt-get $*\" >>" + fx.calls + "\n[ -e \"" + dir + "/fail-apt-$1\" ] && exit 100\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "browsers", "apt-get"), []byte(apt), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for name, version := range map[string]string{
 		"google-chrome":  "155.0.8059.84",
 		"microsoft-edge": "Microsoft Edge 141.0.3537.71",
@@ -118,7 +141,6 @@ func (fx completerFixture) run(t *testing.T, report bool, components ...string) 
 		"BILLET_COMPLETE_ENVIRONMENT=" + fx.environment,
 		"BILLET_COMPLETE_IMAGE_ENV=" + fx.imageEnv,
 		"BILLET_COMPLETE_BIN=" + fx.bin,
-		"BILLET_COMPLETE_SETUP=0",
 		"BILLET_COMPLETE_ROOT=" + fx.root,
 	}
 	if report {
@@ -170,10 +192,14 @@ func TestTheCompleterInstallsEachComponentAndReportsItsVersion(t *testing.T) {
 	for _, want := range []string{
 		"install-google-chrome.sh HELPER_SCRIPTS=" + filepath.Join(fx.complete, "scripts", "helpers") +
 			" INSTALLER_SCRIPT_FOLDER=" + filepath.Join(fx.complete, "installers") +
-			" DEBIAN_FRONTEND=noninteractive HOME=/root EARLIER=\n",
-		// EACH STEP READS WHAT THE STEP BEFORE IT WROTE to /etc/environment.
+			" DEBIAN_FRONTEND=noninteractive HOME=/root EARLIER= REPORT=\n",
+		// EACH STEP READS WHAT THE STEP BEFORE IT WROTE to /etc/environment, and
+		// NOTHING IS REPORTED WHILE ANY STEP RUNS: the report is written once the
+		// image is finished.
 		"install-android-sdk.sh HELPER_SCRIPTS=",
-		" EARLIER=install-google-chrome.sh\n",
+		" EARLIER=install-google-chrome.sh REPORT=\n",
+		"apt-get update\n",
+		"apt-get clean\n",
 		"invoke_tests Toolset Toolset.CodeQL\n",
 	} {
 		if !strings.Contains(string(calls), want) {
@@ -259,6 +285,93 @@ func TestTheCompleterFailsEverythingWhenTheJobEnvironmentCannotBeWritten(t *test
 	}
 	if got, want := fx.reportLines(t), []string{"failed=google-chrome", "failed=firefox"}; !slices.Equal(got, want) {
 		t.Fatalf("the report is %q, want %q", got, want)
+	}
+}
+
+// AN APT THAT CANNOT UPDATE ITS LISTS PREPARES NOTHING: every component is
+// reported failed and no installer runs, because the published image keeps no
+// lists to install from.
+func TestTheCompleterFailsEverythingWhenAptCannotUpdate(t *testing.T) {
+	t.Parallel()
+
+	fx := newCompleterFixture(t)
+	if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-update"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := fx.run(t, true, "google-chrome", "codeql"); err != nil {
+		t.Fatalf("the completer exited %v:\n%s", err, output)
+	}
+	if got, want := fx.reportLines(t), []string{"failed=google-chrome", "failed=codeql"}; !slices.Equal(got, want) {
+		t.Fatalf("the report is %q, want %q", got, want)
+	}
+	calls, err := os.ReadFile(fx.calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "install-") {
+		t.Fatalf("an installer ran with no apt lists:\n%s", calls)
+	}
+}
+
+// THE IMAGE IS LEFT AS GITHUB'S TEMPLATE LEAVES IT: what the components installed
+// under /opt and /usr/share writable by everyone, Ruby's toolcache keeping the
+// sticky bit Ruby 4 needs, billet's own /opt/billet untouched, and apt's lists
+// and the scratch GitHub's cleanup removes gone.
+func TestTheCompleterLeavesTheImageAsTheTemplateDoes(t *testing.T) {
+	t.Parallel()
+
+	fx := newCompleterFixture(t)
+	if output, err := fx.run(t, true, "google-chrome"); err != nil {
+		t.Fatalf("the completer exited %v:\n%s", err, output)
+	}
+	mode := func(path string) os.FileMode {
+		t.Helper()
+
+		info, err := os.Stat(filepath.Join(fx.root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return info.Mode()
+	}
+	for path, want := range map[string]os.FileMode{
+		"opt/google/chrome":                  os.ModeDir | 0o777,
+		"usr/share/doc":                      os.ModeDir | 0o777,
+		"opt/hostedtoolcache/Ruby/3.3.1/x64": os.ModeDir | os.ModeSticky | 0o777,
+		"opt/hostedtoolcache/Ruby/3.3.1":     os.ModeDir | os.ModeSticky | 0o777,
+		"opt/billet/bin":                     os.ModeDir | 0o755,
+		"opt/billet/bin/billet":              0o755,
+	} {
+		if got := mode(path); got != want {
+			t.Errorf("%s is %v, want %v", path, got, want)
+		}
+	}
+	for _, gone := range []string{"var/lib/apt/lists/archive_ubuntu_dists", "tmp/download"} {
+		if _, err := os.Stat(filepath.Join(fx.root, gone)); !os.IsNotExist(err) {
+			t.Errorf("%s was left in the image (%v)", gone, err)
+		}
+	}
+}
+
+// THE PERMISSIONS ARE configure-system.sh'S OWN, line for line, so a pin bump that
+// changes what GitHub's image leaves writable fails here.
+func TestTheCompletersPermissionsAreTheTemplatesOwn(t *testing.T) {
+	t.Parallel()
+
+	upstream := readScriptFile(t, filepath.Join("runner-images", "upstream", "images", "ubuntu", "scripts", "build",
+		"configure-system.sh"))
+	run := readScriptFile(t, filepath.Join("runner-images", "completer", "run"))
+	for template, completer := range map[string]string{
+		`chmod -R 777 /usr/share`: `chmod -R 777 "$root/usr/share" || finished=0`,
+		`chmod -R 777 /opt`:       `find "$root/opt" -mindepth 1 -maxdepth 1 ! -name billet -exec chmod -R 777 {} + || finished=0`,
+		`    find /opt/hostedtoolcache/Ruby -type d -exec chmod +t {} +`: `	find "$root/opt/hostedtoolcache/Ruby" -type d -exec chmod +t {} + || finished=0`,
+	} {
+		if !hasExactLine(upstream, template) {
+			t.Errorf("configure-system.sh no longer says %q; the completer's permissions follow it", template)
+		}
+		if !hasExactLine(run, completer) {
+			t.Errorf("the completer does not say %q", completer)
+		}
 	}
 }
 

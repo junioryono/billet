@@ -213,6 +213,47 @@ func TestUnmountUnderTakesDownOnlyWhatIsUnderTheDirectory(t *testing.T) {
 	}
 }
 
+// A MOUNT TABLE THAT CANNOT BE READ IS NOT A DIRECTORY WITH NOTHING MOUNTED IN
+// IT: unmount_under refuses, and unmounts nothing it could not see.
+func TestUnmountUnderRefusesAMountTableItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	fx := newTrialFixture(t)
+	calls := filepath.Join(fx.dir, "calls")
+	writeExecutable(t, filepath.Join(fx.fakes, "findmnt"), "#!/bin/sh\necho /w/trial/merged\nexit 1\n")
+	writeExecutable(t, filepath.Join(fx.fakes, "umount"), "#!/bin/sh\necho \"$*\" >>"+calls+"\n")
+	script := "#!/usr/bin/env bash\nset -euo pipefail\n" + guestImageFunction(t, "unmount_under") +
+		"\nif unmount_under /w/trial; then echo CLEARED; fi\n"
+	path := filepath.Join(fx.dir, "unmount.sh")
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), "bash", path)
+	cmd.Env = append(os.Environ(), "PATH="+fx.fakes+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.Contains(string(out), "CLEARED") || !strings.Contains(string(out), "could not read the mount table") {
+		t.Fatalf("an unreadable mount table answered %v:\n%s", err, out)
+	}
+	if _, err := os.Stat(calls); !os.IsNotExist(err) {
+		t.Fatalf("unmount_under unmounted from a table it could not read (%v)", err)
+	}
+}
+
+// A GENERATION PUBLISHED STRAIGHT FROM THE BUILD IS RECORDED BEFORE IT EXISTS: a
+// crash between the two must leave a record for a generation never made, never a
+// generation with no record, which reads as one that left nothing out.
+func TestAGenerationPublishedStraightFromTheBuildIsRecordedBeforeItIsMade(t *testing.T) {
+	t.Parallel()
+
+	publish := guestImageFunction(t, "publish")
+	record := strings.Index(publish, `image-meta set "$IMAGE_NAME" "billet.components.$gen"`)
+	snapshot := strings.Index(publish, `snap create "$IMAGE_NAME@$gen"`)
+	if record < 0 || snapshot < 0 || record > snapshot {
+		t.Fatalf("publish records the components at %d and makes the snapshot at %d; the record must come first",
+			record, snapshot)
+	}
+}
+
 // A GENERATION PUBLISHED STRAIGHT FROM THE BUILD RECORDS WHAT IT LEFT OUT in the
 // form ceph.SetComponents writes and Components reads, strict: everything left
 // out, sorted, and nothing installed.

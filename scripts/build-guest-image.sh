@@ -257,7 +257,7 @@ install_completer() {
 	install -m 0644 "$SCRIPT_DIR/runner-images/pam-environment.awk" "$completer/pam-environment.awk"
 	install -m 0644 "$SCRIPT_DIR/../internal/runnerimages/toolset-2404.json" "$completer/installers/toolset.json"
 	for script in install-android-sdk.sh install-codeql-bundle.sh install-firefox.sh \
-		install-google-chrome.sh install-microsoft-edge.sh configure-apt-mock.sh; do
+		install-google-chrome.sh install-microsoft-edge.sh; do
 		install -m 0755 "$upstream/build/$script" "$completer/scripts/build/$script"
 	done
 	cp -R "$upstream/helpers" "$completer/scripts/helpers"
@@ -542,13 +542,26 @@ unmount_trial() {
 
 # unmount_under unmounts every mount at or under DIR, deepest first, lazily when a
 # plain unmount refuses, and fails when any is still there afterwards.
+#
+# THE MOUNT TABLE IS READ BEFORE IT IS FILTERED, both times: a findmnt that could
+# not answer is not a workspace with nothing mounted in it.
 unmount_under() {
-	local dir=${1%/} target
+	local dir=${1%/} table target under
+	if ! table=$(findmnt -rn -o TARGET); then
+		echo "could not read the mount table to unmount what is under $dir" >&2
+		return 1
+	fi
+	under=$(awk -v dir="$dir" '$0 == dir || index($0, dir "/") == 1' <<<"$table" | sort -r)
 	while IFS= read -r target; do
+		[ -n "$target" ] || continue
 		umount "$target" 2>/dev/null || umount -l "$target" || true
-	done < <(findmnt -rn -o TARGET | awk -v dir="$dir" '$0 == dir || index($0, dir "/") == 1' | sort -r)
+	done <<<"$under"
 
-	if findmnt -rn -o TARGET | awk -v dir="$dir" '$0 == dir || index($0, dir "/") == 1 { found = 1 } END { exit !found }'; then
+	if ! table=$(findmnt -rn -o TARGET); then
+		echo "could not read the mount table to prove nothing is mounted under $dir" >&2
+		return 1
+	fi
+	if [ -n "$(awk -v dir="$dir" '$0 == dir || index($0, dir "/") == 1' <<<"$table")" ]; then
 		echo "something is still mounted under $dir" >&2
 		return 1
 	fi
@@ -2574,6 +2587,15 @@ publish() {
 	dev=""
 	MAPPED_DEV=""
 
+	# WHAT THE IMAGE LEFT OUT, AND THAT NOTHING WAS INSTALLED (#584), as
+	# ceph.SetComponents records it, BEFORE THE SNAPSHOT EXISTS: a generation with no
+	# record is read as one that left nothing out, which this one did not, and a
+	# deployment that accepts a component refuses to verify one that lacks it. A
+	# crash between the two leaves a record for a generation never made, which
+	# nothing reads.
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.components.$gen" \
+		"$(components_record)"
+
 	"${rbd[@]}" -p "$IMAGE_POOL" snap create "$IMAGE_NAME@$gen"
 
 	# WHAT THIS IMAGE ACTUALLY INSTALLED, recorded where anything with cluster access
@@ -2598,12 +2620,6 @@ publish() {
 	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.runner_version.$gen" \
 		"$RUNNER_VERSION"
 
-	# WHAT THE IMAGE LEFT OUT, AND THAT NOTHING WAS INSTALLED (#584), as
-	# ceph.SetComponents records it. A generation with no record is read as one that
-	# left nothing out, which this one did not: a deployment that accepts a
-	# component then refuses to verify it rather than boot a tier without it.
-	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.components.$gen" \
-		"$(components_record)"
 
 	# The head keys stay as a record of the most recent build. Nothing reads them for
 	# a verdict; they are there so `image-meta list` says what happened last.
