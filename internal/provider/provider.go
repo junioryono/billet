@@ -194,6 +194,14 @@ type Spec struct {
 	// on the host can read it, and MUST NOT log it. Both mistakes look like
 	// working code.
 	JITConfig string
+
+	// CompletionRoot says Image names a completion root: an image as published,
+	// without what its deployment accepted, that only the microVM completing it may
+	// boot (#584). Set by `billet images pull`, on a firecracker node, and nothing
+	// else. Firecracker resolves a spec that sets it only to a completion root, and
+	// refuses a completion root named by a spec that does not; the other backends
+	// have no completion roots and do not read it.
+	CompletionRoot bool
 }
 
 // Instance is a unit of compute the backend knows about. It may be running,

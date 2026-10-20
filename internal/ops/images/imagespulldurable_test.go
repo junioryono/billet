@@ -27,6 +27,7 @@ import (
 	"github.com/junioryono/billet/internal/imagesource"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/runnerrelease"
+	"github.com/junioryono/billet/internal/store/ceph"
 )
 
 // NOTHING REMOTE HAPPENS UNTIL THE KERNEL IS DURABLE, and this is the test that can
@@ -716,11 +717,14 @@ type recordingPublisher struct {
 
 type publishedGeneration struct {
 	image, rawPath, runnerVersion, kernel, guestContract string
+	components                                           *ceph.GenerationComponents
+	completionRootOwner                                  string
 }
 
-func (p *recordingPublisher) ImportGeneration(
+func (p *recordingPublisher) ImportCompletedGeneration(
 	_ context.Context,
 	image, rawPath, runnerVersion, kernel, guestContract string,
+	components *ceph.GenerationComponents,
 	_ time.Time,
 ) (string, error) {
 	// BEFORE THE LOCK THIS FAKE TAKES FOR ITS OWN BOOKKEEPING, so a hook is free to
@@ -734,7 +738,7 @@ func (p *recordingPublisher) ImportGeneration(
 
 	p.seen = append(p.seen, publishedGeneration{
 		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
-		kernel: kernel, guestContract: guestContract,
+		kernel: kernel, guestContract: guestContract, components: components,
 	})
 
 	if p.fails {
@@ -742,6 +746,32 @@ func (p *recordingPublisher) ImportGeneration(
 	}
 
 	return "gen-20260831-000000", nil
+}
+
+// ImportCompletionRoot records a completion root as a publication of its own, with
+// the image name and the c snapshot it answers.
+func (p *recordingPublisher) ImportCompletionRoot(
+	_ context.Context,
+	image, rawPath, runnerVersion, kernel, guestContract, owner string,
+	_ time.Time,
+) (string, error) {
+	if p.onImport != nil {
+		p.onImport()
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.seen = append(p.seen, publishedGeneration{
+		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
+		kernel: kernel, guestContract: guestContract, completionRootOwner: owner,
+	})
+
+	if p.fails {
+		return "", errors.New("the cluster refused")
+	}
+
+	return "c20260831000000", nil
 }
 
 func (p *recordingPublisher) calls() int {
@@ -828,7 +858,7 @@ func pullWithin(t *testing.T, fixture *pullFixture, within time.Duration) error 
 // INSTALL THEM, and it is refused before its assets are copied into staging, the
 // sideloaded equivalent of a download.
 func TestAPullRefusesAnImageThisBuildCannotCompleteBeforeStagingIt(t *testing.T) {
-	fixture := newPullFixture(t, leavingOut)
+	fixture := newPullFixture(t, leavingOut, underAnotherContract)
 
 	// THE PART IS THERE TO COPY, so a refusal that came only after staging would
 	// leave it in staging rather than failing for its absence.

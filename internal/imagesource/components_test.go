@@ -131,11 +131,18 @@ func TestAnEmptySchema3KeyIsRefusedBeforeSchema3(t *testing.T) {
 // what its tiers expect.
 func TestAnImageThisBuildCannotCompleteIsNotUsable(t *testing.T) {
 	m := validCompletableManifest()
+	m.CompletionContract = "2"
 
 	err := m.Usable(m.GuestContract, m.Arch)
 	if err == nil || !strings.Contains(err.Error(), `leaves out android-sdk, google-chrome for each `+
-		`deployment to install, through completion contract "1", which this billet cannot run`) {
+		`deployment to install, through completion contract "2", which this billet cannot run`) {
 		t.Fatalf("got %v, want the image refused as one this build cannot complete", err)
+	}
+
+	// The contract this build implements is usable.
+	m.CompletionContract = CompletionContractV1
+	if err := m.Usable(m.GuestContract, m.Arch); err != nil {
+		t.Fatalf("an image under completion contract %s was refused: %v", CompletionContractV1, err)
 	}
 
 	full := validMultipartManifest()
