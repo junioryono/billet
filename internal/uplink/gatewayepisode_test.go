@@ -157,7 +157,10 @@ func TestForgettingAGatewayDropsItsWindowsAndEpisodes(t *testing.T) {
 				d.episode, d.futile, d.cutGateway)
 		}
 	}
-	if len(c.recent) != 0 || len(c.delayTrail) != 0 {
-		t.Errorf("the windows kept the old gateway's delays: recent %v, trail %v", c.recent, c.delayTrail)
+	// THE REFLECTORS' OWN WINDOW WITH THEM, or stale delays beside one fresh
+	// spike would exempt a trickle from the loss share (lossShare).
+	if len(c.recent) != 0 || len(c.delayTrail) != 0 || len(c.reflectorRecent) != 0 {
+		t.Errorf("the windows kept the old gateway's delays: recent %v, trail %v, reflectors %v", c.recent,
+			c.delayTrail, c.reflectorRecent)
 	}
 }

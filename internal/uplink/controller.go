@@ -1004,7 +1004,7 @@ func helped(d *Direction, v verdict, o Observation) (bool, bool) {
 // whose futility latch it may have set. Rare, since a route seldom moves, and
 // the safe way: a queue still there is seen again within Detect rounds.
 func (c *Controller) forgetGateway() {
-	c.recent, c.delayTrail, c.gatewayStalled = nil, nil, false
+	c.recent, c.delayTrail, c.reflectorRecent, c.gatewayStalled = nil, nil, nil, false
 	c.lastGateway, c.lastHigh = measured{}, measured{}
 
 	for _, d := range []*Direction{&c.Up, &c.Down} {
