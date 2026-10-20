@@ -295,40 +295,49 @@ func TestTheCompleterFailsEverythingWhenTheJobEnvironmentCannotBeWritten(t *test
 func TestTheCompleterInstallsWhatGitHubsOrderGivesTheBrowsers(t *testing.T) {
 	t.Parallel()
 
-	fx := newCompleterFixture(t)
-	if output, err := fx.run(t, true, "google-chrome", "codeql"); err != nil {
-		t.Fatalf("the completer exited %v:\n%s", err, output)
-	}
-	calls, err := os.ReadFile(fx.calls)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ran := string(calls)
-	prerequisite := strings.Index(ran, "apt-get install -y --no-install-recommends libasound2t64\n")
-	installer := strings.Index(ran, "install-google-chrome.sh ")
-	if prerequisite < 0 || installer < 0 || prerequisite > installer {
-		t.Fatalf("libasound2t64 was not installed before Chrome's installer ran:\n%s", calls)
-	}
-	if strings.Count(string(calls), "libasound2t64") != 1 {
-		t.Fatalf("a component that needs no prerequisite was given one:\n%s", calls)
-	}
+	for browser, installer := range map[string]string{
+		"google-chrome":  "install-google-chrome.sh ",
+		"microsoft-edge": "install-microsoft-edge.sh ",
+	} {
+		t.Run(browser, func(t *testing.T) {
+			t.Parallel()
 
-	fx = newCompleterFixture(t)
-	if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-install"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if output, err := fx.run(t, true, "google-chrome", "codeql"); err != nil {
-		t.Fatalf("the completer exited %v:\n%s", err, output)
-	}
-	if got, want := fx.reportLines(t), []string{"failed=google-chrome", "installed=codeql 2.23.3"}; !slices.Equal(got, want) {
-		t.Fatalf("the report is %q, want %q", got, want)
-	}
-	calls, err = os.ReadFile(fx.calls)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(calls), "install-google-chrome.sh ") {
-		t.Fatalf("Chrome's installer ran without its prerequisite:\n%s", calls)
+			fx := newCompleterFixture(t)
+			if output, err := fx.run(t, true, browser, "codeql"); err != nil {
+				t.Fatalf("the completer exited %v:\n%s", err, output)
+			}
+			calls, err := os.ReadFile(fx.calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ran := string(calls)
+			prerequisite := strings.Index(ran, "apt-get install -y --no-install-recommends libasound2t64\n")
+			installed := strings.Index(ran, installer)
+			if prerequisite < 0 || installed < 0 || prerequisite > installed {
+				t.Fatalf("libasound2t64 was not installed before %s's installer ran:\n%s", browser, ran)
+			}
+			if strings.Count(ran, "libasound2t64") != 1 {
+				t.Fatalf("a component that needs no prerequisite was given one:\n%s", ran)
+			}
+
+			fx = newCompleterFixture(t)
+			if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-install"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if output, err := fx.run(t, true, browser, "codeql"); err != nil {
+				t.Fatalf("the completer exited %v:\n%s", err, output)
+			}
+			if got, want := fx.reportLines(t), []string{"failed=" + browser, "installed=codeql 2.23.3"}; !slices.Equal(got, want) {
+				t.Fatalf("the report is %q, want %q", got, want)
+			}
+			calls, err = os.ReadFile(fx.calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(calls), installer) {
+				t.Fatalf("%s's installer ran without its prerequisite:\n%s", browser, calls)
+			}
+		})
 	}
 }
 
