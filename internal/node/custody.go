@@ -1025,17 +1025,14 @@ func (r *Runner) unconfirmedForRequest(requestID int64) (string, bool) {
 // listener has no record of the request, so its own completion handling returns
 // without releasing anything; this is what connects the message to the container
 // a previous incarnation started.
-func (r *Runner) releaseRequest(ctx context.Context, requestID int64) error {
-	// HELD ACROSS THE WHOLE TRANSITION, not just the flag write. This runs on the
-	// listener's goroutine while the periodic tick runs on the reaper's, so
-	// releasing the lock before tendOne would let both act on the same entry —
-	// duplicate destroys, and a delete racing a replacement.
-	//
-	// tendOne does not take this lock itself, so holding it here is not
-	// re-entrant. The lock order is tending before mu, everywhere.
-	r.tending.Lock()
-	defer r.tending.Unlock()
-
+//
+// THE CALLER MUST HOLD r.tending, across the whole transition and not just the
+// flag write. This runs on the listener's goroutine while the periodic tick runs
+// on the reaper's, so releasing the lock before tendOne would let both act on the
+// same entry: duplicate destroys, and a delete racing a replacement. The caller
+// holds it on past the return too, until it has answered for what the tend left
+// (settleCustodyFor). The lock order is tending before mu, everywhere.
+func (r *Runner) releaseRequestLocked(ctx context.Context, requestID int64) error {
 	r.mu.Lock()
 
 	var held []*custody
