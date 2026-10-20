@@ -18,6 +18,11 @@ func TestAUsageRowWrittenAtVersion58ReadsBackWithoutDestinations(t *testing.T) {
 	}
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			// MIGRATION 63 FIRST: its partial index reads destinations_incomplete.
+			`DROP INDEX job_history_detail_retired_at`,
+			`DROP INDEX job_usage_destinations_kept`,
+			`ALTER TABLE job_history DROP COLUMN detail_retired_at`,
+			`DELETE FROM schema_migrations WHERE version = 63`,
 			`DROP TABLE job_destinations`,
 			`ALTER TABLE job_usage DROP COLUMN destinations_incomplete`,
 			`ALTER TABLE job_usage DROP COLUMN tap_sent_bytes`,

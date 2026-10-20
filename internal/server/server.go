@@ -53,6 +53,9 @@ type Server struct {
 	prov  Provisioner
 	tiers []config.Tier
 	log   *slog.Logger
+	// detailRetention is how long a job's series, destinations and guest report
+	// are kept; zero is config.DefaultJobDetailRetention.
+	detailRetention time.Duration
 	// owner identifies this process to GitHub's message queue, so a session left
 	// by a crashed run can be told apart from a live one.
 	owner string
@@ -252,6 +255,12 @@ func WithDrainTimeout(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.drainTimeout = &d }
 }
 
+// WithJobDetailRetention is server.job_detail_retention reaching the loop that
+// deletes a job's detail past it.
+func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.detailRetention = d }
+}
+
 // WithHurry gives every listener the channel that ends its drain wait early.
 //
 // This is the operator's second signal reaching the code that honours it. See
@@ -302,10 +311,15 @@ func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
 	if err != nil {
 		return nil, err
 	}
+	retention, err := cfg.Server.JobDetailRetentionDuration()
+	if err != nil {
+		return nil, err
+	}
 
 	return []ControlPlaneOption{
 		WithDrainTimeout(drain),
 		WithAdmissionOrder(cfg.Server.Order()),
+		WithJobDetailRetention(retention),
 	}, nil
 }
 
@@ -447,6 +461,9 @@ func (s *Server) Run(ctx context.Context) error {
 	group.Background("github queue times", func(ctx context.Context) {
 		s.fillQueueTimes(ctx, targets)
 	})
+
+	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
+	group.Background("job detail retention", s.retireJobDetail)
 
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for

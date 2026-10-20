@@ -374,5 +374,6 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
        chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
-       github_scale_set_assigned_at, github_runner_assigned_at, bought_at
+       github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
+       detail_retired_at
   FROM job_history WHERE lease_id = @lease_id;
