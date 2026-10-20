@@ -147,26 +147,37 @@ type queueTimeWork struct {
 	run          queueTimeRun
 	installation string
 	reader       QueueTimes
-	// headroom is the installation's budget, nil for a Provisioner that keeps
-	// none.
-	headroom RESTHeadroom
-	jobs     []alloc.AwaitingQueueTime
+	jobs         []alloc.AwaitingQueueTime
 }
 
-// inReserve says whether an installation's budget, as GitHub last stated it, is
-// down to its reserve for the rest of the hour. A budget no answer has stated
-// yet, or one whose hour has ended, is not: the read's own throttle still pauses
-// the installation.
-func inReserve(headroom RESTHeadroom, now time.Time) (int64, int64, time.Time, bool) {
-	if headroom == nil {
-		return 0, 0, time.Time{}, false
-	}
-	remaining, limit, reset, ok := headroom.RESTHeadroom()
-	if !ok || !now.Before(reset) {
-		return 0, 0, time.Time{}, false
+// installationBudgets is every target's budget by the installation it counts
+// against, whether or not the target has jobs awaiting a queue time: a target
+// with none may still have seen the installation's budget spent.
+func installationBudgets(targets map[string]Target) map[string][]RESTHeadroom {
+	budgets := map[string][]RESTHeadroom{}
+	for _, target := range targets {
+		if h, ok := target.Provisioner.(RESTHeadroom); ok {
+			budgets[installationOf(target)] = append(budgets[installationOf(target)], h)
+		}
 	}
 
-	return remaining, limit, reset, remaining*queueTimeReserve < limit
+	return budgets
+}
+
+// inReserve says whether an installation's budget is down to its reserve for
+// the rest of the hour, as any of its targets' clients last saw it: each keeps
+// the statement its own requests drew, and within an hour the lowest of them is
+// the newest. A budget no answer has stated yet, or one whose hour has ended,
+// holds nothing back: the read's own throttle still pauses the installation.
+func inReserve(budgets []RESTHeadroom, now time.Time) (int64, int64, time.Time, bool) {
+	for _, h := range budgets {
+		remaining, limit, reset, ok := h.RESTHeadroom()
+		if ok && now.Before(reset) && remaining*queueTimeReserve < limit {
+			return remaining, limit, reset, true
+		}
+	}
+
+	return 0, 0, time.Time{}, false
 }
 
 // fillQueueTimesOnce is one pass at now.
@@ -189,24 +200,16 @@ func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Targ
 	if !ok {
 		return
 	}
-	s.readQueueTimeWork(ctx, work, sweep, now)
+	s.readQueueTimeWork(ctx, work, installationBudgets(targets), sweep, now)
 }
 
-// readQueueTimeWork reads work in order within each installation's budget for
-// the pass, and records each run's backoff and each installation's pause.
-func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sweep *queueTimeSweep,
-	now time.Time,
+// readQueueTimeWork reads work in order within each installation's share of
+// the pass and its reserve, and records each run's backoff and each
+// installation's pause.
+func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, budgets map[string][]RESTHeadroom,
+	sweep *queueTimeSweep, now time.Time,
 ) {
 	read := map[string]int{}
-	// AN INSTALLATION IS HELD WHEN ANY OF ITS TARGETS' CLIENTS SAW IT IN
-	// RESERVE: each keeps the statement its own requests drew, and within an
-	// hour the lowest of them is the newest.
-	held := map[string]RESTHeadroom{}
-	for _, w := range work {
-		if _, _, _, low := inReserve(w.headroom, now); low {
-			held[w.installation] = w.headroom
-		}
-	}
 	for _, w := range work {
 		if ctx.Err() != nil {
 			return
@@ -214,9 +217,10 @@ func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sw
 		if read[w.installation] == queueTimeRunsPerInstallation || now.Before(sweep.paused[w.installation]) {
 			continue
 		}
-		if headroom, low := held[w.installation]; low {
+		// BEFORE EVERY RUN, since the run read before it may have spent the
+		// installation down to its reserve.
+		if remaining, limit, reset, low := inReserve(budgets[w.installation], now); low {
 			if !sweep.reserved[w.installation] {
-				remaining, limit, reset, _ := inReserve(headroom, now)
 				sweep.reserved[w.installation] = true
 				s.log.Warn("this App installation's REST budget is down to its reserve; reading queue times "+
 					"again when GitHub's next hour begins", "target", w.run.target, "installation", w.installation,
@@ -298,12 +302,7 @@ func (s *Server) gatherQueueTimeWork(ctx context.Context, targets map[string]Tar
 				if !seen {
 					at = len(work)
 					index[run] = at
-					var headroom RESTHeadroom
-					if h, ok := target.Provisioner.(RESTHeadroom); ok {
-						headroom = h
-					}
-					work = append(work, queueTimeWork{run: run, installation: installationOf(target),
-						reader: reader, headroom: headroom})
+					work = append(work, queueTimeWork{run: run, installation: installationOf(target), reader: reader})
 				}
 				work[at].jobs = append(work[at].jobs, *job)
 			}

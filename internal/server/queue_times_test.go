@@ -411,7 +411,7 @@ func TestTargetsOfOneInstallationShareItsBudgetAndItsPause(t *testing.T) {
 			installation: installationOf(Target{Config: target}), reader: reader,
 		})
 	}
-	s.readQueueTimeWork(t.Context(), work, newQueueTimeSweep(), time.Now())
+	s.readQueueTimeWork(t.Context(), work, nil, newQueueTimeSweep(), time.Now())
 	if got := reader.asked(); len(got) != queueTimeRunsPerInstallation {
 		t.Errorf("two targets of one installation read runs %v in one pass, want %d in all", got,
 			queueTimeRunsPerInstallation)
@@ -529,13 +529,20 @@ func TestAJobBothScansReadIsGatheredOnce(t *testing.T) {
 	}
 }
 
-// budgetedReader is a queueTimeReader whose installation states a budget.
+// budgetedReader is a queueTimeReader whose installation states a budget, and
+// each of whose reads spends spend of it.
 type budgetedReader struct {
 	*queueTimeReader
 
-	remaining, limit int64
-	reset            time.Time
-	stated           bool
+	remaining, limit, spend int64
+	reset                   time.Time
+	stated                  bool
+}
+
+func (r *budgetedReader) RunQueueTimes(ctx context.Context, owner, repository string, runID int64,
+) (map[string]time.Time, error) {
+	r.remaining -= r.spend
+	return r.queueTimeReader.RunQueueTimes(ctx, owner, repository, runID)
 }
 
 func (r *budgetedReader) RESTHeadroom() (int64, int64, time.Time, bool) {
@@ -609,29 +616,45 @@ func TestAnInstallationDownToItsReserveIsNotRead(t *testing.T) {
 	}
 
 	// Targets of one installation each keep the statement their own requests
-	// drew, and one in reserve holds the installation for all of them.
+	// drew, and one in reserve holds the installation for all of them, though it
+	// has no run of its own to read.
 	low := &budgetedReader{queueTimeReader: reader.queueTimeReader, remaining: 500, limit: 5000,
 		reset: now.Add(time.Hour), stated: true}
 	ample := &budgetedReader{queueTimeReader: reader.queueTimeReader, remaining: 4000, limit: 5000,
 		reset: now.Add(time.Hour), stated: true}
-	before := len(reader.asked())
-	var shared []queueTimeWork
-	for i, h := range []*budgetedReader{ample, low, ample} {
-		shared = append(shared, queueTimeWork{
-			run:          queueTimeRun{target: "acme-" + strconv.Itoa(i), repository: "acme/api", run: int64(980 + i)},
-			installation: "installation 22", reader: h, headroom: h,
-		})
+	shared := func(first int64) []queueTimeWork {
+		var work []queueTimeWork
+		for i := range 3 {
+			work = append(work, queueTimeWork{
+				run:          queueTimeRun{target: "acme-" + strconv.Itoa(i), repository: "acme/api", run: first + int64(i)},
+				installation: "installation 22", reader: ample,
+			})
+		}
+		return work
 	}
-	s.readQueueTimeWork(t.Context(), shared, newQueueTimeSweep(), now)
+	before := len(reader.asked())
+	s.readQueueTimeWork(t.Context(), shared(980), map[string][]RESTHeadroom{"installation 22": {ample, low}},
+		newQueueTimeSweep(), now)
 	if got := len(reader.asked()) - before; got != 0 {
-		t.Errorf("an installation one of whose targets saw it in reserve read %d runs through the others", got)
+		t.Errorf("an installation one of whose targets saw it in reserve read %d runs through another", got)
+	}
+
+	// And it is asked before every run: the one that spends the installation
+	// into its reserve is the last a pass starts.
+	ample.remaining, ample.spend = 1000, 1
+	before = len(reader.asked())
+	s.readQueueTimeWork(t.Context(), shared(990), map[string][]RESTHeadroom{"installation 22": {ample}},
+		newQueueTimeSweep(), now)
+	if got := len(reader.asked()) - before; got != 1 {
+		t.Errorf("a pass that spent the installation into its reserve on its first run read %d runs, want 1", got)
 	}
 
 	// A budget no answer has stated holds nothing back.
 	reader.stated, reader.reset = false, reset.Add(time.Hour)
+	before = len(reader.asked())
 	s.fillQueueTimesOnce(t.Context(), targets, sweep, reset.Add(4*queueTimeRetryFirst))
-	if got := len(reader.asked()); got != 3*queueTimeRunsPerInstallation {
-		t.Errorf("an installation that has stated no budget read %d runs in all, want %d more", got,
+	if got := len(reader.asked()) - before; got != queueTimeRunsPerInstallation {
+		t.Errorf("an installation that has stated no budget read %d runs, want %d", got,
 			queueTimeRunsPerInstallation)
 	}
 }
