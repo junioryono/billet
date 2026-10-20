@@ -15,7 +15,7 @@ ALTER TABLE job_history ADD COLUMN detail_retired_at text NOT NULL DEFAULT '';
 -- +billet:end
 
 -- +billet:statement
-CREATE INDEX job_usage_recorded_at ON job_usage (recorded_at);
+CREATE INDEX job_usage_destinations_kept ON job_usage (lease_id) WHERE destinations_incomplete IS NOT NULL;
 -- +billet:end
 
 -- +billet:statement

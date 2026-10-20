@@ -84,6 +84,11 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	guest := readJobGuest(ctx, a, leaseID)
+	// A RETIREMENT THAT COMMITTED BETWEEN THESE READS took the detail and wrote
+	// its marker in one transaction, and the history row was read first, so
+	// it is read again: missing detail is then said to be retired, never
+	// unmeasured.
+	rec = withRetirement(ctx, a, rec)
 
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
 	if *asJSON {
@@ -266,6 +271,19 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		return
 	}
 	renderDestinations(w, u.Destinations)
+}
+
+// withRetirement is rec with its retirement marker read again, for a retirement
+// that committed after rec was read.
+func withRetirement(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord) alloc.JobRecord {
+	if rec.DetailRetiredAt != "" {
+		return rec
+	}
+	if again, err := a.Job(ctx, rec.LeaseID); err == nil {
+		rec.DetailRetiredAt = again.DetailRetiredAt
+	}
+
+	return rec
 }
 
 // detailRetired says that a job's per-sample series, destinations and guest

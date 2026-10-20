@@ -23,9 +23,18 @@ func retentionFleet(t *testing.T, now *time.Time) *Allocator {
 	return a
 }
 
+// detail is what detailedJob records for a job, and when.
+type detail struct {
+	usageAt time.Time
+	// guestAt is when the guest report was recorded; zero records none.
+	guestAt  time.Time
+	finished bool
+}
+
 // detailedJob is a busy lease with a usage report carrying a series and
-// destinations, and a guest report, each recorded at at.
-func detailedJob(t *testing.T, a *Allocator, at time.Time, guest bool) *Lease {
+// destinations recorded at d.usageAt, a guest report at d.guestAt, and the
+// lease finished if d.finished.
+func detailedJob(t *testing.T, a *Allocator, d detail) *Lease {
 	t.Helper()
 
 	lease := busyLease(t, a)
@@ -35,21 +44,25 @@ func detailedJob(t *testing.T, a *Allocator, at time.Time, guest bool) *Lease {
 	if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, usage, series); err != nil {
 		t.Fatalf("RecordLeaseUsage: %v", err)
 	}
-	if guest {
+	if !d.guestAt.IsZero() {
 		if err := a.RecordGuestReport(t.Context(), lease.ID, lease.Epoch, aGuestReport()); err != nil {
 			t.Fatalf("RecordGuestReport: %v", err)
 		}
 	}
+	if d.finished {
+		if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+	}
 	// recorded_at is the wall clock's, written by the ledger writer; the test
-	// sets it to when the job is meant to have been recorded.
-	stamp := at.UTC().Format(time.RFC3339Nano)
+	// sets it to when the detail is meant to have been recorded.
 	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(t.Context(), `UPDATE job_usage SET recorded_at = ? WHERE lease_id = ?`,
-			stamp, lease.ID); err != nil {
+		if _, err := tx.ExecContext(t.Context(), `UPDATE job_usage SET recorded_at = $1 WHERE lease_id = $2`,
+			d.usageAt.UTC().Format(time.RFC3339Nano), lease.ID); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(t.Context(), `UPDATE job_guest_reports SET recorded_at = ? WHERE lease_id = ?`,
-			stamp, lease.ID)
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_guest_reports SET recorded_at = $1 WHERE lease_id = $2`,
+			d.guestAt.UTC().Format(time.RFC3339Nano), lease.ID)
 		return err
 	}); err != nil {
 		t.Fatalf("date the job's detail: %v", err)
@@ -90,19 +103,23 @@ func detailOf(t *testing.T, a *Allocator, leaseID string) (usage, series, destin
 	return usage, series, destinations, guest, job.DetailRetiredAt
 }
 
-// A JOB'S DETAIL PAST THE RETENTION GOES AND ITS SUMMARY STAYS; DETAIL INSIDE IT
-// STAYS. The series, the destinations and the guest report of a job recorded
-// before the cutoff are deleted and the job is marked retired; a newer job's
-// are untouched and unmarked; batches take the oldest first and progress; and
-// a pass with nothing older marks nothing.
+// cutoff is the moment the retention tests retire detail recorded before.
+var cutoff = time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+
+// A FINISHED JOB'S DETAIL PAST THE RETENTION GOES AND ITS SUMMARY STAYS; DETAIL
+// INSIDE IT STAYS. The series, the destinations and the guest report of a job
+// recorded before the cutoff are deleted and the job is marked retired; a newer
+// job's are untouched and unmarked; batches take the oldest first and progress;
+// and a pass with nothing older marks nothing.
 func TestJobDetailPastTheRetentionGoesAndItsSummaryStays(t *testing.T) {
 	now := time.Now().UTC()
 	a := retentionFleet(t, &now)
 
-	cutoff := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
-	oldest := detailedJob(t, a, cutoff.Add(-72*time.Hour), true)
-	old := detailedJob(t, a, cutoff.Add(-time.Hour), false)
-	recent := detailedJob(t, a, cutoff.Add(time.Hour), true)
+	oldest := detailedJob(t, a, detail{usageAt: cutoff.Add(-72 * time.Hour), guestAt: cutoff.Add(-72 * time.Hour),
+		finished: true})
+	old := detailedJob(t, a, detail{usageAt: cutoff.Add(-time.Hour), finished: true})
+	recent := detailedJob(t, a, detail{usageAt: cutoff.Add(time.Hour), guestAt: cutoff.Add(time.Hour),
+		finished: true})
 
 	first, err := a.RetireJobDetail(t.Context(), cutoff, 1)
 	if err != nil {
@@ -143,6 +160,55 @@ func TestJobDetailPastTheRetentionGoesAndItsSummaryStays(t *testing.T) {
 	}
 }
 
+// A JOB IS RETIRED WHOLE AND ONLY ONCE IT IS DONE: an unfinished job keeps its
+// detail however old, so none arrives after its retirement; a job whose guest
+// report is newer than its usage waits for both; and a job whose usage and
+// guest report arrived at different times takes one place in a batch, so a
+// batch that comes back full means more may be left.
+func TestAJobIsRetiredWholeAndOnlyOnceItIsDone(t *testing.T) {
+	now := time.Now().UTC()
+	a := retentionFleet(t, &now)
+
+	running := detailedJob(t, a, detail{usageAt: cutoff.Add(-48 * time.Hour), guestAt: cutoff.Add(-48 * time.Hour)})
+	split := detailedJob(t, a, detail{usageAt: cutoff.Add(-48 * time.Hour), guestAt: cutoff.Add(time.Hour),
+		finished: true})
+	apartA := detailedJob(t, a, detail{usageAt: cutoff.Add(-30 * time.Hour), guestAt: cutoff.Add(-20 * time.Hour),
+		finished: true})
+	apartB := detailedJob(t, a, detail{usageAt: cutoff.Add(-29 * time.Hour), guestAt: cutoff.Add(-19 * time.Hour),
+		finished: true})
+
+	got, err := a.RetireJobDetail(t.Context(), cutoff, 2)
+	if err != nil {
+		t.Fatalf("RetireJobDetail: %v", err)
+	}
+	if got.Jobs != 2 || got.GuestReports != 2 {
+		t.Errorf("a batch of two retired %+v, want both jobs whose usage and guest report arrived apart", got)
+	}
+	for _, lease := range []*Lease{apartA, apartB} {
+		if _, series, _, guest, retired := detailOf(t, a, lease.ID); series || guest || retired == "" {
+			t.Errorf("job %s keeps series %t, guest %t, retired %q", lease.ID, series, guest, retired)
+		}
+	}
+
+	rest, err := a.RetireJobDetail(t.Context(), cutoff, 10)
+	if err != nil || rest.Jobs != 0 {
+		t.Errorf("the next batch retired %+v (%v); an unfinished job and one with a newer guest report wait", rest, err)
+	}
+	for _, lease := range []*Lease{running, split} {
+		if _, series, _, guest, retired := detailOf(t, a, lease.ID); !series || !guest || retired != "" {
+			t.Errorf("job %s lost series %t, guest %t, or was marked %q", lease.ID, !series, !guest, retired)
+		}
+	}
+
+	later, err := a.RetireJobDetail(t.Context(), cutoff.Add(2*time.Hour), 10)
+	if err != nil || later.Jobs != 1 || later.GuestReports != 1 {
+		t.Errorf("past the newer guest report retired %+v (%v), want that job whole", later, err)
+	}
+	if _, series, _, guest, _ := detailOf(t, a, running.ID); !series || !guest {
+		t.Error("an unfinished job lost its detail")
+	}
+}
+
 // A JOB WITH NO DETAIL IS NEVER MARKED RETIRED, so a report never says a job's
 // series was retired when the job never had one.
 func TestAJobWithNoDetailIsNotMarkedRetired(t *testing.T) {
@@ -152,6 +218,9 @@ func TestAJobWithNoDetailIsNotMarkedRetired(t *testing.T) {
 	lease := busyLease(t, a)
 	if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, measuredUsage(), nil); err != nil {
 		t.Fatalf("RecordLeaseUsage: %v", err)
+	}
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
 	}
 	got, err := a.RetireJobDetail(t.Context(), now.Add(time.Hour), 10)
 	if err != nil || got.Jobs != 0 {

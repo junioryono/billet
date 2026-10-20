@@ -11,9 +11,10 @@
 -- detail_retired_at is when that happened to this job's row, empty for a job
 -- whose detail was never retired, so a report can say "retired" rather than
 -- "never measured" for a job whose series, guest report or destinations are
--- gone. The indexes serve the retention: it finds a job's series and
--- destinations by when its usage was recorded, in the same transaction as them,
--- and deletes a batch's detail by the stamp it marked the batch with.
+-- gone. The indexes serve the retention: it finds the jobs whose usage still
+-- claims destinations (a verdict it clears when it deletes them, so the index
+-- holds only what is left to retire, not the deployment's history), and it
+-- deletes a batch's detail by the stamp it marked the batch with.
 --
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
 -- Reformat one tab and every ledger that applied this migration refuses to open.
@@ -23,7 +24,7 @@ ALTER TABLE job_history ADD COLUMN detail_retired_at TEXT NOT NULL DEFAULT ''
 -- +billet:end
 
 -- +billet:statement
-CREATE INDEX job_usage_recorded_at ON job_usage (recorded_at)
+CREATE INDEX job_usage_destinations_kept ON job_usage (lease_id) WHERE destinations_incomplete IS NOT NULL
 -- +billet:end
 
 -- +billet:statement

@@ -7,30 +7,43 @@
 -- and never marks a job whose detail it did not delete.
 
 -- name: MarkJobDetailRetired :execrows
--- Stamp at most max_rows jobs that still hold detail recorded before a moment:
--- a series or destinations, by when the job's usage was recorded (they are
--- written in its transaction), or a guest report, by its own time. Oldest
--- first. A retired job holds none, so batches progress; a job with no history
--- row cannot be stamped, so the join keeps one from taking a place in every
--- batch. A stamp, once written, is the job's first retirement and is kept.
+-- Stamp at most max_rows finished jobs all of whose detail was recorded before
+-- a moment, oldest first: a series or destinations, by when the job's usage
+-- was recorded (they are written in its transaction), and a guest report, by
+-- its own time.
+--
+-- DISCOVERED FROM WHAT IS LEFT TO RETIRE, never from the history: job_series
+-- and job_guest_reports hold only unretired detail, and the usage rows that
+-- still claim destinations are the partial index migration 63 adds, which a
+-- retirement empties. So a batch's work is the unretired detail, which the
+-- retention bounds, and not every job the deployment ever ran.
+--
+-- ONE CANDIDATE A JOB, grouped by lease, so a job whose usage and guest report
+-- arrived at different times does not take two places in the limit, and a
+-- short batch means none is left. ONLY A FINISHED JOB, whose lease takes no
+-- more reports, so no detail arrives after its retirement. A job with no
+-- history row is never a candidate, since it could never be stamped and would
+-- take a place in every batch; and a stamp, once written, is kept.
 UPDATE job_history
    SET detail_retired_at = CAST(@stamp AS TEXT)
  WHERE detail_retired_at = ''
    AND lease_id IN (
-       SELECT lease_id FROM (
-           SELECT u.lease_id AS lease_id, u.recorded_at AS at
-             FROM job_usage u
-             JOIN job_history h ON h.lease_id = u.lease_id
-            WHERE u.recorded_at < @before
-              AND (EXISTS (SELECT 1 FROM job_series s WHERE s.lease_id = u.lease_id)
-                   OR EXISTS (SELECT 1 FROM job_destinations d WHERE d.lease_id = u.lease_id))
-           UNION
-           SELECT g.lease_id AS lease_id, g.recorded_at AS at
-             FROM job_guest_reports g
-             JOIN job_history h ON h.lease_id = g.lease_id
-            WHERE g.recorded_at < @before
-       ) old
-        ORDER BY at, lease_id
+       SELECT c.lease_id
+         FROM (
+             SELECT s.lease_id AS lease_id, u.recorded_at AS at
+               FROM job_series s JOIN job_usage u ON u.lease_id = s.lease_id
+             UNION ALL
+             SELECT u.lease_id AS lease_id, u.recorded_at AS at
+               FROM job_usage u WHERE u.destinations_incomplete IS NOT NULL
+             UNION ALL
+             SELECT g.lease_id AS lease_id, g.recorded_at AS at
+               FROM job_guest_reports g
+         ) AS c
+         JOIN job_history h ON h.lease_id = c.lease_id
+        WHERE h.detail_retired_at = '' AND COALESCE(h.finished_at, '') != ''
+        GROUP BY c.lease_id
+       HAVING MAX(c.at) < CAST(@before AS TEXT)
+        ORDER BY MAX(c.at), c.lease_id
         LIMIT CAST(@max_rows AS BIGINT));
 
 -- name: DeleteRetiredJobSeries :execrows

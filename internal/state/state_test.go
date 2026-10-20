@@ -1132,7 +1132,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
 			`DROP INDEX job_history_detail_retired_at`,
-			`DROP INDEX job_usage_recorded_at`,
+			`DROP INDEX job_usage_destinations_kept`,
 			`ALTER TABLE job_history DROP COLUMN detail_retired_at`,
 			`ALTER TABLE job_history DROP COLUMN github_run_id`,
 			`DROP INDEX job_history_started_idx`,

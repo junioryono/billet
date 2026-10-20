@@ -91,6 +91,9 @@ func TestARetentionPassRetiresOnlyWhatIsPastIt(t *testing.T) {
 		&alloc.UsageSeries{Codec: alloc.UsageSeriesCodec, Data: []byte{1}}); err != nil {
 		t.Fatalf("RecordLeaseUsage: %v", err)
 	}
+	if err := p.a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
 
 	s := New(p.a, &fakeProvisioner{}, nil, "test", nil, WithJobDetailRetention(time.Hour))
 	s.retireJobDetailOnce(t.Context(), time.Now().Add(30*time.Minute))

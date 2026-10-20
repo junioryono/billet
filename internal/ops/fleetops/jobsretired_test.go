@@ -11,9 +11,9 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
-// retireEveryJob deletes the detail of every job in the ledger at stateDir, as
-// the control plane does past its retention.
-func retireEveryJob(t *testing.T, stateDir string) {
+// retireEveryJob finishes lease and deletes the detail of every job in the
+// ledger at stateDir, as the control plane does past its retention.
+func retireEveryJob(t *testing.T, stateDir, lease string) {
 	t.Helper()
 
 	db, err := state.Open(t.Context(), stateDir)
@@ -30,6 +30,13 @@ func retireEveryJob(t *testing.T, stateDir string) {
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, []config.Tier{tier})
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
+	}
+	held, err := a.Lease(t.Context(), lease)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if err := a.Release(t.Context(), held.ID, held.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
 	}
 	got, err := a.RetireJobDetail(t.Context(), time.Now().Add(time.Hour), 100)
 	if err != nil || got.Jobs != 1 {
@@ -53,7 +60,7 @@ func TestARetiredJobSaysItsDetailWasRetired(t *testing.T) {
 	}
 	lease := seedJob(t, stateDir, jobSeed{requestID: 77, job: &forgedJob, usage: usage,
 		series: &alloc.UsageSeries{Codec: alloc.UsageSeriesCodec, Data: []byte{0, 1, 2}}})
-	retireEveryJob(t, stateDir)
+	retireEveryJob(t, stateDir, lease)
 
 	text := capture(t, func() {
 		if err := Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {

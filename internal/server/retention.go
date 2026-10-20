@@ -12,11 +12,12 @@ const (
 	// retention.
 	retentionEvery = 10 * time.Minute
 	// A pass deletes at most retentionBatches batches of retentionBatchJobs jobs,
-	// each its own short transaction, so the writer slot is never held for long
-	// and a backlog (a ledger's first pass after an upgrade) is worked through over
-	// a few passes rather than in one.
-	retentionBatchJobs = 200
-	retentionBatches   = 50
+	// each its own transaction, so the writer slot is held for one batch at a
+	// time and a backlog (a ledger's first pass after an upgrade) is worked
+	// through over several passes rather than in one. A job holds at most 257
+	// destination rows, so a batch deletes at most 12,850 of them.
+	retentionBatchJobs = 50
+	retentionBatches   = 100
 )
 
 // retireJobDetail deletes the series, destinations and guest report of every

@@ -22,7 +22,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `placement` | no | `pack` (default) or `spread` |
 | `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
-| `job_detail_retention` | no | how long the ledger keeps a job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
+| `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
 | `metrics.listen` | with `metrics` | the control plane's Prometheus endpoint (`/metrics`); absent block, no endpoint. A literal loopback address (`127.0.0.1` or `[::1]`, not `localhost`) unless `metrics.allow_remote`; may not share a socket with any other listener in the file, however it is spelled. See [Metrics](../operating/metrics.md) |
 | `metrics.allow_remote` | no | admits a non-loopback `metrics.listen`; the endpoint has no authentication |
 | `metrics.pprof` | no | also serves Go's profiler under `/debug/pprof/`; refused on any `listen` that is not a literal loopback address, `allow_remote` or not, because a profile carries memory |
