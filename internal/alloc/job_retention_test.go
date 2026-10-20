@@ -103,6 +103,19 @@ func detailOf(t *testing.T, a *Allocator, leaseID string) (usage, series, destin
 	return usage, series, destinations, guest, job.DetailRetiredAt
 }
 
+// retire is one retention batch as the control plane runs it: the jobs past
+// before listed on a read, at most limit of them, then retired.
+func retire(t *testing.T, a *Allocator, before time.Time, limit int) (RetiredJobDetail, error) {
+	t.Helper()
+
+	ids, err := a.JobsWithRetirableDetail(t.Context(), before, limit)
+	if err != nil {
+		return RetiredJobDetail{}, err
+	}
+
+	return a.RetireJobDetail(t.Context(), ids)
+}
+
 // cutoff is the moment the retention tests retire detail recorded before.
 var cutoff = time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
 
@@ -121,7 +134,7 @@ func TestJobDetailPastTheRetentionGoesAndItsSummaryStays(t *testing.T) {
 	recent := detailedJob(t, a, detail{usageAt: cutoff.Add(time.Hour), guestAt: cutoff.Add(time.Hour),
 		finished: true})
 
-	first, err := a.RetireJobDetail(t.Context(), cutoff, 1)
+	first, err := retire(t, a, cutoff, 1)
 	if err != nil {
 		t.Fatalf("RetireJobDetail: %v", err)
 	}
@@ -133,7 +146,7 @@ func TestJobDetailPastTheRetentionGoesAndItsSummaryStays(t *testing.T) {
 		t.Errorf("a batch of one took the newer of two old jobs (series kept %t, retired %q)", series, retired)
 	}
 
-	second, err := a.RetireJobDetail(t.Context(), cutoff, 10)
+	second, err := retire(t, a, cutoff, 10)
 	if err != nil {
 		t.Fatalf("RetireJobDetail: %v", err)
 	}
@@ -154,7 +167,7 @@ func TestJobDetailPastTheRetentionGoesAndItsSummaryStays(t *testing.T) {
 			"want all of it, unmarked", usage, series, destinations, guest, retired)
 	}
 
-	third, err := a.RetireJobDetail(t.Context(), cutoff, 10)
+	third, err := retire(t, a, cutoff, 10)
 	if err != nil || third != (RetiredJobDetail{}) {
 		t.Errorf("a batch with nothing older retired %+v (%v), want nothing", third, err)
 	}
@@ -177,7 +190,7 @@ func TestAJobIsRetiredWholeAndOnlyOnceItIsDone(t *testing.T) {
 	apartB := detailedJob(t, a, detail{usageAt: cutoff.Add(-29 * time.Hour), guestAt: cutoff.Add(-19 * time.Hour),
 		finished: true})
 
-	got, err := a.RetireJobDetail(t.Context(), cutoff, 2)
+	got, err := retire(t, a, cutoff, 2)
 	if err != nil {
 		t.Fatalf("RetireJobDetail: %v", err)
 	}
@@ -190,7 +203,7 @@ func TestAJobIsRetiredWholeAndOnlyOnceItIsDone(t *testing.T) {
 		}
 	}
 
-	rest, err := a.RetireJobDetail(t.Context(), cutoff, 10)
+	rest, err := retire(t, a, cutoff, 10)
 	if err != nil || rest.Jobs != 0 {
 		t.Errorf("the next batch retired %+v (%v); an unfinished job and one with a newer guest report wait", rest, err)
 	}
@@ -200,7 +213,7 @@ func TestAJobIsRetiredWholeAndOnlyOnceItIsDone(t *testing.T) {
 		}
 	}
 
-	later, err := a.RetireJobDetail(t.Context(), cutoff.Add(2*time.Hour), 10)
+	later, err := retire(t, a, cutoff.Add(2*time.Hour), 10)
 	if err != nil || later.Jobs != 1 || later.GuestReports != 1 {
 		t.Errorf("past the newer guest report retired %+v (%v), want that job whole", later, err)
 	}
@@ -222,11 +235,40 @@ func TestAJobWithNoDetailIsNotMarkedRetired(t *testing.T) {
 	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	got, err := a.RetireJobDetail(t.Context(), now.Add(time.Hour), 10)
+	got, err := retire(t, a, now.Add(time.Hour), 10)
 	if err != nil || got.Jobs != 0 {
 		t.Fatalf("retired %+v (%v) of a job with a usage summary and nothing else", got, err)
 	}
 	if _, _, _, _, retired := detailOf(t, a, lease.ID); retired != "" {
 		t.Errorf("a job with no detail is marked retired %q", retired)
+	}
+}
+
+// A WRITE BATCH STAMPS ONLY WHAT IS STILL RETIRABLE: a job it is handed that is
+// unfinished, or already retired, is left as it is, since the list was read
+// before the batch's transaction.
+func TestARetirementBatchChecksWhatItIsHanded(t *testing.T) {
+	now := time.Now().UTC()
+	a := retentionFleet(t, &now)
+
+	running := detailedJob(t, a, detail{usageAt: cutoff.Add(-48 * time.Hour)})
+	done := detailedJob(t, a, detail{usageAt: cutoff.Add(-48 * time.Hour), finished: true})
+
+	got, err := a.RetireJobDetail(t.Context(), []string{running.ID, done.ID})
+	if err != nil || got.Jobs != 1 {
+		t.Fatalf("handed an unfinished and a finished job, retired %+v (%v); want the finished one", got, err)
+	}
+	if _, series, _, _, retired := detailOf(t, a, running.ID); !series || retired != "" {
+		t.Errorf("the unfinished job lost its series (%t) or was marked %q", !series, retired)
+	}
+	_, _, _, _, first := detailOf(t, a, done.ID)
+
+	now = now.Add(time.Hour)
+	again, err := a.RetireJobDetail(t.Context(), []string{done.ID})
+	if err != nil || again.Jobs != 0 {
+		t.Errorf("handed a retired job again, retired %+v (%v); want nothing", again, err)
+	}
+	if _, _, _, _, retired := detailOf(t, a, done.ID); retired != first {
+		t.Errorf("a retired job's stamp moved from %q to %q", first, retired)
 	}
 }

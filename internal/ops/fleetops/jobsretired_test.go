@@ -31,6 +31,13 @@ func retireEveryJob(t *testing.T, stateDir, lease string) {
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
+	retireWith(t, a, lease)
+}
+
+// retireWith finishes lease and deletes the detail of every job a can reach.
+func retireWith(t *testing.T, a *alloc.Allocator, lease string) {
+	t.Helper()
+
 	held, err := a.Lease(t.Context(), lease)
 	if err != nil {
 		t.Fatalf("Lease: %v", err)
@@ -38,7 +45,11 @@ func retireEveryJob(t *testing.T, stateDir, lease string) {
 	if err := a.Release(t.Context(), held.ID, held.Epoch, alloc.PhaseDone); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	got, err := a.RetireJobDetail(t.Context(), time.Now().Add(time.Hour), 100)
+	ids, err := a.JobsWithRetirableDetail(t.Context(), time.Now().Add(time.Hour), 100)
+	if err != nil {
+		t.Fatalf("JobsWithRetirableDetail: %v", err)
+	}
+	got, err := a.RetireJobDetail(t.Context(), ids)
 	if err != nil || got.Jobs != 1 {
 		t.Fatalf("RetireJobDetail retired %+v (%v), want the one job", got, err)
 	}
@@ -103,5 +114,35 @@ func TestARetiredJobSaysItsDetailWasRetired(t *testing.T) {
 	})
 	if strings.Count(page, "past server.job_detail_retention") < 2 {
 		t.Errorf("the page does not say the job's detail and its destinations were retired")
+	}
+}
+
+// A RETIREMENT THAT COMMITS WHILE A REPORT IS READ IS IN THE REPORT. The first
+// build read the job unretired; the detail is retired before the marker is read
+// again, and what is printed is the rebuilt report, which says so, rather than
+// the first, which would show the detail as kept or missing without a reason.
+// Not parallel: it sets the package's afterJobShown.
+func TestARetirementDuringAReportIsInTheReport(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeJobsConfig(t, stateDir)
+	fakeJobsGitHub(t, noJobs)
+	usage := &alloc.JobUsage{Source: alloc.UsageSourceHost, Unmeasured: []string{alloc.UsageEnergy},
+		Samples: 60, IntervalMillis: 1000, WindowMillis: 60_000}
+	lease := seedJob(t, stateDir, jobSeed{requestID: 78, job: &forgedJob, usage: usage,
+		series: &alloc.UsageSeries{Codec: alloc.UsageSeriesCodec, Data: []byte{0, 1, 2}}})
+
+	afterJobShown = func(a *alloc.Allocator) {
+		afterJobShown = nil
+		retireWith(t, a, lease)
+	}
+	t.Cleanup(func() { afterJobShown = nil })
+
+	text := capture(t, func() {
+		if err := Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {
+			t.Errorf("billet jobs show: %v", err)
+		}
+	})
+	if !strings.Contains(text, "detail     retired ") {
+		t.Errorf("a report read across a retirement does not say the detail was retired:\n%s", text)
 	}
 }

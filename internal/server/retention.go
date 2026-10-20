@@ -11,11 +11,11 @@ const (
 	// retentionEvery is how often the control plane deletes job detail past its
 	// retention.
 	retentionEvery = 10 * time.Minute
-	// A pass deletes at most retentionBatches batches of retentionBatchJobs jobs,
-	// each its own transaction, so the writer slot is held for one batch at a
-	// time and a backlog (a ledger's first pass after an upgrade) is worked
-	// through over several passes rather than in one. A job holds at most 257
-	// destination rows, so a batch deletes at most 12,850 of them.
+	// A pass lists at most retentionBatches batches of retentionBatchJobs jobs
+	// and deletes them a batch to a transaction, so the writer slot is held for
+	// one batch at a time and a backlog (a ledger's first pass after an
+	// upgrade) is worked through over several passes rather than in one. A job
+	// holds at most 257 destination rows, so a batch deletes at most 12,850.
 	retentionBatchJobs = 50
 	retentionBatches   = 100
 )
@@ -46,21 +46,26 @@ func (s *Server) retireJobDetailOnce(ctx context.Context, now time.Time) {
 	}
 	before := now.Add(-retention)
 
+	// ONE READ A PASS lists what is past the retention, and the writes then take
+	// it a batch at a time, so the reading never holds the writer slot.
+	ids, err := s.alloc.JobsWithRetirableDetail(ctx, before, retentionBatchJobs*retentionBatches)
+	if err != nil {
+		s.log.Warn("could not list job detail past its retention; trying again", "error", err)
+		return
+	}
+
 	var jobs, series, destinations, guest int
-	for range retentionBatches {
+	for start := 0; start < len(ids); start += retentionBatchJobs {
 		if ctx.Err() != nil {
 			return
 		}
-		batch, err := s.alloc.RetireJobDetail(ctx, before, retentionBatchJobs)
+		batch, err := s.alloc.RetireJobDetail(ctx, ids[start:min(start+retentionBatchJobs, len(ids))])
 		if err != nil {
 			s.log.Warn("could not delete job detail past its retention; trying again", "error", err)
 			break
 		}
 		jobs, series, destinations, guest = jobs+batch.Jobs, series+batch.Series,
 			destinations+batch.Destinations, guest+batch.GuestReports
-		if batch.Jobs < retentionBatchJobs {
-			break
-		}
 	}
 	if jobs > 0 {
 		s.log.Info("deleted job detail past its retention", "jobs", jobs, "series", series,

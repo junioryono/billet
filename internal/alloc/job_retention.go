@@ -12,34 +12,60 @@ import (
 
 // RetiredJobDetail is what one batch of RetireJobDetail deleted.
 type RetiredJobDetail struct {
-	// Jobs is how many jobs the batch marked retired; fewer than the batch's
-	// limit means none older is left.
+	// Jobs is how many of the jobs it was handed the batch marked retired.
 	Jobs         int
 	Series       int
 	Destinations int
 	GuestReports int
 }
 
-// RetireJobDetail deletes the series, destinations and guest report of at most
-// limit jobs whose detail was recorded before before, oldest first, and marks
-// each job's history row retired, in one transaction. A job's usage summary is
-// kept.
+// JobsWithRetirableDetail lists at most limit finished, unretired jobs all of
+// whose series, destinations and guest report were recorded before before,
+// oldest first. It is a read: listing them reads every unretired job's detail,
+// and that work stays outside the writer's transaction.
 //
 // BY recorded_at, which usage and guest reports write as RFC 3339 with its
 // trailing zeros trimmed: compared as text, two times in different seconds
 // order correctly, which is the resolution a retention of hours needs.
-func (a *Allocator) RetireJobDetail(ctx context.Context, before time.Time, limit int) (RetiredJobDetail, error) {
+func (a *Allocator) JobsWithRetirableDetail(ctx context.Context, before time.Time, limit int) ([]string, error) {
+	var out []string
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListRetirableJobDetail(ctx, ledgerdb.ListRetirableJobDetailParams{
+			Before: before.UTC().Format(time.RFC3339Nano), MaxRows: int64(limit),
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: list jobs whose detail is past its retention: %w", err)
+		}
+		out = rows
+
+		return nil
+	})
+
+	return out, err
+}
+
+// RetireJobDetail deletes the series, destinations and guest report of the
+// jobs leaseIDs names that are still unretired and finished, and marks each
+// one's history row retired, in one transaction. A job's usage summary is
+// kept, its destinations verdict cleared with its destinations.
+func (a *Allocator) RetireJobDetail(ctx context.Context, leaseIDs []string) (RetiredJobDetail, error) {
 	var out RetiredJobDetail
+	if len(leaseIDs) == 0 {
+		return out, nil
+	}
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		q := state.WriteQueries(tx)
 		stamp := ts(a.now())
 
-		jobs, err := q.MarkJobDetailRetired(ctx, ledgerdb.MarkJobDetailRetiredParams{
-			Stamp: stamp, Before: before.UTC().Format(time.RFC3339Nano), MaxRows: int64(limit),
-		})
-		if err != nil {
-			return fmt.Errorf("alloc: mark job detail retired: %w", err)
+		jobs := 0
+		for _, id := range leaseIDs {
+			marked, err := q.MarkJobDetailRetired(ctx, ledgerdb.MarkJobDetailRetiredParams{Stamp: stamp, LeaseID: id})
+			if err != nil {
+				return fmt.Errorf("alloc: mark the detail of lease %s retired: %w", id, err)
+			}
+			jobs += int(marked)
 		}
 		if jobs == 0 {
 			return nil
@@ -59,7 +85,7 @@ func (a *Allocator) RetireJobDetail(ctx context.Context, before time.Time, limit
 		if err != nil {
 			return fmt.Errorf("alloc: delete retired guest reports: %w", err)
 		}
-		out = RetiredJobDetail{Jobs: int(jobs), Series: int(series), Destinations: int(destinations),
+		out = RetiredJobDetail{Jobs: jobs, Series: int(series), Destinations: int(destinations),
 			GuestReports: int(guest)}
 
 		return nil

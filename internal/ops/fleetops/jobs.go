@@ -1,6 +1,7 @@
 package fleetops
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -71,50 +72,91 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	}
 	defer closeDB()
 
-	rec, err := a.Job(ctx, leaseID)
+	// A RETIREMENT THAT COMMITS WHILE THE REPORT IS READ takes the detail and
+	// writes its marker in one transaction, and the reads below are separate,
+	// so the report is built first and the marker read again after: if it was
+	// written meanwhile, the report is built once more, now with the marker,
+	// which is never unset. A report is therefore never missing detail it does
+	// not say was retired.
+	show := func(out io.Writer) (string, error) {
+		return showJob(ctx, out, a, *cfgPath, leaseID, *asJSON, *asHTML, w)
+	}
+	var out bytes.Buffer
+	retired, err := show(&out)
 	if err != nil {
 		return err
+	}
+	if afterJobShown != nil {
+		afterJobShown(a)
+	}
+	if retired == "" {
+		again, err := a.Job(ctx, leaseID)
+		if err != nil {
+			return err
+		}
+		if again.DetailRetiredAt != "" {
+			out.Reset()
+			if _, err := show(&out); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := env.Stdout.Write(out.Bytes()); err != nil {
+		return fmt.Errorf("write the job record: %w", err)
+	}
+
+	return nil
+}
+
+// afterJobShown runs between a report's first build and the read of its
+// retirement marker, with the command's allocator; nil outside a test that
+// commits a retirement there.
+var afterJobShown func(a *alloc.Allocator)
+
+// showJob writes one job's report to out in the form asked for, and says the
+// retirement marker it was built with.
+func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, leaseID string,
+	asJSON, asHTML bool, w *window,
+) (string, error) {
+	rec, err := a.Job(ctx, leaseID)
+	if err != nil {
+		return "", err
 	}
 	var measured *alloc.RecordedUsage
 	switch u, err := a.LeaseUsage(ctx, leaseID); {
 	case err == nil:
 		measured = &u
 	case !errors.Is(err, alloc.ErrLeaseNotFound):
-		return err
+		return "", err
 	}
 
 	guest := readJobGuest(ctx, a, leaseID)
-	// A RETIREMENT THAT COMMITTED BETWEEN THESE READS took the detail and wrote
-	// its marker in one transaction, and the history row was read first, so
-	// it is read again: missing detail is then said to be retired, never
-	// unmeasured.
-	rec = withRetirement(ctx, a, rec)
 
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
-	if *asJSON {
+	if asJSON {
 		tl, unaligned := jobTimeline(ctx, a, rec, measured)
 		var wj *windowJSON
 		if w != nil {
 			wj = windowJSONOf(tl, unaligned, *w)
 		}
 
-		return renderJobJSON(env.Stdout, rec, measured, tl, unaligned, guest, wj)
+		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest, wj)
 	}
-	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
-	if *asHTML {
-		return renderJobPage(env.Stdout, buildJobPage(ctx, a, rec, measured, steps, guest))
+	steps := readJobSteps(ctx, cfgPath, a, rec, measured)
+	if asHTML {
+		return rec.DetailRetiredAt, renderJobPage(out, buildJobPage(ctx, a, rec, measured, steps, guest))
 	}
 	// THE SERIES THE STEPS WERE PLACED ON, read here when no step was asked about.
 	tl, unaligned := steps.timeline, steps.unaligned
 	if steps.none != "" {
 		tl, unaligned = jobTimeline(ctx, a, rec, measured)
 	}
-	renderJob(env.Stdout, rec, measured)
-	renderSeries(env.Stdout, tl, unaligned, measured)
-	renderSteps(env.Stdout, steps)
-	renderGuest(env.Stdout, retiredGuest(guestViewOf(guest, measured, steps), guest, rec))
+	renderJob(out, rec, measured)
+	renderSeries(out, tl, unaligned, measured)
+	renderSteps(out, steps)
+	renderGuest(out, retiredGuest(guestViewOf(guest, measured, steps), guest, rec))
 
-	return nil
+	return rec.DetailRetiredAt, nil
 }
 
 // jobJSON is `billet jobs show --json`: the record renderJob prints, for a
@@ -271,19 +313,6 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		return
 	}
 	renderDestinations(w, u.Destinations)
-}
-
-// withRetirement is rec with its retirement marker read again, for a retirement
-// that committed after rec was read.
-func withRetirement(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord) alloc.JobRecord {
-	if rec.DetailRetiredAt != "" {
-		return rec
-	}
-	if again, err := a.Job(ctx, rec.LeaseID); err == nil {
-		rec.DetailRetiredAt = again.DetailRetiredAt
-	}
-
-	return rec
 }
 
 // detailRetired says that a job's per-sample series, destinations and guest

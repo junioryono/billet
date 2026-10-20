@@ -83,9 +83,6 @@ func jobTimeline(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord, m
 		return nil, "no usage report was recorded"
 	}
 	series, err := a.LeaseUsageSeries(ctx, rec.LeaseID)
-	if errors.Is(err, alloc.ErrLeaseNotFound) {
-		rec = withRetirement(ctx, a, rec)
-	}
 	switch {
 	case errors.Is(err, alloc.ErrLeaseNotFound) && rec.DetailRetiredAt != "":
 		return nil, detailRetired(rec)

@@ -66,33 +66,28 @@ func (q *Queries) ForgetRetiredJobDestinationTotals(ctx context.Context, stamp s
 	return err
 }
 
-const markJobDetailRetired = `-- name: MarkJobDetailRetired :execrows
+const listRetirableJobDetail = `-- name: ListRetirableJobDetail :many
 
-UPDATE job_history
-   SET detail_retired_at = CAST($1 AS TEXT)
- WHERE detail_retired_at = ''
-   AND lease_id IN (
-       SELECT c.lease_id
-         FROM (
-             SELECT s.lease_id AS lease_id, u.recorded_at AS at
-               FROM job_series s JOIN job_usage u ON u.lease_id = s.lease_id
-             UNION ALL
-             SELECT u.lease_id AS lease_id, u.recorded_at AS at
-               FROM job_usage u WHERE u.destinations_incomplete IS NOT NULL
-             UNION ALL
-             SELECT g.lease_id AS lease_id, g.recorded_at AS at
-               FROM job_guest_reports g
-         ) AS c
-         JOIN job_history h ON h.lease_id = c.lease_id
-        WHERE h.detail_retired_at = '' AND COALESCE(h.finished_at, '') != ''
-        GROUP BY c.lease_id
-       HAVING MAX(c.at) < CAST($2 AS TEXT)
-        ORDER BY MAX(c.at), c.lease_id
-        LIMIT CAST($3 AS BIGINT))
+SELECT c.lease_id
+  FROM (
+      SELECT s.lease_id AS lease_id, u.recorded_at AS at
+        FROM job_series s JOIN job_usage u ON u.lease_id = s.lease_id
+      UNION ALL
+      SELECT u.lease_id AS lease_id, u.recorded_at AS at
+        FROM job_usage u WHERE u.destinations_incomplete IS NOT NULL
+      UNION ALL
+      SELECT g.lease_id AS lease_id, g.recorded_at AS at
+        FROM job_guest_reports g
+  ) AS c
+  JOIN job_history h ON h.lease_id = c.lease_id
+ WHERE h.detail_retired_at = '' AND COALESCE(h.finished_at, '') != ''
+ GROUP BY c.lease_id
+HAVING MAX(c.at) < CAST($1 AS TEXT)
+ ORDER BY MAX(c.at), c.lease_id
+ LIMIT CAST($2 AS BIGINT)
 `
 
-type MarkJobDetailRetiredParams struct {
-	Stamp   string
+type ListRetirableJobDetailParams struct {
 	Before  string
 	MaxRows int64
 }
@@ -100,29 +95,68 @@ type MarkJobDetailRetiredParams struct {
 // Job detail retention: a job's series, destinations and guest report are kept
 // for a bounded time and then deleted, its usage summary kept (migration 63).
 //
-// ONE BATCH IS ONE TRANSACTION OF FOUR STATEMENTS: the jobs are stamped first,
-// with a stamp unique to the batch, and the three deletes then take exactly the
-// stamped jobs' rows, so a batch never deletes detail it did not mark retired
-// and never marks a job whose detail it did not delete.
-// Stamp at most max_rows finished jobs all of whose detail was recorded before
-// a moment, oldest first: a series or destinations, by when the job's usage
-// was recorded (they are written in its transaction), and a guest report, by
-// its own time.
+// FOUND ON A READ, RETIRED IN A WRITE. The candidates are listed outside any
+// write transaction, since listing them reads every unretired job's detail;
+// a write batch then stamps the jobs it was handed by their key, each still
+// unretired and finished, and the deletes take exactly the stamped jobs'
+// rows, so a batch never deletes detail it did not mark retired and never
+// marks a job whose detail it did not delete, and the writer slot is held for
+// key lookups and indexed deletes only.
+// At most max_rows finished, unretired jobs all of whose detail was recorded
+// before a moment, oldest first: a series or destinations, by when the job's
+// usage was recorded (they are written in its transaction), and a guest
+// report, by its own time.
 //
 // DISCOVERED FROM WHAT IS LEFT TO RETIRE, never from the history: job_series
 // and job_guest_reports hold only unretired detail, and the usage rows that
 // still claim destinations are the partial index migration 63 adds, which a
-// retirement empties. So a batch's work is the unretired detail, which the
+// retirement empties. So the read's work is the unretired detail, which the
 // retention bounds, and not every job the deployment ever ran.
 //
 // ONE CANDIDATE A JOB, grouped by lease, so a job whose usage and guest report
-// arrived at different times does not take two places in the limit, and a
-// short batch means none is left. ONLY A FINISHED JOB, whose lease takes no
-// more reports, so no detail arrives after its retirement. A job with no
-// history row is never a candidate, since it could never be stamped and would
-// take a place in every batch; and a stamp, once written, is kept.
+// arrived at different times does not take two places in the limit. ONLY A
+// FINISHED JOB, whose lease takes no more reports, so no detail arrives after
+// its retirement. A job with no history row is never a candidate, since it
+// could never be stamped.
+func (q *Queries) ListRetirableJobDetail(ctx context.Context, arg ListRetirableJobDetailParams) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listRetirableJobDetail, arg.Before, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var lease_id string
+		if err := rows.Scan(&lease_id); err != nil {
+			return nil, err
+		}
+		items = append(items, lease_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markJobDetailRetired = `-- name: MarkJobDetailRetired :execrows
+UPDATE job_history
+   SET detail_retired_at = CAST($1 AS TEXT)
+ WHERE lease_id = $2 AND detail_retired_at = '' AND COALESCE(finished_at, '') != ''
+`
+
+type MarkJobDetailRetiredParams struct {
+	Stamp   string
+	LeaseID string
+}
+
+// Stamp one job a read listed, if it is still unretired and finished: its
+// detail cannot have changed since, because a finished job's lease takes no
+// report, and a stamp, once written, is kept.
 func (q *Queries) MarkJobDetailRetired(ctx context.Context, arg MarkJobDetailRetiredParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, markJobDetailRetired, arg.Stamp, arg.Before, arg.MaxRows)
+	result, err := q.db.ExecContext(ctx, markJobDetailRetired, arg.Stamp, arg.LeaseID)
 	if err != nil {
 		return 0, err
 	}
