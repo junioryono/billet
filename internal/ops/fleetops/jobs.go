@@ -81,25 +81,29 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	show := func(out io.Writer) (string, error) {
 		return showJob(ctx, out, a, *cfgPath, leaseID, *asJSON, *asHTML, w)
 	}
+	// A BUILD THAT FAILED is rebuilt too when the job is now retired: on
+	// PostgreSQL a usage summary and its destinations are two reads at read
+	// committed, and a retirement between them reads as a summary claiming rows
+	// it has not, which a rebuild over the retired job does not.
 	var out bytes.Buffer
 	retired, err := show(&out)
-	if err != nil {
-		return err
-	}
 	if afterJobShown != nil {
 		afterJobShown(a)
 	}
 	if retired == "" {
-		again, err := a.Job(ctx, leaseID)
-		if err != nil {
+		again, readErr := a.Job(ctx, leaseID)
+		switch {
+		case readErr != nil && err != nil:
 			return err
-		}
-		if again.DetailRetiredAt != "" {
+		case readErr != nil:
+			return readErr
+		case again.DetailRetiredAt != "":
 			out.Reset()
-			if _, err := show(&out); err != nil {
-				return err
-			}
+			_, err = show(&out)
 		}
+	}
+	if err != nil {
+		return err
 	}
 	if _, err := env.Stdout.Write(out.Bytes()); err != nil {
 		return fmt.Errorf("write the job record: %w", err)
