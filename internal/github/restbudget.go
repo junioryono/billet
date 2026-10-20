@@ -10,12 +10,13 @@ import (
 // RESTBudget is an installation's hourly REST budget as GitHub stated it in the
 // last answer to a request made with the installation's token.
 //
-// Every REST call billet makes for one installation draws on it: the
-// runner-group checks, the offline-runner inspection, the cache authority's run
-// and branch reads, and the queue-time sweep. GitHub gives an installation
-// 5,000 requests an hour, 50 more for each repository and each organization
-// user past 20, at most 12,500 (15,000 on Enterprise Cloud), per its REST
-// rate-limit reference as read on 2026-10-18 (#583).
+// Every request made with the installation's token draws on it, whoever makes
+// it: among billet's own, this client's runner-group checks, offline-runner
+// inspection, cache-authority reads and queue-time sweep, the scale-set
+// client's registration-token requests, and the CLI's reads. GitHub gives an
+// installation 5,000 requests an hour, 50 more for each repository and each
+// organization user past 20, at most 12,500 (15,000 on Enterprise Cloud), per
+// its REST rate-limit reference as read on 2026-10-18 (#583).
 type RESTBudget struct {
 	Limit     int64
 	Remaining int64
@@ -56,10 +57,14 @@ type restAccount struct {
 // observer of the request. An answer missing a header, or carrying one that
 // does not read as a count, leaves the last stated budget as it was: could
 // not tell is not zero.
+//
+// A 401 IS NOT THE INSTALLATION'S ANSWER: GitHub did not take the token, so any
+// budget it stated would be another bucket's. Measured on 2026-10-20, a 401 to
+// an invalid token carried no X-RateLimit values at all.
 func (r *restAccount) answered(operation string, status int, header http.Header, now time.Time) {
 	r.mu.Lock()
 	observer := r.observer
-	if budget, ok := budgetOf(header, now); ok {
+	if budget, ok := budgetOf(header, now); ok && status != http.StatusUnauthorized {
 		r.budget, r.stated = budget, true
 	}
 	r.mu.Unlock()

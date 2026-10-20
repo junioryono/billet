@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -605,6 +606,25 @@ func TestAnInstallationDownToItsReserveIsNotRead(t *testing.T) {
 	if got := len(reader.asked()); got != 2*queueTimeRunsPerInstallation {
 		t.Errorf("an installation whose hour has ended read %d runs in all, want %d more", got,
 			queueTimeRunsPerInstallation)
+	}
+
+	// Targets of one installation each keep the statement their own requests
+	// drew, and one in reserve holds the installation for all of them.
+	low := &budgetedReader{queueTimeReader: reader.queueTimeReader, remaining: 500, limit: 5000,
+		reset: now.Add(time.Hour), stated: true}
+	ample := &budgetedReader{queueTimeReader: reader.queueTimeReader, remaining: 4000, limit: 5000,
+		reset: now.Add(time.Hour), stated: true}
+	before := len(reader.asked())
+	var shared []queueTimeWork
+	for i, h := range []*budgetedReader{ample, low, ample} {
+		shared = append(shared, queueTimeWork{
+			run:          queueTimeRun{target: "acme-" + strconv.Itoa(i), repository: "acme/api", run: int64(980 + i)},
+			installation: "installation 22", reader: h, headroom: h,
+		})
+	}
+	s.readQueueTimeWork(t.Context(), shared, newQueueTimeSweep(), now)
+	if got := len(reader.asked()) - before; got != 0 {
+		t.Errorf("an installation one of whose targets saw it in reserve read %d runs through the others", got)
 	}
 
 	// A budget no answer has stated holds nothing back.

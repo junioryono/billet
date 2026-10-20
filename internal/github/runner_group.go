@@ -108,6 +108,9 @@ const maxPolicyResponse = 1 << 20
 // token exchange the caller abandoned. Undecided reads it as could-not-tell.
 var errNoAnswer = errors.New("github: GitHub did not answer in full")
 
+// errNotSent marks a request that could not be built, which drew on no budget.
+var errNotSent = errors.New("github: the request was not sent")
+
 // NewRunnerGroupPolicyClientAt builds the policy client for one target on the
 // REST API at base, on an HTTP client of its own.
 //
@@ -169,8 +172,10 @@ func policyDialer(b policyBounds) *net.Dialer {
 }
 
 // exchange sends one request under the per-request bound and returns the
-// status and the whole body. A transport failure comes back as the client's
-// *url.Error and a body not read whole as errNoAnswer, both undecided.
+// status, the headers and the whole body. A transport failure comes back as the
+// client's *url.Error, with no status, and a body not read whole as errNoAnswer,
+// both undecided; the status and headers of an answer whose body broke off are
+// still returned, because they state the budget the request drew on.
 func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint, bearer string,
 ) (int, http.Header, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.request)
@@ -178,7 +183,7 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, http.NoBody)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("build request: %w", err)
+		return 0, nil, nil, fmt.Errorf("%w: build request: %w", errNotSent, err)
 	}
 
 	setAPIHeaders(req)
@@ -194,12 +199,13 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 	if err != nil {
 		// A TRAILER THE CLIENT COULD NOT PARSE is quoted in its error, so the
 		// bearer is replaced here as in a transport error.
-		return 0, nil, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer,
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer,
 			withoutBearerText(err, bearer))
 	}
 
 	if len(body) > maxPolicyResponse {
-		return 0, nil, nil, fmt.Errorf("%w: the response exceeds %d bytes", errNoAnswer, maxPolicyResponse)
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf("%w: the response exceeds %d bytes", errNoAnswer,
+			maxPolicyResponse)
 	}
 
 	return resp.StatusCode, resp.Header, body, nil
@@ -210,7 +216,9 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, operation string,
 ) ([]byte, error) {
 	status, header, body, err := c.exchange(ctx, http.MethodGet, endpoint, token)
-	c.rest.answered(operation, status, header, time.Now())
+	if !errors.Is(err, errNotSent) {
+		c.rest.answered(operation, status, header, time.Now())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("github: %s: %w", operation, err)
 	}

@@ -3,7 +3,9 @@ package github
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,9 +25,9 @@ func (o *recordingObserver) GitHubRESTRequest(operation string, status int) {
 }
 
 // THE BUDGET IS WHAT THE LAST ANSWER WITH THE INSTALLATION'S TOKEN STATED, and
-// every such request is told to the observer, refused or not. The token
-// exchange is answered from the App's own budget, so its headers state nothing
-// about the installation's and it is not one of the installation's requests.
+// every such request is told to the observer, refused or not. A 401 is told and
+// states nothing: GitHub did not take the token, so a budget it carried would be
+// another bucket's.
 func TestTheBudgetIsWhatTheLastInstallationAnswerStated(t *testing.T) {
 	t.Parallel()
 
@@ -37,6 +39,7 @@ func TestTheBudgetIsWhatTheLastInstallationAnswerStated(t *testing.T) {
 		{http.StatusOK, "5000", "4990", "10"},
 		{http.StatusOK, "", "", ""},
 		{http.StatusForbidden, "5000", "0", "5000"},
+		{http.StatusUnauthorized, "60", "59", "1"},
 		{http.StatusOK, "5000", "many", "4"},
 	}
 	var at int
@@ -64,6 +67,7 @@ func TestTheBudgetIsWhatTheLastInstallationAnswerStated(t *testing.T) {
 		{Limit: 5000, Remaining: 4990, Used: 10, Reset: reset},
 		{Limit: 5000, Remaining: 0, Used: 5000, Reset: reset},
 		{Limit: 5000, Remaining: 0, Used: 5000, Reset: reset},
+		{Limit: 5000, Remaining: 0, Used: 5000, Reset: reset},
 	}
 	for i, w := range want {
 		if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); (err != nil) != (answers[i].status != http.StatusOK) {
@@ -85,10 +89,51 @@ func TestTheBudgetIsWhatTheLastInstallationAnswerStated(t *testing.T) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	wantRequests := []string{
-		"list the run's jobs 200", "list the run's jobs 200", "list the run's jobs 403", "list the run's jobs 200",
+		"list the run's jobs 200", "list the run's jobs 200", "list the run's jobs 403", "list the run's jobs 401",
+		"list the run's jobs 200",
 	}
 	if fmt.Sprint(o.requests) != fmt.Sprint(wantRequests) {
 		t.Errorf("observed %q, want %q", o.requests, wantRequests)
+	}
+}
+
+// THE TOKEN EXCHANGE IS ANSWERED FROM THE APP'S OWN BUDGET, so what its answer
+// states is not the installation's budget, and it is not one of the
+// installation's requests.
+func TestTheTokenExchangeIsNotTheInstallationsAccount(t *testing.T) {
+	t.Parallel()
+
+	key, _ := testKeyPKCS1(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /app/installations/22/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Ratelimit-Limit", "15000")
+		w.Header().Set("X-Ratelimit-Remaining", "14999")
+		w.Header().Set("X-Ratelimit-Used", "1")
+		w.Header().Set("X-Ratelimit-Reset", "1792461600")
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"token":"installation-secret","expires_at":%q}`,
+			time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	})
+	mux.HandleFunc("GET /repos/acme/api/actions/runs/31/jobs", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"total_count":0,"jobs":[]}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
+	o := &recordingObserver{}
+	c.ObserveREST(o)
+
+	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err != nil {
+		t.Fatalf("RunQueueTimes: %v", err)
+	}
+	if got, ok := c.RESTBudget(); ok {
+		t.Errorf("the token exchange's answer stated the installation's budget as %+v", got)
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if fmt.Sprint(o.requests) != "[list the run's jobs 200]" {
+		t.Errorf("observed %q, want only the installation's one request", o.requests)
 	}
 }
 
@@ -124,6 +169,37 @@ func TestARequestWithNoAnswerIsToldAsNone(t *testing.T) {
 	defer o.mu.Unlock()
 	if fmt.Sprint(o.requests) != "[list the run's jobs 0]" {
 		t.Errorf("observed %q, want the one request with no answer", o.requests)
+	}
+}
+
+// AN ANSWER WHOSE BODY IS NOT READ WHOLE STILL STATES THE BUDGET its request
+// drew on, and is told by its status: the body failing is not the answer
+// failing to come.
+func TestAnAnswerTooLargeToReadStillStatesTheBudget(t *testing.T) {
+	t.Parallel()
+
+	c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.Header().Set("X-Ratelimit-Limit", "5000")
+		w.Header().Set("X-Ratelimit-Remaining", "12")
+		w.Header().Set("X-Ratelimit-Used", "4988")
+		w.Header().Set("X-Ratelimit-Reset", "1792461600")
+		fmt.Fprint(w, `{"total_count":0,"jobs":[],"pad":"`+strings.Repeat("x", maxPolicyResponse)+`"}`)
+	})
+	o := &recordingObserver{}
+	c.ObserveREST(o)
+
+	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil {
+		t.Fatal("an answer past the bound read as one")
+	}
+	got, ok := c.RESTBudget()
+	if !ok || got.Remaining != 12 || got.Limit != 5000 {
+		t.Errorf("the budget after an answer too large to read = %+v (%t), want 12 of 5000", got, ok)
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if fmt.Sprint(o.requests) != "[list the run's jobs 200]" {
+		t.Errorf("observed %q, want the one request answered 200", o.requests)
 	}
 }
 

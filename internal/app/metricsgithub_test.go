@@ -70,7 +70,8 @@ func restClient(t *testing.T, installation int64, api string) *scaleset.Client {
 // GitHub's answer: through the assembled targets, the way the control plane
 // builds them. Targets of one installation are one series, the newest
 // statement's; an installation that has made no request has none; and the
-// sweep's headroom is the same budget.
+// headroom the sweep reads through a target is what that target's own client
+// last saw.
 func TestTheGitHubSourceServesEachInstallationsBudget(t *testing.T) {
 	t.Parallel()
 

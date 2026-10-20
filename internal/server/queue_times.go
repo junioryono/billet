@@ -69,11 +69,13 @@ const (
 	// read, and one it refuses waits queueTimeRefused.
 	queueTimeThrottled = 15 * time.Minute
 	queueTimeRefused   = time.Hour
-	// The sweep reads nothing through an installation whose budget, as GitHub
-	// last stated it, has less than one queueTimeReserve-th of its limit left
-	// before the next hour begins: the rest is the runner-group checks' and the
-	// cache authority's, which decide whether a runner starts and what a job may
-	// write, where a missing queue time decides nothing.
+	// The sweep starts no run's read through an installation whose budget, as
+	// any of its targets' clients last saw it, has less than one
+	// queueTimeReserve-th of its limit left before the next hour begins: the rest
+	// is the runner-group checks' and the cache authority's, which decide whether
+	// a runner starts and what a job may write, where a missing queue time
+	// decides nothing. A read already started finishes, at most eight pages
+	// against a reserve of at least a thousand requests.
 	queueTimeReserve = 5
 )
 
@@ -196,6 +198,15 @@ func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sw
 	now time.Time,
 ) {
 	read := map[string]int{}
+	// AN INSTALLATION IS HELD WHEN ANY OF ITS TARGETS' CLIENTS SAW IT IN
+	// RESERVE: each keeps the statement its own requests drew, and within an
+	// hour the lowest of them is the newest.
+	held := map[string]RESTHeadroom{}
+	for _, w := range work {
+		if _, _, _, low := inReserve(w.headroom, now); low {
+			held[w.installation] = w.headroom
+		}
+	}
 	for _, w := range work {
 		if ctx.Err() != nil {
 			return
@@ -203,8 +214,9 @@ func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sw
 		if read[w.installation] == queueTimeRunsPerInstallation || now.Before(sweep.paused[w.installation]) {
 			continue
 		}
-		if remaining, limit, reset, low := inReserve(w.headroom, now); low {
+		if headroom, low := held[w.installation]; low {
 			if !sweep.reserved[w.installation] {
+				remaining, limit, reset, _ := inReserve(headroom, now)
 				sweep.reserved[w.installation] = true
 				s.log.Warn("this App installation's REST budget is down to its reserve; reading queue times "+
 					"again when GitHub's next hour begins", "target", w.run.target, "installation", w.installation,
