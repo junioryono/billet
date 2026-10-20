@@ -288,6 +288,23 @@ func TestTheCompleterFailsEverythingWhenTheJobEnvironmentCannotBeWritten(t *test
 	}
 }
 
+// A FINISH THAT FAILS FAILS EVERY COMPONENT, those already installed included:
+// the image is not the one GitHub's template leaves until it is finished.
+func TestTheCompleterFailsEverythingWhenTheFinishFails(t *testing.T) {
+	t.Parallel()
+
+	fx := newCompleterFixture(t)
+	if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-clean"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := fx.run(t, true, "google-chrome", "firefox"); err != nil {
+		t.Fatalf("the completer exited %v:\n%s", err, output)
+	}
+	if got, want := fx.reportLines(t), []string{"failed=google-chrome", "failed=firefox"}; !slices.Equal(got, want) {
+		t.Fatalf("the report is %q, want %q", got, want)
+	}
+}
+
 // AN APT THAT CANNOT UPDATE ITS LISTS PREPARES NOTHING: every component is
 // reported failed and no installer runs, because the published image keeps no
 // lists to install from.

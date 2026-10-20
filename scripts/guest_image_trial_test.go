@@ -237,6 +237,26 @@ func TestUnmountUnderRefusesAMountTableItCannotRead(t *testing.T) {
 	if _, err := os.Stat(calls); !os.IsNotExist(err) {
 		t.Fatalf("unmount_under unmounted from a table it could not read (%v)", err)
 	}
+
+	// AND THE PROOF AFTERWARDS: a table read once and then not again proves nothing.
+	reads := filepath.Join(fx.dir, "reads")
+	writeExecutable(t, filepath.Join(fx.fakes, "findmnt"),
+		"#!/bin/sh\nif [ -e "+reads+" ]; then exit 1; fi\n: >"+reads+"\necho /w/trial/merged\n")
+	proof, err := runWithFakes(t, path, fx)
+	if err != nil || strings.Contains(proof, "CLEARED") || !strings.Contains(proof, "to prove nothing is mounted") {
+		t.Fatalf("a mount table unreadable for the proof answered %v:\n%s", err, proof)
+	}
+}
+
+// runWithFakes runs the script at path with the fixture's stand-ins first on PATH.
+func runWithFakes(t *testing.T, path string, fx trialFixture) (string, error) {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "bash", path)
+	cmd.Env = append(os.Environ(), "PATH="+fx.fakes+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+
+	return string(out), err
 }
 
 // A GENERATION PUBLISHED STRAIGHT FROM THE BUILD IS RECORDED BEFORE IT EXISTS: a
