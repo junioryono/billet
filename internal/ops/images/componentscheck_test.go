@@ -28,10 +28,14 @@ type fakeComponentsChecker struct {
 	generationsErr error
 	// contracts is each generation's guest contract; one not named speaks this
 	// billet's.
-	contracts map[string]string
+	contracts   map[string]string
+	contractErr error
 }
 
 func (f fakeComponentsChecker) GuestContract(_ context.Context, _, generation string) (string, bool, error) {
+	if f.contractErr != nil {
+		return "", false, f.contractErr
+	}
 	if contract, named := f.contracts[generation]; named {
 		return contract, contract != "", nil
 	}
@@ -273,7 +277,23 @@ func TestCheckSendsAnUnverifiedMatchingGenerationToVerification(t *testing.T) {
 		"speaks guest contract 999, which this billet does not") || strings.Contains(out, "billet images verify") {
 		t.Errorf("a newer generation under another contract was sent to this billet's verification:\n%s", out)
 	}
+
+	// NO RECORDED CONTRACT, OR NONE THAT COULD BE READ, IS NOT A VERIFICATION TO RUN.
+	store.contracts = map[string]string{newer: ""}
+	out = checkComponents(t, store, "images:\n  accept: [google-chrome]\n", "")
+	if !strings.Contains(out, "records no guest contract, so no billet resolves @verified to it") ||
+		strings.Contains(out, "billet images verify") {
+		t.Errorf("a newer generation with no contract was sent to verification:\n%s", out)
+	}
 	store.contracts = nil
+
+	store.contractErr = errors.New("rbd timed out")
+	out = checkComponents(t, store, "images:\n  accept: [google-chrome]\n", "")
+	if !strings.Contains(out, "could not tell which guest contract the newer generation "+newer) ||
+		!strings.Contains(out, "rbd timed out") || strings.Contains(out, "billet images verify") {
+		t.Errorf("an unreadable contract was not reported as unknown:\n%s", out)
+	}
+	store.contractErr = nil
 
 	// A NEWER GENERATION THAT ALSO LACKS IT leaves the refresh to complete one.
 	store.records[newer] = ceph.GenerationComponents{LeftOut: []string{"google-chrome"}, Installed: map[string]string{}}
