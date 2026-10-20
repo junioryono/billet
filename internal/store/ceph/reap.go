@@ -231,7 +231,7 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 		// what is still needed. A dead generation's key would have kept its kernel
 		// alive forever, which is the opposite of what reaping is for.
 		c.removeGenerationMetadata(ctx, name, gen.Name,
-			VerifiedKey, RunnerVersionKey, KernelKey, GuestContractKey)
+			VerifiedKey, RunnerVersionKey, KernelKey, GuestContractKey, ComponentsKey)
 
 		removed = append(removed, gen.Name)
 	}

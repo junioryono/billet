@@ -45,11 +45,31 @@ const MaxImageBytes = 1 << 40
 // snapshots OF one head image, so a pull that imported to a fresh image would
 // publish a generation of something else, which no tier could name and no clone
 // could descend from.
-func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap reports through the return value; a local set inside a defer is read after the return value has already been computed, which is the dead-code bug this shape replaced
+func (c *Client) ImportGeneration(
 	ctx context.Context,
 	image, rawPath, runnerVersion, kernel, guestContract string,
 	now time.Time,
+) (string, error) {
+	return c.ImportCompletedGeneration(ctx, image, rawPath, runnerVersion, kernel, guestContract,
+		nil, now)
+}
+
+// ImportCompletedGeneration is ImportGeneration for an image that left components
+// out: it records what it left out and what was installed (components) beside the
+// generation's other metadata, inside the same lock. A nil components is an image
+// that left nothing out, and records nothing.
+func (c *Client) ImportCompletedGeneration( //nolint:nonamedreturns // the deferred unmap reports through the return value; a local set inside a defer is read after the return value has already been computed, which is the dead-code bug this shape replaced
+	ctx context.Context,
+	image, rawPath, runnerVersion, kernel, guestContract string,
+	components *GenerationComponents,
+	now time.Time,
 ) (generation string, err error) {
+	if components != nil {
+		if err := components.validate(); err != nil {
+			return "", err
+		}
+	}
+
 	if err := checkCloneName(image); err != nil {
 		return "", err
 	}
@@ -192,7 +212,7 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 		image+"@"+generation); err != nil {
 		return "", fmt.Errorf("ceph: could not publish %s@%s: %w", image, generation, err)
 	}
-	attemptedMetadata := make([]string, 0, 3)
+	attemptedMetadata := make([]string, 0, 4)
 
 	// RECORDED PER GENERATION, because a tier boots a generation rather than the
 	// head. A single head-level key describes the LAST import, which is not what
@@ -249,6 +269,23 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 
 		return "", fmt.Errorf("ceph: %s could not be published because its guest contract could "+
 			"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
+	}
+
+	// WITHDRAWN WITHOUT IT, like every other field: a generation that left
+	// components out and does not say so reads as one that left nothing out, and a
+	// refresh would never complete it.
+	if components != nil {
+		attemptedMetadata = append(attemptedMetadata, ComponentsKey)
+		if setErr := c.SetComponents(ctx, image, generation, *components); setErr != nil {
+			if rmErr := c.withdrawGeneration(ctx, image, generation, attemptedMetadata); rmErr != nil {
+				return "", fmt.Errorf("ceph: %s@%s was published, its components could not be "+
+					"recorded (%w), and it could not be withdrawn (%w)",
+					image, generation, setErr, rmErr)
+			}
+
+			return "", fmt.Errorf("ceph: %s could not be published because its components could "+
+				"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
+		}
 	}
 
 	return generation, nil

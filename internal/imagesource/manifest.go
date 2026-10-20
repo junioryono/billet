@@ -896,10 +896,15 @@ func (m *Manifest) Usable(contract, arch string) error {
 	return nil
 }
 
-// completionContracts are the completion contracts this build can run. Empty
-// until the pull can complete an image: a reader that understands schema 3 but
-// cannot complete one must still refuse it.
-var completionContracts = map[string]bool{}
+// CompletionContractV1 is the completion contract internal/ops/images implements
+// (completion.go states it): the image's /opt/billet/complete/run, chrooted into
+// the image inside a completion microVM, reporting one line per component.
+const CompletionContractV1 = "1"
+
+// completionContracts are the completion contracts this build can run. A reader
+// that understands schema 3 but cannot run an image's contract must still refuse
+// it.
+var completionContracts = map[string]bool{CompletionContractV1: true}
 
 // AgeNotice is when an image is old enough to be worth mentioning.
 //

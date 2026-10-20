@@ -27,6 +27,7 @@ import (
 	"github.com/junioryono/billet/internal/imagesource"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/runnerrelease"
+	"github.com/junioryono/billet/internal/store/ceph"
 )
 
 // NOTHING REMOTE HAPPENS UNTIL THE KERNEL IS DURABLE, and this is the test that can
@@ -716,11 +717,13 @@ type recordingPublisher struct {
 
 type publishedGeneration struct {
 	image, rawPath, runnerVersion, kernel, guestContract string
+	components                                           *ceph.GenerationComponents
 }
 
-func (p *recordingPublisher) ImportGeneration(
+func (p *recordingPublisher) ImportCompletedGeneration(
 	_ context.Context,
 	image, rawPath, runnerVersion, kernel, guestContract string,
+	components *ceph.GenerationComponents,
 	_ time.Time,
 ) (string, error) {
 	// BEFORE THE LOCK THIS FAKE TAKES FOR ITS OWN BOOKKEEPING, so a hook is free to
@@ -734,7 +737,7 @@ func (p *recordingPublisher) ImportGeneration(
 
 	p.seen = append(p.seen, publishedGeneration{
 		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
-		kernel: kernel, guestContract: guestContract,
+		kernel: kernel, guestContract: guestContract, components: components,
 	})
 
 	if p.fails {
@@ -828,7 +831,7 @@ func pullWithin(t *testing.T, fixture *pullFixture, within time.Duration) error 
 // INSTALL THEM, and it is refused before its assets are copied into staging, the
 // sideloaded equivalent of a download.
 func TestAPullRefusesAnImageThisBuildCannotCompleteBeforeStagingIt(t *testing.T) {
-	fixture := newPullFixture(t, leavingOut)
+	fixture := newPullFixture(t, leavingOut, underAnotherContract)
 
 	// THE PART IS THERE TO COPY, so a refusal that came only after staging would
 	// leave it in staging rather than failing for its absence.

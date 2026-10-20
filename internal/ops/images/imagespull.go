@@ -56,9 +56,10 @@ const DefaultKernelDir = config.DefaultKernelDir
 // kernel it will name is durable on this disk — and that is only observable if a
 // test can fail a local step and then ask whether anything remote was attempted.
 type generationPublisher interface {
-	ImportGeneration(
+	ImportCompletedGeneration(
 		ctx context.Context,
 		image, rawPath, runnerVersion, kernel, guestContract string,
+		components *ceph.GenerationComponents,
 		now time.Time,
 	) (string, error)
 }
@@ -109,6 +110,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		"OIDC issuer that certificate must come from")
 	skipSignature := fs.Bool("skip-signature-verification", false,
 		"import without proving who published the manifest; for a source trusted by other means")
+	completionWait := fs.Duration("completion-wait", defaultCompletionWait,
+		"how long to give the microVM that installs the image's accepted components")
 
 	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
@@ -237,6 +240,49 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// WHAT THE IMAGE LEAVES OUT IS INSTALLED BEFORE IT IS PUBLISHED, and only what
+	// this deployment accepts (#584), so no tier is ever moved onto an image without
+	// what its deployment accepted. A completion that fails imports nothing, and the
+	// generation every tier boots is unchanged.
+	//
+	// OUTSIDE THE KERNEL LOCK, because a completion runs for as long as its
+	// downloads take, and every reap and pull on this host would wait that long. A
+	// site with no generation to boot the completion from stages one, which names
+	// the kernel, so that is the one part done under the lock.
+	var components *ceph.GenerationComponents
+
+	if manifest.Schema == imagesource.SchemaV3 {
+		plan := planCompletion(manifest, cfg.Images.Accepted())
+
+		stage := func(ctx context.Context, name string) (string, error) {
+			lock, err := takeKernelDirLock(ctx, env, *kernelDir,
+				"install the kernel the completion root will name")
+			if err != nil {
+				return "", err
+			}
+
+			defer func() {
+				if err := lock.release(); err != nil {
+					fmt.Fprintf(env.Stdout, "warning: the kernel directory lock was not released: %v\n", err)
+				}
+			}()
+
+			if _, err := installKernel(kernelInstaller, manifest, dir, *kernelDir); err != nil {
+				return "", fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
+			}
+
+			return store.ImportCompletedGeneration(ctx, name, raw, manifest.RunnerVersion,
+				kernelFileName(manifest), manifest.GuestContract, nil, time.Now())
+		}
+
+		installed, err := completeImage(ctx, env, cfg, image, raw, plan, *completionWait, stage)
+		if err != nil {
+			return err
+		}
+
+		components = &ceph.GenerationComponents{LeftOut: plan.LeftOut, Installed: installed}
+	}
+
 	// THE KERNEL DIRECTORY IS HELD FROM BEFORE THE INSTALL THROUGH THE PUBLISH, and
 	// the span is the whole point rather than the lock.
 	//
@@ -291,8 +337,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 
 	fmt.Fprintf(env.Stdout, "importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
 
-	generation, err := store.ImportGeneration(ctx, image, raw, manifest.RunnerVersion,
-		kernelFileName(manifest), manifest.GuestContract, time.Now())
+	generation, err := store.ImportCompletedGeneration(ctx, image, raw, manifest.RunnerVersion,
+		kernelFileName(manifest), manifest.GuestContract, components, time.Now())
 	if err != nil {
 		return err
 	}

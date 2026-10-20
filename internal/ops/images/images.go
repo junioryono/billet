@@ -826,6 +826,57 @@ func verifyGuestImage(
 	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
 	image, lease string, disk config.ByteSize, wait time.Duration, hold func() error,
 ) error {
+	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
+
+	return runGuestProbe(ctx, env, prov, bridge, port, verificationProbe(env, image, lease, disk, wait),
+		hold)
+}
+
+// verificationProbe is the probe `images verify` runs: the guest reports on itself,
+// and checkGuestReport judges whether it can run a job.
+func verificationProbe(env cli.Env, image, lease string, disk config.ByteSize,
+	wait time.Duration,
+) guestProbe {
+	return guestProbe{
+		command: "billet images verify",
+		image:   image,
+		lease:   lease,
+		wait:    wait,
+		spec: func(name, addr, secret string) provider.Spec {
+			return probeSpec(name, image, addr, secret, disk)
+		},
+		check: func(body, secret string) error { return checkGuestReport(env, body, secret, disk) },
+		silent: "so it cannot be shown to run a job; boot it by hand with a console " +
+			"(console=ttyS0 systemd.journald.forward_to_console=1) to read the agent's own " +
+			"account of itself",
+	}
+}
+
+// guestProbe is one trusted microVM a command launches on this node, outside the
+// node's own deployment, and the report it waits for from the guest.
+type guestProbe struct {
+	// command names the command in its errors, as "billet images verify".
+	command string
+	// image is what the probe boots, image@generation.
+	image string
+	lease string
+	wait  time.Duration
+	// spec is the launch, given the instance name, the listener's address and the
+	// run's secret.
+	spec func(name, addr, secret string) provider.Spec
+	// check turns the guest's authenticated report into the verdict.
+	check func(body, secret string) error
+	// silent completes the sentence a probe that never reported is refused with.
+	silent string
+}
+
+// runGuestProbe launches a probe, waits for its report and destroys it. hold
+// makes sure this run holds the probe lock, and is asked before the launch and
+// before each destroy of the probe; nil asks nothing.
+func runGuestProbe(
+	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
+	probe guestProbe, hold func() error,
+) error {
 	if hold == nil {
 		hold = func() error { return nil }
 	}
@@ -866,10 +917,8 @@ func verifyGuestImage(
 		}
 	}()
 
-	name := provider.InstanceName(lease)
-	spec := probeSpec(name, image, addr, secret, disk)
-
-	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
+	name := provider.InstanceName(probe.lease)
+	spec := probe.spec(name, addr, secret)
 
 	if err := hold(); err != nil {
 		return err
@@ -882,12 +931,12 @@ func verifyGuestImage(
 		// reconciled rather than assumed away — otherwise a failed verification is
 		// also a leaked uid, device name and cloned disk.
 		return errors.Join(
-			fmt.Errorf("billet images verify: %s did not launch: %w", image, err),
+			fmt.Errorf("%s: %s did not launch: %w", probe.command, probe.image, err),
 			destroy(name),
 		)
 	}
 
-	verdict := awaitGuestReport(ctx, env, report, serveErr, image, secret, disk, wait)
+	verdict := awaitProbeReport(ctx, report, serveErr, probe, secret)
 
 	// CLEANUP IS PART OF THE RESULT, NOT A WARNING BESIDE IT. As a bare defer this
 	// printed a line and returned success, so the weekly job would announce a
@@ -945,30 +994,39 @@ func probeSpec(name, image, addr, secret string, disk config.ByteSize) provider.
 	}
 }
 
-// awaitGuestReport waits for the guest to say something, or for a reason it cannot.
+// awaitGuestReport waits for a verification's guest to say something, or for a
+// reason it cannot.
 func awaitGuestReport(
 	ctx context.Context, env cli.Env, report <-chan string, serveErr <-chan error,
 	image, secret string, disk config.ByteSize, wait time.Duration,
 ) error {
-	timer := time.NewTimer(wait)
+	return awaitProbeReport(ctx, report, serveErr, verificationProbe(env, image, "", disk, wait),
+		secret)
+}
+
+// awaitProbeReport waits for a probe's guest to say something, or for a reason it
+// cannot.
+func awaitProbeReport(
+	ctx context.Context, report <-chan string, serveErr <-chan error, probe guestProbe,
+	secret string,
+) error {
+	timer := time.NewTimer(probe.wait)
 	defer timer.Stop()
 
 	select {
 	case body := <-report:
-		return checkGuestReport(env, body, secret, disk)
+		return probe.check(body, secret)
 
 	case err := <-serveErr:
 		// THE LISTENER DIED, WHICH IS NOT THE IMAGE'S FAULT. Without this the wait
 		// runs to its deadline and the verdict blames a guest that was reporting to
 		// a socket nobody was reading.
-		return fmt.Errorf("billet images verify: the listener the guest reports to failed, so "+
-			"nothing here can say whether %s works: %w", image, err)
+		return fmt.Errorf("%s: the listener the guest reports to failed, so "+
+			"nothing here can say whether %s works: %w", probe.command, probe.image, err)
 
 	case <-timer.C:
-		return fmt.Errorf("billet images verify: %s booted and never reported back within %s, "+
-			"so it cannot be shown to run a job; boot it by hand with a console "+
-			"(console=ttyS0 systemd.journald.forward_to_console=1) to read the agent's own "+
-			"account of itself", image, wait)
+		return fmt.Errorf("%s: %s booted and never reported back within %s, %s",
+			probe.command, probe.image, probe.wait, probe.silent)
 
 	case <-ctx.Done():
 		return ctx.Err()

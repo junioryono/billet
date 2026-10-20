@@ -57,9 +57,13 @@ func leavingOut(m *imagesource.Manifest) {
 			Size: m.Rootfs.Size}},
 	}
 	m.Rootfs = imagesource.Asset{}
-	m.CompletionContract = "1"
+	m.CompletionContract = imagesource.CompletionContractV1
 	m.Components = []imagesource.Component{{Name: "google-chrome", Space: 600 << 20}}
 }
+
+// underAnotherContract makes an image's completer speak a contract this build
+// cannot run.
+func underAnotherContract(m *imagesource.Manifest) { m.CompletionContract = "999" }
 
 // AN IMAGE THIS BUILD CANNOT COMPLETE IS REFUSED BY THE REFRESH, once and by name,
 // and nothing is pulled.
@@ -67,6 +71,7 @@ func TestARefreshRefusesAnImageThisBuildCannotComplete(t *testing.T) {
 	cfgPath := firecrackerRefreshConfig(t, "")
 	run := stageRefresh(t, fakeRefreshStore{}, time.Now().UTC().Truncate(time.Second))
 	leavingOut(run.manifest)
+	underAnotherContract(run.manifest)
 
 	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", cfgPath})
 	if err == nil || !strings.Contains(err.Error(), "the channel's image cannot be imported by "+
