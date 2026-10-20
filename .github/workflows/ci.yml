@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # WHICH JOB FAMILIES A CHANGE NEEDS. test, release-config and docs always run
+  # WHICH JOB FAMILIES A CHANGE NEEDS. test, release-config, docs and dco always run
   # (test reads scripts, actions, workflows, docs, Ansible, Terraform and source
   # text). Every other job belongs to exactly one family in verify-all-checks'
   # FAMILY map, and runs only when scripts/ci-scope.sh selects that family: a
@@ -1251,6 +1251,32 @@ jobs:
           SPHINXBUILD: sphinx-build
         run: make docs
 
+  # A CONTRIBUTOR'S COMMITS ARE SIGNED OFF under the Developer Certificate of
+  # Origin (scripts/dco.sh). KEPT rather than a family: whether a commit is signed
+  # off has nothing to do with the paths it touches. A push, and a pull request the
+  # owner or a bot opened, pass at once, so the job costs only a clone there.
+  dco:
+    runs-on: billet-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The merge ref and both its parents' full histories, so the range
+          # HEAD^1..HEAD^2 is every commit the pull request adds. A literal, never
+          # an expression: a bare 0 is falsy, so `&& 0 || 1` always gives 1.
+          fetch-depth: 0
+      - env:
+          DCO_EVENT: ${{ github.event_name }}
+          DCO_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          DCO_OWNER: ${{ github.repository_owner }}
+          # Named in the repair a refusal prints: billet's own repository and
+          # this pull request's base, never the contributor's origin.
+          DCO_UPSTREAM: ${{ github.server_url }}/${{ github.repository }}
+          DCO_BASE_REF: ${{ github.base_ref }}
+          DCO_HEAD_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
+          DCO_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/dco.sh
+
   # THE ONE CONTEXT BRANCH PROTECTION REQUIRES. Protection names a status check
   # by its job name, and naming every job above would have to be re-done each
   # time one is added or renamed, with a forgotten one leaving a gate that no
@@ -1279,6 +1305,7 @@ jobs:
         terraform-lint,
         replay,
         docs,
+        dco,
       ]
     if: always()
     steps:
@@ -1287,7 +1314,7 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           EVENT: ${{ github.event_name }}
           # The jobs every run runs, whatever the change.
-          KEPT: '["changes", "test", "release-config", "docs"]'
+          KEPT: '["changes", "test", "release-config", "docs", "dco"]'
           # Every other job, and the one family whose selection is the only
           # permission to skip it.
           FAMILY: >-

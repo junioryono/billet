@@ -1592,7 +1592,15 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 		store.failReleaseOf(l.ID, errors.New("database is locked"))
 	}
 
-	if err := r.releaseRequest(t.Context(), requestID); err == nil {
+	// UNDER tending, as its one caller holds it.
+	release := func() error {
+		r.tending.Lock()
+		defer r.tending.Unlock()
+
+		return r.releaseRequestLocked(t.Context(), requestID)
+	}
+
+	if err := release(); err == nil {
 		t.Fatal("reported success though both releases failed")
 	}
 
@@ -1610,7 +1618,7 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 	// Now ONE recovers. The loop must reach it whichever order it visits.
 	store.allowReleaseOf(leases[0].ID)
 
-	if err := r.releaseRequest(t.Context(), requestID); err == nil {
+	if err := release(); err == nil {
 		t.Fatal("reported success though one release still fails")
 	}
 

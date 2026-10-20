@@ -68,9 +68,13 @@ func TestEveryLicenseFileInTheTreeIsListed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("git ls-files: %v", err)
 	}
+	billetsOwn := map[string]bool{"LICENSE": true, "NOTICE": true, "ee/LICENSE": true}
 	found := 0
 	for _, f := range strings.Split(strings.TrimRight(string(out), "\x00"), "\x00") {
-		if f == "LICENSE" || !IsLicenseName(path.Base(f)) {
+		// BILLET'S OWN LICENSES are not third-party copies, so no entry lists them:
+		// the Apache text, the NOTICE carrying billet's copyright, and ee/'s
+		// Enterprise License.
+		if billetsOwn[f] || !IsLicenseName(path.Base(f)) {
 			continue
 		}
 		found++

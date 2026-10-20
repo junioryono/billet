@@ -123,6 +123,10 @@ type Runner struct {
 	// spawn runs the purge in the background; a seam so a test controls when it
 	// runs instead of racing a goroutine. Nil is `go`.
 	spawn func(func())
+	// beforeCustodyAnswer runs between a destroy's tend of a request's custody and
+	// its answer for what that tend left; a seam so a test can put an adoption in
+	// the gap the two once had between them. Nil in production.
+	beforeCustodyAnswer func()
 
 	jit             JITSource
 	provider        provider.Provider
@@ -767,6 +771,47 @@ func (r *Runner) cacheInstanceForRequest(requestID int64) string {
 	return ""
 }
 
+// settleCustodyFor tends whatever custody this runner holds for a request and
+// answers, under the same hold of tending, what that left: the request's running
+// instance, or with none, a lease whose compute is not confirmed gone. A failure
+// to finish the custody is logged, not returned; destroy says why.
+//
+// ONE HOLD FOR THE TEND AND THE ANSWER. An adoption takes tending too, and
+// recovery reads a survivor's lease before it does. Released between the two, an
+// adoption that read the lease while the tend was settling it recorded a fresh,
+// unconfirmed entry for compute the tend had just destroyed, built from that stale
+// read, and the answer then called a lease the tend had already released held
+// here. The answer is about what survived this tend; an entry an adoption records
+// afterwards is the next tend's to settle, and that tend finds its lease gone.
+//
+// It answers the running instance and true, or nil, false and whether a lease
+// is still held, and which.
+func (r *Runner) settleCustodyFor(ctx context.Context, requestID int64,
+) (*provider.Instance, bool, string, bool) {
+	r.tending.Lock()
+	defer r.tending.Unlock()
+
+	if err := r.releaseRequestLocked(ctx, requestID); err != nil {
+		r.log.Error("could not finish releasing compute billet was holding for a finished job; "+
+			"its lease still holds the capacity and the next sweep will retry",
+			"request", requestID, "error", err)
+	}
+	if r.beforeCustodyAnswer != nil {
+		r.beforeCustodyAnswer()
+	}
+
+	r.mu.Lock()
+	inst, running := r.running[requestID]
+	r.mu.Unlock()
+	if running {
+		return inst, true, "", false
+	}
+
+	heldLease, held := r.unconfirmedForRequest(requestID)
+
+	return nil, false, heldLease, held
+}
+
 func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute in
 	// the running map AND a custody entry — a redelivered assignment after a crash
@@ -781,16 +826,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// listener's help: its entry holds its own lease, and Tend retries it every tick.
 	// So it is logged here, where the context is, and the return value speaks for the
 	// running half alone.
-	if err := r.releaseRequest(ctx, requestID); err != nil {
-		r.log.Error("could not finish releasing compute billet was holding for a finished job; "+
-			"its lease still holds the capacity and the next sweep will retry",
-			"request", requestID, "error", err)
-	}
-
+	//
 	// STILL HELD? THEN SAY SO, EVERY TIME — not only on the destroy that took
 	// custody.
 	//
-	// releaseRequest above has just tended any custody entry for this request. If
+	// settleCustodyFor below tends any custody entry for this request first. If
 	// one SURVIVED that, its compute is not confirmed gone and its capacity is
 	// still charged, so this call must answer ErrCustody exactly as the first one
 	// did.
@@ -802,9 +842,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// empty, read that as "nothing was ever started here", and returned success.
 	// The caller released the lease on it, which is precisely the release this
 	// whole change exists to prevent, reached one call later.
-	r.mu.Lock()
-	inst, ok := r.running[requestID]
-	r.mu.Unlock()
+	inst, ok, leaseID, held := r.settleCustodyFor(ctx, requestID)
 
 	if !ok {
 		// AND ONLY HERE, WITH NOTHING RUNNING FOR THIS REQUEST.
@@ -821,7 +859,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 		// The rule the enclosing function already states is what this obeys: the
 		// return value speaks for the RUNNING half. Custody speaks for itself only
 		// when there is no running half to speak for.
-		if leaseID, held := r.unconfirmedForRequest(requestID); held {
+		if held {
 			return fmt.Errorf("%w: lease %s is held here until its compute is confirmed gone",
 				dispatch.ErrCustody, leaseID)
 		}
