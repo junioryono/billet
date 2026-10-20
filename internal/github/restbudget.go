@@ -60,6 +60,10 @@ type restAccount struct {
 // does not read as a count, leaves the last stated budget as it was: could
 // not tell is not zero.
 //
+// WITHIN ONE HOUR THE LOWEST REMAINING IS KEPT: answers to concurrent requests
+// can arrive out of order, and one that left before another was counted must
+// not restore what that one spent.
+//
 // A 401 IS NOT THE INSTALLATION'S ANSWER: GitHub did not take the token, so any
 // budget it stated would be another bucket's. Measured on 2026-10-20, a 401 to
 // an invalid token carried no X-RateLimit values at all.
@@ -67,7 +71,9 @@ func (r *restAccount) answered(operation string, status int, header http.Header,
 	r.mu.Lock()
 	observer := r.observer
 	if budget, ok := budgetOf(header, now); ok && status != http.StatusUnauthorized {
-		r.budget, r.stated = budget, true
+		if !r.stated || !budget.Reset.Equal(r.budget.Reset) || budget.Remaining <= r.budget.Remaining {
+			r.budget, r.stated = budget, true
+		}
 	}
 	r.mu.Unlock()
 
@@ -91,8 +97,8 @@ const maxRESTRedirects = 10
 // redirected is the client's redirect policy. A REDIRECT IS AN ANSWER OF ITS
 // OWN, drawing on the budget like any other, so each one a request made with
 // the installation's token is answered with is recorded and told before the
-// client follows it; the answer at the end of the chain is recorded by the
-// request's own caller.
+// client follows it; the answer at the end of the chain, a redirect it refused
+// to follow among them, is recorded by the request's own caller.
 func (r *restAccount) redirected(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRESTRedirects {
 		return fmt.Errorf("stopped after %d redirects", maxRESTRedirects)

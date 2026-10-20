@@ -194,6 +194,12 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		// A REDIRECT THE CLIENT REFUSED TO FOLLOW is still an answer, the only
+		// error the client returns one with, its body already closed.
+		if resp != nil {
+			return resp.StatusCode, resp.Header, nil, withoutBearerText(err, bearer)
+		}
+
 		return 0, nil, nil, withoutBearerText(err, bearer)
 	}
 	defer resp.Body.Close()

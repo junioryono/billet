@@ -55,10 +55,10 @@ const (
 	queueTimePages    = 10
 	// queueTimeRunsPerInstallation is how many runs one pass reads through one
 	// App installation, whose hourly budget the scale-set, runner-group and
-	// cache-authority calls share. A run is a request per 25 of its jobs and the
+	// cache-authority calls share. A run is a page per 25 of its jobs and the
 	// GitHub client reads no run of more than 200, so a pass costs an
-	// installation at most 24 requests, 1,440 an hour, against a budget of at
-	// least 5,000. It also caps what the sweep keeps up with: 180 runs an hour an
+	// installation at most 24 pages, 1,440 an hour, each a request and one more
+	// for each redirect it is answered with, against a budget of at least 5,000. It also caps what the sweep keeps up with: 180 runs an hour an
 	// installation, past which the oldest runs reach the window unread.
 	queueTimeRunsPerInstallation = 3
 	// queueTimeRetryFirst is the wait after a run's read that left a job unfound

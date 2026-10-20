@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -181,6 +182,82 @@ func TestEachRedirectIsCountedAsAnAnswer(t *testing.T) {
 	defer o.mu.Unlock()
 	if fmt.Sprint(o.requests) != "[list the run's jobs 301 list the run's jobs 200]" {
 		t.Errorf("observed %q, want the redirect and the answer it led to", o.requests)
+	}
+}
+
+// A REDIRECT THE CLIENT REFUSES TO FOLLOW IS STILL AN ANSWER: a loop is ten
+// redirects, each counted and the last one's budget kept, not nine and a
+// request no answer came to.
+func TestTheRedirectPastTheLimitIsCountedAsAnAnswer(t *testing.T) {
+	t.Parallel()
+
+	key, _ := testKeyPKCS1(t)
+	var hops atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /app/installations/22/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"token":"installation-secret","expires_at":%q}`,
+			time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	})
+	mux.HandleFunc("GET /repos/acme/api/actions/runs/31/jobs", func(w http.ResponseWriter, r *http.Request) {
+		n := hops.Add(1)
+		w.Header().Set("X-Ratelimit-Limit", "5000")
+		w.Header().Set("X-Ratelimit-Remaining", strconv.FormatInt(5000-n, 10))
+		w.Header().Set("X-Ratelimit-Used", strconv.FormatInt(n, 10))
+		w.Header().Set("X-Ratelimit-Reset", "1792461600")
+		http.Redirect(w, r, r.URL.String(), http.StatusFound)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
+	o := &recordingObserver{}
+	c.ObserveREST(o)
+
+	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil {
+		t.Fatal("a redirect loop read as an answer")
+	}
+	if got, ok := c.RESTBudget(); !ok || got.Remaining != 5000-hops.Load() {
+		t.Errorf("the budget after a redirect loop = %+v (%t), want the last answer's %d", got, ok, 5000-hops.Load())
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	want := strings.TrimSuffix(strings.Repeat("list the run's jobs 302 ", maxRESTRedirects), " ")
+	if hops.Load() != maxRESTRedirects || fmt.Sprint(o.requests) != "["+want+"]" {
+		t.Errorf("%d answers sent, observed %q; want %d, each a 302", hops.Load(), o.requests, maxRESTRedirects)
+	}
+}
+
+// WITHIN ONE HOUR THE LOWEST REMAINING IS KEPT, so an answer that arrives after
+// a later one cannot restore what that one spent; a new hour starts afresh.
+func TestAnAnswerArrivingLateDoesNotRestoreTheBudget(t *testing.T) {
+	t.Parallel()
+
+	stated := func(remaining string, reset int64) http.Header {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Limit", "5000")
+		h.Set("X-Ratelimit-Remaining", remaining)
+		h.Set("X-Ratelimit-Used", "1")
+		h.Set("X-Ratelimit-Reset", strconv.FormatInt(reset, 10))
+		return h
+	}
+	var r restAccount
+	now := time.Now()
+	for _, step := range []struct {
+		remaining string
+		reset     int64
+		want      int64
+	}{
+		{"999", 1792461600, 999},
+		{"1000", 1792461600, 999},
+		{"998", 1792461600, 998},
+		{"4999", 1792465200, 4999},
+	} {
+		r.answered("list the run's jobs", http.StatusOK, stated(step.remaining, step.reset), now)
+		if r.budget.Remaining != step.want {
+			t.Errorf("after an answer stating %s left until %d the budget is %d, want %d",
+				step.remaining, step.reset, r.budget.Remaining, step.want)
+		}
 	}
 }
 
