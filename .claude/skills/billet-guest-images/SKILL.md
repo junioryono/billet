@@ -18,6 +18,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The guest image is GitHub's own build, run on Ubuntu's own base (#250).**
 - **The template drifts from what it downloads, and each drift is carried as a difference until the pin moves.**
 - **The nspawn driver proves what it stops, three ways, before the workspace is touched.**
+- **The published image leaves out what billet may not redistribute, and carries what completes it (#584).**
 - **The build runs on a fleet tier, not a hosted runner.**
 - **The build job checks out the release the stable channel names, never `main`.**
 - **The guest carries billet itself, for the build caches (#226).**
@@ -26,6 +27,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The kernel and the filesystem are a matched pair.**
 - **The kernel gate's verdict is its exit status, and billet's own rule is the artifact-level claim.**
+- **The gate refuses an image that carries any of the five, and one without its completer or a manifest that declares them (#584).**
 - **Two halves of a gate before an image is published.**
 
 ### Publication, verification and pulling: [references/publication-and-pull.md](references/publication-and-pull.md)

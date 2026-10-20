@@ -141,6 +141,142 @@ func TestTheTestPreparesSkipExactlyTheirTests(t *testing.T) {
 	}
 }
 
+// THE COMPONENT PREPARES CHANGE EXACTLY THEIR LINES IN THE VENDORED SUITE AND
+// REPORT (#584): the toolset walk leaves CodeQL out, the browsers' and Android's
+// Describe blocks are skipped with Android's discovery returning early, and each
+// report line that would read one of the five names who installs it instead. No
+// other line changes, and a pin bump that rewords any of them fails here.
+func TestTheComponentPreparesChangeExactlyTheirLines(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	stageUpstreamTests(t, root, "Toolset.Tests.ps1", "Browsers.Tests.ps1", "Android.Tests.ps1")
+	report := filepath.Join(root, "imagegeneration", "SoftwareReport")
+	if err := os.MkdirAll(report, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	vendoredReport := filepath.Join(runnerImagesDir, "upstream", "images", "ubuntu", "scripts", "docs-gen",
+		"Generate-SoftwareReport.ps1")
+	body, err := os.ReadFile(vendoredReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(report, "Generate-SoftwareReport.ps1"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := runPrepare(t, root,
+		"per_deployment='installed by each billet deployment that accepts its license'\n"+
+			"prepare_codeql_per_deployment && prepare_components_per_deployment",
+		"replace_upstream_line", "prepare_codeql_per_deployment", "prepare_components_per_deployment")
+	if err != nil {
+		t.Fatalf("the prepares failed against the vendored files: %v\n%s", err, output)
+	}
+
+	const said = `"installed by each billet deployment that accepts its license"`
+	tests := filepath.Join(runnerImagesDir, "upstream", "images", "ubuntu", "scripts", "tests")
+	for _, file := range []struct {
+		vendored, staged string
+		changes          map[string]string
+	}{
+		{filepath.Join(tests, "Toolset.Tests.ps1"), filepath.Join(root, "imagegeneration", "tests", "Toolset.Tests.ps1"),
+			map[string]string{
+				`    $tools = (Get-ToolsetContent).toolcache`: `    $tools = (Get-ToolsetContent).toolcache | Where-Object { $_.name -ne "CodeQL" }`,
+			}},
+		{filepath.Join(tests, "Browsers.Tests.ps1"), filepath.Join(root, "imagegeneration", "tests", "Browsers.Tests.ps1"),
+			map[string]string{
+				`Describe "Firefox" {`:                       `Describe "Firefox" -Skip {`,
+				`Describe "Chrome" -Skip:(Test-IsArm64) {`:   `Describe "Chrome" -Skip {`,
+				`Describe "Edge" -Skip:(Test-IsArm64) {`:     `Describe "Edge" -Skip {`,
+				`Describe "Chromium" -Skip:(Test-IsArm64) {`: `Describe "Chromium" -Skip {`,
+			}},
+		{filepath.Join(tests, "Android.Tests.ps1"), filepath.Join(root, "imagegeneration", "tests", "Android.Tests.ps1"),
+			map[string]string{
+				`Describe "Android" -Skip:(Test-IsArm64) {`: `Describe "Android" -Skip {`,
+				`        if (Test-IsArm64) { return }`:      `        return`,
+			}},
+		{vendoredReport, filepath.Join(report, "Generate-SoftwareReport.ps1"), map[string]string{
+			`    $tools.AddToolVersion("CodeQL Action Bundle", $(Get-CodeQLBundleVersion))`:                   `    $tools.AddToolVersion("CodeQL Action Bundle", ` + said + `)`,
+			`    $browsersTools.AddToolVersion("Google Chrome", $(Get-ChromeVersion))`:                        `    $browsersTools.AddToolVersion("Google Chrome", ` + said + `)`,
+			`    $browsersTools.AddToolVersion("ChromeDriver", $(Get-ChromeDriverVersion))`:                   `    $browsersTools.AddToolVersion("ChromeDriver", ` + said + `)`,
+			`    $browsersTools.AddToolVersion("Chromium", $(Get-ChromiumVersion))`:                           `    $browsersTools.AddToolVersion("Chromium", ` + said + `)`,
+			`    $browsersTools.AddToolVersion("Microsoft Edge", $(Get-EdgeVersion))`:                         `    $browsersTools.AddToolVersion("Microsoft Edge", ` + said + `)`,
+			`    $browsersTools.AddToolVersion("Microsoft Edge WebDriver", $(Get-EdgeDriverVersion))`:         `    $browsersTools.AddToolVersion("Microsoft Edge WebDriver", ` + said + `)`,
+			`$browsersTools.AddToolVersion("Mozilla Firefox", $(Get-FirefoxVersion))`:                         `$browsersTools.AddToolVersion("Mozilla Firefox", ` + said + `)`,
+			`$browsersTools.AddToolVersion("Geckodriver", $(Get-GeckodriverVersion))`:                         `$browsersTools.AddToolVersion("Geckodriver", ` + said + `)`,
+			`    $androidTools.AddTable($(Build-AndroidTable))`:                                               `    $androidTools.AddToolVersion("Android SDK", ` + said + `)`,
+			`    $androidTools.AddHeader("Environment variables").AddTable($(Build-AndroidEnvironmentTable))`: `    # billet: the Android environment is written by each deployment's completion (#584)`,
+		}},
+	} {
+		before, err := os.ReadFile(file.vendored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.ReadFile(file.staged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		was, is := strings.Split(string(before), "\n"), strings.Split(string(after), "\n")
+		if len(was) != len(is) {
+			t.Fatalf("%s went from %d lines to %d", file.staged, len(was), len(is))
+		}
+		want := map[string]string{}
+		for old, replaced := range file.changes {
+			want[old] = replaced
+		}
+		for i := range was {
+			if was[i] == is[i] {
+				continue
+			}
+			if replaced, asked := want[was[i]]; !asked || is[i] != replaced {
+				t.Errorf("%s line %d changed from %q to %q, which no prepare asks for", file.staged, i+1, was[i], is[i])
+
+				continue
+			}
+			delete(want, was[i])
+		}
+		for old := range want {
+			t.Errorf("%s: %q was not replaced", file.staged, old)
+		}
+		if _, err := os.Stat(file.staged + ".billet"); !os.IsNotExist(err) {
+			t.Errorf("%s: the rewrite left its scratch copy behind (%v)", file.staged, err)
+		}
+	}
+}
+
+// A LINE REPLACED NONE OR TWICE IS REFUSED, AND THE FILE IS LEFT AS IT WAS.
+func TestReplacingALineRefusesAnythingButOneMatch(t *testing.T) {
+	t.Parallel()
+
+	for name, body := range map[string]string{
+		"absent":        "a line\nanother line\n",
+		"a prefix only": "the line, longer\n",
+		"twice":         "the line\nthe line\n",
+	} {
+		root := t.TempDir()
+		dir := filepath.Join(root, "imagegeneration", "tests")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(dir, "X.Tests.ps1")
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		output, err := runPrepare(t, root, `replace_upstream_line /imagegeneration/tests/X.Tests.ps1 "the line" "new"`,
+			"replace_upstream_line")
+		if err == nil || !strings.Contains(output, `lines reading "the line", want exactly one`) {
+			t.Errorf("%s: answered %v, want a refusal naming the line:\n%s", name, err, output)
+		}
+		got, readErr := os.ReadFile(file)
+		if readErr != nil || string(got) != body {
+			t.Errorf("%s: the file changed on a refusal (%v):\n%s", name, readErr, got)
+		}
+		if _, statErr := os.Stat(file + ".billet"); !os.IsNotExist(statErr) {
+			t.Errorf("%s: the refusal left its scratch copy behind (%v)", name, statErr)
+		}
+	}
+}
+
 // A TEST NAMED NONE OR TWICE IS REFUSED, AND THE FILE IS LEFT AS IT WAS: a name
 // that only begins another test's name is not that test.
 func TestSkippingATestRefusesAnythingButOneMatch(t *testing.T) {
@@ -255,11 +391,18 @@ func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 		}
 		preparedOn[name][fields[1]] = true
 	}
+	skipped := map[string]bool{}
+	for _, line := range strings.Split(string(differences), "\n") {
+		if fields := strings.Split(line, "\t"); len(fields) == 3 && fields[0] == "skip" {
+			skipped[fields[1]] = true
+		}
+	}
 
+	// A SKIPPED STEP RUNS NOTHING, so it is not the first step that can run a file.
 	plan := readTemplatePlan(t, vendoredTemplate(t))
 	texts := make([]string, len(plan))
 	for i, step := range plan {
-		if step.Kind == "shell" && !step.Reboots {
+		if step.Kind == "shell" && !step.Reboots && !skipped[step.ID] {
 			texts[i] = stepText(t, step)
 		}
 	}
@@ -281,12 +424,20 @@ func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 		t.Error("no step calls update-grub any more; retire prepare:grub-absent and this check")
 	}
 
-	for prepare, file := range map[string]string{
-		"apt-tests-two-mirrors":  "Apt",
-		"system-tests-virtio":    "System",
-		"system-tests-rootflags": "System",
+	for _, need := range []struct{ prepare, file string }{
+		{"apt-tests-two-mirrors", "Apt"},
+		{"system-tests-virtio", "System"},
+		{"system-tests-rootflags", "System"},
+		{"codeql-per-deployment", "Toolset"},
+		{"components-per-deployment", "Browsers"},
+		{"components-per-deployment", "Android"},
+		{"components-per-deployment", "Generate-SoftwareReport"},
 	} {
-		runs := regexp.MustCompile(`(?m)^[^#\n]*(invoke_tests[ \t]+["']?` + file + `["']?([ \t;&|]|$)|RunAll-Tests\.ps1)`)
+		prepare, file := need.prepare, need.file
+		runs := regexp.MustCompile(`(?m)^[^#\n]*(invoke_tests[ \t]+["']?` + file + `["']?([ \t;&|]|$)|Invoke-PesterTests[ \t]+-TestFile[ \t]+["']?` + file + `["']?|RunAll-Tests\.ps1)`)
+		if file == "Generate-SoftwareReport" {
+			runs = regexp.MustCompile(`(?m)^[^#\n]*Generate-SoftwareReport\.ps1`)
+		}
 		first := -1
 		for i := range plan {
 			if runs.MatchString(texts[i]) {

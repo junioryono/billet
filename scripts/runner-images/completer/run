@@ -1,0 +1,168 @@
+#!/bin/bash
+# /opt/billet/complete/run: complete a billet guest image with the components its
+# license-restricted parts left out (#584), under completion contract 1.
+#
+#   run <component>...
+#
+# THE CONTRACT (internal/ops/images/completion.go states the node's half). This is
+# run as root, chrooted into the image being completed, with /proc, /sys, /dev,
+# /dev/pts and /run bound from the machine doing it, and BILLET_COMPLETION_REPORT
+# naming a file. For each component it runs GitHub's own installer and GitHub's own
+# tests for it, at the runner-images commit the image was built from, and writes
+# one line to the report: `installed=<name> <version>`, or `failed=<name>`. Its
+# exit status and its output decide nothing; the node reads the report.
+#
+# THE STEP'S OWN ENVIRONMENT. Each installer runs as the template ran it: as root,
+# in what /etc/environment holds when it starts, with the template's variables for
+# that step, the apt retry wrapper GitHub's build installs, and invoke_tests on the
+# PATH. The scripts, helpers and tests here are GitHub's, unedited, except that the
+# tests are read from beside the helpers rather than from /imagegeneration.
+#
+# Environment, for tests only:
+#   BILLET_COMPLETE_DIR          this directory (default: the script's own)
+#   BILLET_COMPLETE_ENVIRONMENT  /etc/environment
+#   BILLET_COMPLETE_IMAGE_ENV    /etc/billet-image-env
+#   BILLET_COMPLETE_BIN          /usr/local/bin, where invoke_tests and the apt
+#                                wrapper are placed
+#   BILLET_COMPLETE_SETUP        0 skips the apt wrapper, apt-get update and the
+#                                permissions and cleanup afterwards
+#   BILLET_COMPLETE_ROOT         a prefix for where the components' versions are read
+set -u
+
+here=${BILLET_COMPLETE_DIR:-$(cd "$(dirname "$0")" && pwd)}
+root=${BILLET_COMPLETE_ROOT:-}
+environment=${BILLET_COMPLETE_ENVIRONMENT:-/etc/environment}
+image_env=${BILLET_COMPLETE_IMAGE_ENV:-/etc/billet-image-env}
+bin=${BILLET_COMPLETE_BIN:-/usr/local/bin}
+setup=${BILLET_COMPLETE_SETUP:-1}
+report=${BILLET_COMPLETION_REPORT:-}
+helpers=$here/scripts/helpers
+
+log() { echo "billet-complete: $*" >&2; }
+
+if [ -z "$report" ]; then
+	log "BILLET_COMPLETION_REPORT names no report"
+	exit 2
+fi
+: >"$report" || exit 2
+
+# installer is the template step that installs COMPONENT; an unknown name has none.
+installer() {
+	case "$1" in
+	android-sdk) echo install-android-sdk.sh ;;
+	codeql) echo install-codeql-bundle.sh ;;
+	firefox) echo install-firefox.sh ;;
+	google-chrome) echo install-google-chrome.sh ;;
+	microsoft-edge) echo install-microsoft-edge.sh ;;
+	*) return 1 ;;
+	esac
+}
+
+# step runs ARGV as a template step runs: /etc/environment as it stands now,
+# made plain by the build's own reader, then the step's variables on top.
+step() {
+	(
+		if [ -e "$environment" ]; then
+			normalized=$(awk -f "$here/pam-environment.awk" "$environment") || exit 1
+			while IFS= read -r line; do
+				[ -n "$line" ] && export "$line"
+			done <<<"$normalized"
+		fi
+		exec env HOME=/root DEBIAN_FRONTEND=noninteractive HELPER_SCRIPTS="$helpers" \
+			INSTALLER_SCRIPT_FOLDER="$here/installers" "$@"
+	)
+}
+
+# version prints what COMPONENT installed, read from what is now on disk, and
+# fails when it cannot say.
+version() {
+	local v
+	case "$1" in
+	google-chrome) v=$(step google-chrome --product-version) ;;
+	microsoft-edge) v=$(step microsoft-edge --version) && v=${v##* } ;;
+	firefox) v=$(step firefox --version) && v=${v##* } ;;
+	android-sdk)
+		v=$(sed -n 's/^Pkg\.Revision=//p' "$root/usr/local/lib/android/sdk/cmdline-tools/latest/source.properties")
+		;;
+	codeql)
+		local found=("$root"/opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql)
+		[ "${#found[@]}" -eq 1 ] && [ -x "${found[0]}" ] || return 1
+		v=$("${found[0]}" version --quiet)
+		;;
+	*) return 1 ;;
+	esac
+	v=$(printf '%s' "$v" | tr -d '\r' | head -n 1)
+	[[ $v =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,63}$ ]] || return 1
+	printf '%s\n' "$v"
+}
+
+# THE TEMPLATE'S OWN PREPARATION OF A STEP, kept for as long as the run lasts:
+# invoke_tests on the PATH (configure-environment.sh links it) and the apt retry
+# wrapper (configure-apt-mock.sh); the published image carries neither, because
+# GitHub's cleanup.sh removes both, and it carries no apt lists.
+prepared=1
+if ! ln -sf "$helpers/invoke-tests.sh" "$bin/invoke_tests"; then
+	prepared=0
+fi
+if [ "$setup" = 1 ] && [ "$prepared" = 1 ]; then
+	step "$here/scripts/build/configure-apt-mock.sh" && step apt-get update || prepared=0
+fi
+
+for name in "$@"; do
+	script=$(installer "$name") || {
+		log "$name is not a component this image completes"
+		printf 'failed=%s\n' "$name" >>"$report"
+		continue
+	}
+	if [ "$prepared" != 1 ]; then
+		log "$name: the run could not be prepared"
+		printf 'failed=%s\n' "$name" >>"$report"
+		continue
+	fi
+
+	log "installing $name with $script"
+	if ! step "$here/scripts/build/$script"; then
+		log "$name: $script failed"
+		printf 'failed=%s\n' "$name" >>"$report"
+		continue
+	fi
+	# THE CODEQL BUNDLE'S INSTALLER RUNS NO TESTS of its own; GitHub's toolset test
+	# is what proves it, and it is filtered to CodeQL's context.
+	if [ "$name" = codeql ] && ! step invoke_tests Toolset Toolset.CodeQL; then
+		log "$name: GitHub's toolset test for it failed"
+		printf 'failed=%s\n' "$name" >>"$report"
+		continue
+	fi
+	if ! installed=$(version "$name"); then
+		log "$name: installed, and what version could not be read"
+		printf 'failed=%s\n' "$name" >>"$report"
+		continue
+	fi
+	printf 'installed=%s %s\n' "$name" "$installed" >>"$report"
+done
+
+# AS THE TEMPLATE LEAVES ITS IMAGE: configure-system.sh makes /opt and /usr/share
+# writable by everyone after every install, which is where these put themselves,
+# and billet's own /opt/billet keeps the modes the build gave it; cleanup.sh takes
+# away the wrapper, the link and apt's downloads, and billet's build the lists.
+if [ "$setup" = 1 ]; then
+	find /opt -mindepth 1 -maxdepth 1 ! -name billet -exec chmod -R 777 {} +
+	chmod -R 777 /usr/share
+	for tool in apt apt-get apt-key; do
+		rm -f "$bin/$tool"
+	done
+	apt-get clean
+	rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
+fi
+rm -f "$bin/invoke_tests"
+
+# THE JOB'S ENVIRONMENT IS WRITTEN AGAIN, from what the installers added to
+# /etc/environment (ANDROID_HOME, CHROMEWEBDRIVER and the rest), by the one writer
+# the build uses for it.
+if ! "$here/write-image-env.sh" "$environment" "$image_env"; then
+	log "could not write $image_env again; every component is reported failed"
+	tmp=$(mktemp) && sed 's/^installed=\([^ ]*\) .*/failed=\1/' "$report" >"$tmp" && cat "$tmp" >"$report"
+	rm -f "$tmp"
+fi
+
+exit 0
