@@ -127,6 +127,29 @@ func TestALossWithADelayIsNotJudgedByTheLossShare(t *testing.T) {
 	}
 }
 
+// NOR DOES A STALLED GATEWAY CONFIRM A REFLECTOR'S LONE SPIKE: three rounds of a
+// 60 ms stall fill the shared window, but only the reflectors' own Detect rounds
+// are a queue a trickle is not exempt beside.
+func TestAGatewayStallDoesNotConfirmALoneReflectorSpike(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	c.Down.Rate, c.Down.Limit = 905, 602
+
+	for n := range 8 {
+		s := of3(0, false, []string{"a", "b", "c"}[n%3], []string{"a", "b", "c"}[(n+1)%3])
+		if n == 2 {
+			s = of3(40*time.Millisecond, true, "a")
+		}
+
+		c.Step(withGateway(probed(n, 0, 19.4, s), gatewayRose(60*time.Millisecond)))
+		if c.Cause != CauseNone {
+			t.Fatalf("round %d: a download moving 19.4 Mbit/s beside a stalled gateway and one delayed reflector "+
+				"round was cut on %v to %.1f", n, c.Cause, c.Down.Rate)
+		}
+	}
+}
+
 // ONE ROUND OVER BLOAT BESIDE A LOSS IS NOT A CONFIRMED QUEUE, and cuts no
 // trickle: the incident's two-in-three loss, with one of its rounds measuring a
 // 40 ms rise.

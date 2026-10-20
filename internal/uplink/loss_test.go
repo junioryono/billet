@@ -7,10 +7,9 @@ import (
 )
 
 // atLine is a controller whose download runs a quarter above mbit, where a run
-// whose traffic moves mbit stands once a climb past it stops (ProbeFull): a cut
-// on loss alone needs the direction to fill a share of its line (lossShare),
-// and newController's 10000 Mbit/s is a line no traffic here fills, while a
-// rate at mbit itself would rise on every clear round.
+// whose traffic moves mbit stands once a climb past it stops (ProbeFull): its
+// rate stands near what moves, as a run's does, rather than at newController's
+// 1000, and a rate at mbit itself would rise on every clear round.
 func atLine(mbit float64) *Controller {
 	c := newController()
 	c.Down.Rate = 1.25 * mbit
