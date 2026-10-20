@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
@@ -45,6 +46,26 @@ func (a *Allocator) JobsWithRetirableDetail(ctx context.Context, before time.Tim
 	return out, err
 }
 
+// leaseIDWidth is a lease id's length (newLeaseID: 16 random bytes in hex),
+// which MarkJobDetailRetired cuts its packed list by; a change to one is a
+// change to both.
+const leaseIDWidth = 32
+
+// packLeaseIDs is lease ids end to end, as MarkJobDetailRetired reads them. An
+// id of any other length is refused rather than cut wrong.
+func packLeaseIDs(ids []string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(ids) * leaseIDWidth)
+	for _, id := range ids {
+		if len(id) != leaseIDWidth {
+			return "", fmt.Errorf("alloc: lease id %q is not %d characters", id, leaseIDWidth)
+		}
+		b.WriteString(id)
+	}
+
+	return b.String(), nil
+}
+
 // RetireJobDetail deletes the series, destinations and guest report of the
 // jobs leaseIDs names that are still unretired and finished, and marks each
 // one's history row retired, in one transaction. A job's usage summary is
@@ -55,18 +76,20 @@ func (a *Allocator) RetireJobDetail(ctx context.Context, leaseIDs []string) (Ret
 		return out, nil
 	}
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	packed, err := packLeaseIDs(leaseIDs)
+	if err != nil {
+		return out, err
+	}
+
+	err = a.db.Tx(ctx, func(tx *sql.Tx) error {
 		q := state.WriteQueries(tx)
 		stamp := ts(a.now())
 
-		jobs := 0
-		for _, id := range leaseIDs {
-			marked, err := q.MarkJobDetailRetired(ctx, ledgerdb.MarkJobDetailRetiredParams{Stamp: stamp, LeaseID: id})
-			if err != nil {
-				return fmt.Errorf("alloc: mark the detail of lease %s retired: %w", id, err)
-			}
-			jobs += int(marked)
+		marked, err := q.MarkJobDetailRetired(ctx, ledgerdb.MarkJobDetailRetiredParams{Stamp: stamp, Packed: packed})
+		if err != nil {
+			return fmt.Errorf("alloc: mark %d jobs' detail retired: %w", len(leaseIDs), err)
 		}
+		jobs := int(marked)
 		if jobs == 0 {
 			return nil
 		}

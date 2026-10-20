@@ -79,13 +79,15 @@ func TestARetiredJobSaysItsDetailWasRetired(t *testing.T) {
 		}
 	})
 	for _, want := range []string{"detail     retired ", "past server.job_detail_retention",
-		"destinations retired ", "usage      measured by the host epyc-1"} {
+		"destinations retired ", "guest      retired ", "usage      measured by the host epyc-1"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the report does not say %q:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "destinations not measured") {
-		t.Errorf("a retired job's destinations read as never measured:\n%s", text)
+	for _, never := range []string{"destinations not measured", noGuestReport} {
+		if strings.Contains(text, never) {
+			t.Errorf("a retired job's report says %q:\n%s", never, text)
+		}
 	}
 
 	raw := capture(t, func() {
@@ -112,8 +114,11 @@ func TestARetiredJobSaysItsDetailWasRetired(t *testing.T) {
 			t.Errorf("billet jobs show --html: %v", err)
 		}
 	})
-	if strings.Count(page, "past server.job_detail_retention") < 2 {
-		t.Errorf("the page does not say the job's detail and its destinations were retired")
+	if !strings.Contains(page, "Destinations retired ") {
+		t.Error("the page does not say the job's destinations were retired")
+	}
+	if strings.Contains(page, "Destinations not measured") {
+		t.Error("the page says a retired job's destinations were not measured")
 	}
 }
 

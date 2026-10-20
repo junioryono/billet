@@ -272,3 +272,48 @@ func TestARetirementBatchChecksWhatItIsHanded(t *testing.T) {
 		t.Errorf("a retired job's stamp moved from %q to %q", first, retired)
 	}
 }
+
+// A JOB WITH DESTINATIONS AND NO SERIES IS RETIRED TOO, by its usage's time: an
+// older wire, or a series its node could not re-encode, leaves a usage report
+// with destinations and no series, and those rows are detail all the same.
+func TestAJobWithDestinationsAndNoSeriesIsRetired(t *testing.T) {
+	now := time.Now().UTC()
+	a := retentionFleet(t, &now)
+
+	lease := busyLease(t, a)
+	usage := measuredUsage()
+	usage.Destinations = fullDestinations()
+	if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, usage, nil); err != nil {
+		t.Fatalf("RecordLeaseUsage: %v", err)
+	}
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_usage SET recorded_at = $1 WHERE lease_id = $2`,
+			cutoff.Add(-time.Hour).Format(time.RFC3339Nano), lease.ID)
+		return err
+	}); err != nil {
+		t.Fatalf("date the job's usage: %v", err)
+	}
+
+	got, err := retire(t, a, cutoff, 10)
+	if err != nil || got.Jobs != 1 || got.Destinations == 0 || got.Series != 0 {
+		t.Fatalf("retired %+v (%v), want the job's destinations", got, err)
+	}
+	if usage, _, destinations, _, retired := detailOf(t, a, lease.ID); !usage || destinations || retired == "" {
+		t.Errorf("the job keeps usage %t, destinations %t, retired %q; want its summary alone, marked", usage,
+			destinations, retired)
+	}
+}
+
+// A LEASE ID OF ANY LENGTH BUT A LEASE ID'S IS REFUSED before a batch is
+// packed, since the statement cuts the list by that length.
+func TestARetirementBatchRefusesAMalformedLeaseID(t *testing.T) {
+	now := time.Now().UTC()
+	a := retentionFleet(t, &now)
+
+	if _, err := a.RetireJobDetail(t.Context(), []string{"short"}); err == nil {
+		t.Error("a five-character lease id was packed")
+	}
+}

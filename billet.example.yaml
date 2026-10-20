@@ -160,7 +160,7 @@ server:
   # report, which `billet jobs show` draws its charts, steps and guest view from;
   # the job's usage summary is kept. Past it they are deleted a batch at a time
   # and the job says it was retired. At least 1h; absent, 72h. Each day kept cost
-  # the reference deployment about 150 MB of ledger, and the control plane reads
+  # the reference deployment over 100 MB of ledger, and the control plane reads
   # the whole ledger at every start.
   #
   # job_detail_retention: 72h

@@ -3,7 +3,7 @@
 -- A JOB'S DETAIL IS KEPT FOR A BOUNDED TIME, AND ITS RETIREMENT IS RECORDED.
 -- job_series, job_guest_reports and job_destinations grew with every job a
 -- monitored node ran, and nothing deleted a row: on 2026-10-17 they were 588 MiB
--- of the reference controller's 740 MB ledger, which grew about 170 MB a day,
+-- of the reference controller's 740 MB ledger, which grew over 100 MB a day,
 -- and the startup integrity scan reads the whole file cold after every host
 -- upgrade (#572). The control plane now deletes them past a retention; a job's
 -- usage summary (job_usage) stays.

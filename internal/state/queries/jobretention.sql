@@ -45,12 +45,24 @@ HAVING MAX(c.at) < CAST(@before AS TEXT)
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: MarkJobDetailRetired :execrows
--- Stamp one job a read listed, if it is still unretired and finished: its
+-- Stamp the jobs a read listed that are still unretired and finished: their
 -- detail cannot have changed since, because a finished job's lease takes no
 -- report, and a stamp, once written, is kept.
+--
+-- ONE STATEMENT FOR THE BATCH, for RecordJobDestinations' reason: a write
+-- transaction holds the writer slot (SQLite) or the deployment's write lock
+-- (PostgreSQL) for every round trip it makes. The caller packs the lease ids
+-- end to end (internal/alloc packLeaseIDs: each a lease id's 32 characters),
+-- and the recursive list below cuts one off the front at each step.
+WITH RECURSIVE ids (id, rest) AS (
+    SELECT SUBSTR(CAST(@packed AS TEXT), 1, 32), SUBSTR(CAST(@packed AS TEXT), 33)
+    UNION ALL
+    SELECT SUBSTR(rest, 1, 32), SUBSTR(rest, 33) FROM ids WHERE rest != ''
+)
 UPDATE job_history
    SET detail_retired_at = CAST(@stamp AS TEXT)
- WHERE lease_id = @lease_id AND detail_retired_at = '' AND COALESCE(finished_at, '') != '';
+ WHERE lease_id IN (SELECT id FROM ids)
+   AND detail_retired_at = '' AND COALESCE(finished_at, '') != '';
 
 -- name: DeleteRetiredJobSeries :execrows
 -- The series of the jobs a batch stamped.
@@ -69,7 +81,8 @@ DELETE FROM job_destinations
 -- readDestinations), so it goes with them.
 UPDATE job_usage
    SET destinations_incomplete = NULL, tap_sent_bytes = NULL, tap_received_bytes = NULL
- WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST(@stamp AS TEXT));
+ WHERE destinations_incomplete IS NOT NULL
+   AND lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST(@stamp AS TEXT));
 
 -- name: DeleteRetiredJobGuestReports :execrows
 -- The guest reports of the jobs a batch stamped.

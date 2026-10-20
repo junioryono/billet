@@ -9,8 +9,8 @@ import (
 // DefaultJobDetailRetention is how long a job's per-sample series, destinations
 // and guest report are kept when server.job_detail_retention is absent.
 //
-// DAYS, NOT WEEKS. The three grew the reference controller's ledger by about
-// 150 MB a day on 2026-10-17 and 18, and the startup integrity scan reads the
+// DAYS, NOT WEEKS. The three grew the reference controller's ledger by over
+// 100 MB a day from 2026-10-17 to 20, and the startup integrity scan reads the
 // whole file cold after every host upgrade, measured at 55 s for 740 MB against
 // its 80 s bound (#572). Three days keeps a few days of investigation and the
 // ledger far inside that bound.

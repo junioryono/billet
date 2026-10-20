@@ -54,7 +54,8 @@ func (q *Queries) DeleteRetiredJobSeries(ctx context.Context, stamp string) (int
 const forgetRetiredJobDestinationTotals = `-- name: ForgetRetiredJobDestinationTotals :exec
 UPDATE job_usage
    SET destinations_incomplete = NULL, tap_sent_bytes = NULL, tap_received_bytes = NULL
- WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST($1 AS TEXT))
+ WHERE destinations_incomplete IS NOT NULL
+   AND lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST($1 AS TEXT))
 `
 
 // The usage summary's verdict on the destinations of the jobs a batch stamped,
@@ -142,21 +143,33 @@ func (q *Queries) ListRetirableJobDetail(ctx context.Context, arg ListRetirableJ
 }
 
 const markJobDetailRetired = `-- name: MarkJobDetailRetired :execrows
+WITH RECURSIVE ids (id, rest) AS (
+    SELECT SUBSTR(CAST($2 AS TEXT), 1, 32), SUBSTR(CAST($2 AS TEXT), 33)
+    UNION ALL
+    SELECT SUBSTR(rest, 1, 32), SUBSTR(rest, 33) FROM ids WHERE rest != ''
+)
 UPDATE job_history
    SET detail_retired_at = CAST($1 AS TEXT)
- WHERE lease_id = $2 AND detail_retired_at = '' AND COALESCE(finished_at, '') != ''
+ WHERE lease_id IN (SELECT id FROM ids)
+   AND detail_retired_at = '' AND COALESCE(finished_at, '') != ''
 `
 
 type MarkJobDetailRetiredParams struct {
-	Stamp   string
-	LeaseID string
+	Stamp  string
+	Packed string
 }
 
-// Stamp one job a read listed, if it is still unretired and finished: its
+// Stamp the jobs a read listed that are still unretired and finished: their
 // detail cannot have changed since, because a finished job's lease takes no
 // report, and a stamp, once written, is kept.
+//
+// ONE STATEMENT FOR THE BATCH, for RecordJobDestinations' reason: a write
+// transaction holds the writer slot (SQLite) or the deployment's write lock
+// (PostgreSQL) for every round trip it makes. The caller packs the lease ids
+// end to end (internal/alloc packLeaseIDs: each a lease id's 32 characters),
+// and the recursive list below cuts one off the front at each step.
 func (q *Queries) MarkJobDetailRetired(ctx context.Context, arg MarkJobDetailRetiredParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, markJobDetailRetired, arg.Stamp, arg.LeaseID)
+	result, err := q.db.ExecContext(ctx, markJobDetailRetired, arg.Stamp, arg.Packed)
 	if err != nil {
 		return 0, err
 	}
