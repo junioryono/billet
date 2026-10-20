@@ -184,11 +184,23 @@ func (c *Client) completionRootOwners(ctx context.Context, image string) (map[st
 
 // snapshotNames lists every snapshot of image, whatever billet calls it. No image
 // is no snapshots.
+//
+// AN ENOENT FROM THE LISTING IS NOT AN ABSENT IMAGE until `info` says so. rbd reads
+// each snapshot after enumerating them, so a snapshot removed during the listing
+// fails the whole listing with ENOENT; read as no snapshots, it would let a caller
+// clear the metadata of a root that is still there.
 func (c *Client) snapshotNames(ctx context.Context, image string) ([]string, error) {
 	out, err := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "snap", "ls", image)
 	if err != nil {
 		if isNoSuchFile(err) {
-			return nil, nil
+			_, infoErr := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "info", image)
+			if infoErr != nil && isNoSuchFile(infoErr) {
+				return nil, nil
+			}
+			if infoErr != nil {
+				return nil, fmt.Errorf("ceph: list the snapshots of %s/%s: %w (and whether the "+
+					"image exists could not be read: %w)", c.cfg.ImagePool, image, err, infoErr)
+			}
 		}
 
 		return nil, fmt.Errorf("ceph: list the snapshots of %s/%s: %w", c.cfg.ImagePool, image, err)

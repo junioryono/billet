@@ -43,11 +43,15 @@ type importFake struct {
 	cancelMetaSetKey string
 	// failSnapCreate refuses `snap create` before it applies; failSnapCreateApplied
 	// applies it and then returns an error, and failSnapListAfterCreate also fails
-	// every snapshot listing after that.
+	// every snapshot listing after that. snapListENOENT answers every listing with
+	// ENOENT, which rbd does when a snapshot is removed while it lists, and
+	// enoentListAfterCreate turns it on once a create has applied.
 	failSnapCreate          bool
 	failSnapCreateApplied   bool
 	failSnapListAfterCreate bool
 	snapListFails           bool
+	snapListENOENT          bool
+	enoentListAfterCreate   bool
 	failMetaRemove          bool
 	failSnapRemove          bool
 	failSnapRemoveApplied   bool
@@ -233,18 +237,19 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 		return []byte(""), nil
 	case "snap":
 		// `snap ls` is asked for json; `snap create` and `snap rm` are not.
-		for _, a := range args {
-			if a == "ls" {
-				if f.snapListFails {
-					return nil, errors.New("rbd did not answer the snapshot listing")
-				}
-				entries := make([]string, 0, len(f.snapshots))
-				for i, name := range f.snapshots {
-					entries = append(entries, fmt.Sprintf(`{"id":%d,"name":%q}`, i+1, name))
-				}
-
-				return []byte("[" + strings.Join(entries, ",") + "]"), nil
+		if slices.Contains(args, "ls") {
+			if f.snapListFails {
+				return nil, errors.New("rbd did not answer the snapshot listing")
 			}
+			if f.snapListENOENT {
+				return nil, errors.New("rbd: failed to list snapshots: (2) No such file or directory")
+			}
+			entries := make([]string, 0, len(f.snapshots))
+			for i, name := range f.snapshots {
+				entries = append(entries, fmt.Sprintf(`{"id":%d,"name":%q}`, i+1, name))
+			}
+
+			return []byte("[" + strings.Join(entries, ",") + "]"), nil
 		}
 		if slices.Contains(args, "create") {
 			_, generation, _ := strings.Cut(args[len(args)-1], "@")
@@ -257,6 +262,9 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 				// a snapshot the caller was told was not made.
 				if f.failSnapListAfterCreate {
 					f.snapListFails = true
+				}
+				if f.enoentListAfterCreate {
+					f.snapListENOENT = true
 				}
 
 				return nil, errors.New("snapshot creation response was lost")

@@ -269,6 +269,9 @@ func TestACompletionRootsOwnerIsRecordedBeforeItsSnapshot(t *testing.T) {
 		"applied, then its answer lost": {importFake{failSnapCreateApplied: true}, true, true},
 		"applied, and nothing can say so": {importFake{failSnapCreateApplied: true,
 			failSnapListAfterCreate: true}, false, false},
+		// ENOENT FROM THE LISTING OF AN IMAGE THAT EXISTS is not an absent snapshot.
+		"applied, and its listing answers ENOENT": {importFake{infoJSON: `{"size": 8388608}`,
+			failSnapCreateApplied: true, enoentListAfterCreate: true}, false, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := tc.fake
@@ -340,13 +343,40 @@ func TestAReservationClearsOwnerKeysWhoseSnapshotIsGone(t *testing.T) {
 		t.Fatalf("import: %v", err)
 	}
 
-	for _, gone := range []string{mine, theirs} {
-		if !f.ranWith("image-meta", "remove", "ubuntu-2404-x64", CompletionRootOwnerKey+"."+gone) {
-			t.Errorf("the owner key of %s, whose snapshot is gone, was kept; billet ran %v", gone, f.calls)
+	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey} {
+		for _, gone := range []string{mine, theirs} {
+			if !f.ranWith("image-meta", "remove", "ubuntu-2404-x64", key+"."+gone) {
+				t.Errorf("%s of %s, whose snapshot is gone, was kept; billet ran %v", key, gone, f.calls)
+			}
+		}
+		if f.ranWith("image-meta", "remove", "ubuntu-2404-x64", key+"."+live) {
+			t.Errorf("%s of %s, whose snapshot exists, was removed", key, live)
 		}
 	}
-	if f.ranWith("image-meta", "remove", "ubuntu-2404-x64", CompletionRootOwnerKey+"."+live) {
-		t.Errorf("the owner key of %s, whose snapshot exists, was removed", live)
+}
+
+// A LISTING THAT ANSWERS ENOENT FOR AN IMAGE THAT EXISTS PROVES NO SNAPSHOT GONE:
+// rbd answers so when a snapshot is removed while it lists, and a reservation that
+// read it as none would clear the metadata of every root still there.
+func TestAReservationOnAListingThatAnswersENOENTClearsNothing(t *testing.T) {
+	const live = "c20260801000000"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:         device,
+		infoJSON:       `{"size": 8388608}`,
+		snapshots:      []string{live},
+		snapListENOENT: true,
+		metadata:       "Key  Value\n" + CompletionRootOwnerKey + "." + live + "  epyc-1\n",
+	}
+
+	_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
+	if err == nil || !strings.Contains(err.Error(), "list the snapshots") {
+		t.Fatalf("got %v, want the import refused on a listing that could not be read", err)
+	}
+	if f.ranWith("image-meta", "remove", "ubuntu-2404-x64") || f.ranWith("snap", "create") {
+		t.Fatalf("an unreadable listing was acted on; billet ran %v", f.calls)
 	}
 }
 
