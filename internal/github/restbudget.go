@@ -117,7 +117,14 @@ func (r *restAccount) redirected(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// budgetOf reads GitHub's X-RateLimit headers.
+// maxRESTResetAhead is how far past the answer's reading a stated reset may lie:
+// GitHub's window is an hour, and five minutes more allows for the two clocks.
+const maxRESTResetAhead = time.Hour + 5*time.Minute
+
+// budgetOf reads GitHub's X-RateLimit headers. A RESET FURTHER AHEAD THAN ONE
+// WINDOW STATES NOTHING: a later hour supersedes an earlier one, so a single
+// statement of a distant reset would otherwise pin the budget, and the sweep's
+// reserve with it, until that time.
 func budgetOf(header http.Header, now time.Time) (RESTBudget, bool) {
 	count := func(name string) (int64, bool) {
 		v, err := strconv.ParseInt(header.Get(name), 10, 64)
@@ -130,9 +137,12 @@ func budgetOf(header http.Header, now time.Time) (RESTBudget, bool) {
 	if !ok1 || !ok2 || !ok3 || !ok4 || limit == 0 {
 		return RESTBudget{}, false
 	}
+	at := time.Unix(reset, 0).UTC()
+	if at.After(now.Add(maxRESTResetAhead)) {
+		return RESTBudget{}, false
+	}
 
-	return RESTBudget{Limit: limit, Remaining: remaining, Used: used, Reset: time.Unix(reset, 0).UTC(), Read: now},
-		true
+	return RESTBudget{Limit: limit, Remaining: remaining, Used: used, Reset: at, Read: now}, true
 }
 
 // RESTBudget is the installation's budget as GitHub last stated it.

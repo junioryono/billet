@@ -358,6 +358,9 @@ func TestABudgetIsReadOnlyFromACompleteHeaderSet(t *testing.T) {
 		"a zero limit":      func(h http.Header) { h.Set("X-Ratelimit-Limit", "0") },
 		"a negative count":  func(h http.Header) { h.Set("X-Ratelimit-Remaining", "-1") },
 		"a word for a time": func(h http.Header) { h.Set("X-Ratelimit-Reset", "soon") },
+		"a reset past the window": func(h http.Header) {
+			h.Set("X-Ratelimit-Reset", strconv.FormatInt(now.Add(maxRESTResetAhead+time.Second).Unix(), 10))
+		},
 	} {
 		h := full()
 		change(h)
