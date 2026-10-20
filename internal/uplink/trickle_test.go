@@ -101,21 +101,51 @@ func TestALossUnderADirectionFillingItsLineStillCuts(t *testing.T) {
 	}
 }
 
-// A LOSS WITH A RISING ROUND TRIP IS CUT FOR BY THE DELAY RULE, whatever share of
-// its line the direction moves: the loss share governs a round the reflectors
-// measured no rise in.
+// A LOSS WITH A RISING ROUND TRIP THE WINDOW CONFIRMS IS CUT FOR BY THE DELAY
+// RULE, whatever share of its line the direction moves, and not before the
+// rise is confirmed: the loss share governs every round until then.
 func TestALossWithADelayIsNotJudgedByTheLossShare(t *testing.T) {
 	t.Parallel()
 
 	c := newController()
 	c.Down.Rate, c.Down.Limit = 905, 602
 
-	for n := range 4 {
+	// THE FIRST TWO DELAYED ROUNDS ARE A LOSS WITH NO QUEUE CONFIRMED YET, which
+	// a trickle is not cut for; the third confirms the queue, and is cut for.
+	for n := range 3 {
 		c.Step(probed(n, 0, 60, of3(40*time.Millisecond, true, []string{"a", "b", "c"}[n%3])))
+
+		if n < 2 && c.Cause != CauseNone {
+			t.Fatalf("round %d: a download moving 60 Mbit/s was cut on %v to %.1f before the delay was "+
+				"confirmed", n, c.Cause, c.Down.Rate)
+		}
 	}
 
-	if c.Down.Rate >= 60 {
-		t.Errorf("a download moving 60 Mbit/s under a delayed, lossy line was left at %.1f; the loss share "+
-			"applies to a loss alone", c.Down.Rate)
+	if c.Down.Rate >= 60 || (c.Cause != CauseDelay && c.Cause != CauseDelayAndLoss) {
+		t.Errorf("a download moving 60 Mbit/s under a confirmed, lossy queue was left at %.1f (cause %v); the "+
+			"loss share applies to a round with no confirmed rise", c.Down.Rate, c.Cause)
+	}
+}
+
+// ONE ROUND OVER BLOAT BESIDE A LOSS IS NOT A CONFIRMED QUEUE, and cuts no
+// trickle: the incident's two-in-three loss, with one of its rounds measuring a
+// 40 ms rise.
+func TestALoneDelaySpikeBesideALossCutsNoTrickle(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	c.Down.Rate, c.Down.Limit = 905, 602
+
+	for n := range 8 {
+		s := of3(0, false, []string{"a", "b", "c"}[n%3], []string{"a", "b", "c"}[(n+1)%3])
+		if n == 1 {
+			s = of3(40*time.Millisecond, true, "a")
+		}
+
+		c.Step(probed(n, 0, 19.4, s))
+		if c.Cause != CauseNone {
+			t.Fatalf("round %d: a download moving 19.4 Mbit/s beside a loss and one delayed round was cut on %v "+
+				"to %.1f", n, c.Cause, c.Down.Rate)
+		}
 	}
 }

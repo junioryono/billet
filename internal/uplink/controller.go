@@ -808,10 +808,12 @@ func (c *Controller) step(d *Direction, moving, other float64, v verdict, o Obse
 			return false, false
 		}
 
-		// WITH NO RISE IN THE REFLECTORS' ROUND TRIP, A DIRECTION IS BLAMED ONLY
-		// WHILE IT FILLS A SHARE OF ITS LINE (lossShare), for a loss or for a
-		// gateway's stall alike.
-		if !o.reflectorsDelayed(p.Bloat) {
+		// WITHOUT A RISE IN THE REFLECTORS' ROUND TRIP THAT THE WINDOW CONFIRMS
+		// AND THIS ROUND MEASURED, A DIRECTION IS BLAMED ONLY WHILE IT FILLS A
+		// SHARE OF ITS LINE (lossShare), for a loss or a gateway's stall alike:
+		// one round over Bloat is not the queue Detect rounds are, and would
+		// bring back the cut of a trickle beside a loss.
+		if !v.onDelay || !o.reflectorsDelayed(p.Bloat) {
 			line := d.Rate
 			if d.Limit > 0 {
 				line = min(line, d.Limit)
