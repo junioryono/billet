@@ -64,6 +64,12 @@ Docs: Set up the Read the Docs build
 
 The body covers what changed and why, how it was verified beyond `make check` (a mutation test, a manual `billet check`, a real host), and what is **not** covered. "Untested on a real Mac" is useful information; silence is not. Link the issue with `Closes #N`. `.claude/skills/billet-git-flow/SKILL.md` has the full conventions, including the adversarial review that runs before a push.
 
+## Signing off your commits
+
+Every commit you author is signed off under the [Developer Certificate of Origin](https://developercertificate.org): by adding `Signed-off-by: Your Name <you@example.com>`, matching the commit's author, you certify that you wrote the change or otherwise have the right to contribute it under the project's license. `git commit -s` adds the line for you. CI's `dco` job checks every commit your pull request adds, merges included, and names any that lacks it. Merge `main` in with `git merge --signoff`: GitHub's "Update branch" button and its web conflict editor make unsigned merges. Repairing commits you have already made rewrites them, which is the one exception to never rebasing or force-pushing: squash your branch into one signed-off commit, which keeps its contents exactly, merges included. A failed `dco` job prints the exact commands for your pull request; they fetch its base branch from billet's repository rather than your fork's `origin`, whose `main` may be behind, push to your pull request's branch by name whatever your push settings, assume nothing is uncommitted or staged, and stop if your branch is not the commit CI checked or has more than one merge base with billet's.
+
+Contributions outside `ee/` are accepted under the Apache License 2.0. `ee/` is under the billet Enterprise License, and takes outside contributions only under a written agreement with its licensor, so open an issue first.
+
 ## Releases
 
 Releases are maintainer-operated through the **Cut Release** workflow. It creates or reuses the `release/vX.Y` branch (one per minor, carrying every patch), tags, builds through GoReleaser, publishes a signed release manifest beside the archives and packages, verifies the release's immutability attestation, advances the signed `stable` channel, and moves the `v0` tag. A hotfix is a commit on the release branch and the same button with the patch version, then a merge back to `main`. Never tag by hand.

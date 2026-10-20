@@ -204,6 +204,19 @@ linters:
             - pkg: "github.com/actions/scaleset"
               desc: "Consume GitHub's scale-set API through internal/scaleset, which adapts it to server.Session. The upstream module is a public preview."
 
+        # NOTHING OUTSIDE ee/ IMPORTS IT. Everything else is Apache-2.0 and must
+        # build without the enterprise code (ee/LICENSE): an enterprise feature is
+        # an addition to the open build, never a dependency of it. Held here while
+        # ee/ holds no Go at all, so the rule starts at zero violations.
+        enterprise:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!${config-path}/ee/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/ee"
+              desc: "ee/ is under the billet Enterprise License; nothing outside it may import it."
+
         # One hardware-counter reader, imported in one place. internal/usage
         # opens, reads and closes every perf descriptor on the sampler's one
         # goroutine, and a second import site is a descriptor nothing closes.
