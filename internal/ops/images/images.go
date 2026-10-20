@@ -629,6 +629,26 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	}
 	disk := verifyDisk(cfg, override)
 
+	// AN INCOMPLETE GENERATION IS NOT RECORDED, AND THAT IS ASKED BEFORE THE BOOT
+	// rather than after it: a boot that passes says nothing about what the image
+	// lacks.
+	if *record {
+		if cfg.Node.Ceph == nil {
+			return errors.New("billet images verify: this config names no ceph cluster")
+		}
+
+		reader, err := openComponentsReader(cfg)
+		if err != nil {
+			return err
+		}
+
+		imageName, generation, _ := strings.Cut(rest, "@")
+		if err := refuseIncomplete(ctx, reader, "billet images verify", imageName, generation,
+			cfg.Images.Accepted()); err != nil {
+			return err
+		}
+	}
+
 	// THE SAME DERIVATION `billet node` USES, rather than a second one that agrees
 	// with it by luck. The identity decides which jails this command can see, so a
 	// verification that derived it differently would either see nothing of its own
@@ -828,8 +848,10 @@ func verifyGuestImage(
 ) error {
 	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
 
-	return runGuestProbe(ctx, env, prov, bridge, port, verificationProbe(env, image, lease, disk, wait),
+	result := runGuestProbe(ctx, env, prov, bridge, port, verificationProbe(env, image, lease, disk, wait),
 		hold)
+
+	return errors.Join(result.verdict, result.cleanup)
 }
 
 // verificationProbe is the probe `images verify` runs: the guest reports on itself,
@@ -870,13 +892,22 @@ type guestProbe struct {
 	silent string
 }
 
+// probeResult is what a probe ended with: the guest's verdict, the cleanup's
+// failure, and whether the microVM is proved gone, which only a destroy the
+// backend answered TeardownStopped proves.
+type probeResult struct {
+	verdict error
+	cleanup error
+	gone    bool
+}
+
 // runGuestProbe launches a probe, waits for its report and destroys it. hold
 // makes sure this run holds the probe lock, and is asked before the launch and
 // before each destroy of the probe; nil asks nothing.
 func runGuestProbe(
 	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
 	probe guestProbe, hold func() error,
-) error {
+) probeResult {
 	if hold == nil {
 		hold = func() error { return nil }
 	}
@@ -885,13 +916,13 @@ func runGuestProbe(
 	// so after the lock's name moved (#175) it may be another verification's
 	// live microVM; it is left in place, and the next verification's pre-launch
 	// cleanup collects it.
-	destroy := func(name string) error {
+	destroy := func(name string) (bool, error) {
 		if err := hold(); err != nil {
-			return fmt.Errorf("%w; the probe %s was left in place for the next verification's "+
-				"cleanup", err, name)
+			return false, fmt.Errorf("%w; the probe %s was left in place for the next "+
+				"verification's cleanup", err, name)
 		}
 
-		return destroyProbe(ctx, prov, name)
+		return destroyProbeProved(ctx, prov, name)
 	}
 
 	// A LISTENER ON THIS MACHINE, because the assertion has to be made BY THE GUEST.
@@ -903,12 +934,12 @@ func runGuestProbe(
 	// decide what is even worth keeping.
 	secret, err := verificationSecret()
 	if err != nil {
-		return err
+		return probeResult{verdict: err, gone: true}
 	}
 
 	srv, addr, serveErr, err := listenGuestReport(ctx, bridge, port, secret, report)
 	if err != nil {
-		return err
+		return probeResult{verdict: err, gone: true}
 	}
 
 	defer func() {
@@ -921,7 +952,7 @@ func runGuestProbe(
 	spec := probe.spec(name, addr, secret)
 
 	if err := hold(); err != nil {
-		return err
+		return probeResult{verdict: err, gone: true}
 	}
 
 	if _, err := prov.Launch(ctx, spec); err != nil {
@@ -930,10 +961,13 @@ func runGuestProbe(
 		// was accepted, and the backend's own unwind can itself fail. So the probe is
 		// reconciled rather than assumed away — otherwise a failed verification is
 		// also a leaked uid, device name and cloned disk.
-		return errors.Join(
-			fmt.Errorf("%s: %s did not launch: %w", probe.command, probe.image, err),
-			destroy(name),
-		)
+		gone, cleanup := destroy(name)
+
+		return probeResult{
+			verdict: fmt.Errorf("%s: %s did not launch: %w", probe.command, probe.image, err),
+			cleanup: cleanup,
+			gone:    gone,
+		}
 	}
 
 	verdict := awaitProbeReport(ctx, report, serveErr, probe, secret)
@@ -942,7 +976,9 @@ func runGuestProbe(
 	// printed a line and returned success, so the weekly job would announce a
 	// verified image while probes accumulated — each holding a uid, a device name
 	// and a cloned disk, and each invisible to the node's sweep by design.
-	return errors.Join(verdict, destroy(name))
+	gone, cleanup := destroy(name)
+
+	return probeResult{verdict: verdict, cleanup: cleanup, gone: gone}
 }
 
 // probeSpec is the launch a verification makes: a trusted microVM whose command
@@ -1040,6 +1076,15 @@ func awaitProbeReport(
 // removes the deadline as well, so a teardown that wedges would hang a scheduled job
 // until systemd killed it two hours later.
 func destroyProbe(ctx context.Context, prov provider.Provider, name string) error {
+	_, err := destroyProbeProved(ctx, prov, name)
+
+	return err
+}
+
+// destroyProbeProved is destroyProbe, also answering whether the backend
+// confirmed the microVM gone (TeardownStopped). Nothing else proves it, and
+// what the probe was given (a loop device, say) is released only on that proof.
+func destroyProbeProved(ctx context.Context, prov provider.Provider, name string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	defer cancel()
 
@@ -1056,14 +1101,18 @@ func destroyProbe(ctx context.Context, prov provider.Provider, name string) erro
 	// The teardown state is not consulted: this is the firecracker backend, whose
 	// Destroy is synchronous, and the probe holds no lease whose capacity could be
 	// released early if it were not.
-	if _, err := prov.Destroy(ctx, name); err != nil {
-		return fmt.Errorf("billet images verify: the probe %s was not cleaned up and holds a "+
+	teardown, err := prov.Destroy(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("billet images verify: the probe %s was not cleaned up and holds a "+
 			"uid, a device name and a cloned disk; nothing else will reap it, because it is "+
 			"deliberately not owned by the node: %w", name, err)
 	}
 
-	return nil
+	return teardown == provider.TeardownStopped, nil
 }
+
+// maxGuestReportBytes bounds what the report listener accepts from a guest.
+const maxGuestReportBytes = 64 << 10
 
 // listenGuestReport is listenForGuestReport, a variable so a test can verify
 // without a bridge on the machine it runs on.
@@ -1104,9 +1153,19 @@ func listenForGuestReport(
 
 		// BOUNDED, because this is a report from a guest running somebody's image
 		// and the alternative is letting it decide how much this process allocates.
-		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+		//
+		// AND REFUSED PAST THE BOUND, NOT CUT AT IT. A report cut at its limit
+		// reads as a shorter report that ends cleanly, so a guest could pad a line
+		// to push what follows it, a failure, out of what is judged.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxGuestReportBytes+1))
 		if err != nil {
 			http.Error(w, "could not read the report", http.StatusBadRequest)
+
+			return
+		}
+
+		if len(body) > maxGuestReportBytes {
+			http.Error(w, "the report is too long", http.StatusRequestEntityTooLarge)
 
 			return
 		}
@@ -1400,6 +1459,20 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 
 	if cfg.Node == nil || cfg.Node.Ceph == nil {
 		return errors.New(name + ": this config names no ceph cluster")
+	}
+
+	// AN INCOMPLETE GENERATION IS NEVER PROMOTED: verified, @verified would move
+	// every tier onto an image without what this deployment accepted.
+	if verified {
+		reader, err := openComponentsReader(cfg)
+		if err != nil {
+			return err
+		}
+
+		imageName, generation, _ := strings.Cut(rest, "@")
+		if err := refuseIncomplete(ctx, reader, name, imageName, generation, cfg.Images.Accepted()); err != nil {
+			return err
+		}
 	}
 
 	store, err := ceph.New(*cfg.Node.Ceph)

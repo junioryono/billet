@@ -61,41 +61,6 @@ func (g *GenerationComponents) validate() error {
 	return nil
 }
 
-// CompletionRootSuffix ends the name of the image a pull boots its completion
-// microVM from on a site with no generation of the image yet: a staging import of
-// the image being completed, which no tier, alias, refresh or reap names, and
-// which the pull removes when it is done.
-const CompletionRootSuffix = ".completion-root"
-
-// CompletionRoot is the completion root of image.
-func CompletionRoot(image string) string { return image + CompletionRootSuffix }
-
-// RemoveCompletionRoot removes a completion root and its snapshots. Already gone is
-// not an error.
-//
-// IT REMOVES NOTHING ELSE, whatever it is asked. The one other image a pull holds a
-// name for is the one every tier boots.
-func (c *Client) RemoveCompletionRoot(ctx context.Context, name string) error {
-	base, ok := strings.CutSuffix(name, CompletionRootSuffix)
-	if !ok || base == "" {
-		return fmt.Errorf("ceph: %s is not a completion root, so it is not removed", bounded(name))
-	}
-	if err := checkCloneName(name); err != nil {
-		return err
-	}
-
-	for _, args := range [][]string{
-		{"-p", c.cfg.ImagePool, "snap", "purge", name},
-		{"-p", c.cfg.ImagePool, "rm", name},
-	} {
-		if _, err := c.rbdCmd(ctx, false, args...); err != nil && !isNoSuchFile(err) {
-			return fmt.Errorf("ceph: remove the completion root %s/%s: %w", c.cfg.ImagePool, name, err)
-		}
-	}
-
-	return nil
-}
-
 // SetComponents records what a generation left out and what was installed.
 func (c *Client) SetComponents(ctx context.Context, image, generation string,
 	components GenerationComponents,

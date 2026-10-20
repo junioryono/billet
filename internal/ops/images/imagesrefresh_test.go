@@ -16,14 +16,67 @@ import (
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
-// fakeRefreshStore answers with one newest generation, or none.
+// fakeRefreshStore answers with one newest generation, or none, and its
+// components record, or none.
 type fakeRefreshStore struct {
-	newest ceph.Generation
-	found  bool
+	newest     ceph.Generation
+	found      bool
+	components *ceph.GenerationComponents
 }
 
 func (s fakeRefreshStore) NewestGeneration(context.Context, string) (ceph.Generation, bool, error) {
 	return s.newest, s.found, nil
+}
+
+func (s fakeRefreshStore) Components(context.Context, string, string) (ceph.GenerationComponents, bool, error) {
+	if s.components == nil {
+		return ceph.GenerationComponents{}, false, nil
+	}
+
+	return *s.components, true, nil
+}
+
+// THE SAME IMAGE IS PULLED AGAIN WHEN ITS NEWEST GENERATION IS NOT WHAT THIS
+// DEPLOYMENT ACCEPTS, though nothing newer is published: a component accepted
+// since, a completion that failed and left the image as published newest, or an
+// acceptance withdrawn.
+func TestARefreshPullsAgainWhenTheNewestGenerationIsNotWhatIsAccepted(t *testing.T) {
+	for name, tc := range map[string]struct {
+		accept  string
+		record  ceph.GenerationComponents
+		due     bool
+		because string
+	}{
+		"a component accepted since": {"google-chrome",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"}}, true,
+			"lacks google-chrome, which this deployment accepts"},
+		"an acceptance withdrawn": {"",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"},
+				Installed: map[string]string{"google-chrome": "155"}}, true,
+			"carries google-chrome, which this deployment no longer accepts"},
+		"completed as accepted": {"google-chrome",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"},
+				Installed: map[string]string{"google-chrome": "155"}}, false, "after the channel's image"},
+		"left out and not accepted": {"",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"}}, false, "after the channel's image"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			record := tc.record
+			store := fakeRefreshStore{newest: newer, found: true, components: &record}
+			var accepted []config.ImageComponent
+			if tc.accept != "" {
+				accepted = []config.ImageComponent{config.ImageComponent(tc.accept)}
+			}
+
+			due, why, err := refreshDue(t.Context(), store, "ubuntu-2404-x64", refreshManifest(channelBuilt), accepted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if due != tc.due || !strings.Contains(why, tc.because) {
+				t.Fatalf("due = %v (%s), want %v because %q", due, why, tc.due, tc.because)
+			}
+		})
+	}
 }
 
 // refreshRun stages the seams a refresh runs through and records what it did.

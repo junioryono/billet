@@ -202,9 +202,15 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if !*keep {
-		defer cleanup()
-	}
+	// KEPT AFTER A COMPLETION WHOSE MICROVM WAS NOT PROVED GONE, because the file
+	// it was given is still attached to it and may still be being written.
+	keepStaging := *keep
+
+	defer func() {
+		if !keepStaging {
+			cleanup()
+		}
+	}()
 
 	// REFUSED ONLY ON EVIDENCE THIS CAN ACTUALLY ESTABLISH. An image whose runner is
 	// past github's window produces microVMs that register and are never given work,
@@ -247,16 +253,17 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	//
 	// OUTSIDE THE KERNEL LOCK, because a completion runs for as long as its
 	// downloads take, and every reap and pull on this host would wait that long. A
-	// site with no generation to boot the completion from stages one, which names
-	// the kernel, so that is the one part done under the lock.
+	// node with no verified generation to boot the completion from imports the
+	// image as published first, which names the kernel, so that is the one part
+	// done under the lock.
 	var components *ceph.GenerationComponents
 
 	if manifest.Schema == imagesource.SchemaV3 {
 		plan := planCompletion(manifest, cfg.Images.Accepted())
 
-		stage := func(ctx context.Context, name string) (string, error) {
+		asPublished := func(ctx context.Context) (string, error) {
 			lock, err := takeKernelDirLock(ctx, env, *kernelDir,
-				"install the kernel the completion root will name")
+				"install the kernel the image as published will name")
 			if err != nil {
 				return "", err
 			}
@@ -271,11 +278,16 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 				return "", fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
 			}
 
-			return store.ImportCompletedGeneration(ctx, name, raw, manifest.RunnerVersion,
-				kernelFileName(manifest), manifest.GuestContract, nil, time.Now())
+			return store.ImportCompletedGeneration(ctx, image, raw, manifest.RunnerVersion,
+				kernelFileName(manifest), manifest.GuestContract,
+				&ceph.GenerationComponents{LeftOut: plan.LeftOut}, time.Now())
 		}
 
-		installed, err := completeImage(ctx, env, cfg, image, raw, plan, *completionWait, stage)
+		installed, err := completeImage(ctx, env, cfg, image, raw, *kernelDir, plan, *completionWait,
+			asPublished)
+		if errors.Is(err, errCompletionLeftRunning) {
+			keepStaging = true
+		}
 		if err != nil {
 			return err
 		}

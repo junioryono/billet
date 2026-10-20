@@ -130,51 +130,6 @@ func TestAMissingComponentsRecordIsAnImageThatLeftNothingOut(t *testing.T) {
 	}
 }
 
-// A COMPLETION ROOT IS THE ONLY THING THIS REMOVES, so a caller holding the wrong
-// name cannot delete the image every tier boots.
-func TestRemoveCompletionRootRemovesOnlyACompletionRoot(t *testing.T) {
-	var calls [][]string
-	c := componentsClient(t, func(_ context.Context, _ string, args []string) ([]byte, error) {
-		calls = append(calls, args)
-
-		return nil, nil
-	})
-
-	for _, name := range []string{"ubuntu-2404-x64", CompletionRootSuffix, "ubuntu-2404-x64.completion", ""} {
-		if err := c.RemoveCompletionRoot(t.Context(), name); err == nil {
-			t.Errorf("RemoveCompletionRoot(%q) was accepted", name)
-		}
-	}
-	if len(calls) != 0 {
-		t.Fatalf("a refused name still reached rbd: %v", calls)
-	}
-
-	if err := c.RemoveCompletionRoot(t.Context(), CompletionRoot("ubuntu-2404-x64")); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{
-		"-p billet-images snap purge ubuntu-2404-x64.completion-root",
-		"-p billet-images rm ubuntu-2404-x64.completion-root",
-	}
-	if len(calls) != len(want) {
-		t.Fatalf("rbd ran %v, want %v", calls, want)
-	}
-	for i := range want {
-		if !strings.HasSuffix(strings.Join(calls[i], " "), want[i]) {
-			t.Fatalf("rbd ran %v, want %v", calls, want)
-		}
-	}
-}
-
-func TestRemovingAnAbsentCompletionRootIsNotAnError(t *testing.T) {
-	c := componentsClient(t, func(context.Context, string, []string) ([]byte, error) {
-		return nil, errors.New("rbd: error opening image: (2) No such file or directory")
-	})
-	if err := c.RemoveCompletionRoot(t.Context(), CompletionRoot("ubuntu-2404-x64")); err != nil {
-		t.Fatalf("an absent completion root was an error: %v", err)
-	}
-}
-
 func componentsClient(t *testing.T, run runner) *Client {
 	t.Helper()
 

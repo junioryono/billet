@@ -23,6 +23,7 @@ import (
 // — and that is observable only if a test can supply the answer.
 type refreshStore interface {
 	NewestGeneration(ctx context.Context, image string) (ceph.Generation, bool, error)
+	componentsReader
 }
 
 // The seams a refresh runs through, so a test can see what it decided without a
@@ -171,7 +172,7 @@ func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Conf
 		// alias, exactly as `images pull` with no argument already does.
 		image, _, _ := strings.Cut(configured, "@")
 
-		due, why, err := refreshDue(ctx, store, image, manifest)
+		due, why, err := refreshDue(ctx, store, image, manifest, cfg.Images.Accepted())
 		if err != nil {
 			problems = append(problems, err)
 
@@ -212,9 +213,10 @@ func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Conf
 }
 
 // refreshDue decides whether the channel's image is newer than the newest
-// imported generation, and says why in a sentence.
+// imported generation, or the newest generation is not what this deployment
+// accepts, and says why in a sentence.
 func refreshDue(ctx context.Context, store refreshStore, image string,
-	manifest *imagesource.Manifest,
+	manifest *imagesource.Manifest, accepted []config.ImageComponent,
 ) (bool, string, error) {
 	newest, found, err := store.NewestGeneration(ctx, image)
 	if err != nil {
@@ -232,6 +234,28 @@ func refreshDue(ctx context.Context, store refreshStore, image string,
 		return true, fmt.Sprintf("the newest generation %s was imported %s, and the channel "+
 			"publishes an image built %s", newest.Name, newest.Built.UTC().Format(time.RFC3339),
 			built), nil
+	}
+
+	// THE SAME IMAGE IS IMPORTED AGAIN WHEN WHAT IT WAS COMPLETED WITH IS NOT WHAT
+	// THIS DEPLOYMENT ACCEPTS: a component accepted since, a completion that failed
+	// and left the image as published newest, or an acceptance withdrawn.
+	record, recorded, err := store.Components(ctx, image, newest.Name)
+	if err != nil {
+		return false, "", fmt.Errorf("refresh %s: %w", image, err)
+	}
+
+	if missing, unaccepted := completionGap(record, recorded, accepted); len(missing) > 0 || len(unaccepted) > 0 {
+		var differs []string
+		if len(missing) > 0 {
+			differs = append(differs, "lacks "+strings.Join(missing, ", ")+", which this deployment accepts")
+		}
+		if len(unaccepted) > 0 {
+			differs = append(differs, "carries "+strings.Join(unaccepted, ", ")+
+				", which this deployment no longer accepts")
+		}
+
+		return true, fmt.Sprintf("the newest generation %s %s", newest.Name,
+			strings.Join(differs, ", and ")), nil
 	}
 
 	return false, fmt.Sprintf("the newest generation %s was imported %s, after the channel's "+

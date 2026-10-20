@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -57,6 +58,10 @@ const (
 
 	// maxReportLines bounds what the guest may claim, at four lines per component.
 	maxReportLines = 4 * imagesource.MaxComponents
+
+	// maxReportLineBytes bounds one line of it: a component name and a version are
+	// under a hundred bytes.
+	maxReportLineBytes = 256
 )
 
 // completionVersionPattern is what a recorded version may be, the same shape the
@@ -108,19 +113,33 @@ var (
 	openCompletionStore = func(cfg *config.Config) (completionStore, error) {
 		return ceph.New(*cfg.Node.Ceph)
 	}
+
+	openComponentsReader = func(cfg *config.Config) (componentsReader, error) {
+		return ceph.New(*cfg.Node.Ceph)
+	}
 )
 
 // completionStore is what a completion asks of the cluster: a generation to boot
-// the completion microVM from, and the removal of a staged one.
+// the completion microVM from, and the kernel it is paired with.
 type completionStore interface {
 	NewestVerifiedForContract(ctx context.Context, image, contract string) (ceph.Generation, bool, error)
-	RemoveCompletionRoot(ctx context.Context, name string) error
+	Kernel(ctx context.Context, image, generation string) (string, bool, error)
 }
 
-// stageRoot imports the image as published, under the completion root's name,
-// and returns the generation. The pull supplies it, because a staged generation
-// names the kernel the pull installs, under the pull's kernel lock.
-type stageRoot func(ctx context.Context, name string) (string, error)
+// importAsPublished imports the image being completed as it was published, as a
+// generation recording the components it leaves out and none installed, and
+// returns that generation. The pull supplies it, because the generation names the
+// kernel the pull installs, under the pull's kernel lock.
+//
+// SUCH A GENERATION IS NEVER VERIFIED, because it lacks what this deployment
+// accepted, and so no tier naming @verified ever boots it; it exists to be the
+// completion microVM's root.
+type importAsPublished func(ctx context.Context) (string, error)
+
+// errCompletionLeftRunning is a completion whose microVM was not proved gone. The
+// loop device and the file it backs are left in place, because releasing either
+// under a guest that may still be writing is the failure the proof exists for.
+var errCompletionLeftRunning = errors.New("the completion microVM was not proved gone")
 
 // completeImage installs plan.Install into the root filesystem at raw, through a
 // completion microVM, and returns the version installed of each. It fails unless
@@ -128,7 +147,8 @@ type stageRoot func(ctx context.Context, name string) (string, error)
 // failure raw must not be imported.
 func completeImage(
 	ctx context.Context, env cli.Env, cfg *config.Config,
-	image, raw string, plan completionPlan, wait time.Duration, stage stageRoot,
+	image, raw, kernelDir string, plan completionPlan, wait time.Duration,
+	asPublished importAsPublished,
 ) (map[string]string, error) {
 	if len(plan.Install) == 0 {
 		return map[string]string{}, nil
@@ -141,61 +161,63 @@ func completeImage(
 		return nil, err
 	}
 
-	// THE ROOT IS CHOSEN, AND ANY STAGING IMPORTED, BEFORE raw IS GROWN OR WRITTEN.
-	// A staging root is the image as published, and imported from a file the
-	// completion has started to change it would be neither that nor the result.
-	root, removeRoot, err := completionRoot(ctx, env, store, image, stage)
+	// THE ROOT IS CHOSEN, AND ANY IMPORT OF THE IMAGE AS PUBLISHED MADE, BEFORE raw
+	// IS GROWN OR WRITTEN. Imported from a file the completion has started to
+	// change, it would be neither the published image nor the result.
+	root, err := completionRoot(ctx, env, store, image, kernelDir, asPublished)
 	if err != nil {
 		return nil, err
 	}
 
-	installed, completeErr := completeOnRoot(ctx, env, cfg, root, raw, plan, wait)
-
-	return installed, errors.Join(completeErr, removeRoot())
+	return completeOnRoot(ctx, env, cfg, root, raw, plan, wait)
 }
 
 // completionRoot is the generation the completion microVM boots: the newest of
-// this image proved to boot under this binary's guest contract, or, on a site
-// that has none, a staging import of the image being completed. remove takes the
-// staging away again and does nothing for a real generation.
+// this image verified under this binary's guest contract whose kernel is on this
+// node, or else the image as published, imported as a generation of its own.
+//
+// THE KERNEL MUST BE HERE. A generation is paired with a kernel file, and a node
+// that joined a site after it was verified has never installed that file, so the
+// launch would refuse; the image as published carries its own, installed by this
+// pull.
 func completionRoot(
-	ctx context.Context, env cli.Env, store completionStore, image string, stage stageRoot,
-) (string, func() error, error) {
-	nothing := func() error { return nil }
-
+	ctx context.Context, env cli.Env, store completionStore,
+	image, kernelDir string, asPublished importAsPublished,
+) (string, error) {
 	newest, ok, err := store.NewestVerifiedForContract(ctx, image, firecracker.GuestContract)
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
+
 	if ok {
-		return image + "@" + newest.Name, nothing, nil
+		kernel, recorded, err := store.Kernel(ctx, image, newest.Name)
+		if err != nil {
+			return "", err
+		}
+
+		if !recorded || regularFileExists(filepath.Join(kernelDir, kernel)) {
+			return image + "@" + newest.Name, nil
+		}
+
+		fmt.Fprintf(env.Stdout, "the newest verified generation %s@%s is paired with a kernel this "+
+			"node does not have, so the completion boots the image as published\n", image, newest.Name)
 	}
 
-	staging := ceph.CompletionRoot(image)
-
-	// LEFTOVERS FIRST. A completion that died left its root behind, and a second
-	// generation of it would only be more to remove.
-	if err := store.RemoveCompletionRoot(ctx, staging); err != nil {
-		return "", nil, err
-	}
-
-	fmt.Fprintf(env.Stdout, "no generation of %s is verified yet, so the completion boots a "+
-		"staging copy of it, %s\n", image, staging)
-
-	generation, err := stage(ctx, staging)
+	generation, err := asPublished(ctx)
 	if err != nil {
-		return "", nil, errors.Join(err, store.RemoveCompletionRoot(context.WithoutCancel(ctx), staging))
+		return "", err
 	}
 
-	return staging + "@" + generation, func() error {
-		// ON A CONTEXT OF ITS OWN, because removal is owed even when the
-		// completion was cancelled, and is what a later pull would otherwise have
-		// to find.
-		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-		defer cancel()
+	fmt.Fprintf(env.Stdout, "imported %s@%s, the image as published, to boot the completion from; "+
+		"it is never verified, because it lacks what this deployment accepted\n", image, generation)
 
-		return store.RemoveCompletionRoot(removeCtx, staging)
-	}, nil
+	return image + "@" + generation, nil
+}
+
+func regularFileExists(path string) bool {
+	info, err := os.Stat(path)
+
+	return err == nil && info.Mode().IsRegular()
 }
 
 // completeOnRoot grows raw by what plan installs, attaches it as a block device and
@@ -213,14 +235,23 @@ func completeOnRoot(
 		return nil, err
 	}
 
-	installed, runErr := runCompletion(ctx, env, cfg, root, device, plan, wait)
+	installed, gone, runErr := runCompletion(ctx, env, cfg, root, device, plan, wait)
 
-	// DETACHED AFTER THE MICROVM IS GONE, which runCompletion's destroy proves;
-	// detaching under a running guest would cut off a write it had not finished.
+	// DETACHED ONLY ONCE THE MICROVM IS PROVED GONE. A guest that may still be
+	// running may still be writing, and a detach under it cuts off the write.
+	if !gone {
+		return nil, errors.Join(runErr, fmt.Errorf("billet images pull: %w; %s and %s, which it "+
+			"may still be writing, are left in place", errCompletionLeftRunning, device, raw))
+	}
+
 	detachCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
 
-	return installed, errors.Join(runErr, detach(detachCtx))
+	if err := errors.Join(runErr, detach(detachCtx)); err != nil {
+		return nil, err
+	}
+
+	return installed, nil
 }
 
 // growForCompletion extends raw by the space each component it installs declares.
@@ -243,31 +274,33 @@ func growForCompletion(raw string, plan completionPlan) error {
 	return nil
 }
 
-// runCompletion boots the completion microVM and judges what it reports.
+// runCompletion boots the completion microVM and judges what it reports. gone is
+// whether no microVM holding device remains: nothing was launched with it, or the
+// one launched was destroyed and the backend confirmed it.
 func runCompletion(
 	ctx context.Context, env cli.Env, cfg *config.Config,
 	root, device string, plan completionPlan, wait time.Duration,
-) (map[string]string, error) {
+) (map[string]string, bool, error) {
 	deployment, err := verifyDeploymentID(cfg)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 
 	// THE PROBE'S IDENTITY AND ITS LOCK, so the node's sweep leaves the microVM
 	// alone and no verification on this host is the same microVM at once.
 	prov, err := newCompletionProvider(cfg, probeDeployment(deployment))
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 
 	lease, err := probeLeaseID(deployment)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 
 	lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 
 	defer func() {
@@ -277,11 +310,13 @@ func runCompletion(
 	}()
 
 	if err := lock.hold(); err != nil {
-		return nil, err
+		return nil, true, err
 	}
 
+	// A PROBE AN EARLIER RUN LEFT is not one holding this device, so failing to
+	// remove it leaves nothing of this run's behind.
 	if err := destroyProbe(ctx, prov, provider.InstanceName(lease)); err != nil {
-		return nil, err
+		return nil, true, err
 	}
 
 	var installed map[string]string
@@ -313,12 +348,65 @@ func runCompletion(
 		silent: "so nothing was installed into the image and it has not been imported",
 	}
 
-	if err := runGuestProbe(ctx, env, prov, cfg.Node.Firecracker.Bridge,
-		cfg.Node.Firecracker.ImageVerifyPort, probe, lock.hold); err != nil {
-		return nil, err
+	result := runGuestProbe(ctx, env, prov, cfg.Node.Firecracker.Bridge,
+		cfg.Node.Firecracker.ImageVerifyPort, probe, lock.hold)
+	if err := errors.Join(result.verdict, result.cleanup); err != nil {
+		return nil, result.gone, err
 	}
 
-	return installed, nil
+	return installed, result.gone, nil
+}
+
+// componentsReader reads what a generation's image left out and what was installed.
+type componentsReader interface {
+	Components(ctx context.Context, image, generation string) (ceph.GenerationComponents, bool, error)
+}
+
+// completionGap compares a generation's components record with what this
+// deployment accepts: missing is what the image left out, the deployment accepts
+// and was not installed; unaccepted is what was installed and the deployment no
+// longer accepts. A generation with no record left nothing out.
+func completionGap(record ceph.GenerationComponents, found bool, accepted []config.ImageComponent,
+) ([]string, []string) {
+	if !found {
+		return nil, nil
+	}
+
+	var missing, unaccepted []string
+
+	for _, name := range record.LeftOut {
+		_, installed := record.Installed[name]
+		isAccepted := slices.Contains(accepted, config.ImageComponent(name))
+		switch {
+		case isAccepted && !installed:
+			missing = append(missing, name)
+		case !isAccepted && installed:
+			unaccepted = append(unaccepted, name)
+		}
+	}
+
+	return missing, unaccepted
+}
+
+// refuseIncomplete refuses to let image@generation be verified when it lacks a
+// component this deployment accepts, which is the image as published that a
+// completion boots from, or one whose completion failed. Verified, @verified
+// would move every tier onto it.
+func refuseIncomplete(ctx context.Context, store componentsReader, command, image, generation string,
+	accepted []config.ImageComponent,
+) error {
+	record, found, err := store.Components(ctx, image, generation)
+	if err != nil {
+		return err
+	}
+
+	if missing, _ := completionGap(record, found, accepted); len(missing) > 0 {
+		return fmt.Errorf("%s: %s@%s lacks %s, which this deployment accepts, so it is not marked "+
+			"verified; `billet images pull` completes a new generation of the image",
+			command, image, generation, strings.Join(missing, ", "))
+	}
+
+	return nil
 }
 
 // completionCommand is the guest's half of completion contract 1: prepare the
@@ -387,6 +475,11 @@ func checkCompletionReport(body, secret string, plan completionPlan) (map[string
 
 	fields := map[string][]string{}
 	for _, line := range lines {
+		if len(line) > maxReportLineBytes {
+			return nil, fmt.Errorf("billet images pull: the completion reported a line of %d bytes, "+
+				"past the %d one may be", len(line), maxReportLineBytes)
+		}
+
 		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
 		if !ok {
 			return nil, errors.New("billet images pull: the completion reported a line that is " +
