@@ -21,6 +21,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`cut-release.yml` calls `release.yml` rather than relying on the tag push.** A ref pushed with `GITHUB_TOKEN` starts no workflow.
 - **Cut Release previews what a release carries and cuts only on `confirm=<tag>@<commit>` (#145).** The report is a report, not a policy; the token binds the cut to the commit that was read.
 - **Installing the package directly is not a transactional upgrade.**
+- **A release carries the third-party notices of everything it contains.** `scripts/mknotices` writes them; a dependency change regenerates them in the same PR.
 
 ### Automatic updates: [references/automatic-updates.md](references/automatic-updates.md)
 
