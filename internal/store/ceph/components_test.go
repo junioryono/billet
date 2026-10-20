@@ -380,6 +380,51 @@ func TestAReservationOnAListingThatAnswersENOENTClearsNothing(t *testing.T) {
 	}
 }
 
+// A LISTING'S ENOENT IS ABSENCE ONLY WHEN `info` SAYS SO: an image that is not there
+// yet is a first import and proceeds, and an `info` that fails otherwise cannot
+// tell, so the import is refused with nothing cleared.
+func TestAListingThatAnswersENOENTIsAbsenceOnlyWhenTheImageIs(t *testing.T) {
+	const orphan = "c20260801000000"
+
+	for name, tc := range map[string]struct {
+		failOn    string
+		published bool
+	}{
+		"the image is absent":              {"", true},
+		"whether it exists cannot be read": {"info", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, device := stageRaw(t, "content")
+			f := &importFake{
+				device:         device,
+				failOn:         tc.failOn,
+				snapListENOENT: true,
+				metadata:       "Key  Value\n" + CompletionRootOwnerKey + "." + orphan + "  epyc-1\n",
+			}
+
+			_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+				"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
+			if tc.published {
+				if err != nil {
+					t.Fatalf("a first import on an absent image was refused: %v", err)
+				}
+				if !f.ranWith("snap", "create") {
+					t.Fatalf("a first import made no snapshot; billet ran %v", f.calls)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), "whether the image exists could not be read") {
+				t.Fatalf("got %v, want the import refused on an image that cannot be read", err)
+			}
+			if f.ranWith("image-meta", "remove", "ubuntu-2404-x64") || f.ranWith("snap", "create") {
+				t.Fatalf("an unreadable image was acted on; billet ran %v", f.calls)
+			}
+		})
+	}
+}
+
 // A COMPLETION ROOT THAT COULD NOT BE WITHDRAWN KEEPS ITS METADATA, owner included:
 // its absence is confirmed on every snapshot, not on the generations, which leave
 // a completion root out and would have read it as gone.
