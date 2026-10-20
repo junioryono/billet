@@ -91,7 +91,8 @@
               billet_firecracker_links.changed | default(false) or
               (billet_server_environment | default({}) | length > 0 and
                billet_server_environment_install.changed | default(false)) or
-              (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0)
+              (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0) or
+              billet_node_drain_owed_dir | default('') | length > 0
         - file: services.yml
           name: Enable and start the billet node
           conditions: [billet_node_should_run, not ansible_check_mode]

@@ -479,6 +479,89 @@
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
 
+# A DRAIN THE NODE OWES (#127), from an earlier converge that recorded it and
+# never proved it, names the record that must prove it. A node configured under
+# any other state directory would leave that record, and whatever compute it
+# names, to nobody.
+- name: Read the drain the billet node owes before its configuration changes
+  ansible.builtin.include_tasks: node-drain-owed.yml
+
+- name: Refuse a node elsewhere than the record whose drain it owes
+  ansible.builtin.assert:
+    that:
+      - billet_node_drain_owed_dir == billet_candidate_node_state_dir
+    fail_msg: >-
+      A node this host ran under {{ billet_node_drain_owed_dir }} owes a drain an
+      earlier converge never proved ({{ billet_node_drain_owed_path }}). Refusing
+      to run a node under {{ billet_candidate_node_state_dir }} beside it:
+      converge the node back under its own state directory, where its drain is
+      judged, or prove that nothing is left and remove
+      {{ billet_node_drain_owed_path }}.
+  when:
+    - billet_effective_config.get('node') is mapping
+    - billet_node_drain_owed_dir | length > 0
+
+# A CHANGED CONFIGURATION'S DRAIN IS ASKED FOR BEFORE IT IS INSTALLED (#374,
+# #127): the request makes the running node's next stop a drain, and the owed
+# drain outlives a converge that fails after the install, which the
+# configuration does not, since the next converge finds it unchanged. A
+# rendering previewed in check mode says whether it changes.
+- name: Preview whether this converge changes the billet configuration
+  vars:
+    billet_config_document: "{{ billet_effective_config }}"
+  ansible.builtin.template:
+    src: billet.yaml.j2
+    dest: "{{ billet_ordinary_config_path }}"
+    owner: root
+    group: "{{ billet_service_group }}"
+    mode: "0640"
+  check_mode: true
+  register: billet_config_preview
+  become: true
+  when: not billet_binary_upgrade | default(false)
+
+- name: Make the node's next stop a drain before its configuration changes
+  ansible.builtin.include_tasks: request-node-drain.yml
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+    - not billet_binary_upgrade | default(false)
+    - billet_config_preview.changed | default(false)
+
+# A NODE THIS CONVERGE CHANGES OR RENDERS AWAY OWES ITS DRAIN, recorded where
+# the record is before the configuration changes: once it names no node, only
+# this says where that is.
+- name: Record the drain the billet node owes before its configuration changes
+  ansible.builtin.copy:
+    content: "{{ billet_previous_node_state_dir }}\n"
+    dest: "{{ billet_node_drain_owed_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  register: billet_node_drain_owed_write
+  become: true
+  when:
+    - billet_previous_config.get('node') is mapping
+    - billet_effective_config.get('node') is not mapping or billet_config_preview.changed | default(false)
+    - not ansible_check_mode
+
+# DURABLE BEFORE THE RENDER IT GUARDS: a rename is atomic, not durable, so a
+# crash could otherwise keep the new configuration and lose the drain it owes.
+# Flushed whenever it is written, changed or not: a retry after a converge that
+# wrote it and failed before the flush finds it unchanged and still unflushed.
+- name: Flush the drain the billet node owes before its configuration changes
+  ansible.builtin.command:
+    argv: [sync, -f, "{{ billet_node_drain_owed_path }}"]
+  changed_when: false
+  become: true
+  when: billet_node_drain_owed_write is not skipped
+
+- name: Note the record whose drain this converge owes
+  ansible.builtin.set_fact:
+    billet_node_drain_owed_dir: "{{ billet_previous_node_state_dir }}"
+    billet_node_drain_proved: false
+  when: billet_node_drain_owed_write is not skipped
+
 - name: Render billet configuration
   vars:
     billet_config_document: "{{ billet_effective_config }}"

@@ -1,144 +1,545 @@
 ---
-# THE ORDINARY NODE RESTART AGAINST A SCRIPTED systemctl. The restart must be
-# requested with --no-block and proved by polling for an active, running node
-# under a MainPID other than the one recorded before it, with no job queued. A
-# poll that never sees that ends at its deadline and says which of three things
-# it last read: nothing usable (could not tell), the old process or a queued job
-# still in charge (still draining), or anything else (did not come back). Each
-# case drives the production task file through include_role; the fake answers
-# only the requests that file makes. A case that succeeds waits 30 seconds and
-# is ended by its script, never the deadline; one that fails waits 3 and reads
-# one state throughout, and its poll count is a range because the deadline, not
-# the count, ends it (one read on a controller slow enough to spend the three
-# seconds before the first).
-- name: Prove the node restart is requested without waiting and polled to a new main process
+# THE ORDINARY NODE RESTART AGAINST A SCRIPTED systemctl AND billet. The
+# restart is a stop and a start, each requested with --no-block and polled: the
+# stop until no process and no job remain, then proved by the stopped
+# invocation's own ending (`billet node ending check`, #127), then the start
+# admitted (`billet node ending admit-start`), requested, and proved by an
+# active, running node under a MainPID other than the one recorded before it,
+# with no job queued. A node from before the record (no answerer, or one that
+# refuses the word) is judged by systemd's clean triple, the floor. Each case
+# drives the production task file through include_role; the fakes answer only
+# the requests that file makes, and `billet node ending` answers from the
+# fixtures the Go test wrote. A case that succeeds waits 30 seconds and is
+# ended by its script, never the deadline; one that fails waits 3 and reads one
+# state throughout, and its poll count is a range because the deadline, not
+# the count, ends it.
+- name: Prove the node restart is a polled stop, a proved ending and a gated start
   hosts: localhost
   connection: local
   gather_facts: false
   vars:
+    billet_gate_running: {ActiveState: active, SubState: running, MainPID: "100", InvocationID: 0123456789abcdef0123456789abcdef}
+    billet_gate_check: billet node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --json
+    billet_gate_admit: billet node ending admit-start --config /etc/billet/billet.yaml --json
+    billet_gate_check_drain: billet node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --drain --json
+    billet_gate_check_stopped: billet node ending check --config /etc/billet/billet.yaml --drain --json
     billet_gate_restart_cases:
       - name: restarts
         wait: 30
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
-        after:
+        before: "{{ billet_gate_running }}"
+        stopping:
           - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
-          - {ActiveState: activating, SubState: start, MainPID: "0", Job: "41"}
-          - {ActiveState: active, SubState: running, MainPID: "200"}
-        succeeds: true
-        polls: [3, 3]
-      # A NOTIFY SERVICE HAS ITS NEW MAIN PROCESS BEFORE IT IS READY: a new
-      # MainPID alone is not the proof, active and running are too.
-      - name: new-process-before-ready
-        wait: 30
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+          - {ActiveState: inactive, SubState: dead, MainPID: "0"}
         after:
-          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
-          - {ActiveState: activating, SubState: start, MainPID: "200"}
+          - {ActiveState: activating, SubState: start, MainPID: "0", Job: "42"}
           - {ActiveState: active, SubState: running, MainPID: "200"}
         succeeds: true
-        polls: [3, 3]
-      # A NEW PROCESS BESIDE A QUEUED JOB started before this request, and the
-      # requested restart is still to come.
-      - name: new-process-before-the-job-ran
-        wait: 30
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
-        after:
-          - {ActiveState: active, SubState: running, MainPID: "150", Job: "41"}
-          - {ActiveState: active, SubState: running, MainPID: "200"}
-        succeeds: true
+        stop_polls: [3, 4]
         polls: [2, 2]
-      # A NODE THAT WAS NOT RUNNING HAS NO OLD MAIN PROCESS: MainPID=0 before.
+      # THE RECORD PROVES THE STOP AND ADMITS THE START, asked about the
+      # invocation read before the stop, with no drain required.
+      - name: proved-by-the-record
+        wait: 30
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-handoff, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
+      # A NODE KILLED AT ITS STOP: systemd's account is clean, the record is
+      # not, and the node is not started.
+      - name: stop-unproved
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-unproved, rc: 2}
+        succeeds: false
+        starts: 0
+        endings: ["{{ billet_gate_check }}"]
+        message: [killed or crashed, "billet node ending acknowledge --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --json", The node is left as it is]
+      - name: stop-unknown
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-unknown, rc: 3}
+        succeeds: false
+        starts: 0
+        message: [is unknown by the node's own ending]
+      - name: start-refused
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-handoff, rc: 0}
+          admit-start: {fixture: admit-start-unproved, rc: 2}
+        succeeds: false
+        starts: 0
+        message: [is not started, killed or crashed]
+      # A CHANGED CONFIGURATION ASKED FOR A DRAIN, so the stop must have drained.
+      - name: config-changed-requires-a-drain
+        wait: 30
+        config_changed: true
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      # AN ANSWER TO ANOTHER QUESTION: a proof of some other invocation, or of
+      # a drain nobody asked about, is not a proof of this stop.
+      - name: answer-about-another-invocation
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-floor, rc: 0, verbatim: true}
+        succeeds: false
+        starts: 0
+        message: [cannot read, invocation]
+      - name: answer-without-the-drain-asked
+        config_changed: true
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {raw: '{"schema":1,"command":"check","outcome":"proved","proof":"record","why":"x","invocation":"0123456789abcdef0123456789abcdef"}', rc: 0}
+        succeeds: false
+        starts: 0
+        message: [cannot read, drain]
+      # THE EXECUTABLES ARE TRIED IN ORDER: one from before the record defers
+      # to the next, the first that answers decides, and only when every one
+      # is from before the record is systemd's account the floor.
+      - name: older-then-newer
+        wait: 30
+        with: [older, billet]
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: inactive, SubState: dead, Result: timeout, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-handoff, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
+      - name: every-one-older
+        with: [older, older]
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: failed, SubState: failed, Result: timeout, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: false
+        starts: 0
+        message: [from before the node's ending record, Result=timeout]
+      - name: newer-fails-before-an-older
+        with: [billet, older]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {stderr: "boom\n", rc: 1}
+        succeeds: false
+        starts: 0
+        message: [did not answer, boom]
+        absent: [from before the node's ending record]
+      # ONE THAT CANNOT RUN DOES NOT DECIDE when a later one answers, and a
+      # later failure is not the floor an earlier older release would allow.
+      - name: unrunnable-then-newer
+        wait: 30
+        with: [missing, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-handoff, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
+      - name: older-then-a-failure
+        with: [older, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {stderr: "boom\n", rc: 1}
+        succeeds: false
+        starts: 0
+        message: [did not answer, boom]
+        absent: [from before the node's ending record]
+      - name: older-then-unproved
+        with: [older, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-unproved, rc: 2}
+        succeeds: false
+        starts: 0
+        message: [killed or crashed]
+        absent: [from before the node's ending record]
+      # THE FIRST ANSWER DECIDES, whatever a later one would have said: the
+      # stopped node's own release first, a candidate after it.
+      - name: first-answer-refuses
+        with: [billet, candidate]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          billet: {check: {fixture: check-unproved, rc: 2}}
+          candidate: {check: {fixture: check-proved-handoff, rc: 0}}
+        succeeds: false
+        starts: 0
+        endings: ["{{ billet_gate_check }}", "candidate {{ billet_gate_check[7:] }}"]
+        message: [killed or crashed]
+      - name: first-answer-proves
+        wait: 30
+        with: [candidate, billet]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          billet: {check: {fixture: check-unproved, rc: 2}, admit-start: {fixture: admit-start-unproved, rc: 2}}
+          candidate: {check: {fixture: check-proved-handoff, rc: 0}, admit-start: {fixture: admit-start-proved, rc: 0}}
+        succeeds: true
+      # EACH EXECUTABLE READS THE CONFIGURATION IT IS PAIRED WITH.
+      - name: each-with-its-own-configuration
+        wait: 30
+        with: [older, "candidate:/var/lib/billet/recovery/billet.yaml.candidate"]
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          candidate: {check: {fixture: check-proved-handoff, rc: 0}, admit-start: {fixture: admit-start-proved, rc: 0}}
+        succeeds: true
+        asked:
+          - older node ending check --config /etc/billet/billet.yaml --invocation 0123456789abcdef0123456789abcdef --json
+          - candidate node ending check --config /var/lib/billet/recovery/billet.yaml.candidate --invocation 0123456789abcdef0123456789abcdef --json
+          - older node ending admit-start --config /etc/billet/billet.yaml --json
+          - candidate node ending admit-start --config /var/lib/billet/recovery/billet.yaml.candidate --json
+      # A DRAIN ASKED FOR BY A REQUEST AN EARLIER CONVERGE LEFT, with the
+      # configuration already installed: the stop must still have drained.
+      - name: drain-request-left-behind
+        wait: 30
+        drain_requested: true
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      # A STOPPED NODE WHERE A DRAIN IS ASKED FOR is judged by what its last
+      # process left before anything starts over it: a handoff is not a drain.
+      - name: stopped-handoff-under-a-drain
+        drain_requested: true
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0", InvocationID: ""}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "300"}
+        ending:
+          check: {fixture: check-stopped-unproved, rc: 2}
+        succeeds: false
+        stops: 0
+        starts: 0
+        endings: ["{{ billet_gate_check_stopped }}"]
+        message: [had no process to stop, never adopted]
+      - name: stopped-drained-under-a-changed-configuration
+        wait: 30
+        config_changed: true
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0", InvocationID: ""}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "300"}
+        ending:
+          check: {fixture: check-stopped-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        stops: 0
+        endings: ["{{ billet_gate_check_stopped }}", "{{ billet_gate_admit }}"]
+      # THE SHARED TASK FILE ASKED AS THE CALLERS THAT JUDGE A NODE WITH NO
+      # PROCESS TO STOP ASK IT: no invocation, the drain, and the record a
+      # configuration no longer names.
+      - name: standing-proved
+        direct: {drain: true, state_dir: /var/lib/old-node}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        ending:
+          check: {fixture: check-stopped-proved, rc: 0}
+        succeeds: true
+        stops: 0
+        starts: 0
+        endings: [billet node ending check --config /etc/billet/billet.yaml --drain --state-dir /var/lib/old-node --json]
+      - name: standing-unproved
+        direct: {drain: true}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        ending:
+          check: {fixture: check-stopped-unproved, rc: 2}
+        succeeds: false
+        stops: 0
+        starts: 0
+        endings: ["{{ billet_gate_check_stopped }}"]
+        message: [had no process to stop, never adopted, "--invocation inv-1"]
+      - name: standing-answered-about-an-invocation
+        direct: {drain: true}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        ending:
+          check: {raw: '{"schema":1,"command":"check","outcome":"proved","proof":"record","why":"x","invocation":"inv-1","drain":true}', rc: 0}
+        succeeds: false
+        stops: 0
+        starts: 0
+        message: [cannot read, invocation]
+      # THE DRAIN THE NODE OWES: the record an earlier converge recorded,
+      # none when nothing is recorded, and a record that names nothing or
+      # cannot be read refuses.
+      - name: owed-drain-recorded
+        owed_file: {record: /srv/node-state}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: true
+        stops: 0
+        starts: 0
+        resolves: /srv/node-state
+      - name: owed-drain-none
+        owed_file: {}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: true
+        stops: 0
+        starts: 0
+        resolves: ""
+      - name: owed-drain-naming-nothing
+        owed_file: {record: ""}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: false
+        stops: 0
+        starts: 0
+        message: [names no node state directory]
+      - name: owed-drain-unreadable
+        owed_file: {unreadable: true}
+        before: "{{ billet_gate_running }}"
+        after: [{ActiveState: active, SubState: running, MainPID: "100"}]
+        succeeds: false
+        stops: 0
+        starts: 0
+        resolves: unresolved
+        message: [is a directory]
+      # A DRAIN AN EARLIER CONVERGE OWES makes the restart's stop a drain, and
+      # a stopped node's start wait on one.
+      - name: owed-drain-on-a-running-node
+        wait: 30
+        owed: /srv/node-state
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      - name: owed-drain-on-a-stopped-handoff
+        owed: /srv/node-state
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0", InvocationID: ""}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "300"}
+        ending:
+          check: {fixture: check-stopped-unproved, rc: 2}
+        succeeds: false
+        stops: 0
+        starts: 0
+        endings: ["{{ billet_gate_check_stopped }}"]
+        message: [had no process to stop, never adopted]
+      # A MEMBER THE PARSER CANNOT READ, AND AN EXIT THAT DOES NOT MATCH THE
+      # OUTCOME, end the restart with the node stopped.
+      - name: answer-with-a-surprise
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {raw: '{"schema":1,"command":"check","outcome":"proved","proof":"record","why":"x","invocation":"inv-1","surprise":1}', rc: 0}
+        succeeds: false
+        starts: 0
+        message: [answered with a member this role cannot read]
+      - name: exit-that-does-not-match
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-unproved, rc: 0}
+        succeeds: false
+        starts: 0
+        message: [answered with a member this role cannot read]
+      - name: no-answer
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {stderr: "boom\n", rc: 1}
+        succeeds: false
+        starts: 0
+        message: [did not answer, boom]
+      # A RELEASE FROM BEFORE THE RECORD refuses the word and runs nothing:
+      # systemd's clean triple is the floor, and a killed stop is not clean.
+      - name: older-release-clean
+        wait: 30
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {stderr: "billet node: unexpected argument \"ending\"\n", rc: 1}
+          admit-start: {stderr: "billet node: unexpected argument \"ending\"\n", rc: 1}
+        succeeds: true
+      - name: older-release-killed
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: failed, SubState: failed, Result: timeout, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {stderr: "billet node: unexpected argument \"ending\"\n", rc: 1}
+        succeeds: false
+        starts: 0
+        message: [from before the node's ending record, Result=timeout]
+      - name: older-release-inactive-timeout
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: inactive, SubState: dead, Result: timeout, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: false
+        starts: 0
+        message: [from before the node's ending record, Result=timeout]
+      # A STOPPED UNIT WITH A JOB STILL QUEUED is not one with no process to
+      # come: the poll goes on until the job is gone.
+      - name: stopped-with-a-job-queued
+        wait: 30
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: inactive, SubState: dead, MainPID: "0", Job: "43"}
+          - {ActiveState: inactive, SubState: dead, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: true
+        stop_polls: [4, 4]
+      - name: no-answerer-killed
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: failed, SubState: failed, Result: timeout, MainPID: "0"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: false
+        starts: 0
+        message: [from before the node's ending record]
+      # A NODE THAT WAS NOT RUNNING HAS NO STOP TO PROVE: the start is gated
+      # and proved by a process, against MainPID=0 before.
       - name: first-start
         wait: 30
-        before: {ActiveState: inactive, SubState: dead, MainPID: "0"}
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0", InvocationID: ""}
         after:
           - {ActiveState: activating, SubState: start, MainPID: "0", Job: "41"}
           - {ActiveState: active, SubState: running, MainPID: "300"}
+        ending:
+          admit-start: {fixture: admit-start-proved, rc: 0}
         succeeds: true
+        stops: 0
+        endings: ["{{ billet_gate_admit }}"]
         polls: [2, 2]
-      - name: still-draining
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+      - name: running-without-an-invocation
+        before: {ActiveState: active, SubState: running, MainPID: "100", InvocationID: ""}
         after:
-          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
+          - {ActiveState: active, SubState: running, MainPID: "200"}
         succeeds: false
-        polls: [1, 5]
-        message: [still draining, "`systemctl show billet-node -p ActiveState,SubState,MainPID`", MainPID=100, billet_node_restart_wait]
-        absent: [did not come back, could not be told]
+        stops: 0
+        starts: 0
+        message: [names no InvocationID, Nothing was stopped]
+      - name: stop-still-draining
+        before: "{{ billet_gate_running }}"
+        stopping:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: false
+        starts: 0
+        stop_polls: [1, 5]
+        message: [still draining, billet_node_restart_wait]
       # THE DEADLINE ENDS THE POLL, NOT THE COUNT: three seconds at a
-      # two-second interval caps the loop at four reads, and the third is
-      # already past the deadline.
+      # two-second interval caps the loop at four reads.
       - name: deadline-ends-the-poll
         interval: 2
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
-        after:
+        before: "{{ billet_gate_running }}"
+        stopping:
           - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
-        succeeds: false
-        polls: [1, 3]
-        message: [still draining]
-      # BACK WHERE IT WAS IS NOT A RESTART: the job left the queue, and the
-      # same main process still runs the old inputs.
-      - name: same-main-process
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
         after:
-          - {ActiveState: active, SubState: running, MainPID: "100"}
+          - {ActiveState: active, SubState: running, MainPID: "200"}
         succeeds: false
-        polls: [1, 5]
-        message: [still draining, "ActiveState=active SubState=running"]
-      - name: queued-behind-a-new-process
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        starts: 0
+        stop_polls: [1, 3]
+        message: [still draining]
+      - name: start-still-queued
+        before: "{{ billet_gate_running }}"
         after:
           - {ActiveState: active, SubState: running, MainPID: "150", Job: "41"}
         succeeds: false
         polls: [1, 5]
-        message: [still draining, Job=41]
+        message: [still queued, Job=41]
       - name: never-ready
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        before: "{{ billet_gate_running }}"
         after:
           - {ActiveState: activating, SubState: start, MainPID: "200"}
         succeeds: false
         polls: [1, 5]
         message: [did not come back, ActiveState=activating, "`journalctl -u billet-node`"]
-        absent: [still draining, could not be told]
+        absent: [still queued, could not be told]
       - name: failed
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        before: "{{ billet_gate_running }}"
         after:
           - {ActiveState: failed, SubState: failed, MainPID: "0"}
         succeeds: false
         polls: [1, 5]
         message: [did not come back, ActiveState=failed]
-        absent: [still draining, could not be told]
-      # A READ THAT FAILED IS NOT A DRAIN: could not tell, never "still draining".
+        absent: [still queued, could not be told]
+      # A READ THAT FAILED IS NOT A START: could not tell.
       - name: unreadable-after
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        before: "{{ billet_gate_running }}"
         after:
           - {rc: 1}
         succeeds: false
         polls: [1, 5]
         message: [could not be told, systemctl show exited 1]
-        absent: [still draining, did not come back]
+        absent: [still queued, did not come back]
       # A READ MISSING A PROPERTY IS NOT AN ANSWER, even one that looks ready.
       - name: incomplete-after
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        before: "{{ billet_gate_running }}"
         after:
           - {raw: "ActiveState=active\nMainPID=200\nJob=\n"}
         succeeds: false
         polls: [1, 5]
         message: [could not be told]
-        absent: [still draining, did not come back]
+        absent: [still queued, did not come back]
       - name: unreadable-before
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        before: "{{ billet_gate_running }}"
         before_rc: 1
         after:
           - {ActiveState: active, SubState: running, MainPID: "200"}
         succeeds: false
-        restarts: 0
+        stops: 0
+        starts: 0
       - name: unusable-bound
         wait: soon
-        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        before: "{{ billet_gate_running }}"
         after:
           - {ActiveState: active, SubState: running, MainPID: "200"}
         succeeds: false
-        restarts: 0
+        stops: 0
+        starts: 0
         calls: 0
         message: [billet_node_restart_wait (soon), Nothing was restarted]
   tasks:
@@ -148,13 +549,14 @@
         suffix: -node-restart
       register: billet_gate_restart_root
 
-    - name: Install the scripted systemctl
+    - name: Install the scripted systemctl and billet
       ansible.builtin.copy:
-        dest: "{{ billet_gate_restart_root.path }}/systemctl"
+        dest: "{{ billet_gate_restart_root.path }}/{{ item }}"
         mode: "0755"
         content: |
           #!/bin/sh
-          exec '{{ ansible_playbook_python }}' '{{ playbook_dir }}/node-restart-systemctl.py' "$BILLET_GATE_RESTART_CASE" "$@"
+          exec '{{ ansible_playbook_python }}' '{{ playbook_dir }}/node-restart-systemctl.py' {{ item }} "$BILLET_GATE_RESTART_CASE" "$@"
+      loop: [systemctl, billet, candidate, older]
 
     - name: Exercise each restart case
       ansible.builtin.include_tasks: node-restart-case.yml

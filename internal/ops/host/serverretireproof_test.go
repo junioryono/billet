@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -182,8 +183,13 @@ func TestRetirementRequiresASuccessfulNodeStop(t *testing.T) {
 	cases := []struct {
 		name, active, sub, result string
 		unreadable                bool
+		// killed records the stopped invocation as never having written its
+		// ending, which a kill at the stop timeout leaves, under a triple
+		// reset-failed has made clean (#127).
+		killed bool
 	}{
 		{name: "successful drain", active: "inactive", sub: "dead", result: "success"},
+		{name: "killed, then reset-failed", active: "inactive", sub: "dead", result: "success", killed: true},
 		{name: "failed", active: "failed", sub: "failed", result: "exit-code"},
 		{name: "timeout", active: "inactive", sub: "dead", result: "timeout"},
 		{name: "missing result", active: "inactive", sub: "dead"},
@@ -213,6 +219,12 @@ func TestRetirementRequiresASuccessfulNodeStop(t *testing.T) {
 				f.manager.set(unit, "ActiveState", c.active)
 				f.manager.set(unit, "SubState", c.sub)
 				f.manager.set(unit, "Result", c.result)
+				if c.killed {
+					if _, err := nodeending.Begin(f.nodeState, nodeending.Entry{InvocationID: retainedInvocation,
+						Role: nodeending.RoleNode}, nil); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 
 			out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
@@ -225,8 +237,11 @@ func TestRetirementRequiresASuccessfulNodeStop(t *testing.T) {
 			}
 			m := retireAnswer(t, out)
 			why := "only inactive/dead/success permits restart"
-			if c.unreadable {
+			switch {
+			case c.unreadable:
 				why = "after the node stop: ask systemd"
+			case c.killed:
+				why = "killed or crashed"
 			}
 			if code != exitUnknown || m["reason"] != retireReasonRestart || !strings.Contains(whyOf(m), why) ||
 				m["state"] != string(retirement.PhaseConfigRewritten) {

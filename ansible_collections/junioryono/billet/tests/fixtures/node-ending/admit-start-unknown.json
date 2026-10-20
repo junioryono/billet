@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "command": "admit-start",
+  "outcome": "unknown",
+  "why": "the ending record could not be read: /var/lib/billet/node/endings.json is not an ending record: unexpected end of JSON input",
+  "acknowledge": "--reset-unreadable",
+  "unit": {
+    "active_state": "inactive",
+    "sub_state": "dead",
+    "result": "success",
+    "main_pid": "0",
+    "job": "",
+    "invocation_id": ""
+  }
+}

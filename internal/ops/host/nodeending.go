@@ -93,41 +93,95 @@ func NodeEnding(ctx context.Context, env cli.Env, args []string) error {
 	}
 }
 
+// endingTarget is the record a subcommand reads and the node it belongs to.
+type endingTarget struct {
+	cfg     *config.Config
+	cfgPath string
+	// stateDir is --state-dir, the configuration's node.state_dir, or, where
+	// the configuration names no node, the packaged one.
+	stateDir string
+	// runsOnHost is the configured provider's, and only for its own record: a
+	// record named any other way says nothing of what compute survives a
+	// reboot, so it asserts none.
+	runsOnHost bool
+}
+
+// endingPackagedStateDir is the packaged configuration's node.state_dir, read
+// where a configuration names no node: a node the package ran under it may
+// have left a record there however the configuration has been edited since.
+var endingPackagedStateDir = "/var/lib/billet/node"
+
+// endingStateDirFlag adds --state-dir to a subcommand that reads a record
+// another configuration may have named.
+func endingStateDirFlag(fs *flag.FlagSet) *string {
+	return fs.String("state-dir", "", "the node state directory whose record to read, in place of the "+
+		"configuration's node.state_dir: a converge that has already rendered the node's configuration away "+
+		"names the one its node used")
+}
+
 // endingFlags adds --config and --json to one subcommand's flag set, parses
-// it, and loads the node's configuration.
-func endingFlags(fs *flag.FlagSet, args []string) (*config.Config, error) {
+// it, and reads the configuration; stateDir is its --state-dir, or nil for a
+// subcommand that reads only the configuration's own record.
+func endingFlags(fs *flag.FlagSet, args []string, stateDir *string) (endingTarget, error) {
 	cfgPath := cli.AddConfigFlag(fs)
+	if stateDir == nil {
+		stateDir = new(string)
+	}
+
 	asJSON := fs.Bool("json", false, "print the answer as JSON (the only form)")
 
 	if err := cli.Parse(fs, args); err != nil {
-		return nil, err
+		return endingTarget{}, err
 	}
 
 	if !*asJSON {
-		return nil, fmt.Errorf("%s answers as JSON; pass --json", fs.Name())
+		return endingTarget{}, fmt.Errorf("%s answers as JSON; pass --json", fs.Name())
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := readEndingConfig(*cfgPath)
 	if err != nil {
-		return nil, err
+		return endingTarget{}, err
 	}
 
-	if cfg.Node == nil {
-		return nil, fmt.Errorf("%s has no node section", *cfgPath)
+	t := endingTarget{cfg: cfg, cfgPath: *cfgPath, stateDir: *stateDir}
+
+	switch {
+	case cfg.Node != nil && (t.stateDir == "" || t.stateDir == cfg.Node.StateDir):
+		t.stateDir = cfg.Node.StateDir
+		t.runsOnHost = cfg.Node.Provider.RunsOnHost()
+	case cfg.Node == nil && t.stateDir == "":
+		t.stateDir = endingPackagedStateDir
 	}
 
-	return cfg, nil
+	return t, nil
+}
+
+// readEndingConfig reads the node section alone: the record is judged on a
+// host whose configuration the loader as a whole would refuse (the package's
+// template before it is filled in, which a removal still has to judge), and
+// a configuration that is positively absent names no node.
+func readEndingConfig(path string) (*config.Config, error) {
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &config.Config{}, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	return parseConfiguration(path, body, false)
 }
 
 func endingShow(env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet node ending show", env.Stdout)
 
-	cfg, err := endingFlags(fs, args)
+	target, err := endingFlags(fs, args, endingStateDirFlag(fs))
 	if err != nil {
 		return err
 	}
 
-	rec, present, err := nodeending.Read(cfg.Node.StateDir)
+	rec, present, err := nodeending.Read(target.stateDir)
 	if err != nil {
 		return answerEnding(env, endingAnswer{Command: "show", Outcome: nodeending.Unknown.String(),
 			Why: err.Error()})
@@ -143,17 +197,13 @@ func endingShow(env cli.Env, args []string) error {
 
 func endingCheck(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet node ending check", env.Stdout)
-	invocation := fs.String("invocation", "", "the node unit's InvocationID, read before the stop (required)")
+	invocation := fs.String("invocation", "", "the node unit's InvocationID, read before the stop; with none, a "+
+		"node that had no process to stop is judged by what its last process left")
 	drain := fs.Bool("drain", false, "only a drain proves the stop")
 
-	cfg, err := endingFlags(fs, args)
+	target, err := endingFlags(fs, args, endingStateDirFlag(fs))
 	if err != nil {
 		return err
-	}
-
-	if *invocation == "" {
-		return errors.New("billet node ending check: --invocation is required: the stop is bound to the " +
-			"invocation read before it, since a clean stop clears systemd's")
 	}
 
 	if r := endingPlatform("check"); r != nil {
@@ -162,14 +212,24 @@ func endingCheck(ctx context.Context, env cli.Env, args []string) error {
 
 	var observed *endingUnitAnswer
 
-	j, recorded := nodeending.JudgeStop(cfg.Node.StateDir, *invocation, *drain, cfg.Node.Provider.RunsOnHost(),
-		func() nodeending.Unit {
-			var unit nodeending.Unit
+	sample := func() nodeending.Unit {
+		var unit nodeending.Unit
 
-			unit, observed = observeEndingUnit(ctx)
+		unit, observed = observeEndingUnit(ctx)
 
-			return unit
-		}, nil)
+		return unit
+	}
+
+	// A NODE THAT HAD NO PROCESS TO STOP, asked about by a retry or by an
+	// operation that found it already down: what its last process left
+	// decides, at the stop's own standard.
+	if *invocation == "" {
+		j := nodeending.JudgeStanding(target.stateDir, *drain, sample)
+
+		return answerEnding(env, endingAnswer{Command: "check", Drain: *drain, Unit: observed, judgement: &j})
+	}
+
+	j, recorded := nodeending.JudgeStop(target.stateDir, *invocation, *drain, target.runsOnHost, sample, nil)
 
 	answer := endingAnswer{Command: "check", Invocation: *invocation, Drain: *drain, Unit: observed, judgement: &j}
 
@@ -183,7 +243,7 @@ func endingCheck(ctx context.Context, env cli.Env, args []string) error {
 func endingAdmitStart(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet node ending admit-start", env.Stdout)
 
-	cfg, err := endingFlags(fs, args)
+	target, err := endingFlags(fs, args, endingStateDirFlag(fs))
 	if err != nil {
 		return err
 	}
@@ -194,7 +254,7 @@ func endingAdmitStart(ctx context.Context, env cli.Env, args []string) error {
 
 	var observed *endingUnitAnswer
 
-	j := admitStart(cfg.Node.StateDir, func() nodeending.Unit {
+	j := admitStart(target.stateDir, func() nodeending.Unit {
 		var unit nodeending.Unit
 
 		unit, observed = observeEndingUnit(ctx)
@@ -218,9 +278,16 @@ func endingAcknowledge(ctx context.Context, env cli.Env, args []string) error {
 	resetUnreadable := fs.Bool("reset-unreadable", false,
 		"set aside a record that cannot be read and acknowledge the stop it would have judged")
 
-	cfg, err := endingFlags(fs, args)
+	target, err := endingFlags(fs, args, nil)
 	if err != nil {
 		return err
+	}
+
+	// THE NODE'S OWN LOCK IS TAKEN THROUGH ITS CONFIGURATION, so the record
+	// acknowledged is that configuration's, never another directory's.
+	cfg := target.cfg
+	if cfg.Node == nil {
+		return fmt.Errorf("%s has no node section; an acknowledgement takes the node's own lock", target.cfgPath)
 	}
 
 	chosen := 0

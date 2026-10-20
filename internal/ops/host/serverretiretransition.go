@@ -16,10 +16,12 @@ import (
 	"github.com/junioryono/billet/internal/ops/setup"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
 
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/retirement"
 )
 
@@ -1100,6 +1102,23 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, r
 	}
 
+	// THE STOPPED INVOCATION, read before the stop because a clean stop clears
+	// systemd's, so the stop is proved by that process's own ending (#127).
+	cfg, err := config.Load(configPath)
+	if err == nil && cfg.Node == nil {
+		err = errors.New("it has no node section")
+	}
+
+	if err != nil {
+		return j, retireUnknown(retireReasonRestart, fmt.Sprintf("read the node's configuration at %s before its "+
+			"stop: %v; the node was not stopped", configPath, err), "")
+	}
+
+	invocation, err := invocationBeforeStop(ctx, endpointInspector())
+	if err != nil {
+		return j, retireUnknown(retireReasonRestart, err.Error(), "")
+	}
+
 	noteRetireMutation("service-operation", "stop "+nodeUnit)
 	if _, err := c.StopAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "stop "+nodeUnit+": "+err.Error(), "")
@@ -1117,6 +1136,15 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, retireUnknown(retireReasonRestart, fmt.Sprintf("the successful stop of %s is not proved: "+
 			"ActiveState=%s SubState=%s Result=%s; only inactive/dead/success permits restart; the node was not restarted",
 			nodeUnit, orUnknownWord(post.ActiveState), orUnknownWord(post.SubState), orUnknownWord(post.Result)), "")
+	}
+
+	// The triple proves the process gone; only its own ending proves how it
+	// ended. No drain is required: the node is started again at once, and the
+	// next process adopts what this one handed off.
+	if ending := judgeNodeStop(ctx, endpointInspector(), cfg, invocation, false); ending.Verdict != nodeending.Proved {
+		return j, retireUnknown(retireReasonRestart, fmt.Sprintf("%s stopped, but its stop is %s by the node's own "+
+			"ending: %s; the node was not restarted", nodeUnit, ending.Answer, ending.Why),
+			strings.TrimPrefix(acknowledgeRemedy(ending), ". "))
 	}
 
 	if r := proveRetireNodeExecution(ctx, configPath); r != nil {

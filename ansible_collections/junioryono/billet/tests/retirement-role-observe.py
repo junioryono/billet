@@ -172,13 +172,16 @@ def require_observable_command(module, args, phase):
     if argv[0] == '/usr/bin/billet':
         require(argv[1:] in [['version'], ['--version']]
                 or argv[1:3] in [['release', 'inspect'], ['server', 'retire'], ['node', 'migrate-endpoint'],
-                                 ['node', 'receipt'], ['rollout', 'registration']],
+                                 ['node', 'receipt'], ['node', 'ending'], ['rollout', 'registration']],
                 'unmodeled billet command cannot prove protected-path inactivity')
         return  # Unknown subcommands are refused by the recording answerer.
     require(argv in [['ip', '-json', 'link', 'show'], ['networkctl', 'reload'],
                      ['/usr/sbin/nft', '-f', '/etc/billet/network.nft']]
             or argv[:4] == ['ip', 'link', 'show', 'dev']
             or argv == ['pgrep', '-u', 'billetgate']
+            # A flush writes no file: it makes durable what a recorded write
+            # already wrote (the owed drain, #127).
+            or (len(argv) == 3 and argv[:2] == ['sync', '-f'] and argv[2].startswith('/'))
             or (len(argv) == 3 and argv[:2] == ['realpath', '--canonicalize-missing'] and argv[2].startswith('/')),
             'unclassified command cannot prove protected-path inactivity: ' + str(argv[0]))
 
@@ -328,16 +331,19 @@ def require_control(trace, scenario, pass_name):
     # task conditions. A shared regression cannot pass by changing both legs.
     expected = {
         'active': [], 'inactive': [['start', NODE]], 'failed': [['start', NODE]],
-        'input': [['restart', '--no-block', NODE]], 'migration': [['stop', NODE], ['start', NODE]],
+        # THE INPUT RESTART IS A STOP AND A START (#127), each asked without
+        # waiting, so the stop's ending is proved before anything starts.
+        'input': [['stop', '--no-block', NODE], ['start', '--no-block', NODE]],
+        'migration': [['stop', NODE], ['start', NODE]],
         'stable': [],
     }
     network = [['stop', NODE], ['restart', 'billet-dnsmasq@billet0.service'],
                ['restart', 'billet-dnsmasq@billet1.service'], ['start', NODE]]
     # COMBINED ALSO CHANGES THE NODE'S INPUTS, so after the network drain's stop
-    # the node comes back through the input restart, which asks without waiting,
-    # rather than through the services step's start; a stopped unit restarted
-    # is a unit started.
-    combined = network[:-1] + [['restart', '--no-block', NODE]]
+    # the node comes back through the input restart rather than through the
+    # services step's start; with no process left to stop, that restart is
+    # its start alone, asked without waiting.
+    combined = network[:-1] + [['start', '--no-block', NODE]]
     expected.update(network=network, combined=combined,
                     resume=network if pass_name == 'first' else [])
     require(trace == expected[scenario], f'independent node-only {scenario}/{pass_name}: {trace!r} != {expected[scenario]!r}')

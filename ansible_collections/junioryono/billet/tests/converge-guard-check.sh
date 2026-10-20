@@ -435,12 +435,22 @@ if operation in ["start", "restart", "stop"]:
             registration = pathlib.Path("/var/lib/billet/node/gate-registration.json")
             registration.parent.mkdir(parents=True, exist_ok=True)
             registration.write_text(json.dumps(dict(invocation=unit["InvocationID"], endpoint=unit["Endpoint"])))
-    # A RESTART RUNS A NEW MAIN PROCESS, as systemd's does: the role's restart
-    # is proved by a MainPID other than the one it recorded before, so the fake
-    # alternates between two live processes rather than answering the same one.
+    # A START RUNS A NEW MAIN PROCESS, as systemd's does: the role's restart
+    # is proved by a MainPID other than the one it recorded before, whether it
+    # is one restart job or a stop and a start (#127), so the fake alternates
+    # between two live processes rather than answering the same one. The last
+    # process a unit ran is kept beside the units, since a stop clears MainPID.
     pid = os.environ["BILLET_GATE_SERVICE_PID"]
-    if operation == "restart" and unit["MainPID"] == pid:
+    last_path = path.with_name(path.name + ".last-pid")
+    last = json.loads(last_path.read_text()) if last_path.exists() else {}
+    previous = unit["MainPID"] if unit["MainPID"] != "0" else last.get(names[0], "0")
+    if active and (operation == "restart" or unit["ActiveState"] != "active") and previous == pid:
         pid = os.environ["BILLET_GATE_SERVICE_PID_NEXT"]
+    if active and unit["ActiveState"] == "active" and operation == "start":
+        pid = unit["MainPID"]
+    if unit["MainPID"] != "0":
+        last[names[0]] = unit["MainPID"]
+        last_path.write_text(json.dumps(last))
     unit.update(ActiveState="active" if active else "inactive", SubState="running" if active else "dead",
                 MainPID=pid if active else "0", ControlPID="0", Result="success")
 elif operation in ["enable", "disable"]:
@@ -527,7 +537,7 @@ WRAP
 # always continue to the real backing binary.
 if [ -n "${BILLET_GATE_ROLE:-}" ] && [ "${1:-}" != converge-guard ]; then
   case "$cmd" in
-    retire-*|migrate-endpoint|receipt|registration|release|check|local)
+    retire-*|migrate-endpoint|receipt|registration|release|check|local|ending)
       printf 'backing=0 cmd=%s whole-role-adapter\n' "$cmd" >>"$priv"
       "${PYTHON:-python3}" "$BILLET_GATE_ROLE_HELPER" answer "$cmd" "$input" "$@"
       exit "$?" ;;

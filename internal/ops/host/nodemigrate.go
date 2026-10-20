@@ -313,7 +313,7 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 	}
 
 	// (13) THE POST-STOP OBSERVATION, the command's own: the proof.
-	stopped, r := proveNodeStopped(ctx, insp)
+	stopped, r := proveNodeStopped(ctx, insp, installed.cfg.Node, br.obs.InvocationID)
 	if r != nil {
 		return nil, r
 	}

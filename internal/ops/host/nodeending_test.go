@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -277,12 +278,181 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		}
 	})
 
-	t.Run("the invocation required", func(t *testing.T) {
+	// A NODE THAT HAD NO PROCESS TO STOP is judged by what its last process
+	// left, at the stop's standard: a retry does not pass what the first
+	// attempt refused.
+	t.Run("no invocation: a node already stopped", func(t *testing.T) {
 		f := newEndingFixture(t)
+		f.begin(t, "inv-0", nodeending.HandedOff)
 
-		o := f.run(t, "check")
-		if o.err == nil || !strings.Contains(o.err.Error(), "--invocation is required") {
-			t.Fatalf("check without an invocation returned %v, want the flag's refusal", o.err)
+		if o := f.run(t, "check", "--drain"); o.code != exitRefused || !strings.Contains(o.str("why"), "never adopted it") {
+			t.Fatalf("check --drain over a stopped handoff: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+
+		if o := f.run(t, "check"); o.code != 0 || o.str("invocation") != "" {
+			t.Fatalf("check over a stopped handoff, no drain: code %d invocation %q (%s), want proved and no "+
+				"invocation", o.code, o.str("invocation"), o.str("why"))
+		}
+
+		f.begin(t, "inv-1", nodeending.Running)
+
+		if o := f.run(t, "check"); o.code != exitRefused || !strings.Contains(o.str("why"), "killed or crashed") {
+			t.Fatalf("check over a stopped killed node: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+
+		f.unit(t, "active", "running", "success", "41", "inv-2")
+
+		if o := f.run(t, "check"); o.code != exitRefused || !strings.Contains(o.str("why"), "is active") {
+			t.Fatalf("check with no invocation over a running node: code %d (%s), want refused", o.code,
+				o.str("why"))
+		}
+	})
+
+	// THE RECORD A CONVERGE NAMES, under a configuration that no longer has a
+	// node: --state-dir; and a configuration with neither, or none at all, is
+	// judged by the packaged node's record, which a node it ran may have left.
+	t.Run("a configuration without a node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		packaged := newEndingFixture(t)
+		prevPackaged := endingPackagedStateDir
+		endingPackagedStateDir = packaged.stateDir
+
+		t.Cleanup(func() { endingPackagedStateDir = prevPackaged })
+
+		serverOnly := filepath.Join(t.TempDir(), "server-only.yaml")
+		dir := t.TempDir()
+		writeFile(t, serverOnly, "server:\n  listen: 127.0.0.1:7717\n  state_dir: "+dir+
+			"\n  max_vcpu: 8\n  max_memory: 32GiB\ngithub:\n  org: acme\n  app_id: 1\n  installation_id: 2\n"+
+			"  private_key_path: "+filepath.Join(dir, "app.pem")+"\ntiers:\n  - label: billet-2vcpu\n"+
+			"    provider: docker\n    vcpu: 2\n    memory: 8GiB\n    image: ubuntu:24.04\n", 0o600)
+
+		// THE PACKAGE'S TEMPLATE before it is filled in: no node, and App ids
+		// the loader as a whole refuses.
+		template, err := os.ReadFile("../../../deploy/billet.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		unfilled := filepath.Join(t.TempDir(), "billet.yaml")
+		writeFile(t, unfilled, string(template), 0o600)
+
+		absent := filepath.Join(t.TempDir(), "absent.yaml")
+
+		runWith := func(cfg string, args ...string) endpointOut {
+			return runEndpoint(t, NodeEnding, "", append([]string{args[0], "--config", cfg}, args[1:]...)...)
+		}
+		run := func(args ...string) endpointOut { return runWith(serverOnly, args...) }
+
+		if o := run("check", "--drain", "--state-dir", f.stateDir); o.code != exitRefused ||
+			!strings.Contains(o.str("why"), "killed or crashed") {
+			t.Fatalf("check --state-dir under a server-only configuration: code %d (%s; %v), want the record's "+
+				"refusal", o.code, o.str("why"), o.err)
+		}
+
+		for _, cfg := range []string{serverOnly, unfilled, absent} {
+			if o := runWith(cfg, "check", "--drain"); o.code != 0 || o.str("proof") != nodeending.ProofSystemd {
+				t.Fatalf("check under %s with no packaged record: code %d (%s; %v), want proved by systemd's "+
+					"account", cfg, o.code, o.str("why"), o.err)
+			}
+		}
+
+		packaged.begin(t, "inv-p", nodeending.Running)
+
+		for _, cfg := range []string{serverOnly, unfilled, absent} {
+			if o := runWith(cfg, "check", "--drain"); o.code != exitRefused || !strings.Contains(o.str("why"), "inv-p") {
+				t.Fatalf("check under %s over a killed packaged node: code %d (%s; %v), want its refusal", cfg,
+					o.code, o.str("why"), o.err)
+			}
+		}
+
+		// THE READERS NAME THE RECORD THE SAME WAY.
+		if o := run("admit-start", "--state-dir", f.stateDir); o.code != exitRefused ||
+			!strings.Contains(o.str("why"), "inv-1") {
+			t.Fatalf("admit-start --state-dir: code %d (%s; %v), want the named record's refusal", o.code,
+				o.str("why"), o.err)
+		}
+
+		if o := run("admit-start"); o.code != exitRefused || !strings.Contains(o.str("why"), "inv-p") {
+			t.Fatalf("admit-start with no node: code %d (%s; %v), want the packaged record's refusal", o.code,
+				o.str("why"), o.err)
+		}
+
+		if o := run("show", "--state-dir", f.stateDir); o.err != nil || !strings.Contains(o.raw, `"inv-1"`) {
+			t.Fatalf("show --state-dir: %v\n%s, want the named record's entry", o.err, o.raw)
+		}
+
+		if o := run("show"); o.err != nil || !strings.Contains(o.raw, `"inv-p"`) {
+			t.Fatalf("show with no node: %v\n%s, want the packaged record's entry", o.err, o.raw)
+		}
+
+		// AN ACKNOWLEDGEMENT TAKES THE NODE'S OWN LOCK, which only a node
+		// section names: never a record another directory holds.
+		var usage bytes.Buffer
+
+		env := processEnv()
+		env.Stdout = &usage
+
+		if err := NodeEnding(t.Context(), env, []string{"acknowledge", "--config", serverOnly, "--unrecorded",
+			"--state-dir", f.stateDir, "--json"}); err == nil ||
+			!strings.Contains(err.Error(), "flag provided but not defined: -state-dir") {
+			t.Fatalf("acknowledge --state-dir returned %v, want the flag refused", err)
+		}
+
+		if o := run("acknowledge", "--unrecorded"); o.err == nil || !strings.Contains(o.err.Error(), "no node section") {
+			t.Fatalf("acknowledge under a configuration that runs no node returned %v, want refused", o.err)
+		}
+	})
+
+	// --STATE-DIR NAMES THE RECORD OVER A CONFIGURED NODE'S OWN, and claims
+	// nothing of the configured provider for it.
+	t.Run("--state-dir over a configured node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Drained)
+
+		other := t.TempDir()
+
+		if o := f.run(t, "check", "--drain", "--state-dir", other, "--invocation", "inv-9"); o.code != 0 ||
+			!o.boolean("recorded") {
+			t.Fatalf("check --state-dir over a configured node: code %d recorded %v (%s), want the floor recorded "+
+				"in the named record", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		rec, _, err := nodeending.Read(other)
+		if err != nil || len(rec.Entries) != 1 || rec.Entries[0].InvocationID != "inv-9" || rec.Entries[0].RunsOnHost {
+			t.Fatalf("the named record holds %+v (%v), want inv-9's account and no claim it ran on the host",
+				rec.Entries, err)
+		}
+
+		if o := f.run(t, "check", "--drain", "--invocation", "inv-1"); o.code != 0 {
+			t.Fatalf("the configured record after the named one was written: code %d (%s)", o.code, o.str("why"))
+		}
+
+		// --STATE-DIR NAMING THE CONFIGURATION'S OWN RECORD keeps its provider's
+		// claim: the docker provider's compute ends with the host.
+		own := newEndingFixture(t)
+
+		if o := own.run(t, "check", "--drain", "--state-dir", own.stateDir, "--invocation", "inv-9"); o.code != 0 ||
+			!o.boolean("recorded") {
+			t.Fatalf("check --state-dir naming the configured record: code %d recorded %v (%s)", o.code,
+				o.boolean("recorded"), o.str("why"))
+		}
+
+		ownRec, _, err := nodeending.Read(own.stateDir)
+		if err != nil || len(ownRec.Entries) != 1 || !ownRec.Entries[0].RunsOnHost {
+			t.Fatalf("the configured record holds %+v (%v), want inv-9's account claiming it ran on the host",
+				ownRec.Entries, err)
+		}
+	})
+
+	// A CONFIGURATION THAT CANNOT BE READ IS NOT ONE THAT IS ABSENT.
+	t.Run("an unreadable configuration", func(t *testing.T) {
+		newEndingFixture(t)
+
+		o := runEndpoint(t, NodeEnding, "", "check", "--config", t.TempDir(), "--drain")
+		if o.err == nil || !strings.Contains(o.err.Error(), "read config") {
+			t.Fatalf("check under a configuration that is a directory returned %v, want it refused", o.err)
 		}
 	})
 }
