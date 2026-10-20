@@ -411,6 +411,29 @@ func firecrackerTierImage(cfg *config.Config) (string, error) {
 
 // firecrackerTierImages are the distinct images this deployment's microVM tiers boot.
 func FirecrackerTierImages(cfg *config.Config) ([]string, error) {
+	uses, err := firecrackerTierUses(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	images := make([]string, 0, len(uses))
+	for _, use := range uses {
+		images = append(images, use.image)
+	}
+
+	return images, nil
+}
+
+// tierImageUse is one image reference this node's microVM tiers boot, and the
+// labels of the tiers that boot it.
+type tierImageUse struct {
+	image string
+	tiers []string
+}
+
+// firecrackerTierUses are the distinct images this node's microVM tiers boot, in
+// the order the tiers first name them, each with the tiers that name it.
+func firecrackerTierUses(cfg *config.Config) ([]tierImageUse, error) {
 	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker {
 		return nil, nil
 	}
@@ -419,8 +442,8 @@ func FirecrackerTierImages(cfg *config.Config) ([]string, error) {
 		return nil, fmt.Errorf("select firecracker tier images: resolve node identity: %w", err)
 	}
 
-	images := make([]string, 0, len(cfg.Tiers))
-	seen := map[string]bool{}
+	var uses []tierImageUse
+	at := map[string]int{}
 
 	for i := range cfg.Tiers {
 		if cfg.Tiers[i].Node != "" && cfg.Tiers[i].Node != cfg.Node.Name {
@@ -429,15 +452,21 @@ func FirecrackerTierImages(cfg *config.Config) ([]string, error) {
 		if cfg.Tiers[i].Site != "" && cfg.Tiers[i].Site != cfg.Node.Site {
 			continue
 		}
-		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
-			if !seen[image] {
-				images = append(images, image)
-				seen[image] = true
-			}
+		image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker)
+		if !cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) || image == "" {
+			continue
 		}
+
+		j, seen := at[image]
+		if !seen {
+			j = len(uses)
+			at[image] = j
+			uses = append(uses, tierImageUse{image: image})
+		}
+		uses[j].tiers = append(uses[j].tiers, cfg.Tiers[i].Label)
 	}
 
-	return images, nil
+	return uses, nil
 }
 
 // tartTierImages are the distinct images this node's tart tiers boot.

@@ -57,7 +57,7 @@ The shape is the whole product in miniature: a `server` block for the control pl
 
 - `--profile local-service` writes the packaged paths (`/etc/billet`, `/var/lib/billet`) for a machine that will run the systemd units or launch agents.
 - `--provider tart --node-name <this-mac>` writes a Mac config, and is refused anywhere but on the Mac itself, because the ceiling, the paths and the images all come from the machine running the command.
-- `--provider firecracker`, `--provider ec2` and `--provider codebuild` write the block each backend needs; the [deploying](../deploying/choose-a-shape.md) guides show them.
+- `--provider firecracker`, `--provider ec2` and `--provider codebuild` write the block each backend needs; the [deploying](../deploying/choose-a-shape.md) guides show them. A Firecracker config also carries `images.accept: []`. These are the parts of GitHub's runner image (the Android SDK, CodeQL, Firefox, Chrome and Edge) whose licenses forbid billet shipping them, and naming one there is accepting its license, so that the pull installs it. Nothing is installed unless it is named ([Components the image leaves out](../operating/guest-images.md#components-the-image-leaves-out)).
 - `--emit ansible` prints the `billet_config` block for an Ansible inventory instead of writing a file.
 
 ## Next

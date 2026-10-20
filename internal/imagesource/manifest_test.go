@@ -3,6 +3,7 @@ package imagesource
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -128,6 +129,29 @@ func TestParseManifestRefusesASchemaItDoesNotKnow(t *testing.T) {
 		// on the single-asset layout check alone.
 		if !strings.Contains(err.Error(), "this build reads manifest schemas") {
 			t.Errorf("schema %d refused without saying why: %v", schema, err)
+		}
+	}
+}
+
+// A NEWER SCHEMA IS AN UPGRADE TO MAKE, even when it carries a key this build has
+// never heard of; an older or impossible one is not, because no billet publishes it.
+func TestANewerSchemaNeedsANewerBillet(t *testing.T) {
+	m := validManifest()
+	m.Schema = SchemaV3 + 1
+	doc := strings.Replace(string(mustJSON(t, m)), "{", `{"a_field_from_the_future":true,`, 1)
+
+	_, err := ParseManifest([]byte(doc))
+	if !errors.Is(err, ErrNeedsNewerBillet) || !strings.Contains(err.Error(), "upgrade billet") {
+		t.Fatalf("got %v, want a newer schema refused as needing a newer billet", err)
+	}
+
+	for _, schema := range []int{0, -1} {
+		m := validManifest()
+		m.Schema = schema
+
+		_, err := ParseManifest(mustJSON(t, m))
+		if err == nil || errors.Is(err, ErrNeedsNewerBillet) {
+			t.Errorf("schema %d: got %v, want it refused as no billet's", schema, err)
 		}
 	}
 }
