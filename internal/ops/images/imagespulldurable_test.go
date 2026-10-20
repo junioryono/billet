@@ -718,6 +718,7 @@ type recordingPublisher struct {
 type publishedGeneration struct {
 	image, rawPath, runnerVersion, kernel, guestContract string
 	components                                           *ceph.GenerationComponents
+	completionRootOwner                                  string
 }
 
 func (p *recordingPublisher) ImportCompletedGeneration(
@@ -745,6 +746,28 @@ func (p *recordingPublisher) ImportCompletedGeneration(
 	}
 
 	return "gen-20260831-000000", nil
+}
+
+// ImportCompletionRoot records a completion root as a publication of its own, with
+// the image name and the c snapshot it answers.
+func (p *recordingPublisher) ImportCompletionRoot(
+	_ context.Context,
+	image, rawPath, runnerVersion, kernel, guestContract, owner string,
+	_ time.Time,
+) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.seen = append(p.seen, publishedGeneration{
+		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
+		kernel: kernel, guestContract: guestContract, completionRootOwner: owner,
+	})
+
+	if p.fails {
+		return "", errors.New("the cluster refused")
+	}
+
+	return "c20260831000000", nil
 }
 
 func (p *recordingPublisher) calls() int {

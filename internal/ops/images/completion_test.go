@@ -216,6 +216,13 @@ type fakeCompletionStore struct {
 	verified ceph.Generation
 	found    bool
 	kernel   string
+	removed  []string
+}
+
+func (f *fakeCompletionStore) RemoveCompletionRoots(_ context.Context, image, owner string) error {
+	f.removed = append(f.removed, image+" by "+owner)
+
+	return nil
 }
 
 func (f *fakeCompletionStore) NewestVerifiedForContract(context.Context, string, string,
@@ -366,7 +373,7 @@ func TestAPullCompletesAnImageBeforeImportingIt(t *testing.T) {
 		t.Fatalf("launched %d microVMs, want one", len(run.backend.launched))
 	}
 	spec := run.backend.launched[0]
-	if spec.Image != "ubuntu-2404-x64@g20260901000000" || spec.Trust != provider.TrustTrusted ||
+	if spec.Image != "ubuntu-2404-x64@g20260901000000" || spec.CompletionRoot || spec.Trust != provider.TrustTrusted ||
 		len(spec.Volumes) != 1 || spec.Volumes[0].Device != "/dev/loop7" ||
 		spec.VCPU != completionVCPU || spec.Memory != completionMemory {
 		t.Fatalf("launched %+v", spec)
@@ -394,6 +401,11 @@ func TestAPullCompletesAnImageBeforeImportingIt(t *testing.T) {
 	if got == nil || !slices.Equal(got.LeftOut, []string{"google-chrome"}) ||
 		got.Installed["google-chrome"] != "155.0.8059.84" {
 		t.Fatalf("the generation records %+v", got)
+	}
+
+	// ONLY THIS NODE'S LEFTOVERS, and none made, so one removal before.
+	if want := []string{"ubuntu-2404-x64 by epyc-1"}; !slices.Equal(store.removed, want) {
+		t.Fatalf("removed completion roots %v, want %v", store.removed, want)
 	}
 }
 
@@ -488,9 +500,9 @@ func stagingHolds(t *testing.T, dir, suffix string) bool {
 	return found
 }
 
-// WITH NO VERIFIED GENERATION, the pull imports the image as published, recording
-// what it leaves out and nothing installed, boots the completion from that exact
-// generation, and then imports the completed image as the next one.
+// WITH NO VERIFIED GENERATION, the pull imports the image as published as a
+// completion root this node owns, boots the completion from it, imports the
+// completed image as a generation, and removes the root.
 func TestAFirstPullCompletesOnTheImageAsPublished(t *testing.T) {
 	store := &fakeCompletionStore{}
 	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
@@ -521,21 +533,40 @@ func assertCompletedOnTheImageAsPublished(t *testing.T, run *completionPull) {
 	t.Helper()
 
 	if got := run.fixture.publisher.calls(); got != 2 {
-		t.Fatalf("ImportGeneration was reached %d times, want the image as published and completed", got)
+		t.Fatalf("the cluster was published to %d times, want the completion root and the completed image", got)
 	}
-	published := run.fixture.publisher.seen[0]
-	if published.image != "ubuntu-2404-x64" || published.components == nil ||
-		!slices.Equal(published.components.LeftOut, []string{"google-chrome"}) ||
-		len(published.components.Installed) != 0 {
-		t.Fatalf("the first import was %+v, want the image as published, recording google-chrome "+
-			"left out and nothing installed", published)
+	root := run.fixture.publisher.seen[0]
+	if root.image != "ubuntu-2404-x64" || root.completionRootOwner != "epyc-1" || root.components != nil {
+		t.Fatalf("the first import was %+v, want the image as published as epyc-1's completion root", root)
 	}
-	if spec := run.backend.launched[0]; spec.Image != "ubuntu-2404-x64@gen-20260831-000000" {
-		t.Fatalf("the completion booted %s, want the image as published", spec.Image)
+	if spec := run.backend.launched[0]; spec.Image != "ubuntu-2404-x64@c20260831000000" || !spec.CompletionRoot {
+		t.Fatalf("the completion booted %s (completion root %v), want the completion root", spec.Image,
+			spec.CompletionRoot)
 	}
-	if got := run.fixture.publisher.last().components; got == nil ||
-		got.Installed["google-chrome"] != "155.0.8059.84" {
-		t.Fatalf("the completed image records %+v", got)
+	if got := run.fixture.publisher.last(); got.completionRootOwner != "" || got.components == nil ||
+		got.components.Installed["google-chrome"] != "155.0.8059.84" {
+		t.Fatalf("the completed image was imported as %+v", got)
+	}
+	if want := []string{"ubuntu-2404-x64 by epyc-1", "ubuntu-2404-x64 by epyc-1"}; !slices.Equal(run.store.removed, want) {
+		t.Fatalf("removed completion roots %v, want this node's leftovers before and its root after", run.store.removed)
+	}
+}
+
+// A FAILED COMPLETION ON A COMPLETION ROOT IMPORTS NOTHING AND STILL REMOVES THE
+// ROOT, so a failing completion retried every day leaves nothing behind.
+func TestAFailedCompletionOnACompletionRootRemovesIt(t *testing.T) {
+	store := &fakeCompletionStore{}
+	run := newCompletionPull(t, "google-chrome", completionReportFor("failed=google-chrome"), store)
+
+	err := run.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "google-chrome did not install") {
+		t.Fatalf("got %v, want the failed completion refused", err)
+	}
+	if got := run.fixture.publisher.calls(); got != 1 || run.fixture.publisher.last().completionRootOwner == "" {
+		t.Fatalf("the cluster was published to %d times, want only the completion root", got)
+	}
+	if want := []string{"ubuntu-2404-x64 by epyc-1", "ubuntu-2404-x64 by epyc-1"}; !slices.Equal(store.removed, want) {
+		t.Fatalf("removed completion roots %v, want the root removed after the failure", store.removed)
 	}
 }
 

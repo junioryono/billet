@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -59,6 +60,92 @@ func (g *GenerationComponents) validate() error {
 	}
 
 	return nil
+}
+
+// CompletionRootOwnerKey records, per completion root, the node whose pull made it
+// and may remove it.
+const CompletionRootOwnerKey = "billet.completion_root_owner"
+
+// ResolveCompletionRoot is ResolveGeneration for the completion microVM: ref must
+// name a completion root, exactly, recorded as speaking guestContract.
+func (c *Client) ResolveCompletionRoot(ctx context.Context, ref, guestContract string) (string, error) {
+	image, snapshot, found := strings.Cut(strings.TrimSpace(ref), "@")
+	if !found || !IsCompletionRoot(snapshot) {
+		return "", fmt.Errorf("ceph: %s is not a completion root", bounded(ref))
+	}
+
+	contract, ok, err := c.GuestContract(ctx, image, snapshot)
+	if err != nil {
+		return "", err
+	}
+	if !ok || contract != guestContract {
+		return "", fmt.Errorf("ceph: the completion root %s does not speak guest contract %s", bounded(ref),
+			guestContract)
+	}
+
+	return image + "@" + snapshot, nil
+}
+
+// RemoveCompletionRoots removes the completion roots of image that owner made.
+// Another node's are left to it: one may be booting that node's completion.
+//
+// SAFE UNDER A CLONE, because billet requires clone v2, under which removing a
+// snapshot that still has a clone moves it to the trash until the clone is gone.
+func (c *Client) RemoveCompletionRoots(ctx context.Context, image, owner string) error {
+	if err := checkCloneName(image); err != nil {
+		return err
+	}
+	if strings.TrimSpace(owner) == "" {
+		return fmt.Errorf("ceph: no owner to remove the completion roots of %s for", image)
+	}
+
+	out, err := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "snap", "ls", image)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return nil
+		}
+
+		return fmt.Errorf("ceph: list the snapshots of %s/%s: %w", c.cfg.ImagePool, image, err)
+	}
+
+	var snaps []snapshot
+	if err := json.Unmarshal(trimSpace(out), &snaps); err != nil {
+		return fmt.Errorf("ceph: %s did not answer with a json snapshot list; is it the rbd command?", c.bin)
+	}
+
+	var errs []error
+	for _, snap := range snaps {
+		if !IsCompletionRoot(snap.Name) {
+			continue
+		}
+
+		recorded, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "get", image,
+			CompletionRootOwnerKey+"."+snap.Name)
+		if err != nil {
+			// AN UNKNOWN OWNER IS NOT THIS NODE. A root whose owner cannot be read
+			// may be another node's live one.
+			if !isNoSuchFile(err) {
+				errs = append(errs, fmt.Errorf("ceph: read the owner of %s@%s: %w", image, snap.Name, err))
+			}
+
+			continue
+		}
+		if strings.TrimSpace(string(recorded)) != owner {
+			continue
+		}
+
+		if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
+			image+"@"+snap.Name); err != nil && !isNoSuchFile(err) {
+			errs = append(errs, fmt.Errorf("ceph: remove the completion root %s@%s: %w", image, snap.Name, err))
+
+			continue
+		}
+
+		c.removeGenerationMetadata(ctx, image, snap.Name,
+			KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
+	}
+
+	return errors.Join(errs...)
 }
 
 // SetComponents records what a generation left out and what was installed.

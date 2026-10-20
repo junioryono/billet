@@ -49,6 +49,33 @@ func ParseGeneration(name string) (Generation, bool) {
 	return Generation{Name: trimmed, Built: built}, true
 }
 
+// CompletionRootPrefix marks a snapshot as a completion root: an image as it was
+// published, imported only so a pull can boot the microVM that completes it
+// (#584). It is not a generation, so nothing that deals in generations sees it
+// (@verified, the refresh, reap, verify, promote), and a tier cannot boot it,
+// because ResolveGeneration refuses it.
+const CompletionRootPrefix = "c"
+
+// IsCompletionRoot reports whether name is a completion root's snapshot name.
+func IsCompletionRoot(name string) bool {
+	rest, found := strings.CutPrefix(strings.TrimSpace(name), CompletionRootPrefix)
+	if !found {
+		return false
+	}
+
+	_, err := time.ParseInLocation(GenerationLayout, rest, time.UTC)
+
+	return err == nil
+}
+
+// isPublishedSnapshot is a snapshot billet itself made, which may carry the
+// metadata a launch reads: a generation or a completion root.
+func isPublishedSnapshot(name string) bool {
+	_, ok := ParseGeneration(name)
+
+	return ok || IsCompletionRoot(name)
+}
+
 // snapshot is the half of `rbd snap ls --format json` this needs.
 type snapshot struct {
 	Name string `json:"name"`

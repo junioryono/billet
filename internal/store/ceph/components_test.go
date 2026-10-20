@@ -3,6 +3,7 @@ package ceph
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -127,6 +128,99 @@ func TestAMissingComponentsRecordIsAnImageThatLeftNothingOut(t *testing.T) {
 	got, found, err := c.Components(t.Context(), "ubuntu-2404-x64", "g20260815041709")
 	if err != nil || found || len(got.LeftOut) != 0 {
 		t.Fatalf("got %+v found=%v err=%v, want no record", got, found, err)
+	}
+}
+
+// A COMPLETION ROOT IS A SNAPSHOT THAT IS NOT A GENERATION, by its name, made
+// atomically by rbd, carrying the kernel and contract a launch reads and its owner.
+func TestACompletionRootIsImportedUnderItsOwnPrefix(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device}
+
+	snap, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0",
+		"vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if snap != "c20260815041709" || !IsCompletionRoot(snap) {
+		t.Fatalf("the completion root is %q", snap)
+	}
+	if _, isGeneration := ParseGeneration(snap); isGeneration {
+		t.Fatalf("the completion root %s parses as a generation", snap)
+	}
+	for key, value := range map[string]string{
+		KernelKey: "vmlinux-6.1.155-ea1d42638d13", GuestContractKey: "7", CompletionRootOwnerKey: "epyc-1",
+	} {
+		if !f.ranWith("image-meta", "set", key+"."+snap, value) {
+			t.Errorf("%s was not recorded for the completion root; billet ran %v", key, f.calls)
+		}
+	}
+
+	if _, err := importClient(t, &importFake{device: device}).ImportCompletionRoot(t.Context(),
+		"ubuntu-2404-x64", raw, "2.336.0", "", "7", " ", importAt); err == nil {
+		t.Fatal("a completion root with no owner was imported")
+	}
+}
+
+// NO TIER BOOTS A COMPLETION ROOT, named exactly or not; only the completion's own
+// resolver reaches one, and only one speaking the contract.
+func TestOnlyTheCompletionResolverReachesACompletionRoot(t *testing.T) {
+	c := componentsClient(t, func(_ context.Context, _ string, args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), GuestContractKey+".c20260815041709") {
+			return []byte("7\n"), nil
+		}
+
+		return nil, errors.New("rbd: (2) No such file or directory")
+	})
+
+	if _, err := c.ResolveGeneration(t.Context(), "ubuntu-2404-x64@c20260815041709", "7"); err == nil ||
+		!strings.Contains(err.Error(), "is a completion root") {
+		t.Fatalf("ResolveGeneration = %v, want the completion root refused", err)
+	}
+
+	got, err := c.ResolveCompletionRoot(t.Context(), "ubuntu-2404-x64@c20260815041709", "7")
+	if err != nil || got != "ubuntu-2404-x64@c20260815041709" {
+		t.Fatalf("ResolveCompletionRoot = %q, %v", got, err)
+	}
+	for ref, contract := range map[string]string{
+		"ubuntu-2404-x64@g20260815041709": "7",
+		"ubuntu-2404-x64@c20260815041709": "8",
+		"ubuntu-2404-x64":                 "7",
+	} {
+		if _, err := c.ResolveCompletionRoot(t.Context(), ref, contract); err == nil {
+			t.Errorf("ResolveCompletionRoot(%s, %s) was accepted", ref, contract)
+		}
+	}
+}
+
+// A NODE REMOVES ONLY THE COMPLETION ROOTS IT MADE: another node's may be booting
+// that node's completion, and one whose owner cannot be read is not this node's.
+func TestRemoveCompletionRootsRemovesOnlyTheOwnersRoots(t *testing.T) {
+	var removed []string
+	c := componentsClient(t, func(_ context.Context, _ string, args []string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "snap ls"):
+			return []byte(`[{"name":"g20260815041709"},{"name":"c20260815041710"},` +
+				`{"name":"c20260815041711"},{"name":"c20260815041712"}]`), nil
+		case strings.Contains(joined, CompletionRootOwnerKey+".c20260815041710"):
+			return []byte("epyc-1\n"), nil
+		case strings.Contains(joined, CompletionRootOwnerKey+".c20260815041711"):
+			return []byte("epyc-2\n"), nil
+		case strings.Contains(joined, "image-meta get"):
+			return nil, errors.New("rbd: (2) No such file or directory")
+		case strings.Contains(joined, "snap rm"):
+			removed = append(removed, args[len(args)-1])
+		}
+
+		return nil, nil
+	})
+
+	if err := c.RemoveCompletionRoots(t.Context(), "ubuntu-2404-x64", "epyc-1"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"ubuntu-2404-x64@c20260815041710"}; !slices.Equal(removed, want) {
+		t.Fatalf("removed %v, want only epyc-1's root", removed)
 	}
 }
 

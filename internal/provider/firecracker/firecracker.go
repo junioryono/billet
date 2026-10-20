@@ -581,7 +581,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 	// design. Passing that through would leave the launch log, and therefore any
 	// later question about which image a job actually ran, pointing at a word rather
 	// than at an artifact somebody can go and look at.
-	image, err := p.disk.ResolveGeneration(ctx, spec.Image, GuestContract)
+	image, err := p.resolveRoot(ctx, spec)
 	if err != nil {
 		return nil, errors.Join(err, p.unwindBeforeClone(j, res))
 	}
@@ -2078,6 +2078,30 @@ func lastLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 
 	return strings.TrimSpace(lines[len(lines)-1])
+}
+
+// completionRootResolver is the disk a completion microVM's root is resolved
+// through (ceph's ResolveCompletionRoot). A disk without it has no completion
+// roots, and a spec naming one is refused.
+type completionRootResolver interface {
+	ResolveCompletionRoot(ctx context.Context, ref, guestContract string) (string, error)
+}
+
+// resolveRoot turns spec.Image into the exact snapshot the launch clones: a
+// generation through ResolveGeneration, which refuses a completion root, or, for a
+// spec marked CompletionRoot, a completion root and nothing else.
+func (p *Provider) resolveRoot(ctx context.Context, spec provider.Spec) (string, error) {
+	if !spec.CompletionRoot {
+		return p.disk.ResolveGeneration(ctx, spec.Image, GuestContract)
+	}
+
+	resolver, ok := p.disk.(completionRootResolver)
+	if !ok {
+		return "", fmt.Errorf("firecracker: %s asks for a completion root and this node's disk has none",
+			spec.Name)
+	}
+
+	return resolver.ResolveCompletionRoot(ctx, spec.Image, GuestContract)
 }
 
 // kernelFor resolves which kernel file a generation must boot.

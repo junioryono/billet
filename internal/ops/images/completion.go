@@ -120,20 +120,21 @@ var (
 )
 
 // completionStore is what a completion asks of the cluster: a generation to boot
-// the completion microVM from, and the kernel it is paired with.
+// the completion microVM from, the kernel it is paired with, and the removal of the
+// completion roots this node made.
 type completionStore interface {
 	NewestVerifiedForContract(ctx context.Context, image, contract string) (ceph.Generation, bool, error)
 	Kernel(ctx context.Context, image, generation string) (string, bool, error)
+	RemoveCompletionRoots(ctx context.Context, image, owner string) error
 }
 
 // importAsPublished imports the image being completed as it was published, as a
-// generation recording the components it leaves out and none installed, and
-// returns that generation. The pull supplies it, because the generation names the
-// kernel the pull installs, under the pull's kernel lock.
+// completion root this node owns, and returns its snapshot. The pull supplies it,
+// because the root names the kernel the pull installs, under the pull's kernel
+// lock.
 //
-// SUCH A GENERATION IS NEVER VERIFIED, because it lacks what this deployment
-// accepted, and so no tier naming @verified ever boots it; it exists to be the
-// completion microVM's root.
+// A COMPLETION ROOT IS NOT A GENERATION, by its name: nothing that deals in
+// generations sees it, no tier can boot it, and the pull removes it.
 type importAsPublished func(ctx context.Context) (string, error)
 
 // errCompletionLeftRunning is a completion whose microVM was not proved gone. The
@@ -161,15 +162,39 @@ func completeImage(
 		return nil, err
 	}
 
+	owner := cfg.Node.Name
+
+	// LEFTOVERS FIRST, and only this node's: another node's completion root may be
+	// booting its completion right now.
+	if err := store.RemoveCompletionRoots(ctx, image, owner); err != nil {
+		return nil, err
+	}
+
 	// THE ROOT IS CHOSEN, AND ANY IMPORT OF THE IMAGE AS PUBLISHED MADE, BEFORE raw
 	// IS GROWN OR WRITTEN. Imported from a file the completion has started to
 	// change, it would be neither the published image nor the result.
-	root, err := completionRoot(ctx, env, store, image, kernelDir, asPublished)
+	root, isCompletionRoot, err := completionRoot(ctx, env, store, image, kernelDir, asPublished)
 	if err != nil {
 		return nil, err
 	}
 
-	return completeOnRoot(ctx, env, cfg, root, raw, plan, wait)
+	installed, completeErr := completeOnRoot(ctx, env, cfg, root, isCompletionRoot, raw, plan, wait)
+
+	// REMOVED WHATEVER THE COMPLETION CAME TO, on a context of its own: it is owed
+	// even to a cancelled pull, and is safe under a live clone, which clone v2
+	// keeps working from the trash.
+	if isCompletionRoot {
+		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+
+		completeErr = errors.Join(completeErr, store.RemoveCompletionRoots(removeCtx, image, owner))
+	}
+
+	if completeErr != nil {
+		return nil, completeErr
+	}
+
+	return installed, nil
 }
 
 // completionRoot is the generation the completion microVM boots: the newest of
@@ -183,35 +208,35 @@ func completeImage(
 func completionRoot(
 	ctx context.Context, env cli.Env, store completionStore,
 	image, kernelDir string, asPublished importAsPublished,
-) (string, error) {
+) (string, bool, error) {
 	newest, ok, err := store.NewestVerifiedForContract(ctx, image, firecracker.GuestContract)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	if ok {
 		kernel, recorded, err := store.Kernel(ctx, image, newest.Name)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 
 		if !recorded || regularFileExists(filepath.Join(kernelDir, kernel)) {
-			return image + "@" + newest.Name, nil
+			return image + "@" + newest.Name, false, nil
 		}
 
 		fmt.Fprintf(env.Stdout, "the newest verified generation %s@%s is paired with a kernel this "+
 			"node does not have, so the completion boots the image as published\n", image, newest.Name)
 	}
 
-	generation, err := asPublished(ctx)
+	snapshot, err := asPublished(ctx)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
-	fmt.Fprintf(env.Stdout, "imported %s@%s, the image as published, to boot the completion from; "+
-		"it is never verified, because it lacks what this deployment accepted\n", image, generation)
+	fmt.Fprintf(env.Stdout, "imported the image as published as %s@%s, a completion root no tier "+
+		"can boot, to boot the completion from\n", image, snapshot)
 
-	return image + "@" + generation, nil
+	return image + "@" + snapshot, true, nil
 }
 
 func regularFileExists(path string) bool {
@@ -224,7 +249,7 @@ func regularFileExists(path string) bool {
 // runs the completion microVM on root.
 func completeOnRoot(
 	ctx context.Context, env cli.Env, cfg *config.Config,
-	root, raw string, plan completionPlan, wait time.Duration,
+	root string, isCompletionRoot bool, raw string, plan completionPlan, wait time.Duration,
 ) (map[string]string, error) {
 	if err := growForCompletion(raw, plan); err != nil {
 		return nil, err
@@ -235,7 +260,7 @@ func completeOnRoot(
 		return nil, err
 	}
 
-	installed, gone, runErr := runCompletion(ctx, env, cfg, root, device, plan, wait)
+	installed, gone, runErr := runCompletion(ctx, env, cfg, root, isCompletionRoot, device, plan, wait)
 
 	// DETACHED ONLY ONCE THE MICROVM IS PROVED GONE. A guest that may still be
 	// running may still be writing, and a detach under it cuts off the write.
@@ -279,7 +304,7 @@ func growForCompletion(raw string, plan completionPlan) error {
 // one launched was destroyed and the backend confirmed it.
 func runCompletion(
 	ctx context.Context, env cli.Env, cfg *config.Config,
-	root, device string, plan completionPlan, wait time.Duration,
+	root string, isCompletionRoot bool, device string, plan completionPlan, wait time.Duration,
 ) (map[string]string, bool, error) {
 	deployment, err := verifyDeploymentID(cfg)
 	if err != nil {
@@ -337,6 +362,8 @@ func runCompletion(
 				Command:   []string{"/bin/sh", "-c", completionCommand(addr, plan.names())},
 				Trust:     provider.TrustTrusted,
 				JITConfig: secret,
+
+				CompletionRoot: isCompletionRoot,
 			}
 		},
 		check: func(body, secret string) error {

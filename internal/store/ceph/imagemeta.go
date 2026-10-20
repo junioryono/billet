@@ -141,7 +141,7 @@ func (c *Client) setGenerationMeta(
 		return err
 	}
 
-	if _, ok := ParseGeneration(generation); !ok {
+	if !isPublishedSnapshot(generation) {
 		return fmt.Errorf("ceph: %q is not a generation billet published, so recording %s "+
 			"against it would write a key nothing reads and nothing reaps", generation, key)
 	}
@@ -227,7 +227,9 @@ func (c *Client) Kernel(ctx context.Context, image, generation string) (string, 
 		return "", false, err
 	}
 
-	if _, ok := ParseGeneration(generation); !ok {
+	// A COMPLETION ROOT TOO, because the completion microVM boots one and the
+	// launch reads its kernel and contract the way it reads a generation's.
+	if !isPublishedSnapshot(generation) {
 		return "", false, fmt.Errorf("ceph: %q is not a generation billet published", generation)
 	}
 
@@ -254,7 +256,9 @@ func (c *Client) GuestContract(
 		return "", false, err
 	}
 
-	if _, ok := ParseGeneration(generation); !ok {
+	// A COMPLETION ROOT TOO, because the completion microVM boots one and the
+	// launch reads its kernel and contract the way it reads a generation's.
+	if !isPublishedSnapshot(generation) {
 		return "", false, fmt.Errorf("ceph: %q is not a generation billet published", generation)
 	}
 

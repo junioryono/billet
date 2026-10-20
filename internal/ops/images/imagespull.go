@@ -62,6 +62,11 @@ type generationPublisher interface {
 		components *ceph.GenerationComponents,
 		now time.Time,
 	) (string, error)
+	ImportCompletionRoot(
+		ctx context.Context,
+		image, rawPath, runnerVersion, kernel, guestContract, owner string,
+		now time.Time,
+	) (string, error)
 }
 
 // openGenerationPublisher builds the cluster client this config names.
@@ -254,8 +259,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	// OUTSIDE THE KERNEL LOCK, because a completion runs for as long as its
 	// downloads take, and every reap and pull on this host would wait that long. A
 	// node with no verified generation to boot the completion from imports the
-	// image as published first, which names the kernel, so that is the one part
-	// done under the lock.
+	// image as published first, as a completion root, which names the kernel, so
+	// that is the one part done under the lock.
 	var components *ceph.GenerationComponents
 
 	if manifest.Schema == imagesource.SchemaV3 {
@@ -278,9 +283,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 				return "", fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
 			}
 
-			return store.ImportCompletedGeneration(ctx, image, raw, manifest.RunnerVersion,
-				kernelFileName(manifest), manifest.GuestContract,
-				&ceph.GenerationComponents{LeftOut: plan.LeftOut}, time.Now())
+			return store.ImportCompletionRoot(ctx, image, raw, manifest.RunnerVersion,
+				kernelFileName(manifest), manifest.GuestContract, cfg.Node.Name, time.Now())
 		}
 
 		installed, err := completeImage(ctx, env, cfg, image, raw, *kernelDir, plan, *completionWait,
