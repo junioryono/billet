@@ -22,6 +22,8 @@ The lease is the key. The job reads it from `RUNNER_NAME`, which billet sets to 
 
 `billet jobs show --json` is new with this kit, so the control plane needs a billet that has it; v0.12.44 does not. The node needs nothing new.
 
+Run the checks within `server.job_detail_retention` of the jobs (72 hours unless the configuration says otherwise). Past it the control plane deletes a job's per-sample series, destinations and guest report, and the record says `detail_retired_at`; the checks that read the series then have nothing to compare.
+
 On the node (`ubuntu-01`), install the tools and load the in-band IPMI driver:
 
 ```bash

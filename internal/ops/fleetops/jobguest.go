@@ -29,6 +29,17 @@ const guestBanner = "Reported by the job's own VM. The job runs as root there an
 const guestNeverContacted = "the guest never contacted the node (an image older than the agent, " +
 	"or an agent that did not start)"
 
+// retiredGuest is v for a job with no guest report row whose detail was
+// retired, which says so rather than that no report was recorded.
+func retiredGuest(v guestView, g *jobGuest, rec alloc.JobRecord) guestView {
+	if g != nil || rec.DetailRetiredAt == "" {
+		return v
+	}
+	v.Verdict, v.Why = "retired", detailRetired(rec)
+
+	return v
+}
+
 // noGuestReport is what a job with no guest report row says in place of one.
 const noGuestReport = "no report recorded (the node had node.monitoring.guest off, or is older than " +
 	"wire 29; a job still running has none yet, since the node sends it as the compute is destroyed)"

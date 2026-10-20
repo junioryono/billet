@@ -156,6 +156,15 @@ server:
   #
   # drain_timeout: 6h
 
+  # How long the ledger keeps a job's per-sample series, destinations and guest
+  # report, which `billet jobs show` draws its charts, steps and guest view from;
+  # the job's usage summary is kept. Past it they are deleted a batch at a time
+  # and the job says it was retired. At least 1h; absent, 72h. Each day kept cost
+  # the reference deployment about 150 MB of ledger, and the control plane reads
+  # the whole ledger at every start.
+  #
+  # job_detail_retention: 72h
+
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
   # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
   # not localhost) unless allow_remote is true: the endpoint has no

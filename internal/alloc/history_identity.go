@@ -127,6 +127,10 @@ type JobRecord struct {
 	GitHubScaleSetAssignedAt string
 	GitHubRunnerAssignedAt   string
 	BoughtAt                 string
+	// DetailRetiredAt is when the job's series, destinations and guest report
+	// were deleted past their retention, empty while they are kept or for a job
+	// that never had them.
+	DetailRetiredAt string
 }
 
 // Job reads one lease's history row. A lease that was never assigned a job is
@@ -153,6 +157,7 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			VCPU: row.Vcpu, Memory: row.Memory, Site: row.Site,
 			GitHubQueuedAt: row.GithubQueuedAt, GitHubScaleSetAssignedAt: row.GithubScaleSetAssignedAt,
 			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, BoughtAt: row.BoughtAt,
+			DetailRetiredAt: row.DetailRetiredAt,
 		}
 		return nil
 	})

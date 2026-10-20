@@ -87,7 +87,7 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
 	if *asJSON {
-		tl, unaligned := jobTimeline(ctx, a, leaseID, measured)
+		tl, unaligned := jobTimeline(ctx, a, rec, measured)
 		var wj *windowJSON
 		if w != nil {
 			wj = windowJSONOf(tl, unaligned, *w)
@@ -102,12 +102,12 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	// THE SERIES THE STEPS WERE PLACED ON, read here when no step was asked about.
 	tl, unaligned := steps.timeline, steps.unaligned
 	if steps.none != "" {
-		tl, unaligned = jobTimeline(ctx, a, leaseID, measured)
+		tl, unaligned = jobTimeline(ctx, a, rec, measured)
 	}
 	renderJob(env.Stdout, rec, measured)
 	renderSeries(env.Stdout, tl, unaligned, measured)
 	renderSteps(env.Stdout, steps)
-	renderGuest(env.Stdout, guestViewOf(guest, measured, steps))
+	renderGuest(env.Stdout, retiredGuest(guestViewOf(guest, measured, steps), guest, rec))
 
 	return nil
 }
@@ -138,11 +138,14 @@ type jobJSON struct {
 	FinishedAt  string `json:"finished_at"`
 	// GitHubQueuedAt, GitHubScaleSetAssignedAt and GitHubRunnerAssignedAt are
 	// GitHub's clock; BoughtAt is when billet bought the lease, on billet's.
-	GitHubQueuedAt           string     `json:"github_queued_at"`
-	GitHubScaleSetAssignedAt string     `json:"github_scale_set_assigned_at"`
-	GitHubRunnerAssignedAt   string     `json:"github_runner_assigned_at"`
-	BoughtAt                 string     `json:"bought_at"`
-	Usage                    *usageJSON `json:"usage"`
+	GitHubQueuedAt           string `json:"github_queued_at"`
+	GitHubScaleSetAssignedAt string `json:"github_scale_set_assigned_at"`
+	GitHubRunnerAssignedAt   string `json:"github_runner_assigned_at"`
+	BoughtAt                 string `json:"bought_at"`
+	// DetailRetiredAt is when the job's series, destinations and guest report
+	// were deleted past the deployment's retention, empty while they are kept.
+	DetailRetiredAt string     `json:"detail_retired_at"`
+	Usage           *usageJSON `json:"usage"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
 	// Window is present only when --window asked for one.
@@ -183,6 +186,7 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
 		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
 		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
+		DetailRetiredAt: rec.DetailRetiredAt,
 	}
 	if u != nil {
 		groups := make(map[string]bool, len(usageGroups))
@@ -242,6 +246,9 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		orUnknown(rec.AssignedAt), orUnknown(rec.StartedAt), orUnknown(rec.FinishedAt))
 	line("github", "%s", githubTimes(rec, orUnknown))
 	line("waited", "%s", waitedLine(rec))
+	if rec.DetailRetiredAt != "" {
+		line("detail", "%s", detailRetired(rec))
+	}
 
 	fmt.Fprintln(w)
 	if u == nil {
@@ -253,7 +260,19 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	line("usage", "%s", measuredBy(u))
 	renderUsageGroups(line, u)
 	renderCounters(line, u.Counters)
+	if u.Destinations == nil && rec.DetailRetiredAt != "" {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "destinations "+detailRetired(rec))
+		return
+	}
 	renderDestinations(w, u.Destinations)
+}
+
+// detailRetired says that a job's per-sample series, destinations and guest
+// report were deleted past the deployment's retention, and when.
+func detailRetired(rec alloc.JobRecord) string {
+	return "retired " + rec.DetailRetiredAt + ", past server.job_detail_retention: the per-sample series, " +
+		"the destinations and the guest report are gone, and the usage summary is kept"
 }
 
 // noUsageReport is what a job with no usage report says in place of one.

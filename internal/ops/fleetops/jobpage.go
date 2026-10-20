@@ -150,7 +150,7 @@ func buildJobPage(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord, 
 ) jobPage {
 	tl, unaligned := steps.timeline, steps.unaligned
 	if steps.none != "" {
-		tl, unaligned = jobTimeline(ctx, a, rec.LeaseID, measured)
+		tl, unaligned = jobTimeline(ctx, a, rec, measured)
 	}
 	page := jobPageOf(rec, measured, steps, tl, unaligned)
 	page.Guest = guestSection(guest, rec, measured, steps, page.Charts)
@@ -163,7 +163,7 @@ func buildJobPage(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord, 
 func guestSection(guest *jobGuest, rec alloc.JobRecord, measured *alloc.RecordedUsage, steps jobSteps,
 	charts pageCharts,
 ) guestView {
-	v := guestViewOf(guest, measured, steps)
+	v := retiredGuest(guestViewOf(guest, measured, steps), guest, rec)
 	if v.HasReport {
 		v.Chart = guestMemoryChart(charts, rec, measured, guest.report)
 	}
@@ -203,7 +203,7 @@ func jobPageOf(rec alloc.JobRecord, measured *alloc.RecordedUsage, steps jobStep
 	}
 	page.Charts = buildCharts(tl, unaligned, rec, measured, listed)
 	page.Steps = stepsSection(steps, tl, unaligned, measured, page.Charts)
-	page.Destinations = destinationsSection(measured)
+	page.Destinations = destinationsSection(rec, measured)
 	page.Guest = guestViewOf(nil, measured, steps)
 
 	return page
@@ -240,6 +240,7 @@ func identityFields(rec alloc.JobRecord) []pageField {
 		{Label: "finished", Value: orNotRecorded(rec.FinishedAt)},
 		{Label: "github times", Value: githubTimes(rec, orNotRecorded)},
 		{Label: "waited", Value: waitedLine(rec)},
+		{Label: "detail", Value: orKept(rec)},
 		{Label: "tier", Value: orNotRecorded(rec.Tier)},
 		{Label: "node", Value: orNotRecorded(rec.Node)},
 		{Label: "provider", Value: orNotRecorded(rec.ChosenProvider)},
@@ -254,6 +255,15 @@ func orNotRecorded(s string) string {
 	}
 
 	return s
+}
+
+// orKept is whether a job's detail is still kept, or when it was retired.
+func orKept(rec alloc.JobRecord) string {
+	if rec.DetailRetiredAt == "" {
+		return "kept"
+	}
+
+	return detailRetired(rec)
 }
 
 // collect is a line function, as renderJob's sections take, that keeps each
@@ -434,10 +444,12 @@ func windowCells(u usage.WindowUsage, m *alloc.RecordedUsage) []pageField {
 
 // destinationsSection is where the job's traffic went, worded as
 // renderDestinations words it.
-func destinationsSection(m *alloc.RecordedUsage) pageDestinations {
+func destinationsSection(rec alloc.JobRecord, m *alloc.RecordedUsage) pageDestinations {
 	switch {
 	case m == nil:
 		return pageDestinations{Why: "No usage report was recorded."}
+	case m.Destinations == nil && rec.DetailRetiredAt != "":
+		return pageDestinations{Why: "Destinations " + detailRetired(rec) + "."}
 	case m.Destinations == nil:
 		return pageDestinations{Why: "Destinations not measured (node.monitoring.flows, on a firecracker node)."}
 	}
