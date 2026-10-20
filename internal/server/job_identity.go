@@ -319,9 +319,11 @@ func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode 
 				if launched.ActualRequestID != 0 {
 					bound.requests = []int64{launched.ActualRequestID}
 				}
-				// A completion naming the runner's own id is that runner's: it is not
-				// runner-less, whatever the runner is bound to.
-				own := job.RunnerID != 0 && job.RunnerID == launched.RunnerID
+				// A completion naming the runner's own id is that runner's while the
+				// runner is bound to no job: it is not runner-less. One bound to
+				// another job stays detached, because nothing here weighs the
+				// completion against that binding as the by-name path does.
+				own := job.RunnerID != 0 && job.RunnerID == launched.RunnerID && launched.ActualRequestID == 0
 				if own {
 					// AND ITS BINDING IS THE ONE HANDED BACK, so the lease is restored
 					// and settled as a named completion's would be after a restart.

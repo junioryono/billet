@@ -534,6 +534,38 @@ func TestAWatchedMemberWhoseRowIsGoneLeavesTheWatch(t *testing.T) {
 	}
 }
 
+// A COMPLETION NAMING THE ID OF A RUNNER BOUND TO ANOTHER JOB IS NOT ITS: GitHub
+// contradicting its own binding settles nothing on the runner running that job,
+// which stays to report its own result.
+func TestACompletionNamingTheIDOfARunnerBoundToAnotherJobSettlesNothing(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11, job12)
+	swapped := p.launchedFor11(t)
+
+	started := job12
+	started.RunnerID, started.RunnerName = 77, swapped.RunnerName
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("start job 12 on the runner launched for 11: %v", err)
+	}
+
+	canceled := job11
+	canceled.Result, canceled.RunnerID = "Canceled", 77
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{canceled}}); err != nil {
+		t.Fatalf("the completion was refused: %v", err)
+	}
+	for _, r := range p.results {
+		if r.lease == swapped.LeaseID {
+			t.Errorf("recorded %q on the lease of the runner running job 12", r.result)
+		}
+	}
+	if slices.Contains(p.destroyed, 11) || slices.Contains(p.registry.names, swapped.RunnerName) {
+		t.Errorf("destroyed %v and removed %v: the runner running job 12 was torn down", p.destroyed,
+			p.registry.names)
+	}
+}
+
 // A COMPLETION NAMING THE RUNNER'S OWN ID IS THAT RUNNER'S, though it names no
 // runner by name and the runner is busy with its job unknown: it settles it, its
 // lease restored from the runner's binding as a named completion's is, rather
