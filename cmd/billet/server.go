@@ -138,7 +138,7 @@ func serveControlPlane(
 	//
 	// BETWEEN THE OPEN AND THE CLAIM, so its failure carries what the open
 	// migrated, as the open's own refusals and every failed claim do.
-	served, err := app.ServeMetrics(ctx, "server", cfg.Server.Metrics, cp.LedgerMetrics())
+	served, err := app.ServeMetrics(ctx, "server", cfg.Server.Metrics, cp.LedgerMetrics(), cp.GitHubMetrics())
 	if err != nil {
 		return errors.Join(err, cp.UnclaimedMove())
 	}

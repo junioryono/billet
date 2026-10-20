@@ -84,6 +84,35 @@ func (c *Client) RunQueueTimes(
 	}
 }
 
+// RESTBudget is the installation's REST budget as GitHub last stated it to the
+// target's App client, false before any answer stated one or for a client
+// built without the App's credentials.
+func (c *Client) RESTBudget() (billetgithub.RESTBudget, bool) {
+	account, ok := c.policy.(billetgithub.RESTAccount)
+	if c.policy == nil || !ok {
+		return billetgithub.RESTBudget{}, false
+	}
+
+	return account.RESTBudget()
+}
+
+// ObserveREST tells o of every request the target's App client makes with the
+// installation's token.
+func (c *Client) ObserveREST(o billetgithub.RESTObserver) {
+	if account, ok := c.policy.(billetgithub.RESTAccount); c.policy != nil && ok {
+		account.ObserveREST(o)
+	}
+}
+
+var _ server.RESTHeadroom = (*Client)(nil)
+
+// RESTHeadroom is the budget in the server's terms.
+func (c *Client) RESTHeadroom() (int64, int64, time.Time, bool) {
+	b, ok := c.RESTBudget()
+
+	return b.Remaining, b.Limit, b.Reset, ok
+}
+
 func (c *Client) runEvidence() (billetgithub.RunEvidence, error) {
 	evidence, ok := c.policy.(billetgithub.RunEvidence)
 	if c.policy == nil || !ok {

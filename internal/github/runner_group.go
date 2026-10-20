@@ -67,6 +67,10 @@ type runnerGroupPolicyClient struct {
 	// answer. Guarded by sentMu, since reads run beside the exchange.
 	sentMu   sync.Mutex
 	sentJWTs []string
+
+	// rest is the installation's REST budget as GitHub last stated it, and who
+	// is told of each request; see restbudget.go.
+	rest restAccount
 }
 
 // policyBounds limits every request the policy client makes. The policy is read
@@ -104,6 +108,9 @@ const maxPolicyResponse = 1 << 20
 // token exchange the caller abandoned. Undecided reads it as could-not-tell.
 var errNoAnswer = errors.New("github: GitHub did not answer in full")
 
+// errNotSent marks a request that could not be built, which drew on no budget.
+var errNotSent = errors.New("github: the request was not sent")
+
 // NewRunnerGroupPolicyClientAt builds the policy client for one target on the
 // REST API at base, on an HTTP client of its own.
 //
@@ -135,9 +142,12 @@ func NewRunnerGroupPolicyClientAt(base string, target Target, appID, installatio
 func newRunnerGroupPolicyClient(bounds policyBounds, base string, target Target, appID,
 	installationID int64, privateKey []byte,
 ) *runnerGroupPolicyClient {
-	return &runnerGroupPolicyClient{client: newPolicyHTTPClient(bounds), request: bounds.request,
+	c := &runnerGroupPolicyClient{client: newPolicyHTTPClient(bounds), request: bounds.request,
 		base: base, target: target, appID: appID, installationID: installationID,
 		privateKey: bytes.Clone(privateKey), tokenSlot: make(chan struct{}, 1)}
+	c.client.CheckRedirect = c.rest.redirected
+
+	return c
 }
 
 // newPolicyHTTPClient builds a client and transport of the policy client's own,
@@ -165,16 +175,18 @@ func policyDialer(b policyBounds) *net.Dialer {
 }
 
 // exchange sends one request under the per-request bound and returns the
-// status and the whole body. A transport failure comes back as the client's
-// *url.Error and a body not read whole as errNoAnswer, both undecided.
+// status, the headers and the whole body. A transport failure comes back as the
+// client's *url.Error, with no status, and a body not read whole as errNoAnswer,
+// both undecided; the status and headers of an answer whose body broke off are
+// still returned, because they state the budget the request drew on.
 func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint, bearer string,
-) (int, []byte, error) {
+) (int, http.Header, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.request)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, http.NoBody)
 	if err != nil {
-		return 0, nil, fmt.Errorf("build request: %w", err)
+		return 0, nil, nil, fmt.Errorf("%w: build request: %w", errNotSent, err)
 	}
 
 	setAPIHeaders(req)
@@ -182,7 +194,13 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, nil, withoutBearerText(err, bearer)
+		// A REDIRECT THE CLIENT REFUSED TO FOLLOW is still an answer, the only
+		// error the client returns one with, its body already closed.
+		if resp != nil {
+			return resp.StatusCode, resp.Header, nil, withoutBearerText(err, bearer)
+		}
+
+		return 0, nil, nil, withoutBearerText(err, bearer)
 	}
 	defer resp.Body.Close()
 
@@ -190,22 +208,26 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 	if err != nil {
 		// A TRAILER THE CLIENT COULD NOT PARSE is quoted in its error, so the
 		// bearer is replaced here as in a transport error.
-		return 0, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer,
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer,
 			withoutBearerText(err, bearer))
 	}
 
 	if len(body) > maxPolicyResponse {
-		return 0, nil, fmt.Errorf("%w: the response exceeds %d bytes", errNoAnswer, maxPolicyResponse)
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf("%w: the response exceeds %d bytes", errNoAnswer,
+			maxPolicyResponse)
 	}
 
-	return resp.StatusCode, body, nil
+	return resp.StatusCode, resp.Header, body, nil
 }
 
 // get reads one document with the installation token, refusing any status but
 // 200 with GitHub's own error.
 func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, operation string,
 ) ([]byte, error) {
-	status, body, err := c.exchange(ctx, http.MethodGet, endpoint, token)
+	status, header, body, err := c.exchange(withRESTOperation(ctx, operation), http.MethodGet, endpoint, token)
+	if !errors.Is(err, errNotSent) {
+		c.rest.answered(operation, status, header, time.Now())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("github: %s: %w", operation, err)
 	}
@@ -659,7 +681,9 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		return "", err
 	}
 	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", c.base, c.installationID)
-	status, body, err := c.exchange(ctx, http.MethodPost, endpoint, jwt)
+	// THE APP'S OWN BUDGET answers a JWT, not the installation's, so its
+	// headers are not the installation's account.
+	status, _, body, err := c.exchange(ctx, http.MethodPost, endpoint, jwt)
 	if err != nil {
 		return "", fmt.Errorf("github: create installation token: %w", err)
 	}

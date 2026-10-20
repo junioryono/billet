@@ -24,6 +24,13 @@ type QueueTimes interface {
 	RunQueueTimes(ctx context.Context, owner, repository string, runID int64) (map[string]time.Time, error)
 }
 
+// RESTHeadroom is an App installation's REST budget as GitHub last stated it:
+// what is left of the hour's limit and when the next hour begins, false before
+// any answer stated one. A target's Provisioner implements it.
+type RESTHeadroom interface {
+	RESTHeadroom() (remaining, limit int64, reset time.Time, ok bool)
+}
+
 var (
 	// ErrQueueTimesThrottled is a QueueTimes read GitHub's rate limit refused.
 	ErrQueueTimesThrottled = errors.New("server: GitHub is rate-limiting this App installation")
@@ -48,10 +55,10 @@ const (
 	queueTimePages    = 10
 	// queueTimeRunsPerInstallation is how many runs one pass reads through one
 	// App installation, whose hourly budget the scale-set, runner-group and
-	// cache-authority calls share. A run is a request per 25 of its jobs and the
+	// cache-authority calls share. A run is a page per 25 of its jobs and the
 	// GitHub client reads no run of more than 200, so a pass costs an
-	// installation at most 24 requests, 1,440 an hour, against a budget of at
-	// least 5,000. It also caps what the sweep keeps up with: 180 runs an hour an
+	// installation at most 24 pages, 1,440 an hour, each a request and one more
+	// for each redirect it is answered with, against a budget of at least 5,000. It also caps what the sweep keeps up with: 180 runs an hour an
 	// installation, past which the oldest runs reach the window unread.
 	queueTimeRunsPerInstallation = 3
 	// queueTimeRetryFirst is the wait after a run's read that left a job unfound
@@ -62,6 +69,14 @@ const (
 	// read, and one it refuses waits queueTimeRefused.
 	queueTimeThrottled = 15 * time.Minute
 	queueTimeRefused   = time.Hour
+	// The sweep starts no run's read through an installation whose budget, as
+	// any of its targets' clients last saw it, has less than one
+	// queueTimeReserve-th of its limit left before the next hour begins: the rest
+	// is the runner-group checks' and the cache authority's, which decide whether
+	// a runner starts and what a job may write, where a missing queue time
+	// decides nothing. A read already started finishes, at most eight pages and
+	// their redirects against a reserve of at least a thousand requests.
+	queueTimeReserve = 5
 )
 
 // queueTimeRun is one run of one target's repository.
@@ -83,7 +98,10 @@ type queueTimeRetry struct {
 type queueTimeSweep struct {
 	retries map[queueTimeRun]queueTimeRetry
 	paused  map[string]time.Time
-	cursor  alloc.QueueTimeCursor
+	// reserved is each installation the sweep is leaving its reserve to, so the
+	// hold is logged once rather than on every pass.
+	reserved map[string]bool
+	cursor   alloc.QueueTimeCursor
 	// pageRows and pages are queueTimePageRows and queueTimePages, smaller in a
 	// test.
 	pageRows, pages int
@@ -91,7 +109,7 @@ type queueTimeSweep struct {
 
 func newQueueTimeSweep() *queueTimeSweep {
 	return &queueTimeSweep{retries: map[queueTimeRun]queueTimeRetry{}, paused: map[string]time.Time{},
-		pageRows: queueTimePageRows, pages: queueTimePages}
+		reserved: map[string]bool{}, pageRows: queueTimePageRows, pages: queueTimePages}
 }
 
 // installationOf is what a target's REST requests are counted against: its App
@@ -132,6 +150,36 @@ type queueTimeWork struct {
 	jobs         []alloc.AwaitingQueueTime
 }
 
+// installationBudgets is every target's budget by the installation it counts
+// against, whether or not the target has jobs awaiting a queue time: a target
+// with none may still have seen the installation's budget spent.
+func installationBudgets(targets map[string]Target) map[string][]RESTHeadroom {
+	budgets := map[string][]RESTHeadroom{}
+	for _, target := range targets {
+		if h, ok := target.Provisioner.(RESTHeadroom); ok {
+			budgets[installationOf(target)] = append(budgets[installationOf(target)], h)
+		}
+	}
+
+	return budgets
+}
+
+// inReserve says whether an installation's budget is down to its reserve for
+// the rest of the hour, as any of its targets' clients last saw it: each keeps
+// the statement its own requests drew, and within an hour the lowest of them is
+// the newest. A budget no answer has stated yet, or one whose hour has ended,
+// holds nothing back: the read's own throttle still pauses the installation.
+func inReserve(budgets []RESTHeadroom, now time.Time) (int64, int64, time.Time, bool) {
+	for _, h := range budgets {
+		remaining, limit, reset, ok := h.RESTHeadroom()
+		if ok && now.Before(reset) && remaining*queueTimeReserve < limit {
+			return remaining, limit, reset, true
+		}
+	}
+
+	return 0, 0, time.Time{}, false
+}
+
 // fillQueueTimesOnce is one pass at now.
 //
 // ONE READ OF A RUN SERVES EVERY JOB OF IT, so a run of forty jobs costs two
@@ -152,13 +200,14 @@ func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Targ
 	if !ok {
 		return
 	}
-	s.readQueueTimeWork(ctx, work, sweep, now)
+	s.readQueueTimeWork(ctx, work, installationBudgets(targets), sweep, now)
 }
 
-// readQueueTimeWork reads work in order within each installation's budget for
-// the pass, and records each run's backoff and each installation's pause.
-func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sweep *queueTimeSweep,
-	now time.Time,
+// readQueueTimeWork reads work in order within each installation's share of
+// the pass and its reserve, and records each run's backoff and each
+// installation's pause.
+func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, budgets map[string][]RESTHeadroom,
+	sweep *queueTimeSweep, now time.Time,
 ) {
 	read := map[string]int{}
 	for _, w := range work {
@@ -168,6 +217,18 @@ func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sw
 		if read[w.installation] == queueTimeRunsPerInstallation || now.Before(sweep.paused[w.installation]) {
 			continue
 		}
+		// BEFORE EVERY RUN, since the run read before it may have spent the
+		// installation down to its reserve.
+		if remaining, limit, reset, low := inReserve(budgets[w.installation], now); low {
+			if !sweep.reserved[w.installation] {
+				sweep.reserved[w.installation] = true
+				s.log.Warn("this App installation's REST budget is down to its reserve; reading queue times "+
+					"again when GitHub's next hour begins", "target", w.run.target, "installation", w.installation,
+					"remaining", remaining, "limit", limit, "reset", reset)
+			}
+			continue
+		}
+		delete(sweep.reserved, w.installation)
 		read[w.installation]++
 		missing, err := s.fillRunQueueTimes(ctx, w.reader, w.run, w.jobs)
 		switch {

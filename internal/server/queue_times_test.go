@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -410,7 +411,7 @@ func TestTargetsOfOneInstallationShareItsBudgetAndItsPause(t *testing.T) {
 			installation: installationOf(Target{Config: target}), reader: reader,
 		})
 	}
-	s.readQueueTimeWork(t.Context(), work, newQueueTimeSweep(), time.Now())
+	s.readQueueTimeWork(t.Context(), work, nil, newQueueTimeSweep(), time.Now())
 	if got := reader.asked(); len(got) != queueTimeRunsPerInstallation {
 		t.Errorf("two targets of one installation read runs %v in one pass, want %d in all", got,
 			queueTimeRunsPerInstallation)
@@ -525,5 +526,135 @@ func TestAJobBothScansReadIsGatheredOnce(t *testing.T) {
 	}
 	if len(work[0].jobs) != 3 || len(leases) != 3 {
 		t.Errorf("gathered %d jobs of %d leases, want each of the three once", len(work[0].jobs), len(leases))
+	}
+}
+
+// budgetedReader is a queueTimeReader whose installation states a budget, and
+// each of whose reads spends spend of it.
+type budgetedReader struct {
+	*queueTimeReader
+
+	remaining, limit, spend int64
+	reset                   time.Time
+	stated                  bool
+}
+
+func (r *budgetedReader) RunQueueTimes(ctx context.Context, owner, repository string, runID int64,
+) (map[string]time.Time, error) {
+	r.remaining -= r.spend
+	return r.queueTimeReader.RunQueueTimes(ctx, owner, repository, runID)
+}
+
+func (r *budgetedReader) RESTHeadroom() (int64, int64, time.Time, bool) {
+	return r.remaining, r.limit, r.reset, r.stated
+}
+
+// AN INSTALLATION DOWN TO THE LAST FIFTH OF ITS HOUR'S BUDGET IS LEFT IT until
+// GitHub's next hour begins, because the runner-group checks and the cache
+// authority draw on the same budget and a missing queue time decides nothing.
+// A budget no answer has stated, or one whose hour has ended, holds nothing
+// back: the read's own throttle still pauses the installation.
+func TestAnInstallationDownToItsReserveIsNotRead(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11, job12, job13)
+	var started []dispatch.Job
+	for i, request := range []int64{11, 12, 13} {
+		runner, err := p.a.PoolRunnerLaunchedFor(t.Context(), p.l.tier, request)
+		if err != nil {
+			t.Fatalf("the runner launched for %d: %v", request, err)
+		}
+		started = append(started, dispatch.Job{RequestID: request, RunID: 600 + request, JobID: runner.LeaseID,
+			RunnerID: int64(40 + i), RunnerName: runner.RunnerName, Owner: "acme", Repository: "api"})
+	}
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: started,
+		Statistics: &Statistics{TotalAssignedJobs: len(started)}}); err != nil {
+		t.Fatalf("start three jobs of three runs: %v", err)
+	}
+
+	now := time.Now()
+	reset := now.Add(20 * time.Minute)
+	reader := &budgetedReader{queueTimeReader: &queueTimeReader{fakeProvisioner: &fakeProvisioner{},
+		times: map[int64]map[string]time.Time{}}, remaining: 999, limit: 5000, reset: reset, stated: true}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme", InstallationID: 22},
+		Provisioner: reader}}
+	sweep := newQueueTimeSweep()
+
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
+	if got := reader.asked(); len(got) != 0 {
+		t.Errorf("an installation with 999 of 5000 left read runs %v", got)
+	}
+	if !sweep.reserved["installation 22"] {
+		t.Error("the sweep does not remember the installation it is leaving its reserve to")
+	}
+
+	// A fifth left exactly is not yet the reserve, and a pass reads all it may.
+	reader.remaining = 1000
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(time.Second))
+	if got := len(reader.asked()); got != queueTimeRunsPerInstallation {
+		t.Errorf("an installation with 1000 of 5000 left read %d runs, want %d", got, queueTimeRunsPerInstallation)
+	}
+	if sweep.reserved["installation 22"] {
+		t.Error("an installation read again is still remembered as held")
+	}
+
+	// Every run is inside its backoff after an empty answer; past it, nothing
+	// left before the reset reads nothing, and the reset itself reads again.
+	later := now.Add(2 * queueTimeRetryFirst)
+	reader.remaining, reset = 0, later.Add(time.Minute)
+	reader.reset = reset
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, reset.Add(-time.Second))
+	if got := len(reader.asked()); got != queueTimeRunsPerInstallation {
+		t.Errorf("an installation with nothing left before its reset read %d runs in all, want still %d", got,
+			queueTimeRunsPerInstallation)
+	}
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, reset)
+	if got := len(reader.asked()); got != 2*queueTimeRunsPerInstallation {
+		t.Errorf("an installation whose hour has ended read %d runs in all, want %d more", got,
+			queueTimeRunsPerInstallation)
+	}
+
+	// Targets of one installation each keep the statement their own requests
+	// drew, and one in reserve holds the installation for all of them, though it
+	// has no run of its own to read.
+	low := &budgetedReader{queueTimeReader: reader.queueTimeReader, remaining: 500, limit: 5000,
+		reset: now.Add(time.Hour), stated: true}
+	ample := &budgetedReader{queueTimeReader: reader.queueTimeReader, remaining: 4000, limit: 5000,
+		reset: now.Add(time.Hour), stated: true}
+	shared := func(first int64) []queueTimeWork {
+		var work []queueTimeWork
+		for i := range 3 {
+			work = append(work, queueTimeWork{
+				run:          queueTimeRun{target: "acme-" + strconv.Itoa(i), repository: "acme/api", run: first + int64(i)},
+				installation: "installation 22", reader: ample,
+			})
+		}
+		return work
+	}
+	before := len(reader.asked())
+	s.readQueueTimeWork(t.Context(), shared(980), map[string][]RESTHeadroom{"installation 22": {ample, low}},
+		newQueueTimeSweep(), now)
+	if got := len(reader.asked()) - before; got != 0 {
+		t.Errorf("an installation one of whose targets saw it in reserve read %d runs through another", got)
+	}
+
+	// And it is asked before every run: the one that spends the installation
+	// into its reserve is the last a pass starts.
+	ample.remaining, ample.spend = 1000, 1
+	before = len(reader.asked())
+	s.readQueueTimeWork(t.Context(), shared(990), map[string][]RESTHeadroom{"installation 22": {ample}},
+		newQueueTimeSweep(), now)
+	if got := len(reader.asked()) - before; got != 1 {
+		t.Errorf("a pass that spent the installation into its reserve on its first run read %d runs, want 1", got)
+	}
+
+	// A budget no answer has stated holds nothing back.
+	reader.stated, reader.reset = false, reset.Add(time.Hour)
+	before = len(reader.asked())
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, reset.Add(4*queueTimeRetryFirst))
+	if got := len(reader.asked()) - before; got != queueTimeRunsPerInstallation {
+		t.Errorf("an installation that has stated no budget read %d runs, want %d", got,
+			queueTimeRunsPerInstallation)
 	}
 }
