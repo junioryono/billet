@@ -16,10 +16,38 @@ import (
 
 // fakeComponentsChecker resolves @verified to one generation, returns an exact one
 // unchanged, and answers each generation's components record.
+//
+// The generations that exist are the one @verified names and every one with a
+// record, unless generations says otherwise.
 type fakeComponentsChecker struct {
-	verified   string
-	resolveErr error
-	records    map[string]ceph.GenerationComponents
+	verified       string
+	resolveErr     error
+	records        map[string]ceph.GenerationComponents
+	generations    []string
+	generationsErr error
+}
+
+func (f fakeComponentsChecker) Generations(context.Context, string) ([]ceph.Generation, error) {
+	if f.generationsErr != nil {
+		return nil, f.generationsErr
+	}
+
+	names := f.generations
+	if names == nil {
+		names = append(names, f.verified)
+		for name := range f.records {
+			names = append(names, name)
+		}
+	}
+
+	var out []ceph.Generation
+	for _, name := range names {
+		if g, ok := ceph.ParseGeneration(name); ok {
+			out = append(out, g)
+		}
+	}
+
+	return out, nil
 }
 
 func (f fakeComponentsChecker) ResolveGeneration(_ context.Context, image, _ string) (string, error) {
@@ -185,6 +213,54 @@ func TestCheckIsQuietForAnImageThatLeftNothingOutAndSaysWhenItCannotTell(t *test
 	}
 }
 
+// A PIN TO A GENERATION THAT DOES NOT EXIST IS SAID SO, never read as an image that
+// left nothing out, and a listing that fails is could-not-tell.
+func TestCheckSaysWhenATierNamesAGenerationThatIsNotThere(t *testing.T) {
+	pinned := `  - label: pinned
+    provider: firecracker
+    vcpu: 2
+    memory: 4GiB
+    image: ubuntu-2404-x64@g20260101000000
+`
+	store := fakeComponentsChecker{verified: completedGeneration, generations: []string{completedGeneration}}
+
+	out := checkComponents(t, store, "", pinned)
+	if !strings.Contains(out, "ubuntu-2404-x64@g20260101000000 (tier pinned) names "+
+		"ubuntu-2404-x64@g20260101000000, which is not a generation of ubuntu-2404-x64, so a launch of it fails") {
+		t.Errorf("a pin to a missing generation was not reported:\n%s", out)
+	}
+
+	store.generationsErr = errors.New("rbd timed out")
+	out = checkComponents(t, store, "", "")
+	if !strings.Contains(out, "could not tell which generations of ubuntu-2404-x64 exist: rbd timed out") {
+		t.Errorf("a failed listing was not reported as unknown:\n%s", out)
+	}
+}
+
+// A NEWER GENERATION THAT ALREADY MATCHES IS A VERIFICATION OUTSTANDING, NOT A PULL:
+// the refresh compares against the newest generation and sees nothing to do.
+func TestCheckSendsAnUnverifiedMatchingGenerationToVerification(t *testing.T) {
+	const newer = "g20260903120000"
+	store := fakeComponentsChecker{verified: completedGeneration, records: map[string]ceph.GenerationComponents{
+		completedGeneration: {LeftOut: []string{"google-chrome"}, Installed: map[string]string{}},
+		newer:               {LeftOut: []string{"google-chrome"}, Installed: map[string]string{"google-chrome": "155.0.8059.84"}},
+	}}
+
+	out := checkComponents(t, store, "images:\n  accept: [google-chrome]\n", "")
+	if !strings.Contains(out, "lacks google-chrome, which this deployment accepts; the newer generation "+
+		newer+" matches what this deployment accepts and @verified has not moved onto it") ||
+		!strings.Contains(out, "`billet images verify ubuntu-2404-x64@"+newer+"` proves it") {
+		t.Errorf("a matching unverified generation was not sent to verification:\n%s", out)
+	}
+
+	// A NEWER GENERATION THAT ALSO LACKS IT leaves the refresh to complete one.
+	store.records[newer] = ceph.GenerationComponents{LeftOut: []string{"google-chrome"}, Installed: map[string]string{}}
+	out = checkComponents(t, store, "images:\n  accept: [google-chrome]\n", "")
+	if !strings.Contains(out, "the refresh timer's next `billet images refresh` completes a new generation") {
+		t.Errorf("a newer generation lacking the component was treated as complete:\n%s", out)
+	}
+}
+
 // checkChannel runs ReportChannelImage against a fetch that answers manifest or
 // err, and returns what it printed.
 func checkChannel(t *testing.T, extra string, manifest *imagesource.Manifest, fetchErr error) string {
@@ -234,6 +310,13 @@ func TestCheckSaysWhetherThisBilletCanTakeUpTheChannelsImage(t *testing.T) {
 	if !strings.Contains(out, "needs a newer billet, and release.automatic is false, so no newer "+
 		"guest image is taken up until an operator upgrades billet") {
 		t.Errorf("a deployment that does not update itself was not told:\n%s", out)
+	}
+
+	// A PINNED RELEASE FOLLOWS NO CHANNEL, so nothing installs a newer billet by itself.
+	out = checkChannel(t, "release:\n  version: v0.13.0\n", needsNewer, nil)
+	if !strings.Contains(out, "release.version pins this deployment at v0.13.0, so no newer guest "+
+		"image is taken up until the pin moves") || strings.Contains(out, "installs by itself") {
+		t.Errorf("a pinned release was promised an automatic upgrade:\n%s", out)
 	}
 
 	out = checkChannel(t, "", nil, errors.New("dial tcp: i/o timeout"))

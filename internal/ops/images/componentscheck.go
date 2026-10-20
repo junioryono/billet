@@ -19,6 +19,7 @@ import (
 // image reference boots, and what that generation's image left out.
 type componentsChecker interface {
 	ResolveGeneration(ctx context.Context, image, guestContract string) (string, error)
+	Generations(ctx context.Context, image string) ([]ceph.Generation, error)
 	componentsReader
 }
 
@@ -73,6 +74,21 @@ func componentLines(ctx context.Context, store componentsChecker, use tierImageU
 	}
 
 	image, generation, _ := strings.Cut(ref, "@")
+
+	// THE GENERATION IS PROVED TO EXIST BEFORE ITS RECORD IS READ. An exact pin is
+	// resolved unchanged, and a generation that is not there has no record either,
+	// which would read as an image that left nothing out.
+	generations, err := store.Generations(ctx, image)
+	if err != nil {
+		return []string{fmt.Sprintf("%s (%s): could not tell which generations of %s exist: %v",
+			use.image, tiers, image, err)}
+	}
+	booted, exists := findGeneration(generations, generation)
+	if !exists {
+		return []string{fmt.Sprintf("%s (%s) names %s, which is not a generation of %s, so a "+
+			"launch of it fails", use.image, tiers, ref, image)}
+	}
+
 	record, found, err := store.Components(ctx, image, generation)
 	if err != nil {
 		return []string{fmt.Sprintf("%s (%s): could not tell what %s left out: %v", use.image, tiers,
@@ -94,17 +110,7 @@ func componentLines(ctx context.Context, store componentsChecker, use tierImageU
 	}
 	missing, unaccepted := completionGap(record, found, accepted)
 
-	// A PINNED TIER KEEPS ITS PIN. A newer completed generation reaches it only when
-	// somebody moves the pin, so that is what the sentence has to say.
-	next := "the refresh timer's next `billet images refresh` completes a new generation of it"
-	switch _, alias, _ := strings.Cut(use.image, "@"); {
-	case alias != ceph.Verified:
-		next = "it is pinned, so a generation completed with what this deployment accepts reaches " +
-			"it only when the pin moves"
-	case !automatic:
-		next = "release.automatic is false, so `billet images pull --verify " + image +
-			"` is what completes a new generation of it"
-	}
+	next := nextCompletion(ctx, store, use.image, image, booted, generations, accepted, automatic)
 
 	who := fmt.Sprintf("%s (%s) boots %s", use.image, tiers, ref)
 
@@ -127,6 +133,62 @@ func componentLines(ctx context.Context, store componentsChecker, use tierImageU
 	}
 
 	return lines
+}
+
+// nextCompletion says what will bring the generation a tier boots into line with
+// what this deployment accepts.
+//
+// THE SAME COMPARISON THE REFRESH MAKES, against the newest generation imported,
+// not the one @verified resolves to: when a newer generation already matches, a
+// refresh sees nothing to do while the channel is unchanged, and what is
+// outstanding is that generation's verification, not another pull.
+func nextCompletion(ctx context.Context, store componentsChecker, ref, image string,
+	booted ceph.Generation, generations []ceph.Generation, accepted []config.ImageComponent,
+	automatic bool,
+) string {
+	// A PINNED TIER KEEPS ITS PIN. A newer completed generation reaches it only when
+	// somebody moves the pin, so that is what the sentence has to say.
+	if _, alias, _ := strings.Cut(ref, "@"); alias != ceph.Verified {
+		return "it is pinned, so a generation completed with what this deployment accepts reaches " +
+			"it only when the pin moves"
+	}
+
+	newest := booted
+	for _, g := range generations {
+		if g.Built.After(newest.Built) {
+			newest = g
+		}
+	}
+
+	if newest.Name != booted.Name {
+		record, found, err := store.Components(ctx, image, newest.Name)
+		if err != nil {
+			return fmt.Sprintf("could not tell what the newer generation %s left out: %v", newest.Name, err)
+		}
+		if missing, unaccepted := completionGap(record, found, accepted); len(missing) == 0 && len(unaccepted) == 0 {
+			return fmt.Sprintf("the newer generation %s matches what this deployment accepts and "+
+				"@verified has not moved onto it, which no refresh retries while the channel is "+
+				"unchanged; `billet images verify %s@%s` proves it", newest.Name, image, newest.Name)
+		}
+	}
+
+	if !automatic {
+		return "release.automatic is false, so `billet images pull --verify " + image +
+			"` is what completes a new generation of it"
+	}
+
+	return "the refresh timer's next `billet images refresh` completes a new generation of it"
+}
+
+// findGeneration is the generation of generations named name.
+func findGeneration(generations []ceph.Generation, name string) (ceph.Generation, bool) {
+	for _, g := range generations {
+		if g.Name == name {
+			return g, true
+		}
+	}
+
+	return ceph.Generation{}, false
 }
 
 // ReportChannelImage says whether this billet can take up the guest image the
@@ -157,6 +219,11 @@ func ReportChannelImage(ctx context.Context, env cli.Env, cfg *config.Config) {
 	case err == nil:
 		fmt.Fprintf(env.Stdout, "images   the channel's image, built %s, is one this billet can import\n",
 			manifest.BuiltAt.UTC().Format("2006-01-02 15:04 MST"))
+	case errors.Is(err, imagesource.ErrNeedsNewerBillet) && cfg.Release.Pinned():
+		fmt.Fprintf(env.Stdout, "images   the channel's image needs a newer billet, and "+
+			"release.version pins this deployment at %s, so no newer guest image is taken up until "+
+			"the pin moves, and the tiers keep booting what they have until it ages out of GitHub's "+
+			"runner window: %v\n", cfg.Release.PinnedVersion(), err)
 	case errors.Is(err, imagesource.ErrNeedsNewerBillet) && cfg.Release.AutomaticUpdates():
 		fmt.Fprintf(env.Stdout, "images   the channel's image needs a newer billet, which this "+
 			"deployment installs by itself when its release channel advances: %v\n", err)

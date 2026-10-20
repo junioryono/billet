@@ -154,6 +154,21 @@ func TestANewerSchemaNeedsANewerBillet(t *testing.T) {
 			t.Errorf("schema %d: got %v, want it refused as no billet's", schema, err)
 		}
 	}
+
+	// A SCHEMA NAMED TWICE IS AMBIGUOUS, in either order, never a newer billet's.
+	for _, keys := range []string{`"schema":1,"schema":4,`, `"schema":4,"schema":1,`} {
+		m := validManifest()
+		body := strings.Replace(string(mustJSON(t, m)), `"schema":1,`, keys, 1)
+		if body == string(mustJSON(t, m)) {
+			t.Fatalf("the fixture does not spell its schema as %q", `"schema":1,`)
+		}
+
+		_, err := ParseManifest([]byte(body))
+		if err == nil || errors.Is(err, ErrNeedsNewerBillet) ||
+			!strings.Contains(err.Error(), "more than once") {
+			t.Errorf("%s: got %v, want the duplicate refused as ambiguous", keys, err)
+		}
+	}
 }
 
 // TestTheReaderIsAheadOfTheWriter is the migration invariant, asserted directly.

@@ -380,6 +380,21 @@ func TestAReservationOnAListingThatAnswersENOENTClearsNothing(t *testing.T) {
 	}
 }
 
+// GENERATIONS READS A LISTING'S ENOENT THE SAME WAY: none for an absent image, and
+// an error for one that exists, never an empty answer a caller would act on.
+func TestGenerationsOnAListingThatAnswersENOENT(t *testing.T) {
+	present := &importFake{infoJSON: `{"size": 8388608}`, snapListENOENT: true}
+	if gens, err := importClient(t, present).Generations(t.Context(), "ubuntu-2404-x64"); err == nil {
+		t.Fatalf("got %v and no error, want a listing that could not be read reported", gens)
+	}
+
+	absent := &importFake{snapListENOENT: true}
+	gens, err := importClient(t, absent).Generations(t.Context(), "ubuntu-2404-x64")
+	if err != nil || len(gens) != 0 {
+		t.Fatalf("got %v, %v, want an absent image to have no generations", gens, err)
+	}
+}
+
 // A LISTING'S ENOENT IS ABSENCE ONLY WHEN `info` SAYS SO: an image that is not there
 // yet is a first import and proceeds, and an `info` that fails otherwise cannot
 // tell, so the import is refused with nothing cleared.

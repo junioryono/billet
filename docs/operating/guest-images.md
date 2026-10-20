@@ -75,8 +75,9 @@ images:
 
 - the generation they boot, and the versions it was completed with;
 - what its image left out that this deployment has not accepted, which a job will not find;
-- what it lacks that the deployment accepts (a component accepted since it was imported), and what will complete it: the refresh timer, a pull by hand when `release.automatic` is false, or moving the pin of a tier that names an exact generation;
-- with its network probes, whether the channel's image is one this billet can import, and if it needs a newer billet, whether this deployment installs one by itself.
+- what it lacks that the deployment accepts (a component accepted since it was imported), and what will complete it: the refresh timer, a pull by hand when `release.automatic` is false, moving the pin of a tier that names an exact generation, or verifying a newer generation that already matches, which a refresh does not retry while the channel is unchanged;
+- a tier that names a generation that does not exist;
+- with its network probes, whether the channel's image is one this billet can import, and if it needs a newer billet, whether this deployment installs one by itself (not with `release.automatic: false`, and not while `release.version` pins it).
 
 **A node behind a firewall.** The completion microVM leaves through the same egress as a trusted job. GitHub's installers download from these hosts, read from the installers at the pinned runner-images commit on 2026-10-20 rather than measured from a completion. Every component also needs the Ubuntu archive for the packages it depends on.
 

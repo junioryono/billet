@@ -751,15 +751,36 @@ func ParseManifest(data []byte) (*Manifest, error) {
 }
 
 // peekSchema reads the top-level "schema" of a manifest, spelled exactly; found is
-// false for a document that is not an object or names no integer schema.
+// false for a document that is not an object, names no integer schema, or names
+// one more than once, which the strict path refuses as ambiguous rather than as a
+// manifest a newer billet would read.
 func peekSchema(data []byte) (int, bool) {
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(data, &top); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return 0, false
 	}
 
+	var raw json.RawMessage
+	seen := 0
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return 0, false
+		}
+
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return 0, false
+		}
+
+		if key, isKey := tok.(string); isKey && key == "schema" {
+			seen++
+			raw = value
+		}
+	}
+
 	var schema int
-	if err := json.Unmarshal(top["schema"], &schema); err != nil {
+	if seen != 1 || json.Unmarshal(raw, &schema) != nil {
 		return 0, false
 	}
 
