@@ -57,6 +57,17 @@ func newRunnerlessPool(t *testing.T, assigned ...dispatch.Job) *runnerlessPool {
 	return p
 }
 
+// restart replaces the listener with a fresh one over the same ledger, runner
+// and registry, as a controller restart leaves it: nothing held in memory.
+func (p *runnerlessPool) restart() {
+	runner := p.l.runner
+	p.l = NewListener(p.a, p.l.tier, p.session, WithRunner(runner), WithRunnerRegistry(p.registry))
+	p.l.writeJobResult = func(_ context.Context, leaseID, result string, _ int64) error {
+		p.results = append(p.results, recordedResult{leaseID, result})
+		return nil
+	}
+}
+
 func (p *runnerlessPool) launchedFor11(t *testing.T) alloc.PoolRunner {
 	t.Helper()
 
@@ -460,11 +471,11 @@ func TestACancellationNamingOnlyARunnerIDStillSettles(t *testing.T) {
 	}
 }
 
-// A MEMBER BUSY WITH ITS JOB UNKNOWN IS WATCHED FROM WHEN THIS LISTENER FIRST
-// SEES IT, so a restart that forgot when it was reinstated, or a runner recovered
-// busy, is still asked about again once the recheck has passed, and a member
-// whose row is gone leaves the watch.
-func TestAMemberBusyWithAnUnknownJobIsWatchedAcrossARestart(t *testing.T) {
+// A RUNNER RECOVERED BUSY IS LEFT TO RECOVERY, never asked about by the pool's
+// recheck: recovery inspects it at GitHub on the node's adoption, and the
+// retirement the recheck uses destroys by request, which after a restart cannot
+// tell an unreachable holder from no compute at all.
+func TestARunnerRecoveredBusyIsLeftToRecovery(t *testing.T) {
 	t.Parallel()
 
 	p := newRunnerlessPool(t, job11)
@@ -473,25 +484,19 @@ func TestAMemberBusyWithAnUnknownJobIsWatchedAcrossARestart(t *testing.T) {
 	if err := p.a.PreserveRecoveredBusyPoolRunner(t.Context(), recovered); err != nil {
 		t.Fatalf("recover the runner as busy: %v", err)
 	}
-	now := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
+	// FROM THE WALL CLOCK, which the fixture's own first pass ran on, so no time
+	// it may have kept lies in this clock's future.
+	now := time.Now()
 	p.l.now = func() time.Time { return now }
 
-	reconcile := func(at time.Time) {
-		t.Helper()
+	for _, at := range []time.Time{now, now.Add(reinstatedRecheck), now.Add(3 * reinstatedRecheck)} {
 		now = at
 		if err := p.l.reconcilePool(t.Context(), 1); err != nil {
 			t.Fatalf("reconcile at %s: %v", at, err)
 		}
 	}
-
-	start := now
-	reconcile(start)
-	if slices.Contains(p.registry.names, recovered.RunnerName) {
-		t.Fatalf("removed %v on first sight, want the recheck waited for", p.registry.names)
-	}
-	reconcile(start.Add(reinstatedRecheck))
-	if !slices.Contains(p.registry.names, recovered.RunnerName) || !slices.Contains(p.destroyed, 11) {
-		t.Fatalf("removed %v and destroyed %v at the recheck; want GitHub asked and the member torn down",
+	if slices.Contains(p.registry.names, recovered.RunnerName) || slices.Contains(p.destroyed, 11) {
+		t.Errorf("removed %v and destroyed %v: the pool's recheck took a runner recovery holds",
 			p.registry.names, p.destroyed)
 	}
 }
@@ -503,25 +508,22 @@ func TestAWatchedMemberWhoseRowIsGoneLeavesTheWatch(t *testing.T) {
 	t.Parallel()
 
 	p := newRunnerlessPool(t, job11)
-	recovered := p.launchedFor11(t)
-	recovered.RunnerID = 77
-	if err := p.a.PreserveRecoveredBusyPoolRunner(t.Context(), recovered); err != nil {
-		t.Fatalf("recover the runner as busy: %v", err)
-	}
-	if err := p.l.reconcilePool(t.Context(), 1); err != nil {
+	member := p.launchedFor11(t)
+	p.registry.busy[member.RunnerName] = true
+	if err := p.l.reconcilePool(t.Context(), 0); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	watched := func() bool {
 		p.l.mu.Lock()
 		defer p.l.mu.Unlock()
-		_, ok := p.l.reinstated[recovered.LeaseID]
+		_, ok := p.l.reinstated[member.LeaseID]
 		return ok
 	}
 	if !watched() {
-		t.Fatal("a member busy with its job unknown is not watched")
+		t.Fatal("a member reinstated busy is not watched")
 	}
 
-	if err := p.a.ForgetPoolRunner(t.Context(), recovered.LeaseID); err != nil {
+	if err := p.a.ForgetPoolRunner(t.Context(), member.LeaseID); err != nil {
 		t.Fatalf("forget the settled member's row: %v", err)
 	}
 	if err := p.l.reconcilePool(t.Context(), 0); err != nil {
@@ -533,8 +535,9 @@ func TestAWatchedMemberWhoseRowIsGoneLeavesTheWatch(t *testing.T) {
 }
 
 // A COMPLETION NAMING THE RUNNER'S OWN ID IS THAT RUNNER'S, though it names no
-// runner by name and the runner is busy with its job unknown: it settles it
-// rather than being detached and its result dropped.
+// runner by name and the runner is busy with its job unknown: it settles it, its
+// lease restored from the runner's binding as a named completion's is, rather
+// than being detached and its result dropped, after a restart too.
 func TestACompletionNamingAPlaceholdersOwnRunnerIDSettlesIt(t *testing.T) {
 	t.Parallel()
 
@@ -544,6 +547,7 @@ func TestACompletionNamingAPlaceholdersOwnRunnerIDSettlesIt(t *testing.T) {
 	if err := p.a.PreserveRecoveredBusyPoolRunner(t.Context(), recovered); err != nil {
 		t.Fatalf("recover the runner as busy: %v", err)
 	}
+	p.restart()
 
 	succeeded := job11
 	succeeded.Result, succeeded.RunnerID = "Succeeded", 77

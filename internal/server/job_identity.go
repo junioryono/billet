@@ -322,6 +322,11 @@ func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode 
 				// A completion naming the runner's own id is that runner's: it is not
 				// runner-less, whatever the runner is bound to.
 				own := job.RunnerID != 0 && job.RunnerID == launched.RunnerID
+				if own {
+					// AND ITS BINDING IS THE ONE HANDED BACK, so the lease is restored
+					// and settled as a named completion's would be after a restart.
+					out.binding = &launched
+				}
 				out.detached = !own &&
 					(launched.ActualRequestID != 0 || launched.Status == alloc.PoolRunnerBusy) &&
 					!sameActualJob(out.actual, bound)

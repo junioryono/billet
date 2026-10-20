@@ -426,18 +426,21 @@ const (
 	reinstatedPerPass = 2
 )
 
-// recheckReinstated asks again to remove a member busy with its job unknown, so
-// a JobStarted and a completion that were both lost do not hold its capacity,
-// its pool slot and a drain for ever. Such a member is one GitHub refused to
-// remove because it was running a job, or one recovered busy after a restart.
-// THE REMOVAL IS STILL THE PROOF and the clock only when it is asked: a refusal
-// reinstates it again, and only a removal GitHub carries out tears it down, as
-// the retiring retry did before members were reinstated.
+// recheckReinstated asks again to remove a member this listener reinstated busy
+// whose job has not named itself, so a JobStarted and a completion that were
+// both lost do not hold its capacity, its pool slot and a drain for ever. THE
+// REMOVAL IS STILL THE PROOF and the clock only when it is asked: a refusal
+// reinstates it again, and only a removal GitHub carries out tears it down,
+// through the same retirement the retiring retry used before members were
+// reinstated. The watch is read against the pool's rows on each pass, so a
+// member bound to its job or whose row is gone leaves it.
 //
-// EVERY SUCH MEMBER IS WATCHED FROM WHEN THIS LISTENER FIRST SEES IT, read
-// afresh from the pool's rows on each pass, so a restart that forgets the times
-// starts them again rather than forgetting the members, and a member whose row
-// is gone leaves the watch.
+// ONLY WHAT THIS PROCESS REINSTATED, never a runner recovered busy after a
+// restart: recovery inspects that one at GitHub on the node's adoption, and the
+// retirement here destroys by request, which after a restart cannot tell an
+// unreachable holder from no compute at all. A restart therefore leaves a
+// reinstated member as recovery leaves its own, waiting for its job's start or
+// completion.
 func (l *Listener) recheckReinstated(ctx context.Context, runners []alloc.PoolRunner) {
 	now := l.clock()
 
@@ -446,15 +449,14 @@ func (l *Listener) recheckReinstated(ctx context.Context, runners []alloc.PoolRu
 	var due []alloc.PoolRunner
 	for i := range runners {
 		member := runners[i]
-		if member.Status != alloc.PoolRunnerBusy || member.ActualRequestID != 0 || member.RunID != 0 ||
-			member.JobID != "" {
+		since, reinstated := l.reinstated[member.LeaseID]
+		if !reinstated || member.ActualRequestID != 0 || member.RunID != 0 || member.JobID != "" {
 			continue
 		}
-		since, seen := l.reinstated[member.LeaseID]
-		if !seen {
-			since = now
-		}
 		watched[member.LeaseID] = since
+		if member.Status != alloc.PoolRunnerBusy {
+			continue
+		}
 		if now.Sub(since) >= reinstatedRecheck && len(due) < reinstatedPerPass {
 			due = append(due, member)
 		}
