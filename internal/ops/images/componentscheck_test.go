@@ -11,6 +11,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
@@ -25,6 +26,17 @@ type fakeComponentsChecker struct {
 	records        map[string]ceph.GenerationComponents
 	generations    []string
 	generationsErr error
+	// contracts is each generation's guest contract; one not named speaks this
+	// billet's.
+	contracts map[string]string
+}
+
+func (f fakeComponentsChecker) GuestContract(_ context.Context, _, generation string) (string, bool, error) {
+	if contract, named := f.contracts[generation]; named {
+		return contract, contract != "", nil
+	}
+
+	return firecracker.GuestContract, true, nil
 }
 
 func (f fakeComponentsChecker) Generations(context.Context, string) ([]ceph.Generation, error) {
@@ -252,6 +264,16 @@ func TestCheckSendsAnUnverifiedMatchingGenerationToVerification(t *testing.T) {
 		!strings.Contains(out, "`billet images verify ubuntu-2404-x64@"+newer+"` proves it") {
 		t.Errorf("a matching unverified generation was not sent to verification:\n%s", out)
 	}
+
+	// A NEWER GENERATION UNDER ANOTHER GUEST CONTRACT is not this billet's to verify:
+	// during a rolling upgrade it is a newer binary's.
+	store.contracts = map[string]string{newer: "999"}
+	out = checkComponents(t, store, "images:\n  accept: [google-chrome]\n", "")
+	if !strings.Contains(out, "the newer generation "+newer+" matches what this deployment accepts and "+
+		"speaks guest contract 999, which this billet does not") || strings.Contains(out, "billet images verify") {
+		t.Errorf("a newer generation under another contract was sent to this billet's verification:\n%s", out)
+	}
+	store.contracts = nil
 
 	// A NEWER GENERATION THAT ALSO LACKS IT leaves the refresh to complete one.
 	store.records[newer] = ceph.GenerationComponents{LeftOut: []string{"google-chrome"}, Installed: map[string]string{}}

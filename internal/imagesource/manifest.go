@@ -779,6 +779,15 @@ func peekSchema(data []byte) (int, bool) {
 		}
 	}
 
+	// ONE WHOLE DOCUMENT, closed and followed by nothing. A corrupt document is not
+	// one a newer billet reads, and the strict path refuses it for what it is.
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return 0, false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return 0, false
+	}
+
 	var schema int
 	if seen != 1 || json.Unmarshal(raw, &schema) != nil {
 		return 0, false

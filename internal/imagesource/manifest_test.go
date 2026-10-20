@@ -155,6 +155,20 @@ func TestANewerSchemaNeedsANewerBillet(t *testing.T) {
 		}
 	}
 
+	// A CORRUPT DOCUMENT IS NOT A NEWER BILLET'S, whatever schema it names.
+	future := validManifest()
+	future.Schema = SchemaV3 + 1
+	whole := string(mustJSON(t, future))
+	for name, body := range map[string]string{
+		"trailing garbage":  whole + "garbage",
+		"a second document": whole + `{"schema":1}`,
+		"unclosed":          strings.TrimSuffix(strings.TrimSpace(whole), "}"),
+	} {
+		if _, err := ParseManifest([]byte(body)); err == nil || errors.Is(err, ErrNeedsNewerBillet) {
+			t.Errorf("%s: got %v, want a corrupt document refused as corrupt", name, err)
+		}
+	}
+
 	// A SCHEMA NAMED TWICE IS AMBIGUOUS, in either order, never a newer billet's.
 	for _, keys := range []string{`"schema":1,"schema":4,`, `"schema":4,"schema":1,`} {
 		m := validManifest()

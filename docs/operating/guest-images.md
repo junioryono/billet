@@ -75,7 +75,7 @@ images:
 
 - the generation they boot, and the versions it was completed with;
 - what its image left out that this deployment has not accepted, which a job will not find;
-- what it lacks that the deployment accepts (a component accepted since it was imported), and what will complete it: the refresh timer, a pull by hand when `release.automatic` is false, moving the pin of a tier that names an exact generation, or verifying a newer generation that already matches, which a refresh does not retry while the channel is unchanged;
+- what it lacks that the deployment accepts (a component accepted since it was imported), and what will complete it: the refresh timer, a pull by hand when `release.automatic` is false, moving the pin of a tier that names an exact generation, or verifying a newer generation that already matches, which a refresh does not retry while the channel is unchanged (when that generation speaks a guest contract this billet does not, it says a billet that speaks it is what boots it);
 - a tier that names a generation that does not exist;
 - with its network probes, whether the channel's image is one this billet can import, and if it needs a newer billet, whether this deployment installs one by itself (not with `release.automatic: false`, and not while `release.version` pins it).
 

@@ -20,6 +20,7 @@ import (
 type componentsChecker interface {
 	ResolveGeneration(ctx context.Context, image, guestContract string) (string, error)
 	Generations(ctx context.Context, image string) ([]ceph.Generation, error)
+	GuestContract(ctx context.Context, image, generation string) (string, bool, error)
 	componentsReader
 }
 
@@ -166,6 +167,25 @@ func nextCompletion(ctx context.Context, store componentsChecker, ref, image str
 			return fmt.Sprintf("could not tell what the newer generation %s left out: %v", newest.Name, err)
 		}
 		if missing, unaccepted := completionGap(record, found, accepted); len(missing) == 0 && len(unaccepted) == 0 {
+			// ITS CONTRACT DECIDES WHO CAN PROVE IT. During a rolling upgrade the
+			// newest generation may speak a guest contract this binary does not, and
+			// then a verification here is the wrong advice: it is a binary that
+			// speaks it that boots it.
+			contract, recorded, err := store.GuestContract(ctx, image, newest.Name)
+			switch {
+			case err != nil:
+				return fmt.Sprintf("could not tell which guest contract the newer generation %s, which "+
+					"matches what this deployment accepts, speaks: %v", newest.Name, err)
+			case !recorded:
+				return fmt.Sprintf("the newer generation %s matches what this deployment accepts and "+
+					"records no guest contract, so no billet resolves @verified to it", newest.Name)
+			case contract != firecracker.GuestContract:
+				return fmt.Sprintf("the newer generation %s matches what this deployment accepts and "+
+					"speaks guest contract %s, which this billet does not (%s), so @verified here keeps "+
+					"resolving to the older one until this host runs a billet that speaks it",
+					newest.Name, contract, firecracker.GuestContract)
+			}
+
 			return fmt.Sprintf("the newer generation %s matches what this deployment accepts and "+
 				"@verified has not moved onto it, which no refresh retries while the channel is "+
 				"unchanged; `billet images verify %s@%s` proves it", newest.Name, image, newest.Name)
