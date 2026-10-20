@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -18,7 +19,7 @@ type runnerlessPool struct {
 	a         *alloc.Allocator
 	l         *Listener
 	session   *fakeSession
-	registry  *fakeRunnerRegistry
+	registry  *inspectingRegistry
 	destroyed []int64
 	results   []recordedResult
 }
@@ -30,7 +31,7 @@ func newRunnerlessPool(t *testing.T, assigned ...dispatch.Job) *runnerlessPool {
 	p := &runnerlessPool{
 		a:        newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers),
 		session:  &fakeSession{},
-		registry: &fakeRunnerRegistry{},
+		registry: &inspectingRegistry{byName: map[string][]RunnerState{}},
 	}
 	runner := &fakeRunner{onDestroy: func(requestID int64) error {
 		p.destroyed = append(p.destroyed, requestID)
@@ -183,12 +184,15 @@ func TestARunnerlessCancellationStillFinishesItsJob(t *testing.T) {
 }
 
 // A RUNNER LAUNCHED FOR THE JOB AND STILL IDLE IS WHAT THE CANCELLATION RETIRES,
-// because nothing else will: its job is gone and it runs nothing.
+// because nothing else will: its job is gone and it runs nothing. GitHub deleting
+// the id it holds for the runner is the proof, asked for before anything is
+// journaled, and the cancellation is not recorded on a lease that never ran it.
 func TestARunnerlessCancellationRetiresTheIdleRunnerLaunchedForIt(t *testing.T) {
 	t.Parallel()
 
 	p := newRunnerlessPool(t, job11)
 	idle := p.launchedFor11(t)
+	p.registry.byName[idle.RunnerName] = []RunnerState{{Present: true, Online: true, ID: 4401}}
 
 	canceled := job11
 	canceled.Result = "Canceled"
@@ -199,9 +203,109 @@ func TestARunnerlessCancellationRetiresTheIdleRunnerLaunchedForIt(t *testing.T) 
 		t.Fatalf("the runner-less cancellation was refused: %v", err)
 	}
 
-	if !slices.Contains(p.destroyed, 11) || !slices.Contains(p.registry.names, idle.RunnerName) {
-		t.Errorf("destroyed %v, removed %v: the idle runner launched for a cancelled job was kept",
-			p.destroyed, p.registry.names)
+	if !slices.Equal(p.registry.withdrawn, []int64{4401}) || !slices.Contains(p.destroyed, 11) {
+		t.Errorf("withdrew %v, destroyed %v: the idle runner launched for a cancelled job was not retired "+
+			"by deleting the id GitHub holds", p.registry.withdrawn, p.destroyed)
+	}
+	for _, r := range p.results {
+		if r.lease == idle.LeaseID {
+			t.Errorf("recorded %q on the idle runner's lease, for a job it never ran", r.result)
+		}
+	}
+	if _, err := p.a.PoolRunnerByLease(t.Context(), idle.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("the retired runner's journal is still read (%v), want it forgotten", err)
+	}
+}
+
+// AN IDLE RUNNER GITHUB WILL NOT DELETE IS RUNNING A JOB BILLET HAS NOT HEARD OF.
+// Measured on 2026-10-20: a runner launched for a job cancelled before any runner
+// took it was refused deletion as "currently running a job", and the JobStarted
+// naming its real job arrived four minutes later. Settled on the cancellation,
+// the runner's lease took the cancelled job's result, that JobStarted was refused
+// and the real result was refused as a contradiction. Kept idle and unjournaled,
+// the JobStarted binds it and the real completion settles it.
+func TestARunnerlessCancellationKeepsAnIdleRunnerGitHubWillNotDelete(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11, job12)
+	swapped := p.launchedFor11(t)
+	p.registry.byName[swapped.RunnerName] = []RunnerState{{Present: true, Online: true, ID: 4402}}
+	p.registry.withdrawErr = errors.New("job still running: Runner is currently running a job and cannot be deleted")
+
+	canceled := job11
+	canceled.Result = "Canceled"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{canceled}}); err != nil {
+		t.Fatalf("the runner-less cancellation was refused: %v", err)
+	}
+	if !slices.Equal(p.registry.withdrawn, []int64{4402}) {
+		t.Fatalf("withdrew %v, want the id GitHub holds asked for once", p.registry.withdrawn)
+	}
+	if slices.Contains(p.destroyed, 11) {
+		t.Fatalf("destroyed %v: a runner GitHub refused to delete was torn down", p.destroyed)
+	}
+	kept, err := p.a.PoolRunnerByLease(t.Context(), swapped.LeaseID)
+	if err != nil || kept.Status != alloc.PoolRunnerIdle {
+		t.Fatalf("the refused runner is %+v (%v), want it idle and unjournaled", kept, err)
+	}
+
+	started := job12
+	started.RunnerID, started.RunnerName = 4402, swapped.RunnerName
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Started: []dispatch.Job{started},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("the delayed JobStarted was refused: %v", err)
+	}
+	bound, err := p.a.PoolRunnerByLease(t.Context(), swapped.LeaseID)
+	if err != nil || bound.Status != alloc.PoolRunnerBusy || bound.JobID != "job-12" || bound.RunID != 102 {
+		t.Fatalf("after the delayed JobStarted the runner is %+v (%v), want busy with job 12 of run 102", bound, err)
+	}
+
+	succeeded := started
+	succeeded.Result = "Succeeded"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 4, Completed: []dispatch.Job{succeeded},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("the real completion was refused: %v", err)
+	}
+	var recorded []string
+	for _, r := range p.results {
+		if r.lease == swapped.LeaseID {
+			recorded = append(recorded, r.result)
+		}
+	}
+	if !slices.Equal(recorded, []string{"Succeeded"}) || !slices.Contains(p.destroyed, 11) {
+		t.Errorf("recorded %v on the runner's lease and destroyed %v; want only the real job's Succeeded, "+
+			"then its teardown", recorded, p.destroyed)
+	}
+}
+
+// AN IDLE RUNNER GITHUB REPORTS BUSY, OR CANNOT ANSWER FOR, IS KEPT WITHOUT A
+// DELETE BEING ASKED: could not tell is not idle.
+func TestARunnerlessCancellationAsksNoDeleteOfARunnerGitHubReportsBusy(t *testing.T) {
+	t.Parallel()
+
+	for name, answer := range map[string][]RunnerState{
+		"busy":       {{Present: true, Online: true, Busy: true, ID: 4403}},
+		"absent":     {{}},
+		"unanswered": nil,
+	} {
+		p := newRunnerlessPool(t, job11)
+		runner := p.launchedFor11(t)
+		if answer != nil {
+			p.registry.byName[runner.RunnerName] = answer
+		}
+
+		canceled := job11
+		canceled.Result = "Canceled"
+		if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{canceled}}); err != nil {
+			t.Fatalf("%s: the runner-less cancellation was refused: %v", name, err)
+		}
+		if len(p.registry.withdrawn) != 0 || slices.Contains(p.destroyed, 11) || len(p.registry.askedFor) != 1 {
+			t.Errorf("%s: asked about %v, withdrew %v, destroyed %v; want one inspection and nothing removed",
+				name, p.registry.askedFor, p.registry.withdrawn, p.destroyed)
+		}
+		if kept, err := p.a.PoolRunnerByLease(t.Context(), runner.LeaseID); err != nil ||
+			kept.Status != alloc.PoolRunnerIdle {
+			t.Errorf("%s: the runner is %+v (%v), want it idle and unjournaled", name, kept, err)
+		}
 	}
 }
 

@@ -392,6 +392,67 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 	l.dropPoolMember(member)
 }
 
+// withdrawLaunchRunner retires the idle runner launched for a job GitHub
+// completed before any runner took it.
+//
+// THE DELETE IS THE PROOF, AND IT COMES FIRST, as for an offline member. GitHub
+// may already have given the runner another job whose JobStarted has not
+// arrived, and it refuses to delete a runner with a job running: on 2026-10-20
+// twenty such runners were each refused with "is currently running a job and
+// cannot be deleted" minutes before their JobStarted came. Only an acknowledged
+// deletion of the id GitHub holds journals the member retiring; a refusal, an
+// absent registration or any error leaves it idle and unjournaled, so a delayed
+// JobStarted still binds it and its own completion settles it, and the pool's
+// reconciliation retires it if it was idle after all.
+func (l *Listener) withdrawLaunchRunner(ctx context.Context, member alloc.PoolRunner, job dispatch.Job) {
+	keep := func(why string, args ...any) {
+		l.log.Info("a job completed before any runner took it; keeping the runner launched for it, "+why,
+			append([]any{"tier", l.tier, "request", member.LaunchRequestID, "job", job.JobID,
+				"result", job.Result, "runner", member.RunnerName}, args...)...)
+	}
+
+	inspector, ok := l.registry.(RunnerInspector)
+	if !ok {
+		keep("since this registry cannot prove it idle")
+		return
+	}
+
+	id := member.RunnerID
+	if id == 0 {
+		state, err := inspector.InspectRunner(ctx, member.RunnerName, 0)
+		switch {
+		case err != nil:
+			keep("since GitHub could not be asked about it", "error", err)
+			return
+		case !state.Present || state.ID <= 0:
+			keep("since GitHub holds no registration for it to delete")
+			return
+		case state.Busy:
+			keep("since GitHub reports it running another job")
+			return
+		}
+		id = state.ID
+	}
+
+	if err := inspector.WithdrawRunner(ctx, id); err != nil {
+		keep("since GitHub refused or did not confirm its deletion", "runner_id", id, "error", err)
+		return
+	}
+
+	if err := l.alloc.RetirePoolRunner(ctx, member.LeaseID); err != nil {
+		l.log.Error("could not claim a withdrawn pool member for retirement; the pool's reconciliation "+
+			"retires it", "tier", l.tier, "runner", member.RunnerName, "error", err)
+		return
+	}
+
+	l.log.Info("a job completed before any runner took it; GitHub deleted the idle runner launched for it, "+
+		"retiring it", "tier", l.tier, "request", member.LaunchRequestID, "job", job.JobID,
+		"result", job.Result, "runner", member.RunnerName, "runner_id", id)
+
+	member.RunnerID, member.Status = id, alloc.PoolRunnerRetiring
+	l.retirePoolMember(ctx, member)
+}
+
 func (l *Listener) dropPoolMember(member alloc.PoolRunner) {
 	l.mu.Lock()
 	delete(l.running, member.LaunchRequestID)

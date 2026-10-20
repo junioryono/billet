@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
 )
+
+// resultCanceled is GitHub's result for a job cancelled, as its completions
+// spell it, in any case.
+const resultCanceled = "canceled"
 
 // actualJobIdentity contains only job aliases, never a pool launch identity.
 type actualJobIdentity struct {
@@ -29,6 +34,9 @@ type resolvedJob struct {
 	// of a pool runner GitHub gave another job, or a job not yet known: the
 	// completion is not that runner's, and settling it would end the other job.
 	detached bool
+	// withdraw is the idle runner launched for a detached completion's job,
+	// which only GitHub's acknowledged deletion may retire (withdrawLaunchRunner).
+	withdraw *alloc.PoolRunner
 }
 
 type jobResolution int
@@ -313,6 +321,15 @@ func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode 
 				}
 				out.detached = (launched.ActualRequestID != 0 || launched.Status == alloc.PoolRunnerBusy) &&
 					!sameActualJob(out.actual, bound)
+				// AN IDLE RUNNER IS NOT SETTLED BY A CANCELLATION EITHER: it never
+				// ran the job, and GitHub may already have given it another whose
+				// JobStarted has not arrived (2026-10-20, 04:43 to 04:47Z, 20 runners
+				// on one pool). Only a cancellation is known to name no runner for a
+				// job none took; any other result keeps settling its launch runner.
+				if launched.Status == alloc.PoolRunnerIdle && launched.ActualRequestID == 0 &&
+					strings.EqualFold(job.Result, resultCanceled) {
+					out.detached, out.withdraw = true, &launched
+				}
 			case !errors.Is(err, alloc.ErrLeaseNotFound):
 				return out, fmt.Errorf("%w: cannot resolve the runner launched for %s request %d: %w",
 					ErrUntrustworthySession, l.tier, out.cleanup.RequestID, err)
