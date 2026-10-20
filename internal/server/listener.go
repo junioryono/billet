@@ -331,6 +331,9 @@ type Listener struct {
 	// and now its clock; nil is the wall clock. See retireOfflineMembers.
 	offline offlineWatch
 	now     func() time.Time
+	// reinstated is when each member GitHub refused to remove was journaled busy
+	// with its job unknown, for recheckReinstated, under mu.
+	reinstated map[string]time.Time
 	// claimRetirement stands in for alloc.RetirePoolRunner on the offline path,
 	// so a test can fail the ledger write after GitHub accepted the withdrawal.
 	claimRetirement func(context.Context, string) error

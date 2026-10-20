@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -371,5 +373,89 @@ func TestARunnerlessCancellationDoesNotSettleARecoveredBusyRunner(t *testing.T) 
 	if after.Status != alloc.PoolRunnerBusy || after.SourceAcknowledged {
 		t.Errorf("the recovered runner is %q with its completion source acknowledged=%v; want busy and unacknowledged",
 			after.Status, after.SourceAcknowledged)
+	}
+}
+
+// A MEMBER REINSTATED BUSY WHOSE JOB NEVER NAMES ITSELF IS ASKED ABOUT AGAIN, so a
+// JobStarted and a completion that were both lost do not hold its capacity for
+// ever. Not before the recheck: the JobStarted GitHub promised gets its time.
+// Then GitHub's answer decides, as before reinstatement: refused again, it is
+// reinstated again; removed, it is torn down and its capacity released.
+func TestAReinstatedMemberWhoseJobNeverNamesItselfIsAskedAgain(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	member := p.launchedFor11(t)
+	p.registry.busy[member.RunnerName] = true
+	now := time.Date(2026, 10, 20, 4, 43, 20, 0, time.UTC)
+	p.l.now = func() time.Time { return now }
+
+	reconcile := func(at time.Time) {
+		t.Helper()
+		now = at
+		if err := p.l.reconcilePool(t.Context(), 0); err != nil {
+			t.Fatalf("reconcile at %s: %v", at, err)
+		}
+	}
+	asked := func() int {
+		n := 0
+		for _, name := range p.registry.names {
+			if name == member.RunnerName {
+				n++
+			}
+		}
+		return n
+	}
+
+	start := now
+	reconcile(start)
+	if got, err := p.a.PoolRunnerByLease(t.Context(), member.LeaseID); err != nil || got.Status != alloc.PoolRunnerBusy {
+		t.Fatalf("the refused member is %+v (%v), want reinstated busy", got, err)
+	}
+	if asked() != 1 {
+		t.Fatalf("asked GitHub to remove it %d times, want once", asked())
+	}
+
+	reconcile(start.Add(reinstatedRecheck - time.Second))
+	if asked() != 1 {
+		t.Errorf("asked again %d times before the recheck, want not yet", asked()-1)
+	}
+
+	reconcile(start.Add(reinstatedRecheck))
+	if asked() != 2 || slices.Contains(p.destroyed, 11) {
+		t.Fatalf("at the recheck asked %d times and destroyed %v; want a second request and nothing torn down",
+			asked(), p.destroyed)
+	}
+	if got, err := p.a.PoolRunnerByLease(t.Context(), member.LeaseID); err != nil || got.Status != alloc.PoolRunnerBusy {
+		t.Fatalf("refused again, the member is %+v (%v), want reinstated busy again", got, err)
+	}
+
+	delete(p.registry.busy, member.RunnerName)
+	reconcile(start.Add(2*reinstatedRecheck + time.Second))
+	if asked() != 3 || !slices.Contains(p.destroyed, 11) {
+		t.Errorf("once GitHub would remove it, asked %d times and destroyed %v; want it removed and torn down",
+			asked(), p.destroyed)
+	}
+	if _, err := p.a.PoolRunnerByLease(t.Context(), member.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("the removed member is still journaled (%v)", err)
+	}
+}
+
+// A CANCELLATION THAT NAMES ITS RUNNER BY ID IS NOT RUNNER-LESS: only a
+// completion naming no runner at all is a job none took, so one naming an id
+// still settles its launch runner as before.
+func TestACancellationNamingOnlyARunnerIDStillSettles(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	own := p.launchedFor11(t)
+
+	canceled := job11
+	canceled.Result, canceled.RunnerID = "Canceled", 77
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{canceled}}); err != nil {
+		t.Fatalf("the cancellation was refused: %v", err)
+	}
+	if !slices.Contains(p.results, recordedResult{own.LeaseID, "Canceled"}) || !slices.Contains(p.destroyed, 11) {
+		t.Errorf("recorded %v and destroyed %v; want the cancellation settled on its runner", p.results, p.destroyed)
 	}
 }

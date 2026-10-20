@@ -331,7 +331,8 @@ func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode 
 				// is known to name no runner for a job none took; any other result
 				// keeps settling its launch runner.
 				if (launched.Status == alloc.PoolRunnerIdle || launched.Status == alloc.PoolRunnerRetiring) &&
-					launched.ActualRequestID == 0 && strings.EqualFold(job.Result, resultCanceled) {
+					launched.ActualRequestID == 0 && job.RunnerID == 0 &&
+					strings.EqualFold(job.Result, resultCanceled) {
 					out.detached, out.unbound = true, true
 				}
 			case !errors.Is(err, alloc.ErrLeaseNotFound):

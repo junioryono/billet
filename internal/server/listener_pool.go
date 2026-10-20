@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/dispatch"
@@ -35,6 +36,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			l.retirePoolMember(ctx, runners[i])
 		}
 	}
+	l.recheckReinstated(ctx, runners)
 
 	runners, err = l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
@@ -385,6 +387,12 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 					"runner", member.RunnerName, "error", errors.Join(err, reinstateErr))
 				return
 			}
+			l.mu.Lock()
+			if l.reinstated == nil {
+				l.reinstated = map[string]time.Time{}
+			}
+			l.reinstated[member.LeaseID] = l.clock()
+			l.mu.Unlock()
 			l.log.Warn("GitHub refused to remove an idle pool member because it is running a job billet has "+
 				"not heard of yet; keeping it busy until that job's start and completion settle it",
 				"tier", l.tier, "runner", member.RunnerName, "lease", member.LeaseID)
@@ -409,8 +417,51 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 	l.dropPoolMember(member)
 }
 
+const (
+	// reinstatedRecheck is how long a member reinstated busy waits for the
+	// JobStarted GitHub's refusal promised before its removal is asked again: the
+	// one measured arrived four minutes late (2026-10-20).
+	reinstatedRecheck = 10 * time.Minute
+	// reinstatedPerPass bounds how many such removals one reconciliation asks.
+	reinstatedPerPass = 2
+)
+
+// recheckReinstated asks again to remove a member reinstated busy whose job
+// never named itself, so a JobStarted and a completion that were both lost do
+// not hold its capacity, its pool slot and a drain for ever. THE REMOVAL IS
+// STILL THE PROOF and the clock only when it is asked: a refusal reinstates it
+// again, and only a removal GitHub carries out tears it down, as the retiring
+// retry did before members were reinstated.
+func (l *Listener) recheckReinstated(ctx context.Context, runners []alloc.PoolRunner) {
+	now := l.clock()
+	asked := 0
+	for i := range runners {
+		member := runners[i]
+		l.mu.Lock()
+		since, waiting := l.reinstated[member.LeaseID]
+		if waiting && (member.JobID != "" || member.ActualRequestID != 0) {
+			delete(l.reinstated, member.LeaseID)
+			waiting = false
+		}
+		l.mu.Unlock()
+		if !waiting || member.Status != alloc.PoolRunnerBusy || now.Sub(since) < reinstatedRecheck ||
+			asked == reinstatedPerPass {
+			continue
+		}
+		asked++
+		if err := l.alloc.RetirePoolRunner(ctx, member.LeaseID); err != nil {
+			l.log.Error("could not claim a reinstated pool member to ask its removal again", "tier", l.tier,
+				"runner", member.RunnerName, "error", err)
+			continue
+		}
+		member.Status = alloc.PoolRunnerRetiring
+		l.retirePoolMember(ctx, member)
+	}
+}
+
 func (l *Listener) dropPoolMember(member alloc.PoolRunner) {
 	l.mu.Lock()
+	delete(l.reinstated, member.LeaseID)
 	delete(l.running, member.LaunchRequestID)
 	delete(l.runningJobs, member.LaunchRequestID)
 	delete(l.acquiring, member.LaunchRequestID)

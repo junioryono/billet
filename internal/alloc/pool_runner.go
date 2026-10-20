@@ -118,6 +118,17 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			// delayed JobStarted arrives. That empty job identity is a reservation
 			// for this exact physical runner, not a competing job binding.
 			if prior.ActualRequestID == 0 && prior.RunID == 0 && prior.JobID == "" {
+				// A MEMBER REINSTATED BUSY MAY NOT KNOW ITS RUNNER'S ID YET, and
+				// this start is where it learns it, so a later start under another
+				// id is refused and a cleanup by name keeps refusing a replacement.
+				if prior.RunnerID == 0 {
+					if err := q.MarkPoolRunnerBusy(ctx, ledgerdb.MarkPoolRunnerBusyParams{
+						RunnerID: runnerID, UpdatedAt: nowStamp(), LeaseID: leaseID,
+					}); err != nil {
+						return fmt.Errorf("alloc: record the runner id of pool runner %q: %w", runnerName, err)
+					}
+					prior.RunnerID = runnerID
+				}
 				if err := bindPoolRunnerJob(ctx, q, leaseID, requestID, runID, jobID,
 					identity); err != nil {
 					return fmt.Errorf("alloc: bind recovered pool runner %q to job %q: %w",
@@ -397,7 +408,10 @@ func (a *Allocator) ReinstateBusyPoolRunner(ctx context.Context, leaseID string)
 		if !found {
 			return ErrLeaseNotFound
 		}
-		if prior.Status != PoolRunnerRetiring || prior.ActualRequestID != 0 || prior.JobID != "" {
+		// UNBOUND IN ALL THREE, as StartPoolRunner reads a reservation: a row
+		// naming any of them would be reinstated as one no JobStarted could bind.
+		if prior.Status != PoolRunnerRetiring || prior.ActualRequestID != 0 || prior.RunID != 0 ||
+			prior.JobID != "" {
 			return fmt.Errorf("alloc: %w: pool runner %q is %s, not retiring and unbound",
 				ErrConflict, prior.RunnerName, prior.Status)
 		}

@@ -402,6 +402,15 @@ func TestARefusedRetirementIsReinstatedAsABusyReservation(t *testing.T) {
 	if err != nil || started.JobID != "actual-job" || started.ActualRequestID != 22 {
 		t.Fatalf("the delayed JobStarted did not bind the reinstated member: %+v, %v", started, err)
 	}
+	// It learned its runner's id from that start, and a start under another id
+	// for the same job is refused.
+	if got, err := a.PoolRunnerByLease(t.Context(), refused.LeaseID); err != nil || got.RunnerID != 77 {
+		t.Errorf("the bound member's runner id is %+v (%v), want the start's 77", got, err)
+	}
+	if _, err := a.StartPoolRunner(t.Context(), refused.LeaseID, "linux", 78, refused.RunnerName,
+		22, 202, "actual-job", JobIdentity{}); !errors.Is(err, ErrConflict) {
+		t.Errorf("a start under another runner id was accepted: %v", err)
+	}
 
 	if _, err := a.StartPoolRunner(t.Context(), bound.LeaseID, "linux", 78, bound.RunnerName,
 		33, 303, "bound-job", JobIdentity{}); err != nil {
