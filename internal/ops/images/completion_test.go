@@ -217,10 +217,15 @@ type fakeCompletionStore struct {
 	found    bool
 	kernel   string
 	removed  []string
+	// onRemove runs inside each removal, so a test can ask what is true then.
+	onRemove func()
 }
 
 func (f *fakeCompletionStore) RemoveCompletionRoots(_ context.Context, image, owner string) error {
 	f.removed = append(f.removed, image+" by "+owner)
+	if f.onRemove != nil {
+		f.onRemove()
+	}
 
 	return nil
 }
@@ -549,6 +554,41 @@ func assertCompletedOnTheImageAsPublished(t *testing.T, run *completionPull) {
 	}
 	if want := []string{"ubuntu-2404-x64 by epyc-1", "ubuntu-2404-x64 by epyc-1"}; !slices.Equal(run.store.removed, want) {
 		t.Fatalf("removed completion roots %v, want this node's leftovers before and its root after", run.store.removed)
+	}
+}
+
+// THE PROBE LOCK IS HELD AT EVERY REMOVAL OF THIS NODE'S COMPLETION ROOTS, before
+// and after, so a second pull on this node cannot remove a root before this one
+// has cloned it.
+func TestTheProbeLockIsHeldAtEveryRemovalOfACompletionRoot(t *testing.T) {
+	store := &fakeCompletionStore{}
+	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+
+	cfg, err := config.Load(run.fixture.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := verifyDeploymentID(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var held []bool
+	store.onRemove = func() {
+		lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
+		if err == nil {
+			if releaseErr := lock.release(); releaseErr != nil {
+				t.Error(releaseErr)
+			}
+		}
+		held = append(held, err != nil)
+	}
+
+	if err := run.pull(t); err != nil {
+		t.Fatalf("images pull: %v", err)
+	}
+	if !slices.Equal(held, []bool{true, true}) {
+		t.Fatalf("the probe lock was held at the removals: %v, want held at both", held)
 	}
 }
 

@@ -86,8 +86,9 @@ func (c *Client) ResolveCompletionRoot(ctx context.Context, ref, guestContract s
 	return image + "@" + snapshot, nil
 }
 
-// RemoveCompletionRoots removes the completion roots of image that owner made.
-// Another node's are left to it: one may be booting that node's completion.
+// RemoveCompletionRoots removes the completion roots of image that owner made, and
+// owner keys of this owner for snapshots that were never made. Another node's are
+// left to it: one may be booting that node's completion.
 //
 // SAFE UNDER A CLONE, because billet requires clone v2, under which removing a
 // snapshot that still has a clone moves it to the trash until the clone is gone.
@@ -99,53 +100,105 @@ func (c *Client) RemoveCompletionRoots(ctx context.Context, image, owner string)
 		return fmt.Errorf("ceph: no owner to remove the completion roots of %s for", image)
 	}
 
-	out, err := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "snap", "ls", image)
+	names, err := c.snapshotNames(ctx, image)
 	if err != nil {
-		if isNoSuchFile(err) {
-			return nil
-		}
-
-		return fmt.Errorf("ceph: list the snapshots of %s/%s: %w", c.cfg.ImagePool, image, err)
+		return err
 	}
 
-	var snaps []snapshot
-	if err := json.Unmarshal(trimSpace(out), &snaps); err != nil {
-		return fmt.Errorf("ceph: %s did not answer with a json snapshot list; is it the rbd command?", c.bin)
+	owners, err := c.completionRootOwners(ctx, image)
+	if err != nil {
+		return err
 	}
 
 	var errs []error
-	for _, snap := range snaps {
-		if !IsCompletionRoot(snap.Name) {
+	for snap, recorded := range owners {
+		// AN UNKNOWN OR OTHER OWNER IS NOT THIS NODE.
+		if recorded != owner {
 			continue
 		}
 
-		recorded, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "get", image,
-			CompletionRootOwnerKey+"."+snap.Name)
-		if err != nil {
-			// AN UNKNOWN OWNER IS NOT THIS NODE. A root whose owner cannot be read
-			// may be another node's live one.
-			if !isNoSuchFile(err) {
-				errs = append(errs, fmt.Errorf("ceph: read the owner of %s@%s: %w", image, snap.Name, err))
+		if slices.Contains(names, snap) {
+			if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
+				image+"@"+snap); err != nil && !isNoSuchFile(err) {
+				errs = append(errs, fmt.Errorf("ceph: remove the completion root %s@%s: %w", image, snap, err))
+
+				continue
 			}
-
-			continue
-		}
-		if strings.TrimSpace(string(recorded)) != owner {
-			continue
 		}
 
-		if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
-			image+"@"+snap.Name); err != nil && !isNoSuchFile(err) {
-			errs = append(errs, fmt.Errorf("ceph: remove the completion root %s@%s: %w", image, snap.Name, err))
-
-			continue
-		}
-
-		c.removeGenerationMetadata(ctx, image, snap.Name,
+		c.removeGenerationMetadata(ctx, image, snap,
 			KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
 	}
 
 	return errors.Join(errs...)
+}
+
+// completionRoots lists image's completion roots that exist.
+func (c *Client) completionRoots(ctx context.Context, image string) ([]string, error) {
+	names, err := c.snapshotNames(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+
+	var roots []string
+	for _, name := range names {
+		if IsCompletionRoot(name) {
+			roots = append(roots, name)
+		}
+	}
+
+	return roots, nil
+}
+
+// completionRootOwners reads every completion-root owner key of image, whether or
+// not its snapshot exists.
+func (c *Client) completionRootOwners(ctx context.Context, image string) (map[string]string, error) {
+	out, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "list", image)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return map[string]string{}, nil
+		}
+
+		return nil, fmt.Errorf("ceph: read the metadata of %s/%s: %w", c.cfg.ImagePool, image, err)
+	}
+
+	owners := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		if snap, isOwner := strings.CutPrefix(key, CompletionRootOwnerKey+"."); isOwner && IsCompletionRoot(snap) {
+			owners[snap] = strings.TrimSpace(value)
+		}
+	}
+
+	return owners, nil
+}
+
+// snapshotNames lists every snapshot of image, whatever billet calls it. No image
+// is no snapshots.
+func (c *Client) snapshotNames(ctx context.Context, image string) ([]string, error) {
+	out, err := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "snap", "ls", image)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("ceph: list the snapshots of %s/%s: %w", c.cfg.ImagePool, image, err)
+	}
+
+	var snaps []snapshot
+	if err := json.Unmarshal(trimSpace(out), &snaps); err != nil {
+		return nil, fmt.Errorf("ceph: %s did not answer with a json snapshot list; is it the rbd command?", c.bin)
+	}
+
+	names := make([]string, 0, len(snaps))
+	for _, snap := range snaps {
+		names = append(names, snap.Name)
+	}
+
+	return names, nil
 }
 
 // SetComponents records what a generation left out and what was installed.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -238,11 +239,29 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 
 	generation = prefix + now.UTC().Format(GenerationLayout)
 
+	// A COMPLETION ROOT'S OWNER IS RECORDED BEFORE THE SNAPSHOT EXISTS. A root is
+	// reclaimed only by the node that owns it, so one made without an owner, by a
+	// crash between the two, would be kept forever; an owner recorded for a
+	// snapshot never made is a key RemoveCompletionRoots clears.
+	if owner != "" {
+		if err := c.setGenerationMeta(ctx, CompletionRootOwnerKey, image, generation, owner); err != nil {
+			return "", fmt.Errorf("ceph: %s@%s was not made, because its owner could not be "+
+				"recorded: %w", image, generation, err)
+		}
+	}
+
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "create",
 		image+"@"+generation); err != nil {
+		if owner != "" {
+			c.removeGenerationMetadata(context.WithoutCancel(ctx), image, generation, CompletionRootOwnerKey)
+		}
+
 		return "", fmt.Errorf("ceph: could not publish %s@%s: %w", image, generation, err)
 	}
 	attemptedMetadata := make([]string, 0, 5)
+	if owner != "" {
+		attemptedMetadata = append(attemptedMetadata, CompletionRootOwnerKey)
+	}
 
 	// RECORDED PER GENERATION, because a tier boots a generation rather than the
 	// head. A single head-level key describes the LAST import, which is not what
@@ -318,20 +337,6 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 		}
 	}
 
-	if owner != "" {
-		attemptedMetadata = append(attemptedMetadata, CompletionRootOwnerKey)
-		if setErr := c.setGenerationMeta(ctx, CompletionRootOwnerKey, image, generation, owner); setErr != nil {
-			if rmErr := c.withdrawGeneration(ctx, image, generation, attemptedMetadata); rmErr != nil {
-				return "", fmt.Errorf("ceph: %s@%s was published, its owner could not be "+
-					"recorded (%w), and it could not be withdrawn (%w)",
-					image, generation, setErr, rmErr)
-			}
-
-			return "", fmt.Errorf("ceph: %s could not be published because its owner could "+
-				"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
-		}
-	}
-
 	return generation, nil
 }
 
@@ -353,16 +358,16 @@ func (c *Client) withdrawGeneration(
 		// A command timeout can consume its entire deadline, so confirmation gets a
 		// fresh bounded context rather than inheriting the expired removal context.
 		listCtx, cancelList := context.WithTimeout(cleanupBase, c.wait)
-		generations, listErr := c.Generations(listCtx, image)
+		// EVERY SNAPSHOT, NOT ONLY THE GENERATIONS: a completion root a filtered
+		// listing leaves out would read as gone while it survives.
+		names, listErr := c.snapshotNames(listCtx, image)
 		cancelList()
 		if listErr != nil {
 			return fmt.Errorf("%w (and snapshot absence could not be confirmed: %w)",
 				removeErr, listErr)
 		}
-		for _, existing := range generations {
-			if existing.Name == generation {
-				return removeErr
-			}
+		if slices.Contains(names, generation) {
+			return removeErr
 		}
 	}
 

@@ -162,6 +162,30 @@ func completeImage(
 		return nil, err
 	}
 
+	deployment, err := verifyDeploymentID(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// THE PROBE LOCK IS HELD FROM BEFORE THE LEFTOVERS ARE REMOVED UNTIL THE ROOT IS
+	// REMOVED AGAIN. A second pull on this node removes this node's completion roots
+	// before it publishes its own, so without it one pull removes the other's root
+	// before the other has cloned it.
+	lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err := lock.release(); err != nil {
+			fmt.Fprintf(env.Stdout, "warning: the verification lock was not released: %v\n", err)
+		}
+	}()
+
+	if err := lock.hold(); err != nil {
+		return nil, err
+	}
+
 	owner := cfg.Node.Name
 
 	// LEFTOVERS FIRST, and only this node's: another node's completion root may be
@@ -178,7 +202,8 @@ func completeImage(
 		return nil, err
 	}
 
-	installed, completeErr := completeOnRoot(ctx, env, cfg, root, isCompletionRoot, raw, plan, wait)
+	installed, completeErr := completeOnRoot(ctx, env, cfg, deployment, lock, root, isCompletionRoot, raw,
+		plan, wait)
 
 	// REMOVED WHATEVER THE COMPLETION CAME TO, on a context of its own: it is owed
 	// even to a cancelled pull, and is safe under a live clone, which clone v2
@@ -248,7 +273,7 @@ func regularFileExists(path string) bool {
 // completeOnRoot grows raw by what plan installs, attaches it as a block device and
 // runs the completion microVM on root.
 func completeOnRoot(
-	ctx context.Context, env cli.Env, cfg *config.Config,
+	ctx context.Context, env cli.Env, cfg *config.Config, deployment string, lock *probeLock,
 	root string, isCompletionRoot bool, raw string, plan completionPlan, wait time.Duration,
 ) (map[string]string, error) {
 	if err := growForCompletion(raw, plan); err != nil {
@@ -260,7 +285,8 @@ func completeOnRoot(
 		return nil, err
 	}
 
-	installed, gone, runErr := runCompletion(ctx, env, cfg, root, isCompletionRoot, device, plan, wait)
+	installed, gone, runErr := runCompletion(ctx, env, cfg, deployment, lock, root, isCompletionRoot,
+		device, plan, wait)
 
 	// DETACHED ONLY ONCE THE MICROVM IS PROVED GONE. A guest that may still be
 	// running may still be writing, and a detach under it cuts off the write.
@@ -299,20 +325,15 @@ func growForCompletion(raw string, plan completionPlan) error {
 	return nil
 }
 
-// runCompletion boots the completion microVM and judges what it reports. gone is
-// whether no microVM holding device remains: nothing was launched with it, or the
-// one launched was destroyed and the backend confirmed it.
+// runCompletion boots the completion microVM, under the probe lock the caller
+// holds, and judges what it reports. gone is whether no microVM holding device
+// remains: nothing was launched with it, or the one launched was destroyed and the
+// backend confirmed it.
 func runCompletion(
-	ctx context.Context, env cli.Env, cfg *config.Config,
+	ctx context.Context, env cli.Env, cfg *config.Config, deployment string, lock *probeLock,
 	root string, isCompletionRoot bool, device string, plan completionPlan, wait time.Duration,
 ) (map[string]string, bool, error) {
-	deployment, err := verifyDeploymentID(cfg)
-	if err != nil {
-		return nil, true, err
-	}
-
-	// THE PROBE'S IDENTITY AND ITS LOCK, so the node's sweep leaves the microVM
-	// alone and no verification on this host is the same microVM at once.
+	// THE PROBE'S IDENTITY, so the node's sweep leaves the microVM alone.
 	prov, err := newCompletionProvider(cfg, probeDeployment(deployment))
 	if err != nil {
 		return nil, true, err
@@ -322,17 +343,6 @@ func runCompletion(
 	if err != nil {
 		return nil, true, err
 	}
-
-	lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
-	if err != nil {
-		return nil, true, err
-	}
-
-	defer func() {
-		if err := lock.release(); err != nil {
-			fmt.Fprintf(env.Stdout, "warning: the verification lock was not released: %v\n", err)
-		}
-	}()
 
 	if err := lock.hold(); err != nil {
 		return nil, true, err

@@ -196,21 +196,25 @@ func TestOnlyTheCompletionResolverReachesACompletionRoot(t *testing.T) {
 // A NODE REMOVES ONLY THE COMPLETION ROOTS IT MADE: another node's may be booting
 // that node's completion, and one whose owner cannot be read is not this node's.
 func TestRemoveCompletionRootsRemovesOnlyTheOwnersRoots(t *testing.T) {
-	var removed []string
+	var removed, cleared []string
 	c := componentsClient(t, func(_ context.Context, _ string, args []string) ([]byte, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "snap ls"):
 			return []byte(`[{"name":"g20260815041709"},{"name":"c20260815041710"},` +
 				`{"name":"c20260815041711"},{"name":"c20260815041712"}]`), nil
-		case strings.Contains(joined, CompletionRootOwnerKey+".c20260815041710"):
-			return []byte("epyc-1\n"), nil
-		case strings.Contains(joined, CompletionRootOwnerKey+".c20260815041711"):
-			return []byte("epyc-2\n"), nil
-		case strings.Contains(joined, "image-meta get"):
-			return nil, errors.New("rbd: (2) No such file or directory")
+		case strings.Contains(joined, "image-meta list"):
+			// c...10 is epyc-1's, c...11 epyc-2's, c...12 has no owner, and c...13 is
+			// an owner key epyc-1 recorded for a snapshot never made.
+			return []byte("There are 4 metadata on this image:\n\nKey  Value\n" +
+				CompletionRootOwnerKey + ".c20260815041710  epyc-1\n" +
+				CompletionRootOwnerKey + ".c20260815041711  epyc-2\n" +
+				CompletionRootOwnerKey + ".c20260815041713  epyc-1\n" +
+				KernelKey + ".c20260815041710  vmlinux-6.1.155-ea1d42638d13\n"), nil
 		case strings.Contains(joined, "snap rm"):
 			removed = append(removed, args[len(args)-1])
+		case strings.Contains(joined, "image-meta remove") && strings.Contains(joined, CompletionRootOwnerKey):
+			cleared = append(cleared, args[len(args)-1])
 		}
 
 		return nil, nil
@@ -221,6 +225,99 @@ func TestRemoveCompletionRootsRemovesOnlyTheOwnersRoots(t *testing.T) {
 	}
 	if want := []string{"ubuntu-2404-x64@c20260815041710"}; !slices.Equal(removed, want) {
 		t.Fatalf("removed %v, want only epyc-1's root", removed)
+	}
+	slices.Sort(cleared)
+	if want := []string{CompletionRootOwnerKey + ".c20260815041710", CompletionRootOwnerKey + ".c20260815041713"}; !slices.Equal(cleared, want) {
+		t.Fatalf("cleared owner keys %v, want epyc-1's root's and the one for a snapshot never made", cleared)
+	}
+}
+
+// A COMPLETION ROOT'S OWNER IS RECORDED BEFORE ITS SNAPSHOT EXISTS, so a crash
+// between the two leaves a key the owner clears, never a root nobody reclaims; a
+// snapshot that could not be made takes its owner key away again.
+func TestACompletionRootsOwnerIsRecordedBeforeItsSnapshot(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device}
+
+	snap, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "",
+		"7", "epyc-1", importAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	owner, created := -1, -1
+	for i, call := range f.calls {
+		joined := strings.Join(call, " ")
+		if strings.Contains(joined, "image-meta set") && strings.Contains(joined, CompletionRootOwnerKey+"."+snap) {
+			owner = i
+		}
+		if strings.Contains(joined, "snap create") {
+			created = i
+		}
+	}
+	if owner < 0 || created < 0 || owner > created {
+		t.Fatalf("the owner was recorded at call %d and the snapshot made at %d; billet ran %v", owner, created, f.calls)
+	}
+
+	failed := &importFake{device: device, failOn: "snap", failErr: errors.New("snap create refused")}
+	if _, err := importClient(t, failed).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "",
+		"7", "epyc-1", importAt); err == nil {
+		t.Fatal("a completion root whose snapshot was refused was reported as made")
+	}
+	if !failed.ranWith("image-meta", "remove", CompletionRootOwnerKey+"."+snap) {
+		t.Fatalf("the owner of a snapshot never made was kept; billet ran %v", failed.calls)
+	}
+}
+
+// A COMPLETION ROOT THAT COULD NOT BE WITHDRAWN KEEPS ITS METADATA, owner included:
+// its absence is confirmed on every snapshot, not on the generations, which leave
+// a completion root out and would have read it as gone.
+func TestACompletionRootThatCouldNotBeWithdrawnKeepsItsOwner(t *testing.T) {
+	const root = "c20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:         device,
+		failMetaSetKey: GuestContractKey + "." + root,
+		failSnapRemove: true,
+	}
+
+	_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
+	if err == nil || !strings.Contains(err.Error(), "could not be withdrawn") {
+		t.Fatalf("got %v, want the root reported as still there", err)
+	}
+	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey} {
+		if f.ranWith("image-meta", "remove", key+"."+root) {
+			t.Errorf("rollback removed %s from a completion root that still exists", key)
+		}
+	}
+}
+
+// A COMPLETION ROOT'S KERNEL IS KEPT WHILE THE ROOT EXISTS, though the root is not a
+// generation and the caller's list leaves it out.
+func TestACompletionRootsKernelIsNeededWhileItExists(t *testing.T) {
+	c := componentsClient(t, func(_ context.Context, _ string, args []string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "snap ls"):
+			return []byte(`[{"name":"g20260815041709"},{"name":"c20260815041710"}]`), nil
+		case strings.Contains(joined, KernelKey+".g20260815041709"):
+			return []byte("vmlinux-old\n"), nil
+		case strings.Contains(joined, KernelKey+".c20260815041710"):
+			return []byte("vmlinux-new\n"), nil
+		}
+
+		return nil, errors.New("rbd: (2) No such file or directory")
+	})
+
+	needed, _, err := c.NeededKernels(t.Context(), "ubuntu-2404-x64",
+		[]Generation{{Name: "g20260815041709"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needed["vmlinux-old"] || !needed["vmlinux-new"] {
+		t.Fatalf("needed %v, want the generation's kernel and the completion root's", needed)
 	}
 }
 

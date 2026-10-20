@@ -218,6 +218,25 @@ func (c *Client) NeededKernels(
 		needed[file] = true
 	}
 
+	// A COMPLETION ROOT'S KERNEL IS NEEDED WHILE THE ROOT EXISTS. The root is not a
+	// generation, so the caller's list leaves it out, and the completion microVM
+	// boots it with that kernel.
+	roots, err := c.completionRoots(ctx, image)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	for _, root := range roots {
+		file, found, err := c.Kernel(ctx, image, root)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		if found && file != "" {
+			needed[file] = true
+		}
+	}
+
 	return needed, unknown, nil
 }
 
