@@ -171,6 +171,9 @@ func TestALosingProberCutsABusyHostOnLoss(t *testing.T) {
 		return answers
 	}}
 	r := newRig(t, p, 400)
+	// A RATE THE HOST CLIMBED UNDER: a loss alone cuts only a direction filling
+	// a share of its line (lossShare).
+	r.controller.Down.Rate = 500
 
 	r.run(12)
 
@@ -215,6 +218,7 @@ func TestALosingProberCutsABusyHostOnLoss(t *testing.T) {
 		return answers
 	}}
 	r = newRig(t, p, 400)
+	r.controller.Down.Rate = 500
 
 	r.run(12)
 

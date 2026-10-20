@@ -214,6 +214,28 @@ const foundShare = 0.5
 // upload's line is found while the download is quiet, and kept.
 const ackShare = 0.05
 
+// lossShare is the least share of its line a direction must be moving to be
+// cut on anything but a queue the reflectors confirm by themselves (their
+// delay past Bloat in Detect of the window's rounds, this one included): on a
+// loss, a gateway stall, or a rise not yet confirmed. Of its rate, or of the
+// line it found when that is lower.
+// Busy is judged against the direction's own last minute, which after a quiet
+// minute is the trickle itself, so a loss somebody else caused cut a direction
+// moving 19 Mbit/s under a 905 Mbit/s rate and a line found at 602, and
+// another moving 18 under about 600, each to about 14 (#592): 3% of the line,
+// which a tenth refuses with room to spare. A gateway's stall beside such a loss
+// is no more the trickle's doing. A queue the reflectors confirm is cut for as
+// before, by its own evidence, which also covers a line that queues.
+//
+// WHAT A TENTH GIVES UP, all on a line that drops rather than queues and stands
+// under a tenth of the rate: one that shrank since the last climb, one under a
+// rate that LAN traffic raised with no line found yet (the interface's counters
+// and CAKE's ingress carry both), and traffic that overruns it in bursts too
+// short to reach a tenth of the line over the two-second window, which no
+// average of the counters tells from a trickle. Their loss cuts nothing until
+// the rate comes down.
+const lossShare = 0.1
+
 // improvement is the least a cut must shorten the queue by to count as having
 // helped, when a tenth of the delay is less.
 const improvement = 2 * time.Millisecond
@@ -401,9 +423,11 @@ type Controller struct {
 	// rounds', kept across cuts, which say whether the line has stopped
 	// queueing and dropping. A cut forgets the evidence that caused it, but not
 	// that the queue is still there: a round after it that forgot would read as
-	// clear and end a futile episode.
-	recent, delayTrail []bool
-	losses, trail      [][]Probe
+	// clear and end a futile episode. reflectorRecent is recent with the
+	// reflectors' own delays only, the one queue a direction carrying a trickle
+	// is not exempt beside (lossShare): a gateway's stall fills recent too.
+	recent, delayTrail, reflectorRecent []bool
+	losses, trail                       [][]Probe
 	// round counts the rounds stepped. lastGateway and lastHigh are the
 	// gateway's last counted reading and its last one over Bloat since its last
 	// quiet pair, with the rounds they were read in, which a reading now pairs
@@ -478,6 +502,9 @@ type verdict struct {
 	// are not enough: the round after a cut would find them empty with the
 	// queue still there, and an episode that ended on that would never latch.
 	cleared bool
+	// reflectorQueue is a queue the reflectors confirm by themselves: their
+	// delay past Bloat in Detect of the window's rounds, this one included.
+	reflectorQueue bool
 	// tally is each reflector's probes and misses since the last cut, and
 	// dropping whether they say the line is dropping.
 	tally    tally
@@ -521,6 +548,7 @@ func (c *Controller) Step(o Observation) bool {
 	g := c.readGateway(o)
 	reflectors := o.reflectorsDelayed(p.Bloat)
 	c.recent = lastRounds(append(c.recent, reflectors || g.confirmed), p.Window)
+	c.reflectorRecent = lastRounds(append(c.reflectorRecent, reflectors), p.Window)
 	c.delayTrail = lastRounds(append(c.delayTrail, reflectors || g.high), p.Window)
 	c.losses = lastRounds(append(c.losses, o.Probes), p.Window)
 	c.trail = lastRounds(append(c.trail, o.Probes), p.Window)
@@ -556,7 +584,7 @@ func (c *Controller) Step(o Observation) bool {
 	// forgotten, so the next cut needs the windows to fill with delays and
 	// losses seen after it.
 	if upCut || downCut {
-		c.recent, c.losses = nil, nil
+		c.recent, c.reflectorRecent, c.losses = nil, nil, nil
 
 		switch {
 		case v.onDelay && v.onLoss:
@@ -636,6 +664,7 @@ func (c *Controller) judge(o Observation, g gatewayRound) verdict {
 		cut:      1,
 	}
 	v.cleared = v.clear && !stillDelayed
+	v.reflectorQueue = reflectors && countTrue(c.reflectorRecent) >= p.Detect
 
 	if v.onDelay {
 		queue, _ := o.queue(g)
@@ -786,6 +815,22 @@ func (c *Controller) step(d *Direction, moving, other float64, v verdict, o Obse
 		// round that measured nothing says nothing at all.
 		if !v.onDelay && !v.onLoss {
 			return false, false
+		}
+
+		// WITHOUT A QUEUE THE REFLECTORS CONFIRM BY THEMSELVES, A DIRECTION IS
+		// BLAMED ONLY WHILE IT FILLS A SHARE OF ITS LINE (lossShare), for a loss,
+		// a gateway's stall, or a rise in their round trip not yet confirmed:
+		// one round over Bloat is not the queue Detect rounds are, and a
+		// gateway's stall is no more a trickle's doing than the loss beside it.
+		if !v.reflectorQueue {
+			line := d.Rate
+			if d.Limit > 0 {
+				line = min(line, d.Limit)
+			}
+
+			if moving < lossShare*line {
+				return false, false
+			}
 		}
 
 		if d.cutSince && o.At.Sub(d.lastCut) < p.Cooldown {
@@ -959,7 +1004,7 @@ func helped(d *Direction, v verdict, o Observation) (bool, bool) {
 // whose futility latch it may have set. Rare, since a route seldom moves, and
 // the safe way: a queue still there is seen again within Detect rounds.
 func (c *Controller) forgetGateway() {
-	c.recent, c.delayTrail, c.gatewayStalled = nil, nil, false
+	c.recent, c.delayTrail, c.reflectorRecent, c.gatewayStalled = nil, nil, nil, false
 	c.lastGateway, c.lastHigh = measured{}, measured{}
 
 	for _, d := range []*Direction{&c.Up, &c.Down} {

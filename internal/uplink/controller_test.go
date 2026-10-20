@@ -23,9 +23,21 @@ func probed(n int, upMbit, downMbit float64, s Sample) Observation {
 	return Observation{At: at(n), Interval: Tick, SentBits: bits(upMbit), ReceivedBits: bits(downMbit), Sample: s}
 }
 
+// newController is a controller under a 10000 Mbit/s ceiling with each direction
+// at 1000, above anything these tests move, so traffic never raises a rate on
+// its own; but within a tenth of it, where a run whose traffic it climbed under
+// stands, so a direction moving a few hundred is filling a share of its line
+// (lossShare) when the reflectors measured no rise.
 func newController() *Controller {
-	return &Controller{Params: DefaultParams(), Up: NewDirection(10000), Down: NewDirection(10000)}
+	c := &Controller{Params: DefaultParams(), Up: NewDirection(10000), Down: NewDirection(10000)}
+	c.Up.Rate, c.Down.Rate = testStart, testStart
+
+	return c
 }
+
+// testStart is the rate newController starts each direction at, which a
+// direction that was neither cut nor raised still holds.
+const testStart = 1000
 
 // A FULL QUEUE UNDER THIS HOST'S OWN DOWNLOAD CUTS THE DOWNLOAD BELOW WHAT WAS
 // FLOWING, and only once the window agrees. Measured at the reference site: the
@@ -52,7 +64,7 @@ func TestAFullQueueUnderTheHostsDownloadCutsItBelowWhatFlowed(t *testing.T) {
 
 	// THE UPLOAD IS ITS OWN PEAK BUT NOT THE LINE'S PROBLEM: five Mbit/s of
 	// acknowledgements beside 378 down filled nothing.
-	if c.Up.Rate != c.Up.Max {
+	if c.Up.Rate != testStart {
 		t.Fatalf("the upload, 5 Mbit/s beside a 378 Mbit/s download, was cut to %.1f; "+
 			"it carried the download's acknowledgements and filled nothing", c.Up.Rate)
 	}
@@ -487,7 +499,7 @@ func TestALossCutThatLessenedTheLossHelped(t *testing.T) {
 		return probed(n, 5, 400, Sample{Delay: 2 * time.Millisecond, DelayKnown: true, Probes: probes})
 	}
 
-	c := newController()
+	c := atLine(400)
 	cuts := 0
 	for n := range 60 {
 		o := lossy(n, "a", "b")
