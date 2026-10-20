@@ -363,3 +363,61 @@ func TestJobAndPoolSlotIdentitiesShareOneNumberSpace(t *testing.T) {
 		seen[id] = name
 	}
 }
+
+// A RETIREMENT GITHUB REFUSED IS UNDONE INTO A BUSY RESERVATION: the member is
+// journaled busy with its job unknown, a delayed JobStarted binds it, and a
+// member that is not retiring, or that already names its job, is not reinstated.
+func TestARefusedRetirementIsReinstatedAsABusyReservation(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 4, MaxMemory: 8 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	register := func(request int64) PoolRunner {
+		t.Helper()
+		lease := reserve(t, a, "linux")
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 100+request, request); err != nil {
+			t.Fatalf("Assign(%d): %v", request, err)
+		}
+		runner := PoolRunner{LeaseID: lease.ID, Tier: "linux", LaunchRequestID: request,
+			RunnerName: "billet-" + lease.ID}
+		if err := a.RegisterPoolRunner(t.Context(), runner); err != nil {
+			t.Fatalf("RegisterPoolRunner(%d): %v", request, err)
+		}
+		return runner
+	}
+	refused, bound := register(11), register(12)
+
+	if err := a.ReinstateBusyPoolRunner(t.Context(), refused.LeaseID); !errors.Is(err, ErrConflict) {
+		t.Errorf("an idle member was reinstated: %v", err)
+	}
+	if err := a.RetirePoolRunner(t.Context(), refused.LeaseID); err != nil {
+		t.Fatalf("RetirePoolRunner: %v", err)
+	}
+	if err := a.ReinstateBusyPoolRunner(t.Context(), refused.LeaseID); err != nil {
+		t.Fatalf("ReinstateBusyPoolRunner: %v", err)
+	}
+	if got, err := a.PoolRunnerByLease(t.Context(), refused.LeaseID); err != nil || got.Status != PoolRunnerBusy {
+		t.Fatalf("the reinstated member is %+v (%v), want busy", got, err)
+	}
+	started, err := a.StartPoolRunner(t.Context(), refused.LeaseID, "linux", 77, refused.RunnerName,
+		22, 202, "actual-job", JobIdentity{})
+	if err != nil || started.JobID != "actual-job" || started.ActualRequestID != 22 {
+		t.Fatalf("the delayed JobStarted did not bind the reinstated member: %+v, %v", started, err)
+	}
+
+	if _, err := a.StartPoolRunner(t.Context(), bound.LeaseID, "linux", 78, bound.RunnerName,
+		33, 303, "bound-job", JobIdentity{}); err != nil {
+		t.Fatalf("StartPoolRunner: %v", err)
+	}
+	if err := a.ReinstateBusyPoolRunner(t.Context(), bound.LeaseID); !errors.Is(err, ErrConflict) {
+		t.Errorf("a busy member bound to its job was reinstated: %v", err)
+	}
+	// Its job's completion journals it retiring with the job still named.
+	if err := a.RetirePoolRunner(t.Context(), bound.LeaseID); err != nil {
+		t.Fatalf("RetirePoolRunner(bound): %v", err)
+	}
+	if err := a.ReinstateBusyPoolRunner(t.Context(), bound.LeaseID); !errors.Is(err, ErrConflict) {
+		t.Errorf("a retiring member bound to its job was reinstated: %v", err)
+	}
+	if err := a.ReinstateBusyPoolRunner(t.Context(), "no-such-lease"); !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("an unknown lease was reinstated: %v", err)
+	}
+}

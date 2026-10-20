@@ -122,4 +122,4 @@ e3d87fa784dd The network drain's stop and the transaction's stops are now proved
 d02ede176458 #127 now proves every node stop by the node's ending, the retirement's restart included; the sentence says it establishes the guarantee.
 dffafcd4ce59 #127 now proves each node stop the role and the command perform by the node's ending; the sentence says it establishes the guarantee.
 b56657d3069e The images row gained `accept`, the components whose licenses a deployment accepts (#584); the row is otherwise unchanged.
-301e180e7feb An idle launch runner is no longer retired by a runner-less cancellation but withdrawn by an acknowledged deletion first (#598); the sentence now ends at the job being marked finished and the next ones state the withdrawal.
+301e180e7feb An idle launch runner is no longer retired by a runner-less cancellation: the cancellation detaches it and the pool retires it, reinstating it busy when GitHub refuses its removal as running a job (#598); the sentence now ends at the job being marked finished and the next ones state that.

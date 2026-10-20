@@ -379,6 +379,37 @@ func (a *Allocator) IdlePoolRunners(ctx context.Context, tier string) ([]PoolRun
 	return idle, nil
 }
 
+// ReinstateBusyPoolRunner undoes a retirement claim GitHub refused because the
+// runner is running a job. The refusal answered the deletion of its
+// registration, which comes before any compute is touched, and it is the proof
+// GitHub gave the member a job whose JobStarted has not arrived; so the member is
+// journaled busy with that job unknown, the reservation a delayed JobStarted
+// binds, as a runner recovered busy after a restart is. Only a retiring member
+// bound to no job is reinstated: a bound one already names its job.
+func (a *Allocator) ReinstateBusyPoolRunner(ctx context.Context, leaseID string) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		prior, found, err := poolRunnerByLease(ctx, q, leaseID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrLeaseNotFound
+		}
+		if prior.Status != PoolRunnerRetiring || prior.ActualRequestID != 0 || prior.JobID != "" {
+			return fmt.Errorf("alloc: %w: pool runner %q is %s, not retiring and unbound",
+				ErrConflict, prior.RunnerName, prior.Status)
+		}
+
+		return q.MarkPoolRunnerBusy(ctx, ledgerdb.MarkPoolRunnerBusyParams{
+			RunnerID:  prior.RunnerID,
+			UpdatedAt: nowStamp(),
+			LeaseID:   leaseID,
+		})
+	})
+}
+
 // RetirePoolRunner claims one member for teardown.
 func (a *Allocator) RetirePoolRunner(ctx context.Context, leaseID string) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {

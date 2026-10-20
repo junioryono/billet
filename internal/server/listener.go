@@ -43,6 +43,11 @@ type RunnerRegistry interface {
 	RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error
 }
 
+// ErrRunnerBusy is a RemoveRunner GitHub refused because the runner is running
+// a job (its JobStillRunningException): proof GitHub gave it work, though billet
+// may not have heard which yet.
+var ErrRunnerBusy = errors.New("server: GitHub refused to remove a runner that is running a job")
+
 // completionStore is the durable half of result-dependent teardown.
 type completionStore interface {
 	PutPendingCompletion(ctx context.Context, completion state.PendingCompletion) (state.PendingCompletionDisposition, error)

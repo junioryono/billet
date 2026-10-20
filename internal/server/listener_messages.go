@@ -96,8 +96,11 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if entry.detached {
 			// Still finished, so a redelivered offer for it is not acquired.
 			finished = append(finished, entry.actual)
-			if entry.withdraw != nil {
-				l.withdrawLaunchRunner(ctx, *entry.withdraw, entry.job)
+			if entry.unbound {
+				l.log.Info("a job was cancelled before any runner took it; the runner launched for it is "+
+					"left to the pool, which retires it only if GitHub will delete it",
+					"tier", l.tier, "request", entry.cleanup.RequestID, "job", entry.job.JobID,
+					"result", entry.job.Result)
 				continue
 			}
 			l.log.Info("a job completed before any runner took it; the runner launched for it is running another job and is left to finish it",

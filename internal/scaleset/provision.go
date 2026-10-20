@@ -600,6 +600,10 @@ func (c *Client) RemoveRunner(ctx context.Context, runnerID int64, runnerName st
 		return errors.New("scaleset: runner removal needs an id or name")
 	}
 	if err := c.gh.RemoveRunner(ctx, runnerID); err != nil {
+		if errors.Is(err, gh.JobStillRunningError) {
+			return fmt.Errorf("scaleset: remove runner %q (%d): %w: %w", runnerName, runnerID,
+				server.ErrRunnerBusy, err)
+		}
 		return fmt.Errorf("scaleset: remove runner %q (%d): %w", runnerName, runnerID, err)
 	}
 	return nil
