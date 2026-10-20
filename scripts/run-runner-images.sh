@@ -173,11 +173,17 @@ replace_upstream_line() {
 				exit 1
 			}
 		}'
+	# A REFUSAL SHOWS WHAT IT WAS GIVEN AND WHAT THE FILE HOLDS NEAR IT: the line as
+	# it arrived in the target, byte by byte, and the file's lines that share its
+	# first words, so a refusal in the build's last hour says why.
 	target exec sh -c '
 		if old=$2 new=$3 awk "$4" "$1" >"$1.billet"; then
 			cat "$1.billet" >"$1" && rm -f "$1.billet"
 		else
 			rm -f "$1.billet"
+			printf "%s" "$2" | od -c | head -n 8 >&2
+			words=$(printf "%s" "$2" | sed "s/^[[:space:]]*//" | cut -c1-20)
+			grep -n -F -- "$words" "$1" >&2 || echo "no line of $1 holds \"$words\"" >&2
 			exit 1
 		fi' sh "$1" "$2" "$3" "$program"
 }
