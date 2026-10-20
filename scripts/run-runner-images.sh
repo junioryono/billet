@@ -107,7 +107,10 @@ skip_upstream_test() {
 				exit 1
 			}
 		}'
+	# THREE ARGUMENTS OR NOTHING IS WRITTEN: a transport that drops one would hand
+	# awk the wrong program and rewrite the file from its output.
 	target exec sh -c '
+		[ "$#" -eq 3 ] || { echo "skip_upstream_test: given $# arguments in the target, want 3" >&2; exit 1; }
 		if name=$2 awk "$3" "$1" >"$1.billet"; then
 			cat "$1.billet" >"$1" && rm -f "$1.billet"
 		else
@@ -176,14 +179,20 @@ replace_upstream_line() {
 	# A REFUSAL SHOWS WHAT IT WAS GIVEN AND WHAT THE FILE HOLDS NEAR IT: the line as
 	# it arrived in the target, byte by byte, and the file's lines that share its
 	# first words, so a refusal in the build's last hour says why.
+	# FOUR ARGUMENTS OR NOTHING IS WRITTEN, for the same reason: the build's first
+	# report edit lost two of them to systemd-run's expansion and awk, handed an
+	# empty program, emptied the report (2026-10-20).
 	target exec sh -c '
+		[ "$#" -eq 4 ] || { echo "replace_upstream_line: given $# arguments in the target, want 4" >&2; exit 1; }
 		if old=$2 new=$3 awk "$4" "$1" >"$1.billet"; then
 			cat "$1.billet" >"$1" && rm -f "$1.billet"
 		else
 			rm -f "$1.billet"
 			printf "%s" "$2" | od -c | head -n 8 >&2
 			words=$(printf "%s" "$2" | sed "s/^[[:space:]]*//" | cut -c1-20)
-			grep -n -F -- "$words" "$1" >&2 || echo "no line of $1 holds \"$words\"" >&2
+			status=0
+			grep -n -F -- "$words" "$1" >&2 || status=$?
+			[ "$status" -ne 1 ] || echo "no line of $1 holds \"$words\"" >&2
 			exit 1
 		fi' sh "$1" "$2" "$3" "$program"
 }

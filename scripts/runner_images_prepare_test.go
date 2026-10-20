@@ -277,6 +277,52 @@ func TestReplacingALineRefusesAnythingButOneMatch(t *testing.T) {
 	}
 }
 
+// A TRANSPORT THAT DROPS AN ARGUMENT CANNOT REWRITE THE FILE: systemd-run, unless
+// told not to, drops an argument that begins with `$` (systemd 255's
+// replace_env_argv), which once handed awk an empty program and emptied the
+// software report (2026-10-20). The stand-in target here drops such arguments as
+// systemd does, and the replacement must refuse with the file untouched.
+func TestALineReplacementRefusesWhenItsArgumentsDoNotArrive(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "imagegeneration", "tests")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "X.ps1")
+	body := "$tools.Add($(Get-Version))\nanother line\n"
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dropping := `target() {
+	[ "$1" = exec ] || return 64
+	shift
+	local arg args=()
+	for arg; do
+		case $arg in
+		'${'* | '$$'*) ;;
+		'$'*) continue ;;
+		esac
+		args+=("${arg//\/imagegeneration\//$ROOT/imagegeneration/}")
+	done
+	"${args[@]}"
+}
+`
+	script := dropping + runnerImagesFunction(t, "replace_upstream_line") +
+		`replace_upstream_line /imagegeneration/tests/X.ps1 '$tools.Add($(Get-Version))' '$tools.Add("said")'` + "\n"
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
+	cmd.Env = append(os.Environ(), "ROOT="+root)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "given 2 arguments in the target, want 4") {
+		t.Fatalf("a replacement whose arguments were dropped answered %v:\n%s", err, out)
+	}
+	if got, readErr := os.ReadFile(file); readErr != nil || string(got) != body {
+		t.Fatalf("the file changed under a dropped argument (%v):\n%q", readErr, got)
+	}
+}
+
 // A TEST NAMED NONE OR TWICE IS REFUSED, AND THE FILE IS LEFT AS IT WAS: a name
 // that only begins another test's name is not that test.
 func TestSkippingATestRefusesAnythingButOneMatch(t *testing.T) {
