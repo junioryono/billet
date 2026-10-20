@@ -607,6 +607,57 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 	}
 }
 
+// A DESTROY ANSWERS FOR WHAT ITS OWN TEND LEFT. Recovery reads a survivor's lease
+// before it takes tending, so an adoption that read it while a destroy's tend was
+// settling it records a fresh entry, from that stale read, for compute the tend
+// has just destroyed. Let in between the tend and the destroy's answer, it made a
+// destroy whose own tend had released the lease answer that the lease was held
+// here; under the race detector on 16 CPUs, as CI runs it, that was five runs in
+// six hundred of the test above (measured 2026-10-19). The gap is staged here: at
+// the point between the two, an adoption takes custody from the stale read
+// whenever tending would let it.
+func TestADestroyAnswersForWhatItsOwnTendLeft(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	next, _ := h.process(t)
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// THE STALE READ: the lease as recovery found it, open, before the destroy.
+	stale, err := h.a.Lease(t.Context(), h.lease.ID)
+	if err != nil {
+		t.Fatalf("read the lease: %v", err)
+	}
+
+	asked, adopted := 0, false
+	next.beforeCustodyAnswer = func() {
+		asked++
+		// AN ADOPTION RUNS HERE ONLY IF IT COULD, since it takes tending first.
+		if !next.tending.TryLock() {
+			return
+		}
+		next.tending.Unlock()
+		adopted = true
+		// Its renewal finds gone the lease the tend released, and the entry stays,
+		// as every adoption does, for the next tend.
+		inst := &provider.Instance{ID: h.id, Name: h.name, Running: true}
+		if _, err := next.takeCustody(t.Context(), stale, inst, true); !errors.Is(err, alloc.ErrLeaseNotFound) {
+			t.Errorf("the stale adoption's renewal = %v, want the lease gone", err)
+		}
+	}
+
+	if err := next.Destroy(t.Context(), h.lease.RequestID); err != nil {
+		t.Errorf("Destroy = %v, want nil, since its tend released the lease (an adoption ran in between: %v)",
+			err, adopted)
+	}
+	if asked != 1 {
+		t.Fatalf("the destroy reached the point before its answer %d times, want 1", asked)
+	}
+}
+
 // A JOB WHOSE ENTRY OWES NO REPORT IS NOT LEFT MEASURED: one that settled, or
 // whose lease went, while its counters were being found starts a series that
 // nothing would ever end.
