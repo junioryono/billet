@@ -86,6 +86,27 @@ func (c *Client) ImportCompletionRoot(
 		guestContract, nil, owner, now)
 }
 
+// reserveCompletionRoot refuses a completion-root name that a snapshot or an owner
+// key already holds.
+func (c *Client) reserveCompletionRoot(ctx context.Context, image, name string) error {
+	names, err := c.snapshotNames(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	owners, err := c.completionRootOwners(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	if _, owned := owners[name]; owned || slices.Contains(names, name) {
+		return fmt.Errorf("ceph: %s@%s is already taken; a completion root is named for the "+
+			"second it is made, so try again", image, name)
+	}
+
+	return nil
+}
+
 // importSnapshot writes rawPath into image's head and snapshots it under prefix,
 // with its metadata, inside the publish lock.
 func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap reports through the return value; a local set inside a defer is read after the return value has already been computed, which is the dead-code bug this shape replaced
@@ -243,7 +264,15 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 	// reclaimed only by the node that owns it, so one made without an owner, by a
 	// crash between the two, would be kept forever; an owner recorded for a
 	// snapshot never made is a key RemoveCompletionRoots clears.
+	//
+	// AND THE NAME IS RESERVED FIRST, under the publish lock this holds: names are
+	// to the second, and a second root of the same name would overwrite the first's
+	// owner before its own create failed, and then take it away.
 	if owner != "" {
+		if err := c.reserveCompletionRoot(ctx, image, generation); err != nil {
+			return "", err
+		}
+
 		if err := c.setGenerationMeta(ctx, CompletionRootOwnerKey, image, generation, owner); err != nil {
 			return "", fmt.Errorf("ceph: %s@%s was not made, because its owner could not be "+
 				"recorded: %w", image, generation, err)
@@ -253,7 +282,24 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "create",
 		image+"@"+generation); err != nil {
 		if owner != "" {
-			c.removeGenerationMetadata(context.WithoutCancel(ctx), image, generation, CompletionRootOwnerKey)
+			// A FAILED CREATE MAY STILL HAVE MADE THE SNAPSHOT, since rbd can commit
+			// before its client sees the error. Its owner goes only once the
+			// snapshot is proved absent, and stays when that cannot be told.
+			cleanupCtx := context.WithoutCancel(ctx)
+			names, listErr := c.snapshotNames(cleanupCtx, image)
+			switch {
+			case listErr != nil:
+				return "", fmt.Errorf("ceph: could not publish %s@%s (%w), and whether it was "+
+					"made could not be read, so its owner is kept: %w", image, generation, err, listErr)
+			case slices.Contains(names, generation):
+				if rmErr := c.withdrawGeneration(ctx, image, generation,
+					[]string{CompletionRootOwnerKey}); rmErr != nil {
+					return "", fmt.Errorf("ceph: %s@%s was made though its create failed (%w), and "+
+						"it could not be withdrawn (%w)", image, generation, err, rmErr)
+				}
+			default:
+				c.removeGenerationMetadata(cleanupCtx, image, generation, CompletionRootOwnerKey)
+			}
 		}
 
 		return "", fmt.Errorf("ceph: could not publish %s@%s: %w", image, generation, err)

@@ -208,11 +208,20 @@ func completeImage(
 	// REMOVED WHATEVER THE COMPLETION CAME TO, on a context of its own: it is owed
 	// even to a cancelled pull, and is safe under a live clone, which clone v2
 	// keeps working from the trash.
+	//
+	// ONLY AS THE LOCK'S HOLDER. A lock whose name moved is one another pull on this
+	// node may now hold, with a root of its own published under this node's name,
+	// so the roots are left to it.
 	if isCompletionRoot {
 		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()
 
-		completeErr = errors.Join(completeErr, store.RemoveCompletionRoots(removeCtx, image, owner))
+		if err := lock.hold(); err != nil {
+			completeErr = errors.Join(completeErr, fmt.Errorf("billet images pull: %w; this node's "+
+				"completion roots of %s are left for the pull that holds it", err, image))
+		} else {
+			completeErr = errors.Join(completeErr, store.RemoveCompletionRoots(removeCtx, image, owner))
+		}
 	}
 
 	if completeErr != nil {

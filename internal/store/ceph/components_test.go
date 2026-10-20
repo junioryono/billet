@@ -259,13 +259,57 @@ func TestACompletionRootsOwnerIsRecordedBeforeItsSnapshot(t *testing.T) {
 		t.Fatalf("the owner was recorded at call %d and the snapshot made at %d; billet ran %v", owner, created, f.calls)
 	}
 
-	failed := &importFake{device: device, failOn: "snap", failErr: errors.New("snap create refused")}
-	if _, err := importClient(t, failed).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "",
-		"7", "epyc-1", importAt); err == nil {
-		t.Fatal("a completion root whose snapshot was refused was reported as made")
+	for name, tc := range map[string]struct {
+		fake      importFake
+		ownerGone bool
+		withdrawn bool
+	}{
+		"refused before it applied":     {importFake{failSnapCreate: true}, true, false},
+		"applied, then its answer lost": {importFake{failSnapCreateApplied: true}, true, true},
+		"applied, and nothing can say so": {importFake{failSnapCreateApplied: true,
+			failSnapListAfterCreate: true}, false, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := tc.fake
+			f.device = device
+
+			if _, err := importClient(t, &f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0",
+				"", "7", "epyc-1", importAt); err == nil {
+				t.Fatal("a completion root whose create failed was reported as made")
+			}
+			if got := f.ranWith("image-meta", "remove", CompletionRootOwnerKey+"."+snap); got != tc.ownerGone {
+				t.Fatalf("the owner was removed: %v, want %v; billet ran %v", got, tc.ownerGone, f.calls)
+			}
+			if got := f.ranWith("snap", "rm", "ubuntu-2404-x64@"+snap); got != tc.withdrawn {
+				t.Fatalf("the snapshot was withdrawn: %v, want %v; billet ran %v", got, tc.withdrawn, f.calls)
+			}
+		})
 	}
-	if !failed.ranWith("image-meta", "remove", CompletionRootOwnerKey+"."+snap) {
-		t.Fatalf("the owner of a snapshot never made was kept; billet ran %v", failed.calls)
+}
+
+// A COMPLETION-ROOT NAME ALREADY TAKEN IS REFUSED BEFORE ANYTHING IS WRITTEN, so a
+// second root made in the same second cannot overwrite the first's owner and then
+// take it away.
+func TestACompletionRootNameAlreadyTakenIsRefused(t *testing.T) {
+	const root = "c20260815041709"
+
+	for name, f := range map[string]*importFake{
+		"by a snapshot":   {snapshots: []string{root}},
+		"by an owner key": {metadata: "Key  Value\n" + CompletionRootOwnerKey + "." + root + "  epyc-2\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, device := stageRaw(t, "content")
+			f.device = device
+
+			_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0",
+				"", "7", "epyc-1", importAt)
+			if err == nil || !strings.Contains(err.Error(), "is already taken") {
+				t.Fatalf("got %v, want the taken name refused", err)
+			}
+			if f.ranWith("image-meta", "set", CompletionRootOwnerKey+"."+root) || f.ranWith("snap", "create") {
+				t.Fatalf("a taken name was written to; billet ran %v", f.calls)
+			}
+		})
 	}
 }
 

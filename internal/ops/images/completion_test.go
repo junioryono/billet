@@ -254,9 +254,15 @@ type completionBackend struct {
 
 	destroyErr      error
 	destroyTeardown provider.Teardown
+
+	// onLaunch runs at the launch, so a test can ask what is true then.
+	onLaunch func()
 }
 
 func (b *completionBackend) Launch(_ context.Context, spec provider.Spec) (*provider.Instance, error) {
+	if b.onLaunch != nil {
+		b.onLaunch()
+	}
 	b.launched = append(b.launched, spec)
 	b.events = append(b.events, "launch")
 	b.live = true
@@ -557,10 +563,11 @@ func assertCompletedOnTheImageAsPublished(t *testing.T, run *completionPull) {
 	}
 }
 
-// THE PROBE LOCK IS HELD AT EVERY REMOVAL OF THIS NODE'S COMPLETION ROOTS, before
-// and after, so a second pull on this node cannot remove a root before this one
-// has cloned it.
-func TestTheProbeLockIsHeldAtEveryRemovalOfACompletionRoot(t *testing.T) {
+// THE PROBE LOCK IS HELD WITHOUT A BREAK from the removal of leftovers, through the
+// root's publication and the launch, to the root's removal, so a second pull on
+// this node cannot remove a root before this one has cloned it. Each point asks
+// for the lock and must be refused for the reason a held lock gives.
+func TestTheProbeLockIsHeldThroughoutACompletionOnARoot(t *testing.T) {
 	store := &fakeCompletionStore{}
 	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
 
@@ -573,22 +580,81 @@ func TestTheProbeLockIsHeldAtEveryRemovalOfACompletionRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var held []bool
-	store.onRemove = func() {
-		lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
-		if err == nil {
-			if releaseErr := lock.release(); releaseErr != nil {
-				t.Error(releaseErr)
+	var points []string
+	probe := func(point string) func() {
+		return func() {
+			lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
+			if err == nil {
+				if releaseErr := lock.release(); releaseErr != nil {
+					t.Error(releaseErr)
+				}
+				points = append(points, point+" unheld")
+
+				return
 			}
+			if !strings.Contains(err.Error(), "another verification is already running") {
+				t.Errorf("at %s the lock was refused for another reason: %v", point, err)
+			}
+			points = append(points, point)
 		}
-		held = append(held, err != nil)
 	}
+	store.onRemove = probe("removal")
+	run.fixture.publisher.onImport = probe("publication")
+	run.backend.onLaunch = probe("launch")
 
 	if err := run.pull(t); err != nil {
 		t.Fatalf("images pull: %v", err)
 	}
-	if !slices.Equal(held, []bool{true, true}) {
-		t.Fatalf("the probe lock was held at the removals: %v, want held at both", held)
+
+	// The completed image's own import comes after the lock is released.
+	if want := []string{"removal", "publication", "launch", "removal", "publication unheld"}; !slices.Equal(points, want) {
+		t.Fatalf("the probe lock was held at %v, want %v", points, want)
+	}
+}
+
+// A PULL THAT LOST THE PROBE LOCK LEAVES THIS NODE'S COMPLETION ROOTS ALONE, since
+// the pull that now holds the lock may have published one of its own under the
+// same owner. The lock's name is moved under it, as a node unit's stop moves it.
+func TestAPullThatLostTheProbeLockLeavesTheRootsAlone(t *testing.T) {
+	store := &fakeCompletionStore{}
+	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+
+	cfg, err := config.Load(run.fixture.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := verifyDeploymentID(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// THE NAME MOVES AND ANOTHER PULL TAKES THE NEW ONE, which is what makes the
+	// loss real: a moved name nobody else holds is simply taken again.
+	run.backend.onLaunch = func() {
+		path := filepath.Join(cfg.Node.LockDir, "billet-imageverify-"+deployment+".lock")
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("move the lock's name: %v", err)
+		}
+
+		other, err := takeProbeLock(cfg.Node.LockDir, deployment)
+		if err != nil {
+			t.Fatalf("the other pull could not take the lock: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := other.release(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+
+	if err := run.pull(t); err == nil {
+		t.Fatal("a pull that lost its lock reported success")
+	}
+	if want := []string{"ubuntu-2404-x64 by epyc-1"}; !slices.Equal(store.removed, want) {
+		t.Fatalf("removed completion roots %v, want only the leftovers removed before the loss", store.removed)
+	}
+	if got := run.fixture.publisher.calls(); got != 1 {
+		t.Fatalf("the cluster was published to %d times, want only the completion root", got)
 	}
 }
 

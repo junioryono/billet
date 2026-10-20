@@ -755,6 +755,10 @@ func (p *recordingPublisher) ImportCompletionRoot(
 	image, rawPath, runnerVersion, kernel, guestContract, owner string,
 	_ time.Time,
 ) (string, error) {
+	if p.onImport != nil {
+		p.onImport()
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
