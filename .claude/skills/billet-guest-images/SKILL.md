@@ -36,6 +36,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A tier says `@verified` or an exact generation, never a bare name.**
 - **A node takes up a newer published image by itself, and the same image is never imported twice.**
 - **An image that leaves components out is completed in a microVM before it is imported, or not imported at all (#584).**
+- **`billet check` describes each tier's generation against `images.accept`, and an image that needs a newer billet says so (#584).**
 - **A per-node rebuild timer is gone on purpose.**
 - **The AMI is the same contract on the other backend.**
 

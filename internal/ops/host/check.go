@@ -435,6 +435,10 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			// the failure this line exists to catch is a refresh timer that stopped
 			// firing, which looks exactly like one that is working.
 			reportGuestImageFreshness(ctx, env, cfg)
+			opsimages.ReportImageComponents(ctx, env, cfg)
+			if !skipNetworkProbes {
+				opsimages.ReportChannelImage(ctx, env, cfg)
+			}
 		}
 
 		if cfg.Node.Provider == config.ProviderTart {

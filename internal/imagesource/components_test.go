@@ -1,6 +1,7 @@
 package imagesource
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -137,6 +138,9 @@ func TestAnImageThisBuildCannotCompleteIsNotUsable(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `leaves out android-sdk, google-chrome for each `+
 		`deployment to install, through completion contract "2", which this billet cannot run`) {
 		t.Fatalf("got %v, want the image refused as one this build cannot complete", err)
+	}
+	if !errors.Is(err, ErrNeedsNewerBillet) {
+		t.Fatalf("got %v, want an unknown completion contract to need a newer billet", err)
 	}
 
 	// The contract this build implements is usable.

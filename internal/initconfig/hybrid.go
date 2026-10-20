@@ -821,7 +821,7 @@ node:
 		hybridSiteLineYAML(p, p.LocalSite),
 		serviceStateBase, serviceLockDir,
 		localVCPU, localMemory,
-		firecrackerNodeBlocks(trusted, p.Host),
+		firecrackerNodeBlocks(trusted, p.Host)+imagesAcceptYAML(),
 	)
 }
 

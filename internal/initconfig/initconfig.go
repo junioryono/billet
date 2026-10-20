@@ -1037,6 +1037,35 @@ func firecrackerNodeBlocks(trusted bool, h HostInputs) string {
 // Text rather than a marshalled struct, because the comments are most of the
 // value: an operator reading this file should see which numbers billet measured,
 // which it chose, and what changing one costs.
+// imagesAcceptYAML is the images block a Firecracker host's generated config
+// carries: images.accept, empty, and what each name it may hold installs and under
+// which license, because writing a name is the operator accepting it.
+func imagesAcceptYAML() string {
+	return `
+# THE PARTS OF GITHUB'S RUNNER IMAGE BILLET MAY NOT SHIP. Their licenses forbid
+# billet redistributing them, so billet's published guest image is to leave them
+# out, and a pull installs each one named here from its vendor, inside a microVM,
+# before the image is imported. Nothing is installed unless you name it, and
+# naming one accepts its license. Today's published images still carry all five.
+#
+#   android-sdk     the Android SDK, platforms, build tools and NDKs
+#                   (https://developer.android.com/studio/terms)
+#   codeql          the CodeQL bundle; without it the CodeQL Action downloads it
+#                   per job (https://github.com/github/codeql-cli-binaries/blob/main/LICENSE.md)
+#   firefox         Mozilla Firefox and geckodriver
+#                   (https://www.mozilla.org/en-US/about/legal/terms/firefox/)
+#   google-chrome   Google Chrome, ChromeDriver and Chromium
+#                   (https://www.google.com/chrome/terms/)
+#   microsoft-edge  Microsoft Edge and its WebDriver
+#                   (https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/eula)
+#
+# For example: accept: [google-chrome, codeql]. ` + "`billet check`" + ` says what each
+# tier's image left out that is not accepted here.
+images:
+  accept: []
+`
+}
+
 func renderConfig(p Params, trusted bool, appID, installationID int) string {
 	scope := scopeLineFor(p.Org, p.Repository)
 
@@ -1080,7 +1109,7 @@ func renderConfig(p Params, trusted bool, appID, installationID int) string {
 	}
 
 	if p.Provider == config.ProviderFirecracker {
-		nodeBlocks = firecrackerNodeBlocks(trusted, p.Host)
+		nodeBlocks = firecrackerNodeBlocks(trusted, p.Host) + imagesAcceptYAML()
 		tierIntro = "# A microVM isolates the guest kernel, so these tiers are `trust: untrusted`\n" +
 			"# and run on the untrusted bridge above — firecracker can run code billet\n" +
 			"# cannot vouch for. The image is a published guest generation from\n" +

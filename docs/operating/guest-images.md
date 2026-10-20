@@ -46,6 +46,49 @@ Nothing has to be pulled by hand on a host that follows the packaged units. `bil
 
 A host upgrade converges images on its own, separately from the timer: the transaction asks the candidate binary whether this host's images are compatible with it and pulls a generation for each that is not, after the services are stopped and before anything is fenced. See [upgrades](upgrades.md).
 
+## Components the image leaves out
+
+Five parts of GitHub's runner image come under licenses that forbid billet redistributing them, so billet's published guest image is to leave them out, and each deployment installs the ones it accepts, from their vendors, on its own nodes (#584). **Today's published images still carry all five.** What follows takes effect for an image whose signed manifest says it left something out; a deployment that has accepted nothing then boots an image without them.
+
+| Name | What it installs | A job without it | License |
+|---|---|---|---|
+| `android-sdk` | the Android SDK (command-line tools, platform tools, platforms, build tools, NDKs) at `/usr/local/lib/android/sdk`, with `ANDROID_HOME` set | an Android build fails unless it installs the SDK itself | [Android SDK terms](https://developer.android.com/studio/terms) |
+| `codeql` | the CodeQL bundle in the toolcache | the CodeQL Action downloads the bundle in each job: slower, not a failure | [CodeQL terms](https://github.com/github/codeql-cli-binaries/blob/main/LICENSE.md) |
+| `firefox` | Firefox from the mozillateam PPA, and geckodriver | a browser test that drives Firefox fails | [Firefox terms](https://www.mozilla.org/en-US/about/legal/terms/firefox/) |
+| `google-chrome` | Google Chrome, ChromeDriver and Chromium | a browser test that drives Chrome fails | [Google Chrome terms](https://www.google.com/chrome/terms/) |
+| `microsoft-edge` | Microsoft Edge and msedgedriver | a browser test that drives Edge fails | [Microsoft Edge WebDriver terms](https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/eula) |
+
+**Accepting one is one line of `billet.yaml`, and nothing else.** Writing a name accepts that component's license for this deployment. Nothing is accepted unless it is named, and a name billet does not know is refused when the file loads. `billet init` writes `images.accept: []` on a Firecracker host, with each name and a link to its license above it. The packaged refresh timer does the rest; there is no other command to run.
+
+```yaml
+images:
+  accept: [google-chrome, codeql]
+```
+
+**A new image is used only once it is complete.** When a pull imports an image that left components out, it installs each accepted one before the image becomes a generation. It boots a Firecracker microVM from the newest verified generation of the image, or, on a site's first pull, from the image as published, imported as a completion root that no tier can boot. It attaches the new image as the microVM's second disk, and inside the guest runs GitHub's own installer and tests for each component. The image is imported only if every accepted component installed, its tests passed and the filesystem then checked clean. Otherwise nothing is imported, and every tier keeps the generation it has. Vendor code never runs on the node itself, and the node never mounts a filesystem vendor code wrote. `billet images verify` and `promote` refuse a generation that lacks an accepted component, so `@verified` never moves onto one.
+
+**Nothing is downloaded again for nothing.** Completion runs only when a generation is imported: when the channel publishes a newer image, or when the accepted set differs from what the newest generation was completed with. A week in which the channel does not move imports and installs nothing. Accepting a component later, or withdrawing one, makes the next refresh import the current image again with the new set, without waiting for the next weekly image. Each generation records what its image left out and the version of each component installed into it.
+
+**What the versions are.** The installers run at the runner-images commit the image was built from and take each vendor's current release, as GitHub's own builds do: Google's apt repository serves only the current Chrome (one version, measured 2026-10-18), while Microsoft's keeps about two hundred versions of Edge. A browser and its driver install together, and GitHub's own tests, run before anything is imported, prove their major versions match. An image declaring its components through a completion contract this billet cannot run, or written in a manifest schema it cannot read, is refused before anything is downloaded, and the tiers keep booting what they have until a newer billet takes it up. With `release.automatic: false` neither billet nor its images update by themselves.
+
+**What `billet check` says.** On a Firecracker node, for each image the tiers boot, it reports:
+
+- the generation they boot, and the versions it was completed with;
+- what its image left out that this deployment has not accepted, which a job will not find;
+- what it lacks that the deployment accepts (a component accepted since it was imported), and what will complete it: the refresh timer, a pull by hand when `release.automatic` is false, moving the pin of a tier that names an exact generation, or verifying a newer generation that already matches, which a refresh does not retry while the channel is unchanged (when that generation speaks a guest contract this billet does not, it says a billet that speaks it is what boots it);
+- a tier that names a generation that does not exist;
+- with its network probes, whether the channel's image is one this billet can import, and if it needs a newer billet, whether this deployment installs one by itself (not with `release.automatic: false`, and not while `release.version` pins it).
+
+**A node behind a firewall.** The completion microVM leaves through the same egress as a trusted job. GitHub's installers download from these hosts, read from the installers at the pinned runner-images commit on 2026-10-20 rather than measured from a completion. Every component also needs the Ubuntu archive for the packages it depends on.
+
+| Component | Hosts |
+|---|---|
+| `android-sdk` | `dl.google.com` |
+| `codeql` | `api.github.com`, `raw.githubusercontent.com`, `github.com`, and the `githubusercontent.com` hosts its release downloads redirect to |
+| `firefox` | Launchpad, for the mozillateam PPA and the key `add-apt-repository` fetches (`ppa.launchpadcontent.net`, `api.launchpad.net`); `api.github.com` and `github.com` for geckodriver |
+| `google-chrome` | `dl.google.com`, `googlechromelabs.github.io` (the Chrome for Testing list), the ChromeDriver download that list names, and `www.googleapis.com` (Chromium) |
+| `microsoft-edge` | `packages.microsoft.com`, `msedgedriver.microsoft.com` |
+
 ## Where images come from
 
 The built-in source reads a signed pointer from billet's `release-channel` branch, verifies that the main publication workflow signed a still-current pointer (it expires after ten days, so rewriting the branch cannot pin a fleet to an old genuine channel) naming an immutable dated `guest-YYYYMMDD-HHMMSS` prerelease, then downloads that release. The rootfs is published in parts because a release asset caps at 2 GiB. Every image is built weekly by `.github/workflows/guest-image.yml` from the tree of the billet release the stable channel names (never from `main`, which a fleet should not inherit unreviewed), at whatever `actions/runner` GitHub has published, and passes two gates before it is published: its **contents**, by loop-mounting the filesystem (the runner is the version the manifest claims, Docker with Buildx and Compose, the agent's contract, the units enabled, root locked), and that it **boots** under Firecracker on the runner that built it, proving the kernel, systemd, the network, the metadata service and the agent in one sentence on the console.

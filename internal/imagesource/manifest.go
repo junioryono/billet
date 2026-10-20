@@ -60,6 +60,11 @@ const (
 // deployment in the wild can already read what it is about to publish.
 const SchemaVersion = SchemaV1
 
+// ErrNeedsNewerBillet is an image this build cannot take up and a newer billet
+// can: a manifest schema it does not read, or a completion contract it cannot run.
+// It is distinct from a manifest that is wrong, which no upgrade fixes.
+var ErrNeedsNewerBillet = errors.New("this image needs a newer billet")
+
 // readableSchemas is what this build will parse.
 var readableSchemas = map[int]bool{
 	SchemaV1: true,
@@ -295,6 +300,20 @@ var knownCompression = map[string]bool{
 	"zstd": true,
 }
 
+// unreadableSchema refuses a manifest schema this build does not read. A schema
+// above the newest it reads is ErrNeedsNewerBillet; one below the oldest, or not a
+// schema at all, is a manifest no billet publishes.
+func unreadableSchema(schema int) error {
+	if schema > SchemaV3 {
+		return fmt.Errorf("imagesource: %w: this build reads manifest schemas %d to %d, and the "+
+			"published one is schema %d; upgrade billet rather than importing an image "+
+			"it cannot describe", ErrNeedsNewerBillet, SchemaV1, SchemaV3, schema)
+	}
+
+	return fmt.Errorf("imagesource: this build reads manifest schemas %d to %d, and the "+
+		"published one is schema %d, which no billet publishes", SchemaV1, SchemaV3, schema)
+}
+
 // Validate reports everything wrong with a manifest, or nil.
 //
 // CALLED BEFORE ANY FIELD IS USED, including before the digests are trusted
@@ -307,9 +326,7 @@ func (m *Manifest) Validate() error {
 	}
 
 	if !readableSchemas[m.Schema] {
-		return fmt.Errorf("imagesource: this build reads manifest schemas %d to %d, and the "+
-			"published one is schema %d; upgrade billet rather than importing an image "+
-			"it cannot describe", SchemaV1, SchemaV3, m.Schema)
+		return unreadableSchema(m.Schema)
 	}
 
 	// CONSTRAINED, NOT MERELY NON-EMPTY. This value is interpolated into operator-
@@ -668,6 +685,15 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	// For a document whose whole purpose is to be signed and agreed upon by
 	// several readers, that is a parser differential: two implementations can
 	// read one signed byte string as two different manifests.
+	//
+	// THE SCHEMA IS READ FIRST, ONLY TO REFUSE. A newer schema can carry a key this
+	// build has never heard of, and the key check would then refuse it as a
+	// malformed document rather than one a newer billet reads. The exact key, read
+	// leniently, can only turn a refusal into a better-worded refusal.
+	if schema, found := peekSchema(data); found && !readableSchemas[schema] {
+		return nil, unreadableSchema(schema)
+	}
+
 	if err := checkStrictKeys(data); err != nil {
 		return nil, err
 	}
@@ -722,6 +748,52 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	}
 
 	return &m, nil
+}
+
+// peekSchema reads the top-level "schema" of a manifest, spelled exactly; found is
+// false for a document that is not an object, names no integer schema, or names
+// one more than once, which the strict path refuses as ambiguous rather than as a
+// manifest a newer billet would read.
+func peekSchema(data []byte) (int, bool) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return 0, false
+	}
+
+	var raw json.RawMessage
+	seen := 0
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return 0, false
+		}
+
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return 0, false
+		}
+
+		if key, isKey := tok.(string); isKey && key == "schema" {
+			seen++
+			raw = value
+		}
+	}
+
+	// ONE WHOLE DOCUMENT, closed and followed by nothing. A corrupt document is not
+	// one a newer billet reads, and the strict path refuses it for what it is.
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return 0, false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return 0, false
+	}
+
+	var schema int
+	if seen != 1 || json.Unmarshal(raw, &schema) != nil {
+		return 0, false
+	}
+
+	return schema, true
 }
 
 // knownKeys is every field name a manifest may carry, spelled exactly.
@@ -888,9 +960,10 @@ func (m *Manifest) Usable(contract, arch string) error {
 			names = append(names, c.Name)
 		}
 
-		return fmt.Errorf("imagesource: this image leaves out %s for each deployment to install, "+
+		return fmt.Errorf("imagesource: %w: this image leaves out %s for each deployment to install, "+
 			"through completion contract %q, which this billet cannot run; upgrade billet "+
-			"rather than importing it without them", strings.Join(names, ", "), m.CompletionContract)
+			"rather than importing it without them", ErrNeedsNewerBillet, strings.Join(names, ", "),
+			m.CompletionContract)
 	}
 
 	return nil
