@@ -1,6 +1,8 @@
 package github
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -72,6 +74,34 @@ func (r *restAccount) answered(operation string, status int, header http.Header,
 	if observer != nil {
 		observer.GitHubRESTRequest(operation, status)
 	}
+}
+
+// restOperation keys the operation a request made with the installation's token
+// is for, in its context, so a redirect it is answered with is counted under it.
+type restOperation struct{}
+
+func withRESTOperation(ctx context.Context, operation string) context.Context {
+	return context.WithValue(ctx, restOperation{}, operation)
+}
+
+// maxRESTRedirects is how many redirects a request follows, as many as the
+// standard client's default.
+const maxRESTRedirects = 10
+
+// redirected is the client's redirect policy. A REDIRECT IS AN ANSWER OF ITS
+// OWN, drawing on the budget like any other, so each one a request made with
+// the installation's token is answered with is recorded and told before the
+// client follows it; the answer at the end of the chain is recorded by the
+// request's own caller.
+func (r *restAccount) redirected(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRESTRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRESTRedirects)
+	}
+	if operation, ok := req.Context().Value(restOperation{}).(string); ok && req.Response != nil {
+		r.answered(operation, req.Response.StatusCode, req.Response.Header, time.Now())
+	}
+
+	return nil
 }
 
 // budgetOf reads GitHub's X-RateLimit headers.

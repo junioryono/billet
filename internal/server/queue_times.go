@@ -74,8 +74,8 @@ const (
 	// queueTimeReserve-th of its limit left before the next hour begins: the rest
 	// is the runner-group checks' and the cache authority's, which decide whether
 	// a runner starts and what a job may write, where a missing queue time
-	// decides nothing. A read already started finishes, at most eight pages
-	// against a reserve of at least a thousand requests.
+	// decides nothing. A read already started finishes, at most eight pages and
+	// their redirects against a reserve of at least a thousand requests.
 	queueTimeReserve = 5
 )
 

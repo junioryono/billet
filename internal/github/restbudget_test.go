@@ -137,6 +137,53 @@ func TestTheTokenExchangeIsNotTheInstallationsAccount(t *testing.T) {
 	}
 }
 
+// A REDIRECT IS AN ANSWER OF ITS OWN: a renamed repository's old path is
+// answered with a 301 that draws on the budget, and the request the client
+// follows it with is a second, each told and each stating the budget.
+func TestEachRedirectIsCountedAsAnAnswer(t *testing.T) {
+	t.Parallel()
+
+	key, _ := testKeyPKCS1(t)
+	budget := func(w http.ResponseWriter, remaining string) {
+		w.Header().Set("X-Ratelimit-Limit", "5000")
+		w.Header().Set("X-Ratelimit-Remaining", remaining)
+		w.Header().Set("X-Ratelimit-Used", "1")
+		w.Header().Set("X-Ratelimit-Reset", "1792461600")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /app/installations/22/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"token":"installation-secret","expires_at":%q}`,
+			time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	})
+	mux.HandleFunc("GET /repos/acme/api/actions/runs/31/jobs", func(w http.ResponseWriter, r *http.Request) {
+		budget(w, "4000")
+		http.Redirect(w, r, "/repositories/7/actions/runs/31/jobs?"+r.URL.RawQuery, http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /repositories/7/actions/runs/31/jobs", func(w http.ResponseWriter, _ *http.Request) {
+		budget(w, "3999")
+		fmt.Fprint(w, `{"total_count":0,"jobs":[]}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
+	o := &recordingObserver{}
+	c.ObserveREST(o)
+
+	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err != nil {
+		t.Fatalf("RunQueueTimes: %v", err)
+	}
+	if got, ok := c.RESTBudget(); !ok || got.Remaining != 3999 {
+		t.Errorf("the budget after a redirect = %+v (%t), want the final answer's 3999", got, ok)
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if fmt.Sprint(o.requests) != "[list the run's jobs 301 list the run's jobs 200]" {
+		t.Errorf("observed %q, want the redirect and the answer it led to", o.requests)
+	}
+}
+
 // AN ANSWER THAT NEVER CAME IS TOLD AS STATUS ZERO and leaves the budget as it
 // was.
 func TestARequestWithNoAnswerIsToldAsNone(t *testing.T) {

@@ -142,9 +142,12 @@ func NewRunnerGroupPolicyClientAt(base string, target Target, appID, installatio
 func newRunnerGroupPolicyClient(bounds policyBounds, base string, target Target, appID,
 	installationID int64, privateKey []byte,
 ) *runnerGroupPolicyClient {
-	return &runnerGroupPolicyClient{client: newPolicyHTTPClient(bounds), request: bounds.request,
+	c := &runnerGroupPolicyClient{client: newPolicyHTTPClient(bounds), request: bounds.request,
 		base: base, target: target, appID: appID, installationID: installationID,
 		privateKey: bytes.Clone(privateKey), tokenSlot: make(chan struct{}, 1)}
+	c.client.CheckRedirect = c.rest.redirected
+
+	return c
 }
 
 // newPolicyHTTPClient builds a client and transport of the policy client's own,
@@ -215,7 +218,7 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 // 200 with GitHub's own error.
 func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, operation string,
 ) ([]byte, error) {
-	status, header, body, err := c.exchange(ctx, http.MethodGet, endpoint, token)
+	status, header, body, err := c.exchange(withRESTOperation(ctx, operation), http.MethodGet, endpoint, token)
 	if !errors.Is(err, errNotSent) {
 		c.rest.answered(operation, status, header, time.Now())
 	}
