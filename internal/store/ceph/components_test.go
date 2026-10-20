@@ -226,9 +226,10 @@ func TestRemoveCompletionRootsRemovesOnlyTheOwnersRoots(t *testing.T) {
 	if want := []string{"ubuntu-2404-x64@c20260815041710"}; !slices.Equal(removed, want) {
 		t.Fatalf("removed %v, want only epyc-1's root", removed)
 	}
-	slices.Sort(cleared)
-	if want := []string{CompletionRootOwnerKey + ".c20260815041710", CompletionRootOwnerKey + ".c20260815041713"}; !slices.Equal(cleared, want) {
-		t.Fatalf("cleared owner keys %v, want epyc-1's root's and the one for a snapshot never made", cleared)
+	// THE KEY FOR A SNAPSHOT NOT LISTED IS LEFT: it may be an import of this owner's
+	// between its owner write and its snapshot.
+	if want := []string{CompletionRootOwnerKey + ".c20260815041710"}; !slices.Equal(cleared, want) {
+		t.Fatalf("cleared owner keys %v, want only epyc-1's listed root's", cleared)
 	}
 }
 
@@ -308,6 +309,11 @@ func TestACompletionRootNameAlreadyTakenIsRefused(t *testing.T) {
 			}
 			if f.ranWith("image-meta", "set", CompletionRootOwnerKey+"."+root) || f.ranWith("snap", "create") {
 				t.Fatalf("a taken name was written to; billet ran %v", f.calls)
+			}
+			// REFUSED BEFORE THE HEAD IS TOUCHED: ensureHead begins with `info` on the
+			// image, and the write with `device map`.
+			if f.ranWith("info", "ubuntu-2404-x64") || f.ranWith("device", "map") {
+				t.Fatalf("a taken name still reached the head; billet ran %v", f.calls)
 			}
 		})
 	}

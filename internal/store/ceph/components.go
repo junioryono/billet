@@ -86,9 +86,13 @@ func (c *Client) ResolveCompletionRoot(ctx context.Context, ref, guestContract s
 	return image + "@" + snapshot, nil
 }
 
-// RemoveCompletionRoots removes the completion roots of image that owner made, and
-// owner keys of this owner for snapshots that were never made. Another node's are
-// left to it: one may be booting that node's completion.
+// RemoveCompletionRoots removes the completion roots of image that owner made.
+// Another node's are left to it: one may be booting that node's completion.
+//
+// ONLY A ROOT THE LISTING SAW. An owner key whose snapshot is not listed may be an
+// import of this owner's between its owner write and its snapshot, which a pull
+// that lost the probe lock is still making; removing its key would leave that
+// snapshot with no owner, so the key is left.
 //
 // SAFE UNDER A CLONE, because billet requires clone v2, under which removing a
 // snapshot that still has a clone moves it to the trash until the clone is gone.
@@ -117,13 +121,15 @@ func (c *Client) RemoveCompletionRoots(ctx context.Context, image, owner string)
 			continue
 		}
 
-		if slices.Contains(names, snap) {
-			if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
-				image+"@"+snap); err != nil && !isNoSuchFile(err) {
-				errs = append(errs, fmt.Errorf("ceph: remove the completion root %s@%s: %w", image, snap, err))
+		if !slices.Contains(names, snap) {
+			continue
+		}
 
-				continue
-			}
+		if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
+			image+"@"+snap); err != nil && !isNoSuchFile(err) {
+			errs = append(errs, fmt.Errorf("ceph: remove the completion root %s@%s: %w", image, snap, err))
+
+			continue
 		}
 
 		c.removeGenerationMetadata(ctx, image, snap,

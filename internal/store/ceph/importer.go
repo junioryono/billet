@@ -183,6 +183,17 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 		}
 	}()
 
+	// THE NAME IS RESERVED BEFORE THE HEAD IS TOUCHED, under the publish lock this
+	// holds: names are to the second, and a second root of the same name would
+	// overwrite the first's owner before its own create failed, and then take it
+	// away. Refused here, it costs no transfer and leaves the head as it was.
+	generation = prefix + now.UTC().Format(GenerationLayout)
+	if owner != "" {
+		if err := c.reserveCompletionRoot(ctx, image, generation); err != nil {
+			return "", err
+		}
+	}
+
 	if err := c.ensureHead(ctx, image, wantMB); err != nil {
 		return "", err
 	}
@@ -258,21 +269,12 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 
 	unmapped = true
 
-	generation = prefix + now.UTC().Format(GenerationLayout)
-
 	// A COMPLETION ROOT'S OWNER IS RECORDED BEFORE THE SNAPSHOT EXISTS. A root is
 	// reclaimed only by the node that owns it, so one made without an owner, by a
-	// crash between the two, would be kept forever; an owner recorded for a
-	// snapshot never made is a key RemoveCompletionRoots clears.
-	//
-	// AND THE NAME IS RESERVED FIRST, under the publish lock this holds: names are
-	// to the second, and a second root of the same name would overwrite the first's
-	// owner before its own create failed, and then take it away.
+	// crash between the two, would hold its data forever; an owner recorded for a
+	// snapshot never made is a few bytes of metadata, which nothing reclaims and
+	// nothing needs to.
 	if owner != "" {
-		if err := c.reserveCompletionRoot(ctx, image, generation); err != nil {
-			return "", err
-		}
-
 		if err := c.setGenerationMeta(ctx, CompletionRootOwnerKey, image, generation, owner); err != nil {
 			return "", fmt.Errorf("ceph: %s@%s was not made, because its owner could not be "+
 				"recorded: %w", image, generation, err)
