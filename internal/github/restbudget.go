@@ -29,6 +29,15 @@ type RESTBudget struct {
 	Read time.Time
 }
 
+// Supersedes says whether b is a later statement of the budget than old: one
+// of a later hour, or of the same hour with no more left. ANSWERS ARRIVE OUT OF
+// ORDER, to concurrent requests and from several clients of one installation,
+// so a statement that left first and arrived last must neither restore what a
+// later one spent nor bring back an hour that has ended.
+func (b RESTBudget) Supersedes(old RESTBudget) bool {
+	return b.Reset.After(old.Reset) || b.Reset.Equal(old.Reset) && b.Remaining <= old.Remaining
+}
+
 // RESTObserver is told of every request made with an installation's token, as
 // it is answered, by the operation's fixed name and GitHub's status, zero when
 // no answer came. It must return at once.
@@ -60,9 +69,7 @@ type restAccount struct {
 // does not read as a count, leaves the last stated budget as it was: could
 // not tell is not zero.
 //
-// WITHIN ONE HOUR THE LOWEST REMAINING IS KEPT: answers to concurrent requests
-// can arrive out of order, and one that left before another was counted must
-// not restore what that one spent.
+// A statement is kept only if it supersedes the last (RESTBudget.Supersedes).
 //
 // A 401 IS NOT THE INSTALLATION'S ANSWER: GitHub did not take the token, so any
 // budget it stated would be another bucket's. Measured on 2026-10-20, a 401 to
@@ -71,7 +78,7 @@ func (r *restAccount) answered(operation string, status int, header http.Header,
 	r.mu.Lock()
 	observer := r.observer
 	if budget, ok := budgetOf(header, now); ok && status != http.StatusUnauthorized {
-		if !r.stated || !budget.Reset.Equal(r.budget.Reset) || budget.Remaining <= r.budget.Remaining {
+		if !r.stated || budget.Supersedes(r.budget) {
 			r.budget, r.stated = budget, true
 		}
 	}

@@ -68,8 +68,9 @@ func restClient(t *testing.T, installation int64, api string) *scaleset.Client {
 // EACH INSTALLATION'S BUDGET IS WHAT GITHUB LAST STATED TO ITS TARGETS' CLIENTS,
 // served at the scrape, and every request made with its token is counted by
 // GitHub's answer: through the assembled targets, the way the control plane
-// builds them. Targets of one installation are one series, the newest
-// statement's; an installation that has made no request has none; and the
+// builds them. Targets of one installation are one series, the latest
+// statement's: of the latest hour, the lowest remaining, whichever client read
+// it last; an installation that has made no request has none; and the
 // headroom the sweep reads through a target is what that target's own client
 // last saw.
 func TestTheGitHubSourceServesEachInstallationsBudget(t *testing.T) {
@@ -84,6 +85,7 @@ func TestTheGitHubSourceServesEachInstallationsBudget(t *testing.T) {
 		{Config: config.GitHubTarget{Name: "first", Org: "acme", InstallationID: 22}, Client: restClient(t, 22, api22)},
 		{Config: config.GitHubTarget{Name: "middle", Org: "acme", InstallationID: 22}, Client: restClient(t, 22, api22)},
 		{Config: config.GitHubTarget{Name: "last", Org: "acme", InstallationID: 22}, Client: restClient(t, 22, api22)},
+		{Config: config.GitHubTarget{Name: "late", Org: "acme", InstallationID: 22}, Client: restClient(t, 22, api22)},
 		{Config: config.GitHubTarget{Name: "idle", Org: "acme", InstallationID: 23}, Client: restClient(t, 23, api23)},
 	})
 	if err != nil {
@@ -108,14 +110,18 @@ func TestTheGitHubSourceServesEachInstallationsBudget(t *testing.T) {
 		}
 	}
 
-	// The newest statement is the middle target's, so neither the first listed
-	// nor the last is what the series reports by position.
+	// The latest statement is the middle target's, so neither the first listed
+	// nor the last is what the series reports by position; and an answer of the
+	// same hour read after it, stating more left, as one to a request that left
+	// earlier would, does not restore what it spent.
 	remaining22.Store(4000)
 	read(servers[0])
 	remaining22.Store(3995)
 	read(servers[2])
 	remaining22.Store(3990)
 	read(servers[1])
+	remaining22.Store(3998)
+	read(servers[3])
 
 	body := scrapeMetrics(t, m)
 	for series, want := range map[string]float64{
@@ -123,7 +129,7 @@ func TestTheGitHubSourceServesEachInstallationsBudget(t *testing.T) {
 		`billet_github_rest_remaining{installation="22"}`:                                                   3990,
 		`billet_github_rest_used{installation="22"}`:                                                        1010,
 		`billet_github_rest_reset_timestamp_seconds{installation="22"}`:                                     float64(reset.Unix()),
-		`billet_github_rest_requests_total{answer="2xx",installation="22",operation="list the run's jobs"}`: 3,
+		`billet_github_rest_requests_total{answer="2xx",installation="22",operation="list the run's jobs"}`: 4,
 		`billet_scrape_up{source="github"}`:                                                                 1,
 	} {
 		if got := sampleValue(t, body, series); got != want {

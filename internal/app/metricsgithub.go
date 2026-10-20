@@ -85,7 +85,8 @@ func githubSource(targets []server.Target) MetricsSource {
 func githubSnapshot(accounts []restAccount) func(context.Context) (metrics.Snapshot, error) {
 	return func(context.Context) (metrics.Snapshot, error) {
 		// SEVERAL TARGETS MAY SHARE AN INSTALLATION, each with a client of its
-		// own: the newest statement is the installation's, and one series each.
+		// own: the latest statement is the installation's, by the same order a
+		// client keeps its own, and one series each.
 		newest := map[string]billetgithub.RESTBudget{}
 
 		for _, a := range accounts {
@@ -94,7 +95,7 @@ func githubSnapshot(accounts []restAccount) func(context.Context) (metrics.Snaps
 				continue
 			}
 
-			if seen, ok := newest[a.installation]; !ok || b.Read.After(seen.Read) {
+			if seen, ok := newest[a.installation]; !ok || b.Supersedes(seen) {
 				newest[a.installation] = b
 			}
 		}

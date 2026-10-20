@@ -229,7 +229,8 @@ func TestTheRedirectPastTheLimitIsCountedAsAnAnswer(t *testing.T) {
 }
 
 // WITHIN ONE HOUR THE LOWEST REMAINING IS KEPT, so an answer that arrives after
-// a later one cannot restore what that one spent; a new hour starts afresh.
+// a later one cannot restore what that one spent; a new hour starts afresh, and
+// an answer from an hour that has ended, arriving late, does not bring it back.
 func TestAnAnswerArrivingLateDoesNotRestoreTheBudget(t *testing.T) {
 	t.Parallel()
 
@@ -252,6 +253,7 @@ func TestAnAnswerArrivingLateDoesNotRestoreTheBudget(t *testing.T) {
 		{"1000", 1792461600, 999},
 		{"998", 1792461600, 998},
 		{"4999", 1792465200, 4999},
+		{"0", 1792461600, 4999},
 	} {
 		r.answered("list the run's jobs", http.StatusOK, stated(step.remaining, step.reset), now)
 		if r.budget.Remaining != step.want {
