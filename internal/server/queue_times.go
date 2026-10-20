@@ -24,6 +24,13 @@ type QueueTimes interface {
 	RunQueueTimes(ctx context.Context, owner, repository string, runID int64) (map[string]time.Time, error)
 }
 
+// RESTHeadroom is an App installation's REST budget as GitHub last stated it:
+// what is left of the hour's limit and when the next hour begins, false before
+// any answer stated one. A target's Provisioner implements it.
+type RESTHeadroom interface {
+	RESTHeadroom() (remaining, limit int64, reset time.Time, ok bool)
+}
+
 var (
 	// ErrQueueTimesThrottled is a QueueTimes read GitHub's rate limit refused.
 	ErrQueueTimesThrottled = errors.New("server: GitHub is rate-limiting this App installation")
@@ -62,6 +69,12 @@ const (
 	// read, and one it refuses waits queueTimeRefused.
 	queueTimeThrottled = 15 * time.Minute
 	queueTimeRefused   = time.Hour
+	// The sweep reads nothing through an installation whose budget, as GitHub
+	// last stated it, has less than one queueTimeReserve-th of its limit left
+	// before the next hour begins: the rest is the runner-group checks' and the
+	// cache authority's, which decide whether a runner starts and what a job may
+	// write, where a missing queue time decides nothing.
+	queueTimeReserve = 5
 )
 
 // queueTimeRun is one run of one target's repository.
@@ -83,7 +96,10 @@ type queueTimeRetry struct {
 type queueTimeSweep struct {
 	retries map[queueTimeRun]queueTimeRetry
 	paused  map[string]time.Time
-	cursor  alloc.QueueTimeCursor
+	// reserved is each installation the sweep is leaving its reserve to, so the
+	// hold is logged once rather than on every pass.
+	reserved map[string]bool
+	cursor   alloc.QueueTimeCursor
 	// pageRows and pages are queueTimePageRows and queueTimePages, smaller in a
 	// test.
 	pageRows, pages int
@@ -91,7 +107,7 @@ type queueTimeSweep struct {
 
 func newQueueTimeSweep() *queueTimeSweep {
 	return &queueTimeSweep{retries: map[queueTimeRun]queueTimeRetry{}, paused: map[string]time.Time{},
-		pageRows: queueTimePageRows, pages: queueTimePages}
+		reserved: map[string]bool{}, pageRows: queueTimePageRows, pages: queueTimePages}
 }
 
 // installationOf is what a target's REST requests are counted against: its App
@@ -129,7 +145,26 @@ type queueTimeWork struct {
 	run          queueTimeRun
 	installation string
 	reader       QueueTimes
-	jobs         []alloc.AwaitingQueueTime
+	// headroom is the installation's budget, nil for a Provisioner that keeps
+	// none.
+	headroom RESTHeadroom
+	jobs     []alloc.AwaitingQueueTime
+}
+
+// inReserve says whether an installation's budget, as GitHub last stated it, is
+// down to its reserve for the rest of the hour. A budget no answer has stated
+// yet, or one whose hour has ended, is not: the read's own throttle still pauses
+// the installation.
+func inReserve(headroom RESTHeadroom, now time.Time) (int64, int64, time.Time, bool) {
+	if headroom == nil {
+		return 0, 0, time.Time{}, false
+	}
+	remaining, limit, reset, ok := headroom.RESTHeadroom()
+	if !ok || !now.Before(reset) {
+		return 0, 0, time.Time{}, false
+	}
+
+	return remaining, limit, reset, remaining*queueTimeReserve < limit
 }
 
 // fillQueueTimesOnce is one pass at now.
@@ -168,6 +203,16 @@ func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, sw
 		if read[w.installation] == queueTimeRunsPerInstallation || now.Before(sweep.paused[w.installation]) {
 			continue
 		}
+		if remaining, limit, reset, low := inReserve(w.headroom, now); low {
+			if !sweep.reserved[w.installation] {
+				sweep.reserved[w.installation] = true
+				s.log.Warn("this App installation's REST budget is down to its reserve; reading queue times "+
+					"again when GitHub's next hour begins", "target", w.run.target, "installation", w.installation,
+					"remaining", remaining, "limit", limit, "reset", reset)
+			}
+			continue
+		}
+		delete(sweep.reserved, w.installation)
 		read[w.installation]++
 		missing, err := s.fillRunQueueTimes(ctx, w.reader, w.run, w.jobs)
 		switch {
@@ -241,7 +286,12 @@ func (s *Server) gatherQueueTimeWork(ctx context.Context, targets map[string]Tar
 				if !seen {
 					at = len(work)
 					index[run] = at
-					work = append(work, queueTimeWork{run: run, installation: installationOf(target), reader: reader})
+					var headroom RESTHeadroom
+					if h, ok := target.Provisioner.(RESTHeadroom); ok {
+						headroom = h
+					}
+					work = append(work, queueTimeWork{run: run, installation: installationOf(target),
+						reader: reader, headroom: headroom})
 				}
 				work[at].jobs = append(work[at].jobs, *job)
 			}

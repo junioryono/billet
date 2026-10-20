@@ -16,7 +16,8 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 		fn, role, block, before string
 		sources                 []string // the methods whose results are its sources, in order
 	}{
-		{fn: "serveControlPlane", role: "server", block: "Server", before: "BecomeController", sources: []string{"LedgerMetrics"}},
+		{fn: "serveControlPlane", role: "server", block: "Server", before: "BecomeController",
+			sources: []string{"LedgerMetrics", "GitHubMetrics"}},
 		{fn: "cmdNode", role: "node", block: "Node", before: "Run",
 			sources: []string{"UsageMetrics", "KernelMappingMetrics"}},
 	} {

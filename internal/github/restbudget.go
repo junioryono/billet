@@ -1,0 +1,104 @@
+package github
+
+import (
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+)
+
+// RESTBudget is an installation's hourly REST budget as GitHub stated it in the
+// last answer to a request made with the installation's token.
+//
+// Every REST call billet makes for one installation draws on it: the
+// runner-group checks, the offline-runner inspection, the cache authority's run
+// and branch reads, and the queue-time sweep. GitHub gives an installation
+// 5,000 requests an hour, 50 more for each repository and each organization
+// user past 20, at most 12,500 (15,000 on Enterprise Cloud), per its REST
+// rate-limit reference as read on 2026-10-18 (#583).
+type RESTBudget struct {
+	Limit     int64
+	Remaining int64
+	Used      int64
+	// Reset is when GitHub starts the next hour's budget.
+	Reset time.Time
+	// Read is when billet read the answer that stated it.
+	Read time.Time
+}
+
+// RESTObserver is told of every request made with an installation's token, as
+// it is answered, by the operation's fixed name and GitHub's status, zero when
+// no answer came. It must return at once.
+type RESTObserver interface {
+	GitHubRESTRequest(operation string, status int)
+}
+
+// RESTAccount is what a REST client says about its installation's budget.
+type RESTAccount interface {
+	// RESTBudget is the budget as GitHub last stated it, false before any
+	// answer stated one.
+	RESTBudget() (RESTBudget, bool)
+	// ObserveREST tells o of every request from now on.
+	ObserveREST(o RESTObserver)
+}
+
+var _ RESTAccount = (*runnerGroupPolicyClient)(nil)
+
+// restAccount keeps an installation's last stated budget and its observer.
+type restAccount struct {
+	mu       sync.Mutex
+	budget   RESTBudget
+	stated   bool
+	observer RESTObserver
+}
+
+// answered records what an answer said about the budget, and tells the
+// observer of the request. An answer missing a header, or carrying one that
+// does not read as a count, leaves the last stated budget as it was: could
+// not tell is not zero.
+func (r *restAccount) answered(operation string, status int, header http.Header, now time.Time) {
+	r.mu.Lock()
+	observer := r.observer
+	if budget, ok := budgetOf(header, now); ok {
+		r.budget, r.stated = budget, true
+	}
+	r.mu.Unlock()
+
+	if observer != nil {
+		observer.GitHubRESTRequest(operation, status)
+	}
+}
+
+// budgetOf reads GitHub's X-RateLimit headers.
+func budgetOf(header http.Header, now time.Time) (RESTBudget, bool) {
+	count := func(name string) (int64, bool) {
+		v, err := strconv.ParseInt(header.Get(name), 10, 64)
+		return v, err == nil && v >= 0
+	}
+	limit, ok1 := count("X-Ratelimit-Limit")
+	remaining, ok2 := count("X-Ratelimit-Remaining")
+	used, ok3 := count("X-Ratelimit-Used")
+	reset, ok4 := count("X-Ratelimit-Reset")
+	if !ok1 || !ok2 || !ok3 || !ok4 || limit == 0 {
+		return RESTBudget{}, false
+	}
+
+	return RESTBudget{Limit: limit, Remaining: remaining, Used: used, Reset: time.Unix(reset, 0).UTC(), Read: now},
+		true
+}
+
+// RESTBudget is the installation's budget as GitHub last stated it.
+func (c *runnerGroupPolicyClient) RESTBudget() (RESTBudget, bool) {
+	c.rest.mu.Lock()
+	defer c.rest.mu.Unlock()
+
+	return c.rest.budget, c.rest.stated
+}
+
+// ObserveREST tells o of every request made with the installation's token.
+func (c *runnerGroupPolicyClient) ObserveREST(o RESTObserver) {
+	c.rest.mu.Lock()
+	defer c.rest.mu.Unlock()
+
+	c.rest.observer = o
+}

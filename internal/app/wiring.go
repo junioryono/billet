@@ -129,7 +129,14 @@ var (
 	_ server.RunEvidence     = Provisioner{}
 	_ server.RunEvidence     = NodeJIT{}
 	_ server.QueueTimes      = Provisioner{}
+	_ server.RESTHeadroom    = Provisioner{}
 )
+
+// RESTHeadroom is the target's App installation's REST budget as GitHub last
+// stated it.
+func (p Provisioner) RESTHeadroom() (int64, int64, time.Time, bool) {
+	return p.Client.RESTHeadroom()
+}
 
 // RunQueueTimes reads when GitHub queued each job of a run, by runner name.
 func (p Provisioner) RunQueueTimes(ctx context.Context, owner, repository string, runID int64,
