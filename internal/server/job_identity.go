@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
 )
+
+// resultCanceled is GitHub's result for a job cancelled, as its completions
+// spell it, in any case.
+const resultCanceled = "canceled"
 
 // actualJobIdentity contains only job aliases, never a pool launch identity.
 type actualJobIdentity struct {
@@ -29,6 +34,9 @@ type resolvedJob struct {
 	// of a pool runner GitHub gave another job, or a job not yet known: the
 	// completion is not that runner's, and settling it would end the other job.
 	detached bool
+	// unbound says the runner launched for a detached completion's job is bound
+	// to no job, so the pool, not the completion, decides what becomes of it.
+	unbound bool
 }
 
 type jobResolution int
@@ -311,8 +319,33 @@ func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode 
 				if launched.ActualRequestID != 0 {
 					bound.requests = []int64{launched.ActualRequestID}
 				}
-				out.detached = (launched.ActualRequestID != 0 || launched.Status == alloc.PoolRunnerBusy) &&
+				// A completion naming the runner's own id is that runner's while the
+				// runner is bound to no job: it is not runner-less. One bound to
+				// another job stays detached, because nothing here weighs the
+				// completion against that binding as the by-name path does.
+				own := job.RunnerID != 0 && job.RunnerID == launched.RunnerID && launched.ActualRequestID == 0
+				if own {
+					// AND ITS BINDING IS THE ONE HANDED BACK, so the lease is restored
+					// and settled as a named completion's would be after a restart.
+					out.binding = &launched
+				}
+				out.detached = !own &&
+					(launched.ActualRequestID != 0 || launched.Status == alloc.PoolRunnerBusy) &&
 					!sameActualJob(out.actual, bound)
+				// NOR IS AN UNBOUND ONE BY A CANCELLATION: it never ran the job, and
+				// GitHub may already have given it another whose JobStarted has not
+				// arrived (2026-10-20, 04:43 to 04:47Z, 20 runners on one pool).
+				// Settled, it took the cancelled job's identity and result, refused
+				// the late JobStarted and then its real result. Left to the pool, it
+				// is retired as surplus if GitHub will delete it, and reinstated busy
+				// if GitHub refuses because it is running a job. Only a cancellation
+				// is known to name no runner for a job none took; any other result
+				// keeps settling its launch runner.
+				if (launched.Status == alloc.PoolRunnerIdle || launched.Status == alloc.PoolRunnerRetiring) &&
+					launched.ActualRequestID == 0 && job.RunnerID == 0 &&
+					strings.EqualFold(job.Result, resultCanceled) {
+					out.detached, out.unbound = true, true
+				}
 			case !errors.Is(err, alloc.ErrLeaseNotFound):
 				return out, fmt.Errorf("%w: cannot resolve the runner launched for %s request %d: %w",
 					ErrUntrustworthySession, l.tier, out.cleanup.RequestID, err)

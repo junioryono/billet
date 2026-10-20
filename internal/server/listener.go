@@ -43,6 +43,11 @@ type RunnerRegistry interface {
 	RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error
 }
 
+// ErrRunnerBusy is a RemoveRunner GitHub refused because the runner is running
+// a job (its JobStillRunningException): proof GitHub gave it work, though billet
+// may not have heard which yet.
+var ErrRunnerBusy = errors.New("server: GitHub refused to remove a runner that is running a job")
+
 // completionStore is the durable half of result-dependent teardown.
 type completionStore interface {
 	PutPendingCompletion(ctx context.Context, completion state.PendingCompletion) (state.PendingCompletionDisposition, error)
@@ -326,6 +331,9 @@ type Listener struct {
 	// and now its clock; nil is the wall clock. See retireOfflineMembers.
 	offline offlineWatch
 	now     func() time.Time
+	// reinstated is when this listener last reinstated each member busy with its
+	// job unknown, for recheckReinstated, under mu.
+	reinstated map[string]time.Time
 	// claimRetirement stands in for alloc.RetirePoolRunner on the offline path,
 	// so a test can fail the ledger write after GitHub accepted the withdrawal.
 	claimRetirement func(context.Context, string) error
