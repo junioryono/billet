@@ -214,6 +214,18 @@ const foundShare = 0.5
 // upload's line is found while the download is quiet, and kept.
 const ackShare = 0.05
 
+// lossShare is the least share of its line a direction must be moving to be
+// cut on loss alone: of its rate, or of the line it found when that is lower.
+// Busy is judged against the direction's own last minute, which after a quiet
+// minute is the trickle itself, so a loss somebody else caused cut a direction
+// moving 19 Mbit/s under a 905 Mbit/s rate and a line found at 602, and
+// another moving 18 under about 600, each to about 14 (#592). A loss that
+// comes with a rising round trip is cut for as before: a trickle raises no
+// queue, and the delay rule has its own evidence. What this gives up is a line
+// that shrinks under a quarter of the rate since the last climb and drops
+// rather than queues, whose loss then cuts nothing until the rate comes down.
+const lossShare = 0.25
+
 // improvement is the least a cut must shorten the queue by to count as having
 // helped, when a tenth of the delay is less.
 const improvement = 2 * time.Millisecond
@@ -786,6 +798,19 @@ func (c *Controller) step(d *Direction, moving, other float64, v verdict, o Obse
 		// round that measured nothing says nothing at all.
 		if !v.onDelay && !v.onLoss {
 			return false, false
+		}
+
+		// A LOSS ALONE IS BLAMED ON A DIRECTION ONLY WHILE IT FILLS A SHARE OF
+		// ITS LINE (lossShare).
+		if !v.onDelay {
+			line := d.Rate
+			if d.Limit > 0 {
+				line = min(line, d.Limit)
+			}
+
+			if moving < lossShare*line {
+				return false, false
+			}
 		}
 
 		if d.cutSince && o.At.Sub(d.lastCut) < p.Cooldown {

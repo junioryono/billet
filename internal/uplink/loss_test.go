@@ -6,6 +6,18 @@ import (
 	"time"
 )
 
+// atLine is a controller whose download runs a quarter above mbit, where a run
+// whose traffic moves mbit stands once a climb past it stops (ProbeFull): a cut
+// on loss alone needs the direction to fill a share of its line (lossShare),
+// and newController's 10000 Mbit/s is a line no traffic here fills, while a
+// rate at mbit itself would rise on every clear round.
+func atLine(mbit float64) *Controller {
+	c := newController()
+	c.Down.Rate = 1.25 * mbit
+
+	return c
+}
+
 // of3 is a round's sample with three reflectors counted, these of them lost,
 // and the delay the others measured; known is false when too few answered.
 func of3(delay time.Duration, known bool, lost ...string) Sample {
@@ -25,7 +37,7 @@ func of3(delay time.Duration, known bool, lost ...string) Sample {
 func TestLossAcrossTheReflectorsCutsABusyDirection(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(400)
 
 	c.Step(probed(0, 5, 400, of3(time.Millisecond, true)))
 
@@ -79,7 +91,7 @@ func TestOneReflectorLostEveryRoundIsNotADroppingLine(t *testing.T) {
 func TestOneRoundOfTotalLossIsNotADroppingLine(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(400)
 
 	c.Step(probed(0, 0, 400, of3(time.Millisecond, true)))
 
@@ -164,7 +176,7 @@ func TestAFullWindowDoesNotCutOnARoundThatMeasuredNothing(t *testing.T) {
 func TestCutsThatLeaveTheLossAloneStop(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(300)
 	cuts := 0
 	names := []string{"a", "b", "c"}
 
@@ -211,7 +223,7 @@ func TestALossTheLineHasStoppedIsNotCutFor(t *testing.T) {
 func TestCutsThatLeaveARotatingLossAloneStop(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(300)
 	cuts := 0
 	names := []string{"a", "b", "c"}
 
@@ -269,7 +281,7 @@ func TestEvidenceFromBeforeAnOutageExpires(t *testing.T) {
 func TestAReflectorLeavingDoesNotReadAsACutHelping(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(300)
 	cuts := 0
 	firstCut := -1
 
@@ -355,7 +367,7 @@ func TestADropBeforeAnOutageDoesNotHoldTheRateAfterIt(t *testing.T) {
 func TestASparselyAskedReflectorDoesNotReadAsACutHelping(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(300)
 	cuts := 0
 	lossy := []Probe{{Reflector: "b", Lost: true}, {Reflector: "c", Lost: true}}
 
@@ -396,7 +408,7 @@ func TestASparselyAskedReflectorDoesNotReadAsACutHelping(t *testing.T) {
 func TestAReflectorAskedMoreOftenDoesNotReadAsACutHelping(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(300)
 	cuts := 0
 	lossy := []Probe{{Reflector: "b", Lost: true}, {Reflector: "c", Lost: true}}
 

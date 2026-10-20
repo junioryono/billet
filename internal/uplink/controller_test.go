@@ -487,7 +487,7 @@ func TestALossCutThatLessenedTheLossHelped(t *testing.T) {
 		return probed(n, 5, 400, Sample{Delay: 2 * time.Millisecond, DelayKnown: true, Probes: probes})
 	}
 
-	c := newController()
+	c := atLine(400)
 	cuts := 0
 	for n := range 60 {
 		o := lossy(n, "a", "b")
