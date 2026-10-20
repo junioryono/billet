@@ -215,16 +215,24 @@ const foundShare = 0.5
 const ackShare = 0.05
 
 // lossShare is the least share of its line a direction must be moving to be
-// cut on loss alone: of its rate, or of the line it found when that is lower.
+// cut when the reflectors measured no rise in the round trip, on loss or a
+// gateway stall: of its rate, or of the line it found when that is lower.
 // Busy is judged against the direction's own last minute, which after a quiet
 // minute is the trickle itself, so a loss somebody else caused cut a direction
 // moving 19 Mbit/s under a 905 Mbit/s rate and a line found at 602, and
-// another moving 18 under about 600, each to about 14 (#592). A loss that
-// comes with a rising round trip is cut for as before: a trickle raises no
-// queue, and the delay rule has its own evidence. What this gives up is a line
-// that shrinks under a quarter of the rate since the last climb and drops
-// rather than queues, whose loss then cuts nothing until the rate comes down.
-const lossShare = 0.25
+// another moving 18 under about 600, each to about 14 (#592): 3% of the line,
+// which a tenth refuses with room to spare. A gateway's stall beside such a loss
+// is no more the trickle's doing. A rise in the reflectors' round trip is cut
+// for as before, by its own evidence, which also covers a line that queues.
+//
+// WHAT A TENTH GIVES UP, all on a line that drops rather than queues and stands
+// under a tenth of the rate: one that shrank since the last climb, one under a
+// rate that LAN traffic raised with no line found yet (the interface's counters
+// and CAKE's ingress carry both), and traffic that overruns it in bursts too
+// short to reach a tenth of the line over the two-second window, which no
+// average of the counters tells from a trickle. Their loss cuts nothing until
+// the rate comes down.
+const lossShare = 0.1
 
 // improvement is the least a cut must shorten the queue by to count as having
 // helped, when a tenth of the delay is less.
@@ -800,9 +808,10 @@ func (c *Controller) step(d *Direction, moving, other float64, v verdict, o Obse
 			return false, false
 		}
 
-		// A LOSS ALONE IS BLAMED ON A DIRECTION ONLY WHILE IT FILLS A SHARE OF
-		// ITS LINE (lossShare).
-		if !v.onDelay {
+		// WITH NO RISE IN THE REFLECTORS' ROUND TRIP, A DIRECTION IS BLAMED ONLY
+		// WHILE IT FILLS A SHARE OF ITS LINE (lossShare), for a loss or for a
+		// gateway's stall alike.
+		if !o.reflectorsDelayed(p.Bloat) {
 			line := d.Rate
 			if d.Limit > 0 {
 				line = min(line, d.Limit)

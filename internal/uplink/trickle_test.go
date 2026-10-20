@@ -53,6 +53,25 @@ func TestALossTheHostDidNotCauseCutsNoTrickle(t *testing.T) {
 	}
 }
 
+// NOR DOES A GATEWAY'S STALL BESIDE THAT LOSS: with the reflectors' delay
+// unmeasured, as in both of the reference node's cuts, a stall is the only
+// delay there is, and somebody else's traffic filling a gateway that queues and
+// drops makes both; a trickle makes neither.
+func TestAGatewayStallBesideALossCutsNoTrickle(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	c.Down.Rate, c.Down.Limit = 905, 602
+
+	for n := range 12 {
+		c.Step(withGateway(probed(n, 0, 19.4, of3(0, false, "a", "b", "c")), gatewayRose(60*time.Millisecond)))
+		if c.Cause != CauseNone {
+			t.Fatalf("round %d: a download moving 19.4 Mbit/s under a line found at 602 was cut on %v to %.1f "+
+				"beside a stalled gateway", n, c.Cause, c.Down.Rate)
+		}
+	}
+}
+
 // AND A LOSS UNDER A DIRECTION FILLING ITS LINE STILL CUTS IT: the reference
 // node's two loss cuts that found the line, replayed. 602 Mbit/s moving under
 // about 1000 with no line found, and 412 under 680 with a line found at 602.
@@ -65,9 +84,12 @@ func TestALossUnderADirectionFillingItsLineStillCuts(t *testing.T) {
 	}{
 		{"no line found", 1000, 0, 602},
 		{"a line found", 680, 602, 412},
-		// THE LINE FOUND IS THE MEASURE WHEN IT IS LOWER THAN THE RATE: 200 is a
-		// quarter of the 602 found, though not of the 905 the rate stands at.
-		{"a rate above the line found", 905, 602, 200},
+		// THE LINE FOUND IS THE MEASURE WHEN IT IS LOWER THAN THE RATE: 75 is a
+		// tenth of the 602 found, though not of the 905 the rate stands at.
+		{"a rate above the line found", 905, 602, 75},
+		// AND THE RATE WHEN IT IS LOWER THAN THE LINE FOUND, as just after a cut:
+		// 40 is a tenth of the 300 rate, though not of the 602 found.
+		{"a line found above the rate", 300, 602, 40},
 	} {
 		ctl := newController()
 		ctl.Down.Rate, ctl.Down.Limit = c.rate, c.limit
@@ -80,7 +102,8 @@ func TestALossUnderADirectionFillingItsLineStillCuts(t *testing.T) {
 }
 
 // A LOSS WITH A RISING ROUND TRIP IS CUT FOR BY THE DELAY RULE, whatever share of
-// its line the direction moves: the loss share governs a loss alone.
+// its line the direction moves: the loss share governs a round the reflectors
+// measured no rise in.
 func TestALossWithADelayIsNotJudgedByTheLossShare(t *testing.T) {
 	t.Parallel()
 

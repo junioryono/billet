@@ -59,7 +59,7 @@ func TestLossAcrossTheReflectorsCutsABusyDirection(t *testing.T) {
 			c.Down.Rate, want)
 	}
 
-	if c.Up.Rate != c.Up.Max {
+	if c.Up.Rate != testStart {
 		t.Fatalf("the 5 Mbit/s upload was cut to %.1f; it filled nothing", c.Up.Rate)
 	}
 }
@@ -203,7 +203,7 @@ func TestCutsThatLeaveTheLossAloneStop(t *testing.T) {
 func TestALossTheLineHasStoppedIsNotCutFor(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(400)
 
 	c.Step(probed(0, 0, 8, of3(time.Millisecond, true)))
 	c.Step(probed(1, 0, 8, of3(time.Millisecond, true, "a")))
@@ -256,7 +256,7 @@ func TestEvidenceFromBeforeAnOutageExpires(t *testing.T) {
 	t.Parallel()
 
 	for _, after := range []Sample{of3(time.Millisecond, true, "a"), of3(30*time.Millisecond, true)} {
-		c := newController()
+		c := atLine(400)
 
 		c.Step(probed(0, 0, 8, of3(time.Millisecond, true)))
 		c.Step(probed(1, 0, 8, of3(30*time.Millisecond, true, "a")))
@@ -320,7 +320,7 @@ func TestAReflectorLeavingDoesNotReadAsACutHelping(t *testing.T) {
 func TestABenchedReflectorsMissesDoNotMakeALoss(t *testing.T) {
 	t.Parallel()
 
-	c := newController()
+	c := atLine(400)
 
 	c.Step(probed(0, 0, 8, of3(time.Millisecond, true)))
 

@@ -48,7 +48,7 @@ func TestAGatewayThatStallsCutsABusyDirection(t *testing.T) {
 	// WITHOUT THE GATEWAY THE SAME ROUNDS ARE CLEAR.
 	reflectorsOnly := newController()
 	for n := range 6 {
-		if reflectorsOnly.Step(moving(n, 5, 400, 2*time.Millisecond)) && reflectorsOnly.Down.Rate < reflectorsOnly.Down.Max {
+		if reflectorsOnly.Step(moving(n, 5, 400, 2*time.Millisecond)) && reflectorsOnly.Down.Rate < testStart {
 			t.Fatalf("round %d cut on reflectors 2 ms above their baseline", n)
 		}
 	}
@@ -262,7 +262,7 @@ func TestAGatewayAloneNeverCutsOrRaises(t *testing.T) {
 	for n := range 8 {
 		c.Step(withGateway(probed(n, 5, 400, Sample{}), gatewayRose(40*time.Millisecond)))
 	}
-	if c.Down.Rate != c.Down.Max {
+	if c.Down.Rate != testStart {
 		t.Errorf("a gateway stalled 40 ms with no reflector counted cut the download to %.1f", c.Down.Rate)
 	}
 
