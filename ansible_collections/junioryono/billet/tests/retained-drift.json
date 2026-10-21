@@ -996,42 +996,6 @@
         "parity:read-only observation or node validation; exact full module arguments and definitions are bound"
       ]
     },
-    "tasks/node-config-verdict.yml / Allocate the candidate configuration for the node's verdict": {
-      "task": "{\"ansible.builtin.tempfile\":{\"path\":\"{{ billet_ordinary_config_path | dirname }}\",\"prefix\":\".billet.yaml.verdict.\",\"state\":\"file\"},\"become\":\"{{ billet_ending_become | default(true) | bool }}\",\"changed_when\":false,\"check_mode\":false,\"name\":\"Allocate the candidate configuration for the node's verdict\",\"register\":\"billet_node_config_candidate\"}",
-      "contexts": [
-        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"account.yml\",\"name\":\"Configure billet account and files\"}},{\"file\":\"tasks/account.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"node-config-verdict.yml\",\"name\":\"Decide whether the node reads what this converge changes\",\"when\":\"not billet_binary_upgrade | default(false)\"}},{\"branch\":\"block\",\"file\":\"tasks/node-config-verdict.yml\",\"task\":{\"name\":\"Ask billet whether the node reads what this converge changes\",\"when\":[\"billet_config_preview.changed | default(false) | bool\",\"billet_node_should_run\",\"billet_exclusion_answerer | default('') | length > 0\",\"not ansible_check_mode\"]}}]"
-      ],
-      "sources": [
-        "const:the directory of billet_ordinary_config_path (the role's fixed configuration path) and a fixed prefix; tempfile allocates a name no other run holds"
-      ]
-    },
-    "tasks/node-config-verdict.yml / Write the candidate configuration for the node's verdict": {
-      "task": "{\"ansible.builtin.template\":{\"dest\":\"{{ billet_node_config_candidate.path }}\",\"group\":\"{{ 'root' if (billet_ending_become | default(true) | bool) else omit }}\",\"mode\":\"0600\",\"owner\":\"{{ 'root' if (billet_ending_become | default(true) | bool) else omit }}\",\"src\":\"billet.yaml.j2\"},\"become\":\"{{ billet_ending_become | default(true) | bool }}\",\"changed_when\":false,\"check_mode\":false,\"name\":\"Write the candidate configuration for the node's verdict\",\"vars\":{\"billet_config_document\":\"{{ billet_effective_config }}\"}}",
-      "contexts": [
-        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"account.yml\",\"name\":\"Configure billet account and files\"}},{\"file\":\"tasks/account.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"node-config-verdict.yml\",\"name\":\"Decide whether the node reads what this converge changes\",\"when\":\"not billet_binary_upgrade | default(false)\"}},{\"branch\":\"block\",\"file\":\"tasks/node-config-verdict.yml\",\"task\":{\"name\":\"Ask billet whether the node reads what this converge changes\",\"when\":[\"billet_config_preview.changed | default(false) | bool\",\"billet_node_should_run\",\"billet_exclusion_answerer | default('') | length > 0\",\"not ansible_check_mode\"]}}]"
-      ],
-      "sources": [
-        "E:the whole rendering from billet_effective_config through billet.yaml.j2, exactly as the render installs it, written root 0600 to the name this run allocated"
-      ]
-    },
-    "tasks/node-config-verdict.yml / Ask the installed billet for the node's verdict": {
-      "task": "{\"ansible.builtin.command\":{\"argv\":[\"{{ billet_exclusion_answerer }}\",\"node\",\"config-change\",\"--installed\",\"{{ billet_ordinary_config_path }}\",\"--candidate\",\"{{ billet_node_config_candidate.path }}\",\"--json\"]},\"become\":\"{{ billet_ending_become | default(true) | bool }}\",\"changed_when\":false,\"check_mode\":false,\"failed_when\":false,\"name\":\"Ask the installed billet for the node's verdict\",\"register\":\"billet_node_config_verdict_raw\"}",
-      "contexts": [
-        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"account.yml\",\"name\":\"Configure billet account and files\"}},{\"file\":\"tasks/account.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"node-config-verdict.yml\",\"name\":\"Decide whether the node reads what this converge changes\",\"when\":\"not billet_binary_upgrade | default(false)\"}},{\"branch\":\"block\",\"file\":\"tasks/node-config-verdict.yml\",\"task\":{\"name\":\"Ask billet whether the node reads what this converge changes\",\"when\":[\"billet_config_preview.changed | default(false) | bool\",\"billet_node_should_run\",\"billet_exclusion_answerer | default('') | length > 0\",\"not ansible_check_mode\"]}}]"
-      ],
-      "sources": [
-        "parity:read-only observation; the argv is billet_exclusion_answerer, the role's fixed configuration path and the name this run allocated, and its answer only ever withholds a node restart on billet's keep"
-      ]
-    },
-    "tasks/node-config-verdict.yml / Remove the candidate configuration for the node's verdict": {
-      "task": "{\"ansible.builtin.file\":{\"path\":\"{{ billet_node_config_candidate.path }}\",\"state\":\"absent\"},\"become\":\"{{ billet_ending_become | default(true) | bool }}\",\"changed_when\":false,\"check_mode\":false,\"name\":\"Remove the candidate configuration for the node's verdict\",\"when\":\"billet_node_config_candidate.path | default('') | length > 0\"}",
-      "contexts": [
-        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"account.yml\",\"name\":\"Configure billet account and files\"}},{\"file\":\"tasks/account.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"node-config-verdict.yml\",\"name\":\"Decide whether the node reads what this converge changes\",\"when\":\"not billet_binary_upgrade | default(false)\"}},{\"branch\":\"always\",\"file\":\"tasks/node-config-verdict.yml\",\"task\":{\"name\":\"Ask billet whether the node reads what this converge changes\",\"when\":[\"billet_config_preview.changed | default(false) | bool\",\"billet_node_should_run\",\"billet_exclusion_answerer | default('') | length > 0\",\"not ansible_check_mode\"]}}]"
-      ],
-      "sources": [
-        "parity:removes only the name this run's tempfile allocated, whatever billet answered"
-      ]
-    },
     "tasks/account.yml / Record the drain the billet node owes before its configuration changes": {
       "task": "{\"ansible.builtin.copy\":{\"content\":\"{{ billet_previous_node_state_dir }}\\n\",\"dest\":\"{{ billet_node_drain_owed_path }}\",\"group\":\"root\",\"mode\":\"0600\",\"owner\":\"root\"},\"become\":true,\"name\":\"Record the drain the billet node owes before its configuration changes\",\"register\":\"billet_node_drain_owed_write\",\"when\":[\"billet_previous_config.get('node') is mapping\",\"billet_effective_config.get('node') is not mapping or billet_node_config_changed | default(billet_config_preview.changed | default(false)) | bool\",\"not ansible_check_mode\"]}",
       "contexts": [
