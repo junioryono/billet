@@ -55,7 +55,7 @@ func (q *Queries) DeleteScaleSet(ctx context.Context, arg DeleteScaleSetParams) 
 
 const listScaleSets = `-- name: ListScaleSets :many
 SELECT org, runner_group, label, scale_set_id FROM scale_set
- WHERE org = $1 ORDER BY runner_group, label
+ WHERE LOWER(org) = LOWER(CAST($1 AS TEXT)) ORDER BY runner_group, label
 `
 
 type ListScaleSetsRow struct {
@@ -65,7 +65,9 @@ type ListScaleSetsRow struct {
 	ScaleSetID  int64
 }
 
-// Every scale set billet recorded creating for one organization.
+// Every scale set billet recorded creating for one target, its path compared
+// without case as GitHub compares owners and repositories, so a record written
+// under another spelling of the same target is still found.
 func (q *Queries) ListScaleSets(ctx context.Context, org string) ([]ListScaleSetsRow, error) {
 	rows, err := q.db.QueryContext(ctx, listScaleSets, org)
 	if err != nil {

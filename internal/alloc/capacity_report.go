@@ -57,6 +57,11 @@ type ListenerCapacity struct {
 	// the field, never none, because a drain reads it to say whether assigned
 	// work is still waiting (#140).
 	Unstarted *int `json:"unstarted,omitempty"`
+	// UnstartedAt is when Unstarted was counted, which is not when the
+	// observation was written: a listener republishes its last count at every
+	// poll, including polls on which it could not count again, so the
+	// observation's own date would make an old count look new.
+	UnstartedAt string `json:"unstarted_at,omitempty"`
 }
 
 // RecordListenerCapacity publishes the listener's ownership for another process.

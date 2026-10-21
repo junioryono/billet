@@ -372,6 +372,9 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 
 	last := ""
 
+	// awaitingCounts says the wait for fresh demand counts was announced.
+	awaitingCounts := false
+
 	for {
 		q, err := allocator.Quiescence(ctx)
 		if err != nil {
@@ -417,7 +420,33 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 			// asks each host what its provider is actually running. The order is
 			// load-bearing: while a lease is open a launch may still be dispatched,
 			// which moves a host's fence and discards whatever it had proved.
-			reportAssignedDemand(ctx, env, allocator, cfg)
+			//
+			// AND GITHUB'S ASSIGNED WORK IS JUDGED ON COUNTS TAKEN SINCE THE SEAL.
+			// One taken before it cannot speak for what was assigned after, so a
+			// quiet ledger waits a little for every listener to count again, and
+			// a count that still predates the seal is said to be unknown.
+			sealedAt := sealTime(ctx, db)
+			demand := assignedDemand(ctx, allocator, cfg, sealedAt)
+
+			if countsPredateTheSeal(demand) && time.Since(sealedAt) < demandCountWithin {
+				if !awaitingCounts {
+					fmt.Fprintf(env.Stdout, "The ledger is quiet. Waiting up to %s after the seal for every "+
+						"tier's listener\nto count what GitHub has assigned it since.\n",
+						demandCountWithin)
+
+					awaitingCounts = true
+				}
+
+				select {
+				case <-ctx.Done():
+					return stillDraining(env, ctx.Err())
+				case <-ticker.C:
+				}
+
+				continue
+			}
+
+			reportAssignedDemand(env, demand)
 
 			if opts.WithoutProof {
 				fmt.Fprintf(env.Stdout, "No host was asked what it is running (--without-compute-proof).\n")
@@ -443,20 +472,37 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 	}
 }
 
+// demandCountWithin is how long after its seal a quiet drain waits for every
+// tier's listener to count GitHub's assigned work again. A healthy listener
+// counts at every reconciliation, which runs before every long poll, and the
+// longest long poll measured was about 88 seconds; this is two of those. A
+// count still dated before the seal after it is reported unknown.
+var demandCountWithin = 3 * time.Minute
+
 // tierDemand is work GitHub has assigned one tier and this deployment has not
 // started, as the tier's listener last counted it.
 type tierDemand struct {
 	tier string
-	// unstarted is the count, or nil when it could not be read, which unknown
-	// says why.
+	// unstarted is the count, or nil when it could not be trusted, which
+	// unknown says why.
 	unstarted *int
 	unknown   string
-	observed  string
+	counted   string
+	// stale is a count taken before the seal, which cannot speak for what was
+	// assigned since.
+	stale bool
 }
 
 // assignedDemand reads every tier's last count of assigned work it has not
-// started, keeping only the tiers with some or whose count could not be read.
-func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config.Config) []tierDemand {
+// started, keeping only the tiers with some or whose count cannot be trusted:
+// unreadable, or taken before sealedAt.
+//
+// ONLY THE TIERS THE CONFIG DECLARES. A tier removed from it has no listener
+// and will start nothing after `billet resume`; its scale set is reported at
+// every start as one no tier declares, which is where its queued work is said.
+func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config.Config,
+	sealedAt time.Time,
+) []tierDemand {
 	var out []tierDemand
 
 	for i := range cfg.Tiers {
@@ -467,19 +513,66 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 		switch {
 		case err != nil:
 			out = append(out, tierDemand{tier: label, unknown: err.Error()})
+
+			continue
 		case r.ObservationError != "":
 			out = append(out, tierDemand{tier: label, unknown: r.ObservationError})
+
+			continue
 		case r.ObservedAt == "":
 			out = append(out, tierDemand{tier: label, unknown: "no listener has reported"})
+
+			continue
 		case r.Listener.Unstarted == nil:
-			out = append(out, tierDemand{tier: label, observed: r.ObservedAt,
+			out = append(out, tierDemand{tier: label,
 				unknown: "its listener has not counted it, or predates the count"})
-		case *r.Listener.Unstarted > 0:
-			out = append(out, tierDemand{tier: label, unstarted: r.Listener.Unstarted, observed: r.ObservedAt})
+
+			continue
+		}
+
+		counted, err := time.Parse(time.RFC3339Nano, r.Listener.UnstartedAt)
+		if err != nil || counted.Before(sealedAt) {
+			out = append(out, tierDemand{tier: label, counted: r.Listener.UnstartedAt, stale: true,
+				unknown: fmt.Sprintf("last counted at %q, before this seal", r.Listener.UnstartedAt)})
+
+			continue
+		}
+
+		if *r.Listener.Unstarted > 0 {
+			out = append(out, tierDemand{tier: label, unstarted: r.Listener.Unstarted, counted: r.Listener.UnstartedAt})
 		}
 	}
 
 	return out
+}
+
+// countsPredateTheSeal reports whether any tier's count was taken before the
+// seal, which a listener still running replaces within a poll.
+func countsPredateTheSeal(demand []tierDemand) bool {
+	for _, d := range demand {
+		if d.stale {
+			return true
+		}
+	}
+
+	return false
+}
+
+// sealTime is when admission was last changed, which is the seal this drain
+// waits under. A time that cannot be read is taken as now, so every count reads
+// as taken before it: a seal of unknown age cannot vouch for any count.
+func sealTime(ctx context.Context, db *state.DB) time.Time {
+	admission, err := db.Admission(ctx)
+	if err != nil {
+		return time.Now()
+	}
+
+	at, err := time.Parse(time.RFC3339Nano, admission.ChangedAt)
+	if err != nil {
+		return time.Now()
+	}
+
+	return at
 }
 
 // reportAssignedDemand is the ledger barrier's verdict, which says "Drained"
@@ -489,15 +582,14 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 // nothing, so a job GitHub assigned to a sealed tier holds no lease and the
 // ledger barrier cannot see it; it waits at GitHub until admission reopens.
 // Printed as "Drained", an operator retiring the deployment would take that as
-// nothing left to do while builds sat queued behind it. The count is each
-// listener's last observation, so it is printed with its date, and a count that
-// could not be read is said to be unknown rather than taken for none.
+// nothing left to do while builds sat queued behind it. Each count is a
+// listener's, taken since the seal and printed with when; one that could not be
+// read, or predates the seal, is said to be unknown rather than taken for none.
 //
 // NOT A WAIT. Work a seal keeps out never starts while the seal holds, so
 // waiting for it would never end; the drain goes on to prove the machines idle,
 // which is what a maintenance window needs, and says what is still owed.
-func reportAssignedDemand(ctx context.Context, env cli.Env, allocator *alloc.Allocator, cfg *config.Config) {
-	demand := assignedDemand(ctx, allocator, cfg)
+func reportAssignedDemand(env cli.Env, demand []tierDemand) {
 	if len(demand) == 0 {
 		fmt.Fprintf(env.Stdout, "Drained: this deployment is sealed, the ledger records no outstanding\n")
 		fmt.Fprintf(env.Stdout, "lease, and no tier has work GitHub assigned it waiting to start.\n\n")
@@ -515,7 +607,7 @@ func reportAssignedDemand(ctx context.Context, env cli.Env, allocator *alloc.All
 			continue
 		}
 
-		fmt.Fprintf(env.Stdout, "  %s: %d job(s) assigned and not started (as of %s)\n", d.tier, *d.unstarted, d.observed)
+		fmt.Fprintf(env.Stdout, "  %s: %d job(s) assigned and not started (counted %s)\n", d.tier, *d.unstarted, d.counted)
 	}
 
 	fmt.Fprintf(env.Stdout, "Assigned work waits at GitHub and starts after `billet resume`; nothing is\n")

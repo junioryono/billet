@@ -52,6 +52,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	// tier as it stood at one instant.
 	admission := l.admission(ctx)
 
+	launched := false
+
 	for active < desired {
 		// BOUGHT ONE AT A TIME, LAUNCHED TOGETHER. Each purchase still asks the
 		// order and the allocator on its own, exactly as before; what changes is
@@ -113,12 +115,34 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		if err := l.launchPool(ctx, batch); err != nil {
 			return err
 		}
+
+		launched = true
 	}
+
+	// COUNTED AGAIN AFTER A LAUNCH, which can fail and release its lease
+	// without an error: the count above went up when the lease was bought, and
+	// a demand published as met while its job waits is what a drain would read
+	// as drained. A recount that cannot be read leaves the demand unknown.
+	counted := true
+
+	if launched {
+		if recount, err := l.alloc.ActiveRunnerLeases(ctx, l.tier); err == nil {
+			active = recount
+		} else {
+			counted = false
+
+			l.log.Warn("could not count this tier's runners after launching; what it still wants "+
+				"is reported unknown until the next reconciliation", "tier", l.tier, "error", err)
+		}
+	}
+
 	// WHAT THIS TIER STILL WANTS, recorded for the order. Demand that is met, or
 	// that GitHub's count says has gone away, releases this tier's place rather
-	// than holding the fleet behind work nobody is waiting for any more.
+	// than holding the fleet behind work nobody is waiting for any more. Dated
+	// here, where it is counted, and nowhere else: a report republishes it on
+	// every poll, and a date taken there would make an old count look new.
 	l.mu.Lock()
-	l.waitingFor, l.demandKnown = max(desired-active, 0), true
+	l.waitingFor, l.demandKnown, l.demandAt = max(desired-active, 0), counted, l.clock()
 	l.mu.Unlock()
 
 	// A TIER THAT COULD NOT GROW WHATEVER ANYONE FREED DOES NOT HOLD THE LINE.

@@ -25,7 +25,9 @@ type RoomRefusal struct {
 	// and zero otherwise.
 	AtCap int
 	// ShareBound and CeilingBound are the target's share and the deployment
-	// ceiling, judged as the admission view judges them.
+	// ceiling, each leaving no shape the hosts with room could take. Not the
+	// admission view's flags of the same names, which judge a waiter for the
+	// order; these say which limit raising would help.
 	ShareBound, CeilingBound bool
 	// HostsFull names the live hosts the tier's shape fits on when none of them
 	// has room for one more now, other tiers' outstanding floors charged.
@@ -123,16 +125,9 @@ func (a *Allocator) WhyNoRoom(ctx context.Context, tier string) (RoomRefusal, er
 		var fits []string
 
 		for _, n := range p.order {
-			cost, ok := p.cost[n.name]
-			if !ok || cost.vcpu > n.vcpu || cost.memory > n.memory {
-				continue
+			if a.placesOnEmpty(n, t) {
+				fits = append(fits, n.name)
 			}
-
-			if t.GuestOS == config.GuestMacOS && a.macOSLimit(n.name) <= 0 {
-				continue
-			}
-
-			fits = append(fits, n.name)
 		}
 
 		switch {
@@ -153,6 +148,53 @@ func (a *Allocator) WhyNoRoom(ctx context.Context, tier string) (RoomRefusal, er
 		// room at all. These are the diagnostic's own measure, not the admission
 		// order's flags, which judge the waiter for whom it holds back.
 		return a.whichPotRefuses(ctx, tx, t, p, floors, &out)
+	})
+
+	return out, err
+}
+
+// placesOnEmpty reports whether an empty one of host n could place one lease of
+// t: the shape it charges there fits the host's size, and a macOS guest has a
+// licence slot there.
+func (a *Allocator) placesOnEmpty(n nodeRow, t config.Tier) bool {
+	cost, ok := n.cost(t)
+	if !ok || cost.vcpu > n.vcpu || cost.memory > n.memory {
+		return false
+	}
+
+	return t.GuestOS != config.GuestMacOS || a.macOSLimit(n.name) > 0
+}
+
+// ShapeHosts is, for every tier, the live hosts an empty one of could place a
+// lease of it on, by name: where its provider, the host's policy, the host's
+// size and a macOS licence slot all admit its shape. A tier with none waits
+// whatever is freed, which nothing else reports until its jobs queue (#140).
+// Whether a host is too old to read the tier's cache block is not asked here;
+// billet status reports that wait on its own.
+func (a *Allocator) ShapeHosts(ctx context.Context) (map[string][]string, error) {
+	out := make(map[string][]string, len(a.tiers))
+
+	err := a.db.View(ctx, func(tx querier) error {
+		for _, label := range a.sortedLabels() {
+			t := a.tiers[label]
+
+			nodes, err := a.eligibleNodesFor(ctx, tx, t, false)
+			if err != nil {
+				return err
+			}
+
+			hosts := []string{}
+
+			for _, n := range nodes {
+				if a.placesOnEmpty(n, t) {
+					hosts = append(hosts, n.name)
+				}
+			}
+
+			out[label] = hosts
+		}
+
+		return nil
 	})
 
 	return out, err

@@ -46,26 +46,44 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 
 	// --tier names a scale set, which is a tier's runs_on: one per target, so
 	// several targets may each declare one by that name.
-	var matched []config.Tier
+	var (
+		matched   []config.Tier
+		elsewhere bool
+	)
 
 	for i := range tiers {
-		if tiers[i].ScaleSetName() == tier {
-			// Its own runner group, not the flag's: the config still describes
-			// this one, and letting a flag override it would delete from a group
-			// the tier was never in while reporting success.
-			if group != "" && groupOrDefault(group) != groupOrDefault(tiers[i].RunnerGroup) {
-				return nil, false, fmt.Errorf(
-					"tier %q is declared with runner group %q, so --runner-group %q would "+
-						"look in the wrong place; drop the flag to use the declared group",
-					tiers[i].Label, groupOrDefault(tiers[i].RunnerGroup), group)
-			}
-
-			matched = append(matched, tiers[i])
+		if tiers[i].ScaleSetName() != tier {
+			continue
 		}
+
+		// ANOTHER GROUP IS ANOTHER SCALE SET. A set of the declared tier's name
+		// left in a group the tier has moved out of is exactly what a control
+		// plane refuses to start beside (#140), and this is how it is removed:
+		// the flag addresses that set, never the declared one, which keeps its
+		// own group. It is deleted as an undeclared set is, by name, behind the
+		// label check and the confirmation, and teardownCommand says which set it
+		// is and that the declared one is left alone.
+		if group != "" && groupOrDefault(group) != groupOrDefault(tiers[i].RunnerGroup) {
+			elsewhere = true
+
+			continue
+		}
+
+		matched = append(matched, tiers[i])
 	}
 
 	if len(matched) > 0 {
 		return matched, false, nil
+	}
+
+	if elsewhere {
+		if force {
+			return nil, false, fmt.Errorf("--force skips the check that %q in runner group %q carries the "+
+				"label billet would have given it, and the config declares that name only in another "+
+				"group, so nothing else says this set is billet's", tier, group)
+		}
+
+		return []config.Tier{{Label: tier, RunnerGroup: group}}, true, nil
 	}
 
 	if group == "" {
@@ -96,6 +114,17 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 	}
 
 	return []config.Tier{{Label: tier, RunnerGroup: group}}, true, nil
+}
+
+// declaredGroup is the runner group a declared tier answering to name is in.
+func declaredGroup(tiers []config.Tier, name string) (string, bool) {
+	for i := range tiers {
+		if tiers[i].ScaleSetName() == name {
+			return groupOrDefault(tiers[i].RunnerGroup), true
+		}
+	}
+
+	return "", false
 }
 
 // tiersOnTarget narrows the config's tiers to one target's, so a scale-set name

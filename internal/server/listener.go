@@ -286,10 +286,11 @@ type Listener struct {
 	order *admissionQueue
 
 	// waitingFor is how much of GitHub's assigned work this tier could not buy
-	// capacity for at its last reconciliation, and demandKnown that one has
-	// counted it. Guarded by mu; reported, never scheduled on.
+	// capacity for at its last reconciliation, demandKnown that it could be
+	// counted, and demandAt when. Guarded by mu; reported, never scheduled on.
 	waitingFor  int
 	demandKnown bool
+	demandAt    time.Time
 	// refused is why the last purchase this tier asked for bought nothing, and
 	// refusedLogged the reason last logged for it. Guarded by mu; reported and
 	// logged, never scheduled on.

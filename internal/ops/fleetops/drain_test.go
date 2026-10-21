@@ -300,8 +300,18 @@ func loadFixtureConfig(t *testing.T, cfgPath string) *config.Config {
 
 // publishDemand records what a tier's listener last counted of the work GitHub
 // assigned it and it has not started, as a running control plane does at every
-// poll; nil publishes an observation without the count.
+// poll, counted an hour from now, after the seal the drain is about to take;
+// nil publishes an observation without the count.
 func publishDemand(t *testing.T, db *state.DB, cfg *config.Config, tier string, unstarted *int) {
+	t.Helper()
+
+	publishDemandAt(t, db, cfg, tier, unstarted, time.Now().Add(time.Hour))
+}
+
+// publishDemandAt is publishDemand counted at a given time.
+func publishDemandAt(t *testing.T, db *state.DB, cfg *config.Config, tier string, unstarted *int,
+	at time.Time,
+) {
 	t.Helper()
 
 	a, err := alloc.New(db, alloc.Limits{
@@ -312,7 +322,7 @@ func publishDemand(t *testing.T, db *state.DB, cfg *config.Config, tier string, 
 	}
 
 	if err := a.RecordListenerCapacity(t.Context(), tier, alloc.ListenerCapacity{
-		Exchange: "confirmed", Unstarted: unstarted,
+		Exchange: "confirmed", Unstarted: unstarted, UnstartedAt: at.UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatalf("record %s's observation: %v", tier, err)
 	}
@@ -371,6 +381,42 @@ func TestADrainNamesAssignedWorkTheLedgerCannotSee(t *testing.T) {
 
 	if !strings.Contains(out, waiting+": 3 job(s) assigned and not started") {
 		t.Errorf("the drain does not name the tier with assigned work waiting:\n%s", out)
+	}
+}
+
+// AND A COUNT TAKEN BEFORE THE SEAL IS NOT A COUNT OF NONE. A listener that
+// counted zero and then went away, or one that has not polled since the seal,
+// cannot speak for what GitHub assigned after it; once the drain has given the
+// listeners a poll's worth of time to count again, that tier is unknown.
+func TestADrainDoesNotTrustACountFromBeforeTheSeal(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	before := cfg.Tiers[0].Label
+	publishDemandAt(t, db, cfg, before, &none, time.Now().Add(-time.Hour))
+
+	saved := demandCountWithin
+	demandCountWithin = time.Second
+
+	t.Cleanup(func() { demandCountWithin = saved })
+
+	out := drainWait(t, cfgPath)
+
+	if strings.Contains(out, "Drained") {
+		t.Errorf("a drain called a deployment drained on a count taken before its seal:\n%s", out)
+	}
+
+	if !strings.Contains(out, before+": unknown (last counted at") || !strings.Contains(out, "before this seal") {
+		t.Errorf("the drain does not say the tier's count predates the seal:\n%s", out)
+	}
+
+	if !strings.Contains(out, "Waiting up to") {
+		t.Errorf("the drain did not wait for the listeners to count again before giving up:\n%s", out)
 	}
 }
 

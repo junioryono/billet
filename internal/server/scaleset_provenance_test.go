@@ -316,6 +316,44 @@ func TestAStaleRepositoryScaleSetRefusesTheOrganizationsTier(t *testing.T) {
 	}
 }
 
+// A RECORD UNDER ANOTHER SPELLING OF THE DECLARED SET IS THE DECLARED SET.
+// GitHub compares runner groups and names without case, and a tier naming no
+// group lands in the default one however an earlier config spelled it; read
+// exactly, the tier's own set would be a stranger carrying its name, and a
+// healthy deployment would refuse to start.
+func TestARecordOfTheDeclaredSetUnderAnotherSpellingIsNotAStranger(t *testing.T) {
+	declared := tier("billet-4vcpu")
+
+	handler, _, err := runWithRecords(t, []config.Tier{declared}, []state.ScaleSetRecord{
+		{Target: testOrg, RunnerGroup: "Default", Label: "Billet-4vcpu", ID: 43},
+	}, testTarget)
+	if err != nil {
+		t.Fatalf("the declared set's own record, spelled differently, refused the start: %v", err)
+	}
+
+	if got := handler.warningsAbout("Default", "Billet-4vcpu"); len(got) != 0 {
+		t.Errorf("the declared set's own record was reported as undeclared: %v", got)
+	}
+}
+
+// AND A STALE ORGANIZATION RECORD UNDER ANOTHER SPELLING OF THE OWNER IS FOUND:
+// the ledger is asked for a target's records without case, as GitHub names
+// owners.
+func TestAStaleOrganizationRecordIsFoundUnderAnotherSpelling(t *testing.T) {
+	repo := config.GitHubTarget{Name: "app", Repository: testOrg + "/app"}
+
+	declared := tier("billet-4vcpu")
+	declared.Target = repo.Name
+
+	_, _, err := runWithRecords(t, []config.Tier{declared}, []state.ScaleSetRecord{
+		{Target: strings.ToUpper(testOrg), RunnerGroup: "default", Label: "billet-4vcpu", ID: 53},
+	}, repo)
+
+	if err == nil {
+		t.Fatal("a stale organization record written under another spelling of the owner was missed")
+	}
+}
+
 // AND ONE THAT TAKES NO DECLARED TIER'S NAME IS STILL ONLY REPORTED. A stale
 // set under a name nothing answers to queues jobs aimed at that name, which is
 // worth a warning, and refusing the whole control plane for it would be an

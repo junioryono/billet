@@ -23,6 +23,8 @@ ON CONFLICT (org, runner_group, label) DO UPDATE SET scale_set_id = excluded.sca
 DELETE FROM scale_set WHERE org = @org AND runner_group = @runner_group AND label = @label;
 
 -- name: ListScaleSets :many
--- Every scale set billet recorded creating for one organization.
+-- Every scale set billet recorded creating for one target, its path compared
+-- without case as GitHub compares owners and repositories, so a record written
+-- under another spelling of the same target is still found.
 SELECT org, runner_group, label, scale_set_id FROM scale_set
- WHERE org = @org ORDER BY runner_group, label;
+ WHERE LOWER(org) = LOWER(CAST(@org AS TEXT)) ORDER BY runner_group, label;

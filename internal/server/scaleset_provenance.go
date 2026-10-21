@@ -96,7 +96,7 @@ func (s *Server) judgeUndeclaredScaleSets(
 		}
 
 		for _, rec := range recorded {
-			if _, ok := declared[path][scaleSetKey{group: rec.RunnerGroup, label: rec.Label}]; ok {
+			if isDeclared(declared[path], rec.RunnerGroup, rec.Label) {
 				continue
 			}
 
@@ -164,7 +164,7 @@ func (s *Server) routedTo(declared map[string]map[scaleSetKey]struct{}, target c
 
 	for _, other := range s.targets {
 		otherPath := other.Config.Path()
-		if otherPath == path {
+		if strings.EqualFold(otherPath, path) {
 			continue
 		}
 
@@ -182,6 +182,21 @@ func (s *Server) routedTo(declared map[string]map[scaleSetKey]struct{}, target c
 	}
 
 	return "", false
+}
+
+// isDeclared reports whether a recorded scale set is one of a target's declared
+// ones, its group and name compared as GitHub compares them, without case, and
+// a record of the default group under either spelling. Compared exactly, a
+// record written under another spelling of the declared set's own group read
+// as a stranger carrying its name, and refused a healthy start.
+func isDeclared(declared map[scaleSetKey]struct{}, group, label string) bool {
+	for key := range declared {
+		if strings.EqualFold(key.group, groupOrDefault(group)) && strings.EqualFold(key.label, label) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // claimedOn reports the name a declared scale set of one target answers to

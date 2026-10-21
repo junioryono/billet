@@ -41,6 +41,7 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	if l.demandKnown {
 		unstarted := l.waitingFor
 		report.Unstarted = &unstarted
+		report.UnstartedAt = l.demandAt.UTC().Format(time.RFC3339Nano)
 	}
 
 	// THE QUEUE'S OWN RECORD OF WHEN THIS TIER BEGAN WAITING, not a fresh

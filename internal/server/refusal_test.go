@@ -3,7 +3,9 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -251,6 +253,56 @@ func TestAnOfferDeclinedPastHeldEscrowSaysWhy(t *testing.T) {
 
 	if reason, _ := declines[0]["reason"].(string); !strings.Contains(reason, "deployment ceiling") {
 		t.Errorf("the decline's reason %q does not name the ceiling that refused the second lease", reason)
+	}
+}
+
+// refusingLaunch is a node that starts nothing it is asked to.
+type refusingLaunch struct{}
+
+func (refusingLaunch) Launch(context.Context, *alloc.Lease, dispatch.Job) error {
+	return errors.New("the host refused the guest")
+}
+
+func (refusingLaunch) Destroy(context.Context, int64) error { return nil }
+
+// A LAUNCH THAT FAILED COVERS NO DEMAND (#140). The count a drain reads goes up
+// when a lease is bought; a launch that then fails releases the lease without
+// an error, and a count left at "met" would tell a drain the one assigned job
+// was running while it waited at GitHub.
+func TestAFailedLaunchLeavesItsJobCountedAsWaiting(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tierOf("a-work", 4)}
+
+	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registerHost(t, a)
+
+	s := New(a, nil, tiers, "failed-launch-test", slog.New(slog.DiscardHandler),
+		WithNodeRunner(refusingLaunch{}), WithAdmissionOrder(config.AdmissionFair))
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, s.listenerOpts(nil)...)
+
+	if err := l.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	l.reportCapacity(t.Context(), nil, "")
+
+	got, err := a.CapacityReport(t.Context(), "a-work")
+	if err != nil {
+		t.Fatalf("read the report: %v", err)
+	}
+
+	if got.Listener.Unstarted == nil || *got.Listener.Unstarted != 1 {
+		t.Errorf("after its one launch failed the tier publishes %v jobs unstarted, want the 1 still waiting",
+			got.Listener.Unstarted)
+	}
+
+	if got.Listener.UnstartedAt == "" {
+		t.Error("the count was published without when it was counted")
 	}
 }
 
