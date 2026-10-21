@@ -206,9 +206,20 @@ func TestEveryCloseAdvancesItsTiersReleases(t *testing.T) {
 	generation := func(label string) int64 {
 		t.Helper()
 
-		_, at, err := a.ActiveRunnersAt(t.Context(), label)
+		active, at, err := a.ActiveRunnersAt(t.Context(), label)
 		if err != nil {
 			t.Fatalf("ActiveRunnersAt(%s): %v", label, err)
+		}
+
+		// ONE PREDICATE, written twice: the statement that reads the count with
+		// the generation must count what ActiveRunnerLeases counts.
+		want, err := a.ActiveRunnerLeases(t.Context(), label)
+		if err != nil {
+			t.Fatalf("ActiveRunnerLeases(%s): %v", label, err)
+		}
+
+		if active != want {
+			t.Fatalf("tier %s counts %d runners read with its generation and %d alone", label, active, want)
 		}
 
 		all, err := a.TierReleases(t.Context())
@@ -225,6 +236,39 @@ func TestEveryCloseAdvancesItsTiersReleases(t *testing.T) {
 
 	if got := generation("one"); got != 0 {
 		t.Fatalf("a tier none of whose leases closed is at generation %d, want 0", got)
+	}
+
+	// THE COUNT'S CASES: escrow that started nothing, a runner launching, and a
+	// launching runner whose registration GitHub removed. Only the second counts.
+	held, err := a.Escrow(t.Context(), "one", 3)
+	if err != nil || len(held) != 3 {
+		t.Fatalf("Escrow = %v, %v", held, err)
+	}
+
+	for i, lease := range held[1:] {
+		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, int64(i+1)); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+	}
+
+	if err := a.MarkDeregistered(t.Context(), held[2].ID); err != nil {
+		t.Fatalf("MarkDeregistered: %v", err)
+	}
+
+	if active, _, err := a.ActiveRunnersAt(t.Context(), "one"); err != nil || active != 1 {
+		t.Fatalf("ActiveRunnersAt = %d, %v; want the one launching runner still registered", active, err)
+	}
+
+	if got := generation("one"); got != 0 {
+		t.Fatalf("nothing closed, but tier one is at generation %d", got)
 	}
 
 	done := reserve(t, a, "one")

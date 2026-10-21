@@ -264,10 +264,17 @@ SELECT CAST(COUNT(*) AS BIGINT) FROM leases
 INSERT INTO tier_releases (tier, generation) VALUES (@tier, 1)
 ON CONFLICT (tier) DO UPDATE SET generation = tier_releases.generation + 1;
 
--- name: TierReleases :one
--- One tier's release generation, zero for a tier none of whose leases has
--- closed.
-SELECT CAST(COALESCE(MAX(generation), 0) AS BIGINT) FROM tier_releases WHERE tier = @tier;
+-- name: CountActiveRunnersAt :one
+-- CountActiveRunnerLeases, and the tier's release generation (zero for a tier
+-- none of whose leases has closed), IN ONE STATEMENT. Two statements in one
+-- transaction are two snapshots under PostgreSQL's READ COMMITTED, so a close
+-- landing between them would pair the count from before it with the
+-- generation after it, and a drain would trust a count the close made wrong.
+-- The predicate is CountActiveRunnerLeases's, and a test holds them equal.
+SELECT CAST((SELECT COUNT(*) FROM leases l
+              WHERE l.tier = @tier AND l.phase NOT IN ('capacity','done','failed')
+                AND l.deregistered = 0) AS BIGINT) AS active,
+       CAST(COALESCE((SELECT r.generation FROM tier_releases r WHERE r.tier = @tier), 0) AS BIGINT) AS releases;
 
 -- name: ListTierReleases :many
 -- Every tier's release generation.

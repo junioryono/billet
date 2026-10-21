@@ -123,6 +123,31 @@ func (q *Queries) CountActiveRunnerLeases(ctx context.Context, tier string) (int
 	return column_1, err
 }
 
+const countActiveRunnersAt = `-- name: CountActiveRunnersAt :one
+SELECT CAST((SELECT COUNT(*) FROM leases l
+              WHERE l.tier = $1 AND l.phase NOT IN ('capacity','done','failed')
+                AND l.deregistered = 0) AS BIGINT) AS active,
+       CAST(COALESCE((SELECT r.generation FROM tier_releases r WHERE r.tier = $1), 0) AS BIGINT) AS releases
+`
+
+type CountActiveRunnersAtRow struct {
+	Active   int64
+	Releases int64
+}
+
+// CountActiveRunnerLeases, and the tier's release generation (zero for a tier
+// none of whose leases has closed), IN ONE STATEMENT. Two statements in one
+// transaction are two snapshots under PostgreSQL's READ COMMITTED, so a close
+// landing between them would pair the count from before it with the
+// generation after it, and a drain would trust a count the close made wrong.
+// The predicate is CountActiveRunnerLeases's, and a test holds them equal.
+func (q *Queries) CountActiveRunnersAt(ctx context.Context, tier string) (CountActiveRunnersAtRow, error) {
+	row := q.db.QueryRowContext(ctx, countActiveRunnersAt, tier)
+	var i CountActiveRunnersAtRow
+	err := row.Scan(&i.Active, &i.Releases)
+	return i, err
+}
+
 const countOpenInTier = `-- name: CountOpenInTier :one
 SELECT CAST(COUNT(*) AS BIGINT) FROM leases
  WHERE tier = $1 AND phase NOT IN ('done','failed')
@@ -942,19 +967,6 @@ type SetLeasePhaseParams struct {
 func (q *Queries) SetLeasePhase(ctx context.Context, arg SetLeasePhaseParams) error {
 	_, err := q.db.ExecContext(ctx, setLeasePhase, arg.Phase, arg.ID, arg.Epoch)
 	return err
-}
-
-const tierReleases = `-- name: TierReleases :one
-SELECT CAST(COALESCE(MAX(generation), 0) AS BIGINT) FROM tier_releases WHERE tier = $1
-`
-
-// One tier's release generation, zero for a tier none of whose leases has
-// closed.
-func (q *Queries) TierReleases(ctx context.Context, tier string) (int64, error) {
-	row := q.db.QueryRowContext(ctx, tierReleases, tier)
-	var column_1 int64
-	err := row.Scan(&column_1)
-	return column_1, err
 }
 
 const totalUsage = `-- name: TotalUsage :one

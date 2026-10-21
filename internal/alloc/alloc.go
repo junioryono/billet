@@ -2685,21 +2685,16 @@ func (a *Allocator) ActiveRunnerLeases(ctx context.Context, tier string) (int, e
 }
 
 // ActiveRunnersAt is ActiveRunnerLeases with the tier's release generation read
-// in the same snapshot: the generation a count of the tier's demand made from
-// this number is valid at, which a drain compares with the current one.
+// in the same statement, so in one snapshot on either engine: the generation a
+// count of the tier's demand made from this number is valid at, which a drain
+// compares with the current one.
 func (a *Allocator) ActiveRunnersAt(ctx context.Context, tier string) (int, int64, error) {
-	var count, releases int64
+	var row ledgerdb.CountActiveRunnersAtRow
 
 	err := a.db.View(ctx, func(tx querier) error {
 		var err error
 
-		q := state.ReadQueries(tx)
-
-		if count, err = q.CountActiveRunnerLeases(ctx, tier); err != nil {
-			return err
-		}
-
-		releases, err = q.TierReleases(ctx, tier)
+		row, err = state.ReadQueries(tx).CountActiveRunnersAt(ctx, tier)
 
 		return err
 	})
@@ -2707,7 +2702,7 @@ func (a *Allocator) ActiveRunnersAt(ctx context.Context, tier string) (int, int6
 		return 0, 0, fmt.Errorf("alloc: count active runner leases for %s: %w", tier, err)
 	}
 
-	return int(count), releases, nil
+	return int(row.Active), row.Releases, nil
 }
 
 // ServiceableRunnerLeaseIDs reports restart-surviving runner capacity that may
