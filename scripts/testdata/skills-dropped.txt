@@ -152,3 +152,4 @@ d6c1cc3aa66f The Makefile is gone (#78); the sentence names the script under scr
 de65ee2d5832 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 e29c5205f066 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 f2b09ff92300 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+1c37e966cf7d The Makefile is gone (#78); the scenario tests run through scripts/gates/scenario.sh NAME, and the rule says so.
