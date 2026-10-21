@@ -1,6 +1,7 @@
 package images
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -203,11 +204,12 @@ func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 	// the verification does, creates neither directory.
 	for _, tc := range []struct {
 		name, deployment string
-		refused          bool
+		// refusal is the verification's own diagnostic, or "" for a lock taken.
+		refusal string
 	}{
-		{"a minted deployment", deployment, false},
-		{"a deployment billet did not mint", "not-a-minted-identity", true},
-		{"no deployment at all", "", true},
+		{"a minted deployment", deployment, ""},
+		{"a deployment billet did not mint", "not-a-minted-identity", "not one billet mints"},
+		{"no deployment at all", "", "names no deployment"},
 	} {
 		ca, err := wirecert.LoadOrCreateCA(t.TempDir(), tc.deployment)
 		if err != nil {
@@ -237,23 +239,38 @@ func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 			t.Errorf("%s: a node whose certificate loads declares a directory for an identity it never writes", tc.name)
 		}
 
-		// THE VERIFICATION'S OWN ANSWER, through the probe lock's Take: the
-		// lock for a minted deployment, a refusal for the others.
-		probed := false
+		// THE VERIFICATION'S OWN ANSWER, through the probe lock's Take: the lock
+		// file for a minted deployment, the verification's refusal for the others.
+		taken := false
 
 		for _, n := range RefreshPaths(processEnv(), certified, cfgPath) {
-			if n.Access == unitpath.Lock && strings.HasPrefix(n.Path, filepath.Join(root, "locks")) {
-				_, err := unitpath.Exercise(t.Context(), n, "")
-				if (err != nil) != tc.refused {
-					t.Errorf("%s: resolving the identity answered %v, want refused=%v", tc.name, err, tc.refused)
-				}
+			if n.Access != unitpath.Lock || !strings.HasPrefix(n.Path, filepath.Join(root, "locks")) {
+				continue
+			}
 
-				probed = true
+			take := n.Take
+			n.Take = func(ctx context.Context) (func() error, error) {
+				taken = true
+
+				return take(ctx)
+			}
+
+			_, err := unitpath.Exercise(t.Context(), n, "")
+
+			switch {
+			case tc.refusal == "" && err != nil:
+				t.Errorf("%s: the probe lock was refused: %v", tc.name, err)
+			case tc.refusal == "":
+				if _, err := os.Stat(n.Path); err != nil {
+					t.Errorf("%s: the probe lock was not taken at %s: %v", tc.name, n.Path, err)
+				}
+			case err == nil || !strings.Contains(err.Error(), tc.refusal):
+				t.Errorf("%s: resolving the identity answered %v, want the verification's %q", tc.name, err, tc.refusal)
 			}
 		}
 
-		if !probed {
-			t.Fatalf("%s: no probe lock was declared to resolve the identity through", tc.name)
+		if !taken {
+			t.Fatalf("%s: the identity was never resolved through the probe lock's Take", tc.name)
 		}
 
 		for _, dir := range []string{stateDir, serverDir} {
