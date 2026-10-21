@@ -529,17 +529,22 @@ rehearsal_journal_step() {
     ' 2>/dev/null || true
 }
 
-# rehearsal_absent succeeds only when Docker positively says a container or a
-# network does not exist: rehearsal_absent container|network <name>. An
-# inspection that fails for any other reason (the daemon unreachable, say) is
-# "could not tell", which teardown counts as left behind, never as gone.
+# rehearsal_absent succeeds only when the Docker daemon itself says that the
+# named container or network does not exist: rehearsal_absent container|network
+# <name>. An inspection that fails for any other reason (the daemon unreachable,
+# a missing context, whose message also says "not found") is "could not tell",
+# which teardown counts as left behind, never as gone. The two diagnostics are
+# the daemon's own, measured on Docker 29.9.2 (2026-10-21): `Error response from
+# daemon: No such container: <name>` and `... network <name> not found`.
 rehearsal_absent() {
     local out
     if out=$(docker "$1" inspect "$2" 2>&1 >/dev/null); then
         return 1
     fi
-    case "${out}" in
-        *"No such"* | *"not found"*) return 0 ;;
+    case "$1:${out}" in
+        "container:Error response from daemon: No such container: $2") return 0 ;;
+        "network:Error response from daemon: network $2 not found") return 0 ;;
+        "network:Error response from daemon: No such network: $2") return 0 ;;
     esac
     return 1
 }
