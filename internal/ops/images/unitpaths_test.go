@@ -201,10 +201,13 @@ func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 	// verification accepts or one it refuses: either way it writes no identity,
 	// so none is declared, and taking the locks, which resolves the identity as
 	// the verification does, creates neither directory.
-	for _, tc := range []struct{ name, deployment string }{
-		{"a minted deployment", deployment},
-		{"a deployment billet did not mint", "not-a-minted-identity"},
-		{"no deployment at all", ""},
+	for _, tc := range []struct {
+		name, deployment string
+		refused          bool
+	}{
+		{"a minted deployment", deployment, false},
+		{"a deployment billet did not mint", "not-a-minted-identity", true},
+		{"no deployment at all", "", true},
 	} {
 		ca, err := wirecert.LoadOrCreateCA(t.TempDir(), tc.deployment)
 		if err != nil {
@@ -234,11 +237,17 @@ func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 			t.Errorf("%s: a node whose certificate loads declares a directory for an identity it never writes", tc.name)
 		}
 
+		// THE VERIFICATION'S OWN ANSWER, through the probe lock's Take: the
+		// lock for a minted deployment, a refusal for the others.
 		probed := false
 
 		for _, n := range RefreshPaths(processEnv(), certified, cfgPath) {
 			if n.Access == unitpath.Lock && strings.HasPrefix(n.Path, filepath.Join(root, "locks")) {
-				_, _ = unitpath.Exercise(t.Context(), n, "")
+				_, err := unitpath.Exercise(t.Context(), n, "")
+				if (err != nil) != tc.refused {
+					t.Errorf("%s: resolving the identity answered %v, want refused=%v", tc.name, err, tc.refused)
+				}
+
 				probed = true
 			}
 		}
