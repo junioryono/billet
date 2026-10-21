@@ -180,6 +180,11 @@ classify() {
 		known=0
 		select_families terraform
 		;;
+	# The runner-usage sampler runs in gate-binaries and every host-lifecycle group.
+	scripts/ci-usage.sh)
+		known=0
+		select_families host_lifecycle
+		;;
 	tools/lint/* | .golangci.yml)
 		known=0
 		select_families lint

@@ -468,6 +468,7 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"terraform/modules/fleet-ec2/main.tf", families("terraform", "terraform_lint")},
 		{"terraform/modules/billet/main.tf", families("terraform", "terraform_lint", "terraform_consumer_floor")},
 		{"scripts/hybrid-root-check.sh", "terraform"},
+		{"scripts/ci-usage.sh", "host_lifecycle"},
 		// The linter's own module and configuration.
 		{"tools/lint/rawsql/rawsql.go", families("lint", "postgres")},
 		{".golangci.yml", "lint"},

@@ -27,6 +27,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`sqlc` and `sqlc-check` are outside `check` for the opposite reason to the terraform gates.**
 - **Go comments wrap at 88 columns; Markdown never wraps.**
 - **Superseded CI runs are force-cancelled.**
+- **A CI job runs on the smallest runner its measured use fits, and `scripts/ci-usage.sh` keeps measuring it.**
 
 ### The layering and the bans: [references/layering-and-bans.md](references/layering-and-bans.md)
 
