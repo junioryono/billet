@@ -130,6 +130,22 @@ func TestStatusSaysWhatHoldsAWaitingTierBack(t *testing.T) {
 		t.Errorf("status does not say why the allocator refused:\n%s", refused)
 	}
 
+	// A TIER THAT NEVER WAITS IN LINE STILL SAYS WHY: at its own cap it has no
+	// waiting line, and the refusal is the only line about its work.
+	var capped strings.Builder
+
+	printTierCapacity(&capped, "repo-capped", alloc.TierCapacity{
+		ObservedAt: "2026-09-25T17:55:00Z",
+		Listener: alloc.ListenerCapacity{
+			Exchange: "confirmed", Refusal: "the allocator has no room: the tier holds its max_concurrent of 4",
+		},
+	}, statusNow)
+
+	if !strings.Contains(capped.String(), "last purchase refused: the allocator has no room: the tier holds its "+
+		"max_concurrent of 4") || strings.Contains(capped.String(), "waiting") {
+		t.Errorf("a tier refused at its own cap does not say why, or claims a place in line:\n%s", capped.String())
+	}
+
 	// A REPORT FROM BEFORE THE FIELDS SAYS NEITHER, which is not the same as
 	// neither being true.
 	older := report(alloc.ListenerCapacity{})

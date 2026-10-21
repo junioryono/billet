@@ -59,11 +59,13 @@ func (l *Listener) buyForOffers(ctx context.Context, offers int) error {
 		return err
 	}
 
+	// SHORT OF THE OFFERS, NOT ONLY EMPTY: escrow already held backs some of
+	// them, and the rest are declined for a reason this records.
 	l.mu.Lock()
-	none := len(l.held) == 0
+	short := len(l.held) < offers
 	l.mu.Unlock()
 
-	if none {
+	if short {
 		l.refuse(l.roomRefusal(ctx, nil), false)
 	}
 

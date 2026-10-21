@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -31,11 +32,15 @@ type RoomRefusal struct {
 	HostsFull []string
 	// NoHost is a tier whose shape no live host can place at all.
 	NoHost bool
+	// Budgets is the deployment ceiling and the target's share together
+	// leaving no charged shape that fits, though each alone would.
+	Budgets bool
 }
 
 // Binds reports whether any limit is named.
 func (r RoomRefusal) Binds() bool {
-	return r.Sealed || r.AtCap > 0 || r.ShareBound || r.CeilingBound || len(r.HostsFull) > 0 || r.NoHost
+	return r.Sealed || r.AtCap > 0 || r.ShareBound || r.CeilingBound || len(r.HostsFull) > 0 ||
+		r.NoHost || r.Budgets
 }
 
 // String names every limit that binds, or says none does.
@@ -64,6 +69,10 @@ func (r RoomRefusal) String() string {
 
 	if len(r.HostsFull) > 0 {
 		parts = append(parts, "no room on its hosts ("+strings.Join(r.HostsFull, ", ")+")")
+	}
+
+	if r.Budgets {
+		parts = append(parts, "the deployment ceiling and its target's share together leave no shape that fits")
 	}
 
 	if len(parts) == 0 {
@@ -114,12 +123,23 @@ func (a *Allocator) WhyNoRoom(ctx context.Context, tier string) (RoomRefusal, er
 			return err
 		}
 
+		// THE HOSTS AN EMPTY ONE OF COULD PLACE IT, not every host with a charge:
+		// eligibleNodes keeps a host-backed host smaller than the shape, and one
+		// of those reported as full would read as contention that ends rather
+		// than a shape that never fits there.
 		var fits []string
 
 		for _, n := range p.order {
-			if _, ok := p.cost[n.name]; ok {
-				fits = append(fits, n.name)
+			cost, ok := p.cost[n.name]
+			if !ok || cost.vcpu > n.vcpu || cost.memory > n.memory {
+				continue
 			}
+
+			if t.GuestOS == config.GuestMacOS && a.macOSLimit(n.name) <= 0 {
+				continue
+			}
+
+			fits = append(fits, n.name)
 		}
 
 		switch {
@@ -127,6 +147,18 @@ func (a *Allocator) WhyNoRoom(ctx context.Context, tier string) (RoomRefusal, er
 			out.NoHost = true
 		case p.total(t) == 0:
 			out.HostsFull = fits
+		}
+
+		// AND THE TWO POTS TOGETHER. The share and the ceiling are each judged
+		// alone, as the admission order needs them, so one can fit a shape the
+		// other does not and both read as free while together they fit none.
+		if !out.Binds() {
+			room, err := a.headroom(ctx, tx, t)
+			if err != nil {
+				return err
+			}
+
+			out.Budgets = room == 0
 		}
 
 		return nil

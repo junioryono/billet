@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // These are #248: a purchase that buys nothing says why, the order or the
@@ -179,6 +180,69 @@ func TestThePoolPathSaysWhyOncePerReason(t *testing.T) {
 
 	if reason, _ := said[0]["reason"].(string); !strings.Contains(reason, "deployment ceiling") {
 		t.Errorf("the reason %q does not name the ceiling the small tier spent", reason)
+	}
+}
+
+// A TIER AT ITS OWN CAP PUBLISHES WHY, THOUGH IT NEVER WAITS IN LINE: its
+// refusal is its own max_concurrent, so the order leaves it out, and the
+// report is then the only place its reason is said.
+func TestATierAtItsCapPublishesItsRefusal(t *testing.T) {
+	t.Parallel()
+
+	capped := tierOf("a-capped", 4)
+	capped.MaxConcurrent = 1
+
+	a, _, _, listeners := loggedListeners(t, []config.Tier{capped}, 64, config.AdmissionFair)
+
+	if err := listeners[0].reconcilePool(t.Context(), 3); err != nil {
+		t.Fatalf("capped tier reconcile: %v", err)
+	}
+
+	listeners[0].reportCapacity(t.Context(), nil, "")
+
+	got, err := a.CapacityReport(t.Context(), "a-capped")
+	if err != nil {
+		t.Fatalf("read the capped tier's report: %v", err)
+	}
+
+	if got.Listener.WaitingSince != "" {
+		t.Fatalf("a tier at its own cap waits in line (%+v), so this case cannot show its reason outside it",
+			got.Listener)
+	}
+
+	if !strings.Contains(got.Listener.Refusal, "max_concurrent of 1") {
+		t.Errorf("the capped tier's report says its purchase was refused for %q, want its own cap",
+			got.Listener.Refusal)
+	}
+}
+
+// AN OFFER DECLINED PAST THE ESCROW ALREADY HELD SAYS WHY. One lease is held
+// before two offers arrive and the allocator has no room for the second, so
+// the refill buys nothing while the tier holds some escrow: the second offer's
+// decline must still carry the allocator's reason.
+func TestAnOfferDeclinedPastHeldEscrowSaysWhy(t *testing.T) {
+	t.Parallel()
+
+	_, _, lines, listeners := loggedListeners(t, []config.Tier{tierOf("a-work", 4)}, 4, config.AdmissionFair)
+	l := listeners[0]
+
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("stage the one lease the ceiling allows: %v", err)
+	}
+
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []dispatch.Job{
+		{RequestID: 11, RunID: 101}, {RequestID: 12, RunID: 102},
+	}}); err != nil {
+		t.Fatalf("handle two offers: %v", err)
+	}
+
+	declines := lines.with(t, "declining an offer with no escrow to back it")
+	if len(declines) != 1 {
+		t.Fatalf("logged %d offer declines, want the one past the held lease: %v", len(declines), declines)
+	}
+
+	if reason, _ := declines[0]["reason"].(string); !strings.Contains(reason, "deployment ceiling") {
+		t.Errorf("the decline's reason %q does not name the ceiling that refused the second lease", reason)
 	}
 }
 

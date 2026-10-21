@@ -45,18 +45,19 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 		report.WaitingProgress = progress.UTC().Format(time.RFC3339Nano)
 
 		// WHO HOLDS THE LINE, asked of the queue now rather than remembered from
-		// the refusal, which may be a poll old; and what the allocator said, which
-		// the queue does not know (#248).
+		// the refusal, which may be a poll old (#248).
 		if holder, holderSince, held := l.order.waiterHeldBy(l.tier); held {
 			report.HeldBy = holder
 			report.HeldBySince = holderSince.UTC().Format(time.RFC3339Nano)
 		}
+	}
 
-		if l.refused.room != nil || l.refused.unread != nil {
-			if !l.refused.byOrder() {
-				report.Refusal = l.refused.String()
-			}
-		}
+	// AND WHAT THE ALLOCATOR SAID, which the queue does not know, for any tier
+	// with demand it could not buy for, in the queue or not: a tier at its own
+	// cap or with no host never waits in line, and is exactly the one whose
+	// reason an operator cannot otherwise find.
+	if l.waitingFor > 0 && (l.refused.room != nil || l.refused.unread != nil) && !l.refused.byOrder() {
+		report.Refusal = l.refused.String()
 	}
 
 	// A COUNT WITHOUT A DATE IS NOT A WAIT. The two are written by different
