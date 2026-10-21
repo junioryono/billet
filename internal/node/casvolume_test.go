@@ -141,6 +141,9 @@ func casService(
 	// A REFRESH OF A GIT MIRROR OUTLIVES ITS REQUEST, so it is ended and joined
 	// before the state directory it writes is removed.
 	t.Cleanup(service.git.close)
+	// NO TEST ASKS THE REAL GITHUB which repository a name is: one with a
+	// stand-in points this at it, and any other is refused at once.
+	service.git.api = "http://127.0.0.1:1"
 	volumes := newDeviceVolumes(t)
 	service.actionIO = volumes
 	instance := provider.InstanceName(scopedLease)

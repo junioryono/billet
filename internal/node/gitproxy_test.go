@@ -75,6 +75,42 @@ type gitUpstream struct {
 	refuse atomic.Bool
 	// hold, when set, holds the node's own fetches until it is closed.
 	hold atomic.Pointer[chan struct{}]
+	// ids is the id each repository name is, as GitHub's REST API answers
+	// `GET /repos/{owner}/{repo}` under /api; apiDown makes it answer 503.
+	ids      sync.Map
+	nextID   atomic.Int64
+	apiDown  atomic.Bool
+	apiCalls atomic.Int64
+}
+
+// repositoryID is the id GitHub's API gives a name, a new one the first time
+// the name is asked about.
+func (u *gitUpstream) repositoryID(name string) int64 {
+	id, _ := u.ids.LoadOrStore(name, u.nextID.Add(1))
+
+	return id.(int64) //nolint:forcetypeassert // only int64s are stored
+}
+
+// recreate deletes acme/api and makes another repository of that name, with a
+// history of its own and a new id, as an owner can once the first is renamed
+// or deleted.
+func (u *gitUpstream) recreate(t *testing.T) string {
+	t.Helper()
+
+	work := filepath.Join(t.TempDir(), "recreated")
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, work, "init", "-q", "-b", "main")
+	runIn(t, work, "commit", "-q", "--allow-empty", "-m", "another repository")
+	if err := os.RemoveAll(u.repo); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, u.root, "clone", "-q", "--bare", work, u.repo)
+	githubLike(t, u.repo)
+	u.ids.Store("api", u.nextID.Add(1))
+
+	return runIn(t, u.repo, "rev-parse", "main")
 }
 
 // holdMirrorFetches holds every fetch the node's own git makes until release
@@ -189,6 +225,22 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 				return
 			}
 		}
+		// THE REST API ANSWERS A NAME IT CANNOT SHOW THIS HEADER 404, as
+		// api.github.com does for a private repository (measured, 2026-10-21).
+		if name, ok := strings.CutPrefix(r.URL.Path, "/api/repos/acme/"); ok {
+			upstream.apiCalls.Add(1)
+			switch {
+			case upstream.apiDown.Load():
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			case r.Header.Get("Authorization") != githubBasic || upstream.refuse.Load():
+				http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+			default:
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"id":%d,"name":%q}`, upstream.repositoryID(name), name)
+			}
+
+			return
+		}
 		if r.Header.Get("Authorization") != githubBasic || upstream.refuse.Load() {
 			w.Header().Set("WWW-Authenticate", `Basic realm="GitHub"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
@@ -275,7 +327,7 @@ func gitNode(t *testing.T, upstream *gitUpstream) (*CacheService, *httptest.Serv
 	t.Helper()
 
 	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
-	service.git.upstream = upstream.URL
+	service.git.upstream, service.git.api = upstream.URL, upstream.URL+"/api"
 	service.git.fullFraction = 1
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
@@ -467,6 +519,13 @@ func TestABloblessCheckoutIsServedFromTheMirror(t *testing.T) {
 		"https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("the blobless clone: %v\n%s", err, output)
 	}
+	// THE CLONE HOLDS NO FILE, so the checkout has to fetch every one of them.
+	// --missing=print lists what the clone lacks without fetching it.
+	blob := runIn(t, upstream.repo, "rev-parse", "main:src/main.go")
+	if output, err := git("-C", "c", "rev-list", "--objects", "--missing=print", "main"); err != nil ||
+		!strings.Contains(output, "?"+blob) {
+		t.Fatalf("the blobless clone already holds the file, so its checkout fetches nothing (%v):\n%s", err, output)
+	}
 	before := upstream.fetches.Load()
 	if output, err := git("-C", "c", "checkout", "-q", "main"); err != nil {
 		t.Fatalf("the checkout: %v\n%s", err, output)
@@ -567,7 +626,7 @@ func TestARepositoryAboveTheCeilingIsForwarded(t *testing.T) {
 	spec := gitCache()
 	spec.Git.MaxSize = 1
 	service, _, token, _ := casService(t, provider.TrustUntrusted, spec, &fakeCacheStore{})
-	service.git.upstream, service.git.fullFraction = upstream.URL, 1
+	service.git.upstream, service.git.api, service.git.fullFraction = upstream.URL, upstream.URL+"/api", 1
 	// A MIRROR ATTEMPT IS COUNTED AT THE NODE'S git, BY ITS init: the watchdog
 	// stops a fetch past a one-byte ceiling at its first tick, which under load
 	// comes before that fetch has asked GitHub for anything or even started,
@@ -777,13 +836,13 @@ func TestAnOlderGrantDoesNotOvertakeANewerRefusal(t *testing.T) {
 		repo: "api", auth: "basic eA=="}
 	now := time.Now()
 	earlier, later := g.ask(), g.ask()
-	g.remember(request, now, later, false)
-	g.remember(request, now, earlier, true)
-	if g.granted(request, now) {
+	g.remember(request, now, later, false, 0)
+	g.remember(request, now, earlier, true, 7)
+	if _, ok := g.granted(request, now); ok {
 		t.Fatal("a grant asked for before a refusal overtook it")
 	}
-	g.remember(request, now, g.ask(), true)
-	if !g.granted(request, now) {
+	g.remember(request, now, g.ask(), true, 7)
+	if repository, ok := g.granted(request, now); !ok || repository != 7 {
 		t.Fatal("a grant asked for after the refusal did not stand")
 	}
 }
@@ -812,7 +871,7 @@ func TestAFetchIsStoppedWhileItRunsAtTheCeiling(t *testing.T) {
 		owner: "acme", repo: "api"}
 
 	err := gitWithin(t, "a fetch past its ceiling", func() error {
-		return service.fetchMirror(t.Context(), service.git.mirrorPath(request.key()), request, 1)
+		return service.fetchMirror(t.Context(), service.git.mirrorPath(request.key()), request, 7, 1)
 	})
 	if !errors.Is(err, errMirrorTooLarge) {
 		t.Fatalf("fetchMirror = %v, want errMirrorTooLarge", err)
@@ -907,7 +966,7 @@ func TestAShallowNegotiationIsServedWhenTheMirrorHoldsItsBoundary(t *testing.T) 
 		return fmt.Sprintf("%04x%s%04x%s%04x%s00000009done\n", len(want)+4, want,
 			len(shallow)+4, shallow, len(deepen)+4, deepen)
 	}
-	post := func(negotiation string) {
+	post := func(negotiation string) []byte {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
 			node.URL+"/v1/git/github.com/acme/api.git/git-upload-pack", strings.NewReader(negotiation))
 		if err != nil {
@@ -918,14 +977,19 @@ func TestAShallowNegotiationIsServedWhenTheMirrorHoldsItsBoundary(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+
+		return body
 	}
 
 	before := upstream.fetches.Load()
-	post(shallowNegotiation(main))
+	if body := post(shallowNegotiation(main)); !bytes.Contains(body, []byte("PACK")) || bytes.Contains(body, []byte("ERR ")) {
+		t.Fatalf("a shallow negotiation the mirror holds was not answered with a pack: %q", body[:min(len(body), 120)])
+	}
 	if got := upstream.fetches.Load() - before; got != 0 {
 		t.Fatalf("a shallow negotiation the mirror can answer went to github.com (%d fetches)", got)
 	}
@@ -982,10 +1046,10 @@ func TestARefusalOutlivesUnrelatedAnswers(t *testing.T) {
 	b := gitRequest{session: session, owner: "acme", repo: "api", auth: "basic Yg=="}
 	now := time.Now()
 	older, refusal, unrelated := g.ask(), g.ask(), g.ask()
-	g.remember(a, now, refusal, false)
-	g.remember(b, now.Add(gitAuthorisationAge), unrelated, true)
-	g.remember(a, now.Add(gitAuthorisationAge), older, true)
-	if g.granted(a, now.Add(gitAuthorisationAge)) {
+	g.remember(a, now, refusal, false, 0)
+	g.remember(b, now.Add(gitAuthorisationAge), unrelated, true, 7)
+	g.remember(a, now.Add(gitAuthorisationAge), older, true, 7)
+	if _, ok := g.granted(a, now.Add(gitAuthorisationAge)); ok {
 		t.Fatal("an unrelated answer cleared a refusal and let an older grant stand")
 	}
 }
@@ -1000,7 +1064,7 @@ func TestOnlyTheScopeOwnersRepositoriesAreMirrored(t *testing.T) {
 	spec := gitCache()
 	spec.Publish, spec.Owner, spec.Repository = config.CachePublishDefaultBranch, "other", "repo"
 	service, _, token, _ := casService(t, provider.TrustUntrusted, spec, &fakeCacheStore{})
-	service.git.upstream, service.git.fullFraction = upstream.URL, 1
+	service.git.upstream, service.git.api, service.git.fullFraction = upstream.URL, upstream.URL+"/api", 1
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
@@ -1275,7 +1339,7 @@ func scriptedNode(t *testing.T) (*CacheService, *scriptedGitHub, *httptest.Serve
 
 	github := newScriptedGitHub(t)
 	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
-	service.git.upstream, service.git.fullFraction = github.URL, 1
+	service.git.upstream, service.git.api, service.git.fullFraction = github.URL, github.URL+"/api", 1
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 

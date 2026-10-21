@@ -4,7 +4,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -45,7 +47,8 @@ func (u *gitUpstream) guestFetches() int64 { return u.fetches.Load() - u.mirrorF
 
 // gitWrapper puts a git in front of the node's that answers every fetch served
 // from the mirror as mode's file says: "refuse" with an ERR line, "silent" with
-// nothing at all, anything else as git would.
+// nothing at all, "hang" with nothing for ten minutes, "nakfail" with a NAK and
+// then a failure, anything else as git would.
 func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 	t.Helper()
 
@@ -61,6 +64,8 @@ func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 		"  case \"$(cat " + mode + ")\" in\n" +
 		"  refuse) printf '0017ERR forced refusal\\n'; exit 1 ;;\n" +
 		"  silent) exit 128 ;;\n" +
+		"  hang) sleep 600; exit 128 ;;\n" +
+		"  nakfail) printf '0008NAK\\n'; exit 128 ;;\n" +
 		"  esac ;;\n" +
 		"esac\n" +
 		"exec git \"$@\"\n"
@@ -78,7 +83,7 @@ func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 func TestTheMirrorsRefusalIsAnsweredByGitHub(t *testing.T) {
 	t.Parallel()
 
-	for _, behaviour := range []string{"refuse", "silent"} {
+	for _, behaviour := range []string{"refuse", "silent", "hang"} {
 		t.Run(behaviour, func(t *testing.T) {
 			t.Parallel()
 
@@ -87,6 +92,9 @@ func TestTheMirrorsRefusalIsAnsweredByGitHub(t *testing.T) {
 			var log gitLog
 			service.log = slog.New(slog.NewTextHandler(&log, nil))
 			mode := gitWrapper(t, service)
+			// A HUNG upload-pack IS GIVEN UP ON well inside the request's own
+			// life, so the request is still alive for GitHub to answer.
+			service.git.firstLineWait = 500 * time.Millisecond
 			git := gitClient(t, node, token, githubBasic)
 			if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
 				t.Fatalf("clone: %v\n%s", err, output)
@@ -106,7 +114,8 @@ func TestTheMirrorsRefusalIsAnsweredByGitHub(t *testing.T) {
 				t.Fatalf("github.com answered %d of the pull's fetches, want the one the mirror would not", got)
 			}
 			want := map[string]string{"refuse": "the mirror refused: ERR forced refusal",
-				"silent": "the mirror's upload-pack said nothing"}[behaviour]
+				"silent": "the mirror's upload-pack said nothing",
+				"hang":   "the mirror's upload-pack said nothing within 500ms"}[behaviour]
 			if !strings.Contains(log.String(), want) {
 				t.Fatalf("the request's line does not say %q:\n%s", want, log.String())
 			}
@@ -156,13 +165,16 @@ func TestARefreshHoldsNoJobPastItsWait(t *testing.T) {
 	want := runIn(t, upstream.repo, "rev-parse", "main")
 	path := service.git.mirrorPath("untrusted/acme/api")
 	gitWithin(t, "the refresh no job waited for", func() struct{} {
-		for {
+		// ENDS WITH THE TEST, so a refresh that never lands leaves no loop behind.
+		for t.Context().Err() == nil {
 			refs, err := service.mirrorRefs(t.Context(), path)
 			if err == nil && refs["refs/heads/main"] == want {
-				return struct{}{}
+				break
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
+
+		return struct{}{}
 	})
 	before := upstream.guestFetches()
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "after"); err != nil {
@@ -238,12 +250,37 @@ func TestAForwardedBodyIsWholeBeforeGitHubSeesIt(t *testing.T) {
 		}
 	}))
 	t.Cleanup(github.Close)
+
+	// HELD IN MEMORY, and past a limit of sixteen bytes on disk, which the
+	// proxy removes once the request is done.
+	for _, limit := range []int64{gitRequestLimit, 16} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			lengths.Clear()
+			service := forwardSlowBody(t, github.URL, limit, idle, &lengths)
+			entries, err := os.ReadDir(service.git.root)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".request-") {
+					t.Fatalf("a spooled request body was left behind: %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+// forwardSlowBody sends a fetch whose body stops for three times GitHub's idle
+// limit halfway through, through a node holding limit bytes in memory, and
+// fails unless GitHub answered it whole.
+func forwardSlowBody(t *testing.T, github string, limit int64, idle time.Duration, lengths *sync.Map) *CacheService {
+	t.Helper()
+
 	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
-	service.git.upstream, service.git.fullFraction = github.URL, 1
+	service.git.upstream, service.git.fullFraction, service.git.requestLimit = github, 1, limit
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 
-	// THE BODY STOPS FOR THREE TIMES GITHUB'S IDLE LIMIT halfway through.
 	reader, writer := io.Pipe()
 	go func() {
 		if _, err := io.WriteString(writer, "0032want "+strings.Repeat("a", 40)+"\n"); err != nil {
@@ -272,6 +309,8 @@ func TestAForwardedBodyIsWholeBeforeGitHubSeesIt(t *testing.T) {
 	if length, _ := lengths.Load("/acme/api.git/git-upload-pack"); length != int64(len("0032want "+strings.Repeat("a", 40)+"\n00000009done\n")) {
 		t.Fatalf("github.com was sent a body of length %v, want the whole body's", length)
 	}
+
+	return service
 }
 
 // THE PROXY REACHES GITHUB OVER HTTP/1.1, one connection per request, even
