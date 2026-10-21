@@ -5,26 +5,34 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // THE GATE SCRIPTS ARE EXECUTED IN A TREE OF THEIR OWN. Each test copies the
 // scripts it runs, the lock script and the pinned versions into a temporary
 // checkout and puts stand-ins where the scripts would find the real work: the
-// steps of the full gate, the verify, `go`, `nice`. A script that stopped
-// reading an override could then reach only a stand-in, never the real gate,
-// which run from inside `go test` would run this suite inside itself.
+// steps of the full gate, the verify, `go`, `nice`, golangci-lint. A script that
+// stopped reading an override could then reach only a stand-in, never the real
+// gate, which run from inside `go test` would run this suite inside itself; and
+// the environment is sealed (gateEnv), so no startup file or inherited variable
+// can put the real tools or the shared lock back in reach.
 
-// gateFixture is a checkout holding copies of the named gate scripts, the lock
-// script and .github/tool-versions.env (unless pins is false), plus the given
-// executables, each at its path under the checkout.
+// gateFixture is a checkout in a new temporary directory; see gateFixtureAt.
 func gateFixture(t *testing.T, scripts []string, pins bool, executables map[string]string) string {
 	t.Helper()
 
-	root := t.TempDir()
+	return gateFixtureAt(t, t.TempDir(), scripts, pins, executables)
+}
+
+// gateFixtureAt makes root a checkout holding copies of env.sh and the named gate
+// scripts, the lock script and .github/tool-versions.env (unless pins is false),
+// plus the given executables, each at its path under the checkout.
+func gateFixtureAt(t *testing.T, root string, scripts []string, pins bool, executables map[string]string) string {
+	t.Helper()
 
 	copyInto := func(from, to string) {
 		body, err := os.ReadFile(from)
@@ -61,16 +69,31 @@ func gateFixture(t *testing.T, scripts []string, pins bool, executables map[stri
 	return root
 }
 
-// gateEnv is the test's environment with the gates' own variables removed, so
-// the script's defaults are what a case does not set, plus extra, with bin first
-// on PATH when it is not empty.
-func gateEnv(bin string, extra ...string) []string {
-	var env []string
+// gateEnv is a sealed environment for a gate script: the test's own, less every
+// variable the gate scripts or the shell read (so a script's defaults are what a
+// case does not set, and no BASH_ENV, exported function or shell option runs
+// first), with a private HOME, XDG_CACHE_HOME and TMPDIR, bin first on PATH when
+// it is not empty, and extra, which replaces a variable of the same name.
+func gateEnv(t *testing.T, bin string, extra ...string) []string {
+	t.Helper()
+
+	private := t.TempDir()
+	env := []string{
+		"HOME=" + filepath.Join(private, "home"),
+		"XDG_CACHE_HOME=" + filepath.Join(private, "cache"),
+		"TMPDIR=" + private,
+	}
 
 	for _, kv := range scriptEnv() {
 		name, value, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, "BASH_FUNC_") || setIn(env, name) {
+			continue
+		}
+
 		switch name {
-		case "NICE", "TEST_PARALLEL", "GO", "GOEXPERIMENT", "CI", "CHECK_LOCK", "CHECK_STEPS", "VERIFY_CHANGED", "COVERPROFILE":
+		case "NICE", "TEST_PARALLEL", "GO", "GOEXPERIMENT", "GOOS", "GOARCH", "CI", "CHECK_LOCK", "CHECK_STEPS",
+			"VERIFY_CHANGED", "COVERPROFILE", "BILLET_NICED", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH",
+			"GLOBIGNORE", "PWD", "OLDPWD":
 			continue
 		case "PATH":
 			if bin != "" {
@@ -78,12 +101,45 @@ func gateEnv(bin string, extra ...string) []string {
 			}
 		}
 
-		if !setIn(extra, name) {
-			env = append(env, kv)
+		env = append(env, kv)
+	}
+
+	var out []string
+
+	for _, kv := range env {
+		if name, _, _ := strings.Cut(kv, "="); !setIn(extra, name) {
+			out = append(out, kv)
 		}
 	}
 
-	return append(env, extra...)
+	return append(out, extra...)
+}
+
+// gateCommand runs the gate script at rel under root, from root, in a sealed
+// environment with root/bin first on PATH.
+func gateCommand(t *testing.T, root, rel string, extra ...string) *exec.Cmd {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), filepath.Join(root, rel))
+	cmd.Dir = root
+	cmd.Env = gateEnv(t, filepath.Join(root, "bin"), extra...)
+	inGroup(cmd)
+
+	return cmd
+}
+
+// recordArgv is shell that prints its arguments each in brackets, so one argument
+// holding a space reads differently from two.
+const recordArgv = `for a; do printf ' [%s]' "$a"; done; echo`
+
+// argv is the line recordArgv prints for args.
+func argv(args ...string) string {
+	var b strings.Builder
+	for _, a := range args {
+		b.WriteString(" [" + a + "]")
+	}
+
+	return b.String()
 }
 
 // niceStandIn is a `nice` that insists on the gates' `-n 10`, marks the
@@ -137,11 +193,7 @@ func TestTheFullGateTakesTheSharedLock(t *testing.T) {
 	})
 	xdg := filepath.Join(t.TempDir(), "a cache")
 
-	cmd := exec.CommandContext(t.Context(), filepath.Join(root, "scripts", "gates", "check.sh"))
-	cmd.Env = gateEnv("", "XDG_CACHE_HOME="+xdg)
-	inGroup(cmd)
-
-	out, err := cmd.CombinedOutput()
+	out, err := gateCommand(t, root, "scripts/gates/check.sh", "XDG_CACHE_HOME="+xdg).CombinedOutput()
 	if err != nil {
 		t.Fatalf("gates/check.sh: %v (%s)", err, out)
 	}
@@ -174,7 +226,8 @@ func TestTheGatesHoldTheLockWhileTheyRun(t *testing.T) {
 		release := filepath.Join(dir, "release")
 
 		cmd := exec.CommandContext(holderContext(t), filepath.Join(root, "scripts", "gates", gate), held, release)
-		cmd.Env = gateEnv("", "CHECK_LOCK="+lock, "CI=true")
+		cmd.Dir = root
+		cmd.Env = gateEnv(t, "", "CHECK_LOCK="+lock, "CI=true")
 		inGroup(cmd)
 
 		if err := cmd.Start(); err != nil {
@@ -222,11 +275,7 @@ func TestTheVerifyRunsUnderNiceLocallyAndNotUnderCI(t *testing.T) {
 			"bin/nice":                  niceStandIn,
 		})
 
-		cmd := exec.CommandContext(t.Context(), filepath.Join(root, "scripts", "gates", "verify.sh"))
-		cmd.Env = gateEnv(filepath.Join(root, "bin"), append(tc.env, "CHECK_LOCK="+filepath.Join(root, "v.lock"))...)
-		inGroup(cmd)
-
-		out, err := cmd.CombinedOutput()
+		out, err := gateCommand(t, root, "scripts/gates/verify.sh", tc.env...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s: gates/verify.sh: %v (%s)", name, err, out)
 		}
@@ -237,41 +286,108 @@ func TestTheVerifyRunsUnderNiceLocallyAndNotUnderCI(t *testing.T) {
 	}
 }
 
+// raceSuite runs test.sh in a fixture whose `go` and `nice` are stand-ins, and
+// answers the line go printed: whether it ran niced, and its arguments.
+func raceSuite(t *testing.T, env ...string) string {
+	t.Helper()
+
+	root := gateFixture(t, []string{"test.sh"}, true, map[string]string{
+		"bin/go":   "#!/bin/sh\nprintf 'niced=%s' \"${BILLET_NICED-}\"\n" + recordArgv + "\n",
+		"bin/nice": niceStandIn,
+	})
+
+	out, err := gateCommand(t, root, "scripts/gates/test.sh", env...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("gates/test.sh: %v (%s)", err, out)
+	}
+
+	return strings.TrimSpace(string(out))
+}
+
 // THE RACE SUITE TAKES THE LOCAL CAPS BY DEFAULT, AND CI'S RUN TAKES NONE: at
 // most TEST_PARALLEL packages at once (4 unless set) under `nice -n 10` locally,
 // go test's own -p and no nice under CI or with both set empty, over the whole
-// tree with atomic coverage into the named profile. `go` and `nice` are
-// stand-ins first on PATH that print the line they were given.
+// tree with atomic coverage into the named profile.
 func TestTheRaceSuiteTakesTheLocalCapsAndCIsNone(t *testing.T) {
 	t.Parallel()
 
-	const suite = "-race -count=1 -timeout 35m -covermode=atomic -coverprofile=c.out ./..."
+	suite := []string{"-race", "-count=1", "-timeout", "35m", "-covermode=atomic", "-coverprofile=c.out", "./..."}
 
 	for name, tc := range map[string]struct {
 		env  []string
 		want string
 	}{
-		"local, by default":    {want: "niced=yes test -p 4 " + suite},
-		"local, three at once": {env: []string{"TEST_PARALLEL=3"}, want: "niced=yes test -p 3 " + suite},
-		"under CI":             {env: []string{"CI=true", "TEST_PARALLEL=3"}, want: "niced= test " + suite},
-		"local, both lifted":   {env: []string{"NICE=", "TEST_PARALLEL="}, want: "niced= test " + suite},
+		"local, by default":    {want: "niced=yes" + argv(append([]string{"test", "-p", "4"}, suite...)...)},
+		"local, three at once": {env: []string{"TEST_PARALLEL=3"}, want: "niced=yes" + argv(append([]string{"test", "-p", "3"}, suite...)...)},
+		"under CI":             {env: []string{"CI=true", "TEST_PARALLEL=3"}, want: "niced=" + argv(append([]string{"test"}, suite...)...)},
+		"local, both lifted":   {env: []string{"NICE=", "TEST_PARALLEL="}, want: "niced=" + argv(append([]string{"test"}, suite...)...)},
 	} {
-		root := gateFixture(t, []string{"test.sh"}, true, map[string]string{
-			"bin/go":   "#!/bin/sh\necho \"niced=${BILLET_NICED-} $*\"\n",
-			"bin/nice": niceStandIn,
-		})
-
-		cmd := exec.CommandContext(t.Context(), filepath.Join(root, "scripts", "gates", "test.sh"))
-		cmd.Env = gateEnv(filepath.Join(root, "bin"), append(tc.env, "COVERPROFILE=c.out")...)
-
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s: gates/test.sh: %v (%s)", name, err, out)
-		}
-
-		if got := strings.TrimSpace(string(out)); got != tc.want {
+		if got := raceSuite(t, append(tc.env, "COVERPROFILE=c.out")...); got != tc.want {
 			t.Errorf("%s: the suite would run as %q, want %q", name, got, tc.want)
 		}
+	}
+}
+
+// THE LOCAL RACE SUITE IS CI'S: the arguments test.sh hands go under CI are the
+// test job's own go test, but for what changes only the output (-json, which the
+// job pipes through jq, and the profile's name) and -vet=off (the gates vet in a
+// step of their own; the local suite vetting again only adds a check).
+func TestTheLocalRaceSuiteRunsCIsFlags(t *testing.T) {
+	t.Parallel()
+
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Run string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join("..", ".github", "workflows", "ci.yml"))), &workflow); err != nil {
+		t.Fatal(err)
+	}
+
+	var ci []string
+
+	for _, step := range workflow.Jobs["test"].Steps {
+		for line := range strings.SplitSeq(strings.ReplaceAll(step.Run, "\\\n", " "), "\n") {
+			if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "go test -race "); ok {
+				command, _, _ := strings.Cut(rest, " |")
+				ci = append([]string{"test", "-race"}, strings.Fields(command)...)
+			}
+		}
+	}
+
+	if ci == nil {
+		t.Fatal("the test job runs no `go test -race`")
+	}
+
+	local := strings.Split(strings.TrimPrefix(raceSuite(t, "CI=true"), "niced= ["), "] [")
+	local[len(local)-1] = strings.TrimSuffix(local[len(local)-1], "]")
+
+	normal := func(args []string) []string {
+		var out []string
+
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			if slices.Contains([]string{"-timeout", "-run", "-skip", "-tags", "-p", "-parallel", "-coverpkg"}, a) && i+1 < len(args) {
+				a += "=" + args[i+1]
+				i++
+			}
+
+			if a == "-json" || a == "-vet=off" || strings.HasPrefix(a, "-coverprofile=") {
+				continue
+			}
+
+			out = append(out, a)
+		}
+
+		slices.Sort(out)
+
+		return out
+	}
+
+	if !slices.Equal(normal(ci), normal(local)) {
+		t.Errorf("test.sh hands go %v and CI's test job runs %v", normal(local), normal(ci))
 	}
 }
 
@@ -282,27 +398,23 @@ func TestToolsInstallsEveryToolAtItsPin(t *testing.T) {
 
 	v := toolVersions(t)
 	root := gateFixture(t, []string{"tools.sh"}, true, map[string]string{
-		"bin/go": "#!/bin/sh\necho \"GOEXPERIMENT=${GOEXPERIMENT-} $*\"\n",
+		"bin/go": "#!/bin/sh\nprintf 'GOEXPERIMENT=%s' \"${GOEXPERIMENT-}\"\n" + recordArgv + "\n",
 	})
 
-	cmd := exec.CommandContext(t.Context(), filepath.Join(root, "scripts", "gates", "tools.sh"))
-	cmd.Env = gateEnv(filepath.Join(root, "bin"))
-
-	out, err := cmd.CombinedOutput()
+	out, err := gateCommand(t, root, "scripts/gates/tools.sh").CombinedOutput()
 	if err != nil {
 		t.Fatalf("gates/tools.sh: %v (%s)", err, out)
 	}
 
-	for _, want := range []string{
-		"GOEXPERIMENT= install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@" + v["GOLANGCI_VERSION"] + "\n",
-		"GOEXPERIMENT= install github.com/goreleaser/goreleaser/v2@" + v["GORELEASER_VERSION"] + "\n",
-		"GOEXPERIMENT= install github.com/sqlc-dev/sqlc/cmd/sqlc@" + v["SQLC_VERSION"] + "\n",
-		"GOEXPERIMENT= install github.com/terraform-linters/tflint@" + v["TFLINT_VERSION"] + "\n",
-		"GOEXPERIMENT=jsonv2 install github.com/aquasecurity/trivy/cmd/trivy@" + v["TRIVY_VERSION"] + "\n",
-	} {
-		if !strings.Contains(string(out), want) {
-			t.Errorf("gates/tools.sh did not run %q:\n%s", want, out)
-		}
+	want := strings.Join([]string{
+		"GOEXPERIMENT=" + argv("install", "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@"+v["GOLANGCI_VERSION"]),
+		"GOEXPERIMENT=" + argv("install", "github.com/goreleaser/goreleaser/v2@"+v["GORELEASER_VERSION"]),
+		"GOEXPERIMENT=" + argv("install", "github.com/sqlc-dev/sqlc/cmd/sqlc@"+v["SQLC_VERSION"]),
+		"GOEXPERIMENT=" + argv("install", "github.com/terraform-linters/tflint@"+v["TFLINT_VERSION"]),
+		"GOEXPERIMENT=jsonv2" + argv("install", "github.com/aquasecurity/trivy/cmd/trivy@"+v["TRIVY_VERSION"]),
+	}, "\n") + "\n"
+	if string(out) != want {
+		t.Errorf("gates/tools.sh ran\n%s\nwant\n%s", out, want)
 	}
 }
 
@@ -314,10 +426,7 @@ func TestAGateRefusesACheckoutWithNoPinFile(t *testing.T) {
 		"bin/go": "#!/bin/sh\necho the suite ran\n",
 	})
 
-	cmd := exec.CommandContext(t.Context(), filepath.Join(root, "scripts", "gates", "test.sh"))
-	cmd.Env = gateEnv(filepath.Join(root, "bin"))
-
-	out, err := cmd.CombinedOutput()
+	out, err := gateCommand(t, root, "scripts/gates/test.sh").CombinedOutput()
 
 	exit, ok := errors.AsType[*exec.ExitError](err)
 	if !ok || exit.ExitCode() != 2 || !strings.Contains(string(out), ".github/tool-versions.env is missing") ||
@@ -326,75 +435,86 @@ func TestAGateRefusesACheckoutWithNoPinFile(t *testing.T) {
 	}
 }
 
-// THE FULL GATE'S STEPS ARE THE GATE'S, IN ITS ORDER: no-mutants first, because
-// an interrupted mutation run leaves a mutant every later step would pass, and
-// the rest as CI runs them one by one. CI never runs check-steps.sh, so this is
-// what holds its list.
-func TestTheFullGateRunsItsStepsInOrder(t *testing.T) {
+// THE FULL GATE RUNS ITS STEPS, IN ITS ORDER, AND STOPS AT THE FIRST THAT FAILS:
+// no-mutants first, because an interrupted mutation run leaves a mutant every
+// later step would pass, and the rest as CI runs them one by one. CI never runs
+// check-steps.sh, so this is what holds it. Every step is a stand-in that records
+// its name and fails when FAIL names it.
+func TestTheFullGateRunsItsStepsInOrderAndStopsAtAFailure(t *testing.T) {
 	t.Parallel()
 
-	var steps []string
-
-	for line := range strings.SplitSeq(readFile(t, filepath.Join("gates", "check-steps.sh")), "\n") {
-		if rest, ok := strings.CutPrefix(line, "step "); ok {
-			steps = append(steps, strings.Fields(rest)[0])
-		}
+	stand := func(name string) string {
+		return "#!/bin/sh\necho " + name + " \"$@\" >> \"$STEPS\"\n[ \"${FAIL-}\" != " + name + " ]\n"
+	}
+	executables := map[string]string{
+		"scripts/check-no-mutants.py":     "import os\nopen(os.environ['STEPS'], 'a').write('no-mutants\\n')\n",
+		"bin/go":                          stand("go"),
+		"scripts/check-module-sources.sh": stand("module-sources"),
 	}
 
-	want := []string{"no-mutants", "build", "vet", "fmt-check", "lint", "lint-custom", "test", "lambda-test", "module-sources"}
-	if !slices.Equal(steps, want) {
-		t.Errorf("check-steps.sh runs %v, want %v", steps, want)
+	for _, step := range []string{"build", "fmt-check", "lint", "lint-custom", "test", "lambda-test"} {
+		executables["scripts/gates/"+step+".sh"] = stand(step)
+	}
+
+	all := []string{"no-mutants", "build", "go vet ./...", "fmt-check", "lint", "lint-custom", "test", "lambda-test",
+		"module-sources"}
+
+	for _, tc := range []struct {
+		fail string
+		want []string
+	}{
+		{"", all},
+		{"lint", all[:5]},
+	} {
+		root := gateFixture(t, []string{"check-steps.sh"}, true, executables)
+		steps := filepath.Join(t.TempDir(), "steps")
+
+		out, err := gateCommand(t, root, "scripts/gates/check-steps.sh", "STEPS="+steps, "FAIL="+tc.fail).CombinedOutput()
+		if (err != nil) != (tc.fail != "") {
+			t.Errorf("FAIL=%q: check-steps.sh = %v (%s)", tc.fail, err, out)
+		}
+
+		var got []string
+
+		for line := range strings.SplitSeq(strings.TrimSpace(readFile(t, steps)), "\n") {
+			got = append(got, strings.TrimSpace(line))
+		}
+
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("FAIL=%q: check-steps.sh ran %q, want %q", tc.fail, got, tc.want)
+		}
 	}
 }
 
 // THE LINTER RUNS FOR LINUX AS WELL AS THE HOST, because a linter sees only the
 // files it would compile; CI's lint job runs the action rather than lint.sh, so
-// this is what holds the second pass.
-func TestTheLintGateLintsForLinuxToo(t *testing.T) {
+// this is what holds the second pass. A checkout path holding glob syntax is
+// refused before either runs.
+func TestTheLintGateLintsForTheHostAndLinux(t *testing.T) {
 	t.Parallel()
 
-	lint := readFile(t, filepath.Join("gates", "lint.sh"))
-	if !regexp.MustCompile(`(?m)^GOOS=linux GOARCH=amd64 .*golangci-lint run `).MatchString(lint) {
-		t.Error("lint.sh has no golangci-lint pass for GOOS=linux GOARCH=amd64")
+	lint := map[string]string{"bin/golangci-lint": "#!/bin/sh\nprintf 'GOOS=%s GOARCH=%s' \"${GOOS-}\" \"${GOARCH-}\"\n" +
+		recordArgv + "\n"}
+	pass := argv("run", "--timeout=15m", "--allow-serial-runners")
+
+	root := gateFixture(t, []string{"lint.sh"}, true, lint)
+
+	out, err := gateCommand(t, root, "scripts/gates/lint.sh", "CI=true").CombinedOutput()
+	if err != nil {
+		t.Fatalf("gates/lint.sh: %v (%s)", err, out)
 	}
 
-	if !strings.Contains(lint, "*[][*?{}]*)") {
-		t.Error("lint.sh no longer refuses a checkout path holding glob syntax")
-	}
-}
-
-// THE LOCAL RACE SUITE IS CI'S: test.sh and the test job's go test run the same
-// flags over the same tree, so a local run is the gate CI runs, caps aside.
-func TestTheLocalRaceSuiteRunsCIsFlags(t *testing.T) {
-	t.Parallel()
-
-	flags := func(line string) []string {
-		var out []string
-		for _, f := range strings.Fields(line) {
-			if f == "-race" || f == "./..." || strings.HasPrefix(f, "-count=") || strings.HasPrefix(f, "-covermode=") {
-				out = append(out, f)
-			}
-		}
-
-		if i := strings.Index(line, "-timeout "); i >= 0 {
-			out = append(out, strings.Fields(line[i:])[1])
-		}
-
-		slices.Sort(out)
-
-		return out
+	if want := "GOOS= GOARCH=" + pass + "\nGOOS=linux GOARCH=amd64" + pass + "\n"; string(out) != want {
+		t.Errorf("gates/lint.sh ran\n%s\nwant\n%s", out, want)
 	}
 
-	ciLine := regexp.MustCompile(`go test -race -count=1 -timeout \S+ .*\./\.{3}`).FindString(
-		readFile(t, filepath.Join("..", ".github", "workflows", "ci.yml")))
-	local := strings.Join(strings.Fields(strings.ReplaceAll(readFile(t, filepath.Join("gates", "test.sh")), "\\\n", " ")), " ")
-	localLine := regexp.MustCompile(`test \$\{test_p\[@\]\+"\$\{test_p\[@\]\}"\} -race -count=1 -timeout \S+ .*\./\.{3}`).FindString(local)
+	globbed := filepath.Join(t.TempDir(), "billet[2]")
+	gateFixtureAt(t, globbed, []string{"lint.sh"}, true, lint)
 
-	if ciLine == "" || localLine == "" {
-		t.Fatalf("could not find the race suite's line: ci.yml %q, test.sh %q", ciLine, localLine)
-	}
+	out, err = gateCommand(t, globbed, "scripts/gates/lint.sh", "CI=true").CombinedOutput()
 
-	if !slices.Equal(flags(ciLine), flags(localLine)) {
-		t.Errorf("test.sh runs %v and CI's test job %v", flags(localLine), flags(ciLine))
+	exit, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "glob syntax") || strings.Contains(string(out), "GOOS=") {
+		t.Errorf("gates/lint.sh under %s = %v, %q; want exit 1 naming the glob, and no lint run", globbed, err, out)
 	}
 }

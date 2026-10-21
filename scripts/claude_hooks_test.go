@@ -484,6 +484,12 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"source scripts/gates/check.sh", gate},
 		{"source -- scripts/gates/check.sh", gate},
 		{"cd scripts/gates && . check.sh", gate},
+		{"cd scripts/gates && source -p . test.sh", gate},
+		{"source -p" + root + "/scripts/gates test.sh", gate},
+		{"source -p /nowhere: test.sh", ""},
+		{"bash -s +c scripts/gates/check.sh", gate},
+		{"bash +c 'scripts/gates/check.sh'", gate},
+		{"bash +s scripts/gates/check.sh", ""},
 		{"bash g/../gates/test.sh", gate},
 		{"bash -o pipefail -c 'git push --force origin junior-oct03-work'", "force"},
 		{"golangci-lint run > /tmp/lint.log", module},
@@ -582,6 +588,9 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"cat scripts/gates/check.sh", ""},
 		{". scripts/gates/env.sh", ""},
 		{"source", ""},
+		{"source test.sh", ""},
+		{"source -x scripts/gates/check.sh", ""},
+		{"source -p /nowhere test.sh", ""},
 		{"/tmp/other/scripts/gates/check.sh", ""},
 		{"nice -n 10 scripts/gates/verify.sh", ""},
 		{"scripts/gates/verify.sh > /tmp/verify.log 2>&1", ""},
@@ -645,6 +654,9 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"CI=true", "go test -race ./...", ""},
 		{"CI=true", "git worktree add ../billet-feature", ""},
 		{"CI=true", "git rebase main", "merging"},
+		// A sourced name without a slash is looked for in the hook's PATH.
+		{"PATH=" + filepath.Join(root, "scripts", "gates") + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"source test.sh", gate},
 	} {
 		code, stderr := runClaudeGuard(t, "bash", root, bashPayload(root, tc.command), tc.env)
 		expectHook(t, tc.env+" "+tc.command, code, stderr, tc.refuse)
