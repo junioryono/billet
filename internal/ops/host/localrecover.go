@@ -236,16 +236,8 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 		}
 	}()
 
-	// THE STAGE AGAIN, UNDER THE LOCK. It was read before the lock so the
-	// quiesce could run, and another command (an abandon, above all) may have
-	// changed the journal while this one waited; acting on the stale stage would
-	// skip Execute's re-plan and seal a ledger that command is putting back.
-	switch again, err := recoveryStageOf(target.StateDir, archive); {
-	case err != nil:
+	if err := restageUnderLock(target.StateDir, archive, stage); err != nil {
 		return err
-	case again != stage:
-		return fmt.Errorf("another command changed this recovery while this one waited for the "+
-			"lifecycle lock (it was %v and is now %v); run it again", stage, again)
 	}
 
 	var res deployarchive.Result
@@ -330,6 +322,41 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 
 // recoveryStage is how far an earlier attempt at THIS recovery got.
 type recoveryStage int
+
+// String names a stage for a diagnostic.
+func (s recoveryStage) String() string {
+	switch s {
+	case recoverFresh:
+		return "fresh"
+	case recoverResume:
+		return "resuming"
+	case recoverPublished:
+		return "published"
+	}
+
+	return fmt.Sprintf("stage %d", int(s))
+}
+
+// restageUnderLock reads a recovery's stage again once the lifecycle lock is
+// held, and refuses a change.
+//
+// THE FIRST READ PRECEDES THE LOCK so the quiesce can run, and another command
+// (an abandon, above all) may change the journal while this one waits: acting
+// on the stale stage would skip Execute's re-plan and seal a ledger that command
+// is putting back.
+func restageUnderLock(stateDir string, a *deployarchive.Archive, stage recoveryStage) error {
+	again, err := recoveryStageOf(stateDir, a)
+	if err != nil {
+		return err
+	}
+
+	if again != stage {
+		return fmt.Errorf("another command changed this recovery while this one waited for the "+
+			"lifecycle lock (it was %v and is now %v); run it again", stage, again)
+	}
+
+	return nil
+}
 
 const (
 	// recoverFresh: nothing of this recovery is here. Seal, prove it quiet,

@@ -60,8 +60,9 @@ func TestARecoveryProvesItsDatabaseBeforeItSeals(t *testing.T) {
 
 // AND IT READS ITS STAGE AGAIN ONCE IT HOLDS THE LIFECYCLE LOCK: the first read
 // precedes the lock so the quiesce can run, and an abandon may change the
-// journal while this run waits, so runLocalRecover calls recoveryStageOf after
-// lifecycleLock and before it seals.
+// journal while this run waits, so runLocalRecover calls restageUnderLock after
+// lifecycleLock and before it seals. What restageUnderLock decides is
+// TestAStageThatChangedWhileWaitingIsRefused's.
 func TestARecoveryReadsItsStageAgainUnderTheLock(t *testing.T) {
 	file, err := parser.ParseFile(token.NewFileSet(), "localrecover.go", nil, 0)
 	if err != nil {
@@ -90,7 +91,7 @@ func TestARecoveryReadsItsStageAgainUnderTheLock(t *testing.T) {
 					if lock == token.NoPos {
 						lock = call.Pos()
 					}
-				case "recoveryStageOf":
+				case "restageUnderLock":
 					stages = append(stages, call.Pos())
 				case "sealRecoveredDeployment":
 					if seal == token.NoPos {
@@ -113,5 +114,5 @@ func TestARecoveryReadsItsStageAgainUnderTheLock(t *testing.T) {
 		}
 	}
 
-	t.Fatal("runLocalRecover does not read its stage again between taking the lifecycle lock and sealing")
+	t.Fatal("runLocalRecover does not call restageUnderLock between taking the lifecycle lock and sealing")
 }

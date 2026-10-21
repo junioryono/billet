@@ -2170,3 +2170,67 @@ func TestARecoveryStopsAtAnAbandonThatHasBegun(t *testing.T) {
 		}
 	}
 }
+
+// A STAGE THAT CHANGED WHILE THE RUN WAITED FOR THE LIFECYCLE LOCK IS REFUSED,
+// naming both; an unchanged one goes on; an abandon that began is refused as
+// itself.
+func TestAStageThatChangedWhileWaitingIsRefused(t *testing.T) {
+	f := newBackupFixture(t, true)
+	archive := backupInto(t, f)
+
+	a, err := deployarchive.Open(t.Context(), archive)
+	if err != nil {
+		t.Fatalf("open the archive: %v", err)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(archive, deployarchive.EntryManifest))
+	if err != nil {
+		t.Fatalf("read the archive manifest: %v", err)
+	}
+
+	sum := sha256.Sum256(manifest)
+
+	if err := restageUnderLock(f.stateDir, a, recoverFresh); err != nil {
+		t.Fatalf("an unchanged fresh stage: %v", err)
+	}
+
+	stage := func(abandoning bool) {
+		journal := fmt.Appendf(nil,
+			`{"schema":3,"intent":"recover","phase":"published","abandoning":%t,"archive_dir":%q,"manifest_sha256":%q}`,
+			abandoning, a.Dir, hex.EncodeToString(sum[:]))
+		if err := os.WriteFile(deployarchive.JournalPath(f.stateDir), journal, 0o600); err != nil {
+			t.Fatalf("stage the journal: %v", err)
+		}
+	}
+
+	// ANOTHER RUN PUBLISHED while this one, which read "fresh", waited.
+	stage(false)
+
+	if err := restageUnderLock(f.stateDir, a, recoverFresh); err == nil ||
+		!strings.Contains(err.Error(), "it was fresh and is now published") {
+		t.Errorf("a stage that changed while waiting = %v, want a refusal naming both", err)
+	}
+
+	if err := restageUnderLock(f.stateDir, a, recoverPublished); err != nil {
+		t.Errorf("an unchanged published stage: %v", err)
+	}
+
+	// AN ABANDON BEGAN while it waited.
+	stage(true)
+
+	if err := restageUnderLock(f.stateDir, a, recoverPublished); err == nil ||
+		!strings.Contains(err.Error(), "--abandon") {
+		t.Errorf("a stage whose abandon began while waiting = %v, want a refusal naming --abandon", err)
+	}
+
+	// AN ABANDON FINISHED while it waited, removing the journal: a run that read
+	// "published" would otherwise take the shortcut and seal the put-back ledger.
+	if err := os.Remove(deployarchive.JournalPath(f.stateDir)); err != nil {
+		t.Fatalf("remove the journal: %v", err)
+	}
+
+	if err := restageUnderLock(f.stateDir, a, recoverPublished); err == nil ||
+		!strings.Contains(err.Error(), "it was published and is now fresh") {
+		t.Errorf("a published stage whose journal went while waiting = %v, want a refusal naming both", err)
+	}
+}
