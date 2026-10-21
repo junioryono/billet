@@ -233,16 +233,21 @@ ON CONFLICT (lease_id) DO UPDATE SET
 -- and an archive arriving from a caller that did not load them must not blank an
 -- observation already here. The generation moves with the image-cache token, so
 -- a report never shows a generation with nothing to attribute it to.
+--
+-- THE HOLDER IS THE LEASE'S LAST, the node process that held the compute when
+-- the lease ended (migration 65), and an archive from a caller that did not
+-- load it keeps what an earlier one wrote.
 INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
-      sticky_cache, git_cache, bazel_cache, go_cache, queued_at, finished_at)
+      sticky_cache, git_cache, bazel_cache, go_cache, holder_incarnation, queued_at,
+      finished_at)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @conclusion, @failure_reason,
         @disruption, @disrupted_at, @chosen_provider, @instance_type, @vcpu, @memory,
         @site, @price_micros_per_hour, @image_cache, @cache_generation,
         @actions_cache, @sticky_cache, @git_cache, @bazel_cache, @go_cache,
-        @queued_at, @finished_at)
+        @holder_incarnation, @queued_at, @finished_at)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
@@ -273,7 +278,38 @@ ON CONFLICT (lease_id) DO UPDATE SET
   bazel_cache      = CASE WHEN job_history.bazel_cache = ''
                           THEN excluded.bazel_cache ELSE job_history.bazel_cache END,
   go_cache         = CASE WHEN job_history.go_cache = ''
-                          THEN excluded.go_cache ELSE job_history.go_cache END;
+                          THEN excluded.go_cache ELSE job_history.go_cache END,
+  holder_incarnation = CASE WHEN excluded.holder_incarnation != ''
+                            THEN excluded.holder_incarnation
+                            ELSE job_history.holder_incarnation END;
+
+-- name: RecordJobPhase :exec
+-- Record when a lease first entered a phase, on the row that outlives it.
+--
+-- EACH COLUMN IS WRITE-ONCE, and the phase's own: a repeated move into a phase,
+-- or a move into another, keeps the first time. The incarnation travels with
+-- the launch, read from the lease, which Bind wrote as the process launching
+-- it. A lease with no history row ran no job and updates nothing. Every
+-- comparison reads the row as it was before this statement, so the launch's
+-- incarnation is written exactly when its time is.
+UPDATE job_history
+   SET launched_at = CASE WHEN CAST(@phase AS TEXT) = 'launching' AND launched_at = ''
+                          THEN CAST(@at AS TEXT) ELSE launched_at END,
+       launch_incarnation = CASE WHEN CAST(@phase AS TEXT) = 'launching' AND launched_at = ''
+                                 THEN CAST(@incarnation AS TEXT) ELSE launch_incarnation END,
+       custody_at = CASE WHEN CAST(@phase AS TEXT) = 'custody' AND custody_at = ''
+                         THEN CAST(@at AS TEXT) ELSE custody_at END,
+       teardown_at = CASE WHEN CAST(@phase AS TEXT) = 'teardown' AND teardown_at = ''
+                          THEN CAST(@at AS TEXT) ELSE teardown_at END,
+       quarantined_at = CASE WHEN CAST(@phase AS TEXT) = 'quarantine' AND quarantined_at = ''
+                             THEN CAST(@at AS TEXT) ELSE quarantined_at END
+ WHERE lease_id = @lease_id;
+
+-- name: RecordJobRegistration :exec
+-- Record when the plane journaled the runner it minted for a lease, and
+-- GitHub's id for it, once.
+UPDATE job_history SET registered_at = @registered_at, runner_id = @runner_id
+ WHERE lease_id = @lease_id AND registered_at = '';
 
 -- name: ReadJobPlacement :one
 -- What one lease was charged for and what the cache did, from the row that
@@ -371,9 +407,26 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(request_id, 0) AS request_id, github_job_id,
        COALESCE(repo, '') AS repo, workflow_ref, job_name, event,
        COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
-       queued_at, COALESCE(assigned_at, '') AS assigned_at,
+       disrupted_at, queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
        chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
-       detail_retired_at
+       detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
+       sticky_cache, git_cache, bazel_cache, go_cache, launched_at, registered_at,
+       runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
+       holder_incarnation
   FROM job_history WHERE lease_id = @lease_id;
+
+-- name: ListJobsOfRun :many
+-- The leases whose jobs belong to one of GitHub's workflow runs, oldest
+-- assignment first, bounded.
+--
+-- THE RUN IS THE ONE THAT STARTED, as ListJobsAwaitingQueueTime reads it:
+-- github_run_id, which the JobStarted wrote, and run_id only for a row with
+-- none. A pooled runner launched for one run's job may be given another run's,
+-- and is then that other run's; a lease that never started is the run it was
+-- assigned. The two arms are separate so each is served by its own index.
+SELECT lease_id FROM job_history
+ WHERE github_run_id = @run_id OR (github_run_id = 0 AND run_id = @run_id)
+ ORDER BY COALESCE(assigned_at, queued_at), lease_id
+ LIMIT CAST(@max_rows AS BIGINT);

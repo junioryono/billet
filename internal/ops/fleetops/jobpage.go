@@ -225,7 +225,7 @@ func identityFields(rec alloc.JobRecord) []pageField {
 		run = strconv.FormatInt(rec.RunID, 10)
 	}
 
-	return []pageField{
+	fields := []pageField{
 		{Label: "repository", Value: orNotRecorded(rec.Repo)},
 		{Label: "workflow", Value: orNotRecorded(rec.Job.WorkflowRef)},
 		{Label: "job", Value: orNotRecorded(rec.Job.Name)},
@@ -247,6 +247,9 @@ func identityFields(rec alloc.JobRecord) []pageField {
 		{Label: "shape", Value: shape},
 		{Label: "lease", Value: rec.LeaseID},
 	}
+	renderLifecycle(collect(&fields), rec)
+
+	return fields
 }
 
 func orNotRecorded(s string) string {

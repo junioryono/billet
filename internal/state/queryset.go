@@ -149,6 +149,7 @@ type ReadOps interface {
 	ListRetirableJobDetail(ctx context.Context, arg ledgerdb.ListRetirableJobDetailParams) ([]string, error)
 	ListJobsAwaitingQueueTime(ctx context.Context,
 		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
+	ListJobsOfRun(ctx context.Context, arg ledgerdb.ListJobsOfRunParams) ([]string, error)
 	ReadJobUsage(ctx context.Context, leaseID string) (ledgerdb.JobUsage, error)
 	ReadJobSeries(ctx context.Context, leaseID string) (ledgerdb.ReadJobSeriesRow, error)
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)
@@ -261,6 +262,8 @@ type WriteOps interface {
 	RecordJobAssignment(ctx context.Context, arg ledgerdb.RecordJobAssignmentParams) error
 	RecordJobResult(ctx context.Context, arg ledgerdb.RecordJobResultParams) error
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
+	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
+	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
 	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) (int64, error)
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error
 	RecordJobDestinations(ctx context.Context, arg ledgerdb.RecordJobDestinationsParams) error

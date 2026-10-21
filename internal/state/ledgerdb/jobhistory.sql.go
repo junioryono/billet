@@ -15,12 +15,13 @@ INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
-      sticky_cache, git_cache, bazel_cache, go_cache, queued_at, finished_at)
+      sticky_cache, git_cache, bazel_cache, go_cache, holder_incarnation, queued_at,
+      finished_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17,
         $18, $19, $20, $21, $22,
-        $23, $24)
+        $23, $24, $25)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
@@ -51,7 +52,10 @@ ON CONFLICT (lease_id) DO UPDATE SET
   bazel_cache      = CASE WHEN job_history.bazel_cache = ''
                           THEN excluded.bazel_cache ELSE job_history.bazel_cache END,
   go_cache         = CASE WHEN job_history.go_cache = ''
-                          THEN excluded.go_cache ELSE job_history.go_cache END
+                          THEN excluded.go_cache ELSE job_history.go_cache END,
+  holder_incarnation = CASE WHEN excluded.holder_incarnation != ''
+                            THEN excluded.holder_incarnation
+                            ELSE job_history.holder_incarnation END
 `
 
 type ArchiveJobHistoryParams struct {
@@ -77,6 +81,7 @@ type ArchiveJobHistoryParams struct {
 	GitCache           string
 	BazelCache         string
 	GoCache            string
+	HolderIncarnation  string
 	QueuedAt           string
 	FinishedAt         sql.NullString
 }
@@ -103,6 +108,10 @@ type ArchiveJobHistoryParams struct {
 // and an archive arriving from a caller that did not load them must not blank an
 // observation already here. The generation moves with the image-cache token, so
 // a report never shows a generation with nothing to attribute it to.
+//
+// THE HOLDER IS THE LEASE'S LAST, the node process that held the compute when
+// the lease ended (migration 65), and an archive from a caller that did not
+// load it keeps what an earlier one wrote.
 func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryParams) error {
 	_, err := q.db.ExecContext(ctx, archiveJobHistory,
 		arg.LeaseID,
@@ -127,6 +136,7 @@ func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryPa
 		arg.GitCache,
 		arg.BazelCache,
 		arg.GoCache,
+		arg.HolderIncarnation,
 		arg.QueuedAt,
 		arg.FinishedAt,
 	)
@@ -574,16 +584,62 @@ func (q *Queries) ListJobsAwaitingQueueTime(ctx context.Context, arg ListJobsAwa
 	return items, nil
 }
 
+const listJobsOfRun = `-- name: ListJobsOfRun :many
+SELECT lease_id FROM job_history
+ WHERE github_run_id = $1 OR (github_run_id = 0 AND run_id = $1)
+ ORDER BY COALESCE(assigned_at, queued_at), lease_id
+ LIMIT CAST($2 AS BIGINT)
+`
+
+type ListJobsOfRunParams struct {
+	RunID   int64
+	MaxRows int64
+}
+
+// The leases whose jobs belong to one of GitHub's workflow runs, oldest
+// assignment first, bounded.
+//
+// THE RUN IS THE ONE THAT STARTED, as ListJobsAwaitingQueueTime reads it:
+// github_run_id, which the JobStarted wrote, and run_id only for a row with
+// none. A pooled runner launched for one run's job may be given another run's,
+// and is then that other run's; a lease that never started is the run it was
+// assigned. The two arms are separate so each is served by its own index.
+func (q *Queries) ListJobsOfRun(ctx context.Context, arg ListJobsOfRunParams) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listJobsOfRun, arg.RunID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var lease_id string
+		if err := rows.Scan(&lease_id); err != nil {
+			return nil, err
+		}
+		items = append(items, lease_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const readJob = `-- name: ReadJob :one
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
        COALESCE(request_id, 0) AS request_id, github_job_id,
        COALESCE(repo, '') AS repo, workflow_ref, job_name, event,
        COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
-       queued_at, COALESCE(assigned_at, '') AS assigned_at,
+       disrupted_at, queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
        chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
-       detail_retired_at
+       detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
+       sticky_cache, git_cache, bazel_cache, go_cache, launched_at, registered_at,
+       runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
+       holder_incarnation
   FROM job_history WHERE lease_id = $1
 `
 
@@ -602,6 +658,7 @@ type ReadJobRow struct {
 	FailureReason            string
 	Result                   string
 	Disruption               string
+	DisruptedAt              string
 	QueuedAt                 string
 	AssignedAt               string
 	StartedAt                string
@@ -616,6 +673,22 @@ type ReadJobRow struct {
 	GithubRunnerAssignedAt   string
 	BoughtAt                 string
 	DetailRetiredAt          string
+	GithubRunID              int64
+	ImageCache               string
+	CacheGeneration          string
+	ActionsCache             string
+	StickyCache              string
+	GitCache                 string
+	BazelCache               string
+	GoCache                  string
+	LaunchedAt               string
+	RegisteredAt             string
+	RunnerID                 int64
+	CustodyAt                string
+	TeardownAt               string
+	QuarantinedAt            string
+	LaunchIncarnation        string
+	HolderIncarnation        string
 }
 
 // One job's whole history row, for `billet jobs show`.
@@ -641,6 +714,7 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.FailureReason,
 		&i.Result,
 		&i.Disruption,
+		&i.DisruptedAt,
 		&i.QueuedAt,
 		&i.AssignedAt,
 		&i.StartedAt,
@@ -655,6 +729,22 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.GithubRunnerAssignedAt,
 		&i.BoughtAt,
 		&i.DetailRetiredAt,
+		&i.GithubRunID,
+		&i.ImageCache,
+		&i.CacheGeneration,
+		&i.ActionsCache,
+		&i.StickyCache,
+		&i.GitCache,
+		&i.BazelCache,
+		&i.GoCache,
+		&i.LaunchedAt,
+		&i.RegisteredAt,
+		&i.RunnerID,
+		&i.CustodyAt,
+		&i.TeardownAt,
+		&i.QuarantinedAt,
+		&i.LaunchIncarnation,
+		&i.HolderIncarnation,
 	)
 	return i, err
 }
@@ -932,6 +1022,64 @@ func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityPa
 		arg.GithubRunID,
 		arg.LeaseID,
 	)
+	return err
+}
+
+const recordJobPhase = `-- name: RecordJobPhase :exec
+UPDATE job_history
+   SET launched_at = CASE WHEN CAST($1 AS TEXT) = 'launching' AND launched_at = ''
+                          THEN CAST($2 AS TEXT) ELSE launched_at END,
+       launch_incarnation = CASE WHEN CAST($1 AS TEXT) = 'launching' AND launched_at = ''
+                                 THEN CAST($3 AS TEXT) ELSE launch_incarnation END,
+       custody_at = CASE WHEN CAST($1 AS TEXT) = 'custody' AND custody_at = ''
+                         THEN CAST($2 AS TEXT) ELSE custody_at END,
+       teardown_at = CASE WHEN CAST($1 AS TEXT) = 'teardown' AND teardown_at = ''
+                          THEN CAST($2 AS TEXT) ELSE teardown_at END,
+       quarantined_at = CASE WHEN CAST($1 AS TEXT) = 'quarantine' AND quarantined_at = ''
+                             THEN CAST($2 AS TEXT) ELSE quarantined_at END
+ WHERE lease_id = $4
+`
+
+type RecordJobPhaseParams struct {
+	Phase       string
+	At          string
+	Incarnation string
+	LeaseID     string
+}
+
+// Record when a lease first entered a phase, on the row that outlives it.
+//
+// EACH COLUMN IS WRITE-ONCE, and the phase's own: a repeated move into a phase,
+// or a move into another, keeps the first time. The incarnation travels with
+// the launch, read from the lease, which Bind wrote as the process launching
+// it. A lease with no history row ran no job and updates nothing. Every
+// comparison reads the row as it was before this statement, so the launch's
+// incarnation is written exactly when its time is.
+func (q *Queries) RecordJobPhase(ctx context.Context, arg RecordJobPhaseParams) error {
+	_, err := q.db.ExecContext(ctx, recordJobPhase,
+		arg.Phase,
+		arg.At,
+		arg.Incarnation,
+		arg.LeaseID,
+	)
+	return err
+}
+
+const recordJobRegistration = `-- name: RecordJobRegistration :exec
+UPDATE job_history SET registered_at = $1, runner_id = $2
+ WHERE lease_id = $3 AND registered_at = ''
+`
+
+type RecordJobRegistrationParams struct {
+	RegisteredAt string
+	RunnerID     int64
+	LeaseID      string
+}
+
+// Record when the plane journaled the runner it minted for a lease, and
+// GitHub's id for it, once.
+func (q *Queries) RecordJobRegistration(ctx context.Context, arg RecordJobRegistrationParams) error {
+	_, err := q.db.ExecContext(ctx, recordJobRegistration, arg.RegisteredAt, arg.RunnerID, arg.LeaseID)
 	return err
 }
 

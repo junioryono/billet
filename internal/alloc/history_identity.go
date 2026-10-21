@@ -131,6 +131,28 @@ type JobRecord struct {
 	// were deleted past their retention, empty while they are kept or for a job
 	// that never had them.
 	DetailRetiredAt string
+	// GitHubRunID is the run of the job that started, which for a pooled runner
+	// may differ from RunID; zero is not recorded.
+	GitHubRunID int64
+	DisruptedAt string
+	// Caches is what the node observed each cache do for the job, first
+	// observation kept. An empty token is not observed, and a token this binary
+	// does not know is a newer binary's, kept verbatim.
+	Caches CacheObservation
+	// LaunchedAt, RegisteredAt, CustodyAt, TeardownAt and QuarantinedAt are when
+	// the lease first entered each part of its life, on billet's clock, and
+	// RunnerID is GitHub's id for the runner registered; empty or zero is not
+	// recorded (never entered, or a row from before migration 65).
+	LaunchedAt    string
+	RegisteredAt  string
+	RunnerID      int64
+	CustodyAt     string
+	TeardownAt    string
+	QuarantinedAt string
+	// LaunchIncarnation is the node process that began the launch, and
+	// HolderIncarnation the one that held the compute when the lease ended.
+	LaunchIncarnation string
+	HolderIncarnation string
 }
 
 // Job reads one lease's history row. A lease that was never assigned a job is
@@ -158,6 +180,16 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			GitHubQueuedAt: row.GithubQueuedAt, GitHubScaleSetAssignedAt: row.GithubScaleSetAssignedAt,
 			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, BoughtAt: row.BoughtAt,
 			DetailRetiredAt: row.DetailRetiredAt,
+			GitHubRunID:     row.GithubRunID, DisruptedAt: row.DisruptedAt,
+			Caches: CacheObservation{
+				ImageCache: ImageCache(row.ImageCache), CacheGeneration: row.CacheGeneration,
+				ActionsCache: ActionsCache(row.ActionsCache),
+				BuildCaches: BuildCaches{Sticky: BuildCache(row.StickyCache), Git: BuildCache(row.GitCache),
+					Bazel: BuildCache(row.BazelCache), Go: BuildCache(row.GoCache)},
+			},
+			LaunchedAt: row.LaunchedAt, RegisteredAt: row.RegisteredAt, RunnerID: row.RunnerID,
+			CustodyAt: row.CustodyAt, TeardownAt: row.TeardownAt, QuarantinedAt: row.QuarantinedAt,
+			LaunchIncarnation: row.LaunchIncarnation, HolderIncarnation: row.HolderIncarnation,
 		}
 		return nil
 	})

@@ -80,6 +80,16 @@ func (a *Allocator) RegisterPoolRunner(ctx context.Context, runner PoolRunner) e
 			return fmt.Errorf("alloc: register pool runner %q: %w", runner.RunnerName, err)
 		}
 
+		// THE REGISTRATION IS PART OF THE JOB'S STORY, kept on the row that
+		// outlives the lease and this binding alike.
+		if err := q.RecordJobRegistration(ctx, ledgerdb.RecordJobRegistrationParams{
+			RegisteredAt: ts(a.now()),
+			RunnerID:     max(runner.RunnerID, 0),
+			LeaseID:      runner.LeaseID,
+		}); err != nil {
+			return fmt.Errorf("alloc: record the registration of pool runner %q: %w", runner.RunnerName, err)
+		}
+
 		return nil
 	})
 }

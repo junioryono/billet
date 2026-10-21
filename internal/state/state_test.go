@@ -1131,6 +1131,16 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	// data. The declarations themselves are checked structurally elsewhere.
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`DROP INDEX job_history_github_run_idx`,
+			`DROP INDEX job_history_run_idx`,
+			`ALTER TABLE job_history DROP COLUMN launched_at`,
+			`ALTER TABLE job_history DROP COLUMN registered_at`,
+			`ALTER TABLE job_history DROP COLUMN runner_id`,
+			`ALTER TABLE job_history DROP COLUMN custody_at`,
+			`ALTER TABLE job_history DROP COLUMN teardown_at`,
+			`ALTER TABLE job_history DROP COLUMN quarantined_at`,
+			`ALTER TABLE job_history DROP COLUMN launch_incarnation`,
+			`ALTER TABLE job_history DROP COLUMN holder_incarnation`,
 			`ALTER TABLE leases DROP COLUMN github_target`,
 			`DROP INDEX job_history_detail_retired_at`,
 			`DROP INDEX job_usage_destinations_kept`,
@@ -1256,6 +1266,8 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	requireIndex(t, upgraded, "pending_completions_lease_idx")
 	requireIndex(t, upgraded, "job_guest_reports_recorded_at")
 	requireIndex(t, upgraded, "job_history_started_idx")
+	requireIndex(t, upgraded, "job_history_github_run_idx")
+	requireIndex(t, upgraded, "job_history_run_idx")
 
 	// THE SINGLETON EXISTS AFTER AN UPGRADE, and is open. A deployment that
 	// upgraded into a sealed or absent admission row would stop taking work with
