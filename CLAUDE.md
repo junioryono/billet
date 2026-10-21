@@ -50,7 +50,7 @@ Layering is enforced by `depguard` in `.golangci.yml`, not by convention: `confi
 ## Commands
 
 ```bash
-make verify      # THE CHECK WHILE WORKING: gofmt, go build ./..., then vet, tests (no -race) and golangci-lint on the changed packages only; says what it ran and why
+make verify      # THE CHECK WHILE WORKING: gofmt, go build ./..., then vet, tests (no -race) and golangci-lint on the changed packages only; says what it ran and why; one run at a time per machine (the shared check lock)
 make build       # ./bin/billet
 make docs        # Sphinx with -W, as CI and Read the Docs run it (15 s); make verify runs it when docs/ changed and sphinx-build is installed
 make sqlc        # regenerate internal/state/ledgerdb after editing queries/ or adding a migration
