@@ -119,6 +119,35 @@ if [ "$part_count" -gt 0 ]; then
 	SCHEMA=2
 fi
 
+# WHAT THE IMAGE LEAVES OUT FOR EACH DEPLOYMENT TO INSTALL (#584), as the build's
+# trial completion measured it: schema 3, with every component the build recorded
+# leaving out and the space each needs, under completion contract 1, the one the
+# image's completer speaks. A billet that cannot complete it refuses the schema or
+# the contract rather than importing an image without them.
+#
+# NO TRIAL, NO MANIFEST: a component with no measured space is one a node cannot
+# grow the image for, so a build that skipped the trial cannot be described.
+COMPONENTS_FILE="${COMPONENTS_FILE:-$WORK/components.json}"
+COMPLETION_CONTRACT=1
+components_json="[]"
+
+if [ -n "${LEFT_OUT:-}" ]; then
+	[ -r "$COMPONENTS_FILE" ] || die "the image leaves out $LEFT_OUT and no trial completion
+measured them ($COMPONENTS_FILE); a node could not grow the image to complete it"
+	[ "$part_count" -gt 0 ] || die "the image leaves out $LEFT_OUT, which only schema 3 can
+declare, and schema 3 is the multipart layout; this image was not split"
+
+	components_json=$(jq -c . "$COMPONENTS_FILE") || die "$COMPONENTS_FILE is not JSON"
+	measured=$(jq -r '[.[].name] | sort | join(" ")' <<<"$components_json")
+	recorded=$(tr ' ' '\n' <<<"$LEFT_OUT" | sort | tr '\n' ' ')
+	[ "$measured" = "${recorded% }" ] || die "the trial measured [$measured] and the build
+left out [${recorded% }]"
+	jq -e 'all(.[]; (.space | type) == "number" and .space > 0)' <<<"$components_json" >/dev/null ||
+		die "$COMPONENTS_FILE names a component without a positive space"
+
+	SCHEMA=3
+fi
+
 # BUILT BY jq, NOT BY printf. Every value here is interpolated into JSON, and a
 # hand-built document is one unescaped character away from being invalid -- or,
 # worse, valid and wrong. jq --arg escapes each one.
@@ -137,6 +166,8 @@ jq -n \
 	--arg kernel_sha "$(digest "$KERNEL")" \
 	--argjson kernel_size "$(filesize "$KERNEL")" \
 	--arg kernel_version "$kernel_version" \
+	--argjson components "$components_json" \
+	--arg completion_contract "$COMPLETION_CONTRACT" \
 	'{
 		schema: $schema,
 		guest_contract: $contract,
@@ -165,4 +196,8 @@ jq -n \
 			size: $kernel_size,
 			version: $kernel_version,
 		},
-	}'
+	}
+	+ (if $schema == 3 then {
+		components: $components,
+		completion_contract: $completion_contract,
+	} else {} end)'

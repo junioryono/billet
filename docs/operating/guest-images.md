@@ -4,7 +4,7 @@ A Firecracker job boots a **golden image**: an Ubuntu 24.04 rootfs carrying Dock
 
 ## What is in it
 
-GitHub does not publish the image its hosted runners boot; it publishes the recipe. billet vendors GitHub's own `toolset-2404.json`, pinned by digest, and builds from it, so a workflow that assumes something a hosted runner has (`openssh-client`, a particular Python minor, five JDKs, the node/go/Python/PyPy/Ruby/CodeQL toolcache) finds it here, on x64 and arm64 alike. The image carries the Android SDK at `/usr/local/lib/android/sdk` with `ANDROID_HOME` set, and what GitHub installs outside its declaration (Git LFS, yq, the AWS and Kubernetes tools, Podman, MySQL, PostgreSQL, Composer and the rest ADR-005 lists), as a hosted runner does, and is about 27 GiB used; [ADR-005](../reference/decisions/adr-005-runner-image-parity.md) records what parity costs, and [ADR-014](../reference/decisions/adr-014-guest-image-from-githubs-template.md) how the guest image builds from GitHub's own template, browsers and their drivers included.
+GitHub does not publish the image its hosted runners boot; it publishes the recipe. billet vendors GitHub's own `toolset-2404.json`, pinned by digest, and builds from it, so a workflow that assumes something a hosted runner has (`openssh-client`, a particular Python minor, five JDKs, the node/go/Python/PyPy/Ruby toolcache) finds it here, on x64 and arm64 alike. The image leaves out what billet may not redistribute (the Android SDK, the CodeQL bundle, Firefox, Google Chrome and Microsoft Edge), which a deployment that accepts them installs before it imports the image ([below](#components-the-image-leaves-out)), and carries what GitHub installs outside its declaration (Git LFS, yq, the AWS and Kubernetes tools, Podman, MySQL, PostgreSQL, Composer and the rest ADR-005 lists), as a hosted runner does, and is about 27 GiB used; [ADR-005](../reference/decisions/adr-005-runner-image-parity.md) records what parity costs, and [ADR-014](../reference/decisions/adr-014-guest-image-from-githubs-template.md) how the guest image builds from GitHub's own template, browsers and their drivers included.
 
 ## Pull, verify, promote
 
@@ -48,7 +48,7 @@ A host upgrade converges images on its own, separately from the timer: the trans
 
 ## Components the image leaves out
 
-Five parts of GitHub's runner image come under licenses that forbid billet redistributing them, so billet's published guest image is to leave them out, and each deployment installs the ones it accepts, from their vendors, on its own nodes (#584). **Today's published images still carry all five.** What follows takes effect for an image whose signed manifest says it left something out; a deployment that has accepted nothing then boots an image without them.
+Five parts of GitHub's runner image come under licenses that forbid billet redistributing them, so billet's published guest image is to leave them out, and each deployment installs the ones it accepts, from their vendors, on its own nodes (#584). billet's build skips their installers, ships GitHub's installers and tests for them inside the image at `/opt/billet/complete`, and before it publishes completes a copy of the image with each one on the builder, which proves each completes and measures the space each needs; the signed manifest declares them (schema 3). An image built before the build began leaving them out carries all five and declares none. A deployment that has accepted nothing boots an image without them.
 
 | Name | What it installs | A job without it | License |
 |---|---|---|---|

@@ -151,10 +151,32 @@ func TestTheNspawnDriverCarriesTheCommandsStatus(t *testing.T) {
 	}
 	calls := driverCalls(t, fake)
 	for _, want := range []string{"--machine=probe", "--wait --pipe", "--setenv=HOME=/root",
-		"-- env A=b /var/tmp/billet-ri/3"} {
+		"--expand-environment=no", "-- env A=b /var/tmp/billet-ri/3"} {
 		if !strings.Contains(calls, want) {
 			t.Errorf("exec did not pass %q:\n%s", want, calls)
 		}
+	}
+}
+
+// NOTHING THE DRIVER RUNS IN THE MACHINE IS READ BY systemd FIRST: every
+// systemd-run that names the machine turns its own variable expansion off, which
+// would otherwise drop an argument that begins with `$` (measured 2026-10-20).
+func TestTheNspawnDriverPassesItsArgumentsUnexpanded(t *testing.T) {
+	t.Parallel()
+
+	driver := readScriptFile(t, "runner-images-nspawn.sh")
+	runs := 0
+	for _, line := range strings.Split(driver, "\n") {
+		if !strings.Contains(line, "systemd-run --machine=") {
+			continue
+		}
+		runs++
+		if !strings.Contains(line, "--expand-environment=no") {
+			t.Errorf("a command run in the machine is expanded by systemd first: %s", strings.TrimSpace(line))
+		}
+	}
+	if runs != 2 {
+		t.Errorf("the driver runs %d commands in the machine, want the probe and the exec", runs)
 	}
 }
 

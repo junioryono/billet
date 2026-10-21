@@ -47,7 +47,10 @@ TOOLSET_FILE="${TOOLSET_FILE:-$(cd "$(dirname "$0")/.." && pwd)/internal/runneri
 # is the defect this file just had: CodeQL's declared `*` iterated the working
 # directory. No value here contains a glob character, and that is precisely the
 # reasoning that made the other one safe until it was not.
-TOOLCACHE_TOOLS=(node go Python PyPy Ruby CodeQL)
+#
+# CODEQL IS NOT ONE OF THEM: its bundle is a component billet may not ship
+# (#584), and check-guest-component.sh holds what a completed image carries of it.
+TOOLCACHE_TOOLS=(node go Python PyPy Ruby)
 
 # THE SAME ALIAS MAP THE BUILD INSTALLS FROM.
 #
@@ -364,30 +367,109 @@ check_filesystem_ready() {
 	fi
 }
 
-# check_android_sdk passes or fails the gate on the Android SDK in the image
-# mounted at $1: sdkmanager where the installer puts it, at least one platform, and
-# ANDROID_HOME in the environment the runner reads. GitHub's image carries the SDK,
-# and a build that relies on it fails with "SDK location not found" without it.
-check_android_sdk() {
-	local sdk="$1/usr/local/lib/android/sdk"
+# THE COMPONENTS BILLET MAY NOT SHIP (#584): the Android SDK, the CodeQL bundle,
+# Firefox, Google Chrome and Microsoft Edge, whose licenses forbid billet
+# redistributing them. check-guest-component.sh holds the one list of what each
+# leaves in an image; the build's trial completion asks it whether a completed copy
+# carries each one, and this gate whether the image to publish carries none.
+GATE_DIR=$(cd "$(dirname "$0")" && pwd)
 
-	if [ ! -x "$sdk/cmdline-tools/latest/bin/sdkmanager" ]; then
-		fail "no sdkmanager at /usr/local/lib/android/sdk/cmdline-tools/latest/bin; the
-        Android SDK is not installed"
+# check_components_left_out passes or fails the gate on the image mounted at $1
+# carrying any part of a component billet may not ship.
+check_components_left_out() {
+	local names name status=0
+
+	names=$("$GATE_DIR/check-guest-component.sh" names) || status=$?
+	if [ "$status" -ne 0 ] || [ -z "$names" ]; then
+		fail "could not list the components billet may not ship (status $status)"
 		return
 	fi
 
-	if ! compgen -G "$sdk/platforms/android-*" >/dev/null; then
-		fail "the Android SDK has no platform under /usr/local/lib/android/sdk/platforms"
+	while IFS= read -r name; do
+		status=0
+		"$GATE_DIR/check-guest-component.sh" absent "$name" "$1" || status=$?
+		case "$status" in
+		0) ;;
+		1) fail "the image carries part of $name, which billet may not redistribute (#584)" ;;
+		*) fail "could not ask whether the image carries $name (status $status)" ;;
+		esac
+	done <<<"$names"
+}
+
+# COMPLETER_FILES is the image's completer as build-guest-image.sh installs it: its
+# runner, the job environment's one writer and its reader, the toolset, and
+# GitHub's installers, helpers and tests for each component. COMPLETER_EXECUTED
+# is what of it is executed rather than read or sourced, which must be executable;
+# GitHub's other helpers are sourced and are ordinary files in the template.
+COMPLETER_FILES=(
+	run write-image-env.sh pam-environment.awk installers/toolset.json
+	scripts/build/install-android-sdk.sh scripts/build/install-codeql-bundle.sh
+	scripts/build/install-firefox.sh scripts/build/install-google-chrome.sh
+	scripts/build/install-microsoft-edge.sh
+	scripts/helpers/install.sh scripts/helpers/etc-environment.sh scripts/helpers/os.sh
+	scripts/helpers/invoke-tests.sh scripts/helpers/Common.Helpers.psm1
+	scripts/tests/Helpers.psm1 scripts/tests/Android.Tests.ps1
+	scripts/tests/Browsers.Tests.ps1 scripts/tests/Toolset.Tests.ps1
+)
+COMPLETER_EXECUTED=(
+	run write-image-env.sh
+	scripts/build/install-android-sdk.sh scripts/build/install-codeql-bundle.sh
+	scripts/build/install-firefox.sh scripts/build/install-google-chrome.sh
+	scripts/build/install-microsoft-edge.sh scripts/helpers/invoke-tests.sh
+)
+
+# check_completer passes or fails the gate on the image mounted at $1 carrying the
+# completer a deployment runs to install what the image left out: every file, the
+# runner and every script it executes executable, and GitHub's test runner reading
+# the tests beside it rather than the build's edited copies.
+check_completer() {
+	local completer="$1/opt/billet/complete" missing=() file status=0
+
+	for file in "${COMPLETER_FILES[@]}"; do
+		[ -f "$completer/$file" ] && [ -s "$completer/$file" ] || missing+=("$file")
+	done
+	for file in "${COMPLETER_EXECUTED[@]}"; do
+		[ ! -f "$completer/$file" ] || [ -x "$completer/$file" ] || missing+=("$file (executable)")
+	done
+	if [ "${#missing[@]}" -gt 0 ]; then
+		fail "the completer at /opt/billet/complete lacks ${missing[*]}, so no deployment can install what this image leaves out"
 		return
 	fi
 
-	if ! grep -qx 'ANDROID_HOME=/usr/local/lib/android/sdk' "$1/etc/billet-image-env" 2>/dev/null; then
-		fail "ANDROID_HOME is not in /etc/billet-image-env, so a job cannot find the SDK"
+	grep -qF '$testPath = Join-Path $PSScriptRoot "${TestFile}.Tests.ps1"' \
+		"$completer/scripts/tests/Helpers.psm1" || status=$?
+	case "$status" in
+	0) pass "the completer is installed, with GitHub's tests read from beside it" ;;
+	1) fail "the completer's Helpers.psm1 still reads the tests from /imagegeneration, where the build skipped them" ;;
+	*) fail "could not read the completer's Helpers.psm1 (status $status)" ;;
+	esac
+}
+
+# check_manifest_components passes or fails the gate on the manifest declaring
+# exactly the components the image leaves out, each with the space it needs, under
+# the completion contract the image's completer speaks: a node completes only what
+# the manifest declares, and grows the image by what it says.
+check_manifest_components() {
+	[ -n "$MANIFEST" ] && [ -r "$MANIFEST" ] || return 0
+
+	local declared want status=0
+	want=$("$GATE_DIR/check-guest-component.sh" names | sort | tr '\n' ' ') || status=$?
+	declared=$(jq -r '[(.components // [])[] | .name] | sort | .[]' "$MANIFEST" | tr '\n' ' ') || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "could not read the components the manifest declares (status $status)"
 		return
 	fi
-
-	pass "the Android SDK is installed, with ANDROID_HOME set"
+	if [ "$declared" != "$want" ]; then
+		fail "the manifest declares the components [${declared% }] and the image leaves out [${want% }]; a node completes only what the manifest declares"
+		return
+	fi
+	if ! jq -e '.schema == 3 and .completion_contract == "1" and
+		all(.components[]; (.space | type) == "number" and .space > 0 and .space == (.space | floor))' \
+		"$MANIFEST" >/dev/null; then
+		fail "the manifest does not declare its components under schema 3 and completion contract 1, each with a positive whole space"
+		return
+	fi
+	pass "the manifest declares every component the image leaves out, with the space each needs"
 }
 
 # HOSTED_TOOLS are the commands GitHub's image installs with scripts of its own,
@@ -479,9 +561,6 @@ check_hosted_tools() {
 	# holds the variable GitHub sets, not a value GitHub's image does not carry.
 	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:' "$env" 2>/dev/null ||
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
-	if [ -d "$1/usr/local/lib/android/sdk" ] && [ -z "$(find "$1/usr/local/lib/android/sdk" -maxdepth 0 -perm -o+w)" ]; then
-		missing+=("a writable Android SDK (Gradle installs the NDK a project asks for into it)")
-	fi
 	grep -qx 'AZURE_EXTENSION_DIR=/opt/az/azcliextensions' "$env" 2>/dev/null ||
 		missing+=("AZURE_EXTENSION_DIR in /etc/billet-image-env")
 	grep -q '^GOROOT_[0-9]*_[0-9]*_X64=/opt/hostedtoolcache/go/' "$env" 2>/dev/null ||
@@ -838,7 +917,9 @@ done
 
 check_filesystem_ready "$IMAGE"
 check_github_cli "$MNT"
-check_android_sdk "$MNT"
+check_components_left_out "$MNT"
+check_completer "$MNT"
+check_manifest_components
 check_hosted_tools "$MNT"
 
 # --- parity with github's declaration ---------------------------------------
@@ -952,9 +1033,8 @@ if [ ! -d "$TOOLCACHE" ]; then
 else
 	toolcache_entries=0
 
-	# ALL SIX THE DECLARATION NAMES. PyPy, Ruby and CodeQL were installed by the
-	# shared installer and checked by nothing, so the gate reported success about
-	# half a toolcache.
+	# EVERY ONE BILLET BAKES. PyPy and Ruby were installed by the shared installer
+	# and checked by nothing, so the gate reported success about half a toolcache.
 	for tool in "${TOOLCACHE_TOOLS[@]}"; do
 		for versiondir in "$TOOLCACHE/$tool"/*; do
 			[ -d "$versiondir" ] || continue
@@ -1216,21 +1296,20 @@ check_toolcache_coverage() {
 		fi
 	done
 
-	# AND THE THREE THIS GATE USED TO CHECK ONLY STRUCTURALLY.
+	# AND THE TWO THIS GATE USED TO CHECK ONLY STRUCTURALLY.
 	#
 	# A directory, an x64 subdirectory and a marker beside it are satisfied by a
 	# tarball that unpacked to the wrong place -- which is precisely the failure
-	# each of these three is prone to: ruby-builder's archive is NOT stripped, the
-	# codeql bundle nests under `codeql/`, and pypy's entry points are symlinks
-	# this build creates rather than ones the tarball ships. The EC2 gate already
-	# executes all three, so leaving this one structural made the two backends
-	# disagree about what a usable image is.
+	# each of these is prone to: ruby-builder's archive is NOT stripped, and pypy's
+	# entry points are symlinks this build creates rather than ones the tarball
+	# ships. The EC2 gate already executes them, so leaving this one structural made
+	# the two backends disagree about what a usable image is. (The CodeQL bundle,
+	# which nests under `codeql/`, is check-guest-component.sh's now.)
 	#
 	# `--version` PROVES THE WHOLE CHAIN: for pypy it resolves two symlinks, and
 	# for a shared-library runtime it proves the loader finds what it needs, which
 	# no stat can.
-	for tool_spec in "PyPy bin/python --version" "Ruby bin/ruby --version" \
-		"CodeQL codeql/codeql version"; do
+	for tool_spec in "PyPy bin/python --version" "Ruby bin/ruby --version"; do
 		# PARAMETER EXPANSION RATHER THAN `set --`. At top level `set --` replaces
 		# the SCRIPT's positional parameters, and this script reads its image and
 		# manifest from $1 and $2. They are captured into variables long before
@@ -1412,24 +1491,6 @@ check_toolcache_coverage() {
 		fi
 	done <<<"$declared_globals"
 
-	# CODEQL NEEDS A SECOND MARKER, INSIDE THE ENTRY.
-	#
-	# `x64.complete` beside the entry is what @actions/tool-cache stats; codeql's
-	# own action stats `pinned-version` within it, and without that it re-downloads
-	# a bundle that is already there -- the entire cost this bakes in to avoid,
-	# paid on every job while every other check passes.
-	for versiondir in "$TOOLCACHE/CodeQL"/*; do
-		[ -d "$versiondir/x64" ] || continue
-
-		version=$(basename "$versiondir")
-
-		if [ -f "$versiondir/x64/pinned-version" ]; then
-			pass "codeql $version carries the pinned-version marker its action looks for"
-		else
-			fail "codeql $version has no x64/pinned-version, so the action re-downloads the
-        bundle it already has on every job"
-		fi
-	done
 fi
 
 # --- the JDKs ---------------------------------------------------------------

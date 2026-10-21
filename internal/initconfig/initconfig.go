@@ -1046,7 +1046,7 @@ func imagesAcceptYAML() string {
 # billet redistributing them, so billet's published guest image is to leave them
 # out, and a pull installs each one named here from its vendor, inside a microVM,
 # before the image is imported. Nothing is installed unless you name it, and
-# naming one accepts its license. Today's published images still carry all five.
+# naming one accepts its license.
 #
 #   android-sdk     the Android SDK, platforms, build tools and NDKs
 #                   (https://developer.android.com/studio/terms)
