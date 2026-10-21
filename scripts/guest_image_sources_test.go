@@ -329,16 +329,18 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 		t.Errorf("an exported manifest that is not the image's passed:\n%s", out)
 	}
 
-	edit := func(old, new string) func(t *testing.T, root string) {
+	edit := func(from, to string) func(t *testing.T, root string) {
 		return func(t *testing.T, root string) {
+			t.Helper()
+
 			path := filepath.Join(root, "opt", "billet", "IMAGE_SOURCES.tsv")
 			body, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			changed := strings.Replace(string(body), old, new, 1)
+			changed := strings.Replace(string(body), from, to, 1)
 			if changed == string(body) {
-				t.Fatalf("the fixture has no %q", old)
+				t.Fatalf("the fixture has no %q", from)
 			}
 			writeTreeFile(t, root, "opt/billet/IMAGE_SOURCES.tsv", changed)
 		}
@@ -349,6 +351,8 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 		want  string
 	}{
 		{"no manifest", func(t *testing.T, root string) {
+			t.Helper()
+
 			removeAll(t, filepath.Join(root, "opt", "billet", "IMAGE_SOURCES.tsv"))
 		}, "has no /opt/billet/IMAGE_SOURCES.tsv"},
 		{"a package left out", edit("libfoo1\tamd64\t1.2-1build1\tfoo\t1.2-1\tarchive.ubuntu.com\tother\n", ""), "does not list exactly what dpkg installed"},
@@ -364,6 +368,8 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 		{"a row missing its source", edit("\tfoo\t1.2-1\t", "\t\t\t"), "malformed rows (lines 5 )"},
 		{"another header", edit("package\t", "name\t"), "does not begin with its header"},
 		{"a package dpkg did not finish", func(t *testing.T, root string) {
+			t.Helper()
+
 			path := filepath.Join(root, "var", "lib", "dpkg", "status")
 			body, err := os.ReadFile(path)
 			if err != nil {
@@ -373,6 +379,8 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 				string(body)+"\nPackage: unfinished\nStatus: install ok half-configured\nArchitecture: amd64\nVersion: 1.0\n")
 		}, "records it cannot publish: unfinished (install ok half-configured)"},
 		{"a record with no status", func(t *testing.T, root string) {
+			t.Helper()
+
 			path := filepath.Join(root, "var", "lib", "dpkg", "status")
 			body, err := os.ReadFile(path)
 			if err != nil {

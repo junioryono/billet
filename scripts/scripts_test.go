@@ -340,36 +340,36 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 		},
 		{
 			name: "an empty source manifest stops the publish before the tag",
-			dir: replaced(t, publishDir(t, multipart,
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv", ""),
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), ""),
 			wantSuccess: false,
 		},
 		{
 			name: "a source manifest naming no package stops the publish before the tag",
-			dir: replaced(t, publishDir(t, multipart,
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"),
 			wantSuccess: false,
 		},
 		{
 			name: "a source manifest of its header and a blank line stops the publish before the tag",
-			dir: replaced(t, publishDir(t, multipart,
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n\n"),
 			wantSuccess: false,
 		},
 		{
 			name: "a source manifest with an incomplete row stops the publish before the tag",
-			dir: replaced(t, publishDir(t, multipart,
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
 					"bash\tamd64\t5.2.21-2ubuntu4\t\t\tarchive.ubuntu.com\tgnu\n"),
 			wantSuccess: false,
 		},
 		{
 			name: "a malformed row after a valid one stops the publish before the tag",
-			dir: replaced(t, publishDir(t, multipart,
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
 					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"+
 					"jq\tamd64\t1.7.1\n"),
@@ -377,8 +377,8 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 		},
 		{
 			name: "a source manifest under another header stops the publish before the tag",
-			dir: replaced(t, publishDir(t, multipart,
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 				"name\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
 					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"),
 			wantSuccess: false,
@@ -474,12 +474,12 @@ func swapped(t *testing.T, dir, a, b string) string {
 	return dir
 }
 
-// replaced rewrites one file of a publication directory with BODY.
-func replaced(t *testing.T, dir, name, body string) string {
+// withSources rewrites a publication directory's image-sources.tsv with BODY.
+func withSources(t *testing.T, dir, body string) string {
 	t.Helper()
 
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
-		t.Fatalf("rewrite %s: %v", name, err)
+	if err := os.WriteFile(filepath.Join(dir, "image-sources.tsv"), []byte(body), 0o600); err != nil {
+		t.Fatalf("rewrite image-sources.tsv: %v", err)
 	}
 
 	return dir
