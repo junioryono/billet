@@ -92,6 +92,56 @@ func TestHybridGenerationOfReadsTheRenderedRoot(t *testing.T) {
 	}
 }
 
+// THE SCAN IS LEXICAL BUT NOT NAIVE: a declaration commented out, quoted
+// inside a string or written in a heredoc is not one; a comment inside the
+// live one does not hide it; and everything the scan cannot settle (two
+// declarations, an expression, a template, an unterminated string, comment or
+// heredoc) is an error, never "none", because "none" mints a fingerprint.
+func TestHybridGenerationOfReadsOnlyALiveDeclaration(t *testing.T) {
+	t.Parallel()
+
+	const fp = "0123-4567-89ab-cdef"
+	live := "output \"generation\" {\n  description = \"d\"\n  value       = \"" + fp + "\"\n}\n"
+
+	for _, c := range []struct {
+		name, root string
+		found      bool
+		fails      bool
+	}{
+		{"the rendered shape", live, true, false},
+		{"a comment inside the declaration", "output /* why */ \"generation\" { # here\n  value = \"" + fp + "\" // and here\n}\n", true, false},
+		{"an old block commented out above the live one",
+			"/*\noutput \"generation\" {\n  value = \"fedc-ba98-7654-3210\"\n}\n*/\n" + live, true, false},
+		{"a line comment", "# output \"generation\" { value = \"" + fp + "\" }\n", false, false},
+		{"inside a description", "output \"name\" {\n  description = \"see output \\\"generation\\\" {\"\n  value = \"x\"\n}\n", false, false},
+		{"inside a heredoc", "locals {\n  note = <<EOT\noutput \"generation\" {\n  value = \"" + fp + "\"\n}\nEOT\n}\n", false, false},
+		{"a brace in the description", "output \"generation\" {\n  description = \"a } b\"\n  value = \"" + fp + "\"\n}\n", true, false},
+		{"two declarations", live + live, false, true},
+		{"an expression", "output \"generation\" {\n  value = \"" + fp + "\" + \"\"\n}\n", false, true},
+		{"a template", "output \"generation\" {\n  value = \"${var.g}\"\n}\n", false, true},
+		{"no value", "output \"generation\" {\n  description = \"d\"\n}\n", false, true},
+		{"an unterminated string before it", "locals { a = \"oops\n}\n" + live, false, true},
+		{"an unterminated comment before it", "/* oops\n" + live, false, true},
+		{"an unterminated heredoc before it", "locals {\n  a = <<EOT\nnever closed\n" + live, false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, found, err := HybridGenerationOf(c.root)
+			switch {
+			case c.fails && err == nil:
+				t.Fatalf("read as (%q, %v) with no error, want an error", got, found)
+			case !c.fails && err != nil:
+				t.Fatalf("refused: %v", err)
+			case found != c.found:
+				t.Fatalf("found %v, want %v", found, c.found)
+			case c.found && got != fp:
+				t.Fatalf("read %q, want %q", got, fp)
+			}
+		})
+	}
+}
+
 // THE ROOT DECLARES THE FINGERPRINT IT WAS RENDERED WITH AND THE ACCOUNT FROM
 // THE APPLY'S OWN CALLER IDENTITY, so the outputs carry both facts a later
 // render compares.

@@ -84,9 +84,16 @@ func resolveHybridGeneration(out, flag string, flagSet, later bool) (string, err
 	case declared != "":
 		return declared, nil
 	case later:
+		// WHERE A ROOT FROM BEFORE THE FINGERPRINT LANDS, since neither its
+		// runbook nor its root has one, so the way through is said here too.
 		return "", fmt.Errorf("this render reads --terraform-output, and nothing says which generation "+
 			"those outputs must belong to: pass --generation as the runbook prints it, or point "+
-			"--out at the directory whose %s declares it", initconfig.HybridTerraformFile)
+			"--out at the directory whose %s declares it. A root rendered before billet minted "+
+			"fingerprints declares none: run the plan render into a scratch --out with the same "+
+			"flags, copy its %q and %q output blocks into your root and nothing else, check that "+
+			"`terraform plan` adds only those two outputs, apply, save `terraform output -json` "+
+			"again, and pass --generation with the value you copied",
+			initconfig.HybridTerraformFile, initconfig.HybridOutputGeneration, initconfig.HybridOutputAccountID)
 	}
 
 	return initconfig.NewHybridGeneration()

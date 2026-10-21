@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
@@ -21,8 +23,9 @@ import (
 // rather than an empty match, and a service that never answers is cut off by
 // the wait rather than holding the operator's terminal.
 //
-// Mutations: returning id.ARN fails the first case; dropping the wait makes the
-// third case run to its client's ten-second timeout and fail its bound.
+// Mutations: returning id.ARN fails the first case; dropping the wait leaves
+// the third case's request held for ever, which the bubble reports as a
+// deadlock.
 func TestAccountOfAnswersTheAccountUnderItsWait(t *testing.T) {
 	creds := awscreds.Static{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "secret"}
 
@@ -57,35 +60,39 @@ func TestAccountOfAnswersTheAccountUnderItsWait(t *testing.T) {
 		}
 	})
 
+	// IN A BUBBLE, through an in-memory transport that holds every request until
+	// its context ends: the wait is the only thing that can end it, so the
+	// deadline is the error, it lands exactly at the wait on the bubble's clock,
+	// and no real socket or wall clock is involved.
 	t.Run("a service that never answers", func(t *testing.T) {
-		release := make(chan struct{})
-		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-			select {
-			case <-release:
-			case <-r.Context().Done():
+		synctest.Test(t, func(t *testing.T) {
+			reached := 0
+			hold := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				reached++
+				<-r.Context().Done()
+
+				return nil, r.Context().Err()
+			})
+
+			start := time.Now()
+			_, err := accountOf(t.Context(), awssts.New("us-west-2", "https://sts.invalid/", creds, &http.Client{Transport: hold}))
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("a service that never answered gave %v, want the wait's deadline", err)
 			}
-		}))
-		t.Cleanup(func() { close(release); srv.Close() })
-
-		prev := hybridAccountWait
-		hybridAccountWait = 100 * time.Millisecond
-		t.Cleanup(func() { hybridAccountWait = prev })
-
-		// The client's own bound is longer than the guard below, so without the
-		// wait this fails in ten seconds rather than hanging the binary.
-		start := time.Now()
-		_, err := accountOf(t.Context(), awssts.New("us-west-2", srv.URL, creds, &http.Client{Timeout: 10 * time.Second}))
-		if err == nil {
-			t.Fatal("a service that never answered produced an account")
-		}
-		// A FAILURE GUARD, not the condition: the wait is 100ms, and anything
-		// near the http client's own bound means the wait was not applied.
-		if elapsed := time.Since(start); elapsed > 5*time.Second {
-			t.Fatalf("accountOf waited %s for a service that never answered; the wait is %s",
-				elapsed, hybridAccountWait)
-		}
+			if reached != 1 {
+				t.Fatalf("the request reached the transport %d times, want once", reached)
+			}
+			if elapsed := time.Since(start); elapsed != hybridAccountWait {
+				t.Fatalf("accountOf gave up after %s, want the wait of %s", elapsed, hybridAccountWait)
+			}
+		})
 	})
 }
+
+// roundTripFunc is an http.RoundTripper made of one function.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // hybridArgsMinting is hybridArgs without --generation, so the plan render
 // resolves one itself: from the root in --out, or a fresh one.
@@ -271,6 +278,54 @@ func TestInitHybridRefusesAnUnboundGeneration(t *testing.T) {
 	for _, bad := range []string{"", "0123"} {
 		if _, err := runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--generation", bad)...); err == nil {
 			t.Errorf("--generation %q was accepted", bad)
+		}
+	}
+}
+
+// A ROOT FROM BEFORE THE FINGERPRINT, ITS OUTPUTS AND ITS RUNBOOK'S COMMAND
+// (no --generation) is the path an existing deployment takes, and it reaches
+// the merge remedy rather than only being told to pass a flag it never had.
+func TestInitHybridGivesAnOldRootTheWayThrough(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+
+	if _, err := runInitHybrid(t, hybridArgsMinting(out, cfg)...); err != nil {
+		t.Fatalf("plan render: %v", err)
+	}
+
+	// THE ROOT AS IT WAS: no generation output at all.
+	root := filepath.Join(out, initconfig.HybridTerraformFile)
+	raw, err := os.ReadFile(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := strings.Replace(string(raw), `output "generation"`, `output "removed_generation"`, 1)
+	if old == string(raw) {
+		t.Fatal("the rendered root no longer declares the generation output this case removes")
+	}
+	if err := os.WriteFile(root, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outputs := filepath.Join(dir, "outputs.json")
+	legacy := strings.Replace(hybridOutputsJSON,
+		",\n  \"generation\": {\"sensitive\": false, \"type\": \"string\", \"value\": \"0123-4567-89ab-cdef\"},\n"+
+			"  \"account_id\": {\"sensitive\": false, \"type\": \"string\", \"value\": \"123456789012\"}", "", 1)
+	if legacy == hybridOutputsJSON {
+		t.Fatal("the outputs fixture no longer carries the two outputs this case removes")
+	}
+	if err := os.WriteFile(outputs, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--terraform-output", outputs)...)
+	if err == nil {
+		t.Fatal("an old root's outputs were accepted with no generation")
+	}
+	for _, want := range []string{"scratch --out", "terraform plan", "--generation"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not give the way through (%q): %v", want, err)
 		}
 	}
 }
