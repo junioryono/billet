@@ -331,6 +331,70 @@ func TestNoPlacementExceedsAHostOrTheDeployment(t *testing.T) {
 	}
 }
 
+// GITHUB.COM'S PROTOCOL REPLAYS TOO (#140). Work arrives as JobAssigned with
+// runnerRequestId 0, never offered and never acquired, as on GitHub.com, and
+// on a fleet the burst saturates some of it is assigned before there is room,
+// declined, and taken by a runner the tier starts later. Every job still has
+// a row that started and finished, nothing overcommits a host or the ceiling,
+// and two replays place every job alike.
+func TestADirectAssignmentReplayKeepsEveryProof(t *testing.T) {
+	fleet := Fleet{
+		Hosts: []Host{
+			{Name: "small-a", VCPU: 8, Memory: 32 * config.GiB},
+			{Name: "small-b", VCPU: 8, Memory: 32 * config.GiB},
+		},
+		Tiers: []TierShape{
+			{Label: "billet-2vcpu", VCPU: 2, Memory: 4 * config.GiB},
+			{Label: "billet-4vcpu", VCPU: 4, Memory: 8 * config.GiB},
+		},
+		MaxVCPU:   12,
+		MaxMemory: 64 * config.GiB,
+		Placement: config.PlacementPack,
+	}
+
+	trace := MonorepoFanOut(5, Params{Jobs: 40})
+
+	report := Run(t, fleet, trace, Options{DirectAssignment: true})
+	keep(t, "direct-assignment", report)
+
+	if len(report.Missing) != 0 || len(report.Unstarted) != 0 || len(report.Unfinished) != 0 {
+		t.Fatalf("missing %v, unstarted %v, unfinished %v", report.Missing, report.Unstarted, report.Unfinished)
+	}
+
+	if len(report.Records) != len(trace.Arrivals) {
+		t.Fatalf("recorded %d jobs for a trace of %d", len(report.Records), len(trace.Arrivals))
+	}
+
+	// EVERY JOB UNDER AN IDENTITY BILLET GAVE IT, which only a job that came with
+	// no request id has: the replay ran GitHub.com's protocol, not the offer.
+	if report.ByJobID != len(trace.Arrivals) {
+		t.Fatalf("%d of %d jobs were recorded under an identity billet gave them; the replay did not "+
+			"run direct assignment", report.ByJobID, len(trace.Arrivals))
+	}
+
+	if len(report.Violations) != 0 {
+		t.Fatalf("the ledger records an overcommit: %v", report.Violations)
+	}
+
+	queued := 0
+
+	for _, rec := range report.Records {
+		if time.Duration(rec.QueueWait) > fleet.boot() {
+			queued++
+		}
+	}
+
+	if queued == 0 {
+		t.Fatal("no job waited beyond the boot model, so no assignment found the fleet full and this " +
+			"never replayed an assignment billet had to decline")
+	}
+
+	again := Run(t, fleet, trace, Options{DirectAssignment: true})
+	if !reflect.DeepEqual(report.Placements(), again.Placements()) {
+		t.Error("two direct-assignment replays of one trace placed its jobs differently")
+	}
+}
+
 // A FEW THOUSAND JOBS REPLAY IN MINUTES AND PRODUCE A PER-LEASE RECORD SET. The
 // acceptance-size run; its wall time is logged and belongs in the record of the
 // change that moved it.

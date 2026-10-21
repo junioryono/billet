@@ -33,6 +33,12 @@ type Options struct {
 	// SettleWithin bounds, in wall time, how long billet may take to settle
 	// after one event before the replay is declared stuck. Zero means a minute.
 	SettleWithin time.Duration
+	// DirectAssignment replays GitHub.com's protocol rather than the offer and
+	// acquisition GHES keeps: each job is assigned to its tier's scale set as
+	// JobAssigned with runnerRequestId 0 as soon as the set advertises room
+	// for it, nothing is offered or acquired, and an assignment billet cannot
+	// back waits at GitHub for the next runner the tier starts (#140).
+	DirectAssignment bool
 }
 
 func (o Options) settleWithin() time.Duration {
@@ -74,6 +80,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	clock := NewClock(trace.Arrivals[0].At.Add(-time.Minute))
 
 	actions := newPlane(t, clock, fleet, trace)
+	actions.direct = opts.DirectAssignment
 	st := buildStack(t, log, fleet, tiers, clock, actions)
 	stop := st.run(t)
 
@@ -156,7 +163,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	stop()
 	st.stopNodes()
 
-	report, err := readReport(t.Context(), st.db, fleet, trace)
+	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment)
 	if err != nil {
 		t.Fatalf("replay: read the ledger back: %v", err)
 	}
