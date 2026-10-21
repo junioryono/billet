@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "command": "check",
+  "outcome": "unknown",
+  "why": "systemd did not answer ActiveState",
+  "invocation": "inv-1",
+  "unit": {
+    "active_state": "",
+    "sub_state": "",
+    "result": "",
+    "main_pid": "",
+    "job": "",
+    "invocation_id": ""
+  }
+}

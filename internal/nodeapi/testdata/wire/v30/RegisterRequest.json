@@ -1,0 +1,31 @@
+{
+  "version": 1982211185,
+  "min_version": 1365648989,
+  "release": "RegisterRequest.release",
+  "installed_digest": "RegisterRequest.installed_digest",
+  "node": "RegisterRequest.node",
+  "provider": "RegisterRequest.provider",
+  "guest_os": [
+    "RegisterRequest.guest_os[0]"
+  ],
+  "site": "RegisterRequest.site",
+  "vcpu": 1432503943,
+  "memory": 1222113448,
+  "ec2_shapes": [
+    {
+      "type": "RegisterRequest.ec2_shapes[0].type",
+      "vcpu": 84739990,
+      "memory": 530032884,
+      "price_usd_per_hour": 140301506
+    }
+  ],
+  "codebuild_fleet": "RegisterRequest.codebuild_fleet",
+  "codebuild_jit_parameter_path": "RegisterRequest.codebuild_jit_parameter_path",
+  "codebuild_region": "RegisterRequest.codebuild_region",
+  "instances": [
+    "RegisterRequest.instances[0]"
+  ],
+  "inventory_known": true,
+  "deployment": "RegisterRequest.deployment",
+  "incarnation": "RegisterRequest.incarnation"
+}

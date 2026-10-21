@@ -299,6 +299,136 @@ func (p *Provider) releaseTap(name, jailID string) error {
 	return p.releaseClaim(filepath.Join(p.claimsDir("taps"), name), jailID)
 }
 
+// removeTap deletes a microVM's network device if the kernel proves it is billet's,
+// and reports what must stay claimed afterwards.
+func (p *Provider) removeTap(ctx context.Context, res resources, jailID string) (resources, error) {
+	if res.Tap == "" {
+		return resources{}, nil
+	}
+
+	unlock, err := p.lockClaims()
+	if err != nil {
+		return res, err
+	}
+	defer unlock()
+
+	return p.removeTapLocked(ctx, res, jailID)
+}
+
+// removeTapLocked is removeTap for a caller holding lockClaims. What it returns is
+// what the caller must NOT release: the zero value releases everything.
+//
+// THE KERNEL DECIDES WHOSE A DEVICE IS, NOT A RECORD OF WHAT BILLET MEANT TO DO.
+// addTap creates every tap with `user <jail uid>`, and the kernel reports that owner
+// for as long as the device exists. So a device under this jail's claimed name is
+// deleted only when it is a tap owned by a jail uid (ownedByJail says why whoever
+// holds that uid now does not matter). A launch that failed before creating its tap finds no device, or finds
+// somebody else's, and deletes nothing; and because the proof is the device itself,
+// there is no second record a crash, a failed write or an older billet can leave
+// disagreeing with it.
+//
+//   - No claim on the name, or one naming another jail: nothing here is this
+//     microVM's. Nothing is deleted and nothing kept.
+//   - No device: nothing to delete. The name goes back.
+//   - A device that is not billet's (no owner, or one outside the jail uid range that
+//     is not this jail's): left alone, and its name kept out of the pool, because a
+//     launch handed it would fail on the device too.
+//   - billet's device: deleted, and the name goes back only if it went.
+//   - Anything that could not be read: could not tell, which is not permission.
+//     Nothing is deleted and the name is kept for a later teardown to judge.
+//
+// ONLY THE NAME IS EVER KEPT, as before this rule: the uid goes back with the rest.
+// What a kept claim can and cannot protect against once its jail is gone (the reaper
+// frees it, and the uid that owns a stuck tap can be handed out again) is a property
+// of the claims as a whole, not of this decision (#522).
+func (p *Provider) removeTapLocked(ctx context.Context, res resources, jailID string) (resources, error) {
+	if res.Tap == "" {
+		return resources{}, nil
+	}
+
+	held := resources{Tap: res.Tap}
+
+	raw, err := os.ReadFile(filepath.Join(p.claimsDir("taps"), res.Tap))
+	if errors.Is(err, os.ErrNotExist) {
+		return resources{}, nil
+	}
+
+	if err != nil {
+		return held, fmt.Errorf("firecracker: could not tell whether %s is still claimed: %w", res.Tap, err)
+	}
+
+	if strings.TrimSpace(string(raw)) != jailID {
+		return resources{}, nil
+	}
+
+	owner, present, err := p.tapOwner(res.Tap)
+	if err != nil {
+		return held, fmt.Errorf("firecracker: could not tell whose device %s is: %w", res.Tap, err)
+	}
+
+	if !present {
+		return resources{}, nil
+	}
+
+	ours, err := p.ownedByJail(owner, jailID)
+	if err != nil {
+		return held, err
+	}
+
+	if !ours {
+		p.log.Warn("left a network device billet did not make under a name it had claimed",
+			"device", res.Tap, "owner", owner, "runner", jailID)
+
+		return resources{Tap: res.Tap}, nil
+	}
+
+	if err := p.deleteTap(ctx, res.Tap); err != nil {
+		return held, err
+	}
+
+	return resources{}, nil
+}
+
+// ownedByJail reports whether a tap's owner proves it billet's to delete: a jail uid,
+// or a uid whose claim names this jail.
+//
+// ANY JAIL UID, WHOEVER HOLDS IT NOW. billet creates a tap only under a name it has
+// claimed, and a name has one claim, which this jail holds. So a tap under it owned
+// by a jail uid is this jail's own, or a leftover of an earlier holder of the name,
+// whose jail is gone (the reaper frees a name only then): no live microVM is using it.
+// The uid's current holder says nothing about the device. A teardown that kept a
+// stuck tap's name gave its uid back, so another launch holding that uid is the
+// ordinary case, and treating it as foreign stranded the tap (or, as could-not-tell,
+// blocked recovery until a lease that recovery itself had to reach let the uid go).
+//
+// THIS JAIL'S OWN CLAIM COUNTS OUTSIDE THE RANGE, so a range changed under a running
+// microVM does not strand the tap it made.
+func (p *Provider) ownedByJail(owner int, jailID string) (bool, error) {
+	if owner >= p.cfg.JailUIDMin && owner < p.cfg.JailUIDMin+p.cfg.JailUIDCount {
+		return true, nil
+	}
+
+	raw, err := os.ReadFile(filepath.Join(p.claimsDir("uids"), strconv.Itoa(owner)))
+
+	switch {
+	case err == nil:
+		return strings.TrimSpace(string(raw)) == jailID, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, fmt.Errorf("firecracker: could not tell which microVM holds uid %d: %w", owner, err)
+	}
+}
+
+// releasable is what a microVM held, less the tap name a teardown must keep claimed.
+func releasable(res, keep resources) resources {
+	if keep.Tap != "" {
+		res.Tap = ""
+	}
+
+	return res
+}
+
 // maxTaps bounds how many microVMs one host may run at once, as far as naming goes.
 //
 // Far above what a machine can hold — the reference host is 64 cores and a tier is
@@ -415,7 +545,20 @@ func (p *Provider) claimedBy(jailID string) (resources, error) {
 
 		for _, entry := range entries {
 			raw, err := os.ReadFile(filepath.Join(p.claimsDir(kind), entry.Name()))
-			if err != nil || strings.TrimSpace(string(raw)) != jailID {
+			if err != nil {
+				// COULD NOT TELL WHOSE IT IS, so the inventory is incomplete, and
+				// releasing from an incomplete inventory would let lifecycle authority
+				// go while a claim of this jail's may remain. A claim gone since the
+				// listing is simply not there.
+				if !errors.Is(err, os.ErrNotExist) {
+					failures = append(failures, fmt.Errorf("firecracker: could not tell whose the claim %s is: %w",
+						filepath.Join(p.claimsDir(kind), entry.Name()), err))
+				}
+
+				continue
+			}
+
+			if strings.TrimSpace(string(raw)) != jailID {
 				continue
 			}
 
@@ -449,23 +592,11 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID st
 	}
 	defer unlock()
 
-	// RE-READ UNDER THE LOCK. What claimedBy found is a snapshot taken without it,
-	// and the jail is gone, so a launch may have reaped this tap's claim and created
-	// its own device under the same name since. Only a claim that still names this
-	// jail authorizes deleting the device.
-	if res.Tap != "" {
-		raw, err := os.ReadFile(filepath.Join(p.claimsDir("taps"), res.Tap))
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("firecracker: read the claim on %s: %w", res.Tap, err)
-		}
-		if err != nil || strings.TrimSpace(string(raw)) != jailID {
-			res.Tap = ""
-		}
-	}
-
-	// THE DEVICE FIRST, because releasing the NAME while the device still exists
-	// would let another microVM claim a name the kernel already has — and `ip tuntap
-	// add` would then refuse a launch for a reason that names nothing billet did.
+	// RE-READ UNDER THE LOCK (removeTapLocked). What claimedBy found is a snapshot
+	// taken without it, and the jail is gone, so a launch may have reaped this tap's
+	// claim and created its own device under the same name since. Only a claim that
+	// still names this jail, over a device the kernel says is billet's, authorizes
+	// deleting it.
 	//
 	// AND THE NAME IS KEPT WHEN THE DEVICE WOULD NOT GO. Releasing it anyway is how
 	// a host wedges itself permanently: the device stays attached to the bridge,
@@ -474,13 +605,9 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID st
 	// and every launch after it fails the same way until an operator deletes the
 	// device by hand. Keeping the claim is what lets a later teardown find the device
 	// and finish the job.
-	if res.Tap != "" {
-		if err := p.deleteTap(ctx, res.Tap); err != nil {
-			return errors.Join(err, p.releaseUID(res.UID, jailID))
-		}
-	}
+	keep, err := p.removeTapLocked(ctx, res, jailID)
 
-	return p.releaseResourcesLocked(res, jailID)
+	return errors.Join(err, p.releaseResourcesLocked(releasable(res, keep), jailID))
 }
 
 const defaultProcMountsPath = "/proc/mounts"

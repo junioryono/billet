@@ -37,11 +37,11 @@ func TestOperationAdmissionBatchesRetainedShippedSequence(t *testing.T) {
 	tmp["LoadState"], tmp["ActiveState"] = "not-found", "inactive"
 	f.units["billet-server.service"]["StateDirectory"] = "billet/server"
 	f.units["billet-node.service"]["StateDirectory"] = "billet/node"
-	f.units["billet-node.service"]["RuntimeDirectory"] = "billet/locks billet/registration"
+	f.units["billet-node.service"]["RuntimeDirectory"] = "billet/registration"
 	f.units["billet-backup.service"]["StateDirectory"] = "billet/backups"
 	f.units["billet-node.service"]["ActiveState"] = "active"
 	f.units["billet-node.service"]["ReadOnlyPaths"] = "/etc/billet"
-	f.units["billet-node.service"]["ReadWritePaths"] = "-/etc/billet/tls -/srv/jailer"
+	f.units["billet-node.service"]["ReadWritePaths"] = "-/etc/billet/tls -/srv/jailer /run/billet/locks"
 	var sequence []Operation
 	for _, unit := range []string{"billet-upgrade.timer", "billet-backup.timer", "billet-server.service"} {
 		sequence = append(sequence, Operation{Verb: "stop", Unit: unit}, Operation{Verb: "disable", Unit: unit})

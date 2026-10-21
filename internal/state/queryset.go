@@ -144,6 +144,11 @@ type ReadOps interface {
 	ReadJobIdentity(ctx context.Context, jobID string) (int64, error)
 	ReadJobIdentityByInternalID(ctx context.Context, internalID int64) (string, error)
 	ReadJob(ctx context.Context, leaseID string) (ledgerdb.ReadJobRow, error)
+	ReadJobWait(ctx context.Context, leaseID string) (ledgerdb.ReadJobWaitRow, error)
+	ListJobWaits(ctx context.Context, arg ledgerdb.ListJobWaitsParams) ([]ledgerdb.ListJobWaitsRow, error)
+	ListRetirableJobDetail(ctx context.Context, arg ledgerdb.ListRetirableJobDetailParams) ([]string, error)
+	ListJobsAwaitingQueueTime(ctx context.Context,
+		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
 	ReadJobUsage(ctx context.Context, leaseID string) (ledgerdb.JobUsage, error)
 	ReadJobSeries(ctx context.Context, leaseID string) (ledgerdb.ReadJobSeriesRow, error)
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)
@@ -258,6 +263,11 @@ type WriteOps interface {
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error
 	RecordJobDestinations(ctx context.Context, arg ledgerdb.RecordJobDestinationsParams) error
 	RecordJobGuestReport(ctx context.Context, arg ledgerdb.RecordJobGuestReportParams) (int64, error)
+	MarkJobDetailRetired(ctx context.Context, arg ledgerdb.MarkJobDetailRetiredParams) (int64, error)
+	DeleteRetiredJobSeries(ctx context.Context, stamp string) (int64, error)
+	DeleteRetiredJobDestinations(ctx context.Context, stamp string) (int64, error)
+	ForgetRetiredJobDestinationTotals(ctx context.Context, stamp string) error
+	DeleteRetiredJobGuestReports(ctx context.Context, stamp string) (int64, error)
 	RecordJobRun(ctx context.Context, arg ledgerdb.RecordJobRunParams) error
 	RecordJobStart(ctx context.Context, arg ledgerdb.RecordJobStartParams) error
 	BackfillFailureReason(ctx context.Context, arg ledgerdb.BackfillFailureReasonParams) error

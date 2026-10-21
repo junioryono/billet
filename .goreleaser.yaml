@@ -57,6 +57,12 @@ archives:
     files:
       - README.md
       - LICENSE
+      # THE NOTICES OF EVERYTHING THE BINARY LINKS, which MIT, BSD and Apache-2.0
+      # require beside a binary that redistributes them. scripts/mknotices writes
+      # it and its test keeps it current; strip_parent puts it at the archive's
+      # root beside LICENSE.
+      - src: internal/notices/THIRD_PARTY_NOTICES
+        strip_parent: true
       - billet.example.yaml
       # The macOS service definitions travel in the ARCHIVE because there is no
       # package for them: nfpms builds .deb and .rpm, and a Mac operator
@@ -119,6 +125,14 @@ nfpms:
       - src: deploy/billet-rbd.conf
         dst: /usr/lib/modules-load.d/billet-rbd.conf
 
+      # THE HOST LOCK DIRECTORY, made at every boot and by postinstall now. No
+      # unit's stop removes it under a lock another process holds (#175): the
+      # node names it, and the image refresh declares it preserved.
+      # Package-owned is right here: the entry describes a directory under
+      # /run, which holds nothing that must outlive the package.
+      - src: deploy/billet-tmpfiles.conf
+        dst: /usr/lib/tmpfiles.d/billet.conf
+
       # THE LIVE CONFIG IS NOT PACKAGED — postinstall copies this template to
       # /etc/billet/billet.yaml when nothing is there yet.
       #
@@ -155,6 +169,11 @@ nfpms:
         dst: /usr/share/doc/billet/README.md
       - src: LICENSE
         dst: /usr/share/doc/billet/LICENSE
+      # Under /usr/share/doc like LICENSE, which a minimal image may drop at unpack
+      # (see the config template above); nothing reads it, and the binary carries
+      # the same text (`billet version --notices`).
+      - src: internal/notices/THIRD_PARTY_NOTICES
+        dst: /usr/share/doc/billet/THIRD_PARTY_NOTICES
 
       # /etc/billet is created here so its mode is right before the config file
       # lands in it — it holds the GitHub App private key.

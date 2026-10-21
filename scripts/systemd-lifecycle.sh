@@ -63,6 +63,13 @@ dpkg -l billet | tail -1
 ls -l /usr/lib/systemd/system/billet-server.service \
     /usr/lib/systemd/system/billet-node.service 2>/dev/null
 
+# THE HOST LOCK DIRECTORY IS THE PACKAGE'S TMPFILES ENTRY'S, made by postinstall
+# where systemd runs, and no unit's: a node unit naming it in ReadWritePaths
+# refuses to start without it (#175).
+lockdir=$(stat -c '%U:%G %a' /run/billet/locks 2>&1)
+[ "$lockdir" = "root:root 750" ] && ok "postinstall made /run/billet/locks root:root 0750" ||
+    bad "/run/billet/locks after the install: $lockdir"
+
 say "billet local up"
 "$BILLET" local up --config "$CFG" 2>&1 | tail -8
 [ "${PIPESTATUS[0]}" -eq 0 ] && ok "local up exited 0" || bad "local up did not exit 0"
@@ -144,6 +151,14 @@ for u in billet-node.service billet-server.service; do
         ok "$u was stopped"
 done
 
+# THE NODE'S STOP LEAVES THE LOCK DIRECTORY AND WHAT IS IN IT (#175). The node
+# took its deployment lock there at its start; a unit that declared the
+# directory a RuntimeDirectory removed it at this stop, under any lock another
+# process held in it.
+[ -f "/run/billet/locks/deployment-$identity.lock" ] &&
+    ok "the node's stop left /run/billet/locks and its deployment lock in place" ||
+    bad "/run/billet/locks/deployment-$identity.lock is gone after the node's stop"
+
 # THE NODE STOPS BEFORE THE SERVER. A control plane that outlives its node has
 # nothing left to talk to, and stopping the server first strands the node's
 # renewals — so the order is part of what the command promises.
@@ -154,6 +169,51 @@ if [ -n "$node_line" ] && [ -n "$srv_line" ] && [ "$node_line" -lt "$srv_line" ]
 else
     bad "the stop order is not node-then-server (node@$node_line server@$srv_line)"
 fi
+
+# A DOWN'S NODE STOP IS PROVED BY THE NODE'S OWN ENDING (#127): the record the
+# node keeps says the process the down stopped drained.
+"$BILLET" node ending show --config "$CFG" --json | grep -q '"ending": "drained"' &&
+    ok "the down's node stop is recorded drained" ||
+    bad "the node's ending record does not say the down's stop drained"
+
+say "a node killed at its stop is not started over until acknowledged"
+"$BILLET" local up --config "$CFG" 2>&1 | tail -4
+[ "${PIPESTATUS[0]}" -eq 0 ] && ok "local up started the node over a drained ending" ||
+    bad "local up did not start the node over a drained ending"
+
+invocation=$(systemctl show -p InvocationID --value billet-node.service)
+echo "node invocation: ${invocation:-<none>}"
+
+# KILLED, AND KEPT DOWN: SIGKILL ends the process without its ending, and the
+# stop that follows cancels the restart Restart=on-failure would queue.
+systemctl kill --kill-whom=main --signal=SIGKILL billet-node.service
+systemctl stop billet-node.service
+st=$(active billet-node.service)
+[ "$st" != active ] && ok "the killed node is down ($st)" || bad "the killed node is still active"
+
+up_out=$("$BILLET" local up --config "$CFG" 2>&1)
+up_status=$?
+echo "$up_out" | tail -6
+[ "$up_status" -ne 0 ] && [ "$(active billet-node.service)" != active ] &&
+    ok "local up refused to start the node over the killed process (exit $up_status)" ||
+    bad "local up started the node over a process killed without its ending"
+echo "$up_out" | grep -qF "acknowledge --invocation ${invocation}" &&
+    ok "the refusal names the acknowledgement" ||
+    bad "the refusal does not name acknowledge --invocation ${invocation}"
+
+"$BILLET" node ending acknowledge --config "$CFG" --invocation "$invocation" --json >/dev/null &&
+    ok "the killed stop was acknowledged" || bad "the acknowledgement was refused"
+
+"$BILLET" local up --config "$CFG" 2>&1 | tail -4
+[ "${PIPESTATUS[0]}" -eq 0 ] && [ "$(active billet-node.service)" = active ] &&
+    ok "local up started the node over the acknowledged stop" ||
+    bad "local up did not start the node over the acknowledged stop"
+
+down_out=$("$BILLET" local down --timeout 12m 2>&1)
+down_status=$?
+echo "$down_out" | tail -6
+[ "$down_status" -eq 0 ] && ok "local down drained and stopped the node again" ||
+    bad "local down did not succeed after the acknowledged start (exit $down_status)"
 
 say "result"
 if [ "$fail" -eq 0 ]; then

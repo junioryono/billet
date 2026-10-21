@@ -121,6 +121,15 @@ type ImagesConfig struct {
 	// Without this, any authority able to mint a certificate carrying that name
 	// satisfies the policy.
 	SigningIssuer string `yaml:"signing_issuer,omitempty"`
+
+	// Accept names the components of GitHub's image this deployment accepts the
+	// licenses of, from ImageComponents. billet's published guest image leaves them
+	// out, because their licenses forbid billet redistributing them, and a pull
+	// installs each accepted one from its vendor before importing a generation.
+	//
+	// EMPTY BY DEFAULT, AND NEVER INFERRED. The acceptance is the operator's, so a
+	// deployment that writes nothing gets an image without them.
+	Accept []string `yaml:"accept,omitempty"`
 }
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
@@ -453,6 +462,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateCapacity()...)
 	errs = append(errs, ValidateRelease(c.Release)...)
 	errs = append(errs, c.validateBackup()...)
+	errs = append(errs, c.validateImages()...)
 
 	return errors.Join(errs...)
 }

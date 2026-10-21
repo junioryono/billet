@@ -92,7 +92,7 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 	}
 
 	var out PoolRunner
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.txTelling(ctx, func(tx *sql.Tx, told *waitsToTell) error {
 		q := state.WriteQueries(tx)
 
 		prior, found, err := poolRunnerByLease(ctx, q, leaseID)
@@ -118,12 +118,23 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			// delayed JobStarted arrives. That empty job identity is a reservation
 			// for this exact physical runner, not a competing job binding.
 			if prior.ActualRequestID == 0 && prior.RunID == 0 && prior.JobID == "" {
+				// A MEMBER REINSTATED BUSY MAY NOT KNOW ITS RUNNER'S ID YET, and
+				// this start is where it learns it, so a later start under another
+				// id is refused and a cleanup by name keeps refusing a replacement.
+				if prior.RunnerID == 0 {
+					if err := q.MarkPoolRunnerBusy(ctx, ledgerdb.MarkPoolRunnerBusyParams{
+						RunnerID: runnerID, UpdatedAt: nowStamp(), LeaseID: leaseID,
+					}); err != nil {
+						return fmt.Errorf("alloc: record the runner id of pool runner %q: %w", runnerName, err)
+					}
+					prior.RunnerID = runnerID
+				}
 				if err := bindPoolRunnerJob(ctx, q, leaseID, requestID, runID, jobID,
 					identity); err != nil {
 					return fmt.Errorf("alloc: bind recovered pool runner %q to job %q: %w",
 						runnerName, jobID, err)
 				}
-				if err := a.recordJobStartTx(ctx, tx, leaseID, a.now()); err != nil {
+				if err := a.recordJobStartTx(ctx, tx, leaseID, a.now(), told); err != nil {
 					return err
 				}
 				prior.ActualRequestID, prior.RunID, prior.JobID = requestID, runID, jobID
@@ -144,7 +155,7 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			}
 			// The same job reported started again: the start is already recorded,
 			// and a reason that landed in between is repaired now.
-			if err := a.recordJobStartTx(ctx, tx, leaseID, a.now()); err != nil {
+			if err := a.recordJobStartTx(ctx, tx, leaseID, a.now(), told); err != nil {
 				return err
 			}
 			out = prior
@@ -169,7 +180,7 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 		// a pool member stays where the launch left it while GitHub binds work
 		// to the physical runner, so the ledger's evidence that a job ran (see
 		// disruptionFor) is written on this edge as well as on `busy`.
-		if err := a.recordJobStartTx(ctx, tx, leaseID, a.now()); err != nil {
+		if err := a.recordJobStartTx(ctx, tx, leaseID, a.now(), told); err != nil {
 			return err
 		}
 		prior.RunnerID, prior.Status = runnerID, PoolRunnerBusy
@@ -377,6 +388,40 @@ func (a *Allocator) IdlePoolRunners(ctx context.Context, tier string) ([]PoolRun
 		}
 	}
 	return idle, nil
+}
+
+// ReinstateBusyPoolRunner undoes a retirement claim GitHub refused because the
+// runner is running a job. The refusal answered the deletion of its
+// registration, which comes before any compute is touched, and it is the proof
+// GitHub gave the member a job whose JobStarted has not arrived; so the member is
+// journaled busy with that job unknown, the reservation a delayed JobStarted
+// binds, as a runner recovered busy after a restart is. Only a retiring member
+// bound to no job is reinstated: a bound one already names its job.
+func (a *Allocator) ReinstateBusyPoolRunner(ctx context.Context, leaseID string) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		prior, found, err := poolRunnerByLease(ctx, q, leaseID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrLeaseNotFound
+		}
+		// UNBOUND IN ALL THREE, as StartPoolRunner reads a reservation: a row
+		// naming any of them would be reinstated as one no JobStarted could bind.
+		if prior.Status != PoolRunnerRetiring || prior.ActualRequestID != 0 || prior.RunID != 0 ||
+			prior.JobID != "" {
+			return fmt.Errorf("alloc: %w: pool runner %q is %s, not retiring and unbound",
+				ErrConflict, prior.RunnerName, prior.Status)
+		}
+
+		return q.MarkPoolRunnerBusy(ctx, ledgerdb.MarkPoolRunnerBusyParams{
+			RunnerID:  prior.RunnerID,
+			UpdatedAt: nowStamp(),
+			LeaseID:   leaseID,
+		})
+	})
 }
 
 // RetirePoolRunner claims one member for teardown.

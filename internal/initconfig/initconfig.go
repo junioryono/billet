@@ -102,7 +102,8 @@ const (
 	// ProfileLocalService is the system-service shape the services billet ships
 	// run, and its CONTENTS differ by platform. On Linux: config and App key
 	// under /etc/billet, state under /var/lib/billet, the node's deployment lock
-	// under /run/billet/locks — the units' own RuntimeDirectory. On macOS the
+	// under /run/billet/locks — the directory billet's tmpfiles.d entry makes
+	// at boot and the node unit names writable. On macOS the
 	// same shape lives under /usr/local, because launchd performs no variable
 	// substitution and every path a launch agent uses is a literal in a file
 	// billet ships. Written for `billet local up` on either.
@@ -113,9 +114,10 @@ const (
 const DefaultListen = "127.0.0.1:7717"
 
 // Paths a local-service config must use, matched to the packaged units.
-// deploy/billet-server.service pins StateDirectory=billet/server and the node
-// unit RuntimeDirectory=billet/locks; TestLocalServiceMatchesThePackagedUnits
-// keeps these in step with the unit files.
+// deploy/billet-server.service pins StateDirectory=billet/server, and
+// deploy/billet-tmpfiles.conf the lock directory the node unit names in
+// ReadWritePaths; TestGenerateLocalServiceMatchesThePackagedUnits keeps these
+// in step with the shipped files.
 const (
 	serviceConfDir    = "/etc/billet"
 	serviceStateBase  = "/var/lib/billet"
@@ -1035,6 +1037,35 @@ func firecrackerNodeBlocks(trusted bool, h HostInputs) string {
 // Text rather than a marshalled struct, because the comments are most of the
 // value: an operator reading this file should see which numbers billet measured,
 // which it chose, and what changing one costs.
+// imagesAcceptYAML is the images block a Firecracker host's generated config
+// carries: images.accept, empty, and what each name it may hold installs and under
+// which license, because writing a name is the operator accepting it.
+func imagesAcceptYAML() string {
+	return `
+# THE PARTS OF GITHUB'S RUNNER IMAGE BILLET MAY NOT SHIP. Their licenses forbid
+# billet redistributing them, so billet's published guest image is to leave them
+# out, and a pull installs each one named here from its vendor, inside a microVM,
+# before the image is imported. Nothing is installed unless you name it, and
+# naming one accepts its license. Today's published images still carry all five.
+#
+#   android-sdk     the Android SDK, platforms, build tools and NDKs
+#                   (https://developer.android.com/studio/terms)
+#   codeql          the CodeQL bundle; without it the CodeQL Action downloads it
+#                   per job (https://github.com/github/codeql-cli-binaries/blob/main/LICENSE.md)
+#   firefox         Mozilla Firefox and geckodriver
+#                   (https://www.mozilla.org/en-US/about/legal/terms/firefox/)
+#   google-chrome   Google Chrome, ChromeDriver and Chromium
+#                   (https://www.google.com/chrome/terms/)
+#   microsoft-edge  Microsoft Edge and its WebDriver
+#                   (https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/eula)
+#
+# For example: accept: [google-chrome, codeql]. ` + "`billet check`" + ` says what each
+# tier's image left out that is not accepted here.
+images:
+  accept: []
+`
+}
+
 func renderConfig(p Params, trusted bool, appID, installationID int) string {
 	scope := scopeLineFor(p.Org, p.Repository)
 
@@ -1078,7 +1109,7 @@ func renderConfig(p Params, trusted bool, appID, installationID int) string {
 	}
 
 	if p.Provider == config.ProviderFirecracker {
-		nodeBlocks = firecrackerNodeBlocks(trusted, p.Host)
+		nodeBlocks = firecrackerNodeBlocks(trusted, p.Host) + imagesAcceptYAML()
 		tierIntro = "# A microVM isolates the guest kernel, so these tiers are `trust: untrusted`\n" +
 			"# and run on the untrusted bridge above — firecracker can run code billet\n" +
 			"# cannot vouch for. The image is a published guest generation from\n" +
@@ -1340,8 +1371,8 @@ func stateDirBase() string {
 // ec2 node is an orchestrator, so it is the one backend a Mac can run without
 // any of the hardware the others need.
 func (p Params) lockBlock(dir string) string {
-	note := "in the tmpfs directory the packaged node\n" +
-		"  # unit creates per boot (RuntimeDirectory=billet/locks). The per-user\n" +
+	note := "in the tmpfs directory billet's tmpfiles.d\n" +
+		"  # entry creates at boot (no unit removes it at a stop). The per-user\n" +
 		"  # default is wrong for a system service sharing a rootful runtime socket."
 
 	if p.platform() == "darwin" {
@@ -1387,9 +1418,9 @@ func (p Params) platform() string {
 // profilePaths is where a generated config points, resolved by profile.
 type profilePaths struct {
 	serverState, nodeState, keyPath string
-	// lockDir is set only for the service shape: the packaged node unit's
-	// RuntimeDirectory creates it per boot, while the user-session shape takes
-	// billet's per-user default.
+	// lockDir is set only for the service shape: billet's tmpfiles.d entry
+	// creates it per boot, while the user-session shape takes billet's per-user
+	// default.
 	lockDir string
 }
 

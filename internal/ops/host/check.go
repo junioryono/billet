@@ -154,6 +154,10 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		reportNeedrestart(env.Stdout, "/")
 	}
 
+	if runtime.GOOS == "linux" && cfg.Node != nil {
+		reportLockDir(env.Stdout, cfg.Node.LockDir, checkUnitProperties(ctx))
+	}
+
 	// The probe flag skips the network; so does the BILLET_MAINTENANCE
 	// environment variable — for the SKIPS ONLY, never the fence. The env form
 	// exists for binary-vintage compatibility: the Ansible upgrade transaction
@@ -414,6 +418,8 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			if err := checkCephCluster(ctx, env, cfg.Node.Ceph); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
+
+			reportKernelMappings(ctx, env, cfg)
 		}
 
 		// AFTER THE STORAGE, because the storage belongs to the SITE and this belongs
@@ -429,6 +435,10 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			// the failure this line exists to catch is a refresh timer that stopped
 			// firing, which looks exactly like one that is working.
 			reportGuestImageFreshness(ctx, env, cfg)
+			opsimages.ReportImageComponents(ctx, env, cfg)
+			if !skipNetworkProbes {
+				opsimages.ReportChannelImage(ctx, env, cfg)
+			}
 		}
 
 		if cfg.Node.Provider == config.ProviderTart {

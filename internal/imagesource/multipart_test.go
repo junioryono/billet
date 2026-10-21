@@ -96,7 +96,7 @@ func TestTheRootFilesystemIsDescribedExactlyOnce(t *testing.T) {
 		m := validMultipartManifest()
 		m.Schema = SchemaV1
 
-		requireRefused(t, m, "only schema 2 describes")
+		requireRefused(t, m, "only schemas 2 and 3 describe")
 	})
 }
 

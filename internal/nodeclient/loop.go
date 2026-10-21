@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -67,6 +68,13 @@ type Compute interface {
 type completionAwareCompute interface {
 	DestroyCompleted(ctx context.Context, requestID int64, result string,
 		authority dispatch.CacheAuthority) error
+}
+
+// HandingOver keeps, for the next node process, what this one knows of the
+// jobs a handoff leaves running. Optional: compute that keeps nothing hands
+// its jobs over unmeasured, which costs a measurement and nothing else.
+type HandingOver interface {
+	HandOver(ctx context.Context)
 }
 
 // upgradableCompute can replace this node's own billet.
@@ -143,8 +151,9 @@ type LoopOptions struct {
 	// renewed — so the node has to be re-enrolled by hand.
 	Identity *wirecert.Rotating
 
-	// Hurry, when closed, ends the drain's wait early. It is the operator's
-	// second signal: stop waiting, but still stop properly.
+	// Hurry, when closed, ends the drain's wait early, and cancels a launch the
+	// stop was letting finish (#393). It is the operator's second signal: stop
+	// waiting, but still stop properly.
 	Hurry <-chan struct{}
 	// DrainTimeout is when a stopping node starts REPORTING that it is still
 	// waiting for the compute it holds. It is not a deadline — nothing bounds
@@ -188,6 +197,19 @@ type LoopOptions struct {
 	// Now is the clock the record's registered_at is read from. Nil is the
 	// wall clock.
 	Now func() time.Time
+
+	// Ended is told how this process's stop ended, once, on every way Run
+	// returns nil, with whether the stop was asked to drain; a Run that returns
+	// an error reports nothing, and its caller records the failure. Nil records
+	// nothing.
+	Ended func(ending nodeending.Ending, drainRequested bool)
+}
+
+// ended reports how the stop ended, when the caller asked.
+func (o LoopOptions) ended(ending nodeending.Ending, drainRequested bool) {
+	if o.Ended != nil {
+		o.Ended(ending, drainRequested)
+	}
 }
 
 // registration is what this node tells the control plane about itself.
@@ -385,6 +407,8 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	// have systemd mark the unit failed — the same reasoning as stopGracefully's
 	// own returns.
 	if errors.Is(err, ErrSuperseded) && ctx.Err() != nil {
+		opts.ended(nodeending.Superseded, opts.DrainRequested != nil && opts.DrainRequested())
+
 		return nil
 	}
 
@@ -600,8 +624,15 @@ func stopGracefully(
 	// stopped before its first recovery may already own what it registered with.
 	if opts.HandOverOnStop && !drainRequested {
 		if withdraw(ctx, c, log, opts) {
+			// WHAT IS KNOWN OF THE JOBS IS KEPT FOR THE NEXT PROCESS, which adopts
+			// them and continues measuring them from it (#384). Only now: a
+			// withdrawal that did not land drains instead, and measures them here.
+			if h, ok := compute.(HandingOver); ok {
+				h.HandOver(context.WithoutCancel(ctx))
+			}
 			log.Info("handing over to the next node process: the compute running here keeps " +
 				"running and is adopted when billet node starts again")
+			opts.ended(nodeending.HandedOff, drainRequested)
 
 			return nil
 		}
@@ -627,7 +658,7 @@ func stopGracefully(
 		if !drainRequested {
 			attempts = unrecoveredStopAttempts
 		}
-		recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
+		recovered = recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
 	}
 
 	// A node holding nothing stops at once. The drain is for work in flight, not
@@ -641,6 +672,18 @@ func stopGracefully(
 	// succeeding, and the caller turns what comes back into a process exit status.
 	if !compute.Holding() {
 		withdraw(ctx, c, log, opts)
+
+		// HOLDING NOTHING IS A DRAIN ONLY WHEN THIS PROCESS KNEW WHAT ITS HOST RUNS.
+		// One that never registered was given nothing; one that registered and
+		// never recovered may own guests it cannot see, and leaves them running.
+		switch {
+		case recovered:
+			opts.ended(nodeending.Drained, drainRequested)
+		case !c.EverRegistered():
+			opts.ended(nodeending.Idle, drainRequested)
+		default:
+			opts.ended(nodeending.LeftRunning, drainRequested)
+		}
 
 		return nil
 	}
@@ -792,6 +835,18 @@ func stopGracefully(
 		withdraw(ctx, c, log, opts)
 	}
 
+	// A WAIT THAT EMPTIED IS A DRAIN ONLY WHEN THIS PROCESS KNEW WHAT ITS HOST
+	// RUNS: a recovery that adopted one guest and failed on the next leaves the
+	// second outside Holding() for the whole wait.
+	switch {
+	case drained && recovered:
+		opts.ended(nodeending.Drained, drainRequested)
+	case superseded.Load():
+		opts.ended(nodeending.Superseded, drainRequested)
+	default:
+		opts.ended(nodeending.LeftRunning, drainRequested)
+	}
+
 	if drained {
 		log.Info("everything running here has finished; stopping")
 
@@ -918,14 +973,15 @@ const unrecoveredStopAttempts = 3
 
 // recoverBeforeDrain registers if this process never did and recovers, until it
 // succeeds, a second signal arrives or, when attempts is positive, that many
-// attempts have failed. The janitor starts once a registration
-// has told it the lease TTL and before anything is recovered, exactly as at an
-// ordinary registration: recovery adopts leases, and a drain can outlast their
-// TTL many times over while Tend's provider calls are not what renews them.
+// attempts have failed, and says whether it recovered. The janitor starts once a
+// registration has told it the lease TTL and before anything is recovered,
+// exactly as at an ordinary registration: recovery adopts leases, and a drain
+// can outlast their TTL many times over while Tend's provider calls are not
+// what renews them.
 func recoverBeforeDrain(
 	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions,
 	startJanitor func(), attempts int,
-) {
+) bool {
 	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
@@ -949,23 +1005,25 @@ func recoverBeforeDrain(
 			err = compute.Recover(recoverCtx)
 		}
 		if err == nil {
-			return
+			return true
 		}
 
 		if attempts > 0 && attempt >= attempts {
 			log.Error("could not learn what this host runs before stopping; stopping anyway, "+
 				"and the next node process adopts what it finds", "attempts", attempt, "error", err)
 
-			return
+			return false
 		}
 
 		log.Error("stopping before this process knew what its host runs; recovering before "+
 			"deciding whether it holds anything", "error", err)
 
 		if !sleep(recoverCtx, backoffFor(opts)) {
-			return
+			return false
 		}
 	}
+
+	return false
 }
 
 // backoffFor is the pause after a failed registration or poll.
@@ -1117,10 +1175,33 @@ func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptio
 func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, draining bool) error {
 	sweepAt := time.Now().Add(opts.SweepEvery)
 
+	// A LAUNCH ALREADY EXECUTING FINISHES; THE STOP DOES NOT CANCEL IT (#393). A
+	// stop cut the first live handover's launch off while it sized its root disk,
+	// which wasted the launch, held its capacity in quarantine for minutes and
+	// read like a storage fault, when the launch was seconds of work. Only the
+	// operator's second signal cancels one.
+	launchCtx, endLaunches := launchContext(ctx, opts.Hurry)
+
+	// SAID WHEN THE STOP ARRIVES, while the launches it waits for run, whether
+	// they overlap or run inline: a stop that waits in silence is one somebody
+	// kills.
+	var executing atomic.Int32
+	stopSaying := context.AfterFunc(ctx, func() {
+		if n := executing.Load(); n > 0 {
+			log.Info("waiting for the launches already running to finish before stopping; a second "+
+				"signal cancels them", "launches", n)
+		}
+	})
+
 	// EVERY LAUNCH STARTED HERE IS REPORTED BEFORE serve RETURNS, so a
-	// re-registration never runs beside a launch begun under the last one.
+	// re-registration never runs beside a launch begun under the last one. The
+	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
-	defer launches.wait()
+	defer func() {
+		launches.wait()
+		stopSaying()
+		endLaunches()
+	}()
 
 	// CUSTODY IS ADVANCED BY ONE CALLER AT A TIME. A launch whose report is lost
 	// takes custody from its own goroutine, and the custody it creates can settle
@@ -1213,7 +1294,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		// destroy run under a fresh, bounded context so shutdown can still converge.
 		run := func() error {
 			return reportOutcome(ctx, c, compute, log, &custody, cmd,
-				executePolled(ctx, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
+				executePolled(ctx, launchCtx, &executing, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
 		}
 
 		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
@@ -1235,6 +1316,24 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			return err
 		}
 	}
+}
+
+// launchContext is what a launch runs under once it has begun: ctx's values
+// without its cancellation, ended by hurry (the operator's second signal) or by
+// the returned cancel, which the caller runs once every launch has returned.
+func launchContext(ctx context.Context, hurry <-chan struct{}) (context.Context, context.CancelFunc) {
+	launchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	if hurry != nil {
+		go func() {
+			select {
+			case <-hurry:
+				cancel()
+			case <-launchCtx.Done():
+			}
+		}()
+	}
+
+	return launchCtx, cancel
 }
 
 // reportOutcome reports what one command did, taking custody of a launch whose
@@ -1270,9 +1369,12 @@ func reportOutcome(
 		// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
 		// runner records the lease before it tries to renew it, precisely
 		// because this call happens during the outage that lost the report
-		// — so the janitor already owns it and will keep retrying.
+		// — so the janitor already owns it and will keep retrying. Never on
+		// the poll's context, which a stop may end before or during the
+		// report, and a launch the stop let finish lands here: its first
+		// renewal would fail on it. The renewal bounds its own request.
 		custody.Lock()
-		custodyErr := compute.AssumeCustody(ctx, cmd.Lease, cmd.RequestIDOf())
+		custodyErr := compute.AssumeCustody(context.WithoutCancel(ctx), cmd.Lease, cmd.RequestIDOf())
 		custody.Unlock()
 		if custodyErr != nil {
 			log.Warn("took custody of a launch whose result was lost, but could not "+
@@ -1302,12 +1404,16 @@ func reportOutcome(
 // staging either over a real wire would mean building a deliberately wrong
 // control plane to test a node.
 func ExecuteForTest(ctx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.CommandResult {
-	return executePolled(ctx, compute, cmd, false, requestTimeout, nodeapi.Version)
+	return executePolled(ctx, ctx, nil, compute, cmd, false, requestTimeout, nodeapi.Version)
 }
 
-// executePolled settles the shutdown boundary before a command starts.
+// executePolled settles the shutdown boundary before a command starts: the
+// poll's context decides it, and a launch that passes it runs under launchCtx,
+// which the stop does not cancel, counted in executing while it runs (nil
+// counts nothing).
 func executePolled(
-	ctx context.Context,
+	ctx, launchCtx context.Context,
+	executing *atomic.Int32,
 	compute Compute,
 	cmd nodeapi.Command,
 	draining bool,
@@ -1315,7 +1421,15 @@ func executePolled(
 	negotiated int,
 ) nodeapi.CommandResult {
 	if ctx.Err() == nil {
-		return execute(ctx, compute, cmd, draining, negotiated)
+		if cmd.Kind != nodeapi.CommandLaunch {
+			return execute(ctx, compute, cmd, draining, negotiated)
+		}
+		if executing != nil {
+			executing.Add(1)
+			defer executing.Add(-1)
+		}
+
+		return execute(launchCtx, compute, cmd, draining, negotiated)
 	}
 
 	commandCtx, finishCommand := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)

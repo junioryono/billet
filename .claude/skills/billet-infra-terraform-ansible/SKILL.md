@@ -16,6 +16,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### Terraform: [references/terraform.md](references/terraform.md)
 
 - **The terraform gates are outside `make check` and CI runs them on every PR that touches more than documentation.** Run `make tf-fmt-check tf-validate tf-test tf-lint tf-scan` before pushing a `.tf` change.
+- **Every lock file records all four platforms' h1 checksum, or CI's provider cache is never used.**
 - **The root `billet init hybrid` writes is validated by terraform, not by Go.**
 - **`tfclass` says what a change costs a running deployment; `terraform plan` cannot.**
 - **`tfpolicy` keeps the module's IAM equal to the generator's.**
@@ -31,6 +32,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **cephadm.log has one rotation rule, ceph-common's.**
 - **A converge restarts services, so never drive one from a runner billet manages.**
 - **The ordinary node restart is requested, never awaited.**
+- **Every node stop the role performs is proved by the node's ending, and every node start is admitted.**
 - **The role's variables that must be supplied, never guessed.**
 - **The host role migrates a node's endpoint through billet's own commands, and infers nothing from the configurations.**
 - **The scenario tests are make targets, each one converging the role in a specific state.**

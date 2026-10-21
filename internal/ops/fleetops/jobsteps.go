@@ -61,7 +61,7 @@ func readJobSteps(ctx context.Context, cfgPath string, a *alloc.Allocator, rec a
 		return out
 	}
 
-	out.timeline, out.unaligned = jobTimeline(ctx, a, rec.LeaseID, measured)
+	out.timeline, out.unaligned = jobTimeline(ctx, a, rec, measured)
 
 	ctx, cancel := context.WithTimeout(ctx, stepsReadLimit)
 	defer cancel()
@@ -77,13 +77,15 @@ func readJobSteps(ctx context.Context, cfgPath string, a *alloc.Allocator, rec a
 
 // jobTimeline is a lease's stored series on the host's clock, or why there is
 // none.
-func jobTimeline(ctx context.Context, a *alloc.Allocator, leaseID string, measured *alloc.RecordedUsage,
+func jobTimeline(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord, measured *alloc.RecordedUsage,
 ) (*usage.Timeline, string) {
 	if measured == nil {
 		return nil, "no usage report was recorded"
 	}
-	series, err := a.LeaseUsageSeries(ctx, leaseID)
+	series, err := a.LeaseUsageSeries(ctx, rec.LeaseID)
 	switch {
+	case errors.Is(err, alloc.ErrLeaseNotFound) && rec.DetailRetiredAt != "":
+		return nil, detailRetired(rec)
 	case errors.Is(err, alloc.ErrLeaseNotFound):
 		return nil, "the usage report came with no series"
 	case err != nil:
@@ -93,7 +95,7 @@ func jobTimeline(ctx context.Context, a *alloc.Allocator, leaseID string, measur
 	switch {
 	case errors.Is(err, usage.ErrNoClock):
 		return nil, "the series was recorded without its start on the host's clock (by a node, or for a " +
-			"control plane, older than wire 26), so no step can be placed on it"
+			"control plane, older than wire 28), so no step can be placed on it"
 	case err != nil:
 		return nil, "the usage series could not be decoded: " + strconv.Quote(err.Error())
 	}

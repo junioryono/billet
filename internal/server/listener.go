@@ -43,6 +43,11 @@ type RunnerRegistry interface {
 	RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error
 }
 
+// ErrRunnerBusy is a RemoveRunner GitHub refused because the runner is running
+// a job (its JobStillRunningException): proof GitHub gave it work, though billet
+// may not have heard which yet.
+var ErrRunnerBusy = errors.New("server: GitHub refused to remove a runner that is running a job")
+
 // completionStore is the durable half of result-dependent teardown.
 type completionStore interface {
 	PutPendingCompletion(ctx context.Context, completion state.PendingCompletion) (state.PendingCompletionDisposition, error)
@@ -161,7 +166,8 @@ const identityWriteLimit = 2 * time.Second
 // historyJob is what a message said about its job, as job_history keeps it.
 func historyJob(j dispatch.Job) alloc.HistoryJob {
 	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
-		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event}
+		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event, QueuedAt: j.QueuedAt,
+		ScaleSetAssignedAt: j.ScaleSetAssignedAt, RunnerAssignedAt: j.RunnerAssignedAt}
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -325,6 +331,9 @@ type Listener struct {
 	// and now its clock; nil is the wall clock. See retireOfflineMembers.
 	offline offlineWatch
 	now     func() time.Time
+	// reinstated is when this listener last reinstated each member busy with its
+	// job unknown, for recheckReinstated, under mu.
+	reinstated map[string]time.Time
 	// claimRetirement stands in for alloc.RetirePoolRunner on the offline path,
 	// so a test can fail the ledger write after GitHub accepted the withdrawal.
 	claimRetirement func(context.Context, string) error
@@ -1187,7 +1196,7 @@ func (l *Listener) Run(ctx context.Context) error {
 //
 // WHICH IS THE COST OF THIS ONE, AND THE REASON NOT TO REACH FOR IT MORE WIDELY.
 // It is a blanket collapse: a genuine storage fault racing a SIGTERM comes out of
-// here as a bare cancellation, and `onlyCancellation` then discards it. It is
+// here as a bare cancellation, and Run's `state.StoppedBy` then discards it. It is
 // used on the poll loop's paths, where a cancellation is the OVERWHELMING case
 // and the alternative is a drain that reports nothing. Adding it to a startup
 // path — which a round of this already tried — buys nothing the state layer does

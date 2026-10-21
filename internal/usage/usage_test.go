@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -152,7 +153,9 @@ func TestTheReferenceVMReadsAsItWasMeasured(t *testing.T) {
 // MiB dirty, then io.stat 512 MiB (the batch moved): it is discarded, and the
 // second pass reads dirty afresh (0), so the answer is 512 MiB, once. Reusing
 // the first pass's dirty read would answer 1 GiB. Each pass reads io, dirty,
-// io, in that order. Three passes that keep moving are could-not-tell.
+// io, in that order. Three passes that writeback kept moving forward are a
+// lower bound; a counter that fell, within a pass or between two, is
+// could-not-tell.
 func TestWrittenIsReadCoherentlyAcrossWriteback(t *testing.T) {
 	t.Parallel()
 
@@ -176,26 +179,56 @@ func TestWrittenIsReadCoherentlyAcrossWriteback(t *testing.T) {
 		dirtyCalls++
 		return dirties[dirtyCalls-1], nil
 	}
-	rb, written, ok := coherentWritten(readIO, readDirty)
-	if !ok || written != 512<<20 || rb != 7 {
-		t.Fatalf("written %d (ok %v); want 512 MiB from the second, coherent pass", written, ok)
+	rb, written, bounded, ok := coherentWritten(readIO, readDirty)
+	if !ok || bounded || written != 512<<20 || rb != 7 {
+		t.Fatalf("written %d (ok %v, bounded %v); want 512 MiB exactly from the second, coherent pass",
+			written, ok, bounded)
 	}
 	if want := []string{"io", "dirty", "io", "io", "dirty", "io"}; !slices.Equal(calls, want) {
 		t.Fatalf("reads were %v, want %v", calls, want)
 	}
 
+	// WRITEBACK THAT MOVED io.stat ON EVERY PASS IS A LOWER BOUND, NOT A LOST
+	// SAMPLE (#495): the last pass's first read plus its dirty bytes, which
+	// misses only what moved between those two reads.
 	moving := int64(0)
-	alwaysMoving := func() (int64, int64, error) { moving += 1 << 20; return 0, moving, nil }
-	if _, w, ok := coherentWritten(alwaysMoving, func() (int64, error) { return 0, nil }); ok {
-		t.Errorf("io.stat that moved on every pass answered %d written; want could-not-tell", w)
+	alwaysMoving := func() (int64, int64, error) { moving += 1 << 20; return 3, moving, nil }
+	rb, w, bounded, ok := coherentWritten(alwaysMoving, func() (int64, error) { return 1 << 10, nil })
+	if !ok || !bounded || w != 5<<20+1<<10 || rb != 3 {
+		t.Errorf("io.stat that moved on every pass answered %d written, %d read (ok %v, bounded %v); want "+
+			"the lower bound 5 MiB + 1 KiB from the last pass", w, rb, ok, bounded)
 	}
-	if _, w, ok := coherentWritten(func() (int64, int64, error) { return 0, 1 << 20, nil },
+	if _, w, _, ok := coherentWritten(func() (int64, int64, error) { return 0, 1 << 20, nil },
 		func() (int64, error) { return -4096, nil }); ok {
 		t.Errorf("a negative dirty count answered %d written", w)
 	}
-	if _, w, ok := coherentWritten(func() (int64, int64, error) { return 0, math.MaxInt64, nil },
+	if _, w, _, ok := coherentWritten(func() (int64, int64, error) { return 0, math.MaxInt64, nil },
 		func() (int64, error) { return 1, nil }); ok {
 		t.Errorf("a sum past an int64 answered %d", w)
+	}
+	movingToTheTop := int64(math.MaxInt64 - 10)
+	if _, w, _, ok := coherentWritten(func() (int64, int64, error) { movingToTheTop++; return 0, movingToTheTop, nil },
+		func() (int64, error) { return 1 << 20, nil }); ok {
+		t.Errorf("a lower bound past an int64 answered %d", w)
+	}
+	if _, w, _, ok := coherentWritten(func() (int64, int64, error) { return 0, 0, errors.New("gone") },
+		func() (int64, error) { return 0, nil }); ok {
+		t.Errorf("an io.stat that could not be read answered %d written", w)
+	}
+
+	// A COUNTER THAT FALLS IS NOT WRITEBACK, so it is no lower bound: falling
+	// on every read, and rising within each pass but starting the next below
+	// where the last ended.
+	for name, reads := range map[string][]int64{
+		"falling":           {100, 90, 80, 70, 60, 50},
+		"falling between":   {100, 110, 50, 60, 20, 30},
+		"falling in a pass": {100, 110, 110, 120, 130, 125},
+	} {
+		next := 0
+		read := func() (int64, int64, error) { next++; return 0, reads[next-1], nil }
+		if _, w, _, ok := coherentWritten(read, func() (int64, error) { return 0, nil }); ok {
+			t.Errorf("%s: io.stat that went %v answered %d written", name, reads, w)
+		}
 	}
 	if _, _, err := parseIOStat("8:0 rbytes=0 wbytes=9223372036854775807\n8:16 rbytes=0 wbytes=1\n"); err == nil {
 		t.Error("io.stat devices summing past an int64 parsed")

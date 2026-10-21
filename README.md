@@ -115,7 +115,7 @@ Terraform modules live under [`terraform/modules`](terraform/modules/billet/READ
 
 ## Alternatives
 
-Use one of these if it fits. [actions-runner-controller](https://github.com/actions/actions-runner-controller) is GitHub's own and needs Kubernetes. [terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner) is AWS-only. [GARM](https://github.com/cloudbase/garm) is the closest open-source multi-provider control plane, without a cache. [Ubicloud](https://github.com/ubicloud/ubicloud) is the best open reference for how a commercial runner cloud is built, under AGPL. [Actuated](https://actuated.com), [Blacksmith](https://blacksmith.sh), [Namespace](https://namespace.so), [WarpBuild](https://warpbuild.com) and [Depot](https://depot.dev) are managed products. billet is one `runs-on` label spanning bare metal, Apple Silicon and the cloud with failover between them, plus a colocated cache, in one Apache-2.0 binary with no Kubernetes; every piece of that exists somewhere in that list and the combination does not. billet borrows several of Blacksmith's published designs and says so.
+Use one of these if it fits. [actions-runner-controller](https://github.com/actions/actions-runner-controller) is GitHub's own and needs Kubernetes. [terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner) is AWS-only. [GARM](https://github.com/cloudbase/garm) is the closest open-source multi-provider control plane, without a cache. [Ubicloud](https://github.com/ubicloud/ubicloud) is the best open reference for how a commercial runner cloud is built, under AGPL. [Actuated](https://actuated.com), [Blacksmith](https://blacksmith.sh), [Namespace](https://namespace.so), [WarpBuild](https://warpbuild.com) and [Depot](https://depot.dev) are managed products. billet is one `runs-on` label spanning bare metal, Apple Silicon and the cloud with failover between them, plus a colocated cache, in one Apache-2.0 binary with no Kubernetes; every piece of that exists somewhere in that list and the combination does not. Where one of billet's designs follows an approach someone else has published, its decision record or the [upstream references](docs/reference/upstream-references.md) cite the source.
 
 ## Contributing
 
@@ -123,4 +123,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). `make check` is the gate; the skills und
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE). Apple Silicon support requires [Tart](https://tart.run), which is licensed FSL-1.1-ALv2 and is an external dependency you install yourself, like Docker or Ceph.
+billet is Apache-2.0 ([LICENSE](LICENSE)), with one exception:
+
+| Path | License |
+|---|---|
+| Everything outside `ee/` | [Apache License 2.0](LICENSE) |
+| [`ee/`](ee/) | [The billet Enterprise License](ee/LICENSE): free to read, and to modify and run to develop, test or evaluate it; any other use, including running it in your own CI, needs a subscription |
+| Third-party code billet carries | Its own license, kept beside it |
+
+Nothing outside `ee/` depends on it, so the Apache-licensed build is complete on its own. Copyright 2026 Junior Yono; [NOTICE](NOTICE) is the notice a redistribution carries. Apple Silicon support requires [Tart](https://tart.run), which is licensed FSL-1.1-ALv2 and is an external dependency you install yourself, like Docker or Ceph.

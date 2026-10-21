@@ -411,6 +411,29 @@ func firecrackerTierImage(cfg *config.Config) (string, error) {
 
 // firecrackerTierImages are the distinct images this deployment's microVM tiers boot.
 func FirecrackerTierImages(cfg *config.Config) ([]string, error) {
+	uses, err := firecrackerTierUses(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	images := make([]string, 0, len(uses))
+	for _, use := range uses {
+		images = append(images, use.image)
+	}
+
+	return images, nil
+}
+
+// tierImageUse is one image reference this node's microVM tiers boot, and the
+// labels of the tiers that boot it.
+type tierImageUse struct {
+	image string
+	tiers []string
+}
+
+// firecrackerTierUses are the distinct images this node's microVM tiers boot, in
+// the order the tiers first name them, each with the tiers that name it.
+func firecrackerTierUses(cfg *config.Config) ([]tierImageUse, error) {
 	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker {
 		return nil, nil
 	}
@@ -419,8 +442,8 @@ func FirecrackerTierImages(cfg *config.Config) ([]string, error) {
 		return nil, fmt.Errorf("select firecracker tier images: resolve node identity: %w", err)
 	}
 
-	images := make([]string, 0, len(cfg.Tiers))
-	seen := map[string]bool{}
+	var uses []tierImageUse
+	at := map[string]int{}
 
 	for i := range cfg.Tiers {
 		if cfg.Tiers[i].Node != "" && cfg.Tiers[i].Node != cfg.Node.Name {
@@ -429,15 +452,21 @@ func FirecrackerTierImages(cfg *config.Config) ([]string, error) {
 		if cfg.Tiers[i].Site != "" && cfg.Tiers[i].Site != cfg.Node.Site {
 			continue
 		}
-		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
-			if !seen[image] {
-				images = append(images, image)
-				seen[image] = true
-			}
+		image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker)
+		if !cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) || image == "" {
+			continue
 		}
+
+		j, seen := at[image]
+		if !seen {
+			j = len(uses)
+			at[image] = j
+			uses = append(uses, tierImageUse{image: image})
+		}
+		uses[j].tiers = append(uses[j].tiers, cfg.Tiers[i].Label)
 	}
 
-	return images, nil
+	return uses, nil
 }
 
 // tartTierImages are the distinct images this node's tart tiers boot.
@@ -629,6 +658,26 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	}
 	disk := verifyDisk(cfg, override)
 
+	// AN INCOMPLETE GENERATION IS NOT RECORDED, AND THAT IS ASKED BEFORE THE BOOT
+	// rather than after it: a boot that passes says nothing about what the image
+	// lacks.
+	if *record {
+		if cfg.Node.Ceph == nil {
+			return errors.New("billet images verify: this config names no ceph cluster")
+		}
+
+		reader, err := openComponentsReader(cfg)
+		if err != nil {
+			return err
+		}
+
+		imageName, generation, _ := strings.Cut(rest, "@")
+		if err := refuseIncomplete(ctx, reader, "billet images verify", imageName, generation,
+			cfg.Images.Accepted()); err != nil {
+			return err
+		}
+	}
+
 	// THE SAME DERIVATION `billet node` USES, rather than a second one that agrees
 	// with it by luck. The identity decides which jails this command can see, so a
 	// verification that derived it differently would either see nothing of its own
@@ -696,12 +745,21 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	// rather than a sweep of whatever happened to be there — which could not be made
 	// safe, because the provider deliberately reports jails with no owner marker and
 	// those are indistinguishable from a real node launch caught mid-creation.
+	//
+	// ONLY AS THE HOLDER: a probe by this name may be another verification's
+	// live one when the lock's name has moved (#175). Nothing guards the
+	// record below: the report the verdict rests on is authenticated by this
+	// run's own secret, so a verdict that passed is this run's guest's boot.
+	if err := lock.hold(); err != nil {
+		return err
+	}
+
 	if err := destroyProbe(ctx, prov, provider.InstanceName(lease)); err != nil {
 		return err
 	}
 
 	if err := verifyGuestImage(ctx, env, prov, cfg.Node.Firecracker.Bridge,
-		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait); err != nil {
+		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait, lock.hold); err != nil {
 		return err
 	}
 
@@ -811,10 +869,91 @@ func verifyDisk(cfg *config.Config, override config.ByteSize) config.ByteSize {
 }
 
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
+// hold makes sure this run holds the verification lock, and is asked
+// before the launch and before each destroy of the probe; nil asks nothing.
 func verifyGuestImage(
 	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
-	image, lease string, disk config.ByteSize, wait time.Duration,
+	image, lease string, disk config.ByteSize, wait time.Duration, hold func() error,
 ) error {
+	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
+
+	result := runGuestProbe(ctx, env, prov, bridge, port, verificationProbe(env, image, lease, disk, wait),
+		hold)
+
+	return errors.Join(result.verdict, result.cleanup)
+}
+
+// verificationProbe is the probe `images verify` runs: the guest reports on itself,
+// and checkGuestReport judges whether it can run a job.
+func verificationProbe(env cli.Env, image, lease string, disk config.ByteSize,
+	wait time.Duration,
+) guestProbe {
+	return guestProbe{
+		command: "billet images verify",
+		image:   image,
+		lease:   lease,
+		wait:    wait,
+		spec: func(name, addr, secret string) provider.Spec {
+			return probeSpec(name, image, addr, secret, disk)
+		},
+		check: func(body, secret string) error { return checkGuestReport(env, body, secret, disk) },
+		silent: "so it cannot be shown to run a job; boot it by hand with a console " +
+			"(console=ttyS0 systemd.journald.forward_to_console=1) to read the agent's own " +
+			"account of itself",
+	}
+}
+
+// guestProbe is one trusted microVM a command launches on this node, outside the
+// node's own deployment, and the report it waits for from the guest.
+type guestProbe struct {
+	// command names the command in its errors, as "billet images verify".
+	command string
+	// image is what the probe boots, image@generation.
+	image string
+	lease string
+	wait  time.Duration
+	// spec is the launch, given the instance name, the listener's address and the
+	// run's secret.
+	spec func(name, addr, secret string) provider.Spec
+	// check turns the guest's authenticated report into the verdict.
+	check func(body, secret string) error
+	// silent completes the sentence a probe that never reported is refused with.
+	silent string
+}
+
+// probeResult is what a probe ended with: the guest's verdict, the cleanup's
+// failure, and whether the microVM is proved gone, which only a destroy the
+// backend answered TeardownStopped proves.
+type probeResult struct {
+	verdict error
+	cleanup error
+	gone    bool
+}
+
+// runGuestProbe launches a probe, waits for its report and destroys it. hold
+// makes sure this run holds the probe lock, and is asked before the launch and
+// before each destroy of the probe; nil asks nothing.
+func runGuestProbe(
+	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
+	probe guestProbe, hold func() error,
+) probeResult {
+	if hold == nil {
+		hold = func() error { return nil }
+	}
+
+	// A PROBE IS DESTROYED ONLY BY ITS HOLDER. The name is the same on every run,
+	// so after the lock's name moved (#175) it may be another verification's
+	// live microVM; it is left in place, and the next verification's pre-launch
+	// cleanup collects it.
+	destroy := func(name string) (bool, error) {
+		if err := hold(); err != nil {
+			return false, fmt.Errorf("%w; the probe %s was left in place for the next "+
+				"verification's cleanup", err, name)
+		}
+
+		return destroyProbeProved(ctx, prov, name)
+	}
+
 	// A LISTENER ON THIS MACHINE, because the assertion has to be made BY THE GUEST.
 	// Anything the host can check on its own was already green for an image that ran
 	// no job at all.
@@ -824,12 +963,12 @@ func verifyGuestImage(
 	// decide what is even worth keeping.
 	secret, err := verificationSecret()
 	if err != nil {
-		return err
+		return probeResult{verdict: err, gone: true}
 	}
 
 	srv, addr, serveErr, err := listenGuestReport(ctx, bridge, port, secret, report)
 	if err != nil {
-		return err
+		return probeResult{verdict: err, gone: true}
 	}
 
 	defer func() {
@@ -838,10 +977,12 @@ func verifyGuestImage(
 		}
 	}()
 
-	name := provider.InstanceName(lease)
-	spec := probeSpec(name, image, addr, secret, disk)
+	name := provider.InstanceName(probe.lease)
+	spec := probe.spec(name, addr, secret)
 
-	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
+	if err := hold(); err != nil {
+		return probeResult{verdict: err, gone: true}
+	}
 
 	if _, err := prov.Launch(ctx, spec); err != nil {
 		// A LAUNCH ERROR IS NOT PROOF THAT NOTHING STARTED, which the provider says
@@ -849,19 +990,24 @@ func verifyGuestImage(
 		// was accepted, and the backend's own unwind can itself fail. So the probe is
 		// reconciled rather than assumed away — otherwise a failed verification is
 		// also a leaked uid, device name and cloned disk.
-		return errors.Join(
-			fmt.Errorf("billet images verify: %s did not launch: %w", image, err),
-			destroyProbe(ctx, prov, name),
-		)
+		gone, cleanup := destroy(name)
+
+		return probeResult{
+			verdict: fmt.Errorf("%s: %s did not launch: %w", probe.command, probe.image, err),
+			cleanup: cleanup,
+			gone:    gone,
+		}
 	}
 
-	verdict := awaitGuestReport(ctx, env, report, serveErr, image, secret, disk, wait)
+	verdict := awaitProbeReport(ctx, report, serveErr, probe, secret)
 
 	// CLEANUP IS PART OF THE RESULT, NOT A WARNING BESIDE IT. As a bare defer this
 	// printed a line and returned success, so the weekly job would announce a
 	// verified image while probes accumulated — each holding a uid, a device name
 	// and a cloned disk, and each invisible to the node's sweep by design.
-	return errors.Join(verdict, destroyProbe(ctx, prov, name))
+	gone, cleanup := destroy(name)
+
+	return probeResult{verdict: verdict, cleanup: cleanup, gone: gone}
 }
 
 // probeSpec is the launch a verification makes: a trusted microVM whose command
@@ -913,30 +1059,39 @@ func probeSpec(name, image, addr, secret string, disk config.ByteSize) provider.
 	}
 }
 
-// awaitGuestReport waits for the guest to say something, or for a reason it cannot.
+// awaitGuestReport waits for a verification's guest to say something, or for a
+// reason it cannot.
 func awaitGuestReport(
 	ctx context.Context, env cli.Env, report <-chan string, serveErr <-chan error,
 	image, secret string, disk config.ByteSize, wait time.Duration,
 ) error {
-	timer := time.NewTimer(wait)
+	return awaitProbeReport(ctx, report, serveErr, verificationProbe(env, image, "", disk, wait),
+		secret)
+}
+
+// awaitProbeReport waits for a probe's guest to say something, or for a reason it
+// cannot.
+func awaitProbeReport(
+	ctx context.Context, report <-chan string, serveErr <-chan error, probe guestProbe,
+	secret string,
+) error {
+	timer := time.NewTimer(probe.wait)
 	defer timer.Stop()
 
 	select {
 	case body := <-report:
-		return checkGuestReport(env, body, secret, disk)
+		return probe.check(body, secret)
 
 	case err := <-serveErr:
 		// THE LISTENER DIED, WHICH IS NOT THE IMAGE'S FAULT. Without this the wait
 		// runs to its deadline and the verdict blames a guest that was reporting to
 		// a socket nobody was reading.
-		return fmt.Errorf("billet images verify: the listener the guest reports to failed, so "+
-			"nothing here can say whether %s works: %w", image, err)
+		return fmt.Errorf("%s: the listener the guest reports to failed, so "+
+			"nothing here can say whether %s works: %w", probe.command, probe.image, err)
 
 	case <-timer.C:
-		return fmt.Errorf("billet images verify: %s booted and never reported back within %s, "+
-			"so it cannot be shown to run a job; boot it by hand with a console "+
-			"(console=ttyS0 systemd.journald.forward_to_console=1) to read the agent's own "+
-			"account of itself", image, wait)
+		return fmt.Errorf("%s: %s booted and never reported back within %s, %s",
+			probe.command, probe.image, probe.wait, probe.silent)
 
 	case <-ctx.Done():
 		return ctx.Err()
@@ -950,6 +1105,15 @@ func awaitGuestReport(
 // removes the deadline as well, so a teardown that wedges would hang a scheduled job
 // until systemd killed it two hours later.
 func destroyProbe(ctx context.Context, prov provider.Provider, name string) error {
+	_, err := destroyProbeProved(ctx, prov, name)
+
+	return err
+}
+
+// destroyProbeProved is destroyProbe, also answering whether the backend
+// confirmed the microVM gone (TeardownStopped). Nothing else proves it, and
+// what the probe was given (a loop device, say) is released only on that proof.
+func destroyProbeProved(ctx context.Context, prov provider.Provider, name string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	defer cancel()
 
@@ -966,14 +1130,18 @@ func destroyProbe(ctx context.Context, prov provider.Provider, name string) erro
 	// The teardown state is not consulted: this is the firecracker backend, whose
 	// Destroy is synchronous, and the probe holds no lease whose capacity could be
 	// released early if it were not.
-	if _, err := prov.Destroy(ctx, name); err != nil {
-		return fmt.Errorf("billet images verify: the probe %s was not cleaned up and holds a "+
+	teardown, err := prov.Destroy(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("billet images verify: the probe %s was not cleaned up and holds a "+
 			"uid, a device name and a cloned disk; nothing else will reap it, because it is "+
 			"deliberately not owned by the node: %w", name, err)
 	}
 
-	return nil
+	return teardown == provider.TeardownStopped, nil
 }
+
+// maxGuestReportBytes bounds what the report listener accepts from a guest.
+const maxGuestReportBytes = 64 << 10
 
 // listenGuestReport is listenForGuestReport, a variable so a test can verify
 // without a bridge on the machine it runs on.
@@ -1014,9 +1182,19 @@ func listenForGuestReport(
 
 		// BOUNDED, because this is a report from a guest running somebody's image
 		// and the alternative is letting it decide how much this process allocates.
-		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+		//
+		// AND REFUSED PAST THE BOUND, NOT CUT AT IT. A report cut at its limit
+		// reads as a shorter report that ends cleanly, so a guest could pad a line
+		// to push what follows it, a failure, out of what is judged.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxGuestReportBytes+1))
 		if err != nil {
 			http.Error(w, "could not read the report", http.StatusBadRequest)
+
+			return
+		}
+
+		if len(body) > maxGuestReportBytes {
+			http.Error(w, "the report is too long", http.StatusRequestEntityTooLarge)
 
 			return
 		}
@@ -1310,6 +1488,20 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 
 	if cfg.Node == nil || cfg.Node.Ceph == nil {
 		return errors.New(name + ": this config names no ceph cluster")
+	}
+
+	// AN INCOMPLETE GENERATION IS NEVER PROMOTED: verified, @verified would move
+	// every tier onto an image without what this deployment accepted.
+	if verified {
+		reader, err := openComponentsReader(cfg)
+		if err != nil {
+			return err
+		}
+
+		imageName, generation, _ := strings.Cut(rest, "@")
+		if err := refuseIncomplete(ctx, reader, name, imageName, generation, cfg.Images.Accepted()); err != nil {
+			return err
+		}
 	}
 
 	store, err := ceph.New(*cfg.Node.Ceph)

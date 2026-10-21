@@ -156,6 +156,15 @@ server:
   #
   # drain_timeout: 6h
 
+  # How long the ledger keeps a job's per-sample series, destinations and guest
+  # report, which `billet jobs show` draws its charts, steps and guest view from;
+  # the job's usage summary is kept. Past it they are deleted a batch at a time
+  # and the job says it was retired. At least 1h; absent, 72h. Each day kept cost
+  # the reference deployment over 100 MB of ledger, and the control plane reads
+  # the whole ledger at every start.
+  #
+  # job_detail_retention: 72h
+
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
   # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
   # not localhost) unless allow_remote is true: the endpoint has no
@@ -1240,6 +1249,42 @@ tiers:
 #     vcpu: 4
 #     memory: 16GiB
 #     image: ubuntu-2404-x64@g1
+
+# ── images ───────────────────────────────────────────────────────────────────
+#
+# The guest image a Firecracker node pulls. billet publishes it built from
+# GitHub's own runner-image template. Five of its components have licenses that
+# forbid billet redistributing them, so billet's published image is to leave them
+# out, and a deployment that accepts a component's license here is to have it
+# installed from its vendor into every new image, inside a microVM, before the
+# image is used (#584).
+#
+# NOT YET IN EFFECT FOR billet's OWN IMAGES, which still contain all five. A pull
+# of an image that leaves components out installs the accepted ones before
+# importing it, and imports nothing if any fails to install.
+#
+#   android-sdk     the Android SDK, platforms, build tools and NDKs
+#                   (https://developer.android.com/studio/terms)
+#   codeql          the CodeQL bundle in the toolcache; without it the CodeQL
+#                   Action downloads it per job
+#                   (https://github.com/github/codeql-cli-binaries/blob/main/LICENSE.md)
+#   firefox         Mozilla Firefox and geckodriver
+#                   (https://www.mozilla.org/en-US/about/legal/terms/firefox/)
+#   google-chrome   Google Chrome, ChromeDriver and Chromium
+#                   (https://www.google.com/chrome/terms/)
+#   microsoft-edge  Microsoft Edge and its WebDriver, under the terms Microsoft
+#                   ships with the package
+#                   (https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/eula)
+#
+# images:
+#   # Writing a name here is this deployment accepting that component's license.
+#   accept: [android-sdk, codeql, firefox, google-chrome, microsoft-edge]
+#
+#   # Where images are pulled from; empty means billet's own. A mirror needs both
+#   # of the next two, because billet's signing identity cannot vouch for it.
+#   # source: https://images.example.com/billet
+#   # signing_identity: '^https://github\.com/your-org/billet/\.github/workflows/guest-image\.yml@refs/heads/main$'
+#   # signing_issuer: https://token.actions.githubusercontent.com
 
 # ── release ──────────────────────────────────────────────────────────────────
 #

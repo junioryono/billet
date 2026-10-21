@@ -756,22 +756,20 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 
 	for _, d := range []struct {
 		what, configured, declared, root string
+		// named is a ReadWritePaths answer, read for the lock directory alone.
+		named string
+		lock  bool
 	}{
-		{"state_dir", spec.stateDir, s.StateDirectory, stateRoot},
-		{"lock_dir", spec.lockDir, s.RuntimeDirectory, runtimeRoot},
+		{what: "state_dir", configured: spec.stateDir, declared: s.StateDirectory, root: stateRoot},
+		// THE LOCK DIRECTORY IS NAMED, NOT DECLARED, by this release's node
+		// unit: a RuntimeDirectory is removed at the unit's stop under a lock
+		// another process holds in it (#175), so billet-tmpfiles.conf creates
+		// /run/billet/locks and the unit names it in ReadWritePaths. A unit from
+		// before that still declares it, and is admitted too: its node starts.
+		{what: "lock_dir", configured: spec.lockDir, declared: s.RuntimeDirectory, root: runtimeRoot,
+			named: s.ReadWritePaths, lock: true},
 	} {
 		if d.configured == "" {
-			continue
-		}
-
-		if d.declared == "" {
-			refusals = append(refusals, Refusal{
-				What: fmt.Sprintf("%s declares no directory for %s, so billet cannot tell whether "+
-					"%s is writable by it", s.Name, d.what, d.configured),
-				Remedy: "restore the packaged unit, which declares the directories systemd creates " +
-					"and makes writable",
-			})
-
 			continue
 		}
 
@@ -781,6 +779,33 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 		var wants []string
 		for _, entry := range strings.Fields(d.declared) {
 			wants = append(wants, filepath.Join(d.root, entry))
+		}
+
+		// ONLY THE SHIPPED LOCK DIRECTORY, declared by a unit from before or
+		// named, required, by this release's: the unit's other directories
+		// (the registration record's, removed at every stop; its credentials;
+		// the jailer) are not where a lock belongs, and an optional entry
+		// starts a node that cannot create the directory under the read-only
+		// /run.
+		if d.lock {
+			lockWritable := slices.Contains(wants, deploy.NodeLockDir) ||
+				slices.Contains(strings.Fields(d.named), deploy.NodeLockDir)
+
+			wants = nil
+			if lockWritable {
+				wants = []string{deploy.NodeLockDir}
+			}
+		}
+
+		if len(wants) == 0 {
+			refusals = append(refusals, Refusal{
+				What: fmt.Sprintf("%s declares no directory for %s, so billet cannot tell whether "+
+					"%s is writable by it", s.Name, d.what, d.configured),
+				Remedy: "restore the packaged unit, which declares the directories systemd creates " +
+					"and makes writable",
+			})
+
+			continue
 		}
 
 		if !slices.Contains(wants, filepath.Clean(d.configured)) {
@@ -1758,10 +1783,15 @@ func (c *Converger) StopAndProveAdmitted(ctx context.Context, unit string, admit
 	// empty answer is systemd not telling us, which is uncertainty rather than
 	// absence, and a state a future systemd adds must not be read as proof.
 	//
-	// `failed` counts as stopped: nothing is running, which is the question here.
-	// How it ended is reported separately in Result, because a unit killed at
-	// TimeoutStopSec is inactive AND failed, and an operator being told their
-	// host is down should know which.
+	// `failed` counts as stopped: nothing is running, which is the question here,
+	// and the only one this answers. It proves no process remains; it does NOT
+	// prove how the process ended. A node killed at TimeoutStopSec, one that
+	// handed its compute over and one whose drain a second signal cut short all
+	// pass, and reset-failed erases the difference (#127): a node's stop is
+	// proved by its own ending record (internal/nodeending), which the callers
+	// that need a drain read after this. How it ended is reported separately in
+	// Result, because a unit killed at TimeoutStopSec is inactive AND failed, and
+	// an operator being told their host is down should know which.
 	switch active {
 	case "inactive", "failed":
 		return StopResult{Gone: Yes, How: how}, nil

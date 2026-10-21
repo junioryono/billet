@@ -53,7 +53,7 @@ func (w WindowUsage) Complete() bool { return w.Span > 0 && w.Covered == w.Span 
 // MORE: a cumulative column's increment between two samples is shared by time,
 // rounded to the nearest unit, so a window covering a third of an interval is
 // given a third of what that interval used. An interval is uncovered, never
-// split, when the sampler marked the point that ends it AfterGap, or when a
+// split, when the sampler marked the point that ends it with a gap, or when a
 // cumulative column falls across it or across the interval before it: a fall
 // is a counter that was reset or misread, and the rise after a misread is its
 // catch-up rather than usage. The memory level is never interpolated.
@@ -88,7 +88,7 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 		// plausible overlap. Both ends lie within the interval once it is
 		// non-empty, so the difference cannot overflow.
 		lo, hi := max(a, p.offset()), min(b, next.offset())
-		if hi <= lo || next.AfterGap {
+		if hi <= lo || next.Gap != GapNone {
 			continue
 		}
 		overlap := hi - lo
@@ -154,29 +154,71 @@ func shareOf(delta, part, whole int64) int64 {
 
 // settle is the points with each run sharing one offset collapsed to its
 // last, and every counter fall turned into marks: a point some counter fell
-// into (from the sample before it, collapsed or not) is marked AfterGap, and
-// so is the point after it, whose interval holds the catch-up. Two samples
-// taken within one millisecond have no interval between them to split, so
-// what the later one adds belongs to the interval before it, and so does a
-// fall between them, which collapsing alone would hide.
+// into (from the sample before it, collapsed or not) is marked
+// GapCounterFell, and so is the point after it, whose interval holds the
+// catch-up. Two samples taken within one millisecond have no interval between
+// them to split, so what the later one adds belongs to the interval before it,
+// and so does a fall between them, which collapsing alone would hide.
 //
 // EVERY READER OF A SERIES SETTLES IT FIRST, the window and the halving alike,
 // so a fall is evidence no later step can drop.
 func settle(points []Point) []Point {
 	out := make([]Point, 0, len(points))
 	fell := false
+	fallen := func(dropped bool) GapCause {
+		if dropped {
+			return GapCounterFell
+		}
+
+		return GapNone
+	}
 	for i, p := range points {
 		dropped := i > 0 && falls(points[i-1], p)
 		if n := len(out); n > 0 && out[n-1].OffsetMillis == p.OffsetMillis {
-			p.AfterGap = p.AfterGap || out[n-1].AfterGap || dropped
+			p.Gap = joinGaps(joinGaps(out[n-1].Gap, p.Gap), fallen(dropped))
 			out[n-1] = p
 			fell = fell || dropped
 			continue
 		}
 		// THE CATCH-UP: the interval after a point a counter fell into.
-		p.AfterGap = p.AfterGap || dropped || fell
+		p.Gap = joinGaps(p.Gap, fallen(dropped || fell))
 		fell = dropped
 		out = append(out, p)
+	}
+
+	return out
+}
+
+// Gap is an interval of a timeline the series does not cover, and why.
+type Gap struct {
+	From, To time.Time
+	Cause    GapCause
+}
+
+// Length is how long the gap lasted.
+func (g Gap) Length() time.Duration { return g.To.Sub(g.From) }
+
+// Gaps is every interval Window leaves uncovered for want of a sample: each
+// the sampler marked unseen, and each a counter fell across with the catch-up
+// after it, adjacent ones of one cause joined into one. Together with what
+// Window covers they make up the whole series, save one case no sampler
+// produces: an interval Window leaves uncovered because the window's total
+// would pass an int64, which depends on the window and is no gap.
+func (tl Timeline) Gaps() []Gap {
+	points := settle(tl.Points)
+	var out []Gap
+	for i := 1; i < len(points); i++ {
+		p, next := points[i-1], points[i]
+		if next.Gap == GapNone || next.OffsetMillis == p.OffsetMillis {
+			continue
+		}
+		from, to := tl.First.Add(p.offset()), tl.First.Add(next.offset())
+		if n := len(out); n > 0 && out[n-1].To.Equal(from) && out[n-1].Cause == next.Gap {
+			out[n-1].To = to
+
+			continue
+		}
+		out = append(out, Gap{From: from, To: to, Cause: next.Gap})
 	}
 
 	return out
@@ -189,9 +231,11 @@ var ErrNoClock = errors.New("usage: the series records no start on the host's cl
 
 // TimelineOf reads a stored series as a timeline. A series of SeriesCodec,
 // which a node or a control plane older than SeriesCodecClocked writes, is
-// ErrNoClock.
+// ErrNoClock; one of SeriesCodecClocked marks its gaps GapUnspecified.
 func TimelineOf(codec int, data []byte) (Timeline, error) {
 	switch codec {
+	case SeriesCodecGaps:
+		return DecodeSeriesGaps(data)
 	case SeriesCodecClocked:
 		return DecodeSeriesAt(data)
 	case SeriesCodec:

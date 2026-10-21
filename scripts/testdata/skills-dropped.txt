@@ -109,3 +109,17 @@ c1d37654415e The full gate's steps are now listed in billet-git-flow as what CI 
 e71e192ec55c make verify runs make docs for a docs/ change when Sphinx is installed, and otherwise says CI's docs job runs it.
 e8e645e2b725 The terraform gates are named by make verify and run by CI; billet-infra-terraform-ansible keeps the rule to run them before pushing a .tf change.
 ea5dd02815a7 make check is the full gate and a session runs make verify (2026-10-15 policy); the sentence is restated with both.
+f2dc70408ec2 The fixture list gained node-repair-unit, the runtime-unit repair (#168); the sentence is restated with it.
+298aa03ea951 The node unit declares only billet/registration since #175; host-inspection.md now names RuntimeDirectory=billet/registration, the lock directory being the tmpfiles entry's.
+b79b507956a0 The node's writable paths gained the host lock directory (#175); systemd.md restates the list with it.
+2614b062c2dc The node unit's two-entry RuntimeDirectory is the shape before #175; the measured fact is restated as of then.
+697517353b3a #149 made check-module-sources.sh expect the tree's own ref (scripts/release-ref.sh), so a release branch is held at its tag; the sentence now says both.
+e51f6255d097 An adoption now drops the running entry without forgetting the job's measurement (#384); the sentence names dropRunningLocked beside forgetRunningLocked.
+3dd4f89a5df0 The restart's scenario test now drives a stop and a start against a scripted systemctl and billet (#127); the sentence is restated with both.
+829fb2d11b53 The ordinary node restart became a polled stop, a proved ending, a gated start and a polled start (#127); host-role.md restates it.
+a7aa3d9b4079 The restart's last-read words now name a stop still draining and a start still queued separately (#127); the sentence is restated.
+e3d87fa784dd The network drain's stop and the transaction's stops are now proved by the node's ending (#127); the new rule beside the restart says so.
+d02ede176458 #127 now proves every node stop by the node's ending, the retirement's restart included; the sentence says it establishes the guarantee.
+dffafcd4ce59 #127 now proves each node stop the role and the command perform by the node's ending; the sentence says it establishes the guarantee.
+b56657d3069e The images row gained `accept`, the components whose licenses a deployment accepts (#584); the row is otherwise unchanged.
+301e180e7feb An idle launch runner is no longer retired by a runner-less cancellation: the cancellation detaches it and the pool retires it, reinstating it busy when GitHub refuses its removal as running a job (#598); the sentence now ends at the job being marked finished and the next ones state that.

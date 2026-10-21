@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	billetgithub "github.com/junioryono/billet/internal/github"
+	"github.com/junioryono/billet/internal/server"
 )
 
 type recoveryPolicy struct {
@@ -44,6 +45,49 @@ func TestRunnerRemovalRefusesAStaticReplacementBeforeDelete(t *testing.T) {
 	}
 	if got := deletes.Load(); got != 0 {
 		t.Fatalf("runner DELETE calls = %d, want 0", got)
+	}
+}
+
+// A DELETE GITHUB REFUSES BECAUSE THE RUNNER IS RUNNING A JOB IS
+// server.ErrRunnerBusy, the proof the listener reinstates a retiring member on;
+// any other refusal is not. The body is the one the Actions service sent on
+// 2026-10-20: "Runner billet-… is currently running a job and cannot be deleted."
+func TestARunnerRemovalRefusedForARunningJobIsBusy(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		busy bool
+	}{
+		"running a job": {`{"typeName":"GitHub.DistributedTask.WebApi.JobStillRunningException",` +
+			`"message":"Runner billet-l1 is currently running a job and cannot be deleted."}`, true},
+		"anything else": {`{"typeName":"GitHub.DistributedTask.WebApi.AccessDeniedException",` +
+			`"message":"no"}`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeActions(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					fmt.Fprint(w, `{"count":1,"value":[{"id":79,"name":"billet-l1","runnerScaleSetId":9}]}`)
+				case http.MethodDelete:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprint(w, tc.body)
+				default:
+					t.Errorf("unexpected runner request %s %s", r.Method, r.URL.Path)
+				}
+			})
+			client, err := New(fake.config(t), slog.Default())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			err = client.RemoveRunner(t.Context(), 79, "billet-l1")
+			if err == nil {
+				t.Fatal("a refused DELETE read as a removal")
+			}
+			if got := errors.Is(err, server.ErrRunnerBusy); got != tc.busy {
+				t.Errorf("errors.Is(%v, ErrRunnerBusy) = %t, want %t", err, got, tc.busy)
+			}
+		})
 	}
 }
 

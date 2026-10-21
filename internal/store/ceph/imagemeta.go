@@ -141,7 +141,7 @@ func (c *Client) setGenerationMeta(
 		return err
 	}
 
-	if _, ok := ParseGeneration(generation); !ok {
+	if !isPublishedSnapshot(generation) {
 		return fmt.Errorf("ceph: %q is not a generation billet published, so recording %s "+
 			"against it would write a key nothing reads and nothing reaps", generation, key)
 	}
@@ -218,6 +218,25 @@ func (c *Client) NeededKernels(
 		needed[file] = true
 	}
 
+	// A COMPLETION ROOT'S KERNEL IS NEEDED WHILE THE ROOT EXISTS. The root is not a
+	// generation, so the caller's list leaves it out, and the completion microVM
+	// boots it with that kernel.
+	roots, err := c.completionRoots(ctx, image)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	for _, root := range roots {
+		file, found, err := c.Kernel(ctx, image, root)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		if found && file != "" {
+			needed[file] = true
+		}
+	}
+
 	return needed, unknown, nil
 }
 
@@ -227,7 +246,9 @@ func (c *Client) Kernel(ctx context.Context, image, generation string) (string, 
 		return "", false, err
 	}
 
-	if _, ok := ParseGeneration(generation); !ok {
+	// A COMPLETION ROOT TOO, because the completion microVM boots one and the
+	// launch reads its kernel and contract the way it reads a generation's.
+	if !isPublishedSnapshot(generation) {
 		return "", false, fmt.Errorf("ceph: %q is not a generation billet published", generation)
 	}
 
@@ -254,7 +275,9 @@ func (c *Client) GuestContract(
 		return "", false, err
 	}
 
-	if _, ok := ParseGeneration(generation); !ok {
+	// A COMPLETION ROOT TOO, because the completion microVM boots one and the
+	// launch reads its kernel and contract the way it reads a generation's.
+	if !isPublishedSnapshot(generation) {
 		return "", false, fmt.Errorf("ceph: %q is not a generation billet published", generation)
 	}
 

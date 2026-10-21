@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "command": "check",
+  "outcome": "unproved",
+  "why": "invocation inv-1 never wrote its ending, so it was killed or crashed (systemd: failed/failed/timeout)",
+  "acknowledge": "--invocation inv-1",
+  "invocation": "inv-1",
+  "unit": {
+    "active_state": "failed",
+    "sub_state": "failed",
+    "result": "timeout",
+    "main_pid": "0",
+    "job": "",
+    "invocation_id": "inv-1"
+  },
+  "entry": {
+    "invocation_id": "inv-1",
+    "pid": 4,
+    "boot_id": "boot-a",
+    "release": "",
+    "role": "node",
+    "runs_on_host": true,
+    "started_at": "2026-10-17T18:00:00Z",
+    "drain_requested": false,
+    "ending": "running",
+    "source": "node",
+    "acknowledged": false
+  }
+}

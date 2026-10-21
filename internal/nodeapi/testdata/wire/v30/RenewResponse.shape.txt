@@ -1,0 +1,2 @@
+RenewResponse.cert_pem string
+RenewResponse.ca_pem string

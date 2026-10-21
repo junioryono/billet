@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // EVERY STOP AND START RUNS UNDER THE UNIT'S OWN BOUND: lifeops gives a stop
@@ -45,8 +47,11 @@ func TestUpStartsEachUnitUnderItsOwnStartBound(t *testing.T) {
 		t.Fatalf("a prepared host was refused: %v", err)
 	}
 
+	// THE SERVER'S BOUND CARRIES THE EXTENSION it asks systemd for before it
+	// opens the ledger (unitStartDeadline); the node's is the unit's own.
 	for _, unit := range []string{deploy.ServerUnitName, deploy.NodeUnitName} {
-		deadlineWithin(t, "the start of "+unit, f.deadlines["start "+unit], deploy.UnitStartTimeout)
+		deadlineWithin(t, "the start of "+unit, f.deadlines["start "+unit],
+			unitStartDeadline(unit)-lifecycleDeadlineMargin)
 	}
 }
 
@@ -69,16 +74,63 @@ func TestDownStopsEachUnitUnderItsOwnStopBound(t *testing.T) {
 	}
 }
 
+// THE TRANSACTION'S SERVER START WAITS AS LONG AS SYSTEMD DOES, which with the
+// extension the server asks for is longer than the unit's own bound: a start
+// cut off sooner would roll a slow, healthy upgrade back. A case of its own,
+// because /usr/bin/false fails the server's start before the node's is reached.
+func TestTheTransactionWaitsTheServersExtendedStart(t *testing.T) {
+	seen := map[string]time.Time{}
+
+	prev := newHostInspector
+	newHostInspector = func() *lifeops.Inspector {
+		return lifeops.NewInspector(
+			lifeops.WithSystemctl("/usr/bin/false"),
+			lifeops.WithObserver(func(ctx context.Context, args []string) {
+				if d, ok := ctx.Deadline(); ok {
+					seen[args[0]+" "+args[len(args)-1]] = d
+				}
+			}))
+	}
+
+	t.Cleanup(func() { newHostInspector = prev })
+
+	cfg := &config.Config{Server: &config.ServerConfig{}}
+	h := newSystemdHost(processEnv(), cfg, "/etc/billet/billet.yaml", "/tmp/staged", nil)
+
+	if err := h.StartServices(t.Context()); err == nil || !strings.Contains(err.Error(), "starting") {
+		t.Fatalf("a start through /usr/bin/false: %v", err)
+	}
+
+	deadlineWithin(t, "the transaction's server start", seen["start "+serverUnit],
+		deploy.UnitStartTimeout+state.StartupBound()+deploy.UnitStartTimeout)
+}
+
 // THE TRANSACTION: its starts under the start bound, observed through the
 // inspector's own seam; its node stop under no deadline at all.
 func TestTheTransactionStartsUnderTheStartBoundAndStopsTheNodeUnbounded(t *testing.T) {
 	seen := map[string]time.Time{}
 	unbounded := map[string]bool{}
 
+	// A systemctl holding one unit's state in a file: `show` answers from it,
+	// `stop` leaves it clean, and `start` fails, which is fine: the deadline is
+	// observed before the failure. The gate before the start and the proof
+	// after the stop read the state through the same seam.
+	dir := t.TempDir()
+	unitState := filepath.Join(dir, "state")
+	systemctl := filepath.Join(dir, "systemctl")
+	writeFile(t, systemctl, `#!/bin/sh
+case "$1" in
+show) cat "`+unitState+`" ;;
+stop) printf 'ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n' >"`+unitState+`" ;;
+*) exit 1 ;;
+esac
+`, 0o755)
+	writeFile(t, unitState, "ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n", 0o644)
+
 	prev := newHostInspector
 	newHostInspector = func() *lifeops.Inspector {
 		return lifeops.NewInspector(
-			lifeops.WithSystemctl("/usr/bin/false"),
+			lifeops.WithSystemctl(systemctl),
 			lifeops.WithObserver(func(ctx context.Context, args []string) {
 				if d, ok := ctx.Deadline(); ok {
 					seen[args[0]+" "+args[len(args)-1]] = d
@@ -90,16 +142,17 @@ func TestTheTransactionStartsUnderTheStartBoundAndStopsTheNodeUnbounded(t *testi
 
 	t.Cleanup(func() { newHostInspector = prev })
 
-	cfg := &config.Config{Node: &config.NodeConfig{}}
+	cfg := &config.Config{Node: &config.NodeConfig{StateDir: t.TempDir()}}
 	h := newSystemdHost(processEnv(), cfg, "/etc/billet/billet.yaml", "/tmp/staged", nil)
 
-	// The starts: /usr/bin/false fails them, which is fine; the deadline was
-	// observed before the failure.
 	if err := h.StartServices(t.Context()); err == nil || !strings.Contains(err.Error(), "starting") {
-		t.Fatalf("a start through /usr/bin/false: %v", err)
+		t.Fatalf("a start through a systemctl that fails it: %v", err)
 	}
 
 	deadlineWithin(t, "the transaction's node start", seen["start "+nodeUnit], deploy.UnitStartTimeout)
+
+	writeFile(t, unitState, "ActiveState=active\nSubState=running\nResult=success\nMainPID=5\nJob=\n"+
+		"InvocationID=inv-1\n", 0o644)
 
 	if err := h.StopNode(t.Context()); err != nil {
 		t.Logf("the node's stop: %v", err)

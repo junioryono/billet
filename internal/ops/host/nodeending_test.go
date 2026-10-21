@@ -1,0 +1,572 @@
+package host
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/nodeending"
+)
+
+// endingFixture is a node-only host: its configuration, its state directory
+// holding the ending record, and a systemctl that answers only the properties
+// it is asked for, from a file the test rewrites.
+type endingFixture struct {
+	configPath string
+	stateDir   string
+	unitFile   string
+	claimed    int
+}
+
+func newEndingFixture(t *testing.T) *endingFixture {
+	t.Helper()
+
+	dir := t.TempDir()
+	f := &endingFixture{stateDir: filepath.Join(dir, "node"), unitFile: filepath.Join(dir, "unit.properties")}
+
+	if err := os.MkdirAll(f.stateDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	f.configPath = filepath.Join(dir, "billet.yaml")
+	writeFile(t, f.configPath, fmt.Sprintf(`node:
+  name: n1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: %s
+  lock_dir: %s
+`, f.stateDir, filepath.Join(dir, "lock")), 0o600)
+
+	systemctl := filepath.Join(dir, "systemctl")
+	writeFile(t, systemctl, `#!/bin/sh
+case " $* " in *" billet-node.service "*) ;; *) exit 0 ;; esac
+for a in "$@"; do case "$a" in --property=*) grep "^${a#--property=}=" "`+f.unitFile+`";; esac; done
+exit 0
+`, 0o755)
+
+	f.unit(t, "inactive", "dead", "success", "0", "")
+
+	prevInsp, prevOS, prevEUID, prevClaim := endingInspector, cli.HostOS, endingEUID, endingClaim
+	endingInspector = func() *lifeops.Inspector { return lifeops.NewInspector(lifeops.WithSystemctl(systemctl)) }
+	cli.HostOS = "linux"
+	endingEUID = func() int { return 0 }
+	endingClaim = func(*config.Config) (func() error, error) {
+		f.claimed++
+
+		return func() error { return nil }, nil
+	}
+
+	t.Cleanup(func() { endingInspector, cli.HostOS, endingEUID, endingClaim = prevInsp, prevOS, prevEUID, prevClaim })
+
+	return f
+}
+
+// unit sets what systemd answers about the node unit; Job is answered empty.
+func (f *endingFixture) unit(t *testing.T, active, sub, result, mainPID, invocation string) {
+	t.Helper()
+
+	writeFile(t, f.unitFile, fmt.Sprintf("ActiveState=%s\nSubState=%s\nResult=%s\nMainPID=%s\nJob=\nInvocationID=%s\n",
+		active, sub, result, mainPID, invocation), 0o644)
+}
+
+// begin records a node process in the fixture's record and ends it, unless
+// ending is Running.
+func (f *endingFixture) begin(t *testing.T, invocation string, ending nodeending.Ending) {
+	t.Helper()
+
+	h, err := nodeending.Begin(f.stateDir, nodeending.Entry{InvocationID: invocation, PID: 4,
+		BootID: nodeending.BootID(), Role: nodeending.RoleNode, RunsOnHost: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ending != nodeending.Running {
+		if err := h.End(ending, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func (f *endingFixture) run(t *testing.T, args ...string) endpointOut {
+	t.Helper()
+
+	return runEndpoint(t, NodeEnding, "", append(append([]string{args[0]}, "--config", f.configPath),
+		args[1:]...)...)
+}
+
+// CHECK ANSWERS BY THE STOPPED INVOCATION'S OWN ENDING, through its exit
+// status: a drain exits 0; a killed node (its entry still running) exits 2
+// even after reset-failed made systemd's triple clean; and a node that kept
+// no record falls back to systemd's clean triple, which check then records so
+// the start that follows sees it.
+func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
+	t.Run("a drain", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Drained)
+
+		o := f.run(t, "check", "--invocation", "inv-1", "--drain")
+		if o.code != 0 || o.str("outcome") != "proved" || o.str("proof") != nodeending.ProofRecord {
+			t.Fatalf("code %d outcome %q proof %q (%s), want proved by the record", o.code, o.str("outcome"),
+				o.str("proof"), o.str("why"))
+		}
+	})
+
+	t.Run("an idle stop over a handoff, with and without --drain", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-0", nodeending.HandedOff)
+		f.begin(t, "inv-1", nodeending.Idle)
+
+		if o := f.run(t, "check", "--invocation", "inv-1"); o.code != 0 {
+			t.Fatalf("an idle stop without --drain: code %d (%s), want proved", o.code, o.str("why"))
+		}
+
+		if o := f.run(t, "check", "--invocation", "inv-1", "--drain"); o.code != exitRefused ||
+			!strings.Contains(o.str("why"), "never adopted it") {
+			t.Fatalf("an idle stop with --drain: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+	})
+
+	t.Run("no record, systemd timeout", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-0", nodeending.Drained)
+		f.unit(t, "failed", "failed", "timeout", "0", "inv-old")
+
+		o := f.run(t, "check", "--invocation", "inv-old")
+		if o.code != exitRefused || !o.boolean("recorded") || o.str("acknowledge") != "--invocation inv-old" {
+			t.Fatalf("a node with no record killed at the timeout: code %d recorded %v acknowledge %q (%s), want "+
+				"unproved, recorded, and the failure named", o.code, o.boolean("recorded"), o.str("acknowledge"),
+				o.str("why"))
+		}
+
+		f.unit(t, "inactive", "dead", "success", "0", "")
+
+		if c := f.run(t, "check", "--invocation", "inv-old"); c.code != exitRefused {
+			t.Fatalf("check after reset-failed: code %d (%s), want the first account to stand", c.code, c.str("why"))
+		}
+
+		if a := f.run(t, "admit-start"); a.code != exitRefused || a.str("acknowledge") != "--invocation inv-old" {
+			t.Fatalf("admit-start after reset-failed: code %d acknowledge %q (%s), want the recorded failure "+
+				"refused", a.code, a.str("acknowledge"), a.str("why"))
+		}
+
+		// The acknowledgement the refusal named is one the command accepts.
+		args := append([]string{"acknowledge"}, strings.Fields(o.str("acknowledge"))...)
+		if k := f.run(t, args...); k.code != 0 {
+			t.Fatalf("%v: code %d (%s), want accepted", args, k.code, k.str("why"))
+		}
+
+		if a := f.run(t, "admit-start"); a.code != 0 {
+			t.Fatalf("admit-start after the acknowledgement: code %d (%s)", a.code, a.str("why"))
+		}
+
+		// The acknowledgement admits a start; it does not make the killed stop
+		// a proved one, however clean systemd reports the unit now.
+		if c := f.run(t, "check", "--invocation", "inv-old"); c.code != exitRefused {
+			t.Fatalf("check after the acknowledgement: code %d (%s), want still unproved", c.code, c.str("why"))
+		}
+	})
+
+	t.Run("a repeated check names the newest process", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.unit(t, "failed", "failed", "timeout", "0", "inv-old")
+
+		if o := f.run(t, "check", "--invocation", "inv-old"); o.code != exitRefused || !o.boolean("recorded") {
+			t.Fatalf("the first check: code %d recorded %v (%s)", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		f.begin(t, "inv-new", nodeending.LeftRunning)
+
+		o := f.run(t, "check", "--invocation", "inv-old")
+		if o.code != exitRefused || o.str("acknowledge") != "--invocation inv-new" {
+			t.Fatalf("the repeated check: code %d acknowledge %q (%s), want the newest, inv-new, named", o.code,
+				o.str("acknowledge"), o.str("why"))
+		}
+	})
+
+	t.Run("an acknowledged history does not pass the floor a drain needs", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		if k := f.run(t, "acknowledge", "--invocation", "inv-1"); k.code != 0 {
+			t.Fatalf("acknowledge: code %d (%s)", k.code, k.str("why"))
+		}
+
+		if o := f.run(t, "check", "--invocation", "inv-absent", "--drain"); o.code != exitRefused ||
+			o.boolean("recorded") {
+			t.Fatalf("the floor over an acknowledged killed node with --drain: code %d recorded %v (%s), want "+
+				"unproved and nothing recorded", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		if o := f.run(t, "check", "--invocation", "inv-absent"); o.code != 0 {
+			t.Fatalf("the floor over an acknowledged node without --drain: code %d (%s), want proved", o.code,
+				o.str("why"))
+		}
+	})
+
+	t.Run("admit-start over a running node agrees with the host's gate", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+		f.unit(t, "active", "running", "success", "41", "inv-1")
+
+		if a := f.run(t, "admit-start"); a.code != 0 || a.str("proof") != nodeending.ProofRunning ||
+			!strings.Contains(a.raw, `"active_state": "active"`) {
+			t.Fatalf("admit-start over a running node: code %d proof %q (%s), want admitted as running with "+
+				"the unit it rests on:\n%s", a.code, a.str("proof"), a.str("why"), a.raw)
+		}
+	})
+
+	t.Run("a stale invocation over a killed node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		if o := f.run(t, "check", "--invocation", "inv-stale"); o.code != exitRefused || o.boolean("recorded") {
+			t.Fatalf("a stale invocation over a killed node: code %d recorded %v (%s), want unproved and "+
+				"nothing recorded", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		if a := f.run(t, "admit-start"); a.code != exitRefused || a.str("acknowledge") != "--invocation inv-1" {
+			t.Fatalf("admit-start after a stale check: code %d acknowledge %q (%s), want refused", a.code,
+				a.str("acknowledge"), a.str("why"))
+		}
+	})
+
+	t.Run("killed, then reset-failed", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		o := f.run(t, "check", "--invocation", "inv-1")
+		if o.code != exitRefused || o.str("outcome") != "unproved" || !strings.Contains(o.str("why"),
+			"killed or crashed") {
+			t.Fatalf("code %d outcome %q (%s), want unproved with exit %d", o.code, o.str("outcome"), o.str("why"),
+				exitRefused)
+		}
+	})
+
+	t.Run("no record, systemd clean", func(t *testing.T) {
+		f := newEndingFixture(t)
+
+		o := f.run(t, "check", "--invocation", "inv-old")
+		if o.code != 0 || o.str("proof") != nodeending.ProofSystemd || !o.boolean("recorded") {
+			t.Fatalf("code %d proof %q recorded %v (%s), want the systemd floor, recorded", o.code,
+				o.str("proof"), o.boolean("recorded"), o.str("why"))
+		}
+
+		a := f.run(t, "admit-start")
+		if a.code != 0 || a.str("proof") != nodeending.ProofSystemd || !strings.Contains(a.str("why"),
+			"kept no record") {
+			t.Fatalf("admit-start after the floor: code %d proof %q (%s), want the recorded systemd stop",
+				a.code, a.str("proof"), a.str("why"))
+		}
+	})
+
+	t.Run("systemd unanswered", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Drained)
+		writeFile(t, f.unitFile, "", 0o644)
+
+		o := f.run(t, "check", "--invocation", "inv-1")
+		if o.code != exitUnknown || o.str("outcome") != "unknown" {
+			t.Fatalf("code %d outcome %q (%s), want could-not-tell with exit %d", o.code, o.str("outcome"),
+				o.str("why"), exitUnknown)
+		}
+	})
+
+	// A NODE THAT HAD NO PROCESS TO STOP is judged by what its last process
+	// left, at the stop's standard: a retry does not pass what the first
+	// attempt refused.
+	t.Run("no invocation: a node already stopped", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-0", nodeending.HandedOff)
+
+		if o := f.run(t, "check", "--drain"); o.code != exitRefused || !strings.Contains(o.str("why"), "never adopted it") {
+			t.Fatalf("check --drain over a stopped handoff: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+
+		if o := f.run(t, "check"); o.code != 0 || o.str("invocation") != "" {
+			t.Fatalf("check over a stopped handoff, no drain: code %d invocation %q (%s), want proved and no "+
+				"invocation", o.code, o.str("invocation"), o.str("why"))
+		}
+
+		f.begin(t, "inv-1", nodeending.Running)
+
+		if o := f.run(t, "check"); o.code != exitRefused || !strings.Contains(o.str("why"), "killed or crashed") {
+			t.Fatalf("check over a stopped killed node: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+
+		f.unit(t, "active", "running", "success", "41", "inv-2")
+
+		if o := f.run(t, "check"); o.code != exitRefused || !strings.Contains(o.str("why"), "is active") {
+			t.Fatalf("check with no invocation over a running node: code %d (%s), want refused", o.code,
+				o.str("why"))
+		}
+	})
+
+	// THE RECORD A CONVERGE NAMES, under a configuration that no longer has a
+	// node: --state-dir; and a configuration with neither, or none at all, is
+	// judged by the packaged node's record, which a node it ran may have left.
+	t.Run("a configuration without a node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		packaged := newEndingFixture(t)
+		prevPackaged := endingPackagedStateDir
+		endingPackagedStateDir = packaged.stateDir
+
+		t.Cleanup(func() { endingPackagedStateDir = prevPackaged })
+
+		serverOnly := filepath.Join(t.TempDir(), "server-only.yaml")
+		dir := t.TempDir()
+		writeFile(t, serverOnly, "server:\n  listen: 127.0.0.1:7717\n  state_dir: "+dir+
+			"\n  max_vcpu: 8\n  max_memory: 32GiB\ngithub:\n  org: acme\n  app_id: 1\n  installation_id: 2\n"+
+			"  private_key_path: "+filepath.Join(dir, "app.pem")+"\ntiers:\n  - label: billet-2vcpu\n"+
+			"    provider: docker\n    vcpu: 2\n    memory: 8GiB\n    image: ubuntu:24.04\n", 0o600)
+
+		// THE PACKAGE'S TEMPLATE before it is filled in: no node, and App ids
+		// the loader as a whole refuses.
+		template, err := os.ReadFile("../../../deploy/billet.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		unfilled := filepath.Join(t.TempDir(), "billet.yaml")
+		writeFile(t, unfilled, string(template), 0o600)
+
+		absent := filepath.Join(t.TempDir(), "absent.yaml")
+
+		runWith := func(cfg string, args ...string) endpointOut {
+			return runEndpoint(t, NodeEnding, "", append([]string{args[0], "--config", cfg}, args[1:]...)...)
+		}
+		run := func(args ...string) endpointOut { return runWith(serverOnly, args...) }
+
+		if o := run("check", "--drain", "--state-dir", f.stateDir); o.code != exitRefused ||
+			!strings.Contains(o.str("why"), "killed or crashed") {
+			t.Fatalf("check --state-dir under a server-only configuration: code %d (%s; %v), want the record's "+
+				"refusal", o.code, o.str("why"), o.err)
+		}
+
+		for _, cfg := range []string{serverOnly, unfilled, absent} {
+			if o := runWith(cfg, "check", "--drain"); o.code != 0 || o.str("proof") != nodeending.ProofSystemd {
+				t.Fatalf("check under %s with no packaged record: code %d (%s; %v), want proved by systemd's "+
+					"account", cfg, o.code, o.str("why"), o.err)
+			}
+		}
+
+		packaged.begin(t, "inv-p", nodeending.Running)
+
+		for _, cfg := range []string{serverOnly, unfilled, absent} {
+			if o := runWith(cfg, "check", "--drain"); o.code != exitRefused || !strings.Contains(o.str("why"), "inv-p") {
+				t.Fatalf("check under %s over a killed packaged node: code %d (%s; %v), want its refusal", cfg,
+					o.code, o.str("why"), o.err)
+			}
+		}
+
+		// THE READERS NAME THE RECORD THE SAME WAY.
+		if o := run("admit-start", "--state-dir", f.stateDir); o.code != exitRefused ||
+			!strings.Contains(o.str("why"), "inv-1") {
+			t.Fatalf("admit-start --state-dir: code %d (%s; %v), want the named record's refusal", o.code,
+				o.str("why"), o.err)
+		}
+
+		if o := run("admit-start"); o.code != exitRefused || !strings.Contains(o.str("why"), "inv-p") {
+			t.Fatalf("admit-start with no node: code %d (%s; %v), want the packaged record's refusal", o.code,
+				o.str("why"), o.err)
+		}
+
+		if o := run("show", "--state-dir", f.stateDir); o.err != nil || !strings.Contains(o.raw, `"inv-1"`) {
+			t.Fatalf("show --state-dir: %v\n%s, want the named record's entry", o.err, o.raw)
+		}
+
+		if o := run("show"); o.err != nil || !strings.Contains(o.raw, `"inv-p"`) {
+			t.Fatalf("show with no node: %v\n%s, want the packaged record's entry", o.err, o.raw)
+		}
+
+		// AN ACKNOWLEDGEMENT TAKES THE NODE'S OWN LOCK, which only a node
+		// section names: never a record another directory holds.
+		var usage bytes.Buffer
+
+		env := processEnv()
+		env.Stdout = &usage
+
+		if err := NodeEnding(t.Context(), env, []string{"acknowledge", "--config", serverOnly, "--unrecorded",
+			"--state-dir", f.stateDir, "--json"}); err == nil ||
+			!strings.Contains(err.Error(), "flag provided but not defined: -state-dir") {
+			t.Fatalf("acknowledge --state-dir returned %v, want the flag refused", err)
+		}
+
+		if o := run("acknowledge", "--unrecorded"); o.err == nil || !strings.Contains(o.err.Error(), "no node section") {
+			t.Fatalf("acknowledge under a configuration that runs no node returned %v, want refused", o.err)
+		}
+	})
+
+	// --STATE-DIR NAMES THE RECORD OVER A CONFIGURED NODE'S OWN, and claims
+	// nothing of the configured provider for it.
+	t.Run("--state-dir over a configured node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Drained)
+
+		other := t.TempDir()
+
+		if o := f.run(t, "check", "--drain", "--state-dir", other, "--invocation", "inv-9"); o.code != 0 ||
+			!o.boolean("recorded") {
+			t.Fatalf("check --state-dir over a configured node: code %d recorded %v (%s), want the floor recorded "+
+				"in the named record", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		rec, _, err := nodeending.Read(other)
+		if err != nil || len(rec.Entries) != 1 || rec.Entries[0].InvocationID != "inv-9" || rec.Entries[0].RunsOnHost {
+			t.Fatalf("the named record holds %+v (%v), want inv-9's account and no claim it ran on the host",
+				rec.Entries, err)
+		}
+
+		if o := f.run(t, "check", "--drain", "--invocation", "inv-1"); o.code != 0 {
+			t.Fatalf("the configured record after the named one was written: code %d (%s)", o.code, o.str("why"))
+		}
+
+		// --STATE-DIR NAMING THE CONFIGURATION'S OWN RECORD keeps its provider's
+		// claim: the docker provider's compute ends with the host.
+		own := newEndingFixture(t)
+
+		if o := own.run(t, "check", "--drain", "--state-dir", own.stateDir, "--invocation", "inv-9"); o.code != 0 ||
+			!o.boolean("recorded") {
+			t.Fatalf("check --state-dir naming the configured record: code %d recorded %v (%s)", o.code,
+				o.boolean("recorded"), o.str("why"))
+		}
+
+		ownRec, _, err := nodeending.Read(own.stateDir)
+		if err != nil || len(ownRec.Entries) != 1 || !ownRec.Entries[0].RunsOnHost {
+			t.Fatalf("the configured record holds %+v (%v), want inv-9's account claiming it ran on the host",
+				ownRec.Entries, err)
+		}
+	})
+
+	// A CONFIGURATION THAT CANNOT BE READ IS NOT ONE THAT IS ABSENT.
+	t.Run("an unreadable configuration", func(t *testing.T) {
+		newEndingFixture(t)
+
+		o := runEndpoint(t, NodeEnding, "", "check", "--config", t.TempDir(), "--drain")
+		if o.err == nil || !strings.Contains(o.err.Error(), "read config") {
+			t.Fatalf("check under a configuration that is a directory returned %v, want it refused", o.err)
+		}
+	})
+}
+
+// A START REFUSED FOR A KILLED NODE IS ADMITTED BY ITS ACKNOWLEDGEMENT, which
+// is root's, taken under the node's own lock with systemd reporting no
+// process, and only of the newest stop by its exact invocation.
+func TestAcknowledgementAdmitsTheStartItWasRefused(t *testing.T) {
+	f := newEndingFixture(t)
+	f.begin(t, "inv-0", nodeending.Drained)
+	f.begin(t, "inv-1", nodeending.Running)
+	f.unit(t, "failed", "failed", "timeout", "0", "inv-1")
+
+	if o := f.run(t, "admit-start"); o.code != exitRefused || o.str("acknowledge") != "--invocation inv-1" {
+		t.Fatalf("admit-start over a killed node: code %d acknowledge %q (%s), want refused naming the "+
+			"acknowledgement", o.code, o.str("acknowledge"), o.str("why"))
+	}
+
+	endingEUID = func() int { return 1000 }
+
+	if o := f.run(t, "acknowledge", "--invocation", "inv-1"); o.code != exitRefused ||
+		!strings.Contains(o.str("why"), "root's") || f.claimed != 0 {
+		t.Fatalf("a non-root acknowledgement: code %d (%s), claims %d; want refused before the lock", o.code,
+			o.str("why"), f.claimed)
+	}
+
+	endingEUID = func() int { return 0 }
+	f.unit(t, "active", "running", "success", "77", "inv-2")
+
+	if o := f.run(t, "acknowledge", "--invocation", "inv-1"); o.code != exitRefused ||
+		!strings.Contains(o.str("why"), "is active") {
+		t.Fatalf("an acknowledgement with a node running: code %d (%s), want refused", o.code, o.str("why"))
+	}
+
+	f.unit(t, "failed", "failed", "timeout", "0", "inv-1")
+
+	if o := f.run(t, "acknowledge", "--invocation", "inv-0"); o.code != exitRefused ||
+		!strings.Contains(o.str("why"), `not "inv-0"`) {
+		t.Fatalf("acknowledging another invocation: code %d (%s), want refused", o.code, o.str("why"))
+	}
+
+	if o := f.run(t, "acknowledge", "--invocation", "inv-1"); o.code != 0 ||
+		o.str("proof") != nodeending.ProofAcknowledged {
+		t.Fatalf("acknowledging the newest stop: code %d (%s)", o.code, o.str("why"))
+	}
+
+	if f.claimed == 0 {
+		t.Error("the acknowledgement never took the node's deployment lock")
+	}
+
+	if o := f.run(t, "admit-start"); o.code != 0 || o.str("proof") != nodeending.ProofAcknowledged {
+		t.Fatalf("admit-start after the acknowledgement: code %d (%s), want admitted", o.code, o.str("why"))
+	}
+}
+
+// AN UNREADABLE RECORD IS RECOVERED BY THE RESET IT NAMES: admit-start answers
+// could-not-tell naming --reset-unreadable, which sets the record aside under
+// the node's lock, after which a start is admitted.
+func TestAnUnreadableRecordIsRecoveredByItsReset(t *testing.T) {
+	f := newEndingFixture(t)
+	writeFile(t, nodeending.Path(f.stateDir), "{", 0o600)
+
+	if o := f.run(t, "admit-start"); o.code != exitUnknown || o.str("acknowledge") != "--reset-unreadable" {
+		t.Fatalf("admit-start over an unreadable record: code %d acknowledge %q (%s), want could-not-tell "+
+			"naming the reset", o.code, o.str("acknowledge"), o.str("why"))
+	}
+
+	if o := f.run(t, "acknowledge", "--reset-unreadable"); o.code != 0 || f.claimed != 1 ||
+		!strings.Contains(o.str("why"), "set aside") {
+		t.Fatalf("the reset: code %d claims %d (%s), want proved under the lock", o.code, f.claimed, o.str("why"))
+	}
+
+	if o := f.run(t, "admit-start"); o.code != 0 {
+		t.Fatalf("admit-start after the reset: code %d (%s), want admitted", o.code, o.str("why"))
+	}
+
+	if o := f.run(t, "acknowledge", "--reset-unreadable", "--unrecorded"); o.err == nil {
+		t.Fatal("two acknowledgements at once were accepted")
+	}
+}
+
+// AN ACKNOWLEDGEMENT WHOSE LOCK IS HELD REFUSES: a node process may hold the
+// identity, and an acknowledgement is of a stop.
+func TestAnAcknowledgementWhoseLockIsHeldRefuses(t *testing.T) {
+	f := newEndingFixture(t)
+	f.begin(t, "inv-1", nodeending.Running)
+
+	endingClaim = func(*config.Config) (func() error, error) { return nil, errors.New("held by pid 9") }
+
+	o := f.run(t, "acknowledge", "--invocation", "inv-1")
+	if o.code != exitRefused || !strings.Contains(o.str("why"), "held by pid 9") {
+		t.Fatalf("code %d (%s), want refused naming the lock", o.code, o.str("why"))
+	}
+
+	rec, _, err := nodeending.Read(f.stateDir)
+	if err != nil || rec.Entries[0].Acknowledged {
+		t.Errorf("the record is %+v (%v), want nothing acknowledged", rec.Entries, err)
+	}
+}
+
+// OFF systemd THE JUDGEMENTS REFUSE, and show still prints the record.
+func TestEndingJudgementsRefuseOffSystemd(t *testing.T) {
+	f := newEndingFixture(t)
+	f.begin(t, "inv-1", nodeending.Drained)
+	cli.HostOS = "darwin"
+
+	for _, args := range [][]string{{"check", "--invocation", "inv-1"}, {"admit-start"},
+		{"acknowledge", "--unrecorded"}} {
+		if o := f.run(t, args...); o.code != exitRefused || !strings.Contains(o.str("why"), "systemd") {
+			t.Errorf("%v on a Mac: code %d (%s), want refused", args, o.code, o.str("why"))
+		}
+	}
+
+	if o := f.run(t, "show"); o.code != 0 || !strings.Contains(o.raw, `"inv-1"`) {
+		t.Errorf("show on a Mac: code %d, want the record printed:\n%s", o.code, o.raw)
+	}
+}

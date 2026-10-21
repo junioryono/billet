@@ -420,6 +420,160 @@ func (q *Queries) ListJobHistory(ctx context.Context, maxRows int64) ([]ListJobH
 	return items, nil
 }
 
+const listJobWaits = `-- name: ListJobWaits :many
+SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
+       github_runner_assigned_at, bought_at, COALESCE(assigned_at, '') AS assigned_at,
+       COALESCE(started_at, '') AS started_at
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= $1
+ ORDER BY started_at DESC, lease_id DESC
+ LIMIT CAST($2 AS BIGINT)
+`
+
+type ListJobWaitsParams struct {
+	Since   sql.NullString
+	MaxRows int64
+}
+
+type ListJobWaitsRow struct {
+	LeaseID                  string
+	Tier                     string
+	Vcpu                     int64
+	GithubQueuedAt           string
+	GithubScaleSetAssignedAt string
+	GithubRunnerAssignedAt   string
+	BoughtAt                 string
+	AssignedAt               string
+	StartedAt                string
+}
+
+// The jobs that started since a moment, with every time their wait is split
+// by, newest start first, bounded: a window past the bound loses its oldest
+// jobs, never the ones an operator is looking at now.
+//
+// WINDOWED ON started_at, because a wait is known once the job starts: a job
+// still queued has no row here that says so, and the report counts those from
+// the listeners' own reports instead. Every empty time is "not recorded", which
+// the report keeps out of the parts it cannot compute rather than reading it
+// as zero. vcpu is the charged shape, written when the row opens.
+func (q *Queries) ListJobWaits(ctx context.Context, arg ListJobWaitsParams) ([]ListJobWaitsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listJobWaits, arg.Since, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListJobWaitsRow
+	for rows.Next() {
+		var i ListJobWaitsRow
+		if err := rows.Scan(
+			&i.LeaseID,
+			&i.Tier,
+			&i.Vcpu,
+			&i.GithubQueuedAt,
+			&i.GithubScaleSetAssignedAt,
+			&i.GithubRunnerAssignedAt,
+			&i.BoughtAt,
+			&i.AssignedAt,
+			&i.StartedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listJobsAwaitingQueueTime = `-- name: ListJobsAwaitingQueueTime :many
+SELECT lease_id, tier, COALESCE(repo, '') AS repo,
+       CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
+            AS BIGINT) AS run_id,
+       github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= $1
+   AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
+   AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
+   AND (CAST($2 AS TEXT) = ''
+        OR started_at < CAST($2 AS TEXT)
+        OR (started_at = CAST($2 AS TEXT) AND lease_id < CAST($3 AS TEXT)))
+ ORDER BY started_at DESC, lease_id DESC
+ LIMIT CAST($4 AS BIGINT)
+`
+
+type ListJobsAwaitingQueueTimeParams struct {
+	Since         sql.NullString
+	BeforeStarted string
+	BeforeLease   string
+	MaxRows       int64
+}
+
+type ListJobsAwaitingQueueTimeRow struct {
+	LeaseID                  string
+	Tier                     string
+	Repo                     string
+	RunID                    int64
+	GithubJobID              string
+	StartedAt                string
+	GithubScaleSetAssignedAt string
+}
+
+// The jobs that started since a moment and still have no GitHub queue time,
+// with what finds each in GitHub's REST record of its run: the repository, the
+// run and GitHub's job id (the lease names the runner). Newest start first,
+// bounded, so a backlog is worked from the jobs an operator is looking at now.
+//
+// THE RUN IS THE ONE THAT STARTED: github_run_id, which the JobStarted wrote
+// (migration 62). A pooled runner's run_id is the run of the job it was
+// launched for, and GitHub may give the runner a job of another run, so
+// run_id is read only for a row with no github_run_id, which a row written
+// before the migration has, and a direct assignment's run_id names the job it
+// ran. A run that is wrong finds no job on the runner, never another job's
+// time, because the runner's name is unique.
+//
+// PAGED FROM A CURSOR, (before_started, before_lease), the last row of the page
+// before; an empty before_started is the newest. A reader that filters what it
+// cannot use yet pages on rather than stopping at one page of it.
+func (q *Queries) ListJobsAwaitingQueueTime(ctx context.Context, arg ListJobsAwaitingQueueTimeParams) ([]ListJobsAwaitingQueueTimeRow, error) {
+	rows, err := q.db.QueryContext(ctx, listJobsAwaitingQueueTime,
+		arg.Since,
+		arg.BeforeStarted,
+		arg.BeforeLease,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListJobsAwaitingQueueTimeRow
+	for rows.Next() {
+		var i ListJobsAwaitingQueueTimeRow
+		if err := rows.Scan(
+			&i.LeaseID,
+			&i.Tier,
+			&i.Repo,
+			&i.RunID,
+			&i.GithubJobID,
+			&i.StartedAt,
+			&i.GithubScaleSetAssignedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const readJob = `-- name: ReadJob :one
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
        COALESCE(request_id, 0) AS request_id, github_job_id,
@@ -427,34 +581,41 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
        queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
-       chosen_provider, instance_type, vcpu, memory, site
+       chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
+       github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
+       detail_retired_at
   FROM job_history WHERE lease_id = $1
 `
 
 type ReadJobRow struct {
-	LeaseID        string
-	Tier           string
-	Node           string
-	RunID          int64
-	RequestID      int64
-	GithubJobID    string
-	Repo           string
-	WorkflowRef    string
-	JobName        string
-	Event          string
-	Conclusion     string
-	FailureReason  string
-	Result         string
-	Disruption     string
-	QueuedAt       string
-	AssignedAt     string
-	StartedAt      string
-	FinishedAt     string
-	ChosenProvider string
-	InstanceType   string
-	Vcpu           int64
-	Memory         int64
-	Site           string
+	LeaseID                  string
+	Tier                     string
+	Node                     string
+	RunID                    int64
+	RequestID                int64
+	GithubJobID              string
+	Repo                     string
+	WorkflowRef              string
+	JobName                  string
+	Event                    string
+	Conclusion               string
+	FailureReason            string
+	Result                   string
+	Disruption               string
+	QueuedAt                 string
+	AssignedAt               string
+	StartedAt                string
+	FinishedAt               string
+	ChosenProvider           string
+	InstanceType             string
+	Vcpu                     int64
+	Memory                   int64
+	Site                     string
+	GithubQueuedAt           string
+	GithubScaleSetAssignedAt string
+	GithubRunnerAssignedAt   string
+	BoughtAt                 string
+	DetailRetiredAt          string
 }
 
 // One job's whole history row, for `billet jobs show`.
@@ -489,6 +650,11 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.Vcpu,
 		&i.Memory,
 		&i.Site,
+		&i.GithubQueuedAt,
+		&i.GithubScaleSetAssignedAt,
+		&i.GithubRunnerAssignedAt,
+		&i.BoughtAt,
+		&i.DetailRetiredAt,
 	)
 	return i, err
 }
@@ -627,12 +793,38 @@ func (q *Queries) ReadJobStarted(ctx context.Context, leaseID string) (bool, err
 	return exists, err
 }
 
+const readJobWait = `-- name: ReadJobWait :one
+SELECT tier, github_queued_at, COALESCE(started_at, '') AS started_at
+  FROM job_history WHERE lease_id = $1
+`
+
+type ReadJobWaitRow struct {
+	Tier           string
+	GithubQueuedAt string
+	StartedAt      string
+}
+
+// The two ends of one job's queue wait, and its tier: GitHub's queue time and
+// billet's start, each empty while unrecorded.
+func (q *Queries) ReadJobWait(ctx context.Context, leaseID string) (ReadJobWaitRow, error) {
+	row := q.db.QueryRowContext(ctx, readJobWait, leaseID)
+	var i ReadJobWaitRow
+	err := row.Scan(&i.Tier, &i.GithubQueuedAt, &i.StartedAt)
+	return i, err
+}
+
 const recordJobAssignment = `-- name: RecordJobAssignment :exec
-INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at,
+                         vcpu, memory, bought_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7,
+        $8, $9,
+        COALESCE((SELECT created_at FROM leases WHERE id = $1), ''))
 ON CONFLICT (lease_id) DO UPDATE SET
   run_id = excluded.run_id, request_id = excluded.request_id,
-  assigned_at = excluded.assigned_at
+  assigned_at = excluded.assigned_at,
+  vcpu = excluded.vcpu, memory = excluded.memory,
+  bought_at = CASE WHEN job_history.bought_at = '' THEN excluded.bought_at
+                   ELSE job_history.bought_at END
 `
 
 type RecordJobAssignmentParams struct {
@@ -643,12 +835,20 @@ type RecordJobAssignmentParams struct {
 	RequestID  sql.NullInt64
 	QueuedAt   string
 	AssignedAt sql.NullString
+	Vcpu       int64
+	Memory     int64
 }
 
 // Open the history row when the job is assigned.
 //
 // AT ASSIGNMENT RATHER THAN AT TERMINALIZATION, so the row carries a real
 // assignment time instead of one fabricated when the lease closes.
+//
+// WITH WHEN THE LEASE WAS BOUGHT AND ITS CHARGED SHAPE, which a queue-wait
+// report splits a wait by and groups jobs under while the lease still runs;
+// the archive overwrites the shape with the same terminal facts. The purchase
+// time is the lease row's own, read here because that row is reaped and this
+// one is what an operator reads, and kept at its first value.
 //
 // THE HOST IS COALESCE(node, target_node), the way the rest of the arithmetic
 // reads a lease: `node` is filled at bind and escrow chose the machine long
@@ -664,6 +864,8 @@ func (q *Queries) RecordJobAssignment(ctx context.Context, arg RecordJobAssignme
 		arg.RequestID,
 		arg.QueuedAt,
 		arg.AssignedAt,
+		arg.Vcpu,
+		arg.Memory,
 	)
 	return err
 }
@@ -677,18 +879,32 @@ UPDATE job_history
                             ELSE workflow_ref END,
        job_name      = CASE WHEN job_name = '' THEN CAST($4 AS TEXT)
                             ELSE job_name END,
-       event         = CASE WHEN event = '' THEN CAST($5 AS TEXT) ELSE event END
- WHERE lease_id = $6
+       event         = CASE WHEN event = '' THEN CAST($5 AS TEXT) ELSE event END,
+       github_queued_at = CASE WHEN github_queued_at = ''
+                               THEN CAST($6 AS TEXT) ELSE github_queued_at END,
+       github_scale_set_assigned_at = CASE WHEN github_scale_set_assigned_at = ''
+                               THEN CAST($7 AS TEXT)
+                               ELSE github_scale_set_assigned_at END,
+       github_runner_assigned_at = CASE WHEN github_runner_assigned_at = ''
+                               THEN CAST($8 AS TEXT)
+                               ELSE github_runner_assigned_at END,
+       github_run_id = CASE WHEN github_run_id = 0 THEN CAST($9 AS BIGINT)
+                            ELSE github_run_id END
+ WHERE lease_id = $10
    AND (github_job_id = '' OR github_job_id = CAST($1 AS TEXT))
 `
 
 type RecordJobIdentityParams struct {
-	GithubJobID string
-	Repo        string
-	WorkflowRef string
-	JobName     string
-	Event       string
-	LeaseID     string
+	GithubJobID              string
+	Repo                     string
+	WorkflowRef              string
+	JobName                  string
+	Event                    string
+	GithubQueuedAt           string
+	GithubScaleSetAssignedAt string
+	GithubRunnerAssignedAt   string
+	GithubRunID              int64
+	LeaseID                  string
 }
 
 // Record which of GitHub's jobs this lease ran, filling only what is empty.
@@ -699,6 +915,10 @@ type RecordJobIdentityParams struct {
 // the statement so a message about a different job can never splice its name
 // or repository onto the one this row recorded, which is also why the job id
 // itself needs no CASE: the filter admits only an empty one or the same.
+//
+// GITHUB'S TIMES FOLLOW THE SAME RULE: each is written once, from the first
+// message about this job that carried it, and an empty one (a time the message
+// left out) never replaces anything. They are GitHub's clock, kept verbatim.
 func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityParams) error {
 	_, err := q.db.ExecContext(ctx, recordJobIdentity,
 		arg.GithubJobID,
@@ -706,6 +926,10 @@ func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityPa
 		arg.WorkflowRef,
 		arg.JobName,
 		arg.Event,
+		arg.GithubQueuedAt,
+		arg.GithubScaleSetAssignedAt,
+		arg.GithubRunnerAssignedAt,
+		arg.GithubRunID,
 		arg.LeaseID,
 	)
 	return err

@@ -21,7 +21,35 @@ type Options struct {
 	// nil counts nothing. Only a job with a VMM and a vCPU thread prefix is
 	// counted.
 	Counters CounterSource
+	// Observer is told what the sampler does, for the node's metrics; nil tells
+	// nobody.
+	Observer Observer
 }
+
+// Observer is told how the sampler is keeping up: how long each tick's reads
+// took, each interval of a job it marked unseen and why, and each read whose
+// disk written is a lower bound. Its methods are called on the sampler's
+// goroutine, some with its lock held, so they must return at once.
+//
+// THE DIAGNOSIS OF A SHORT SERIES (#495). A job's own series says which of its
+// intervals were not seen and why; these say how often that happens on a node,
+// which is what decides whether the sampler needs anything more.
+type Observer interface {
+	TickTook(took time.Duration)
+	// Gap is one interval marked unseen, by its cause's name (GapCause.String,
+	// so an observer need not import this package), counted when the sampler
+	// keeps the sample that ends it or marks earlier ones; a job's last
+	// interval, which its final read decides, is not counted.
+	Gap(cause string)
+	IOBounded()
+}
+
+// unobserved is the Observer nil means.
+type unobserved struct{}
+
+func (unobserved) TickTook(time.Duration) {}
+func (unobserved) Gap(string)             {}
+func (unobserved) IOBounded()             {}
 
 // maxPackageWatts bounds how fast a package can advance its energy counter, to
 // decide how long a gap between readings may be before a wrap could have gone
@@ -136,10 +164,25 @@ type job struct {
 	// energyBroken is set when any interval of the job's life could not be
 	// attributed, which makes its energy could-not-tell rather than too low.
 	energyBroken bool
-	// unseen says the sampler has not seen an interval since the last point it
-	// kept, a tick it missed or a read that failed, so the next point it keeps
-	// is marked AfterGap.
-	unseen bool
+	// unseen is why the sampler has not seen an interval since the last point
+	// it kept, a read that failed or took a whole interval, so the next point it
+	// keeps is marked with it; GapNone when it has seen every one.
+	unseen GapCause
+	// fell says a counter fell into the last point kept, so the next interval
+	// holds its catch-up and is uncovered too (settle).
+	fell bool
+	// resumed is a job this process adopted (Resume): its hardware counters are
+	// not opened and its package energy is broken, since neither was counted
+	// before it. carried says its series so far came from a checkpoint.
+	resumed, carried bool
+}
+
+// see records that an interval since the last kept point went unseen, and why;
+// two different causes for one interval are GapSeveral. What follows from a
+// cause (the spacing a dropped sample leaves) is not a second one: nextPoint
+// reads the spacing only when nothing was recorded.
+func (j *job) see(c GapCause) {
+	j.unseen = joinGaps(j.unseen, c)
 }
 
 type seen struct{ cpu, memory, oom, io, net, threads, pressure, processEnergy bool }
@@ -149,6 +192,9 @@ type seen struct{ cpu, memory, oom, io, net, threads, pressure, processEnergy bo
 func NewMonitor(root string, opts Options) *Monitor {
 	if opts.Now == nil {
 		opts.Now = time.Now
+	}
+	if opts.Observer == nil {
+		opts.Observer = unobserved{}
 	}
 
 	return &Monitor{reader: Reader{Root: root}, opts: opts, jobs: map[string]*job{},
@@ -241,7 +287,8 @@ func (m *Monitor) start(key string, j *job) {
 	s, vcpus := m.reader.readListing(j.target)
 	now := m.opts.Now()
 	var counters *Counters
-	if m.opts.Counters != nil && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" && !j.target.Process {
+	if m.opts.Counters != nil && !j.resumed && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" &&
+		!j.target.Process {
 		c := &jobCounters{}
 		m.counting[j] = c
 		m.count(j, c, s, vcpus)
@@ -253,12 +300,48 @@ func (m *Monitor) start(key string, j *job) {
 	if m.jobs[key] != j {
 		return
 	}
-	j.first, j.pending, j.points = now, false, nil
-	j.absorb(s, now)
+	if j.carried {
+		m.continueFrom(j, s, now)
+	} else {
+		j.first, j.pending, j.points = now, false, nil
+		j.absorb(s, now)
+		j.points = append(j.points, j.point(now))
+		j.unseen = GapNone
+	}
 	j.counters = counters
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
-	j.points = append(j.points, j.point(now))
-	j.unseen = now.Sub(began) >= m.opts.Interval
+	if now.Sub(began) >= m.opts.Interval {
+		j.see(GapSlowRead)
+	}
+	m.readBounded(s)
+}
+
+// continueFrom takes the baseline of a job whose series a checkpoint carried
+// from the process that handed it over: its first sample in this process ends
+// the interval between the two, which nobody sampled, and is marked so.
+// Called with mu held.
+//
+// A BASELINE THAT COULD NOT READ A GROUP THE FIRST PROCESS READ KEEPS NO POINT,
+// as a tick's would not: it would hold that group's value from before the
+// handover at a time it was not read, and the interval after it would be given
+// what the job did across the handover. The gap stays open until a sample
+// that reads it all.
+func (m *Monitor) continueFrom(j *job, s Sample, now time.Time) {
+	before := j.seen
+	j.pending = false
+	j.absorb(s, now)
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
+	if unread(s, before, j.target.Process) {
+		j.see(GapFailedRead)
+
+		return
+	}
+	p := j.point(now)
+	p.Gap = joinGaps(j.unseen, GapHandover)
+	j.fell = falls(j.points[len(j.points)-1], p)
+	j.points = append(j.points, p)
+	j.unseen = GapNone
+	m.observeGaps(p.Gap, 1)
 }
 
 // Forget stops measuring a job without reporting it.
@@ -284,6 +367,7 @@ func (m *Monitor) Tick() {
 // checked against the job it was read for, because Forget does not wait for
 // Run.
 func (m *Monitor) tick() {
+	took := time.Now()
 	m.sweepCounters()
 	m.mu.Lock()
 	snapshot := make(map[string]*job, len(m.jobs))
@@ -405,14 +489,39 @@ func (m *Monitor) tick() {
 			}
 		}
 		j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
-		j.lateRead(firstRead(*s, before, j.target.Process))
+		m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(*s, before, j.target.Process)))
 		// A READ THAT TOOK A WHOLE INTERVAL IS UNSEEN: which of its counters were
 		// read when is not known.
-		j.keepPoint(unread(*s, before, j.target.Process) || stalled[key], readAt[key], m.opts.Interval)
+		cause := GapNone
+		switch {
+		case unread(*s, before, j.target.Process):
+			cause = GapFailedRead
+		case stalled[key]:
+			cause = GapSlowRead
+		}
+		if kept := j.keepPoint(cause, readAt[key], m.opts.Interval); kept != GapNone {
+			m.observeGaps(kept, 1)
+		}
+		m.readBounded(*s)
 	}
 
 	m.host, m.hostOK = host, hostErr == nil
 	m.lastTick = now
+	m.opts.Observer.TickTook(time.Since(took))
+}
+
+// observeGaps tells the observer of n intervals marked unseen for cause.
+func (m *Monitor) observeGaps(cause GapCause, n int) {
+	for range n {
+		m.opts.Observer.Gap(cause.String())
+	}
+}
+
+// readBounded tells the observer of a read whose disk written is a lower bound.
+func (m *Monitor) readBounded(s Sample) {
+	if s.IOOK && s.IOBounded {
+		m.opts.Observer.IOBounded()
+	}
 }
 
 func maxTime(a, b time.Time) time.Time {
@@ -511,35 +620,52 @@ func (j *job) point(now time.Time) Point {
 // is within it.
 const gapAfter = 2
 
-// nextPoint is the point the job would keep at now, marked AfterGap when time
-// since its last kept point went unseen: an interval it already knows of,
-// unseen now, or at least gapAfter intervals since that point.
-func (j *job) nextPoint(now time.Time, unseen bool, interval time.Duration) Point {
+// nextPoint is the point the job would keep at now, marked with why the time
+// since its last kept point went unseen: an interval it already knows of, one
+// unseen now, or, with neither, at least gapAfter intervals since that point.
+func (j *job) nextPoint(now time.Time, unseen GapCause, interval time.Duration) Point {
 	p := j.point(now)
-	gap := j.unseen || unseen
-	if n := len(j.points); n > 0 &&
-		time.Duration(p.OffsetMillis-j.points[n-1].OffsetMillis)*time.Millisecond >= gapAfter*interval {
-		gap = true
+	gap := j.unseen
+	if gap == GapNone {
+		gap = unseen
 	}
-	p.AfterGap = gap
+	if n := len(j.points); gap == GapNone && n > 0 &&
+		time.Duration(p.OffsetMillis-j.points[n-1].OffsetMillis)*time.Millisecond >= gapAfter*interval {
+		gap = GapMissedTick
+	}
+	p.Gap = gap
 
 	return p
 }
 
-// keepPoint keeps the point a tick read, unless the tick could not read a
-// group the job had read before: that point would hold the group's last value
-// at a time it was not read, and the next read's catch-up would be split into
-// the wrong interval, so the interval is marked unseen instead.
-func (j *job) keepPoint(unreadNow bool, now time.Time, interval time.Duration) {
-	if unreadNow {
-		j.unseen = true
-		return
+// keepPoint keeps the point a tick read, unless the tick's read was unseen
+// (cause is not GapNone): a group the job had read before that it could not
+// read would be held at its last value at a time it was not read, and a read
+// that took a whole interval read its counters at times not known, so the
+// interval is marked unseen instead and the next point kept carries the
+// cause. It answers the cause the kept point's interval is uncovered for,
+// GapNone when it saw it or kept none: its own mark, or, for a point a counter
+// fell into or the catch-up after one, the GapCounterFell every reader's settle
+// gives it, so the falls are counted where they happen.
+func (j *job) keepPoint(cause GapCause, now time.Time, interval time.Duration) GapCause {
+	if cause != GapNone {
+		j.see(cause)
+		return GapNone
 	}
-	j.points = append(j.points, j.nextPoint(now, false, interval))
-	j.unseen = false
+	p := j.nextPoint(now, GapNone, interval)
+	dropped := len(j.points) > 0 && falls(j.points[len(j.points)-1], p)
+	uncovered := p.Gap
+	if uncovered == GapNone && (dropped || j.fell) {
+		uncovered = GapCounterFell
+	}
+	j.fell = dropped
+	j.points = append(j.points, p)
+	j.unseen = GapNone
 	if len(j.points) > maxPoints {
 		j.points = downsample(j.points, 2)
 	}
+
+	return uncovered
 }
 
 // firstRead reports whether a sample read a group of the series that the job
@@ -554,15 +680,22 @@ func firstRead(s Sample, before seen, process bool) bool {
 // first point, every interval up to now unseen: each point before held that
 // group's zero, so an earlier interval would show it doing nothing and the
 // interval that reads it first would be given everything it did before. The
-// first point ends no interval and keeps no mark.
-func (j *job) lateRead(first bool) {
+// first point ends no interval and keeps no mark, and a point already marked
+// keeps its cause. It answers how many points it marked.
+func (j *job) lateRead(first bool) int {
 	if !first || len(j.points) == 0 {
-		return
+		return 0
 	}
+	marked := 0
 	for i := 1; i < len(j.points); i++ {
-		j.points[i].AfterGap = true
+		if j.points[i].Gap == GapNone {
+			j.points[i].Gap = GapLateFirstRead
+			marked++
+		}
 	}
-	j.unseen = true
+	j.see(GapLateFirstRead)
+
+	return marked
 }
 
 // unread reports whether a sample failed to read a group of the series that
@@ -625,7 +758,7 @@ func (m *Monitor) Final(key string) (Summary, bool) {
 	// THE FINAL POINT IS UNSEEN: the sampler did not answer, so it holds the
 	// last values read, at a time they were not read. Kept on the job, so a
 	// Final asked again after a failed destroy still says so.
-	j.unseen = true
+	j.see(GapSamplerStuck)
 
 	return m.summaryOf(j, m.opts.Now()), true
 }
@@ -661,15 +794,20 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	if counting {
 		j.counters = counters
 	}
-	j.lateRead(firstRead(s, before, j.target.Process))
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
 	// WHAT THIS READ COULD NOT SEE IS KEPT ON THE JOB, not only in the summary:
 	// a destroy that fails discards the summary, and the Final its retry asks
 	// for must still mark the interval. A read that failed, one that took a
 	// whole interval, and one that saw a counter fall all leave it unseen.
-	if unread(s, before, j.target.Process) || now.Sub(began) >= m.opts.Interval ||
-		len(j.points) > 0 && falls(j.points[len(j.points)-1], j.point(now)) {
-		j.unseen = true
+	switch {
+	case unread(s, before, j.target.Process):
+		j.see(GapFailedRead)
+	case now.Sub(began) >= m.opts.Interval:
+		j.see(GapSlowRead)
+	case len(j.points) > 0 && falls(j.points[len(j.points)-1], j.point(now)):
+		j.see(GapCounterFell)
 	}
+	m.readBounded(s)
 
 	return m.summaryOf(j, now), true
 }
@@ -681,7 +819,10 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	// takes no package reading, so the last point repeats the last tick's
 	// energy. With energy shared from the package, that interval is unseen
 	// rather than shown using none.
-	unseen := m.opts.RAPL && !j.target.Process
+	unseen := GapNone
+	if m.opts.RAPL && !j.target.Process {
+		unseen = GapFinalEnergy
+	}
 	points := append(append([]Point(nil), j.points...), j.nextPoint(now, unseen, m.opts.Interval))
 	sum := Summary{
 		First: j.first, Samples: j.samples, Interval: m.opts.Interval, Window: now.Sub(j.first),

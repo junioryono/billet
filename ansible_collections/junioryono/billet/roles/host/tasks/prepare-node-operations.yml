@@ -13,7 +13,12 @@
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem:
       - {kind: write, path: "{{ billet_ordinary_config_path }}"}
+      - {kind: write, path: /etc/tmpfiles.d/billet.conf}
       - {kind: delete, path: /etc/modules-load.d/billet-rbd.conf}
+      # THE DRAIN THE NODE OWES (#127), recorded before a changed configuration
+      # and removed once a converge proves it.
+      - {kind: write, path: "{{ billet_node_drain_owed_path }}"}
+      - {kind: delete, path: "{{ billet_node_drain_owed_path }}"}
     billet_retirement_planned_services:
       - {verb: enable, unit: billet-node.service}
       - {verb: stop, unit: billet-node.service}

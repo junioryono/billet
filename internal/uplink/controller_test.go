@@ -1,6 +1,7 @@
 package uplink
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -22,9 +23,21 @@ func probed(n int, upMbit, downMbit float64, s Sample) Observation {
 	return Observation{At: at(n), Interval: Tick, SentBits: bits(upMbit), ReceivedBits: bits(downMbit), Sample: s}
 }
 
+// newController is a controller under a 10000 Mbit/s ceiling with each direction
+// at 1000, above anything these tests move, so traffic never raises a rate on
+// its own; but within a tenth of it, where a run whose traffic it climbed under
+// stands, so a direction moving a few hundred is filling a share of its line
+// (lossShare) when the reflectors measured no rise.
 func newController() *Controller {
-	return &Controller{Params: DefaultParams(), Up: NewDirection(10000), Down: NewDirection(10000)}
+	c := &Controller{Params: DefaultParams(), Up: NewDirection(10000), Down: NewDirection(10000)}
+	c.Up.Rate, c.Down.Rate = testStart, testStart
+
+	return c
 }
+
+// testStart is the rate newController starts each direction at, which a
+// direction that was neither cut nor raised still holds.
+const testStart = 1000
 
 // A FULL QUEUE UNDER THIS HOST'S OWN DOWNLOAD CUTS THE DOWNLOAD BELOW WHAT WAS
 // FLOWING, and only once the window agrees. Measured at the reference site: the
@@ -51,7 +64,7 @@ func TestAFullQueueUnderTheHostsDownloadCutsItBelowWhatFlowed(t *testing.T) {
 
 	// THE UPLOAD IS ITS OWN PEAK BUT NOT THE LINE'S PROBLEM: five Mbit/s of
 	// acknowledgements beside 378 down filled nothing.
-	if c.Up.Rate != c.Up.Max {
+	if c.Up.Rate != testStart {
 		t.Fatalf("the upload, 5 Mbit/s beside a 378 Mbit/s download, was cut to %.1f; "+
 			"it carried the download's acknowledgements and filled nothing", c.Up.Rate)
 	}
@@ -152,6 +165,7 @@ func TestAQueueThatDrainedIsNotCutForWhenTheCooldownEnds(t *testing.T) {
 
 // CUTS THAT DO NOT SHORTEN THE QUEUE STOP: a delay that stays where it was
 // through two cuts is not this host's, and cutting on would take it to the floor.
+// The second, the last before the latch, is the deepest.
 func TestCutsThatLeaveTheDelayAloneStop(t *testing.T) {
 	t.Parallel()
 
@@ -163,8 +177,40 @@ func TestCutsThatLeaveTheDelayAloneStop(t *testing.T) {
 		c.Step(moving(n, 0, 300, delay))
 	}
 
-	if want := 300 * f * f; c.Down.Rate < want*0.999 || c.Down.Rate > want*1.001 {
-		t.Fatalf("after thirty seconds of a delay no cut moved, the download is at %.1f; want two cuts, %.1f",
+	if want := 300 * f * c.Params.DeepCut; c.Down.Rate < want*0.999 || c.Down.Rate > want*1.001 {
+		t.Fatalf("after thirty seconds of a delay no cut moved, the download is at %.1f; want a cut of %.3f "+
+			"and a deep one, %.1f", c.Down.Rate, f, want)
+	}
+}
+
+// A CUT THAT HELPED IS NOT DEEPENED: the escalation is for a cut that left the
+// queue alone, and a queue a gentle cut is shortening keeps being cut gently.
+func TestACutThatHelpedIsFollowedByAGentleOne(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	first, second := 40*time.Millisecond, 25*time.Millisecond
+
+	n := 0
+	for ; c.Down.Rate >= 300; n++ {
+		c.Step(moving(n, 0, 300, first))
+	}
+
+	after := c.Down.Rate
+	if want := 300 * c.cutFactor(first); after < want*0.999 || after > want*1.001 {
+		t.Fatalf("the first cut took the download to %.1f, want %.1f", after, want)
+	}
+
+	for ; c.Down.Rate >= after; n++ {
+		if n > 60 {
+			t.Fatalf("no second cut while the queue stood at %v", second)
+		}
+
+		c.Step(moving(n, 0, 300, second))
+	}
+
+	if want := after * c.cutFactor(second); c.Down.Rate < want*0.999 || c.Down.Rate > want*1.001 {
+		t.Errorf("a cut after one that shortened the queue took the download to %.1f, want a gentle %.1f",
 			c.Down.Rate, want)
 	}
 }
@@ -436,4 +482,45 @@ func TestEachEpisodeGetsItsOwnCuts(t *testing.T) {
 	if cuts != 2*c.Params.Futile {
 		t.Fatalf("two episodes of a queue no cut moved drew %d cuts; want %d each", cuts, c.Params.Futile)
 	}
+}
+
+// A LOSS CUT THAT LESSENED THE LOSS HELPED: a cut taken on a dropping line keeps
+// its tally, so the next cut, on a line still dropping but losing one probe in
+// three where it lost two, counts the first as having helped.
+func TestALossCutThatLessenedTheLossHelped(t *testing.T) {
+	t.Parallel()
+
+	lossy := func(n int, lost ...string) Observation {
+		probes := []Probe{{Reflector: "a"}, {Reflector: "b"}, {Reflector: "c"}}
+		for i := range probes {
+			probes[i].Lost = slices.Contains(lost, probes[i].Reflector)
+		}
+
+		return probed(n, 5, 400, Sample{Delay: 2 * time.Millisecond, DelayKnown: true, Probes: probes})
+	}
+
+	c := atLine(400)
+	cuts := 0
+	for n := range 60 {
+		o := lossy(n, "a", "b")
+		if cuts > 0 {
+			o = lossy(n, []string{"a", "b"}[n%2])
+		}
+
+		c.Step(o)
+		if c.Cause == CauseNone {
+			continue
+		}
+
+		cuts++
+		if cuts == 2 {
+			if c.Down.futile != 0 {
+				t.Errorf("a loss cut after one that halved the loss was counted futile (%d)", c.Down.futile)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("a line dropping a probe in three was cut %d times; want a second cut to judge", cuts)
 }

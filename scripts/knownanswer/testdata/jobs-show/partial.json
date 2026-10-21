@@ -18,6 +18,11 @@
   "assigned_at": "2026-10-09T10:00:01Z",
   "started_at": "2026-10-09T10:00:05Z",
   "finished_at": "2026-10-09T10:01:40Z",
+  "github_queued_at": "",
+  "github_scale_set_assigned_at": "",
+  "github_runner_assigned_at": "",
+  "bought_at": "",
+  "detail_retired_at": "",
   "usage": {
     "node": "ubuntu-01",
     "recorded_at": "2026-10-09T10:01:41Z",
@@ -31,6 +36,8 @@
       "pressure": true,
       "threads": true
     },
+    "series": null,
+    "series_unavailable": "the usage report came with no series",
     "source": "host",
     "unmeasured": [
       "memory",

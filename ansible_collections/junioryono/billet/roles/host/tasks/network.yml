@@ -112,6 +112,25 @@
     - billet_node_unit_load_state.stdout | trim != 'not-found'
     - not ansible_check_mode
 
+# THE INVOCATION BESIDE THE MAIN PROCESS, read before the stop because a clean
+# stop clears it: the drain is proved by that invocation's own ending, so a
+# running process systemd names none for is refused before its stop.
+- name: Record the billet node's invocation before the network drain
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=MainPID, --property=InvocationID, billet-node.service]
+  register: billet_network_node_before
+  changed_when: false
+  failed_when: >-
+    billet_network_node_before.rc != 0 or
+    billet_network_node_before.stdout_lines | select('match', '^MainPID=[0-9]+\Z') | list | length != 1 or
+    billet_network_node_before.stdout_lines | select('match', '^InvocationID=[0-9a-f]*\Z') | list | length != 1 or
+    ('MainPID=0' not in billet_network_node_before.stdout_lines and 'InvocationID=' in billet_network_node_before.stdout_lines)
+  when:
+    - billet_network_requires_drain
+    - billet_node_unit_load_state.stdout | trim != 'not-found'
+    - not ansible_check_mode
+  become: true
+
 - name: Drain billet compute before changing guest networking
   ansible.builtin.systemd_service:
     name: billet-node.service
@@ -121,6 +140,25 @@
     - billet_node_unit_load_state.stdout | trim != 'not-found'
     - not ansible_check_mode
   become: true
+
+# A STOP SYSTEMD CALLS SUCCESSFUL IS NOT A DRAIN (#127): a stop killed at
+# TimeoutStopSec, and a drain a second signal cut short, both end with the
+# unit stopped. Guest networking changes under running guests only after the
+# stopped invocation's own ending proves it drained, and a node that had no
+# process to stop only after its last process's ending does: one an earlier
+# converge killed may have left them.
+- name: Prove the network drain by the node's own ending
+  ansible.builtin.include_tasks: node-ending.yml
+  vars:
+    billet_ending_call: check
+    billet_ending_invocation: >-
+      {{ '' if 'MainPID=0' in billet_network_node_before.stdout_lines
+         else (billet_network_node_before.stdout_lines | select('match', '^InvocationID=') | first)[13:] }}
+    billet_ending_drain: true
+  when:
+    - billet_network_requires_drain
+    - billet_node_unit_load_state.stdout | trim != 'not-found'
+    - not ansible_check_mode
 
 - name: Enable IP forwarding for guest bridges
   ansible.posix.sysctl:

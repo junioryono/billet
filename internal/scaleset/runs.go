@@ -2,7 +2,10 @@ package scaleset
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"time"
 
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/server"
@@ -51,6 +54,63 @@ func (c *Client) DefaultBranch(ctx context.Context, owner, repository string) (s
 	}
 
 	return branch, nil
+}
+
+var _ server.QueueTimes = (*Client)(nil)
+
+// RunQueueTimes reads when GitHub queued each job of a run, by runner name,
+// through the target's App client. A throttle is server.ErrQueueTimesThrottled
+// and a refused credential or permission server.ErrQueueTimesRefused, which the
+// sweep pauses the App installation for rather than the one run.
+func (c *Client) RunQueueTimes(
+	ctx context.Context, owner, repository string, runID int64,
+) (map[string]time.Time, error) {
+	reader, ok := c.policy.(billetgithub.QueueTimes)
+	if c.policy == nil || !ok {
+		return nil, billetgithub.ErrRunEvidenceUnavailable
+	}
+	times, err := reader.RunQueueTimes(ctx, owner, repository, runID)
+	if err == nil {
+		return times, nil
+	}
+	refused, ok := errors.AsType[*billetgithub.APIError](err)
+	switch {
+	case ok && refused.RateLimited:
+		return nil, fmt.Errorf("scaleset: %w: %w", server.ErrQueueTimesThrottled, err)
+	case ok && (refused.Status == http.StatusUnauthorized || refused.Status == http.StatusForbidden):
+		return nil, fmt.Errorf("scaleset: %w: %w", server.ErrQueueTimesRefused, err)
+	default:
+		return nil, fmt.Errorf("scaleset: %w", err)
+	}
+}
+
+// RESTBudget is the installation's REST budget as GitHub last stated it to the
+// target's App client, false before any answer stated one or for a client
+// built without the App's credentials.
+func (c *Client) RESTBudget() (billetgithub.RESTBudget, bool) {
+	account, ok := c.policy.(billetgithub.RESTAccount)
+	if c.policy == nil || !ok {
+		return billetgithub.RESTBudget{}, false
+	}
+
+	return account.RESTBudget()
+}
+
+// ObserveREST tells o of every request the target's App client makes with the
+// installation's token.
+func (c *Client) ObserveREST(o billetgithub.RESTObserver) {
+	if account, ok := c.policy.(billetgithub.RESTAccount); c.policy != nil && ok {
+		account.ObserveREST(o)
+	}
+}
+
+var _ server.RESTHeadroom = (*Client)(nil)
+
+// RESTHeadroom is the budget in the server's terms.
+func (c *Client) RESTHeadroom() (int64, int64, time.Time, bool) {
+	b, ok := c.RESTBudget()
+
+	return b.Remaining, b.Limit, b.Reset, ok
 }
 
 func (c *Client) runEvidence() (billetgithub.RunEvidence, error) {

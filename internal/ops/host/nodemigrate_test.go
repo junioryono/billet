@@ -77,7 +77,7 @@ echo "$*" >> "$BILLET_FAKE_LOG"
 cmd=""
 unit=""
 names=""
-for a in "$@"; do case "$a" in --property=*) names="$names ${a#--property=}";; --) ;; show|stop|start) cmd=$a;; *) unit=$a;; esac; done
+for a in "$@"; do case "$a" in --property=*) names="$names ${a#--property=}";; --) ;; show|stop|start|daemon-reload) cmd=$a;; *) unit=$a;; esac; done
 case "$cmd" in
   show)
     file="$BILLET_FAKE_UNITS/$unit"
@@ -97,6 +97,7 @@ case "$cmd" in
       hang-ignoring-term) trap '' TERM; exec sleep 90 ;;
       fail) exit 1 ;;
       replace-config) cp "$BILLET_FAKE_CONFIG" "$BILLET_FAKE_CONFIG.new" && mv "$BILLET_FAKE_CONFIG.new" "$BILLET_FAKE_CONFIG" ;;
+      edit-unit-file) echo "# edited under the stop" >> "$BILLET_FAKE_UNIT_FILE" ;;
     esac
     [ -f "$BILLET_FAKE_UNITS/$unit.after-stop" ] && cp "$BILLET_FAKE_UNITS/$unit.after-stop" "$BILLET_FAKE_UNITS/$unit"
     exit 0 ;;
@@ -106,6 +107,14 @@ case "$cmd" in
     [ -f "$BILLET_FAKE_UNITS/$unit.after-start" ] && cp "$BILLET_FAKE_UNITS/$unit.after-start" "$BILLET_FAKE_UNITS/$unit"
     [ -f "$BILLET_FAKE_UNITS/record.remove" ] && rm -f "$BILLET_FAKE_RECORD"
     [ -f "$BILLET_FAKE_UNITS/record.after-start" ] && cp "$BILLET_FAKE_UNITS/record.after-start" "$BILLET_FAKE_RECORD"
+    exit 0 ;;
+  daemon-reload)
+    mode=$(cat "$BILLET_FAKE_UNITS/reload.mode" 2>/dev/null || echo ok)
+    [ "$mode" = fail ] && exit 1
+    # SYSTEMD LOADS WHAT IS ON DISK: the repaired answer only over a repaired file.
+    if [ -f "$BILLET_FAKE_UNITS/billet-node.service.after-reload" ] && grep -qx 'RuntimeDirectory=billet/locks billet/registration' "${BILLET_FAKE_UNIT_FILE:-/dev/null}"; then
+      cp "$BILLET_FAKE_UNITS/billet-node.service.after-reload" "$BILLET_FAKE_UNITS/billet-node.service"
+    fi
     exit 0 ;;
 esac
 exit 1
@@ -135,7 +144,29 @@ func nodeUnitBody(active, sub string, pid int, invocation, killMode, result stri
 	return "LoadState=loaded\nUnitFileState=enabled\nActiveState=" + active + "\nSubState=" + sub + "\nMainPID=" +
 		strconv.Itoa(pid) + "\nInvocationID=" + invocation + "\nKillMode=" + killMode + "\nResult=" + result +
 		"\nStateChangeTimestamp=Tue 2026-09-09 12:00:00 UTC\nNeedDaemonReload=no\nExecMainStartTimestamp=\n" +
-		"NRestarts=0\nExecMainStartTimestampMonotonic=" + strconv.Itoa(pid*1000) + "\nEnvironmentFiles=\nEnvironment=\n"
+		"NRestarts=0\nExecMainStartTimestampMonotonic=" + strconv.Itoa(pid*1000) + "\nEnvironmentFiles=\nEnvironment=\n" +
+		"Job=\nRuntimeDirectory=billet/locks billet/registration\n"
+}
+
+// legacyRuntimeDirectory makes the node unit declare what a unit rendered
+// before the registration record declares (#168): its locks alone.
+func (f *endpointFixture) legacyRuntimeDirectory(t *testing.T) {
+	t.Helper()
+
+	path := f.unitFile(nodeUnit)
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := strings.Replace(string(body), "RuntimeDirectory=billet/locks billet/registration\n",
+		"RuntimeDirectory=billet/locks\n", 1)
+	if legacy == string(body) {
+		t.Fatal("the node unit fixture declares no RuntimeDirectory to make legacy")
+	}
+
+	writeFile(t, path, legacy, 0o644)
 }
 
 func (f *endpointFixture) unitFile(name string) string { return filepath.Join(f.unitsDir, name) }
@@ -763,9 +794,10 @@ func TestMigrateStopsStartsAndWaitsForTheRecordUnderTheNewInvocation(t *testing.
 	}
 
 	// THE TRACE: the first observation, the bracket, the stop, StopAndProve's
-	// own observation, the command's post-stop observation, the start,
-	// StartAndProve's samples, the new invocation, the bracket around the
-	// record, the closing observation. Verbs in order.
+	// own observation, the command's post-stop observation, the ending
+	// judgement's own observation (#127), the start, StartAndProve's samples,
+	// the new invocation, the bracket around the record, the closing
+	// observation. Verbs in order.
 	var verbs []string
 
 	for _, c := range f.systemctlCalls(t) {
@@ -773,7 +805,7 @@ func TestMigrateStopsStartsAndWaitsForTheRecordUnderTheNewInvocation(t *testing.
 	}
 
 	joined := strings.Join(verbs, " ")
-	if !strings.Contains(joined, "show stop show show start show") || strings.Count(joined, "stop") != 1 ||
+	if !strings.Contains(joined, "show stop show show show start show") || strings.Count(joined, "stop") != 1 ||
 		strings.Count(joined, "start") != 1 {
 		t.Errorf("the trace: %s", joined)
 	}

@@ -31,6 +31,21 @@ func TestNotifyReadySignalsSystemdSocket(t *testing.T) {
 	}
 }
 
+// THE START EXTENSION COVERS THE OPEN AND THEN THE UNIT'S WHOLE START BOUND,
+// in microseconds, as systemd reads EXTEND_TIMEOUT_USEC.
+func TestNotifyExtendStartAsksForTheOpenAndTheUnitsBound(t *testing.T) {
+	path, listener := notifySocket(t)
+	t.Setenv("NOTIFY_SOCKET", path)
+
+	if err := ExtendStartFor(processEnv())(110 * time.Second); err != nil {
+		t.Fatalf("notify the start extension: %v", err)
+	}
+
+	if got, want := readNotification(t, listener), "EXTEND_TIMEOUT_USEC=230000000"; got != want {
+		t.Fatalf("start extension = %q, want %q (110s to open plus the unit's 120s)", got, want)
+	}
+}
+
 // notifySocket is a datagram socket standing in for systemd's, at a path short
 // enough for a Unix address.
 func notifySocket(t *testing.T) (string, *net.UnixConn) {

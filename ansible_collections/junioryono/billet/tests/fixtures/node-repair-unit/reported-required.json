@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "required": true,
+  "why": "runtime-unit repair required; effective endpoint unknown: the running node cannot publish its registration record, because its unit declares no billet/registration directory",
+  "unit": {
+    "load_state": "loaded",
+    "fragment_path": "/etc/systemd/system/billet-node.service",
+    "runtime_directory": "billet/locks"
+  }
+}

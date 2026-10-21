@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 )
 
@@ -13,6 +15,25 @@ import (
 // notification socket. Other service managers and interactive runs are no-ops.
 func NotifyReady(env cli.Env) error {
 	return notifySystemd(env, "READY=1", "readiness")
+}
+
+// NotifyExtendStart asks systemd for more time to start: the open about to run
+// may take up to open, and what follows it keeps the unit's whole start bound,
+// as if the open had taken none of it. A no-op without a notification socket.
+//
+// FOR THE LEDGER'S INTEGRITY SCAN, which reads the whole file and on a cold
+// cache took 55 seconds on the reference controller (2026-10-17): the unit is
+// Type=notify, and a start still opening past TimeoutStartSec is killed however
+// healthy it is.
+func NotifyExtendStart(env cli.Env, open time.Duration) error {
+	return notifySystemd(env, fmt.Sprintf("EXTEND_TIMEOUT_USEC=%d",
+		(open+deploy.UnitStartTimeout).Microseconds()), "start extension")
+}
+
+// ExtendStartFor is NotifyExtendStart bound to one process's environment, the
+// shape app.Host takes.
+func ExtendStartFor(env cli.Env) func(time.Duration) error {
+	return func(open time.Duration) error { return NotifyExtendStart(env, open) }
 }
 
 // upgradeProbeReady is the sentence a HOLDING probe prints once it has opened

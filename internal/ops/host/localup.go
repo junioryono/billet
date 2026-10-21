@@ -284,7 +284,13 @@ func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 			path, initconfig.ServiceGroup)
 	}
 
-	if err := startUnits(ctx, env, c, req, plan); err != nil {
+	var admitNode func(context.Context) error
+	if req.WantNode && cli.HostOS == "linux" && cfg.Node != nil {
+		endings := nodeEndings()
+		admitNode = func(ctx context.Context) error { return endings.AdmitStart(ctx, cfg) }
+	}
+
+	if err := startUnits(ctx, env, c, req, plan, admitNode); err != nil {
 		return err
 	}
 
@@ -493,8 +499,10 @@ func upButSealed(env cli.Env, cause error) error {
 // startUnits starts, proves and enables each unit in order, and unwinds the
 // enablement this run performed if a later one fails.
 func startUnits(ctx context.Context, env cli.Env, c converger, req lifeops.UpRequest,
-	plan lifeops.UpPlan,
+	plan lifeops.UpPlan, admitNode func(context.Context) error,
 ) error {
+	_, nodeService := c.Services()
+
 	var enabled []string
 
 	// THE UNWINDING MUST OUTLIVE WHAT CAUSED IT. A context cancelled by the
@@ -540,6 +548,15 @@ func startUnits(ctx context.Context, env cli.Env, c converger, req lifeops.UpReq
 		}
 
 		if unit.Start {
+			// THE NODE STARTS ONLY OVER A PROVED ENDING (#127): its last stop's
+			// record, an acknowledgement, or a reboot since; a node killed at its
+			// stop's timeout left work this one would adopt blind.
+			if unit.Name == nodeService && admitNode != nil {
+				if err := admitNode(ctx); err != nil {
+					return rollback(err)
+				}
+			}
+
 			// WHAT ELSE IS RUNNING, BEFORE THIS START. A unit billet refused to
 			// let name the other one can still reach it at a remove — through
 			// something it pulls in — and no amount of property-reading models
@@ -562,9 +579,9 @@ func startUnits(ctx context.Context, env cli.Env, c converger, req lifeops.UpReq
 			// printing "ready" for both would tell a Mac operator something
 			// nothing checked.
 			// UNDER THE UNIT'S OWN START BOUND: the start runs under the
-			// caller's context and the unit's TimeoutStartSec is what
-			// systemd gives it, so that plus a margin is the deadline.
-			startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+			// caller's context and what systemd gives it, with the server's
+			// extension, plus a margin is the deadline.
+			startCtx, cancelStart := context.WithTimeout(ctx, unitStartDeadline(unit.Name))
 			proof, err := c.StartAndProve(startCtx, unit.Name)
 			cancelStart()
 
@@ -739,6 +756,24 @@ func orDefaultDetail(unit lifeops.UnitPlan) string {
 // beyond the unit's own bound, so systemd's own timeout is what ends a slow
 // operation and the deadline here catches only a manager that never answered.
 const lifecycleDeadlineMargin = 30 * time.Second
+
+// unitStartDeadline is how long billet waits for a start of unit before it
+// presumes the service manager silent: the unit's own start bound and the
+// margin, and for the server the start extension it asks for before opening
+// the ledger (NotifyExtendStart), which systemd grants on top of the time the
+// start had already taken, up to the unit's whole bound. Giving up sooner
+// would call a slow, healthy start a failed one while systemd still waits. A
+// server that asks for no extension (a PostgreSQL ledger) is ended by systemd at
+// the unit's own bound, so the longer wait never outlives it.
+func unitStartDeadline(unit string) time.Duration {
+	deadline := deploy.UnitStartTimeout + lifecycleDeadlineMargin
+
+	if unit == deploy.ServerUnitName {
+		deadline += state.StartupBound() + deploy.UnitStartTimeout
+	}
+
+	return deadline
+}
 
 func liveFor(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), rollbackGrace)

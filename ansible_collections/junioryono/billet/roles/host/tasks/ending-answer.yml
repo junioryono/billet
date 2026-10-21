@@ -1,0 +1,90 @@
+---
+# THE ONE PARSER OF A `billet node ending check|admit-start` ANSWER (#127).
+# The answer is JSON on stdout, exit 0 for `proved`, 2 for `unproved` and 3 for
+# `unknown`; a run the bound ended (124, 137, a negative status) did not answer
+# and is never read as an outcome. A release from before the record has no
+# `node ending` and refuses the word itself (`unexpected argument "ending"`),
+# never running a node: that is read as `billet_ending_older`, for the caller
+# to judge systemd's account the older way. Every member is held to the
+# producer's shape (tests/fixtures/node-ending, written by the Go test), and a
+# member outside the rules refuses naming it.
+#
+# Inputs: billet_ending_raw (the registered command result), billet_ending_call
+# ('check' or 'admit-start'), billet_ending_answered_by (the executable that
+# answered, for the diagnostics).
+
+- name: Note whether the answering release knows the node's ending
+  ansible.builtin.set_fact:
+    billet_ending_older: >-
+      {{ billet_ending_raw.rc | default(-1) not in [-1, 0, 2, 3, 124, 137] and
+         'unexpected argument "ending"' in (billet_ending_raw.stderr | default('')) }}
+
+- name: Refuse a node ending call that did not answer
+  ansible.builtin.assert:
+    that:
+      - billet_ending_raw.rc is defined
+      - billet_ending_raw.rc >= 0
+      - billet_ending_raw.rc not in [124, 137]
+      - billet_ending_raw.stdout | default('') | trim | length > 0
+      - (billet_ending_raw.stdout | default('') | trim) is match('^\{')
+    fail_msg: >-
+      {{ billet_ending_answered_by }} did not answer `billet node ending
+      {{ billet_ending_call }}` (exit {{ billet_ending_raw.rc | default('none') }},
+      {{ 'ended by the bound' if (billet_ending_raw.rc is not defined or billet_ending_raw.rc < 0 or billet_ending_raw.rc in [124, 137]) else 'no JSON answer' }}),
+      so how the node's last process ended cannot be established; the node is
+      left as it is. Ask on the host with `billet node ending show --config
+      /etc/billet/billet.yaml --json` and converge again{{ (': ' ~ (billet_ending_raw.stderr | default('') | trim)) if (billet_ending_raw.stderr | default('') | trim | length > 0) else '' }}.
+  when: not billet_ending_older | bool
+
+- name: Read the node ending's answer
+  ansible.builtin.set_fact:
+    billet_ending_answer: "{{ billet_ending_raw.stdout | junioryono.billet.from_json_strict }}"
+  when: not billet_ending_older | bool
+
+- name: Judge the node ending's answer
+  vars:
+    billet_ending_a: "{{ billet_ending_answer | default({}) }}"
+    billet_ending_outcome: "{{ billet_ending_a.outcome | default('') }}"
+    billet_ending_members: [schema, command, outcome, proof, why, acknowledge, invocation, drain, unit, entry, recorded]
+    billet_ending_checks:
+      - name: schema
+        ok: "{{ billet_ending_a.schema | default(0) is integer and billet_ending_a.schema | default(0) == 1 }}"
+      - name: command
+        ok: "{{ billet_ending_a.command | default('') == billet_ending_call }}"
+      - name: outcome
+        ok: "{{ billet_ending_outcome in ['proved', 'unproved', 'unknown'] }}"
+      - name: exit
+        ok: "{{ billet_ending_outcome in ['proved', 'unproved', 'unknown'] and (billet_ending_raw.rc | default(1)) == {'proved': 0, 'unproved': 2, 'unknown': 3}[billet_ending_outcome] }}"
+      - name: members
+        ok: "{{ billet_ending_a.keys() | list | difference(billet_ending_members) | length == 0 }}"
+      - name: why
+        ok: "{{ billet_ending_a.why | default('x') is string and (billet_ending_a.why | default('')) | length > 0 }}"
+      - name: proof
+        ok: "{{ (billet_ending_a.proof | default('x') is string and billet_ending_a.proof | default('') in ['record', 'systemd', 'acknowledged', 'reboot', 'running']) if billet_ending_outcome == 'proved' else ('proof' not in billet_ending_a) }}"
+      - name: acknowledge
+        ok: "{{ ('acknowledge' not in billet_ending_a) or (billet_ending_outcome != 'proved' and billet_ending_a.acknowledge is string and billet_ending_a.acknowledge is match('^(--invocation [0-9A-Za-z-]+|--unrecorded|--reset-unreadable)\\Z')) }}"
+      # THE ANSWER IS TO THE QUESTION ASKED: the invocation named, or none for
+      # a node that had no process to stop, and the drain the caller required.
+      - name: invocation
+        ok: >-
+          {{ (((billet_ending_invocation | default('') | string | length == 0) and 'invocation' not in billet_ending_a)
+              or (billet_ending_a.invocation | default(none) == (billet_ending_invocation | default('') | string)))
+             if billet_ending_call == 'check' else ('invocation' not in billet_ending_a) }}
+      - name: drain
+        ok: >-
+          {{ ((billet_ending_a.drain | default(false)) is sameas (billet_ending_drain | default(false) | bool))
+             if billet_ending_call == 'check' else ('drain' not in billet_ending_a) }}
+      - name: recorded
+        ok: "{{ ('recorded' not in billet_ending_a) or (billet_ending_call == 'check' and (billet_ending_a.recorded is sameas true or billet_ending_a.recorded is sameas false)) }}"
+  ansible.builtin.assert:
+    that: [item.ok | bool]
+    fail_msg: >-
+      `billet node ending {{ billet_ending_call }}` through {{ billet_ending_answered_by }}
+      answered with a member this role cannot read: {{ item.name }}. How the
+      node's last process ended cannot be established from this answer; the
+      node is left as it is. Ask on the host with `billet node ending show
+      --config /etc/billet/billet.yaml --json` and converge again.
+  loop: "{{ billet_ending_checks }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not billet_ending_older | bool

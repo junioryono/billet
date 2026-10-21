@@ -180,3 +180,90 @@ test ! -s /etc/needrestart/conf.d
 		t.Fatalf("package needrestart exclusion: %v\n%s", err, out)
 	}
 }
+
+// TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns executes the
+// postinstall in a container: where systemd runs, it reloads systemd and then
+// asks systemd-tmpfiles to create the entry the package installs, exactly once
+// and by its path, before the timers are armed; a
+// failure is said and never ends the install, because the next boot creates the
+// directory; and where systemd is not running (an image build, a chroot) it
+// asks nothing. Stand-ins answer for systemctl and systemd-tmpfiles, whose real
+// effect on the entry is measured against systemd in
+// internal/lifeops's real-systemd test.
+func TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("Docker is required to execute the package installer on Linux")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "docker", "image", "inspect", "ubuntu:24.04").Run(); err != nil {
+		t.Skipf("a local ubuntu:24.04 image and Docker daemon are required: %v", err)
+	}
+	script, err := filepath.Abs("scripts/postinstall.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "billet-package-tmpfiles-" + filepath.Base(filepath.Dir(t.TempDir()))
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+		defer stop()
+		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "No such container:") {
+			t.Errorf("remove the package-test container: %v: %s", err, out)
+		}
+	})
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--pull=never", "--network=none",
+		"--name", name, "--mount", "type=bind,src="+script+",dst=/postinstall.sh,readonly",
+		"-i", "ubuntu:24.04", "sh", "-eu")
+	cmd.Stdin = strings.NewReader(`
+mkdir /shim
+printf '#!/bin/sh\nprintf "systemctl %%s\\n" "$*" >>/calls\n[ "$1" != daemon-reload ] || exit "${RELOAD_EXIT:-0}"\nexit 0\n' >/shim/systemctl
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>/tmpfiles.argv\nprintf "tmpfiles\\n" >>/calls\nexit "${TMPFILES_EXIT:-0}"\n' >/shim/systemd-tmpfiles
+chmod 0755 /shim/systemctl /shim/systemd-tmpfiles
+
+PATH="/shim:${PATH}" sh /postinstall.sh
+if [ -e /tmpfiles.argv ]; then
+    echo 'the package asked systemd-tmpfiles for something where systemd is not running' >&2
+    exit 1
+fi
+
+mkdir -p /run/systemd/system
+# A billet that answers the authority status open, so the unit decisions run
+# and arm the timers.
+printf '#!/bin/sh\necho "{\\"closed\\":false}"\n' >/usr/bin/billet
+chmod 0755 /usr/bin/billet
+rm -f /calls
+PATH="/shim:${PATH}" sh /postinstall.sh
+test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
+
+# AFTER A RELOAD, so a stop under the old loaded unit no longer removes it,
+# and BEFORE THE TIMERS ARE ARMED: the image refresh requires the directory.
+reload_at=$(grep -n '^systemctl daemon-reload$' /calls | head -n 1 | cut -d: -f1)
+tmpfiles_at=$(grep -n '^tmpfiles$' /calls | cut -d: -f1)
+timer_at=$(grep -n 'enable --now billet-images-refresh.timer' /calls | cut -d: -f1)
+if [ -z "${reload_at}" ] || [ -z "${tmpfiles_at}" ] || [ -z "${timer_at}" ] ||
+    [ "${reload_at}" -ge "${tmpfiles_at}" ] || [ "${tmpfiles_at}" -ge "${timer_at}" ]; then
+    echo "the directory was not made between a reload and the image refresh's timer:" >&2
+    cat /calls >&2
+    exit 1
+fi
+
+rm /tmpfiles.argv
+TMPFILES_EXIT=1 PATH="/shim:${PATH}" sh /postinstall.sh 2>/tmpfiles.err
+test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
+grep -F '/run/billet/locks could not be created now' /tmpfiles.err
+
+# A RELOAD THAT FAILED IS SAID, with the order to run both in, and the
+# directory is still made.
+rm /tmpfiles.argv
+RELOAD_EXIT=1 PATH="/shim:${PATH}" sh /postinstall.sh 2>/reload.err
+test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
+grep -F 'systemd could not be reloaded' /reload.err
+grep -F 'systemctl daemon-reload && systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf' /reload.err
+`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("package host lock directory: %v\n%s", err, out)
+	}
+}

@@ -59,12 +59,16 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		// The identity is the message's own, which is the evidence a cache
 		// authority will be decided from; what each field holds per event is
-		// measured on the fleet from this line (#226).
+		// measured on the fleet from this line (#226), and so is which of
+		// GitHub's three times a JobStarted carries (#525).
 		l.log.Info("a pooled runner started a job", "tier", l.tier,
 			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID,
 			"run", msg.Started[i].RunID, "event", msg.Started[i].Event,
 			"owner", msg.Started[i].Owner, "repository", msg.Started[i].Repository,
-			"workflow_ref", msg.Started[i].WorkflowRef)
+			"workflow_ref", msg.Started[i].WorkflowRef,
+			"github_queued", msg.Started[i].QueuedAt,
+			"github_scale_set_assigned", msg.Started[i].ScaleSetAssignedAt,
+			"github_runner_assigned", msg.Started[i].RunnerAssignedAt)
 	}
 
 	resolved, err := l.resolveMessage(ctx, msg)
@@ -92,6 +96,13 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if entry.detached {
 			// Still finished, so a redelivered offer for it is not acquired.
 			finished = append(finished, entry.actual)
+			if entry.unbound {
+				l.log.Info("a job was cancelled before any runner took it; the runner launched for it is "+
+					"left to the pool, which retires it only if GitHub will delete it",
+					"tier", l.tier, "request", entry.cleanup.RequestID, "job", entry.job.JobID,
+					"result", entry.job.Result)
+				continue
+			}
 			l.log.Info("a job completed before any runner took it; the runner launched for it is running another job and is left to finish it",
 				"tier", l.tier, "request", entry.cleanup.RequestID, "job", entry.job.JobID,
 				"result", entry.job.Result)
@@ -417,6 +428,6 @@ func (l *Listener) identifyStarted(ctx context.Context, job dispatch.Job) (dispa
 		}
 		return dispatch.Job{}, fmt.Errorf("server: bind started runner %q: %w", job.RunnerName, err)
 	}
-	l.recordJobIdentity(ctx, leaseID, job)
+	l.recordJobIdentity(ctx, leaseID, job, job.RunID)
 	return identified, nil
 }

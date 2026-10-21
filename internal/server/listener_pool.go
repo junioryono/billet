@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/dispatch"
@@ -35,6 +36,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			l.retirePoolMember(ctx, runners[i])
 		}
 	}
+	l.recheckReinstated(ctx, runners)
 
 	runners, err = l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
@@ -373,6 +375,29 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 			l.dropPoolMember(member)
 			return
 		}
+		// A REFUSAL BECAUSE THE RUNNER IS RUNNING A JOB IS GITHUB'S WORD THAT IT
+		// IS NOT IDLE. The removal comes before any compute is touched, so the
+		// member is journaled busy with that job unknown and its delayed JobStarted
+		// binds it; left retiring, the JobStarted is refused and the claim retried
+		// against a runner mid-job on every message (#598).
+		if errors.Is(err, ErrRunnerBusy) && member.ActualRequestID == 0 {
+			if reinstateErr := l.alloc.ReinstateBusyPoolRunner(ctx, member.LeaseID); reinstateErr != nil {
+				l.log.Error("GitHub refused to remove an idle pool member because it is running a job, and "+
+					"it could not be journaled busy; its retirement is retried", "tier", l.tier,
+					"runner", member.RunnerName, "error", errors.Join(err, reinstateErr))
+				return
+			}
+			l.mu.Lock()
+			if l.reinstated == nil {
+				l.reinstated = map[string]time.Time{}
+			}
+			l.reinstated[member.LeaseID] = l.clock()
+			l.mu.Unlock()
+			l.log.Warn("GitHub refused to remove an idle pool member because it is running a job billet has "+
+				"not heard of yet; keeping it busy until that job's start and completion settle it",
+				"tier", l.tier, "runner", member.RunnerName, "lease", member.LeaseID)
+			return
+		}
 		l.log.Error("could not retire an idle pool member; its capacity stays held", "tier", l.tier,
 			"runner", member.RunnerName, "error", err)
 		return
@@ -392,8 +417,68 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 	l.dropPoolMember(member)
 }
 
+const (
+	// reinstatedRecheck is how long a member busy with its job unknown waits for
+	// the JobStarted that would name it before its removal is asked again: the
+	// one measured arrived four minutes late (2026-10-20).
+	reinstatedRecheck = 10 * time.Minute
+	// reinstatedPerPass bounds how many such removals one reconciliation asks.
+	reinstatedPerPass = 2
+)
+
+// recheckReinstated asks again to remove a member this listener reinstated busy
+// whose job has not named itself, so a JobStarted and a completion that were
+// both lost do not hold its capacity, its pool slot and a drain for ever. THE
+// REMOVAL IS STILL THE PROOF and the clock only when it is asked: a refusal
+// reinstates it again, and only a removal GitHub carries out tears it down,
+// through the same retirement the retiring retry used before members were
+// reinstated. The watch is read against the pool's rows on each pass, so a
+// member bound to its job or whose row is gone leaves it.
+//
+// ONLY WHAT THIS PROCESS REINSTATED, never a runner recovered busy after a
+// restart: recovery inspects that one at GitHub on the node's adoption, and the
+// retirement here destroys by request, which after a restart cannot tell an
+// unreachable holder from no compute at all. A restart therefore leaves a
+// reinstated member as recovery leaves its own, waiting for its job's start or
+// completion.
+func (l *Listener) recheckReinstated(ctx context.Context, runners []alloc.PoolRunner) {
+	now := l.clock()
+
+	l.mu.Lock()
+	watched := make(map[string]time.Time, len(l.reinstated))
+	var due []alloc.PoolRunner
+	for i := range runners {
+		member := runners[i]
+		since, reinstated := l.reinstated[member.LeaseID]
+		if !reinstated || member.ActualRequestID != 0 || member.RunID != 0 || member.JobID != "" {
+			continue
+		}
+		watched[member.LeaseID] = since
+		if member.Status != alloc.PoolRunnerBusy {
+			continue
+		}
+		if now.Sub(since) >= reinstatedRecheck && len(due) < reinstatedPerPass {
+			due = append(due, member)
+		}
+	}
+	l.reinstated = watched
+	l.mu.Unlock()
+
+	for i := range due {
+		member := &due[i]
+		if err := l.alloc.RetirePoolRunner(ctx, member.LeaseID); err != nil {
+			l.log.Error("could not claim a pool member busy with an unknown job to ask its removal again",
+				"tier", l.tier, "runner", member.RunnerName, "error", err)
+			continue
+		}
+		member.Status = alloc.PoolRunnerRetiring
+		l.retirePoolMember(ctx, *member)
+	}
+}
+
 func (l *Listener) dropPoolMember(member alloc.PoolRunner) {
 	l.mu.Lock()
+	delete(l.reinstated, member.LeaseID)
 	delete(l.running, member.LaunchRequestID)
 	delete(l.runningJobs, member.LaunchRequestID)
 	delete(l.acquiring, member.LaunchRequestID)

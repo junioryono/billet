@@ -56,9 +56,15 @@ const DefaultKernelDir = config.DefaultKernelDir
 // kernel it will name is durable on this disk — and that is only observable if a
 // test can fail a local step and then ask whether anything remote was attempted.
 type generationPublisher interface {
-	ImportGeneration(
+	ImportCompletedGeneration(
 		ctx context.Context,
 		image, rawPath, runnerVersion, kernel, guestContract string,
+		components *ceph.GenerationComponents,
+		now time.Time,
+	) (string, error)
+	ImportCompletionRoot(
+		ctx context.Context,
+		image, rawPath, runnerVersion, kernel, guestContract, owner string,
 		now time.Time,
 	) (string, error)
 }
@@ -109,6 +115,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		"OIDC issuer that certificate must come from")
 	skipSignature := fs.Bool("skip-signature-verification", false,
 		"import without proving who published the manifest; for a source trusted by other means")
+	completionWait := fs.Duration("completion-wait", defaultCompletionWait,
+		"how long to give the microVM that installs the image's accepted components")
 
 	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
@@ -199,13 +207,15 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if !*keep {
-		defer cleanup()
-	}
+	// KEPT AFTER A COMPLETION WHOSE MICROVM WAS NOT PROVED GONE, because the file
+	// it was given is still attached to it and may still be being written.
+	keepStaging := *keep
 
-	if err := manifest.Usable(firecracker.GuestContract, hostArch()); err != nil {
-		return err
-	}
+	defer func() {
+		if !keepStaging {
+			cleanup()
+		}
+	}()
 
 	// REFUSED ONLY ON EVIDENCE THIS CAN ACTUALLY ESTABLISH. An image whose runner is
 	// past github's window produces microVMs that register and are never given work,
@@ -239,6 +249,54 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	store, err := openGenerationPublisher(cfg)
 	if err != nil {
 		return err
+	}
+
+	// WHAT THE IMAGE LEAVES OUT IS INSTALLED BEFORE IT IS PUBLISHED, and only what
+	// this deployment accepts (#584), so no tier is ever moved onto an image without
+	// what its deployment accepted. A completion that fails imports nothing, and the
+	// generation every tier boots is unchanged.
+	//
+	// OUTSIDE THE KERNEL LOCK, because a completion runs for as long as its
+	// downloads take, and every reap and pull on this host would wait that long. A
+	// node with no verified generation to boot the completion from imports the
+	// image as published first, as a completion root, which names the kernel, so
+	// that is the one part done under the lock.
+	var components *ceph.GenerationComponents
+
+	if manifest.Schema == imagesource.SchemaV3 {
+		plan := planCompletion(manifest, cfg.Images.Accepted())
+
+		asPublished := func(ctx context.Context) (string, error) {
+			lock, err := takeKernelDirLock(ctx, env, *kernelDir,
+				"install the kernel the image as published will name")
+			if err != nil {
+				return "", err
+			}
+
+			defer func() {
+				if err := lock.release(); err != nil {
+					fmt.Fprintf(env.Stdout, "warning: the kernel directory lock was not released: %v\n", err)
+				}
+			}()
+
+			if _, err := installKernel(kernelInstaller, manifest, dir, *kernelDir); err != nil {
+				return "", fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
+			}
+
+			return store.ImportCompletionRoot(ctx, image, raw, manifest.RunnerVersion,
+				kernelFileName(manifest), manifest.GuestContract, cfg.Node.Name, time.Now())
+		}
+
+		installed, err := completeImage(ctx, env, cfg, image, raw, *kernelDir, plan, *completionWait,
+			asPublished)
+		if errors.Is(err, errCompletionLeftRunning) {
+			keepStaging = true
+		}
+		if err != nil {
+			return err
+		}
+
+		components = &ceph.GenerationComponents{LeftOut: plan.LeftOut, Installed: installed}
 	}
 
 	// THE KERNEL DIRECTORY IS HELD FROM BEFORE THE INSTALL THROUGH THE PUBLISH, and
@@ -295,8 +353,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 
 	fmt.Fprintf(env.Stdout, "importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
 
-	generation, err := store.ImportGeneration(ctx, image, raw, manifest.RunnerVersion,
-		kernelFileName(manifest), manifest.GuestContract, time.Now())
+	generation, err := store.ImportCompletedGeneration(ctx, image, raw, manifest.RunnerVersion,
+		kernelFileName(manifest), manifest.GuestContract, components, time.Now())
 	if err != nil {
 		return err
 	}
@@ -537,6 +595,10 @@ func stageImage(
 			return nil, "", nil, err
 		}
 
+		if err := manifest.Usable(firecracker.GuestContract, hostArch()); err != nil {
+			return nil, "", nil, err
+		}
+
 		// COPIED INTO PRIVATE STAGING WHILE BEING HASHED, rather than verified where
 		// they sit and read again later.
 		//
@@ -559,6 +621,13 @@ func stageImage(
 
 	manifest, client, err := resolveImageManifest(ctx, env, cfg, opts)
 	if err != nil {
+		return nil, "", nil, err
+	}
+
+	// REFUSED BEFORE A BYTE IS DOWNLOADED. An image this build cannot import --
+	// another guest contract, another architecture, components it cannot install
+	// -- is otherwise found out only after gigabytes, every day the timer runs.
+	if err := manifest.Usable(firecracker.GuestContract, hostArch()); err != nil {
 		return nil, "", nil, err
 	}
 

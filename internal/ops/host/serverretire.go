@@ -602,7 +602,7 @@ func retireGuard(run string) (*txLock, *os.File, claimShape, *retireRefusal) {
 		return nil, nil, claimShape{}, retireUnknown(retireReasonGuard, err.Error(), "")
 	}
 
-	r := judgeGuardShape(shape, run)
+	r := judgeGuardShape(shape, run, "a retirement")
 	if r != nil {
 		if dir != nil {
 			_ = dir.Close()
@@ -616,30 +616,31 @@ func retireGuard(run string) (*txLock, *os.File, claimShape, *retireRefusal) {
 	return root, dir, shape, nil
 }
 
-// judgeGuardShape is what a retirement requires of a guard, whether the
-// caller holds the transaction lock or is only reporting: this converge's
-// guard, its record readable, no binary transaction's pointer, its acquirer's
-// cleanup window closed and no interrupted rewrite beside it.
-func judgeGuardShape(shape claimShape, run string) *retireRefusal {
+// judgeGuardShape is what an act under this converge's guard (a retirement, a
+// runtime-unit repair) requires of it, whether the caller holds the
+// transaction lock or is only reporting: this converge's guard, its record
+// readable, no binary transaction's pointer, its acquirer's cleanup window
+// closed and no interrupted rewrite beside it. act names the act in a refusal.
+func judgeGuardShape(shape claimShape, run, act string) *retireRefusal {
 	switch {
 	case shape.Kind != claimGuard:
-		return retireRefuse(retireReasonGuard, fmt.Sprintf("this host is not held by a converge guard (%s); a retirement runs "+
-			"under this converge's guard", shape), "")
+		return retireRefuse(retireReasonGuard, fmt.Sprintf("this host is not held by a converge guard (%s); %s runs "+
+			"under this converge's guard", shape, act), "")
 	case shape.RecordErr != "":
 		return retireUnknown(retireReasonGuard, "the guard's record cannot be read: "+shape.RecordErr, "")
 	case shape.Guard.Holder != run:
 		return retireRefuse(retireReasonGuard, fmt.Sprintf("the guard names %s, not %s", shape.Guard.Holder, run), "")
 	case shape.Pointer:
-		return retireRefuse(retireReasonGuard, "the guard carries a binary transaction's pointer; a retirement never "+
+		return retireRefuse(retireReasonGuard, "the guard carries a binary transaction's pointer; "+act+" never "+
 			"runs inside a binary transaction", "")
 	case shape.Guard.Preparing:
 		// The acquirer's cleanup window is still open: a cleanup release could
 		// take the guard away under the retirement's first mutation.
 		return retireRefuse(retireReasonGuard, "the guard is still preparing; settle it (`converge-guard settle`) before "+
-			"a retirement mutates anything under it", "")
+			act+" mutates anything under it", "")
 	case shape.StrayTemporary:
 		return retireUnknown(retireReasonGuard, "the guard carries an interrupted rewrite (guard.json.tmp); recover it "+
-			"before a retirement runs under it", "")
+			"before "+act+" runs under it", "")
 	}
 
 	return nil
@@ -1476,7 +1477,7 @@ func retireDryRun(ctx context.Context, env cli.Env, m retireMode) (any, *retireR
 		// the observed holder supplies no expectation. A preview with no guard
 		// has neither fact to exclude it from a mutating route.
 		if shape.Kind == claimGuard && (report.Route == "new-request" || report.Route == "continue" || report.Route == "cancel") {
-			if r := judgeGuardShape(shape, shape.Guard.Holder); r != nil {
+			if r := judgeGuardShape(shape, shape.Guard.Holder, "a retirement"); r != nil {
 				report.Route, report.RouteWhy = "hold", r.Why
 			}
 		}

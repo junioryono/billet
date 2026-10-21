@@ -117,6 +117,26 @@ def answer(command, source, argv):
         else:
             result = fixture('node-migrate-endpoint', 'unchanged' if active else 'unchanged-stopped')
             result.update(endpoint=desired, effective=current if active else None)
+    elif command == 'ending':
+        # A canned proof, bound to the question the role asked: these cases
+        # exercise retirement, and the ending's judgement has its own gates
+        # (node-restart-check and the Go tests that write these fixtures).
+        call = argv[2]
+        if call == 'admit-start':
+            result = fixture('node-ending', 'admit-start-proved')
+        elif call == 'check':
+            drain = '--drain' in argv
+            invocation = operand('--invocation') if '--invocation' in argv else None
+            result = fixture('node-ending', ('check-proved' if drain else 'check-proved-handoff') if invocation
+                             else 'check-stopped-proved')
+            result.pop('invocation', None)
+            result.pop('drain', None)
+            if invocation:
+                result['invocation'] = invocation
+            if drain:
+                result['drain'] = True
+        else:
+            raise ValueError('unexpected node ending call: ' + repr(argv))
     elif command == 'registration':
         result = fixture('rollout-registration', 'confirmed')
         result['incarnation'] = operand('--incarnation')

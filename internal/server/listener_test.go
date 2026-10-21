@@ -3780,11 +3780,16 @@ type fakeRunnerRegistry struct {
 	names []string
 	ids   []int64
 	err   error
+	// busy is each runner GitHub refuses to remove because it is running a job.
+	busy map[string]bool
 }
 
 func (f *fakeRunnerRegistry) RemoveRunner(_ context.Context, id int64, name string) error {
 	f.names = append(f.names, name)
 	f.ids = append(f.ids, id)
+	if f.busy[name] {
+		return fmt.Errorf("scaleset: remove runner %q (%d): %w: job still running", name, id, ErrRunnerBusy)
+	}
 	return f.err
 }
 

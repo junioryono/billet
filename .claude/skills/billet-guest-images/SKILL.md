@@ -32,8 +32,11 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The manifest is the only thing that needs signing, and it is verified before it is parsed.**
 - **Manifest schema 2 splits the rootfs into ordered parts, and the reader shipped before the writer.**
+- **A verification acts as the probe's holder only while its lock's name still leads to the file it locked.**
 - **A tier says `@verified` or an exact generation, never a bare name.**
 - **A node takes up a newer published image by itself, and the same image is never imported twice.**
+- **An image that leaves components out is completed in a microVM before it is imported, or not imported at all (#584).**
+- **`billet check` describes each tier's generation against `images.accept`, and an image that needs a newer billet says so (#584).**
 - **A per-node rebuild timer is gone on purpose.**
 - **The AMI is the same contract on the other backend.**
 

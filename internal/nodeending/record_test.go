@@ -1,0 +1,927 @@
+package nodeending
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func clock(start time.Time) func() time.Time {
+	at := start
+
+	return func() time.Time {
+		at = at.Add(time.Second)
+
+		return at
+	}
+}
+
+var epoch = time.Date(2026, 10, 17, 18, 0, 0, 0, time.UTC)
+
+func nodeEntry(invocation string, pid int) Entry {
+	return Entry{InvocationID: invocation, PID: pid, BootID: "boot-a", Release: "v0.17.0", Role: RoleNode,
+		RunsOnHost: true}
+}
+
+// A PROCESS'S ENTRY IS WRITTEN AS RUNNING AND ENDED ONCE: the ending replaces
+// running on the same entry, the file is 0600, and a second End changes
+// nothing.
+func TestAProcessIsRecordedRunningAndEndedOnce(t *testing.T) {
+	dir := t.TempDir()
+
+	h, err := Begin(dir, nodeEntry("inv-1", 41), clock(epoch))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, present, err := Read(dir)
+	if err != nil || !present || len(rec.Entries) != 1 || rec.Entries[0].Ending != Running ||
+		rec.Entries[0].Source != SourceNode {
+		t.Fatalf("after Begin: %+v present %v err %v, want one running node entry", rec, present, err)
+	}
+
+	if err := h.End(Drained, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.End(Failed, false); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, _, err = Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := rec.Entries[0]
+	if len(rec.Entries) != 1 || got.Ending != Drained || !got.DrainRequested || got.EndedAt == nil {
+		t.Fatalf("after End: %+v, want the one entry drained with a drain requested and an end time", rec)
+	}
+
+	info, err := os.Stat(Path(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("the record is %v, want 0600", info.Mode().Perm())
+	}
+}
+
+// THE RECORD KEEPS THE NEWEST SIXTEEN: the oldest go, the newest stay.
+func TestTheRecordKeepsTheNewestEntries(t *testing.T) {
+	dir := t.TempDir()
+	now := clock(epoch)
+
+	for i := range MaxEntries + 3 {
+		if _, err := Begin(dir, nodeEntry("inv-"+string(rune('a'+i)), i), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rec.Entries) != MaxEntries || rec.Entries[0].PID != 3 || rec.Entries[MaxEntries-1].PID != MaxEntries+2 {
+		t.Fatalf("kept %d entries, first pid %d, last pid %d; want %d, 3 and %d", len(rec.Entries),
+			rec.Entries[0].PID, rec.Entries[len(rec.Entries)-1].PID, MaxEntries, MaxEntries+2)
+	}
+}
+
+// AN UNREADABLE RECORD IS NEVER OVERWRITTEN: a Begin over it refuses, and the
+// file keeps what it held, because the evidence in it is what a later
+// judgement needs.
+func TestAnUnreadableRecordIsNeverOverwritten(t *testing.T) {
+	for name, body := range map[string]string{
+		"not JSON":       "{",
+		"another schema": `{"schema":2,"entries":[]}`,
+		"an unknown end": `{"schema":1,"entries":[{"ending":"vanished","role":"node","source":"node"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(Path(dir), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err == nil {
+				t.Fatal("Begin wrote over an unreadable record")
+			}
+
+			got, err := os.ReadFile(Path(dir))
+			if err != nil || string(got) != body {
+				t.Errorf("the record now holds %q (%v), want it untouched", got, err)
+			}
+		})
+	}
+}
+
+// A MISSING RECORD IS ABSENT, NOT AN ERROR; a symlink at its name is an error.
+func TestAMissingRecordIsAbsentAndALinkIsRefused(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, present, err := Read(dir); err != nil || present {
+		t.Fatalf("a missing record read present %v, err %v; want absent and no error", present, err)
+	}
+
+	target := filepath.Join(t.TempDir(), "elsewhere.json")
+	if err := os.WriteFile(target, []byte(`{"schema":1,"entries":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink(target, Path(dir)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Read(dir); err == nil {
+		t.Error("a symlink at the record's name was read")
+	}
+}
+
+// AN END WHOSE ENTRY IS GONE SAYS SO: the record was replaced under the
+// process, and its ending is not written onto someone else's entry.
+func TestAnEndWhoseEntryIsGoneSaysSo(t *testing.T) {
+	dir := t.TempDir()
+
+	h, err := Begin(dir, nodeEntry("inv-1", 7), clock(epoch))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := json.Marshal(Record{Schema: Schema, Entries: []Entry{{InvocationID: "other", PID: 8,
+		Role: RoleNode, Source: SourceNode, Ending: Running}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(Path(dir), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.End(Drained, false); !errors.Is(err, ErrNoEntry) {
+		t.Fatalf("End over a replaced record returned %v, want ErrNoEntry", err)
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil || rec.Entries[0].Ending != Running {
+		t.Errorf("the other process's entry is now %+v (%v), want it still running", rec.Entries, err)
+	}
+}
+
+// ONLY THE NEWEST STOP IS ACKNOWLEDGED, BY ITS EXACT INVOCATION; an
+// unrecorded acknowledgement appends its own entry.
+func TestOnlyTheNewestStopIsAcknowledged(t *testing.T) {
+	dir := t.TempDir()
+	now := clock(epoch)
+
+	for _, inv := range []string{"inv-old", "inv-new"} {
+		if _, err := Begin(dir, nodeEntry(inv, 1), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	probe := nodeEntry("inv-probe", 2)
+	probe.Role = RoleProbe
+
+	if _, err := Begin(dir, probe, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Acknowledge(dir, "inv-old", false, now); err == nil ||
+		!strings.Contains(err.Error(), `newest node entry is invocation "inv-new"`) {
+		t.Fatalf("acknowledging an older stop returned %v, want a refusal naming the newest", err)
+	}
+
+	got, err := Acknowledge(dir, "inv-new", false, now)
+	if err != nil || !got.Acknowledged || got.InvocationID != "inv-new" {
+		t.Fatalf("acknowledging the newest stop returned %+v, %v", got, err)
+	}
+
+	got, err = Acknowledge(dir, "", true, now)
+	if err != nil || got.Ending != Unrecorded || got.Source != SourceOperator || !got.Acknowledged {
+		t.Fatalf("an unrecorded acknowledgement returned %+v, %v", got, err)
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil || len(rec.Entries) != 4 || rec.Entries[3].Ending != Unrecorded {
+		t.Errorf("the record is %+v (%v), want the unrecorded acknowledgement appended", rec.Entries, err)
+	}
+}
+
+// PROBES GO BEFORE ANY NODE PROCESS: sixteen readiness probes never push out
+// the node's own unresolved ending, and the record says it was trimmed only
+// once a node process's entry went.
+func TestTheTrimDropsProbesFirst(t *testing.T) {
+	dir := t.TempDir()
+	now := clock(epoch)
+
+	if _, err := Begin(dir, nodeEntry("inv-node", 1), now); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range MaxEntries + 4 {
+		p := nodeEntry("inv-probe", 100+i)
+		p.Role = RoleProbe
+
+		if _, err := Begin(dir, p, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rec.Entries) != MaxEntries || rec.Entries[0].InvocationID != "inv-node" || rec.Trimmed {
+		t.Fatalf("kept %d entries, the first %q, trimmed %v; want %d with the node's first and not trimmed",
+			len(rec.Entries), rec.Entries[0].InvocationID, rec.Trimmed, MaxEntries)
+	}
+
+	if got := AdmitStart(rec, nil, cleanUnit, "boot-a"); got.Verdict != Unproved {
+		t.Fatalf("the node's killed process was admitted over: %s (%s)", got.Verdict, got.Why)
+	}
+
+	for i := range MaxEntries {
+		if _, err := Begin(dir, nodeEntry("inv-later", 200+i), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, _, err = Read(dir)
+	if err != nil || !rec.Trimmed {
+		t.Fatalf("after node entries were dropped the record is trimmed %v (%v), want true", rec.Trimmed, err)
+	}
+}
+
+// A RECORD ANOTHER USER COULD HAVE WRITTEN IS NOT EVIDENCE.
+func TestARecordOthersCanWriteIsRefused(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Read(dir); err != nil {
+		t.Fatalf("the record as written was refused: %v", err)
+	}
+
+	for _, mode := range []os.FileMode{0o620, 0o602} {
+		if err := os.Chmod(Path(dir), mode); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, _, err := Read(dir); err == nil || !strings.Contains(err.Error(), "lets another user write it") {
+			t.Errorf("a record at %04o read as %v, want a refusal", mode, err)
+		}
+	}
+}
+
+// SYSTEMD'S ACCOUNT IS RECORDED ONLY WHERE THE NODE KEPT NONE, ONCE, AND A
+// CLEAN STOP ONLY OVER A HISTORY THAT ADMITS A START, all read again under the
+// record's lock: so a stale check cannot write a clean stop over a newer
+// failure.
+func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
+	stopped := func(inv string) Entry {
+		return Entry{InvocationID: inv, BootID: "boot-a", Ending: Stopped}
+	}
+
+	t.Run("the invocation has its own entry", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := observeIn(dir, stopped("inv-1"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("Observe over the node's own entry returned %v, want ErrRecordChanged", err)
+		}
+	})
+
+	t.Run("over a killed process", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := observeIn(dir, stopped("inv-stale"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("a clean stop over a killed process was recorded: %v", err)
+		}
+
+		failed := stopped("inv-stale")
+		failed.Ending = Failed
+
+		if _, err := observeIn(dir, failed, false, clock(epoch)); err != nil {
+			t.Fatalf("a failed stop was refused: %v", err)
+		}
+	})
+
+	t.Run("once", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		for range 2 {
+			if _, err := observeIn(dir, stopped("inv-old"), false, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		rec, _, err := Read(dir)
+		if err != nil || len(rec.Entries) != 1 || rec.Entries[0].Source != SourceSystemd {
+			t.Fatalf("after two observations the record is %+v (%v), want one systemd entry", rec.Entries, err)
+		}
+
+		// The failure was read first and reached the lock second: it still wins,
+		// and the clean account cannot take it back.
+		failed := stopped("inv-old")
+		failed.Ending = Failed
+
+		if _, err := observeIn(dir, failed, false, now); err != nil {
+			t.Fatalf("a failure over a recorded clean stop returned %v, want it recorded", err)
+		}
+
+		if _, err := observeIn(dir, stopped("inv-old"), false, now); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("a clean account over a recorded failure returned %v, want ErrRecordChanged", err)
+		}
+
+		rec, _, err = Read(dir)
+		if err != nil || len(rec.Entries) != 1 || rec.Entries[0].Ending != Failed {
+			t.Fatalf("the record is %+v (%v), want the one entry failed", rec.Entries, err)
+		}
+
+		if got := AdmitStart(rec, nil, cleanUnit, "boot-a"); got.Verdict != Unproved {
+			t.Errorf("a start over the recorded failure is %s (%s), want refused", got.Verdict, got.Why)
+		}
+	})
+
+	t.Run("a repeated failure names what is newest now", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		failed := stopped("inv-a")
+		failed.Ending = Failed
+
+		if _, err := observeIn(dir, failed, false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		h, err := Begin(dir, nodeEntry("inv-b", 2), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := h.End(LeftRunning, false); err != nil {
+			t.Fatal(err)
+		}
+
+		after, err := observeIn(dir, failed, false, now)
+		if err != nil || Remedy(after) != "--invocation inv-b" {
+			t.Fatalf("a repeated observation returned %v and names %q, want the newest, inv-b", err,
+				Remedy(after))
+		}
+	})
+
+	t.Run("a failure over an acknowledged clean account", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		if _, err := observeIn(dir, stopped("inv-x"), false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := Acknowledge(dir, "inv-x", false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		failed := stopped("inv-x")
+		failed.Ending = Failed
+
+		after, err := observeIn(dir, failed, false, now)
+		if err != nil || after.Entries[0].Acknowledged || after.Entries[0].Ending != Failed {
+			t.Fatalf("a failure over an acknowledged clean stop left %+v (%v), want failed and not acknowledged",
+				after.Entries, err)
+		}
+
+		if got := AdmitStart(after, nil, cleanUnit, "boot-a"); got.Verdict != Unproved {
+			t.Errorf("a start over the failure is %s (%s), want refused: the acknowledgement was of a clean "+
+				"stop", got.Verdict, got.Why)
+		}
+	})
+
+	t.Run("a clean account over an acknowledged failure", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		failed := stopped("inv-x")
+		failed.Ending = Failed
+
+		if _, err := observeIn(dir, failed, false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := Acknowledge(dir, "inv-x", false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := observeIn(dir, stopped("inv-x"), false, now); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("a clean account over an acknowledged failure returned %v, want ErrRecordChanged", err)
+		}
+	})
+
+	t.Run("a clean stop where a drain is required", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		if _, err := Begin(dir, nodeEntry("inv-1", 1), now); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := Acknowledge(dir, "inv-1", false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := observeIn(dir, stopped("inv-2"), true, now); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("a clean stop over an acknowledgement, a drain required, returned %v", err)
+		}
+
+		if _, err := observeIn(dir, stopped("inv-2"), false, now); err != nil {
+			t.Fatalf("a clean stop over an acknowledgement, no drain required, returned %v", err)
+		}
+	})
+
+	t.Run("no invocation", func(t *testing.T) {
+		if _, err := observeIn(t.TempDir(), stopped(""), false, clock(epoch)); err == nil {
+			t.Fatal("a stop with no invocation was recorded")
+		}
+	})
+}
+
+// A DIRECTORY AT THE RECORD'S NAME IS RESET TOO: it cannot be linked, so it is
+// moved aside, and a start may follow.
+func TestADirectoryAtTheRecordsNameIsReset(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(Path(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	aside, _, err := Reset(dir, clock(epoch))
+	if err != nil {
+		t.Fatalf("the reset of a directory returned %v", err)
+	}
+
+	if info, err := os.Stat(aside); err != nil || !info.IsDir() {
+		t.Errorf("the directory set aside is %v (%v), want it kept", info, err)
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := AdmitStart(rec, nil, cleanUnit, "boot-a"); got.Verdict != Proved {
+		t.Errorf("after the reset a start is %s (%s), want proved", got.Verdict, got.Why)
+	}
+}
+
+// A RESET THAT CANNOT WRITE ITS REPLACEMENT LEAVES THE OLD RECORD AT ITS NAME:
+// every judgement still answers could-not-tell, and the host never has no
+// record, which systemd's clean triple alone would prove.
+func TestAFailedResetLeavesTheRecordInPlace(t *testing.T) {
+	t.Run("a directory", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(Path(dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		prev := resetInstall
+		resetInstall = func(string, Record) error { return errors.New("the disk is full") }
+
+		t.Cleanup(func() { resetInstall = prev })
+
+		_, _, err := Reset(dir, clock(epoch))
+
+		resetInstall = prev
+
+		if err == nil {
+			t.Fatal("a reset whose install failed reported success")
+		}
+
+		// The directory is aside and nothing is at the record's name, which the
+		// marker makes could-not-tell rather than absent.
+		rec, present, err := Read(dir)
+		if err == nil || present || !strings.Contains(err.Error(), "interrupted") {
+			t.Fatalf("after a failed directory reset the record reads present %v, err %v; want interrupted",
+				present, err)
+		}
+
+		if got := Standing(rec, err, cleanUnit, true, "boot-a"); got.Verdict != Unknown {
+			t.Fatalf("a drain over an interrupted reset is %s (%s), want could-not-tell", got.Verdict, got.Why)
+		}
+
+		if _, _, err := Reset(dir, clock(epoch.Add(time.Hour))); err != nil {
+			t.Fatalf("the reset run again returned %v", err)
+		}
+
+		if _, err := os.Lstat(filepath.Join(dir, resetMarker)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the marker outlived the reset: %v", err)
+		}
+
+		if rec, _, err := Read(dir); err != nil || AdmitStart(rec, nil, cleanUnit, "boot-a").Verdict != Proved {
+			t.Errorf("after the reset completed the record reads %v and a start is not admitted", err)
+		}
+	})
+
+	t.Run("a file", func(t *testing.T) { aFailedFileResetLeavesTheRecordInPlace(t) })
+}
+
+// lockHeld says another descriptor holds the record's flock, by failing to
+// take it without waiting.
+func lockHeld(t *testing.T, dir string) bool {
+	t.Helper()
+
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open the lock: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return false // the close releases it
+	}
+
+	if !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("flock: %v", err)
+	}
+
+	return true
+}
+
+// SYSTEMD IS ASKED WITH THE RECORD'S LOCK HELD, by a stop's judgement and by a
+// start's or an already-stopped node's alike, so each is judged before or
+// after a stop is written, never between its sampling and its write.
+func TestSystemdIsAskedUnderTheRecordsLock(t *testing.T) {
+	for name, judge := range map[string]func(dir string, sample func() Unit){
+		"a stop": func(dir string, sample func() Unit) {
+			JudgeStop(dir, "inv-x", false, true, sample, clock(epoch))
+		},
+		"a standing": func(dir string, sample func() Unit) { JudgeStanding(dir, true, sample) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			held := false
+
+			judge(dir, func() Unit {
+				held = lockHeld(t, dir)
+
+				return cleanUnit
+			})
+
+			if !held {
+				t.Fatal("systemd was asked without the record's lock held")
+			}
+		})
+	}
+}
+
+// A STOP'S REFUSAL IS ADVISED FROM THE RECORD AS WRITTEN: the failure just
+// recorded is the newest entry, so it is what to acknowledge, and nothing
+// tells the operator to start a node the gate would refuse.
+func TestAStopsRemedyIsNamedFromTheRecordAsWritten(t *testing.T) {
+	dir := t.TempDir()
+	now := clock(epoch)
+
+	if _, err := Begin(dir, nodeEntry("inv-0", 1), now); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Acknowledge(dir, "inv-0", false, now); err != nil {
+		t.Fatal(err)
+	}
+
+	j, recorded := JudgeStop(dir, "inv-1", false, true, func() Unit { return timedOut }, now)
+	if j.Verdict != Unproved || !recorded || j.Acknowledge != "--invocation inv-1" ||
+		strings.Contains(j.Why, "start the node") {
+		t.Fatalf("JudgeStop = %s recorded %v acknowledge %q (%s), want unproved, recorded, inv-1 named and no "+
+			"start advised", j.Verdict, recorded, j.Acknowledge, j.Why)
+	}
+}
+
+// A STOP THAT CANNOT BE RECORDED IS NOT PROVED: a clean one is could-not-tell,
+// since the start after it would not see it, and a failed one names no
+// acknowledgement of a record that does not hold it.
+func TestAStopThatCannotBeRecordedIsNotProved(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+
+	for name, tc := range map[string]struct {
+		unit Unit
+		want Verdict
+	}{
+		"clean":     {cleanUnit, Unknown},
+		"timed out": {timedOut, Unproved},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, lockName), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Chmod(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() {
+				if err := os.Chmod(dir, 0o700); err != nil {
+					t.Error(err)
+				}
+			})
+
+			j, recorded := JudgeStop(dir, "inv-1", false, true, func() Unit { return tc.unit }, clock(epoch))
+			if j.Verdict != tc.want || recorded || !j.Floor || j.Acknowledge != "" ||
+				!strings.Contains(j.Why, "could not be recorded") {
+				t.Fatalf("JudgeStop = %s recorded %v floor %v acknowledge %q (%s), want %s, unrecorded, "+
+					"nothing to acknowledge", j.Verdict, recorded, j.Floor, j.Acknowledge, j.Why, tc.want)
+			}
+		})
+	}
+}
+
+// A STANDING OVER A STATE DIRECTORY THAT DOES NOT EXIST IS JUDGED UNLOCKED,
+// since nothing can be partway through writing there; one whose lock this
+// user may not take says it is root's.
+func TestAStandingWithoutItsLock(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "never-made")
+
+	if j := JudgeStanding(missing, false, func() Unit { return cleanUnit }); j.Verdict != Proved {
+		t.Fatalf("a start on a host with no state directory is %s (%s), want proved by systemd", j.Verdict, j.Why)
+	}
+
+	if os.Geteuid() == 0 {
+		return
+	}
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Error(err)
+		}
+	})
+
+	if j := JudgeStanding(dir, false, func() Unit { return cleanUnit }); j.Verdict != Unknown ||
+		!strings.Contains(j.Why, "judge it as root") {
+		t.Fatalf("a standing whose lock cannot be taken is %s (%s), want could-not-tell naming root", j.Verdict,
+			j.Why)
+	}
+}
+
+// A STATE DIRECTORY THAT APPEARS WHILE A STANDING IS JUDGED UNLOCKED IS
+// JUDGED AGAIN UNDER ITS LOCK: a writer may already be recording a stop there.
+func TestADirectoryThatAppearsIsJudgedAgainUnderItsLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "made-meanwhile")
+	calls, heldOnSecond := 0, false
+
+	// The first, unlocked sample is clean and would prove the start; the
+	// second, locked one is a timeout, which the verdict must rest on.
+	j := JudgeStanding(dir, false, func() Unit {
+		calls++
+
+		if calls == 1 {
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			return cleanUnit
+		}
+
+		heldOnSecond = lockHeld(t, dir)
+
+		return timedOut
+	})
+
+	if calls != 2 || !heldOnSecond || j.Verdict != Unproved || j.Sampled != timedOut {
+		t.Fatalf("systemd was asked %d times, the second locked %v, and the verdict is %s on %+v (%s); want "+
+			"twice, the second locked, and unproved on the timeout", calls, heldOnSecond, j.Verdict, j.Sampled,
+			j.Why)
+	}
+}
+
+// A NODE WHOSE RECORD STAYS LOCKED PAST THE WAIT DOES NOT START, and one whose
+// ending cannot be written leaves its entry running, which reads as killed:
+// both the safe direction.
+func TestANodeBehindAHeldLock(t *testing.T) {
+	dir := t.TempDir()
+
+	h, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := lockWait
+	lockWait = 100 * time.Millisecond
+
+	t.Cleanup(func() { lockWait = prev })
+
+	if _, err := Begin(dir, nodeEntry("inv-2", 2), clock(epoch)); !errors.Is(err, errLockHeld) {
+		t.Fatalf("Begin behind a held lock returned %v, want errLockHeld", err)
+	}
+
+	if err := h.End(Drained, false); !errors.Is(err, errLockHeld) || h.Ended() {
+		t.Fatalf("End behind a held lock returned %v and ended %v, want errLockHeld and not ended", err,
+			h.Ended())
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil || len(rec.Entries) != 1 || rec.Entries[0].Ending != Running {
+		t.Fatalf("the record is %+v (%v), want the one entry still running", rec.Entries, err)
+	}
+}
+
+// A SAMPLE TAKEN BEFORE A LOCK THAT WAS THEN REFUSED IS NOT WHAT THE VERDICT
+// RESTS ON: a node seen running there may have been killed during the wait,
+// so the judgement carries no sample, and a completed one carries its own.
+func TestARefusedRetryCarriesNoSample(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "made-meanwhile")
+	active := Unit{ActiveState: "active", SubState: "running", Result: "success", MainPID: "5", JobAnswered: true}
+
+	var holder *os.File
+
+	t.Cleanup(func() {
+		if holder != nil {
+			_ = holder.Close()
+		}
+	})
+
+	prev := lockWait
+	lockWait = 100 * time.Millisecond
+
+	t.Cleanup(func() { lockWait = prev })
+
+	j := JudgeStanding(dir, false, func() Unit {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		holder = f
+
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatal(err)
+		}
+
+		return active
+	})
+
+	if j.Verdict != Unknown || j.Sampled != (Unit{}) {
+		t.Fatalf("a refused retry is %s carrying %+v (%s), want could-not-tell and no sample", j.Verdict,
+			j.Sampled, j.Why)
+	}
+
+	done := JudgeStanding(t.TempDir(), false, func() Unit { return active })
+	if done.Sampled != active {
+		t.Fatalf("a completed standing carries %+v, want the sample it rests on", done.Sampled)
+	}
+}
+
+// A LOCK HELD PAST THE WAIT IS COULD-NOT-TELL, never a wait without end: one
+// hung holder would otherwise hold every start and stop behind it.
+func TestALockHeldPastTheWaitIsCouldNotTell(t *testing.T) {
+	dir := t.TempDir()
+
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := lockWait
+	lockWait = 100 * time.Millisecond
+
+	t.Cleanup(func() { lockWait = prev })
+
+	j := JudgeStanding(dir, false, func() Unit { return cleanUnit })
+	if j.Verdict != Unknown || !strings.Contains(j.Why, "locked by another process") {
+		t.Fatalf("a standing behind a held lock is %s (%s), want could-not-tell", j.Verdict, j.Why)
+	}
+}
+
+// A MARKER AN EARLIER RESET LEFT IS REMOVED BY THE NEXT ONE, whatever path it
+// takes, or a record that later went missing would read as a reset interrupted.
+func TestAResetRemovesAStaleMarker(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(Path(dir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, resetMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Reset(dir, clock(epoch)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(dir, resetMarker)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the stale marker outlived the reset: %v", err)
+	}
+}
+
+func aFailedFileResetLeavesTheRecordInPlace(t *testing.T) {
+	t.Helper()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(Path(dir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := resetInstall
+	resetInstall = func(string, Record) error { return errors.New("the disk is full") }
+
+	t.Cleanup(func() { resetInstall = prev })
+
+	aside, _, err := Reset(dir, clock(epoch))
+	if err == nil {
+		t.Fatal("a reset whose install failed reported success")
+	}
+
+	if _, present, err := Read(dir); err == nil || present {
+		t.Fatalf("after a failed reset the record reads present %v, err %v; want it still unreadable", present, err)
+	}
+
+	if body, err := os.ReadFile(aside); err != nil || string(body) != "{" {
+		t.Errorf("the record kept beside itself holds %q (%v), want what it held", body, err)
+	}
+}
+
+// AN UNREADABLE RECORD IS SET ASIDE, NEVER DELETED, by the reset alone, which
+// leaves an acknowledgement a start may follow; a readable or absent record is
+// refused, naming what to acknowledge instead.
+func TestAnUnreadableRecordIsSetAsideByTheReset(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, _, err := Reset(dir, clock(epoch)); err == nil || !strings.Contains(err.Error(), "no ending record") {
+		t.Fatalf("a reset with no record returned %v, want a refusal", err)
+	}
+
+	if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Reset(dir, clock(epoch)); err == nil || !strings.Contains(err.Error(), "can be read") {
+		t.Fatalf("a reset of a readable record returned %v, want a refusal", err)
+	}
+
+	if err := os.WriteFile(Path(dir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	aside, e, err := Reset(dir, clock(epoch))
+	if err != nil || !e.Acknowledged || e.Ending != Unrecorded {
+		t.Fatalf("the reset returned %+v, %v", e, err)
+	}
+
+	if body, err := os.ReadFile(aside); err != nil || string(body) != "{" {
+		t.Errorf("the unreadable record set aside holds %q (%v), want what it held", body, err)
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := AdmitStart(rec, nil, cleanUnit, "boot-a"); got.Verdict != Proved {
+		t.Errorf("after the reset a start is %s (%s), want proved", got.Verdict, got.Why)
+	}
+}

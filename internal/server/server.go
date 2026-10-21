@@ -53,6 +53,9 @@ type Server struct {
 	prov  Provisioner
 	tiers []config.Tier
 	log   *slog.Logger
+	// detailRetention is how long a job's series, destinations and guest report
+	// are kept; zero is config.DefaultJobDetailRetention.
+	detailRetention time.Duration
 	// owner identifies this process to GitHub's message queue, so a session left
 	// by a crashed run can be told apart from a live one.
 	owner string
@@ -252,6 +255,12 @@ func WithDrainTimeout(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.drainTimeout = &d }
 }
 
+// WithJobDetailRetention is server.job_detail_retention reaching the loop that
+// deletes a job's detail past it.
+func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.detailRetention = d }
+}
+
 // WithHurry gives every listener the channel that ends its drain wait early.
 //
 // This is the operator's second signal reaching the code that honours it. See
@@ -302,10 +311,15 @@ func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
 	if err != nil {
 		return nil, err
 	}
+	retention, err := cfg.Server.JobDetailRetentionDuration()
+	if err != nil {
+		return nil, err
+	}
 
 	return []ControlPlaneOption{
 		WithDrainTimeout(drain),
 		WithAdmissionOrder(cfg.Server.Order()),
+		WithJobDetailRetention(retention),
 	}, nil
 }
 
@@ -365,6 +379,10 @@ func New(
 // reconciliation fails leaves the others running against a budget they are
 // quietly splitting with a tier that will never take work — and the operator
 // sees a half-configured control plane reported as healthy.
+//
+// A stop returns nil wherever it lands, startup included, and only a stop does:
+// both exits ask state.StoppedBy, so a fault joined to the stop, or a
+// cancellation while ctx is still live, is returned.
 func (s *Server) Run(ctx context.Context) error {
 	if len(s.tiers) == 0 {
 		// REPORTED EVEN HERE, and especially here. Removing the LAST tier is the
@@ -423,105 +441,29 @@ func (s *Server) Run(ctx context.Context) error {
 		})
 	}
 
-	sets := make(map[string]*ScaleSet, len(s.tiers))
+	sets, targets, err := s.reconcile(ctx)
+	if err != nil {
+		// A STOP DURING STARTUP IS A STOP, asked of the same rule as the listeners'
+		// ending below. These errors return before any listener exists, so nothing
+		// else would ever classify them, and a stop landing in a GitHub round trip
+		// or the startup reap would leave the service manager holding a failed unit.
+		if state.StoppedBy(ctx, err) {
+			s.log.Info("stopped while reconciling this control plane's scale sets", "detail", err.Error())
 
-	// EVERY TIER RESOLVES TO ITS TARGET BEFORE ANYTHING IS RECONCILED, and the
-	// per-target policy is re-applied here: a trusted tier under a repository
-	// target is refused at load, and this is the same rule at the layer that
-	// would otherwise create its scale set with the wrong credential. The
-	// catalogue alloc.New was given may never have gone through Parse.
-	targets := make(map[string]Target, len(s.tiers))
-	declared := make(map[string]map[scaleSetKey]struct{}, len(s.targets))
-
-	for i := range s.tiers {
-		t := &s.tiers[i]
-
-		target, ok := s.targetFor(t)
-		if !ok {
-			return fmt.Errorf("server: tier %s names target %q, which this control plane does not "+
-				"serve; every tier belongs to exactly one declared target", t.Label, t.Target)
+			return nil
 		}
 
-		if len(s.targets) > 0 {
-			if errs := config.TierTargetPolicyErrors("tier "+t.Label, *t, target.Config); len(errs) > 0 {
-				return fmt.Errorf("server: refuse tier %s: %w", t.Label, errors.Join(errs...))
-			}
-		}
-
-		targets[t.Label] = target
-
-		path := target.Config.Path()
-		if declared[path] == nil {
-			declared[path] = make(map[scaleSetKey]struct{})
-		}
-
-		key := scaleSetKey{group: groupOrDefault(t.RunnerGroup), label: t.ScaleSetName()}
-		if _, dup := declared[path][key]; dup {
-			return fmt.Errorf("server: tier %s answers to %q on %s, which another tier already "+
-				"does; two tiers on one scale set would each take the other's jobs", t.Label, key.label, path)
-		}
-
-		declared[path][key] = struct{}{}
-	}
-
-	if err := s.reportUndeclaredScaleSets(ctx, declared); err != nil {
 		return err
 	}
 
-	for i := range s.tiers {
-		t := &s.tiers[i]
-		prov := targets[t.Label].Provisioner
+	// GITHUB'S QUEUE TIME COMES FROM ITS REST RECORD, after the start, beside
+	// the listeners and unable to stop them: it decides nothing.
+	group.Background("github queue times", func(ctx context.Context) {
+		s.fillQueueTimes(ctx, targets)
+	})
 
-		if t.Trust == config.WorkloadTrusted {
-			validator, ok := prov.(trustedRunnerGroupValidator)
-			if !ok {
-				return fmt.Errorf("server: tier %s is trusted, but its provisioner cannot verify runner-group policy", t.Label)
-			}
-			if err := validator.ValidateTrustedRunnerGroup(ctx, t.RunnerGroup, t.Workflows); err != nil {
-				return fmt.Errorf("server: refuse trusted tier %s: %w", t.Label, err)
-			}
-		}
-
-		set, err := prov.EnsureScaleSet(ctx, t.ScaleSetName(), t.RunnerGroup, []string{t.ScaleSetName()})
-		if err != nil {
-			return fmt.Errorf("server: reconcile scale set for tier %s: %w", t.Label, err)
-		}
-
-		if set == nil {
-			return fmt.Errorf("server: no scale set for tier %s and no error explaining why", t.Label)
-		}
-
-		sets[t.Label] = set
-
-		if s.completionStore != nil && len(s.targets) > 0 {
-			rec := state.ScaleSetRecord{
-				Target: targets[t.Label].Config.Path(), RunnerGroup: set.Group, Label: t.ScaleSetName(), ID: set.ID,
-			}
-			if err := s.completionStore.RecordScaleSet(ctx, rec); err != nil {
-				return fmt.Errorf("server: record scale set for tier %s: %w", t.Label, err)
-			}
-		}
-
-		s.log.Info("scale set ready", "tier", t.Label, "runs_on", t.ScaleSetName(),
-			"scale_set", set.ID, "group", set.Group,
-			"target", targets[t.Label].Config.Path())
-	}
-
-	// Reaped ONCE before anything is escrowed, and then on a timer.
-	//
-	// A hard kill leaves escrowed leases in SQLite with no process behind them.
-	// Nothing else ever removes those: every restart counts them against headroom,
-	// so a host that was SIGKILLed while holding capacity comes back advertising
-	// less, and eventually advertises nothing at all. The failure is permanent and
-	// silent, which is the worst pair.
-	//
-	// The startup pass is what makes a restart recover rather than accumulate. The
-	// timer is for a lease whose holder dies mid-run.
-	if n, err := s.alloc.Reap(ctx); err != nil {
-		return fmt.Errorf("server: reclaim abandoned capacity: %w", err)
-	} else if n > 0 {
-		s.log.Info("reclaimed capacity from leases with no live holder", "leases", n)
-	}
+	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
+	group.Background("job detail retention", s.retireJobDetail)
 
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for
@@ -548,17 +490,142 @@ func (s *Server) Run(ctx context.Context) error {
 		})
 	}
 
-	errs := group.Wait()
-
 	// A cancelled context is how this stops on purpose, so it is not an error to
 	// report — but a listener that failed for its own reason is, even if the
-	// cancellation it triggered arrived at the others first.
-	joined := errors.Join(errs...)
-	if joined != nil && !onlyCancellation(errs) {
-		return joined
+	// cancellation it triggered arrived at the others first. And a context still
+	// live is never a stop: every tier returning a cancellation while nobody
+	// asked this process to stop is a failure, and reporting it as a clean stop
+	// would leave the service manager nothing to restart.
+	if errs := group.Wait(); !allStopped(ctx, errs) {
+		return errors.Join(errs...)
 	}
 
 	return nil
+}
+
+// allStopped reports whether every error a tier ended with is nothing but ctx
+// ending.
+//
+// EACH ON ITS OWN, never their join. The walk behind state.StoppedBy has a
+// budget for the whole tree it is given, and a deployment with enough tiers
+// would exhaust it on a join of nothing but cancellations: a clean stop read as
+// a could-not-tell, and the process would exit 1 for it.
+func allStopped(ctx context.Context, errs []error) bool {
+	for _, err := range errs {
+		if !state.StoppedBy(ctx, err) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// reconcile resolves every tier to its target, reports scale sets no tier
+// declares any more, makes each tier's scale set exist and records it, and
+// reclaims the capacity a hard kill left escrowed: everything Run does before a
+// listener starts.
+func (s *Server) reconcile(ctx context.Context) (map[string]*ScaleSet, map[string]Target, error) {
+	sets := make(map[string]*ScaleSet, len(s.tiers))
+
+	// EVERY TIER RESOLVES TO ITS TARGET BEFORE ANYTHING IS RECONCILED, and the
+	// per-target policy is re-applied here: a trusted tier under a repository
+	// target is refused at load, and this is the same rule at the layer that
+	// would otherwise create its scale set with the wrong credential. The
+	// catalogue alloc.New was given may never have gone through Parse.
+	targets := make(map[string]Target, len(s.tiers))
+	declared := make(map[string]map[scaleSetKey]struct{}, len(s.targets))
+
+	for i := range s.tiers {
+		t := &s.tiers[i]
+
+		target, ok := s.targetFor(t)
+		if !ok {
+			return nil, nil, fmt.Errorf("server: tier %s names target %q, which this control plane does not "+
+				"serve; every tier belongs to exactly one declared target", t.Label, t.Target)
+		}
+
+		if len(s.targets) > 0 {
+			if errs := config.TierTargetPolicyErrors("tier "+t.Label, *t, target.Config); len(errs) > 0 {
+				return nil, nil, fmt.Errorf("server: refuse tier %s: %w", t.Label, errors.Join(errs...))
+			}
+		}
+
+		targets[t.Label] = target
+
+		path := target.Config.Path()
+		if declared[path] == nil {
+			declared[path] = make(map[scaleSetKey]struct{})
+		}
+
+		key := scaleSetKey{group: groupOrDefault(t.RunnerGroup), label: t.ScaleSetName()}
+		if _, dup := declared[path][key]; dup {
+			return nil, nil, fmt.Errorf("server: tier %s answers to %q on %s, which another tier already "+
+				"does; two tiers on one scale set would each take the other's jobs", t.Label, key.label, path)
+		}
+
+		declared[path][key] = struct{}{}
+	}
+
+	if err := s.reportUndeclaredScaleSets(ctx, declared); err != nil {
+		return nil, nil, err
+	}
+
+	for i := range s.tiers {
+		t := &s.tiers[i]
+		prov := targets[t.Label].Provisioner
+
+		if t.Trust == config.WorkloadTrusted {
+			validator, ok := prov.(trustedRunnerGroupValidator)
+			if !ok {
+				return nil, nil, fmt.Errorf("server: tier %s is trusted, but its provisioner cannot verify runner-group policy", t.Label)
+			}
+			if err := validator.ValidateTrustedRunnerGroup(ctx, t.RunnerGroup, t.Workflows); err != nil {
+				return nil, nil, fmt.Errorf("server: refuse trusted tier %s: %w", t.Label, err)
+			}
+		}
+
+		set, err := prov.EnsureScaleSet(ctx, t.ScaleSetName(), t.RunnerGroup, []string{t.ScaleSetName()})
+		if err != nil {
+			return nil, nil, fmt.Errorf("server: reconcile scale set for tier %s: %w", t.Label, err)
+		}
+
+		if set == nil {
+			return nil, nil, fmt.Errorf("server: no scale set for tier %s and no error explaining why", t.Label)
+		}
+
+		sets[t.Label] = set
+
+		if s.completionStore != nil && len(s.targets) > 0 {
+			rec := state.ScaleSetRecord{
+				Target: targets[t.Label].Config.Path(), RunnerGroup: set.Group, Label: t.ScaleSetName(), ID: set.ID,
+			}
+			if err := s.completionStore.RecordScaleSet(ctx, rec); err != nil {
+				return nil, nil, fmt.Errorf("server: record scale set for tier %s: %w", t.Label, err)
+			}
+		}
+
+		s.log.Info("scale set ready", "tier", t.Label, "runs_on", t.ScaleSetName(),
+			"scale_set", set.ID, "group", set.Group,
+			"target", targets[t.Label].Config.Path())
+	}
+
+	// Reaped ONCE before anything is escrowed, and then on a timer.
+	//
+	// A hard kill leaves escrowed leases in SQLite with no process behind them.
+	// Nothing else ever removes those: every restart counts them against headroom,
+	// so a host that was SIGKILLed while holding capacity comes back advertising
+	// less, and eventually advertises nothing at all. The failure is permanent and
+	// silent, which is the worst pair.
+	//
+	// The startup pass is what makes a restart recover rather than accumulate. The
+	// timer is for a lease whose holder dies mid-run.
+	if n, err := s.alloc.Reap(ctx); err != nil {
+		return nil, nil, fmt.Errorf("server: reclaim abandoned capacity: %w", err)
+	} else if n > 0 {
+		s.log.Info("reclaimed capacity from leases with no live holder", "leases", n)
+	}
+
+	return sets, targets, nil
 }
 
 // sessionRetry is how long to wait between attempts at a session another one is
@@ -880,17 +947,6 @@ func (s *Server) sweep(ctx context.Context) {
 // enough that a crashed holder does not strand capacity for long, rare enough
 // that it is not a meaningful load on the one authoritative writer.
 const defaultReapInterval = 30 * time.Second
-
-// onlyCancellation reports whether every error is the shutdown itself.
-func onlyCancellation(errs []error) bool {
-	for _, err := range errs {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			return false
-		}
-	}
-
-	return true
-}
 
 // WithRolloutCoordinator gives the control plane the driver for a fleet rollout.
 //

@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -127,7 +128,21 @@ var (
 	_ server.RunnerInspector = Provisioner{}
 	_ server.RunEvidence     = Provisioner{}
 	_ server.RunEvidence     = NodeJIT{}
+	_ server.QueueTimes      = Provisioner{}
+	_ server.RESTHeadroom    = Provisioner{}
 )
+
+// RESTHeadroom is the target's App installation's REST budget as GitHub last
+// stated it.
+func (p Provisioner) RESTHeadroom() (int64, int64, time.Time, bool) {
+	return p.Client.RESTHeadroom()
+}
+
+// RunQueueTimes reads when GitHub queued each job of a run, by runner name.
+func (p Provisioner) RunQueueTimes(ctx context.Context, owner, repository string, runID int64,
+) (map[string]time.Time, error) {
+	return p.Client.RunQueueTimes(ctx, owner, repository, runID)
+}
 
 // WorkflowRun reads GitHub's record of one run, for a cache authority.
 func (p Provisioner) WorkflowRun(ctx context.Context, owner, repository string, runID int64,

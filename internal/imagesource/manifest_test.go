@@ -3,6 +3,7 @@ package imagesource
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -114,7 +115,7 @@ func TestParseManifestRefusesASchemaItDoesNotKnow(t *testing.T) {
 	// NOT `SchemaVersion + 1`. This build deliberately reads one schema further
 	// than it writes, so deriving the unknown one from the written version made
 	// this test refuse exactly the layout the reader had just learned.
-	for _, schema := range []int{0, SchemaV2 + 1, -1, 99} {
+	for _, schema := range []int{0, SchemaV3 + 1, -1, 99} {
 		m := validManifest()
 		m.Schema = schema
 
@@ -123,8 +124,63 @@ func TestParseManifestRefusesASchemaItDoesNotKnow(t *testing.T) {
 			t.Fatalf("schema %d was accepted", schema)
 		}
 
-		if !strings.Contains(err.Error(), "schema") {
+		// THE READER'S OWN REFUSAL, not a layout complaint that happens to name a
+		// schema: when schema 3 became readable, `SchemaV2 + 1` here went on passing
+		// on the single-asset layout check alone.
+		if !strings.Contains(err.Error(), "this build reads manifest schemas") {
 			t.Errorf("schema %d refused without saying why: %v", schema, err)
+		}
+	}
+}
+
+// A NEWER SCHEMA IS AN UPGRADE TO MAKE, even when it carries a key this build has
+// never heard of; an older or impossible one is not, because no billet publishes it.
+func TestANewerSchemaNeedsANewerBillet(t *testing.T) {
+	m := validManifest()
+	m.Schema = SchemaV3 + 1
+	doc := strings.Replace(string(mustJSON(t, m)), "{", `{"a_field_from_the_future":true,`, 1)
+
+	_, err := ParseManifest([]byte(doc))
+	if !errors.Is(err, ErrNeedsNewerBillet) || !strings.Contains(err.Error(), "upgrade billet") {
+		t.Fatalf("got %v, want a newer schema refused as needing a newer billet", err)
+	}
+
+	for _, schema := range []int{0, -1} {
+		m := validManifest()
+		m.Schema = schema
+
+		_, err := ParseManifest(mustJSON(t, m))
+		if err == nil || errors.Is(err, ErrNeedsNewerBillet) {
+			t.Errorf("schema %d: got %v, want it refused as no billet's", schema, err)
+		}
+	}
+
+	// A CORRUPT DOCUMENT IS NOT A NEWER BILLET'S, whatever schema it names.
+	future := validManifest()
+	future.Schema = SchemaV3 + 1
+	whole := string(mustJSON(t, future))
+	for name, body := range map[string]string{
+		"trailing garbage":  whole + "garbage",
+		"a second document": whole + `{"schema":1}`,
+		"unclosed":          strings.TrimSuffix(strings.TrimSpace(whole), "}"),
+	} {
+		if _, err := ParseManifest([]byte(body)); err == nil || errors.Is(err, ErrNeedsNewerBillet) {
+			t.Errorf("%s: got %v, want a corrupt document refused as corrupt", name, err)
+		}
+	}
+
+	// A SCHEMA NAMED TWICE IS AMBIGUOUS, in either order, never a newer billet's.
+	for _, keys := range []string{`"schema":1,"schema":4,`, `"schema":4,"schema":1,`} {
+		m := validManifest()
+		body := strings.Replace(string(mustJSON(t, m)), `"schema":1,`, keys, 1)
+		if body == string(mustJSON(t, m)) {
+			t.Fatalf("the fixture does not spell its schema as %q", `"schema":1,`)
+		}
+
+		_, err := ParseManifest([]byte(body))
+		if err == nil || errors.Is(err, ErrNeedsNewerBillet) ||
+			!strings.Contains(err.Error(), "more than once") {
+			t.Errorf("%s: got %v, want the duplicate refused as ambiguous", keys, err)
 		}
 	}
 }
@@ -150,6 +206,11 @@ func TestTheReaderIsAheadOfTheWriter(t *testing.T) {
 	if !readableSchemas[SchemaV2] {
 		t.Error("schema 2 is not readable, so the fleet cannot be rolled forward before the " +
 			"writer moves")
+	}
+
+	if !readableSchemas[SchemaV3] {
+		t.Error("schema 3 is not readable, so the build cannot leave components out before " +
+			"the fleet can complete them (#584)")
 	}
 }
 

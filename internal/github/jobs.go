@@ -29,6 +29,19 @@ type JobRecords interface {
 		runnerName string) (WorkflowJob, error)
 }
 
+// QueueTimes reads when GitHub queued each job of a run, by the name of the
+// runner that ran it.
+//
+// GITHUB'S QUEUE TIME IS THE JOB'S created_at, because the scale-set protocol
+// does not carry it: every JobStarted, JobAssigned and JobCompleted billet's
+// reference fleet received on 2026-10-18 under v0.17.0 and v0.18.0 had
+// queueTime 0001-01-01, and no JobAvailable arrived at all. The REST record's
+// created_at fell a second or less before the start's scaleSetAssignTime on the
+// jobs compared. It is whole seconds.
+type QueueTimes interface {
+	RunQueueTimes(ctx context.Context, owner, repository string, runID int64) (map[string]time.Time, error)
+}
+
 // WorkflowJob is the part of GitHub's job record `billet jobs show` reads.
 type WorkflowJob struct {
 	ID         int64
@@ -65,9 +78,11 @@ const (
 	MaxRunJobs = 1000
 	// MaxJobSteps is the most steps the job may list.
 	MaxJobSteps = 1000
-	// maxRunJobPages is what MaxRunJobs takes at runJobsPerPage, so a server
-	// answering a few jobs a page cannot make the read one request per job.
-	maxRunJobPages = (MaxRunJobs + runJobsPerPage - 1) / runJobsPerPage
+	// MaxQueueTimeRunJobs is the most jobs RunQueueTimes reads of one run. It is
+	// read for every run the control plane starts a job of, from the same hourly
+	// budget the scale-set and runner-group calls draw on, so a larger run costs
+	// its first page and is refused rather than read whole.
+	MaxQueueTimeRunJobs = 200
 )
 
 // NewJobRecordsAt builds the job-record reader for one target on the REST API
@@ -91,6 +106,7 @@ type jobRecord struct {
 	Name       *string         `json:"name"`
 	RunAttempt *int64          `json:"run_attempt"`
 	RunnerName json.RawMessage `json:"runner_name"`
+	CreatedAt  *string         `json:"created_at"`
 	Steps      *[]struct {
 		Number      *int64  `json:"number"`
 		Name        *string `json:"name"`
@@ -119,76 +135,21 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 	if strings.TrimSpace(runnerName) == "" {
 		return WorkflowJob{}, errors.New("github: a runner's job needs the runner's name")
 	}
-	endpoint, err := repositoryEndpoint(c.base, owner, repository)
-	if err != nil {
-		return WorkflowJob{}, err
-	}
-	endpoint += "/actions/runs/" + strconv.FormatInt(runID, 10) + "/jobs"
 
 	var matches []WorkflowJob
-	listed := map[int64]bool{}
-	total, read := -1, 0
-	for page := 1; total < 0 || read < total; page++ {
-		if page > maxRunJobPages {
-			return WorkflowJob{}, fmt.Errorf("github: run %d's %d jobs did not arrive in %d pages",
-				runID, total, maxRunJobPages)
+	err := c.listRunJobs(ctx, owner, repository, runID, MaxRunJobs, func(record jobRecord, name string) error {
+		if name != runnerName {
+			return nil
 		}
-		query := url.Values{"filter": {"all"}, "per_page": {strconv.Itoa(runJobsPerPage)},
-			"page": {strconv.Itoa(page)}}
-		var body struct {
-			TotalCount *int         `json:"total_count"`
-			Jobs       *[]jobRecord `json:"jobs"`
+		job, err := workflowJobOf(record)
+		if err != nil {
+			return err
 		}
-		if err := c.getJSON(ctx, endpoint+"?"+query.Encode(), "list the run's jobs", &body); err != nil {
-			return WorkflowJob{}, err
-		}
-		if body.TotalCount == nil || body.Jobs == nil || *body.TotalCount < 0 {
-			return WorkflowJob{}, errors.New("github: the run's job list was incomplete")
-		}
-		switch {
-		case total < 0:
-			total = *body.TotalCount
-			if total > MaxRunJobs {
-				return WorkflowJob{}, fmt.Errorf("github: run %d lists %d jobs, more than the %d billet reads",
-					runID, total, MaxRunJobs)
-			}
-		case *body.TotalCount != total:
-			return WorkflowJob{}, fmt.Errorf("github: run %d's job count changed from %d to %d while it was read",
-				runID, total, *body.TotalCount)
-		}
-		if len(*body.Jobs) == 0 && read < total {
-			return WorkflowJob{}, fmt.Errorf("github: run %d's job list ended after %d of the %d jobs it counts",
-				runID, read, total)
-		}
-		read += len(*body.Jobs)
-		if read > total {
-			return WorkflowJob{}, fmt.Errorf("github: run %d listed more jobs than the %d it counts", runID, total)
-		}
-		for _, record := range *body.Jobs {
-			// COUNTED BY ID, NOT BY ENTRY: a list that shifted between pages can
-			// hand one job back twice, and two copies of one job would stand in for
-			// a job never read.
-			if record.ID == nil || *record.ID <= 0 {
-				return WorkflowJob{}, fmt.Errorf("github: run %d lists a job with no id", runID)
-			}
-			if listed[*record.ID] {
-				return WorkflowJob{}, fmt.Errorf("github: run %d listed job %d twice while it was read",
-					runID, *record.ID)
-			}
-			listed[*record.ID] = true
-			name, err := record.runner()
-			if err != nil {
-				return WorkflowJob{}, fmt.Errorf("github: run %d: %w", runID, err)
-			}
-			if name != runnerName {
-				continue
-			}
-			job, err := workflowJobOf(record)
-			if err != nil {
-				return WorkflowJob{}, err
-			}
-			matches = append(matches, job)
-		}
+		matches = append(matches, job)
+		return nil
+	})
+	if err != nil {
+		return WorkflowJob{}, err
 	}
 
 	switch len(matches) {
@@ -200,6 +161,131 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 		return WorkflowJob{}, fmt.Errorf("github: run %d lists %d jobs on runner %q; refusing to guess",
 			runID, len(matches), runnerName)
 	}
+}
+
+// RunQueueTimes reads when GitHub queued each job of a run that has a runner,
+// keyed by the runner's name, across every attempt of the run.
+//
+// A NAME TWO JOBS SHARE IS LEFT OUT rather than given either's time, and a job
+// whose created_at is absent or unreadable is left out with it: the caller
+// reads a missing name as could-not-tell.
+func (c *runnerGroupPolicyClient) RunQueueTimes(
+	ctx context.Context, owner, repository string, runID int64,
+) (map[string]time.Time, error) {
+	if !c.configured() {
+		return nil, errJobRecordsUnavailable
+	}
+	if runID <= 0 {
+		return nil, fmt.Errorf("github: a workflow run needs a positive id, not %d", runID)
+	}
+
+	times := map[string]time.Time{}
+	shared := map[string]bool{}
+	err := c.listRunJobs(ctx, owner, repository, runID, MaxQueueTimeRunJobs, func(record jobRecord,
+		name string,
+	) error {
+		if name == "" || shared[name] {
+			return nil
+		}
+		if _, seen := times[name]; seen {
+			delete(times, name)
+			shared[name] = true
+			return nil
+		}
+		queued, ok := createdAt(record.CreatedAt)
+		if !ok {
+			shared[name] = true
+			return nil
+		}
+		times[name] = queued
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return times, nil
+}
+
+// listRunJobs hands visit every job of a run, across every attempt, with the
+// name of the runner it ran on (empty for none).
+//
+// THE WHOLE LIST OR AN ERROR: a list longer than maxJobs, one whose count
+// changes while it is read, or one that repeats a job is could-not-tell rather
+// than a prefix. maxJobs is at most MaxRunJobs.
+func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, repository string,
+	runID int64, maxJobs int, visit func(record jobRecord, runnerName string) error,
+) error {
+	endpoint, err := repositoryEndpoint(c.base, owner, repository)
+	if err != nil {
+		return err
+	}
+	endpoint += "/actions/runs/" + strconv.FormatInt(runID, 10) + "/jobs"
+
+	// THE PAGES ARE BOUNDED BY WHAT maxJobs TAKES at runJobsPerPage, so a server
+	// answering a few jobs a page cannot make the read one request per job.
+	maxJobs = min(maxJobs, MaxRunJobs)
+	maxPages := (maxJobs + runJobsPerPage - 1) / runJobsPerPage
+	listed := map[int64]bool{}
+	total, read := -1, 0
+	for page := 1; total < 0 || read < total; page++ {
+		if page > maxPages {
+			return fmt.Errorf("github: run %d's %d jobs did not arrive in %d pages",
+				runID, total, maxPages)
+		}
+		query := url.Values{"filter": {"all"}, "per_page": {strconv.Itoa(runJobsPerPage)},
+			"page": {strconv.Itoa(page)}}
+		var body struct {
+			TotalCount *int         `json:"total_count"`
+			Jobs       *[]jobRecord `json:"jobs"`
+		}
+		if err := c.getJSON(ctx, endpoint+"?"+query.Encode(), "list the run's jobs", &body); err != nil {
+			return err
+		}
+		if body.TotalCount == nil || body.Jobs == nil || *body.TotalCount < 0 {
+			return errors.New("github: the run's job list was incomplete")
+		}
+		switch {
+		case total < 0:
+			total = *body.TotalCount
+			if total > maxJobs {
+				return fmt.Errorf("github: run %d lists %d jobs, more than the %d billet reads",
+					runID, total, maxJobs)
+			}
+		case *body.TotalCount != total:
+			return fmt.Errorf("github: run %d's job count changed from %d to %d while it was read",
+				runID, total, *body.TotalCount)
+		}
+		if len(*body.Jobs) == 0 && read < total {
+			return fmt.Errorf("github: run %d's job list ended after %d of the %d jobs it counts",
+				runID, read, total)
+		}
+		read += len(*body.Jobs)
+		if read > total {
+			return fmt.Errorf("github: run %d listed more jobs than the %d it counts", runID, total)
+		}
+		for _, record := range *body.Jobs {
+			// COUNTED BY ID, NOT BY ENTRY: a list that shifted between pages can
+			// hand one job back twice, and two copies of one job would stand in for
+			// a job never read.
+			if record.ID == nil || *record.ID <= 0 {
+				return fmt.Errorf("github: run %d lists a job with no id", runID)
+			}
+			if listed[*record.ID] {
+				return fmt.Errorf("github: run %d listed job %d twice while it was read", runID, *record.ID)
+			}
+			listed[*record.ID] = true
+			name, err := record.runner()
+			if err != nil {
+				return fmt.Errorf("github: run %d: %w", runID, err)
+			}
+			if err := visit(record, name); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // runner is the name of the runner a listed job ran on, empty for a job GitHub
@@ -258,6 +344,13 @@ func workflowJobOf(record jobRecord) (WorkflowJob, error) {
 	}
 
 	return job, nil
+}
+
+// createdAt reads a job's created_at, false when it is absent or unreadable.
+func createdAt(raw *string) (time.Time, bool) {
+	t, err := stepTime(raw)
+
+	return t, err == nil && !t.IsZero()
 }
 
 // stepTime reads a step time GitHub may leave null.

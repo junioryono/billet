@@ -12,24 +12,128 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
-// fakeRefreshStore answers with one newest generation, or none.
+// fakeRefreshStore answers with one newest generation, or none, and its
+// components record, or none.
 type fakeRefreshStore struct {
-	newest ceph.Generation
-	found  bool
+	newest     ceph.Generation
+	found      bool
+	components *ceph.GenerationComponents
 }
 
 func (s fakeRefreshStore) NewestGeneration(context.Context, string) (ceph.Generation, bool, error) {
 	return s.newest, s.found, nil
 }
 
+func (s fakeRefreshStore) Components(context.Context, string, string) (ceph.GenerationComponents, bool, error) {
+	if s.components == nil {
+		return ceph.GenerationComponents{}, false, nil
+	}
+
+	return *s.components, true, nil
+}
+
+// THE SAME IMAGE IS PULLED AGAIN WHEN ITS NEWEST GENERATION IS NOT WHAT THIS
+// DEPLOYMENT ACCEPTS, though nothing newer is published: a component accepted
+// since, a completion that failed and left the image as published newest, or an
+// acceptance withdrawn.
+func TestARefreshPullsAgainWhenTheNewestGenerationIsNotWhatIsAccepted(t *testing.T) {
+	for name, tc := range map[string]struct {
+		accept  string
+		record  ceph.GenerationComponents
+		due     bool
+		because string
+	}{
+		"a component accepted since": {"google-chrome",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"}}, true,
+			"lacks google-chrome, which this deployment accepts"},
+		"an acceptance withdrawn": {"",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"},
+				Installed: map[string]string{"google-chrome": "155"}}, true,
+			"carries google-chrome, which this deployment no longer accepts"},
+		"completed as accepted": {"google-chrome",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"},
+				Installed: map[string]string{"google-chrome": "155"}}, false, "after the channel's image"},
+		"left out and not accepted": {"",
+			ceph.GenerationComponents{LeftOut: []string{"google-chrome"}}, false, "after the channel's image"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			record := tc.record
+			store := fakeRefreshStore{newest: newer, found: true, components: &record}
+			var accepted []config.ImageComponent
+			if tc.accept != "" {
+				accepted = []config.ImageComponent{config.ImageComponent(tc.accept)}
+			}
+
+			due, why, err := refreshDue(t.Context(), store, "ubuntu-2404-x64", refreshManifest(channelBuilt), accepted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if due != tc.due || !strings.Contains(why, tc.because) {
+				t.Fatalf("due = %v (%s), want %v because %q", due, why, tc.due, tc.because)
+			}
+		})
+	}
+}
+
 // refreshRun stages the seams a refresh runs through and records what it did.
 type refreshRun struct {
-	pulled  []string
-	reaped  []string
-	pullErr error
+	pulled   []string
+	reaped   []string
+	pullErr  error
+	manifest *imagesource.Manifest
+}
+
+// refreshManifest is a channel image this build can import, built at builtAt.
+func refreshManifest(builtAt time.Time) *imagesource.Manifest {
+	return &imagesource.Manifest{
+		Schema:        imagesource.SchemaV1,
+		GuestContract: firecracker.GuestContract,
+		Arch:          hostArch(),
+		RunnerVersion: fixtureRunner,
+		BuiltAt:       builtAt,
+		Rootfs:        imagesource.Asset{Name: "rootfs.img", SHA256: strings.Repeat("a", 64), Size: 1},
+		Kernel: imagesource.Asset{Name: "vmlinux-billet", SHA256: strings.Repeat("b", 64), Size: 1,
+			Version: "6.1.155"},
+	}
+}
+
+// leavingOut turns a manifest into a schema 3 image that leaves components out.
+func leavingOut(m *imagesource.Manifest) {
+	m.Schema = imagesource.SchemaV3
+	m.RootfsMultipart = &imagesource.Multipart{
+		Name: m.Rootfs.Name, SHA256: m.Rootfs.SHA256, Size: m.Rootfs.Size,
+		Parts: []imagesource.Asset{{Name: m.Rootfs.Name + ".000", SHA256: m.Rootfs.SHA256,
+			Size: m.Rootfs.Size}},
+	}
+	m.Rootfs = imagesource.Asset{}
+	m.CompletionContract = imagesource.CompletionContractV1
+	m.Components = []imagesource.Component{{Name: "google-chrome", Space: 600 << 20}}
+}
+
+// underAnotherContract makes an image's completer speak a contract this build
+// cannot run.
+func underAnotherContract(m *imagesource.Manifest) { m.CompletionContract = "999" }
+
+// AN IMAGE THIS BUILD CANNOT COMPLETE IS REFUSED BY THE REFRESH, once and by name,
+// and nothing is pulled.
+func TestARefreshRefusesAnImageThisBuildCannotComplete(t *testing.T) {
+	cfgPath := firecrackerRefreshConfig(t, "")
+	run := stageRefresh(t, fakeRefreshStore{}, time.Now().UTC().Truncate(time.Second))
+	leavingOut(run.manifest)
+	underAnotherContract(run.manifest)
+
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", cfgPath})
+	if err == nil || !strings.Contains(err.Error(), "the channel's image cannot be imported by "+
+		"this billet") || !strings.Contains(err.Error(), "leaves out google-chrome") {
+		t.Fatalf("got %v, want the refresh to refuse the image as one it cannot complete", err)
+	}
+	if len(run.pulled) != 0 {
+		t.Fatalf("the refresh pulled %v", run.pulled)
+	}
 }
 
 // firecrackerRefreshConfig writes a config for a firecracker node with one tier
@@ -82,7 +186,7 @@ tiers:
 func stageRefresh(t *testing.T, store fakeRefreshStore, builtAt time.Time) *refreshRun {
 	t.Helper()
 
-	run := &refreshRun{}
+	run := &refreshRun{manifest: refreshManifest(builtAt)}
 
 	restoreStore, restoreFetch, restorePull, restoreReap :=
 		openRefreshStore, fetchImageManifest, refreshPull, refreshReap
@@ -94,7 +198,7 @@ func stageRefresh(t *testing.T, store fakeRefreshStore, builtAt time.Time) *refr
 
 	openRefreshStore = func(*config.Config) (refreshStore, error) { return store, nil }
 	fetchImageManifest = func(context.Context, cli.Env, *config.Config) (*imagesource.Manifest, error) {
-		return &imagesource.Manifest{BuiltAt: builtAt}, nil
+		return run.manifest, nil
 	}
 	refreshPull = func(_ context.Context, _ cli.Env, _, image string) error {
 		run.pulled = append(run.pulled, image)

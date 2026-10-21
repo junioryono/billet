@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "command": "check",
+  "outcome": "proved",
+  "proof": "record",
+  "why": "invocation \"inv-1\" (pid 4, started 2026-10-17T18:00:00Z) drained",
+  "drain": true,
+  "unit": {
+    "active_state": "inactive",
+    "sub_state": "dead",
+    "result": "success",
+    "main_pid": "0",
+    "job": "",
+    "invocation_id": ""
+  },
+  "entry": {
+    "invocation_id": "inv-1",
+    "pid": 4,
+    "boot_id": "boot-a",
+    "release": "",
+    "role": "node",
+    "runs_on_host": true,
+    "started_at": "2026-10-17T18:00:00Z",
+    "ended_at": "2026-10-17T18:00:00Z",
+    "drain_requested": false,
+    "ending": "drained",
+    "source": "node",
+    "acknowledged": false
+  }
+}

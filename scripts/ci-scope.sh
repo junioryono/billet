@@ -96,7 +96,7 @@ is_replay_input() {
 		internal/guestreport/* | \
 		internal/hostauthority/* | internal/lifeops/* | \
 		internal/importcheck/* | internal/lease/* | internal/metrics/* | \
-		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \
+		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeending/* | internal/nodeplane/* | \
 		internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
@@ -187,6 +187,7 @@ classify() {
 	actions/* | scripts/*_test.go | scripts/testdata/* | scripts/install.sh | scripts/build-guest-image.sh | \
 		.claude/settings.json | .claude/hooks/* | \
 		scripts/check-guest-image.sh | scripts/boot-guest-image.sh | scripts/check-module-sources.sh | \
+		scripts/release-ref.sh | scripts/release-contents.sh | scripts/plan-release.sh | \
 		scripts/run-runner-images.sh | scripts/runner-images/* | \
 		scripts/known-answer-job.sh | scripts/power-log.sh | scripts/power-summary.sh | scripts/verify-changed.sh | \
 		scripts/knownanswer/testdata/*)

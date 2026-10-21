@@ -16,6 +16,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### systemd and the package: [references/systemd.md](references/systemd.md)
 
 - **The units are load-bearing and each line was found by installing a package.**
+- **The host lock directory is the tmpfiles entry's, and no unit's stop removes it.**
 - **The package enables and starts nothing.**
 - **needrestart must never restart a billet service, and the package seeds the exclusion.**
 - **`systemctl show` hides the privilege prefix.**
@@ -37,6 +38,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The seal is not the authority; the barrier is.**
 - **Provenance decides who may clear a seal.**
 - **Only states that prove no process remains count as stopped.**
+- **A node's stop is proved by its own ending record, never by its exit or systemd's Result, and a node starts only over a proved ending.**
 - **One lifecycle command at a time, via a host flock taken immediately before the first mutation.**
 - **A root installer prepares the PACKAGED directory, never the calling account's.**
 - **A host is moved onto the authority exclusion by an installer, and only an installer.**

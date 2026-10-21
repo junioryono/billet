@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "outcome": "unchanged",
+  "why": "the node is not running, so the converge installs the current unit before it starts",
+  "unit": {
+    "load_state": "loaded",
+    "fragment_path": "/etc/systemd/system/billet-node.service",
+    "runtime_directory": "billet/locks"
+  }
+}

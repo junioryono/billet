@@ -1,6 +1,7 @@
 package fleetops
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,18 +14,22 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/usage"
 )
 
 // cmdJobs is the operator's view of what jobs did.
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet jobs show <lease>")
+		return errors.New("usage: billet jobs show <lease> | billet jobs wait")
 	}
-	if args[0] == "show" {
+	switch args[0] {
+	case "show":
 		return cmdJobsShow(ctx, env, args[1:])
+	case "wait":
+		return cmdJobsWait(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("unknown jobs command %q; try show", args[0])
+	return fmt.Errorf("unknown jobs command %q; try show or wait", args[0])
 }
 
 // cmdJobsShow prints one job's history and what the host measured it do.
@@ -67,38 +72,95 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	}
 	defer closeDB()
 
-	rec, err := a.Job(ctx, leaseID)
+	// A RETIREMENT THAT COMMITS WHILE THE REPORT IS READ takes the detail and
+	// writes its marker in one transaction, and the reads below are separate,
+	// so the report is built first and the marker read again after: if it was
+	// written meanwhile, the report is built once more, now with the marker,
+	// which is never unset. A report is therefore never missing detail it does
+	// not say was retired.
+	show := func(out io.Writer) (string, error) {
+		return showJob(ctx, out, a, *cfgPath, leaseID, *asJSON, *asHTML, w)
+	}
+	// A BUILD THAT FAILED is rebuilt too when the job is now retired: on
+	// PostgreSQL a usage summary and its destinations are two reads at read
+	// committed, and a retirement between them reads as a summary claiming rows
+	// it has not, which a rebuild over the retired job does not.
+	var out bytes.Buffer
+	retired, err := show(&out)
+	if afterJobShown != nil {
+		afterJobShown(a)
+	}
+	if retired == "" {
+		again, readErr := a.Job(ctx, leaseID)
+		switch {
+		case readErr != nil && err != nil:
+			return err
+		case readErr != nil:
+			return readErr
+		case again.DetailRetiredAt != "":
+			out.Reset()
+			_, err = show(&out)
+		}
+	}
 	if err != nil {
 		return err
+	}
+	if _, err := env.Stdout.Write(out.Bytes()); err != nil {
+		return fmt.Errorf("write the job record: %w", err)
+	}
+
+	return nil
+}
+
+// afterJobShown runs between a report's first build and the read of its
+// retirement marker, with the command's allocator; nil outside a test that
+// commits a retirement there.
+var afterJobShown func(a *alloc.Allocator)
+
+// showJob writes one job's report to out in the form asked for, and says the
+// retirement marker it was built with.
+func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, leaseID string,
+	asJSON, asHTML bool, w *window,
+) (string, error) {
+	rec, err := a.Job(ctx, leaseID)
+	if err != nil {
+		return "", err
 	}
 	var measured *alloc.RecordedUsage
 	switch u, err := a.LeaseUsage(ctx, leaseID); {
 	case err == nil:
 		measured = &u
 	case !errors.Is(err, alloc.ErrLeaseNotFound):
-		return err
+		return "", err
 	}
 
 	guest := readJobGuest(ctx, a, leaseID)
 
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
-	if *asJSON {
+	if asJSON {
+		tl, unaligned := jobTimeline(ctx, a, rec, measured)
 		var wj *windowJSON
 		if w != nil {
-			wj = windowJSONOf(ctx, a, leaseID, measured, *w)
+			wj = windowJSONOf(tl, unaligned, *w)
 		}
 
-		return renderJobJSON(env.Stdout, rec, measured, guest, wj)
+		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest, wj)
 	}
-	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
-	if *asHTML {
-		return renderJobPage(env.Stdout, buildJobPage(ctx, a, rec, measured, steps, guest))
+	steps := readJobSteps(ctx, cfgPath, a, rec, measured)
+	if asHTML {
+		return rec.DetailRetiredAt, renderJobPage(out, buildJobPage(ctx, a, rec, measured, steps, guest))
 	}
-	renderJob(env.Stdout, rec, measured)
-	renderSteps(env.Stdout, steps)
-	renderGuest(env.Stdout, guestViewOf(guest, measured, steps))
+	// THE SERIES THE STEPS WERE PLACED ON, read here when no step was asked about.
+	tl, unaligned := steps.timeline, steps.unaligned
+	if steps.none != "" {
+		tl, unaligned = jobTimeline(ctx, a, rec, measured)
+	}
+	renderJob(out, rec, measured)
+	renderSeries(out, tl, unaligned, measured)
+	renderSteps(out, steps)
+	renderGuest(out, retiredGuest(guestViewOf(guest, measured, steps), guest, rec))
 
-	return nil
+	return rec.DetailRetiredAt, nil
 }
 
 // jobJSON is `billet jobs show --json`: the record renderJob prints, for a
@@ -114,18 +176,27 @@ type jobJSON struct {
 	RunID       int64  `json:"run_id"`
 	// RequestID is GitHub's runner request id, zero for a pooled lease, whose
 	// negative id is billet's own scheduler identity and nothing GitHub shows.
-	RequestID   int64      `json:"request_id"`
-	JobName     string     `json:"job_name"`
-	Repository  string     `json:"repository"`
-	WorkflowRef string     `json:"workflow_ref"`
-	Event       string     `json:"event"`
-	Result      string     `json:"result"`
-	Conclusion  string     `json:"conclusion"`
-	QueuedAt    string     `json:"queued_at"`
-	AssignedAt  string     `json:"assigned_at"`
-	StartedAt   string     `json:"started_at"`
-	FinishedAt  string     `json:"finished_at"`
-	Usage       *usageJSON `json:"usage"`
+	RequestID   int64  `json:"request_id"`
+	JobName     string `json:"job_name"`
+	Repository  string `json:"repository"`
+	WorkflowRef string `json:"workflow_ref"`
+	Event       string `json:"event"`
+	Result      string `json:"result"`
+	Conclusion  string `json:"conclusion"`
+	QueuedAt    string `json:"queued_at"`
+	AssignedAt  string `json:"assigned_at"`
+	StartedAt   string `json:"started_at"`
+	FinishedAt  string `json:"finished_at"`
+	// GitHubQueuedAt, GitHubScaleSetAssignedAt and GitHubRunnerAssignedAt are
+	// GitHub's clock; BoughtAt is when billet bought the lease, on billet's.
+	GitHubQueuedAt           string `json:"github_queued_at"`
+	GitHubScaleSetAssignedAt string `json:"github_scale_set_assigned_at"`
+	GitHubRunnerAssignedAt   string `json:"github_runner_assigned_at"`
+	BoughtAt                 string `json:"bought_at"`
+	// DetailRetiredAt is when the job's series, destinations and guest report
+	// were deleted past the deployment's retention, empty while they are kept.
+	DetailRetiredAt string     `json:"detail_retired_at"`
+	Usage           *usageJSON `json:"usage"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
 	// Window is present only when --window asked for one.
@@ -134,11 +205,15 @@ type jobJSON struct {
 
 // usageJSON is what the host measured. Groups answers for every group, with
 // the OOM count unmeasured whenever memory is, so a reader never re-derives
-// which zeros were read.
+// which zeros were read. Series is the per-sample series' account of its own
+// sampling, null when none is on the host's clock, and SeriesUnavailable then
+// says why: none was recorded, it has no clock, or it could not be read.
 type usageJSON struct {
-	Node       string          `json:"node"`
-	RecordedAt string          `json:"recorded_at"`
-	Groups     map[string]bool `json:"measured"`
+	Node              string          `json:"node"`
+	RecordedAt        string          `json:"recorded_at"`
+	Groups            map[string]bool `json:"measured"`
+	Series            *seriesJSON     `json:"series"`
+	SeriesUnavailable string          `json:"series_unavailable,omitempty"`
 	alloc.JobUsage
 }
 
@@ -149,7 +224,10 @@ var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory
 // renderJobJSON writes one job's record as an indented JSON object. A job with
 // no usage report has a null usage, and one with no guest report a null guest,
 // never a report of zeros.
-func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *jobGuest, win *windowJSON) error {
+func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl *usage.Timeline, unaligned string,
+	g *jobGuest,
+	win *windowJSON,
+) error {
 	out := jobJSON{
 		Lease: rec.LeaseID, Tier: rec.Tier, Node: rec.Node, Provider: rec.ChosenProvider,
 		VCPU: rec.VCPU, MemoryBytes: rec.Memory, GitHubJobID: rec.Job.JobID, RunID: rec.RunID,
@@ -157,13 +235,18 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
 		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
+		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
+		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
+		DetailRetiredAt: rec.DetailRetiredAt,
 	}
 	if u != nil {
 		groups := make(map[string]bool, len(usageGroups))
 		for _, g := range usageGroups {
 			groups[g] = u.Measured(g)
 		}
-		out.Usage = &usageJSON{Node: u.Node, RecordedAt: u.RecordedAt, Groups: groups, JobUsage: u.JobUsage}
+		out.Usage = &usageJSON{Node: u.Node, RecordedAt: u.RecordedAt, Groups: groups, Series: seriesJSONOf(tl),
+			SeriesUnavailable: seriesUnavailable(tl, unaligned),
+			JobUsage:          u.JobUsage}
 	}
 	body, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
@@ -212,6 +295,11 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	line("result", "github %s; billet %s", quoted(rec.Result), orUnknown(rec.Conclusion))
 	line("times", "queued %s, assigned %s, started %s, finished %s", orUnknown(rec.QueuedAt),
 		orUnknown(rec.AssignedAt), orUnknown(rec.StartedAt), orUnknown(rec.FinishedAt))
+	line("github", "%s", githubTimes(rec, orUnknown))
+	line("waited", "%s", waitedLine(rec))
+	if rec.DetailRetiredAt != "" {
+		line("detail", "%s", detailRetired(rec))
+	}
 
 	fmt.Fprintln(w)
 	if u == nil {
@@ -223,7 +311,19 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	line("usage", "%s", measuredBy(u))
 	renderUsageGroups(line, u)
 	renderCounters(line, u.Counters)
+	if u.Destinations == nil && rec.DetailRetiredAt != "" {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "destinations "+detailRetired(rec))
+		return
+	}
 	renderDestinations(w, u.Destinations)
+}
+
+// detailRetired says that a job's per-sample series, destinations and guest
+// report were deleted past the deployment's retention, and when.
+func detailRetired(rec alloc.JobRecord) string {
+	return "retired " + rec.DetailRetiredAt + ", past server.job_detail_retention: the per-sample series, " +
+		"the destinations and the guest report are gone, and the usage summary is kept"
 }
 
 // noUsageReport is what a job with no usage report says in place of one.

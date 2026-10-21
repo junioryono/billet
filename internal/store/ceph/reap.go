@@ -2,7 +2,6 @@ package ceph
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -231,7 +230,7 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 		// what is still needed. A dead generation's key would have kept its kernel
 		// alive forever, which is the opposite of what reaping is for.
 		c.removeGenerationMetadata(ctx, name, gen.Name,
-			VerifiedKey, RunnerVersionKey, KernelKey, GuestContractKey)
+			VerifiedKey, RunnerVersionKey, KernelKey, GuestContractKey, ComponentsKey)
 
 		removed = append(removed, gen.Name)
 	}
@@ -322,25 +321,17 @@ func (c *Client) Generations(ctx context.Context, image string) ([]Generation, e
 		return nil, fmt.Errorf("ceph: no image to list generations of")
 	}
 
-	out, err := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "snap", "ls", name)
+	// THROUGH snapshotNames, which reads a listing's ENOENT as no generations only
+	// once the image itself is proved absent.
+	names, err := c.snapshotNames(ctx, name)
 	if err != nil {
-		if isNoSuchFile(err) {
-			return nil, nil
-		}
-
-		return nil, fmt.Errorf("ceph: list the generations of %s/%s: %w", c.cfg.ImagePool, name, err)
+		return nil, err
 	}
 
-	var snaps []snapshot
-	if err := json.Unmarshal(trimSpace(out), &snaps); err != nil {
-		return nil, fmt.Errorf("ceph: %s did not answer with a json snapshot list; is it the "+
-			"rbd command?", c.bin)
-	}
+	generations := make([]Generation, 0, len(names))
 
-	generations := make([]Generation, 0, len(snaps))
-
-	for _, snap := range snaps {
-		if gen, ok := ParseGeneration(snap.Name); ok {
+	for _, snap := range names {
+		if gen, ok := ParseGeneration(snap); ok {
 			generations = append(generations, gen)
 		}
 	}
