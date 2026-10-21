@@ -49,15 +49,13 @@ func TestAResizeLeavesTheWaitersAheadTheirRoom(t *testing.T) {
 		t.Fatalf("large tier reconcile: %v", err)
 	}
 
-	protect, holder := s.ResizeAdmission(t.Context(), "a-small")
-	if holder != "" || !slices.Equal(protect, []string{"b-large"}) {
-		t.Errorf("a resize for the small tier is asked to protect %v (holder %q), want the waiting large tier",
-			protect, holder)
+	if protect := s.ResizeAdmission(t.Context(), "a-small"); !slices.Equal(protect, []string{"b-large"}) {
+		t.Errorf("a resize for the small tier is asked to protect %v, want the waiting large tier", protect)
 	}
 
 	// The waiter itself is not held behind anyone.
-	if protect, holder := s.ResizeAdmission(t.Context(), "b-large"); len(protect) != 0 || holder != "" {
-		t.Errorf("the waiter's own resize is asked to protect %v (holder %q), want nothing", protect, holder)
+	if protect := s.ResizeAdmission(t.Context(), "b-large"); len(protect) != 0 {
+		t.Errorf("the waiter's own resize is asked to protect %v, want nothing", protect)
 	}
 
 	fill, fillListeners := resizeOrder(t, config.AdmissionFill)
@@ -70,7 +68,7 @@ func TestAResizeLeavesTheWaitersAheadTheirRoom(t *testing.T) {
 		t.Fatalf("large tier reconcile under fill: %v", err)
 	}
 
-	if protect, holder := fill.ResizeAdmission(t.Context(), "a-small"); len(protect) != 0 || holder != "" {
-		t.Errorf("under fill a resize is asked to protect %v (holder %q), want nothing", protect, holder)
+	if protect := fill.ResizeAdmission(t.Context(), "a-small"); len(protect) != 0 {
+		t.Errorf("under fill a resize is asked to protect %v, want nothing", protect)
 	}
 }

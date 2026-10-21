@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"fmt"
 	"sync/atomic"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -38,11 +37,6 @@ func (g *resizeGate) resize(ctx context.Context, leaseID string, epoch int64, in
 		return err
 	}
 
-	protect, holder := order.ResizeAdmission(ctx, lease.Tier)
-	if holder != "" {
-		return fmt.Errorf("%w: fallback %q for lease %s would take room the admission order holds for %s",
-			alloc.ErrNoCapacity, instanceType, leaseID, holder)
-	}
-
-	return g.alloc.ResizeLeaving(ctx, leaseID, epoch, instanceType, vcpu, memory, protect)
+	return g.alloc.ResizeLeaving(ctx, leaseID, epoch, instanceType, vcpu, memory,
+		order.ResizeAdmission(ctx, lease.Tier))
 }

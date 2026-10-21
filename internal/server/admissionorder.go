@@ -39,7 +39,8 @@ import (
 // keeps its place: the moment its listener
 // progresses again it is the longest waiter once more. Silence suspends the right
 // to block others and proves nothing else; the queue releases, destroys and
-// promises nothing, and every purchase is still the allocator's atomic escrow.
+// promises nothing, and every purchase is still one of the allocator's atomic
+// transactions (an escrow, or a fallback's resize).
 //
 // A WAIT IS RELEASED BY DEMAND GOING AWAY AS WELL AS BY BEING SERVED. GitHub's
 // count is the only thing that says a queued job was cancelled, so a record that

@@ -269,9 +269,9 @@ func (p *Provider) startOne(
 			}
 
 			if !ok {
-				refusals = append(refusals, ct.Type+": budget")
-				p.log.Warn("this fallback compute type would exceed the node or deployment "+
-					"budget; trying the next declared one",
+				refusals = append(refusals, ct.Type+": refused by the control plane")
+				p.log.Warn("the control plane refused this fallback compute type (its budget, or "+
+					"room the admission order holds for a waiting tier); trying the next declared one",
 					"runner", spec.Name, "type", ct.Type)
 
 				continue

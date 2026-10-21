@@ -111,14 +111,7 @@ func (a *Allocator) WhyNoRoom(ctx context.Context, tier string) (RoomRefusal, er
 			}
 		}
 
-		b, err := a.boundBy(ctx, tx, t)
-		if err != nil {
-			return err
-		}
-
-		out.ShareBound, out.CeilingBound = b.share, b.ceiling
-
-		p, _, err := a.placerWithFloors(ctx, tx, t)
+		p, floors, err := a.placerWithFloors(ctx, tx, t)
 		if err != nil {
 			return err
 		}
@@ -145,24 +138,64 @@ func (a *Allocator) WhyNoRoom(ctx context.Context, tier string) (RoomRefusal, er
 		switch {
 		case len(fits) == 0:
 			out.NoHost = true
+
+			return nil
 		case p.total(t) == 0:
 			out.HostsFull = fits
+
+			return nil
 		}
 
-		// AND THE TWO POTS TOGETHER. The share and the ceiling are each judged
-		// alone, as the admission order needs them, so one can fit a shape the
-		// other does not and both read as free while together they fit none.
-		if !out.Binds() {
-			room, err := a.headroom(ctx, tx, t)
-			if err != nil {
-				return err
-			}
-
-			out.Budgets = room == 0
-		}
-
-		return nil
+		// THE POTS, JUDGED ON THE HOSTS THAT HAVE ROOM, at the shapes those
+		// hosts charge, so a pot is named only where raising it would help: a
+		// share that fits a shape only a full host sells, or a ceiling that fits
+		// one only a host with no room offers, binds as surely as one with no
+		// room at all. These are the diagnostic's own measure, not the admission
+		// order's flags, which judge the waiter for whom it holds back.
+		return a.whichPotRefuses(ctx, tx, t, p, floors, &out)
 	})
 
 	return out, err
+}
+
+// whichPotRefuses sets which of the target's share and the deployment ceiling
+// leave no shape the hosts with room could take, alone or only together.
+func (a *Allocator) whichPotRefuses(ctx context.Context, tx querier, t config.Tier, p *placer,
+	floors floorCharge, out *RoomRefusal,
+) error {
+	used, err := a.usage(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	ceiling := placementCost{
+		vcpu:   a.limits.MaxVCPU - used.VCPU - floors.vcpu,
+		memory: a.limits.MaxMemory - used.Memory - floors.memory,
+	}
+
+	share := placementCost{vcpu: unboundedVCPU, memory: unboundedMemory}
+	if _, ok := a.limits.Shares[config.ShareTarget(t)]; ok {
+		share, err = a.shareRoomFor(ctx, tx, t.Label, placementCost{}, floors)
+		if err != nil {
+			return err
+		}
+	}
+
+	within := func(room placementCost) int {
+		c := p.clone()
+		c.deploymentVCPU, c.deploymentMemory = max(room.vcpu, 0), max(room.memory, 0)
+
+		return c.total(t)
+	}
+
+	shareAlone, ceilingAlone := within(share), within(ceiling)
+	out.ShareBound = shareAlone == 0
+	out.CeilingBound = ceilingAlone == 0
+
+	// AND THE TWO TOGETHER: each can fit a shape the other does not, and both
+	// read as free while together they fit none.
+	both := placementCost{vcpu: min(share.vcpu, ceiling.vcpu), memory: min(share.memory, ceiling.memory)}
+	out.Budgets = shareAlone > 0 && ceilingAlone > 0 && within(both) == 0
+
+	return nil
 }

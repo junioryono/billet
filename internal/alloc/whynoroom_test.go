@@ -168,6 +168,42 @@ func TestWhyNoRoomNamesTheLimitThatBinds(t *testing.T) {
 		}
 	})
 
+	// AND A SHARE THAT FITS ONLY A FULL HOST'S SHAPE IS THE SHARE, not the two
+	// pots together: the host selling 4 vCPU is full, the one with room sells
+	// 8, the share has 4 left and the ceiling plenty, so raising the ceiling
+	// would change nothing.
+	t.Run("share on the hosts with room", func(t *testing.T) {
+		cloud := targetTier("cloud", "repo", 2, 4*config.GiB)
+		cloud.Provider = config.ProviderEC2
+
+		a := newBareAllocator(t, Limits{
+			MaxVCPU: 64, MaxMemory: 256 * config.GiB,
+			Shares: map[string]config.TargetShare{"repo": {VCPU: 8}},
+		}, []config.Tier{cloud})
+
+		// The small-shape host alone first, so the first lease fills it.
+		mustRegister(t, a, NodeRegistration{
+			Name: "small-shape", Provider: config.ProviderEC2, VCPU: 4, Memory: 8 * config.GiB,
+			EC2Shapes: []config.EC2InstanceType{{Type: "four", VCPU: 4, Memory: 8 * config.GiB}},
+		})
+
+		if lease := reserve(t, a, "cloud"); lease.VCPU != 4 {
+			t.Fatalf("the first lease was charged %d vCPU, want the full host's 4 vCPU shape", lease.VCPU)
+		}
+
+		mustRegister(t, a, NodeRegistration{
+			Name: "big-shape", Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
+			EC2Shapes: []config.EC2InstanceType{{Type: "eight", VCPU: 8, Memory: 16 * config.GiB}},
+		})
+
+		noHeadroom(t, a, "cloud")
+
+		got := whyNoRoom(t, a, "cloud")
+		if !got.ShareBound || got.CeilingBound || got.Budgets || len(got.HostsFull) != 0 {
+			t.Errorf("a share that fits only the full host's shape reports %+v, want the share alone", got)
+		}
+	})
+
 	t.Run("sealed", func(t *testing.T) {
 		a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
 			[]config.Tier{tier("work", 4, 8*config.GiB)})

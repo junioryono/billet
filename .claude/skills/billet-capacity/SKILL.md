@@ -58,7 +58,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 **Adding a teardown path.** Only proof the compute is gone releases capacity; a timer never authorises a teardown, and `TestOnlyTheForceOperationDestroysRunningWork` holds who may destroy running work.
 
-**Changing a purchase.** Every purchase goes through `Allocator.Escrow`, whose headroom check and insert are one transaction, and asks the admission queue (`mayBuy`); `TestConcurrentReservationsNeverOvercommit` is the guard.
+**Changing a purchase.** Every purchase goes through `Allocator.Escrow`, whose headroom check and insert are one transaction, and asks the admission queue (`mayBuy`); `TestConcurrentReservationsNeverOvercommit` is the guard. A remote fallback's growth is a purchase too: `Allocator.ResizeLeaving`, asked through `Server.ResizeAdmission` (#172).
 
 ## Where the tests are
 
