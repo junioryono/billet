@@ -334,6 +334,15 @@ func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, _ string, gro
 // the benefit is that neither side moves because the other was edited.
 type NodeJIT struct{ Client *scaleset.Client }
 
+// GitHubTarget is the GitHub path of the owner this client registers runners
+// on, which the plane records with every runner it mints so that its removal
+// and recovery reach the same owner whatever the catalogue names later.
+func (n NodeJIT) GitHubTarget() string { return n.Client.Target().Path() }
+
+// The plane asks a source for its owner through this interface; a NodeJIT that
+// stopped answering it would mint runners whose owner nothing records.
+var _ nodeplane.TargetSource = NodeJIT{}
+
 // Describe finds a scale set for the wire.
 //
 // The nil-set-means-absent contract is preserved rather than flattened: the node

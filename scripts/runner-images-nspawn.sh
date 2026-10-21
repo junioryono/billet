@@ -112,8 +112,17 @@ leader() {
 
 # answers runs a probe in the machine, each bounded, so no one probe can outlast
 # the wait it belongs to.
+#
+# --expand-environment=no ON EVERY COMMAND RUN IN THE MACHINE. systemd-run expands
+# environment variables in a command's arguments by default (systemd 254 on), as
+# ExecStart= does: an argument that begins with `$` is a whole-word variable, and
+# an unset one is DROPPED, which shifts every argument after it. Measured in the
+# first build that passed one (2026-10-20, run 39492954159): the software report's
+# `$browsersTools.AddToolVersion(...)` line vanished from a replacement's argv, awk
+# was handed an empty program, and the report was rewritten as an empty file. The
+# arguments are billet's and the template's, never meant for systemd to read.
 answers() {
-	timeout -k 5 15 systemd-run --machine="$machine" --quiet --wait --pipe -- "$@" \
+	timeout -k 5 15 systemd-run --machine="$machine" --quiet --wait --pipe --expand-environment=no -- "$@" \
 		</dev/null >/dev/null 2>&1
 }
 
@@ -260,7 +269,7 @@ exec)
 	[ "$#" -gt 0 ] || fail "exec needs a command"
 	# --pipe CARRIES THE STATUS: systemd-run --wait --pipe exits with the command's
 	# own exit status, which is the step's verdict.
-	exec systemd-run --machine="$machine" --quiet --wait --pipe --collect \
+	exec systemd-run --machine="$machine" --quiet --wait --pipe --collect --expand-environment=no \
 		--setenv=HOME=/root --setenv=DEBIAN_FRONTEND=noninteractive -- "$@"
 	;;
 copy-in)

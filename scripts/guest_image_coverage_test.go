@@ -126,6 +126,10 @@ func TestTheCoverageCheckIteratesTheDeclarationAndNotTheDirectory(t *testing.T) 
 				// error but an empty loop, so the check passed having checked
 				// nothing.
 				gateAssignment(t, "TOOLCACHE_TOOLS") + "\n" +
+				// AND CODEQL, WHICH THE GATE NO LONGER WALKS (#584): its declared `*`
+				// is the one in the real declaration, so it is the vehicle that
+				// proves a declared glob is read rather than expanded.
+				"TOOLCACHE_TOOLS+=(CodeQL)\n" +
 				gateFunction(t, "check_toolcache_coverage") + "\n" +
 				"check_toolcache_coverage\n"
 

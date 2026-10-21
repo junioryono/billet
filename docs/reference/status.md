@@ -40,7 +40,7 @@ billet is pre-alpha. This page says what has actually run, by backend, against r
 
 ## Not built
 
-Observability and a dashboard; SSH into a job; a Windows port (needs a `flock` equivalent); a Terraform provider (deferred by [ADR-004](decisions/adr-004-terraform-provider.md)); billet-built macOS guest images; an Apple Silicon cache.
+A dashboard; keeping and searching job logs ([#534](https://github.com/junioryono/billet/issues/534)) and attaching to a running job ([#533](https://github.com/junioryono/billet/issues/533)), each decided in its own issue (a job's timeline, from the run id GitHub shows, is `billet jobs show --run`); a Windows port (needs a `flock` equivalent); a Terraform provider (deferred by [ADR-004](decisions/adr-004-terraform-provider.md)); billet-built macOS guest images; an Apple Silicon cache.
 
 ## Compatibility caveats
 

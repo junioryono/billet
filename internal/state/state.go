@@ -89,6 +89,10 @@ type DB struct {
 	// deliberately NOT behind it.
 	backend backend
 
+	// startupBudget is the budget this handle's open ran under, which a migration
+	// at promotion takes for itself and its timeout names. See budget.
+	startupBudget time.Duration
+
 	// admin marks a handle belonging to a ONE-SHOT OPERATOR COMMAND, whether or
 	// not it managed to take the directory lock. It decides how patient the
 	// handle is: a command has a person waiting on it and gives up, a control
@@ -262,6 +266,19 @@ type openMode struct {
 	// empty for a caller that named none and gets neither the check nor the
 	// record. See WithRunningRelease.
 	release string
+
+	// startupBudget replaces startupTimeout for this open when positive. See
+	// WithStartupBudget.
+	startupBudget time.Duration
+}
+
+// budget is how long this open's startup may take.
+func (m openMode) budget() time.Duration {
+	if m.startupBudget > 0 {
+		return m.startupBudget
+	}
+
+	return startupTimeout
 }
 
 // records reports whether a handle opened in this mode is the one that moves the
@@ -414,15 +431,17 @@ func openDir(
 		maintenanceBypass: maintenanceBypass,
 		runningRelease:    mode.release,
 		recordsRelease:    mode.records(),
+		startupBudget:     mode.budget(),
 		fencedCh:          make(chan struct{}),
 	}
 
 	db.revalidate.Store(lock == nil)
 	db.standby.Store(mode.standby)
 
+	budget := db.startupBudget
 	started := time.Now()
 
-	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	startupCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	// Every failure here closes both pools and releases the lock. The cleanup
@@ -479,7 +498,7 @@ func openDir(
 
 		var cancelRest context.CancelFunc
 
-		startupCtx, cancelRest = context.WithTimeout(ctx, startupTimeout-spent)
+		startupCtx, cancelRest = context.WithTimeout(ctx, budget-spent)
 		defer cancelRest()
 	}
 
@@ -659,6 +678,29 @@ var startupTimeout = defaultStartupTimeout
 // defaultStartupTimeout is startupTimeout's production value, named so a test
 // that shortens the variable can still check the bound a real start has.
 const defaultStartupTimeout = 30 * time.Second
+
+// WithStartupBudget gives one open a startup budget other than startupTimeout,
+// for a test's throwaway ledger and nothing else.
+//
+// THE BUDGET GUARDS A SICK DISK, NOT A SLOW ONE, and a loaded test run is a slow
+// one: ledgertest migrates its template from empty once per test binary, and
+// under a full gate that missed thirty seconds and failed every test sharing the
+// binary (#188). Only internal/state/ledgertest may pass it, which
+// TestOnlyTheTestLedgerStretchesTheStartupBudget holds, so no billet process can
+// open a production ledger with a longer guard.
+func WithStartupBudget(d time.Duration) OpenOption {
+	return func(m *openMode) { m.startupBudget = d }
+}
+
+// budget is the startup budget this handle was opened with, or startupTimeout
+// for a handle built without an open.
+func (db *DB) budget() time.Duration {
+	if db.startupBudget > 0 {
+		return db.startupBudget
+	}
+
+	return startupTimeout
+}
 
 // PingContext proves the database is reachable AND configured as promised.
 //
@@ -1927,7 +1969,7 @@ func (db *DB) migrate(ctx context.Context) (*SchemaMoved, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 
-		ctx, cancel = context.WithTimeout(ctx, startupTimeout)
+		ctx, cancel = context.WithTimeout(ctx, db.budget())
 		defer cancel()
 	}
 
@@ -2040,7 +2082,7 @@ func (db *DB) migrate(ctx context.Context) (*SchemaMoved, error) {
 	// startup and not a stall, so it is left alone.
 	if errors.Is(err, context.DeadlineExceeded) {
 		return moved, fmt.Errorf("%w; the migration did not finish inside the %s startup budget. %s",
-			err, startupTimeout, db.backend.migrationTimeoutAdvice())
+			err, db.budget(), db.backend.migrationTimeoutAdvice())
 	}
 
 	return moved, err

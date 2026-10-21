@@ -6,6 +6,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/simulated"
 )
 
@@ -52,7 +53,23 @@ func TestAJobOnASecondTargetIsServedByThatTargetsCredential(t *testing.T) {
 	second.queue(fakeactions.StatisticsJSON(0, 1),
 		fakeactions.JobJSON("JobAssigned", 5001, "push", secondTier))
 
-	s.awaitOneRunning(t)
+	names := s.awaitOneRunning(t)
+
+	// AND THE LEDGER RECORDS THE OWNER IT WAS MINTED ON, on the lease and on the
+	// binding, which is what removes and recovers the runner should its tier be
+	// taken out of the config (#93).
+	leaseID, ours := provider.LeaseOf(names[0])
+	if !ours {
+		t.Fatalf("instance %q does not carry a lease", names[0])
+	}
+
+	if owner, err := s.alloc.LeaseGitHubTarget(t.Context(), leaseID); err != nil || owner != "beta" {
+		t.Errorf("the lease records owner %q (err %v), want the second target's, beta", owner, err)
+	}
+
+	if member, err := s.alloc.PoolRunnerByLease(t.Context(), leaseID); err != nil || member.GitHubTarget != "beta" {
+		t.Errorf("the runner's binding is %+v (err %v), want owner beta", member, err)
+	}
 
 	// THE REGISTRATION WAS MINTED THROUGH THE SECOND TARGET'S SERVICE, and the
 	// first target's service minted nothing and acquired nothing: a mint on the

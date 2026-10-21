@@ -21,6 +21,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A ledger writer reaches no network.**
 - **Three open modes, and what each may do.**
 - **An open's own startup budget is a deadline, and a caller can tell it from its own.**
+- **Only `ledgertest`'s template build may stretch an open's startup budget (`WithStartupBudget`).**
 - **The integrity scan has its own bound, the startup budget pauses for it, and systemd is asked for the time a cold one takes.**
 - **Unreachability is a property of the ERROR, never of the step that produced it, and its rule is MEASURED.**
 - **`OpenPostgresCompletion` writes one row and is not a control plane.**

@@ -1,0 +1,185 @@
+#!/bin/bash
+# /opt/billet/complete/run: complete a billet guest image with the components its
+# license-restricted parts left out (#584), under completion contract 1.
+#
+#   run <component>...
+#
+# THE CONTRACT (internal/ops/images/completion.go states the node's half). This is
+# run as root, chrooted into the image being completed, with /proc, /sys, /dev,
+# /dev/pts and /run bound from the machine doing it, and BILLET_COMPLETION_REPORT
+# naming a file. For each component it runs GitHub's own installer and GitHub's own
+# tests for it, at the runner-images commit the image was built from, and writes
+# one line to the report: `installed=<name> <version>`, or `failed=<name>`. Its
+# exit status and its output decide nothing; the node reads the report.
+#
+# THE STEP'S OWN ENVIRONMENT. Each installer runs as the template ran it: as root,
+# in what /etc/environment holds when it starts, with the template's variables for
+# that step and invoke_tests on the PATH (but not GitHub's apt retry wrapper; see
+# below). The scripts, helpers and tests here are GitHub's, unedited, except that the
+# tests are read from beside the helpers rather than from /imagegeneration.
+#
+# Environment, for tests only:
+#   BILLET_COMPLETE_DIR          this directory (default: the script's own)
+#   BILLET_COMPLETE_ENVIRONMENT  /etc/environment
+#   BILLET_COMPLETE_IMAGE_ENV    /etc/billet-image-env
+#   BILLET_COMPLETE_BIN          /usr/local/bin, where invoke_tests is linked
+#   BILLET_COMPLETE_ROOT         a prefix for every other path the run reads or
+#                                changes: the components' versions, /opt,
+#                                /usr/share, apt's lists, /tmp
+set -u
+
+here=${BILLET_COMPLETE_DIR:-$(cd "$(dirname "$0")" && pwd)}
+root=${BILLET_COMPLETE_ROOT:-}
+environment=${BILLET_COMPLETE_ENVIRONMENT:-/etc/environment}
+image_env=${BILLET_COMPLETE_IMAGE_ENV:-/etc/billet-image-env}
+bin=${BILLET_COMPLETE_BIN:-/usr/local/bin}
+report=${BILLET_COMPLETION_REPORT:-}
+helpers=$here/scripts/helpers
+
+log() { echo "billet-complete: $*" >&2; }
+
+if [ -z "$report" ]; then
+	log "BILLET_COMPLETION_REPORT names no report"
+	exit 2
+fi
+: >"$report" || exit 2
+
+# installer is the template step that installs COMPONENT; an unknown name has none.
+installer() {
+	case "$1" in
+	android-sdk) echo install-android-sdk.sh ;;
+	codeql) echo install-codeql-bundle.sh ;;
+	firefox) echo install-firefox.sh ;;
+	google-chrome) echo install-google-chrome.sh ;;
+	microsoft-edge) echo install-microsoft-edge.sh ;;
+	*) return 1 ;;
+	esac
+}
+
+# prerequisites prints the packages COMPONENT's installer assumes are already
+# there because GitHub's template installs them first, in its order of steps.
+#
+# THE BROWSERS NEED THE REAL libasound2. Ubuntu 24.04's 64-bit time transition
+# made libasound2 a virtual package two packages provide, and with neither
+# installed apt resolves Chrome's dependency on it to liboss4-salsa-asound2, which
+# conflicts with it, and refuses the install (measured 2026-10-20, run
+# 39502269791, completing Chrome on its own). In GitHub's build Firefox has
+# installed libasound2t64 by the time Chrome runs; a deployment may accept Chrome
+# alone.
+prerequisites() {
+	case "$1" in
+	google-chrome | microsoft-edge) echo libasound2t64 ;;
+	esac
+}
+
+# step runs ARGV as a template step runs: /etc/environment as it stands now,
+# made plain by the build's own reader, then the step's variables on top.
+step() {
+	(
+		if [ -e "$environment" ]; then
+			normalized=$(awk -f "$here/pam-environment.awk" "$environment") || exit 1
+			while IFS= read -r line; do
+				[ -n "$line" ] && export "$line"
+			done <<<"$normalized"
+		fi
+		exec env HOME=/root DEBIAN_FRONTEND=noninteractive HELPER_SCRIPTS="$helpers" \
+			INSTALLER_SCRIPT_FOLDER="$here/installers" "$@"
+	)
+}
+
+# version prints what COMPONENT installed, read from what is now on disk, and
+# fails when it cannot say.
+version() {
+	local v
+	case "$1" in
+	google-chrome) v=$(step google-chrome --product-version) ;;
+	# THE LAST FIELD OF THE FIRST LINE THAT HAS ONE: Edge, as Chromium does, ends
+	# `--version` with a space, which left a last word of nothing (measured
+	# 2026-10-20, run 39512924074).
+	microsoft-edge) v=$(step microsoft-edge --version) && v=$(awk 'NF { print $NF; exit }' <<<"$v") ;;
+	firefox) v=$(step firefox --version) && v=$(awk 'NF { print $NF; exit }' <<<"$v") ;;
+	android-sdk)
+		v=$(sed -n 's/^Pkg\.Revision=//p' "$root/usr/local/lib/android/sdk/cmdline-tools/latest/source.properties")
+		;;
+	codeql)
+		local found=("$root"/opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql)
+		[ "${#found[@]}" -eq 1 ] && [ -x "${found[0]}" ] || return 1
+		v=$("${found[0]}" version --quiet)
+		;;
+	*) return 1 ;;
+	esac
+	v=$(printf '%s' "$v" | tr -d '\r' | head -n 1)
+	[[ $v =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,63}$ ]] || return 1
+	printf '%s\n' "$v"
+}
+
+# THE TEMPLATE'S OWN PREPARATION OF A STEP: invoke_tests on the PATH, as
+# configure-environment.sh links it, for as long as the run lasts; the published
+# image carries no link, because GitHub's cleanup.sh removes it, and no apt lists.
+#
+# NOT GITHUB'S APT RETRY WRAPPER (configure-apt-mock.sh), which retries a lock
+# Azure's agent holds and answers success whatever apt answered: here nothing
+# else holds the lock, and an apt that failed must fail the component.
+prepared=1
+if ! ln -sf "$helpers/invoke-tests.sh" "$bin/invoke_tests"; then
+	prepared=0
+elif ! step apt-get update; then
+	prepared=0
+fi
+
+# THE RESULTS ARE KEPT HERE UNTIL THE IMAGE IS FINISHED, and reach the report
+# only then: a success reported before the job's environment is written again
+# would let an interrupted run import an image whose jobs do not see what it
+# installed.
+results=""
+for name in "$@"; do
+	result="failed=$name"
+	if ! script=$(installer "$name"); then
+		log "$name is not a component this image completes"
+	elif [ "$prepared" != 1 ]; then
+		log "$name: the run could not be prepared"
+	elif needs=$(prerequisites "$name") && [ -n "$needs" ] &&
+		! step apt-get install -y --no-install-recommends $needs; then
+		log "$name: its prerequisites ($needs) could not be installed"
+	elif ! log "installing $name with $script" || ! step "$here/scripts/build/$script"; then
+		log "$name: $script failed"
+	# THE CODEQL BUNDLE'S INSTALLER RUNS NO TESTS of its own; GitHub's toolset
+	# test is what proves it, filtered to CodeQL's context.
+	elif [ "$name" = codeql ] && ! step invoke_tests Toolset Toolset.CodeQL; then
+		log "$name: GitHub's toolset test for it failed"
+	elif ! installed=$(version "$name"); then
+		log "$name: installed, and what version could not be read"
+	else
+		result="installed=$name $installed"
+	fi
+	results+="$result"$'\n'
+done
+
+# AS THE TEMPLATE LEAVES ITS IMAGE, each line as configure-system.sh has it
+# (scripts_test.go holds them to it): /usr/share and /opt writable by everyone
+# after every install, billet's own /opt/billet keeping the modes the build gave
+# it, and then the sticky bit Ruby 4 needs on its toolcache directories put back.
+# Then what cleanup.sh and billet's build take away: the link, apt's downloads and
+# its lists.
+finished=1
+chmod -R 777 "$root/usr/share" || finished=0
+find "$root/opt" -mindepth 1 -maxdepth 1 ! -name billet -exec chmod -R 777 {} + || finished=0
+if [ -d "$root/opt/hostedtoolcache/Ruby" ]; then
+	find "$root/opt/hostedtoolcache/Ruby" -type d -exec chmod +t {} + || finished=0
+fi
+rm -f "$bin/invoke_tests" || finished=0
+step apt-get clean || finished=0
+rm -rf "$root"/var/lib/apt/lists/* "$root"/tmp/* "$root/root/.cache" || finished=0
+
+# THE JOB'S ENVIRONMENT IS WRITTEN AGAIN, from what the installers added to
+# /etc/environment (ANDROID_HOME, CHROMEWEBDRIVER and the rest), by the one writer
+# the build uses for it.
+"$here/write-image-env.sh" "$environment" "$image_env" || finished=0
+
+if [ "$finished" != 1 ]; then
+	log "the image could not be finished after its components; every one is reported failed"
+	results=$(sed 's/^installed=\([^ ]*\) .*/failed=\1/' <<<"$results")$'\n'
+fi
+printf '%s' "$results" >"$report.tmp" && mv "$report.tmp" "$report"
+
+exit 0

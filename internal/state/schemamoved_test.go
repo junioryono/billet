@@ -12,13 +12,13 @@ import (
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 63
+const newestMigration = 65
 
 // rewindNewest takes the newest migration back off a migrated ledger, so the
 // next migration has exactly one version to apply.
 //
 // IT KNOWS THAT MIGRATION'S STATEMENTS, the way the version tests beside it do:
-// the index and the four columns migration 61 added, and its record. It refuses
+// the indexes and columns migration 65 added, and its record. It refuses
 // to run once a newer one exists, so the ledger it leaves is always the schema
 // just before this binary's newest and, when a move is reported, its endpoints
 // are {newest-1, newest}; rewinding 61 under a 62 would leave a ledger at 62 with
@@ -33,10 +33,17 @@ func rewindNewest(t *testing.T, db *DB) {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
-			`DROP INDEX job_history_detail_retired_at`,
-			`DROP INDEX job_usage_destinations_kept`,
-			`ALTER TABLE job_history DROP COLUMN detail_retired_at`,
-			`DELETE FROM schema_migrations WHERE version = 63`,
+			`DROP INDEX job_history_github_run_idx`,
+			`DROP INDEX job_history_run_idx`,
+			`ALTER TABLE job_history DROP COLUMN launched_at`,
+			`ALTER TABLE job_history DROP COLUMN registered_at`,
+			`ALTER TABLE job_history DROP COLUMN runner_id`,
+			`ALTER TABLE job_history DROP COLUMN custody_at`,
+			`ALTER TABLE job_history DROP COLUMN teardown_at`,
+			`ALTER TABLE job_history DROP COLUMN quarantined_at`,
+			`ALTER TABLE job_history DROP COLUMN launch_incarnation`,
+			`ALTER TABLE job_history DROP COLUMN holder_incarnation`,
+			`DELETE FROM schema_migrations WHERE version = 65`,
 		} {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
