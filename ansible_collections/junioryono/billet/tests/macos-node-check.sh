@@ -46,6 +46,15 @@ case "$1 ${2:-}" in
         rm -f "$BILLET_FAKE_STATE/running"
         echo "stop     sh.billet.node"
         ;;
+    "node config-change")
+        # FROM THE FIXTURES THE GO TEST WRITES, or the failure of a release
+        # without the verb: the role must read that as the drain.
+        if [ "${BILLET_FAKE_VERDICT:-restart}" = absent ]; then
+            echo "billet: unknown command \"config-change\"" >&2
+            exit 2
+        fi
+        cat "$BILLET_FAKE_FIXTURES/node-config-change/${BILLET_FAKE_VERDICT:-restart}.json"
+        ;;
     "local up")
         cp "$config" "$BILLET_FAKE_STATE/at-up" 2>/dev/null || :
         [ "${BILLET_FAKE_UP_RC:-0}" = 0 ] || { echo "refuse   the loaded sh.billet.node differs from its plist" >&2; exit "$BILLET_FAKE_UP_RC"; }
@@ -126,7 +135,7 @@ run() {
     rm -f "$work/state/checked" "$work/state/at-down" "$work/state/at-up"
     status=0
     # shellcheck disable=SC2086
-    env BILLET_FAKE_CALLS="$work/calls" BILLET_FAKE_STATE="$work/state" \
+    env BILLET_FAKE_CALLS="$work/calls" BILLET_FAKE_STATE="$work/state" BILLET_FAKE_FIXTURES="$here/fixtures" \
         BILLET_TEST_ROOT="$work/root" BILLET_TEST_BIN="$work/bin" BILLET_TEST_BINARY="$work/bin/billet" \
         ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" \
         ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_FORCE_COLOR=0 ANSIBLE_NOCOLOR=1 \
@@ -149,7 +158,7 @@ fresh() {
 }
 
 calls_are() {
-    got=$(sed 's/ --config .*//' "$work/calls" | tr '\n' ';')
+    got=$(sed -e 's/ --config .*//' -e 's/ --installed .*//' "$work/calls" | tr '\n' ';')
     [ "$got" = "$1" ] || { echo "FAIL: $2: billet was called as [$got], want [$1]" >&2; exit 1; }
 }
 
@@ -160,11 +169,12 @@ no_candidate() {
 }
 
 # is_config <file> <max_vcpu or none>: the file is, byte for byte, what
-# to_nice_yaml(indent=2, sort_keys=false) renders for config-a (or config-b):
-# the host role's billet.yaml.j2, key order and trailing newline included
-# (measured with ansible-core's filter, 2026-09-28).
+# the host role's billet.yaml.j2 renders for config-a (or config-b): the
+# marker line, then to_nice_yaml(indent=2, sort_keys=false), key order and
+# trailing newline included (measured with ansible-core's filter, 2026-09-28).
 is_config() {
-    printf 'node:\n  name: mac-1\n  server_addr: 10.0.0.1:7717\n  provider: tart\n' >"$work/want.yaml"
+    printf '%s\n' '# Rendered by the junioryono.billet collection from billet_config: change the inventory, not this file.' >"$work/want.yaml"
+    printf 'node:\n  name: mac-1\n  server_addr: 10.0.0.1:7717\n  provider: tart\n' >>"$work/want.yaml"
     [ "$2" = none ] || printf '  max_vcpu: %s\n' "$2" >>"$work/want.yaml"
     cmp -s "$1" "$work/want.yaml" || { echo "FAIL: $1 is not the rendered billet_config: $(cat "$1")" >&2; exit 1; }
 }
@@ -189,7 +199,7 @@ run "a missing configuration is refused" "cannot be told apart from a running no
 fresh
 cp "$conf" "$work/old.yaml"
 run "a changed configuration drains, replaces and brings up" pass -- -e "@$work/config-a.yml"
-calls_are "billet check;billet local down;billet local up;" "a changed configuration"
+calls_are "billet check;billet node config-change;billet local down;billet local up;" "a changed configuration"
 is_config "$conf" none
 cmp -s "$work/state/checked" "$conf" || { echo "FAIL: the check was not given the configuration that was installed" >&2; exit 1; }
 cmp -s "$work/state/at-down" "$work/old.yaml" || { echo "FAIL: the drain did not run against the configuration the node was running" >&2; exit 1; }
@@ -217,7 +227,7 @@ no_candidate "a refused candidate"
 
 # 6. A drain that fails: nothing replaced and nothing brought up.
 run "a failed drain replaces nothing" "is unchanged" BILLET_FAKE_DOWN_RC=1 -- -e "@$work/config-b.yml"
-calls_are "billet check;billet local down;" "a failed drain"
+calls_are "billet check;billet node config-change;billet local down;" "a failed drain"
 cmp -s "$conf" "$work/before.yaml" || { echo "FAIL: a failed drain was followed by a replacement" >&2; exit 1; }
 no_candidate "a failed drain"
 
@@ -232,7 +242,7 @@ grep -q 'runs `billet local down`' "$work/out.log" || { echo "FAIL: a dry run di
 #    previous configuration is, and does not claim the node is stopped.
 BILLET_TEST_STAGED=staged run "a node that does not come up is reported with the backup" "The previous configuration is at" \
     BILLET_FAKE_UP_RC=1 -- -e "@$work/config-b.yml"
-calls_are "billet check;billet local down;billet local up;" "a node that did not come up"
+calls_are "billet check;billet node config-change;billet local down;billet local up;" "a node that did not come up"
 grep -q 'differs from its plist' "$work/out.log" || { echo "FAIL: the refusal did not quote local up" >&2; exit 1; }
 grep -q 'billet local status' "$work/out.log" || { echo "FAIL: the refusal did not name local status" >&2; exit 1; }
 is_config "$conf" 16
@@ -267,6 +277,27 @@ run "an unreadable ACL listing is refused" "could not be listed" BILLET_FAKE_LS_
 #     must fail rather than report a converged node.
 BILLET_TEST_STAGED=staged run "a node restarted during the converge is refused" "something started it between the drain and the install" \
     BILLET_FAKE_RESTARTED=1 -- -e "@$work/config-b.yml"
-calls_are "billet check;billet local down;billet local up;" "a node restarted during the converge"
+calls_are "billet check;billet node config-change;billet local down;billet local up;" "a node restarted during the converge"
+
+# 11. A change billet says the node does not read (#183: a tier or a nodes:
+#     entry for another host in a shared catalogue): checked, installed, and
+#     the node is NOT drained; `local up` finds it running and leaves it be.
+fresh
+cp "$conf" "$work/old.yaml"
+run "a change the node does not read is installed without a drain" pass BILLET_FAKE_VERDICT=keep -- -e "@$work/config-a.yml"
+calls_are "billet check;billet node config-change;billet local up;" "a change the node does not read"
+is_config "$conf" none
+[ ! -e "$work/state/at-down" ] || { echo "FAIL: a change the node does not read drained it" >&2; exit 1; }
+grep -q 'billet node config-change --installed '"$conf"' --candidate '"$work/root/etc/billet/.billet.yaml.candidate." "$work/calls" ||
+    { echo "FAIL: the verdict was not asked about the installed file and this run's candidate: $(cat "$work/calls")" >&2; exit 1; }
+no_candidate "a change the node does not read"
+
+# 12. A billet without the verb (a release before it): no verdict is a drain,
+#     exactly as before.
+fresh
+run "no verdict is a drain" pass BILLET_FAKE_VERDICT=absent -- -e "@$work/config-a.yml"
+calls_are "billet check;billet node config-change;billet local down;billet local up;" "no verdict"
+is_config "$conf" none
+no_candidate "no verdict"
 
 echo "macos-node-check: every case behaved as the role requires"

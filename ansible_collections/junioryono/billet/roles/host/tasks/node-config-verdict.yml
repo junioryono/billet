@@ -1,0 +1,100 @@
+---
+# WHETHER THE NODE READS WHAT THIS CONVERGE CHANGES (#183), decided by billet
+# and never inferred here. A node restart is a drain behind every running job,
+# and a tier added to a catalogue the hosts share (another provider's, which
+# this node cannot even run) changed every host's billet.yaml and drained a busy
+# Firecracker node for about ninety minutes. `billet node config-change` compares
+# the installed configuration with the rendering, setting aside the keys no
+# running node reads, and answers keep or restart.
+#
+# THE ZERO VALUE IS THE RESTART: a configuration that changes is a node change
+# unless the installed billet answered keep, so no answerer (a host with no
+# billet, a release before the verb), a failed call, an answer that is not
+# JSON and any other word all restart the node as before.
+- name: Start from a changed configuration being a node change
+  ansible.builtin.set_fact:
+    billet_node_config_changed: "{{ billet_config_preview.changed | default(false) | bool }}"
+    billet_node_config_verdict_why: ""
+
+- name: Ask billet whether the node reads what this converge changes
+  # NOT IN A DRY RUN, which writes nothing, not even this temporary file: the
+  # dry run reports the change as the node change it is assumed to be.
+  when:
+    - billet_config_preview.changed | default(false) | bool
+    - billet_node_should_run
+    - billet_exclusion_answerer | default('') | length > 0
+    - not ansible_check_mode
+  block:
+    # BESIDE THE INSTALLED FILE, under a name allocated for this run, and
+    # removed whatever billet answered, never by a name the role did not
+    # create: the same rule macos_node keeps for its candidate.
+    - name: Allocate the candidate configuration for the node's verdict
+      ansible.builtin.tempfile:
+        path: "{{ billet_ordinary_config_path | dirname }}"
+        prefix: .billet.yaml.verdict.
+        state: file
+      register: billet_node_config_candidate
+      changed_when: false
+      check_mode: false
+      become: true
+
+    - name: Write the candidate configuration for the node's verdict
+      vars:
+        billet_config_document: "{{ billet_effective_config }}"
+      ansible.builtin.template:
+        src: billet.yaml.j2
+        dest: "{{ billet_node_config_candidate.path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+      check_mode: false
+      become: true
+
+    - name: Ask the installed billet for the node's verdict
+      ansible.builtin.command:
+        argv:
+          - "{{ billet_exclusion_answerer }}"
+          - node
+          - config-change
+          - --installed
+          - "{{ billet_ordinary_config_path }}"
+          - --candidate
+          - "{{ billet_node_config_candidate.path }}"
+          - --json
+      register: billet_node_config_verdict_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: true
+
+    - name: Keep the node running only on billet's keep
+      vars:
+        billet_node_config_answer: >-
+          {{ (billet_node_config_verdict_raw.stdout | from_json)
+             if (billet_node_config_verdict_raw.rc | default(1)) == 0
+                and (billet_node_config_verdict_raw.stdout | default('') | trim) is match('^\{')
+             else {} }}
+      ansible.builtin.set_fact:
+        billet_node_config_changed: "{{ billet_node_config_answer.verdict | default('') != 'keep' }}"
+        billet_node_config_verdict_why: "{{ billet_node_config_answer.why | default('billet gave no verdict') }}"
+
+  always:
+    - name: Remove the candidate configuration for the node's verdict
+      ansible.builtin.file:
+        path: "{{ billet_node_config_candidate.path }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      become: true
+      when: billet_node_config_candidate.path | default('') | length > 0
+
+- name: Report a configuration change the node does not read
+  ansible.builtin.debug:
+    msg: >-
+      The billet configuration changes, and billet says the running node reads none of it
+      ({{ billet_node_config_verdict_why }}), so the node is not stopped or drained; the
+      control plane, if this host runs one, restarts as usual.
+  when:
+    - billet_config_preview.changed | default(false) | bool
+    - not billet_node_config_changed | bool

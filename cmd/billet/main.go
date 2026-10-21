@@ -174,6 +174,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 			return host.NodeReceipt(ctx, env, args[1:])
 		case "ending":
 			return host.NodeEnding(ctx, env, args[1:])
+		case "config-change":
+			return host.NodeConfigChange(ctx, env, args[1:])
 		}
 	}
 

@@ -91,6 +91,21 @@
           admit-start: {fixture: admit-start-proved, rc: 0}
         succeeds: true
         endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      # A CHANGE BILLET SAYS THE NODE DOES NOT READ (#183: tiers or nodes:
+      # alone) asks no drain of a restart some other input made, so its stop
+      # is proved like any ordinary one, without --drain.
+      - name: config-changed-but-not-read-requires-no-drain
+        wait: 30
+        config_changed: true
+        node_reads: false
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-handoff, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
       # AN ANSWER TO ANOTHER QUESTION: a proof of some other invocation, or of
       # a drain nobody asked about, is not a proof of this stop.
       - name: answer-about-another-invocation

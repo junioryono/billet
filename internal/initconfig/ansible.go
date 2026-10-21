@@ -19,10 +19,19 @@ import (
 // ignores — which would converge a host with no config change and no error.
 const AnsibleVar = "billet_config"
 
+// RoleRenderedMarker is the first line of every billet.yaml the collection's
+// roles render (the host role's templates/billet.yaml.j2 and macos_node's twin
+// of it), so billet can tell a file an inventory owns from one it may edit in
+// place: `billet join accept` refuses to edit a rendered one, because the next
+// converge would put the inventory's version back and drop the edit silently.
+const RoleRenderedMarker = "# Rendered by the junioryono.billet collection from billet_config: " +
+	"change the inventory, not this file."
+
 // AnsibleVars nests a generated config under the variable the host role reads.
 //
-// The role's template is `{{ billet_config | to_nice_yaml }}` — the value IS the
-// billet.yaml, verbatim — so the only thing between a generated config and a
+// The role's template is RoleRenderedMarker's line and then
+// `{{ billet_config | to_nice_yaml }}` — the value IS the billet.yaml,
+// verbatim — so the only thing between a generated config and a
 // usable inventory entry is this indentation. Without it the operator retypes
 // the generator's output by hand, which is how a ceiling ends up naming more
 // vCPU than the machine has.

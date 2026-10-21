@@ -77,7 +77,8 @@
 - name: Note whether the node's stop must have drained
   ansible.builtin.set_fact:
     billet_node_restart_drain: >-
-      {{ billet_config_install.changed | default(false) | bool or billet_node_restart_drain_request.stat.exists
+      {{ billet_node_config_changed | default(billet_config_install.changed | default(false)) | bool
+         or billet_node_restart_drain_request.stat.exists
          or billet_node_drain_owed_dir | default('') | length > 0 }}
 
 # AND THE STOP IS ASKED TO BE ONE: a drain owed by an earlier converge, or one

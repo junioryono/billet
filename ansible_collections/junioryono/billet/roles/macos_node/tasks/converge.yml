@@ -170,12 +170,18 @@
   check_mode: false
 
 # THE HOST ROLE'S RENDERING, byte for byte: templates/billet.yaml.j2 in the
-# host role is this one expression, and a template drops the newline after it.
+# host role is the marker line and this one expression, and a template drops
+# the newline after it. The marker is what `billet join accept` refuses to edit
+# (initconfig.RoleRenderedMarker).
 - name: Render the configuration and decide whether it changes
+  vars:
+    billet_macos_node_marker: "# Rendered by the junioryono.billet collection from billet_config: change the inventory, not this file."
   ansible.builtin.set_fact:
-    billet_macos_node_rendered: "{{ billet_config | to_nice_yaml(indent=2, sort_keys=false) }}"
-    billet_macos_node_changes: >-
-      {{ (billet_macos_node_installed.content | b64decode) != (billet_config | to_nice_yaml(indent=2, sort_keys=false)) }}
+    # BOTH DOUBLE-QUOTED, because YAML turns the \n into the newline there; in
+    # a folded scalar it stays a backslash and an n, and no installed file
+    # would ever equal the rendering (measured with ansible-core 2.21.2).
+    billet_macos_node_rendered: "{{ billet_macos_node_marker ~ '\n' ~ (billet_config | to_nice_yaml(indent=2, sort_keys=false)) }}"
+    billet_macos_node_changes: "{{ (billet_macos_node_installed.content | b64decode) != (billet_macos_node_marker ~ '\n' ~ (billet_config | to_nice_yaml(indent=2, sort_keys=false))) }}"
 
 # THE CANDIDATE IS CHECKED BEFORE ANYTHING STOPS: a configuration billet
 # refuses must not cost a drain. Written beside the configuration as the node
@@ -228,6 +234,37 @@
           {{ (billet_macos_node_check.stdout | default('')) | trim | split('\n') | last }}
           {{ billet_macos_node_check.stderr | default('') | trim }}
           The node was not stopped and {{ billet_macos_node_config_path }} is unchanged.
+
+    # WHETHER THE NODE READS WHAT CHANGES (#183), billet's word rather than the
+    # role's: a tier or a nodes: entry for another host in a shared catalogue is
+    # no reason to drain this one. Anything but keep, no answer included (a
+    # release before the verb), is the drain it always was.
+    - name: Ask billet whether the node reads what changes
+      ansible.builtin.command:
+        argv:
+          - "{{ billet_macos_node_binary }}"
+          - node
+          - config-change
+          - --installed
+          - "{{ billet_macos_node_config_path }}"
+          - --candidate
+          - "{{ billet_macos_node_candidate.path }}"
+          - --json
+      environment:
+        PATH: "{{ billet_macos_node_path }}"
+      register: billet_macos_node_verdict
+      changed_when: false
+      failed_when: false
+
+    - name: Drain the node unless billet answered keep
+      vars:
+        billet_macos_node_answer: >-
+          {{ (billet_macos_node_verdict.stdout | from_json)
+             if (billet_macos_node_verdict.rc | default(1)) == 0
+                and (billet_macos_node_verdict.stdout | default('') | trim) is match('^\{')
+             else {} }}
+      ansible.builtin.set_fact:
+        billet_macos_node_drains: "{{ billet_macos_node_answer.verdict | default('') != 'keep' }}"
   always:
     - name: Remove the candidate configuration
       ansible.builtin.file:
@@ -240,7 +277,7 @@
   ansible.builtin.debug:
     msg: >-
       {{ ('The rendered configuration differs from ' ~ billet_macos_node_config_path
-          ~ ': a converge checks it, runs `billet local down` (a drain, which waits for every running job), installs it and runs `billet local up`.')
+          ~ ': a converge checks it, asks billet whether the node reads what changes, and unless billet answers keep runs `billet local down` (a drain, which waits for every running job); it then installs it and runs `billet local up`.')
          if billet_macos_node_changes | bool
          else (billet_macos_node_config_path ~ ' already holds the rendered configuration: a converge runs `billet local up` alone, which starts nothing already running.') }}
   when: ansible_check_mode
@@ -264,6 +301,7 @@
   failed_when: false
   when:
     - billet_macos_node_changes | bool
+    - billet_macos_node_drains | default(true) | bool
     - not ansible_check_mode
 
 - name: Refuse to replace the configuration of a node that did not stop
@@ -328,6 +366,7 @@
       again once nothing else is managing the node.
   when:
     - billet_macos_node_changes | bool
+    - billet_macos_node_drains | default(true) | bool
     - not ansible_check_mode
     - billet_macos_node_up.rc | default(1) == 0
 
@@ -341,7 +380,7 @@
       ({{ 'exit ' ~ billet_macos_node_up.rc if billet_macos_node_up.rc is defined else billet_macos_node_up.msg | default('no answer') }}):
       {{ billet_macos_node_up.stdout | default('') | trim }}
       {{ billet_macos_node_up.stderr | default('') | trim }}
-      {{ ('The new configuration is installed and the node was drained, and its start failed or was not confirmed: `billet local status` on the Mac says what is running. '
+      {{ ('The new configuration is installed' ~ (' and the node was drained' if billet_macos_node_drains | default(true) | bool else '') ~ ', and its start failed or was not confirmed: `billet local status` on the Mac says what is running. '
           ~ (('The previous configuration is at ' ~ billet_macos_node_install.backup_file ~ '. ') if billet_macos_node_install.backup_file | default('') | length > 0 else '')
           ~ 'Fix what is named above and run `billet local up` on the Mac, or converge again.')
          if billet_macos_node_install is changed
