@@ -93,8 +93,7 @@ func Unique(needs []Need) []Need {
 	out := make([]Need, 0, len(needs))
 
 	for _, n := range needs {
-		if (n.Access == Write || n.Access == Private) && n.Path != "" &&
-			!slices.Contains(strings.Split(n.Path, string(filepath.Separator)), "..") {
+		if (n.Access == Write || n.Access == Private) && n.Path != "" && !hasDotDot(n.Path) {
 			n.Path = filepath.Clean(n.Path)
 		}
 
@@ -104,6 +103,11 @@ func Unique(needs []Need) []Need {
 	}
 
 	return out
+}
+
+// hasDotDot reports whether a path has a `..` element.
+func hasDotDot(path string) bool {
+	return slices.Contains(strings.Split(path, string(filepath.Separator)), "..")
 }
 
 // ExerciseAll performs every need in order, reports each to report, releases
@@ -170,6 +174,15 @@ func Exercise(ctx context.Context, n Need, marker string) (func() error, error) 
 		return nil, f.Close()
 
 	case Write, Private:
+		// A `..` AFTER A LINK NAMES ONE DIRECTORY TO THE KERNEL AND ANOTHER TO A
+		// JOIN, and a command reaches its directories both ways (an open of the
+		// path, a filepath.Join of a file in it), so which one it writes cannot
+		// be told from here: a refusal, never a yes.
+		if hasDotDot(n.Path) {
+			return nil, fmt.Errorf("%s: %w: a `..` in a directory's path can name two directories, "+
+				"and its command may write either; name it without one", n.Path, ErrUnknown)
+		}
+
 		if n.Access == Private || n.Create {
 			mode := n.Mode
 			if mode == 0 {
@@ -229,12 +242,12 @@ func writeMarker(dir, marker string) error {
 		return fmt.Errorf("a marker is one plain file name beginning %s, not %q", MarkerPrefix, name)
 	}
 
-	// THE DIRECTORY AS SPELLED, through a descriptor: the kernel resolves the
-	// name exactly as the command's own open does (a `..` after a link is the
-	// link target's parent, which joining strings would not be), and the marker
-	// is created in that directory and nowhere else, exclusively, never through
-	// a link at its name.
-	root, err := os.OpenRoot(dir)
+	// THE DIRECTORY, THROUGH A DESCRIPTOR, and the marker created in it and
+	// nowhere else, exclusively, never through a link at its name. The trailing
+	// separator makes the open itself refuse anything but a directory: a FIFO at
+	// the name would otherwise hold a plain open until something wrote to it,
+	// with whatever exclusion the exercise holds still held.
+	root, err := os.OpenRoot(strings.TrimRight(dir, string(filepath.Separator)) + string(filepath.Separator))
 	if err != nil {
 		return fmt.Errorf("write in %s: %w", dir, err)
 	}

@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
@@ -179,10 +181,10 @@ func TestUniqueKeepsTheFirstOfEachPathAndAccess(t *testing.T) {
 	}
 }
 
-// A MARKER LANDS WHERE THE COMMAND'S OPEN WOULD: in the directory the path
-// names as the kernel resolves it, a `..` after a link included, never in the
-// directory the string would name if it were cleaned.
-func TestAMarkerLandsInTheDirectoryTheKernelResolves(t *testing.T) {
+// A `..` AFTER A LINK NAMES TWO DIRECTORIES, the kernel's and a join's, and a
+// command may write either: its exercise cannot tell which and refuses,
+// writing in neither.
+func TestADirectoryNamedWithDotDotIsCouldNotTell(t *testing.T) {
 	base := t.TempDir()
 
 	for _, dir := range []string{"real/child", "real/kernels", "kernels"} {
@@ -198,16 +200,42 @@ func TestAMarkerLandsInTheDirectoryTheKernelResolves(t *testing.T) {
 	spelled := base + "/link/../kernels"
 
 	need := Unique([]Need{{Path: spelled, Access: Write}})[0]
-	if _, err := Exercise(t.Context(), need, "billet-unit-paths-gate"); err != nil {
-		t.Fatal(err)
+	if need.Path != spelled {
+		t.Fatalf("Unique rewrote %s as %s", spelled, need.Path)
 	}
 
-	if _, err := os.Stat(filepath.Join(base, "real", "kernels", "billet-unit-paths-gate")); err != nil {
-		t.Errorf("the marker is not in the directory %s resolves to: %v", spelled, err)
+	if _, err := Exercise(t.Context(), need, "billet-unit-paths-gate"); !errors.Is(err, ErrUnknown) {
+		t.Errorf("a directory named through `..` was exercised as %v, want could-not-tell", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(base, "kernels", "billet-unit-paths-gate")); !os.IsNotExist(err) {
-		t.Errorf("the marker landed in the directory the cleaned string names (%v)", err)
+	for _, dir := range []string{"real/kernels", "kernels"} {
+		if _, err := os.Stat(filepath.Join(base, dir, "billet-unit-paths-gate")); !os.IsNotExist(err) {
+			t.Errorf("a marker was written in %s (%v)", dir, err)
+		}
+	}
+}
+
+// A FIFO WHERE A DIRECTORY SHOULD BE IS REFUSED AT ONCE, never waited on: the
+// open that would wait for a writer is one the exercise never makes.
+func TestAFIFOWhereADirectoryShouldBeIsRefusedWithoutAWait(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "backups")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("this filesystem cannot make a FIFO: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Exercise(context.Background(), Need{Path: fifo, Access: Write}, "billet-unit-paths-gate")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a FIFO was written in as a directory")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exercise waited on a FIFO where a directory should be")
 	}
 }
 
