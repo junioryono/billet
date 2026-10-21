@@ -267,6 +267,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 			// machine sees nothing there; it ships all the same.
 			name: "a linked Copilot CLI without its license", want: "/opt/hostedtoolcache/copilot-cli/1.0.102/x64/LICENSE.md",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				dir := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.102", "x64", "bin")
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
@@ -280,6 +282,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 			// The link names a file this machine has and the image does not.
 			name: "a license linked to a file outside the image", want: "/usr/local/bin/LICENSE.txt",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				outside := filepath.Join(t.TempDir(), "LICENSE.txt")
 				writeTreeFile(t, filepath.Dir(outside), "LICENSE.txt", "Business Source License 1.1\n")
 				license := filepath.Join(root, "usr", "local", "bin", "LICENSE.txt")
@@ -292,6 +296,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 		{
 			name: "a directory where Packer's license is", want: "/usr/local/bin/LICENSE.txt",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				license := filepath.Join(root, "usr", "local", "bin", "LICENSE.txt")
 				removeAll(t, license)
 				writeTreeFile(t, license, "terms", "Business Source License 1.1\n")
@@ -300,6 +306,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 		{
 			name: "a directory where the notices are", want: "has no /opt/billet/IMAGE_NOTICES",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				notices := filepath.Join(root, "opt", "billet", "IMAGE_NOTICES")
 				removeAll(t, notices)
 				writeTreeFile(t, notices, "x", "  Text: /usr/local/bin/LICENSE.txt\n")
@@ -311,6 +319,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 			name: "a Copilot CLI under a linked directory without its license",
 			want: "/opt/hostedtoolcache/copilot-cli/1.0.102/x64/LICENSE.md",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				writeTreeFile(t, root, "opt/extra-copilot-bin/copilot", "#!/bin/sh\n")
 				dir := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.102", "x64")
 				if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -327,6 +337,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 			name: "a Copilot CLI version linked elsewhere in the image without its license",
 			want: "/opt/hostedtoolcache/copilot-cli/1.0.103/x64/LICENSE.md",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				writeTreeFile(t, root, "opt/copilot-1.0.103/x64/bin/copilot", "#!/bin/sh\n")
 				link := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.103")
 				if err := os.Symlink("/opt/copilot-1.0.103", link); err != nil {
@@ -341,6 +353,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 			name: "notices linked to a file that names nothing in the image",
 			want: "/usr/local/bin/LICENSE.txt (not named in IMAGE_NOTICES)",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				notices := filepath.Join(root, "opt", "billet", "IMAGE_NOTICES")
 				body, err := os.ReadFile(notices)
 				if err != nil {
@@ -438,6 +452,8 @@ func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T
 			name: "a version behind a link readlink cannot read", command: "readlink", failOn: "*/1.0.104",
 			want: "could not tell which tools",
 			stage: func(t *testing.T, root string) {
+				t.Helper()
+
 				writeTreeFile(t, root, "opt/copilot-1.0.104/x64/bin/copilot", "#!/bin/sh\n")
 				if err := os.Symlink("/opt/copilot-1.0.104",
 					filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.104")); err != nil {
@@ -449,6 +465,8 @@ func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T
 			name: "a version directory that cannot be listed", command: "ls", failOn: "*/1.0.105",
 			want: "could not tell which tools",
 			stage: func(t *testing.T, root string) {
+				t.Helper()
+
 				writeTreeFile(t, root, "opt/hostedtoolcache/copilot-cli/1.0.105/x64/bin/copilot", "#!/bin/sh\n")
 			},
 		},
@@ -456,6 +474,8 @@ func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T
 			name: "notices behind a link readlink cannot read", command: "readlink", failOn: "*/opt/billet/IMAGE_NOTICES",
 			want: "could not inspect /opt/billet/IMAGE_NOTICES",
 			stage: func(t *testing.T, root string) {
+				t.Helper()
+
 				notices := filepath.Join(root, "opt", "billet", "IMAGE_NOTICES")
 				body, err := os.ReadFile(notices)
 				if err != nil {
@@ -472,6 +492,8 @@ func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T
 			name: "a license behind a link readlink cannot read", command: "readlink", failOn: "*/usr/local/bin/LICENSE.txt",
 			want: "could not inspect /usr/local/bin/LICENSE.txt",
 			stage: func(t *testing.T, root string) {
+				t.Helper()
+
 				license := filepath.Join(root, "usr", "local", "bin", "LICENSE.txt")
 				removeAll(t, license)
 				writeTreeFile(t, root, "usr/share/doc/packer/LICENSE.txt", "Business Source License 1.1\n")
@@ -487,14 +509,14 @@ func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T
 			root := imageNoticesRoot(t)
 			tc.stage(t, root)
 
-			real, err := exec.LookPath(tc.command)
+			binary, err := exec.LookPath(tc.command)
 			if err != nil {
 				t.Fatal(err)
 			}
 			bin := t.TempDir()
 			// The last argument is the path either command is asked about.
 			writeExecutable(t, filepath.Join(bin, tc.command), "#!/bin/sh\nfor last; do :; done\n"+
-				"case \"$last\" in "+tc.failOn+") exit 2 ;; esac\nexec "+real+" \"$@\"\n")
+				"case \"$last\" in "+tc.failOn+") exit 2 ;; esac\nexec "+binary+" \"$@\"\n")
 
 			script := "set -euo pipefail\nFAILED=0\npass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n"
 			for _, name := range noticeGateFunctions {
@@ -723,6 +745,8 @@ func TestTheBuildFailsWithoutEachToolsLicense(t *testing.T) {
 			name: "a directory where Packer's license is", tool: "usr/local/bin/packer", curl: "exit 0\n",
 			want: "Packer is installed without",
 			mutate: func(t *testing.T, root string) {
+				t.Helper()
+
 				writeTreeFile(t, root, "usr/local/bin/LICENSE.txt/terms", "Business Source License 1.1\n")
 			},
 		},
