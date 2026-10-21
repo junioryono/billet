@@ -68,16 +68,8 @@
       check_mode: false
       become: true
 
-    - name: Keep the node running only on billet's keep
-      vars:
-        billet_node_config_answer: >-
-          {{ (billet_node_config_verdict_raw.stdout | from_json)
-             if (billet_node_config_verdict_raw.rc | default(1)) == 0
-                and (billet_node_config_verdict_raw.stdout | default('') | trim) is match('^\{')
-             else {} }}
-      ansible.builtin.set_fact:
-        billet_node_config_changed: "{{ billet_node_config_answer.verdict | default('') != 'keep' }}"
-        billet_node_config_verdict_why: "{{ billet_node_config_answer.why | default('billet gave no verdict') }}"
+    - name: Read the node's verdict
+      ansible.builtin.import_tasks: node-config-answer.yml
 
   always:
     - name: Remove the candidate configuration for the node's verdict

@@ -49,11 +49,21 @@ case "$1 ${2:-}" in
     "node config-change")
         # FROM THE FIXTURES THE GO TEST WRITES, or the failure of a release
         # without the verb: the role must read that as the drain.
-        if [ "${BILLET_FAKE_VERDICT:-restart}" = absent ]; then
-            echo "billet: unknown command \"config-change\"" >&2
-            exit 2
-        fi
-        cat "$BILLET_FAKE_FIXTURES/node-config-change/${BILLET_FAKE_VERDICT:-restart}.json"
+        # A broken answer (half of one, none, or keep from a failed call) must
+        # be read as the drain too, never fail the converge.
+        case "${BILLET_FAKE_VERDICT:-restart}" in
+            absent)
+                echo "billet: unknown command \"config-change\"" >&2
+                exit 2
+                ;;
+            truncated) head -c 20 "$BILLET_FAKE_FIXTURES/node-config-change/keep.json" ;;
+            empty) : ;;
+            failed-keep)
+                cat "$BILLET_FAKE_FIXTURES/node-config-change/keep.json"
+                exit 1
+                ;;
+            *) cat "$BILLET_FAKE_FIXTURES/node-config-change/${BILLET_FAKE_VERDICT:-restart}.json" ;;
+        esac
         ;;
     "local up")
         cp "$config" "$BILLET_FAKE_STATE/at-up" 2>/dev/null || :
@@ -299,5 +309,15 @@ run "no verdict is a drain" pass BILLET_FAKE_VERDICT=absent -- -e "@$work/config
 calls_are "billet check;billet node config-change;billet local down;billet local up;" "no verdict"
 is_config "$conf" none
 no_candidate "no verdict"
+
+# 13. An answer that is not billet's keep (half of one, none at all, or keep
+#     from a call that failed) is a drain, and never a failed converge.
+for verdict in truncated empty failed-keep; do
+    fresh
+    run "a $verdict answer is a drain" pass BILLET_FAKE_VERDICT=$verdict -- -e "@$work/config-a.yml"
+    calls_are "billet check;billet node config-change;billet local down;billet local up;" "a $verdict answer"
+    is_config "$conf" none
+    no_candidate "a $verdict answer"
+done
 
 echo "macos-node-check: every case behaved as the role requires"

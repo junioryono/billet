@@ -116,6 +116,10 @@ tiers:
     image: ubuntu:24.04
 `
 	broken := strings.Replace(base, "max_vcpu: 8", "max_vcpu: eight", 1)
+	// ONE BOOLEAN TO YAML, TWO NAMES TO billet: the untyped documents agree
+	// and the loaded configurations do not.
+	trueName := strings.Replace(base, "name: fc-1", "name: true", 1)
+	trueNameUpper := strings.Replace(base, "name: fc-1", "name: TRUE", 1)
 
 	for _, c := range []struct {
 		name, installed, candidate, verdict, why string
@@ -130,6 +134,7 @@ tiers:
 		{"the candidate runs a control plane", base, withServer, configChangeRestart, "this host runs the control plane too"},
 		{"the installed one ran a control plane", withServer, withServer, configChangeRestart, "this host runs the control plane too"},
 		{"the candidate does not load", base, broken, configChangeRestart, "does not load"},
+		{"a name YAML reads as the same boolean", trueName, trueNameUpper, configChangeRestart, "as billet loads it"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := runConfigChange(t, c.installed, c.candidate)

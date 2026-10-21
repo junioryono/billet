@@ -105,12 +105,21 @@ func judgeNodeConfigChange(installedPath, candidatePath string) (string, string)
 		return configChangeRestart, fmt.Sprintf("what the node reads changed: %v", changed)
 	}
 
+	// AND AS BILLET LOADS THEM, because the untyped document is not what the
+	// node reads: `name: TRUE` and `name: true` decode to one boolean there and
+	// load as two different names.
+	if !reflect.DeepEqual(installed.loaded, candidate.loaded) {
+		return configChangeRestart, "what the node reads changed as billet loads it"
+	}
+
 	return configChangeKeep, fmt.Sprintf("only %v changed, which no running node reads", nodeIgnores)
 }
 
-// nodeView is one configuration as the comparison sees it.
+// nodeView is one configuration as the comparison sees it: its document and
+// what billet loads from it, each without the keys a node does not read.
 type nodeView struct {
 	doc    map[string]any
+	loaded config.Config
 	server bool
 }
 
@@ -136,7 +145,10 @@ func readNodeView(path string) (nodeView, error) {
 		delete(doc, key)
 	}
 
-	return nodeView{doc: doc, server: cfg.Server != nil}, nil
+	loaded := *cfg
+	loaded.Tiers, loaded.Nodes = nil, nil
+
+	return nodeView{doc: doc, loaded: loaded, server: cfg.Server != nil}, nil
 }
 
 // changedKeys names the top-level keys whose values differ, sorted.

@@ -256,15 +256,16 @@
       changed_when: false
       failed_when: false
 
+    # MATCHED, NEVER PARSED, for the host role's reason: an answer that is not
+    # JSON must be the drain, not a failed converge.
     - name: Drain the node unless billet answered keep
       vars:
-        billet_macos_node_answer: >-
-          {{ (billet_macos_node_verdict.stdout | from_json)
-             if (billet_macos_node_verdict.rc | default(1)) == 0
-                and (billet_macos_node_verdict.stdout | default('') | trim) is match('^\{')
-             else {} }}
+        billet_macos_node_keeps: >-
+          {{ (billet_macos_node_verdict.rc | default(1)) == 0
+             and (billet_macos_node_verdict.stdout | default('') | trim)
+                 is match('^[{]"schema":1,"verdict":"keep","why":"[^"]*"[}]$') }}
       ansible.builtin.set_fact:
-        billet_macos_node_drains: "{{ billet_macos_node_answer.verdict | default('') != 'keep' }}"
+        billet_macos_node_drains: "{{ not (billet_macos_node_keeps | bool) }}"
   always:
     - name: Remove the candidate configuration
       ansible.builtin.file:

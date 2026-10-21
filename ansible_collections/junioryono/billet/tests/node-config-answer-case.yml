@@ -1,0 +1,18 @@
+---
+# One answer read by the host role's parser of `node config-change`.
+- name: Read the answer through the production task file
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: node-config-answer
+  vars:
+    billet_node_config_verdict_raw: "{{ billet_gate_verdict_case.raw }}"
+
+- name: Hold the verdict to the case
+  ansible.builtin.assert:
+    that:
+      - (billet_node_config_changed | bool) == billet_gate_verdict_case.changed
+      - billet_gate_verdict_case.changed or 'tiers' in billet_node_config_verdict_why
+    fail_msg: >-
+      {{ billet_gate_verdict_case.name }}: billet_node_config_changed is
+      {{ billet_node_config_changed }} ({{ billet_node_config_verdict_why }}),
+      want {{ billet_gate_verdict_case.changed }}

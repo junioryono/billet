@@ -584,3 +584,33 @@
       ansible.builtin.file:
         path: "{{ billet_gate_restart_root.path }}"
         state: absent
+
+# BILLET'S VERDICT, READ BY THE PRODUCTION PARSER (node-config-answer.yml): keep
+# only on the exact answer billet writes for it, exit 0, and the restart for
+# everything else. None of these may fail the converge, which is the parser's
+# whole point: a template error here would stop it where the rule is to restart.
+- name: Prove the node's verdict is keep only on billet's keep
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_keep: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/fixtures/node-config-change/keep.json') }}"
+    billet_gate_restart: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/fixtures/node-config-change/restart.json') }}"
+    billet_gate_verdict_cases:
+      - {name: keep, raw: {rc: 0, stdout: "{{ billet_gate_keep }}\n"}, changed: false}
+      - {name: restart, raw: {rc: 0, stdout: "{{ billet_gate_restart }}\n"}, changed: true}
+      - {name: keep-from-a-failed-call, raw: {rc: 1, stdout: "{{ billet_gate_keep }}"}, changed: true}
+      - {name: keep-truncated, raw: {rc: 0, stdout: "{{ billet_gate_keep[:-2] }}"}, changed: true}
+      - {name: keep-then-more, raw: {rc: 0, stdout: "{{ billet_gate_keep }} {}"}, changed: true}
+      - {name: a-brace-alone, raw: {rc: 0, stdout: "{"}, changed: true}
+      - {name: not-json, raw: {rc: 0, stdout: "keep"}, changed: true}
+      - {name: empty, raw: {rc: 0, stdout: ""}, changed: true}
+      - {name: unknown-verb, raw: {rc: 2, stdout: "", stderr: 'billet: unknown command "config-change"'}, changed: true}
+      - {name: no-exit-status, raw: {stdout: "{{ billet_gate_keep }}"}, changed: true}
+  tasks:
+    - name: Read each answer through the production parser
+      ansible.builtin.include_tasks: node-config-answer-case.yml
+      loop: "{{ billet_gate_verdict_cases }}"
+      loop_control:
+        loop_var: billet_gate_verdict_case
+        label: "{{ billet_gate_verdict_case.name }}"

@@ -1,0 +1,22 @@
+---
+# THE ONE PARSER OF A `node config-change` ANSWER: keep only when the call
+# exited 0 and printed exactly the bytes billet writes for keep, and the
+# restart otherwise.
+#
+# MATCHED, NEVER PARSED: from_json raises on an answer that is not JSON, and a
+# raise here would fail the converge where the rule is to restart. Half an
+# answer, an empty one, a failed call and any other word are all the restart.
+#
+# Input: billet_node_config_verdict_raw (the registered command result).
+- name: Keep the node running only on billet's keep
+  vars:
+    billet_node_config_keeps: >-
+      {{ (billet_node_config_verdict_raw.rc | default(1)) == 0
+         and (billet_node_config_verdict_raw.stdout | default('') | trim)
+             is match('^[{]"schema":1,"verdict":"keep","why":"[^"]*"[}]$') }}
+  ansible.builtin.set_fact:
+    billet_node_config_changed: "{{ not (billet_node_config_keeps | bool) }}"
+    billet_node_config_verdict_why: >-
+      {{ (billet_node_config_verdict_raw.stdout | default('') | trim
+          | regex_replace('^.*"why":"([^"]*)".*$', '\1'))
+         if billet_node_config_keeps | bool else 'billet did not answer keep' }}
