@@ -424,48 +424,88 @@ func TestThePublicationGateFollowsTheImagesOwnLinks(t *testing.T) {
 	}
 }
 
-// A LOOKUP THAT CANNOT TELL FAILS THE GATE. Beside a licensed version, a second
-// version behind a link readlink cannot read must not read as no tool at all.
+// A LOOKUP THAT CANNOT TELL FAILS THE GATE, and says it could not tell. Beside a
+// licensed version, a second version the gate cannot read must not read as no
+// tool at all, and a license it cannot inspect must not read as one missing.
 func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T) {
 	t.Parallel()
 
-	root := imageNoticesRoot(t)
-	writeTreeFile(t, root, "opt/copilot-1.0.104/x64/bin/copilot", "#!/bin/sh\n")
-	if err := os.Symlink("/opt/copilot-1.0.104", filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.104")); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct {
+		name, command, failOn, want string
+		stage                       func(t *testing.T, root string)
+	}{
+		{
+			name: "a version behind a link readlink cannot read", command: "readlink", failOn: "*/1.0.104",
+			want: "could not tell which tools",
+			stage: func(t *testing.T, root string) {
+				writeTreeFile(t, root, "opt/copilot-1.0.104/x64/bin/copilot", "#!/bin/sh\n")
+				if err := os.Symlink("/opt/copilot-1.0.104",
+					filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.104")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "a version directory that cannot be listed", command: "ls", failOn: "*/1.0.105",
+			want: "could not tell which tools",
+			stage: func(t *testing.T, root string) {
+				writeTreeFile(t, root, "opt/hostedtoolcache/copilot-cli/1.0.105/x64/bin/copilot", "#!/bin/sh\n")
+			},
+		},
+		{
+			name: "a license behind a link readlink cannot read", command: "readlink", failOn: "*/usr/local/bin/LICENSE.txt",
+			want: "could not inspect /usr/local/bin/LICENSE.txt",
+			stage: func(t *testing.T, root string) {
+				license := filepath.Join(root, "usr", "local", "bin", "LICENSE.txt")
+				removeAll(t, license)
+				writeTreeFile(t, root, "usr/share/doc/packer/LICENSE.txt", "Business Source License 1.1\n")
+				if err := os.Symlink("/usr/share/doc/packer/LICENSE.txt", license); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	real, err := exec.LookPath("readlink")
-	if err != nil {
-		t.Fatal(err)
-	}
-	bin := t.TempDir()
-	writeExecutable(t, filepath.Join(bin, "readlink"),
-		"#!/bin/sh\ncase \"$1\" in */1.0.104) exit 1 ;; esac\nexec "+real+" \"$@\"\n")
+			root := imageNoticesRoot(t)
+			tc.stage(t, root)
 
-	script := "set -euo pipefail\nFAILED=0\npass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n"
-	for _, name := range noticeGateFunctions {
-		script += checkImageFunction(t, name) + "\n"
-	}
-	script += "check_image_notices \"$1\"\necho \"FAILED=$FAILED\"\n"
-	path := filepath.Join(t.TempDir(), "gate.sh")
-	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.CommandContext(t.Context(), "bash", path, root)
-	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("the check did not run to its verdict: %v\n%s", err, out)
-	}
-	if !strings.Contains(string(out), "FAILED=1") || !strings.Contains(string(out), "could not tell which tools") {
-		t.Fatalf("the gate passed an image it could not read:\n%s", out)
+			real, err := exec.LookPath(tc.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bin := t.TempDir()
+			// The last argument is the path either command is asked about.
+			writeExecutable(t, filepath.Join(bin, tc.command), "#!/bin/sh\nfor last; do :; done\n"+
+				"case \"$last\" in "+tc.failOn+") exit 2 ;; esac\nexec "+real+" \"$@\"\n")
+
+			script := "set -euo pipefail\nFAILED=0\npass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n"
+			for _, name := range noticeGateFunctions {
+				script += checkImageFunction(t, name) + "\n"
+			}
+			script += "check_image_notices \"$1\"\necho \"FAILED=$FAILED\"\n"
+			path := filepath.Join(t.TempDir(), "gate.sh")
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.CommandContext(t.Context(), "bash", path, root)
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("the check did not run to its verdict: %v\n%s", err, out)
+			}
+			if !strings.Contains(string(out), "FAILED=1") || !strings.Contains(string(out), tc.want) {
+				t.Fatalf("the gate did not refuse saying %q:\n%s", tc.want, out)
+			}
+		})
 	}
 }
 
-// A LINK THAT CANNOT BE READ RESOLVES NOWHERE. With readlink failing, a path
-// through /usr/share/miniconda must not resolve to /usr/share/LICENSE.txt, which
-// is what dropping the unreadable component would give.
+// A LINK THAT CANNOT BE READ RESOLVES NOWHERE, and the resolver says it could not
+// tell (2) rather than that the path is not there (1). With readlink failing, a
+// path through /usr/share/miniconda must not resolve to /usr/share/LICENSE.txt,
+// which is what dropping the unreadable component would give.
 func TestTheImageResolverRefusesALinkItCannotRead(t *testing.T) {
 	t.Parallel()
 
@@ -479,7 +519,8 @@ func TestTheImageResolverRefusesALinkItCannotRead(t *testing.T) {
 	bin := t.TempDir()
 	writeExecutable(t, filepath.Join(bin, "readlink"), "#!/bin/sh\nexit 1\n")
 	script := "set -euo pipefail\n" + checkImageFunction(t, "image_resolve") + "\n" +
-		"if out=$(image_resolve \"$1\" /usr/share/miniconda/LICENSE.txt); then echo \"resolved=$out\"; else echo refused; fi\n"
+		"status=0\nout=$(image_resolve \"$1\" /usr/share/miniconda/LICENSE.txt) || status=$?\n" +
+		"echo \"status=$status out=$out\"\n"
 	path := filepath.Join(t.TempDir(), "resolve.sh")
 	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
@@ -487,8 +528,8 @@ func TestTheImageResolverRefusesALinkItCannotRead(t *testing.T) {
 	cmd := exec.CommandContext(t.Context(), "bash", path, root)
 	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
-	if err != nil || strings.TrimSpace(string(out)) != "refused" {
-		t.Fatalf("image_resolve with an unreadable link answered %q (%v), want refused", out, err)
+	if err != nil || strings.TrimSpace(string(out)) != "status=2 out=" {
+		t.Fatalf("image_resolve with an unreadable link answered %q (%v), want status=2 and no path", out, err)
 	}
 }
 

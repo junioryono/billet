@@ -459,9 +459,16 @@ check_completer() {
 check_image_notices() {
 	local found text notices want=() missing=() status=0
 
-	if ! image_text_file "$1" /opt/billet/IMAGE_NOTICES ||
-		! notices=$(image_resolve "$1" /opt/billet/IMAGE_NOTICES); then
+	image_text_file "$1" /opt/billet/IMAGE_NOTICES || status=$?
+	case "$status" in
+	0) notices=$(image_resolve "$1" /opt/billet/IMAGE_NOTICES) || status=$? ;;
+	1)
 		fail "the image has no /opt/billet/IMAGE_NOTICES, so it ships tools whose licenses ask for their text without saying where it is"
+		return
+		;;
+	esac
+	if [ "$status" -ne 0 ]; then
+		fail "could not inspect /opt/billet/IMAGE_NOTICES (status $status)"
 		return
 	fi
 	found=$(tool_licenses "$1" /opt/hostedtoolcache/copilot-cli bin/copilot LICENSE.md &&
@@ -479,10 +486,19 @@ check_image_notices() {
 	done <<<"$found"
 
 	for text in ${want[@]+"${want[@]}"}; do
-		if ! image_text_file "$1" "$text"; then
+		status=0
+		image_text_file "$1" "$text" || status=$?
+		case "$status" in
+		0) ;;
+		1)
 			missing+=("$text")
 			continue
-		fi
+			;;
+		*)
+			fail "could not inspect $text in the image (status $status)"
+			return
+			;;
+		esac
 		status=0
 		grep -qxF "  Text: $text" "$1$notices" || status=$?
 		case "$status" in
@@ -550,8 +566,11 @@ tool_license() {
 # image_entries prints the name of each entry of DIR, resolved inside the image
 # mounted at ROOT, one per line. It fails 1 when the image has no such directory,
 # and 2 when it cannot tell.
+#
+# LISTED BY ls, WHOSE STATUS SAYS WHETHER THE DIRECTORY WAS READ: a glob over a
+# directory that cannot be read expands to nothing, which would read as empty.
 image_entries() {
-	local resolved entry status=0
+	local resolved status=0
 	resolved=$(image_resolve "$1" "$2") || status=$?
 	case "$status" in
 	0) ;;
@@ -559,11 +578,7 @@ image_entries() {
 	*) return 2 ;;
 	esac
 	[ -d "$1$resolved" ] || return 1
-	for entry in "$1$resolved"/*; do
-		if [ -e "$entry" ] || [ -L "$entry" ]; then
-			printf '%s\n' "${entry##*/}"
-		fi
-	done
+	ls -1A -- "$1$resolved" || return 2
 }
 
 # image_present succeeds when anything, a symlink included, is at PATH inside the
@@ -581,10 +596,15 @@ image_present() {
 }
 
 # image_text_file succeeds when PATH, resolved inside the image mounted at ROOT, is
-# a non-empty regular file.
+# a non-empty regular file. It fails 1 when it is not, and 2 when it cannot tell.
 image_text_file() {
-	local resolved
-	resolved=$(image_resolve "$1" "$2") || return 1
+	local resolved status=0
+	resolved=$(image_resolve "$1" "$2") || status=$?
+	case "$status" in
+	0) ;;
+	1) return 1 ;;
+	*) return 2 ;;
+	esac
 	[ -f "$1$resolved" ] && [ ! -L "$1$resolved" ] && [ -s "$1$resolved" ]
 }
 
