@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -125,6 +126,35 @@ func claudeHookRepo(t *testing.T, refs fixtureRefs) string {
 }
 
 // runClaudeGuard runs one hook and answers its exit status and stderr.
+// shPlusS is what the hook answers `sh +s <a gate>` with here: nothing where sh
+// is bash (macOS, whose /bin/sh runs what /private/var/select/sh names), which
+// reads standard input, and gate where it is dash (Linux), which runs the script.
+func shPlusS(t *testing.T, gate string) string {
+	t.Helper()
+
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := filepath.EvalSymlinks(sh)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if runtime.GOOS == "darwin" && target == "/bin/sh" {
+		if target, err = filepath.EvalSymlinks("/private/var/select/sh"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if filepath.Base(target) == "bash" {
+		return ""
+	}
+
+	return gate
+}
+
 func runClaudeGuard(t *testing.T, mode, root string, payload map[string]any, extraEnv ...string) (int, string) {
 	t.Helper()
 
@@ -492,7 +522,8 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"bash +s scripts/gates/check.sh", ""},
 		{"zsh +s scripts/gates/check.sh", gate},
 		{"zsh -s +s scripts/gates/check.sh", gate},
-		{"sh +s scripts/gates/check.sh", gate},
+		{"sh +s scripts/gates/check.sh", shPlusS(t, gate)},
+		{"/bin/bash +s scripts/gates/check.sh", ""},
 		{"dash -s scripts/gates/check.sh", ""},
 		{"bash g/../gates/test.sh", gate},
 		{"bash -o pipefail -c 'git push --force origin junior-oct03-work'", "force"},
