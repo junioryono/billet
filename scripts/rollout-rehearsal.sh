@@ -21,7 +21,11 @@
 # back and the host stays on TO. That is the rollback path under a real
 # service manager, and the watermark's own restore with it.
 #
-#   BILLET_REHEARSAL_FROM=v0.5.0 BILLET_REHEARSAL_TO=v0.6.0 \
+# A FROM BELOW v0.10.0 cannot complete it: every release through v0.9.2 launches
+# the node's updater inside the node service's sandbox, which refuses its first
+# write (host-rehearsals.md); the record names the pairs it has run with.
+#
+#   BILLET_REHEARSAL_FROM=v0.21.0 BILLET_REHEARSAL_TO=v0.22.0 \
 #   BILLET_REHEARSAL_APP_CONFIG=... BILLET_REHEARSAL_APP_KEY=... \
 #   scripts/rollout-rehearsal.sh
 set -euo pipefail
@@ -233,6 +237,8 @@ test "$(rehearsal_active "${controller}" billet-server.service)" = active ||
     rehearsal_fail "billet-server.service is not active on the controller after its upgrade"
 docker exec "${controller}" grep -qF "${to_digest}" /var/lib/billet/installed.json ||
     rehearsal_fail "the controller's provenance does not name ${TO}'s manifest"
+rehearsal_units_run_installed_binary "${controller}" ||
+    rehearsal_fail "a billet service on the controller is not running ${TO}'s binary after the upgrade"
 
 rehearsal_step "the coordinator moves the node"
 node_upgrade_started=$(date -u +%s)
@@ -248,6 +254,10 @@ test "$(rehearsal_active "${node}" billet-node.service)" = active ||
     rehearsal_fail "billet-node.service is not active on the node after its upgrade"
 docker exec "${node}" grep -qF "${to_digest}" /var/lib/billet/installed.json ||
     rehearsal_fail "the node's provenance does not name ${TO}'s manifest"
+# EVERY UNIT, NOT ONLY billet-node: the uplink shaper beside it is what #503 left
+# on the replaced binary while the node came back healthy.
+rehearsal_units_run_installed_binary "${node}" ||
+    rehearsal_fail "a billet service on the node is not running ${TO}'s binary after the upgrade"
 
 rehearsal_wait_for 300 "the rollout to complete" "${controller}" \
     runuser -u billet -- sh -c "/usr/bin/billet rollout status --config /etc/billet/billet.yaml | grep -q 'No rollout is running. The last one was .* completed'" ||
@@ -283,6 +293,10 @@ test "$(rehearsal_version "${controller}")" = "${TO_VERSION}" ||
     rehearsal_fail "after the rollback the controller reports $(rehearsal_version "${controller}"), not ${TO_VERSION}"
 rehearsal_wait_for 120 "the server to be back" "${controller}" systemctl is-active --quiet billet-server.service ||
     rehearsal_fail "billet-server.service did not come back after the rollback"
+# A ROLLBACK REPLACES THE BINARY TWICE, so it is the likelier place for a unit to
+# be left on the candidate's.
+rehearsal_units_run_installed_binary "${controller}" ||
+    rehearsal_fail "a billet service on the controller is not running ${TO}'s binary after the rollback"
 
 # THE GUARD IS GIVEN TIME TO BE VIOLATED. The coordinator looks every thirty
 # seconds; a check made the instant the controller rolled back proves nothing

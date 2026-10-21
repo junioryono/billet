@@ -430,6 +430,43 @@ rehearsal_stopped() {
     esac
 }
 
+# rehearsal_units_run_installed_binary proves every billet service running on a
+# host executes the binary installed at /usr/bin/billet NOW, not one an upgrade
+# replaced under it.
+#
+# FOUND BY A REAL ROLLOUT (#503): the automatic v0.16.5 -> v0.16.6 rollout
+# committed on a node and left billet-uplink.service running the replaced binary
+# (/proc/<pid>/exe -> /usr/bin/billet (deleted)), because the transaction never
+# restarted it. "billet-node came back" was true and proved nothing about the
+# units beside it.
+#
+# BY INODE, NOT BY NAME: a process whose binary was replaced in place still
+# reads /usr/bin/billet through its exe link, suffixed " (deleted)"; one started
+# from the new binary resolves to the same file /usr/bin/billet does. A oneshot
+# that has finished has no MainPID and is skipped; a service running nothing at
+# all is a failure, because a host with no billet unit running proves nothing.
+rehearsal_units_run_installed_binary() {
+    docker exec "$1" sh -c '
+        want=$(stat -L -c "%d:%i" /usr/bin/billet) || { echo "cannot stat /usr/bin/billet"; exit 2; }
+        units=$(systemctl list-units --type=service --state=active --no-legend --plain "billet*" | awk "{print \$1}")
+        test -n "$units" || { echo "no billet service is active"; exit 3; }
+        checked=0
+        for u in $units; do
+            pid=$(systemctl show -p MainPID --value "$u")
+            case "$pid" in "" | 0) continue ;; esac
+            exe=$(readlink "/proc/$pid/exe") || { echo "$u: could not read the binary of pid $pid"; exit 4; }
+            case "$exe" in
+                *" (deleted)") echo "$u (pid $pid) is running a replaced binary: $exe"; exit 1 ;;
+            esac
+            got=$(stat -L -c "%d:%i" "/proc/$pid/exe") || { echo "$u: could not stat pid $pid"; exit 4; }
+            test "$got" = "$want" || { echo "$u (pid $pid) runs $exe, not the installed /usr/bin/billet"; exit 1; }
+            echo "$u (pid $pid) runs the installed binary"
+            checked=$((checked + 1))
+        done
+        test "$checked" -gt 0 || { echo "no billet service has a running process"; exit 3; }
+    '
+}
+
 # rehearsal_wait_for polls a command in a host until it succeeds or the
 # deadline (seconds) passes. The command's success is the condition.
 rehearsal_wait_for() {

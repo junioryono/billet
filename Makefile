@@ -541,17 +541,17 @@ restore-rehearsal: dist ## Back a deployment up and restore it onto a packaged L
 
 .PHONY: postgres-restore-rehearsal
 postgres-restore-rehearsal: dist ## Rehearse a restore of a deployment whose ledger is in PostgreSQL
-	@# ITS OWN TARGET, NOT A FLAG ON THE ONE ABOVE. On this profile billet archives
-	@# HALF a deployment on purpose — the ledger is pg_dump's to copy — so the
-	@# archive is a different schema, the entry set is one short, and two of the
-	@# restore's refusals exist only here. It is also the profile where the archive
-	@# matters most: control-plane-postgres has no ledger volume by design, so that
-	@# archive is the only copy of the deployment's identity there is.
+	@# ITS OWN TARGET, NOT A FLAG ON THE ONE ABOVE. On this profile the ledger
+	@# travels as pg_dump's copy (archive schema 4) and comes back three ways the
+	@# SQLite rehearsal never takes: kept in the database that survived the host,
+	@# restored by pg_restore into a database that never held it, and replaced in
+	@# place by a recovery. It is also the profile where the archive matters most:
+	@# control-plane-postgres has no ledger volume by design.
 	scripts/test-postgres-restore-rehearsal.sh
 
 # THE REAL-HOST REHEARSALS. Each drives a path that was proved only against a
 # fake onto packaged hosts under real systemd in throwaway containers, and
-# asserts on what the hosts hold afterwards (scripts/rehearsal-lib.sh). All five
+# asserts on what the hosts hold afterwards (scripts/rehearsal-lib.sh). All six
 # need a config with a working GitHub App (BILLET_REHEARSAL_APP_CONFIG) and the
 # key it names (BILLET_REHEARSAL_APP_KEY), because a control plane will not start
 # without one; they SKIP rather than fail without it. Outside `check` for that
@@ -568,6 +568,10 @@ rollout-rehearsal: ## Move two packaged hosts from one PUBLISHED release to the 
 .PHONY: recover-rehearsal
 recover-rehearsal: dist ## Recover a deployment a real control plane served, restart it sealed, and prove the node comes back
 	scripts/recover-rehearsal.sh
+
+.PHONY: restore-first-start-rehearsal
+restore-first-start-rehearsal: dist ## Restore a served deployment onto a host that never saw it, start it with local up, and prove the node is served
+	scripts/restore-first-start-rehearsal.sh
 
 .PHONY: ca-rotation-rehearsal
 ca-rotation-rehearsal: dist ## Rotate and retire the node-wire authority across two nodes that renew twenty-minute leaves
