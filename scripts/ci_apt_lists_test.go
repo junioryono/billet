@@ -115,6 +115,26 @@ func usesAptOrAGate(script string) bool {
 	return false
 }
 
+// WHAT NEEDS THE PACKAGE LISTS: an install, or a gate script, which installs
+// what its scenario needs; a step that does neither does not.
+func TestUsesAptOrAGateSeesAnInstallOrAGate(t *testing.T) {
+	t.Parallel()
+
+	for script, want := range map[string]bool{
+		"scripts/gates/scenario.sh alert-lifecycle\n":       true,
+		"  scripts/gates/terraform.sh lint\n":               true,
+		"sudo apt-get install -y python3-apt\n":             true,
+		"sudo apt install -y jq\n":                          true,
+		"echo hi\n":                                         false,
+		"python3 scripts/check-retirement-shards.py\n":      false,
+		"echo see scripts/gates/scenario.sh for the list\n": false,
+	} {
+		if got := usesAptOrAGate(script); got != want {
+			t.Errorf("usesAptOrAGate(%q) = %v, want %v", script, got, want)
+		}
+	}
+}
+
 // THE PREDICATE IS ITSELF A GATE, so the shapes it must refuse are tested: the
 // step that hid the update behind python3-apt's early exit, a conditional step,
 // one that swallows its failure, one without the check or with it in the wrong

@@ -512,8 +512,16 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 
 				mustWrite(t, dir, tc.path, "changed\n")
 			})
-			if got, stderr := runScope(t, dir, "pull_request"); got != tc.want {
+			got, stderr := runScope(t, dir, "pull_request")
+			if got != tc.want {
 				t.Fatalf("%s selected %q (%q), want %q", tc.path, got, stderr, tc.want)
+			}
+
+			// A row that selects everything does so by the rule it names, not by
+			// falling through to the path no rule names, which answers the same.
+			unnamed := tc.path == "scripts/some-new-gate.sh" || tc.path == "vendor.txt"
+			if strings.Contains(stderr, "no rule names") != unnamed {
+				t.Errorf("%s: no rule names it is %v, want %v (%q)", tc.path, !unnamed, unnamed, stderr)
 			}
 		})
 	}

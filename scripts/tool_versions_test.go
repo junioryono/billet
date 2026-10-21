@@ -118,9 +118,10 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 		}
 	}
 
-	// LOADED BEFORE IT IS USED, IN EVERY JOB THAT USES IT: $GITHUB_ENV reaches
-	// only the steps after the one that writes it, so a loader after its first use
-	// leaves that use an empty version. The loader is unconditional, and a job
+	// LOADED BEFORE IT IS USED, IN EVERY JOB THAT USES IT, whether a step's run,
+	// its with or its env names it: $GITHUB_ENV reaches only the steps after the
+	// one that writes it, so a loader after its first use leaves that use an
+	// empty version. The loader is unconditional, and a job
 	// that names no pinned version needs none.
 	var workflow struct {
 		Jobs map[string]struct {
@@ -128,6 +129,7 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 				If   string         `yaml:"if"`
 				Run  string         `yaml:"run"`
 				With map[string]any `yaml:"with"`
+				Env  map[string]any `yaml:"env"`
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
@@ -148,7 +150,11 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 
 			text := step.Run
 			for _, value := range step.With {
-				text += fmt.Sprint(value)
+				text += " " + fmt.Sprint(value)
+			}
+
+			for _, value := range step.Env {
+				text += " " + fmt.Sprint(value)
 			}
 
 			for key := range v {

@@ -57,7 +57,7 @@ func verifyFixtureNamed(t *testing.T, name string) (dir, bin string) {
 		t.Fatal(err)
 	}
 
-	writeExecutable(t, filepath.Join(dir, "scripts", "gates", "docs.sh"), "#!/bin/sh\necho fixture docs built\n")
+	writeExecutable(t, filepath.Join(dir, "scripts", "gates", "docs.sh"), "#!/bin/sh\necho fixture docs built\nexit \"${FAKE_DOCS_STATUS:-0}\"\n")
 
 	hookGit(t, dir, "add", ".")
 	hookGit(t, dir, "commit", "-q", "-m", "base")
@@ -289,6 +289,16 @@ func TestVerifyChecksTheChangedPackagesAndNothingElse(t *testing.T) {
 		if strings.Contains(out, "go build") {
 			t.Errorf("a change with no Go in it built the module:\n%s", out)
 		}
+	})
+
+	t.Run("a docs build that fails fails the verify", func(t *testing.T) {
+		t.Parallel()
+
+		dir, bin := verifyFixture(t)
+		hookWrite(t, dir, "docs/index.rst", "Fixture\n=======\n\nMore.\n")
+
+		code, out := runVerify(t, dir, bin, "FAKE_DOCS_STATUS=1")
+		wantVerify(t, out, code, 1, "fixture docs built", "FAILED: docs")
 	})
 
 	t.Run("a deleted package still builds the module that imported it", func(t *testing.T) {

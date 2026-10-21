@@ -69,6 +69,7 @@ func TestTheTerraformModuleListIsWholeOrRefused(t *testing.T) {
 				"terraform/modules/a/modules/child/main.tf":           "",
 				"terraform/modules/a/.terraform/modules/x/main.tf":    "",
 				"terraform/modules/b/.terraform/providers/README.txt": "",
+				"terraform/modules/README.md":                         "",
 			},
 			code:   0,
 			stdout: "terraform/modules/a\nterraform/modules/b\n",
@@ -78,6 +79,15 @@ func TestTheTerraformModuleListIsWholeOrRefused(t *testing.T) {
 			files:  map[string]string{"terraform/modules/README.md": ""},
 			code:   1,
 			stderr: "no terraform modules discovered under terraform/modules",
+		},
+		{
+			name: "a module whose only .tf an init downloaded",
+			files: map[string]string{
+				"terraform/modules/a/main.tf":                      "",
+				"terraform/modules/d/.terraform/modules/x/main.tf": "",
+			},
+			code:   1,
+			stderr: "terraform module directories with no discovered .tf: terraform/modules/d",
 		},
 		{
 			name: "a module whose configuration is JSON",
