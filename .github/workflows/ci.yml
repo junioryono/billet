@@ -976,7 +976,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.package_lifecycle == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
-    timeout-minutes: 30
+    # Thirty held the two package legs; the unit sandbox leg adds a systemd
+    # container's bootstrap (two bounded apt calls) and a rebuild of dist.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
 
@@ -992,6 +994,14 @@ jobs:
 
       - name: Exercise package installation and removal
         run: make package-lifecycle
+
+      # THE UNITS STARTED, NOT READ (#174). Every packaged unit under
+      # ProtectSystem=strict runs under real systemd with its real sandbox and
+      # `billet local unit-paths --exercise` in place of its command, and the
+      # writes are judged from outside the sandbox. It needs no App, so it runs
+      # here rather than with the rehearsals that do.
+      - name: Prove the packaged units' sandboxes permit what their commands do
+        run: make unit-sandbox-check
 
       # AN UNTESTED BACKUP IS NOT A BACKUP, which ADR-001 has said since before
       # backup existed. This is the packaged-Linux half of the rehearsal: a real

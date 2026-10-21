@@ -24,6 +24,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`billet-upgrade.timer` and `billet-images-refresh.timer` are the one exception to the package enabling nothing.**
 - **Every systemctl the inspector runs is bounded, and a stop or a start runs under the caller's deadline from the unit's own bound.**
 - **The rehearsals drive the packaged units on real systemd in containers.**
+- **A strict unit's sandbox is proved by starting the unit, never by reading it, and the paths come from billet (#174).**
 
 ### launchd: [references/launchd.md](references/launchd.md)
 

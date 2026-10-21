@@ -150,6 +150,16 @@ The privileged bootstrap the package's postinstall, `billet local up` and the ho
 | `--wait` | how long to wait for a lock another billet holds (default `1m`) |
 | `--json` | print the answer as JSON |
 
+### `billet local unit-paths`
+
+Say which host paths the command a shipped systemd unit runs needs, and how (Linux): `billet local unit-paths [--json] <unit>` for `billet-images-refresh.service`, `billet-node.service`, `billet-server.service` or `billet-backup.service`, the units whose sandbox is `ProtectSystem=strict`. Each path is `read` (a file it opens), `write` (a directory it creates entries in), `private` (a directory in the unit's own `PrivateTmp`, whose writes never reach the host's) or `lock` (a lock it takes), with what the command does there; a lock named for a deployment identity the host has not minted yet is said to be unknown. Every path is built by the functions the command itself calls, so it is the list a drop-in that narrows or widens a unit's sandbox has to keep permitting. With `--exercise` it performs each access the way the command does, creating what the command would create, and exits non-zero naming every path it could not reach: run as a unit's `ExecStart` in place of its command, it proves that unit's real sandbox permits what the command does, which is what `make unit-sandbox-check` does with the packaged units on real systemd.
+
+| Flag | Meaning |
+|---|---|
+| `--json` | print the paths as JSON |
+| `--exercise` | perform each access instead of reporting it |
+| `--marker` | with `--exercise`, leave a file of this name in each writable directory, so whoever is outside the unit's sandbox can see where the write landed |
+
 ### `billet local backup|restore|recover`
 
 Capture a deployment as one unit, put it back as one unit or not at all, or put it back over itself. [Backup, restore and recover](../operating/backup-restore-recover.md).

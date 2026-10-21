@@ -72,11 +72,7 @@ func takeProbeLock(dir, deployment string) (*probeLock, error) {
 		return nil, fmt.Errorf("billet images verify: refusing to lock: %w", err)
 	}
 
-	if dir == "" {
-		dir = "/var/lock"
-	}
-
-	path := filepath.Join(dir, "billet-imageverify-"+deployment+".lock")
+	path := probeLockPath(dir, deployment)
 
 	var lost error
 
@@ -85,7 +81,8 @@ func takeProbeLock(dir, deployment string) (*probeLock, error) {
 		if errors.Is(err, errProbeLockContended) {
 			return nil, fmt.Errorf("billet images verify: another verification is already "+
 				"running on this machine, and two would be the same microVM — the second one's "+
-				"cleanup would destroy the first one's probe. Wait for it, or look at %s", path)
+				"cleanup would destroy the first one's probe. Wait for it, or look at %s: %w",
+				path, errProbeLockContended)
 		}
 
 		if err != nil {
@@ -106,6 +103,17 @@ func takeProbeLock(dir, deployment string) (*probeLock, error) {
 	}
 
 	return nil, lost
+}
+
+// probeLockPath is the one spelling of the verification lock's path, which
+// takeProbeLock locks and RefreshPaths declares: the node's lock directory, or
+// /var/lock when the configuration names none.
+func probeLockPath(dir, deployment string) string {
+	if dir == "" {
+		dir = "/var/lock"
+	}
+
+	return filepath.Join(dir, "billet-imageverify-"+deployment+".lock")
 }
 
 // lockName opens the lock file at path, creating it and its directory, and

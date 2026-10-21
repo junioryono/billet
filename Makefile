@@ -539,6 +539,13 @@ host-fresh-check: ## Check-mode converge of the host role against a FRESH machin
 package-lifecycle: dist ## Install and remove both Linux packages without losing operator state
 	scripts/test-package-lifecycle.sh
 
+.PHONY: unit-sandbox-check
+unit-sandbox-check: dist ## Start every strict packaged unit under real systemd and prove its sandbox permits what its command does
+	@# Outside `check` because it needs privileged docker and the package `dist`
+	@# builds. It needs no GitHub App: every unit runs `billet local unit-paths
+	@# --exercise` in place of its command, which contacts nothing (#174).
+	scripts/test-unit-sandboxes.sh
+
 .PHONY: restore-rehearsal
 restore-rehearsal: dist ## Back a deployment up and restore it onto a packaged Linux host that has never seen it
 	@# AN UNTESTED BACKUP IS NOT A BACKUP (ADR-001), and until this existed the

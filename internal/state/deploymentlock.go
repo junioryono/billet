@@ -51,6 +51,13 @@ type LockOptions struct {
 	AllowUnplaceable bool
 }
 
+// DeploymentLockName is the file the host-wide lock for an identity is, inside
+// its lock directory: the one spelling LockDeployment locks and a unit's
+// declared paths name.
+func DeploymentLockName(id string) string {
+	return "deployment-" + id + ".lock"
+}
+
 // LockDeployment takes the host-wide lock for a deployment identity.
 //
 // FAILING TO PLACE THE LOCK IS AN ERROR, and it did not used to be. The first
@@ -140,7 +147,7 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		return unplaceable(opts, err.Error())
 	}
 
-	name := "deployment-" + id + ".lock"
+	name := DeploymentLockName(id)
 	path := filepath.Join(dir, name)
 
 	lock, err := lockFileIn(dirf, name, path, shared, gid)

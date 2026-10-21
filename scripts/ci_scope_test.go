@@ -462,7 +462,9 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{".goreleaser.yaml", "package_lifecycle"},
 		{"billet.example.yaml", "package_lifecycle"},
 		{"scripts/restore-rehearsal.sh", "package_lifecycle"},
-		{"scripts/mkreleasemanifest/main.go", families("package_lifecycle", "lint", "postgres")},
+		{"scripts/test-unit-sandboxes.sh", "package_lifecycle"},
+		{"scripts/unit-sandboxes.sh", "package_lifecycle"},
+		{"scripts/mkreleasemanifest/main.go", families("host_lifecycle", "package_lifecycle", "lint", "postgres")},
 		// Terraform: every module selects plan and lint, only the billet module
 		// the consumer floor, and the hybrid root check selects plan alone.
 		{"terraform/modules/fleet-ec2/main.tf", families("terraform", "terraform_lint")},
