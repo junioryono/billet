@@ -317,6 +317,9 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := recordHybridGeneration(*out, gen); err != nil {
+		return err
+	}
 
 	report := env.Stdout
 	fmt.Fprintf(report, "Wrote the %s render of the hybrid shape into %s:\n", hybridRenderName(p), *out)
@@ -644,7 +647,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	fmt.Fprintf(&b, "# Bringing up the %s hybrid deployment\n\n", p.Name)
 	b.WriteString("One `runs-on` label means the machine at home if it is up and EC2 if it is not, with a small always-on controller. These are the steps between the files billet wrote, in the order they depend on each other, and every command runs from this directory. Every converge names one host with `-l`, because a bare run reaching a host before its certificate exists fails at `billet check` after a wasted drain.\n\n")
 	fmt.Fprintf(&b, "The tiers are %s\n\n", trust)
-	fmt.Fprintf(&b, "This generation is `%s`. The Terraform root declares it as the `generation` output and every render command below carries it as `--generation`, so a later render refuses outputs another root wrote even when their name and region match. A render also compares the `account_id` output with the account its own AWS credentials are in, and says so when it cannot ask.\n\n", p.Generation)
+	fmt.Fprintf(&b, "This generation is `%s`, recorded in `%s` beside this file. The Terraform root declares it as the `generation` output and every render command below carries it as `--generation`, so a later render refuses outputs another root wrote even when their name and region match. A render also compares the `account_id` output with the account its own AWS credentials are in, and says so when it cannot ask.\n\n", p.Generation, HybridGenerationFile)
 
 	b.WriteString("## 1. Mint the GitHub App\n\n")
 	if carried {

@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/initconfig"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // hybridAccountWait bounds the one STS call a later render makes. A render is
@@ -40,15 +42,22 @@ func accountOf(ctx context.Context, sts *awssts.Client) (string, error) {
 	return id.Account, nil
 }
 
+// HybridGenerationFile is where a generation keeps its fingerprint, in --out
+// beside the files it renders: one line, written once and never replaced.
+const HybridGenerationFile = "GENERATION"
+
 // resolveHybridGeneration decides the fingerprint this render carries: the
-// flag, then the root already in --out, then, on a plan render only, a fresh
-// one.
+// flag, then the GENERATION file a render already wrote into --out, then, on a
+// plan render only, a fresh one.
 //
-// THE ROOT IN --out IS READ WHOEVER WROTE IT. The marker rule decides which
-// files a re-run may replace, and a root an operator edited lands beside as
-// .new; either way the fingerprint it declares is the one its outputs carry, so
-// a re-run of the plan render and --force both keep it rather than starting
-// another generation under the same directory.
+// A FILE BILLET OWNS, NOT THE ROOT. The root declares the fingerprint as an
+// output, because the outputs must carry it, but reading it back out of HCL
+// means parsing a language billet has no parser for, and a lexical reader was
+// tried and withdrawn after four reviews each found valid HCL it misread. The
+// file is outside the marker rule, so a re-run of the plan render and --force
+// both keep it. Every way of reading it wrongly fails safe: a render accepts
+// outputs only when their generation equals its own, which no misread can
+// produce for another root's outputs.
 func resolveHybridGeneration(out, flag string, flagSet, later bool) (string, error) {
 	if flagSet {
 		if err := initconfig.CheckHybridGeneration(flag); err != nil {
@@ -56,49 +65,96 @@ func resolveHybridGeneration(out, flag string, flagSet, later bool) (string, err
 		}
 	}
 
-	root := filepath.Join(out, initconfig.HybridTerraformFile)
-
-	var declared string
-
-	raw, err := os.ReadFile(root)
-	switch {
-	case err == nil:
-		g, found, err := initconfig.HybridGenerationOf(string(raw))
-		if err != nil {
-			return "", fmt.Errorf("%s: %w", root, err)
-		}
-		if found {
-			declared = g
-		}
-	case !errors.Is(err, os.ErrNotExist):
-		return "", fmt.Errorf("read %s for its generation: %w", root, err)
+	recorded, err := readHybridGeneration(out)
+	if err != nil {
+		return "", err
 	}
 
 	switch {
-	case flagSet && declared != "" && declared != flag:
-		return "", fmt.Errorf("--generation %s and the root in %s, which declares %s, are two "+
-			"generations: one directory holds one. Render into another --out, or drop "+
-			"--generation to keep the root's", flag, out, declared)
+	case flagSet && recorded != "" && recorded != flag:
+		return "", fmt.Errorf("--generation %s and %s, which records %s, are two generations: one "+
+			"directory holds one. Render into another --out, or drop --generation to keep the one "+
+			"recorded", flag, filepath.Join(out, HybridGenerationFile), recorded)
 	case flagSet:
 		return flag, nil
-	case declared != "":
-		return declared, nil
+	case recorded != "":
+		return recorded, nil
 	case later:
 		// WHERE A ROOT FROM BEFORE THE FINGERPRINT LANDS, since neither its
-		// runbook nor its root has one, so the way through is said here too.
+		// runbook nor its directory has one, so the way through is said here too.
 		return "", fmt.Errorf("this render reads --terraform-output, and nothing says which generation "+
 			"those outputs must belong to: pass --generation as the runbook prints it, or point "+
-			"--out at the directory whose %s declares it. A root rendered before billet minted "+
-			"fingerprints declares none: run the plan render into a scratch --out with the same "+
+			"--out at the directory whose %s records it. A root rendered before billet minted "+
+			"fingerprints has neither: run the plan render into a scratch --out with the same "+
 			"flags, copy its %q and %q output blocks into your root and nothing else, check that "+
 			"`terraform plan` adds only those two outputs, apply, save `terraform output -json` "+
 			"again, and pass --generation with the value you copied. A root that still begins with "+
 			"billet's marker is replaced whole by the next render; remove the marker from one you "+
 			"want kept",
-			initconfig.HybridTerraformFile, initconfig.HybridOutputGeneration, initconfig.HybridOutputAccountID)
+			HybridGenerationFile, initconfig.HybridOutputGeneration, initconfig.HybridOutputAccountID)
 	}
 
 	return initconfig.NewHybridGeneration()
+}
+
+// readHybridGeneration is the fingerprint --out's GENERATION records, or ""
+// when there is none. A file that is there and cannot be read, or does not hold
+// a fingerprint, is an error, never none.
+func readHybridGeneration(out string) (string, error) {
+	path := filepath.Join(out, HybridGenerationFile)
+
+	raw, err := regularfile.ReadFile(path, 256, regularfile.Options{NoFollow: true})
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+
+	g := strings.TrimSuffix(string(raw), "\n")
+	if err := initconfig.CheckHybridGeneration(g); err != nil {
+		return "", fmt.Errorf("%s does not hold one generation fingerprint: %w", path, err)
+	}
+
+	return g, nil
+}
+
+// recordHybridGeneration writes --out's GENERATION when it has none.
+//
+// AFTER THE RENDER'S FILES, so a render that failed leaves no fingerprint
+// claiming a directory it never wrote; a failure here, after the files landed,
+// is said, because the next render would otherwise mint another. EXCLUSIVE, so
+// two renders racing into one directory cannot both write one: the loser finds
+// the winner's and is refused unless it is the same.
+func recordHybridGeneration(out, g string) error {
+	path := filepath.Join(out, HybridGenerationFile)
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if errors.Is(err, os.ErrExist) {
+		recorded, err := readHybridGeneration(out)
+		if err != nil {
+			return err
+		}
+		if recorded != g {
+			return fmt.Errorf("%s records %s while this render wrote generation %s: another render "+
+				"into the same --out got there first; render again, which keeps the one recorded",
+				path, recorded, g)
+		}
+
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("record the generation in %s (the files were written; until it exists, "+
+			"pass --generation %s on every render): %w", path, g, err)
+	}
+
+	if _, err := f.WriteString(g + "\n"); err != nil {
+		_ = f.Close()
+
+		return fmt.Errorf("record the generation in %s: %w", path, err)
+	}
+
+	return f.Close()
 }
 
 // bindHybridOutputs refuses outputs another root wrote, before a single

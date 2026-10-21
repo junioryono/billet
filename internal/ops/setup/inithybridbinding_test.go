@@ -95,7 +95,7 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // hybridArgsMinting is hybridArgs without --generation, so the plan render
-// resolves one itself: from the root in --out, or a fresh one.
+// resolves one itself: from --out's GENERATION, or a fresh one.
 func hybridArgsMinting(out, cfg string) []string {
 	args := hybridArgs(out, cfg)
 	i := slices.Index(args, "--generation")
@@ -103,13 +103,17 @@ func hybridArgsMinting(out, cfg string) []string {
 	return slices.Delete(args, i, i+2)
 }
 
-// rootGeneration is the fingerprint the root in out declares.
+// rootGeneration is the fingerprint out's GENERATION records, held to the
+// root's own declaration of it: the two are written by one render.
 func rootGeneration(t *testing.T, out string) string {
 	t.Helper()
 
-	g, found, err := initconfig.HybridGenerationOf(readHybrid(t, out, initconfig.HybridTerraformFile))
-	if err != nil || !found {
-		t.Fatalf("the root in %s declares no generation (found %v, %v)", out, found, err)
+	g := strings.TrimSuffix(readHybrid(t, out, HybridGenerationFile), "\n")
+	if err := initconfig.CheckHybridGeneration(g); err != nil {
+		t.Fatalf("%s/%s: %v", out, HybridGenerationFile, err)
+	}
+	if root := readHybrid(t, out, initconfig.HybridTerraformFile); !strings.Contains(root, `value       = "`+g+`"`) {
+		t.Fatalf("the root in %s does not declare the generation %s its %s records", out, g, HybridGenerationFile)
 	}
 
 	return g
@@ -154,12 +158,13 @@ func writeOutputs(t *testing.T, dir, generation string) string {
 }
 
 // THE GENERATION SURVIVES A RE-RUN OF THE PLAN RENDER AND --force (#62). The
-// first plan render mints it; every later one into the same --out reads it back
-// from the root, so the outputs of the one apply keep matching. A fresh mint on
-// the second run would refuse the apply's outputs at the prepare render.
+// first plan render mints it and records it in GENERATION; every later one into
+// the same --out reads it back, so the outputs of the one apply keep matching.
+// A fresh mint on the second run would refuse the apply's outputs at the
+// prepare render.
 //
-// Mutation: dropping the read of the existing root makes the second render
-// mint another fingerprint, and this fails.
+// Mutation: dropping the read of GENERATION makes the second render mint
+// another fingerprint, and this fails.
 func TestInitHybridKeepsItsGenerationAcrossReRuns(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "acme-ci")
@@ -194,7 +199,7 @@ func TestInitHybridKeepsItsGenerationAcrossReRuns(t *testing.T) {
 	assertEveryRenderCarries(t, "the runbook", readHybrid(t, out, HybridRunbookFile), minted, 3)
 	assertEveryRenderCarries(t, "stdout", printed, minted, 1)
 
-	// And a prepare render with no flag at all reads it from the root and
+	// And a prepare render with no flag at all reads it from GENERATION and
 	// accepts the outputs of that root.
 	outputs := writeOutputs(t, dir, minted)
 	if _, err := runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--terraform-output", outputs)...); err != nil {
@@ -202,10 +207,10 @@ func TestInitHybridKeepsItsGenerationAcrossReRuns(t *testing.T) {
 	}
 }
 
-// AN OPERATOR'S OWN ROOT STILL NAMES THE GENERATION: a root that is not
-// billet's own is left alone and the fresh render goes beside it, and the
-// fingerprint it declares is the one its outputs carry.
-func TestInitHybridReadsTheGenerationOfAForeignRoot(t *testing.T) {
+// AN OPERATOR'S OWN ROOT KEEPS THE GENERATION: a root that is not billet's own
+// is left alone and the fresh render goes beside it, carrying the fingerprint
+// GENERATION records, which is the one the operator's root declares.
+func TestInitHybridKeepsTheGenerationBesideAForeignRoot(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "acme-ci")
 	cfg := filepath.Join(dir, "none.yaml")
@@ -233,9 +238,46 @@ func TestInitHybridReadsTheGenerationOfAForeignRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the fresh root did not land beside the operator's: %v", err)
 	}
-	g, found, err := initconfig.HybridGenerationOf(string(beside))
-	if err != nil || !found || g != minted {
-		t.Errorf("the render beside the operator's root carries (%q, %v, %v), want %s", g, found, err, minted)
+	if !strings.Contains(string(beside), `value       = "`+minted+`"`) {
+		t.Errorf("the render beside the operator's root does not carry the generation %s", minted)
+	}
+}
+
+// A GENERATION FILE THAT DOES NOT HOLD A FINGERPRINT IS AN ERROR, never none,
+// and a record already there is never replaced by another.
+func TestInitHybridRefusesAnUnreadableOrOtherRecord(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	if err := os.MkdirAll(out, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(out, HybridGenerationFile)
+
+	if err := os.WriteFile(record, []byte("not a fingerprint\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runInitHybrid(t, hybridArgsMinting(out, cfg)...); err == nil ||
+		!strings.Contains(err.Error(), HybridGenerationFile) {
+		t.Fatalf("a GENERATION holding no fingerprint was not refused by name: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, initconfig.HybridTerraformFile)); !os.IsNotExist(statErr) {
+		t.Errorf("the refused render wrote a root (stat: %v)", statErr)
+	}
+
+	// The record stands: a render that resolved another generation (a race
+	// into one directory) cannot replace it.
+	if err := os.WriteFile(record, []byte(testGeneration+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordHybridGeneration(out, "fedc-ba98-7654-3210"); err == nil {
+		t.Error("a second generation replaced the one recorded")
+	}
+	if err := recordHybridGeneration(out, testGeneration); err != nil {
+		t.Errorf("recording the generation already recorded was refused: %v", err)
+	}
+	if got, err := os.ReadFile(record); err != nil || string(got) != testGeneration+"\n" {
+		t.Errorf("the record now reads %q (%v), want %s", got, err, testGeneration)
 	}
 }
 
@@ -305,6 +347,10 @@ func TestInitHybridGivesAnOldRootTheWayThrough(t *testing.T) {
 		t.Fatal("the rendered root no longer declares the generation output this case removes")
 	}
 	if err := os.WriteFile(root, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// And no record: a directory a release before the fingerprint wrote.
+	if err := os.Remove(filepath.Join(out, HybridGenerationFile)); err != nil {
 		t.Fatal(err)
 	}
 
