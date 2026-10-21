@@ -583,6 +583,7 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 		dir     func(t *testing.T) string
 		env     func(t *testing.T) []string
 		ok      bool
+		want    string
 		uploads []string
 		absent  []string
 	}{
@@ -744,6 +745,9 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 			// AN awk THAT FAILS INTO A SORT IS AN EMPTY SET under dash, and an
 			// empty set of reviewed sources hides the GNU one marked reviewed.
 			name: "an extraction that fails beside a GNU-licensed source marked reviewed",
+			// THE REFUSAL IS THE EXTRACTION'S, not the comparison's that would
+			// refuse this index anyway.
+			want: "could not read the sources image-sources.tsv needs",
 			dir: func(t *testing.T) string {
 				t.Helper()
 
@@ -818,6 +822,9 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 				t.Fatalf("publication success = %v, want %v\n%s\n%s", ok, tc.ok, out, calls)
 			}
 			if !tc.ok {
+				if tc.want != "" && !strings.Contains(out, tc.want) {
+					t.Errorf("the publication was refused without saying %q:\n%s", tc.want, out)
+				}
 				for _, call := range []string{"git tag", "git push", "release create"} {
 					if strings.Contains(calls, call) {
 						t.Errorf("a refused publication still ran %q:\n%s", call, calls)
