@@ -475,7 +475,7 @@ func writeSourceArchive(t *testing.T, dir, index string, parts int) {
 
 // runPublisher runs publish-guest-release.sh against DIR with git and gh stubbed,
 // and returns its output, whether it succeeded, and the calls it made.
-func runPublisher(t *testing.T, dir string) (string, bool, string) {
+func runPublisher(t *testing.T, dir string, env ...string) (string, bool, string) {
 	t.Helper()
 
 	publisher, err := filepath.Abs("publish-guest-release.sh")
@@ -490,6 +490,12 @@ func runPublisher(t *testing.T, dir string) (string, bool, string) {
 	cmd := exec.CommandContext(t.Context(), publisher, dir)
 	cmd.Env = append(os.Environ(), "PATH="+tools+":"+os.Getenv("PATH"), "BILLET_TEST_CALLS="+calls,
 		"GITHUB_REPOSITORY=junioryono/billet", "SOURCE_SHA="+strings.Repeat("a", 40), "TAG=guest-20260821-000000")
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			e = "PATH=" + strings.TrimPrefix(e, "PATH=") + ":" + tools + ":" + os.Getenv("PATH")
+		}
+		cmd.Env = append(cmd.Env, e)
+	}
 	out, err := cmd.CombinedOutput()
 	if exit := (*exec.ExitError)(nil); err != nil && !errors.As(err, &exit) {
 		t.Fatalf("the publisher did not run: %v\n%s", err, out)
@@ -510,7 +516,7 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 	t.Parallel()
 
 	manifest := `{"schema": 1, "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST:rootfs.img.zst", "size": 1},
-  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}}`
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1, "version": "6.1.155"}}`
 	fresh := func(t *testing.T) string {
 		t.Helper()
 
@@ -547,6 +553,7 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		dir     func(t *testing.T) string
+		env     func(t *testing.T) []string
 		ok      bool
 		uploads []string
 		absent  []string
@@ -669,6 +676,71 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 			},
 		},
 		{
+			// THE OUTPUT DIRECTORY'S OWN PATH IS ANYTHING: only the part names
+			// are checked, and the archive is read from inside it.
+			name: "an archive in parts under a directory whose path has a space", ok: true,
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				dir := split(t, 2)
+				spaced := filepath.Join(t.TempDir(), "release files")
+				if err := os.Rename(dir, spaced); err != nil {
+					t.Fatal(err)
+				}
+
+				return spaced
+			},
+			uploads: []string{"/release files/image-sources.tar.part000", "/release files/image-sources.tar.part001"},
+		},
+		{
+			name: "the source of a kernel other than the image's",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return edit(t, fresh(t), "manifest.json", func(s string) string {
+					return strings.Replace(s, `"version": "6.1.155"`, `"version": "6.1.156"`, 1)
+				})
+			},
+		},
+		{
+			name: "a manifest naming no kernel version",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return edit(t, fresh(t), "manifest.json", func(s string) string {
+					return strings.Replace(s, `, "version": "6.1.155"`, ``, 1)
+				})
+			},
+		},
+		{
+			// A comm THAT FAILS SAYS NOTHING, and nothing is not "no GNU source
+			// marked reviewed".
+			name: "a comparison that fails",
+			dir:  fresh,
+			env: func(t *testing.T) []string {
+				t.Helper()
+
+				bin := t.TempDir()
+				writeExecutable(t, filepath.Join(bin, "comm"), "#!/bin/sh\nexit 2\n")
+
+				return []string{"PATH=" + bin}
+			},
+		},
+		{
+			name: "one of two GNU-licensed sources marked reviewed",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				dir := fresh(t)
+				dir = edit(t, dir, "image-sources.tsv", func(s string) string {
+					return s + "zlib1g\tamd64\t1:1.3\tzlib\t1:1.3\tarchive.ubuntu.com\tgnu\n"
+				})
+				writeSourceArchive(t, dir, indexLines[0]+"\n"+indexLines[1]+"\n"+indexLines[2]+"\nzlib\t1:1.3\treviewed\t-\t-\t-\n", 0)
+
+				return dir
+			},
+		},
+		{
 			name: "an index without the kernel's source",
 			dir: func(t *testing.T) string {
 				t.Helper()
@@ -683,7 +755,11 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			out, ok, calls := runPublisher(t, tc.dir(t))
+			var env []string
+			if tc.env != nil {
+				env = tc.env(t)
+			}
+			out, ok, calls := runPublisher(t, tc.dir(t), env...)
 			if ok != tc.ok {
 				t.Fatalf("publication success = %v, want %v\n%s\n%s", ok, tc.ok, out, calls)
 			}

@@ -291,7 +291,7 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
       {"name": "rootfs.img.zst.part001", "sha256": "DIGEST:rootfs.img.zst.part001", "size": 1}
     ]
   },
-  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1, "version": "6.1.155"}
 }`
 
 	for _, tc := range []struct {
@@ -569,7 +569,7 @@ exit 97
 			cmd := exec.CommandContext(t.Context(), publisher, publishDir(t, `{
   "schema": 1,
   "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST:rootfs.img.zst", "size": 1},
-  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1, "version": "6.1.155"}
 }`, "rootfs.img.zst", "vmlinux-billet"))
 			cmd.Env = append(os.Environ(),
 				"PATH="+tools+":"+os.Getenv("PATH"),

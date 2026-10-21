@@ -121,6 +121,9 @@ if [ "$name" != image-sources.tar ] || [ -n "$extra" ] ||
 fi
 
 sed 1d "$out/image-sources.parts" >"$scratch/parts"
+# THE ARCHIVE BY ITS FILE NAMES ALONE, each checked against the one pattern a
+# part may have, so the list splits safely on spaces and is read from inside $out,
+# whatever $out's own path holds.
 archive=''
 n=0
 # A LAST LINE WITH NO NEWLINE IS A PART TOO: read fails on it while still setting
@@ -144,28 +147,27 @@ while read -r part want rest || [ -n "$part" ]; do
         printf '%s is not the part image-sources.parts describes (sha256 %s, want %s)\n' "$part" "$got" "$want" >&2
         exit 2
     fi
-    archive="$archive $out/$part"
+    archive="$archive $part"
     n=$((n + 1))
 done <"$scratch/parts"
 if [ "$n" -eq 0 ]; then
-    archive="$out/image-sources.tar"
-    if [ ! -r "$archive" ]; then
+    archive=image-sources.tar
+    if [ ! -r "$out/$archive" ]; then
         printf 'image-sources.parts names the whole archive and the build did not produce it\n' >&2
         exit 2
     fi
 fi
 
-# The part names are checked above, so splitting $archive on spaces is safe.
 # shellcheck disable=SC2086
-got=$(cat $archive | sha256sum | cut -d ' ' -f 1)
+got=$(cd "$out" && cat $archive | sha256sum | cut -d ' ' -f 1)
 # shellcheck disable=SC2086
-length=$(cat $archive | wc -c | tr -d ' ')
+length=$(cd "$out" && cat $archive | wc -c | tr -d ' ')
 if [ "$got" != "$whole" ] || [ "$length" != "$size" ]; then
     printf 'the source archive'"'"'s parts are not the archive image-sources.parts describes (sha256 %s, %s bytes; want %s, %s bytes)\n' "$got" "$length" "$whole" "$size" >&2
     exit 2
 fi
 # shellcheck disable=SC2086
-if ! cat $archive | tar -xOf - ./index.tsv >"$scratch/index" ||
+if ! (cd "$out" && cat $archive) | tar -xOf - ./index.tsv >"$scratch/index" ||
     ! cmp -s "$scratch/index" "$out/image-sources-index.tsv"; then
     printf 'image-sources-index.tsv is not the index the source archive carries\n' >&2
     exit 2
@@ -177,17 +179,26 @@ awk -F '\t' 'NR > 1 && $7 == "gnu" { print $4 "\t" $5 }' "$out/image-sources.tsv
 awk -F '\t' 'NR > 1 && $1 != "guest-kernel" && ($3 == "fetched" || $3 == "reviewed") { print $1 "\t" $2 }' \
     "$out/image-sources-index.tsv" | LC_ALL=C sort -u >"$scratch/indexed"
 awk -F '\t' 'NR > 1 && $3 == "reviewed" { print $1 "\t" $2 }' "$out/image-sources-index.tsv" | LC_ALL=C sort -u >"$scratch/reviewed"
-kernels=$(awk -F '\t' 'NR > 1 && $1 == "guest-kernel" && $3 == "fetched" { print $2 }' "$out/image-sources-index.tsv" | sort -u | wc -l | tr -d ' ')
-if ! cmp -s "$scratch/needed" "$scratch/indexed" || [ -n "$(comm -12 "$scratch/reviewed" "$scratch/gnu")" ] ||
-    [ "$kernels" != 1 ] || [ ! -s "$scratch/needed" ]; then
-    printf 'image-sources-index.tsv does not account for exactly the sources image-sources.tsv needs, and the kernel'"'"'s\n' >&2
+# THE KERNEL'S SOURCE IS THE KERNEL THE MANIFEST NAMES, once.
+kernels=$(awk -F '\t' 'NR > 1 && $1 == "guest-kernel" && $3 == "fetched" { print $2 }' "$out/image-sources-index.tsv" | LC_ALL=C sort -u)
+kernel=$(jq -r '.kernel.version // empty' "$out/manifest.json")
+# A FAILED comm IS NOT AN EMPTY ONE: its status is checked before its output is
+# read, and it collates as the sorts above did.
+if ! LC_ALL=C comm -12 "$scratch/reviewed" "$scratch/gnu" >"$scratch/reviewed-gnu"; then
+    printf 'could not compare the reviewed sources with the GNU-licensed ones, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+if ! cmp -s "$scratch/needed" "$scratch/indexed" || [ -s "$scratch/reviewed-gnu" ] ||
+    [ -z "$kernel" ] || [ "$kernels" != "$kernel" ] || [ ! -s "$scratch/needed" ]; then
+    printf 'image-sources-index.tsv does not account for exactly the sources image-sources.tsv needs, and kernel %s'"'"'s\n' "${kernel:-?}" >&2
     exit 2
 fi
 
 set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv" \
     "$out/image-sources-index.tsv" "$out/image-sources.parts"
-# shellcheck disable=SC2086
-set -- "$@" $archive
+for part in $archive; do
+    set -- "$@" "$out/$part"
+done
 
 while read -r name want; do
     # A BARE FILE NAME, CHECKED HERE TOO. The Go reader validates this before a
