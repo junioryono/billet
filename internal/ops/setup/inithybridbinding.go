@@ -83,6 +83,49 @@ func lockHybridOut(out string) (func(), error) {
 	return func() { _ = f.Close() }, nil
 }
 
+// The render's seams, for a test that stages two renders interleaving: one
+// runs after the generation is resolved and before the lock is taken, the
+// other with the lock held, before the first write. Both do nothing here.
+var (
+	hybridBeforeLock = func() {}
+	hybridLocked     = func() {}
+)
+
+// recheckHybridGeneration holds the generation this render resolved to what
+// --out records now, under the lock: a render that held the lock first and
+// recorded another refuses this one, and so does a root that appeared without
+// a record (a render that died before recording it) unless this render's
+// generation was supplied, which is an adoption. Every render records before it
+// lets the lock go, so a live one is never seen half done.
+func recheckHybridGeneration(out, g string, supplied bool) error {
+	recorded, err := readHybridGeneration(out)
+	switch {
+	case err != nil:
+		return err
+	case recorded == g:
+		return nil
+	case recorded != "":
+		return fmt.Errorf("another render recorded generation %s in %s while this one rendered %s; run "+
+			"this again, which takes the one recorded", recorded, out, g)
+	case supplied:
+		return nil
+	}
+
+	root := filepath.Join(out, initconfig.HybridTerraformFile)
+	_, statErr := os.Lstat(root)
+	switch {
+	case statErr == nil:
+		return fmt.Errorf("%s appeared without a record while this render ran (another render wrote it "+
+			"and died before recording its generation), and billet will not mint a fresh one over it. "+
+			"If the root declares a %q output, pass its value as --generation", root,
+			initconfig.HybridOutputGeneration)
+	case !errors.Is(statErr, os.ErrNotExist):
+		return fmt.Errorf("check %s: %w", root, statErr)
+	}
+
+	return nil
+}
+
 // resolveHybridGeneration decides the fingerprint this render carries: the
 // flag, then the GENERATION file a render already wrote into --out, then, on a
 // plan render into a directory that holds no root yet, a fresh one.
@@ -178,6 +221,11 @@ func readHybridGeneration(out string) (string, error) {
 	return g, nil
 }
 
+// publishHybridGeneration puts the staged record at its name, failing rather
+// than replacing. A seam, so a test can observe the record before it is
+// published.
+var publishHybridGeneration = os.Link
+
 // recordHybridGeneration writes --out's GENERATION when it has none.
 //
 // AFTER THE RENDER'S FILES, so a render that failed leaves no fingerprint
@@ -214,7 +262,7 @@ func recordHybridGeneration(out, g string) error {
 			"pass --generation %s on every render): %w", path, g, err)
 	}
 
-	if err := os.Link(name, path); err != nil {
+	if err := publishHybridGeneration(name, path); err != nil {
 		if !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("record the generation in %s (the files were written; until it exists, "+
 				"pass --generation %s on every render): %w", path, g, err)

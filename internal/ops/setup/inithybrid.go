@@ -316,18 +316,19 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 	// HELD FROM HERE TO THE RECORD, AND THE GENERATION RESOLVED AGAIN UNDER IT,
 	// so two renders into one --out cannot interleave (see lockHybridOut), while
 	// every refusal above still writes nothing at all.
+	hybridBeforeLock()
+
 	unlock, err := lockHybridOut(*out)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	// AS THOUGH PASSED, because the question now is only whether a render that
-	// held the lock first recorded another; every render records before it lets
-	// go, so its root cannot be found here without its record.
-	if _, err := resolveHybridGeneration(*out, gen, true, *tfOutput != ""); err != nil {
+	if err := recheckHybridGeneration(*out, gen, setFlags["generation"]); err != nil {
 		return err
 	}
+
+	hybridLocked()
 
 	written, beside, err := writeHybridFiles(env, *out, files, *force)
 	if err != nil {

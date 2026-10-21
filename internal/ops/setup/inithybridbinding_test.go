@@ -310,13 +310,40 @@ func TestInitHybridRefusesARenderIntoADirectoryAnotherHolds(t *testing.T) {
 	}
 }
 
-// THE RECORD IS PUBLISHED WHOLE: staged under a name of its own and linked in,
-// so no partial record is ever at the name and nothing staged is left behind.
+// THE RECORD IS PUBLISHED WHOLE: at the moment it is published the name is
+// still absent and the staged file already holds the whole fingerprint, so no
+// partial record is ever at the name, and nothing staged is left behind. That
+// the staged file was synced before it is not observable here.
+//
+// Mutation: the create-then-write publication fails the first assertion in the
+// seam, since the name exists, empty, before the bytes arrive.
 func TestRecordHybridGenerationPublishesWholeAndLeavesNothing(t *testing.T) {
 	out := t.TempDir()
+	record := filepath.Join(out, HybridGenerationFile)
+
+	published := 0
+	prev := publishHybridGeneration
+	publishHybridGeneration = func(staged, name string) error {
+		published++
+		if name != record {
+			t.Errorf("published to %s, want %s", name, record)
+		}
+		if _, err := os.Lstat(record); !os.IsNotExist(err) {
+			t.Errorf("the record existed before it was published (lstat: %v)", err)
+		}
+		if got, err := os.ReadFile(staged); err != nil || string(got) != testGeneration+"\n" {
+			t.Errorf("the staged record held %q (%v) when published, want the whole fingerprint", got, err)
+		}
+
+		return prev(staged, name)
+	}
+	t.Cleanup(func() { publishHybridGeneration = prev })
 
 	if err := recordHybridGeneration(out, testGeneration); err != nil {
 		t.Fatalf("record: %v", err)
+	}
+	if published != 1 {
+		t.Fatalf("the record was published %d times, want once", published)
 	}
 
 	entries, err := os.ReadDir(out)
@@ -333,6 +360,97 @@ func TestRecordHybridGenerationPublishesWholeAndLeavesNothing(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(out, HybridGenerationFile)); err != nil || string(got) != testGeneration+"\n" {
 		t.Errorf("the record reads %q (%v)", got, err)
 	}
+}
+
+// stageHybridHook replaces one of the render's seams for one test, running fn
+// only the first time, since a render fn starts reaches the same seam.
+func stageHybridHook(t *testing.T, seam *func(), fn func()) {
+	t.Helper()
+
+	prev := *seam
+	ran := false
+	*seam = func() {
+		if !ran {
+			ran = true
+			fn()
+		}
+	}
+	t.Cleanup(func() { *seam = prev })
+}
+
+// TWO RENDERS INTO ONE --out, INTERLEAVED THROUGH THE COMMAND ITSELF.
+//
+// Held: a render that reaches a held directory is refused, which proves the
+// lock is still held at the first write (releasing it early fails this).
+// Raced: a render that resolved a fresh generation, while another rendered and
+// recorded its own before it took the lock, is refused before it writes a file
+// (dropping the re-check under the lock fails this). Died: a root that appeared
+// without a record while this render resolved is not minted over.
+func TestInitHybridSerialisesRendersIntoOneDirectory(t *testing.T) {
+	t.Run("held", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "acme-ci")
+		cfg := filepath.Join(dir, "none.yaml")
+
+		var second error
+		stageHybridHook(t, &hybridLocked, func() {
+			second = Init(t.Context(), processEnv(), append([]string{"hybrid"}, hybridArgs(out, cfg)...))
+		})
+
+		if _, err := runInitHybrid(t, hybridArgs(out, cfg)...); err != nil {
+			t.Fatalf("the first render: %v", err)
+		}
+		if second == nil || !strings.Contains(second.Error(), "another billet init hybrid") {
+			t.Fatalf("a render while the first held the directory was not refused for it: %v", second)
+		}
+	})
+
+	t.Run("raced", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "acme-ci")
+		cfg := filepath.Join(dir, "none.yaml")
+
+		var other error
+		stageHybridHook(t, &hybridBeforeLock, func() {
+			other = Init(t.Context(), processEnv(), append([]string{"hybrid"}, hybridArgsMinting(out, cfg)...))
+		})
+
+		_, err := runInitHybrid(t, hybridArgsMinting(out, cfg)...)
+		if other != nil {
+			t.Fatalf("the render that got there first: %v", other)
+		}
+		winner := rootGeneration(t, out)
+		if err == nil || !strings.Contains(err.Error(), "another render recorded generation "+winner) {
+			t.Fatalf("the render that lost the race was not refused for it: %v", err)
+		}
+		if got := rootGeneration(t, out); got != winner {
+			t.Errorf("the losing render changed the root to %s", got)
+		}
+	})
+
+	t.Run("died", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "acme-ci")
+		cfg := filepath.Join(dir, "none.yaml")
+
+		stageHybridHook(t, &hybridBeforeLock, func() {
+			root := filepath.Join(out, initconfig.HybridTerraformFile)
+			if err := os.MkdirAll(filepath.Dir(root), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(root, []byte("# a render that died before recording\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		})
+
+		_, err := runInitHybrid(t, hybridArgsMinting(out, cfg)...)
+		if err == nil || !strings.Contains(err.Error(), "appeared without a record") {
+			t.Fatalf("a render minted over a root that appeared without a record: %v", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(out, HybridGenerationFile)); !os.IsNotExist(statErr) {
+			t.Errorf("the refused render recorded a generation (stat: %v)", statErr)
+		}
+	})
 }
 
 // A GENERATION FILE THAT DOES NOT HOLD A FINGERPRINT IS AN ERROR, never none,
