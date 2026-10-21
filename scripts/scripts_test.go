@@ -251,6 +251,7 @@ func publishDir(t *testing.T, manifest string, assets ...string) string {
 		"manifest.json":          manifest,
 		"manifest.sigstore.json": "{}",
 		"release-notes.md":       "notes",
+		"image-sources.tsv":      "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
@@ -303,7 +304,7 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 			wantSuccess: true,
 			wantUploads: []string{
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet",
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet", "image-sources.tsv",
 			},
 		},
 		{
@@ -328,6 +329,12 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			name: "no release notes stops the publish before the tag",
 			dir: without(t, publishDir(t, multipart,
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "release-notes.md"),
+			wantSuccess: false,
+		},
+		{
+			name: "no source manifest stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv"),
 			wantSuccess: false,
 		},
 		{

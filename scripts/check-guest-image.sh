@@ -609,6 +609,82 @@ image_text_file() {
 	[ -f "$1$resolved" ] && [ ! -L "$1$resolved" ] && [ -s "$1$resolved" ]
 }
 
+# SOURCES_HEADER is the first line of /opt/billet/IMAGE_SOURCES.tsv, which
+# scripts/runner-images/source-manifest.py writes.
+SOURCES_HEADER=$'package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense'
+
+# check_image_sources passes or fails the gate on the image mounted at $1 carrying
+# /opt/billet/IMAGE_SOURCES.tsv, the source manifest of what it installed with
+# apt (#584), with one well-formed row for exactly each package dpkg records as
+# installed, at the version installed: a manifest that misses a package, or names
+# one the image no longer has, does not describe what is published. It reports how
+# many are under a GNU license and how many of those apt could fetch from no
+# source the image still names, which is what a release has to carry the source
+# of itself.
+check_image_sources() {
+	local sources installed listed malformed status=0 gnu unfetchable
+
+	image_text_file "$1" /opt/billet/IMAGE_SOURCES.tsv || status=$?
+	case "$status" in
+	0) sources=$1$(image_resolve "$1" /opt/billet/IMAGE_SOURCES.tsv) || status=$? ;;
+	1)
+		fail "the image has no /opt/billet/IMAGE_SOURCES.tsv, so a release would not say what source it must carry"
+		return
+		;;
+	esac
+	if [ "$status" -ne 0 ]; then
+		fail "could not inspect /opt/billet/IMAGE_SOURCES.tsv (status $status)"
+		return
+	fi
+	if ! image_text_file "$1" /var/lib/dpkg/status; then
+		fail "could not read the image's dpkg status, so its source manifest cannot be checked"
+		return
+	fi
+
+	if [ "$(head -n 1 "$sources")" != "$SOURCES_HEADER" ]; then
+		fail "/opt/billet/IMAGE_SOURCES.tsv does not begin with its header ($SOURCES_HEADER)"
+		return
+	fi
+	malformed=$(awk -F '\t' 'NR > 1 && (NF != 7 || $6 == "" || ($7 != "gnu" && $7 != "other" && $7 != "unclassified")) { print NR }' \
+		"$sources") || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "could not read /opt/billet/IMAGE_SOURCES.tsv (status $status)"
+		return
+	fi
+	if [ -n "$malformed" ]; then
+		fail "/opt/billet/IMAGE_SOURCES.tsv has malformed rows (lines $(tr '\n' ' ' <<<"$malformed"))"
+		return
+	fi
+
+	# WHAT dpkg RECORDS AS INSTALLED, read from the image's own status file, so
+	# the comparison needs no dpkg on the machine running the gate.
+	installed=$(awk 'BEGIN { RS = ""; FS = "\n" }
+		{
+			p = a = v = s = ""
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /^Package: /) p = substr($i, 10)
+				else if ($i ~ /^Architecture: /) a = substr($i, 15)
+				else if ($i ~ /^Version: /) v = substr($i, 10)
+				else if ($i ~ /^Status: /) s = substr($i, 9)
+			}
+			if (s ~ / ok installed$/) print p "\t" a "\t" v
+		}' "$1$(image_resolve "$1" /var/lib/dpkg/status)" | LC_ALL=C sort) || status=$?
+	listed=$(awk -F '\t' 'NR > 1 { print $1 "\t" $2 "\t" $3 }' "$sources" | LC_ALL=C sort) || status=$?
+	if [ "$status" -ne 0 ] || [ -z "$installed" ]; then
+		fail "could not list what the image installed with apt (status $status)"
+		return
+	fi
+	if [ "$installed" != "$listed" ]; then
+		fail "/opt/billet/IMAGE_SOURCES.tsv does not list exactly what dpkg installed: $(
+			diff <(printf '%s\n' "$installed") <(printf '%s\n' "$listed") | grep -E '^[<>]' | head -n 5 | tr '\n\t' '; ' || true)"
+		return
+	fi
+
+	gnu=$(awk -F '\t' 'NR > 1 && $7 == "gnu"' "$sources" | wc -l | tr -d ' ')
+	unfetchable=$(awk -F '\t' 'NR > 1 && $7 == "gnu" && $6 == "none"' "$sources" | wc -l | tr -d ' ')
+	pass "/opt/billet/IMAGE_SOURCES.tsv lists every package dpkg installed ($(wc -l <<<"$installed" | tr -d ' ')), $gnu under a GNU license, $unfetchable of those from no source apt still names"
+}
+
 # check_manifest_components passes or fails the gate on the manifest declaring
 # exactly the components the image leaves out, each with the space it needs, under
 # the completion contract the image's completer speaks: a node completes only what
@@ -984,6 +1060,7 @@ else
 fi
 
 check_image_notices "$MNT"
+check_image_sources "$MNT"
 
 # THE CONTAINER HOOK PUTS THAT SHIM INSIDE A JOB CONTAINER. The reference hook is
 # vendored beside billet's wrapper, the runner is pointed at the wrapper, and the

@@ -60,16 +60,20 @@ if [ -z "$assets" ]; then
     exit 2
 fi
 
-# THE SIGNATURE AND THE NOTES TOO, before any ref is written: gh reads the notes
-# only once the tag exists, so a missing file there would leave the tag behind.
-for file in manifest.sigstore.json release-notes.md; do
+# THE SIGNATURE, THE NOTES AND THE SOURCE MANIFEST TOO, before any ref is written:
+# gh reads the notes only once the tag exists, so a missing file there would leave
+# the tag behind. image-sources.tsv is the image's /opt/billet/IMAGE_SOURCES.tsv,
+# which the gate held to what the image installed: every package, its source and
+# where apt could fetch it, which a release that redistributes GNU-licensed
+# packages has to say (#584).
+for file in manifest.sigstore.json release-notes.md image-sources.tsv; do
     if [ ! -r "$out/$file" ]; then
         printf 'the publication has no %s, so nothing is tagged or released\n' "$file" >&2
         exit 2
     fi
 done
 
-set -- "$out/manifest.json" "$out/manifest.sigstore.json"
+set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv"
 
 while read -r name want; do
     # A BARE FILE NAME, CHECKED HERE TOO. The Go reader validates this before a
