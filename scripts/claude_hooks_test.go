@@ -437,6 +437,12 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 	root := claudeHookRepo(t, bothRefs)
 	hookWrite(t, root, "go.mod", "module github.com/junioryono/billet\n\ngo 1.26\n")
 	hookWrite(t, root, "tools/lint/go.mod", "module github.com/junioryono/billet/tools/lint\n\ngo 1.26\n")
+	// A REAL GATE SCRIPT AND A SYMLINK TO ITS DIRECTORY, so a path through the
+	// link is judged by the file it resolves to.
+	hookWrite(t, root, "scripts/gates/test.sh", "#!/bin/sh\n")
+	if err := os.Symlink(filepath.Join(root, "scripts", "gates"), filepath.Join(root, "g")); err != nil {
+		t.Fatal(err)
+	}
 
 	const (
 		gate      = "is a full gate, which CI runs"
@@ -458,6 +464,12 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"cd scripts/gates && ./check.sh", gate},
 		{root + "/scripts/gates/lint.sh", gate},
 		{"CHECK_LOCK=/tmp/x scripts/gates/check.sh", gate},
+		{"bash scripts/gates/test.sh -n", gate},
+		{"bash -o pipefail scripts/gates/check.sh", gate},
+		{"bash -x -- scripts/gates/check.sh", gate},
+		{"cd scripts/gates && bash test.sh", gate},
+		{"g/test.sh", gate},
+		{"bash g/test.sh", gate},
 		{"golangci-lint run > /tmp/lint.log", module},
 		{"golangci-lint --color always run ./...", module},
 		{"golangci-lint run --allow-parallel-runners=true ./internal/alloc", parallel},
@@ -546,6 +558,9 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"sqlc diff", ""},
 		{"make check", ""},
 		{"bash -n scripts/gates/check.sh", ""},
+		{"bash -xn scripts/gates/check.sh", ""},
+		{"cd scripts/gates && test.sh", ""},
+		{"bash -c 'echo scripts/gates/check.sh'", ""},
 		{"cat scripts/gates/check.sh", ""},
 		{"/tmp/other/scripts/gates/check.sh", ""},
 		{"nice -n 10 scripts/gates/verify.sh", ""},

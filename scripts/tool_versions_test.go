@@ -1,11 +1,14 @@
 package scripts_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // toolVersions reads .github/tool-versions.env, the one place billet pins its
@@ -115,9 +118,58 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 		}
 	}
 
+	// LOADED BEFORE IT IS USED, IN EVERY JOB THAT USES IT: $GITHUB_ENV reaches
+	// only the steps after the one that writes it, so a loader after its first use
+	// leaves that use an empty version. The loader is unconditional, and a job
+	// that names no pinned version needs none.
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				If   string         `yaml:"if"`
+				Run  string         `yaml:"run"`
+				With map[string]any `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(body, &workflow); err != nil {
+		t.Fatalf("ci.yml is not valid yaml: %v", err)
+	}
+
 	load := `grep -E '^[A-Z_]+=' .github/tool-versions.env >> "$GITHUB_ENV"`
-	if got := strings.Count(ci, load); got < 4 {
-		t.Errorf("ci.yml loads the pin file %d times, want it in each of the lint, release-config, "+
-			"package-lifecycle and terraform-lint jobs", got)
+	jobsUsing := 0
+
+	for name, job := range workflow.Jobs {
+		loaded := -1
+
+		for i, step := range job.Steps {
+			if loaded < 0 && step.If == "" && strings.TrimSpace(step.Run) == load {
+				loaded = i
+			}
+
+			text := step.Run
+			for _, value := range step.With {
+				text += fmt.Sprint(value)
+			}
+
+			for key := range v {
+				if !strings.Contains(text, "$"+key) && !strings.Contains(text, "env."+key) {
+					continue
+				}
+
+				if loaded < 0 {
+					t.Errorf("job %s step %d names %s before any unconditional step loads .github/tool-versions.env",
+						name, i, key)
+				}
+			}
+		}
+
+		if loaded >= 0 {
+			jobsUsing++
+		}
+	}
+
+	if jobsUsing < 4 {
+		t.Errorf("%d jobs load the pin file, want the lint, release-config, package-lifecycle and terraform-lint jobs",
+			jobsUsing)
 	}
 }

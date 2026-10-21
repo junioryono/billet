@@ -1189,6 +1189,83 @@ func TestTheVerifyTakesTheSharedLockAndItsCaps(t *testing.T) {
 	}
 }
 
+// lockHeld reports whether another process holds path's lock now, asked the way
+// with-check-lock.sh's own probe asks it: a take that may not wait, whose status
+// 75 means held.
+func lockHeld(t *testing.T, path string) bool {
+	t.Helper()
+
+	var cmd *exec.Cmd
+
+	switch {
+	case lookPath("lockf"):
+		cmd = exec.CommandContext(t.Context(), "lockf", "-k", "-t", "0", path, "true")
+	case lookPath("flock"):
+		cmd = exec.CommandContext(t.Context(), "flock", "-n", "-E", "75", path, "true")
+	default:
+		t.Fatal("no lock tool to probe with")
+	}
+
+	err := cmd.Run()
+	if err == nil {
+		return false
+	}
+
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok && exit.ExitCode() == 75 {
+		return true
+	}
+
+	t.Fatalf("probe %s: %v", path, err)
+
+	return false
+}
+
+// THE GATES HOLD THE LOCK FOR AS LONG AS THEIR WORK RUNS, not around a moment of
+// it: while a stand-in for the gate's steps (check.sh) or for the verify
+// (verify.sh) is still running, the lock is held, and once it ends it is free.
+// The stand-in holds until the test releases it, so the probe cannot land after
+// it by chance.
+func TestTheGatesHoldTheLockWhileTheyRun(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	for gate, variable := range map[string]string{"check.sh": "CHECK_STEPS", "verify.sh": "VERIFY_CHANGED"} {
+		dir := t.TempDir()
+		lock := filepath.Join(dir, "gate.lock")
+		held := filepath.Join(dir, "held")
+		release := filepath.Join(dir, "release")
+		standIn := filepath.Join(dir, "work")
+		writeExecutable(t, standIn, "#!/bin/sh\n"+holdUntilReleased)
+
+		cmd := exec.CommandContext(holderContext(t), "./gates/"+gate, held, release)
+		cmd.Env = scriptEnv(variable+"="+standIn, "CHECK_LOCK="+lock, "CI=true")
+		inGroup(cmd)
+
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("%s: start: %v", gate, err)
+		}
+
+		releaseAndReap(t, cmd, release)
+		waitForLockFile(t, held, gate+": the work under the lock never started")
+
+		if !lockHeld(t, lock) {
+			t.Errorf("%s: the lock was free while the work it guards ran", gate)
+		}
+
+		if err := os.WriteFile(release, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("%s: %v", gate, err)
+		}
+
+		if lockHeld(t, lock) {
+			t.Errorf("%s: the lock was still held after the gate ended", gate)
+		}
+	}
+}
+
 // THE RACE SUITE TAKES THE LOCAL CAPS, and CI's run takes none: at most
 // TEST_PARALLEL packages at once (4) under NICE locally, go test's own -p and no
 // nice under CI, whatever the environment says. GO names a stand-in that prints
