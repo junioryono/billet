@@ -138,6 +138,9 @@ func casService(
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
+	// A REFRESH OF A GIT MIRROR OUTLIVES ITS REQUEST, so it is ended and joined
+	// before the state directory it writes is removed.
+	t.Cleanup(service.git.close)
 	volumes := newDeviceVolumes(t)
 	service.actionIO = volumes
 	instance := provider.InstanceName(scopedLease)

@@ -123,3 +123,4 @@ d02ede176458 #127 now proves every node stop by the node's ending, the retiremen
 dffafcd4ce59 #127 now proves each node stop the role and the command perform by the node's ending; the sentence says it establishes the guarantee.
 b56657d3069e The images row gained `accept`, the components whose licenses a deployment accepts (#584); the row is otherwise unchanged.
 301e180e7feb An idle launch runner is no longer retired by a runner-less cancellation: the cancellation detaches it and the pool retires it, reinstating it busy when GitHub refuses its removal as running a job (#598); the sentence now ends at the job being marked finished and the next ones state that.
+da96fb8352a7 ADR-018 (2026-10-21): GitHub serves an object no ref reaches by name, so the Git proxy serves any object a repository's mirror holds, falls back to GitHub on anything it cannot do, and refreshes off the request path; build-caches.md restates the rule.

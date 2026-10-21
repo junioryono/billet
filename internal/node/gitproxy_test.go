@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,15 +57,87 @@ func gitWithin[T any](t *testing.T, what string, call func() T) T {
 	}
 }
 
-// gitUpstream is github.com: git's own smart-HTTP server over one private
-// repository, refusing any request without githubBasic, counting fetches.
+// gitUpstream is github.com: git's own smart-HTTP server over private
+// repositories, refusing any request without githubBasic, counting fetches.
+// Like github.com it serves any object a repository holds, whether or not a ref
+// reaches it, and serves filters (measured, 2026-10-21, ADR-018).
 type gitUpstream struct {
 	*httptest.Server
+	root    string
 	repo    string
 	fetches atomic.Int64
+	// mirrorFetches counts the fetches the node's own git makes, which speak
+	// protocol v2 where a guest's, answered by the node's v0 advertisement,
+	// do not.
+	mirrorFetches atomic.Int64
 	// refuse makes it answer every request as it would a header it no longer
 	// accepts.
 	refuse atomic.Bool
+	// hold, when set, holds the node's own fetches until it is closed.
+	hold atomic.Pointer[chan struct{}]
+}
+
+// holdMirrorFetches holds every fetch the node's own git makes until release
+// is called, which the test's end does too.
+func (u *gitUpstream) holdMirrorFetches(t *testing.T) (release func()) {
+	t.Helper()
+
+	gate := make(chan struct{})
+	u.hold.Store(&gate)
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(release)
+
+	return release
+}
+
+// addRepository makes another private repository beside acme/api, with one
+// commit of its own, and returns that commit.
+func (u *gitUpstream) addRepository(t *testing.T, name string) string {
+	t.Helper()
+
+	work := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, work, "init", "-q", "-b", "main")
+	runIn(t, work, "commit", "-q", "--allow-empty", "-m", "only in "+name)
+	bare := filepath.Join(u.root, "acme", name+".git")
+	runIn(t, u.root, "clone", "-q", "--bare", work, bare)
+	githubLike(t, bare)
+
+	return runIn(t, bare, "rev-parse", "main")
+}
+
+// githubLike configures a bare repository to answer as github.com does.
+func githubLike(t *testing.T, bare string) {
+	t.Helper()
+
+	runIn(t, bare, "config", "uploadpack.allowAnySHA1InWant", "true")
+	runIn(t, bare, "config", "uploadpack.allowFilter", "true")
+}
+
+// commitTo commits files to the upstream repository's branch and returns the
+// commit.
+func (u *gitUpstream) commitTo(t *testing.T, branch string, files map[string]string) string {
+	t.Helper()
+
+	work := filepath.Join(t.TempDir(), "w")
+	runIn(t, filepath.Dir(work), "clone", "-q", u.repo, work)
+	runIn(t, work, "checkout", "-q", "-B", branch)
+	for name, content := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(work, name)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(work, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runIn(t, work, "add", "-A")
+	runIn(t, work, "commit", "-q", "--allow-empty", "-m", "commit to "+branch)
+	runIn(t, work, "push", "-q", "-f", "origin", branch)
+
+	return runIn(t, work, "rev-parse", "HEAD")
 }
 
 func runIn(t *testing.T, dir string, args ...string) string {
@@ -98,8 +171,9 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 	runIn(t, work, "commit", "-q", "--allow-empty", "-m", "one")
 	repo := filepath.Join(root, "acme", "api.git")
 	runIn(t, root, "clone", "-q", "--bare", work, repo)
+	githubLike(t, repo)
 
-	upstream := &gitUpstream{repo: repo}
+	upstream := &gitUpstream{root: root, repo: repo}
 	backend := &cgi.Handler{
 		Path: filepath.Join(strings.TrimSpace(string(execPath)), "git-http-backend"),
 		Env:  []string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1"},
@@ -142,6 +216,16 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 			}
 			if bytes.Contains(plain, []byte("command=fetch")) || bytes.Contains(plain, []byte("want ")) {
 				upstream.fetches.Add(1)
+			}
+			if bytes.Contains(plain, []byte("command=fetch")) {
+				upstream.mirrorFetches.Add(1)
+				if gate := upstream.hold.Load(); gate != nil {
+					select {
+					case <-*gate:
+					case <-r.Context().Done():
+						return
+					}
+				}
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
@@ -292,91 +376,158 @@ func TestAGitFetchGitHubRefusesIsNotServedFromTheMirror(t *testing.T) {
 	}
 }
 
-// AN OBJECT ONLY A DELETED BRANCH REACHED IS NOT SERVED, though the mirror still
-// holds it: the mirror is pruned to github.com's refs and served under v0.
-func TestAnObjectOnlyADeletedBranchReachedIsNotServed(t *testing.T) {
+// AN OBJECT NO REF REACHES IS SERVED FROM THE MIRROR, as github.com serves it:
+// a deleted branch's commit, tree and blob alike (ADR-018). The stand-in serves
+// them too, so the mirror is checked to be what answered.
+func TestAnObjectNoRefReachesIsServedFromTheMirror(t *testing.T) {
 	t.Parallel()
 
 	upstream := newGitUpstream(t)
-	service, node, token := gitNode(t, upstream)
-	work := t.TempDir()
-	runIn(t, work, "clone", "-q", upstream.repo, "w")
-	runIn(t, filepath.Join(work, "w"), "checkout", "-q", "-b", "secret")
-	if err := os.WriteFile(filepath.Join(work, "w", "credential"), []byte("hunter2\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runIn(t, filepath.Join(work, "w"), "add", "credential")
-	runIn(t, filepath.Join(work, "w"), "commit", "-q", "-m", "secret")
-	runIn(t, filepath.Join(work, "w"), "push", "-q", "origin", "secret")
-	secret := runIn(t, filepath.Join(work, "w"), "rev-parse", "HEAD")
-	// THE COMMIT, ITS TREE AND ITS FILE: a reachability check that walks
-	// commits alone passes a want for a tree or a blob.
-	secretObjects := map[string]string{
+	_, node, token := gitNode(t, upstream)
+	secret := upstream.commitTo(t, "secret", map[string]string{"credential": "hunter2\n"})
+	objects := map[string]string{
 		"commit": secret,
-		"tree":   runIn(t, filepath.Join(work, "w"), "rev-parse", "HEAD^{tree}"),
-		"blob":   runIn(t, filepath.Join(work, "w"), "rev-parse", "HEAD:credential"),
+		"tree":   runIn(t, upstream.repo, "rev-parse", secret+"^{tree}"),
+		"blob":   runIn(t, upstream.repo, "rev-parse", secret+":credential"),
 	}
-
 	git := gitClient(t, node, token, githubBasic)
-	// THE MIRROR TAKES EVERY REF, the secret branch's object included; the
-	// client takes main alone, so it has to ask for the object to have it.
 	if output, err := git("clone", "-q", "--single-branch", "--branch", "main",
 		"https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("clone: %v\n%s", err, output)
 	}
-	if _, err := git("-C", "c", "cat-file", "-e", secret); err == nil {
-		t.Fatal("the client already holds the object, so asking for it proves nothing")
-	}
-	// WHILE ITS BRANCH EXISTS the same request is served, so the refusal below
-	// is the deletion's doing and not a fetch by object that never works.
-	if output, err := git("clone", "-q", "--single-branch", "--branch", "main",
-		"https://github.com/acme/api.git", "control"); err != nil {
-		t.Fatalf("clone: %v\n%s", err, output)
-	}
-	if output, err := git("-C", "control", "fetch", "-q", "origin", secret); err != nil {
-		t.Fatalf("while its branch exists the object is not served: %v\n%s", err, output)
-	}
 	runIn(t, upstream.repo, "branch", "-q", "-D", "secret")
-	// SENT RAW, because a client of its own accord will not ask for an object
-	// the advertisement lacks, and a hostile one will.
 	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
 		t.Fatalf("ls-remote: %v\n%s", err, output)
 	}
-	// THE MIRROR ANSWERS NONE OF THEM. The commit it refuses itself, as
-	// upload-pack judges a commit; a tree or a blob it sends to GitHub, whose
-	// answer is GitHub's own business (the stand-in here is git's http-backend,
-	// which serves one as upload-pack does).
-	if body := negotiate(t, node, token, githubBasic, secretObjects["commit"]); bytes.Contains(body, []byte("PACK")) {
-		t.Errorf("a commit only a deleted branch reached was served: %q", body[:min(len(body), 80)])
+	if output := runIn(t, upstream.repo, "branch", "--list", "secret"); output != "" {
+		t.Fatalf("the branch was not deleted upstream: %q", output)
 	}
-	for _, kind := range []string{"tree", "blob"} {
+	for kind, object := range objects {
 		before := upstream.fetches.Load()
-		negotiate(t, node, token, githubBasic, secretObjects[kind])
-		if upstream.fetches.Load() == before {
-			t.Errorf("a %s only a deleted branch reached was answered from the mirror", kind)
+		if body := negotiate(t, node, token, githubBasic, object); !bytes.Contains(body, []byte("PACK")) {
+			t.Errorf("a %s no ref reaches was not served: %q", kind, body[:min(len(body), 80)])
+		}
+		if got := upstream.fetches.Load() - before; got != 0 {
+			t.Errorf("a %s no ref reaches went to github.com (%d fetches), want the mirror", kind, got)
 		}
 	}
-	if body := negotiate(t, node, token, githubBasic, runIn(t, upstream.repo, "rev-parse", "main")); !bytes.Contains(body, []byte("PACK")) {
-		t.Fatalf("an advertised object was not served by the same negotiation: %q", body)
+}
+
+// A PULL REQUEST'S SUPERSEDED MERGE COMMIT IS FETCHED BY ITS NAME, as
+// actions/checkout fetches one when a job of an earlier push runs after the
+// pull request moved; the mirror holds it and no ref reaches it.
+func TestASupersededMergeCommitIsFetchedByName(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	_, node, token := gitNode(t, upstream)
+	merge := upstream.commitTo(t, "topic", map[string]string{"a": "1\n"})
+	runIn(t, upstream.repo, "update-ref", "refs/pull/1/merge", merge)
+	git := gitClient(t, node, token, githubBasic)
+	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
+		t.Fatalf("ls-remote: %v\n%s", err, output)
+	}
+	// THE PULL REQUEST MOVES: GitHub's merge ref names a new commit, and the
+	// mirror, refreshed to it, keeps the old one with no ref reaching it.
+	moved := upstream.commitTo(t, "topic", map[string]string{"a": "2\n"})
+	runIn(t, upstream.repo, "update-ref", "refs/pull/1/merge", moved)
+	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
+		t.Fatalf("ls-remote: %v\n%s", err, output)
 	}
 
-	// A MIRROR THAT COULD NOT BE REFRESHED IS NOT SERVED: its refs may be ones
-	// GitHub no longer has. The fetch goes to GitHub, which refuses it.
-	runIn(t, filepath.Join(work, "w"), "push", "-q", "origin", secret+":refs/heads/secret")
-	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
-		t.Fatalf("ls-remote: %v\n%s", err, output)
+	if output, err := git("init", "-q", "w"); err != nil {
+		t.Fatalf("init: %v\n%s", err, output)
 	}
-	runIn(t, upstream.repo, "branch", "-q", "-D", "secret")
+	if output, err := git("-C", "w", "remote", "add", "origin", "https://github.com/acme/api"); err != nil {
+		t.Fatalf("remote add: %v\n%s", err, output)
+	}
+	before := upstream.fetches.Load()
+	if output, err := git("-C", "w", "fetch", "--no-tags", "--prune", "--no-recurse-submodules", "--depth=1",
+		"origin", "+"+merge+":refs/remotes/pull/1/merge"); err != nil {
+		t.Fatalf("the fetch of a superseded merge commit failed: %v\n%s", err, output)
+	}
+	if got := upstream.fetches.Load() - before; got != 0 {
+		t.Fatalf("the superseded merge commit was fetched from github.com (%d fetches), want the mirror", got)
+	}
+	if output, err := git("-C", "w", "rev-parse", "refs/remotes/pull/1/merge"); err != nil || strings.TrimSpace(output) != merge {
+		t.Fatalf("the fetched ref is %q (%v), want %s", output, err, merge)
+	}
+}
+
+// A BLOBLESS CLONE'S CHECKOUT IS SERVED FROM THE MIRROR: the lazy fetch of every
+// file it names, which a full-history job makes, is answered by the node.
+func TestABloblessCheckoutIsServedFromTheMirror(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	_, node, token := gitNode(t, upstream)
+	upstream.commitTo(t, "main", map[string]string{"README": "hello\n", "src/main.go": "package main\n"})
+	git := gitClient(t, node, token, githubBasic)
+	if output, err := git("clone", "-q", "--filter=blob:none", "--no-checkout",
+		"https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("the blobless clone: %v\n%s", err, output)
+	}
+	before := upstream.fetches.Load()
+	if output, err := git("-C", "c", "checkout", "-q", "main"); err != nil {
+		t.Fatalf("the checkout: %v\n%s", err, output)
+	}
+	if got := upstream.fetches.Load() - before; got != 0 {
+		t.Fatalf("the checkout's lazy fetch went to github.com (%d fetches), want the mirror", got)
+	}
+	if output, err := git("-C", "c", "diff", "--quiet", "HEAD"); err != nil {
+		t.Fatalf("the checkout does not match its commit: %v\n%s", err, output)
+	}
+	if output, err := git("-C", "c", "cat-file", "-p", "HEAD:src/main.go"); err != nil || output != "package main\n" {
+		t.Fatalf("the checkout has %q (%v)", output, err)
+	}
+}
+
+// AN OBJECT OF ANOTHER REPOSITORY IS NEVER SERVED FROM THIS ONE'S MIRROR, though
+// the node mirrors both: each repository's mirror holds only what GitHub gave
+// for that repository, which is what makes serving any object it holds safe.
+func TestAnotherRepositorysObjectIsNotServed(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	_, node, token := gitNode(t, upstream)
+	other := upstream.addRepository(t, "other")
+	git := gitClient(t, node, token, githubBasic)
+	for _, repo := range []string{"api", "other"} {
+		if output, err := git("clone", "-q", "https://github.com/acme/"+repo+".git", repo); err != nil {
+			t.Fatalf("clone %s: %v\n%s", repo, err, output)
+		}
+	}
+	before := upstream.fetches.Load()
+	if body := negotiate(t, node, token, githubBasic, other); bytes.Contains(body, []byte("PACK")) {
+		t.Fatalf("acme/api served an object only acme/other holds: %q", body[:min(len(body), 80)])
+	}
+	if upstream.fetches.Load() == before {
+		t.Fatal("a want acme/api's mirror lacks was not github.com's to answer")
+	}
+}
+
+// A FETCH WHOSE MIRROR WAS NOT REFRESHED IS STILL CORRECT: what the stale mirror
+// holds it serves, and a commit pushed since, which it lacks, GitHub serves.
+func TestAFetchAStaleMirrorLacksGoesToGitHub(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, token := gitNode(t, upstream)
+	git := gitClient(t, node, token, githubBasic)
+	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, output)
+	}
 	service.git.fullFraction = 0
-	fetches := upstream.fetches.Load()
-	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
-		t.Fatalf("ls-remote: %v\n%s", err, output)
+	pushed := upstream.commitTo(t, "main", map[string]string{"new": "1\n"})
+	before := upstream.fetches.Load()
+	if output, err := git("-C", "c", "pull", "-q", "--ff-only"); err != nil {
+		t.Fatalf("a pull past a stale mirror: %v\n%s", err, output)
 	}
-	if body := negotiate(t, node, token, githubBasic, secret); bytes.Contains(body, []byte("PACK")) {
-		t.Fatalf("a stale mirror served an object GitHub no longer advertises: %q", body[:min(len(body), 80)])
+	if output, err := git("-C", "c", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(output) != pushed {
+		t.Fatalf("the pull is at %q (%v), want %s", output, err, pushed)
 	}
-	if upstream.fetches.Load() == fetches {
-		t.Fatal("the fetch after a failed refresh was not GitHub's to answer")
+	if upstream.fetches.Load() == before {
+		t.Fatal("a commit the stale mirror lacks was not fetched from github.com")
 	}
 }
 
@@ -626,13 +777,13 @@ func TestAnOlderGrantDoesNotOvertakeANewerRefusal(t *testing.T) {
 		repo: "api", auth: "basic eA=="}
 	now := time.Now()
 	earlier, later := g.ask(), g.ask()
-	g.remember(request, now, later, false, false)
-	g.remember(request, now, earlier, true, true)
-	if g.servesFromMirror(request, now) {
+	g.remember(request, now, later, false)
+	g.remember(request, now, earlier, true)
+	if g.granted(request, now) {
 		t.Fatal("a grant asked for before a refusal overtook it")
 	}
-	g.remember(request, now, g.ask(), true, true)
-	if !g.servesFromMirror(request, now) {
+	g.remember(request, now, g.ask(), true)
+	if !g.granted(request, now) {
 		t.Fatal("a grant asked for after the refusal did not stand")
 	}
 }
@@ -736,9 +887,9 @@ func TestGitAdmissionIsBoundedAndGivesBack(t *testing.T) {
 	}
 }
 
-// A SHALLOW NEGOTIATION IS GITHUB'S TO ANSWER: a client's `shallow` line makes
-// upload-pack send that commit's parents without judging them.
-func TestAShallowNegotiationGoesToGitHub(t *testing.T) {
+// A SHALLOW NEGOTIATION IS SERVED FROM THE MIRROR when it holds every object the
+// negotiation names, its shallow boundary included, and is GitHub's otherwise.
+func TestAShallowNegotiationIsServedWhenTheMirrorHoldsItsBoundary(t *testing.T) {
 	t.Parallel()
 
 	upstream := newGitUpstream(t)
@@ -748,28 +899,74 @@ func TestAShallowNegotiationGoesToGitHub(t *testing.T) {
 		t.Fatalf("clone: %v\n%s", err, output)
 	}
 	main := runIn(t, upstream.repo, "rev-parse", "main")
-	shallow := "shallow " + main + "\n"
-	want := "want " + main + "\n"
-	deepen := "deepen 2147483647\n"
-	negotiation := fmt.Sprintf("%04x%s%04x%s%04x%s00000009done\n", len(want)+4, want,
-		len(shallow)+4, shallow, len(deepen)+4, deepen)
+	shallowNegotiation := func(boundary string) string {
+		shallow := "shallow " + boundary + "\n"
+		want := "want " + main + "\n"
+		deepen := "deepen 2147483647\n"
+
+		return fmt.Sprintf("%04x%s%04x%s%04x%s00000009done\n", len(want)+4, want,
+			len(shallow)+4, shallow, len(deepen)+4, deepen)
+	}
+	post := func(negotiation string) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+			node.URL+"/v1/git/github.com/acme/api.git/git-upload-pack", strings.NewReader(negotiation))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth(token, githubBasic)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
 	before := upstream.fetches.Load()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		node.URL+"/v1/git/github.com/acme/api.git/git-upload-pack", strings.NewReader(negotiation))
-	if err != nil {
-		t.Fatal(err)
+	post(shallowNegotiation(main))
+	if got := upstream.fetches.Load() - before; got != 0 {
+		t.Fatalf("a shallow negotiation the mirror can answer went to github.com (%d fetches)", got)
 	}
-	req.SetBasicAuth(token, githubBasic)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
+	unknown := strings.Repeat("ab", 20)
+	before = upstream.fetches.Load()
+	post(shallowNegotiation(unknown))
 	if upstream.fetches.Load() == before {
-		t.Fatal("a shallow negotiation was answered from the mirror")
+		t.Fatal("a shallow boundary the mirror lacks was answered from the mirror")
 	}
-	if wants, shallow := negotiatedWants([]byte(negotiation)); !shallow || len(wants) != 1 {
-		t.Fatalf("negotiatedWants = %v, %v", wants, shallow)
+}
+
+// THE NEGOTIATION'S OBJECTS ARE EVERY WANT AND SHALLOW BEFORE ITS FIRST FLUSH, and
+// only full object names: anything else is not a negotiation the proxy judges,
+// because cat-file would read it as a revision.
+func TestNegotiatedObjects(t *testing.T) {
+	t.Parallel()
+
+	a, b := strings.Repeat("a", 40), strings.Repeat("b", 64)
+	line := func(payload string) string { return fmt.Sprintf("%04x%s", len(payload)+4, payload) }
+	for _, c := range []struct {
+		name        string
+		negotiation string
+		want        []string
+		ok          bool
+	}{
+		{"wants and shallows", line("want "+a+" multi_ack side-band-64k\n") + line("want "+b+"\n") +
+			line("shallow "+a+"\n") + line("deepen 1\n") + "0000" + line("have "+b+"\n") + "0009done\n",
+			[]string{a, b, a}, true},
+		{"no wants", "0000", nil, true},
+		{"a revision, not a name", line("want HEAD~1\n") + "0000", nil, false},
+		{"an abbreviated name", line("want "+a[:12]+"\n") + "0000", nil, false},
+		{"an uppercase name", line("want "+strings.ToUpper(a)+"\n") + "0000", nil, false},
+		{"a v2 command", line("command=fetch\n") + "0001" + line("want "+a+"\n") + "0000", nil, false},
+		{"no flush", line("want " + a + "\n"), nil, false},
+		{"a truncated line", "00ffwant " + a, nil, false},
+		{"not a pkt-line", "zzzz", nil, false},
+	} {
+		got, ok := negotiatedObjects([]byte(c.negotiation))
+		if ok != c.ok || !slices.Equal(got, c.want) {
+			t.Errorf("%s: negotiatedObjects = %v, %v; want %v, %v", c.name, got, ok, c.want, c.ok)
+		}
 	}
 }
 
@@ -785,10 +982,10 @@ func TestARefusalOutlivesUnrelatedAnswers(t *testing.T) {
 	b := gitRequest{session: session, owner: "acme", repo: "api", auth: "basic Yg=="}
 	now := time.Now()
 	older, refusal, unrelated := g.ask(), g.ask(), g.ask()
-	g.remember(a, now, refusal, false, false)
-	g.remember(b, now.Add(gitAuthorisationAge), unrelated, true, true)
-	g.remember(a, now.Add(gitAuthorisationAge), older, true, true)
-	if g.servesFromMirror(a, now.Add(gitAuthorisationAge)) {
+	g.remember(a, now, refusal, false)
+	g.remember(b, now.Add(gitAuthorisationAge), unrelated, true)
+	g.remember(a, now.Add(gitAuthorisationAge), older, true)
+	if g.granted(a, now.Add(gitAuthorisationAge)) {
 		t.Fatal("an unrelated answer cleared a refusal and let an older grant stand")
 	}
 }
