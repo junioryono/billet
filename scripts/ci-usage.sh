@@ -112,8 +112,8 @@ report() {
 				if (gap > maxgap) maxgap = gap
 				dbusy = $3 - busy; dtotal = $4 - total; dsteal = $5 - steal
 				if ($2 == cpus && dtotal == 0 && dbusy == 0 && dsteal == 0) {
-					# No time passed between the two (report's own last sample, taken
-					# in the same tick): no interval, and nothing wrong with it.
+					# No time passed between the two, as when report samples within
+					# the same tick: no interval, and nothing wrong with it.
 				} else if ($2 == cpus && dtotal > 0 && dbusy >= 0 && dsteal >= 0 && dbusy + dsteal <= dtotal) {
 					intervals++
 					sumbusy += dbusy; sumsteal += dsteal; sumtotal += dtotal
