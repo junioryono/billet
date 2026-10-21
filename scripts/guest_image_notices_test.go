@@ -200,6 +200,12 @@ func imageNoticesRoot(t *testing.T) string {
 		"usr/share/miniconda/LICENSE.txt":                                            "MINICONDA END USER LICENSE AGREEMENT\n",
 		"usr/local/bin/packer":                                                       "#!/bin/sh\n",
 		"usr/local/bin/LICENSE.txt":                                                  "Business Source License 1.1\n",
+		// The installers' completion markers, siblings of the architecture
+		// directories, and a stray file among the versions: none holds a tool.
+		"opt/hostedtoolcache/copilot-cli/1.0.101/x64.complete":                  "",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64.complete": "",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64.complete": "",
+		"opt/hostedtoolcache/copilot-cli/README":                                "not a version\n",
 	} {
 		writeTreeFile(t, root, path, body)
 	}
@@ -316,6 +322,19 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 			},
 		},
 		{
+			// A VERSION DIRECTORY THAT IS ITSELF A LINK only the image resolves: a
+			// listing on this machine finds nothing behind it.
+			name: "a Copilot CLI version linked elsewhere in the image without its license",
+			want: "/opt/hostedtoolcache/copilot-cli/1.0.103/x64/LICENSE.md",
+			mutate: func(t *testing.T, root string) {
+				writeTreeFile(t, root, "opt/copilot-1.0.103/x64/bin/copilot", "#!/bin/sh\n")
+				link := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.103")
+				if err := os.Symlink("/opt/copilot-1.0.103", link); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
 			// THE NOTICES SEARCHED ARE THE ONES VALIDATED: the link resolves, inside
 			// the image, to a file naming nothing, and on this machine to one
 			// naming everything.
@@ -373,7 +392,8 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 
 // noticeGateFunctions are the gate's functions check_image_notices runs on.
 var noticeGateFunctions = []string{
-	"image_resolve", "image_entries", "image_present", "image_text_file", "check_image_notices",
+	"image_resolve", "image_entries", "image_present", "image_text_file",
+	"tool_licenses", "tool_license", "check_image_notices",
 }
 
 // LINKS THE IMAGE RESOLVES PASS: a license and the notices each an absolute link to
@@ -401,6 +421,45 @@ func TestThePublicationGateFollowsTheImagesOwnLinks(t *testing.T) {
 	if out, failed := gateRun(t, "check_image_notices", root, "", noticeGateFunctions...); failed != "0" ||
 		!strings.Contains(out, "(5)") {
 		t.Errorf("an image whose license and notices are links inside it failed:\n%s", out)
+	}
+}
+
+// A LOOKUP THAT CANNOT TELL FAILS THE GATE. Beside a licensed version, a second
+// version behind a link readlink cannot read must not read as no tool at all.
+func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T) {
+	t.Parallel()
+
+	root := imageNoticesRoot(t)
+	writeTreeFile(t, root, "opt/copilot-1.0.104/x64/bin/copilot", "#!/bin/sh\n")
+	if err := os.Symlink("/opt/copilot-1.0.104", filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.104")); err != nil {
+		t.Fatal(err)
+	}
+
+	real, err := exec.LookPath("readlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	writeExecutable(t, filepath.Join(bin, "readlink"),
+		"#!/bin/sh\ncase \"$1\" in */1.0.104) exit 1 ;; esac\nexec "+real+" \"$@\"\n")
+
+	script := "set -euo pipefail\nFAILED=0\npass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n"
+	for _, name := range noticeGateFunctions {
+		script += checkImageFunction(t, name) + "\n"
+	}
+	script += "check_image_notices \"$1\"\necho \"FAILED=$FAILED\"\n"
+	path := filepath.Join(t.TempDir(), "gate.sh")
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), "bash", path, root)
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the check did not run to its verdict: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "FAILED=1") || !strings.Contains(string(out), "could not tell which tools") {
+		t.Fatalf("the gate passed an image it could not read:\n%s", out)
 	}
 }
 
