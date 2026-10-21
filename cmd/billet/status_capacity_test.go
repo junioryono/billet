@@ -105,6 +105,39 @@ func TestStatusSaysWhatATierIsWaitingFor(t *testing.T) {
 	}
 }
 
+// STATUS SAYS WHICH OF THE TWO REFUSES A WAITING TIER (#248): the admission
+// order holding freed room for an older waiter, named, or the allocator having
+// none, with its reason. On 2026-09-25 the report said only that a tier was
+// waiting, and that a starved tier and a full fleet read the same.
+func TestStatusSaysWhatHoldsAWaitingTierBack(t *testing.T) {
+	report := func(l alloc.ListenerCapacity) string {
+		var b strings.Builder
+
+		l.Exchange, l.Waiting, l.WaitingSince = "confirmed", 10, "2026-09-25T17:21:36Z"
+		l.WaitingProgress = statusNow.Format(time.RFC3339Nano)
+		printTierCapacity(&b, "org-2vcpu", alloc.TierCapacity{ObservedAt: "2026-09-25T17:55:00Z", Listener: l}, statusNow)
+
+		return b.String()
+	}
+
+	behind := report(alloc.ListenerCapacity{HeldBy: "repo-8vcpu", HeldBySince: "2026-09-25T17:20:00Z"})
+	if !strings.Contains(behind, "behind repo-8vcpu, waiting since 2026-09-25T17:20:00Z") {
+		t.Errorf("status does not name the waiter that holds the line:\n%s", behind)
+	}
+
+	refused := report(alloc.ListenerCapacity{Refusal: "the allocator has no room: no room on its hosts (ubuntu-01)"})
+	if !strings.Contains(refused, "last purchase refused: the allocator has no room: no room on its hosts (ubuntu-01)") {
+		t.Errorf("status does not say why the allocator refused:\n%s", refused)
+	}
+
+	// A REPORT FROM BEFORE THE FIELDS SAYS NEITHER, which is not the same as
+	// neither being true.
+	older := report(alloc.ListenerCapacity{})
+	if strings.Contains(older, "behind") || strings.Contains(older, "refused") {
+		t.Errorf("a report without the fields claimed a reason:\n%s", older)
+	}
+}
+
 // statusNow is the clock the status tests read the reports against.
 var statusNow = time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
 

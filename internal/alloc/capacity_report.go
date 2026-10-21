@@ -40,6 +40,14 @@ type ListenerCapacity struct {
 	// stalled listener cannot say it has stalled, so the reader compares this
 	// with its own clock.
 	WaitingProgress string `json:"waiting_progress,omitempty"`
+	// HeldBy is the waiter the admission order holds the line for ahead of this
+	// tier, and HeldBySince when it began waiting; Refusal is the allocator's
+	// reason for this tier's last refused purchase. Each is empty when there is
+	// none to name, and an older control plane writes neither, so a reader shows
+	// nothing rather than "no reason" (#248).
+	HeldBy      string `json:"held_by,omitempty"`
+	HeldBySince string `json:"held_by_since,omitempty"`
+	Refusal     string `json:"refusal,omitempty"`
 }
 
 // RecordListenerCapacity publishes the listener's ownership for another process.

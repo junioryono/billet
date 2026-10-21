@@ -43,6 +43,20 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	if since, progress, ok := l.order.waitingSince(l.tier); ok {
 		report.WaitingSince = since.UTC().Format(time.RFC3339Nano)
 		report.WaitingProgress = progress.UTC().Format(time.RFC3339Nano)
+
+		// WHO HOLDS THE LINE, asked of the queue now rather than remembered from
+		// the refusal, which may be a poll old; and what the allocator said, which
+		// the queue does not know (#248).
+		if holder, holderSince, held := l.order.waiterHeldBy(l.tier); held {
+			report.HeldBy = holder
+			report.HeldBySince = holderSince.UTC().Format(time.RFC3339Nano)
+		}
+
+		if l.refused.room != nil || l.refused.unread != nil {
+			if !l.refused.byOrder() {
+				report.Refusal = l.refused.String()
+			}
+		}
 	}
 
 	// A COUNT WITHOUT A DATE IS NOT A WAIT. The two are written by different

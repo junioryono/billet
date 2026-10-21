@@ -202,6 +202,21 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	first, _, stalled := q.head(tier, where)
+
+	allowed := first == "" || first == tier
+	if allowed {
+		q.letPast(tier, stalled)
+	}
+
+	return allowed
+}
+
+// head requires q.mu. It is the waiter that holds the line for a tier at where,
+// which may be the tier itself, and the stalled waiters that stepped aside for
+// it; an empty label means nobody holds it. It logs nothing, so naming the
+// holder does not spend letPast's once-per-stall line.
+func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, time.Time, []string) {
 	first, since := "", time.Time{}
 	now := q.now()
 
@@ -228,12 +243,52 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 		}
 	}
 
-	allowed := first == "" || first == tier
-	if allowed {
-		q.letPast(tier, stalled)
+	return first, since, stalled
+}
+
+// heldBy names the waiter that holds the line ahead of a tier at where, and
+// when it began waiting: what mayBuy refused this tier for. False when nothing
+// does, which includes the tier being at the head itself.
+func (q *admissionQueue) heldBy(tier string, where alloc.TierAdmission) (string, time.Time, bool) {
+	if q == nil || q.policy == config.AdmissionFill {
+		return "", time.Time{}, false
 	}
 
-	return allowed
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return q.heldByLocked(tier, where)
+}
+
+// waiterHeldBy is heldBy for a tier the queue records as waiting, judged at the
+// ground it last waited on; false for a tier that is not waiting, which has no
+// purchase being held back. It is what the status report publishes, asked of
+// the queue when the report is written rather than remembered from a refusal,
+// so it names who holds the line now.
+func (q *admissionQueue) waiterHeldBy(tier string) (string, time.Time, bool) {
+	if q == nil || q.policy == config.AdmissionFill {
+		return "", time.Time{}, false
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	own, waiting := q.waiting[tier]
+	if !waiting {
+		return "", time.Time{}, false
+	}
+
+	return q.heldByLocked(tier, own.where)
+}
+
+// heldByLocked requires q.mu.
+func (q *admissionQueue) heldByLocked(tier string, where alloc.TierAdmission) (string, time.Time, bool) {
+	first, since, _ := q.head(tier, where)
+	if first == "" || first == tier {
+		return "", time.Time{}, false
+	}
+
+	return first, since, true
 }
 
 // ahead lists the waiters that hold the line ahead of tier, judged as mayBuy

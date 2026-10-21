@@ -289,6 +289,11 @@ type Listener struct {
 	// capacity for at its last reconciliation. Guarded by mu; reported, never
 	// scheduled on.
 	waitingFor int
+	// refused is why the last purchase this tier asked for bought nothing, and
+	// refusedLogged the reason last logged for it. Guarded by mu; reported and
+	// logged, never scheduled on.
+	refused       refusal
+	refusedLogged string
 
 	stalePromise time.Duration
 

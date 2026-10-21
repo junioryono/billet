@@ -77,6 +77,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			if !l.order.mayBuy(l.tier, admission) {
 				protect = l.order.ahead(l.tier, admission)
 				if len(protect) == 0 {
+					l.refuse(l.orderRefusal(admission), true)
+
 					break
 				}
 			}
@@ -94,6 +96,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 				return errors.Join(err, l.launchPool(ctx, batch))
 			}
 			if lease == nil {
+				l.refuse(l.roomRefusal(ctx, protect), true)
+
 				break
 			}
 			batch = append(batch, poolLaunch{lease: lease, job: job})
@@ -134,6 +138,10 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		l.order.waits(l.tier, admission)
 	} else {
 		l.order.served(l.tier)
+	}
+
+	if active >= desired {
+		l.refusalServed()
 	}
 
 	surplus := active - desired
@@ -248,6 +256,8 @@ func (l *Listener) backPoolSlotLeaving(ctx context.Context, protect []string) er
 // the message hands it back. Not while draining, for backPoolSlot's reason.
 func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	if l.isDraining() {
+		l.refuse(refusal{draining: true}, false)
+
 		return nil
 	}
 
@@ -266,11 +276,29 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	// fragment of room the longest-waiting tier was accumulating and fairness
 	// protected only the pool path (#157). The assignment is not acquired here:
 	// billet declines it and GitHub reassigns it after its pickup deadline.
-	if !l.order.mayBuy(l.tier, l.admission(ctx)) {
+	//
+	// AND WHATEVER REFUSES IT IS RECORDED for the decline that follows, which
+	// otherwise could not say whether the order or the allocator refused (#248).
+	where := l.admission(ctx)
+	if !l.order.mayBuy(l.tier, where) {
+		l.refuse(l.orderRefusal(where), false)
+
 		return nil
 	}
 
-	return l.refillEscrowUngated(ctx, l.capacity()+1, 1)
+	if err := l.refillEscrowUngated(ctx, l.capacity()+1, 1); err != nil {
+		return err
+	}
+
+	l.mu.Lock()
+	bought := len(l.held) > 0
+	l.mu.Unlock()
+
+	if !bought {
+		l.refuse(l.roomRefusal(ctx, nil), false)
+	}
+
+	return nil
 }
 
 // admission is what the order needs to know about this tier: whether room could

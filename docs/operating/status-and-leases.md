@@ -41,7 +41,23 @@ Which waiting tier takes that room is `server.admission_order`. Under `fair`, th
 
 That line is an observation, not the queue's decision: a stalled listener cannot publish that it has stalled, so `billet status` compares the last progress it did publish with its own clock. The listener publishes once a poll, so the queue can have seen a launch start or finish that the report has not yet shown. Under `fill` anything that fits starts instead, and the largest shape may wait indefinitely.
 
-**Taking turns is fair between tiers, not between jobs.** On a full fleet a waiting tier whose turn it is buys one pool pass (up to four leases on a Firecracker-only tier) before it goes to the back, and GitHub hands a tier's new runner to that tier's own queue, roughly in order. So a job waits behind its own tier's backlog as well as behind a larger waiter the order is holding room for: on 2026-10-16 a 2 vCPU tier with 20 to 33 jobs queued at GitHub waited up to 52 minutes while a 16 vCPU tier with one or two queued started in three ([Queue wait on a shared node](../reference/records/shared-node-queue-wait.md)). `billet jobs wait` splits each tier's wait into GitHub's part, the wait for room and the launch; a long wait for room with a short launch says the room was taken, by a full fleet or by a larger waiter the order was holding it for, and does not say which. More room shortens the total, through more capacity or jobs that hold their lease for less time, and so can an order that does not hold usable room idle; a target's share, `server.admission_order: fill`, or an order by job age rather than by tier, which billet does not have, decide which jobs carry the wait.
+A waiter holds back only the tiers it competes with: those its shape could be placed on a shared host with, every tier while the deployment ceiling (`server.max_vcpu`, `max_memory`) is what refuses it (its own hosts have room the ceiling will not let it use, so any purchase anywhere takes what it waits for), and the other tiers of its own target when that target has a share. A tier waiting for a host that is full, such as a Mac whose macOS VM slots are taken, does not hold a tier on another machine, however close the ceiling is to the hosts' total.
+
+**Which of the two refuses a waiting tier is printed beneath its waiting line**, because a starved tier and a full fleet otherwise read the same. When the admission order is holding freed room for an older waiter, the report names it; when the allocator had no room, it says which limit binds (illustrative output):
+
+```text
+          waiting 10 job(s) for room, oldest since 2026-09-25T17:21:36Z
+          behind repo-8vcpu, waiting since 2026-09-25T17:20:00Z: the admission order holds freed room for it
+```
+
+```text
+          waiting 2 job(s) for room, oldest since 2026-09-25T17:21:36Z
+          last purchase refused: the allocator has no room: no room on its hosts (ubuntu-01)
+```
+
+The allocator's reasons are the admission seal, the tier's own `max_concurrent`, its target's share, the deployment ceiling, a shape no live host can place, and no room on the hosts it fits; every one that binds is named. A control plane older than these lines prints neither, which is not the same as neither being true. The control plane's log carries the same reason on each declined assignment (`reason=` and, when the order refused, `held_by=`), and a pool reconciliation that bought nothing logs `assigned work is waiting: a purchase for it bought nothing` once each time its reason changes.
+
+**Taking turns is fair between tiers, not between jobs.** On a full fleet a waiting tier whose turn it is buys one pool pass (up to four leases on a Firecracker-only tier) before it goes to the back, and GitHub hands a tier's new runner to that tier's own queue, roughly in order. So a job waits behind its own tier's backlog as well as behind a larger waiter the order is holding room for: on 2026-10-16 a 2 vCPU tier with 20 to 33 jobs queued at GitHub waited up to 52 minutes while a 16 vCPU tier with one or two queued started in three ([Queue wait on a shared node](../reference/records/shared-node-queue-wait.md)). `billet jobs wait` splits each tier's wait into GitHub's part, the wait for room and the launch; a long wait for room with a short launch says the room was taken, by a full fleet or by a larger waiter the order was holding it for, and `billet status` says which while the tier is waiting. More room shortens the total, through more capacity or jobs that hold their lease for less time, and so can an order that does not hold usable room idle; a target's share, `server.admission_order: fill`, or an order by job age rather than by tier, which billet does not have, decide which jobs carry the wait.
 
 ## `billet leases`
 

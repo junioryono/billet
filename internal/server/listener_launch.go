@@ -129,7 +129,8 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 			// escrow. The job is not acquired, GitHub reassigns it, and the
 			// operator gets a loud line rather than an outage.
 			l.log.Error("assigned a request with no escrow to back it; declining it",
-				"tier", l.tier, "request", job.RequestID, "run", job.RunID)
+				append([]any{"tier", l.tier, "request", job.RequestID, "run", job.RunID},
+					l.declineReason()...)...)
 
 			return nil, false, nil
 		}
