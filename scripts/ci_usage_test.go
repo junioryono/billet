@@ -140,19 +140,24 @@ func TestTheUsageSamplerReportsCoresAndMemoryFromProc(t *testing.T) {
 
 // AN INTERVAL THE COUNTERS CANNOT ACCOUNT FOR IS LEFT OUT, NEVER READ AS A
 // NUMBER, and the rest are still measured: iowait going backwards (which the
-// kernel allows) so that more time was busy than passed, the CPU count changing,
-// a read that failed and a line cut short. Stolen time is reported on its own.
+// kernel allows) while user and idle advance enough to hide it in the sum, the
+// CPU count changing, a counter going backwards, a read that failed and a line
+// cut short. The mean is over the CPU time of the intervals kept, each at its own
+// CPU count, and stolen time is reported on its own.
 func TestTheUsageSamplerLeavesOutWhatTheCountersCannotAccountFor(t *testing.T) {
 	t.Parallel()
 
 	proc, dir := t.TempDir(), t.TempDir()
 	env := []string{"CI_USAGE_PROC=" + proc}
 
-	// busy 200 of 1000.
 	usageProc(t, proc, "100 0 100 700 100 0 0 0", 2, 6*gib)
 	runUsage(t, env, "sample", dir)
-	// iowait -50: busy +100 against total +50, which would read as 4 cores on 2.
-	usageProc(t, proc, "200 0 100 700 50 0 0 0", 2, 6*gib)
+	// user +50 and idle +50 on 2 CPUs: one core.
+	usageProc(t, proc, "150 0 100 750 100 0 0 0", 2, 6*gib)
+	runUsage(t, env, "sample", dir)
+	// user +100, idle +100, iowait -50: busy +100 of +150 in the sum, which
+	// would read as 1.33 cores, but iowait went backwards.
+	usageProc(t, proc, "250 0 100 850 50 0 0 0", 2, 6*gib)
 	runUsage(t, env, "sample", dir)
 
 	// A read that fails appends nothing.
@@ -163,7 +168,7 @@ func TestTheUsageSamplerLeavesOutWhatTheCountersCannotAccountFor(t *testing.T) {
 	runUsage(t, env, "sample", dir)
 
 	// The CPU count changes: 4 CPUs now.
-	usageProc(t, proc, "300 0 100 1100 50 0 0 0", 4, 6*gib)
+	usageProc(t, proc, "350 0 100 1150 50 0 0 0", 4, 6*gib)
 	runUsage(t, env, "sample", dir)
 
 	// A line cut short by a write that stopped.
@@ -180,65 +185,83 @@ func TestTheUsageSamplerLeavesOutWhatTheCountersCannotAccountFor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// busy -100, which a counter cannot do.
-	usageProc(t, proc, "200 0 100 1250 50 0 0 0", 4, 6*gib)
+	// user -100, which a counter cannot do.
+	usageProc(t, proc, "250 0 100 1300 50 0 0 0", 4, 6*gib)
 	runUsage(t, env, "sample", dir)
 
-	// busy +100 and steal +100 of +300 across 4 CPUs: 1.33 cores run, 1.33 stolen.
-	usageProc(t, proc, "300 0 100 1350 50 0 0 100", 4, 5*gib)
+	// user +100, idle +100 and steal +100 across 4 CPUs: 1.33 cores run, 1.33 stolen.
+	usageProc(t, proc, "350 0 100 1400 50 0 0 100", 4, 5*gib)
 	runUsage(t, env, "sample", dir)
 
 	out := runUsage(t, env, "report", dir, "policy")
 	got := readUsage(t, dir, out)
 
-	if got.Samples != 6 || got.SkippedIntervals != 3 || got.VCPU != 4 {
-		t.Errorf("usage = %+v, want 6 whole samples (the failed read and the cut line are none) and 3 intervals left out", got)
+	if got.Samples != 7 || got.SkippedIntervals != 3 || got.VCPU != 4 {
+		t.Errorf("usage = %+v, want 7 whole samples (the failed read and the cut line are none) and 3 intervals left out", got)
 	}
 
-	if got.CPUMeanCores != 1.33 || got.CPUPeakCores != 1.33 || got.CPUStealCores != 1.33 || got.MemPeakGiB != 3 {
-		t.Errorf("usage = %+v, want 1.33 cores run and 1.33 stolen over the one interval that adds up, and 3 GiB held", got)
+	// Busy 50 + 100 over elapsed 100/2 + 300/4: 1.20 cores, where scaling every
+	// interval by the last CPU count would give 1.50. Stolen 100 over the same.
+	if got.CPUMeanCores != 1.2 || got.CPUPeakCores != 1.33 || got.CPUStealCores != 0.8 || got.MemPeakGiB != 3 {
+		t.Errorf("usage = %+v, want a mean of 1.20 cores, a peak of 1.33, 0.80 stolen and 3 GiB held", got)
 	}
 }
 
-// A SAMPLER THAT STOPPED EARLY IS VISIBLE: the longest gap between two samples
-// is reported, and over three intervals the peaks are called partial, because a
-// peak over a long gap is an average.
+// A SAMPLER THAT MISSED PART OF THE JOB IS VISIBLE: the longest stretch no
+// sample covers is reported, from the start to the first sample, between two,
+// and from the last to the report, and over three intervals the peaks are called
+// partial, because a peak over a long gap is an average.
 func TestTheUsageSamplerCallsAReportWithALongGapPartial(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
+		name    string
+		started int // seconds from the start to the first sample; 0 for no start file
 		times   []int
-		gap     int
+		ended   int // seconds the report comes after the last sample, at least
+		gap     int // the longest stretch, at least
 		partial bool
 	}{
-		{[]int{0, 5, 10, 15}, 5, false},
-		{[]int{0, 5, 10, 100}, 90, true},
+		{"whole", 0, []int{0, 5, 10, 15}, 0, 5, false},
+		{"a gap between two samples", 0, []int{0, 5, 10, 100}, 0, 90, true},
+		{"samples that stopped long before the report", 0, []int{0, 5, 10}, 600, 600, true},
+		{"a first sample long after the start", 80, []int{0, 5, 10, 15}, 0, 80, true},
 	} {
 		dir := t.TempDir()
+		last := tc.times[len(tc.times)-1]
+		// The last sample sits tc.ended seconds before now, which the report reads.
+		base := int(time.Now().Unix()) - tc.ended - last
 
 		var samples strings.Builder
 		for i, at := range tc.times {
-			fmt.Fprintf(&samples, "%d 2 %d %d 0 %d %d\n", 1700000000+at, 100*i, 1000*(i+1), 8*gib, 6*gib)
+			// user +100 and idle +900 a sample on 2 CPUs: 0.20 cores.
+			fmt.Fprintf(&samples, "%d 2 %d 0 0 %d 0 0 0 0 %d %d\n", base+at, 100*i, 900*(i+1), 8*gib, 6*gib)
 		}
 
-		if err := os.WriteFile(filepath.Join(dir, "samples"), []byte(samples.String()), 0o600); err != nil {
-			t.Fatal(err)
+		files := map[string]string{"samples": samples.String(), "interval": "5\n"}
+		if tc.started != 0 {
+			files["started"] = strconv.Itoa(base+tc.times[0]-tc.started) + "\n"
 		}
 
-		if err := os.WriteFile(filepath.Join(dir, "interval"), []byte("5\n"), 0o600); err != nil {
-			t.Fatal(err)
+		for name, body := range files {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
 		}
 
-		// No /proc, so report's own last sample adds nothing.
+		// No /proc, so report's own last sample adds nothing, as when it fails.
 		summary := filepath.Join(dir, "summary.md")
 		out := runUsage(t, []string{"CI_USAGE_PROC=" + filepath.Join(dir, "absent"), "GITHUB_STEP_SUMMARY=" + summary},
 			"report", dir, "guard")
 		got := readUsage(t, dir, out)
 
-		last := tc.times[len(tc.times)-1]
-		if got.MaxGapSeconds != tc.gap || got.Partial != tc.partial || got.Seconds != last || got.Samples != len(tc.times) {
-			t.Errorf("samples at %v: %+v; want a longest gap of %d, partial %v, %d s and %d samples", tc.times, got, tc.gap,
-				tc.partial, last, len(tc.times))
+		// The report reads the clock itself, so a slow run can only lengthen the
+		// stretch after the last sample, by the seconds it took.
+		seconds := last - tc.times[0]
+		if got.MaxGapSeconds < tc.gap || got.MaxGapSeconds > tc.gap+5 || got.Partial != tc.partial ||
+			got.Seconds != seconds || got.Samples != len(tc.times) {
+			t.Errorf("%s: %+v; want a longest stretch of %d s, partial %v, %d s sampled and %d samples", tc.name, got,
+				tc.gap, tc.partial, seconds, len(tc.times))
 		}
 
 		peak := "| 0.20 cores |"
@@ -250,12 +273,27 @@ func TestTheUsageSamplerCallsAReportWithALongGapPartial(t *testing.T) {
 		for _, want := range []string{
 			"| job | runner | mean CPU | peak CPU | peak memory | sampled |\n|---|---|---|---|---|---|\n",
 			peak,
-			fmt.Sprintf("| %d s, %d samples, longest gap %d s |", last, len(tc.times), tc.gap),
+			fmt.Sprintf("| %d s, %d samples, longest gap %d s |", seconds, len(tc.times), got.MaxGapSeconds),
 		} {
 			if !strings.Contains(row, want) {
-				t.Errorf("samples at %v: the step summary does not say %q:\n%s", tc.times, want, row)
+				t.Errorf("%s: the step summary does not say %q:\n%s", tc.name, want, row)
 			}
 		}
+	}
+}
+
+// AN INHERITED errexit ENDS NOTHING: bash takes it from an exported SHELLOPTS,
+// and a sample that fails must still leave the step at status 0.
+func TestTheUsageSamplerIgnoresAnInheritedErrexit(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	env := []string{"CI_USAGE_PROC=" + filepath.Join(t.TempDir(), "absent"), "SHELLOPTS=errexit"}
+
+	runUsage(t, env, "sample", dir)
+
+	if out := runUsage(t, env, "report", dir, "x"); !strings.Contains(out, "no measurement for x") {
+		t.Errorf("report under an inherited errexit said %q, want that it has no measurement", out)
 	}
 }
 
@@ -295,7 +333,7 @@ func TestTheUsageSamplerSamplesOnceAsItStarts(t *testing.T) {
 	proc, dir := t.TempDir(), t.TempDir()
 	usageProc(t, proc, "100 0 100 800 0 0 0 0 0 0", 2, 6*gib)
 
-	if err := os.WriteFile(filepath.Join(dir, "samples"), []byte("1 2 3 4 5 6 7\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "samples"), []byte("1 2 3 4 5 6 7 8 9 10 11 12\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -303,7 +341,7 @@ func TestTheUsageSamplerSamplesOnceAsItStarts(t *testing.T) {
 
 	body := readFile(t, filepath.Join(dir, "samples"))
 	if lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n"); len(lines) != 1 ||
-		!strings.HasSuffix(lines[0], " 2 200 1000 0 8388608 6291456") {
+		!strings.HasSuffix(lines[0], " 2 100 0 100 800 0 0 0 0 8388608 6291456") {
 		t.Errorf("start left samples %q, want its own one reading alone", body)
 	}
 
@@ -391,7 +429,7 @@ func TestTheUsageSamplerSamplesInTheBackgroundAndStopsWhenItReports(t *testing.T
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		body, err := os.ReadFile(filepath.Join(dir, "samples"))
-		if err == nil && strings.Contains(string(body), " 2 400 1400 0 8388608 4194304\n") {
+		if err == nil && strings.Contains(string(body), " 2 300 0 100 1000 0 0 0 0 8388608 4194304\n") {
 			break
 		}
 

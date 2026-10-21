@@ -18,20 +18,25 @@
 # one interval, so a burst shorter than it is averaged in.
 #
 # AN INTERVAL THE COUNTERS CANNOT ACCOUNT FOR IS LEFT OUT, never read as a
-# number: one in which the CPU count changed, a counter went backwards (the
-# kernel lets iowait decrease), or more time was busy than passed. And a sampler
-# that stopped early is visible: the report gives the longest gap between two
-# samples, and calls its peaks partial when that gap is over three intervals,
-# because a peak over a long gap is an average.
+# number: one in which the CPU count changed or any one counter went backwards
+# (the kernel lets iowait decrease, and the others advancing can hide it in a
+# sum). The mean is over the CPU time of the intervals kept, each at its own CPU
+# count. And a sampler that missed part of the job is visible: the report gives
+# the longest stretch the samples do not cover, from the start to the first
+# sample, between two, and from the last to the report itself, and calls its
+# peaks partial when that stretch is over three intervals, because a peak over a
+# long gap is an average.
 #
 # A MEASUREMENT, NEVER A GATE. Every mode exits 0 whatever it finds (CI runs
 # each step with continue-on-error as well), and report says "no measurement"
 # with the reason when it has no interval it can read: a sampler that failed
 # must not fail the job it was watching, and a missing number must read as
-# missing rather than as zero.
+# missing rather than as zero. errexit is off by name, because bash takes it
+# from an exported SHELLOPTS.
 #
 # CI_USAGE_PROC names the /proc to read (a test points it at a fake one).
 set -uo pipefail
+set +e
 
 proc=${CI_USAGE_PROC:-/proc}
 
@@ -40,27 +45,24 @@ usage() {
 	exit 2
 }
 
-# sample appends "<epoch> <cpus> <busy> <total> <steal> <mem_total_kib> <mem_available_kib>":
-# jiffies across all CPUs from the aggregate cpu line (busy is user, nice,
-# system, irq and softirq; total adds idle, iowait and steal), and the CPU count
-# from the per-CPU lines. It fails, writing nothing, when either file lacks what
-# it needs.
+# sample appends "<epoch> <cpus> <user> <nice> <system> <idle> <iowait> <irq>
+# <softirq> <steal> <mem_total_kib> <mem_available_kib>": the aggregate cpu
+# line's jiffies across all CPUs (guest and guest_nice after them are already in
+# user and nice) and the CPU count from the per-CPU lines. It fails, writing
+# nothing, when either file lacks what it needs.
 sample() {
 	local dir=$1 line
 	line=$(awk -v now="$(date +%s)" '
 		FILENAME ~ /stat$/ && $1 == "cpu" {
-			# user nice system idle iowait irq softirq steal; guest and guest_nice
-			# after them are already counted in user and nice.
-			for (i = 2; i <= 9 && i <= NF; i++) total += $i
-			busy = $2 + $3 + $4 + $7 + $8
-			steal = (NF >= 9) ? $9 : 0
+			for (i = 2; i <= 9; i++) { c[i] = (i <= NF) ? $i : 0; total += c[i] }
 		}
 		FILENAME ~ /stat$/ && $1 ~ /^cpu[0-9]+$/ { cpus++ }
 		FILENAME ~ /meminfo$/ && $1 == "MemTotal:" { memtotal = $2 }
 		FILENAME ~ /meminfo$/ && $1 == "MemAvailable:" { memavail = $2 }
 		END {
 			if (cpus == 0 || total == 0 || memtotal == "" || memavail == "") exit 1
-			printf "%s %d %d %d %d %d %d\n", now, cpus, busy, total, steal, memtotal, memavail
+			printf "%s %d %d %d %d %d %d %d %d %d %d %d\n", now, cpus, c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9],
+				memtotal, memavail
 		}' "$proc/stat" "$proc/meminfo") || return 1
 	printf '%s\n' "$line" >>"$dir/samples"
 }
@@ -73,7 +75,8 @@ start() {
 	if ! awk -v i="$interval" 'BEGIN { exit !(i > 0) }'; then
 		interval=5
 	fi
-	if ! mkdir -p "$dir" || ! : >"$dir/samples" || ! printf '%s\n' "$interval" >"$dir/interval"; then
+	if ! mkdir -p "$dir" || ! : >"$dir/samples" || ! printf '%s\n' "$interval" >"$dir/interval" ||
+		! date +%s >"$dir/started"; then
 		printf 'ci-usage: cannot write to %s; this job is not measured\n' "$dir" >&2
 		return 0
 	fi
@@ -91,7 +94,7 @@ start() {
 }
 
 report() {
-	local dir=$1 label=$2 pid result interval=5
+	local dir=$1 label=$2 pid result interval=5 started=
 	if [ -s "$dir/pid" ]; then
 		pid=$(cat "$dir/pid")
 		kill "$pid" 2>/dev/null
@@ -100,41 +103,55 @@ report() {
 	if [ -s "$dir/interval" ]; then
 		interval=$(cat "$dir/interval")
 	fi
+	if [ -s "$dir/started" ]; then
+		started=$(cat "$dir/started")
+	fi
 	sample "$dir" 2>/dev/null
 
 	# Lines that are not a whole sample (a write cut short) are skipped, not fatal.
-	if ! result=$(awk -v label="$label" -v interval="$interval" '
-		NF != 7 { next }
+	if ! result=$(awk -v label="$label" -v interval="$interval" -v started="$started" -v ended="$(date +%s)" '
+		NF != 12 { next }
 		{
 			n++
 			if (n > 1) {
 				gap = $1 - last
 				if (gap > maxgap) maxgap = gap
-				dbusy = $3 - busy; dtotal = $4 - total; dsteal = $5 - steal
-				if ($2 == cpus && dtotal == 0 && dbusy == 0 && dsteal == 0) {
-					# No time passed between the two, as when report samples within
-					# the same tick: no interval, and nothing wrong with it.
-				} else if ($2 == cpus && dtotal > 0 && dbusy >= 0 && dsteal >= 0 && dbusy + dsteal <= dtotal) {
+				backwards = 0; moved = 0
+				for (i = 3; i <= 10; i++) {
+					if ($i < c[i]) backwards = 1
+					if ($i != c[i]) moved = 1
+				}
+				dbusy = ($3 + $4 + $5 + $8 + $9) - (c[3] + c[4] + c[5] + c[8] + c[9])
+				dsteal = $10 - c[10]
+				dtotal = dbusy + dsteal + ($6 + $7) - (c[6] + c[7])
+				if ($2 != cpus || backwards) {
+					skipped++
+				} else if (moved && dtotal > 0) {
+					# Elapsed time is the interval CPU time spread over its CPUs.
 					intervals++
-					sumbusy += dbusy; sumsteal += dsteal; sumtotal += dtotal
+					sumbusy += dbusy; sumsteal += dsteal; sumelapsed += dtotal / $2
 					cores = dbusy / dtotal * $2
 					if (cores > peak) peak = cores
-				} else {
-					skipped++
 				}
+				# An interval in which no counter moved adds nothing (report samples
+				# within the same tick as the last one).
 			}
 			if (n == 1) first = $1
-			last = $1; cpus = $2; busy = $3; total = $4; steal = $5
-			used = ($6 - $7) / 1048576
+			last = $1; cpus = $2
+			for (i = 3; i <= 10; i++) c[i] = $i
+			used = ($11 - $12) / 1048576
 			if (used > mempeak) mempeak = used
-			memtotal = $6 / 1048576
+			memtotal = $11 / 1048576
 		}
 		END {
-			if (intervals == 0 || sumtotal == 0) exit 1
+			if (intervals == 0 || sumelapsed == 0) exit 1
+			# The stretches no sample covers at either end count as gaps too.
+			if (started != "" && first - started > maxgap) maxgap = first - started
+			if (ended - last > maxgap) maxgap = ended - last
 			# Stamps are whole seconds, so a gap reads up to one second long.
 			partial = (maxgap > 3 * interval + 1) ? "true" : "false"
 			printf "{\"label\":\"%s\",\"vcpu\":%d,\"mem_total_gib\":%.1f,\"cpu_mean_cores\":%.2f,\"cpu_peak_cores\":%.2f,\"cpu_steal_cores\":%.2f,\"mem_peak_gib\":%.2f,\"samples\":%d,\"skipped_intervals\":%d,\"max_gap_seconds\":%d,\"partial\":%s,\"seconds\":%d}\n",
-				label, cpus, memtotal, sumbusy / sumtotal * cpus, peak, sumsteal / sumtotal * cpus, mempeak, n, skipped, maxgap, partial, last - first
+				label, cpus, memtotal, sumbusy / sumelapsed, peak, sumsteal / sumelapsed, mempeak, n, skipped, maxgap, partial, last - first
 		}' "$dir/samples" 2>/dev/null); then
 		printf 'ci-usage: no measurement for %s: no interval it can read in %s\n' "$label" "$dir/samples"
 		if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
