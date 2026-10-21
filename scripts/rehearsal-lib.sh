@@ -529,6 +529,21 @@ rehearsal_journal_step() {
     ' 2>/dev/null || true
 }
 
+# rehearsal_absent succeeds only when Docker positively says a container or a
+# network does not exist: rehearsal_absent container|network <name>. An
+# inspection that fails for any other reason (the daemon unreachable, say) is
+# "could not tell", which teardown counts as left behind, never as gone.
+rehearsal_absent() {
+    local out
+    if out=$(docker "$1" inspect "$2" 2>&1 >/dev/null); then
+        return 1
+    fi
+    case "${out}" in
+        *"No such"* | *"not found"*) return 0 ;;
+    esac
+    return 1
+}
+
 # rehearsal_teardown_hosts removes the containers, the network and the storage
 # a rehearsal created. Registered on EXIT by every driver, so a failed
 # assertion still leaves nothing running. Returns non-zero, having named each
@@ -549,16 +564,16 @@ rehearsal_teardown_hosts() {
         if ! docker rm -f -v "${name}" >/dev/null 2>&1; then
             # A removal of a container that was never created fails too, so the
             # survivor is what decides, never the removal's own status.
-            if docker container inspect "${name}" >/dev/null 2>&1; then
-                echo "TEARDOWN: container ${name} survived removal" >&2
+            if ! rehearsal_absent container "${name}"; then
+                echo "TEARDOWN: container ${name} survived removal, or Docker could not say" >&2
                 left=1
             fi
         fi
     done
 
     if ! docker network rm "${network}" >/dev/null 2>&1; then
-        if docker network inspect "${network}" >/dev/null 2>&1; then
-            echo "TEARDOWN: network ${network} survived removal" >&2
+        if ! rehearsal_absent network "${network}"; then
+            echo "TEARDOWN: network ${network} survived removal, or Docker could not say" >&2
             left=1
         fi
     fi

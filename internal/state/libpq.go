@@ -451,69 +451,81 @@ func uriSettings(text string) (map[string]string, error) {
 }
 
 // keywordSettings reads a `key=value key='quoted value'` connection string into
-// libpq keywords, with libpq's quoting: a value may be single-quoted, and a
-// backslash escapes the next character inside or outside quotes.
+// libpq keywords, exactly as pgx v5.10.0's parseKeywordValueSettings reads it.
+//
+// pgx's DECODING, NOT libpq's, because the values go into libpq's environment,
+// which libpq takes literally: what the client program must see is the value
+// billet's own connection used. A value may be single-quoted; a backslash keeps
+// the next byte in the value (a space, or a quote inside quotes), and only `\\`
+// and `\'` are then unescaped, so `billet\ worker` stays `billet\ worker`,
+// which PGOPTIONS splits as one word, as the server splits what pgx sent.
 func keywordSettings(text string) (map[string]string, error) {
 	out := map[string]string{}
 
-	for s := strings.TrimSpace(text); s != ""; s = strings.TrimSpace(s) {
+	s := strings.TrimLeftFunc(text, isSpaceRune)
+	for s != "" {
 		eq := strings.IndexByte(s, '=')
-		if eq <= 0 {
+		if eq < 0 {
 			return nil, errUnparsableDSN
 		}
 
-		key := strings.TrimSpace(s[:eq])
-		s = strings.TrimLeft(s[eq+1:], " \t\n\r")
+		key := strings.TrimFunc(s[:eq], isSpaceRune)
+		s = strings.TrimLeftFunc(s[eq+1:], isSpaceRune)
 
-		var (
-			value strings.Builder
-			i     int
-		)
+		var value string
 
-		if strings.HasPrefix(s, "'") {
-			closed := false
-
-			for i = 1; i < len(s); i++ {
-				switch c := s[i]; {
-				case c == '\\' && i+1 < len(s):
-					i++
-					value.WriteByte(s[i])
-				case c == '\'':
-					closed = true
-				default:
-					value.WriteByte(c)
-				}
-
-				if closed {
-					i++
-
-					break
+		switch {
+		case s == "":
+		case s[0] != '\'':
+			end := 0
+			for ; end < len(s) && !isSpace(s[end]); end++ {
+				if s[end] == '\\' {
+					end++
+					if end == len(s) {
+						return nil, errUnparsableDSN
+					}
 				}
 			}
 
-			if !closed {
+			value, s = unescapeKeyword(s[:end]), strings.TrimLeftFunc(s[end:], isSpaceRune)
+		default:
+			s = s[1:]
+
+			end := 0
+			for ; end < len(s) && s[end] != '\''; end++ {
+				if s[end] == '\\' {
+					end++
+				}
+			}
+
+			if end >= len(s) {
 				return nil, errUnparsableDSN
 			}
-		} else {
-			for i = 0; i < len(s) && !isSpace(s[i]); i++ {
-				if s[i] == '\\' && i+1 < len(s) {
-					i++
-				}
 
-				value.WriteByte(s[i])
-			}
+			value, s = unescapeKeyword(s[:end]), strings.TrimLeftFunc(s[end+1:], isSpaceRune)
 		}
 
-		if key == "" || strings.ContainsAny(key, " \t") {
+		if key == "" || strings.IndexFunc(key, isSpaceRune) >= 0 {
 			return nil, errUnparsableDSN
 		}
 
-		out[canonicalKeyword(key)] = value.String()
-		s = s[i:]
+		// AS pgx DOES: an empty user is no setting at all.
+		if key == "user" && value == "" {
+			continue
+		}
+
+		out[canonicalKeyword(key)] = value
 	}
 
 	return out, nil
 }
+
+// unescapeKeyword is pgx's unescaping of a keyword value: `\\` and `\'` only.
+func unescapeKeyword(v string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(v, `\\`, `\`), `\'`, `'`)
+}
+
+func isSpaceRune(r rune) bool { return r < 0x80 && isSpace(byte(r)) }
 
 // isSpace is pgconn's asciiSpace, so the two readings of a keyword string end a
 // value at the same byte: a separator only one of them saw would hide a keyword

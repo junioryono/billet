@@ -110,6 +110,16 @@ func TestADSNIsRenderedAsTheEnvironmentLibpqReads(t *testing.T) {
 			want: map[string]string{"PGPORT": "5432", "PGUSER": "u"},
 		},
 		{
+			name: "an escaped space in quoted options, kept as pgx keeps it",
+			dsn:  `host=h user=u dbname=d sslmode=disable options='-c application_name=billet\ worker'`,
+			want: map[string]string{"PGOPTIONS": `-c application_name=billet\ worker`},
+		},
+		{
+			name: "a backslash before an ordinary byte, kept as pgx keeps it",
+			dsn:  `host=h user=u dbname=d sslmode=disable password=a\xb`,
+			want: map[string]string{"PGPASSWORD": `a\xb`},
+		},
+		{
 			name: "several hosts, each with its own port",
 			dsn:  "postgres://u@h1:5433,h2:5434/d?sslmode=disable",
 			want: map[string]string{"PGHOST": "h1,h2", "PGPORT": "5433,5434"},
