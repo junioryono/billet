@@ -59,12 +59,35 @@ func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Ne
 		unitpath.Need{Path: cfg.Node.Firecracker.ChrootBase, Access: unitpath.Write, Create: true, Mode: 0o700,
 			Why: "the jailer's chroot base, where the verification boots its probe"})
 
-	if cfg.Node.TLS == nil {
+	// WHERE THE VERIFICATION FINDS ITS IDENTITY, in verifyDeploymentID's order: a
+	// certificate that loads and names one is read and nothing is written; past
+	// it, the control plane's directory beside the node, or else the node's own
+	// state directory, is where the identity is read or minted.
+	switch {
+	case certificateNamesDeployment(cfg):
+	case cfg.Server != nil:
+		needs = append(needs, unitpath.Need{Path: cfg.Server.IdentityDir, Access: unitpath.Write, Create: true, Mode: 0o700,
+			Why: "where a node beside the control plane, with no certificate, reads or founds the deployment identity"})
+	default:
 		needs = append(needs, unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true, Mode: 0o700,
 			Why: "where a node with no certificate keeps its deployment identity"})
 	}
 
 	return append(needs, probeLockNeed(cfg))
+}
+
+// certificateNamesDeployment reports whether the node's certificate bundle
+// loads and names a deployment, the one case the verification writes no
+// identity: a bundle that does not load is passed over, not refused.
+func certificateNamesDeployment(cfg *config.Config) bool {
+	bundle, err := app.NodeBundle(cfg)
+	if err != nil || bundle == nil {
+		return false
+	}
+
+	_, err = bundle.Deployment()
+
+	return err == nil
 }
 
 // probeLockNeed is the verification lock, named for the deployment the probe

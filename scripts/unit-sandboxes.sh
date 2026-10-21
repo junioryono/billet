@@ -147,17 +147,36 @@ EOF
     done </tmp/paths
 
     # WHAT THIS START LOGGED, never an earlier exercise's: a refusal left in the
-    # journal by another run would otherwise read as this one's reason.
-    cursor=$(journalctl -n 0 --show-cursor -o cat --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p')
+    # journal by another run would otherwise read as this one's reason. journald
+    # is synced on both sides, since a unit's exit says nothing about whether
+    # its output has been written: before, so the cursor is past everything
+    # earlier, and after, so the read holds everything this start said.
+    if ! journalctl --sync; then
+        why="journald could not be synced before ${unit} started"
+        unstub "${unit}"
+        return 1
+    fi
+    cursor=$(journalctl -n 1 --show-cursor -o cat --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p')
+    if [ -z "${cursor}" ]; then
+        why="journald gave no cursor before ${unit} started, so this start's log could not be told from an earlier one's"
+        unstub "${unit}"
+        return 1
+    fi
 
     started=0
     if systemctl start "${unit}"; then
         started=1
     fi
 
+    if ! journalctl --sync; then
+        why="journald could not be synced after ${unit} ran"
+        unstub "${unit}"
+        return 1
+    fi
+
     result=$(systemctl show --property=Result --value "${unit}")
     status=$(systemctl show --property=ExecMainStatus --value "${unit}")
-    journalctl -u "${unit}" -o cat --no-pager ${cursor:+--after-cursor "${cursor}"} >/tmp/journal 2>&1 || true
+    journalctl -u "${unit}" -o cat --no-pager --after-cursor "${cursor}" >/tmp/journal 2>&1 || true
     grep -E '^(ok|REFUSED) ' /tmp/journal || true
     refused=$(grep -E '^REFUSED ' /tmp/journal | tr '\n' ' ' || true)
 

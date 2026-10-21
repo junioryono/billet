@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/unitpath"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // THE DECLARED LOCKS ARE THE FILES THE COMMAND LOCKS (#174): each Take is the
@@ -45,7 +47,7 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 		dirs["kernels"]:                 unitpath.Write,
 		kernelLockPath(dirs["kernels"]): unitpath.Lock,
 		dirs["jailer"]:                  unitpath.Write,
-		dirs["node"]:                    unitpath.Write,
+		dirs["server"]:                  unitpath.Write,
 	}
 
 	var probe unitpath.Need
@@ -117,15 +119,30 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 			t.Errorf("the probe lock declared at %s is not the file the verification locked: %v", n.Path, err)
 		}
 	}
+
+	// IN THE DIRECTORY DECLARED FOR IT: beside a control plane, the node with no
+	// certificate founds the identity in the server's directory, never its own.
+	if _, err := os.Stat(state.DeploymentIDPath(dirs["server"])); err != nil {
+		t.Errorf("the identity was not minted in the declared %s: %v", dirs["server"], err)
+	}
+
+	if _, err := os.Stat(dirs["node"]); !os.IsNotExist(err) {
+		t.Errorf("the undeclared %s was written (%v)", dirs["node"], err)
+	}
 }
 
-// A NODE WITH A CERTIFICATE takes its identity from it, so the refresh never
-// writes the node's state directory, and an exercise must not either.
-func TestRefreshPathsOfANodeWithACertificateLeaveItsStateDirectory(t *testing.T) {
+// THE IDENTITY'S DIRECTORY IS DECLARED WHERE THE VERIFICATION WRITES IT, in
+// verifyDeploymentID's order: nowhere for a certificate that loads and names a
+// deployment, the control plane's directory beside the node, or else the node's
+// own state directory, which is also where a certificate that does not load
+// falls back to.
+func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "node")
+	serverDir := filepath.Join(root, "server")
 
 	body := strings.NewReplacer(
+		"state_dir: /var/lib/billet/server", "state_dir: "+serverDir,
 		"state_dir: /var/lib/billet/node", "state_dir: "+stateDir+"\n  lock_dir: "+filepath.Join(root, "locks"),
 	).Replace(firecrackerNodeConfig)
 
@@ -134,23 +151,76 @@ func TestRefreshPathsOfANodeWithACertificateLeaveItsStateDirectory(t *testing.T)
 		t.Fatal(err)
 	}
 
-	cfg, err := config.Load(cfgPath)
+	load := func() *config.Config {
+		cfg, err := config.Load(cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return cfg
+	}
+
+	declares := func(cfg *config.Config, dir string) bool {
+		return slices.ContainsFunc(RefreshPaths(processEnv(), cfg, cfgPath), func(n unitpath.Need) bool {
+			return n.Path == dir && n.Access == unitpath.Write
+		})
+	}
+
+	beside := load()
+	if !declares(beside, serverDir) || declares(beside, stateDir) {
+		t.Error("a node beside a control plane, with no certificate, does not declare the server's directory alone")
+	}
+
+	alone := load()
+	alone.Server = nil
+
+	if !declares(alone, stateDir) {
+		t.Error("a node alone, with no certificate, does not declare the state directory its identity is minted in")
+	}
+
+	// A CERTIFICATE THAT DOES NOT LOAD IS PASSED OVER, as the verification
+	// passes over it, so the directory past it is still written.
+	broken := load()
+	broken.Server = nil
+	broken.Node.TLS = &config.NodeTLS{
+		CertPath: filepath.Join(root, "absent.crt"), KeyPath: filepath.Join(root, "absent.key"), CAPath: filepath.Join(root, "absent-ca.crt"),
+	}
+
+	if !declares(broken, stateDir) {
+		t.Error("a node whose certificate does not load does not declare the state directory it falls back to")
+	}
+
+	deployment, err := state.DeploymentID(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !slices.ContainsFunc(RefreshPaths(processEnv(), cfg, cfgPath), func(n unitpath.Need) bool { return n.Path == stateDir }) {
-		t.Fatal("a node with no certificate does not declare the state directory its identity is minted in")
+	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), deployment)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	cfg.Node.TLS = &config.NodeTLS{
-		CertPath: filepath.Join(root, "node.crt"), KeyPath: filepath.Join(root, "node.key"), CAPath: filepath.Join(root, "ca.crt"),
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for _, n := range RefreshPaths(processEnv(), cfg, cfgPath) {
-		if n.Path == stateDir {
-			t.Errorf("a node with a certificate declares %s %s", n.Access, n.Path)
-		}
+	bundleDir := t.TempDir()
+	if err := bundle.Write(bundleDir); err != nil {
+		t.Fatal(err)
+	}
+
+	certified := load()
+	certified.Node.TLS = &config.NodeTLS{
+		CertPath: filepath.Join(bundleDir, "node.crt"), KeyPath: filepath.Join(bundleDir, "node.key"), CAPath: filepath.Join(bundleDir, "ca.crt"),
+	}
+
+	if !certificateNamesDeployment(certified) {
+		t.Fatal("the bundle this case turns on does not load")
+	}
+
+	if declares(certified, stateDir) || declares(certified, serverDir) {
+		t.Error("a node whose certificate names its deployment declares a directory for an identity it never writes")
 	}
 }
 

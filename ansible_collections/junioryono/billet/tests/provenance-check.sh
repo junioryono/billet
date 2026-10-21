@@ -20,8 +20,9 @@
 #                 the manifest published later is found by the next converge
 #   refetch       a candidate staged without its evidence gets it, unchanged
 #   origin-gone   a staged candidate whose origin stopped serving it converges,
-#                 records nothing new, and says why
-#   rollback      the record before a transaction comes back after it, or stays
+#                 records nothing new, says why, and asks once
+#   origin-down   an unreachable origin is not retried for evidence alone
+#   rollback     the record before a transaction comes back after it, or stays
 #                 away, and a journal from before the record was kept leaves it
 #   check-mode    a dry run fetches nothing (the record steps are all gated off
 #                 a dry run, which host-upgrade-order.yml holds)
@@ -300,6 +301,20 @@ grep -q 'could not be fetched again beside the staged candidate' "$work/backfill
 # ASKED ONCE: the play allows a retry, which evidence for a staged candidate
 # must not spend.
 [ "$asked" -eq 1 ] || fail "origin-gone: the evidence was asked for ${asked} times, not once" "$work/origin.log"
+
+# origin-down: an origin that refuses connections is a failure the role retries
+# for a candidate it needs, and must not for evidence it does not: neither the
+# archive nor the manifest is asked again.
+rm -f "$stage/billet-v0.16.9.tar.gz" "$stage/billet-v0.16.9.release-manifest.json"
+record_before=$(sha "$record")
+run backfill v0.16.9 -e "origin=http://127.0.0.1:9"
+if grep -q 'FAILED - RETRYING' "$work/backfill.log"; then
+    fail "origin-down: evidence beside a staged candidate was retried" "$work/backfill.log"
+fi
+grep -q 'could not be fetched again beside the staged candidate' "$work/backfill.log" ||
+    fail "origin-down: the run did not say the evidence could not be fetched" "$work/backfill.log"
+[ "$(sha "$record")" = "$record_before" ] || fail "origin-down: the record changed without evidence"
+echo "ok   origin-down: evidence an unreachable origin cannot serve is asked for once and fails nothing"
 echo "ok   origin-gone: an origin that stopped serving the release fails nothing and says so"
 
 # rollback: the record comes back as it was before the transaction, from what
