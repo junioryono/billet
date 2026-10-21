@@ -102,9 +102,10 @@ func (q *Queries) DeletePoolRunner(ctx context.Context, leaseID string) error {
 const insertPoolRunner = `-- name: InsertPoolRunner :exec
 
 INSERT INTO pool_runners
-     (lease_id, tier, launch_request_id, runner_id, runner_name, status, updated_at)
+     (lease_id, tier, launch_request_id, runner_id, runner_name, status, updated_at,
+      github_target)
 VALUES ($1, $2, $3, $4, $5, $6,
-        $7)
+        $7, $8)
 `
 
 type InsertPoolRunnerParams struct {
@@ -115,6 +116,7 @@ type InsertPoolRunnerParams struct {
 	RunnerName      string
 	Status          string
 	UpdatedAt       string
+	GithubTarget    string
 }
 
 // Pool runners: one GitHub registration backed by one compute lease.
@@ -136,6 +138,10 @@ type InsertPoolRunnerParams struct {
 // a legacy registration GitHub says is working, and retiring when recovery is
 // claiming one for teardown and no row existed. The table's CHECK is what keeps
 // the vocabulary closed.
+//
+// github_target IS THE OWNER THE RUNNER WAS REGISTERED ON (migration 64), which
+// a removal and a recovery resolve their credential from rather than from the
+// tier's target today. Empty only where the plane had no path to give.
 func (q *Queries) InsertPoolRunner(ctx context.Context, arg InsertPoolRunnerParams) error {
 	_, err := q.db.ExecContext(ctx, insertPoolRunner,
 		arg.LeaseID,
@@ -145,6 +151,7 @@ func (q *Queries) InsertPoolRunner(ctx context.Context, arg InsertPoolRunnerPara
 		arg.RunnerName,
 		arg.Status,
 		arg.UpdatedAt,
+		arg.GithubTarget,
 	)
 	return err
 }
@@ -152,7 +159,7 @@ func (q *Queries) InsertPoolRunner(ctx context.Context, arg InsertPoolRunnerPara
 const listPoolRunnersInTier = `-- name: ListPoolRunnersInTier :many
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
        actual_request_id, run_id, job_id, source_acknowledged, updated_at,
-       job_owner, job_repository, job_workflow_ref, job_event
+       job_owner, job_repository, job_workflow_ref, job_event, github_target
   FROM pool_runners WHERE tier = $1 ORDER BY updated_at, lease_id
 `
 
@@ -182,6 +189,7 @@ func (q *Queries) ListPoolRunnersInTier(ctx context.Context, tier string) ([]Poo
 			&i.JobRepository,
 			&i.JobWorkflowRef,
 			&i.JobEvent,
+			&i.GithubTarget,
 		); err != nil {
 			return nil, err
 		}
@@ -256,7 +264,7 @@ func (q *Queries) MarkPoolRunnerRetiring(ctx context.Context, arg MarkPoolRunner
 const readPoolRunnerByLease = `-- name: ReadPoolRunnerByLease :one
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
        actual_request_id, run_id, job_id, source_acknowledged, updated_at,
-       job_owner, job_repository, job_workflow_ref, job_event
+       job_owner, job_repository, job_workflow_ref, job_event, github_target
   FROM pool_runners WHERE lease_id = $1
 `
 
@@ -283,6 +291,7 @@ func (q *Queries) ReadPoolRunnerByLease(ctx context.Context, leaseID string) (Po
 		&i.JobRepository,
 		&i.JobWorkflowRef,
 		&i.JobEvent,
+		&i.GithubTarget,
 	)
 	return i, err
 }
@@ -290,7 +299,7 @@ func (q *Queries) ReadPoolRunnerByLease(ctx context.Context, leaseID string) (Po
 const readPoolRunnerByName = `-- name: ReadPoolRunnerByName :one
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
        actual_request_id, run_id, job_id, source_acknowledged, updated_at,
-       job_owner, job_repository, job_workflow_ref, job_event
+       job_owner, job_repository, job_workflow_ref, job_event, github_target
   FROM pool_runners WHERE runner_name = $1
 `
 
@@ -314,6 +323,7 @@ func (q *Queries) ReadPoolRunnerByName(ctx context.Context, runnerName string) (
 		&i.JobRepository,
 		&i.JobWorkflowRef,
 		&i.JobEvent,
+		&i.GithubTarget,
 	)
 	return i, err
 }

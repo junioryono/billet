@@ -19,10 +19,15 @@
 -- a legacy registration GitHub says is working, and retiring when recovery is
 -- claiming one for teardown and no row existed. The table's CHECK is what keeps
 -- the vocabulary closed.
+--
+-- github_target IS THE OWNER THE RUNNER WAS REGISTERED ON (migration 64), which
+-- a removal and a recovery resolve their credential from rather than from the
+-- tier's target today. Empty only where the plane had no path to give.
 INSERT INTO pool_runners
-     (lease_id, tier, launch_request_id, runner_id, runner_name, status, updated_at)
+     (lease_id, tier, launch_request_id, runner_id, runner_name, status, updated_at,
+      github_target)
 VALUES (@lease_id, @tier, @launch_request_id, @runner_id, @runner_name, @status,
-        @updated_at);
+        @updated_at, @github_target);
 
 -- name: ReadPoolRunnerByLease :one
 -- The pool member backed by one lease.
@@ -31,21 +36,21 @@ VALUES (@lease_id, @tier, @launch_request_id, @runner_id, @runner_name, @status,
 -- write transaction by every mutation below, against the row that write acts on.
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
        actual_request_id, run_id, job_id, source_acknowledged, updated_at,
-       job_owner, job_repository, job_workflow_ref, job_event
+       job_owner, job_repository, job_workflow_ref, job_event, github_target
   FROM pool_runners WHERE lease_id = @lease_id;
 
 -- name: ReadPoolRunnerByName :one
 -- GitHub's runner identity resolved to billet's compute lease.
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
        actual_request_id, run_id, job_id, source_acknowledged, updated_at,
-       job_owner, job_repository, job_workflow_ref, job_event
+       job_owner, job_repository, job_workflow_ref, job_event, github_target
   FROM pool_runners WHERE runner_name = @runner_name;
 
 -- name: ListPoolRunnersInTier :many
 -- Every durable member of one tier's GitHub runner pool.
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
        actual_request_id, run_id, job_id, source_acknowledged, updated_at,
-       job_owner, job_repository, job_workflow_ref, job_event
+       job_owner, job_repository, job_workflow_ref, job_event, github_target
   FROM pool_runners WHERE tier = @tier ORDER BY updated_at, lease_id;
 
 -- name: ReadPoolRunnerSettlementByRequest :one

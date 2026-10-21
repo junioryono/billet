@@ -267,6 +267,8 @@ type fakeStore struct {
 	usages  []reportedUsage
 	pool    map[string]alloc.PoolRunner
 	retired []string
+	// leaseTargets is the GitHub owner recorded on each lease, by lease id.
+	leaseTargets map[string]string
 	// guests are the guest reports recorded, with the epoch each arrived under.
 	guests []reportedGuest
 }
@@ -419,6 +421,25 @@ func (f *fakeStore) RegisterPoolRunner(_ context.Context, runner alloc.PoolRunne
 	}
 	f.pool[runner.RunnerName] = runner
 	return nil
+}
+
+func (f *fakeStore) RecordLeaseGitHubTarget(_ context.Context, leaseID string, _ int64, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if prior := f.leaseTargets[leaseID]; prior != "" && prior != path {
+		return alloc.ErrConflict
+	}
+	if f.leaseTargets == nil {
+		f.leaseTargets = make(map[string]string)
+	}
+	f.leaseTargets[leaseID] = path
+	return nil
+}
+
+func (f *fakeStore) LeaseGitHubTarget(_ context.Context, leaseID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.leaseTargets[leaseID], nil
 }
 
 func (f *fakeStore) PoolRunnerByName(_ context.Context, name string) (alloc.PoolRunner, error) {

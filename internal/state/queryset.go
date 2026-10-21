@@ -159,6 +159,7 @@ type ReadOps interface {
 	ReadLeaseCharge(ctx context.Context, id string) (ledgerdb.ReadLeaseChargeRow, error)
 	ReadLeaseClosure(ctx context.Context, id string) (ledgerdb.ReadLeaseClosureRow, error)
 	ReadLeaseEpoch(ctx context.Context, id string) (int64, error)
+	ReadLeaseGitHubTarget(ctx context.Context, id string) (string, error)
 	ReadLeaseJob(ctx context.Context, id string) (ledgerdb.ReadLeaseJobRow, error)
 	ReadLeaseSettlement(ctx context.Context, id string) (ledgerdb.ReadLeaseSettlementRow, error)
 	ReadLeaseTargetSize(ctx context.Context, id string) (ledgerdb.ReadLeaseTargetSizeRow, error)
@@ -274,6 +275,7 @@ type WriteOps interface {
 	BackfillLeaseFailureReason(ctx context.Context, arg ledgerdb.BackfillLeaseFailureReasonParams) error
 	RecordLeaseCacheObservation(ctx context.Context, arg ledgerdb.RecordLeaseCacheObservationParams) error
 	RecordLeaseDisruption(ctx context.Context, arg ledgerdb.RecordLeaseDisruptionParams) error
+	RecordLeaseGitHubTarget(ctx context.Context, arg ledgerdb.RecordLeaseGitHubTargetParams) error
 	RecordMigration(ctx context.Context, arg ledgerdb.RecordMigrationParams) error
 	RecordNodeRevocation(ctx context.Context, arg ledgerdb.RecordNodeRevocationParams) error
 	ReplaceDeniedEnrollment(ctx context.Context, arg ledgerdb.ReplaceDeniedEnrollmentParams) error

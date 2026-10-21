@@ -64,6 +64,28 @@ type poolRunnerStore interface {
 	PreserveRecoveredBusyPoolRunner(ctx context.Context, runner alloc.PoolRunner) error
 	RetireRecoveredPoolRunner(ctx context.Context, runner alloc.PoolRunner) (alloc.PoolRunner, error)
 	RetirePoolRunner(ctx context.Context, leaseID string) error
+	// RecordLeaseGitHubTarget records the owner a lease's runner is about to be
+	// registered on, fenced and written once; LeaseGitHubTarget reads it back,
+	// empty when none was recorded.
+	RecordLeaseGitHubTarget(ctx context.Context, leaseID string, epoch int64, path string) error
+	LeaseGitHubTarget(ctx context.Context, leaseID string) (string, error)
+}
+
+// TargetSource is a source that names the GitHub owner its credential is for,
+// by the owner's path. A source that does not is one whose owner the plane
+// cannot record, and a runner it mints resolves through the catalogue.
+type TargetSource interface {
+	GitHubTarget() string
+}
+
+// targetPath is the GitHub path of the owner a source serves, empty when the
+// source does not say.
+func targetPath(src JITSource) string {
+	if named, ok := src.(TargetSource); ok {
+		return named.GitHubTarget()
+	}
+
+	return ""
 }
 
 // LeaseStore is the ledger, as the node wire needs it.
@@ -1956,25 +1978,40 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// REFUSED BEFORE ANYTHING IS MINTED when the runner's identity cannot be
+	// journaled: a registration nothing records is one nothing removes.
+	pool, ok := h.store.(poolRunnerStore)
+	if !ok {
+		writeStoreErr(w, errors.New("nodeplane: the lease store cannot preserve runner identity"))
+
+		return
+	}
+
+	// THE OWNER IS DURABLE BEFORE THE REGISTRATION EXISTS. A mint whose answer is
+	// lost leaves a runner on GitHub and no binding naming it, and recovering it
+	// later through whatever the catalogue then names would ask the wrong owner,
+	// which answers that no such runner exists.
+	path := targetPath(src)
+	if path != "" {
+		owned, err := h.store.Lease(r.Context(), leaseID)
+		if err == nil && owned == nil {
+			err = fmt.Errorf("nodeplane: lease %s no longer exists", leaseID)
+		}
+		if err == nil {
+			err = pool.RecordLeaseGitHubTarget(r.Context(), leaseID, owned.Epoch, path)
+		}
+		if err != nil {
+			writeStoreErr(w, err)
+
+			return
+		}
+	}
+
 	reg, err := src.JITConfig(r.Context(), req.ScaleSetID, req.RunnerName, req.WorkFolder)
 	if err != nil {
 		// NOT LOGGED WITH THE REQUEST. A failure to mint can carry the runner name
 		// and the scale set, which are harmless, but this path is one edit away
 		// from carrying the config itself into a log line that outlives the job.
-		writeStoreErr(w, err)
-
-		return
-	}
-	pool, ok := h.store.(poolRunnerStore)
-	if !ok {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
-		defer cancel()
-		if removeErr := src.RemoveRunner(cleanupCtx, reg.ID(), reg.RunnerName()); removeErr != nil {
-			err = errors.Join(errors.New("nodeplane: the lease store cannot preserve runner identity"),
-				fmt.Errorf("remove unjournaled runner %q: %w", reg.RunnerName(), removeErr))
-		} else {
-			err = errors.New("nodeplane: the lease store cannot preserve runner identity")
-		}
 		writeStoreErr(w, err)
 
 		return
@@ -1988,7 +2025,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		err = pool.RegisterPoolRunner(persistCtx, alloc.PoolRunner{
 			LeaseID: leaseID, Tier: tier, LaunchRequestID: lease.RequestID,
-			RunnerID: reg.ID(), RunnerName: reg.RunnerName(),
+			RunnerID: reg.ID(), RunnerName: reg.RunnerName(), GitHubTarget: path,
 		})
 	}
 	if err != nil {
@@ -2081,7 +2118,16 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	src, err := h.jitForLabel(binding.Tier)
+	recorded := []string{binding.GitHubTarget}
+	if !ended {
+		leaseTarget, err := pool.LeaseGitHubTarget(r.Context(), binding.LeaseID)
+		if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+			writeStoreErr(w, err)
+			return
+		}
+		recorded = append(recorded, leaseTarget)
+	}
+	src, err := h.jitForRunner(binding.Tier, recorded...)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
@@ -2294,13 +2340,26 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 			"runner recovery name does not match its lease")
 		return
 	}
-	src, err := h.jitForLabel(lease.Tier)
+	binding, bindingErr := pool.PoolRunnerByLease(r.Context(), leaseID)
+	if bindingErr != nil && !errors.Is(bindingErr, alloc.ErrLeaseNotFound) {
+		writeStoreErr(w, bindingErr)
+		return
+	}
+	// THE OWNER THE RUNNER WAS MINTED ON, from the lease, which records it before
+	// the mint, and the binding, which records it after; a lease whose binding
+	// was never journaled has only the first.
+	leaseTarget, err := pool.LeaseGitHubTarget(r.Context(), leaseID)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
 	}
-	binding, err := pool.PoolRunnerByLease(r.Context(), leaseID)
-	if err == nil {
+	src, err := h.jitForRunner(lease.Tier, leaseTarget, binding.GitHubTarget)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	path := targetPath(src)
+	if bindingErr == nil {
 		if binding.Tier != lease.Tier || binding.LaunchRequestID != lease.RequestID {
 			writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
 				"durable runner identity does not match its lease")
@@ -2331,10 +2390,6 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
-		writeStoreErr(w, err)
-		return
-	}
 	recovery, err := src.RecoverRunner(r.Context(), req.RunnerName)
 	if err != nil {
 		writeStoreErr(w, err)
@@ -2349,7 +2404,7 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 	if recovery.Busy {
 		if err := pool.PreserveRecoveredBusyPoolRunner(r.Context(), alloc.PoolRunner{
 			LeaseID: leaseID, Tier: lease.Tier, LaunchRequestID: lease.RequestID,
-			RunnerID: recovery.RunnerID, RunnerName: req.RunnerName,
+			RunnerID: recovery.RunnerID, RunnerName: req.RunnerName, GitHubTarget: path,
 		}); err != nil {
 			writeStoreErr(w, err)
 			return
@@ -2373,7 +2428,7 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 	}
 	settled, err := pool.RetireRecoveredPoolRunner(r.Context(), alloc.PoolRunner{
 		LeaseID: leaseID, Tier: lease.Tier, LaunchRequestID: lease.RequestID,
-		RunnerID: retiringID, RunnerName: req.RunnerName,
+		RunnerID: retiringID, RunnerName: req.RunnerName, GitHubTarget: path,
 	})
 	if err != nil {
 		writeStoreErr(w, err)
@@ -2650,4 +2705,71 @@ func (h *handler) jitForLabel(label string) (JITSource, error) {
 	}
 
 	return h.jitFor(tier)
+}
+
+// jitForRunner is the source that holds the credential of the owner a lease's
+// runner was registered on, given what the ledger recorded of it.
+//
+// THE RECORDED OWNER, NEVER THE CATALOGUE'S, once one was recorded: a tier
+// removed from the config, or moved to another target, still has runners on the
+// owner they were minted on (#93). Asking another owner's App to remove one is
+// refused at best, and a recovery would read its "no such runner" as proof the
+// runner is gone. So a recorded path resolves to the source serving it (the
+// tier's own when the catalogue's target serves that path, else the one source
+// that does), and is refused when no source, or more than one and not the
+// tier's, serves it. Records that disagree are refused. A runner minted before
+// the owner was recorded resolves through the catalogue, as it always did.
+func (h *handler) jitForRunner(label string, recorded ...string) (JITSource, error) {
+	path := ""
+	for _, r := range recorded {
+		switch {
+		case r == "" || r == path:
+		case path == "":
+			path = r
+		default:
+			return nil, fmt.Errorf("nodeplane: the runner of tier %q is recorded on GitHub targets %q and %q, "+
+				"so this control plane cannot tell which credential removes it", label, path, r)
+		}
+	}
+
+	if path == "" {
+		return h.jitForLabel(label)
+	}
+
+	if tier, ok := h.plane.tierFor(label); ok {
+		if src, err := h.jitFor(tier); err == nil && targetPath(src) == path {
+			return src, nil
+		}
+	}
+
+	candidates := make([]JITSource, 0, len(h.targets)+1)
+	for _, src := range h.targets {
+		candidates = append(candidates, src)
+	}
+	if len(h.targets) == 0 && h.jit != nil {
+		candidates = append(candidates, h.jit)
+	}
+
+	var (
+		match   JITSource
+		serving int
+	)
+	for _, src := range candidates {
+		if targetPath(src) == path {
+			match = src
+			serving++
+		}
+	}
+
+	switch serving {
+	case 1:
+		return match, nil
+	case 0:
+		return nil, fmt.Errorf("nodeplane: the runner of tier %q was registered on GitHub target %q, "+
+			"which this control plane has no credential for", label, path)
+	default:
+		return nil, fmt.Errorf("nodeplane: the runner of tier %q was registered on GitHub target %q, which "+
+			"%d of this control plane's targets serve; declare the tier on one of them so the catalogue "+
+			"says whose credential removes it", label, path, serving)
+	}
 }
