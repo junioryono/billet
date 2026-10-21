@@ -274,6 +274,16 @@ func withTapOwner(f func(tap string) (int, bool, error)) Option {
 	}
 }
 
+// withAPIAs replaces the client for a VMM that must answer as a uid, for tests whose
+// fake VMMs answer as the test's own account.
+func withAPIAs(f func(socket string, uid int) *vmmAPI) Option {
+	return func(p *Provider) {
+		if f != nil {
+			p.apiAs = f
+		}
+	}
+}
+
 // withDurability replaces filesystem syncs for crash-ordering tests.
 func withDurability(file func(*os.File) error, dir func(string) error) Option {
 	return func(p *Provider) {
@@ -710,7 +720,7 @@ func (p *Provider) launch(
 		return nil, err
 	}
 
-	api, err := p.awaitAPI(ctx, j)
+	api, err := p.awaitAPI(ctx, j, res)
 	if err != nil {
 		return nil, err
 	}
@@ -1306,8 +1316,10 @@ const vmmLog = "fc.log"
 // startup leaves its socket file behind — so this polls the API itself rather than
 // stat-ing a path. What it is waiting out is the millisecond or two between the
 // jailer returning and the VMM binding its socket.
-func (p *Provider) awaitAPI(ctx context.Context, j jail) (*vmmAPI, error) {
-	api := p.apiFor(j.socket())
+func (p *Provider) awaitAPI(ctx context.Context, j jail, res resources) (*vmmAPI, error) {
+	// CHECKED FOR WHOSE VMM ANSWERS FROM THE FIRST CALL, like every client of a VMM
+	// (newVMMAPIAs), so the client this returns is one the launch can keep using.
+	api := p.apiAs(j.socket(), res.UID)
 
 	ctx, cancel := context.WithTimeout(ctx, p.bootWait)
 	defer cancel()
@@ -1319,6 +1331,10 @@ func (p *Provider) awaitAPI(ctx context.Context, j jail) (*vmmAPI, error) {
 
 	for {
 		info, err := api.info(ctx)
+		if errors.Is(err, errVMMPeer) {
+			return nil, err
+		}
+
 		if err == nil {
 			if info.ID != j.id {
 				return nil, fmt.Errorf("firecracker: the vmm at %s calls itself %s rather than "+
@@ -2043,7 +2059,20 @@ func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
 // listener and the guest running, so `ended` needs the pid file to name a
 // process that /proc proves is no longer this jail's VMM (vmmExited).
 func (p *Provider) runState(ctx context.Context, j jail) (bool, bool, error) {
-	info, err := p.apiFor(j.socket()).info(ctx)
+	res, err := resourcesOf(j)
+	if err != nil {
+		return false, false, err
+	}
+
+	// WHOSE VMM ANSWERS IS CHECKED (newVMMAPIAs). The socket is in the jail root, so
+	// a guest that has run could make it a link to another lease's socket, and an
+	// answer from that VMM would describe the wrong microVM. A socket answered by
+	// anyone else is neither running nor stopped, which is what an error is for.
+	info, err := p.apiAs(j.socket(), res.UID).info(ctx)
+	if errors.Is(err, errVMMPeer) {
+		return false, false, err
+	}
+
 	if err != nil {
 		vmmGone := gone(err)
 

@@ -27,6 +27,14 @@ type PoolRunner struct {
 	// Identity is what JobStarted said about the job, the evidence a cache
 	// authority is decided from. Zero means not recorded, never a match.
 	Identity JobIdentity
+	// GitHubTarget is the GitHub path of the owner the runner was registered on,
+	// which its removal and recovery take their credential from. Empty for a
+	// member journaled before it was recorded (migration 64).
+	GitHubTarget string
+	// Minted tells RegisterPoolRunner that this member's registration was just
+	// minted, so the job's history records when; a member billet adopted was
+	// registered at no time the ledger saw. Not stored.
+	Minted bool
 }
 
 // JobIdentity is what one of GitHub's own scale-set messages said about a job.
@@ -61,19 +69,34 @@ func (a *Allocator) RegisterPoolRunner(ctx context.Context, runner PoolRunner) e
 		if found {
 			if prior.Tier != runner.Tier || prior.LaunchRequestID != runner.LaunchRequestID ||
 				prior.RunnerName != runner.RunnerName ||
-				(prior.RunnerID != 0 && runner.RunnerID != 0 && prior.RunnerID != runner.RunnerID) {
+				(prior.RunnerID != 0 && runner.RunnerID != 0 && prior.RunnerID != runner.RunnerID) ||
+				!sameTarget(prior.GitHubTarget, runner.GitHubTarget) {
 				return fmt.Errorf("alloc: %w: lease %s is already registered as runner %q for tier %q request %d",
 					ErrConflict, runner.LeaseID, prior.RunnerName, prior.Tier, prior.LaunchRequestID)
 			}
 
-			return nil
-		}
-
-		if err := insertPoolRunner(ctx, q, runner, PoolRunnerIdle); err != nil {
+			if _, err := fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+				return err
+			}
+		} else if err := insertPoolRunner(ctx, q, runner, PoolRunnerIdle); err != nil {
 			return fmt.Errorf("alloc: register pool runner %q: %w", runner.RunnerName, err)
 		}
 
-		return nil
+		// THE REGISTRATION IS PART OF THE JOB'S STORY, kept on the row that
+		// outlives the lease and this binding alike, when it was a mint; a runner
+		// billet adopted was registered at no time this row can say, and only
+		// its id is kept.
+		if runner.Minted {
+			if err := q.RecordJobRegistration(ctx, ledgerdb.RecordJobRegistrationParams{
+				RegisteredAt: ts(a.now()),
+				RunnerID:     max(runner.RunnerID, 0),
+				LeaseID:      runner.LeaseID,
+			}); err != nil {
+				return fmt.Errorf("alloc: record the registration of pool runner %q: %w", runner.RunnerName, err)
+			}
+		}
+
+		return recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID)
 	})
 }
 
@@ -105,6 +128,9 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 		if prior.Tier != tier || prior.RunnerName != runnerName ||
 			(prior.RunnerID != 0 && prior.RunnerID != runnerID) {
 			return fmt.Errorf("alloc: %w: runner %q does not match lease %s", ErrConflict, runnerName, leaseID)
+		}
+		if err := recordJobRunnerID(ctx, q, leaseID, runnerID); err != nil {
+			return err
 		}
 		if prior.Status == PoolRunnerRetiring || prior.Status == PoolRunnerRetired {
 			if prior.ActualRequestID == requestID && prior.RunID == runID && prior.JobID == jobID {
@@ -228,17 +254,28 @@ func (a *Allocator) PreserveRecoveredBusyPoolRunner(ctx context.Context, runner 
 			return err
 		}
 		if !found {
-			return insertPoolRunner(ctx, q, runner, PoolRunnerBusy)
+			if err := insertPoolRunner(ctx, q, runner, PoolRunnerBusy); err != nil {
+				return err
+			}
+
+			return recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID)
 		}
 		if prior.Tier != runner.Tier || prior.LaunchRequestID != runner.LaunchRequestID ||
 			prior.RunnerName != runner.RunnerName ||
-			(prior.RunnerID != 0 && prior.RunnerID != runner.RunnerID) {
+			(prior.RunnerID != 0 && prior.RunnerID != runner.RunnerID) ||
+			!sameTarget(prior.GitHubTarget, runner.GitHubTarget) {
 			return fmt.Errorf("alloc: %w: recovered runner %q does not match lease %s",
 				ErrConflict, runner.RunnerName, runner.LeaseID)
 		}
 		if prior.Status == PoolRunnerRetiring || prior.Status == PoolRunnerRetired {
 			return fmt.Errorf("alloc: %w: recovered runner %q is already retiring",
 				ErrConflict, runner.RunnerName)
+		}
+		if _, err := fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+			return err
+		}
+		if err := recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID); err != nil {
+			return err
 		}
 		if prior.Status == PoolRunnerBusy {
 			return nil
@@ -271,6 +308,9 @@ func (a *Allocator) RetireRecoveredPoolRunner(
 			return err
 		}
 		if !found {
+			if err := recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID); err != nil {
+				return err
+			}
 			err = insertPoolRunner(ctx, q, runner, PoolRunnerRetiring)
 			runner.Status = PoolRunnerRetiring
 			out = runner
@@ -278,9 +318,16 @@ func (a *Allocator) RetireRecoveredPoolRunner(
 		}
 		if prior.Tier != runner.Tier || prior.LaunchRequestID != runner.LaunchRequestID ||
 			prior.RunnerName != runner.RunnerName ||
-			(prior.RunnerID != 0 && runner.RunnerID != 0 && prior.RunnerID != runner.RunnerID) {
+			(prior.RunnerID != 0 && runner.RunnerID != 0 && prior.RunnerID != runner.RunnerID) ||
+			!sameTarget(prior.GitHubTarget, runner.GitHubTarget) {
 			return fmt.Errorf("alloc: %w: recovered retirement for %q does not match lease %s",
 				ErrConflict, runner.RunnerName, runner.LeaseID)
+		}
+		if prior, err = fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+			return err
+		}
+		if err := recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID); err != nil {
+			return err
 		}
 		out = prior
 		if prior.Status == PoolRunnerBusy &&
@@ -548,7 +595,55 @@ func poolRunnerFrom(row *ledgerdb.PoolRunner) PoolRunner {
 			Owner: row.JobOwner, Repository: row.JobRepository,
 			WorkflowRef: row.JobWorkflowRef, Event: row.JobEvent,
 		},
+		GitHubTarget: row.GithubTarget,
 	}
+}
+
+// sameTarget reports whether two records of a member's owner agree. An empty
+// side is a record made without one, which contradicts nothing, and GitHub's
+// owner names are case-insensitive.
+func sameTarget(prior, next string) bool {
+	return prior == "" || next == "" || strings.EqualFold(prior, next)
+}
+
+// recordJobRunnerID keeps GitHub's id for a lease's runner on its history row,
+// once, when the runner was journaled without one: a start or a recovery is
+// where an adopted runner's id is learned.
+func recordJobRunnerID(ctx context.Context, q state.WriteOps, leaseID string, runnerID int64) error {
+	if runnerID <= 0 {
+		return nil
+	}
+
+	if err := q.RecordJobRunnerID(ctx, ledgerdb.RecordJobRunnerIDParams{RunnerID: runnerID, LeaseID: leaseID}); err != nil {
+		return fmt.Errorf("alloc: record the runner of lease %s: %w", leaseID, err)
+	}
+
+	return nil
+}
+
+// fillTarget records the owner of a member journaled without one, when the
+// caller brings one, and returns the member as it now stands. The caller has
+// already refused an owner that disagrees.
+//
+// WHAT A CALLER BRINGS IS EVIDENCE, so it is kept: a recovery that found the
+// runner on an owner, or a mint on one. Left empty, the member's next removal
+// or recovery would be resolved through whatever the catalogue names then, and
+// a different owner answers that no such runner exists.
+func fillTarget(ctx context.Context, q state.WriteOps, prior PoolRunner, owner string) (PoolRunner, error) {
+	if prior.GitHubTarget != "" || owner == "" {
+		return prior, nil
+	}
+
+	if err := q.FillPoolRunnerGitHubTarget(ctx, ledgerdb.FillPoolRunnerGitHubTargetParams{
+		GithubTarget: owner,
+		LeaseID:      prior.LeaseID,
+	}); err != nil {
+		return prior, fmt.Errorf("alloc: record the owner of pool runner %q: %w", prior.RunnerName, err)
+	}
+
+	prior.GitHubTarget = owner
+
+	return prior, nil
 }
 
 // insertPoolRunner journals one member at the status the caller decided on.
@@ -568,6 +663,7 @@ func insertPoolRunner(
 		RunnerName:      runner.RunnerName,
 		Status:          status,
 		UpdatedAt:       nowStamp(),
+		GithubTarget:    runner.GitHubTarget,
 	})
 }
 
