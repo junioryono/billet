@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/unitpath"
@@ -135,7 +136,8 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 // verifyDeploymentID's order: nowhere for a certificate that loads and names a
 // deployment, the control plane's directory beside the node, or else the node's
 // own state directory, which is also where a certificate that does not load
-// falls back to.
+// falls back to; a certificate that loads writes nothing, even one the
+// verification refuses.
 func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "node")
@@ -195,32 +197,61 @@ func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), deployment)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// A CERTIFICATE THAT LOADS IS THE ANSWER, whether it names a deployment the
+	// verification accepts or one it refuses: either way it writes no identity,
+	// so none is declared, and taking the locks, which resolves the identity as
+	// the verification does, creates neither directory.
+	for _, tc := range []struct{ name, deployment string }{
+		{"a minted deployment", deployment},
+		{"a deployment billet did not mint", "not-a-minted-identity"},
+		{"no deployment at all", ""},
+	} {
+		ca, err := wirecert.LoadOrCreateCA(t.TempDir(), tc.deployment)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	bundle, err := ca.IssueNode("epyc-1")
-	if err != nil {
-		t.Fatal(err)
-	}
+		bundle, err := ca.IssueNode("epyc-1")
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	bundleDir := t.TempDir()
-	if err := bundle.Write(bundleDir); err != nil {
-		t.Fatal(err)
-	}
+		bundleDir := t.TempDir()
+		if err := bundle.Write(bundleDir); err != nil {
+			t.Fatal(err)
+		}
 
-	certified := load()
-	certified.Node.TLS = &config.NodeTLS{
-		CertPath: filepath.Join(bundleDir, "node.crt"), KeyPath: filepath.Join(bundleDir, "node.key"), CAPath: filepath.Join(bundleDir, "ca.crt"),
-	}
+		certified := load()
+		certified.Node.TLS = &config.NodeTLS{
+			CertPath: filepath.Join(bundleDir, "node.crt"), KeyPath: filepath.Join(bundleDir, "node.key"), CAPath: filepath.Join(bundleDir, "ca.crt"),
+		}
 
-	if !certificateNamesDeployment(certified) {
-		t.Fatal("the bundle this case turns on does not load")
-	}
+		if loaded, err := app.NodeBundle(certified); err != nil || loaded == nil {
+			t.Fatalf("%s: the bundle this case turns on does not load (%v)", tc.name, err)
+		}
 
-	if declares(certified, stateDir) || declares(certified, serverDir) {
-		t.Error("a node whose certificate names its deployment declares a directory for an identity it never writes")
+		if declares(certified, stateDir) || declares(certified, serverDir) {
+			t.Errorf("%s: a node whose certificate loads declares a directory for an identity it never writes", tc.name)
+		}
+
+		probed := false
+
+		for _, n := range RefreshPaths(processEnv(), certified, cfgPath) {
+			if n.Access == unitpath.Lock && strings.HasPrefix(n.Path, filepath.Join(root, "locks")) {
+				_, _ = unitpath.Exercise(t.Context(), n, "")
+				probed = true
+			}
+		}
+
+		if !probed {
+			t.Fatalf("%s: no probe lock was declared to resolve the identity through", tc.name)
+		}
+
+		for _, dir := range []string{stateDir, serverDir} {
+			if _, err := os.Stat(dir); !os.IsNotExist(err) {
+				t.Errorf("%s: resolving the identity wrote %s, which the verification never does (%v)", tc.name, dir, err)
+			}
+		}
 	}
 }
 
