@@ -201,23 +201,20 @@ func TestReconcilingATierRecordsItsScaleSet(t *testing.T) {
 	}
 }
 
-// THE SAME LABEL IN TWO RUNNER GROUPS IS TWO SCALE SETS. One declared and one
-// not is the case a label-only comparison cannot tell apart, and getting it
-// wrong either hides a real orphan or sends an operator to delete a tier that is
-// in use.
-func TestOneGroupsOrphanDoesNotImplicateTheOther(t *testing.T) {
-	declared := tier("billet-4vcpu-a")
-	declared.RunnerGroup = "billet"
-	tiers := []config.Tier{declared}
+// runWithRecords runs a control plane over the given targets with these scale
+// sets already recorded, stopping at the first poll, and returns what Run
+// answered and what it logged.
+func runWithRecords(t *testing.T, tiers []config.Tier, records []state.ScaleSetRecord,
+	targets ...config.GitHubTarget,
+) (*capturingHandler, *fakeProvisioner, error) {
+	t.Helper()
 
 	db := openState(t)
 
-	// Same label, different group: a set an earlier config created elsewhere.
-	gone := state.ScaleSetRecord{
-		Target: testOrg, RunnerGroup: "retired", Label: declared.Label, ID: 41,
-	}
-	if err := db.RecordScaleSet(t.Context(), gone); err != nil {
-		t.Fatalf("RecordScaleSet: %v", err)
+	for _, rec := range records {
+		if err := db.RecordScaleSet(t.Context(), rec); err != nil {
+			t.Fatalf("RecordScaleSet(%s): %v", rec.Label, err)
+		}
 	}
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
@@ -231,20 +228,110 @@ func TestOneGroupsOrphanDoesNotImplicateTheOther(t *testing.T) {
 		},
 	}
 
-	handler := newCapturingHandler()
-
-	if err := New(a, prov, tiers, "test-owner", slog.New(handler),
-		WithCompletionLedger(db), WithTargets(Target{Config: testTarget, Provisioner: prov})).Run(ctx); err != nil {
-		t.Fatalf("Run: %v", err)
+	served := make([]Target, 0, len(targets))
+	for _, target := range targets {
+		served = append(served, Target{Config: target, Provisioner: prov})
 	}
 
-	if got := handler.warningsAbout("retired", declared.Label); len(got) == 0 {
-		t.Error("the orphan in the retired group was not reported, because a tier " +
-			"with the same label in another group was taken as claiming it")
+	handler := newCapturingHandler()
+
+	err := New(a, prov, tiers, "test-owner", slog.New(handler),
+		WithCompletionLedger(db), WithTargets(served...)).Run(ctx)
+
+	return handler, prov, err
+}
+
+// THE SAME NAME IN ANOTHER RUNNER GROUP OF ONE TARGET IS REFUSED (#140). A job
+// for that name can be given to either scale set, and the one billet left
+// behind is polled by nothing, so the tier's jobs routed there wait however much
+// room it has. The refusal names the teardown that clears it, and the declared
+// tier's own scale set is neither refused nor reported.
+func TestAStaleScaleSetSharingATiersNameRefusesTheStart(t *testing.T) {
+	declared := tier("billet-4vcpu-a")
+	declared.RunnerGroup = "billet"
+
+	// Same name, another group: a set an earlier config created elsewhere.
+	handler, prov, err := runWithRecords(t, []config.Tier{declared}, []state.ScaleSetRecord{
+		{Target: testOrg, RunnerGroup: "retired", Label: declared.Label, ID: 41},
+	}, testTarget)
+
+	if err == nil {
+		t.Fatal("a control plane started beside a scale set it left behind under a declared tier's name")
+	}
+
+	want := "billet teardown --tier billet-4vcpu-a --runner-group retired --target " + config.DefaultTargetName
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("the refusal does not name the teardown that clears it (%q): %v", want, err)
 	}
 
 	if got := handler.warningsAbout("billet", declared.Label); len(got) != 0 {
 		t.Errorf("the declared tier's own scale set was reported as an orphan: %v", got)
+	}
+
+	prov.mu.Lock()
+	created := len(prov.labels)
+	prov.mu.Unlock()
+
+	if created != 0 {
+		t.Errorf("the refused start created %d scale sets before refusing", created)
+	}
+}
+
+// AND A STALE SET AT THE ORGANIZATION TAKES A REPOSITORY'S JOBS. A repository
+// target's jobs can also go to its organization's scale sets, so one billet
+// left there under a name the repository's tier answers to is refused too, read
+// from the ledger though this control plane no longer serves the organization.
+func TestAStaleOrganizationScaleSetRefusesARepositorysTier(t *testing.T) {
+	repo := config.GitHubTarget{Name: "app", Repository: testOrg + "/app"}
+
+	declared := tier("billet-4vcpu")
+	declared.Target = repo.Name
+
+	_, _, err := runWithRecords(t, []config.Tier{declared}, []state.ScaleSetRecord{
+		{Target: testOrg, RunnerGroup: "default", Label: "billet-4vcpu", ID: 51},
+	}, repo)
+
+	if err == nil || !strings.Contains(err.Error(), "organization "+testOrg) {
+		t.Fatalf("a repository's tier started beside a stale organization scale set under its name: %v", err)
+	}
+}
+
+// AND THE OTHER WAY ROUND, WITH BOTH SERVED: a set billet left on one of the
+// organization's repositories under a name the organization's tier answers to
+// takes that repository's jobs for it.
+func TestAStaleRepositoryScaleSetRefusesTheOrganizationsTier(t *testing.T) {
+	repo := config.GitHubTarget{Name: "app", Repository: testOrg + "/app"}
+
+	declared := tier("billet-4vcpu")
+	declared.Target = testTarget.Name
+	other := tier("billet-2vcpu-app")
+	other.Target = repo.Name
+
+	_, _, err := runWithRecords(t, []config.Tier{declared, other}, []state.ScaleSetRecord{
+		{Target: repo.Repository, RunnerGroup: "default", Label: "billet-4vcpu", ID: 52},
+	}, testTarget, repo)
+
+	if err == nil || !strings.Contains(err.Error(), `"billet-4vcpu" answers to on `+testOrg) {
+		t.Fatalf("the organization's tier started beside a stale set on its repository under its name: %v", err)
+	}
+}
+
+// AND ONE THAT TAKES NO DECLARED TIER'S NAME IS STILL ONLY REPORTED. A stale
+// set under a name nothing answers to queues jobs aimed at that name, which is
+// worth a warning, and refusing the whole control plane for it would be an
+// outage over a size nobody asked for.
+func TestAStaleScaleSetUnderAnotherNameOnlyWarns(t *testing.T) {
+	declared := tier("billet-4vcpu-a")
+
+	handler, _, err := runWithRecords(t, []config.Tier{declared}, []state.ScaleSetRecord{
+		{Target: testOrg, RunnerGroup: "retired", Label: "billet-16vcpu", ID: 42},
+	}, testTarget)
+	if err != nil {
+		t.Fatalf("Run refused over a stale set no tier's name is routed to: %v", err)
+	}
+
+	if len(handler.warningsAbout("retired", "billet-16vcpu")) == 0 {
+		t.Error("the stale set under another name was not reported")
 	}
 }
 
