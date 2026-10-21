@@ -177,7 +177,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 
 		// A RUNNER RETIRED FOR BEING OFFLINE may have been one the count above
 		// had covering an assigned job, and its retirement left the count
-		// unknown (retireWithdrawn); a count of none is the one it can make
+		// unknown (retirePoolMember); a count of none is the one it can make
 		// wrong. Either is counted again.
 		l.mu.Lock()
 		invalidated := !l.demandKnown
@@ -455,6 +455,18 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 	if errors.Is(err, alloc.ErrLeaseNotFound) {
 		lease = nil
 	}
+	// UNKNOWN WHERE A DRAIN READS IT BEFORE THE LEASE CAN GO, on every path
+	// here, a retry of the journal included: this member may be the runner the
+	// published count had covering an assigned job, and once its lease is
+	// released the ledger can be quiet beside that count of none. A publication
+	// that did not land releases nothing, and the journal retries.
+	if lease != nil {
+		if err := l.forgetDemand(ctx); err != nil {
+			l.log.Error("could not record this tier's demand as unknown before retiring a pool member; "+
+				"its retirement is retried", "tier", l.tier, "runner", member.RunnerName, "error", err)
+			return
+		}
+	}
 	job := dispatch.Job{RequestID: member.LaunchRequestID, RunnerID: member.RunnerID,
 		RunnerName: member.RunnerName}
 	if err := l.destroyCompleted(ctx, job, lease, alloc.PhaseDone); err != nil {
@@ -506,6 +518,16 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 		return
 	}
 	l.dropPoolMember(member)
+}
+
+// forgetDemand publishes this tier's demand as unknown until the next
+// reconciliation counts it again.
+func (l *Listener) forgetDemand(ctx context.Context) error {
+	l.mu.Lock()
+	l.demandKnown = false
+	l.mu.Unlock()
+
+	return l.publishCapacity(ctx, nil, "")
 }
 
 const (

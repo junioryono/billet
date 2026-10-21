@@ -346,12 +346,14 @@ func TestAFailedLaunchLeavesItsJobCountedAsWaiting(t *testing.T) {
 // listener of an open deployment polls advertising its ceiling, and GitHub may
 // assign against that advertisement after the poll returns empty, so its count
 // stays undated, which a drain reads as from before any seal. Under a seal it
-// advertises only committed work, and each exchange that returns dates the
-// count with when it did.
+// advertises only committed work, and an exchange that returns empty dates the
+// count with when it did. A delivery changes what GitHub has assigned, so one
+// whose statistics are not adopted leaves the count undated however many empty
+// exchanges follow it; one whose statistics are adopted is dated by the next.
 func TestOnlyAWithdrawnPollDatesTheCount(t *testing.T) {
 	t.Parallel()
 
-	run := func(t *testing.T, sealed bool) (alloc.ListenerCapacity, time.Time) {
+	run := func(t *testing.T, sealed bool, first *Message) (alloc.ListenerCapacity, time.Time) {
 		t.Helper()
 
 		tiers := []config.Tier{tierOf("a-work", 4)}
@@ -384,6 +386,12 @@ func TestOnlyAWithdrawnPollDatesTheCount(t *testing.T) {
 			if polls.Add(1) >= 4 {
 				cancel()
 			}
+		}, onGet: func() (*Message, error) {
+			if first != nil && polls.Load() == 1 {
+				return first, nil
+			}
+
+			return nil, ErrNoMessage
 		}}
 
 		l := NewListener(a, tiers[0].Label, session, WithRunner(&launchLog{}),
@@ -401,18 +409,39 @@ func TestOnlyAWithdrawnPollDatesTheCount(t *testing.T) {
 		return got.Listener, sealedAt
 	}
 
-	open, _ := run(t, false)
+	open, _ := run(t, false, nil)
 	if open.UnstartedAt != "" {
 		t.Errorf("an open listener's count is dated %q; polls advertising its ceiling vouch for nothing",
 			open.UnstartedAt)
 	}
 
-	closed, sealedAt := run(t, true)
+	datedAfter := func(t *testing.T, name string, got alloc.ListenerCapacity, sealedAt time.Time) {
+		t.Helper()
 
-	counted, err := time.Parse(time.RFC3339Nano, closed.UnstartedAt)
-	if err != nil || counted.Before(sealedAt) {
-		t.Errorf("a sealed listener's count is dated %q (%v), want a time after the seal at %s",
-			closed.UnstartedAt, err, sealedAt.UTC())
+		counted, err := time.Parse(time.RFC3339Nano, got.UnstartedAt)
+		if err != nil || counted.Before(sealedAt) {
+			t.Errorf("%s: the count is dated %q (%v), want a time after the seal at %s",
+				name, got.UnstartedAt, err, sealedAt.UTC())
+		}
+	}
+
+	closed, sealedAt := run(t, true, nil)
+	datedAfter(t, "a sealed listener", closed, sealedAt)
+
+	// AN ASSIGNMENT DELIVERED WITHOUT STATISTICS: the zero in hand predates it,
+	// and the sealed listener declines it, so the job still waits at GitHub.
+	blind, _ := run(t, true, &Message{MessageID: 1, Assigned: []dispatch.Job{{JobID: "J-pre-seal"}}})
+	if blind.UnstartedAt != "" || blind.Unstarted == nil || *blind.Unstarted != 0 {
+		t.Errorf("after an assignment delivered without statistics the count is %v dated %q, want the "+
+			"stale none undated", blind.Unstarted, blind.UnstartedAt)
+	}
+
+	counted, sealedAt := run(t, true, directlyAssigned(1, "J-pre-seal", 1))
+	datedAfter(t, "a delivery whose statistics were adopted", counted, sealedAt)
+
+	if counted.Unstarted == nil || *counted.Unstarted != 1 {
+		t.Errorf("the adopted statistics count %v waiting, want the one assignment the seal declined",
+			counted.Unstarted)
 	}
 }
 

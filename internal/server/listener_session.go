@@ -147,7 +147,7 @@ func (l *Listener) install(session Session) {
 	l.closing = nil
 	l.recoverCause = nil
 	l.lastMessageID = 0
-	l.observed = session.Statistics()
+	l.observed, l.observedStale = session.Statistics(), false
 
 	l.mu.Lock()
 	l.heldMessageID = nil

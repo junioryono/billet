@@ -249,24 +249,6 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 // retries the ledger without inspecting again; a controller restart in that
 // window forgets it and leaves the member idle with no registration.
 func (l *Listener) retireWithdrawn(ctx context.Context, member alloc.PoolRunner) {
-	// THE COUNT IS UNKNOWN BEFORE THE LEASE GOES, AND SAID SO WHERE A DRAIN
-	// READS IT, before anything is claimed. This member may be the runner the
-	// published count had covering an assigned job; once its lease is released
-	// the ledger can be quiet beside that count of none, and a drain reading the
-	// two would call the deployment drained. A publication that did not land
-	// retires nothing; reconcilePool counts again either way.
-	l.mu.Lock()
-	l.demandKnown = false
-	l.mu.Unlock()
-
-	if err := l.publishCapacity(ctx, nil, ""); err != nil {
-		l.log.Error("could not record this tier's demand as unknown before retiring a withdrawn "+
-			"pool member; retrying on the next reconcile", "tier", l.tier, "runner", member.RunnerName,
-			"error", err)
-
-		return
-	}
-
 	claim := l.alloc.RetirePoolRunner
 	if l.claimRetirement != nil {
 		claim = l.claimRetirement

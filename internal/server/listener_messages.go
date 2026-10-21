@@ -275,7 +275,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// A delivery that no longer holds carries current statistics even while the
 	// earlier hold blocks reconciliation until this message is acknowledged.
 	if msg.Statistics != nil && len(resolved.held) == 0 {
-		l.observed = msg.Statistics
+		l.observed, l.observedStale = msg.Statistics, false
 		if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
 			return err
 		}

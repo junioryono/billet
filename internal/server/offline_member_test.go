@@ -595,43 +595,59 @@ func TestRetiringTheRunnerThatCoveredAJobCountsItAsWaiting(t *testing.T) {
 			before.Unstarted)
 	}
 
-	var (
-		atClaim, duringRetirement *int
-		claimed, read             bool
-	)
+	// THE JOURNAL'S RETRY INCLUDED: the first attempt's removal of the
+	// registration fails after the claim, so the lease still counts and the next
+	// reconciliation publishes the job as covered again; the retry that releases
+	// it goes through the journal, not the offline watch.
+	reg.err = errors.New("GitHub did not answer")
 
-	// UNKNOWN BEFORE THE CLAIM, so a publication that fails retires nothing.
-	f.l.claimRetirement = func(ctx context.Context, leaseID string) error {
-		atClaim, claimed = report().Unstarted, true
-
-		return f.a.RetirePoolRunner(ctx, leaseID)
-	}
+	var during []*int
 
 	f.duringDestroy = func() {
-		duringRetirement, read = report().Unstarted, true
+		during = append(during, report().Unstarted)
 	}
 
 	f.reconcileAt(t, offlineIdleAfter)
 	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
 
-	if !slices.Equal(reg.withdrawn, []int64{10899}) || !read {
-		t.Fatalf("the member was not retired (withdrawn %v), so this case shows nothing", reg.withdrawn)
-	}
-
-	if !claimed {
-		t.Error("the withdrawn member was retired without its claim being made")
-	} else if atClaim != nil {
-		t.Errorf("when the retirement was claimed the published count was %d, want unknown", *atClaim)
-	}
-
-	if duringRetirement != nil {
-		t.Errorf("while the runner covering the job was retired the published count was %d, want unknown",
-			*duringRetirement)
+	if !slices.Equal(reg.withdrawn, []int64{10899}) || len(reg.names) != 1 || len(during) != 0 ||
+		f.status(t) != alloc.PoolRunnerRetiring {
+		t.Fatalf("the first retirement did not stop at its removal (withdrawn %v, removals %d, destroys %d, "+
+			"status %s), so this case shows nothing", reg.withdrawn, len(reg.names), len(during), f.status(t))
 	}
 
 	f.l.reportCapacity(t.Context(), nil, "")
 
-	if after := report(); after.Unstarted == nil || *after.Unstarted != 1 {
-		t.Errorf("after its runner was retired the job is published as %v waiting, want 1", after.Unstarted)
+	if between := report(); between.Unstarted == nil || *between.Unstarted != 0 {
+		t.Fatalf("between the attempts the job was published as %v waiting, want the none a held lease "+
+			"covers, or the retry has nothing to prove", between.Unstarted)
+	}
+
+	reg.err = nil
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace+time.Minute)
+
+	if len(during) != 1 || f.status(t) != "forgotten" {
+		t.Fatalf("the journal did not retry the retirement (destroys %d, status %s)", len(during), f.status(t))
+	}
+
+	if during[0] != nil {
+		t.Errorf("while the journal's retry destroyed the runner covering the job the published count "+
+			"was %d, want unknown", *during[0])
+	}
+
+	// AND COUNTED AGAIN AFTERWARDS against what the ledger holds now: the retry
+	// ran first in its reconciliation, which then bought the job a replacement
+	// where the room allowed.
+	f.l.reportCapacity(t.Context(), nil, "")
+
+	active, err := f.a.ActiveRunnerLeases(t.Context(), "billet-4vcpu-a")
+	if err != nil {
+		t.Fatalf("ActiveRunnerLeases: %v", err)
+	}
+
+	if after := report(); after.Unstarted == nil || *after.Unstarted != 1-active {
+		t.Errorf("after its runner was retired the job is published as %v waiting beside %d runner(s), "+
+			"want %d", after.Unstarted, active, 1-active)
 	}
 }

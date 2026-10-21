@@ -90,10 +90,18 @@ func TestAFallbackDoesNotGrowIntoRoomAWaiterIsAccumulating(t *testing.T) {
 		t.Errorf("a resize to the shape the lease already holds was refused for a waiter: %v", err)
 	}
 
-	// AND THE LEASE'S OWN TIER IN protect IS NOT A WAITER IT MUST LEAVE ROOM FOR.
-	if err := a.ResizeLeaving(t.Context(), lease.ID, lease.Epoch, "four", 4, 8*config.GiB,
+	// AND THE LEASE'S OWN TIER IN protect IS NOT A WAITER IT MUST LEAVE ROOM
+	// FOR: the same growth, which leaves the cloud tier no room for another of
+	// its own, is granted when only its own tier is named.
+	own, ownLease := resizeFleet(t, 8)
+
+	if err := own.ResizeLeaving(t.Context(), ownLease.ID, ownLease.Epoch, "eight", 8, 16*config.GiB,
 		[]string{"cloud"}); err != nil {
-		t.Errorf("a resize was refused for its own tier: %v", err)
+		t.Errorf("a growth was refused for its own tier: %v", err)
+	}
+
+	if got := chargedVCPU(t, own, ownLease.ID); got != 8 {
+		t.Errorf("the growth protecting only its own tier left the lease charged %d vCPU, want 8", got)
 	}
 
 	// THE BUDGET ALONE ALLOWS IT, or this case would not tell the order from

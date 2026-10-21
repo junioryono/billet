@@ -292,9 +292,12 @@ type Listener struct {
 	demandKnown bool
 	demandAt    time.Time
 	// observedAt is when GitHub last vouched for observed: a poll sent with the
-	// advertisement withdrawn returned, with a message or empty. Zero until one
-	// has. Touched only by the poll goroutine.
-	observedAt time.Time
+	// advertisement withdrawn returned empty. Zero until one has, and again from
+	// any delivery; observedStale is that a delivery's statistics have not been
+	// adopted since, so no empty poll may date the older ones. Touched only by
+	// the poll goroutine.
+	observedAt    time.Time
+	observedStale bool
 	// refused is why the last purchase this tier asked for bought nothing, and
 	// refusedLogged the reason last logged for it. Guarded by mu; reported and
 	// logged, never scheduled on.
@@ -777,7 +780,7 @@ func (l *Listener) Run(ctx context.Context) error {
 
 	// A restart does not replay messages for work already assigned, so a listener
 	// that waits to be told about a backlog sits idle in front of one.
-	l.observed = l.session.Statistics()
+	l.observed, l.observedStale = l.session.Statistics(), false
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
 		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
@@ -1001,13 +1004,18 @@ func (l *Listener) Run(ctx context.Context) error {
 			polled++
 			l.sessionFailures = 0
 
-			// AN EXCHANGE SENT WITH THE ADVERTISEMENT WITHDRAWN VOUCHES FOR THE
-			// STATISTICS AS IT RETURNS: GitHub assigns nothing past committed
-			// work under it, and whatever it had pending came back in it. Only
-			// such an exchange dates the count a drain trusts; one sent while
-			// still advertising may return empty after a seal and say nothing
-			// about an assignment made against the advertisement it carried.
-			if withdrawnWhenSent && l.observed != nil {
+			// AN EMPTY EXCHANGE SENT WITH THE ADVERTISEMENT WITHDRAWN VOUCHES FOR
+			// THE STATISTICS IN HAND: GitHub assigns nothing past committed work
+			// under it, and had nothing pending to deliver. Only such an exchange
+			// dates the count a drain trusts; one sent while still advertising may
+			// return empty after a seal and say nothing about an assignment made
+			// against the advertisement it carried. A delivery changes what GitHub
+			// has assigned, so it leaves the count undated, and until its own
+			// statistics are adopted no empty exchange can date the old ones.
+			switch {
+			case err == nil && msg != nil:
+				l.observedAt, l.observedStale = time.Time{}, true
+			case errors.Is(err, ErrNoMessage) && withdrawnWhenSent && l.observed != nil && !l.observedStale:
 				l.observedAt = l.clock()
 			}
 
