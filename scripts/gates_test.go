@@ -385,10 +385,10 @@ func TestTheLocalRaceSuiteRunsCIsFlags(t *testing.T) {
 		return out
 	}
 
-	ciLine := regexp.MustCompile(`go test -race -count=1 -timeout \S+ .*\./\.\.\.`).FindString(
+	ciLine := regexp.MustCompile(`go test -race -count=1 -timeout \S+ .*\./\.{3}`).FindString(
 		readFile(t, filepath.Join("..", ".github", "workflows", "ci.yml")))
 	local := strings.Join(strings.Fields(strings.ReplaceAll(readFile(t, filepath.Join("gates", "test.sh")), "\\\n", " ")), " ")
-	localLine := regexp.MustCompile(`test \$\{test_p\[@\]\+"\$\{test_p\[@\]\}"\} -race -count=1 -timeout \S+ .*\./\.\.\.`).FindString(local)
+	localLine := regexp.MustCompile(`test \$\{test_p\[@\]\+"\$\{test_p\[@\]\}"\} -race -count=1 -timeout \S+ .*\./\.{3}`).FindString(local)
 
 	if ciLine == "" || localLine == "" {
 		t.Fatalf("could not find the race suite's line: ci.yml %q, test.sh %q", ciLine, localLine)

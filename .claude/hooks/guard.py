@@ -797,7 +797,16 @@ def shell_invocation(words):
 
 def judge_gate_script(words, cwd):
     path = words[0]
-    if os.path.basename(path) in SHELLS:
+    if path in (".", "source"):
+        # Sourced, the gate runs in this shell, and a name without a slash is
+        # found in the current directory when PATH does not hold it.
+        args = words[1:]
+        if args[:1] == ["--"]:
+            args = args[1:]
+        if not args:
+            return
+        path = args[0]
+    elif os.path.basename(path) in SHELLS:
         # A shell runs a script named without a slash from its own directory.
         mode, path = shell_invocation(words)
         if mode != "script":
