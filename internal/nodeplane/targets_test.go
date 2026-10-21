@@ -686,7 +686,11 @@ func TestAMintForAReclaimedLaunchIsRefusedBeforeGitHub(t *testing.T) {
 		t.Errorf("the source minted %v for a launch whose lease was reclaimed", minted)
 	}
 
-	if owner, _ := store.LeaseGitHubTarget(t.Context(), "l1"); owner != "" {
+	store.mu.Lock()
+	owner := store.leaseTargets["l1"]
+	store.mu.Unlock()
+
+	if owner != "" {
 		t.Errorf("the reclaimed lease recorded owner %q", owner)
 	}
 }
