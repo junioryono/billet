@@ -171,9 +171,15 @@ func (c *Client) CheckDump(ctx context.Context) error {
 		return err
 	}
 
-	// A TABLE pg_restore's LIST COULD NOT NAME makes every dump of this ledger
+	// A NAME pg_restore's LIST COULD NOT CARRY makes every dump of this ledger
 	// unrestorable, which is this copy's failure to do the job and not the
 	// database's: the backup still captures the identity half.
+	if strings.ContainsFunc(led.Schema, unicode.IsSpace) {
+		return clientRefusal(fmt.Sprintf("pgdump: the ledger is in schema %q, and a dump of a schema "+
+			"whose name has whitespace in it could not be restored unambiguously; move the ledger to "+
+			"a schema without", led.Schema))
+	}
+
 	for _, table := range led.Tables {
 		if strings.ContainsFunc(table, unicode.IsSpace) {
 			return clientRefusal(fmt.Sprintf("pgdump: schema %s holds a table named %q, and a dump "+
@@ -285,7 +291,10 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, into
 		return fmt.Errorf("pgdump: stage the restore list: %w", err)
 	}
 
-	db, err := c.databaseConninfo()
+	// THE DATABASE THE CALLER PROVED, which the drop re-proves on its own
+	// connection: a data source that leaves the database to libpq's default
+	// still names it here.
+	db, err := databaseConninfo(into.Database)
 	if err != nil {
 		return err
 	}
@@ -323,7 +332,11 @@ func quoteName(name string) string { return `"` + strings.ReplaceAll(name, `"`, 
 // tocEntry matches a restore-list entry, e.g. `220; 1259 16386 TABLE s1 t
 // billet` (measured): the ids, then the entry's type, namespace, name and
 // owner, separated by spaces and quoted not at all.
-var tocEntry = regexp.MustCompile(`^\d+; \d+ \d+ (.*)$`)
+var tocEntry = regexp.MustCompile(`^\d+; (\d+) \d+ (.*)$`)
+
+// pgClassOID is pg_class's catalog OID, the catalog id a TABLE entry carries;
+// a TABLE DATA entry carries 0 (measured, `3482; 0 16386 TABLE DATA ...`).
+const pgClassOID = "1259"
 
 // tablesOf lists the tables a dump's restore list holds in schema.
 //
@@ -343,8 +356,11 @@ func tablesOf(toc []byte, schema string) ([]string, error) {
 			continue
 		}
 
-		rest, ok := strings.CutPrefix(m[1], "TABLE ")
-		if !ok || strings.HasPrefix(rest, "DATA ") {
+		// BY THE CATALOG, NOT BY THE TEXT: a table in a schema named DATA reads
+		// `TABLE DATA <name> <owner>`, which only its catalog id tells from a
+		// TABLE DATA entry.
+		rest, ok := strings.CutPrefix(m[2], "TABLE ")
+		if !ok || m[1] != pgClassOID {
 			continue
 		}
 
@@ -399,14 +415,12 @@ func (c *Client) SingleEndpoint() error {
 // given for pg_restore to connect at all rather than print a script. A conninfo
 // with only dbname in it, so nothing secret reaches argv and a name holding '='
 // is not read as a connection string.
-func (c *Client) databaseConninfo() (string, error) {
-	for _, v := range c.env.Environ(nil) {
-		if name, ok := strings.CutPrefix(v, "PGDATABASE="); ok {
-			return "dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(name) + "'", nil
-		}
+func databaseConninfo(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("pgdump: the restore names no database to restore into")
 	}
 
-	return "", errors.New("pgdump: the PostgreSQL data source names no database to restore into")
+	return "dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(name) + "'", nil
 }
 
 // program finds a client program and its major version, asked with the same

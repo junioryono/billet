@@ -853,3 +853,48 @@ func TestCheckDumpRefusesALedgerItsDumpCouldNotName(t *testing.T) {
 		t.Fatalf("CheckDump over a table with a space in its name = %v, want ErrClientUnusable naming it", err)
 	}
 }
+
+// A TABLE ENTRY IS TOLD FROM A TABLE DATA ENTRY BY ITS CATALOG, not by its text:
+// a table in a schema named DATA reads `TABLE DATA <name> <owner>`, which only
+// its catalog id (pg_class's, 1259) tells from a TABLE DATA entry (0).
+func TestATableInASchemaNamedDataIsStillATable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFakeProgram(t, dir, "pg_restore", 18, `    echo '220; 1259 16386 TABLE DATA admission billet'
+    echo '3482; 0 16386 TABLE DATA DATA admission billet'`)
+
+	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
+		"@db.internal:5432/ledger?sslmode=disable&search_path=DATA", dir)
+
+	into := state.RestoreInto{Database: "ledger", Schema: "DATA"}
+	if err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, into); err != nil {
+		t.Fatalf("Restore into a schema named DATA: %v", err)
+	}
+
+	if calls := dropped.snapshot(); len(calls) != 1 || !slices.Equal(calls[0].keep, []string{"admission"}) {
+		t.Errorf("the restore kept %+v, want [admission] once", calls)
+	}
+}
+
+// PG_RESTORE IS POINTED AT THE DATABASE THE RESTORE PROVED, not at the data
+// source's own spelling of it: one that leaves the database to libpq's default
+// still has a database to restore into.
+func TestARestoreNamesTheDatabaseItProved(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	fakeProgram(t, dir, "pg_restore", 18)
+
+	c, _ := clientWithFakes(t, "host=db.internal user=billet password="+testPassword+
+		" sslmode=disable search_path=billet_x", dir)
+
+	into := state.RestoreInto{Database: "billet_proved", Schema: "billet_x"}
+	if err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, into); err != nil {
+		t.Fatalf("Restore through a data source naming no database: %v", err)
+	}
+
+	if argv := readLines(t, filepath.Join(dir, "pg_restore.argv")); !slices.Contains(argv, "--dbname=dbname='billet_proved'") {
+		t.Errorf("pg_restore was not pointed at the proved database: %q", argv)
+	}
+}

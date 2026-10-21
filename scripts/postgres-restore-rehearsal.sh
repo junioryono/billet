@@ -334,6 +334,16 @@ grep -q 'empty ledger of its own' /tmp/wrong-backend.log ||
     fail "the refusal does not say what the mismatch would cost"
 untouched "the restore refused for a ledger-backend mismatch"
 
+step "the surviving database moves on after the backup"
+# A ROW ONLY THE SURVIVING DATABASE HOLDS: an admission taken after the backup.
+# A restore that kept the database's ledger keeps it; one that replayed the
+# archive's dump over the database would lose it, while printing anything.
+runuser -u billet -- env "${DSN_ENV}=${BILLET_STATE_DSN}" \
+    billet ca issue node-post --config "${CONFIG_A}" --out /var/lib/billet/bundles/node-post
+post=$(runuser -u postgres -- psql -d billet -tAc "SELECT count(*) FROM issued_certs WHERE node = 'node-post'")
+test "${post}" = "1" ||
+    fail "the surviving database does not record node-post, so its survival later would prove nothing"
+
 step "restore it where nothing has seen it — as root, which is what an operator is"
 # THE SAME DATABASE, A NEW IDENTITY DIRECTORY. That is the replacement-controller
 # shape this profile exists for: the ledger survived the instance, and what has
@@ -353,9 +363,14 @@ billet local restore --config "${CONFIG_B}" --from "${ARCHIVE}" \
 }
 cat /tmp/kept.log
 
-# THE DATABASE'S LEDGER WAS KEPT, and the command said so.
+# THE DATABASE'S LEDGER WAS KEPT, and the command said so; asked of psql too,
+# because a restore that said so while replaying the archive's dump would have
+# lost node-post.
 grep -q 'KEEP the ledger' /tmp/kept.log ||
     fail "the restore did not say it keeps the surviving database's ledger"
+post=$(runuser -u postgres -- psql -d billet -tAc "SELECT count(*) FROM issued_certs WHERE node = 'node-post'")
+test "${post}" = "1" ||
+    fail "the surviving database lost node-post, so the restore replaced its ledger rather than keeping it"
 
 step "what root restored, and who owns it"
 ls -la "${IDENTITY_B}" "${IDENTITY_B}/ca"
@@ -412,7 +427,7 @@ openssl verify -CAfile "${IDENTITY_A}/ca/ca.crt" /var/lib/billet/bundles/node-b/
 admitted=$(runuser -u postgres -- psql -d billet -tAc \
     "SELECT string_agg(node, ',' ORDER BY node) FROM issued_certs")
 case "${admitted}" in
-    'node-a,node-b') ;;
+    'node-a,node-b,node-post') ;;
     *)
         fail "the ledger holds admissions for [${admitted}] and it must hold both node-a, which the ORIGINAL deployment issued, and node-b, which the RESTORED one did — anything less means the identity and the ledger were never paired"
         ;;

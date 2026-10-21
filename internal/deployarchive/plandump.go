@@ -279,6 +279,20 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 // changed. A restore that keeps the database's own ledger writes nothing there
 // and is not refused.
 func (p *Plan) refuseHierarchy(led state.PostgresLedger) bool {
+	// A SCHEMA NAME pg_restore's LIST CANNOT CARRY is refused here too, for the
+	// same reason: pgdump.Restore refuses it, after a recovery has sealed and
+	// fenced, and so would the abandon's put-back.
+	if strings.ContainsFunc(led.Schema, unicode.IsSpace) {
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf("the ledger's schema %q has whitespace in its name, which billet cannot "+
+				"restore a dump into unambiguously", led.Schema),
+			Remedy: "move the ledger to a schema whose name has no whitespace, take a backup there, " +
+				"and run this again",
+		})
+
+		return true
+	}
+
 	if len(led.Hierarchy) == 0 {
 		return false
 	}

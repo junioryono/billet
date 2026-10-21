@@ -99,7 +99,7 @@ A real run needs `BILLET_REHEARSAL_APP_CONFIG` pointing to a billet configuratio
 
 **2026-10-21 (UTC), on a shared Linux amd64 test host (Ubuntu 24.04), on the tree's own package, against a test organization's App.** Each rehearsal ran one at a time under the host's heavy-run lock, and each passed on the run recorded here; the runs before them found what follows.
 
-**The rollout, v0.19.0 to v0.20.0: passed in 276 seconds.** Two packaged hosts on v0.19.0, moved by `billet rollout start` alone: the controller through `billet-upgrade.timer` in 10 seconds, the node dispatched by the coordinator and converged 15 seconds after it, the rollout completed. After each host's upgrade transaction had exited, every billet service with a process ran the binary installed at `/usr/bin/billet` by inode, not a replaced one (`billet-server.service` and `billet-node.service`; #503's check). Then `rollout start --version v0.19.0 --allow-downgrade` was refused in a second, before any host was touched: `v0.19.0 expects ledger schema 62 and this deployment is at 63`, and both hosts stayed on v0.20.0 with no upgrade journal begun across three coordinator passes. That is the first full rollout from a release carrying the transient-unit dispatcher.
+**The rollout, v0.19.0 to v0.20.0: passed in 276 seconds.** Two packaged hosts on v0.19.0, moved by `billet rollout start`: the controller by the unit `billet-upgrade.timer` runs (`billet-upgrade.service`, which the rehearsal starts rather than waiting up to five minutes for the timer's tick) in 10 seconds, the node dispatched by the coordinator and converged 15 seconds after it, the rollout completed. After each host's upgrade transaction had exited, every billet service with a process ran the binary installed at `/usr/bin/billet` by inode, not a replaced one (`billet-server.service` and `billet-node.service`; #503's check). Then `rollout start --version v0.19.0 --allow-downgrade` was refused in a second, before any host was touched: `v0.19.0 expects ledger schema 62 and this deployment is at 63`, and both hosts stayed on v0.20.0 with no upgrade journal begun across three coordinator passes. That is the first full rollout from a release carrying the transient-unit dispatcher.
 
 Three things the earlier runs that day found:
 
@@ -111,10 +111,10 @@ Three things the earlier runs that day found:
 
 **A restored deployment's first start with a real App: passed in 573 seconds** (448 on the first run that day). The old controller served, issued and revoked a certificate for a node that never existed (a row only its ledger holds), was backed up, stopped, disabled and cut off the network. A fresh host was restored from the archive as root and started with `billet local up`; the node that trusted the old controller registered with the new one under the same network alias, and the new controller's `billet ca revocations` listed the revocation, so it serves the archive's ledger rather than an empty one beside the restored authority.
 
-**`make postgres-restore-rehearsal`: passed in 41 seconds**, on the archive that now carries pg_dump's copy (#19). It covers four paths:
+**`make postgres-restore-rehearsal`: passed in 52 seconds** (41 on an earlier run, before the keep had its evidence), on the archive that now carries pg_dump's copy (#19). It covers four paths:
 
 - the manifest's shape and the dump's own `pg_restore --list`;
-- the refusal onto a surviving database bound to nobody;
+- the refusal onto a surviving database bound to nobody, then that ledger kept once the operator says whose it is, an admission taken after the backup still there by psql;
 - a restore into a database that never held the ledger, proved by psql;
 - `local recover` replacing the ledger in place and keeping a dump of what it replaced.
 

@@ -1869,3 +1869,58 @@ func TestAnAbandonThatCannotSaveItsMarkDoesNothing(t *testing.T) {
 
 	assertFenced(t, tgt.StateDir)
 }
+
+// A SCHEMA NAME pg_restore's LIST CANNOT CARRY IS REFUSED AT THE PLAN, for a
+// restore and a recovery, before anything is sealed or fenced: the restore and
+// an abandon's put-back would both refuse it later.
+func TestASchemaNameTheListCannotCarryIsRefusedAtThePlan(t *testing.T) {
+	const spaced = "billet ledger"
+
+	d, migrations := pgDeployment(t)
+	dest := filepath.Join(t.TempDir(), "archive")
+
+	if _, err := Write(t.Context(), BackupRequest{
+		Dest: dest, StateDir: d.stateDir, ConfigPath: d.configPath, DeploymentID: d.id,
+		GitHub: d.github, AppKeyPEM: d.appKey, ConfigBody: []byte("server: {}\n"),
+		Dump: func(_ context.Context, path string) (LedgerDump, error) {
+			return LedgerDump{
+				Facts:      DumpFacts{Schema: spaced, ServerVersion: 160015, DumpVersion: 16, Binding: d.id},
+				Migrations: migrations, DSNEnv: "BILLET_STATE_DSN",
+			}, os.WriteFile(path, archiveDumpBody, 0o600)
+		},
+		Now: nowStub,
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	a, err := Open(t.Context(), dest)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	f := dumpFixture{d: d, archive: a, migrations: migrations}
+
+	empty := emptySchema()
+	empty.Schema = spaced
+
+	p, err := PlanRestore(t.Context(), a, pgTarget(t, d, f.ledgerFor(empty)))
+	if err != nil {
+		t.Fatalf("PlanRestore: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "whitespace in its name")) == 0 {
+		t.Errorf("a restore into a schema named %q was planned: %+v", spaced, p.Refusals)
+	}
+
+	live := f.liveLedger()
+	live.Schema = spaced
+
+	p, err = PlanRecover(t.Context(), a, recoverTarget(t, f, f.ledgerFor(live)))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "whitespace in its name")) == 0 {
+		t.Errorf("a recovery over a schema named %q was planned: %+v", spaced, p.Refusals)
+	}
+}
