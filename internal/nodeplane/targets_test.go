@@ -850,7 +850,10 @@ func TestARecoveryKeepsOnlyTheOwnerItFoundTheRunnerOn(t *testing.T) {
 		moved := twoTargetCatalogue()
 		moved[0].Target = "personal"
 		c = serve(t, store, moved, sources)
-		_, _ = c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1")
+		// THE RETRY MEETS THE SAME FAILING REMOVAL on the owner it was found on.
+		if _, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err == nil {
+			t.Error("the retry reported success though its owner's removal still fails")
+		}
 
 		if _, _, recoveredB := jitB.asked(); len(recoveredB) != 0 {
 			t.Errorf("the retry asked the owner the catalogue names now %v, not the one the runner was found on",
