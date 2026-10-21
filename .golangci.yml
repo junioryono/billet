@@ -404,13 +404,16 @@ linters:
         # lifecycle drains through fleetops, installs a restored App key through
         # setup's writer and pulls Tart images through images, and `billet check`,
         # which `local up` and the upgrade probe run, checks every family's
-        # configuration. Nothing but cmd/billet imports host.
+        # configuration. Nothing but cmd/billet imports host. internal/e2e's test
+        # files run an operator command against a job its real stack ran (#28), as
+        # an operator would after it; nothing they build ships.
         opsconsumers:
           list-mode: lax
           files:
             - "$all"
             - "!${config-path}/cmd/billet/**"
             - "!${config-path}/internal/ops/host/**"
+            - "!${config-path}/internal/e2e/*_test.go"
           deny:
             - pkg: "github.com/junioryono/billet/internal/ops$"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
@@ -422,7 +425,8 @@ linters:
         # imported it would be a layer below reaching up into the CLI. Only the
         # binary and its command families use it. Measured at zero violations
         # when it went in (#356 Phase 5, the one layer rule the regroup was to add
-        # that was not already held package by package).
+        # that was not already held package by package). internal/e2e's tests hand
+        # the operator command they run an Env, as opsconsumers above says.
         cliconsumers:
           list-mode: lax
           files:
@@ -430,6 +434,7 @@ linters:
             - "!${config-path}/cmd/billet/**"
             - "!${config-path}/internal/cli/**"
             - "!${config-path}/internal/ops/**"
+            - "!${config-path}/internal/e2e/*_test.go"
           deny:
             - pkg: "github.com/junioryono/billet/internal/cli$"
               desc: "internal/cli is the command line; only cmd/billet and its command families under internal/ops use it (#356 Phase 5)."

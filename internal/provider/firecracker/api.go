@@ -59,17 +59,21 @@ func newVMMAPIAs(socket string, uid int) *vmmAPI {
 	return newVMMAPIDialing(socket, func(conn net.Conn) error {
 		peer, err := peerUID(conn)
 		if err != nil {
-			return fmt.Errorf("firecracker: tell whose VMM answers on %s: %w", socket, err)
+			return fmt.Errorf("firecracker: %w: tell whose VMM answers on %s: %w", errVMMPeer, socket, err)
 		}
 
 		if uid <= 0 || peer != uid {
-			return fmt.Errorf("firecracker: %s is answered by uid %d, not the microVM's uid %d",
-				socket, peer, uid)
+			return fmt.Errorf("firecracker: %w: %s is answered by uid %d, not the microVM's uid %d",
+				errVMMPeer, socket, peer, uid)
 		}
 
 		return nil
 	})
 }
+
+// errVMMPeer is a VMM socket answered by a process that is not, or cannot be shown to
+// be, the microVM's own VMM. It is never "the VMM is gone": something is listening.
+var errVMMPeer = errors.New("the VMM socket is not answered by the microVM's VMM")
 
 func newVMMAPIDialing(socket string, check func(net.Conn) error) *vmmAPI {
 	var d net.Dialer
