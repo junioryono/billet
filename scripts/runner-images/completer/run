@@ -93,8 +93,11 @@ version() {
 	local v
 	case "$1" in
 	google-chrome) v=$(step google-chrome --product-version) ;;
-	microsoft-edge) v=$(step microsoft-edge --version) && v=${v##* } ;;
-	firefox) v=$(step firefox --version) && v=${v##* } ;;
+	# THE LAST FIELD OF THE FIRST LINE THAT HAS ONE: Edge, as Chromium does, ends
+	# `--version` with a space, which left a last word of nothing (measured
+	# 2026-10-20, run 39512924074).
+	microsoft-edge) v=$(step microsoft-edge --version) && v=$(awk 'NF { print $NF; exit }' <<<"$v") ;;
+	firefox) v=$(step firefox --version) && v=$(awk 'NF { print $NF; exit }' <<<"$v") ;;
 	android-sdk)
 		v=$(sed -n 's/^Pkg\.Revision=//p' "$root/usr/local/lib/android/sdk/cmdline-tools/latest/source.properties")
 		;;
