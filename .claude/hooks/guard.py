@@ -513,10 +513,9 @@ class Shell:
             cwd = os.path.join(self.cwd, os.path.expanduser(chdir)) if chdir else self.cwd
             program = os.path.basename(words[0])
             if program in SHELLS:
-                for i, a in enumerate(words[1:], start=1):
-                    if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a) and i + 1 < len(words):
-                        Shell(cwd, self.calls, self.commands).gather(words[i + 1])
-                        break
+                mode, value = shell_invocation(words)
+                if mode == "command":
+                    Shell(cwd, self.calls, self.commands).gather(value)
                 else:
                     # A shell handed a script runs that script; the gate judgements
                     # read the script's path from it.
@@ -730,11 +729,11 @@ def whole_tree(pattern, cwd):
 
 def full_gate_script(path, cwd):
     """The gate script's name when path, from cwd, is one of billet's full-gate
-    scripts under scripts/gates/, else None. Both the path as written and the
-    file it resolves to are asked, so a symlink to the directory or the script
-    names the gate it runs."""
-    lexical = os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
-    for full in (lexical, os.path.realpath(lexical)):
+    scripts under scripts/gates/, else None. The path is asked as written and as
+    the file it resolves to, each from the path as joined: resolving after `..`
+    is removed would follow a different directory than the shell does."""
+    raw = os.path.join(cwd, os.path.expanduser(path))
+    for full in (os.path.normpath(raw), os.path.realpath(raw)):
         gates, name = os.path.split(full)
         scripts = os.path.dirname(gates)
         if (name in FULL_GATE_SCRIPTS and os.path.basename(gates) == "gates" and os.path.basename(scripts) == "scripts"
@@ -743,19 +742,25 @@ def full_gate_script(path, cwd):
     return None
 
 
-# Shell options that take the next word as their value.
-SHELL_VALUE_OPTIONS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+# Long shell options that take the next word as their value; in a short cluster,
+# each o or O takes one.
+SHELL_VALUE_OPTIONS = {"--rcfile", "--init-file", "--emulate"}
 
 
-def shell_script_operand(words):
-    """The script a shell is handed, read the way the shell reads its options:
-    in order, a value consumed where an option takes one, and nothing after the
-    script counted. None when there is no script, or when -n makes the shell
-    read it and run none of it."""
+def shell_invocation(words):
+    """How a shell is invoked, read the way the shell reads its options: in order,
+    a value consumed where an option takes one, `-` or `--` ending them, and
+    nothing after the first operand counted as the shell's. ("command", text)
+    for -c, ("script", path) for a script it runs, or (None, None) when it reads
+    its standard input (-s), runs nothing (-n or -o noexec, unless a later +n or
+    +o noexec clears it), or names nothing. A script fed on standard input
+    through a redirection is not seen: the redirection is gone before this
+    reads the words."""
+    command = noexec = stdin = False
     i = 1
     while i < len(words):
         w = words[i]
-        if w == "--":
+        if w in ("--", "-"):
             i += 1
             break
         if w in SHELL_VALUE_OPTIONS:
@@ -765,21 +770,37 @@ def shell_script_operand(words):
             i += 1
             continue
         if len(w) > 1 and w[0] in "-+":
-            # A cluster such as -xe; -n anywhere in it reads without running.
-            if w[0] == "-" and "n" in w[1:]:
-                return None
-            i += 1
+            on = w[0] == "-"
+            values = 0
+            for letter in w[1:]:
+                if letter == "n":
+                    noexec = on
+                elif letter == "c" and on:
+                    command = True
+                elif letter == "s" and on:
+                    stdin = True
+                elif letter in "oO":
+                    value = words[i + 1 + values] if i + 1 + values < len(words) else ""
+                    if letter == "o" and value == "noexec":
+                        noexec = on
+                    values += 1
+            i += 1 + values
             continue
         break
-    return words[i] if i < len(words) else None
+    operand = words[i] if i < len(words) else None
+    if command:
+        return ("command", operand) if operand is not None else (None, None)
+    if noexec or stdin or operand is None:
+        return (None, None)
+    return ("script", operand)
 
 
 def judge_gate_script(words, cwd):
     path = words[0]
     if os.path.basename(path) in SHELLS:
         # A shell runs a script named without a slash from its own directory.
-        path = shell_script_operand(words)
-        if path is None:
+        mode, path = shell_invocation(words)
+        if mode != "script":
             return
     elif "/" not in path:
         # Run by name, it is found on PATH, never in the current directory.
