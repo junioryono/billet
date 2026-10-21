@@ -453,6 +453,12 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"tools/lint/go.work", "all"},
 		{"internal/state/migrations/0099_x.sql", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/lifeops/unit.go", families(append([]string{"postgres", "replay"}, application...)...)},
+		// test-postgres runs these packages' tests against a real server, so a
+		// test-only change to one selects it too.
+		{"internal/deployarchive/dump_test.go", families(append([]string{"postgres"}, application...)...)},
+		{"internal/pgdump/pgdump_test.go", families(append([]string{"postgres"}, application...)...)},
+		{"internal/e2e/restore_test.go", families(append([]string{"postgres"}, application...)...)},
+		{"internal/e2e/lifecycle_test.go", families(application...)},
 		{"deploy/billet-server.service", families(application...)},
 		// The collection and the retirement shard checker.
 		{"ansible_collections/junioryono/billet/roles/host/tasks/main.yml",

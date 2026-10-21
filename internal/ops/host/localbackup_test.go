@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -295,9 +296,8 @@ tiers:
 				openErr)
 		}
 
-		if !a.Manifest.Ledger.IsExternal() {
-			t.Fatal("the command reported success and the archive does not record an external " +
-				"ledger")
+		if !a.Manifest.Ledger.IsDump() {
+			t.Fatal("the command reported success and the archive carries no dump of the ledger")
 		}
 
 		return
@@ -403,9 +403,9 @@ func requireBackupPostgres(t *testing.T) string {
 // reintroduced one statement further down and go unseen.
 //
 // So this one connects, migrates, mints an identity and an authority, and drives
-// the real `runLocalBackup` to a finished archive. A refusal anywhere in the
-// command fails it.
-func TestAPostgresBackupWritesAnIdentityOnlyArchive(t *testing.T) {
+// the real `runLocalBackup` — through the real pg_dump — to a finished archive
+// that carries the ledger's dump. A refusal anywhere in the command fails it.
+func TestAPostgresBackupCarriesADumpOfTheLedger(t *testing.T) {
 	dsn := requireBackupPostgres(t)
 	f := newBackupFixture(t, false)
 
@@ -476,8 +476,20 @@ tiers:
 		t.Fatalf("the archive it wrote does not read back: %v", err)
 	}
 
-	if !a.Manifest.Ledger.IsExternal() {
-		t.Error("the archive does not record the ledger as external")
+	if !a.Manifest.Ledger.IsDump() || a.Manifest.Ledger.IsExternal() {
+		t.Fatalf("the archive does not carry the ledger as a dump: %+v", a.Manifest.Ledger)
+	}
+
+	if _, ok := a.Manifest.Record(deployarchive.EntryLedgerDump); !ok {
+		t.Errorf("the manifest does not describe %s", deployarchive.EntryLedgerDump)
+	}
+
+	if a.Manifest.Schema != 4 {
+		t.Errorf("an archive carrying a dump is schema %d, want 4", a.Manifest.Schema)
+	}
+
+	if got, want := a.Manifest.Ledger.Dump.Schema, schemaOf(t, dsn); got != want {
+		t.Errorf("the dump is of schema %q and this deployment's ledger is in %q", got, want)
 	}
 
 	if a.Manifest.Ledger.Backend != "postgres" {
@@ -492,10 +504,27 @@ tiers:
 		t.Errorf("the archive is of deployment %s and this host is %s", a.Manifest.DeploymentID, id)
 	}
 
-	// THE MIGRATIONS CAME FROM THE LIVE DATABASE, which is the one place this
-	// path reads a schema from something still moving. An empty list would mean
-	// AppliedMigrations answered nothing and nobody noticed.
-	if len(a.Manifest.Ledger.Migrations) == 0 {
-		t.Error("the archive records no migrations, so the live ledger was never read")
+	// THE MIGRATIONS ARE THE LEDGER'S, read in the dump's own snapshot: exactly
+	// what the database records, not merely a non-empty list.
+	led, err := state.PeekPostgresLedger(t.Context(), state.DSN(dsn))
+	if err != nil {
+		t.Fatalf("PeekPostgresLedger: %v", err)
 	}
+
+	if len(led.Migrations) == 0 || !slices.Equal(a.Manifest.Ledger.Migrations, led.Migrations) {
+		t.Errorf("the archive records %d migrations and the ledger has %d applied",
+			len(a.Manifest.Ledger.Migrations), len(led.Migrations))
+	}
+}
+
+// schemaOf is the schema a test DSN's search_path names.
+func schemaOf(t *testing.T, dsn string) string {
+	t.Helper()
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse the DSN: %v", err)
+	}
+
+	return u.Query().Get("search_path")
 }

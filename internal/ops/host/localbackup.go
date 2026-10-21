@@ -27,17 +27,17 @@ type backupOptions struct {
 
 // cmdLocalBackup captures this deployment as ONE unit.
 //
-// THE UNIT IS FOUR THINGS AND EACH IS USELESS WITHOUT THE OTHERS: the SQLite
-// ledger, the deployment identity, the GitHub App private key and the node-wire
+// THE UNIT IS FOUR THINGS AND EACH IS USELESS WITHOUT THE OTHERS: the ledger
+// (a SQLite file, or a PostgreSQL database's dump), the deployment identity, the GitHub App private key and the node-wire
 // certificate authority. A ledger without its identity is a fresh authority that
 // cannot see the compute the old one launched; an identity without the CA cannot
 // issue a node certificate; a CA without the App key cannot get a token. So this
 // captures all four or it captures nothing.
 //
-// IT RUNS AGAINST A LIVE CONTROL PLANE. The ledger copy is SQLite's VACUUM INTO,
-// which is a consistent snapshot of a database somebody is writing to, and the
-// handle it uses is the operator one that does not need the directory lock the
-// server is holding.
+// IT RUNS AGAINST A LIVE CONTROL PLANE. The ledger copy is SQLite's VACUUM INTO
+// or pg_dump, each a consistent snapshot of a database somebody is writing to,
+// and the handle it uses is the operator one that does not need the directory
+// lock the server is holding.
 //
 // WHAT IT DELIBERATELY DOES NOT CAPTURE is said out loud at the end: node-local
 // custody state, which must never be restored blindly while compute may still
@@ -177,44 +177,39 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 		fmt.Fprintf(env.Stdout, "         the ledger snapshot holds the single writer slot while it runs\n\n")
 	}
 
-	// THE LEDGER IS BILLET'S TO COPY ONLY WHEN BILLET HOLDS IT.
+	// THE LEDGER TRAVELS AS ITS ENGINE'S OWN CONSISTENT COPY.
 	//
-	// SQLite's VACUUM INTO produces a consistent copy of the whole ledger as one
-	// file. There is no equivalent billet should own for PostgreSQL: a consistent
-	// copy there is pg_dump or the provider's snapshot, both the operator's to run
-	// and to restore, and copying rows through this connection would produce an
-	// archive that LOOKS like a backup and is not.
-	//
-	// UNTIL THIS EXISTED THE WHOLE COMMAND FAILED on such a deployment — so the
-	// half billet DOES own went uncaptured too, and for a control plane built by
-	// the control-plane-postgres module that is the only recovery path there is:
-	// no ledger volume by design, a root volume that is delete_on_termination,
-	// and an App key GitHub issues exactly once.
-	snapshot, external, err := ledgerSource(ctx, cfg, db)
+	// SQLite's VACUUM INTO produces one as a file. For PostgreSQL it is pg_dump,
+	// never rows copied through this connection, which would produce an archive
+	// that LOOKS like a backup and is not (ADR-008). For a control plane built by
+	// the control-plane-postgres module this archive is the only recovery path
+	// there is for the identity half — no ledger volume by design, a root volume
+	// that is delete_on_termination, and an App key GitHub issues exactly once —
+	// and with the dump beside it, for the ledger half too.
+	snapshot, dump, err := ledgerSource(ctx, cfg, db)
 	if err != nil {
 		return err
 	}
 
-	if external != nil {
-		fmt.Fprintf(env.Stdout, "         the ledger is %s and is NOT in this archive; your database's own\n",
-			external.Backend)
-		fmt.Fprintf(env.Stdout, "         backup is the other half\n\n")
+	if dump != nil {
+		fmt.Fprintf(env.Stdout, "         the ledger is PostgreSQL and is copied by its own pg_dump, in one\n")
+		fmt.Fprintf(env.Stdout, "         snapshot, without holding any write\n\n")
 	}
 
 	m, err := deployarchive.Write(ctx, deployarchive.BackupRequest{
-		Dest:           dest,
-		StateDir:       cfg.Server.IdentityDir,
-		ConfigPath:     o.configPath,
-		DeploymentID:   deployment,
-		GitHub:         archiveIdentity(targets[0]),
-		Targets:        further,
-		AppKeyPEM:      appKey,
-		ConfigBody:     configBody,
-		Snapshot:       snapshot,
-		ExternalLedger: external,
-		Now:            time.Now,
-		Hostname:       host,
-		Authority:      acc.Lock(),
+		Dest:         dest,
+		StateDir:     cfg.Server.IdentityDir,
+		ConfigPath:   o.configPath,
+		DeploymentID: deployment,
+		GitHub:       archiveIdentity(targets[0]),
+		Targets:      further,
+		AppKeyPEM:    appKey,
+		ConfigBody:   configBody,
+		Snapshot:     snapshot,
+		Dump:         dump,
+		Now:          time.Now,
+		Hostname:     host,
+		Authority:    acc.Lock(),
 	})
 	if err != nil {
 		return err
@@ -236,41 +231,52 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 	return uploadArchive(ctx, env, cfg, dest, deployment)
 }
 
-// ledgerSource decides whether this deployment's ledger travels in the archive.
+// ledgerSource decides how this deployment's ledger travels in the archive.
 //
-// EXACTLY ONE OF THE TWO IS NON-NIL, which BackupRequest.validate re-checks: an
-// archive carries its ledger or declares it external, and a request claiming
-// both would write a snapshot AND a manifest saying there is none.
+// EXACTLY ONE OF THE TWO IS NON-NIL, which BackupRequest.validate re-checks: a
+// SQLite ledger is a VACUUM INTO snapshot, a PostgreSQL ledger is a pg_dump of
+// the snapshot billet read its migrations in.
 //
-// THE MIGRATION LIST FOR AN EXTERNAL LEDGER COMES FROM THE LIVE DATABASE,
-// because there is no snapshot to read it back from. It is provenance rather
-// than a description of an artifact — see deployarchive.LedgerFacts for why a
-// stale answer is safe in the only direction it can be stale.
+// THE CLIENT PROGRAM IS PROVED BEFORE ANYTHING IS WRITTEN. pg_dump is the
+// operator's, installed with the PostgreSQL client, and one that is absent or
+// older than the server would otherwise be found after the identity and the
+// keys were already in the destination: a directory that is visibly not an
+// archive, but one the operator has to clear before the next attempt.
 func ledgerSource(
 	ctx context.Context, cfg *config.Config, db *state.DB,
-) (func(context.Context, string) error, *deployarchive.ExternalLedger, error) {
+) (func(context.Context, string) error,
+	func(context.Context, string) (deployarchive.LedgerDump, error), error,
+) {
 	if cfg.Server.LedgerBackend() != config.StatePostgres {
 		return db.SnapshotInto, nil, nil
 	}
 
-	applied, err := db.AppliedMigrations(ctx)
+	client, err := postgresClient(cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read what this ledger has applied: %w", err)
+		return nil, nil, err
 	}
 
-	external := &deployarchive.ExternalLedger{
-		Backend:    string(config.StatePostgres),
-		Migrations: applied,
+	if err := client.CheckDump(ctx); err != nil {
+		return nil, nil, err
 	}
 
-	// THE VARIABLE'S NAME, NEVER ITS VALUE. A DSN carries a password and this
-	// manifest travels off-site; the indirection is the rule PostgresStateConfig
-	// already states.
-	if cfg.Server.State != nil && cfg.Server.State.Postgres != nil {
-		external.DSNEnv = cfg.Server.State.Postgres.DSNEnv
+	dump := func(ctx context.Context, dest string) (deployarchive.LedgerDump, error) {
+		// THE IDENTITY DIRECTORY'S FENCE IS HONOURED, as SnapshotInto honours
+		// its handle's: a ledger an upgrade or a restore has closed is not copied.
+		d, err := client.Dump(ctx, cfg.Server.IdentityDir, dest)
+		if err != nil {
+			return deployarchive.LedgerDump{}, err
+		}
+
+		out := d.LedgerDump()
+		// THE VARIABLE'S NAME, NEVER ITS VALUE. A DSN carries a password and this
+		// manifest travels off-site.
+		out.DSNEnv = cfg.Server.LedgerDSNEnv()
+
+		return out, nil
 	}
 
-	return nil, external, nil
+	return nil, dump, nil
 }
 
 // printBackup reports what was captured, and what an archive is not.
@@ -282,6 +288,12 @@ func printBackup(env cli.Env, m deployarchive.Manifest, dest string) {
 	fmt.Fprintln(env.Stdout)
 	fmt.Fprintf(env.Stdout, "ledger   schema %d (%d migrations applied)\n",
 		m.Ledger.HighestVersion(), len(m.Ledger.Migrations))
+
+	if d := m.Ledger.Dump; d != nil {
+		fmt.Fprintf(env.Stdout, "         a pg_dump %d copy of PostgreSQL schema %s (server %d)\n",
+			d.DumpVersion, d.Schema, d.ServerVersion)
+	}
+
 	fmt.Fprintf(env.Stdout, "app      %s\n", m.GitHub)
 	fmt.Fprintf(env.Stdout, "ca       %s, expires %s\n", m.Authority.Fingerprint, m.Authority.NotAfter)
 

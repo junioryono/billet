@@ -19,6 +19,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Every write transaction begins IMMEDIATE, and that is not tuning.**
 - **The writer slot is observed from inside `DB.Tx`, and the observer must return at once.**
 - **A ledger writer reaches no network.**
+- **A PostgreSQL recovery crosses its own fence with `OpenPostgresRecovery`, and the archive's PostgreSQL reads are peeks, not opens (`pgpeek.go`, #19).**
 - **Three open modes, and what each may do.**
 - **An open's own startup budget is a deadline, and a caller can tell it from its own.**
 - **The integrity scan has its own bound, the startup budget pauses for it, and systemd is asked for the time a cold one takes.**

@@ -405,6 +405,25 @@ linters:
             - pkg: "github.com/junioryono/billet/internal/ops/"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
 
+        # THE POSTGRESQL CLIENT PROGRAMS ARE RUN BY A COMMAND, never by a role.
+        # internal/pgdump execs pg_dump and pg_restore against the ledger's
+        # database; a runtime package that reached it could start a dump or a
+        # restore from inside a control plane, which no operation wants.
+        # internal/deployarchive is handed it through an interface rather than
+        # importing it, so the archive package runs no subprocess. Measured at
+        # zero violations when it went in.
+        pgdumpconsumers:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!${config-path}/cmd/billet/**"
+            - "!${config-path}/internal/ops/**"
+            - "!${config-path}/internal/e2e/**"
+            - "!${config-path}/internal/pgdump/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/pgdump$"
+              desc: "internal/pgdump runs the PostgreSQL client programs; only the commands that back up, restore and recover a deployment (and the end-to-end suite) use it."
+
         # THE COMMAND LINE IS THE TOP LAYER. internal/cli is the command tree, the
         # Env a command writes to and the exit statuses; a runtime package that
         # imported it would be a layer below reaching up into the CLI. Only the

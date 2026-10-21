@@ -1,0 +1,379 @@
+// Package pgdump runs PostgreSQL's own client programs against a deployment's
+// ledger: pg_dump to copy it into an archive, pg_restore to put a copy back.
+//
+// BILLET DOES NOT COPY ROWS THROUGH ITS OWN CONNECTION (ADR-008). A consistent
+// copy of a database is the database's own tool's to take, so this package
+// takes it with that tool and adds what billet alone can: the copy is of the
+// snapshot billet read the ledger's migrations and binding in (pg_dump
+// --snapshot), so the archive's description of the dump is exact, and the
+// connection reaches the client program through its environment, never argv,
+// because it carries a password.
+//
+// THE ONE IMPORTER OF os/exec FOR THESE PROGRAMS. internal/state may run no
+// subprocess (a ledger writer must not, and depguard holds it), so the SQL half
+// of a dump and a restore lives there and the process half lives here.
+//
+// The programs are the operator's, installed with the PostgreSQL client, not
+// billet's: when one is absent or too old for the server it must talk to, the
+// refusal names the package to install rather than running a tool that would
+// fail late.
+package pgdump
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"github.com/junioryono/billet/internal/state"
+)
+
+// Dumped is what a dump carries, read in the snapshot the dump was taken in.
+type Dumped struct {
+	// Schema is the PostgreSQL schema the ledger lives in, and the only one the
+	// dump holds. A restore must land in a schema of the same name.
+	Schema string
+	// ServerVersion is the source server's server_version_num.
+	ServerVersion int
+	// DumpVersion is the major version of the pg_dump that wrote it; a pg_restore
+	// older than this may not read it.
+	DumpVersion int
+	// Migrations and Binding are the ledger's, in the dump's own snapshot.
+	Migrations []state.AppliedMigration
+	Binding    string
+}
+
+// Client runs pg_dump and pg_restore against one ledger.
+type Client struct {
+	dsn state.DSN
+	env state.ClientEnv
+
+	// lookPath finds a program; a test replaces it to execute a fake.
+	lookPath func(string) (string, error)
+}
+
+// New renders dsn for the client programs. It refuses a DSN that libpq cannot
+// be handed faithfully (state.LibpqEnv), before anything runs.
+func New(dsn state.DSN) (*Client, error) {
+	env, err := state.LibpqEnv(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{dsn: dsn, env: env, lookPath: exec.LookPath}, nil
+}
+
+// String names the client and never the connection.
+func (c *Client) String() string { return "pgdump.Client{" + c.env.String() + "}" }
+
+// Peek reports what the ledger holds, read-only (state.PeekPostgresLedger).
+func (c *Client) Peek(ctx context.Context) (state.PostgresLedger, error) {
+	return state.PeekPostgresLedger(ctx, c.dsn)
+}
+
+// Admission reads the ledger's admission row behind any fence
+// (state.PeekPostgresAdmission).
+func (c *Client) Admission(ctx context.Context) (state.Admission, error) {
+	return state.PeekPostgresAdmission(ctx, c.dsn)
+}
+
+// Barrier proves no billet write transaction is in flight on the ledger, from
+// any host (state.PostgresWriterBarrier).
+func (c *Client) Barrier(ctx context.Context) error {
+	return state.PostgresWriterBarrier(ctx, c.dsn)
+}
+
+// Dump writes a custom-format dump of the ledger to dest, which must not exist.
+//
+// fenceDir is the directory whose maintenance fence the copy honours, empty for
+// a caller that holds the fence itself (see state.ExportPostgresSnapshot).
+func (c *Client) Dump(ctx context.Context, fenceDir, dest string) (Dumped, error) {
+	// pg_dump TRUNCATES an existing --file, so the no-clobber rule every archive
+	// write follows is held here: a caller writes a dump only to a name it has
+	// just made free.
+	switch _, err := os.Lstat(dest); {
+	case err == nil:
+		return Dumped{}, fmt.Errorf("pgdump: %s already exists and billet will not write a dump over it", dest)
+	case !errors.Is(err, os.ErrNotExist):
+		return Dumped{}, fmt.Errorf("pgdump: inspect %s: %w", dest, err)
+	}
+
+	path, major, err := c.program(ctx, "pg_dump")
+	if err != nil {
+		return Dumped{}, err
+	}
+
+	var out Dumped
+
+	err = state.ExportPostgresSnapshot(ctx, c.dsn, fenceDir, func(snap state.LedgerSnapshot) error {
+		// pg_dump REFUSES A NEWER SERVER, and says so only after connecting
+		// ("aborting because of server version mismatch", measured 2026-10-20 with
+		// pg_dump 17 against 18). Asked here first so the refusal names the
+		// package that fixes it.
+		if server := snap.ServerVersion / 10000; major < server {
+			return fmt.Errorf("pgdump: %s is PostgreSQL %d and the ledger's server is %d, and "+
+				"pg_dump cannot copy a newer server. %s", path, major, server, installAdvice(server))
+		}
+
+		args := []string{
+			"--format=custom",
+			"--no-password",
+			"--schema=" + snap.Schema,
+			"--snapshot=" + snap.ID,
+			"--file=" + dest,
+		}
+
+		if _, err := c.run(ctx, path, args...); err != nil {
+			return err
+		}
+
+		out = Dumped{
+			Schema: snap.Schema, ServerVersion: snap.ServerVersion, DumpVersion: major,
+			Migrations: snap.Migrations, Binding: snap.Binding,
+		}
+
+		return nil
+	})
+	if err != nil {
+		return Dumped{}, err
+	}
+
+	return out, nil
+}
+
+// CheckDump proves pg_dump is installed and can copy this ledger's server,
+// before a caller writes anything it would have to clear up after a refusal.
+func (c *Client) CheckDump(ctx context.Context) error {
+	path, major, err := c.program(ctx, "pg_dump")
+	if err != nil {
+		return err
+	}
+
+	led, err := c.Peek(ctx)
+	if err != nil {
+		return err
+	}
+
+	if server := led.ServerVersion / 10000; major < server {
+		return fmt.Errorf("pgdump: %s is PostgreSQL %d and the ledger's server is %d, and "+
+			"pg_dump cannot copy a newer server. %s", path, major, server, installAdvice(server))
+	}
+
+	return nil
+}
+
+// Restore puts a dump into the ledger's schema, in one transaction.
+//
+// --single-transaction MAKES IT ALL OR NOTHING: a failure part-way leaves the
+// schema exactly as it was (measured 2026-10-20: a restore refused at its third
+// statement left none of its tables behind), which is what lets a resumed or
+// abandoned operation reason about the database by the journal alone.
+//
+// THE SCHEMA ITSELF IS NOT RESTORED. pg_dump --schema writes the schema as an
+// entry of its own, and --clean then emits `DROP SCHEMA IF EXISTS <s>` and
+// `CREATE SCHEMA <s>` (measured): the drop fails, and with it the whole restore,
+// when anything else lives in that schema, and for `public` it would recreate a
+// schema the database owner owns as one the restoring role owns. So the entry is
+// filtered out of the restore's list and the schema must already exist, which
+// the caller has proved by finding current_schema() equal to the dump's.
+//
+// --no-owner and --no-privileges, because the objects belong to whichever role
+// this deployment connects as here, which need not be the source's.
+//
+// lock_timeout BOUNDS THE WAIT: --clean takes an exclusive lock on every table
+// it drops, and a session holding one would otherwise keep the restore waiting
+// for as long as it lived.
+func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int) error {
+	path, major, err := c.program(ctx, "pg_restore")
+	if err != nil {
+		return err
+	}
+
+	if major < dumpVersion {
+		return fmt.Errorf("pgdump: %s is PostgreSQL %d and this archive's dump was written by "+
+			"pg_dump %d, which an older pg_restore may not read. %s", path, major, dumpVersion,
+			installAdvice(dumpVersion))
+	}
+
+	toc, err := c.run(ctx, path, "--list", dump)
+	if err != nil {
+		return err
+	}
+
+	dir, err := os.MkdirTemp("", "billet-restore-list-*")
+	if err != nil {
+		return fmt.Errorf("pgdump: stage the restore list: %w", err)
+	}
+
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	list := filepath.Join(dir, "toc.list")
+	if err := os.WriteFile(list, withoutSchemaEntries(toc), 0o600); err != nil {
+		return fmt.Errorf("pgdump: stage the restore list: %w", err)
+	}
+
+	db, err := c.databaseConninfo()
+	if err != nil {
+		return err
+	}
+
+	_, err = c.runWith(ctx, []string{"PGOPTIONS=" + c.restoreOptions()}, path,
+		"--single-transaction", "--exit-on-error", "--clean", "--if-exists",
+		"--no-owner", "--no-privileges", "--no-password",
+		"--use-list="+list, "--dbname="+db, dump)
+
+	return err
+}
+
+// tocSchemaEntry matches the restore-list lines for the schema itself: its
+// creation and its comment, e.g. `6; 2615 16385 SCHEMA - s1 billet` and
+// `3490; 0 0 COMMENT - SCHEMA public pg_database_owner` (measured).
+var tocSchemaEntry = regexp.MustCompile(`^\d+; \d+ \d+ (SCHEMA|COMMENT) - (SCHEMA )?\S+ `)
+
+// withoutSchemaEntries comments out the schema's own entries in a restore list.
+func withoutSchemaEntries(toc []byte) []byte {
+	lines := strings.Split(string(toc), "\n")
+
+	for i, line := range lines {
+		if tocSchemaEntry.MatchString(line) {
+			lines[i] = ";" + line
+		}
+	}
+
+	return []byte(strings.Join(lines, "\n"))
+}
+
+// restoreOptions is the PGOPTIONS a restore runs with: the DSN's own, and the
+// lock timeout after them.
+func (c *Client) restoreOptions() string {
+	for _, v := range c.env.Environ(nil) {
+		if opts, ok := strings.CutPrefix(v, "PGOPTIONS="); ok {
+			return opts + " -c lock_timeout=30s"
+		}
+	}
+
+	return "-c lock_timeout=30s"
+}
+
+// databaseConninfo names the database for pg_restore's --dbname, which must be
+// given for pg_restore to connect at all rather than print a script. A conninfo
+// with only dbname in it, so nothing secret reaches argv and a name holding '='
+// is not read as a connection string.
+func (c *Client) databaseConninfo() (string, error) {
+	for _, v := range c.env.Environ(nil) {
+		if name, ok := strings.CutPrefix(v, "PGDATABASE="); ok {
+			return "dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(name) + "'", nil
+		}
+	}
+
+	return "", errors.New("pgdump: the PostgreSQL data source names no database to restore into")
+}
+
+// program finds a client program and its major version, asked with the same
+// environment it will run with: Debian's pg_wrapper picks a version by the
+// connection it is given.
+func (c *Client) program(ctx context.Context, name string) (string, int, error) {
+	path, err := c.lookPath(name)
+	if err != nil {
+		return "", 0, fmt.Errorf("pgdump: %s is not installed, and billet copies a PostgreSQL ledger "+
+			"with the PostgreSQL client's own tools. %s", name, installAdvice(0))
+	}
+
+	out, err := c.run(ctx, path, "--version")
+	if err != nil {
+		return "", 0, err
+	}
+
+	major, err := parseMajor(string(out))
+	if err != nil {
+		return "", 0, fmt.Errorf("pgdump: %s: %w", path, err)
+	}
+
+	return path, major, nil
+}
+
+// versionLine is `pg_dump (PostgreSQL) 18.1 (Homebrew)` or
+// `pg_dump (PostgreSQL) 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)` (measured).
+var versionLine = regexp.MustCompile(`\(PostgreSQL\) (\d+)`)
+
+func parseMajor(out string) (int, error) {
+	m := versionLine.FindStringSubmatch(out)
+	if m == nil {
+		return 0, errors.New("its --version did not say which PostgreSQL it is")
+	}
+
+	return strconv.Atoi(m[1])
+}
+
+// installAdvice names what to install for a major, or the client in general.
+func installAdvice(major int) string {
+	pkg, brew := "postgresql-client", "postgresql"
+	if major > 0 {
+		pkg, brew = fmt.Sprintf("postgresql-client-%d", major), fmt.Sprintf("postgresql@%d", major)
+	}
+
+	if runtime.GOOS == "darwin" {
+		return "Install it with `brew install " + brew + "` and put its bin directory on PATH."
+	}
+
+	return "Install it with `apt-get install " + pkg + "` (from apt.postgresql.org when the " +
+		"distribution's is older than the server), or your distribution's equivalent."
+}
+
+// stderrLimit bounds what a client program's complaint can grow to in an error.
+const stderrLimit = 8 << 10
+
+func (c *Client) run(ctx context.Context, path string, args ...string) ([]byte, error) {
+	return c.runWith(ctx, nil, path, args...)
+}
+
+// runWith runs a client program with the connection in its environment and
+// extra laid over that, and returns its standard output.
+func (c *Client) runWith(ctx context.Context, extra []string, path string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.Env = append(c.env.Environ(os.Environ()), append([]string{"LC_ALL=C"}, extra...)...)
+
+	var stdout, stderr bytes.Buffer
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &limitWriter{w: &stderr, left: stderrLimit}
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("pgdump: %s %s failed (%w): %s", filepath.Base(path),
+			firstArg(args), err, strings.TrimSpace(c.env.Redact(stderr.String())))
+	}
+
+	return stdout.Bytes(), nil
+}
+
+func firstArg(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+
+	return args[0]
+}
+
+// limitWriter keeps the first left bytes and discards the rest, so a program
+// that writes without end cannot grow an error without end.
+type limitWriter struct {
+	w    *bytes.Buffer
+	left int
+}
+
+func (l *limitWriter) Write(p []byte) (int, error) {
+	if l.left > 0 {
+		n := min(len(p), l.left)
+		l.w.Write(p[:n])
+		l.left -= n
+	}
+
+	return len(p), nil
+}

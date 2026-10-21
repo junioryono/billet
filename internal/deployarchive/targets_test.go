@@ -79,7 +79,7 @@ func TestEveryTargetsKeyTravelsAndLands(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "archive")
 	m := backupWithTargets(t, src, dest, extra)
 
-	if m.Schema != Schema || len(m.Targets) != 1 || m.Targets[0].Name != "personal" ||
+	if m.Schema != 3 || len(m.Targets) != 1 || m.Targets[0].Name != "personal" ||
 		!m.Targets[0].Same(personal) {
 		t.Fatalf("manifest = schema %d, targets %+v", m.Schema, m.Targets)
 	}

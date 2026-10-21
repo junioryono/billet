@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -152,6 +153,12 @@ func runLocalRestore(ctx context.Context, env cli.Env, o restoreOptions) error {
 	}
 
 	archiveTargets(cfg, &target)
+
+	if reachesArchiveLedger(cfg, archive) {
+		if target.Postgres, err = archiveTargetLedger(cfg); err != nil {
+			return err
+		}
+	}
 
 	if o.abandon {
 		return runRestoreAbandon(ctx, env, archive, target)
@@ -428,6 +435,12 @@ func restoredStateTargets(plan deployarchive.Plan) []lifeops.RepairTarget {
 	}
 
 	for _, a := range plan.Actions {
+		// A DUMP LANDS IN A DATABASE, not under this directory: its Path names a
+		// schema, and there is no file of it to hand back.
+		if a.Entry == deployarchive.EntryLedgerDump {
+			continue
+		}
+
 		add(a.Path, false)
 
 		// SQLite keeps these beside the ledger, and anything that opened the
@@ -437,6 +450,13 @@ func restoredStateTargets(plan deployarchive.Plan) []lifeops.RepairTarget {
 				add(sidecar, false)
 			}
 		}
+	}
+
+	// A POSTGRESQL RECOVERY'S COPY OF THE LEDGER IT REPLACED is a file a root
+	// run created in the service account's directory; the SQLite one is a rename
+	// and keeps the owner it had.
+	if plan.Superseded != "" && plan.Archive != nil && plan.Archive.Manifest.Ledger.IsDump() {
+		add(plan.Superseded, false)
 	}
 
 	add(wirecert.CADir(plan.Target.StateDir), true)
@@ -545,6 +565,16 @@ func printArchive(env cli.Env, a *deployarchive.Archive) {
 	fmt.Fprintf(env.Stdout, "         ledger     schema %d (%d migrations)\n",
 		m.Ledger.HighestVersion(), len(m.Ledger.Migrations))
 
+	switch {
+	case m.Ledger.Dump != nil:
+		fmt.Fprintf(env.Stdout, "                    a pg_dump %d copy of PostgreSQL schema %s\n",
+			m.Ledger.Dump.DumpVersion, m.Ledger.Dump.Schema)
+	case m.Ledger.IsExternal():
+		fmt.Fprintf(env.Stdout, "                    NOT in this backup: the ledger is %s, an older archive's\n",
+			m.Ledger.Backend)
+		fmt.Fprintf(env.Stdout, "                    identity-only shape\n")
+	}
+
 	if m.Source.Host != "" {
 		fmt.Fprintf(env.Stdout, "         from       %s:%s\n", m.Source.Host, m.Source.StateDir)
 	}
@@ -563,6 +593,8 @@ func printRestorePlan(env cli.Env, p deployarchive.Plan) {
 			fmt.Fprintf(env.Stdout, "         (it has no deployment data in it; `billet check` creates one)\n")
 		case deployarchive.Install:
 			fmt.Fprintf(env.Stdout, "plan     install %s at %s\n", a.What, a.Path)
+		case deployarchive.KeepLiveLedger:
+			printKeepLiveLedger(env, a)
 		}
 	}
 
@@ -570,6 +602,15 @@ func printRestorePlan(env cli.Env, p deployarchive.Plan) {
 		fmt.Fprintf(env.Stdout, "plan     remove %s with it (a stray write-ahead log is replayed into the\n", path)
 		fmt.Fprintf(env.Stdout, "         restored ledger, which is corruption rather than a stale file)\n")
 	}
+}
+
+// printKeepLiveLedger says the database keeps its own ledger and why: those rows
+// are newer than the backup's, and replacing them is a recovery's decision.
+func printKeepLiveLedger(env cli.Env, a deployarchive.Action) {
+	fmt.Fprintf(env.Stdout, "plan     KEEP the ledger already in %s: it is this deployment's own and\n", a.Path)
+	fmt.Fprintf(env.Stdout, "         newer than this backup, so its leases are the ones the fleet holds.\n")
+	fmt.Fprintf(env.Stdout, "         The backup's dump is not used; `billet local recover` replaces it\n")
+	fmt.Fprintf(env.Stdout, "         deliberately if that is what you mean\n")
 }
 
 // printRestoreResult says what actually happened, whether or not it finished.
@@ -583,6 +624,12 @@ func printRestoreResult(env cli.Env, res deployarchive.Result) {
 	}
 
 	for _, a := range res.Skipped {
+		if a.Disposition == deployarchive.KeepLiveLedger {
+			fmt.Fprintf(env.Stdout, "keep     the ledger in %s, which is this deployment's own\n", a.Path)
+
+			continue
+		}
+
 		fmt.Fprintf(env.Stdout, "skip     %s was already in place\n", a.What)
 	}
 
@@ -677,12 +724,20 @@ func printRestored(env cli.Env, a *deployarchive.Archive, t deployarchive.Target
 	// restored the ledger themselves — quite possibly to a different point.
 	// Printing it as the state of the thing they are about to start reinforces
 	// confidence in exactly the half billet asked THEM to vouch for.
-	if a.Manifest.Ledger.IsExternal() {
+	keptLive := slices.ContainsFunc(res.Skipped, func(a deployarchive.Action) bool {
+		return a.Disposition == deployarchive.KeepLiveLedger
+	})
+
+	switch {
+	case a.Manifest.Ledger.IsExternal():
 		fmt.Fprintf(env.Stdout, "  this backup recorded the external ledger at schema %d when it was taken;\n",
 			a.Manifest.Ledger.HighestVersion())
 		fmt.Fprintf(env.Stdout, "  billet did not inspect the database you restored, and a newer\n")
 		fmt.Fprintf(env.Stdout, "  `billet server` migrates whatever it finds there on its first start\n\n")
-	} else {
+	case keptLive:
+		fmt.Fprintf(env.Stdout, "  the database kept this deployment's own ledger, which is newer than the\n")
+		fmt.Fprintf(env.Stdout, "  backup; the backup's dump was not used\n\n")
+	default:
 		fmt.Fprintf(env.Stdout, "  the ledger is at schema %d; a newer `billet server` migrates it forward on\n",
 			a.Manifest.Ledger.HighestVersion())
 		fmt.Fprintf(env.Stdout, "  its first start, exactly as it would any older ledger\n\n")
@@ -694,6 +749,12 @@ func printRestored(env cli.Env, a *deployarchive.Archive, t deployarchive.Target
 	// stayed root-owned however many times it ran, and the control plane could
 	// not start.
 	fmt.Fprintf(env.Stdout, "  `billet local up` starts the services — it is what to run next\n\n")
+
+	// A LEDGER THE DATABASE KEPT HAS EVERY LEASE THE FLEET HOLDS, so the warning
+	// below, which is about a ledger older than the fleet, would be false.
+	if keptLive {
+		return
+	}
 
 	fmt.Fprintf(env.Stdout, "BEFORE you reconnect nodes: this ledger has no lease for compute created after\n")
 	fmt.Fprintf(env.Stdout, "%s. Node recovery treats an instance with no lease as an orphan and destroys\n",
@@ -762,6 +823,14 @@ func runRestoreAbandon(ctx context.Context, env cli.Env, a *deployarchive.Archiv
 
 	if err != nil {
 		return err
+	}
+
+	// SAID, NOT UNDONE. The restore's pg_restore had committed, and taking those
+	// rows out again is dropping a schema, which is a decision rather than an undo.
+	if schema := res.LedgerLeftInDatabase; schema != "" {
+		fmt.Fprintf(env.Stdout, "note     PostgreSQL schema %s still holds the ledger this restore put there;\n", schema)
+		fmt.Fprintf(env.Stdout, "         billet does not drop a schema. Empty it yourself if you mean to\n")
+		fmt.Fprintf(env.Stdout, "         discard it; a restore of this backup again keeps it as it is\n")
 	}
 
 	fmt.Fprintln(env.Stdout)

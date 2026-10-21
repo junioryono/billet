@@ -123,3 +123,6 @@ d02ede176458 #127 now proves every node stop by the node's ending, the retiremen
 dffafcd4ce59 #127 now proves each node stop the role and the command perform by the node's ending; the sentence says it establishes the guarantee.
 b56657d3069e The images row gained `accept`, the components whose licenses a deployment accepts (#584); the row is otherwise unchanged.
 301e180e7feb An idle launch runner is no longer retired by a runner-less cancellation: the cancellation detaches it and the pool retires it, reinstating it busy when GitHub refuses its removal as running a job (#598); the sentence now ends at the job being marked finished and the next ones state that.
+2005dcd34322 #19 added dump_test.go to internal/deployarchive's tests; the list now names it.
+705b3b1bd8f9 #19 carries a PostgreSQL ledger as pg_dump's copy (archive schema 4); the sentence now says which schema each archive is written at and that identity-only archives are still read.
+d60701766066 #19: `billet local backup` no longer records a PostgreSQL ledger as external, it carries pg_dump's copy; the host-transaction rule is restated without that clause and the dump has its own invariant.

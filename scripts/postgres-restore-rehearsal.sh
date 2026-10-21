@@ -3,13 +3,13 @@
 # fresh Linux machine with a real PostgreSQL beside it.
 #
 # WHAT THIS PROVES THAT scripts/restore-rehearsal.sh CANNOT, and it is not the
-# same operation with a different database underneath. On this profile billet
-# archives HALF a deployment on purpose: the ledger is pg_dump's or the
-# provider's to copy, so the archive holds the deployment identity, the node-wire
-# authority and the GitHub App private key and records the ledger as external
-# external. Everything about restoring that half is a path the SQLite rehearsal
-# never takes — a different archive schema, an entry set one short, and two
-# refusals that exist only here.
+# same operation with a different database underneath. On this profile the
+# ledger travels as pg_dump's own copy (archive schema 4), taken by the real
+# pg_dump on a packaged host as the service account, and comes back three ways
+# the SQLite rehearsal never takes: kept as it is in the database that survived
+# the host, restored by pg_restore into a database that never held it, and
+# replaced in place by `billet local recover`, which keeps a dump of what it
+# replaced.
 #
 # AND IT IS THE PROFILE WHERE THE ARCHIVE MATTERS MOST. The control-plane-postgres
 # module has no ledger volume by design — a volume pins the instance to one
@@ -231,25 +231,33 @@ runuser -u billet -- env "${DSN_ENV}=${BILLET_STATE_DSN}" \
 
 test -f "${ARCHIVE}/manifest.json" || fail "the backup wrote no manifest"
 
-# THE ARCHIVE IS THE IDENTITY-ONLY ONE, asserted STRUCTURALLY rather than by
-# substring. The first version grepped for `"external": true` and friends, which
-# establishes three fragments of text: it cannot say the ledger is absent from
-# the manifest's own file list, and it goes red on a formatting change that
-# breaks nothing.
+# THE ARCHIVE CARRIES THE LEDGER AS pg_dump'S COPY, asserted STRUCTURALLY rather
+# than by substring: schema 4, not external, the engine, the variable's name,
+# exactly one ledger entry and it is the dump, and the schema it was taken from.
 manifest_shape=$(jq -r '[
     .schema,
-    (.ledger.external | tostring),
+    (.ledger.external // false | tostring),
     .ledger.backend,
     .ledger.dsn_env,
-    ([.files[].path | select(startswith("ledger/"))] | length | tostring)
+    ([.files[].path | select(startswith("ledger/"))] | join(",")),
+    .ledger.dump.format,
+    .ledger.dump.schema
 ] | join("|")' "${ARCHIVE}/manifest.json") ||
     fail "the archive's manifest is not readable JSON"
 
-test "${manifest_shape}" = "3|true|postgres|${DSN_ENV}|0" ||
-    fail "the manifest reads [${manifest_shape}] and an identity-only archive is [3|true|postgres|${DSN_ENV}|0]"
+want_shape="4|false|postgres|${DSN_ENV}|ledger/billet.pgdump|pg_dump-custom|public"
+test "${manifest_shape}" = "${want_shape}" ||
+    fail "the manifest reads [${manifest_shape}] and an archive carrying the ledger's dump is [${want_shape}]"
 
-test -e "${ARCHIVE}/ledger" &&
-    fail "the archive holds a ledger directory its manifest says does not exist"
+# AND THE FILE IS pg_dump'S OWN, asked of pg_restore rather than of billet: a
+# dump billet wrote some other way would list nothing, or not be readable at all.
+pg_restore --list "${ARCHIVE}/ledger/billet.pgdump" >/tmp/dump.list ||
+    fail "pg_restore cannot read the archived dump"
+grep -q 'TABLE public issued_certs' /tmp/dump.list ||
+    fail "the archived dump does not hold the ledger's issued_certs table"
+
+mode=$(stat -c '%a' "${ARCHIVE}/ledger/billet.pgdump")
+test "${mode}" = "600" || fail "the archived dump is mode ${mode}, want 600"
 
 # AND THE SECRET ITSELF IS NOWHERE IN IT. The manifest records the variable's
 # NAME because a DSN carries a password and this directory travels off-site — so
@@ -269,9 +277,7 @@ case "${dsn_hit}" in
     *) fail "billet could not search the archive for the DSN (grep exited ${dsn_hit})" ;;
 esac
 
-# AND IT STILL CARRIES EVERY OTHER PIECE. That is the half of the fix that matters:
-# the command used to fail outright, so an operator got NOTHING — not a smaller
-# archive, no archive at all.
+# AND EVERY OTHER PIECE BESIDE IT.
 for entry in identity/deployment-id github/app-private-key.pem \
     authority/ca.key authority/ca.crt authority/authority-created; do
     test -f "${ARCHIVE}/${entry}" || fail "the archive is missing ${entry}"
@@ -283,12 +289,12 @@ test "${mode}" = "700" || fail "the archive directory is mode ${mode}, want 700"
 mode=$(stat -c '%a' "${ARCHIVE}/github/app-private-key.pem")
 test "${mode}" = "600" || fail "the archived App key is mode ${mode}, want 600"
 
-step "a restore is REFUSED until the operator says the ledger is back"
-# BILLET CANNOT CHECK THIS ONE, which is exactly why it asks. The database is on
-# the other end of a connection string, and whether the one answering is the one
-# this identity was minted beside is not something this process can establish.
-# An identity restored beside an EMPTY ledger is a control plane that advertises
-# capacity for a fleet it has no record of.
+step "onto the database that survived, a ledger bound to nobody is REFUSED until the operator says whose it is"
+# THE REPLACEMENT-CONTROLLER SHAPE: the host is gone and the database is not, so
+# the database's rows are newer than the archive's and are KEPT, never replaced
+# by the dump. billet reads whose they are from the ledger's deployment binding;
+# this deployment was commissioned by `ca issue` alone, no controller ever
+# claimed it, so the rows are bound to nobody and billet cannot tell. It asks.
 sed -e "s#identity_dir: ${IDENTITY_A}#identity_dir: ${IDENTITY_B}#" \
     -e 's#private_key_path: /etc/billet/app-private-key.pem#private_key_path: /etc/billet/restored-app-private-key.pem#' \
     "${CONFIG_A}" > "${CONFIG_B}"
@@ -300,7 +306,7 @@ install -d -o billet -g billet -m 0700 "${IDENTITY_B}"
 if billet local restore --config "${CONFIG_B}" --from "${ARCHIVE}" \
     --old-controller-fenced >/tmp/unattached.log 2>&1; then
     cat /tmp/unattached.log >&2
-    fail "an identity-only restore was allowed without the operator asserting the ledger is back"
+    fail "a restore onto a populated ledger bound to nobody was allowed without the operator saying whose it is"
 fi
 grep -q -- '--external-ledger-attached' /tmp/unattached.log ||
     fail "the refusal does not name the flag that answers it"
@@ -322,7 +328,7 @@ absent "${CONFIG_SQLITE}" "backend: postgres"
 if billet local restore --config "${CONFIG_SQLITE}" --from "${ARCHIVE}" \
     --old-controller-fenced --external-ledger-attached >/tmp/wrong-backend.log 2>&1; then
     cat /tmp/wrong-backend.log >&2
-    fail "an identity-only restore was allowed onto a host configured for a local ledger"
+    fail "a PostgreSQL ledger's archive was restored onto a host configured for a local ledger"
 fi
 grep -q 'empty ledger of its own' /tmp/wrong-backend.log ||
     fail "the refusal does not say what the mismatch would cost"
@@ -341,7 +347,15 @@ billet local restore --config "${CONFIG_B}" --from "${ARCHIVE}" \
 untouched "the dry run"
 
 billet local restore --config "${CONFIG_B}" --from "${ARCHIVE}" \
-    --old-controller-fenced --external-ledger-attached
+    --old-controller-fenced --external-ledger-attached >/tmp/kept.log 2>&1 || {
+    cat /tmp/kept.log >&2
+    fail "the restore onto the surviving database failed"
+}
+cat /tmp/kept.log
+
+# THE DATABASE'S LEDGER WAS KEPT, and the command said so.
+grep -q 'KEEP the ledger' /tmp/kept.log ||
+    fail "the restore did not say it keeps the surviving database's ledger"
 
 step "what root restored, and who owns it"
 ls -la "${IDENTITY_B}" "${IDENTITY_B}/ca"
@@ -441,17 +455,98 @@ grep -qi 'app-private-key\|app key\|private key' /tmp/restored-check.log || {
     fail "billet check said nothing about the App private key, so this step did not exercise it"
 }
 
-step "\`billet local recover\` is REFUSED on this profile, and says what to run instead"
-# Recover exists to put a deployment back over ITSELF, and the only thing it
-# moves is the ledger: it seals, waits for quiescence, and renames the live
-# billet.db aside. None of that exists for a database billet does not hold.
-if billet local recover --config "${CONFIG_A}" --from "${ARCHIVE}" \
-    --old-controller-fenced >/tmp/recover.log 2>&1; then
+step "restore it into a database that has never held it"
+# THE OTHER HALF OF THE PROFILE: the database is new too, and the ledger comes
+# back from the archive's dump. A second database owned by the same role, a
+# config naming it, and an identity directory nothing has seen.
+runuser -u postgres -- psql -q -c "CREATE DATABASE billet_c OWNER billet"
+
+IDENTITY_C=/var/lib/billet/fresh
+CONFIG_C=/etc/billet/billet-fresh.yaml
+DSN_ENV_C=BILLET_STATE_DSN_FRESH
+export BILLET_STATE_DSN_FRESH='postgres://billet:billet@127.0.0.1:5432/billet_c?sslmode=disable'
+
+sed -e "s#identity_dir: ${IDENTITY_A}#identity_dir: ${IDENTITY_C}#" \
+    -e "s#dsn_env: ${DSN_ENV}#dsn_env: ${DSN_ENV_C}#" \
+    -e 's#private_key_path: /etc/billet/app-private-key.pem#private_key_path: /etc/billet/fresh-app-private-key.pem#' \
+    "${CONFIG_A}" > "${CONFIG_C}"
+edited "${CONFIG_C}" "identity_dir: ${IDENTITY_C}"
+edited "${CONFIG_C}" "dsn_env: ${DSN_ENV_C}"
+install -d -o billet -g billet -m 0700 "${IDENTITY_C}"
+
+billet local restore --config "${CONFIG_C}" --from "${ARCHIVE}" --old-controller-fenced
+
+# ASKED OF psql, NOT OF BILLET: the ledger the original deployment wrote is now
+# in the new database, node-a's admission and every migration with it.
+admitted=$(runuser -u postgres -- psql -d billet_c -tAc \
+    "SELECT string_agg(node, ',' ORDER BY node) FROM issued_certs")
+test "${admitted}" = "node-a" ||
+    fail "the new database holds admissions for [${admitted}], want node-a, which only the archive's dump carries"
+
+migrations_a=$(jq -r '.ledger.migrations | length' "${ARCHIVE}/manifest.json")
+migrations_c=$(runuser -u postgres -- psql -d billet_c -tAc "SELECT count(*) FROM schema_migrations")
+test "${migrations_c}" = "${migrations_a}" ||
+    fail "the new database records ${migrations_c} migrations and the archive's ledger ${migrations_a}"
+
+# AND THE SERVICE ACCOUNT SERVES FROM IT: a certificate issued through the
+# restored identity is admitted in the NEW database, and not in the old one.
+runuser -u billet -- env "${DSN_ENV_C}=${BILLET_STATE_DSN_FRESH}" \
+    billet ca issue node-c --config "${CONFIG_C}" --out /var/lib/billet/bundles/node-c ||
+    fail "the service account could not use the deployment restored into the new database"
+admitted=$(runuser -u postgres -- psql -d billet_c -tAc \
+    "SELECT string_agg(node, ',' ORDER BY node) FROM issued_certs")
+test "${admitted}" = "node-a,node-c" ||
+    fail "the new database holds admissions for [${admitted}], want node-a and node-c"
+
+step "billet local recover puts the ledger back over itself, keeping a dump of what it replaced"
+# THE LEDGER MOVES ON after the backup: an admission the archive has never heard
+# of. Proved present first, or its absence afterwards would prove nothing.
+runuser -u billet -- env "${DSN_ENV}=${BILLET_STATE_DSN}" \
+    billet ca issue node-later --config "${CONFIG_A}" --out /var/lib/billet/bundles/node-later
+later=$(runuser -u postgres -- psql -d billet -tAc \
+    "SELECT count(*) FROM issued_certs WHERE node = 'node-later'")
+test "${later}" = "1" ||
+    fail "the live ledger does not record node-later, so its absence later would prove nothing"
+
+billet local recover --config "${CONFIG_A}" --from "${ARCHIVE}" --old-controller-fenced \
+    --reason "postgres restore rehearsal" >/tmp/recover.log 2>&1 || {
     cat /tmp/recover.log >&2
-    fail "billet local recover was allowed against an external ledger"
-fi
-grep -q 'billet local restore' /tmp/recover.log ||
-    fail "the refusal does not name the operation that IS available"
+    fail "billet local recover failed on a PostgreSQL deployment"
+}
+cat /tmp/recover.log
+
+later=$(runuser -u postgres -- psql -d billet -tAc \
+    "SELECT count(*) FROM issued_certs WHERE node = 'node-later'")
+test "${later}" = "0" ||
+    fail "the recovered ledger still knows node-later, so the archive's ledger is not the one in place"
+
+kept=$(find "${IDENTITY_A}" -maxdepth 1 -name 'ledger.pgdump.superseded-*' -print)
+test -n "${kept}" || fail "the recovery kept no dump of the ledger it replaced"
+
+# THE KEPT DUMP IS THE LEDGER IT REPLACED, asked of pg_restore: its data holds
+# node-later, which only the replaced ledger had. Captured before it is searched,
+# so a pg_restore that could not read the file fails here by its own status.
+pg_restore --data-only --table=issued_certs -f /tmp/kept.sql "${kept}" ||
+    fail "pg_restore cannot read the kept dump at ${kept}"
+grep -q 'node-later' /tmp/kept.sql ||
+    fail "the kept dump at ${kept} does not hold the ledger the recovery replaced"
+
+# ROOT WROTE IT; THE SERVICE ACCOUNT MUST OWN IT, like everything else root
+# leaves in a directory that account owns.
+foreign=$(find "${IDENTITY_A}" -not -user billet -print)
+test -z "${foreign}" || fail "root left these behind in the identity directory: ${foreign}"
+
+runuser -u billet -- env "${DSN_ENV}=${BILLET_STATE_DSN}" \
+    billet status --config "${CONFIG_A}" >/tmp/recovered-status.log 2>&1 ||
+    fail "the service account could not read the recovered deployment"
+grep -q 'not taking new work' /tmp/recovered-status.log || {
+    cat /tmp/recovered-status.log >&2
+    fail "the recovered deployment is not sealed"
+}
+grep -q 'survives a restart' /tmp/recovered-status.log || {
+    cat /tmp/recovered-status.log >&2
+    fail "the recovered deployment's seal is not an operator's"
+}
 
 echo
 echo "postgres restore rehearsal: PASSED"

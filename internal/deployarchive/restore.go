@@ -139,13 +139,23 @@ type journal struct {
 	// RECORDED BEFORE THE FIRST RENAME, so a crash leaves a claim about files
 	// that did not move rather than moved files nothing describes.
 	SupersededDigests map[string]string `json:"superseded_digests,omitempty"`
-	ArchiveDir        string            `json:"archive_dir"`
-	ManifestSHA       string            `json:"manifest_sha256"`
-	DeploymentID      string            `json:"deployment_id"`
-	StartedAt         string            `json:"started_at"`
-	Actor             string            `json:"actor"`
-	Created           []string          `json:"created"`
-	RemovedFiles      []string          `json:"removed_files,omitempty"`
+	// LedgerRestored says this run's pg_restore of the archive's dump committed.
+	//
+	// THE ONE FACT ABOUT A DATABASE THE JOURNAL CAN HOLD, and the one a resume
+	// needs: the restore is a single transaction, so before this the database is
+	// as the run found it and after it the database is the archive's. A ledger
+	// never bound to a deployment cannot say which by itself, and a re-plan
+	// reading it as somebody else's populated schema would refuse its own work.
+	// Only a schema-4 archive's run writes it, which no build that reads schema 3
+	// alone can open, so its absence on an older journal means what it always did.
+	LedgerRestored bool     `json:"ledger_restored,omitempty"`
+	ArchiveDir     string   `json:"archive_dir"`
+	ManifestSHA    string   `json:"manifest_sha256"`
+	DeploymentID   string   `json:"deployment_id"`
+	StartedAt      string   `json:"started_at"`
+	Actor          string   `json:"actor"`
+	Created        []string `json:"created"`
+	RemovedFiles   []string `json:"removed_files,omitempty"`
 }
 
 // RestoreRequest is what Execute acts on.
@@ -348,6 +358,16 @@ func executeLocked(ctx context.Context, req RestoreRequest) (Result, error) {
 		return undoFence(err)
 	}
 
+	// AND THE DATABASE'S, for a PostgreSQL ledger: the fence above reaches this
+	// host's handles only, and a transaction another host began before it — a
+	// standby that promoted, an operator command run elsewhere — is what this
+	// waits out before anything is read to plan with.
+	if req.Plan.Archive.Manifest.Ledger.IsDump() && req.Plan.Target.Postgres != nil {
+		if err := req.Plan.Target.Postgres.Barrier(ctx); err != nil {
+			return undoFence(err)
+		}
+	}
+
 	// THE PLAN IS RE-DERIVED HERE, INSIDE THE EXCLUSION, AND THAT IS THE ONLY
 	// PLAN ACTED ON.
 	//
@@ -409,7 +429,7 @@ func executeLocked(ctx context.Context, req RestoreRequest) (Result, error) {
 
 	res := Result{Resumed: resumed}
 
-	if err := publish(&res, req, j); err != nil {
+	if err := publish(ctx, &res, req, j); err != nil {
 		// THE FENCE STAYS UP. A half-restored directory must not become
 		// startable: a control plane opening it would find whichever pieces did
 		// land, and the pieces that did not are the ones that make it this
@@ -492,8 +512,27 @@ func Finish(ctx context.Context, plan Plan) error {
 // the first shape, and it MIGRATED the ledger before anything had established
 // the operation was this caller's, and left a window between the answer and the
 // lock in which admission could change. This reads the row where it is acted on.
-func requireSealed(ctx context.Context, stateDir string) error {
-	a, err := state.PeekAdmission(ctx, stateDir)
+func requireSealed(ctx context.Context, plan Plan) error {
+	stateDir := plan.Target.StateDir
+
+	var (
+		a   state.Admission
+		err error
+	)
+
+	// A POSTGRESQL LEDGER IS ASKED THROUGH ITS DATABASE, by the same rule: no
+	// lock, no migration, no fence, the row read where it is acted on.
+	if plan.Archive != nil && plan.Archive.Manifest.Ledger.IsDump() {
+		if plan.Target.Postgres == nil {
+			return errors.New("deployarchive: a PostgreSQL recovery's fence cannot be lifted without " +
+				"the database to read its admission from")
+		}
+
+		a, err = plan.Target.Postgres.Admission(ctx)
+	} else {
+		a, err = state.PeekAdmission(ctx, stateDir)
+	}
+
 	if err != nil {
 		return fmt.Errorf("deployarchive: read %s's admission before lifting its fence: %w",
 			stateDir, err)
@@ -627,7 +666,7 @@ func finishLocked(ctx context.Context, plan Plan) error {
 	// merely documented "seal first" would open exactly the window the fence
 	// exists to close, and no test of the caller can show that it did not.
 	if plan.Intent == ReplaceLedger {
-		if err := requireSealed(ctx, stateDir); err != nil {
+		if err := requireSealed(ctx, plan); err != nil {
 			return err
 		}
 	}
@@ -811,7 +850,7 @@ var onPublish func(a Action) error
 var onPublished func() error
 
 // publish installs each item in an order the executor owns.
-func publish(res *Result, req RestoreRequest, j *journal) error {
+func publish(ctx context.Context, res *Result, req RestoreRequest, j *journal) error {
 	actions := slices.Clone(req.Plan.Actions)
 
 	// THE ORDER IS THE CRASH ARGUMENT AND IT IS ENFORCED HERE, not inherited
@@ -839,7 +878,7 @@ func publish(res *Result, req RestoreRequest, j *journal) error {
 	})
 
 	for _, a := range actions {
-		if a.Disposition == AlreadyPresent {
+		if a.Disposition == AlreadyPresent || a.Disposition == KeepLiveLedger {
 			res.Skipped = append(res.Skipped, a)
 
 			continue
@@ -854,6 +893,19 @@ func publish(res *Result, req RestoreRequest, j *journal) error {
 			if err := onPublish(a); err != nil {
 				return err
 			}
+		}
+
+		// A DUMP IS NOT A FILE THAT LANDS: it is restored into a database, so it
+		// has no path to record or remove, and what the journal records instead
+		// is that the restore committed.
+		if a.Entry == EntryLedgerDump {
+			if err := publishDump(ctx, res, req, j, a); err != nil {
+				return err
+			}
+
+			res.Installed = append(res.Installed, a)
+
+			continue
 		}
 
 		if a.Disposition == ReplaceEmptyLedger {
@@ -900,7 +952,7 @@ func publicationRank(a Action) int {
 	switch a.Entry {
 	case EntryIdentity:
 		return 0
-	case EntryLedger:
+	case EntryLedger, EntryLedgerDump:
 		return 1
 	case AuthorityEntry("ca.key"):
 		return 2
@@ -1376,6 +1428,10 @@ type AbandonResult struct {
 	// the operator's own capacity record, so an abandon that did not return it
 	// would leave the deployment with none.
 	Restored []string
+	// LedgerLeftInDatabase says a restore's pg_restore had committed, and the
+	// abandon left those rows in the database: removing them is dropping a
+	// schema, which is the operator's decision rather than an undo.
+	LedgerLeftInDatabase string
 }
 
 // Abandon undoes an interrupted restore, and only what that restore created.
@@ -1578,6 +1634,20 @@ func abandonLocked(ctx context.Context, a *Archive, t Target,
 			// nothing to remove and nothing to keep, and reporting it as removed
 			// would name a file that never existed.
 		}
+	}
+
+	// A POSTGRESQL LEDGER IS PUT BACK FROM THE DUMP THIS RECOVERY KEPT, and a
+	// restore's leaves the database as it is: see putSupersededDumpBack.
+	if a.Manifest.Ledger.IsDump() {
+		if err := putSupersededDumpBack(ctx, a, t, intent, &j, &res); err != nil {
+			return res, err
+		}
+
+		if err := (&j).remove(t.StateDir); err != nil {
+			return res, err
+		}
+
+		return res, state.ClearMaintenanceFence(t.StateDir, reason)
 	}
 
 	if err := putSupersededBack(a, t, j.SupersededDigests, &res); err != nil {
@@ -2068,11 +2138,12 @@ func InProgress(stateDir string) (Progress, error) {
 	}
 
 	return Progress{
-		Present:     true,
-		ArchiveDir:  strings.TrimSpace(j.ArchiveDir),
-		ManifestSHA: strings.TrimSpace(j.ManifestSHA),
-		Intent:      j.Intent,
-		Phase:       j.phase(),
+		Present:        true,
+		ArchiveDir:     strings.TrimSpace(j.ArchiveDir),
+		ManifestSHA:    strings.TrimSpace(j.ManifestSHA),
+		Intent:         j.Intent,
+		Phase:          j.phase(),
+		LedgerRestored: j.LedgerRestored,
 	}, nil
 }
 
@@ -2099,6 +2170,8 @@ type Progress struct {
 	Intent string
 	// Phase is how far it got. See phasePublishing and its neighbours.
 	Phase string
+	// LedgerRestored says its pg_restore of the archive's dump committed.
+	LedgerRestored bool
 }
 
 // Finished reports whether the operation completed and only its record remains.

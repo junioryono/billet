@@ -25,6 +25,7 @@ func TestEachLedgerOpenerIsTheModeItsNameSays(t *testing.T) {
 		"openStateAdmin":       {"OpenLedger", "LedgerOperator"},
 		"openStateInspect":     {"OpenLedgerWith", "LedgerInspect"},
 		"openStateMaintenance": {"OpenLedger", "LedgerMaintenance"},
+		"openStateRecovery":    {"OpenLedger", "LedgerRecovery"},
 	}
 
 	found := map[string]bool{}

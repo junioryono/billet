@@ -11,7 +11,7 @@ The decision is smaller than it looks. **Both backends run exactly one controlle
 | Ledger | a file in `identity_dir` | a database you operate |
 | Extra to run | nothing | a PostgreSQL server |
 | Recovering the controller | restore the state directory onto local storage | rebuild the machine; the ledger is already elsewhere |
-| Ledger backup | `billet local backup` takes it with the identity, CA and App key in one archive | yours — `pg_dump`; `billet local backup` still takes the identity, CA and App key |
+| Ledger backup | `billet local backup` takes it with the identity, CA and App key in one archive | `billet local backup` takes it as `pg_dump`'s copy, with the identity, CA and App key in one archive |
 | A second controller is stopped by | the exclusive lock on the state directory | that, **and** a claim in the database |
 | A replaced controller is stopped by | the same lock, which it never lost | the claim's epoch, which every write re-reads |
 | Binary | — | +5.24 MB, carried by every node too |
@@ -75,40 +75,30 @@ On AWS, `terraform/modules/billet/modules/state-rds-postgres` provisions the dat
 
 billet does **not** need any extension.
 
-### What billet will not do for you
+### Backing it up, and putting it back
 
-**It does not back up the ledger.** A consistent copy of a PostgreSQL database is `pg_dump` or your provider's snapshot, both of which are yours to run and to restore — and a half-measure that copied rows out through billet's own connection would produce an archive that *looks* like a backup and is not.
-
-**It does back up everything else**, and you should let it. `billet local backup` writes an **identity-only archive** here: the deployment identity, the node-wire CA and its rotation state, and the GitHub App private key, with a manifest recording that the ledger is external and naming the engine and the `dsn_env` variable. It reports what it did:
+**`billet local backup` carries the ledger as `pg_dump`'s own copy**, beside the deployment identity, the node-wire CA and its rotation state, and the GitHub App private key, in one archive. It never copies rows through billet's own connection, because that would produce an archive that *looks* like a backup and is not. billet exports a snapshot, reads the ledger's migrations and binding in it, and has `pg_dump --snapshot` dump exactly that snapshot of the ledger's schema, so the manifest describes the dump exactly and nothing waits on the copy. The connection reaches `pg_dump` through its environment, never its arguments, because it carries a password. It reports what it did:
 
 ```
 backup   /var/backups/billet/2026-09-03T014500Z
          deployment 8f2a…
-         the ledger is postgres and is NOT in this archive; your database's own
-         backup is the other half
+         the ledger is PostgreSQL and is copied by its own pg_dump, in one
+         snapshot, without holding any write
 ```
 
-**This matters more than it sounds.** The App private key is issued exactly once, a node-wire CA no replacement controller has is a fleet whose certificates mean nothing — and the `control-plane-postgres` module has **no ledger volume by design** (a volume pins the instance to one availability zone, which is exactly what makes the SQLite controller un-replaceable) with a root volume that is `delete_on_termination`. On that host the archive is the only copy of the identity there is. Take one before you need it, and send it off-box: with `backup.s3` configured the upload happens automatically.
+**Install the PostgreSQL client on the controller, at the server's major version or newer.** `pg_dump` is the PostgreSQL client's, not billet's, and it refuses to copy a newer server. Without a suitable one the backup is refused before anything is written, naming the package (`postgresql-client-<major>`, from apt.postgresql.org where the distribution's is older), and so is every run of the packaged backup timer. Install it on every PostgreSQL controller, standbys included, before upgrading them to a billet that carries the dump.
 
-### Pairing the two halves on the way back
+**This matters more than it sounds.** The App private key is issued exactly once, a node-wire CA no replacement controller has is a fleet whose certificates mean nothing — and the `control-plane-postgres` module has **no ledger volume by design** (a volume pins the instance to one availability zone, which is exactly what makes the SQLite controller un-replaceable) with a root volume that is `delete_on_termination`. On that host the archive is the only copy of the identity there is. Take one before you need it, and send it off-box: with `backup.s3` configured the upload happens automatically. A provider's managed snapshot of the database is still worth having; it is yours to take and to restore.
 
-A ledger without its deployment identity is a fresh authority that cannot see the compute the old one launched; an identity without the CA cannot issue a node certificate. **Restore both from the same moment**, ledger first:
+**`billet local restore` decides by what the database already holds**, read through the connection this host's config names. It keeps **this deployment's own ledger** when the database still has it, because the host died and the database did not, and those rows are newer than the archive's: it restores the identity half beside them and needs no assertion, because it reads the deployment the rows are bound to. It restores the archive's dump, in one transaction, into a schema with nothing in it or only a preflight's empty tables. It refuses a schema bound to another deployment, rows bound to none unless `--external-ledger-attached` says they are this deployment's, and a config whose ledger is local. The dump goes back into the schema it came from, so point the connection's `search_path` at a schema of that name that already exists:
 
 ```bash
-# 1. your database's own restore, into the endpoint this host's config names
-pg_restore --dbname "$BILLET_STATE_DSN" billet-ledger.dump
-
-# 2. then the identity half
-billet local restore --from /var/backups/billet/2026-09-03T014500Z \
-    --old-controller-fenced --external-ledger-attached
+billet local restore --from /var/backups/billet/2026-09-03T014500Z --old-controller-fenced
 ```
 
-`billet local restore` refuses an identity-only archive twice over, and the two refusals are different in kind:
+**`billet local recover` puts the ledger back over itself here too.** It seals, proves the deployment quiet, keeps a `pg_dump` copy of the ledger it replaces in the identity directory, restores the archive's in one transaction and seals again; `--abandon` restores from the copy it kept. The fence it raises reaches this host only, so `--old-controller-fenced` means every controller, standbys included.
 
-- **It will not install one onto a host whose config names a local ledger** — that is a check, and billet makes it. The control plane would otherwise create an empty `billet.db` of its own beside the restored identity and start against it: every node's certificate valid, every lease gone.
-- **It will not install one at all without `--external-ledger-attached`** — that is a question, because billet cannot answer it. The database is on the other end of a connection string this command has not been given. An identity restored beside an *empty* ledger is a control plane that advertises capacity for a fleet it has no record of, and reaps as orphans the compute the old one launched.
-
-**`billet local recover` is refused outright here**, and the message says so. That command exists to put a deployment back over itself, and the only thing it moves is the ledger — it seals the deployment, waits for it to go quiet, and renames the live `billet.db` aside. None of that exists for a database billet does not hold.
+Archives an older billet wrote for this profile hold the identity half only. `billet local restore` still accepts one onto a host whose config names this ledger, once you have put the ledger back with your database's own restore and said so with `--external-ledger-attached`, and `billet local recover` refuses one: there is nothing in it to put the ledger back from.
 
 **The transactional host upgrade runs here without the ledger steps.** billet copies no PostgreSQL database, so on this backend `billet host-upgrade` fences nothing, snapshots nothing and migrates nothing: it preserves the binary, units and config, drains the node, stops the server, installs the candidate, proves it can open what it inherits (the schema is one it knows and not ahead of it, the deployment binding agrees, the release watermark admits it), and starts the services. The migration happens where [ADR-009](../reference/decisions/adr-009-controller-election.md) already put it, when the candidate takes the controller claim. The rollback boundary is therefore the candidate's start: before it, a failed candidate restores the binary, units and config and the ledger was never touched; after it, the new binary has claimed and migrated, and what lies past that is your database's own backup, as it is for every other write. The journal records the three skipped steps as reached so a resume runs the same shape.
 

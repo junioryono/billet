@@ -270,12 +270,42 @@ jobs:
           key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}
           restore-keys: |
             go-race-cover-${{ hashFiles('go.sum') }}-
+      # THE CLIENT OF THE SERVER'S MAJOR, from apt.postgresql.org. A PostgreSQL
+      # ledger travels in the deployment archive as pg_dump's own copy, and
+      # pg_dump refuses a newer server ("aborting because of server version
+      # mismatch", measured 2026-10-20 with 17 against 18); the runner image's
+      # client is older than the service below. Its bin directory goes first on
+      # PATH rather than through Debian's pg_wrapper, which picks a version by
+      # the connection and could answer --version for the image's local cluster.
+      # Every fetch bounded and retried, the restore rehearsal's apt rule.
+      - name: Install the PostgreSQL 18 client
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL --retry 3 --max-time 60 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" |
+            sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq
+          sudo timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq postgresql-client-18
+          version=$(/usr/lib/postgresql/18/bin/pg_dump --version)
+          case "$version" in *'(PostgreSQL) 18.'*) ;; *) echo "installed $version, want 18" >&2; exit 1 ;; esac
+          echo /usr/lib/postgresql/18/bin >>"$GITHUB_PATH"
       - name: Test the ledger backend against PostgreSQL
         run: go test -race -count=1 -timeout 20m -vet=off ./internal/state/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:
           BILLET_TEST_LEDGER: postgres
+      # THE ARCHIVE'S POSTGRESQL DUMP, through the real pg_dump and pg_restore:
+      # the archive package, the client package, and the restore rehearsal on a
+      # PostgreSQL deployment (a dump restored into a database that starts empty,
+      # and the fleet that trusted the old controller served by the new one).
+      - name: Test the PostgreSQL dump, its restore and the restore rehearsal
+        run: |
+          go test -race -count=1 -timeout 20m -vet=off ./internal/deployarchive/ ./internal/pgdump/
+          go test -race -count=1 -timeout 20m -vet=off -run '^TestARestored' ./internal/e2e/
 
   # THE WHOLE COMMAND SUITE, NOT A LIST OF NAMES. Everything in cmd/billet and its
   # command families (internal/ops) that needs a real PostgreSQL -- the backup's
@@ -339,6 +369,23 @@ jobs:
           key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}-${{ matrix.shard }}
           restore-keys: |
             go-race-cover-${{ hashFiles('go.sum') }}-
+      # The backup, restore and recover commands run pg_dump and pg_restore on a
+      # PostgreSQL deployment; see test-postgres for why this client and why its
+      # bin directory rather than pg_wrapper.
+      - name: Install the PostgreSQL 18 client
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL --retry 3 --max-time 60 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" |
+            sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq
+          sudo timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq postgresql-client-18
+          version=$(/usr/lib/postgresql/18/bin/pg_dump --version)
+          case "$version" in *'(PostgreSQL) 18.'*) ;; *) echo "installed $version, want 18" >&2; exit 1 ;; esac
+          echo /usr/lib/postgresql/18/bin >>"$GITHUB_PATH"
       - name: Test the command suite against PostgreSQL
         run: |
           set -o pipefail

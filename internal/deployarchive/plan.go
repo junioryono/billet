@@ -58,6 +58,29 @@ type Target struct {
 	// fleet it has no record of, and reaps as orphans the compute the old one
 	// launched.
 	ExternalLedgerAttached bool
+
+	// Postgres reaches the database this host's config names, for an archive
+	// carrying a PostgreSQL ledger's dump. Nil on a host whose ledger is SQLite.
+	//
+	// INJECTED, as InstallAppKey is: the SQL half is internal/state's and the
+	// client programs are internal/pgdump's, and this package runs neither.
+	Postgres PostgresLedger
+}
+
+// PostgresLedger is the database a dump is restored into, or a recovery
+// replaces the ledger in.
+type PostgresLedger interface {
+	// Peek reports what the database holds, read-only.
+	Peek(ctx context.Context) (state.PostgresLedger, error)
+	// Barrier proves no billet write transaction is in flight on it.
+	Barrier(ctx context.Context) error
+	// Dump writes a dump of it to dest, which must not exist, crossing this
+	// host's fence: only a recovery that raised that fence calls it.
+	Dump(ctx context.Context, dest string) (LedgerDump, error)
+	// Restore puts a dump into it in one transaction.
+	Restore(ctx context.Context, dump string, dumpVersion int) error
+	// Admission reads its admission row behind any fence.
+	Admission(ctx context.Context) (state.Admission, error)
 }
 
 // TargetPath is where one further target's App key lands, and which App the
@@ -103,6 +126,15 @@ const (
 	// jobs this operation fails, and an operator who has just accepted losing
 	// them needs to be able to say which they were.
 	SupersedeLedger
+	// KeepLiveLedger leaves a database that already holds this deployment's
+	// ledger exactly as it is, and does not use the archive's dump.
+	//
+	// THE REPLACEMENT-CONTROLLER CASE: the host died and the database did not, so
+	// the database's rows are NEWER than the archive's, and putting the archive's
+	// back would forget every lease taken since — node recovery then destroys
+	// that compute as orphans. Replacing them is `billet local recover`, which
+	// seals, quiesces and keeps a dump of what it replaced.
+	KeepLiveLedger
 )
 
 func (d Disposition) String() string {
@@ -115,6 +147,8 @@ func (d Disposition) String() string {
 		return "replace the empty preflight ledger"
 	case SupersedeLedger:
 		return "supersede this deployment's ledger"
+	case KeepLiveLedger:
+		return "keep the database's own ledger"
 	default:
 		return "unknown"
 	}
@@ -219,7 +253,7 @@ type Plan struct {
 // Nothing reports whether every item is already in place.
 func (p *Plan) Nothing() bool {
 	for _, a := range p.Actions {
-		if a.Disposition != AlreadyPresent {
+		if a.Disposition != AlreadyPresent && a.Disposition != KeepLiveLedger {
 			return false
 		}
 	}
@@ -510,6 +544,10 @@ func (p *Plan) planLedger(ctx context.Context) error {
 		return nil
 	}
 
+	if p.Archive.Manifest.Ledger.IsDump() {
+		return p.planDumpLedger(ctx)
+	}
+
 	path := LedgerPath(p.Target.StateDir)
 
 	// A RECOVER IS REFUSED BEFORE THE FILE IS EVEN LOOKED AT, and that ordering
@@ -524,14 +562,7 @@ func (p *Plan) planLedger(ctx context.Context) error {
 	// names exactly the deployment this archive is of — so asking it is asking
 	// whether this host IS the deployment being put back.
 	if p.Intent == ReplaceLedger && p.dispositionOf(EntryIdentity) != AlreadyPresent {
-		p.refuse(lifeops.Refusal{
-			What: fmt.Sprintf("%s is not already deployment %s, and `billet local recover` puts "+
-				"a deployment back over ITSELF", p.Target.StateDir,
-				p.Archive.Manifest.DeploymentID),
-			Remedy: "use `billet local restore`, which is the operation for a host that is not " +
-				"already this deployment — it refuses a commissioned one, which is the other " +
-				"half of the same rule",
-		})
+		p.refuseRecoverOntoAnotherHost()
 
 		return nil
 	}
@@ -792,6 +823,28 @@ func (p *Plan) checkLedgerBackendAgrees() {
 				p.archiveLedgerBackend(), p.Target.ConfigPath, p.targetLedgerBackend()),
 			Remedy: "point this host's config at the ledger this identity belongs to — " +
 				"`state: {backend: " + p.archiveLedgerBackend() + ", ...}` beside " +
+				"`server.identity_dir` — and run this again",
+		})
+
+		return
+	}
+
+	// A DUMP IS A POSTGRESQL LEDGER AND GOES ONLY INTO ONE. Onto a SQLite host it
+	// would be restored nowhere, and the control plane there would create an
+	// empty billet.db beside the restored identity and start against it.
+	if p.Archive.Manifest.Ledger.IsDump() {
+		if target == p.Archive.Manifest.Ledger.Backend {
+			return
+		}
+
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf(
+				"this backup carries a %s ledger's dump and %s says this host's ledger is %s. "+
+					"Restoring the identity here would leave the control plane to create an "+
+					"empty ledger of its own and start against it",
+				p.Archive.Manifest.Ledger.Backend, p.Target.ConfigPath, p.targetLedgerBackend()),
+			Remedy: "point this host's config at the database this ledger is restored into — " +
+				"`state: {backend: " + p.Archive.Manifest.Ledger.Backend + ", ...}` beside " +
 				"`server.identity_dir` — and run this again",
 		})
 

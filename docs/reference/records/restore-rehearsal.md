@@ -37,6 +37,13 @@ The Linux leg goes one step further than a restore. It proves that `billet local
 
 That last assertion is not decoration. The seal a recovery takes before replacing the ledger lives *in* the ledger being replaced, and the archive's admission row is whatever it was when the backup was taken — open. A recovery that stopped there would hand back a control plane that takes new work immediately, while its nodes still hold compute the restored ledger has never heard of. The rehearsal is what found that.
 
+## A deployment whose ledger is in PostgreSQL
+
+Until #19 this profile archived half a deployment, the identity without the ledger, and both legs proved only that half. Now the ledger travels as `pg_dump`'s copy, and both legs carry it:
+
+- **In-process:** `TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne` runs on PostgreSQL in CI's `test-postgres` job, with the PostgreSQL 18 client beside a PostgreSQL 18 server. The source and the target are two databases, each with a schema of the same name, and the target starts empty, so the restored control plane serves from rows `pg_restore` put there: the node's original certificate, the lease's capacity charge and the admission trail all come back.
+- **Packaged:** `make postgres-restore-rehearsal` runs the real `pg_dump` as the service account and the real `pg_restore` as root on Ubuntu's PostgreSQL 16. It asserts the manifest's shape and that `pg_restore` can list the archived dump. It restores onto the database that survived, which keeps that database's ledger. It restores into a second, empty database, where `psql` (not billet) finds node-a's admission and every migration, and where the service account then admits node-c. Finally it runs `billet local recover`: an admission taken after the backup is gone, a `pg_dump` copy of the replaced ledger is kept in the identity directory holding that admission (asked of `pg_restore`), root left nothing it owns, and the deployment is sealed by an operator.
+
 ## Every target's key, or none
 
 A deployment serving several GitHub targets holds one App key per target, and a single-target rehearsal passes with a second key silently dropped. The packaged leg therefore adds a repository-scoped second target with a throwaway key of its own to the template it restores, and asserts that both keys are archived at mode 600, both come back byte-identical at the paths the restored config names, and both are owned by the service account afterwards, because a root-run restore that repaired the first key and forgot the second would start a control plane that serves one target and refuses the other.
