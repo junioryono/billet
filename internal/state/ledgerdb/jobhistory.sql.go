@@ -1066,7 +1066,9 @@ func (q *Queries) RecordJobPhase(ctx context.Context, arg RecordJobPhaseParams) 
 }
 
 const recordJobRegistration = `-- name: RecordJobRegistration :exec
-UPDATE job_history SET registered_at = $1, runner_id = $2
+UPDATE job_history
+   SET registered_at = $1,
+       runner_id = CASE WHEN runner_id = 0 THEN CAST($2 AS BIGINT) ELSE runner_id END
  WHERE lease_id = $3 AND registered_at = ''
 `
 
@@ -1078,6 +1080,9 @@ type RecordJobRegistrationParams struct {
 
 // Record when the plane journaled the runner it minted for a lease, and
 // GitHub's id for it, once.
+//
+// THE RUNNER'S ID IS KEPT IF ALREADY LEARNED: a start or a recovery may have
+// written it first, and it is written once.
 func (q *Queries) RecordJobRegistration(ctx context.Context, arg RecordJobRegistrationParams) error {
 	_, err := q.db.ExecContext(ctx, recordJobRegistration, arg.RegisteredAt, arg.RunnerID, arg.LeaseID)
 	return err

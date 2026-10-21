@@ -75,12 +75,10 @@ func (a *Allocator) RegisterPoolRunner(ctx context.Context, runner PoolRunner) e
 					ErrConflict, runner.LeaseID, prior.RunnerName, prior.Tier, prior.LaunchRequestID)
 			}
 
-			_, err := fillTarget(ctx, q, prior, runner.GitHubTarget)
-
-			return err
-		}
-
-		if err := insertPoolRunner(ctx, q, runner, PoolRunnerIdle); err != nil {
+			if _, err := fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+				return err
+			}
+		} else if err := insertPoolRunner(ctx, q, runner, PoolRunnerIdle); err != nil {
 			return fmt.Errorf("alloc: register pool runner %q: %w", runner.RunnerName, err)
 		}
 
@@ -310,6 +308,9 @@ func (a *Allocator) RetireRecoveredPoolRunner(
 			return err
 		}
 		if !found {
+			if err := recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID); err != nil {
+				return err
+			}
 			err = insertPoolRunner(ctx, q, runner, PoolRunnerRetiring)
 			runner.Status = PoolRunnerRetiring
 			out = runner
@@ -323,6 +324,9 @@ func (a *Allocator) RetireRecoveredPoolRunner(
 				ErrConflict, runner.RunnerName, runner.LeaseID)
 		}
 		if prior, err = fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+			return err
+		}
+		if err := recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID); err != nil {
 			return err
 		}
 		out = prior

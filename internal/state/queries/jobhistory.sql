@@ -308,7 +308,12 @@ UPDATE job_history
 -- name: RecordJobRegistration :exec
 -- Record when the plane journaled the runner it minted for a lease, and
 -- GitHub's id for it, once.
-UPDATE job_history SET registered_at = @registered_at, runner_id = @runner_id
+--
+-- THE RUNNER'S ID IS KEPT IF ALREADY LEARNED: a start or a recovery may have
+-- written it first, and it is written once.
+UPDATE job_history
+   SET registered_at = @registered_at,
+       runner_id = CASE WHEN runner_id = 0 THEN CAST(@runner_id AS BIGINT) ELSE runner_id END
  WHERE lease_id = @lease_id AND registered_at = '';
 
 -- name: RecordJobRunnerID :exec

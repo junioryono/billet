@@ -2347,6 +2347,14 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
+	// RECORDS THAT DISAGREE ARE REFUSED BEFORE ANY ANSWER, the ledger's own
+	// included: a member retired on one owner says nothing about a runner the
+	// lease records on another, and a retired answer lets the node discard the
+	// compute.
+	if _, err := recordedOwner(lease.Tier, leaseTarget, binding.GitHubTarget); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
 	// THE CREDENTIAL IS RESOLVED ONLY WHERE GITHUB IS ASKED. A member already
 	// retired, or busy with the job GitHub bound it to, is answered from the
 	// ledger alone, so an owner this control plane can no longer serve holds
@@ -2746,6 +2754,27 @@ func (h *handler) jitForLabel(label string) (JITSource, error) {
 	return h.jitFor(tier)
 }
 
+// recordedOwner is the one owner the ledger's records of a runner name, empty
+// when none names one, and an error when two disagree: the ledger then cannot
+// say where the runner is registered, and nothing about it may be answered.
+// GitHub's owner names are case-insensitive, so two spellings of one owner are
+// one owner.
+func recordedOwner(label string, recorded ...string) (string, error) {
+	path := ""
+	for _, r := range recorded {
+		switch {
+		case r == "" || strings.EqualFold(r, path):
+		case path == "":
+			path = r
+		default:
+			return "", fmt.Errorf("nodeplane: the runner of tier %q is recorded on GitHub targets %q and %q, "+
+				"so this control plane cannot tell which credential removes it", label, path, r)
+		}
+	}
+
+	return path, nil
+}
+
 // jitForRunner is the source that holds the credential of the owner a lease's
 // runner was registered on, given what the ledger recorded of it.
 //
@@ -2759,18 +2788,9 @@ func (h *handler) jitForLabel(label string) (JITSource, error) {
 // tier's, serves it. Records that disagree are refused. A runner minted before
 // the owner was recorded resolves through the catalogue, as it always did.
 func (h *handler) jitForRunner(label string, recorded ...string) (JITSource, error) {
-	// GITHUB'S OWNER NAMES ARE CASE-INSENSITIVE, so two spellings of one owner,
-	// in a record or in the config, are one owner.
-	path := ""
-	for _, r := range recorded {
-		switch {
-		case r == "" || strings.EqualFold(r, path):
-		case path == "":
-			path = r
-		default:
-			return nil, fmt.Errorf("nodeplane: the runner of tier %q is recorded on GitHub targets %q and %q, "+
-				"so this control plane cannot tell which credential removes it", label, path, r)
-		}
+	path, err := recordedOwner(label, recorded...)
+	if err != nil {
+		return nil, err
 	}
 
 	if path == "" {

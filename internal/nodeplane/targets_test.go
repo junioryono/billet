@@ -1031,3 +1031,42 @@ func TestASingleCredentialServesTheOwnerItNames(t *testing.T) {
 		})
 	}
 }
+
+// RECORDS THAT DISAGREE ARE REFUSED BEFORE ANY ANSWER, the ledger's own
+// included: a member retired, or tracked busy, on one owner says nothing about
+// a runner the lease records on another, and a retired answer would let the
+// node discard the compute.
+func TestARecoveryRefusesRecordsThatDisagreeBeforeAnyAnswer(t *testing.T) {
+	t.Parallel()
+
+	for name, member := range map[string]alloc.PoolRunner{
+		"a retired member": {Status: alloc.PoolRunnerRetired},
+		"a member tracked busy": {Status: alloc.PoolRunnerBusy, ActualRequestID: 8, RunID: 9,
+			JobID: "job-9"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			member.LeaseID, member.Tier, member.LaunchRequestID = "l1", "tier-a", 7
+			member.RunnerID, member.RunnerName, member.GitHubTarget = 91, "billet-l1", ownerB
+			store := &fakeStore{
+				lease: &alloc.Lease{ID: "l1", Tier: "tier-a", Node: "n1", Epoch: 1, RequestID: 7,
+					Phase: alloc.PhaseQuarantine},
+				leaseTargets: map[string]string{"l1": ownerA},
+				pool:         map[string]alloc.PoolRunner{"billet-l1": member},
+			}
+			jitA, jitB := &targetJIT{path: ownerA}, &targetJIT{path: ownerB}
+
+			log := slog.New(slog.DiscardHandler)
+			p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog(twoTargetCatalogue()))
+			srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil,
+				nodeplane.WithTargetJIT(map[string]nodeplane.JITSource{"default": jitA, "personal": jitB})))
+			t.Cleanup(srv.Close)
+
+			got, err := dial(t, srv.URL).RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1")
+			if err == nil || !strings.Contains(err.Error(), "cannot tell which credential") {
+				t.Fatalf("recovery with records on two owners = %q, err %v; want a refusal", got, err)
+			}
+		})
+	}
+}

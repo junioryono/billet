@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
@@ -112,9 +111,18 @@ func (r JobRecord) Phases() []JobPhase {
 		}
 	}
 
-	// billet's stamps are fixed-width (see timestampFormat), so their string
-	// order is their time order.
-	slices.SortStableFunc(out, func(a, b JobPhase) int { return strings.Compare(a.At, b.At) })
+	// ORDERED BY THE INSTANT, NOT THE STRING: a stamp an older binary wrote in
+	// another precision sorts wrongly as text ("…:00Z" after "…:00.5Z"). A
+	// stamp that does not parse keeps its place in the lifecycle order.
+	slices.SortStableFunc(out, func(a, b JobPhase) int {
+		at, errA := time.Parse(time.RFC3339Nano, a.At)
+		bt, errB := time.Parse(time.RFC3339Nano, b.At)
+		if errA != nil || errB != nil {
+			return 0
+		}
+
+		return at.Compare(bt)
+	})
 
 	return out
 }

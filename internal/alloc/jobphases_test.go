@@ -193,6 +193,61 @@ func TestAnAdoptedRunnerKeepsItsIDAndNoRegistrationTime(t *testing.T) {
 	}
 }
 
+// A RUNNER'S HISTORY KEEPS WHAT EVERY JOURNALING LEARNS OF IT: a mint after a
+// member was journaled without one records the registration and its id, and a
+// recovery that found and retired a runner keeps the id it found.
+func TestEveryJournalingOfARunnerKeepsWhatItLearned(t *testing.T) {
+	t.Run("a mint after an adopted member", func(t *testing.T) {
+		a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+			[]config.Tier{tier("linux", 2, 4*config.GiB)})
+		lease := reserve(t, a, "linux")
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 500, 11); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+
+		member := PoolRunner{LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11, RunnerName: "billet-" + lease.ID}
+		if err := a.RegisterPoolRunner(t.Context(), member); err != nil {
+			t.Fatalf("RegisterPoolRunner (adopted): %v", err)
+		}
+		member.RunnerID, member.Minted = 91, true
+		if err := a.RegisterPoolRunner(t.Context(), member); err != nil {
+			t.Fatalf("RegisterPoolRunner (minted): %v", err)
+		}
+
+		rec, err := a.Job(t.Context(), lease.ID)
+		if err != nil {
+			t.Fatalf("Job: %v", err)
+		}
+		if rec.RegisteredAt == "" || rec.RunnerID != 91 {
+			t.Errorf("after the mint the history has registered %q and runner %d; want a time and 91",
+				rec.RegisteredAt, rec.RunnerID)
+		}
+	})
+
+	t.Run("an idle recovery that found the runner", func(t *testing.T) {
+		a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+			[]config.Tier{tier("linux", 2, 4*config.GiB)})
+		lease := reserve(t, a, "linux")
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 500, 11); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+
+		if _, err := a.RetireRecoveredPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+			LaunchRequestID: 11, RunnerID: 92, RunnerName: "billet-" + lease.ID}); err != nil {
+			t.Fatalf("RetireRecoveredPoolRunner: %v", err)
+		}
+
+		rec, err := a.Job(t.Context(), lease.ID)
+		if err != nil {
+			t.Fatalf("Job: %v", err)
+		}
+		if rec.RunnerID != 92 || rec.RegisteredAt != "" {
+			t.Errorf("after the recovery the history has runner %d registered %q; want 92 and no time",
+				rec.RunnerID, rec.RegisteredAt)
+		}
+	})
+}
+
 // THE PHASES ARE IN THE ORDER THEY HAPPENED: GitHub's start arrives
 // independently of the lease's phase, so custody taken of a launch whose answer
 // was lost can come before the start, and the timeline shows it first rather
@@ -210,6 +265,13 @@ func TestThePhasesAreInTheOrderTheyHappened(t *testing.T) {
 	}
 	if want := []string{"assigned", "launched", "custody", "started", "finished"}; !slices.Equal(names, want) {
 		t.Errorf("the phases are %v, want %v", names, want)
+	}
+
+	// A STAMP IN ANOTHER PRECISION, as an older binary may have written one, is
+	// placed by its instant: as text, "…:00Z" sorts after "…:00.5Z".
+	mixed := JobRecord{BoughtAt: "2026-10-20T12:00:00Z", AssignedAt: "2026-10-20T12:00:00.500000000Z"}
+	if phases := mixed.Phases(); len(phases) != 2 || phases[0].Name != "bought" {
+		t.Errorf("phases of mixed precision are %v, want bought before assigned", phases)
 	}
 
 	if got := (JobRecord{RunID: 600, GitHubRunID: 700}).StartedRun(); got != 700 {

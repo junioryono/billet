@@ -123,6 +123,33 @@ func TestTheJobsJSONRecordCarriesItsWholeLife(t *testing.T) {
 	if got != want {
 		t.Errorf("the record reads back as\n  %+v\nwant\n  %+v", got, want)
 	}
+
+	// AND UNDER THE KEYS A PROGRAM READS, decoded apart from the type that
+	// wrote them, so a renamed tag cannot pass by renaming both directions.
+	var keys map[string]any
+	if err := json.Unmarshal(out.Bytes(), &keys); err != nil {
+		t.Fatalf("decode the record's keys: %v", err)
+	}
+	for key, value := range map[string]any{
+		"github_run_id": 700.0, "launched_at": "t-launched", "registered_at": "t-registered",
+		"custody_at": "t-custody", "teardown_at": "t-teardown", "quarantined_at": "t-quarantined",
+		"runner_id": 91.0, "launch_incarnation": "process-launch", "holder_incarnation": "process-held",
+		"failure_reason": "the reason", "disruption": "reclaimed", "disrupted_at": "t-disrupted",
+	} {
+		if keys[key] != value {
+			t.Errorf("the record's %q is %v, want %v", key, keys[key], value)
+		}
+	}
+	cache, ok := keys["cache"].(map[string]any)
+	if !ok {
+		t.Fatalf("the record's cache is %T, want an object", keys["cache"])
+	}
+	for key, value := range map[string]string{"image": "warm", "image_generation": "g7", "actions": "served",
+		"sticky": "cold", "git": "unused", "bazel": "disabled", "go": "unavailable"} {
+		if cache[key] != value {
+			t.Errorf("the record's cache %q is %v, want %q", key, cache[key], value)
+		}
+	}
 }
 
 // --run IS REFUSED WHERE IT CANNOT MEAN ONE THING: beside a lease, with --html,
