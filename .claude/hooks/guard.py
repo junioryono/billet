@@ -775,9 +775,10 @@ def shell_invocation(words):
             for letter in w[1:]:
                 if letter == "n":
                     noexec = on
-                elif letter == "c" and on:
+                elif letter == "c":
+                    # +c and +s act as -c and -s (bash 5.2.21, measured 2026-10-21).
                     command = True
-                elif letter == "s" and on:
+                elif letter == "s":
                     stdin = True
                 elif letter in "oO":
                     value = words[i + 1 + values] if i + 1 + values < len(words) else ""
@@ -798,14 +799,32 @@ def shell_invocation(words):
 def judge_gate_script(words, cwd):
     path = words[0]
     if path in (".", "source"):
-        # Sourced, the gate runs in this shell, and a name without a slash is
-        # found in the current directory when PATH does not hold it.
-        args = words[1:]
-        if args[:1] == ["--"]:
-            args = args[1:]
+        # Sourced, the gate runs in this shell. A name without a slash is searched
+        # for in PATH (in -p's directories instead, bash 5.3) and then in the
+        # current directory, so each place it could be found is asked. A PATH the
+        # command line itself sets is not seen.
+        args, search = words[1:], None
+        while args and args[0].startswith("-") and args[0] != "-":
+            if args[0] == "--":
+                args = args[1:]
+                break
+            if args[0] == "-p" and len(args) > 1:
+                search, args = args[1], args[2:]
+            elif args[0].startswith("-p") and len(args[0]) > 2:
+                search, args = args[0][2:], args[1:]
+            else:
+                return  # an option source does not take: it refuses to run
         if not args:
             return
         path = args[0]
+        if "/" not in path:
+            dirs = (os.environ.get("PATH", "") if search is None else search).split(":")
+            for d in dirs + [cwd]:
+                name = full_gate_script(os.path.join(d or ".", path), cwd)
+                if name:
+                    refuse(f"billet hook: `scripts/gates/{name}` is a full gate, which CI runs on every push. "
+                           f"{GATE_ADVICE}")
+            return
     elif os.path.basename(path) in SHELLS:
         # A shell runs a script named without a slash from its own directory.
         mode, path = shell_invocation(words)
