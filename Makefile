@@ -88,9 +88,16 @@ check-unlocked: no-mutants build vet fmt-check lint lint-custom test lambda-test
 # only, and it says what it ran and why. CI runs the full gate on every push, so
 # a session verifies narrowly here and reads CI; `check` stays for a person who
 # wants the whole gate on their own machine. See scripts/verify-changed.sh.
+#
+# AND IT TAKES THE SAME MACHINE-WIDE LOCK AS `check`. A narrow check is still a
+# build, a vet, two packages' tests and a lint pass, and a dozen sessions running
+# theirs at once is the starved machine the lock exists for: on 2026-10-20 the
+# development Mac sat at a load average of 392 with billet's verifies running
+# side by side. The lock is the one every repository's gate shares, so a
+# verify here also takes turns with the other repository's gates and verifies.
 .PHONY: verify
-verify: ## Check only what changed: gofmt, build, vet, tests (no -race) and lint of the changed packages
-	@$(NICE) scripts/verify-changed.sh
+verify: ## Check only what changed: gofmt, build, vet, tests (no -race) and lint of the changed packages, one run at a time per machine
+	@scripts/with-check-lock.sh "$(CHECK_LOCK)" $(NICE) scripts/verify-changed.sh
 
 .PHONY: build
 build: ## Build ./bin/billet
