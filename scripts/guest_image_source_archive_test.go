@@ -386,6 +386,31 @@ func TestTheSourceArchiveStartsFromAnEmptyDirectory(t *testing.T) {
 	}
 }
 
+// THE PUBLISHER COMPARES SOURCE SETS IN BYTE ORDER whatever locale it inherits:
+// its sorts and its comm must collate alike, or comm misses an intersection.
+func TestGuestReleasePublisherComparesInByteOrder(t *testing.T) {
+	t.Parallel()
+
+	comm, err := exec.LookPath("comm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	seen := filepath.Join(t.TempDir(), "locale")
+	writeExecutable(t, filepath.Join(bin, "comm"), "#!/bin/sh\nprintf '%s' \"$LC_ALL\" >\""+seen+"\"\nexec "+comm+" \"$@\"\n")
+
+	manifest := `{"schema": 1, "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST:rootfs.img.zst", "size": 1},
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1, "version": "6.1.155"}}`
+	out, ok, _ := runPublisher(t, publishDir(t, manifest, "rootfs.img.zst", "vmlinux-billet"), "PATH="+bin, "LC_ALL=en_US.UTF-8")
+	if !ok {
+		t.Fatalf("the publication failed:\n%s", out)
+	}
+	got, err := os.ReadFile(seen)
+	if err != nil || string(got) != "C" {
+		t.Fatalf("comm ran with LC_ALL=%q (%v), want C", got, err)
+	}
+}
+
 // THE PPAS THE FETCHER KNOWS ARE THE TEMPLATE'S, and every source the review
 // leaves out is under a license that asks for no source.
 func TestTheSourceArchivesTablesAreTheTemplatesAndTheReviews(t *testing.T) {
@@ -474,7 +499,9 @@ func writeSourceArchive(t *testing.T, dir, index string, parts int) {
 }
 
 // runPublisher runs publish-guest-release.sh against DIR with git and gh stubbed,
-// and returns its output, whether it succeeded, and the calls it made.
+// and returns its output, whether it succeeded, and the calls it made. The calls
+// end with release create's arguments, one per line, each prefixed "arg ", so a
+// path split into two arguments shows as two lines.
 func runPublisher(t *testing.T, dir string, env ...string) (string, bool, string) {
 	t.Helper()
 
@@ -486,6 +513,7 @@ func runPublisher(t *testing.T, dir string, env ...string) (string, bool, string
 	calls := filepath.Join(tools, "calls.log")
 	writeExecutable(t, filepath.Join(tools, "git"), "#!/bin/sh\nprintf 'git %s\\n' \"$*\" >> \"$BILLET_TEST_CALLS\"\nexit 0\n")
 	writeExecutable(t, filepath.Join(tools, "gh"), "#!/bin/sh\nprintf 'gh %s\\n' \"$*\" >> \"$BILLET_TEST_CALLS\"\n"+
+		"if [ \"$1 $2\" = \"release create\" ]; then for a; do printf 'arg %s\\n' \"$a\" >> \"$BILLET_TEST_CALLS\"; done; fi\n"+
 		"if [ \"$1 $2\" = \"release view\" ]; then printf 'true\\n'; exit 0; fi\nexit 0\n")
 	cmd := exec.CommandContext(t.Context(), publisher, dir)
 	cmd.Env = append(os.Environ(), "PATH="+tools+":"+os.Getenv("PATH"), "BILLET_TEST_CALLS="+calls,
@@ -558,7 +586,7 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 		uploads []string
 		absent  []string
 	}{
-		{name: "one archive", dir: fresh, ok: true, uploads: []string{"/image-sources.tar ", "/image-sources.parts", "/image-sources-index.tsv"}},
+		{name: "one archive", dir: fresh, ok: true, uploads: []string{"/image-sources.tar", "/image-sources.parts", "/image-sources-index.tsv"}},
 		{
 			name: "an archive in parts", ok: true,
 			dir: func(t *testing.T) string {
@@ -567,7 +595,7 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 				return split(t, 3)
 			},
 			uploads: []string{"/image-sources.tar.part000", "/image-sources.tar.part001", "/image-sources.tar.part002"},
-			absent:  []string{"/image-sources.tar "},
+			absent:  []string{"/image-sources.tar"},
 		},
 		{
 			name: "a list with no final newline", ok: true,
@@ -713,6 +741,32 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 			},
 		},
 		{
+			// AN awk THAT FAILS INTO A SORT IS AN EMPTY SET under dash, and an
+			// empty set of reviewed sources hides the GNU one marked reviewed.
+			name: "an extraction that fails beside a GNU-licensed source marked reviewed",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				dir := fresh(t)
+				writeSourceArchive(t, dir, indexLines[0]+"\nbash\t5.2.21-2ubuntu4\treviewed\t-\t-\t-\n"+indexLines[2]+"\n", 0)
+
+				return dir
+			},
+			env: func(t *testing.T) []string {
+				t.Helper()
+
+				awk, err := exec.LookPath("awk")
+				if err != nil {
+					t.Fatal(err)
+				}
+				bin := t.TempDir()
+				writeExecutable(t, filepath.Join(bin, "awk"), "#!/bin/sh\n"+
+					"case \"$*\" in *'$3 == \"reviewed\" {'*) exit 2 ;; esac\nexec "+awk+" \"$@\"\n")
+
+				return []string{"PATH=" + bin}
+			},
+		},
+		{
 			// A comm THAT FAILS SAYS NOTHING, and nothing is not "no GNU source
 			// marked reviewed".
 			name: "a comparison that fails",
@@ -772,20 +826,29 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 
 				return
 			}
-			create := ""
+			var args []string
 			for _, line := range strings.Split(calls, "\n") {
-				if strings.Contains(line, "release create") {
-					create = line + " "
+				if arg, ok := strings.CutPrefix(line, "arg "); ok {
+					args = append(args, arg)
 				}
 			}
+			uploaded := func(suffix string) bool {
+				for _, arg := range args {
+					if strings.HasSuffix(arg, suffix) {
+						return true
+					}
+				}
+
+				return false
+			}
 			for _, want := range tc.uploads {
-				if !strings.Contains(create, want) {
-					t.Errorf("the release was created without %s:\n%s", want, create)
+				if !uploaded(want) {
+					t.Errorf("the release was created without an argument ending %s:\n%s", want, strings.Join(args, "\n"))
 				}
 			}
 			for _, never := range tc.absent {
-				if strings.Contains(create, never) {
-					t.Errorf("the release was created with %s:\n%s", never, create)
+				if uploaded(never) {
+					t.Errorf("the release was created with an argument ending %s:\n%s", never, strings.Join(args, "\n"))
 				}
 			}
 		})

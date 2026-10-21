@@ -173,14 +173,24 @@ if ! (cd "$out" && cat $archive) | tar -xOf - ./index.tsv >"$scratch/index" ||
     exit 2
 fi
 
-awk -F '\t' 'NR > 1 && ($7 == "gnu" || $7 == "unclassified") { print $4 "\t" $5 }' "$out/image-sources.tsv" |
-    LC_ALL=C sort -u >"$scratch/needed"
-awk -F '\t' 'NR > 1 && $7 == "gnu" { print $4 "\t" $5 }' "$out/image-sources.tsv" | LC_ALL=C sort -u >"$scratch/gnu"
-awk -F '\t' 'NR > 1 && $1 != "guest-kernel" && ($3 == "fetched" || $3 == "reviewed") { print $1 "\t" $2 }' \
-    "$out/image-sources-index.tsv" | LC_ALL=C sort -u >"$scratch/indexed"
-awk -F '\t' 'NR > 1 && $3 == "reviewed" { print $1 "\t" $2 }' "$out/image-sources-index.tsv" | LC_ALL=C sort -u >"$scratch/reviewed"
+# EACH SET IS EXTRACTED TO A FILE WHOSE STATUS IS CHECKED, then sorted: dash has
+# no pipefail, so an awk that failed into a sort would read as an empty set, and an
+# empty set of reviewed or GNU-licensed sources is a pass.
+pairs() { # program file out
+    awk -F '\t' "$1" "$2" >"$3.raw" && LC_ALL=C sort -u "$3.raw" >"$3"
+}
+if ! pairs 'NR > 1 && ($7 == "gnu" || $7 == "unclassified") { print $4 "\t" $5 }' "$out/image-sources.tsv" "$scratch/needed" ||
+    ! pairs 'NR > 1 && $7 == "gnu" { print $4 "\t" $5 }' "$out/image-sources.tsv" "$scratch/gnu" ||
+    ! pairs 'NR > 1 && $1 != "guest-kernel" && ($3 == "fetched" || $3 == "reviewed") { print $1 "\t" $2 }' \
+        "$out/image-sources-index.tsv" "$scratch/indexed" ||
+    ! pairs 'NR > 1 && $3 == "reviewed" { print $1 "\t" $2 }' "$out/image-sources-index.tsv" "$scratch/reviewed" ||
+    ! pairs 'NR > 1 && $1 == "guest-kernel" && $3 == "fetched" { print $2 }' "$out/image-sources-index.tsv" "$scratch/kernels"; then
+    printf 'could not read the sources image-sources.tsv needs or image-sources-index.tsv holds, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+
 # THE KERNEL'S SOURCE IS THE KERNEL THE MANIFEST NAMES, once.
-kernels=$(awk -F '\t' 'NR > 1 && $1 == "guest-kernel" && $3 == "fetched" { print $2 }' "$out/image-sources-index.tsv" | LC_ALL=C sort -u)
+kernels=$(cat "$scratch/kernels")
 kernel=$(jq -r '.kernel.version // empty' "$out/manifest.json")
 # A FAILED comm IS NOT AN EMPTY ONE: its status is checked before its output is
 # read, and it collates as the sorts above did.
