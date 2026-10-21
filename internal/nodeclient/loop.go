@@ -1293,7 +1293,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		// Treat that boundary as part of the drain: refuse a launch, but let a
 		// destroy run under a fresh, bounded context so shutdown can still converge.
 		run := func() error {
-			return reportOutcome(ctx, c, compute, log, &custody, cmd,
+			return reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd,
 				executePolled(ctx, launchCtx, &executing, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
 		}
 
@@ -1336,10 +1336,20 @@ func launchContext(ctx context.Context, hurry <-chan struct{}) (context.Context,
 	return launchCtx, cancel
 }
 
+// reportAttempts is how many times a destroy's outcome is sent before the loop
+// gives up on it, and reportRetryWait the wait before the second; each later
+// wait is one more of it.
+const (
+	reportAttempts  = 3
+	reportRetryWait = time.Second
+)
+
 // reportOutcome reports what one command did, taking custody of a launch whose
 // report was lost. It returns an error only when the loop must stop serving.
+// hurry ends a wait between two reports of a destroy: the operator's second
+// signal, which the loop carries as the launches' context.
 func reportOutcome(
-	ctx context.Context, c *Client, compute Compute, log *slog.Logger, custody *sync.Mutex,
+	ctx, hurry context.Context, c *Client, compute Compute, log *slog.Logger, custody *sync.Mutex,
 	cmd nodeapi.Command, res nodeapi.CommandResult,
 ) error {
 	// REPORT AN OUTCOME EVEN IF SHUTDOWN LANDED WHILE THE COMMAND RAN. Using
@@ -1352,6 +1362,32 @@ func reportOutcome(
 	}
 
 	err := c.Report(reportCtx, res)
+
+	// A DESTROY'S OUTCOME IS SENT AGAIN, because it may be the last thing a
+	// stopping node says: no poll follows to be given the command again (#408),
+	// so a report lost to a busy plane left its lease launching until the plane's
+	// ten-minute command timeout (#188). The plane takes a repeat as already
+	// accounted for and a late one as the proof it is, so sending it twice is
+	// safe. Only a failure to be heard is retried: a verdict the plane gave is
+	// the same the next time. A launch is never retried here; a lost launch
+	// report is custody, below.
+retry:
+	for attempt := 1; err != nil && attempt < reportAttempts && retriesReport(cmd, err); attempt++ {
+		log.Warn("could not report a destroy's outcome; sending it again",
+			"command", cmd.ID, "attempt", attempt, "error", err)
+
+		wait := time.NewTimer(time.Duration(attempt) * reportRetryWait)
+		select {
+		case <-wait.C:
+		case <-hurry.Done():
+			wait.Stop()
+
+			break retry
+		}
+
+		err = c.Report(reportCtx, res)
+	}
+
 	if err == nil {
 		return nil
 	}
@@ -1387,13 +1423,30 @@ func reportOutcome(
 		return err
 	}
 
-	// Nothing is retried here: retrying a launch risks a second container
-	// for one job, and the destroy path is idempotent but has no queue yet.
+	// No COMMAND is run again here: retrying a launch risks a second container
+	// for one job. Only a destroy's report was sent again, above.
 	log.Error("could not report a command's outcome; the control plane will treat "+
 		"it as unknown, and a launch as custody",
 		"command", cmd.ID, "kind", cmd.Kind, "error", err)
 
 	return nil
+}
+
+// retriesReport reports whether a command's report that failed with err is sent
+// again: a destroy's, when the plane did not answer with a verdict about this
+// node, which a second request would only hear again.
+func retriesReport(cmd nodeapi.Command, err error) bool {
+	if cmd.Kind != nodeapi.CommandDestroy {
+		return false
+	}
+
+	for _, verdict := range []error{ErrUnregistered, ErrRefused, ErrSuperseded, ErrUnauthenticated} {
+		if errors.Is(err, verdict) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // ExecuteForTest runs one command, for tests that need the command semantics

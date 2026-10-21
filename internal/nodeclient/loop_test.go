@@ -396,6 +396,16 @@ func harnessWithCommandTimeout(
 ) (*nodeplane.Plane, *nodeclient.Client) {
 	t.Helper()
 
+	return harnessBehind(t, commandTimeout, func(h http.Handler) http.Handler { return h })
+}
+
+// harnessBehind is harnessWithCommandTimeout with the plane's handler served
+// through wrap, for a test that has to make the wire itself fail.
+func harnessBehind(
+	t *testing.T, commandTimeout time.Duration, wrap func(http.Handler) http.Handler,
+) (*nodeplane.Plane, *nodeclient.Client) {
+	t.Helper()
+
 	log := slog.New(slog.DiscardHandler)
 	// WITH A CATALOGUE: a launch carries its tier's shape to the node, so a plane
 	// that cannot describe the tier refuses the launch before dispatching it.
@@ -407,7 +417,7 @@ func harnessWithCommandTimeout(
 		}}))
 	p.SetPollWindowForTest(60 * time.Millisecond)
 
-	srv := httptest.NewServer(nodeplane.Handler(log, p, stubStore{}, stubJIT{}))
+	srv := httptest.NewServer(wrap(nodeplane.Handler(log, p, stubStore{}, stubJIT{})))
 	t.Cleanup(srv.Close)
 
 	c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
@@ -546,6 +556,103 @@ func TestADestroyReachesTheCompute(t *testing.T) {
 
 	if len(destroyed) != 1 || destroyed[0] != 42 {
 		t.Fatalf("the destroy did not reach the compute: %v", destroyed)
+	}
+}
+
+// lostResults serves the plane through a wire that drops the first `drop`
+// command results it carries, closing each connection without an answer as a
+// plane too busy to reply would, and counts every result that reached it.
+type lostResults struct {
+	drop int64
+	seen atomic.Int64
+}
+
+func (l *lostResults) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/result") {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		if l.seen.Add(1) > l.drop {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			http.Error(w, "this test's wire could not drop the result", http.StatusTeapot)
+
+			return
+		}
+
+		_ = conn.Close()
+	})
+}
+
+// A DESTROY'S OUTCOME THAT DID NOT LAND IS SENT AGAIN. A stopping node's last
+// report is its destroy's, and no poll follows to be handed the command again,
+// so a report a busy plane did not answer left the lease launching for the
+// plane's whole command timeout (#188's multi-day row). The second report is
+// what the plane hears, and the destroy itself ran once.
+//
+// RAN ONCE IS THE ASSERTION THAT CAN FAIL. This node goes on polling, so a node
+// that never sent again is handed the destroy a second time (#408) and Destroy
+// still succeeds; only a node that is stopping has no poll to be handed it on.
+func TestALostDestroyReportIsSentAgain(t *testing.T) {
+	t.Parallel()
+
+	lost := &lostResults{drop: 1}
+	// Longer than the retry's wait, so the second report lands inside it.
+	p, c := harnessBehind(t, 15*time.Second, lost.wrap)
+	compute := &fakeCompute{}
+
+	runLoop(t, c, compute)
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	if err := p.NewRunner().Destroy(t.Context(), 42); err != nil {
+		t.Fatalf("Destroy = %v, want the second report of its outcome to settle it", err)
+	}
+
+	if got := lost.seen.Load(); got != 2 {
+		t.Errorf("the plane's wire carried %d results, want the dropped one and the one sent again", got)
+	}
+
+	if _, _, destroyed := compute.snapshot(); len(destroyed) != 1 || destroyed[0] != 42 {
+		t.Errorf("the compute was asked to destroy %v, want request 42 once: a report is sent again, "+
+			"never the command", destroyed)
+	}
+}
+
+// A LAUNCH'S OUTCOME IS NOT SENT AGAIN: a lost launch report is custody, which
+// the node takes at once rather than after a retry that could arrive after the
+// plane has answered the listener.
+func TestALostLaunchReportIsNotSentAgain(t *testing.T) {
+	t.Parallel()
+
+	lost := &lostResults{drop: 1}
+	p, c := harnessBehind(t, 2*time.Second, lost.wrap)
+	compute := &fakeCompute{}
+
+	runLoop(t, c, compute)
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	lease := &alloc.Lease{
+		ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB, GuestOS: config.GuestLinux,
+		Providers: []config.ProviderKind{config.ProviderDocker}, Epoch: 1, RequestID: 7,
+	}
+
+	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); err == nil {
+		t.Fatal("a launch whose report was lost reported success")
+	}
+
+	// CUSTODY IS TAKEN AFTER THE LAST REPORT, so once it is, nothing more is sent.
+	waitFor(t, func() bool { return len(compute.custodyTaken()) == 1 })
+
+	if got := lost.seen.Load(); got != 1 {
+		t.Errorf("the plane's wire carried %d launch results, want the one that was lost", got)
 	}
 }
 
