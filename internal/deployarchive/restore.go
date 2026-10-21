@@ -1367,6 +1367,10 @@ func (j *journal) noteRemoval(stateDir string, paths []string) error {
 	return j.save(stateDir)
 }
 
+// saveJournalHook fails a journal save before it writes anything. Nil in
+// production.
+var saveJournalHook func() error
+
 // save rewrites the journal durably.
 //
 // REPLACED RATHER THAN APPENDED, and written through a temporary so a crash
@@ -1374,6 +1378,12 @@ func (j *journal) noteRemoval(stateDir string, paths []string) error {
 // what an abandon deletes from, and a half-written one is a list that has lost
 // entries.
 func (j *journal) save(stateDir string) error {
+	if saveJournalHook != nil {
+		if err := saveJournalHook(); err != nil {
+			return err
+		}
+	}
+
 	body, err := json.MarshalIndent(j, "", "  ")
 	if err != nil {
 		return fmt.Errorf("deployarchive: encode the restore journal: %w", err)

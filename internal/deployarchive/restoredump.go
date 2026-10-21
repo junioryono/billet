@@ -175,6 +175,11 @@ func ProveRestoredLedger(ctx context.Context, plan Plan) error {
 		return err
 	}
 
+	// THE SEAL IS A WRITE, and an abandon that has begun is the only way on.
+	if prog.IsFor(plan.Archive) && prog.IsFrom(plan.Intent) && prog.Abandoning {
+		return errAbandoning(plan.Intent)
+	}
+
 	if plan.Intent == ReplaceLedger {
 		if err := requirePublishedCopy(plan.Archive, plan.Target.StateDir,
 			prog.SupersededDigests, prog.SupersedePublished); err != nil {

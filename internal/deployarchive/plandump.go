@@ -197,7 +197,11 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 
 	switch {
 	case len(led.Tables) == 0:
-		p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: Install})
+		// A HIERARCHY THE ROLE CANNOT SEE: information_schema lists only the
+		// tables billet's role has a privilege on, and the catalogue every one.
+		if !p.refuseHierarchy(led) {
+			p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: Install})
+		}
 	case (led.Binding == deployment || led.Populated && p.Target.ExternalLedgerAttached) &&
 		!slices.Contains(led.Tables, "schema_migrations"):
 		// KEPT ONLY IF IT IS A BILLET LEDGER AT ALL. Rows with no migration

@@ -303,7 +303,7 @@ refusal_started=$(date -u +%s)
 if refusal=$(rehearsal_as_billet "${controller}" /usr/bin/billet rollout start --version "${FROM}" \
     --allow-downgrade --config /etc/billet/billet.yaml 2>&1); then
     printf '%s\n' "${refusal}" | tail -6
-    rehearsal_fail "the downgrade to ${FROM} was accepted although it cannot open the ledger ${TO} left; this pair must cross a ledger migration"
+    rehearsal_fail "the downgrade to ${FROM} was accepted: either the pair crosses no ledger migration, or ${TO} predates the manifest's compatibility gate"
 fi
 printf '%s\n' "${refusal}" | tail -4
 grep -qF "expects ledger schema" <<<"${refusal}" ||

@@ -1617,6 +1617,13 @@ func TestAForwardRunAfterAnAbandonBeganIsRefused(t *testing.T) {
 
 	ledger.admission = state.Admission{Mode: state.AdmissionSealed, Provenance: state.ProvenanceOperator}
 
+	// THE SEAL'S PROOF REFUSES IT TOO, for a run planned before the abandon
+	// began and taking the published shortcut past Execute.
+	if err := ProveRestoredLedger(t.Context(), p); err == nil ||
+		!strings.Contains(err.Error(), "has already begun undoing it") {
+		t.Errorf("ProveRestoredLedger after an abandon began = %v, want a refusal", err)
+	}
+
 	if err := Finish(t.Context(), p); err == nil || !strings.Contains(err.Error(), "has already begun undoing it") {
 		t.Errorf("Finish after an abandon began = %v, want a refusal", err)
 	}
@@ -1721,6 +1728,20 @@ func TestASchemaHoldingAHierarchyIsRefusedAtThePlan(t *testing.T) {
 		t.Errorf("a restore into a schema holding a hierarchy was planned: %+v", p.Refusals)
 	}
 
+	// A HIERARCHY THE ROLE CANNOT SEE: no table listed, the catalogue's
+	// hierarchy still reported, and an install refused for it.
+	hidden := emptySchema()
+	hidden.Hierarchy = []string{"reports"}
+
+	p, err = PlanRestore(t.Context(), f.archive, pgTarget(t, f.d, f.ledgerFor(hidden)))
+	if err != nil {
+		t.Fatalf("PlanRestore: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "partitioned, a partition or an inheriting")) == 0 {
+		t.Errorf("an install into a schema hiding a hierarchy was planned: %+v", p.Refusals)
+	}
+
 	// KEEPING THE DATABASE'S OWN LEDGER WRITES NOTHING THERE, so it is not
 	// refused for one.
 	own := f.restoredAs()
@@ -1759,7 +1780,7 @@ func TestAnAbandonIsJournaledBeforeItsFirstAction(t *testing.T) {
 		t.Fatalf("parse restore.go: %v", err)
 	}
 
-	var mark, firstRemove, putBack token.Pos
+	var mark, save, firstRemove, putBack token.Pos
 
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -1774,6 +1795,12 @@ func TestAnAbandonIsJournaledBeforeItsFirstAction(t *testing.T) {
 					mark = n.Pos()
 				}
 			case *ast.CallExpr:
+				// THE SAVE THAT MAKES THE MARK DURABLE, the first after it.
+				if sel, ok := n.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "save" &&
+					mark != token.NoPos && save == token.NoPos {
+					save = n.Pos()
+				}
+
 				if id, ok := n.Fun.(*ast.Ident); ok {
 					switch {
 					case id.Name == "abandonOne" && firstRemove == token.NoPos:
@@ -1789,10 +1816,56 @@ func TestAnAbandonIsJournaledBeforeItsFirstAction(t *testing.T) {
 	}
 
 	switch {
-	case mark == token.NoPos || firstRemove == token.NoPos || putBack == token.NoPos:
-		t.Fatalf("abandonLocked no longer has the mark (%v), abandonOne (%v) and the put-back (%v) "+
-			"this test holds in order", mark, firstRemove, putBack)
-	case mark > firstRemove || mark > putBack:
-		t.Fatal("abandonLocked acts before it journals that an abandon has begun")
+	case mark == token.NoPos || save == token.NoPos || firstRemove == token.NoPos || putBack == token.NoPos:
+		t.Fatalf("abandonLocked no longer has the mark (%v), its save (%v), abandonOne (%v) and the "+
+			"put-back (%v) this test holds in order", mark, save, firstRemove, putBack)
+	case save > firstRemove || save > putBack:
+		t.Fatal("abandonLocked acts before the journal durably says an abandon has begun")
 	}
+}
+
+// THE MARK IS SAVED BEFORE THE ABANDON ACTS, ON EVERY RUN: an abandon that cannot
+// save its journal removes nothing and puts nothing back, even when the journal
+// it loaded already carries the mark, because the run that first set it may
+// have died before that save was durable.
+func TestAnAbandonThatCannotSaveItsMarkDoesNothing(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	path := JournalPath(tgt.StateDir)
+
+	var raw map[string]any
+	if err := json.Unmarshal(read(t, path), &raw); err != nil {
+		t.Fatalf("decode the journal: %v", err)
+	}
+
+	raw["abandoning"] = true
+
+	body, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("encode the journal: %v", err)
+	}
+
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write the journal: %v", err)
+	}
+
+	// EVERY SAVE FAILS from here, the abandon's own first one included.
+	prev := saveJournalHook
+	saveJournalHook = func() error { return errStopHere }
+
+	t.Cleanup(func() { saveJournalHook = prev })
+
+	if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); !errors.Is(err, errStopHere) {
+		t.Fatalf("Abandon with a journal it cannot save = %v, want that failure", err)
+	}
+
+	if len(ledger.restored) != 0 {
+		t.Errorf("the abandon put %v back without saving its mark", ledger.restored)
+	}
+
+	if _, err := os.Lstat(supersededDumpPath(f.archive, tgt.StateDir)); err != nil {
+		t.Errorf("the copy moved although the mark was never saved (%v)", err)
+	}
+
+	assertFenced(t, tgt.StateDir)
 }

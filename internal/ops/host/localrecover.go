@@ -369,6 +369,15 @@ func recoveryStageOf(stateDir string, a *deployarchive.Archive) (recoveryStage, 
 		return recoverFresh, nil
 	}
 
+	// AN ABANDON THAT HAS BEGUN is the only way on, and this is read under the
+	// lifecycle lock: a run planned before an abandon began would otherwise take
+	// the published shortcut past Execute's re-plan and seal a ledger the
+	// abandon is putting back.
+	if prog.Abandoning {
+		return recoverFresh, errors.New("an abandon of this recovery has already begun undoing " +
+			"it; run `billet local recover --abandon` again to finish it")
+	}
+
 	// THE FENCE IS NOT CONSULTED HERE, deliberately. A published recovery is
 	// finished the same way whether or not its fence is still standing: the last
 	// two steps take the fence down and then remove the journal, so a crash

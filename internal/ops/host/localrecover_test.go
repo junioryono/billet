@@ -2131,3 +2131,42 @@ func insertSuperseded(created []any, superseded string, rank int) []any {
 func installAppKeyHere(path string, pem []byte) error {
 	return installAppKey(processEnv(), path, pem)
 }
+
+// AN ABANDON THAT HAS BEGUN STOPS A FORWARD RECOVERY AT ITS STAGE, read under the
+// lifecycle lock: a run planned before the abandon began would otherwise take
+// the published shortcut past Execute's re-plan and seal the ledger the abandon
+// is putting back.
+func TestARecoveryStopsAtAnAbandonThatHasBegun(t *testing.T) {
+	f := newBackupFixture(t, true)
+	archive := backupInto(t, f)
+
+	a, err := deployarchive.Open(t.Context(), archive)
+	if err != nil {
+		t.Fatalf("open the archive: %v", err)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(archive, deployarchive.EntryManifest))
+	if err != nil {
+		t.Fatalf("read the archive manifest: %v", err)
+	}
+
+	sum := sha256.Sum256(manifest)
+
+	for _, abandoning := range []bool{false, true} {
+		journal := fmt.Appendf(nil,
+			`{"schema":3,"intent":"recover","phase":"published","abandoning":%t,"archive_dir":%q,"manifest_sha256":%q}`,
+			abandoning, a.Dir, hex.EncodeToString(sum[:]))
+		if err := os.WriteFile(deployarchive.JournalPath(f.stateDir), journal, 0o600); err != nil {
+			t.Fatalf("stage the journal: %v", err)
+		}
+
+		got, err := recoveryStageOf(f.stateDir, a)
+
+		switch {
+		case abandoning && (err == nil || !strings.Contains(err.Error(), "--abandon")):
+			t.Errorf("a published recovery whose abandon began = %v, %v; want a refusal naming --abandon", got, err)
+		case !abandoning && (err != nil || got != recoverPublished):
+			t.Errorf("a published recovery = %v, %v; want %v", got, err, recoverPublished)
+		}
+	}
+}

@@ -126,3 +126,4 @@ b56657d3069e The images row gained `accept`, the components whose licenses a dep
 2005dcd34322 #19 added dump_test.go to internal/deployarchive's tests; the list now names it.
 705b3b1bd8f9 #19 carries a PostgreSQL ledger as pg_dump's copy (archive schema 4); the sentence now says which schema each archive is written at and that identity-only archives are still read.
 d60701766066 #19: `billet local backup` no longer records a PostgreSQL ledger as external, it carries pg_dump's copy; the host-transaction rule is restated without that clause and the dump has its own invariant.
+de65ee2d5832 #20: the rollout rehearsal's last stage asserted a rollback no downgrade can reach since the manifest compatibility gate refuses an incompatible candidate at rollout start (measured 2026-10-21); the sentence now says the candidate is refused before any host is touched and that a transaction's rollback is held by hostupgrade's tests.
