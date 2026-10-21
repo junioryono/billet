@@ -78,4 +78,10 @@ func TestCheckNamesATierNoLiveHostCanPlace(t *testing.T) {
 	if strings.Contains(fits, "UNPLACEABLE") {
 		t.Errorf("check called a tier unplaceable with a live host its shape fits:\n%s", fits)
 	}
+
+	// AND WITH NO HOST AT ALL IT SAYS NOTHING NEW: every tier would say it, and
+	// the fleet line has said why.
+	if empty := checkWithHosts(t); strings.Contains(empty, "UNPLACEABLE") {
+		t.Errorf("check called a tier unplaceable on a fleet with no host registered:\n%s", empty)
+	}
 }

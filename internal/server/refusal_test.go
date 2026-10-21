@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // These are #248: a purchase that buys nothing says why, the order or the
@@ -49,7 +51,7 @@ func (l *logLines) with(t *testing.T, msg string) []map[string]any {
 			t.Fatalf("a log line is not JSON: %v: %s", err, scanner.Text())
 		}
 
-		if text, _ := record["msg"].(string); strings.HasPrefix(text, msg) {
+		if strings.HasPrefix(stringAttr(record, "msg"), msg) {
 			out = append(out, record)
 		}
 	}
@@ -57,9 +59,19 @@ func (l *logLines) with(t *testing.T, msg string) []map[string]any {
 	return out
 }
 
+// stringAttr is a record's string attribute, or "" when it has none.
+func stringAttr(record map[string]any, key string) string {
+	s, ok := record[key].(string)
+	if !ok {
+		return ""
+	}
+
+	return s
+}
+
 // loggedListeners is orderedListeners with a log the test reads.
 func loggedListeners(t *testing.T, tiers []config.Tier, vcpu int, order config.AdmissionOrder,
-) (*alloc.Allocator, *launchLog, *logLines, []*Listener) {
+) (*alloc.Allocator, *logLines, []*Listener) {
 	t.Helper()
 
 	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: vcpu, MaxMemory: 64 * config.GiB}, tiers)
@@ -72,15 +84,14 @@ func loggedListeners(t *testing.T, tiers []config.Tier, vcpu int, order config.A
 	lines := &logLines{}
 	logger := slog.New(slog.NewJSONHandler(lines, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	log := &launchLog{}
-	s := New(a, nil, tiers, "refusal-test", logger, WithNodeRunner(log), WithAdmissionOrder(order))
+	s := New(a, nil, tiers, "refusal-test", logger, WithNodeRunner(&launchLog{}), WithAdmissionOrder(order))
 
 	listeners := make([]*Listener, 0, len(tiers))
 	for i := range tiers {
 		listeners = append(listeners, NewListener(a, tiers[i].Label, &fakeSession{}, s.listenerOpts(nil)...))
 	}
 
-	return a, log, lines, listeners
+	return a, lines, listeners
 }
 
 const declineMessage = "assigned a request with no escrow to back it; declining it"
@@ -92,7 +103,7 @@ const declineMessage = "assigned a request with no escrow to back it; declining 
 func TestADeclineTheOrderCausedNamesTheWaiter(t *testing.T) {
 	t.Parallel()
 
-	a, _, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFair)
+	a, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFair)
 	small, large := listeners[0], listeners[1]
 
 	if err := small.reconcilePool(t.Context(), 2); err != nil {
@@ -118,7 +129,7 @@ func TestADeclineTheOrderCausedNamesTheWaiter(t *testing.T) {
 		t.Errorf("the decline names held_by %v, want the waiting large tier: %v", got, declines[0])
 	}
 
-	if reason, _ := declines[0]["reason"].(string); !strings.Contains(reason, "admission order") {
+	if reason := stringAttr(declines[0], "reason"); !strings.Contains(reason, "admission order") {
 		t.Errorf("the decline's reason %q does not say the admission order refused it", reason)
 	}
 }
@@ -128,7 +139,7 @@ func TestADeclineTheOrderCausedNamesTheWaiter(t *testing.T) {
 func TestADeclineTheAllocatorCausedSaysWhy(t *testing.T) {
 	t.Parallel()
 
-	_, _, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFill)
+	_, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFill)
 	small := listeners[0]
 
 	if err := small.reconcilePool(t.Context(), 2); err != nil {
@@ -148,7 +159,7 @@ func TestADeclineTheAllocatorCausedSaysWhy(t *testing.T) {
 		t.Errorf("an allocator refusal named a waiter %v: %v", got, declines[0])
 	}
 
-	reason, _ := declines[0]["reason"].(string)
+	reason := stringAttr(declines[0], "reason")
 	if !strings.Contains(reason, "the allocator has no room") || !strings.Contains(reason, "deployment ceiling") {
 		t.Errorf("the decline's reason %q does not say the allocator refused it for the ceiling", reason)
 	}
@@ -159,7 +170,7 @@ func TestADeclineTheAllocatorCausedSaysWhy(t *testing.T) {
 func TestThePoolPathSaysWhyOncePerReason(t *testing.T) {
 	t.Parallel()
 
-	_, _, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFair)
+	_, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFair)
 	small, large := listeners[0], listeners[1]
 
 	if err := small.reconcilePool(t.Context(), 2); err != nil {
@@ -181,7 +192,7 @@ func TestThePoolPathSaysWhyOncePerReason(t *testing.T) {
 		t.Errorf("the line names tier %v, want b-large: %v", said[0]["tier"], said[0])
 	}
 
-	if reason, _ := said[0]["reason"].(string); !strings.Contains(reason, "deployment ceiling") {
+	if reason := stringAttr(said[0], "reason"); !strings.Contains(reason, "deployment ceiling") {
 		t.Errorf("the reason %q does not name the ceiling the small tier spent", reason)
 	}
 }
@@ -195,7 +206,7 @@ func TestATierAtItsCapPublishesItsRefusal(t *testing.T) {
 	capped := tierOf("a-capped", 4)
 	capped.MaxConcurrent = 1
 
-	a, _, _, listeners := loggedListeners(t, []config.Tier{capped}, 64, config.AdmissionFair)
+	a, _, listeners := loggedListeners(t, []config.Tier{capped}, 64, config.AdmissionFair)
 
 	if err := listeners[0].reconcilePool(t.Context(), 3); err != nil {
 		t.Fatalf("capped tier reconcile: %v", err)
@@ -234,7 +245,7 @@ func TestATierAtItsCapPublishesItsRefusal(t *testing.T) {
 func TestAnOfferDeclinedPastHeldEscrowSaysWhy(t *testing.T) {
 	t.Parallel()
 
-	_, _, lines, listeners := loggedListeners(t, []config.Tier{tierOf("a-work", 4)}, 4, config.AdmissionFair)
+	_, lines, listeners := loggedListeners(t, []config.Tier{tierOf("a-work", 4)}, 4, config.AdmissionFair)
 	l := listeners[0]
 
 	if err := l.refillEscrow(t.Context()); err != nil {
@@ -252,7 +263,7 @@ func TestAnOfferDeclinedPastHeldEscrowSaysWhy(t *testing.T) {
 		t.Fatalf("logged %d offer declines, want the one past the held lease: %v", len(declines), declines)
 	}
 
-	if reason, _ := declines[0]["reason"].(string); !strings.Contains(reason, "deployment ceiling") {
+	if reason := stringAttr(declines[0], "reason"); !strings.Contains(reason, "deployment ceiling") {
 		t.Errorf("the decline's reason %q does not name the ceiling that refused the second lease", reason)
 	}
 }
@@ -331,6 +342,80 @@ func TestAFailedLaunchLeavesItsJobCountedAsWaiting(t *testing.T) {
 	}
 }
 
+// ONLY A POLL SENT WITH THE ADVERTISEMENT WITHDRAWN DATES THE COUNT (#140). A
+// listener of an open deployment polls advertising its ceiling, and GitHub may
+// assign against that advertisement after the poll returns empty, so its count
+// stays undated, which a drain reads as from before any seal. Under a seal it
+// advertises only committed work, and each exchange that returns dates the
+// count with when it did.
+func TestOnlyAWithdrawnPollDatesTheCount(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T, sealed bool) (alloc.ListenerCapacity, time.Time) {
+		t.Helper()
+
+		tiers := []config.Tier{tierOf("a-work", 4)}
+
+		db := openState(t)
+
+		a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		registerHost(t, a)
+
+		var sealedAt time.Time
+
+		if sealed {
+			sealedAt = time.Now()
+
+			if _, err := db.Seal(t.Context(), state.SealRequest{Provenance: state.ProvenanceOperator, Actor: "ops"}); err != nil {
+				t.Fatalf("Seal: %v", err)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		var polls atomic.Int32
+
+		session := &fakeSession{stats: &Statistics{}, onPoll: func(int) {
+			if polls.Add(1) >= 4 {
+				cancel()
+			}
+		}}
+
+		l := NewListener(a, tiers[0].Label, session, WithRunner(&launchLog{}),
+			WithLogger(slog.New(slog.DiscardHandler)))
+
+		if err := l.Run(ctx); err != nil && ctx.Err() == nil {
+			t.Fatalf("Run: %v", err)
+		}
+
+		got, err := a.CapacityReport(t.Context(), tiers[0].Label)
+		if err != nil {
+			t.Fatalf("CapacityReport: %v", err)
+		}
+
+		return got.Listener, sealedAt
+	}
+
+	open, _ := run(t, false)
+	if open.UnstartedAt != "" {
+		t.Errorf("an open listener's count is dated %q; polls advertising its ceiling vouch for nothing",
+			open.UnstartedAt)
+	}
+
+	closed, sealedAt := run(t, true)
+
+	counted, err := time.Parse(time.RFC3339Nano, closed.UnstartedAt)
+	if err != nil || counted.Before(sealedAt) {
+		t.Errorf("a sealed listener's count is dated %q (%v), want a time after the seal at %s",
+			closed.UnstartedAt, err, sealedAt.UTC())
+	}
+}
+
 // THE STATUS REPORT NAMES WHO HOLDS THE LINE. A tier waiting behind another is
 // published with that tier's label, asked of the queue when the report is
 // written, so `billet status` can say which waiter holds it.
@@ -340,7 +425,7 @@ func TestTheReportNamesTheWaiterThatHoldsTheLine(t *testing.T) {
 	// A third tier, which can grow once the small tier's jobs end and so waits
 	// in line behind the large one; the small tier, at the most the ceiling
 	// lets it hold, never waits at all.
-	a, _, _, listeners := loggedListeners(t, append(contenders(), tierOf("c-medium", 4)), 8,
+	a, _, listeners := loggedListeners(t, append(contenders(), tierOf("c-medium", 4)), 8,
 		config.AdmissionFair)
 	small, large, medium := listeners[0], listeners[1], listeners[2]
 

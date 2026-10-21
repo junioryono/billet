@@ -23,6 +23,12 @@ type resizeGate struct {
 	order atomic.Pointer[server.Server]
 }
 
+// resizeOrder is what the gate asks: the waiters a lease of tier must leave
+// room for (server.Server.ResizeAdmission).
+type resizeOrder interface {
+	ResizeAdmission(ctx context.Context, tier string) []string
+}
+
 // resize is the route's nodeplane.Resizer.
 func (g *resizeGate) resize(ctx context.Context, leaseID string, epoch int64, instanceType string,
 	vcpu int, memory config.ByteSize,
@@ -32,11 +38,21 @@ func (g *resizeGate) resize(ctx context.Context, leaseID string, epoch int64, in
 		return g.alloc.Resize(ctx, leaseID, epoch, instanceType, vcpu, memory)
 	}
 
+	return g.resizeAsking(ctx, order, leaseID, epoch, instanceType, vcpu, memory)
+}
+
+// resizeAsking grows a lease leaving room for the waiters order names for its
+// tier. The order is read before the allocator's transaction opens, never
+// inside it: a ledger writer calls out to nothing.
+func (g *resizeGate) resizeAsking(ctx context.Context, order resizeOrder, leaseID string, epoch int64,
+	instanceType string, vcpu int, memory config.ByteSize,
+) error {
 	lease, err := g.alloc.Lease(ctx, leaseID)
 	if err != nil {
 		return err
 	}
 
-	return g.alloc.ResizeLeaving(ctx, leaseID, epoch, instanceType, vcpu, memory,
-		order.ResizeAdmission(ctx, lease.Tier))
+	protect := order.ResizeAdmission(ctx, lease.Tier)
+
+	return g.alloc.ResizeLeaving(ctx, leaseID, epoch, instanceType, vcpu, memory, protect)
 }

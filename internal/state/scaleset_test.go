@@ -176,6 +176,21 @@ func TestARecordIsFoundAndForgottenUnderAnySpelling(t *testing.T) {
 	if got := scaleSets(t, db); len(got) != 0 {
 		t.Fatalf("ScaleSets = %v after forgetting it under another spelling, want none", got)
 	}
+
+	// AND BEYOND ASCII, which SQLite's LOWER does not fold: a group named with a
+	// letter outside it is forgotten under its other case all the same.
+	accented := ScaleSetRecord{Target: testOrg, RunnerGroup: "Équipe", Label: "billet-4vcpu", ID: 10}
+	if err := db.RecordScaleSet(t.Context(), accented); err != nil {
+		t.Fatalf("RecordScaleSet: %v", err)
+	}
+
+	if err := db.ForgetScaleSet(t.Context(), testOrg, "équipe", "billet-4vcpu"); err != nil {
+		t.Fatalf("ForgetScaleSet: %v", err)
+	}
+
+	if got := scaleSets(t, db); len(got) != 0 {
+		t.Fatalf("ScaleSets = %v after forgetting %q as %q, want none", got, "Équipe", "équipe")
+	}
 }
 
 // Teardown may run against a deployment whose ledger predates the record, and

@@ -176,9 +176,14 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		l.retireOfflineMembers(ctx, runners)
 
 		// A RUNNER RETIRED FOR BEING OFFLINE may have been one the count above
-		// had covering an assigned job. Only a count of none can be made wrong
-		// that way, so only it is counted again.
-		if surplus == 0 && desired > 0 {
+		// had covering an assigned job, and its retirement left the count
+		// unknown (retireWithdrawn); a count of none is the one it can make
+		// wrong. Either is counted again.
+		l.mu.Lock()
+		invalidated := !l.demandKnown
+		l.mu.Unlock()
+
+		if invalidated || (surplus == 0 && desired > 0) {
 			l.recountDemand(ctx, desired)
 		}
 
@@ -219,7 +224,7 @@ func (l *Listener) recountDemand(ctx context.Context, desired int) {
 		return
 	}
 
-	l.waitingFor = max(desired-active, 0)
+	l.waitingFor, l.demandKnown = max(desired-active, 0), true
 }
 
 // poolLaunchBatch is how many pool members one pass starts at once on a tier

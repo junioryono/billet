@@ -349,8 +349,32 @@ func TestAStaleOrganizationRecordIsFoundUnderAnotherSpelling(t *testing.T) {
 		{Target: strings.ToUpper(testOrg), RunnerGroup: "default", Label: "billet-4vcpu", ID: 53},
 	}, repo)
 
-	if err == nil {
-		t.Fatal("a stale organization record written under another spelling of the owner was missed")
+	if err == nil || !strings.Contains(err.Error(), "(id 53)") ||
+		!strings.Contains(err.Error(), "organization "+testOrg) {
+		t.Fatalf("a stale organization record written under another spelling of the owner was not "+
+			"the refusal: %v", err)
+	}
+}
+
+// AND A SERVED ORGANIZATION'S STALE SET TAKES ITS SERVED REPOSITORY'S JOBS:
+// the record is on the organization this control plane serves, and the name
+// is one a tier of one of its repositories answers to.
+func TestAStaleSetOnAServedOrganizationRefusesItsRepositorysTier(t *testing.T) {
+	repo := config.GitHubTarget{Name: "app", Repository: testOrg + "/app"}
+
+	org := tier("billet-2vcpu-org")
+	org.Target = testTarget.Name
+	app := tier("billet-4vcpu")
+	app.Target = repo.Name
+
+	_, _, err := runWithRecords(t, []config.Tier{org, app}, []state.ScaleSetRecord{
+		{Target: testOrg, RunnerGroup: "default", Label: "billet-4vcpu", ID: 54},
+	}, testTarget, repo)
+
+	if err == nil || !strings.Contains(err.Error(), `"billet-4vcpu" answers to on `+testOrg+"/app") ||
+		!strings.Contains(err.Error(), "(id 54)") {
+		t.Fatalf("a stale set on the organization under a name its repository's tier answers to "+
+			"did not refuse the start: %v", err)
 	}
 }
 

@@ -10,10 +10,18 @@ import (
 
 // reportCapacity keeps observation writes in ownership order under mu. Reporting
 // failure is audible and changes no scheduling decision or lease ownership.
-// THE WRITE IS BOUNDED so a failed observation cannot stall renewal indefinitely.
 func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange string) {
+	if err := l.publishCapacity(ctx, sent, exchange); err != nil {
+		l.log.Warn("could not report listener capacity", "tier", l.tier, "error", err)
+	}
+}
+
+// publishCapacity is reportCapacity for a caller whose next step depends on the
+// observation having reached the ledger. THE WRITE IS BOUNDED so a failed
+// observation cannot stall renewal indefinitely.
+func (l *Listener) publishCapacity(ctx context.Context, sent *int, exchange string) error {
 	if l.alloc == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, l.releaseGrace)
 	defer cancel()
@@ -41,7 +49,12 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	if l.demandKnown {
 		unstarted := l.waitingFor
 		report.Unstarted = &unstarted
-		report.UnstartedAt = l.demandAt.UTC().Format(time.RFC3339Nano)
+
+		// UNDATED UNTIL GITHUB HAS VOUCHED FOR IT under a withdrawn
+		// advertisement, which a drain reads as a count from before its seal.
+		if !l.demandAt.IsZero() {
+			report.UnstartedAt = l.demandAt.UTC().Format(time.RFC3339Nano)
+		}
 	}
 
 	// THE QUEUE'S OWN RECORD OF WHEN THIS TIER BEGAN WAITING, not a fresh
@@ -88,7 +101,5 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	}
 	slices.Sort(report.Discovery)
 	slices.Sort(report.Pending)
-	if err := l.alloc.RecordListenerCapacity(ctx, l.tier, report); err != nil {
-		l.log.Warn("could not report listener capacity", "tier", l.tier, "error", err)
-	}
+	return l.alloc.RecordListenerCapacity(ctx, l.tier, report)
 }

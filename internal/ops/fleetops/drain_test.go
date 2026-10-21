@@ -420,6 +420,34 @@ func TestADrainDoesNotTrustACountFromBeforeTheSeal(t *testing.T) {
 	}
 }
 
+// AND A COUNT TAKEN SINCE THE SEAL IS TRUSTED, at the moment it was taken: the
+// operator sealed, the listeners counted none, and the drain run afterwards
+// says Drained without waiting for anything newer.
+func TestADrainTrustsACountTakenSinceItsSeal(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	if _, err := db.Seal(t.Context(), state.SealRequest{
+		Provenance: state.ProvenanceOperator, Reason: "maintenance", Actor: "ops@example.com",
+	}); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemandAt(t, db, cfg, cfg.Tiers[i].Label, &none, time.Now())
+	}
+
+	saved := demandCountWithin
+	demandCountWithin = time.Second
+
+	t.Cleanup(func() { demandCountWithin = saved })
+
+	if out := drainWait(t, cfgPath); !strings.Contains(out, "Drained") || strings.Contains(out, "unknown") {
+		t.Errorf("a drain did not trust counts taken since its seal:\n%s", out)
+	}
+}
+
 // AND A COUNT THAT COULD NOT BE READ IS NOT A COUNT OF NONE: a tier no
 // listener has reported for, or one whose listener predates the count, is
 // said to be unknown.
@@ -437,7 +465,7 @@ func TestADrainSaysAnUnreadableDemandIsUnknown(t *testing.T) {
 
 	out := drainWait(t, cfgPath)
 
-	if strings.Contains(out, "Drained") || !strings.Contains(out, older+": unknown") {
+	if strings.Contains(out, "Drained") || !strings.Contains(out, older+": unknown (its listener has not counted it") {
 		t.Errorf("a drain took a tier whose count it could not read for none:\n%s", out)
 	}
 }

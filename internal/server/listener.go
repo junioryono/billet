@@ -291,9 +291,9 @@ type Listener struct {
 	waitingFor  int
 	demandKnown bool
 	demandAt    time.Time
-	// observedAt is when GitHub last confirmed observed: the session that
-	// carried it opened, a message carried it, or a long poll returned empty,
-	// which says nothing was pending then. Touched only by the poll goroutine.
+	// observedAt is when GitHub last vouched for observed: a poll sent with the
+	// advertisement withdrawn returned, with a message or empty. Zero until one
+	// has. Touched only by the poll goroutine.
 	observedAt time.Time
 	// refused is why the last purchase this tier asked for bought nothing, and
 	// refusedLogged the reason last logged for it. Guarded by mu; reported and
@@ -777,7 +777,7 @@ func (l *Listener) Run(ctx context.Context) error {
 
 	// A restart does not replay messages for work already assigned, so a listener
 	// that waits to be told about a backlog sits idle in front of one.
-	l.observed, l.observedAt = l.session.Statistics(), l.clock()
+	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
 		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
@@ -1000,6 +1000,17 @@ func (l *Listener) Run(ctx context.Context) error {
 		if err == nil || errors.Is(err, ErrNoMessage) {
 			polled++
 			l.sessionFailures = 0
+
+			// AN EXCHANGE SENT WITH THE ADVERTISEMENT WITHDRAWN VOUCHES FOR THE
+			// STATISTICS AS IT RETURNS: GitHub assigns nothing past committed
+			// work under it, and whatever it had pending came back in it. Only
+			// such an exchange dates the count a drain trusts; one sent while
+			// still advertising may return empty after a seal and say nothing
+			// about an assignment made against the advertisement it carried.
+			if withdrawnWhenSent && l.observed != nil {
+				l.observedAt = l.clock()
+			}
+
 			l.reportCapacity(pollCtx, &advertised, "confirmed")
 		} else {
 			l.reportCapacity(context.WithoutCancel(pollCtx), nil, "ambiguous")
@@ -1030,13 +1041,6 @@ func (l *Listener) Run(ctx context.Context) error {
 			// invariant beginDrain used to provide for free, not because anything
 			// proves it.
 			l.handBackIdleEscrow(pollCtx, draining || (quiesced && admissionKnown))
-
-			// AN EMPTY POLL IS GITHUB SAYING NOTHING WAS PENDING AS IT RETURNED,
-			// so the statistics it last sent still stand as of now: the date a
-			// drain needs to know that no assignment is still on its way.
-			if l.observed != nil {
-				l.observedAt = l.clock()
-			}
 
 			if l.observed != nil && !l.messageHeld() {
 				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {

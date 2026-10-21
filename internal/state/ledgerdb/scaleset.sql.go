@@ -42,10 +42,7 @@ func (q *Queries) DeleteMovedScaleSet(ctx context.Context, arg DeleteMovedScaleS
 }
 
 const deleteScaleSet = `-- name: DeleteScaleSet :exec
-DELETE FROM scale_set
- WHERE LOWER(org) = LOWER(CAST($1 AS TEXT))
-   AND LOWER(runner_group) = LOWER(CAST($2 AS TEXT))
-   AND LOWER(label) = LOWER(CAST($3 AS TEXT))
+DELETE FROM scale_set WHERE org = $1 AND runner_group = $2 AND label = $3
 `
 
 type DeleteScaleSetParams struct {
@@ -54,10 +51,9 @@ type DeleteScaleSetParams struct {
 	Label       string
 }
 
-// Drop the record for a scale set billet has deleted, every spelling of its
-// target, group and name alike, as GitHub compares them and ListScaleSets reads
-// them: a record left under another spelling would refuse the next start over a
-// set that is gone.
+// Drop one record by its exact key. ForgetScaleSet finds every spelling of a
+// set's group and name in Go, where case folding is not ASCII alone, and
+// deletes each by this.
 func (q *Queries) DeleteScaleSet(ctx context.Context, arg DeleteScaleSetParams) error {
 	_, err := q.db.ExecContext(ctx, deleteScaleSet, arg.Org, arg.RunnerGroup, arg.Label)
 	return err

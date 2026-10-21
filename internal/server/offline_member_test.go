@@ -93,6 +93,8 @@ type offlineFixture struct {
 	destroyed int
 	// requests is every launch request the runner was told to destroy.
 	requests []int64
+	// duringDestroy runs inside each destroy, before the lease is released.
+	duringDestroy func()
 }
 
 // newOfflineFixture registers one idle pool member the way a launch journals it:
@@ -160,6 +162,10 @@ func newOfflineFixtureWith(t *testing.T, reg *inspectingRegistry, n int, poolID 
 		onDestroy: func(request int64) error {
 			f.destroyed++
 			f.requests = append(f.requests, request)
+
+			if f.duringDestroy != nil {
+				f.duringDestroy()
+			}
 
 			return nil
 		},
@@ -554,5 +560,78 @@ func TestAMemberJournaledWithItsIDIsWithdrawnByThatID(t *testing.T) {
 	if !slices.Equal(reg.withdrawn, []int64{10899}) || f.destroyed != 1 {
 		t.Fatalf("withdrawn %v, destroyed %d; want 10899 withdrawn and its compute destroyed",
 			reg.withdrawn, f.destroyed)
+	}
+}
+
+// RETIRING THE RUNNER THAT COVERED AN ASSIGNED JOB LEAVES THE JOB COUNTED AS
+// WAITING, AND NEVER AS NONE ON THE WAY (#140). One job is assigned and one
+// idle member covers it, so the published count is none; GitHub then reports
+// the member offline and it is retired. Its lease is released before the next
+// publication, so a drain reading a quiet ledger beside that none would call
+// the deployment drained while the job has no runner. The count is said to be
+// unknown before the release and one afterwards.
+func TestRetiringTheRunnerThatCoveredAJobCountsItAsWaiting(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixture(t, reg)
+	f.l.observedAt = offlineEpoch
+
+	report := func() alloc.ListenerCapacity {
+		t.Helper()
+
+		r, err := f.a.CapacityReport(t.Context(), "billet-4vcpu-a")
+		if err != nil {
+			t.Fatalf("CapacityReport: %v", err)
+		}
+
+		return r.Listener
+	}
+
+	f.reconcileAt(t, 0)
+	f.l.reportCapacity(t.Context(), nil, "")
+
+	if before := report(); before.Unstarted == nil || *before.Unstarted != 0 {
+		t.Fatalf("the covered job was published as %v waiting, want none, before anything was retired",
+			before.Unstarted)
+	}
+
+	var (
+		atClaim, duringRetirement *int
+		claimed, read             bool
+	)
+
+	// UNKNOWN BEFORE THE CLAIM, so a publication that fails retires nothing.
+	f.l.claimRetirement = func(ctx context.Context, leaseID string) error {
+		atClaim, claimed = report().Unstarted, true
+
+		return f.a.RetirePoolRunner(ctx, leaseID)
+	}
+
+	f.duringDestroy = func() {
+		duringRetirement, read = report().Unstarted, true
+	}
+
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{10899}) || !read {
+		t.Fatalf("the member was not retired (withdrawn %v), so this case shows nothing", reg.withdrawn)
+	}
+
+	if !claimed {
+		t.Error("the withdrawn member was retired without its claim being made")
+	} else if atClaim != nil {
+		t.Errorf("when the retirement was claimed the published count was %d, want unknown", *atClaim)
+	}
+
+	if duringRetirement != nil {
+		t.Errorf("while the runner covering the job was retired the published count was %d, want unknown",
+			*duringRetirement)
+	}
+
+	f.l.reportCapacity(t.Context(), nil, "")
+
+	if after := report(); after.Unstarted == nil || *after.Unstarted != 1 {
+		t.Errorf("after its runner was retired the job is published as %v waiting, want 1", after.Unstarted)
 	}
 }
