@@ -618,7 +618,10 @@ jobs:
     # 39539367492, 2026-10-21, ci-usage-<group>). policy alone peaks at 7.7
     # cores, compiling two test binaries for its real-systemd step, a few
     # minutes of its eighteen. A 2 vCPU runner reserves a quarter of the vCPU
-    # and memory, and the fleet runs out of memory first. ci-usage reports each
+    # and memory, and the fleet runs out of memory first. On it (run
+    # 39566892000, 2026-10-21) every group passed, none peaked above 2.0 cores
+    # or 1.9 GiB, policy took 22.6 minutes against 17.9, and the longest group,
+    # retirement-parity-network, took 32.0 against 31.9. ci-usage reports each
     # group's use on every run, so a group that outgrows its runner shows there.
     runs-on: billet-2vcpu-ubuntu-2404
     # The former retirement group reached 36 minutes before request coverage
