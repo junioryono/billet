@@ -61,8 +61,9 @@ import (
 // shape no live host fits is never recorded: freed room elsewhere will never
 // let it buy, so holding everyone behind it is an outage with no end. And a
 // waiter blocks only the tiers it could take room from: those sharing at least
-// one host it could be placed on, so a tier waiting for a Mac does not stop a
-// Linux tier whose room is on another machine.
+// one host it could be placed on, unless what refuses it is the deployment
+// ceiling, so a tier waiting for a Mac does not stop a Linux tier whose room is
+// on another machine (#157, #187).
 type admissionQueue struct {
 	policy config.AdmissionOrder
 	now    func() time.Time
@@ -85,8 +86,8 @@ const WaiterAllowance = 3 * time.Minute
 type waitingTier struct {
 	since time.Time
 	// where is the tier's admission as it was last recorded: the hosts it could
-	// be placed on, and whether the deployment ceiling is a pot shared with every
-	// other tier. An empty host set means the hosts could not be read, which
+	// be placed on, and whether the deployment ceiling or its target's share is
+	// what refuses it. An empty host set means the hosts could not be read, which
 	// competes with everyone rather than with nobody: an unknown is not a licence
 	// to bypass the order.
 	//
@@ -131,13 +132,21 @@ func (q *admissionQueue) gates() bool {
 // competes reports whether a buyer contends with a waiter for the same room.
 //
 // THREE WAYS TO COMPETE, and the last two are easy to miss: they share a host
-// either could be placed on; the deployment's own ceiling is smaller than the
-// hosts it caps, which makes it one pot every tier buys from; or they belong to
-// one target with a share, which is a pot its tiers buy from wherever their
+// either could be placed on; the waiter is ceiling-bound, so what refuses it is
+// the deployment ceiling, which every purchase anywhere spends; or they belong
+// to one target with a share, which is a pot its tiers buy from wherever their
 // hosts are. Under such a pot a tier pinned to one host and a tier pinned to
 // another still take room from each other, and a rule that looked only at hosts
 // let a stream of small jobs on one host starve a large tier waiting on the
 // other.
+//
+// THE CEILING IS THE WAITER'S, NOT THE DEPLOYMENT'S (#187). It used to be a
+// fact about the deployment (the ceiling is smaller than the hosts), true of
+// every tier at once, so a ceiling a couple of vCPU below the hosts had a tier
+// waiting for a Mac's macOS slot hold every Linux tier on another machine. A
+// waiter whose own hosts are full is waiting for those hosts, and only a buyer
+// on one of them takes what it waits for, wherever the ceiling sits; the
+// buyer's own relation to the ceiling says nothing about that.
 //
 // A tier whose hosts are unknown competes with every tier, so a failed read
 // never lets a purchase skip the order.
@@ -147,8 +156,10 @@ func (q *admissionQueue) gates() bool {
 // target's buyers back. Only the WAITER's flag decides it: a buyer's own share
 // being full says nothing about whether the waiter it would pass could use the
 // room. Both targets must be known, because an unknown one may be the waiter's
-// own. The flag is the waiter's view at its last refusal, so it can be one poll
-// stale in the direction that favours the other target.
+// own. The flags are the waiter's view at its last refusal, so each can be one
+// poll stale: a share-bound one in the direction that favours the other target,
+// a host-bound one in the direction that lets one purchase elsewhere take the
+// ceiling it would have needed, after which it is ceiling-bound.
 func competes(buyer, waiter alloc.TierAdmission) bool {
 	known := buyer.Target != "" && waiter.Target != ""
 
@@ -160,7 +171,7 @@ func competes(buyer, waiter alloc.TierAdmission) bool {
 		return true
 	}
 
-	if buyer.CeilingShared && waiter.CeilingShared {
+	if waiter.CeilingBound {
 		return true
 	}
 

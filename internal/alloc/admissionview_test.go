@@ -190,48 +190,128 @@ func TestTheAdmissionHostsExcludeAHostTheShapeDoesNotFit(t *testing.T) {
 	}
 }
 
-// AND A CEILING SMALLER THAN THE FLEET IS ONE POT EVERY TIER BUYS FROM.
+// A WAITER THE CEILING REFUSES IS CEILING-BOUND, AND ONE ITS HOSTS REFUSE IS NOT.
 //
-// Asking whether the ceiling cuts one tier's own total is not the question: two
-// tiers can each fit under it alone and still not fit together, which is exactly
-// when a stream of the small one starves the large one on a host it never
-// touches.
-func TestTheAdmissionSaysWhenTheDeploymentCeilingIsShared(t *testing.T) {
+// Two tiers pinned to different hosts under a ceiling that fits either but not
+// both: the large tier's host is empty while the small tier's jobs spend the
+// ceiling, so only the ceiling stands between the large tier and its host, and
+// every purchase anywhere takes from it (#173's review). The small tier, whose
+// own host is full, is waiting for that host, which the large tier's jobs never
+// touch.
+func TestAWaiterTheCeilingRefusesIsCeilingBound(t *testing.T) {
 	pinnedA := tier("a", 8, 16*config.GiB)
 	pinnedA.Node = "host-a"
 	pinnedB := tier("b", 4, 8*config.GiB)
 	pinnedB.Node = "host-b"
 
-	hosts := func(t *testing.T, a *Allocator) {
+	fleet := func(t *testing.T, limits Limits) *Allocator {
 		t.Helper()
 
+		a := newBareAllocator(t, limits, []config.Tier{pinnedA, pinnedB})
 		for _, name := range []string{"host-a", "host-b"} {
 			mustRegister(t, a, NodeRegistration{
 				Name: name, Provider: config.ProviderFirecracker, VCPU: 8, Memory: 16 * config.GiB,
 			})
 		}
+
+		return a
 	}
 
-	// Eight vCPU over two 8 vCPU hosts: each tier fits under the ceiling on its
-	// own host, and the two of them do not fit at once.
-	tight := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB},
-		[]config.Tier{pinnedA, pinnedB})
-	hosts(t, tight)
+	// Eight vCPU over two 8 vCPU hosts, and the small tier holds all of it.
+	tight := fleet(t, Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB})
+	reserve(t, tight, "b")
+	reserve(t, tight, "b")
+
+	if got := admissionOf(t, tight, "a"); !got.CeilingBound {
+		t.Errorf("tier a reports %+v; its host is empty and the ceiling is spent, so the "+
+			"ceiling is what refuses it and every purchase anywhere takes from it", got)
+	}
+
+	if got := admissionOf(t, tight, "b"); got.CeilingBound {
+		t.Errorf("tier b reports %+v; its own host is full, so it waits for that host and "+
+			"not for the ceiling", got)
+	}
+
+	// The same work under a ceiling the hosts cannot reach: the hosts decide.
+	roomy := fleet(t, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB})
+	reserve(t, roomy, "b")
+	reserve(t, roomy, "b")
 
 	for _, label := range []string{"a", "b"} {
-		if got := admissionOf(t, tight, label); !got.CeilingShared {
-			t.Errorf("tier %s reports %+v; the deployment ceiling is smaller than the hosts it "+
-				"caps, so a tier on another host is buying from the same pot", label, got)
+		if got := admissionOf(t, roomy, label); got.CeilingBound {
+			t.Errorf("tier %s reports %+v under a ceiling far above the fleet; the hosts are its limit",
+				label, got)
+		}
+	}
+}
+
+// A WAITER WHOSE HOSTS ARE FULL IS HOST-BOUND, WHEREVER THE CEILING SITS (#187).
+//
+// A Linux host contributing 120 vCPU and a Mac contributing 18, under a ceiling
+// of 136 vCPU and 540 GiB: just below what the hosts hold (138, 544), which the
+// rule this replaced read as "the ceiling is one pot" for every tier. A macOS
+// tier waiting for one of the Mac's two VM slots has plenty of ceiling left;
+// what refuses it is the slot limit, and no room freed on the Linux host can
+// ever reach it, so it must not be ceiling-bound and hold the Linux tiers.
+func TestAWaiterForAMacSlotIsNotCeilingBound(t *testing.T) {
+	mac := func(label string) config.Tier {
+		return config.Tier{
+			Label: label, Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+			Node: "mac", VCPU: 4, Memory: 8 * config.GiB, Image: "macos",
 		}
 	}
 
-	// With a ceiling the hosts cannot reach, the hosts are the limit again.
-	roomy := newBareAllocator(t, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB},
-		[]config.Tier{pinnedA, pinnedB})
-	hosts(t, roomy)
+	linux := tier("linux", 2, 8*config.GiB)
+	a := newBareAllocator(t, Limits{MaxVCPU: 136, MaxMemory: 540 * config.GiB},
+		[]config.Tier{mac("mac-a"), mac("mac-b"), linux})
 
-	if got := admissionOf(t, roomy, "a"); got.CeilingShared {
-		t.Errorf("tier a reports %+v under a ceiling far above the fleet; the hosts are its limit", got)
+	mustRegister(t, a, NodeRegistration{
+		Name: "linux-host", Provider: config.ProviderFirecracker, VCPU: 120, Memory: 480 * config.GiB,
+	})
+	mustRegister(t, a, NodeRegistration{
+		Name: "mac", Provider: config.ProviderTart, VCPU: 18, Memory: 64 * config.GiB,
+	})
+
+	// The Mac's two slots, held by the other macOS tier.
+	reserve(t, a, "mac-a")
+	reserve(t, a, "mac-a")
+	noHeadroom(t, a, "mac-b")
+
+	got := admissionOf(t, a, "mac-b")
+	if !got.CanGrow {
+		t.Fatalf("tier mac-b reports %+v; it can grow once the other tier's jobs end, so this "+
+			"case would not reach the order at all", got)
+	}
+
+	if got.CeilingBound {
+		t.Errorf("tier mac-b reports %+v; 128 vCPU of ceiling is left and the Mac's slot limit "+
+			"is what refuses it, so it would hold every Linux tier behind room it cannot use", got)
+	}
+}
+
+// A WAITER AT ITS OWN CAP IS NOT CEILING-BOUND, whatever the ceiling says: its
+// cap refuses it first, and a purchase elsewhere takes nothing it could use.
+func TestATierAtItsCapIsNotCeilingBound(t *testing.T) {
+	capped := tier("capped", 4, 8*config.GiB)
+	capped.MaxConcurrent = 1
+	other := tier("other", 4, 8*config.GiB)
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB},
+		[]config.Tier{capped, other})
+	mustRegister(t, a, NodeRegistration{
+		Name: "host", Provider: config.ProviderFirecracker, VCPU: 16, Memory: 32 * config.GiB,
+	})
+
+	reserve(t, a, "capped")
+	reserve(t, a, "other")
+
+	if got := admissionOf(t, a, "capped"); got.CeilingBound {
+		t.Errorf("tier capped reports %+v; it holds its whole max_concurrent, so the ceiling "+
+			"is not what refuses it", got)
+	}
+
+	if got := admissionOf(t, a, "other"); !got.CeilingBound {
+		t.Errorf("tier other reports %+v; its host has room and the ceiling is spent", got)
 	}
 }
 
@@ -239,10 +319,10 @@ func TestTheAdmissionSaysWhenTheDeploymentCeilingIsShared(t *testing.T) {
 //
 // A lease on a host the fleet no longer contains holds its shape against the
 // deployment until something proves its compute gone, and no live host can use
-// what it holds. Measured against the ceiling's face value, a deployment whose
-// ceiling exactly matches its hosts reports the ceiling as nobody's constraint
-// while that charge is making it everybody's.
-func TestAChargeOnADepartedHostMakesTheCeilingShared(t *testing.T) {
+// what it holds. The waiter it starves has a host with room and no ceiling,
+// which is exactly ceiling-bound, with nothing special done for the stranded
+// charge.
+func TestAChargeOnADepartedHostMakesAWaiterCeilingBound(t *testing.T) {
 	big := tier("big", 8, 16*config.GiB)
 	small := tier("small", 4, 8*config.GiB)
 
@@ -272,8 +352,8 @@ func TestAChargeOnADepartedHostMakesTheCeilingShared(t *testing.T) {
 		}
 	}
 
-	// The same host leaves in both cases, so the surviving fleet is the same
-	// sixteen vCPU; only the lease left behind on it differs.
+	// The same host leaves in both cases and the same small job runs on a
+	// survivor; only the lease left behind on the departed host differs.
 	quiet, quietEpoch := fleet(t)
 	survivors(t, quiet)
 
@@ -281,9 +361,11 @@ func TestAChargeOnADepartedHostMakesTheCeilingShared(t *testing.T) {
 		t.Fatalf("withdraw leaving: %v", err)
 	}
 
-	if got := admissionOf(t, quiet, "small"); got.CeilingShared {
-		t.Fatalf("tier small reports %+v on a fleet its ceiling exactly matches; this case "+
-			"cannot tell a stranded charge from the ceiling itself", got)
+	reserve(t, quiet, "small")
+
+	if got := admissionOf(t, quiet, "big"); got.CeilingBound {
+		t.Fatalf("tier big reports %+v with twelve of the sixteen vCPU free; this case cannot "+
+			"tell a stranded charge from the ceiling itself", got)
 	}
 
 	// The same fleet, with eight vCPU of it charged to a lease on the host that
@@ -297,11 +379,10 @@ func TestAChargeOnADepartedHostMakesTheCeilingShared(t *testing.T) {
 		t.Fatalf("withdraw leaving: %v", err)
 	}
 
-	for _, label := range []string{"big", "small"} {
-		if got := admissionOf(t, stranded, label); !got.CeilingShared {
-			t.Errorf("tier %s reports %+v; eight of the sixteen vCPU the deployment may spend "+
-				"are held by a lease on a host that is gone, so both tiers are buying what is "+
-				"left of one pot", label, got)
-		}
+	reserve(t, stranded, "small")
+
+	if got := admissionOf(t, stranded, "big"); !got.CeilingBound {
+		t.Errorf("tier big reports %+v; a host of its has room, and the eight vCPU it needs are "+
+			"held by a lease on a host that is gone and the small job, so the ceiling refuses it", got)
 	}
 }

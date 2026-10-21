@@ -54,24 +54,27 @@ type TierAdmission struct {
 	// admit this tier's shape. Two tiers compete for host room only where these
 	// overlap.
 	Nodes []string
-	// CeilingShared reports that the deployment's own vCPU or memory ceiling is
-	// smaller than what the live hosts could hold, which makes it one pot every
-	// tier buys from. It is a fact about the deployment rather than about this
-	// tier, and it is carried per tier because a waiter is judged by the view it
-	// last saw.
+	// CeilingBound reports that the deployment ceiling is what refuses this tier
+	// one more now: its hosts could place one, with current work and other
+	// tiers' outstanding floors charged, and the ceiling will not let it. Every
+	// purchase anywhere spends the ceiling, so such a waiter competes with every
+	// buyer; a waiter whose own hosts are full competes only with the buyers on
+	// them.
 	//
-	// A PER-TIER TEST WAS NOT ENOUGH. Asking whether the ceiling cut THIS tier's
-	// own total said no for two tiers that each fit under it alone — an 8 vCPU
-	// tier on one host, a 4 vCPU tier on another, an 8 vCPU ceiling — while the
-	// two of them together could not, so a stream of the small one starved the
-	// large one on a fleet where they shared no host.
-	CeilingShared bool
+	// A FACT ABOUT THE WAITER, NOT THE DEPLOYMENT (#187). The flag it replaced
+	// said the ceiling was one pot whenever it sat below what the live hosts
+	// could hold, which held for every tier at once: a ceiling two vCPU below the
+	// hosts had a tier waiting for a Mac's macOS slot hold every Linux tier on
+	// another machine, though room freed on Linux could never reach it. It is
+	// refreshed at every refusal, like Nodes and ShareBound, so a host-bound
+	// waiter that a purchase elsewhere leaves short of ceiling is ceiling-bound
+	// from its next refusal; that one purchase is what it can lose.
+	CeilingBound bool
 	// Target is the target this tier's share is keyed by.
 	Target string
 	// TargetShared reports that the target has a share, which makes it one pot
-	// its tiers buy from wherever their hosts are, as CeilingShared does for the
-	// deployment: two tiers of it pinned to different hosts still take room from
-	// each other.
+	// its tiers buy from wherever their hosts are: two tiers of it pinned to
+	// different hosts still take room from each other.
 	TargetShared bool
 	// ShareBound reports that this tier's own target share, not the fleet, is
 	// what stops it buying one more now. Room another target's jobs free can
@@ -104,11 +107,6 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 		// cannot grow, and starve it. The tier's own cap is a different question,
 		// asked below over every lease.
 		held, err := a.countOpenPerTier(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		shared, err := a.ceilingSharedOver(ctx, tx, nodes)
 		if err != nil {
 			return err
 		}
@@ -151,7 +149,7 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 				grow = room > 0
 			}
 
-			bound, err := a.shareBound(ctx, tx, t)
+			bound, err := a.boundBy(ctx, tx, t)
 			if err != nil {
 				return err
 			}
@@ -159,8 +157,8 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 			_, hasShare := a.limits.Shares[config.ShareTarget(t)]
 
 			out[label] = TierAdmission{
-				CanGrow: grow, Nodes: p.nodes, CeilingShared: shared,
-				Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound,
+				CanGrow: grow, Nodes: p.nodes, CeilingBound: bound.ceiling,
+				Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound.share,
 			}
 		}
 
@@ -213,49 +211,6 @@ func (a *Allocator) sortedLabels() []string {
 	slices.Sort(labels)
 
 	return labels
-}
-
-// ceilingSharedOver reports whether the deployment's own ceiling is smaller than
-// what these hosts could hold, which is what makes it one pot every tier buys
-// from rather than a number each tier meets on its own.
-//
-// WHAT IS CHARGED OFF THE FLEET IS SPENT, NOT FREE. A lease on a host the fleet
-// no longer contains, or one aimed at no host at all, holds its shape against
-// the ceiling until something proves its compute gone, and nothing on a live
-// host can use what it holds. Measured against the ceiling's face value, a
-// deployment whose ceiling exactly matched its hosts reported the ceiling as
-// nobody's constraint while a stranded charge was making it everybody's, and a
-// tier waiting on one host could not stop another replenishing a second.
-func (a *Allocator) ceilingSharedOver(ctx context.Context, tx querier, nodes []nodeRow) (bool, error) {
-	spent, err := a.usage(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-
-	byNode, err := a.usageByNode(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-
-	var (
-		vcpu     int
-		memory   config.ByteSize
-		onFleet  int
-		onFleetM config.ByteSize
-	)
-	for _, n := range nodes {
-		vcpu += n.vcpu
-		memory += n.memory
-
-		used := byNode[n.name]
-		onFleet += used.VCPU
-		onFleetM += used.Memory
-	}
-
-	elsewhere, elsewhereM := max(spent.VCPU-onFleet, 0), max(spent.Memory-onFleetM, 0)
-
-	return (a.limits.MaxVCPU > 0 && a.limits.MaxVCPU-elsewhere < vcpu) ||
-		(a.limits.MaxMemory > 0 && a.limits.MaxMemory-elsewhereM < memory), nil
 }
 
 // potentialIn computes one tier's potential inside an open ledger view.
