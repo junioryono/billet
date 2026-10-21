@@ -80,15 +80,19 @@ var ErrUnknown = errors.New("the path could not be derived on this host")
 // ErrNotAdmitted is a need not tried because a need it depends on was refused.
 var ErrNotAdmitted = errors.New("not tried: the exclusion before it was refused")
 
-// Unique is needs with every path cleaned and every repeated path and access
-// dropped, the first kept: a directory two declarations name, however spelled
-// (a certificate kept in a state directory configured with a trailing slash),
-// is one directory, written once.
+// Unique is needs with every repeated path and access dropped, the first kept:
+// a directory two declarations name, however spelled (a certificate kept in a
+// state directory configured with a trailing slash), is one directory, written
+// once. ONLY A DIRECTORY'S SPELLING IS CLEANED, and only one with no `..`: there
+// cleaning drops nothing but separators and `.`, which name the same directory,
+// while `..` after a link is not the link's parent, and a file named with a
+// trailing slash is not the file (the command opens it as spelled, and fails).
 func Unique(needs []Need) []Need {
 	out := make([]Need, 0, len(needs))
 
 	for _, n := range needs {
-		if n.Path != "" {
+		if (n.Access == Write || n.Access == Private) && n.Path != "" &&
+			!slices.Contains(strings.Split(n.Path, string(filepath.Separator)), "..") {
 			n.Path = filepath.Clean(n.Path)
 		}
 

@@ -14,8 +14,12 @@ fail() {
     exit 1
 }
 
-if ! dpkg -i /tmp/billet.deb >/tmp/dpkg.log 2>&1; then
-    cat /tmp/dpkg.log >&2
+# THROUGH apt, AS AN OPERATOR INSTALLS IT, so its dependencies (kmod and the
+# rest) come with it; `dpkg -i` alone leaves it unconfigured.
+if ! timeout -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+    -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt \
+    install -y -qq /tmp/billet.deb >/tmp/apt.log 2>&1; then
+    tail -30 /tmp/apt.log >&2
     fail "the package did not install"
 fi
 

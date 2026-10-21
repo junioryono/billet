@@ -163,8 +163,19 @@ func TestUniqueKeepsTheFirstOfEachPathAndAccess(t *testing.T) {
 	})
 
 	if len(got) != 3 || !got[0].Create || got[0].Path != "/var/lib/billet/node" ||
-		got[2].Access != Read || got[2].Path != "/var/lib/billet/node" {
+		got[2].Access != Read || got[2].Path != "/var/lib/billet//node" {
 		t.Errorf("Unique answered %+v", got)
+	}
+
+	// A FILE IS OPENED AS SPELLED, and `..` after a link is not the link's
+	// parent: neither is rewritten.
+	kept := Unique([]Need{
+		{Path: "/etc/billet/app-private-key.pem/", Access: Read},
+		{Path: "/var/lib/link/../kernels", Access: Write},
+	})
+
+	if kept[0].Path != "/etc/billet/app-private-key.pem/" || kept[1].Path != "/var/lib/link/../kernels" {
+		t.Errorf("Unique rewrote what it may not: %+v", kept)
 	}
 }
 

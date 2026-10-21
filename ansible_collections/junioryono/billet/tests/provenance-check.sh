@@ -44,9 +44,15 @@ command -v ansible-playbook >/dev/null || { echo "provenance-check: no ansible-p
 
 work=$(mktemp -d)
 origin_pid=""
+# PROVENANCE_CHECK_KEEP=1 keeps the work directory (every case's log, the
+# origin, the overlays' uppers) for a failure's diagnosis.
 cleanup() {
     [ -z "$origin_pid" ] || kill "$origin_pid" 2>/dev/null || true
-    sudo -n rm -rf "$work"
+    if [ "${PROVENANCE_CHECK_KEEP:-0}" = 1 ]; then
+        echo "provenance-check: the work directory is kept at $work"
+    else
+        sudo -n rm -rf "$work"
+    fi
 }
 trap cleanup EXIT
 
@@ -260,7 +266,8 @@ run no-manifest v0.16.11
 [ ! -e "$stage/billet-v0.16.11.release-manifest.json" ] || fail "no-manifest: a 404 was kept as a manifest"
 [ ! -e "$record" ] || fail "no-manifest: something was recorded"
 grep -q 'publishes no release-manifest.json' "$work/no-manifest.log" || fail "no-manifest: the absence was not said" "$work/no-manifest.log"
-cp "$work/dist-v0.16.11/release-manifest.json" "$work/origin/v0.16.11/release-manifest.json"
+# PUBLISHED READABLE: this runs as root, and the origin serves as the caller.
+install -m 0644 "$work/dist-v0.16.11/release-manifest.json" "$work/origin/v0.16.11/release-manifest.json"
 run no-manifest v0.16.11
 [ -f "$record" ] || fail "no-manifest: a manifest published after its archive was never found" "$work/no-manifest.log"
 [ "$(field manifest_digest)" = "$(sha "$work/origin/v0.16.11/release-manifest.json")" ] ||
