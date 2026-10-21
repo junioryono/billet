@@ -435,6 +435,10 @@ exit 0
 				if strings.Contains(readCalls(t, calls), "git push") {
 					t.Error("the tag was pushed for a publication that was then refused")
 				}
+				// AND NOT EVEN LOCALLY: every check precedes the tag.
+				if strings.Contains(readCalls(t, calls), "git tag") {
+					t.Error("the tag was made for a publication that was then refused")
+				}
 
 				return
 			}
