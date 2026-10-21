@@ -621,6 +621,76 @@ func TestADrainWaitsForCountsFromWhenTheLedgerWentQuiet(t *testing.T) {
 	}
 }
 
+// AND THE WAIT IS A WAIT: a count made fresh while the drain waits is read and
+// trusted. The last lease closes after the seal, so every count the drain finds
+// when the ledger goes quiet is stale; the listeners count again six seconds
+// later, after that first quiet sample, and the drain must end Drained on their
+// new counts rather than having already said unknown.
+func TestADrainTrustsACountMadeFreshWhileItWaits(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	lease := outstandingLease(t, db, cfg)
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	a, err := alloc.New(db, alloc.Limits{
+		MaxVCPU: cfg.Server.MaxVCPU, MaxMemory: cfg.Server.MaxMemory, Nodes: cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		t.Fatalf("allocator: %v", err)
+	}
+
+	saved := demandCountWithin
+	demandCountWithin = 30 * time.Second
+
+	t.Cleanup(func() { demandCountWithin = saved })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+
+	counted := make(chan struct{})
+
+	go func() {
+		defer close(counted)
+
+		waitUntilSealed(t, db, 30*time.Second)
+		time.Sleep(drainPollInterval)
+
+		if err := a.Release(context.WithoutCancel(ctx), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+			t.Errorf("Release: %v", err)
+
+			return
+		}
+
+		time.Sleep(drainPollInterval + time.Second)
+
+		for i := range cfg.Tiers {
+			if err := recordDemand(context.WithoutCancel(ctx), db, cfg, cfg.Tiers[i].Label, &none,
+				time.Now().Add(time.Hour)); err != nil {
+				t.Errorf("count %s again: %v", cfg.Tiers[i].Label, err)
+			}
+		}
+	}()
+
+	out := capture(t, func() {
+		if err := Drain(ctx, processEnv(), []string{
+			"--config", cfgPath, "--wait", "--without-compute-proof",
+		}); err != nil {
+			t.Errorf("drain --wait: %v", err)
+		}
+	})
+
+	<-counted
+
+	if !strings.Contains(out, "Drained") || strings.Contains(out, "unknown") {
+		t.Errorf("a drain did not wait for and trust the counts made after the last close:\n%s", out)
+	}
+}
+
 // AND A GENERATION THAT CANNOT BE READ TRUSTS NO COUNT: read as none, every
 // count published at generation zero would match it.
 func TestADrainTrustsNoCountWhenItCannotReadTheReleases(t *testing.T) {
