@@ -85,6 +85,11 @@ func publishDump(ctx context.Context, res *Result, req RestoreRequest, j *journa
 //
 // A JOURNAL THAT RECORDS WORK AND NO DATABASE COULD NOT TELL where that work
 // went, and is refused rather than read as "anywhere".
+//
+// SAVED ON EVERY PASS, a resume included, before anything is written to the
+// database: the run that first recorded it may have died before that save was
+// durable, and a database write the journal cannot place is the state this
+// exists to prevent.
 func bindLedgerDatabase(stateDir string, j *journal, led state.PostgresLedger) error {
 	switch {
 	case led.Database == "":
@@ -96,15 +101,13 @@ func bindLedgerDatabase(stateDir string, j *journal, led state.PostgresLedger) e
 			led.Database)
 	case j.LedgerDatabase == "":
 		j.LedgerDatabase = led.Database
-
-		return j.save(stateDir)
 	case led.Database != j.LedgerDatabase:
 		return fmt.Errorf("deployarchive: this run began writing the ledger in database %s and "+
 			"the connection now reaches %s; billet will not write a ledger into a database it "+
 			"did not start in", j.LedgerDatabase, led.Database)
 	}
 
-	return nil
+	return j.save(stateDir)
 }
 
 // restoreArchiveDump restores the archive's dump through a copy verified

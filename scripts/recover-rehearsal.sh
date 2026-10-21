@@ -67,7 +67,11 @@ cleanup() {
         docker exec "${node}" journalctl -u billet-node -n 40 --no-pager -o cat 2>&1 | tail -40 || true
     fi
 
-    rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"
+    # A HOST, NETWORK OR STORAGE LEFT BEHIND FAILS THE RUN, so a green rehearsal
+    # never hides something an operator has to remove by hand.
+    if ! rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"; then
+        if [ "${status}" -eq 0 ]; then status=1; fi
+    fi
     rm -rf "${work}" || true
     exit "${status}"
 }

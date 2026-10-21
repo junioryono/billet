@@ -150,7 +150,7 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	// served nothing a recovery could put back.
 	if p.Intent == ReplaceLedger {
 		switch {
-		case p.refuseHierarchy(led):
+		case p.refuseUnreplaceableSchema(led):
 			return nil
 		case slices.ContainsFunc(led.Tables, func(t string) bool { return strings.ContainsFunc(t, unicode.IsSpace) }):
 			// REFUSED BEFORE THE QUIESCE AND THE FENCE: the copy this recovery takes
@@ -199,7 +199,7 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	case len(led.Tables) == 0:
 		// A HIERARCHY THE ROLE CANNOT SEE: information_schema lists only the
 		// tables billet's role has a privilege on, and the catalogue every one.
-		if !p.refuseHierarchy(led) {
+		if !p.refuseUnreplaceableSchema(led) {
 			p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: Install})
 		}
 	case (led.Binding == deployment || led.Populated && p.Target.ExternalLedgerAttached) &&
@@ -262,7 +262,7 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 			Remedy: "pg_restore would leave that billet's newer tables beside the restored ledger; " +
 				"empty the schema and run this again",
 		})
-	case p.refuseHierarchy(led):
+	case p.refuseUnreplaceableSchema(led):
 	default:
 		p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: ReplaceEmptyLedger})
 	}
@@ -270,15 +270,16 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	return nil
 }
 
-// refuseHierarchy refuses, and reports that it did, a schema holding a table
-// hierarchy, for the dispositions that replace the ledger in it.
+// refuseUnreplaceableSchema refuses, and reports that it did, a schema a restore
+// cannot replace the ledger in: one whose name has whitespace in it, or one
+// holding a table hierarchy. For the dispositions that replace the ledger.
 //
 // REFUSED AT THE PLAN, before a recovery seals, fences or copies anything: the
 // cleanup refuses a hierarchy anywhere in the schema, and so would an abandon's
 // put-back, which would leave the deployment fenced over a database billet never
 // changed. A restore that keeps the database's own ledger writes nothing there
 // and is not refused.
-func (p *Plan) refuseHierarchy(led state.PostgresLedger) bool {
+func (p *Plan) refuseUnreplaceableSchema(led state.PostgresLedger) bool {
 	// A SCHEMA NAME pg_restore's LIST CANNOT CARRY is refused here too, for the
 	// same reason: pgdump.Restore refuses it, after a recovery has sealed and
 	// fenced, and so would the abandon's put-back.

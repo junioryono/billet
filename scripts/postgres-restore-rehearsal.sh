@@ -429,7 +429,7 @@ admitted=$(runuser -u postgres -- psql -d billet -tAc \
 case "${admitted}" in
     'node-a,node-b,node-post') ;;
     *)
-        fail "the ledger holds admissions for [${admitted}] and it must hold both node-a, which the ORIGINAL deployment issued, and node-b, which the RESTORED one did — anything less means the identity and the ledger were never paired"
+        fail "the ledger holds admissions for [${admitted}] and it must hold node-a, which the ORIGINAL deployment issued, node-b, which the RESTORED one did, and node-post, admitted on the surviving database after the backup — anything less means the identity and the ledger were never paired, or the ledger was not the one kept"
         ;;
 esac
 

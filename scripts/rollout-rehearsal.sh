@@ -1,8 +1,8 @@
 #!/bin/bash
 # The rollout rehearsal: a packaged control plane and a packaged node, both on
 # release FROM under real systemd, moved to release TO by `billet rollout start`
-# and nothing else, then asked to take a candidate that cannot serve them and
-# proved to refuse it before any host is touched.
+# and the controller's own upgrade unit, then asked to take a candidate that
+# cannot serve them and proved to refuse it before any host is touched.
 #
 # WHAT THIS PROVES THAT NO TEST DOES. `internal/ops/host/hostupgrade.go` stops a
 # service, replaces a binary and migrates a ledger; every test of it supplies a
@@ -10,9 +10,11 @@
 # the doing happens: systemd's `Type=notify` start, the packaged units, the
 # service account's ownership of the ledger, the detached updater surviving the
 # node that started it, the coordinator observing a real registration on the
-# target, and the controller's own upgrade through the root timer the package
-# enables (from v0.6.0; on an older FROM the controller is upgraded the way its
-# documentation of the day said, by running `billet host-upgrade` on it).
+# target, and the controller's own upgrade through the unit the package's root
+# timer runs, which the rehearsal starts rather than waiting up to five minutes
+# for the tick, so the timer's own firing is not what this proves (from v0.6.0;
+# on an older FROM the controller is upgraded the way its documentation of the
+# day said, by running `billet host-upgrade` on it).
 #
 # THE FAILING CANDIDATE IS A DOWNGRADE, because a rehearsal that runs on the day
 # a release is cut has exactly two releases to work with. FROM cannot open the
@@ -112,7 +114,11 @@ cleanup() {
         docker exec "${node}" journalctl -u billet-node -n 40 --no-pager -o cat 2>&1 | tail -40 || true
     fi
 
-    rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"
+    # A HOST, NETWORK OR STORAGE LEFT BEHIND FAILS THE RUN, so a green rehearsal
+    # never hides something an operator has to remove by hand.
+    if ! rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"; then
+        if [ "${status}" -eq 0 ]; then status=1; fi
+    fi
     rm -rf "${work}" || true
     exit "${status}"
 }

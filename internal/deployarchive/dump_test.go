@@ -1924,3 +1924,19 @@ func TestASchemaNameTheListCannotCarryIsRefusedAtThePlan(t *testing.T) {
 		t.Errorf("a recovery over a schema named %q was planned: %+v", spaced, p.Refusals)
 	}
 }
+
+// THE JOURNALED DATABASE IS SAVED ON EVERY WRITING PASS, a resume that finds it
+// already recorded included: the run that recorded it may have died before that
+// save was durable, and a failed save writes nothing to the database.
+func TestTheJournaledDatabaseIsSavedOnEveryPass(t *testing.T) {
+	prev := saveJournalHook
+	saveJournalHook = func() error { return errStopHere }
+
+	t.Cleanup(func() { saveJournalHook = prev })
+
+	j := journal{LedgerDatabase: dumpDatabase}
+
+	if err := bindLedgerDatabase(t.TempDir(), &j, state.PostgresLedger{Database: dumpDatabase}); !errors.Is(err, errStopHere) {
+		t.Fatalf("binding a run to the database it already recorded = %v, want the save's failure", err)
+	}
+}
