@@ -75,6 +75,8 @@ type gitUpstream struct {
 	refuse atomic.Bool
 	// hold, when set, holds the node's own fetches until it is closed.
 	hold atomic.Pointer[chan struct{}]
+	// onMirrorFetch, when set, runs as each of the node's own fetches arrives.
+	onMirrorFetch atomic.Pointer[func()]
 	// ids is the id each repository name is, as GitHub's REST API answers
 	// `GET /repos/{owner}/{repo}` under /api; apiDown makes it answer 503.
 	ids      sync.Map
@@ -275,6 +277,9 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 			}
 			if bytes.Contains(plain, []byte("command=fetch")) {
 				upstream.mirrorFetches.Add(1)
+				if hook := upstream.onMirrorFetch.Load(); hook != nil {
+					(*hook)()
+				}
 				if gate := upstream.hold.Load(); gate != nil {
 					select {
 					case <-*gate:

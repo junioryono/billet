@@ -47,7 +47,8 @@ func (u *gitUpstream) guestFetches() int64 { return u.fetches.Load() - u.mirrorF
 // gitWrapper puts a git in front of the node's that answers every fetch served
 // from the mirror as mode's file says: "refuse" with an ERR line, "silent" with
 // nothing at all, "hang" with nothing for ten minutes, "nakfail" with a NAK and
-// then a failure, anything else as git would.
+// then a failure, "slow" as git would a second after touching mode.started,
+// anything else as git would.
 func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 	t.Helper()
 
@@ -64,6 +65,7 @@ func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 		"  refuse) printf '0017ERR forced refusal\\n'; exit 1 ;;\n" +
 		"  silent) exit 128 ;;\n" +
 		"  hang) sleep 600; exit 128 ;;\n" +
+		"  slow) : >" + mode + ".started; sleep 1 ;;\n" +
 		"  nakfail) printf '0008NAK\\n'; exit 128 ;;\n" +
 		"  esac ;;\n" +
 		"esac\n" +

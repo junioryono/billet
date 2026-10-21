@@ -149,8 +149,9 @@ func TestAMirrorThatFailsMidAnswerIsReplaced(t *testing.T) {
 	if output, err := git("-C", "c", "pull", "-q", "--ff-only"); err == nil {
 		t.Fatalf("a pull whose serve failed mid-answer succeeded, so the failure was never staged:\n%s", output)
 	}
-	if !service.git.isBroken("untrusted/acme/api") {
-		t.Fatal("the mirror whose serve failed mid-answer was not marked broken")
+	path := service.git.mirrorPath("untrusted/acme/api")
+	if _, _, err := mirrorRepository(path); !errors.Is(err, errMirrorUnverified) {
+		t.Fatalf("the mirror whose serve failed mid-answer reads %v, want it marked unverified on disk", err)
 	}
 
 	if err := os.WriteFile(mode, []byte("pass"), 0o600); err != nil {
@@ -163,8 +164,8 @@ func TestAMirrorThatFailsMidAnswerIsReplaced(t *testing.T) {
 	if output, err := git("-C", "c", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(output) != pushed {
 		t.Fatalf("the pull is at %q (%v), want %s", output, err, pushed)
 	}
-	if service.git.isBroken("untrusted/acme/api") {
-		t.Fatal("the broken mark outlived the mirror it was on")
+	if stamped, _, err := mirrorRepository(path); err != nil || stamped != upstream.repositoryID("api") {
+		t.Fatalf("the mirror after the broken one reads %d, %v; want a verified mirror of the repository", stamped, err)
 	}
 	if !strings.Contains(log.String(), "removed a git mirror it could not serve") {
 		t.Fatalf("the broken mirror's removal was not logged:\n%s", log.String())
@@ -241,5 +242,158 @@ func TestNoRefreshStartsOnceTheProxyCloses(t *testing.T) {
 	}
 	if _, err := os.Stat(service.git.mirrorPath(request.key())); err == nil {
 		t.Fatal("a refresh after close made a mirror")
+	}
+}
+
+// A MIRROR LEFT UNVERIFIED WHILE A FETCH WAITS FOR ITS FIRST LINE IS NOT
+// SERVED: the last check before an answer commits reads the mirror again, as a
+// refresh sharing the request's hold can mark it while the request waits.
+func TestAMirrorUnverifiedMidRequestIsNotServed(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, token := gitNode(t, upstream)
+	mode := gitWrapper(t, service)
+	git := gitClient(t, node, token, githubBasic)
+	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, output)
+	}
+	pushed := upstream.commitTo(t, "main", map[string]string{"f": "1\n"})
+	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
+		t.Fatalf("ls-remote: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(mode, []byte("slow"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := service.git.mirrorPath("untrusted/acme/api")
+	before := upstream.guestFetches()
+	type pulled struct {
+		output string
+		err    error
+	}
+	done := make(chan pulled, 1)
+	go func() {
+		output, err := git("-C", "c", "pull", "-q", "--ff-only")
+		done <- pulled{output, err}
+	}()
+	gitWithin(t, "the mirror's upload-pack to start", func() struct{} {
+		for t.Context().Err() == nil {
+			if _, err := os.Stat(mode + ".started"); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		return struct{}{}
+	})
+	if err := markUnverified(path); err != nil {
+		t.Fatal(err)
+	}
+	result := gitWithin(t, "the pull", func() pulled { return <-done })
+	if result.err != nil {
+		t.Fatalf("the pull: %v\n%s", result.err, result.output)
+	}
+	if output, err := git("-C", "c", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(output) != pushed {
+		t.Fatalf("the pull is at %q (%v), want %s", output, err, pushed)
+	}
+	if upstream.guestFetches() == before {
+		t.Fatal("a mirror marked unverified while the fetch waited was served")
+	}
+}
+
+// A FETCH IS VERIFIED ONLY BY GITHUB NAMING THE SAME REPOSITORY AFTER IT: a name
+// that passed to another repository while the node fetched it, or an API that
+// could not say, leaves the mirror unverified on disk, served to no one, and
+// the next advertisement replaces it.
+func TestAFetchGitHubCannotVouchForLeavesTheMirrorUnverified(t *testing.T) {
+	t.Parallel()
+
+	for name, during := range map[string]func(*gitUpstream){
+		"the name changed hands": func(u *gitUpstream) { u.ids.Store("api", u.nextID.Add(1)) },
+		"the API could not say":  func(u *gitUpstream) { u.apiDown.Store(true) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			upstream := newGitUpstream(t)
+			service, node, token := gitNode(t, upstream)
+			git := gitClient(t, node, token, githubBasic)
+			if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
+				t.Fatalf("clone: %v\n%s", err, output)
+			}
+			path := service.git.mirrorPath("untrusted/acme/api")
+			if _, _, err := mirrorRepository(path); err != nil {
+				t.Fatalf("the first mirror is not verified, so what follows proves nothing: %v", err)
+			}
+
+			hook := func() { during(upstream) }
+			upstream.onMirrorFetch.Store(&hook)
+			pushed := upstream.commitTo(t, "main", map[string]string{"f": "1\n"})
+			before := upstream.guestFetches()
+			if output, err := git("-C", "c", "pull", "-q", "--ff-only"); err != nil {
+				t.Fatalf("a pull beside an unverified fetch: %v\n%s", err, output)
+			}
+			if output, err := git("-C", "c", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(output) != pushed {
+				t.Fatalf("the pull is at %q (%v), want %s", output, err, pushed)
+			}
+			if _, _, err := mirrorRepository(path); !errors.Is(err, errMirrorUnverified) {
+				t.Fatalf("the mirror after a fetch GitHub did not vouch for reads %v, want unverified", err)
+			}
+			if upstream.guestFetches() == before {
+				t.Fatal("the pull was served from a mirror GitHub had not vouched for")
+			}
+
+			upstream.onMirrorFetch.Store(nil)
+			upstream.apiDown.Store(false)
+			if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
+				t.Fatalf("ls-remote: %v\n%s", err, output)
+			}
+			if stamped, _, err := mirrorRepository(path); err != nil || stamped != upstream.repositoryID("api") {
+				t.Fatalf("the unverified mirror was not replaced by a verified one: %d, %v", stamped, err)
+			}
+		})
+	}
+}
+
+// THE REAPER TAKES ONLY WHAT A CLAIM RENAMED ASIDE, under a directory no
+// repository's mirror can be named, and only once the claim has had its time
+// to delete it: a repository whose name looks like a discard is a mirror.
+func TestTheReaperTakesOnlyDiscardedMirrors(t *testing.T) {
+	t.Parallel()
+
+	service, _, _, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
+	service.git.fullFraction = 1
+	now := time.Now()
+	service.now = func() time.Time { return now }
+	live := service.git.mirrorPath("untrusted/acme/api.git.discard-demo")
+	if err := os.MkdirAll(live, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(live, gitUsedStamp), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// THE LIVE MIRROR'S DIRECTORY IS AS OLD AS A LEFTOVER DISCARD, so only its
+	// name keeps it, not its age; its stamp says it was used now.
+	if err := os.Chtimes(live, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	discards := filepath.Join(service.git.root, gitDiscardDirectory)
+	old, young := filepath.Join(discards, "mirror-old"), filepath.Join(discards, "mirror-young")
+	for _, dir := range []string{old, young} {
+		if err := os.MkdirAll(filepath.Join(dir, "mirror.git", "objects"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(old, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.ReapGitMirrors(t.Context()); err != nil {
+		t.Fatalf("ReapGitMirrors: %v", err)
+	}
+	for path, want := range map[string]bool{live: true, old: false, young: true} {
+		if _, err := os.Stat(path); (err == nil) != want {
+			t.Errorf("%s kept = %v, want %v", path, err == nil, want)
+		}
 	}
 }

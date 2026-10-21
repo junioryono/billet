@@ -183,8 +183,6 @@ type gitProxy struct {
 	mirrors    map[string]*gitMirror
 	authorised map[string]gitAuthorisation
 	tooLarge   map[string]time.Time
-	// broken holds the mirrors a serve failed in after its answer had begun.
-	broken map[string]bool
 	// renamed maps a repository GitHub redirected to where it now lives.
 	renamed map[string]gitRename
 	// sequence orders GitHub's answers, so a later one always wins over an
@@ -253,7 +251,6 @@ func newGitProxy(root string) *gitProxy {
 		work:          make(chan struct{}, gitWork),
 		mirrors:       make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
 		tooLarge: make(map[string]time.Time),
-		broken:   make(map[string]bool),
 		renamed:  make(map[string]gitRename),
 	}
 }
@@ -1225,18 +1222,33 @@ func (s *CacheService) refreshMirror(
 // A mirror stamped with another repository, or with none it can read, was
 // fetched from a repository the name no longer is (one renamed or deleted, and
 // another given its name) and holds objects this one's jobs may not have, so
-// it is removed before anything of it is served. So is one a failed serve
-// marked broken. One in use is left, and GitHub answers until it is free.
+// it is removed before anything of it is served. So is one marked unverified
+// by a fetch that did not end in a matching id, or by a serve that failed
+// mid-answer, unless that fetch is still running, which this request joins.
+// One in use is left, and GitHub answers until it is free.
 func (s *CacheService) claimMirror(
 	ctx context.Context, request gitRequest, mirror *gitMirror, path string, repository int64,
 ) error {
-	key := request.key()
+	keep := func(stamped int64, exists bool, err error) bool {
+		switch {
+		case !exists:
+			return true
+		case errors.Is(err, errMirrorUnverified):
+			mirror.mu.Lock()
+			refreshing := mirror.refreshing != nil
+			mirror.mu.Unlock()
+
+			return refreshing && stamped == repository
+		default:
+			return err == nil && stamped == repository
+		}
+	}
 	if !rlockWithin(ctx, &mirror.use) {
 		return context.Cause(ctx)
 	}
 	stamped, exists, err := mirrorRepository(path)
 	mirror.use.RUnlock()
-	if !exists || err == nil && stamped == repository && !s.git.isBroken(key) {
+	if keep(stamped, exists, err) {
 		return nil
 	}
 	if !lockWithin(ctx, &mirror.use, s.git.refreshWait) {
@@ -1244,20 +1256,26 @@ func (s *CacheService) claimMirror(
 	}
 	defer mirror.use.Unlock()
 	stamped, exists, err = mirrorRepository(path)
-	broken := s.git.isBroken(key)
-	if !exists || err == nil && stamped == repository && !broken {
+	if keep(stamped, exists, err) {
 		return nil
 	}
 	s.log.Info("removed a git mirror it could not serve", "repository", request.name(),
-		"stamped", stamped, "repository_id", repository, "broken", broken, "error", err)
+		"stamped", stamped, "repository_id", repository, "error", err)
 	// RENAMED ASIDE AT ONCE, DELETED AFTER: deleting a large mirror takes as
-	// long as its files, which no advertisement waits for. A name the deletion
-	// never finished is the reaper's.
-	discarded := path + gitDiscardSuffix + strconv.FormatInt(time.Now().UnixNano(), 36)
-	if err := os.Rename(path, discarded); err != nil {
+	// long as its files, which no advertisement waits for. It goes under a name
+	// no repository can have (gitSegment refuses a leading dot), and one whose
+	// deletion never finished is the reaper's.
+	discards := filepath.Join(s.git.root, gitDiscardDirectory)
+	if err := os.MkdirAll(discards, 0o700); err != nil {
 		return err
 	}
-	s.git.clearBroken(key)
+	discarded, err := os.MkdirTemp(discards, "mirror-")
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(path, filepath.Join(discarded, "mirror.git")); err != nil {
+		return errors.Join(err, os.Remove(discarded))
+	}
 	s.git.goBackground(func() {
 		if err := os.RemoveAll(discarded); err != nil {
 			s.log.Warn("could not delete a discarded git mirror; the reaper will", "error", err)
@@ -1267,8 +1285,44 @@ func (s *CacheService) claimMirror(
 	return nil
 }
 
-// gitDiscardSuffix marks a mirror renamed aside to be deleted.
-const gitDiscardSuffix = ".discard-"
+// gitDiscardDirectory holds mirrors renamed aside to be deleted, under the
+// mirrors' root: no repository's mirror can be named so.
+const gitDiscardDirectory = ".discarded"
+
+// gitUnverifiedStamp marks a mirror whose objects may not all be its
+// repository's: written before a fetch begins and removed only once GitHub
+// names the same repository after it, and written by a serve that failed
+// mid-answer. A mirror carrying it is never served, never fetched into, and
+// replaced, on disk so a restart forgets nothing of it.
+const gitUnverifiedStamp = "billet-unverified"
+
+// errMirrorUnverified says a mirror carries gitUnverifiedStamp.
+var errMirrorUnverified = errors.New("the mirror's last fetch or serve was not verified")
+
+// markUnverified writes gitUnverifiedStamp into the mirror at path.
+func markUnverified(path string) error {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	return root.WriteFile(gitUnverifiedStamp, nil, 0o600)
+}
+
+// markVerified removes gitUnverifiedStamp from the mirror at path.
+func markVerified(path string) error {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := root.Remove(gitUnverifiedStamp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	return nil
+}
 
 // goBackground runs work on the proxy's background, which close joins; once
 // close has begun, the work is not started and its leftovers are the reaper's.
@@ -1283,7 +1337,8 @@ func (g *gitProxy) goBackground(work func()) {
 
 // mirrorRepository is the repository a mirror at path was fetched from, and
 // whether a mirror is there at all. A mirror whose stamp is missing or cannot
-// be read is one billet cannot say is any repository's.
+// be read is one billet cannot say is any repository's; one marked unverified
+// answers its stamp with errMirrorUnverified.
 func mirrorRepository(path string) (int64, bool, error) {
 	root, err := os.OpenRoot(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -1300,6 +1355,11 @@ func mirrorRepository(path string) (int64, bool, error) {
 	id, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
 	if err != nil || id <= 0 {
 		return 0, true, fmt.Errorf("the mirror's repository stamp %q is unreadable", boundedOutput(raw))
+	}
+	// COULD NOT TELL IS NOT ABSENT: only a stamp proved missing leaves the
+	// mirror verified.
+	if _, err := root.Stat(gitUnverifiedStamp); !errors.Is(err, fs.ErrNotExist) {
+		return id, true, errors.Join(errMirrorUnverified, err)
 	}
 
 	return id, true, nil
@@ -1320,28 +1380,6 @@ func rlockWithin(ctx context.Context, l *sync.RWMutex) bool {
 	}
 
 	return true
-}
-
-// markBroken records that serving from the mirror at key failed after its
-// answer had begun, so the next advertisement removes it rather than serving
-// it again.
-func (g *gitProxy) markBroken(key string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.broken[key] = true
-}
-
-func (g *gitProxy) isBroken(key string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	return g.broken[key]
-}
-
-func (g *gitProxy) clearBroken(key string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	delete(g.broken, key)
 }
 
 // heldRefs is the mirror's refs and what its HEAD names, read while the mirror
@@ -1459,10 +1497,11 @@ func (s *CacheService) refreshHeld(ctx context.Context, request gitRequest, repo
 
 		return errors.New("the git cache's filesystem is full")
 	}
-	// NEVER FETCHED INTO ANOTHER REPOSITORY'S MIRROR: the claim removes one, and
-	// a refresh that finds one meanwhile leaves it to be removed.
+	// NEVER FETCHED INTO ANOTHER REPOSITORY'S MIRROR, nor one left unverified:
+	// the claim removes either, and a refresh that finds one meanwhile leaves
+	// it to be removed.
 	if stamped, exists, err := mirrorRepository(path); exists && (err != nil || stamped != repository) {
-		return errors.New("the mirror is another repository's")
+		return errors.Join(errors.New("the mirror is another repository's or unverified"), err)
 	}
 	// THE ONLY WRITER IS THIS REFRESH, one per mirror at a time, so a lock file
 	// or a half-written pack found now was left by one that was killed, and
@@ -1471,21 +1510,26 @@ func (s *CacheService) refreshHeld(ctx context.Context, request gitRequest, repo
 		return err
 	}
 	err := s.fetchMirror(ctx, path, request, repository, volumeCeiling(sessionSetting(request.session, config.CacheGit)))
-	// THE NAME WAS FETCHED, NOT THE ID: GitHub serves git by name alone
-	// (`/repositories/<id>` is not found over git, 2026-10-21). A name that
-	// passed to another repository while the fetch ran brought that one's
-	// objects, so the mirror is broken and replaced before its next serve.
-	// Could not tell leaves it, as a refresh that could not run would.
-	if err == nil {
-		if after, idErr := s.repositoryID(ctx, request); idErr == nil && after != repository {
-			s.git.markBroken(request.key())
-			err = fmt.Errorf("the name became repository %d while the mirror of %d was fetched", after, repository)
-		}
-	}
 	if err == nil && head != "" && strings.HasPrefix(head, "refs/") {
 		_, err = s.runGit(ctx, path, nil, "symbolic-ref", "HEAD", head)
 	}
 	if err != nil {
+		return err
+	}
+	// THE NAME WAS FETCHED, NOT THE ID: GitHub serves git by name alone
+	// (`/repositories/<id>` is not found over git, 2026-10-21). The mirror
+	// stays unverified, never served and replaced at the next claim, unless
+	// GitHub names the same repository after the fetch: a name that passed to
+	// another repository meanwhile brought that one's objects, and could not
+	// tell is not the same.
+	after, err := s.repositoryID(ctx, request)
+	switch {
+	case err != nil:
+		return fmt.Errorf("could not verify which repository was fetched: %w", err)
+	case after != repository:
+		return fmt.Errorf("the name became repository %d while the mirror of %d was fetched", after, repository)
+	}
+	if err := markVerified(path); err != nil {
 		return err
 	}
 	s.markMirrorUsed(path)
@@ -1609,6 +1653,11 @@ func (s *CacheService) fetchMirror(
 			[]byte(strconv.FormatInt(repository, 10)+"\n"), 0o600); err != nil {
 			return err
 		}
+	}
+	// UNVERIFIED BEFORE A BYTE ARRIVES, verified by the caller only once GitHub
+	// names the same repository after the fetch.
+	if err := markUnverified(path); err != nil {
+		return err
 	}
 	var secret []string
 	if request.auth != "" {
@@ -1785,7 +1834,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 		s.forwardGit(exchange, r, request, "no mirror yet")
 
 		return
-	case err != nil || stamped != repository || s.git.isBroken(key):
+	case err != nil || stamped != repository:
 		s.forwardGit(exchange, r, request, "the mirror is not one this repository can be served from")
 
 		return
@@ -1841,12 +1890,16 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 
 		return
 	}
+	// STILL GRANTED AND STILL VERIFIED, read at the last moment: a refresh that
+	// shares this request's hold on the mirror can leave it unverified while
+	// the request waits.
 	stillGranted := func() bool {
 		again, ok := s.git.granted(request, s.now())
+		stamped, _, err := mirrorRepository(path)
 
-		return ok && again == repository
+		return ok && again == repository && err == nil && stamped == repository
 	}
-	if served, reason := s.serveUploadPack(ctx, exchange, key, path, negotiation, stillGranted); !served {
+	if served, reason := s.serveUploadPack(ctx, exchange, path, negotiation, stillGranted); !served {
 		s.forwardGit(exchange, r, request, reason)
 
 		return
@@ -1862,11 +1915,11 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 // never ends.
 //
 // A SERVE THAT FAILS AFTER ITS ANSWER BEGAN cannot be taken back, and the
-// client sees the failure; the mirror is marked broken so the next
+// client sees the failure; the mirror is marked unverified so the next
 // advertisement removes it and every fetch after goes to GitHub until it is
 // fetched again.
 func (s *CacheService) serveUploadPack(
-	ctx context.Context, exchange *gitExchange, key, path string, negotiation []byte, stillGranted func() bool,
+	ctx context.Context, exchange *gitExchange, path string, negotiation []byte, stillGranted func() bool,
 ) (bool, string) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1927,7 +1980,9 @@ func (s *CacheService) serveUploadPack(
 	// THE CLIENT LEAVING, or the request's own end, says nothing of the mirror;
 	// an upload-pack that failed while both were alive does.
 	if waitErr != nil && copyErr == nil && ctx.Err() == nil {
-		s.git.markBroken(key)
+		if err := markUnverified(path); err != nil {
+			waitErr = errors.Join(waitErr, fmt.Errorf("could not mark the mirror unverified: %w", err))
+		}
 	}
 	if waitErr != nil || copyErr != nil {
 		s.log.Warn("a fetch from the git cache failed", "error", errors.Join(waitErr, copyErr),
@@ -2045,9 +2100,12 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 			return err
 		}
 		// A MIRROR RENAMED ASIDE whose deletion never finished, a restart's
-		// leftover, is no mirror and goes whatever its age.
-		if entry.IsDir() && strings.Contains(filepath.Base(path), ".git"+gitDiscardSuffix) {
-			discarded = append(discarded, path)
+		// leftover, is no mirror. One renamed in the last ten minutes is still
+		// a claim's to delete.
+		if entry.IsDir() && filepath.Dir(path) == filepath.Join(s.git.root, gitDiscardDirectory) {
+			if info, err := entry.Info(); err == nil && s.now().Sub(info.ModTime()) > 10*time.Minute {
+				discarded = append(discarded, path)
+			}
 
 			return fs.SkipDir
 		}
