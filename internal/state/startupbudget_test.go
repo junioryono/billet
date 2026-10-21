@@ -170,6 +170,20 @@ var stretch = state.WithStartupBudget
 	if len(uses) != 1 || !inOpen {
 		t.Errorf("the permitted caller alone scans as %v (passed to Open: %v), want its one use", uses, inOpen)
 	}
+
+	// AND ONLY build PASSING templateBudget ITSELF counts as the template's open:
+	// any other value, or the call outside build, leaves it on the production
+	// budget.
+	for name, src := range map[string]string{
+		"another value": "package ledgertest\n\nimport \"github.com/junioryono/billet/internal/state\"\n\n" +
+			"func build() { state.Open(nil, \"\", state.WithStartupBudget(0)) }\n",
+		"another function": "package ledgertest\n\nimport \"github.com/junioryono/billet/internal/state\"\n\n" +
+			"func seed() { state.Open(nil, \"\", state.WithStartupBudget(templateBudget)) }\n",
+	} {
+		if _, inOpen := startupBudgetUses(t, map[string][]byte{budgetCaller: []byte(src)}); inOpen {
+			t.Errorf("%s: the scan counts it as the template's open", name)
+		}
+	}
 }
 
 // AND EVERY WAY PAST THE OPTION: the field set by assignment or in a literal,
@@ -195,6 +209,14 @@ func openDir() { db := &DB{startupBudget: mode.budget()} }
 		"an assignment":               "package state\n\nfunc promote(db *DB) { db.startupBudget = time.Hour }\n",
 		"a mode literal":              "package state\n\nfunc open() { _ = openMode{startupBudget: time.Hour} }\n",
 		"a handle literal in openDir": "package state\n\nfunc openDir() { _ = &DB{startupBudget: time.Hour} }\n",
+		"an increment":                "package state\n\nfunc grow(db *DB) { db.startupBudget++ }\n",
+		"the field's address":         "package state\n\nfunc open(m *openMode) { p := &m.startupBudget; *p = time.Hour }\n",
+		"an unkeyed mode literal": "package state\n\nfunc open(m *openMode) " +
+			"{ *m = openMode{false, false, false, false, false, false, \"\", time.Hour} }\n",
+		"an unkeyed handle literal": "package state\n\nfunc open() { _ = &DB{nil, nil, nil, nil, time.Hour} }\n",
+		"a package-level option": "package state\n\n" +
+			"var Stretch OpenOption = func(m *openMode) { m.startupBudget = time.Hour }\n",
+		"an alias of the mode": "package state\n\ntype mode2 = openMode\n",
 	} {
 		if writes := startupBudgetWrites(t, map[string][]byte{"internal/state/other.go": []byte(src)}); len(writes) == 0 {
 			t.Errorf("%s of the startup budget was not seen", name)
@@ -202,16 +224,23 @@ func openDir() { db := &DB{startupBudget: mode.budget()} }
 	}
 }
 
-// startupBudgetWrites lists, as file:line:column, every assignment to a
-// startupBudget field and every literal that sets one, in the sources under
-// internal/state, except WithStartupBudget's own assignment and openDir's
-// `startupBudget: mode.budget()`.
+// budgetTypes are the types that carry a startup budget.
+var budgetTypes = []string{"openMode", "DB"}
+
+// startupBudgetWrites lists, as file:line:column, every way the sources under
+// internal/state set a startupBudget field: an assignment or increment, its
+// address taken, a keyed literal that names it, an unkeyed literal of a type
+// that carries it, or an alias of such a type, in a function or a package-level
+// declaration alike. Only WithStartupBudget's own assignment and openDir's
+// `startupBudget: mode.budget()` are permitted.
 func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 	t.Helper()
 
 	fset := token.NewFileSet()
 
 	var writes []string
+
+	write := func(n ast.Node) { writes = append(writes, fset.Position(n.Pos()).String()) }
 
 	for rel, body := range sources {
 		if filepath.ToSlash(filepath.Dir(rel)) != "internal/state" {
@@ -224,31 +253,51 @@ func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 		}
 
 		for _, decl := range file.Decls {
-			fd, ok := decl.(*ast.FuncDecl)
-			if !ok || fd.Body == nil {
-				continue
+			// The function a write is in; empty at package level.
+			within := ""
+			if fd, ok := decl.(*ast.FuncDecl); ok && fd.Recv == nil {
+				within = fd.Name.Name
 			}
 
-			ast.Inspect(fd.Body, func(n ast.Node) bool {
+			ast.Inspect(decl, func(n ast.Node) bool {
 				switch node := n.(type) {
 				case *ast.AssignStmt:
 					for _, lhs := range node.Lhs {
-						sel, ok := lhs.(*ast.SelectorExpr)
-						if ok && sel.Sel.Name == "startupBudget" && fd.Name.Name != "WithStartupBudget" {
-							writes = append(writes, fset.Position(lhs.Pos()).String())
+						if isBudgetField(lhs) && within != "WithStartupBudget" {
+							write(lhs)
 						}
+					}
+				case *ast.IncDecStmt:
+					if isBudgetField(node.X) {
+						write(node)
+					}
+				case *ast.UnaryExpr:
+					if node.Op == token.AND && isBudgetField(node.X) {
+						write(node)
 					}
 				case *ast.KeyValueExpr:
 					key, ok := node.Key.(*ast.Ident)
-					if !ok || key.Name != "startupBudget" {
+					if ok && key.Name == "startupBudget" &&
+						(within != "openDir" || !isMethodCall(node.Value, "mode", "budget")) {
+						write(node)
+					}
+				case *ast.CompositeLit:
+					id, ok := node.Type.(*ast.Ident)
+					if !ok || !slices.Contains(budgetTypes, id.Name) {
 						return true
 					}
 
-					if fd.Name.Name == "openDir" && isMethodCall(node.Value, "mode", "budget") {
-						return true
-					}
+					for _, elt := range node.Elts {
+						if _, keyed := elt.(*ast.KeyValueExpr); !keyed {
+							write(node)
 
-					writes = append(writes, fset.Position(node.Pos()).String())
+							break
+						}
+					}
+				case *ast.TypeSpec:
+					if id, ok := node.Type.(*ast.Ident); ok && slices.Contains(budgetTypes, id.Name) {
+						write(node)
+					}
 				}
 
 				return true
@@ -257,6 +306,13 @@ func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 	}
 
 	return writes
+}
+
+// isBudgetField reports whether expr is x.startupBudget.
+func isBudgetField(expr ast.Expr) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+
+	return ok && sel.Sel.Name == "startupBudget"
 }
 
 // isMethodCall reports whether expr is recv.name() with no arguments.
@@ -268,9 +324,9 @@ func isMethodCall(expr ast.Expr, recv, name string) bool {
 
 // startupBudgetUses lists every place the sources name WithStartupBudget, as
 // file:line:column, except its declared name in budgetDeclaration, and reports
-// whether budgetCaller passes it to state.Open. Every identifier counts, so a
-// selector, a bare name under a dot import, a method value and a same-named
-// wrapper are each a use.
+// whether budgetCaller's build passes state.WithStartupBudget(templateBudget) to
+// state.Open. Every identifier counts, so a selector, a bare name under a dot
+// import, a method value and a same-named wrapper are each a use.
 func startupBudgetUses(t *testing.T, sources map[string][]byte) ([]string, bool) {
 	t.Helper()
 
@@ -297,23 +353,43 @@ func startupBudgetUses(t *testing.T, sources map[string][]byte) ([]string, bool)
 		}
 
 		ast.Inspect(file, func(n ast.Node) bool {
-			switch node := n.(type) {
-			case *ast.Ident:
-				if node.Name == "WithStartupBudget" && node != declared {
-					uses = append(uses, fset.Position(node.Pos()).String())
-				}
-			case *ast.CallExpr:
-				if rel == budgetCaller && isSelector(node.Fun, "state", "Open") {
-					for _, arg := range node.Args {
-						if call, ok := arg.(*ast.CallExpr); ok && isSelector(call.Fun, "state", "WithStartupBudget") {
-							inOpen = true
-						}
-					}
-				}
+			if id, ok := n.(*ast.Ident); ok && id.Name == "WithStartupBudget" && id != declared {
+				uses = append(uses, fset.Position(id.Pos()).String())
 			}
 
 			return true
 		})
+
+		if rel != budgetCaller {
+			continue
+		}
+
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Recv != nil || fd.Name.Name != "build" {
+				continue
+			}
+
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				open, ok := n.(*ast.CallExpr)
+				if !ok || !isSelector(open.Fun, "state", "Open") {
+					return true
+				}
+
+				for _, arg := range open.Args {
+					call, ok := arg.(*ast.CallExpr)
+					if !ok || !isSelector(call.Fun, "state", "WithStartupBudget") || len(call.Args) != 1 {
+						continue
+					}
+
+					if budget, ok := call.Args[0].(*ast.Ident); ok && budget.Name == "templateBudget" {
+						inOpen = true
+					}
+				}
+
+				return true
+			})
+		}
 	}
 
 	slices.Sort(uses)

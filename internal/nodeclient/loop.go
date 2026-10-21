@@ -1390,6 +1390,12 @@ retry:
 			break retry
 		}
 
+		// ASKED AGAIN, because a select with both ready picks either: a timer
+		// that fired with the second signal must not start a send after it.
+		if hurry.Err() != nil {
+			break retry
+		}
+
 		err = c.Report(context.WithoutCancel(ctx), res)
 	}
 

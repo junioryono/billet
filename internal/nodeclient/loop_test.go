@@ -708,8 +708,10 @@ func TestADestroyReportIsSentThreeTimesAtMost(t *testing.T) {
 				t.Errorf("the compute was asked to destroy %v, want %d times", destroyed, tc.destroyed)
 			}
 
+			// THE NUMBERS, not the constant, so the constant cannot move alone; the
+			// exact waits are TestADestroysResendsWaitASecondAndThenTwo's.
 			gaps := lost.gaps()
-			for i, want := range []time.Duration{nodeclient.ReportRetryWaitForTest, 2 * nodeclient.ReportRetryWaitForTest} {
+			for i, want := range []time.Duration{time.Second, 2 * time.Second} {
 				if i < len(gaps) && gaps[i] < want {
 					t.Errorf("send %d followed send %d after %s, want at least %s: a busy plane is "+
 						"asked again at once", i+2, i+1, gaps[i], want)
@@ -729,19 +731,44 @@ func TestTheSecondSignalEndsADestroyReportsResends(t *testing.T) {
 
 	var once sync.Once
 
-	lost := &lostResults{drop: 99, onDrop: func() {
+	signal := func() {
 		once.Do(func() {
 			stop()
 			close(hurry)
 		})
-	}}
+	}
+
+	lost := &lostResults{drop: 99, onDrop: signal}
 	p, c := harnessBehind(t, 15*time.Second, lost.wrap)
 	compute := &fakeCompute{}
 
-	ended := make(chan error, 1)
+	var workers sync.WaitGroup
 
-	go func() {
-		ended <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+	ended := make(chan struct{})
+
+	// EVERY WAY OUT OF THIS TEST SIGNALS AND JOINS BOTH WORKERS, before the
+	// harness closes the plane's server.
+	t.Cleanup(func() {
+		signal()
+
+		joined := make(chan struct{})
+
+		go func() {
+			workers.Wait()
+			close(joined)
+		}()
+
+		select {
+		case <-joined:
+		case <-time.After(30 * time.Second):
+			t.Error("a worker outlived the test")
+		}
+	})
+
+	workers.Go(func() {
+		defer close(ended)
+
+		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
 			VCPU:       testNodeVCPU,
 			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
@@ -751,13 +778,20 @@ func TestTheSecondSignalEndsADestroyReportsResends(t *testing.T) {
 			Backoff:    20 * time.Millisecond,
 			Hurry:      hurry,
 		})
-	}()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the loop stopped for a reason other than the signals: %v", err)
+		}
+	})
 
 	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
 
-	destroyed := make(chan error, 1)
-
-	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 42) }()
+	// NOTHING THE NODE SENT WAS HEARD, so the destroy cannot have been answered
+	// as done.
+	workers.Go(func() {
+		if err := p.NewRunner().Destroy(t.Context(), 42); err == nil {
+			t.Error("a destroy whose every report was lost was answered as done")
+		}
+	})
 
 	select {
 	case <-ended:
@@ -767,12 +801,6 @@ func TestTheSecondSignalEndsADestroyReportsResends(t *testing.T) {
 
 	if got := lost.seen.Load(); got != 1 {
 		t.Errorf("the plane's wire carried %d results after the second signal, want the one lost", got)
-	}
-
-	select {
-	case <-destroyed:
-	case <-time.After(30 * time.Second):
-		t.Error("the destroy never answered once the node had withdrawn")
 	}
 }
 
