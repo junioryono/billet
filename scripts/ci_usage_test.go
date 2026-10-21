@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -192,7 +193,7 @@ func TestTheUsageSamplerStopsWhenItReports(t *testing.T) {
 	}
 
 	// AND IT SAMPLED NOTHING ON ITS WAY OUT.
-	if after, err := os.ReadFile(filepath.Join(dir, "samples")); err != nil || string(after) != string(reported) {
+	if after, err := os.ReadFile(filepath.Join(dir, "samples")); err != nil || !bytes.Equal(after, reported) {
 		t.Errorf("the sampler wrote after report stopped it: %q, then %q (%v)", reported, after, err)
 	}
 }
