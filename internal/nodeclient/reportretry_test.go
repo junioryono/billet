@@ -20,8 +20,8 @@ type roundTrip func(*http.Request) (*http.Response, error)
 func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // unheardClient is a client whose every request fails before the plane answers,
-// counting each one, with onSend run as each leaves.
-func unheardClient(t *testing.T, sends *int, onSend func()) *Client {
+// recording when each left on the bubble's clock.
+func unheardClient(t *testing.T, sent *[]time.Time) *Client {
 	t.Helper()
 
 	c, err := New(Options{Base: "http://plane.invalid", Node: "n1"})
@@ -30,8 +30,7 @@ func unheardClient(t *testing.T, sends *int, onSend func()) *Client {
 	}
 
 	c.http = &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
-		*sends++
-		onSend()
+		*sent = append(*sent, time.Now())
 
 		return nil, errors.New("the plane did not answer")
 	})}
@@ -39,49 +38,70 @@ func unheardClient(t *testing.T, sends *int, onSend func()) *Client {
 	return c
 }
 
-// THE RESENDS WAIT ONE SECOND AND THEN TWO, on the bubble's clock: exactly that,
-// so neither a busy plane asked again at once nor a longer stall passes.
+var unheardDestroy = nodeapi.Command{ID: "d1", Kind: nodeapi.CommandDestroy}
+
+// THE RESENDS WAIT ONE SECOND AND THEN TWO, on the bubble's clock: each gap
+// exactly, so neither a busy plane asked again at once nor a longer stall passes.
 func TestADestroysResendsWaitASecondAndThenTwo(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		sends := 0
-		c := unheardClient(t, &sends, func() {})
-
-		start := time.Now()
-		destroy := nodeapi.Command{ID: "d1", Kind: nodeapi.CommandDestroy}
+		var sent []time.Time
+		c := unheardClient(t, &sent)
 
 		if err := reportOutcome(t.Context(), t.Context(), c, nil, slog.New(slog.DiscardHandler), &sync.Mutex{},
-			destroy, nodeapi.CommandResult{ID: "d1", OK: true}); err != nil {
+			unheardDestroy, nodeapi.CommandResult{ID: "d1", OK: true}); err != nil {
 			t.Fatalf("reportOutcome = %v", err)
 		}
 
-		if waited := time.Since(start); sends != 3 || waited != 3*time.Second {
-			t.Errorf("%d sends over %s, want 3 over 3s (a second, then two)", sends, waited)
+		if len(sent) != 3 || sent[1].Sub(sent[0]) != time.Second || sent[2].Sub(sent[1]) != 2*time.Second {
+			t.Errorf("the sends left at %v, want three: a second apart and then two", sent)
 		}
 	})
 }
 
 // THE SECOND SIGNAL ENDS A WAIT THAT HAS BEGUN, at once and with nothing sent
-// after it: here it arrives during the first send, so the wait it ends is the
-// one before the second.
+// after it. The report is first shown blocked in its wait before the second
+// send, and only then signalled; it must return without the bubble's clock
+// moving.
 func TestTheSecondSignalEndsTheWaitBeforeAResend(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		hurry, second := context.WithCancel(t.Context())
 		defer second()
 
-		sends := 0
-		c := unheardClient(t, &sends, second)
+		var sent []time.Time
+		c := unheardClient(t, &sent)
 
-		start := time.Now()
-		destroy := nodeapi.Command{ID: "d1", Kind: nodeapi.CommandDestroy}
+		done := make(chan error, 1)
 
-		if err := reportOutcome(t.Context(), hurry, c, nil, slog.New(slog.DiscardHandler), &sync.Mutex{},
-			destroy, nodeapi.CommandResult{ID: "d1", OK: true}); err != nil {
-			t.Fatalf("reportOutcome = %v", err)
+		go func() {
+			done <- reportOutcome(t.Context(), hurry, c, nil, slog.New(slog.DiscardHandler), &sync.Mutex{},
+				unheardDestroy, nodeapi.CommandResult{ID: "d1", OK: true})
+		}()
+
+		// DURABLY BLOCKED: the first send has failed and the report waits for its
+		// second, which the bubble's clock has not reached.
+		synctest.Wait()
+
+		if len(sent) != 1 {
+			t.Fatalf("%d sends before the wait, want the first alone", len(sent))
 		}
 
-		if waited := time.Since(start); sends != 1 || waited != 0 {
-			t.Errorf("%d sends over %s after the second signal, want the one it interrupted and no wait",
-				sends, waited)
+		blocked := time.Now()
+
+		second()
+		synctest.Wait()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("reportOutcome = %v", err)
+			}
+		default:
+			t.Fatal("the report was still waiting after the second signal")
+		}
+
+		if waited := time.Since(blocked); waited != 0 || len(sent) != 1 {
+			t.Errorf("after the second signal the report waited %s and sent %d in all, want no wait and the one",
+				waited, len(sent))
 		}
 	})
 }

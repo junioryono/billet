@@ -216,7 +216,13 @@ func openDir() { db := &DB{startupBudget: mode.budget()} }
 		"an unkeyed handle literal": "package state\n\nfunc open() { _ = &DB{nil, nil, nil, nil, time.Hour} }\n",
 		"a package-level option": "package state\n\n" +
 			"var Stretch OpenOption = func(m *openMode) { m.startupBudget = time.Hour }\n",
-		"an alias of the mode": "package state\n\ntype mode2 = openMode\n",
+		"an alias of the mode":      "package state\n\ntype mode2 = openMode\n",
+		"a parenthesised increment": "package state\n\nfunc grow(m *openMode) { (m.startupBudget)++ }\n",
+		"a parenthesised address":   "package state\n\nfunc open(m *openMode) { p := &(m.startupBudget); *p = time.Hour }\n",
+		"a range target": "package state\n\nfunc open(m *openMode) " +
+			"{ for _, m.startupBudget = range []time.Duration{time.Hour} {} }\n",
+		"an element of a slice literal": "package state\n\ntype openMode struct {\n\tadmin bool\n\tstartupBudget time.Duration\n}\n\n" +
+			"func open(m *openMode) { *m = []openMode{{false, time.Hour}}[0] }\n",
 	} {
 		if writes := startupBudgetWrites(t, map[string][]byte{"internal/state/other.go": []byte(src)}); len(writes) == 0 {
 			t.Errorf("%s of the startup budget was not seen", name)
@@ -242,6 +248,8 @@ func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 
 	write := func(n ast.Node) { writes = append(writes, fset.Position(n.Pos()).String()) }
 
+	var files []*ast.File
+
 	for rel, body := range sources {
 		if filepath.ToSlash(filepath.Dir(rel)) != "internal/state" {
 			continue
@@ -252,6 +260,15 @@ func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 			t.Fatalf("parse %s: %v", rel, err)
 		}
 
+		files = append(files, file)
+	}
+
+	// HOW MANY FIELDS EACH BUDGET TYPE HAS, from its declaration: an unkeyed
+	// literal with that many elements is refused whatever its type is spelled as,
+	// since an element of a slice literal names no type at all.
+	widths := budgetTypeWidths(files)
+
+	for _, file := range files {
 		for _, decl := range file.Decls {
 			// The function a write is in; empty at package level.
 			within := ""
@@ -266,6 +283,10 @@ func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 						if isBudgetField(lhs) && within != "WithStartupBudget" {
 							write(lhs)
 						}
+					}
+				case *ast.RangeStmt:
+					if node.Tok == token.ASSIGN && (isBudgetField(node.Key) || isBudgetField(node.Value)) {
+						write(node)
 					}
 				case *ast.IncDecStmt:
 					if isBudgetField(node.X) {
@@ -282,17 +303,21 @@ func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 						write(node)
 					}
 				case *ast.CompositeLit:
-					id, ok := node.Type.(*ast.Ident)
-					if !ok || !slices.Contains(budgetTypes, id.Name) {
+					unkeyed := len(node.Elts) > 0
+					for _, elt := range node.Elts {
+						if _, keyed := elt.(*ast.KeyValueExpr); keyed {
+							unkeyed = false
+						}
+					}
+
+					if !unkeyed {
 						return true
 					}
 
-					for _, elt := range node.Elts {
-						if _, keyed := elt.(*ast.KeyValueExpr); !keyed {
-							write(node)
-
-							break
-						}
+					if id, ok := node.Type.(*ast.Ident); ok && slices.Contains(budgetTypes, id.Name) {
+						write(node)
+					} else if slices.Contains(widths, len(node.Elts)) {
+						write(node)
 					}
 				case *ast.TypeSpec:
 					if id, ok := node.Type.(*ast.Ident); ok && slices.Contains(budgetTypes, id.Name) {
@@ -308,11 +333,41 @@ func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
 	return writes
 }
 
-// isBudgetField reports whether expr is x.startupBudget.
+// isBudgetField reports whether expr is x.startupBudget, parenthesised or not.
 func isBudgetField(expr ast.Expr) bool {
-	sel, ok := expr.(*ast.SelectorExpr)
+	sel, ok := ast.Unparen(expr).(*ast.SelectorExpr)
 
 	return ok && sel.Sel.Name == "startupBudget"
+}
+
+// budgetTypeWidths is how many fields each budget type declared in files has.
+func budgetTypeWidths(files []*ast.File) []int {
+	var widths []int
+
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			spec, ok := n.(*ast.TypeSpec)
+			if !ok || !slices.Contains(budgetTypes, spec.Name.Name) {
+				return true
+			}
+
+			st, ok := spec.Type.(*ast.StructType)
+			if !ok {
+				return true
+			}
+
+			width := 0
+			for _, field := range st.Fields.List {
+				width += max(len(field.Names), 1)
+			}
+
+			widths = append(widths, width)
+
+			return true
+		})
+	}
+
+	return widths
 }
 
 // isMethodCall reports whether expr is recv.name() with no arguments.
