@@ -46,8 +46,10 @@ func TestTheIntegrityScanFitsTheServerUnitsStartBound(t *testing.T) {
 //   - takes started before the first startup budget is derived;
 //   - measures spent := time.Since(started) before the scan;
 //   - scans under scanCtx := context.WithTimeout(ctx, integrityScanBudget),
-//     from the caller's context and not the one carrying startupTimeout;
-//   - resumes context.WithTimeout(ctx, startupTimeout - spent) after it.
+//     from the caller's context and not the one carrying the startup budget;
+//   - derives both startup budgets from budget, the one the open was given
+//     (startupTimeout unless WithStartupBudget said otherwise), and resumes
+//     context.WithTimeout(ctx, budget - spent) after the scan.
 //
 // And the SQLite scan reads through the context it is handed, so the open's
 // bound reaches the read and `billet check`'s unbounded context does too.
@@ -91,6 +93,11 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 				if !firstBudget.IsValid() {
 					firstBudget = node.Pos()
 
+					if exprName(call.Args[1]) != "budget" {
+						t.Errorf("the first startup budget is %s, not budget, the one this open was given",
+							exprName(call.Args[1]))
+					}
+
 					return true
 				}
 
@@ -107,9 +114,9 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 				}
 
 				left, ok := call.Args[1].(*ast.BinaryExpr)
-				if !ok || left.Op != token.SUB || exprName(left.X) != "startupTimeout" ||
+				if !ok || left.Op != token.SUB || exprName(left.X) != "budget" ||
 					exprName(left.Y) != "spent" {
-					t.Error("the startup budget after the scan is not startupTimeout - spent; " +
+					t.Error("the startup budget after the scan is not budget - spent; " +
 						"restarting it whole lets an open outlast the unit's start bound")
 				}
 			}

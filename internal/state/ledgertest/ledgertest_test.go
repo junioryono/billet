@@ -164,3 +164,15 @@ func TestNothingOutsideATestImportsThisPackage(t *testing.T) {
 		t.Fatalf("the template ledger is imported by production code: %v", importers)
 	}
 }
+
+// THE TEMPLATE'S BUDGET IS LONGER THAN ANY A PRODUCTION OPEN HAS: passed as zero,
+// or as anything up to the production bound, the option changes nothing and the
+// build misses its budget under load again (#188).
+func TestTheTemplateIsBuiltUnderALongerBudgetThanProduction(t *testing.T) {
+	t.Parallel()
+
+	if templateBudget <= state.StartupBound() {
+		t.Fatalf("the template is migrated under %s, no longer than a production open's %s",
+			templateBudget, state.StartupBound())
+	}
+}

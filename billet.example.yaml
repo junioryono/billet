@@ -1259,9 +1259,9 @@ tiers:
 # installed from its vendor into every new image, inside a microVM, before the
 # image is used (#584).
 #
-# NOT YET IN EFFECT FOR billet's OWN IMAGES, which still contain all five. A pull
-# of an image that leaves components out installs the accepted ones before
-# importing it, and imports nothing if any fails to install.
+# billet's published images leave all five out (an image built before that
+# carries them). A pull of an image that leaves components out installs the
+# accepted ones before importing it, and imports nothing if any fails to install.
 #
 #   android-sdk     the Android SDK, platforms, build tools and NDKs
 #                   (https://developer.android.com/studio/terms)

@@ -65,6 +65,10 @@ func (b *builder) get(build func() ([]byte, error)) ([]byte, error) {
 
 var ledger builder
 
+// templateBudget is the startup budget the template's migration runs under: the
+// one internal/state's own tests give every open.
+const templateBudget = 10 * time.Minute
+
 // Dir is a fresh t.TempDir() holding a migrated ledger, for state.Open to open.
 func Dir(tb testing.TB) string {
 	tb.Helper()
@@ -118,7 +122,10 @@ func build(tb testing.TB) ([]byte, error) {
 		return nil, fmt.Errorf("resolve the scratch directory: %w", err)
 	}
 
-	db, err := state.Open(tb.Context(), filepath.Join(work, "state"))
+	// UNDER A BUDGET NO LOADED MACHINE REACHES. The production thirty seconds
+	// guards a sick disk; one migration from empty under a full gate missed it, and
+	// every test sharing this binary failed with it (#188).
+	db, err := state.Open(tb.Context(), filepath.Join(work, "state"), state.WithStartupBudget(templateBudget))
 	if err != nil {
 		return nil, fmt.Errorf("migrate a ledger: %w", err)
 	}

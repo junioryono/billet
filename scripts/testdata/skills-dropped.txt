@@ -127,3 +127,4 @@ b56657d3069e The images row gained `accept`, the components whose licenses a dep
 63530ec575db #183: macos_node drains only when billet node config-change says the node reads the change; fleet-and-connectors.md restates the order with the verdict between the check and the drain.
 82c3625c88c9 #183: a change only the control plane reads (tiers or nodes: alone) is installed without a drain; the rule now says a change the node reads is a drain.
 1911dca723a8 #183 added billet join accept, a third writer of billet.yaml (an in-place merge through the same writer as github-app create --config); the rule now counts three writers and a fourth that writes a directory.
+e1d3650f30ef #93 records a runner's owner on the lease and the binding when it is minted, and the plane resolves removal and recovery from it; the gap is closed and the sentence now states the rule and what an unrecorded runner still does.

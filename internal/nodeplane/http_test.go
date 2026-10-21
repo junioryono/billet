@@ -267,6 +267,8 @@ type fakeStore struct {
 	usages  []reportedUsage
 	pool    map[string]alloc.PoolRunner
 	retired []string
+	// leaseTargets is the GitHub owner recorded on each lease, by lease id.
+	leaseTargets map[string]string
 	// guests are the guest reports recorded, with the epoch each arrived under.
 	guests []reportedGuest
 }
@@ -415,10 +417,47 @@ func (f *fakeStore) RegisterPoolRunner(_ context.Context, runner alloc.PoolRunne
 			prior.LaunchRequestID != runner.LaunchRequestID {
 			return alloc.ErrConflict
 		}
+		f.pool[runner.RunnerName] = fillOwner(prior, runner.GitHubTarget)
 		return nil
 	}
 	f.pool[runner.RunnerName] = runner
 	return nil
+}
+
+// fillOwner is alloc's rule for a member journaled without an owner: one the
+// caller brings is kept, and a recorded one is never replaced.
+func fillOwner(member alloc.PoolRunner, owner string) alloc.PoolRunner {
+	if member.GitHubTarget == "" {
+		member.GitHubTarget = owner
+	}
+	return member
+}
+
+// RecordLeaseGitHubTarget keeps alloc's rules: fenced on the lease's epoch,
+// and written once.
+func (f *fakeStore) RecordLeaseGitHubTarget(_ context.Context, leaseID string, epoch int64, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if strings.TrimSpace(path) == "" {
+		return errors.New("alloc: a lease's GitHub target must not be empty")
+	}
+	if f.lease != nil && f.lease.ID == leaseID && f.lease.Epoch != epoch {
+		return alloc.ErrFenced
+	}
+	if prior := f.leaseTargets[leaseID]; prior != "" && prior != path {
+		return alloc.ErrConflict
+	}
+	if f.leaseTargets == nil {
+		f.leaseTargets = make(map[string]string)
+	}
+	f.leaseTargets[leaseID] = path
+	return nil
+}
+
+func (f *fakeStore) LeaseGitHubTarget(_ context.Context, leaseID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.leaseTargets[leaseID], nil
 }
 
 func (f *fakeStore) PoolRunnerByName(_ context.Context, name string) (alloc.PoolRunner, error) {
@@ -475,6 +514,7 @@ func (f *fakeStore) PreserveRecoveredBusyPoolRunner(
 		runner.RunnerID = recovered.RunnerID
 		runner.RunnerName = recovered.RunnerName
 		runner.Status = alloc.PoolRunnerBusy
+		runner = fillOwner(runner, recovered.GitHubTarget)
 		delete(f.pool, name)
 		f.pool[runner.RunnerName] = runner
 		return nil
@@ -494,6 +534,8 @@ func (f *fakeStore) RetireRecoveredPoolRunner(
 		if runner.LeaseID != recovered.LeaseID {
 			continue
 		}
+		runner = fillOwner(runner, recovered.GitHubTarget)
+		f.pool[name] = runner
 		if runner.Status == alloc.PoolRunnerBusy &&
 			(runner.ActualRequestID != 0 || runner.RunID != 0 || runner.JobID != "") {
 			return runner, nil
