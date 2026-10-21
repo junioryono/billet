@@ -43,7 +43,7 @@ Generate a `billet.yaml` that runs. It measures the host, writes a ceiling below
 | `--listen` | the loopback address the server binds and the node dials (default `127.0.0.1:7717`) |
 | `--image` | the tier image (default: a runner container for docker, a golden generation for firecracker) |
 | `--emit file\|ansible` | write the file, or print the `billet_config` block for an inventory and write nothing |
-| `--join ADDR` | write a node-only config for this machine that dials the control plane at `ADDR` (its node-wire `host:port`), carrying the measured ceiling as `node.max_vcpu`/`max_memory` and naming the certificate bundle under the config's `tls/` directory, and print what the control plane's config needs: how far to raise `server.max_vcpu`/`max_memory`, and the `tiers:` and `nodes:` to add. Not with `--emit ansible` |
+| `--join ADDR` | write a node-only config for this machine that dials the control plane at `ADDR` (its node-wire `host:port`), carrying the measured ceiling as `node.max_vcpu`/`max_memory` and naming the certificate bundle under the config's `tls/` directory, and print what the control plane's config needs: how far to raise `server.max_vcpu`/`max_memory`, and the `tiers:` and `nodes:` to add. With `--node-name` it also prints that half as one `billet join accept <token>` command to run on the control plane. Not with `--emit ansible` |
 | `--state-backend sqlite\|postgres`, `--state-dsn-env` | where the ledger lives; the DSN's environment variable is required for postgres |
 | `--node-name` | this host's name; required for a macOS tier on tart or codebuild |
 | `--guest-os macos\|linux` (repeatable), `--macos-image`, `--linux-image` | tart guest kinds and their images (defaults `ghcr.io/cirruslabs/macos-tahoe-xcode:latest` and `ghcr.io/cirruslabs/ubuntu-runner-arm64:latest`) |
@@ -189,6 +189,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
+| `billet join accept [--config PATH] [--dry-run] <token\|@file\|->` | on the control plane, merge a joining node's half into its config: the node's tiers by label and its `nodes:` entry by name (an identical entry is kept, a different one under the same label or name is refused with both shown), and `server.max_vcpu`/`max_memory` raised to cover every registered host plus the node (never lowered, and accepting twice, or after the node registered, raises nothing again). Comments, mode and owner are kept, and the result must load. A proposal made enrolling against another deployment is refused. A config the collection renders (its first line is the collection's marker) is not edited: the same half is printed as inventory changes and the command exits non-zero. The control plane reads tiers when it starts, so the command ends by naming the restart, which is a handoff rather than a drain |
 | `billet nodes pending [--all]` | machines waiting to be let in, with their fingerprints |
 | `billet nodes approve <node> --fingerprint <fp>` | admit one machine; the fingerprint is required |
 | `billet nodes deny <node> --fingerprint <fp>` | refuse one |

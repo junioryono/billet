@@ -23,6 +23,9 @@ type JoinResult struct {
 	// its tiers, its nodes: policy, and how far to raise the deployment ceiling.
 	// Printed, never written, because it belongs in another machine's file.
 	ControlPlane string
+	// Proposal is the same half as data, for `billet join accept` to apply on
+	// the control plane.
+	Proposal JoinProposal
 }
 
 // Join turns a single-machine generation into a node-only config for a control
@@ -61,6 +64,13 @@ func Join(generated, serverAddr, tlsDir string) (JoinResult, error) {
 	maxMemory := mappingValue(server, "max_memory")
 	if maxVCPU == nil || maxMemory == nil {
 		return JoinResult{}, errors.New("the generated server block names no ceiling to carry to the node")
+	}
+
+	// THE PROPOSAL BEFORE ANYTHING IS REMOVED, from the generation's own tiers,
+	// nodes: and measured ceiling.
+	proposal, err := proposalFrom(root, maxVCPU.Value, maxMemory.Value)
+	if err != nil {
+		return JoinResult{}, err
 	}
 
 	for _, key := range []string{"server", "github", "targets"} {
@@ -103,7 +113,7 @@ func Join(generated, serverAddr, tlsDir string) (JoinResult, error) {
 		return JoinResult{}, err
 	}
 
-	return JoinResult{Node: out.String(), ControlPlane: cp}, nil
+	return JoinResult{Node: out.String(), ControlPlane: cp, Proposal: proposal}, nil
 }
 
 // joinKeyOf names what identifies an entry in each list the control plane

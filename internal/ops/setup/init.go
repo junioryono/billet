@@ -1165,7 +1165,24 @@ func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, join
 
 // printJoinControlPlane prints the half of a join that belongs in the control
 // plane's config.
+//
+// THE TOKEN ONLY WHEN THE NODE'S NAME IS KNOWN. `billet join accept` sets the
+// node's own registered row aside when it raises the ceiling, which is what
+// makes accepting twice, or after the node registered, raise nothing again;
+// with no name it could not, so a generation whose name comes from a
+// certificate not yet issued prints the half to merge by hand, and `billet
+// join`, which knows the name, prints the token.
 func printJoinControlPlane(env cli.Env, joined initconfig.JoinResult) {
+	if joined.Proposal.Node != "" {
+		if token, err := joined.Proposal.Token(); err == nil {
+			fmt.Fprintf(env.Stdout, "\nOn the control plane, one command merges this node's tiers, its "+
+				"nodes: entry and its share of the ceiling into its config:\n\n  billet join accept %s\n\n"+
+				"What that merges, for reading:\n\n%s\n", token, joined.ControlPlane)
+
+			return
+		}
+	}
+
 	fmt.Fprintf(env.Stdout, "\nOn the control plane:\n\n%s\n", joined.ControlPlane)
 }
 

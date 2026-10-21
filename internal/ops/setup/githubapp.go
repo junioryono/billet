@@ -1792,6 +1792,13 @@ func WriteGitHubBlock(env cli.Env, path string, b GitHubBlock) error {
 			"recorded nowhere here", path, err)
 	}
 
+	return ReplaceConfig(env, path, rendered)
+}
+
+// ReplaceConfig replaces an existing config with rendered, atomically, keeping
+// the original's mode and owner: the one in-place writer of a config billet
+// edits a block of (`github-app create --config`, `billet join accept`).
+func ReplaceConfig(env cli.Env, path string, rendered []byte) error {
 	// THE REPLACEMENT PRESERVES WHAT THE ORIGINAL HAD. A rename swaps the
 	// inode, so without this a package-installed root:billet 0640 config — or
 	// the one `init --profile local-service` just arranged — silently becomes
@@ -1893,7 +1900,7 @@ func WriteGitHubBlock(env cli.Env, path string, b GitHubBlock) error {
 	// failed — which would print the block as though nothing had been recorded.
 	if err := SyncDir(filepath.Dir(path)); err != nil {
 		fmt.Fprintf(env.Stderr, "\nWarning: %s was updated, but that could not be flushed to "+
-			"disk (%v). Confirm it still names the App after a reboot.\n", path, err)
+			"disk (%v). Confirm it still says what was written after a reboot.\n", path, err)
 	}
 
 	return nil
