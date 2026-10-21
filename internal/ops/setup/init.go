@@ -15,6 +15,7 @@ import (
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/state"
 
@@ -132,6 +133,9 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 	join := fs.String("join", "",
 		"write a node-only config for this machine that joins the control plane at this "+
 			"node-wire address (host:port), and print what that control plane's config needs")
+	joinDeployment := fs.String("join-deployment", "",
+		"with --join: the deployment the node is enrolling with, which binds the printed "+
+			"`billet join accept` token to it (`billet join` sets it from the authority it verified)")
 
 	// WHERE THE LEDGER LIVES, and it is a property of the CONTROL PLANE rather
 	// than of a backend — so unlike every flag below, these apply to any provider.
@@ -376,6 +380,14 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 	joining := setFlags["join"]
 	if joining && strings.TrimSpace(*join) == "" {
 		return errors.New("--join: the control plane's node-wire address is empty")
+	}
+	if *joinDeployment != "" {
+		if !joining {
+			return errors.New("--join-deployment is a property of a join; pass it with --join")
+		}
+		if err := deploymentid.Validate(*joinDeployment); err != nil {
+			return fmt.Errorf("--join-deployment: %w", err)
+		}
 	}
 	if joining && emitValue == emitAnsible {
 		return errors.New("--join writes this machine's node config and prints the control " +
@@ -705,6 +717,7 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 		if err != nil {
 			return err
 		}
+		joined.Proposal.Deployment = *joinDeployment
 		body = joined.Node
 	}
 
