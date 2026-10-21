@@ -55,4 +55,4 @@ The order never lowers an advertisement. That distinction is the whole lesson of
 
 **Advertise live headroom.** Zero when busy, which is when work queues; and it flickers, so GitHub's view of a tier depends on which poll it read.
 
-**Per-job queueing inside billet.** The wire does not distinguish a re-assignment cancel from a real cancellation, so a local queue drifts into phantom demand or loses real demand. GitHub's `TotalAssignedJobs` is the count billet trusts.
+**Per-job queueing inside billet.** Nothing billet reads distinguishes a re-assignment cancel from a real cancellation (the fields billet's client decodes were identical for both when measured, C1 in [the record](../records/assignment-protocol.md)), so a local queue drifts into phantom demand or loses real demand. GitHub's `TotalAssignedJobs` is the count billet trusts.
