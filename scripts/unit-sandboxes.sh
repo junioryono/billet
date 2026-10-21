@@ -87,6 +87,7 @@ write_config 0.0.0.0:7717 "  tls:
 
 exercises=0
 config=/etc/billet/billet.yaml
+authority_lock=/var/lib/billet/authority.lock
 
 # THE CONFIGURATION EVERY EXERCISE LOADS, loaded once first: a refusal here is
 # the gate's own fixture, and must not read as a sandbox refusing a unit.
@@ -123,27 +124,8 @@ ExecStart=/usr/bin/billet local unit-paths --config ${config} --exercise --marke
 EOF
     systemctl daemon-reload
 
-    started=0
-    if systemctl start "${unit}"; then
-        started=1
-    fi
-
-    result=$(systemctl show --property=Result --value "${unit}")
-    status=$(systemctl show --property=ExecMainStatus --value "${unit}")
-    journalctl -u "${unit}" -o cat --no-pager 2>&1 | grep -E '^(ok|REFUSED) ' || true
-    refused=$(journalctl -u "${unit}" -o cat --no-pager 2>&1 | grep -E '^REFUSED ' | tr '\n' ' ' || true)
-
-    if [ "${started}" -ne 1 ] || [ "${result}" != success ]; then
-        journalctl -u "${unit}" -o cat --no-pager 2>&1 | tail -20 >&2
-        why="${unit} did not start and succeed under its sandbox (Result=${result}, status=${status}) ${refused}"
-        unstub "${unit}"
-        return 1
-    fi
-
-    # WHERE EACH WRITE AND LOCK LANDED, judged outside the sandbox by the same
-    # declaration: a shared directory must hold the marker the unit wrote and a
-    # private one must not, and every lock must be a file on the host, or the
-    # exercise wrote or locked somewhere the command does not expect.
+    # WHERE EACH WRITE AND LOCK MUST LAND, from the same declaration, read
+    # outside the sandbox.
     if ! billet local unit-paths --config "${config}" "${unit}" >/tmp/paths 2>&1; then
         cat /tmp/paths >&2
         why="billet could not say which paths ${unit} needs"
@@ -151,6 +133,45 @@ EOF
         return 1
     fi
 
+    # A LOCK FILE ALREADY THERE PROVES NOTHING ABOUT THIS START, so each is
+    # removed first (every unit is stopped, so nothing holds one) and must be
+    # back once the unit has run. The host's authority lock stays: the
+    # package's `local prepare` made it, its presence is what makes this a
+    # prepared host, and only the exercise inside the sandbox proves it
+    # reachable.
+    while read -r access path rest; do
+        case "${access}:${rest}" in
+            lock:*"could not tell"*) ;;
+            lock:*) [ "${path}" = "${authority_lock}" ] || rm -f "${path}" ;;
+        esac
+    done </tmp/paths
+
+    # WHAT THIS START LOGGED, never an earlier exercise's: a refusal left in the
+    # journal by another run would otherwise read as this one's reason.
+    cursor=$(journalctl -n 0 --show-cursor -o cat --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p')
+
+    started=0
+    if systemctl start "${unit}"; then
+        started=1
+    fi
+
+    result=$(systemctl show --property=Result --value "${unit}")
+    status=$(systemctl show --property=ExecMainStatus --value "${unit}")
+    journalctl -u "${unit}" -o cat --no-pager ${cursor:+--after-cursor "${cursor}"} >/tmp/journal 2>&1 || true
+    grep -E '^(ok|REFUSED) ' /tmp/journal || true
+    refused=$(grep -E '^REFUSED ' /tmp/journal | tr '\n' ' ' || true)
+
+    if [ "${started}" -ne 1 ] || [ "${result}" != success ]; then
+        tail -20 /tmp/journal >&2
+        why="${unit} did not start and succeed under its sandbox (Result=${result}, status=${status}) ${refused}"
+        unstub "${unit}"
+        return 1
+    fi
+
+    # Judged outside the sandbox: a shared directory must hold the marker the
+    # unit wrote and a private one must not, and every lock must be a file on
+    # the host, or the exercise wrote or locked somewhere the command does not
+    # expect.
     writes=0
     : >/tmp/locks
     while read -r access path rest; do
@@ -226,9 +247,10 @@ unstub() {
     return 0
 }
 
-# THE UNITS ARE BILLET'S TO NAME, in the order `billet local up` starts them
-# (the server first: the node on a host that runs both claims the identity the
-# server founded in its directory, which the node's own sandbox cannot write).
+# THE UNITS ARE BILLET'S TO NAME, in the order a fresh host runs them (the
+# server first: the node on a host that runs both claims the identity the server
+# founded in its directory, which the node's own sandbox cannot write; then the
+# node, and then the units the timers `billet local up` enables last start).
 # A strict unit billet declares is started here; one it does not is refused by
 # TestEveryStrictUnitDeclaresItsPaths before a package is built.
 if ! billet local unit-paths --units >/tmp/units 2>&1; then

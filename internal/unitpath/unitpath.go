@@ -68,13 +68,19 @@ type Need struct {
 	// this one is held: an authority exclusion before the directory it guards.
 	// When it is refused, nothing after it is tried.
 	Admits bool `json:"admits,omitempty"`
-	// Take performs a Lock's acquisition the way the command does. It answers
-	// the lock's release, called once every need after it has been exercised,
-	// so a lock the command holds across its work is held across the exercise of
-	// that work; or nil, with nothing held, when another process holds the lock:
-	// the path was reached and the lock is real, which is what a sandbox is asked.
+	// Take performs a Lock's acquisition the way the command does, and answers
+	// what it still holds. An authority exclusion the command holds across its
+	// work answers its release, called once every need after it has been
+	// exercised, so it is held across the exercise of that work. A lock taken and
+	// dropped is released inside Take, which answers NothingHeld, and so does a
+	// lock another process holds: the path was reached and the lock is real,
+	// which is what a sandbox is asked.
 	Take func(ctx context.Context) (release func() error, err error) `json:"-"`
 }
+
+// NothingHeld is the release a Take answers when it holds nothing once it
+// returns.
+func NothingHeld() error { return nil }
 
 // ErrUnknown is an exercise of a need whose path could not be derived.
 var ErrUnknown = errors.New("the path could not be derived on this host")

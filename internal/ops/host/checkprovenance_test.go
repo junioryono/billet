@@ -65,7 +65,7 @@ func TestCheckReportsProvenanceBeforeTheLedger(t *testing.T) {
 	guard := strings.Index(body, "checkGuard(env)")
 	ledger := strings.Index(body, "integrity verified")
 
-	if report < 0 || guard < 0 || ledger < 0 || !(guard < report && report < ledger) {
+	if report < 0 || guard < 0 || ledger < 0 || guard >= report || report >= ledger {
 		t.Errorf("billet check does not report provenance after the guard and before the ledger "+
 			"(guard %d, report %d, ledger %d)", guard, report, ledger)
 	}

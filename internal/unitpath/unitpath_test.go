@@ -45,7 +45,7 @@ func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
 		{"a lock it takes", Need{Path: filepath.Join(dir, "x.lock"), Access: Lock, Take: func(context.Context) (func() error, error) {
 			taken = true
 
-			return nil, nil
+			return NothingHeld, nil
 		}}, "", ""},
 		{"a lock it cannot take", Need{Path: filepath.Join(dir, "y.lock"), Access: Lock, Take: func(context.Context) (func() error, error) {
 			return nil, errors.New("read-only file system")
@@ -156,8 +156,8 @@ func TestExerciseAllHoldsWhatAdmitsTheRestAndStopsWhenRefused(t *testing.T) {
 		t.Errorf("a refused exclusion answered %v", err)
 	}
 
-	if entries, _ := os.ReadDir(guarded); len(entries) != 0 {
-		t.Errorf("a directory behind a refused exclusion was written: %v", entries)
+	if entries, err := os.ReadDir(guarded); err != nil || len(entries) != 0 {
+		t.Errorf("a directory behind a refused exclusion was written (%v): %v", err, entries)
 	}
 }
 
@@ -230,7 +230,7 @@ func TestAFIFOWhereADirectoryShouldBeIsRefusedWithoutAWait(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := Exercise(context.Background(), Need{Path: fifo, Access: Write}, "billet-unit-paths-gate")
+		_, err := Exercise(t.Context(), Need{Path: fifo, Access: Write}, "billet-unit-paths-gate")
 		done <- err
 	}()
 

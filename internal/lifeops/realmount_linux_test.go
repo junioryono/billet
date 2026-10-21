@@ -107,7 +107,12 @@ func TestRealMountsRepairServerStateByMount(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st := info.Sys().(*syscall.Stat_t); st.Uid != 0 {
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatalf("%s has no ownership to read", source)
+		}
+
+		if st.Uid != 0 {
 			t.Errorf("the bound file was given to uid %d", st.Uid)
 		}
 	})

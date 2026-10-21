@@ -290,11 +290,16 @@ echo "ok   refetch: a candidate staged without evidence gets it and is not repla
 rm -f "$stage/billet-v0.16.9.tar.gz" "$stage/billet-v0.16.9.release-manifest.json"
 mv "$work/origin/v0.16.9" "$work/origin/v0.16.9.gone"
 record_before=$(sha "$record")
+asked_before=$(grep -c 'GET /v0.16.9/checksums.txt' "$work/origin.log" || true)
 run backfill v0.16.9
+asked=$(($(grep -c 'GET /v0.16.9/checksums.txt' "$work/origin.log" || true) - asked_before))
 mv "$work/origin/v0.16.9.gone" "$work/origin/v0.16.9"
 grep -q 'could not be fetched again beside the staged candidate' "$work/backfill.log" ||
     fail "origin-gone: the run did not say the evidence could not be fetched" "$work/backfill.log"
 [ "$(sha "$record")" = "$record_before" ] || fail "origin-gone: the record changed without evidence"
+# ASKED ONCE: the play allows a retry, which evidence for a staged candidate
+# must not spend.
+[ "$asked" -eq 1 ] || fail "origin-gone: the evidence was asked for ${asked} times, not once" "$work/origin.log"
 echo "ok   origin-gone: an origin that stopped serving the release fails nothing and says so"
 
 # rollback: the record comes back as it was before the transaction, from what

@@ -247,8 +247,8 @@ func TestUnitPathsListsTheUnitsInStartOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := deploy.ServerUnitName + "\n" + deploy.BackupUnitName + "\n" + deploy.ImagesRefreshUnitName + "\n" +
-		deploy.NodeUnitName + "\n"
+	want := deploy.ServerUnitName + "\n" + deploy.NodeUnitName + "\n" + deploy.BackupUnitName + "\n" +
+		deploy.ImagesRefreshUnitName + "\n"
 	if out.String() != want {
 		t.Errorf("--units printed %q, want %q", out.String(), want)
 	}

@@ -19,12 +19,14 @@ const unitPathLockWait = 5 * time.Second
 // RefreshPaths is every host path `billet images refresh` touches through the
 // pull it runs (#174), built by the functions the pull calls: the staging
 // directory, the kernel directory and its lock, the jailer's chroot base the
-// probe boots under, the probe's lock, and the node's state directory, where a
-// node with no certificate keeps the identity those locks are named for. A
+// probe boots under, the probe's lock, and, for a node with no certificate to
+// name its identity, the state directory that keeps the one the probe's lock is
+// named for. A
 // host that boots no firecracker guest needs the configuration alone, and a
 // lock named for an identity the host has not minted is Unknown.
 func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
-	needs := []unitpath.Need{{Path: cfgPath, Access: unitpath.Read, Why: "the configuration the refresh reads"}}
+	needs := make([]unitpath.Need, 0, 7)
+	needs = append(needs, unitpath.Need{Path: cfgPath, Access: unitpath.Read, Why: "the configuration the refresh reads"})
 
 	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker || cfg.Node.Firecracker == nil {
 		return needs
@@ -45,7 +47,7 @@ func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Ne
 
 				lock, err := takeKernelDirLock(ctx, env, kernels, "exercise this unit's paths")
 				if errors.Is(err, errKernelLockBusy) {
-					return nil, nil
+					return unitpath.NothingHeld, nil
 				}
 
 				if err != nil {
@@ -55,12 +57,14 @@ func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Ne
 				return nil, lock.release()
 			}},
 		unitpath.Need{Path: cfg.Node.Firecracker.ChrootBase, Access: unitpath.Write, Create: true, Mode: 0o700,
-			Why: "the jailer's chroot base, where the verification boots its probe"},
-		unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true, Mode: 0o700,
-			Why: "where a node with no certificate keeps its deployment identity"},
-		probeLockNeed(cfg))
+			Why: "the jailer's chroot base, where the verification boots its probe"})
 
-	return needs
+	if cfg.Node.TLS == nil {
+		needs = append(needs, unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true, Mode: 0o700,
+			Why: "where a node with no certificate keeps its deployment identity"})
+	}
+
+	return append(needs, probeLockNeed(cfg))
 }
 
 // probeLockNeed is the verification lock, named for the deployment the probe
@@ -78,7 +82,7 @@ func probeLockNeed(cfg *config.Config) unitpath.Need {
 
 			lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
 			if errors.Is(err, errProbeLockContended) {
-				return nil, nil
+				return unitpath.NothingHeld, nil
 			}
 
 			if err != nil {

@@ -246,7 +246,10 @@
     mode: "0600"
   register: billet_release_download
   until: billet_release_download is succeeded
-  retries: "{{ billet_fetch_retries }}"
+  # ASKED ONCE WHEN IT IS ONLY EVIDENCE: retried, a pruned version or an origin
+  # that has gone away would cost every converge minutes, for a record that
+  # decides nothing.
+  retries: "{{ 0 if billet_release_candidate_stat.stat.exists else billet_fetch_retries }}"
   delay: "{{ billet_fetch_retry_delay }}"
   changed_when: false
   ignore_errors: "{{ billet_release_candidate_stat.stat.exists }}"
@@ -274,7 +277,7 @@
   until: >-
     billet_release_manifest_download is succeeded
     or billet_release_manifest_download.status_code | default(0) == 404
-  retries: "{{ billet_fetch_retries }}"
+  retries: "{{ 0 if billet_release_candidate_stat.stat.exists else billet_fetch_retries }}"
   delay: "{{ billet_fetch_retry_delay }}"
   changed_when: false
   ignore_errors: true

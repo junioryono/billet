@@ -137,7 +137,11 @@ func assertOwned(t *testing.T, path string, uid, gid int, mode os.FileMode) {
 		t.Fatal(err)
 	}
 
-	st := info.Sys().(*syscall.Stat_t)
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("%s has no ownership to read", path)
+	}
+
 	if int(st.Uid) != uid || int(st.Gid) != gid || info.Mode().Perm() != mode {
 		t.Errorf("%s is %d:%d %o, want %d:%d %o", path, st.Uid, st.Gid, info.Mode().Perm(), uid, gid, mode)
 	}

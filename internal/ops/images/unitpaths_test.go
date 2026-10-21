@@ -3,6 +3,7 @@ package images
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -114,6 +115,41 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 
 		if _, err := os.Stat(n.Path); err != nil {
 			t.Errorf("the probe lock declared at %s is not the file the verification locked: %v", n.Path, err)
+		}
+	}
+}
+
+// A NODE WITH A CERTIFICATE takes its identity from it, so the refresh never
+// writes the node's state directory, and an exercise must not either.
+func TestRefreshPathsOfANodeWithACertificateLeaveItsStateDirectory(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "node")
+
+	body := strings.NewReplacer(
+		"state_dir: /var/lib/billet/node", "state_dir: "+stateDir+"\n  lock_dir: "+filepath.Join(root, "locks"),
+	).Replace(firecrackerNodeConfig)
+
+	cfgPath := filepath.Join(root, "billet.yaml")
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.ContainsFunc(RefreshPaths(processEnv(), cfg, cfgPath), func(n unitpath.Need) bool { return n.Path == stateDir }) {
+		t.Fatal("a node with no certificate does not declare the state directory its identity is minted in")
+	}
+
+	cfg.Node.TLS = &config.NodeTLS{
+		CertPath: filepath.Join(root, "node.crt"), KeyPath: filepath.Join(root, "node.key"), CAPath: filepath.Join(root, "ca.crt"),
+	}
+
+	for _, n := range RefreshPaths(processEnv(), cfg, cfgPath) {
+		if n.Path == stateDir {
+			t.Errorf("a node with a certificate declares %s %s", n.Access, n.Path)
 		}
 	}
 }

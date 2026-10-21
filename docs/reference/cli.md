@@ -159,7 +159,7 @@ Say which host paths the command a shipped systemd unit runs needs, and how (Lin
 | `--json` | print the paths as JSON |
 | `--exercise` | perform each access instead of reporting it |
 | `--marker` | with `--exercise`, leave a file of this name (beginning `billet-unit-paths-`) in each writable directory, so whoever is outside the unit's sandbox can see where the write landed |
-| `--units` | print the units billet declares, in the order `billet local up` starts them, and nothing else |
+| `--units` | print the units billet declares, in the order a fresh host runs them (the server, the node, then the timers' units), and nothing else |
 
 ### `billet local backup|restore|recover`
 

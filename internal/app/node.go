@@ -513,11 +513,11 @@ func NodeDeploymentID(cfg *config.Config, bundle *wirecert.Bundle) (string, erro
 
 // PeekNodeDeploymentID is the identity a node on this host would claim, read
 // without minting one: its certificate's, the control plane's beside it, or its
-// own state directory's, in NodeDeploymentID's order. known is false when none
-// says yet, which is a fresh host's ordinary answer and an error's is not. A
+// own state directory's, in NodeDeploymentID's order. It answers false when
+// none says yet, which is a fresh host's ordinary answer and an error's is not. A
 // bundle the node could not load is an error here, as it is to the node: the
 // next answer down is not the identity it would claim.
-func PeekNodeDeploymentID(cfg *config.Config) (deployment string, known bool, err error) {
+func PeekNodeDeploymentID(cfg *config.Config) (string, bool, error) {
 	if cfg.Node == nil {
 		return "", false, nil
 	}

@@ -60,7 +60,8 @@
       on this host records which release manifest produced /usr/bin/billet, and a
       rollout reads its version rather than its bytes ("NAMED NO MANIFEST" in billet
       status).
-      {{ ('It said: ' ~ ((billet_provenance_record.stderr | default('')) ~ ' ' ~ (billet_provenance_record.stdout | default(''))) | trim)
+      {{ ('It said: ' ~ ((billet_provenance_record.stderr | default('')) ~ ' ' ~ (billet_provenance_record.stdout | default(''))) | trim
+          ~ ' (a billet from before `release record` refuses on every converge, until the role installs a newer one.)')
          if billet_provenance_record.rc is defined
          else 'There is no release evidence to record from: the binary was supplied, or its release publishes no manifest.' }}
   when: >-

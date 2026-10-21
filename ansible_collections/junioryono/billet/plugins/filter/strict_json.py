@@ -83,11 +83,13 @@ def provenance_proves(text, binary_sha256):
         return False
     if not isinstance(record, dict):
         return False
-    # GO MATCHES A MEMBER'S NAME WITHOUT REGARD TO CASE, Unicode folding
-    # included (the long s, U+017F, is an s to it), so "VERSION": 7 or
-    # "verſion": 7 is a version it refuses; casefold() folds them as Go
-    # does, and any spelling of the three but billet's own is refused here
-    # rather than guessed at.
+    # GO MATCHES A MEMBER'S NAME WITHOUT REGARD TO CASE, by Unicode's simple
+    # folding (the long s, U+017F, is an s to it; the dotless and dotted i
+    # are not i), so "VERSION": 7 or "verſion": 7 is a version it refuses.
+    # casefold() folds every name Go's folding does and a few it does not
+    # (the st ligature, U+FB06, is "st"), so a spelling of the three but
+    # billet's own is never proved here, only refused (measured with Go
+    # 1.26.9's encoding/json, 2026-10-21).
     for key in record:
         if key.casefold() in PROVENANCE_MEMBERS and key not in PROVENANCE_MEMBERS:
             return False

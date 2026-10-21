@@ -36,16 +36,17 @@ type unitDeclaration struct {
 }
 
 // unitDeclarations are the shipped units whose sandbox is ProtectSystem=strict
-// (#174), IN THE ORDER `billet local up` STARTS THEM: a node beside a control
-// plane claims the identity the server founded, which the node's own sandbox
-// cannot write. A unit added under a strict sandbox is added here, or unit-paths
+// (#174), IN THE ORDER A FRESH HOST RUNS THEM: `billet local up` starts the
+// server, whose identity a node beside it claims and the node's own sandbox
+// cannot write, then the node, and only then enables the timers that start the
+// backup and the image refresh. A unit added under a strict sandbox is added here, or unit-paths
 // cannot be asked about it and the gate in scripts/test-unit-sandboxes.sh, which
 // asks `--units`, does not start it.
 var unitDeclarations = []unitDeclaration{
 	{unit: deploy.ServerUnitName, paths: serverPaths},
+	{unit: deploy.NodeUnitName, root: true, paths: nodePaths},
 	{unit: deploy.BackupUnitName, paths: backupPaths},
 	{unit: deploy.ImagesRefreshUnitName, root: true, paths: opsimages.RefreshPaths},
-	{unit: deploy.NodeUnitName, root: true, paths: nodePaths},
 }
 
 // cmdLocalUnitPaths reports, or exercises, the host paths a shipped unit's
@@ -65,8 +66,8 @@ func cmdLocalUnitPaths(ctx context.Context, env cli.Env, args []string) error {
 	marker := fs.String("marker", "", "with --exercise, leave a file of this name (beginning "+
 		unitpath.MarkerPrefix+") in each writable directory, so a caller outside the unit's sandbox "+
 		"can see where the write landed")
-	listUnits := fs.Bool("units", false, "print the units billet declares, in the order "+
-		"`billet local up` starts them, and nothing else")
+	listUnits := fs.Bool("units", false, "print the units billet declares, in the order a fresh "+
+		"host runs them (the server, the node, then the timers' units), and nothing else")
 
 	units := make([]string, 0, len(unitDeclarations))
 	for _, d := range unitDeclarations {
@@ -238,7 +239,7 @@ func nodeLockNeed(cfg *config.Config) unitpath.Need {
 
 			_, lock, err := app.ClaimNodeDeployment(cfg, bundle)
 			if errors.Is(err, state.ErrDeploymentLocked) {
-				return nil, nil
+				return unitpath.NothingHeld, nil
 			}
 
 			if err != nil {
@@ -283,7 +284,7 @@ func nodeLockNeed(cfg *config.Config) unitpath.Need {
 // directory's exclusive lock beside the deployment identity the server founds
 // on its first open and a node on the same host claims. Refused, the exclusion
 // leaves the identity directory untouched.
-func serverPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
+func serverPaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
 	needs := configPaths(cfg, cfgPath)
 
 	if cfg.Server == nil {
@@ -317,7 +318,7 @@ func serverPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Nee
 
 				lock, err := state.LockStateDir(dir)
 				if errors.Is(err, state.ErrLocked) {
-					return nil, nil
+					return unitpath.NothingHeld, nil
 				}
 
 				if err != nil {
@@ -331,9 +332,12 @@ func serverPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Nee
 // configPaths is what the server and the backup both read: the configuration
 // and the App keys.
 func configPaths(cfg *config.Config, cfgPath string) []unitpath.Need {
-	needs := []unitpath.Need{{Path: cfgPath, Access: unitpath.Read, Why: "the configuration"}}
+	keys := app.KeyFilePaths(cfg)
 
-	for _, key := range app.KeyFilePaths(cfg) {
+	needs := make([]unitpath.Need, 0, 1+len(keys))
+	needs = append(needs, unitpath.Need{Path: cfgPath, Access: unitpath.Read, Why: "the configuration"})
+
+	for _, key := range keys {
 		needs = append(needs, unitpath.Need{Path: key, Access: unitpath.Read, Why: "a GitHub App private key"})
 	}
 
