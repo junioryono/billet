@@ -530,7 +530,7 @@ func TestTheLintGateLintsForTheHostAndLinux(t *testing.T) {
 	globbed := filepath.Join(t.TempDir(), "billet[2]")
 	gateFixtureAt(t, globbed, []string{"lint.sh"}, true, lint)
 
-	out, err = gateCommand(t, globbed, "scripts/gates/lint.sh", "CI=true").CombinedOutput()
+	out, err := gateCommand(t, globbed, "scripts/gates/lint.sh", "CI=true").CombinedOutput()
 
 	exit, ok := errors.AsType[*exec.ExitError](err)
 	if !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "glob syntax") || strings.Contains(string(out), "niced=") {
