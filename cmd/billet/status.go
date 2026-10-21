@@ -85,12 +85,8 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if hostVCPU > cfg.Server.MaxVCPU || hostMemory > cfg.Server.MaxMemory {
-		fmt.Fprintf(env.Stdout, "ceiling   BELOW THE HOSTS: the %d live hosts contribute %d vCPU and %s, "+
-			"and server.max_vcpu / max_memory allow %d and %s, so the ceiling, not the hosts, "+
-			"decides what runs; raise the ceiling to the hosts' sum, or cap a host with "+
-			"node.max_vcpu / max_memory\n",
-			hosts, hostVCPU, hostMemory, cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+	if below := host.CeilingBelow("live", hosts, hostVCPU, hostMemory, cfg.Server); below != "" {
+		fmt.Fprintf(env.Stdout, "ceiling   %s\n", below)
 	}
 
 	// GROUPED BY TARGET WHEN THERE ARE SEVERAL, because a tier's scale set lives

@@ -98,6 +98,20 @@ SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version
  WHERE live = 1 AND drained = 0
  ORDER BY name;
 
+-- name: ListContributingNodes :many
+-- What every host the fleet still expects to answer contributes, offline ones
+-- included: the hosts a deployment ceiling is sized for.
+--
+-- OFFLINE COUNTS, unlike ListPlaceableNodes, because the question is whether
+-- the configured ceiling covers the fleet, and a host that is down for a
+-- reboot comes back with its whole contribution. A decommissioned host does
+-- not count, proven or not: it is out of the fleet until it registers again,
+-- which clears decommissioned_at.
+SELECT name, total_vcpu, total_memory
+  FROM nodes
+ WHERE decommissioned_at = ''
+ ORDER BY name;
+
 -- name: ReadNodeIncarnation :one
 -- The process one host presented at its current registration, or '' for a host
 -- that never presented one.
