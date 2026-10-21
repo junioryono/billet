@@ -730,26 +730,59 @@ def whole_tree(pattern, cwd):
 
 def full_gate_script(path, cwd):
     """The gate script's name when path, from cwd, is one of billet's full-gate
-    scripts under scripts/gates/, else None."""
-    full = os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
-    gates, name = os.path.split(full)
-    scripts = os.path.dirname(gates)
-    if (name in FULL_GATE_SCRIPTS and os.path.basename(gates) == "gates" and os.path.basename(scripts) == "scripts"
-            and billet_root(os.path.dirname(scripts))):
-        return name
+    scripts under scripts/gates/, else None. Both the path as written and the
+    file it resolves to are asked, so a symlink to the directory or the script
+    names the gate it runs."""
+    lexical = os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
+    for full in (lexical, os.path.realpath(lexical)):
+        gates, name = os.path.split(full)
+        scripts = os.path.dirname(gates)
+        if (name in FULL_GATE_SCRIPTS and os.path.basename(gates) == "gates" and os.path.basename(scripts) == "scripts"
+                and billet_root(os.path.dirname(scripts))):
+            return name
     return None
+
+
+# Shell options that take the next word as their value.
+SHELL_VALUE_OPTIONS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+
+
+def shell_script_operand(words):
+    """The script a shell is handed, read the way the shell reads its options:
+    in order, a value consumed where an option takes one, and nothing after the
+    script counted. None when there is no script, or when -n makes the shell
+    read it and run none of it."""
+    i = 1
+    while i < len(words):
+        w = words[i]
+        if w == "--":
+            i += 1
+            break
+        if w in SHELL_VALUE_OPTIONS:
+            i += 2
+            continue
+        if w.startswith("--"):
+            i += 1
+            continue
+        if len(w) > 1 and w[0] in "-+":
+            # A cluster such as -xe; -n anywhere in it reads without running.
+            if w[0] == "-" and "n" in w[1:]:
+                return None
+            i += 1
+            continue
+        break
+    return words[i] if i < len(words) else None
 
 
 def judge_gate_script(words, cwd):
     path = words[0]
     if os.path.basename(path) in SHELLS:
-        options = [w for w in words[1:] if w.startswith("-")]
-        operands = [w for w in words[1:] if not w.startswith("-")]
-        # -n reads a script and runs none of it.
-        if not operands or any(o.startswith("-") and not o.startswith("--") and "n" in o for o in options):
+        # A shell runs a script named without a slash from its own directory.
+        path = shell_script_operand(words)
+        if path is None:
             return
-        path = operands[0]
-    if "/" not in path:
+    elif "/" not in path:
+        # Run by name, it is found on PATH, never in the current directory.
         return
     name = full_gate_script(path, cwd)
     if name:
