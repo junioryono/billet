@@ -580,6 +580,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+      - name: Sample what this job uses of its runner
+        run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -595,6 +597,15 @@ jobs:
           path: ${{ runner.temp }}/gate-binaries
           if-no-files-found: error
           retention-days: 1
+      - name: Report what this job used of its runner
+        if: always()
+        run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" gate-binaries
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ci-usage-gate-binaries
+          path: ${{ runner.temp }}/ci-usage/usage.json
+          if-no-files-found: ignore
 
   host-lifecycle:
     needs: [changes, gate-binaries]
@@ -640,6 +651,13 @@ jobs:
         shell: env -u RUNNER_NAME bash -e {0}
     steps:
       - uses: actions/checkout@v6
+
+      # WHAT EACH GROUP USES OF ITS RUNNER, which is what its size is chosen
+      # from (#155): busy cores and held memory, sampled every five seconds and
+      # reported in the job's summary and the ci-usage-<group> artifact. A
+      # measurement, never a gate: the report fails nothing.
+      - name: Sample what this group uses of its runner
+        run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
 
       - uses: actions/setup-python@v6
         with:
@@ -954,6 +972,17 @@ jobs:
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^(TestRealSystemdRetirementOperationEffects|TestRealSystemdHostLockDirectoryOutlivesTheNodeStop)$'
           cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
+
+      - name: Report what this group used of its runner
+        if: always()
+        run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" "host-lifecycle (${{ matrix.group }})"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ci-usage-${{ matrix.group }}
+          path: ${{ runner.temp }}/ci-usage/usage.json
+          if-no-files-found: ignore
 
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm
