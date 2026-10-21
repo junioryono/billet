@@ -581,6 +581,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Sample what this job uses of its runner
+        continue-on-error: true
         run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
       - uses: actions/setup-go@v6
         with:
@@ -599,9 +600,11 @@ jobs:
           retention-days: 1
       - name: Report what this job used of its runner
         if: always()
+        continue-on-error: true
         run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" gate-binaries
       - uses: actions/upload-artifact@v7
         if: always()
+        continue-on-error: true
         with:
           name: ci-usage-gate-binaries
           path: ${{ runner.temp }}/ci-usage/usage.json
@@ -665,8 +668,10 @@ jobs:
       # WHAT EACH GROUP USES OF ITS RUNNER, which is what its size is chosen
       # from (#155): busy cores and held memory, sampled every five seconds and
       # reported in the job's summary and the ci-usage-<group> artifact. A
-      # measurement, never a gate: the report fails nothing.
+      # measurement, never a gate: the script exits 0 whatever it finds, and
+      # each of its steps continues on error, the upload included.
       - name: Sample what this group uses of its runner
+        continue-on-error: true
         run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
 
       - uses: actions/setup-python@v6
@@ -985,10 +990,12 @@ jobs:
 
       - name: Report what this group used of its runner
         if: always()
+        continue-on-error: true
         run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" "host-lifecycle (${{ matrix.group }})"
 
       - uses: actions/upload-artifact@v7
         if: always()
+        continue-on-error: true
         with:
           name: ci-usage-${{ matrix.group }}
           path: ${{ runner.temp }}/ci-usage/usage.json

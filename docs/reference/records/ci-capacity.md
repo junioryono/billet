@@ -17,7 +17,7 @@ The longest job in every Go run is about 32 minutes (`host-lifecycle (retirement
 
 ## What each host-lifecycle group uses
 
-Measured by `scripts/ci-usage.sh`, which samples a job's `/proc/stat` and `/proc/meminfo` every five seconds and reports in the job's summary and its `ci-usage-<group>` artifact. On the 8 vCPU runner (31 GiB) in run 39539367492 (2026-10-21):
+Measured by `scripts/ci-usage.sh`, which samples a job's `/proc/stat` and `/proc/meminfo` every five seconds and reports in the job's summary and its `ci-usage-<group>` artifact. The figures below are from its first version, which counted stolen time (the host running something else on the vCPU) as busy, so each is an upper bound on the cores the job ran on; the sampler now reports stolen time on its own. On the 8 vCPU runner (31 GiB) in run 39539367492 (2026-10-21):
 
 | group | mean cores | peak cores | peak GiB held | minutes |
 |---|---|---|---|---|
@@ -72,7 +72,7 @@ On the 2 vCPU runner (8 GiB) in run 39566892000 (2026-10-21):
 | `roles` | 1.02 | 1.34 | 0.82 | 18.0 | not measured |
 | `shape` | 0.90 | 1.25 | 0.81 | 14.1 | 12.5 |
 
-Every group passed. None came near the runner: the highest peak was 1.99 cores and 1.82 GiB, both from `policy` while it compiles, against 2 cores and 7.8 GiB. The longest group is still `retirement-parity-network` at 32.0 minutes against 31.9 on 8 vCPU, inside its 45-minute timeout. `policy` took 22.6 minutes against 17.9, because its compile has two cores instead of eight. The rest moved by -0.5 to +3.0 minutes. That is what two runs of one group differ by on a shared fleet: `retirement-node-shape`, on 2 vCPU in both runs, moved by +3.1. `roles` has no 8 vCPU figure because the baseline run was cancelled before it reported. Counted from GitHub's job records, host-lifecycle took 308 job-minutes, 616 reserved vCPU-minutes. The 8 vCPU baseline took 272 job-minutes and 2,157 vCPU-minutes, so the move frees about 1,540 vCPU-minutes (6,160 GiB-minutes) on every run that selects host-lifecycle.
+Every group passed. Memory never came near the runner's 7.8 GiB: the most any group held was 1.82 GiB. CPU did, in one place: `policy` used both cores (a peak of 1.99) for the few minutes it compiles. Every other group peaked at 1.37 cores or less. The longest group is still `retirement-parity-network` at 32.0 minutes against 31.9 on 8 vCPU, inside its 45-minute timeout. `policy` took 22.6 minutes against 17.9, which is what a compile on two cores instead of eight would cost. The rest moved by -0.5 to +3.0 minutes. That is comparable to what two runs of one group differ by on a shared fleet: `retirement-node-shape`, on 2 vCPU in both runs, moved by +3.1. One pair of runs cannot separate that variance from a small slowdown, and the `ci-usage` reports of later runs will. `roles` has no 8 vCPU figure because the baseline run was cancelled before it reported. Counted from GitHub's job records over the 20 groups both runs completed, host-lifecycle reserved 2,038 vCPU-minutes (257 job-minutes) on 8 vCPU and 579 (290 job-minutes) on 2 vCPU. The move therefore freed 1,459 vCPU-minutes, or 5,836 GiB-minutes, measured. With `roles` at its 2 vCPU time, about 1,570 vCPU-minutes are freed on every run that selects host-lifecycle.
 
 ## The options
 
@@ -80,7 +80,7 @@ Each option is judged on what it does to a Go pull request's verdict and a docs 
 
 | option | Go verdict | reserved per PR run | coverage | flakes | cost to keep | verdict |
 |---|---|---|---|---|---|---|
-| **Run every host-lifecycle group on 2 vCPU** (#155) | shorter by the queue it frees: a quarter of host-lifecycle's reservation | about 1,850 vCPU-minutes instead of 3,400 (host-lifecycle 616 instead of 2,157, measured), and the same in GiB at 4 a vCPU | none | none added | a sampler that reports each group's use every run | **chosen** |
+| **Run every host-lifecycle group on 2 vCPU** (#155) | shorter by the queue it frees: a quarter of host-lifecycle's reservation | about 1,850 vCPU-minutes instead of 3,400 (host-lifecycle 579 instead of 2,038 over the 20 groups measured in both runs), and the same in GiB at 4 a vCPU | unchanged: every group runs every case it ran | none added | a sampler that reports each group's use every run | **chosen** |
 | Run host-lifecycle after merge, or nightly | shorter by host-lifecycle's whole reservation | about 1,200 | a pull request's green check no longer covers the roles, the guard or retirement; a break is found on main, after it merged | fewer per PR | a second gate and a rule for what main does when it fails | declined: CI is the gate |
 | Select host-lifecycle by the Go import closure of the commands its shards run | unchanged | unchanged | none | none | a closure kept in step with the shards | ruled out: the shards run the real `billet` binary, whose closure is nearly all of `internal/`, and 50 of the last 60 merged pull requests selected host-lifecycle |
 | Select host-lifecycle only for test files of the packages its steps compile | unchanged | unchanged | none | none | a rule per package | declined: of the last 60 merged pull requests, it would have spared none |
