@@ -1,10 +1,17 @@
 package host
 
 import (
+	"encoding/json"
 	"go/ast"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // THE DIRECTORIES COME BEFORE EVERY STEP THAT USES THEM (#181): the lifecycle
@@ -118,6 +125,70 @@ func TestJoinStopsOnEveryWayTheConfigIsNotItsNode(t *testing.T) {
 			}
 			if slices.ContainsFunc(f.trace, func(s string) bool { return strings.HasPrefix(s, "enroll") || s == "up" }) {
 				t.Errorf("a config with %s went on to %v", name, f.trace)
+			}
+		})
+	}
+}
+
+// productionJoinFetchAuthority is the fetch as the package declares it,
+// captured before any test replaces it.
+var productionJoinFetchAuthority = joinFetchAuthority
+
+// THE JOIN ITSELF CONFIRMS THE AUTHORITY'S HOLDER, through its own fetch: a
+// bootstrap listener whose certificate the authority signed goes on to the
+// prerequisites, and a responder that replays the public certificate stops the
+// join before anything on the machine is touched.
+func TestJoinStopsAtAResponderThatOnlyReplaysTheAuthority(t *testing.T) {
+	for name, honest := range map[string]bool{"the control plane": true, "a replayer": false} {
+		t.Run(name, func(t *testing.T) {
+			onPlatform(t, "darwin", 501)
+
+			f := &joinFakes{generated: joinedNodeConfig}
+			stageJoin(t, f)
+			joinFetchAuthority = productionJoinFetchAuthority
+
+			caPEM, err := os.ReadFile(f.caCertPath)
+			mustOK(t, err)
+
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if err := json.NewEncoder(w).Encode(nodeapi.CAResponse{
+					CAPEM: string(caPEM), Deployment: testJoinDeployment,
+				}); err != nil {
+					t.Errorf("the stand-in could not answer: %v", err)
+				}
+			}))
+			if honest {
+				serving, err := f.ca.IssueServer([]string{"127.0.0.1"})
+				mustOK(t, err)
+				srv.TLS, err = wirecert.BootstrapTLS(serving)
+				mustOK(t, err)
+			}
+			srv.StartTLS()
+			t.Cleanup(srv.Close)
+
+			args := slices.Clone(joinArgs)
+			args[1] = strings.TrimPrefix(srv.URL, "https://")
+			args[3] = f.ca.Fingerprint()
+			f.generated = strings.Replace(joinedNodeConfig, "cp.example:7717", args[1], 1)
+
+			err = Join(t.Context(), processEnv(), args)
+
+			if honest {
+				if err != nil {
+					t.Fatalf("a join to the real control plane: %v", err)
+				}
+				if !slices.Contains(f.trace, "generate") {
+					t.Errorf("a confirmed authority did not go on to the generation: %v", f.trace)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), "did not prove it holds a key") {
+				t.Fatalf("a replayer answered %v", err)
+			}
+			if len(f.trace) != 0 {
+				t.Errorf("after a replayed authority the join went on to %v", f.trace)
 			}
 		})
 	}

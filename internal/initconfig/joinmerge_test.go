@@ -1,6 +1,8 @@
 package initconfig
 
 import (
+	"bytes"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -140,7 +142,7 @@ func TestMergeJoinIsIdempotentAndNeverLowersTheCeiling(t *testing.T) {
 	}
 
 	// The node has since registered: its own row is set aside as this node.
-	registered := append(fleet, ContributingNode{Name: p.Node, VCPU: p.MaxVCPU, Memory: p.MaxMemory})
+	registered := append(slices.Clone(fleet), ContributingNode{Name: p.Node, VCPU: p.MaxVCPU, Memory: p.MaxMemory})
 
 	for name, reg := range map[string][]ContributingNode{"again": fleet, "after registering": registered} {
 		second, err := MergeJoin(first.Body, p, reg)
@@ -151,7 +153,7 @@ func TestMergeJoinIsIdempotentAndNeverLowersTheCeiling(t *testing.T) {
 			t.Errorf("%s: a second accept changed the config: added %v %v, ceiling %v %v", name,
 				second.AddedTiers, second.AddedNodes, second.VCPU, second.Memory)
 		}
-		if string(second.Body) != string(first.Body) {
+		if !bytes.Equal(second.Body, first.Body) {
 			t.Errorf("%s: a second accept rewrote the config", name)
 		}
 	}

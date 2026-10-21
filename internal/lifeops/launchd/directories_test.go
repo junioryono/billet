@@ -34,7 +34,11 @@ func TestUpPlansTheDirectoriesThisAccountCanCreate(t *testing.T) {
 
 	locked := filepath.Join(home, "locked")
 	mustMkdir(t, locked, 0o500)
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	t.Cleanup(func() {
+		if err := os.Chmod(locked, 0o700); err != nil {
+			t.Errorf("give the test its directory back: %v", err)
+		}
+	})
 	lockDir := filepath.Join(locked, "lock")
 
 	file := filepath.Join(home, "a-file")

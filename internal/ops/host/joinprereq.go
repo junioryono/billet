@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -35,9 +36,15 @@ var (
 
 		return string(out), err
 	}
-	prereqSudo = func(ctx context.Context, env cli.Env, args []string) error {
-		cmd := exec.CommandContext(ctx, "sudo", args...)
+	// SUDO BY ITS ABSOLUTE PATH: a PATH lookup would take a wrapper from any
+	// directory this account can write, /usr/local/bin among them. A command
+	// given input reads it from that, with its output discarded.
+	prereqSudo = func(ctx context.Context, env cli.Env, input io.Reader, args []string) error {
+		cmd := exec.CommandContext(ctx, sudoBinary, args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = env.Stdin, env.Stdout, env.Stderr
+		if input != nil {
+			cmd.Stdin, cmd.Stdout = input, io.Discard
+		}
 
 		return cmd.Run()
 	}
@@ -64,14 +71,15 @@ var (
 // The system binaries the privileged steps run, by absolute path: macOS keeps
 // them on the sealed system volume, so the command sudo runs is the one named.
 const (
-	sudoPmset   = "/usr/bin/pmset"
-	sudoScutil  = "/usr/sbin/scutil"
-	sudoMkdir   = "/bin/mkdir"
-	sudoChown   = "/usr/sbin/chown"
-	sudoChmod   = "/bin/chmod"
-	sudoInstall = "/usr/bin/install"
-	sudoSshd    = "/usr/sbin/sshd"
-	sudoRm      = "/bin/rm"
+	sudoBinary = "/usr/bin/sudo"
+	sudoPmset  = "/usr/bin/pmset"
+	sudoScutil = "/usr/sbin/scutil"
+	sudoMkdir  = "/bin/mkdir"
+	sudoChown  = "/usr/sbin/chown"
+	sudoChmod  = "/bin/chmod"
+	sudoTee    = "/usr/bin/tee"
+	sudoSshd   = "/usr/sbin/sshd"
+	sudoRm     = "/bin/rm"
 )
 
 // macRootStep is one prerequisite that needs root: what it is, whether it is
@@ -167,7 +175,7 @@ func joinPrerequisites(ctx context.Context, env cli.Env, req joinRequest) error 
 	}
 
 	fmt.Fprintln(env.Stdout, "join     asking for sudo once for these (a host whose sudo keeps no timestamp asks for each)")
-	if err := prereqSudo(ctx, env, []string{"-v"}); err != nil {
+	if err := prereqSudo(ctx, env, nil, []string{"-v"}); err != nil {
 		return fmt.Errorf("billet join: sudo: %w; nothing was run as root", err)
 	}
 
@@ -179,8 +187,12 @@ func joinPrerequisites(ctx context.Context, env cli.Env, req joinRequest) error 
 
 		// PROVED, NOT ASSUMED: a command that exits 0 and changes nothing is a
 		// step not done.
-		if done, err := s.done(ctx); err != nil || !done {
-			return fmt.Errorf("billet join: %s: done, and it still does not read back as done (%v)", s.what, err)
+		switch done, err := s.done(ctx); {
+		case err != nil:
+			return fmt.Errorf("billet join: %s: done, and whether it reads back as done could not be told: %w",
+				s.what, err)
+		case !done:
+			return fmt.Errorf("billet join: %s: done, and it still does not read back as done", s.what)
 		}
 
 		fmt.Fprintf(env.Stdout, "done     %s\n", s.what)
@@ -193,7 +205,18 @@ func joinPrerequisites(ctx context.Context, env cli.Env, req joinRequest) error 
 func sudoRun(ctx context.Context, env cli.Env, argv ...string) error {
 	fmt.Fprintf(env.Stdout, "         sudo %s\n", cli.ShellArgs(argv))
 
-	if err := prereqSudo(ctx, env, argv); err != nil {
+	if err := prereqSudo(ctx, env, nil, argv); err != nil {
+		return fmt.Errorf("sudo %s: %w", cli.ShellArgs(argv), err)
+	}
+
+	return nil
+}
+
+// sudoRunInput is sudoRun with input on the command's standard input.
+func sudoRunInput(ctx context.Context, env cli.Env, input string, argv ...string) error {
+	fmt.Fprintf(env.Stdout, "         sudo %s\n", cli.ShellArgs(argv))
+
+	if err := prereqSudo(ctx, env, strings.NewReader(input), argv); err != nil {
 		return fmt.Errorf("sudo %s: %w", cli.ShellArgs(argv), err)
 	}
 
@@ -352,7 +375,7 @@ func scutilNamed(ctx context.Context, key, want string) (bool, error) {
 // ownedBy reports whether dir is a directory account owns. Absent is not
 // owned; anything else unreadable is an error, never a no.
 func ownedBy(dir, account string) (bool, error) {
-	uid, _, err := accountIDs(account)
+	uid, err := accountUID(account)
 	if err != nil {
 		return false, err
 	}
@@ -446,8 +469,13 @@ func grantableSoftnet(path, account string) error {
 		return fmt.Errorf("%s is not a softnet inside a Homebrew Cellar, so it is not made setuid-root", path)
 	}
 
-	if resolved, err := filepath.EvalSymlinks(path); err != nil || resolved != filepath.Clean(path) {
-		return fmt.Errorf("%s is reached through a symbolic link (%v), so it is not made setuid-root", path, err)
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", path, err)
+	}
+	if resolved != filepath.Clean(path) {
+		return fmt.Errorf("%s is reached through a symbolic link (it is %s), so it is not made setuid-root",
+			path, resolved)
 	}
 
 	info, err := os.Lstat(path)
@@ -455,7 +483,7 @@ func grantableSoftnet(path, account string) error {
 		return err
 	}
 
-	uid, _, err := accountIDs(account)
+	uid, err := accountUID(account)
 	if err != nil {
 		return err
 	}
@@ -508,9 +536,12 @@ func sshdHardened(account string) (bool, error) {
 // with no key in its authorized_keys, for which key-only SSH is no SSH at all
 // while AllowUsers shuts every other account out.
 func sshdHardenable(account string) error {
-	if _, err := os.Lstat(sshdDropIn); !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("%s is already there (%v); merge the four lines from the reference hardware page "+
-			"into it yourself", sshdDropIn, err)
+	switch _, err := os.Lstat(sshdDropIn); {
+	case err == nil:
+		return fmt.Errorf("%s is already there; merge the four lines from the reference hardware page "+
+			"into it yourself", sshdDropIn)
+	case !errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("whether %s is already there could not be told: %w", sshdDropIn, err)
 	}
 
 	u, err := prereqLookupUser(account)
@@ -526,36 +557,40 @@ func sshdHardenable(account string) error {
 	return nil
 }
 
-// hardenSSHD installs the drop-in and removes it again when sshd refuses the
-// result: it was not there before (sshdHardenable), so removing it is the
-// exact state it found.
+// hardenSSHD writes the drop-in as root, reads it back, has sshd check it, and
+// removes it again when either is not what it should be: it was not there
+// before (sshdHardenable), so removing it is the exact state it found.
+//
+// THE POLICY TRAVELS ON root's STANDARD INPUT, never through a file this
+// account can write: a file staged in the account's temporary directory and
+// copied by root could be swapped by a process running as the account between
+// its write and root's read, installing policy of that process's choosing, or
+// copying a file only root may read into a world-readable one (Codex,
+// 2026-10-21). The destination's directory is root's, so nothing else can put
+// a link there.
 func hardenSSHD(ctx context.Context, env cli.Env, account string) error {
-	staged, err := os.CreateTemp("", "billet-sshd-*.conf")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(staged.Name()) }()
+	undo := func(cause error) error {
+		if rmErr := sudoRun(ctx, env, sudoRm, "-f", sshdDropIn); rmErr != nil {
+			return fmt.Errorf("%w, and removing the drop-in again failed: %v: remove %s by hand before "+
+				"sshd restarts", cause, rmErr, sshdDropIn)
+		}
 
-	if _, err := staged.WriteString(sshdDropInBody(account)); err != nil {
-		_ = staged.Close()
-
-		return err
-	}
-	if err := staged.Close(); err != nil {
-		return err
+		return fmt.Errorf("%w, so the drop-in was removed again", cause)
 	}
 
-	if err := sudoRun(ctx, env, sudoInstall, "-o", "root", "-g", "wheel", "-m", "0644", staged.Name(), sshdDropIn); err != nil {
-		return err
+	if err := sudoRunInput(ctx, env, sshdDropInBody(account), sudoTee, sshdDropIn); err != nil {
+		return undo(err)
+	}
+
+	switch done, err := sshdHardened(account); {
+	case err != nil:
+		return undo(fmt.Errorf("the drop-in could not be read back: %w", err))
+	case !done:
+		return undo(errors.New("the drop-in does not read back as what was written"))
 	}
 
 	if err := sudoRun(ctx, env, sudoSshd, "-t"); err != nil {
-		if rmErr := sudoRun(ctx, env, sudoRm, "-f", sshdDropIn); rmErr != nil {
-			return fmt.Errorf("sshd refused the drop-in (%w), and removing it again failed: %v: remove %s by "+
-				"hand before sshd restarts", err, rmErr, sshdDropIn)
-		}
-
-		return fmt.Errorf("sshd refused the drop-in, so it was removed again: %w", err)
+		return undo(fmt.Errorf("sshd refused the drop-in: %w", err))
 	}
 
 	return nil
@@ -586,24 +621,14 @@ func fileOwner(info fs.FileInfo) int {
 	return -1
 }
 
-// accountIDs is an account's uid and primary gid.
-func accountIDs(account string) (int, int, error) {
+// accountUID is an account's uid.
+func accountUID(account string) (int, error) {
 	u, err := prereqLookupUser(account)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	return uid, gid, nil
+	return strconv.Atoi(u.Uid)
 }
 
 // verifyLinuxPrerequisites refuses a Linux machine the node cannot run on,

@@ -198,7 +198,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `billet nodes revoke <node> [--reason]` | take back every credential a machine holds |
 | `billet nodes decommission <node> [--force]` | stop expecting a host to answer for its compute; `--force` records the exclusion as unproven |
 | `billet ca issue <node> [--out <dir>] [--reissue] [--lifetime <duration>]` | write a node's certificate bundle (default `./<node>-billet-tls`); `--lifetime` shortens the certificate from a year down to no less than ten minutes, for a short-lived host or a rotation rehearsal |
-| `billet ca token [--ttl 1h] [--uses 1] [--note]` | mint a join token; shown once, stored as a hash. Prints the whole `billet join` the new machine runs (the node-wire address, the authority's fingerprint read without creating one, the token, `--bootstrap-addr` and the target), and the `billet node --enroll` form for a machine whose config is already written |
+| `billet ca token [--ttl 1h] [--uses 1] [--note]` | mint a join token; shown once, stored as a hash. Prints the whole `billet join` the new machine runs (the node-wire address, the authority's fingerprint read without creating one, the token, the enrollment address when one is served, and the target), or for a loopback-only node wire what makes it reachable instead,, and the `billet node --enroll` form for a machine whose config is already written |
 | `billet ca show` | the authority's fingerprint and expiry, with a warning once it is shortening what it issues |
 | `billet ca rotate` | start a rotation: the new authority issues, both are trusted |
 | `billet ca retire [--force]` | finish it: drop the old authority once every node has renewed |

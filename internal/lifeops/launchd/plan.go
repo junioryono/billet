@@ -139,7 +139,8 @@ func creatableBy(dir string) bool {
 // dirMode is the mode a created directory gets: what holds the ledger, the
 // node's state, its locks or an App key is the account's alone.
 func dirMode(req lifeops.UpRequest, dir string) fs.FileMode {
-	private := []string{req.ServerStateDir, req.NodeStateDir, req.NodeLockDir}
+	private := make([]string, 0, 3+len(req.KeyPaths))
+	private = append(private, req.ServerStateDir, req.NodeStateDir, req.NodeLockDir)
 	for _, path := range req.KeyPaths {
 		private = append(private, filepath.Dir(path))
 	}

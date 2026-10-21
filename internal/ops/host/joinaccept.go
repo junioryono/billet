@@ -131,7 +131,9 @@ func joinAccept(ctx context.Context, env cli.Env, args []string) error {
 	if !merge.Changed() {
 		fmt.Fprintf(env.Stdout, "\n%s already has everything this node proposes; nothing to change.\n", path)
 
-		return pendingEnrollmentNote(env, p)
+		pendingEnrollmentNote(env, p)
+
+		return nil
 	}
 
 	if initconfig.RoleRendered(raw) {
@@ -156,7 +158,9 @@ func joinAccept(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "\nWrote %s. The control plane reads tiers when it starts; restart it to take "+
 		"them, which hands over to the next process rather than draining:\n  %s\n", path, serverRestartCommand())
 
-	return pendingEnrollmentNote(env, p)
+	pendingEnrollmentNote(env, p)
+
+	return nil
 }
 
 // proposalText is the proposal from the argument: the token itself, @file, or
@@ -357,10 +361,8 @@ func serverRestartCommand() string {
 // pendingEnrollmentNote reminds the operator of the other half of a join: the
 // node's enrollment request, which is approved by the fingerprint the node
 // printed, never by one read here.
-func pendingEnrollmentNote(env cli.Env, p initconfig.JoinProposal) error {
+func pendingEnrollmentNote(env cli.Env, p initconfig.JoinProposal) {
 	fmt.Fprintf(env.Stdout, "\nIf %s is waiting to enroll, `billet nodes pending` shows its request: compare "+
 		"the fingerprint there with the one the node printed, then\n  billet nodes approve %s --fingerprint "+
 		"<the value you compared>\n", p.Node, p.Node)
-
-	return nil
 }

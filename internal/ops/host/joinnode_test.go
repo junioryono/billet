@@ -28,6 +28,10 @@ type joinFakes struct {
 	// sshdErr fails the fake `sudo sshd -t`.
 	sshdErr  error
 	upConfig string
+	// ca is the authority the fake fetch confirms, and caCertPath its
+	// certificate.
+	ca         *wirecert.CA
+	caCertPath string
 }
 
 func (f *joinFakes) record(step string) { f.trace = append(f.trace, step) }
@@ -56,42 +60,40 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 	// A HOMEBREW LAYOUT: tart and softnet side by side in bin, softnet a
 	// symlink into a Cellar whose file is not yet setuid-root.
 	cellar := filepath.Join(dir, "Cellar")
-	real := filepath.Join(cellar, "softnet", "0.23.0", "bin", "softnet")
-	mustOK(t, os.MkdirAll(filepath.Dir(real), 0o755))
-	mustOK(t, os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755))
+	softnetFile := filepath.Join(cellar, "softnet", "0.23.0", "bin", "softnet")
+	mustOK(t, os.MkdirAll(filepath.Dir(softnetFile), 0o755))
+	mustOK(t, os.WriteFile(softnetFile, []byte("#!/bin/sh\n"), 0o755))
 	bin := filepath.Join(dir, "bin")
 	mustOK(t, os.MkdirAll(bin, 0o755))
-	mustOK(t, os.Symlink(real, filepath.Join(bin, "softnet")))
+	mustOK(t, os.Symlink(softnetFile, filepath.Join(bin, "softnet")))
 	mustOK(t, os.WriteFile(filepath.Join(bin, "tart"), nil, 0o755))
 
 	owned := filepath.Join(dir, "usr-local-bin")
 	mustOK(t, os.Mkdir(owned, 0o755))
 
-	saved := []any{joinFetchAuthority, joinGenerate, joinEnroll, joinPullImages, joinUp, serviceConfigPath,
-		prereqRun, prereqSudo, prereqLookPath, macServiceDirs, softnetCellars, prereqRootUID, prereqTrustRoot,
-		sshdDropIn, prereqLookupUser}
+	fetch, generate, enroll, pull, up, svc := joinFetchAuthority, joinGenerate, joinEnroll, joinPullImages, joinUp,
+		serviceConfigPath
+	run, sudo, look, lookup := prereqRun, prereqSudo, prereqLookPath, prereqLookupUser
+	dirs, cellars, rootUID, trust, dropIn := macServiceDirs, softnetCellars, prereqRootUID, prereqTrustRoot, sshdDropIn
 	t.Cleanup(func() {
-		joinFetchAuthority = saved[0].(func(context.Context, string, string) (string, error))
-		joinGenerate = saved[1].(func(context.Context, cli.Env, []string) error)
-		joinEnroll = saved[2].(func(context.Context, cli.Env, *config.Config, string, string, string) error)
-		joinPullImages = saved[3].(func(context.Context, cli.Env, *config.Config) error)
-		joinUp = saved[4].(func(context.Context, cli.Env, upOptions) error)
-		serviceConfigPath = saved[5].(func() string)
-		prereqRun = saved[6].(func(context.Context, string, ...string) (string, error))
-		prereqSudo = saved[7].(func(context.Context, cli.Env, []string) error)
-		prereqLookPath = saved[8].(func(string) (string, error))
-		macServiceDirs = saved[9].([]string)
-		softnetCellars = saved[10].([]string)
-		prereqRootUID = saved[11].(int)
-		prereqTrustRoot = saved[12].(string)
-		sshdDropIn = saved[13].(string)
-		prereqLookupUser = saved[14].(func(string) (*user.User, error))
+		joinFetchAuthority, joinGenerate, joinEnroll, joinPullImages, joinUp, serviceConfigPath =
+			fetch, generate, enroll, pull, up, svc
+		prereqRun, prereqSudo, prereqLookPath, prereqLookupUser = run, sudo, look, lookup
+		macServiceDirs, softnetCellars, prereqRootUID, prereqTrustRoot, sshdDropIn = dirs, cellars, rootUID, trust, dropIn
 	})
 
-	joinFetchAuthority = func(_ context.Context, base, fp string) (string, error) {
+	// A REAL AUTHORITY, so a bundle it issued verifies against what the fake
+	// confirms.
+	ca, err := wirecert.LoadOrCreateCA(filepath.Join(dir, "authority"), testJoinDeployment)
+	mustOK(t, err)
+	f.ca = ca
+	f.caCertPath = wirecert.CACertPath(filepath.Join(dir, "authority"))
+	caPEM, err := os.ReadFile(wirecert.CACertPath(filepath.Join(dir, "authority")))
+	mustOK(t, err)
+	joinFetchAuthority = func(_ context.Context, base, fp string) (joinAuthority, error) {
 		f.record("fetch " + base + " " + fp)
 
-		return testJoinDeployment, f.fetchErr
+		return joinAuthority{deployment: testJoinDeployment, caPEM: caPEM}, f.fetchErr
 	}
 	joinGenerate = func(_ context.Context, _ cli.Env, args []string) error {
 		f.record("generate")
@@ -205,13 +207,13 @@ func TestJoinFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 		t.Fatalf("join: %v", err)
 	}
 
-	real := strings.TrimPrefix(f.sudoCalls[1], "/usr/sbin/chown -h root ")
+	softnetFile := strings.TrimPrefix(f.sudoCalls[1], "/usr/sbin/chown -h root ")
 	want := []string{
 		"fetch https://cp.example:7717 SHA256:abc",
 		// ONE PASSWORD, THEN THE SYSTEM BINARIES: billet itself never runs as root.
 		"sudo -v",
-		"sudo /usr/sbin/chown -h root " + real,
-		"sudo /bin/chmod u+s " + real,
+		"sudo /usr/sbin/chown -h root " + softnetFile,
+		"sudo /bin/chmod u+s " + softnetFile,
 		"generate",
 		"enroll mac-1 https://cp.example:7717 SHA256:abc tok-1",
 		"images",
@@ -221,8 +223,8 @@ func TestJoinFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 		t.Errorf("join did:\n  %s\nwant:\n  %s", strings.Join(f.trace, " → "), strings.Join(want, " → "))
 	}
 
-	if !strings.HasSuffix(real, "/Cellar/softnet/0.23.0/bin/softnet") {
-		t.Errorf("the grant landed on %q, want the Cellar file behind the symlink", real)
+	if !strings.HasSuffix(softnetFile, "/Cellar/softnet/0.23.0/bin/softnet") {
+		t.Errorf("the grant landed on %q, want the Cellar file behind the symlink", softnetFile)
 	}
 
 	// AND --harden-ssh ADDS THE DROP-IN, installed by the system's install and
@@ -232,7 +234,7 @@ func TestJoinFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 	if err := Join(t.Context(), processEnv(), append(slices.Clone(joinArgs), "--harden-ssh")); err != nil {
 		t.Fatalf("join --harden-ssh: %v", err)
 	}
-	if !slices.ContainsFunc(f2.sudoCalls, func(c string) bool { return strings.HasPrefix(c, "/usr/bin/install ") }) ||
+	if !slices.ContainsFunc(f2.sudoCalls, func(c string) bool { return strings.HasPrefix(c, "/usr/bin/tee ") }) ||
 		!slices.Contains(f2.sudoCalls, "/usr/sbin/sshd -t") {
 		t.Errorf("--harden-ssh did not install and check the drop-in: %v", f2.sudoCalls)
 	}
@@ -297,29 +299,47 @@ func TestJoinStopsWhenInitLeftTheConfigAlone(t *testing.T) {
 // deployment, or that is not a bundle at all is refused, never enrolled over or
 // started with.
 func TestJoinDoesNotEnrollANodeThatHoldsItsBundle(t *testing.T) {
-	issue := func(t *testing.T, deployment, name string) wirecert.Bundle {
+	issue := func(t *testing.T, ca *wirecert.CA, name string) wirecert.Bundle {
 		t.Helper()
 
-		ca, err := wirecert.LoadOrCreateCA(t.TempDir(), deployment)
-		mustOK(t, err)
 		b, err := ca.IssueNode(name)
 		mustOK(t, err)
 
 		return b
 	}
+	another := func(t *testing.T, deployment string) *wirecert.CA {
+		t.Helper()
+
+		ca, err := wirecert.LoadOrCreateCA(t.TempDir(), deployment)
+		mustOK(t, err)
+
+		return ca
+	}
 
 	for name, c := range map[string]struct {
-		write func(t *testing.T, dir string)
+		write func(t *testing.T, f *joinFakes, dir string)
 		want  string
 	}{
-		"its own": {func(t *testing.T, dir string) { mustOK(t, issue(t, testJoinDeployment, "mac-1").Write(dir)) }, ""},
-		"another node's": {func(t *testing.T, dir string) {
-			mustOK(t, issue(t, testJoinDeployment, "mac-2").Write(dir))
+		"its own": {func(t *testing.T, f *joinFakes, dir string) {
+			t.Helper()
+			mustOK(t, issue(t, f.ca, "mac-1").Write(dir))
+		}, ""},
+		"another node's": {func(t *testing.T, f *joinFakes, dir string) {
+			t.Helper()
+			mustOK(t, issue(t, f.ca, "mac-2").Write(dir))
 		}, `node "mac-2"'s`},
-		"another deployment's": {func(t *testing.T, dir string) {
-			mustOK(t, issue(t, "fedcba9876543210fedcba9876543210", "mac-1").Write(dir))
+		"another deployment's": {func(t *testing.T, _ *joinFakes, dir string) {
+			t.Helper()
+			mustOK(t, issue(t, another(t, "fedcba9876543210fedcba9876543210"), "mac-1").Write(dir))
 		}, "deployment fedcba9876543210fedcba9876543210's"},
-		"not a bundle": {func(t *testing.T, dir string) {
+		// A RESTORED OR FOREIGN BUNDLE: right node, right deployment, and an
+		// authority this control plane does not present.
+		"another authority's, naming this deployment": {func(t *testing.T, _ *joinFakes, dir string) {
+			t.Helper()
+			mustOK(t, issue(t, another(t, testJoinDeployment), "mac-1").Write(dir))
+		}, "not issued by the authority this control plane presents now"},
+		"not a bundle": {func(t *testing.T, _ *joinFakes, dir string) {
+			t.Helper()
 			mustOK(t, os.MkdirAll(dir, 0o700))
 			for _, n := range []string{"node.crt", "node.key", "ca.crt"} {
 				mustOK(t, os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600))
@@ -331,7 +351,7 @@ func TestJoinDoesNotEnrollANodeThatHoldsItsBundle(t *testing.T) {
 
 			f := &joinFakes{generated: joinedNodeConfig}
 			cfgPath := stageJoin(t, f)
-			c.write(t, filepath.Join(filepath.Dir(cfgPath), "tls"))
+			c.write(t, f, filepath.Join(filepath.Dir(cfgPath), "tls"))
 
 			err := Join(t.Context(), processEnv(), joinArgs)
 			if c.want != "" {

@@ -100,11 +100,11 @@ func TestCATokenPrintsTheWholeJoinCommand(t *testing.T) {
 
 	// The authority `ca issue` creates, and the fingerprint `ca show` prints,
 	// read from its own output rather than the helper the token's code calls.
-	env, out := bufferEnv()
+	env, _ := bufferEnv()
 	if err := CAIssue(t.Context(), env, []string{"mac-1", "--config", cfg, "--out", filepath.Join(t.TempDir(), "b")}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
-	env, out = bufferEnv()
+	env, out := bufferEnv()
 	mustNil(t, CA(t.Context(), env, []string{"show", "--config", cfg}))
 	fp := ""
 	for l := range strings.SplitSeq(out.String(), "\n") {

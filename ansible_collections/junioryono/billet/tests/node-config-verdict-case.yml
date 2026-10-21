@@ -7,8 +7,10 @@
     content: |
       #!/bin/sh
       printf '%s\n' "$*" >>'{{ billet_gate_verdict_root.path }}/calls'
-      # THE CANDIDATE AS IT WAS WHEN ASKED: $6 is --candidate's value.
+      # THE CANDIDATE AS IT WAS WHEN ASKED: $6 is --candidate's value, and
+      # whether it was 0600 then (find -perm with no sign is an exact match).
       cp "$6" '{{ billet_gate_verdict_root.path }}/asked-candidate' || exit 3
+      find "$6" -perm 600 >'{{ billet_gate_verdict_root.path }}/asked-mode'
       case '{{ billet_gate_verdict_case.verdict | default("keep") }}' in
         keep) cat '{{ playbook_dir }}/fixtures/node-config-change/keep.json' ;;
         restart) cat '{{ playbook_dir }}/fixtures/node-config-change/restart.json' ;;
@@ -32,7 +34,7 @@
     billet_exclusion_answerer: >-
       {{ (billet_gate_verdict_root.path ~ '/billet') if billet_gate_verdict_case.answerer | default(true) else '' }}
     billet_ordinary_config_path: "{{ billet_gate_verdict_root.path }}/etc/billet.yaml"
-    billet_effective_config: {node: {name: gate-node, provider: docker}}
+    billet_effective_config: "{{ billet_gate_verdict_rendering }}"
 
 - name: Read what the answerer was asked
   ansible.builtin.slurp:
@@ -70,8 +72,14 @@
   when: billet_gate_verdict_case.asked
   vars:
     billet_gate_seen: "{{ lookup('ansible.builtin.file', billet_gate_verdict_root.path ~ '/asked-candidate') }}"
+    billet_gate_mode: "{{ lookup('ansible.builtin.file', billet_gate_verdict_root.path ~ '/asked-mode') }}"
   ansible.builtin.assert:
     that:
-      - billet_gate_seen.startswith('# Rendered by the junioryono.billet collection')
-      - "'name: gate-node' in billet_gate_seen"
-    fail_msg: "{{ billet_gate_verdict_case.name }}: the answerer saw {{ billet_gate_seen }}"
+      - >-
+        billet_gate_seen.splitlines()[0] == '# Rendered by the junioryono.billet collection from
+        billet_config: change the inventory, not this file.'
+      # THE WHOLE MAPPING, which differs from the installed file (max_vcpu), so
+      # a candidate copied from the installed one fails.
+      - (billet_gate_seen.splitlines()[1:] | join('\n') | from_yaml) == billet_gate_verdict_rendering
+      - billet_gate_mode | length > 0
+    fail_msg: "{{ billet_gate_verdict_case.name }}: the answerer saw {{ billet_gate_seen }} (0600: {{ billet_gate_mode | length > 0 }})"

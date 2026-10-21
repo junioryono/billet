@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -14,14 +15,14 @@ import (
 )
 
 // fakeSudo stands in for sudo, recording each command and acting it out on the
-// test's own files: mkdir makes the directory, chmod u+s sets the bit, install
-// copies, rm removes, and chown changes nothing because the test's account
-// already owns what it made. extra answers the rest (pmset, scutil, sshd -t),
-// and with no extra they succeed and change nothing.
-func fakeSudo(t *testing.T, record func(string), extra func(args []string) error) func(context.Context, cli.Env, []string) error {
+// test's own files: mkdir makes the directory, chmod u+s sets the bit, tee
+// writes its input, rm removes, and chown changes nothing because the test's
+// account already owns what it made. extra answers the rest (pmset, scutil,
+// sshd -t), and with no extra they succeed and change nothing.
+func fakeSudo(t *testing.T, record func(string), extra func(args []string) error) func(context.Context, cli.Env, io.Reader, []string) error {
 	t.Helper()
 
-	return func(_ context.Context, _ cli.Env, args []string) error {
+	return func(_ context.Context, _ cli.Env, input io.Reader, args []string) error {
 		record(strings.Join(args, " "))
 
 		switch args[0] {
@@ -38,10 +39,13 @@ func fakeSudo(t *testing.T, record func(string), extra func(args []string) error
 			}
 
 			return os.Chmod(args[2], info.Mode().Perm()|os.ModeSetuid)
-		case sudoInstall:
-			raw, err := os.ReadFile(args[len(args)-2])
+		case sudoTee:
+			raw, err := io.ReadAll(input)
 			if err != nil {
 				return err
+			}
+			if teeWrites != nil {
+				raw = teeWrites(raw)
 			}
 
 			return os.WriteFile(args[len(args)-1], raw, 0o644)
@@ -58,6 +62,10 @@ func fakeSudo(t *testing.T, record func(string), extra func(args []string) error
 		return nil
 	}
 }
+
+// teeWrites, when set, changes what the fake tee writes, standing for a write
+// that did not land as sent.
+var teeWrites func([]byte) []byte
 
 // macState is a fake Mac's pmset and scutil, changed by what sudo runs.
 type macState struct {
@@ -139,8 +147,8 @@ func TestJoinPrerequisitesDoOnlyWhatDiffers(t *testing.T) {
 	mac := &macState{sleep: "0", setting: true, names: map[string]string{
 		"HostName": "mac-1", "LocalHostName": "mac-1", "ComputerName": "Somebody's Mac mini",
 	}}
-	calls, top := stageMac(t, mac, "usr/local/var/log/billet")
-	dir := filepath.Join(top, "usr/local/var/log/billet")
+	calls, top := stageMac(t, mac, filepath.Join("usr", "local", "var", "log", "billet"))
+	dir := filepath.Join(top, "usr", "local", "var", "log", "billet")
 
 	if err := joinPrerequisites(t.Context(), processEnv(), joinRequest{provider: "docker", nodeName: "mac-1"}); err != nil {
 		t.Fatalf("join prerequisites: %v", err)
@@ -186,7 +194,7 @@ func TestJoinPrerequisitesRefuseBeforeThePassword(t *testing.T) {
 				mac = &macState{sleep: "0", names: map[string]string{
 					"HostName": "mac-1", "LocalHostName": "mac-1", "ComputerName": "mac-1"}}
 			}
-			calls, top := stageMac(t, mac, "usr/local/var/log/billet")
+			calls, top := stageMac(t, mac, filepath.Join("usr", "local", "var", "log", "billet"))
 			c.stage(top)
 
 			err := joinPrerequisites(t.Context(), processEnv(), joinRequest{provider: "docker", nodeName: "mac-1"})

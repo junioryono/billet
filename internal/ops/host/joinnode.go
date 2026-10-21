@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,22 +32,22 @@ var (
 	// the fingerprint, and ConfirmAuthority reads the deployment over a
 	// handshake only the control plane can complete, before anything on this
 	// machine is changed (Codex, 2026-10-21).
-	joinFetchAuthority = func(ctx context.Context, base, fingerprint string) (string, error) {
+	joinFetchAuthority = func(ctx context.Context, base, fingerprint string) (joinAuthority, error) {
 		caPEM, _, err := nodeclient.FetchCA(ctx, base, fingerprint)
 		if err != nil {
-			return "", err
+			return joinAuthority{}, err
 		}
 
-		deployment, err := nodeclient.ConfirmAuthority(ctx, base, caPEM)
+		deployment, pinned, err := nodeclient.ConfirmAuthority(ctx, base, caPEM, fingerprint)
 		if err != nil {
-			return "", err
+			return joinAuthority{}, err
 		}
 
 		if err := deploymentid.Validate(deployment); err != nil {
-			return "", fmt.Errorf("the control plane names no deployment billet would mint: %w", err)
+			return joinAuthority{}, fmt.Errorf("the control plane names no deployment billet would mint: %w", err)
 		}
 
-		return deployment, nil
+		return joinAuthority{deployment: deployment, caPEM: pinned}, nil
 	}
 	joinGenerate   = setup.Init
 	joinEnroll     = fleetops.EnrollNode
@@ -57,6 +58,13 @@ var (
 	joinGOARCH  = runtime.GOARCH
 	joinGeteuid = os.Geteuid
 )
+
+// joinAuthority is the control plane a join confirmed: its deployment, and
+// the one authority certificate the operator's fingerprint names.
+type joinAuthority struct {
+	deployment string
+	caPEM      []byte
+}
 
 // joinRequest is what `billet join` was asked for.
 type joinRequest struct {
@@ -107,14 +115,14 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 		base = "https://" + req.bootstrapAddr
 	}
 
-	deployment, err := joinFetchAuthority(ctx, base, req.fingerprint)
+	authority, err := joinFetchAuthority(ctx, base, req.fingerprint)
 	if err != nil {
 		return fmt.Errorf("billet join: the control plane's authority at %s: %w (nothing on this machine "+
 			"was changed)", base, err)
 	}
 
 	fmt.Fprintf(env.Stdout, "join     the authority at %s matches %s (deployment %s)\n", base, req.fingerprint,
-		deployment)
+		authority.deployment)
 
 	if req.skipPrerequisites {
 		fmt.Fprintln(env.Stdout, "join     prerequisites skipped (--skip-prerequisites)")
@@ -122,7 +130,7 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	initArgs := joinInitArgs(req, deployment)
+	initArgs := joinInitArgs(req, authority.deployment)
 	if req.dryRun {
 		fmt.Fprintf(env.Stdout, "join     would generate the node's config: billet init %s\n",
 			cli.ShellArgs(initArgs))
@@ -162,14 +170,14 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "\njoin     billet join does the steps above on this machine now; the control "+
 		"plane's half (`billet join accept`) and the approval are yours to run there.\n\n")
 
-	done, err := enrolled(cfg, req.nodeName, deployment)
+	done, err := enrolled(cfg, req.nodeName, authority)
 	switch {
 	case err != nil:
 		return fmt.Errorf("billet join: the certificate bundle at %s cannot be used (%w); move it aside "+
 			"and run billet join again to enroll", filepath.Dir(cfg.Node.TLS.CertPath), err)
 	case done:
 		fmt.Fprintf(env.Stdout, "join     already enrolled: %s is node %s's in deployment %s\n",
-			cfg.Node.TLS.CertPath, req.nodeName, deployment)
+			cfg.Node.TLS.CertPath, req.nodeName, authority.deployment)
 	default:
 		if err := joinEnroll(ctx, env, cfg, base, req.fingerprint, req.token); err != nil {
 			return err
@@ -195,38 +203,38 @@ func parseJoin(env cli.Env, args []string) (joinRequest, error) {
 		workflows, guestOS repeatedFlag
 	)
 
-	fs := cli.NewFlagSet("billet join", env.Stdout)
-	fs.StringVar(&req.server, "server", "", "the control plane's node-wire address, host:port (required)")
-	fs.StringVar(&req.fingerprint, "ca-fingerprint", "", "the control plane's authority fingerprint, from "+
+	flags := cli.NewFlagSet("billet join", env.Stdout)
+	flags.StringVar(&req.server, "server", "", "the control plane's node-wire address, host:port (required)")
+	flags.StringVar(&req.fingerprint, "ca-fingerprint", "", "the control plane's authority fingerprint, from "+
 		"`billet ca show` or `billet ca token` (required)")
-	fs.StringVar(&req.token, "token", "", "a join token from `billet ca token` (required)")
-	fs.StringVar(&req.nodeName, "node-name", "", "this machine's node name (required)")
-	fs.StringVar(&req.bootstrapAddr, "bootstrap-addr", "", "the control plane's enrollment address, when it "+
+	flags.StringVar(&req.token, "token", "", "a join token from `billet ca token` (required)")
+	flags.StringVar(&req.nodeName, "node-name", "", "this machine's node name (required)")
+	flags.StringVar(&req.bootstrapAddr, "bootstrap-addr", "", "the control plane's enrollment address, when it "+
 		"serves one apart from the node wire (`billet ca token` prints it)")
-	fs.StringVar(&req.provider, "provider", defaultJoinProvider(), "this machine's backend")
-	fs.StringVar(&req.org, "org", "", "the GitHub organization the deployment serves")
-	fs.StringVar(&req.repository, "repository", "", "the GitHub repository the deployment serves, as owner/name")
-	fs.StringVar(&req.runnerGroup, "runner-group", "", "the trusted pool's runner group")
-	fs.Var(&workflows, "workflow", "a workflow the trusted pool admits (repeatable)")
-	fs.Var(&guestOS, "guest-os", "tart: macos or linux (repeatable)")
-	fs.StringVar(&req.image, "image", "", "the tier image")
-	fs.StringVar(&req.cfgPath, "config", "", "where to write billet.yaml (defaults to the config the services "+
+	flags.StringVar(&req.provider, "provider", defaultJoinProvider(), "this machine's backend")
+	flags.StringVar(&req.org, "org", "", "the GitHub organization the deployment serves")
+	flags.StringVar(&req.repository, "repository", "", "the GitHub repository the deployment serves, as owner/name")
+	flags.StringVar(&req.runnerGroup, "runner-group", "", "the trusted pool's runner group")
+	flags.Var(&workflows, "workflow", "a workflow the trusted pool admits (repeatable)")
+	flags.Var(&guestOS, "guest-os", "tart: macos or linux (repeatable)")
+	flags.StringVar(&req.image, "image", "", "the tier image")
+	flags.StringVar(&req.cfgPath, "config", "", "where to write billet.yaml (defaults to the config the services "+
 		"billet ships read)")
-	fs.BoolVar(&req.force, "force", false, "replace an existing config billet cannot prove is its own "+
+	flags.BoolVar(&req.force, "force", false, "replace an existing config billet cannot prove is its own "+
 		"output (a live control plane's is never replaced)")
-	fs.BoolVar(&req.skipPrerequisites, "skip-prerequisites", false, "neither perform nor verify the "+
+	flags.BoolVar(&req.skipPrerequisites, "skip-prerequisites", false, "neither perform nor verify the "+
 		"prerequisites")
-	fs.BoolVar(&req.hardenSSH, "harden-ssh", false, "macOS: also write the key-only sshd drop-in, "+
+	flags.BoolVar(&req.hardenSSH, "harden-ssh", false, "macOS: also write the key-only sshd drop-in, "+
 		"AllowUsers this account; prove a key login from a second terminal before closing this one")
-	fs.BoolVar(&req.dryRun, "dry-run", false, "say what would be done, and change nothing")
+	flags.BoolVar(&req.dryRun, "dry-run", false, "say what would be done, and change nothing")
 
-	if err := fs.Parse(args); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return joinRequest{}, err
 	}
 
 	// EVERYTHING AFTER `--` IS INIT'S, and nothing else may be left over: a
 	// positional before it is a mistyped flag.
-	if rest := fs.Args(); len(rest) > 0 {
+	if rest := flags.Args(); len(rest) > 0 {
 		at := len(args) - len(rest) - 1
 		if at < 0 || args[at] != "--" {
 			return joinRequest{}, fmt.Errorf("unexpected argument %q (pass `billet init` flags after --)", rest[0])
@@ -359,11 +367,16 @@ func wroteBeside(path string, before fs.FileInfo, beforeErr error) bool {
 //
 // A BUNDLE IS ENROLLED ONLY WHEN IT PROVES IT: none of its three files is
 // enrollment to do, and all three must load as a key pair that chains to the
-// authority beside it, name this node and this deployment, and still be valid.
-// Anything between (a partial bundle, an unreadable one, another node's or
-// another deployment's, an expired one) is refused rather than enrolled over or
-// started with.
-func enrolled(cfg *config.Config, name, deployment string) (bool, error) {
+// authority beside it, name this node and this deployment, still be valid, and
+// verify against the authority this join just confirmed. Anything between (a
+// partial bundle, an unreadable one, another node's or another deployment's,
+// an expired one, or one an authority this control plane no longer presents
+// issued, such as one restored from before a rotation, or another CA that
+// names the same deployment) is refused rather than enrolled over or started
+// with.
+func enrolled(cfg *config.Config, name string, authority joinAuthority) (bool, error) {
+	deployment := authority.deployment
+
 	tls := cfg.Node.TLS
 	paths := []string{tls.CertPath, tls.KeyPath, tls.CAPath}
 
@@ -406,9 +419,19 @@ func enrolled(cfg *config.Config, name, deployment string) (bool, error) {
 	case got != name:
 		return false, fmt.Errorf("it is node %q's, not %q's", got, name)
 	case dep != deployment:
-		return false, fmt.Errorf("it is deployment %s's, not %s's", dep, deployment)
+		return false, fmt.Errorf("it is deployment %s's, not %s's", dep, authority.deployment)
 	case !time.Now().Before(leaf.NotAfter):
 		return false, fmt.Errorf("it expired at %s", leaf.NotAfter.Format(time.RFC3339))
+	}
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(authority.caPEM) {
+		return false, errors.New("the confirmed authority could not be parsed")
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return false, fmt.Errorf("it was not issued by the authority this control plane presents now: %w", err)
 	}
 
 	return true, nil

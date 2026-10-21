@@ -627,6 +627,8 @@
   connection: local
   gather_facts: false
   vars:
+    # WHAT THE CONVERGE RENDERS, which the installed file below does not say.
+    billet_gate_verdict_rendering: {node: {name: gate-node, provider: docker, max_vcpu: 7}}
     billet_gate_verdict_cases:
       - {name: keep, verdict: keep, changed: false, asked: true}
       - {name: restart, verdict: restart, changed: true, asked: true}

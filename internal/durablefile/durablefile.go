@@ -71,7 +71,8 @@ func (i Installer) Install(
 // matching fs.ErrExist when name is already there, rather than by a rename,
 // which replaces it. The staged name is removed once the link holds the file,
 // and the directory is flushed after both, so a crash leaves either no file or
-// the whole one, and never the staging name beside it.
+// the whole one; one between the link and the removal can also leave the
+// staging name, a dot file (IsStagingName) nothing reads.
 func (i Installer) InstallNew(
 	dir, name string,
 	mode fs.FileMode,

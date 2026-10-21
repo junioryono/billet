@@ -448,7 +448,11 @@ func TestPlanRefusesDirectoriesNothingCanWrite(t *testing.T) {
 	if err := os.Mkdir(locked, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	t.Cleanup(func() {
+		if err := os.Chmod(locked, 0o700); err != nil {
+			t.Errorf("give the test its directory back: %v", err)
+		}
+	})
 	c.logDir = filepath.Join(locked, "does-not-exist")
 	creatable := filepath.Join(t.TempDir(), "node-state")
 

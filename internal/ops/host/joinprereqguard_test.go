@@ -40,8 +40,10 @@ func stageSSH(t *testing.T, sshd func() error) (*[]string, string, string) {
 
 // THE sshd STEP EXISTS ONLY WITH --harden-ssh; IT REFUSES OVER A DROP-IN
 // ALREADY THERE (whatever it says, it is someone's policy) AND FOR AN ACCOUNT
-// WITH NO KEY; it installs through the system's install, and when sshd refuses
-// the result it is removed again, which is exactly the state it found.
+// WITH NO KEY; it writes the policy as root from standard input, never through
+// a file this account could swap, and when sshd refuses the result, or it does
+// not read back as what was sent, it is removed again, which is exactly the
+// state it found.
 func TestJoinHardensSSHDOnlyOverAKeyAndUndoesARefusedDropIn(t *testing.T) {
 	sshdErr := errors.New("exit status 255")
 	calls, home, dropIn := stageSSH(t, func() error { return sshdErr })
@@ -69,10 +71,23 @@ func TestJoinHardensSSHDOnlyOverAKeyAndUndoesARefusedDropIn(t *testing.T) {
 	if _, err := os.Stat(dropIn); !os.IsNotExist(err) {
 		t.Errorf("the drop-in sshd refused is still there (%v)", err)
 	}
-	if want := []string{"/usr/bin/install", "/usr/sbin/sshd -t", "/bin/rm -f " + dropIn}; len(*calls) != 3 ||
-		!strings.HasPrefix((*calls)[0], want[0]+" -o root -g wheel -m 0644 ") || (*calls)[1] != want[1] || (*calls)[2] != want[2] {
-		t.Errorf("sudo ran %v, want install, sshd -t and the removal", *calls)
+	if want := []string{"/usr/bin/tee " + dropIn, "/usr/sbin/sshd -t", "/bin/rm -f " + dropIn}; !slices.Equal(*calls, want) {
+		t.Errorf("sudo ran %v, want %v", *calls, want)
 	}
+
+	// A WRITE THAT DID NOT LAND AS SENT is removed before sshd is asked.
+	*calls = nil
+	sshdErr = nil
+	teeWrites = func([]byte) []byte { return []byte("PermitRootLogin yes\n") }
+	t.Cleanup(func() { teeWrites = nil })
+	err = hardenSSHD(t.Context(), processEnv(), "op")
+	if err == nil || !strings.Contains(err.Error(), "does not read back") || !strings.Contains(err.Error(), "removed again") {
+		t.Errorf("a drop-in that did not read back answered %v", err)
+	}
+	if want := []string{"/usr/bin/tee " + dropIn, "/bin/rm -f " + dropIn}; !slices.Equal(*calls, want) {
+		t.Errorf("sudo ran %v, want %v", *calls, want)
+	}
+	teeWrites = nil
 
 	sshdErr = nil
 	mustOK(t, hardenSSHD(t.Context(), processEnv(), "op"))
