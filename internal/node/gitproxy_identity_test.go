@@ -150,8 +150,8 @@ func TestAMirrorThatFailsMidAnswerIsReplaced(t *testing.T) {
 		t.Fatalf("a pull whose serve failed mid-answer succeeded, so the failure was never staged:\n%s", output)
 	}
 	path := service.git.mirrorPath("untrusted/acme/api")
-	if _, _, err := mirrorRepository(path); !errors.Is(err, errMirrorUnverified) {
-		t.Fatalf("the mirror whose serve failed mid-answer reads %v, want it marked unverified on disk", err)
+	if _, _, err := mirrorRepository(path); !errors.Is(err, errMirrorBroken) {
+		t.Fatalf("the mirror whose serve failed mid-answer reads %v, want it marked broken on disk", err)
 	}
 
 	if err := os.WriteFile(mode, []byte("pass"), 0o600); err != nil {
@@ -265,6 +265,14 @@ func TestAMirrorUnverifiedMidRequestIsNotServed(t *testing.T) {
 	if err := os.WriteFile(mode, []byte("slow"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// UPLOAD-PACK WAITS FOR THIS, so the mark below lands before it answers
+	// however the test is scheduled; the test's end releases it too.
+	release := func() error { return os.WriteFile(mode+".release", nil, 0o600) }
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	})
 	path := service.git.mirrorPath("untrusted/acme/api")
 	before := upstream.guestFetches()
 	type pulled struct {
@@ -289,6 +297,9 @@ func TestAMirrorUnverifiedMidRequestIsNotServed(t *testing.T) {
 	if err := markUnverified(path); err != nil {
 		t.Fatal(err)
 	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
 	result := gitWithin(t, "the pull", func() pulled { return <-done })
 	if result.err != nil {
 		t.Fatalf("the pull: %v\n%s", result.err, result.output)
@@ -298,6 +309,64 @@ func TestAMirrorUnverifiedMidRequestIsNotServed(t *testing.T) {
 	}
 	if upstream.guestFetches() == before {
 		t.Fatal("a mirror marked unverified while the fetch waited was served")
+	}
+}
+
+// A MIRROR MARKED WHILE ITS ADVERTISEMENT IS READ IS NOT ADVERTISED: refs a
+// refresh brought meanwhile are never sent from a mirror GitHub has not
+// vouched for; GitHub's own advertisement is.
+func TestAMirrorMarkedWhileAdvertisedIsNotAdvertised(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, token := gitNode(t, upstream)
+	var log gitLog
+	service.log = slog.New(slog.NewTextHandler(&log, nil))
+	mode := gitWrapper(t, service)
+	git := gitClient(t, node, token, githubBasic)
+	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(mode, []byte("slowadvert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	release := func() error { return os.WriteFile(mode+".release", nil, 0o600) }
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	})
+	type listed struct {
+		output string
+		err    error
+	}
+	done := make(chan listed, 1)
+	go func() {
+		output, err := git("ls-remote", "https://github.com/acme/api.git")
+		done <- listed{output, err}
+	}()
+	gitWithin(t, "the mirror's advertisement to start", func() struct{} {
+		for t.Context().Err() == nil {
+			if _, err := os.Stat(mode + ".started"); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		return struct{}{}
+	})
+	if err := markUnverified(service.git.mirrorPath("untrusted/acme/api")); err != nil {
+		t.Fatal(err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	result := gitWithin(t, "the ls-remote", func() listed { return <-done })
+	if result.err != nil {
+		t.Fatalf("ls-remote: %v\n%s", result.err, result.output)
+	}
+	if !strings.Contains(log.String(), "the mirror was marked while it was advertised") {
+		t.Fatalf("a mirror marked while it was advertised was advertised:\n%s", log.String())
 	}
 }
 

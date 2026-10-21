@@ -47,8 +47,9 @@ func (u *gitUpstream) guestFetches() int64 { return u.fetches.Load() - u.mirrorF
 // gitWrapper puts a git in front of the node's that answers every fetch served
 // from the mirror as mode's file says: "refuse" with an ERR line, "silent" with
 // nothing at all, "hang" with nothing for ten minutes, "nakfail" with a NAK and
-// then a failure, "slow" as git would a second after touching mode.started,
-// anything else as git would.
+// then a failure, "slow" as git would once mode.release exists, after touching
+// mode.started, anything else as git would; "slowadvert" holds the mirror's
+// advertisement the same way.
 func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 	t.Helper()
 
@@ -59,13 +60,17 @@ func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 	wrapper := filepath.Join(t.TempDir(), "git")
 	script := "#!/bin/sh\n" +
 		"case \" $* \" in\n" +
-		"*\" --advertise-refs \"*) exec git \"$@\" ;;\n" +
+		"*\" --advertise-refs \"*)\n" +
+		"  if [ \"$(cat " + mode + ")\" = slowadvert ]; then\n" +
+		"    : >" + mode + ".started; while [ ! -e " + mode + ".release ]; do sleep 0.05; done\n" +
+		"  fi\n" +
+		"  exec git \"$@\" ;;\n" +
 		"*\" upload-pack \"*)\n" +
 		"  case \"$(cat " + mode + ")\" in\n" +
 		"  refuse) printf '0017ERR forced refusal\\n'; exit 1 ;;\n" +
 		"  silent) exit 128 ;;\n" +
 		"  hang) sleep 600; exit 128 ;;\n" +
-		"  slow) : >" + mode + ".started; sleep 1 ;;\n" +
+		"  slow) : >" + mode + ".started; while [ ! -e " + mode + ".release ]; do sleep 0.05; done ;;\n" +
 		"  nakfail) printf '0008NAK\\n'; exit 128 ;;\n" +
 		"  esac ;;\n" +
 		"esac\n" +

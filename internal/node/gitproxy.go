@@ -30,6 +30,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/durablefile"
 )
 
 // The Git proxy serves `git fetch` of github.com repositories from a mirror on
@@ -183,6 +184,8 @@ type gitProxy struct {
 	mirrors    map[string]*gitMirror
 	authorised map[string]gitAuthorisation
 	tooLarge   map[string]time.Time
+	// held is the mirrors a failed serve could not mark on disk, by path.
+	held map[string]bool
 	// renamed maps a repository GitHub redirected to where it now lives.
 	renamed map[string]gitRename
 	// sequence orders GitHub's answers, so a later one always wins over an
@@ -251,6 +254,7 @@ func newGitProxy(root string) *gitProxy {
 		work:          make(chan struct{}, gitWork),
 		mirrors:       make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
 		tooLarge: make(map[string]time.Time),
+		held:     make(map[string]bool),
 		renamed:  make(map[string]gitRename),
 	}
 }
@@ -1214,6 +1218,13 @@ func (s *CacheService) refreshMirror(
 	if err != nil && ctx.Err() != nil {
 		err = context.Cause(ctx)
 	}
+	// AND ONCE MORE AFTER IT: a refresh shares this hold, and one that began
+	// while the refs were read leaves the mirror marked, so refs it fetched are
+	// never advertised from a mirror GitHub has not vouched for.
+	if stamped, _, stampErr := mirrorRepository(path); err == nil &&
+		(stampErr != nil || stamped != repository || s.git.quarantined(path)) {
+		err = errors.Join(errors.New("the mirror was marked while it was advertised"), stampErr)
+	}
 
 	return advertisement, existed, err
 }
@@ -1233,6 +1244,8 @@ func (s *CacheService) claimMirror(
 		switch {
 		case !exists:
 			return true
+		case s.git.quarantined(path):
+			return false
 		case errors.Is(err, errMirrorUnverified):
 			mirror.mu.Lock()
 			refreshing := mirror.refreshing != nil
@@ -1276,6 +1289,7 @@ func (s *CacheService) claimMirror(
 	if err := os.Rename(path, filepath.Join(discarded, "mirror.git")); err != nil {
 		return errors.Join(err, os.Remove(discarded))
 	}
+	s.git.release(path)
 	s.git.goBackground(func() {
 		if err := os.RemoveAll(discarded); err != nil {
 			s.log.Warn("could not delete a discarded git mirror; the reaper will", "error", err)
@@ -1296,18 +1310,54 @@ const gitDiscardDirectory = ".discarded"
 // replaced, on disk so a restart forgets nothing of it.
 const gitUnverifiedStamp = "billet-unverified"
 
-// errMirrorUnverified says a mirror carries gitUnverifiedStamp.
-var errMirrorUnverified = errors.New("the mirror's last fetch or serve was not verified")
+// gitBrokenStamp marks a mirror a serve failed in after its answer began. A
+// refresh that verifies its fetch leaves it, since fetching new refs repairs
+// nothing that broke a serve; only replacing the mirror clears it.
+const gitBrokenStamp = "billet-broken"
 
-// markUnverified writes gitUnverifiedStamp into the mirror at path.
-func markUnverified(path string) error {
-	root, err := os.OpenRoot(path)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
+// errMirrorUnverified says a mirror carries gitUnverifiedStamp, and
+// errMirrorBroken gitBrokenStamp.
+var (
+	errMirrorUnverified = errors.New("the mirror's last fetch was not verified")
+	errMirrorBroken     = errors.New("a serve from the mirror failed mid-answer")
+)
 
-	return root.WriteFile(gitUnverifiedStamp, nil, 0o600)
+// quarantine holds the mirror at path out of service in this process, for a
+// failed serve whose mark could not be written: a disk that refused the mark
+// must not leave the mirror trusted.
+func (g *gitProxy) quarantine(path string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.held[path] = true
+}
+
+func (g *gitProxy) quarantined(path string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.held[path]
+}
+
+// release ends a quarantine once its mirror is gone.
+func (g *gitProxy) release(path string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.held, path)
+}
+
+// markUnverified writes gitUnverifiedStamp into the mirror at path, durably:
+// the fetch it precedes must not begin until a crash would still find it.
+func markUnverified(path string) error { return stampMirror(path, gitUnverifiedStamp) }
+
+// markBroken writes gitBrokenStamp into the mirror at path, durably.
+func markBroken(path string) error { return stampMirror(path, gitBrokenStamp) }
+
+// stampMirror installs an empty file named name in the mirror at path, synced
+// with its directory before it returns.
+func stampMirror(path, name string) error {
+	_, err := durablefile.Installer{}.Install(path, name, 0o600, func(io.Writer) error { return nil })
+
+	return err
 }
 
 // markVerified removes gitUnverifiedStamp from the mirror at path.
@@ -1356,8 +1406,11 @@ func mirrorRepository(path string) (int64, bool, error) {
 	if err != nil || id <= 0 {
 		return 0, true, fmt.Errorf("the mirror's repository stamp %q is unreadable", boundedOutput(raw))
 	}
-	// COULD NOT TELL IS NOT ABSENT: only a stamp proved missing leaves the
-	// mirror verified.
+	// COULD NOT TELL IS NOT ABSENT: only a mark proved missing leaves the
+	// mirror servable.
+	if _, err := root.Stat(gitBrokenStamp); !errors.Is(err, fs.ErrNotExist) {
+		return id, true, errors.Join(errMirrorBroken, err)
+	}
 	if _, err := root.Stat(gitUnverifiedStamp); !errors.Is(err, fs.ErrNotExist) {
 		return id, true, errors.Join(errMirrorUnverified, err)
 	}
@@ -1834,7 +1887,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 		s.forwardGit(exchange, r, request, "no mirror yet")
 
 		return
-	case err != nil || stamped != repository:
+	case err != nil || stamped != repository || s.git.quarantined(path):
 		s.forwardGit(exchange, r, request, "the mirror is not one this repository can be served from")
 
 		return
@@ -1897,7 +1950,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 		again, ok := s.git.granted(request, s.now())
 		stamped, _, err := mirrorRepository(path)
 
-		return ok && again == repository && err == nil && stamped == repository
+		return ok && again == repository && err == nil && stamped == repository && !s.git.quarantined(path)
 	}
 	if served, reason := s.serveUploadPack(ctx, exchange, path, negotiation, stillGranted); !served {
 		s.forwardGit(exchange, r, request, reason)
@@ -1980,8 +2033,9 @@ func (s *CacheService) serveUploadPack(
 	// THE CLIENT LEAVING, or the request's own end, says nothing of the mirror;
 	// an upload-pack that failed while both were alive does.
 	if waitErr != nil && copyErr == nil && ctx.Err() == nil {
-		if err := markUnverified(path); err != nil {
-			waitErr = errors.Join(waitErr, fmt.Errorf("could not mark the mirror unverified: %w", err))
+		if err := markBroken(path); err != nil {
+			s.git.quarantine(path)
+			waitErr = errors.Join(waitErr, fmt.Errorf("could not mark the mirror broken; held out of service: %w", err))
 		}
 	}
 	if waitErr != nil || copyErr != nil {
