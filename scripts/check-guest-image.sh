@@ -578,7 +578,8 @@ image_entries() {
 	*) return 2 ;;
 	esac
 	[ -d "$1$resolved" ] || return 1
-	ls -1A -- "$1$resolved" || return 2
+	# GNU ls quotes names as QUOTING_STYLE says even into a pipe.
+	QUOTING_STYLE=literal ls -1A -- "$1$resolved" || return 2
 }
 
 # image_present succeeds when anything, a symlink included, is at PATH inside the

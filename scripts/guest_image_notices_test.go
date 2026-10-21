@@ -453,6 +453,22 @@ func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T
 			},
 		},
 		{
+			name: "notices behind a link readlink cannot read", command: "readlink", failOn: "*/opt/billet/IMAGE_NOTICES",
+			want: "could not inspect /opt/billet/IMAGE_NOTICES",
+			stage: func(t *testing.T, root string) {
+				notices := filepath.Join(root, "opt", "billet", "IMAGE_NOTICES")
+				body, err := os.ReadFile(notices)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeTreeFile(t, root, "usr/share/doc/billet/IMAGE_NOTICES", string(body))
+				removeAll(t, notices)
+				if err := os.Symlink("/usr/share/doc/billet/IMAGE_NOTICES", notices); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
 			name: "a license behind a link readlink cannot read", command: "readlink", failOn: "*/usr/local/bin/LICENSE.txt",
 			want: "could not inspect /usr/local/bin/LICENSE.txt",
 			stage: func(t *testing.T, root string) {
@@ -499,6 +515,46 @@ func TestThePublicationGateFailsWhenItCannotTellWhatTheImageCarries(t *testing.T
 				t.Fatalf("the gate did not refuse saying %q:\n%s", tc.want, out)
 			}
 		})
+	}
+}
+
+// THE LISTING IS THE DIRECTORY'S OWN NAMES, whatever QUOTING_STYLE the gate
+// inherits: GNU ls quotes into a pipe when told to, and a quoted "1.0.101" names
+// no directory, which would drop every toolcache version from the check. BSD ls
+// ignores the variable, so on macOS this passes either way.
+func TestThePublicationGateListsTheImageWhateverQuotingItInherits(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T, root string) string {
+		t.Helper()
+
+		script := "set -euo pipefail\nFAILED=0\npass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n"
+		for _, name := range noticeGateFunctions {
+			script += checkImageFunction(t, name) + "\n"
+		}
+		script += "check_image_notices \"$1\"\necho \"FAILED=$FAILED\"\n"
+		path := filepath.Join(t.TempDir(), "gate.sh")
+		if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(t.Context(), "bash", path, root)
+		cmd.Env = append(os.Environ(), "QUOTING_STYLE=c")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("the check did not run to its verdict: %v\n%s", err, out)
+		}
+
+		return string(out)
+	}
+
+	if out := run(t, imageNoticesRoot(t)); !strings.Contains(out, "FAILED=0") || !strings.Contains(out, "(5)") {
+		t.Errorf("under QUOTING_STYLE=c a complete image failed, or did not count five:\n%s", out)
+	}
+	root := imageNoticesRoot(t)
+	removeAll(t, filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.101", "x64", "LICENSE.md"))
+	if out := run(t, root); !strings.Contains(out, "FAILED=1") ||
+		!strings.Contains(out, "/opt/hostedtoolcache/copilot-cli/1.0.101/x64/LICENSE.md") {
+		t.Errorf("under QUOTING_STYLE=c an image without the Copilot CLI's license passed:\n%s", out)
 	}
 }
 
