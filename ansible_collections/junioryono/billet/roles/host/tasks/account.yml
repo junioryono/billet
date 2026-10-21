@@ -520,9 +520,15 @@
   become: true
   when: not billet_binary_upgrade | default(false)
 
+# NOT ON A RETIRING NODE'S RETAINED CONVERGE, whose commands are admitted one
+# by one (retirement-role-observe.py) and whose node a retirement holds to the
+# file it started with: skipped, every reader of the verdict falls back to the
+# change itself, which is the restart the retained route always took.
 - name: Decide whether the node reads what this converge changes
   ansible.builtin.import_tasks: node-config-verdict.yml
-  when: not billet_binary_upgrade | default(false)
+  when:
+    - not billet_binary_upgrade | default(false)
+    - not billet_retirement_node_ordinary | bool
 
 - name: Make the node's next stop a drain before its configuration changes
   ansible.builtin.include_tasks: request-node-drain.yml
