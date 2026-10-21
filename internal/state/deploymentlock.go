@@ -58,6 +58,31 @@ func DeploymentLockName(id string) string {
 	return "deployment-" + id + ".lock"
 }
 
+// DeploymentLockPath is where LockDeployment puts the lock for id given the
+// directory a configuration names, the per-user default when it names none.
+func DeploymentLockPath(dir, id string) (string, error) {
+	dir, err := deploymentLockDir(dir)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dir, DeploymentLockName(id)), nil
+}
+
+// deploymentLockDir is the lock directory for a configured one: itself,
+// cleaned, or the per-user default.
+func deploymentLockDir(dir string) (string, error) {
+	if dir == "" {
+		var err error
+
+		if dir, err = defaultLockDir(); err != nil {
+			return "", err
+		}
+	}
+
+	return filepath.Clean(dir), nil
+}
+
 // LockDeployment takes the host-wide lock for a deployment identity.
 //
 // FAILING TO PLACE THE LOCK IS AN ERROR, and it did not used to be. The first
@@ -91,14 +116,11 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		return nil, fmt.Errorf("state: refusing to lock: %w", err)
 	}
 
-	dir, operatorChose := opts.Dir, opts.Dir != ""
-	if !operatorChose {
-		var err error
+	operatorChose := opts.Dir != ""
 
-		dir, err = defaultLockDir()
-		if err != nil {
-			return unplaceable(opts, fmt.Sprintf("no default lock directory (%v)", err))
-		}
+	dir, err := deploymentLockDir(opts.Dir)
+	if err != nil {
+		return unplaceable(opts, fmt.Sprintf("no default lock directory (%v)", err))
 	}
 
 	// ABSOLUTE, AND RESOLVED BEFORE IT IS USED OR LOGGED. A relative lock_dir is

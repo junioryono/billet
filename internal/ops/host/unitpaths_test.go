@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -26,6 +27,8 @@ func TestEveryStrictUnitDeclaresItsPaths(t *testing.T) {
 
 	var strict []string
 
+	root := map[string]bool{}
+
 	for _, file := range files {
 		body, err := os.ReadFile(file)
 		if err != nil {
@@ -34,12 +37,18 @@ func TestEveryStrictUnitDeclaresItsPaths(t *testing.T) {
 
 		if strings.Contains("\n"+string(body), "\nProtectSystem=strict\n") {
 			strict = append(strict, filepath.Base(file))
+			root[filepath.Base(file)] = strings.Contains("\n"+string(body), "\nUser=root\n")
 		}
 	}
 
 	declared := make([]string, 0, len(unitDeclarations))
-	for unit := range unitDeclarations {
-		declared = append(declared, unit)
+	for _, d := range unitDeclarations {
+		declared = append(declared, d.unit)
+
+		// THE ACCOUNT AN EXERCISE IS ALLOWED is the one the unit runs as.
+		if d.root != root[d.unit] {
+			t.Errorf("%s is declared root=%v and its unit says User=root is %v", d.unit, d.root, root[d.unit])
+		}
 	}
 
 	sort.Strings(strict)
@@ -47,6 +56,12 @@ func TestEveryStrictUnitDeclaresItsPaths(t *testing.T) {
 
 	if strings.Join(strict, " ") != strings.Join(declared, " ") {
 		t.Errorf("the strict units are %v and the declared ones %v", strict, declared)
+	}
+
+	// THE SERVER BEFORE THE NODE, as `billet local up` starts them.
+	if slices.IndexFunc(unitDeclarations, func(d unitDeclaration) bool { return d.unit == deploy.ServerUnitName }) >
+		slices.IndexFunc(unitDeclarations, func(d unitDeclaration) bool { return d.unit == deploy.NodeUnitName }) {
+		t.Error("the node is declared before the server, whose identity it claims")
 	}
 }
 
@@ -115,6 +130,48 @@ func TestTheNodeLockIsTheFileTheNodeLocks(t *testing.T) {
 	}
 }
 
+// A LOCK THE CLAIM COULD NOT PLACE IS NOT A LOCK THE SANDBOX PERMITS, even where
+// allow_unlocked_deployment lets the node start without one: the exercise says
+// the path was refused.
+func TestAnUnplacedNodeLockIsARefusal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a 0555 directory, so the refusal this stages needs an unprivileged run")
+	}
+
+	root := t.TempDir()
+	lockDir := filepath.Join(root, "locks")
+	if err := os.Mkdir(lockDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(root, "billet.yaml")
+	body := "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /etc/billet/app-private-key.pem\n" +
+		"node:\n  name: n1\n  server_addr: 127.0.0.1:7717\n  provider: docker\n  state_dir: " +
+		filepath.Join(root, "node") + "\n  lock_dir: " + lockDir + "\n  allow_unlocked_deployment: true\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, n := range nodePaths(processEnv(), cfg, cfgPath) {
+		if n.Access != unitpath.Lock {
+			continue
+		}
+
+		if err := unitpath.Exercise(t.Context(), n, ""); err == nil || !strings.Contains(err.Error(), "could not be placed") {
+			t.Errorf("an unplaced lock was exercised as %v", err)
+		}
+
+		return
+	}
+
+	t.Fatal("the node declares no lock")
+}
+
 func TestUnitPathsRefusesWhatItCannotAnswer(t *testing.T) {
 	old := cli.HostOS
 	cli.HostOS = "linux"
@@ -132,8 +189,11 @@ func TestUnitPathsRefusesWhatItCannotAnswer(t *testing.T) {
 	}{
 		{[]string{"--config", cfgPath}, "usage: billet local unit-paths"},
 		{[]string{"--config", cfgPath, "billet-upgrade.service"}, `"billet-upgrade.service" is not one of them`},
-		{[]string{"--config", cfgPath, "--marker", "gate", deploy.NodeUnitName}, "only with --exercise"},
-		{[]string{"--config", cfgPath, "--exercise", "--marker", "../gate", deploy.NodeUnitName}, "one plain file"},
+		{[]string{"--config", cfgPath, "--marker", "billet-unit-paths-gate", deploy.NodeUnitName}, "only with --exercise"},
+		{[]string{"--config", cfgPath, "--exercise", "--marker", "../billet-unit-paths-gate", deploy.NodeUnitName}, "one plain file"},
+		// A MARKER NEVER NAMES A FILE A COMMAND KEEPS: the ledger here.
+		{[]string{"--config", cfgPath, "--exercise", "--marker", "billet.db", deploy.ServerUnitName}, "one plain file beginning billet-unit-paths-"},
+		{[]string{"--config", cfgPath, "--units", deploy.NodeUnitName}, "--units takes no unit"},
 	} {
 		var out bytes.Buffer
 
@@ -141,6 +201,54 @@ func TestUnitPathsRefusesWhatItCannotAnswer(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%v: got %v, want a refusal saying %q", tc.args, err, tc.want)
 		}
+	}
+}
+
+// AS ROOT, A UNIT THAT RUNS AS ITS SERVICE ACCOUNT IS NOT EXERCISED: the
+// identity and lock it would create beside the ledger would be root's, and the
+// server could not open them at its next start. Refused before anything exists.
+func TestAnExerciseRunsAsTheUnitsOwnAccount(t *testing.T) {
+	oldOS, oldEUID := cli.HostOS, geteuid
+	cli.HostOS, geteuid = "linux", func() int { return 0 }
+	t.Cleanup(func() { cli.HostOS, geteuid = oldOS, oldEUID })
+
+	root := t.TempDir()
+	serverDir := filepath.Join(root, "server")
+	cfgPath := filepath.Join(root, "billet.yaml")
+	if err := os.WriteFile(cfgPath, []byte("server:\n  listen: 127.0.0.1:7717\n  state_dir: "+serverDir+
+		"\n  max_vcpu: 2\n  max_memory: 4GiB\n"+
+		"github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n"+
+		"  private_key_path: /etc/billet/app-private-key.pem\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+
+	err := cmdLocalUnitPaths(t.Context(), cli.Env{Stdout: &out, Stderr: &out},
+		[]string{"--config", cfgPath, "--exercise", deploy.ServerUnitName})
+	if err == nil || !strings.Contains(err.Error(), "runs its command as its service account, not root") {
+		t.Fatalf("root exercised the server's paths: %v", err)
+	}
+
+	if _, err := os.Stat(serverDir); !os.IsNotExist(err) {
+		t.Errorf("the refused exercise created %s (%v)", serverDir, err)
+	}
+}
+
+func TestUnitPathsListsTheUnitsInStartOrder(t *testing.T) {
+	old := cli.HostOS
+	cli.HostOS = "linux"
+	t.Cleanup(func() { cli.HostOS = old })
+
+	var out bytes.Buffer
+	if err := cmdLocalUnitPaths(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, []string{"--units"}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := deploy.ServerUnitName + "\n" + deploy.BackupUnitName + "\n" + deploy.ImagesRefreshUnitName + "\n" +
+		deploy.NodeUnitName + "\n"
+	if out.String() != want {
+		t.Errorf("--units printed %q, want %q", out.String(), want)
 	}
 }
 

@@ -56,21 +56,27 @@ if [ "${deb_count}" -ne 1 ]; then
     exit 1
 fi
 
-name=${BILLET_UNIT_SANDBOX_NAME:-billet-unit-sandboxes}
+name=${BILLET_UNIT_SANDBOX_NAME:-billet-unit-sandboxes-$$}
 replacements=${BILLET_UNIT_SANDBOX_UNIT_DIR:-}
 
+# ONLY THE CONTAINER THIS RUN CREATED IS REMOVED, by the id `docker run`
+# answered: a name another run already holds fails the run below and is left
+# alone.
+container=
 cleanup() {
-    docker rm -f "${name}" >/dev/null 2>&1 || true
+    if [ -n "${container}" ]; then
+        docker rm -f "${container}" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
-docker run -d --name "${name}" --privileged --cgroupns=host \
+container=$(docker run -d --name "${name}" --privileged --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     -v /etc/ssl/certs/ca-certificates.crt:/usr/local/share/billet-host-ca.crt:ro \
     -e DEBIAN_FRONTEND=noninteractive \
     ubuntu:24.04 sh -c \
     'sed -i -e "s,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/," -e "s,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/," /etc/apt/sources.list.d/ubuntu.sources && timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt update -qq && ls /var/lib/apt/lists/*InRelease >/dev/null && timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt install -y -qq systemd systemd-sysv dbus >/dev/null && exec /lib/systemd/systemd' \
-    >/dev/null
+    )
 
 # LONGER THAN THE BOOTSTRAP IT WAITS FOR, as in test-systemd-lifecycle.sh: two
 # bounded apt calls of up to 300s each come before systemd, and a container that

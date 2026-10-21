@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"github.com/junioryono/billet/internal/regularfile"
 )
@@ -103,19 +105,40 @@ func Exercise(ctx context.Context, n Need, marker string) error {
 	}
 }
 
+// MarkerPrefix begins every marker's name, so a marker can never be the name of
+// a file a command keeps in the same directory (a ledger, a lock, an identity).
+const MarkerPrefix = "billet-unit-paths-"
+
+// ValidMarker reports whether name is one plain file name with MarkerPrefix.
+func ValidMarker(name string) bool {
+	return strings.HasPrefix(name, MarkerPrefix) && len(name) > len(MarkerPrefix) &&
+		name == filepath.Base(name) && !strings.ContainsAny(name, "/\x00")
+}
+
 // writeMarker creates a file in dir, synced, and removes it unless it was named.
+//
+// IT NEVER WRITES OVER ANYTHING: a named marker is created exclusively and not
+// through a link at its name, and an unnamed one has a name nobody else has, so
+// the exercise cannot truncate a file a command keeps where it writes.
 func writeMarker(dir, marker string) error {
-	name := marker
-	if name == "" {
-		name = fmt.Sprintf(".billet-unit-paths-%d", os.Getpid())
+	var (
+		f   *os.File
+		err error
+	)
+
+	if marker == "" {
+		f, err = os.CreateTemp(dir, "."+MarkerPrefix+"*")
+	} else if !ValidMarker(marker) {
+		return fmt.Errorf("a marker is one plain file name beginning %s, not %q", MarkerPrefix, marker)
+	} else {
+		f, err = os.OpenFile(filepath.Join(dir, marker), os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	}
 
-	path := filepath.Join(dir, name)
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("write in %s: %w", dir, err)
 	}
+
+	path := f.Name()
 
 	if _, err := f.WriteString("written by billet local unit-paths --exercise\n"); err != nil {
 		_ = f.Close()

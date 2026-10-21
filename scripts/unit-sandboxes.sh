@@ -31,10 +31,13 @@ if [ -d /tmp/replacement-units ]; then
     done
 fi
 
-# A HOST THAT RUNS BOTH ROLES AND BOOTS FIRECRACKER GUESTS, so every strict
-# unit's command has every path it can need. Nothing here is contacted: the App
-# key is read and never used, and no cluster is reached.
-cat >/etc/billet/billet.yaml <<'EOF'
+# A HOST THAT RUNS BOTH ROLES AND BOOTS FIRECRACKER GUESTS, with a node
+# certificate under /etc/billet/tls, so every strict unit's command has every
+# path it can need, renewal's directory included. Nothing here is contacted:
+# the App key is read and never used, and no cluster is reached. The bundle is
+# issued by billet itself, before the node's configuration names it.
+write_config() {
+    cat >/etc/billet/billet.yaml <<EOF
 server:
   listen: 127.0.0.1:7717
   state_dir: /var/lib/billet/server
@@ -51,6 +54,7 @@ node:
   provider: firecracker
   state_dir: /var/lib/billet/node
   lock_dir: /run/billet/locks
+$1
   firecracker:
     kernel_image: /var/lib/billet/kernels/vmlinux
     bridge: billet0
@@ -64,30 +68,52 @@ tiers:
     memory: 4GiB
     image: ubuntu-2404-x64@verified
 EOF
-chown root:billet /etc/billet/billet.yaml
-chmod 0640 /etc/billet/billet.yaml
+    chown root:billet /etc/billet/billet.yaml
+    chmod 0640 /etc/billet/billet.yaml
+}
 
 printf 'a placeholder the units read and never use\n' >/etc/billet/app-private-key.pem
 chown billet:billet /etc/billet/app-private-key.pem
 chmod 0600 /etc/billet/app-private-key.pem
 
-marker=billet-unit-sandbox-gate
+write_config ""
+if ! billet ca issue unit-sandboxes --config /etc/billet/billet.yaml --out /etc/billet/tls >/tmp/issue.log 2>&1; then
+    cat /tmp/issue.log >&2
+    fail "billet could not issue the node's certificate bundle"
+fi
+write_config "  tls:
+    cert: /etc/billet/tls/node.crt
+    key: /etc/billet/tls/node.key
+    ca: /etc/billet/tls/ca.crt"
+
+marker=billet-unit-paths-gate
 config=/etc/billet/billet.yaml
 
-# IN `billet local up`'S ORDER, the server first: the node on a host that runs
-# both claims the identity the server founded in its directory, which the node's
-# own sandbox cannot write.
-for unit in billet-server.service billet-backup.service billet-images-refresh.service billet-node.service; do
+# THE UNITS ARE BILLET'S TO NAME, in the order `billet local up` starts them
+# (the server first: the node on a host that runs both claims the identity the
+# server founded in its directory, which the node's own sandbox cannot write).
+# A strict unit billet declares is started here; one it does not is refused by
+# TestEveryStrictUnitDeclaresItsPaths before a package is built.
+if ! billet local unit-paths --units >/tmp/units 2>&1; then
+    cat /tmp/units >&2
+    fail "billet could not say which units it declares"
+fi
+
+[ -s /tmp/units ] || fail "billet declares no unit"
+
+while read -r unit <&3; do
     if ! systemctl cat "${unit}" >/dev/null 2>&1; then
         fail "${unit} is not installed by the package"
     fi
 
+    # ONLY THE COMMAND IS REPLACED, and the unit stays active once it has run,
+    # because its stop removes the runtime directories it declares, markers and
+    # all, before anything outside could look.
     mkdir -p "/etc/systemd/system/${unit}.d"
     cat >"/etc/systemd/system/${unit}.d/50-unit-sandbox-stub.conf" <<EOF
-# ONLY THE COMMAND IS REPLACED: the stub exercises the paths the command needs,
-# inside every other line of the package's unit.
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 Restart=no
 ExecStart=
 ExecStart=/usr/bin/billet local unit-paths --config ${config} --exercise --marker ${marker} ${unit}
@@ -116,6 +142,7 @@ EOF
         fail "billet could not say which paths ${unit} needs"
     fi
 
+    writes=0
     while read -r access path _; do
         case "${access}" in
             write)
@@ -123,6 +150,7 @@ EOF
                     fail "${unit} wrote in ${path} inside its sandbox, and the host's ${path} has no trace of it"
                 fi
                 rm -f "${path}/${marker}"
+                writes=$((writes + 1))
                 ;;
             private)
                 if [ -e "${path}/${marker}" ]; then
@@ -132,9 +160,14 @@ EOF
         esac
     done </tmp/paths
 
+    [ "${writes}" -gt 0 ] || fail "${unit} declares nowhere it writes, so nothing was judged"
+
+    if ! systemctl stop "${unit}"; then
+        fail "${unit} could not be stopped after its exercise"
+    fi
     rm -rf "/etc/systemd/system/${unit}.d"
     systemctl daemon-reload
-    echo "ok   ${unit}: its sandbox permits every path its command needs"
-done
+    echo "ok   ${unit}: its sandbox permits every path its command needs (${writes} writes judged)"
+done 3</tmp/units
 
 echo "unit sandboxes: every strict unit started under its own sandbox and reached what its command needs"
