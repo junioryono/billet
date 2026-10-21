@@ -84,6 +84,23 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 		t.Errorf("the kernel lock was not taken where it is declared: %v", err)
 	}
 
+	// AN ABSENT CHROOT BASE IS CREATED, as the firecracker provider creates it
+	// (0700) before the probe boots, so a fresh custom one is not a refusal.
+	for _, n := range needs {
+		if n.Path != dirs["jailer"] {
+			continue
+		}
+
+		if _, err := unitpath.Exercise(t.Context(), n, ""); err != nil {
+			t.Fatalf("an absent chroot base was refused: %v", err)
+		}
+
+		info, err := os.Stat(dirs["jailer"])
+		if err != nil || info.Mode().Perm() != 0o700 {
+			t.Errorf("the chroot base was made %v (%v), want the jailer's 0700", info.Mode().Perm(), err)
+		}
+	}
+
 	// THE EXERCISE MINTED THE IDENTITY WHERE THE VERIFICATION DOES, and the
 	// lock it then took is the file the declaration now names.
 	for _, n := range RefreshPaths(processEnv(), cfg, cfgPath) {

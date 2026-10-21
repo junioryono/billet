@@ -59,6 +59,9 @@ type Need struct {
 	// authority exclusion forbids recreating) must already be there, and an
 	// exercise never makes one.
 	Create bool `json:"create,omitempty"`
+	// Mode is the mode the command creates the directory with, 0755 unless it
+	// says otherwise.
+	Mode os.FileMode `json:"mode,omitempty"`
 	// Admits says the needs after this one are what the command does only once
 	// this one is held: an authority exclusion before the directory it guards.
 	// When it is refused, nothing after it is tried.
@@ -77,13 +80,18 @@ var ErrUnknown = errors.New("the path could not be derived on this host")
 // ErrNotAdmitted is a need not tried because a need it depends on was refused.
 var ErrNotAdmitted = errors.New("not tried: the exclusion before it was refused")
 
-// Unique is needs with every repeated path and access dropped, the first kept:
-// a directory two declarations name (a certificate kept in the state directory)
+// Unique is needs with every path cleaned and every repeated path and access
+// dropped, the first kept: a directory two declarations name, however spelled
+// (a certificate kept in a state directory configured with a trailing slash),
 // is one directory, written once.
 func Unique(needs []Need) []Need {
 	out := make([]Need, 0, len(needs))
 
 	for _, n := range needs {
+		if n.Path != "" {
+			n.Path = filepath.Clean(n.Path)
+		}
+
 		if !slices.ContainsFunc(out, func(o Need) bool { return o.Path == n.Path && o.Access == n.Access }) {
 			out = append(out, n)
 		}
@@ -157,7 +165,12 @@ func Exercise(ctx context.Context, n Need, marker string) (func() error, error) 
 
 	case Write, Private:
 		if n.Access == Private || n.Create {
-			if err := os.MkdirAll(n.Path, 0o755); err != nil {
+			mode := n.Mode
+			if mode == 0 {
+				mode = 0o755
+			}
+
+			if err := os.MkdirAll(n.Path, mode); err != nil {
 				return nil, fmt.Errorf("create %s: %w", n.Path, err)
 			}
 		}

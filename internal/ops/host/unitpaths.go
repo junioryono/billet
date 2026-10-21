@@ -158,7 +158,6 @@ func cmdLocalUnitPaths(ctx context.Context, env cli.Env, args []string) error {
 	return nil
 }
 
-
 // exerciseUnitPaths performs every need and refuses if the sandbox refused any.
 func exerciseUnitPaths(ctx context.Context, env cli.Env, unit string, needs []unitpath.Need, marker string) error {
 	err := unitpath.ExerciseAll(ctx, needs, marker, func(n unitpath.Need, err error) {
@@ -189,7 +188,7 @@ func nodePaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
 		return needs
 	}
 
-	needs = append(needs, unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true,
+	needs = append(needs, unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true, Mode: 0o700,
 		Why: "the node's identity and the record of how each of its processes ended"})
 
 	if tls := cfg.Node.TLS; tls != nil {
@@ -213,7 +212,7 @@ func nodePaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
 			Why: "where the node publishes its registration record"})
 
 	if cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.Firecracker != nil {
-		needs = append(needs, unitpath.Need{Path: cfg.Node.Firecracker.ChrootBase, Access: unitpath.Write,
+		needs = append(needs, unitpath.Need{Path: cfg.Node.Firecracker.ChrootBase, Access: unitpath.Write, Create: true, Mode: 0o700,
 			Why: "the jailer's chroot base, where every guest runs"})
 	}
 

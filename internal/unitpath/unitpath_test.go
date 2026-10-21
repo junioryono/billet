@@ -156,13 +156,14 @@ func TestExerciseAllHoldsWhatAdmitsTheRestAndStopsWhenRefused(t *testing.T) {
 
 func TestUniqueKeepsTheFirstOfEachPathAndAccess(t *testing.T) {
 	got := Unique([]Need{
-		{Path: "/var/lib/billet/node", Access: Write, Create: true},
+		{Path: "/var/lib/billet/node/", Access: Write, Create: true},
 		{Path: "/etc/billet/tls/node.crt", Access: Read},
 		{Path: "/var/lib/billet/node", Access: Write},
-		{Path: "/var/lib/billet/node", Access: Read},
+		{Path: "/var/lib/billet//node", Access: Read},
 	})
 
-	if len(got) != 3 || !got[0].Create || got[2].Access != Read {
+	if len(got) != 3 || !got[0].Create || got[0].Path != "/var/lib/billet/node" ||
+		got[2].Access != Read || got[2].Path != "/var/lib/billet/node" {
 		t.Errorf("Unique answered %+v", got)
 	}
 }

@@ -54,9 +54,9 @@ func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Ne
 
 				return nil, lock.release()
 			}},
-		unitpath.Need{Path: cfg.Node.Firecracker.ChrootBase, Access: unitpath.Write,
+		unitpath.Need{Path: cfg.Node.Firecracker.ChrootBase, Access: unitpath.Write, Create: true, Mode: 0o700,
 			Why: "the jailer's chroot base, where the verification boots its probe"},
-		unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true,
+		unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true, Mode: 0o700,
 			Why: "where a node with no certificate keeps its deployment identity"},
 		probeLockNeed(cfg))
 

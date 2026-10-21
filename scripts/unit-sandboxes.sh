@@ -81,7 +81,7 @@ write_config 0.0.0.0:7717 "  tls:
     key: /etc/billet/tls/node.key
     ca: /etc/billet/tls/ca.crt"
 
-marker=billet-unit-paths-gate
+exercises=0
 config=/etc/billet/billet.yaml
 
 # THE CONFIGURATION EVERY EXERCISE LOADS, loaded once first: a refusal here is
@@ -98,6 +98,12 @@ fi
 exercise_unit() {
     unit=$1
     why=
+
+    # A FRESH MARKER EVERY EXERCISE: one an earlier, refused exercise left
+    # behind would make this one's exclusive create fail for a reason that is
+    # not the sandbox's.
+    exercises=$((exercises + 1))
+    marker=billet-unit-paths-gate-${exercises}
 
     # ONLY THE COMMAND IS REPLACED, and the unit stays active once it has run,
     # because its stop removes the runtime directories it declares, markers and
@@ -119,11 +125,13 @@ EOF
     fi
 
     result=$(systemctl show --property=Result --value "${unit}")
+    status=$(systemctl show --property=ExecMainStatus --value "${unit}")
     journalctl -u "${unit}" -o cat --no-pager 2>&1 | grep -E '^(ok|REFUSED) ' || true
+    refused=$(journalctl -u "${unit}" -o cat --no-pager 2>&1 | grep -E '^REFUSED ' | tr '\n' ' ' || true)
 
     if [ "${started}" -ne 1 ] || [ "${result}" != success ]; then
         journalctl -u "${unit}" -o cat --no-pager 2>&1 | tail -20 >&2
-        why="${unit} did not start and succeed under its sandbox (Result=${result})"
+        why="${unit} did not start and succeed under its sandbox (Result=${result}, status=${status}) ${refused}"
         unstub "${unit}"
         return 1
     fi
@@ -199,12 +207,19 @@ EOF
     return 0
 }
 
-# unstub stops UNIT if it is up and removes the stub drop-in.
+# unstub stops UNIT if it is up, removes the stub drop-in, and removes every
+# marker this exercise may have left, whichever way it ended.
 unstub() {
     systemctl stop "$1" >/dev/null 2>&1 || true
     systemctl reset-failed "$1" >/dev/null 2>&1 || true
     rm -rf "/etc/systemd/system/$1.d"
     systemctl daemon-reload
+    if billet local unit-paths --config "${config}" "$1" >/tmp/cleanup-paths 2>/dev/null; then
+        while read -r access path _; do
+            [ "${access}" = write ] && rm -f "${path}/${marker}"
+        done </tmp/cleanup-paths
+    fi
+    return 0
 }
 
 # THE UNITS ARE BILLET'S TO NAME, in the order `billet local up` starts them
@@ -253,7 +268,24 @@ for incident in 169 176 175; do
         cp /tmp/images-refresh.service "${shipped}"
         fail "the gate passed billet-images-refresh.service with #${incident}'s fix reverted"
     fi
-    echo "ok   #${incident}'s revert is refused: ${why}"
+
+    # REFUSED FOR ITS OWN REASON, or the refusal proves nothing about the check
+    # that should have made it: systemd's namespace setup for #169, the probe
+    # lock under the read-only /run for #176, the lock gone after the stop for
+    # #175.
+    case "${incident}" in
+        169) expected="status=226" ;;
+        176) expected="/run/billet/locks/billet-imageverify-" ;;
+        175) expected="stop removed /run/billet/locks/" ;;
+    esac
+    case "${why}" in
+        *"${expected}"*) ;;
+        *)
+            cp /tmp/images-refresh.service "${shipped}"
+            fail "#${incident}'s revert was refused, but not for the reason it reverts (want ${expected}): ${why}"
+            ;;
+    esac
+    echo "ok   #${incident}'s revert is refused for its reason: ${why}"
 
     cp /tmp/images-refresh.service "${shipped}"
     systemctl daemon-reload

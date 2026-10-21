@@ -81,6 +81,8 @@ def main():
         "a record over 64 KiB": ('{"manifest_digest": "x", "binary_sha256": "%s", "pad": "%s"}' % (sha, "x" * (64 << 10)), sha, False),
         "deep nesting, which some decoders raise on": ('[' * 20000 + ']' * 20000, sha, False),
         "a member Go decodes whatever its case": ('{"VERSION": 7, "manifest_digest": "x", "binary_sha256": "%s"}' % sha, sha, False),
+        "a member Go folds the long s into": ('{"ver\\u017fion": 7, "manifest_digest": "x", "binary_sha256": "%s"}' % sha, sha, False),
+        "a folded alias after the hash, which Go keeps": ('{"manifest_digest": "x", "binary_sha256": "%s", "binary_\\u017fha256": "%s"}' % (sha, "c" * 64), sha, False),
         "a NaN, which is Python's and not JSON's": ('{"manifest_digest": "x", "binary_sha256": "%s", "note": NaN}' % sha, sha, False),
         "not UTF-8": (b'{"manifest_digest": "x", "binary_sha256": "\xff"}', sha, False),
         "bytes": (record.encode("utf-8"), sha, True),
