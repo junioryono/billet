@@ -21,14 +21,31 @@ func TestJoinRunsSudoByItsAbsolutePath(t *testing.T) {
 	src, err := os.ReadFile("joinprereq.go")
 	mustOK(t, err)
 
-	// AND A COMMAND GIVEN INPUT READS IT, with its output discarded: the sshd
-	// policy reaches root on tee's standard input, never through a file.
-	if !strings.Contains(string(src), "cmd.Stdin, cmd.Stdout = input, io.Discard") {
-		t.Error("prereqSudo no longer hands a command its input on standard input")
-	}
-
 	file, err := parser.ParseFile(token.NewFileSet(), "joinprereq.go", src, 0)
 	mustOK(t, err)
+
+	// AND A COMMAND GIVEN INPUT READS IT, with its output discarded: the sshd
+	// policy reaches root on tee's standard input, never through a file. Read
+	// as code, so a commented-out assignment does not count.
+	handsInput := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 2 || len(as.Rhs) != 2 {
+			return true
+		}
+
+		var b strings.Builder
+		for _, e := range append(append([]ast.Expr{}, as.Lhs...), as.Rhs...) {
+			b.WriteString(string(src[e.Pos()-file.FileStart : e.End()-file.FileStart]))
+			b.WriteString(";")
+		}
+		handsInput = handsInput || b.String() == "cmd.Stdin;cmd.Stdout;input;io.Discard;"
+
+		return true
+	})
+	if !handsInput {
+		t.Error("prereqSudo no longer hands a command its input on standard input")
+	}
 
 	byConstant := 0
 	ast.Inspect(file, func(n ast.Node) bool {

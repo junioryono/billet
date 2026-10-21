@@ -94,8 +94,12 @@ func TestJoinHardensSSHDOnlyOverAKeyAndUndoesARefusedDropIn(t *testing.T) {
 	if done, err := sshdHardened("op"); err != nil || !done {
 		t.Errorf("the drop-in sshd accepted does not read back as done (%v)", err)
 	}
-	if info, err := os.Stat(dropIn); err != nil || info.Mode().Perm() != 0o644 {
-		t.Errorf("the drop-in is %v (%v), want 0644 whatever the umask left", info.Mode().Perm(), err)
+	info, err := os.Stat(dropIn)
+	if err != nil {
+		t.Fatalf("stat the drop-in: %v", err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("the drop-in is %v, want 0644 whatever the umask left", info.Mode().Perm())
 	}
 
 	// AND NOW IT IS THERE, so another run refuses rather than replacing it.
