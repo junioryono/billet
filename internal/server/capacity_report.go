@@ -36,6 +36,13 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 		Waiting: l.waitingFor,
 	}
 
+	// GITHUB'S DEMAND AS COUNTED, whatever the order made of it: a drain reads
+	// this to say whether assigned work is still waiting (#140).
+	if l.demandKnown {
+		unstarted := l.waitingFor
+		report.Unstarted = &unstarted
+	}
+
 	// THE QUEUE'S OWN RECORD OF WHEN THIS TIER BEGAN WAITING, not a fresh
 	// timestamp: the point of the field is how long the oldest work has been
 	// waiting, and a value stamped at each observation would always read as

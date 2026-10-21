@@ -214,6 +214,14 @@ func TestATierAtItsCapPublishesItsRefusal(t *testing.T) {
 		t.Errorf("the capped tier's report says its purchase was refused for %q, want its own cap",
 			got.Listener.Refusal)
 	}
+
+	// AND GITHUB'S DEMAND IS PUBLISHED WHATEVER THE ORDER MADE OF IT: three
+	// assigned, one started, so a drain can say two are waiting though the
+	// tier holds no place in line (#140).
+	if got.Listener.Unstarted == nil || *got.Listener.Unstarted != 2 {
+		t.Errorf("the capped tier publishes %v unstarted jobs, want the 2 it could not buy for",
+			got.Listener.Unstarted)
+	}
 }
 
 // AN OFFER DECLINED PAST THE ESCROW ALREADY HELD SAYS WHY. One lease is held

@@ -417,8 +417,7 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 			// asks each host what its provider is actually running. The order is
 			// load-bearing: while a lease is open a launch may still be dispatched,
 			// which moves a host's fence and discards whatever it had proved.
-			fmt.Fprintf(env.Stdout, "Drained: this deployment is sealed and the ledger records no\n")
-			fmt.Fprintf(env.Stdout, "outstanding lease.\n\n")
+			reportAssignedDemand(ctx, env, allocator, cfg)
 
 			if opts.WithoutProof {
 				fmt.Fprintf(env.Stdout, "No host was asked what it is running (--without-compute-proof).\n")
@@ -442,6 +441,85 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 		case <-ticker.C:
 		}
 	}
+}
+
+// tierDemand is work GitHub has assigned one tier and this deployment has not
+// started, as the tier's listener last counted it.
+type tierDemand struct {
+	tier string
+	// unstarted is the count, or nil when it could not be read, which unknown
+	// says why.
+	unstarted *int
+	unknown   string
+	observed  string
+}
+
+// assignedDemand reads every tier's last count of assigned work it has not
+// started, keeping only the tiers with some or whose count could not be read.
+func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config.Config) []tierDemand {
+	var out []tierDemand
+
+	for i := range cfg.Tiers {
+		label := cfg.Tiers[i].Label
+
+		r, err := allocator.CapacityReport(ctx, label)
+
+		switch {
+		case err != nil:
+			out = append(out, tierDemand{tier: label, unknown: err.Error()})
+		case r.ObservationError != "":
+			out = append(out, tierDemand{tier: label, unknown: r.ObservationError})
+		case r.ObservedAt == "":
+			out = append(out, tierDemand{tier: label, unknown: "no listener has reported"})
+		case r.Listener.Unstarted == nil:
+			out = append(out, tierDemand{tier: label, observed: r.ObservedAt,
+				unknown: "its listener has not counted it, or predates the count"})
+		case *r.Listener.Unstarted > 0:
+			out = append(out, tierDemand{tier: label, unstarted: r.Listener.Unstarted, observed: r.ObservedAt})
+		}
+	}
+
+	return out
+}
+
+// reportAssignedDemand is the ledger barrier's verdict, which says "Drained"
+// only when no tier has work GitHub assigned it waiting to start.
+//
+// A SEALED DEPLOYMENT CAN BE QUIET AND STILL OWE WORK (#140). A seal buys
+// nothing, so a job GitHub assigned to a sealed tier holds no lease and the
+// ledger barrier cannot see it; it waits at GitHub until admission reopens.
+// Printed as "Drained", an operator retiring the deployment would take that as
+// nothing left to do while builds sat queued behind it. The count is each
+// listener's last observation, so it is printed with its date, and a count that
+// could not be read is said to be unknown rather than taken for none.
+//
+// NOT A WAIT. Work a seal keeps out never starts while the seal holds, so
+// waiting for it would never end; the drain goes on to prove the machines idle,
+// which is what a maintenance window needs, and says what is still owed.
+func reportAssignedDemand(ctx context.Context, env cli.Env, allocator *alloc.Allocator, cfg *config.Config) {
+	demand := assignedDemand(ctx, allocator, cfg)
+	if len(demand) == 0 {
+		fmt.Fprintf(env.Stdout, "Drained: this deployment is sealed, the ledger records no outstanding\n")
+		fmt.Fprintf(env.Stdout, "lease, and no tier has work GitHub assigned it waiting to start.\n\n")
+
+		return
+	}
+
+	fmt.Fprintf(env.Stdout, "The ledger is quiet: this deployment is sealed and records no outstanding\n")
+	fmt.Fprintf(env.Stdout, "lease. It is NOT drained of what GitHub has assigned it:\n")
+
+	for _, d := range demand {
+		if d.unstarted == nil {
+			fmt.Fprintf(env.Stdout, "  %s: unknown (%s)\n", d.tier, d.unknown)
+
+			continue
+		}
+
+		fmt.Fprintf(env.Stdout, "  %s: %d job(s) assigned and not started (as of %s)\n", d.tier, *d.unstarted, d.observed)
+	}
+
+	fmt.Fprintf(env.Stdout, "Assigned work waits at GitHub and starts after `billet resume`; nothing is\n")
+	fmt.Fprintf(env.Stdout, "running for it here, and a drain cannot finish it.\n\n")
 }
 
 // barrierSilentAfter is how long the fleet may say nothing before this hints at

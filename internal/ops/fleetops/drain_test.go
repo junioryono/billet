@@ -298,21 +298,101 @@ func loadFixtureConfig(t *testing.T, cfgPath string) *config.Config {
 	return cfg
 }
 
-// A DRAIN WITH NOTHING RUNNING RETURNS IMMEDIATELY.
-func TestDrainWaitReturnsWhenTheDeploymentHoldsNothing(t *testing.T) {
-	_, cfg := drainFixture(t)
+// publishDemand records what a tier's listener last counted of the work GitHub
+// assigned it and it has not started, as a running control plane does at every
+// poll; nil publishes an observation without the count.
+func publishDemand(t *testing.T, db *state.DB, cfg *config.Config, tier string, unstarted *int) {
+	t.Helper()
+
+	a, err := alloc.New(db, alloc.Limits{
+		MaxVCPU: cfg.Server.MaxVCPU, MaxMemory: cfg.Server.MaxMemory, Nodes: cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		t.Fatalf("allocator: %v", err)
+	}
+
+	if err := a.RecordListenerCapacity(t.Context(), tier, alloc.ListenerCapacity{
+		Exchange: "confirmed", Unstarted: unstarted,
+	}); err != nil {
+		t.Fatalf("record %s's observation: %v", tier, err)
+	}
+}
+
+// drainWait runs `billet drain --wait` and returns what it printed.
+func drainWait(t *testing.T, cfgPath string) string {
+	t.Helper()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	out := capture(t, func() {
-		if err := Drain(ctx, processEnv(), []string{"--config", cfg, "--wait"}); err != nil {
+	return capture(t, func() {
+		if err := Drain(ctx, processEnv(), []string{"--config", cfgPath, "--wait", "--without-compute-proof"}); err != nil {
 			t.Errorf("drain --wait: %v", err)
 		}
 	})
+}
 
-	if !strings.Contains(out, "Drained") {
+// A DRAIN WITH NOTHING RUNNING AND NOTHING ASSIGNED RETURNS IMMEDIATELY.
+func TestDrainWaitReturnsWhenTheDeploymentHoldsNothing(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	if out := drainWait(t, cfgPath); !strings.Contains(out, "Drained") {
 		t.Errorf("a deployment holding nothing did not report itself drained:\n%s", out)
+	}
+}
+
+// A QUIET LEDGER IS NOT A DRAINED DEPLOYMENT WHILE GITHUB HAS ASSIGNED IT WORK
+// (#140). A seal buys nothing, so a job assigned to a sealed tier holds no
+// lease and the ledger barrier cannot see it; "Drained" would tell an operator
+// retiring the deployment there was nothing left, while builds sat queued.
+func TestADrainNamesAssignedWorkTheLedgerCannotSee(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	none, three := 0, 3
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	waiting := cfg.Tiers[0].Label
+	publishDemand(t, db, cfg, waiting, &three)
+
+	out := drainWait(t, cfgPath)
+
+	if strings.Contains(out, "Drained") {
+		t.Errorf("a drain called a deployment drained with three assigned jobs waiting:\n%s", out)
+	}
+
+	if !strings.Contains(out, waiting+": 3 job(s) assigned and not started") {
+		t.Errorf("the drain does not name the tier with assigned work waiting:\n%s", out)
+	}
+}
+
+// AND A COUNT THAT COULD NOT BE READ IS NOT A COUNT OF NONE: a tier no
+// listener has reported for, or one whose listener predates the count, is
+// said to be unknown.
+func TestADrainSaysAnUnreadableDemandIsUnknown(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	older := cfg.Tiers[0].Label
+	publishDemand(t, db, cfg, older, nil)
+
+	out := drainWait(t, cfgPath)
+
+	if strings.Contains(out, "Drained") || !strings.Contains(out, older+": unknown") {
+		t.Errorf("a drain took a tier whose count it could not read for none:\n%s", out)
 	}
 }
 
@@ -384,6 +464,13 @@ func TestDrainWaitReturnsOnceTheRunningWorkIsReleased(t *testing.T) {
 	}, cfg.Tiers)
 	if err != nil {
 		t.Fatalf("allocator: %v", err)
+	}
+
+	// Nothing assigned is waiting at GitHub, as the listeners would publish;
+	// what this waits for is the ledger.
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)

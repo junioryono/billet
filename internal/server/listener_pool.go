@@ -118,7 +118,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	// that GitHub's count says has gone away, releases this tier's place rather
 	// than holding the fleet behind work nobody is waiting for any more.
 	l.mu.Lock()
-	l.waitingFor = max(desired-active, 0)
+	l.waitingFor, l.demandKnown = max(desired-active, 0), true
 	l.mu.Unlock()
 
 	// A TIER THAT COULD NOT GROW WHATEVER ANYONE FREED DOES NOT HOLD THE LINE.

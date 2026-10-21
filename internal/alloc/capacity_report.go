@@ -48,6 +48,15 @@ type ListenerCapacity struct {
 	HeldBy      string `json:"held_by,omitempty"`
 	HeldBySince string `json:"held_by_since,omitempty"`
 	Refusal     string `json:"refusal,omitempty"`
+	// Unstarted is how many jobs GitHub has assigned this tier beyond the
+	// runners it has, as its last reconciliation counted them: GitHub's demand,
+	// whatever the admission order makes of it. Waiting is the same count only
+	// while the tier holds a place in line, and is zero for a tier at its own
+	// cap or under a seal it does not wait out in line; this is not. Nil means
+	// unknown, a listener that has not reconciled or a control plane older than
+	// the field, never none, because a drain reads it to say whether assigned
+	// work is still waiting (#140).
+	Unstarted *int `json:"unstarted,omitempty"`
 }
 
 // RecordListenerCapacity publishes the listener's ownership for another process.
