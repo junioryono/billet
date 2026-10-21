@@ -19,6 +19,10 @@
 #   no-manifest   a release with no manifest records nothing and says so, and
 #                 the manifest published later is found by the next converge
 #   refetch       a candidate staged without its evidence gets it, unchanged
+#   origin-gone   a staged candidate whose origin stopped serving it converges,
+#                 records nothing new, and says why
+#   rollback      the record before a transaction comes back after it, or stays
+#                 away, and a journal from before the record was kept leaves it
 #   check-mode    a dry run fetches nothing (the record steps are all gated off
 #                 a dry run, which host-upgrade-order.yml holds)
 #
@@ -117,7 +121,19 @@ cat >"$work/play.yml" <<'PLAY'
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: binary
-      when: case != 'supplied'
+      when: case in ['transaction', 'unchanged', 'backfill', 'refused', 'no-manifest', 'check-mode']
+
+    - name: Preserve the record beside the journal as the transaction does
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: preserve-provenance
+      when: case == 'preserve'
+
+    - name: Restore the record as the rollback does
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: restore-provenance
+      when: case == 'restore'
 
     - name: Install the candidate as the transaction does
       ansible.builtin.copy:
@@ -170,7 +186,17 @@ mkdir -p /var/lib/billet
 record=/var/lib/billet/installed.json
 stage=/var/lib/billet-provenance-check/stage
 
-fail() { echo "FAIL $1" >&2; [ -z "${2:-}" ] || sed -n '/fatal\|FAILED/,+12p' "$2" >&2; exit 1; }
+fail() {
+    echo "FAIL $1" >&2
+    if [ -n "${2:-}" ]; then
+        if grep -q 'fatal\|FAILED' "$2"; then
+            sed -n '/fatal\|FAILED/,+12p' "$2" >&2
+        else
+            grep -A8 'TASK \[junioryono.billet.host : \(Download the release manifest\|Keep the release manifest\|Record which release manifest\|Say that nothing records\|Say that nothing here can name\)' "$2" >&2
+        fi
+    fi
+    exit 1
+}
 
 run() { # case version [ansible-playbook args]
     local name=$1 version=$2
@@ -250,6 +276,55 @@ run transaction v0.16.9
 [ "$(sha "$stage/billet-v0.16.9")" = "$candidate_before" ] || fail "refetch: the staged candidate was replaced"
 [ "$(field binary_sha256)" = "$(sha /usr/bin/billet)" ] || fail "refetch: nothing was recorded from the refetched evidence"
 echo "ok   refetch: a candidate staged without evidence gets it and is not replaced"
+
+# origin-gone: the evidence is fetched again for a staged candidate as a
+# courtesy, and an origin that no longer serves the release fails nothing.
+rm -f "$stage/billet-v0.16.9.tar.gz" "$stage/billet-v0.16.9.release-manifest.json"
+mv "$work/origin/v0.16.9" "$work/origin/v0.16.9.gone"
+record_before=$(sha "$record")
+run backfill v0.16.9
+mv "$work/origin/v0.16.9.gone" "$work/origin/v0.16.9"
+grep -q 'could not be fetched again beside the staged candidate' "$work/backfill.log" ||
+    fail "origin-gone: the run did not say the evidence could not be fetched" "$work/backfill.log"
+[ "$(sha "$record")" = "$record_before" ] || fail "origin-gone: the record changed without evidence"
+echo "ok   origin-gone: an origin that stopped serving the release fails nothing and says so"
+
+# rollback: the record comes back as it was before the transaction, from what
+# the transaction left beside its journal, whatever the transaction recorded
+# in between; a journal from before the role kept the record leaves it alone.
+journal=/var/lib/billet-provenance-check/recovery
+rollback() { # name, then whether a record exists before the transaction
+    rm -rf "$journal" && mkdir -p "$journal"
+    run preserve v0.16.9 -e "billet_upgrade_recovery_dir=$journal"
+    printf '{"version": "v9.9.9", "manifest_digest": "candidate", "binary_sha256": "candidate"}\n' >"$record"
+    run restore v0.16.9 -e "billet_upgrade_recovery_dir=$journal"
+}
+before=$(cat "$record")
+rollback existing
+[ "$(cat "$record")" = "$before" ] || fail "rollback: the record before the transaction did not come back" "$work/restore.log"
+[ -f "$journal/installed.json.previous" ] && [ ! -e "$journal/installed.json.absent" ] ||
+    fail "rollback: an existing record was not preserved as installed.json.previous"
+
+rm -f "$record"
+rollback absent
+[ ! -e "$record" ] || fail "rollback: a host that had no record kept the candidate's" "$work/restore.log"
+[ -f "$journal/installed.json.absent" ] && [ ! -e "$journal/installed.json.previous" ] ||
+    fail "rollback: an absent record was not noted as installed.json.absent"
+
+rm -rf "$journal" && mkdir -p "$journal"
+printf '{"version": "v0.16.9", "manifest_digest": "kept", "binary_sha256": "kept"}\n' >"$record"
+run restore v0.16.9 -e "billet_upgrade_recovery_dir=$journal"
+grep -q '"manifest_digest": "kept"' "$record" || fail "rollback: a journal from before the record was kept changed it"
+
+touch "$journal/installed.json.absent"
+cp "$record" "$journal/installed.json.previous"
+if ANSIBLE_COLLECTIONS_PATH=$collections ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 \
+    ansible-playbook -i localhost, -e case=restore -e billet_version=v0.16.9 -e "origin=$origin" \
+    -e "billet_upgrade_recovery_dir=$journal" "$work/play.yml" >"$work/contradiction.log" 2>&1; then
+    fail "rollback: a journal holding both the record and its absence was restored from"
+fi
+grep -q 'contradicts itself' "$work/contradiction.log" || fail "rollback: the contradiction was not refused for itself" "$work/contradiction.log"
+echo "ok   rollback: the record comes back as it was, or stays away, and a journal from before leaves it alone"
 
 # check-mode: a release not yet staged, dry run.
 run check-mode v0.16.9 --check -e billet_release_stage=/var/lib/billet-provenance-check/dry

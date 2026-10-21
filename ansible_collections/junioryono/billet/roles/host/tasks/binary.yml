@@ -217,6 +217,8 @@
     prefix: billet-release-
     suffix: .d
   register: billet_release_workdir
+  # SCRATCH, NOT A CHANGE TO THE HOST: removed below, whatever was fetched.
+  changed_when: false
   become: true
   when:
     - billet_release_fetch_archive or billet_release_fetch_manifest
@@ -229,6 +231,10 @@
     - billet_release_fetch_archive or billet_release_fetch_manifest
     - not ansible_check_mode
 
+# THE ARCHIVE IS REQUIRED ONLY WHERE IT IS THE CANDIDATE. Fetched again beside a
+# candidate already staged, it is evidence for the provenance record, which
+# decides nothing: a fleet whose origin has since gone away, or a mirror that
+# pruned the version, converges as it did before and records nothing.
 - name: Download the pinned billet release
   ansible.builtin.get_url:
     url: "{{ billet_release_base }}/{{ billet_release_archive }}"
@@ -242,17 +248,20 @@
   until: billet_release_download is succeeded
   retries: "{{ billet_fetch_retries }}"
   delay: "{{ billet_fetch_retry_delay }}"
+  changed_when: false
+  ignore_errors: "{{ billet_release_candidate_stat.stat.exists }}"
   become: true
   when:
     - billet_release_fetch_archive
     - not ansible_check_mode
 
-# THE MANIFEST, IF THIS RELEASE PUBLISHES ONE, as install.sh fetches it: a
-# release cut before manifests has none, and a 404 says so rather than failing
-# the converge. Its bytes are kept as served, because their sha256 is the
-# digest a rollout compares. NOT VERIFIED HERE: `billet release record` refuses
-# unless the manifest names this archive by hash and the binary is the one
-# inside it.
+# THE MANIFEST, IF THIS RELEASE PUBLISHES ONE, as install.sh fetches it: any
+# failure to fetch one (a release cut before manifests answers 404, a mirror may
+# answer 403 or be unreachable) is a release with none here, said and never a
+# failure of the converge, since the record decides nothing. A 404 is not
+# retried. Its bytes are kept as served, because their sha256 is the digest a
+# rollout compares. NOT VERIFIED HERE: `billet release record` refuses unless
+# the manifest names this archive by hash and the binary is the one inside it.
 - name: Download the release manifest, when the release publishes one
   ansible.builtin.get_url:
     url: "{{ billet_release_base }}/release-manifest.json"
@@ -262,12 +271,13 @@
     group: root
     mode: "0600"
   register: billet_release_manifest_download
-  until: billet_release_manifest_download is succeeded
+  until: >-
+    billet_release_manifest_download is succeeded
+    or billet_release_manifest_download.status_code | default(0) == 404
   retries: "{{ billet_fetch_retries }}"
   delay: "{{ billet_fetch_retry_delay }}"
-  failed_when:
-    - billet_release_manifest_download.failed | default(false)
-    - billet_release_manifest_download.status_code | default(0) != 404
+  changed_when: false
+  ignore_errors: true
   become: true
   when:
     - billet_release_fetch_manifest
@@ -314,6 +324,7 @@
   when:
     - billet_release_fetch_archive
     - not ansible_check_mode
+    - billet_release_download is succeeded
 
 - name: Keep the release manifest beside the candidate
   ansible.builtin.copy:
@@ -327,18 +338,25 @@
   when:
     - billet_release_fetch_manifest
     - not ansible_check_mode
-    - billet_release_manifest_download.status_code | default(0) != 404
+    - billet_release_manifest_download is succeeded
 
-- name: Say that this release can name no manifest for the host
+- name: Say that nothing here can name this release's manifest
   ansible.builtin.debug:
     msg: >-
-      {{ billet_resolved_version }} publishes no release-manifest.json, so nothing
-      will record which manifest produced this host's binary, and a rollout reads
-      its version rather than its bytes.
+      {{ 'The release archive could not be fetched again beside the staged candidate ('
+         ~ (billet_release_download.msg | default('no reason given')) ~ '), so'
+         if billet_release_fetch_archive and billet_release_download is not succeeded
+         else billet_resolved_version ~ ' publishes no release-manifest.json'
+              if billet_release_manifest_download.status_code | default(0) == 404
+         else 'The release manifest could not be fetched ('
+              ~ (billet_release_manifest_download.msg | default('no reason given')) ~ '), so' }}
+      nothing will record which manifest produced this host's binary, and a rollout
+      reads its version rather than its bytes. Nothing else of the converge depends on it.
   when:
-    - billet_release_fetch_manifest
     - not ansible_check_mode
-    - billet_release_manifest_download.status_code | default(0) == 404
+    - >-
+      (billet_release_fetch_archive and billet_release_download is not succeeded)
+      or (billet_release_fetch_manifest and billet_release_manifest_download is not succeeded)
 
 # What account.yml inspects, journals and installs. The transaction is unchanged
 # by where the candidate came from; only the side it lives on moves.
@@ -346,6 +364,7 @@
   ansible.builtin.file:
     path: "{{ billet_release_unpack }}"
     state: absent
+  changed_when: false
   become: true
   when:
     - billet_release_fetch_archive or billet_release_fetch_manifest

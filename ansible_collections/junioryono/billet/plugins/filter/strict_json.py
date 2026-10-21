@@ -51,6 +51,14 @@ def from_json_strict(text):
 # billet refuses to read.
 PROVENANCE_RECORD_LIMIT = 64 << 10
 
+# PROVENANCE_MEMBERS are provenance.Record's members, as billet writes them.
+PROVENANCE_MEMBERS = ("version", "manifest_digest", "binary_sha256")
+
+
+def _refuse_constant(name):
+    """NaN and the infinities are Python's, not JSON's: Go refuses them."""
+    raise ValueError("%s is not JSON" % name)
+
 
 def provenance_proves(text, binary_sha256):
     """Whether a provenance record proves which manifest produced these bytes.
@@ -67,19 +75,21 @@ def provenance_proves(text, binary_sha256):
     """
     try:
         if isinstance(text, bytes):
-            size = len(text)
-        elif isinstance(text, str):
-            size = len(text.encode("utf-8"))
-        else:
+            text = text.decode("utf-8")
+        if not isinstance(text, str) or len(text.encode("utf-8")) > PROVENANCE_RECORD_LIMIT:
             return False
-        if size > PROVENANCE_RECORD_LIMIT:
-            return False
-        record = from_json_strict(text)
-    except (AnsibleFilterError, ValueError, RecursionError, MemoryError):
+        record = json.loads(text, object_pairs_hook=_one_of_each, parse_constant=_refuse_constant)
+    except (ValueError, RecursionError, MemoryError):
         return False
     if not isinstance(record, dict):
         return False
-    for member in ("version", "manifest_digest", "binary_sha256"):
+    # GO MATCHES A MEMBER'S NAME WITHOUT REGARD TO CASE, so "VERSION": 7 is a
+    # version it refuses; any spelling of the three but billet's own is refused
+    # here rather than guessed at.
+    for key in record:
+        if key.lower() in PROVENANCE_MEMBERS and key not in PROVENANCE_MEMBERS:
+            return False
+    for member in PROVENANCE_MEMBERS:
         if member in record and not isinstance(record[member], str):
             return False
     digest = record.get("manifest_digest", "")

@@ -262,68 +262,13 @@
     - not ansible_check_mode
     - billet_installed_binary.stat.exists
 
-# THE PROVENANCE RECORD IS PRESERVED BESIDE THE JOURNAL, NOT IN IT (#91), as Go's
-# preservedPaths keeps it: a rollback that left the candidate's record beside the
-# previous binary is the contradiction the node's hash refuses. Not a fourth
-# journaled input, because every billet that reads manifest.yml (a guard's
-# takeover, the retirement classifier) holds it to exactly three, an older
-# release included. installed.json.previous is the record, installed.json.absent
-# says there was none; a journal with neither is one from before, whose rollback
-# leaves the record alone, as that transaction never touched it.
-- name: Inspect the provenance record before live mutation
-  ansible.builtin.stat:
-    path: "{{ billet_provenance_path }}"
-    get_checksum: false
-  register: billet_previous_provenance
-  check_mode: false
-  become: true
+# THE PROVENANCE RECORD, BESIDE THE JOURNAL (#91): see preserve-provenance.yml.
+- name: Preserve the provenance record beside the journal before live mutation
+  ansible.builtin.import_tasks: preserve-provenance.yml
   when:
     - billet_binary_upgrade | default(false)
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
-
-- name: Refuse a redirected or non-file provenance record
-  ansible.builtin.assert:
-    that:
-      - not billet_previous_provenance.stat.exists or billet_previous_provenance.stat.isreg
-      - not billet_previous_provenance.stat.islnk | default(false)
-    fail_msg: >-
-      {{ billet_provenance_path }} is not a real regular file. Remove it before a
-      transactional upgrade so rollback never follows or recreates a privileged
-      symlink; the upgrade records it afresh.
-  when:
-    - billet_binary_upgrade | default(false)
-    - not billet_interrupted_upgrade | bool
-    - not ansible_check_mode
-
-- name: Preserve the provenance record before live mutation
-  ansible.builtin.copy:
-    src: "{{ billet_provenance_path }}"
-    dest: "{{ billet_upgrade_recovery_dir }}/installed.json.previous"
-    remote_src: true
-    owner: root
-    group: root
-    mode: "0644"
-  become: true
-  when:
-    - billet_binary_upgrade | default(false)
-    - not billet_interrupted_upgrade | bool
-    - not ansible_check_mode
-    - billet_previous_provenance.stat.exists
-
-- name: Record that there was no provenance record before live mutation
-  ansible.builtin.copy:
-    content: "no provenance record before this transaction\n"
-    dest: "{{ billet_upgrade_recovery_dir }}/installed.json.absent"
-    owner: root
-    group: root
-    mode: "0600"
-  become: true
-  when:
-    - billet_binary_upgrade | default(false)
-    - not billet_interrupted_upgrade | bool
-    - not ansible_check_mode
-    - not billet_previous_provenance.stat.exists
 
 # A CANDIDATE THAT DOES NOT KNOW THE HOLD FLAG REFUSES IT, in its own flag parser,
 # before it has probed anything. Releases through v0.9.0 hold under --upgrade-probe

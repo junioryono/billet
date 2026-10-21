@@ -494,47 +494,10 @@
   when: not billet_upgrade_manifest.binary_existed | bool
   become: true
 
-# THE PROVENANCE RECORD COMES BACK WITH THE BINARY IT DESCRIBES (#91), from the
-# files the transaction left beside its journal (account.yml): the record, or the
-# note that there was none. A journal with neither is from before the role kept
-# the record, and its transaction never touched it.
-- name: Inspect the preserved provenance record
-  ansible.builtin.stat:
-    path: "{{ billet_upgrade_recovery_dir }}/{{ item }}"
-    follow: false
-    get_checksum: false
-  loop: [installed.json.previous, installed.json.absent]
-  register: billet_recovery_provenance
-  become: true
-
-- name: Refuse a preserved provenance record that is redirected or contradicts itself
-  ansible.builtin.assert:
-    that:
-      - not (billet_recovery_provenance.results[0].stat.exists and billet_recovery_provenance.results[1].stat.exists)
-      - not billet_recovery_provenance.results[0].stat.exists or billet_recovery_provenance.results[0].stat.isreg
-      - not billet_recovery_provenance.results[0].stat.islnk | default(false)
-    fail_msg: >-
-      {{ billet_upgrade_recovery_dir }} holds a provenance record that is redirected,
-      or both the record and the note that there was none. Leave the fence and the
-      recovery pointer intact for manual inspection.
-
-- name: Restore the previous provenance record
-  ansible.builtin.copy:
-    src: "{{ billet_upgrade_recovery_dir }}/installed.json.previous"
-    dest: "{{ billet_provenance_path }}"
-    remote_src: true
-    owner: root
-    group: root
-    mode: "0644"
-  when: billet_recovery_provenance.results[0].stat.exists
-  become: true
-
-- name: Remove the provenance record a host that had none did not have
-  ansible.builtin.file:
-    path: "{{ billet_provenance_path }}"
-    state: absent
-  when: billet_recovery_provenance.results[1].stat.exists
-  become: true
+# THE PROVENANCE RECORD COMES BACK WITH THE BINARY IT DESCRIBES (#91): see
+# restore-provenance.yml.
+- name: Restore the provenance record the transaction preserved
+  ansible.builtin.import_tasks: restore-provenance.yml
 
 - name: Durably flush every restored host filesystem before rollback commit
   ansible.builtin.command:

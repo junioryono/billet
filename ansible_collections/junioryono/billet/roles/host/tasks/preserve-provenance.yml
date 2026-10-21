@@ -1,0 +1,48 @@
+---
+# THE PROVENANCE RECORD IS PRESERVED BESIDE THE JOURNAL, NOT IN IT (#91), as Go's
+# preservedPaths keeps it: a rollback that left the candidate's record beside the
+# previous binary is the contradiction the node's hash refuses. Not a fourth
+# journaled input, because every billet that reads manifest.yml (a guard's
+# takeover, the retirement classifier) holds it to exactly three, an older
+# release included. installed.json.previous is the record, installed.json.absent
+# says there was none; a journal with neither is one from before, whose rollback
+# leaves the record alone, as that transaction never touched it
+# (restore-provenance.yml). Imported by account.yml before live mutation.
+- name: Inspect the provenance record before live mutation
+  ansible.builtin.stat:
+    path: "{{ billet_provenance_path }}"
+    get_checksum: false
+  register: billet_previous_provenance
+  check_mode: false
+  become: true
+
+- name: Refuse a redirected or non-file provenance record
+  ansible.builtin.assert:
+    that:
+      - not billet_previous_provenance.stat.exists or billet_previous_provenance.stat.isreg
+      - not billet_previous_provenance.stat.islnk | default(false)
+    fail_msg: >-
+      {{ billet_provenance_path }} is not a real regular file. Remove it before a
+      transactional upgrade so rollback never follows or recreates a privileged
+      symlink; the upgrade records it afresh.
+
+- name: Preserve the provenance record before live mutation
+  ansible.builtin.copy:
+    src: "{{ billet_provenance_path }}"
+    dest: "{{ billet_upgrade_recovery_dir }}/installed.json.previous"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: billet_previous_provenance.stat.exists
+
+- name: Record that there was no provenance record before live mutation
+  ansible.builtin.copy:
+    content: "no provenance record before this transaction\n"
+    dest: "{{ billet_upgrade_recovery_dir }}/installed.json.absent"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when: not billet_previous_provenance.stat.exists

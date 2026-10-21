@@ -492,15 +492,12 @@
           - billet_inspected_inputs | length == 3
           - billet_journaled_inputs | length == 3
           - "'provenance' not in (billet_journaled_inputs | string)"
-          - billet_account_names.index('Preserve the previous billet binary before live mutation') < billet_account_names.index('Preserve the provenance record before live mutation')
-          - billet_account_names.index('Inspect the provenance record before live mutation') < billet_account_names.index('Refuse a redirected or non-file provenance record')
-          - billet_account_names.index('Refuse a redirected or non-file provenance record') < billet_account_names.index('Preserve the provenance record before live mutation')
-          - billet_account_names.index('Refuse a redirected or non-file provenance record') < billet_account_names.index('Record that there was no provenance record before live mutation')
-          - billet_recovery_names.index('Inspect the preserved provenance record') < billet_recovery_names.index('Restore the previous provenance record')
-          - billet_recovery_names.index('Restore the previous provenance record') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
-          - billet_recovery_names.index('Remove the provenance record a host that had none did not have') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
-          - (billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore the previous provenance record') | first).when is search('installed.json.previous|results\[0\]')
-          - (billet_host_recovery_tasks | selectattr('name', 'equalto', 'Remove the provenance record a host that had none did not have') | first).when is search('results\[1\]')
+          - billet_account_names.index('Preserve the previous billet binary before live mutation') < billet_account_names.index('Preserve the provenance record beside the journal before live mutation')
+          - (billet_host_account_tasks | selectattr('name', 'equalto', 'Preserve the provenance record beside the journal before live mutation') | first)['ansible.builtin.import_tasks'] == 'preserve-provenance.yml'
+          - (billet_host_account_tasks | selectattr('name', 'equalto', 'Preserve the provenance record beside the journal before live mutation') | first).when == ['billet_binary_upgrade | default(false)', 'not billet_interrupted_upgrade | bool', 'not ansible_check_mode']
+          - (billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore the provenance record the transaction preserved') | first)['ansible.builtin.import_tasks'] == 'restore-provenance.yml'
+          - billet_recovery_names.index('Restore the previous billet binary') < billet_recovery_names.index('Restore the provenance record the transaction preserved')
+          - billet_recovery_names.index('Restore the provenance record the transaction preserved') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
           - billet_record_backfill['ansible.builtin.import_tasks'] == 'backfill-provenance.yml'
           - "'not billet_retirement_node_ordinary | bool' in billet_record_backfill.when"
           - "'not billet_binary_upgrade | default(false)' in billet_record_backfill.when"
