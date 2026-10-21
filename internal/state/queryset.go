@@ -248,6 +248,7 @@ type WriteOps interface {
 	MarkNodeNotLive(ctx context.Context, arg ledgerdb.MarkNodeNotLiveParams) error
 	MarkPoolRunnerBusy(ctx context.Context, arg ledgerdb.MarkPoolRunnerBusyParams) error
 	MarkPoolRunnerRetired(ctx context.Context, arg ledgerdb.MarkPoolRunnerRetiredParams) error
+	FillPoolRunnerGitHubTarget(ctx context.Context, arg ledgerdb.FillPoolRunnerGitHubTargetParams) error
 	MarkPoolRunnerRetiring(ctx context.Context, arg ledgerdb.MarkPoolRunnerRetiringParams) error
 	ReclaimLease(ctx context.Context, arg ledgerdb.ReclaimLeaseParams) error
 	RecordCredentialSweep(ctx context.Context, arg ledgerdb.RecordCredentialSweepParams) error

@@ -98,6 +98,14 @@ UPDATE pool_runners
    SET runner_id = @runner_id, status = 'busy', updated_at = @updated_at
  WHERE lease_id = @lease_id;
 
+-- name: FillPoolRunnerGitHubTarget :exec
+-- Record the owner of a member journaled without one, once.
+--
+-- ONLY AN EMPTY OWNER IS FILLED, so a member's recorded owner is never
+-- replaced: the caller has already refused a different one.
+UPDATE pool_runners SET github_target = @github_target
+ WHERE lease_id = @lease_id AND github_target = '';
+
 -- name: MarkPoolRunnerRetiring :exec
 -- Claim a member for teardown, having already decided it may be claimed.
 UPDATE pool_runners SET status = 'retiring', updated_at = @updated_at

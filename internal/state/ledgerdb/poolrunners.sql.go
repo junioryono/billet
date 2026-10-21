@@ -99,6 +99,25 @@ func (q *Queries) DeletePoolRunner(ctx context.Context, leaseID string) error {
 	return err
 }
 
+const fillPoolRunnerGitHubTarget = `-- name: FillPoolRunnerGitHubTarget :exec
+UPDATE pool_runners SET github_target = $1
+ WHERE lease_id = $2 AND github_target = ''
+`
+
+type FillPoolRunnerGitHubTargetParams struct {
+	GithubTarget string
+	LeaseID      string
+}
+
+// Record the owner of a member journaled without one, once.
+//
+// ONLY AN EMPTY OWNER IS FILLED, so a member's recorded owner is never
+// replaced: the caller has already refused a different one.
+func (q *Queries) FillPoolRunnerGitHubTarget(ctx context.Context, arg FillPoolRunnerGitHubTargetParams) error {
+	_, err := q.db.ExecContext(ctx, fillPoolRunnerGitHubTarget, arg.GithubTarget, arg.LeaseID)
+	return err
+}
+
 const insertPoolRunner = `-- name: InsertPoolRunner :exec
 
 INSERT INTO pool_runners

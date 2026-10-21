@@ -651,3 +651,194 @@ func TestAnOwnerTwoSourcesServeResolvesThroughTheTiersTarget(t *testing.T) {
 		t.Errorf("the other source serving the owner removed %v", removed)
 	}
 }
+
+// A MINT FOR A LAUNCH WHOSE LEASE WAS RECLAIMED IS REFUSED BEFORE GITHUB: the
+// owner is written under the LAUNCH's epoch, which a reclaim has moved past,
+// never under whatever epoch the lease has reached since.
+func TestAMintForAReclaimedLaunchIsRefusedBeforeGitHub(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{lease: &alloc.Lease{ID: "l1", Tier: "tier-a", Node: "n1", Epoch: 1, RequestID: 7}}
+	jitA := &targetJIT{path: ownerA}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute,
+		nodeplane.WithTierCatalog(twoTargetCatalogue()), nodeplane.WithCommandTimeout(time.Minute))
+
+	srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil,
+		nodeplane.WithTargetJIT(map[string]nodeplane.JITSource{"default": jitA})))
+	t.Cleanup(srv.Close)
+
+	c := dial(t, srv.URL)
+	queueLaunch(t, p, c, "tier-a")
+
+	// THE REAPER RECLAIMS THE LEASE after the command was given: its epoch moves on.
+	store.mu.Lock()
+	store.lease.Epoch = 2
+	store.lease.Phase = alloc.PhaseQuarantine
+	store.mu.Unlock()
+
+	if _, err := c.JITConfig(t.Context(), 7, "billet-l1", "_work"); err == nil {
+		t.Fatal("a registration was minted for a launch whose lease was reclaimed")
+	}
+
+	if minted, _, _ := jitA.asked(); len(minted) != 0 {
+		t.Errorf("the source minted %v for a launch whose lease was reclaimed", minted)
+	}
+
+	if owner, _ := store.LeaseGitHubTarget(t.Context(), "l1"); owner != "" {
+		t.Errorf("the reclaimed lease recorded owner %q", owner)
+	}
+}
+
+// AN ENDED LEASE STILL SAYS WHICH OWNER ITS RUNNER WAS MINTED ON, and a removal
+// for it reads that record rather than the catalogue, refusing when it and the
+// binding disagree.
+func TestAnEndedLeasesRunnerIsRemovedOnTheOwnerItsLeaseRecorded(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		bindingTarget string
+		wantRemovedB  bool
+		wantRefusal   string
+	}{
+		"a binding that recorded no owner": {wantRemovedB: true},
+		"a binding that disagrees":         {bindingTarget: ownerA, wantRefusal: "cannot tell which credential"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			// ENDED: the ledger reports no live lease, and its job's history names
+			// this node.
+			store := &fakeStore{
+				leaseErr:     alloc.ErrLeaseNotFound,
+				historyNode:  map[string]string{"l1": "n1"},
+				leaseTargets: map[string]string{"l1": ownerB},
+				pool: map[string]alloc.PoolRunner{"billet-l1": {
+					LeaseID: "l1", Tier: "tier-b", LaunchRequestID: 7, RunnerID: 91,
+					RunnerName: "billet-l1", Status: alloc.PoolRunnerIdle, GitHubTarget: tc.bindingTarget,
+				}},
+			}
+			jitA, jitB := &targetJIT{path: ownerA}, &targetJIT{path: ownerB}
+
+			log := slog.New(slog.DiscardHandler)
+			p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog(twoTargetCatalogue()[:1]))
+
+			srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil,
+				nodeplane.WithTargetJIT(map[string]nodeplane.JITSource{"default": jitA, "personal": jitB})))
+			t.Cleanup(srv.Close)
+
+			err := dial(t, srv.URL).RemoveRunner(t.Context(), "l1", 91, "billet-l1")
+
+			switch {
+			case tc.wantRefusal != "":
+				if err == nil || !strings.Contains(err.Error(), tc.wantRefusal) {
+					t.Fatalf("removal: %v, want a refusal saying %q", err, tc.wantRefusal)
+				}
+			case err != nil:
+				t.Fatalf("removal: %v", err)
+			}
+
+			_, removedB, _ := jitB.asked()
+			if got := slices.Equal(removedB, []string{"billet-l1"}); got != tc.wantRemovedB {
+				t.Errorf("the lease's recorded owner removed %v", removedB)
+			}
+
+			if _, removedA, _ := jitA.asked(); len(removedA) != 0 {
+				t.Errorf("the other owner removed %v", removedA)
+			}
+		})
+	}
+}
+
+// A RECOVERY KEEPS THE OWNER IT FOUND THE RUNNER ON, for a member journaled
+// before owners were recorded, so a later recovery asks that owner again
+// whatever the catalogue names by then; and it keeps none an owner it merely
+// asked, and was told the runner is not there, because that proves nothing
+// about where the runner is.
+func TestARecoveryKeepsOnlyTheOwnerItFoundTheRunnerOn(t *testing.T) {
+	t.Parallel()
+
+	legacy := func() *fakeStore {
+		return &fakeStore{
+			lease: &alloc.Lease{ID: "l1", Tier: "tier-a", Node: "n1", Epoch: 1, RequestID: 7,
+				Phase: alloc.PhaseQuarantine},
+			pool: map[string]alloc.PoolRunner{"billet-l1": {
+				LeaseID: "l1", Tier: "tier-a", LaunchRequestID: 7, RunnerID: 91,
+				RunnerName: "billet-l1", Status: alloc.PoolRunnerIdle,
+			}},
+		}
+	}
+
+	serve := func(t *testing.T, store *fakeStore, catalogue []config.Tier, sources map[string]nodeplane.JITSource,
+	) *nodeclient.Client {
+		t.Helper()
+
+		log := slog.New(slog.DiscardHandler)
+		p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog(catalogue))
+		srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil, nodeplane.WithTargetJIT(sources)))
+		t.Cleanup(srv.Close)
+
+		return dial(t, srv.URL)
+	}
+
+	t.Run("found busy", func(t *testing.T) {
+		t.Parallel()
+
+		store := legacy()
+		jitA := &targetJIT{path: ownerA, recovery: nodeplane.JITRunnerRecovery{RunnerID: 91, Present: true, Busy: true}}
+		jitB := &targetJIT{path: ownerB}
+		sources := map[string]nodeplane.JITSource{"default": jitA, "personal": jitB}
+
+		// tier-a's target is "default", owner A, which finds the runner busy.
+		c := serve(t, store, twoTargetCatalogue(), sources)
+		if got, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err != nil ||
+			got != billetnode.RunnerRecoveryBusy {
+			t.Fatalf("recovery = %q, err %v; want busy", got, err)
+		}
+
+		member, err := store.PoolRunnerByLease(t.Context(), "l1")
+		if err != nil || member.GitHubTarget != ownerA {
+			t.Fatalf("the member found busy on %q is journaled with owner %q (err %v)", ownerA,
+				member.GitHubTarget, err)
+		}
+
+		// THE CATALOGUE MOVES tier-a TO THE OTHER OWNER, and the next recovery
+		// still asks the one the runner was found on.
+		moved := twoTargetCatalogue()
+		moved[0].Target = "personal"
+		c = serve(t, store, moved, sources)
+		if _, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err != nil {
+			t.Fatalf("the second recovery: %v", err)
+		}
+
+		if _, _, recoveredB := jitB.asked(); len(recoveredB) != 0 {
+			t.Errorf("the owner the catalogue names now was asked %v about a runner found on %q",
+				recoveredB, ownerA)
+		}
+
+		if _, _, recoveredA := jitA.asked(); len(recoveredA) != 2 {
+			t.Errorf("the owner the runner was found on was asked %d times, want 2", len(recoveredA))
+		}
+	})
+
+	t.Run("not there", func(t *testing.T) {
+		t.Parallel()
+
+		store := legacy()
+		store.pool = nil
+		jitA := &targetJIT{path: ownerA}
+
+		c := serve(t, store, twoTargetCatalogue(), map[string]nodeplane.JITSource{"default": jitA})
+		if got, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err != nil ||
+			got != billetnode.RunnerRecoveryRetired {
+			t.Fatalf("recovery = %q, err %v; want retired", got, err)
+		}
+
+		member, err := store.PoolRunnerByLease(t.Context(), "l1")
+		if err != nil || member.GitHubTarget != "" {
+			t.Errorf("a member the asked owner did not have is journaled with owner %q (err %v), want none",
+				member.GitHubTarget, err)
+		}
+	})
+}

@@ -54,6 +54,58 @@ func TestALeasesGitHubTargetIsWrittenOnceByItsHolder(t *testing.T) {
 	}
 }
 
+// A MEMBER JOURNALED WITHOUT AN OWNER TAKES THE FIRST ONE A CALLER BRINGS, on
+// every path that journals one, and keeps it: a recovery that found the runner
+// on an owner is evidence a later removal must not throw away for whatever the
+// catalogue names then.
+func TestAMemberJournaledWithoutAnOwnerKeepsTheFirstOneBrought(t *testing.T) {
+	for name, bring := range map[string]func(a *Allocator, member PoolRunner) (PoolRunner, error){
+		"a registration retry": func(a *Allocator, member PoolRunner) (PoolRunner, error) {
+			return member, a.RegisterPoolRunner(t.Context(), member)
+		},
+		"a busy recovery": func(a *Allocator, member PoolRunner) (PoolRunner, error) {
+			return member, a.PreserveRecoveredBusyPoolRunner(t.Context(), member)
+		},
+		"a retiring recovery": func(a *Allocator, member PoolRunner) (PoolRunner, error) {
+			return a.RetireRecoveredPoolRunner(t.Context(), member)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+				[]config.Tier{tier("linux", 2, 4*config.GiB)})
+			lease := reserve(t, a, "linux")
+			if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+				t.Fatalf("Assign: %v", err)
+			}
+
+			legacy := PoolRunner{LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11, RunnerID: 91,
+				RunnerName: "billet-" + lease.ID}
+			if err := a.RegisterPoolRunner(t.Context(), legacy); err != nil {
+				t.Fatalf("RegisterPoolRunner: %v", err)
+			}
+
+			brought := legacy
+			brought.GitHubTarget = "acme"
+			returned, err := bring(a, brought)
+			if err != nil {
+				t.Fatalf("bringing an owner: %v", err)
+			}
+
+			stored, err := a.PoolRunnerByLease(t.Context(), lease.ID)
+			if err != nil || stored.GitHubTarget != "acme" || returned.GitHubTarget != "acme" {
+				t.Fatalf("the member is journaled with owner %q and returned with %q (err %v); want acme",
+					stored.GitHubTarget, returned.GitHubTarget, err)
+			}
+
+			other := legacy
+			other.GitHubTarget = "someone/widgets"
+			if _, err := bring(a, other); !errors.Is(err, ErrConflict) {
+				t.Errorf("a second owner after the first was kept: %v, want ErrConflict", err)
+			}
+		})
+	}
+}
+
 // A POOL MEMBER KEEPS THE OWNER IT WAS REGISTERED ON, and a retry naming
 // another owner is refused on every path that journals one, while a record
 // made without an owner contradicts nothing.

@@ -417,15 +417,30 @@ func (f *fakeStore) RegisterPoolRunner(_ context.Context, runner alloc.PoolRunne
 			prior.LaunchRequestID != runner.LaunchRequestID {
 			return alloc.ErrConflict
 		}
+		f.pool[runner.RunnerName] = fillOwner(prior, runner.GitHubTarget)
 		return nil
 	}
 	f.pool[runner.RunnerName] = runner
 	return nil
 }
 
-func (f *fakeStore) RecordLeaseGitHubTarget(_ context.Context, leaseID string, _ int64, path string) error {
+// fillOwner is alloc's rule for a member journaled without an owner: one the
+// caller brings is kept, and a recorded one is never replaced.
+func fillOwner(member alloc.PoolRunner, owner string) alloc.PoolRunner {
+	if member.GitHubTarget == "" {
+		member.GitHubTarget = owner
+	}
+	return member
+}
+
+// RecordLeaseGitHubTarget keeps alloc's rules: fenced on the lease's epoch,
+// and written once.
+func (f *fakeStore) RecordLeaseGitHubTarget(_ context.Context, leaseID string, epoch int64, path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.lease != nil && f.lease.ID == leaseID && f.lease.Epoch != epoch {
+		return alloc.ErrFenced
+	}
 	if prior := f.leaseTargets[leaseID]; prior != "" && prior != path {
 		return alloc.ErrConflict
 	}
@@ -496,6 +511,7 @@ func (f *fakeStore) PreserveRecoveredBusyPoolRunner(
 		runner.RunnerID = recovered.RunnerID
 		runner.RunnerName = recovered.RunnerName
 		runner.Status = alloc.PoolRunnerBusy
+		runner = fillOwner(runner, recovered.GitHubTarget)
 		delete(f.pool, name)
 		f.pool[runner.RunnerName] = runner
 		return nil
@@ -515,6 +531,8 @@ func (f *fakeStore) RetireRecoveredPoolRunner(
 		if runner.LeaseID != recovered.LeaseID {
 			continue
 		}
+		runner = fillOwner(runner, recovered.GitHubTarget)
+		f.pool[name] = runner
 		if runner.Status == alloc.PoolRunnerBusy &&
 			(runner.ActualRequestID != 0 || runner.RunID != 0 || runner.JobID != "") {
 			return runner, nil

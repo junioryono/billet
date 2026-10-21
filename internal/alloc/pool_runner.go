@@ -71,7 +71,9 @@ func (a *Allocator) RegisterPoolRunner(ctx context.Context, runner PoolRunner) e
 					ErrConflict, runner.LeaseID, prior.RunnerName, prior.Tier, prior.LaunchRequestID)
 			}
 
-			return nil
+			_, err := fillTarget(ctx, q, prior, runner.GitHubTarget)
+
+			return err
 		}
 
 		if err := insertPoolRunner(ctx, q, runner, PoolRunnerIdle); err != nil {
@@ -246,6 +248,9 @@ func (a *Allocator) PreserveRecoveredBusyPoolRunner(ctx context.Context, runner 
 			return fmt.Errorf("alloc: %w: recovered runner %q is already retiring",
 				ErrConflict, runner.RunnerName)
 		}
+		if _, err := fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+			return err
+		}
 		if prior.Status == PoolRunnerBusy {
 			return nil
 		}
@@ -288,6 +293,9 @@ func (a *Allocator) RetireRecoveredPoolRunner(
 			!sameTarget(prior.GitHubTarget, runner.GitHubTarget) {
 			return fmt.Errorf("alloc: %w: recovered retirement for %q does not match lease %s",
 				ErrConflict, runner.RunnerName, runner.LeaseID)
+		}
+		if prior, err = fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+			return err
 		}
 		out = prior
 		if prior.Status == PoolRunnerBusy &&
@@ -563,6 +571,31 @@ func poolRunnerFrom(row *ledgerdb.PoolRunner) PoolRunner {
 // side is a record made without one, which contradicts nothing.
 func sameTarget(prior, next string) bool {
 	return prior == "" || next == "" || prior == next
+}
+
+// fillTarget records the owner of a member journaled without one, when the
+// caller brings one, and returns the member as it now stands. The caller has
+// already refused an owner that disagrees.
+//
+// WHAT A CALLER BRINGS IS EVIDENCE, so it is kept: a recovery that found the
+// runner on an owner, or a mint on one. Left empty, the member's next removal
+// or recovery would be resolved through whatever the catalogue names then, and
+// a different owner answers that no such runner exists.
+func fillTarget(ctx context.Context, q state.WriteOps, prior PoolRunner, owner string) (PoolRunner, error) {
+	if prior.GitHubTarget != "" || owner == "" {
+		return prior, nil
+	}
+
+	if err := q.FillPoolRunnerGitHubTarget(ctx, ledgerdb.FillPoolRunnerGitHubTargetParams{
+		GithubTarget: owner,
+		LeaseID:      prior.LeaseID,
+	}); err != nil {
+		return prior, fmt.Errorf("alloc: record the owner of pool runner %q: %w", prior.RunnerName, err)
+	}
+
+	prior.GitHubTarget = owner
+
+	return prior, nil
 }
 
 // insertPoolRunner journals one member at the status the caller decided on.

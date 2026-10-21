@@ -1891,7 +1891,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tier, err := h.plane.EntitledToLaunch(r.PathValue("node"),
+	tier, epoch, err := h.plane.EntitledToLaunch(r.PathValue("node"),
 		r.Header.Get(nodeapi.HeaderIncarnation), leaseID)
 	if err != nil {
 		h.log.Warn("refused a runner registration a node was not entitled to",
@@ -1990,17 +1990,12 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	// THE OWNER IS DURABLE BEFORE THE REGISTRATION EXISTS. A mint whose answer is
 	// lost leaves a runner on GitHub and no binding naming it, and recovering it
 	// later through whatever the catalogue then names would ask the wrong owner,
-	// which answers that no such runner exists.
+	// which answers that no such runner exists. Fenced on the LAUNCH's epoch, not
+	// the lease's now: a lease reclaimed since the command was given refuses it,
+	// and nothing is minted for a launch that has lost its lease.
 	path := targetPath(src)
 	if path != "" {
-		owned, err := h.store.Lease(r.Context(), leaseID)
-		if err == nil && owned == nil {
-			err = fmt.Errorf("nodeplane: lease %s no longer exists", leaseID)
-		}
-		if err == nil {
-			err = pool.RecordLeaseGitHubTarget(r.Context(), leaseID, owned.Epoch, path)
-		}
-		if err != nil {
+		if err := pool.RecordLeaseGitHubTarget(r.Context(), leaseID, epoch, path); err != nil {
 			writeStoreErr(w, err)
 
 			return
@@ -2118,16 +2113,14 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	recorded := []string{binding.GitHubTarget}
-	if !ended {
-		leaseTarget, err := pool.LeaseGitHubTarget(r.Context(), binding.LeaseID)
-		if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
-			writeStoreErr(w, err)
-			return
-		}
-		recorded = append(recorded, leaseTarget)
+	// THE LEASE'S RECORD TOO, ended or not: an ended lease's row still says
+	// which owner its runner was minted on, until the row itself is gone.
+	leaseTarget, err := pool.LeaseGitHubTarget(r.Context(), binding.LeaseID)
+	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+		writeStoreErr(w, err)
+		return
 	}
-	src, err := h.jitForRunner(binding.Tier, recorded...)
+	src, err := h.jitForRunner(binding.Tier, binding.GitHubTarget, leaseTarget)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
@@ -2358,7 +2351,21 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	path := targetPath(src)
+	// THE OWNER A RECOVERY JOURNALS IS ONE IT HAS PROOF OF: the one recorded at
+	// the mint, or the one that answered that the runner is there. An owner the
+	// catalogue chose that answers "not present" proves nothing about where the
+	// runner is, and journaling it would make that choice the runner's owner.
+	recorded := leaseTarget
+	if recorded == "" {
+		recorded = binding.GitHubTarget
+	}
+	provenOwner := func(present bool) string {
+		if recorded == "" && present {
+			return targetPath(src)
+		}
+
+		return recorded
+	}
 	if bindingErr == nil {
 		if binding.Tier != lease.Tier || binding.LaunchRequestID != lease.RequestID {
 			writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
@@ -2404,7 +2411,7 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 	if recovery.Busy {
 		if err := pool.PreserveRecoveredBusyPoolRunner(r.Context(), alloc.PoolRunner{
 			LeaseID: leaseID, Tier: lease.Tier, LaunchRequestID: lease.RequestID,
-			RunnerID: recovery.RunnerID, RunnerName: req.RunnerName, GitHubTarget: path,
+			RunnerID: recovery.RunnerID, RunnerName: req.RunnerName, GitHubTarget: provenOwner(true),
 		}); err != nil {
 			writeStoreErr(w, err)
 			return
@@ -2428,7 +2435,7 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 	}
 	settled, err := pool.RetireRecoveredPoolRunner(r.Context(), alloc.PoolRunner{
 		LeaseID: leaseID, Tier: lease.Tier, LaunchRequestID: lease.RequestID,
-		RunnerID: retiringID, RunnerName: req.RunnerName, GitHubTarget: path,
+		RunnerID: retiringID, RunnerName: req.RunnerName, GitHubTarget: provenOwner(recovery.Present),
 	})
 	if err != nil {
 		writeStoreErr(w, err)
