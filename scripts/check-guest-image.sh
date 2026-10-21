@@ -625,7 +625,7 @@ SOURCES_HEADER=$'package\tarchitecture\tversion\tsource\tsource_version\torigin\
 # those apt could fetch from no source the image still names, which is what a
 # release has to carry the source of itself.
 check_image_sources() {
-	local sources records installed listed unfinished malformed status=0 gnu unfetchable
+	local sources records installed listed unfinished malformed status=0 gnu unfetchable from
 
 	image_text_file "$1" /opt/billet/IMAGE_SOURCES.tsv || status=$?
 	case "$status" in
@@ -727,7 +727,11 @@ check_image_sources() {
 
 	gnu=$(awk -F '\t' 'NR > 1 && $7 == "gnu"' "$sources" | wc -l | tr -d ' ')
 	unfetchable=$(awk -F '\t' 'NR > 1 && $7 == "gnu" && $6 == "none"' "$sources" | wc -l | tr -d ' ')
-	pass "/opt/billet/IMAGE_SOURCES.tsv lists every package dpkg installed ($(wc -l <<<"$installed" | tr -d ' ')), $gnu under a GNU license, $unfetchable of those from no source apt still names"
+	# THE SOURCES OF THOSE, by name and version, which is what a release would
+	# have to carry itself.
+	from=$(awk -F '\t' 'NR > 1 && $7 == "gnu" && $6 == "none" { print $4 " " $5 }' "$sources" |
+		LC_ALL=C sort -u | paste -sd ',' - | sed 's/,/, /g')
+	pass "/opt/billet/IMAGE_SOURCES.tsv lists every package dpkg installed ($(wc -l <<<"$installed" | tr -d ' ')), $gnu under a GNU license, $unfetchable of those from no source apt still names${from:+ (built from $from)}"
 }
 
 # check_manifest_components passes or fails the gate on the manifest declaring

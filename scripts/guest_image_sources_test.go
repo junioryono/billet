@@ -271,7 +271,8 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 	}
 
 	out, failed := sourcesGate(t, sourcesRoot(t))
-	if failed != "0" || !strings.Contains(out, "(4), 3 under a GNU license, 1 of those from no source apt still names") {
+	if failed != "0" || !strings.Contains(out,
+		"(4), 3 under a GNU license, 1 of those from no source apt still names (built from git 1:2.55.0-0ppa1~ubuntu24.04.2)\n") {
 		t.Fatalf("a manifest listing exactly what was installed failed, or miscounted:\n%s", out)
 	}
 
