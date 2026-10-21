@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -90,10 +91,18 @@ func TestTheImageEnvironmentIsWrittenOnceAfterGitHubsBuild(t *testing.T) {
 
 	source := readBuildScript(t)
 
-	// ONE WRITER, to a temporary file renamed into place, so no reader sees half.
-	if writes := strings.Count(source, `>"$rootfs/etc/billet-image-env`); writes != 1 {
-		t.Errorf("the image environment file is written %d times; it must be written once, "+
-			"by write_image_env", writes)
+	// ONE WRITER, write-image-env.sh, which the completer runs again (#584), to a
+	// temporary file renamed into place, so no reader sees half; the build reaches
+	// it only through write_image_env.
+	if writes := strings.Count(source, `"$rootfs/etc/billet-image-env`); writes != 1 ||
+		!strings.Contains(source, `"$SCRIPT_DIR/runner-images/write-image-env.sh" "$rootfs/etc/environment" \
+		"$rootfs/etc/billet-image-env"`) {
+		t.Errorf("the build names the image environment file %d times; it must name it once, "+
+			"handing it to write-image-env.sh in write_image_env", writes)
+	}
+	writer := readScriptFile(t, filepath.Join("runner-images", "write-image-env.sh"))
+	if strings.Count(writer, `>"$dest.tmp"`) != 1 || !strings.Contains(writer, `mv "$dest.tmp" "$dest"`) {
+		t.Error("write-image-env.sh does not write its file once, through a temporary renamed into place")
 	}
 
 	main := mainBody(t, source)

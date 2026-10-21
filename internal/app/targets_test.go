@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	billetgithub "github.com/junioryono/billet/internal/github"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -160,6 +161,22 @@ func TestBuildTargetsKeysBothViewsByTargetName(t *testing.T) {
 
 	if len(jit) != 2 {
 		t.Errorf("the plane got %d sources, want 2", len(jit))
+	}
+
+	// AND EACH NAMES ITS OWNER BY PATH, which the plane records with every runner
+	// it mints (#93): a source answering nothing, or another owner's path, would
+	// send a removed tier's runner to the catalogue or to the wrong App.
+	for name, want := range map[string]string{"default": "acme", "personal": "someone/widgets"} {
+		named, ok := jit[name].(nodeplane.TargetSource)
+		if !ok {
+			t.Errorf("the plane's source for %s is %T, which names no owner", name, jit[name])
+
+			continue
+		}
+
+		if got := named.GitHubTarget(); got != want {
+			t.Errorf("the plane's source for %s names owner %q, want %q", name, got, want)
+		}
 	}
 }
 
