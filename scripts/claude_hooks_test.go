@@ -476,11 +476,14 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 	// TWO SHELLS NAMED sh, one bash and one dash by the file each resolves to, in
 	// directories of their own, so a shell is judged from the command's directory.
 	for dir, target := range map[string]string{"b": "bash", "d": "dash"} {
-		hookWrite(t, root, "shells/bin/"+target, "#!/bin/sh\n")
-
-		if err := os.MkdirAll(filepath.Join(root, "shells", dir), 0o755); err != nil {
-			t.Fatal(err)
+		for _, d := range []string{"bin", dir} {
+			if err := os.MkdirAll(filepath.Join(root, "shells", d), 0o755); err != nil {
+				t.Fatal(err)
+			}
 		}
+
+		// Executable, or a search of PATH passes over it.
+		writeExecutable(t, filepath.Join(root, "shells", "bin", target), "#!/bin/sh\n")
 
 		if err := os.Symlink(filepath.Join(root, "shells", "bin", target), filepath.Join(root, "shells", dir, "sh")); err != nil {
 			t.Fatal(err)
