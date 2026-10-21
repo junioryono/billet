@@ -39,6 +39,8 @@ type targetJIT struct {
 	removed      []string
 	recovered    []string
 	ownerAtMints []string
+	// ownerAtRemoves is the owner the lease recorded as each removal began.
+	ownerAtRemoves []string
 }
 
 func (j *targetJIT) GitHubTarget() string { return j.path }
@@ -72,6 +74,12 @@ func (j *targetJIT) RemoveRunner(_ context.Context, _ int64, name string) error 
 	defer j.mu.Unlock()
 
 	j.removed = append(j.removed, name)
+
+	if j.store != nil {
+		j.store.mu.Lock()
+		j.ownerAtRemoves = append(j.ownerAtRemoves, j.store.leaseTargets["l1"])
+		j.store.mu.Unlock()
+	}
 
 	return j.removeErr
 }
@@ -837,22 +845,34 @@ func TestARecoveryKeepsOnlyTheOwnerItFoundTheRunnerOn(t *testing.T) {
 		t.Parallel()
 
 		store := legacy()
-		jitA := &targetJIT{path: ownerA, recovery: nodeplane.JITRunnerRecovery{RunnerID: 91, Present: true},
+		jitA := &targetJIT{path: ownerA, store: store,
+			recovery:  nodeplane.JITRunnerRecovery{RunnerID: 91, Present: true},
 			removeErr: errors.New("github unavailable")}
 		jitB := &targetJIT{path: ownerB}
 		sources := map[string]nodeplane.JITSource{"default": jitA, "personal": jitB}
 
 		c := serve(t, store, twoTargetCatalogue(), sources)
-		if _, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err == nil {
-			t.Fatal("a recovery whose removal failed reported success")
+		if _, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err == nil ||
+			!strings.Contains(err.Error(), "github unavailable") {
+			t.Fatalf("a recovery whose removal failed: %v, want the removal's failure", err)
+		}
+
+		// THE OWNER WAS DURABLE BEFORE THE REMOVAL BEGAN, not written after it
+		// failed: a crash between the two would otherwise lose it.
+		jitA.mu.Lock()
+		atRemoves := append([]string(nil), jitA.ownerAtRemoves...)
+		jitA.mu.Unlock()
+		if len(atRemoves) != 1 || atRemoves[0] != ownerA {
+			t.Fatalf("the lease recorded owners %q as the removals began, want [%s]", atRemoves, ownerA)
 		}
 
 		moved := twoTargetCatalogue()
 		moved[0].Target = "personal"
 		c = serve(t, store, moved, sources)
 		// THE RETRY MEETS THE SAME FAILING REMOVAL on the owner it was found on.
-		if _, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err == nil {
-			t.Error("the retry reported success though its owner's removal still fails")
+		if _, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err == nil ||
+			!strings.Contains(err.Error(), "github unavailable") {
+			t.Errorf("the retry: %v, want the same removal's failure on the owner it was found on", err)
 		}
 
 		if _, _, recoveredB := jitB.asked(); len(recoveredB) != 0 {
@@ -860,8 +880,9 @@ func TestARecoveryKeepsOnlyTheOwnerItFoundTheRunnerOn(t *testing.T) {
 				recoveredB)
 		}
 
-		if _, _, recoveredA := jitA.asked(); len(recoveredA) != 2 {
-			t.Errorf("the owner the runner was found on was asked %d times, want 2", len(recoveredA))
+		if _, removedA, recoveredA := jitA.asked(); len(recoveredA) != 2 || len(removedA) != 2 {
+			t.Errorf("the owner the runner was found on was asked %d times and removed %d, want 2 of each",
+				len(recoveredA), len(removedA))
 		}
 	})
 
