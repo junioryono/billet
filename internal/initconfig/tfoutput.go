@@ -81,7 +81,9 @@ func ParseTerraformOutput(raw []byte, need HybridNeeds) (HybridFacts, error) {
 				"Run the plan render again into a scratch --out with the same flags, copy its "+
 				"%q and %q output blocks into your terraform/main.tf and nothing else, run "+
 				"`terraform plan` and check it adds only those two outputs, apply it, save "+
-				"`terraform output -json` again, and pass --generation with the value you copied",
+				"`terraform output -json` again, and pass --generation with the value you copied. A root "+
+				"that still begins with billet's marker is replaced whole by the next render; remove the "+
+				"marker from one you want kept",
 				name, HybridOutputGeneration, HybridOutputAccountID)
 		}
 		if *dst, err = read(name); err != nil {

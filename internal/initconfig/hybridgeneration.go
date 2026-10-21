@@ -21,9 +21,10 @@ import (
 // hybridGenerationPattern is the one shape a fingerprint has.
 var hybridGenerationPattern = regexp.MustCompile(`^[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}$`)
 
-// hybridGenerationDeclaration finds an output block named generation in a root
-// whose comments and heredocs are already masked.
-var hybridGenerationDeclaration = regexp.MustCompile(`\boutput\s+"` + HybridOutputGeneration + `"\s*\{`)
+// hybridGenerationDeclaration finds an output block named generation, its
+// label quoted or bare (HCL allows both), in a root whose comments and
+// heredocs are already masked.
+var hybridGenerationDeclaration = regexp.MustCompile(`\boutput\s+(?:"` + HybridOutputGeneration + `"|` + HybridOutputGeneration + `\b)\s*\{`)
 
 // hybridValueAttribute finds a block's value attribute, up to the token after
 // the equals sign.
@@ -76,8 +77,8 @@ func HybridGenerationOf(mainTF string) (string, bool, error) {
 	if !complete {
 		// AN UNTERMINATED STRING OR COMMENT HIDES EVERYTHING AFTER IT, so a
 		// declaration there is could-not-tell, which is never "none".
-		return "", false, fmt.Errorf("the root has an unterminated string or comment, so whether it " +
-			"declares a generation cannot be read")
+		return "", false, fmt.Errorf("the root has an unterminated string, template, comment or " +
+			"heredoc, or a << that is not a heredoc, so whether it declares a generation cannot be read")
 	}
 
 	// A STRING CANNOT HIDE ONE: inside a literal the quotes around the name
@@ -140,128 +141,181 @@ type hclLiteral struct{ start, end int }
 // maskHCL returns src with comments and heredoc bodies blanked (keeping
 // newlines, so offsets and lines survive), the same with every quoted string
 // literal's contents blanked as well, the literals' spans, and whether the
-// scan reached the end without an unterminated string or block comment.
+// whole file was settled: an unterminated string, template, comment or
+// heredoc, or a `<<` that is not a heredoc, is not.
 func maskHCL(src string) (string, string, []hclLiteral, bool) {
-	out := []byte(src)
-	var (
-		literals []hclLiteral
-		contents [][2]int
-	)
+	s := &hclScan{src: src, out: []byte(src)}
 
-	blank := func(from, to int) {
-		for i := from; i < to && i < len(out); i++ {
-			if out[i] != '\n' {
-				out[i] = ' '
-			}
-		}
-	}
-
-	both := func() (string, string) {
-		uncommented := string(out)
-		for _, c := range contents {
-			blank(c[0], c[1])
-		}
-
-		return uncommented, string(out)
-	}
-
+	complete := true
 	for i := 0; i < len(src); {
-		switch {
-		case src[i] == '#' || strings.HasPrefix(src[i:], "//"):
-			end := strings.IndexByte(src[i:], '\n')
-			if end < 0 {
-				end = len(src) - i
-			}
-			blank(i, i+end)
-			i += end
+		next, ok := s.skip(i)
+		if !ok {
+			complete = false
 
-		case strings.HasPrefix(src[i:], "/*"):
-			end := strings.Index(src[i+2:], "*/")
-			if end < 0 {
-				blank(i, len(src))
-				uncommented, masked := both()
-
-				return uncommented, masked, literals, false
-			}
-			blank(i, i+2+end+2)
-			i += 2 + end + 2
-
-		case strings.HasPrefix(src[i:], "<<"):
-			if i = maskHeredoc(src, i, blank); i < 0 {
-				uncommented, masked := both()
-
-				return uncommented, masked, literals, false
-			}
-
-		case src[i] == '"':
-			j := i + 1
-			for j < len(src) && src[j] != '"' && src[j] != '\n' {
-				if src[j] == '\\' {
-					j++
-				}
-				j++
-			}
-			if j >= len(src) || src[j] != '"' {
-				// UNTERMINATED: no literal, and nothing after it is trusted.
-				blank(i, len(src))
-				uncommented, masked := both()
-
-				return uncommented, masked, literals, false
-			}
-			literals = append(literals, hclLiteral{start: i, end: j})
-			contents = append(contents, [2]int{i + 1, j})
-			i = j + 1
-
-		default:
-			i++
+			break
 		}
+		i = next
 	}
 
-	uncommented, masked := both()
+	uncommented := string(s.out)
+	for _, c := range s.contents {
+		s.blank(c[0], c[1])
+	}
 
-	return uncommented, masked, literals, true
+	return uncommented, string(s.out), s.literals, complete
 }
 
-// maskHeredoc blanks a heredoc starting at src[i] ("<<" or "<<-" then an
-// identifier and a newline) through its closing line, and returns the offset
-// after it, or -1 for a heredoc that never closes; anything else at "<<" is
-// left alone.
-func maskHeredoc(src string, i int, blank func(int, int)) int {
-	j := i + 2
-	if j < len(src) && src[j] == '-' {
-		j++
-	}
+// hclScan is one lexical pass over a root.
+type hclScan struct {
+	src      string
+	out      []byte
+	literals []hclLiteral
+	contents [][2]int
+}
 
-	k := j
-	for k < len(src) && (src[k] == '_' || src[k] >= 'a' && src[k] <= 'z' || src[k] >= 'A' && src[k] <= 'Z' || src[k] >= '0' && src[k] <= '9') {
-		k++
-	}
-
-	ident := src[j:k]
-	if ident == "" || k >= len(src) || src[k] != '\n' {
-		return i + 2
-	}
-
-	for line := k + 1; line < len(src); {
-		next := strings.IndexByte(src[line:], '\n')
-		lineEnd := len(src)
-		if next >= 0 {
-			lineEnd = line + next
+// blank replaces out[from:to] with spaces, keeping newlines.
+func (s *hclScan) blank(from, to int) {
+	for i := from; i < to && i < len(s.out); i++ {
+		if s.out[i] != '\n' {
+			s.out[i] = ' '
 		}
-		if strings.TrimSpace(src[line:lineEnd]) == ident {
-			blank(k+1, line)
+	}
+}
 
-			return lineEnd
+// skip reads the construct at i (a comment, a heredoc, a string, or one other
+// byte) and returns the offset after it; false is a construct that cannot be
+// settled.
+func (s *hclScan) skip(i int) (int, bool) {
+	src := s.src
+
+	switch {
+	case src[i] == '#' || strings.HasPrefix(src[i:], "//"):
+		end := len(src)
+		if nl := strings.IndexByte(src[i:], '\n'); nl >= 0 {
+			end = i + nl
 		}
-		if next < 0 {
+		s.blank(i, end)
+
+		return end, true
+
+	case strings.HasPrefix(src[i:], "/*"):
+		end := strings.Index(src[i+2:], "*/")
+		if end < 0 {
+			return 0, false
+		}
+		s.blank(i, i+2+end+2)
+
+		return i + 2 + end + 2, true
+
+	case strings.HasPrefix(src[i:], "<<"):
+		return s.heredoc(i)
+
+	case src[i] == '"':
+		return s.str(i)
+	}
+
+	return i + 1, true
+}
+
+// str reads a quoted string at i, its templates included, and records it.
+//
+// A TEMPLATE IS AN EXPRESSION, and its strings are strings of their own:
+// "${"/*"}" holds a quote that does not close the outer string, so a scan that
+// stopped there would read the /* after it as a comment and swallow what
+// follows.
+func (s *hclScan) str(i int) (int, bool) {
+	src := s.src
+
+	for j := i + 1; j < len(src); {
+		switch {
+		case src[j] == '\n':
+			return 0, false
+		case src[j] == '\\':
+			j += 2
+		case src[j] == '"':
+			s.literals = append(s.literals, hclLiteral{start: i, end: j})
+			s.contents = append(s.contents, [2]int{i + 1, j})
+
+			return j + 1, true
+		case strings.HasPrefix(src[j:], "$${") || strings.HasPrefix(src[j:], "%%{"):
+			j += 3
+		case strings.HasPrefix(src[j:], "${") || strings.HasPrefix(src[j:], "%{"):
+			next, ok := s.template(j + 2)
+			if !ok {
+				return 0, false
+			}
+			j = next
+		default:
+			j++
+		}
+	}
+
+	return 0, false
+}
+
+// template reads a template's expression from just after its `${` or `%{` to
+// just after the brace that closes it, nested braces, strings, comments and
+// heredocs included.
+func (s *hclScan) template(i int) (int, bool) {
+	depth := 1
+
+	for i < len(s.src) {
+		switch s.src[i] {
+		case '{':
+			depth++
+			i++
+		case '}':
+			depth--
+			i++
+			if depth == 0 {
+				return i, true
+			}
+		default:
+			next, ok := s.skip(i)
+			if !ok {
+				return 0, false
+			}
+			i = next
+		}
+	}
+
+	return 0, false
+}
+
+// heredocHeader is a heredoc's opening: "<<" or "<<-", an identifier (which
+// HCL lets carry hyphens), and the end of its line, CRLF included.
+var heredocHeader = regexp.MustCompile(`^<<-?([A-Za-z_][A-Za-z0-9_-]*)\r?\n`)
+
+// heredoc blanks a heredoc's body at i through its closing line and returns
+// the offset after it. HCL has no other `<<`, so anything at "<<" that is not
+// a heredoc header, and a heredoc that never closes, cannot be settled.
+func (s *hclScan) heredoc(i int) (int, bool) {
+	m := heredocHeader.FindStringSubmatch(s.src[i:])
+	if m == nil {
+		return 0, false
+	}
+
+	ident := m[1]
+	body := i + len(m[0])
+
+	for line := body; line < len(s.src); {
+		lineEnd := len(s.src)
+		if nl := strings.IndexByte(s.src[line:], '\n'); nl >= 0 {
+			lineEnd = line + nl
+		}
+		// TrimSpace takes a CRLF's \r and the indentation "<<-" allows.
+		if strings.TrimSpace(s.src[line:lineEnd]) == ident {
+			s.blank(body, line)
+
+			return lineEnd, true
+		}
+		if lineEnd == len(s.src) {
 			break
 		}
 		line = lineEnd + 1
 	}
 
-	blank(k+1, len(src))
-
-	return -1
+	return 0, false
 }
 
 // literalAt is the literal that opens exactly at offset.

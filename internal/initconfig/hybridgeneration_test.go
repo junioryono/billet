@@ -123,6 +123,22 @@ func TestHybridGenerationOfReadsOnlyALiveDeclaration(t *testing.T) {
 		{"an unterminated string before it", "locals { a = \"oops\n}\n" + live, false, true},
 		{"an unterminated comment before it", "/* oops\n" + live, false, true},
 		{"an unterminated heredoc before it", "locals {\n  a = <<EOT\nnever closed\n" + live, false, true},
+		{"a bare label", "output generation {\n  value = \"" + fp + "\"\n}\n", true, false},
+		{"a bare label of another output", "output generation_x {\n  value = \"" + fp + "\"\n}\n", false, false},
+		// A TEMPLATE'S OWN STRING, which holds a quote that does not close the
+		// outer one: read as the end of the string, the /* after it swallowed
+		// the declaration up to a */ further down.
+		{"a quote inside a template", "locals { opener = \"${\"/*\"}\" }\n" + live + "locals { closer = \"*/#\" }\n", true, false},
+		{"an escaped template", "locals { a = \"$${\\\"/*\\\"}\" }\n" + live, true, false},
+		{"a template in the rendered root's bucket", "resource \"x\" \"y\" {\n  bucket = \"n-${data.aws_caller_identity.this.account_id}\"\n}\n" + live, true, false},
+		// CRLF AND HYPHENATED DELIMITERS ARE HEREDOCS, so their bodies are not
+		// code: a /* in one swallows nothing, and a declaration in one is dead.
+		{"a CRLF heredoc holding a comment opener",
+			strings.ReplaceAll("locals {\n  opener = <<EOT\n/*\nEOT\n}\n"+live+"locals { closer = \"*/#\" }\n", "\n", "\r\n"), true, false},
+		{"a CRLF heredoc holding a declaration",
+			strings.ReplaceAll("locals {\n  note = <<EOT\noutput \"generation\" {\n  value = \""+fp+"\"\n}\nEOT\n}\n", "\n", "\r\n"), false, false},
+		{"a hyphenated delimiter", "locals {\n  note = <<-END-TEXT\n  output \"generation\" { value = \"x\" }\n  END-TEXT\n}\n" + live, true, false},
+		{"a << that is not a heredoc", "locals { a = 1 << 2 }\n" + live, false, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()

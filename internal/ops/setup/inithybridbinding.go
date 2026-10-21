@@ -92,7 +92,9 @@ func resolveHybridGeneration(out, flag string, flagSet, later bool) (string, err
 			"fingerprints declares none: run the plan render into a scratch --out with the same "+
 			"flags, copy its %q and %q output blocks into your root and nothing else, check that "+
 			"`terraform plan` adds only those two outputs, apply, save `terraform output -json` "+
-			"again, and pass --generation with the value you copied",
+			"again, and pass --generation with the value you copied. A root that still begins with "+
+			"billet's marker is replaced whole by the next render; remove the marker from one you "+
+			"want kept",
 			initconfig.HybridTerraformFile, initconfig.HybridOutputGeneration, initconfig.HybridOutputAccountID)
 	}
 
