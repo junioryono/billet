@@ -274,6 +274,18 @@ func TestThePhasesAreInTheOrderTheyHappened(t *testing.T) {
 		t.Errorf("phases of mixed precision are %v, want bought before assigned", phases)
 	}
 
+	// A STAMP THAT DOES NOT PARSE KEEPS ITS PLACE, and the ones around it are
+	// still put in order: here custody, recorded before the launch, comes first.
+	malformed := JobRecord{LaunchedAt: "2026-10-20T12:00:09.000000000Z", RegisteredAt: "not a time",
+		CustodyAt: "2026-10-20T12:00:05.000000000Z"}
+	var around []string
+	for _, p := range malformed.Phases() {
+		around = append(around, p.Name)
+	}
+	if want := []string{"custody", "registered", "launched"}; !slices.Equal(around, want) {
+		t.Errorf("phases around a stamp that does not parse are %v, want %v", around, want)
+	}
+
 	if got := (JobRecord{RunID: 600, GitHubRunID: 700}).StartedRun(); got != 700 {
 		t.Errorf("a job started in run 700 on a lease assigned 600 is run %d's", got)
 	}

@@ -113,16 +113,28 @@ func (r JobRecord) Phases() []JobPhase {
 
 	// ORDERED BY THE INSTANT, NOT THE STRING: a stamp an older binary wrote in
 	// another precision sorts wrongly as text ("…:00Z" after "…:00.5Z"). A
-	// stamp that does not parse keeps its place in the lifecycle order.
-	slices.SortStableFunc(out, func(a, b JobPhase) int {
-		at, errA := time.Parse(time.RFC3339Nano, a.At)
-		bt, errB := time.Parse(time.RFC3339Nano, b.At)
-		if errA != nil || errB != nil {
-			return 0
+	// stamp that does not parse keeps its place in the lifecycle order, and the
+	// ones that do are sorted among the places they hold: a comparison calling
+	// an unparsable stamp equal to every other would not be an ordering, and
+	// could leave two parsable ones reversed around it.
+	type timed struct {
+		phase JobPhase
+		at    time.Time
+	}
+	var (
+		places []int
+		parsed []timed
+	)
+	for i, p := range out {
+		if at, err := time.Parse(time.RFC3339Nano, p.At); err == nil {
+			places = append(places, i)
+			parsed = append(parsed, timed{phase: p, at: at})
 		}
-
-		return at.Compare(bt)
-	})
+	}
+	slices.SortStableFunc(parsed, func(a, b timed) int { return a.at.Compare(b.at) })
+	for i, place := range places {
+		out[place] = parsed[i].phase
+	}
 
 	return out
 }
