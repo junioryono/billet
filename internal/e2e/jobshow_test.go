@@ -150,27 +150,32 @@ func TestJobsShowPrintsTheTimelineOfAJobTheStackRan(t *testing.T) {
 		`result     github "succeeded"; billet done`,
 		"runner     GitHub runner 99, instance " + names[0],
 		"held by    launched and held to the end by process ",
-		// AND NOTHING WAS ASKED OF GITHUB: no target holds the job's repository.
-		`no target holds \"acme/billet-test\"`,
+		// AND NOTHING WAS ASKED OF GITHUB: a run's jobs are shown without steps.
+		"steps      not read for a run's jobs",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("the report does not say %q:\n%s", want, report)
 		}
 	}
 
-	// EVERY PART OF ITS LIFE, IN THE ORDER IT LIVED THEM, each on a line of its
-	// own and after the one before.
-	at := -1
-	for _, phase := range []string{"bought", "assigned", "launched", "registered", "started", "finished"} {
-		i := strings.Index(report, " "+phase+strings.Repeat(" ", 12-len(phase)))
-		if i < 0 {
-			t.Errorf("the timeline does not show the job %s:\n%s", phase, report)
+	// EVERY PART OF ITS LIFE THE LEDGER RECORDED, each on a line of its own
+	// with the time the ledger holds for it: the real stack launched the lease,
+	// minted its runner, saw the job start and settled it.
+	rec, err := s.alloc.Job(t.Context(), leaseID)
+	if err != nil {
+		t.Fatalf("read the job's history: %v", err)
+	}
+	for phase, at := range map[string]string{
+		"bought": rec.BoughtAt, "assigned": rec.AssignedAt, "launched": rec.LaunchedAt,
+		"registered": rec.RegisteredAt, "started": rec.StartedAt, "finished": rec.FinishedAt,
+	} {
+		if at == "" {
+			t.Errorf("the ledger recorded no time the job was %s", phase)
 
 			continue
 		}
-		if i < at {
-			t.Errorf("the timeline shows the job %s before the part of its life that came first:\n%s", phase, report)
+		if line := phase + strings.Repeat(" ", 12-len(phase)) + at; !strings.Contains(report, line) {
+			t.Errorf("the timeline does not show the job %s at %s:\n%s", phase, at, report)
 		}
-		at = i
 	}
 }

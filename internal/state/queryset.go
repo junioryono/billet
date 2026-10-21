@@ -264,6 +264,7 @@ type WriteOps interface {
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
+	RecordJobRunnerID(ctx context.Context, arg ledgerdb.RecordJobRunnerIDParams) error
 	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) (int64, error)
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error
 	RecordJobDestinations(ctx context.Context, arg ledgerdb.RecordJobDestinationsParams) error

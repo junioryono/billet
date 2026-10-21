@@ -32,6 +32,11 @@ func TestALeasesGitHubTargetIsWrittenOnceByItsHolder(t *testing.T) {
 		t.Fatalf("a retry naming the same owner was refused: %v", err)
 	}
 
+	// GITHUB'S OWNER NAMES ARE CASE-INSENSITIVE: another spelling is the same owner.
+	if err := a.RecordLeaseGitHubTarget(t.Context(), lease.ID, lease.Epoch, "Acme"); err != nil {
+		t.Fatalf("a retry spelling the owner in another case was refused: %v", err)
+	}
+
 	if err := a.RecordLeaseGitHubTarget(t.Context(), lease.ID, lease.Epoch, "someone/widgets"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a second owner was accepted: %v, want ErrConflict", err)
 	}

@@ -36,10 +36,12 @@ func (a *Allocator) RecordLeaseGitHubTarget(ctx context.Context, leaseID string,
 			return fmt.Errorf("alloc: read the GitHub target of lease %s: %w", leaseID, err)
 		}
 
-		switch recorded {
-		case path:
+		// GITHUB'S OWNER NAMES ARE CASE-INSENSITIVE: another spelling of the
+		// recorded owner is a retry, not a second owner.
+		switch {
+		case strings.EqualFold(recorded, path):
 			return nil
-		case "":
+		case recorded == "":
 		default:
 			return fmt.Errorf("%w: lease %s's runner is registered on GitHub target %q, not %q",
 				ErrConflict, leaseID, recorded, path)

@@ -3,6 +3,7 @@ package alloc
 import (
 	"database/sql"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,7 +55,7 @@ func TestAJobKeepsWhenEachPartOfItsLifeBeganAndWhoHeldIt(t *testing.T) {
 
 	clock.step(4)
 	runner := PoolRunner{LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11, RunnerID: 91,
-		RunnerName: "billet-" + lease.ID}
+		RunnerName: "billet-" + lease.ID, Minted: true}
 	if err := a.RegisterPoolRunner(t.Context(), runner); err != nil {
 		t.Fatalf("RegisterPoolRunner: %v", err)
 	}
@@ -162,6 +163,63 @@ func TestAPhaseTimeIsWrittenOnce(t *testing.T) {
 	}
 }
 
+// A RUNNER BILLET ADOPTED RATHER THAN MINTED HAS NO REGISTRATION TIME, and its
+// id, unknown when it was journaled, is kept once a start learns it.
+func TestAnAdoptedRunnerKeepsItsIDAndNoRegistrationTime(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 500, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	name := "billet-" + lease.ID
+	if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+		LaunchRequestID: 11, RunnerName: name}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 91, name, 11, 500, "job-1",
+		JobIdentity{}); err != nil {
+		t.Fatalf("StartPoolRunner: %v", err)
+	}
+
+	rec, err := a.Job(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if rec.RunnerID != 91 || rec.RegisteredAt != "" {
+		t.Errorf("the adopted runner's history has runner %d registered %q; want runner 91 and no "+
+			"registration time", rec.RunnerID, rec.RegisteredAt)
+	}
+}
+
+// THE PHASES ARE IN THE ORDER THEY HAPPENED: GitHub's start arrives
+// independently of the lease's phase, so custody taken of a launch whose answer
+// was lost can come before the start, and the timeline shows it first rather
+// than a step back in time.
+func TestThePhasesAreInTheOrderTheyHappened(t *testing.T) {
+	rec := JobRecord{
+		AssignedAt: "2026-10-20T12:00:01.000000000Z", LaunchedAt: "2026-10-20T12:00:02.000000000Z",
+		CustodyAt: "2026-10-20T12:00:05.000000000Z", StartedAt: "2026-10-20T12:00:09.000000000Z",
+		FinishedAt: "2026-10-20T12:03:00.000000000Z",
+	}
+
+	var names []string
+	for _, p := range rec.Phases() {
+		names = append(names, p.Name)
+	}
+	if want := []string{"assigned", "launched", "custody", "started", "finished"}; !slices.Equal(names, want) {
+		t.Errorf("the phases are %v, want %v", names, want)
+	}
+
+	if got := (JobRecord{RunID: 600, GitHubRunID: 700}).StartedRun(); got != 700 {
+		t.Errorf("a job started in run 700 on a lease assigned 600 is run %d's", got)
+	}
+	if got := (JobRecord{RunID: 600}).StartedRun(); got != 600 {
+		t.Errorf("a job that never started, assigned run 600, is run %d's", got)
+	}
+}
+
 // A QUARANTINE IS KEPT ON THE HISTORY WHEN THE REAPER MAKES IT: the lease's
 // holder stopped renewing with compute behind it, and when that happened is
 // part of the job's story however the quarantine ends.
@@ -261,7 +319,81 @@ func TestARunResolvesToTheLeasesOfItsJobs(t *testing.T) {
 		}
 	}
 
-	if _, _, err := a.JobsOfRun(t.Context(), 0); err == nil {
-		t.Error("run 0, which no job has, was looked up rather than refused")
+	if _, _, err := a.JobsOfRun(t.Context(), 0); err == nil ||
+		!strings.Contains(err.Error(), "a workflow run id is positive") {
+		t.Errorf("run 0, which no job has: %v, want it refused as no run's id", err)
+	}
+}
+
+// A RUN WITH MORE JOBS THAN THE BOUND SHOWS ITS OLDEST, IN THE ORDER THEY WERE
+// ASSIGNED, and says some were left out: eight jobs whose random lease ids
+// cannot all happen to sort in assignment order, against a bound of five.
+func TestARunPastTheBoundShowsItsOldestJobsAndSaysSo(t *testing.T) {
+	saved := jobsOfRunLimit
+	jobsOfRunLimit = 5
+	t.Cleanup(func() { jobsOfRunLimit = saved })
+
+	clock := newPhaseClock()
+	a := newAllocator(t, Limits{MaxVCPU: 32, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)}, WithClock(clock.read))
+
+	var assigned []string
+	for i := range 8 {
+		clock.step(i)
+		lease := reserve(t, a, "linux")
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 800, int64(20+i)); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+		assigned = append(assigned, lease.ID)
+	}
+
+	got, more, err := a.JobsOfRun(t.Context(), 800)
+	if err != nil {
+		t.Fatalf("JobsOfRun: %v", err)
+	}
+	if !more || !slices.Equal(got, assigned[:5]) {
+		t.Errorf("run 800 resolves to %v (more %v), want the five assigned first, %v, and more", got, more,
+			assigned[:5])
+	}
+
+	if got, more, err := a.JobsOfRun(t.Context(), 801); err != nil || more || len(got) != 0 {
+		t.Errorf("a run with no jobs resolves to %v (more %v, err %v), want nothing and no more", got, more, err)
+	}
+}
+
+// WHAT THE HISTORY ROW HOLDS IS WHAT A JOB'S RECORD READS: the run that
+// started, the caches the node observed, the reason billet failed the lease
+// and the disruption it recorded, each read back as written.
+func TestAJobsRecordReadsWhatItsHistoryHolds(t *testing.T) {
+	tiers := []config.Tier{tier("linux", 4, 8*config.GiB)}
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	lease := launchingLease(t, a, "linux")
+
+	if err := a.RecordJobIdentity(t.Context(), lease.ID, HistoryJob{JobID: "job-1", RunID: 700}); err != nil {
+		t.Fatalf("RecordJobIdentity: %v", err)
+	}
+	observed := CacheObservation{ImageCache: ImageCacheWarm, CacheGeneration: "g1",
+		ActionsCache: ActionsCacheServed, BuildCaches: BuildCaches{Sticky: BuildCacheWarm,
+			Git: BuildCacheCold, Bazel: BuildCacheUnused, Go: BuildCacheDisabled}}
+	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, observed); err != nil {
+		t.Fatalf("RecordCacheObservation: %v", err)
+	}
+	if err := a.MarkFailure(t.Context(), lease.ID, lease.Epoch, "spot interruption"); err != nil {
+		t.Fatalf("MarkFailure: %v", err)
+	}
+
+	rec, err := a.Job(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if rec.GitHubRunID != 700 || rec.RunID != 1 {
+		t.Errorf("the record's runs are started %d and assigned %d, want 700 and 1", rec.GitHubRunID, rec.RunID)
+	}
+	if rec.Caches != observed {
+		t.Errorf("the record's caches are %+v, want %+v", rec.Caches, observed)
+	}
+	if rec.Disruption != string(DisruptionReclaimed) || rec.DisruptedAt == "" {
+		t.Errorf("the record's disruption is %q at %q, want %q with its time", rec.Disruption, rec.DisruptedAt,
+			DisruptionReclaimed)
 	}
 }

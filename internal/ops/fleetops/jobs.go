@@ -14,6 +14,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/usage"
 )
 
@@ -85,8 +86,11 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	}
 	defer closeDB()
 
+	// A RUN'S JOBS ARE SHOWN WITHOUT THEIR STEPS: reading them asks GitHub for
+	// each job in turn, with the App's installation the control plane also
+	// polls through, and a wide matrix would spend a share of its budget.
 	show := func(leaseID string) ([]byte, error) {
-		return showJobOnce(ctx, a, *cfgPath, leaseID, *asJSON, *asHTML, w)
+		return showJobOnce(ctx, a, *cfgPath, leaseID, *asJSON, *asHTML, w, !runGiven)
 	}
 	if !runGiven {
 		out, err := show(fs.Arg(0))
@@ -163,10 +167,10 @@ func showRun(ctx context.Context, env cli.Env, a *alloc.Allocator, run int64, as
 // unset. A report is therefore never missing detail it does not say was
 // retired.
 func showJobOnce(ctx context.Context, a *alloc.Allocator, cfgPath, leaseID string, asJSON, asHTML bool,
-	w *window,
+	w *window, readSteps bool,
 ) ([]byte, error) {
 	show := func(out io.Writer) (string, error) {
-		return showJob(ctx, out, a, cfgPath, leaseID, asJSON, asHTML, w)
+		return showJob(ctx, out, a, cfgPath, leaseID, asJSON, asHTML, w, readSteps)
 	}
 	// A BUILD THAT FAILED is rebuilt too when the job is now retired: on
 	// PostgreSQL a usage summary and its destinations are two reads at read
@@ -202,9 +206,10 @@ func showJobOnce(ctx context.Context, a *alloc.Allocator, cfgPath, leaseID strin
 var afterJobShown func(a *alloc.Allocator)
 
 // showJob writes one job's report to out in the form asked for, and says the
-// retirement marker it was built with.
+// retirement marker it was built with. readSteps is whether the text report
+// and the page read the job's steps from GitHub.
 func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, leaseID string,
-	asJSON, asHTML bool, w *window,
+	asJSON, asHTML bool, w *window, readSteps bool,
 ) (string, error) {
 	rec, err := a.Job(ctx, leaseID)
 	if err != nil {
@@ -230,7 +235,12 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, le
 
 		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest, wj)
 	}
-	steps := readJobSteps(ctx, cfgPath, a, rec, measured)
+	steps := jobSteps{measured: measured, runner: provider.InstanceName(rec.LeaseID),
+		none: "not read for a run's jobs, which would ask GitHub once for each; `billet jobs show " +
+			rec.LeaseID + "` reads them"}
+	if readSteps {
+		steps = readJobSteps(ctx, cfgPath, a, rec, measured)
+	}
 	if asHTML {
 		return rec.DetailRetiredAt, renderJobPage(out, buildJobPage(ctx, a, rec, measured, steps, guest))
 	}
@@ -290,8 +300,9 @@ type jobJSON struct {
 	TeardownAt    string `json:"teardown_at"`
 	QuarantinedAt string `json:"quarantined_at"`
 	// RunnerID is GitHub's id for the runner registered, zero when none was
-	// recorded; LaunchIncarnation and HolderIncarnation are the node processes
-	// that launched the job and held its compute when its lease ended.
+	// recorded; LaunchIncarnation is the node process that launched the job and
+	// HolderIncarnation the one the ledger last recorded holding its compute,
+	// which for a quarantined lease is the holder before the quarantine.
 	RunnerID          int64  `json:"runner_id"`
 	LaunchIncarnation string `json:"launch_incarnation"`
 	HolderIncarnation string `json:"holder_incarnation"`
@@ -419,7 +430,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		request = fmt.Sprintf(", request %d", rec.RequestID)
 	}
 	line("job", "%s (github job %s, run %s%s)", quoted(rec.Job.Name),
-		quoted(rec.Job.JobID), identifier(rec.RunID), request)
+		quoted(rec.Job.JobID), runOf(rec), request)
 	line("repository", "%s", quoted(rec.Repo))
 	line("workflow", "%s", quoted(rec.Job.WorkflowRef))
 	line("event", "%s", quoted(rec.Job.Event))

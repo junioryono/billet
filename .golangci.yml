@@ -392,16 +392,16 @@ linters:
         # lifecycle drains through fleetops, installs a restored App key through
         # setup's writer and pulls Tart images through images, and `billet check`,
         # which `local up` and the upgrade probe run, checks every family's
-        # configuration. Nothing but cmd/billet imports host. internal/e2e, which
-        # holds only tests, runs an operator command against a job its real stack
-        # ran (#28), as an operator would after it; no package it builds ships.
+        # configuration. Nothing but cmd/billet imports host. internal/e2e's test
+        # files run an operator command against a job its real stack ran (#28), as
+        # an operator would after it; nothing they build ships.
         opsconsumers:
           list-mode: lax
           files:
             - "$all"
             - "!${config-path}/cmd/billet/**"
             - "!${config-path}/internal/ops/host/**"
-            - "!${config-path}/internal/e2e/**"
+            - "!${config-path}/internal/e2e/*_test.go"
           deny:
             - pkg: "github.com/junioryono/billet/internal/ops$"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
@@ -422,7 +422,7 @@ linters:
             - "!${config-path}/cmd/billet/**"
             - "!${config-path}/internal/cli/**"
             - "!${config-path}/internal/ops/**"
-            - "!${config-path}/internal/e2e/**"
+            - "!${config-path}/internal/e2e/*_test.go"
           deny:
             - pkg: "github.com/junioryono/billet/internal/cli$"
               desc: "internal/cli is the command line; only cmd/billet and its command families under internal/ops use it (#356 Phase 5)."

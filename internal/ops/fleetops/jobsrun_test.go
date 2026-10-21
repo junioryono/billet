@@ -53,6 +53,21 @@ func TestJobsShowRunPrintsEveryJobOfTheRun(t *testing.T) {
 	if strings.Contains(text, elsewhere) {
 		t.Errorf("a lease whose job started in another run is printed under run 4242:\n%s", text)
 	}
+	// A RUN'S JOBS ARE SHOWN WITHOUT STEPS, asking GitHub nothing per job.
+	if strings.Count(text, "steps      not read for a run's jobs") != 2 {
+		t.Errorf("a run's jobs do not each say their steps were not read:\n%s", text)
+	}
+
+	// THE LEASE WHOSE RUNNER GITHUB GAVE ANOTHER RUN'S JOB IS THAT RUN'S, and
+	// its report names that run, with the one its lease was assigned.
+	env, out = bufferedEnv()
+	if err := Jobs(t.Context(), env, []string{"show", "--config", cfg, "--run", "9999"}); err != nil {
+		t.Fatalf("billet jobs show --run 9999: %v", err)
+	}
+	if want := "run 9999, its lease assigned run 4242"; !strings.Contains(out.String(), want) ||
+		!strings.Contains(out.String(), "lease      "+elsewhere) {
+		t.Errorf("run 9999's report does not show lease %s saying %q:\n%s", elsewhere, want, out)
+	}
 
 	// --json IS ONE ARRAY of the same records.
 	env, out = bufferedEnv()
@@ -70,6 +85,43 @@ func TestJobsShowRunPrintsEveryJobOfTheRun(t *testing.T) {
 	if records[0].LaunchedAt != "" || records[0].BoughtAt == "" {
 		t.Errorf("the record's phases are launched %q and bought %q; the seeded job was bought and "+
 			"never launched", records[0].LaunchedAt, records[0].BoughtAt)
+	}
+}
+
+// THE JSON RECORD CARRIES EVERY PART OF A JOB'S LIFE THE LEDGER HOLDS, each
+// under its own key: a record with a distinct value in every field reads back
+// field for field, so no field is dropped or carried under another's name.
+func TestTheJobsJSONRecordCarriesItsWholeLife(t *testing.T) {
+	rec := alloc.JobRecord{
+		LeaseID: "6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64", RunID: 600, GitHubRunID: 700,
+		LaunchedAt: "t-launched", RegisteredAt: "t-registered", CustodyAt: "t-custody",
+		TeardownAt: "t-teardown", QuarantinedAt: "t-quarantined", RunnerID: 91,
+		LaunchIncarnation: "process-launch", HolderIncarnation: "process-held",
+		FailureReason: "the reason", Disruption: "reclaimed", DisruptedAt: "t-disrupted",
+		Caches: alloc.CacheObservation{ImageCache: "warm", CacheGeneration: "g7", ActionsCache: "served",
+			BuildCaches: alloc.BuildCaches{Sticky: "cold", Git: "unused", Bazel: "disabled", Go: "unavailable"}},
+	}
+
+	var out bytes.Buffer
+	if err := renderJobJSON(&out, rec, nil, nil, "", nil, nil); err != nil {
+		t.Fatalf("renderJobJSON: %v", err)
+	}
+	var got jobJSON
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("decode the record: %v\n%s", err, out.String())
+	}
+
+	want := jobJSON{
+		Lease: rec.LeaseID, RunID: 600, GitHubRunID: 700,
+		LaunchedAt: "t-launched", RegisteredAt: "t-registered", CustodyAt: "t-custody",
+		TeardownAt: "t-teardown", QuarantinedAt: "t-quarantined", RunnerID: 91,
+		LaunchIncarnation: "process-launch", HolderIncarnation: "process-held",
+		FailureReason: "the reason", Disruption: "reclaimed", DisruptedAt: "t-disrupted",
+		Cache: cacheJSON{Image: "warm", ImageGeneration: "g7", Actions: "served", Sticky: "cold",
+			Git: "unused", Bazel: "disabled", Go: "unavailable"},
+	}
+	if got != want {
+		t.Errorf("the record reads back as\n  %+v\nwant\n  %+v", got, want)
 	}
 }
 
@@ -154,6 +206,14 @@ func TestTheJobsLifeIsWordedFromWhatWasRecorded(t *testing.T) {
 		}
 	}
 
+	// A QUARANTINED LEASE'S HOLDER AFTER THE QUARANTINE IS NOT RECORDED, and the
+	// report never says the process from before held it to the end.
+	if got, want := describeProcesses("aaaa", "aaaa", true), "launched by process aaaa; last recorded "+
+		"holding it, before its quarantine, process aaaa; the process that held it after its quarantine "+
+		"is not recorded"; got != want {
+		t.Errorf("a quarantined job's processes read %q, want %q", got, want)
+	}
+
 	for _, tc := range []struct{ launched, held, want string }{
 		{"aaaa", "aaaa", "launched and held to the end by process aaaa"},
 		{"aaaa", "", "launched by process aaaa; the process holding it at the end is not recorded"},
@@ -162,7 +222,7 @@ func TestTheJobsLifeIsWordedFromWhatWasRecorded(t *testing.T) {
 		{"a\nlease      forged", "", `launched by process "a\nlease      forged"; the process holding it at ` +
 			"the end is not recorded"},
 	} {
-		if got := describeProcesses(tc.launched, tc.held); got != tc.want {
+		if got := describeProcesses(tc.launched, tc.held, false); got != tc.want {
 			t.Errorf("describeProcesses(%q, %q) = %q, want %q", tc.launched, tc.held, got, tc.want)
 		}
 	}

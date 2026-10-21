@@ -38,9 +38,21 @@ func renderLifecycle(line func(label, format string, args ...any), rec alloc.Job
 		runner = "GitHub runner " + strconv.FormatInt(rec.RunnerID, 10)
 	}
 	line("runner", "%s, instance %s", runner, provider.InstanceName(rec.LeaseID))
-	line("held by", "%s", describeProcesses(rec.LaunchIncarnation, rec.HolderIncarnation))
+	line("held by", "%s", describeProcesses(rec.LaunchIncarnation, rec.HolderIncarnation, rec.QuarantinedAt != ""))
 	line("failure", "%s", describeFailure(rec))
 	line("caches", "%s", describeCaches(rec.Caches))
+}
+
+// runOf names the run a job belongs to: the one that started on its runner,
+// with the run its lease was assigned when GitHub gave the runner another run's
+// job.
+func runOf(rec alloc.JobRecord) string {
+	run := identifier(rec.StartedRun())
+	if rec.GitHubRunID > 0 && rec.RunID > 0 && rec.RunID != rec.GitHubRunID {
+		run += ", its lease assigned run " + strconv.FormatInt(rec.RunID, 10)
+	}
+
+	return run
 }
 
 // between is how long after one of billet's stamps another came, false when
@@ -59,12 +71,27 @@ func between(from, to string) (time.Duration, bool) {
 }
 
 // describeProcesses names the node process that launched a job and the one
-// that held its compute when the lease ended.
+// the ledger last recorded holding its compute.
 //
 // A DIFFERENT HOLDER IS A REPLACEMENT that adopted the compute, the host's next
 // process after a restart or an upgrade, and the report says so; an unknown
-// side is said in that word, never read as a replacement.
-func describeProcesses(launched, held string) string {
+// side is said in that word, never read as a replacement. A QUARANTINED LEASE'S
+// HOLDER IS NOT RECORDED after the quarantine: the process that adopts it
+// moves no phase, so the last holder recorded is the one from before, and the
+// report says that rather than that it held the compute to the end.
+func describeProcesses(launched, held string, quarantined bool) string {
+	if quarantined {
+		var parts []string
+		if launched != "" {
+			parts = append(parts, "launched by process "+processName(launched))
+		}
+		if held != "" {
+			parts = append(parts, "last recorded holding it, before its quarantine, process "+processName(held))
+		}
+
+		return strings.Join(append(parts, "the process that held it after its quarantine is not recorded"), "; ")
+	}
+
 	switch {
 	case launched == "" && held == "":
 		return "not recorded"

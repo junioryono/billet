@@ -311,6 +311,13 @@ UPDATE job_history
 UPDATE job_history SET registered_at = @registered_at, runner_id = @runner_id
  WHERE lease_id = @lease_id AND registered_at = '';
 
+-- name: RecordJobRunnerID :exec
+-- Record GitHub's id for a lease's runner once a start or a recovery learns
+-- it, for a runner journaled without one: one billet adopted rather than
+-- minted. Written once; the registration time is left as it was.
+UPDATE job_history SET runner_id = @runner_id
+ WHERE lease_id = @lease_id AND runner_id = 0;
+
 -- name: ReadJobPlacement :one
 -- What one lease was charged for and what the cache did, from the row that
 -- outlives the lease.

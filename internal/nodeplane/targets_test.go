@@ -394,9 +394,11 @@ func queueLaunch(t *testing.T, p *nodeplane.Plane, c *nodeclient.Client, tier st
 		Providers: []config.ProviderKind{config.ProviderDocker}}
 
 	// THE LAUNCH'S OWN ANSWER IS NOT WHAT THESE TESTS ASK ABOUT: it waits on a
-	// report the node never sends, and ends with the test's context.
+	// report the node never sends, and ends with the test's context, which is
+	// cancelled before the cleanup joins it.
 	launched := make(chan error, 1)
 	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}) }()
+	t.Cleanup(func() { <-launched })
 
 	deadline := time.Now().Add(5 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
@@ -689,8 +691,8 @@ func TestAMintForAReclaimedLaunchIsRefusedBeforeGitHub(t *testing.T) {
 	store.lease.Phase = alloc.PhaseQuarantine
 	store.mu.Unlock()
 
-	if _, err := c.JITConfig(t.Context(), 7, "billet-l1", "_work"); err == nil {
-		t.Fatal("a registration was minted for a launch whose lease was reclaimed")
+	if _, err := c.JITConfig(t.Context(), 7, "billet-l1", "_work"); !errors.Is(err, alloc.ErrFenced) {
+		t.Fatalf("a mint for a launch whose lease was reclaimed: %v, want it fenced", err)
 	}
 
 	if minted, _, _ := jitA.asked(); len(minted) != 0 {
@@ -904,5 +906,128 @@ func TestARecoveryKeepsOnlyTheOwnerItFoundTheRunnerOn(t *testing.T) {
 			t.Errorf("a member the asked owner did not have is journaled with owner %q (err %v), want none",
 				member.GitHubTarget, err)
 		}
+
+		// NOR ON THE LEASE, whose record every later removal and recovery
+		// resolves through.
+		store.mu.Lock()
+		leaseOwner := store.leaseTargets["l1"]
+		store.mu.Unlock()
+		if leaseOwner != "" {
+			t.Errorf("the lease recorded owner %q, which answered that the runner is not there", leaseOwner)
+		}
 	})
+}
+
+// A RECOVERY THE LEDGER ALONE CAN ANSWER NEEDS NO CREDENTIAL: a member already
+// retired is answered as retired even when the owner it was recorded on is one
+// this control plane can no longer serve, so that owner holds only the
+// recoveries that must ask GitHub, never a node's whole recovery.
+func TestARecoveryTheLedgerAnswersNeedsNoCredential(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{
+		lease: &alloc.Lease{ID: "l1", Tier: "tier-a", Node: "n1", Epoch: 1, RequestID: 7,
+			Phase: alloc.PhaseQuarantine},
+		leaseTargets: map[string]string{"l1": "gone-org"},
+		pool: map[string]alloc.PoolRunner{"billet-l1": {
+			LeaseID: "l1", Tier: "tier-a", LaunchRequestID: 7, RunnerID: 91,
+			RunnerName: "billet-l1", Status: alloc.PoolRunnerRetired, GitHubTarget: "gone-org",
+		}},
+	}
+	jitA := &targetJIT{path: ownerA}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog(twoTargetCatalogue()[:1]))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil,
+		nodeplane.WithTargetJIT(map[string]nodeplane.JITSource{"default": jitA})))
+	t.Cleanup(srv.Close)
+
+	got, err := dial(t, srv.URL).RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1")
+	if err != nil || got != billetnode.RunnerRecoveryRetired {
+		t.Fatalf("recovering a retired member on an owner with no credential = %q, err %v; want retired",
+			got, err)
+	}
+
+	if _, removed, recovered := jitA.asked(); len(removed)+len(recovered) != 0 {
+		t.Errorf("a source was asked about a member the ledger had already retired: removed %v recovered %v",
+			removed, recovered)
+	}
+}
+
+// GITHUB'S OWNER NAMES ARE CASE-INSENSITIVE, so an owner recorded in one case
+// resolves to the source that names it in another.
+func TestAnOwnerRecordedInAnotherCaseResolvesToItsSource(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{
+		lease: &alloc.Lease{ID: "l1", Tier: "tier-b", Node: "n1", Epoch: 1, RequestID: 7},
+		// TWO SPELLINGS, NEITHER THE SOURCE'S: the records agree with each
+		// other and with the source only case-insensitively.
+		leaseTargets: map[string]string{"l1": "SOMEONE/widgets"},
+		pool: map[string]alloc.PoolRunner{"billet-l1": {
+			LeaseID: "l1", Tier: "tier-b", LaunchRequestID: 7, RunnerID: 91,
+			RunnerName: "billet-l1", Status: alloc.PoolRunnerIdle, GitHubTarget: "Someone/Widgets",
+		}},
+	}
+	jitA, jitB := &targetJIT{path: ownerA}, &targetJIT{path: ownerB}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog(twoTargetCatalogue()[:1]))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil,
+		nodeplane.WithTargetJIT(map[string]nodeplane.JITSource{"default": jitA, "personal": jitB})))
+	t.Cleanup(srv.Close)
+
+	if err := dial(t, srv.URL).RemoveRunner(t.Context(), "l1", 91, "billet-l1"); err != nil {
+		t.Fatalf("removal of a runner whose owner is recorded in another case: %v", err)
+	}
+
+	if _, removed, _ := jitB.asked(); !slices.Equal(removed, []string{"billet-l1"}) {
+		t.Errorf("the owner's source removed %v, want [billet-l1]", removed)
+	}
+}
+
+// A PLANE WITH ONE CREDENTIAL AND NO PER-TARGET SOURCES serves a runner whose
+// recorded owner is that credential's, though its tier was removed from the
+// config, and refuses one recorded on another owner.
+func TestASingleCredentialServesTheOwnerItNames(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		owner       string
+		wantRemoved bool
+	}{
+		"its own owner":   {owner: ownerA, wantRemoved: true},
+		"another's owner": {owner: ownerB},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &fakeStore{
+				lease:        &alloc.Lease{ID: "l1", Tier: "tier-b", Node: "n1", Epoch: 1, RequestID: 7},
+				leaseTargets: map[string]string{"l1": tc.owner},
+				pool: map[string]alloc.PoolRunner{"billet-l1": {
+					LeaseID: "l1", Tier: "tier-b", LaunchRequestID: 7, RunnerID: 91,
+					RunnerName: "billet-l1", Status: alloc.PoolRunnerIdle, GitHubTarget: tc.owner,
+				}},
+			}
+			only := &targetJIT{path: ownerA}
+
+			log := slog.New(slog.DiscardHandler)
+			p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog(twoTargetCatalogue()[:1]))
+			srv := httptest.NewServer(nodeplane.Handler(log, p, store, only))
+			t.Cleanup(srv.Close)
+
+			err := dial(t, srv.URL).RemoveRunner(t.Context(), "l1", 91, "billet-l1")
+			_, removed, _ := only.asked()
+
+			switch {
+			case tc.wantRemoved && (err != nil || !slices.Equal(removed, []string{"billet-l1"})):
+				t.Errorf("removal through the one credential, which serves the owner: %v, removed %v", err, removed)
+			case !tc.wantRemoved && (err == nil || len(removed) != 0 ||
+				!strings.Contains(err.Error(), "no credential for")):
+				t.Errorf("removal of a runner on another owner: %v, removed %v; want a refusal and no removal",
+					err, removed)
+			}
+		})
+	}
 }

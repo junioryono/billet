@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
@@ -39,6 +41,10 @@ func recordJobPhaseTx(ctx context.Context, tx *sql.Tx, leaseID string, to Phase,
 // has at most 256 jobs a matrix can make, and a re-run adds its attempt's.
 const JobsOfRunLimit = 1000
 
+// jobsOfRunLimit is the bound JobsOfRun applies: JobsOfRunLimit, outside a
+// test that lowers it to reach the bound with a handful of leases.
+var jobsOfRunLimit = JobsOfRunLimit
+
 // JobsOfRun lists the leases whose jobs belong to one of GitHub's workflow
 // runs, oldest assignment first: the run that started, or for a lease whose
 // job never started, the run it was assigned. The second result reports that
@@ -54,7 +60,7 @@ func (a *Allocator) JobsOfRun(ctx context.Context, runID int64) ([]string, bool,
 
 		leases, err = state.ReadQueries(q).ListJobsOfRun(ctx, ledgerdb.ListJobsOfRunParams{
 			RunID:   runID,
-			MaxRows: JobsOfRunLimit + 1,
+			MaxRows: int64(jobsOfRunLimit) + 1,
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: list the jobs of run %d: %w", runID, err)
@@ -66,8 +72,8 @@ func (a *Allocator) JobsOfRun(ctx context.Context, runID int64) ([]string, bool,
 		return nil, false, err
 	}
 
-	if len(leases) > JobsOfRunLimit {
-		return leases[:JobsOfRunLimit], true, nil
+	if len(leases) > jobsOfRunLimit {
+		return leases[:jobsOfRunLimit], true, nil
 	}
 
 	return leases, false, nil
@@ -80,10 +86,13 @@ type JobPhase struct {
 }
 
 // Phases are the parts of the job's life the history recorded a time for, in
-// the order a lease lives them: bought, assigned, launched, registered,
-// started, custody, teardown, quarantined, finished. A part with no time is
-// left out rather than shown as never entered, because an empty time is also
-// what a row written before the time was kept holds.
+// the order they happened, and in the order a lease lives them where two share
+// a time: bought, assigned, launched, registered, started, custody, teardown,
+// quarantined, finished. The start is GitHub's word, arriving independently of
+// the lease's phase, so a node that took custody of a launch whose answer was
+// lost can record custody before the start. A part with no time is left out
+// rather than shown as never entered, because an empty time is also what a
+// row written before the time was kept holds.
 func (r JobRecord) Phases() []JobPhase {
 	var out []JobPhase
 
@@ -103,5 +112,21 @@ func (r JobRecord) Phases() []JobPhase {
 		}
 	}
 
+	// billet's stamps are fixed-width (see timestampFormat), so their string
+	// order is their time order.
+	slices.SortStableFunc(out, func(a, b JobPhase) int { return strings.Compare(a.At, b.At) })
+
 	return out
+}
+
+// StartedRun is the workflow run of the job that started on the lease's
+// runner, which for a pooled runner GitHub gave another run's job is that other
+// run; for a job that never started, the run the lease was assigned. Zero when
+// neither is recorded.
+func (r JobRecord) StartedRun() int64 {
+	if r.GitHubRunID > 0 {
+		return r.GitHubRunID
+	}
+
+	return r.RunID
 }

@@ -31,6 +31,10 @@ type PoolRunner struct {
 	// which its removal and recovery take their credential from. Empty for a
 	// member journaled before it was recorded (migration 64).
 	GitHubTarget string
+	// Minted tells RegisterPoolRunner that this member's registration was just
+	// minted, so the job's history records when; a member billet adopted was
+	// registered at no time the ledger saw. Not stored.
+	Minted bool
 }
 
 // JobIdentity is what one of GitHub's own scale-set messages said about a job.
@@ -81,16 +85,20 @@ func (a *Allocator) RegisterPoolRunner(ctx context.Context, runner PoolRunner) e
 		}
 
 		// THE REGISTRATION IS PART OF THE JOB'S STORY, kept on the row that
-		// outlives the lease and this binding alike.
-		if err := q.RecordJobRegistration(ctx, ledgerdb.RecordJobRegistrationParams{
-			RegisteredAt: ts(a.now()),
-			RunnerID:     max(runner.RunnerID, 0),
-			LeaseID:      runner.LeaseID,
-		}); err != nil {
-			return fmt.Errorf("alloc: record the registration of pool runner %q: %w", runner.RunnerName, err)
+		// outlives the lease and this binding alike, when it was a mint; a runner
+		// billet adopted was registered at no time this row can say, and only
+		// its id is kept.
+		if runner.Minted {
+			if err := q.RecordJobRegistration(ctx, ledgerdb.RecordJobRegistrationParams{
+				RegisteredAt: ts(a.now()),
+				RunnerID:     max(runner.RunnerID, 0),
+				LeaseID:      runner.LeaseID,
+			}); err != nil {
+				return fmt.Errorf("alloc: record the registration of pool runner %q: %w", runner.RunnerName, err)
+			}
 		}
 
-		return nil
+		return recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID)
 	})
 }
 
@@ -122,6 +130,9 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 		if prior.Tier != tier || prior.RunnerName != runnerName ||
 			(prior.RunnerID != 0 && prior.RunnerID != runnerID) {
 			return fmt.Errorf("alloc: %w: runner %q does not match lease %s", ErrConflict, runnerName, leaseID)
+		}
+		if err := recordJobRunnerID(ctx, q, leaseID, runnerID); err != nil {
+			return err
 		}
 		if prior.Status == PoolRunnerRetiring || prior.Status == PoolRunnerRetired {
 			if prior.ActualRequestID == requestID && prior.RunID == runID && prior.JobID == jobID {
@@ -245,7 +256,11 @@ func (a *Allocator) PreserveRecoveredBusyPoolRunner(ctx context.Context, runner 
 			return err
 		}
 		if !found {
-			return insertPoolRunner(ctx, q, runner, PoolRunnerBusy)
+			if err := insertPoolRunner(ctx, q, runner, PoolRunnerBusy); err != nil {
+				return err
+			}
+
+			return recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID)
 		}
 		if prior.Tier != runner.Tier || prior.LaunchRequestID != runner.LaunchRequestID ||
 			prior.RunnerName != runner.RunnerName ||
@@ -259,6 +274,9 @@ func (a *Allocator) PreserveRecoveredBusyPoolRunner(ctx context.Context, runner 
 				ErrConflict, runner.RunnerName)
 		}
 		if _, err := fillTarget(ctx, q, prior, runner.GitHubTarget); err != nil {
+			return err
+		}
+		if err := recordJobRunnerID(ctx, q, runner.LeaseID, runner.RunnerID); err != nil {
 			return err
 		}
 		if prior.Status == PoolRunnerBusy {
@@ -578,9 +596,25 @@ func poolRunnerFrom(row *ledgerdb.PoolRunner) PoolRunner {
 }
 
 // sameTarget reports whether two records of a member's owner agree. An empty
-// side is a record made without one, which contradicts nothing.
+// side is a record made without one, which contradicts nothing, and GitHub's
+// owner names are case-insensitive.
 func sameTarget(prior, next string) bool {
-	return prior == "" || next == "" || prior == next
+	return prior == "" || next == "" || strings.EqualFold(prior, next)
+}
+
+// recordJobRunnerID keeps GitHub's id for a lease's runner on its history row,
+// once, when the runner was journaled without one: a start or a recovery is
+// where an adopted runner's id is learned.
+func recordJobRunnerID(ctx context.Context, q state.WriteOps, leaseID string, runnerID int64) error {
+	if runnerID <= 0 {
+		return nil
+	}
+
+	if err := q.RecordJobRunnerID(ctx, ledgerdb.RecordJobRunnerIDParams{RunnerID: runnerID, LeaseID: leaseID}); err != nil {
+		return fmt.Errorf("alloc: record the runner of lease %s: %w", leaseID, err)
+	}
+
+	return nil
 }
 
 // fillTarget records the owner of a member journaled without one, when the

@@ -53,7 +53,7 @@ func readJobSteps(ctx context.Context, cfgPath string, a *alloc.Allocator, rec a
 	case rec.Job.JobID == "":
 		out.none = "no GitHub job is recorded for this lease, so there are no steps to read"
 		return out
-	case rec.RunID <= 0:
+	case rec.StartedRun() <= 0:
 		out.none = "no workflow run is recorded for this lease's job, so its steps cannot be found"
 		return out
 	case !ok:
@@ -70,7 +70,7 @@ func readJobSteps(ctx context.Context, cfgPath string, a *alloc.Allocator, rec a
 		out.err = err
 		return out
 	}
-	out.job, out.err = records.RunnerJob(ctx, owner, repository, rec.RunID, out.runner)
+	out.job, out.err = records.RunnerJob(ctx, owner, repository, rec.StartedRun(), out.runner)
 
 	return out
 }

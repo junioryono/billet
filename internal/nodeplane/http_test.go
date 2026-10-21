@@ -438,6 +438,9 @@ func fillOwner(member alloc.PoolRunner, owner string) alloc.PoolRunner {
 func (f *fakeStore) RecordLeaseGitHubTarget(_ context.Context, leaseID string, epoch int64, path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if strings.TrimSpace(path) == "" {
+		return errors.New("alloc: a lease's GitHub target must not be empty")
+	}
 	if f.lease != nil && f.lease.ID == leaseID && f.lease.Epoch != epoch {
 		return alloc.ErrFenced
 	}

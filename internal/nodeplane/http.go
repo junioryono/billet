@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -2020,7 +2021,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		err = pool.RegisterPoolRunner(persistCtx, alloc.PoolRunner{
 			LeaseID: leaseID, Tier: tier, LaunchRequestID: lease.RequestID,
-			RunnerID: reg.ID(), RunnerName: reg.RunnerName(), GitHubTarget: path,
+			RunnerID: reg.ID(), RunnerName: reg.RunnerName(), GitHubTarget: path, Minted: true,
 		})
 	}
 	if err != nil {
@@ -2346,10 +2347,22 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	src, err := h.jitForRunner(lease.Tier, leaseTarget, binding.GitHubTarget)
-	if err != nil {
-		writeStoreErr(w, err)
-		return
+	// THE CREDENTIAL IS RESOLVED ONLY WHERE GITHUB IS ASKED. A member already
+	// retired, or busy with the job GitHub bound it to, is answered from the
+	// ledger alone, so an owner this control plane can no longer serve holds
+	// only the recoveries that need it, never a node's whole recovery.
+	var src JITSource
+	resolve := func() bool {
+		if src != nil {
+			return true
+		}
+		resolved, err := h.jitForRunner(lease.Tier, leaseTarget, binding.GitHubTarget)
+		if err != nil {
+			writeStoreErr(w, err)
+			return false
+		}
+		src = resolved
+		return true
 	}
 	// THE OWNER A RECOVERY JOURNALS IS ONE IT HAS PROOF OF: the one recorded at
 	// the mint, or the one that answered that the runner is there. An owner the
@@ -2382,6 +2395,9 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		case alloc.PoolRunnerIdle:
 			req.RunnerName = binding.RunnerName
 		case alloc.PoolRunnerRetiring:
+			if !resolve() {
+				return
+			}
 			if err := src.RemoveRunner(r.Context(), binding.RunnerID, binding.RunnerName); err != nil {
 				writeStoreErr(w, err)
 				return
@@ -2396,6 +2412,9 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 				"durable runner identity has an unknown status")
 			return
 		}
+	}
+	if !resolve() {
+		return
 	}
 	recovery, err := src.RecoverRunner(r.Context(), req.RunnerName)
 	if err != nil {
@@ -2740,10 +2759,12 @@ func (h *handler) jitForLabel(label string) (JITSource, error) {
 // tier's, serves it. Records that disagree are refused. A runner minted before
 // the owner was recorded resolves through the catalogue, as it always did.
 func (h *handler) jitForRunner(label string, recorded ...string) (JITSource, error) {
+	// GITHUB'S OWNER NAMES ARE CASE-INSENSITIVE, so two spellings of one owner,
+	// in a record or in the config, are one owner.
 	path := ""
 	for _, r := range recorded {
 		switch {
-		case r == "" || r == path:
+		case r == "" || strings.EqualFold(r, path):
 		case path == "":
 			path = r
 		default:
@@ -2757,7 +2778,7 @@ func (h *handler) jitForRunner(label string, recorded ...string) (JITSource, err
 	}
 
 	if tier, ok := h.plane.tierFor(label); ok {
-		if src, err := h.jitFor(tier); err == nil && targetPath(src) == path {
+		if src, err := h.jitFor(tier); err == nil && strings.EqualFold(targetPath(src), path) {
 			return src, nil
 		}
 	}
@@ -2775,7 +2796,7 @@ func (h *handler) jitForRunner(label string, recorded ...string) (JITSource, err
 		serving int
 	)
 	for _, src := range candidates {
-		if targetPath(src) == path {
+		if strings.EqualFold(targetPath(src), path) {
 			match = src
 			serving++
 		}

@@ -1128,6 +1128,24 @@ func (q *Queries) RecordJobRun(ctx context.Context, arg RecordJobRunParams) erro
 	return err
 }
 
+const recordJobRunnerID = `-- name: RecordJobRunnerID :exec
+UPDATE job_history SET runner_id = $1
+ WHERE lease_id = $2 AND runner_id = 0
+`
+
+type RecordJobRunnerIDParams struct {
+	RunnerID int64
+	LeaseID  string
+}
+
+// Record GitHub's id for a lease's runner once a start or a recovery learns
+// it, for a runner journaled without one: one billet adopted rather than
+// minted. Written once; the registration time is left as it was.
+func (q *Queries) RecordJobRunnerID(ctx context.Context, arg RecordJobRunnerIDParams) error {
+	_, err := q.db.ExecContext(ctx, recordJobRunnerID, arg.RunnerID, arg.LeaseID)
+	return err
+}
+
 const recordJobStart = `-- name: RecordJobStart :exec
 UPDATE job_history SET started_at = $1
  WHERE lease_id = $2 AND started_at IS NULL

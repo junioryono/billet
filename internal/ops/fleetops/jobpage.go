@@ -221,8 +221,8 @@ func identityFields(rec alloc.JobRecord) []pageField {
 		request = strconv.FormatInt(rec.RequestID, 10)
 	}
 	run := "not recorded"
-	if rec.RunID > 0 {
-		run = strconv.FormatInt(rec.RunID, 10)
+	if rec.StartedRun() > 0 {
+		run = runOf(rec)
 	}
 
 	fields := []pageField{
