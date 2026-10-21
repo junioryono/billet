@@ -243,6 +243,98 @@ func TestInitHybridKeepsTheGenerationBesideAForeignRoot(t *testing.T) {
 	}
 }
 
+// A ROOT WITH NO RECORD IS NEVER MINTED OVER: its generation is one billet
+// cannot see, and a fresh one recorded beside it would refuse that root's
+// outputs from then on. It is adopted by --generation, which records it.
+//
+// Mutation: dropping the existing-root refusal mints over it, and the first
+// render here succeeds.
+func TestInitHybridAdoptsARootWithoutARecordAndNeverMintsOverIt(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+
+	if _, err := runInitHybrid(t, hybridArgsMinting(out, cfg)...); err != nil {
+		t.Fatalf("plan render: %v", err)
+	}
+	minted := rootGeneration(t, out)
+
+	// A render that died after its files and before its record.
+	if err := os.Remove(filepath.Join(out, HybridGenerationFile)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runInitHybrid(t, hybridArgsMinting(out, cfg)...)
+	if err == nil {
+		t.Fatal("a plan render minted a fresh generation over a root with no record")
+	}
+	for _, want := range []string{HybridGenerationFile, "--generation", "scratch --out"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q: %v", want, err)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(out, HybridGenerationFile)); !os.IsNotExist(statErr) {
+		t.Errorf("the refused render recorded a generation (stat: %v)", statErr)
+	}
+
+	if _, err := runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--generation", minted)...); err != nil {
+		t.Fatalf("adopting the root's own generation was refused: %v", err)
+	}
+	if got := rootGeneration(t, out); got != minted {
+		t.Errorf("the adoption recorded %s, want the root's %s", got, minted)
+	}
+}
+
+// A SECOND RENDER INTO ONE --out WHILE THE FIRST HOLDS IT IS REFUSED, before
+// it writes a file: interleaved, the second would write its files over the
+// first's and then be refused by the record the first left.
+//
+// Mutation: dropping the lock lets the render through.
+func TestInitHybridRefusesARenderIntoADirectoryAnotherHolds(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+
+	unlock, err := lockHybridOut(out)
+	if err != nil {
+		t.Fatalf("hold the directory: %v", err)
+	}
+	defer unlock()
+
+	_, err = runInitHybrid(t, hybridArgs(out, cfg)...)
+	if err == nil || !strings.Contains(err.Error(), "another billet init hybrid") {
+		t.Fatalf("a render into a held directory was not refused for it: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, initconfig.HybridTerraformFile)); !os.IsNotExist(statErr) {
+		t.Errorf("the refused render wrote a root (stat: %v)", statErr)
+	}
+}
+
+// THE RECORD IS PUBLISHED WHOLE: staged under a name of its own and linked in,
+// so no partial record is ever at the name and nothing staged is left behind.
+func TestRecordHybridGenerationPublishesWholeAndLeavesNothing(t *testing.T) {
+	out := t.TempDir()
+
+	if err := recordHybridGeneration(out, testGeneration); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	entries, err := os.ReadDir(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != HybridGenerationFile {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("the directory holds %v, want only %s", names, HybridGenerationFile)
+	}
+	if got, err := os.ReadFile(filepath.Join(out, HybridGenerationFile)); err != nil || string(got) != testGeneration+"\n" {
+		t.Errorf("the record reads %q (%v)", got, err)
+	}
+}
+
 // A GENERATION FILE THAT DOES NOT HOLD A FINGERPRINT IS AN ERROR, never none,
 // and a record already there is never replaced by another.
 func TestInitHybridRefusesAnUnreadableOrOtherRecord(t *testing.T) {
