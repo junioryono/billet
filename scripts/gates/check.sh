@@ -12,12 +12,8 @@
 # CHECK_LOCK names another lock file; empty means the shared one. It is a
 # courtesy, not a gate: without a lock tool, or a lock that cannot be taken, the
 # run goes ahead and says so.
-#
-# CHECK_STEPS names the command run under the lock (default check-steps.sh
-# beside this file), which is how a test proves the lock is taken without
-# running a gate.
 set -euo pipefail
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 
-exec "$here/../with-check-lock.sh" "${CHECK_LOCK-}" "${CHECK_STEPS:-$here/check-steps.sh}" "$@"
+exec "$here/../with-check-lock.sh" "${CHECK_LOCK-}" "$here/check-steps.sh" "$@"

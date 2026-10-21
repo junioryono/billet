@@ -14,14 +14,10 @@
 # side by side. The lock is the one every repository's gate shares, so a verify
 # here also takes turns with the other repository's gates and verifies. It runs
 # under NICE (env.sh) outside CI.
-#
-# VERIFY_CHANGED names the command run under the lock (default
-# scripts/verify-changed.sh), which is how a test proves the lock is taken
-# without running a verify.
 set -euo pipefail
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 . "$here/env.sh"
 
 exec "$gates_root/scripts/with-check-lock.sh" "${CHECK_LOCK-}" \
-	${nice_cmd[@]+"${nice_cmd[@]}"} "${VERIFY_CHANGED:-$gates_root/scripts/verify-changed.sh}" "$@"
+	${nice_cmd[@]+"${nice_cmd[@]}"} "$gates_root/scripts/verify-changed.sh" "$@"

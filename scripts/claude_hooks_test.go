@@ -125,7 +125,6 @@ func claudeHookRepo(t *testing.T, refs fixtureRefs) string {
 	return dir
 }
 
-// runClaudeGuard runs one hook and answers its exit status and stderr.
 // shPlusS is what the hook answers `sh +s <a gate>` with here: nothing where sh
 // is bash (macOS, whose /bin/sh runs what /private/var/select/sh names), which
 // reads standard input, and gate where it is dash (Linux), which runs the script.
@@ -155,6 +154,7 @@ func shPlusS(t *testing.T, gate string) string {
 	return gate
 }
 
+// runClaudeGuard runs one hook and answers its exit status and stderr.
 func runClaudeGuard(t *testing.T, mode, root string, payload map[string]any, extraEnv ...string) (int, string) {
 	t.Helper()
 
@@ -720,6 +720,12 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{path(helpers, gates), "source test.sh", ""},
 		{path(gates, helpers), "source test.sh", gate},
 		{path(helpers), "cd scripts/gates && source test.sh", ""},
+		// A shell named without a slash is the first sh PATH holds, a relative
+		// entry read from the command's directory.
+		{path(filepath.Join(root, "shells", "b")), "sh +s scripts/gates/check.sh", ""},
+		{path(filepath.Join(root, "shells", "d")), "sh +s scripts/gates/check.sh", gate},
+		{path(filepath.Join("shells", "b")), "sh +s scripts/gates/check.sh", ""},
+		{path(filepath.Join("shells", "b")), "cd scripts && sh +s gates/check.sh", shPlusS(t, gate)},
 	} {
 		code, stderr := runClaudeGuard(t, "bash", root, bashPayload(root, tc.command), tc.env)
 		expectHook(t, tc.env+" "+tc.command, code, stderr, tc.refuse)

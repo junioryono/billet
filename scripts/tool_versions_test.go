@@ -125,12 +125,7 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 	// that names no pinned version needs none.
 	var workflow struct {
 		Jobs map[string]struct {
-			Steps []struct {
-				If   string         `yaml:"if"`
-				Run  string         `yaml:"run"`
-				With map[string]any `yaml:"with"`
-				Env  map[string]any `yaml:"env"`
-			} `yaml:"steps"`
+			Steps []pinStep `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
 	if err := yaml.Unmarshal(body, &workflow); err != nil {
@@ -148,18 +143,8 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 				loaded = i
 			}
 
-			text := step.Run
-			for _, value := range step.With {
-				text += " " + fmt.Sprint(value)
-			}
-
-			for _, value := range step.Env {
-				text += " " + fmt.Sprint(value)
-			}
-
 			for key := range v {
-				// $KEY, ${KEY} and ${{ env.KEY }} alike, the name whole.
-				if !regexp.MustCompile(`(\$\{?|env\.)` + key + `\b`).MatchString(text) {
+				if !namesPin(step, key) {
 					continue
 				}
 
@@ -178,5 +163,52 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 	if jobsUsing < 4 {
 		t.Errorf("%d jobs load the pin file, want the lint, release-config, package-lifecycle and terraform-lint jobs",
 			jobsUsing)
+	}
+}
+
+// pinStep is a workflow step as the pin test reads it.
+type pinStep struct {
+	If   string         `yaml:"if"`
+	Run  string         `yaml:"run"`
+	With map[string]any `yaml:"with"`
+	Env  map[string]any `yaml:"env"`
+}
+
+// namesPin reports whether the step hands a command the pin key, through its
+// run, its with or its env, as $KEY, ${KEY} or ${{ env.KEY }}, the name whole.
+func namesPin(step pinStep, key string) bool {
+	text := step.Run
+	for _, value := range step.With {
+		text += " " + fmt.Sprint(value)
+	}
+
+	for _, value := range step.Env {
+		text += " " + fmt.Sprint(value)
+	}
+
+	return regexp.MustCompile(`(\$\{?|env\.)` + key + `\b`).MatchString(text)
+}
+
+// A PIN IS SEEN WHEREVER A STEP NAMES IT: in its run, its with or its env, in
+// each spelling, and a longer name that only begins with it is not it.
+func TestNamesPinSeesEverySpellingInEveryField(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		step pinStep
+		want bool
+	}{
+		{"run, bare", pinStep{Run: `go install "x@$SQLC_VERSION"`}, true},
+		{"run, braced", pinStep{Run: `go install "x@${SQLC_VERSION}"`}, true},
+		{"run, expression", pinStep{Run: "echo ${{ env.SQLC_VERSION }}"}, true},
+		{"with", pinStep{With: map[string]any{"version": "${{ env.SQLC_VERSION }}"}}, true},
+		{"env", pinStep{Env: map[string]any{"V": "${{ env.SQLC_VERSION }}"}}, true},
+		{"a longer name", pinStep{Run: "echo $SQLC_VERSION_OLD"}, false},
+		{"none", pinStep{Run: "echo hi", Env: map[string]any{"V": "1"}}, false},
+	} {
+		if got := namesPin(tc.step, "SQLC_VERSION"); got != tc.want {
+			t.Errorf("%s: namesPin = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

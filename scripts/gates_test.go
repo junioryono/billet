@@ -91,8 +91,8 @@ func gateEnv(t *testing.T, bin string, extra ...string) []string {
 		}
 
 		switch name {
-		case "NICE", "TEST_PARALLEL", "GO", "GOEXPERIMENT", "GOOS", "GOARCH", "CI", "CHECK_LOCK", "CHECK_STEPS",
-			"VERIFY_CHANGED", "COVERPROFILE", "BILLET_NICED", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH",
+		case "NICE", "TEST_PARALLEL", "GOEXPERIMENT", "GOOS", "GOARCH", "CI", "CHECK_LOCK", "COVERPROFILE",
+			"BILLET_NICED", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH",
 			"GLOBIGNORE", "PWD", "OLDPWD":
 			continue
 		case "PATH":
@@ -255,8 +255,9 @@ func TestTheGatesHoldTheLockWhileTheyRun(t *testing.T) {
 	}
 }
 
-// THE VERIFY RUNS UNDER `nice -n 10` LOCALLY BY DEFAULT, and under nothing when
-// CI runs it or NICE is set empty. Its default verify-changed.sh is a stand-in
+// THE VERIFY TAKES THE SHARED LOCK AND RUNS UNDER `nice -n 10` LOCALLY BY
+// DEFAULT, and under no nice when CI runs it or NICE is set empty. The lock is
+// taken under an XDG_CACHE_HOME holding spaces; verify-changed.sh is a stand-in
 // that says whether it was niced, and `nice` is a stand-in first on PATH.
 func TestTheVerifyRunsUnderNiceLocallyAndNotUnderCI(t *testing.T) {
 	t.Parallel()
@@ -275,13 +276,19 @@ func TestTheVerifyRunsUnderNiceLocallyAndNotUnderCI(t *testing.T) {
 			"bin/nice":                  niceStandIn,
 		})
 
-		out, err := gateCommand(t, root, "scripts/gates/verify.sh", tc.env...).CombinedOutput()
+		xdg := filepath.Join(t.TempDir(), "a cache")
+
+		out, err := gateCommand(t, root, "scripts/gates/verify.sh", append(tc.env, "XDG_CACHE_HOME="+xdg)...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s: gates/verify.sh: %v (%s)", name, err, out)
 		}
 
 		if !strings.Contains(string(out), tc.want+"\n") {
 			t.Errorf("%s: the verify ran as %q, want %q", name, out, tc.want)
+		}
+
+		if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
+			t.Errorf("%s: gates/verify.sh did not take the shared lock: %v (%s)", name, err, out)
 		}
 	}
 }
@@ -488,24 +495,36 @@ func TestTheFullGateRunsItsStepsInOrderAndStopsAtAFailure(t *testing.T) {
 
 // THE LINTER RUNS FOR LINUX AS WELL AS THE HOST, because a linter sees only the
 // files it would compile; CI's lint job runs the action rather than lint.sh, so
-// this is what holds the second pass. A checkout path holding glob syntax is
-// refused before either runs.
+// this is what holds the second pass. Both run under `nice -n 10` locally and
+// under none in CI. A checkout path holding glob syntax is refused before either
+// runs.
 func TestTheLintGateLintsForTheHostAndLinux(t *testing.T) {
 	t.Parallel()
 
-	lint := map[string]string{"bin/golangci-lint": "#!/bin/sh\nprintf 'GOOS=%s GOARCH=%s' \"${GOOS-}\" \"${GOARCH-}\"\n" +
-		recordArgv + "\n"}
+	lint := map[string]string{
+		"bin/golangci-lint": "#!/bin/sh\nprintf 'niced=%s GOOS=%s GOARCH=%s' \"${BILLET_NICED-}\" \"${GOOS-}\" \"${GOARCH-}\"\n" +
+			recordArgv + "\n",
+		"bin/nice": niceStandIn,
+	}
 	pass := argv("run", "--timeout=15m", "--allow-serial-runners")
 
-	root := gateFixture(t, []string{"lint.sh"}, true, lint)
+	for _, tc := range []struct{ env, niced string }{{"CI=true", ""}, {"CI=", "yes"}} {
+		root := gateFixture(t, []string{"lint.sh"}, true, lint)
 
-	out, err := gateCommand(t, root, "scripts/gates/lint.sh", "CI=true").CombinedOutput()
-	if err != nil {
-		t.Fatalf("gates/lint.sh: %v (%s)", err, out)
-	}
+		env := []string{}
+		if tc.env != "CI=" {
+			env = append(env, tc.env)
+		}
 
-	if want := "GOOS= GOARCH=" + pass + "\nGOOS=linux GOARCH=amd64" + pass + "\n"; string(out) != want {
-		t.Errorf("gates/lint.sh ran\n%s\nwant\n%s", out, want)
+		out, err := gateCommand(t, root, "scripts/gates/lint.sh", env...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: gates/lint.sh: %v (%s)", tc.env, err, out)
+		}
+
+		want := "niced=" + tc.niced + " GOOS= GOARCH=" + pass + "\nniced=" + tc.niced + " GOOS=linux GOARCH=amd64" + pass + "\n"
+		if string(out) != want {
+			t.Errorf("%s: gates/lint.sh ran\n%s\nwant\n%s", tc.env, out, want)
+		}
 	}
 
 	globbed := filepath.Join(t.TempDir(), "billet[2]")
@@ -514,7 +533,7 @@ func TestTheLintGateLintsForTheHostAndLinux(t *testing.T) {
 	out, err = gateCommand(t, globbed, "scripts/gates/lint.sh", "CI=true").CombinedOutput()
 
 	exit, ok := errors.AsType[*exec.ExitError](err)
-	if !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "glob syntax") || strings.Contains(string(out), "GOOS=") {
+	if !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "glob syntax") || strings.Contains(string(out), "niced=") {
 		t.Errorf("gates/lint.sh under %s = %v, %q; want exit 1 naming the glob, and no lint run", globbed, err, out)
 	}
 }

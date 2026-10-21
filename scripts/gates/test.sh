@@ -16,20 +16,18 @@
 # to every test ledger's open, against go test's default of 600s, and cmd/billet
 # crossed 20m on a loaded fleet runner on 2026-09-26.
 #
-# GO names the go command (a test points it at a stand-in), and COVERPROFILE the
-# profile (coverage.out).
+# COVERPROFILE names the profile (coverage.out).
 set -euo pipefail
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 . "$here/env.sh"
 
-go_cmd=${GO:-go}
 profile=${COVERPROFILE:-coverage.out}
 
-${nice_cmd[@]+"${nice_cmd[@]}"} "$go_cmd" test ${test_p[@]+"${test_p[@]}"} -race -count=1 -timeout 35m \
+${nice_cmd[@]+"${nice_cmd[@]}"} go test ${test_p[@]+"${test_p[@]}"} -race -count=1 -timeout 35m \
 	-covermode=atomic -coverprofile="$profile" ./...
 
 if [ "${1-}" = --report ]; then
-	"$go_cmd" tool cover -func="$profile" | tail -1
-	"$go_cmd" tool cover -html="$profile"
+	go tool cover -func="$profile" | tail -1
+	go tool cover -html="$profile"
 fi
