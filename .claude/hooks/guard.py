@@ -513,7 +513,7 @@ class Shell:
             cwd = os.path.join(self.cwd, os.path.expanduser(chdir)) if chdir else self.cwd
             program = os.path.basename(words[0])
             if program in SHELLS:
-                mode, value = shell_invocation(words)
+                mode, value = shell_invocation(words, cwd)
                 if mode == "command":
                     Shell(cwd, self.calls, self.commands).gather(value)
                 else:
@@ -747,26 +747,33 @@ def full_gate_script(path, cwd):
 SHELL_VALUE_OPTIONS = {"--rcfile", "--init-file", "--emulate"}
 
 
-def is_bash(shell):
-    """Whether the shell is bash: named so, or an sh that resolves to it. macOS's
-    /bin/sh is a separate binary that runs whatever /private/var/select/sh names
-    (bash, 2026-10-21); an sh that resolves to neither is read as dash, the sh of
-    Linux, as is one that cannot be resolved."""
+def is_bash(shell, cwd):
+    """Whether the shell, run from cwd, is bash: named so, or an sh that resolves
+    to it. macOS's /bin/sh is a separate binary that runs whatever
+    /private/var/select/sh names (bash, 2026-10-21); an sh that resolves to
+    neither is read as dash, the sh of Linux, as is one that cannot be resolved."""
     name = os.path.basename(shell)
     if name == "bash":
         return True
     if name != "sh":
         return False
-    found = shell if "/" in shell else shutil.which(shell)
-    if not found:
+    try:
+        if "/" in shell:
+            found = os.path.join(cwd, os.path.expanduser(shell))
+        else:
+            dirs = os.environ.get("PATH", "").split(os.pathsep)
+            found = shutil.which(shell, path=os.pathsep.join(os.path.join(cwd, d or ".") for d in dirs))
+        if not found:
+            return False
+        target = os.path.realpath(found)
+        if sys.platform == "darwin" and target == "/bin/sh":
+            target = os.path.realpath("/private/var/select/sh")
+        return os.path.basename(target) == "bash"
+    except (OSError, ValueError):
         return False
-    target = os.path.realpath(found)
-    if sys.platform == "darwin" and target == "/bin/sh":
-        target = os.path.realpath("/private/var/select/sh")
-    return os.path.basename(target) == "bash"
 
 
-def shell_invocation(words):
+def shell_invocation(words, cwd):
     """How a shell is invoked, read the way the shell reads its options: in order,
     a value consumed where an option takes one, `-` or `--` ending them, and
     nothing after the first operand counted as the shell's. ("command", text)
@@ -776,7 +783,7 @@ def shell_invocation(words):
     through a redirection is not seen: the redirection is gone before this
     reads the words."""
     command = noexec = stdin = False
-    bash = is_bash(words[0])
+    bash = is_bash(words[0], cwd)
     i = 1
     while i < len(words):
         w = words[i]
@@ -847,7 +854,7 @@ def judge_gate_script(words, cwd):
                     break
     elif os.path.basename(path) in SHELLS:
         # A shell runs a script named without a slash from its own directory.
-        mode, path = shell_invocation(words)
+        mode, path = shell_invocation(words, cwd)
         if mode != "script":
             return
     elif "/" not in path:
