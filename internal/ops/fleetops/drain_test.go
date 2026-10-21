@@ -512,7 +512,8 @@ func TestADrainDoesNotTrustACountTakenBeforeALeaseClosed(t *testing.T) {
 
 	if strings.Contains(out, "Drained") ||
 		!strings.Contains(out, cfg.Tiers[0].Label+": unknown (last counted at") ||
-		!strings.Contains(out, "before 1 more of its leases closed") {
+		!strings.Contains(out, "before 1 more of its leases closed") ||
+		!strings.Contains(out, "Waiting up to") {
 		t.Errorf("a drain trusted a count taken before a lease of its tier closed:\n%s", out)
 	}
 }
@@ -552,8 +553,103 @@ func TestADrainDoesNotTrustACountWithoutItsReleases(t *testing.T) {
 	out := drainWait(t, cfgPath)
 
 	if strings.Contains(out, "Drained") ||
-		!strings.Contains(out, older+": unknown (its listener does not say which of its leases had closed") {
+		!strings.Contains(out, older+": unknown (its listener does not say which of its leases had closed") ||
+		!strings.Contains(out, "Waiting up to") {
 		t.Errorf("a drain trusted a count that does not say which closes it saw:\n%s", out)
+	}
+}
+
+// THE WAIT FOR FRESH COUNTS RUNS FROM THE QUIET, NOT ONLY FROM THE SEAL: the
+// last lease closes long after the seal, which stales its tier's count, and the
+// listeners need a poll from then to count again. With a one-second window and
+// the close a drain poll after the seal, a wait measured from the seal alone has
+// already run out when the ledger goes quiet, and reports the tier unknown
+// without waiting.
+func TestADrainWaitsForCountsFromWhenTheLedgerWentQuiet(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	lease := outstandingLease(t, db, cfg)
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	a, err := alloc.New(db, alloc.Limits{
+		MaxVCPU: cfg.Server.MaxVCPU, MaxMemory: cfg.Server.MaxMemory, Nodes: cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		t.Fatalf("allocator: %v", err)
+	}
+
+	saved := demandCountWithin
+	demandCountWithin = time.Second
+
+	t.Cleanup(func() { demandCountWithin = saved })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	released := make(chan struct{})
+
+	go func() {
+		defer close(released)
+
+		waitUntilSealed(t, db, 30*time.Second)
+		time.Sleep(drainPollInterval)
+
+		if err := a.Release(context.WithoutCancel(ctx), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+			t.Errorf("Release: %v", err)
+		}
+	}()
+
+	out := capture(t, func() {
+		if err := Drain(ctx, processEnv(), []string{
+			"--config", cfgPath, "--wait", "--without-compute-proof",
+		}); err != nil {
+			t.Errorf("drain --wait: %v", err)
+		}
+	})
+
+	<-released
+
+	if strings.Contains(out, "Drained") || !strings.Contains(out, "Waiting up to") ||
+		!strings.Contains(out, cfg.Tiers[0].Label+": unknown (last counted at") ||
+		!strings.Contains(out, "before 1 more of its leases closed") {
+		t.Errorf("a drain whose last lease closed after the seal did not wait for fresh counts:\n%s", out)
+	}
+}
+
+// AND A GENERATION THAT CANNOT BE READ TRUSTS NO COUNT: read as none, every
+// count published at generation zero would match it.
+func TestADrainTrustsNoCountWhenItCannotReadTheReleases(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `DROP TABLE tier_releases`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("drop tier_releases: %v", err)
+	}
+
+	saved := demandCountWithin
+	demandCountWithin = time.Second
+
+	t.Cleanup(func() { demandCountWithin = saved })
+
+	out := drainWait(t, cfgPath)
+
+	if strings.Contains(out, "Drained") ||
+		!strings.Contains(out, cfg.Tiers[0].Label+": unknown (could not read how many of its leases have closed") {
+		t.Errorf("a drain trusted counts it could not hold against the release generation:\n%s", out)
 	}
 }
 

@@ -271,6 +271,12 @@ func TestEveryCloseAdvancesItsTiersReleases(t *testing.T) {
 		t.Fatalf("nothing closed, but tier one is at generation %d", got)
 	}
 
+	// OTHER CLOSES FIRST, so it has a row that a bump of every row would move.
+	theirs := reserve(t, a, "other")
+	if err := a.Release(t.Context(), theirs.ID, theirs.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release(other): %v", err)
+	}
+
 	done := reserve(t, a, "one")
 	if err := a.Release(t.Context(), done.ID, done.Epoch, PhaseDone); err != nil {
 		t.Fatalf("Release: %v", err)
@@ -285,7 +291,7 @@ func TestEveryCloseAdvancesItsTiersReleases(t *testing.T) {
 		t.Errorf("after two closes tier one is at generation %d, want 2", got)
 	}
 
-	if got := generation("other"); got != 0 {
-		t.Errorf("closes of tier one moved tier other to generation %d", got)
+	if got := generation("other"); got != 1 {
+		t.Errorf("tier other closed one lease and is at generation %d after tier one's closes, want 1", got)
 	}
 }

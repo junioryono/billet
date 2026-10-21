@@ -652,7 +652,9 @@ func (p *protocolProbe) measureU7() {
 	window := durationOr("BILLET_LIVE_WINDOW", 2*time.Hour)
 	tallies := make([]sessionTally, n)
 
-	var wg sync.WaitGroup
+	// EVERY SET FIRST, so a failure here stops the test before any session's
+	// goroutine has started and could outlive it.
+	sets := make([]*scaleset.ScaleSet, n)
 
 	for i := range n {
 		name := fmt.Sprintf("%s-%02d", p.set.Name, i)
@@ -663,7 +665,13 @@ func (p *protocolProbe) measureU7() {
 			p.t.Fatalf("ensure scale set %s: %v", name, err)
 		}
 
-		wg.Go(func() { p.holdSession(set, window, &tallies[i]) })
+		sets[i] = set
+	}
+
+	var wg sync.WaitGroup
+
+	for i := range n {
+		wg.Go(func() { p.holdSession(sets[i], window, &tallies[i]) })
 	}
 
 	budgets := map[string]any{}

@@ -31,6 +31,27 @@ func admissionOf(t *testing.T, a *Allocator, label string) TierAdmission {
 	return view[label]
 }
 
+// A TIER THE ALLOCATOR DOES NOT KNOW IS THE VIEW'S MISSING ENTRY: the zero
+// value, which says it cannot grow, never an admission invented for it.
+func TestAnUnknownTiersAdmissionIsTheZeroValue(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB},
+		[]config.Tier{tier("known", 1, config.GiB)})
+
+	got, err := a.AdmissionFor(t.Context(), "absent")
+	if err != nil {
+		t.Fatalf("AdmissionFor(absent): %v", err)
+	}
+
+	view, err := a.AdmissionView(t.Context())
+	if err != nil {
+		t.Fatalf("AdmissionView: %v", err)
+	}
+
+	if !reflect.DeepEqual(got, TierAdmission{}) || !reflect.DeepEqual(got, view["absent"]) {
+		t.Errorf("an unknown tier's admission is %+v (the view says %+v), want the zero value", got, view["absent"])
+	}
+}
+
 // noHeadroom proves the tier could not buy this instant, so what an assertion
 // about CanGrow below reads is the model and not the allocator's own answer.
 func noHeadroom(t *testing.T, a *Allocator, label string) {

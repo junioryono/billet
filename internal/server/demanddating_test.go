@@ -87,6 +87,7 @@ func TestADeliveryUndatesTheCountBeforeItIsHandled(t *testing.T) {
 		polls             atomic.Int32
 		before, atDestroy alloc.ListenerCapacity
 		destroyed         bool
+		atDestroyErr      error
 		acknowledged      []int64
 		launched          []int64
 	)
@@ -125,7 +126,10 @@ func TestADeliveryUndatesTheCountBeforeItIsHandled(t *testing.T) {
 
 			return nil
 		}, onDestroyCompleted: func(int64, string) error {
-			atDestroy, destroyed = published(), true
+			// READ, NOT ASSERTED, HERE: a destroy the cleanup loop retries runs
+			// off the test's goroutine.
+			report, err := a.CapacityReport(context.WithoutCancel(ctx), label)
+			atDestroy, atDestroyErr, destroyed = report.Listener, err, true
 
 			return nil
 		}}), WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
@@ -143,8 +147,28 @@ func TestADeliveryUndatesTheCountBeforeItIsHandled(t *testing.T) {
 			"running, or the delivery has nothing to undo", before.Unstarted, before.UnstartedAt)
 	}
 
-	if !destroyed {
-		t.Fatal("the completion never destroyed its runner, so this case shows nothing")
+	// THE GENERATION GOES OUT WITH THE COUNT: none of the tier's leases had
+	// closed when the job was counted as covered, and the completion's close is
+	// counted by the time the listener published again.
+	if before.UnstartedReleases == nil || *before.UnstartedReleases != 0 {
+		t.Errorf("before any close the count was published at release generation %v, want 0",
+			before.UnstartedReleases)
+	}
+
+	releases, err := a.TierReleases(t.Context())
+	if err != nil {
+		t.Fatalf("TierReleases: %v", err)
+	}
+
+	if after := published(); releases[label] != 1 || after.UnstartedReleases == nil ||
+		*after.UnstartedReleases != releases[label] {
+		t.Errorf("after the completion closed a lease the tier is at release generation %d and its "+
+			"count was published at %v, want both 1", releases[label], after.UnstartedReleases)
+	}
+
+	if !destroyed || atDestroyErr != nil {
+		t.Fatalf("the completion never destroyed its runner, or its report could not be read (%v), "+
+			"so this case shows nothing", atDestroyErr)
 	}
 
 	if datedNone(atDestroy) {
