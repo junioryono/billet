@@ -35,7 +35,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Every node stop the role performs is proved by the node's ending, and every node start is admitted.**
 - **The role's variables that must be supplied, never guessed.**
 - **The host role migrates a node's endpoint through billet's own commands, and infers nothing from the configurations.**
-- **The scenario tests are make targets, each one converging the role in a specific state.**
+- **The scenario tests are scripts/gates/scenario.sh NAME, each one converging the role in a specific state.**
 - **The collection's `galaxy.yml` carries the release version.**
 - **Every JSON a role consumes has fixtures written by the Go test that produces it.**
 
