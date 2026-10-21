@@ -104,7 +104,7 @@ func newCompleterFixture(t *testing.T) completerFixture {
 		t.Fatal(err)
 	}
 	for name, version := range map[string]string{
-		"google-chrome":  "155.0.8059.84",
+		"google-chrome": "155.0.8059.84",
 		// WITH THE TRAILING SPACE Edge's own --version prints.
 		"microsoft-edge": "Microsoft Edge 141.0.3537.71 ",
 		"firefox":        "Mozilla Firefox 144.0",
