@@ -152,7 +152,8 @@ func TestCIInstallsEveryPinnedToolFromThePinFile(t *testing.T) {
 			}
 
 			for key := range v {
-				if !strings.Contains(text, "$"+key) && !strings.Contains(text, "env."+key) {
+				// $KEY, ${KEY} and ${{ env.KEY }} alike, the name whole.
+				if !regexp.MustCompile(`(\$\{?|env\.)` + key + `\b`).MatchString(text) {
 					continue
 				}
 
