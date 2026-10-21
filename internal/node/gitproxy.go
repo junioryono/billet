@@ -1360,12 +1360,12 @@ func (g *gitProxy) holdBroken(path string, markErr error) error {
 	return errors.Join(err, dir.Sync(), dir.Close())
 }
 
-// exitedOnSignal reports whether a process ended on a signal, as one killed
-// because its request ended does, rather than exiting of its own accord.
-func exitedOnSignal(exit *exec.ExitError) bool {
+// killedBySIGKILL reports whether a process ended on SIGKILL, the signal
+// killGroup sends when its request ends.
+func killedBySIGKILL(exit *exec.ExitError) bool {
 	status, ok := exit.Sys().(syscall.WaitStatus)
 
-	return ok && status.Signaled()
+	return ok && status.Signaled() && status.Signal() == syscall.SIGKILL
 }
 
 // release ends a quarantine once its mirror is gone.
@@ -2066,10 +2066,10 @@ func (s *CacheService) serveUploadPack(
 		cancel()
 	}
 	waitErr := cmd.Wait()
-	// AN upload-pack THAT EXITED FAILING OF ITS OWN ACCORD says the mirror is
-	// broken, whatever the client did after; one killed because the client left
-	// or the request ended says nothing of it.
-	if exit, ok := errors.AsType[*exec.ExitError](waitErr); ok && !exitedOnSignal(exit) {
+	// AN upload-pack THAT FAILED OF ITS OWN ACCORD says the mirror is broken,
+	// whatever the client did after, a crash on a signal included; only the
+	// SIGKILL this request's end sends says nothing of it.
+	if exit, ok := errors.AsType[*exec.ExitError](waitErr); ok && (ctx.Err() == nil || !killedBySIGKILL(exit)) {
 		if err := markBroken(path); err != nil {
 			waitErr = errors.Join(waitErr, s.git.holdBroken(path, err))
 		}

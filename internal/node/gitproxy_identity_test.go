@@ -133,6 +133,22 @@ func TestARepositoryGitHubCannotNameIsGitHubsToAnswer(t *testing.T) {
 func TestAMirrorThatFailsMidAnswerIsReplaced(t *testing.T) {
 	t.Parallel()
 
+	// A FAILING EXIT AND A CRASH ON A SIGNAL ALIKE: only the kill a request's
+	// own end sends says nothing of the mirror.
+	for _, behaviour := range []string{"nakfail", "nakcrash"} {
+		t.Run(behaviour, func(t *testing.T) {
+			t.Parallel()
+
+			failMidAnswer(t, behaviour)
+		})
+	}
+}
+
+// failMidAnswer has the mirror's upload-pack fail as behaviour says after its
+// first line, and proves the mirror is marked and then replaced.
+func failMidAnswer(t *testing.T, behaviour string) {
+	t.Helper()
+
 	upstream := newGitUpstream(t)
 	service, node, token := gitNode(t, upstream)
 	var log gitLog
@@ -142,7 +158,7 @@ func TestAMirrorThatFailsMidAnswerIsReplaced(t *testing.T) {
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("clone: %v\n%s", err, output)
 	}
-	if err := os.WriteFile(mode, []byte("nakfail"), 0o600); err != nil {
+	if err := os.WriteFile(mode, []byte(behaviour), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	upstream.commitTo(t, "main", map[string]string{"f": "1\n"})

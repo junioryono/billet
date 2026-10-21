@@ -47,7 +47,7 @@ func (u *gitUpstream) guestFetches() int64 { return u.fetches.Load() - u.mirrorF
 // gitWrapper puts a git in front of the node's that answers every fetch served
 // from the mirror as mode's file says: "refuse" with an ERR line, "silent" with
 // nothing at all, "hang" with nothing for ten minutes, "nakfail" with a NAK and
-// then a failure, "slow" as git would once mode.release exists, after touching
+// then a failure, "nakcrash" with a NAK and then a crash on SIGSEGV, "slow" as git would once mode.release exists, after touching
 // mode.started, anything else as git would; "slowadvert" holds the mirror's
 // advertisement the same way.
 func gitWrapper(t *testing.T, service *CacheService) (mode string) {
@@ -72,6 +72,7 @@ func gitWrapper(t *testing.T, service *CacheService) (mode string) {
 		"  hang) sleep 600; exit 128 ;;\n" +
 		"  slow) : >" + mode + ".started; while [ ! -e " + mode + ".release ]; do sleep 0.05; done ;;\n" +
 		"  nakfail) printf '0008NAK\\n'; exit 128 ;;\n" +
+		"  nakcrash) printf '0008NAK\\n'; kill -SEGV $$ ;;\n" +
 		"  esac ;;\n" +
 		"esac\n" +
 		"exec git \"$@\"\n"
