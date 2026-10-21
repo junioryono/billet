@@ -52,9 +52,16 @@ cat >"$outputs" <<'EOF'
   "node_wire_address": {"sensitive": false, "type": "string", "value": "10.60.0.10:7717"},
   "backup_bucket": {"sensitive": false, "type": "string", "value": "hybrid-check-backups-1"},
   "backup_prefix": {"sensitive": false, "type": "string", "value": "billet-backups"},
-  "control_plane_instance_id": {"sensitive": false, "type": "string", "value": "i-0abc"}
+  "control_plane_instance_id": {"sensitive": false, "type": "string", "value": "i-0abc"},
+  "generation": {"sensitive": false, "type": "string", "value": "0123-4567-89ab-cdef"},
+  "account_id": {"sensitive": false, "type": "string", "value": "123456789012"}
 }
 EOF
+
+# THE GENERATION BOTH RENDERS CARRY, so the fixture's outputs are this root's:
+# a render refuses outputs naming another generation, and the commission render
+# below writes into a fresh directory with no root to read one from.
+generation=0123-4567-89ab-cdef
 
 # THIS FIXTURE IS A HAND-WRITTEN COPY OF WHAT AN APPLY PRODUCES, and the fifth
 # such copy in the repository. A render that begins DEMANDING a new output
@@ -70,7 +77,7 @@ EOF
 # a render reads: that is what `terraform output -json` would hand over, and it
 # is what makes this check exact rather than one more list to keep in step.
 plan=$work/plan
-"$billet" init hybrid --out "$plan" \
+"$billet" init hybrid --out "$plan" --generation "$generation" \
     --name hybrid-check --region us-west-2 --org acme \
     --control-plane-private-ip 10.60.0.10 \
     --local-vcpu 32 --local-memory 128GiB \
@@ -93,7 +100,7 @@ fi
 
 # THE COMMISSION RENDER, because it is the most complete one: both hosts carry
 # a node, the controller carries the server, the App and the backup block.
-"$billet" init hybrid --out "$out" \
+"$billet" init hybrid --out "$out" --generation "$generation" \
     --name hybrid-check --region us-west-2 --org acme \
     --control-plane-private-ip 10.60.0.10 \
     --local-vcpu 32 --local-memory 128GiB \

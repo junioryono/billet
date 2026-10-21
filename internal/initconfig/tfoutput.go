@@ -3,8 +3,13 @@ package initconfig
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// awsAccountPattern is the one shape an account id has; anything else is an
+// output an apply did not write, and comparing it would compare garbage.
+var awsAccountPattern = regexp.MustCompile(`^\d{12}$`)
 
 // HybridNeeds says which optional facts a generation depends on, so
 // ParseTerraformOutput demands exactly what this deployment's shape consumes
@@ -60,6 +65,30 @@ func ParseTerraformOutput(raw []byte, need HybridNeeds) (HybridFacts, error) {
 		f   HybridFacts
 		err error
 	)
+
+	// THE TWO A ROOT FROM BEFORE THE FINGERPRINT DOES NOT DECLARE, refused with
+	// the way to a root that does: re-rendering the plan writes both outputs,
+	// and an apply then changes nothing but its outputs.
+	for name, dst := range map[string]*string{
+		HybridOutputGeneration: &f.Generation,
+		HybridOutputAccountID:  &f.AccountID,
+	} {
+		if _, ok := doc[name]; !ok {
+			return HybridFacts{}, fmt.Errorf("--terraform-output: no output named %q, so this root "+
+				"was rendered before billet bound its outputs to the generation that wrote them. "+
+				"Run the plan render again into the same --out (it keeps everything else and adds "+
+				"the output), then `terraform apply`, which changes only the outputs, and "+
+				"`terraform output -json` again", name)
+		}
+		if *dst, err = read(name); err != nil {
+			return HybridFacts{}, err
+		}
+	}
+
+	if !awsAccountPattern.MatchString(f.AccountID) {
+		return HybridFacts{}, fmt.Errorf("--terraform-output: output %q is %q, which is not a "+
+			"twelve-digit AWS account id", HybridOutputAccountID, f.AccountID)
+	}
 
 	for name, dst := range map[string]*string{
 		HybridOutputControlPlanePrivateIP: &f.ControlPlanePrivateIP,
