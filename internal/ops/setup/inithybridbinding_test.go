@@ -1,14 +1,87 @@
 package setup
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/initconfig"
 )
+
+// THE ADAPTER BEHIND THE SEAM, against a stand-in for STS: it answers the
+// ACCOUNT (not the ARN or the user id), an answer without one is ErrNoAccount
+// rather than an empty match, and a service that never answers is cut off by
+// the wait rather than holding the operator's terminal.
+//
+// Mutations: returning id.ARN fails the first case; dropping the wait makes the
+// third case run to its client's ten-second timeout and fail its bound.
+func TestAccountOfAnswersTheAccountUnderItsWait(t *testing.T) {
+	creds := awscreds.Static{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "secret"}
+
+	t.Run("an account", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`<GetCallerIdentityResponse><GetCallerIdentityResult>` +
+				`<Arn>arn:aws:sts::123456789012:assumed-role/x/y</Arn><UserId>AROAEXAMPLE:y</UserId>` +
+				`<Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`))
+		}))
+		t.Cleanup(srv.Close)
+
+		got, err := accountOf(t.Context(), awssts.New("us-west-2", srv.URL, creds, srv.Client()))
+		if err != nil || got != "123456789012" {
+			t.Fatalf("accountOf = (%q, %v), want the account 123456789012", got, err)
+		}
+	})
+
+	t.Run("no account in the answer", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`<GetCallerIdentityResponse><GetCallerIdentityResult>` +
+				`</GetCallerIdentityResult></GetCallerIdentityResponse>`))
+		}))
+		t.Cleanup(srv.Close)
+
+		_, err := accountOf(t.Context(), awssts.New("us-west-2", srv.URL, creds, srv.Client()))
+		if !errors.Is(err, awssts.ErrNoAccount) {
+			t.Fatalf("an answer without an account gave %v, want ErrNoAccount", err)
+		}
+	})
+
+	t.Run("a service that never answers", func(t *testing.T) {
+		release := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(func() { close(release); srv.Close() })
+
+		prev := hybridAccountWait
+		hybridAccountWait = 100 * time.Millisecond
+		t.Cleanup(func() { hybridAccountWait = prev })
+
+		// The client's own bound is longer than the guard below, so without the
+		// wait this fails in ten seconds rather than hanging the binary.
+		start := time.Now()
+		_, err := accountOf(t.Context(), awssts.New("us-west-2", srv.URL, creds, &http.Client{Timeout: 10 * time.Second}))
+		if err == nil {
+			t.Fatal("a service that never answered produced an account")
+		}
+		// A FAILURE GUARD, not the condition: the wait is 100ms, and anything
+		// near the http client's own bound means the wait was not applied.
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("accountOf waited %s for a service that never answered; the wait is %s",
+				elapsed, hybridAccountWait)
+		}
+	})
+}
 
 // hybridArgsMinting is hybridArgs without --generation, so the plan render
 // resolves one itself: from the root in --out, or a fresh one.
@@ -29,6 +102,28 @@ func rootGeneration(t *testing.T, out string) string {
 	}
 
 	return g
+}
+
+// assertEveryRenderCarries holds each `billet init hybrid` command in text to
+// carrying --generation g, and requires at least min of them, so a text that
+// stopped printing the commands cannot pass by having none.
+func assertEveryRenderCarries(t *testing.T, where, text, g string, minimum int) {
+	t.Helper()
+
+	var commands []string
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.Contains(line, "billet init hybrid --out") {
+			commands = append(commands, line)
+		}
+	}
+	if len(commands) < minimum {
+		t.Fatalf("%s prints %d render commands, want at least %d:\n%s", where, len(commands), minimum, text)
+	}
+	for _, c := range commands {
+		if !strings.Contains(c, "--generation "+g) {
+			t.Errorf("a render command in %s does not carry --generation %s:\n  %s", where, g, c)
+		}
+	}
 }
 
 // writeOutputs writes the outputs fixture with its generation replaced.
@@ -74,18 +169,19 @@ func TestInitHybridKeepsItsGenerationAcrossReRuns(t *testing.T) {
 		t.Errorf("a re-run of the plan render moved the generation from %s to %s", minted, got)
 	}
 
-	if _, err := runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--force")...); err != nil {
+	printed, err := runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--force")...)
+	if err != nil {
 		t.Fatalf("forced plan render: %v", err)
 	}
 	if got := rootGeneration(t, out); got != minted {
 		t.Errorf("--force moved the generation from %s to %s", minted, got)
 	}
 
-	// The runbook repeats it, because the prepare render on another machine
-	// has only the command it prints.
-	if runbook := readHybrid(t, out, HybridRunbookFile); !strings.Contains(runbook, "--generation "+minted) {
-		t.Errorf("the runbook's re-render commands do not carry --generation %s", minted)
-	}
+	// EVERY RENDER COMMAND REPEATS IT, the runbook's and the one on stdout,
+	// because the prepare render on another machine has only the command it
+	// was given; one command that lost its flags would mint another generation.
+	assertEveryRenderCarries(t, "the runbook", readHybrid(t, out, HybridRunbookFile), minted, 3)
+	assertEveryRenderCarries(t, "stdout", printed, minted, 1)
 
 	// And a prepare render with no flag at all reads it from the root and
 	// accepts the outputs of that root.

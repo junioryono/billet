@@ -16,16 +16,23 @@ import (
 
 // hybridAccountWait bounds the one STS call a later render makes. A render is
 // an operator at a terminal, and a credential chain that hangs is an answer of
-// its own: the account was not verified.
-const hybridAccountWait = 30 * time.Second
+// its own: the account was not verified. A variable so a test can shorten it.
+var hybridAccountWait = 30 * time.Second
 
 // hybridAccount answers which account the credentials this render runs under
-// belong to. A seam, so the suite never reaches AWS.
+// belong to. A seam, so the suite never reaches AWS; what it calls is
+// accountOf, which the suite tests against a stand-in for STS.
 var hybridAccount = func(ctx context.Context, region string) (string, error) {
+	return accountOf(ctx, awssts.New(region, "", awscreds.Default(), nil))
+}
+
+// accountOf is the account a caller identity answer names, under the wait.
+// Never the ARN or the user id: the account is the only field compared.
+func accountOf(ctx context.Context, sts *awssts.Client) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, hybridAccountWait)
 	defer cancel()
 
-	id, err := awssts.New(region, "", awscreds.Default(), nil).Whoami(ctx)
+	id, err := sts.Whoami(ctx)
 	if err != nil {
 		return "", err
 	}

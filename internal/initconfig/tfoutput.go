@@ -67,8 +67,10 @@ func ParseTerraformOutput(raw []byte, need HybridNeeds) (HybridFacts, error) {
 	)
 
 	// THE TWO A ROOT FROM BEFORE THE FINGERPRINT DOES NOT DECLARE, refused with
-	// the way to a root that does: re-rendering the plan writes both outputs,
-	// and an apply then changes nothing but its outputs.
+	// the way to a root that does. The way is a merge, never "re-render and
+	// apply": a root the operator owns gets the fresh render beside it at
+	// main.tf.new, where an apply never reads it, and a newer billet's render
+	// also moves the module's release pin, which is not only an output.
 	for name, dst := range map[string]*string{
 		HybridOutputGeneration: &f.Generation,
 		HybridOutputAccountID:  &f.AccountID,
@@ -76,9 +78,11 @@ func ParseTerraformOutput(raw []byte, need HybridNeeds) (HybridFacts, error) {
 		if _, ok := doc[name]; !ok {
 			return HybridFacts{}, fmt.Errorf("--terraform-output: no output named %q, so this root "+
 				"was rendered before billet bound its outputs to the generation that wrote them. "+
-				"Run the plan render again into the same --out (it keeps everything else and adds "+
-				"the output), then `terraform apply`, which changes only the outputs, and "+
-				"`terraform output -json` again", name)
+				"Run the plan render again into a scratch --out with the same flags, copy its "+
+				"%q and %q output blocks into your terraform/main.tf and nothing else, run "+
+				"`terraform plan` and check it adds only those two outputs, apply it, save "+
+				"`terraform output -json` again, and pass --generation with the value you copied",
+				name, HybridOutputGeneration, HybridOutputAccountID)
 		}
 		if *dst, err = read(name); err != nil {
 			return HybridFacts{}, err

@@ -80,6 +80,16 @@ func TestHybridGenerationOfReadsTheRenderedRoot(t *testing.T) {
 	if _, found, err := HybridGenerationOf(malformed); found || err == nil {
 		t.Errorf("a malformed fingerprint read as (found %v, %v), want an error", found, err)
 	}
+
+	// AND A VALUE THAT IS NOT A QUOTED STRING AT ALL, which the extraction
+	// cannot even see: it is a declaration, so it refuses like a malformed one.
+	for _, value := range []string{"null", "42", `"0123-4567`, "var.generation"} {
+		odd := strings.Replace(files[HybridTerraformFile], `"`+testGeneration+`"`, value, 1)
+		if _, found, err := HybridGenerationOf(odd); found || err == nil {
+			t.Errorf("a generation output whose value is %s read as (found %v, %v), want an error",
+				value, found, err)
+		}
+	}
 }
 
 // THE ROOT DECLARES THE FINGERPRINT IT WAS RENDERED WITH AND THE ACCOUNT FROM
@@ -147,7 +157,7 @@ func TestParseTerraformOutputDemandsTheBinding(t *testing.T) {
 
 			continue
 		}
-		for _, want := range []string{name, "plan render", "terraform apply"} {
+		for _, want := range []string{name, "scratch --out", "terraform plan", "only those two outputs", "--generation"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the refusal of a missing %q does not say %q: %v", name, want, err)
 			}

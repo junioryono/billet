@@ -25,6 +25,11 @@ var hybridGenerationPattern = regexp.MustCompile(`^[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 var hybridGenerationOutput = regexp.MustCompile(
 	`(?m)^output "` + HybridOutputGeneration + `" \{[^}]*?\n\s*value\s*=\s*"([^"]*)"`)
 
+// hybridGenerationDeclared finds the generation output's block whatever its
+// value is, so a block whose value the extraction cannot read is told apart
+// from a root that declares none.
+var hybridGenerationDeclared = regexp.MustCompile(`(?m)^\s*output\s+"` + HybridOutputGeneration + `"\s*\{`)
+
 // NewHybridGeneration mints a fingerprint.
 func NewHybridGeneration() (string, error) {
 	var b [8]byte
@@ -55,6 +60,17 @@ func CheckHybridGeneration(g string) error {
 func HybridGenerationOf(mainTF string) (string, bool, error) {
 	m := hybridGenerationOutput.FindStringSubmatch(mainTF)
 	if m == nil {
+		// A DECLARED BLOCK WHOSE VALUE CANNOT BE READ (null, a number, an
+		// expression, an unterminated string) IS NOT AN ABSENT ONE. Reading it as
+		// absent let a re-run of the plan render mint another fingerprint over
+		// it, and let --generation pass a root that declares something else.
+		if hybridGenerationDeclared.MatchString(mainTF) {
+			return "", false, fmt.Errorf("the root declares a %q output whose value is not the "+
+				"quoted fingerprint billet renders, so which generation it belongs to cannot be "+
+				"read; restore the value as `value = \"xxxx-xxxx-xxxx-xxxx\"`, or move the root "+
+				"aside and render the plan again", HybridOutputGeneration)
+		}
+
 		return "", false, nil
 	}
 

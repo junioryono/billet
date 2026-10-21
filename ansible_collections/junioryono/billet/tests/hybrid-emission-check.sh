@@ -100,7 +100,16 @@ fi
 
 # THE COMMISSION RENDER, because it is the most complete one: both hosts carry
 # a node, the controller carries the server, the App and the backup block.
-"$billet" init hybrid --out "$out" --generation "$generation" \
+#
+# NO AWS, DETERMINISTICALLY. The render compares the fixture's account with the
+# account its own credentials are in, and the machine running this may hold
+# credentials for a real one, which would refuse the fixture's. A session token
+# with neither key half is one billet's credential chain refuses locally,
+# before instance metadata or STS, so the account is reported unverified on
+# every machine, and that report is asserted below.
+env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_PROFILE \
+    AWS_SESSION_TOKEN=hybrid-emission-check-reaches-no-aws \
+    "$billet" init hybrid --out "$out" --generation "$generation" \
     --name hybrid-check --region us-west-2 --org acme \
     --control-plane-private-ip 10.60.0.10 \
     --local-vcpu 32 --local-memory 128GiB \
@@ -110,6 +119,12 @@ fi
     --terraform-output "$outputs" --commission --ami ami-0123456789abcdef0 --cache \
     >"$work/gen.log" 2>&1 || {
     echo "hybrid-emission-check: the generation failed" >&2; cat "$work/gen.log" >&2; exit 1; }
+grep -q 'was NOT verified' "$work/gen.log" || {
+    echo "hybrid-emission-check: the render did not report the account unverified, so it" >&2
+    echo "  reached some AWS this gate meant to withhold" >&2
+    cat "$work/gen.log" >&2
+    exit 1
+}
 
 export ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections"
 export ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_FORCE_COLOR=0 ANSIBLE_NOCOLOR=1
