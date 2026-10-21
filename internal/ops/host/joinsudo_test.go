@@ -36,7 +36,7 @@ func TestJoinRunsSudoByItsAbsolutePath(t *testing.T) {
 
 		var b strings.Builder
 		for _, e := range append(append([]ast.Expr{}, as.Lhs...), as.Rhs...) {
-			b.WriteString(string(src[e.Pos()-file.FileStart : e.End()-file.FileStart]))
+			b.Write(src[e.Pos()-file.FileStart : e.End()-file.FileStart])
 			b.WriteString(";")
 		}
 		handsInput = handsInput || b.String() == "cmd.Stdin;cmd.Stdout;input;io.Discard;"
