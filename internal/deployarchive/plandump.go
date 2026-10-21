@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
+	"unicode"
 
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
@@ -125,13 +127,7 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 		// account and reports where it is, as the first run would have, and it
 		// must still be there: it is the only record of the ledger replaced.
 		if p.Intent == ReplaceLedger {
-			if err := requirePublishedCopy(p.Archive, p.Target.StateDir, prog.SupersededDigests,
-				prog.SupersedePublished); err != nil {
-				p.refuse(lifeops.Refusal{
-					What:   err.Error(),
-					Remedy: "put the copy back at that name, or abandon the recovery",
-				})
-
+			if p.refuseMissingCopy(prog) {
 				return nil
 			}
 
@@ -154,6 +150,17 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	// served nothing a recovery could put back.
 	if p.Intent == ReplaceLedger {
 		switch {
+		case slices.ContainsFunc(led.Tables, func(t string) bool { return strings.ContainsFunc(t, unicode.IsSpace) }):
+			// REFUSED BEFORE THE QUIESCE AND THE FENCE: the copy this recovery takes
+			// of the ledger it replaces could not be restored, so an abandon could
+			// never put it back.
+			p.refuse(lifeops.Refusal{
+				What: fmt.Sprintf("schema %s holds a table with whitespace in its name, so a dump of "+
+					"it could not be restored unambiguously", led.Schema),
+				Remedy: "move that table out of the ledger's schema and run this again",
+			})
+
+			return nil
 		case led.Binding != "" && led.Binding != deployment:
 			p.refuseForeignLedger(led.Binding)
 
@@ -254,6 +261,22 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// refuseMissingCopy refuses, and reports that it did, when a recovery's
+// published copy of the ledger it replaced is gone or changed.
+func (p *Plan) refuseMissingCopy(prog Progress) bool {
+	err := requirePublishedCopy(p.Archive, p.Target.StateDir, prog.SupersededDigests, prog.SupersedePublished)
+	if err == nil {
+		return false
+	}
+
+	p.refuse(lifeops.Refusal{
+		What:   err.Error(),
+		Remedy: "put the copy back at that name, or abandon the recovery",
+	})
+
+	return true
 }
 
 // refuseAnotherDatabase refuses, and reports that it did, when this run's

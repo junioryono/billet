@@ -99,6 +99,7 @@ func (f *fakeLedger) Dump(_ context.Context, dest string) (LedgerDump, error) {
 	return LedgerDump{
 		Facts:      DumpFacts{Schema: f.now.Schema, DumpVersion: takenDumpVersion, Binding: f.now.Binding},
 		Migrations: slices.Clone(f.now.Migrations),
+		Database:   f.now.Database,
 	}, nil
 }
 
@@ -1397,8 +1398,6 @@ func TestEveryStepAfterTheRestoreProvesItsDatabase(t *testing.T) {
 	}
 
 	ledger.now.Binding = f.d.id
-	ledger.now.Database = "elsewhere"
-
 	ledger.now.Database = dumpDatabase
 
 	// THE PUBLISHED COPY GONE: the only record of the ledger replaced, so the
@@ -1562,4 +1561,129 @@ func TestARecoveryResumedAfterItsAbandonSaysToFinishTheAbandon(t *testing.T) {
 	}
 
 	assertFenced(t, tgt.StateDir)
+}
+
+// AN ABANDON THAT HAS BEGUN IS THE ONLY WAY ON. Interrupted after its put-back
+// committed and before it kept its copy, it leaves a ledger a forward run would
+// re-prove as plausible (same database, binding and leading migrations) and
+// finish the recovery over; the journal's mark refuses that run, and Finish,
+// and a second abandon completes.
+func TestAForwardRunAfterAnAbandonBeganIsRefused(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	copyPath := supersededDumpPath(f.archive, tgt.StateDir)
+	kept := keptCopyPath(copyPath, digest(ledger.dumpBody))
+
+	// THE ABANDON STOPS AFTER ITS PUT-BACK: something it cannot read where it
+	// keeps the copy.
+	if err := os.Mkdir(kept, 0o700); err != nil {
+		t.Fatalf("block the kept name: %v", err)
+	}
+
+	if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); err == nil {
+		t.Fatal("the abandon finished although it could not keep its copy")
+	}
+
+	if !slices.Equal(ledger.restored, []string{digest(ledger.dumpBody)}) {
+		t.Fatalf("the abandon restored %v, want its copy, before it stopped", ledger.restored)
+	}
+
+	prog, err := InProgress(tgt.StateDir)
+	if err != nil || !prog.Abandoning {
+		t.Fatalf("the journal does not record the abandon that began (%+v, %v)", prog, err)
+	}
+
+	p, err := PlanRecover(t.Context(), f.archive, tgt)
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "has already begun undoing it")) == 0 {
+		t.Errorf("a forward recovery after an abandon began was planned: %+v", p.Refusals)
+	}
+
+	ledger.admission = state.Admission{Mode: state.AdmissionSealed, Provenance: state.ProvenanceOperator}
+
+	if err := Finish(t.Context(), p); err == nil || !strings.Contains(err.Error(), "has already begun undoing it") {
+		t.Errorf("Finish after an abandon began = %v, want a refusal", err)
+	}
+
+	assertFenced(t, tgt.StateDir)
+
+	if err := os.Remove(kept); err != nil {
+		t.Fatalf("unblock the kept name: %v", err)
+	}
+
+	if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); err != nil {
+		t.Fatalf("the second abandon: %v", err)
+	}
+
+	assertOpen(t, tgt.StateDir)
+}
+
+// A RECOVERY OVER A LEDGER SCHEMA HOLDING A TABLE WITH WHITESPACE IN ITS NAME IS
+// REFUSED AT THE PLAN, before any quiesce or fence: the copy it would take could
+// not be restored, so an abandon could never put it back.
+func TestARecoveryOverATableItsCopyCouldNotNameIsRefusedAtThePlan(t *testing.T) {
+	f := newDumpFixture(t, bound)
+
+	spaced := f.liveLedger()
+	spaced.Tables = append(slices.Clone(spaced.Tables), "operator notes")
+
+	p, err := PlanRecover(t.Context(), f.archive, recoverTarget(t, f, f.ledgerFor(spaced)))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "whitespace in its name")) == 0 {
+		t.Errorf("a recovery over a table with a space in its name was not refused: %+v", p.Refusals)
+	}
+}
+
+// THE COPY A RECOVERY KEEPS IS HELD TO THE LEDGER IT REPLACES, read in the
+// dump's own snapshot, before its digest is journaled: a copy of another
+// database, schema or deployment would become the ledger an abandon puts back.
+func TestARecoveryKeepsNoCopyOfAnotherLedger(t *testing.T) {
+	for name, edit := range map[string]func(*state.PostgresLedger){
+		"another database":   func(l *state.PostgresLedger) { l.Database = "elsewhere" },
+		"another schema":     func(l *state.PostgresLedger) { l.Schema = "public" },
+		"another deployment": func(l *state.PostgresLedger) { l.Binding = "ffffffffffffffffffffffffffffffff" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newDumpFixture(t, bound)
+			ledger := &dumpOfAnother{fakeLedger: f.ledgerFor(f.liveLedger()), edit: edit}
+			tgt := recoverTarget(t, f, ledger)
+
+			if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); err == nil ||
+				!strings.Contains(err.Error(), "will not keep it as the record of that ledger") {
+				t.Fatalf("Execute = %v, want a refusal", err)
+			}
+
+			if prog, err := InProgress(tgt.StateDir); err != nil || prog.SupersedePublished ||
+				len(prog.SupersededDigests) != 0 {
+				t.Errorf("the copy was journaled or published (%+v, %v)", prog, err)
+			}
+
+			if slices.Contains(ledger.callsSnapshot(), "restore") {
+				t.Error("the archive was restored over a ledger whose copy was refused")
+			}
+		})
+	}
+}
+
+// dumpOfAnother is a database whose pg_dump reaches another ledger than its
+// peek: the copy's snapshot says what it is of.
+type dumpOfAnother struct {
+	*fakeLedger
+	edit func(*state.PostgresLedger)
+}
+
+func (d *dumpOfAnother) Dump(ctx context.Context, dest string) (LedgerDump, error) {
+	out, err := d.fakeLedger.Dump(ctx, dest)
+
+	other := state.PostgresLedger{Database: out.Database, Schema: out.Facts.Schema, Binding: out.Facts.Binding}
+	d.edit(&other)
+	out.Database, out.Facts.Schema, out.Facts.Binding = other.Database, other.Schema, other.Binding
+
+	return out, err
 }

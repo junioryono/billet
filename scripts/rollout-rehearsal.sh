@@ -25,7 +25,13 @@
 # the node's updater inside the node service's sandbox, which refuses its first
 # write (host-rehearsals.md); the record names the pairs it has run with.
 #
-#   BILLET_REHEARSAL_FROM=v0.21.0 BILLET_REHEARSAL_TO=v0.22.0 \
+# AND THE PAIR MUST CROSS A LEDGER MIGRATION, or there is no rollback to see:
+# FROM opens a ledger TO left at FROM's own schema, its probe passes, and the
+# downgrade commits (measured 2026-10-21 with v0.21.0 and v0.22.0, which share
+# migration 63). v0.19.0 and v0.20.0 are the newest pair that cross one (62 to
+# 63).
+#
+#   BILLET_REHEARSAL_FROM=v0.19.0 BILLET_REHEARSAL_TO=v0.20.0 \
 #   BILLET_REHEARSAL_APP_CONFIG=... BILLET_REHEARSAL_APP_KEY=... \
 #   scripts/rollout-rehearsal.sh
 set -euo pipefail

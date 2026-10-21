@@ -819,3 +819,37 @@ func TestATableOwnerWithASpaceIsReadAsTheOwner(t *testing.T) {
 		t.Errorf("the restore kept %+v, want [admission]", calls)
 	}
 }
+
+// A LEDGER SCHEMA HOLDING A TABLE pg_restore's LIST COULD NOT NAME IS THE CLIENT'S
+// REFUSAL AT BACKUP, ErrClientUnusable, so the backup still captures the identity
+// half rather than nothing.
+func TestCheckDumpRefusesALedgerItsDumpCouldNotName(t *testing.T) {
+	const schema = "billet_spaced"
+
+	dsn := requireDatabase(t, "spaced", schema)
+
+	if _, err := state.OpenPostgres(t.Context(), t.TempDir(), state.DSN(dsn)); err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE "`+schema+`"."operator notes" (x int)`); err != nil {
+		t.Fatalf("create the table: %v", err)
+	}
+
+	dir := t.TempDir()
+	fakeProgram(t, dir, "pg_dump", 99)
+
+	c, _ := clientWithFakes(t, dsn, dir)
+
+	if err := c.CheckDump(t.Context()); !errors.Is(err, ErrClientUnusable) ||
+		!strings.Contains(err.Error(), "operator notes") {
+		t.Fatalf("CheckDump over a table with a space in its name = %v, want ErrClientUnusable naming it", err)
+	}
+}

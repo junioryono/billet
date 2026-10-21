@@ -161,6 +161,11 @@ type journal struct {
 	// copy's own snapshot, so a put-back is read back against the copy rather
 	// than against a binding the archive's ledger carries too.
 	SupersededMigrations []state.AppliedMigration `json:"superseded_migrations,omitempty"`
+	// Abandoning says an abandon of this operation has begun undoing it, saved
+	// before its first removal or write. From then on only the abandon may go
+	// on: a forward run would re-prove a ledger the abandon may already have put
+	// back, find it plausible, and finish the operation over it.
+	Abandoning bool `json:"abandoning,omitempty"`
 	// LedgerDatabase is the database a PostgreSQL run writes the ledger into,
 	// recorded before its first write there, so a resume, a seal, a finish or an
 	// abandon refuses a connection since pointed at another one rather than
@@ -683,6 +688,10 @@ func finishLocked(ctx context.Context, plan Plan) error {
 	// this function is what takes that fence down. An exported entry point that
 	// merely documented "seal first" would open exactly the window the fence
 	// exists to close, and no test of the caller can show that it did not.
+	if found && j.Abandoning {
+		return errAbandoning(plan.Intent)
+	}
+
 	if plan.Intent == ReplaceLedger {
 		// THE SEAL IS READ FROM THE DATABASE THE LEDGER WAS RESTORED INTO, proved
 		// first: a seal read from wherever the connection points by now is no
@@ -1643,6 +1652,16 @@ func abandonLocked(ctx context.Context, a *Archive, t Target,
 
 	var res AbandonResult
 
+	// THE ABANDON IS RECORDED BEFORE IT ACTS, so a crash part-way leaves a
+	// journal that only an abandon will go on with.
+	if !j.Abandoning {
+		j.Abandoning = true
+
+		if err := j.save(t.StateDir); err != nil {
+			return res, err
+		}
+	}
+
 	// WHAT A RECOVER MOVED ASIDE IS NOT SOMETHING THIS RUN CREATED, whatever the
 	// journal says. The journal records it so a crash can be reasoned about, and
 	// the file at that name is the operator's OWN ledger — the only record of the
@@ -2190,6 +2209,7 @@ func InProgress(stateDir string) (Progress, error) {
 
 		SupersededDigests:  j.SupersededDigests,
 		SupersedePublished: j.SupersedePublished,
+		Abandoning:         j.Abandoning,
 	}, nil
 }
 
@@ -2225,6 +2245,8 @@ type Progress struct {
 	// copy it keeps of the ledger it replaces.
 	SupersededDigests  map[string]string
 	SupersedePublished bool
+	// Abandoning says an abandon of it has begun, and only the abandon may go on.
+	Abandoning bool
 }
 
 // Finished reports whether the operation completed and only its record remains.

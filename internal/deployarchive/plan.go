@@ -308,6 +308,7 @@ func planFor(ctx context.Context, a *Archive, t Target, intent Intent) (Plan, er
 
 	p := Plan{Archive: a, Target: t, Intent: intent}
 
+	p.refuseAfterAbandon()
 	p.checkBinaryUnderstandsArchive()
 	p.checkConfigNamesThisApp()
 	p.checkConfigNamesEveryTarget()
@@ -1322,3 +1323,23 @@ func LedgerPath(stateDir string) string { return filepath.Join(stateDir, "billet
 func supersededSuffix(a *Archive) string { return ".superseded-" + a.Name() }
 
 func (p *Plan) refuse(r lifeops.Refusal) { p.Refusals = append(p.Refusals, r) }
+
+// refuseAfterAbandon refuses to plan an operation an abandon has begun undoing:
+// only the abandon may go on from there.
+func (p *Plan) refuseAfterAbandon() {
+	prog, err := InProgress(p.Target.StateDir)
+	if err != nil || !prog.IsFor(p.Archive) || !prog.IsFrom(p.Intent) || !prog.Abandoning {
+		return
+	}
+
+	p.refuse(lifeops.Refusal{
+		What:   errAbandoning(p.Intent).Error(),
+		Remedy: "run the same command with --abandon to finish undoing it",
+	})
+}
+
+// errAbandoning is the refusal of a forward run over an abandon that has begun.
+func errAbandoning(intent Intent) error {
+	return fmt.Errorf("deployarchive: an abandon of this %s has already begun undoing it, and "+
+		"only the abandon may go on: run it again to finish", intent)
+}

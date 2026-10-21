@@ -35,5 +35,11 @@ func archiveTargetLedger(cfg *config.Config) (deployarchive.PostgresLedger, erro
 		return nil, err
 	}
 
+	// ONE SERVER, refused here, before the command seals, fences or copies
+	// anything: a restore writes through several connections.
+	if err := client.SingleEndpoint(); err != nil {
+		return nil, err
+	}
+
 	return pgdump.Archive{Client: client}, nil
 }

@@ -36,5 +36,6 @@ func (d Dumped) LedgerDump() deployarchive.LedgerDump {
 			Binding:       d.Binding,
 		},
 		Migrations: d.Migrations,
+		Database:   d.Database,
 	}
 }

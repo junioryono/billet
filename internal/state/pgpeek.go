@@ -218,7 +218,9 @@ type LedgerSnapshot struct {
 	// fails on any database but this one ("cannot import a snapshot from a
 	// different database", measured 2026-10-20), which is what proves the dump
 	// is of this ledger rather than of whatever the client program reached.
-	ID            string
+	ID string
+	// Database is current_database() in the snapshot, the one the dump is of.
+	Database      string
 	Schema        string
 	ServerVersion int
 	Migrations    []AppliedMigration
@@ -253,10 +255,11 @@ func ExportPostgresSnapshot(ctx context.Context, dsn DSN, fenceDir string,
 	return peekPostgres(ctx, dsn, func(be *postgresBackend, tx *sql.Tx) error {
 		var snap LedgerSnapshot
 
-		//billet:ignore rawsql // exports a snapshot and asks which schema and major answer, not a query over billet's tables
+		//billet:ignore rawsql // exports a snapshot and asks which database, schema and major answer, not a query over billet's tables
 		if err := tx.QueryRowContext(ctx,
-			`SELECT pg_export_snapshot(), coalesce(current_schema(), ''), current_setting('server_version_num')::int`,
-		).Scan(&snap.ID, &snap.Schema, &snap.ServerVersion); err != nil {
+			`SELECT pg_export_snapshot(), current_database(), coalesce(current_schema(), ''), `+
+				`current_setting('server_version_num')::int`,
+		).Scan(&snap.ID, &snap.Database, &snap.Schema, &snap.ServerVersion); err != nil {
 			return fmt.Errorf("state: export a snapshot of the ledger: %w", err)
 		}
 
@@ -495,6 +498,20 @@ func DropTablesOutside(ctx context.Context, dsn DSN, into RestoreInto, keep []st
 		return nil, err
 	}
 
+	// EVERY TABLE IN THE SCHEMA, the kept ones included: pg_restore --clean
+	// drops those itself, so a hierarchy among them reaches outside the schema
+	// just the same.
+	inHierarchy, err := hierarchyTables(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(inHierarchy) > 0 {
+		return nil, fmt.Errorf("state: %s.%s is partitioned, a partition or an inheriting table, "+
+			"which billet's ledger never holds, and replacing it would take rows outside it "+
+			"wherever they are; billet drops nothing", schema, inHierarchy[0])
+	}
+
 	var dropped []string
 
 	for _, table := range tables {
@@ -504,20 +521,9 @@ func DropTablesOutside(ctx context.Context, dsn DSN, into RestoreInto, keep []st
 	}
 
 	if len(dropped) > 0 {
-		inHierarchy, err := hierarchyTables(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-
 		quoted := make([]string, 0, len(dropped))
 
 		for _, table := range dropped {
-			if slices.Contains(inHierarchy, table) {
-				return nil, fmt.Errorf("state: %s.%s is partitioned, a partition or an inheriting "+
-					"table, which billet's ledger never holds, and dropping it would take rows "+
-					"outside it wherever they are; billet drops nothing", schema, table)
-			}
-
 			quoted = append(quoted, quoteIdent(schema)+"."+quoteIdent(table))
 		}
 

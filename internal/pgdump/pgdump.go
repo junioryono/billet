@@ -38,6 +38,8 @@ import (
 
 // Dumped is what a dump carries, read in the snapshot the dump was taken in.
 type Dumped struct {
+	// Database is the database the dump is of, read in its own snapshot.
+	Database string
 	// Schema is the PostgreSQL schema the ledger lives in, and the only one the
 	// dump holds. A restore must land in a schema of the same name.
 	Schema string
@@ -143,8 +145,8 @@ func (c *Client) Dump(ctx context.Context, fenceDir, dest string) (Dumped, error
 		}
 
 		out = Dumped{
-			Schema: snap.Schema, ServerVersion: snap.ServerVersion, DumpVersion: major,
-			Migrations: snap.Migrations, Binding: snap.Binding,
+			Database: snap.Database, Schema: snap.Schema, ServerVersion: snap.ServerVersion,
+			DumpVersion: major, Migrations: snap.Migrations, Binding: snap.Binding,
 		}
 
 		return nil
@@ -167,6 +169,17 @@ func (c *Client) CheckDump(ctx context.Context) error {
 	led, err := c.Peek(ctx)
 	if err != nil {
 		return err
+	}
+
+	// A TABLE pg_restore's LIST COULD NOT NAME makes every dump of this ledger
+	// unrestorable, which is this copy's failure to do the job and not the
+	// database's: the backup still captures the identity half.
+	for _, table := range led.Tables {
+		if strings.ContainsFunc(table, unicode.IsSpace) {
+			return clientRefusal(fmt.Sprintf("pgdump: schema %s holds a table named %q, and a dump "+
+				"of a ledger schema holding a name with whitespace in it could not be restored "+
+				"unambiguously; move that table out of the ledger's schema", led.Schema, table))
+		}
 	}
 
 	if server := led.ServerVersion / 10000; major < server {
@@ -223,7 +236,7 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, into
 	// lets each reach a different one, so the server the target was proved on
 	// need not be the one written. The drop re-proves the target on its own
 	// connection; pg_restore cannot, so it is handed one endpoint or nothing.
-	if err := c.singleEndpoint(); err != nil {
+	if err := c.SingleEndpoint(); err != nil {
 		return err
 	}
 
@@ -367,8 +380,9 @@ func withoutSchemaEntries(toc []byte) []byte {
 	return []byte(strings.Join(lines, "\n"))
 }
 
-// singleEndpoint refuses a connection naming more than one host or port.
-func (c *Client) singleEndpoint() error {
+// SingleEndpoint refuses a connection naming more than one host or port, which a
+// restore cannot write through: a caller asks it before anything is fenced.
+func (c *Client) SingleEndpoint() error {
 	for _, v := range c.env.Environ(nil) {
 		name, value, _ := strings.Cut(v, "=")
 		if (name == "PGHOST" || name == "PGPORT") && strings.Contains(value, ",") {

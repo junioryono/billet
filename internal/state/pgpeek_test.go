@@ -445,6 +445,13 @@ func TestDropTablesOutsideTakesNothingOutsideThem(t *testing.T) {
 		t.Fatalf("DropTablesOutside over an inheriting table = %v, want a refusal", err)
 	}
 
+	// AND KEPT BY NAME, still refused: pg_restore --clean drops a kept table
+	// itself, which takes its rows out of the parent elsewhere just the same.
+	if _, err := DropTablesOutside(t.Context(), dsn, into, append(slices.Clone(keep), "a_later_migration")); err == nil ||
+		!strings.Contains(err.Error(), "partitioned, a partition or an inheriting") {
+		t.Fatalf("DropTablesOutside keeping an inheriting table = %v, want a refusal", err)
+	}
+
 	// A TABLE WITH WHITESPACE IN ITS NAME, which a dump's list could not name.
 	run(`DROP TABLE "` + schema + `".a_later_migration`)
 	run(`CREATE TABLE "` + schema + `"."a later migration" (x int)`)

@@ -171,6 +171,9 @@ type LedgerDump struct {
 	// connection string, recorded as LedgerFacts.DSNEnv: the NAME, never the
 	// value.
 	DSNEnv string
+	// Database is the database the dump is of, read in its own snapshot; not
+	// recorded in a manifest, and what a recovery holds its copy to.
+	Database string
 }
 
 // ExternalLedger describes a ledger the archive deliberately does not contain.

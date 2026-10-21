@@ -339,6 +339,19 @@ func supersedeDump(ctx context.Context, res *Result, req RestoreRequest, j *jour
 		return fmt.Errorf("deployarchive: take a copy of the ledger this recovery replaces: %w", err)
 	}
 
+	// THE COPY IS OF THE LEDGER BEING REPLACED, read in the dump's own snapshot,
+	// before its digest is journaled as the operator's: the database the run
+	// journaled, the archive's schema, bound to this deployment. A copy of
+	// anything else would become the ledger an abandon puts back.
+	deployment := req.Plan.Archive.Manifest.DeploymentID
+	if taken.Database != j.LedgerDatabase || taken.Facts.Schema != req.Plan.Archive.Manifest.Ledger.Dump.Schema ||
+		taken.Facts.Binding != deployment {
+		return fmt.Errorf("deployarchive: the copy pg_dump took is of %s.%s bound to %q, and this "+
+			"recovery replaces the ledger in %s.%s bound to %s; billet will not keep it as the "+
+			"record of that ledger", taken.Database, taken.Facts.Schema, taken.Facts.Binding,
+			j.LedgerDatabase, req.Plan.Archive.Manifest.Ledger.Dump.Schema, deployment)
+	}
+
 	if err := os.Chmod(staged, entryMode); err != nil {
 		return fmt.Errorf("deployarchive: tighten %s: %w", staged, err)
 	}
