@@ -444,7 +444,7 @@ func TestTheFullGateRunsItsStepsInOrderAndStopsAtAFailure(t *testing.T) {
 	t.Parallel()
 
 	stand := func(name string) string {
-		return "#!/bin/sh\necho " + name + " \"$@\" >> \"$STEPS\"\n[ \"${FAIL-}\" != " + name + " ]\n"
+		return "#!/bin/sh\n{ printf %s " + name + "; " + recordArgv + "; } >> \"$STEPS\"\n[ \"${FAIL-}\" != " + name + " ]\n"
 	}
 	executables := map[string]string{
 		"scripts/check-no-mutants.py":     "import os\nopen(os.environ['STEPS'], 'a').write('no-mutants\\n')\n",
@@ -456,7 +456,7 @@ func TestTheFullGateRunsItsStepsInOrderAndStopsAtAFailure(t *testing.T) {
 		executables["scripts/gates/"+step+".sh"] = stand(step)
 	}
 
-	all := []string{"no-mutants", "build", "go vet ./...", "fmt-check", "lint", "lint-custom", "test", "lambda-test",
+	all := []string{"no-mutants", "build", "go" + argv("vet", "./..."), "fmt-check", "lint", "lint-custom", "test", "lambda-test",
 		"module-sources"}
 
 	for _, tc := range []struct {

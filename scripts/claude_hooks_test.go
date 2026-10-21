@@ -490,6 +490,10 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"bash -s +c scripts/gates/check.sh", gate},
 		{"bash +c 'scripts/gates/check.sh'", gate},
 		{"bash +s scripts/gates/check.sh", ""},
+		{"zsh +s scripts/gates/check.sh", gate},
+		{"zsh -s +s scripts/gates/check.sh", gate},
+		{"sh +s scripts/gates/check.sh", gate},
+		{"dash -s scripts/gates/check.sh", ""},
 		{"bash g/../gates/test.sh", gate},
 		{"bash -o pipefail -c 'git push --force origin junior-oct03-work'", "force"},
 		{"golangci-lint run > /tmp/lint.log", module},
@@ -639,6 +643,16 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		expectHook(t, tc.command, code, stderr, tc.refuse)
 	}
 
+	// A sourced name is the first readable file PATH holds, so a helper of the
+	// same name earlier on PATH is what runs.
+	helpers := t.TempDir()
+	hookWrite(t, helpers, "test.sh", "echo a helper\n")
+
+	gates := filepath.Join(root, "scripts", "gates")
+	path := func(dirs ...string) string {
+		return "PATH=" + strings.Join(append(dirs, os.Getenv("PATH")), string(os.PathListSeparator))
+	}
+
 	// Only the hook's own environment lifts the gate refusals, and only to 1; a CI
 	// environment skips every one of these judgements.
 	for _, tc := range []struct{ env, command, refuse string }{
@@ -655,8 +669,10 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"CI=true", "git worktree add ../billet-feature", ""},
 		{"CI=true", "git rebase main", "merging"},
 		// A sourced name without a slash is looked for in the hook's PATH.
-		{"PATH=" + filepath.Join(root, "scripts", "gates") + string(os.PathListSeparator) + os.Getenv("PATH"),
-			"source test.sh", gate},
+		{path(gates), "source test.sh", gate},
+		{path(helpers, gates), "source test.sh", ""},
+		{path(gates, helpers), "source test.sh", gate},
+		{path(helpers), "cd scripts/gates && source test.sh", ""},
 	} {
 		code, stderr := runClaudeGuard(t, "bash", root, bashPayload(root, tc.command), tc.env)
 		expectHook(t, tc.env+" "+tc.command, code, stderr, tc.refuse)
