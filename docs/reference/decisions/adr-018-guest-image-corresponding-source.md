@@ -31,7 +31,17 @@ Where a source version can still be found differs by where it came from. Measure
 | Temurin's JDKs | the source tarball Adoptium publishes beside each Temurin release |
 | The guest kernel | the Linux tarball `scripts/kernel/linux.pin` names, with the configuration the kernel was built from |
 
-Each file is checked against the digest its own `.dsc`, Adoptium's checksum file or the pin gives. A source that cannot be fetched and verified fails the build. Everything goes into one tar, split as the image is, because the sources are more files than a release's thousand assets. `image-sources.parts` names each part with its sha256, and `image-sources-index.tsv` names each file in it. The publisher refuses to tag a release without them, or with a part that is not the one its list describes. The scripts that built the image and the kernel are this repository at the commit the release names, which GitHub serves as the release's source archive.
+Each file is checked against the digest its own `.dsc`, Adoptium's checksum file or the pin gives. A source that cannot be fetched and verified fails the build. Everything goes into one tar, split as the image is, because the sources are more files than a release's thousand assets.
+
+- **`image-sources.parts`** names the whole tar with its sha256 and size, then each part, `.part000` upwards, with its own.
+- **`image-sources-index.tsv`** accounts for every source the manifest needs: each file fetched, with its source, version, sha256 and size, and each source reviewed as needing none.
+
+Before it tags, the publisher checks four things:
+
+- that the parts the list names, joined in order, are the whole tar it describes;
+- that the published index is the one inside the tar, byte for byte;
+- that the index accounts for exactly the source packages `image-sources.tsv` marks `gnu` or `unclassified`, with none of the `gnu` ones marked reviewed;
+- that the index names the guest kernel's source once. The scripts that built the image and the kernel are this repository at the commit the release names, which GitHub serves as the release's source archive.
 
 **A package with no readable copyright file is reviewed rather than assumed.** It is classified `unclassified`, never `other`. Six vendor packages ship no copyright file and are reviewed by hand in `scripts/runner-images/reviewed-licenses.tsv`, with the license their own repositories state and the date: docker-ce, gh, kubectl, powershell, session-manager-plugin, adoptium-ca-certificates. They are Apache-2.0 or MIT, and the fetcher leaves them out. Any other `unclassified` package has its source fetched. A package that drops out of the review has its source fetched too, or fails the build.
 

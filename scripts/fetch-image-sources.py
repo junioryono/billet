@@ -7,8 +7,11 @@ MANIFEST is the image's IMAGE_SOURCES.tsv. Every source package a row classified
 `gnu` or `unclassified` names is downloaded at its exact version and checked
 against the digests its own description gives, together with the Linux tarball
 the guest kernel was built from (KERNEL_VERSION, held to scripts/kernel/linux.pin)
-and the configuration it was built with (KERNEL_CONFIG). Each lands in a directory
-of its own under OUT, and OUT/index.tsv lists every file with its sha256 and size.
+and the configuration it was built with (KERNEL_CONFIG), as the source
+`guest-kernel`. Each lands in a directory of its own under OUT, which must be new or
+empty, and OUT/index.tsv accounts for every source the manifest needs: one row per
+file fetched (source, version, `fetched`, the file, its sha256 and size), and one
+per source reviewed as under no GNU license (`reviewed`, and `-` for the rest).
 
 WHERE EACH SOURCE IS KEPT, so a version stays downloadable after its archive
 moves on (measured 2026-10-21): Ubuntu's archive, through Launchpad, which keeps
@@ -182,11 +185,16 @@ def temurin(directory, major, version):
 
 
 def fetch(out, source, version):
-    """Fetch SOURCE at VERSION into a directory of its own under OUT."""
+    """Fetch SOURCE at VERSION into a directory of its own under OUT, and return the
+    directory.
+
+    THE WHOLE VERSION NAMES THE DIRECTORY, epoch included: two versions that differ
+    only in their epoch are two sources, and sharing a directory would let one
+    overwrite the other while both report success."""
     if not SAFE.match(source) or not re.match(r"^[0-9A-Za-z.+~:_-]+$", version):
         raise Failure(f"refusing the source {source!r} {version!r}")
-    directory = os.path.join(out, f"{source}_{version.split(':', 1)[-1]}")
-    os.makedirs(directory, exist_ok=True)
+    directory = os.path.join(out, f"{source}_{version}")
+    os.makedirs(directory)
     t = TEMURIN.match(source)
     if t:
         temurin(directory, t.group(1), version)
@@ -196,6 +204,7 @@ def fetch(out, source, version):
         debian_source(directory, launchpad(PPAS[source], source, version), source, version)
     else:
         debian_source(directory, launchpad("ubuntu/+archive/primary", source, version), source, version)
+    return directory
 
 
 def kernel(out, version, config):
@@ -204,19 +213,21 @@ def kernel(out, version, config):
         pinned, sha = f.read().split()
     if version != pinned:
         raise Failure(f"the image's kernel is {version} and scripts/kernel/linux.pin pins {pinned}")
-    directory = os.path.join(out, f"linux_{version}")
-    os.makedirs(directory, exist_ok=True)
+    directory = os.path.join(out, f"guest-kernel_{version}")
+    os.makedirs(directory)
     save(directory, f"linux-{version}.tar.xz", f"{KERNEL}/linux-{version}.tar.xz", sha)
     shutil.copyfile(config, os.path.join(directory, "config"))
+    return directory
 
 
 def needed(manifest, reviewed):
-    """The (source, version) pairs MANIFEST needs the source of."""
+    """The (source, version) pairs MANIFEST needs the source of, and those it would
+    but for the review."""
     with open(manifest, encoding="utf-8") as f:
         lines = f.read().splitlines()
     if not lines or lines[0] != "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense":
         raise Failure(f"{manifest} is not a source manifest")
-    pairs = set()
+    pairs, left = set(), set()
     for line in lines[1:]:
         cells = line.split("\t")
         if len(cells) != 7:
@@ -224,9 +235,11 @@ def needed(manifest, reviewed):
         license = cells[6]
         if license == "gnu" or (license == "unclassified" and cells[3] not in reviewed):
             pairs.add((cells[3], cells[4]))
-        elif license not in ("gnu", "other", "unclassified"):
+        elif license == "unclassified":
+            left.add((cells[3], cells[4]))
+        elif license != "other":
             raise Failure(f"{manifest}: unknown license class {license!r}")
-    return sorted(pairs)
+    return sorted(pairs), sorted(left - pairs)
 
 
 def read_reviewed():
@@ -249,43 +262,47 @@ def main(argv):
         return 2
     manifest, kernel_version, kernel_config, out = argv[1:]
     try:
-        pairs = needed(manifest, read_reviewed())
+        pairs, reviewed = needed(manifest, read_reviewed())
     except (Failure, OSError) as e:
         print(f"fetch-image-sources: {e}", file=sys.stderr)
         return 1
+    # A FRESH DIRECTORY: whatever an earlier run left in one, a partial download
+    # or a source an older manifest needed, would be indexed and published.
+    if os.path.exists(out) and os.listdir(out):
+        print(f"fetch-image-sources: {out} is not empty", file=sys.stderr)
+        return 1
     os.makedirs(out, exist_ok=True)
 
-    failures = []
+    failures, fetched = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        jobs = {pool.submit(fetch, out, s, v): f"{s} {v}" for s, v in pairs}
-        jobs[pool.submit(kernel, out, kernel_version, kernel_config)] = f"linux {kernel_version}"
+        jobs = {pool.submit(fetch, out, s, v): (s, v) for s, v in pairs}
+        jobs[pool.submit(kernel, out, kernel_version, kernel_config)] = ("guest-kernel", kernel_version)
         for job in concurrent.futures.as_completed(jobs):
+            source, version = jobs[job]
             try:
-                job.result()
+                fetched.append((source, version, job.result()))
             except (Failure, OSError, ValueError) as e:
-                failures.append(f"{jobs[job]}: {e}")
+                failures.append(f"{'linux' if source == 'guest-kernel' else source} {version}: {e}")
     if failures:
         for failure in sorted(failures):
             print(f"fetch-image-sources: {failure}", file=sys.stderr)
         print(f"fetch-image-sources: {len(failures)} of {len(jobs)} sources could not be fetched and verified", file=sys.stderr)
         return 1
 
-    total = 0
-    rows = []
-    for root, _, files in os.walk(out):
-        for name in files:
-            path = os.path.join(root, name)
-            rel = os.path.relpath(path, out)
-            if rel == "index.tsv":
-                continue
+    total, files = 0, 0
+    rows = [(s, v, "reviewed", "-", "-", "-") for s, v in reviewed]
+    for source, version, directory in fetched:
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(directory, name)
             size = os.path.getsize(path)
             total += size
-            rows.append((rel.split(os.sep, 1)[0], rel, file_sha256(path), size))
+            files += 1
+            rows.append((source, version, "fetched", os.path.relpath(path, out), file_sha256(path), size))
     with open(os.path.join(out, "index.tsv"), "w", encoding="utf-8") as f:
-        f.write("source\tfile\tsha256\tsize\n")
+        f.write("source\tversion\tstatus\tfile\tsha256\tsize\n")
         for row in sorted(rows):
             f.write("\t".join(str(c) for c in row) + "\n")
-    print(f"fetch-image-sources: {len(jobs)} sources, {len(rows)} files, {total} bytes")
+    print(f"fetch-image-sources: {len(jobs)} sources, {files} files, {total} bytes; {len(reviewed)} reviewed as needing none")
     return 0
 
 

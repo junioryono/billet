@@ -410,16 +410,17 @@ jobs:
           tar -C sources -cf out/image-sources.tar .
           rm -rf sources
 
+          # THE WHOLE ARCHIVE FIRST, its sha256 and size, then each part with its
+          # sha256: the publisher joins the parts and holds them to the whole.
+          printf 'image-sources.tar %s %s\n' "$(sha256sum out/image-sources.tar | cut -d ' ' -f 1)" \
+            "$(stat -c %s out/image-sources.tar)" >out/image-sources.parts
           parts=$(scripts/split-image.sh out/image-sources.tar)
           if [ -n "$parts" ]; then
             rm -f out/image-sources.tar
-          else
-            parts=out/image-sources.tar
+            while IFS= read -r part; do
+              printf '%s %s\n' "${part##*/}" "$(sha256sum "$part" | cut -d ' ' -f 1)" >>out/image-sources.parts
+            done <<<"$parts"
           fi
-          : >out/image-sources.parts
-          while IFS= read -r part; do
-            printf '%s %s\n' "${part##*/}" "$(sha256sum "$part" | cut -d ' ' -f 1)" >>out/image-sources.parts
-          done <<<"$parts"
           cat out/image-sources.parts
 
       # THE RELEASE GATE. Nothing below this runs against an image that fails it.

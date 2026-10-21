@@ -1,6 +1,8 @@
 package scripts_test
 
 import (
+	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -112,6 +114,12 @@ func newSourceFixture(t *testing.T) *sourceFixture {
 	srv.debianSource("/ubuntu/+archive/primary/+sourcefiles/mystery/1.0-1/", "mystery_1.0-1.dsc", map[string]string{
 		"mystery_1.0.orig.tar.gz": "mystery upstream",
 	})
+	srv.debianSource("/ubuntu/+archive/primary/+sourcefiles/foo/1:2.0-1/", "foo_2.0-1.dsc", map[string]string{
+		"foo_2.0.orig.tar.gz": "foo under epoch 1",
+	})
+	srv.debianSource("/ubuntu/+archive/primary/+sourcefiles/foo/2:2.0-1/", "foo_2.0-1.dsc", map[string]string{
+		"foo_2.0.orig.tar.gz": "foo under epoch 2",
+	})
 	srv.debianSource("/~git-core/+archive/ubuntu/ppa/+sourcefiles/git/1:2.55.0-0ppa1~ubuntu24.04.2/",
 		"git_2.55.0-0ppa1~ubuntu24.04.2.dsc", map[string]string{
 			"git_2.55.0.orig.tar.xz":                       "git upstream",
@@ -153,6 +161,8 @@ func newSourceFixture(t *testing.T) *sourceFixture {
 		"temurin-17-jdk\tamd64\t17.0.9.0.0+9\ttemurin-17-jdk\t17.0.9.0.0+9\tnone\tgnu",
 		"temurin-8-jdk\tamd64\t8.0.504.0.0+1-0\ttemurin-8-jdk\t8.0.504.0.0+1-0\tnone\tgnu",
 		"mystery\tamd64\t1.0-1\tmystery\t1.0-1\tarchive.ubuntu.com\tunclassified",
+		"foo\tamd64\t1:2.0-1\tfoo\t1:2.0-1\tarchive.ubuntu.com\tgnu",
+		"foo-tools\tamd64\t2:2.0-1\tfoo\t2:2.0-1\tarchive.ubuntu.com\tgnu",
 		"gh\tamd64\t2.102.1\tgh\t2.102.1\tnone\tunclassified",
 		"jq\tamd64\t1.7.1-3build1\tjq\t1.7.1-3build1\tarchive.ubuntu.com\tother",
 	}, "\n")+"\n")
@@ -168,7 +178,13 @@ func newSourceFixture(t *testing.T) *sourceFixture {
 func (fx *sourceFixture) run(t *testing.T, kernelVersion string) (string, string, bool) {
 	t.Helper()
 
-	out := filepath.Join(t.TempDir(), "sources")
+	return fx.runInto(t, kernelVersion, filepath.Join(t.TempDir(), "sources"))
+}
+
+// runInto runs the fetcher against the fixture into OUT.
+func (fx *sourceFixture) runInto(t *testing.T, kernelVersion, out string) (string, string, bool) {
+	t.Helper()
+
 	cmd := exec.CommandContext(t.Context(), "python3", "fetch-image-sources.py", fx.manifest, kernelVersion, fx.config, out)
 	cmd.Env = append(os.Environ(),
 		"BILLET_SOURCES_LAUNCHPAD="+fx.srv.URL,
@@ -205,26 +221,40 @@ func TestTheSourceArchiveHoldsEachSourceAtItsVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "source\tfile\tsha256\tsize\n"
-	for _, f := range []struct{ dir, name, body string }{
-		{"git_2.55.0-0ppa1~ubuntu24.04.2", "git_2.55.0-0ppa1~ubuntu24.04.2.debian.tar.xz", "git packaging"},
-		{"git_2.55.0-0ppa1~ubuntu24.04.2", "git_2.55.0-0ppa1~ubuntu24.04.2.dsc", ""},
-		{"git_2.55.0-0ppa1~ubuntu24.04.2", "git_2.55.0.orig.tar.xz", "git upstream"},
-		{"hello_2.10-3", "hello_2.10-3.debian.tar.xz", "hello packaging"},
-		{"hello_2.10-3", "hello_2.10-3.dsc", ""},
-		{"hello_2.10-3", "hello_2.10.orig.tar.gz", "hello upstream"},
-		{"libpgfoo_1.2-1.pgdg24.04+1", "libpgfoo_1.2-1.pgdg24.04+1.dsc", ""},
-		{"libpgfoo_1.2-1.pgdg24.04+1", "libpgfoo_1.2-1.pgdg24.04+1.tar.xz", "libpgfoo"},
-		{"linux_6.1.155", "config", "CONFIG_EXAMPLE=y\n"},
-		{"linux_6.1.155", "linux-6.1.155.tar.xz", "linux"},
-		{"mystery_1.0-1", "mystery_1.0-1.dsc", ""},
-		{"mystery_1.0-1", "mystery_1.0.orig.tar.gz", "mystery upstream"},
-		{"postgresql-common_293.pgdg24.04+1", "postgresql-common_293.pgdg24.04+1.dsc", ""},
-		{"postgresql-common_293.pgdg24.04+1", "postgresql-common_293.pgdg24.04+1.tar.xz", "postgresql-common"},
-		{"temurin-17-jdk_17.0.9.0.0+9", "OpenJDK17U-jdk-sources_17.0.9_9.tar.gz", "jdk17"},
-		{"temurin-21-jdk_21.0.12.1.0+1-0", "OpenJDK21U-jdk-sources_21.0.12.1_1.tar.gz", "jdk21"},
-		{"temurin-8-jdk_8.0.504.0.0+1-0", "OpenJDK8U-jdk-sources_8u504b01.tar.gz", "jdk8"},
+	// THE INDEX ACCOUNTS FOR EVERY SOURCE THE MANIFEST NEEDS: each file fetched,
+	// with the source and version it is of, and the reviewed one as reviewed.
+	// The directory carries the whole version, epoch included, so foo's two
+	// epochs are two sources.
+	want := "source\tversion\tstatus\tfile\tsha256\tsize\n"
+	for _, f := range []struct{ source, version, dir, name, body string }{
+		{"foo", "1:2.0-1", "foo_1:2.0-1", "foo_2.0-1.dsc", ""},
+		{"foo", "1:2.0-1", "foo_1:2.0-1", "foo_2.0.orig.tar.gz", "foo under epoch 1"},
+		{"foo", "2:2.0-1", "foo_2:2.0-1", "foo_2.0-1.dsc", ""},
+		{"foo", "2:2.0-1", "foo_2:2.0-1", "foo_2.0.orig.tar.gz", "foo under epoch 2"},
+		{"gh", "2.102.1", "", "", ""},
+		{"git", "1:2.55.0-0ppa1~ubuntu24.04.2", "git_1:2.55.0-0ppa1~ubuntu24.04.2", "git_2.55.0-0ppa1~ubuntu24.04.2.debian.tar.xz", "git packaging"},
+		{"git", "1:2.55.0-0ppa1~ubuntu24.04.2", "git_1:2.55.0-0ppa1~ubuntu24.04.2", "git_2.55.0-0ppa1~ubuntu24.04.2.dsc", ""},
+		{"git", "1:2.55.0-0ppa1~ubuntu24.04.2", "git_1:2.55.0-0ppa1~ubuntu24.04.2", "git_2.55.0.orig.tar.xz", "git upstream"},
+		{"guest-kernel", "6.1.155", "guest-kernel_6.1.155", "config", "CONFIG_EXAMPLE=y\n"},
+		{"guest-kernel", "6.1.155", "guest-kernel_6.1.155", "linux-6.1.155.tar.xz", "linux"},
+		{"hello", "2.10-3", "hello_2.10-3", "hello_2.10-3.debian.tar.xz", "hello packaging"},
+		{"hello", "2.10-3", "hello_2.10-3", "hello_2.10-3.dsc", ""},
+		{"hello", "2.10-3", "hello_2.10-3", "hello_2.10.orig.tar.gz", "hello upstream"},
+		{"libpgfoo", "1.2-1.pgdg24.04+1", "libpgfoo_1.2-1.pgdg24.04+1", "libpgfoo_1.2-1.pgdg24.04+1.dsc", ""},
+		{"libpgfoo", "1.2-1.pgdg24.04+1", "libpgfoo_1.2-1.pgdg24.04+1", "libpgfoo_1.2-1.pgdg24.04+1.tar.xz", "libpgfoo"},
+		{"mystery", "1.0-1", "mystery_1.0-1", "mystery_1.0-1.dsc", ""},
+		{"mystery", "1.0-1", "mystery_1.0-1", "mystery_1.0.orig.tar.gz", "mystery upstream"},
+		{"postgresql-common", "293.pgdg24.04+1", "postgresql-common_293.pgdg24.04+1", "postgresql-common_293.pgdg24.04+1.dsc", ""},
+		{"postgresql-common", "293.pgdg24.04+1", "postgresql-common_293.pgdg24.04+1", "postgresql-common_293.pgdg24.04+1.tar.xz", "postgresql-common"},
+		{"temurin-17-jdk", "17.0.9.0.0+9", "temurin-17-jdk_17.0.9.0.0+9", "OpenJDK17U-jdk-sources_17.0.9_9.tar.gz", "jdk17"},
+		{"temurin-21-jdk", "21.0.12.1.0+1-0", "temurin-21-jdk_21.0.12.1.0+1-0", "OpenJDK21U-jdk-sources_21.0.12.1_1.tar.gz", "jdk21"},
+		{"temurin-8-jdk", "8.0.504.0.0+1-0", "temurin-8-jdk_8.0.504.0.0+1-0", "OpenJDK8U-jdk-sources_8u504b01.tar.gz", "jdk8"},
 	} {
+		if f.dir == "" {
+			want += f.source + "\t" + f.version + "\treviewed\t-\t-\t-\n"
+
+			continue
+		}
 		path := filepath.Join(out, f.dir, f.name)
 		body, err := os.ReadFile(path)
 		if err != nil {
@@ -235,7 +265,7 @@ func TestTheSourceArchiveHoldsEachSourceAtItsVersion(t *testing.T) {
 		if f.body != "" && string(body) != f.body {
 			t.Errorf("%s/%s = %q, want %q", f.dir, f.name, body, f.body)
 		}
-		want += fmt.Sprintf("%s\t%s/%s\t%s\t%d\n", f.dir, f.dir, f.name, digest(string(body)), len(body))
+		want += fmt.Sprintf("%s\t%s\tfetched\t%s/%s\t%s\t%d\n", f.source, f.version, f.dir, f.name, digest(string(body)), len(body))
 	}
 	if string(index) != want {
 		t.Errorf("index.tsv is\n%s\nwant\n%s", index, want)
@@ -301,7 +331,7 @@ func TestTheSourceArchiveRefusesWhatItCannotVerify(t *testing.T) {
 				fx.srv.files["/linux-6.1.155.tar.xz"] = "not linux"
 			},
 			want:   "linux 6.1.155: linux-6.1.155.tar.xz: sha256",
-			absent: "linux_6.1.155/linux-6.1.155.tar.xz",
+			absent: "guest-kernel_6.1.155/linux-6.1.155.tar.xz",
 		},
 		{
 			name: "an unclassified package the review no longer names",
@@ -340,6 +370,22 @@ func TestTheSourceArchiveRefusesWhatItCannotVerify(t *testing.T) {
 	}
 }
 
+// A USED OUTPUT DIRECTORY IS REFUSED: what an earlier run left in it, a partial
+// download or a source an older manifest needed, would be indexed and published.
+func TestTheSourceArchiveStartsFromAnEmptyDirectory(t *testing.T) {
+	t.Parallel()
+
+	fx := newSourceFixture(t)
+	out := t.TempDir()
+	writeTreeFile(t, out, "stale_1.0/stale_1.0.orig.tar.gz.part", "left over")
+	if _, output, ok := fx.runInto(t, "6.1.155", out); ok || !strings.Contains(output, out+" is not empty") {
+		t.Fatalf("the fetcher ran into a used directory:\n%s", output)
+	}
+	if _, err := os.Stat(filepath.Join(out, "index.tsv")); err == nil {
+		t.Error("the fetcher indexed a used directory")
+	}
+}
+
 // THE PPAS THE FETCHER KNOWS ARE THE TEMPLATE'S, and every source the review
 // leaves out is under a license that asks for no source.
 func TestTheSourceArchivesTablesAreTheTemplatesAndTheReviews(t *testing.T) {
@@ -372,5 +418,300 @@ func TestTheSourceArchivesTablesAreTheTemplatesAndTheReviews(t *testing.T) {
 			!strings.HasPrefix(cells[2], "https://") || !regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`).MatchString(cells[3]) {
 			t.Errorf("reviewed-licenses.tsv row %q is not a source, a license that asks for no source, its evidence and a date", line)
 		}
+	}
+}
+
+// publishIndex is the source index of the publication publishDir writes: its one
+// GNU-licensed package, bash, fetched, and the guest kernel.
+var publishIndex = "source\tversion\tstatus\tfile\tsha256\tsize\n" +
+	"bash\t5.2.21-2ubuntu4\tfetched\tbash_5.2.21-2ubuntu4/bash_5.2.21.orig.tar.xz\t" + digest("bash") + "\t4\n" +
+	"guest-kernel\t6.1.155\tfetched\tguest-kernel_6.1.155/linux-6.1.155.tar.xz\t" + digest("linux") + "\t5\n"
+
+// writeSourceArchive writes into DIR the corresponding source a publication
+// carries: a tar holding INDEX as ./index.tsv and a file, INDEX again as
+// image-sources-index.tsv, and image-sources.parts naming the tar, its sha256
+// and size, and, when PARTS is above zero, the tar split into that many parts.
+func writeSourceArchive(t *testing.T, dir, index string, parts int) {
+	t.Helper()
+
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	for _, f := range []struct{ name, body string }{
+		{"./index.tsv", index},
+		{"./bash_5.2.21-2ubuntu4/bash_5.2.21.orig.tar.xz", "bash"},
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: f.name, Mode: 0o644, Size: int64(len(f.body))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(f.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archive := b.Bytes()
+
+	list := fmt.Sprintf("image-sources.tar %s %d\n", digest(string(archive)), len(archive))
+	write := func(name string, body []byte) {
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write("image-sources-index.tsv", []byte(index))
+	if parts == 0 {
+		write("image-sources.tar", archive)
+	} else {
+		step := (len(archive) + parts - 1) / parts
+		for i := range parts {
+			piece := archive[min(i*step, len(archive)):min((i+1)*step, len(archive))]
+			name := fmt.Sprintf("image-sources.tar.part%03d", i)
+			write(name, piece)
+			list += name + " " + digest(string(piece)) + "\n"
+		}
+	}
+	write("image-sources.parts", []byte(list))
+}
+
+// runPublisher runs publish-guest-release.sh against DIR with git and gh stubbed,
+// and returns its output, whether it succeeded, and the calls it made.
+func runPublisher(t *testing.T, dir string) (string, bool, string) {
+	t.Helper()
+
+	publisher, err := filepath.Abs("publish-guest-release.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := t.TempDir()
+	calls := filepath.Join(tools, "calls.log")
+	writeExecutable(t, filepath.Join(tools, "git"), "#!/bin/sh\nprintf 'git %s\\n' \"$*\" >> \"$BILLET_TEST_CALLS\"\nexit 0\n")
+	writeExecutable(t, filepath.Join(tools, "gh"), "#!/bin/sh\nprintf 'gh %s\\n' \"$*\" >> \"$BILLET_TEST_CALLS\"\n"+
+		"if [ \"$1 $2\" = \"release view\" ]; then printf 'true\\n'; exit 0; fi\nexit 0\n")
+	cmd := exec.CommandContext(t.Context(), publisher, dir)
+	cmd.Env = append(os.Environ(), "PATH="+tools+":"+os.Getenv("PATH"), "BILLET_TEST_CALLS="+calls,
+		"GITHUB_REPOSITORY=junioryono/billet", "SOURCE_SHA="+strings.Repeat("a", 40), "TAG=guest-20260821-000000")
+	out, err := cmd.CombinedOutput()
+	if exit := (*exec.ExitError)(nil); err != nil && !errors.As(err, &exit) {
+		t.Fatalf("the publisher did not run: %v\n%s", err, out)
+	}
+	logged, readErr := os.ReadFile(calls)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		t.Fatal(readErr)
+	}
+
+	return string(out), err == nil, string(logged)
+}
+
+// THE PUBLISHER HOLDS THE CORRESPONDING SOURCE WHOLE BEFORE IT TAGS: the parts the
+// list names, joined in order, must be the archive its first line describes; the
+// published index must be the one inside it; and the index must account for
+// exactly the sources the manifest needs, the kernel's once.
+func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
+	t.Parallel()
+
+	manifest := `{"schema": 1, "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST:rootfs.img.zst", "size": 1},
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}}`
+	fresh := func(t *testing.T) string {
+		t.Helper()
+
+		return publishDir(t, manifest, "rootfs.img.zst", "vmlinux-billet")
+	}
+	split := func(t *testing.T, parts int) string {
+		t.Helper()
+
+		dir := fresh(t)
+		removeAll(t, filepath.Join(dir, "image-sources.tar"))
+		writeSourceArchive(t, dir, publishIndex, parts)
+
+		return dir
+	}
+	edit := func(t *testing.T, dir, name string, change func(string) string) string {
+		t.Helper()
+
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed := change(string(body))
+		if changed == string(body) {
+			t.Fatalf("the edit left %s unchanged", name)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(changed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		return dir
+	}
+	indexLines := strings.Split(strings.TrimSuffix(publishIndex, "\n"), "\n")
+
+	for _, tc := range []struct {
+		name    string
+		dir     func(t *testing.T) string
+		ok      bool
+		uploads []string
+		absent  []string
+	}{
+		{name: "one archive", dir: fresh, ok: true, uploads: []string{"/image-sources.tar ", "/image-sources.parts", "/image-sources-index.tsv"}},
+		{
+			name: "an archive in parts", ok: true,
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return split(t, 3)
+			},
+			uploads: []string{"/image-sources.tar.part000", "/image-sources.tar.part001", "/image-sources.tar.part002"},
+			absent:  []string{"/image-sources.tar "},
+		},
+		{
+			name: "a list with no final newline", ok: true,
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return edit(t, split(t, 2), "image-sources.parts", func(s string) string { return strings.TrimSuffix(s, "\n") })
+			},
+			uploads: []string{"/image-sources.tar.part001"},
+		},
+		{
+			name: "a list leaving out the last part",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return edit(t, split(t, 3), "image-sources.parts", func(s string) string {
+					kept, _, found := strings.Cut(s, "image-sources.tar.part002")
+					if !found {
+						t.Fatal("the fixture's list has no third part")
+					}
+
+					return kept
+				})
+			},
+		},
+		{
+			name: "parts listed out of order",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return edit(t, split(t, 2), "image-sources.parts", func(s string) string {
+					lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+
+					return lines[0] + "\n" + lines[2] + "\n" + lines[1] + "\n"
+				})
+			},
+		},
+		{
+			// THE PART'S CONTENT IS THE WHOLE ARCHIVE, digest and all, so only the
+			// name check stands between it and the release.
+			name: "a part under a name not the archive's",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				dir := fresh(t)
+				body, err := os.ReadFile(filepath.Join(dir, "image-sources.tar"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "elsewhere.tar"), body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				removeAll(t, filepath.Join(dir, "image-sources.tar"))
+
+				return edit(t, dir, "image-sources.parts", func(s string) string {
+					return s + "elsewhere.tar " + digest(string(body)) + "\n"
+				})
+			},
+		},
+		{
+			name: "a list of nothing but a space",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return rewritten(t, fresh(t), "image-sources.parts", " ")
+			},
+		},
+		{
+			name: "an archive that is not the one the list describes",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return edit(t, fresh(t), "image-sources.tar", func(s string) string { return s + "x" })
+			},
+		},
+		{
+			name: "a published index that is not the archive's",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				return edit(t, fresh(t), "image-sources-index.tsv", func(s string) string {
+					return s + "bash\t5.2.21-2ubuntu4\tfetched\tbash_5.2.21-2ubuntu4/extra\t" + digest("x") + "\t1\n"
+				})
+			},
+		},
+		{
+			name: "an index without a source the manifest needs",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				dir := fresh(t)
+				writeSourceArchive(t, dir, indexLines[0]+"\n"+indexLines[2]+"\n", 0)
+
+				return dir
+			},
+		},
+		{
+			name: "a GNU-licensed source marked reviewed",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				dir := fresh(t)
+				writeSourceArchive(t, dir, indexLines[0]+"\nbash\t5.2.21-2ubuntu4\treviewed\t-\t-\t-\n"+indexLines[2]+"\n", 0)
+
+				return dir
+			},
+		},
+		{
+			name: "an index without the kernel's source",
+			dir: func(t *testing.T) string {
+				t.Helper()
+
+				dir := fresh(t)
+				writeSourceArchive(t, dir, indexLines[0]+"\n"+indexLines[1]+"\n", 0)
+
+				return dir
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			out, ok, calls := runPublisher(t, tc.dir(t))
+			if ok != tc.ok {
+				t.Fatalf("publication success = %v, want %v\n%s\n%s", ok, tc.ok, out, calls)
+			}
+			if !tc.ok {
+				for _, call := range []string{"git tag", "git push", "release create"} {
+					if strings.Contains(calls, call) {
+						t.Errorf("a refused publication still ran %q:\n%s", call, calls)
+					}
+				}
+
+				return
+			}
+			create := ""
+			for _, line := range strings.Split(calls, "\n") {
+				if strings.Contains(line, "release create") {
+					create = line + " "
+				}
+			}
+			for _, want := range tc.uploads {
+				if !strings.Contains(create, want) {
+					t.Errorf("the release was created without %s:\n%s", want, create)
+				}
+			}
+			for _, never := range tc.absent {
+				if strings.Contains(create, never) {
+					t.Errorf("the release was created with %s:\n%s", never, create)
+				}
+			}
+		})
 	}
 }
