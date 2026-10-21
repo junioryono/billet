@@ -312,6 +312,54 @@ func TestAMirrorUnverifiedMidRequestIsNotServed(t *testing.T) {
 	}
 }
 
+// A BROKEN MIRROR THE DISK WILL NOT MARK IS STILL NEVER SERVED AGAIN: it is held
+// out of service in the process, and its stamp is taken away so a restart that
+// forgets the hold finds a mirror of no repository; the hold ends with the
+// mirror, however it is removed.
+func TestABrokenMirrorTheDiskWillNotMarkIsHeldAcrossARestart(t *testing.T) {
+	t.Parallel()
+
+	service, _, _, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
+	service.git.fullFraction = 1
+	path := service.git.mirrorPath("untrusted/acme/api")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{gitIdentityStamp: "7\n", gitUsedStamp: ""} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stamped, _, err := mirrorRepository(path); err != nil || stamped != 7 {
+		t.Fatalf("the mirror reads %d, %v before it broke", stamped, err)
+	}
+
+	if err := service.git.holdBroken(path, errors.New("no space left on device")); err == nil ||
+		!strings.Contains(err.Error(), "no space left on device") {
+		t.Fatalf("holdBroken = %v, want the mark's failure reported", err)
+	}
+	if !service.git.quarantined(path) {
+		t.Fatal("the broken mirror is not held out of service in the process")
+	}
+	if _, exists, err := mirrorRepository(path); !exists || err == nil {
+		t.Fatalf("after a restart the broken mirror would read exists=%v, %v; want no repository it can serve", exists, err)
+	}
+
+	// THE HOLD ENDS WITH THE MIRROR, here the reaper's removal of one unused
+	// for longer than its retention, so the mirror made after it is served.
+	now := time.Now()
+	service.now = func() time.Time { return now.Add(gitMirrorRetention + time.Hour) }
+	if err := service.ReapGitMirrors(t.Context()); err != nil {
+		t.Fatalf("ReapGitMirrors: %v", err)
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("the reaper kept a mirror past its retention")
+	}
+	if service.git.quarantined(path) {
+		t.Fatal("the hold outlived the mirror it was on")
+	}
+}
+
 // A MIRROR MARKED WHILE ITS ADVERTISEMENT IS READ IS NOT ADVERTISED: refs a
 // refresh brought meanwhile are never sent from a mirror GitHub has not
 // vouched for; GitHub's own advertisement is.

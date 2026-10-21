@@ -1338,6 +1338,36 @@ func (g *gitProxy) quarantined(path string) bool {
 	return g.held[path]
 }
 
+// holdBroken holds a broken mirror the disk would not mark out of service in
+// this process, and takes away its repository stamp, which needs no space, so
+// a restart that forgets the quarantine still finds a mirror it cannot serve.
+func (g *gitProxy) holdBroken(path string, markErr error) error {
+	g.quarantine(path)
+	err := fmt.Errorf("could not mark the mirror broken; held out of service: %w", markErr)
+	root, openErr := os.OpenRoot(path)
+	if openErr != nil {
+		return errors.Join(err, openErr)
+	}
+	defer root.Close()
+	if removeErr := root.Remove(gitIdentityStamp); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+		return errors.Join(err, removeErr)
+	}
+	dir, openErr := root.Open(".")
+	if openErr != nil {
+		return errors.Join(err, openErr)
+	}
+
+	return errors.Join(err, dir.Sync(), dir.Close())
+}
+
+// exitedOnSignal reports whether a process ended on a signal, as one killed
+// because its request ended does, rather than exiting of its own accord.
+func exitedOnSignal(exit *exec.ExitError) bool {
+	status, ok := exit.Sys().(syscall.WaitStatus)
+
+	return ok && status.Signaled()
+}
+
 // release ends a quarantine once its mirror is gone.
 func (g *gitProxy) release(path string) {
 	g.mu.Lock()
@@ -1408,11 +1438,15 @@ func mirrorRepository(path string) (int64, bool, error) {
 	}
 	// COULD NOT TELL IS NOT ABSENT: only a mark proved missing leaves the
 	// mirror servable.
-	if _, err := root.Stat(gitBrokenStamp); !errors.Is(err, fs.ErrNotExist) {
-		return id, true, errors.Join(errMirrorBroken, err)
-	}
+	// THE REMOVABLE MARK FIRST: a refresh may take away billet-unverified
+	// between the two reads, and a serve may add billet-broken, but none takes
+	// billet-broken away, so reading it second never finds a mirror clean that
+	// was marked throughout.
 	if _, err := root.Stat(gitUnverifiedStamp); !errors.Is(err, fs.ErrNotExist) {
 		return id, true, errors.Join(errMirrorUnverified, err)
+	}
+	if _, err := root.Stat(gitBrokenStamp); !errors.Is(err, fs.ErrNotExist) {
+		return id, true, errors.Join(errMirrorBroken, err)
 	}
 
 	return id, true, nil
@@ -1527,6 +1561,8 @@ func (s *CacheService) refresh(
 		if lockWithin(ctx, &mirror.use, casReleaseWait) {
 			if removeErr := os.RemoveAll(path); removeErr != nil {
 				err = errors.Join(err, removeErr)
+			} else {
+				s.git.release(path)
 			}
 			mirror.use.Unlock()
 		}
@@ -2030,12 +2066,12 @@ func (s *CacheService) serveUploadPack(
 		cancel()
 	}
 	waitErr := cmd.Wait()
-	// THE CLIENT LEAVING, or the request's own end, says nothing of the mirror;
-	// an upload-pack that failed while both were alive does.
-	if waitErr != nil && copyErr == nil && ctx.Err() == nil {
+	// AN upload-pack THAT EXITED FAILING OF ITS OWN ACCORD says the mirror is
+	// broken, whatever the client did after; one killed because the client left
+	// or the request ended says nothing of it.
+	if exit, ok := errors.AsType[*exec.ExitError](waitErr); ok && !exitedOnSignal(exit) {
 		if err := markBroken(path); err != nil {
-			s.git.quarantine(path)
-			waitErr = errors.Join(waitErr, fmt.Errorf("could not mark the mirror broken; held out of service: %w", err))
+			waitErr = errors.Join(waitErr, s.git.holdBroken(path, err))
 		}
 	}
 	if waitErr != nil || copyErr != nil {
@@ -2208,6 +2244,9 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 			continue
 		}
 		err = os.RemoveAll(s.git.mirrorPath(m.key))
+		if err == nil {
+			s.git.release(s.git.mirrorPath(m.key))
+		}
 		held.use.Unlock()
 		if err != nil {
 			failures = append(failures, err)
