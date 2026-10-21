@@ -299,6 +299,43 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 				writeTreeFile(t, notices, "x", "  Text: /usr/local/bin/LICENSE.txt\n")
 			},
 		},
+		{
+			// A VERSION REACHED THROUGH A LINKED DIRECTORY that only the image
+			// resolves: a glob on this machine finds no executable there.
+			name: "a Copilot CLI under a linked directory without its license",
+			want: "/opt/hostedtoolcache/copilot-cli/1.0.102/x64/LICENSE.md",
+			mutate: func(t *testing.T, root string) {
+				writeTreeFile(t, root, "opt/extra-copilot-bin/copilot", "#!/bin/sh\n")
+				dir := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.102", "x64")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("/opt/extra-copilot-bin", filepath.Join(dir, "bin")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			// THE NOTICES SEARCHED ARE THE ONES VALIDATED: the link resolves, inside
+			// the image, to a file naming nothing, and on this machine to one
+			// naming everything.
+			name: "notices linked to a file that names nothing in the image",
+			want: "/usr/local/bin/LICENSE.txt (not named in IMAGE_NOTICES)",
+			mutate: func(t *testing.T, root string) {
+				notices := filepath.Join(root, "opt", "billet", "IMAGE_NOTICES")
+				body, err := os.ReadFile(notices)
+				if err != nil {
+					t.Fatal(err)
+				}
+				host := filepath.Join(t.TempDir(), "IMAGE_NOTICES")
+				writeTreeFile(t, filepath.Dir(host), "IMAGE_NOTICES", string(body))
+				writeTreeFile(t, root, strings.TrimPrefix(host, "/"), "Notices for the billet guest image\n")
+				removeAll(t, notices)
+				if err := os.Symlink(host, notices); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -335,7 +372,66 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 }
 
 // noticeGateFunctions are the gate's functions check_image_notices runs on.
-var noticeGateFunctions = []string{"image_resolve", "image_text_file", "check_image_notices"}
+var noticeGateFunctions = []string{
+	"image_resolve", "image_entries", "image_present", "image_text_file", "check_image_notices",
+}
+
+// LINKS THE IMAGE RESOLVES PASS: a license and the notices each an absolute link to
+// a file only the image has, which a test on this machine would find missing.
+func TestThePublicationGateFollowsTheImagesOwnLinks(t *testing.T) {
+	t.Parallel()
+
+	root := imageNoticesRoot(t)
+	for _, link := range []struct{ path, target string }{
+		{"usr/local/bin/LICENSE.txt", "/usr/share/doc/packer/LICENSE.txt"},
+		{"opt/billet/IMAGE_NOTICES", "/usr/share/doc/billet/IMAGE_NOTICES"},
+	} {
+		full := filepath.Join(root, link.path)
+		body, err := os.ReadFile(full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTreeFile(t, root, strings.TrimPrefix(link.target, "/"), string(body))
+		removeAll(t, full)
+		if err := os.Symlink(link.target, full); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if out, failed := gateRun(t, "check_image_notices", root, "", noticeGateFunctions...); failed != "0" ||
+		!strings.Contains(out, "(5)") {
+		t.Errorf("an image whose license and notices are links inside it failed:\n%s", out)
+	}
+}
+
+// A LINK THAT CANNOT BE READ RESOLVES NOWHERE. With readlink failing, a path
+// through /usr/share/miniconda must not resolve to /usr/share/LICENSE.txt, which
+// is what dropping the unreadable component would give.
+func TestTheImageResolverRefusesALinkItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeTreeFile(t, root, "opt/conda/LICENSE.txt", "MINICONDA END USER LICENSE AGREEMENT\n")
+	writeTreeFile(t, root, "usr/share/LICENSE.txt", "something else\n")
+	if err := os.Symlink("/opt/conda", filepath.Join(root, "usr", "share", "miniconda")); err != nil {
+		t.Fatal(err)
+	}
+
+	bin := t.TempDir()
+	writeExecutable(t, filepath.Join(bin, "readlink"), "#!/bin/sh\nexit 1\n")
+	script := "set -euo pipefail\n" + checkImageFunction(t, "image_resolve") + "\n" +
+		"if out=$(image_resolve \"$1\" /usr/share/miniconda/LICENSE.txt); then echo \"resolved=$out\"; else echo refused; fi\n"
+	path := filepath.Join(t.TempDir(), "resolve.sh")
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), "bash", path, root)
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "refused" {
+		t.Fatalf("image_resolve with an unreadable link answered %q (%v), want refused", out, err)
+	}
+}
 
 // buildAssignment returns one top-level assignment from build-guest-image.sh.
 func buildAssignment(t *testing.T, name string) string {
@@ -472,26 +568,6 @@ func TestTheBuildFailsWithoutEachToolsLicense(t *testing.T) {
 			want: "Packer is installed without",
 			mutate: func(t *testing.T, root string) {
 				writeTreeFile(t, root, "usr/local/bin/LICENSE.txt/terms", "Business Source License 1.1\n")
-			},
-		},
-		{
-			// A toolcache directory linked out of the image would have the build
-			// write, as root, onto the builder.
-			name: "a toolcache directory linked outside the image", tool: "opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72",
-			curl: "echo fetched >&2; exit 0\n", want: "firewall 0.28.72",
-			mutate: func(t *testing.T, root string) {
-				outside := t.TempDir()
-				writeTreeFile(t, outside, "x64/awf-bundle.js", "bundle\n")
-				link := filepath.Join(root, "opt", "hostedtoolcache", "agentic-workflow-firewall-js", "0.28.72")
-				removeAll(t, link)
-				if err := os.Symlink(outside, link); err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() {
-					if _, err := os.Lstat(filepath.Join(outside, "x64", "LICENSE")); err == nil {
-						t.Error("the build wrote a license outside the image")
-					}
-				})
 			},
 		},
 	} {

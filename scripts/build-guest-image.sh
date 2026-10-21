@@ -207,22 +207,9 @@ plain_file() {
 	[ -f "$1" ] && [ ! -L "$1" ] && [ -s "$1" ]
 }
 
-# fetch_license downloads the license at URL to DEST, inside the image at ROOT, and
-# fails when it cannot or what arrived is not a non-empty file.
-#
-# NOTHING IN THE IMAGE DECIDES WHERE THE BUILDER WRITES: this runs as root on the
-# builder, so DEST's directory, with every link on the way to it followed, must
-# still be inside ROOT, and whatever is at DEST is removed rather than written
-# through.
+# fetch_license downloads the license at URL to DEST, and fails when it cannot or
+# what arrived is not a non-empty file.
 fetch_license() {
-	local into real root
-	into=${2%/*}
-	real=$(cd "$into" 2>/dev/null && pwd -P) || return 1
-	root=$(cd "$3" && pwd -P) || return 1
-	case "$real/" in
-	"$root"/*) ;;
-	*) return 1 ;;
-	esac
 	rm -f "$2" &&
 		curl -fsSL --http1.1 \
 			--connect-timeout 20 --max-time 120 \
@@ -246,6 +233,11 @@ notice_entry() {
 # license is fetched from the tag of the version installed, read back from the
 # directory the template's installer made, and lands beside the tool. Miniconda's
 # installer and Packer's zip place their own, and one missing fails the build.
+#
+# THE BUILD TRUSTS THE ROOT IT BUILT, as every step after the template does (#614):
+# it writes into it as root on this machine, and a tool the template reached
+# through a symlinked directory is found by the gate, which resolves paths inside
+# the image, rather than here.
 install_image_notices() {
 	local rootfs=$1 dir path version
 	local tools="$rootfs$TOOLCACHE_DIR" notices="$rootfs/opt/billet/IMAGE_NOTICES"
@@ -269,7 +261,7 @@ NOTICES
 			echo "the toolcache holds the GitHub Copilot CLI as $version, which this build will not put in a URL" >&2
 			exit 1
 		fi
-		if ! fetch_license "https://raw.githubusercontent.com/github/copilot-cli/v$version/LICENSE.md" "${dir}LICENSE.md" "$rootfs"; then
+		if ! fetch_license "https://raw.githubusercontent.com/github/copilot-cli/v$version/LICENSE.md" "${dir}LICENSE.md"; then
 			echo "could not fetch the license of the GitHub Copilot CLI $version, which must travel with it" >&2
 			exit 1
 		fi
@@ -285,7 +277,7 @@ NOTICES
 			echo "the toolcache holds the agentic workflow firewall as $version, which this build will not put in a URL" >&2
 			exit 1
 		fi
-		if ! fetch_license "https://raw.githubusercontent.com/github/gh-aw-firewall/v$version/LICENSE" "$dir/LICENSE" "$rootfs"; then
+		if ! fetch_license "https://raw.githubusercontent.com/github/gh-aw-firewall/v$version/LICENSE" "$dir/LICENSE"; then
 			echo "could not fetch the license of the agentic workflow firewall $version, which must travel with it" >&2
 			exit 1
 		fi

@@ -451,41 +451,46 @@ check_completer() {
 # GitHub Copilot CLI, the agentic workflow firewall bundle, Miniconda and Packer,
 # each wherever the template put it.
 #
-# A TOOL SHIPS IF ANYTHING IS AT ITS PATH, a symlink included, whatever it points
-# to on this machine; and a license counts only as a non-empty regular file, found
-# by resolving its path inside the image, never against the builder's own root.
+# EVERY PATH IS THE IMAGE'S, resolved inside it: a symlink in the image names a
+# path in the image, so a host glob or test would look on this machine instead.
+# A tool ships if anything is at its path, a link included, and a license counts
+# only as a non-empty regular file.
 check_image_notices() {
-	local path text want=() missing=() status
+	local version arch text notices want=() missing=() status
 
-	if ! image_text_file "$1" /opt/billet/IMAGE_NOTICES; then
+	if ! image_text_file "$1" /opt/billet/IMAGE_NOTICES ||
+		! notices=$(image_resolve "$1" /opt/billet/IMAGE_NOTICES); then
 		fail "the image has no /opt/billet/IMAGE_NOTICES, so it ships tools whose licenses ask for their text without saying where it is"
 		return
 	fi
-	for path in "$1"/opt/hostedtoolcache/copilot-cli/*/*/bin/copilot; do
-		if [ -e "$path" ] || [ -L "$path" ]; then
-			want+=("${path%/bin/copilot}/LICENSE.md")
-		fi
-	done
-	for path in "$1"/opt/hostedtoolcache/agentic-workflow-firewall-js/*/*/awf-bundle.js; do
-		if [ -e "$path" ] || [ -L "$path" ]; then
-			want+=("${path%/awf-bundle.js}/LICENSE")
-		fi
-	done
-	if [ -e "$1/usr/share/miniconda" ] || [ -L "$1/usr/share/miniconda" ]; then
-		want+=("$1/usr/share/miniconda/LICENSE.txt")
+	while IFS= read -r version; do
+		while IFS= read -r arch; do
+			if image_present "$1" "/opt/hostedtoolcache/copilot-cli/$version/$arch/bin/copilot"; then
+				want+=("/opt/hostedtoolcache/copilot-cli/$version/$arch/LICENSE.md")
+			fi
+		done < <(image_entries "$1" "/opt/hostedtoolcache/copilot-cli/$version")
+	done < <(image_entries "$1" /opt/hostedtoolcache/copilot-cli)
+	while IFS= read -r version; do
+		while IFS= read -r arch; do
+			if image_present "$1" "/opt/hostedtoolcache/agentic-workflow-firewall-js/$version/$arch/awf-bundle.js"; then
+				want+=("/opt/hostedtoolcache/agentic-workflow-firewall-js/$version/$arch/LICENSE")
+			fi
+		done < <(image_entries "$1" "/opt/hostedtoolcache/agentic-workflow-firewall-js/$version")
+	done < <(image_entries "$1" /opt/hostedtoolcache/agentic-workflow-firewall-js)
+	if image_present "$1" /usr/share/miniconda; then
+		want+=(/usr/share/miniconda/LICENSE.txt)
 	fi
-	if [ -e "$1/usr/local/bin/packer" ] || [ -L "$1/usr/local/bin/packer" ]; then
-		want+=("$1/usr/local/bin/LICENSE.txt")
+	if image_present "$1" /usr/local/bin/packer; then
+		want+=(/usr/local/bin/LICENSE.txt)
 	fi
 
-	for path in ${want[@]+"${want[@]}"}; do
-		text=${path#"$1"}
+	for text in ${want[@]+"${want[@]}"}; do
 		if ! image_text_file "$1" "$text"; then
 			missing+=("$text")
 			continue
 		fi
 		status=0
-		grep -qxF "  Text: $text" "$1/opt/billet/IMAGE_NOTICES" || status=$?
+		grep -qxF "  Text: $text" "$1$notices" || status=$?
 		case "$status" in
 		0) ;;
 		1) missing+=("$text (not named in IMAGE_NOTICES)") ;;
@@ -500,6 +505,27 @@ check_image_notices() {
 		return
 	fi
 	pass "the image carries the license of each tool installed outside apt that asks for it (${#want[@]}), and IMAGE_NOTICES names each"
+}
+
+# image_entries prints the name of each entry of DIR, resolved inside the image
+# mounted at ROOT, one per line, and nothing for a directory the image lacks.
+image_entries() {
+	local resolved entry
+	resolved=$(image_resolve "$1" "$2") || return 0
+	[ -d "$1$resolved" ] || return 0
+	for entry in "$1$resolved"/*; do
+		if [ -e "$entry" ] || [ -L "$entry" ]; then
+			printf '%s\n' "${entry##*/}"
+		fi
+	done
+}
+
+# image_present succeeds when anything, a symlink included, is at PATH inside the
+# image mounted at ROOT, its directory resolved inside the image.
+image_present() {
+	local parent
+	parent=$(image_resolve "$1" "${2%/*}") || return 1
+	[ -e "$1$parent/${2##*/}" ] || [ -L "$1$parent/${2##*/}" ]
 }
 
 # image_text_file succeeds when PATH, resolved inside the image mounted at ROOT, is
@@ -576,7 +602,10 @@ image_resolve() {
 		if [ -L "$root$out/$part" ]; then
 			hops=$((hops + 1))
 			[ "$hops" -le 40 ] || return 1
-			target=$(readlink "$root$out/$part")
+			# A LINK THAT CANNOT BE READ RESOLVES NOWHERE: an empty target would
+			# drop this component and resolve a different path.
+			target=$(readlink "$root$out/$part") || return 1
+			[ -n "$target" ] || return 1
 			case "$target" in /*) out="" ;; esac
 			rest="${target#/}${rest:+/$rest}"
 		else
