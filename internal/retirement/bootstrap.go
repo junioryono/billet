@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // BootstrapRequest is what a privileged installer knows when it prepares a host.
@@ -232,8 +234,8 @@ func ensureIdentityDir(dir string, acct ServiceAccount) (bool, error) {
 // BY DESCRIPTOR AND WHATEVER THEIR PREVIOUS OWNER: the global lock root:<gid>
 // 0660, the inner lock <uid>:<gid> 0600. A lock is never unlinked or recreated,
 // since a holder's flock lives on the inode; a symlink at either name refuses,
-// and so does a file with more than one link or one on another filesystem than
-// its directory's, because giving an inode away through one name gives it away
+// and so does a file with more than one link or one that is not on its
+// directory's mount, because giving an inode away through one name gives it away
 // through every name it has. An absent inner lock is left absent (its creator
 // owns it when it appears). The answer is never nil: an installer reports it as
 // a list, and nothing repaired is an empty list, not an absent one.
@@ -296,20 +298,23 @@ func reownLock(path string, uid, gid int, mode os.FileMode) (bool, error) {
 	// THE CHECKS BEFORE ANY CHANGE, ON THE OPEN DESCRIPTOR: one link, because a
 	// hard link to a file elsewhere passes every regular-file check and a chown
 	// through this name would give that file away through its other one; and
-	// the directory's own filesystem, because a lock billet wrote lives beside
-	// its directory and a file from elsewhere is not it.
+	// the directory's own mount, because a lock billet wrote lives beside its
+	// directory and a file mounted onto the name is not it. The mount, not the
+	// device: on an overlay of more than one filesystem a file and its directory
+	// report different devices (#123), and a bind mount from the same filesystem
+	// reports the same one.
 	if st.Nlink != 1 {
 		return false, fmt.Errorf("retirement: %s has %d links, so re-owning it would give away "+
 			"whatever else names that inode; billet leaves it alone", path, st.Nlink)
 	}
 
-	dirInfo, err := os.Lstat(filepath.Dir(path))
+	held, err := onDirectoryMount(f, filepath.Dir(path))
 	if err != nil {
-		return false, fmt.Errorf("retirement: examine %s's directory: %w", path, err)
+		return false, fmt.Errorf("retirement: %s: %w", path, err)
 	}
 
-	if dirSt, ok := dirInfo.Sys().(*syscall.Stat_t); !ok || dirSt.Dev != st.Dev {
-		return false, fmt.Errorf("retirement: %s is not on its directory's filesystem, so it is not "+
+	if !held {
+		return false, fmt.Errorf("retirement: %s is not on its directory's mount, so it is not "+
 			"a lock billet wrote; billet leaves it alone", path)
 	}
 
@@ -332,4 +337,29 @@ func reownLock(path string, uid, gid int, mode os.FileMode) (bool, error) {
 	}
 
 	return changed, nil
+}
+
+// onDirectoryMount reports whether the open lock f lives on the mount of the
+// directory dir names, and not on a mount of its own (regularfile.Mount.Holds).
+// The directory is opened as the lock's own path resolved it, following a link
+// at its name, so both answers are about the directory the lock was opened in.
+func onDirectoryMount(f *os.File, dir string) (bool, error) {
+	d, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return false, fmt.Errorf("open its directory: %w", err)
+	}
+
+	defer func() { _ = d.Close() }()
+
+	dirMount, err := regularfile.MountOf(d)
+	if err != nil {
+		return false, err
+	}
+
+	lockMount, err := regularfile.MountOf(f)
+	if err != nil {
+		return false, err
+	}
+
+	return dirMount.Holds(lockMount), nil
 }

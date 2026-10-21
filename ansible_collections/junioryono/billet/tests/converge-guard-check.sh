@@ -1480,15 +1480,13 @@ cat >"$work/ns-lib.sh" <<'LIB'
 # Sourced inside the namespace by plant and post scripts: the tree at its real paths.
 ROOT=/var/lib/billet/upgrades
 plant_root() {
-  # The /var/lib overlay has a host lower and a tmpfs upper. Without xino,
-  # directories report the overlay's device and files the upper's, so real
-  # local prepare refuses even its own authority.lock before repairing it.
-  # Bind a whole tmpfs directory before planting anything. Cases that start
-  # without a root must still exercise the role's creation of its parent.
-  if [ ! -d "$MNT/billet" ]; then
-    mkdir -p "$MNT/billet" /var/lib/billet || return 1
-    mount --bind "$MNT/billet" /var/lib/billet || return 1
-  fi
+  # INSIDE THE /var/lib OVERLAY, whose lower is the host's disk and whose upper
+  # is a tmpfs: without xino a directory there reports the overlay's device and
+  # a file the upper's, the layout in which real local prepare once refused its
+  # own authority.lock (#123). It answers by mount now, and every case that
+  # plants a root runs it there. Cases that start without a root still
+  # exercise the role's creation of its parent.
+  mkdir -p /var/lib/billet || return 1
   chmod 0755 /var/lib/billet; chown root:root /var/lib/billet
   mkdir -p "$ROOT"; chmod 0700 "$ROOT"; chown root:root "$ROOT"
 }
@@ -1683,11 +1681,6 @@ PYFILES
 [ "$?" -eq 0 ] || exit 96
 [ -f /etc/billet/billet.yaml ] && cp /etc/billet/billet.yaml "$case_dir/installed.yaml"
 mkdir -p "$case_dir/upper" && cp -a "$MNT/ub-upper" "$case_dir/upper/usr-bin" 2>/dev/null; cp -a "$MNT/vl-upper" "$case_dir/upper/var-lib" 2>/dev/null
-# A planted root's contents live on the tmpfs bind, outside the overlay upper.
-if [ -d "$MNT/billet" ]; then
-  mkdir -p "$case_dir/upper/var-lib/billet" || exit 96
-  cp -a "$MNT/billet/." "$case_dir/upper/var-lib/billet/" || exit 96
-fi
 chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir" 2>/dev/null || true
 exit 0
 NSRUN

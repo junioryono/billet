@@ -935,6 +935,8 @@ jobs:
           sudo /usr/bin/python3 -c 'import jinja2'
           go test -c -o "$RUNNER_TEMP/lifeops.test" ./internal/lifeops
           go test -c -o "$RUNNER_TEMP/billet-command.test" ./internal/ops/host
+          go test -c -o "$RUNNER_TEMP/regularfile.test" ./internal/regularfile
+          go test -c -o "$RUNNER_TEMP/retirement.test" ./internal/retirement
           retirement_postgres=$(docker run -d --rm -p 127.0.0.1::5432 -e POSTGRES_USER=billet -e POSTGRES_PASSWORD=billet -e POSTGRES_DB=billet postgres:18-alpine)
           trap 'docker stop "$retirement_postgres" >/dev/null' EXIT
           retirement_postgres_ready=false
@@ -950,7 +952,12 @@ jobs:
             exit 1
           fi
           retirement_postgres_address=$(docker port "$retirement_postgres" 5432/tcp)
+          # The mount rule on the layouts it is for (#123): an overlay of two
+          # filesystems without xino, and single files bind-mounted onto a name.
+          (cd internal/regularfile && sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_REAL_MOUNTS=1 "$RUNNER_TEMP/regularfile.test" -test.count=1 -test.v -test.run '^TestRealMounts')
+          (cd internal/retirement && sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_REAL_MOUNTS=1 "$RUNNER_TEMP/retirement.test" -test.count=1 -test.v -test.run '^TestRealMounts')
           cd internal/lifeops
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_REAL_MOUNTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealMounts'
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^(TestRealSystemdRetirementOperationEffects|TestRealSystemdHostLockDirectoryOutlivesTheNodeStop)$'
           cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
