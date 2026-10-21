@@ -29,13 +29,14 @@ type Mount struct {
 // Holds reports whether entry lives on the mount dir is on. Where either side's
 // mount identity is unknown it is the device comparison, which is what billet
 // answered before statx reported a mount, so an old kernel is never more
-// permissive than before.
+// permissive than before. A side that observed nothing (the zero Mount: no
+// mounted filesystem has device 0) holds nothing and is held by nothing.
 func (dir Mount) Holds(entry Mount) bool {
 	if dir.Known && entry.Known {
 		return entry.ID == dir.ID
 	}
 
-	return entry.Dev == dir.Dev
+	return dir.Dev != 0 && entry.Dev == dir.Dev
 }
 
 // MountOf reports where an open descriptor lives.

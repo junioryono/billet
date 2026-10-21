@@ -10,30 +10,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// THE KERNELS BILLET RUNS ON REPORT A MOUNT IDENTITY (Linux 5.8 onwards), and a
-// file in a temporary directory is on that directory's mount by it.
-func TestLinuxReportsTheMountIdentity(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "lock")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-
-	m, err := MountOf(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !m.Known || m.ID == 0 {
-		t.Errorf("this kernel reported no mount identity: %+v", m)
-	}
-}
-
 // A KERNEL THAT DOES NOT FILL STATX_MNT_ID, OR HAS NO STATX AT ALL, is answered
 // with the device alone, which Holds then compares.
 func TestAKernelWithoutAMountIdentityAnswersWithTheDevice(t *testing.T) {

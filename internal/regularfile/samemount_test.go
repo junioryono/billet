@@ -24,6 +24,8 @@ func TestHoldsJudgesByMountWhereTheKernelSaysAndByDeviceOtherwise(t *testing.T) 
 		{"no mount identity for the entry: same device", dir, Mount{Dev: 64}, true},
 		{"no mount identity for the entry: another device", dir, Mount{Dev: 99, ID: 7}, false},
 		{"no mount identity for the directory", Mount{Dev: 64, ID: 7}, Mount{Dev: 99, Known: true, ID: 7}, false},
+		{"nothing observed on either side", Mount{}, Mount{}, false},
+		{"nothing observed for the directory", Mount{}, Mount{Dev: 64}, false},
 	} {
 		if got := tc.dir.Holds(tc.entry); got != tc.want {
 			t.Errorf("%s: Holds = %v, want %v", tc.name, got, tc.want)

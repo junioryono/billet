@@ -195,5 +195,11 @@ func holdsAt(t *testing.T, dir, path string) bool {
 
 	t.Logf("%s: directory %+v, entry %+v", path, dirMount, entry)
 
+	// THE MOUNT IDENTITY IS WHAT THESE LAYOUTS ARE ABOUT: a kernel that reports
+	// none answers by device, which is the rule this test proves wrong.
+	if !dirMount.Known || !entry.Known {
+		t.Fatalf("this kernel reported no mount identity for %s or its directory", path)
+	}
+
 	return dirMount.Holds(entry)
 }

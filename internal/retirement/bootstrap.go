@@ -270,7 +270,23 @@ func RepairLocks(acct ServiceAccount, innerLock string) ([]string, error) {
 }
 
 func reownLock(path string, uid, gid int, mode os.FileMode) (bool, error) {
-	f, err := openLockFile(path)
+	// THE LOCK IS OPENED IN THE DIRECTORY IT IS JUDGED AGAINST: relative to the
+	// held directory descriptor, never following a link at its name, so the
+	// mount comparison below is between this lock and the directory that holds
+	// it, not two resolutions of one pathname. The directory follows a link at
+	// its own name, as every other open of it does.
+	dir, err := os.OpenFile(filepath.Dir(path), os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("retirement: open %s's directory to repair its owner: %w", path, err)
+	}
+
+	defer func() { _ = dir.Close() }()
+
+	f, _, err := regularfile.OpenAt(dir, filepath.Base(path))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
@@ -308,7 +324,7 @@ func reownLock(path string, uid, gid int, mode os.FileMode) (bool, error) {
 			"whatever else names that inode; billet leaves it alone", path, st.Nlink)
 	}
 
-	held, err := onDirectoryMount(f, filepath.Dir(path))
+	held, err := onDirectoryMount(dir, f)
 	if err != nil {
 		return false, fmt.Errorf("retirement: %s: %w", path, err)
 	}
@@ -339,19 +355,10 @@ func reownLock(path string, uid, gid int, mode os.FileMode) (bool, error) {
 	return changed, nil
 }
 
-// onDirectoryMount reports whether the open lock f lives on the mount of the
-// directory dir names, and not on a mount of its own (regularfile.Mount.Holds).
-// The directory is opened as the lock's own path resolved it, following a link
-// at its name, so both answers are about the directory the lock was opened in.
-func onDirectoryMount(f *os.File, dir string) (bool, error) {
-	d, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY, 0)
-	if err != nil {
-		return false, fmt.Errorf("open its directory: %w", err)
-	}
-
-	defer func() { _ = d.Close() }()
-
-	dirMount, err := regularfile.MountOf(d)
+// onDirectoryMount reports whether the lock f, opened relative to dir, lives on
+// dir's mount rather than on a mount of its own (regularfile.Mount.Holds).
+func onDirectoryMount(dir, f *os.File) (bool, error) {
+	dirMount, err := regularfile.MountOf(dir)
 	if err != nil {
 		return false, err
 	}

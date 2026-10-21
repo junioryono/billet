@@ -2610,6 +2610,9 @@ func TestRepairServerStateRepairsAnOverlayFileWhoseDeviceDiffers(t *testing.T) {
 		"billet.db": &fstest.MapFile{Data: []byte("the ledger")},
 	}
 	ops.owners = map[string]uint32{".": 990, "billet.db": 0}
+	// THE STAT DISAGREES TOO, as the overlay's does, so the device comparison
+	// this replaced would refuse the ledger here.
+	ops.devices = map[string]uint64{".": 64, "billet.db": 99}
 	ops.mounts = map[string]regularfile.Mount{
 		".":         {Dev: 64, Known: true, ID: 7},
 		"billet.db": {Dev: 99, Known: true, ID: 7},
@@ -2622,6 +2625,10 @@ func TestRepairServerStateRepairsAnOverlayFileWhoseDeviceDiffers(t *testing.T) {
 
 	if len(repaired) != 1 || repaired[0] != "/var/lib/billet/server/billet.db" {
 		t.Errorf("repaired %v, want the ledger alone", repaired)
+	}
+
+	if kinds := ops.kinds(); len(kinds) != 1 || kinds[0] != "lchown billet.db" {
+		t.Errorf("the change made was %v, want the ledger given back", kinds)
 	}
 }
 
