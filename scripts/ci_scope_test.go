@@ -484,7 +484,7 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"scripts/power-summary.sh", "none"},
 		{"scripts/verify-changed.sh", "none"},
 		// The release scripts: test runs them against fixtures and release-config
-		// runs the resolver through make module-sources; cut-release.yml is not CI.
+		// runs the resolver through scripts/check-module-sources.sh; cut-release.yml is not CI.
 		{"scripts/release-ref.sh", "none"},
 		{"scripts/release-contents.sh", "none"},
 		{"scripts/plan-release.sh", "none"},

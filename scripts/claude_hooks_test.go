@@ -544,7 +544,7 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"scripts/gates/terraform.sh fmt validate", ""},
 		{"scripts/gates/dist.sh", ""},
 		{"sqlc diff", ""},
-		{"make check", ""},
+		{"scripts/gates/check.sh", ""},
 		{"bash -n scripts/gates/check.sh", ""},
 		{"cat scripts/gates/check.sh", ""},
 		{"/tmp/other/scripts/gates/check.sh", ""},

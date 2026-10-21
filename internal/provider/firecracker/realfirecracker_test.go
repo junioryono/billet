@@ -31,7 +31,7 @@ const selftestDeployment = "5e1f7e575e1f7e575e1f7e575e1f7e57"
 // AND THAT CONSTANT IS CHECKED WHERE THE REAL TESTS CANNOT BE.
 //
 // Everything below this needs root, /dev/kvm, a bridge and a ceph pool, so on every
-// machine CI and `make check` run on it skips — which makes a fixture constant that
+// machine CI and `scripts/gates/check.sh` run on it skips — which makes a fixture constant that
 // the production constructor refuses invisible for as long as nobody runs the
 // reference host.
 //

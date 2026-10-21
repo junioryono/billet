@@ -47,8 +47,8 @@ func toolVersions(t *testing.T) map[string]string {
 // the first time one is bumped, and the gate in CI and the same gate run by hand
 // then use two different tools. The copies that cannot read the file are held
 // equal to it here: release.yml, which builds release branches whose tree may
-// predate the file, the .golangci.yml comment that tells a person what to
-// install, and the skill's measured-facts line. Everything else reads the file.
+// predate the file, the .golangci.yml and sqlc.yaml comments that tell a person
+// what to install, and the skill's measured-facts line. Everything else reads the file.
 func TestEveryCopyOfAToolVersionIsThePin(t *testing.T) {
 	t.Parallel()
 
@@ -63,6 +63,7 @@ func TestEveryCopyOfAToolVersionIsThePin(t *testing.T) {
 			"# PINNED VERSION: " + v["GOLANGCI_VERSION"] + ",",
 			"golangci-lint@" + v["GOLANGCI_VERSION"] + "\n",
 		}},
+		{"sqlc.yaml", []string{"# PINNED at " + v["SQLC_VERSION"] + " "}},
 		{".claude/skills/billet-checks-and-lint/references/measured-facts.md", []string{
 			"golangci-lint " + v["GOLANGCI_VERSION"] + ", goreleaser " + v["GORELEASER_VERSION"] +
 				", sqlc " + v["SQLC_VERSION"] + ", tflint " + v["TFLINT_VERSION"] + ", trivy " + v["TRIVY_VERSION"],

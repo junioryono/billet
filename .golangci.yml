@@ -6,7 +6,7 @@
 # Do NOT silence a rule with a bare //nolint — nolintlint rejects that. Use
 # `//nolint:linter-name // reason` when an exception is genuinely justified.
 #
-# Run: make lint (both platforms, and it refuses a checkout path with glob
+# Run: scripts/gates/lint.sh (both platforms, and it refuses a checkout path with glob
 # syntax in it, which the depguard rules below would read as a pattern).
 #
 # PINNED VERSION: v2.12.2, as GOLANGCI_VERSION in .github/tool-versions.env,
@@ -804,7 +804,7 @@ linters:
   exclusions:
     generated: lax
     # A LINKED WORKTREE IS NOT THIS CHECKOUT'S SOURCE. Sessions park git
-    # worktrees under .claude/, so `make check` linted another branch's
+    # worktrees under .claude/, so `scripts/gates/check.sh` linted another branch's
     # in-progress code and failed on it — a gate failing for something the
     # committer cannot fix, and one CI never reproduces, because CI checks out
     # a clean tree. .gitignore excludes the same path for the same reason.

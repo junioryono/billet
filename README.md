@@ -119,7 +119,7 @@ Use one of these if it fits. [actions-runner-controller](https://github.com/acti
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). `make check` is the gate; the skills under `.claude/skills` are the project's written-down rules.
+See [CONTRIBUTING.md](CONTRIBUTING.md). `scripts/gates/check.sh` is the gate; the skills under `.claude/skills` are the project's written-down rules.
 
 ## License
 

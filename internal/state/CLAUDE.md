@@ -4,10 +4,10 @@ The control-plane ledger: SQLite or PostgreSQL behind one seam, the migrations, 
 
 - A write is `DB.Tx`, which begins IMMEDIATE and holds the single writer slot. An operation that only reads uses `DB.View`, never `DB.Tx`; a read that decides or validates a write stays inside that same `DB.Tx`, through `ReadQueries(tx)`, or the decision and its write come apart.
 - Production files reach no network, run no subprocess and import no upper layer: the `ledgerwriters` depguard rule refuses it, because a call inside a transaction holds the writer slot. Test files are exempt, and a second process that proves a lock belongs there.
-- A published migration is never edited, reformatting included: add the next dense version, as a SQLite file and its PostgreSQL twin, then run `make sqlc`.
+- A published migration is never edited, reformatting included: add the next dense version, as a SQLite file and its PostgreSQL twin, then run `sqlc generate`.
 - SQL lives only in `queries/*.sql`, and `ledgerdb/` is what sqlc generates from it; never edit `ledgerdb/`.
 - The claim's epoch is re-read inside every write transaction, and a lost claim stops the process, not only the write.
 
 A test that needs a throwaway SQLite ledger opens `ledgertest.Dir(t)`, a fresh directory seeded from a template migrated once; a test about migrating itself opens an empty one. A test outside this package that needs a controller replaced stages the successor's claim with `ledgertest.StageSuccessor` through an operator handle, which is how a test reaches the epoch fence without importing `ledgerdb`.
 
-Gates (CI runs them on every push; locally, `make verify`): `make check`; `make sqlc-check` after a query or migration; `BILLET_TEST_POSTGRES_DSN` to run the PostgreSQL suite.
+Gates (CI runs them on every push; locally, `scripts/gates/verify.sh`): `scripts/gates/check.sh`; `sqlc diff` after a query or migration; `BILLET_TEST_POSTGRES_DSN` to run the PostgreSQL suite.

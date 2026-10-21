@@ -251,7 +251,7 @@ func TestVerifyChecksTheChangedPackagesAndNothingElse(t *testing.T) {
 		t.Parallel()
 
 		dir, bin := verifyFixture(t)
-		hookWrite(t, dir, "e/CLAUDE.md", "Gates: make verify.\n")
+		hookWrite(t, dir, "e/CLAUDE.md", "Gates: scripts/gates/verify.sh.\n")
 
 		code, out := runVerify(t, dir, bin)
 		wantVerify(t, out, code, 0, "changed paths: 1", "every check that ran passed")

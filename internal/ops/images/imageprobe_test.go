@@ -160,7 +160,7 @@ func TestANodeSweepIgnoresAProbeJailWithoutFailingItsInventory(t *testing.T) {
 // cannot be asserted from here, and the reason is measured rather than assumed: on
 // this platform Destroy gets past the ownership check and then fails needing `ip`
 // and /proc/mounts, whose injection seams are private to the provider's package. A
-// test for it would skip on every machine `make check` runs on, which is exactly
+// test for it would skip on every machine `scripts/gates/check.sh` runs on, which is exactly
 // the drift that left "billet-selftest" refused for a release. The firecracker
 // package owns that direction.
 func TestTheNodeCannotDestroyTheProbeItMustNotSweep(t *testing.T) {

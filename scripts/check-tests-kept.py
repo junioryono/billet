@@ -12,7 +12,7 @@ cheap to confirm and a deletion is expensive to miss.
 
 Run it before committing any scripted edit to a _test.go file:
 
-    make tests-kept
+    python3 scripts/check-tests-kept.py
 
 Usage: python3 scripts/check-tests-kept.py [<path>...]  (default: every _test.go)
 """

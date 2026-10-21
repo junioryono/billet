@@ -55,9 +55,9 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 ## Checklists
 
-**Adding a migration.** Add the SQLite file and its PostgreSQL twin with the next dense version, never edit a published one (`migrationsAreFrozen` holds every sum; revert the file, never the table), run `make sqlc`, and take the new columns back in the rewind tests in `state_test.go`.
+**Adding a migration.** Add the SQLite file and its PostgreSQL twin with the next dense version, never edit a published one (`migrationsAreFrozen` holds every sum; revert the file, never the table), run `sqlc generate`, and take the new columns back in the rewind tests in `state_test.go`.
 
-**Adding a query.** Put it in `internal/state/queries/*.sql` (ASCII only, no `SELECT *`, integer casts as `BIGINT`), run `make sqlc`, and bind it in exactly one of `ReadOps` or `WriteOps`; `TestEveryGeneratedQueryPreparesAgainstTheMigratedSchema` proves it fits the schema.
+**Adding a query.** Put it in `internal/state/queries/*.sql` (ASCII only, no `SELECT *`, integer casts as `BIGINT`), run `sqlc generate`, and bind it in exactly one of `ReadOps` or `WriteOps`; `TestEveryGeneratedQueryPreparesAgainstTheMigratedSchema` proves it fits the schema.
 
 **A read.** Use `DB.View`, never `DB.Tx`, which takes the single writer slot.
 
