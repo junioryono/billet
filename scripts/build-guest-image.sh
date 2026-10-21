@@ -408,7 +408,10 @@ trial_completion() {
 	TRIAL_DIR=""
 	rm -rf "$dir"
 
+	# READABLE BY THE WORKFLOW'S OWN USER, which writes the manifest from it after
+	# this, run as root, returns, whatever umask the build inherited.
 	printf '%s\n' "$components" >"$WORK/components.json.tmp"
+	chmod 0644 "$WORK/components.json.tmp"
 	mv "$WORK/components.json.tmp" "$WORK/components.json"
 }
 
