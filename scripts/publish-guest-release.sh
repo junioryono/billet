@@ -73,6 +73,15 @@ for file in manifest.sigstore.json release-notes.md image-sources.tsv; do
     fi
 done
 
+# THE SOURCE MANIFEST BEGINS WITH ITS HEADER AND NAMES AT LEAST ONE PACKAGE. The
+# gate compared this copy with the image's own; this refuses an empty or a
+# truncated file handed over in its place.
+if [ "$(head -n 1 "$out/image-sources.tsv")" != "$(printf 'package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense')" ] ||
+    [ "$(wc -l <"$out/image-sources.tsv")" -lt 2 ]; then
+    printf 'the publication'"'"'s image-sources.tsv is not a source manifest naming a package, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+
 set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv"
 
 while read -r name want; do

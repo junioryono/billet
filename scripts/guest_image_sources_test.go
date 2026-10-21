@@ -106,6 +106,10 @@ func TestTheSourceManifestDescribesEveryInstalledPackage(t *testing.T) {
 		{"bash", "amd64", "5.2.21-2ubuntu4", "bash", "5.2.21-2ubuntu4", [][2]string{ubuntu, dpkg}, true},
 		{"libc6", "i386", "2.39-0ubuntu8.6", "glibc", "2.39-0ubuntu8.6", [][2]string{ubuntu, {"security.ubuntu.com", "noble-security"}, dpkg}, true},
 		{"jq", "amd64", "1.7.1-3build1", "jq", "1.7.1-3build1", [][2]string{ubuntu, dpkg}, true},
+		{"libfoo1", "amd64", "1.2-1build1", "foo", "1.2-1", [][2]string{ubuntu, dpkg}, true},
+		{"prose", "amd64", "1.0", "prose", "1.0", [][2]string{ubuntu, dpkg}, true},
+		{"wrapped", "amd64", "1.0", "wrapped", "1.0", [][2]string{ubuntu, dpkg}, true},
+		{"versioned", "amd64", "1.0", "versioned", "1.0", [][2]string{ubuntu, dpkg}, true},
 		{"undocumented", "all", "1.0", "undocumented", "1.0", [][2]string{ubuntu, dpkg}, true},
 		{"removed", "amd64", "1.0", "removed", "1.0", [][2]string{ubuntu}, false},
 	}
@@ -114,6 +118,12 @@ func TestTheSourceManifestDescribesEveryInstalledPackage(t *testing.T) {
 		"bash":  "This is free software, under the GNU General Public License, version 3 or later.\n",
 		"libc6": "On Debian systems the full text is in /usr/share/common-licenses/LGPL-2.1.\n",
 		"jq":    "Files: *\nLicense: MIT\n",
+		// THE COUNTEREXAMPLES a License:-field rule misses: a short name in
+		// prose, a title wrapped across lines, and a version run into the name.
+		"libfoo1":   "Files: *\nLicense: BSD-3-clause\n",
+		"prose":     "Copyright 2020 Someone.\nLicensed under GPL-2.0-only.\n",
+		"wrapped":   "Licensed under the GNU General Public\nLicense, version 2.\n",
+		"versioned": "This program is GPLv2.\n",
 	}
 
 	table, out, ok := runSourceManifest(t, packages, docs)
@@ -126,7 +136,11 @@ func TestTheSourceManifestDescribesEveryInstalledPackage(t *testing.T) {
 		"git\tamd64\t1:2.55.0-0ppa1~ubuntu24.04.2\tgit\t1:2.55.0-0ppa1~ubuntu24.04.2\tnone\tgnu",
 		"jq\tamd64\t1.7.1-3build1\tjq\t1.7.1-3build1\tarchive.ubuntu.com\tother",
 		"libc6\ti386\t2.39-0ubuntu8.6\tglibc\t2.39-0ubuntu8.6\tarchive.ubuntu.com,security.ubuntu.com\tgnu",
+		"libfoo1\tamd64\t1.2-1build1\tfoo\t1.2-1\tarchive.ubuntu.com\tother",
+		"prose\tamd64\t1.0\tprose\t1.0\tarchive.ubuntu.com\tgnu",
 		"undocumented\tall\t1.0\tundocumented\t1.0\tarchive.ubuntu.com\tunclassified",
+		"versioned\tamd64\t1.0\tversioned\t1.0\tarchive.ubuntu.com\tgnu",
+		"wrapped\tamd64\t1.0\twrapped\t1.0\tarchive.ubuntu.com\tgnu",
 	}, "\n") + "\n"
 	if table != want {
 		t.Fatalf("the source manifest is\n%s\nwant\n%s", table, want)
@@ -161,46 +175,57 @@ func TestTheSourceManifestRefusesWhatItCannotWrite(t *testing.T) {
 	}
 }
 
-// sourcesRoot writes an image root whose dpkg status records three packages as
-// installed and one with only its configuration left, and whose source manifest
-// lists the three.
+// sourcesRoot writes an image root whose dpkg status records four packages as
+// installed, one of them written with the freedoms dpkg's parser allows (a field
+// name in another case, a tab after the colon, trailing space) and two built from
+// a source of another name, one at another version; one with only its
+// configuration left; and a source manifest listing the four.
 func sourcesRoot(t *testing.T) string {
 	t.Helper()
 
 	root := t.TempDir()
-	writeTreeFile(t, root, "var/lib/dpkg/status", `Package: bash
-Status: install ok installed
-Architecture: amd64
-Version: 5.2.21-2ubuntu4
-
-Package: git
-Status: install ok installed
-Priority: optional
-Architecture: amd64
-Version: 1:2.55.0-0ppa1~ubuntu24.04.2
-
-Package: jq
-Status: install ok installed
-Architecture: amd64
-Version: 1.7.1-3build1
-
-Package: purged
-Status: deinstall ok config-files
-Architecture: amd64
-Version: 1.0
-`)
+	writeTreeFile(t, root, "var/lib/dpkg/status", "Package: bash\n"+
+		"Status: install ok installed\n"+
+		"Architecture: amd64\n"+
+		"Version: 5.2.21-2ubuntu4\n"+
+		"Description: GNU Bourne Again SHell\n"+
+		" Package: not-a-package\n"+
+		"\n"+
+		"Package: git\n"+
+		"status:\tinstall ok installed  \n"+
+		"Priority: optional\n"+
+		"architecture: amd64\n"+
+		"Version: 1:2.55.0-0ppa1~ubuntu24.04.2\n"+
+		"\n"+
+		"Package: libc6\n"+
+		"Status: hold ok installed\n"+
+		"Architecture: amd64\n"+
+		"Source: glibc\n"+
+		"Version: 2.39-0ubuntu8.6\n"+
+		"\n"+
+		"Package: libfoo1\n"+
+		"Status: install ok installed\n"+
+		"Architecture: amd64\n"+
+		"Source: foo (1.2-1)\n"+
+		"Version: 1.2-1build1\n"+
+		"\n"+
+		"Package: purged\n"+
+		"Status: deinstall ok config-files\n"+
+		"Architecture: amd64\n"+
+		"Version: 1.0\n")
 	writeTreeFile(t, root, "opt/billet/IMAGE_SOURCES.tsv", strings.Join([]string{
 		"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense",
 		"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu",
 		"git\tamd64\t1:2.55.0-0ppa1~ubuntu24.04.2\tgit\t1:2.55.0-0ppa1~ubuntu24.04.2\tnone\tgnu",
-		"jq\tamd64\t1.7.1-3build1\tjq\t1.7.1-3build1\tarchive.ubuntu.com\tother",
+		"libc6\tamd64\t2.39-0ubuntu8.6\tglibc\t2.39-0ubuntu8.6\tarchive.ubuntu.com\tgnu",
+		"libfoo1\tamd64\t1.2-1build1\tfoo\t1.2-1\tarchive.ubuntu.com\tother",
 	}, "\n")+"\n")
 
 	return root
 }
 
 // sourcesGate runs the gate's check_image_sources against ROOT.
-func sourcesGate(t *testing.T, root string) (string, string) {
+func sourcesGate(t *testing.T, root string, env ...string) (string, string) {
 	t.Helper()
 
 	here, err := os.Getwd()
@@ -218,7 +243,9 @@ func sourcesGate(t *testing.T, root string) (string, string) {
 	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.CommandContext(t.Context(), "bash", path, root).CombinedOutput()
+	cmd := exec.CommandContext(t.Context(), "bash", path, root)
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("the check did not run to its verdict: %v\n%s", err, out)
 	}
@@ -241,8 +268,25 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 	}
 
 	out, failed := sourcesGate(t, sourcesRoot(t))
-	if failed != "0" || !strings.Contains(out, "(3), 2 under a GNU license, 1 of those from no source apt still names") {
+	if failed != "0" || !strings.Contains(out, "(4), 3 under a GNU license, 1 of those from no source apt still names") {
 		t.Fatalf("a manifest listing exactly what was installed failed, or miscounted:\n%s", out)
+	}
+
+	// THE COPY THE RELEASE CARRIES IS THE IMAGE'S OWN.
+	root := sourcesRoot(t)
+	export := filepath.Join(t.TempDir(), "image-sources.tsv")
+	body, err := os.ReadFile(filepath.Join(root, "opt", "billet", "IMAGE_SOURCES.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTreeFile(t, filepath.Dir(export), "image-sources.tsv", string(body))
+	if out, failed := sourcesGate(t, root, "SOURCES_EXPORT="+export); failed != "0" {
+		t.Errorf("the image's own manifest, exported, failed:\n%s", out)
+	}
+	writeTreeFile(t, filepath.Dir(export), "image-sources.tsv", strings.SplitN(string(body), "\n", 2)[0]+"\n")
+	if out, failed := sourcesGate(t, root, "SOURCES_EXPORT="+export); failed != "1" ||
+		!strings.Contains(out, "is not the image's /opt/billet/IMAGE_SOURCES.tsv") {
+		t.Errorf("an exported manifest that is not the image's passed:\n%s", out)
 	}
 
 	edit := func(old, new string) func(t *testing.T, root string) {
@@ -267,12 +311,35 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 		{"no manifest", func(t *testing.T, root string) {
 			removeAll(t, filepath.Join(root, "opt", "billet", "IMAGE_SOURCES.tsv"))
 		}, "has no /opt/billet/IMAGE_SOURCES.tsv"},
-		{"a package left out", edit("jq\tamd64\t1.7.1-3build1\tjq\t1.7.1-3build1\tarchive.ubuntu.com\tother\n", ""), "does not list exactly what dpkg installed"},
-		{"a package the image no longer has", edit("jq\t", "purged\tamd64\t1.0\tpurged\t1.0\tarchive.ubuntu.com\tother\njq\t"), "does not list exactly what dpkg installed"},
-		{"another version", edit("1.7.1-3build1\tjq", "1.7.1-3\tjq"), "does not list exactly what dpkg installed"},
-		{"a license the gate does not know", edit("archive.ubuntu.com\tother", "archive.ubuntu.com\tmit"), "malformed rows (lines 4 )"},
+		{"a package left out", edit("libfoo1\tamd64\t1.2-1build1\tfoo\t1.2-1\tarchive.ubuntu.com\tother\n", ""), "does not list exactly what dpkg installed"},
+		// git's stanza is the one in dpkg's freer formatting.
+		{"the package in dpkg's freer formatting left out", edit("git\tamd64\t1:2.55.0-0ppa1~ubuntu24.04.2\tgit\t1:2.55.0-0ppa1~ubuntu24.04.2\tnone\tgnu\n", ""), "does not list exactly what dpkg installed"},
+		{"a package the image no longer has", edit("libfoo1\t", "purged\tamd64\t1.0\tpurged\t1.0\tarchive.ubuntu.com\tother\nlibfoo1\t"), "does not list exactly what dpkg installed"},
+		{"another version", edit("1.2-1build1\tfoo", "1.2-1\tfoo"), "does not list exactly what dpkg installed"},
+		{"another architecture", edit("libc6\tamd64", "libc6\ti386"), "does not list exactly what dpkg installed"},
+		{"another source", edit("\tglibc\t", "\tlibc6\t"), "does not list exactly what dpkg installed"},
+		{"the binary's version as the source's", edit("\tfoo\t1.2-1\t", "\tfoo\t1.2-1build1\t"), "does not list exactly what dpkg installed"},
+		{"a license the gate does not know", edit("archive.ubuntu.com\tother", "archive.ubuntu.com\tmit"), "malformed rows (lines 5 )"},
 		{"a row missing its origin", edit("\tnone\tgnu", "\t\tgnu"), "malformed rows (lines 3 )"},
+		{"a row missing its source", edit("\tfoo\t1.2-1\t", "\t\t\t"), "malformed rows (lines 5 )"},
 		{"another header", edit("package\t", "name\t"), "does not begin with its header"},
+		{"a package dpkg did not finish", func(t *testing.T, root string) {
+			path := filepath.Join(root, "var", "lib", "dpkg", "status")
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTreeFile(t, root, "var/lib/dpkg/status",
+				string(body)+"\nPackage: unfinished\nStatus: install ok half-configured\nArchitecture: amd64\nVersion: 1.0\n")
+		}, "records it cannot publish: unfinished (install ok half-configured)"},
+		{"a record with no status", func(t *testing.T, root string) {
+			path := filepath.Join(root, "var", "lib", "dpkg", "status")
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTreeFile(t, root, "var/lib/dpkg/status", string(body)+"\nPackage: nameless\nVersion: 1.0\n")
+		}, "records it cannot publish: record 6"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -315,9 +382,24 @@ func TestTheBuildWritesTheSourceManifestBeforeTheListsGo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"cp \"$WORK/image-sources.tsv\" out/image-sources.tsv", "out/image-sources.tsv\n"} {
-		if !strings.Contains(string(workflow), want) {
-			t.Errorf("guest-image.yml does not carry the source manifest to the release (%q)", want)
+	step := func(name string) string {
+		t.Helper()
+		_, after, found := strings.Cut(string(workflow), "\n      - name: "+name+"\n")
+		if !found {
+			t.Fatalf("guest-image.yml has no step %q", name)
 		}
+		body, _, _ := strings.Cut(after, "\n      - name: ")
+
+		return body
+	}
+	if !strings.Contains(step("Pack and describe"), "\n          cp \"$WORK/image-sources.tsv\" out/image-sources.tsv\n") {
+		t.Error("guest-image.yml's pack step does not put the source manifest in out/")
+	}
+	if !strings.Contains(step("Upload the checked image"), "\n            out/image-sources.tsv\n") {
+		t.Error("guest-image.yml's upload does not carry out/image-sources.tsv to the publish job")
+	}
+	if !strings.Contains(step("Check the image is fit to publish"),
+		`sudo SOURCES_EXPORT="${{ github.workspace }}/out/image-sources.tsv" \`) {
+		t.Error("guest-image.yml's gate does not hold the exported source manifest to the image's")
 	}
 }

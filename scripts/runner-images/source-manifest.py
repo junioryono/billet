@@ -26,14 +26,16 @@ import sys
 
 COLUMNS = ("package", "architecture", "version", "source", "source_version", "origin", "license")
 
-# WHAT NAMES A GNU LICENSE IN A COPYRIGHT FILE: a DEP-5 License: field naming one
-# (GPL-2+, LGPL-2.1, AGPL-3 and the like), the license's own title, or the path
-# Debian points at instead of reproducing it.
+# WHAT NAMES A GNU LICENSE IN A COPYRIGHT FILE, anywhere in it: the short name
+# (GPL-2+, LGPL-2.1-or-later, AGPL-3, GPL v2 and the like, in a DEP-5 License:
+# field or in prose), the license's own title however its words are wrapped, or the
+# path Debian points at instead of reproducing it. It errs towards naming a
+# package GNU: a false `gnu` costs a source lookup, a false `other` hides one.
 GNU = re.compile(
-    r"^License:\s*.*\b(A|L)?GPL"
-    r"|GNU (Affero |Lesser |Library )?General Public License"
+    r"\b(A|L)?GPL(v?[0-9]|\b)"
+    r"|GNU\s+(Affero\s+|Lesser\s+|Library\s+)?General\s+Public\s+License"
     r"|/usr/share/common-licenses/(L?GPL|AGPL)",
-    re.MULTILINE | re.IGNORECASE,
+    re.IGNORECASE,
 )
 
 

@@ -251,7 +251,8 @@ func publishDir(t *testing.T, manifest string, assets ...string) string {
 		"manifest.json":          manifest,
 		"manifest.sigstore.json": "{}",
 		"release-notes.md":       "notes",
-		"image-sources.tsv":      "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n",
+		"image-sources.tsv": "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n" +
+			"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
@@ -338,6 +339,19 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			wantSuccess: false,
 		},
 		{
+			name: "an empty source manifest stops the publish before the tag",
+			dir: replaced(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv", ""),
+			wantSuccess: false,
+		},
+		{
+			name: "a source manifest naming no package stops the publish before the tag",
+			dir: replaced(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"),
+			wantSuccess: false,
+		},
+		{
 			name: "no signature bundle stops the publish before the tag",
 			dir: without(t, publishDir(t, multipart,
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "manifest.sigstore.json"),
@@ -419,6 +433,17 @@ func swapped(t *testing.T, dir, a, b string) string {
 		if err := os.Rename(filepath.Join(dir, move[0]), filepath.Join(dir, move[1])); err != nil {
 			t.Fatalf("swap %s and %s: %v", a, b, err)
 		}
+	}
+
+	return dir
+}
+
+// replaced rewrites one file of a publication directory with BODY.
+func replaced(t *testing.T, dir, name, body string) string {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+		t.Fatalf("rewrite %s: %v", name, err)
 	}
 
 	return dir

@@ -408,7 +408,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo scripts/check-guest-image.sh \
+          # SOURCES_EXPORT: the copy of the image's source manifest the release
+          # carries, which the gate holds to the image's own byte for byte.
+          sudo SOURCES_EXPORT="${{ github.workspace }}/out/image-sources.tsv" \
+            scripts/check-guest-image.sh \
             "$WORK/$IMAGE_NAME.ext4" \
             "${{ github.workspace }}/out/manifest.json"
 

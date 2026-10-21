@@ -616,13 +616,16 @@ SOURCES_HEADER=$'package\tarchitecture\tversion\tsource\tsource_version\torigin\
 # check_image_sources passes or fails the gate on the image mounted at $1 carrying
 # /opt/billet/IMAGE_SOURCES.tsv, the source manifest of what it installed with
 # apt (#584), with one well-formed row for exactly each package dpkg records as
-# installed, at the version installed: a manifest that misses a package, or names
-# one the image no longer has, does not describe what is published. It reports how
-# many are under a GNU license and how many of those apt could fetch from no
-# source the image still names, which is what a release has to carry the source
-# of itself.
+# installed, at the version installed and built from the source dpkg names: a
+# manifest that misses a package, or names one the image no longer has, does not
+# describe what is published. A package dpkg did not finish installing or
+# removing fails the gate whatever the manifest says. When SOURCES_EXPORT names a
+# file, it must be this manifest byte for byte: it is the copy the release
+# carries. The pass line counts the packages under a GNU license, and how many of
+# those apt could fetch from no source the image still names, which is what a
+# release has to carry the source of itself.
 check_image_sources() {
-	local sources installed listed malformed status=0 gnu unfetchable
+	local sources records installed listed unfinished malformed status=0 gnu unfetchable
 
 	image_text_file "$1" /opt/billet/IMAGE_SOURCES.tsv || status=$?
 	case "$status" in
@@ -640,13 +643,17 @@ check_image_sources() {
 		fail "could not read the image's dpkg status, so its source manifest cannot be checked"
 		return
 	fi
+	if [ -n "${SOURCES_EXPORT:-}" ] && ! cmp -s "$sources" "$SOURCES_EXPORT"; then
+		fail "$SOURCES_EXPORT, which the release carries, is not the image's /opt/billet/IMAGE_SOURCES.tsv"
+		return
+	fi
 
 	if [ "$(head -n 1 "$sources")" != "$SOURCES_HEADER" ]; then
 		fail "/opt/billet/IMAGE_SOURCES.tsv does not begin with its header ($SOURCES_HEADER)"
 		return
 	fi
-	malformed=$(awk -F '\t' 'NR > 1 && (NF != 7 || $6 == "" || ($7 != "gnu" && $7 != "other" && $7 != "unclassified")) { print NR }' \
-		"$sources") || status=$?
+	malformed=$(awk -F '\t' 'NR > 1 && (NF != 7 || $1 == "" || $2 == "" || $3 == "" || $4 == "" || $5 == "" || $6 == "" ||
+		($7 != "gnu" && $7 != "other" && $7 != "unclassified")) { print NR }' "$sources") || status=$?
 	if [ "$status" -ne 0 ]; then
 		fail "could not read /opt/billet/IMAGE_SOURCES.tsv (status $status)"
 		return
@@ -656,22 +663,50 @@ check_image_sources() {
 		return
 	fi
 
-	# WHAT dpkg RECORDS AS INSTALLED, read from the image's own status file, so
-	# the comparison needs no dpkg on the machine running the gate.
-	installed=$(awk 'BEGIN { RS = ""; FS = "\n" }
+	# WHAT dpkg RECORDS, read from the image's own status file as dpkg reads it,
+	# so the comparison needs no dpkg on the machine running the gate: a field's
+	# name in any case, its value with the space around it trimmed, continuation
+	# lines skipped. A package's source is its Source field, `name` or `name
+	# (version)`, defaulting to the package and its version. A record with no
+	# package or status is `?`; one dpkg did not finish is `!`.
+	records=$(awk 'BEGIN { RS = ""; FS = "\n" }
 		{
-			p = a = v = s = ""
+			split("", f)
 			for (i = 1; i <= NF; i++) {
-				if ($i ~ /^Package: /) p = substr($i, 10)
-				else if ($i ~ /^Architecture: /) a = substr($i, 15)
-				else if ($i ~ /^Version: /) v = substr($i, 10)
-				else if ($i ~ /^Status: /) s = substr($i, 9)
+				if ($i ~ /^[ \t]/) continue
+				n = index($i, ":")
+				if (n == 0) continue
+				v = substr($i, n + 1)
+				gsub(/^[ \t]+|[ \t]+$/, "", v)
+				f[tolower(substr($i, 1, n - 1))] = v
 			}
-			if (s ~ / ok installed$/) print p "\t" a "\t" v
-		}' "$1$(image_resolve "$1" /var/lib/dpkg/status)" | LC_ALL=C sort) || status=$?
-	listed=$(awk -F '\t' 'NR > 1 { print $1 "\t" $2 "\t" $3 }' "$sources" | LC_ALL=C sort) || status=$?
-	if [ "$status" -ne 0 ] || [ -z "$installed" ]; then
+			if (f["package"] == "" || f["status"] == "") { print "?\trecord " NR; next }
+			split(f["status"], st, /[ \t]+/)
+			if (st[3] == "not-installed" || st[3] == "config-files") next
+			if (st[2] != "ok" || st[3] != "installed") { print "!\t" f["package"] " (" f["status"] ")"; next }
+			src = f["source"]
+			sv = f["version"]
+			if (src == "") src = f["package"]
+			else if (match(src, /\(.*\)/)) {
+				sv = substr(src, RSTART + 1, RLENGTH - 2)
+				src = substr(src, 1, RSTART - 1)
+				gsub(/[ \t]+$/, "", src)
+			}
+			print f["package"] "\t" f["architecture"] "\t" f["version"] "\t" src "\t" sv
+		}' "$1$(image_resolve "$1" /var/lib/dpkg/status)") || status=$?
+	if [ "$status" -ne 0 ] || [ -z "$records" ]; then
 		fail "could not list what the image installed with apt (status $status)"
+		return
+	fi
+	unfinished=$(awk -F '\t' '$1 == "?" || $1 == "!" { print $2 }' <<<"$records")
+	if [ -n "$unfinished" ]; then
+		fail "the image's dpkg status has records it cannot publish: $(tr '\n' ';' <<<"$unfinished")"
+		return
+	fi
+	installed=$(LC_ALL=C sort <<<"$records")
+	listed=$(awk -F '\t' 'NR > 1 { print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 }' "$sources" | LC_ALL=C sort) || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "could not read /opt/billet/IMAGE_SOURCES.tsv (status $status)"
 		return
 	fi
 	if [ "$installed" != "$listed" ]; then
