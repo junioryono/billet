@@ -757,6 +757,7 @@ def shell_invocation(words):
     through a redirection is not seen: the redirection is gone before this
     reads the words."""
     command = noexec = stdin = False
+    bash = os.path.basename(words[0]) == "bash"
     i = 1
     while i < len(words):
         w = words[i]
@@ -776,10 +777,13 @@ def shell_invocation(words):
                 if letter == "n":
                     noexec = on
                 elif letter == "c":
-                    # +c and +s act as -c and -s (bash 5.2.21, measured 2026-10-21).
+                    # +c is -c in bash, zsh and dash; +s reads standard input in
+                    # bash alone, and zsh and dash run the script (measured on
+                    # macOS and Ubuntu 24.04, 2026-10-21). sh is bash on macOS and
+                    # dash on Linux, so it is read as dash, which runs the script.
                     command = True
                 elif letter == "s":
-                    stdin = True
+                    stdin = True if bash else on
                 elif letter in "oO":
                     value = words[i + 1 + values] if i + 1 + values < len(words) else ""
                     if letter == "o" and value == "noexec":
@@ -799,10 +803,10 @@ def shell_invocation(words):
 def judge_gate_script(words, cwd):
     path = words[0]
     if path in (".", "source"):
-        # Sourced, the gate runs in this shell. A name without a slash is searched
-        # for in PATH (in -p's directories instead, bash 5.3) and then in the
-        # current directory, so each place it could be found is asked. A PATH the
-        # command line itself sets is not seen.
+        # Sourced, the gate runs in this shell. A name without a slash is the first
+        # readable file found in PATH (in -p's directories instead, bash 5.3), or
+        # else the one in the current directory. A PATH the command line itself
+        # sets is not seen.
         args, search = words[1:], None
         while args and args[0].startswith("-") and args[0] != "-":
             if args[0] == "--":
@@ -818,13 +822,11 @@ def judge_gate_script(words, cwd):
             return
         path = args[0]
         if "/" not in path:
-            dirs = (os.environ.get("PATH", "") if search is None else search).split(":")
-            for d in dirs + [cwd]:
-                name = full_gate_script(os.path.join(d or ".", path), cwd)
-                if name:
-                    refuse(f"billet hook: `scripts/gates/{name}` is a full gate, which CI runs on every push. "
-                           f"{GATE_ADVICE}")
-            return
+            for d in (os.environ.get("PATH", "") if search is None else search).split(":"):
+                found = os.path.join(cwd, d or ".", path)
+                if os.path.isfile(found) and os.access(found, os.R_OK):
+                    path = found
+                    break
     elif os.path.basename(path) in SHELLS:
         # A shell runs a script named without a slash from its own directory.
         mode, path = shell_invocation(words)
