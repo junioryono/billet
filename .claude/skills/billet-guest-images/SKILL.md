@@ -28,6 +28,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The kernel and the filesystem are a matched pair.**
 - **The kernel gate's verdict is its exit status, and billet's own rule is the artifact-level claim.**
 - **The gate refuses an image that carries any of the five, and one without its completer or a manifest that declares them (#584).**
+- **The gate refuses an image that ships a tool without the license text the tool's license asks for (#584).**
 - **Two halves of a gate before an image is published.**
 
 ### Publication, verification and pulling: [references/publication-and-pull.md](references/publication-and-pull.md)

@@ -198,6 +198,107 @@ install_container_hook() {
 	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"
 }
 
+# NOTICE_VERSION is the shape of a version this build puts into a license's URL: a
+# toolcache directory the template's installer named, read back from the image.
+NOTICE_VERSION='^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$'
+
+# fetch_license downloads the license at URL to DEST, and fails when it cannot or
+# what arrived is empty.
+fetch_license() {
+	curl -fsSL --http1.1 \
+		--connect-timeout 20 --max-time 120 \
+		--retry 5 --retry-delay 5 --retry-all-errors \
+		-o "$2" "$1" && [ -s "$2" ] && chmod 0644 "$2"
+}
+
+# notice_entry appends to NOTICES the entry for one tool: its name and version, its
+# license, and where the license's text is in the image.
+notice_entry() {
+	printf '%s\n  License: %s\n  Text: %s\n\n' "$2" "$3" "$4" >>"$1"
+}
+
+# install_image_notices completes the notices of the tools the template installs
+# outside apt under a license that asks for its text with every copy (#584), and
+# writes /opt/billet/IMAGE_NOTICES, which names each one and where its license is.
+# A package installed with apt carries its own under /usr/share/doc.
+#
+# THE TWO GITHUB TOOLS ARRIVE WITHOUT THEIR LICENSES: the Copilot CLI's tarball
+# holds only the binary, and the firewall's release asset only the bundle. Each
+# license is fetched from the tag of the version installed, read back from the
+# directory the template's installer made, and lands beside the tool. Miniconda's
+# installer and Packer's zip place their own, and one missing fails the build.
+install_image_notices() {
+	local rootfs=$1 dir path version
+	local tools="$rootfs$TOOLCACHE_DIR" notices="$rootfs/opt/billet/IMAGE_NOTICES"
+	install -d -m 0755 "$rootfs/opt/billet"
+	cat >"$notices" <<'NOTICES'
+Notices for the billet guest image
+
+This image is based on Ubuntu 24.04. billet builds it by running GitHub's actions/runner-images template on that base; neither Canonical nor GitHub publishes it.
+
+Every package installed with apt carries its copyright and license in /usr/share/doc/<package>/copyright. billet's own third-party notices are in /opt/billet/THIRD_PARTY_NOTICES, and the container hook's in /usr/local/lib/billet/container-hook/.
+
+These tools are installed outside apt, under licenses that ask for their text with every copy:
+
+NOTICES
+
+	for dir in "$tools"/copilot-cli/*/*/; do
+		[ -x "${dir}bin/copilot" ] || continue
+		version=${dir#"$tools/copilot-cli/"}
+		version=${version%%/*}
+		if ! [[ $version =~ $NOTICE_VERSION ]]; then
+			echo "the toolcache holds the GitHub Copilot CLI as $version, which this build will not put in a URL" >&2
+			exit 1
+		fi
+		if ! fetch_license "https://raw.githubusercontent.com/github/copilot-cli/v$version/LICENSE.md" "${dir}LICENSE.md"; then
+			echo "could not fetch the license of the GitHub Copilot CLI $version, which must travel with it" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "GitHub Copilot CLI $version" "GitHub Copilot CLI License" "${dir#"$rootfs"}LICENSE.md"
+	done
+
+	for path in "$tools"/agentic-workflow-firewall-js/*/*/awf-bundle.js; do
+		[ -f "$path" ] || continue
+		dir=${path%/awf-bundle.js}
+		version=${dir#"$tools/agentic-workflow-firewall-js/"}
+		version=${version%%/*}
+		if ! [[ $version =~ $NOTICE_VERSION ]]; then
+			echo "the toolcache holds the agentic workflow firewall as $version, which this build will not put in a URL" >&2
+			exit 1
+		fi
+		if ! fetch_license "https://raw.githubusercontent.com/github/gh-aw-firewall/v$version/LICENSE" "$dir/LICENSE"; then
+			echo "could not fetch the license of the agentic workflow firewall $version, which must travel with it" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "Agentic workflow firewall bundle $version" "MIT" "${dir#"$rootfs"}/LICENSE"
+	done
+
+	if [ -e "$rootfs/usr/share/miniconda" ]; then
+		if ! [ -s "$rootfs/usr/share/miniconda/LICENSE.txt" ]; then
+			echo "Miniconda is installed without the end user license agreement its installer places" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "Miniconda" "Miniconda End User License Agreement" /usr/share/miniconda/LICENSE.txt
+	fi
+
+	if [ -e "$rootfs/usr/local/bin/packer" ]; then
+		if ! [ -s "$rootfs/usr/local/bin/LICENSE.txt" ]; then
+			echo "Packer is installed without the license its zip places beside it" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "Packer" "Business Source License 1.1" /usr/local/bin/LICENSE.txt
+	fi
+
+	cat >>"$notices" <<'NOTICES'
+Two settings a deployment should know about:
+
+ACCEPT_EULA=Y is set for every job, as on GitHub's hosted runners, so a package that asks for its license to be accepted when it is installed, such as Microsoft's SQL Server tools, is accepted on the job's behalf.
+
+Anaconda's terms of service govern its own package repository, the defaults channel conda uses unless it is told otherwise. Read them before an organisation uses it.
+NOTICES
+	chmod 0644 "$notices"
+}
+
 # install_guest_billet builds billet from this tree into the image, with the newest
 # go the image's toolcache carries, and installs Bazel's credential helper beside
 # it. The go command's own GOTOOLCHAIN rule fetches (and verifies) a newer
@@ -1134,6 +1235,10 @@ IMAGEINFO
 	# sha256 the way the runner is, behind a wrapper that adds one mount. The
 	# runner runs it with its own node, so the guest needs no node of its own.
 	install_container_hook "$rootfs"
+
+	# THE NOTICES OF WHAT THE TEMPLATE INSTALLED outside apt, which the image
+	# redistributes with it.
+	install_image_notices "$rootfs"
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
 # Read this microVM's runner registration out of the metadata service and start the

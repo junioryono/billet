@@ -445,6 +445,59 @@ check_completer() {
 	esac
 }
 
+# check_image_notices passes or fails the gate on the image mounted at $1 carrying,
+# for each tool installed outside apt whose license asks for its text with every
+# copy, that text, and /opt/billet/IMAGE_NOTICES naming where it is (#584): the
+# GitHub Copilot CLI, the agentic workflow firewall bundle, Miniconda and Packer,
+# each wherever the template put it.
+check_image_notices() {
+	local notices="$1/opt/billet/IMAGE_NOTICES" path text want=() missing=() status
+
+	if ! [ -s "$notices" ]; then
+		fail "the image has no /opt/billet/IMAGE_NOTICES, so it ships tools whose licenses ask for their text without saying where it is"
+		return
+	fi
+	for path in "$1"/opt/hostedtoolcache/copilot-cli/*/*/bin/copilot; do
+		if [ -e "$path" ]; then
+			want+=("${path%/bin/copilot}/LICENSE.md")
+		fi
+	done
+	for path in "$1"/opt/hostedtoolcache/agentic-workflow-firewall-js/*/*/awf-bundle.js; do
+		if [ -e "$path" ]; then
+			want+=("${path%/awf-bundle.js}/LICENSE")
+		fi
+	done
+	if [ -e "$1/usr/share/miniconda" ]; then
+		want+=("$1/usr/share/miniconda/LICENSE.txt")
+	fi
+	if [ -e "$1/usr/local/bin/packer" ]; then
+		want+=("$1/usr/local/bin/LICENSE.txt")
+	fi
+
+	for path in ${want[@]+"${want[@]}"}; do
+		text=${path#"$1"}
+		if ! [ -s "$path" ]; then
+			missing+=("$text")
+			continue
+		fi
+		status=0
+		grep -qxF "  Text: $text" "$notices" || status=$?
+		case "$status" in
+		0) ;;
+		1) missing+=("$text (not named in IMAGE_NOTICES)") ;;
+		*)
+			fail "could not read /opt/billet/IMAGE_NOTICES (status $status)"
+			return
+			;;
+		esac
+	done
+	if [ "${#missing[@]}" -gt 0 ]; then
+		fail "the image ships tools without the license text their licenses ask for: ${missing[*]}"
+		return
+	fi
+	pass "the image carries the license of each tool installed outside apt that asks for it (${#want[@]}), and IMAGE_NOTICES names each"
+}
+
 # check_manifest_components passes or fails the gate on the manifest declaring
 # exactly the components the image leaves out, each with the space it needs, under
 # the completion contract the image's completer speaks: a node completes only what
@@ -814,6 +867,8 @@ else
         (/opt/billet/THIRD_PARTY_NOTICES, /usr/local/lib/billet/container-hook/LICENSE,
         /usr/local/lib/billet/container-hook/THIRD_PARTY_NOTICES)"
 fi
+
+check_image_notices "$MNT"
 
 # THE CONTAINER HOOK PUTS THAT SHIM INSIDE A JOB CONTAINER. The reference hook is
 # vendored beside billet's wrapper, the runner is pointed at the wrapper, and the

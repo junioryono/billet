@@ -181,3 +181,247 @@ func TestTheHookNoticesNameThePinnedVersion(t *testing.T) {
 		}
 	}
 }
+
+// imageNoticesRoot writes an image root carrying the four tools whose licenses ask
+// for their text with every copy, each license beside its tool, and the notices
+// file naming every one, which is what install_image_notices leaves.
+func imageNoticesRoot(t *testing.T) string {
+	t.Helper()
+
+	root := t.TempDir()
+	for path, body := range map[string]string{
+		"opt/hostedtoolcache/copilot-cli/1.0.101/x64/bin/copilot":                    "#!/bin/sh\n",
+		"opt/hostedtoolcache/copilot-cli/1.0.101/x64/LICENSE.md":                     "GitHub Copilot CLI License\n",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64/awf-bundle.js": "bundle\n",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64/LICENSE":       "MIT License\n",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/awf-bundle.js": "bundle\n",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/LICENSE":       "MIT License\n",
+		"usr/share/miniconda/bin/conda":                                              "#!/bin/sh\n",
+		"usr/share/miniconda/LICENSE.txt":                                            "MINICONDA END USER LICENSE AGREEMENT\n",
+		"usr/local/bin/packer":                                                       "#!/bin/sh\n",
+		"usr/local/bin/LICENSE.txt":                                                  "Business Source License 1.1\n",
+	} {
+		writeTreeFile(t, root, path, body)
+	}
+	writeTreeFile(t, root, "opt/billet/IMAGE_NOTICES", "Notices for the billet guest image\n\n"+
+		"  Text: /opt/hostedtoolcache/copilot-cli/1.0.101/x64/LICENSE.md\n"+
+		"  Text: /opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64/LICENSE\n"+
+		"  Text: /opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/LICENSE\n"+
+		"  Text: /usr/share/miniconda/LICENSE.txt\n"+
+		"  Text: /usr/local/bin/LICENSE.txt\n")
+
+	return root
+}
+
+// THE GATE REFUSES AN IMAGE SHIPPING A TOOL WITHOUT THE LICENSE TEXT IT ASKS FOR,
+// or with one the notices file does not name, and passes an image carrying every
+// one, or carrying none of the tools.
+func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
+	t.Parallel()
+
+	gate := readScriptFile(t, "check-guest-image.sh")
+	if !hasExactLine(gate, `check_image_notices "$MNT"`) {
+		t.Fatal(`check-guest-image.sh never runs check_image_notices "$MNT"`)
+	}
+
+	if out, failed := gateRun(t, "check_image_notices", imageNoticesRoot(t), "", "check_image_notices"); failed != "0" ||
+		!strings.Contains(out, "(5)") {
+		t.Errorf("an image carrying every license failed, or did not count five:\n%s", out)
+	}
+
+	empty := t.TempDir()
+	writeTreeFile(t, empty, "opt/billet/IMAGE_NOTICES", "Notices for the billet guest image\n")
+	if out, failed := gateRun(t, "check_image_notices", empty, "", "check_image_notices"); failed != "0" {
+		t.Errorf("an image carrying none of the tools failed:\n%s", out)
+	}
+
+	for _, tc := range []struct {
+		name, remove, empty, unnamed, want string
+	}{
+		{name: "no notices file", remove: "opt/billet/IMAGE_NOTICES", want: "has no /opt/billet/IMAGE_NOTICES"},
+		{name: "an empty notices file", empty: "opt/billet/IMAGE_NOTICES", want: "has no /opt/billet/IMAGE_NOTICES"},
+		{
+			name: "no Copilot CLI license", remove: "opt/hostedtoolcache/copilot-cli/1.0.101/x64/LICENSE.md",
+			want: "/opt/hostedtoolcache/copilot-cli/1.0.101/x64/LICENSE.md",
+		},
+		{
+			name:   "an older firewall bundle without its license",
+			remove: "opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/LICENSE",
+			want:   "/opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/LICENSE",
+		},
+		{name: "an empty Miniconda agreement", empty: "usr/share/miniconda/LICENSE.txt", want: "/usr/share/miniconda/LICENSE.txt"},
+		{name: "no Packer license", remove: "usr/local/bin/LICENSE.txt", want: "/usr/local/bin/LICENSE.txt"},
+		{
+			name: "a license the notices do not name", unnamed: "/usr/local/bin/LICENSE.txt",
+			want: "/usr/local/bin/LICENSE.txt (not named in IMAGE_NOTICES)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := imageNoticesRoot(t)
+			if tc.remove != "" {
+				removeAll(t, filepath.Join(root, tc.remove))
+			}
+			if tc.empty != "" {
+				writeTreeFile(t, root, tc.empty, "")
+			}
+			if tc.unnamed != "" {
+				path := filepath.Join(root, "opt", "billet", "IMAGE_NOTICES")
+				body, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				without := strings.Replace(string(body), "  Text: "+tc.unnamed+"\n", "", 1)
+				if without == string(body) {
+					t.Fatalf("the fixture's notices do not name %s", tc.unnamed)
+				}
+				writeTreeFile(t, root, "opt/billet/IMAGE_NOTICES", without)
+			}
+
+			out, failed := gateRun(t, "check_image_notices", root, "", "check_image_notices")
+			if failed != "1" || !strings.Contains(out, tc.want) {
+				t.Errorf("the gate did not refuse naming %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// buildAssignment returns one top-level assignment from build-guest-image.sh.
+func buildAssignment(t *testing.T, name string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(readScriptFile(t, "build-guest-image.sh"), "\n") {
+		if strings.HasPrefix(line, name+"=") {
+			return line
+		}
+	}
+	t.Fatalf("build-guest-image.sh has no top-level %s assignment", name)
+
+	return ""
+}
+
+// runImageNotices runs the build's install_image_notices against ROOT, as the build
+// defines it, with a curl on PATH whose body is CURL; it returns the output and
+// whether the step succeeded.
+func runImageNotices(t *testing.T, root, curl string) (string, bool) {
+	t.Helper()
+
+	bin := t.TempDir()
+	writeExecutable(t, filepath.Join(bin, "curl"), "#!/usr/bin/env bash\n"+curl)
+	script := "set -euo pipefail\nTOOLCACHE_DIR=/opt/hostedtoolcache\n" + buildAssignment(t, "NOTICE_VERSION") + "\n"
+	for _, name := range []string{"fetch_license", "notice_entry", "install_image_notices"} {
+		script += guestImageFunction(t, name) + "\n"
+	}
+	script += "install_image_notices \"$1\"\n"
+	path := filepath.Join(t.TempDir(), "notices.sh")
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), "bash", path, root)
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if exit := (*exec.ExitError)(nil); err != nil && !errors.As(err, &exit) {
+		t.Fatalf("the step did not run: %v\n%s", err, out)
+	}
+
+	return string(out), err == nil
+}
+
+// THE BUILD WRITES WHAT THE GATE CHECKS: each GitHub tool's license fetched from the
+// tag of the version the toolcache holds and put beside it, and the notices naming
+// all four tools, so the gate passes the image the build leaves.
+func TestTheBuildInstallsEachToolsLicenseFromItsTag(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	for _, path := range []string{
+		"opt/hostedtoolcache/copilot-cli/1.0.101/x64/bin/copilot",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64/awf-bundle.js",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/awf-bundle.js",
+		"usr/share/miniconda/bin/conda",
+		"usr/local/bin/packer",
+	} {
+		writeTreeFile(t, root, path, "#!/bin/sh\n")
+	}
+	writeTreeFile(t, root, "usr/share/miniconda/LICENSE.txt", "MINICONDA END USER LICENSE AGREEMENT\n")
+	writeTreeFile(t, root, "usr/local/bin/LICENSE.txt", "Business Source License 1.1\n")
+
+	// The fake writes the URL it was asked for as the license, so each file says
+	// which tag it came from.
+	const fetch = `out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done
+printf '%s\n' "$url" >"$out"
+`
+	if out, ok := runImageNotices(t, root, fetch); !ok {
+		t.Fatalf("the step failed:\n%s", out)
+	}
+	for path, url := range map[string]string{
+		"opt/hostedtoolcache/copilot-cli/1.0.101/x64/LICENSE.md":               "https://raw.githubusercontent.com/github/copilot-cli/v1.0.101/LICENSE.md",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64/LICENSE": "https://raw.githubusercontent.com/github/gh-aw-firewall/v0.28.72/LICENSE",
+		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/LICENSE": "https://raw.githubusercontent.com/github/gh-aw-firewall/v0.28.71/LICENSE",
+	} {
+		body, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil || string(body) != url+"\n" {
+			t.Errorf("%s = %q, %v; want the license fetched from %s", path, body, err, url)
+		}
+	}
+	if out, failed := gateRun(t, "check_image_notices", root, "", "check_image_notices"); failed != "0" ||
+		!strings.Contains(out, "(5)") {
+		t.Errorf("the gate refused the notices the build wrote:\n%s", out)
+	}
+	notices, err := os.ReadFile(filepath.Join(root, "opt", "billet", "IMAGE_NOTICES"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"GitHub Copilot CLI 1.0.101\n  License: GitHub Copilot CLI License\n",
+		"Packer\n  License: Business Source License 1.1\n",
+		"based on Ubuntu 24.04",
+		"ACCEPT_EULA=Y",
+	} {
+		if !strings.Contains(string(notices), want) {
+			t.Errorf("IMAGE_NOTICES does not say %q:\n%s", want, notices)
+		}
+	}
+}
+
+// A LICENSE THAT CANNOT BE FETCHED FAILS THE BUILD, and so does a version the URL
+// cannot safely carry, before anything is fetched for it; a tool whose installer
+// placed no license fails it too.
+func TestTheBuildFailsWithoutEachToolsLicense(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, tool, curl, want string
+	}{
+		{
+			name: "a fetch that fails", tool: "opt/hostedtoolcache/copilot-cli/1.0.101/x64/bin/copilot",
+			curl: "exit 22\n", want: "GitHub Copilot CLI 1.0.101",
+		},
+		{
+			name: "an empty license", tool: "opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64/awf-bundle.js",
+			curl: "while [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then : >\"$2\"; fi; shift; done\n", want: "firewall 0.28.72",
+		},
+		{
+			name: "a version a URL cannot carry", tool: "opt/hostedtoolcache/copilot-cli/1.0.101?x=1/x64/bin/copilot",
+			curl: "echo fetched >&2; exit 0\n", want: "Copilot CLI as 1.0.101?x=1, which this build will not put in a URL",
+		},
+		{name: "Miniconda without its agreement", tool: "usr/share/miniconda/bin/conda", curl: "exit 0\n", want: "Miniconda is installed without"},
+		{name: "Packer without its license", tool: "usr/local/bin/packer", curl: "exit 0\n", want: "Packer is installed without"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			writeTreeFile(t, root, tc.tool, "#!/bin/sh\n")
+			out, ok := runImageNotices(t, root, tc.curl)
+			if ok || !strings.Contains(out, tc.want) {
+				t.Errorf("the step did not fail naming %q:\n%s", tc.want, out)
+			}
+			if strings.Contains(out, "fetched") {
+				t.Errorf("the step fetched a license for a version it should have refused:\n%s", out)
+			}
+		})
+	}
+}
