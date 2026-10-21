@@ -3,6 +3,7 @@ package scripts_test
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,6 +66,97 @@ func TestTheManifestWriterAndTheGoReaderAgree(t *testing.T) {
 			t.Errorf("4096 bytes split at 1024 produced %d parts, want 4", n)
 		}
 	})
+}
+
+// AN IMAGE THAT LEAVES COMPONENTS OUT IS SCHEMA 3, READ BY billet's OWN READER
+// (#584): every component the build left out, with the space its trial
+// completion measured, under the completion contract the completer speaks, and
+// usable by this billet. The writer refuses what would describe an image a node
+// could not complete.
+func TestAnImageThatLeavesComponentsOutIsSchema3(t *testing.T) {
+	t.Parallel()
+
+	const leftOut = "android-sdk codeql firefox google-chrome microsoft-edge"
+	const measured = `[{"name":"android-sdk","space":13958643712},{"name":"codeql","space":1073741824},` +
+		`{"name":"firefox","space":402653184},{"name":"google-chrome","space":805306368},` +
+		`{"name":"microsoft-edge","space":671088640}]`
+
+	dir := t.TempDir()
+	out, err := writeManifest(t, dir, 1024, leftOut, measured)
+	if err != nil {
+		t.Fatalf("write-image-manifest.sh: %v", err)
+	}
+	m, err := imagesource.ParseManifest(out)
+	if err != nil {
+		t.Fatalf("billet's own reader refuses the manifest the build writes: %v\n%s", err, out)
+	}
+	if m.Schema != imagesource.SchemaV3 || m.CompletionContract != imagesource.CompletionContractV1 {
+		t.Fatalf("schema %d under contract %q, want schema 3 under %q", m.Schema, m.CompletionContract,
+			imagesource.CompletionContractV1)
+	}
+	if got := len(m.Components); got != 5 || m.Components[0].Name != "android-sdk" ||
+		m.Components[0].Space != 13958643712 {
+		t.Fatalf("the components are %+v, want the five the trial measured", m.Components)
+	}
+	if err := m.Usable(m.GuestContract, m.Arch); err != nil {
+		t.Fatalf("this billet cannot use the image the build describes: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		partBytes         int
+		leftOut, measured string
+		says              string
+	}{
+		"no trial":         {1024, leftOut, "", "and no trial completion"},
+		"a name not left":  {1024, "codeql firefox", measured, "the trial measured"},
+		"no space":         {1024, "codeql", `[{"name":"codeql","space":0}]`, "without a positive space"},
+		"an unsplit image": {0, leftOut, measured, "only schema 3 can"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			out, err := writeManifest(t, t.TempDir(), tc.partBytes, tc.leftOut, tc.measured)
+			var exit *exec.ExitError
+			ok := errors.As(err, &exit)
+			if !ok || !strings.Contains(string(exit.Stderr), tc.says) {
+				t.Fatalf("answered %v with %s, want a refusal saying %q", err, out, tc.says)
+			}
+		})
+	}
+}
+
+// writeManifest runs the writer over a split (partBytes > 0) or single image in
+// dir, with LEFT_OUT recorded in build-info.env and MEASURED, when not empty, as
+// the trial's components.json.
+func writeManifest(t *testing.T, dir string, partBytes int, leftOut, measured string) ([]byte, error) {
+	t.Helper()
+
+	image := makeRootfs(t, dir, 4096)
+	kernel := filepath.Join(dir, "vmlinux-billet")
+	if err := os.WriteFile(kernel, []byte("Linux version 6.1.155 (billet@test)\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info := filepath.Join(dir, "build-info.env")
+	if err := os.WriteFile(info, []byte("RUNNER_VERSION=2.336.0\nGUEST_CONTRACT=9\nARCH=x86_64\nLEFT_OUT=\""+
+		leftOut+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	components := filepath.Join(dir, "components.json")
+	if measured != "" {
+		if err := os.WriteFile(components, []byte(measured+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var parts string
+	if partBytes > 0 {
+		parts = strings.Join(runSplit(t, image, partBytes), "\n")
+	}
+
+	cmd := exec.CommandContext(t.Context(), repoScript(t, "write-image-manifest.sh"))
+	cmd.Env = append(os.Environ(), "ROOTFS="+image, "KERNEL="+kernel, "INFO="+info,
+		"ROOTFS_PARTS="+parts, "COMPONENTS_FILE="+components)
+
+	return cmd.Output()
 }
 
 // TestASplitImageReassemblesIntoTheOriginal is the property the whole scheme

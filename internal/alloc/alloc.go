@@ -2499,6 +2499,10 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 				// NOT ARCHIVED YET. The lease has not finished; the history row is
 				// written when it actually terminalizes, with the outcome it
 				// actually had.
+				if err := recordJobPhaseTx(ctx, tx, l.ID, to, now, ""); err != nil {
+					return err
+				}
+
 				quarantined++
 
 				continue
@@ -2778,6 +2782,10 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 			Epoch:             epoch,
 		}); err != nil {
 			return fmt.Errorf("alloc: advance lease %s: %w", leaseID, err)
+		}
+
+		if err := recordJobPhaseTx(ctx, tx, leaseID, to, now, holder); err != nil {
+			return err
 		}
 
 		// A JOB STARTED, AND THE LEDGER KEEPS THAT PAST THE PHASE. Custody and
@@ -3425,6 +3433,7 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 		GitCache:           string(l.Git),
 		BazelCache:         string(l.Bazel),
 		GoCache:            string(l.Go),
+		HolderIncarnation:  l.HolderIncarnation,
 		QueuedAt:           ts(now),
 		FinishedAt:         sql.NullString{String: ts(now), Valid: true},
 	})

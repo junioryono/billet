@@ -1943,14 +1943,17 @@ func (p *Plane) AuthorizeLease(node, incarnation, leaseID string) (bool, error) 
 //
 // The lease id carries the entitlement because it is already in the runner name
 // billet chooses (see provider.InstanceName), so a node can only ask for the
-// registration belonging to the launch it was actually told to perform.
-func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, error) {
+// registration belonging to the launch it was actually told to perform. The
+// launch's tier and epoch come back: the epoch is the fence a write on the
+// launch's behalf presents, so a lease reclaimed since the command was given
+// refuses it.
+func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	n, ok := p.nodes[node]
 	if !ok {
-		return "", fmt.Errorf("%w: %s", ErrUnregistered, node)
+		return "", 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
 
 	for _, pend := range n.inflight {
@@ -1979,11 +1982,11 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 			// runner it starts joins a tier with different labels, different jobs and
 			// possibly different secrets. The caller resolves this tier's own set and
 			// refuses anything else.
-			return pend.cmd.Lease.Tier, nil
+			return pend.cmd.Lease.Tier, pend.cmd.Lease.Epoch, nil
 		}
 	}
 
-	return "", fmt.Errorf(
+	return "", 0, fmt.Errorf(
 		"%w: node %q was not given a launch for lease %s, so it may not mint a runner "+
 			"registration for it", ErrNotEntitled, node, leaseID)
 }
@@ -2120,18 +2123,34 @@ func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi
 	timer := time.NewTimer(p.poll)
 	defer timer.Stop()
 
-	select {
-	case <-ctx.Done():
-		return nodeapi.Command{}, false, ctx.Err()
-	case <-timer.C:
-		return nodeapi.Command{}, false, nil
-	case <-wait:
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nodeapi.Command{}, false, ctx.Err()
+		case <-timer.C:
+			return nodeapi.Command{}, false, nil
+		case <-wait:
+		}
 
+		cmd, took, err := p.takeAfterWake(nodeName, incarnation)
+		if err != nil || took {
+			return cmd, took, err
+		}
+
+		// A WAKE THAT FOUND NOTHING WAITS ON. The signal is one slot sent without
+		// blocking whenever a command is queued, so a command an earlier poll took
+		// without waiting leaves it behind, and this poll would otherwise answer
+		// empty at once instead of waiting out its window (#188).
+	}
+}
+
+// takeAfterWake takes the node's next command once a poll has been woken,
+// checking again that the poller still owns the name.
+func (p *Plane) takeAfterWake(nodeName, incarnation string) (nodeapi.Command, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	n, ok = p.nodes[nodeName]
+	n, ok := p.nodes[nodeName]
 	if !ok {
 		return nodeapi.Command{}, false, ErrUnregistered
 	}

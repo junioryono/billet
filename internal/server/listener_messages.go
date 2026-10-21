@@ -319,7 +319,7 @@ func (l *Listener) quarantineStarted(ctx context.Context, job dispatch.Job, caus
 					legacy.Tier == l.tier && legacy.RequestID != 0 {
 					regErr := l.alloc.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: leaseID,
 						Tier: l.tier, LaunchRequestID: legacy.RequestID, RunnerID: job.RunnerID,
-						RunnerName: job.RunnerName})
+						RunnerName: job.RunnerName, GitHubTarget: l.githubTarget})
 					if regErr == nil {
 						member, err = l.alloc.PoolRunnerByName(ctx, job.RunnerName)
 					} else {
@@ -404,7 +404,8 @@ func (l *Listener) identifyStarted(ctx context.Context, job dispatch.Job) (dispa
 				ErrUntrustworthySession, job.RunnerName, l.tier)
 		}
 		if regErr := l.alloc.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: leaseID,
-			Tier: l.tier, LaunchRequestID: legacy.RequestID, RunnerName: job.RunnerName}); regErr != nil {
+			Tier: l.tier, LaunchRequestID: legacy.RequestID, RunnerName: job.RunnerName,
+			GitHubTarget: l.githubTarget}); regErr != nil {
 			if errors.Is(regErr, alloc.ErrConflict) {
 				return dispatch.Job{}, fmt.Errorf("%w: cannot adopt started runner %q: %w",
 					errQuarantinableStarted, job.RunnerName, regErr)

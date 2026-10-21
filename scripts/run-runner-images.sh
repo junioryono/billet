@@ -107,7 +107,10 @@ skip_upstream_test() {
 				exit 1
 			}
 		}'
+	# THREE ARGUMENTS OR NOTHING IS WRITTEN: a transport that drops one would hand
+	# awk the wrong program and rewrite the file from its output.
 	target exec sh -c '
+		[ "$#" -eq 3 ] || { echo "skip_upstream_test: given $# arguments in the target, want 3" >&2; exit 1; }
 		if name=$2 awk "$3" "$1" >"$1.billet"; then
 			cat "$1.billet" >"$1" && rm -f "$1.billet"
 		else
@@ -159,7 +162,101 @@ prepare_grub_absent() {
 			chmod 0755 "$stand_in"'
 }
 
-prepares=" waagent-conf docker-daemon build-user system-tests-virtio system-tests-rootflags apt-tests-two-mirrors grub-absent "
+# replace_upstream_line replaces the line of FILE that is exactly OLD with NEW.
+# EXACTLY ONE LINE MUST BE OLD, for the reason skip_upstream_test gives; the file
+# is rewritten only when one was.
+replace_upstream_line() {
+	local program='
+		$0 == ENVIRON["old"] { print ENVIRON["new"]; replaced++; next }
+		{ print }
+		END {
+			if (replaced != 1) {
+				printf "%s has %d lines reading \"%s\", want exactly one\n",
+					FILENAME, replaced + 0, ENVIRON["old"] > "/dev/stderr"
+				exit 1
+			}
+		}'
+	# A REFUSAL SHOWS WHAT IT WAS GIVEN AND WHAT THE FILE HOLDS NEAR IT: the line as
+	# it arrived in the target, byte by byte, and the file's lines that share its
+	# first words, so a refusal in the build's last hour says why.
+	# FOUR ARGUMENTS OR NOTHING IS WRITTEN, for the same reason: the build's first
+	# report edit lost two of them to systemd-run's expansion and awk, handed an
+	# empty program, emptied the report (2026-10-20).
+	target exec sh -c '
+		[ "$#" -eq 4 ] || { echo "replace_upstream_line: given $# arguments in the target, want 4" >&2; exit 1; }
+		if old=$2 new=$3 awk "$4" "$1" >"$1.billet"; then
+			cat "$1.billet" >"$1" && rm -f "$1.billet"
+		else
+			rm -f "$1.billet"
+			printf "%s" "$2" | od -c | head -n 8 >&2
+			words=$(printf "%s" "$2" | sed "s/^[[:space:]]*//" | cut -c1-20)
+			status=0
+			grep -n -F -- "$words" "$1" >&2 || status=$?
+			[ "$status" -ne 1 ] || echo "no line of $1 holds \"$words\"" >&2
+			exit 1
+		fi' sh "$1" "$2" "$3" "$program"
+}
+
+# THE COMPONENTS BILLET MAY NOT SHIP (#584): Google Chrome, Microsoft Edge,
+# Firefox, the Android SDK and the CodeQL bundle, whose licenses forbid billet
+# redistributing them. Their installers are skipped, and each deployment that
+# accepts one runs that installer, and GitHub's tests for it, from the image's
+# own /opt/billet/complete before importing the image. What the build still runs
+# of GitHub's suite and report must then not expect them: the tests are skipped
+# here as GitHub's arm64 image skips the browsers and Android, and the report says
+# who installs them. The completer carries the suite unedited.
+per_deployment='installed by each billet deployment that accepts its license'
+
+# THE TOOLSET TEST WALKS EVERY TOOLCACHE ENTRY AT DISCOVERY, and the CodeQL bundle
+# is one, so a -Skip on its Context would still read a directory that is not
+# there; the walk leaves it out instead. Configure-Toolset.ps1 is the first step
+# that runs the toolset tests.
+prepare_codeql_per_deployment() {
+	replace_upstream_line /imagegeneration/tests/Toolset.Tests.ps1 \
+		'    $tools = (Get-ToolsetContent).toolcache' \
+		'    $tools = (Get-ToolsetContent).toolcache | Where-Object { $_.name -ne "CodeQL" }'
+}
+
+# THE FINAL SUITE AND THE SOFTWARE REPORT run in one step, and they are the only
+# steps left that read the browsers or Android once their installers are skipped.
+# Android's discovery reads the SDK before its Describe can be skipped, so its
+# early return, GitHub's arm64 path, is taken unconditionally.
+prepare_components_per_deployment() {
+	local describe
+	for describe in 'Firefox" {' 'Chrome" -Skip:(Test-IsArm64) {' 'Edge" -Skip:(Test-IsArm64) {' \
+		'Chromium" -Skip:(Test-IsArm64) {'; do
+		replace_upstream_line /imagegeneration/tests/Browsers.Tests.ps1 "Describe \"$describe" \
+			"Describe \"${describe%%\"*}\" -Skip {" || return 1
+	done
+	replace_upstream_line /imagegeneration/tests/Android.Tests.ps1 \
+		'Describe "Android" -Skip:(Test-IsArm64) {' 'Describe "Android" -Skip {' &&
+		replace_upstream_line /imagegeneration/tests/Android.Tests.ps1 \
+			'        if (Test-IsArm64) { return }' '        return' || return 1
+
+	# EACH LINE A VERSION FUNCTION WOULD FILL is given the sentence instead: the
+	# report runs under ErrorActionPreference Stop, and every one of them reads a
+	# binary that is not there. Each row is the line's start and its call.
+	local report=/imagegeneration/SoftwareReport/Generate-SoftwareReport.ps1 start call
+	while IFS='|' read -r start call; do
+		replace_upstream_line "$report" "$start\$($call))" "$start\"$per_deployment\")" || return 1
+	done <<'ENTRIES'
+    $tools.AddToolVersion("CodeQL Action Bundle", |Get-CodeQLBundleVersion
+    $browsersTools.AddToolVersion("Google Chrome", |Get-ChromeVersion
+    $browsersTools.AddToolVersion("ChromeDriver", |Get-ChromeDriverVersion
+    $browsersTools.AddToolVersion("Chromium", |Get-ChromiumVersion
+    $browsersTools.AddToolVersion("Microsoft Edge", |Get-EdgeVersion
+    $browsersTools.AddToolVersion("Microsoft Edge WebDriver", |Get-EdgeDriverVersion
+$browsersTools.AddToolVersion("Mozilla Firefox", |Get-FirefoxVersion
+$browsersTools.AddToolVersion("Geckodriver", |Get-GeckodriverVersion
+ENTRIES
+	replace_upstream_line "$report" '    $androidTools.AddTable($(Build-AndroidTable))' \
+		"    \$androidTools.AddToolVersion(\"Android SDK\", \"$per_deployment\")" &&
+		replace_upstream_line "$report" \
+			'    $androidTools.AddHeader("Environment variables").AddTable($(Build-AndroidEnvironmentTable))' \
+			"    # billet: the Android environment is written by each deployment's completion (#584)"
+}
+
+prepares=" waagent-conf docker-daemon build-user system-tests-virtio system-tests-rootflags apt-tests-two-mirrors grub-absent codeql-per-deployment components-per-deployment "
 
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT

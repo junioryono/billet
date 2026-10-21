@@ -776,6 +776,19 @@ func (q *Queries) ReadLeaseEpoch(ctx context.Context, id string) (int64, error) 
 	return epoch, err
 }
 
+const readLeaseGitHubTarget = `-- name: ReadLeaseGitHubTarget :one
+SELECT github_target FROM leases WHERE id = $1
+`
+
+// The GitHub owner a lease's runner was registered on, empty when none was
+// recorded (migration 64).
+func (q *Queries) ReadLeaseGitHubTarget(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRowContext(ctx, readLeaseGitHubTarget, id)
+	var github_target string
+	err := row.Scan(&github_target)
+	return github_target, err
+}
+
 const readLeaseJob = `-- name: ReadLeaseJob :one
 SELECT tier, run_id, request_id FROM leases WHERE id = $1
 `
@@ -827,6 +840,28 @@ func (q *Queries) ReclaimLease(ctx context.Context, arg ReclaimLeaseParams) erro
 		arg.ID,
 		arg.Epoch,
 	)
+	return err
+}
+
+const recordLeaseGitHubTarget = `-- name: RecordLeaseGitHubTarget :exec
+UPDATE leases SET github_target = $1
+ WHERE id = $2 AND epoch = $3 AND github_target = ''
+`
+
+type RecordLeaseGitHubTargetParams struct {
+	GithubTarget string
+	ID           string
+	Epoch        int64
+}
+
+// Record the GitHub owner a lease's runner is about to be registered on.
+//
+// WRITE-ONCE AND FENCED. The caller reads the column inside the same
+// transaction and refuses a different owner, so the filter here only keeps a
+// written value from ever being replaced; a reclaimed lease's holder matches
+// no row.
+func (q *Queries) RecordLeaseGitHubTarget(ctx context.Context, arg RecordLeaseGitHubTargetParams) error {
+	_, err := q.db.ExecContext(ctx, recordLeaseGitHubTarget, arg.GithubTarget, arg.ID, arg.Epoch)
 	return err
 }
 

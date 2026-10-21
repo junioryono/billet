@@ -198,6 +198,118 @@ install_container_hook() {
 	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"
 }
 
+# NOTICE_VERSION is the shape of a version this build puts into a license's URL: a
+# toolcache directory the template's installer named, read back from the image.
+NOTICE_VERSION='^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$'
+
+# plain_file succeeds when PATH is a non-empty regular file and not a symlink.
+plain_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] && [ -s "$1" ]
+}
+
+# fetch_license downloads the license at URL to DEST, and fails when it cannot or
+# what arrived is not a non-empty file.
+fetch_license() {
+	rm -f "$2" &&
+		curl -fsSL --http1.1 \
+			--connect-timeout 20 --max-time 120 \
+			--retry 5 --retry-delay 5 --retry-all-errors \
+			-o "$2" "$1" && plain_file "$2" && chmod 0644 "$2"
+}
+
+# notice_entry appends to NOTICES the entry for one tool: its name and version, its
+# license, and where the license's text is in the image.
+notice_entry() {
+	printf '%s\n  License: %s\n  Text: %s\n\n' "$2" "$3" "$4" >>"$1"
+}
+
+# install_image_notices completes the notices of the tools the template installs
+# outside apt under a license that asks for its text with every copy (#584), and
+# writes /opt/billet/IMAGE_NOTICES, which names each one and where its license is.
+# A package installed with apt carries its own under /usr/share/doc.
+#
+# THE TWO GITHUB TOOLS ARRIVE WITHOUT THEIR LICENSES: the Copilot CLI's tarball
+# holds only the binary, and the firewall's release asset only the bundle. Each
+# license is fetched from the tag of the version installed, read back from the
+# directory the template's installer made, and lands beside the tool. Miniconda's
+# installer and Packer's zip place their own, and one missing fails the build.
+#
+# THE BUILD TRUSTS THE ROOT IT BUILT, as every step after the template does (#614):
+# it writes into it as root on this machine, and a tool the template reached
+# through a symlinked directory is found by the gate, which resolves paths inside
+# the image, rather than here.
+install_image_notices() {
+	local rootfs=$1 dir path version
+	local tools="$rootfs$TOOLCACHE_DIR" notices="$rootfs/opt/billet/IMAGE_NOTICES"
+	install -d -m 0755 "$rootfs/opt/billet"
+	cat >"$notices" <<'NOTICES'
+Notices for the billet guest image
+
+This image is based on Ubuntu 24.04. billet builds it by running GitHub's actions/runner-images template on that base; neither Canonical nor GitHub publishes it.
+
+Every package installed with apt carries its copyright and license in /usr/share/doc/<package>/copyright. billet's own third-party notices are in /opt/billet/THIRD_PARTY_NOTICES, and the container hook's in /usr/local/lib/billet/container-hook/.
+
+These tools are installed outside apt, under licenses that ask for their text with every copy:
+
+NOTICES
+
+	for dir in "$tools"/copilot-cli/*/*/; do
+		[ -e "${dir}bin/copilot" ] || [ -L "${dir}bin/copilot" ] || continue
+		version=${dir#"$tools/copilot-cli/"}
+		version=${version%%/*}
+		if ! [[ $version =~ $NOTICE_VERSION ]]; then
+			echo "the toolcache holds the GitHub Copilot CLI as $version, which this build will not put in a URL" >&2
+			exit 1
+		fi
+		if ! fetch_license "https://raw.githubusercontent.com/github/copilot-cli/v$version/LICENSE.md" "${dir}LICENSE.md"; then
+			echo "could not fetch the license of the GitHub Copilot CLI $version, which must travel with it" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "GitHub Copilot CLI $version" "GitHub Copilot CLI License" "${dir#"$rootfs"}LICENSE.md"
+	done
+
+	for path in "$tools"/agentic-workflow-firewall-js/*/*/awf-bundle.js; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		dir=${path%/awf-bundle.js}
+		version=${dir#"$tools/agentic-workflow-firewall-js/"}
+		version=${version%%/*}
+		if ! [[ $version =~ $NOTICE_VERSION ]]; then
+			echo "the toolcache holds the agentic workflow firewall as $version, which this build will not put in a URL" >&2
+			exit 1
+		fi
+		if ! fetch_license "https://raw.githubusercontent.com/github/gh-aw-firewall/v$version/LICENSE" "$dir/LICENSE"; then
+			echo "could not fetch the license of the agentic workflow firewall $version, which must travel with it" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "Agentic workflow firewall bundle $version" "MIT" "${dir#"$rootfs"}/LICENSE"
+	done
+
+	if [ -e "$rootfs/usr/share/miniconda" ] || [ -L "$rootfs/usr/share/miniconda" ]; then
+		if ! plain_file "$rootfs/usr/share/miniconda/LICENSE.txt"; then
+			echo "Miniconda is installed without the end user license agreement its installer places" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "Miniconda" "Miniconda End User License Agreement" /usr/share/miniconda/LICENSE.txt
+	fi
+
+	if [ -e "$rootfs/usr/local/bin/packer" ] || [ -L "$rootfs/usr/local/bin/packer" ]; then
+		if ! plain_file "$rootfs/usr/local/bin/LICENSE.txt"; then
+			echo "Packer is installed without the license its zip places beside it" >&2
+			exit 1
+		fi
+		notice_entry "$notices" "Packer" "Business Source License 1.1" /usr/local/bin/LICENSE.txt
+	fi
+
+	cat >>"$notices" <<'NOTICES'
+Two settings a deployment should know about:
+
+ACCEPT_EULA=Y is set for every job, as on GitHub's hosted runners, so a package that asks for its license to be accepted when it is installed, such as Microsoft's SQL Server tools, is accepted on the job's behalf.
+
+Anaconda's terms of service govern its own package repository, the defaults channel conda uses unless it is told otherwise. Read them before an organisation uses it.
+NOTICES
+	chmod 0644 "$notices"
+}
+
 # install_guest_billet builds billet from this tree into the image, with the newest
 # go the image's toolcache carries, and installs Bazel's credential helper beside
 # it. The go command's own GOTOOLCHAIN rule fetches (and verifies) a newer
@@ -233,6 +345,186 @@ install_guest_billet() {
 exec /opt/billet/bin/billet cache credential-helper "$@"
 HELPER
 	echo "guest billet: built with go $newest"
+}
+
+# THE COMPONENTS THE PUBLISHED IMAGE LEAVES OUT (#584), whose licenses forbid
+# billet redistributing them; differences.tsv skips their installers. The one
+# list is check-guest-component.sh's, which a test holds to config.ImageComponents.
+COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" names | tr '\n' ' ')
+
+# install_completer puts the image's completer at /opt/billet/complete: what a
+# deployment that accepts a component runs, chrooted into the image, to install
+# it before the image is imported (completion contract 1). It carries GitHub's
+# installers, helpers and tests for the components, unedited, from the pinned
+# template, except that the tests are read from beside the helpers: the build's
+# own /imagegeneration/tests had them skipped.
+install_completer() {
+	local rootfs=$1 upstream="$SCRIPT_DIR/runner-images/upstream/images/ubuntu/scripts"
+	local completer="$rootfs/opt/billet/complete" script file
+	rm -rf "$completer"
+	install -d -m 0755 "$completer" "$completer/installers" "$completer/scripts" \
+		"$completer/scripts/build" "$completer/scripts/tests"
+	install -m 0755 "$SCRIPT_DIR/runner-images/completer/run" "$completer/run"
+	install -m 0755 "$SCRIPT_DIR/runner-images/write-image-env.sh" "$completer/write-image-env.sh"
+	install -m 0644 "$SCRIPT_DIR/runner-images/pam-environment.awk" "$completer/pam-environment.awk"
+	install -m 0644 "$SCRIPT_DIR/../internal/runnerimages/toolset-2404.json" "$completer/installers/toolset.json"
+	for script in install-android-sdk.sh install-codeql-bundle.sh install-firefox.sh \
+		install-google-chrome.sh install-microsoft-edge.sh; do
+		install -m 0755 "$upstream/build/$script" "$completer/scripts/build/$script"
+	done
+	cp -R "$upstream/helpers" "$completer/scripts/helpers"
+	# EXECUTABLE AS configure-environment.sh MAKES IT before linking invoke_tests
+	# to it; the template carries it as an ordinary file.
+	chmod 0755 "$completer/scripts/helpers/invoke-tests.sh"
+	for file in Android.Tests.ps1 Browsers.Tests.ps1 Toolset.Tests.ps1; do
+		install -m 0644 "$upstream/tests/$file" "$completer/scripts/tests/$file"
+	done
+
+	# THE ONE EDIT, AND ONLY IF IT IS STILL THE ONE LINE: GitHub's Invoke-PesterTests
+	# reads every test file from /imagegeneration/tests, which the build edited.
+	if ! old='    $testPath = "/imagegeneration/tests/${TestFile}.Tests.ps1"' \
+		new='    $testPath = Join-Path $PSScriptRoot "${TestFile}.Tests.ps1"' \
+		awk '
+			$0 == ENVIRON["old"] { print ENVIRON["new"]; replaced++; next }
+			{ print }
+			END { exit replaced == 1 ? 0 : 1 }' \
+		"$upstream/tests/Helpers.psm1" >"$completer/scripts/tests/Helpers.psm1"; then
+		echo "the template's Helpers.psm1 no longer reads its tests from one /imagegeneration" >&2
+		echo "  path, so the completer cannot point it at its own" >&2
+		exit 1
+	fi
+	chmod 0644 "$completer/scripts/tests/Helpers.psm1"
+	echo "completer: installed for $COMPONENTS"
+}
+
+# components_record prints the components record of a generation published
+# straight from this build: everything it leaves out, sorted, and nothing
+# installed, in the JSON ceph.SetComponents writes.
+components_record() {
+	# shellcheck disable=SC2086 # the names are words, split on purpose
+	jq -cn '{left_out: ($ARGS.positional | sort), installed: {}}' --args $COMPONENTS
+}
+
+# TRIAL_TIMEOUT bounds one component's trial completion; the Android SDK is
+# several gigabytes, and GitHub's own tests run after each.
+TRIAL_TIMEOUT="${TRIAL_TIMEOUT:-90m}"
+
+# TRIAL_POLL is how often a trial samples the builder's disk while it runs, in
+# seconds: often, because an archive downloaded, unpacked and deleted between two
+# samples is space the completion needed and the measurement missed. The quarter
+# added to the peak is for what sampling misses and the vendor's next release adds.
+TRIAL_POLL="${TRIAL_POLL:-1}"
+
+# TRIAL_REPORT is where the completer reports: under /run, which is bound into the
+# copy, so the builder reads what the completer wrote inside it. TRIAL_PATH is the
+# PATH it runs the completer with, and nothing else of the build's environment.
+TRIAL_REPORT="${TRIAL_REPORT:-/run/billet-completion-trial.report}"
+TRIAL_PATH="${TRIAL_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
+
+# fs_used prints the bytes in use on the filesystem holding DIR.
+fs_used() {
+	local used
+	used=$(df -B1 --output=used "$1" | tail -n 1 | tr -dc '0-9')
+	[ -n "$used" ] || return 1
+	printf '%s\n' "$used"
+}
+
+# trial_completion completes a copy of IMG with each component, one at a time, the
+# way a deployment's completion microVM does (completion contract 1), and refuses
+# the build unless every component installs, passes GitHub's tests for it and
+# check-guest-component.sh's, and leaves the image carrying what it should. It
+# writes $WORK/components.json, the components with the space each needed, which
+# write-image-manifest.sh declares.
+#
+# A COPY, NEVER THE IMAGE: IMG is mounted read-only beneath an overlay whose upper
+# layer is on the builder's disk, so the published image carries none of what a
+# trial installed, and every component starts from the image as published.
+#
+# THE SPACE IS MEASURED, NEVER GUESSED. The builder's disk is sampled while the
+# completer runs, and the most it grew by, with a quarter more for what the
+# vendor's next release adds, is what a node grows the image by before
+# completing it. Nothing else writes to that disk while a trial runs.
+#
+# THE COMPLETER'S EXIT STATUS DECIDES NOTHING, as the contract says; its report
+# and the checks after it do.
+trial_completion() {
+	local img=$1 dir="$WORK/trial" report="$TRIAL_REPORT" sub
+	local component before peak used line status space components="[]"
+
+	TRIAL_DIR=$dir
+	mkdir -p "$dir/lower"
+	mount -o loop,ro,noload "$img" "$dir/lower"
+
+	for component in $COMPONENTS; do
+		echo "trial completion: $component"
+		# NOTHING IS MOUNTED HERE: the copy before was unmounted, and proved so.
+		rm -rf "$dir/upper" "$dir/work"
+		mkdir -p "$dir/upper" "$dir/work" "$dir/merged"
+		# metacopy=on, OR THE MEASUREMENT IS OF THE OVERLAY: the completer's last act
+		# is configure-system.sh's chmod -R of /opt and /usr/share, which without it
+		# copies every file of the toolcache up into the upper layer, and the first
+		# trials measured 24 GiB of that for Firefox (2026-10-20). On a node the
+		# completer changes the image's own inodes, which costs no space.
+		mount -t overlay overlay \
+			-o "lowerdir=$dir/lower,upperdir=$dir/upper,workdir=$dir/work,metacopy=on" "$dir/merged"
+		for sub in proc sys dev dev/pts run; do
+			mount --bind "/$sub" "$dir/merged/$sub"
+		done
+		rm -f "$report"
+
+		before=$(fs_used "$dir")
+		peak=$before
+		env -i PATH="$TRIAL_PATH" BILLET_COMPLETION_REPORT="$report" \
+			timeout -k 60 "$TRIAL_TIMEOUT" chroot "$dir/merged" /opt/billet/complete/run "$component" &
+		TRIAL_PID=$!
+		while kill -0 "$TRIAL_PID" 2>/dev/null; do
+			used=$(fs_used "$dir")
+			[ "$used" -le "$peak" ] || peak=$used
+			sleep "$TRIAL_POLL"
+		done
+		wait "$TRIAL_PID" || true
+		TRIAL_PID=""
+		used=$(fs_used "$dir")
+		[ "$used" -le "$peak" ] || peak=$used
+
+		status=0
+		line=$(grep -xE "installed=$component [0-9A-Za-z][0-9A-Za-z.+:~_-]{0,63}" "$report") || status=$?
+		case "$status" in
+		0) ;;
+		1)
+			echo "the trial completion did not install $component; its report says:" >&2
+			cat "$report" >&2 || true
+			exit 1
+			;;
+		*)
+			echo "could not read the trial completion's report for $component (grep $status)" >&2
+			exit 1
+			;;
+		esac
+
+		if ! "$SCRIPT_DIR/check-guest-component.sh" present "$component" "$dir/merged"; then
+			echo "a copy completed with $component does not carry what it should" >&2
+			exit 1
+		fi
+
+		unmount_under "$dir/merged"
+		space=$(((peak - before) * 5 / 4))
+		space=$(((space + 1048575) / 1048576 * 1048576))
+		[ "$space" -ge 67108864 ] || space=67108864
+		components=$(jq -c --arg name "$component" --argjson space "$space" \
+			'. + [{name: $name, space: $space}]' <<<"$components")
+		echo "trial completion: ${line#installed=}, needing $space bytes"
+	done
+
+	unmount_under "$dir"
+	TRIAL_DIR=""
+	rm -rf "$dir"
+
+	# READABLE BY THE WORKFLOW'S OWN USER, which writes the manifest from it after
+	# this, run as root, returns, whatever umask the build inherited.
+	printf '%s\n' "$components" >"$WORK/components.json.tmp"
+	chmod 0644 "$WORK/components.json.tmp"
+	mv "$WORK/components.json.tmp" "$WORK/components.json"
 }
 
 read_guest_contract() {
@@ -338,16 +630,68 @@ on_signal() {
 	local signal="$1"
 
 	stop_runner_images
+	unmount_trial
 	unmount_rootfs
 
 	trap - "$signal"
 	kill -s "$signal" $$
 }
 
+# TRIAL_DIR is the directory a trial completion has mounts under, or empty, and
+# TRIAL_PID the completer it is running; the traps read both.
+TRIAL_DIR=""
+TRIAL_PID=""
+
+# unmount_trial stops a trial completion's completer and takes down every mount
+# under TRIAL_DIR, deepest first: the image mounted read-only, the overlay a copy
+# is completed in, and the builder's /proc, /sys, /dev and /run bound into it.
+# BOUND FROM THE BUILDER, which is why a trial's mounts must never outlive it: the
+# next build's first act is a recursive delete of the workspace.
+unmount_trial() {
+	[ -n "$TRIAL_DIR" ] || return 0
+
+	if [ -n "$TRIAL_PID" ]; then
+		kill "$TRIAL_PID" 2>/dev/null || true
+		wait "$TRIAL_PID" 2>/dev/null || true
+		TRIAL_PID=""
+	fi
+
+	unmount_under "$TRIAL_DIR"
+	TRIAL_DIR=""
+}
+
+# unmount_under unmounts every mount at or under DIR, deepest first, lazily when a
+# plain unmount refuses, and fails when any is still there afterwards.
+#
+# THE MOUNT TABLE IS READ BEFORE IT IS FILTERED, both times: a findmnt that could
+# not answer is not a workspace with nothing mounted in it.
+unmount_under() {
+	local dir=${1%/} table target under
+	if ! table=$(findmnt -rn -o TARGET); then
+		echo "could not read the mount table to unmount what is under $dir" >&2
+		return 1
+	fi
+	under=$(awk -v dir="$dir" '$0 == dir || index($0, dir "/") == 1' <<<"$table" | sort -r)
+	while IFS= read -r target; do
+		[ -n "$target" ] || continue
+		umount "$target" 2>/dev/null || umount -l "$target" || true
+	done <<<"$under"
+
+	if ! table=$(findmnt -rn -o TARGET); then
+		echo "could not read the mount table to prove nothing is mounted under $dir" >&2
+		return 1
+	fi
+	if [ -n "$(awk -v dir="$dir" '$0 == dir || index($0, dir "/") == 1' <<<"$table")" ]; then
+		echo "something is still mounted under $dir" >&2
+		return 1
+	fi
+}
+
 # THE ORDER IS IN THE TRAP, NOT INSIDE EITHER FUNCTION. The machine booted on the
 # rootfs is stopped before the rootfs is unmounted, and unmount_rootfs refuses when
-# that stop could not be proved; the sequence is stated once, here.
-trap 'stop_runner_images; unmount_rootfs' EXIT
+# that stop could not be proved; the sequence is stated once, here. A trial
+# completion mounts the finished image, never the rootfs, after both.
+trap 'stop_runner_images; unmount_trial; unmount_rootfs' EXIT
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
 
@@ -569,18 +913,13 @@ run_runner_images_build() {
 # line is made a plain NAME=VALUE here by pam-environment.awk, the reader the build's own steps
 # use; and $HOME, which GitHub writes into PATH and XDG_CONFIG_HOME for a login
 # shell to expand, is the runner's home, which nothing downstream expands.
+#
+# THROUGH write-image-env.sh, the one writer of it, which the image's completer
+# runs again after it installs what the image left out (#584).
 write_image_env() {
 	local rootfs="$1"
-	awk -f "$SCRIPT_DIR/runner-images/pam-environment.awk" "$rootfs/etc/environment" |
-		sed -e 's#\$HOME#/home/runner#g' -e 's#\${HOME}#/home/runner#g' \
-		>"$rootfs/etc/billet-image-env.tmp"
-	if ! grep -q '^ImageOS=' "$rootfs/etc/billet-image-env.tmp"; then
-		echo "GitHub's build wrote no ImageOS to /etc/environment; refusing an image whose jobs" >&2
-		echo "would not see the variables a hosted runner exports" >&2
-		exit 1
-	fi
-	chmod 0644 "$rootfs/etc/billet-image-env.tmp"
-	mv "$rootfs/etc/billet-image-env.tmp" "$rootfs/etc/billet-image-env"
+	"$SCRIPT_DIR/runner-images/write-image-env.sh" "$rootfs/etc/environment" \
+		"$rootfs/etc/billet-image-env"
 }
 
 need_root() {
@@ -729,7 +1068,16 @@ main() {
 
 	clear_stale_mount "$rootfs"
 
-	rm -rf "$WORK"
+	# AND EVERYTHING ELSE MOUNTED IN THE WORKSPACE, which a trial completion that
+	# died leaves: the builder's own /dev and /run bound into an overlay there, which
+	# a recursive delete would empty. --one-file-system as well, so a mount nothing
+	# here knows about stops the delete at its edge.
+	if ! unmount_under "$WORK"; then
+		echo "refusing to clear $WORK while something is still mounted under it" >&2
+		exit 1
+	fi
+
+	rm -rf --one-file-system "$WORK"
 	mkdir -p "$rootfs"
 	touch "$WORK/.billet-guest-workspace"
 
@@ -890,10 +1238,18 @@ IMAGEINFO
 	# removed to make room; the go command verifies every module against go.sum.
 	install_guest_billet "$rootfs"
 
+	# WHAT EACH DEPLOYMENT INSTALLS BEFORE IT IMPORTS THE IMAGE, the components
+	# billet may not ship (#584).
+	install_completer "$rootfs"
+
 	# THE CONTAINER HOOK: GitHub's reference docker hook, pinned by version and
 	# sha256 the way the runner is, behind a wrapper that adds one mount. The
 	# runner runs it with its own node, so the guest needs no node of its own.
 	install_container_hook "$rootfs"
+
+	# THE NOTICES OF WHAT THE TEMPLATE INSTALLED outside apt, which the image
+	# redistributes with it.
+	install_image_notices "$rootfs"
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
 # Read this microVM's runner registration out of the metadata service and start the
@@ -2093,6 +2449,19 @@ NET
 
 	echo "built $img ($(du -h "$img" | cut -f1))"
 
+	# EVERY COMPONENT THE IMAGE LEAVES OUT IS COMPLETED ON A COPY BEFORE THE IMAGE
+	# IS DESCRIBED (#584), which is what proves a deployment can complete it and
+	# measures the space each needs. COMPLETION_TRIAL=skip is for a hand-run build
+	# with no route to the vendors; its manifest is then refused, because a node
+	# cannot complete an image whose components declare no space.
+	if [ "${COMPLETION_TRIAL:-run}" = skip ]; then
+		echo "COMPLETION_TRIAL=skip: no trial completion, so no manifest can describe this image" >&2
+		rm -f "$WORK/components.json"
+	else
+		echo "=== trial completion of what the image leaves out ==="
+		trial_completion "$img"
+	fi
+
 	# WHAT WAS ACTUALLY BUILT, WRITTEN WHERE SOMETHING ELSE CAN READ IT.
 	#
 	# RUNNER_VERSION may have arrived empty and been resolved from the pinned file
@@ -2115,6 +2484,7 @@ GUEST_CONTRACT=$contract
 ARCH=$(uname -m)
 IMAGE_NAME=$IMAGE_NAME
 IMAGE_FILE=$img
+LEFT_OUT="${COMPONENTS% }"
 INFO
 
 	echo "recorded $WORK/build-info.env"
@@ -2341,6 +2711,15 @@ publish() {
 	dev=""
 	MAPPED_DEV=""
 
+	# WHAT THE IMAGE LEFT OUT, AND THAT NOTHING WAS INSTALLED (#584), as
+	# ceph.SetComponents records it, BEFORE THE SNAPSHOT EXISTS: a generation with no
+	# record is read as one that left nothing out, which this one did not, and a
+	# deployment that accepts a component refuses to verify one that lacks it. A
+	# crash between the two leaves a record for a generation never made, which
+	# nothing reads.
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.components.$gen" \
+		"$(components_record)"
+
 	"${rbd[@]}" -p "$IMAGE_POOL" snap create "$IMAGE_NAME@$gen"
 
 	# WHAT THIS IMAGE ACTUALLY INSTALLED, recorded where anything with cluster access
@@ -2364,6 +2743,7 @@ publish() {
 	# Per generation, the value describes exactly the thing a tier can name.
 	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.runner_version.$gen" \
 		"$RUNNER_VERSION"
+
 
 	# The head keys stay as a record of the most recent build. Nothing reads them for
 	# a verdict; they are there so `image-meta list` says what happened last.
