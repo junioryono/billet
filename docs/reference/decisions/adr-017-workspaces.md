@@ -1,6 +1,6 @@
 # ADR-017: Workspaces, long-lived environments forked from a warm snapshot
 
-Proposed, 2026-10-16. Nothing here is implemented. The Firecracker facts it rests on were first a reading of the documentation; those the [workspace snapshots record](../records/workspace-snapshots.md) has since measured (2026-10-16, v1.16.1) are marked so under Measure before accepting, and the rest are still to be measured before this is accepted. Relates to issue #28: accepting this record revises the exposure rule #28 states for HTTP views (see The edge), and its attach transport is meant to serve #28's SSH item too.
+Proposed, 2026-10-16. Being implemented in stages, of which only the snapshot primitive (#508) has begun: Firecracker can capture a running microVM into a published snapshot and restore one through the launch path, and every restore refuses a snapshot taken where it cannot run (#521, which carried #551). No workspace resource, edge, credential home or command exists yet. The Firecracker facts it rests on were first a reading of the documentation; those the [workspace snapshots record](../records/workspace-snapshots.md) has since measured (2026-10-16, v1.16.1) are marked so under Measure before accepting, and the rest are still to be measured before this is accepted. Relates to issue #28: accepting this record revises the exposure rule #28 states for HTTP views (see The edge), and its attach transport is meant to serve #28's SSH item too.
 
 ## Context
 
