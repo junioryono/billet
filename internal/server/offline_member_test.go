@@ -651,3 +651,41 @@ func TestRetiringTheRunnerThatCoveredAJobCountsItAsWaiting(t *testing.T) {
 			"want %d", after.Unstarted, active, 1-active)
 	}
 }
+
+// A RETIREMENT WHOSE "UNKNOWN" DID NOT REACH THE LEDGER RELEASES NOTHING: the
+// runner is not destroyed and the journal keeps the member retiring, so the
+// next reconciliation retries it, and a drain never reads the ledger quiet
+// beside the count of none that had the runner covering the job.
+func TestARetirementWhoseUnknownDidNotLandReleasesNothing(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixture(t, reg)
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+
+	// THE PUBLICATION'S OWN BOUND, which nothing else on this path uses.
+	grace := f.l.releaseGrace
+	f.l.releaseGrace = 0
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{10899}) {
+		t.Fatalf("GitHub was asked to withdraw %v, want the member's registration, or nothing was retired",
+			reg.withdrawn)
+	}
+
+	if f.destroyed != 0 || len(reg.names) != 0 || f.status(t) != alloc.PoolRunnerRetiring {
+		t.Fatalf("with the unknown unpublished the retirement went on: %d destroyed, %d removals, "+
+			"status %s; want none, none and still retiring", f.destroyed, len(reg.names), f.status(t))
+	}
+
+	f.l.releaseGrace = grace
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace+time.Minute)
+
+	if f.destroyed != 1 || f.status(t) != "forgotten" {
+		t.Errorf("once the publication landed the journal did not finish the retirement: %d destroyed, "+
+			"status %s", f.destroyed, f.status(t))
+	}
+}

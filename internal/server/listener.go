@@ -1012,14 +1012,33 @@ func (l *Listener) Run(ctx context.Context) error {
 			// against the advertisement it carried. A delivery changes what GitHub
 			// has assigned, so it leaves the count undated, and until its own
 			// statistics are adopted no empty exchange can date the old ones.
+			delivered := err == nil && msg != nil
+
 			switch {
-			case err == nil && msg != nil:
-				l.observedAt, l.observedStale = time.Time{}, true
+			case delivered:
+				l.observedStale = true
+				l.undate()
 			case errors.Is(err, ErrNoMessage) && withdrawnWhenSent && l.observed != nil && !l.observedStale:
 				l.observedAt = l.clock()
 			}
 
-			l.reportCapacity(pollCtx, &advertised, "confirmed")
+			// AND THE DELIVERY'S COUNT IS UNKNOWN IN THE LEDGER BEFORE IT IS
+			// HANDLED: a completion in it can release the last runner while an
+			// assignment beside it waits, and a drain reading the quiet ledger
+			// beside the count before it would call the deployment drained. A
+			// publication that did not land leaves the message unacknowledged, and
+			// GitHub delivers it again.
+			if perr := l.publishCapacity(pollCtx, &advertised, "confirmed"); perr != nil {
+				l.log.Warn("could not report listener capacity", "tier", l.tier, "error", perr)
+
+				if delivered {
+					l.log.Error("could not record this tier's demand as unknown before handling a "+
+						"delivery; leaving it unacknowledged for GitHub to deliver again",
+						"tier", l.tier, "message", msg.MessageID)
+
+					continue
+				}
+			}
 		} else {
 			l.reportCapacity(context.WithoutCancel(pollCtx), nil, "ambiguous")
 		}

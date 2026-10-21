@@ -520,6 +520,17 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 	l.dropPoolMember(member)
 }
 
+// undate forgets GitHub's word on the statistics in hand: the count made from
+// them is unknown until counted again, and undated until an empty exchange sent
+// with the advertisement withdrawn vouches for what it is counted from.
+func (l *Listener) undate() {
+	l.observedAt = time.Time{}
+
+	l.mu.Lock()
+	l.demandKnown, l.demandAt = false, time.Time{}
+	l.mu.Unlock()
+}
+
 // forgetDemand publishes this tier's demand as unknown until the next
 // reconciliation counts it again.
 func (l *Listener) forgetDemand(ctx context.Context) error {
