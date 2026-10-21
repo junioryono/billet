@@ -174,6 +174,12 @@ func Exercise(ctx context.Context, n Need, marker string) (func() error, error) 
 		return nil, f.Close()
 
 	case Write, Private:
+		// AN EMPTY NAME IS NO DIRECTORY: given the separator below, it would be
+		// written as the root.
+		if n.Path == "" {
+			return nil, fmt.Errorf("a writable directory with no name: %w: the configuration names none", ErrUnknown)
+		}
+
 		// A `..` AFTER A LINK NAMES ONE DIRECTORY TO THE KERNEL AND ANOTHER TO A
 		// JOIN, and a command reaches its directories both ways (an open of the
 		// path, a filepath.Join of a file in it), so which one it writes cannot

@@ -52,6 +52,7 @@ func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
 		}}, "", "read-only file system"},
 		{"a lock with no way to take it", Need{Path: filepath.Join(dir, "z.lock"), Access: Lock}, "", "declares no way"},
 		{"a path it could not derive", Need{Path: dir, Access: Write, Unknown: "no identity yet"}, "", "no identity yet"},
+		{"a directory with no name", Need{Path: "", Access: Write}, "billet-unit-paths-gate", "no name"},
 	} {
 		_, err := Exercise(t.Context(), tc.need, tc.marker)
 
@@ -80,6 +81,10 @@ func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join(dir, "tmp", "billet-images"))
 	if err != nil || len(entries) != 0 {
 		t.Errorf("an unnamed marker was left behind (%v): %v", err, entries)
+	}
+
+	if _, err := Exercise(t.Context(), Need{Path: "", Access: Write}, "billet-unit-paths-gate"); !errors.Is(err, ErrUnknown) {
+		t.Errorf("a directory with no name is not could-not-tell: %v", err)
 	}
 
 	if _, err := Exercise(t.Context(), Need{Path: dir, Access: Lock, Unknown: "x"}, ""); !errors.Is(err, ErrUnknown) {
@@ -235,6 +240,13 @@ func TestAFIFOWhereADirectoryShouldBeIsRefusedWithoutAWait(t *testing.T) {
 			t.Error("a FIFO was written in as a directory")
 		}
 	case <-time.After(10 * time.Second):
+		// The writer this open releases the waiting exercise, so it ends before
+		// the test does.
+		if f, err := os.OpenFile(fifo, os.O_RDWR, 0); err == nil {
+			<-done
+			_ = f.Close()
+		}
+
 		t.Fatal("the exercise waited on a FIFO where a directory should be")
 	}
 }
