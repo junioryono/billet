@@ -16,6 +16,8 @@ package unitpath
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -214,24 +216,37 @@ func ValidMarker(name string) bool {
 // through a link at its name, and an unnamed one has a name nobody else has, so
 // the exercise cannot truncate a file a command keeps where it writes.
 func writeMarker(dir, marker string) error {
-	var (
-		f   *os.File
-		err error
-	)
+	name := marker
 
-	if marker == "" {
-		f, err = os.CreateTemp(dir, "."+MarkerPrefix+"*")
-	} else if !ValidMarker(marker) {
-		return fmt.Errorf("a marker is one plain file name beginning %s, not %q", MarkerPrefix, marker)
-	} else {
-		f, err = os.OpenFile(filepath.Join(dir, marker), os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if name == "" {
+		var raw [8]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return fmt.Errorf("name a marker: %w", err)
+		}
+
+		name = "." + MarkerPrefix + hex.EncodeToString(raw[:])
+	} else if !ValidMarker(name) {
+		return fmt.Errorf("a marker is one plain file name beginning %s, not %q", MarkerPrefix, name)
 	}
 
+	// THE DIRECTORY AS SPELLED, through a descriptor: the kernel resolves the
+	// name exactly as the command's own open does (a `..` after a link is the
+	// link target's parent, which joining strings would not be), and the marker
+	// is created in that directory and nowhere else, exclusively, never through
+	// a link at its name.
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return fmt.Errorf("write in %s: %w", dir, err)
 	}
 
-	path := f.Name()
+	defer func() { _ = root.Close() }()
+
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("write in %s: %w", dir, err)
+	}
+
+	path := dir + string(filepath.Separator) + name
 
 	if _, err := f.WriteString("written by billet local unit-paths --exercise\n"); err != nil {
 		_ = f.Close()
@@ -250,7 +265,7 @@ func writeMarker(dir, marker string) error {
 	}
 
 	if marker == "" {
-		return os.Remove(path)
+		return root.Remove(name)
 	}
 
 	return nil

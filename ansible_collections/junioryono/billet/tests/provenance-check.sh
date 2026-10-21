@@ -44,8 +44,9 @@ command -v ansible-playbook >/dev/null || { echo "provenance-check: no ansible-p
 
 work=$(mktemp -d)
 origin_pid=""
-# PROVENANCE_CHECK_KEEP=1 keeps the work directory (every case's log, the
-# origin, the overlays' uppers) for a failure's diagnosis.
+# PROVENANCE_CHECK_KEEP=1 keeps the work directory (every case's log and the
+# origin) for a failure's diagnosis. What the cases wrote at the real paths
+# lived in the private namespace's tmpfs, which is gone with it.
 cleanup() {
     [ -z "$origin_pid" ] || kill "$origin_pid" 2>/dev/null || true
     if [ "${PROVENANCE_CHECK_KEEP:-0}" = 1 ]; then

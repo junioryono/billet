@@ -179,6 +179,38 @@ func TestUniqueKeepsTheFirstOfEachPathAndAccess(t *testing.T) {
 	}
 }
 
+// A MARKER LANDS WHERE THE COMMAND'S OPEN WOULD: in the directory the path
+// names as the kernel resolves it, a `..` after a link included, never in the
+// directory the string would name if it were cleaned.
+func TestAMarkerLandsInTheDirectoryTheKernelResolves(t *testing.T) {
+	base := t.TempDir()
+
+	for _, dir := range []string{"real/child", "real/kernels", "kernels"} {
+		if err := os.MkdirAll(filepath.Join(base, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := os.Symlink(filepath.Join(base, "real", "child"), filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	spelled := base + "/link/../kernels"
+
+	need := Unique([]Need{{Path: spelled, Access: Write}})[0]
+	if _, err := Exercise(t.Context(), need, "billet-unit-paths-gate"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(base, "real", "kernels", "billet-unit-paths-gate")); err != nil {
+		t.Errorf("the marker is not in the directory %s resolves to: %v", spelled, err)
+	}
+
+	if _, err := os.Stat(filepath.Join(base, "kernels", "billet-unit-paths-gate")); !os.IsNotExist(err) {
+		t.Errorf("the marker landed in the directory the cleaned string names (%v)", err)
+	}
+}
+
 // A MARKER NEVER WRITES OVER ANYTHING: not an existing file at its name, not
 // through a link at its name, and never a name a command keeps.
 func TestAMarkerWritesOverNothing(t *testing.T) {
