@@ -405,7 +405,17 @@ func (c *Converger) ApplyDirectories(dirs []lifeops.DirectoryCreation) error {
 }
 
 // makeDirs creates path and its missing ancestors, each with mode.
+//
+// THE PLANNED DIRECTORY ITSELF IS READ WITHOUT FOLLOWING: one that became a
+// link after it was planned is refused, never written through. Its ancestors
+// are followed, as the plan followed them (a Mac's /var and /tmp are links):
+// this runs as the account in directories that account owns, so a link there
+// redirects nothing it could not do itself.
 func makeDirs(path string, mode fs.FileMode) error {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("launchd: create %s: it is a symbolic link now, so nothing was created through it", path)
+	}
+
 	var missing []string
 
 	// THE FIRST COMPONENT THAT EXISTS ENDS THE WALK, whatever it is: one that

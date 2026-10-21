@@ -95,10 +95,24 @@ func (f joinFixture) deployment(t *testing.T) string {
 func runJoin(t *testing.T, stdin string, args ...string) (string, error) {
 	t.Helper()
 
+	return runJoinLockedWith(t, stdin, func() {}, args...)
+}
+
+// runJoinLocked is runJoin with onLock run as the lock is taken.
+func runJoinLocked(t *testing.T, onLock func(), args ...string) (string, error) {
+	t.Helper()
+
+	return runJoinLockedWith(t, "", onLock, args...)
+}
+
+func runJoinLockedWith(t *testing.T, stdin string, onLock func(), args ...string) (string, error) {
+	t.Helper()
+
 	realLock := lifecycleLock
 	t.Cleanup(func() { lifecycleLock = realLock })
 	lifecycleLock = func() (*hostauthority.LifecycleLock, error) {
 		locksTaken++
+		onLock()
 
 		return &hostauthority.LifecycleLock{}, nil
 	}
@@ -139,8 +153,10 @@ func TestJoinAcceptMergesTheNodesHalfIntoTheControlPlane(t *testing.T) {
 	if !found {
 		t.Errorf("the proposed tier was not merged")
 	}
-	if info, err := os.Stat(f.configPath); err != nil || info.Mode().Perm() != 0o640 {
-		t.Errorf("the config's mode is %v (%v), want it kept at 0640", info.Mode().Perm(), err)
+	info, err := os.Stat(f.configPath)
+	mustOK(t, err)
+	if info.Mode().Perm() != 0o640 {
+		t.Errorf("the config's mode is %v, want it kept at 0640", info.Mode().Perm())
 	}
 	for _, want := range []string{"add tier      billet-4vcpu", "raise ceiling 8 vCPU, 32GiB -> 18 vCPU, 60GiB",
 		serverRestartCommand(), "billet nodes approve mac-1"} {
@@ -154,14 +170,14 @@ func TestJoinAcceptMergesTheNodesHalfIntoTheControlPlane(t *testing.T) {
 	if err := os.WriteFile(path, []byte(f.proposal(t, f.deployment(t))+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := os.ReadFile(f.configPath)
+	before := mustRead(t, f.configPath)
 	for _, arg := range []string{"@" + path, "-"} {
 		out, err := runJoin(t, f.proposal(t, f.deployment(t)), "accept", "--config", f.configPath, arg)
 		if err != nil || !strings.Contains(out, "nothing to change") {
 			t.Errorf("accepting %s again: %v\n%s", arg, err, out)
 		}
 	}
-	if after, _ := os.ReadFile(f.configPath); !bytes.Equal(before, after) {
+	if after := mustRead(t, f.configPath); after != before {
 		t.Errorf("accepting again rewrote the config")
 	}
 }
@@ -172,13 +188,13 @@ func TestJoinAcceptMergesTheNodesHalfIntoTheControlPlane(t *testing.T) {
 func TestJoinAcceptWritesNothingItShouldNot(t *testing.T) {
 	t.Run("dry run", func(t *testing.T) {
 		f := newJoinFixture(t)
-		before, _ := os.ReadFile(f.configPath)
+		before := mustRead(t, f.configPath)
 
 		out, err := runJoin(t, "", "accept", "--config", f.configPath, "--dry-run", f.proposal(t, f.deployment(t)))
 		if err != nil || !strings.Contains(out, "raise ceiling") || !strings.Contains(out, "--dry-run") {
 			t.Fatalf("dry run: %v\n%s", err, out)
 		}
-		if after, _ := os.ReadFile(f.configPath); !bytes.Equal(before, after) {
+		if after := mustRead(t, f.configPath); after != before {
 			t.Errorf("a dry run changed the config")
 		}
 	})
@@ -203,14 +219,14 @@ func TestJoinAcceptWritesNothingItShouldNot(t *testing.T) {
 				t.Errorf("the inventory form does not say %q:\n%s", want, out)
 			}
 		}
-		if after, _ := os.ReadFile(f.configPath); string(after) != rendered {
+		if after := mustRead(t, f.configPath); after != rendered {
 			t.Errorf("a rendered config was changed")
 		}
 	})
 
 	t.Run("another deployment", func(t *testing.T) {
 		f := newJoinFixture(t)
-		before, _ := os.ReadFile(f.configPath)
+		before := mustRead(t, f.configPath)
 
 		other := "fedcba9876543210fedcba9876543210"
 		if other == f.deployment(t) {
@@ -220,7 +236,7 @@ func TestJoinAcceptWritesNothingItShouldNot(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), other) {
 			t.Fatalf("another deployment's node was accepted: %v", err)
 		}
-		if after, _ := os.ReadFile(f.configPath); !bytes.Equal(before, after) {
+		if after := mustRead(t, f.configPath); after != before {
 			t.Errorf("a refused accept changed the config")
 		}
 	})

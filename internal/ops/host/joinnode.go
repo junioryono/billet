@@ -5,27 +5,48 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/ops/fleetops"
 	opsimages "github.com/junioryono/billet/internal/ops/images"
 	"github.com/junioryono/billet/internal/ops/setup"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // The steps `billet join` composes, each a seam so the order it imposes can be
 // asserted against fakes: none of them can run in the suite for real (one
 // fetches from a control plane, one waits for a person, one starts services).
 var (
+	// THE AUTHORITY, AND THEN WHO HOLDS IT: FetchCA holds the certificate to
+	// the fingerprint, and ConfirmAuthority reads the deployment over a
+	// handshake only the control plane can complete, before anything on this
+	// machine is changed (Codex, 2026-10-21).
 	joinFetchAuthority = func(ctx context.Context, base, fingerprint string) (string, error) {
-		_, deployment, err := nodeclient.FetchCA(ctx, base, fingerprint)
+		caPEM, _, err := nodeclient.FetchCA(ctx, base, fingerprint)
+		if err != nil {
+			return "", err
+		}
 
-		return deployment, err
+		deployment, err := nodeclient.ConfirmAuthority(ctx, base, caPEM)
+		if err != nil {
+			return "", err
+		}
+
+		if err := deploymentid.Validate(deployment); err != nil {
+			return "", fmt.Errorf("the control plane names no deployment billet would mint: %w", err)
+		}
+
+		return deployment, nil
 	}
 	joinGenerate   = setup.Init
 	joinEnroll     = fleetops.EnrollNode
@@ -115,9 +136,22 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 		return nil
 	}
 
+	// WHETHER INIT WROTE BESIDE THE CONFIG, read from the file it writes there:
+	// init returns success when it leaves a file it cannot prove is its own
+	// alone and writes `<path>.new`, and an old file can carry this join's name
+	// and server while differing in everything else.
+	beside := req.cfgPath + ".new"
+	besideBefore, besideErr := os.Lstat(beside)
+
 	fmt.Fprintf(env.Stdout, "\njoin     generating the node's config (billet init --join)\n\n")
 	if err := joinGenerate(ctx, env, initArgs); err != nil {
 		return err
+	}
+
+	if wroteBeside(beside, besideBefore, besideErr) {
+		return fmt.Errorf("billet join: billet init wrote %s beside the existing %s and left that alone, so "+
+			"nothing was enrolled or started. Merge the two, or run billet join again with --force to "+
+			"replace it", beside, req.cfgPath)
 	}
 
 	cfg, err := joinedConfig(req)
@@ -128,10 +162,18 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "\njoin     billet join does the steps above on this machine now; the control "+
 		"plane's half (`billet join accept`) and the approval are yours to run there.\n\n")
 
-	if enrolled(cfg) {
-		fmt.Fprintf(env.Stdout, "join     already enrolled: %s holds a certificate bundle\n", cfg.Node.TLS.CertPath)
-	} else if err := joinEnroll(ctx, env, cfg, base, req.fingerprint, req.token); err != nil {
-		return err
+	done, err := enrolled(cfg, req.nodeName, deployment)
+	switch {
+	case err != nil:
+		return fmt.Errorf("billet join: the certificate bundle at %s cannot be used (%w); move it aside "+
+			"and run billet join again to enroll", filepath.Dir(cfg.Node.TLS.CertPath), err)
+	case done:
+		fmt.Fprintf(env.Stdout, "join     already enrolled: %s is node %s's in deployment %s\n",
+			cfg.Node.TLS.CertPath, req.nodeName, deployment)
+	default:
+		if err := joinEnroll(ctx, env, cfg, base, req.fingerprint, req.token); err != nil {
+			return err
+		}
 	}
 
 	if cfg.Node.Provider == config.ProviderTart {
@@ -295,16 +337,81 @@ func joinedConfig(req joinRequest) (*config.Config, error) {
 	return cfg, nil
 }
 
-// enrolled reports whether the node already holds a whole bundle, so a re-run
-// after the approval goes straight on.
-func enrolled(cfg *config.Config) bool {
-	for _, p := range []string{cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath} {
-		if info, err := os.Stat(p); err != nil || !info.Mode().IsRegular() {
-			return false
-		}
+// wroteBeside reports whether the generation wrote the beside-file: it is
+// there now and was not before, or it is another file or was written since.
+// Could-not-tell (a read that fails) is a yes, which stops the join.
+func wroteBeside(path string, before fs.FileInfo, beforeErr error) bool {
+	after, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return false
+	case err != nil:
+		return true
+	case beforeErr != nil:
+		return true
 	}
 
-	return true
+	return !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size()
+}
+
+// enrolled reports whether the node already holds a whole bundle, so a re-run
+// after the approval goes straight on.
+//
+// A BUNDLE IS ENROLLED ONLY WHEN IT PROVES IT: none of its three files is
+// enrollment to do, and all three must load as a key pair that chains to the
+// authority beside it, name this node and this deployment, and still be valid.
+// Anything between (a partial bundle, an unreadable one, another node's or
+// another deployment's, an expired one) is refused rather than enrolled over or
+// started with.
+func enrolled(cfg *config.Config, name, deployment string) (bool, error) {
+	tls := cfg.Node.TLS
+	paths := []string{tls.CertPath, tls.KeyPath, tls.CAPath}
+
+	present := 0
+	for _, p := range paths {
+		switch _, err := os.Lstat(p); {
+		case err == nil:
+			present++
+		case !errors.Is(err, fs.ErrNotExist):
+			return false, fmt.Errorf("read %s: %w", p, err)
+		}
+	}
+	if present == 0 {
+		return false, nil
+	}
+
+	bundle, err := wirecert.LoadBundle(tls.CertPath, tls.KeyPath, tls.CAPath)
+	if err != nil {
+		return false, err
+	}
+	if _, err := wirecert.ClientTLS(bundle); err != nil {
+		return false, fmt.Errorf("it does not verify against itself: %w", err)
+	}
+
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		return false, err
+	}
+
+	got, err := bundle.NodeName()
+	if err != nil {
+		return false, err
+	}
+	dep, err := bundle.Deployment()
+	if err != nil {
+		return false, err
+	}
+
+	switch {
+	case got != name:
+		return false, fmt.Errorf("it is node %q's, not %q's", got, name)
+	case dep != deployment:
+		return false, fmt.Errorf("it is deployment %s's, not %s's", dep, deployment)
+	case !time.Now().Before(leaf.NotAfter):
+		return false, fmt.Errorf("it expired at %s", leaf.NotAfter.Format(time.RFC3339))
+	}
+
+	return true, nil
 }
 
 // defaultJoinProvider is the backend a join assumes on this platform.

@@ -240,9 +240,23 @@ func (p JoinProposal) ownEntriesOnly() error {
 			return fmt.Errorf("tier %s of the join proposal is pinned to %q, not to the joining node %q",
 				label, pin, p.Node)
 		}
-		if kind := scalarValue(t, "provider"); kind != "" && kind != string(p.Provider) {
-			return fmt.Errorf("tier %s of the join proposal runs on %s, and the joining node is %s",
-				label, kind, p.Provider)
+		// EVERY BACKEND THE TIER ACCEPTS, as billet reads it (`provider:` or a
+		// `providers:` list), and at least one: a tier naming none would take
+		// whatever the control plane's own node runs.
+		var tier config.Tier
+		if err := t.Decode(&tier); err != nil {
+			return fmt.Errorf("tier %s of the join proposal: %w", label, err)
+		}
+		kinds := tier.AcceptableProviders()
+		if len(kinds) == 0 {
+			return fmt.Errorf("tier %s of the join proposal names no backend, so it would take the control "+
+				"plane's own; it must name %s", label, p.Provider)
+		}
+		for _, kind := range kinds {
+			if kind != p.Provider {
+				return fmt.Errorf("tier %s of the join proposal runs on %s, and the joining node is %s",
+					label, kind, p.Provider)
+			}
 		}
 	}
 

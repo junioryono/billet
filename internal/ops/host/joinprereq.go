@@ -24,8 +24,8 @@ import (
 const prereqCommandWait = 2 * time.Minute
 
 // The prerequisites' seams: every command they run, the sudo that runs the
-// privileged half, and the paths a test points elsewhere. Nothing privileged
-// runs in the suite; what is recorded there is the argv.
+// privileged steps, and the paths and the owner a test points elsewhere.
+// Nothing privileged runs in the suite; what is recorded there is the argv.
 var (
 	prereqRun = func(ctx context.Context, name string, args ...string) (string, error) {
 		ctx, cancel := context.WithTimeout(ctx, prereqCommandWait)
@@ -42,7 +42,13 @@ var (
 		return cmd.Run()
 	}
 	prereqLookPath   = exec.LookPath
-	prereqExecutable = os.Executable
+	prereqLookupUser = user.Lookup
+	// prereqRootUID is the owner a directory above a root write must have, and
+	// prereqTrustRoot where the walk that checks it starts: no account but root
+	// can then replace a component under the command. Seams, because a test's
+	// directories are its own, under a temporary directory others may write.
+	prereqRootUID   = 0
+	prereqTrustRoot = "/"
 	// macServiceDirs are the directories a Mac's services need under the
 	// root-owned /usr/local, given to the node account (docs/deploying/mac-tart.md).
 	macServiceDirs = []string{
@@ -55,15 +61,30 @@ var (
 	linuxKVM       = "/dev/kvm"
 )
 
-// macRootStep is one thing the privileged half does: what it is, whether it
-// is already so, and how to make it so.
+// The system binaries the privileged steps run, by absolute path: macOS keeps
+// them on the sealed system volume, so the command sudo runs is the one named.
+const (
+	sudoPmset   = "/usr/bin/pmset"
+	sudoScutil  = "/usr/sbin/scutil"
+	sudoMkdir   = "/bin/mkdir"
+	sudoChown   = "/usr/sbin/chown"
+	sudoChmod   = "/bin/chmod"
+	sudoInstall = "/usr/bin/install"
+	sudoSshd    = "/usr/sbin/sshd"
+	sudoRm      = "/bin/rm"
+)
+
+// macRootStep is one prerequisite that needs root: what it is, whether it is
+// already so (read as this account), what must hold before root acts on it,
+// and the commands that make it so.
 type macRootStep struct {
 	what  string
 	done  func(ctx context.Context) (bool, error)
-	apply func(ctx context.Context) error
+	check func() error
+	apply func(ctx context.Context, env cli.Env) error
 }
 
-// macRootRequest is what the privileged half is asked to arrange.
+// macRootRequest is what the privileged steps arrange.
 type macRootRequest struct {
 	account, nodeName, softnet string
 	hardenSSH                  bool
@@ -71,6 +92,14 @@ type macRootRequest struct {
 
 // joinPrerequisites performs (macOS) or verifies (Linux) what this machine
 // needs before its node can run.
+//
+// BILLET NEVER RUNS AS ROOT ON A MAC. The steps that need root run as `sudo`
+// of the system binaries themselves, after one `sudo -v` so the password is
+// asked once, and every read before and after them runs as this account. The
+// first design ran `sudo billet join prerequisites` from os.Executable, and
+// the node account owns /usr/local/bin (the updater renames into it), so any
+// process running as that account could replace the binary sudo was about to
+// run as root (Codex, 2026-10-21).
 func joinPrerequisites(ctx context.Context, env cli.Env, req joinRequest) error {
 	if cli.HostOS == "linux" {
 		return verifyLinuxPrerequisites(ctx, env, req)
@@ -84,29 +113,32 @@ func joinPrerequisites(ctx context.Context, env cli.Env, req joinRequest) error 
 	root := macRootRequest{account: account.Username, nodeName: req.nodeName, hardenSSH: req.hardenSSH}
 
 	if req.provider == string(config.ProviderTart) {
-		if err := installTart(ctx, env, req.dryRun); err != nil {
+		installed, err := installTart(ctx, env, req.dryRun)
+		if err != nil {
 			return err
 		}
 
 		// THE GRANT ONLY FOR UNTRUSTED WORK: a trusted generation (a runner group)
 		// runs no softnet, and setuid-root is not given to a binary nothing uses.
-		if req.runnerGroup == "" {
+		switch {
+		case req.runnerGroup != "":
+		case !installed:
+			fmt.Fprintln(env.Stdout, "join     would let softnet confine untrusted guests once it is installed")
+		default:
 			if root.softnet, err = resolveSoftnet(); err != nil {
 				return err
 			}
 		}
 	}
 
-	steps := macRootSteps(root)
-
-	var owed []string
-	for _, s := range steps {
+	var owed []macRootStep
+	for _, s := range macRootSteps(root) {
 		done, err := s.done(ctx)
 		if err != nil {
-			return fmt.Errorf("billet join: %s: %w", s.what, err)
+			return fmt.Errorf("billet join: %s: could not tell whether it is done: %w", s.what, err)
 		}
 		if !done {
-			owed = append(owed, s.what)
+			owed = append(owed, s)
 		}
 	}
 
@@ -116,49 +148,71 @@ func joinPrerequisites(ctx context.Context, env cli.Env, req joinRequest) error 
 		return nil
 	}
 
-	for _, what := range owed {
-		fmt.Fprintf(env.Stdout, "join     needs root: %s\n", what)
+	for _, s := range owed {
+		fmt.Fprintf(env.Stdout, "join     needs root: %s\n", s.what)
 	}
 
 	if req.dryRun {
 		return nil
 	}
 
-	self, err := prereqExecutable()
-	if err != nil {
-		return fmt.Errorf("billet join: find this billet to run its privileged half: %w", err)
+	// EVERY PRE-CHECK BEFORE THE PASSWORD, so a refused step asks for nothing.
+	for _, s := range owed {
+		if s.check == nil {
+			continue
+		}
+		if err := s.check(); err != nil {
+			return fmt.Errorf("billet join: %s: %w; nothing was run as root", s.what, err)
+		}
 	}
 
-	args := []string{self, "join", "prerequisites", "--account", root.account, "--node-name", root.nodeName}
-	if root.softnet != "" {
-		args = append(args, "--softnet", root.softnet)
-	}
-	if root.hardenSSH {
-		args = append(args, "--harden-ssh")
+	fmt.Fprintln(env.Stdout, "join     asking for sudo once for these (a host whose sudo keeps no timestamp asks for each)")
+	if err := prereqSudo(ctx, env, []string{"-v"}); err != nil {
+		return fmt.Errorf("billet join: sudo: %w; nothing was run as root", err)
 	}
 
-	fmt.Fprintf(env.Stdout, "join     sudo %s\n", cli.ShellArgs(args))
+	for _, s := range owed {
+		if err := s.apply(ctx, env); err != nil {
+			return fmt.Errorf("billet join: %s: %w (what was done before it is kept, and a re-run does the rest)",
+				s.what, err)
+		}
 
-	if err := prereqSudo(ctx, env, args); err != nil {
-		return fmt.Errorf("billet join: the privileged prerequisites did not finish (%w); what they did "+
-			"is kept, and a re-run does the rest", err)
+		// PROVED, NOT ASSUMED: a command that exits 0 and changes nothing is a
+		// step not done.
+		if done, err := s.done(ctx); err != nil || !done {
+			return fmt.Errorf("billet join: %s: done, and it still does not read back as done (%v)", s.what, err)
+		}
+
+		fmt.Fprintf(env.Stdout, "done     %s\n", s.what)
+	}
+
+	return nil
+}
+
+// sudoRun runs one system binary as root, printing it first.
+func sudoRun(ctx context.Context, env cli.Env, argv ...string) error {
+	fmt.Fprintf(env.Stdout, "         sudo %s\n", cli.ShellArgs(argv))
+
+	if err := prereqSudo(ctx, env, argv); err != nil {
+		return fmt.Errorf("sudo %s: %w", cli.ShellArgs(argv), err)
 	}
 
 	return nil
 }
 
 // installTart installs tart and softnet with Homebrew when either is missing,
-// as this account: Homebrew refuses to run as root.
-func installTart(ctx context.Context, env cli.Env, dryRun bool) error {
+// as this account: Homebrew refuses to run as root. It reports whether both
+// are installed now, which a dry run leaves false when they were not.
+func installTart(ctx context.Context, env cli.Env, dryRun bool) (bool, error) {
 	_, tartErr := prereqLookPath("tart")
 	_, softnetErr := prereqLookPath("softnet")
 	if tartErr == nil && softnetErr == nil {
-		return nil
+		return true, nil
 	}
 
 	brew, err := prereqLookPath("brew")
 	if err != nil {
-		return errors.New("billet join: tart is not installed, and neither is Homebrew, which installs it: " +
+		return false, errors.New("billet join: tart is not installed, and neither is Homebrew, which installs it: " +
 			"install Homebrew (https://brew.sh), then run this again")
 	}
 
@@ -166,14 +220,14 @@ func installTart(ctx context.Context, env cli.Env, dryRun bool) error {
 	fmt.Fprintf(env.Stdout, "join     %s %s\n", brew, strings.Join(args, " "))
 
 	if dryRun {
-		return nil
+		return false, nil
 	}
 
 	if out, err := prereqRun(ctx, brew, args...); err != nil {
-		return fmt.Errorf("billet join: brew install: %w\n%s", err, out)
+		return false, fmt.Errorf("billet join: brew install: %w\n%s", err, out)
 	}
 
-	return nil
+	return true, nil
 }
 
 // resolveSoftnet is the softnet file a grant would land on: the Cellar target
@@ -203,20 +257,20 @@ func resolveSoftnet() (string, error) {
 // macRootSteps are the privileged prerequisites, in order.
 func macRootSteps(r macRootRequest) []macRootStep {
 	steps := []macRootStep{{
-		what:  "keep the Mac awake (pmset -a sleep 0 disksleep 0)",
-		done:  pmsetAwake,
-		apply: func(ctx context.Context) error { return runStep(ctx, "pmset", "-a", "sleep", "0", "disksleep", "0") },
+		what: "keep the Mac awake (pmset -a sleep 0 disksleep 0)",
+		done: pmsetAwake,
+		apply: func(ctx context.Context, env cli.Env) error {
+			return sudoRun(ctx, env, sudoPmset, "-a", "sleep", "0", "disksleep", "0")
+		},
 	}}
 
 	for _, key := range []string{"HostName", "LocalHostName", "ComputerName"} {
 		steps = append(steps, macRootStep{
 			what: fmt.Sprintf("name the Mac %s (scutil --set %s)", r.nodeName, key),
-			done: func(ctx context.Context) (bool, error) {
-				out, err := prereqRun(ctx, "scutil", "--get", key)
-
-				return err == nil && strings.TrimSpace(out) == r.nodeName, nil
+			done: func(ctx context.Context) (bool, error) { return scutilNamed(ctx, key, r.nodeName) },
+			apply: func(ctx context.Context, env cli.Env) error {
+				return sudoRun(ctx, env, sudoScutil, "--set", key, r.nodeName)
 			},
-			apply: func(ctx context.Context) error { return runStep(ctx, "scutil", "--set", key, r.nodeName) },
 		})
 	}
 
@@ -224,7 +278,14 @@ func macRootSteps(r macRootRequest) []macRootStep {
 		steps = append(steps, macRootStep{
 			what:  fmt.Sprintf("give %s to %s", dir, r.account),
 			done:  func(context.Context) (bool, error) { return ownedBy(dir, r.account) },
-			apply: func(context.Context) error { return giveDir(dir, r.account) },
+			check: func() error { return rootOwnedAbove(dir) },
+			apply: func(ctx context.Context, env cli.Env) error {
+				if err := sudoRun(ctx, env, sudoMkdir, "-p", dir); err != nil {
+					return err
+				}
+
+				return sudoRun(ctx, env, sudoChown, "-h", r.account, dir)
+			},
 		})
 	}
 
@@ -232,7 +293,15 @@ func macRootSteps(r macRootRequest) []macRootStep {
 		steps = append(steps, macRootStep{
 			what:  fmt.Sprintf("let softnet confine untrusted guests (chown root, then chmod u+s %s)", r.softnet),
 			done:  func(context.Context) (bool, error) { return softnetGranted(r.softnet) },
-			apply: func(context.Context) error { return grantSoftnet(r.softnet) },
+			check: func() error { return grantableSoftnet(r.softnet, r.account) },
+			// BOTH, IN THIS ORDER: chown clears the setuid bit (measured on macOS).
+			apply: func(ctx context.Context, env cli.Env) error {
+				if err := sudoRun(ctx, env, sudoChown, "-h", "root", r.softnet); err != nil {
+					return err
+				}
+
+				return sudoRun(ctx, env, sudoChmod, "u+s", r.softnet)
+			},
 		})
 	}
 
@@ -240,77 +309,12 @@ func macRootSteps(r macRootRequest) []macRootStep {
 		steps = append(steps, macRootStep{
 			what:  fmt.Sprintf("allow only key logins, as %s, over SSH (%s)", r.account, sshdDropIn),
 			done:  func(context.Context) (bool, error) { return sshdHardened(r.account) },
-			apply: func(ctx context.Context) error { return hardenSSHD(ctx, r.account) },
+			check: func() error { return sshdHardenable(r.account) },
+			apply: func(ctx context.Context, env cli.Env) error { return hardenSSHD(ctx, env, r.account) },
 		})
 	}
 
 	return steps
-}
-
-// joinPrerequisitesRoot is `billet join prerequisites`, the privileged half
-// `billet join` runs under sudo on a Mac. Each step is read first, applied
-// only where it differs, and read again afterwards.
-func joinPrerequisitesRoot(ctx context.Context, env cli.Env, args []string) error {
-	var r macRootRequest
-
-	fs := cli.NewFlagSet("billet join prerequisites", env.Stdout)
-	fs.StringVar(&r.account, "account", "", "the account that will run the node (required)")
-	fs.StringVar(&r.nodeName, "node-name", "", "this Mac's node name (required)")
-	fs.StringVar(&r.softnet, "softnet", "", "the resolved softnet to make setuid-root")
-	fs.BoolVar(&r.hardenSSH, "harden-ssh", false, "also write the key-only sshd drop-in")
-
-	if err := cli.Parse(fs, args); err != nil {
-		return err
-	}
-
-	if cli.HostOS != "darwin" {
-		return errors.New("billet join prerequisites: it prepares a Mac; on Linux the package and the host " +
-			"role prepare a node")
-	}
-	if joinGeteuid() != 0 {
-		return errors.New("billet join prerequisites: run by `billet join` under sudo; it needs root")
-	}
-	if r.account == "" || r.account == "root" {
-		return errors.New("billet join prerequisites: --account must name the account that will run the node")
-	}
-	if err := config.ValidateNodeName("--node-name", r.nodeName); err != nil {
-		return err
-	}
-
-	for _, s := range macRootSteps(r) {
-		done, err := s.done(ctx)
-		if err != nil {
-			return fmt.Errorf("%s: %w", s.what, err)
-		}
-		if done {
-			fmt.Fprintf(env.Stdout, "ok       %s\n", s.what)
-
-			continue
-		}
-
-		if err := s.apply(ctx); err != nil {
-			return fmt.Errorf("%s: %w", s.what, err)
-		}
-
-		// PROVED, NOT ASSUMED: a command that exits 0 and changes nothing is a
-		// step not done.
-		if done, err := s.done(ctx); err != nil || !done {
-			return fmt.Errorf("%s: done, and it still does not read back as done (%v)", s.what, err)
-		}
-
-		fmt.Fprintf(env.Stdout, "done     %s\n", s.what)
-	}
-
-	return nil
-}
-
-// runStep runs one command, failing with its output.
-func runStep(ctx context.Context, name string, args ...string) error {
-	if out, err := prereqRun(ctx, name, args...); err != nil {
-		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out)
-	}
-
-	return nil
 }
 
 // pmsetAwake reads whether system and disk sleep are both off.
@@ -331,6 +335,20 @@ func pmsetAwake(ctx context.Context) (bool, error) {
 	return values["sleep"] == "0" && values["disksleep"] == "0", nil
 }
 
+// scutilNamed reads whether a system name is already want. An unset name is
+// no; any other failure is could-not-tell, never no.
+func scutilNamed(ctx context.Context, key, want string) (bool, error) {
+	out, err := prereqRun(ctx, "scutil", "--get", key)
+	switch {
+	case err == nil:
+		return strings.TrimSpace(out) == want, nil
+	case strings.Contains(out, "not set"):
+		return false, nil
+	default:
+		return false, fmt.Errorf("scutil --get %s: %w %s", key, err, strings.TrimSpace(out))
+	}
+}
+
 // ownedBy reports whether dir is a directory account owns. Absent is not
 // owned; anything else unreadable is an error, never a no.
 func ownedBy(dir, account string) (bool, error) {
@@ -346,80 +364,114 @@ func ownedBy(dir, account string) (bool, error) {
 	case err != nil:
 		return false, err
 	case !info.IsDir():
-		return false, fmt.Errorf("%s is not a directory", dir)
+		return false, fmt.Errorf("%s is a %s, not a directory", dir, info.Mode().Type())
 	}
 
 	return fileOwner(info) == uid, nil
 }
 
-// giveDir creates dir and hands it to account, never following a symlink.
-func giveDir(dir, account string) error {
-	uid, gid, err := accountIDs(account)
-	if err != nil {
-		return err
+// rootOwnedAbove holds what root is about to create and hand over to a tree no
+// other account can change under it: every existing component above dir is a
+// real directory root owns that no group or other may write, and dir itself,
+// if it exists, is a directory and not a link. Then nothing can turn a
+// component into a link between this check and the commands.
+func rootOwnedAbove(dir string) error {
+	dir = filepath.Clean(dir)
+	top := filepath.Clean(prereqTrustRoot)
+
+	rel, err := filepath.Rel(top, dir)
+	if !filepath.IsAbs(dir) || err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("%s is not an absolute path under %s", dir, top)
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	parts := strings.Split(rel, string(filepath.Separator))
+	at := top
+
+	for i, part := range parts {
+		at = filepath.Join(at, part)
+
+		info, err := os.Lstat(at)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		last := i == len(parts)-1
+		switch {
+		case info.Mode()&fs.ModeSymlink != 0:
+			return fmt.Errorf("%s is a symbolic link, and root will not create or hand over through one", at)
+		case !info.IsDir():
+			return fmt.Errorf("%s is not a directory", at)
+		case !last && (fileOwner(info) != prereqRootUID || info.Mode().Perm()&0o022 != 0):
+			return fmt.Errorf("%s is not a directory only root can change (owner uid %d, mode %04o), so what "+
+				"root would create under it could be redirected", at, fileOwner(info), info.Mode().Perm())
+		}
 	}
 
-	info, err := os.Lstat(dir)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("%s is a %s, not a directory, so it was not handed over", dir, info.Mode().Type())
-	}
-
-	return os.Lchown(dir, uid, gid)
+	return nil
 }
 
 // softnetGranted reports whether the softnet file is setuid and root's.
 func softnetGranted(path string) (bool, error) {
-	info, err := checkedSoftnet(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return false, err
 	}
-
-	return info.Mode()&fs.ModeSetuid != 0 && fileOwner(info) == 0, nil
-}
-
-// grantSoftnet makes softnet setuid-root: chown first, because chown clears
-// the setuid bit (measured on macOS), then the bit.
-func grantSoftnet(path string) error {
-	info, err := checkedSoftnet(path)
-	if err != nil {
-		return err
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular file", path)
 	}
 
-	if err := os.Lchown(path, 0, -1); err != nil {
-		return err
-	}
-
-	return os.Chmod(path, info.Mode().Perm()|fs.ModeSetuid)
+	return info.Mode()&fs.ModeSetuid != 0 && fileOwner(info) == prereqRootUID, nil
 }
 
-// checkedSoftnet refuses a softnet path that is not a regular file named
-// softnet inside a Homebrew Cellar: root is about to make it setuid-root.
-func checkedSoftnet(path string) (fs.FileInfo, error) {
+// grantableSoftnet refuses a softnet that root should not make setuid-root: it
+// must be a regular file named softnet inside a Homebrew Cellar, reached by no
+// symbolic link, with one name only (a hard link could be another program),
+// and owned by this account or root.
+//
+// WHAT IS LEFT IS THE MANUAL GRANT'S OWN RACE: the Cellar is this account's, so
+// a process running as it could swap the file between this check and the two
+// commands, exactly as it could between `billet check`'s printed commands and
+// an operator typing them. Closing that needs root code holding the file open,
+// which is what this command no longer runs.
+func grantableSoftnet(path, account string) error {
 	inCellar := false
 	for _, cellar := range softnetCellars {
 		inCellar = inCellar || strings.HasPrefix(filepath.Clean(path), cellar)
 	}
 
 	if !filepath.IsAbs(path) || filepath.Base(path) != "softnet" || !inCellar {
-		return nil, fmt.Errorf("%s is not a softnet inside a Homebrew Cellar, so it is not made setuid-root", path)
+		return fmt.Errorf("%s is not a softnet inside a Homebrew Cellar, so it is not made setuid-root", path)
+	}
+
+	if resolved, err := filepath.EvalSymlinks(path); err != nil || resolved != filepath.Clean(path) {
+		return fmt.Errorf("%s is reached through a symbolic link (%v), so it is not made setuid-root", path, err)
 	}
 
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file, so it is not made setuid-root", path)
+		return err
 	}
 
-	return info, nil
+	uid, _, err := accountIDs(account)
+	if err != nil {
+		return err
+	}
+
+	st, ok := info.Sys().(*syscall.Stat_t)
+	switch {
+	case !info.Mode().IsRegular():
+		return fmt.Errorf("%s is not a regular file, so it is not made setuid-root", path)
+	case !ok || st.Nlink != 1:
+		return fmt.Errorf("%s has more than one name, so it may be another program, and it is not made setuid-root", path)
+	case fileOwner(info) != uid && fileOwner(info) != prereqRootUID:
+		return fmt.Errorf("%s belongs to uid %d, neither %s nor root, so it is not made setuid-root",
+			path, fileOwner(info), account)
+	}
+
+	return nil
 }
 
 // sshdDropInBody is the key-only drop-in, from
@@ -431,10 +483,18 @@ func sshdDropInBody(account string) string {
 
 // sshdHardened reports whether the drop-in says exactly what it should.
 func sshdHardened(account string) (bool, error) {
-	raw, err := os.ReadFile(sshdDropIn)
+	info, err := os.Lstat(sshdDropIn)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular file", sshdDropIn)
+	}
+
+	raw, err := os.ReadFile(sshdDropIn)
 	if err != nil {
 		return false, err
 	}
@@ -442,13 +502,18 @@ func sshdHardened(account string) (bool, error) {
 	return string(raw) == sshdDropInBody(account), nil
 }
 
-// hardenSSHD writes the drop-in, and removes it again when sshd refuses the
-// result.
-//
-// ONLY OVER A KEY THIS ACCOUNT HOLDS: with no authorized key, key-only SSH is
-// no SSH at all for it, and AllowUsers shuts every other account out.
-func hardenSSHD(ctx context.Context, account string) error {
-	u, err := user.Lookup(account)
+// sshdHardenable refuses the drop-in where it would take something away:
+// over a drop-in already there (whatever it says, it is someone's policy, and
+// a refused one would be removed rather than restored), and for an account
+// with no key in its authorized_keys, for which key-only SSH is no SSH at all
+// while AllowUsers shuts every other account out.
+func sshdHardenable(account string) error {
+	if _, err := os.Lstat(sshdDropIn); !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%s is already there (%v); merge the four lines from the reference hardware page "+
+			"into it yourself", sshdDropIn, err)
+	}
+
+	u, err := prereqLookupUser(account)
 	if err != nil {
 		return err
 	}
@@ -458,17 +523,39 @@ func hardenSSHD(ctx context.Context, account string) error {
 			"in; add one, prove a key login, and run this again", account)
 	}
 
-	if err := os.WriteFile(sshdDropIn, []byte(sshdDropInBody(account)), 0o644); err != nil {
+	return nil
+}
+
+// hardenSSHD installs the drop-in and removes it again when sshd refuses the
+// result: it was not there before (sshdHardenable), so removing it is the
+// exact state it found.
+func hardenSSHD(ctx context.Context, env cli.Env, account string) error {
+	staged, err := os.CreateTemp("", "billet-sshd-*.conf")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(staged.Name()) }()
+
+	if _, err := staged.WriteString(sshdDropInBody(account)); err != nil {
+		_ = staged.Close()
+
+		return err
+	}
+	if err := staged.Close(); err != nil {
 		return err
 	}
 
-	if out, err := prereqRun(ctx, "sshd", "-t"); err != nil {
-		if rmErr := os.Remove(sshdDropIn); rmErr != nil {
-			return fmt.Errorf("sshd -t refused the drop-in (%w: %s), and removing it again failed: %v: "+
-				"remove %s by hand before sshd restarts", err, strings.TrimSpace(out), rmErr, sshdDropIn)
+	if err := sudoRun(ctx, env, sudoInstall, "-o", "root", "-g", "wheel", "-m", "0644", staged.Name(), sshdDropIn); err != nil {
+		return err
+	}
+
+	if err := sudoRun(ctx, env, sudoSshd, "-t"); err != nil {
+		if rmErr := sudoRun(ctx, env, sudoRm, "-f", sshdDropIn); rmErr != nil {
+			return fmt.Errorf("sshd refused the drop-in (%w), and removing it again failed: %v: remove %s by "+
+				"hand before sshd restarts", err, rmErr, sshdDropIn)
 		}
 
-		return fmt.Errorf("sshd -t refused the drop-in, so it was removed again: %w: %s", err, strings.TrimSpace(out))
+		return fmt.Errorf("sshd refused the drop-in, so it was removed again: %w", err)
 	}
 
 	return nil
@@ -501,7 +588,7 @@ func fileOwner(info fs.FileInfo) int {
 
 // accountIDs is an account's uid and primary gid.
 func accountIDs(account string) (int, int, error) {
-	u, err := user.Lookup(account)
+	u, err := prereqLookupUser(account)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -525,7 +612,7 @@ func accountIDs(account string) (int, int, error) {
 func verifyLinuxPrerequisites(ctx context.Context, env cli.Env, req joinRequest) error {
 	var missing []string
 
-	if _, err := user.Lookup(initconfig.ServiceGroup); err != nil {
+	if _, err := prereqLookupUser(initconfig.ServiceGroup); err != nil {
 		missing = append(missing, fmt.Sprintf("the %s account, which the package's postinstall creates: "+
 			"install the billet .deb or .rpm", initconfig.ServiceGroup))
 	}

@@ -89,6 +89,46 @@ func TestAccountOfAnswersTheAccountUnderItsWait(t *testing.T) {
 	})
 }
 
+// productionHybridAccount is hybridAccount as the package declares it,
+// captured before the suite's init replaces it: package variables are
+// initialised before any init function runs.
+var productionHybridAccount = hybridAccount
+
+// THE RENDER'S OWN ACCOUNT CHECK GOES THROUGH accountOf, for the render's
+// region: run under a bubble against a service that never answers, it gives up
+// at exactly the wait, which a call that skipped accountOf would never do.
+func TestTheRendersAccountCheckAsksSTSUnderTheWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		creds := awscreds.Static{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "secret"}
+		hold := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			<-r.Context().Done()
+
+			return nil, r.Context().Err()
+		})
+
+		var regions []string
+		prev := hybridSTS
+		t.Cleanup(func() { hybridSTS = prev })
+		hybridSTS = func(region string) *awssts.Client {
+			regions = append(regions, region)
+
+			return awssts.New(region, "https://sts.invalid/", creds, &http.Client{Transport: hold})
+		}
+
+		start := time.Now()
+		_, err := productionHybridAccount(t.Context(), "eu-north-1")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("the render's account check gave %v, want the wait's deadline", err)
+		}
+		if elapsed := time.Since(start); elapsed != hybridAccountWait {
+			t.Errorf("it gave up after %s, want the wait of %s", elapsed, hybridAccountWait)
+		}
+		if len(regions) != 1 || regions[0] != "eu-north-1" {
+			t.Errorf("it asked STS for %v, want the render's region once", regions)
+		}
+	})
+}
+
 // roundTripFunc is an http.RoundTripper made of one function.
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -509,8 +549,9 @@ func TestInitHybridRefusesAnUnreadableOrOtherRecord(t *testing.T) {
 	if err := os.WriteFile(record, []byte(testGeneration+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := recordHybridGeneration(out, "fedc-ba98-7654-3210"); err == nil {
-		t.Error("a second generation replaced the one recorded")
+	if err := recordHybridGeneration(out, "fedc-ba98-7654-3210"); err == nil ||
+		!strings.Contains(err.Error(), "records "+testGeneration) {
+		t.Errorf("a second generation over the one recorded answered %v", err)
 	}
 	if err := recordHybridGeneration(out, testGeneration); err != nil {
 		t.Errorf("recording the generation already recorded was refused: %v", err)
@@ -544,8 +585,9 @@ func TestInitHybridRefusesAnUnboundGeneration(t *testing.T) {
 	other := "fedc-ba98-7654-3210"
 	args := append(hybridArgsMinting(out, cfg), "--generation", other)
 	_, err = runInitHybrid(t, args...)
-	if err == nil {
-		t.Fatal("a second generation was rendered into a directory whose root declares another")
+	if err == nil || !strings.Contains(err.Error(), "are two generations") {
+		t.Fatalf("a second generation into a directory that records another answered %v, want the "+
+			"refusal before the lock", err)
 	}
 	for _, want := range []string{other, testGeneration} {
 		if !strings.Contains(err.Error(), want) {
@@ -557,8 +599,9 @@ func TestInitHybridRefusesAnUnboundGeneration(t *testing.T) {
 	}
 
 	for _, bad := range []string{"", "0123"} {
-		if _, err := runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--generation", bad)...); err == nil {
-			t.Errorf("--generation %q was accepted", bad)
+		_, err := runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--generation", bad)...)
+		if err == nil || !strings.Contains(err.Error(), "is not a generation fingerprint") {
+			t.Errorf("--generation %q answered %v, want the fingerprint refusal", bad, err)
 		}
 	}
 }
@@ -612,6 +655,15 @@ func TestInitHybridGivesAnOldRootTheWayThrough(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not give the way through (%q): %v", want, err)
 		}
+	}
+
+	// AND THE STEP THE REMEDY NAMES: with --generation passed, the outputs
+	// themselves are read and refused for lacking the binding, with the merge
+	// that adds it.
+	_, err = runInitHybrid(t, append(hybridArgsMinting(out, cfg), "--terraform-output", outputs,
+		"--generation", testGeneration)...)
+	if err == nil || !strings.Contains(err.Error(), "rendered before billet bound its outputs") {
+		t.Errorf("an old root's outputs with --generation answered %v, want the outputs' own refusal", err)
 	}
 }
 

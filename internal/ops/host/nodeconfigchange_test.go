@@ -142,7 +142,7 @@ tiers:
 		{"the node block changed", base, nodeChanged, configChangeRestart, "[node]"},
 		{"another key the node reads", base, siteAdded, configChangeRestart, "images"},
 		{"the candidate runs a control plane", base, withServer, configChangeRestart, "this host runs the control plane too"},
-		{"the installed one ran a control plane", withServer, withServer, configChangeRestart, "this host runs the control plane too"},
+		{"the installed one ran a control plane", withServer, base, configChangeRestart, "this host runs the control plane too"},
 		{"the candidate does not load", base, broken, configChangeRestart, "does not load"},
 		{"a name YAML reads as the same boolean", trueName, trueNameUpper, configChangeRestart, "as billet loads it"},
 	} {
@@ -182,12 +182,12 @@ func TestNodeConfigChangeRestartsWhenAFileCannotBeRead(t *testing.T) {
 		t.Errorf("an unreadable installed file answered %+v, want restart naming it", answer)
 	}
 
-	for _, args := range [][]string{
-		{"--installed", present, "--candidate", present},
-		{"--candidate", present, "--json"},
+	for want, args := range map[string][]string{
+		"pass --json":       {"--installed", present, "--candidate", present},
+		"are both required": {"--candidate", present, "--json"},
 	} {
-		if err := NodeConfigChange(t.Context(), env, args); err == nil {
-			t.Errorf("%v was accepted", args)
+		if err := NodeConfigChange(t.Context(), env, args); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%v answered %v, want a refusal saying %q", args, err, want)
 		}
 	}
 }

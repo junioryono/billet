@@ -30,7 +30,13 @@ var hybridAccountWait = 30 * time.Second
 // belong to. A seam, so the suite never reaches AWS; what it calls is
 // accountOf, which the suite tests against a stand-in for STS.
 var hybridAccount = func(ctx context.Context, region string) (string, error) {
-	return accountOf(ctx, awssts.New(region, "", awscreds.Default(), nil))
+	return accountOf(ctx, hybridSTS(region))
+}
+
+// hybridSTS is the client hybridAccount asks, for the region the render signs
+// into. A seam, so a test runs hybridAccount itself against a stand-in.
+var hybridSTS = func(region string) *awssts.Client {
+	return awssts.New(region, "", awscreds.Default(), nil)
 }
 
 // accountOf is the account a caller identity answer names, under the wait.

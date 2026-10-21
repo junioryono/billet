@@ -615,3 +615,52 @@
       loop_control:
         loop_var: billet_gate_verdict_case
         label: "{{ billet_gate_verdict_case.name }}"
+
+# THE VERDICT TASK ITSELF (node-config-verdict.yml), against a scripted answerer:
+# it asks only when the configuration changes, the node will run and an
+# answerer is there; asks about the installed file and a candidate beside it
+# that is the rendering; keeps the node only on billet's keep; and leaves no
+# candidate behind. THE ZERO VALUE IS THE RESTART, so every case that does not
+# ask is the preview's change.
+- name: Prove the verdict task asks billet and restarts unless billet keeps
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_verdict_cases:
+      - {name: keep, verdict: keep, changed: false, asked: true}
+      - {name: restart, verdict: restart, changed: true, asked: true}
+      - {name: a-release-without-the-verb, verdict: absent, changed: true, asked: true}
+      - {name: no-answerer, answerer: false, changed: true, asked: false}
+      - {name: no-change, preview_changed: false, changed: false, asked: false}
+      - {name: a-node-that-will-not-run, should_run: false, changed: true, asked: false}
+  tasks:
+    - name: Create the case directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -node-config-verdict
+      register: billet_gate_verdict_root
+
+    - name: Create the configuration directory
+      ansible.builtin.file:
+        path: "{{ billet_gate_verdict_root.path }}/etc"
+        state: directory
+        mode: "0755"
+
+    - name: Install the configuration the node runs on
+      ansible.builtin.copy:
+        dest: "{{ billet_gate_verdict_root.path }}/etc/billet.yaml"
+        content: "node:\n  name: gate-node\n"
+        mode: "0600"
+
+    - name: Ask for each verdict through the production task file
+      ansible.builtin.include_tasks: node-config-verdict-case.yml
+      loop: "{{ billet_gate_verdict_cases }}"
+      loop_control:
+        loop_var: billet_gate_verdict_case
+        label: "{{ billet_gate_verdict_case.name }}"
+
+    - name: Remove the case directory
+      ansible.builtin.file:
+        path: "{{ billet_gate_verdict_root.path }}"
+        state: absent

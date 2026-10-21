@@ -1,7 +1,6 @@
 package host
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -147,15 +146,10 @@ func joinAccept(ctx context.Context, env cli.Env, args []string) error {
 
 	joinAcceptMerged()
 
-	// THE FILE MERGED INTO IS THE FILE REPLACED: an edit by something that does
-	// not take the lock (an operator's editor, `github-app create`) since the
-	// read refuses rather than being overwritten.
-	if now, err := os.ReadFile(path); err != nil || !bytes.Equal(now, raw) {
-		return fmt.Errorf("%s changed while the merge was made (%v), so nothing was written; run billet "+
-			"join accept again", path, err)
-	}
-
-	if err := setup.ReplaceConfig(env, path, merge.Body); err != nil {
+	// THE FILE MERGED INTO IS THE FILE REPLACED: ReplaceConfig refuses, as its
+	// last step before the rename, a file an editor or `github-app create`
+	// (which do not take the lifecycle lock) changed since it was read.
+	if err := setup.ReplaceConfig(env, path, raw, merge.Body); err != nil {
 		return err
 	}
 

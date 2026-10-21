@@ -1792,13 +1792,20 @@ func WriteGitHubBlock(env cli.Env, path string, b GitHubBlock) error {
 			"recorded nowhere here", path, err)
 	}
 
-	return ReplaceConfig(env, path, rendered)
+	return ReplaceConfig(env, path, raw, rendered)
 }
 
 // ReplaceConfig replaces an existing config with rendered, atomically, keeping
 // the original's mode and owner: the one in-place writer of a config billet
 // edits a block of (`github-app create --config`, `billet join accept`).
-func ReplaceConfig(env cli.Env, path string, rendered []byte) error {
+//
+// ONLY WHILE THE FILE STILL SAYS expect, the bytes the edit was made from,
+// checked as the last thing before the rename: a write by anything else since
+// the caller read it is refused rather than replaced by an edit of what the
+// file used to say. The window between that check and the rename stays, and a
+// writer that neither locks nor checks can still land in it; it is the length
+// of one rename, where it was the whole render.
+func ReplaceConfig(env cli.Env, path string, expect, rendered []byte) error {
 	// THE REPLACEMENT PRESERVES WHAT THE ORIGINAL HAD. A rename swaps the
 	// inode, so without this a package-installed root:billet 0640 config — or
 	// the one `init --profile local-service` just arranged — silently becomes
@@ -1886,6 +1893,11 @@ func ReplaceConfig(env cli.Env, path string, rendered []byte) error {
 	if verifyInstalled(staged, name) != identityMatches {
 		return fmt.Errorf("%s is no longer the file this run staged, so it was NOT installed "+
 			"as %s", name, path)
+	}
+
+	if now, err := os.ReadFile(path); err != nil || !bytes.Equal(now, expect) {
+		return fmt.Errorf("%s changed after it was read (%v), so it was NOT replaced with an edit of "+
+			"what it used to say; run the command again", path, err)
 	}
 
 	if err := os.Rename(name, path); err != nil {

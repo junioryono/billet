@@ -156,17 +156,19 @@ func TestMergeJoinIsIdempotentAndNeverLowersTheCeiling(t *testing.T) {
 		}
 	}
 
-	// A ceiling already above what the fleet and the node need stays.
+	// A ceiling already above what the fleet and the node need stays, in both
+	// dimensions.
 	high := strings.Replace(string(cp), "max_vcpu: "+strconv.Itoa(curVCPU), "max_vcpu: 512", 1)
-	if high == string(cp) {
-		t.Fatalf("the control plane's config no longer spells max_vcpu: %d", curVCPU)
+	high = strings.Replace(high, "max_memory: "+curMemory.String(), "max_memory: 4TiB", 1)
+	if !strings.Contains(high, "max_vcpu: 512") || !strings.Contains(high, "max_memory: 4TiB") {
+		t.Fatalf("the control plane's config no longer spells its ceiling as %d and %s", curVCPU, curMemory)
 	}
 	m, err := MergeJoin([]byte(high), p, fleet)
 	if err != nil {
 		t.Fatalf("MergeJoin over a high ceiling: %v", err)
 	}
-	if got, _ := ceilingOf(t, m.Body); got != 512 {
-		t.Errorf("a ceiling of 512 became %d", got)
+	if vcpu, memory := ceilingOf(t, m.Body); vcpu != 512 || memory != 4*config.TiB {
+		t.Errorf("a ceiling of 512 and 4TiB became %d and %s", vcpu, memory)
 	}
 }
 
@@ -225,7 +227,7 @@ func TestMergeJoinRefusesWhatWouldNotLoad(t *testing.T) {
 
 	bad := p
 	var broken yaml.Node
-	if err := yaml.Unmarshal([]byte("label: billet-broken\nvcpu: -1\n"), &broken); err != nil {
+	if err := yaml.Unmarshal([]byte("label: billet-broken\nprovider: tart\nvcpu: -1\n"), &broken); err != nil {
 		t.Fatal(err)
 	}
 	bad.Tiers = []*yaml.Node{broken.Content[0]}
@@ -288,21 +290,24 @@ func TestJoinProposalTokenRoundTripsAndRefusesAForgery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, text := range map[string]string{
-		"a truncated token":    token[:len(token)-8],
-		"another encoding":     "billet-join-2." + strings.TrimPrefix(token, joinTokenPrefix),
-		"an unknown field":     strings.Replace(string(doc), "schema: 1", "schema: 1\nextra: x", 1),
-		"another schema":       strings.Replace(string(doc), "schema: 1", "schema: 2", 1),
-		"two documents":        string(doc) + "---\nschema: 1\n",
-		"no vCPU":              strings.Replace(string(doc), "max_vcpu: "+strconv.Itoa(p.MaxVCPU), "max_vcpu: 0", 1),
-		"an unknown provider":  strings.Replace(string(doc), "provider: tart", "provider: mainframe", 1),
-		"a tier with no label": strings.Replace(string(doc), "label:", "notlabel:", 1),
+	// EACH REFUSED BY ITS OWN CLAUSE, so a deleted check is not covered by an
+	// unrelated one further on.
+	for name, c := range map[string]struct{ text, want string }{
+		"a truncated token": {token[:len(token)-8], "not one billet printed"},
+		"another encoding":  {"billet-join-2." + strings.TrimPrefix(token, joinTokenPrefix), "another billet's encoding"},
+		"an unknown field":  {strings.Replace(string(doc), "schema: 1", "schema: 1\nextra: x", 1), "does not parse"},
+		"another schema":    {strings.Replace(string(doc), "schema: 1", "schema: 2", 1), "schema is 2"},
+		"two documents":     {string(doc) + "---\nschema: 1\n", "more than one document"},
+		"no vCPU": {strings.Replace(string(doc), "max_vcpu: "+strconv.Itoa(p.MaxVCPU), "max_vcpu: 0", 1),
+			"contributes 0 vCPU"},
+		"an unknown provider":  {strings.Replace(string(doc), "provider: tart", "provider: mainframe", 1), `names provider "mainframe"`},
+		"a tier with no label": {strings.Replace(string(doc), "label:", "notlabel:", 1), "has no label"},
 	} {
-		if text == token || text == string(doc) {
+		if c.text == token || c.text == string(doc) {
 			t.Fatalf("%s: the case changed nothing", name)
 		}
-		if _, err := ParseJoinProposal(text); err == nil {
-			t.Errorf("%s was accepted", name)
+		if _, err := ParseJoinProposal(c.text); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s answered %v, want a refusal saying %q", name, err, c.want)
 		}
 	}
 }

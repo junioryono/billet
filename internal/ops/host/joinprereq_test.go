@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -12,113 +13,232 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 )
 
-// macState is a fake Mac's pmset and scutil, changed by what is run on it.
+// fakeSudo stands in for sudo, recording each command and acting it out on the
+// test's own files: mkdir makes the directory, chmod u+s sets the bit, install
+// copies, rm removes, and chown changes nothing because the test's account
+// already owns what it made. extra answers the rest (pmset, scutil, sshd -t),
+// and with no extra they succeed and change nothing.
+func fakeSudo(t *testing.T, record func(string), extra func(args []string) error) func(context.Context, cli.Env, []string) error {
+	t.Helper()
+
+	return func(_ context.Context, _ cli.Env, args []string) error {
+		record(strings.Join(args, " "))
+
+		switch args[0] {
+		case "-v", sudoChown:
+		case sudoMkdir:
+			return os.MkdirAll(args[len(args)-1], 0o755)
+		case sudoChmod:
+			if args[1] != "u+s" {
+				t.Fatalf("an unexpected chmod: %v", args)
+			}
+			info, err := os.Stat(args[2])
+			if err != nil {
+				return err
+			}
+
+			return os.Chmod(args[2], info.Mode().Perm()|os.ModeSetuid)
+		case sudoInstall:
+			raw, err := os.ReadFile(args[len(args)-2])
+			if err != nil {
+				return err
+			}
+
+			return os.WriteFile(args[len(args)-1], raw, 0o644)
+		case sudoRm:
+			if err := os.Remove(args[len(args)-1]); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		default:
+			if extra != nil {
+				return extra(args)
+			}
+		}
+
+		return nil
+	}
+}
+
+// macState is a fake Mac's pmset and scutil, changed by what sudo runs.
 type macState struct {
-	sleep string
-	names map[string]string
-	ran   []string
+	sleep   string
+	names   map[string]string
+	getErr  error
+	setting bool
 }
 
 func (m *macState) run(_ context.Context, name string, args ...string) (string, error) {
-	line := name + " " + strings.Join(args, " ")
 	switch {
-	case line == "pmset -g":
+	case name == "pmset" && len(args) == 1 && args[0] == "-g":
 		return " sleep                " + m.sleep + "\n disksleep            0\n", nil
 	case name == "scutil" && args[0] == "--get":
+		if m.getErr != nil {
+			return "", m.getErr
+		}
+		if m.names[args[1]] == "" {
+			return args[1] + ": not set\n", errors.New("exit status 1")
+		}
+
 		return m.names[args[1]] + "\n", nil
 	}
 
-	m.ran = append(m.ran, line)
-
-	switch {
-	case line == "pmset -a sleep 0 disksleep 0":
-		m.sleep = "0"
-	case name == "scutil" && args[0] == "--set":
-		m.names[args[1]] = args[2]
-	}
-
-	return "", nil
+	return "", errors.New("not run here: " + name)
 }
 
-// THE PRIVILEGED HALF DOES ONLY WHAT DIFFERS, AND PROVES EACH STEP AFTERWARDS:
-// a Mac already awake with two of its three names right gets one scutil and
-// its missing directory, and nothing else.
-//
-// Mutations: a step that applies without reading first runs pmset; a step
-// whose read-back is skipped passes a command that changed nothing.
-func TestJoinPrerequisitesRootDoesOnlyWhatDiffers(t *testing.T) {
-	onPlatform(t, "darwin", 0)
+func (m *macState) sudo(args []string) error {
+	switch {
+	case args[0] == sudoPmset:
+		m.sleep = "0"
+	case args[0] == sudoScutil && m.setting:
+		m.names[args[2]] = args[3]
+	}
 
+	return nil
+}
+
+// stageMac pins a Mac whose prerequisites live under the test's own
+// directory, the test's account standing for root there.
+func stageMac(t *testing.T, mac *macState, dirs ...string) (*[]string, string) {
+	t.Helper()
+
+	onPlatform(t, "darwin", 501)
+
+	top, err := filepath.EvalSymlinks(t.TempDir())
+	mustOK(t, err)
+
+	var calls []string
+
+	run, sudo, svc, uid, trust := prereqRun, prereqSudo, macServiceDirs, prereqRootUID, prereqTrustRoot
+	t.Cleanup(func() {
+		prereqRun, prereqSudo, macServiceDirs, prereqRootUID, prereqTrustRoot = run, sudo, svc, uid, trust
+	})
+	prereqRun = mac.run
+	prereqSudo = fakeSudo(t, func(c string) { calls = append(calls, c) }, mac.sudo)
+	prereqRootUID, prereqTrustRoot = os.Getuid(), top
+
+	macServiceDirs = nil
+	for _, d := range dirs {
+		macServiceDirs = append(macServiceDirs, filepath.Join(top, d))
+	}
+
+	return &calls, top
+}
+
+// THE PREREQUISITES DO ONLY WHAT DIFFERS, AS sudo OF THE SYSTEM BINARIES, AND
+// PROVE EACH STEP AFTERWARDS (#181): a Mac already awake with two of its three
+// names right gets one password, one scutil, and its missing directory made
+// and handed over, and nothing else; billet itself never runs as root.
+//
+// Mutations: a step applied without reading first runs pmset; a step whose
+// read-back is skipped passes a command that changed nothing; dropping the
+// `sudo -v` asks for a password per step.
+func TestJoinPrerequisitesDoOnlyWhatDiffers(t *testing.T) {
 	me, err := user.Current()
 	mustOK(t, err)
 
-	mac := &macState{sleep: "0", names: map[string]string{
+	mac := &macState{sleep: "0", setting: true, names: map[string]string{
 		"HostName": "mac-1", "LocalHostName": "mac-1", "ComputerName": "Somebody's Mac mini",
 	}}
-	missing := filepath.Join(t.TempDir(), "usr", "local", "var", "log", "billet")
+	calls, top := stageMac(t, mac, "usr/local/var/log/billet")
+	dir := filepath.Join(top, "usr/local/var/log/billet")
 
-	run, dirs := prereqRun, macServiceDirs
-	t.Cleanup(func() { prereqRun, macServiceDirs = run, dirs })
-	prereqRun, macServiceDirs = mac.run, []string{missing}
-
-	if err := Join(t.Context(), processEnv(), []string{
-		"prerequisites", "--account", me.Username, "--node-name", "mac-1",
-	}); err != nil {
+	if err := joinPrerequisites(t.Context(), processEnv(), joinRequest{provider: "docker", nodeName: "mac-1"}); err != nil {
 		t.Fatalf("join prerequisites: %v", err)
 	}
 
-	if want := []string{"scutil --set ComputerName mac-1"}; !slices.Equal(mac.ran, want) {
-		t.Errorf("ran %v, want only %v", mac.ran, want)
-	}
-
-	if owned, err := ownedBy(missing, me.Username); err != nil || !owned {
-		t.Errorf("%s was not created for %s: %v", missing, me.Username, err)
+	want := []string{"-v", "/usr/sbin/scutil --set ComputerName mac-1", "/bin/mkdir -p " + dir,
+		"/usr/sbin/chown -h " + me.Username + " " + dir}
+	if !slices.Equal(*calls, want) {
+		t.Errorf("sudo ran\n  %v\nwant\n  %v", *calls, want)
 	}
 
 	// A STEP THAT DOES NOT READ BACK AS DONE FAILS, rather than reporting done.
-	mac.names["ComputerName"] = "stuck"
-	prereqRun = func(ctx context.Context, name string, args ...string) (string, error) {
-		if name == "scutil" && args[0] == "--set" {
-			return "", nil
-		}
-
-		return mac.run(ctx, name, args...)
-	}
-
-	err = Join(t.Context(), processEnv(), []string{"prerequisites", "--account", me.Username, "--node-name", "mac-1"})
+	mac.names["ComputerName"], mac.setting = "stuck", false
+	err = joinPrerequisites(t.Context(), processEnv(), joinRequest{provider: "docker", nodeName: "mac-1"})
 	if err == nil || !strings.Contains(err.Error(), "still does not read back as done") {
 		t.Errorf("a step that changed nothing answered %v", err)
 	}
 }
 
-// THE PRIVILEGED HALF REFUSES TO RUN WHERE IT DOES NOT BELONG.
-func TestJoinPrerequisitesRootRefuses(t *testing.T) {
-	for _, c := range []struct {
-		name, goos string
-		euid       int
-		args       []string
-		want       string
+// NOTHING RUNS AS ROOT WHERE A CHECK REFUSES, not even the password: a
+// directory under a symbolic link, under a directory others may write, or a
+// name scutil could not read.
+func TestJoinPrerequisitesRefuseBeforeThePassword(t *testing.T) {
+	for name, c := range map[string]struct {
+		stage func(top string)
+		mac   *macState
+		want  string
 	}{
-		{"not root", "darwin", 501, []string{"--account", "op", "--node-name", "mac-1"}, "needs root"},
-		{"on Linux", "linux", 0, []string{"--account", "op", "--node-name", "mac-1"}, "prepares a Mac"},
-		{"for root", "darwin", 0, []string{"--account", "root", "--node-name", "mac-1"}, "--account must name"},
-		{"a bad name", "darwin", 0, []string{"--account", "op", "--node-name", "mac mini"}, "node-name"},
+		"a symlinked ancestor": {func(top string) {
+			mustOK(t, os.MkdirAll(filepath.Join(top, "elsewhere"), 0o755))
+			mustOK(t, os.Symlink(filepath.Join(top, "elsewhere"), filepath.Join(top, "usr")))
+		}, nil, "symbolic link"},
+		"an ancestor others may write": {func(top string) {
+			mustOK(t, os.MkdirAll(filepath.Join(top, "usr"), 0o755))
+			mustOK(t, os.Chmod(filepath.Join(top, "usr"), 0o777))
+		}, nil, "only root can change"},
+		"a name scutil could not read": {func(string) {}, &macState{sleep: "0", names: map[string]string{},
+			getErr: errors.New("signal: killed")}, "could not tell"},
 	} {
-		t.Run(c.name, func(t *testing.T) {
-			onPlatform(t, c.goos, c.euid)
+		t.Run(name, func(t *testing.T) {
+			mac := c.mac
+			if mac == nil {
+				mac = &macState{sleep: "0", names: map[string]string{
+					"HostName": "mac-1", "LocalHostName": "mac-1", "ComputerName": "mac-1"}}
+			}
+			calls, top := stageMac(t, mac, "usr/local/var/log/billet")
+			c.stage(top)
 
-			err := Join(t.Context(), processEnv(), append([]string{"prerequisites"}, c.args...))
+			err := joinPrerequisites(t.Context(), processEnv(), joinRequest{provider: "docker", nodeName: "mac-1"})
 			if err == nil || !strings.Contains(err.Error(), c.want) {
-				t.Errorf("answered %v, want %q", err, c.want)
+				t.Fatalf("answered %v, want a refusal saying %q", err, c.want)
+			}
+			if len(*calls) != 0 {
+				t.Errorf("a refused run ran sudo %v", *calls)
 			}
 		})
 	}
 }
 
-// ROOT MAKES ONLY A HOMEBREW softnet SETUID-ROOT: a file elsewhere, by
-// another name, or a symlink is refused before anything is changed.
+// A DRY RUN ON A FRESH MAC SAYS WHAT IT WOULD DO: tart is not installed yet, so
+// there is no softnet to resolve, and that is a plan, not a failure.
+func TestJoinDryRunOnAFreshMacPlansTheInstall(t *testing.T) {
+	mac := &macState{sleep: "0", names: map[string]string{
+		"HostName": "mac-1", "LocalHostName": "mac-1", "ComputerName": "mac-1"}}
+	calls, _ := stageMac(t, mac)
+
+	look := prereqLookPath
+	t.Cleanup(func() { prereqLookPath = look })
+	prereqLookPath = func(name string) (string, error) {
+		if name == "brew" {
+			return "/opt/homebrew/bin/brew", nil
+		}
+
+		return "", errors.New("not found")
+	}
+
+	var out strings.Builder
+	env := processEnv()
+	env.Stdout = &out
+	if err := joinPrerequisites(t.Context(), env, joinRequest{provider: "tart", nodeName: "mac-1", dryRun: true}); err != nil {
+		t.Fatalf("a dry run on a fresh Mac: %v", err)
+	}
+	for _, want := range []string{"brew install openai/tools/tart", "would let softnet confine"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the dry run does not say %q:\n%s", want, out.String())
+		}
+	}
+	if len(*calls) != 0 {
+		t.Errorf("a dry run ran sudo %v", *calls)
+	}
+}
+
+// ROOT MAKES ONLY A HOMEBREW softnet SETUID-ROOT: a file outside a Cellar, by
+// another name, reached through a link, or with a second name is refused.
 func TestJoinGrantsOnlyACellarSoftnet(t *testing.T) {
 	dir, err := filepath.EvalSymlinks(t.TempDir())
+	mustOK(t, err)
+	me, err := user.Current()
 	mustOK(t, err)
 
 	cellars := softnetCellars
@@ -138,54 +258,39 @@ func TestJoinGrantsOnlyACellarSoftnet(t *testing.T) {
 
 	link := filepath.Join(dir, "Cellar", "softnet", "2", "bin", "softnet")
 	mustOK(t, os.MkdirAll(filepath.Dir(link), 0o755))
-	mustOK(t, os.Symlink("/bin/sh", link))
+	mustOK(t, os.Symlink(good, link))
 
-	if _, err := checkedSoftnet(good); err != nil {
+	mustOK(t, os.Symlink(filepath.Join(dir, "Cellar", "softnet", "1"), filepath.Join(dir, "Cellar", "softnet", "3")))
+	throughLink := filepath.Join(dir, "Cellar", "softnet", "3", "bin", "softnet")
+
+	twice := filepath.Join(dir, "Cellar", "softnet", "4", "bin", "softnet")
+	mustOK(t, os.MkdirAll(filepath.Dir(twice), 0o755))
+	mustOK(t, os.WriteFile(twice, nil, 0o755))
+	mustOK(t, os.Link(twice, filepath.Join(dir, "second-name")))
+
+	if err := grantableSoftnet(good, me.Username); err != nil {
 		t.Errorf("a Cellar softnet was refused: %v", err)
 	}
-	for _, p := range []string{elsewhere, named, link} {
-		if _, err := checkedSoftnet(p); err == nil {
-			t.Errorf("%s would be made setuid-root", p)
+	for p, want := range map[string]string{
+		elsewhere: "not a softnet inside a Homebrew Cellar", named: "not a softnet inside a Homebrew Cellar",
+		link: "symbolic link", throughLink: "symbolic link", twice: "more than one name",
+	} {
+		if err := grantableSoftnet(p, me.Username); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s answered %v, want a refusal saying %q", p, err, want)
 		}
 	}
 }
 
-// THE sshd DROP-IN IS WRITTEN ONLY OVER A KEY, says exactly the reference
-// hardware page's four lines, and is never the default.
-func TestJoinHardensSSHOnlyWhenAskedAndOverAKey(t *testing.T) {
-	dir := t.TempDir()
-
-	keys := filepath.Join(dir, "authorized_keys")
-	mustOK(t, os.WriteFile(keys, []byte("# no keys yet\n\n"), 0o600))
-	if holdsAuthorizedKey(keys) {
-		t.Error("a file of comments counted as a key")
-	}
-	mustOK(t, os.WriteFile(keys, []byte("ssh-ed25519 AAAA op@laptop\n"), 0o600))
-	if !holdsAuthorizedKey(keys) {
-		t.Error("a key was not counted")
-	}
-
-	want := "PermitRootLogin no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nAllowUsers op\n"
-	if got := sshdDropInBody("op"); got != want {
-		t.Errorf("the drop-in says %q, want %q", got, want)
-	}
-
-	for _, s := range macRootSteps(macRootRequest{account: "op", nodeName: "mac-1"}) {
-		if strings.Contains(s.what, "SSH") {
-			t.Errorf("sshd is hardened without --harden-ssh: %s", s.what)
-		}
-	}
-}
-
-// LINUX IS VERIFIED, NEVER CHANGED: a missing account and an unreachable
-// Docker daemon are both named, with the fix.
+// LINUX IS VERIFIED, NEVER CHANGED: an unreachable Docker daemon is named,
+// with the fix.
 func TestJoinVerifiesALinuxNodeAndChangesNothing(t *testing.T) {
 	onPlatform(t, "linux", 0)
 
 	var ran []string
 
-	run := prereqRun
-	t.Cleanup(func() { prereqRun = run })
+	run, lookup := prereqRun, prereqLookupUser
+	t.Cleanup(func() { prereqRun, prereqLookupUser = run, lookup })
+	prereqLookupUser = func(name string) (*user.User, error) { return &user.User{Username: name}, nil }
 	prereqRun = func(_ context.Context, name string, args ...string) (string, error) {
 		ran = append(ran, name+" "+strings.Join(args, " "))
 

@@ -1,7 +1,6 @@
 package host
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +9,49 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 )
+
+// THE READ IS MADE UNDER THE LOCK: the stand-in edits the file as it is taken,
+// so a read made before it would find the file changed and refuse, and one
+// made under it merges the edit in. A dry run takes no lock at all.
+func TestJoinAcceptReadsTheConfigUnderTheLock(t *testing.T) {
+	f := newJoinFixture(t)
+
+	out, err := runJoinLocked(t, func() {
+		raw := mustRead(t, f.configPath)
+		mustOK(t, os.WriteFile(f.configPath, []byte("# written under the lock\n"+raw), 0o600))
+	}, "accept", "--config", f.configPath, f.proposal(t, f.deployment(t)))
+	if err != nil {
+		t.Fatalf("join accept: %v\n%s", err, out)
+	}
+	if !strings.Contains(mustRead(t, f.configPath), "# written under the lock") {
+		t.Errorf("the merge did not start from the file as it was under the lock")
+	}
+
+	locksTaken = 0
+	if _, err := runJoin(t, "", "accept", "--config", f.configPath, "--dry-run", f.proposal(t, f.deployment(t))); err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if locksTaken != 0 {
+		t.Errorf("a dry run took the lifecycle lock %d times", locksTaken)
+	}
+}
+
+// A CONTROL PLANE WITH NO DEPLOYMENT IDENTITY YET is not the one a proposal
+// bound to a deployment was made against.
+func TestJoinAcceptRefusesWhenThisControlPlaneHasNoIdentity(t *testing.T) {
+	f := newJoinFixture(t)
+	token := f.proposal(t, f.deployment(t))
+	mustOK(t, os.Remove(filepath.Join(f.stateDir, "deployment-id")))
+	before := mustRead(t, f.configPath)
+
+	_, err := runJoin(t, "", "accept", "--config", f.configPath, token)
+	if err == nil || !strings.Contains(err.Error(), "no deployment identity yet") {
+		t.Fatalf("a control plane with no identity answered %v", err)
+	}
+	if mustRead(t, f.configPath) != before {
+		t.Errorf("a refused accept changed the config")
+	}
+}
 
 // THE INVENTORY'S FILE IS RECOGNISED HOWEVER AN EDITOR LEFT IT: a byte-order
 // mark, CRLF line ends, or a comment above the marker do not let an edit
@@ -40,7 +82,7 @@ func TestJoinAcceptRecognisesTheInventorysFileInEveryForm(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "the inventory's") {
 				t.Fatalf("the inventory's file was edited: %v", err)
 			}
-			if after, _ := os.ReadFile(f.configPath); string(after) != rendered {
+			if after := mustRead(t, f.configPath); after != rendered {
 				t.Errorf("the inventory's file was changed")
 			}
 		})
@@ -90,10 +132,10 @@ func TestJoinAcceptRefusesAFileChangedUnderIt(t *testing.T) {
 
 	locksTaken = 0
 	_, err := runJoin(t, "", "accept", "--config", f.configPath, f.proposal(t, f.deployment(t)))
-	if err == nil || !strings.Contains(err.Error(), "changed while the merge was made") {
+	if err == nil || !strings.Contains(err.Error(), "changed after it was read") {
 		t.Fatalf("a file changed under the merge answered %v", err)
 	}
-	if after, _ := os.ReadFile(f.configPath); !bytes.Equal(after, edited) {
+	if after := mustRead(t, f.configPath); after != string(edited) {
 		t.Errorf("the edit made meanwhile was overwritten")
 	}
 	if locksTaken != 1 {

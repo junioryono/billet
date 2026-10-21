@@ -1,0 +1,77 @@
+---
+# One run of the host role's verdict task against a scripted answerer.
+- name: Install the case's answerer
+  ansible.builtin.copy:
+    dest: "{{ billet_gate_verdict_root.path }}/billet"
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      printf '%s\n' "$*" >>'{{ billet_gate_verdict_root.path }}/calls'
+      # THE CANDIDATE AS IT WAS WHEN ASKED: $6 is --candidate's value.
+      cp "$6" '{{ billet_gate_verdict_root.path }}/asked-candidate' || exit 3
+      case '{{ billet_gate_verdict_case.verdict | default("keep") }}' in
+        keep) cat '{{ playbook_dir }}/fixtures/node-config-change/keep.json' ;;
+        restart) cat '{{ playbook_dir }}/fixtures/node-config-change/restart.json' ;;
+        *) echo 'billet: unknown command "config-change"' >&2; exit 2 ;;
+      esac
+
+- name: Start the case with no calls recorded
+  ansible.builtin.file:
+    path: "{{ billet_gate_verdict_root.path }}/calls"
+    state: absent
+
+- name: Ask for the verdict through the production task file
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: node-config-verdict
+  vars:
+    billet_ending_become: false
+    billet_config_preview:
+      changed: "{{ billet_gate_verdict_case.preview_changed | default(true) }}"
+    billet_node_should_run: "{{ billet_gate_verdict_case.should_run | default(true) }}"
+    billet_exclusion_answerer: >-
+      {{ (billet_gate_verdict_root.path ~ '/billet') if billet_gate_verdict_case.answerer | default(true) else '' }}
+    billet_ordinary_config_path: "{{ billet_gate_verdict_root.path }}/etc/billet.yaml"
+    billet_effective_config: {node: {name: gate-node, provider: docker}}
+
+- name: Read what the answerer was asked
+  ansible.builtin.slurp:
+    src: "{{ billet_gate_verdict_root.path }}/calls"
+  register: billet_gate_verdict_calls
+  failed_when: false
+
+- name: Find any candidate left behind
+  ansible.builtin.find:
+    paths: "{{ billet_gate_verdict_root.path }}/etc"
+    patterns: ".billet.yaml.verdict.*"
+    hidden: true
+  register: billet_gate_verdict_left
+
+- name: Hold the verdict and the asking to the case
+  vars:
+    billet_gate_asked: >-
+      {{ (billet_gate_verdict_calls.content | default('') | b64decode).splitlines() }}
+  ansible.builtin.assert:
+    that:
+      - (billet_node_config_changed | bool) == billet_gate_verdict_case.changed
+      - billet_gate_asked | length == (1 if billet_gate_verdict_case.asked else 0)
+      - >-
+        not billet_gate_verdict_case.asked or
+        (billet_gate_asked[0].startswith('node config-change --installed ' ~ billet_gate_verdict_root.path
+        ~ '/etc/billet.yaml --candidate ' ~ billet_gate_verdict_root.path ~ '/etc/.billet.yaml.verdict.')
+        and billet_gate_asked[0].endswith(' --json'))
+      - billet_gate_verdict_left.matched == 0
+    fail_msg: >-
+      {{ billet_gate_verdict_case.name }}: billet_node_config_changed is {{ billet_node_config_changed }},
+      want {{ billet_gate_verdict_case.changed }}; asked {{ billet_gate_asked }}; left
+      {{ billet_gate_verdict_left.files | map(attribute='path') | list }}
+
+- name: Hold the candidate the answerer saw to the rendering
+  when: billet_gate_verdict_case.asked
+  vars:
+    billet_gate_seen: "{{ lookup('ansible.builtin.file', billet_gate_verdict_root.path ~ '/asked-candidate') }}"
+  ansible.builtin.assert:
+    that:
+      - billet_gate_seen.startswith('# Rendered by the junioryono.billet collection')
+      - "'name: gate-node' in billet_gate_seen"
+    fail_msg: "{{ billet_gate_verdict_case.name }}: the answerer saw {{ billet_gate_seen }}"

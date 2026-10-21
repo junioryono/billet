@@ -17,6 +17,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -753,6 +754,18 @@ func CAToken(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	fmt.Fprintf(env.Stdout, "Join token (shown once, valid for %s, %d use(s)):\n\n  %s\n\n", *ttl, *uses, token)
+
+	// A LOOPBACK NODE WIRE IS NOT AN ADDRESS ANOTHER MACHINE HAS: printed as
+	// --server, it names the joining machine itself.
+	if nodeplane.LoopbackOnly(cfg.Server.Listen) {
+		fmt.Fprintf(env.Stdout, "This control plane's node wire listens only on loopback (%s), so no other "+
+			"machine can join it. Bind server.listen to an address the fleet reaches (and set "+
+			"server.bootstrap_listen for enrollment), restart, and run billet ca token again for the "+
+			"command to run there.\n", cfg.Server.Listen)
+
+		return nil
+	}
+
 	fmt.Fprintf(env.Stdout, "On the machine that should join, naming it (#181):\n\n  %s\n\n",
 		joinCommand(cfg, token))
 	fmt.Fprintf(env.Stdout, "That generates its config, does its prerequisites, enrolls and starts it; it prints a "+

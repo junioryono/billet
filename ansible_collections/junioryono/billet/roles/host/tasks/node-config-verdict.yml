@@ -36,7 +36,7 @@
       register: billet_node_config_candidate
       changed_when: false
       check_mode: false
-      become: true
+      become: "{{ billet_ending_become | default(true) | bool }}"
 
     - name: Write the candidate configuration for the node's verdict
       vars:
@@ -44,12 +44,12 @@
       ansible.builtin.template:
         src: billet.yaml.j2
         dest: "{{ billet_node_config_candidate.path }}"
-        owner: root
-        group: root
+        owner: "{{ 'root' if (billet_ending_become | default(true) | bool) else omit }}"
+        group: "{{ 'root' if (billet_ending_become | default(true) | bool) else omit }}"
         mode: "0600"
       changed_when: false
       check_mode: false
-      become: true
+      become: "{{ billet_ending_become | default(true) | bool }}"
 
     - name: Ask the installed billet for the node's verdict
       ansible.builtin.command:
@@ -66,7 +66,7 @@
       changed_when: false
       failed_when: false
       check_mode: false
-      become: true
+      become: "{{ billet_ending_become | default(true) | bool }}"
 
     - name: Read the node's verdict
       ansible.builtin.import_tasks: node-config-answer.yml
@@ -78,7 +78,7 @@
         state: absent
       changed_when: false
       check_mode: false
-      become: true
+      become: "{{ billet_ending_become | default(true) | bool }}"
       when: billet_node_config_candidate.path | default('') | length > 0
 
 - name: Report a configuration change the node does not read

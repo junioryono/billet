@@ -30,6 +30,7 @@ func TestUpPlansTheDirectoriesThisAccountCanCreate(t *testing.T) {
 	agents := filepath.Join(home, "Library", "LaunchAgents")
 	logs := filepath.Join(home, "logs")
 	state := filepath.Join(home, "state", "node")
+	keys := filepath.Join(home, "keys")
 
 	locked := filepath.Join(home, "locked")
 	mustMkdir(t, locked, 0o500)
@@ -47,9 +48,10 @@ func TestUpPlansTheDirectoriesThisAccountCanCreate(t *testing.T) {
 		NodeStateDir: state,
 		NodeLockDir:  lockDir,
 		BinaryDir:    file,
+		KeyPaths:     []string{filepath.Join(keys, "app-private-key.pem")},
 	})
 
-	want := map[string]fs.FileMode{agents: 0o755, logs: 0o755, state: 0o700}
+	want := map[string]fs.FileMode{agents: 0o755, logs: 0o755, state: 0o700, keys: 0o700}
 	got := map[string]fs.FileMode{}
 	for _, d := range dirs {
 		got[d.Path] = d.Mode
@@ -109,10 +111,23 @@ func TestApplyDirectoriesCreatesThePlannedDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, p := range []string{file, filepath.Join(file, "under")} {
+	// A PLANNED DIRECTORY THAT BECAME A LINK is refused, not written through.
+	elsewhere := t.TempDir()
+	link := filepath.Join(home, "became-a-link")
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// EACH REFUSED BY BILLET'S OWN CLAUSE: the file itself by the writable
+	// proof, the path through it by the creation, the link by its own check.
+	for p, want := range map[string]string{
+		file:                         "still cannot write it",
+		filepath.Join(file, "under"): "launchd: create",
+		link:                         "symbolic link now",
+	} {
 		err := c.ApplyDirectories([]lifeops.DirectoryCreation{{Path: p, Mode: 0o755}})
-		if err == nil || !strings.Contains(err.Error(), "not a directory") {
-			t.Errorf("%s, a file or a path through one, was not refused: %v", p, err)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s answered %v, want a refusal saying %q", p, err, want)
 		}
 	}
 }

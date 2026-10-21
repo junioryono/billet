@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // joinFakes replaces every step `billet join` composes with one that records
@@ -22,8 +24,10 @@ type joinFakes struct {
 	fetchErr  error
 	generated string
 	initArgs  []string
-	sudoArgs  []string
-	upConfig  string
+	sudoCalls []string
+	// sshdErr fails the fake `sudo sshd -t`.
+	sshdErr  error
+	upConfig string
 }
 
 func (f *joinFakes) record(step string) { f.trace = append(f.trace, step) }
@@ -64,7 +68,8 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 	mustOK(t, os.Mkdir(owned, 0o755))
 
 	saved := []any{joinFetchAuthority, joinGenerate, joinEnroll, joinPullImages, joinUp, serviceConfigPath,
-		prereqRun, prereqSudo, prereqLookPath, prereqExecutable, macServiceDirs, softnetCellars}
+		prereqRun, prereqSudo, prereqLookPath, macServiceDirs, softnetCellars, prereqRootUID, prereqTrustRoot,
+		sshdDropIn, prereqLookupUser}
 	t.Cleanup(func() {
 		joinFetchAuthority = saved[0].(func(context.Context, string, string) (string, error))
 		joinGenerate = saved[1].(func(context.Context, cli.Env, []string) error)
@@ -75,15 +80,18 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 		prereqRun = saved[6].(func(context.Context, string, ...string) (string, error))
 		prereqSudo = saved[7].(func(context.Context, cli.Env, []string) error)
 		prereqLookPath = saved[8].(func(string) (string, error))
-		prereqExecutable = saved[9].(func() (string, error))
-		macServiceDirs = saved[10].([]string)
-		softnetCellars = saved[11].([]string)
+		macServiceDirs = saved[9].([]string)
+		softnetCellars = saved[10].([]string)
+		prereqRootUID = saved[11].(int)
+		prereqTrustRoot = saved[12].(string)
+		sshdDropIn = saved[13].(string)
+		prereqLookupUser = saved[14].(func(string) (*user.User, error))
 	})
 
 	joinFetchAuthority = func(_ context.Context, base, fp string) (string, error) {
 		f.record("fetch " + base + " " + fp)
 
-		return "dep-1", f.fetchErr
+		return testJoinDeployment, f.fetchErr
 	}
 	joinGenerate = func(_ context.Context, _ cli.Env, args []string) error {
 		f.record("generate")
@@ -125,12 +133,16 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 
 		return "", nil
 	}
-	prereqSudo = func(_ context.Context, _ cli.Env, args []string) error {
-		f.record("sudo")
-		f.sudoArgs = args
+	prereqSudo = fakeSudo(t, func(call string) {
+		f.record("sudo " + call)
+		f.sudoCalls = append(f.sudoCalls, call)
+	}, func(args []string) error {
+		if args[0] == sudoSshd {
+			return f.sshdErr
+		}
 
 		return nil
-	}
+	})
 	prereqLookPath = func(name string) (string, error) {
 		switch name {
 		case "tart", "softnet":
@@ -139,9 +151,23 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 
 		return "", errors.New("not found")
 	}
-	prereqExecutable = func() (string, error) { return "/usr/local/bin/billet", nil }
 	macServiceDirs = []string{owned}
 	softnetCellars = []string{cellar + "/"}
+
+	// THIS TEST'S ACCOUNT STANDS FOR ROOT, under its own directory: the
+	// pre-checks then read files it made exactly as they read root's.
+	prereqRootUID = os.Getuid()
+	prereqTrustRoot = dir
+	sshdDropIn = filepath.Join(dir, "sshd_config.d", "000-headless.conf")
+	mustOK(t, os.MkdirAll(filepath.Dir(sshdDropIn), 0o755))
+	home := filepath.Join(dir, "home")
+	mustOK(t, os.MkdirAll(filepath.Join(home, ".ssh"), 0o700))
+	mustOK(t, os.WriteFile(filepath.Join(home, ".ssh", "authorized_keys"), []byte("ssh-ed25519 AAAA op\n"), 0o600))
+	me, err := user.Current()
+	mustOK(t, err)
+	prereqLookupUser = func(name string) (*user.User, error) {
+		return &user.User{Username: name, Uid: me.Uid, Gid: me.Gid, HomeDir: home}, nil
+	}
 
 	return cfgPath
 }
@@ -179,9 +205,13 @@ func TestJoinFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 		t.Fatalf("join: %v", err)
 	}
 
+	real := strings.TrimPrefix(f.sudoCalls[1], "/usr/sbin/chown -h root ")
 	want := []string{
 		"fetch https://cp.example:7717 SHA256:abc",
-		"sudo",
+		// ONE PASSWORD, THEN THE SYSTEM BINARIES: billet itself never runs as root.
+		"sudo -v",
+		"sudo /usr/sbin/chown -h root " + real,
+		"sudo /bin/chmod u+s " + real,
 		"generate",
 		"enroll mac-1 https://cp.example:7717 SHA256:abc tok-1",
 		"images",
@@ -191,12 +221,24 @@ func TestJoinFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 		t.Errorf("join did:\n  %s\nwant:\n  %s", strings.Join(f.trace, " → "), strings.Join(want, " → "))
 	}
 
-	if !slices.Contains(f.sudoArgs, "--softnet") || f.sudoArgs[1] != "join" || f.sudoArgs[2] != "prerequisites" {
-		t.Errorf("the privileged half was asked %v, want `billet join prerequisites ... --softnet <file>`", f.sudoArgs)
+	if !strings.HasSuffix(real, "/Cellar/softnet/0.23.0/bin/softnet") {
+		t.Errorf("the grant landed on %q, want the Cellar file behind the symlink", real)
+	}
+
+	// AND --harden-ssh ADDS THE DROP-IN, installed by the system's install and
+	// checked by sshd, on a Mac whose softnet is already granted.
+	f2 := &joinFakes{generated: joinedNodeConfig}
+	stageJoin(t, f2)
+	if err := Join(t.Context(), processEnv(), append(slices.Clone(joinArgs), "--harden-ssh")); err != nil {
+		t.Fatalf("join --harden-ssh: %v", err)
+	}
+	if !slices.ContainsFunc(f2.sudoCalls, func(c string) bool { return strings.HasPrefix(c, "/usr/bin/install ") }) ||
+		!slices.Contains(f2.sudoCalls, "/usr/sbin/sshd -t") {
+		t.Errorf("--harden-ssh did not install and check the drop-in: %v", f2.sudoCalls)
 	}
 
 	for _, pair := range [][2]string{
-		{"--join", "cp.example:7717"}, {"--join-deployment", "dep-1"}, {"--node-name", "mac-1"},
+		{"--join", "cp.example:7717"}, {"--join-deployment", testJoinDeployment}, {"--node-name", "mac-1"},
 		{"--profile", "local-service"}, {"--config", cfgPath}, {"--org", "acme"}, {"--provider", "tart"},
 	} {
 		i := slices.Index(f.initArgs, pair[0])
@@ -250,27 +292,110 @@ func TestJoinStopsWhenInitLeftTheConfigAlone(t *testing.T) {
 
 // A NODE ALREADY HOLDING ITS BUNDLE IS NOT ENROLLED AGAIN, so a re-run after
 // the approval goes on to the images and the start.
+//
+// AND ONLY A BUNDLE THAT PROVES IT: one issued for another node, by another
+// deployment, or that is not a bundle at all is refused, never enrolled over or
+// started with.
 func TestJoinDoesNotEnrollANodeThatHoldsItsBundle(t *testing.T) {
+	issue := func(t *testing.T, deployment, name string) wirecert.Bundle {
+		t.Helper()
+
+		ca, err := wirecert.LoadOrCreateCA(t.TempDir(), deployment)
+		mustOK(t, err)
+		b, err := ca.IssueNode(name)
+		mustOK(t, err)
+
+		return b
+	}
+
+	for name, c := range map[string]struct {
+		write func(t *testing.T, dir string)
+		want  string
+	}{
+		"its own": {func(t *testing.T, dir string) { mustOK(t, issue(t, testJoinDeployment, "mac-1").Write(dir)) }, ""},
+		"another node's": {func(t *testing.T, dir string) {
+			mustOK(t, issue(t, testJoinDeployment, "mac-2").Write(dir))
+		}, `node "mac-2"'s`},
+		"another deployment's": {func(t *testing.T, dir string) {
+			mustOK(t, issue(t, "fedcba9876543210fedcba9876543210", "mac-1").Write(dir))
+		}, "deployment fedcba9876543210fedcba9876543210's"},
+		"not a bundle": {func(t *testing.T, dir string) {
+			mustOK(t, os.MkdirAll(dir, 0o700))
+			for _, n := range []string{"node.crt", "node.key", "ca.crt"} {
+				mustOK(t, os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600))
+			}
+		}, "cannot be used"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			onPlatform(t, "darwin", 501)
+
+			f := &joinFakes{generated: joinedNodeConfig}
+			cfgPath := stageJoin(t, f)
+			c.write(t, filepath.Join(filepath.Dir(cfgPath), "tls"))
+
+			err := Join(t.Context(), processEnv(), joinArgs)
+			if c.want != "" {
+				if err == nil || !strings.Contains(err.Error(), c.want) {
+					t.Fatalf("a bundle that is %s answered %v, want a refusal saying %q", name, err, c.want)
+				}
+				if slices.ContainsFunc(f.trace, func(s string) bool { return strings.HasPrefix(s, "enroll") || s == "up" }) {
+					t.Errorf("a bundle that is %s went on to %v", name, f.trace)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("join: %v", err)
+			}
+			if slices.ContainsFunc(f.trace, func(s string) bool { return strings.HasPrefix(s, "enroll") }) {
+				t.Errorf("an enrolled node enrolled again: %v", f.trace)
+			}
+			if f.trace[len(f.trace)-1] != "up" {
+				t.Errorf("the re-run did not end with local up: %v", f.trace)
+			}
+		})
+	}
+}
+
+// A CONFIG INIT LEFT ALONE BESIDE A `.new` STOPS THE JOIN, even when the old
+// file names this join's node and server: init returned success and the
+// generation is not what the services would start.
+func TestJoinStopsWhenInitWroteBesideTheConfig(t *testing.T) {
 	onPlatform(t, "darwin", 501)
 
 	f := &joinFakes{generated: joinedNodeConfig}
 	cfgPath := stageJoin(t, f)
-	tlsDir := filepath.Join(filepath.Dir(cfgPath), "tls")
-	mustOK(t, os.MkdirAll(tlsDir, 0o700))
-	for _, name := range []string{"node.crt", "node.key", "ca.crt"} {
-		mustOK(t, os.WriteFile(filepath.Join(tlsDir, name), []byte("x"), 0o600))
+
+	generate := joinGenerate
+	joinGenerate = func(ctx context.Context, env cli.Env, args []string) error {
+		if err := generate(ctx, env, args); err != nil {
+			return err
+		}
+
+		return os.WriteFile(cfgPath+".new", []byte("node: {}\n"), 0o600)
 	}
 
+	err := Join(t.Context(), processEnv(), joinArgs)
+	if err == nil || !strings.Contains(err.Error(), "wrote "+cfgPath+".new") {
+		t.Fatalf("a generation written beside the config answered %v", err)
+	}
+	if slices.ContainsFunc(f.trace, func(s string) bool { return strings.HasPrefix(s, "enroll") || s == "up" }) {
+		t.Errorf("the join went on to %v", f.trace)
+	}
+
+	// A `.new` LEFT FROM BEFORE, unchanged by this run, is not this run's.
+	f2 := &joinFakes{generated: joinedNodeConfig}
+	cfgPath = stageJoin(t, f2)
+	mustOK(t, os.MkdirAll(filepath.Dir(cfgPath), 0o755))
+	mustOK(t, os.WriteFile(cfgPath+".new", []byte("node: {}\n"), 0o600))
 	if err := Join(t.Context(), processEnv(), joinArgs); err != nil {
-		t.Fatalf("join: %v", err)
-	}
-	if slices.ContainsFunc(f.trace, func(s string) bool { return strings.HasPrefix(s, "enroll") }) {
-		t.Errorf("an enrolled node enrolled again: %v", f.trace)
-	}
-	if f.trace[len(f.trace)-1] != "up" {
-		t.Errorf("the re-run did not end with local up: %v", f.trace)
+		t.Errorf("a .new this run did not write stopped the join: %v", err)
 	}
 }
+
+// testJoinDeployment is the deployment the fake authority names.
+const testJoinDeployment = "0123456789abcdef0123456789abcdef"
 
 // --dry-run PROVES THE AUTHORITY AND READS, AND CHANGES NOTHING.
 func TestJoinDryRunChangesNothing(t *testing.T) {
@@ -338,7 +463,7 @@ func TestJoinPassesInitsFlagsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := joinInitArgs(req, "dep-1")
+	got := joinInitArgs(req, testJoinDeployment)
 	if !slices.Equal(got[len(got)-2:], []string{"--macos-image", "ghcr.io/x/y:1"}) {
 		t.Errorf("init would be given %v, want the flags after -- at the end", got)
 	}

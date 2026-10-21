@@ -123,6 +123,59 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 	return []byte(body.CAPEM), body.Deployment, nil
 }
 
+// ConfirmAuthority asks the control plane at base for its authority again,
+// over a connection verified against caPEM, the authority FetchCA held to the
+// fingerprint, and returns the deployment it names.
+//
+// FetchCA'S ANSWER PROVES WHICH AUTHORITY, NOT WHO SENT IT: the certificate is
+// public, so anything that has seen it can replay it over an unverified
+// handshake and name any deployment beside it. Only the holder of a key the
+// authority signed completes this handshake, so the deployment read here is
+// the control plane's own. A caller that changes the machine before enrolling
+// confirms first (`billet join`); enrollment itself is verified the same way.
+func ConfirmAuthority(ctx context.Context, base string, caPEM []byte) (string, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return "", errors.New("nodeclient: the authority could not be parsed for verification")
+	}
+
+	endpoint, err := url.JoinPath(base, "/v1/ca")
+	if err != nil {
+		return "", fmt.Errorf("nodeclient: build the ca url: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	if err != nil {
+		return "", fmt.Errorf("nodeclient: build the ca request: %w", err)
+	}
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13},
+		},
+	}
+
+	res, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("nodeclient: the control plane at %s did not prove it holds a key the "+
+			"authority signed: %w", base, err)
+	}
+
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("nodeclient: the control plane returned %s for its authority", res.Status)
+	}
+
+	var body nodeapi.CAResponse
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
+		return "", fmt.Errorf("nodeclient: decode the authority: %w", err)
+	}
+
+	return body.Deployment, nil
+}
+
 // Enroll asks a control plane to admit this node, and reports what it said: the
 // certificate, and the authority to install beside it.
 //
