@@ -202,13 +202,32 @@ install_container_hook() {
 # toolcache directory the template's installer named, read back from the image.
 NOTICE_VERSION='^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$'
 
-# fetch_license downloads the license at URL to DEST, and fails when it cannot or
-# what arrived is empty.
+# plain_file succeeds when PATH is a non-empty regular file and not a symlink.
+plain_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] && [ -s "$1" ]
+}
+
+# fetch_license downloads the license at URL to DEST, inside the image at ROOT, and
+# fails when it cannot or what arrived is not a non-empty file.
+#
+# NOTHING IN THE IMAGE DECIDES WHERE THE BUILDER WRITES: this runs as root on the
+# builder, so DEST's directory, with every link on the way to it followed, must
+# still be inside ROOT, and whatever is at DEST is removed rather than written
+# through.
 fetch_license() {
-	curl -fsSL --http1.1 \
-		--connect-timeout 20 --max-time 120 \
-		--retry 5 --retry-delay 5 --retry-all-errors \
-		-o "$2" "$1" && [ -s "$2" ] && chmod 0644 "$2"
+	local into real root
+	into=${2%/*}
+	real=$(cd "$into" 2>/dev/null && pwd -P) || return 1
+	root=$(cd "$3" && pwd -P) || return 1
+	case "$real/" in
+	"$root"/*) ;;
+	*) return 1 ;;
+	esac
+	rm -f "$2" &&
+		curl -fsSL --http1.1 \
+			--connect-timeout 20 --max-time 120 \
+			--retry 5 --retry-delay 5 --retry-all-errors \
+			-o "$2" "$1" && plain_file "$2" && chmod 0644 "$2"
 }
 
 # notice_entry appends to NOTICES the entry for one tool: its name and version, its
@@ -243,14 +262,14 @@ These tools are installed outside apt, under licenses that ask for their text wi
 NOTICES
 
 	for dir in "$tools"/copilot-cli/*/*/; do
-		[ -x "${dir}bin/copilot" ] || continue
+		[ -e "${dir}bin/copilot" ] || [ -L "${dir}bin/copilot" ] || continue
 		version=${dir#"$tools/copilot-cli/"}
 		version=${version%%/*}
 		if ! [[ $version =~ $NOTICE_VERSION ]]; then
 			echo "the toolcache holds the GitHub Copilot CLI as $version, which this build will not put in a URL" >&2
 			exit 1
 		fi
-		if ! fetch_license "https://raw.githubusercontent.com/github/copilot-cli/v$version/LICENSE.md" "${dir}LICENSE.md"; then
+		if ! fetch_license "https://raw.githubusercontent.com/github/copilot-cli/v$version/LICENSE.md" "${dir}LICENSE.md" "$rootfs"; then
 			echo "could not fetch the license of the GitHub Copilot CLI $version, which must travel with it" >&2
 			exit 1
 		fi
@@ -258,7 +277,7 @@ NOTICES
 	done
 
 	for path in "$tools"/agentic-workflow-firewall-js/*/*/awf-bundle.js; do
-		[ -f "$path" ] || continue
+		[ -e "$path" ] || [ -L "$path" ] || continue
 		dir=${path%/awf-bundle.js}
 		version=${dir#"$tools/agentic-workflow-firewall-js/"}
 		version=${version%%/*}
@@ -266,23 +285,23 @@ NOTICES
 			echo "the toolcache holds the agentic workflow firewall as $version, which this build will not put in a URL" >&2
 			exit 1
 		fi
-		if ! fetch_license "https://raw.githubusercontent.com/github/gh-aw-firewall/v$version/LICENSE" "$dir/LICENSE"; then
+		if ! fetch_license "https://raw.githubusercontent.com/github/gh-aw-firewall/v$version/LICENSE" "$dir/LICENSE" "$rootfs"; then
 			echo "could not fetch the license of the agentic workflow firewall $version, which must travel with it" >&2
 			exit 1
 		fi
 		notice_entry "$notices" "Agentic workflow firewall bundle $version" "MIT" "${dir#"$rootfs"}/LICENSE"
 	done
 
-	if [ -e "$rootfs/usr/share/miniconda" ]; then
-		if ! [ -s "$rootfs/usr/share/miniconda/LICENSE.txt" ]; then
+	if [ -e "$rootfs/usr/share/miniconda" ] || [ -L "$rootfs/usr/share/miniconda" ]; then
+		if ! plain_file "$rootfs/usr/share/miniconda/LICENSE.txt"; then
 			echo "Miniconda is installed without the end user license agreement its installer places" >&2
 			exit 1
 		fi
 		notice_entry "$notices" "Miniconda" "Miniconda End User License Agreement" /usr/share/miniconda/LICENSE.txt
 	fi
 
-	if [ -e "$rootfs/usr/local/bin/packer" ]; then
-		if ! [ -s "$rootfs/usr/local/bin/LICENSE.txt" ]; then
+	if [ -e "$rootfs/usr/local/bin/packer" ] || [ -L "$rootfs/usr/local/bin/packer" ]; then
+		if ! plain_file "$rootfs/usr/local/bin/LICENSE.txt"; then
 			echo "Packer is installed without the license its zip places beside it" >&2
 			exit 1
 		fi

@@ -224,19 +224,20 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 		t.Fatal(`check-guest-image.sh never runs check_image_notices "$MNT"`)
 	}
 
-	if out, failed := gateRun(t, "check_image_notices", imageNoticesRoot(t), "", "check_image_notices"); failed != "0" ||
+	if out, failed := gateRun(t, "check_image_notices", imageNoticesRoot(t), "", noticeGateFunctions...); failed != "0" ||
 		!strings.Contains(out, "(5)") {
 		t.Errorf("an image carrying every license failed, or did not count five:\n%s", out)
 	}
 
 	empty := t.TempDir()
 	writeTreeFile(t, empty, "opt/billet/IMAGE_NOTICES", "Notices for the billet guest image\n")
-	if out, failed := gateRun(t, "check_image_notices", empty, "", "check_image_notices"); failed != "0" {
+	if out, failed := gateRun(t, "check_image_notices", empty, "", noticeGateFunctions...); failed != "0" {
 		t.Errorf("an image carrying none of the tools failed:\n%s", out)
 	}
 
 	for _, tc := range []struct {
 		name, remove, empty, unnamed, want string
+		mutate                             func(t *testing.T, root string)
 	}{
 		{name: "no notices file", remove: "opt/billet/IMAGE_NOTICES", want: "has no /opt/billet/IMAGE_NOTICES"},
 		{name: "an empty notices file", empty: "opt/billet/IMAGE_NOTICES", want: "has no /opt/billet/IMAGE_NOTICES"},
@@ -254,6 +255,49 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 		{
 			name: "a license the notices do not name", unnamed: "/usr/local/bin/LICENSE.txt",
 			want: "/usr/local/bin/LICENSE.txt (not named in IMAGE_NOTICES)",
+		},
+		{
+			// The tool is a link that resolves only inside the image, so this
+			// machine sees nothing there; it ships all the same.
+			name: "a linked Copilot CLI without its license", want: "/opt/hostedtoolcache/copilot-cli/1.0.102/x64/LICENSE.md",
+			mutate: func(t *testing.T, root string) {
+				dir := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.102", "x64", "bin")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("/opt/copilot/bin/copilot", filepath.Join(dir, "copilot")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			// The link names a file this machine has and the image does not.
+			name: "a license linked to a file outside the image", want: "/usr/local/bin/LICENSE.txt",
+			mutate: func(t *testing.T, root string) {
+				outside := filepath.Join(t.TempDir(), "LICENSE.txt")
+				writeTreeFile(t, filepath.Dir(outside), "LICENSE.txt", "Business Source License 1.1\n")
+				license := filepath.Join(root, "usr", "local", "bin", "LICENSE.txt")
+				removeAll(t, license)
+				if err := os.Symlink(outside, license); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "a directory where Packer's license is", want: "/usr/local/bin/LICENSE.txt",
+			mutate: func(t *testing.T, root string) {
+				license := filepath.Join(root, "usr", "local", "bin", "LICENSE.txt")
+				removeAll(t, license)
+				writeTreeFile(t, license, "terms", "Business Source License 1.1\n")
+			},
+		},
+		{
+			name: "a directory where the notices are", want: "has no /opt/billet/IMAGE_NOTICES",
+			mutate: func(t *testing.T, root string) {
+				notices := filepath.Join(root, "opt", "billet", "IMAGE_NOTICES")
+				removeAll(t, notices)
+				writeTreeFile(t, notices, "x", "  Text: /usr/local/bin/LICENSE.txt\n")
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -278,14 +322,20 @@ func TestThePublicationGateRefusesAToolWithoutItsLicense(t *testing.T) {
 				}
 				writeTreeFile(t, root, "opt/billet/IMAGE_NOTICES", without)
 			}
+			if tc.mutate != nil {
+				tc.mutate(t, root)
+			}
 
-			out, failed := gateRun(t, "check_image_notices", root, "", "check_image_notices")
+			out, failed := gateRun(t, "check_image_notices", root, "", noticeGateFunctions...)
 			if failed != "1" || !strings.Contains(out, tc.want) {
 				t.Errorf("the gate did not refuse naming %q:\n%s", tc.want, out)
 			}
 		})
 	}
 }
+
+// noticeGateFunctions are the gate's functions check_image_notices runs on.
+var noticeGateFunctions = []string{"image_resolve", "image_text_file", "check_image_notices"}
 
 // buildAssignment returns one top-level assignment from build-guest-image.sh.
 func buildAssignment(t *testing.T, name string) string {
@@ -310,7 +360,7 @@ func runImageNotices(t *testing.T, root, curl string) (string, bool) {
 	bin := t.TempDir()
 	writeExecutable(t, filepath.Join(bin, "curl"), "#!/usr/bin/env bash\n"+curl)
 	script := "set -euo pipefail\nTOOLCACHE_DIR=/opt/hostedtoolcache\n" + buildAssignment(t, "NOTICE_VERSION") + "\n"
-	for _, name := range []string{"fetch_license", "notice_entry", "install_image_notices"} {
+	for _, name := range []string{"plain_file", "fetch_license", "notice_entry", "install_image_notices"} {
 		script += guestImageFunction(t, name) + "\n"
 	}
 	script += "install_image_notices \"$1\"\n"
@@ -336,7 +386,6 @@ func TestTheBuildInstallsEachToolsLicenseFromItsTag(t *testing.T) {
 
 	root := t.TempDir()
 	for _, path := range []string{
-		"opt/hostedtoolcache/copilot-cli/1.0.101/x64/bin/copilot",
 		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72/x64/awf-bundle.js",
 		"opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.71/x64/awf-bundle.js",
 		"usr/share/miniconda/bin/conda",
@@ -346,6 +395,14 @@ func TestTheBuildInstallsEachToolsLicenseFromItsTag(t *testing.T) {
 	}
 	writeTreeFile(t, root, "usr/share/miniconda/LICENSE.txt", "MINICONDA END USER LICENSE AGREEMENT\n")
 	writeTreeFile(t, root, "usr/local/bin/LICENSE.txt", "Business Source License 1.1\n")
+	// A TOOL LINKED TO WHERE ONLY THE IMAGE HAS IT ships all the same.
+	bin := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.101", "x64", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/opt/copilot/bin/copilot", filepath.Join(bin, "copilot")); err != nil {
+		t.Fatal(err)
+	}
 
 	// The fake writes the URL it was asked for as the license, so each file says
 	// which tag it came from.
@@ -366,7 +423,7 @@ printf '%s\n' "$url" >"$out"
 			t.Errorf("%s = %q, %v; want the license fetched from %s", path, body, err, url)
 		}
 	}
-	if out, failed := gateRun(t, "check_image_notices", root, "", "check_image_notices"); failed != "0" ||
+	if out, failed := gateRun(t, "check_image_notices", root, "", noticeGateFunctions...); failed != "0" ||
 		!strings.Contains(out, "(5)") {
 		t.Errorf("the gate refused the notices the build wrote:\n%s", out)
 	}
@@ -394,6 +451,7 @@ func TestTheBuildFailsWithoutEachToolsLicense(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, tool, curl, want string
+		mutate                 func(t *testing.T, root string)
 	}{
 		{
 			name: "a fetch that fails", tool: "opt/hostedtoolcache/copilot-cli/1.0.101/x64/bin/copilot",
@@ -409,12 +467,42 @@ func TestTheBuildFailsWithoutEachToolsLicense(t *testing.T) {
 		},
 		{name: "Miniconda without its agreement", tool: "usr/share/miniconda/bin/conda", curl: "exit 0\n", want: "Miniconda is installed without"},
 		{name: "Packer without its license", tool: "usr/local/bin/packer", curl: "exit 0\n", want: "Packer is installed without"},
+		{
+			name: "a directory where Packer's license is", tool: "usr/local/bin/packer", curl: "exit 0\n",
+			want: "Packer is installed without",
+			mutate: func(t *testing.T, root string) {
+				writeTreeFile(t, root, "usr/local/bin/LICENSE.txt/terms", "Business Source License 1.1\n")
+			},
+		},
+		{
+			// A toolcache directory linked out of the image would have the build
+			// write, as root, onto the builder.
+			name: "a toolcache directory linked outside the image", tool: "opt/hostedtoolcache/agentic-workflow-firewall-js/0.28.72",
+			curl: "echo fetched >&2; exit 0\n", want: "firewall 0.28.72",
+			mutate: func(t *testing.T, root string) {
+				outside := t.TempDir()
+				writeTreeFile(t, outside, "x64/awf-bundle.js", "bundle\n")
+				link := filepath.Join(root, "opt", "hostedtoolcache", "agentic-workflow-firewall-js", "0.28.72")
+				removeAll(t, link)
+				if err := os.Symlink(outside, link); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if _, err := os.Lstat(filepath.Join(outside, "x64", "LICENSE")); err == nil {
+						t.Error("the build wrote a license outside the image")
+					}
+				})
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			root := t.TempDir()
 			writeTreeFile(t, root, tc.tool, "#!/bin/sh\n")
+			if tc.mutate != nil {
+				tc.mutate(t, root)
+			}
 			out, ok := runImageNotices(t, root, tc.curl)
 			if ok || !strings.Contains(out, tc.want) {
 				t.Errorf("the step did not fail naming %q:\n%s", tc.want, out)

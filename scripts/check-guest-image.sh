@@ -450,38 +450,42 @@ check_completer() {
 # copy, that text, and /opt/billet/IMAGE_NOTICES naming where it is (#584): the
 # GitHub Copilot CLI, the agentic workflow firewall bundle, Miniconda and Packer,
 # each wherever the template put it.
+#
+# A TOOL SHIPS IF ANYTHING IS AT ITS PATH, a symlink included, whatever it points
+# to on this machine; and a license counts only as a non-empty regular file, found
+# by resolving its path inside the image, never against the builder's own root.
 check_image_notices() {
-	local notices="$1/opt/billet/IMAGE_NOTICES" path text want=() missing=() status
+	local path text want=() missing=() status
 
-	if ! [ -s "$notices" ]; then
+	if ! image_text_file "$1" /opt/billet/IMAGE_NOTICES; then
 		fail "the image has no /opt/billet/IMAGE_NOTICES, so it ships tools whose licenses ask for their text without saying where it is"
 		return
 	fi
 	for path in "$1"/opt/hostedtoolcache/copilot-cli/*/*/bin/copilot; do
-		if [ -e "$path" ]; then
+		if [ -e "$path" ] || [ -L "$path" ]; then
 			want+=("${path%/bin/copilot}/LICENSE.md")
 		fi
 	done
 	for path in "$1"/opt/hostedtoolcache/agentic-workflow-firewall-js/*/*/awf-bundle.js; do
-		if [ -e "$path" ]; then
+		if [ -e "$path" ] || [ -L "$path" ]; then
 			want+=("${path%/awf-bundle.js}/LICENSE")
 		fi
 	done
-	if [ -e "$1/usr/share/miniconda" ]; then
+	if [ -e "$1/usr/share/miniconda" ] || [ -L "$1/usr/share/miniconda" ]; then
 		want+=("$1/usr/share/miniconda/LICENSE.txt")
 	fi
-	if [ -e "$1/usr/local/bin/packer" ]; then
+	if [ -e "$1/usr/local/bin/packer" ] || [ -L "$1/usr/local/bin/packer" ]; then
 		want+=("$1/usr/local/bin/LICENSE.txt")
 	fi
 
 	for path in ${want[@]+"${want[@]}"}; do
 		text=${path#"$1"}
-		if ! [ -s "$path" ]; then
+		if ! image_text_file "$1" "$text"; then
 			missing+=("$text")
 			continue
 		fi
 		status=0
-		grep -qxF "  Text: $text" "$notices" || status=$?
+		grep -qxF "  Text: $text" "$1/opt/billet/IMAGE_NOTICES" || status=$?
 		case "$status" in
 		0) ;;
 		1) missing+=("$text (not named in IMAGE_NOTICES)") ;;
@@ -496,6 +500,14 @@ check_image_notices() {
 		return
 	fi
 	pass "the image carries the license of each tool installed outside apt that asks for it (${#want[@]}), and IMAGE_NOTICES names each"
+}
+
+# image_text_file succeeds when PATH, resolved inside the image mounted at ROOT, is
+# a non-empty regular file.
+image_text_file() {
+	local resolved
+	resolved=$(image_resolve "$1" "$2") || return 1
+	[ -f "$1$resolved" ] && [ ! -L "$1$resolved" ] && [ -s "$1$resolved" ]
 }
 
 # check_manifest_components passes or fails the gate on the manifest declaring
