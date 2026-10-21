@@ -28,9 +28,11 @@ func TestAccountOfAnswersTheAccountUnderItsWait(t *testing.T) {
 
 	t.Run("an account", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte(`<GetCallerIdentityResponse><GetCallerIdentityResult>` +
+			if _, err := w.Write([]byte(`<GetCallerIdentityResponse><GetCallerIdentityResult>` +
 				`<Arn>arn:aws:sts::123456789012:assumed-role/x/y</Arn><UserId>AROAEXAMPLE:y</UserId>` +
-				`<Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`))
+				`<Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`)); err != nil {
+				t.Errorf("the stand-in for STS could not answer: %v", err)
+			}
 		}))
 		t.Cleanup(srv.Close)
 
@@ -42,8 +44,10 @@ func TestAccountOfAnswersTheAccountUnderItsWait(t *testing.T) {
 
 	t.Run("no account in the answer", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte(`<GetCallerIdentityResponse><GetCallerIdentityResult>` +
-				`</GetCallerIdentityResult></GetCallerIdentityResponse>`))
+			if _, err := w.Write([]byte(`<GetCallerIdentityResponse><GetCallerIdentityResult>` +
+				`</GetCallerIdentityResult></GetCallerIdentityResponse>`)); err != nil {
+				t.Errorf("the stand-in for STS could not answer: %v", err)
+			}
 		}))
 		t.Cleanup(srv.Close)
 
