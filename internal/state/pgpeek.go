@@ -383,6 +383,14 @@ func holdWriterLock(ctx context.Context, be *postgresBackend, w *sql.DB) error {
 // or this refuses before dropping anything. lock_timeout bounds the wait for a
 // table another session holds, so a stray transaction is a refusal naming the
 // wait rather than a command that never returns.
+//
+// NOTHING OUTSIDE THE DROPPED TABLES GOES WITH THEM. The copies a caller holds
+// are dumps of this schema alone, so a view, a foreign key or an inheriting
+// table elsewhere that a CASCADE took could never be put back. The drop is one
+// RESTRICT statement over every table at once (dependencies among them are
+// allowed, a dependent anywhere else refuses the whole transaction), and a
+// partitioned table is refused outright, because its partitions go with it
+// whatever the drop says.
 func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []string) ([]string, error) {
 	be := newPostgresBackend(dsn)
 
@@ -435,20 +443,38 @@ func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []strin
 	var dropped []string
 
 	for _, table := range tables {
-		if slices.Contains(keep, table) {
-			continue
+		if !slices.Contains(keep, table) {
+			dropped = append(dropped, table)
+		}
+	}
+
+	if len(dropped) > 0 {
+		partitioned, err := partitionedTables(ctx, tx)
+		if err != nil {
+			return nil, err
 		}
 
-		//nolint:gosec // G202: an identifier cannot be a bind parameter; it comes from the catalogue, quoted with every " doubled.
-		stmt := `DROP TABLE IF EXISTS "` + strings.ReplaceAll(table, `"`, `""`) + `" CASCADE`
+		quoted := make([]string, 0, len(dropped))
 
-		//billet:ignore rawsql // the TABLE is the variable, discovered from the catalogue at run time
+		for _, table := range dropped {
+			if slices.Contains(partitioned, table) {
+				return nil, fmt.Errorf("state: %s.%s is a partitioned table, which billet's ledger "+
+					"never holds, and dropping it would take its partitions wherever they are; "+
+					"billet drops nothing", schema, table)
+			}
+
+			quoted = append(quoted, quoteIdent(schema)+"."+quoteIdent(table))
+		}
+
+		//nolint:gosec // G202: an identifier cannot be a bind parameter; each comes from the catalogue, quoted with every " doubled.
+		stmt := `DROP TABLE ` + strings.Join(quoted, ", ") + ` RESTRICT`
+
+		//billet:ignore rawsql // the TABLES are the variable, discovered from the catalogue at run time
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("state: drop table %s, which the restored ledger does not have: %w",
-				table, err)
+			return nil, fmt.Errorf("state: drop %s, which the restored ledger does not have: something "+
+				"outside them depends on them, or they could not be dropped, so billet drops nothing: %w",
+				strings.Join(dropped, ", "), err)
 		}
-
-		dropped = append(dropped, table)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -457,6 +483,40 @@ func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []strin
 
 	return dropped, nil
 }
+
+// partitionedTables lists the partitioned tables in the connection's schema.
+func partitionedTables(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	//billet:ignore rawsql // pg_class is not in sqlc's catalogue, and this asks which tables are partitioned
+	rows, err := tx.QueryContext(ctx,
+		`SELECT c.relname FROM pg_catalog.pg_class c `+
+			`JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace `+
+			`WHERE n.nspname = current_schema() AND c.relkind = 'p' ORDER BY c.relname`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list the schema's partitioned tables: %w", err)
+	}
+
+	defer rows.Close()
+
+	var out []string
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("state: scan the schema's partitioned tables: %w", err)
+		}
+
+		out = append(out, name)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: list the schema's partitioned tables: %w", err)
+	}
+
+	return out, nil
+}
+
+// quoteIdent quotes a PostgreSQL identifier, doubling every quote in it.
+func quoteIdent(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
 
 // OpenPostgresRecovery opens a PostgreSQL ledger for `billet local recover` to
 // seal what it has just put back, across the fence that recovery raised.

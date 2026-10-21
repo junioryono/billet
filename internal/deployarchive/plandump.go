@@ -96,8 +96,23 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 
 	// A RESUME FINDS ITS OWN WORK. A run interrupted after its pg_restore
 	// committed left a populated schema that, on a ledger never bound, nothing
-	// else here could tell from somebody else's; the journal can.
-	if p.ledgerRestoredByThisRun() {
+	// else here could tell from somebody else's; the journal can. And the
+	// database is proved to be the one that work went into, because nothing
+	// after this point restores anything: what follows seals the ledger the
+	// connection reaches and opens the fence over it.
+	if prog, restored := p.ledgerRestoredByThisRun(); restored {
+		if err := checkRestoredLedger(p.Archive, prog.LedgerDatabase, led); err != nil {
+			p.refuse(lifeops.Refusal{
+				What: fmt.Sprintf("this %s restored the ledger once already, and the database the "+
+					"connection %s names is not proved to be the one it went into: %v",
+					p.Intent, p.Target.ConfigPath, err),
+				Remedy: "point the connection back at the database this run restored into, or " +
+					"abandon it and reconcile the ledger by hand",
+			})
+
+			return nil
+		}
+
 		// A RECOVERY STILL NAMES ITS COPY, so a resumed run hands it to the service
 		// account and reports where it is, as the first run would have.
 		if p.Intent == ReplaceLedger {
@@ -112,9 +127,34 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	// A RECOVERY REPLACES THE LEDGER WHATEVER ITS SCHEMA'S AGE: Restore drops the
 	// tables the archive's dump does not name before it restores, so a ledger a
 	// later migration widened comes back as the archive's whole, not as a mix.
+	//
+	// AND ONLY A LEDGER BOUND TO THIS DEPLOYMENT, FROM AN ARCHIVE BOUND TO IT. The
+	// binding is the one fact that names this deployment's ledger wherever the
+	// connection points, so it is what every later pass (a resume, an abandon,
+	// the seal) holds the database to; a ledger no controller ever claimed has
+	// served nothing a recovery could put back.
 	if p.Intent == ReplaceLedger {
-		if led.Binding != "" && led.Binding != deployment {
+		switch {
+		case led.Binding != "" && led.Binding != deployment:
 			p.refuseForeignLedger(led.Binding)
+
+			return nil
+		case led.Binding == "":
+			p.refuse(lifeops.Refusal{
+				What: fmt.Sprintf("the ledger %s names is bound to no deployment, so billet cannot "+
+					"prove it is %s's", p.Target.ConfigPath, deployment),
+				Remedy: "`billet local recover` puts a served deployment back over its own ledger; " +
+					"for a ledger no controller has claimed, `billet local restore` into an empty " +
+					"schema is the operation",
+			})
+
+			return nil
+		case facts.Binding != deployment:
+			p.refuse(lifeops.Refusal{
+				What: fmt.Sprintf("this backup's ledger is bound to %q, not to %s, so a recovery "+
+					"from it could not prove which ledger it put back", facts.Binding, deployment),
+				Remedy: "recover from a backup taken after this deployment's controller first started",
+			})
 
 			return nil
 		}
@@ -172,6 +212,16 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 				"Otherwise empty that schema deliberately; billet replaces only a ledger nothing " +
 				"has written to",
 		})
+	case !slices.Contains(led.Tables, "schema_migrations") || len(led.Migrations) == 0:
+		// EMPTY IS NOT PRISTINE. Tables with no rows and no migration bookkeeping
+		// are somebody's schema, and the restore would drop them with no copy
+		// taken; only a ledger billet migrated is replaced as one.
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf("schema %s holds tables (%s) and no billet migrations, so it is not a "+
+				"ledger billet prepared", led.Schema, joinOrNone(led.Tables)),
+			Remedy: "point the connection at an empty schema for this backup's ledger to be " +
+				"restored into",
+		})
 	case newerThanArchive(led.Migrations, p.Archive.Manifest.Ledger.HighestVersion()):
 		p.refuse(lifeops.Refusal{
 			What: fmt.Sprintf("schema %s was prepared by a billet newer than the one that took this "+
@@ -191,13 +241,13 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 // this archive's dump was already restored by this operation. A journal billet
 // cannot read answers no, which plans the database afresh: the safe direction,
 // since what that plan can do to a populated schema is refuse.
-func (p *Plan) ledgerRestoredByThisRun() bool {
+func (p *Plan) ledgerRestoredByThisRun() (Progress, bool) {
 	prog, err := InProgress(p.Target.StateDir)
 	if err != nil {
-		return false
+		return Progress{}, false
 	}
 
-	return prog.IsFor(p.Archive) && prog.IsFrom(p.Intent) && prog.LedgerRestored
+	return prog, prog.IsFor(p.Archive) && prog.IsFrom(p.Intent) && prog.LedgerRestored
 }
 
 // refuseRecoverOntoAnotherHost is a recovery planned on a host that is not

@@ -339,3 +339,102 @@ func TestDropTablesOutsideDropsOnlyWhatTheDumpDoesNotName(t *testing.T) {
 		t.Errorf("after the cleanup the schema holds %v, want %v", after.Tables, keep)
 	}
 }
+
+// NOTHING OUTSIDE THE DROPPED TABLES GOES WITH THEM: a view in another schema
+// that depends on a table the dump does not name refuses the whole drop, and so
+// does a partitioned table, whose partitions a drop takes wherever they are.
+// The copies a caller holds are of this schema alone and could not bring either
+// back. A table in another schema that depends on nothing stays as it was.
+func TestDropTablesOutsideTakesNothingOutsideThem(t *testing.T) {
+	t.Parallel()
+
+	dsn := requirePostgres(t)
+	schema := schemaFrom(t, t.Name())
+	elsewhere := schema + "_elsewhere"
+
+	db, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	raw, err := sql.Open("pgx", string(dsn))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = raw.Close() }()
+
+	run := func(stmt string) {
+		t.Helper()
+
+		if _, err := raw.ExecContext(t.Context(), stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// ITS OWN CONNECTION, because raw is closed by the time a cleanup runs, and
+	// a schema left from a run that died is cleared first.
+	t.Cleanup(func() {
+		cleanup, err := sql.Open("pgx", string(dsn))
+		if err != nil {
+			return
+		}
+
+		defer func() { _ = cleanup.Close() }()
+
+		//nolint:errcheck,noctx // teardown, after the test's context is gone.
+		_, _ = cleanup.Exec(`DROP SCHEMA IF EXISTS "` + elsewhere + `" CASCADE`)
+	})
+
+	run(`DROP SCHEMA IF EXISTS "` + elsewhere + `" CASCADE`)
+	run(`CREATE SCHEMA "` + elsewhere + `"`)
+	run(`CREATE TABLE "` + elsewhere + `".neighbour (x int)`)
+	run(`CREATE TABLE "` + schema + `".a_later_migration (x int)`)
+	run(`CREATE VIEW "` + elsewhere + `".report AS SELECT x FROM "` + schema + `".a_later_migration`)
+
+	before, err := PeekPostgresLedger(t.Context(), dsn)
+	if err != nil {
+		t.Fatalf("PeekPostgresLedger: %v", err)
+	}
+
+	keep := slices.DeleteFunc(slices.Clone(before.Tables), func(s string) bool { return s == "a_later_migration" })
+
+	if _, err := DropTablesOutside(t.Context(), dsn, schema, keep); err == nil ||
+		!strings.Contains(err.Error(), "billet drops nothing") {
+		t.Fatalf("DropTablesOutside with a view elsewhere depending on it = %v, want a refusal", err)
+	}
+
+	if still, err := PeekPostgresLedger(t.Context(), dsn); err != nil || !slices.Equal(still.Tables, before.Tables) {
+		t.Fatalf("a refused drop changed the schema: %v (%v)", still.Tables, err)
+	}
+
+	run(`SELECT x FROM "` + elsewhere + `".report`)
+
+	// PARTITIONED, with no dependent at all: still refused.
+	run(`DROP VIEW "` + elsewhere + `".report`)
+	run(`DROP TABLE "` + schema + `".a_later_migration`)
+	run(`CREATE TABLE "` + schema + `".a_later_migration (x int) PARTITION BY RANGE (x)`)
+
+	if _, err := DropTablesOutside(t.Context(), dsn, schema, keep); err == nil ||
+		!strings.Contains(err.Error(), "partitioned table") {
+		t.Fatalf("DropTablesOutside over a partitioned table = %v, want a refusal", err)
+	}
+
+	// AN ORDINARY TABLE WITH NOTHING DEPENDING ON IT GOES, and the neighbour
+	// elsewhere stays.
+	run(`DROP TABLE "` + schema + `".a_later_migration`)
+	run(`CREATE TABLE "` + schema + `".a_later_migration (x int)`)
+
+	dropped, err := DropTablesOutside(t.Context(), dsn, schema, keep)
+	if err != nil {
+		t.Fatalf("DropTablesOutside: %v", err)
+	}
+
+	if !slices.Equal(dropped, []string{"a_later_migration"}) {
+		t.Errorf("dropped %v, want only the table the dump does not name", dropped)
+	}
+
+	run(`SELECT x FROM "` + elsewhere + `".neighbour`)
+}

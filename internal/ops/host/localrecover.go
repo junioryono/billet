@@ -290,6 +290,13 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 	// and sealing afterwards leaves an interval in which a control plane can start
 	// on an open ledger; the fence is the only thing that refuses one, so it stays
 	// up until the seal is durable and Finish takes it down.
+	// AND ON POSTGRESQL, INTO THE DATABASE THE LEDGER WAS RESTORED INTO, proved
+	// before the seal's open, which writes and may migrate whatever schema the
+	// connection reaches by now.
+	if err := deployarchive.ProveRestoredLedger(ctx, plan); err != nil {
+		return err
+	}
+
 	if err := sealRecoveredDeployment(ctx, env, cfg, o); err != nil {
 		return err
 	}

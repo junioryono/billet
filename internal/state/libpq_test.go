@@ -390,3 +390,93 @@ func keys(m map[string]string) []string {
 
 	return out
 }
+
+// THE ENDPOINTS, PINNED: values read off pgx's resolution once and written
+// down, so a rendering that took the text's ports, or that a change to the
+// dedup broke, fails here and not only in a test computing its answer the way
+// production does. The default sslmode=prefer is the case the dedup exists
+// for: pgx keeps a TLS and a plain attempt per host.
+func TestTheEndpointsArePinned(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ dsn, host, port string }{
+		{"postgres://u@h1,h2:6543/d?sslmode=disable", "h1,h2", "6543,6543"},
+		{"postgres://u@h1,h2:6543/d", "h1,h2", "6543,6543"},
+		{"postgres://u@h1:5433,h2:5434/d", "h1,h2", "5433,5434"},
+		{"host=h1,h2 port=6543 user=u dbname=d", "h1,h2", "6543,6543"},
+	} {
+		got := envOf(t, tc.dsn)
+
+		if got["PGHOST"] != tc.host || got["PGPORT"] != tc.port {
+			t.Errorf("%q renders as PGHOST=%q PGPORT=%q, want %q and %q",
+				tc.dsn, got["PGHOST"], got["PGPORT"], tc.host, tc.port)
+		}
+	}
+}
+
+// AN EMPTY HOST IS REFUSED, or rendered as a host: libpq reads an empty one as
+// its default socket, which is not where pgx goes.
+func TestAnEmptyHostIsNeverRendered(t *testing.T) {
+	t.Parallel()
+
+	for _, dsn := range []string{
+		"host=,db.internal port=5432 user=u dbname=d sslmode=disable",
+		"host=db.internal, port=5432 user=u dbname=d sslmode=disable",
+	} {
+		env, err := LibpqEnv(DSN(dsn))
+		if err != nil {
+			continue
+		}
+
+		for _, v := range env.Environ(nil) {
+			if host, ok := strings.CutPrefix(v, "PGHOST="); ok && slices.Contains(strings.Split(host, ","), "") {
+				t.Errorf("%q renders an empty host: %s", dsn, v)
+			}
+		}
+	}
+}
+
+// A VERTICAL TAB OR A FORM FEED ENDS A VALUE FOR BOTH READINGS, as pgx's
+// asciiSpace does, so a keyword behind one is seen and refused here rather
+// than acted on by pgx alone.
+func TestAKeywordBehindAnUnusualSpaceIsStillSeen(t *testing.T) {
+	t.Parallel()
+
+	for _, sep := range []string{"\v", "\f"} {
+		dsn := "host=h" + sep + "service=billet dbname=d user=u"
+
+		_, err := LibpqEnv(DSN(dsn))
+		if err == nil || !strings.Contains(err.Error(), "service") {
+			t.Errorf("a service keyword behind %q = %v, want a refusal naming it", sep, err)
+		}
+	}
+}
+
+// WHAT THE CHILD INHERITS IS RENDERED AS pgx READ IT: an inherited PGOPTIONS
+// stays beside the DSN's runtime parameters, and an inherited password is
+// redacted like the DSN's own.
+func TestWhatTheChildInheritsIsRenderedAsPgxReadIt(t *testing.T) {
+	t.Setenv("PGOPTIONS", "-c role=ledger_owner")
+	t.Setenv("PGPASSWORD", testDSNPassword)
+
+	env, err := LibpqEnv("postgres://u@h/d?sslmode=disable&search_path=billet")
+	if err != nil {
+		t.Fatalf("LibpqEnv: %v", err)
+	}
+
+	var options string
+
+	for _, v := range env.Environ([]string{"PGOPTIONS=-c role=ledger_owner", "PGPASSWORD=" + testDSNPassword}) {
+		if o, ok := strings.CutPrefix(v, "PGOPTIONS="); ok {
+			options = o
+		}
+	}
+
+	if options != "-c role=ledger_owner -c search_path=billet" {
+		t.Errorf("PGOPTIONS = %q, want the inherited options and then the DSN's", options)
+	}
+
+	if got := env.Redact("FATAL: " + testDSNPassword); strings.Contains(got, testDSNPassword) {
+		t.Errorf("an inherited password survived redaction: %q", got)
+	}
+}

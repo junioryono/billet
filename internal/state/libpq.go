@@ -279,6 +279,15 @@ func LibpqEnv(dsn DSN) (ClientEnv, error) {
 		}
 	}
 
+	// AN INHERITED PGOPTIONS STAYS. pgx takes it as the options keyword when the
+	// text names none, and sends the runtime parameters beside it; setting
+	// PGOPTIONS from the runtime parameters alone would replace it in the child.
+	if _, named := settings["options"]; !named && len(options) > 0 {
+		if inherited := os.Getenv("PGOPTIONS"); inherited != "" {
+			options = append([]string{inherited}, options...)
+		}
+	}
+
 	if len(options) > 0 {
 		vars["PGOPTIONS"] = strings.Join(options, " ")
 	}
@@ -294,7 +303,14 @@ func LibpqEnv(dsn DSN) (ClientEnv, error) {
 
 	sort.Strings(out)
 
-	return ClientEnv{vars: out, password: vars["PGPASSWORD"]}, nil
+	// THE PASSWORD REDACTED IS THE ONE THE CHILD USES, the DSN's or, where it
+	// names none, the one the child inherits.
+	password, ok := vars["PGPASSWORD"]
+	if !ok {
+		password = os.Getenv("PGPASSWORD")
+	}
+
+	return ClientEnv{vars: out, password: password}, nil
 }
 
 // agreeWithPgx makes the client program dial what pgx dials, fills what the
@@ -328,6 +344,13 @@ func agreeWithPgx(vars map[string]string, cfg *pgx.ConnConfig) error {
 	}
 
 	for _, h := range hosts {
+		// AN EMPTY HOST IS THE DEFAULT SOCKET TO libpq and something else to pgx,
+		// so the two would reach different servers.
+		if h == "" {
+			return errors.New("state: the PostgreSQL data source names an empty host, which " +
+				"libpq and billet would resolve to different servers; name every host")
+		}
+
 		if strings.Contains(h, ",") {
 			return errors.New("state: the PostgreSQL data source names a host with a comma in " +
 				"it, which libpq would read as two")
@@ -492,7 +515,12 @@ func keywordSettings(text string) (map[string]string, error) {
 	return out, nil
 }
 
-func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+// isSpace is pgconn's asciiSpace, so the two readings of a keyword string end a
+// value at the same byte: a separator only one of them saw would hide a keyword
+// from this reading that pgx then acts on.
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+}
 
 // canonicalKeyword folds pgx's spelling of the database onto libpq's.
 func canonicalKeyword(key string) string {

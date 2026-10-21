@@ -157,17 +157,23 @@ type journal struct {
 	// SupersededDumpVersion is the major of the pg_dump that took that copy, so
 	// the put-back holds pg_restore to it as the archive's restore is held.
 	SupersededDumpVersion int `json:"superseded_dump_version,omitempty"`
-	// SupersededDatabase is the database that copy was taken from, so a resume
-	// or an abandon refuses a connection since pointed at another one rather
-	// than replacing a ledger nobody looked at.
-	SupersededDatabase string   `json:"superseded_database,omitempty"`
-	ArchiveDir         string   `json:"archive_dir"`
-	ManifestSHA        string   `json:"manifest_sha256"`
-	DeploymentID       string   `json:"deployment_id"`
-	StartedAt          string   `json:"started_at"`
-	Actor              string   `json:"actor"`
-	Created            []string `json:"created"`
-	RemovedFiles       []string `json:"removed_files,omitempty"`
+	// SupersededMigrations is what that copy's ledger had applied, read in the
+	// copy's own snapshot, so a put-back is read back against the copy rather
+	// than against a binding the archive's ledger carries too.
+	SupersededMigrations []state.AppliedMigration `json:"superseded_migrations,omitempty"`
+	// LedgerDatabase is the database a PostgreSQL run writes the ledger into,
+	// recorded before its first write there, so a resume, a seal, a finish or an
+	// abandon refuses a connection since pointed at another one rather than
+	// acting on a ledger nobody looked at. Empty beside recorded work is "could
+	// not tell", never "anywhere".
+	LedgerDatabase string   `json:"ledger_database,omitempty"`
+	ArchiveDir     string   `json:"archive_dir"`
+	ManifestSHA    string   `json:"manifest_sha256"`
+	DeploymentID   string   `json:"deployment_id"`
+	StartedAt      string   `json:"started_at"`
+	Actor          string   `json:"actor"`
+	Created        []string `json:"created"`
+	RemovedFiles   []string `json:"removed_files,omitempty"`
 }
 
 // RestoreRequest is what Execute acts on.
@@ -678,6 +684,25 @@ func finishLocked(ctx context.Context, plan Plan) error {
 	// merely documented "seal first" would open exactly the window the fence
 	// exists to close, and no test of the caller can show that it did not.
 	if plan.Intent == ReplaceLedger {
+		// THE SEAL IS READ FROM THE DATABASE THE LEDGER WAS RESTORED INTO, proved
+		// first: a seal read from wherever the connection points by now is no
+		// proof about the ledger this fence protects.
+		if found && plan.Archive != nil && plan.Archive.Manifest.Ledger.IsDump() {
+			if plan.Target.Postgres == nil {
+				return errors.New("deployarchive: a PostgreSQL recovery's fence cannot be lifted " +
+					"without the database it restored into")
+			}
+
+			led, err := plan.Target.Postgres.Peek(ctx)
+			if err != nil {
+				return fmt.Errorf("deployarchive: read the restored ledger before lifting its fence: %w", err)
+			}
+
+			if err := checkRestoredLedger(plan.Archive, j.LedgerDatabase, led); err != nil {
+				return err
+			}
+		}
+
 		if err := requireSealed(ctx, plan); err != nil {
 			return err
 		}
@@ -2156,6 +2181,7 @@ func InProgress(stateDir string) (Progress, error) {
 		Intent:         j.Intent,
 		Phase:          j.phase(),
 		LedgerRestored: j.LedgerRestored,
+		LedgerDatabase: j.LedgerDatabase,
 	}, nil
 }
 
@@ -2184,6 +2210,9 @@ type Progress struct {
 	Phase string
 	// LedgerRestored says its pg_restore of the archive's dump committed.
 	LedgerRestored bool
+	// LedgerDatabase is the database it writes the ledger into, or empty when it
+	// has not written there yet.
+	LedgerDatabase string
 }
 
 // Finished reports whether the operation completed and only its record remains.

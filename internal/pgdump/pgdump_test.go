@@ -669,3 +669,87 @@ func TestALedgerDumpedFromOneDatabaseRestoresIntoAnother(t *testing.T) {
 
 	runSQL(target, `SELECT x FROM public.neighbour`)
 }
+
+// A TABLE ENTRY WHOSE FIELDS CANNOT BE TOLD APART, OR A SCHEMA NAME THE LIST
+// CANNOT CARRY, IS REFUSED BEFORE ANYTHING IS DROPPED: `TABLE s foo bar billet`
+// is a table `foo bar` or a table `foo` owned by `bar billet`, and the wrong
+// reading keeps a table the restore should replace.
+func TestARestoreRefusesNamesTheListCannotCarry(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, tables, schema, refusal string
+	}{
+		{
+			name:    "a table with a space in its name",
+			tables:  `    echo '220; 1259 16386 TABLE billet_x foo bar billet'`,
+			schema:  "billet_x",
+			refusal: "cannot be told apart",
+		},
+		{
+			name:    "a schema with a space in its name",
+			tables:  `    echo '220; 1259 16386 TABLE billet_x admission billet'`,
+			schema:  "billet x",
+			refusal: "no whitespace",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			writeFakeProgram(t, dir, "pg_restore", 18, tc.tables)
+
+			c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
+				"@db.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
+
+			err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, tc.schema)
+			if err == nil || !strings.Contains(err.Error(), tc.refusal) {
+				t.Fatalf("Restore = %v, want a refusal saying %q", err, tc.refusal)
+			}
+
+			if calls := dropped.snapshot(); len(calls) != 0 {
+				t.Errorf("the refused restore dropped %+v", calls)
+			}
+
+			if argv, err := os.ReadFile(filepath.Join(dir, "pg_restore.argv")); err == nil &&
+				!strings.HasPrefix(string(argv), "--list\n") {
+				t.Errorf("pg_restore ran past --list: %q", argv)
+			}
+		})
+	}
+}
+
+// A REFUSAL ABOUT THE CLIENT PROGRAM IS ErrClientUnusable, AND A DATABASE THAT
+// COULD NOT BE READ IS NOT: a backup falls back to the identity-only archive on
+// the first and fails before writing anything on the second.
+func TestAClientRefusalIsToldFromADatabaseError(t *testing.T) {
+	t.Parallel()
+
+	absent, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", t.TempDir())
+
+	if err := absent.CheckDump(t.Context()); !errors.Is(err, ErrClientUnusable) {
+		t.Errorf("CheckDump with no pg_dump = %v, want ErrClientUnusable", err)
+	}
+
+	dir := t.TempDir()
+	fakeProgram(t, dir, "pg_restore", 15)
+
+	old, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
+
+	if err := old.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, "billet_x"); !errors.Is(err, ErrClientUnusable) {
+		t.Errorf("Restore with an older pg_restore = %v, want ErrClientUnusable", err)
+	}
+
+	// A pg_dump THAT IS FINE, AGAINST A DATABASE NOTHING ANSWERS FOR.
+	reachable := t.TempDir()
+	fakeProgram(t, reachable, "pg_dump", 99)
+
+	unreachable, _ := clientWithFakes(t,
+		"postgres://billet:"+testPassword+"@127.0.0.1:1/d?sslmode=disable&connect_timeout=5", reachable)
+
+	err := unreachable.CheckDump(t.Context())
+	if err == nil || errors.Is(err, ErrClientUnusable) {
+		t.Errorf("CheckDump against a database that does not answer = %v, want a database error "+
+			"that is not ErrClientUnusable", err)
+	}
+}

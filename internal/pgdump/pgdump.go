@@ -31,6 +31,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/junioryono/billet/internal/state"
 )
@@ -120,8 +121,8 @@ func (c *Client) Dump(ctx context.Context, fenceDir, dest string) (Dumped, error
 		// pg_dump 17 against 18). Asked here first so the refusal names the
 		// package that fixes it.
 		if server := snap.ServerVersion / 10000; major < server {
-			return fmt.Errorf("pgdump: %s is PostgreSQL %d and the ledger's server is %d, and "+
-				"pg_dump cannot copy a newer server. %s", path, major, server, installAdvice(server))
+			return clientRefusal(fmt.Sprintf("pgdump: %s is PostgreSQL %d and the ledger's server is %d, and "+
+				"pg_dump cannot copy a newer server. %s", path, major, server, installAdvice(server)))
 		}
 
 		// THE SCHEMA AS AN EXACT NAME, NOT A PATTERN. pg_dump reads --schema as
@@ -169,8 +170,8 @@ func (c *Client) CheckDump(ctx context.Context) error {
 	}
 
 	if server := led.ServerVersion / 10000; major < server {
-		return fmt.Errorf("pgdump: %s is PostgreSQL %d and the ledger's server is %d, and "+
-			"pg_dump cannot copy a newer server. %s", path, major, server, installAdvice(server))
+		return clientRefusal(fmt.Sprintf("pgdump: %s is PostgreSQL %d and the ledger's server is %d, and "+
+			"pg_dump cannot copy a newer server. %s", path, major, server, installAdvice(server)))
 	}
 
 	return nil
@@ -212,7 +213,8 @@ func (c *Client) CheckDump(ctx context.Context) error {
 // was started with. The writer barrier has proved no billet transaction is in
 // flight and the deployment is fenced, so a lock it waits on belongs to some
 // other session, which pg_stat_activity names; interrupting the command ends
-// the restore's transaction, which changes nothing.
+// the restore's transaction and leaves the schema as the drop left it, which
+// the caller's copy, or its proof the schema held nothing, covers.
 func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, schema string) error {
 	path, major, err := c.program(ctx, "pg_restore")
 	if err != nil {
@@ -220,9 +222,16 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, sche
 	}
 
 	if major < dumpVersion {
-		return fmt.Errorf("pgdump: %s is PostgreSQL %d and this archive's dump was written by "+
-			"pg_dump %d, which an older pg_restore may not read. %s", path, major, dumpVersion,
-			installAdvice(dumpVersion))
+		return clientRefusal(fmt.Sprintf("pgdump: %s is PostgreSQL %d and this archive's dump was "+
+			"written by pg_dump %d, which an older pg_restore may not read. %s", path, major, dumpVersion,
+			installAdvice(dumpVersion)))
+	}
+
+	// A NAME pg_restore'S LIST CANNOT CARRY UNAMBIGUOUSLY is refused before
+	// anything runs: the list separates its fields with spaces and quotes nothing.
+	if schema == "" || strings.ContainsFunc(schema, unicode.IsSpace) {
+		return fmt.Errorf("pgdump: billet restores a ledger only into a schema whose name has no "+
+			"whitespace in it, and this one is %q", schema)
 	}
 
 	toc, err := c.run(ctx, path, "--list", dump)
@@ -230,7 +239,11 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, sche
 		return err
 	}
 
-	keep := tablesOf(toc, schema)
+	keep, err := tablesOf(toc, schema)
+	if err != nil {
+		return err
+	}
+
 	if len(keep) == 0 {
 		return fmt.Errorf("pgdump: %s holds no table of schema %s, so it is not a ledger to "+
 			"restore there; billet changed nothing", dump, schema)
@@ -265,25 +278,61 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, sche
 	return err
 }
 
+// ErrClientUnusable is what every refusal about the client program itself
+// matches (errors.Is): absent, unrunnable, or too old for the server or the
+// dump. A caller tells it from a database error, which is not the client's.
+var ErrClientUnusable = errors.New("pgdump: the PostgreSQL client program cannot do this")
+
+// clientRefusal is a refusal about the client program, worded for the
+// operator and matching ErrClientUnusable.
+type clientRefusal string
+
+func (r clientRefusal) Error() string { return string(r) }
+
+// Is makes a clientRefusal match ErrClientUnusable.
+func (clientRefusal) Is(target error) bool { return target == ErrClientUnusable }
+
 // quoteName quotes a name for a pg_dump pattern, so it matches that name and
 // nothing else.
 func quoteName(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
 
-// tocTable matches a restore-list line for a table, e.g.
-// `220; 1259 16386 TABLE s1 t billet` (measured): the namespace, then the name.
-var tocTable = regexp.MustCompile(`^\d+; \d+ \d+ TABLE (\S+) (\S+) `)
+// tocEntry matches a restore-list entry, e.g. `220; 1259 16386 TABLE s1 t
+// billet` (measured): the ids, then the entry's type, namespace, name and
+// owner, separated by spaces and quoted not at all.
+var tocEntry = regexp.MustCompile(`^\d+; \d+ \d+ (.*)$`)
 
 // tablesOf lists the tables a dump's restore list holds in schema.
-func tablesOf(toc []byte, schema string) []string {
+//
+// A TABLE ENTRY THAT IS NOT EXACTLY THREE FIELDS IS REFUSED, never split on a
+// guess: `TABLE s foo bar billet` is a table `foo bar` or a table `foo` owned
+// by `bar billet`, and reading the wrong one keeps a table the restore should
+// have replaced. billet's own names have no spaces in them.
+func tablesOf(toc []byte, schema string) ([]string, error) {
 	var out []string
 
 	for line := range strings.SplitSeq(string(toc), "\n") {
-		if m := tocTable.FindStringSubmatch(line); len(m) == 3 && m[1] == schema {
-			out = append(out, m[2])
+		m := tocEntry.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+
+		rest, ok := strings.CutPrefix(m[1], "TABLE ")
+		if !ok || strings.HasPrefix(rest, "DATA ") {
+			continue
+		}
+
+		fields := strings.Split(rest, " ")
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("pgdump: the dump lists a table as %q, whose namespace, name "+
+				"and owner cannot be told apart, so billet cannot say which tables it holds", rest)
+		}
+
+		if fields[0] == schema {
+			out = append(out, fields[1])
 		}
 	}
 
-	return out
+	return out, nil
 }
 
 // tocSchemaEntry matches the restore-list lines for the schema itself: its
@@ -324,18 +373,18 @@ func (c *Client) databaseConninfo() (string, error) {
 func (c *Client) program(ctx context.Context, name string) (string, int, error) {
 	path, err := c.lookPath(name)
 	if err != nil {
-		return "", 0, fmt.Errorf("pgdump: %s is not installed, and billet copies a PostgreSQL ledger "+
-			"with the PostgreSQL client's own tools. %s", name, installAdvice(0))
+		return "", 0, clientRefusal(fmt.Sprintf("pgdump: %s is not installed, and billet copies a "+
+			"PostgreSQL ledger with the PostgreSQL client's own tools. %s", name, installAdvice(0)))
 	}
 
 	out, err := c.run(ctx, path, "--version")
 	if err != nil {
-		return "", 0, err
+		return "", 0, clientRefusal(fmt.Sprintf("%v. %s", err, installAdvice(0)))
 	}
 
 	major, err := parseMajor(string(out))
 	if err != nil {
-		return "", 0, fmt.Errorf("pgdump: %s: %w", path, err)
+		return "", 0, clientRefusal(fmt.Sprintf("pgdump: %s: %v", path, err))
 	}
 
 	return path, major, nil

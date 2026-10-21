@@ -96,7 +96,10 @@ func (f *fakeLedger) Dump(_ context.Context, dest string) (LedgerDump, error) {
 	// WHAT THE DATABASE HOLDS NOW is what restoring this copy puts back.
 	f.byDigest[digest(f.dumpBody)] = f.now
 
-	return LedgerDump{Facts: DumpFacts{Schema: f.now.Schema, DumpVersion: takenDumpVersion}}, nil
+	return LedgerDump{
+		Facts:      DumpFacts{Schema: f.now.Schema, DumpVersion: takenDumpVersion, Binding: f.now.Binding},
+		Migrations: slices.Clone(f.now.Migrations),
+	}, nil
 }
 
 func (f *fakeLedger) Restore(_ context.Context, dump string, dumpVersion int, schema string) error {
@@ -439,8 +442,13 @@ func TestADumpRestorePlansByWhatTheDatabaseHolds(t *testing.T) {
 	}{
 		{name: "an empty schema", now: emptySchema(), want: Install},
 		{name: "a preflight's untouched ledger",
-			now:  state.PostgresLedger{Schema: dumpSchema, Tables: []string{"admission"}, Migrations: f.migrations},
+			now: state.PostgresLedger{
+				Schema: dumpSchema, Tables: []string{"admission", "schema_migrations"}, Migrations: f.migrations,
+			},
 			want: ReplaceEmptyLedger},
+		{name: "empty tables with no billet migrations",
+			now:     state.PostgresLedger{Schema: dumpSchema, Tables: []string{"reports"}},
+			refusal: "no billet migrations"},
 		{name: "this deployment's own ledger", now: f.restoredAs(), want: KeepLiveLedger},
 		{name: "this deployment's own ledger, newer than the backup",
 			now: func() state.PostgresLedger {
@@ -466,7 +474,9 @@ func TestADumpRestorePlansByWhatTheDatabaseHolds(t *testing.T) {
 		{name: "a database that could not be read", now: emptySchema(),
 			peekErr: errors.New("connection refused"), refusal: "could not read the PostgreSQL ledger"},
 		{name: "a schema a newer billet prepared",
-			now:     state.PostgresLedger{Schema: dumpSchema, Tables: []string{"admission"}, Migrations: newer},
+			now: state.PostgresLedger{
+				Schema: dumpSchema, Tables: []string{"admission", "schema_migrations"}, Migrations: newer,
+			},
 			refusal: "newer than the one that took this backup"},
 		{name: "another schema",
 			now: state.PostgresLedger{Schema: "public"}, refusal: "resolves to schema public"},
@@ -691,10 +701,12 @@ func recoverTarget(t *testing.T, f dumpFixture, ledger PostgresLedger) Target {
 }
 
 // liveLedger is the database's ledger as the recovery finds it: this
-// deployment's, and newer than the archive.
+// deployment's, and newer than the archive, by rows and by a migration, so a
+// put-back of it reads back differently from the archive's ledger.
 func (f dumpFixture) liveLedger() state.PostgresLedger {
 	l := f.restoredAs()
 	l.NonEmpty = []string{"leases (3)"}
+	l.Migrations = append(slices.Clone(f.migrations), state.AppliedMigration{Version: 9998, Name: "later"})
 
 	return l
 }
@@ -973,7 +985,14 @@ func TestAnAbandonRefusesADatabaseTheCopyDidNotComeFrom(t *testing.T) {
 		},
 		"another deployment's ledger": {
 			edit:    func(l *state.PostgresLedger) { l.Binding = "ffffffffffffffffffffffffffffffff" },
-			refusal: "bound to ffffffffffffffffffffffffffffffff, not to this deployment",
+			refusal: `bound to "ffffffffffffffffffffffffffffffff", not to this deployment`,
+		},
+		// AN UNBOUND DATABASE IS NOT THIS DEPLOYMENT'S: the recovery replaced only a
+		// ledger bound to it, and every state since holds that binding, so a
+		// database of the same name on another server is refused.
+		"a ledger bound to nobody": {
+			edit:    func(l *state.PostgresLedger) { l.Binding = "" },
+			refusal: `bound to "", not to this deployment`,
 		},
 	}
 
@@ -1073,6 +1092,33 @@ func TestARecoverPlansByWhoseLedgerItIs(t *testing.T) {
 	if len(refusalsMentioning(p, "back over ITSELF")) == 0 {
 		t.Errorf("a recovery onto a host that is not this deployment was not refused: %+v", p.Refusals)
 	}
+
+	// A LEDGER NO CONTROLLER CLAIMED, OR AN ARCHIVE OF ONE, IS NOT RECOVERED: the
+	// binding is what every later pass holds the database to.
+	unclaimed := f.liveLedger()
+	unclaimed.Binding = ""
+
+	p, err = PlanRecover(t.Context(), f.archive, recoverTarget(t, f, f.ledgerFor(unclaimed)))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "bound to no deployment")) == 0 {
+		t.Errorf("a recovery onto an unbound ledger was not refused for it: %+v", p.Refusals)
+	}
+
+	u := newDumpFixture(t, unbound)
+	claimedSince := u.liveLedger()
+	claimedSince.Binding = u.d.id
+
+	p, err = PlanRecover(t.Context(), u.archive, recoverTarget(t, u, u.ledgerFor(claimedSince)))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "this backup's ledger is bound to")) == 0 {
+		t.Errorf("a recovery from an unbound archive was not refused for it: %+v", p.Refusals)
+	}
 }
 
 // A BARRIER THAT CANNOT BE HAD STOPS THE RESTORE BEFORE ANYTHING IS PUBLISHED,
@@ -1096,4 +1142,223 @@ func TestARestoreWhoseDatabaseBarrierFailsPublishesNothing(t *testing.T) {
 	}
 
 	assertOpen(t, tgt.StateDir)
+}
+
+// A RESUMED RECOVERY WHOSE PUBLISHED COPY IS GONE STOPS, and takes no second
+// copy: the archive's restore may have begun, so a copy now could hold a ledger
+// part-way replaced, recorded as the operator's.
+func TestAResumedRecoveryWhoseCopyIsGoneTakesNoSecondCopy(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	if err := os.Remove(supersededDumpPath(f.archive, tgt.StateDir)); err != nil {
+		t.Fatalf("remove the copy: %v", err)
+	}
+
+	before := len(ledger.callsSnapshot())
+
+	if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); err == nil ||
+		!strings.Contains(err.Error(), "is gone") {
+		t.Fatalf("the resume = %v, want a refusal", err)
+	}
+
+	resumed := ledger.callsSnapshot()[before:]
+	if slices.Contains(resumed, "dump") || slices.Contains(resumed, "restore") {
+		t.Errorf("the resume went on without its copy: %v", resumed)
+	}
+
+	assertFenced(t, tgt.StateDir)
+}
+
+// AN ABANDON THAT STOPPED AFTER IT PUT THE LEDGER BACK FINISHES: its copy is at
+// the kept name with this recovery's digest, and the ledger reads back as the
+// copy's. A kept copy that is not this recovery's is no such proof.
+func TestAnAbandonThatStoppedAfterItsPutBackFinishes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		keptBody []byte
+		wantErr  string
+	}{
+		{name: "the copy at the kept name"},
+		{name: "somebody else's file at the kept name", keptBody: []byte("PGDMP not this one"),
+			wantErr: "it is gone"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, ledger, tgt := interruptedRecovery(t)
+
+			copyPath := supersededDumpPath(f.archive, tgt.StateDir)
+			kept := copyPath + ".abandoned"
+
+			if tc.keptBody == nil {
+				if err := os.Link(copyPath, kept); err != nil {
+					t.Fatalf("keep the copy: %v", err)
+				}
+			} else if err := os.WriteFile(kept, tc.keptBody, 0o600); err != nil {
+				t.Fatalf("write the kept name: %v", err)
+			}
+
+			if err := os.Remove(copyPath); err != nil {
+				t.Fatalf("remove the copy: %v", err)
+			}
+
+			// THE PUT-BACK HAD COMMITTED: the database holds what the copy held.
+			ledger.now = ledger.byDigest[digest(ledger.dumpBody)]
+
+			_, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger)
+
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Abandon = %v, want a refusal saying %q", err, tc.wantErr)
+				}
+
+				assertFenced(t, tgt.StateDir)
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Abandon: %v", err)
+			}
+
+			if len(ledger.restored) != 0 {
+				t.Errorf("the finishing abandon restored %v again", ledger.restored)
+			}
+
+			assertOpen(t, tgt.StateDir)
+		})
+	}
+}
+
+// THE PUT-BACK IS READ BACK AGAINST THE COPY'S MIGRATIONS, which the archive's
+// ledger, bound to the same deployment, does not share: a restore that left
+// the archive's ledger in place is not a put-back.
+func TestAnAbandonReadsThePutBackAgainstTheCopysMigrations(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	ledger.byDigest[digest(ledger.dumpBody)] = f.restoredAs()
+
+	if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); err == nil ||
+		!strings.Contains(err.Error(), "does not record the migrations the copy did") {
+		t.Fatalf("Abandon = %v, want the read-back's refusal", err)
+	}
+
+	assertFenced(t, tgt.StateDir)
+}
+
+// A RESUME AFTER THE RESTORE COMMITTED, A FINISH AND THE SEAL'S PROOF ALL HOLD
+// THE CONNECTION TO THE DATABASE THE LEDGER WENT INTO: nothing after the
+// restore restores anything, so each would otherwise seal or open whatever the
+// connection reaches by then.
+func TestEveryStepAfterTheRestoreProvesItsDatabase(t *testing.T) {
+	f := newDumpFixture(t, bound)
+	ledger := f.ledgerFor(f.liveLedger())
+	tgt := recoverTarget(t, f, ledger)
+
+	// THE LAST ITEM IS THE LEDGER on the deployment's own host, so the run is
+	// stopped after publication and before its journal says so.
+	prev := onPublished
+	onPublished = func() error { return errStopHere }
+
+	t.Cleanup(func() { onPublished = prev })
+
+	if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); !errors.Is(err, errStopHere) {
+		t.Fatalf("Execute = %v, want the interruption", err)
+	}
+
+	onPublished = nil
+
+	if prog, err := InProgress(tgt.StateDir); err != nil || !prog.LedgerRestored {
+		t.Fatalf("the interrupted run did not record its restore (%+v, %v)", prog, err)
+	}
+
+	plan, err := PlanRecover(t.Context(), f.archive, tgt)
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if err := ProveRestoredLedger(t.Context(), plan); err != nil {
+		t.Fatalf("ProveRestoredLedger over the database restored into: %v", err)
+	}
+
+	ledger.now.Database = "elsewhere"
+
+	if err := ProveRestoredLedger(t.Context(), plan); err == nil ||
+		!strings.Contains(err.Error(), "the connection now reaches elsewhere") {
+		t.Errorf("ProveRestoredLedger over another database = %v, want a refusal", err)
+	}
+
+	replanned, err := PlanRecover(t.Context(), f.archive, tgt)
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(replanned, "not proved to be the one it went into")) == 0 {
+		t.Errorf("a resume onto another database was not refused: %+v", replanned.Refusals)
+	}
+
+	ledger.now.Database = dumpDatabase
+
+	if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); err != nil {
+		t.Fatalf("the resume: %v", err)
+	}
+
+	ledger.admission = state.Admission{Mode: state.AdmissionSealed, Provenance: state.ProvenanceOperator}
+	ledger.now.Database = "elsewhere"
+
+	if err := Finish(t.Context(), plan); err == nil || !strings.Contains(err.Error(), "now reaches elsewhere") {
+		t.Fatalf("Finish over another database = %v, want a refusal", err)
+	}
+
+	assertFenced(t, tgt.StateDir)
+
+	ledger.now.Database = dumpDatabase
+
+	if err := Finish(t.Context(), plan); err != nil {
+		t.Fatalf("Finish over the database restored into: %v", err)
+	}
+
+	assertOpen(t, tgt.StateDir)
+}
+
+// A JOURNAL THAT RECORDS WORK AND NOT THE DATABASE COULD NOT TELL where it went,
+// and neither a resume nor an abandon reads that as "anywhere".
+func TestAJournalWithoutItsDatabaseIsCouldNotTell(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	path := JournalPath(tgt.StateDir)
+
+	var raw map[string]any
+	if err := json.Unmarshal(read(t, path), &raw); err != nil {
+		t.Fatalf("decode the journal: %v", err)
+	}
+
+	if raw["ledger_database"] != dumpDatabase {
+		t.Fatalf("the journal records ledger_database %v, want %s", raw["ledger_database"], dumpDatabase)
+	}
+
+	delete(raw, "ledger_database")
+
+	body, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("encode the journal: %v", err)
+	}
+
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write the journal: %v", err)
+	}
+
+	if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); err == nil ||
+		!strings.Contains(err.Error(), "without saying which") {
+		t.Errorf("a resume over a journal with no database = %v, want a refusal", err)
+	}
+
+	if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); err == nil ||
+		!strings.Contains(err.Error(), "does not say which database") {
+		t.Errorf("an abandon over a journal with no database = %v, want a refusal", err)
+	}
+
+	if len(ledger.restored) != 0 {
+		t.Errorf("a journal that could not tell led to restores %v", ledger.restored)
+	}
+
+	assertFenced(t, tgt.StateDir)
 }

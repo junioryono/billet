@@ -451,10 +451,18 @@ rehearsal_stopped() {
 rehearsal_units_run_installed_binary() {
     local name=$1
     shift
+    # A CALL THAT NAMES NO UNIT WOULD PASS HAVING CHECKED NOTHING.
+    if [ "$#" -eq 0 ]; then
+        echo "rehearsal_units_run_installed_binary: name at least one unit that must be running" >&2
+        return 3
+    fi
     docker exec "${name}" sh -c '
         want=$(stat -L -c "%d:%i" /usr/bin/billet) || { echo "cannot stat /usr/bin/billet"; exit 2; }
-        units=$(systemctl list-units --type=service --state=active,activating,reloading,deactivating \
-            --no-legend --plain "billet*" | awk "{print \$1}") || { echo "cannot list the billet units"; exit 2; }
+        # The listing status is captured before awk reads it: sh has no
+        # pipefail, so a failed systemctl would otherwise read as no units.
+        listing=$(systemctl list-units --type=service --state=active,activating,reloading,deactivating \
+            --no-legend --plain "billet*") || { echo "cannot list the billet units"; exit 2; }
+        units=$(printf "%s\n" "$listing" | awk "{print \$1}")
         checked=" "
         for u in $units; do
             pid=$(systemctl show -p MainPID --value "$u") || { echo "$u: cannot read its MainPID"; exit 2; }

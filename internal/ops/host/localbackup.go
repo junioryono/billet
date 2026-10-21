@@ -14,6 +14,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/hostauthority"
+	"github.com/junioryono/billet/internal/pgdump"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -258,8 +259,8 @@ func (l ledgerCopy) missingLedger(dest string) error {
 	}
 
 	return fmt.Errorf("the archive at %s holds the deployment identity, the node-wire "+
-		"authority and the App key and NOT the PostgreSQL ledger, because this host cannot run "+
-		"pg_dump for it: %w", dest, l.clientErr)
+		"authority and the App key and NOT the PostgreSQL ledger, because this host cannot copy "+
+		"it with pg_dump: %w", dest, l.clientErr)
 }
 
 // ledgerSource decides how this deployment's ledger travels in the archive.
@@ -270,8 +271,9 @@ func (l ledgerCopy) missingLedger(dest string) error {
 //
 // THE CLIENT PROGRAM IS PROVED BEFORE ANYTHING IS WRITTEN, and a host that
 // cannot run it still captures the rest. pg_dump is the operator's, installed
-// with the PostgreSQL client; when it is absent or older than the server, the
-// archive is the identity-only one older billets wrote (the identity, the
+// with the PostgreSQL client; when it is absent, older than the server, or
+// cannot be handed this connection, the archive is the identity-only one older
+// billets wrote (the identity, the
 // authority and the App key GitHub issues once, with the ledger recorded as
 // external), and the command then fails naming what to install. Refusing
 // outright would leave a packaged timer capturing nothing at all on the day the
@@ -282,12 +284,21 @@ func ledgerSource(ctx context.Context, cfg *config.Config, db *state.DB) (ledger
 		return ledgerCopy{snapshot: db.SnapshotInto}, nil
 	}
 
-	client, err := postgresClient(cfg)
-	if err != nil {
-		return ledgerCopy{}, err
+	// THE CLIENT'S OWN REFUSALS FALL BACK; THE DATABASE'S DO NOT. A connection
+	// libpq cannot be handed, or a pg_dump absent or too old, is this host's
+	// to fix and the identity half is still worth capturing. A database that
+	// could not be read is a failure before anything is written: an identity-only
+	// archive sent off-site would become the newest one a replacement host
+	// restores from, over the last complete archive.
+	client, clientErr := postgresClient(cfg)
+	if clientErr == nil {
+		clientErr = client.CheckDump(ctx)
+		if clientErr != nil && !errors.Is(clientErr, pgdump.ErrClientUnusable) {
+			return ledgerCopy{}, clientErr
+		}
 	}
 
-	if clientErr := client.CheckDump(ctx); clientErr != nil {
+	if clientErr != nil {
 		applied, err := db.AppliedMigrations(ctx)
 		if err != nil {
 			return ledgerCopy{}, errors.Join(clientErr,
