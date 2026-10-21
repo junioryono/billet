@@ -472,6 +472,15 @@ jobs:
           # Pinned, not `latest`: a linter that changes under you turns an
           # unrelated PR red and trains people to ignore the signal.
           version: v2.12.2
+          # NO RESTORED ANALYSIS CACHE. On 2026-10-21 every lint run whose key
+          # matched one restored cache entry exactly reported staticcheck SA5011
+          # (a nil dereference after `if x == nil { t.Fatal(...) }`) in 16 to 60
+          # untouched places, as if testing.T.Fatal could return, while every run
+          # that restored the same entry by prefix found 0 issues; the same tree
+          # linted clean on a test host with an empty cache. A gate whose verdict
+          # depends on which cache entry it restored is no gate, so the analysis
+          # runs whole every time (about five minutes rather than two).
+          skip-cache: true
 
       # billet's own analyzers, plus the tests that prove they still detect
       # anything. The second half is not optional: tools/lint is a nested module,
