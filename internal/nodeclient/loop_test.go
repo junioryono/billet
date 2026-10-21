@@ -3,6 +3,7 @@ package nodeclient_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -568,6 +569,23 @@ type lostResults struct {
 	// onDrop, when set, runs as each result is dropped, before its connection
 	// closes.
 	onDrop func()
+
+	mu sync.Mutex
+	// arrived is when each result reached the wire, in order.
+	arrived []time.Time
+}
+
+// gaps is how long the wire waited between each result and the next.
+func (l *lostResults) gaps() []time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var gaps []time.Duration
+	for i := 1; i < len(l.arrived); i++ {
+		gaps = append(gaps, l.arrived[i].Sub(l.arrived[i-1]))
+	}
+
+	return gaps
 }
 
 func (l *lostResults) wrap(next http.Handler) http.Handler {
@@ -577,6 +595,10 @@ func (l *lostResults) wrap(next http.Handler) http.Handler {
 
 			return
 		}
+
+		l.mu.Lock()
+		l.arrived = append(l.arrived, time.Now())
+		l.mu.Unlock()
 
 		if l.seen.Add(1) > l.drop {
 			next.ServeHTTP(w, r)
@@ -649,6 +671,111 @@ func TestADestroyReportLostAsTheNodeStopsIsSentAgain(t *testing.T) {
 	}
 }
 
+// THREE SENDS, A SECOND AND THEN TWO APART. Two lost reports are sent a third
+// time and the destroy runs once; three lost reports are the node giving up, so
+// the plane hands the destroy to the next poll (#408) and it runs again. The
+// waits are lower bounds, which a loaded machine only lengthens.
+func TestADestroyReportIsSentThreeTimesAtMost(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		drop      int64
+		seen      int64
+		destroyed int
+	}{
+		{drop: 2, seen: 3, destroyed: 1},
+		{drop: 3, seen: 4, destroyed: 2},
+	} {
+		t.Run(fmt.Sprintf("%d lost", tc.drop), func(t *testing.T) {
+			t.Parallel()
+
+			lost := &lostResults{drop: tc.drop}
+			p, c := harnessBehind(t, 30*time.Second, lost.wrap)
+			compute := &fakeCompute{}
+
+			runLoop(t, c, compute)
+			waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+			if err := p.NewRunner().Destroy(t.Context(), 42); err != nil {
+				t.Fatalf("Destroy = %v", err)
+			}
+
+			if got := lost.seen.Load(); got != tc.seen {
+				t.Errorf("the plane's wire carried %d results, want %d", got, tc.seen)
+			}
+
+			if _, _, destroyed := compute.snapshot(); len(destroyed) != tc.destroyed {
+				t.Errorf("the compute was asked to destroy %v, want %d times", destroyed, tc.destroyed)
+			}
+
+			gaps := lost.gaps()
+			for i, want := range []time.Duration{nodeclient.ReportRetryWaitForTest, 2 * nodeclient.ReportRetryWaitForTest} {
+				if i < len(gaps) && gaps[i] < want {
+					t.Errorf("send %d followed send %d after %s, want at least %s: a busy plane is "+
+						"asked again at once", i+2, i+1, gaps[i], want)
+				}
+			}
+		})
+	}
+}
+
+// THE SECOND SIGNAL ENDS THE WAIT, and nothing is sent after it: the operator
+// who sent it has asked the node to stop now.
+func TestTheSecondSignalEndsADestroyReportsResends(t *testing.T) {
+	t.Parallel()
+
+	ctx, stop := context.WithCancel(t.Context())
+	hurry := make(chan struct{})
+
+	var once sync.Once
+
+	lost := &lostResults{drop: 99, onDrop: func() {
+		once.Do(func() {
+			stop()
+			close(hurry)
+		})
+	}}
+	p, c := harnessBehind(t, 15*time.Second, lost.wrap)
+	compute := &fakeCompute{}
+
+	ended := make(chan error, 1)
+
+	go func() {
+		ended <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
+			Provider:   config.ProviderDocker,
+			GuestOS:    []config.GuestOS{config.GuestLinux},
+			Deployment: deployment,
+			Log:        slog.New(slog.DiscardHandler),
+			Backoff:    20 * time.Millisecond,
+			Hurry:      hurry,
+		})
+	}()
+
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	destroyed := make(chan error, 1)
+
+	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 42) }()
+
+	select {
+	case <-ended:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the loop did not end after both signals")
+	}
+
+	if got := lost.seen.Load(); got != 1 {
+		t.Errorf("the plane's wire carried %d results after the second signal, want the one lost", got)
+	}
+
+	select {
+	case <-destroyed:
+	case <-time.After(30 * time.Second):
+		t.Error("the destroy never answered once the node had withdrawn")
+	}
+}
+
 // A DESTROY'S OUTCOME THAT DID NOT LAND IS SENT AGAIN. A stopping node's last
 // report is its destroy's, and no poll follows to be handed the command again,
 // so a report a busy plane did not answer left the lease launching for the
@@ -701,8 +828,10 @@ func TestALostLaunchReportIsNotSentAgain(t *testing.T) {
 		Providers: []config.ProviderKind{config.ProviderDocker}, Epoch: 1, RequestID: 7,
 	}
 
-	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); err == nil {
-		t.Fatal("a launch whose report was lost reported success")
+	// CUSTODY, which is what the plane answers for a delivered launch it stopped
+	// waiting on, and not some other refusal.
+	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); !errors.Is(err, dispatch.ErrCustody) {
+		t.Fatalf("a launch whose report was lost = %v, want custody", err)
 	}
 
 	// CUSTODY IS TAKEN AFTER THE LAST REPORT, so once it is, nothing more is sent.

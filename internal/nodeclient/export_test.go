@@ -42,3 +42,6 @@ func SetDrainServingDoneForTest(f func()) func() {
 
 	return func() { drainServingDone = saved }
 }
+
+// ReportRetryWaitForTest is the wait before a destroy's second report.
+const ReportRetryWaitForTest = reportRetryWait

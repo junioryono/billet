@@ -104,7 +104,9 @@ func TestAMigrationStoppedByItsDeadlineSaysSoOnSQLite(t *testing.T) {
 
 	t.Cleanup(func() { _ = blocked.Close() })
 
-	db := &DB{w: blocked, backend: newSQLiteBackend(t.TempDir())}
+	// A BUDGET OF ITS OWN, so the refusal is shown to name the one this handle
+	// was opened with rather than the package's default.
+	db := &DB{w: blocked, backend: newSQLiteBackend(t.TempDir()), startupBudget: 7 * time.Minute}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -124,7 +126,7 @@ func TestAMigrationStoppedByItsDeadlineSaysSoOnSQLite(t *testing.T) {
 		t.Fatalf("the deadline's identity must survive the wrapping; got: %v", err)
 	}
 
-	for _, want := range []string{"startup budget", "disk that did not answer"} {
+	for _, want := range []string{"the 7m0s startup budget", "disk that did not answer"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal should mention %q; got: %v", want, err)
 		}

@@ -100,6 +100,10 @@ func TestOnlyTheTestLedgerStretchesTheStartupBudget(t *testing.T) {
 		t.Errorf("WithStartupBudget is named at %v; its one use is %s's template build", uses, budgetCaller)
 	}
 
+	if writes := startupBudgetWrites(t, sources); len(writes) != 0 {
+		t.Errorf("the startup budget is set at %v, outside WithStartupBudget and openDir's handle", writes)
+	}
+
 	if !inOpen {
 		t.Errorf("%s does not pass WithStartupBudget to state.Open, so the template is migrated under "+
 			"the production budget", budgetCaller)
@@ -166,6 +170,100 @@ var stretch = state.WithStartupBudget
 	if len(uses) != 1 || !inOpen {
 		t.Errorf("the permitted caller alone scans as %v (passed to Open: %v), want its one use", uses, inOpen)
 	}
+}
+
+// AND EVERY WAY PAST THE OPTION: the field set by assignment or in a literal,
+// anywhere in the package but the option's own body and the handle openDir
+// builds from the mode.
+func TestTheStartupBudgetScanSeesTheFieldSetDirectly(t *testing.T) {
+	t.Parallel()
+
+	permitted := []byte(`package state
+
+func WithStartupBudget(d time.Duration) OpenOption {
+	return func(m *openMode) { m.startupBudget = d }
+}
+
+func openDir() { db := &DB{startupBudget: mode.budget()} }
+`)
+
+	if writes := startupBudgetWrites(t, map[string][]byte{budgetDeclaration: permitted}); len(writes) != 0 {
+		t.Errorf("the permitted writes scan as %v", writes)
+	}
+
+	for name, src := range map[string]string{
+		"an assignment":               "package state\n\nfunc promote(db *DB) { db.startupBudget = time.Hour }\n",
+		"a mode literal":              "package state\n\nfunc open() { _ = openMode{startupBudget: time.Hour} }\n",
+		"a handle literal in openDir": "package state\n\nfunc openDir() { _ = &DB{startupBudget: time.Hour} }\n",
+	} {
+		if writes := startupBudgetWrites(t, map[string][]byte{"internal/state/other.go": []byte(src)}); len(writes) == 0 {
+			t.Errorf("%s of the startup budget was not seen", name)
+		}
+	}
+}
+
+// startupBudgetWrites lists, as file:line:column, every assignment to a
+// startupBudget field and every literal that sets one, in the sources under
+// internal/state, except WithStartupBudget's own assignment and openDir's
+// `startupBudget: mode.budget()`.
+func startupBudgetWrites(t *testing.T, sources map[string][]byte) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+
+	var writes []string
+
+	for rel, body := range sources {
+		if filepath.ToSlash(filepath.Dir(rel)) != "internal/state" {
+			continue
+		}
+
+		file, err := parser.ParseFile(fset, rel, body, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", rel, err)
+		}
+
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				switch node := n.(type) {
+				case *ast.AssignStmt:
+					for _, lhs := range node.Lhs {
+						sel, ok := lhs.(*ast.SelectorExpr)
+						if ok && sel.Sel.Name == "startupBudget" && fd.Name.Name != "WithStartupBudget" {
+							writes = append(writes, fset.Position(lhs.Pos()).String())
+						}
+					}
+				case *ast.KeyValueExpr:
+					key, ok := node.Key.(*ast.Ident)
+					if !ok || key.Name != "startupBudget" {
+						return true
+					}
+
+					if fd.Name.Name == "openDir" && isMethodCall(node.Value, "mode", "budget") {
+						return true
+					}
+
+					writes = append(writes, fset.Position(node.Pos()).String())
+				}
+
+				return true
+			})
+		}
+	}
+
+	return writes
+}
+
+// isMethodCall reports whether expr is recv.name() with no arguments.
+func isMethodCall(expr ast.Expr, recv, name string) bool {
+	call, ok := expr.(*ast.CallExpr)
+
+	return ok && len(call.Args) == 0 && isSelector(call.Fun, recv, name)
 }
 
 // startupBudgetUses lists every place the sources name WithStartupBudget, as
