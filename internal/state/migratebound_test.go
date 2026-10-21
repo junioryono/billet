@@ -21,8 +21,9 @@ import (
 // so a standby promoting onto a table another session holds would sit inside
 // the database for as long as the process lived, saying nothing. The bound
 // cannot be exercised from a unit test without waiting the budget out, so the
-// step is asserted structurally: migrate derives startupTimeout, and does so
-// before the transaction begins.
+// step is asserted structurally: migrate derives the handle's budget (db.budget,
+// startupTimeout unless its open was given another), and does so before the
+// transaction begins.
 func TestAMigrationBoundsItselfWhenItsCallerDoesNot(t *testing.T) {
 	fset := token.NewFileSet()
 
@@ -63,7 +64,7 @@ func TestAMigrationBoundsItselfWhenItsCallerDoesNot(t *testing.T) {
 
 		switch {
 		case x.Name == "context" && sel.Sel.Name == "WithTimeout" && len(call.Args) == 2:
-			if id, ok := call.Args[1].(*ast.Ident); ok && id.Name == "startupTimeout" && !bound.IsValid() {
+			if budgetCall(call.Args[1]) && !bound.IsValid() {
 				bound = call.Pos()
 			}
 		case x.Name == "db" && sel.Sel.Name == "Tx" && !begin.IsValid():
@@ -74,7 +75,7 @@ func TestAMigrationBoundsItselfWhenItsCallerDoesNot(t *testing.T) {
 	})
 
 	if !bound.IsValid() {
-		t.Fatal("migrate never derives startupTimeout for a caller whose context has no " +
+		t.Fatal("migrate never derives db.budget() for a caller whose context has no " +
 			"deadline, so a promotion's migration can wait on a lock for as long as the " +
 			"process lives")
 	}
@@ -158,4 +159,21 @@ func (blockingConn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx,
 	<-ctx.Done()
 
 	return nil, ctx.Err()
+}
+
+// budgetCall reports whether expr is db.budget(), the handle's startup budget.
+func budgetCall(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 0 {
+		return false
+	}
+
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "budget" {
+		return false
+	}
+
+	x, ok := sel.X.(*ast.Ident)
+
+	return ok && x.Name == "db"
 }
