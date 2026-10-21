@@ -445,6 +445,170 @@ check_completer() {
 	esac
 }
 
+# check_image_notices passes or fails the gate on the image mounted at $1 carrying,
+# for each tool installed outside apt whose license asks for its text with every
+# copy, that text, and /opt/billet/IMAGE_NOTICES naming where it is (#584): the
+# GitHub Copilot CLI, the agentic workflow firewall bundle, Miniconda and Packer,
+# each wherever the template put it.
+#
+# EVERY PATH IS THE IMAGE'S, resolved inside it: a symlink in the image names a
+# path in the image, so a host glob or test would look on this machine instead.
+# A tool ships if anything is at its path, a link included, and a license counts
+# only as a non-empty regular file. A lookup that cannot tell fails the gate,
+# never reads as a tool that is not there.
+check_image_notices() {
+	local found text notices want=() missing=() status=0
+
+	image_text_file "$1" /opt/billet/IMAGE_NOTICES || status=$?
+	case "$status" in
+	0) notices=$(image_resolve "$1" /opt/billet/IMAGE_NOTICES) || status=$? ;;
+	1)
+		fail "the image has no /opt/billet/IMAGE_NOTICES, so it ships tools whose licenses ask for their text without saying where it is"
+		return
+		;;
+	esac
+	if [ "$status" -ne 0 ]; then
+		fail "could not inspect /opt/billet/IMAGE_NOTICES (status $status)"
+		return
+	fi
+	found=$(tool_licenses "$1" /opt/hostedtoolcache/copilot-cli bin/copilot LICENSE.md &&
+		tool_licenses "$1" /opt/hostedtoolcache/agentic-workflow-firewall-js awf-bundle.js LICENSE &&
+		tool_license "$1" /usr/share/miniconda /usr/share/miniconda/LICENSE.txt &&
+		tool_license "$1" /usr/local/bin/packer /usr/local/bin/LICENSE.txt) || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "could not tell which tools the image carries that ask for their license (status $status)"
+		return
+	fi
+	while IFS= read -r text; do
+		if [ -n "$text" ]; then
+			want+=("$text")
+		fi
+	done <<<"$found"
+
+	for text in ${want[@]+"${want[@]}"}; do
+		status=0
+		image_text_file "$1" "$text" || status=$?
+		case "$status" in
+		0) ;;
+		1)
+			missing+=("$text")
+			continue
+			;;
+		*)
+			fail "could not inspect $text in the image (status $status)"
+			return
+			;;
+		esac
+		status=0
+		grep -qxF "  Text: $text" "$1$notices" || status=$?
+		case "$status" in
+		0) ;;
+		1) missing+=("$text (not named in IMAGE_NOTICES)") ;;
+		*)
+			fail "could not read /opt/billet/IMAGE_NOTICES (status $status)"
+			return
+			;;
+		esac
+	done
+	if [ "${#missing[@]}" -gt 0 ]; then
+		fail "the image ships tools without the license text their licenses ask for: ${missing[*]}"
+		return
+	fi
+	pass "the image carries the license of each tool installed outside apt that asks for it (${#want[@]}), and IMAGE_NOTICES names each"
+}
+
+# tool_licenses prints, for each FAMILY/<version>/<arch> in the image at ROOT that
+# holds TOOL, the path of the LICENSE beside it, and fails 2 when a lookup cannot
+# tell. The template's <arch>.complete markers are files, and hold nothing.
+tool_licenses() {
+	local versions arches version arch status=0
+
+	versions=$(image_entries "$1" "$2") || status=$?
+	case "$status" in
+	0) ;;
+	1) return 0 ;;
+	*) return 2 ;;
+	esac
+	while IFS= read -r version; do
+		[ -n "$version" ] || continue
+		status=0
+		arches=$(image_entries "$1" "$2/$version") || status=$?
+		case "$status" in
+		0) ;;
+		1) continue ;;
+		*) return 2 ;;
+		esac
+		while IFS= read -r arch; do
+			[ -n "$arch" ] || continue
+			status=0
+			image_present "$1" "$2/$version/$arch/$3" || status=$?
+			case "$status" in
+			0) printf '%s\n' "$2/$version/$arch/$4" ;;
+			1) ;;
+			*) return 2 ;;
+			esac
+		done <<<"$arches"
+	done <<<"$versions"
+}
+
+# tool_license prints LICENSE when anything is at TOOL in the image at ROOT, and
+# fails 2 when the lookup cannot tell.
+tool_license() {
+	local status=0
+	image_present "$1" "$2" || status=$?
+	case "$status" in
+	0) printf '%s\n' "$3" ;;
+	1) ;;
+	*) return 2 ;;
+	esac
+}
+
+# image_entries prints the name of each entry of DIR, resolved inside the image
+# mounted at ROOT, one per line. It fails 1 when the image has no such directory,
+# and 2 when it cannot tell.
+#
+# LISTED BY ls, WHOSE STATUS SAYS WHETHER THE DIRECTORY WAS READ: a glob over a
+# directory that cannot be read expands to nothing, which would read as empty.
+image_entries() {
+	local resolved status=0
+	resolved=$(image_resolve "$1" "$2") || status=$?
+	case "$status" in
+	0) ;;
+	1) return 1 ;;
+	*) return 2 ;;
+	esac
+	[ -d "$1$resolved" ] || return 1
+	# GNU ls quotes names as QUOTING_STYLE says even into a pipe.
+	QUOTING_STYLE=literal ls -1A -- "$1$resolved" || return 2
+}
+
+# image_present succeeds when anything, a symlink included, is at PATH inside the
+# image mounted at ROOT, its directory resolved inside the image. It fails 1 when
+# nothing is, and 2 when it cannot tell.
+image_present() {
+	local parent status=0
+	parent=$(image_resolve "$1" "${2%/*}") || status=$?
+	case "$status" in
+	0) ;;
+	1) return 1 ;;
+	*) return 2 ;;
+	esac
+	[ -e "$1$parent/${2##*/}" ] || [ -L "$1$parent/${2##*/}" ]
+}
+
+# image_text_file succeeds when PATH, resolved inside the image mounted at ROOT, is
+# a non-empty regular file. It fails 1 when it is not, and 2 when it cannot tell.
+image_text_file() {
+	local resolved status=0
+	resolved=$(image_resolve "$1" "$2") || status=$?
+	case "$status" in
+	0) ;;
+	1) return 1 ;;
+	*) return 2 ;;
+	esac
+	[ -f "$1$resolved" ] && [ ! -L "$1$resolved" ] && [ -s "$1$resolved" ]
+}
+
 # check_manifest_components passes or fails the gate on the manifest declaring
 # exactly the components the image leaves out, each with the space it needs, under
 # the completion contract the image's completer speaks: a node completes only what
@@ -490,7 +654,8 @@ HOSTED_TOOLS=(
 # image_resolve prints path as the image at $1 resolves it, following every
 # symlink along the way inside the image. The AWS CLI's links are absolute, and
 # resolved against the machine running this gate they would find the host's
-# tools, or miss the image's.
+# tools, or miss the image's. It fails 1 when a directory on the way is not in
+# the image, and 2 when it cannot tell: a link it cannot read, or too many.
 image_resolve() {
 	local root="$1" rest="${2#/}" out="" part target hops=0
 
@@ -510,8 +675,11 @@ image_resolve() {
 
 		if [ -L "$root$out/$part" ]; then
 			hops=$((hops + 1))
-			[ "$hops" -le 40 ] || return 1
-			target=$(readlink "$root$out/$part")
+			[ "$hops" -le 40 ] || return 2
+			# A LINK THAT CANNOT BE READ RESOLVES NOWHERE: an empty target would
+			# drop this component and resolve a different path.
+			target=$(readlink "$root$out/$part") || return 2
+			[ -n "$target" ] || return 2
 			case "$target" in /*) out="" ;; esac
 			rest="${target#/}${rest:+/$rest}"
 		else
@@ -814,6 +982,8 @@ else
         (/opt/billet/THIRD_PARTY_NOTICES, /usr/local/lib/billet/container-hook/LICENSE,
         /usr/local/lib/billet/container-hook/THIRD_PARTY_NOTICES)"
 fi
+
+check_image_notices "$MNT"
 
 # THE CONTAINER HOOK PUTS THAT SHIM INSIDE A JOB CONTAINER. The reference hook is
 # vendored beside billet's wrapper, the runner is pointed at the wrapper, and the
