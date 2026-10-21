@@ -149,6 +149,7 @@ type ReadOps interface {
 	ListRetirableJobDetail(ctx context.Context, arg ledgerdb.ListRetirableJobDetailParams) ([]string, error)
 	ListJobsAwaitingQueueTime(ctx context.Context,
 		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
+	ListJobsOfRun(ctx context.Context, arg ledgerdb.ListJobsOfRunParams) ([]string, error)
 	ReadJobUsage(ctx context.Context, leaseID string) (ledgerdb.JobUsage, error)
 	ReadJobSeries(ctx context.Context, leaseID string) (ledgerdb.ReadJobSeriesRow, error)
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)
@@ -159,6 +160,7 @@ type ReadOps interface {
 	ReadLeaseCharge(ctx context.Context, id string) (ledgerdb.ReadLeaseChargeRow, error)
 	ReadLeaseClosure(ctx context.Context, id string) (ledgerdb.ReadLeaseClosureRow, error)
 	ReadLeaseEpoch(ctx context.Context, id string) (int64, error)
+	ReadLeaseGitHubTarget(ctx context.Context, id string) (string, error)
 	ReadLeaseJob(ctx context.Context, id string) (ledgerdb.ReadLeaseJobRow, error)
 	ReadLeaseSettlement(ctx context.Context, id string) (ledgerdb.ReadLeaseSettlementRow, error)
 	ReadLeaseTargetSize(ctx context.Context, id string) (ledgerdb.ReadLeaseTargetSizeRow, error)
@@ -247,6 +249,7 @@ type WriteOps interface {
 	MarkNodeNotLive(ctx context.Context, arg ledgerdb.MarkNodeNotLiveParams) error
 	MarkPoolRunnerBusy(ctx context.Context, arg ledgerdb.MarkPoolRunnerBusyParams) error
 	MarkPoolRunnerRetired(ctx context.Context, arg ledgerdb.MarkPoolRunnerRetiredParams) error
+	FillPoolRunnerGitHubTarget(ctx context.Context, arg ledgerdb.FillPoolRunnerGitHubTargetParams) error
 	MarkPoolRunnerRetiring(ctx context.Context, arg ledgerdb.MarkPoolRunnerRetiringParams) error
 	ReclaimLease(ctx context.Context, arg ledgerdb.ReclaimLeaseParams) error
 	RecordCredentialSweep(ctx context.Context, arg ledgerdb.RecordCredentialSweepParams) error
@@ -259,6 +262,9 @@ type WriteOps interface {
 	RecordJobAssignment(ctx context.Context, arg ledgerdb.RecordJobAssignmentParams) error
 	RecordJobResult(ctx context.Context, arg ledgerdb.RecordJobResultParams) error
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
+	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
+	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
+	RecordJobRunnerID(ctx context.Context, arg ledgerdb.RecordJobRunnerIDParams) error
 	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) (int64, error)
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error
 	RecordJobDestinations(ctx context.Context, arg ledgerdb.RecordJobDestinationsParams) error
@@ -274,6 +280,7 @@ type WriteOps interface {
 	BackfillLeaseFailureReason(ctx context.Context, arg ledgerdb.BackfillLeaseFailureReasonParams) error
 	RecordLeaseCacheObservation(ctx context.Context, arg ledgerdb.RecordLeaseCacheObservationParams) error
 	RecordLeaseDisruption(ctx context.Context, arg ledgerdb.RecordLeaseDisruptionParams) error
+	RecordLeaseGitHubTarget(ctx context.Context, arg ledgerdb.RecordLeaseGitHubTargetParams) error
 	RecordMigration(ctx context.Context, arg ledgerdb.RecordMigrationParams) error
 	RecordNodeRevocation(ctx context.Context, arg ledgerdb.RecordNodeRevocationParams) error
 	ReplaceDeniedEnrollment(ctx context.Context, arg ledgerdb.ReplaceDeniedEnrollmentParams) error

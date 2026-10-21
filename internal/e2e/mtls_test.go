@@ -81,6 +81,10 @@ func (mtlsStore) RetireRecoveredPoolRunner(context.Context, alloc.PoolRunner) (a
 
 func (mtlsStore) RetirePoolRunner(context.Context, string) error { return nil }
 
+func (mtlsStore) RecordLeaseGitHubTarget(context.Context, string, int64, string) error { return nil }
+
+func (mtlsStore) LeaseGitHubTarget(context.Context, string) (string, error) { return "", nil }
+
 func (m mtlsStore) MarkDeregistered(context.Context, string) error { return nil }
 
 func (mtlsStore) RecordLeaseUsage(context.Context, string, int64, alloc.JobUsage, *alloc.UsageSeries) error {

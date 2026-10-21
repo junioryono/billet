@@ -14,13 +14,14 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/usage"
 )
 
 // cmdJobs is the operator's view of what jobs did.
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet jobs show <lease> | billet jobs wait")
+		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait")
 	}
 	switch args[0] {
 	case "show":
@@ -32,27 +33,41 @@ func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	return fmt.Errorf("unknown jobs command %q; try show or wait", args[0])
 }
 
-// cmdJobsShow prints one job's history and what the host measured it do.
+// cmdJobsShow prints one job's history and what the host measured it do, or
+// every job of one of GitHub's workflow runs.
 func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet jobs show", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
-	asJSON := fs.Bool("json", false, "print the record as one JSON object")
+	asJSON := fs.Bool("json", false, "print the record as one JSON object (with --run, an array of them)")
 	asHTML := fs.Bool("html", false, "print the job as one self-contained HTML page")
+	run := fs.Int64("run", 0, "show every job of the GitHub workflow run with this id (the number in the "+
+		"run's URL) rather than one lease")
 	windowFlag := fs.String("window", "", "with --json, add the usage the host's series shows between FROM and "+
 		"TO, given as FROM,TO in RFC 3339")
 	if err := cli.ParseWithArgs(fs, args, 1); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("usage: billet jobs show [--config PATH] [--json [--window FROM,TO] | --html] <lease>")
-	}
-	if *asJSON && *asHTML {
+	// GIVEN AT ALL, EVEN EMPTY OR ZERO, a flag is a request: an empty --window=
+	// or a --run=0 is refused rather than read as none.
+	windowGiven, runGiven := false, false
+	fs.Visit(func(f *flag.Flag) {
+		windowGiven = windowGiven || f.Name == "window"
+		runGiven = runGiven || f.Name == "run"
+	})
+	switch {
+	case runGiven && fs.NArg() != 0:
+		return errors.New("billet jobs show: --run names the jobs to show; give it or a lease, not both")
+	case !runGiven && fs.NArg() != 1:
+		return errors.New("usage: billet jobs show [--config PATH] [--json [--window FROM,TO] | --html] " +
+			"<lease> | --run <run id>")
+	case runGiven && *run <= 0:
+		return fmt.Errorf("billet jobs show: --run takes the positive id of a GitHub workflow run, not %d", *run)
+	case runGiven && *asHTML:
+		return errors.New("billet jobs show: --html prints one lease's page; show a run's jobs as text or " +
+			"with --json, and a lease of it with --html")
+	case *asJSON && *asHTML:
 		return errors.New("billet jobs show: --json and --html each print the whole record; choose one")
 	}
-	// GIVEN AT ALL, EVEN EMPTY, it is a request: an empty --window= is refused
-	// rather than read as no window.
-	windowGiven := false
-	fs.Visit(func(f *flag.Flag) { windowGiven = windowGiven || f.Name == "window" })
 	var w *window
 	if windowGiven {
 		if !*asJSON {
@@ -64,7 +79,6 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 		}
 		w = &parsed
 	}
-	leaseID := fs.Arg(0)
 
 	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
@@ -72,14 +86,91 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	}
 	defer closeDB()
 
-	// A RETIREMENT THAT COMMITS WHILE THE REPORT IS READ takes the detail and
-	// writes its marker in one transaction, and the reads below are separate,
-	// so the report is built first and the marker read again after: if it was
-	// written meanwhile, the report is built once more, now with the marker,
-	// which is never unset. A report is therefore never missing detail it does
-	// not say was retired.
+	// A RUN'S JOBS ARE SHOWN WITHOUT THEIR STEPS: reading them asks GitHub for
+	// each job in turn, with the App's installation the control plane also
+	// polls through, and a wide matrix would spend a share of its budget.
+	show := func(leaseID string) ([]byte, error) {
+		return showJobOnce(ctx, a, *cfgPath, leaseID, *asJSON, *asHTML, w, !runGiven)
+	}
+	if !runGiven {
+		out, err := show(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		if _, err := env.Stdout.Write(out); err != nil {
+			return fmt.Errorf("write the job record: %w", err)
+		}
+
+		return nil
+	}
+
+	return showRun(ctx, env, a, *run, *asJSON, show)
+}
+
+// showRun prints every job of one workflow run, oldest assignment first: as
+// text, each record under a line naming it, or as one JSON array.
+func showRun(ctx context.Context, env cli.Env, a *alloc.Allocator, run int64, asJSON bool,
+	show func(leaseID string) ([]byte, error),
+) error {
+	leases, more, err := a.JobsOfRun(ctx, run)
+	if err != nil {
+		return err
+	}
+	if len(leases) == 0 {
+		return fmt.Errorf("billet jobs show: no job of run %d is recorded in this deployment's ledger: its "+
+			"jobs ran on other runners or another deployment, or it is not a workflow run's id", run)
+	}
+	if more {
+		fmt.Fprintf(env.Stderr, "billet jobs show: run %d has more than %d jobs recorded; the newest are "+
+			"left out\n", run, alloc.JobsOfRunLimit)
+	}
+
+	var out bytes.Buffer
+	records := make([]json.RawMessage, 0, len(leases))
+	for i, leaseID := range leases {
+		record, err := show(leaseID)
+		if err != nil {
+			return err
+		}
+		if asJSON {
+			records = append(records, json.RawMessage(record))
+
+			continue
+		}
+		if i > 0 {
+			out.WriteString("\n")
+		}
+		fmt.Fprintf(&out, "== run %d, job %d of %d: lease %s ==\n\n", run, i+1, len(leases), leaseID)
+		out.Write(record)
+	}
+	if asJSON {
+		body, err := json.MarshalIndent(records, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encode the run's job records: %w", err)
+		}
+		out.Write(body)
+		out.WriteString("\n")
+	}
+	if _, err := env.Stdout.Write(out.Bytes()); err != nil {
+		return fmt.Errorf("write the run's job records: %w", err)
+	}
+
+	return nil
+}
+
+// showJobOnce builds one job's report in the form asked for.
+//
+// A RETIREMENT THAT COMMITS WHILE THE REPORT IS READ takes the detail and
+// writes its marker in one transaction, and the reads below are separate, so
+// the report is built first and the marker read again after: if it was written
+// meanwhile, the report is built once more, now with the marker, which is never
+// unset. A report is therefore never missing detail it does not say was
+// retired.
+func showJobOnce(ctx context.Context, a *alloc.Allocator, cfgPath, leaseID string, asJSON, asHTML bool,
+	w *window, readSteps bool,
+) ([]byte, error) {
 	show := func(out io.Writer) (string, error) {
-		return showJob(ctx, out, a, *cfgPath, leaseID, *asJSON, *asHTML, w)
+		return showJob(ctx, out, a, cfgPath, leaseID, asJSON, asHTML, w, readSteps)
 	}
 	// A BUILD THAT FAILED is rebuilt too when the job is now retired: on
 	// PostgreSQL a usage summary and its destinations are two reads at read
@@ -94,22 +185,19 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 		again, readErr := a.Job(ctx, leaseID)
 		switch {
 		case readErr != nil && err != nil:
-			return err
+			return nil, err
 		case readErr != nil:
-			return readErr
+			return nil, readErr
 		case again.DetailRetiredAt != "":
 			out.Reset()
 			_, err = show(&out)
 		}
 	}
 	if err != nil {
-		return err
-	}
-	if _, err := env.Stdout.Write(out.Bytes()); err != nil {
-		return fmt.Errorf("write the job record: %w", err)
+		return nil, err
 	}
 
-	return nil
+	return out.Bytes(), nil
 }
 
 // afterJobShown runs between a report's first build and the read of its
@@ -118,9 +206,10 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 var afterJobShown func(a *alloc.Allocator)
 
 // showJob writes one job's report to out in the form asked for, and says the
-// retirement marker it was built with.
+// retirement marker it was built with. readSteps is whether the text report
+// and the page read the job's steps from GitHub.
 func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, leaseID string,
-	asJSON, asHTML bool, w *window,
+	asJSON, asHTML bool, w *window, readSteps bool,
 ) (string, error) {
 	rec, err := a.Job(ctx, leaseID)
 	if err != nil {
@@ -146,7 +235,12 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, le
 
 		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest, wj)
 	}
-	steps := readJobSteps(ctx, cfgPath, a, rec, measured)
+	steps := jobSteps{measured: measured, runner: provider.InstanceName(rec.LeaseID),
+		none: "not read for a run's jobs, which would ask GitHub once for each; `billet jobs show " +
+			rec.LeaseID + "` reads them"}
+	if readSteps {
+		steps = readJobSteps(ctx, cfgPath, a, rec, measured)
+	}
 	if asHTML {
 		return rec.DetailRetiredAt, renderJobPage(out, buildJobPage(ctx, a, rec, measured, steps, guest))
 	}
@@ -174,6 +268,10 @@ type jobJSON struct {
 	MemoryBytes int64  `json:"memory_bytes"`
 	GitHubJobID string `json:"github_job_id"`
 	RunID       int64  `json:"run_id"`
+	// GitHubRunID is the run of the job that started, which for a pooled runner
+	// may differ from RunID, the run the lease was assigned; zero is not
+	// recorded.
+	GitHubRunID int64 `json:"github_run_id"`
 	// RequestID is GitHub's runner request id, zero for a pooled lease, whose
 	// negative id is billet's own scheduler identity and nothing GitHub shows.
 	RequestID   int64  `json:"request_id"`
@@ -193,6 +291,29 @@ type jobJSON struct {
 	GitHubScaleSetAssignedAt string `json:"github_scale_set_assigned_at"`
 	GitHubRunnerAssignedAt   string `json:"github_runner_assigned_at"`
 	BoughtAt                 string `json:"bought_at"`
+	// LaunchedAt, RegisteredAt, CustodyAt, TeardownAt and QuarantinedAt are
+	// when the lease first entered each part of its life, on billet's clock; an
+	// empty one was never entered or not recorded.
+	LaunchedAt    string `json:"launched_at"`
+	RegisteredAt  string `json:"registered_at"`
+	CustodyAt     string `json:"custody_at"`
+	TeardownAt    string `json:"teardown_at"`
+	QuarantinedAt string `json:"quarantined_at"`
+	// RunnerID is GitHub's id for the runner registered, zero when none was
+	// recorded; LaunchIncarnation is the node process that launched the job and
+	// HolderIncarnation the one the ledger last recorded holding its compute,
+	// which for a quarantined lease is the holder before the quarantine.
+	RunnerID          int64  `json:"runner_id"`
+	LaunchIncarnation string `json:"launch_incarnation"`
+	HolderIncarnation string `json:"holder_incarnation"`
+	// FailureReason is why billet failed the lease, and Disruption what its own
+	// infrastructure did to the job, with when; empty when none was recorded.
+	FailureReason string `json:"failure_reason"`
+	Disruption    string `json:"disruption"`
+	DisruptedAt   string `json:"disrupted_at"`
+	// Cache is what each cache did for the job, as the node observed it; an
+	// empty token was not observed.
+	Cache cacheJSON `json:"cache"`
 	// DetailRetiredAt is when the job's series, destinations and guest report
 	// were deleted past the deployment's retention, empty while they are kept.
 	DetailRetiredAt string     `json:"detail_retired_at"`
@@ -201,6 +322,17 @@ type jobJSON struct {
 	Guest *guestJSON `json:"guest"`
 	// Window is present only when --window asked for one.
 	Window *windowJSON `json:"window,omitempty"`
+}
+
+// cacheJSON is each cache's token for one job, verbatim.
+type cacheJSON struct {
+	Image           string `json:"image"`
+	ImageGeneration string `json:"image_generation"`
+	Actions         string `json:"actions"`
+	Sticky          string `json:"sticky"`
+	Git             string `json:"git"`
+	Bazel           string `json:"bazel"`
+	Go              string `json:"go"`
 }
 
 // usageJSON is what the host measured. Groups answers for every group, with
@@ -238,6 +370,16 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
 		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
 		DetailRetiredAt: rec.DetailRetiredAt,
+		GitHubRunID:     rec.GitHubRunID, LaunchedAt: rec.LaunchedAt, RegisteredAt: rec.RegisteredAt,
+		CustodyAt: rec.CustodyAt, TeardownAt: rec.TeardownAt, QuarantinedAt: rec.QuarantinedAt,
+		RunnerID: rec.RunnerID, LaunchIncarnation: rec.LaunchIncarnation,
+		HolderIncarnation: rec.HolderIncarnation, FailureReason: rec.FailureReason,
+		Disruption: rec.Disruption, DisruptedAt: rec.DisruptedAt,
+		Cache: cacheJSON{
+			Image: string(rec.Caches.ImageCache), ImageGeneration: rec.Caches.CacheGeneration,
+			Actions: string(rec.Caches.ActionsCache), Sticky: string(rec.Caches.Sticky),
+			Git: string(rec.Caches.Git), Bazel: string(rec.Caches.Bazel), Go: string(rec.Caches.Go),
+		},
 	}
 	if u != nil {
 		groups := make(map[string]bool, len(usageGroups))
@@ -288,7 +430,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		request = fmt.Sprintf(", request %d", rec.RequestID)
 	}
 	line("job", "%s (github job %s, run %s%s)", quoted(rec.Job.Name),
-		quoted(rec.Job.JobID), identifier(rec.RunID), request)
+		quoted(rec.Job.JobID), runOf(rec), request)
 	line("repository", "%s", quoted(rec.Repo))
 	line("workflow", "%s", quoted(rec.Job.WorkflowRef))
 	line("event", "%s", quoted(rec.Job.Event))
@@ -300,6 +442,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	if rec.DetailRetiredAt != "" {
 		line("detail", "%s", detailRetired(rec))
 	}
+	renderLifecycle(line, rec)
 
 	fmt.Fprintln(w)
 	if u == nil {

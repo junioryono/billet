@@ -1943,14 +1943,17 @@ func (p *Plane) AuthorizeLease(node, incarnation, leaseID string) (bool, error) 
 //
 // The lease id carries the entitlement because it is already in the runner name
 // billet chooses (see provider.InstanceName), so a node can only ask for the
-// registration belonging to the launch it was actually told to perform.
-func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, error) {
+// registration belonging to the launch it was actually told to perform. The
+// launch's tier and epoch come back: the epoch is the fence a write on the
+// launch's behalf presents, so a lease reclaimed since the command was given
+// refuses it.
+func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	n, ok := p.nodes[node]
 	if !ok {
-		return "", fmt.Errorf("%w: %s", ErrUnregistered, node)
+		return "", 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
 
 	for _, pend := range n.inflight {
@@ -1979,11 +1982,11 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 			// runner it starts joins a tier with different labels, different jobs and
 			// possibly different secrets. The caller resolves this tier's own set and
 			// refuses anything else.
-			return pend.cmd.Lease.Tier, nil
+			return pend.cmd.Lease.Tier, pend.cmd.Lease.Epoch, nil
 		}
 	}
 
-	return "", fmt.Errorf(
+	return "", 0, fmt.Errorf(
 		"%w: node %q was not given a launch for lease %s, so it may not mint a runner "+
 			"registration for it", ErrNotEntitled, node, leaseID)
 }
