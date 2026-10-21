@@ -56,24 +56,33 @@ func (c *Client) publishRootAt(ctx context.Context, name, golden string, now tim
 	disk := c.cfg.CachePool + "/" + golden
 
 	// THE GENERATION FIRST, on the clone: a rename that succeeds then carries it, and
-	// one that fails leaves a snapshot this removes, so the builder's teardown finds
-	// the clone as it left it.
+	// one that fails is undone, so the builder's teardown finds the clone as it left it.
+	//
+	// A FAILURE IS NOT PROOF NOTHING HAPPENED: a command cut short by its context can
+	// have taken effect in the cluster. So each failure undoes what it may have done,
+	// on a context of its own, since the usual reason it failed is that the caller's
+	// ended: a snapshot that may exist is removed, and a rename that may have happened
+	// is renamed back from whichever name holds the clone (WithdrawRoot).
 	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create",
 		clone+"@"+generation)...); err != nil {
-		return "", fmt.Errorf("ceph: snapshot the root disk %s as %s as client.%s: %w",
+		err = fmt.Errorf("ceph: snapshot the root disk %s as %s as client.%s: %w",
 			clone, generation, c.cfg.User, err)
+		if rmErr := c.removeSnapshot(context.WithoutCancel(ctx), clone+"@"+generation); rmErr != nil {
+			return "", fmt.Errorf("%w (and the snapshot it may have made could not be removed, so the "+
+				"builder's discard may leave the clone in the trash: %w)", err, rmErr)
+		}
+
+		return "", err
 	}
 
 	if _, err := c.rbdCmd(ctx, false, keepKernelClient("rename", clone, disk)...); err != nil {
-		// ON A CONTEXT OF ITS OWN: the usual reason the rename failed is that the
-		// caller's context ended, and a removal asked on it fails too.
-		if rmErr := c.removeSnapshot(context.WithoutCancel(ctx), clone+"@"+generation); rmErr != nil {
-			return "", fmt.Errorf("ceph: rename %s to %s as client.%s: %w (and its snapshot %s could "+
-				"not be removed, so the builder's discard will leave the clone in the trash: %w)",
-				clone, disk, c.cfg.User, err, generation, rmErr)
+		err = fmt.Errorf("ceph: rename %s to %s as client.%s: %w", clone, disk, c.cfg.User, err)
+		if undoErr := c.WithdrawRoot(context.WithoutCancel(ctx), golden+"@"+generation, name); undoErr != nil {
+			return "", fmt.Errorf("%w (and it could not be undone, so %s may hold the builder's disk with "+
+				"nothing naming it: %w)", err, disk, undoErr)
 		}
 
-		return "", fmt.Errorf("ceph: rename %s to %s as client.%s: %w", clone, disk, c.cfg.User, err)
+		return "", err
 	}
 
 	return golden + "@" + generation, nil

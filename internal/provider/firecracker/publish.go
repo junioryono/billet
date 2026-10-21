@@ -186,6 +186,12 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 	record.Image, record.Disk = shape.Image, disk
 
 	if err := p.publishCapture(ctx, j, res, shape, store, snapshot, record); err != nil {
+		// A SNAPSHOT ALREADY VISIBLE KEEPS ITS DISK: a restore of it clones that disk,
+		// so only a publication that never reached its name is withdrawn.
+		if errors.Is(err, errPublishedNotDurable) {
+			return err
+		}
+
 		// ON A CONTEXT OF ITS OWN: the usual reason the publication failed is that
 		// the caller's context ended.
 		if withdrawErr := goldens.WithdrawRoot(context.WithoutCancel(ctx), disk, id); withdrawErr != nil {
@@ -198,6 +204,10 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 
 	return nil
 }
+
+// errPublishedNotDurable is a snapshot renamed into place whose directories could not
+// be synced after: it is visible and may be restored, and may not survive a crash.
+var errPublishedNotDurable = errors.New("the snapshot is published and not yet durable")
 
 // heldStore is the snapshot store, open and locked for one publish.
 type heldStore struct {
@@ -346,11 +356,11 @@ func (p *Provider) publishCapture(
 	// THE NAME AND THE STORE BOTH DURABLE before success is reported: the store may
 	// have been created by this call, and its own entry is in the directory above.
 	if err := p.syncDir(store); err != nil {
-		return fmt.Errorf("firecracker: sync the published snapshot %s: %w", name, err)
+		return fmt.Errorf("firecracker: %w: sync the published snapshot %s: %w", errPublishedNotDurable, name, err)
 	}
 
 	if err := p.syncDir(filepath.Dir(store)); err != nil {
-		return fmt.Errorf("firecracker: sync the snapshot store %s: %w", store, err)
+		return fmt.Errorf("firecracker: %w: sync the snapshot store %s: %w", errPublishedNotDurable, store, err)
 	}
 
 	// THE JAIL'S COPIES GO, because each is the guest's whole memory again. Not a

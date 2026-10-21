@@ -588,7 +588,12 @@ func (d rbdDisk) PublishRoot(ctx context.Context, name, golden string) (string, 
 
 	if out, err := exec.CommandContext(ctx, "rbd", d.args("rename",
 		d.cache+"/"+name, d.cache+"/"+golden)...).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("rename %s to %s: %w: %s", name, golden, err, strings.TrimSpace(string(out)))
+		// UNDONE AS THE STORE UNDOES IT, so the builder's discard can still remove
+		// its clone: a clone that keeps a snapshot is one rbd rm refuses.
+		renameErr := fmt.Errorf("rename %s to %s: %w: %s", name, golden, err, strings.TrimSpace(string(out)))
+
+		return "", errors.Join(renameErr,
+			d.WithdrawRoot(context.WithoutCancel(ctx), golden+"@"+generation, name))
 	}
 
 	return golden + "@" + generation, nil

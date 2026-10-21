@@ -51,24 +51,79 @@ func TestARootDiskIsPublishedAsAGoldenInPlace(t *testing.T) {
 	}
 }
 
-// A RENAME THAT FAILS LEAVES THE CLONE AS IT WAS: the generation it took is removed,
-// so the builder's discard moves a clone with no snapshot to the trash, which the
-// purge can delete.
-func TestAPublicationWhoseRenameFailsRemovesItsGeneration(t *testing.T) {
+// A RENAME THAT FAILS LEAVES THE CLONE AS IT WAS, whether or not the cluster renamed
+// it: a rename cut short can have taken effect, so it is renamed back from the
+// golden's name (an absence there meaning it never moved) and the generation it took
+// is removed, so the builder's discard moves a clone with no snapshot to the trash,
+// which the purge can delete.
+func TestAPublicationWhoseRenameFailsIsUndoneWhicheverWayItWent(t *testing.T) {
+	t.Parallel()
+
+	notThere := errors.New("rbd: error opening image golden-app: (2) No such file or directory")
+
+	for _, tc := range []struct {
+		name string
+		// back is what the rename back answers: absent if the rename never
+		// happened, success if it did.
+		back error
+	}{
+		{"the rename never happened", notThere},
+		{"the rename happened and still failed", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCloneFake()
+			f.failOn = "rename"
+			f.failSeq = []error{errors.New("rbd: context deadline exceeded"), tc.back}
+
+			_, err := cloneClient(t, f).publishRootAt(t.Context(), "billet-abc", "golden-app",
+				time.Date(2026, 10, 21, 3, 4, 5, 0, time.UTC))
+			if err == nil || !strings.Contains(err.Error(), "rename billet-cache/billet-abc") {
+				t.Fatalf("PublishRoot = %v, want the rename's failure", err)
+			}
+
+			if strings.Contains(err.Error(), "could not be undone") {
+				t.Errorf("an undone rename was reported as not undone: %v", err)
+			}
+
+			var renames [][]string
+			for _, call := range f.calls {
+				if subcommandOf(call) == "rename" {
+					renames = append(renames, call[len(call)-2:])
+				}
+			}
+
+			if len(renames) != 2 || !slices.Equal(renames[1], []string{"billet-cache/golden-app", "billet-cache/billet-abc"}) {
+				t.Errorf("the renames were %v, want the publication's and then one back", renames)
+			}
+
+			removal := f.ran(t, "snap", "rm")
+			if got := removal[len(removal)-1]; got != "billet-cache/billet-abc@g20261021030405" {
+				t.Errorf("the failed publication removed %q, not the generation it took", got)
+			}
+		})
+	}
+}
+
+// A SNAPSHOT THAT FAILED MAY STILL HAVE BEEN MADE, so it is removed, and the
+// publication goes no further.
+func TestAPublicationWhoseSnapshotFailsRemovesWhatItMayHaveMade(t *testing.T) {
 	t.Parallel()
 
 	f := newCloneFake()
-	f.failOn = "rename"
+	f.failOn = "snap"
+	f.failSeq = []error{errors.New("rbd: context deadline exceeded")}
 
-	_, err := cloneClient(t, f).publishRootAt(t.Context(), "billet-abc", "golden-app",
-		time.Date(2026, 10, 21, 3, 4, 5, 0, time.UTC))
-	if err == nil || !strings.Contains(err.Error(), "rename billet-cache/billet-abc") {
-		t.Fatalf("PublishRoot = %v, want the rename's failure", err)
+	if _, err := cloneClient(t, f).publishRootAt(t.Context(), "billet-abc", "golden-app",
+		time.Date(2026, 10, 21, 3, 4, 5, 0, time.UTC)); err == nil {
+		t.Fatal("PublishRoot reported success after its snapshot failed")
 	}
 
-	removal := f.ran(t, "snap", "rm")
-	if got := removal[len(removal)-1]; got != "billet-cache/billet-abc@g20261021030405" {
-		t.Errorf("the failed publication removed %q, not the generation it took", got)
+	f.ran(t, "snap", "rm", "billet-cache/billet-abc@g20261021030405")
+
+	if callIndex(f, "rename") >= 0 {
+		t.Errorf("a publication whose snapshot failed went on to rename: %v", f.calls)
 	}
 }
 

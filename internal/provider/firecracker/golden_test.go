@@ -3,10 +3,58 @@ package firecracker
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 )
+
+// A SNAPSHOT ALREADY VISIBLE KEEPS ITS DISK. A sync that fails after the published
+// directory was renamed into place leaves a snapshot a restore can find, so its disk
+// stays published for that restore to clone; the failure is reported as not durable.
+func TestACaptureVisibleButNotDurableKeepsItsDisk(t *testing.T) {
+	t.Parallel()
+
+	for _, which := range []string{"the published snapshot", "the snapshot store"} {
+		t.Run(which, func(t *testing.T) {
+			t.Parallel()
+
+			var h *harness
+
+			failing := errors.New("input/output error")
+			h = newHarness(t, withDurability(
+				func(f *os.File) error { return f.Sync() },
+				func(dir string) error {
+					// THE STORE, AND THE DIRECTORY ABOVE IT: the two syncs after the rename.
+					store := h.p.snapshotsDir()
+					if (which == "the published snapshot" && dir == store) ||
+						(which == "the snapshot store" && dir == filepath.Dir(store)) {
+						if _, err := os.Lstat(filepath.Join(store, "gold-1")); err == nil {
+							return failing
+						}
+					}
+
+					return syncDirectory(dir)
+				}))
+			h.launch(t)
+
+			err := h.p.Capture(t.Context(), theInstance, "gold-1")
+			if !errors.Is(err, errPublishedNotDurable) || !errors.Is(err, failing) {
+				t.Fatalf("Capture = %v, want the sync's failure reported as not durable", err)
+			}
+
+			if _, err := os.Lstat(filepath.Join(h.p.snapshotsDir(), "gold-1")); err != nil {
+				t.Fatalf("the snapshot is not published: %v", err)
+			}
+
+			published, withdrawn, _ := h.disk.goldenCalls()
+			if len(published) != 1 || len(withdrawn) != 0 {
+				t.Errorf("the disk was published %v and withdrawn %v, want it kept for the published snapshot",
+					published, withdrawn)
+			}
+		})
+	}
+}
 
 // The value ceph.GoldenPrefix holds. Asserted as a literal because importing it is
 // forbidden here, and the store asserts the same literal: a drift would publish a
