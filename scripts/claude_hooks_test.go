@@ -473,6 +473,19 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 	if err := os.Symlink(filepath.Join(root, "scripts", "gates"), filepath.Join(root, "g")); err != nil {
 		t.Fatal(err)
 	}
+	// TWO SHELLS NAMED sh, one bash and one dash by the file each resolves to, in
+	// directories of their own, so a shell is judged from the command's directory.
+	for dir, target := range map[string]string{"b": "bash", "d": "dash"} {
+		hookWrite(t, root, "shells/bin/"+target, "#!/bin/sh\n")
+
+		if err := os.MkdirAll(filepath.Join(root, "shells", dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Symlink(filepath.Join(root, "shells", "bin", target), filepath.Join(root, "shells", dir, "sh")); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	const (
 		gate      = "is a full gate, which CI runs"
@@ -524,6 +537,9 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"zsh -s +s scripts/gates/check.sh", gate},
 		{"sh +s scripts/gates/check.sh", shPlusS(t, gate)},
 		{"/bin/bash +s scripts/gates/check.sh", ""},
+		{"cd shells/b && ./sh +s " + root + "/scripts/gates/check.sh", ""},
+		{"cd shells/d && ./sh +s " + root + "/scripts/gates/check.sh", gate},
+		{"shells/b/sh +s scripts/gates/check.sh", ""},
 		{"dash -s scripts/gates/check.sh", ""},
 		{"bash g/../gates/test.sh", gate},
 		{"bash -o pipefail -c 'git push --force origin junior-oct03-work'", "force"},
