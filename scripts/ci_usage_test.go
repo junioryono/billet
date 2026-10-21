@@ -218,7 +218,7 @@ func TestTheUsageSamplerCallsAReportWithALongGapPartial(t *testing.T) {
 
 		var samples strings.Builder
 		for i, at := range tc.times {
-			fmt.Fprintf(&samples, "%d 2 %d %d 0 %d %d\n", 1700000000+at, 100*i, 1000*(i+1), 6*gib)
+			fmt.Fprintf(&samples, "%d 2 %d %d 0 %d %d\n", 1700000000+at, 100*i, 1000*(i+1), 8*gib, 6*gib)
 		}
 
 		if err := os.WriteFile(filepath.Join(dir, "samples"), []byte(samples.String()), 0o600); err != nil {
