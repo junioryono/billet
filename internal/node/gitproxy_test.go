@@ -87,8 +87,12 @@ type gitUpstream struct {
 // the name is asked about.
 func (u *gitUpstream) repositoryID(name string) int64 {
 	id, _ := u.ids.LoadOrStore(name, u.nextID.Add(1))
+	repository, ok := id.(int64)
+	if !ok {
+		panic(fmt.Sprintf("the stand-in's id for %s is a %T", name, id))
+	}
 
-	return id.(int64) //nolint:forcetypeassert // only int64s are stored
+	return repository
 }
 
 // recreate deletes acme/api and makes another repository of that name, with a

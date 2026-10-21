@@ -549,8 +549,8 @@ func (g *gitProxy) watchIdle(ctx context.Context, exchange *gitExchange) (contex
 				now := time.Now()
 				// A WRITER THAT CANNOT MOVE ITS DEADLINES (a test's recorder) is
 				// ended by the context alone.
-				_ = controller.SetReadDeadline(now)
-				_ = controller.SetWriteDeadline(now)
+				_ = controller.SetReadDeadline(now)  //nolint:errcheck // best effort: the context is ended whatever this says
+				_ = controller.SetWriteDeadline(now) //nolint:errcheck // best effort: the context is ended whatever this says
 
 				return
 			}
@@ -657,10 +657,14 @@ func (g *gitProxy) bufferGitBody(r *http.Request) (func(), error) {
 	if err != nil {
 		return func() {}, err
 	}
-	remove := func() {
+	// UNLINKED AT ONCE and used through its descriptor alone, so not even a
+	// node killed mid-request leaves it on the disk.
+	if err := os.Remove(spool.Name()); err != nil {
 		_ = spool.Close()
-		_ = os.Remove(spool.Name())
+
+		return func() {}, err
 	}
+	remove := func() { _ = spool.Close() }
 	size, err := io.Copy(spool, io.LimitReader(io.MultiReader(bytes.NewReader(raw), r.Body), gitSpoolLimit+1))
 	if err == nil && size > gitSpoolLimit {
 		err = errGitBodyTooLarge
@@ -999,18 +1003,18 @@ func (s *CacheService) gitAdvertise(ctx context.Context, exchange *gitExchange, 
 
 		return
 	}
-	// WHICH REPOSITORY THE NAME IS, asked once a grant: a mirror is served only
-	// to the repository it was fetched from, and a name GitHub could not tie to
-	// one is GitHub's to answer.
-	repository, known := s.git.granted(request, s.now())
-	if !known || repository == 0 {
-		if repository, err = s.repositoryID(ctx, request); err != nil {
-			s.git.remember(request, s.now(), sequence, true, 0)
-			exchange.answered("github", "could not learn which repository the name is: "+err.Error())
-			s.relayGit(exchange, r, resp)
+	// WHICH REPOSITORY THE NAME IS, asked with every advertisement and never
+	// carried from an earlier grant: a name can pass to another repository while
+	// every advertisement answers 200, a mirror is served only to the repository
+	// it was fetched from, and a name GitHub could not tie to one is GitHub's to
+	// answer.
+	repository, err := s.repositoryID(ctx, request)
+	if err != nil {
+		s.git.remember(request, s.now(), sequence, true, 0)
+		exchange.answered("github", "could not learn which repository the name is: "+err.Error())
+		s.relayGit(exchange, r, resp)
 
-			return
-		}
+		return
 	}
 	s.git.remember(request, s.now(), sequence, true, repository)
 
@@ -1246,12 +1250,35 @@ func (s *CacheService) claimMirror(
 	}
 	s.log.Info("removed a git mirror it could not serve", "repository", request.name(),
 		"stamped", stamped, "repository_id", repository, "broken", broken, "error", err)
-	if err := os.RemoveAll(path); err != nil {
+	// RENAMED ASIDE AT ONCE, DELETED AFTER: deleting a large mirror takes as
+	// long as its files, which no advertisement waits for. A name the deletion
+	// never finished is the reaper's.
+	discarded := path + gitDiscardSuffix + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if err := os.Rename(path, discarded); err != nil {
 		return err
 	}
 	s.git.clearBroken(key)
+	s.git.goBackground(func() {
+		if err := os.RemoveAll(discarded); err != nil {
+			s.log.Warn("could not delete a discarded git mirror; the reaper will", "error", err)
+		}
+	})
 
 	return nil
+}
+
+// gitDiscardSuffix marks a mirror renamed aside to be deleted.
+const gitDiscardSuffix = ".discard-"
+
+// goBackground runs work on the proxy's background, which close joins; once
+// close has begun, the work is not started and its leftovers are the reaper's.
+func (g *gitProxy) goBackground(work func()) {
+	g.lifecycle.Lock()
+	defer g.lifecycle.Unlock()
+	if g.closed {
+		return
+	}
+	g.background.Go(work)
 }
 
 // mirrorRepository is the repository a mirror at path was fetched from, and
@@ -1281,16 +1308,18 @@ func mirrorRepository(path string) (int64, bool, error) {
 // rlockWithin takes l for reading, giving up when ctx ends: a writer removing
 // the mirror holds it for as long as the removal takes.
 func rlockWithin(ctx context.Context, l *sync.RWMutex) bool {
-	for {
-		if l.TryRLock() {
-			return true
-		}
+	for !l.TryRLock() {
+		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
+
 			return false
-		case <-time.After(10 * time.Millisecond):
+		case <-timer.C:
 		}
 	}
+
+	return true
 }
 
 // markBroken records that serving from the mirror at key failed after its
@@ -1442,6 +1471,17 @@ func (s *CacheService) refreshHeld(ctx context.Context, request gitRequest, repo
 		return err
 	}
 	err := s.fetchMirror(ctx, path, request, repository, volumeCeiling(sessionSetting(request.session, config.CacheGit)))
+	// THE NAME WAS FETCHED, NOT THE ID: GitHub serves git by name alone
+	// (`/repositories/<id>` is not found over git, 2026-10-21). A name that
+	// passed to another repository while the fetch ran brought that one's
+	// objects, so the mirror is broken and replaced before its next serve.
+	// Could not tell leaves it, as a refresh that could not run would.
+	if err == nil {
+		if after, idErr := s.repositoryID(ctx, request); idErr == nil && after != repository {
+			s.git.markBroken(request.key())
+			err = fmt.Errorf("the name became repository %d while the mirror of %d was fetched", after, repository)
+		}
+	}
 	if err == nil && head != "" && strings.HasPrefix(head, "refs/") {
 		_, err = s.runGit(ctx, path, nil, "symbolic-ref", "HEAD", head)
 	}
@@ -1784,7 +1824,12 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 
 		return
 	}
-	if !s.mirrorHolds(ctx, path, objects) {
+	// THE PROBE HAS A DEADLINE OF ITS OWN, so a stalled one leaves the request
+	// alive for GitHub to answer.
+	probe, cancelProbe := context.WithTimeout(ctx, s.git.firstLineWait)
+	holds := s.mirrorHolds(probe, path, objects)
+	cancelProbe()
+	if !holds {
 		s.forwardGit(exchange, r, request, "the mirror lacks an object the fetch names")
 
 		return
@@ -1796,7 +1841,12 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 
 		return
 	}
-	if served, reason := s.serveUploadPack(ctx, exchange, key, path, negotiation); !served {
+	stillGranted := func() bool {
+		again, ok := s.git.granted(request, s.now())
+
+		return ok && again == repository
+	}
+	if served, reason := s.serveUploadPack(ctx, exchange, key, path, negotiation, stillGranted); !served {
 		s.forwardGit(exchange, r, request, reason)
 
 		return
@@ -1816,7 +1866,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 // advertisement removes it and every fetch after goes to GitHub until it is
 // fetched again.
 func (s *CacheService) serveUploadPack(
-	ctx context.Context, exchange *gitExchange, key, path string, negotiation []byte,
+	ctx context.Context, exchange *gitExchange, key, path string, negotiation []byte, stillGranted func() bool,
 ) (bool, string) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1843,13 +1893,19 @@ func (s *CacheService) serveUploadPack(
 	// A TIMER THAT FIRED HAS KILLED upload-pack, even one whose line arrived as
 	// it fired, so that answer is not served.
 	answeredInTime := quiet.Stop()
-	if err != nil || !answeredInTime || bytes.HasPrefix(first[min(len(first), 4):], []byte("ERR ")) {
+	// THE GRANT ONCE MORE, at the last moment before an answer commits: the
+	// wait for the first line can outlast it, or meet a refusal GitHub gave
+	// this header meanwhile.
+	granted := err != nil || !answeredInTime || stillGranted()
+	if err != nil || !answeredInTime || !granted || bytes.HasPrefix(first[min(len(first), 4):], []byte("ERR ")) {
 		cancel()
 		waitErr := cmd.Wait()
 		reason := "the mirror's upload-pack said nothing"
 		switch {
 		case !answeredInTime:
 			reason = fmt.Sprintf("the mirror's upload-pack said nothing within %s", s.git.firstLineWait)
+		case !granted:
+			reason = "github.com's grant ended before the mirror answered"
 		case err == nil:
 			reason = "the mirror refused: " + strings.TrimSpace(string(first[4:]))
 		}
@@ -1979,6 +2035,7 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 		used time.Time
 	}
 	var mirrors []mirror
+	var discarded []string
 	err := filepath.WalkDir(s.git.root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) && path == s.git.root {
@@ -1986,6 +2043,13 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 			}
 
 			return err
+		}
+		// A MIRROR RENAMED ASIDE whose deletion never finished, a restart's
+		// leftover, is no mirror and goes whatever its age.
+		if entry.IsDir() && strings.Contains(filepath.Base(path), ".git"+gitDiscardSuffix) {
+			discarded = append(discarded, path)
+
+			return fs.SkipDir
 		}
 		if !entry.IsDir() || !strings.HasSuffix(path, ".git") {
 			return nil
@@ -2008,6 +2072,11 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 	slices.SortFunc(mirrors, func(a, b mirror) int { return a.used.Compare(b.used) })
 
 	var failures []error
+	for _, path := range discarded {
+		if err := os.RemoveAll(path); err != nil {
+			failures = append(failures, err)
+		}
+	}
 	for _, m := range mirrors {
 		if ctx.Err() != nil {
 			return ctx.Err()

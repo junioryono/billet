@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -251,21 +250,13 @@ func TestAForwardedBodyIsWholeBeforeGitHubSeesIt(t *testing.T) {
 	}))
 	t.Cleanup(github.Close)
 
-	// HELD IN MEMORY, and past a limit of sixteen bytes on disk, which the
-	// proxy removes once the request is done.
+	// HELD IN MEMORY, and past a limit of sixteen bytes on disk; each on a
+	// repository of its own, so the two can run at once.
 	for _, limit := range []int64{gitRequestLimit, 16} {
 		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
-			lengths.Clear()
-			service := forwardSlowBody(t, github.URL, limit, idle, &lengths)
-			entries, err := os.ReadDir(service.git.root)
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
-				t.Fatal(err)
-			}
-			for _, entry := range entries {
-				if strings.HasPrefix(entry.Name(), ".request-") {
-					t.Fatalf("a spooled request body was left behind: %s", entry.Name())
-				}
-			}
+			t.Parallel()
+
+			forwardSlowBody(t, github.URL, fmt.Sprintf("api%d", limit), limit, idle, &lengths)
 		})
 	}
 }
@@ -273,7 +264,7 @@ func TestAForwardedBodyIsWholeBeforeGitHubSeesIt(t *testing.T) {
 // forwardSlowBody sends a fetch whose body stops for three times GitHub's idle
 // limit halfway through, through a node holding limit bytes in memory, and
 // fails unless GitHub answered it whole.
-func forwardSlowBody(t *testing.T, github string, limit int64, idle time.Duration, lengths *sync.Map) *CacheService {
+func forwardSlowBody(t *testing.T, github, repo string, limit int64, idle time.Duration, lengths *sync.Map) {
 	t.Helper()
 
 	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
@@ -293,7 +284,7 @@ func forwardSlowBody(t *testing.T, github string, limit int64, idle time.Duratio
 		writer.CloseWithError(err)
 	}()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		node.URL+"/v1/git/github.com/acme/api.git/git-upload-pack", reader)
+		node.URL+"/v1/git/github.com/acme/"+repo+".git/git-upload-pack", reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,11 +297,9 @@ func forwardSlowBody(t *testing.T, github string, limit int64, idle time.Duratio
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("a slowly sent fetch was answered %d, want github.com's 200", resp.StatusCode)
 	}
-	if length, _ := lengths.Load("/acme/api.git/git-upload-pack"); length != int64(len("0032want "+strings.Repeat("a", 40)+"\n00000009done\n")) {
+	if length, _ := lengths.Load("/acme/" + repo + ".git/git-upload-pack"); length != int64(len("0032want "+strings.Repeat("a", 40)+"\n00000009done\n")) {
 		t.Fatalf("github.com was sent a body of length %v, want the whole body's", length)
 	}
-
-	return service
 }
 
 // THE PROXY REACHES GITHUB OVER HTTP/1.1, one connection per request, even
@@ -439,7 +428,7 @@ func TestAStalledGitRequestEndsAndAMovingOneDoesNot(t *testing.T) {
 		t.Fatalf("the stalled request answered %q", stalled.body)
 	}
 	gitWithin(t, "github.com's side of the stalled request", func() struct{} {
-		for !stallEnded.Load() {
+		for !stallEnded.Load() && t.Context().Err() == nil {
 			time.Sleep(10 * time.Millisecond)
 		}
 

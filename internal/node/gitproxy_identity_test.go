@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -182,29 +183,37 @@ func TestAStalledGuestEndsAtTheIdleLimit(t *testing.T) {
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 
+	// HALF A NEGOTIATION, then nothing until the test ends. The client is not
+	// what is watched: Go's client waits for its request body to finish before
+	// it returns, so the node's slot is.
 	reader, writer := io.Pipe()
-	t.Cleanup(func() { writer.Close() })
-	go func() {
-		// HALF A NEGOTIATION, then nothing until the test ends.
-		if _, err := io.WriteString(writer, "0032want "+strings.Repeat("a", 40)+"\n"); err != nil {
-			writer.CloseWithError(err)
-		}
-	}()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
 		node.URL+"/v1/git/github.com/acme/api.git/git-upload-pack", reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.SetBasicAuth(token, githubBasic)
-	gitWithin(t, "a request whose guest stopped sending", func() struct{} {
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
+	var client sync.WaitGroup
+	t.Cleanup(func() {
+		writer.Close()
+		client.Wait()
+	})
+	client.Go(func() {
+		if resp, err := http.DefaultClient.Do(req); err == nil {
 			resp.Body.Close()
+		}
+	})
+	if _, err := io.WriteString(writer, "0032want "+strings.Repeat("a", 40)+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	gitWithin(t, "the stalled request to be admitted", func() struct{} {
+		for len(service.git.work) == 0 && t.Context().Err() == nil {
+			time.Sleep(10 * time.Millisecond)
 		}
 
 		return struct{}{}
 	})
-	gitWithin(t, "the stalled request's slots", func() struct{} {
+	gitWithin(t, "the stalled request's slot to be given back", func() struct{} {
 		for len(service.git.work) != 0 && t.Context().Err() == nil {
 			time.Sleep(10 * time.Millisecond)
 		}
