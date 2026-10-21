@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// A KERNEL THAT DOES NOT FILL STATX_MNT_ID, OR HAS NO STATX AT ALL, is answered
+// A KERNEL THAT DOES NOT FILL STATX_MNT_ID, OR HAS OR ALLOWS NO STATX, is answered
 // with the device alone, which Holds then compares.
 func TestAKernelWithoutAMountIdentityAnswersWithTheDevice(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lock")
@@ -40,7 +40,8 @@ func TestAKernelWithoutAMountIdentityAnswersWithTheDevice(t *testing.T) {
 
 			return err
 		},
-		"no statx": func(int, string, int, int, *unix.Statx_t) error { return unix.ENOSYS },
+		"no statx":                func(int, string, int, int, *unix.Statx_t) error { return unix.ENOSYS },
+		"statx denied by seccomp": func(int, string, int, int, *unix.Statx_t) error { return unix.EPERM },
 	} {
 		statx = fake
 
