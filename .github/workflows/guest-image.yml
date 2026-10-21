@@ -263,7 +263,7 @@ jobs:
           path: |
             out/vmlinux-billet
             out/vmlinux-billet.config
-          key: guest-kernel-${{ hashFiles('scripts/guest-kernel.config', 'scripts/build-guest-kernel.sh', 'scripts/kernel/required-builtins.txt') }}
+          key: guest-kernel-${{ hashFiles('scripts/guest-kernel.config', 'scripts/build-guest-kernel.sh', 'scripts/kernel/required-builtins.txt', 'scripts/kernel/linux.pin') }}
 
       - name: Build the guest kernel
         if: steps.kernel-cache.outputs.cache-hit != 'true'
@@ -373,6 +373,14 @@ jobs:
             echo
             echo "Pulled by \`billet images pull\`, which verifies the manifest"
             echo "signature and each asset's digest before anything reaches the cluster."
+            echo
+            echo "The corresponding source of what this image carries under a GNU license"
+            echo "is published with it: \`image-sources.tar\` (in the parts"
+            echo "\`image-sources.parts\` lists, joined in order) holds every source package"
+            echo "\`image-sources.tsv\` marks \`gnu\` or \`unclassified\`, at its exact"
+            echo "version, and the Linux tarball and configuration the kernel was built"
+            echo "from; \`image-sources-index.tsv\` lists each file with its sha256. The"
+            echo "scripts that built the image are this repository at \`$SOURCE_SHA\`."
           } > out/release-notes.md
 
           {
@@ -383,6 +391,36 @@ jobs:
           ROOTFS: ${{ github.workspace }}/out/rootfs.img.zst
           SOURCE_TAG: ${{ steps.source.outputs.tag }}
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
+
+      # THE CORRESPONDING SOURCE OF WHAT THE IMAGE REDISTRIBUTES, published beside it
+      # (#584, ADR-018): every source package the image's source manifest marks gnu or
+      # unclassified, at its exact version, and the Linux tarball and configuration
+      # the kernel was built from. A source that cannot be fetched and verified fails
+      # the build, because a published image without its source is what this
+      # prevents. One tar, split as the image is, because a release holds a thousand
+      # assets and the sources are more files than that; the parts list carries each
+      # part's digest for the publisher to check.
+      - name: Fetch the corresponding source
+        run: |
+          set -euo pipefail
+
+          python3 scripts/fetch-image-sources.py out/image-sources.tsv \
+            "$(jq -r .kernel.version out/manifest.json)" out/vmlinux-billet.config sources
+          cp sources/index.tsv out/image-sources-index.tsv
+          tar -C sources -cf out/image-sources.tar .
+          rm -rf sources
+
+          parts=$(scripts/split-image.sh out/image-sources.tar)
+          if [ -n "$parts" ]; then
+            rm -f out/image-sources.tar
+          else
+            parts=out/image-sources.tar
+          fi
+          : >out/image-sources.parts
+          while IFS= read -r part; do
+            printf '%s %s\n' "${part##*/}" "$(sha256sum "$part" | cut -d ' ' -f 1)" >>out/image-sources.parts
+          done <<<"$parts"
+          cat out/image-sources.parts
 
       # THE RELEASE GATE. Nothing below this runs against an image that fails it.
       #
@@ -448,6 +486,9 @@ jobs:
             out/manifest.json
             out/release-notes.md
             out/image-sources.tsv
+            out/image-sources-index.tsv
+            out/image-sources.parts
+            out/image-sources.tar*
             out/rootfs.img.zst*
             out/vmlinux-billet
           # SHORT, because these are hundreds of megabytes and the default is

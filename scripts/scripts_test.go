@@ -229,6 +229,13 @@ func readCalls(t *testing.T, path string) string {
 	return string(body)
 }
 
+// sourcesTarDigest is the sha256 of the image-sources.tar publishDir writes.
+var sourcesTarDigest = func() string {
+	sum := sha256.Sum256([]byte("sources"))
+
+	return hex.EncodeToString(sum[:])
+}()
+
 // publishDir builds the output directory a publish runs against: the manifest,
 // its signature, the release notes, and each named asset.
 // publishDir writes a publication directory: the assets, each holding its own
@@ -253,6 +260,10 @@ func publishDir(t *testing.T, manifest string, assets ...string) string {
 		"release-notes.md":       "notes",
 		"image-sources.tsv": "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n" +
 			"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n",
+		"image-sources-index.tsv": "source\tfile\tsha256\tsize\n" +
+			"bash_5.2.21-2ubuntu4\tbash_5.2.21-2ubuntu4/bash_5.2.21.orig.tar.xz\t" + strings.Repeat("0", 64) + "\t1\n",
+		"image-sources.tar":   "sources",
+		"image-sources.parts": "image-sources.tar " + sourcesTarDigest + "\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
@@ -306,7 +317,16 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			wantSuccess: true,
 			wantUploads: []string{
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet", "image-sources.tsv",
+				"image-sources-index.tsv", "image-sources.parts", "image-sources.tar",
 			},
+		},
+		{
+			name: "a list of the source's parts with no final newline still uploads its last part",
+			dir: rewritten(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.parts",
+				"image-sources.tar "+sourcesTarDigest),
+			wantSuccess: true,
+			wantUploads: []string{"image-sources.parts", "/image-sources.tar"},
 		},
 		{
 			name:        "a promised part the build did not produce stops the publish",
@@ -381,6 +401,50 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 				"name\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
 					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "no list of the source's parts stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.parts"),
+			wantSuccess: false,
+		},
+		{
+			name: "no index of the source stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources-index.tsv"),
+			wantSuccess: false,
+		},
+		{
+			name: "an index naming no source stops the publish before the tag",
+			dir: rewritten(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources-index.tsv",
+				"source\tfile\tsha256\tsize\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a part of the source that is not the one its list describes stops the publish before the tag",
+			dir: rewritten(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tar", "other"),
+			wantSuccess: false,
+		},
+		{
+			name: "a part of the source the build did not produce stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tar"),
+			wantSuccess: false,
+		},
+		{
+			name: "a part named outside the source's own stops the publish before the tag",
+			dir: rewritten(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.parts",
+				"../manifest.json "+sourcesTarDigest+"\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a list of the source naming no part stops the publish before the tag",
+			dir: rewritten(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.parts", "\n"),
 			wantSuccess: false,
 		},
 		{
@@ -474,15 +538,22 @@ func swapped(t *testing.T, dir, a, b string) string {
 	return dir
 }
 
+// rewritten rewrites one file of a publication directory with BODY.
+func rewritten(t *testing.T, dir, name, body string) string {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+		t.Fatalf("rewrite %s: %v", name, err)
+	}
+
+	return dir
+}
+
 // withSources rewrites a publication directory's image-sources.tsv with BODY.
 func withSources(t *testing.T, dir, body string) string {
 	t.Helper()
 
-	if err := os.WriteFile(filepath.Join(dir, "image-sources.tsv"), []byte(body), 0o600); err != nil {
-		t.Fatalf("rewrite image-sources.tsv: %v", err)
-	}
-
-	return dir
+	return rewritten(t, dir, "image-sources.tsv", body)
 }
 
 // without removes one file from a publication directory.
@@ -2473,7 +2544,7 @@ func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
 	buildBody = buildBody[checkout:]
 
 	scripts := map[string]bool{}
-	for _, m := range regexp.MustCompile(`scripts/[a-z0-9/-]+\.(?:sh|txt|config)`).FindAllString(buildBody, -1) {
+	for _, m := range regexp.MustCompile(`scripts/[a-z0-9/-]+\.(?:sh|txt|config|py|pin)`).FindAllString(buildBody, -1) {
 		scripts[m] = true
 	}
 	env := map[string]bool{}
@@ -2495,6 +2566,8 @@ func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
 		"scripts/write-image-manifest.sh":      true,
 		"scripts/guest-kernel.config":          true,
 		"scripts/kernel/required-builtins.txt": true,
+		"scripts/kernel/linux.pin":             true,
+		"scripts/fetch-image-sources.py":       true,
 		"IMAGE_NAME":                           true,
 		"WORK":                                 true,
 		"PUBLISH":                              true,

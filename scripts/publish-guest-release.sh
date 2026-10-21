@@ -87,7 +87,47 @@ if ! awk -F '\t' '
     exit 2
 fi
 
-set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv"
+# THE CORRESPONDING SOURCE (#584, ADR-018): the index of what it holds, and the
+# parts of one tar, each named and digested by image-sources.parts. A release
+# without them would redistribute GNU-licensed software with no source beside it,
+# and once published it could never be added.
+for file in image-sources-index.tsv image-sources.parts; do
+    if [ ! -s "$out/$file" ]; then
+        printf 'the publication has no %s, so nothing is tagged or released\n' "$file" >&2
+        exit 2
+    fi
+done
+if [ "$(head -n 1 "$out/image-sources-index.tsv")" != "$(printf 'source\tfile\tsha256\tsize')" ] ||
+    [ "$(wc -l <"$out/image-sources-index.tsv")" -lt 2 ]; then
+    printf 'the publication'"'"'s image-sources-index.tsv is not an index of any source, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+
+set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv" \
+    "$out/image-sources-index.tsv" "$out/image-sources.parts"
+
+# A LAST LINE WITH NO NEWLINE IS A PART TOO: read fails on it while still setting
+# the fields, and skipping it would publish the tar without its last part.
+while read -r name want rest || [ -n "$name" ]; do
+    case "$name" in
+        image-sources.tar | image-sources.tar.part[0-9][0-9][0-9]) ;;
+        *) printf 'image-sources.parts names an unusable part: %s\n' "$name" >&2; exit 2 ;;
+    esac
+    if [ -n "$rest" ] || ! printf '%s\n' "$want" | grep -Eq '^[0-9a-f]{64}$'; then
+        printf 'image-sources.parts gives %s no single sha256\n' "$name" >&2
+        exit 2
+    fi
+    if [ ! -r "$out/$name" ]; then
+        printf 'image-sources.parts names %s and the build did not produce it\n' "$name" >&2
+        exit 2
+    fi
+    got=$(sha256sum "$out/$name" | cut -d ' ' -f 1)
+    if [ "$got" != "$want" ]; then
+        printf '%s is not the part image-sources.parts describes (sha256 %s, want %s)\n' "$name" "$got" "$want" >&2
+        exit 2
+    fi
+    set -- "$@" "$out/$name"
+done <"$out/image-sources.parts"
 
 while read -r name want; do
     # A BARE FILE NAME, CHECKED HERE TOO. The Go reader validates this before a
