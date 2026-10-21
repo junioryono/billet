@@ -355,7 +355,12 @@ NAME is this Mac's node name (letters, digits, dot, dash, underscore). The
 /usr/local directories the launch agents use, the Setup Assistant choices a
 node needs (automatic login, FileVault off) and the softnet grant untrusted
 work needs are all in the Mac guide:
-  https://github.com/junioryono/billet/blob/main/docs/deploying/mac-tart.md"
+  https://github.com/junioryono/billet/blob/main/docs/deploying/mac-tart.md
+
+To add this Mac to a deployment whose control plane runs elsewhere, run
+instead the one billet join command that billet ca token prints there: it
+does the directories, the softnet grant, the config, the enrollment and
+billet local up, asking for sudo itself for the steps that need root."
     elif [ "${native}" = true ]; then
         echo "Next:
   billet init --org YOUR-ORG --runner-group YOUR-GROUP \\

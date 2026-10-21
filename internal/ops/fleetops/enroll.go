@@ -753,11 +753,63 @@ func CAToken(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	fmt.Fprintf(env.Stdout, "Join token (shown once, valid for %s, %d use(s)):\n\n  %s\n\n", *ttl, *uses, token)
-	fmt.Fprintf(env.Stdout, "On the machine that should join:\n\n")
-	fmt.Fprintf(env.Stdout, "  billet node --enroll --ca-fingerprint <from `billet ca show`> --join-token %s%s\n",
-		token, enrollAddrFlag(cfg))
+	fmt.Fprintf(env.Stdout, "On the machine that should join, naming it (#181):\n\n  %s\n\n",
+		joinCommand(cfg, token))
+	fmt.Fprintf(env.Stdout, "That generates its config, does its prerequisites, enrolls and starts it; it prints a "+
+		"`billet join accept` for this control plane and the fingerprint to approve. A Docker node also takes "+
+		"--runner-group and --workflow, as `billet init` does.\n\n")
+	fmt.Fprintf(env.Stdout, "A machine whose config is already written enrolls with:\n\n")
+	fmt.Fprintf(env.Stdout, "  billet node --enroll --ca-fingerprint %s --join-token %s%s\n",
+		caFingerprintOrAsk(cfg), token, enrollAddrFlag(cfg))
 
 	return nil
+}
+
+// joinCommand is the whole `billet join` a new machine runs.
+func joinCommand(cfg *config.Config, token string) string {
+	cmd := "billet join --server " + nodeWireAddr(cfg) + " --ca-fingerprint " + caFingerprintOrAsk(cfg) +
+		" --token " + token + enrollAddrFlag(cfg) + " --node-name <its name>"
+
+	switch {
+	case cfg.GitHub != nil && cfg.GitHub.Org != "":
+		cmd += " --org " + cli.ShellArg(cfg.GitHub.Org)
+	case cfg.GitHub != nil && cfg.GitHub.Repository != "":
+		cmd += " --repository " + cli.ShellArg(cfg.GitHub.Repository)
+	}
+
+	return cmd
+}
+
+// nodeWireAddr is the node-wire address a joining machine dials, with a
+// wildcard host left for the operator, as enrollAddrFlag leaves it.
+func nodeWireAddr(cfg *config.Config) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Server.Listen))
+	if err != nil {
+		return "<this control plane's node-wire address>"
+	}
+
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return "<this control plane>:" + port
+	}
+
+	return net.JoinHostPort(host, port)
+}
+
+// caFingerprintOrAsk is the authority's fingerprint, read without creating or
+// locking anything (the public certificate `billet ca show` reports), or the
+// command that prints it when it cannot be read.
+func caFingerprintOrAsk(cfg *config.Config) string {
+	raw, err := os.ReadFile(wirecert.CACertPath(cfg.Server.IdentityDir))
+	if err != nil {
+		return "<from `billet ca show`>"
+	}
+
+	fp, err := wirecert.FingerprintOfCAPEM(raw)
+	if err != nil {
+		return "<from `billet ca show`>"
+	}
+
+	return fp
 }
 
 // enrollAddrFlag is the --bootstrap-addr an enrolling machine needs, or nothing.
