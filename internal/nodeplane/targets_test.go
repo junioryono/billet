@@ -2,6 +2,7 @@ package nodeplane_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http/httptest"
 	"slices"
@@ -26,8 +27,10 @@ type targetJIT struct {
 	// store, when set, is read at each mint for the owner the lease records,
 	// so a test can tell whether it was durable before the registration existed.
 	store *fakeStore
-	// recovery is what a recovery finds on GitHub.
-	recovery nodeplane.JITRunnerRecovery
+	// recovery is what a recovery finds on GitHub, and removeErr what a
+	// removal answers.
+	recovery  nodeplane.JITRunnerRecovery
+	removeErr error
 
 	mu           sync.Mutex
 	described    []string
@@ -70,7 +73,7 @@ func (j *targetJIT) RemoveRunner(_ context.Context, _ int64, name string) error 
 
 	j.removed = append(j.removed, name)
 
-	return nil
+	return j.removeErr
 }
 
 func (j *targetJIT) RecoverRunner(_ context.Context, name string) (nodeplane.JITRunnerRecovery, error) {
@@ -819,6 +822,39 @@ func TestARecoveryKeepsOnlyTheOwnerItFoundTheRunnerOn(t *testing.T) {
 		if _, _, recoveredB := jitB.asked(); len(recoveredB) != 0 {
 			t.Errorf("the owner the catalogue names now was asked %v about a runner found on %q",
 				recoveredB, ownerA)
+		}
+
+		if _, _, recoveredA := jitA.asked(); len(recoveredA) != 2 {
+			t.Errorf("the owner the runner was found on was asked %d times, want 2", len(recoveredA))
+		}
+	})
+
+	// FOUND, AND ITS REMOVAL FAILED: the owner it was found on is kept before
+	// the removal is tried, so the retry asks that owner again after the
+	// catalogue has moved the tier, and never the one that would answer "not
+	// present".
+	t.Run("found and its removal failed", func(t *testing.T) {
+		t.Parallel()
+
+		store := legacy()
+		jitA := &targetJIT{path: ownerA, recovery: nodeplane.JITRunnerRecovery{RunnerID: 91, Present: true},
+			removeErr: errors.New("github unavailable")}
+		jitB := &targetJIT{path: ownerB}
+		sources := map[string]nodeplane.JITSource{"default": jitA, "personal": jitB}
+
+		c := serve(t, store, twoTargetCatalogue(), sources)
+		if _, err := c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1"); err == nil {
+			t.Fatal("a recovery whose removal failed reported success")
+		}
+
+		moved := twoTargetCatalogue()
+		moved[0].Target = "personal"
+		c = serve(t, store, moved, sources)
+		_, _ = c.RecoverRunner(t.Context(), "l1", "tier-a", 7, "billet-l1")
+
+		if _, _, recoveredB := jitB.asked(); len(recoveredB) != 0 {
+			t.Errorf("the retry asked the owner the catalogue names now %v, not the one the runner was found on",
+				recoveredB)
 		}
 
 		if _, _, recoveredA := jitA.asked(); len(recoveredA) != 2 {

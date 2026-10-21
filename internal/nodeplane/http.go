@@ -2408,6 +2408,19 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 			"recovered runner id changed; refusing replacement identity")
 		return
 	}
+	// FOUND IS PROOF, AND IT IS KEPT BEFORE ANYTHING ELSE CAN FAIL. A removal
+	// below that fails returns before any binding is written, and the retry,
+	// after the catalogue has moved the tier, would ask another owner, hear "not
+	// present" and let the compute go. The lease's record is what the retry
+	// resolves through, fenced and written once.
+	if recorded == "" && recovery.Present {
+		if owner := targetPath(src); owner != "" {
+			if err := pool.RecordLeaseGitHubTarget(r.Context(), leaseID, lease.Epoch, owner); err != nil {
+				writeStoreErr(w, err)
+				return
+			}
+		}
+	}
 	if recovery.Busy {
 		if err := pool.PreserveRecoveredBusyPoolRunner(r.Context(), alloc.PoolRunner{
 			LeaseID: leaseID, Tier: lease.Tier, LaunchRequestID: lease.RequestID,
