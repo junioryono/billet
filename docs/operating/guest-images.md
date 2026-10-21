@@ -1,6 +1,6 @@
 # Guest images
 
-A Firecracker job boots a **golden image**: an Ubuntu 24.04 rootfs carrying Docker, the GitHub Actions runner, and a small agent that reads the runner registration out of the metadata service and starts the runner with it. It lives in Ceph as an RBD image with immutable named snapshots called **generations**, and every job gets a copy-on-write clone of one, grown to the tier's `disk` before boot and discarded with the guest. billet builds the image once, centrally, and a deployment pulls it.
+A Firecracker job boots a **golden image**: a root filesystem based on Ubuntu 24.04, carrying Docker, the GitHub Actions runner, and a small agent that reads the runner registration out of the metadata service and starts the runner with it. It lives in Ceph as an RBD image with immutable named snapshots called **generations**, and every job gets a copy-on-write clone of one, grown to the tier's `disk` before boot and discarded with the guest. billet builds the image once, centrally, and a deployment pulls it.
 
 ## What is in it
 
@@ -88,6 +88,21 @@ images:
 | `firefox` | Launchpad, for the mozillateam PPA and the key `add-apt-repository` fetches (`ppa.launchpadcontent.net`, `api.launchpad.net`); `api.github.com` and `github.com` for geckodriver |
 | `google-chrome` | `dl.google.com`, `googlechromelabs.github.io` (the Chrome for Testing list), the ChromeDriver download that list names, and `www.googleapis.com` (Chromium) |
 | `microsoft-edge` | `packages.microsoft.com`, `msedgedriver.microsoft.com` |
+
+## Notices in the image
+
+The image redistributes what GitHub's template installs, so it carries the license of each tool whose license asks for its text with every copy. `/opt/billet/IMAGE_NOTICES` names each tool installed outside apt that asks this, and where its license is in the image:
+
+| Tool | License | Where its text is |
+|---|---|---|
+| The GitHub Copilot CLI | GitHub Copilot CLI License | `LICENSE.md` beside the binary in the toolcache (`copilot-cli/<version>/x64/`), fetched by the build from the tag of the version installed, because the release tarball holds only the binary |
+| The agentic workflow firewall bundle | MIT | `LICENSE` beside each `awf-bundle.js` in the toolcache, fetched from the tag of its version |
+| Miniconda | Miniconda End User License Agreement | `/usr/share/miniconda/LICENSE.txt`, where its installer puts it |
+| Packer | Business Source License 1.1 | `/usr/local/bin/LICENSE.txt`, where its zip puts it |
+
+A package installed with apt carries its copyright and license in `/usr/share/doc/<package>/copyright`, billet's own third-party notices are in `/opt/billet/THIRD_PARTY_NOTICES`, and the container hook's are beside it in `/usr/local/lib/billet/container-hook/`. The publication gate refuses an image that carries one of these tools without its license, or without the notices file naming it.
+
+The same file records two settings each deployment should know about. `ACCEPT_EULA=Y` is set for every job, as on GitHub's hosted runners, so a package that asks for its license to be accepted when it installs is accepted on the job's behalf. And Anaconda's terms of service govern its own package repository, the `defaults` channel conda uses unless told otherwise; read them before an organisation uses it.
 
 ## Where images come from
 
