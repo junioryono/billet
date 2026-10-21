@@ -35,28 +35,28 @@ func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Ne
 	needs = append(needs,
 		unitpath.Need{Path: DefaultStagingDir, Access: unitpath.Private,
 			Why: "where a pull stages and decompresses the image's parts"},
-		unitpath.Need{Path: kernels, Access: unitpath.Write,
+		unitpath.Need{Path: kernels, Access: unitpath.Write, Create: true,
 			Why: "where a pull installs the kernel paired with the image"},
 		unitpath.Need{Path: kernelLockPath(kernels), Access: unitpath.Lock,
 			Why: "the lock around every change to the kernel directory",
-			Take: func(ctx context.Context) error {
+			Take: func(ctx context.Context) (func() error, error) {
 				ctx, cancel := context.WithTimeout(ctx, unitPathLockWait)
 				defer cancel()
 
 				lock, err := takeKernelDirLock(ctx, env, kernels, "exercise this unit's paths")
 				if errors.Is(err, errKernelLockBusy) {
-					return nil
+					return nil, nil
 				}
 
 				if err != nil {
-					return err
+					return nil, err
 				}
 
-				return lock.release()
+				return nil, lock.release()
 			}},
 		unitpath.Need{Path: cfg.Node.Firecracker.ChrootBase, Access: unitpath.Write,
 			Why: "the jailer's chroot base, where the verification boots its probe"},
-		unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write,
+		unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true,
 			Why: "where a node with no certificate keeps its deployment identity"},
 		probeLockNeed(cfg))
 
@@ -70,22 +70,22 @@ func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Ne
 func probeLockNeed(cfg *config.Config) unitpath.Need {
 	need := unitpath.Need{Access: unitpath.Lock,
 		Why: "the lock that keeps two verifications from being one microVM",
-		Take: func(context.Context) error {
+		Take: func(context.Context) (func() error, error) {
 			deployment, err := verifyDeploymentID(cfg)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			lock, err := takeProbeLock(cfg.Node.LockDir, deployment)
 			if errors.Is(err, errProbeLockContended) {
-				return nil
+				return nil, nil
 			}
 
 			if err != nil {
-				return err
+				return nil, err
 			}
 
-			return lock.release()
+			return nil, lock.release()
 		}}
 
 	deployment, known, err := app.PeekNodeDeploymentID(cfg)

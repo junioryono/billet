@@ -37,7 +37,9 @@ func TestEveryStrictUnitDeclaresItsPaths(t *testing.T) {
 
 		if strings.Contains("\n"+string(body), "\nProtectSystem=strict\n") {
 			strict = append(strict, filepath.Base(file))
-			root[filepath.Base(file)] = strings.Contains("\n"+string(body), "\nUser=root\n")
+			// A UNIT THAT NAMES NO User= RUNS AS ROOT.
+			text := "\n" + string(body)
+			root[filepath.Base(file)] = strings.Contains(text, "\nUser=root\n") || !strings.Contains(text, "\nUser=")
 		}
 	}
 
@@ -106,7 +108,7 @@ func TestTheNodeLockIsTheFileTheNodeLocks(t *testing.T) {
 		t.Fatalf("a host with no identity reported its lock as %s", before.Path)
 	}
 
-	if err := unitpath.Exercise(t.Context(), before, ""); err != nil {
+	if _, err := unitpath.Exercise(t.Context(), before, ""); err != nil {
 		t.Fatalf("the node's own claim could not be exercised: %v", err)
 	}
 
@@ -162,7 +164,7 @@ func TestAnUnplacedNodeLockIsARefusal(t *testing.T) {
 			continue
 		}
 
-		if err := unitpath.Exercise(t.Context(), n, ""); err == nil || !strings.Contains(err.Error(), "could not be placed") {
+		if _, err := unitpath.Exercise(t.Context(), n, ""); err == nil || !strings.Contains(err.Error(), "could not be placed") {
 			t.Errorf("an unplaced lock was exercised as %v", err)
 		}
 

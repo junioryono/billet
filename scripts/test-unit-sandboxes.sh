@@ -22,10 +22,11 @@
 # runs it. It needs privileged docker and the package `make dist` builds, which
 # is why it is outside `make check`.
 #
-# BILLET_UNIT_SANDBOX_UNIT_DIR names a directory of unit files installed over
-# the package's before anything starts: how the gate is shown to fail, by
-# handing it a unit with #169's or #176's fix reverted. BILLET_UNIT_SANDBOX_NAME
-# names the container (default billet-unit-sandboxes).
+# IT IS SHOWN TO FAIL EVERY RUN: after the shipped units pass, the same
+# container installs billet-images-refresh.service with #169's, #175's and
+# #176's fixes reverted, one at a time, and requires each to be refused.
+# BILLET_UNIT_SANDBOX_NAME names the container (default
+# billet-unit-sandboxes-<pid>).
 set -eu
 
 if [ "$(uname -s)" != Linux ]; then
@@ -57,7 +58,6 @@ if [ "${deb_count}" -ne 1 ]; then
 fi
 
 name=${BILLET_UNIT_SANDBOX_NAME:-billet-unit-sandboxes-$$}
-replacements=${BILLET_UNIT_SANDBOX_UNIT_DIR:-}
 
 # ONLY THE CONTAINER THIS RUN CREATED IS REMOVED, by the id `docker run`
 # answered: a name another run already holds fails the run below and is left
@@ -108,8 +108,5 @@ esac
 
 docker cp "${deb_path}" "${name}":/tmp/billet.deb
 docker cp "$(pwd)/scripts/unit-sandboxes.sh" "${name}":/tmp/unit-sandboxes.sh
-if [ -n "${replacements}" ]; then
-    docker cp "${replacements}/." "${name}":/tmp/replacement-units/
-fi
 
 docker exec "${name}" sh /tmp/unit-sandboxes.sh

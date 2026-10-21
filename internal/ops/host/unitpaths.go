@@ -129,7 +129,7 @@ func cmdLocalUnitPaths(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	needs := declared.paths(env, cfg, *cfgPath)
+	needs := unitpath.Unique(declared.paths(env, cfg, *cfgPath))
 
 	if *exercise {
 		return exerciseUnitPaths(ctx, env, unit, needs, *marker)
@@ -158,23 +158,20 @@ func cmdLocalUnitPaths(ctx context.Context, env cli.Env, args []string) error {
 	return nil
 }
 
+
 // exerciseUnitPaths performs every need and refuses if the sandbox refused any.
 func exerciseUnitPaths(ctx context.Context, env cli.Env, unit string, needs []unitpath.Need, marker string) error {
-	var refused []string
-
-	for _, n := range needs {
-		if err := unitpath.Exercise(ctx, n, marker); err != nil {
+	err := unitpath.ExerciseAll(ctx, needs, marker, func(n unitpath.Need, err error) {
+		if err != nil {
 			fmt.Fprintf(env.Stdout, "REFUSED  %-8s %s: %v\n", n.Access, n.Path, err)
-			refused = append(refused, n.Path)
 
-			continue
+			return
 		}
 
 		fmt.Fprintf(env.Stdout, "ok       %-8s %s\n", n.Access, n.Path)
-	}
-
-	if len(refused) > 0 {
-		return fmt.Errorf("%s's command could not reach %s here", unit, strings.Join(refused, ", "))
+	})
+	if err != nil {
+		return fmt.Errorf("%s's command could not reach what it needs here: %w", unit, err)
 	}
 
 	return nil
@@ -192,25 +189,20 @@ func nodePaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
 		return needs
 	}
 
-	needs = append(needs, unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write,
+	needs = append(needs, unitpath.Need{Path: cfg.Node.StateDir, Access: unitpath.Write, Create: true,
 		Why: "the node's identity and the record of how each of its processes ended"})
 
 	if tls := cfg.Node.TLS; tls != nil {
-		var dirs []string
-
 		for _, path := range []string{tls.CertPath, tls.KeyPath, tls.CAPath} {
 			needs = append(needs, unitpath.Need{Path: path, Access: unitpath.Read,
 				Why: "the node's certificate bundle"})
-
-			if dir := filepath.Dir(path); !slices.Contains(dirs, dir) {
-				dirs = append(dirs, dir)
-			}
 		}
 
 		// RENEWAL REPLACES EACH FILE BESIDE ITSELF, so every directory the bundle
-		// is in is written, however the configuration spreads it.
-		for _, dir := range dirs {
-			needs = append(needs, unitpath.Need{Path: dir, Access: unitpath.Write,
+		// is in is written, however the configuration spreads it; one the state
+		// directory already is collapses into it (unitpath.Unique).
+		for _, path := range []string{tls.CertPath, tls.KeyPath, tls.CAPath} {
+			needs = append(needs, unitpath.Need{Path: filepath.Dir(path), Access: unitpath.Write,
 				Why: "where certificate renewal installs a new key, leaf or CA"})
 		}
 	}
@@ -225,7 +217,7 @@ func nodePaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
 			Why: "the jailer's chroot base, where every guest runs"})
 	}
 
-	return needs
+	return unitpath.Unique(needs)
 }
 
 // nodeLockNeed is the host-wide lock on the node's identity, where
@@ -239,26 +231,26 @@ func nodePaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
 func nodeLockNeed(cfg *config.Config) unitpath.Need {
 	need := unitpath.Need{Access: unitpath.Lock,
 		Why: "the host-wide lock that keeps two billets with one identity off the same compute",
-		Take: func(context.Context) error {
+		Take: func(context.Context) (func() error, error) {
 			bundle, err := app.NodeBundle(cfg)
 			if err != nil {
-				return fmt.Errorf("the node would not load its certificate bundle: %w", err)
+				return nil, fmt.Errorf("the node would not load its certificate bundle: %w", err)
 			}
 
 			_, lock, err := app.ClaimNodeDeployment(cfg, bundle)
 			if errors.Is(err, state.ErrDeploymentLocked) {
-				return nil
+				return nil, nil
 			}
 
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			if why := lock.Degraded(); why != "" {
-				return errors.Join(fmt.Errorf("the lock could not be placed: %s", why), lock.Release())
+				return nil, errors.Join(fmt.Errorf("the lock could not be placed: %s", why), lock.Release())
 			}
 
-			return lock.Release()
+			return nil, lock.Release()
 		}}
 
 	deployment, known, err := app.PeekNodeDeploymentID(cfg)
@@ -283,15 +275,17 @@ func nodeLockNeed(cfg *config.Config) unitpath.Need {
 	return need
 }
 
-// serverPaths is what `billet server` touches: its configuration, the App keys
-// it signs with, its identity directory (the ledger and the node-wire
-// authority), the authority exclusion it takes around every authority read
-// (hostauthority.ServerWireAccess: the global lock beside the directory and the
-// directory's own), and the directory's exclusive lock, beside the deployment
-// identity the server founds on its first open and a node on the same host
-// claims.
+// serverPaths is what `billet server` touches, in the order it touches it: its
+// configuration and App keys; the authority exclusion it takes before any
+// identity access (hostauthority.ServerAccess: the global lock beside the
+// directory and the directory's own), HELD while the rest is exercised, and
+// admitting it, as the server holds it across its first open; then the
+// identity directory (the ledger and the node-wire authority), and the
+// directory's exclusive lock beside the deployment identity the server founds
+// on its first open and a node on the same host claims. Refused, the exclusion
+// leaves the identity directory untouched.
 func serverPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
-	needs := identityPaths(env, cfg, cfgPath)
+	needs := configPaths(cfg, cfgPath)
 
 	if cfg.Server == nil {
 		return needs
@@ -300,82 +294,79 @@ func serverPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Nee
 	dir := cfg.Server.IdentityDir
 
 	return append(needs,
-		unitpath.Need{Path: retirement.GlobalLockPath(), Access: unitpath.Lock,
-			Why: "the authority exclusion the control plane takes around every authority read",
-			Take: func(ctx context.Context) error {
+		unitpath.Need{Path: retirement.GlobalLockPath(), Access: unitpath.Lock, Admits: true,
+			Why: "the authority exclusion the control plane takes before it touches its identity",
+			Take: func(ctx context.Context) (func() error, error) {
 				ctx, cancel := context.WithTimeout(ctx, unitPathLockWait)
 				defer cancel()
 
-				release, err := hostauthority.ServerWireAccess(ctx, dir)
+				acc, err := hostauthority.ServerAccess(ctx, dir)
 				if err != nil {
-					return err
+					return nil, err
 				}
 
-				return release()
+				return acc.Release, nil
 			}},
+		unitpath.Need{Path: dir, Access: unitpath.Write,
+			Why: "the ledger and the node-wire authority"},
 		unitpath.Need{Path: state.DirectoryLockPath(dir), Access: unitpath.Lock,
 			Why: "the exclusive lock the control plane holds on its directory, beside the identity it founds",
-			Take: func(context.Context) error {
+			Take: func(context.Context) (func() error, error) {
 				if _, err := state.DeploymentID(dir); err != nil {
-					return err
+					return nil, err
 				}
 
 				lock, err := state.LockStateDir(dir)
 				if errors.Is(err, state.ErrLocked) {
-					return nil
+					return nil, nil
 				}
 
 				if err != nil {
-					return err
+					return nil, err
 				}
 
-				return lock.Release()
+				return nil, lock.Release()
 			}})
 }
 
-// identityPaths is what the server and the backup both read and write: the
-// configuration, the App keys, and the identity directory.
-func identityPaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
+// configPaths is what the server and the backup both read: the configuration
+// and the App keys.
+func configPaths(cfg *config.Config, cfgPath string) []unitpath.Need {
 	needs := []unitpath.Need{{Path: cfgPath, Access: unitpath.Read, Why: "the configuration"}}
 
 	for _, key := range app.KeyFilePaths(cfg) {
 		needs = append(needs, unitpath.Need{Path: key, Access: unitpath.Read, Why: "a GitHub App private key"})
 	}
 
-	if cfg.Server != nil {
-		needs = append(needs, unitpath.Need{Path: cfg.Server.IdentityDir, Access: unitpath.Write,
-			Why: "the ledger and the node-wire authority"})
-	}
-
 	return needs
 }
 
-// backupPaths is what the packaged `billet local backup` run touches: the
-// identity directory it copies, the directory its ExecStart writes each
-// archive into, and the authority exclusion it holds while it copies
-// (hostauthority.Open: the global lock beside the directory and the
-// directory's own). Not the control plane's exclusive lock: a backup runs
-// beside a live one.
-func backupPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
-	needs := identityPaths(env, cfg, cfgPath)
-
-	needs = append(needs, unitpath.Need{Path: localBackupDir, Access: unitpath.Write,
-		Why: "where the packaged unit writes each archive"})
+// backupPaths is what the packaged `billet local backup` run touches, in its
+// order: the configuration and App keys, the authority exclusion it holds
+// while it copies (hostauthority.Open: the global lock beside the directory and
+// the directory's own), held and admitting the rest, then the identity
+// directory it copies and the directory its ExecStart writes each archive
+// into. Not the control plane's exclusive lock: a backup runs beside a live one.
+func backupPaths(_ cli.Env, cfg *config.Config, cfgPath string) []unitpath.Need {
+	needs := configPaths(cfg, cfgPath)
 
 	if cfg.Server != nil {
 		dir := cfg.Server.IdentityDir
 
-		needs = append(needs, unitpath.Need{Path: retirement.GlobalLockPath(), Access: unitpath.Lock,
-			Why: "the authority exclusion a backup holds while it copies",
-			Take: func(ctx context.Context) error {
-				acc, err := hostauthority.Open(ctx, dir, hostauthority.Intent{Wait: unitPathLockWait})
-				if err != nil {
-					return err
-				}
+		needs = append(needs,
+			unitpath.Need{Path: retirement.GlobalLockPath(), Access: unitpath.Lock, Admits: true,
+				Why: "the authority exclusion a backup holds while it copies",
+				Take: func(ctx context.Context) (func() error, error) {
+					acc, err := hostauthority.Open(ctx, dir, hostauthority.Intent{Wait: unitPathLockWait})
+					if err != nil {
+						return nil, err
+					}
 
-				return acc.ReleaseWithoutHandBack()
-			}})
+					return acc.ReleaseWithoutHandBack, nil
+				}},
+			unitpath.Need{Path: dir, Access: unitpath.Write, Why: "the ledger and the node-wire authority it copies"})
 	}
 
-	return needs
+	return append(needs, unitpath.Need{Path: localBackupDir, Access: unitpath.Write,
+		Why: "where the packaged unit writes each archive"})
 }

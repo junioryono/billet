@@ -364,6 +364,18 @@ linters:
             - github.com/junioryono/billet/internal/durablefile$
             - github.com/junioryono/billet/internal/regularfile$
 
+        # THE WORDS A COMMAND DECLARES ITS HOST PATHS IN (#174), which every
+        # command family and the host family's `local unit-paths` share: a leaf,
+        # so a declaration can be imported by any family without importing
+        # another's. The standard library and the one open of a file by name.
+        unitpath:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/unitpath/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/regularfile$
+
         # THE ASSEMBLY IS IMPORTED BY WHAT INVOKES IT, AND NOTHING IT ASSEMBLES.
         # internal/app builds the control plane and the node from a config, so a
         # package below it that imported it would import every role; the binary

@@ -10,6 +10,10 @@ import (
 )
 
 func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a 0555 directory, so the refusal this stages needs an unprivileged run")
+	}
+
 	dir := t.TempDir()
 
 	config := filepath.Join(dir, "billet.yaml")
@@ -22,10 +26,6 @@ func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if os.Geteuid() == 0 {
-		t.Skip("root writes a 0555 directory, so the refusal this stages needs an unprivileged run")
-	}
-
 	taken := false
 
 	for _, tc := range []struct {
@@ -36,21 +36,22 @@ func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
 	}{
 		{"a file it reads", Need{Path: config, Access: Read}, "", ""},
 		{"a file that is not there", Need{Path: filepath.Join(dir, "absent"), Access: Read}, "", "read"},
-		{"a directory it writes", Need{Path: filepath.Join(dir, "kernels"), Access: Write}, "billet-unit-paths-gate", ""},
+		{"a directory it creates and writes", Need{Path: filepath.Join(dir, "kernels"), Access: Write, Create: true}, "billet-unit-paths-gate", ""},
+		{"a directory it does not create, absent", Need{Path: filepath.Join(dir, "identity"), Access: Write}, "billet-unit-paths-gate", "write in"},
 		{"a directory it cannot write", Need{Path: readOnly, Access: Write}, "billet-unit-paths-gate", "write in"},
 		{"its private staging", Need{Path: filepath.Join(dir, "tmp", "billet-images"), Access: Private}, "", ""},
-		{"a lock it takes", Need{Path: filepath.Join(dir, "x.lock"), Access: Lock, Take: func(context.Context) error {
+		{"a lock it takes", Need{Path: filepath.Join(dir, "x.lock"), Access: Lock, Take: func(context.Context) (func() error, error) {
 			taken = true
 
-			return nil
+			return nil, nil
 		}}, "", ""},
-		{"a lock it cannot take", Need{Path: filepath.Join(dir, "y.lock"), Access: Lock, Take: func(context.Context) error {
-			return errors.New("read-only file system")
+		{"a lock it cannot take", Need{Path: filepath.Join(dir, "y.lock"), Access: Lock, Take: func(context.Context) (func() error, error) {
+			return nil, errors.New("read-only file system")
 		}}, "", "read-only file system"},
 		{"a lock with no way to take it", Need{Path: filepath.Join(dir, "z.lock"), Access: Lock}, "", "declares no way"},
-		{"a path it could not derive", Need{Path: dir, Access: Lock, Unknown: "no identity yet"}, "", "no identity yet"},
+		{"a path it could not derive", Need{Path: dir, Access: Write, Unknown: "no identity yet"}, "", "no identity yet"},
 	} {
-		err := Exercise(t.Context(), tc.need, tc.marker)
+		_, err := Exercise(t.Context(), tc.need, tc.marker)
 
 		switch {
 		case tc.want == "" && err != nil:
@@ -68,13 +69,101 @@ func TestExercisePerformsEachAccessAndRefusesWhatItCannotDo(t *testing.T) {
 		t.Errorf("the named marker was not left where the write landed: %v", err)
 	}
 
+	// A DIRECTORY THE COMMAND DOES NOT CREATE IS NOT CREATED by its exercise: an
+	// identity directory a retirement moved stays moved.
+	if _, err := os.Stat(filepath.Join(dir, "identity")); !os.IsNotExist(err) {
+		t.Errorf("an exercise created a directory its command does not create (%v)", err)
+	}
+
 	entries, err := os.ReadDir(filepath.Join(dir, "tmp", "billet-images"))
 	if err != nil || len(entries) != 0 {
 		t.Errorf("an unnamed marker was left behind (%v): %v", err, entries)
 	}
 
-	if err := Exercise(t.Context(), Need{Path: dir, Access: Lock, Unknown: "x"}, ""); !errors.Is(err, ErrUnknown) {
+	if _, err := Exercise(t.Context(), Need{Path: dir, Access: Lock, Unknown: "x"}, ""); !errors.Is(err, ErrUnknown) {
 		t.Errorf("an underived path is not ErrUnknown: %v", err)
+	}
+}
+
+// A LOCK THE COMMAND HOLDS ACROSS ITS WORK IS HELD ACROSS THE EXERCISE OF IT,
+// released last and in reverse; and an exclusion that is refused admits nothing
+// after it.
+func TestExerciseAllHoldsWhatAdmitsTheRestAndStopsWhenRefused(t *testing.T) {
+	dir := t.TempDir()
+
+	var events []string
+
+	hold := func(name string) func(context.Context) (func() error, error) {
+		return func(context.Context) (func() error, error) {
+			events = append(events, "take "+name)
+
+			return func() error {
+				events = append(events, "release "+name)
+
+				return nil
+			}, nil
+		}
+	}
+
+	needs := []Need{
+		{Path: "authority", Access: Lock, Admits: true, Take: hold("authority")},
+		{Path: "inner", Access: Lock, Take: hold("inner")},
+		{Path: dir, Access: Write, Take: nil},
+	}
+
+	var reported []string
+
+	err := ExerciseAll(t.Context(), needs, "billet-unit-paths-gate", func(n Need, err error) {
+		reported = append(reported, n.Path)
+		if n.Access == Write {
+			events = append(events, "write")
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := strings.Join(events, ", "); got != "take authority, take inner, write, release inner, release authority" {
+		t.Errorf("the exercise ran %s", got)
+	}
+
+	if len(reported) != 3 {
+		t.Errorf("reported %v", reported)
+	}
+
+	// REFUSED, THE EXCLUSION ADMITS NOTHING: the directory it guards is not
+	// written, and the refusal says why.
+	guarded := filepath.Join(dir, "guarded")
+	if err := os.Mkdir(guarded, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err = ExerciseAll(t.Context(), []Need{
+		{Path: "authority", Access: Lock, Admits: true, Take: func(context.Context) (func() error, error) {
+			return nil, errors.New("the authority is closed")
+		}},
+		{Path: guarded, Access: Write},
+	}, "billet-unit-paths-gate", func(Need, error) {})
+
+	if !errors.Is(err, ErrNotAdmitted) || !strings.Contains(err.Error(), "the authority is closed") {
+		t.Errorf("a refused exclusion answered %v", err)
+	}
+
+	if entries, _ := os.ReadDir(guarded); len(entries) != 0 {
+		t.Errorf("a directory behind a refused exclusion was written: %v", entries)
+	}
+}
+
+func TestUniqueKeepsTheFirstOfEachPathAndAccess(t *testing.T) {
+	got := Unique([]Need{
+		{Path: "/var/lib/billet/node", Access: Write, Create: true},
+		{Path: "/etc/billet/tls/node.crt", Access: Read},
+		{Path: "/var/lib/billet/node", Access: Write},
+		{Path: "/var/lib/billet/node", Access: Read},
+	})
+
+	if len(got) != 3 || !got[0].Create || got[2].Access != Read {
+		t.Errorf("Unique answered %+v", got)
 	}
 }
 
@@ -98,7 +187,7 @@ func TestAMarkerWritesOverNothing(t *testing.T) {
 	}
 
 	for _, marker := range []string{"billet-unit-paths-gate", "billet-unit-paths-linked", "billet.db", "../billet-unit-paths-x"} {
-		if err := Exercise(t.Context(), Need{Path: dir, Access: Write}, marker); err == nil {
+		if _, err := Exercise(t.Context(), Need{Path: dir, Access: Write}, marker); err == nil {
 			t.Errorf("the marker %q was written", marker)
 		}
 	}

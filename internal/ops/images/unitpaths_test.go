@@ -74,7 +74,7 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 
 	for _, n := range needs {
 		if n.Access == unitpath.Lock {
-			if err := unitpath.Exercise(t.Context(), n, ""); err != nil {
+			if _, err := unitpath.Exercise(t.Context(), n, ""); err != nil {
 				t.Fatalf("the pull's own lock could not be taken: %v", err)
 			}
 		}

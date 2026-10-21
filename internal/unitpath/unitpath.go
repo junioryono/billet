@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -35,14 +36,15 @@ const (
 	// Write is a directory the command creates entries in.
 	Write Access = "write"
 	// Private is a directory in the unit's own private /tmp or /var/tmp
-	// (PrivateTmp=true): the command writes there, and nothing it writes may
-	// reach the host's.
+	// (PrivateTmp=true): the command creates it and writes there, and nothing it
+	// writes may reach the host's.
 	Private Access = "private"
 	// Lock is a lock the command takes, which Take performs as the command does.
 	Lock Access = "lock"
 )
 
-// Need is one path a command needs, and how.
+// Need is one path a command needs, and how. A command's needs are exercised in
+// the order it declares them, which is the order it touches them.
 type Need struct {
 	Path   string `json:"path"`
 	Access Access `json:"access"`
@@ -52,56 +54,130 @@ type Need struct {
 	// named for a deployment identity the host has not minted yet. Path is then
 	// the directory the name would be in.
 	Unknown string `json:"unknown,omitempty"`
-	// Take performs a Lock's acquisition and release the way the command does,
-	// answering nil when the lock is held by another process: the path was
-	// reached and the lock is real, which is what a sandbox is asked.
-	Take func(ctx context.Context) error `json:"-"`
+	// Create says the command creates a Write directory when it is absent. A
+	// directory it does not create (a state directory systemd makes, or one an
+	// authority exclusion forbids recreating) must already be there, and an
+	// exercise never makes one.
+	Create bool `json:"create,omitempty"`
+	// Admits says the needs after this one are what the command does only once
+	// this one is held: an authority exclusion before the directory it guards.
+	// When it is refused, nothing after it is tried.
+	Admits bool `json:"admits,omitempty"`
+	// Take performs a Lock's acquisition the way the command does. It answers
+	// the lock's release, called once every need after it has been exercised,
+	// so a lock the command holds across its work is held across the exercise of
+	// that work; or nil, with nothing held, when another process holds the lock:
+	// the path was reached and the lock is real, which is what a sandbox is asked.
+	Take func(ctx context.Context) (release func() error, err error) `json:"-"`
 }
 
 // ErrUnknown is an exercise of a need whose path could not be derived.
 var ErrUnknown = errors.New("the path could not be derived on this host")
 
-// Exercise performs a need's access. A writable directory is given a file named
-// marker, left there so a caller outside the sandbox can see where the write
-// landed; with no marker the file is created and removed. A directory a command
-// creates (a private one, or a write one that is absent) is created first, as
-// the command creates it. A lock the report could not name is still taken: its
+// ErrNotAdmitted is a need not tried because a need it depends on was refused.
+var ErrNotAdmitted = errors.New("not tried: the exclusion before it was refused")
+
+// Unique is needs with every repeated path and access dropped, the first kept:
+// a directory two declarations name (a certificate kept in the state directory)
+// is one directory, written once.
+func Unique(needs []Need) []Need {
+	out := make([]Need, 0, len(needs))
+
+	for _, n := range needs {
+		if !slices.ContainsFunc(out, func(o Need) bool { return o.Path == n.Path && o.Access == n.Access }) {
+			out = append(out, n)
+		}
+	}
+
+	return out
+}
+
+// ExerciseAll performs every need in order, reports each to report, releases
+// whatever was held in reverse order, and answers every refusal. A refused need
+// that Admits the rest leaves them untried.
+func ExerciseAll(ctx context.Context, needs []Need, marker string, report func(Need, error)) error {
+	var (
+		releases []func() error
+		refused  []error
+		blocked  bool
+	)
+
+	for _, n := range needs {
+		if blocked {
+			report(n, ErrNotAdmitted)
+			refused = append(refused, fmt.Errorf("%s: %w", n.Path, ErrNotAdmitted))
+
+			continue
+		}
+
+		release, err := Exercise(ctx, n, marker)
+		report(n, err)
+
+		if err != nil {
+			refused = append(refused, err)
+			blocked = n.Admits
+
+			continue
+		}
+
+		if release != nil {
+			releases = append(releases, release)
+		}
+	}
+
+	for i := len(releases) - 1; i >= 0; i-- {
+		if err := releases[i](); err != nil {
+			refused = append(refused, fmt.Errorf("release: %w", err))
+		}
+	}
+
+	return errors.Join(refused...)
+}
+
+// Exercise performs a need's access and answers what it holds. A writable
+// directory is given a file named marker, left there so a caller outside the
+// sandbox can see where the write landed; with no marker the file is created
+// and removed. A directory the command creates is created first; one it does
+// not must already exist. A lock the report could not name is still taken: its
 // Take resolves the name the way the command does, minting what the command
 // would mint, which is what a fresh host's first start does too.
-func Exercise(ctx context.Context, n Need, marker string) error {
+func Exercise(ctx context.Context, n Need, marker string) (func() error, error) {
 	if n.Unknown != "" && (n.Access != Lock || n.Take == nil) {
-		return fmt.Errorf("%s: %w: %s", n.Path, ErrUnknown, n.Unknown)
+		return nil, fmt.Errorf("%s: %w: %s", n.Path, ErrUnknown, n.Unknown)
 	}
 
 	switch n.Access {
 	case Read:
 		f, _, err := regularfile.Open(n.Path, regularfile.Options{})
 		if err != nil {
-			return fmt.Errorf("read %s: %w", n.Path, err)
+			return nil, fmt.Errorf("read %s: %w", n.Path, err)
 		}
 
-		return f.Close()
+		return nil, f.Close()
 
 	case Write, Private:
-		if err := os.MkdirAll(n.Path, 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", n.Path, err)
+		if n.Access == Private || n.Create {
+			if err := os.MkdirAll(n.Path, 0o755); err != nil {
+				return nil, fmt.Errorf("create %s: %w", n.Path, err)
+			}
 		}
 
-		return writeMarker(n.Path, marker)
+		return nil, writeMarker(n.Path, marker)
 
 	case Lock:
 		if n.Take == nil {
-			return fmt.Errorf("lock %s: the command declares no way to take it", n.Path)
+			return nil, fmt.Errorf("lock %s: the command declares no way to take it", n.Path)
 		}
 
-		if err := n.Take(ctx); err != nil {
-			return fmt.Errorf("lock %s: %w", n.Path, err)
+		release, err := n.Take(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("lock %s: %w", n.Path, err)
 		}
 
-		return nil
+		return release, nil
 
 	default:
-		return fmt.Errorf("%s: unknown access %q", n.Path, n.Access)
+		return nil, fmt.Errorf("%s: unknown access %q", n.Path, n.Access)
 	}
 }
 
