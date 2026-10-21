@@ -2,7 +2,7 @@
 
 One scale-set listener per tier and the scheduler: sessions and messages against GitHub, escrow, the pool, heartbeats, cleanup and drains. Load `billet-capacity` and `billet-github-protocol` before changing anything here.
 
-- Capacity is bought only when a runner starts: per offer, per pool launch, and per unpromised assignment. Every purchase asks the admission order (`mayBuy`); the advertisement is never gated.
+- Capacity is bought only when a runner starts: per offer, per pool launch, and per unpromised assignment. Every purchase asks the admission order (`mayBuy`), and so does a remote fallback growing a lease (`ResizeAdmission`, through the node plane's resize route); the advertisement is never gated.
 - Exactly one party renews a lease, and a heartbeat pass's budget starts after it holds the mutex.
 - A timer never authorises a teardown, and only the force operation destroys running work (`TestOnlyTheForceOperationDestroysRunningWork`).
 - A failed session is reopened in place; the tier keeps what it holds.

@@ -83,15 +83,22 @@ func dialledHost(key, addr string) (string, error) {
 	return host, nil
 }
 
-// wireOption adjusts how serveNodeWire builds its listeners.
-type wireOption func(*wireLimits)
+// wireOption adjusts how serveNodeWire builds its listeners and routes.
+type wireOption func(*wireSettings)
 
-// wireLimits are the two connection budgets, which are separate on purpose — an
+// wireSettings are the two connection budgets, which are separate on purpose — an
 // anonymous caller occupies the enrollment listener's and can never occupy the
-// node wire's — plus how long a connection may take to prove itself.
-type wireLimits struct {
+// node wire's — plus how long a connection may take to prove itself, and what
+// answers the resize route when it is not the lease store.
+type wireSettings struct {
 	operational, bootstrap int
 	handshake              time.Duration
+	resizer                nodeplane.Resizer
+}
+
+// withResizer answers the resize route with r (nodeplane.WithResizer).
+func withResizer(r nodeplane.Resizer) wireOption {
+	return func(s *wireSettings) { s.resizer = r }
 }
 
 // withConnectionLimits is for tests, which need both budgets SMALL AND EQUAL.
@@ -99,7 +106,7 @@ type wireLimits struct {
 // the enrollment listener's 64 leaves 448 of a shared 512, so the node wire is
 // served either way and the assertion proves only that 64 is a bound.
 func withConnectionLimits(operational, bootstrap int) wireOption {
-	return func(l *wireLimits) { l.operational, l.bootstrap = operational, bootstrap }
+	return func(l *wireSettings) { l.operational, l.bootstrap = operational, bootstrap }
 }
 
 // withHandshakeTimeout is for tests, which otherwise have to SLEEP past the
@@ -107,7 +114,7 @@ func withConnectionLimits(operational, bootstrap int) wireOption {
 // do, and measured, that is enough added wall clock to make an already
 // load-sensitive package fail under a full -race run.
 func withHandshakeTimeout(d time.Duration) wireOption {
-	return func(l *wireLimits) { l.handshake = d }
+	return func(l *wireSettings) { l.handshake = d }
 }
 
 // stopServing drains a listener, and stops it outright if draining runs out of
@@ -199,7 +206,7 @@ func ServeNodeWire(
 	cachePolicy nodeplane.CachePolicy,
 	opts ...wireOption,
 ) (*ServedWire, error) {
-	limits := wireLimits{
+	limits := wireSettings{
 		operational: nodeWireConnectionLimit,
 		bootstrap:   bootstrapConnectionLimit,
 	}
@@ -260,6 +267,7 @@ func ServeNodeWire(
 		Revocations: revocations,
 		Enrollments: enrollments,
 		CachePolicy: cachePolicy,
+		Resizer:     limits.resizer,
 	})
 	if err := errors.Join(err, release()); err != nil {
 		return nil, err

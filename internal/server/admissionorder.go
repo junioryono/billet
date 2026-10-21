@@ -46,15 +46,18 @@ import (
 // outlived its demand would hold every other tier for as long as the control
 // plane ran — a worse outage than the starvation fairness prevents.
 //
-// WHAT IT GATES IS THE PURCHASE OF A LEASE. Every one of the listener's three
-// purchases asks it, and one thing that spends capacity does not: a remote
-// fallback resizes a lease that already exists (`alloc.Resize`) to the shape the
-// cloud actually sold, which is re-authorised against the deployment ceiling and
-// every floor but not against this queue. The order admitted that lease; the
-// resize is asked for by the node, through the node plane's resize route or the
-// in-process runtime, and the queue is handed only to listeners, so nothing on
-// that path holds it. A fallback to a larger shape can therefore take pot a
-// waiter was accumulating, which is #172 and is exempt until that says otherwise.
+// WHAT IT GATES IS EVERYTHING THAT SPENDS CAPACITY. Every one of the listener's
+// three purchases asks it, and so does a remote fallback growing a lease that
+// already exists to the larger shape the cloud sold (#172): that is a purchase
+// of the difference, and before it asked, a fallback took pot a longest-waiting
+// tier was accumulating while that tier's own purchases were refused. The
+// node asks for it through the node plane's resize route, which internal/app
+// binds to this queue through Server.ResizeAdmission once the scheduler exists;
+// it is judged as a purchase out of turn, so it is granted while each waiter
+// ahead could still be granted one lease (alloc.ResizeLeaving) and otherwise
+// fails the launch as a fallback the budget refuses does. The node runtime run
+// in process by billet's own harness calls the allocator directly and is not
+// gated; no deployment runs one.
 //
 // A TIER HOLDS THE LINE ONLY WHERE ROOM COULD REACH IT, which is #157. A tier
 // waiting on its own max_concurrent, pinned to a host that is gone, or with a

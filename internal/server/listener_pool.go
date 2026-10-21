@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -315,15 +316,21 @@ func (l *Listener) admission(ctx context.Context) alloc.TierAdmission {
 		return alloc.TierAdmission{CanGrow: true}
 	}
 
-	view, err := l.alloc.AdmissionView(ctx)
+	return admissionOf(ctx, l.alloc, l.tier, l.log)
+}
+
+// admissionOf reads one tier's admission, and a read that failed as an
+// eligible tier with an unknown host set (see Listener.admission).
+func admissionOf(ctx context.Context, a *alloc.Allocator, tier string, log *slog.Logger) alloc.TierAdmission {
+	view, err := a.AdmissionView(ctx)
 	if err != nil {
-		l.log.Warn("could not read which tiers room could reach; admitting this purchase",
-			"tier", l.tier, "error", err)
+		log.Warn("could not read which tiers room could reach; admitting this purchase",
+			"tier", tier, "error", err)
 
 		return alloc.TierAdmission{CanGrow: true}
 	}
 
-	return view[l.tier]
+	return view[tier]
 }
 
 func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {

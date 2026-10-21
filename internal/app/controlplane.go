@@ -414,7 +414,10 @@ func (c *Controller) AdoptAuthority(ctx context.Context) (AdoptedAuthority, erro
 type ServingWire struct {
 	*ServedWire
 
-	nodes    *nodeplane.Plane
+	nodes *nodeplane.Plane
+	// resizes is the resize route's gate, bound to the admission order by
+	// Schedule.
+	resizes  *resizeGate
 	servedBy *Controller
 }
 
@@ -458,13 +461,17 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 
 	nodes := nodeplane.New(slog.Default(), cp.deployment, cp.allocator.LeaseTTL(), planeOpts...)
 
+	// A FALLBACK'S LARGER SHAPE ASKS THE ADMISSION ORDER (#172), which Schedule
+	// binds to this once it has built the scheduler.
+	resizes := &resizeGate{alloc: cp.allocator}
+
 	wire, err := ServeNodeWire(ctx, cp.cfg, cp.host.ServerAccess, nodes, cp.allocator,
-		cp.planeJIT, cp.allocator, cp.allocator, cp.db)
+		cp.planeJIT, cp.allocator, cp.allocator, cp.db, withResizer(resizes.resize))
 	if err != nil {
 		return nil, err
 	}
 
-	return &ServingWire{ServedWire: wire, nodes: nodes, servedBy: c}, nil
+	return &ServingWire{ServedWire: wire, nodes: nodes, resizes: resizes, servedBy: c}, nil
 }
 
 // PublishAuthority puts the authority this host serves with into the
@@ -620,6 +627,11 @@ func (c *Controller) Schedule(
 	serverOpts = append(serverOpts, cp.steering.Server...)
 
 	plane := server.New(cp.allocator, nil, cp.cfg.Tiers, owner, slog.Default(), serverOpts...)
+
+	// AND THE WIRE'S RESIZE ROUTE ASKS ITS ADMISSION ORDER from here on (#172).
+	if wire.resizes != nil {
+		wire.resizes.order.Store(plane)
+	}
 
 	// READINESS IS REPORTED BEFORE THE LISTENERS OPEN THEIR SESSIONS, AND MOVING IT
 	// AFTER THEM WOULD BE A RESTART LOOP.

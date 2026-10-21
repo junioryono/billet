@@ -82,6 +82,9 @@ type NodeWireRequest struct {
 	Revocations nodeplane.Revocations
 	Enrollments nodeplane.Enrollments
 	CachePolicy nodeplane.CachePolicy
+	// Resizer answers the resize route in place of Leases' own Resize; nil
+	// leaves it to Leases (nodeplane.WithResizer).
+	Resizer nodeplane.Resizer
 }
 
 // BuildNodeWire assembles the authenticated node wire from a deployment's
@@ -113,6 +116,9 @@ func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 	// THE CACHE KILL SWITCH IS ON BOTH WIRES, authenticated or not: a loopback
 	// deployment can still be told to stop intercepting.
 	opts := []nodeplane.HandlerOption{nodeplane.WithCachePolicy(req.CachePolicy)}
+	if req.Resizer != nil {
+		opts = append(opts, nodeplane.WithResizer(req.Resizer))
+	}
 
 	wire := NodeWire{}
 
