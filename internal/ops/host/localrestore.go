@@ -155,7 +155,7 @@ func runLocalRestore(ctx context.Context, env cli.Env, o restoreOptions) error {
 	archiveTargets(cfg, &target)
 
 	if reachesArchiveLedger(cfg, archive) {
-		if target.Postgres, err = archiveTargetLedger(cfg); err != nil {
+		if target.Postgres, err = archiveTargetLedger(cfg, !o.abandon); err != nil {
 			return err
 		}
 	}

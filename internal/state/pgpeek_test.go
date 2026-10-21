@@ -429,6 +429,13 @@ func TestDropTablesOutsideTakesNothingOutsideThem(t *testing.T) {
 	run(`DROP TABLE "` + schema + `".a_later_migration`)
 	run(`CREATE TABLE "` + schema + `".a_later_migration (x int) PARTITION BY RANGE (x)`)
 
+	// THE PEEK A PLAN READS REPORTS IT, so a recovery is refused before it
+	// seals, fences or copies anything.
+	if led, err := PeekPostgresLedger(t.Context(), dsn); err != nil ||
+		!slices.Equal(led.Hierarchy, []string{"a_later_migration"}) {
+		t.Fatalf("PeekPostgresLedger reports hierarchy %v (%v), want [a_later_migration]", led.Hierarchy, err)
+	}
+
 	if _, err := DropTablesOutside(t.Context(), dsn, into, keep); err == nil ||
 		!strings.Contains(err.Error(), "partitioned, a partition or an inheriting") {
 		t.Fatalf("DropTablesOutside over a partitioned table = %v, want a refusal", err)

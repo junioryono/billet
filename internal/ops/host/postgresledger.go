@@ -28,8 +28,10 @@ func reachesArchiveLedger(cfg *config.Config, a *deployarchive.Archive) bool {
 }
 
 // archiveTargetLedger is the database an archive carrying a PostgreSQL dump is
-// put into.
-func archiveTargetLedger(cfg *config.Config) (deployarchive.PostgresLedger, error) {
+// put into. forward is a restore or a recovery, which writes through several
+// connections; an abandon writes at most one put-back, which pgdump.Restore
+// guards itself, and may write nothing at all.
+func archiveTargetLedger(cfg *config.Config, forward bool) (deployarchive.PostgresLedger, error) {
 	client, err := postgresClient(cfg)
 	if err != nil {
 		return nil, err
@@ -37,8 +39,10 @@ func archiveTargetLedger(cfg *config.Config) (deployarchive.PostgresLedger, erro
 
 	// ONE SERVER, refused here, before the command seals, fences or copies
 	// anything: a restore writes through several connections.
-	if err := client.SingleEndpoint(); err != nil {
-		return nil, err
+	if forward {
+		if err := client.SingleEndpoint(); err != nil {
+			return nil, err
+		}
 	}
 
 	return pgdump.Archive{Client: client}, nil

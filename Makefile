@@ -565,7 +565,7 @@ postgres-restore-rehearsal: dist ## Rehearse a restore of a deployment whose led
 # reason and because each runs for ten to twenty minutes; they are run by hand
 # against an App the operator provides, and records go to docs/reference/records/.
 .PHONY: rollout-rehearsal
-rollout-rehearsal: ## Move two packaged hosts from one PUBLISHED release to the next by rollout, then roll a bad candidate back
+rollout-rehearsal: ## Move two packaged hosts from one PUBLISHED release to the next by rollout, then refuse a candidate that cannot serve the ledger
 	@# THE ONE REHEARSAL THAT USES PUBLISHED RELEASES rather than dist: what it
 	@# proves is that the release an operator installs today can be moved to the
 	@# next one by `billet rollout start` alone. BILLET_REHEARSAL_FROM and _TO

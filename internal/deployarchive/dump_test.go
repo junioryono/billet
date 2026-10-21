@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1569,7 +1572,17 @@ func TestARecoveryResumedAfterItsAbandonSaysToFinishTheAbandon(t *testing.T) {
 // finish the recovery over; the journal's mark refuses that run, and Finish,
 // and a second abandon completes.
 func TestAForwardRunAfterAnAbandonBeganIsRefused(t *testing.T) {
-	f, ledger, tgt := interruptedRecovery(t)
+	f := newDumpFixture(t, bound)
+	ledger := f.ledgerFor(f.liveLedger())
+	tgt := recoverTarget(t, f, ledger)
+
+	// A RECOVERY THAT PUBLISHED AND WAITS FOR ITS SEAL: the state a forward run
+	// would finish, so Finish's refusal is its own and not the publication's.
+	if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	ledger.restored = nil
 
 	copyPath := supersededDumpPath(f.archive, tgt.StateDir)
 	kept := keptCopyPath(copyPath, digest(ledger.dumpBody))
@@ -1686,4 +1699,100 @@ func (d *dumpOfAnother) Dump(ctx context.Context, dest string) (LedgerDump, erro
 	out.Database, out.Facts.Schema, out.Facts.Binding = other.Database, other.Schema, other.Binding
 
 	return out, err
+}
+
+// A SCHEMA HOLDING A TABLE HIERARCHY IS REFUSED AT THE PLAN, for a restore and a
+// recovery alike: the cleanup and an abandon's put-back would both refuse it,
+// and a recovery would be left fenced over a database billet never changed.
+func TestASchemaHoldingAHierarchyIsRefusedAtThePlan(t *testing.T) {
+	f := newDumpFixture(t, bound)
+
+	pristine := state.PostgresLedger{
+		Database: dumpDatabase, Schema: dumpSchema, Tables: []string{"admission", "reports", "schema_migrations"},
+		Migrations: f.migrations, Hierarchy: []string{"reports"},
+	}
+
+	p, err := PlanRestore(t.Context(), f.archive, pgTarget(t, f.d, f.ledgerFor(pristine)))
+	if err != nil {
+		t.Fatalf("PlanRestore: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "partitioned, a partition or an inheriting")) == 0 {
+		t.Errorf("a restore into a schema holding a hierarchy was planned: %+v", p.Refusals)
+	}
+
+	// KEEPING THE DATABASE'S OWN LEDGER WRITES NOTHING THERE, so it is not
+	// refused for one.
+	own := f.restoredAs()
+	own.Hierarchy = []string{"reports"}
+
+	p, err = PlanRestore(t.Context(), f.archive, pgTarget(t, f.d, f.ledgerFor(own)))
+	if err != nil {
+		t.Fatalf("PlanRestore: %v", err)
+	}
+
+	if len(p.Refusals) > 0 || p.dispositionOf(EntryLedgerDump) != KeepLiveLedger {
+		t.Errorf("keeping a ledger beside a hierarchy planned %q with refusals %+v",
+			p.dispositionOf(EntryLedgerDump), p.Refusals)
+	}
+
+	live := f.liveLedger()
+	live.Hierarchy = []string{"reports"}
+
+	p, err = PlanRecover(t.Context(), f.archive, recoverTarget(t, f, f.ledgerFor(live)))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "partitioned, a partition or an inheriting")) == 0 {
+		t.Errorf("a recovery over a schema holding a hierarchy was planned: %+v", p.Refusals)
+	}
+}
+
+// THE ABANDON RECORDS ITSELF BEFORE ITS FIRST ACTION. Held in the source, because
+// no fake reaches a crash between the mark and the first removal: in
+// abandonLocked the journal's Abandoning mark is saved before the first
+// abandonOne and before the PostgreSQL put-back.
+func TestAnAbandonIsJournaledBeforeItsFirstAction(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "restore.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse restore.go: %v", err)
+	}
+
+	var mark, firstRemove, putBack token.Pos
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "abandonLocked" {
+			continue
+		}
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.AssignStmt:
+				if sel, ok := n.Lhs[0].(*ast.SelectorExpr); ok && sel.Sel.Name == "Abandoning" && mark == token.NoPos {
+					mark = n.Pos()
+				}
+			case *ast.CallExpr:
+				if id, ok := n.Fun.(*ast.Ident); ok {
+					switch {
+					case id.Name == "abandonOne" && firstRemove == token.NoPos:
+						firstRemove = n.Pos()
+					case id.Name == "putSupersededDumpBack" && putBack == token.NoPos:
+						putBack = n.Pos()
+					}
+				}
+			}
+
+			return true
+		})
+	}
+
+	switch {
+	case mark == token.NoPos || firstRemove == token.NoPos || putBack == token.NoPos:
+		t.Fatalf("abandonLocked no longer has the mark (%v), abandonOne (%v) and the put-back (%v) "+
+			"this test holds in order", mark, firstRemove, putBack)
+	case mark > firstRemove || mark > putBack:
+		t.Fatal("abandonLocked acts before it journals that an abandon has begun")
+	}
 }

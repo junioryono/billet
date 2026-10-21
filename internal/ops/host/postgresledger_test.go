@@ -52,13 +52,19 @@ tiers:
 	t.Setenv("BILLET_TEST_SEVERAL_DSN",
 		"postgres://billet:pw@pg1.internal:5432,pg2.internal:5432/billet?sslmode=disable")
 
-	if _, err := archiveTargetLedger(cfg); err == nil || !strings.Contains(err.Error(), "more than one server") {
+	if _, err := archiveTargetLedger(cfg, true); err == nil || !strings.Contains(err.Error(), "more than one server") {
 		t.Fatalf("archiveTargetLedger through two servers = %v, want a refusal", err)
+	}
+
+	// AN ABANDON IS NOT REFUSED FOR IT: it writes at most one put-back, which
+	// pgdump.Restore guards itself, and a restore's abandon writes nothing.
+	if _, err := archiveTargetLedger(cfg, false); err != nil {
+		t.Fatalf("archiveTargetLedger for an abandon through two servers: %v", err)
 	}
 
 	t.Setenv("BILLET_TEST_SEVERAL_DSN", "postgres://billet:pw@pg1.internal:5432/billet?sslmode=disable")
 
-	if _, err := archiveTargetLedger(cfg); err != nil {
+	if _, err := archiveTargetLedger(cfg, true); err != nil {
 		t.Fatalf("archiveTargetLedger through one server: %v", err)
 	}
 }

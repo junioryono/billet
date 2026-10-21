@@ -147,7 +147,7 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 	archiveTargets(cfg, &target)
 
 	if reachesArchiveLedger(cfg, archive) {
-		if target.Postgres, err = archiveTargetLedger(cfg); err != nil {
+		if target.Postgres, err = archiveTargetLedger(cfg, !o.abandon); err != nil {
 			return err
 		}
 	}
@@ -367,13 +367,6 @@ func recoveryStageOf(stateDir string, a *deployarchive.Archive) (recoveryStage, 
 	// quiesce on the strength of somebody else's work.
 	if !prog.IsFor(a) || !prog.IsFrom(deployarchive.ReplaceLedger) {
 		return recoverFresh, nil
-	}
-
-	// AN ABANDON THAT HAS BEGUN is the only way on: going forward would seal and
-	// open a ledger the abandon may already have put back.
-	if prog.Abandoning {
-		return recoverFresh, errors.New("an abandon of this recovery has already begun undoing " +
-			"it; run `billet local recover --abandon` again to finish it")
 	}
 
 	// THE FENCE IS NOT CONSULTED HERE, deliberately. A published recovery is

@@ -150,6 +150,8 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	// served nothing a recovery could put back.
 	if p.Intent == ReplaceLedger {
 		switch {
+		case p.refuseHierarchy(led):
+			return nil
 		case slices.ContainsFunc(led.Tables, func(t string) bool { return strings.ContainsFunc(t, unicode.IsSpace) }):
 			// REFUSED BEFORE THE QUIESCE AND THE FENCE: the copy this recovery takes
 			// of the ledger it replaces could not be restored, so an abandon could
@@ -256,11 +258,36 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 			Remedy: "pg_restore would leave that billet's newer tables beside the restored ledger; " +
 				"empty the schema and run this again",
 		})
+	case p.refuseHierarchy(led):
 	default:
 		p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: ReplaceEmptyLedger})
 	}
 
 	return nil
+}
+
+// refuseHierarchy refuses, and reports that it did, a schema holding a table
+// hierarchy, for the dispositions that replace the ledger in it.
+//
+// REFUSED AT THE PLAN, before a recovery seals, fences or copies anything: the
+// cleanup refuses a hierarchy anywhere in the schema, and so would an abandon's
+// put-back, which would leave the deployment fenced over a database billet never
+// changed. A restore that keeps the database's own ledger writes nothing there
+// and is not refused.
+func (p *Plan) refuseHierarchy(led state.PostgresLedger) bool {
+	if len(led.Hierarchy) == 0 {
+		return false
+	}
+
+	p.refuse(lifeops.Refusal{
+		What: fmt.Sprintf("schema %s holds %s, which is partitioned, a partition or an inheriting "+
+			"table; billet's ledger never holds one, and replacing the ledger would take rows "+
+			"outside the schema with it", led.Schema, joinOrNone(led.Hierarchy)),
+		Remedy: "move that table out of the ledger's schema, or point the connection at a schema " +
+			"of the ledger's own, and run this again",
+	})
+
+	return true
 }
 
 // refuseMissingCopy refuses, and reports that it did, when a recovery's

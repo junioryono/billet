@@ -30,6 +30,10 @@ type PostgresLedger struct {
 	ServerVersion int
 	// Tables are every table in Schema. Empty means nothing is there to replace.
 	Tables []string
+	// Hierarchy names the tables in Schema that are partitioned, are partitions
+	// or inherit, which billet's ledger never holds and a restore will not
+	// replace (DropTablesOutside).
+	Hierarchy []string
 	// Populated is true when any table a deployment writes to holds a row, and
 	// NonEmpty names those, as PeekLedger reports them.
 	Populated bool
@@ -68,6 +72,10 @@ func PeekPostgresLedger(ctx context.Context, dsn DSN) (PostgresLedger, error) {
 		}
 
 		out.Tables = tables
+
+		if out.Hierarchy, err = hierarchyTables(ctx, tx); err != nil {
+			return err
+		}
 
 		contents, err := countLedger(ctx, be, tx, tables)
 		if err != nil {

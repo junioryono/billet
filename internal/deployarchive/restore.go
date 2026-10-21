@@ -1653,13 +1653,13 @@ func abandonLocked(ctx context.Context, a *Archive, t Target,
 	var res AbandonResult
 
 	// THE ABANDON IS RECORDED BEFORE IT ACTS, so a crash part-way leaves a
-	// journal that only an abandon will go on with.
-	if !j.Abandoning {
-		j.Abandoning = true
+	// journal that only an abandon will go on with. Saved on every run, a rerun
+	// included: the run that first set it may have died before its save was
+	// durable, and what follows writes to the database.
+	j.Abandoning = true
 
-		if err := j.save(t.StateDir); err != nil {
-			return res, err
-		}
+	if err := j.save(t.StateDir); err != nil {
+		return res, err
 	}
 
 	// WHAT A RECOVER MOVED ASIDE IS NOT SOMETHING THIS RUN CREATED, whatever the
