@@ -276,6 +276,42 @@ func TestThePublicationGateHoldsTheSourceManifestToWhatWasInstalled(t *testing.T
 		t.Fatalf("a manifest listing exactly what was installed failed, or miscounted:\n%s", out)
 	}
 
+	// THE SOURCES NAMED ARE THE ROWS' SOURCES, each once, in byte order: glibc and
+	// foo differ from the packages built from them, and they come after git in
+	// the file.
+	rewrite := func(t *testing.T, root string, pairs ...string) {
+		t.Helper()
+		path := filepath.Join(root, "opt", "billet", "IMAGE_SOURCES.tsv")
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed := string(body)
+		for i := 0; i < len(pairs); i += 2 {
+			next := strings.Replace(changed, pairs[i], pairs[i+1], 1)
+			if next == changed {
+				t.Fatalf("the fixture has no %q", pairs[i])
+			}
+			changed = next
+		}
+		writeTreeFile(t, root, "opt/billet/IMAGE_SOURCES.tsv", changed)
+	}
+	several := sourcesRoot(t)
+	rewrite(t, several,
+		"\tglibc\t2.39-0ubuntu8.6\tarchive.ubuntu.com\tgnu", "\tglibc\t2.39-0ubuntu8.6\tnone\tgnu",
+		"\tfoo\t1.2-1\tarchive.ubuntu.com\tother", "\tfoo\t1.2-1\tnone\tgnu")
+	if out, failed := sourcesGate(t, several); failed != "0" || !strings.Contains(out,
+		"(4), 4 under a GNU license, 3 of those from no source apt still names "+
+			"(built from foo 1.2-1, git 1:2.55.0-0ppa1~ubuntu24.04.2, glibc 2.39-0ubuntu8.6)\n") {
+		t.Errorf("the gate did not name each source once, in order:\n%s", out)
+	}
+	none := sourcesRoot(t)
+	rewrite(t, none, "\tnone\tgnu", "\tppa.launchpadcontent.net\tgnu")
+	if out, failed := sourcesGate(t, none); failed != "0" ||
+		!strings.Contains(out, "(4), 3 under a GNU license, 0 of those from no source apt still names\n") {
+		t.Errorf("with every source fetchable the gate did not end its line at the count:\n%s", out)
+	}
+
 	// THE COPY THE RELEASE CARRIES IS THE IMAGE'S OWN.
 	root := sourcesRoot(t)
 	export := filepath.Join(t.TempDir(), "image-sources.tsv")
