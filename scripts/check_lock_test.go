@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -55,7 +54,7 @@ func lookPath(tool string) bool {
 	return err == nil
 }
 
-// THE COMMAND'S EXIT STATUS IS THE SCRIPT'S, so `make check` failing under the
+// THE COMMAND'S EXIT STATUS IS THE SCRIPT'S, so a gate failing under the
 // lock still fails, and a command that failed is not run again unlocked.
 func TestTheCheckLockReturnsTheCommandsStatus(t *testing.T) {
 	t.Parallel()
@@ -692,7 +691,7 @@ func TestADiagnosticPrintsAPathWithABackslashWhole(t *testing.T) {
 }
 
 // scriptEnv is this process's environment, without the variable naming a lock
-// an enclosing gate holds (this may run inside `make check`, and a test's run of
+// an enclosing gate holds (this may run inside gates/check.sh, and a test's run of
 // the script must not take that lock for its ancestor's), plus extra, which
 // replaces a variable of the same name.
 func scriptEnv(extra ...string) []string {
@@ -722,7 +721,7 @@ func setIn(kvs []string, name string) bool {
 }
 
 // inGroup starts cmd in a process group of its own and has its cancellation
-// kill the whole group, so a lock tool, a shell or a sub-make it started cannot
+// kill the whole group, so a lock tool, a shell or a gate it started cannot
 // outlive the test.
 func inGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -1122,183 +1121,114 @@ func TestANoHomeCheckStillRuns(t *testing.T) {
 	}
 }
 
-// MAKE CHECK HANDS THE SCRIPT THE PATH WHOLE. With MAKE=echo the recipe runs the
-// real script around an echo instead of the gate, so this is the Makefile's own
-// line, with an XDG_CACHE_HOME holding spaces.
-func TestMakeCheckTakesTheSharedLock(t *testing.T) {
+// THE FULL GATE HANDS THE LOCK SCRIPT THE PATH WHOLE. With CHECK_STEPS naming a
+// stand-in, gates/check.sh runs the real lock script around it instead of the
+// gate, with an XDG_CACHE_HOME holding spaces.
+func TestTheFullGateTakesTheSharedLock(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
 	dir := t.TempDir()
 	xdg := filepath.Join(dir, "a cache")
+	steps := filepath.Join(dir, "steps")
+	writeExecutable(t, steps, "#!/bin/sh\necho the steps ran\n")
 
-	cmd := exec.CommandContext(t.Context(), "make", "-C", "..", "MAKE=echo", "check")
-
-	// The Makefile's own default is the subject (see makeEnv).
-	cmd.Env = makeEnv("XDG_CACHE_HOME=" + xdg)
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("make check with MAKE=echo: %v (%s)", err, out)
-	}
-
-	if !strings.Contains(string(out), "check-unlocked") {
-		t.Errorf("the recipe did not run its steps' target under the script: %q", out)
-	}
-
-	if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
-		t.Errorf("make check did not take the shared lock under an XDG_CACHE_HOME with spaces: %v (%s)", err, out)
-	}
-}
-
-// MAKE VERIFY TAKES THE SAME SHARED LOCK. Sessions run it constantly, and a
-// dozen of them side by side is the starved machine the lock exists for. With
-// NICE=echo the recipe runs the real script around an echo of the verify
-// instead of the verify itself, so this is the Makefile's own line; CI is set
-// empty because under CI the Makefile forces NICE empty, which would run the
-// real verify here.
-func TestMakeVerifyTakesTheSharedLock(t *testing.T) {
-	t.Parallel()
-	requireLockTool(t)
-
-	dir := t.TempDir()
-	xdg := filepath.Join(dir, "a cache")
-
-	cmd := exec.CommandContext(t.Context(), "make", "-C", "..", "NICE=echo", "verify")
-	cmd.Env = makeEnv("XDG_CACHE_HOME="+xdg, "CI=")
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("make verify with NICE=echo: %v (%s)", err, out)
-	}
-
-	if !strings.Contains(string(out), "scripts/verify-changed.sh") {
-		t.Errorf("the recipe did not run the verify under the script: %q", out)
-	}
-
-	if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
-		t.Errorf("make verify did not take the shared lock: %v (%s)", err, out)
-	}
-}
-
-// makeEnv is scriptEnv for a nested make: this may run inside a `make check`
-// holding the lock, and an inherited CHECK_LOCK, or one carried in MAKEFLAGS
-// from `make check CHECK_LOCK=...`, would make the nested make wait for the lock
-// its own enclosing gate holds.
-func makeEnv(extra ...string) []string {
-	var env []string
-
-	for _, kv := range scriptEnv(extra...) {
-		name, _, _ := strings.Cut(kv, "=")
-		switch name {
-		case "CHECK_LOCK", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKELEVEL":
-			if !setIn(extra, name) {
-				continue
-			}
-		}
-
-		env = append(env, kv)
-	}
-
-	return env
-}
-
-// A DRY RUN TAKES NO LOCK. `make -n check` waits for nothing even while another
-// gate holds the lock, and prints the line it would have run.
-func TestADryRunCheckTakesNoLock(t *testing.T) {
-	t.Parallel()
-	requireLockTool(t)
-
-	dir := t.TempDir()
-	lock := filepath.Join(dir, "held.lock")
-	held := filepath.Join(dir, "held")
-	release := filepath.Join(dir, "release")
-
-	holder := exec.CommandContext(holderContext(t), "./with-check-lock.sh", lock, "sh", "-c",
-		holdUntilReleased, "holder", held, release)
-	holder.Env = scriptEnv()
-	inGroup(holder)
-	if err := holder.Start(); err != nil {
-		t.Fatalf("start the holder: %v", err)
-	}
-
-	releaseAndReap(t, holder, release)
-	waitForLockFile(t, held, "the holder never took the lock")
-
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "make", "-C", "..", "-n", "check", "CHECK_LOCK="+lock)
-	cmd.Env = makeEnv()
-	// Killing make alone would leave the script and the lock tool, its
-	// grandchildren, waiting for the lock and starting the steps once the holder
-	// is released.
+	cmd := exec.CommandContext(t.Context(), "./gates/check.sh")
+	cmd.Env = scriptEnv("XDG_CACHE_HOME="+xdg, "CHECK_STEPS="+steps, "CHECK_LOCK=")
 	inGroup(cmd)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("make -n check while the lock is held: %v (%s)", err, out)
+		t.Fatalf("gates/check.sh with a stand-in for its steps: %v (%s)", err, out)
 	}
 
-	if !strings.Contains(string(out), "with-check-lock.sh") {
-		t.Errorf("make -n check did not print the line it would run: %q", out)
+	if !strings.Contains(string(out), "the steps ran") {
+		t.Errorf("the gate did not run its steps under the lock script: %q", out)
 	}
 
-	if strings.Contains(string(out), "waiting") {
-		t.Errorf("make -n check waited for the lock: %q", out)
+	if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
+		t.Errorf("gates/check.sh did not take the shared lock under an XDG_CACHE_HOME with spaces: %v (%s)", err, out)
 	}
 }
 
-// A REAL RUN TAKES THE LOCK whatever is on the command line: reading MAKEFLAGS'
-// first word took `make check CHECK_LOCK=/tmp/x NICE="nice -n 10"` for a touch
-// and ran it unlocked. With MAKE="make -n" the recipe runs the real script
-// around a sub-make that prints its steps instead of running them, so what is
-// asserted is the race test line the steps would run: the overrides reach it
-// locally, and under CI the Makefile forces both caps empty whatever the
-// command line says.
-func TestARealCheckWithOverridesTakesTheLock(t *testing.T) {
+// THE VERIFY TAKES THE SAME SHARED LOCK, and runs under NICE outside CI and
+// without it under CI. Sessions run it constantly, and a dozen of them side by
+// side is the starved machine the lock exists for. With VERIFY_CHANGED naming a
+// stand-in, this is the script's own line; NICE is a stand-in too, which marks
+// the environment of what it runs.
+func TestTheVerifyTakesTheSharedLockAndItsCaps(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
-	goTest := regexp.MustCompile(`(?m)^(.*)go test(.*) -race -count=1 -timeout`)
-
-	for name, tc := range map[string]struct{ ci, nice, parallel string }{
-		"local": {ci: "", nice: "nice -n 10 ", parallel: " -p 2"},
-		"CI":    {ci: "true", nice: "", parallel: ""},
+	for name, tc := range map[string]struct{ ci, niced string }{
+		"local": {ci: "", niced: "niced=yes"},
+		"CI":    {ci: "true", niced: "niced="},
 	} {
-		lock := filepath.Join(t.TempDir(), "tmp", "override.lock")
+		dir := t.TempDir()
+		xdg := filepath.Join(dir, "a cache")
+		verify := filepath.Join(dir, "verify")
+		writeExecutable(t, verify, "#!/bin/sh\necho \"verified niced=${BILLET_NICED-}\"\n")
 
-		// CHECK_LOCK LAST, its path holding a "t": on GNU Make 3.81 a command line
-		// of only assignments puts the last of them first in MAKEFLAGS, with no
-		// flags. Run from the root rather than with -C, which adds its own flag
-		// (w) to MAKEFLAGS and would hide the shape under test.
-		cmd := exec.CommandContext(t.Context(), "make",
-			"NICE=nice -n 10", "TEST_PARALLEL=2", "MAKE=make -n", "CHECK_LOCK="+lock, "check")
-		cmd.Dir = ".."
-		cmd.Env = makeEnv("CI=" + tc.ci)
+		cmd := exec.CommandContext(t.Context(), "./gates/verify.sh")
+		cmd.Env = scriptEnv("XDG_CACHE_HOME="+xdg, "VERIFY_CHANGED="+verify, "CHECK_LOCK=", "CI="+tc.ci,
+			"NICE=env BILLET_NICED=yes")
 		inGroup(cmd)
 
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("%s: make check with overrides: %v (%s)", name, err, out)
+			t.Fatalf("%s: gates/verify.sh with a stand-in: %v (%s)", name, err, out)
 		}
 
-		if _, err := os.Stat(lock); err != nil {
-			t.Errorf("%s: make check with overrides on the command line did not take the lock: %v (%s)",
-				name, err, out)
+		if !strings.Contains(string(out), "verified "+tc.niced+"\n") {
+			t.Errorf("%s: the verify ran as %q, want it %s", name, out, tc.niced)
 		}
 
-		// AND THE OVERRIDES REACH THE STEPS: the line the sub-make is reached
-		// through is not recursive to make, and an override still travels to it
-		// in the MAKEFLAGS make exports to every recipe.
-		m := goTest.FindStringSubmatch(string(out))
-		if m == nil {
-			t.Fatalf("%s: the sub-make printed no race test line: %q", name, out)
+		if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
+			t.Errorf("%s: gates/verify.sh did not take the shared lock: %v (%s)", name, err, out)
+		}
+	}
+}
+
+// THE RACE SUITE TAKES THE LOCAL CAPS, and CI's run takes none: at most
+// TEST_PARALLEL packages at once (4) under NICE locally, go test's own -p and no
+// nice under CI, whatever the environment says. GO names a stand-in that prints
+// the go test line it was given.
+func TestTheRaceSuiteTakesTheLocalCapsAndCIsNone(t *testing.T) {
+	t.Parallel()
+
+	// Each case names every variable the caps read, so nothing the test process
+	// inherits decides them.
+	for name, tc := range map[string]struct {
+		env  []string
+		want string
+	}{
+		"local": {
+			env:  []string{"CI=", "NICE=env BILLET_NICED=yes", "TEST_PARALLEL=4"},
+			want: "niced=yes test -p 4 -race -count=1 -timeout 35m -covermode=atomic",
+		},
+		"CI": {
+			env:  []string{"CI=true", "NICE=env BILLET_NICED=yes", "TEST_PARALLEL=4"},
+			want: "niced= test -race -count=1 -timeout 35m -covermode=atomic",
+		},
+		"local with both lifted": {
+			env:  []string{"CI=", "NICE=", "TEST_PARALLEL="},
+			want: "niced= test -race -count=1 -timeout 35m -covermode=atomic",
+		},
+	} {
+		dir := t.TempDir()
+		fakeGo := filepath.Join(dir, "go")
+		writeExecutable(t, fakeGo, "#!/bin/sh\necho \"niced=${BILLET_NICED-} $*\"\n")
+
+		cmd := exec.CommandContext(t.Context(), "./gates/test.sh")
+		cmd.Env = scriptEnv(append(tc.env, "GO="+fakeGo, "COVERPROFILE="+filepath.Join(dir, "c.out"))...)
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: gates/test.sh with a stand-in go: %v (%s)", name, err, out)
 		}
 
-		if m[1] != tc.nice || strings.TrimRight(m[2], " ") != tc.parallel {
-			t.Errorf("%s: the test step would run as %q, want %q before go test and %q after it",
-				name, m[0], tc.nice, tc.parallel)
+		if !strings.Contains(string(out), tc.want) {
+			t.Errorf("%s: the suite would run as %q, want %q", name, out, tc.want)
 		}
 	}
 }

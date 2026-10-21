@@ -14,7 +14,7 @@ import (
 // main and origin/main hold package a, whose test always fails, so any run that
 // reaches a package nobody changed fails; e, whose test passes and reads a
 // testdata file; f, which imports g; scripts, which the hook and skill files
-// select; a docs page; and a Makefile whose docs target stands in for Sphinx. HEAD
+// select; a docs page; and a scripts/gates/docs.sh that stands in for Sphinx. HEAD
 // is a working branch. The returned bin directory holds stand-ins for
 // golangci-lint, sphinx-build and terraform that record their argv and exit as
 // told.
@@ -49,10 +49,15 @@ func verifyFixtureNamed(t *testing.T, name string) (dir, bin string) {
 		"f/f.go":            "package f\n\nimport \"example.com/fixture/g\"\n\nfunc F() int { return g.G() }\n",
 		"scripts/s_test.go": "package scripts\n\nimport \"testing\"\n\nfunc TestS(t *testing.T) {}\n",
 		"docs/index.rst":    "Fixture\n=======\n",
-		"Makefile":          ".PHONY: docs\ndocs:\n\t@echo fixture docs built\n",
 	} {
 		hookWrite(t, dir, rel, body)
 	}
+
+	if err := os.MkdirAll(filepath.Join(dir, "scripts", "gates"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeExecutable(t, filepath.Join(dir, "scripts", "gates", "docs.sh"), "#!/bin/sh\necho fixture docs built\n")
 
 	hookGit(t, dir, "add", ".")
 	hookGit(t, dir, "commit", "-q", "-m", "base")
@@ -274,7 +279,8 @@ func TestVerifyChecksTheChangedPackagesAndNothingElse(t *testing.T) {
 		hookWrite(t, dir, "infra/main.tf", "locals {}\n")
 
 		code, out := runVerify(t, dir, bin)
-		wantVerify(t, out, code, 0, "CI's docs job", "fixture docs built", "tf-validate", "tf-scan")
+		wantVerify(t, out, code, 0, "CI's docs job", "fixture docs built", "terraform.sh fmt, validate",
+			"terraform.sh lint and scan")
 
 		if got, want := recorded(t, bin, "terraform"), "fmt\n-check\ninfra/main.tf\n"; got != want {
 			t.Errorf("terraform was called with %q, want %q", got, want)

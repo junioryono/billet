@@ -494,7 +494,8 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{".claude/hooks/guard.py", "none"},
 		// What drives the jobs, and the module graph: everything.
 		{".github/workflows/ci.yml", "all"},
-		{"Makefile", "all"},
+		{"scripts/gates/lint.sh", "all"},
+		{"scripts/gates/env.sh", "all"},
 		{"go.sum", "all"},
 		{"tools/lint/go.mod", "all"},
 		{"sqlc.yaml", "all"},
