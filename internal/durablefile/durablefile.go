@@ -40,7 +40,9 @@ type Installer struct {
 	SetMode  func(f *os.File, mode fs.FileMode) error
 	SyncFile func(f *os.File) error
 	Rename   func(from, to string) error
-	SyncDir  func(dir string) error
+	// Link is InstallNew's publish, as Rename is Install's.
+	Link    func(from, to string) error
+	SyncDir func(dir string) error
 }
 
 // Install writes name into dir durably and returns the path it landed at.
@@ -60,6 +62,30 @@ func (i Installer) Install(
 	dir, name string,
 	mode fs.FileMode,
 	write func(w io.Writer) error,
+) (string, error) {
+	return i.install(dir, name, mode, write, false)
+}
+
+// InstallNew is Install for a file that is written once and never replaced:
+// the staged file is published by a hard link, which fails with an error
+// matching fs.ErrExist when name is already there, rather than by a rename,
+// which replaces it. The staged name is removed once the link holds the file,
+// and the directory is flushed after both, so a crash leaves either no file or
+// the whole one, and never the staging name beside it.
+func (i Installer) InstallNew(
+	dir, name string,
+	mode fs.FileMode,
+	write func(w io.Writer) error,
+) (string, error) {
+	return i.install(dir, name, mode, write, true)
+}
+
+// install is the one ordering both publishes share.
+func (i Installer) install(
+	dir, name string,
+	mode fs.FileMode,
+	write func(w io.Writer) error,
+	link bool,
 ) (string, error) {
 	if name == "" || name != filepath.Base(name) || strings.ContainsRune(name, os.PathSeparator) {
 		return "", fmt.Errorf("durablefile: %q is not a file name", name)
@@ -103,11 +129,27 @@ func (i Installer) Install(
 		return "", fmt.Errorf("durablefile: cannot close the staged %s: %w", final, err)
 	}
 
-	if err := i.rename()(staged, final); err != nil {
-		return "", fmt.Errorf("durablefile: cannot put %s in place: %w", final, err)
-	}
+	if link {
+		// THE STAGED NAME GOES EITHER WAY: on failure the deferred removal takes
+		// it, and on success the link holds the file under its real name.
+		if err := i.link()(staged, final); err != nil {
+			return "", fmt.Errorf("durablefile: cannot put %s in place: %w", final, err)
+		}
 
-	renamed = true
+		// BEFORE THE FLUSH BELOW, so the flush commits the removal too.
+		if err := os.Remove(staged); err != nil {
+			return "", fmt.Errorf("durablefile: %s is in place, and its staging name %s could not be "+
+				"removed: %w", final, staged, err)
+		}
+
+		renamed = true
+	} else {
+		if err := i.rename()(staged, final); err != nil {
+			return "", fmt.Errorf("durablefile: cannot put %s in place: %w", final, err)
+		}
+
+		renamed = true
+	}
 
 	// THE RENAME IS NOT THE COMMIT; THIS IS.
 	if err := i.SyncDirectory(dir); err != nil {
@@ -277,6 +319,14 @@ func (i Installer) rename() func(string, string) error {
 	}
 
 	return os.Rename
+}
+
+func (i Installer) link() func(string, string) error {
+	if i.Link != nil {
+		return i.Link
+	}
+
+	return os.Link
 }
 
 func (i Installer) syncDir() func(string) error {

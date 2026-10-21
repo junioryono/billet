@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/regularfile"
 
@@ -59,7 +62,9 @@ const hybridLockFile = ".billet-init-hybrid.lock"
 // generations. Refused at once rather than waited for, since the other is an
 // operator's command that may be waiting on nothing.
 func lockHybridOut(out string) (func(), error) {
-	if err := os.MkdirAll(out, 0o750); err != nil {
+	// DURABLY, because the record this render publishes into it is only as
+	// durable as the entries that name the directory.
+	if err := (durablefile.Installer{}).MkdirAll(out, 0o750); err != nil {
 		return nil, fmt.Errorf("create %s: %w", out, err)
 	}
 
@@ -231,39 +236,21 @@ var publishHybridGeneration = os.Link
 // AFTER THE RENDER'S FILES, so a render that failed leaves no fingerprint
 // claiming a directory it never wrote; a failure here, after the files landed,
 // is said, because the root it wrote is then one a later render will not mint
-// over. PUBLISHED WHOLE AND NEVER REPLACED: the fingerprint is written and
-// synced under a name this call created and linked into place, which fails
-// rather than replaces, so a crash leaves either no record or a complete one,
-// and a record already there is kept and compared.
+// over. PUBLISHED WHOLE AND NEVER REPLACED, by durablefile's one ordering with
+// a link for the rename (InstallNew), so a crash leaves either no record or a
+// complete one, and a record already there is kept and compared.
 func recordHybridGeneration(out, g string) error {
 	path := filepath.Join(out, HybridGenerationFile)
 
-	staged, err := os.CreateTemp(out, ".billet-generation-*")
+	installer := durablefile.Installer{Link: func(from, to string) error { return publishHybridGeneration(from, to) }}
+
+	_, err := installer.InstallNew(out, HybridGenerationFile, 0o644, func(w io.Writer) error {
+		_, err := io.WriteString(w, g+"\n")
+
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("record the generation in %s (the files were written; until it exists, "+
-			"pass --generation %s on every render): %w", path, g, err)
-	}
-
-	name := staged.Name()
-	defer func() { _ = os.Remove(name) }()
-
-	_, err = staged.WriteString(g + "\n")
-	if err == nil {
-		err = staged.Chmod(0o644)
-	}
-	if err == nil {
-		err = staged.Sync()
-	}
-	if cerr := staged.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return fmt.Errorf("record the generation in %s (the files were written; until it exists, "+
-			"pass --generation %s on every render): %w", path, g, err)
-	}
-
-	if err := publishHybridGeneration(name, path); err != nil {
-		if !errors.Is(err, os.ErrExist) {
+		if !errors.Is(err, fs.ErrExist) {
 			return fmt.Errorf("record the generation in %s (the files were written; until it exists, "+
 				"pass --generation %s on every render): %w", path, g, err)
 		}
@@ -278,10 +265,6 @@ func recordHybridGeneration(out, g string) error {
 		}
 
 		return nil
-	}
-
-	if err := SyncDir(out); err != nil {
-		return fmt.Errorf("flush the record of the generation in %s: %w", path, err)
 	}
 
 	return nil
