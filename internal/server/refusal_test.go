@@ -401,6 +401,10 @@ func TestOnlyAWithdrawnPollDatesTheCount(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 
+		if polls.Load() < 4 {
+			t.Fatalf("the listener stopped after %d polls, before the case played out", polls.Load())
+		}
+
 		got, err := a.CapacityReport(t.Context(), tiers[0].Label)
 		if err != nil {
 			t.Fatalf("CapacityReport: %v", err)
@@ -410,6 +414,10 @@ func TestOnlyAWithdrawnPollDatesTheCount(t *testing.T) {
 	}
 
 	open, _ := run(t, false, nil)
+	if open.Unstarted == nil || *open.Unstarted != 0 {
+		t.Errorf("an open listener published %v unstarted jobs, want a counted none", open.Unstarted)
+	}
+
 	if open.UnstartedAt != "" {
 		t.Errorf("an open listener's count is dated %q; polls advertising its ceiling vouch for nothing",
 			open.UnstartedAt)

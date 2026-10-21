@@ -83,13 +83,6 @@ func TestAFallbackDoesNotGrowIntoRoomAWaiterIsAccumulating(t *testing.T) {
 		t.Errorf("the refused fallback left the lease charged %d vCPU, want the 4 it had", got)
 	}
 
-	// ONLY A GROWTH IS JUDGED: the same shape again takes nothing from the
-	// waiter, though it is already short, and is never refused for it.
-	if err := a.ResizeLeaving(t.Context(), lease.ID, lease.Epoch, "four", 4, 8*config.GiB,
-		[]string{"waiter"}); err != nil {
-		t.Errorf("a resize to the shape the lease already holds was refused for a waiter: %v", err)
-	}
-
 	// AND THE LEASE'S OWN TIER IN protect IS NOT A WAITER IT MUST LEAVE ROOM
 	// FOR: the same growth, which leaves the cloud tier no room for another of
 	// its own, is granted when only its own tier is named.

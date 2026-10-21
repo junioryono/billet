@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
@@ -222,4 +223,32 @@ func (out *TierCapacity) countLaunched(phase Phase, member PoolRunner, found boo
 	default:
 		out.Unknown++
 	}
+}
+
+// LastReleases is when each tier's newest lease closed, among those closed at
+// or after since. A drain holds a listener's count against it: a lease released
+// after the count was taken may have been a runner the count had covering an
+// assigned job.
+func (a *Allocator) LastReleases(ctx context.Context, since time.Time) (map[string]time.Time, error) {
+	out := map[string]time.Time{}
+	err := a.db.View(ctx, func(tx querier) error {
+		rows, err := state.ReadQueries(tx).LastFinishedPerTier(ctx, sql.NullString{String: ts(since), Valid: true})
+		if err != nil {
+			return fmt.Errorf("alloc: read when each tier's leases last closed: %w", err)
+		}
+
+		for _, row := range rows {
+			at, err := time.Parse(timestampFormat, row.FinishedAt)
+			if err != nil {
+				return fmt.Errorf("alloc: tier %s's leases last closed at %q, which is not a time the "+
+					"ledger writes: %w", row.Tier, row.FinishedAt, err)
+			}
+
+			out[row.Tier] = at
+		}
+
+		return nil
+	})
+
+	return out, err
 }

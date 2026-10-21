@@ -153,6 +153,28 @@ func TestForgettingOneGroupLeavesTheOther(t *testing.T) {
 	}
 }
 
+// AND ONE NAME LEAVES ANOTHER IN THE SAME GROUP: forgetting a set forgets that
+// set, never every set the group holds on the target.
+func TestForgettingOneNameLeavesItsNeighbour(t *testing.T) {
+	db := open(t)
+
+	for i, label := range []string{"billet-2vcpu", "billet-4vcpu"} {
+		rec := ScaleSetRecord{Target: testOrg, RunnerGroup: "billet", Label: label, ID: 7 + i}
+		if err := db.RecordScaleSet(t.Context(), rec); err != nil {
+			t.Fatalf("RecordScaleSet(%s): %v", label, err)
+		}
+	}
+
+	if err := db.ForgetScaleSet(t.Context(), testOrg, "billet", "billet-2vcpu"); err != nil {
+		t.Fatalf("ForgetScaleSet: %v", err)
+	}
+
+	got := scaleSets(t, db)
+	if len(got) != 1 || got[0].Label != "billet-4vcpu" {
+		t.Fatalf("ScaleSets = %v, want only the name that was not forgotten", got)
+	}
+}
+
 // A RECORD IS FOUND AND FORGOTTEN UNDER ANY SPELLING of its target, group and
 // name, as GitHub compares them. The control plane refuses to start beside a
 // stale set it finds without case, so forgetting with case would leave the

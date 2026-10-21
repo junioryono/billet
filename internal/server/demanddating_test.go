@@ -4,18 +4,20 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/state"
 )
 
-// sealedTier is one 4 vCPU tier on one host of a deployment an operator has
-// sealed, and a read of what its listener last published.
-func sealedTier(t *testing.T) (*alloc.Allocator, string, func() alloc.ListenerCapacity) {
+// workTier is one 4 vCPU tier on one host, a read of what its listener last
+// published, and the operator's seal of the deployment.
+func workTier(t *testing.T) (*alloc.Allocator, string, func() alloc.ListenerCapacity, func()) {
 	t.Helper()
 
 	tiers := []config.Tier{tierOf("a-work", 4)}
@@ -29,10 +31,6 @@ func sealedTier(t *testing.T) (*alloc.Allocator, string, func() alloc.ListenerCa
 
 	registerHost(t, a)
 
-	if _, err := db.Seal(t.Context(), state.SealRequest{Provenance: state.ProvenanceOperator, Actor: "ops"}); err != nil {
-		t.Fatalf("Seal: %v", err)
-	}
-
 	published := func() alloc.ListenerCapacity {
 		t.Helper()
 
@@ -44,7 +42,25 @@ func sealedTier(t *testing.T) (*alloc.Allocator, string, func() alloc.ListenerCa
 		return got.Listener
 	}
 
-	return a, tiers[0].Label, published
+	seal := func() {
+		t.Helper()
+
+		if _, err := db.Seal(t.Context(), state.SealRequest{Provenance: state.ProvenanceOperator, Actor: "ops"}); err != nil {
+			t.Fatalf("Seal: %v", err)
+		}
+	}
+
+	return a, tiers[0].Label, published, seal
+}
+
+// sealedTier is workTier already sealed.
+func sealedTier(t *testing.T) (*alloc.Allocator, string, func() alloc.ListenerCapacity) {
+	t.Helper()
+
+	a, label, published, seal := workTier(t)
+	seal()
+
+	return a, label, published
 }
 
 // datedNone is whether a published count is a known none with a date, which is
@@ -53,68 +69,86 @@ func datedNone(c alloc.ListenerCapacity) bool {
 	return c.Unstarted != nil && *c.Unstarted == 0 && c.UnstartedAt != ""
 }
 
-// A DELIVERY'S COUNT IS UNKNOWN IN THE LEDGER BEFORE IT IS HANDLED (#140). Two
-// empty withdrawn polls date a count of none; the third returns a message, and
-// handling it can release the last runner (a completion) while an assignment in
-// it waits. Read when that message is first reconciled, the ledger must not
-// still show the dated none.
+// A DELIVERY'S COUNT IS UNKNOWN IN THE LEDGER BEFORE IT IS HANDLED (#140). One
+// job runs on the tier's one runner, the deployment is sealed, and withdrawn
+// empty polls date a count of none. Then one message completes that job and
+// assigns another, which the seal declines: the completion releases the last
+// runner while the new job waits. Read inside that completion's destroy, before
+// its lease goes, the ledger must not still show the dated none.
 func TestADeliveryUndatesTheCountBeforeItIsHandled(t *testing.T) {
 	t.Parallel()
 
-	a, label, published := sealedTier(t)
+	a, label, published, seal := workTier(t)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 
 	var (
-		polls               atomic.Int32
-		l                   *Listener
-		armed               bool
-		before, atReconcile alloc.ListenerCapacity
-		reconciled          bool
+		polls             atomic.Int32
+		before, atDestroy alloc.ListenerCapacity
+		destroyed         bool
+		acknowledged      []int64
 	)
 
+	one := &Statistics{TotalAssignedJobs: 1}
+
 	session := &fakeSession{stats: &Statistics{}, onPoll: func(int) {
-		if polls.Add(1) >= 5 {
+		if polls.Add(1) >= 8 {
 			cancel()
 		}
 	}, onGet: func() (*Message, error) {
-		if polls.Load() != 3 {
-			return nil, ErrNoMessage
+		switch polls.Load() {
+		case 1:
+			return &Message{MessageID: 1, Statistics: one,
+				Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
+		case 3:
+			seal()
+		case 6:
+			before = published()
+
+			return &Message{MessageID: 2, Statistics: one,
+				Completed: []dispatch.Job{{RequestID: 11, RunID: 101, Result: "succeeded"}},
+				Assigned:  []dispatch.Job{{RequestID: 12, RunID: 102}}}, nil
 		}
 
-		before, armed = published(), true
+		return nil, ErrNoMessage
+	}, onDelete: func(id int64) error {
+		acknowledged = append(acknowledged, id)
 
-		return directlyAssigned(1, "J-pre-seal", 1), nil
+		return nil
 	}}
 
-	l = NewListener(a, label, session, WithRunner(&launchLog{}), WithLogger(slog.New(slog.DiscardHandler)))
-	l.beforePoolReconcile = func() {
-		if armed {
-			atReconcile, reconciled, armed = published(), true, false
-		}
-	}
+	l := NewListener(a, label, session, WithLogger(slog.New(slog.DiscardHandler)),
+		WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			atDestroy, destroyed = published(), true
+
+			return nil
+		}}), WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if polls.Load() < 5 {
+	if polls.Load() < 8 {
 		t.Fatalf("the listener stopped after %d polls, before the case played out", polls.Load())
 	}
 
 	if !datedNone(before) {
-		t.Fatalf("before the delivery the count was %v dated %q, want a dated none, or the delivery "+
-			"has nothing to undo", before.Unstarted, before.UnstartedAt)
+		t.Fatalf("before the delivery the count was %v dated %q, want a dated none with the job "+
+			"running, or the delivery has nothing to undo", before.Unstarted, before.UnstartedAt)
 	}
 
-	if !reconciled {
-		t.Fatal("the delivery was never reconciled, so this case shows nothing")
+	if !destroyed {
+		t.Fatal("the completion never destroyed its runner, so this case shows nothing")
 	}
 
-	if datedNone(atReconcile) {
-		t.Errorf("while the delivery was handled the ledger still showed the dated none from before it "+
-			"(%d at %q)", *atReconcile.Unstarted, atReconcile.UnstartedAt)
+	if datedNone(atDestroy) {
+		t.Errorf("while the completion released the last runner the ledger still showed the dated none "+
+			"from before the delivery (%d at %q)", *atDestroy.Unstarted, atDestroy.UnstartedAt)
+	}
+
+	if !slices.Contains(acknowledged, 2) {
+		t.Errorf("acknowledged %v, want the delivery (2) handled and acknowledged", acknowledged)
 	}
 }
 

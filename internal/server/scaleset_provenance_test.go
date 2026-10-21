@@ -376,6 +376,12 @@ func TestAStaleSetOnAServedOrganizationRefusesItsRepositorysTier(t *testing.T) {
 		t.Fatalf("a stale set on the organization under a name its repository's tier answers to "+
 			"did not refuse the start: %v", err)
 	}
+
+	// ONCE, AS THE SERVED ORGANIZATION'S: the repository's pass does not read
+	// the organization's records again and call it one this plane does not serve.
+	if strings.Count(err.Error(), "(id 54)") != 1 || strings.Contains(err.Error(), "does not serve") {
+		t.Errorf("the refusal names the organization's set more than once or as unserved: %v", err)
+	}
 }
 
 // AND ONE THAT TAKES NO DECLARED TIER'S NAME IS STILL ONLY REPORTED. A stale

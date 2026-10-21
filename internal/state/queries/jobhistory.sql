@@ -320,6 +320,21 @@ SELECT node FROM job_history WHERE lease_id = @lease_id;
 -- Why it concluded that.
 SELECT failure_reason FROM job_history WHERE lease_id = @lease_id;
 
+-- name: LastFinishedPerTier :many
+-- When each tier's newest lease closed, among those closed since a time.
+--
+-- WHAT A DRAIN HOLDS A LISTENER'S COUNT AGAINST. The count is GitHub's
+-- assigned work less the runners covering it, and a lease released after the
+-- count was taken may have been one of those runners: a ledger gone quiet beside
+-- that count would read as drained while the job it covered waits. Every
+-- terminalization archives here, so a count dated before a tier's newest close
+-- is not trusted. Bounded below by the seal, which is as far back as a drain
+-- asks.
+SELECT tier, CAST(MAX(finished_at) AS TEXT) AS finished_at
+  FROM job_history
+ WHERE finished_at >= @since
+ GROUP BY tier;
+
 -- name: ListJobHistory :many
 -- Every job this deployment recorded, oldest first, bounded.
 --

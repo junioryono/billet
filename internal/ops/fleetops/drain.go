@@ -509,6 +509,12 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 ) []tierDemand {
 	var out []tierDemand
 
+	// A COUNT TAKEN BEFORE A LEASE OF ITS TIER CLOSED is not trusted either: that
+	// lease may have been a runner the count had covering an assigned job, and
+	// the quiet ledger beside the count would then call a waiting job none. A
+	// read that fails trusts no count.
+	released, releasedErr := allocator.LastReleases(ctx, sealedAt)
+
 	for i := range cfg.Tiers {
 		label := cfg.Tiers[i].Label
 
@@ -542,6 +548,21 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 			continue
 		}
 
+		if releasedErr != nil {
+			out = append(out, tierDemand{tier: label, counted: r.Listener.UnstartedAt, stale: true,
+				unknown: fmt.Sprintf("could not read when its leases last closed: %v", releasedErr)})
+
+			continue
+		}
+
+		if closed, ok := released[label]; ok && !counted.After(closed) {
+			out = append(out, tierDemand{tier: label, counted: r.Listener.UnstartedAt, stale: true,
+				unknown: fmt.Sprintf("last counted at %q, before one of its leases closed at %q",
+					r.Listener.UnstartedAt, closed.UTC().Format(time.RFC3339Nano))})
+
+			continue
+		}
+
 		if *r.Listener.Unstarted > 0 {
 			out = append(out, tierDemand{tier: label, unstarted: r.Listener.Unstarted, counted: r.Listener.UnstartedAt})
 		}
@@ -551,7 +572,8 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 }
 
 // countsPredateTheSeal reports whether any tier's count was taken before the
-// seal, which a listener still running replaces within a poll.
+// seal or before one of its leases closed, which a listener still running
+// replaces within a poll.
 func countsPredateTheSeal(demand []tierDemand) bool {
 	for _, d := range demand {
 		if d.stale {

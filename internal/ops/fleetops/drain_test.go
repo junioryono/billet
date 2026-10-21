@@ -443,8 +443,56 @@ func TestADrainTrustsACountTakenSinceItsSeal(t *testing.T) {
 
 	t.Cleanup(func() { demandCountWithin = saved })
 
-	if out := drainWait(t, cfgPath); !strings.Contains(out, "Drained") || strings.Contains(out, "unknown") {
+	if out := drainWait(t, cfgPath); !strings.Contains(out, "Drained") || strings.Contains(out, "unknown") ||
+		strings.Contains(out, "Waiting up to") {
 		t.Errorf("a drain did not trust counts taken since its seal:\n%s", out)
+	}
+}
+
+// AND NOT ONE TAKEN BEFORE A LEASE OF ITS TIER CLOSED (#140): the count was
+// GitHub's assigned work less the runners covering it, and the lease that
+// closed afterwards may have been one of them. Every tier counts none since the
+// seal, then the last lease of one closes, and the ledger is quiet beside a
+// count that no longer says what it said.
+func TestADrainDoesNotTrustACountTakenBeforeALeaseClosed(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	lease := outstandingLease(t, db, cfg)
+
+	if _, err := db.Seal(t.Context(), state.SealRequest{
+		Provenance: state.ProvenanceOperator, Reason: "maintenance", Actor: "ops@example.com",
+	}); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemandAt(t, db, cfg, cfg.Tiers[i].Label, &none, time.Now())
+	}
+
+	a, err := alloc.New(db, alloc.Limits{
+		MaxVCPU: cfg.Server.MaxVCPU, MaxMemory: cfg.Server.MaxMemory, Nodes: cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		t.Fatalf("allocator: %v", err)
+	}
+
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	saved := demandCountWithin
+	demandCountWithin = time.Second
+
+	t.Cleanup(func() { demandCountWithin = saved })
+
+	out := drainWait(t, cfgPath)
+
+	if strings.Contains(out, "Drained") ||
+		!strings.Contains(out, cfg.Tiers[0].Label+": unknown (last counted at") ||
+		!strings.Contains(out, "before one of its leases closed at") {
+		t.Errorf("a drain trusted a count taken before a lease of its tier closed:\n%s", out)
 	}
 }
 

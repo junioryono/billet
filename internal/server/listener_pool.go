@@ -378,7 +378,7 @@ func (l *Listener) admission(ctx context.Context) alloc.TierAdmission {
 // admissionOf reads one tier's admission, and a read that failed as an
 // eligible tier with an unknown host set (see Listener.admission).
 func admissionOf(ctx context.Context, a *alloc.Allocator, tier string, log *slog.Logger) alloc.TierAdmission {
-	view, err := a.AdmissionView(ctx)
+	admission, err := a.AdmissionFor(ctx, tier)
 	if err != nil {
 		log.Warn("could not read which tiers room could reach; admitting this purchase",
 			"tier", tier, "error", err)
@@ -386,7 +386,7 @@ func admissionOf(ctx context.Context, a *alloc.Allocator, tier string, log *slog
 		return alloc.TierAdmission{CanGrow: true}
 	}
 
-	return view[tier]
+	return admission
 }
 
 func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {

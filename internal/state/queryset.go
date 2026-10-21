@@ -81,6 +81,7 @@ type ReadOps interface {
 	HighestForceDestroyGeneration(ctx context.Context) (int64, error)
 	HighestRolloutGeneration(ctx context.Context) (int64, error)
 	HostReportsCompute(ctx context.Context, node string) (bool, error)
+	LastFinishedPerTier(ctx context.Context, since sql.NullString) ([]ledgerdb.LastFinishedPerTierRow, error)
 	LatestForceDestroy(ctx context.Context) (ledgerdb.ForceDestroy, error)
 	ListAdmissionRows(ctx context.Context) ([]ledgerdb.Admission, error)
 	ListAppliedMigrations(ctx context.Context) ([]ledgerdb.ListAppliedMigrationsRow, error)

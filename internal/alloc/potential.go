@@ -88,77 +88,22 @@ type TierAdmission struct {
 // measured on.
 //
 // THE ORDER STILL COMPARES VIEWS TAKEN AT DIFFERENT TIMES: each listener reads
-// this for its own tier when it polls, and a waiter keeps the view it last saw
-// until its next refusal refreshes it. A host that joins between two listeners'
-// polls is therefore in one tier's view and not the other's, which is why a
-// waiter's ground is refreshed at every refusal rather than dated with it.
+// its own tier's entry (AdmissionFor) when it polls, and a waiter keeps the
+// view it last saw until its next refusal refreshes it. A host that joins
+// between two listeners' polls is therefore in one tier's view and not the
+// other's, which is why a waiter's ground is refreshed at every refusal rather
+// than dated with it.
 func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission, error) {
 	out := make(map[string]TierAdmission, len(a.tiers))
 	err := a.db.View(ctx, func(tx querier) error {
-		nodes, err := a.liveNodes(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		// WHAT EACH TIER HOLDS ON THE FLEET THE POTENTIAL MODELS, read once: the
-		// same count a floor is measured against, where a lease on a host that is
-		// gone counts for nothing, because the modelled total does not include that
-		// host either. Counting it here would say a tier with a stranded lease
-		// cannot grow, and starve it. The tier's own cap is a different question,
-		// asked below over every lease.
-		held, err := a.countOpenPerTier(ctx, tx)
+		nodes, held, err := a.admissionReads(ctx, tx)
 		if err != nil {
 			return err
 		}
 
 		for _, label := range a.sortedLabels() {
-			t := a.tiers[label]
-
-			p, err := a.potentialIn(ctx, tx, label, nodes)
-			if err != nil {
+			if out[label], err = a.admissionIn(ctx, tx, a.tiers[label], nodes, held); err != nil {
 				return err
-			}
-
-			grow := p.canGrow(held[label])
-
-			// ITS OWN CAP IS COUNTED THE WAY THE CAP IS ENFORCED: over every open
-			// lease, live host or not. The fleet comparison above deliberately
-			// ignores a lease stranded on a departed host, and max_concurrent does
-			// not, so a tier at its cap with a stranded lease would otherwise be
-			// told it could grow and hold the whole order behind a purchase the
-			// allocator refuses until that lease is resolved.
-			if grow && t.MaxConcurrent > 0 {
-				all, err := a.countOpenByTier(ctx, tx, label)
-				if err != nil {
-					return err
-				}
-
-				grow = all < t.MaxConcurrent
-			}
-
-			// AND WHAT THE ALLOCATOR WOULD GRANT NOW SETTLES ANY DOUBT. The
-			// modelled total packs an empty fleet greedily, so it can refuse a
-			// placement something cleverer would fit; room the allocator can hand
-			// out this instant is proof no model can override.
-			if !grow {
-				room, err := a.headroom(ctx, tx, t)
-				if err != nil {
-					return err
-				}
-
-				grow = room > 0
-			}
-
-			bound, err := a.boundBy(ctx, tx, t)
-			if err != nil {
-				return err
-			}
-
-			_, hasShare := a.limits.Shares[config.ShareTarget(t)]
-
-			out[label] = TierAdmission{
-				CanGrow: grow, Nodes: p.nodes, CeilingBound: bound.ceiling,
-				Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound.share,
 			}
 		}
 
@@ -166,6 +111,104 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 	})
 
 	return out, err
+}
+
+// AdmissionFor is one tier's entry of AdmissionView, read alone: what a listener
+// asks at a refusal, which needs its own tier and pays for no other. A tier
+// this allocator was not configured with is the zero value, as the view's
+// missing entry is.
+func (a *Allocator) AdmissionFor(ctx context.Context, tier string) (TierAdmission, error) {
+	t, ok := a.tiers[tier]
+	if !ok {
+		return TierAdmission{}, nil
+	}
+
+	var out TierAdmission
+	err := a.db.View(ctx, func(tx querier) error {
+		nodes, held, err := a.admissionReads(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		out, err = a.admissionIn(ctx, tx, t, nodes, held)
+
+		return err
+	})
+
+	return out, err
+}
+
+// admissionReads is what every tier's admission is measured against: the live
+// hosts, and what each tier holds on the fleet the potential models, which is
+// the same count a floor is measured against. A lease on a host that is gone
+// counts for nothing there, because the modelled total does not include that
+// host either; counting it would say a tier with a stranded lease cannot grow,
+// and starve it. The tier's own cap is a different question, asked over every
+// lease (admissionIn).
+func (a *Allocator) admissionReads(ctx context.Context, tx querier) ([]nodeRow, map[string]int, error) {
+	nodes, err := a.liveNodes(ctx, tx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	held, err := a.countOpenPerTier(ctx, tx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return nodes, held, nil
+}
+
+// admissionIn is one tier's TierAdmission inside the caller's snapshot.
+func (a *Allocator) admissionIn(ctx context.Context, tx querier, t config.Tier, nodes []nodeRow,
+	held map[string]int,
+) (TierAdmission, error) {
+	p, err := a.potentialIn(ctx, tx, t.Label, nodes)
+	if err != nil {
+		return TierAdmission{}, err
+	}
+
+	grow := p.canGrow(held[t.Label])
+
+	// ITS OWN CAP IS COUNTED THE WAY THE CAP IS ENFORCED: over every open lease,
+	// live host or not. The fleet comparison above deliberately ignores a lease
+	// stranded on a departed host, and max_concurrent does not, so a tier at its
+	// cap with a stranded lease would otherwise be told it could grow and hold
+	// the whole order behind a purchase the allocator refuses until that lease is
+	// resolved.
+	if grow && t.MaxConcurrent > 0 {
+		all, err := a.countOpenByTier(ctx, tx, t.Label)
+		if err != nil {
+			return TierAdmission{}, err
+		}
+
+		grow = all < t.MaxConcurrent
+	}
+
+	// AND WHAT THE ALLOCATOR WOULD GRANT NOW SETTLES ANY DOUBT. The modelled
+	// total packs an empty fleet greedily, so it can refuse a placement something
+	// cleverer would fit; room the allocator can hand out this instant is proof
+	// no model can override.
+	if !grow {
+		room, err := a.headroom(ctx, tx, t)
+		if err != nil {
+			return TierAdmission{}, err
+		}
+
+		grow = room > 0
+	}
+
+	bound, err := a.boundBy(ctx, tx, t)
+	if err != nil {
+		return TierAdmission{}, err
+	}
+
+	_, hasShare := a.limits.Shares[config.ShareTarget(t)]
+
+	return TierAdmission{
+		CanGrow: grow, Nodes: p.nodes, CeilingBound: bound.ceiling,
+		Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound.share,
+	}, nil
 }
 
 // potential is one tier's capacity once current work ends.

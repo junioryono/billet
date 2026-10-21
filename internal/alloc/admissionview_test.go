@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"reflect"
 	"slices"
 	"testing"
 
@@ -8,13 +9,23 @@ import (
 )
 
 // admissionOf reads one tier's admission, failing the test rather than the
-// caller's assertion.
+// caller's assertion. It reads it both ways, the whole view and the tier alone
+// as a listener does, and every case that uses it proves the two agree.
 func admissionOf(t *testing.T, a *Allocator, label string) TierAdmission {
 	t.Helper()
 
 	view, err := a.AdmissionView(t.Context())
 	if err != nil {
 		t.Fatalf("AdmissionView: %v", err)
+	}
+
+	alone, err := a.AdmissionFor(t.Context(), label)
+	if err != nil {
+		t.Fatalf("AdmissionFor(%s): %v", label, err)
+	}
+
+	if !reflect.DeepEqual(alone, view[label]) {
+		t.Fatalf("tier %s read alone is %+v, but the whole view says %+v", label, alone, view[label])
 	}
 
 	return view[label]

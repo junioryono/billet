@@ -251,3 +251,52 @@ func TestServeWireHandsTheResizeRouteTheGateItKeeps(t *testing.T) {
 			"the route never asks", passed, kept)
 	}
 }
+
+// A BOUND GATE ASKS THE ORDER IT HOLDS. TestTheResizeGateAsksTheOrderForTheLeasesTier
+// drives resizeAsking with a stand-in order; this holds the call that reaches
+// it once Schedule has bound the server: resize hands resizeAsking exactly the
+// order it loaded, so a bound gate never answers with the store's Resize alone.
+func TestABoundResizeGateAsksTheOrderItLoaded(t *testing.T) {
+	t.Parallel()
+
+	resize := findMethod(t, "resizeGate", "resize")
+
+	var loaded, asked string
+
+	ast.Inspect(resize, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if len(n.Lhs) != 1 || len(n.Rhs) != 1 {
+				return true
+			}
+
+			if call, ok := n.Rhs[0].(*ast.CallExpr); ok && calleeName(call) == "Load" {
+				if id, ok := n.Lhs[0].(*ast.Ident); ok {
+					loaded = id.Name
+				}
+			}
+		case *ast.ReturnStmt:
+			for _, result := range n.Results {
+				call, ok := result.(*ast.CallExpr)
+				if !ok || calleeName(call) != "resizeAsking" || len(call.Args) < 2 {
+					continue
+				}
+
+				if id, ok := call.Args[1].(*ast.Ident); ok {
+					asked = id.Name
+				}
+			}
+		}
+
+		return true
+	})
+
+	if loaded == "" {
+		t.Fatal("resize never loads the bound order")
+	}
+
+	if asked != loaded {
+		t.Errorf("resize returns resizeAsking with %q, want the order it loaded (%q): a bound gate must ask it",
+			asked, loaded)
+	}
+}
