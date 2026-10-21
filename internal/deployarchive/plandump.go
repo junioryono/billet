@@ -94,6 +94,14 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 		return nil
 	}
 
+	// A RUN THAT STARTED WRITING SOMEWHERE IS HELD TO IT before any disposition
+	// is chosen: a restore resumed after its pg_restore committed and before its
+	// journal said so would otherwise plan the ledger it finds as one to keep,
+	// in whatever database the connection reaches by then.
+	if p.refuseAnotherDatabase(led) {
+		return nil
+	}
+
 	// A RESUME FINDS ITS OWN WORK. A run interrupted after its pg_restore
 	// committed left a populated schema that, on a ledger never bound, nothing
 	// else here could tell from somebody else's; the journal can. And the
@@ -114,8 +122,19 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 		}
 
 		// A RECOVERY STILL NAMES ITS COPY, so a resumed run hands it to the service
-		// account and reports where it is, as the first run would have.
+		// account and reports where it is, as the first run would have, and it
+		// must still be there: it is the only record of the ledger replaced.
 		if p.Intent == ReplaceLedger {
+			if err := requirePublishedCopy(p.Archive, p.Target.StateDir, prog.SupersededDigests,
+				prog.SupersedePublished); err != nil {
+				p.refuse(lifeops.Refusal{
+					What:   err.Error(),
+					Remedy: "put the copy back at that name, or abandon the recovery",
+				})
+
+				return nil
+			}
+
 			p.Superseded = supersededDumpPath(p.Archive, p.Target.StateDir)
 		}
 
@@ -235,6 +254,37 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// refuseAnotherDatabase refuses, and reports that it did, when this run's
+// journal records a database it began writing in and the connection now
+// reaches another. A journal billet cannot read is "could not tell" and refuses
+// too: what it would have said decides whether this database may be written.
+func (p *Plan) refuseAnotherDatabase(led state.PostgresLedger) bool {
+	prog, err := InProgress(p.Target.StateDir)
+
+	switch {
+	case err != nil:
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf("billet could not read this directory's journal to tell which database "+
+				"an earlier run began writing in: %v", err),
+			Remedy: "resolve that first; \"could not tell\" is never permission to write a ledger",
+		})
+
+		return true
+	case !prog.IsFor(p.Archive) || !prog.IsFrom(p.Intent) || prog.LedgerDatabase == "":
+		return false
+	case led.Database != prog.LedgerDatabase:
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf("this %s began writing the ledger in database %s, and the connection %s "+
+				"names now reaches %s", p.Intent, prog.LedgerDatabase, p.Target.ConfigPath, led.Database),
+			Remedy: "point the connection back at the database this run began in, or abandon it",
+		})
+
+		return true
+	}
+
+	return false
 }
 
 // ledgerRestoredByThisRun reports whether this directory's journal records that

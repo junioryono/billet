@@ -310,18 +310,27 @@ func TestDropTablesOutsideDropsOnlyWhatTheDumpDoesNotName(t *testing.T) {
 	}
 
 	keep := slices.DeleteFunc(slices.Clone(before.Tables), func(s string) bool { return s == "a_later_migration" })
+	into := RestoreInto{Database: before.Database, Schema: schema}
 
-	// ANOTHER SCHEMA'S NAME IS REFUSED BEFORE ANYTHING IS DROPPED.
-	if _, err := DropTablesOutside(t.Context(), dsn, schema+"_other", keep); err == nil ||
-		!strings.Contains(err.Error(), "drops nothing") {
-		t.Fatalf("DropTablesOutside into another schema = %v, want a refusal", err)
+	// A TARGET THE CONNECTION DOES NOT REACH IS REFUSED BEFORE ANYTHING IS
+	// DROPPED, on the drop's own connection: another schema, another database,
+	// or a ledger bound otherwise than the caller proved.
+	for name, wrong := range map[string]RestoreInto{
+		"another schema":   {Database: into.Database, Schema: schema + "_other"},
+		"another database": {Database: into.Database + "_other", Schema: schema},
+		"another binding":  {Database: into.Database, Schema: schema, Binding: pgDeployment},
+	} {
+		if _, err := DropTablesOutside(t.Context(), dsn, wrong, keep); err == nil ||
+			!strings.Contains(err.Error(), "drops nothing") {
+			t.Fatalf("DropTablesOutside into %s = %v, want a refusal", name, err)
+		}
 	}
 
 	if still, err := PeekPostgresLedger(t.Context(), dsn); err != nil || !slices.Equal(still.Tables, before.Tables) {
 		t.Fatalf("a refused cleanup changed the schema: %v (%v)", still.Tables, err)
 	}
 
-	dropped, err := DropTablesOutside(t.Context(), dsn, schema, keep)
+	dropped, err := DropTablesOutside(t.Context(), dsn, into, keep)
 	if err != nil {
 		t.Fatalf("DropTablesOutside: %v", err)
 	}
@@ -400,9 +409,12 @@ func TestDropTablesOutsideTakesNothingOutsideThem(t *testing.T) {
 	}
 
 	keep := slices.DeleteFunc(slices.Clone(before.Tables), func(s string) bool { return s == "a_later_migration" })
+	into := RestoreInto{Database: before.Database, Schema: schema}
 
-	if _, err := DropTablesOutside(t.Context(), dsn, schema, keep); err == nil ||
-		!strings.Contains(err.Error(), "billet drops nothing") {
+	// REFUSED BY THE SERVER'S OWN DEPENDENCY CHECK, which is what RESTRICT asks
+	// for; a CASCADE would have taken the view.
+	if _, err := DropTablesOutside(t.Context(), dsn, into, keep); err == nil ||
+		!strings.Contains(err.Error(), "other objects depend on it") {
 		t.Fatalf("DropTablesOutside with a view elsewhere depending on it = %v, want a refusal", err)
 	}
 
@@ -417,17 +429,37 @@ func TestDropTablesOutsideTakesNothingOutsideThem(t *testing.T) {
 	run(`DROP TABLE "` + schema + `".a_later_migration`)
 	run(`CREATE TABLE "` + schema + `".a_later_migration (x int) PARTITION BY RANGE (x)`)
 
-	if _, err := DropTablesOutside(t.Context(), dsn, schema, keep); err == nil ||
-		!strings.Contains(err.Error(), "partitioned table") {
+	if _, err := DropTablesOutside(t.Context(), dsn, into, keep); err == nil ||
+		!strings.Contains(err.Error(), "partitioned, a partition or an inheriting") {
 		t.Fatalf("DropTablesOutside over a partitioned table = %v, want a refusal", err)
+	}
+
+	// AN INHERITING CHILD OF A PARENT ELSEWHERE, with nothing depending on it:
+	// still refused, because its rows are the parent's too.
+	run(`DROP TABLE "` + schema + `".a_later_migration`)
+	run(`CREATE TABLE "` + elsewhere + `".parent (x int)`)
+	run(`CREATE TABLE "` + schema + `".a_later_migration (x int) INHERITS ("` + elsewhere + `".parent)`)
+
+	if _, err := DropTablesOutside(t.Context(), dsn, into, keep); err == nil ||
+		!strings.Contains(err.Error(), "partitioned, a partition or an inheriting") {
+		t.Fatalf("DropTablesOutside over an inheriting table = %v, want a refusal", err)
+	}
+
+	// A TABLE WITH WHITESPACE IN ITS NAME, which a dump's list could not name.
+	run(`DROP TABLE "` + schema + `".a_later_migration`)
+	run(`CREATE TABLE "` + schema + `"."a later migration" (x int)`)
+
+	if _, err := DropTablesOutside(t.Context(), dsn, into, keep); err == nil ||
+		!strings.Contains(err.Error(), "whitespace in its name") {
+		t.Fatalf("DropTablesOutside over a table with a space in its name = %v, want a refusal", err)
 	}
 
 	// AN ORDINARY TABLE WITH NOTHING DEPENDING ON IT GOES, and the neighbour
 	// elsewhere stays.
-	run(`DROP TABLE "` + schema + `".a_later_migration`)
+	run(`DROP TABLE "` + schema + `"."a later migration"`)
 	run(`CREATE TABLE "` + schema + `".a_later_migration (x int)`)
 
-	dropped, err := DropTablesOutside(t.Context(), dsn, schema, keep)
+	dropped, err := DropTablesOutside(t.Context(), dsn, into, keep)
 	if err != nil {
 		t.Fatalf("DropTablesOutside: %v", err)
 	}
@@ -437,4 +469,47 @@ func TestDropTablesOutsideTakesNothingOutsideThem(t *testing.T) {
 	}
 
 	run(`SELECT x FROM "` + elsewhere + `".neighbour`)
+}
+
+// A SNAPSHOT OF A LEDGER SCHEMA HOLDING A TABLE WITH WHITESPACE IN ITS NAME IS
+// REFUSED AT BACKUP, where the operator can move it, rather than discovered by a
+// restore that cannot read the dump.
+func TestASnapshotRefusesATableItsDumpCouldNotName(t *testing.T) {
+	t.Parallel()
+
+	dsn := requirePostgres(t)
+	schema := schemaFrom(t, t.Name())
+
+	db, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	raw, err := sql.Open("pgx", string(dsn))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = raw.Close() }()
+
+	if _, err := raw.ExecContext(t.Context(), `CREATE TABLE "`+schema+`"."operator notes" (x int)`); err != nil {
+		t.Fatalf("create the table: %v", err)
+	}
+
+	called := false
+
+	err = ExportPostgresSnapshot(t.Context(), dsn, "", func(LedgerSnapshot) error {
+		called = true
+
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "whitespace in its name") {
+		t.Fatalf("ExportPostgresSnapshot = %v, want a refusal naming the table", err)
+	}
+
+	if called {
+		t.Error("the snapshot was handed to its caller although the dump could not be restored")
+	}
 }

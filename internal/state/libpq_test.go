@@ -414,24 +414,17 @@ func TestTheEndpointsArePinned(t *testing.T) {
 	}
 }
 
-// AN EMPTY HOST IS REFUSED, or rendered as a host: libpq reads an empty one as
-// its default socket, which is not where pgx goes.
+// AN EMPTY HOST IS REFUSED, by name: libpq reads an empty one as its default
+// socket, which is not where pgx goes.
 func TestAnEmptyHostIsNeverRendered(t *testing.T) {
 	t.Parallel()
 
 	for _, dsn := range []string{
 		"host=,db.internal port=5432 user=u dbname=d sslmode=disable",
-		"host=db.internal, port=5432 user=u dbname=d sslmode=disable",
+		"host=db.internal,,db2.internal port=5432 user=u dbname=d sslmode=disable",
 	} {
-		env, err := LibpqEnv(DSN(dsn))
-		if err != nil {
-			continue
-		}
-
-		for _, v := range env.Environ(nil) {
-			if host, ok := strings.CutPrefix(v, "PGHOST="); ok && slices.Contains(strings.Split(host, ","), "") {
-				t.Errorf("%q renders an empty host: %s", dsn, v)
-			}
+		if _, err := LibpqEnv(DSN(dsn)); err == nil || !strings.Contains(err.Error(), "empty host") {
+			t.Errorf("%q = %v, want a refusal naming the empty host", dsn, err)
 		}
 	}
 }

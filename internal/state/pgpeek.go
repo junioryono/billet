@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // PostgresLedger is what a read-only look at a PostgreSQL ledger can say about
@@ -249,7 +250,7 @@ func ExportPostgresSnapshot(ctx context.Context, dsn DSN, fenceDir string,
 		}
 	}
 
-	return peekPostgres(ctx, dsn, func(_ *postgresBackend, tx *sql.Tx) error {
+	return peekPostgres(ctx, dsn, func(be *postgresBackend, tx *sql.Tx) error {
 		var snap LedgerSnapshot
 
 		//billet:ignore rawsql // exports a snapshot and asks which schema and major answer, not a query over billet's tables
@@ -264,7 +265,17 @@ func ExportPostgresSnapshot(ctx context.Context, dsn DSN, fenceDir string,
 				"exists, so there is no ledger there to copy")
 		}
 
-		var err error
+		// A DUMP A RESTORE COULD NOT READ IS REFUSED HERE, not discovered there:
+		// pg_restore's list quotes nothing, so a table whose name has whitespace
+		// in it makes the dump's tables ambiguous to every restore of it.
+		tables, err := be.userTables(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		if err := refuseSpacedTables(snap.Schema, tables); err != nil {
+			return err
+		}
 
 		if snap.Migrations, err = appliedIn(ctx, tx); err != nil {
 			return err
@@ -361,6 +372,18 @@ func holdWriterLock(ctx context.Context, be *postgresBackend, w *sql.DB) error {
 	return be.beginWrite(ctx, tx)
 }
 
+// RestoreInto is where a restore writes, and what the ledger there must be when
+// the write begins: the database and schema the caller proved, and the
+// deployment its rows are bound to (empty for none, or no ledger at all).
+//
+// CHECKED ON THE CONNECTION THAT WRITES, inside its transaction, because a
+// proof read on another connection is a proof about wherever that one went.
+type RestoreInto struct {
+	Database string
+	Schema   string
+	Binding  string
+}
+
 // DropTablesOutside drops every table in a PostgreSQL ledger's schema that keep
 // does not name, in one transaction, and reports what it dropped.
 //
@@ -379,8 +402,9 @@ func holdWriterLock(ctx context.Context, be *postgresBackend, w *sql.DB) error {
 // pristine. It is its own transaction, before the restore's, so a failure
 // between the two is recovered from that copy.
 //
-// THE SCHEMA IS CHECKED, not assumed: the connection must resolve to schema,
-// or this refuses before dropping anything. lock_timeout bounds the wait for a
+// THE TARGET IS CHECKED, not assumed: inside the transaction that drops, the
+// connection must reach into's database and schema and find the ledger there
+// bound to into's deployment, or this refuses before dropping anything. lock_timeout bounds the wait for a
 // table another session holds, so a stray transaction is a refusal naming the
 // wait rather than a command that never returns.
 //
@@ -389,9 +413,12 @@ func holdWriterLock(ctx context.Context, be *postgresBackend, w *sql.DB) error {
 // table elsewhere that a CASCADE took could never be put back. The drop is one
 // RESTRICT statement over every table at once (dependencies among them are
 // allowed, a dependent anywhere else refuses the whole transaction), and a
-// partitioned table is refused outright, because its partitions go with it
-// whatever the drop says.
-func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []string) ([]string, error) {
+// table in a hierarchy is refused outright: a partitioned table's partitions go
+// with it whatever the drop says, and a partition or an inheriting child takes
+// its rows out of a parent that may live anywhere.
+func DropTablesOutside(ctx context.Context, dsn DSN, into RestoreInto, keep []string) ([]string, error) {
+	schema := into.Schema
+
 	be := newPostgresBackend(dsn)
 
 	pools, err := be.dataSources()
@@ -423,20 +450,48 @@ func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []strin
 		return nil, fmt.Errorf("state: bound the wait for a lock: %w", err)
 	}
 
-	var current string
+	var database, current string
 
-	//billet:ignore rawsql // asks the server which schema answers, not a query over billet's tables
-	if err := tx.QueryRowContext(ctx, `SELECT coalesce(current_schema(), '')`).Scan(&current); err != nil {
+	//billet:ignore rawsql // asks the server which database and schema answer, not a query over billet's tables
+	if err := tx.QueryRowContext(ctx, `SELECT current_database(), coalesce(current_schema(), '')`).
+		Scan(&database, &current); err != nil {
 		return nil, fmt.Errorf("state: ask the server which schema this ledger is in: %w", err)
 	}
 
-	if current != schema {
+	switch {
+	case database != into.Database:
+		return nil, fmt.Errorf("state: the connection reaches database %q and the restore is into "+
+			"%q, so billet drops nothing", database, into.Database)
+	case current != schema:
 		return nil, fmt.Errorf("state: the connection resolves to schema %q and the restore is "+
 			"into %q, so billet drops nothing", current, schema)
 	}
 
 	tables, err := be.userTables(ctx, tx)
 	if err != nil {
+		return nil, err
+	}
+
+	binding := ""
+
+	if slices.Contains(tables, "deployment_binding") {
+		row, err := ReadQueries(tx).ReadDeploymentBinding(ctx)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return nil, fmt.Errorf("state: read the deployment binding of the ledger a restore replaces: %w", err)
+		default:
+			binding = row.DeploymentID
+		}
+	}
+
+	if binding != into.Binding {
+		return nil, fmt.Errorf("state: the ledger in %s.%s is bound to %q and the restore expected "+
+			"%q, so billet drops nothing", database, schema, binding, into.Binding)
+	}
+
+	if err := refuseSpacedTables(schema, tables); err != nil {
 		return nil, err
 	}
 
@@ -449,7 +504,7 @@ func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []strin
 	}
 
 	if len(dropped) > 0 {
-		partitioned, err := partitionedTables(ctx, tx)
+		inHierarchy, err := hierarchyTables(ctx, tx)
 		if err != nil {
 			return nil, err
 		}
@@ -457,10 +512,10 @@ func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []strin
 		quoted := make([]string, 0, len(dropped))
 
 		for _, table := range dropped {
-			if slices.Contains(partitioned, table) {
-				return nil, fmt.Errorf("state: %s.%s is a partitioned table, which billet's ledger "+
-					"never holds, and dropping it would take its partitions wherever they are; "+
-					"billet drops nothing", schema, table)
+			if slices.Contains(inHierarchy, table) {
+				return nil, fmt.Errorf("state: %s.%s is partitioned, a partition or an inheriting "+
+					"table, which billet's ledger never holds, and dropping it would take rows "+
+					"outside it wherever they are; billet drops nothing", schema, table)
 			}
 
 			quoted = append(quoted, quoteIdent(schema)+"."+quoteIdent(table))
@@ -484,15 +539,33 @@ func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []strin
 	return dropped, nil
 }
 
-// partitionedTables lists the partitioned tables in the connection's schema.
-func partitionedTables(ctx context.Context, tx *sql.Tx) ([]string, error) {
-	//billet:ignore rawsql // pg_class is not in sqlc's catalogue, and this asks which tables are partitioned
+// refuseSpacedTables refuses a ledger schema holding a table with whitespace in
+// its name, which billet never creates and which pg_restore's list cannot name
+// unambiguously (pgdump.tablesOf reads a table's name as one field).
+func refuseSpacedTables(schema string, tables []string) error {
+	for _, table := range tables {
+		if strings.ContainsFunc(table, unicode.IsSpace) {
+			return fmt.Errorf("state: schema %s holds a table named %q, and billet's ledger has no "+
+				"table with whitespace in its name; a dump of it could not be restored unambiguously, "+
+				"so move that table out of the ledger's schema", schema, table)
+		}
+	}
+
+	return nil
+}
+
+// hierarchyTables lists the tables in the connection's schema that are
+// partitioned, are partitions, or inherit from another table.
+func hierarchyTables(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	//billet:ignore rawsql // pg_class and pg_inherits are not in sqlc's catalogue, and this asks which tables sit in a hierarchy
 	rows, err := tx.QueryContext(ctx,
 		`SELECT c.relname FROM pg_catalog.pg_class c `+
 			`JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace `+
-			`WHERE n.nspname = current_schema() AND c.relkind = 'p' ORDER BY c.relname`)
+			`WHERE n.nspname = current_schema() AND (c.relkind = 'p' OR c.relispartition `+
+			`OR EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)) `+
+			`ORDER BY c.relname`)
 	if err != nil {
-		return nil, fmt.Errorf("state: list the schema's partitioned tables: %w", err)
+		return nil, fmt.Errorf("state: list the schema's tables in a hierarchy: %w", err)
 	}
 
 	defer rows.Close()
@@ -502,14 +575,14 @@ func partitionedTables(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("state: scan the schema's partitioned tables: %w", err)
+			return nil, fmt.Errorf("state: scan the schema's tables in a hierarchy: %w", err)
 		}
 
 		out = append(out, name)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("state: list the schema's partitioned tables: %w", err)
+		return nil, fmt.Errorf("state: list the schema's tables in a hierarchy: %w", err)
 	}
 
 	return out, nil

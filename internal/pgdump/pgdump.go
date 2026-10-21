@@ -59,7 +59,7 @@ type Client struct {
 	// lookPath finds a program, and dropOutside drops what a restore replaces
 	// (state.DropTablesOutside); a test replaces them to run fakes.
 	lookPath    func(string) (string, error)
-	dropOutside func(ctx context.Context, dsn state.DSN, schema string, keep []string) ([]string, error)
+	dropOutside func(ctx context.Context, dsn state.DSN, into state.RestoreInto, keep []string) ([]string, error)
 }
 
 // New renders dsn for the client programs. It refuses a DSN that libpq cannot
@@ -215,7 +215,18 @@ func (c *Client) CheckDump(ctx context.Context) error {
 // other session, which pg_stat_activity names; interrupting the command ends
 // the restore's transaction and leaves the schema as the drop left it, which
 // the caller's copy, or its proof the schema held nothing, covers.
-func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, schema string) error {
+func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, into state.RestoreInto) error {
+	schema := into.Schema
+
+	// ONE SERVER FOR EVERY CONNECTION THE RESTORE MAKES. The cleanup and
+	// pg_restore each connect afresh, and a data source naming several hosts
+	// lets each reach a different one, so the server the target was proved on
+	// need not be the one written. The drop re-proves the target on its own
+	// connection; pg_restore cannot, so it is handed one endpoint or nothing.
+	if err := c.singleEndpoint(); err != nil {
+		return err
+	}
+
 	path, major, err := c.program(ctx, "pg_restore")
 	if err != nil {
 		return err
@@ -266,7 +277,7 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, sche
 		return err
 	}
 
-	if _, err := c.dropOutside(ctx, c.dsn, schema, keep); err != nil {
+	if _, err := c.dropOutside(ctx, c.dsn, into, keep); err != nil {
 		return err
 	}
 
@@ -303,10 +314,13 @@ var tocEntry = regexp.MustCompile(`^\d+; \d+ \d+ (.*)$`)
 
 // tablesOf lists the tables a dump's restore list holds in schema.
 //
-// A TABLE ENTRY THAT IS NOT EXACTLY THREE FIELDS IS REFUSED, never split on a
-// guess: `TABLE s foo bar billet` is a table `foo bar` or a table `foo` owned
-// by `bar billet`, and reading the wrong one keeps a table the restore should
-// have replaced. billet's own names have no spaces in them.
+// THE NAME IS THE FIELD AFTER THE NAMESPACE, AND THE OWNER IS THE REST. The list
+// quotes nothing, so `TABLE s foo bar billet` could be a table `foo bar` or a
+// table `foo` owned by `bar billet`; what makes it unambiguous is that no table
+// in a ledger schema has whitespace in its name, which a dump and the restore's
+// cleanup both refuse (state.ExportPostgresSnapshot, state.DropTablesOutside),
+// while a role, which billet does not choose, may. The namespace is the planned
+// schema, whose name Restore has already refused whitespace in.
 func tablesOf(toc []byte, schema string) ([]string, error) {
 	var out []string
 
@@ -321,8 +335,8 @@ func tablesOf(toc []byte, schema string) ([]string, error) {
 			continue
 		}
 
-		fields := strings.Split(rest, " ")
-		if len(fields) != 3 {
+		fields := strings.SplitN(rest, " ", 3)
+		if len(fields) != 3 || fields[1] == "" || fields[2] == "" {
 			return nil, fmt.Errorf("pgdump: the dump lists a table as %q, whose namespace, name "+
 				"and owner cannot be told apart, so billet cannot say which tables it holds", rest)
 		}
@@ -351,6 +365,20 @@ func withoutSchemaEntries(toc []byte) []byte {
 	}
 
 	return []byte(strings.Join(lines, "\n"))
+}
+
+// singleEndpoint refuses a connection naming more than one host or port.
+func (c *Client) singleEndpoint() error {
+	for _, v := range c.env.Environ(nil) {
+		name, value, _ := strings.Cut(v, "=")
+		if (name == "PGHOST" || name == "PGPORT") && strings.Contains(value, ",") {
+			return errors.New("pgdump: the PostgreSQL data source names more than one server, and a " +
+				"restore writes through several connections that could each reach a different one; " +
+				"name the one primary to restore into")
+		}
+	}
+
+	return nil
 }
 
 // databaseConninfo names the database for pg_restore's --dbname, which must be

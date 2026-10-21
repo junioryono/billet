@@ -581,3 +581,35 @@ func TestAPostgresBackupWithoutPgDumpCapturesTheRestAndFails(t *testing.T) {
 		t.Error("the identity-only archive does not record the ledger's migrations")
 	}
 }
+
+// A CONNECTION pg_dump CANNOT BE HANDED IS THE CLIENT'S REFUSAL TOO: billet's
+// own connection opens the ledger, and the backup still captures the identity
+// half and fails naming why, rather than writing nothing.
+func TestAPostgresBackupWhoseDSNTheClientCannotTakeCapturesTheRest(t *testing.T) {
+	configPath, dsn, _ := commissionPostgresBackup(t)
+
+	// sslpassword is read by pgx and has no libpq variable, so state.LibpqEnv
+	// refuses it while billet's own open of the ledger succeeds.
+	t.Setenv("BILLET_TEST_BACKUP_DSN", dsn+"&sslpassword=unused")
+
+	dest := filepath.Join(t.TempDir(), "archive")
+
+	err := runLocalBackup(t.Context(), processEnv(), backupOptions{
+		configPath: configPath,
+		out:        dest,
+		noUpload:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "NOT the PostgreSQL ledger") ||
+		!strings.Contains(err.Error(), "sslpassword") {
+		t.Fatalf("a backup over a DSN libpq cannot take = %v, want the failure naming the refusal", err)
+	}
+
+	a, err := deployarchive.Open(t.Context(), dest)
+	if err != nil {
+		t.Fatalf("the identity-only archive does not read back: %v", err)
+	}
+
+	if !a.Manifest.Ledger.IsExternal() || a.Manifest.Ledger.IsDump() {
+		t.Errorf("the archive's ledger is %+v, want the identity-only shape", a.Manifest.Ledger)
+	}
+}

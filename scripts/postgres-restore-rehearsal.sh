@@ -498,6 +498,34 @@ admitted=$(runuser -u postgres -- psql -d billet_c -tAc \
 test "${admitted}" = "node-a,node-c" ||
     fail "the new database holds admissions for [${admitted}], want node-a and node-c"
 
+step "a controller serves the deployment once, which binds its ledger to it"
+# A RECOVERY PUTS A SERVED DEPLOYMENT BACK OVER ITS OWN LEDGER, and refuses a
+# ledger no controller has claimed: the deployment binding a claim writes is
+# what every later step of a recovery proves the database by. So the deployment
+# is served first, the way its first start would: `billet server` claims the
+# controller, which binds the ledger, before it asks GitHub for anything, and
+# this rehearsal's App is not a real one, so the server stops there. Its exit
+# status is not the verdict; the binding in the database is.
+deployment=$(cat "${IDENTITY_A}/deployment-id")
+set +e
+runuser -u billet -- env "${DSN_ENV}=${BILLET_STATE_DSN}" \
+    timeout -k 10 90 billet server --config "${CONFIG_A}" >/tmp/first-start.log 2>&1
+set -e
+bound=$(runuser -u postgres -- psql -d billet -tAc "SELECT deployment_id FROM deployment_binding")
+test "${bound}" = "${deployment}" || {
+    cat /tmp/first-start.log >&2
+    fail "the first start did not bind the ledger to ${deployment} (it reads [${bound}])"
+}
+
+# AND THE BACKUP A RECOVERY RESTORES FROM IS ONE OF THE SERVED DEPLOYMENT, so the
+# archive's ledger carries that binding too.
+RECOVER_ARCHIVE=/var/backups/billet/served
+runuser -u billet -- env "${DSN_ENV}=${BILLET_STATE_DSN}" \
+    billet local backup --config "${CONFIG_A}" --out "${RECOVER_ARCHIVE}"
+archived_binding=$(jq -r '.ledger.dump.binding' "${RECOVER_ARCHIVE}/manifest.json")
+test "${archived_binding}" = "${deployment}" ||
+    fail "the served deployment's backup records binding [${archived_binding}], want ${deployment}"
+
 step "billet local recover puts the ledger back over itself, keeping a dump of what it replaced"
 # THE LEDGER MOVES ON after the backup: an admission the archive has never heard
 # of. Proved present first, or its absence afterwards would prove nothing.
@@ -508,7 +536,7 @@ later=$(runuser -u postgres -- psql -d billet -tAc \
 test "${later}" = "1" ||
     fail "the live ledger does not record node-later, so its absence later would prove nothing"
 
-billet local recover --config "${CONFIG_A}" --from "${ARCHIVE}" --old-controller-fenced \
+billet local recover --config "${CONFIG_A}" --from "${RECOVER_ARCHIVE}" --old-controller-fenced \
     --reason "postgres restore rehearsal" >/tmp/recover.log 2>&1 || {
     cat /tmp/recover.log >&2
     fail "billet local recover failed on a PostgreSQL deployment"

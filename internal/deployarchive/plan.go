@@ -77,9 +77,11 @@ type PostgresLedger interface {
 	// Dump writes a dump of it to dest, which must not exist, crossing this
 	// host's fence: only a recovery that raised that fence calls it.
 	Dump(ctx context.Context, dest string) (LedgerDump, error)
-	// Restore replaces the ledger in schema with a dump's: the tables the dump
-	// does not name are dropped, then the dump is restored in one transaction.
-	Restore(ctx context.Context, dump string, dumpVersion int, schema string) error
+	// Restore replaces the ledger in into's schema with a dump's: the tables the
+	// dump does not name are dropped, then the dump is restored in one
+	// transaction. It refuses before writing when the ledger it reaches is not
+	// into's database, schema and binding.
+	Restore(ctx context.Context, dump string, dumpVersion int, into state.RestoreInto) error
 	// Admission reads its admission row behind any fence.
 	Admission(ctx context.Context) (state.Admission, error)
 }

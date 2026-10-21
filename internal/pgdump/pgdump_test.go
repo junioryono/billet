@@ -75,8 +75,8 @@ type drops struct {
 }
 
 type dropCall struct {
-	schema string
-	keep   []string
+	into state.RestoreInto
+	keep []string
 	// restoreRan is whether pg_restore had already been run for anything but
 	// --list when the drop was asked for.
 	restoreRan bool
@@ -109,7 +109,7 @@ func clientWithFakes(t *testing.T, dsn string, dir string) (*Client, *drops) {
 	}
 
 	d := &drops{}
-	c.dropOutside = func(_ context.Context, _ state.DSN, schema string, keep []string) ([]string, error) {
+	c.dropOutside = func(_ context.Context, _ state.DSN, into state.RestoreInto, keep []string) ([]string, error) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 
@@ -118,7 +118,7 @@ func clientWithFakes(t *testing.T, dsn string, dir string) (*Client, *drops) {
 			ran = !strings.HasPrefix(string(argv), "--list\n")
 		}
 
-		d.calls = append(d.calls, dropCall{schema: schema, keep: slices.Clone(keep), restoreRan: ran})
+		d.calls = append(d.calls, dropCall{into: into, keep: slices.Clone(keep), restoreRan: ran})
 
 		return nil, nil
 	}
@@ -150,7 +150,7 @@ func TestARestoreRunsPgRestoreAsTheProbesProvedIt(t *testing.T) {
 	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
 		"@db.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
 
-	if err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, "billet_x"); err != nil {
+	if err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, intoBilletX); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -206,7 +206,7 @@ func TestARestoreRunsPgRestoreAsTheProbesProvedIt(t *testing.T) {
 	// THE DROP KEEPS EXACTLY THE DUMP'S TABLES OF THIS SCHEMA, not another
 	// schema's, and comes before the restore proper.
 	calls := dropped.snapshot()
-	if len(calls) != 1 || calls[0].schema != "billet_x" || !slices.Equal(calls[0].keep, []string{"admission"}) {
+	if len(calls) != 1 || calls[0].into != intoBilletX || !slices.Equal(calls[0].keep, []string{"admission"}) {
 		t.Fatalf("the restore asked to drop %+v, want once in billet_x keeping [admission]", calls)
 	}
 
@@ -227,7 +227,7 @@ func TestARestoreOfADumpWithNoTableOfTheSchemaDropsNothing(t *testing.T) {
 	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
 		"@db.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
 
-	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, "billet_x")
+	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, intoBilletX)
 	if err == nil || !strings.Contains(err.Error(), "holds no table of schema billet_x") {
 		t.Fatalf("Restore of a dump of another schema = %v, want a refusal", err)
 	}
@@ -251,7 +251,7 @@ func TestAClientProgramThatCannotDoTheJobIsRefusedBeforeItRuns(t *testing.T) {
 
 	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
 
-	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, "billet_x")
+	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, intoBilletX)
 	if err == nil || !strings.Contains(err.Error(), "postgresql") || !strings.Contains(err.Error(), "16") {
 		t.Fatalf("an older pg_restore = %v, want a refusal naming the package for 16", err)
 	}
@@ -266,7 +266,7 @@ func TestAClientProgramThatCannotDoTheJobIsRefusedBeforeItRuns(t *testing.T) {
 
 	empty, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", t.TempDir())
 
-	err = empty.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, "billet_x")
+	err = empty.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, intoBilletX)
 	if err == nil || !strings.Contains(err.Error(), "not installed") {
 		t.Fatalf("an absent pg_restore = %v, want a refusal saying it is not installed", err)
 	}
@@ -321,7 +321,7 @@ func TestAFailedProgramsComplaintIsRedacted(t *testing.T) {
 
 	c, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
 
-	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, "billet_x")
+	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, intoBilletX)
 	if err == nil {
 		t.Fatal("a failing pg_restore reported success")
 	}
@@ -614,7 +614,13 @@ func TestALedgerDumpedFromOneDatabaseRestoresIntoAnother(t *testing.T) {
 
 	runSQL(target, `CREATE TABLE public.neighbour (x int)`)
 
-	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion, schema); err != nil {
+	empty, err := dst.Peek(t.Context())
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+
+	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion,
+		state.RestoreInto{Database: empty.Database, Schema: schema}); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -645,7 +651,16 @@ func TestALedgerDumpedFromOneDatabaseRestoresIntoAnother(t *testing.T) {
 	runSQL(target, `CREATE TABLE "`+schema+`".a_later_migration (x int)`)
 	runSQL(target, `INSERT INTO "`+schema+`".a_later_migration VALUES (1)`)
 
-	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion, schema); err != nil {
+	// OVER THE FIRST RESTORE'S LEDGER, which is now bound: a target that says
+	// otherwise is refused on the drop's own connection before anything goes.
+	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion,
+		state.RestoreInto{Database: empty.Database, Schema: schema}); err == nil ||
+		!strings.Contains(err.Error(), "is bound to") {
+		t.Fatalf("a Restore expecting no ledger over a bound one = %v, want a refusal", err)
+	}
+
+	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion,
+		state.RestoreInto{Database: empty.Database, Schema: schema, Binding: deployment}); err != nil {
 		t.Fatalf("a second Restore: %v", err)
 	}
 
@@ -671,9 +686,9 @@ func TestALedgerDumpedFromOneDatabaseRestoresIntoAnother(t *testing.T) {
 }
 
 // A TABLE ENTRY WHOSE FIELDS CANNOT BE TOLD APART, OR A SCHEMA NAME THE LIST
-// CANNOT CARRY, IS REFUSED BEFORE ANYTHING IS DROPPED: `TABLE s foo bar billet`
-// is a table `foo bar` or a table `foo` owned by `bar billet`, and the wrong
-// reading keeps a table the restore should replace.
+// CANNOT CARRY, IS REFUSED BEFORE ANYTHING IS DROPPED. The list quotes nothing,
+// so the namespace must be one field (Restore refuses whitespace in it) and an
+// entry must have a name and an owner after it.
 func TestARestoreRefusesNamesTheListCannotCarry(t *testing.T) {
 	t.Parallel()
 
@@ -681,8 +696,8 @@ func TestARestoreRefusesNamesTheListCannotCarry(t *testing.T) {
 		name, tables, schema, refusal string
 	}{
 		{
-			name:    "a table with a space in its name",
-			tables:  `    echo '220; 1259 16386 TABLE billet_x foo bar billet'`,
+			name:    "a table entry with no owner after its name",
+			tables:  `    echo '220; 1259 16386 TABLE billet_x admission'`,
 			schema:  "billet_x",
 			refusal: "cannot be told apart",
 		},
@@ -702,7 +717,8 @@ func TestARestoreRefusesNamesTheListCannotCarry(t *testing.T) {
 			c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
 				"@db.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
 
-			err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, tc.schema)
+			err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18,
+				state.RestoreInto{Database: "ledger", Schema: tc.schema})
 			if err == nil || !strings.Contains(err.Error(), tc.refusal) {
 				t.Fatalf("Restore = %v, want a refusal saying %q", err, tc.refusal)
 			}
@@ -736,7 +752,7 @@ func TestAClientRefusalIsToldFromADatabaseError(t *testing.T) {
 
 	old, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
 
-	if err := old.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, "billet_x"); !errors.Is(err, ErrClientUnusable) {
+	if err := old.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, intoBilletX); !errors.Is(err, ErrClientUnusable) {
 		t.Errorf("Restore with an older pg_restore = %v, want ErrClientUnusable", err)
 	}
 
@@ -751,5 +767,55 @@ func TestAClientRefusalIsToldFromADatabaseError(t *testing.T) {
 	if err == nil || errors.Is(err, ErrClientUnusable) {
 		t.Errorf("CheckDump against a database that does not answer = %v, want a database error "+
 			"that is not ErrClientUnusable", err)
+	}
+}
+
+// intoBilletX is the target the fake-program tests restore into.
+var intoBilletX = state.RestoreInto{Database: "ledger", Schema: "billet_x"}
+
+// A RESTORE IS HANDED ONE SERVER OR NOTHING: the cleanup and pg_restore each
+// connect afresh, and a data source naming several hosts lets each reach a
+// different one, so the server the target was proved on need not be the one
+// written.
+func TestARestoreRefusesADataSourceNamingSeveralServers(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	fakeProgram(t, dir, "pg_restore", 18)
+
+	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
+		"@a.internal:5432,b.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
+
+	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, intoBilletX)
+	if err == nil || !strings.Contains(err.Error(), "more than one server") {
+		t.Fatalf("Restore through two hosts = %v, want a refusal", err)
+	}
+
+	if calls := dropped.snapshot(); len(calls) != 0 {
+		t.Errorf("the refused restore dropped %+v", calls)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "pg_restore.argv")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("pg_restore ran through a data source naming two servers (%v)", err)
+	}
+}
+
+// AN OWNER WITH A SPACE IN ITS NAME IS READ AS THE OWNER: the table's name is
+// the one field after the namespace, which no ledger table has whitespace in.
+func TestATableOwnerWithASpaceIsReadAsTheOwner(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFakeProgram(t, dir, "pg_restore", 18, `    echo '220; 1259 16386 TABLE billet_x admission billet ledger'`)
+
+	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
+		"@db.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
+
+	if err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, intoBilletX); err != nil {
+		t.Fatalf("Restore with an owner named %q: %v", "billet ledger", err)
+	}
+
+	if calls := dropped.snapshot(); len(calls) != 1 || !slices.Equal(calls[0].keep, []string{"admission"}) {
+		t.Errorf("the restore kept %+v, want [admission]", calls)
 	}
 }

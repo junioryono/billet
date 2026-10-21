@@ -16,6 +16,8 @@ A checklist. The rules behind each step, and the incidents that wrote them, are 
 5. Update every test that rewinds a ledger to an earlier schema and touches what the migration changes (a table, a column, an index or a constraint): the wind-back list of `TestADatabaseWrittenByAnEarlierBilletUpgrades` in `state_test.go`, and any fixture that rebuilds one table by hand, such as `TestAPendingCompletionWrittenAtVersion25SurvivesVersion26`, which recreates `pending_completions` and removes only migrations 26 and 53 from the bookkeeping. A rewind that leaves the new migration recorded while undoing its effect tests a ledger no deployment has; undo the dependent effects and remove their migration records before reopening.
 6. Run `make sqlc`: sqlc reads the migration directory as its schema, so the generated `ledgerdb` changes with it. Commit what it generates; `make sqlc-check` proves it is current.
 
+A migration creates tables, their columns and their indexes, and references only tables an earlier migration created: never a foreign key, view, sequence default or inheritance from an older table onto a table it creates. A PostgreSQL restore from an archive taken before the migration drops the tables its dump does not name with one `DROP TABLE … RESTRICT` (`state.DropTablesOutside`, `billet-backup-restore`'s `references/archive-and-restore.md`), and a dependency from a kept table onto a dropped one makes every recovery from such an archive refuse.
+
 Never edit a migration once it is on main, not even its whitespace: append a new one. The `.claude` edit hook refuses an edit to a published migration file.
 
 ## A query

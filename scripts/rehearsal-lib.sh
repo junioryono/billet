@@ -485,6 +485,20 @@ rehearsal_units_run_installed_binary() {
     ' rehearsal_units_run_installed_binary "$@"
 }
 
+# rehearsal_upgrade_units_done waits until no upgrade transaction runs on a host:
+# billet-upgrade.service (the controller's root updater) and the transient
+# billet-host-upgrade-* unit a node starts its updater in. The transaction's own
+# process runs the binary it replaced until it exits, which is correct and is
+# not a unit left behind, so rehearsal_units_run_installed_binary is asked only
+# once it has. A systemctl that cannot list is not "nothing running".
+rehearsal_upgrade_units_done() {
+    rehearsal_wait_for "$2" "the upgrade transaction on $1 to exit" "$1" sh -c '
+        listing=$(systemctl list-units --type=service --state=active,activating,reloading,deactivating \
+            --no-legend --plain billet-upgrade.service "billet-host-upgrade-*") || exit 1
+        test -z "$listing"
+    '
+}
+
 # rehearsal_wait_for polls a command in a host until it succeeds or the
 # deadline (seconds) passes. The command's success is the condition.
 rehearsal_wait_for() {

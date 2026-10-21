@@ -298,7 +298,7 @@ func TestAnAbandonedPostgresRecoveryPutsTheLedgerBack(t *testing.T) {
 		t.Error("the abandon did not put back the ledger that knew the later work")
 	}
 
-	if got := keptCopies(t, f.stateDir, ".abandoned"); len(got) != 1 {
+	if got := keptCopies(t, f.stateDir, ".abandoned-*"); len(got) != 1 {
 		t.Errorf("the dump the abandon restored from was not kept aside: %v", got)
 	}
 

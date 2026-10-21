@@ -701,6 +701,11 @@ func finishLocked(ctx context.Context, plan Plan) error {
 			if err := checkRestoredLedger(plan.Archive, j.LedgerDatabase, led); err != nil {
 				return err
 			}
+
+			if err := requirePublishedCopy(plan.Archive, stateDir, j.SupersededDigests,
+				j.SupersedePublished); err != nil {
+				return err
+			}
 		}
 
 		if err := requireSealed(ctx, plan); err != nil {
@@ -2182,6 +2187,9 @@ func InProgress(stateDir string) (Progress, error) {
 		Phase:          j.phase(),
 		LedgerRestored: j.LedgerRestored,
 		LedgerDatabase: j.LedgerDatabase,
+
+		SupersededDigests:  j.SupersededDigests,
+		SupersedePublished: j.SupersedePublished,
 	}, nil
 }
 
@@ -2213,6 +2221,10 @@ type Progress struct {
 	// LedgerDatabase is the database it writes the ledger into, or empty when it
 	// has not written there yet.
 	LedgerDatabase string
+	// SupersededDigests and SupersedePublished are a recovery's record of the
+	// copy it keeps of the ledger it replaces.
+	SupersededDigests  map[string]string
+	SupersedePublished bool
 }
 
 // Finished reports whether the operation completed and only its record remains.
