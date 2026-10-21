@@ -18,7 +18,7 @@ func toolVersions(t *testing.T) map[string]string {
 		t.Fatalf("read the pinned tool versions: %v", err)
 	}
 
-	pin := regexp.MustCompile(`^([A-Z_]+)=(v[0-9]+\.[0-9]+\.[0-9]+)$`)
+	pin := regexp.MustCompile(`^([A-Z_]+)=(v\d+\.\d+\.\d+)$`)
 	versions := map[string]string{}
 
 	for line := range strings.SplitSeq(string(body), "\n") {
