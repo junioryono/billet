@@ -57,3 +57,61 @@ func TestARecoveryProvesItsDatabaseBeforeItSeals(t *testing.T) {
 		t.Fatal("runLocalRecover proves the restored ledger's database only after sealing it")
 	}
 }
+
+// AND IT READS ITS STAGE AGAIN ONCE IT HOLDS THE LIFECYCLE LOCK: the first read
+// precedes the lock so the quiesce can run, and an abandon may change the
+// journal while this run waits, so runLocalRecover calls recoveryStageOf after
+// lifecycleLock and before it seals.
+func TestARecoveryReadsItsStageAgainUnderTheLock(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "localrecover.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse localrecover.go: %v", err)
+	}
+
+	var lock, seal token.Pos
+
+	var stages []token.Pos
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "runLocalRecover" {
+			continue
+		}
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			if id, ok := call.Fun.(*ast.Ident); ok {
+				switch id.Name {
+				case "lifecycleLock":
+					if lock == token.NoPos {
+						lock = call.Pos()
+					}
+				case "recoveryStageOf":
+					stages = append(stages, call.Pos())
+				case "sealRecoveredDeployment":
+					if seal == token.NoPos {
+						seal = call.Pos()
+					}
+				}
+			}
+
+			return true
+		})
+	}
+
+	if lock == token.NoPos || seal == token.NoPos {
+		t.Fatalf("runLocalRecover no longer takes the lifecycle lock (%v) or seals (%v)", lock, seal)
+	}
+
+	for _, at := range stages {
+		if at > lock && at < seal {
+			return
+		}
+	}
+
+	t.Fatal("runLocalRecover does not read its stage again between taking the lifecycle lock and sealing")
+}

@@ -158,16 +158,11 @@ func verifyRestored(ctx context.Context, a *Archive, pg PostgresLedger) error {
 //
 // FOR THE STEPS AFTER THE RESTORE, which read the connection afresh: a seal, a
 // finish, a resume. Each of them would otherwise write to, or open the fence
-// over, whatever database the connection reaches by then. It is a no-op for an
-// archive that carries no dump.
+// over, whatever database the connection reaches by then. For an archive that
+// carries no dump it proves only that no abandon has begun.
 func ProveRestoredLedger(ctx context.Context, plan Plan) error {
-	if plan.Archive == nil || !plan.Archive.Manifest.Ledger.IsDump() {
+	if plan.Archive == nil {
 		return nil
-	}
-
-	if plan.Target.Postgres == nil {
-		return errors.New("deployarchive: a PostgreSQL ledger cannot be proved without the " +
-			"database it is in")
 	}
 
 	prog, err := InProgress(plan.Target.StateDir)
@@ -175,9 +170,19 @@ func ProveRestoredLedger(ctx context.Context, plan Plan) error {
 		return err
 	}
 
-	// THE SEAL IS A WRITE, and an abandon that has begun is the only way on.
+	// THE SEAL IS A WRITE, on either engine, and an abandon that has begun is
+	// the only way on.
 	if prog.IsFor(plan.Archive) && prog.IsFrom(plan.Intent) && prog.Abandoning {
 		return errAbandoning(plan.Intent)
+	}
+
+	if !plan.Archive.Manifest.Ledger.IsDump() {
+		return nil
+	}
+
+	if plan.Target.Postgres == nil {
+		return errors.New("deployarchive: a PostgreSQL ledger cannot be proved without the " +
+			"database it is in")
 	}
 
 	if plan.Intent == ReplaceLedger {

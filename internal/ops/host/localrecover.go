@@ -236,6 +236,18 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 		}
 	}()
 
+	// THE STAGE AGAIN, UNDER THE LOCK. It was read before the lock so the
+	// quiesce could run, and another command (an abandon, above all) may have
+	// changed the journal while this one waited; acting on the stale stage would
+	// skip Execute's re-plan and seal a ledger that command is putting back.
+	switch again, err := recoveryStageOf(target.StateDir, archive); {
+	case err != nil:
+		return err
+	case again != stage:
+		return fmt.Errorf("another command changed this recovery while this one waited for the "+
+			"lifecycle lock (it was %v and is now %v); run it again", stage, again)
+	}
+
 	var res deployarchive.Result
 
 	// A PUBLICATION THAT FINISHED IS NOT RUN AGAIN, and skipping it is the whole
@@ -369,10 +381,9 @@ func recoveryStageOf(stateDir string, a *deployarchive.Archive) (recoveryStage, 
 		return recoverFresh, nil
 	}
 
-	// AN ABANDON THAT HAS BEGUN is the only way on, and this is read under the
-	// lifecycle lock: a run planned before an abandon began would otherwise take
-	// the published shortcut past Execute's re-plan and seal a ledger the
-	// abandon is putting back.
+	// AN ABANDON THAT HAS BEGUN is the only way on: going forward would seal a
+	// ledger the abandon may already have put back. runLocalRecover reads this
+	// again under the lifecycle lock, where it decides.
 	if prog.Abandoning {
 		return recoverFresh, errors.New("an abandon of this recovery has already begun undoing " +
 			"it; run `billet local recover --abandon` again to finish it")

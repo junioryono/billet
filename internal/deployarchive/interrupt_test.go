@@ -2,6 +2,7 @@ package deployarchive
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -557,4 +558,56 @@ func itoa(n int) string {
 	}
 
 	return "stop-after-" + string(b)
+}
+
+// THE SEAL'S PROOF REFUSES AN ABANDON THAT HAS BEGUN ON A SQLITE LEDGER TOO: the
+// seal is a write on either engine, and a run that took the published shortcut
+// would otherwise seal the ledger the abandon is putting back.
+func TestTheSealsProofRefusesAnAbandonOnASQLiteLedger(t *testing.T) {
+	src, dest := backupOf(t)
+
+	a, err := Open(t.Context(), dest)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	tgt := newTarget(t, src.github)
+
+	stopAt(t, 1)
+
+	if _, err := execute(t, a, tgt); !errors.Is(err, errStopHere) {
+		t.Fatalf("the staged interruption did not happen: %v", err)
+	}
+
+	plan, err := PlanRestore(t.Context(), a, tgt)
+	if err != nil {
+		t.Fatalf("PlanRestore: %v", err)
+	}
+
+	if err := ProveRestoredLedger(t.Context(), plan); err != nil {
+		t.Fatalf("ProveRestoredLedger before any abandon: %v", err)
+	}
+
+	path := JournalPath(tgt.StateDir)
+
+	var raw map[string]any
+	if err := json.Unmarshal(read(t, path), &raw); err != nil {
+		t.Fatalf("decode the journal: %v", err)
+	}
+
+	raw["abandoning"] = true
+
+	body, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("encode the journal: %v", err)
+	}
+
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write the journal: %v", err)
+	}
+
+	if err := ProveRestoredLedger(t.Context(), plan); err == nil ||
+		!strings.Contains(err.Error(), "has already begun undoing it") {
+		t.Fatalf("ProveRestoredLedger on a SQLite ledger after an abandon began = %v, want a refusal", err)
+	}
 }
