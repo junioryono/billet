@@ -747,6 +747,25 @@ def full_gate_script(path, cwd):
 SHELL_VALUE_OPTIONS = {"--rcfile", "--init-file", "--emulate"}
 
 
+def is_bash(shell):
+    """Whether the shell is bash: named so, or an sh that resolves to it. macOS's
+    /bin/sh is a separate binary that runs whatever /private/var/select/sh names
+    (bash, 2026-10-21); an sh that resolves to neither is read as dash, the sh of
+    Linux, as is one that cannot be resolved."""
+    name = os.path.basename(shell)
+    if name == "bash":
+        return True
+    if name != "sh":
+        return False
+    found = shell if "/" in shell else shutil.which(shell)
+    if not found:
+        return False
+    target = os.path.realpath(found)
+    if sys.platform == "darwin" and target == "/bin/sh":
+        target = os.path.realpath("/private/var/select/sh")
+    return os.path.basename(target) == "bash"
+
+
 def shell_invocation(words):
     """How a shell is invoked, read the way the shell reads its options: in order,
     a value consumed where an option takes one, `-` or `--` ending them, and
@@ -757,7 +776,7 @@ def shell_invocation(words):
     through a redirection is not seen: the redirection is gone before this
     reads the words."""
     command = noexec = stdin = False
-    bash = os.path.basename(words[0]) == "bash"
+    bash = is_bash(words[0])
     i = 1
     while i < len(words):
         w = words[i]
@@ -779,8 +798,7 @@ def shell_invocation(words):
                 elif letter == "c":
                     # +c is -c in bash, zsh and dash; +s reads standard input in
                     # bash alone, and zsh and dash run the script (measured on
-                    # macOS and Ubuntu 24.04, 2026-10-21). sh is bash on macOS and
-                    # dash on Linux, so it is read as dash, which runs the script.
+                    # macOS and Ubuntu 24.04, 2026-10-21).
                     command = True
                 elif letter == "s":
                     stdin = True if bash else on
