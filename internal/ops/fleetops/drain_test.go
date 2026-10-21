@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -621,11 +622,45 @@ func TestADrainWaitsForCountsFromWhenTheLedgerWentQuiet(t *testing.T) {
 	}
 }
 
+// announcer is a drain's stdout that says when a line was written: what lets a
+// test act after the drain has reached a point rather than after a guess at how
+// long that takes.
+type announcer struct {
+	mu   sync.Mutex
+	buf  strings.Builder
+	want string
+	seen chan struct{}
+	once sync.Once
+}
+
+func newAnnouncer(want string) *announcer {
+	return &announcer{want: want, seen: make(chan struct{})}
+}
+
+func (a *announcer) Write(p []byte) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	n, err := a.buf.Write(p)
+	if strings.Contains(a.buf.String(), a.want) {
+		a.once.Do(func() { close(a.seen) })
+	}
+
+	return n, err
+}
+
+func (a *announcer) String() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.buf.String()
+}
+
 // AND THE WAIT IS A WAIT: a count made fresh while the drain waits is read and
 // trusted. The last lease closes after the seal, so every count the drain finds
-// when the ledger goes quiet is stale; the listeners count again six seconds
-// later, after that first quiet sample, and the drain must end Drained on their
-// new counts rather than having already said unknown.
+// when the ledger goes quiet is stale; the listeners count again only once the
+// drain has said it is waiting, and it must end Drained on their new counts
+// rather than having already said unknown.
 func TestADrainTrustsACountMadeFreshWhileItWaits(t *testing.T) {
 	db, cfgPath := drainFixture(t)
 	cfg := loadFixtureConfig(t, cfgPath)
@@ -652,42 +687,47 @@ func TestADrainTrustsACountMadeFreshWhileItWaits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 
+	out := newAnnouncer("Waiting up to")
 	counted := make(chan struct{})
 
 	go func() {
 		defer close(counted)
 
 		waitUntilSealed(t, db, 30*time.Second)
-		time.Sleep(drainPollInterval)
 
-		if err := a.Release(context.WithoutCancel(ctx), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		if err := a.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
 			t.Errorf("Release: %v", err)
 
 			return
 		}
 
-		time.Sleep(drainPollInterval + time.Second)
+		// ONLY ONCE THE DRAIN HAS SEEN THE STALE COUNTS AND SAID IT WAITS.
+		select {
+		case <-out.seen:
+		case <-ctx.Done():
+			return
+		}
 
 		for i := range cfg.Tiers {
-			if err := recordDemand(context.WithoutCancel(ctx), db, cfg, cfg.Tiers[i].Label, &none,
-				time.Now().Add(time.Hour)); err != nil {
+			if err := recordDemand(ctx, db, cfg, cfg.Tiers[i].Label, &none, time.Now().Add(time.Hour)); err != nil {
 				t.Errorf("count %s again: %v", cfg.Tiers[i].Label, err)
 			}
 		}
 	}()
 
-	out := capture(t, func() {
-		if err := Drain(ctx, processEnv(), []string{
-			"--config", cfgPath, "--wait", "--without-compute-proof",
-		}); err != nil {
-			t.Errorf("drain --wait: %v", err)
-		}
-	})
+	env := processEnv()
+	env.Stdout = out
 
+	if err := Drain(ctx, env, []string{"--config", cfgPath, "--wait", "--without-compute-proof"}); err != nil {
+		t.Errorf("drain --wait: %v", err)
+	}
+
+	cancel()
 	<-counted
 
-	if !strings.Contains(out, "Drained") || strings.Contains(out, "unknown") {
-		t.Errorf("a drain did not wait for and trust the counts made after the last close:\n%s", out)
+	if got := out.String(); !strings.Contains(got, "Waiting up to") || !strings.Contains(got, "Drained") ||
+		strings.Contains(got, "unknown") {
+		t.Errorf("a drain did not wait for and trust the counts made after the last close:\n%s", got)
 	}
 }
 
