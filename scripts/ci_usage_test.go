@@ -3,6 +3,7 @@ package scripts_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,9 +24,9 @@ import (
 // is reported beside the cores, not in them), the memory held as MemTotal less
 // MemAvailable, and the mean over the whole job.
 
-// usageProc writes one reading into a fake /proc: the aggregate cpu line, cpus
-// per-CPU lines, and the two meminfo lines the sampler reads.
-func usageProc(t *testing.T, proc, cpu string, cpus, memTotalKiB, memAvailKiB int) {
+// usageProc writes one reading of an 8 GiB runner into a fake /proc: the aggregate
+// cpu line, cpus per-CPU lines, and the two meminfo lines the sampler reads.
+func usageProc(t *testing.T, proc, cpu string, cpus, memAvailKiB int) {
 	t.Helper()
 
 	stat := "cpu " + cpu + "\n"
@@ -37,7 +38,7 @@ func usageProc(t *testing.T, proc, cpu string, cpus, memTotalKiB, memAvailKiB in
 		t.Fatal(err)
 	}
 
-	meminfo := "MemTotal:       " + strconv.Itoa(memTotalKiB) + " kB\nMemFree:        1 kB\n" +
+	meminfo := "MemTotal:       " + strconv.Itoa(8*gib) + " kB\nMemFree:        1 kB\n" +
 		"MemAvailable:   " + strconv.Itoa(memAvailKiB) + " kB\n"
 	if err := os.WriteFile(filepath.Join(proc, "meminfo"), []byte(meminfo), 0o600); err != nil {
 		t.Fatal(err)
@@ -101,14 +102,14 @@ func TestTheUsageSamplerReportsCoresAndMemoryFromProc(t *testing.T) {
 	env := []string{"CI_USAGE_PROC=" + proc, "GITHUB_STEP_SUMMARY=" + summary}
 
 	// 2 CPUs, 8 GiB. Fields: user nice system idle iowait irq softirq steal guest guest_nice.
-	usageProc(t, proc, "100 0 100 700 100 0 0 0 0 0", 2, 8*gib, 6*gib)
+	usageProc(t, proc, "100 0 100 700 100 0 0 0 0 0", 2, 6*gib)
 	runUsage(t, env, "sample", dir)
 	// Busy +400 of +600 (iowait counts as idle): 1.33 cores. Guest +900, which
 	// is already inside user and must not be counted again. 4 GiB held.
-	usageProc(t, proc, "400 0 200 800 200 0 0 0 900 0", 2, 8*gib, 4*gib)
+	usageProc(t, proc, "400 0 200 800 200 0 0 0 900 0", 2, 4*gib)
 	runUsage(t, env, "sample", dir)
 	// Busy +100 of +1100: 0.18 cores. 1 GiB held.
-	usageProc(t, proc, "500 0 200 1700 300 0 0 0 900 0", 2, 8*gib, 7*gib)
+	usageProc(t, proc, "500 0 200 1700 300 0 0 0 900 0", 2, 7*gib)
 	runUsage(t, env, "sample", dir)
 
 	// report takes one more sample, unchanged, which adds no interval.
@@ -148,10 +149,10 @@ func TestTheUsageSamplerLeavesOutWhatTheCountersCannotAccountFor(t *testing.T) {
 	env := []string{"CI_USAGE_PROC=" + proc}
 
 	// busy 200 of 1000.
-	usageProc(t, proc, "100 0 100 700 100 0 0 0", 2, 8*gib, 6*gib)
+	usageProc(t, proc, "100 0 100 700 100 0 0 0", 2, 6*gib)
 	runUsage(t, env, "sample", dir)
 	// iowait -50: busy +100 against total +50, which would read as 4 cores on 2.
-	usageProc(t, proc, "200 0 100 700 50 0 0 0", 2, 8*gib, 6*gib)
+	usageProc(t, proc, "200 0 100 700 50 0 0 0", 2, 6*gib)
 	runUsage(t, env, "sample", dir)
 
 	// A read that fails appends nothing.
@@ -162,7 +163,7 @@ func TestTheUsageSamplerLeavesOutWhatTheCountersCannotAccountFor(t *testing.T) {
 	runUsage(t, env, "sample", dir)
 
 	// The CPU count changes: 4 CPUs now.
-	usageProc(t, proc, "300 0 100 1100 50 0 0 0", 4, 8*gib, 6*gib)
+	usageProc(t, proc, "300 0 100 1100 50 0 0 0", 4, 6*gib)
 	runUsage(t, env, "sample", dir)
 
 	// A line cut short by a write that stopped.
@@ -180,11 +181,11 @@ func TestTheUsageSamplerLeavesOutWhatTheCountersCannotAccountFor(t *testing.T) {
 	}
 
 	// busy -100, which a counter cannot do.
-	usageProc(t, proc, "200 0 100 1250 50 0 0 0", 4, 8*gib, 6*gib)
+	usageProc(t, proc, "200 0 100 1250 50 0 0 0", 4, 6*gib)
 	runUsage(t, env, "sample", dir)
 
 	// busy +100 and steal +100 of +300 across 4 CPUs: 1.33 cores run, 1.33 stolen.
-	usageProc(t, proc, "300 0 100 1350 50 0 0 100", 4, 8*gib, 5*gib)
+	usageProc(t, proc, "300 0 100 1350 50 0 0 100", 4, 5*gib)
 	runUsage(t, env, "sample", dir)
 
 	out := runUsage(t, env, "report", dir, "policy")
@@ -217,7 +218,7 @@ func TestTheUsageSamplerCallsAReportWithALongGapPartial(t *testing.T) {
 
 		var samples strings.Builder
 		for i, at := range tc.times {
-			fmt.Fprintf(&samples, "%d 2 %d %d 0 %d %d\n", 1700000000+at, 100*i, 1000*(i+1), 8*gib, 6*gib)
+			fmt.Fprintf(&samples, "%d 2 %d %d 0 %d %d\n", 1700000000+at, 100*i, 1000*(i+1), 6*gib)
 		}
 
 		if err := os.WriteFile(filepath.Join(dir, "samples"), []byte(samples.String()), 0o600); err != nil {
@@ -292,7 +293,7 @@ func TestTheUsageSamplerSamplesOnceAsItStarts(t *testing.T) {
 	t.Parallel()
 
 	proc, dir := t.TempDir(), t.TempDir()
-	usageProc(t, proc, "100 0 100 800 0 0 0 0 0 0", 2, 8*gib, 6*gib)
+	usageProc(t, proc, "100 0 100 800 0 0 0 0 0 0", 2, 6*gib)
 
 	if err := os.WriteFile(filepath.Join(dir, "samples"), []byte("1 2 3 4 5 6 7\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -350,7 +351,12 @@ func startUsage(t *testing.T, env []string, dir string) {
 	}
 
 	pgid := cmd.Process.Pid
-	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+	t.Cleanup(func() {
+		// Gone already once report stopped it; anything else is worth knowing.
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Errorf("kill the sampler's group %d: %v", pgid, err)
+		}
+	})
 
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("ci-usage.sh start: %v", err)
@@ -365,7 +371,7 @@ func TestTheUsageSamplerSamplesInTheBackgroundAndStopsWhenItReports(t *testing.T
 	proc, dir := t.TempDir(), t.TempDir()
 	env := []string{"CI_USAGE_PROC=" + proc, "CI_USAGE_INTERVAL=0.05"}
 
-	usageProc(t, proc, "100 0 100 800 0 0 0 0 0 0", 2, 8*gib, 6*gib)
+	usageProc(t, proc, "100 0 100 800 0 0 0 0 0 0", 2, 6*gib)
 	startUsage(t, env, dir)
 
 	raw, err := os.ReadFile(filepath.Join(dir, "pid"))
@@ -380,7 +386,7 @@ func TestTheUsageSamplerSamplesInTheBackgroundAndStopsWhenItReports(t *testing.T
 
 	// THE LOOP SAMPLES ON ITS OWN: a reading written after start returned
 	// reaches the samples, whole.
-	usageProc(t, proc, "300 0 100 1000 0 0 0 0 0 0", 2, 8*gib, 4*gib)
+	usageProc(t, proc, "300 0 100 1000 0 0 0 0 0 0", 2, 4*gib)
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -436,7 +442,7 @@ func TestTheUsageSamplerTakesFiveSecondsForABadInterval(t *testing.T) {
 
 	for _, interval := range []string{"", "0", "-1", "abc", "1.2.3", ".5", "5."} {
 		proc, dir := t.TempDir(), t.TempDir()
-		usageProc(t, proc, "100 0 100 800 0 0 0 0 0 0", 2, 8*gib, 6*gib)
+		usageProc(t, proc, "100 0 100 800 0 0 0 0 0 0", 2, 6*gib)
 		startUsage(t, []string{"CI_USAGE_PROC=" + proc, "CI_USAGE_INTERVAL=" + interval}, dir)
 
 		if got, err := os.ReadFile(filepath.Join(dir, "interval")); err != nil || string(got) != "5\n" {
