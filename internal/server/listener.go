@@ -344,6 +344,10 @@ type Listener struct {
 	// Never nil; see noRunner.
 	runner   dispatch.Runner
 	registry RunnerRegistry
+	// githubTarget is the GitHub path of the owner this listener's session is
+	// on, recorded on every member it journals; empty in the single-provisioner
+	// assembly, which records none. See WithGitHubTarget.
+	githubTarget string
 	// offline is what reconcilePool remembers about idle members between polls,
 	// and now its clock; nil is the wall clock. See retireOfflineMembers.
 	offline offlineWatch

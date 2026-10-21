@@ -685,6 +685,9 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 			return s.openSession(ctx, t, set, prov)
 		}),
 		WithPoolLaunchBatch(poolLaunchBatchFor(t)))
+	if target, ok := s.targetFor(t); ok {
+		opts = append(opts, WithGitHubTarget(target.Config.Path()))
+	}
 
 	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
 }

@@ -1,6 +1,6 @@
--- migration 64: tier_releases, for PostgreSQL
+-- migration 64: runner_github_target, for PostgreSQL
 --
--- The twin of migrations/0064_tier_releases.sql.
+-- The twin of migrations/0064_runner_github_target.sql.
 --
 -- It carries that file's statements with SQLite's spellings translated and
 -- nothing else changed, so the two read side by side. The reasoning lives
@@ -11,8 +11,9 @@
 -- refuses to open.
 
 -- +billet:statement
-CREATE TABLE tier_releases (
-    tier text PRIMARY KEY NOT NULL,
-    generation bigint NOT NULL
-);
+ALTER TABLE leases ADD COLUMN github_target text NOT NULL DEFAULT '';
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE pool_runners ADD COLUMN github_target text NOT NULL DEFAULT '';
 -- +billet:end

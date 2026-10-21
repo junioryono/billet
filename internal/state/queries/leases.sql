@@ -119,6 +119,21 @@ UPDATE leases SET failure_reason = @failure_reason
 -- forever.
 UPDATE leases SET deregistered = 1 WHERE id = @id;
 
+-- name: RecordLeaseGitHubTarget :exec
+-- Record the GitHub owner a lease's runner is about to be registered on.
+--
+-- WRITE-ONCE AND FENCED. The caller reads the column inside the same
+-- transaction and refuses a different owner, so the filter here only keeps a
+-- written value from ever being replaced; a reclaimed lease's holder matches
+-- no row.
+UPDATE leases SET github_target = @github_target
+ WHERE id = @id AND epoch = @epoch AND github_target = '';
+
+-- name: ReadLeaseGitHubTarget :one
+-- The GitHub owner a lease's runner was registered on, empty when none was
+-- recorded (migration 64).
+SELECT github_target FROM leases WHERE id = @id;
+
 -- name: SetLeasePhase :exec
 -- Move a lease to a phase the caller has already validated.
 UPDATE leases SET phase = @phase WHERE id = @id AND epoch = @epoch;
@@ -260,7 +275,7 @@ SELECT CAST(COUNT(*) AS BIGINT) FROM leases
 
 -- name: BumpTierReleases :exec
 -- Advances a tier's release generation, in the transaction that closes one of
--- its leases (migration 64 says why a generation and not a time).
+-- its leases (migration 66 says why a generation and not a time).
 INSERT INTO tier_releases (tier, generation) VALUES (@tier, 1)
 ON CONFLICT (tier) DO UPDATE SET generation = tier_releases.generation + 1;
 

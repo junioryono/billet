@@ -187,18 +187,6 @@ func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
 	}
 
-	if len(req.TargetJIT) > 0 {
-		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
-	}
-
-	if len(req.TargetJIT) > 0 {
-		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
-	}
-
-	if len(req.TargetJIT) > 0 {
-		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
-	}
-
 	wire.Handler = nodeplane.Handler(req.Log, req.Plane, req.Leases, req.JIT, opts...)
 
 	return wire, nil

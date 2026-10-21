@@ -203,7 +203,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.
 			if errors.Is(regErr, alloc.ErrLeaseNotFound) {
 				regErr = l.alloc.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: lease.ID,
 					Tier: l.tier, LaunchRequestID: job.RequestID,
-					RunnerName: provider.InstanceName(lease.ID)})
+					RunnerName: provider.InstanceName(lease.ID), GitHubTarget: l.githubTarget})
 			} else if regErr == nil && (binding.Tier != l.tier ||
 				binding.LaunchRequestID != job.RequestID) {
 				regErr = fmt.Errorf("%w: lease is registered for tier %q request %d",

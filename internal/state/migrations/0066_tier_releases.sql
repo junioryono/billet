@@ -1,4 +1,4 @@
--- migration 64: tier_releases
+-- migration 66: tier_releases
 --
 -- HOW MANY LEASES OF EACH TIER HAVE CLOSED, as a generation every
 -- terminalization advances in its own transaction (#140). A listener publishes

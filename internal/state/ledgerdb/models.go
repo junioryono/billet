@@ -161,6 +161,7 @@ type PoolRunner struct {
 	JobRepository      string
 	JobWorkflowRef     string
 	JobEvent           string
+	GithubTarget       string
 }
 
 type RevokedCert struct {

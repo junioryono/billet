@@ -43,6 +43,14 @@ func WithCachePublication(spec config.CacheSpec, evidence RunEvidence) Option {
 	}
 }
 
+// WithGitHubTarget names the GitHub owner, by path, whose scale set this
+// listener's session is on. A member the listener journals is one GitHub
+// reported on that session, so the owner is proved, and the binding records it
+// for the plane to remove or recover the runner through (#93).
+func WithGitHubTarget(path string) Option {
+	return func(l *Listener) { l.githubTarget = path }
+}
+
 func WithRunnerRegistry(registry RunnerRegistry) Option {
 	return func(l *Listener) { l.registry = registry }
 }
