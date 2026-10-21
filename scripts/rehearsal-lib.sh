@@ -432,7 +432,7 @@ rehearsal_stopped() {
 
 # rehearsal_units_run_installed_binary proves every billet service running on a
 # host executes the binary installed at /usr/bin/billet NOW, not one an upgrade
-# replaced under it.
+# replaced under it: rehearsal_units_run_installed_binary <host> <unit>...
 #
 # FOUND BY A REAL ROLLOUT (#503): the automatic v0.16.5 -> v0.16.6 rollout
 # committed on a node and left billet-uplink.service running the replaced binary
@@ -442,17 +442,22 @@ rehearsal_stopped() {
 #
 # BY INODE, NOT BY NAME: a process whose binary was replaced in place still
 # reads /usr/bin/billet through its exe link, suffixed " (deleted)"; one started
-# from the new binary resolves to the same file /usr/bin/billet does. A oneshot
-# that has finished has no MainPID and is skipped; a service running nothing at
-# all is a failure, because a host with no billet unit running proves nothing.
+# from the new binary resolves to the same file /usr/bin/billet does. Every unit
+# with a process is checked, whether active, starting, reloading or stopping,
+# because a unit caught mid-restart still runs whatever binary it runs. A
+# oneshot that has finished has no MainPID and is skipped, but each unit the
+# caller names must have been checked: a required unit with no process proves
+# nothing, so it fails.
 rehearsal_units_run_installed_binary() {
-    docker exec "$1" sh -c '
+    local name=$1
+    shift
+    docker exec "${name}" sh -c '
         want=$(stat -L -c "%d:%i" /usr/bin/billet) || { echo "cannot stat /usr/bin/billet"; exit 2; }
-        units=$(systemctl list-units --type=service --state=active --no-legend --plain "billet*" | awk "{print \$1}")
-        test -n "$units" || { echo "no billet service is active"; exit 3; }
-        checked=0
+        units=$(systemctl list-units --type=service --state=active,activating,reloading,deactivating \
+            --no-legend --plain "billet*" | awk "{print \$1}") || { echo "cannot list the billet units"; exit 2; }
+        checked=" "
         for u in $units; do
-            pid=$(systemctl show -p MainPID --value "$u")
+            pid=$(systemctl show -p MainPID --value "$u") || { echo "$u: cannot read its MainPID"; exit 2; }
             case "$pid" in "" | 0) continue ;; esac
             exe=$(readlink "/proc/$pid/exe") || { echo "$u: could not read the binary of pid $pid"; exit 4; }
             case "$exe" in
@@ -461,10 +466,15 @@ rehearsal_units_run_installed_binary() {
             got=$(stat -L -c "%d:%i" "/proc/$pid/exe") || { echo "$u: could not stat pid $pid"; exit 4; }
             test "$got" = "$want" || { echo "$u (pid $pid) runs $exe, not the installed /usr/bin/billet"; exit 1; }
             echo "$u (pid $pid) runs the installed binary"
-            checked=$((checked + 1))
+            checked="$checked$u "
         done
-        test "$checked" -gt 0 || { echo "no billet service has a running process"; exit 3; }
-    '
+        for required in "$@"; do
+            case "$checked" in
+                *" $required "*) ;;
+                *) echo "$required has no running process to check"; exit 3 ;;
+            esac
+        done
+    ' rehearsal_units_run_installed_binary "$@"
 }
 
 # rehearsal_wait_for polls a command in a host until it succeeds or the

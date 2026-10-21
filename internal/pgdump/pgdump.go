@@ -55,8 +55,10 @@ type Client struct {
 	dsn state.DSN
 	env state.ClientEnv
 
-	// lookPath finds a program; a test replaces it to execute a fake.
-	lookPath func(string) (string, error)
+	// lookPath finds a program, and dropOutside drops what a restore replaces
+	// (state.DropTablesOutside); a test replaces them to run fakes.
+	lookPath    func(string) (string, error)
+	dropOutside func(ctx context.Context, dsn state.DSN, schema string, keep []string) ([]string, error)
 }
 
 // New renders dsn for the client programs. It refuses a DSN that libpq cannot
@@ -67,7 +69,7 @@ func New(dsn state.DSN) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{dsn: dsn, env: env, lookPath: exec.LookPath}, nil
+	return &Client{dsn: dsn, env: env, lookPath: exec.LookPath, dropOutside: state.DropTablesOutside}, nil
 }
 
 // String names the client and never the connection.
@@ -122,10 +124,15 @@ func (c *Client) Dump(ctx context.Context, fenceDir, dest string) (Dumped, error
 				"pg_dump cannot copy a newer server. %s", path, major, server, installAdvice(server))
 		}
 
+		// THE SCHEMA AS AN EXACT NAME, NOT A PATTERN. pg_dump reads --schema as
+		// a pattern: unquoted, the name is folded to lower case and `*`, `?` and
+		// regular-expression characters match other schemas, so `Billet` could
+		// dump `billet` and `billet*` every schema it matches. Double-quoted,
+		// every character is literal.
 		args := []string{
 			"--format=custom",
 			"--no-password",
-			"--schema=" + snap.Schema,
+			"--schema=" + quoteName(snap.Schema),
 			"--snapshot=" + snap.ID,
 			"--file=" + dest,
 		}
@@ -169,12 +176,25 @@ func (c *Client) CheckDump(ctx context.Context) error {
 	return nil
 }
 
-// Restore puts a dump into the ledger's schema, in one transaction.
+// Restore replaces the ledger in schema with a dump's, and only with what the
+// dump holds of that schema.
 //
-// --single-transaction MAKES IT ALL OR NOTHING: a failure part-way leaves the
-// schema exactly as it was (measured 2026-10-20: a restore refused at its third
-// statement left none of its tables behind), which is what lets a resumed or
-// abandoned operation reason about the database by the journal alone.
+// --single-transaction MAKES THE RESTORE ALL OR NOTHING: a failure part-way
+// leaves the schema exactly as it was (measured 2026-10-20: a restore refused
+// at its third statement left none of its tables behind).
+//
+// AND IT IS A REPLACEMENT, NOT AN OVERLAY. --clean drops only what the dump
+// holds, so the tables in schema the dump does not name (a later migration's)
+// are dropped first, in a transaction of their own (state.DropTablesOutside).
+// Every caller holds a durable copy of what is there, or proof that nothing is,
+// before it calls this, so a failure between the two is recovered from that
+// copy rather than lost.
+//
+// SCHEMA IS THE ONE THE CALLER PLANNED FOR, and nothing outside it is touched:
+// pg_restore restores only that schema's entries (--schema), and a dump that
+// holds no table of it is refused before anything is dropped. A manifest whose
+// schema disagrees with its dump would otherwise send the cleanup into one
+// schema and the restore into another.
 //
 // THE SCHEMA ITSELF IS NOT RESTORED. pg_dump --schema writes the schema as an
 // entry of its own, and --clean then emits `DROP SCHEMA IF EXISTS <s>` and
@@ -182,15 +202,18 @@ func (c *Client) CheckDump(ctx context.Context) error {
 // when anything else lives in that schema, and for `public` it would recreate a
 // schema the database owner owns as one the restoring role owns. So the entry is
 // filtered out of the restore's list and the schema must already exist, which
-// the caller has proved by finding current_schema() equal to the dump's.
+// the caller has proved by finding current_schema() equal to it.
 //
 // --no-owner and --no-privileges, because the objects belong to whichever role
 // this deployment connects as here, which need not be the source's.
 //
-// lock_timeout BOUNDS THE WAIT: --clean takes an exclusive lock on every table
-// it drops, and a session holding one would otherwise keep the restore waiting
-// for as long as it lived.
-func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int) error {
+// THE WAIT FOR A LOCK IS NOT BOUNDED BY A SETTING: pg_restore sets
+// lock_timeout to 0 itself before it restores anything, whatever the session
+// was started with. The writer barrier has proved no billet transaction is in
+// flight and the deployment is fenced, so a lock it waits on belongs to some
+// other session, which pg_stat_activity names; interrupting the command ends
+// the restore's transaction, which changes nothing.
+func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int, schema string) error {
 	path, major, err := c.program(ctx, "pg_restore")
 	if err != nil {
 		return err
@@ -205,6 +228,12 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int) erro
 	toc, err := c.run(ctx, path, "--list", dump)
 	if err != nil {
 		return err
+	}
+
+	keep := tablesOf(toc, schema)
+	if len(keep) == 0 {
+		return fmt.Errorf("pgdump: %s holds no table of schema %s, so it is not a ledger to "+
+			"restore there; billet changed nothing", dump, schema)
 	}
 
 	dir, err := os.MkdirTemp("", "billet-restore-list-*")
@@ -224,12 +253,37 @@ func (c *Client) Restore(ctx context.Context, dump string, dumpVersion int) erro
 		return err
 	}
 
-	_, err = c.runWith(ctx, []string{"PGOPTIONS=" + c.restoreOptions()}, path,
+	if _, err := c.dropOutside(ctx, c.dsn, schema, keep); err != nil {
+		return err
+	}
+
+	_, err = c.run(ctx, path,
 		"--single-transaction", "--exit-on-error", "--clean", "--if-exists",
 		"--no-owner", "--no-privileges", "--no-password",
-		"--use-list="+list, "--dbname="+db, dump)
+		"--schema="+schema, "--use-list="+list, "--dbname="+db, dump)
 
 	return err
+}
+
+// quoteName quotes a name for a pg_dump pattern, so it matches that name and
+// nothing else.
+func quoteName(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
+
+// tocTable matches a restore-list line for a table, e.g.
+// `220; 1259 16386 TABLE s1 t billet` (measured): the namespace, then the name.
+var tocTable = regexp.MustCompile(`^\d+; \d+ \d+ TABLE (\S+) (\S+) `)
+
+// tablesOf lists the tables a dump's restore list holds in schema.
+func tablesOf(toc []byte, schema string) []string {
+	var out []string
+
+	for line := range strings.SplitSeq(string(toc), "\n") {
+		if m := tocTable.FindStringSubmatch(line); len(m) == 3 && m[1] == schema {
+			out = append(out, m[2])
+		}
+	}
+
+	return out
 }
 
 // tocSchemaEntry matches the restore-list lines for the schema itself: its
@@ -248,18 +302,6 @@ func withoutSchemaEntries(toc []byte) []byte {
 	}
 
 	return []byte(strings.Join(lines, "\n"))
-}
-
-// restoreOptions is the PGOPTIONS a restore runs with: the DSN's own, and the
-// lock timeout after them.
-func (c *Client) restoreOptions() string {
-	for _, v := range c.env.Environ(nil) {
-		if opts, ok := strings.CutPrefix(v, "PGOPTIONS="); ok {
-			return opts + " -c lock_timeout=30s"
-		}
-	}
-
-	return "-c lock_timeout=30s"
 }
 
 // databaseConninfo names the database for pg_restore's --dbname, which must be
@@ -330,15 +372,11 @@ func installAdvice(major int) string {
 // stderrLimit bounds what a client program's complaint can grow to in an error.
 const stderrLimit = 8 << 10
 
+// run runs a client program with the connection in its environment, and
+// returns its standard output.
 func (c *Client) run(ctx context.Context, path string, args ...string) ([]byte, error) {
-	return c.runWith(ctx, nil, path, args...)
-}
-
-// runWith runs a client program with the connection in its environment and
-// extra laid over that, and returns its standard output.
-func (c *Client) runWith(ctx context.Context, extra []string, path string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.Env = append(c.env.Environ(os.Environ()), append([]string{"LC_ALL=C"}, extra...)...)
+	cmd.Env = append(c.env.Environ(os.Environ()), "LC_ALL=C")
 
 	var stdout, stderr bytes.Buffer
 

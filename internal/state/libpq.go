@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,9 +41,11 @@ type ClientEnv struct {
 
 // Environ returns parent with this connection's variables laid over it.
 //
-// THE PARENT'S PG* VARIABLES ARE KEPT where the DSN does not name the setting,
-// because pgx read them too: a PGSSLMODE in the service's environment is the same
-// default to billet's own connection and to the client program's.
+// THE PARENT'S PG* VARIABLES ARE KEPT ONLY WHERE pgx READ THEM TOO. A PGSSLMODE in
+// the service's environment is a default billet's own connection took, so the
+// client program takes it as well. One pgx never reads (PGHOSTADDR, say) is
+// dropped: libpq would act on it and billet did not, and the client program
+// would reach a server billet never looked at.
 func (e ClientEnv) Environ(parent []string) []string {
 	set := make(map[string]bool, len(e.vars))
 	for _, v := range e.vars {
@@ -53,13 +56,35 @@ func (e ClientEnv) Environ(parent []string) []string {
 
 	for _, v := range parent {
 		name, _, _ := strings.Cut(v, "=")
-		if !set[name] {
+
+		switch {
+		case set[name]:
+		case strings.HasPrefix(name, "PG") && !pgxReadsEnv[name]:
+		default:
 			out = append(out, v)
 		}
 	}
 
 	return append(out, e.vars...)
 }
+
+// pgxReadsEnv is every PG* variable pgx v5 takes a default from (pgconn's
+// parseEnvSettings), the only ones a client program may inherit.
+var pgxReadsEnv = map[string]bool{
+	"PGHOST": true, "PGPORT": true, "PGDATABASE": true, "PGUSER": true, "PGPASSWORD": true,
+	"PGPASSFILE": true, "PGAPPNAME": true, "PGCONNECT_TIMEOUT": true, "PGSSLMODE": true,
+	"PGSSLKEY": true, "PGSSLCERT": true, "PGSSLSNI": true, "PGSSLROOTCERT": true,
+	"PGSSLNEGOTIATION": true, "PGTARGETSESSIONATTRS": true, "PGTZ": true, "PGOPTIONS": true,
+	"PGMINPROTOCOLVERSION": true, "PGMAXPROTOCOLVERSION": true, "PGCHANNELBINDING": true,
+	"PGREQUIREAUTH": true,
+}
+
+// unrenderableEnv are variables pgx reads and libpq either reads with a
+// different precedence or not at all. A service file's settings override
+// libpq's environment where pgx lets the connection string override them, and
+// libpq has no sslpassword variable, so with any of these set the two programs
+// would connect differently, and the rendering refuses rather than guesses.
+var unrenderableEnv = []string{"PGSERVICE", "PGSERVICEFILE", "PGSSLPASSWORD"}
 
 // Redact removes the password from text a client program wrote, before the text
 // can reach an error. libpq does not print a password it was given, and this is
@@ -115,15 +140,12 @@ func (e ClientEnv) LogValue() slog.Value { return slog.StringValue(e.String()) }
 // connection that verifies less than billet's own, and nothing would say so.
 var libpqVariables = map[string]string{
 	"host":                     "PGHOST",
-	"hostaddr":                 "PGHOSTADDR",
 	"port":                     "PGPORT",
 	"dbname":                   "PGDATABASE",
 	"database":                 "PGDATABASE",
 	"user":                     "PGUSER",
 	"password":                 "PGPASSWORD",
 	"passfile":                 "PGPASSFILE",
-	"service":                  "PGSERVICE",
-	"servicefile":              "PGSERVICEFILE",
 	"application_name":         "PGAPPNAME",
 	"connect_timeout":          "PGCONNECT_TIMEOUT",
 	"client_encoding":          "PGCLIENTENCODING",
@@ -156,23 +178,28 @@ var pgxOnlyKeywords = map[string]bool{
 	"fallback_application_name":  true,
 }
 
-// unrenderableKeywords change how the connection authenticates and have no
-// libpq environment variable, so a client program would connect differently
-// from billet. Refused by name, so the refusal can say which.
+// unrenderableKeywords are settings a client program would act on differently
+// from billet, refused by name so the refusal can say which: sslpassword and
+// krbspn have no libpq variable; a service's settings override libpq's
+// environment where pgx lets the connection string override them; and pgx
+// ignores hostaddr, which libpq would dial instead of the host.
 var unrenderableKeywords = map[string]bool{
 	"sslpassword": true,
 	"krbspn":      true,
+	"service":     true,
+	"servicefile": true,
+	"hostaddr":    true,
 }
 
 // LibpqEnv renders a DSN as the environment libpq reads it from.
 //
-// THE TEXT IS READ HERE, BESIDE registerConn, because this package is the one
-// place a connection string is read as text. pgconn.Config is not enough on its
-// own: it keeps no TLS file paths (sslrootcert, sslcert and sslkey become a
-// loaded tls.Config), so a rendering built from it alone would verify less than
-// billet's connection does. So the keywords come from the text, and pgx's parse
-// of the same text supplies the defaults pgx resolved (the host it would dial,
-// the user, the database) and is the cross-check: where both name a field they
+// THE TEXT IS READ HERE, BESIDE registerConn, because this package is where a
+// connection string is read as text. pgconn.Config is not enough on its own: it
+// keeps no TLS file paths (sslrootcert, sslcert and sslkey become a loaded
+// tls.Config), so a rendering built from it alone would verify less than
+// billet's connection does. So the keywords come from the text, while pgx's
+// parse of the same text decides where to dial (agreeWithPgx), supplies the
+// defaults it resolved, and is the cross-check: where both name a field they
 // must agree, or the client program would reach a different database.
 //
 // A refusal quotes nothing the DSN contains, by the rule errUnparsableDSN states.
@@ -184,12 +211,21 @@ func LibpqEnv(dsn DSN) (ClientEnv, error) {
 				"variable named by server.state.postgres.dsn_env")
 	}
 
-	cfg, err := pgx.ParseConfig(text)
-	if err != nil {
-		return ClientEnv{}, errUnparsableDSN
+	// THE ENVIRONMENT pgx READ is part of the connection too, and these settings
+	// in it would be taken differently by libpq.
+	for _, name := range unrenderableEnv {
+		if os.Getenv(name) != "" {
+			return ClientEnv{}, fmt.Errorf(
+				"state: %s is set in this process's environment, and pg_dump and pg_restore "+
+					"would act on it differently from billet's own connection; unset it and "+
+					"spell the connection out in the data source", name)
+		}
 	}
 
-	var settings map[string]string
+	var (
+		settings map[string]string
+		err      error
+	)
 
 	if strings.HasPrefix(text, "postgres://") || strings.HasPrefix(text, "postgresql://") {
 		settings, err = uriSettings(text)
@@ -199,6 +235,23 @@ func LibpqEnv(dsn DSN) (ClientEnv, error) {
 
 	if err != nil {
 		return ClientEnv{}, err
+	}
+
+	// REFUSED BY NAME BEFORE pgx PARSES, because pgx acts on some of them while
+	// it parses (it reads a service file), and a refusal that names the keyword
+	// is one an operator can act on.
+	for key := range settings {
+		if unrenderableKeywords[key] {
+			return ClientEnv{}, fmt.Errorf(
+				"state: the PostgreSQL data source sets %s, which pg_dump and pg_restore would "+
+					"act on differently from billet's own connection, so they could reach or "+
+					"authenticate to a different server; spell the connection out without it", key)
+		}
+	}
+
+	cfg, err := pgx.ParseConfig(text)
+	if err != nil {
+		return ClientEnv{}, errUnparsableDSN
 	}
 
 	vars := map[string]string{}
@@ -221,11 +274,6 @@ func LibpqEnv(dsn DSN) (ClientEnv, error) {
 		case ok:
 			vars[name] = value
 		case pgxOnlyKeywords[key] || strings.HasPrefix(key, "pool_"):
-		case unrenderableKeywords[key]:
-			return ClientEnv{}, fmt.Errorf(
-				"state: the PostgreSQL data source sets %s, which libpq reads from no "+
-					"environment variable, so pg_dump and pg_restore would connect differently "+
-					"from billet; move that setting to a service file or drop it", key)
 		default:
 			options = append(options, "-c "+escapeOption(key)+"="+escapeOption(value))
 		}
@@ -249,33 +297,59 @@ func LibpqEnv(dsn DSN) (ClientEnv, error) {
 	return ClientEnv{vars: out, password: vars["PGPASSWORD"]}, nil
 }
 
-// agreeWithPgx fills what the text left to defaults from pgx's own resolution,
-// and refuses a field the two read differently.
+// agreeWithPgx makes the client program dial what pgx dials, fills what the
+// text left to defaults from pgx's own resolution, and refuses a field the two
+// read differently.
 //
-// FILLED, so that a default is resolved once, by the parser billet's own
-// connection used: pgx and libpq choose a default socket directory differently,
-// and a dump of whatever answers at the other one is not this ledger's.
+// THE ENDPOINTS ARE pgx's, NEVER THE TEXT'S. The two parsers resolve a host
+// list differently: pgx skips an empty port and maps the rest by position, so
+// `h1,h2:6543` dials h1:6543, where libpq would dial h1 on its default port.
+// And pgx and libpq choose a default socket directory differently. So the host
+// and port lists are rendered from what pgx resolved, its primary and its
+// fallbacks in order, which is exactly where billet's own connection goes.
 func agreeWithPgx(vars map[string]string, cfg *pgx.ConnConfig) error {
+	var hosts, ports []string
+
+	seen := map[string]bool{}
+
+	add := func(host string, port uint16) {
+		if key := host + "\x00" + strconv.Itoa(int(port)); !seen[key] {
+			seen[key] = true
+
+			hosts = append(hosts, host)
+			ports = append(ports, strconv.Itoa(int(port)))
+		}
+	}
+
+	add(cfg.Host, cfg.Port)
+
+	for _, fb := range cfg.Fallbacks {
+		add(fb.Host, fb.Port)
+	}
+
+	for _, h := range hosts {
+		if strings.Contains(h, ",") {
+			return errors.New("state: the PostgreSQL data source names a host with a comma in " +
+				"it, which libpq would read as two")
+		}
+	}
+
+	vars["PGHOST"] = strings.Join(hosts, ",")
+	vars["PGPORT"] = strings.Join(ports, ",")
+
 	fields := []struct{ name, pgx string }{
-		{"PGHOST", cfg.Host},
-		{"PGPORT", strconv.Itoa(int(cfg.Port))},
 		{"PGUSER", cfg.User},
 		{"PGDATABASE", cfg.Database},
 	}
-
-	multiHost := strings.Contains(vars["PGHOST"], ",")
 
 	for _, f := range fields {
 		have, ok := vars[f.name]
 
 		switch {
 		case !ok:
-			if f.pgx != "" && f.pgx != "0" {
+			if f.pgx != "" {
 				vars[f.name] = f.pgx
 			}
-		case multiHost && (f.name == "PGHOST" || f.name == "PGPORT"):
-			// A host list is libpq's to walk; pgx keeps its first entry in Host and
-			// the rest as fallbacks, so the two are not the same shape to compare.
 		case have != f.pgx:
 			return fmt.Errorf("state: billet and libpq read the PostgreSQL data source's %s "+
 				"differently, so pg_dump and pg_restore would reach a different database "+

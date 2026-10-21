@@ -148,14 +148,26 @@ type journal struct {
 	// reading it as somebody else's populated schema would refuse its own work.
 	// Only a schema-4 archive's run writes it, which no build that reads schema 3
 	// alone can open, so its absence on an older journal means what it always did.
-	LedgerRestored bool     `json:"ledger_restored,omitempty"`
-	ArchiveDir     string   `json:"archive_dir"`
-	ManifestSHA    string   `json:"manifest_sha256"`
-	DeploymentID   string   `json:"deployment_id"`
-	StartedAt      string   `json:"started_at"`
-	Actor          string   `json:"actor"`
-	Created        []string `json:"created"`
-	RemovedFiles   []string `json:"removed_files,omitempty"`
+	LedgerRestored bool `json:"ledger_restored,omitempty"`
+	// SupersedePublished says a PostgreSQL recovery's copy of the ledger it
+	// replaces is durable at its name, which is the moment after which the
+	// archive's restore may run. An abandon that finds the copy gone after this
+	// cannot say what the database holds, and refuses.
+	SupersedePublished bool `json:"supersede_published,omitempty"`
+	// SupersededDumpVersion is the major of the pg_dump that took that copy, so
+	// the put-back holds pg_restore to it as the archive's restore is held.
+	SupersededDumpVersion int `json:"superseded_dump_version,omitempty"`
+	// SupersededDatabase is the database that copy was taken from, so a resume
+	// or an abandon refuses a connection since pointed at another one rather
+	// than replacing a ledger nobody looked at.
+	SupersededDatabase string   `json:"superseded_database,omitempty"`
+	ArchiveDir         string   `json:"archive_dir"`
+	ManifestSHA        string   `json:"manifest_sha256"`
+	DeploymentID       string   `json:"deployment_id"`
+	StartedAt          string   `json:"started_at"`
+	Actor              string   `json:"actor"`
+	Created            []string `json:"created"`
+	RemovedFiles       []string `json:"removed_files,omitempty"`
 }
 
 // RestoreRequest is what Execute acts on.

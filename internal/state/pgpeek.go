@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,10 @@ import (
 // so the two must agree), which server major answers, what has been applied,
 // and which deployment the rows say they belong to.
 type PostgresLedger struct {
+	// Database is current_database(), the name a recovery journals beside its
+	// copy so that a resume or an abandon can refuse a connection that has since
+	// been pointed somewhere else.
+	Database string
 	// Schema is current_schema(), or empty when the connection's search_path
 	// names no schema that exists.
 	Schema string
@@ -45,10 +50,10 @@ func PeekPostgresLedger(ctx context.Context, dsn DSN) (PostgresLedger, error) {
 	var out PostgresLedger
 
 	err := peekPostgres(ctx, dsn, func(be *postgresBackend, tx *sql.Tx) error {
-		//billet:ignore rawsql // asks the server which schema and which major answer, not a query over billet's tables
+		//billet:ignore rawsql // asks the server which database, schema and major answer, not a query over billet's tables
 		if err := tx.QueryRowContext(ctx,
-			`SELECT coalesce(current_schema(), ''), current_setting('server_version_num')::int`,
-		).Scan(&out.Schema, &out.ServerVersion); err != nil {
+			`SELECT current_database(), coalesce(current_schema(), ''), current_setting('server_version_num')::int`,
+		).Scan(&out.Database, &out.Schema, &out.ServerVersion); err != nil {
 			return fmt.Errorf("state: ask the server which schema this ledger is in: %w", err)
 		}
 
@@ -354,6 +359,103 @@ func holdWriterLock(ctx context.Context, be *postgresBackend, w *sql.DB) error {
 	}()
 
 	return be.beginWrite(ctx, tx)
+}
+
+// DropTablesOutside drops every table in a PostgreSQL ledger's schema that keep
+// does not name, in one transaction, and reports what it dropped.
+//
+// WHAT MAKES A RESTORE A REPLACEMENT RATHER THAN AN OVERLAY. pg_restore --clean
+// drops only the objects its dump holds, so restoring a ledger from before a
+// migration over one after it leaves that migration's tables, and their rows,
+// beside the restored schema_migrations that says the migration never ran: the
+// next start re-runs it and fails on a table that already exists, or worse,
+// serves a mix of the two ledgers. billet's migrations create tables and their
+// indexes and nothing else, so dropping the tables the dump does not name is
+// the whole difference.
+//
+// ONLY A CALLER HOLDING A DURABLE COPY OF WHAT IS THERE, OR PROOF NOTHING IS,
+// may call this: a recovery after its superseded dump is journaled, an abandon
+// putting that dump back, a restore into a schema the planner proved empty or
+// pristine. It is its own transaction, before the restore's, so a failure
+// between the two is recovered from that copy.
+//
+// THE SCHEMA IS CHECKED, not assumed: the connection must resolve to schema,
+// or this refuses before dropping anything. lock_timeout bounds the wait for a
+// table another session holds, so a stray transaction is a refusal naming the
+// wait rather than a command that never returns.
+func DropTablesOutside(ctx context.Context, dsn DSN, schema string, keep []string) ([]string, error) {
+	be := newPostgresBackend(dsn)
+
+	pools, err := be.dataSources()
+	if err != nil {
+		return nil, err
+	}
+
+	w, err := sql.Open(be.driverName(), pools.writer)
+	if err != nil {
+		return nil, fmt.Errorf("state: open the PostgreSQL ledger: %w", err)
+	}
+
+	defer func() { _ = w.Close() }()
+
+	w.SetMaxOpenConns(1)
+
+	tx, err := w.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("state: begin dropping what a restore replaces: %w", err)
+	}
+
+	defer func() {
+		//nolint:errcheck // after a commit this is a no-op; on failure nothing was dropped.
+		_ = tx.Rollback()
+	}()
+
+	//billet:ignore rawsql // a transaction-local server setting, not a query over billet's tables
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = '30s'`); err != nil {
+		return nil, fmt.Errorf("state: bound the wait for a lock: %w", err)
+	}
+
+	var current string
+
+	//billet:ignore rawsql // asks the server which schema answers, not a query over billet's tables
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce(current_schema(), '')`).Scan(&current); err != nil {
+		return nil, fmt.Errorf("state: ask the server which schema this ledger is in: %w", err)
+	}
+
+	if current != schema {
+		return nil, fmt.Errorf("state: the connection resolves to schema %q and the restore is "+
+			"into %q, so billet drops nothing", current, schema)
+	}
+
+	tables, err := be.userTables(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	var dropped []string
+
+	for _, table := range tables {
+		if slices.Contains(keep, table) {
+			continue
+		}
+
+		//nolint:gosec // G202: an identifier cannot be a bind parameter; it comes from the catalogue, quoted with every " doubled.
+		stmt := `DROP TABLE IF EXISTS "` + strings.ReplaceAll(table, `"`, `""`) + `" CASCADE`
+
+		//billet:ignore rawsql // the TABLE is the variable, discovered from the catalogue at run time
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return nil, fmt.Errorf("state: drop table %s, which the restored ledger does not have: %w",
+				table, err)
+		}
+
+		dropped = append(dropped, table)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("state: commit dropping what a restore replaces: %w", err)
+	}
+
+	return dropped, nil
 }
 
 // OpenPostgresRecovery opens a PostgreSQL ledger for `billet local recover` to

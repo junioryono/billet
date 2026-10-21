@@ -16,9 +16,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -105,6 +109,16 @@ func TestADSNIsRenderedAsTheEnvironmentLibpqReads(t *testing.T) {
 			dsn:  "postgres://u@h/d?sslmode=disable",
 			want: map[string]string{"PGPORT": "5432", "PGUSER": "u"},
 		},
+		{
+			name: "several hosts, each with its own port",
+			dsn:  "postgres://u@h1:5433,h2:5434/d?sslmode=disable",
+			want: map[string]string{"PGHOST": "h1,h2", "PGPORT": "5433,5434"},
+		},
+		{
+			name: "several hosts as keywords",
+			dsn:  "host=h1,h2 port=5433,5434 user=u dbname=d sslmode=disable",
+			want: map[string]string{"PGHOST": "h1,h2", "PGPORT": "5433,5434"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -119,8 +133,14 @@ func TestADSNIsRenderedAsTheEnvironmentLibpqReads(t *testing.T) {
 				}
 			}
 
-			if _, ok := got["PGOPTIONS"]; ok && strings.Contains(got["PGOPTIONS"], "pool_") {
-				t.Errorf("PGOPTIONS carries a pgxpool setting: %q", got["PGOPTIONS"])
+			if strings.Contains(got["PGOPTIONS"], "pool_") || strings.Contains(got["PGOPTIONS"], "cache_capacity") {
+				t.Errorf("PGOPTIONS carries a pgx setting: %q", got["PGOPTIONS"])
+			}
+
+			if _, ok := tc.want["PGOPTIONS"]; !ok {
+				if _, set := got["PGOPTIONS"]; set {
+					t.Errorf("PGOPTIONS = %q, want none: the DSN sets no runtime parameter", got["PGOPTIONS"])
+				}
 			}
 		})
 	}
@@ -153,7 +173,7 @@ func TestThePasswordIsOnlyInPGPASSWORD(t *testing.T) {
 func TestAKeywordLibpqCannotReadIsRefused(t *testing.T) {
 	t.Parallel()
 
-	for _, keyword := range []string{"sslpassword", "krbspn"} {
+	for _, keyword := range []string{"sslpassword", "krbspn", "service", "servicefile", "hostaddr"} {
 		dsn := "host=h user=u dbname=d sslmode=disable " + keyword + "=" + testDSNPassword
 
 		_, err := LibpqEnv(DSN(dsn))
@@ -205,7 +225,9 @@ func TestEnvironLaysTheConnectionOverTheParent(t *testing.T) {
 		t.Fatalf("LibpqEnv: %v", err)
 	}
 
-	got := env.Environ([]string{"PATH=/usr/bin", "PGHOST=elsewhere", "PGSSLMODE=require"})
+	got := env.Environ([]string{
+		"PATH=/usr/bin", "PGHOST=elsewhere", "PGSSLMODE=require", "PGHOSTADDR=10.0.0.9",
+	})
 
 	want := map[string]bool{"PATH=/usr/bin": true, "PGHOST=h": true, "PGSSLMODE=require": true}
 	for w := range want {
@@ -216,6 +238,77 @@ func TestEnvironLaysTheConnectionOverTheParent(t *testing.T) {
 
 	if slices.Contains(got, "PGHOST=elsewhere") {
 		t.Errorf("the parent's PGHOST survived the DSN's: %v", got)
+	}
+
+	// ONE pgx NEVER READS IS DROPPED: libpq would dial PGHOSTADDR instead of the
+	// host billet's own connection reached.
+	for _, v := range got {
+		if strings.HasPrefix(v, "PGHOSTADDR=") {
+			t.Errorf("the parent's PGHOSTADDR reached the client program: %v", got)
+		}
+	}
+}
+
+// THE ENDPOINTS ARE THE ONES pgx DIALS, whatever the text's shape: a host list
+// whose ports libpq and pgx would map differently renders as pgx's resolution,
+// primary first, so pg_dump reaches the server billet's own connection reaches.
+func TestTheEndpointsAreTheOnesPgxDials(t *testing.T) {
+	t.Parallel()
+
+	for _, dsn := range []string{
+		"postgres://u@h1,h2:6543/d?sslmode=disable",
+		"host=h1,h2 port=6543 user=u dbname=d sslmode=disable",
+	} {
+		cfg, err := pgx.ParseConfig(dsn)
+		if err != nil {
+			t.Fatalf("pgx.ParseConfig(%q): %v", dsn, err)
+		}
+
+		var hosts, ports []string
+
+		endpoints := append([]*pgconn.FallbackConfig{{Host: cfg.Host, Port: cfg.Port}}, cfg.Fallbacks...)
+		for _, ep := range endpoints {
+			port := strconv.Itoa(int(ep.Port))
+
+			seen := false
+
+			for i := range hosts {
+				if hosts[i] == ep.Host && ports[i] == port {
+					seen = true
+				}
+			}
+
+			if !seen {
+				hosts, ports = append(hosts, ep.Host), append(ports, port)
+			}
+		}
+
+		got := envOf(t, dsn)
+
+		if got["PGHOST"] != strings.Join(hosts, ",") || got["PGPORT"] != strings.Join(ports, ",") {
+			t.Errorf("%q renders as PGHOST=%q PGPORT=%q, want pgx's %q and %q",
+				dsn, got["PGHOST"], got["PGPORT"], strings.Join(hosts, ","), strings.Join(ports, ","))
+		}
+	}
+}
+
+// A SETTING IN THIS PROCESS'S ENVIRONMENT THAT libpq WOULD TAKE DIFFERENTLY IS
+// REFUSED BY NAME: a service file overrides libpq's environment where pgx lets
+// the connection string override it, and libpq has no sslpassword variable.
+func TestAnInheritedSettingLibpqTakesDifferentlyIsRefused(t *testing.T) {
+	for _, name := range []string{"PGSERVICE", "PGSERVICEFILE", "PGSSLPASSWORD"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, testDSNPassword)
+
+			_, err := LibpqEnv("postgres://u@h/d?sslmode=disable")
+			if err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("LibpqEnv with %s set = %v, want a refusal naming it", name, err)
+			}
+
+			if strings.Contains(err.Error(), testDSNPassword) {
+				t.Errorf("the refusal quotes the variable's value: %v", err)
+			}
+		})
 	}
 }
 

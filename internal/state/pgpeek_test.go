@@ -215,6 +215,10 @@ func TestTheWriterBarrierWaitsOutAWriteInFlight(t *testing.T) {
 		t.Fatalf("rollback: %v", err)
 	}
 
+	// THE PRODUCTION BOUND FOR THE PASS, so a loaded machine slow to take a free
+	// lock is not read as a writer still in flight.
+	writerBarrierLimit = prev
+
 	if err := PostgresWriterBarrier(t.Context(), dsn); err != nil {
 		t.Fatalf("the barrier with nothing in flight: %v", err)
 	}
@@ -269,5 +273,69 @@ func TestARecoveryOpenCrossesTheFenceThatStopsAnOperatorOpen(t *testing.T) {
 
 	if a.Mode != AdmissionSealed || a.Provenance != ProvenanceOperator {
 		t.Errorf("the admission read back is %+v, want an operator's seal", a)
+	}
+}
+
+// A RESTORE'S CLEANUP DROPS EXACTLY THE TABLES THE DUMP DOES NOT NAME, in the
+// schema the connection resolves to and nowhere else, and refuses a schema it
+// was not told: a manifest whose schema disagrees with the connection would
+// otherwise empty one schema and restore into another.
+func TestDropTablesOutsideDropsOnlyWhatTheDumpDoesNotName(t *testing.T) {
+	t.Parallel()
+
+	dsn := requirePostgres(t)
+	schema := schemaFrom(t, t.Name())
+
+	db, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	raw, err := sql.Open("pgx", string(dsn))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = raw.Close() }()
+
+	if _, err := raw.ExecContext(t.Context(), `CREATE TABLE "`+schema+`".a_later_migration (x int)`); err != nil {
+		t.Fatalf("create a later migration's table: %v", err)
+	}
+
+	before, err := PeekPostgresLedger(t.Context(), dsn)
+	if err != nil {
+		t.Fatalf("PeekPostgresLedger: %v", err)
+	}
+
+	keep := slices.DeleteFunc(slices.Clone(before.Tables), func(s string) bool { return s == "a_later_migration" })
+
+	// ANOTHER SCHEMA'S NAME IS REFUSED BEFORE ANYTHING IS DROPPED.
+	if _, err := DropTablesOutside(t.Context(), dsn, schema+"_other", keep); err == nil ||
+		!strings.Contains(err.Error(), "drops nothing") {
+		t.Fatalf("DropTablesOutside into another schema = %v, want a refusal", err)
+	}
+
+	if still, err := PeekPostgresLedger(t.Context(), dsn); err != nil || !slices.Equal(still.Tables, before.Tables) {
+		t.Fatalf("a refused cleanup changed the schema: %v (%v)", still.Tables, err)
+	}
+
+	dropped, err := DropTablesOutside(t.Context(), dsn, schema, keep)
+	if err != nil {
+		t.Fatalf("DropTablesOutside: %v", err)
+	}
+
+	if !slices.Equal(dropped, []string{"a_later_migration"}) {
+		t.Errorf("dropped %v, want only the table the dump does not name", dropped)
+	}
+
+	after, err := PeekPostgresLedger(t.Context(), dsn)
+	if err != nil {
+		t.Fatalf("PeekPostgresLedger: %v", err)
+	}
+
+	if !slices.Equal(after.Tables, keep) {
+		t.Errorf("after the cleanup the schema holds %v, want %v", after.Tables, keep)
 	}
 }

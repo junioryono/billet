@@ -1,6 +1,7 @@
 package pgdump
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -8,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/junioryono/billet/internal/state"
@@ -21,11 +24,20 @@ const testPassword = "hunter2-the-dump-password"
 // client program: it answers --version with the given major, records its argv
 // one argument per line and its environment, and for --list prints a TOC with
 // the schema's own entries in it, in the shape pg_restore prints (measured
-// 2026-10-20).
+// 2026-10-20), and a table of another schema beside the restored one's.
 //
 // EXECUTED, NOT PATTERN-MATCHED (billet-testing): the arguments and the
 // environment asserted on are the ones a real process received.
 func fakeProgram(t *testing.T, dir, name string, major int) {
+	t.Helper()
+
+	writeFakeProgram(t, dir, name, major, `    echo '220; 1259 16386 TABLE billet_x admission billet'
+    echo '221; 1259 16390 TABLE elsewhere stray billet'
+    echo '3482; 0 16386 TABLE DATA billet_x admission billet'`)
+}
+
+// writeFakeProgram is fakeProgram with the TOC's table lines given.
+func writeFakeProgram(t *testing.T, dir, name string, major int, tables string) {
 	t.Helper()
 
 	script := fmt.Sprintf(`#!/bin/sh
@@ -40,8 +52,7 @@ if [ "$1" = "--list" ]; then
     echo '; Archive created at 2026-10-20'
     echo '6; 2615 16385 SCHEMA - billet_x billet'
     echo '3490; 0 0 COMMENT - SCHEMA billet_x billet'
-    echo '220; 1259 16386 TABLE billet_x admission billet'
-    echo '3482; 0 16386 TABLE DATA billet_x admission billet'
+%[4]s
     exit 0
 fi
 for a in "$@"; do
@@ -50,15 +61,37 @@ for a in "$@"; do
     esac
 done
 exit 0
-`, name, major, dir)
+`, name, major, dir, tables)
 
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {
 		t.Fatalf("write the fake %s: %v", name, err)
 	}
 }
 
-// clientWithFakes is a Client whose programs are the fakes in dir.
-func clientWithFakes(t *testing.T, dsn string, dir string) *Client {
+// drops records what a restore asked to drop before pg_restore ran.
+type drops struct {
+	mu    sync.Mutex
+	calls []dropCall
+}
+
+type dropCall struct {
+	schema string
+	keep   []string
+	// restoreRan is whether pg_restore had already been run for anything but
+	// --list when the drop was asked for.
+	restoreRan bool
+}
+
+func (d *drops) snapshot() []dropCall {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return slices.Clone(d.calls)
+}
+
+// clientWithFakes is a Client whose programs are the fakes in dir, and whose
+// drop step is recorded rather than run against a database.
+func clientWithFakes(t *testing.T, dsn string, dir string) (*Client, *drops) {
 	t.Helper()
 
 	c, err := New(state.DSN(dsn))
@@ -75,7 +108,22 @@ func clientWithFakes(t *testing.T, dsn string, dir string) *Client {
 		return path, nil
 	}
 
-	return c
+	d := &drops{}
+	c.dropOutside = func(_ context.Context, _ state.DSN, schema string, keep []string) ([]string, error) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+
+		ran := false
+		if argv, err := os.ReadFile(filepath.Join(dir, "pg_restore.argv")); err == nil {
+			ran = !strings.HasPrefix(string(argv), "--list\n")
+		}
+
+		d.calls = append(d.calls, dropCall{schema: schema, keep: slices.Clone(keep), restoreRan: ran})
+
+		return nil, nil
+	}
+
+	return c, d
 }
 
 func readLines(t *testing.T, path string) []string {
@@ -91,17 +139,18 @@ func readLines(t *testing.T, path string) []string {
 
 // A RESTORE HANDS pg_restore THE CONNECTION THROUGH ITS ENVIRONMENT, never argv,
 // in one transaction that cleans what it replaces and assigns no source owner,
-// and leaves the schema's own entries out of what it restores.
+// restores only the planned schema, leaves the schema's own entries out, and
+// first drops what that schema holds and the dump does not.
 func TestARestoreRunsPgRestoreAsTheProbesProvedIt(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	fakeProgram(t, dir, "pg_restore", 18)
 
-	c := clientWithFakes(t, "postgres://billet:"+testPassword+
+	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
 		"@db.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
 
-	if err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18); err != nil {
+	if err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, "billet_x"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -110,10 +159,15 @@ func TestARestoreRunsPgRestoreAsTheProbesProvedIt(t *testing.T) {
 	for _, want := range []string{
 		"--single-transaction", "--exit-on-error", "--clean", "--if-exists",
 		"--no-owner", "--no-privileges", "--no-password", "--dbname=dbname='ledger'",
+		"--schema=billet_x",
 	} {
 		if !slices.Contains(argv, want) {
 			t.Errorf("pg_restore was not given %s: %q", want, argv)
 		}
+	}
+
+	if grepPrefix(argv, "--use-list=") == "" {
+		t.Errorf("pg_restore was not given the filtered list: %q", argv)
 	}
 
 	for _, a := range argv {
@@ -130,9 +184,8 @@ func TestARestoreRunsPgRestoreAsTheProbesProvedIt(t *testing.T) {
 		}
 	}
 
-	if !slices.Contains(env, "PGOPTIONS=-c search_path=billet_x -c lock_timeout=30s") {
-		t.Errorf("pg_restore's PGOPTIONS is not the DSN's search_path and the lock timeout: %q",
-			grepPrefix(env, "PGOPTIONS="))
+	if got := grepPrefix(env, "PGOPTIONS="); got != "PGOPTIONS=-c search_path=billet_x" {
+		t.Errorf("pg_restore's PGOPTIONS is %q, want the DSN's search_path alone", got)
 	}
 
 	list := strings.Join(readLines(t, filepath.Join(dir, "pg_restore.list")), "\n")
@@ -149,6 +202,43 @@ func TestARestoreRunsPgRestoreAsTheProbesProvedIt(t *testing.T) {
 	if !strings.Contains(list, "\n220; 1259 16386 TABLE billet_x admission billet") {
 		t.Errorf("the restore list dropped a table entry it must restore:\n%s", list)
 	}
+
+	// THE DROP KEEPS EXACTLY THE DUMP'S TABLES OF THIS SCHEMA, not another
+	// schema's, and comes before the restore proper.
+	calls := dropped.snapshot()
+	if len(calls) != 1 || calls[0].schema != "billet_x" || !slices.Equal(calls[0].keep, []string{"admission"}) {
+		t.Fatalf("the restore asked to drop %+v, want once in billet_x keeping [admission]", calls)
+	}
+
+	if calls[0].restoreRan {
+		t.Error("the tables the dump does not name were dropped after pg_restore ran")
+	}
+}
+
+// A DUMP THAT HOLDS NO TABLE OF THE PLANNED SCHEMA IS REFUSED BEFORE ANYTHING IS
+// DROPPED: a manifest whose schema disagrees with its dump would otherwise empty
+// one schema and restore into another.
+func TestARestoreOfADumpWithNoTableOfTheSchemaDropsNothing(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFakeProgram(t, dir, "pg_restore", 18, `    echo '221; 1259 16390 TABLE elsewhere stray billet'`)
+
+	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+
+		"@db.internal:5432/ledger?sslmode=disable&search_path=billet_x", dir)
+
+	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, "billet_x")
+	if err == nil || !strings.Contains(err.Error(), "holds no table of schema billet_x") {
+		t.Fatalf("Restore of a dump of another schema = %v, want a refusal", err)
+	}
+
+	if calls := dropped.snapshot(); len(calls) != 0 {
+		t.Errorf("the refused restore dropped %+v", calls)
+	}
+
+	if argv := readLines(t, filepath.Join(dir, "pg_restore.argv")); argv[0] != "--list" {
+		t.Errorf("pg_restore ran past --list: %q", argv)
+	}
 }
 
 // AN OLDER pg_restore THAN THE ARCHIVE'S pg_dump IS REFUSED BEFORE IT RUNS, and
@@ -159,9 +249,9 @@ func TestAClientProgramThatCannotDoTheJobIsRefusedBeforeItRuns(t *testing.T) {
 	dir := t.TempDir()
 	fakeProgram(t, dir, "pg_restore", 15)
 
-	c := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
+	c, dropped := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
 
-	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16)
+	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, "billet_x")
 	if err == nil || !strings.Contains(err.Error(), "postgresql") || !strings.Contains(err.Error(), "16") {
 		t.Fatalf("an older pg_restore = %v, want a refusal naming the package for 16", err)
 	}
@@ -170,9 +260,13 @@ func TestAClientProgramThatCannotDoTheJobIsRefusedBeforeItRuns(t *testing.T) {
 		t.Error("the older pg_restore was run anyway")
 	}
 
-	empty := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", t.TempDir())
+	if calls := dropped.snapshot(); len(calls) != 0 {
+		t.Errorf("a refused restore dropped %+v", calls)
+	}
 
-	err = empty.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16)
+	empty, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", t.TempDir())
+
+	err = empty.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 16, "billet_x")
 	if err == nil || !strings.Contains(err.Error(), "not installed") {
 		t.Fatalf("an absent pg_restore = %v, want a refusal saying it is not installed", err)
 	}
@@ -184,13 +278,15 @@ func TestADumpRefusesAnOccupiedDestination(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+	fakeProgram(t, dir, "pg_dump", 18)
+
 	dest := filepath.Join(dir, "ledger.pgdump")
 
 	if err := os.WriteFile(dest, []byte("somebody's file"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	c := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
+	c, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
 
 	if _, err := c.Dump(t.Context(), "", dest); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("a dump over an existing file = %v, want a refusal", err)
@@ -204,6 +300,10 @@ func TestADumpRefusesAnOccupiedDestination(t *testing.T) {
 	if string(body) != "somebody's file" {
 		t.Errorf("the occupied destination was changed: %q", body)
 	}
+
+	if _, err := os.Stat(filepath.Join(dir, "pg_dump.argv")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("pg_dump was run over an occupied destination (%v)", err)
+	}
 }
 
 // The redaction of a failed program's complaint, which is the second line
@@ -215,13 +315,13 @@ func TestAFailedProgramsComplaintIsRedacted(t *testing.T) {
 	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'pg_restore (PostgreSQL) 18.0'; exit 0; fi\n" +
 		"echo \"FATAL: password authentication failed: $PGPASSWORD\" >&2\nexit 1\n"
 
-	if err := os.WriteFile(filepath.Join(dir, "pg_restore"), []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, "pg_restore"), []byte(script), 0o700); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	c := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
+	c, _ := clientWithFakes(t, "postgres://billet:"+testPassword+"@h/d?sslmode=disable", dir)
 
-	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18)
+	err := c.Restore(t.Context(), filepath.Join(dir, "ledger.pgdump"), 18, "billet_x")
 	if err == nil {
 		t.Fatal("a failing pg_restore reported success")
 	}
@@ -339,7 +439,7 @@ func TestADumpIsTakenInTheSnapshotBilletRead(t *testing.T) {
 	dir := t.TempDir()
 	fakeProgram(t, dir, "pg_dump", 99)
 
-	c := clientWithFakes(t, dsn, dir)
+	c, _ := clientWithFakes(t, dsn, dir)
 
 	dumped, err := c.Dump(t.Context(), "", filepath.Join(dir, "ledger.pgdump"))
 	if err != nil {
@@ -353,7 +453,8 @@ func TestADumpIsTakenInTheSnapshotBilletRead(t *testing.T) {
 		t.Errorf("pg_dump was not given the snapshot billet exported: %q", argv)
 	}
 
-	for _, want := range []string{"--format=custom", "--no-password", "--schema=" + schema} {
+	// THE SCHEMA QUOTED, so pg_dump reads it as that name and not as a pattern.
+	for _, want := range []string{"--format=custom", "--no-password", `--schema="` + schema + `"`} {
 		if !slices.Contains(argv, want) {
 			t.Errorf("pg_dump was not given %s: %q", want, argv)
 		}
@@ -378,6 +479,58 @@ func TestADumpIsTakenInTheSnapshotBilletRead(t *testing.T) {
 
 	if dumped.Schema != schema || dumped.DumpVersion != 99 || len(dumped.Migrations) == 0 {
 		t.Errorf("the dump describes itself as %+v", dumped)
+	}
+}
+
+// A pg_dump OLDER THAN THE LEDGER'S SERVER IS REFUSED BEFORE IT RUNS, naming the
+// package for the server's major, by CheckDump and by Dump alike: the real one
+// refuses only after connecting ("aborting because of server version
+// mismatch", measured 2026-10-20).
+func TestAPgDumpOlderThanTheServerIsRefusedBeforeItRuns(t *testing.T) {
+	const schema = "billet_old_client"
+
+	dsn := requireDatabase(t, "old_client", schema)
+
+	if _, err := state.OpenPostgres(t.Context(), t.TempDir(), state.DSN(dsn)); err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	dir := t.TempDir()
+	fakeProgram(t, dir, "pg_dump", 9)
+
+	c, _ := clientWithFakes(t, dsn, dir)
+
+	led, err := c.Peek(t.Context())
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+
+	server := led.ServerVersion / 10000
+	advice := fmt.Sprintf("postgresql-client-%d", server)
+
+	if runtime.GOOS == "darwin" {
+		advice = fmt.Sprintf("postgresql@%d", server)
+	}
+
+	if err := c.CheckDump(t.Context()); err == nil || !strings.Contains(err.Error(), advice) {
+		t.Errorf("CheckDump with pg_dump 9 against server %d = %v, want a refusal naming %s", server, err, advice)
+	}
+
+	if _, err := c.Dump(t.Context(), "", filepath.Join(dir, "ledger.pgdump")); err == nil ||
+		!strings.Contains(err.Error(), advice) {
+		t.Errorf("Dump with pg_dump 9 against server %d = %v, want a refusal naming %s", server, err, advice)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "pg_dump.argv")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the older pg_dump was run anyway (%v)", err)
+	}
+
+	// AND ONE AS NEW AS THE SERVER PASSES, so the refusal above is about the
+	// version and not about anything else CheckDump reads.
+	fakeProgram(t, dir, "pg_dump", server)
+
+	if err := c.CheckDump(t.Context()); err != nil {
+		t.Errorf("CheckDump with pg_dump %d against server %d = %v", server, server, err)
 	}
 }
 
@@ -442,7 +595,26 @@ func TestALedgerDumpedFromOneDatabaseRestoresIntoAnother(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion); err != nil {
+	// A NEIGHBOUR IN ANOTHER SCHEMA of the target database, which nothing a
+	// restore does may touch.
+	runSQL := func(dsn, stmt string) {
+		t.Helper()
+
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+
+		defer func() { _ = db.Close() }()
+
+		if _, err := db.ExecContext(t.Context(), stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	runSQL(target, `CREATE TABLE public.neighbour (x int)`)
+
+	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion, schema); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -467,8 +639,13 @@ func TestALedgerDumpedFromOneDatabaseRestoresIntoAnother(t *testing.T) {
 
 	// AND A SECOND RESTORE OVER THE FIRST IS THE SAME LEDGER, which is what lets
 	// a resumed run simply restore again: --clean replaces what the first put
-	// there, in one transaction.
-	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion); err != nil {
+	// there, in one transaction. Over a ledger a later migration widened, it is
+	// a replacement and not an overlay: the table the dump does not name goes,
+	// and the neighbour in another schema stays.
+	runSQL(target, `CREATE TABLE "`+schema+`".a_later_migration (x int)`)
+	runSQL(target, `INSERT INTO "`+schema+`".a_later_migration VALUES (1)`)
+
+	if err := dst.Restore(t.Context(), dump, dumped.DumpVersion, schema); err != nil {
 		t.Fatalf("a second Restore: %v", err)
 	}
 
@@ -480,4 +657,15 @@ func TestALedgerDumpedFromOneDatabaseRestoresIntoAnother(t *testing.T) {
 	if again.Binding != deployment || !slices.Equal(again.Migrations, dumped.Migrations) {
 		t.Errorf("after a second restore the ledger reads as %+v", again)
 	}
+
+	if slices.Contains(again.Tables, "a_later_migration") {
+		t.Errorf("the restore left a table its dump does not name: %v", again.Tables)
+	}
+
+	if !slices.Equal(again.Tables, led.Tables) {
+		t.Errorf("after a second restore the schema holds %v, want the first restore's %v",
+			again.Tables, led.Tables)
+	}
+
+	runSQL(target, `SELECT x FROM public.neighbour`)
 }

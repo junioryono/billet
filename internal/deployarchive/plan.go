@@ -77,8 +77,9 @@ type PostgresLedger interface {
 	// Dump writes a dump of it to dest, which must not exist, crossing this
 	// host's fence: only a recovery that raised that fence calls it.
 	Dump(ctx context.Context, dest string) (LedgerDump, error)
-	// Restore puts a dump into it in one transaction.
-	Restore(ctx context.Context, dump string, dumpVersion int) error
+	// Restore replaces the ledger in schema with a dump's: the tables the dump
+	// does not name are dropped, then the dump is restored in one transaction.
+	Restore(ctx context.Context, dump string, dumpVersion int, schema string) error
 	// Admission reads its admission row behind any fence.
 	Admission(ctx context.Context) (state.Admission, error)
 }
@@ -130,10 +131,12 @@ const (
 	// ledger exactly as it is, and does not use the archive's dump.
 	//
 	// THE REPLACEMENT-CONTROLLER CASE: the host died and the database did not, so
-	// the database's rows are NEWER than the archive's, and putting the archive's
-	// back would forget every lease taken since — node recovery then destroys
-	// that compute as orphans. Replacing them is `billet local recover`, which
-	// seals, quiesces and keeps a dump of what it replaced.
+	// the database holds the leases taken since the backup, and putting the
+	// archive's ledger back would forget them — node recovery then destroys that
+	// compute as orphans. A database provably older than the archive (its schema
+	// behind the archive's) is refused rather than kept. Replacing a kept ledger
+	// is `billet local recover`, which seals, quiesces and keeps a dump of what it
+	// replaced.
 	KeepLiveLedger
 )
 

@@ -32,15 +32,26 @@ type fakeLedger struct {
 	calls     []string
 	restored  []string
 	paths     []string
+	// versions and schemas are the pg_dump major and the schema each restore
+	// was handed, in order.
+	versions []int
+	schemas  []string
 
 	// byDigest is what the database holds after a restore of a file with that
 	// digest.
 	byDigest map[string]state.PostgresLedger
-	// dumpBody is what Dump writes; dumpErr and restoreErr fail those calls.
+	// dumpBody is what Dump writes; dumpErr, restoreErr, peekErr and barrierErr
+	// fail those calls.
 	dumpBody   []byte
 	dumpErr    error
 	restoreErr error
+	peekErr    error
+	barrierErr error
 }
+
+// takenDumpVersion is the pg_dump major the fake's own dumps are taken with,
+// distinct from the archive's so a restore handed the wrong one is seen.
+const takenDumpVersion = 17
 
 func (f *fakeLedger) record(call string) {
 	f.calls = append(f.calls, call)
@@ -52,6 +63,10 @@ func (f *fakeLedger) Peek(context.Context) (state.PostgresLedger, error) {
 
 	f.record("peek")
 
+	if f.peekErr != nil {
+		return state.PostgresLedger{}, f.peekErr
+	}
+
 	return f.now, nil
 }
 
@@ -61,7 +76,7 @@ func (f *fakeLedger) Barrier(context.Context) error {
 
 	f.record("barrier")
 
-	return nil
+	return f.barrierErr
 }
 
 func (f *fakeLedger) Dump(_ context.Context, dest string) (LedgerDump, error) {
@@ -81,14 +96,16 @@ func (f *fakeLedger) Dump(_ context.Context, dest string) (LedgerDump, error) {
 	// WHAT THE DATABASE HOLDS NOW is what restoring this copy puts back.
 	f.byDigest[digest(f.dumpBody)] = f.now
 
-	return LedgerDump{Facts: DumpFacts{Schema: f.now.Schema, DumpVersion: 16}}, nil
+	return LedgerDump{Facts: DumpFacts{Schema: f.now.Schema, DumpVersion: takenDumpVersion}}, nil
 }
 
-func (f *fakeLedger) Restore(_ context.Context, dump string, _ int) error {
+func (f *fakeLedger) Restore(_ context.Context, dump string, dumpVersion int, schema string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.record("restore")
+	f.versions = append(f.versions, dumpVersion)
+	f.schemas = append(f.schemas, schema)
 
 	if f.restoreErr != nil {
 		return f.restoreErr
@@ -125,6 +142,23 @@ func (f *fakeLedger) callsSnapshot() []string {
 	defer f.mu.Unlock()
 
 	return slices.Clone(f.calls)
+}
+
+// stopBefore makes the next Execute stop just before it publishes entry, and
+// puts the hook back when the test ends.
+func stopBefore(t *testing.T, entry string, cause error) {
+	t.Helper()
+
+	prev := onPublish
+	onPublish = func(a Action) error {
+		if a.Entry == entry {
+			return cause
+		}
+
+		return nil
+	}
+
+	t.Cleanup(func() { onPublish = prev })
 }
 
 // dumpSchema is the schema every dump in these tests was taken from.
@@ -220,10 +254,14 @@ func unbound(string) string  { return "" }
 // restoredAs is what the database holds once the archive's dump is in it.
 func (f dumpFixture) restoredAs() state.PostgresLedger {
 	return state.PostgresLedger{
-		Schema: dumpSchema, ServerVersion: 160015, Tables: []string{"admission", "schema_migrations"},
+		Database: dumpDatabase, Schema: dumpSchema, ServerVersion: 160015,
+		Tables:    []string{"admission", "schema_migrations"},
 		Populated: true, Migrations: f.migrations, Binding: f.archive.Manifest.Ledger.Dump.Binding,
 	}
 }
+
+// dumpDatabase is the database every ledger in these tests is in.
+const dumpDatabase = "billet"
 
 // ledgerFor is a fake database holding now, whose restore of the archive's dump
 // produces the archive's ledger.
@@ -248,7 +286,7 @@ func pgTarget(t *testing.T, d deployment, ledger PostgresLedger) Target {
 
 // emptySchema is a database whose schema holds nothing.
 func emptySchema() state.PostgresLedger {
-	return state.PostgresLedger{Schema: dumpSchema, ServerVersion: 160015}
+	return state.PostgresLedger{Database: dumpDatabase, Schema: dumpSchema, ServerVersion: 160015}
 }
 
 // AN ARCHIVE CARRYING A DUMP IS SCHEMA 4 AND SAYS WHAT IT CARRIES: the dump
@@ -351,6 +389,7 @@ func TestAManifestsDumpClaimIsHeldToItsSchema(t *testing.T) {
 		"external too":       func(m map[string]any) { ledger(m)["external"] = true },
 		"another format":     func(m map[string]any) { dump(m)["format"] = "plain" },
 		"no schema":          func(m map[string]any) { dump(m)["schema"] = "" },
+		"no pg_dump version": func(m map[string]any) { dump(m)["dump_version"] = 0 },
 		"another deployment": func(m map[string]any) { dump(m)["binding"] = "ffffffffffffffffffffffffffffffff" },
 		"no engine":          func(m map[string]any) { ledger(m)["backend"] = "" },
 	} {
@@ -376,10 +415,25 @@ func TestADumpRestorePlansByWhatTheDatabaseHolds(t *testing.T) {
 	f := newDumpFixture(t, bound)
 	newer := append(slices.Clone(f.migrations), state.AppliedMigration{Version: 9999, Name: "future"})
 
+	// older is this deployment's own ledger at a migration before the archive's:
+	// restored from something taken before this backup.
+	older := f.restoredAs()
+	older.Migrations = older.Migrations[:len(older.Migrations)-1]
+
+	// unboundLedger is a populated billet ledger bound to no deployment.
+	unboundLedger := f.restoredAs()
+	unboundLedger.Binding = ""
+
+	// notALedger is tables bound to this deployment with no migration
+	// bookkeeping: some other program's.
+	notALedger := f.restoredAs()
+	notALedger.Tables = []string{"admission"}
+
 	cases := []struct {
 		name     string
 		now      state.PostgresLedger
 		attached bool
+		peekErr  error
 		want     Disposition
 		refusal  string
 	}{
@@ -388,15 +442,29 @@ func TestADumpRestorePlansByWhatTheDatabaseHolds(t *testing.T) {
 			now:  state.PostgresLedger{Schema: dumpSchema, Tables: []string{"admission"}, Migrations: f.migrations},
 			want: ReplaceEmptyLedger},
 		{name: "this deployment's own ledger", now: f.restoredAs(), want: KeepLiveLedger},
+		{name: "this deployment's own ledger, newer than the backup",
+			now: func() state.PostgresLedger {
+				l := f.restoredAs()
+				l.Migrations = newer
+
+				return l
+			}(), want: KeepLiveLedger},
+		{name: "this deployment's ledger, older than the backup", now: older,
+			refusal: "the database is older than the backup"},
+		{name: "this deployment's tables with no schema_migrations", now: notALedger,
+			refusal: "it is not a billet ledger"},
 		{name: "another deployment's ledger",
 			now:     state.PostgresLedger{Schema: dumpSchema, Tables: []string{"x"}, Populated: true, Binding: "ff"},
 			refusal: "bound to deployment ff"},
-		{name: "a populated ledger bound to nobody",
-			now:     state.PostgresLedger{Schema: dumpSchema, Tables: []string{"x"}, Populated: true},
+		{name: "a populated ledger bound to nobody", now: unboundLedger,
 			refusal: "--external-ledger-attached"},
-		{name: "a populated ledger bound to nobody, asserted",
-			now:      state.PostgresLedger{Schema: dumpSchema, Tables: []string{"x"}, Populated: true},
+		{name: "a populated ledger bound to nobody, asserted", now: unboundLedger,
 			attached: true, want: KeepLiveLedger},
+		{name: "a populated ledger bound to nobody, asserted, with no schema_migrations",
+			now:      state.PostgresLedger{Schema: dumpSchema, Tables: []string{"x"}, Populated: true},
+			attached: true, refusal: "it is not a billet ledger"},
+		{name: "a database that could not be read", now: emptySchema(),
+			peekErr: errors.New("connection refused"), refusal: "could not read the PostgreSQL ledger"},
 		{name: "a schema a newer billet prepared",
 			now:     state.PostgresLedger{Schema: dumpSchema, Tables: []string{"admission"}, Migrations: newer},
 			refusal: "newer than the one that took this backup"},
@@ -407,7 +475,10 @@ func TestADumpRestorePlansByWhatTheDatabaseHolds(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tgt := pgTarget(t, f.d, f.ledgerFor(tc.now))
+			ledger := f.ledgerFor(tc.now)
+			ledger.peekErr = tc.peekErr
+
+			tgt := pgTarget(t, f.d, ledger)
 			tgt.ExternalLedgerAttached = tc.attached
 
 			p, err := PlanRestore(t.Context(), f.archive, tgt)
@@ -486,9 +557,21 @@ func TestARestoreOfADumpRestoresAVerifiedCopyAndReadsItBack(t *testing.T) {
 		t.Fatalf("the database was handed %v, want the archive's dump once", ledger.restored)
 	}
 
+	// WITH THE ARCHIVE'S OWN pg_dump MAJOR AND SCHEMA, which decide which
+	// pg_restore may read it and where its tables go.
+	if !slices.Equal(ledger.versions, []int{16}) || !slices.Equal(ledger.schemas, []string{dumpSchema}) {
+		t.Errorf("the restore was handed versions %v and schemas %v, want [16] and [%s]",
+			ledger.versions, ledger.schemas, dumpSchema)
+	}
+
 	// A COPY THIS RUN VERIFIED, never the archive's own pathname, whose bytes
 	// were checked once by Open and could have changed since.
-	if rel, err := filepath.Rel(f.archive.Dir, ledger.paths[0]); err == nil && !strings.HasPrefix(rel, "..") {
+	rel, err := filepath.Rel(f.archive.Dir, ledger.paths[0])
+	if err != nil {
+		t.Fatalf("relate %s to the archive: %v", ledger.paths[0], err)
+	}
+
+	if !strings.HasPrefix(rel, "..") {
 		t.Errorf("pg_restore was handed the archive's own file %s", ledger.paths[0])
 	}
 
@@ -573,19 +656,9 @@ func TestAResumeAfterTheDumpRestoredFindsItsOwnWork(t *testing.T) {
 
 	interrupted := errors.New("interrupted after the ledger")
 
-	onPublish = func(a Action) error {
-		if a.Entry == AuthorityEntry("ca.key") {
-			return interrupted
-		}
+	stopBefore(t, AuthorityEntry("ca.key"), interrupted)
 
-		return nil
-	}
-
-	_, err := executeOn(t, f.archive, tgt, RestoreFresh)
-
-	onPublish = nil
-
-	if !errors.Is(err, interrupted) {
+	if _, err := executeOn(t, f.archive, tgt, RestoreFresh); !errors.Is(err, interrupted) {
 		t.Fatalf("the first run = %v, want the interruption", err)
 	}
 
@@ -593,6 +666,8 @@ func TestAResumeAfterTheDumpRestoredFindsItsOwnWork(t *testing.T) {
 	if err != nil || !prog.LedgerRestored {
 		t.Fatalf("the journal does not record the restore (%+v, %v)", prog, err)
 	}
+
+	onPublish = nil
 
 	if _, err := executeOn(t, f.archive, tgt, RestoreFresh); err != nil {
 		t.Fatalf("the resume: %v", err)
@@ -710,6 +785,7 @@ func TestAnAbandonedRecoverPutsTheLedgerBackFromItsCopy(t *testing.T) {
 	assertFenced(t, tgt.StateDir)
 
 	ledger.restoreErr = nil
+	before := len(ledger.callsSnapshot())
 
 	res, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger)
 	if err != nil {
@@ -718,6 +794,18 @@ func TestAnAbandonedRecoverPutsTheLedgerBackFromItsCopy(t *testing.T) {
 
 	if !slices.Equal(ledger.restored, []string{digest(ledger.dumpBody)}) {
 		t.Errorf("the abandon restored %v, want the copy it kept", ledger.restored)
+	}
+
+	// WITH THE MAJOR OF THE pg_dump THAT TOOK THE COPY, not the archive's: the
+	// first restore was the archive's, interrupted, and the second is the copy.
+	if !slices.Equal(ledger.versions, []int{16, takenDumpVersion}) {
+		t.Errorf("the restores were handed pg_dump majors %v, want [16 %d]", ledger.versions, takenDumpVersion)
+	}
+
+	// AND ONLY ONCE NO BILLET WRITER ON ANY HOST IS MID-COMMIT.
+	abandon := ledger.callsSnapshot()[before:]
+	if b, r := slices.Index(abandon, "barrier"), slices.Index(abandon, "restore"); b < 0 || r < b {
+		t.Errorf("the abandon's barrier did not precede its restore: %v", abandon)
 	}
 
 	copyPath := supersededDumpPath(f.archive, tgt.StateDir)
@@ -802,20 +890,10 @@ func TestARestoresAbandonSaysWhatItLeftInTheDatabase(t *testing.T) {
 	ledger := f.ledgerFor(emptySchema())
 	tgt := pgTarget(t, f.d, ledger)
 
-	onPublish = func(a Action) error {
-		if a.Entry == AuthorityEntry("ca.key") {
-			return errors.New("interrupted")
-		}
+	stopBefore(t, AuthorityEntry("ca.key"), errStopHere)
 
-		return nil
-	}
-
-	_, err := executeOn(t, f.archive, tgt, RestoreFresh)
-
-	onPublish = nil
-
-	if err == nil {
-		t.Fatal("Execute succeeded through an interruption")
+	if _, err := executeOn(t, f.archive, tgt, RestoreFresh); !errors.Is(err, errStopHere) {
+		t.Fatalf("Execute = %v, want the interruption", err)
 	}
 
 	res, err := Abandon(t.Context(), f.archive, tgt, RestoreFresh)
@@ -829,6 +907,192 @@ func TestARestoresAbandonSaysWhatItLeftInTheDatabase(t *testing.T) {
 
 	if n := len(ledger.restored); n != 1 {
 		t.Errorf("the abandon touched the database: %d restores", n)
+	}
+
+	assertOpen(t, tgt.StateDir)
+}
+
+// interruptedRecovery is a recovery that published its copy of the ledger and
+// was interrupted in the archive's restore: the state every abandon test below
+// starts from.
+func interruptedRecovery(t *testing.T) (dumpFixture, *fakeLedger, Target) {
+	t.Helper()
+
+	f := newDumpFixture(t, bound)
+	ledger := f.ledgerFor(f.liveLedger())
+	ledger.restoreErr = errors.New("the archive's restore was interrupted")
+	tgt := recoverTarget(t, f, ledger)
+
+	if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); !errors.Is(err, ledger.restoreErr) {
+		t.Fatalf("Execute = %v, want the interrupted restore", err)
+	}
+
+	ledger.restoreErr = nil
+	ledger.restored = nil
+
+	return f, ledger, tgt
+}
+
+// AN ABANDON WHOSE COPY IS GONE AFTER IT WAS PUBLISHED REFUSES: the journal says
+// the archive's restore was allowed to run, so the database may hold the
+// archive's ledger or the operator's, and only that copy could say which.
+func TestAnAbandonWhoseCopyIsGoneRefuses(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	if err := os.Remove(supersededDumpPath(f.archive, tgt.StateDir)); err != nil {
+		t.Fatalf("remove the copy: %v", err)
+	}
+
+	if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); err == nil ||
+		!strings.Contains(err.Error(), "it is gone") {
+		t.Fatalf("Abandon with the copy gone = %v, want a refusal", err)
+	}
+
+	if len(ledger.restored) != 0 {
+		t.Errorf("the abandon restored %v with no copy to restore", ledger.restored)
+	}
+
+	assertFenced(t, tgt.StateDir)
+}
+
+// AN ABANDON PUTS THE LEDGER BACK ONLY INTO THE DATABASE IT CAME FROM, at the
+// archive's schema and bound to this deployment or nobody; a connection pointed
+// elsewhere since is refused before anything is restored.
+func TestAnAbandonRefusesADatabaseTheCopyDidNotComeFrom(t *testing.T) {
+	cases := map[string]struct {
+		edit    func(*state.PostgresLedger)
+		refusal string
+	}{
+		"another database": {
+			edit:    func(l *state.PostgresLedger) { l.Database = "elsewhere" },
+			refusal: "the connection now reaches elsewhere",
+		},
+		"another schema": {
+			edit:    func(l *state.PostgresLedger) { l.Schema = "public" },
+			refusal: `now resolves to "public"`,
+		},
+		"another deployment's ledger": {
+			edit:    func(l *state.PostgresLedger) { l.Binding = "ffffffffffffffffffffffffffffffff" },
+			refusal: "bound to ffffffffffffffffffffffffffffffff, not to this deployment",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f, ledger, tgt := interruptedRecovery(t)
+
+			tc.edit(&ledger.now)
+
+			if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); err == nil ||
+				!strings.Contains(err.Error(), tc.refusal) {
+				t.Fatalf("Abandon = %v, want a refusal saying %q", err, tc.refusal)
+			}
+
+			if len(ledger.restored) != 0 {
+				t.Errorf("the abandon restored %v into a database it could not vouch for", ledger.restored)
+			}
+
+			assertFenced(t, tgt.StateDir)
+		})
+	}
+}
+
+// AN ABANDON READS THE LEDGER BACK AFTER THE PUT-BACK and keeps the fence over
+// one bound to another deployment: the copy was this deployment's, so a foreign
+// binding afterwards means the restore did not put it where billet reads.
+func TestAnAbandonKeepsTheFenceOverAForeignLedgerAfterThePutBack(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	foreign := f.liveLedger()
+	foreign.Binding = "ffffffffffffffffffffffffffffffff"
+	ledger.byDigest[digest(ledger.dumpBody)] = foreign
+
+	if _, err := Abandon(t.Context(), f.archive, tgt, ReplaceLedger); err == nil ||
+		!strings.Contains(err.Error(), "after the put-back") {
+		t.Fatalf("Abandon = %v, want the read-back's refusal", err)
+	}
+
+	assertFenced(t, tgt.StateDir)
+}
+
+// A RESUMED RECOVERY REFUSES A CONNECTION THAT NOW REACHES ANOTHER DATABASE than
+// the one its copy was taken from, before it restores anything there.
+func TestAResumedRecoveryRefusesAnotherDatabase(t *testing.T) {
+	f, ledger, tgt := interruptedRecovery(t)
+
+	ledger.now.Database = "elsewhere"
+
+	if _, err := executeOn(t, f.archive, tgt, ReplaceLedger); err == nil ||
+		!strings.Contains(err.Error(), "the connection now reaches elsewhere") {
+		t.Fatalf("the resume = %v, want a refusal", err)
+	}
+
+	if len(ledger.restored) != 0 {
+		t.Errorf("the resume restored %v into another database", ledger.restored)
+	}
+
+	assertFenced(t, tgt.StateDir)
+}
+
+// A RECOVERY REPLACES A LEDGER NEWER THAN THE ARCHIVE, because the restore
+// drops what the archive's dump does not name; and it refuses another
+// deployment's ledger and a host that is not this deployment.
+func TestARecoverPlansByWhoseLedgerItIs(t *testing.T) {
+	f := newDumpFixture(t, bound)
+
+	ahead := f.liveLedger()
+	ahead.Migrations = append(slices.Clone(f.migrations), state.AppliedMigration{Version: 9999, Name: "future"})
+
+	p, err := PlanRecover(t.Context(), f.archive, recoverTarget(t, f, f.ledgerFor(ahead)))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(p.Refusals) > 0 || p.dispositionOf(EntryLedgerDump) != SupersedeLedger {
+		t.Errorf("a ledger ahead of the archive plans as %q (%+v), want %q",
+			p.dispositionOf(EntryLedgerDump), p.Refusals, SupersedeLedger)
+	}
+
+	foreign := f.liveLedger()
+	foreign.Binding = "ffffffffffffffffffffffffffffffff"
+
+	p, err = PlanRecover(t.Context(), f.archive, recoverTarget(t, f, f.ledgerFor(foreign)))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "bound to deployment ffffffffffffffffffffffffffffffff")) == 0 {
+		t.Errorf("a recovery onto another deployment's ledger was not refused for it: %+v", p.Refusals)
+	}
+
+	p, err = PlanRecover(t.Context(), f.archive, pgTarget(t, f.d, f.ledgerFor(f.liveLedger())))
+	if err != nil {
+		t.Fatalf("PlanRecover: %v", err)
+	}
+
+	if len(refusalsMentioning(p, "back over ITSELF")) == 0 {
+		t.Errorf("a recovery onto a host that is not this deployment was not refused: %+v", p.Refusals)
+	}
+}
+
+// A BARRIER THAT CANNOT BE HAD STOPS THE RESTORE BEFORE ANYTHING IS PUBLISHED,
+// and lifts the fence it raised over a directory nothing touched.
+func TestARestoreWhoseDatabaseBarrierFailsPublishesNothing(t *testing.T) {
+	f := newDumpFixture(t, bound)
+	ledger := f.ledgerFor(emptySchema())
+	ledger.barrierErr = errors.New("a writer held the lock past the limit")
+	tgt := pgTarget(t, f.d, ledger)
+
+	if _, err := executeOn(t, f.archive, tgt, RestoreFresh); !errors.Is(err, ledger.barrierErr) {
+		t.Fatalf("Execute = %v, want the barrier's failure", err)
+	}
+
+	if slices.Contains(ledger.callsSnapshot(), "restore") {
+		t.Error("the dump was restored although the barrier was never had")
+	}
+
+	if _, err := os.Lstat(filepath.Join(tgt.StateDir, "deployment-id")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the identity was published although the barrier was never had (%v)", err)
 	}
 
 	assertOpen(t, tgt.StateDir)

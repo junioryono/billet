@@ -607,10 +607,10 @@ func printRestorePlan(env cli.Env, p deployarchive.Plan) {
 // printKeepLiveLedger says the database keeps its own ledger and why: those rows
 // are newer than the backup's, and replacing them is a recovery's decision.
 func printKeepLiveLedger(env cli.Env, a deployarchive.Action) {
-	fmt.Fprintf(env.Stdout, "plan     KEEP the ledger already in %s: it is this deployment's own and\n", a.Path)
-	fmt.Fprintf(env.Stdout, "         newer than this backup, so its leases are the ones the fleet holds.\n")
-	fmt.Fprintf(env.Stdout, "         The backup's dump is not used; `billet local recover` replaces it\n")
-	fmt.Fprintf(env.Stdout, "         deliberately if that is what you mean\n")
+	fmt.Fprintf(env.Stdout, "plan     KEEP the ledger already in %s: it is this deployment's own, and\n", a.Path)
+	fmt.Fprintf(env.Stdout, "         a database that outlived its host holds the leases taken since the\n")
+	fmt.Fprintf(env.Stdout, "         backup. The backup's dump is not used; `billet local recover` replaces\n")
+	fmt.Fprintf(env.Stdout, "         the ledger deliberately if that is what you mean\n")
 }
 
 // printRestoreResult says what actually happened, whether or not it finished.
@@ -735,8 +735,8 @@ func printRestored(env cli.Env, a *deployarchive.Archive, t deployarchive.Target
 		fmt.Fprintf(env.Stdout, "  billet did not inspect the database you restored, and a newer\n")
 		fmt.Fprintf(env.Stdout, "  `billet server` migrates whatever it finds there on its first start\n\n")
 	case keptLive:
-		fmt.Fprintf(env.Stdout, "  the database kept this deployment's own ledger, which is newer than the\n")
-		fmt.Fprintf(env.Stdout, "  backup; the backup's dump was not used\n\n")
+		fmt.Fprintf(env.Stdout, "  the database kept this deployment's own ledger; the backup's dump was\n")
+		fmt.Fprintf(env.Stdout, "  not used\n\n")
 	default:
 		fmt.Fprintf(env.Stdout, "  the ledger is at schema %d; a newer `billet server` migrates it forward on\n",
 			a.Manifest.Ledger.HighestVersion())
@@ -750,9 +750,16 @@ func printRestored(env cli.Env, a *deployarchive.Archive, t deployarchive.Target
 	// not start.
 	fmt.Fprintf(env.Stdout, "  `billet local up` starts the services — it is what to run next\n\n")
 
-	// A LEDGER THE DATABASE KEPT HAS EVERY LEASE THE FLEET HOLDS, so the warning
-	// below, which is about a ledger older than the fleet, would be false.
+	// A KEPT LEDGER IS AS CURRENT AS THE DATABASE, which billet cannot prove:
+	// one that outlived its host holds every lease, and one restored from an older
+	// snapshot of its own does not. So the warning is said either way, in the
+	// words that fit what was kept.
 	if keptLive {
+		fmt.Fprintf(env.Stdout, "BEFORE you reconnect nodes: if this database was itself restored from a\n")
+		fmt.Fprintf(env.Stdout, "snapshot rather than outliving its host, its ledger has no lease for compute\n")
+		fmt.Fprintf(env.Stdout, "created after that snapshot, and node recovery destroys such an instance as an\n")
+		fmt.Fprintf(env.Stdout, "orphan. Inventory that compute and prove it gone first.\n")
+
 		return
 	}
 

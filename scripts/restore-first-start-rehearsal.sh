@@ -50,11 +50,18 @@ cleanup() {
 
     echo
     echo "=== teardown"
-    # THE SCALE SET IS REMOVED THROUGH WHICHEVER CONTROLLER SERVED LAST, by
-    # evidence rather than by probe: the old one is cut off the network once the
-    # new one is the deployment, so it can reach no GitHub to tear anything down.
-    if [ -n "${serving}" ]; then
-        if ! rehearsal_teardown_scale_sets "${serving}"; then
+    # THE SCALE SET IS REMOVED THROUGH THE LAST CONTROLLER THAT COULD HAVE MADE
+    # ONE, by evidence rather than by probe. Once the old controller has served,
+    # a scale set may exist until a teardown proves otherwise, through whichever
+    # host holds the App: the new one once it has started, otherwise the old one,
+    # reconnected for the purpose (it is stopped and disabled, and the teardown
+    # is a command against GitHub, not a service).
+    if [ "${scale_set}" = yes ]; then
+        teardown_host=${serving:-${old}}
+        if [ -z "${serving}" ]; then
+            docker network connect "${network}" "${old}" >/dev/null 2>&1 || true
+        fi
+        if ! rehearsal_teardown_scale_sets "${teardown_host}"; then
             echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
             echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
             if [ "${status}" -eq 0 ]; then status=1; fi
@@ -70,12 +77,17 @@ cleanup() {
         docker exec "${node}" journalctl -u billet-node -n 40 --no-pager -o cat 2>&1 | tail -40 || true
     fi
 
-    rehearsal_teardown_hosts "${network}" "${storage}" "${old}" "${new}" "${node}"
+    # A HOST, NETWORK OR STORAGE LEFT BEHIND FAILS THE RUN, so a green rehearsal
+    # never hides something an operator has to remove by hand.
+    if ! rehearsal_teardown_hosts "${network}" "${storage}" "${old}" "${new}" "${node}"; then
+        if [ "${status}" -eq 0 ]; then status=1; fi
+    fi
     rm -rf "${work}" || true
     exit "${status}"
 }
 REHEARSAL_PASSED=0
 serving=
+scale_set=no
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap cleanup EXIT
@@ -136,12 +148,25 @@ rehearsal_install_bundle "${node}" "${work}/bundle"
 
 since=$(rehearsal_clock "${old}")
 serving=${old}
+scale_set=yes
 docker exec "${old}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 rehearsal_wait_registered 120 "${old}" "${node}" "${since}" ||
     rehearsal_fail "${node} never registered with the old controller"
 
 rehearsal_step "back the served deployment up, and keep the archive off the host"
+# A ROW ONLY THE ARCHIVE'S LEDGER CAN CARRY to the new host: a certificate
+# issued and revoked before the backup, for a node that never existed, so
+# nothing but the restored ledger can put its revocation on the new controller.
+# A registration proves only a valid certificate, which an empty ledger beside
+# the restored authority would accept as well.
+rehearsal_as_billet "${old}" /usr/bin/billet ca issue "${node}-archived" \
+    --config /etc/billet/billet.yaml --out "/tmp/${node}-archived-tls" >/dev/null ||
+    rehearsal_fail "the old controller could not issue the certificate the archive must carry"
+rehearsal_as_billet "${old}" /usr/bin/billet ca revoke "${node}-archived" \
+    --config /etc/billet/billet.yaml --cert "/tmp/${node}-archived-tls/node.crt" \
+    --reason "restore first-start rehearsal" >/dev/null ||
+    rehearsal_fail "the old controller could not record the revocation the archive must carry"
 docker exec "${old}" install -d -o billet -g billet -m 0700 /var/backups/billet
 rehearsal_as_billet "${old}" /usr/bin/billet local backup --config /etc/billet/billet.yaml \
     --out /var/backups/billet/a --no-upload 2>&1 | tail -6
@@ -211,11 +236,12 @@ rehearsal_step "the node that trusted the old controller is served by the restor
 rehearsal_wait_registered 300 "${new}" "${node}" "${since}" ||
     rehearsal_fail "${node} did not register with the restored controller"
 
-status=$(rehearsal_as_billet "${new}" /usr/bin/billet status --config /etc/billet/billet.yaml 2>&1) ||
-    rehearsal_fail "billet status failed on the restored deployment: ${status}"
-sed -n '1,8p' <<<"${status}"
-grep -qF "${node}" <<<"${status}" ||
-    rehearsal_fail "billet status on the restored host does not list ${node}"
+# AND IT IS SERVING THE ARCHIVE'S LEDGER, not a fresh one beside the restored
+# authority: the revocation recorded before the backup is there.
+revocations=$(rehearsal_as_billet "${new}" /usr/bin/billet ca revocations --config /etc/billet/billet.yaml 2>&1) ||
+    rehearsal_fail "billet ca revocations failed on the restored host: ${revocations}"
+grep -qF "${node}-archived" <<<"${revocations}" ||
+    rehearsal_fail "the restored controller does not hold ${node}-archived's revocation, so it is not serving the archive's ledger"
 
 echo
 echo "restore first-start rehearsal: PASSED"

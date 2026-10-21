@@ -393,20 +393,12 @@ func requireBackupPostgres(t *testing.T) string {
 	return u.String()
 }
 
-// AND THE COMMAND RUNS TO THE END ON A REAL POSTGRESQL LEDGER.
-//
-// THIS IS THE GATE THE CHEAP ONE CANNOT BE. Its sibling proves execution reaches
-// openStateAdmin, and MEASURED by mutation that is all it proves: a blanket
-// refusal moved BELOW that line survives it, because with no database the
-// command stops at the handle either way. The defect this whole pair exists for
-// — every line of the feature unreachable behind an early return — could be
-// reintroduced one statement further down and go unseen.
-//
-// So this one connects, migrates, mints an identity and an authority, and drives
-// the real `runLocalBackup` — through the real pg_dump — to a finished archive
-// that carries the ledger's dump. A refusal anywhere in the command fails it.
-func TestAPostgresBackupCarriesADumpOfTheLedger(t *testing.T) {
-	dsn := requireBackupPostgres(t)
+// commissionPostgresBackup is a PostgreSQL deployment commissioned the way the
+// control plane does it, and the config that names it.
+func commissionPostgresBackup(t *testing.T) (configPath, dsn, id string) {
+	t.Helper()
+
+	dsn = requireBackupPostgres(t)
 	f := newBackupFixture(t, false)
 
 	t.Setenv("BILLET_TEST_BACKUP_DSN", dsn)
@@ -434,7 +426,7 @@ tiers:
     image: ubuntu:24.04
 `
 
-	configPath := filepath.Join(t.TempDir(), "billet.yaml")
+	configPath = filepath.Join(t.TempDir(), "billet.yaml")
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write the config: %v", err)
 	}
@@ -451,7 +443,7 @@ tiers:
 		t.Fatalf("Close: %v", err)
 	}
 
-	id, err := state.DeploymentID(f.stateDir)
+	id, err = state.DeploymentID(f.stateDir)
 	if err != nil {
 		t.Fatalf("DeploymentID: %v", err)
 	}
@@ -459,6 +451,24 @@ tiers:
 	if _, err := wirecert.LoadOrCreateCA(f.stateDir, id); err != nil {
 		t.Fatalf("LoadOrCreateCA: %v", err)
 	}
+
+	return configPath, dsn, id
+}
+
+// AND THE COMMAND RUNS TO THE END ON A REAL POSTGRESQL LEDGER.
+//
+// THIS IS THE GATE THE CHEAP ONE CANNOT BE. Its sibling proves execution reaches
+// openStateAdmin, and MEASURED by mutation that is all it proves: a blanket
+// refusal moved BELOW that line survives it, because with no database the
+// command stops at the handle either way. The defect this whole pair exists for
+// — every line of the feature unreachable behind an early return — could be
+// reintroduced one statement further down and go unseen.
+//
+// So this one connects, migrates, mints an identity and an authority, and drives
+// the real `runLocalBackup` — through the real pg_dump — to a finished archive
+// that carries the ledger's dump. A refusal anywhere in the command fails it.
+func TestAPostgresBackupCarriesADumpOfTheLedger(t *testing.T) {
+	configPath, dsn, id := commissionPostgresBackup(t)
 
 	dest := filepath.Join(t.TempDir(), "archive")
 
@@ -527,4 +537,47 @@ func schemaOf(t *testing.T, dsn string) string {
 	}
 
 	return u.Query().Get("search_path")
+}
+
+// A HOST THAT CANNOT RUN pg_dump STILL CAPTURES THE IDENTITY HALF, and fails
+// afterwards naming what to install: the identity-only archive older billets
+// wrote, never nothing at all, and never a success that hides the missing
+// ledger.
+func TestAPostgresBackupWithoutPgDumpCapturesTheRestAndFails(t *testing.T) {
+	configPath, _, _ := commissionPostgresBackup(t)
+
+	// NO pg_dump ON THE PATH, which is how a host without the client looks.
+	t.Setenv("PATH", t.TempDir())
+
+	dest := filepath.Join(t.TempDir(), "archive")
+
+	err := runLocalBackup(t.Context(), processEnv(), backupOptions{
+		configPath: configPath,
+		out:        dest,
+		noUpload:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "NOT the PostgreSQL ledger") ||
+		!strings.Contains(err.Error(), "pg_dump is not installed") {
+		t.Fatalf("a backup with no pg_dump = %v, want the failure naming the missing ledger and why", err)
+	}
+
+	a, err := deployarchive.Open(t.Context(), dest)
+	if err != nil {
+		t.Fatalf("the identity-only archive does not read back: %v", err)
+	}
+
+	if !a.Manifest.Ledger.IsExternal() || a.Manifest.Ledger.IsDump() || a.Manifest.Schema != 3 {
+		t.Errorf("the archive is schema %d with ledger %+v, want the identity-only schema 3",
+			a.Manifest.Schema, a.Manifest.Ledger)
+	}
+
+	for _, entry := range []string{deployarchive.EntryIdentity, deployarchive.AuthorityEntry("ca.key")} {
+		if _, ok := a.Manifest.Record(entry); !ok {
+			t.Errorf("the identity-only archive does not carry %s", entry)
+		}
+	}
+
+	if len(a.Manifest.Ledger.Migrations) == 0 {
+		t.Error("the identity-only archive does not record the ledger's migrations")
+	}
 }

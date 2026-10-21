@@ -237,7 +237,7 @@ test "$(rehearsal_active "${controller}" billet-server.service)" = active ||
     rehearsal_fail "billet-server.service is not active on the controller after its upgrade"
 docker exec "${controller}" grep -qF "${to_digest}" /var/lib/billet/installed.json ||
     rehearsal_fail "the controller's provenance does not name ${TO}'s manifest"
-rehearsal_units_run_installed_binary "${controller}" ||
+rehearsal_units_run_installed_binary "${controller}" billet-server.service ||
     rehearsal_fail "a billet service on the controller is not running ${TO}'s binary after the upgrade"
 
 rehearsal_step "the coordinator moves the node"
@@ -254,9 +254,11 @@ test "$(rehearsal_active "${node}" billet-node.service)" = active ||
     rehearsal_fail "billet-node.service is not active on the node after its upgrade"
 docker exec "${node}" grep -qF "${to_digest}" /var/lib/billet/installed.json ||
     rehearsal_fail "the node's provenance does not name ${TO}'s manifest"
-# EVERY UNIT, NOT ONLY billet-node: the uplink shaper beside it is what #503 left
-# on the replaced binary while the node came back healthy.
-rehearsal_units_run_installed_binary "${node}" ||
+# EVERY UNIT, NOT ONLY billet-node: the uplink shaper beside one is what #503 left
+# on the replaced binary while the node came back healthy. This node runs no
+# shaper, because shaping loads sch_cake and ifb into the kernel the rehearsal
+# host shares; its restart is held by hostupgrade's own tests.
+rehearsal_units_run_installed_binary "${node}" billet-node.service ||
     rehearsal_fail "a billet service on the node is not running ${TO}'s binary after the upgrade"
 
 rehearsal_wait_for 300 "the rollout to complete" "${controller}" \
@@ -295,7 +297,7 @@ rehearsal_wait_for 120 "the server to be back" "${controller}" systemctl is-acti
     rehearsal_fail "billet-server.service did not come back after the rollback"
 # A ROLLBACK REPLACES THE BINARY TWICE, so it is the likelier place for a unit to
 # be left on the candidate's.
-rehearsal_units_run_installed_binary "${controller}" ||
+rehearsal_units_run_installed_binary "${controller}" billet-server.service ||
     rehearsal_fail "a billet service on the controller is not running ${TO}'s binary after the rollback"
 
 # THE GUARD IS GIVEN TIME TO BE VIOLATED. The coordinator looks every thirty

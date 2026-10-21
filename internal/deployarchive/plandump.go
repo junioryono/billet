@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
@@ -97,11 +98,20 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 	// committed left a populated schema that, on a ledger never bound, nothing
 	// else here could tell from somebody else's; the journal can.
 	if p.ledgerRestoredByThisRun() {
+		// A RECOVERY STILL NAMES ITS COPY, so a resumed run hands it to the service
+		// account and reports where it is, as the first run would have.
+		if p.Intent == ReplaceLedger {
+			p.Superseded = supersededDumpPath(p.Archive, p.Target.StateDir)
+		}
+
 		p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: AlreadyPresent})
 
 		return nil
 	}
 
+	// A RECOVERY REPLACES THE LEDGER WHATEVER ITS SCHEMA'S AGE: Restore drops the
+	// tables the archive's dump does not name before it restores, so a ledger a
+	// later migration widened comes back as the archive's whole, not as a mix.
 	if p.Intent == ReplaceLedger {
 		if led.Binding != "" && led.Binding != deployment {
 			p.refuseForeignLedger(led.Binding)
@@ -115,9 +125,34 @@ func (p *Plan) planDumpLedger(ctx context.Context) error {
 		return nil
 	}
 
+	archived := p.Archive.Manifest.Ledger.HighestVersion()
+
 	switch {
 	case len(led.Tables) == 0:
 		p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: Install})
+	case (led.Binding == deployment || led.Populated && p.Target.ExternalLedgerAttached) &&
+		!slices.Contains(led.Tables, "schema_migrations"):
+		// KEPT ONLY IF IT IS A BILLET LEDGER AT ALL. Rows with no migration
+		// bookkeeping are some other program's tables, and keeping them would
+		// leave this deployment to start on an empty ledger beside them.
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf("schema %s holds tables and no schema_migrations, so it is not a "+
+				"billet ledger", led.Schema),
+			Remedy: "point the connection at this deployment's ledger, or at an empty schema for " +
+				"this backup's to be restored into",
+		})
+	case (led.Binding == deployment || led.Populated && p.Target.ExternalLedgerAttached) &&
+		highestOf(led.Migrations) < archived:
+		// PROVABLY OLDER THAN THE BACKUP: its schema is behind the archive's, so
+		// it was restored from something taken before this backup, and keeping it
+		// would throw away rows the backup holds.
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf("the ledger in schema %s is at migration %d and this backup's at %d, "+
+				"so the database is older than the backup", led.Schema,
+				highestOf(led.Migrations), archived),
+			Remedy: "empty that schema, and this restore puts the backup's ledger there; or " +
+				"restore from a backup no newer than the database",
+		})
 	case led.Binding == deployment:
 		p.add(Action{Entry: EntryLedgerDump, Path: path, What: "ledger", Disposition: KeepLiveLedger})
 	case led.Binding != "":

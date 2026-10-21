@@ -27,12 +27,14 @@ type backupOptions struct {
 
 // cmdLocalBackup captures this deployment as ONE unit.
 //
-// THE UNIT IS FOUR THINGS AND EACH IS USELESS WITHOUT THE OTHERS: the ledger
-// (a SQLite file, or a PostgreSQL database's dump), the deployment identity, the GitHub App private key and the node-wire
-// certificate authority. A ledger without its identity is a fresh authority that
-// cannot see the compute the old one launched; an identity without the CA cannot
-// issue a node certificate; a CA without the App key cannot get a token. So this
-// captures all four or it captures nothing.
+// THE UNIT IS FOUR THINGS AND EACH IS USELESS WITHOUT THE OTHERS: the ledger (a
+// SQLite file, or a PostgreSQL database's dump), the deployment identity, the
+// GitHub App private key and the node-wire certificate authority. A ledger
+// without its identity is a fresh authority that cannot see the compute the old
+// one launched; an identity without the CA cannot issue a node certificate; a CA
+// without the App key cannot get a token. So this captures all four, or, on a
+// PostgreSQL host that cannot run pg_dump, the other three and a failure that
+// says the ledger is missing.
 //
 // IT RUNS AGAINST A LIVE CONTROL PLANE. The ledger copy is SQLite's VACUUM INTO
 // or pg_dump, each a consistent snapshot of a database somebody is writing to,
@@ -186,30 +188,37 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 	// there is for the identity half — no ledger volume by design, a root volume
 	// that is delete_on_termination, and an App key GitHub issues exactly once —
 	// and with the dump beside it, for the ledger half too.
-	snapshot, dump, err := ledgerSource(ctx, cfg, db)
+	src, err := ledgerSource(ctx, cfg, db)
 	if err != nil {
 		return err
 	}
 
-	if dump != nil {
+	switch {
+	case src.dump != nil:
 		fmt.Fprintf(env.Stdout, "         the ledger is PostgreSQL and is copied by its own pg_dump, in one\n")
 		fmt.Fprintf(env.Stdout, "         snapshot, without holding any write\n\n")
+	case src.external != nil:
+		fmt.Fprintf(env.Stdout, "warn     the ledger is PostgreSQL and this host cannot copy it: %v\n", src.clientErr)
+		fmt.Fprintf(env.Stdout, "         The identity, the authority and the App key are captured anyway, and\n")
+		fmt.Fprintf(env.Stdout, "         this command fails afterwards so the missing ledger is not mistaken for\n")
+		fmt.Fprintf(env.Stdout, "         a backup\n\n")
 	}
 
 	m, err := deployarchive.Write(ctx, deployarchive.BackupRequest{
-		Dest:         dest,
-		StateDir:     cfg.Server.IdentityDir,
-		ConfigPath:   o.configPath,
-		DeploymentID: deployment,
-		GitHub:       archiveIdentity(targets[0]),
-		Targets:      further,
-		AppKeyPEM:    appKey,
-		ConfigBody:   configBody,
-		Snapshot:     snapshot,
-		Dump:         dump,
-		Now:          time.Now,
-		Hostname:     host,
-		Authority:    acc.Lock(),
+		Dest:           dest,
+		StateDir:       cfg.Server.IdentityDir,
+		ConfigPath:     o.configPath,
+		DeploymentID:   deployment,
+		GitHub:         archiveIdentity(targets[0]),
+		Targets:        further,
+		AppKeyPEM:      appKey,
+		ConfigBody:     configBody,
+		Snapshot:       src.snapshot,
+		Dump:           src.dump,
+		ExternalLedger: src.external,
+		Now:            time.Now,
+		Hostname:       host,
+		Authority:      acc.Lock(),
 	})
 	if err != nil {
 		return err
@@ -225,39 +234,74 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 		fmt.Fprintf(env.Stdout, "note     --no-upload: this archive was NOT copied to backup.s3, so it is on\n")
 		fmt.Fprintf(env.Stdout, "         the same disk as the deployment it protects\n")
 
+		return src.missingLedger(dest)
+	}
+
+	return errors.Join(uploadArchive(ctx, env, cfg, dest, deployment), src.missingLedger(dest))
+}
+
+// ledgerCopy is how a backup's ledger travels: exactly one of the three is set.
+type ledgerCopy struct {
+	snapshot func(context.Context, string) error
+	dump     func(context.Context, string) (deployarchive.LedgerDump, error)
+	// external is an identity-only archive's description of the ledger, taken
+	// only when this host cannot run pg_dump; clientErr says why.
+	external  *deployarchive.ExternalLedger
+	clientErr error
+}
+
+// missingLedger is the failure a backup reports after it has written and sent
+// an identity-only archive, naming what to install.
+func (l ledgerCopy) missingLedger(dest string) error {
+	if l.clientErr == nil {
 		return nil
 	}
 
-	return uploadArchive(ctx, env, cfg, dest, deployment)
+	return fmt.Errorf("the archive at %s holds the deployment identity, the node-wire "+
+		"authority and the App key and NOT the PostgreSQL ledger, because this host cannot run "+
+		"pg_dump for it: %w", dest, l.clientErr)
 }
 
 // ledgerSource decides how this deployment's ledger travels in the archive.
 //
-// EXACTLY ONE OF THE TWO IS NON-NIL, which BackupRequest.validate re-checks: a
-// SQLite ledger is a VACUUM INTO snapshot, a PostgreSQL ledger is a pg_dump of
-// the snapshot billet read its migrations in.
+// EXACTLY ONE WAY, which BackupRequest.validate re-checks: a SQLite ledger is a
+// VACUUM INTO snapshot, a PostgreSQL ledger is a pg_dump of the snapshot billet
+// read its migrations in.
 //
-// THE CLIENT PROGRAM IS PROVED BEFORE ANYTHING IS WRITTEN. pg_dump is the
-// operator's, installed with the PostgreSQL client, and one that is absent or
-// older than the server would otherwise be found after the identity and the
-// keys were already in the destination: a directory that is visibly not an
-// archive, but one the operator has to clear before the next attempt.
-func ledgerSource(
-	ctx context.Context, cfg *config.Config, db *state.DB,
-) (func(context.Context, string) error,
-	func(context.Context, string) (deployarchive.LedgerDump, error), error,
-) {
+// THE CLIENT PROGRAM IS PROVED BEFORE ANYTHING IS WRITTEN, and a host that
+// cannot run it still captures the rest. pg_dump is the operator's, installed
+// with the PostgreSQL client; when it is absent or older than the server, the
+// archive is the identity-only one older billets wrote (the identity, the
+// authority and the App key GitHub issues once, with the ledger recorded as
+// external), and the command then fails naming what to install. Refusing
+// outright would leave a packaged timer capturing nothing at all on the day the
+// client went missing, which is exactly when the identity half is the only
+// half a replacement host can be rebuilt from.
+func ledgerSource(ctx context.Context, cfg *config.Config, db *state.DB) (ledgerCopy, error) {
 	if cfg.Server.LedgerBackend() != config.StatePostgres {
-		return db.SnapshotInto, nil, nil
+		return ledgerCopy{snapshot: db.SnapshotInto}, nil
 	}
 
 	client, err := postgresClient(cfg)
 	if err != nil {
-		return nil, nil, err
+		return ledgerCopy{}, err
 	}
 
-	if err := client.CheckDump(ctx); err != nil {
-		return nil, nil, err
+	if clientErr := client.CheckDump(ctx); clientErr != nil {
+		applied, err := db.AppliedMigrations(ctx)
+		if err != nil {
+			return ledgerCopy{}, errors.Join(clientErr,
+				fmt.Errorf("read what this ledger has applied: %w", err))
+		}
+
+		return ledgerCopy{
+			external: &deployarchive.ExternalLedger{
+				Backend:    string(config.StatePostgres),
+				DSNEnv:     cfg.Server.LedgerDSNEnv(),
+				Migrations: applied,
+			},
+			clientErr: clientErr,
+		}, nil
 	}
 
 	dump := func(ctx context.Context, dest string) (deployarchive.LedgerDump, error) {
@@ -276,7 +320,7 @@ func ledgerSource(
 		return out, nil
 	}
 
-	return nil, dump, nil
+	return ledgerCopy{dump: dump}, nil
 }
 
 // printBackup reports what was captured, and what an archive is not.

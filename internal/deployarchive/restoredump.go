@@ -48,36 +48,19 @@ func publishDump(ctx context.Context, res *Result, req RestoreRequest, j *journa
 	return j.save(req.Plan.Target.StateDir)
 }
 
-// restoreArchiveDump hands pg_restore a copy of the archive's dump that this
-// call verified, never the archive's own pathname.
-//
-// THE DIGEST IS CHECKED ON THE BYTES THE RESTORE READS, for the reason copyFile
-// gives: Open verified the dump by pathname, and media somebody can change
-// between that and pg_restore opening it would put a ledger into the database
-// that nothing vouched for. The copy is private to this state directory and goes
-// when the restore is done.
+// restoreArchiveDump restores the archive's dump through a copy verified
+// against its manifest record: Open checked the dump by pathname, and that is
+// not the read pg_restore makes.
 func restoreArchiveDump(ctx context.Context, req RestoreRequest) (string, error) {
 	rec, found := req.Plan.Archive.Manifest.Record(EntryLedgerDump)
 	if !found {
 		return "", fmt.Errorf("deployarchive: this backup's manifest does not describe %s", EntryLedgerDump)
 	}
 
-	dir, err := os.MkdirTemp(req.Plan.Target.StateDir, ".billet-restore-dump-*")
-	if err != nil {
-		return "", fmt.Errorf("deployarchive: stage the ledger dump: %w", err)
-	}
+	facts := req.Plan.Archive.Manifest.Ledger.Dump
 
-	defer func() { _ = os.RemoveAll(dir) }()
-
-	staged := filepath.Join(dir, supersededDumpName)
-
-	stray, err := copyFile(req.Plan.Archive.DumpPath(), staged, rec)
-	if err != nil {
-		return stray, err
-	}
-
-	return stray, req.Plan.Target.Postgres.Restore(ctx, staged,
-		req.Plan.Archive.Manifest.Ledger.Dump.DumpVersion)
+	return restoreVerifiedCopy(ctx, req.Plan.Target, req.Plan.Archive.DumpPath(), rec,
+		facts.DumpVersion, facts.Schema)
 }
 
 // verifyRestored reads back what the database holds after a restore, through
@@ -134,6 +117,20 @@ func supersedeDump(ctx context.Context, res *Result, req RestoreRequest, j *jour
 	base := filepath.Base(target)
 	stateDir := req.Plan.Target.StateDir
 
+	// THE DATABASE THIS RECOVERY IS REPLACING THE LEDGER IN, read now and held
+	// to what the journal recorded when the copy was taken: a connection pointed
+	// at another database since is refused rather than overwritten.
+	led, err := req.Plan.Target.Postgres.Peek(ctx)
+	if err != nil {
+		return fmt.Errorf("deployarchive: read the ledger this recovery replaces: %w", err)
+	}
+
+	if j.SupersededDatabase != "" && led.Database != j.SupersededDatabase {
+		return fmt.Errorf("deployarchive: this recovery took its copy of the ledger from database "+
+			"%s and the connection now reaches %s; billet will not replace a ledger in a database "+
+			"it took no copy of", j.SupersededDatabase, led.Database)
+	}
+
 	switch _, err := os.Lstat(target); {
 	case err == nil:
 		want, recorded := j.SupersededDigests[base]
@@ -153,6 +150,13 @@ func supersedeDump(ctx context.Context, res *Result, req RestoreRequest, j *jour
 				"replaces, so billet will not go on with it as the record of that ledger", target)
 		}
 
+		// A RESUME MAKES IT DURABLE AGAIN BEFORE ANYTHING REPLACES THE LEDGER:
+		// the run that linked it may have died before its directory sync, and
+		// the archive's restore is only allowed once the copy cannot vanish.
+		if err := publishedDurably(stateDir, target, j); err != nil {
+			return err
+		}
+
 		res.Superseded = append(res.Superseded, target)
 
 		return nil
@@ -169,7 +173,8 @@ func supersedeDump(ctx context.Context, res *Result, req RestoreRequest, j *jour
 
 	staged := filepath.Join(dir, supersededDumpName)
 
-	if _, err := req.Plan.Target.Postgres.Dump(ctx, staged); err != nil {
+	taken, err := req.Plan.Target.Postgres.Dump(ctx, staged)
+	if err != nil {
 		return fmt.Errorf("deployarchive: take a copy of the ledger this recovery replaces: %w", err)
 	}
 
@@ -187,6 +192,8 @@ func supersedeDump(ctx context.Context, res *Result, req RestoreRequest, j *jour
 	}
 
 	j.SupersededDigests = map[string]string{base: sum}
+	j.SupersededDumpVersion = taken.Facts.DumpVersion
+	j.SupersededDatabase = led.Database
 
 	if err := j.save(stateDir); err != nil {
 		return err
@@ -201,7 +208,7 @@ func supersedeDump(ctx context.Context, res *Result, req RestoreRequest, j *jour
 		return fmt.Errorf("deployarchive: keep the superseded ledger at %s: %w", target, err)
 	}
 
-	if err := syncDir(stateDir); err != nil {
+	if err := publishedDurably(stateDir, target, j); err != nil {
 		return err
 	}
 
@@ -210,17 +217,44 @@ func supersedeDump(ctx context.Context, res *Result, req RestoreRequest, j *jour
 	return nil
 }
 
+// publishedDurably makes a recovery's copy and its name durable, then records
+// that they are, which is what permits the archive's restore and what an
+// abandon reads to tell "never replaced" from "replaced, and the copy is gone".
+func publishedDurably(stateDir, target string, j *journal) error {
+	if err := syncFile(target); err != nil {
+		return err
+	}
+
+	if err := syncDir(stateDir); err != nil {
+		return err
+	}
+
+	if j.SupersedePublished {
+		return nil
+	}
+
+	j.SupersedePublished = true
+
+	return j.save(stateDir)
+}
+
 // putSupersededDumpBack undoes a PostgreSQL recovery's replacement of the
 // ledger, or says what a restore left in the database.
 //
-// A RECOVERY'S COPY IS PROOF ENOUGH, AND ITS ABSENCE IS TOO. The archive's dump
-// is restored only after the copy is durable, so no copy means the database was
-// never touched; a copy whose digest the journal holds is the operator's ledger
-// as it was, and restoring it is one transaction that leaves the database
-// either as the recovery left it or as it was before. A copy the journal does
-// not vouch for is refused, fence and journal standing. What cannot be had is a
-// digest of the database itself; the restore's atomicity and the read-back of
-// the binding are what stand in for it.
+// THE JOURNAL SAYS WHETHER THE LEDGER WAS REPLACED, AND THE COPY PUTS IT BACK.
+// The archive's dump is restored only after the copy is durable and the journal
+// says so (SupersedePublished), so a journal that never got that far means the
+// database was never touched. Past it, the copy is the only record of the
+// operator's ledger: a copy whose digest the journal holds is restored, in one
+// transaction after the tables it does not name are dropped, and a copy that is
+// gone or that the journal does not vouch for is refused with the fence and the
+// journal standing. What cannot be had is a digest of the database itself; the
+// copy's digest, the restore's atomicity and the read-back stand in for it.
+//
+// THE DATABASE IS PROVED BEFORE ANYTHING IS RESTORED INTO IT: the one the copy
+// was taken from, at the archive's schema, bound to this deployment or to
+// nobody. A connection pointed elsewhere since the recovery stopped is refused
+// rather than overwritten.
 //
 // THE COPY IS KEPT afterwards, renamed so a later recovery from the same archive
 // does not take it for its own; nothing deletes a record of a ledger.
@@ -243,6 +277,12 @@ func putSupersededDumpBack(ctx context.Context, a *Archive, t Target, intent Int
 
 	switch _, err := os.Lstat(copyPath); {
 	case errors.Is(err, os.ErrNotExist):
+		if j.SupersedePublished || j.LedgerRestored {
+			return unrestoredLedger(t.StateDir, copyPath,
+				"this recovery published that copy of the ledger it replaced, and it is gone, so "+
+					"billet cannot say what the database holds or put back what it held")
+		}
+
 		return nil
 	case err != nil:
 		return fmt.Errorf("deployarchive: inspect %s: %w", copyPath, err)
@@ -255,14 +295,14 @@ func putSupersededDumpBack(ctx context.Context, a *Archive, t Target, intent Int
 				"ledger it holds")
 	}
 
-	sum, _, err := digestFile(copyPath)
+	sum, size, err := digestFile(copyPath)
 	if err != nil {
-		return fmt.Errorf("deployarchive: read %s to prove it is the ledger this recovery replaced: %w",
-			copyPath, err)
+		return err
 	}
 
 	if sum != want {
-		return unrestoredLedger(t.StateDir, copyPath, "it is not the copy this recovery took")
+		return unrestoredLedger(t.StateDir, copyPath,
+			"it is not the copy this recovery took of the ledger it replaced")
 	}
 
 	if t.Postgres == nil {
@@ -270,13 +310,38 @@ func putSupersededDumpBack(ctx context.Context, a *Archive, t Target, intent Int
 			"goes into, and none was given")
 	}
 
+	schema := a.Manifest.Ledger.Dump.Schema
+
+	before, err := t.Postgres.Peek(ctx)
+	if err != nil {
+		return fmt.Errorf("deployarchive: read the database the ledger goes back into: %w", err)
+	}
+
+	switch {
+	case j.SupersededDatabase != "" && before.Database != j.SupersededDatabase:
+		return unrestoredLedger(t.StateDir, copyPath, fmt.Sprintf(
+			"it was taken from database %s and the connection now reaches %s",
+			j.SupersededDatabase, before.Database))
+	case before.Schema != schema:
+		return unrestoredLedger(t.StateDir, copyPath, fmt.Sprintf(
+			"it was taken from schema %s and the connection now resolves to %q", schema, before.Schema))
+	case before.Binding != "" && before.Binding != a.Manifest.DeploymentID:
+		return unrestoredLedger(t.StateDir, copyPath, fmt.Sprintf(
+			"the database the connection reaches is bound to %s, not to this deployment",
+			before.Binding))
+	}
+
 	if err := t.Postgres.Barrier(ctx); err != nil {
 		return err
 	}
 
-	// The copy was written by this host's pg_dump, so this host's pg_restore reads
-	// it; there is no older writer to check for.
-	if err := t.Postgres.Restore(ctx, copyPath, 0); err != nil {
+	stray, err := restoreVerifiedCopy(ctx, t, copyPath,
+		FileRecord{Path: copyPath, SHA256: want, Size: size}, j.SupersededDumpVersion, schema)
+	if stray != "" {
+		res.Kept = append(res.Kept, stray)
+	}
+
+	if err != nil {
 		return fmt.Errorf("deployarchive: put the ledger this recovery replaced back from %s: %w",
 			copyPath, err)
 	}
@@ -310,4 +375,31 @@ func putSupersededDumpBack(ctx context.Context, a *Archive, t Target, intent Int
 		dumpTargetPath(led.Schema), aside))
 
 	return syncDir(t.StateDir)
+}
+
+// restoreVerifiedCopy hands pg_restore a copy of a dump that this call
+// verified against want, never the pathname whose bytes were checked earlier.
+//
+// THE DIGEST IS CHECKED ON THE BYTES THE RESTORE READS, for the reason copyFile
+// gives: a file verified by pathname and then reopened by pathname can be other
+// bytes by then, and these bytes become the deployment's ledger. The copy is
+// private to the state directory and goes when the restore is done.
+func restoreVerifiedCopy(ctx context.Context, t Target, src string, want FileRecord,
+	dumpVersion int, schema string,
+) (string, error) {
+	dir, err := os.MkdirTemp(t.StateDir, ".billet-restore-dump-*")
+	if err != nil {
+		return "", fmt.Errorf("deployarchive: stage %s: %w", src, err)
+	}
+
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	staged := filepath.Join(dir, supersededDumpName)
+
+	stray, err := copyFile(src, staged, want)
+	if err != nil {
+		return stray, err
+	}
+
+	return stray, t.Postgres.Restore(ctx, staged, dumpVersion, schema)
 }
