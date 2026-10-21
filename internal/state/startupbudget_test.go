@@ -47,21 +47,24 @@ func TestAStartupBudgetReplacesTheStartupTimeout(t *testing.T) {
 	}
 }
 
+const (
+	// budgetDeclaration is the file that declares WithStartupBudget, whose
+	// declared name is the one mention of it that is not a use.
+	budgetDeclaration = "internal/state/state.go"
+	// budgetCaller is the one file allowed to use it.
+	budgetCaller = "internal/state/ledgertest/ledgertest.go"
+)
+
 // ONLY THE TEST LEDGER STRETCHES THE BUDGET. WithStartupBudget lengthens a guard
 // against a sick disk, so a billet process passing it would open a production
-// ledger that waits on that disk for as long as it says. Its one caller is
+// ledger that waits on that disk for as long as it says. Its one use is
 // ledgertest's template build, as an argument to state.Open; the walk is
 // importcheck's, over every non-test file that imports this package, and this
 // package's own non-test files.
 func TestOnlyTheTestLedgerStretchesTheStartupBudget(t *testing.T) {
 	t.Parallel()
 
-	const (
-		module = "github.com/junioryono/billet"
-		caller = "internal/state/ledgertest/ledgertest.go"
-	)
-
-	files := importcheck.ProductionImporters(t, module+"/internal/state")
+	files := importcheck.ProductionImporters(t, "github.com/junioryono/billet/internal/state")
 
 	own, err := filepath.Glob("*.go")
 	if err != nil {
@@ -74,16 +77,13 @@ func TestOnlyTheTestLedgerStretchesTheStartupBudget(t *testing.T) {
 		}
 	}
 
-	if !slices.Contains(files, caller) {
-		t.Fatalf("%s is not among the files the walk found, so it proves nothing about its callers", caller)
+	if !slices.Contains(files, budgetCaller) || !slices.Contains(files, budgetDeclaration) {
+		t.Fatalf("the walk did not find %s and %s, so it proves nothing about the callers", budgetCaller,
+			budgetDeclaration)
 	}
 
 	root := importcheck.ModuleRoot(t)
-	fset := token.NewFileSet()
-
-	var callers []string
-
-	inOpen := false
+	sources := make(map[string][]byte, len(files))
 
 	for _, rel := range files {
 		body, err := os.ReadFile(filepath.Join(root, rel))
@@ -91,33 +91,126 @@ func TestOnlyTheTestLedgerStretchesTheStartupBudget(t *testing.T) {
 			t.Fatalf("read %s: %v", rel, err)
 		}
 
+		sources[filepath.ToSlash(rel)] = body
+	}
+
+	uses, inOpen := startupBudgetUses(t, sources)
+
+	if len(uses) != 1 || !strings.HasPrefix(uses[0], budgetCaller+":") {
+		t.Errorf("WithStartupBudget is named at %v; its one use is %s's template build", uses, budgetCaller)
+	}
+
+	if !inOpen {
+		t.Errorf("%s does not pass WithStartupBudget to state.Open, so the template is migrated under "+
+			"the production budget", budgetCaller)
+	}
+}
+
+// THE SCAN SEES EVERY WAY TO NAME IT: a wrapper of the same name, whose body the
+// first version skipped with its declaration, and a dot import, whose bare name
+// it counted only inside this package.
+func TestTheStartupBudgetScanSeesAWrapperAndADotImport(t *testing.T) {
+	t.Parallel()
+
+	declaration := []byte(`package state
+
+func WithStartupBudget(d time.Duration) OpenOption { return nil }
+`)
+	caller := []byte(`package ledgertest
+
+import "github.com/junioryono/billet/internal/state"
+
+func build() { state.Open(nil, "", state.WithStartupBudget(templateBudget)) }
+`)
+
+	for name, extra := range map[string]string{
+		"a wrapper of the same name": `package elsewhere
+
+import "github.com/junioryono/billet/internal/state"
+
+func WithStartupBudget(d time.Duration) state.OpenOption { return state.WithStartupBudget(d) }
+`,
+		"a dot import": `package elsewhere
+
+import . "github.com/junioryono/billet/internal/state"
+
+func open() { Open(nil, "", WithStartupBudget(time.Hour)) }
+`,
+		"a method value": `package elsewhere
+
+import "github.com/junioryono/billet/internal/state"
+
+var stretch = state.WithStartupBudget
+`,
+	} {
+		uses, _ := startupBudgetUses(t, map[string][]byte{
+			budgetDeclaration:         declaration,
+			budgetCaller:              caller,
+			"internal/elsewhere/x.go": []byte(extra),
+		})
+
+		var elsewhere int
+
+		for _, use := range uses {
+			if strings.HasPrefix(use, "internal/elsewhere/x.go:") {
+				elsewhere++
+			}
+		}
+
+		if elsewhere == 0 {
+			t.Errorf("%s: the scan found WithStartupBudget only at %v", name, uses)
+		}
+	}
+
+	uses, inOpen := startupBudgetUses(t, map[string][]byte{budgetDeclaration: declaration, budgetCaller: caller})
+	if len(uses) != 1 || !inOpen {
+		t.Errorf("the permitted caller alone scans as %v (passed to Open: %v), want its one use", uses, inOpen)
+	}
+}
+
+// startupBudgetUses lists every place the sources name WithStartupBudget, as
+// file:line:column, except its declared name in budgetDeclaration, and reports
+// whether budgetCaller passes it to state.Open. Every identifier counts, so a
+// selector, a bare name under a dot import, a method value and a same-named
+// wrapper are each a use.
+func startupBudgetUses(t *testing.T, sources map[string][]byte) ([]string, bool) {
+	t.Helper()
+
+	fset := token.NewFileSet()
+
+	var uses []string
+
+	inOpen := false
+
+	for rel, body := range sources {
 		file, err := parser.ParseFile(fset, rel, body, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", rel, err)
 		}
 
+		var declared *ast.Ident
+
+		if rel == budgetDeclaration {
+			for _, decl := range file.Decls {
+				if fd, ok := decl.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "WithStartupBudget" {
+					declared = fd.Name
+				}
+			}
+		}
+
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch node := n.(type) {
-			case *ast.FuncDecl:
-				// The declaration's own name is not a use.
-				if node.Recv == nil && node.Name.Name == "WithStartupBudget" {
-					return false
+			case *ast.Ident:
+				if node.Name == "WithStartupBudget" && node != declared {
+					uses = append(uses, fset.Position(node.Pos()).String())
 				}
 			case *ast.CallExpr:
-				if rel == caller && isSelector(node.Fun, "state", "Open") {
+				if rel == budgetCaller && isSelector(node.Fun, "state", "Open") {
 					for _, arg := range node.Args {
 						if call, ok := arg.(*ast.CallExpr); ok && isSelector(call.Fun, "state", "WithStartupBudget") {
 							inOpen = true
 						}
 					}
-				}
-			case *ast.SelectorExpr:
-				if node.Sel.Name == "WithStartupBudget" {
-					callers = append(callers, fset.Position(node.Pos()).String())
-				}
-			case *ast.Ident:
-				if node.Name == "WithStartupBudget" && filepath.Dir(rel) == "internal/state" {
-					callers = append(callers, fset.Position(node.Pos()).String())
 				}
 			}
 
@@ -125,14 +218,9 @@ func TestOnlyTheTestLedgerStretchesTheStartupBudget(t *testing.T) {
 		})
 	}
 
-	if len(callers) != 1 || !strings.HasPrefix(callers[0], caller+":") {
-		t.Errorf("WithStartupBudget is used at %v; its one use is %s's template build", callers, caller)
-	}
+	slices.Sort(uses)
 
-	if !inOpen {
-		t.Errorf("%s does not pass WithStartupBudget to state.Open, so the template is migrated under "+
-			"the production budget", caller)
-	}
+	return uses, inOpen
 }
 
 func isSelector(expr ast.Expr, pkg, name string) bool {

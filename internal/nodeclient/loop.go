@@ -1371,6 +1371,11 @@ func reportOutcome(
 	// safe. Only a failure to be heard is retried: a verdict the plane gave is
 	// the same the next time. A launch is never retried here; a lost launch
 	// report is custody, below.
+	//
+	// EVERY RESEND IS DETACHED FROM THE STOP. A first signal landing during the
+	// first send or a wait is exactly the stopping node this exists for, and a
+	// resend on the cancelled poll context would fail before it left. Each send
+	// keeps Report's own deadline; the second signal ends the waits.
 retry:
 	for attempt := 1; err != nil && attempt < reportAttempts && retriesReport(cmd, err); attempt++ {
 		log.Warn("could not report a destroy's outcome; sending it again",
@@ -1385,7 +1390,7 @@ retry:
 			break retry
 		}
 
-		err = c.Report(reportCtx, res)
+		err = c.Report(context.WithoutCancel(ctx), res)
 	}
 
 	if err == nil {

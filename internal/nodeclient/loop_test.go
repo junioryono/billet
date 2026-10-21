@@ -565,6 +565,9 @@ func TestADestroyReachesTheCompute(t *testing.T) {
 type lostResults struct {
 	drop int64
 	seen atomic.Int64
+	// onDrop, when set, runs as each result is dropped, before its connection
+	// closes.
+	onDrop func()
 }
 
 func (l *lostResults) wrap(next http.Handler) http.Handler {
@@ -581,6 +584,10 @@ func (l *lostResults) wrap(next http.Handler) http.Handler {
 			return
 		}
 
+		if l.onDrop != nil {
+			l.onDrop()
+		}
+
 		conn, _, err := http.NewResponseController(w).Hijack()
 		if err != nil {
 			http.Error(w, "this test's wire could not drop the result", http.StatusTeapot)
@@ -590,6 +597,56 @@ func (l *lostResults) wrap(next http.Handler) http.Handler {
 
 		_ = conn.Close()
 	})
+}
+
+// A STOP THAT LANDS AS THE DESTROY'S REPORT IS LOST DOES NOT LOSE IT. The first
+// signal is the node that is stopping, the one no later poll can be handed the
+// destroy again; its resend must leave on a context the stop has not ended.
+func TestADestroyReportLostAsTheNodeStopsIsSentAgain(t *testing.T) {
+	t.Parallel()
+
+	ctx, stop := context.WithCancel(t.Context())
+	lost := &lostResults{drop: 1, onDrop: stop}
+	p, c := harnessBehind(t, 15*time.Second, lost.wrap)
+	compute := &fakeCompute{}
+
+	ended := make(chan error, 1)
+
+	go func() {
+		ended <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
+			Provider:   config.ProviderDocker,
+			GuestOS:    []config.GuestOS{config.GuestLinux},
+			Deployment: deployment,
+			Log:        slog.New(slog.DiscardHandler),
+			Backoff:    20 * time.Millisecond,
+		})
+	}()
+
+	t.Cleanup(func() {
+		stop()
+
+		select {
+		case <-ended:
+		case <-time.After(30 * time.Second):
+			t.Error("the loop outlived the test")
+		}
+	})
+
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	if err := p.NewRunner().Destroy(t.Context(), 42); err != nil {
+		t.Fatalf("Destroy = %v, want the resend after the stop to settle it", err)
+	}
+
+	if got := lost.seen.Load(); got != 2 {
+		t.Errorf("the plane's wire carried %d results, want the one lost as the node stopped and its resend", got)
+	}
+
+	if _, _, destroyed := compute.snapshot(); len(destroyed) != 1 {
+		t.Errorf("the compute was asked to destroy %v, want once", destroyed)
+	}
 }
 
 // A DESTROY'S OUTCOME THAT DID NOT LAND IS SENT AGAIN. A stopping node's last
