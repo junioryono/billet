@@ -71,7 +71,7 @@ func TestJoinHardensSSHDOnlyOverAKeyAndUndoesARefusedDropIn(t *testing.T) {
 	if _, err := os.Stat(dropIn); !os.IsNotExist(err) {
 		t.Errorf("the drop-in sshd refused is still there (%v)", err)
 	}
-	if want := []string{"/usr/bin/tee " + dropIn, "/usr/sbin/sshd -t", "/bin/rm -f " + dropIn}; !slices.Equal(*calls, want) {
+	if want := []string{"/usr/bin/tee " + dropIn, "/bin/chmod 0644 " + dropIn, "/usr/sbin/sshd -t", "/bin/rm -f " + dropIn}; !slices.Equal(*calls, want) {
 		t.Errorf("sudo ran %v, want %v", *calls, want)
 	}
 
@@ -84,7 +84,7 @@ func TestJoinHardensSSHDOnlyOverAKeyAndUndoesARefusedDropIn(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not read back") || !strings.Contains(err.Error(), "removed again") {
 		t.Errorf("a drop-in that did not read back answered %v", err)
 	}
-	if want := []string{"/usr/bin/tee " + dropIn, "/bin/rm -f " + dropIn}; !slices.Equal(*calls, want) {
+	if want := []string{"/usr/bin/tee " + dropIn, "/bin/chmod 0644 " + dropIn, "/bin/rm -f " + dropIn}; !slices.Equal(*calls, want) {
 		t.Errorf("sudo ran %v, want %v", *calls, want)
 	}
 	teeWrites = nil
@@ -93,6 +93,9 @@ func TestJoinHardensSSHDOnlyOverAKeyAndUndoesARefusedDropIn(t *testing.T) {
 	mustOK(t, hardenSSHD(t.Context(), processEnv(), "op"))
 	if done, err := sshdHardened("op"); err != nil || !done {
 		t.Errorf("the drop-in sshd accepted does not read back as done (%v)", err)
+	}
+	if info, err := os.Stat(dropIn); err != nil || info.Mode().Perm() != 0o644 {
+		t.Errorf("the drop-in is %v (%v), want 0644 whatever the umask left", info.Mode().Perm(), err)
 	}
 
 	// AND NOW IT IS THERE, so another run refuses rather than replacing it.

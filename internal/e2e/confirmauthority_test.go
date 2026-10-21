@@ -1,7 +1,9 @@
 package e2e
 
 import (
+	"bytes"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -88,6 +90,21 @@ func TestAJoinConfirmsTheAuthorityItFetched(t *testing.T) {
 		t.Fatal(err)
 	}
 	appender := serveAuthority(t, append(append([]byte{}, caPEM...), roguePEM...), theirs, &rogueServing)
+
+	// AND ONLY THE PINNED CERTIFICATE COMES BACK, even when the bundle the
+	// real control plane is confirmed with carries a second root.
+	_, pinned, err = nodeclient.ConfirmAuthority(t.Context(), base, append(append([]byte{}, caPEM...), roguePEM...),
+		ca.Fingerprint())
+	if err != nil {
+		t.Fatalf("the real control plane, given a bundle with a second root: %v", err)
+	}
+	block, rest := pem.Decode(pinned)
+	if block == nil || len(bytes.TrimSpace(rest)) != 0 {
+		t.Errorf("the confirmed authority holds more than one certificate:\n%s", pinned)
+	}
+	if got, err := wirecert.FingerprintOfCAPEM(pinned); err != nil || !wirecert.SameFingerprint(got, ca.Fingerprint()) {
+		t.Errorf("the confirmed authority is %s (%v), want the pinned %s", got, err, ca.Fingerprint())
+	}
 
 	for name, url := range map[string]string{"a replayer": replay, "an appended root": appender} {
 		fetched, got, err := nodeclient.FetchCA(t.Context(), url, ca.Fingerprint())

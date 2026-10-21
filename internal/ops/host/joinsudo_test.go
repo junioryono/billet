@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"strings"
 	"testing"
 )
@@ -17,7 +18,16 @@ func TestJoinRunsSudoByItsAbsolutePath(t *testing.T) {
 		t.Errorf("sudo is %q, want /usr/bin/sudo", sudoBinary)
 	}
 
-	file, err := parser.ParseFile(token.NewFileSet(), "joinprereq.go", nil, 0)
+	src, err := os.ReadFile("joinprereq.go")
+	mustOK(t, err)
+
+	// AND A COMMAND GIVEN INPUT READS IT, with its output discarded: the sshd
+	// policy reaches root on tee's standard input, never through a file.
+	if !strings.Contains(string(src), "cmd.Stdin, cmd.Stdout = input, io.Discard") {
+		t.Error("prereqSudo no longer hands a command its input on standard input")
+	}
+
+	file, err := parser.ParseFile(token.NewFileSet(), "joinprereq.go", src, 0)
 	mustOK(t, err)
 
 	byConstant := 0

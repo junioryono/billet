@@ -582,6 +582,13 @@ func hardenSSHD(ctx context.Context, env cli.Env, account string) error {
 		return undo(err)
 	}
 
+	// THE MODE IS SET, NOT LEFT TO sudo's UMASK: tee creates the file masked,
+	// and under a umask of 077 it is root's 0600, which the read-back below,
+	// made as this account, cannot open.
+	if err := sudoRun(ctx, env, sudoChmod, "0644", sshdDropIn); err != nil {
+		return undo(err)
+	}
+
 	switch done, err := sshdHardened(account); {
 	case err != nil:
 		return undo(fmt.Errorf("the drop-in could not be read back: %w", err))

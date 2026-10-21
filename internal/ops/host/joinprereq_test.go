@@ -30,6 +30,9 @@ func fakeSudo(t *testing.T, record func(string), extra func(args []string) error
 		case sudoMkdir:
 			return os.MkdirAll(args[len(args)-1], 0o755)
 		case sudoChmod:
+			if args[1] == "0644" {
+				return os.Chmod(args[2], 0o644)
+			}
 			if args[1] != "u+s" {
 				t.Fatalf("an unexpected chmod: %v", args)
 			}
@@ -48,7 +51,9 @@ func fakeSudo(t *testing.T, record func(string), extra func(args []string) error
 				raw = teeWrites(raw)
 			}
 
-			return os.WriteFile(args[len(args)-1], raw, 0o644)
+			// AS A RESTRICTIVE UMASK LEAVES IT, so only an explicit mode makes it
+			// readable.
+			return os.WriteFile(args[len(args)-1], raw, 0o600)
 		case sudoRm:
 			if err := os.Remove(args[len(args)-1]); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
