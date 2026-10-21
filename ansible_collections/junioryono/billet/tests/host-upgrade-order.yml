@@ -37,6 +37,7 @@
     billet_host_preparation_ledger_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-desired-ledger.yml') | from_yaml }}"
     billet_host_stage_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/stage-candidate.yml') | from_yaml }}"
     billet_host_binary_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/binary.yml') | from_yaml }}"
+    billet_host_provenance_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/record-provenance.yml') | from_yaml }}"
     billet_host_allocate_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/allocate-recovery.yml') | from_yaml }}"
     billet_host_fallback_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') | from_yaml }}"
     billet_host_fallback_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') }}"
@@ -453,6 +454,57 @@
           - billet_finalization_names.index('Observe committed services across the restart interval') < billet_finalization_names.index('Inspect committed service stability after the restart interval')
           - billet_finalization_names.index('Prove committed services are stably active') < billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup')
           - billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup') < billet_finalization_names.index('Durably close the host-upgrade transaction')
+
+    # WHICH MANIFEST PRODUCED THE BINARY IS RECORDED BEFORE ANYTHING STARTS ON IT
+    # (#91): the node reads the record once, at its start, and the readiness
+    # probes are the transaction's first start. The record goes first and comes
+    # back with the other inputs on a rollback, and a host whose binary did not
+    # change is backfilled outside the transaction without a restart.
+    - name: Require the provenance record between the binary's install and its first start
+      vars:
+        billet_record_in_transaction: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Record which release manifest produced the candidate billet binary') | first }}"
+        billet_record_backfill: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Record which release manifest produced the unchanged billet binary') | first }}"
+        billet_backfill_record: "{{ (lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backfill-provenance.yml') | from_yaml) | selectattr('name', 'equalto', 'Record the unchanged billet binary''s manifest where nothing proves it') | first }}"
+        billet_record_removal: "{{ billet_host_provenance_tasks | selectattr('name', 'equalto', 'Remove the provenance record of the binary the transaction replaced') | first }}"
+        billet_record_command: "{{ billet_host_provenance_tasks | selectattr('name', 'equalto', 'Record which release manifest produced the installed binary') | first }}"
+        billet_provenance_names: "{{ billet_host_provenance_tasks | map(attribute='name') | list }}"
+        billet_inspected_inputs: "{{ (billet_host_account_tasks | selectattr('name', 'equalto', 'Inspect configuration and units before replacing them') | first).loop }}"
+        billet_journaled_inputs: "{{ (billet_host_service_tasks | selectattr('name', 'equalto', 'Record every input needed to recover the host transaction') | first)['ansible.builtin.set_fact'].billet_upgrade_manifest.inputs }}"
+      ansible.builtin.assert:
+        that:
+          - billet_upgrade_names.index('Install the candidate billet binary after fencing and ledger preservation') + 1 == billet_upgrade_names.index('Record which release manifest produced the candidate billet binary')
+          - billet_upgrade_names.index('Record which release manifest produced the candidate billet binary') < billet_upgrade_names.index('Probe the candidate binary for the typed maintenance flag')
+          - billet_upgrade_names.index('Record which release manifest produced the candidate billet binary') < billet_upgrade_names.index('Start the quiescent upgraded server readiness probe')
+          - billet_upgrade_names.index('Record which release manifest produced the candidate billet binary') < billet_upgrade_names.index('Start the quiescent upgraded node readiness probe')
+          - billet_record_in_transaction['ansible.builtin.include_tasks'] == 'record-provenance.yml'
+          - billet_record_in_transaction.vars.billet_provenance_replaces is sameas true
+          - "'billet_candidate_evidence_archive' in billet_record_in_transaction.vars.billet_provenance_archive"
+          - "'billet_candidate_evidence_manifest' in billet_record_in_transaction.vars.billet_provenance_manifest"
+          - billet_provenance_names.index('Remove the provenance record of the binary the transaction replaced') < billet_provenance_names.index('Record which release manifest produced the installed binary')
+          - billet_record_removal['ansible.builtin.file'].state == 'absent'
+          - billet_record_removal['ansible.builtin.file'].path is search('^[{][{] billet_provenance_path [}][}]$')
+          - "'billet_provenance_replaces' in (billet_record_removal.when | string)"
+          - billet_record_command['ansible.builtin.command'].argv[4:7] == ['/usr/bin/billet', 'release', 'record']
+          - billet_record_command['ansible.builtin.command'].argv[-2:] == ['--binary', '/usr/bin/billet']
+          - billet_record_command.failed_when is sameas false
+          - billet_inspected_inputs[-1] is search('^[{][{] billet_provenance_path [}][}]$')
+          - billet_journaled_inputs | length == 4
+          - billet_journaled_inputs[-1].path is search('^[{][{] billet_provenance_path [}][}]$')
+          - billet_journaled_inputs[-1].backup == 'installed.json.previous'
+          - "'installed.json.previous' in billet_host_inspection_text"
+          - billet_record_backfill['ansible.builtin.import_tasks'] == 'backfill-provenance.yml'
+          - "'not billet_retirement_node_ordinary | bool' in billet_record_backfill.when"
+          - "'not billet_binary_upgrade | default(false)' in billet_record_backfill.when"
+          - "'not ansible_check_mode' in billet_record_backfill.when"
+          - billet_backfill_record['ansible.builtin.include_tasks'] == 'record-provenance.yml'
+          - billet_backfill_record.vars.billet_provenance_replaces is sameas false
+          - "'junioryono.billet.provenance_proves' in (billet_backfill_record.when | string)"
+          - billet_top_level_names.index('Validate a billet host whose binary did not change') < billet_top_level_names.index('Record which release manifest produced the unchanged billet binary')
+        fail_msg: >-
+          The provenance record must be written by billet release record right after
+          the transaction installs the binary and before anything starts on it, the
+          previous record removed first and journaled for the rollback, and a host
+          whose binary did not change backfilled outside the transaction.
 
     # THE UPLINK SHAPER IS STOPPED BEFORE THE EXECUTABLE IS HIDDEN, by the
     # transaction and by its recovery, and started again after the services are

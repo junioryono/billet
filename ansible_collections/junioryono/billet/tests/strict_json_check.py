@@ -59,6 +59,31 @@ def main():
             continue
         failures.append("%s: admitted as %r" % (name, got))
 
+    # THE PROVENANCE READER, which a backfill decides from: True only for the
+    # record billet writes for exactly these bytes, False (never an error) for
+    # everything else.
+    proves = mod.FilterModule().filters()["provenance_proves"]
+    sha = "a" * 64
+    record = '{\n  "version": "v0.10.1",\n  "manifest_digest": "%s",\n  "binary_sha256": "%s"\n}\n' % ("b" * 64, sha)
+    for name, (text, binary, want) in {
+        "the record of these bytes": (record, sha, True),
+        "a record of other bytes": (record, "c" * 64, False),
+        "no manifest digest": ('{"manifest_digest": "", "binary_sha256": "%s"}' % sha, sha, False),
+        "no binary hash": ('{"manifest_digest": "%s"}' % ("b" * 64), sha, False),
+        "a hash that is not text": ('{"manifest_digest": "x", "binary_sha256": 7}', sha, False),
+        "a repeated member": ('{"manifest_digest": "x", "binary_sha256": "%s", "binary_sha256": "%s"}' % ("c" * 64, sha), sha, False),
+        "not JSON": ("installed", sha, False),
+        "not an object": ('["%s"]' % sha, sha, False),
+        "an empty binary hash": ('{"manifest_digest": "x", "binary_sha256": ""}', "", False),
+    }.items():
+        try:
+            got = proves(text, binary)
+        except Exception as exc:  # the reader must never raise
+            failures.append("provenance_proves: %s: raised %r" % (name, exc))
+            continue
+        if got is not want:
+            failures.append("provenance_proves: %s: %r, want %r" % (name, got, want))
+
     if failures:
         for line in failures:
             print("strict_json_check: " + line, file=sys.stderr)

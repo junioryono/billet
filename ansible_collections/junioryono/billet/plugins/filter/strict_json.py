@@ -47,6 +47,33 @@ def from_json_strict(text):
         raise AnsibleFilterError("from_json_strict: %s" % exc)
 
 
+def provenance_proves(text, binary_sha256):
+    """Whether a provenance record proves which manifest produced these bytes.
+
+    billet's own reading (internal/provenance: Read, then Installed's hash
+    comparison): an object naming a manifest digest and the sha256 of exactly
+    this binary. Anything else is False, never an error, because a record that
+    cannot be read is a host that reports nothing, which a backfill repairs,
+    and failing a converge over it would trade a working host for a diagnostic.
+    """
+    try:
+        record = from_json_strict(text)
+    except AnsibleFilterError:
+        return False
+    if not isinstance(record, dict):
+        return False
+    digest = record.get("manifest_digest")
+    recorded = record.get("binary_sha256")
+    return (
+        isinstance(digest, str)
+        and digest != ""
+        and isinstance(recorded, str)
+        and isinstance(binary_sha256, str)
+        and binary_sha256 != ""
+        and recorded == binary_sha256
+    )
+
+
 class FilterModule(object):
     def filters(self):
-        return {"from_json_strict": from_json_strict}
+        return {"from_json_strict": from_json_strict, "provenance_proves": provenance_proves}

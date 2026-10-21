@@ -500,6 +500,10 @@ fleet-playbook-check: ## Prove the shipped fleet playbook's shape and that its c
 release-fetch-check: ## Prove the billet_version fetch path and the URL it builds
 	ansible_collections/junioryono/billet/tests/release-fetch-check.sh
 
+.PHONY: provenance-check
+provenance-check: ## Prove the host role records which release manifest produced the binary it installs (Linux, sudo)
+	ansible_collections/junioryono/billet/tests/provenance-check.sh
+
 .PHONY: firecracker-example-check
 firecracker-example-check: ## Prove the role accepts a firecracker emission, up to the hardware
 	ansible_collections/junioryono/billet/tests/firecracker-example-check.sh

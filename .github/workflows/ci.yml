@@ -897,6 +897,13 @@ jobs:
         if: matrix.group == 'policy'
         run: make release-fetch-check
 
+      # The record a rollout reads the host by (#91): the real billet and a
+      # real manifest from a local origin, through the role's own task files,
+      # in a private mount namespace (so it needs the runner's sudo).
+      - name: Prove the role records which release manifest produced the binary
+        if: matrix.group == 'policy'
+        run: make provenance-check
+
       # Every fetch site was bounded and retried once, after one stalled
       # connection failed a converge behind an approval gate. This is what
       # keeps the next get_url or uri from shipping with the module defaults.

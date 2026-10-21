@@ -204,6 +204,7 @@
     - /etc/billet/billet.yaml
     - /etc/systemd/system/billet-server.service
     - /etc/systemd/system/billet-node.service
+    - "{{ billet_provenance_path }}"
   register: billet_previous_upgrade_inputs
   check_mode: false
   become: true

@@ -1,0 +1,32 @@
+---
+# THE RECORD OF A BINARY THE CONVERGE DID NOT CHANGE (#91), imported by
+# services.yml for a host whose installed binary is the staged release candidate
+# and whose release evidence is on the target. Recorded only when what is there
+# does not already prove the installed bytes, read the way billet reads it
+# (provenance_proves); anything unreadable counts as unproved, and nothing is
+# removed or restarted.
+- name: Inspect the provenance record of the unchanged billet binary
+  ansible.builtin.stat:
+    path: "{{ billet_provenance_path }}"
+    get_checksum: false
+  register: billet_provenance_installed_stat
+  become: true
+
+- name: Read the provenance record of the unchanged billet binary
+  ansible.builtin.slurp:
+    src: "{{ billet_provenance_path }}"
+  register: billet_provenance_installed_record
+  when:
+    - billet_provenance_installed_stat.stat.isreg | default(false)
+    - not billet_provenance_installed_stat.stat.islnk | default(false)
+  become: true
+
+- name: Record the unchanged billet binary's manifest where nothing proves it
+  ansible.builtin.include_tasks: record-provenance.yml
+  vars:
+    billet_provenance_replaces: false
+    billet_provenance_archive: "{{ billet_candidate_evidence_archive }}"
+    billet_provenance_manifest: "{{ billet_candidate_evidence_manifest }}"
+  when: >-
+    not ((billet_provenance_installed_record.content | default('') | b64decode)
+         | junioryono.billet.provenance_proves(billet_installed_binary.stat.checksum | default('')))

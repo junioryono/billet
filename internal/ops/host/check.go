@@ -22,6 +22,7 @@ import (
 	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -153,6 +154,8 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 	if runtime.GOOS == "linux" {
 		reportNeedrestart(env.Stdout, "/")
 	}
+
+	reportInstalledProvenance(env.Stdout, version.Version())
 
 	if runtime.GOOS == "linux" && cfg.Node != nil {
 		reportLockDir(env.Stdout, cfg.Node.LockDir, checkUnitProperties(ctx))

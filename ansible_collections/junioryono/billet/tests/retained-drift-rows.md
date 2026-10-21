@@ -196,6 +196,8 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/services.yml / Commit the durable ledger snapshot before exposing the candidate | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Durably publish ledger snapshot completion before exposing the candidate | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Install the candidate billet binary after fencing and ledger preservation | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
+| tasks/record-provenance.yml / Remove the provenance record of the binary the transaction replaced | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work, and the backfill include is gated off retained ordinary work |
+| tasks/record-provenance.yml / Record which release manifest produced the installed binary | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work, and the backfill include is gated off retained ordinary work |
 | tasks/services.yml / Install candidate configuration after preserving the stopped ledger | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Install candidate systemd units after preserving the stopped ledger | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Load candidate systemd units before starting either upgraded service | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
