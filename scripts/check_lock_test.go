@@ -1151,6 +1151,36 @@ func TestMakeCheckTakesTheSharedLock(t *testing.T) {
 	}
 }
 
+// MAKE VERIFY TAKES THE SAME SHARED LOCK. Sessions run it constantly, and a
+// dozen of them side by side is the starved machine the lock exists for. With
+// NICE=echo the recipe runs the real script around an echo of the verify
+// instead of the verify itself, so this is the Makefile's own line; CI is set
+// empty because under CI the Makefile forces NICE empty, which would run the
+// real verify here.
+func TestMakeVerifyTakesTheSharedLock(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	dir := t.TempDir()
+	xdg := filepath.Join(dir, "a cache")
+
+	cmd := exec.CommandContext(t.Context(), "make", "-C", "..", "NICE=echo", "verify")
+	cmd.Env = makeEnv("XDG_CACHE_HOME="+xdg, "CI=")
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("make verify with NICE=echo: %v (%s)", err, out)
+	}
+
+	if !strings.Contains(string(out), "scripts/verify-changed.sh") {
+		t.Errorf("the recipe did not run the verify under the script: %q", out)
+	}
+
+	if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
+		t.Errorf("make verify did not take the shared lock: %v (%s)", err, out)
+	}
+}
+
 // makeEnv is scriptEnv for a nested make: this may run inside a `make check`
 // holding the lock, and an inherited CHECK_LOCK, or one carried in MAKEFLAGS
 // from `make check CHECK_LOCK=...`, would make the nested make wait for the lock
