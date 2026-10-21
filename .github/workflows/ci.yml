@@ -472,6 +472,15 @@ jobs:
           # Pinned, not `latest`: a linter that changes under you turns an
           # unrelated PR red and trains people to ignore the signal.
           version: v2.12.2
+          # NO RESTORED ANALYSIS CACHE. On 2026-10-21 every lint run whose key
+          # matched one restored cache entry exactly reported staticcheck SA5011
+          # (a nil dereference after `if x == nil { t.Fatal(...) }`) in 16 to 60
+          # untouched places, as if testing.T.Fatal could return, while every run
+          # that restored the same entry by prefix found 0 issues; the same tree
+          # linted clean on a test host with an empty cache. A gate whose verdict
+          # depends on which cache entry it restored is no gate, so the analysis
+          # runs whole every time (about five minutes rather than two).
+          skip-cache: true
 
       # billet's own analyzers, plus the tests that prove they still detect
       # anything. The second half is not optional: tools/lint is a nested module,
@@ -580,6 +589,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+      - name: Sample what this job uses of its runner
+        continue-on-error: true
+        run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -595,14 +607,35 @@ jobs:
           path: ${{ runner.temp }}/gate-binaries
           if-no-files-found: error
           retention-days: 1
+      - name: Report what this job used of its runner
+        if: always()
+        continue-on-error: true
+        run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" gate-binaries
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: ci-usage-gate-binaries
+          path: ${{ runner.temp }}/ci-usage/usage.json
+          if-no-files-found: ignore
 
   host-lifecycle:
     needs: [changes, gate-binaries]
     if: needs.changes.outputs.host_lifecycle == 'true'
-    # Every group compiles billet at least once except retirement-node-shape,
-    # which runs the shard checker and four plays, so it alone takes the small
-    # runner; the others hold the 8 vCPU one until a measured run says otherwise.
-    runs-on: ${{ matrix.group == 'retirement-node-shape' && 'billet-2vcpu-ubuntu-2404' || 'billet-8vcpu-ubuntu-2404' }}
+    # EVERY GROUP ON THE 2 vCPU RUNNER, FROM WHAT EACH MEASURABLY USES (#155).
+    # The groups run Ansible one case at a time on binaries gate-binaries built,
+    # so on the 8 vCPU runner (31 GiB) each used about one core: 0.76 to 1.29
+    # cores on average, a peak of 1.3 (3.4 in retirement-resume) and at most
+    # 1.4 GiB held, guard and retirement-parity-network included (run
+    # 39539367492, 2026-10-21, ci-usage-<group>). policy alone peaks at 7.7
+    # cores, compiling two test binaries for its real-systemd step, a few
+    # minutes of its eighteen. A 2 vCPU runner reserves a quarter of the vCPU
+    # and memory, and the fleet runs out of memory first. On it (run
+    # 39566892000, 2026-10-21) every group passed, none peaked above 2.0 cores
+    # or 1.9 GiB, policy took 22.6 minutes against 17.9, and the longest group,
+    # retirement-parity-network, took 32.0 against 31.9. ci-usage reports each
+    # group's use on every run, so a group that outgrows its runner shows there.
+    runs-on: billet-2vcpu-ubuntu-2404
     # The former retirement group reached 36 minutes before request coverage
     # on 46fcafa (2026-09-14). Partition its parser, routes, compatibility,
     # retained continuation, recovery and 3c settled callers. The 64 request
@@ -640,6 +673,15 @@ jobs:
         shell: env -u RUNNER_NAME bash -e {0}
     steps:
       - uses: actions/checkout@v6
+
+      # WHAT EACH GROUP USES OF ITS RUNNER, which is what its size is chosen
+      # from (#155): busy cores and held memory, sampled every five seconds and
+      # reported in the job's summary and the ci-usage-<group> artifact. A
+      # measurement, never a gate: the script exits 0 whatever it finds, and
+      # each of its steps continues on error, the upload included.
+      - name: Sample what this group uses of its runner
+        continue-on-error: true
+        run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
 
       - uses: actions/setup-python@v6
         with:
@@ -954,6 +996,19 @@ jobs:
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^(TestRealSystemdRetirementOperationEffects|TestRealSystemdHostLockDirectoryOutlivesTheNodeStop)$'
           cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
+
+      - name: Report what this group used of its runner
+        if: always()
+        continue-on-error: true
+        run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" "host-lifecycle (${{ matrix.group }})"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: ci-usage-${{ matrix.group }}
+          path: ${{ runner.temp }}/ci-usage/usage.json
+          if-no-files-found: ignore
 
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm
