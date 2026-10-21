@@ -352,6 +352,29 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			wantSuccess: false,
 		},
 		{
+			name: "a source manifest of its header and a blank line stops the publish before the tag",
+			dir: replaced(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a source manifest with an incomplete row stops the publish before the tag",
+			dir: replaced(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
+					"bash\tamd64\t5.2.21-2ubuntu4\t\t\tarchive.ubuntu.com\tgnu\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a source manifest under another header stops the publish before the tag",
+			dir: replaced(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+				"name\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
+					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"),
+			wantSuccess: false,
+		},
+		{
 			name: "no signature bundle stops the publish before the tag",
 			dir: without(t, publishDir(t, multipart,
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "manifest.sigstore.json"),

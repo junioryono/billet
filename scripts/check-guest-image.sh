@@ -665,7 +665,8 @@ check_image_sources() {
 
 	# WHAT dpkg RECORDS, read from the image's own status file as dpkg reads it,
 	# so the comparison needs no dpkg on the machine running the gate: a field's
-	# name in any case, its value with the space around it trimmed, continuation
+	# name in any case and with space before its colon, its value with the space
+	# around it trimmed, continuation
 	# lines skipped. A package's source is its Source field, `name` or `name
 	# (version)`, defaulting to the package and its version. A record with no
 	# package or status is `?`; one dpkg did not finish is `!`.
@@ -676,9 +677,11 @@ check_image_sources() {
 				if ($i ~ /^[ \t]/) continue
 				n = index($i, ":")
 				if (n == 0) continue
+				k = substr($i, 1, n - 1)
 				v = substr($i, n + 1)
+				gsub(/[ \t]+$/, "", k)
 				gsub(/^[ \t]+|[ \t]+$/, "", v)
-				f[tolower(substr($i, 1, n - 1))] = v
+				f[tolower(k)] = v
 			}
 			if (f["package"] == "" || f["status"] == "") { print "?\trecord " NR; next }
 			split(f["status"], st, /[ \t]+/)
