@@ -173,6 +173,10 @@ type plane struct {
 	nextRunner  int64
 
 	events eventHeap
+
+	// declinedThenRun counts assignments acknowledged with no runner minted for
+	// them that a later runner took: work billet declined and ran once it could.
+	declinedThenRun int
 }
 
 var (
@@ -562,6 +566,7 @@ func (p *plane) mint(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 		rn.job, s.inflight = s.inflight[0], s.inflight[1:]
 	case len(s.unpaired) > 0:
 		rn.job, s.unpaired = s.unpaired[0], s.unpaired[1:]
+		p.declinedThenRun++
 	default:
 		p.t.Logf("replay: runner %q was minted with no assigned job on %s to take", rn.name, s.name)
 	}

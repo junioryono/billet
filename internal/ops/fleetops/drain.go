@@ -367,6 +367,10 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 	fmt.Fprintf(env.Stdout, "\nWaiting for what is already running to finish. Ctrl-C stops waiting; it does\n")
 	fmt.Fprintf(env.Stdout, "not stop the drain, and nothing running is harmed either way.\n\n")
 
+	// waitBegan bounds the seal from above: this command sealed, or found the
+	// deployment sealed, before it began to wait.
+	waitBegan := time.Now()
+
 	ticker := time.NewTicker(drainPollInterval)
 	defer ticker.Stop()
 
@@ -425,7 +429,7 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 			// One taken before it cannot speak for what was assigned after, so a
 			// quiet ledger waits a little for every listener to count again, and
 			// a count that still predates the seal is said to be unknown.
-			sealedAt := sealTime(ctx, db)
+			sealedAt := sealTime(ctx, db, waitBegan)
 			demand := assignedDemand(ctx, allocator, cfg, sealedAt)
 
 			if countsPredateTheSeal(demand) && time.Since(sealedAt) < demandCountWithin {
@@ -559,17 +563,19 @@ func countsPredateTheSeal(demand []tierDemand) bool {
 }
 
 // sealTime is when admission was last changed, which is the seal this drain
-// waits under. A time that cannot be read is taken as now, so every count reads
-// as taken before it: a seal of unknown age cannot vouch for any count.
-func sealTime(ctx context.Context, db *state.DB) time.Time {
+// waits under. A time that cannot be read is taken as waitBegan, the latest the
+// seal can have been: counts taken before it still read as predating the seal,
+// and the wait for fresh ones is bounded from that fixed moment rather than
+// from each reread, which would extend it for ever.
+func sealTime(ctx context.Context, db *state.DB, waitBegan time.Time) time.Time {
 	admission, err := db.Admission(ctx)
 	if err != nil {
-		return time.Now()
+		return waitBegan
 	}
 
 	at, err := time.Parse(time.RFC3339Nano, admission.ChangedAt)
 	if err != nil {
-		return time.Now()
+		return waitBegan
 	}
 
 	return at

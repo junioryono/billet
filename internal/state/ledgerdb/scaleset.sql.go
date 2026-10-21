@@ -11,7 +11,7 @@ import (
 
 const deleteMovedScaleSet = `-- name: DeleteMovedScaleSet :exec
 DELETE FROM scale_set
- WHERE org = $1 AND scale_set_id = $2
+ WHERE LOWER(org) = LOWER(CAST($1 AS TEXT)) AND scale_set_id = $2
    AND NOT (runner_group = $3 AND label = $4)
 `
 
@@ -27,6 +27,10 @@ type DeleteMovedScaleSetParams struct {
 // A scale set deleted and recreated outside billet keeps its name and takes a
 // new id; one RENAMED keeps its id under a new name. This removes the stale
 // (group, label) so the orphan report does not name an object that is gone.
+//
+// THE TARGET WITHOUT CASE, AS ListScaleSets READS IT, and the name exactly: a
+// row of this id recorded under another spelling of its group or name is an
+// alias of this one, removed here so aliases do not accumulate.
 func (q *Queries) DeleteMovedScaleSet(ctx context.Context, arg DeleteMovedScaleSetParams) error {
 	_, err := q.db.ExecContext(ctx, deleteMovedScaleSet,
 		arg.Org,
@@ -38,7 +42,10 @@ func (q *Queries) DeleteMovedScaleSet(ctx context.Context, arg DeleteMovedScaleS
 }
 
 const deleteScaleSet = `-- name: DeleteScaleSet :exec
-DELETE FROM scale_set WHERE org = $1 AND runner_group = $2 AND label = $3
+DELETE FROM scale_set
+ WHERE LOWER(org) = LOWER(CAST($1 AS TEXT))
+   AND LOWER(runner_group) = LOWER(CAST($2 AS TEXT))
+   AND LOWER(label) = LOWER(CAST($3 AS TEXT))
 `
 
 type DeleteScaleSetParams struct {
@@ -47,7 +54,10 @@ type DeleteScaleSetParams struct {
 	Label       string
 }
 
-// Drop the record for a scale set billet has deleted.
+// Drop the record for a scale set billet has deleted, every spelling of its
+// target, group and name alike, as GitHub compares them and ListScaleSets reads
+// them: a record left under another spelling would refuse the next start over a
+// set that is gone.
 func (q *Queries) DeleteScaleSet(ctx context.Context, arg DeleteScaleSetParams) error {
 	_, err := q.db.ExecContext(ctx, deleteScaleSet, arg.Org, arg.RunnerGroup, arg.Label)
 	return err

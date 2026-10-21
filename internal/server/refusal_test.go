@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -285,6 +286,11 @@ func TestAFailedLaunchLeavesItsJobCountedAsWaiting(t *testing.T) {
 		WithNodeRunner(refusingLaunch{}), WithAdmissionOrder(config.AdmissionFair))
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, s.listenerOpts(nil)...)
 
+	// GitHub's statistics as last confirmed an hour ago: the count must carry
+	// that time, not the moment the arithmetic ran.
+	observed := time.Now().Add(-time.Hour).UTC()
+	l.observedAt = observed
+
 	if err := l.reconcilePool(t.Context(), 1); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -301,8 +307,27 @@ func TestAFailedLaunchLeavesItsJobCountedAsWaiting(t *testing.T) {
 			got.Listener.Unstarted)
 	}
 
-	if got.Listener.UnstartedAt == "" {
-		t.Error("the count was published without when it was counted")
+	// DATED BY GITHUB'S LAST WORD, so a reconciliation on cached statistics
+	// cannot make a count from before a seal look like one taken after it.
+	if want := observed.Format(time.RFC3339Nano); got.Listener.UnstartedAt != want {
+		t.Errorf("the count is dated %q, want %q, when GitHub last confirmed the statistics",
+			got.Listener.UnstartedAt, want)
+	}
+
+	// AND A RUNNER RETIRED AFTERWARDS IS COUNTED AGAIN: a count of none that
+	// lost the runner covering its job is made a count of one.
+	l.mu.Lock()
+	l.waitingFor = 0
+	l.mu.Unlock()
+
+	l.recountDemand(t.Context(), 1)
+
+	l.mu.Lock()
+	recounted := l.waitingFor
+	l.mu.Unlock()
+
+	if recounted != 1 {
+		t.Errorf("a recount with no runner for the one assigned job says %d waiting, want 1", recounted)
 	}
 }
 

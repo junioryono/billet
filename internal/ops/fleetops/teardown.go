@@ -3,6 +3,7 @@ package fleetops
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/junioryono/billet/internal/app"
 
@@ -52,7 +53,10 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 	)
 
 	for i := range tiers {
-		if tiers[i].ScaleSetName() != tier {
+		// GITHUB'S IDENTITY, WITHOUT CASE, for the name and the group alike: a
+		// case-only difference in either names the declared set itself, and
+		// taking it for another would delete the set this promises to keep.
+		if !strings.EqualFold(tiers[i].ScaleSetName(), tier) {
 			continue
 		}
 
@@ -63,7 +67,7 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 		// own group. It is deleted as an undeclared set is, by name, behind the
 		// label check and the confirmation, and teardownCommand says which set it
 		// is and that the declared one is left alone.
-		if group != "" && groupOrDefault(group) != groupOrDefault(tiers[i].RunnerGroup) {
+		if group != "" && !strings.EqualFold(groupOrDefault(group), groupOrDefault(tiers[i].RunnerGroup)) {
 			elsewhere = true
 
 			continue
@@ -119,7 +123,7 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 // declaredGroup is the runner group a declared tier answering to name is in.
 func declaredGroup(tiers []config.Tier, name string) (string, bool) {
 	for i := range tiers {
-		if tiers[i].ScaleSetName() == name {
+		if strings.EqualFold(tiers[i].ScaleSetName(), name) {
 			return groupOrDefault(tiers[i].RunnerGroup), true
 		}
 	}

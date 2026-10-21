@@ -376,17 +376,13 @@ func TestADirectAssignmentReplayKeepsEveryProof(t *testing.T) {
 		t.Fatalf("the ledger records an overcommit: %v", report.Violations)
 	}
 
-	queued := 0
-
-	for _, rec := range report.Records {
-		if time.Duration(rec.QueueWait) > fleet.boot() {
-			queued++
-		}
-	}
-
-	if queued == 0 {
-		t.Fatal("no job waited beyond the boot model, so no assignment found the fleet full and this " +
-			"never replayed an assignment billet had to decline")
+	// AN ASSIGNMENT BILLET DECLINED AND RAN LATER, which is the path this mode
+	// exists to replay: acknowledged with no runner while the fleet was full,
+	// then taken by a runner a later reconciliation started. Queue wait alone
+	// cannot show it, since a job also waits unassigned while the advertisement
+	// is spent.
+	if report.DeclinedThenRun == 0 {
+		t.Fatal("no assignment was declined and run later, so this never replayed the decline")
 	}
 
 	again := Run(t, fleet, trace, Options{DirectAssignment: true})

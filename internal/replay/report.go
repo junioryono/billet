@@ -102,6 +102,11 @@ type Report struct {
 	// capacity bought for an offer or a launch that did not use it. Reported so a
 	// reader can tell them from a missing job.
 	EscrowRows int
+	// DeclinedThenRun counts assignments the scripted service saw billet
+	// acknowledge with no runner and a later runner take: the one figure here
+	// the harness counted rather than read from the ledger, because nothing in
+	// the ledger records a decline.
+	DeclinedThenRun int
 	// ByJobID counts the jobs found by their GitHub job id because billet
 	// recorded them under a request id of its own, which is every job a
 	// direct-assignment replay ran and none an offered one did.

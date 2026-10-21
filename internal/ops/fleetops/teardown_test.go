@@ -78,6 +78,21 @@ func TestARunnerGroupFlagNamesASetLeftInAnotherGroup(t *testing.T) {
 		t.Fatalf("the teardown targets %v, want only billet-4vcpu in the retired group", got)
 	}
 
+	// A CASE-ONLY DIFFERENCE IS THE DECLARED SET, which GitHub resolves to the
+	// same group and the same name; taken for another set it would be deleted
+	// after the notice said it was left alone.
+	for _, spelling := range [][2]string{{"billet-4vcpu", "Trusted"}, {"Billet-4vcpu", "trusted"}} {
+		got, undeclared, err := teardownTargets(teardownTiers(), spelling[0], spelling[1], false)
+		if err != nil {
+			t.Fatalf("--tier %s --runner-group %s: %v", spelling[0], spelling[1], err)
+		}
+
+		if undeclared || len(got) != 1 || got[0].RunnerGroup != "trusted" {
+			t.Errorf("--tier %s --runner-group %s took the declared set for another (undeclared=%v, %v)",
+				spelling[0], spelling[1], undeclared, got)
+		}
+	}
+
 	// --force skips the label check, and nothing else says this set is billet's.
 	if _, _, err := teardownTargets(teardownTiers(), "billet-4vcpu", "retired", true); err == nil ||
 		!strings.Contains(err.Error(), "--force") {

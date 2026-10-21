@@ -138,11 +138,13 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 
 	// WHAT THIS TIER STILL WANTS, recorded for the order. Demand that is met, or
 	// that GitHub's count says has gone away, releases this tier's place rather
-	// than holding the fleet behind work nobody is waiting for any more. Dated
-	// here, where it is counted, and nowhere else: a report republishes it on
-	// every poll, and a date taken there would make an old count look new.
+	// than holding the fleet behind work nobody is waiting for any more. DATED
+	// BY GITHUB'S LAST WORD on the statistics it is counted from, not by when
+	// this ran: a reconciliation reruns on cached statistics before every poll,
+	// and an assignment made before a seal and not yet delivered would otherwise
+	// be counted as none under a date after it (observedAt).
 	l.mu.Lock()
-	l.waitingFor, l.demandKnown, l.demandAt = max(desired-active, 0), counted, l.clock()
+	l.waitingFor, l.demandKnown, l.demandAt = max(desired-active, 0), counted, l.observedAt
 	l.mu.Unlock()
 
 	// A TIER THAT COULD NOT GROW WHATEVER ANYONE FREED DOES NOT HOLD THE LINE.
@@ -173,6 +175,13 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	if surplus <= 0 {
 		l.retireOfflineMembers(ctx, runners)
 
+		// A RUNNER RETIRED FOR BEING OFFLINE may have been one the count above
+		// had covering an assigned job. Only a count of none can be made wrong
+		// that way, so only it is counted again.
+		if surplus == 0 && desired > 0 {
+			l.recountDemand(ctx, desired)
+		}
+
 		return nil
 	}
 	for i := range runners {
@@ -193,6 +202,24 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	return nil
+}
+
+// recountDemand counts again what this tier still wants after its runners
+// changed, under the date the count already carries; a recount that cannot be
+// read leaves it unknown.
+func (l *Listener) recountDemand(ctx context.Context, desired int) {
+	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if err != nil {
+		l.demandKnown = false
+
+		return
+	}
+
+	l.waitingFor = max(desired-active, 0)
 }
 
 // poolLaunchBatch is how many pool members one pass starts at once on a tier

@@ -168,6 +168,10 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		t.Fatalf("replay: read the ledger back: %v", err)
 	}
 
+	actions.mu.Lock()
+	report.DeclinedThenRun = actions.declinedThenRun
+	actions.mu.Unlock()
+
 	st.closeDB()
 
 	return report
