@@ -47,27 +47,45 @@ def from_json_strict(text):
         raise AnsibleFilterError("from_json_strict: %s" % exc)
 
 
+# PROVENANCE_RECORD_LIMIT is provenance.maxRecordBytes: a longer file is one
+# billet refuses to read.
+PROVENANCE_RECORD_LIMIT = 64 << 10
+
+
 def provenance_proves(text, binary_sha256):
     """Whether a provenance record proves which manifest produced these bytes.
 
     billet's own reading (internal/provenance: Read, then Installed's hash
-    comparison): an object naming a manifest digest and the sha256 of exactly
-    this binary. Anything else is False, never an error, because a record that
-    cannot be read is a host that reports nothing, which a backfill repairs,
-    and failing a converge over it would trade a working host for a diagnostic.
+    comparison): at most 64 KiB, an object whose version, manifest_digest and
+    binary_sha256 are text when present (Go's typed decode refuses anything
+    else), a manifest digest and the sha256 of exactly this binary. Anything
+    else is False, NEVER AN ERROR, deep nesting included: a record billet cannot
+    use is a host that reports nothing, which the backfill repairs by recording
+    afresh, and failing the converge over it would trade a working host for a
+    diagnostic. A repeated member is refused here where Go keeps the last, which
+    only ever answers False, so the cost is rewriting a record that was usable.
     """
     try:
+        if isinstance(text, bytes):
+            size = len(text)
+        elif isinstance(text, str):
+            size = len(text.encode("utf-8"))
+        else:
+            return False
+        if size > PROVENANCE_RECORD_LIMIT:
+            return False
         record = from_json_strict(text)
-    except AnsibleFilterError:
+    except (AnsibleFilterError, ValueError, RecursionError, MemoryError):
         return False
     if not isinstance(record, dict):
         return False
-    digest = record.get("manifest_digest")
-    recorded = record.get("binary_sha256")
+    for member in ("version", "manifest_digest", "binary_sha256"):
+        if member in record and not isinstance(record[member], str):
+            return False
+    digest = record.get("manifest_digest", "")
+    recorded = record.get("binary_sha256", "")
     return (
-        isinstance(digest, str)
-        and digest != ""
-        and isinstance(recorded, str)
+        digest != ""
         and isinstance(binary_sha256, str)
         and binary_sha256 != ""
         and recorded == binary_sha256

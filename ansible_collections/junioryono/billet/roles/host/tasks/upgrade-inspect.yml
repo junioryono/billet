@@ -75,18 +75,9 @@
       - billet_upgrade_manifest.node_state_dir is string
       - billet_upgrade_manifest.service_user is match('^[a-z_][a-z0-9_-]{0,31}$')
       - billet_upgrade_manifest.service_group is match('^[a-z_][a-z0-9_-]{0,31}$')
-      # THREE INPUTS, OR THE SAME THREE AND THE PROVENANCE RECORD: a journal
-      # written before the transaction kept the record (#91) still recovers, and
-      # nothing else may name a privileged path for the rollback to write.
-      - billet_upgrade_manifest.inputs | length in [3, 4]
-      - >-
-        billet_upgrade_manifest.inputs | map(attribute='path') | list ==
-        ['/etc/billet/billet.yaml', '/etc/systemd/system/billet-server.service', '/etc/systemd/system/billet-node.service',
-         billet_provenance_path][:billet_upgrade_manifest.inputs | length]
-      - >-
-        billet_upgrade_manifest.inputs | map(attribute='backup') | list ==
-        ['billet.yaml.previous', 'billet-server.service.previous', 'billet-node.service.previous',
-         'installed.json.previous'][:billet_upgrade_manifest.inputs | length]
+      - billet_upgrade_manifest.inputs | length == 3
+      - billet_upgrade_manifest.inputs | map(attribute='path') | list == ['/etc/billet/billet.yaml', '/etc/systemd/system/billet-server.service', '/etc/systemd/system/billet-node.service']
+      - billet_upgrade_manifest.inputs | map(attribute='backup') | list == ['billet.yaml.previous', 'billet-server.service.previous', 'billet-node.service.previous']
       - billet_upgrade_manifest.binary_existed is boolean
       - billet_upgrade_manifest.server_was_active is boolean
       - billet_upgrade_manifest.node_was_active is boolean

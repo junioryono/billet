@@ -138,16 +138,6 @@
           owner: "{{ billet_previous_upgrade_inputs.results[2].stat.pw_name | default('root') }}"
           group: "{{ billet_previous_upgrade_inputs.results[2].stat.gr_name | default('root') }}"
           mode: "{{ billet_previous_upgrade_inputs.results[2].stat.mode | default('0644') }}"
-        # THE PROVENANCE RECORD, LAST, as Go's preservedPaths keeps it: a rollback
-        # that left the candidate's record beside the previous binary would be
-        # the contradiction the node's hash refuses, and the host would lose the
-        # one fact a rollout had about it.
-        - path: "{{ billet_provenance_path }}"
-          backup: installed.json.previous
-          existed: "{{ billet_previous_upgrade_inputs.results[3].stat.exists }}"
-          owner: "{{ billet_previous_upgrade_inputs.results[3].stat.pw_name | default('root') }}"
-          group: "{{ billet_previous_upgrade_inputs.results[3].stat.gr_name | default('root') }}"
-          mode: "{{ billet_previous_upgrade_inputs.results[3].stat.mode | default('0644') }}"
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode

@@ -16,8 +16,8 @@
 #   supplied      a supplied binary in the transaction leaves no record
 #   refused       a manifest that does not name the archive leaves no record,
 #                 says so, and fails nothing
-#   no-manifest   a release with no manifest is noted, records nothing, and is
-#                 not asked again
+#   no-manifest   a release with no manifest records nothing and says so, and
+#                 the manifest published later is found by the next converge
 #   refetch       a candidate staged without its evidence gets it, unchanged
 #   check-mode    a dry run fetches nothing (the record steps are all gated off
 #                 a dry run, which host-upgrade-order.yml holds)
@@ -64,23 +64,30 @@ other=$work/other-billet
 cp "$billet" "$other"
 printf 'not the published build\n' >>"$other"
 
-release() { # version binary manifest-binary|none
+release() { # version binary served|other|none
     local version=$1 binary=$2 named=$3 dir=$work/origin/$1 dist=$work/dist-$1
     local archive=billet_${version#v}_linux_${arch}.tar.gz
-    mkdir -p "$dir" "$dist/stage"
+    mkdir -p "$dir" "$dist/stage" "$dist/named"
     cp "$binary" "$dist/stage/billet"
     tar -C "$dist/stage" -czf "$dir/$archive" billet
     (cd "$dir" && sha256sum "$archive" >checksums.txt)
-    [ "$named" = none ] && return 0
-    mkdir -p "$dist/named"
-    cp "$named" "$dist/stage/billet"
-    tar -C "$dist/stage" -czf "$dist/named/$archive" billet
+    case "$named" in
+        # THE MANIFEST OF THE VERY ARCHIVE SERVED, byte for byte: archiving the
+        # binary again would differ in its timestamps. `late` is written and
+        # not published, for the case that publishes it after its archive.
+        served | late) cp "$dir/$archive" "$dist/named/$archive" ;;
+        other)
+            cp "$other" "$dist/stage/billet"
+            tar -C "$dist/stage" -czf "$dist/named/$archive" billet
+            ;;
+    esac
     (cd "$repo_root" && go run ./scripts/mkreleasemanifest --dist "$dist/named" --version "$version" \
-        --commit 0000000000000000000000000000000000000000 --out "$dir/release-manifest.json") >/dev/null
+        --commit 0000000000000000000000000000000000000000 --out "$dist/release-manifest.json") >/dev/null
+    [ "$named" = late ] || cp "$dist/release-manifest.json" "$dir/release-manifest.json"
 }
-release v0.16.9 "$billet" "$billet"
-release v0.16.10 "$billet" "$other"
-release v0.16.11 "$billet" none
+release v0.16.9 "$billet" served
+release v0.16.10 "$billet" other
+release v0.16.11 "$billet" late
 
 python=$(ansible --version 2>/dev/null | sed -n 's/.*python version.*(\(.*\)).*/\1/p' | head -n1)
 [ -x "${python:-}" ] || python=$(command -v python3)
@@ -221,16 +228,18 @@ grep -q 'billet release record refused' "$work/refused.log" || fail "refused: th
 grep -q 'nothing was recorded' "$work/refused.log" || fail "refused: billet's reason was not passed on" "$work/refused.log"
 echo "ok   refused: a manifest that does not name the archive records nothing and fails nothing"
 
-# no-manifest: noted once, recorded nothing.
+# no-manifest: recorded nothing, said so, and asks again on the next converge,
+# so a manifest published after its archive is found (404 then 200).
 run no-manifest v0.16.11
-[ -f "$stage/billet-v0.16.11.release-manifest.absent" ] || fail "no-manifest: the absence was not noted"
+[ ! -e "$stage/billet-v0.16.11.release-manifest.json" ] || fail "no-manifest: a 404 was kept as a manifest"
 [ ! -e "$record" ] || fail "no-manifest: something was recorded"
 grep -q 'publishes no release-manifest.json' "$work/no-manifest.log" || fail "no-manifest: the absence was not said" "$work/no-manifest.log"
+cp "$work/dist-v0.16.11/release-manifest.json" "$work/origin/v0.16.11/release-manifest.json"
 run no-manifest v0.16.11
-grep -q 'TASK \[junioryono.billet.host : Download the release manifest' "$work/no-manifest.log" &&
-    grep -A1 'TASK \[junioryono.billet.host : Download the release manifest' "$work/no-manifest.log" | grep -q '^ok:\|^changed:' &&
-    fail "no-manifest: the absent manifest was asked for again" "$work/no-manifest.log"
-echo "ok   no-manifest: a release with none is noted and not asked again"
+[ -f "$record" ] || fail "no-manifest: a manifest published after its archive was never found" "$work/no-manifest.log"
+[ "$(field manifest_digest)" = "$(sha "$work/origin/v0.16.11/release-manifest.json")" ] ||
+    fail "no-manifest: the record does not name the manifest published late"
+echo "ok   no-manifest: a release with none records nothing, and its manifest is found once published"
 
 # refetch: a candidate a collection from before #91 staged, with no evidence.
 rm -f "$stage/billet-v0.16.9.tar.gz" "$stage/billet-v0.16.9.release-manifest.json"

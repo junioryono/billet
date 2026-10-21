@@ -464,7 +464,7 @@
       vars:
         billet_record_in_transaction: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Record which release manifest produced the candidate billet binary') | first }}"
         billet_record_backfill: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Record which release manifest produced the unchanged billet binary') | first }}"
-        billet_backfill_record: "{{ (lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backfill-provenance.yml') | from_yaml) | selectattr('name', 'equalto', 'Record the unchanged billet binary''s manifest where nothing proves it') | first }}"
+        billet_backfill_record: "{{ (lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backfill-provenance.yml') | from_yaml) | selectattr('name', 'equalto', 'Record which manifest produced the unchanged binary where nothing proves it') | first }}"
         billet_record_removal: "{{ billet_host_provenance_tasks | selectattr('name', 'equalto', 'Remove the provenance record of the binary the transaction replaced') | first }}"
         billet_record_command: "{{ billet_host_provenance_tasks | selectattr('name', 'equalto', 'Record which release manifest produced the installed binary') | first }}"
         billet_provenance_names: "{{ billet_host_provenance_tasks | map(attribute='name') | list }}"
@@ -487,11 +487,20 @@
           - billet_record_command['ansible.builtin.command'].argv[4:7] == ['/usr/bin/billet', 'release', 'record']
           - billet_record_command['ansible.builtin.command'].argv[-2:] == ['--binary', '/usr/bin/billet']
           - billet_record_command.failed_when is sameas false
-          - billet_inspected_inputs[-1] is search('^[{][{] billet_provenance_path [}][}]$')
-          - billet_journaled_inputs | length == 4
-          - billet_journaled_inputs[-1].path is search('^[{][{] billet_provenance_path [}][}]$')
-          - billet_journaled_inputs[-1].backup == 'installed.json.previous'
-          - "'installed.json.previous' in billet_host_inspection_text"
+          # THE JOURNAL KEEPS ITS SHAPE: every billet that reads manifest.yml holds
+          # it to these three inputs, an older release included.
+          - billet_inspected_inputs | length == 3
+          - billet_journaled_inputs | length == 3
+          - "'provenance' not in (billet_journaled_inputs | string)"
+          - billet_account_names.index('Preserve the previous billet binary before live mutation') < billet_account_names.index('Preserve the provenance record before live mutation')
+          - billet_account_names.index('Inspect the provenance record before live mutation') < billet_account_names.index('Refuse a redirected or non-file provenance record')
+          - billet_account_names.index('Refuse a redirected or non-file provenance record') < billet_account_names.index('Preserve the provenance record before live mutation')
+          - billet_account_names.index('Refuse a redirected or non-file provenance record') < billet_account_names.index('Record that there was no provenance record before live mutation')
+          - billet_recovery_names.index('Inspect the preserved provenance record') < billet_recovery_names.index('Restore the previous provenance record')
+          - billet_recovery_names.index('Restore the previous provenance record') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Remove the provenance record a host that had none did not have') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - (billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore the previous provenance record') | first).when is search('installed.json.previous|results\[0\]')
+          - (billet_host_recovery_tasks | selectattr('name', 'equalto', 'Remove the provenance record a host that had none did not have') | first).when is search('results\[1\]')
           - billet_record_backfill['ansible.builtin.import_tasks'] == 'backfill-provenance.yml'
           - "'not billet_retirement_node_ordinary | bool' in billet_record_backfill.when"
           - "'not billet_binary_upgrade | default(false)' in billet_record_backfill.when"
@@ -503,7 +512,7 @@
         fail_msg: >-
           The provenance record must be written by billet release record right after
           the transaction installs the binary and before anything starts on it, the
-          previous record removed first and journaled for the rollback, and a host
+          previous record removed first and preserved beside the journal for the rollback, and a host
           whose binary did not change backfilled outside the transaction.
 
     # THE UPLINK SHAPER IS STOPPED BEFORE THE EXECUTABLE IS HIDDEN, by the

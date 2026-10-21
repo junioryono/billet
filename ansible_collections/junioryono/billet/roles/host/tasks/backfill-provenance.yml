@@ -21,7 +21,7 @@
     - not billet_provenance_installed_stat.stat.islnk | default(false)
   become: true
 
-- name: Record the unchanged billet binary's manifest where nothing proves it
+- name: Record which manifest produced the unchanged binary where nothing proves it
   ansible.builtin.include_tasks: record-provenance.yml
   vars:
     billet_provenance_replaces: false

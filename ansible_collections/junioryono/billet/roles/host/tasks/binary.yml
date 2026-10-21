@@ -103,12 +103,12 @@
     billet_release_base: "{{ billet_release_url_base }}/{{ billet_resolved_version }}"
     billet_release_candidate: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}"
     # THE EVIDENCE `billet release record` NEEDS, kept beside the candidate: the
-    # archive it was unpacked from and the manifest that names that archive. The
-    # marker says the release publishes no manifest, so a converge does not ask
-    # again for one that is not there.
+    # archive it was unpacked from and the manifest that names that archive. A
+    # release that answered 404 for its manifest is asked again next time, one
+    # request, because a manifest can be published after its archive or a
+    # mirror can catch up, and a remembered absence would never learn of it.
     billet_release_evidence_archive: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}.tar.gz"
     billet_release_evidence_manifest: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}.release-manifest.json"
-    billet_release_evidence_absent: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}.release-manifest.absent"
 
 - name: Inspect the release candidate already staged for this version
   ansible.builtin.stat:
@@ -140,7 +140,6 @@
   loop:
     - "{{ billet_release_evidence_archive }}"
     - "{{ billet_release_evidence_manifest }}"
-    - "{{ billet_release_evidence_absent }}"
   register: billet_release_evidence_stat
   check_mode: false
   become: true
@@ -175,8 +174,7 @@
          or not billet_release_evidence_stat.results[0].stat.exists }}
     billet_release_fetch_manifest: >-
       {{ not billet_release_candidate_stat.stat.exists
-         or not (billet_release_evidence_stat.results[1].stat.exists
-                 or billet_release_evidence_stat.results[2].stat.exists) }}
+         or not billet_release_evidence_stat.results[1].stat.exists }}
 
 - name: Inspect the release staging directory before creating it
   ansible.builtin.stat:
@@ -330,19 +328,6 @@
     - billet_release_fetch_manifest
     - not ansible_check_mode
     - billet_release_manifest_download.status_code | default(0) != 404
-
-- name: Note that the release publishes no manifest
-  ansible.builtin.copy:
-    content: "{{ billet_release_base }}/release-manifest.json answered 404\n"
-    dest: "{{ billet_release_evidence_absent }}"
-    owner: root
-    group: root
-    mode: "0600"
-  become: true
-  when:
-    - billet_release_fetch_manifest
-    - not ansible_check_mode
-    - billet_release_manifest_download.status_code | default(0) == 404
 
 - name: Say that this release can name no manifest for the host
   ansible.builtin.debug:
