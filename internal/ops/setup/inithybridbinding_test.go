@@ -316,15 +316,21 @@ func TestInitHybridRefusesARenderIntoADirectoryAnotherHolds(t *testing.T) {
 // the staged file was synced before it is not observable here.
 //
 // Mutation: the create-then-write publication fails the first assertion in the
-// seam, since the name exists, empty, before the bytes arrive.
+// seam, since the name exists, empty, before the bytes arrive; a publisher
+// that copies the staged bytes into a fresh file fails the identity check.
 func TestRecordHybridGenerationPublishesWholeAndLeavesNothing(t *testing.T) {
 	out := t.TempDir()
 	record := filepath.Join(out, HybridGenerationFile)
 
 	published := 0
+	var stagedInfo os.FileInfo
 	prev := publishHybridGeneration
 	publishHybridGeneration = func(staged, name string) error {
 		published++
+		var err error
+		if stagedInfo, err = os.Lstat(staged); err != nil {
+			t.Errorf("the staged record is not there to publish: %v", err)
+		}
 		if name != record {
 			t.Errorf("published to %s, want %s", name, record)
 		}
@@ -344,6 +350,12 @@ func TestRecordHybridGenerationPublishesWholeAndLeavesNothing(t *testing.T) {
 	}
 	if published != 1 {
 		t.Fatalf("the record was published %d times, want once", published)
+	}
+
+	// THE PUBLISHED RECORD IS THE STAGED FILE ITSELF, linked rather than
+	// copied: a copy into a fresh file is visible partial while it is written.
+	if info, err := os.Lstat(record); err != nil || stagedInfo == nil || !os.SameFile(info, stagedInfo) {
+		t.Errorf("the published record is not the file that was staged (%v)", err)
 	}
 
 	entries, err := os.ReadDir(out)
@@ -397,11 +409,28 @@ func TestInitHybridSerialisesRendersIntoOneDirectory(t *testing.T) {
 			second = Init(t.Context(), processEnv(), append([]string{"hybrid"}, hybridArgs(out, cfg)...))
 		})
 
+		// STILL HELD AT THE LAST MOMENT IT MATTERS, as the record is published
+		// after the files: an unlock anywhere before then fails this.
+		var atPublish error
+		prev := publishHybridGeneration
+		publishHybridGeneration = func(staged, name string) error {
+			if unlock, err := lockHybridOut(out); err == nil {
+				unlock()
+				atPublish = errors.New("the directory was not held while the record was published")
+			}
+
+			return prev(staged, name)
+		}
+		t.Cleanup(func() { publishHybridGeneration = prev })
+
 		if _, err := runInitHybrid(t, hybridArgs(out, cfg)...); err != nil {
 			t.Fatalf("the first render: %v", err)
 		}
 		if second == nil || !strings.Contains(second.Error(), "another billet init hybrid") {
 			t.Fatalf("a render while the first held the directory was not refused for it: %v", second)
+		}
+		if atPublish != nil {
+			t.Fatal(atPublish)
 		}
 	})
 
