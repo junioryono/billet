@@ -19,7 +19,7 @@ func macProposal(t *testing.T) JoinProposal {
 		t.Fatalf("Generate the Mac: %v", err)
 	}
 
-	joined, err := Join(body, "10.0.0.1:7717", "/usr/local/etc/billet/tls")
+	joined, err := Join(body, "10.0.0.1:7717", "/usr/local/etc/billet/tls", "")
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestMergeJoinRefusesWhatWouldNotLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	joined, err := Join(body, "10.0.0.1:7717", "/etc/billet/tls")
+	joined, err := Join(body, "10.0.0.1:7717", "/etc/billet/tls", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,8 +272,15 @@ func TestJoinProposalTokenRoundTripsAndRefusesAForgery(t *testing.T) {
 		t.Fatalf("the proposal did not survive its token: %+v, want %+v", got, p)
 	}
 	for i := range p.Tiers {
-		if same, err := sameValue(p.Tiers[i], got.Tiers[i]); err != nil || !same {
+		if same, err := sameAs[config.Tier](p.Tiers[i], got.Tiers[i]); err != nil || !same {
 			t.Errorf("tier %d changed through the token (%v)", i, err)
+		}
+	}
+	// EVERY POLICY FIELD, not only the count: a token that kept each entry's
+	// name and dropped the rest would pass a count.
+	for i := range p.Nodes {
+		if same, err := sameAs[config.NodePolicy](p.Nodes[i], got.Nodes[i]); err != nil || !same {
+			t.Errorf("nodes entry %d changed through the token (%v)", i, err)
 		}
 	}
 

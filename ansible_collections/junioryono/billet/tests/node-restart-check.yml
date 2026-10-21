@@ -603,6 +603,7 @@
       - {name: keep-truncated, raw: {rc: 0, stdout: "{{ billet_gate_keep[:-2] }}"}, changed: true}
       - {name: keep-then-more, raw: {rc: 0, stdout: "{{ billet_gate_keep }} {}"}, changed: true}
       - {name: a-brace-alone, raw: {rc: 0, stdout: "{"}, changed: true}
+      - {name: an-invalid-escape, raw: {rc: 0, stdout: '{"schema":1,"verdict":"keep","why":"\q"}'}, changed: true}
       - {name: not-json, raw: {rc: 0, stdout: "keep"}, changed: true}
       - {name: empty, raw: {rc: 0, stdout: ""}, changed: true}
       - {name: unknown-verb, raw: {rc: 2, stdout: "", stderr: 'billet: unknown command "config-change"'}, changed: true}

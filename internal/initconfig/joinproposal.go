@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 )
 
 // THE CONTROL PLANE'S HALF OF A JOIN, CARRIED AS ONE LINE (#183). A joining
@@ -122,7 +123,12 @@ func (p JoinProposal) YAML() ([]byte, error) {
 // EVERY FIELD IS CHECKED, because the proposal crossed from another machine
 // and is about to be merged into the control plane's own configuration: an
 // unknown key, a second document, a schema this build does not know, a tier
-// without a label or a node entry without a name are each refused here.
+// without a label or a node entry without a name are each refused here. So
+// are the YAML that could reach past the entries it carries (an anchor, which
+// re-encoding can let redefine one of the operator's own; an alias; a merge
+// key; a custom tag), a proposal that names no node or no deployment, and an
+// entry for another host: a joining node proposes its own policy, its own
+// pins and its own backend, never another machine's.
 func ParseJoinProposal(text string) (JoinProposal, error) {
 	text = strings.TrimSpace(text)
 
@@ -206,7 +212,86 @@ func ParseJoinProposal(text string) (JoinProposal, error) {
 		p.Nodes = append(p.Nodes, n)
 	}
 
+	if p.Node == "" {
+		return JoinProposal{}, errors.New("the join proposal names no node, so the ceiling cannot set its " +
+			"own registration aside; print it again with `billet join`")
+	}
+	if err := deploymentid.Validate(p.Deployment); err != nil {
+		return JoinProposal{}, fmt.Errorf("the join proposal is bound to no deployment it enrolled with "+
+			"(%v); `billet join` prints one that is", err)
+	}
+
+	if err := p.ownEntriesOnly(); err != nil {
+		return JoinProposal{}, err
+	}
+
 	return p, nil
+}
+
+// ownEntriesOnly refuses an entry that is not plain YAML, or that is about a
+// host or a backend other than the joining node's.
+func (p JoinProposal) ownEntriesOnly() error {
+	for _, t := range p.Tiers {
+		label := scalarValue(t, "label")
+		if err := plainYAML(t); err != nil {
+			return fmt.Errorf("tier %s of the join proposal: %w", label, err)
+		}
+		if pin := scalarValue(t, "node"); pin != "" && pin != p.Node {
+			return fmt.Errorf("tier %s of the join proposal is pinned to %q, not to the joining node %q",
+				label, pin, p.Node)
+		}
+		if kind := scalarValue(t, "provider"); kind != "" && kind != string(p.Provider) {
+			return fmt.Errorf("tier %s of the join proposal runs on %s, and the joining node is %s",
+				label, kind, p.Provider)
+		}
+	}
+
+	for _, n := range p.Nodes {
+		name := scalarValue(n, "name")
+		if err := plainYAML(n); err != nil {
+			return fmt.Errorf("nodes entry %s of the join proposal: %w", name, err)
+		}
+		if name != p.Node {
+			return fmt.Errorf("the join proposal carries policy for %q, and only the joining node %q's "+
+				"own is accepted", name, p.Node)
+		}
+		if kind := scalarValue(n, "provider"); kind != "" && kind != string(p.Provider) {
+			return fmt.Errorf("nodes entry %s of the join proposal names provider %s, and the joining "+
+				"node is %s", name, kind, p.Provider)
+		}
+	}
+
+	return nil
+}
+
+// plainTags are the tags a plain YAML value resolves to.
+var plainTags = map[string]bool{
+	"": true, "!!str": true, "!!int": true, "!!bool": true, "!!float": true, "!!null": true,
+	"!!map": true, "!!seq": true,
+}
+
+// plainYAML refuses an anchor, an alias, a merge key or a custom tag anywhere
+// in n.
+func plainYAML(n *yaml.Node) error {
+	switch {
+	case n.Kind == yaml.AliasNode:
+		return errors.New("it holds an alias")
+	case n.Anchor != "":
+		return fmt.Errorf("it declares the anchor &%s", n.Anchor)
+	case !plainTags[n.Tag]:
+		return fmt.Errorf("it carries the tag %s", n.Tag)
+	}
+
+	for i, c := range n.Content {
+		if n.Kind == yaml.MappingNode && i%2 == 0 && c.Value == "<<" {
+			return errors.New("it holds a merge key")
+		}
+		if err := plainYAML(c); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // scalarValue is a mapping's scalar value at key, or "".

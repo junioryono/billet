@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 
@@ -49,10 +50,21 @@ func (m JoinMerge) Changed() bool {
 //
 // THE CEILING COVERS THE FLEET, AND IS NEVER LOWERED: it becomes at least what
 // every registered host other than this one contributes plus this node's
-// share. That is idempotent: a second accept, or one run after the node has
-// registered (when its own row is set aside as this node), raises nothing
-// again, where adding the share to the ceiling would raise it each time.
+// share, the larger of what it proposes and what it registered, dimension by
+// dimension. That is idempotent: a second accept, or one run after the node has
+// registered, raises nothing again, where adding the share to the ceiling would
+// raise it each time; and a stale proposal cannot hide a larger registration.
+//
+// NOTHING ELSE CHANGES, AND THAT IS PROVED: the result loads, and once its
+// tiers, its nodes: and its ceiling are set aside it is the configuration it
+// was, with the existing tiers and policy entries unchanged and in order. A
+// merge key or an anchor in the operator's file is kept by the re-encoding,
+// and this is what catches one that would have changed what it means.
 func MergeJoin(cp []byte, p JoinProposal, registered []ContributingNode) (JoinMerge, error) {
+	if err := p.ownEntriesOnly(); err != nil {
+		return JoinMerge{}, err
+	}
+
 	var doc yaml.Node
 	if err := yaml.Unmarshal(cp, &doc); err != nil {
 		return JoinMerge{}, fmt.Errorf("the control plane's config does not parse: %w", err)
@@ -67,13 +79,26 @@ func MergeJoin(cp []byte, p JoinProposal, registered []ContributingNode) (JoinMe
 		return JoinMerge{}, errors.New("the config has no server block, so it is not a control plane's")
 	}
 
+	// INHERITED KEYS ARE NOT EDITED: a `tiers:` that arrives through a merge key
+	// is not a key of this mapping, and adding one would shadow the whole list.
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "<<" {
+			return JoinMerge{}, errors.New("the control plane's config merges keys into its top level " +
+				"(<<), so its tiers and nodes: may be inherited; merge this node's half by hand")
+		}
+	}
+
+	before, err := config.Parse("the control plane's config", cp)
+	if err != nil {
+		return JoinMerge{}, fmt.Errorf("the control plane's config does not load, so nothing was merged: %w", err)
+	}
+
 	var m JoinMerge
 
-	var err error
-	if m.AddedTiers, m.KeptTiers, err = mergeEntries(root, "tiers", "label", p.Tiers); err != nil {
+	if m.AddedTiers, m.KeptTiers, err = mergeEntries(root, "tiers", "label", p.Tiers, sameAs[config.Tier]); err != nil {
 		return JoinMerge{}, err
 	}
-	if m.AddedNodes, m.KeptNodes, err = mergeEntries(root, "nodes", "name", p.Nodes); err != nil {
+	if m.AddedNodes, m.KeptNodes, err = mergeEntries(root, "nodes", "name", p.Nodes, sameAs[config.NodePolicy]); err != nil {
 		return JoinMerge{}, err
 	}
 
@@ -88,8 +113,17 @@ func MergeJoin(cp []byte, p JoinProposal, registered []ContributingNode) (JoinMe
 
 	wantVCPU, wantMemory := p.MaxVCPU, p.MaxMemory
 	for _, r := range registered {
-		if p.Node != "" && r.Name == p.Node {
+		if r.Name == p.Node {
+			wantVCPU, wantMemory = max(wantVCPU, r.VCPU), max(wantMemory, r.Memory)
+		}
+	}
+	for _, r := range registered {
+		if r.Name == p.Node {
 			continue
+		}
+		if r.VCPU < 0 || r.Memory < 0 || wantVCPU > math.MaxInt-r.VCPU ||
+			wantMemory > config.ByteSize(math.MaxInt64)-r.Memory {
+			return JoinMerge{}, fmt.Errorf("the registered contributions do not sum (at %s)", r.Name)
 		}
 		wantVCPU += r.VCPU
 		wantMemory += r.Memory
@@ -124,9 +158,15 @@ func MergeJoin(cp []byte, p JoinProposal, registered []ContributingNode) (JoinMe
 
 	// PROVED BEFORE IT IS RETURNED, like every file billet generates: a merge
 	// the control plane would refuse to load is one it must not be handed.
-	if _, err := config.Parse("the merged config", out.Bytes()); err != nil {
+	after, err := config.Parse("the merged config", out.Bytes())
+	if err != nil {
 		return JoinMerge{}, fmt.Errorf("the config this merge renders does not load, so nothing was "+
 			"changed: %w", err)
+	}
+
+	if err := onlyTheJoinChanged(before, after, len(m.AddedNodes)); err != nil {
+		return JoinMerge{}, fmt.Errorf("the merge would change more than this node's half, so nothing was "+
+			"changed (%w); merge it by hand", err)
 	}
 
 	m.Body = out.Bytes()
@@ -134,9 +174,53 @@ func MergeJoin(cp []byte, p JoinProposal, registered []ContributingNode) (JoinMe
 	return m, nil
 }
 
+// prefixEqual reports whether long begins with every element of short, each
+// deeply equal (a nil and an empty list are the same list here).
+func prefixEqual[T any](long, short []T) bool {
+	if len(long) < len(short) {
+		return false
+	}
+
+	for i := range short {
+		if !reflect.DeepEqual(long[i], short[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// onlyTheJoinChanged proves after is before with tiers and nodes: entries
+// appended and the ceiling raised, and nothing else.
+func onlyTheJoinChanged(before, after *config.Config, addedNodes int) error {
+	if len(after.Tiers) < len(before.Tiers) || !prefixEqual(after.Tiers, before.Tiers) {
+		return errors.New("the tiers already there would change")
+	}
+	if len(after.Nodes) != len(before.Nodes)+addedNodes || !prefixEqual(after.Nodes, before.Nodes) {
+		return errors.New("the nodes: entries already there would change")
+	}
+
+	b, a := *before, *after
+	b.Tiers, b.Nodes, a.Tiers, a.Nodes = nil, nil, nil, nil
+	if b.Server == nil || a.Server == nil {
+		return errors.New("the server block would go")
+	}
+	bs, as := *b.Server, *a.Server
+	bs.MaxVCPU, bs.MaxMemory, as.MaxVCPU, as.MaxMemory = 0, 0, 0, 0
+	b.Server, a.Server = &bs, &as
+
+	if !reflect.DeepEqual(a, b) {
+		return errors.New("a setting outside the tiers, the nodes: entries and the ceiling would change")
+	}
+
+	return nil
+}
+
 // mergeEntries adds each proposed entry to root's list at key, matched by the
 // scalar at id: an identical entry is kept, a differing one refused.
-func mergeEntries(root *yaml.Node, key, id string, proposed []*yaml.Node) ([]string, []string, error) {
+func mergeEntries(root *yaml.Node, key, id string, proposed []*yaml.Node,
+	same func(a, b *yaml.Node) (bool, error),
+) ([]string, []string, error) {
 	if len(proposed) == 0 {
 		return nil, nil, nil
 	}
@@ -171,11 +255,11 @@ func mergeEntries(root *yaml.Node, key, id string, proposed []*yaml.Node) ([]str
 			continue
 		}
 
-		same, err := sameValue(existing, entry)
+		equal, err := same(existing, entry)
 		if err != nil {
 			return nil, nil, err
 		}
-		if !same {
+		if !equal {
 			return nil, nil, fmt.Errorf("the control plane already has a %s entry with %s %q that "+
 				"differs from the one this node proposes, so nothing was changed; decide which is right "+
 				"and edit it, or give the node's a %s of its own and accept again:\n  control plane: %s\n  "+
@@ -188,10 +272,11 @@ func mergeEntries(root *yaml.Node, key, id string, proposed []*yaml.Node) ([]str
 	return added, kept, nil
 }
 
-// sameValue compares two YAML nodes by the values they decode to, so key
-// order, style and comments do not make two entries differ.
-func sameValue(a, b *yaml.Node) (bool, error) {
-	var av, bv any
+// sameAs compares two entries as billet loads them, as a T: key order, style
+// and comments do not make two differ, and `node: TRUE` and `node: true`,
+// one boolean to untyped YAML, are two different pins.
+func sameAs[T any](a, b *yaml.Node) (bool, error) {
+	var av, bv T
 	if err := a.Decode(&av); err != nil {
 		return false, fmt.Errorf("decode an entry: %w", err)
 	}

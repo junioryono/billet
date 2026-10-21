@@ -27,6 +27,30 @@ const AnsibleVar = "billet_config"
 const RoleRenderedMarker = "# Rendered by the junioryono.billet collection from billet_config: " +
 	"change the inventory, not this file."
 
+// RoleRendered reports whether raw carries RoleRenderedMarker among its
+// leading comments, read past a byte-order mark, CRLF line ends and blank
+// lines: an editor that adds any of those leaves the file the inventory's, and
+// a byte-for-byte first line would let an edit through that the next converge
+// silently undoes.
+func RoleRendered(raw []byte) bool {
+	text := strings.TrimPrefix(string(raw), "\ufeff")
+
+	for line := range strings.SplitSeq(text, "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+
+		switch {
+		case line == RoleRenderedMarker:
+			return true
+		case line == "" || strings.HasPrefix(line, "#"):
+			continue
+		default:
+			return false
+		}
+	}
+
+	return false
+}
+
 // AnsibleVars nests a generated config under the variable the host role reads.
 //
 // The role's template is RoleRenderedMarker's line and then

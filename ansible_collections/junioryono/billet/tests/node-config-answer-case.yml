@@ -11,7 +11,9 @@
   ansible.builtin.assert:
     that:
       - (billet_node_config_changed | bool) == billet_gate_verdict_case.changed
-      - billet_gate_verdict_case.changed or 'tiers' in billet_node_config_verdict_why
+      - >-
+        billet_node_config_verdict_why == ('billet did not answer keep' if billet_gate_verdict_case.changed
+        else 'only tiers or nodes: changed, which no running node reads')
     fail_msg: >-
       {{ billet_gate_verdict_case.name }}: billet_node_config_changed is
       {{ billet_node_config_changed }} ({{ billet_node_config_verdict_why }}),

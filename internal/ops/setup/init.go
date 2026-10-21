@@ -311,7 +311,10 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 	// deliberately writes no node.name at all — with a certificate the name comes
 	// from it, and on a loopback machine there is no certificate to disagree with
 	// — so a name accepted there would be written nowhere and mean nothing.
-	if setFlags["node-name"] &&
+	//
+	// A JOIN TAKES IT ON ANY BACKEND: the node enrolls, and enrolling names the
+	// request before any certificate exists to take a name from.
+	if setFlags["node-name"] && !setFlags["join"] &&
 		kind != config.ProviderTart && kind != config.ProviderCodeBuild {
 		return fmt.Errorf("--node-name can only be used with --provider tart or --provider "+
 			"codebuild, but this is a %s config: those are the two backends that can carry a "+
@@ -713,7 +716,7 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 		if err != nil {
 			return fmt.Errorf("resolve --config %s: %w", *cfgPath, err)
 		}
-		joined, err = initconfig.Join(body, *join, filepath.Join(filepath.Dir(abs), "tls"))
+		joined, err = initconfig.Join(body, *join, filepath.Join(filepath.Dir(abs), "tls"), *nodeName)
 		if err != nil {
 			return err
 		}
@@ -1179,14 +1182,14 @@ func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, join
 // printJoinControlPlane prints the half of a join that belongs in the control
 // plane's config.
 //
-// THE TOKEN ONLY WHEN THE NODE'S NAME IS KNOWN. `billet join accept` sets the
-// node's own registered row aside when it raises the ceiling, which is what
-// makes accepting twice, or after the node registered, raise nothing again;
-// with no name it could not, so a generation whose name comes from a
-// certificate not yet issued prints the half to merge by hand, and `billet
-// join`, which knows the name, prints the token.
+// THE TOKEN ONLY WHEN THE NODE'S NAME AND ITS DEPLOYMENT ARE KNOWN, which is
+// `billet join`'s generation and no other: the name lets `billet join accept`
+// set the node's own registered row aside, so accepting twice raises nothing
+// again, and the deployment, which `billet join` read from the authority it
+// verified, binds the token to one control plane. Otherwise the half is
+// printed to merge by hand.
 func printJoinControlPlane(env cli.Env, joined initconfig.JoinResult) {
-	if joined.Proposal.Node != "" {
+	if joined.Proposal.Node != "" && joined.Proposal.Deployment != "" {
 		if token, err := joined.Proposal.Token(); err == nil {
 			fmt.Fprintf(env.Stdout, "\nOn the control plane, one command merges this node's tiers, its "+
 				"nodes: entry and its share of the ceiling into its config:\n\n  billet join accept %s\n\n"+

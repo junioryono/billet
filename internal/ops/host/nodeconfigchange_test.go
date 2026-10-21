@@ -39,6 +39,16 @@ tiers:
 func runConfigChange(t *testing.T, installed, candidate string) configChangeAnswer {
 	t.Helper()
 
+	answer, _ := runConfigChangeRaw(t, installed, candidate)
+
+	return answer
+}
+
+// runConfigChangeRaw is runConfigChange with the bytes the command printed,
+// which are what the roles read.
+func runConfigChangeRaw(t *testing.T, installed, candidate string) (configChangeAnswer, string) {
+	t.Helper()
+
 	dir := t.TempDir()
 	a, b := filepath.Join(dir, "installed.yaml"), filepath.Join(dir, "candidate.yaml")
 	mustOK(t, os.WriteFile(a, []byte(installed), 0o600))
@@ -58,7 +68,7 @@ func runConfigChange(t *testing.T, installed, candidate string) configChangeAnsw
 		t.Errorf("schema %d, want %d", answer.Schema, configChangeSchema)
 	}
 
-	return answer
+	return answer, out.String()
 }
 
 // A NODE KEEPS RUNNING ONLY WHEN WHAT IT READS IS UNCHANGED (#183): a tier of
@@ -182,21 +192,51 @@ func TestNodeConfigChangeRestartsWhenAFileCannotBeRead(t *testing.T) {
 	}
 }
 
-// THE FIXTURES THE ROLES' SCENARIO TESTS ANSWER FROM, written by the command
-// itself (BILLET_UPDATE_FIXTURES=1 rewrites them).
+// THE FIXTURES THE ROLES' SCENARIO TESTS ANSWER FROM, the bytes the command
+// itself printed (BILLET_UPDATE_FIXTURES=1 rewrites them): re-encoding the
+// decoded answer would let a change to how it prints pass here and fail on
+// every host.
 func TestNodeConfigChangeFixtures(t *testing.T) {
+	for name, stdout := range configChangeOutputs(t) {
+		compareFixture(t, "node-config-change", name, stdout)
+	}
+}
+
+// configChangeOutputs is what the command prints for a keep and a restart.
+func configChangeOutputs(t *testing.T) map[string]string {
+	t.Helper()
+
 	dir := t.TempDir()
 	base := changeTestConfig(dir)
 
+	out := map[string]string{}
 	for name, candidate := range map[string]string{
 		"keep":    base + "nodes:\n  - name: mac-1\n    provider: tart\n    guest_os: [macos]\n",
 		"restart": strings.Replace(base, "max_vcpu: 8", "max_vcpu: 6", 1),
 	} {
-		answer := runConfigChange(t, base, candidate)
-		raw, err := json.Marshal(answer)
+		_, out[name] = runConfigChangeRaw(t, base, candidate)
+	}
+
+	return out
+}
+
+// THE ROLES KEEP A NODE ONLY ON BILLET'S EXACT KEEP, and that literal is the
+// command's own output: both roles compare the answer whole (a pattern let a
+// half-formed reason through as keep), so a reworded keep would read as
+// restart on every host until they follow it, and this fails first.
+func TestTheRolesKeepOnlyOnBilletsExactKeep(t *testing.T) {
+	keep := strings.TrimSpace(configChangeOutputs(t)["keep"])
+
+	for _, path := range []string{
+		"../../../ansible_collections/junioryono/billet/roles/host/tasks/node-config-answer.yml",
+		"../../../ansible_collections/junioryono/billet/roles/macos_node/tasks/converge.yml",
+	} {
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		compareFixture(t, "node-config-change", name, string(raw)+"\n")
+		if !strings.Contains(string(raw), "_keep_answer: '"+keep+"'") {
+			t.Errorf("%s does not compare the answer with billet's exact keep %s", path, keep)
+		}
 	}
 }

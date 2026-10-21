@@ -10,10 +10,14 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 )
+
+// locksTaken counts the lifecycle locks runJoin's stand-in handed out.
+var locksTaken int
 
 // joinFixture is a control plane (writeAdminConfig's: an 8 vCPU, 32GiB
 // ceiling) with one registered host contributing all of it.
@@ -86,8 +90,18 @@ func (f joinFixture) deployment(t *testing.T) string {
 	return id
 }
 
+// runJoin runs `billet join` with the lifecycle lock stood in for, counting
+// how often it is taken: the real one lives in a directory only root creates.
 func runJoin(t *testing.T, stdin string, args ...string) (string, error) {
 	t.Helper()
+
+	realLock := lifecycleLock
+	t.Cleanup(func() { lifecycleLock = realLock })
+	lifecycleLock = func() (*hostauthority.LifecycleLock, error) {
+		locksTaken++
+
+		return &hostauthority.LifecycleLock{}, nil
+	}
 
 	var out bytes.Buffer
 	env := cli.Env{Stdout: &out, Stderr: &out, Stdin: strings.NewReader(stdin), Getenv: os.Getenv}

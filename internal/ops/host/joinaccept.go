@@ -1,11 +1,13 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -22,6 +24,10 @@ import (
 
 // maxProposalText bounds what `join accept` reads from a file or stdin.
 const maxProposalText = 1 << 20
+
+// joinAcceptMerged runs between the merge and the write; a test changes the
+// file there.
+var joinAcceptMerged = func() {}
 
 // joinAccept is `billet join accept`: the control plane's half of a join,
 // applied by machine (#183).
@@ -44,6 +50,13 @@ const maxProposalText = 1 << 20
 // the inventory and mark its first line (initconfig.RoleRenderedMarker), so an
 // edit here would be undone by the next converge; the same half is printed in
 // the inventory's terms instead.
+//
+// ONE EDIT AT A TIME, ON THE FILE ITSELF: the read, the merge and the write run
+// under the lifecycle lock, the file is read again before it is replaced and a
+// change since refuses, and a symlinked config is edited at its target, because
+// the write is a rename and would otherwise replace the link. Two accepts run
+// side by side would each merge into the file the other had not yet written,
+// and the second would put back the first's ceiling.
 func joinAccept(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet join accept", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
@@ -68,25 +81,43 @@ func joinAccept(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	raw, err := os.ReadFile(*cfgPath)
+	path, err := editTarget(*cfgPath)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", *cfgPath, err)
+		return err
 	}
 
-	cfg, err := config.Parse(*cfgPath, raw)
+	if !*dryRun {
+		lock, err := lifecycleLock()
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			if err := lock.Release(); err != nil {
+				fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
+			}
+		}()
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	cfg, err := config.Parse(path, raw)
 	if err != nil {
 		return err
 	}
 	if cfg.Server == nil {
 		return fmt.Errorf("%s has no server block: billet join accept runs on the control plane the node "+
-			"is joining", *cfgPath)
+			"is joining", path)
 	}
 
-	if err := checkProposalDeployment(env, cfg, p); err != nil {
+	if err := checkProposalDeployment(cfg, p); err != nil {
 		return err
 	}
 
-	registered, err := registeredContribution(ctx, *cfgPath)
+	registered, err := registeredContribution(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -96,17 +127,16 @@ func joinAccept(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	describeMerge(env, *cfgPath, p, merge)
+	describeMerge(env, path, p, merge)
 
 	if !merge.Changed() {
-		fmt.Fprintf(env.Stdout, "\n%s already has everything this node proposes; nothing to change.\n", *cfgPath)
+		fmt.Fprintf(env.Stdout, "\n%s already has everything this node proposes; nothing to change.\n", path)
 
 		return pendingEnrollmentNote(env, p)
 	}
 
-	first, _, _ := strings.Cut(string(raw), "\n")
-	if first == initconfig.RoleRenderedMarker {
-		return inventoryForm(env, *cfgPath, p, merge)
+	if initconfig.RoleRendered(raw) {
+		return inventoryForm(env, path, p, merge)
 	}
 
 	if *dryRun {
@@ -115,12 +145,22 @@ func joinAccept(ctx context.Context, env cli.Env, args []string) error {
 		return nil
 	}
 
-	if err := setup.ReplaceConfig(env, *cfgPath, merge.Body); err != nil {
+	joinAcceptMerged()
+
+	// THE FILE MERGED INTO IS THE FILE REPLACED: an edit by something that does
+	// not take the lock (an operator's editor, `github-app create`) since the
+	// read refuses rather than being overwritten.
+	if now, err := os.ReadFile(path); err != nil || !bytes.Equal(now, raw) {
+		return fmt.Errorf("%s changed while the merge was made (%v), so nothing was written; run billet "+
+			"join accept again", path, err)
+	}
+
+	if err := setup.ReplaceConfig(env, path, merge.Body); err != nil {
 		return err
 	}
 
 	fmt.Fprintf(env.Stdout, "\nWrote %s. The control plane reads tiers when it starts; restart it to take "+
-		"them, which hands over to the next process rather than draining:\n  %s\n", *cfgPath, serverRestartCommand())
+		"them, which hands over to the next process rather than draining:\n  %s\n", path, serverRestartCommand())
 
 	return pendingEnrollmentNote(env, p)
 }
@@ -155,16 +195,26 @@ func proposalText(env cli.Env, arg string) (string, error) {
 	return string(raw), nil
 }
 
-// checkProposalDeployment refuses a proposal made against another deployment.
-// A proposal made without enrolling names none, and that is said.
-func checkProposalDeployment(env cli.Env, cfg *config.Config, p initconfig.JoinProposal) error {
-	if p.Deployment == "" {
-		fmt.Fprintf(env.Stdout, "NOTE: this proposal was made without enrolling, so it names no deployment "+
-			"and cannot be checked against this one.\n\n")
+// editTarget is the file an edit of path lands on: its target when path is a
+// symlink. A path that cannot be read is left for the read to report.
+func editTarget(path string) (string, error) {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return "", fmt.Errorf("%s is a symbolic link and billet cannot resolve what it points at: %w",
+				path, err)
+		}
 
-		return nil
+		return resolved, nil
 	}
 
+	return path, nil
+}
+
+// checkProposalDeployment refuses a proposal made against another deployment.
+// Every proposal names one (initconfig.ParseJoinProposal refuses one that does
+// not).
+func checkProposalDeployment(cfg *config.Config, p initconfig.JoinProposal) error {
 	id, ok, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
 	switch {
 	case err != nil:
@@ -314,10 +364,6 @@ func serverRestartCommand() string {
 // node's enrollment request, which is approved by the fingerprint the node
 // printed, never by one read here.
 func pendingEnrollmentNote(env cli.Env, p initconfig.JoinProposal) error {
-	if p.Deployment == "" {
-		return nil
-	}
-
 	fmt.Fprintf(env.Stdout, "\nIf %s is waiting to enroll, `billet nodes pending` shows its request: compare "+
 		"the fingerprint there with the one the node printed, then\n  billet nodes approve %s --fingerprint "+
 		"<the value you compared>\n", p.Node, p.Node)
