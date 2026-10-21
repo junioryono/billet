@@ -76,10 +76,13 @@ done
 # THE SOURCE MANIFEST IS ITS HEADER AND ONE OR MORE COMPLETE ROWS: seven cells,
 # none empty. The gate compared this copy with the image's own; this refuses an
 # empty, truncated or reformatted file handed over in its place.
+#
+# A BAD ROW IS RECORDED, NOT EXITED ON: awk runs END after an exit in a rule, and
+# an END that exits again replaces the status.
 if ! awk -F '\t' '
-    NR == 1 { if ($0 != "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense") exit 1; next }
-    { if (NF != 7) exit 1; for (i = 1; i <= 7; i++) if ($i == "") exit 1; rows++ }
-    END { exit rows > 0 ? 0 : 1 }' "$out/image-sources.tsv"; then
+    NR == 1 { if ($0 != "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense") bad = 1; next }
+    { if (NF != 7) bad = 1; for (i = 1; i <= 7; i++) if ($i == "") bad = 1; rows++ }
+    END { exit (bad || rows == 0) ? 1 : 0 }' "$out/image-sources.tsv"; then
     printf 'the publication'"'"'s image-sources.tsv is not a source manifest naming a package, so nothing is tagged or released\n' >&2
     exit 2
 fi

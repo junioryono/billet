@@ -367,6 +367,15 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			wantSuccess: false,
 		},
 		{
+			name: "a malformed row after a valid one stops the publish before the tag",
+			dir: replaced(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
+					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"+
+					"jq\tamd64\t1.7.1\n"),
+			wantSuccess: false,
+		},
+		{
 			name: "a source manifest under another header stops the publish before the tag",
 			dir: replaced(t, publishDir(t, multipart,
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv",

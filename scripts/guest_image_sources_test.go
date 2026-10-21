@@ -178,7 +178,8 @@ func TestTheSourceManifestRefusesWhatItCannotWrite(t *testing.T) {
 // sourcesRoot writes an image root whose dpkg status records four packages as
 // installed, two of them written with the freedoms dpkg's parser allows (a field
 // name in another case, a tab after the colon, trailing space, a space before the
-// colon) and two built from
+// colon, a carriage return before one, a value continued on the next line) and two
+// built from
 // a source of another name, one at another version; one with only its
 // configuration left; and a source manifest listing the four.
 func sourcesRoot(t *testing.T) string {
@@ -201,13 +202,14 @@ func sourcesRoot(t *testing.T) string {
 		"Package: libc6\n"+
 		"Status: hold ok installed\n"+
 		"Architecture: amd64\n"+
-		"Source: glibc\n"+
+		"Source\r: glibc\n"+
 		"Version: 2.39-0ubuntu8.6\n"+
 		"\n"+
 		"Package: libfoo1\n"+
 		"Status: install ok installed\n"+
 		"Architecture: amd64\n"+
-		"Source : foo (1.2-1)\n"+
+		"Source : foo \n"+
+		" (1.2-1)\n"+
 		"Version: 1.2-1build1\n"+
 		"\n"+
 		"Package: purged\n"+

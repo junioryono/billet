@@ -665,24 +665,31 @@ check_image_sources() {
 
 	# WHAT dpkg RECORDS, read from the image's own status file as dpkg reads it,
 	# so the comparison needs no dpkg on the machine running the gate: a field's
-	# name in any case and with space before its colon, its value with the space
-	# around it trimmed, continuation
-	# lines skipped. A package's source is its Source field, `name` or `name
-	# (version)`, defaulting to the package and its version. A record with no
-	# package or status is `?`; one dpkg did not finish is `!`.
+	# name in any case and with space before its colon, a continuation line part
+	# of the field above it, and the value with the space around it trimmed. A
+	# package's source is its Source field, `name` or `name (version)`, defaulting
+	# to the package and its version. A record with no package or status is `?`;
+	# one dpkg did not finish is `!`.
 	records=$(awk 'BEGIN { RS = ""; FS = "\n" }
 		{
 			split("", f)
+			k = ""
 			for (i = 1; i <= NF; i++) {
-				if ($i ~ /^[ \t]/) continue
+				if ($i ~ /^[[:space:]]/) {
+					if (k != "") f[k] = f[k] " " $i
+					continue
+				}
 				n = index($i, ":")
-				if (n == 0) continue
+				if (n == 0) {
+					k = ""
+					continue
+				}
 				k = substr($i, 1, n - 1)
-				v = substr($i, n + 1)
-				gsub(/[ \t]+$/, "", k)
-				gsub(/^[ \t]+|[ \t]+$/, "", v)
-				f[tolower(k)] = v
+				gsub(/[[:space:]]+$/, "", k)
+				k = tolower(k)
+				f[k] = substr($i, n + 1)
 			}
+			for (k in f) gsub(/^[[:space:]]+|[[:space:]]+$/, "", f[k])
 			if (f["package"] == "" || f["status"] == "") { print "?\trecord " NR; next }
 			split(f["status"], st, /[ \t]+/)
 			if (st[3] == "not-installed" || st[3] == "config-files") next
