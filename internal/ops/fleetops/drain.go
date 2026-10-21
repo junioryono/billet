@@ -376,8 +376,11 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 
 	last := ""
 
-	// awaitingCounts says the wait for fresh demand counts was announced.
+	// awaitingCounts says the wait for fresh demand counts was announced, and
+	// quietSince is when the ledger was first seen quiet since it last was not.
 	awaitingCounts := false
+
+	var quietSince time.Time
 
 	for {
 		q, err := allocator.Quiescence(ctx)
@@ -429,14 +432,22 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 			// One taken before it cannot speak for what was assigned after, so a
 			// quiet ledger waits a little for every listener to count again, and
 			// a count that still predates the seal is said to be unknown.
+			//
+			// THE WAIT RUNS FROM THE LATER OF THE SEAL AND THE QUIET: the last
+			// lease to close makes its tier's count stale, and a listener needs a
+			// poll to count again however long after the seal that close was.
 			sealedAt := sealTime(ctx, db, waitBegan)
 			demand := assignedDemand(ctx, allocator, cfg, sealedAt)
 
-			if countsPredateTheSeal(demand) && time.Since(sealedAt) < demandCountWithin {
+			if quietSince.IsZero() {
+				quietSince = time.Now()
+			}
+
+			if countsPredateTheSeal(demand) && time.Since(later(sealedAt, quietSince)) < demandCountWithin {
 				if !awaitingCounts {
-					fmt.Fprintf(env.Stdout, "The ledger is quiet. Waiting up to %s after the seal for every "+
-						"tier's listener\nto count what GitHub has assigned it since.\n",
-						demandCountWithin)
+					fmt.Fprintf(env.Stdout, "The ledger is quiet. Waiting up to %s for every tier's "+
+						"listener\nto count what GitHub has assigned it since the seal and its last "+
+						"lease closed.\n", demandCountWithin)
 
 					awaitingCounts = true
 				}
@@ -462,6 +473,8 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 
 			return proveComputeClear(ctx, env, allocator, generation, ticker)
 		}
+
+		quietSince = time.Time{}
 
 		if summary := OutstandingSummary(q); summary != last {
 			fmt.Fprintf(env.Stdout, "%s\n", summary)
@@ -499,7 +512,8 @@ type tierDemand struct {
 
 // assignedDemand reads every tier's last count of assigned work it has not
 // started, keeping only the tiers with some or whose count cannot be trusted:
-// unreadable, or taken before sealedAt.
+// unreadable, vouched for before sealedAt, or read before a lease of its tier
+// closed.
 //
 // ONLY THE TIERS THE CONFIG DECLARES. A tier removed from it has no listener
 // and will start nothing after `billet resume`; its scale set is reported at
@@ -509,11 +523,13 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 ) []tierDemand {
 	var out []tierDemand
 
-	// A COUNT TAKEN BEFORE A LEASE OF ITS TIER CLOSED is not trusted either: that
+	// A COUNT READ BEFORE A LEASE OF ITS TIER CLOSED is not trusted either: that
 	// lease may have been a runner the count had covering an assigned job, and
-	// the quiet ledger beside the count would then call a waiting job none. A
-	// read that fails trusts no count.
-	released, releasedErr := allocator.LastReleases(ctx, sealedAt)
+	// the quiet ledger beside the count would then call a waiting job none. The
+	// generation, not a time, says which came first, because no clock orders a
+	// count in one process against a close in another. A read that fails trusts
+	// no count.
+	releases, releasesErr := allocator.TierReleases(ctx)
 
 	for i := range cfg.Tiers {
 		label := cfg.Tiers[i].Label
@@ -548,17 +564,21 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 			continue
 		}
 
-		if releasedErr != nil {
+		switch seen := r.Listener.UnstartedReleases; {
+		case releasesErr != nil:
 			out = append(out, tierDemand{tier: label, counted: r.Listener.UnstartedAt, stale: true,
-				unknown: fmt.Sprintf("could not read when its leases last closed: %v", releasedErr)})
+				unknown: fmt.Sprintf("could not read how many of its leases have closed: %v", releasesErr)})
 
 			continue
-		}
-
-		if closed, ok := released[label]; ok && !counted.After(closed) {
+		case seen == nil:
 			out = append(out, tierDemand{tier: label, counted: r.Listener.UnstartedAt, stale: true,
-				unknown: fmt.Sprintf("last counted at %q, before one of its leases closed at %q",
-					r.Listener.UnstartedAt, closed.UTC().Format(time.RFC3339Nano))})
+				unknown: "its listener does not say which of its leases had closed when it counted"})
+
+			continue
+		case *seen != releases[label]:
+			out = append(out, tierDemand{tier: label, counted: r.Listener.UnstartedAt, stale: true,
+				unknown: fmt.Sprintf("last counted at %q, before %d more of its leases closed",
+					r.Listener.UnstartedAt, releases[label]-*seen)})
 
 			continue
 		}
@@ -569,6 +589,15 @@ func assignedDemand(ctx context.Context, allocator *alloc.Allocator, cfg *config
 	}
 
 	return out
+}
+
+// later is whichever of a and b is later.
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+
+	return b
 }
 
 // countsPredateTheSeal reports whether any tier's count was taken before the

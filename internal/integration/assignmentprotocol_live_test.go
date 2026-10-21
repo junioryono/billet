@@ -198,7 +198,12 @@ func (p *protocolProbe) finish() {
 		}
 	}
 
-	for _, run := range p.dispatch.dispatchedRuns(ctx, p.start) {
+	runs, err := p.dispatch.dispatchedRuns(ctx, p.start)
+	if err != nil {
+		p.cleanup(fmt.Sprintf("finding the runs to cancel (those already known are cancelled): %v", err))
+	}
+
+	for _, run := range runs {
 		if err := p.dispatch.cancel(ctx, run); err != nil {
 			p.cleanup(fmt.Sprintf("cancelling run %d: %v", run, err))
 		}
@@ -366,7 +371,12 @@ func (p *protocolProbe) sampleJobs() {
 	ctx, cancel := context.WithTimeout(p.t.Context(), 30*time.Second)
 	defer cancel()
 
-	for _, run := range p.dispatch.dispatchedRuns(ctx, p.start) {
+	runs, err := p.dispatch.dispatchedRuns(ctx, p.start)
+	if err != nil {
+		p.record(protocolEvent{Error: fmt.Sprintf("list the dispatched runs: %v", err)})
+	}
+
+	for _, run := range runs {
 		jobs, err := p.dispatch.jobs(ctx, run)
 		if err != nil {
 			p.record(protocolEvent{Error: fmt.Sprintf("read run %d's jobs: %v", run, err)})
@@ -785,7 +795,12 @@ func (p *protocolProbe) measureC1() {
 	ctx, cancel := context.WithTimeout(p.t.Context(), time.Minute)
 	defer cancel()
 
-	for _, run := range p.dispatch.dispatchedRuns(ctx, p.start) {
+	runs, err := p.dispatch.dispatchedRuns(ctx, p.start)
+	if err != nil {
+		p.t.Fatalf("find the run to cancel: %v", err)
+	}
+
+	for _, run := range runs {
 		if err := p.dispatch.cancel(ctx, run); err != nil {
 			p.t.Fatalf("cancel run %d: %v", run, err)
 		}
@@ -962,10 +977,23 @@ func (d *dispatcher) dispatch(ctx context.Context, runsOn string, sleep int) err
 // dispatchedRuns are the workflow's dispatched runs created since since whose
 // job is queued on this measurement's label. ONLY THOSE: other sessions
 // dispatch the same workflow, and the cleanup cancels every run this returns.
-func (d *dispatcher) dispatchedRuns(ctx context.Context, since time.Time) []int64 {
+//
+// A listing that fails is said, and the runs already known to be ours are
+// returned anyway, so the cleanup never rests on listing them again.
+func (d *dispatcher) dispatchedRuns(ctx context.Context, since time.Time) ([]int64, error) {
+	listed, listErr := d.workflowRuns(ctx, since)
+
+	d.mu.Lock()
+	for run, ours := range d.ours {
+		if ours && !slices.Contains(listed, run) {
+			listed = append(listed, run)
+		}
+	}
+	d.mu.Unlock()
+
 	var out []int64
 
-	for _, run := range d.workflowRuns(ctx, since) {
+	for _, run := range listed {
 		d.mu.Lock()
 		ours, known := d.ours[run]
 		d.mu.Unlock()
@@ -993,35 +1021,42 @@ func (d *dispatcher) dispatchedRuns(ctx context.Context, since time.Time) []int6
 		}
 	}
 
-	return out
+	return out, listErr
 }
 
 // workflowRuns are the workflow's dispatched runs created since since, by
 // anyone.
-func (d *dispatcher) workflowRuns(ctx context.Context, since time.Time) []int64 {
-	var page struct {
-		Runs []struct {
-			ID        int64     `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-		} `json:"workflow_runs"`
-	}
-
-	path := "/repos/" + d.repo + "/actions/workflows/" + d.workflow +
-		"/runs?event=workflow_dispatch&per_page=100&created=%3E%3D" + since.Add(-time.Minute).UTC().Format(time.RFC3339)
-
-	if err := d.do(ctx, http.MethodGet, path, nil, &page); err != nil {
-		return nil
-	}
-
+func (d *dispatcher) workflowRuns(ctx context.Context, since time.Time) ([]int64, error) {
 	var out []int64
 
-	for _, r := range page.Runs {
-		if !r.CreatedAt.Before(since.Add(-time.Minute)) {
-			out = append(out, r.ID)
+	// EVERY PAGE: other sessions dispatch the same workflow, so this
+	// measurement's runs need not be on the first.
+	for number := 1; ; number++ {
+		var page struct {
+			Runs []struct {
+				ID        int64     `json:"id"`
+				CreatedAt time.Time `json:"created_at"`
+			} `json:"workflow_runs"`
+		}
+
+		path := "/repos/" + d.repo + "/actions/workflows/" + d.workflow +
+			"/runs?event=workflow_dispatch&per_page=100&page=" + strconv.Itoa(number) +
+			"&created=%3E%3D" + since.Add(-time.Minute).UTC().Format(time.RFC3339)
+
+		if err := d.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			return out, fmt.Errorf("list the workflow's runs, page %d: %w", number, err)
+		}
+
+		for _, r := range page.Runs {
+			if !r.CreatedAt.Before(since.Add(-time.Minute)) {
+				out = append(out, r.ID)
+			}
+		}
+
+		if len(page.Runs) < 100 {
+			return out, nil
 		}
 	}
-
-	return out
 }
 
 type restJob struct {

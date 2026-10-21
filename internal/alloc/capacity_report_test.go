@@ -194,3 +194,54 @@ func TestCapacityReportsIsEachTiersReport(t *testing.T) {
 		t.Errorf("large = %+v, want its two unobserved leases unknown, its floor, and no report", got)
 	}
 }
+
+// EVERY CLOSE ADVANCES ITS TIER'S RELEASE GENERATION, AND ONLY ITS TIER'S, in
+// the transaction that closes it (#140). A drain trusts a listener's count only
+// while this has not moved since the count was read, so a release that
+// advanced nothing would leave a count standing that the release made wrong.
+func TestEveryCloseAdvancesItsTiersReleases(t *testing.T) {
+	one, other := tier("one", 1, config.GiB), tier("other", 1, config.GiB)
+	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB}, []config.Tier{one, other})
+
+	generation := func(label string) int64 {
+		t.Helper()
+
+		_, at, err := a.ActiveRunnersAt(t.Context(), label)
+		if err != nil {
+			t.Fatalf("ActiveRunnersAt(%s): %v", label, err)
+		}
+
+		all, err := a.TierReleases(t.Context())
+		if err != nil {
+			t.Fatalf("TierReleases: %v", err)
+		}
+
+		if all[label] != at {
+			t.Fatalf("tier %s's generation is %d read alone and %d read with the others", label, at, all[label])
+		}
+
+		return at
+	}
+
+	if got := generation("one"); got != 0 {
+		t.Fatalf("a tier none of whose leases closed is at generation %d, want 0", got)
+	}
+
+	done := reserve(t, a, "one")
+	if err := a.Release(t.Context(), done.ID, done.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	failed := reserve(t, a, "one")
+	if err := a.ReleaseFailed(t.Context(), failed.ID, failed.Epoch, "the launch failed"); err != nil {
+		t.Fatalf("ReleaseFailed: %v", err)
+	}
+
+	if got := generation("one"); got != 2 {
+		t.Errorf("after two closes tier one is at generation %d, want 2", got)
+	}
+
+	if got := generation("other"); got != 0 {
+		t.Errorf("closes of tier one moved tier other to generation %d", got)
+	}
+}

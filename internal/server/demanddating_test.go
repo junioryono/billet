@@ -88,6 +88,7 @@ func TestADeliveryUndatesTheCountBeforeItIsHandled(t *testing.T) {
 		before, atDestroy alloc.ListenerCapacity
 		destroyed         bool
 		acknowledged      []int64
+		launched          []int64
 	)
 
 	one := &Statistics{TotalAssignedJobs: 1}
@@ -119,7 +120,11 @@ func TestADeliveryUndatesTheCountBeforeItIsHandled(t *testing.T) {
 	}}
 
 	l := NewListener(a, label, session, WithLogger(slog.New(slog.DiscardHandler)),
-		WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+		WithRunner(&fakeRunner{onLaunch: func(requestID int64) error {
+			launched = append(launched, requestID)
+
+			return nil
+		}, onDestroyCompleted: func(int64, string) error {
 			atDestroy, destroyed = published(), true
 
 			return nil
@@ -149,6 +154,11 @@ func TestADeliveryUndatesTheCountBeforeItIsHandled(t *testing.T) {
 
 	if !slices.Contains(acknowledged, 2) {
 		t.Errorf("acknowledged %v, want the delivery (2) handled and acknowledged", acknowledged)
+	}
+
+	// THE SECOND JOB WAITS: the seal bought it nothing, so nothing started.
+	if !slices.Equal(launched, []int64{11}) {
+		t.Errorf("launched %v, want only the job assigned before the seal (11)", launched)
 	}
 }
 

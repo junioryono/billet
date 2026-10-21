@@ -2684,6 +2684,32 @@ func (a *Allocator) ActiveRunnerLeases(ctx context.Context, tier string) (int, e
 	return int(count), nil
 }
 
+// ActiveRunnersAt is ActiveRunnerLeases with the tier's release generation read
+// in the same snapshot: the generation a count of the tier's demand made from
+// this number is valid at, which a drain compares with the current one.
+func (a *Allocator) ActiveRunnersAt(ctx context.Context, tier string) (int, int64, error) {
+	var count, releases int64
+
+	err := a.db.View(ctx, func(tx querier) error {
+		var err error
+
+		q := state.ReadQueries(tx)
+
+		if count, err = q.CountActiveRunnerLeases(ctx, tier); err != nil {
+			return err
+		}
+
+		releases, err = q.TierReleases(ctx, tier)
+
+		return err
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("alloc: count active runner leases for %s: %w", tier, err)
+	}
+
+	return int(count), releases, nil
+}
+
 // ServiceableRunnerLeaseIDs reports restart-surviving runner capacity that may
 // still serve the scale set. Teardown and quarantine remain charged for safety
 // but are cleanup obligations, not capacity GitHub may schedule against.
@@ -3477,6 +3503,13 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	})
 	if err != nil {
 		return fmt.Errorf("alloc: archive lease %s: %w", l.ID, err)
+	}
+
+	// IN THE SAME TRANSACTION AS THE CLOSE, so no reader sees one without the
+	// other: a drain trusts a listener's count only while this has not moved
+	// since the count was read (ActiveRunnersAt).
+	if err := state.WriteQueries(tx).BumpTierReleases(ctx, l.Tier); err != nil {
+		return fmt.Errorf("alloc: count lease %s's close against tier %s: %w", l.ID, l.Tier, err)
 	}
 
 	return nil

@@ -630,7 +630,7 @@ func (c *Controller) Schedule(
 
 	// AND THE WIRE'S RESIZE ROUTE ASKS ITS ADMISSION ORDER from here on (#172).
 	if wire.resizes != nil {
-		wire.resizes.order.Store(plane)
+		wire.resizes.bind(plane)
 	}
 
 	// READINESS IS REPORTED BEFORE THE LISTENERS OPEN THEIR SESSIONS, AND MOVING IT

@@ -81,7 +81,6 @@ type ReadOps interface {
 	HighestForceDestroyGeneration(ctx context.Context) (int64, error)
 	HighestRolloutGeneration(ctx context.Context) (int64, error)
 	HostReportsCompute(ctx context.Context, node string) (bool, error)
-	LastFinishedPerTier(ctx context.Context, since sql.NullString) ([]ledgerdb.LastFinishedPerTierRow, error)
 	LatestForceDestroy(ctx context.Context) (ledgerdb.ForceDestroy, error)
 	ListAdmissionRows(ctx context.Context) ([]ledgerdb.Admission, error)
 	ListAppliedMigrations(ctx context.Context) ([]ledgerdb.ListAppliedMigrationsRow, error)
@@ -122,6 +121,7 @@ type ReadOps interface {
 	ListRunningLeasesWithReplacedHolder(ctx context.Context, arg ledgerdb.ListRunningLeasesWithReplacedHolderParams) ([]ledgerdb.ListRunningLeasesWithReplacedHolderRow, error)
 	ListScaleSets(ctx context.Context, org string) ([]ledgerdb.ListScaleSetsRow, error)
 	ListServiceableRunnerLeaseIDs(ctx context.Context, tier string) ([]string, error)
+	ListTierReleases(ctx context.Context) ([]ledgerdb.TierRelease, error)
 	LiveCertsFor(ctx context.Context, arg ledgerdb.LiveCertsForParams) ([]ledgerdb.IssuedCert, error)
 	LiveJoinTokenExists(ctx context.Context, arg ledgerdb.LiveJoinTokenExistsParams) (bool, error)
 	NodeRevocationCutoff(ctx context.Context, node string) (string, error)
@@ -180,6 +180,7 @@ type ReadOps interface {
 	ReadRolloutControllerPhase(ctx context.Context, id string) (string, error)
 	ReadRolloutInState(ctx context.Context, state string) (ledgerdb.Rollout, error)
 	ReadRolloutNodeProgress(ctx context.Context, arg ledgerdb.ReadRolloutNodeProgressParams) (ledgerdb.ReadRolloutNodeProgressRow, error)
+	TierReleases(ctx context.Context, tier string) (int64, error)
 	TotalUsage(ctx context.Context) (ledgerdb.TotalUsageRow, error)
 	UsageByNode(ctx context.Context) ([]ledgerdb.UsageByNodeRow, error)
 	UsageByTier(ctx context.Context) ([]ledgerdb.UsageByTierRow, error)
@@ -206,6 +207,7 @@ type WriteOps interface {
 	BindLease(ctx context.Context, arg ledgerdb.BindLeaseParams) error
 	BindPoolRunnerJob(ctx context.Context, arg ledgerdb.BindPoolRunnerJobParams) error
 	BumpDispatchGeneration(ctx context.Context, name string) (int64, error)
+	BumpTierReleases(ctx context.Context, tier string) error
 	ClaimController(ctx context.Context, arg ledgerdb.ClaimControllerParams) (int64, error)
 	ClaimPoolRunnerForRetirement(ctx context.Context, arg ledgerdb.ClaimPoolRunnerForRetirementParams) (sql.Result, error)
 	CompleteForceDestroy(ctx context.Context, arg ledgerdb.CompleteForceDestroyParams) error

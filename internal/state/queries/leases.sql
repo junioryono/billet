@@ -258,6 +258,21 @@ SELECT tier,
 SELECT CAST(COUNT(*) AS BIGINT) FROM leases
  WHERE tier = @tier AND phase NOT IN ('capacity','done','failed') AND deregistered = 0;
 
+-- name: BumpTierReleases :exec
+-- Advances a tier's release generation, in the transaction that closes one of
+-- its leases (migration 64 says why a generation and not a time).
+INSERT INTO tier_releases (tier, generation) VALUES (@tier, 1)
+ON CONFLICT (tier) DO UPDATE SET generation = tier_releases.generation + 1;
+
+-- name: TierReleases :one
+-- One tier's release generation, zero for a tier none of whose leases has
+-- closed.
+SELECT CAST(COALESCE(MAX(generation), 0) AS BIGINT) FROM tier_releases WHERE tier = @tier;
+
+-- name: ListTierReleases :many
+-- Every tier's release generation.
+SELECT tier, generation FROM tier_releases;
+
 -- name: ListServiceableRunnerLeaseIDs :many
 -- The leases in one tier whose compute a restart should re-adopt.
 --

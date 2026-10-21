@@ -291,6 +291,9 @@ type Listener struct {
 	waitingFor  int
 	demandKnown bool
 	demandAt    time.Time
+	// demandReleases is the tier's release generation read with the runner
+	// count waitingFor was made from (alloc.ActiveRunnersAt).
+	demandReleases int64
 	// observedAt is when GitHub last vouched for observed: a poll sent with the
 	// advertisement withdrawn returned empty. Zero until one has, and again from
 	// any delivery; observedStale is that a delivery's statistics have not been

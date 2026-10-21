@@ -84,18 +84,6 @@ func TestTheResizeGateAsksTheOrderForTheLeasesTier(t *testing.T) {
 		t.Fatalf("Advance: %v", err)
 	}
 
-	gate := &resizeGate{alloc: a}
-	order := &namedWaiter{}
-
-	err = gate.resizeAsking(t.Context(), order, lease.ID, lease.Epoch, "eight", 8, 16*config.GiB)
-	if !errors.Is(err, alloc.ErrNoCapacity) || !strings.Contains(err.Error(), "admission order holds for waiter") {
-		t.Fatalf("a growth into the waiter's room answered %v, want the order's no-capacity", err)
-	}
-
-	if len(order.asked) != 1 || order.asked[0] != "cloud" {
-		t.Errorf("the order was asked about %v, want the lease's own tier once", order.asked)
-	}
-
 	charged := func() int {
 		t.Helper()
 
@@ -107,12 +95,27 @@ func TestTheResizeGateAsksTheOrderForTheLeasesTier(t *testing.T) {
 		return got.VCPU
 	}
 
+	// BOUND, through the route's own entry point, as Schedule leaves it.
+	bound := &resizeGate{alloc: a}
+	order := &namedWaiter{}
+	bound.bind(order)
+
+	err = bound.resize(t.Context(), lease.ID, lease.Epoch, "eight", 8, 16*config.GiB)
+	if !errors.Is(err, alloc.ErrNoCapacity) || !strings.Contains(err.Error(), "admission order holds for waiter") {
+		t.Fatalf("a growth into the waiter's room answered %v, want the order's no-capacity", err)
+	}
+
+	if len(order.asked) != 1 || order.asked[0] != "cloud" {
+		t.Errorf("the order was asked about %v, want the lease's own tier once", order.asked)
+	}
+
 	if got := charged(); got != 4 {
 		t.Errorf("the refused growth left the lease charged %d vCPU, want 4", got)
 	}
 
 	// UNBOUND, the store's budget alone answers, and it allows this growth.
-	if err := gate.resize(t.Context(), lease.ID, lease.Epoch, "eight", 8, 16*config.GiB); err != nil {
+	unbound := &resizeGate{alloc: a}
+	if err := unbound.resize(t.Context(), lease.ID, lease.Epoch, "eight", 8, 16*config.GiB); err != nil {
 		t.Fatalf("the unbound gate refused a growth the budget allows: %v", err)
 	}
 
@@ -249,54 +252,5 @@ func TestServeWireHandsTheResizeRouteTheGateItKeeps(t *testing.T) {
 	if kept != passed {
 		t.Errorf("ServeWire hands the route %q's resize and keeps %q on the wire, so Schedule binds a gate "+
 			"the route never asks", passed, kept)
-	}
-}
-
-// A BOUND GATE ASKS THE ORDER IT HOLDS. TestTheResizeGateAsksTheOrderForTheLeasesTier
-// drives resizeAsking with a stand-in order; this holds the call that reaches
-// it once Schedule has bound the server: resize hands resizeAsking exactly the
-// order it loaded, so a bound gate never answers with the store's Resize alone.
-func TestABoundResizeGateAsksTheOrderItLoaded(t *testing.T) {
-	t.Parallel()
-
-	resize := findMethod(t, "resizeGate", "resize")
-
-	var loaded, asked string
-
-	ast.Inspect(resize, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.AssignStmt:
-			if len(n.Lhs) != 1 || len(n.Rhs) != 1 {
-				return true
-			}
-
-			if call, ok := n.Rhs[0].(*ast.CallExpr); ok && calleeName(call) == "Load" {
-				if id, ok := n.Lhs[0].(*ast.Ident); ok {
-					loaded = id.Name
-				}
-			}
-		case *ast.ReturnStmt:
-			for _, result := range n.Results {
-				call, ok := result.(*ast.CallExpr)
-				if !ok || calleeName(call) != "resizeAsking" || len(call.Args) < 2 {
-					continue
-				}
-
-				if id, ok := call.Args[1].(*ast.Ident); ok {
-					asked = id.Name
-				}
-			}
-		}
-
-		return true
-	})
-
-	if loaded == "" {
-		t.Fatal("resize never loads the bound order")
-	}
-
-	if asked != loaded {
-		t.Errorf("resize returns resizeAsking with %q, want the order it loaded (%q): a bound gate must ask it",
-			asked, loaded)
 	}
 }

@@ -156,50 +156,6 @@ func (q *Queries) BackfillFailureReason(ctx context.Context, arg BackfillFailure
 	return err
 }
 
-const lastFinishedPerTier = `-- name: LastFinishedPerTier :many
-SELECT tier, CAST(MAX(finished_at) AS TEXT) AS finished_at
-  FROM job_history
- WHERE finished_at >= $1
- GROUP BY tier
-`
-
-type LastFinishedPerTierRow struct {
-	Tier       string
-	FinishedAt string
-}
-
-// When each tier's newest lease closed, among those closed since a time.
-//
-// WHAT A DRAIN HOLDS A LISTENER'S COUNT AGAINST. The count is GitHub's
-// assigned work less the runners covering it, and a lease released after the
-// count was taken may have been one of those runners: a ledger gone quiet beside
-// that count would read as drained while the job it covered waits. Every
-// terminalization archives here, so a count dated before a tier's newest close
-// is not trusted. Bounded below by the seal, which is as far back as a drain
-// asks.
-func (q *Queries) LastFinishedPerTier(ctx context.Context, since sql.NullString) ([]LastFinishedPerTierRow, error) {
-	rows, err := q.db.QueryContext(ctx, lastFinishedPerTier, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []LastFinishedPerTierRow
-	for rows.Next() {
-		var i LastFinishedPerTierRow
-		if err := rows.Scan(&i.Tier, &i.FinishedAt); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listAttributedFailures = `-- name: ListAttributedFailures :many
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
        result, failure_reason, disruption, disrupted_at, result_at

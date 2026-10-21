@@ -91,6 +91,18 @@ func (q *Queries) BindLease(ctx context.Context, arg BindLeaseParams) error {
 	return err
 }
 
+const bumpTierReleases = `-- name: BumpTierReleases :exec
+INSERT INTO tier_releases (tier, generation) VALUES ($1, 1)
+ON CONFLICT (tier) DO UPDATE SET generation = tier_releases.generation + 1
+`
+
+// Advances a tier's release generation, in the transaction that closes one of
+// its leases (migration 64 says why a generation and not a time).
+func (q *Queries) BumpTierReleases(ctx context.Context, tier string) error {
+	_, err := q.db.ExecContext(ctx, bumpTierReleases, tier)
+	return err
+}
+
 const countActiveRunnerLeases = `-- name: CountActiveRunnerLeases :one
 SELECT CAST(COUNT(*) AS BIGINT) FROM leases
  WHERE tier = $1 AND phase NOT IN ('capacity','done','failed') AND deregistered = 0
@@ -553,6 +565,34 @@ func (q *Queries) ListServiceableRunnerLeaseIDs(ctx context.Context, tier string
 	return items, nil
 }
 
+const listTierReleases = `-- name: ListTierReleases :many
+SELECT tier, generation FROM tier_releases
+`
+
+// Every tier's release generation.
+func (q *Queries) ListTierReleases(ctx context.Context) ([]TierRelease, error) {
+	rows, err := q.db.QueryContext(ctx, listTierReleases)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TierRelease
+	for rows.Next() {
+		var i TierRelease
+		if err := rows.Scan(&i.Tier, &i.Generation); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markLeaseDeregistered = `-- name: MarkLeaseDeregistered :exec
 UPDATE leases SET deregistered = 1 WHERE id = $1
 `
@@ -902,6 +942,19 @@ type SetLeasePhaseParams struct {
 func (q *Queries) SetLeasePhase(ctx context.Context, arg SetLeasePhaseParams) error {
 	_, err := q.db.ExecContext(ctx, setLeasePhase, arg.Phase, arg.ID, arg.Epoch)
 	return err
+}
+
+const tierReleases = `-- name: TierReleases :one
+SELECT CAST(COALESCE(MAX(generation), 0) AS BIGINT) FROM tier_releases WHERE tier = $1
+`
+
+// One tier's release generation, zero for a tier none of whose leases has
+// closed.
+func (q *Queries) TierReleases(ctx context.Context, tier string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, tierReleases, tier)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const totalUsage = `-- name: TotalUsage :one

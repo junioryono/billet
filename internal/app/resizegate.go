@@ -20,7 +20,7 @@ import (
 // answer.
 type resizeGate struct {
 	alloc *alloc.Allocator
-	order atomic.Pointer[server.Server]
+	bound atomic.Pointer[boundOrder]
 }
 
 // resizeOrder is what the gate asks: the waiters a lease of tier must leave
@@ -29,16 +29,24 @@ type resizeOrder interface {
 	ResizeAdmission(ctx context.Context, tier string) []string
 }
 
+var _ resizeOrder = (*server.Server)(nil)
+
+// boundOrder carries the order the gate was bound to.
+type boundOrder struct{ order resizeOrder }
+
+// bind makes every later resize ask order.
+func (g *resizeGate) bind(order resizeOrder) { g.bound.Store(&boundOrder{order: order}) }
+
 // resize is the route's nodeplane.Resizer.
 func (g *resizeGate) resize(ctx context.Context, leaseID string, epoch int64, instanceType string,
 	vcpu int, memory config.ByteSize,
 ) error {
-	order := g.order.Load()
-	if order == nil {
+	bound := g.bound.Load()
+	if bound == nil {
 		return g.alloc.Resize(ctx, leaseID, epoch, instanceType, vcpu, memory)
 	}
 
-	return g.resizeAsking(ctx, order, leaseID, epoch, instanceType, vcpu, memory)
+	return g.resizeAsking(ctx, bound.order, leaseID, epoch, instanceType, vcpu, memory)
 }
 
 // resizeAsking grows a lease leaving room for the waiters order names for its

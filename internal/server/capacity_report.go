@@ -47,8 +47,8 @@ func (l *Listener) publishCapacity(ctx context.Context, sent *int, exchange stri
 	// GITHUB'S DEMAND AS COUNTED, whatever the order made of it: a drain reads
 	// this to say whether assigned work is still waiting (#140).
 	if l.demandKnown {
-		unstarted := l.waitingFor
-		report.Unstarted = &unstarted
+		unstarted, releases := l.waitingFor, l.demandReleases
+		report.Unstarted, report.UnstartedReleases = &unstarted, &releases
 
 		// UNDATED UNTIL GITHUB HAS VOUCHED FOR IT under a withdrawn
 		// advertisement, which a drain reads as a count from before its seal.

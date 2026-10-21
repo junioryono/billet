@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"time"
 
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
@@ -58,11 +57,18 @@ type ListenerCapacity struct {
 	// the field, never none, because a drain reads it to say whether assigned
 	// work is still waiting (#140).
 	Unstarted *int `json:"unstarted,omitempty"`
-	// UnstartedAt is when Unstarted was counted, which is not when the
-	// observation was written: a listener republishes its last count at every
-	// poll, including polls on which it could not count again, so the
-	// observation's own date would make an old count look new.
+	// UnstartedAt is when GitHub last vouched for the statistics Unstarted was
+	// counted from (an empty exchange sent with the advertisement withdrawn),
+	// which is not when the observation was written: a listener republishes its
+	// last count at every poll, so the observation's own date would make an old
+	// count look new. Empty when nothing has vouched for it.
 	UnstartedAt string `json:"unstarted_at,omitempty"`
+	// UnstartedReleases is the tier's release generation (TierReleases) read
+	// with the runner count Unstarted was made from. A drain trusts the count
+	// only while the generation has not moved: a lease closed since may have
+	// been a runner the count had covering a job. Nil from a control plane
+	// older than the field, which a drain trusts no count from.
+	UnstartedReleases *int64 `json:"unstarted_releases,omitempty"`
 }
 
 // RecordListenerCapacity publishes the listener's ownership for another process.
@@ -225,26 +231,21 @@ func (out *TierCapacity) countLaunched(phase Phase, member PoolRunner, found boo
 	}
 }
 
-// LastReleases is when each tier's newest lease closed, among those closed at
-// or after since. A drain holds a listener's count against it: a lease released
-// after the count was taken may have been a runner the count had covering an
-// assigned job.
-func (a *Allocator) LastReleases(ctx context.Context, since time.Time) (map[string]time.Time, error) {
-	out := map[string]time.Time{}
+// TierReleases is every tier's release generation: how many of its leases have
+// closed, advanced in each close's own transaction. A tier none of whose leases
+// has closed is absent, which is generation zero. A drain holds a listener's
+// count against it, since a lease released after the count was read may have
+// been a runner the count had covering an assigned job.
+func (a *Allocator) TierReleases(ctx context.Context) (map[string]int64, error) {
+	out := map[string]int64{}
 	err := a.db.View(ctx, func(tx querier) error {
-		rows, err := state.ReadQueries(tx).LastFinishedPerTier(ctx, sql.NullString{String: ts(since), Valid: true})
+		rows, err := state.ReadQueries(tx).ListTierReleases(ctx)
 		if err != nil {
-			return fmt.Errorf("alloc: read when each tier's leases last closed: %w", err)
+			return fmt.Errorf("alloc: read each tier's release generation: %w", err)
 		}
 
 		for _, row := range rows {
-			at, err := time.Parse(timestampFormat, row.FinishedAt)
-			if err != nil {
-				return fmt.Errorf("alloc: tier %s's leases last closed at %q, which is not a time the "+
-					"ledger writes: %w", row.Tier, row.FinishedAt, err)
-			}
-
-			out[row.Tier] = at
+			out[row.Tier] = row.Generation
 		}
 
 		return nil

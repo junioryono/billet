@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -314,18 +315,38 @@ func publishDemandAt(t *testing.T, db *state.DB, cfg *config.Config, tier string
 ) {
 	t.Helper()
 
+	if err := recordDemand(t.Context(), db, cfg, tier, unstarted, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// recordDemand is publishDemandAt answering with its error, for a goroutine.
+func recordDemand(ctx context.Context, db *state.DB, cfg *config.Config, tier string, unstarted *int,
+	at time.Time,
+) error {
 	a, err := alloc.New(db, alloc.Limits{
 		MaxVCPU: cfg.Server.MaxVCPU, MaxMemory: cfg.Server.MaxMemory, Nodes: cfg.NodePolicies(),
 	}, cfg.Tiers)
 	if err != nil {
-		t.Fatalf("allocator: %v", err)
+		return fmt.Errorf("allocator: %w", err)
 	}
 
-	if err := a.RecordListenerCapacity(t.Context(), tier, alloc.ListenerCapacity{
-		Exchange: "confirmed", Unstarted: unstarted, UnstartedAt: at.UTC().Format(time.RFC3339Nano),
-	}); err != nil {
-		t.Fatalf("record %s's observation: %v", tier, err)
+	// READ WITH THE COUNT, as a listener reads it beside its runner count.
+	releases, err := a.TierReleases(ctx)
+	if err != nil {
+		return fmt.Errorf("TierReleases: %w", err)
 	}
+
+	seen := releases[tier]
+
+	if err := a.RecordListenerCapacity(ctx, tier, alloc.ListenerCapacity{
+		Exchange: "confirmed", Unstarted: unstarted, UnstartedAt: at.UTC().Format(time.RFC3339Nano),
+		UnstartedReleases: &seen,
+	}); err != nil {
+		return fmt.Errorf("record %s's observation: %w", tier, err)
+	}
+
+	return nil
 }
 
 // drainWait runs `billet drain --wait` and returns what it printed.
@@ -491,8 +512,48 @@ func TestADrainDoesNotTrustACountTakenBeforeALeaseClosed(t *testing.T) {
 
 	if strings.Contains(out, "Drained") ||
 		!strings.Contains(out, cfg.Tiers[0].Label+": unknown (last counted at") ||
-		!strings.Contains(out, "before one of its leases closed at") {
+		!strings.Contains(out, "before 1 more of its leases closed") {
 		t.Errorf("a drain trusted a count taken before a lease of its tier closed:\n%s", out)
+	}
+}
+
+// AND NOT ONE THAT DOES NOT SAY WHICH CLOSES IT SAW: a control plane older than
+// the generation publishes a count without it, and a drain cannot tell whether
+// a lease closed since.
+func TestADrainDoesNotTrustACountWithoutItsReleases(t *testing.T) {
+	db, cfgPath := drainFixture(t)
+	cfg := loadFixtureConfig(t, cfgPath)
+
+	none := 0
+	for i := range cfg.Tiers {
+		publishDemand(t, db, cfg, cfg.Tiers[i].Label, &none)
+	}
+
+	a, err := alloc.New(db, alloc.Limits{
+		MaxVCPU: cfg.Server.MaxVCPU, MaxMemory: cfg.Server.MaxMemory, Nodes: cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		t.Fatalf("allocator: %v", err)
+	}
+
+	older := cfg.Tiers[0].Label
+	if err := a.RecordListenerCapacity(t.Context(), older, alloc.ListenerCapacity{
+		Exchange: "confirmed", Unstarted: &none,
+		UnstartedAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("record %s's observation: %v", older, err)
+	}
+
+	saved := demandCountWithin
+	demandCountWithin = time.Second
+
+	t.Cleanup(func() { demandCountWithin = saved })
+
+	out := drainWait(t, cfgPath)
+
+	if strings.Contains(out, "Drained") ||
+		!strings.Contains(out, older+": unknown (its listener does not say which of its leases had closed") {
+		t.Errorf("a drain trusted a count that does not say which closes it saw:\n%s", out)
 	}
 }
 
@@ -613,6 +674,15 @@ func TestDrainWaitReturnsOnceTheRunningWorkIsReleased(t *testing.T) {
 		if err := a.Release(context.WithoutCancel(ctx), lease.ID, lease.Epoch,
 			alloc.PhaseDone); err != nil {
 			t.Errorf("Release: %v", err)
+		}
+
+		// AND THE LISTENERS COUNT AGAIN, as they do within a poll of a close: the
+		// counts above were read before it, and a drain trusts none of those.
+		for i := range cfg.Tiers {
+			if err := recordDemand(context.WithoutCancel(ctx), db, cfg, cfg.Tiers[i].Label, &none,
+				time.Now().Add(time.Hour)); err != nil {
+				t.Errorf("count %s again: %v", cfg.Tiers[i].Label, err)
+			}
 		}
 	}()
 

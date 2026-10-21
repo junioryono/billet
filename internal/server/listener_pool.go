@@ -43,7 +43,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	if err != nil {
 		return fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
 	}
-	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
+	active, releases, err := l.alloc.ActiveRunnersAt(ctx, l.tier)
 	if err != nil {
 		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
 	}
@@ -126,8 +126,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	counted := true
 
 	if launched {
-		if recount, err := l.alloc.ActiveRunnerLeases(ctx, l.tier); err == nil {
-			active = recount
+		if recount, at, err := l.alloc.ActiveRunnersAt(ctx, l.tier); err == nil {
+			active, releases = recount, at
 		} else {
 			counted = false
 
@@ -145,6 +145,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	// be counted as none under a date after it (observedAt).
 	l.mu.Lock()
 	l.waitingFor, l.demandKnown, l.demandAt = max(desired-active, 0), counted, l.observedAt
+	l.demandReleases = releases
 	l.mu.Unlock()
 
 	// A TIER THAT COULD NOT GROW WHATEVER ANYONE FREED DOES NOT HOLD THE LINE.
@@ -213,7 +214,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 // changed, under the date the count already carries; a recount that cannot be
 // read leaves it unknown.
 func (l *Listener) recountDemand(ctx context.Context, desired int) {
-	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
+	active, releases, err := l.alloc.ActiveRunnersAt(ctx, l.tier)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -224,7 +225,7 @@ func (l *Listener) recountDemand(ctx context.Context, desired int) {
 		return
 	}
 
-	l.waitingFor, l.demandKnown = max(desired-active, 0), true
+	l.waitingFor, l.demandKnown, l.demandReleases = max(desired-active, 0), true, releases
 }
 
 // poolLaunchBatch is how many pool members one pass starts at once on a tier
