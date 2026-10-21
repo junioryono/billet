@@ -161,7 +161,7 @@ func TestAMicroVMSurvivesTheBinaryBeingUpgradedUnderIt(t *testing.T) {
 	}
 
 	upgraded, err := New(testDeployment, h.p.cfg, h.disk,
-		withRunner(h.record))
+		withRunner(h.record), withAPIAs(answeringAsAnyone))
 	if err != nil {
 		t.Fatalf("New after the upgrade: %v", err)
 	}

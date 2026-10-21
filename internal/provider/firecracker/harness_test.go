@@ -605,7 +605,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 
 	// AND IT ANSWERS AS THE TEST'S ACCOUNT, not a jail uid, so the uid check on its
 	// connections has its own test (vmmexe_linux_test.go).
-	h.p.apiAs = func(socket string, _ int) *vmmAPI { return h.p.apiFor(socket) }
+	h.p.apiAs = answeringAsAnyone
 
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
 	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
@@ -848,3 +848,7 @@ func (v *fakeVMM) writeSnapshot(body map[string]any) error {
 
 	return nil
 }
+
+// answeringAsAnyone is the VMM client for fake VMMs, which answer as the test's own
+// account rather than a jail uid.
+func answeringAsAnyone(socket string, _ int) *vmmAPI { return newVMMAPI(socket) }
