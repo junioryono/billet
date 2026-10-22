@@ -19,7 +19,7 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 		{fn: "serveControlPlane", role: "server", block: "Server", before: "BecomeController",
 			sources: []string{"LedgerMetrics", "GitHubMetrics"}},
 		{fn: "cmdNode", role: "node", block: "Node", before: "Run",
-			sources: []string{"UsageMetrics", "KernelMappingMetrics"}},
+			sources: []string{"UsageMetrics", "KernelMappingMetrics", "GitMetrics"}},
 	} {
 		t.Run(c.fn, func(t *testing.T) {
 			body := findFunc(t, c.fn).Body.List
