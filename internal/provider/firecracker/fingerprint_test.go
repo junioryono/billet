@@ -12,8 +12,22 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/provider"
 )
+
+// changeTime is a file's change time, in nanoseconds.
+func changeTime(t *testing.T, path string) int64 {
+	t.Helper()
+
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
+
+	return unix.TimespecToNsec(st.Ctim)
+}
 
 // A HOST'S CPU IS ITS IDENTITY AND ITS FEATURES, read the same however the cores are
 // listed: two cores reporting the same flags in a different order are one CPU, and a
@@ -140,9 +154,28 @@ func TestALinkMadeWhileAFileIsDigestedIsNotAChange(t *testing.T) {
 		{"a hard link, as a launch makes", func(t *testing.T, path string) {
 			t.Helper()
 
-			if err := os.Link(path, path+".jailed"); err != nil {
-				t.Fatal(err)
+			// THE CHANGE TIME MUST ACTUALLY MOVE, or the old check passes too: a link
+			// in the same timestamp tick as the write leaves it where it was, so the
+			// link is made again across ticks until it has moved.
+			before := changeTime(t, path)
+
+			for range 200 {
+				if err := os.Remove(path + ".jailed"); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+
+				if err := os.Link(path, path+".jailed"); err != nil {
+					t.Fatal(err)
+				}
+
+				if changeTime(t, path) != before {
+					return
+				}
+
+				time.Sleep(10 * time.Millisecond)
 			}
+
+			t.Fatal("linking the file never moved its change time, so this case would prove nothing")
 		}, false},
 		{"a write of more bytes", func(t *testing.T, path string) {
 			t.Helper()
