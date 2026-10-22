@@ -57,7 +57,11 @@ var errSnapshotNotPublished = errors.New("not a published snapshot")
 // AND NEVER BY COPY. A copy would lose the shared page cache and write gigabytes per
 // restore, and a source on another filesystem than the jails is a deployment billet
 // refuses rather than one it quietly makes slow.
-func (p *Provider) placeSnapshot(j jail, name, kernel string, spec provider.Spec) error {
+//
+// THE EVIDENCE AGAIN, through the directory the files are linked from: goldenOf
+// checked it before anything was claimed, by name, and the name could hold another
+// snapshot by now.
+func (p *Provider) placeSnapshot(j jail, name, kernel string, spec provider.Spec, want Evidence) error {
 	if err := checkSnapshotName(name); err != nil {
 		return err
 	}
@@ -79,7 +83,7 @@ func (p *Provider) placeSnapshot(j jail, name, kernel string, spec provider.Spec
 	// WHERE IT CAN RUN, BEFORE ANYTHING IS LINKED: a snapshot taken on another CPU,
 	// host kernel, Firecracker build or guest kernel is refused here, because the
 	// VMM would load it and the guest would misbehave after it resumed.
-	if err := p.checkCompatibility(dir, kernel, spec); err != nil {
+	if err := p.checkCompatibility(dir, kernel, spec, want); err != nil {
 		return err
 	}
 
@@ -308,10 +312,15 @@ func (p *Provider) restoreInto(
 	return &Instance{ID: spec.Name, Name: spec.Name, Running: true}, nil
 }
 
-// checkCompatibility refuses a snapshot whose record does not match this host.
-func (p *Provider) checkCompatibility(dir *os.File, kernel string, spec provider.Spec) error {
+// checkCompatibility refuses a snapshot whose record does not match this host, or
+// is not the golden want names.
+func (p *Provider) checkCompatibility(dir *os.File, kernel string, spec provider.Spec, want Evidence) error {
 	record, err := readCompatibility(dir, filepath.Join(dir.Name(), compatibilityFile))
 	if err != nil {
+		return err
+	}
+
+	if err := record.expected(want, p.owner, dir.Name()); err != nil {
 		return err
 	}
 
@@ -349,7 +358,10 @@ func (p *Provider) checkCompatibility(dir *os.File, kernel string, spec provider
 // describes the disk its memory was taken with, so the disk is the record's, and a
 // caller's image only has to name the same image, which keeps a golden built from
 // one image from being restored under a tier of another.
-func (p *Provider) goldenOf(name string, spec provider.Spec) (compatibility, error) {
+//
+// AND THE SNAPSHOT MUST BE THE GOLDEN THE CALLER EXPECTS (want), checked here so a
+// snapshot of another deployment or other bytes claims nothing.
+func (p *Provider) goldenOf(name string, spec provider.Spec, want Evidence) (compatibility, error) {
 	if err := checkSnapshotName(name); err != nil {
 		return compatibility{}, err
 	}
@@ -382,6 +394,10 @@ func (p *Provider) goldenOf(name string, spec provider.Spec) (compatibility, err
 	if asked, _, _ := strings.Cut(spec.Image, "@"); asked != recorded {
 		return compatibility{}, fmt.Errorf("firecracker: %w: %s was captured from %s, and the restore "+
 			"names %s", errSnapshotIncompatible, dir.Name(), bounded(record.Image), bounded(spec.Image))
+	}
+
+	if err := record.expected(want, p.owner, dir.Name()); err != nil {
+		return compatibility{}, err
 	}
 
 	return record, nil

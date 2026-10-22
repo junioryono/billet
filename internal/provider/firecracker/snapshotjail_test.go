@@ -1,6 +1,8 @@
 package firecracker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -55,6 +57,9 @@ func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compati
 
 	record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
 	record.Image, record.Disk = aRestoreSpec().Image, testGoldenDisk
+	record.Deployment, record.Builder = h.p.owner, theLease
+	record.StateDigest = digestOf("captured " + snapshotStateFile)
+	record.MemoryDigest = digestOf("captured " + snapshotMemoryFile)
 
 	edit(&record)
 
@@ -77,8 +82,26 @@ func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compati
 	}
 }
 
-// testGoldenDisk is the system disk every staged snapshot names.
-const testGoldenDisk = "golden-gold-1@" + fakeGeneration
+// testGoldenDisk is the system disk every staged snapshot names: the one a capture
+// of theInstance publishes.
+const testGoldenDisk = goldenDiskPrefix + theLease + "@" + fakeGeneration
+
+// digestOf is the digest a capture records for a file holding content.
+func digestOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// theEvidence is what a capture on this harness would have answered for a snapshot
+// publish wrote, worked out from what publish writes rather than read from the
+// record a restore is checked against.
+func (h *harness) theEvidence() Evidence {
+	return Evidence{
+		Deployment: h.p.owner, Builder: theLease, Disk: testGoldenDisk,
+		State: digestOf("captured " + snapshotStateFile), Memory: digestOf("captured " + snapshotMemoryFile),
+	}
+}
 
 // aRestoreSpec is a restore that should succeed: a launch's spec with the disk size
 // the snapshot already has.
@@ -89,8 +112,17 @@ func aRestoreSpec() provider.Spec {
 	return spec
 }
 
-// restoreWith runs Restore against a fake VMM and returns it.
+// restoreWith runs Restore against a fake VMM, expecting theEvidence, and returns it.
 func (h *harness) restoreWith(t *testing.T, snapshot string) (*provider.Instance, *fakeVMM, error) {
+	t.Helper()
+
+	return h.restoreExpecting(t, snapshot, h.theEvidence())
+}
+
+// restoreExpecting runs Restore against a fake VMM, expecting want, and returns it.
+func (h *harness) restoreExpecting(
+	t *testing.T, snapshot string, want Evidence,
+) (*provider.Instance, *fakeVMM, error) {
 	t.Helper()
 
 	var vmm *fakeVMM
@@ -99,7 +131,7 @@ func (h *harness) restoreWith(t *testing.T, snapshot string) (*provider.Instance
 	h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
 	h.mu.Unlock()
 
-	inst, err := h.p.Restore(t.Context(), aRestoreSpec(), snapshot)
+	inst, err := h.p.Restore(t.Context(), aRestoreSpec(), snapshot, want)
 
 	return inst, vmm, err
 }
@@ -369,7 +401,7 @@ func TestARestoreRefusesToGrowTheRootDisk(t *testing.T) {
 	spec := aRestoreSpec()
 	spec.Disk = aSpec().Disk
 
-	if _, err := h.p.Restore(t.Context(), spec, "gold-1"); err == nil ||
+	if _, err := h.p.Restore(t.Context(), spec, "gold-1", h.theEvidence()); err == nil ||
 		!strings.Contains(err.Error(), "keeps the size the snapshot was taken at") {
 		t.Fatalf("Restore with a disk size = %v, want the refusal", err)
 	}
@@ -544,7 +576,7 @@ func TestARestoreRefusesALoadedGuestLargerThanItWasAdmittedFor(t *testing.T) {
 	}
 	h.mu.Unlock()
 
-	_, err := h.p.Restore(t.Context(), aRestoreSpec(), "gold-1")
+	_, err := h.p.Restore(t.Context(), aRestoreSpec(), "gold-1", h.theEvidence())
 	if !errors.Is(err, errNotRestorable) {
 		t.Fatalf("Restore of a guest larger than admitted = %v, want errNotRestorable", err)
 	}

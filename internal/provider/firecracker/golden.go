@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/junioryono/billet/internal/provider"
 )
 
 // goldenDiskPrefix begins the name of a golden's system disk. It is the store's
@@ -40,15 +41,22 @@ func (p *Provider) goldens() (goldenDisk, error) {
 	return disk, nil
 }
 
-// goldenNameFor is the name of the system disk a snapshot's golden is published
-// under, refused when it could not be one image name.
-func goldenNameFor(snapshot string) (string, error) {
-	if strings.ContainsAny(snapshot, "@/") || strings.TrimSpace(snapshot) != snapshot {
-		return "", fmt.Errorf("firecracker: %w: %s cannot name a golden's system disk", errSnapshotNotPublished,
-			bounded(snapshot))
+// goldenNameFor is the name of the system disk the microVM id's golden is published
+// under: the prefix and the builder's lease id.
+//
+// THE LEASE, NOT THE SNAPSHOT'S NAME. A snapshot is named by whoever captures it and
+// its store is this node's, but the cache pool is shared by every node of a site and
+// can be by several deployments, so two captures named alike would claim one disk.
+// A lease id is 32 random hex characters, the derivation that keeps root clones
+// (billet-<lease>) apart, and the record names the disk for the restore that needs it.
+func goldenNameFor(id string) (string, error) {
+	lease, ok := provider.LeaseOf(id)
+	if !ok {
+		return "", fmt.Errorf("firecracker: %s does not name a lease, so it is not a microVM billet started",
+			bounded(id))
 	}
 
-	return goldenDiskPrefix + snapshot, nil
+	return goldenDiskPrefix + lease, nil
 }
 
 // flushDevice writes a mapped root disk's dirty host pages back to the device.

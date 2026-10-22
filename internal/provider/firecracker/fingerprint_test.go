@@ -315,6 +315,9 @@ func hostRecordAnd(edit func([]byte) []byte) func(*testing.T, *harness, string) 
 
 		record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
 		record.Image, record.Disk = aRestoreSpec().Image, testGoldenDisk
+		record.Deployment, record.Builder = h.p.owner, theLease
+		record.StateDigest = digestOf("captured " + snapshotStateFile)
+		record.MemoryDigest = digestOf("captured " + snapshotMemoryFile)
 
 		raw, err := json.Marshal(record)
 		if err != nil {
@@ -387,7 +390,7 @@ func TestPlaceSnapshotLinksNothingForASnapshotTakenElsewhere(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := h.p.placeSnapshot(j, "gold-1", h.p.cfg.KernelImage, aRestoreSpec())
+	err := h.p.placeSnapshot(j, "gold-1", h.p.cfg.KernelImage, aRestoreSpec(), h.theEvidence())
 	if !errors.Is(err, errSnapshotIncompatible) {
 		t.Fatalf("placeSnapshot = %v, want errSnapshotIncompatible", err)
 	}
@@ -417,7 +420,7 @@ func TestARestoreRefusesASpecOfAnotherShape(t *testing.T) {
 			h := newHarness(t)
 			publish(t, h, "gold-1", 0o444)
 
-			_, err := h.p.Restore(t.Context(), spec(), "gold-1")
+			_, err := h.p.Restore(t.Context(), spec(), "gold-1", h.theEvidence())
 			if !errors.Is(err, errSnapshotIncompatible) {
 				t.Fatalf("Restore = %v, want errSnapshotIncompatible", err)
 			}

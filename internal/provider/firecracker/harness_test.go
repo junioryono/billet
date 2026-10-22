@@ -313,6 +313,9 @@ type fakeDisk struct {
 	publishErr     error
 	withdrawErr    error
 	cloneGoldenErr error
+	// onCloneGolden runs inside CloneGolden, after the restore read the snapshot's
+	// record and before it links the snapshot, so a test can change it in between.
+	onCloneGolden func()
 }
 
 // fakeGeneration is the generation every fake publication answers.
@@ -342,6 +345,14 @@ func (d *fakeDisk) WithdrawRoot(_ context.Context, ref, name string) error {
 }
 
 func (d *fakeDisk) CloneGolden(_ context.Context, ref, name string) (string, error) {
+	d.mu.Lock()
+	hook := d.onCloneGolden
+	d.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 

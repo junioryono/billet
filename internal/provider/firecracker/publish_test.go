@@ -45,7 +45,8 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 	}
 	vmm.mu.Unlock()
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err != nil {
+	evidence, err := h.p.Capture(t.Context(), theInstance, "gold-1")
+	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
 
@@ -98,10 +99,18 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 
 	host, err := h.p.hostCompatibility(guest)
 	host.VCPUs, host.Memory = aSpec().VCPU, int64(aSpec().Memory)
-	host.Image, host.Disk = aSpec().Image, "golden-gold-1@"+fakeGeneration
+	host.Image, host.Disk = aSpec().Image, testGoldenDisk
+	// THE EVIDENCE, worked out from what the VMM wrote and who captured it.
+	host.Deployment, host.Builder = h.p.owner, theLease
+	host.StateDigest = digestOf("written by the VMM at /" + captureStateFile)
+	host.MemoryDigest = digestOf("written by the VMM at /" + captureMemoryFile)
 
 	if err != nil || record != host {
 		t.Errorf("the published record = %+v (%v), want this host's %+v", record, err, host)
+	}
+
+	if evidence != host.evidence() {
+		t.Errorf("Capture answered the evidence %+v, want %+v", evidence, host.evidence())
 	}
 
 	// THE SYSTEM DISK, FLUSHED AND PUBLISHED AS THE GOLDEN'S, from the device and
@@ -115,22 +124,23 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 	}
 
 	if published, withdrawn, _ := h.disk.goldenCalls(); !slices.Equal(published,
-		[]string{theInstance + " -> golden-gold-1@" + fakeGeneration}) || len(withdrawn) != 0 {
+		[]string{theInstance + " -> " + testGoldenDisk}) || len(withdrawn) != 0 {
 		t.Errorf("the disk was published %v and withdrawn %v, want the builder's clone published once",
 			published, withdrawn)
 	}
 
-	// AND IT RESTORES, as another lease, onto a clone of that disk.
+	// AND IT RESTORES, as another lease, onto a clone of that disk, given the
+	// evidence the capture answered.
 	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("Destroy the golden: %v", err)
 	}
 
-	if _, _, err := h.restoreWith(t, "gold-1"); err != nil {
+	if _, _, err := h.restoreExpecting(t, "gold-1", evidence); err != nil {
 		t.Errorf("a published capture would not restore: %v", err)
 	}
 
 	if _, _, cloned := h.disk.goldenCalls(); len(cloned) != 1 ||
-		!strings.HasPrefix(cloned[0], "golden-gold-1@"+fakeGeneration+" -> ") {
+		!strings.HasPrefix(cloned[0], testGoldenDisk+" -> ") {
 		t.Errorf("the restore cloned %v, want the golden's system disk", cloned)
 	}
 }
@@ -146,7 +156,7 @@ func TestACaptureNeverReplacesAnEmptyDirectoryOfTheSameName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
 		t.Fatal("Capture replaced a directory already under its name")
 	}
 
@@ -166,7 +176,7 @@ func TestACaptureThatCannotDescribeTheHostLeavesTheGuestRunning(t *testing.T) {
 	_, vmm := h.launch(t)
 	h.p.hostKernel = func() (string, error) { return "", errors.New("uname: not permitted") }
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
 		t.Fatal("Capture succeeded without describing the host")
 	}
 
@@ -189,7 +199,7 @@ func TestACaptureNeverReplacesAPublishedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = h.p.Capture(t.Context(), theInstance, "gold-1")
+	_, err = h.p.Capture(t.Context(), theInstance, "gold-1")
 	if err == nil || !strings.Contains(err.Error(), "already published") {
 		t.Fatalf("Capture over a published name = %v, want a refusal", err)
 	}
@@ -263,7 +273,7 @@ func TestACaptureRefusesWhatTheVMMLeftThatIsNotAFile(t *testing.T) {
 			vmm.onCreate = func(root string) { tamper(t, root) }
 			vmm.mu.Unlock()
 
-			if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
+			if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
 				t.Fatal("Capture published what the VMM left in place of its memory")
 			}
 
@@ -317,7 +327,7 @@ func TestACaptureRefusesAJailKernelThatIsNotBillets(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
+		if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
 			t.Errorf("Capture recorded %s in place of the jail's kernel", name)
 		}
 
@@ -335,7 +345,7 @@ func TestACaptureRefusesAJailOfAnotherVMMBuild(t *testing.T) {
 	_, vmm := h.launch(t)
 	h.p.execName = "firecracker-v1.17.0"
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
 		t.Fatal("Capture took a jail no restore here could load")
 	}
 
@@ -399,7 +409,7 @@ func TestARestoredMicroVMCanBeCapturedWithoutTouchingItsSnapshot(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-2"); err != nil {
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-2"); err != nil {
 		t.Fatalf("Capture of a restored microVM: %v", err)
 	}
 
@@ -428,7 +438,7 @@ func TestACaptureRefusesAVMMRunningAReplacedBuild(t *testing.T) {
 
 	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(older) }
 
-	err := h.p.Capture(t.Context(), theInstance, "gold-1")
+	_, err := h.p.Capture(t.Context(), theInstance, "gold-1")
 	if !errors.Is(err, errSnapshotIncompatible) {
 		t.Fatalf("Capture = %v, want errSnapshotIncompatible", err)
 	}
@@ -463,7 +473,7 @@ func TestACaptureRefusesFilesLargerThanItsGuestCouldWrite(t *testing.T) {
 			}
 			vmm.mu.Unlock()
 
-			err := h.p.Capture(t.Context(), theInstance, "gold-1")
+			_, err := h.p.Capture(t.Context(), theInstance, "gold-1")
 			if err == nil || !strings.Contains(err.Error(), "more than") {
 				t.Fatalf("Capture = %v, want a refusal for its size", err)
 			}
@@ -489,7 +499,7 @@ func TestACaptureRefusesAJailWithNoRecordedShape(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
 		t.Fatal("Capture took a microVM with no recorded size")
 	}
 
@@ -531,7 +541,7 @@ func TestACaptureCopyStopsWhenCanceled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = h.p.copyOut(ctx, root, staging, captureMemoryFile, snapshotMemoryFile, 1<<20, j, res)
+	_, err = h.p.copyOut(ctx, root, staging, captureMemoryFile, snapshotMemoryFile, 1<<20, j, res)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("copyOut with a canceled context = %v, want it canceled", err)
 	}
@@ -553,7 +563,7 @@ func TestACaptureSweepsStagingAKilledPublishLeft(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err != nil {
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
 
@@ -597,7 +607,7 @@ func TestACapturePublishesDurably(t *testing.T) {
 	synced = nil
 	mu.Unlock()
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err != nil {
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
 
@@ -630,7 +640,7 @@ func TestACaptureWaitingForTheStoreCanBeAbandonedWithItsGuestRunning(t *testing.
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 
-	err = h.p.Capture(ctx, theInstance, "gold-1")
+	_, err = h.p.Capture(ctx, theInstance, "gold-1")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Capture behind a held store = %v, want it to give up with its context", err)
 	}
