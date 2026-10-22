@@ -87,7 +87,128 @@ if ! awk -F '\t' '
     exit 2
 fi
 
-set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv"
+# THE CORRESPONDING SOURCE (#584, ADR-019), proved whole before anything is
+# tagged: a release is immutable, so a source missing from it can never be added.
+#
+# - image-sources.parts names the archive: its first line is the whole tar, its
+#   sha256 and size; any further lines are its parts, .part000 upwards, each with
+#   its sha256. The parts joined in order must be the whole.
+# - image-sources-index.tsv must be the index the archive itself carries, byte for
+#   byte, and must account for exactly the source packages image-sources.tsv
+#   marks gnu or unclassified: each fetched, or, for an unclassified one only,
+#   reviewed as needing none. It also names the guest kernel's source, once.
+for file in image-sources-index.tsv image-sources.parts; do
+    if [ ! -s "$out/$file" ]; then
+        printf 'the publication has no %s, so nothing is tagged or released\n' "$file" >&2
+        exit 2
+    fi
+done
+if [ "$(head -n 1 "$out/image-sources-index.tsv")" != "$(printf 'source\tversion\tstatus\tfile\tsha256\tsize')" ]; then
+    printf 'the publication'"'"'s image-sources-index.tsv is not an index of the source, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+name='' whole='' size='' extra=''
+read -r name whole size extra <"$out/image-sources.parts" || [ -n "$name" ] || true
+if [ "$name" != image-sources.tar ] || [ -n "$extra" ] ||
+    ! printf '%s\n' "$whole" | grep -Eq '^[0-9a-f]{64}$' ||
+    ! printf '%s\n' "$size" | grep -Eq '^[0-9]+$'; then
+    printf 'image-sources.parts does not begin with the whole archive, its sha256 and size\n' >&2
+    exit 2
+fi
+
+sed 1d "$out/image-sources.parts" >"$scratch/parts"
+# THE ARCHIVE BY ITS FILE NAMES ALONE, each checked against the one pattern a
+# part may have, so the list splits safely on spaces and is read from inside $out,
+# whatever $out's own path holds.
+archive=''
+n=0
+# A LAST LINE WITH NO NEWLINE IS A PART TOO: read fails on it while still setting
+# the fields, and skipping it would publish the tar without its last part.
+while read -r part want rest || [ -n "$part" ]; do
+    expected=$(printf 'image-sources.tar.part%03d' "$n")
+    if [ "$part" != "$expected" ]; then
+        printf 'image-sources.parts names %s where it should name %s\n' "$part" "$expected" >&2
+        exit 2
+    fi
+    if [ -n "$rest" ] || ! printf '%s\n' "$want" | grep -Eq '^[0-9a-f]{64}$'; then
+        printf 'image-sources.parts gives %s no single sha256\n' "$part" >&2
+        exit 2
+    fi
+    if [ ! -r "$out/$part" ]; then
+        printf 'image-sources.parts names %s and the build did not produce it\n' "$part" >&2
+        exit 2
+    fi
+    got=$(sha256sum "$out/$part" | cut -d ' ' -f 1)
+    if [ "$got" != "$want" ]; then
+        printf '%s is not the part image-sources.parts describes (sha256 %s, want %s)\n' "$part" "$got" "$want" >&2
+        exit 2
+    fi
+    archive="$archive $part"
+    n=$((n + 1))
+done <"$scratch/parts"
+if [ "$n" -eq 0 ]; then
+    archive=image-sources.tar
+    if [ ! -r "$out/$archive" ]; then
+        printf 'image-sources.parts names the whole archive and the build did not produce it\n' >&2
+        exit 2
+    fi
+fi
+
+# shellcheck disable=SC2086
+got=$(cd "$out" && cat $archive | sha256sum | cut -d ' ' -f 1)
+# shellcheck disable=SC2086
+length=$(cd "$out" && cat $archive | wc -c | tr -d ' ')
+if [ "$got" != "$whole" ] || [ "$length" != "$size" ]; then
+    printf 'the source archive'"'"'s parts are not the archive image-sources.parts describes (sha256 %s, %s bytes; want %s, %s bytes)\n' "$got" "$length" "$whole" "$size" >&2
+    exit 2
+fi
+# shellcheck disable=SC2086
+if ! (cd "$out" && cat $archive) | tar -xOf - ./index.tsv >"$scratch/index" ||
+    ! cmp -s "$scratch/index" "$out/image-sources-index.tsv"; then
+    printf 'image-sources-index.tsv is not the index the source archive carries\n' >&2
+    exit 2
+fi
+
+# EACH SET IS EXTRACTED TO A FILE WHOSE STATUS IS CHECKED, then sorted: dash has
+# no pipefail, so an awk that failed into a sort would read as an empty set, and an
+# empty set of reviewed or GNU-licensed sources is a pass.
+pairs() { # program file out
+    awk -F '\t' "$1" "$2" >"$3.raw" && LC_ALL=C sort -u "$3.raw" >"$3"
+}
+if ! pairs 'NR > 1 && ($7 == "gnu" || $7 == "unclassified") { print $4 "\t" $5 }' "$out/image-sources.tsv" "$scratch/needed" ||
+    ! pairs 'NR > 1 && $7 == "gnu" { print $4 "\t" $5 }' "$out/image-sources.tsv" "$scratch/gnu" ||
+    ! pairs 'NR > 1 && $1 != "guest-kernel" && ($3 == "fetched" || $3 == "reviewed") { print $1 "\t" $2 }' \
+        "$out/image-sources-index.tsv" "$scratch/indexed" ||
+    ! pairs 'NR > 1 && $3 == "reviewed" { print $1 "\t" $2 }' "$out/image-sources-index.tsv" "$scratch/reviewed" ||
+    ! pairs 'NR > 1 && $1 == "guest-kernel" && $3 == "fetched" { print $2 }' "$out/image-sources-index.tsv" "$scratch/kernels"; then
+    printf 'could not read the sources image-sources.tsv needs or image-sources-index.tsv holds, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+
+# THE KERNEL'S SOURCE IS THE KERNEL THE MANIFEST NAMES, once.
+kernels=$(cat "$scratch/kernels")
+kernel=$(jq -r '.kernel.version // empty' "$out/manifest.json")
+# A FAILED comm IS NOT AN EMPTY ONE: its status is checked before its output is
+# read, and it collates as the sorts above did.
+if ! LC_ALL=C comm -12 "$scratch/reviewed" "$scratch/gnu" >"$scratch/reviewed-gnu"; then
+    printf 'could not compare the reviewed sources with the GNU-licensed ones, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+if ! cmp -s "$scratch/needed" "$scratch/indexed" || [ -s "$scratch/reviewed-gnu" ] ||
+    [ -z "$kernel" ] || [ "$kernels" != "$kernel" ] || [ ! -s "$scratch/needed" ]; then
+    printf 'image-sources-index.tsv does not account for exactly the sources image-sources.tsv needs, and kernel %s'"'"'s\n' "${kernel:-?}" >&2
+    exit 2
+fi
+
+set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv" \
+    "$out/image-sources-index.tsv" "$out/image-sources.parts"
+for part in $archive; do
+    set -- "$@" "$out/$part"
+done
 
 while read -r name want; do
     # A BARE FILE NAME, CHECKED HERE TOO. The Go reader validates this before a
