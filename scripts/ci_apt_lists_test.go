@@ -55,7 +55,7 @@ func TestTheHostLifecycleJobRefreshesAptBeforeItsFirstGate(t *testing.T) {
 	}
 
 	if firstUse < 0 {
-		t.Fatal("the host-lifecycle job installs nothing and runs no make target, so this test is looking at the wrong job")
+		t.Fatal("the host-lifecycle job installs nothing and runs no gate script, so this test is looking at the wrong job")
 	}
 
 	if refresh < 0 {
@@ -101,18 +101,38 @@ func refreshesUnconditionally(step workflowStep) bool {
 		commands[2] == "ls /var/lib/apt/lists/*InRelease >/dev/null"
 }
 
-// usesAptOrAGate reports a step that installs a package or runs a make target,
-// which is everything that needs the package lists.
+// usesAptOrAGate reports a step that installs a package or runs a gate script
+// (scripts/gates/), which is everything that needs the package lists.
 func usesAptOrAGate(script string) bool {
 	for line := range strings.SplitSeq(script, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "make ") || strings.Contains(line, "apt-get install") ||
+		if strings.HasPrefix(line, "scripts/gates/") || strings.Contains(line, "apt-get install") ||
 			strings.Contains(line, "apt install") {
 			return true
 		}
 	}
 
 	return false
+}
+
+// WHAT NEEDS THE PACKAGE LISTS: an install, or a gate script, which installs
+// what its scenario needs; a step that does neither does not.
+func TestUsesAptOrAGateSeesAnInstallOrAGate(t *testing.T) {
+	t.Parallel()
+
+	for script, want := range map[string]bool{
+		"scripts/gates/scenario.sh alert-lifecycle\n":       true,
+		"  scripts/gates/terraform.sh lint\n":               true,
+		"sudo apt-get install -y python3-apt\n":             true,
+		"sudo apt install -y jq\n":                          true,
+		"echo hi\n":                                         false,
+		"python3 scripts/check-retirement-shards.py\n":      false,
+		"echo see scripts/gates/scenario.sh for the list\n": false,
+	} {
+		if got := usesAptOrAGate(script); got != want {
+			t.Errorf("usesAptOrAGate(%q) = %v, want %v", script, got, want)
+		}
+	}
 }
 
 // THE PREDICATE IS ITSELF A GATE, so the shapes it must refuse are tested: the
@@ -148,7 +168,7 @@ func TestRefreshesUnconditionallyRefusesTheShapesThatSkipTheUpdate(t *testing.T)
 		{"the check before the update", workflowStep{Run: rewrite + check + update}, false},
 		{"an exit between the update and the check", workflowStep{Run: rewrite + update + "exit 0\n" + check}, false},
 		{"a heredoc that never runs", workflowStep{Run: ": <<'NOT_EXECUTED'\n" + good + "NOT_EXECUTED\n"}, false},
-		{"the refresh and a gate in one step", workflowStep{Run: good + "make alert-lifecycle\n"}, false},
+		{"the refresh and a gate in one step", workflowStep{Run: good + "scripts/gates/scenario.sh alert-lifecycle\n"}, false},
 	} {
 		if got := refreshesUnconditionally(tc.step); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)

@@ -4,7 +4,7 @@
 //
 // It exists so a scheduling change can be asked what it does to a workload:
 // under this week of arrivals, where did placement put each job, how long did
-// jobs queue, and how did two policies differ. `make test` proves invariants on
+// jobs queue, and how did two policies differ. `scripts/gates/test.sh` proves invariants on
 // single leases and the end-to-end suite proves the wire and the runtime; neither
 // runs a thousand jobs through the placer, because every other backend needs a
 // guest per job.

@@ -62,7 +62,7 @@ codex exec -m gpt-6-astra -c model_reasoning_effort="high" \
 Details that each cost a debugging session to learn:
 
 - **The trailing `< /dev/null` is mandatory.** With an open non-TTY stdin — every background shell — `codex exec` prints "Reading additional input from stdin..." and hangs forever. Harmless in the foreground, so always include it.
-- **`--sandbox read-only`, and say "do not build or test" in the prompt.** A `go build` inside a long reasoning run recompiles the tree and is the most common way one of these dies mid-flight. You run `make verify` yourself, and CI runs the full gate.
+- **`--sandbox read-only`, and say "do not build or test" in the prompt.** A `go build` inside a long reasoning run recompiles the tree and is the most common way one of these dies mid-flight. You run `scripts/gates/verify.sh` yourself, and CI runs the full gate.
 - **Pass the model and reasoning effort explicitly.** Never rely on `~/.codex/config.toml` defaults; they vary per machine. `gpt-6-astra` needs Codex CLI 0.153 or newer: 0.145.0 answers it with a 400, "requires a newer version of Codex", before reading anything, so an old CLI is upgraded (`npm install -g @openai/codex@latest`) rather than pointed at an older model.
 - **State the design intent in the prompt.** A reviewer that does not know the App key must never be overwritten cannot tell you that it can be.
 - **Write output to a deterministic path** keyed to the topic, so a fresh shell can re-derive it after the notification.
@@ -81,15 +81,15 @@ A bare "review this diff" wastes the round. Twelve rounds on the node split conv
 
 4. **An ATTACK LIST in priority order**, ending with test quality. The test items that have actually caught things: assertions that cannot fail, assertions a panic would satisfy, waits satisfied by something other than the thing under test, ordering that makes an assertion unobservable, wall-clock sleeps standing in for conditions, tests claiming to stage a race without establishing its ordering, goroutines outliving their test, and shared state one test mutates.
 
-Then: **fix, mutation-test each fix, run `make verify`, commit, and immediately launch the next round.** Severity falls over rounds but does not reach zero quickly — most rounds find a defect in code written to fix the previous round, so do not treat a small round as the last one.
+Then: **fix, mutation-test each fix, run `scripts/gates/verify.sh`, commit, and immediately launch the next round.** Severity falls over rounds but does not reach zero quickly — most rounds find a defect in code written to fix the previous round, so do not treat a small round as the last one.
 
 ## Verify what changed before the commit; CI is the full gate
 
 ```bash
-make verify
+scripts/gates/verify.sh
 ```
 
-gofmt on the changed Go files, `go build ./...`, and `go vet`, `go test` without `-race` and golangci-lint for this platform on the changed packages, read from the diff against the merge base with origin/main plus staged, unstaged and untracked files. All clean, every commit. It is the floor locally, and green CI is the floor for the PR: CI runs the full gate on every push (`make check`'s steps with `-race -covermode=atomic`, the linux lint pass, billet's own analyzers, `go mod tidy` diff, the suite against a real PostgreSQL, coverage upload, `govulncheck`, cross-builds, `sqlc diff`, the Sphinx docs build, the package and restore rehearsals, the Ansible role tests, and the terraform gates). Push, then watch it in the background with `gh pr checks <n> --watch` and read a failure with `gh run view <id> --log-failed`; fix what it reports at the cause. Do not run `make check`, `make test`, `make lint`, `go test ./...` or `-race` across packages locally: the hook refuses them (a person lifts that by starting Claude Code with `CLAUDE_FULL_CHECKS=1`), because full gates run side by side by several sessions starved a 32 GiB Mac into a kernel panic on 2026-10-15. `make verify` runs `make docs` for a change under `docs/` when Sphinx is installed and names the terraform gates CI runs for a `.tf` change. `billet-checks-and-lint` has the anatomy of the gate.
+gofmt on the changed Go files, `go build ./...`, and `go vet`, `go test` without `-race` and golangci-lint for this platform on the changed packages, read from the diff against the merge base with origin/main plus staged, unstaged and untracked files. All clean, every commit. It is the floor locally, and green CI is the floor for the PR: CI runs the full gate on every push (`scripts/gates/check.sh`'s steps with `-race -covermode=atomic`, the linux lint pass, billet's own analyzers, `go mod tidy` diff, the suite against a real PostgreSQL, coverage upload, `govulncheck`, cross-builds, `sqlc diff`, the Sphinx docs build, the package and restore rehearsals, the Ansible role tests, and the terraform gates). Push, then watch it in the background with `gh pr checks <n> --watch` and read a failure with `gh run view <id> --log-failed`; fix what it reports at the cause. Do not run `scripts/gates/check.sh`, `scripts/gates/test.sh`, `scripts/gates/lint.sh`, `go test ./...` or `-race` across packages locally: the hook refuses them (a person lifts that by starting Claude Code with `CLAUDE_FULL_CHECKS=1`), because full gates run side by side by several sessions starved a 32 GiB Mac into a kernel panic on 2026-10-15. `scripts/gates/verify.sh` runs `scripts/gates/docs.sh` for a change under `docs/` when Sphinx is installed and names the terraform gates CI runs for a `.tf` change. `billet-checks-and-lint` has the anatomy of the gate.
 
 If the linter objects, fix the code. An exception is `//nolint:linter-name // reason` with a real reason for golangci-lint, or `//billet:ignore <analyzer> // reason` for billet's own analyzers; both reject a bare directive and report an unused one, so "0 issues" means "0 unexplained issues".
 
@@ -121,7 +121,7 @@ Cache: Fail open to a miss on any proxy error
 Body covers:
 
 - **What changed and why**, with the failure mode if there is one.
-- **How it was verified.** `make verify` and a green CI run are the floor. Say what else you ran — a mutation test, a manual `billet check`, a crash injection.
+- **How it was verified.** `scripts/gates/verify.sh` and a green CI run are the floor. Say what else you ran — a mutation test, a manual `billet check`, a crash injection.
 - **What is NOT covered.** Be specific. "Untested on a real Mac mini" is useful; silence is not.
 
 Link the issue with `Closes #N`.

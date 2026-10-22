@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -339,4 +340,49 @@ func (p *Provider) checkCompatibility(dir *os.File, kernel string, spec provider
 	}
 
 	return nil
+}
+
+// goldenOf reads which system disk a published snapshot was taken with, and the
+// generation that disk was cloned from, before anything is claimed for a restore.
+//
+// THE SNAPSHOT DECIDES THE DISK, NOT THE CALLER: a restored kernel's page cache
+// describes the disk its memory was taken with, so the disk is the record's, and a
+// caller's image only has to name the same image, which keeps a golden built from
+// one image from being restored under a tier of another.
+func (p *Provider) goldenOf(name string, spec provider.Spec) (compatibility, error) {
+	if err := checkSnapshotName(name); err != nil {
+		return compatibility{}, err
+	}
+
+	store, err := openOwnedDir(unix.AT_FDCWD, p.snapshotsDir())
+	if err != nil {
+		return compatibility{}, err
+	}
+	defer unix.Close(store)
+
+	dirFD, err := openOwnedDir(store, name)
+	if err != nil {
+		return compatibility{}, fmt.Errorf("firecracker: the snapshot %s: %w", name, err)
+	}
+
+	dir := os.NewFile(uintptr(dirFD), filepath.Join(p.snapshotsDir(), name))
+	defer dir.Close()
+
+	record, err := readCompatibility(dir, filepath.Join(dir.Name(), compatibilityFile))
+	if err != nil {
+		return compatibility{}, err
+	}
+
+	recorded, _, recordedOK := strings.Cut(record.Image, "@")
+	if !recordedOK || recorded == "" || record.Disk == "" {
+		return compatibility{}, fmt.Errorf("firecracker: %w: %s names no system disk or no generation it "+
+			"was cloned from", errSnapshotIncompatible, dir.Name())
+	}
+
+	if asked, _, _ := strings.Cut(spec.Image, "@"); asked != recorded {
+		return compatibility{}, fmt.Errorf("firecracker: %w: %s was captured from %s, and the restore "+
+			"names %s", errSnapshotIncompatible, dir.Name(), bounded(record.Image), bounded(spec.Image))
+	}
+
+	return record, nil
 }

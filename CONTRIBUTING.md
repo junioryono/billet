@@ -8,36 +8,40 @@ Requirements:
 
 - Go 1.26.10 or later, as `go.mod` says. Everything builds with `CGO_ENABLED=0`, because a node is deployed by copying one static file, and a cgo dependency is refused by the linter.
 - Python 3.13 for the documentation build and the repository's Python gates.
-- GNU Make, a POSIX shell, and Docker for the end-to-end suite (it skips without one).
+- bash and a POSIX shell for the gate scripts under `scripts/gates/`, and Docker for the end-to-end suite (it skips without one).
 
 Clone the repository, install the pinned tools, and run the same gate CI runs:
 
 ```bash
 git clone https://github.com/junioryono/billet && cd billet
-make tools     # golangci-lint, goreleaser, sqlc, tflint and trivy at the pinned versions
-make check     # the pre-commit gate
+scripts/gates/tools.sh     # golangci-lint, goreleaser, sqlc, tflint and trivy at the versions .github/tool-versions.env pins
+scripts/gates/check.sh     # the full gate, as CI runs its steps
 ```
 
-`tools/lint` is a nested Go module holding billet's own analyzers, so `golang.org/x/tools` never becomes a dependency of the binary. `make check` builds and tests it for you.
+`tools/lint` is a nested Go module holding billet's own analyzers, so `golang.org/x/tools` never becomes a dependency of the binary. `scripts/gates/check.sh` builds and tests it for you.
 
 ## Verification commands
 
-| Command | What it does | In `make check`? |
+| Command | What it does | In `scripts/gates/check.sh`? |
 |---|---|---|
-| `make check` | `no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources` | it is the gate |
-| `make verify` | gofmt, `go build ./...`, then vet, tests without `-race` and golangci-lint on only the packages this checkout changed against origin/main; the check a Claude session runs while working, since CI runs the full gate on every push | no |
-| `make test` | `go test -race -count=1 -covermode=atomic ./...`; the coverage counters are part of the gate because they reorder goroutines | yes |
-| `make lint` | golangci-lint (pinned) for the host **and** for `GOOS=linux`, because a linter only sees the files it would compile | yes |
-| `make lint-custom` | build `tools/lint`, run its own tests, run `billetlint` for darwin/arm64 and linux/amd64 | yes |
-| `make cross` | build every target a node runs on; run it before anything touching a build tag | no |
-| `make docs` | the Sphinx build with warnings as errors, as Read the Docs and CI run it | no; CI runs it |
-| `make sqlc` / `make sqlc-check` | regenerate `internal/state/ledgerdb` after editing a query or adding a migration; prove the committed code is what the pinned sqlc generates | no; CI runs `sqlc diff` |
-| `make tf-fmt-check tf-validate tf-test tf-lint tf-scan` | the terraform gates; run before pushing a `.tf` change | no, they need terraform, tflint and trivy; CI runs them |
-| `make host-upgrade-order unit-parity …` | the Ansible scenario tests (`make help` lists them) | no; CI runs them |
-| `make dist` | build the release artifacts exactly as a tag would | no |
-| `make package-lifecycle`, `make restore-rehearsal`, `make postgres-restore-rehearsal`, `make systemd-lifecycle` | the real-package rehearsals | no; CI runs the first three |
+| `scripts/gates/check.sh` | `no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources` | it is the gate |
+| `scripts/gates/verify.sh` | gofmt, `go build ./...`, then vet, tests without `-race` and golangci-lint on only the packages this checkout changed against origin/main; the check a Claude session runs while working, since CI runs the full gate on every push | no |
+| `scripts/gates/test.sh` | `go test -race -count=1 -covermode=atomic ./...`; the coverage counters are part of the gate because they reorder goroutines | yes |
+| `scripts/gates/lint.sh` | golangci-lint (pinned) for the host **and** for `GOOS=linux`, because a linter only sees the files it would compile | yes |
+| `scripts/gates/lint-custom.sh` | build `tools/lint`, run its own tests, run `billetlint` for darwin/arm64 and linux/amd64 | yes |
+| `scripts/gates/cross.sh` | build every target a node runs on; run it before anything touching a build tag | no |
+| `scripts/gates/docs.sh` | the Sphinx build with warnings as errors, as Read the Docs and CI run it | no; CI runs it |
+| `sqlc generate` / `sqlc diff` | regenerate `internal/state/ledgerdb` after editing a query or adding a migration; prove the committed code is what the pinned sqlc generates | no; CI runs `sqlc diff` |
+| `scripts/gates/terraform.sh fmt validate test lint scan` | the terraform gates; run before pushing a `.tf` change | no, they need terraform, tflint and trivy; CI runs them |
+| `scripts/gates/scenario.sh NAME` | one of the Ansible collection's scenario tests, by the name of its script or playbook under `ansible_collections/junioryono/billet/tests/` (the billet-infra-terraform-ansible skill says which converges what) | no; CI runs them |
+| `scripts/gates/fmt-check.sh`, `scripts/gates/lambda-test.sh`, `scripts/check-module-sources.sh` | gofmt, the spot-router Lambda's tests, and every documented Terraform module source pinnable | yes |
+| `scripts/gates/fuzz.sh`, `scripts/gates/bench.sh` | search past every fuzz target's seeds; the allocator's and the node wire's benchmarks | no; CI runs the fuzz search nightly |
+| `scripts/gates/dist.sh` | build the release artifacts into `dist/` exactly as a tag would | no |
+| `scripts/test-package-lifecycle.sh`, `scripts/test-restore-rehearsal.sh`, `scripts/test-postgres-restore-rehearsal.sh` | the real-package rehearsals, each run after `scripts/gates/dist.sh` | no; CI runs them |
+| `scripts/test-systemd-lifecycle.sh`, `scripts/rollout-rehearsal.sh`, `scripts/recover-rehearsal.sh`, `scripts/ca-rotation-rehearsal.sh`, `scripts/promotion-rehearsal.sh`, `scripts/retirement-rehearsal.sh` | the rehearsals that need a real GitHub App, each run by hand (after `scripts/gates/dist.sh`, except the rollout rehearsal, which installs published releases); `docs/reference/records/host-rehearsals.md` says what each needs | no; run by hand |
+| `python3 scripts/check-tests-kept.py` | report the `Test` functions HEAD has and the working tree does not, after a scripted edit to `_test.go` files | no; a deleted test can be right |
 
-A green `make check` is necessary rather than sufficient: CI additionally proves `go mod tidy` leaves no diff, runs the suite against a real PostgreSQL, runs `govulncheck`, cross-builds, and runs everything in the table's "no" rows. Before pushing, run `make check` if you want the whole gate on your own machine, or `make verify` for what you changed; either way the pull request needs a green CI run, which runs the full gate and the rest. A Claude session runs `make verify` and reads CI, and the repository's hook refuses it the full gate unless Claude Code was started with `CLAUDE_FULL_CHECKS=1`.
+A green `scripts/gates/check.sh` is necessary rather than sufficient: CI additionally proves `go mod tidy` leaves no diff, runs the suite against a real PostgreSQL, runs `govulncheck`, cross-builds, and runs everything in the table's "no" rows. Before pushing, run `scripts/gates/check.sh` if you want the whole gate on your own machine, or `scripts/gates/verify.sh` for what you changed; either way the pull request needs a green CI run, which runs the full gate and the rest. A Claude session runs `scripts/gates/verify.sh` and reads CI, and the repository's hook refuses it the full gate unless Claude Code was started with `CLAUDE_FULL_CHECKS=1`.
 
 ## Making changes
 
@@ -62,7 +66,7 @@ Cache: Fail open to a miss on any proxy error
 Docs: Set up the Read the Docs build
 ```
 
-The body covers what changed and why, how it was verified beyond `make check` (a mutation test, a manual `billet check`, a real host), and what is **not** covered. "Untested on a real Mac" is useful information; silence is not. Link the issue with `Closes #N`. `.claude/skills/billet-git-flow/SKILL.md` has the full conventions, including the adversarial review that runs before a push.
+The body covers what changed and why, how it was verified beyond `scripts/gates/check.sh` (a mutation test, a manual `billet check`, a real host), and what is **not** covered. "Untested on a real Mac" is useful information; silence is not. Link the issue with `Closes #N`. `.claude/skills/billet-git-flow/SKILL.md` has the full conventions, including the adversarial review that runs before a push.
 
 ## Signing off your commits
 

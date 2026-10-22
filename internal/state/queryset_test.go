@@ -138,7 +138,7 @@ func TestEveryGeneratedQueryIsNamedInASourceFile(t *testing.T) {
 
 	for _, name := range declared {
 		if !slices.Contains(compiled, name) {
-			t.Errorf("%s is declared in %s and has no generated constant; run `make sqlc`",
+			t.Errorf("%s is declared in %s and has no generated constant; run `sqlc generate`",
 				name, queriesDir)
 		}
 	}

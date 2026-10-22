@@ -8,4 +8,4 @@ The compute contract and its six backends: docker, firecracker, tart, ec2, codeb
 - Never quote the guest in an error.
 - A fake proves the shape of a request, never the values a real host or service refuses; each backend's `real*_test.go` is the evidence.
 
-Gates (CI runs them on every push; locally, `make verify`): `make check`; `make cross` for anything touching a build tag, which locally is `GOOS=linux GOARCH=amd64 go vet` on the changed package.
+Gates (CI runs them on every push; locally, `scripts/gates/verify.sh`): `scripts/gates/check.sh`; `scripts/gates/cross.sh` for anything touching a build tag, which locally is `GOOS=linux GOARCH=amd64 go vet` on the changed package.

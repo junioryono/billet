@@ -84,40 +84,27 @@ func lockProviders(body string) []lockProvider {
 func TestEveryTerraformLockRecordsEveryPlatformsChecksum(t *testing.T) {
 	t.Parallel()
 
-	// THE MODULES CI'S TERRAFORM GATES WALK, from the Makefile that names them,
-	// not a second discovery that could disagree with it.
-	// A SUB-MAKE WHEN `make test` RUNS THIS, so what it inherits is dropped and
-	// the directory lines a sub-make prints are turned off; and the list is the
-	// one line that says it is.
-	cmd := exec.CommandContext(t.Context(), "make", "-s", "--no-print-directory", "tf-modules-check")
-	cmd.Dir = ".."
-	cmd.Env = environmentWithout("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES")
+	// THE MODULES CI'S TERRAFORM GATES WALK, from the script that discovers them,
+	// not a second discovery that could disagree with it. It prints one module a
+	// line and refuses an empty or partial list.
+	cmd := exec.CommandContext(t.Context(), "./gates/terraform-modules.sh")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("make tf-modules-check: %v\n%s", err, stderr.String())
+		t.Fatalf("gates/terraform-modules.sh: %v\n%s", err, stderr.String())
 	}
-
-	var lists []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "terraform modules:"); ok {
-			lists = append(lists, rest)
-		}
-	}
-	if len(lists) != 1 {
-		t.Fatalf("make tf-modules-check printed %q, want exactly one module list", out)
-	}
-	listed := lists[0]
 
 	var modules []string
-	for _, m := range strings.Fields(listed) {
-		modules = append(modules, filepath.Join("..", m))
+	for m := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if m != "" {
+			modules = append(modules, filepath.Join("..", m))
+		}
 	}
 
 	locks, missing := moduleLocks(modules)
 	if len(locks)+len(missing) == 0 {
-		t.Fatalf("no module read from make tf-modules-check's %q, so nothing was checked", out)
+		t.Fatalf("no module read from gates/terraform-modules.sh's %q, so nothing was checked", out)
 	}
 
 	for _, m := range missing {

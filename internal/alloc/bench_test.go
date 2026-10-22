@@ -13,7 +13,7 @@ import (
 
 // The allocator's hot paths, against the ledger the run exercises: SQLite by
 // default, PostgreSQL under BILLET_TEST_LEDGER=postgres. These are what the
-// heartbeat-batching decision in #356 is made on; `make bench` runs them, and
+// heartbeat-batching decision in #356 is made on; `scripts/gates/bench.sh` runs them, and
 // benchstat compares two runs.
 
 // benchLimits is a ceiling no benchmark reaches, so the measurement is the

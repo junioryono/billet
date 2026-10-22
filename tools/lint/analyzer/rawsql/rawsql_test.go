@@ -18,7 +18,7 @@ import (
 // takes a string and returns none of database/sql's types, and a generated file.
 //
 // TWO OF THE SKIPS ARE PROVED BY THE REAL RUN RATHER THAN HERE, and that is worth
-// saying rather than leaving to be assumed. `make lint-custom` runs this analyzer
+// saying rather than leaving to be assumed. `scripts/gates/lint-custom.sh` runs this analyzer
 // over the whole repository, where internal/state's tests alone hold about fifty
 // direct SQL calls and internal/state/sqlitedb holds about a hundred and eighty:
 // if either the test-file skip or the generated-file skip broke, that run would
