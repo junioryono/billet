@@ -709,6 +709,23 @@ func TestTheKillSwitchSplicesTheNpmCache(t *testing.T) {
 	}
 }
 
+// holdBackTheBody pins the client socket's receive buffer small, so a body far
+// larger than what the two sockets can hold keeps the node's write blocked until
+// the client reads: Linux caps a send buffer at tcp_wmem's maximum (4 MiB on the
+// shared test host, 2026-10-22), and an explicit receive buffer turns off the
+// autotuning that could otherwise grow to tcp_rmem's 32 MiB.
+func holdBackTheBody(t *testing.T, conn *tls.Conn) {
+	t.Helper()
+
+	raw, ok := conn.NetConn().(*net.TCPConn)
+	if !ok {
+		t.Fatalf("the tunnel is a %T, not a TCP connection", conn.NetConn())
+	}
+	if err := raw.SetReadBuffer(64 << 10); err != nil {
+		t.Fatalf("pin the client's receive buffer: %v", err)
+	}
+}
+
 // ageNpmEntry moves an entry's clock back by, so it expires as if time passed.
 func ageNpmEntry(t *testing.T, store *npmStore, key string, by time.Duration) {
 	t.Helper()
@@ -1215,6 +1232,7 @@ func TestADocumentAnsweredAfterAFailedCommitStaysCharged(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		t.Fatalf("set a deadline: %v", err)
 	}
+	holdBackTheBody(t, conn)
 	if _, err := conn.Write([]byte(npmRequestLine("/unkept"))); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -1267,6 +1285,7 @@ func TestADocumentItsCommitEvictedStaysChargedWhileItIsAnswered(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		t.Fatalf("set a deadline: %v", err)
 	}
+	holdBackTheBody(t, conn)
 	if _, err := conn.Write([]byte(npmRequestLine("/huge"))); err != nil {
 		t.Fatalf("write: %v", err)
 	}
