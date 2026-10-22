@@ -956,6 +956,13 @@ jobs:
         if: matrix.group == 'policy'
         run: scripts/gates/scenario.sh release-fetch-check
 
+      # The record a rollout reads the host by (#91): the real billet and a
+      # real manifest from a local origin, through the role's own task files,
+      # in a private mount namespace (so it needs the runner's sudo).
+      - name: Prove the role records which release manifest produced the binary
+        if: matrix.group == 'policy'
+        run: scripts/gates/scenario.sh provenance-check
+
       # Every fetch site was bounded and retried once, after one stalled
       # connection failed a converge behind an approval gate. This is what
       # keeps the next get_url or uri from shipping with the module defaults.
@@ -994,6 +1001,8 @@ jobs:
           sudo /usr/bin/python3 -c 'import jinja2'
           go test -c -o "$RUNNER_TEMP/lifeops.test" ./internal/lifeops
           go test -c -o "$RUNNER_TEMP/billet-command.test" ./internal/ops/host
+          go test -c -o "$RUNNER_TEMP/regularfile.test" ./internal/regularfile
+          go test -c -o "$RUNNER_TEMP/retirement.test" ./internal/retirement
           retirement_postgres=$(docker run -d --rm -p 127.0.0.1::5432 -e POSTGRES_USER=billet -e POSTGRES_PASSWORD=billet -e POSTGRES_DB=billet postgres:18-alpine)
           trap 'docker stop "$retirement_postgres" >/dev/null' EXIT
           retirement_postgres_ready=false
@@ -1009,7 +1018,12 @@ jobs:
             exit 1
           fi
           retirement_postgres_address=$(docker port "$retirement_postgres" 5432/tcp)
+          # The mount rule on the layouts it is for (#123): an overlay of two
+          # filesystems without xino, and single files bind-mounted onto a name.
+          (cd internal/regularfile && sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_REAL_MOUNTS=1 "$RUNNER_TEMP/regularfile.test" -test.count=1 -test.v -test.run '^TestRealMounts')
+          (cd internal/retirement && sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_REAL_MOUNTS=1 "$RUNNER_TEMP/retirement.test" -test.count=1 -test.v -test.run '^TestRealMounts')
           cd internal/lifeops
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_REAL_MOUNTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealMounts'
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^(TestRealSystemdRetirementOperationEffects|TestRealSystemdHostLockDirectoryOutlivesTheNodeStop)$'
           cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
@@ -1033,6 +1047,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.package_lifecycle == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
+    # The unit sandbox leg added about a minute to a job measured at 6m41s
+    # with it (2026-10-21), well inside the thirty the package legs had.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -1056,6 +1072,14 @@ jobs:
 
       - name: Exercise package installation and removal
         run: scripts/test-package-lifecycle.sh
+
+      # THE UNITS STARTED, NOT READ (#174). Every packaged unit under
+      # ProtectSystem=strict runs under real systemd with its real sandbox and
+      # `billet local unit-paths --exercise` in place of its command, and the
+      # writes are judged from outside the sandbox. It needs no App, so it runs
+      # here rather than with the rehearsals that do.
+      - name: Prove the packaged units' sandboxes permit what their commands do
+        run: scripts/test-unit-sandboxes.sh
 
       # AN UNTESTED BACKUP IS NOT A BACKUP, which ADR-001 has said since before
       # backup existed. This is the packaged-Linux half of the rehearsal: a real

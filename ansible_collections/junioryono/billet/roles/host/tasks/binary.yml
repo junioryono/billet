@@ -102,6 +102,13 @@
       billet_{{ billet_resolved_version | regex_replace('^v', '') }}_linux_{{ billet_release_arch }}.tar.gz
     billet_release_base: "{{ billet_release_url_base }}/{{ billet_resolved_version }}"
     billet_release_candidate: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}"
+    # THE EVIDENCE `billet release record` NEEDS, kept beside the candidate: the
+    # archive it was unpacked from and the manifest that names that archive. A
+    # release that answered 404 for its manifest is asked again next time, one
+    # request, because a manifest can be published after its archive or a
+    # mirror can catch up, and a remembered absence would never learn of it.
+    billet_release_evidence_archive: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}.tar.gz"
+    billet_release_evidence_manifest: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}.release-manifest.json"
 
 - name: Inspect the release candidate already staged for this version
   ansible.builtin.stat:
@@ -125,6 +132,49 @@
       {{ billet_release_candidate_stat.stat.pw_name | default('?') }}. Remove it
       and converge again to refetch from {{ billet_release_base }}.
   when: billet_release_candidate_stat.stat.exists
+
+- name: Inspect the release evidence already staged beside the candidate
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - "{{ billet_release_evidence_archive }}"
+    - "{{ billet_release_evidence_manifest }}"
+  register: billet_release_evidence_stat
+  check_mode: false
+  become: true
+
+# THE SAME RULE AS THE CANDIDATE'S: what `release record` is handed is what it
+# attests to, so it must be root's and writable by nobody else.
+- name: Refuse staged release evidence that root did not put there
+  ansible.builtin.assert:
+    that:
+      - item.stat.pw_name == 'root'
+      - not item.stat.wgrp
+      - not item.stat.woth
+      - item.stat.isreg
+      - not item.stat.islnk
+    fail_msg: >-
+      {{ item.item }} is the evidence a provenance record for {{ billet_resolved_version }}
+      would be written from, so it must be a regular file owned by root and writable by
+      nobody else. Remove it and converge again to refetch it from {{ billet_release_base }}.
+  loop: "{{ billet_release_evidence_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stat.exists
+
+# FETCHED AGAIN WHEN A CANDIDATE WAS STAGED WITHOUT IT, by a collection from
+# before the role recorded provenance (#91): the archive is verified against
+# checksums.txt exactly as below, and the candidate is not replaced, so an
+# archive whose binary is not the staged one is refused by `release record`.
+- name: Decide what of the release this run fetches
+  ansible.builtin.set_fact:
+    billet_release_fetch_archive: >-
+      {{ not billet_release_candidate_stat.stat.exists
+         or not billet_release_evidence_stat.results[0].stat.exists }}
+    billet_release_fetch_manifest: >-
+      {{ not billet_release_candidate_stat.stat.exists
+         or not billet_release_evidence_stat.results[1].stat.exists }}
 
 - name: Inspect the release staging directory before creating it
   ansible.builtin.stat:
@@ -167,18 +217,24 @@
     prefix: billet-release-
     suffix: .d
   register: billet_release_workdir
+  # SCRATCH, NOT A CHANGE TO THE HOST: removed below, whatever was fetched.
+  changed_when: false
   become: true
   when:
-    - not billet_release_candidate_stat.stat.exists
+    - billet_release_fetch_archive or billet_release_fetch_manifest
     - not ansible_check_mode
 
 - name: Name this run's private working directory
   ansible.builtin.set_fact:
     billet_release_unpack: "{{ billet_release_workdir.path | default('') }}"
   when:
-    - not billet_release_candidate_stat.stat.exists
+    - billet_release_fetch_archive or billet_release_fetch_manifest
     - not ansible_check_mode
 
+# THE ARCHIVE IS REQUIRED ONLY WHERE IT IS THE CANDIDATE. Fetched again beside a
+# candidate already staged, it is evidence for the provenance record, which
+# decides nothing: a fleet whose origin has since gone away, or a mirror that
+# pruned the version, converges as it did before and records nothing.
 - name: Download the pinned billet release
   ansible.builtin.get_url:
     url: "{{ billet_release_base }}/{{ billet_release_archive }}"
@@ -190,11 +246,44 @@
     mode: "0600"
   register: billet_release_download
   until: billet_release_download is succeeded
-  retries: "{{ billet_fetch_retries }}"
+  # ASKED ONCE WHEN IT IS ONLY EVIDENCE: retried, a pruned version or an origin
+  # that has gone away would cost every converge minutes, for a record that
+  # decides nothing.
+  retries: "{{ 0 if billet_release_candidate_stat.stat.exists else billet_fetch_retries }}"
   delay: "{{ billet_fetch_retry_delay }}"
+  changed_when: false
+  ignore_errors: "{{ billet_release_candidate_stat.stat.exists }}"
   become: true
   when:
-    - not billet_release_candidate_stat.stat.exists
+    - billet_release_fetch_archive
+    - not ansible_check_mode
+
+# THE MANIFEST, IF THIS RELEASE PUBLISHES ONE, as install.sh fetches it: any
+# failure to fetch one (a release cut before manifests answers 404, a mirror may
+# answer 403 or be unreachable) is a release with none here, said and never a
+# failure of the converge, since the record decides nothing. A 404 is not
+# retried. Its bytes are kept as served, because their sha256 is the digest a
+# rollout compares. NOT VERIFIED HERE: `billet release record` refuses unless
+# the manifest names this archive by hash and the binary is the one inside it.
+- name: Download the release manifest, when the release publishes one
+  ansible.builtin.get_url:
+    url: "{{ billet_release_base }}/release-manifest.json"
+    dest: "{{ billet_release_unpack }}/release-manifest.json"
+    timeout: "{{ billet_fetch_timeout }}"
+    owner: root
+    group: root
+    mode: "0600"
+  register: billet_release_manifest_download
+  until: >-
+    billet_release_manifest_download is succeeded
+    or billet_release_manifest_download.status_code | default(0) == 404
+  retries: "{{ 0 if billet_release_candidate_stat.stat.exists else billet_fetch_retries }}"
+  delay: "{{ billet_fetch_retry_delay }}"
+  changed_when: false
+  ignore_errors: true
+  become: true
+  when:
+    - billet_release_fetch_manifest
     - not ansible_check_mode
 
 - name: Unpack only the billet binary from the release
@@ -223,15 +312,65 @@
     - not billet_release_candidate_stat.stat.exists
     - not ansible_check_mode
 
+# BESIDE THE CANDIDATE, so a later converge of the same version still has what
+# `billet release record` needs: the transaction records from these after it
+# installs, and a host whose binary is unchanged backfills from them.
+- name: Keep the verified archive beside the candidate
+  ansible.builtin.copy:
+    src: "{{ billet_release_unpack }}/{{ billet_release_archive }}"
+    dest: "{{ billet_release_evidence_archive }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when:
+    - billet_release_fetch_archive
+    - not ansible_check_mode
+    - billet_release_download is succeeded
+
+- name: Keep the release manifest beside the candidate
+  ansible.builtin.copy:
+    src: "{{ billet_release_unpack }}/release-manifest.json"
+    dest: "{{ billet_release_evidence_manifest }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when:
+    - billet_release_fetch_manifest
+    - not ansible_check_mode
+    - billet_release_manifest_download is succeeded
+
+- name: Say that nothing here can name this release's manifest
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'The release archive could not be fetched again beside the staged candidate ('
+         ~ (billet_release_download.msg | default('no reason given')) ~ '), so'
+         if billet_release_fetch_archive and billet_release_download is not succeeded
+         else billet_resolved_version ~ ' publishes no release-manifest.json'
+              if billet_release_manifest_download.status_code | default(0) == 404
+         else 'The release manifest could not be fetched ('
+              ~ (billet_release_manifest_download.msg | default('no reason given')) ~ '), so' }}
+      nothing will record which manifest produced this host's binary, and a rollout
+      reads its version rather than its bytes. Nothing else of the converge depends on it.
+  when:
+    - not ansible_check_mode
+    - >-
+      (billet_release_fetch_archive and billet_release_download is not succeeded)
+      or (billet_release_fetch_manifest and billet_release_manifest_download is not succeeded)
+
 # What account.yml inspects, journals and installs. The transaction is unchanged
 # by where the candidate came from; only the side it lives on moves.
 - name: Remove this run's working directory once the candidate is published
   ansible.builtin.file:
     path: "{{ billet_release_unpack }}"
     state: absent
+  changed_when: false
   become: true
   when:
-    - not billet_release_candidate_stat.stat.exists
+    - billet_release_fetch_archive or billet_release_fetch_manifest
     - not ansible_check_mode
     - billet_release_unpack | default('') | length > 0
 
@@ -246,8 +385,30 @@
     - ansible_check_mode
     - not billet_release_candidate_stat.stat.exists
 
+# THE EVIDENCE IS NAMED ONLY WHEN BOTH HALVES ARE ON THE TARGET: an archive
+# without a manifest records nothing, and record-provenance.yml reads an empty
+# name as "nothing to record from".
+- name: Inspect the release evidence this run leaves beside the candidate
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - "{{ billet_release_evidence_archive }}"
+    - "{{ billet_release_evidence_manifest }}"
+  register: billet_release_evidence_kept
+  check_mode: false
+  become: true
+
 - name: Point the upgrade transaction at the fetched candidate
   ansible.builtin.set_fact:
     billet_candidate_path: "{{ billet_release_candidate }}"
     billet_candidate_on_target: >-
       {{ billet_release_candidate_stat.stat.exists or not ansible_check_mode }}
+    billet_candidate_evidence_archive: >-
+      {{ billet_release_evidence_archive
+         if billet_release_evidence_kept.results | selectattr('stat.exists') | list | length == 2
+         else '' }}
+    billet_candidate_evidence_manifest: >-
+      {{ billet_release_evidence_manifest
+         if billet_release_evidence_kept.results | selectattr('stat.exists') | list | length == 2
+         else '' }}

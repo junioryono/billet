@@ -123,6 +123,9 @@ d02ede176458 #127 now proves every node stop by the node's ending, the retiremen
 dffafcd4ce59 #127 now proves each node stop the role and the command perform by the node's ending; the sentence says it establishes the guarantee.
 b56657d3069e The images row gained `accept`, the components whose licenses a deployment accepts (#584); the row is otherwise unchanged.
 301e180e7feb An idle launch runner is no longer retired by a runner-less cancellation: the cancellation detaches it and the pool retires it, reinstating it busy when GitHub refuses its removal as running a job (#598); the sentence now ends at the job being marked finished and the next ones state that.
+0edc679bef13 The ownership repair judges a file by its directory's mount, not its device (#123); the sentence now says so.
+16912ef35a29 reownLock refuses a lock that is not on its directory's mount rather than one on another filesystem (#123); the sentence now says so.
+2d282fadec67 The guard gate no longer binds a tmpfs over /var/lib/billet: its planted roots run inside the mixed overlay, where the mount rule is proved (#123); the sentence now says so.
 da96fb8352a7 ADR-018 (2026-10-21): GitHub serves an object no ref reaches by name, so the Git proxy serves any object a repository's mirror holds, falls back to GitHub on anything it cannot do, and refreshes off the request path; build-caches.md restates the rule.
 03d258ac46b3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 082196a51ca3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.

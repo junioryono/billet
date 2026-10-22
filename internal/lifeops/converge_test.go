@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 const probeConfig = "/etc/billet/billet.yaml"
@@ -173,7 +174,10 @@ type hostOps struct {
 	owners  map[string]uint32
 	links   map[string]uint64
 	devices map[string]uint64
-	rootEr  error
+	// mounts is where an entry says it is mounted, for the kernels that report a
+	// mount identity; an entry it does not name reports only its device.
+	mounts map[string]regularfile.Mount
+	rootEr error
 
 	// waited records the stability windows that were actually awaited, and
 	// released gates what the runner answers afterwards.
@@ -255,14 +259,16 @@ func (o *hostOps) root(string) (rootFS, error) {
 }
 
 type fakeFile struct {
-	ops  *hostOps
-	path string
-	info fs.FileInfo
-	kind string
+	ops   *hostOps
+	path  string
+	info  fs.FileInfo
+	kind  string
+	mount regularfile.Mount
 }
 
-func (f *fakeFile) Stat() (fs.FileInfo, error) { return f.info, nil }
-func (f *fakeFile) Close() error               { return nil }
+func (f *fakeFile) Stat() (fs.FileInfo, error)        { return f.info, nil }
+func (f *fakeFile) Close() error                      { return nil }
+func (f *fakeFile) Mount() (regularfile.Mount, error) { return f.mount, nil }
 
 func (f *fakeFile) Chown(uid, gid int) error {
 	kind := f.kind
@@ -312,11 +318,17 @@ func (r *fakeRoot) OpenFile(name string, _ int, _ fs.FileMode) (ownedFile, error
 		dev = d
 	}
 
+	mount, ok := r.ops.mounts[name]
+	if !ok {
+		mount = regularfile.Mount{Dev: dev}
+	}
+
 	return &fakeFile{
-		ops:  r.ops,
-		path: name,
-		info: ownedInfo{FileInfo: info, uid: r.ops.owners[name], links: links, dev: dev},
-		kind: "lchown",
+		ops:   r.ops,
+		path:  name,
+		info:  ownedInfo{FileInfo: info, uid: r.ops.owners[name], links: links, dev: dev},
+		kind:  "lchown",
+		mount: mount,
 	}, nil
 }
 
@@ -2576,7 +2588,70 @@ func TestRepairServerStateRefusesAFileFromAnotherFilesystem(t *testing.T) {
 
 	if _, err := c.RepairServerState("/var/lib/billet/server", 990, 991); err == nil {
 		t.Fatal("a file from another filesystem was chowned")
-	} else if !strings.Contains(err.Error(), "different filesystem") {
+	} else if !strings.Contains(err.Error(), "not on the mount of the directory") {
+		t.Errorf("the refusal does not say what was wrong: %v", err)
+	}
+
+	if len(ops.ops) > 0 {
+		t.Errorf("something was changed anyway: %v", ops.kinds())
+	}
+}
+
+// A FILE ON THE DIRECTORY'S OWN MOUNT IS ITS STATE, WHATEVER DEVICE IT REPORTS.
+// On an overlay of more than one filesystem without xino, a file reports the
+// device of the layer it lives in and the directory the overlay's (#123); the
+// mount the kernel names is the same, and the file is not a mount of its own.
+func TestRepairServerStateRepairsAnOverlayFileWhoseDeviceDiffers(t *testing.T) {
+	h := newHost(t)
+	c, ops := h.converger(t, healthyHost(t, h))
+
+	ops.tree = fstest.MapFS{
+		".":         &fstest.MapFile{Mode: fs.ModeDir},
+		"billet.db": &fstest.MapFile{Data: []byte("the ledger")},
+	}
+	ops.owners = map[string]uint32{".": 990, "billet.db": 0}
+	// THE STAT DISAGREES TOO, as the overlay's does, so the device comparison
+	// this replaced would refuse the ledger here.
+	ops.devices = map[string]uint64{".": 64, "billet.db": 99}
+	ops.mounts = map[string]regularfile.Mount{
+		".":         {Dev: 64, Known: true, ID: 7},
+		"billet.db": {Dev: 99, Known: true, ID: 7},
+	}
+
+	repaired, err := c.RepairServerState("/var/lib/billet/server", 990, 991)
+	if err != nil {
+		t.Fatalf("the overlay's own ledger was refused: %v", err)
+	}
+
+	if len(repaired) != 1 || repaired[0] != "/var/lib/billet/server/billet.db" {
+		t.Errorf("repaired %v, want the ledger alone", repaired)
+	}
+
+	if kinds := ops.kinds(); len(kinds) != 1 || kinds[0] != "lchown billet.db" {
+		t.Errorf("the change made was %v, want the ledger given back", kinds)
+	}
+}
+
+// A BIND MOUNT FROM THE SAME FILESYSTEM SHARES THE DEVICE, and is still an inode
+// from somewhere else: the file is the root of a mount of its own, which the
+// kernel names with an identity of its own.
+func TestRepairServerStateRefusesASameDeviceBindMount(t *testing.T) {
+	h := newHost(t)
+	c, ops := h.converger(t, healthyHost(t, h))
+
+	ops.tree = fstest.MapFS{
+		".":         &fstest.MapFile{Mode: fs.ModeDir},
+		"billet.db": &fstest.MapFile{Data: []byte("from elsewhere on this disk")},
+	}
+	ops.owners = map[string]uint32{".": 990, "billet.db": 0}
+	ops.mounts = map[string]regularfile.Mount{
+		".":         {Dev: 64, Known: true, ID: 7},
+		"billet.db": {Dev: 64, Known: true, ID: 31},
+	}
+
+	if _, err := c.RepairServerState("/var/lib/billet/server", 990, 991); err == nil {
+		t.Fatal("a file bind-mounted from the same filesystem was chowned")
+	} else if !strings.Contains(err.Error(), "not on the mount of the directory") {
 		t.Errorf("the refusal does not say what was wrong: %v", err)
 	}
 
