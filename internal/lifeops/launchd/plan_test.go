@@ -427,9 +427,16 @@ func TestUninstallLeavesAnAgentBilletDidNotWrite(t *testing.T) {
 	}
 }
 
-// A PLAN NAMES WHAT IS WRONG WITH THE MACHINE, not just with the services.
+// A PLAN NAMES WHAT IS WRONG WITH THE MACHINE, not just with the services: a
+// log directory this account cannot create (its parent is not writable, as
+// root-owned /usr/local is on a stock Mac) is refused with the command, and the
+// state directory it can create is planned instead (#181).
 func TestPlanRefusesDirectoriesNothingCanWrite(t *testing.T) {
 	t.Parallel()
+
+	if os.Getuid() == 0 {
+		t.Skip("root writes a read-only directory, so the refusal cannot be staged")
+	}
 
 	f := &fake{t: t, replies: map[string][]reply{
 		"print":          {{out: "", code: notLoaded}},
@@ -437,14 +444,29 @@ func TestPlanRefusesDirectoriesNothingCanWrite(t *testing.T) {
 	}}
 
 	c := f.converger(t)
-	c.logDir = filepath.Join(t.TempDir(), "does-not-exist")
+	locked := filepath.Join(t.TempDir(), "root-owned")
+	if err := os.Mkdir(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(locked, 0o700); err != nil {
+			t.Errorf("give the test its directory back: %v", err)
+		}
+	})
+	c.logDir = filepath.Join(locked, "does-not-exist")
+	creatable := filepath.Join(t.TempDir(), "node-state")
 
 	plan, err := c.Plan(t.Context(), lifeops.UpRequest{
-		ConfigPath: filepath.Join(c.agentsDir, "billet.yaml"),
-		WantNode:   true,
+		ConfigPath:   filepath.Join(c.agentsDir, "billet.yaml"),
+		NodeStateDir: creatable,
+		WantNode:     true,
 	})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
+	}
+
+	if len(plan.Directories) != 1 || plan.Directories[0].Path != creatable {
+		t.Errorf("planned %+v, want only %s created", plan.Directories, creatable)
 	}
 
 	var found bool

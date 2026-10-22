@@ -18,7 +18,7 @@ func TestJoinMovesTheMeasuredCeilingOntoTheNode(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 
-	got, err := Join(body, "10.0.0.1:7717", "/etc/billet/tls")
+	got, err := Join(body, "10.0.0.1:7717", "/etc/billet/tls", "")
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestJoinSaysWhatTheControlPlaneNeeds(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 
-	got, err := Join(body, "controller.example:7717", "/etc/billet/tls")
+	got, err := Join(body, "controller.example:7717", "/etc/billet/tls", "")
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestJoinRefusesAnEmptyControlPlaneAddress(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 
-	if _, err := Join(body, "  ", "/etc/billet/tls"); err == nil || !strings.Contains(err.Error(), "--join") {
+	if _, err := Join(body, "  ", "/etc/billet/tls", ""); err == nil || !strings.Contains(err.Error(), "--join") {
 		t.Fatalf("Join accepted an empty control plane address: %v", err)
 	}
 }

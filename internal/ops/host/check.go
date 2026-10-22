@@ -337,6 +337,27 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			fmt.Fprintf(env.Stdout, "fleet    %-24s at %s via %s (%s)\n", member.Name, site,
 				member.Provider, liveness)
 		}
+
+		// THE CEILING AGAINST EVERY REGISTERED HOST, offline ones included, because
+		// this judges the configuration: a host down for a reboot comes back with
+		// its whole contribution. ADVISORY, as in `billet status`; a host that has
+		// never registered is invisible here, and `billet join accept` is what
+		// raises the ceiling for one before it does.
+		contributing, err := a.RegisteredContribution(ctx)
+		if err != nil {
+			return report, err
+		}
+		var (
+			fleetVCPU   int
+			fleetMemory config.ByteSize
+		)
+		for _, c := range contributing {
+			fleetVCPU += c.VCPU
+			fleetMemory += c.Memory
+		}
+		if below := CeilingBelow("registered", len(contributing), fleetVCPU, fleetMemory, cfg.Server); below != "" {
+			fmt.Fprintf(env.Stdout, "ceiling  %s\n", below)
+		}
 	}
 
 	if cfg.Node != nil {

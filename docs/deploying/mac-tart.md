@@ -55,6 +55,8 @@ billet local up                       # installs, starts and proves both agents
 billet local status
 ```
 
+That is a Mac that runs its own control plane. To add the Mac to a deployment whose control plane runs elsewhere, run instead the `billet join` that `billet ca token` prints on the control plane, as the node account: it installs tart and softnet, asks for `sudo` once for the directories, the sleep settings, the node name and softnet's grant, then generates the node's config, enrolls and runs `billet local up` ([One command on each machine](../operating/nodes.md#one-command-on-each-machine)).
+
 Run these as the account that will run the node, **never under `sudo`**: a launch agent lives in your GUI domain, and root's domain has neither an unlocked keychain nor the images you pulled. The directories are the one thing that needs `sudo`, because `/usr/local` is root-owned and launchd creates nothing itself; `billet local up` refuses with the exact command rather than asking for a password.
 
 `/usr/local/bin` is in that list because the updater runs as this account too. A rollout upgrades a Mac by replacing `/usr/local/bin/billet`, which is a rename into that directory, and on a stock Mac the directory is root's; `billet local up` and the updater both refuse with the `chown` above rather than draining the node and then finding the replacement cannot land. On a dedicated runner Mac the account already controls every guest and every image, so the binary being writable by it adds exposure only through that account.

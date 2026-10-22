@@ -67,6 +67,13 @@ type OwnershipChange struct {
 	at fs.FileInfo
 }
 
+// DirectoryCreation is a missing directory `up` will create, and every missing
+// component above it, each with Mode.
+type DirectoryCreation struct {
+	Path string
+	Mode fs.FileMode
+}
+
 // UnitPlan is what `up` will do with one service.
 type UnitPlan struct {
 	Name string
@@ -98,9 +105,13 @@ type UnitPlan struct {
 // UpPlan is everything `up` would do, computed before anything is touched so
 // that --dry-run and the real run are the same decision.
 type UpPlan struct {
-	Refusals  []Refusal
-	Ownership []OwnershipChange
-	Units     []UnitPlan
+	Refusals []Refusal
+	// Directories are created before anything else is changed. Only a manager
+	// whose services run as the invoking account plans one: launchd, for a
+	// directory that account can create (#181).
+	Directories []DirectoryCreation
+	Ownership   []OwnershipChange
+	Units       []UnitPlan
 	// ServerState is the directory the server unit keeps its ledger in, taken
 	// from the unit's own StateDirectory=. Empty when no server is wanted.
 	ServerState string
@@ -1000,6 +1011,17 @@ func (c *Converger) ApplyOwnership(changes []OwnershipChange, uid, gid int) erro
 	}
 
 	return nil
+}
+
+// ApplyDirectories creates nothing on systemd: the units' StateDirectory= and
+// the package make what the services need, and this planner plans no creation.
+func (c *Converger) ApplyDirectories(dirs []DirectoryCreation) error {
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("systemd: billet planned to create %d director(ies), which the units and "+
+		"the package make on this manager. This is a bug in the plan rather than in the host", len(dirs))
 }
 
 func (c *Converger) applyOne(change OwnershipChange, uid, gid int) error {

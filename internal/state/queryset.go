@@ -88,6 +88,7 @@ type ReadOps interface {
 	ListBarrierRuns(ctx context.Context, barrierID string) ([]ledgerdb.ListBarrierRunsRow, error)
 	ListCacheBlocks(ctx context.Context) ([]ledgerdb.CacheBlock, error)
 	ListCodeBuildRegistrationPaths(ctx context.Context, provider string) ([]ledgerdb.ListCodeBuildRegistrationPathsRow, error)
+	ListContributingNodes(ctx context.Context) ([]ledgerdb.ListContributingNodesRow, error)
 	ListCredentialSweeps(ctx context.Context) ([]ledgerdb.CredentialSweep, error)
 	ListEnrollments(ctx context.Context) ([]ledgerdb.NodeEnrollment, error)
 	ListEnrollmentsInState(ctx context.Context, state string) ([]ledgerdb.NodeEnrollment, error)

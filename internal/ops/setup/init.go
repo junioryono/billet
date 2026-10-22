@@ -15,6 +15,7 @@ import (
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/state"
 
@@ -132,6 +133,9 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 	join := fs.String("join", "",
 		"write a node-only config for this machine that joins the control plane at this "+
 			"node-wire address (host:port), and print what that control plane's config needs")
+	joinDeployment := fs.String("join-deployment", "",
+		"with --join: the deployment the node is enrolling with, which binds the printed "+
+			"`billet join accept` token to it (`billet join` sets it from the authority it verified)")
 
 	// WHERE THE LEDGER LIVES, and it is a property of the CONTROL PLANE rather
 	// than of a backend — so unlike every flag below, these apply to any provider.
@@ -307,7 +311,10 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 	// deliberately writes no node.name at all — with a certificate the name comes
 	// from it, and on a loopback machine there is no certificate to disagree with
 	// — so a name accepted there would be written nowhere and mean nothing.
-	if setFlags["node-name"] &&
+	//
+	// A JOIN TAKES IT ON ANY BACKEND: the node enrolls, and enrolling names the
+	// request before any certificate exists to take a name from.
+	if setFlags["node-name"] && !setFlags["join"] &&
 		kind != config.ProviderTart && kind != config.ProviderCodeBuild {
 		return fmt.Errorf("--node-name can only be used with --provider tart or --provider "+
 			"codebuild, but this is a %s config: those are the two backends that can carry a "+
@@ -376,6 +383,14 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 	joining := setFlags["join"]
 	if joining && strings.TrimSpace(*join) == "" {
 		return errors.New("--join: the control plane's node-wire address is empty")
+	}
+	if *joinDeployment != "" {
+		if !joining {
+			return errors.New("--join-deployment is a property of a join; pass it with --join")
+		}
+		if err := deploymentid.Validate(*joinDeployment); err != nil {
+			return fmt.Errorf("--join-deployment: %w", err)
+		}
 	}
 	if joining && emitValue == emitAnsible {
 		return errors.New("--join writes this machine's node config and prints the control " +
@@ -701,10 +716,11 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 		if err != nil {
 			return fmt.Errorf("resolve --config %s: %w", *cfgPath, err)
 		}
-		joined, err = initconfig.Join(body, *join, filepath.Join(filepath.Dir(abs), "tls"))
+		joined, err = initconfig.Join(body, *join, filepath.Join(filepath.Dir(abs), "tls"), *nodeName)
 		if err != nil {
 			return err
 		}
+		joined.Proposal.Deployment = *joinDeployment
 		body = joined.Node
 	}
 
@@ -1165,7 +1181,24 @@ func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, join
 
 // printJoinControlPlane prints the half of a join that belongs in the control
 // plane's config.
+//
+// THE TOKEN ONLY WHEN THE NODE'S NAME AND ITS DEPLOYMENT ARE KNOWN, which is
+// `billet join`'s generation and no other: the name lets `billet join accept`
+// set the node's own registered row aside, so accepting twice raises nothing
+// again, and the deployment, which `billet join` read from the authority it
+// verified, binds the token to one control plane. Otherwise the half is
+// printed to merge by hand.
 func printJoinControlPlane(env cli.Env, joined initconfig.JoinResult) {
+	if joined.Proposal.Node != "" && joined.Proposal.Deployment != "" {
+		if token, err := joined.Proposal.Token(); err == nil {
+			fmt.Fprintf(env.Stdout, "\nOn the control plane, one command merges this node's tiers, its "+
+				"nodes: entry and its share of the ceiling into its config:\n\n  billet join accept %s\n\n"+
+				"What that merges, for reading:\n\n%s\n", token, joined.ControlPlane)
+
+			return
+		}
+	}
+
 	fmt.Fprintf(env.Stdout, "\nOn the control plane:\n\n%s\n", joined.ControlPlane)
 }
 

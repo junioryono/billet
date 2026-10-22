@@ -1792,6 +1792,20 @@ func WriteGitHubBlock(env cli.Env, path string, b GitHubBlock) error {
 			"recorded nowhere here", path, err)
 	}
 
+	return ReplaceConfig(env, path, raw, rendered)
+}
+
+// ReplaceConfig replaces an existing config with rendered, atomically, keeping
+// the original's mode and owner: the one in-place writer of a config billet
+// edits a block of (`github-app create --config`, `billet join accept`).
+//
+// ONLY WHILE THE FILE STILL SAYS expect, the bytes the edit was made from,
+// checked as the last thing before the rename: a write by anything else since
+// the caller read it is refused rather than replaced by an edit of what the
+// file used to say. The window between that check and the rename stays, and a
+// writer that neither locks nor checks can still land in it; it is the length
+// of one rename, where it was the whole render.
+func ReplaceConfig(env cli.Env, path string, expect, rendered []byte) error {
 	// THE REPLACEMENT PRESERVES WHAT THE ORIGINAL HAD. A rename swaps the
 	// inode, so without this a package-installed root:billet 0640 config — or
 	// the one `init --profile local-service` just arranged — silently becomes
@@ -1881,6 +1895,11 @@ func WriteGitHubBlock(env cli.Env, path string, b GitHubBlock) error {
 			"as %s", name, path)
 	}
 
+	if now, err := os.ReadFile(path); err != nil || !bytes.Equal(now, expect) {
+		return fmt.Errorf("%s changed after it was read (%v), so it was NOT replaced with an edit of "+
+			"what it used to say; run the command again", path, err)
+	}
+
 	if err := os.Rename(name, path); err != nil {
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
@@ -1893,7 +1912,7 @@ func WriteGitHubBlock(env cli.Env, path string, b GitHubBlock) error {
 	// failed — which would print the block as though nothing had been recorded.
 	if err := SyncDir(filepath.Dir(path)); err != nil {
 		fmt.Fprintf(env.Stderr, "\nWarning: %s was updated, but that could not be flushed to "+
-			"disk (%v). Confirm it still names the App after a reboot.\n", path, err)
+			"disk (%v). Confirm it still says what was written after a reboot.\n", path, err)
 	}
 
 	return nil

@@ -23,6 +23,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Never signal a pid you have not proved is still yours.**
 - **Giving away a hard link gives away the inode.**
 - **Privileged operations go through a descriptor, never a pathname.**
+- **A Mac join never runs billet as root.**
 - **The IAM grants have no delete where the credential would sit beside what it could destroy.**
 - **Root-created identity artefacts are handed back to the service account by descriptor, named, never walked.**
 

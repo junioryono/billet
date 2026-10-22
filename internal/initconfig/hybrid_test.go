@@ -25,8 +25,12 @@ func hybridParams() HybridParams {
 		CloudMemory:    32 * config.GiB,
 		Shapes:         ec2Shapes(),
 		Ref:            "v0.5.0",
+		Generation:     testGeneration,
 	}
 }
+
+// testGeneration is the fingerprint every test generation carries.
+const testGeneration = "0123-4567-89ab-cdef"
 
 func hybridFacts() *HybridFacts {
 	return &HybridFacts{
@@ -265,6 +269,9 @@ func TestGenerateHybridPlaceholdersNameDeclaredOutputs(t *testing.T) {
 		// command test green — they hand the parser a document they wrote
 		// themselves — while a real prepare render refused every root.
 		HybridOutputName, HybridOutputRegion,
+		// The two that BIND the outputs to this root (#62): the fingerprint the
+		// plan render minted, and the account the apply ran in.
+		HybridOutputGeneration, HybridOutputAccountID,
 	} {
 		if !declared[name] {
 			t.Errorf("terraform/main.tf does not declare %q, which the prepare render demands", name)
@@ -541,7 +548,9 @@ func TestParseTerraformOutput(t *testing.T) {
   "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
   "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
   "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
-  "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"},
+  "generation": {"sensitive": false, "type": "string", "value": "0123-4567-89ab-cdef"},
+  "account_id": {"sensitive": false, "type": "string", "value": "123456789012"}
 }`
 
 	got, err := ParseTerraformOutput([]byte(full), HybridNeeds{Untrusted: true})
@@ -552,6 +561,7 @@ func TestParseTerraformOutput(t *testing.T) {
 		ControlPlanePrivateIP: "10.60.0.10", LedgerVolumeID: "vol-0abc", SubnetID: "subnet-0abc",
 		RunnerSecurityGroupID: "sg-trusted", UntrustedRunnerSecurityGroupID: "sg-untrusted",
 		AMIPayloadBucket: "acme-ci-ami-payloads-1", Name: "acme-ci", Region: "us-west-2",
+		Generation: testGeneration, AccountID: "123456789012",
 	}
 	if got != want {
 		t.Errorf("facts %+v, want %+v", got, want)
@@ -810,6 +820,8 @@ func TestParseTerraformOutputCacheFacts(t *testing.T) {
   "ami_payload_bucket": {"value": "acme-ci-ami-payloads-1"},
   "name": {"value": "acme-ci"},
   "region": {"value": "us-west-2"},
+  "generation": {"value": "0123-4567-89ab-cdef"},
+  "account_id": {"value": "123456789012"},
   "cache_bucket": {"value": "acme-ci-cache-1"},
   "cache_prefix": {"value": "billet-cache"},
   "availability_zone": {"value": "us-west-2a"}
