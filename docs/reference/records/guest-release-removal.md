@@ -56,7 +56,7 @@ These 19 releases were deleted with `gh release delete` at about 20:20 UTC, minu
 ## What this does to a deployment
 
 - **A generation already imported is untouched.** A deployment keeps the generations it has imported in its own store, until its own `billet images reap` removes them, and a tier pinned to one, or at `@verified` on one, goes on booting it.
-- **Nothing fetches an old tag by itself.** `billet images pull` reads the guest channel, which names the new release. Only a pull pointed by hand at a removed release's assets (`--source`) now fails, because GitHub answers that release's download URLs with 404.
+- **By default nothing fetches an old tag.** `billet images pull` and the unattended refresh read the guest channel, which names the new release. A pull pointed at a removed release's assets now fails, because GitHub answers its download URLs with 404: by hand with `--source`, or on every refresh for a deployment whose `images.source` names one. Such a deployment goes back to the channel by removing `images.source`.
 - **The known-answer run** downloaded a part of `guest-20261005-070030` as its network load. It was moved to the pinned Linux tarball first (#634).
 
 ## Decided by
