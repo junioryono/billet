@@ -286,6 +286,8 @@ type fakeDisk struct {
 	// none, which is the ordinary case for an image built by hand.
 	kernel    string
 	kernelErr error
+	// kernelAsked is every generation whose kernel was looked up.
+	kernelAsked []string
 
 	// cloneGone makes the next N clones fail as though the generation had been
 	// removed, which is the race the launch re-resolves around.
@@ -302,6 +304,63 @@ type fakeDisk struct {
 	// onDiscard runs inside DiscardRoot, so a test can change the host between the
 	// discard and the releases a teardown makes after it.
 	onDiscard func()
+
+	// published, withdrawn and goldenClones record the golden disk calls, each as
+	// "from -> to"; publishErr, withdrawErr and cloneGoldenErr fail them.
+	published      []string
+	withdrawn      []string
+	goldenClones   []string
+	publishErr     error
+	withdrawErr    error
+	cloneGoldenErr error
+}
+
+// fakeGeneration is the generation every fake publication answers.
+const fakeGeneration = "g20261021000000"
+
+func (d *fakeDisk) PublishRoot(_ context.Context, name, golden string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.publishErr != nil {
+		return "", d.publishErr
+	}
+
+	ref := golden + "@" + fakeGeneration
+	d.published = append(d.published, name+" -> "+ref)
+
+	return ref, nil
+}
+
+func (d *fakeDisk) WithdrawRoot(_ context.Context, ref, name string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.withdrawn = append(d.withdrawn, ref+" -> "+name)
+
+	return d.withdrawErr
+}
+
+func (d *fakeDisk) CloneGolden(_ context.Context, ref, name string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.cloneGoldenErr != nil {
+		return "", d.cloneGoldenErr
+	}
+
+	d.goldenClones = append(d.goldenClones, ref+" -> "+name)
+
+	return d.device, nil
+}
+
+// goldenCalls is what the disk was asked to publish, withdraw and clone.
+func (d *fakeDisk) goldenCalls() (published, withdrawn, cloned []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return append([]string(nil), d.published...), append([]string(nil), d.withdrawn...),
+		append([]string(nil), d.goldenClones...)
 }
 
 // resolve stands in for the store turning `@verified` into a generation. The fake
@@ -368,9 +427,11 @@ func (d *fakeDisk) DiscardRoot(_ context.Context, name string) error {
 	return d.discardErr
 }
 
-func (d *fakeDisk) KernelFor(_ context.Context, _, _ string) (string, bool, error) {
+func (d *fakeDisk) KernelFor(_ context.Context, image, generation string) (string, bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	d.kernelAsked = append(d.kernelAsked, image+"@"+generation)
 
 	if d.kernelErr != nil {
 		return "", false, d.kernelErr
@@ -436,6 +497,9 @@ type harness struct {
 	devices map[string]int
 	// ownerErr makes asking the kernel whose a device is fail.
 	ownerErr error
+	// flushed is every root device a capture flushed, and flushErr fails the flush.
+	flushed  []string
+	flushErr error
 }
 
 // tapOwner is the kernel's answer for the fake host.
@@ -609,6 +673,16 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
 	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
+
+	// AND ITS ROOT DISK IS NO DEVICE, so a flush is recorded rather than made.
+	h.p.flushRoot = func(device string) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		h.flushed = append(h.flushed, device)
+
+		return h.flushErr
+	}
 
 	return h
 }

@@ -576,6 +576,74 @@ func (d rbdDisk) KernelFor(_ context.Context, _, _ string) (string, bool, error)
 // exercise the alias re-resolve.
 func (d rbdDisk) GenerationGone(error) bool { return false }
 
+// PublishRoot, WithdrawRoot and CloneGolden are the store's (internal/store/ceph),
+// command for command, so the real test runs the cluster through what billet asks.
+func (d rbdDisk) PublishRoot(ctx context.Context, name, golden string) (string, error) {
+	generation := "g" + time.Now().UTC().Format("20060102150405")
+
+	if out, err := exec.CommandContext(ctx, "rbd", d.args("snap", "create",
+		d.cache+"/"+name+"@"+generation)...).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("snapshot %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+
+	if out, err := exec.CommandContext(ctx, "rbd", d.args("rename",
+		d.cache+"/"+name, d.cache+"/"+golden)...).CombinedOutput(); err != nil {
+		// UNDONE AS THE STORE UNDOES IT, so the builder's discard can still remove
+		// its clone: a clone that keeps a snapshot is one rbd rm refuses.
+		renameErr := fmt.Errorf("rename %s to %s: %w: %s", name, golden, err, strings.TrimSpace(string(out)))
+
+		return "", errors.Join(renameErr,
+			d.WithdrawRoot(context.WithoutCancel(ctx), golden+"@"+generation, name))
+	}
+
+	return golden + "@" + generation, nil
+}
+
+func (d rbdDisk) WithdrawRoot(ctx context.Context, ref, name string) error {
+	golden, generation, _ := strings.Cut(ref, "@")
+
+	if out, err := exec.CommandContext(ctx, "rbd", d.args("rename",
+		d.cache+"/"+golden, d.cache+"/"+name)...).CombinedOutput(); err != nil &&
+		!strings.Contains(string(out), "No such file or directory") {
+		return fmt.Errorf("rename %s back to %s: %w: %s", golden, name, err, strings.TrimSpace(string(out)))
+	}
+
+	if out, err := exec.CommandContext(ctx, "rbd", d.args("snap", "rm",
+		d.cache+"/"+name+"@"+generation)...).CombinedOutput(); err != nil &&
+		!strings.Contains(string(out), "No such file or directory") {
+		return fmt.Errorf("remove %s@%s: %w: %s", name, generation, err, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
+func (d rbdDisk) CloneGolden(ctx context.Context, ref, name string) (string, error) {
+	if out, err := exec.CommandContext(ctx, "rbd", d.args("clone",
+		d.cache+"/"+ref, d.cache+"/"+name)...).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("clone %s: %w: %s", ref, err, strings.TrimSpace(string(out)))
+	}
+
+	out, err := exec.CommandContext(ctx, "rbd", d.args("device", "map", d.cache+"/"+name)...).Output()
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// removeGolden removes a golden's system disk and its generations, once every fork
+// of it is gone.
+func (d rbdDisk) removeGolden(ctx context.Context, golden string) error {
+	for _, args := range [][]string{{"snap", "purge", d.cache + "/" + golden}, {"rm", d.cache + "/" + golden}} {
+		if out, err := exec.CommandContext(ctx, "rbd", d.args(args...)...).CombinedOutput(); err != nil &&
+			!strings.Contains(string(out), "No such file or directory") {
+			return fmt.Errorf("%s %s: %w: %s", args[0], golden, err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	return nil
+}
+
 // freshLease is a lease id of the shape alloc mints, unique per run so a previous
 // failed run's leftovers cannot be mistaken for this one's.
 func freshLease(t *testing.T) string {
