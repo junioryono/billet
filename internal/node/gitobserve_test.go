@@ -19,6 +19,8 @@ type recordingGitObserver struct {
 	took      []time.Duration
 	refreshes []string
 	lookups   []string
+	// maintenances is each maintenance pass as "kind outcome".
+	maintenances []string
 }
 
 func (o *recordingGitObserver) GitRequest(route, reason, status string, took time.Duration) {
@@ -38,6 +40,20 @@ func (o *recordingGitObserver) GitLookup(outcome string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.lookups = append(o.lookups, outcome)
+}
+
+func (o *recordingGitObserver) GitMaintenance(kind, outcome string, _ time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.maintenances = append(o.maintenances, kind+" "+outcome)
+}
+
+// maintained is the maintenance passes the observer was told of.
+func (o *recordingGitObserver) maintained() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return slices.Clone(o.maintenances)
 }
 
 func (o *recordingGitObserver) seen() ([]string, []string, []string) {

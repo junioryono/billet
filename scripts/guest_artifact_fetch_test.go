@@ -69,7 +69,7 @@ func artifactZip(t *testing.T, path string, names ...string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func runFetch(t *testing.T, fake string) (string, string, error) {
+func runFetch(t *testing.T, fake string, env ...string) (string, string, error) {
 	t.Helper()
 
 	bin := filepath.Join(fake, "bin")
@@ -89,7 +89,8 @@ func runFetch(t *testing.T, fake string) (string, string, error) {
 	cmd := exec.CommandContext(t.Context(), "./fetch-guest-artifact.sh", out)
 	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE="+fake,
 		"GH_TOKEN=token-for-test", "GITHUB_REPOSITORY=junioryono/billet", "GITHUB_RUN_ID=77",
-		"RUNNER_TEMP="+temp)
+		"RUNNER_TEMP="+temp, "GUEST_ARTIFACT_ID=42")
+	cmd.Env = append(cmd.Env, env...)
 	output, err := cmd.CombinedOutput()
 
 	return out, string(output), err
@@ -130,9 +131,40 @@ func TestTheGuestArtifactIsFetchedWhole(t *testing.T) {
 	}
 }
 
+// A RERUN'S ARTIFACT IS THE ONE ITS BUILD JOB UPLOADED, by id, beside an earlier
+// attempt's of the same name: run 39813415826 held a failed attempt's beside the
+// successful one's (2026-10-22).
+func TestTheGuestArtifactFetchTakesTheBuildJobsOwn(t *testing.T) {
+	t.Parallel()
+
+	fake := t.TempDir()
+	digest := artifactZip(t, filepath.Join(fake, "artifact.zip"), "manifest.json", "vmlinux-billet")
+	writeFake(t, fake, "listing", fmt.Sprintf(`{"artifacts":[`+
+		`{"id":42,"name":"guest-image","expired":false,"size_in_bytes":45974670,"digest":"sha256:%s"},`+
+		`{"id":43,"name":"guest-image","expired":false,"size_in_bytes":1000,"digest":"sha256:%s"}]}`,
+		strings.Repeat("0", 64), digest))
+	writeFake(t, fake, "free", fmt.Sprintf("%d\n", 2*1000+4<<30))
+
+	out, output, err := runFetch(t, fake, "GUEST_ARTIFACT_ID=43")
+	if err != nil {
+		t.Fatalf("fetch: %v\n%s", err, output)
+	}
+	if got, err := os.ReadFile(filepath.Join(out, "vmlinux-billet")); err != nil || string(got) != "vmlinux-billet" {
+		t.Errorf("the build job's artifact was not extracted (%v): %q", err, got)
+	}
+	calls, err := os.ReadFile(filepath.Join(fake, "calls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "/actions/artifacts/43/zip") || strings.Contains(string(calls), "/actions/artifacts/42/zip") {
+		t.Errorf("the fetch did not take artifact 43 alone:\n%s", calls)
+	}
+}
+
 // A FETCH THAT CANNOT BE PROVED WHOLE EXTRACTS NOTHING: a zip whose digest is not
-// GitHub's, an artifact with no digest, two artifacts of the name, or too little
-// room each refuse, and the last three before anything is downloaded.
+// GitHub's, an artifact with no digest, an id this run has no live guest-image
+// artifact of, or too little room each refuse, and all but the first before
+// anything is downloaded.
 func TestTheGuestArtifactFetchRefusesWhatItCannotProve(t *testing.T) {
 	t.Parallel()
 
@@ -145,10 +177,15 @@ func TestTheGuestArtifactFetchRefusesWhatItCannotProve(t *testing.T) {
 			"10737418240", "is not the one GitHub describes", true},
 		{"no digest", `{"artifacts":[{"id":42,"name":"guest-image","expired":false,"size_in_bytes":1000}]}`,
 			"10737418240", "published no sha256", false},
-		{"two artifacts of the name", `{"artifacts":[` +
-			`{"id":42,"name":"guest-image","expired":false,"size_in_bytes":1000,"digest":"sha256:x"},` +
+		{"an id this run has no artifact of", `{"artifacts":[` +
 			`{"id":43,"name":"guest-image","expired":false,"size_in_bytes":1000,"digest":"sha256:x"}]}`,
-			"10737418240", "exactly one", false},
+			"10737418240", "no live guest-image artifact 42", false},
+		{"the id of another artifact", `{"artifacts":[` +
+			`{"id":42,"name":"something-else","expired":false,"size_in_bytes":1000,"digest":"sha256:x"}]}`,
+			"10737418240", "no live guest-image artifact 42", false},
+		{"the id of an expired artifact", `{"artifacts":[` +
+			`{"id":42,"name":"guest-image","expired":true,"size_in_bytes":1000,"digest":"sha256:x"}]}`,
+			"10737418240", "no live guest-image artifact 42", false},
 		// ROOM FOR THE ZIP AND ITS CONTENTS: a 10GiB artifact needs 24GiB, so 20GiB
 		// (room for one copy and the margin) is refused. The digest is the zip's
 		// own, so only the room check can refuse it.

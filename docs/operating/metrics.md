@@ -74,6 +74,8 @@ A node with `node.cache` counts what its Git proxy does ([ADR-018](../reference/
 | `billet_node_git_refreshes_total{outcome}` | refreshes of a mirror by how each ended: `ok`, `unverified` (GitHub did not name the same repository after the fetch, so the mirror is replaced), `too_large`, `busy` (no fetch slot), `disk_full`, `closed` or `failed` |
 | `billet_node_git_refresh_seconds` | how long each refresh took (a histogram) |
 | `billet_node_git_repository_lookups_total{outcome}` | questions to GitHub's API about which repository a name is, one with every advertisement and after every refresh: `ok`, `refused`, `rate_limited` or `failed`; anything but `ok` sends that request to GitHub, so a rising `rate_limited` is the proxy spending the jobs' API budget |
+| `billet_node_git_maintenance_total{kind,outcome}` | passes keeping a mirror in few packs, run after a refresh: `kind` is `full` (the daily repack into one pack with a bitmap, removing nothing), `prune` (the weekly pass, when a refresh runs, that removes what a pass found unreachable at least fourteen days before, with the mirror to itself) or `geometric` (merging small packs once a mirror holds eight); `outcome` is `ok`, `busy` (fetches being served kept the mirror), `disk_full` (no room for a second copy of the mirror), `closed` or `failed`. A job whose refs moved while its mirror was maintained, past what it waits, and every request while a mirror is pruned, is counted in `billet_node_git_requests_total` under `reason="mirror_maintaining"` |
+| `billet_node_git_maintenance_seconds{kind}` | how long each pass took (a histogram) |
 
 ## Reaching it from another host
 

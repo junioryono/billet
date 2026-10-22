@@ -113,13 +113,22 @@ func TestAnOlderAdvertisementNeverRemovesANewerRef(t *testing.T) {
 			request := gitRequest{session: service.sessionOf(provider.InstanceName(scopedLease)),
 				owner: "acme", repo: "api", auth: gitAuth(githubBasic)}
 			path := service.git.mirrorPath(request.key())
+			// EACH REFRESH RUNS ON ITS OWN, after whatever repack the last left, so
+			// none joins a finished one and proves nothing.
+			var last *gitRefresh
 			refresh := func(refs map[string]string, sequence uint64) {
 				t.Helper()
 
+				awaitIdleMirror(t, service, request.key())
 				started := service.startRefresh(t.Context(), request, upstream.repositoryID("api"),
 					service.git.mirror(request.key()), "refs/heads/main", refs, sequence)
+				if started == last {
+					t.Fatal("the refresh joined the one before it rather than running")
+				}
+				last = started
 				if err := gitWithin(t, "a refresh", func() error {
 					<-started.done
+					<-started.idle
 
 					return started.err
 				}); err != nil {

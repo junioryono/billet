@@ -11,7 +11,8 @@
 # extracted.
 #
 # Usage: fetch-guest-artifact.sh <directory>
-# Needs GH_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_RUN_ID and RUNNER_TEMP.
+# Needs GH_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_RUN_ID, RUNNER_TEMP and
+# GUEST_ARTIFACT_ID, the id the build job's upload reported.
 set -euo pipefail
 
 out=${1:?usage: fetch-guest-artifact.sh <directory>}
@@ -19,22 +20,28 @@ out=${1:?usage: fetch-guest-artifact.sh <directory>}
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+: "${GUEST_ARTIFACT_ID:?GUEST_ARTIFACT_ID is required: the id the upload in the build job reported}"
 
 fail() {
 	echo "fetch-guest-artifact: $*" >&2
 	exit 1
 }
 
-# EXACTLY ONE ARTIFACT OF THAT NAME ON THIS RUN, with a size and a digest. Anything
-# else is not the artifact this run checked, or cannot be proved to be.
+# THE ARTIFACT THE BUILD JOB THAT SUCCEEDED UPLOADED, by the id its upload
+# reported, and one of this run's, live and of that name, with a size and a digest.
+# A rerun leaves the earlier attempts' artifacts on the run under the same name
+# (the upload runs on failure too), so the name alone cannot say which one this
+# run checked: run 39813415826 held a failed attempt's 45MB one beside the
+# successful attempt's 18GB one (2026-10-22).
+[[ $GUEST_ARTIFACT_ID =~ ^[1-9][0-9]*$ ]] || fail "the build job's artifact id '$GUEST_ARTIFACT_ID' is not a number"
 listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=guest-image&per_page=100") ||
 	fail "could not list this run's artifacts"
-if ! meta=$(jq -er '
-	[.artifacts[] | select(.name == "guest-image" and (.expired | not))]
-	| if length != 1 then error("\(length) artifacts named guest-image") else .[0] end
+if ! meta=$(jq -er --argjson id "$GUEST_ARTIFACT_ID" '
+	[.artifacts[] | select(.id == $id and .name == "guest-image" and (.expired | not))]
+	| if length != 1 then error("no live guest-image artifact \($id)") else .[0] end
 	| "\(.id) \(.size_in_bytes) \(.digest // "")"
 ' <<<"$listing"); then
-	fail "this run does not have exactly one live guest-image artifact"
+	fail "this run has no live guest-image artifact $GUEST_ARTIFACT_ID, the one its build job uploaded"
 fi
 read -r id size digest <<<"$meta"
 [[ $id =~ ^[1-9][0-9]*$ ]] || fail "the artifact's id '$id' is not a number"

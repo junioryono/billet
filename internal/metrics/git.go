@@ -11,18 +11,21 @@ import (
 // internal/node's GitObserver by its methods alone, so the node imports no
 // metrics library.
 type GitObserver struct {
-	requests  *prometheus.CounterVec
-	durations *prometheus.HistogramVec
-	refreshes *prometheus.CounterVec
-	refreshed prometheus.Histogram
-	lookups   *prometheus.CounterVec
-	known     map[string]map[string]bool
+	requests   *prometheus.CounterVec
+	durations  *prometheus.HistogramVec
+	refreshes  *prometheus.CounterVec
+	refreshed  prometheus.Histogram
+	lookups    *prometheus.CounterVec
+	maintains  *prometheus.CounterVec
+	maintained *prometheus.HistogramVec
+	known      map[string]map[string]bool
 }
 
 // GitLabels is every value each of the Git proxy's labels may take, as the
 // node package names them.
 type GitLabels struct {
 	Routes, Reasons, Statuses, RefreshOutcomes, LookupOutcomes []string
+	MaintenanceKinds, MaintenanceOutcomes                      []string
 }
 
 // gitRequestBuckets run from a hundredth of a second, an advertisement served
@@ -61,17 +64,32 @@ func (r *Registry) GitObserver(labels GitLabels) (*GitObserver, error) {
 				"and after every refresh, by its answer: ok, refused, rate_limited, or failed. Any answer but ok " +
 				"sends that request to GitHub.",
 		}, []string{"outcome"}),
+		maintains: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "billet_node_git_maintenance_total",
+			Help: "Passes keeping a Git mirror in few packs, off the request path after a refresh, by kind " +
+				"(geometric, which rolls small packs up; full, one pack with a bitmap, removing nothing; prune, " +
+				"which removes what a pass found unreachable longer ago than the retention window, with the " +
+				"mirror to itself) and " +
+				"how each ended: ok, busy (fetches being served kept the mirror), disk_full, closed, or failed.",
+		}, []string{"kind", "outcome"}),
+		maintained: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "billet_node_git_maintenance_seconds",
+			Help:    "How long each maintenance pass of a Git mirror took, by kind, whatever its outcome.",
+			Buckets: gitRequestBuckets,
+		}, []string{"kind"}),
 		known: map[string]map[string]bool{},
 	}
 
-	for _, c := range []prometheus.Collector{o.requests, o.durations, o.refreshes, o.refreshed, o.lookups} {
+	for _, c := range []prometheus.Collector{o.requests, o.durations, o.refreshes, o.refreshed, o.lookups,
+		o.maintains, o.maintained} {
 		if err := r.reg.Register(c); err != nil {
 			return nil, fmt.Errorf("metrics: register the Git proxy's: %w", err)
 		}
 	}
 
 	for name, values := range map[string][]string{"route": labels.Routes, "reason": labels.Reasons,
-		"status": labels.Statuses, "refresh": labels.RefreshOutcomes, "lookup": labels.LookupOutcomes} {
+		"status": labels.Statuses, "refresh": labels.RefreshOutcomes, "lookup": labels.LookupOutcomes,
+		"kind": labels.MaintenanceKinds, "maintenance": labels.MaintenanceOutcomes} {
 		o.known[name] = map[string]bool{otherCause: true}
 		for _, v := range values {
 			o.known[name][v] = true
@@ -90,6 +108,12 @@ func (r *Registry) GitObserver(labels GitLabels) (*GitObserver, error) {
 	}
 	for _, outcome := range append(labels.LookupOutcomes, otherCause) {
 		o.lookups.WithLabelValues(outcome)
+	}
+	for _, kind := range append(labels.MaintenanceKinds, otherCause) {
+		o.maintained.WithLabelValues(kind)
+		for _, outcome := range append(labels.MaintenanceOutcomes, otherCause) {
+			o.maintains.WithLabelValues(kind, outcome)
+		}
 	}
 
 	return o, nil
@@ -120,4 +144,12 @@ func (o *GitObserver) GitRefresh(outcome string, took time.Duration) {
 // GitLookup counts one question to GitHub's API by its answer.
 func (o *GitObserver) GitLookup(outcome string) {
 	o.lookups.WithLabelValues(o.closed("lookup", outcome)).Inc()
+}
+
+// GitMaintenance counts one maintenance pass by its kind and how it ended, and
+// how long it took.
+func (o *GitObserver) GitMaintenance(kind, outcome string, took time.Duration) {
+	kind = o.closed("kind", kind)
+	o.maintains.WithLabelValues(kind, o.closed("maintenance", outcome)).Inc()
+	o.maintained.WithLabelValues(kind).Observe(took.Seconds())
 }

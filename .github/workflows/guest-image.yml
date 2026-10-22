@@ -76,6 +76,9 @@ jobs:
 
     outputs:
       tag: ${{ steps.pack.outputs.tag }}
+      # THE ARTIFACT THIS ATTEMPT UPLOADED, by id: a rerun leaves an earlier
+      # attempt's artifact of the same name on the run.
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
       source_tag: ${{ steps.source.outputs.tag }}
       source_sha: ${{ steps.source.outputs.sha }}
       source_is_release: ${{ steps.source.outputs.is_release }}
@@ -469,6 +472,7 @@ jobs:
       # artifact; the privileged job below consumes it only when this exact run is
       # main and publication was requested. Manual inspection uses the same bytes.
       - name: Upload the checked image
+        id: upload
         # always() SO A FAILED GATE STILL HANDS OVER THE ARTIFACT. Without it, the
         # one run where somebody most wants to open the image -- the one that just
         # refused to publish it -- is the run that uploads nothing.
@@ -548,6 +552,7 @@ jobs:
       - name: Download the checked image
         env:
           GH_TOKEN: ${{ github.token }}
+          GUEST_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
         run: scripts/fetch-guest-artifact.sh out
 
       - name: Install cosign
