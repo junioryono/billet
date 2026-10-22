@@ -131,6 +131,10 @@ var errMirrorTooLarge = errors.New("the repository is larger than the tier's git
 // when the advertisement could wait no longer.
 var errRefreshPending = errors.New("the mirror is still being refreshed")
 
+// errMirrorMaintaining says the mirror's refs were behind GitHub's while it was
+// repacked or pruned, past what an advertisement waits.
+var errMirrorMaintaining = errors.New("the mirror is being repacked")
+
 // errGitIdle ends a git request on which no byte has moved for gitIdleLimit.
 var errGitIdle = errors.New("no byte moved for the git idle limit")
 
@@ -147,10 +151,12 @@ var uploadPackConfig = []string{"-c", "uploadpack.allowAnySHA1InWant=true",
 	"-c", "uploadpack.allowFilter=true"}
 
 // gitFetchConfig is how a mirror is fetched: no automatic gc or maintenance,
-// which git would detach with the job's header in its environment, and a
-// commit-graph kept, which pack-objects reads.
+// which git would detach with the job's header in its environment; a
+// commit-graph kept, which pack-objects reads; and what a fetch brings kept as
+// the pack it came in, never loose objects, so maintenance sees every fetch
+// as the pack it rolls up.
 var gitFetchConfig = []string{"-c", "gc.auto=0", "-c", "maintenance.auto=false",
-	"-c", "fetch.writeCommitGraph=true"}
+	"-c", "fetch.writeCommitGraph=true", "-c", "fetch.unpackLimit=1"}
 
 // gitProxy is the node's mirrors and what it remembers about them.
 type gitProxy struct {
@@ -162,19 +168,30 @@ type gitProxy struct {
 	client *http.Client
 	// fullFraction is gitFullFraction, refreshWait gitRefreshWait, idleLimit
 	// gitIdleLimit, firstLineWait gitFirstLineWait, requestLimit
-	// gitRequestLimit and narrowMost gitNarrowMost: fields so a test is decided
-	// by neither the fill of the disk it runs on nor the clock nor its memory,
-	// and can make a refresh whole.
-	fullFraction  float64
-	refreshWait   time.Duration
-	idleLimit     time.Duration
-	firstLineWait time.Duration
-	requestLimit  int64
-	narrowMost    int
+	// gitRequestLimit, narrowMost gitNarrowMost, maxPacks gitMaxPacks and
+	// fullRepackEvery gitFullRepackEvery: fields so a test is decided by
+	// neither the fill of the disk it runs on nor the clock nor its memory,
+	// and can make a refresh whole or a roll-up due.
+	fullFraction    float64
+	refreshWait     time.Duration
+	idleLimit       time.Duration
+	firstLineWait   time.Duration
+	requestLimit    int64
+	narrowMost      int
+	maxPacks        int
+	fullRepackEvery time.Duration
 
 	fetches chan struct{}
 	work    chan struct{}
-	reaping atomic.Bool
+	// maintaining is the node's one maintenance pass at a time: a full repack
+	// holds the mirror's every object in memory (800 MB for a 476 MB mirror,
+	// measured 2026-10-22), and a pass that finds it taken is skipped.
+	maintaining chan struct{}
+	// beforeRepackWait runs as an advertisement starts to wait for a repack to
+	// free its mirror's refresh slot; a seam so a test can end the repack only
+	// once a request waits for it. Nil in production.
+	beforeRepackWait func()
+	reaping          atomic.Bool
 	// observer is what the proxy reports to (SetGitObserver).
 	observer atomic.Pointer[GitObserver]
 	// background is every refresh still running, which belongs to no request
@@ -233,6 +250,9 @@ type gitMirror struct {
 	refreshing *gitRefresh
 	fetchedAt  uint64
 	use        sync.RWMutex
+	// pruning sends every new request to GitHub while a prune waits for or
+	// holds use alone.
+	pruning atomic.Bool
 }
 
 // gitRefresh is one fetch of a mirror to GitHub's refs. err is set before done
@@ -240,6 +260,11 @@ type gitMirror struct {
 type gitRefresh struct {
 	done chan struct{}
 	err  error
+	// maintaining says the mirror is being repacked after the fetch, with the
+	// refresh slot still held, set before done is closed; idle is closed once
+	// the slot is free.
+	maintaining bool
+	idle        chan struct{}
 }
 
 func newGitProxy(root string) *gitProxy {
@@ -259,9 +284,11 @@ func newGitProxy(root string) *gitProxy {
 		firstLineWait: gitFirstLineWait,
 		requestLimit:  gitRequestLimit,
 		narrowMost:    gitNarrowMost,
-		fetches:       make(chan struct{}, gitFetches),
-		work:          make(chan struct{}, gitWork),
-		mirrors:       make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
+		maxPacks:      gitMaxPacks, fullRepackEvery: gitFullRepackEvery,
+		maintaining: make(chan struct{}, 1),
+		fetches:     make(chan struct{}, gitFetches),
+		work:        make(chan struct{}, gitWork),
+		mirrors:     make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
 		tooLarge: make(map[string]time.Time),
 		held:     make(map[string]bool),
 		renamed:  make(map[string]gitRename),
@@ -1086,7 +1113,11 @@ func (s *CacheService) gitAdvertise(ctx context.Context, exchange *gitExchange, 
 	advertisement, existed, err := s.refreshMirror(ctx, request, repository, sequence, resp.Body)
 	s.noteGit(request.session, err, existed)
 	if err != nil {
-		exchange.answered(gitRouteGitHub, gitMirrorUnavailable, err.Error())
+		reason := gitMirrorUnavailable
+		if errors.Is(err, errMirrorMaintaining) {
+			reason = gitMirrorMaintaining
+		}
+		exchange.answered(gitRouteGitHub, reason, err.Error())
 		s.relayGit(exchange, r, resp)
 
 		return
@@ -1236,6 +1267,9 @@ func (s *CacheService) refreshMirror(
 
 	mirror := s.git.mirror(key)
 	path := s.git.mirrorPath(key)
+	if mirror.pruning.Load() {
+		return nil, false, errMirrorMaintaining
+	}
 	// ONE DEADLINE FOR ALL OF IT: the lock waits, reading the mirror's refs, the
 	// refresh and the advertisement, so no part of a slow disk or a removal in
 	// progress holds the job past refreshWait.
@@ -1245,6 +1279,7 @@ func (s *CacheService) refreshMirror(
 		return nil, false, err
 	}
 	existed := false
+	var last *gitRefresh
 	// TWO REFRESHES AT MOST: one already running may have begun before GitHub
 	// answered this request, the next began after it, so refs that still differ
 	// then are refs a fetch does not bring, and waiting longer changes nothing.
@@ -1256,10 +1291,23 @@ func (s *CacheService) refreshMirror(
 		if err == nil && sameRefs(current, refs) && (head == "" || currentHead == head) {
 			break
 		}
+		// A REPACK HOLDS THE SLOT the next refresh needs, and is waited for
+		// within the same deadline as a refresh is.
+		if last != nil && last.maintaining {
+			if s.git.beforeRepackWait != nil {
+				s.git.beforeRepackWait()
+			}
+			select {
+			case <-last.idle:
+			case <-ctx.Done():
+				return nil, existed, errMirrorMaintaining
+			}
+		}
 		if refreshes == 2 {
 			return nil, existed, errors.New("the mirror's refs still differ from github.com's after a refresh")
 		}
 		refresh := s.startRefresh(ctx, request, repository, mirror, head, refs, sequence)
+		last = refresh
 		select {
 		case <-refresh.done:
 			if refresh.err != nil {
@@ -1573,8 +1621,9 @@ func (s *CacheService) startRefresh(
 	defer s.git.lifecycle.Unlock()
 	if s.git.closed {
 		s.git.observe().GitRefresh(gitRefreshClosed, 0)
-		refresh := &gitRefresh{done: make(chan struct{}), err: errGitClosed}
+		refresh := &gitRefresh{done: make(chan struct{}), idle: make(chan struct{}), err: errGitClosed}
 		close(refresh.done)
+		close(refresh.idle)
 
 		return refresh
 	}
@@ -1583,7 +1632,7 @@ func (s *CacheService) startRefresh(
 	if mirror.refreshing != nil {
 		return mirror.refreshing
 	}
-	refresh := &gitRefresh{done: make(chan struct{})}
+	refresh := &gitRefresh{done: make(chan struct{}), idle: make(chan struct{})}
 	mirror.refreshing = refresh
 	s.git.background.Add(1)
 	go func() {
@@ -1602,13 +1651,43 @@ func (s *CacheService) startRefresh(
 			}
 		}()
 		err := s.refresh(ctx, request, repository, mirror, head, refs, sequence)
+		// MAINTENANCE FOLLOWS A REFRESH THAT WORKED, when one is due and the
+		// node's maintenance slot is free; a busy slot skips it to a later
+		// refresh.
+		kind, release := "", func() {}
+		if err == nil {
+			kind = s.maintenanceDue(s.git.mirrorPath(request.key()))
+		}
+		if kind != "" {
+			select {
+			case s.git.maintaining <- struct{}{}:
+				release = func() { <-s.git.maintaining }
+			default:
+				kind = ""
+			}
+		}
 		// CLEARED BEFORE IT IS ANNOUNCED, so a waiter that finds the refs still
-		// short starts the next refresh rather than joining this finished one.
-		mirror.mu.Lock()
-		mirror.refreshing = nil
-		mirror.mu.Unlock()
+		// short starts the next refresh rather than joining this finished one;
+		// unless the mirror is to be repacked, when the slot stays held, so no
+		// fetch runs beside the repack, and such a waiter waits for idle.
+		free := func() {
+			mirror.mu.Lock()
+			mirror.refreshing = nil
+			mirror.mu.Unlock()
+			close(refresh.idle)
+		}
+		refresh.maintaining = kind != ""
 		refresh.err = err
+		if kind == "" {
+			free()
+			close(refresh.done)
+
+			return
+		}
 		close(refresh.done)
+		s.maintain(ctx, request, repository, mirror, kind)
+		release()
+		free()
 	}()
 
 	return refresh
@@ -1858,7 +1937,8 @@ func clearStaleGitWrites(path string) error {
 	if err != nil {
 		return err
 	}
-	for _, pattern := range []string{"objects/pack/tmp_*", "objects/incoming-*"} {
+	for _, pattern := range []string{"objects/pack/tmp_*", "objects/pack/.tmp-*", "objects/incoming-*",
+		"objects/info/*.lock", "objects/info/commit-graphs/*.lock", "objects/info/commit-graphs/tmp_graph_*"} {
 		matches, err := fs.Glob(root.FS(), pattern)
 		if err != nil {
 			return err
@@ -2160,6 +2240,11 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 	}
 	key := request.key()
 	mirror := s.git.mirror(key)
+	if mirror.pruning.Load() {
+		s.forwardGit(exchange, r, request, gitMirrorMaintaining, "")
+
+		return
+	}
 	held, cancel := context.WithTimeout(ctx, s.git.refreshWait)
 	ok = rlockWithin(held, &mirror.use)
 	cancel()
