@@ -91,8 +91,14 @@ func Teardown(ctx context.Context, env cli.Env, args []string) error {
 	// config does not describe. The operator is deleting by name in a group they
 	// named, and nothing was cross-checked against a tier definition.
 	if undeclared {
-		fmt.Fprintf(env.Stdout, "%q is not a tier in %s. Deleting it by name from runner group %q.\n\n",
-			*tier, *cfgPath, groupOrDefault(*group))
+		if declaredIn, ok := declaredGroup(candidates, *tier); ok {
+			fmt.Fprintf(env.Stdout, "%q is declared in runner group %q in %s, and that scale set is left alone. "+
+				"Deleting the one of that name in runner group %q, which no tier declares.\n\n",
+				*tier, declaredIn, *cfgPath, groupOrDefault(*group))
+		} else {
+			fmt.Fprintf(env.Stdout, "%q is not a tier in %s. Deleting it by name from runner group %q.\n\n",
+				*tier, *cfgPath, groupOrDefault(*group))
+		}
 	}
 
 	// EVERY TARGET IN CONFIG ORDER, each with its own client and its own

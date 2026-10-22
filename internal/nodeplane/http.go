@@ -270,6 +270,22 @@ func WithTrustBundle(pem []byte) HandlerOption {
 	return func(h *handler) { h.trust = pem }
 }
 
+// Resizer authorises a remote fallback's larger shape before the node asks its
+// API to buy it, as LeaseStore.Resize does.
+type Resizer func(ctx context.Context, leaseID string, epoch int64, instanceType string,
+	vcpu int, memory config.ByteSize) error
+
+// WithResizer answers the resize route with r instead of the store's Resize, so
+// a control plane can ask its admission order before a lease grows (#172).
+//
+// AN OPTION, NOT A WRAPPED STORE. The handler finds GuestReportStore and the
+// pool runner store by asserting the store's type, and a wrapper around it
+// would have switched those routes off while every test that hands the handler
+// a fake went on passing.
+func WithResizer(r Resizer) HandlerOption {
+	return func(h *handler) { h.resizer = r }
+}
+
 // WithCachePolicy gives nodes the central interception kill switch.
 func WithCachePolicy(policy CachePolicy) HandlerOption {
 	return func(h *handler) { h.cachePolicy = policy }
@@ -420,6 +436,9 @@ type handler struct {
 	trust       []byte
 	enrollments Enrollments
 	cachePolicy CachePolicy
+	// resizer authorises a fallback's larger shape in place of the store's own
+	// Resize; nil asks the store.
+	resizer Resizer
 	// guests keeps guest reports; nil when the lease store keeps none, and the
 	// route then refuses.
 	guests GuestReportStore
@@ -1687,7 +1706,12 @@ func (h *handler) resize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.Resize(r.Context(), r.PathValue("lease"), req.Epoch,
+	resize := h.store.Resize
+	if h.resizer != nil {
+		resize = h.resizer
+	}
+
+	if err := resize(r.Context(), r.PathValue("lease"), req.Epoch,
 		req.InstanceType, req.VCPU, req.Memory); err != nil {
 		writeStoreErr(w, err)
 

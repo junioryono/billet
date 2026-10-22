@@ -1084,6 +1084,42 @@ func TestLedgerErrorsKeepTheirKind(t *testing.T) {
 	}
 }
 
+// A RESIZER ANSWERS THE RESIZE ROUTE IN PLACE OF THE STORE (#172), and its
+// refusal reaches the node as the same no-capacity a budget refusal is, with
+// its reason. The store would answer fenced, so a route that still asked it
+// cannot pass.
+func TestAResizerAnswersTheResizeRouteInsteadOfTheStore(t *testing.T) {
+	t.Parallel()
+
+	var asked []string
+
+	resizer := func(_ context.Context, leaseID string, _ int64, instanceType string, _ int, _ config.ByteSize) error {
+		asked = append(asked, leaseID+" "+instanceType)
+
+		return fmt.Errorf("%w: the admission order holds this room for org-16", alloc.ErrNoCapacity)
+	}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}}))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{resizeErr: alloc.ErrFenced}, nil,
+		nodeplane.WithResizer(resizer)))
+	t.Cleanup(srv.Close)
+
+	c := dial(t, srv.URL)
+
+	err := c.Resize(t.Context(), "l1", 1, "large", 16, 32*config.GiB)
+	if !errors.Is(err, alloc.ErrNoCapacity) || !strings.Contains(err.Error(), "admission order") {
+		t.Fatalf("the resize answered %v, want the resizer's no-capacity with its reason", err)
+	}
+
+	if len(asked) != 1 || asked[0] != "l1 large" {
+		t.Errorf("the resizer was asked %v, want once for lease l1's large shape", asked)
+	}
+}
+
 // AN UNREGISTERED NODE IS TOLD TO REGISTER, which is what a restarted control
 // plane looks like from a node that is still running.
 func TestARestartedControlPlaneTellsTheNodeToRegister(t *testing.T) {

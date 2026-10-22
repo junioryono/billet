@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/state/ledgerdb"
@@ -74,13 +75,36 @@ func (db *DB) RecordScaleSet(ctx context.Context, rec ScaleSetRecord) error {
 // Called when billet deletes one, so the orphan report stops naming something an
 // operator has already cleaned up. Removing a record billet never had is not an
 // error: teardown may be run against a deployment whose ledger predates this.
+//
+// EVERY SPELLING OF THE GROUP AND THE NAME, compared in Go as GitHub compares
+// them, without case and beyond ASCII, and each row then deleted by its exact
+// key: a record left under another spelling would refuse the next start over a
+// set that is gone, and SQLite's LOWER folds ASCII alone, so a group named
+// with a letter outside it would have survived a comparison made in SQL. The
+// target is matched as ListScaleSets matches it; GitHub's owner and repository
+// names are ASCII.
 func (db *DB) ForgetScaleSet(ctx context.Context, target, group, label string) error {
 	return db.Tx(ctx, func(tx *sql.Tx) error {
-		return WriteQueries(tx).DeleteScaleSet(ctx, ledgerdb.DeleteScaleSetParams{
-			Org:         target,
-			RunnerGroup: group,
-			Label:       label,
-		})
+		rows, err := ReadQueries(tx).ListScaleSets(ctx, target)
+		if err != nil {
+			return fmt.Errorf("state: list scale sets to forget: %w", err)
+		}
+
+		for _, row := range rows {
+			if !strings.EqualFold(row.RunnerGroup, group) || !strings.EqualFold(row.Label, label) {
+				continue
+			}
+
+			if err := WriteQueries(tx).DeleteScaleSet(ctx, ledgerdb.DeleteScaleSetParams{
+				Org:         row.Org,
+				RunnerGroup: row.RunnerGroup,
+				Label:       row.Label,
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
 }
 

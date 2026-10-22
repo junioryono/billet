@@ -102,6 +102,15 @@ type Report struct {
 	// capacity bought for an offer or a launch that did not use it. Reported so a
 	// reader can tell them from a missing job.
 	EscrowRows int
+	// DeclinedThenRun counts assignments the scripted service saw billet
+	// acknowledge with no runner and a later runner take: the one figure here
+	// the harness counted rather than read from the ledger, because nothing in
+	// the ledger records a decline.
+	DeclinedThenRun int
+	// ByJobID counts the jobs found by their GitHub job id because billet
+	// recorded them under a request id of its own, which is every job a
+	// direct-assignment replay ran and none an offered one did.
+	ByJobID int
 	// escrows are those rows' charges, kept out of the job records and in the
 	// capacity proof: an unused lease is charged to its host like any other.
 	escrows []charge
@@ -128,8 +137,26 @@ func (c charge) open() bool { return c.to.IsZero() }
 // truncated history being a smaller ledger that proves less than it seems to.
 const historyBound = 4096
 
+// byJobID finds the trace job a GitHub job id names: "job-<seq>", the id the
+// plane gives every job it sends.
+func byJobID(byRequest map[int64]*Arrival, jobID string) (*Arrival, bool) {
+	digits, ok := strings.CutPrefix(jobID, "job-")
+	if !ok {
+		return nil, false
+	}
+
+	seq, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return nil, false
+	}
+
+	a, found := byRequest[seq]
+
+	return a, found
+}
+
 // readReport reads job_history back and joins it to the trace.
-func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*Report, error) {
+func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, direct bool) (*Report, error) {
 	bound := int64(len(trace.Arrivals)) + historyBound
 
 	rows, err := state.ReadQueries(db.Reader()).ListJobHistory(ctx, bound)
@@ -171,7 +198,21 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 			return nil, fmt.Errorf("lease %s finished_at: %w", row.LeaseID, err)
 		}
 
-		if row.RequestID == 0 {
+		// THE JOB IS FOUND BY ITS REQUEST ID WHERE THE TRACE GAVE ONE, and by its
+		// own id where billet gave it an identity of its own: under direct
+		// assignment no job carries a request id (jobJSON).
+		a, ok := byRequest[row.RequestID]
+		if !ok && direct {
+			if a, ok = byJobID(byRequest, row.GithubJobID); ok {
+				r.ByJobID++
+			}
+		}
+
+		// A CHARGE WITH NO JOB: escrow nothing claimed, or, under direct
+		// assignment, a runner billet started for GitHub's assigned count that
+		// was retired before a job reached it. Capacity all the same, checked
+		// against the fleet like any other.
+		if !ok && (row.RequestID == 0 || (direct && row.GithubJobID == "")) {
 			r.EscrowRows++
 			r.escrows = append(r.escrows, charge{
 				from: chargedFrom, to: finishedAt, vcpu: int(lease.Vcpu),
@@ -185,16 +226,16 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 			continue
 		}
 
-		a, ok := byRequest[row.RequestID]
 		if !ok {
-			return nil, fmt.Errorf("the ledger recorded request %d, which the trace never offered", row.RequestID)
+			return nil, fmt.Errorf("the ledger recorded request %d (job %q), which the trace never offered",
+				row.RequestID, row.GithubJobID)
 		}
 
-		if seen[row.RequestID] {
-			return nil, fmt.Errorf("the ledger recorded request %d twice", row.RequestID)
+		if seen[a.Seq] {
+			return nil, fmt.Errorf("the ledger recorded job %d twice", a.Seq)
 		}
 
-		seen[row.RequestID] = true
+		seen[a.Seq] = true
 
 		// THE ROW IS THE TRACE'S JOB, NOT ONLY ITS REQUEST ID. A row recorded under
 		// another tier, or with a result the scripted GitHub never sent, would

@@ -216,6 +216,39 @@ func BenchmarkHeadroom(b *testing.B) {
 	}
 }
 
+// BenchmarkAdmissionView is what every listener reads under `fair` at each
+// reconciliation: every tier's admission, in one read over the reader pool,
+// for the nine tiers of the reference deployment.
+func BenchmarkAdmissionView(b *testing.B) {
+	a, tiers, _ := benchFleet(b, 16, 9)
+
+	for i := range tiers {
+		escrowN(b, a, tiers[i].Label, 20)
+	}
+
+	for b.Loop() {
+		if _, err := a.AdmissionView(b.Context()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkAdmissionFor is what a listener reads at each reconciliation and
+// refusal: its own tier's admission alone, on the same deployment.
+func BenchmarkAdmissionFor(b *testing.B) {
+	a, tiers, _ := benchFleet(b, 16, 9)
+
+	for i := range tiers {
+		escrowN(b, a, tiers[i].Label, 20)
+	}
+
+	for b.Loop() {
+		if _, err := a.AdmissionFor(b.Context(), tiers[4].Label); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkPlacement is the same purchase over fleets of growing size, with
 // two leases a host of each tier already placed, so how placement grows with
 // the fleet is the difference between them; slot-µs/write is how long the

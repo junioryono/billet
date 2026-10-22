@@ -71,6 +71,12 @@ func (l *Listener) recoverOrStop(ctx, pollCtx context.Context, draining bool, ca
 func (l *Listener) recoverSession(ctx context.Context, cause error) error {
 	l.recoverCause = cause
 
+	// THE FAILED SESSION VOUCHES FOR NOTHING ANY MORE, and its replacement for
+	// nothing until a withdrawn poll of its own returns empty: the count is
+	// unknown where a drain reads it for as long as this lasts.
+	l.undate()
+	l.reportCapacity(context.WithoutCancel(ctx), nil, "")
+
 	for {
 		l.sessionFailures++
 		delay := reopenDelay(l.sessionFailures)
@@ -147,7 +153,8 @@ func (l *Listener) install(session Session) {
 	l.closing = nil
 	l.recoverCause = nil
 	l.lastMessageID = 0
-	l.observed = session.Statistics()
+	l.observed, l.observedStale = session.Statistics(), false
+	l.undate()
 
 	l.mu.Lock()
 	l.heldMessageID = nil

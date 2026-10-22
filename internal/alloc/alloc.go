@@ -1262,6 +1262,23 @@ func (a *Allocator) Resize(
 	ctx context.Context, leaseID string, epoch int64, instanceType string,
 	vcpu int, memory config.ByteSize,
 ) error {
+	return a.ResizeLeaving(ctx, leaseID, epoch, instanceType, vcpu, memory, nil)
+}
+
+// ResizeLeaving is Resize for a lease whose tier the admission order would not
+// let buy now: a larger shape is granted only while every tier in protect
+// could still be granted one lease of its own afterwards, judged in the
+// resize's own transaction exactly as EscrowLeaving judges a purchase (#172).
+//
+// A FALLBACK TO A LARGER SHAPE IS A PURCHASE OF THE DIFFERENCE. The order
+// admitted the lease at the shape it was escrowed for; the larger one the
+// cloud sold instead takes pot a longest-waiting tier was accumulating, at a
+// moment its own purchases are being refused, and before this nothing asked.
+// A shape no larger in either dimension takes nothing and is not judged.
+func (a *Allocator) ResizeLeaving(
+	ctx context.Context, leaseID string, epoch int64, instanceType string,
+	vcpu int, memory config.ByteSize, protect []string,
+) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		lease, err := a.load(ctx, tx, leaseID, epoch)
 		if err != nil {
@@ -1316,6 +1333,18 @@ func (a *Allocator) Resize(
 
 		if lease.InstanceType == instanceType && lease.VCPU == vcpu && lease.Memory == memory {
 			return nil
+		}
+
+		// ONLY A GROWTH IS JUDGED, and only after it is charged: a larger shape
+		// can only take room from a waiter, so one already short now is refused
+		// by the read-back below as surely as by a check before it.
+		var guarded []config.Tier
+		if vcpu > lease.VCPU || memory > lease.Memory {
+			for _, label := range protect {
+				if w, ok := a.tiers[label]; ok && label != lease.Tier {
+					guarded = append(guarded, w)
+				}
+			}
 		}
 
 		fleetUsed, err := a.usage(ctx, tx)
@@ -1374,8 +1403,26 @@ func (a *Allocator) Resize(
 			return fmt.Errorf("alloc: resize lease %s for EC2 shape %s: %w", leaseID, instanceType, err)
 		}
 
+		// READ BACK WITH THE NEW SHAPE CHARGED, floors re-placed and all, and
+		// rolled back if a waiter ahead is left without a lease.
+		if err := guardedHaveRoom(ctx, a, tx, guarded, errWaiterLeftShort); err != nil {
+			return resizeRefused(err, instanceType, protect)
+		}
+
 		return nil
 	})
+}
+
+// resizeRefused turns a guarded waiter's shortfall into the refusal a fallback
+// already understands, naming the waiters so the node's log says the
+// admission order refused it, not the budget.
+func resizeRefused(err error, instanceType string, protect []string) error {
+	if !errors.Is(err, errWaiterLeftShort) {
+		return err
+	}
+
+	return fmt.Errorf("%w: fallback %q would take room the admission order holds for %s: %w",
+		ErrNoCapacity, instanceType, strings.Join(protect, ", "), err)
 }
 
 // Bind records which node is running a lease.
@@ -2641,6 +2688,27 @@ func (a *Allocator) ActiveRunnerLeases(ctx context.Context, tier string) (int, e
 	return int(count), nil
 }
 
+// ActiveRunnersAt is ActiveRunnerLeases with the tier's release generation read
+// in the same statement, so in one snapshot on either engine: the generation a
+// count of the tier's demand made from this number is valid at, which a drain
+// compares with the current one.
+func (a *Allocator) ActiveRunnersAt(ctx context.Context, tier string) (int, int64, error) {
+	var row ledgerdb.CountActiveRunnersAtRow
+
+	err := a.db.View(ctx, func(tx querier) error {
+		var err error
+
+		row, err = state.ReadQueries(tx).CountActiveRunnersAt(ctx, tier)
+
+		return err
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("alloc: count active runner leases for %s: %w", tier, err)
+	}
+
+	return int(row.Active), row.Releases, nil
+}
+
 // ServiceableRunnerLeaseIDs reports restart-surviving runner capacity that may
 // still serve the scale set. Teardown and quarantine remain charged for safety
 // but are cleanup obligations, not capacity GitHub may schedule against.
@@ -3439,6 +3507,13 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	})
 	if err != nil {
 		return fmt.Errorf("alloc: archive lease %s: %w", l.ID, err)
+	}
+
+	// IN THE SAME TRANSACTION AS THE CLOSE, so no reader sees one without the
+	// other: a drain trusts a listener's count only while this has not moved
+	// since the count was read (ActiveRunnersAt).
+	if err := state.WriteQueries(tx).BumpTierReleases(ctx, l.Tier); err != nil {
+		return fmt.Errorf("alloc: count lease %s's close against tier %s: %w", l.ID, l.Tier, err)
 	}
 
 	return nil

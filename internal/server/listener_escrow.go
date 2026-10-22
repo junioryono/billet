@@ -44,6 +44,34 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 	return l.refillEscrowLeaving(ctx, target, maxNew, nil)
 }
 
+// buyForOffers buys escrow for the offers in hand when the admission order lets
+// this tier buy, and records why it bought none when it did not, for the
+// declines reserve logs.
+func (l *Listener) buyForOffers(ctx context.Context, offers int) error {
+	where := l.admission(ctx)
+	if !l.order.mayBuy(l.tier, where) {
+		l.refuse(l.orderRefusal(where), false)
+
+		return nil
+	}
+
+	if err := l.refillEscrowTo(ctx, l.targetCapacityFor(offers)); err != nil {
+		return err
+	}
+
+	// SHORT OF THE OFFERS, NOT ONLY EMPTY: escrow already held backs some of
+	// them, and the rest are declined for a reason this records.
+	l.mu.Lock()
+	short := len(l.held) < offers
+	l.mu.Unlock()
+
+	if short {
+		l.refuse(l.roomRefusal(ctx, nil), false)
+	}
+
+	return nil
+}
+
 // refillEscrowLeaving is refillEscrowUngated for a purchase made ahead of this
 // tier's turn, which must leave room for each waiter in protect (see
 // alloc.EscrowLeaving). PROTECT IS AN ARGUMENT AND NOT LISTENER STATE: the
@@ -126,6 +154,8 @@ func (l *Listener) refillEscrowLeaving(ctx context.Context, target, maxNew int, 
 	// and every batch shrank to one, so a tier bought one runner each time its
 	// listener woke however much room was free (2026-10-03).
 	if len(leases) > 0 {
+		l.refused = refusal{}
+
 		if l.batchBuying {
 			l.batchBought = true
 		} else {
@@ -334,7 +364,7 @@ func (l *Listener) reserve(available []resolvedJob) []int64 {
 
 		if len(l.held) == 0 {
 			l.log.Warn("declining an offer with no escrow to back it",
-				"tier", l.tier, "request", job.RequestID)
+				append([]any{"tier", l.tier, "request", job.RequestID}, l.declineReason()...)...)
 
 			continue
 		}

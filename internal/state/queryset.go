@@ -65,6 +65,7 @@ type ReadOps interface {
 	BarrierRunExists(ctx context.Context, node string) (bool, error)
 	CertRevocation(ctx context.Context, serial string) (int64, error)
 	CountActiveRunnerLeases(ctx context.Context, tier string) (int64, error)
+	CountActiveRunnersAt(ctx context.Context, tier string) (ledgerdb.CountActiveRunnersAtRow, error)
 	CountCacheBlocks(ctx context.Context, arg ledgerdb.CountCacheBlocksParams) (int64, error)
 	CountForceDestroyInState(ctx context.Context, state string) (int64, error)
 	CountForceTargetsInState(ctx context.Context, arg ledgerdb.CountForceTargetsInStateParams) (int64, error)
@@ -122,6 +123,7 @@ type ReadOps interface {
 	ListRunningLeasesWithReplacedHolder(ctx context.Context, arg ledgerdb.ListRunningLeasesWithReplacedHolderParams) ([]ledgerdb.ListRunningLeasesWithReplacedHolderRow, error)
 	ListScaleSets(ctx context.Context, org string) ([]ledgerdb.ListScaleSetsRow, error)
 	ListServiceableRunnerLeaseIDs(ctx context.Context, tier string) ([]string, error)
+	ListTierReleases(ctx context.Context) ([]ledgerdb.TierRelease, error)
 	LiveCertsFor(ctx context.Context, arg ledgerdb.LiveCertsForParams) ([]ledgerdb.IssuedCert, error)
 	LiveJoinTokenExists(ctx context.Context, arg ledgerdb.LiveJoinTokenExistsParams) (bool, error)
 	NodeRevocationCutoff(ctx context.Context, node string) (string, error)
@@ -208,6 +210,7 @@ type WriteOps interface {
 	BindLease(ctx context.Context, arg ledgerdb.BindLeaseParams) error
 	BindPoolRunnerJob(ctx context.Context, arg ledgerdb.BindPoolRunnerJobParams) error
 	BumpDispatchGeneration(ctx context.Context, name string) (int64, error)
+	BumpTierReleases(ctx context.Context, tier string) error
 	ClaimController(ctx context.Context, arg ledgerdb.ClaimControllerParams) (int64, error)
 	ClaimPoolRunnerForRetirement(ctx context.Context, arg ledgerdb.ClaimPoolRunnerForRetirementParams) (sql.Result, error)
 	CompleteForceDestroy(ctx context.Context, arg ledgerdb.CompleteForceDestroyParams) error

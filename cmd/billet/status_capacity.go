@@ -44,6 +44,14 @@ func printTierCapacity(w io.Writer, label string, r alloc.TierCapacity, now time
 	if r.Listener.Waiting > 0 && r.Listener.WaitingSince != "" {
 		fmt.Fprintf(w, "          waiting %d job(s) for room, oldest since %s\n",
 			r.Listener.Waiting, r.Listener.WaitingSince)
+		// WHICH OF THE TWO REFUSES IT, said only when the listener published it:
+		// the admission order holding freed room for an older waiter, or the
+		// allocator having none. A report from before these fields says neither,
+		// which is not the same as neither being true (#248).
+		if r.Listener.HeldBy != "" {
+			fmt.Fprintf(w, "          behind %s, waiting since %s: the admission order holds freed room for it\n",
+				r.Listener.HeldBy, r.Listener.HeldBySince)
+		}
 		// AN OBSERVATION, NOT THE QUEUE'S DECISION. The listener publishes its
 		// progress once a poll, so the queue may have seen progress this report
 		// has not; one that stalled cannot publish that it has.
@@ -52,6 +60,14 @@ func printTierCapacity(w io.Writer, label string, r alloc.TierCapacity, now time
 				"may buy ahead of it until it progresses\n",
 				stalled.Round(time.Second), r.Listener.WaitingProgress)
 		}
+	}
+
+	// AND THE ALLOCATOR'S REASON, WAITING IN LINE OR NOT. A tier at its own
+	// max_concurrent, or whose shape no live host places, has demand it cannot
+	// buy for and never waits in line, so it prints no waiting line; this is
+	// then the only line that says why its work is not starting.
+	if r.Listener.Refusal != "" {
+		fmt.Fprintf(w, "          last purchase refused: %s\n", r.Listener.Refusal)
 	}
 }
 

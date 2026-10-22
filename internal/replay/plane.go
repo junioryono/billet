@@ -154,6 +154,10 @@ type plane struct {
 	clock *Clock
 	boot  time.Duration
 	jobs  map[int64]Arrival
+	// direct is GitHub.com's protocol (Options.DirectAssignment): a job is
+	// assigned to its tier's scale set as soon as the set advertises room for
+	// it, with no offer and no acquisition, and carries no runner request id.
+	direct bool
 	// order is the tier labels in the order their sessions may open.
 	order []string
 
@@ -169,6 +173,10 @@ type plane struct {
 	nextRunner  int64
 
 	events eventHeap
+
+	// declinedThenRun counts assignments acknowledged with no runner minted for
+	// them that a later runner took: work billet declined and ran once it could.
+	declinedThenRun int
 }
 
 var (
@@ -476,6 +484,15 @@ func (p *plane) acquire(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// NOTHING IS OFFERED UNDER DIRECT ASSIGNMENT, so nothing may be bid for: a
+	// listener acquiring there is bidding for work GitHub.com never offers.
+	if p.direct {
+		p.t.Errorf("replay: %s acquired %v under direct assignment, where nothing is offered", s.name, ids)
+		fakeactions.WriteJSON(p.t, w, map[string]any{"count": 0, "value": []int64{}})
+
+		return
+	}
+
 	inOffer := map[int64]bool{}
 
 	if len(s.queue) > 0 && s.served {
@@ -549,6 +566,7 @@ func (p *plane) mint(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 		rn.job, s.inflight = s.inflight[0], s.inflight[1:]
 	case len(s.unpaired) > 0:
 		rn.job, s.unpaired = s.unpaired[0], s.unpaired[1:]
+		p.declinedThenRun++
 	default:
 		p.t.Logf("replay: runner %q was minted with no assigned job on %s to take", rn.name, s.name)
 	}
@@ -742,9 +760,16 @@ func (p *plane) poll(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 
 		if capacity > 0 && len(s.available) > 0 && !s.offered {
 			s.offered = true
-			p.reofferLocked(s, capacity)
 
-			continue
+			if !p.direct {
+				p.reofferLocked(s, capacity)
+
+				continue
+			}
+
+			if p.assignLocked(s, capacity) {
+				continue
+			}
 		}
 
 		if s.nudged {
@@ -809,6 +834,43 @@ func (p *plane) reofferLocked(s *scaleSet, capacity int) {
 	p.pushLocked(s, nil, ids, jobs...)
 }
 
+// assignLocked assigns waiting jobs to a set directly, oldest first, as many as
+// the capacity it advertises leaves room for beside what is already assigned,
+// as one JobAssigned message. It reports whether it queued one.
+//
+// GITHUB.COM'S SHAPE (measured 2026-08-19, docs/reference/upstream-references.md):
+// the job arrives as JobAssigned with runnerRequestId 0, never offered and
+// never acquired, and only to a scale set advertising room for it. What the
+// advertisement does not cover waits at GitHub, unassigned, until it does.
+func (p *plane) assignLocked(s *scaleSet, capacity int) bool {
+	room := capacity - len(s.assigned)
+	if room <= 0 || len(s.available) == 0 {
+		return false
+	}
+
+	ids := make([]int64, 0, len(s.available))
+	for id := range s.available {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	if len(ids) > room {
+		ids = ids[:room]
+	}
+
+	jobs := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		delete(s.available, id)
+		s.assigned[id] = struct{}{}
+		jobs = append(jobs, p.jobJSON("JobAssigned", p.jobs[id], fakeactions.JobFields{}))
+	}
+
+	p.pushLocked(s, ids, nil, jobs...)
+
+	return true
+}
+
 // nudge makes a parked listener run one iteration of its loop: it reconciles its
 // pool against whatever room the fleet now has and re-advertises, and the poll
 // that follows offers it whatever is waiting.
@@ -848,6 +910,13 @@ func (p *plane) needsPoll(label string) bool {
 		if len(peer.available) > 0 {
 			return true
 		}
+
+		// AN ASSIGNMENT NO RUNNER HAS TAKEN is work waiting too, under direct
+		// assignment: billet declined it for want of room, and only a later
+		// reconciliation that buys a runner will take it.
+		if p.direct && len(peer.unpaired) > 0 {
+			return true
+		}
 	}
 
 	return false
@@ -859,6 +928,7 @@ type standing struct {
 	capacity  int
 	available int
 	assigned  int
+	unpaired  int
 }
 
 // standingOf reports a tier's standing.
@@ -871,7 +941,9 @@ func (p *plane) standingOf(label string) standing {
 		return standing{}
 	}
 
-	return standing{capacity: s.lastCap, available: len(s.available), assigned: len(s.assigned)}
+	return standing{
+		capacity: s.lastCap, available: len(s.available), assigned: len(s.assigned), unpaired: len(s.unpaired),
+	}
 }
 
 // wakeLocked returns a parked poll.
@@ -933,7 +1005,15 @@ func (p *plane) jobJSON(kind string, a Arrival, fields fakeactions.JobFields) ma
 	fields.WorkflowRef = a.WorkflowRef
 	fields.RunID = a.RunID
 
-	return fields.Apply(fakeactions.JobJSON(kind, a.Seq, "push", a.Tier))
+	// UNDER DIRECT ASSIGNMENT NO RUNNER REQUEST ID, as on GitHub.com: the job
+	// is named by its own id, and billet gives it an identity of its own.
+	request := a.Seq
+	if p.direct {
+		request = 0
+		fields.JobID = "job-" + itoa(a.Seq)
+	}
+
+	return fields.Apply(fakeactions.JobJSON(kind, request, "push", a.Tier))
 }
 
 // schedule adds an event the run loop will deliver.
@@ -976,6 +1056,15 @@ func (p *plane) deliver(ev event) {
 		}
 
 		s.available[a.Seq] = struct{}{}
+
+		if p.direct {
+			// Assigned now if the set advertises room for it; otherwise it
+			// waits at GitHub until a poll advertises some.
+			p.assignLocked(s, s.lastCap)
+
+			break
+		}
+
 		p.pushLocked(s, nil, []int64{a.Seq}, p.jobJSON("JobAvailable", a, fakeactions.JobFields{}))
 
 	case eventStarted:

@@ -36,7 +36,7 @@ A lease exists from the moment capacity is escrowed, before anything boots, and 
 
 ## Placement
 
-The control plane chooses the machine when the job is admitted, not when it launches. It walks the tier's providers most-preferred first, then packs (`server.placement: pack`, the default) or spreads, then picks by name. A tier may pin a `node` or a `site`; a macOS tier pins a host because Apple's two-guests-per-Mac limit is counted per machine. A cloud node registers its ordered purchasable shapes and placement charges the first shape that fits rather than the smaller tier request, authorising any fallback against both the node's budget and the deployment ceiling before a request reaches AWS.
+The control plane chooses the machine when the job is admitted, not when it launches. It walks the tier's providers most-preferred first, then packs (`server.placement: pack`, the default) or spreads, then picks by name. A tier may pin a `node` or a `site`; a macOS tier pins a host because Apple's two-guests-per-Mac limit is counted per machine. A cloud node registers its ordered purchasable shapes and placement charges the first shape that fits rather than the smaller tier request, authorising any fallback against both the node's budget and the deployment ceiling before a request reaches AWS. A fallback to a larger shape also asks the waiting order (`server.admission_order`) as a purchase would, so under `fair` it is refused when it would take room an older waiting tier is accumulating; the launch then fails and GitHub assigns the job again.
 
 `nodes:` is policy about hosts, not a roster of them: a per-host guest-OS allowlist and macOS limit. Registration is dynamic; adding a machine needs no control-plane restart.
 

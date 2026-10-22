@@ -531,6 +531,12 @@ func (r *Runner) Launch(
 		) (bool, error) {
 			err := r.alloc.Resize(ctx, lease.ID, lease.Epoch, instanceType, vcpu, memory)
 			if errors.Is(err, alloc.ErrNoCapacity) {
+				// SAID WITH THE PLANE'S REASON, which the provider's own line
+				// cannot carry: the budget, or room the admission order is
+				// holding for a waiting tier (#172).
+				r.log.Info("the control plane refused a fallback shape for this lease",
+					"lease", lease.ID, "type", instanceType, "reason", err)
+
 				return false, nil
 			}
 

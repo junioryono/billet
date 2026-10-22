@@ -194,3 +194,104 @@ func TestCapacityReportsIsEachTiersReport(t *testing.T) {
 		t.Errorf("large = %+v, want its two unobserved leases unknown, its floor, and no report", got)
 	}
 }
+
+// EVERY CLOSE ADVANCES ITS TIER'S RELEASE GENERATION, AND ONLY ITS TIER'S, in
+// the transaction that closes it (#140). A drain trusts a listener's count only
+// while this has not moved since the count was read, so a release that
+// advanced nothing would leave a count standing that the release made wrong.
+func TestEveryCloseAdvancesItsTiersReleases(t *testing.T) {
+	one, other := tier("one", 1, config.GiB), tier("other", 1, config.GiB)
+	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB}, []config.Tier{one, other})
+
+	generation := func(label string) int64 {
+		t.Helper()
+
+		active, at, err := a.ActiveRunnersAt(t.Context(), label)
+		if err != nil {
+			t.Fatalf("ActiveRunnersAt(%s): %v", label, err)
+		}
+
+		// ONE PREDICATE, written twice: the statement that reads the count with
+		// the generation must count what ActiveRunnerLeases counts.
+		want, err := a.ActiveRunnerLeases(t.Context(), label)
+		if err != nil {
+			t.Fatalf("ActiveRunnerLeases(%s): %v", label, err)
+		}
+
+		if active != want {
+			t.Fatalf("tier %s counts %d runners read with its generation and %d alone", label, active, want)
+		}
+
+		all, err := a.TierReleases(t.Context())
+		if err != nil {
+			t.Fatalf("TierReleases: %v", err)
+		}
+
+		if all[label] != at {
+			t.Fatalf("tier %s's generation is %d read alone and %d read with the others", label, at, all[label])
+		}
+
+		return at
+	}
+
+	if got := generation("one"); got != 0 {
+		t.Fatalf("a tier none of whose leases closed is at generation %d, want 0", got)
+	}
+
+	// THE COUNT'S CASES: escrow that started nothing, a runner launching, and a
+	// launching runner whose registration GitHub removed. Only the second counts.
+	held, err := a.Escrow(t.Context(), "one", 3)
+	if err != nil || len(held) != 3 {
+		t.Fatalf("Escrow = %v, %v", held, err)
+	}
+
+	for i, lease := range held[1:] {
+		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, int64(i+1)); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+	}
+
+	if err := a.MarkDeregistered(t.Context(), held[2].ID); err != nil {
+		t.Fatalf("MarkDeregistered: %v", err)
+	}
+
+	if active, _, err := a.ActiveRunnersAt(t.Context(), "one"); err != nil || active != 1 {
+		t.Fatalf("ActiveRunnersAt = %d, %v; want the one launching runner still registered", active, err)
+	}
+
+	if got := generation("one"); got != 0 {
+		t.Fatalf("nothing closed, but tier one is at generation %d", got)
+	}
+
+	// OTHER CLOSES FIRST, so it has a row that a bump of every row would move.
+	theirs := reserve(t, a, "other")
+	if err := a.Release(t.Context(), theirs.ID, theirs.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release(other): %v", err)
+	}
+
+	done := reserve(t, a, "one")
+	if err := a.Release(t.Context(), done.ID, done.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	failed := reserve(t, a, "one")
+	if err := a.ReleaseFailed(t.Context(), failed.ID, failed.Epoch, "the launch failed"); err != nil {
+		t.Fatalf("ReleaseFailed: %v", err)
+	}
+
+	if got := generation("one"); got != 2 {
+		t.Errorf("after two closes tier one is at generation %d, want 2", got)
+	}
+
+	if got := generation("other"); got != 1 {
+		t.Errorf("tier other closed one lease and is at generation %d after tier one's closes, want 1", got)
+	}
+}

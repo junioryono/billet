@@ -1126,6 +1126,12 @@ func TestTheControlPlaneAssemblesStepByStep(t *testing.T) {
 		t.Error("the served wire has no address")
 	}
 
+	// THE RESIZE ROUTE'S GATE IS THE WIRE'S, and nothing has bound it to an
+	// admission order before there is a scheduler to own one (#172).
+	if wire.resizes == nil || wire.resizes.bound.Load() != nil {
+		t.Fatalf("the served wire's resize gate is %+v, want one bound to no order yet", wire.resizes)
+	}
+
 	published, err := ctl.PublishAuthority(ctx, wire)
 	if err != nil {
 		t.Fatalf("PublishAuthority: %v", err)
@@ -1138,6 +1144,10 @@ func TestTheControlPlaneAssemblesStepByStep(t *testing.T) {
 
 	if scheduler == nil || readies != 1 {
 		t.Errorf("Schedule returned %v having sent READY=1 %d times, want a scheduler and once", scheduler, readies)
+	}
+
+	if bound := wire.resizes.bound.Load(); scheduler != nil && (bound == nil || bound.order != resizeOrder(scheduler.plane)) {
+		t.Error("the wire's resize route does not ask the admission order of the scheduler Schedule built")
 	}
 
 	if stopped || cp.LeadershipLost() {

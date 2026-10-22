@@ -286,9 +286,26 @@ type Listener struct {
 	order *admissionQueue
 
 	// waitingFor is how much of GitHub's assigned work this tier could not buy
-	// capacity for at its last reconciliation. Guarded by mu; reported, never
-	// scheduled on.
-	waitingFor int
+	// capacity for at its last reconciliation, demandKnown that it could be
+	// counted, and demandAt when. Guarded by mu; reported, never scheduled on.
+	waitingFor  int
+	demandKnown bool
+	demandAt    time.Time
+	// demandReleases is the tier's release generation read with the runner
+	// count waitingFor was made from (alloc.ActiveRunnersAt).
+	demandReleases int64
+	// observedAt is when GitHub last vouched for observed: a poll sent with the
+	// advertisement withdrawn returned empty. Zero until one has, and again from
+	// any delivery; observedStale is that a delivery's statistics have not been
+	// adopted since, so no empty poll may date the older ones. Touched only by
+	// the poll goroutine.
+	observedAt    time.Time
+	observedStale bool
+	// refused is why the last purchase this tier asked for bought nothing, and
+	// refusedLogged the reason last logged for it. Guarded by mu; reported and
+	// logged, never scheduled on.
+	refused       refusal
+	refusedLogged string
 
 	stalePromise time.Duration
 
@@ -770,7 +787,7 @@ func (l *Listener) Run(ctx context.Context) error {
 
 	// A restart does not replay messages for work already assigned, so a listener
 	// that waits to be told about a backlog sits idle in front of one.
-	l.observed = l.session.Statistics()
+	l.observed, l.observedStale = l.session.Statistics(), false
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
 		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
@@ -993,7 +1010,42 @@ func (l *Listener) Run(ctx context.Context) error {
 		if err == nil || errors.Is(err, ErrNoMessage) {
 			polled++
 			l.sessionFailures = 0
-			l.reportCapacity(pollCtx, &advertised, "confirmed")
+
+			// AN EMPTY EXCHANGE SENT WITH THE ADVERTISEMENT WITHDRAWN VOUCHES FOR
+			// THE STATISTICS IN HAND: GitHub assigns nothing past committed work
+			// under it, and had nothing pending to deliver. Only such an exchange
+			// dates the count a drain trusts; one sent while still advertising may
+			// return empty after a seal and say nothing about an assignment made
+			// against the advertisement it carried. A delivery changes what GitHub
+			// has assigned, so it leaves the count undated, and until its own
+			// statistics are adopted no empty exchange can date the old ones.
+			delivered := err == nil && msg != nil
+
+			switch {
+			case delivered:
+				l.observedStale = true
+				l.undate()
+			case errors.Is(err, ErrNoMessage) && withdrawnWhenSent && l.observed != nil && !l.observedStale:
+				l.observedAt = l.clock()
+			}
+
+			// AND THE DELIVERY'S COUNT IS UNKNOWN IN THE LEDGER BEFORE IT IS
+			// HANDLED: a completion in it can release the last runner while an
+			// assignment beside it waits, and a drain reading the quiet ledger
+			// beside the count before it would call the deployment drained. A
+			// publication that did not land leaves the message unacknowledged, and
+			// GitHub delivers it again.
+			if perr := l.publishCapacity(pollCtx, &advertised, "confirmed"); perr != nil {
+				l.log.Warn("could not report listener capacity", "tier", l.tier, "error", perr)
+
+				if delivered {
+					l.log.Error("could not record this tier's demand as unknown before handling a "+
+						"delivery; leaving it unacknowledged for GitHub to deliver again",
+						"tier", l.tier, "message", msg.MessageID)
+
+					continue
+				}
+			}
 		} else {
 			l.reportCapacity(context.WithoutCancel(pollCtx), nil, "ambiguous")
 		}

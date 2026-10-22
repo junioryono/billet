@@ -40,6 +40,35 @@ type ListenerCapacity struct {
 	// stalled listener cannot say it has stalled, so the reader compares this
 	// with its own clock.
 	WaitingProgress string `json:"waiting_progress,omitempty"`
+	// HeldBy is the waiter the admission order holds the line for ahead of this
+	// tier, and HeldBySince when it began waiting; Refusal is the allocator's
+	// reason for this tier's last refused purchase. Each is empty when there is
+	// none to name, and an older control plane writes neither, so a reader shows
+	// nothing rather than "no reason" (#248).
+	HeldBy      string `json:"held_by,omitempty"`
+	HeldBySince string `json:"held_by_since,omitempty"`
+	Refusal     string `json:"refusal,omitempty"`
+	// Unstarted is how many jobs GitHub has assigned this tier beyond the
+	// runners it has, as its last reconciliation counted them: GitHub's demand,
+	// whatever the admission order makes of it. Waiting is the same count only
+	// while the tier holds a place in line, and is zero for a tier at its own
+	// cap or under a seal it does not wait out in line; this is not. Nil means
+	// unknown, a listener that has not reconciled or a control plane older than
+	// the field, never none, because a drain reads it to say whether assigned
+	// work is still waiting (#140).
+	Unstarted *int `json:"unstarted,omitempty"`
+	// UnstartedAt is when GitHub last vouched for the statistics Unstarted was
+	// counted from (an empty exchange sent with the advertisement withdrawn),
+	// which is not when the observation was written: a listener republishes its
+	// last count at every poll, so the observation's own date would make an old
+	// count look new. Empty when nothing has vouched for it.
+	UnstartedAt string `json:"unstarted_at,omitempty"`
+	// UnstartedReleases is the tier's release generation (TierReleases) read
+	// with the runner count Unstarted was made from. A drain trusts the count
+	// only while the generation has not moved: a lease closed since may have
+	// been a runner the count had covering a job. Nil from a control plane
+	// older than the field, which a drain trusts no count from.
+	UnstartedReleases *int64 `json:"unstarted_releases,omitempty"`
 }
 
 // RecordListenerCapacity publishes the listener's ownership for another process.
@@ -200,4 +229,27 @@ func (out *TierCapacity) countLaunched(phase Phase, member PoolRunner, found boo
 	default:
 		out.Unknown++
 	}
+}
+
+// TierReleases is every tier's release generation: how many of its leases have
+// closed, advanced in each close's own transaction. A tier none of whose leases
+// has closed is absent, which is generation zero. A drain holds a listener's
+// count against it, since a lease released after the count was read may have
+// been a runner the count had covering an assigned job.
+func (a *Allocator) TierReleases(ctx context.Context) (map[string]int64, error) {
+	out := map[string]int64{}
+	err := a.db.View(ctx, func(tx querier) error {
+		rows, err := state.ReadQueries(tx).ListTierReleases(ctx)
+		if err != nil {
+			return fmt.Errorf("alloc: read each tier's release generation: %w", err)
+		}
+
+		for _, row := range rows {
+			out[row.Tier] = row.Generation
+		}
+
+		return nil
+	})
+
+	return out, err
 }

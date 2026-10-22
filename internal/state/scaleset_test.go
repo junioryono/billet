@@ -153,6 +153,68 @@ func TestForgettingOneGroupLeavesTheOther(t *testing.T) {
 	}
 }
 
+// AND ONE NAME LEAVES ANOTHER IN THE SAME GROUP: forgetting a set forgets that
+// set, never every set the group holds on the target.
+func TestForgettingOneNameLeavesItsNeighbour(t *testing.T) {
+	db := open(t)
+
+	for i, label := range []string{"billet-2vcpu", "billet-4vcpu"} {
+		rec := ScaleSetRecord{Target: testOrg, RunnerGroup: "billet", Label: label, ID: 7 + i}
+		if err := db.RecordScaleSet(t.Context(), rec); err != nil {
+			t.Fatalf("RecordScaleSet(%s): %v", label, err)
+		}
+	}
+
+	if err := db.ForgetScaleSet(t.Context(), testOrg, "billet", "billet-2vcpu"); err != nil {
+		t.Fatalf("ForgetScaleSet: %v", err)
+	}
+
+	got := scaleSets(t, db)
+	if len(got) != 1 || got[0].Label != "billet-4vcpu" {
+		t.Fatalf("ScaleSets = %v, want only the name that was not forgotten", got)
+	}
+}
+
+// A RECORD IS FOUND AND FORGOTTEN UNDER ANY SPELLING of its target, group and
+// name, as GitHub compares them. The control plane refuses to start beside a
+// stale set it finds without case, so forgetting with case would leave the
+// record behind a teardown GitHub has completed, and every start refused.
+func TestARecordIsFoundAndForgottenUnderAnySpelling(t *testing.T) {
+	db := open(t)
+
+	rec := ScaleSetRecord{Target: strings.ToUpper(testOrg), RunnerGroup: "Retired", Label: "Billet-2vcpu", ID: 9}
+	if err := db.RecordScaleSet(t.Context(), rec); err != nil {
+		t.Fatalf("RecordScaleSet: %v", err)
+	}
+
+	if got := scaleSets(t, db); len(got) != 1 {
+		t.Fatalf("ScaleSets(%q) = %v, want the record written under %q", testOrg, got, rec.Target)
+	}
+
+	if err := db.ForgetScaleSet(t.Context(), testOrg, "retired", "billet-2vcpu"); err != nil {
+		t.Fatalf("ForgetScaleSet: %v", err)
+	}
+
+	if got := scaleSets(t, db); len(got) != 0 {
+		t.Fatalf("ScaleSets = %v after forgetting it under another spelling, want none", got)
+	}
+
+	// AND BEYOND ASCII, which SQLite's LOWER does not fold: a group named with a
+	// letter outside it is forgotten under its other case all the same.
+	accented := ScaleSetRecord{Target: testOrg, RunnerGroup: "Équipe", Label: "billet-4vcpu", ID: 10}
+	if err := db.RecordScaleSet(t.Context(), accented); err != nil {
+		t.Fatalf("RecordScaleSet: %v", err)
+	}
+
+	if err := db.ForgetScaleSet(t.Context(), testOrg, "équipe", "billet-4vcpu"); err != nil {
+		t.Fatalf("ForgetScaleSet: %v", err)
+	}
+
+	if got := scaleSets(t, db); len(got) != 0 {
+		t.Fatalf("ScaleSets = %v after forgetting %q as %q, want none", got, "Équipe", "équipe")
+	}
+}
+
 // Teardown may run against a deployment whose ledger predates the record, and
 // refusing there would fail a teardown GitHub has already completed.
 func TestForgettingSomethingNeverRecordedIsNotAnError(t *testing.T) {

@@ -159,24 +159,92 @@ func anyChargeFits(p *placer, t config.Tier, room placementCost) bool {
 	return !tested && t.VCPU <= room.vcpu && t.Memory <= room.memory
 }
 
-// shareBound reports whether a tier's own target share, rather than the fleet,
-// is what stops it buying one more now, measured at the shape a lease of it is
-// charged on the hosts it could use: a remote tier is charged the shape it
-// buys, not its request.
-func (a *Allocator) shareBound(ctx context.Context, tx querier, t config.Tier) (bool, error) {
-	if _, ok := a.limits.Shares[config.ShareTarget(t)]; !ok {
+// bound is what stops a tier buying one more now, where that is a pot other
+// tiers buy from rather than the tier's own hosts.
+type bound struct {
+	// share is the tier's own target share, measured at the shape a lease of it
+	// is charged on the hosts it could use: a remote tier is charged the shape
+	// it buys, not its request.
+	share bool
+	// ceiling is the deployment ceiling: the tier's hosts could place one more
+	// now, current work and other tiers' outstanding floors charged, and the
+	// ceiling refuses it.
+	ceiling bool
+}
+
+// boundBy measures both pots from one placer, so the admission view walks the
+// fleet once per tier for them. The share and the ceiling are judged apart: the
+// ceiling's question narrows by the deployment's room alone, never by the share,
+// so a tier can be bound by either, both or neither.
+func (a *Allocator) boundBy(ctx context.Context, tx querier, t config.Tier) (bound, error) {
+	p, floors, err := a.placerWithFloors(ctx, tx, t)
+	if err != nil {
+		return bound{}, err
+	}
+
+	var out bound
+
+	if _, ok := a.limits.Shares[config.ShareTarget(t)]; ok {
+		room, err := a.shareRoomFor(ctx, tx, t.Label, placementCost{}, floors)
+		if err != nil {
+			return bound{}, err
+		}
+
+		out.share = !anyChargeFits(p, t, room)
+	}
+
+	out.ceiling, err = a.ceilingRefuses(ctx, tx, t, p, floors)
+	if err != nil {
+		return bound{}, err
+	}
+
+	return out, nil
+}
+
+// ceilingRefuses reports whether the deployment ceiling, and not the tier's
+// hosts or its own cap, is what refuses one more of it now. It spends p's
+// deployment room, so p is not reused after it.
+//
+// ASKED OF THE TIER, NOW, WITH CURRENT WORK CHARGED. A waiter whose hosts have
+// room the ceiling will not let it use is waiting for ceiling, which every
+// purchase anywhere spends; a waiter whose hosts are full is waiting for room on
+// those hosts, which only a tier sharing one can take. The deployment-wide fact
+// this replaced (is the ceiling smaller than the hosts?) said the first of
+// every tier as soon as the ceiling sat a couple of vCPU below the hosts, and a
+// tier waiting for a Mac's macOS slot held every Linux tier on another machine
+// (#187). Nor is it the per-tier test rejected before that, which asked whether
+// the ceiling cut the tier's total on an empty fleet: that ignores what is
+// running, and said no for a large tier whose host was empty while a small tier
+// on another host spent the whole ceiling.
+func (a *Allocator) ceilingRefuses(ctx context.Context, tx querier, t config.Tier, p *placer,
+	floors floorCharge,
+) (bool, error) {
+	if t.MaxConcurrent > 0 {
+		open, err := a.countOpenByTier(ctx, tx, t.Label)
+		if err != nil {
+			return false, err
+		}
+
+		if open >= t.MaxConcurrent {
+			return false, nil
+		}
+	}
+
+	// THE HOSTS FIRST, while the placer still carries no deployment room.
+	if p.total(t) == 0 {
 		return false, nil
 	}
 
-	p, floors, err := a.placerWithFloors(ctx, tx, t)
+	used, err := a.usage(ctx, tx)
 	if err != nil {
 		return false, err
 	}
 
-	room, err := a.shareRoomFor(ctx, tx, t.Label, placementCost{}, floors)
-	if err != nil {
-		return false, err
-	}
+	// THE CEILING AS HEADROOM CHARGES IT (headroomWithPlacer), including what a
+	// lease stranded off the fleet holds: usage counts it, and no live host can
+	// use what it holds.
+	p.deploymentVCPU = max(a.limits.MaxVCPU-used.VCPU-floors.vcpu, 0)
+	p.deploymentMemory = max(a.limits.MaxMemory-used.Memory-floors.memory, 0)
 
-	return !anyChargeFits(p, t, room), nil
+	return p.total(t) == 0, nil
 }

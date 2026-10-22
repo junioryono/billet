@@ -186,3 +186,8 @@ type Rollout struct {
 	FinishedAt      string
 	TerminalReason  string
 }
+
+type TierRelease struct {
+	Tier       string
+	Generation int64
+}

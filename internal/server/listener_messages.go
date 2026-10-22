@@ -208,8 +208,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		// AND THE OFFER PATH ASKS THE ORDER, for the reason backAssignment does:
 		// escrow bought here is room a waiting tier was accumulating (#157).
 		// What is not bought is not acquired, and GitHub offers it again.
-		if len(msg.Available) > 0 && l.order.mayBuy(l.tier, l.admission(ctx)) {
-			if err := l.refillEscrowTo(ctx, l.targetCapacityFor(len(msg.Available))); err != nil {
+		if len(msg.Available) > 0 {
+			if err := l.buyForOffers(ctx, len(msg.Available)); err != nil {
 				return err
 			}
 		}
@@ -275,7 +275,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// A delivery that no longer holds carries current statistics even while the
 	// earlier hold blocks reconciliation until this message is acknowledged.
 	if msg.Statistics != nil && len(resolved.held) == 0 {
-		l.observed = msg.Statistics
+		l.observed, l.observedStale = msg.Statistics, false
 		if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
 			return err
 		}

@@ -10,10 +10,18 @@ import (
 
 // reportCapacity keeps observation writes in ownership order under mu. Reporting
 // failure is audible and changes no scheduling decision or lease ownership.
-// THE WRITE IS BOUNDED so a failed observation cannot stall renewal indefinitely.
 func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange string) {
+	if err := l.publishCapacity(ctx, sent, exchange); err != nil {
+		l.log.Warn("could not report listener capacity", "tier", l.tier, "error", err)
+	}
+}
+
+// publishCapacity is reportCapacity for a caller whose next step depends on the
+// observation having reached the ledger. THE WRITE IS BOUNDED so a failed
+// observation cannot stall renewal indefinitely.
+func (l *Listener) publishCapacity(ctx context.Context, sent *int, exchange string) error {
 	if l.alloc == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, l.releaseGrace)
 	defer cancel()
@@ -36,6 +44,19 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 		Waiting: l.waitingFor,
 	}
 
+	// GITHUB'S DEMAND AS COUNTED, whatever the order made of it: a drain reads
+	// this to say whether assigned work is still waiting (#140).
+	if l.demandKnown {
+		unstarted, releases := l.waitingFor, l.demandReleases
+		report.Unstarted, report.UnstartedReleases = &unstarted, &releases
+
+		// UNDATED UNTIL GITHUB HAS VOUCHED FOR IT under a withdrawn
+		// advertisement, which a drain reads as a count from before its seal.
+		if !l.demandAt.IsZero() {
+			report.UnstartedAt = l.demandAt.UTC().Format(time.RFC3339Nano)
+		}
+	}
+
 	// THE QUEUE'S OWN RECORD OF WHEN THIS TIER BEGAN WAITING, not a fresh
 	// timestamp: the point of the field is how long the oldest work has been
 	// waiting, and a value stamped at each observation would always read as
@@ -43,6 +64,21 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	if since, progress, ok := l.order.waitingSince(l.tier); ok {
 		report.WaitingSince = since.UTC().Format(time.RFC3339Nano)
 		report.WaitingProgress = progress.UTC().Format(time.RFC3339Nano)
+
+		// WHO HOLDS THE LINE, asked of the queue now rather than remembered from
+		// the refusal, which may be a poll old (#248).
+		if holder, holderSince, held := l.order.waiterHeldBy(l.tier); held {
+			report.HeldBy = holder
+			report.HeldBySince = holderSince.UTC().Format(time.RFC3339Nano)
+		}
+	}
+
+	// AND WHAT THE ALLOCATOR SAID, which the queue does not know, for any tier
+	// with demand it could not buy for, in the queue or not: a tier at its own
+	// cap or with no host never waits in line, and is exactly the one whose
+	// reason an operator cannot otherwise find.
+	if l.waitingFor > 0 && (l.refused.room != nil || l.refused.unread != nil) && !l.refused.byOrder() {
+		report.Refusal = l.refused.String()
 	}
 
 	// A COUNT WITHOUT A DATE IS NOT A WAIT. The two are written by different
@@ -65,7 +101,5 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	}
 	slices.Sort(report.Discovery)
 	slices.Sort(report.Pending)
-	if err := l.alloc.RecordListenerCapacity(ctx, l.tier, report); err != nil {
-		l.log.Warn("could not report listener capacity", "tier", l.tier, "error", err)
-	}
+	return l.alloc.RecordListenerCapacity(ctx, l.tier, report)
 }

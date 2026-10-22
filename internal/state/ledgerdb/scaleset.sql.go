@@ -11,7 +11,7 @@ import (
 
 const deleteMovedScaleSet = `-- name: DeleteMovedScaleSet :exec
 DELETE FROM scale_set
- WHERE org = $1 AND scale_set_id = $2
+ WHERE LOWER(org) = LOWER(CAST($1 AS TEXT)) AND scale_set_id = $2
    AND NOT (runner_group = $3 AND label = $4)
 `
 
@@ -27,6 +27,10 @@ type DeleteMovedScaleSetParams struct {
 // A scale set deleted and recreated outside billet keeps its name and takes a
 // new id; one RENAMED keeps its id under a new name. This removes the stale
 // (group, label) so the orphan report does not name an object that is gone.
+//
+// THE TARGET WITHOUT CASE, AS ListScaleSets READS IT, and the name exactly: a
+// row of this id recorded under another spelling of its group or name is an
+// alias of this one, removed here so aliases do not accumulate.
 func (q *Queries) DeleteMovedScaleSet(ctx context.Context, arg DeleteMovedScaleSetParams) error {
 	_, err := q.db.ExecContext(ctx, deleteMovedScaleSet,
 		arg.Org,
@@ -47,7 +51,9 @@ type DeleteScaleSetParams struct {
 	Label       string
 }
 
-// Drop the record for a scale set billet has deleted.
+// Drop one record by its exact key. ForgetScaleSet finds every spelling of a
+// set's group and name in Go, where case folding is not ASCII alone, and
+// deletes each by this.
 func (q *Queries) DeleteScaleSet(ctx context.Context, arg DeleteScaleSetParams) error {
 	_, err := q.db.ExecContext(ctx, deleteScaleSet, arg.Org, arg.RunnerGroup, arg.Label)
 	return err
@@ -55,7 +61,7 @@ func (q *Queries) DeleteScaleSet(ctx context.Context, arg DeleteScaleSetParams) 
 
 const listScaleSets = `-- name: ListScaleSets :many
 SELECT org, runner_group, label, scale_set_id FROM scale_set
- WHERE org = $1 ORDER BY runner_group, label
+ WHERE LOWER(org) = LOWER(CAST($1 AS TEXT)) ORDER BY runner_group, label
 `
 
 type ListScaleSetsRow struct {
@@ -65,7 +71,9 @@ type ListScaleSetsRow struct {
 	ScaleSetID  int64
 }
 
-// Every scale set billet recorded creating for one organization.
+// Every scale set billet recorded creating for one target, its path compared
+// without case as GitHub compares owners and repositories, so a record written
+// under another spelling of the same target is still found.
 func (q *Queries) ListScaleSets(ctx context.Context, org string) ([]ListScaleSetsRow, error) {
 	rows, err := q.db.QueryContext(ctx, listScaleSets, org)
 	if err != nil {

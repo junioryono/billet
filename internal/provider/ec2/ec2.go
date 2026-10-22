@@ -542,9 +542,10 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 			}
 
 			if !ok {
-				refusals = append(refusals, instanceType.Type+": budget")
-				p.log.Warn("this fallback shape would exceed the node or deployment budget; "+
-					"trying the next declared one", "runner", spec.Name, "type", instanceType.Type)
+				refusals = append(refusals, instanceType.Type+": refused by the control plane")
+				p.log.Warn("the control plane refused this fallback shape (its budget, or room the "+
+					"admission order holds for a waiting tier); trying the next declared one",
+					"runner", spec.Name, "type", instanceType.Type)
 
 				continue
 			}

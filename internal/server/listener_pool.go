@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -42,7 +43,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	if err != nil {
 		return fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
 	}
-	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
+	active, releases, err := l.alloc.ActiveRunnersAt(ctx, l.tier)
 	if err != nil {
 		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
 	}
@@ -50,6 +51,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	// READ ONCE, so every purchase in this loop and the record below judge the
 	// tier as it stood at one instant.
 	admission := l.admission(ctx)
+
+	launched := false
 
 	for active < desired {
 		// BOUGHT ONE AT A TIME, LAUNCHED TOGETHER. Each purchase still asks the
@@ -77,6 +80,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			if !l.order.mayBuy(l.tier, admission) {
 				protect = l.order.ahead(l.tier, admission)
 				if len(protect) == 0 {
+					l.refuse(l.orderRefusal(admission), true)
+
 					break
 				}
 			}
@@ -94,6 +99,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 				return errors.Join(err, l.launchPool(ctx, batch))
 			}
 			if lease == nil {
+				l.refuse(l.roomRefusal(ctx, protect), true)
+
 				break
 			}
 			batch = append(batch, poolLaunch{lease: lease, job: job})
@@ -108,12 +115,37 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		if err := l.launchPool(ctx, batch); err != nil {
 			return err
 		}
+
+		launched = true
 	}
+
+	// COUNTED AGAIN AFTER A LAUNCH, which can fail and release its lease
+	// without an error: the count above went up when the lease was bought, and
+	// a demand published as met while its job waits is what a drain would read
+	// as drained. A recount that cannot be read leaves the demand unknown.
+	counted := true
+
+	if launched {
+		if recount, at, err := l.alloc.ActiveRunnersAt(ctx, l.tier); err == nil {
+			active, releases = recount, at
+		} else {
+			counted = false
+
+			l.log.Warn("could not count this tier's runners after launching; what it still wants "+
+				"is reported unknown until the next reconciliation", "tier", l.tier, "error", err)
+		}
+	}
+
 	// WHAT THIS TIER STILL WANTS, recorded for the order. Demand that is met, or
 	// that GitHub's count says has gone away, releases this tier's place rather
-	// than holding the fleet behind work nobody is waiting for any more.
+	// than holding the fleet behind work nobody is waiting for any more. DATED
+	// BY GITHUB'S LAST WORD on the statistics it is counted from, not by when
+	// this ran: a reconciliation reruns on cached statistics before every poll,
+	// and an assignment made before a seal and not yet delivered would otherwise
+	// be counted as none under a date after it (observedAt).
 	l.mu.Lock()
-	l.waitingFor = max(desired-active, 0)
+	l.waitingFor, l.demandKnown, l.demandAt = max(desired-active, 0), counted, l.observedAt
+	l.demandReleases = releases
 	l.mu.Unlock()
 
 	// A TIER THAT COULD NOT GROW WHATEVER ANYONE FREED DOES NOT HOLD THE LINE.
@@ -136,9 +168,25 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		l.order.served(l.tier)
 	}
 
+	if active >= desired {
+		l.refusalServed()
+	}
+
 	surplus := active - desired
 	if surplus <= 0 {
 		l.retireOfflineMembers(ctx, runners)
+
+		// A RUNNER RETIRED FOR BEING OFFLINE may have been one the count above
+		// had covering an assigned job, and its retirement left the count
+		// unknown (retirePoolMember); a count of none is the one it can make
+		// wrong. Either is counted again.
+		l.mu.Lock()
+		invalidated := !l.demandKnown
+		l.mu.Unlock()
+
+		if invalidated || (surplus == 0 && desired > 0) {
+			l.recountDemand(ctx, desired)
+		}
 
 		return nil
 	}
@@ -160,6 +208,24 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	return nil
+}
+
+// recountDemand counts again what this tier still wants after its runners
+// changed, under the date the count already carries; a recount that cannot be
+// read leaves it unknown.
+func (l *Listener) recountDemand(ctx context.Context, desired int) {
+	active, releases, err := l.alloc.ActiveRunnersAt(ctx, l.tier)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if err != nil {
+		l.demandKnown = false
+
+		return
+	}
+
+	l.waitingFor, l.demandKnown, l.demandReleases = max(desired-active, 0), true, releases
 }
 
 // poolLaunchBatch is how many pool members one pass starts at once on a tier
@@ -248,6 +314,8 @@ func (l *Listener) backPoolSlotLeaving(ctx context.Context, protect []string) er
 // the message hands it back. Not while draining, for backPoolSlot's reason.
 func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	if l.isDraining() {
+		l.refuse(refusal{draining: true}, false)
+
 		return nil
 	}
 
@@ -266,11 +334,29 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	// fragment of room the longest-waiting tier was accumulating and fairness
 	// protected only the pool path (#157). The assignment is not acquired here:
 	// billet declines it and GitHub reassigns it after its pickup deadline.
-	if !l.order.mayBuy(l.tier, l.admission(ctx)) {
+	//
+	// AND WHATEVER REFUSES IT IS RECORDED for the decline that follows, which
+	// otherwise could not say whether the order or the allocator refused (#248).
+	where := l.admission(ctx)
+	if !l.order.mayBuy(l.tier, where) {
+		l.refuse(l.orderRefusal(where), false)
+
 		return nil
 	}
 
-	return l.refillEscrowUngated(ctx, l.capacity()+1, 1)
+	if err := l.refillEscrowUngated(ctx, l.capacity()+1, 1); err != nil {
+		return err
+	}
+
+	l.mu.Lock()
+	bought := len(l.held) > 0
+	l.mu.Unlock()
+
+	if !bought {
+		l.refuse(l.roomRefusal(ctx, nil), false)
+	}
+
+	return nil
 }
 
 // admission is what the order needs to know about this tier: whether room could
@@ -287,15 +373,21 @@ func (l *Listener) admission(ctx context.Context) alloc.TierAdmission {
 		return alloc.TierAdmission{CanGrow: true}
 	}
 
-	view, err := l.alloc.AdmissionView(ctx)
+	return admissionOf(ctx, l.alloc, l.tier, l.log)
+}
+
+// admissionOf reads one tier's admission, and a read that failed as an
+// eligible tier with an unknown host set (see Listener.admission).
+func admissionOf(ctx context.Context, a *alloc.Allocator, tier string, log *slog.Logger) alloc.TierAdmission {
+	admission, err := a.AdmissionFor(ctx, tier)
 	if err != nil {
-		l.log.Warn("could not read which tiers room could reach; admitting this purchase",
-			"tier", l.tier, "error", err)
+		log.Warn("could not read which tiers room could reach; admitting this purchase",
+			"tier", tier, "error", err)
 
 		return alloc.TierAdmission{CanGrow: true}
 	}
 
-	return view[l.tier]
+	return admission
 }
 
 func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
@@ -364,6 +456,18 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 	if errors.Is(err, alloc.ErrLeaseNotFound) {
 		lease = nil
 	}
+	// UNKNOWN WHERE A DRAIN READS IT BEFORE THE LEASE CAN GO, on every path
+	// here, a retry of the journal included: this member may be the runner the
+	// published count had covering an assigned job, and once its lease is
+	// released the ledger can be quiet beside that count of none. A publication
+	// that did not land releases nothing, and the journal retries.
+	if lease != nil {
+		if err := l.forgetDemand(ctx); err != nil {
+			l.log.Error("could not record this tier's demand as unknown before retiring a pool member; "+
+				"its retirement is retried", "tier", l.tier, "runner", member.RunnerName, "error", err)
+			return
+		}
+	}
 	job := dispatch.Job{RequestID: member.LaunchRequestID, RunnerID: member.RunnerID,
 		RunnerName: member.RunnerName}
 	if err := l.destroyCompleted(ctx, job, lease, alloc.PhaseDone); err != nil {
@@ -415,6 +519,27 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 		return
 	}
 	l.dropPoolMember(member)
+}
+
+// undate forgets GitHub's word on the statistics in hand: the count made from
+// them is unknown until counted again, and undated until an empty exchange sent
+// with the advertisement withdrawn vouches for what it is counted from.
+func (l *Listener) undate() {
+	l.observedAt = time.Time{}
+
+	l.mu.Lock()
+	l.demandKnown, l.demandAt = false, time.Time{}
+	l.mu.Unlock()
+}
+
+// forgetDemand publishes this tier's demand as unknown until the next
+// reconciliation counts it again.
+func (l *Listener) forgetDemand(ctx context.Context) error {
+	l.mu.Lock()
+	l.demandKnown = false
+	l.mu.Unlock()
+
+	return l.publishCapacity(ctx, nil, "")
 }
 
 const (

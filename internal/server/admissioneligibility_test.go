@@ -134,8 +134,8 @@ func TestAWaiterOnOneHostDoesNotBlockATierOnAnother(t *testing.T) {
 	onB.Node = "host-b"
 
 	// THE CEILING IS ABOVE WHAT THE HOSTS HOLD, so the hosts are the only thing
-	// these tiers could share: a ceiling smaller than the fleet is itself a pot
-	// they all buy from, and every tier would compete for it wherever it runs.
+	// these tiers could share: a waiter the ceiling refuses competes with every
+	// tier wherever it runs.
 	log, listeners := fairListeners(t, []config.Tier{onA, fillsA, onB},
 		alloc.Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
 		[]alloc.NodeRegistration{host("host-a", 8), host("host-b", 8)})
@@ -194,30 +194,152 @@ func on(hosts ...string) alloc.TierAdmission {
 	return alloc.TierAdmission{CanGrow: true, Nodes: hosts}
 }
 
-// TIERS ON DIFFERENT HOSTS STILL COMPETE FOR THE DEPLOYMENT CEILING.
+// A WAITER THE CEILING REFUSES HOLDS EVERY BUYER, WHEREVER IT RUNS.
 //
-// A ceiling smaller than the fleet is one pot both tiers buy from: a tier pinned
-// to one host and a tier pinned to another share nothing but that number, and a
-// rule that looked only at hosts let a stream of small jobs on one host starve a
-// large tier waiting on the other.
-func TestTiersSharingTheDeploymentCeilingCompeteWhereverTheyRun(t *testing.T) {
+// A tier pinned to one host and a tier pinned to another share nothing but the
+// ceiling, and a rule that looked only at hosts let a stream of small jobs on
+// one host starve a large tier whose own host was empty. The waiter's flag
+// decides it, not the buyer's: a buyer that is itself nowhere near the ceiling
+// still spends it.
+func TestACeilingBoundWaiterHoldsBuyersOnEveryHost(t *testing.T) {
 	t.Parallel()
 
-	shared := func(hosts ...string) alloc.TierAdmission {
-		return alloc.TierAdmission{CanGrow: true, Nodes: hosts, CeilingShared: true}
-	}
+	bound := on("host-a")
+	bound.CeilingBound = true
 
 	q := newAdmissionQueue(config.AdmissionFair)
-	q.waits("a-large", shared("host-a"))
+	q.waits("a-large", bound)
 
-	if q.mayBuy("b-small", shared("host-b")) {
-		t.Error("a tier on another host bought room the ceiling was holding for the waiter")
+	if q.mayBuy("b-small", on("host-b")) {
+		t.Error("a tier on another host bought the ceiling a ceiling-bound waiter is waiting for")
 	}
 
-	// On a deployment whose ceiling is above what its hosts could hold, the hosts
-	// are the only thing two tiers can share.
-	if !q.mayBuy("c-elsewhere", on("host-c")) {
-		t.Error("a tier on a fleet its ceiling does not cap was held behind a waiter it shares no host with")
+	// A HOST-BOUND WAITER holds only the buyers on its hosts, however close the
+	// ceiling is and however the buyer stands against it (#187).
+	q = newAdmissionQueue(config.AdmissionFair)
+	q.waits("a-mac", on("mac"))
+
+	buyer := on("linux")
+	buyer.CeilingBound = true
+
+	if !q.mayBuy("b-linux", buyer) {
+		t.Error("a waiter whose own host is full held a tier on another host, which can take " +
+			"nothing it is waiting for")
+	}
+
+	if q.mayBuy("c-mac", on("mac")) {
+		t.Error("a tier on the waiter's own host bought ahead of it")
+	}
+}
+
+// AND A CEILING-BOUND WAITER HOLDS A TIER ON ANOTHER HOST, END TO END.
+//
+// Two tiers pinned to different hosts under a ceiling that fits either but not
+// both (#173's review). The small tier spends the whole ceiling, so the large
+// tier's empty host is of no use to it and it waits for ceiling. When a small
+// job ends, the ceiling it returns is what the large tier is waiting for, and
+// the small tier on the other host must not take it back.
+func TestACeilingBoundWaiterHoldsATierOnAnotherHost(t *testing.T) {
+	t.Parallel()
+
+	large := tierOf("a-large", 8)
+	large.Node = "host-a"
+	small := tierOf("b-small", 4)
+	small.Node = "host-b"
+
+	log, listeners := fairListeners(t, []config.Tier{large, small},
+		alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB},
+		[]alloc.NodeRegistration{host("host-a", 8), host("host-b", 8)})
+
+	if err := listeners[1].reconcilePool(t.Context(), 2); err != nil {
+		t.Fatalf("small tier reconcile: %v", err)
+	}
+
+	if err := listeners[0].reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("large tier reconcile: %v", err)
+	}
+
+	finishOne(t, listeners[1].alloc, "b-small")
+
+	if err := listeners[1].reconcilePool(t.Context(), 2); err != nil {
+		t.Fatalf("small tier reconcile after a job ended: %v", err)
+	}
+
+	if got := startedTiers(log); got["b-small"] != 2 || got["a-large"] != 0 {
+		t.Errorf("started %v: the small tier took back the ceiling the large tier, whose own "+
+			"host is empty, is waiting for", got)
+	}
+}
+
+// finishOne ends one of a tier's open pool leases, as a finished job does.
+func finishOne(t *testing.T, a *alloc.Allocator, tier string) {
+	t.Helper()
+
+	runners, err := a.PoolRunners(t.Context(), tier)
+	if err != nil || len(runners) == 0 {
+		t.Fatalf("read the pool for %s: %d members, %v", tier, len(runners), err)
+	}
+
+	lease, err := a.Lease(t.Context(), runners[0].LeaseID)
+	if err != nil {
+		t.Fatalf("read lease %s: %v", runners[0].LeaseID, err)
+	}
+
+	if err := a.ForgetPoolRunner(t.Context(), lease.ID); err != nil {
+		t.Fatalf("forget pool runner %s: %v", lease.ID, err)
+	}
+
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("release lease %s: %v", lease.ID, err)
+	}
+}
+
+// AND THE MAC BEHIND THE LINUX HOST, END TO END (#187).
+//
+// A ceiling of 136 vCPU over a 120 vCPU Linux host and an 18 vCPU Mac: below
+// the hosts' 138, which the rule this replaced read as one pot for every tier.
+// A macOS tier waits for the Mac's two VM slots, which another macOS tier
+// holds, with 128 vCPU of ceiling to spare. A Linux tier on the other host
+// must still buy, because nothing it takes is anything the waiter could use.
+func TestAWaiterForAMacDoesNotHoldALinuxTierUnderAMarginalCeiling(t *testing.T) {
+	t.Parallel()
+
+	mac := func(label string) config.Tier {
+		return config.Tier{
+			Label: label, Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+			Node: "mac", VCPU: 4, Memory: 8 * config.GiB, Image: "macos",
+		}
+	}
+
+	linux := tierOf("c-linux", 2)
+
+	log, listeners := fairListeners(t, []config.Tier{mac("a-mac-busy"), mac("b-mac-waiting"), linux},
+		alloc.Limits{MaxVCPU: 136, MaxMemory: 540 * config.GiB},
+		[]alloc.NodeRegistration{
+			{Name: "linux-host", Provider: config.ProviderFirecracker, VCPU: 120, Memory: 480 * config.GiB},
+			{Name: "mac", Provider: config.ProviderTart, VCPU: 18, Memory: 64 * config.GiB},
+		})
+
+	// The Mac's two slots are taken, so the second macOS tier waits.
+	if err := listeners[0].reconcilePool(t.Context(), 2); err != nil {
+		t.Fatalf("busy macOS tier reconcile: %v", err)
+	}
+
+	if err := listeners[1].reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("waiting macOS tier reconcile: %v", err)
+	}
+
+	if _, _, waiting := listeners[1].order.waitingSince("b-mac-waiting"); !waiting {
+		t.Fatal("the second macOS tier is not waiting, so this case cannot show who it holds back")
+	}
+
+	if err := listeners[2].reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("linux tier reconcile: %v", err)
+	}
+
+	if got := startedTiers(log); got["c-linux"] != 1 {
+		t.Errorf("started %v: a tier waiting for a Mac's macOS slot held a Linux tier on another "+
+			"host under a ceiling just below the hosts", got)
 	}
 }
 

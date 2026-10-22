@@ -243,6 +243,13 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		report.github = worseGitHubVerdict(report.github, verdict)
 	}
 
+	// The live hosts each tier's shape fits, read with the fleet below, and how
+	// many live hosts there are; nil and zero without a server section.
+	var (
+		shapeHosts map[string][]string
+		liveHosts  int
+	)
+
 	if cfg.Server != nil {
 		fmt.Fprintf(env.Stdout, "listen   %s\n", cfg.Server.Listen)
 
@@ -333,9 +340,17 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			liveness := "offline"
 			if member.Live {
 				liveness = "live"
+				liveHosts++
 			}
 			fmt.Fprintf(env.Stdout, "fleet    %-24s at %s via %s (%s)\n", member.Name, site,
 				member.Provider, liveness)
+		}
+
+		// WHICH LIVE HOSTS EACH SHAPE FITS, for the tier lines below: a tier no
+		// live host can place advertises and is assigned work all the same
+		// (ADR-012), and its jobs wait however much else is free.
+		if shapeHosts, err = a.ShapeHosts(ctx); err != nil {
+			return report, err
 		}
 
 		// THE CEILING AGAINST EVERY REGISTERED HOST, offline ones included, because
@@ -569,6 +584,16 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		fmt.Fprintf(env.Stdout, "  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
 			fleetops.TierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
 			reserved, intercept, onTarget)
+
+		// A SHAPE NO LIVE HOST CAN PLACE, said where the tier is listed (#140).
+		// ADVISORY: a host that can is perhaps offline, or not enrolled yet, and
+		// the tier's jobs wait until one registers. Said only when some host is
+		// live, because with none every tier would say it and the fleet line
+		// above has said why.
+		if hosts, read := shapeHosts[t.Label]; read && len(hosts) == 0 && liveHosts > 0 {
+			fmt.Fprintf(env.Stdout, "           UNPLACEABLE: no live host can place this shape (its providers, "+
+				"each host's policy, size and macOS slots); its jobs are assigned and wait until one registers\n")
+		}
 
 		// THE SERVER REFUSES ON THIS AND CHECK USED TO PASS OVER IT.
 		//

@@ -390,7 +390,7 @@ func (s *Server) Run(ctx context.Context) error {
 		// the one case that guarantees an orphan the one case that never named it.
 		// The refusal still stands — a control plane with nothing to listen for is
 		// a mistake — but the operator leaves with what they left behind.
-		if err := s.reportUndeclaredScaleSets(ctx, nil); err != nil {
+		if err := s.judgeUndeclaredScaleSets(ctx, nil); err != nil {
 			return err
 		}
 
@@ -566,7 +566,7 @@ func (s *Server) reconcile(ctx context.Context) (map[string]*ScaleSet, map[strin
 		declared[path][key] = struct{}{}
 	}
 
-	if err := s.reportUndeclaredScaleSets(ctx, declared); err != nil {
+	if err := s.judgeUndeclaredScaleSets(ctx, declared); err != nil {
 		return nil, nil, err
 	}
 

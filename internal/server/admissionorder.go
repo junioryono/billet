@@ -39,30 +39,35 @@ import (
 // keeps its place: the moment its listener
 // progresses again it is the longest waiter once more. Silence suspends the right
 // to block others and proves nothing else; the queue releases, destroys and
-// promises nothing, and every purchase is still the allocator's atomic escrow.
+// promises nothing, and every purchase is still one of the allocator's atomic
+// transactions (an escrow, or a fallback's resize).
 //
 // A WAIT IS RELEASED BY DEMAND GOING AWAY AS WELL AS BY BEING SERVED. GitHub's
 // count is the only thing that says a queued job was cancelled, so a record that
 // outlived its demand would hold every other tier for as long as the control
 // plane ran — a worse outage than the starvation fairness prevents.
 //
-// WHAT IT GATES IS THE PURCHASE OF A LEASE. Every one of the listener's three
-// purchases asks it, and one thing that spends capacity does not: a remote
-// fallback resizes a lease that already exists (`alloc.Resize`) to the shape the
-// cloud actually sold, which is re-authorised against the deployment ceiling and
-// every floor but not against this queue. The order admitted that lease; the
-// resize is asked for by the node, through the node plane's resize route or the
-// in-process runtime, and the queue is handed only to listeners, so nothing on
-// that path holds it. A fallback to a larger shape can therefore take pot a
-// waiter was accumulating, which is #172 and is exempt until that says otherwise.
+// WHAT IT GATES IS EVERYTHING THAT SPENDS CAPACITY. Every one of the listener's
+// three purchases asks it, and so does a remote fallback growing a lease that
+// already exists to the larger shape the cloud sold (#172): that is a purchase
+// of the difference, and before it asked, a fallback took pot a longest-waiting
+// tier was accumulating while that tier's own purchases were refused. The
+// node asks for it through the node plane's resize route, which internal/app
+// binds to this queue through Server.ResizeAdmission once the scheduler exists;
+// it is judged as a purchase out of turn, so it is granted while each waiter
+// ahead could still be granted one lease (alloc.ResizeLeaving) and otherwise
+// fails the launch as a fallback the budget refuses does. The node runtime run
+// in process by billet's own harness calls the allocator directly and is not
+// gated; no deployment runs one.
 //
 // A TIER HOLDS THE LINE ONLY WHERE ROOM COULD REACH IT, which is #157. A tier
 // waiting on its own max_concurrent, pinned to a host that is gone, or with a
 // shape no live host fits is never recorded: freed room elsewhere will never
 // let it buy, so holding everyone behind it is an outage with no end. And a
 // waiter blocks only the tiers it could take room from: those sharing at least
-// one host it could be placed on, so a tier waiting for a Mac does not stop a
-// Linux tier whose room is on another machine.
+// one host it could be placed on, unless what refuses it is the deployment
+// ceiling, so a tier waiting for a Mac does not stop a Linux tier whose room is
+// on another machine (#157, #187).
 type admissionQueue struct {
 	policy config.AdmissionOrder
 	now    func() time.Time
@@ -85,8 +90,8 @@ const WaiterAllowance = 3 * time.Minute
 type waitingTier struct {
 	since time.Time
 	// where is the tier's admission as it was last recorded: the hosts it could
-	// be placed on, and whether the deployment ceiling is a pot shared with every
-	// other tier. An empty host set means the hosts could not be read, which
+	// be placed on, and whether the deployment ceiling or its target's share is
+	// what refuses it. An empty host set means the hosts could not be read, which
 	// competes with everyone rather than with nobody: an unknown is not a licence
 	// to bypass the order.
 	//
@@ -131,13 +136,21 @@ func (q *admissionQueue) gates() bool {
 // competes reports whether a buyer contends with a waiter for the same room.
 //
 // THREE WAYS TO COMPETE, and the last two are easy to miss: they share a host
-// either could be placed on; the deployment's own ceiling is smaller than the
-// hosts it caps, which makes it one pot every tier buys from; or they belong to
-// one target with a share, which is a pot its tiers buy from wherever their
+// either could be placed on; the waiter is ceiling-bound, so what refuses it is
+// the deployment ceiling, which every purchase anywhere spends; or they belong
+// to one target with a share, which is a pot its tiers buy from wherever their
 // hosts are. Under such a pot a tier pinned to one host and a tier pinned to
 // another still take room from each other, and a rule that looked only at hosts
 // let a stream of small jobs on one host starve a large tier waiting on the
 // other.
+//
+// THE CEILING IS THE WAITER'S, NOT THE DEPLOYMENT'S (#187). It used to be a
+// fact about the deployment (the ceiling is smaller than the hosts), true of
+// every tier at once, so a ceiling a couple of vCPU below the hosts had a tier
+// waiting for a Mac's macOS slot hold every Linux tier on another machine. A
+// waiter whose own hosts are full is waiting for those hosts, and only a buyer
+// on one of them takes what it waits for, wherever the ceiling sits; the
+// buyer's own relation to the ceiling says nothing about that.
 //
 // A tier whose hosts are unknown competes with every tier, so a failed read
 // never lets a purchase skip the order.
@@ -147,8 +160,10 @@ func (q *admissionQueue) gates() bool {
 // target's buyers back. Only the WAITER's flag decides it: a buyer's own share
 // being full says nothing about whether the waiter it would pass could use the
 // room. Both targets must be known, because an unknown one may be the waiter's
-// own. The flag is the waiter's view at its last refusal, so it can be one poll
-// stale in the direction that favours the other target.
+// own. The flags are the waiter's view at its last refusal, so each can be one
+// poll stale: a share-bound one in the direction that favours the other target,
+// a host-bound one in the direction that lets one purchase elsewhere take the
+// ceiling it would have needed, after which it is ceiling-bound.
 func competes(buyer, waiter alloc.TierAdmission) bool {
 	known := buyer.Target != "" && waiter.Target != ""
 
@@ -160,7 +175,7 @@ func competes(buyer, waiter alloc.TierAdmission) bool {
 		return true
 	}
 
-	if buyer.CeilingShared && waiter.CeilingShared {
+	if waiter.CeilingBound {
 		return true
 	}
 
@@ -191,6 +206,21 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	first, _, stalled := q.head(tier, where)
+
+	allowed := first == "" || first == tier
+	if allowed {
+		q.letPast(tier, stalled)
+	}
+
+	return allowed
+}
+
+// head requires q.mu. It is the waiter that holds the line for a tier at where,
+// which may be the tier itself, and the stalled waiters that stepped aside for
+// it; an empty label means nobody holds it. It logs nothing, so naming the
+// holder does not spend letPast's once-per-stall line.
+func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, time.Time, []string) {
 	first, since := "", time.Time{}
 	now := q.now()
 
@@ -217,12 +247,52 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 		}
 	}
 
-	allowed := first == "" || first == tier
-	if allowed {
-		q.letPast(tier, stalled)
+	return first, since, stalled
+}
+
+// heldBy names the waiter that holds the line ahead of a tier at where, and
+// when it began waiting: what mayBuy refused this tier for. False when nothing
+// does, which includes the tier being at the head itself.
+func (q *admissionQueue) heldBy(tier string, where alloc.TierAdmission) (string, time.Time, bool) {
+	if q == nil || q.policy == config.AdmissionFill {
+		return "", time.Time{}, false
 	}
 
-	return allowed
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return q.heldByLocked(tier, where)
+}
+
+// waiterHeldBy is heldBy for a tier the queue records as waiting, judged at the
+// ground it last waited on; false for a tier that is not waiting, which has no
+// purchase being held back. It is what the status report publishes, asked of
+// the queue when the report is written rather than remembered from a refusal,
+// so it names who holds the line now.
+func (q *admissionQueue) waiterHeldBy(tier string) (string, time.Time, bool) {
+	if q == nil || q.policy == config.AdmissionFill {
+		return "", time.Time{}, false
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	own, waiting := q.waiting[tier]
+	if !waiting {
+		return "", time.Time{}, false
+	}
+
+	return q.heldByLocked(tier, own.where)
+}
+
+// heldByLocked requires q.mu.
+func (q *admissionQueue) heldByLocked(tier string, where alloc.TierAdmission) (string, time.Time, bool) {
+	first, since, _ := q.head(tier, where)
+	if first == "" || first == tier {
+		return "", time.Time{}, false
+	}
+
+	return first, since, true
 }
 
 // ahead lists the waiters that hold the line ahead of tier, judged as mayBuy

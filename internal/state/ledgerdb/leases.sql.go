@@ -91,6 +91,18 @@ func (q *Queries) BindLease(ctx context.Context, arg BindLeaseParams) error {
 	return err
 }
 
+const bumpTierReleases = `-- name: BumpTierReleases :exec
+INSERT INTO tier_releases (tier, generation) VALUES ($1, 1)
+ON CONFLICT (tier) DO UPDATE SET generation = tier_releases.generation + 1
+`
+
+// Advances a tier's release generation, in the transaction that closes one of
+// its leases (migration 66 says why a generation and not a time).
+func (q *Queries) BumpTierReleases(ctx context.Context, tier string) error {
+	_, err := q.db.ExecContext(ctx, bumpTierReleases, tier)
+	return err
+}
+
 const countActiveRunnerLeases = `-- name: CountActiveRunnerLeases :one
 SELECT CAST(COUNT(*) AS BIGINT) FROM leases
  WHERE tier = $1 AND phase NOT IN ('capacity','done','failed') AND deregistered = 0
@@ -109,6 +121,31 @@ func (q *Queries) CountActiveRunnerLeases(ctx context.Context, tier string) (int
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const countActiveRunnersAt = `-- name: CountActiveRunnersAt :one
+SELECT CAST((SELECT COUNT(*) FROM leases l
+              WHERE l.tier = $1 AND l.phase NOT IN ('capacity','done','failed')
+                AND l.deregistered = 0) AS BIGINT) AS active,
+       CAST(COALESCE((SELECT r.generation FROM tier_releases r WHERE r.tier = $1), 0) AS BIGINT) AS releases
+`
+
+type CountActiveRunnersAtRow struct {
+	Active   int64
+	Releases int64
+}
+
+// CountActiveRunnerLeases, and the tier's release generation (zero for a tier
+// none of whose leases has closed), IN ONE STATEMENT. Two statements in one
+// transaction are two snapshots under PostgreSQL's READ COMMITTED, so a close
+// landing between them would pair the count from before it with the
+// generation after it, and a drain would trust a count the close made wrong.
+// The predicate is CountActiveRunnerLeases's, and a test holds them equal.
+func (q *Queries) CountActiveRunnersAt(ctx context.Context, tier string) (CountActiveRunnersAtRow, error) {
+	row := q.db.QueryRowContext(ctx, countActiveRunnersAt, tier)
+	var i CountActiveRunnersAtRow
+	err := row.Scan(&i.Active, &i.Releases)
+	return i, err
 }
 
 const countOpenInTier = `-- name: CountOpenInTier :one
@@ -543,6 +580,34 @@ func (q *Queries) ListServiceableRunnerLeaseIDs(ctx context.Context, tier string
 			return nil, err
 		}
 		items = append(items, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTierReleases = `-- name: ListTierReleases :many
+SELECT tier, generation FROM tier_releases
+`
+
+// Every tier's release generation.
+func (q *Queries) ListTierReleases(ctx context.Context) ([]TierRelease, error) {
+	rows, err := q.db.QueryContext(ctx, listTierReleases)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TierRelease
+	for rows.Next() {
+		var i TierRelease
+		if err := rows.Scan(&i.Tier, &i.Generation); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err

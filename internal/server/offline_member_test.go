@@ -93,6 +93,8 @@ type offlineFixture struct {
 	destroyed int
 	// requests is every launch request the runner was told to destroy.
 	requests []int64
+	// duringDestroy runs inside each destroy, before the lease is released.
+	duringDestroy func()
 }
 
 // newOfflineFixture registers one idle pool member the way a launch journals it:
@@ -160,6 +162,10 @@ func newOfflineFixtureWith(t *testing.T, reg *inspectingRegistry, n int, poolID 
 		onDestroy: func(request int64) error {
 			f.destroyed++
 			f.requests = append(f.requests, request)
+
+			if f.duringDestroy != nil {
+				f.duringDestroy()
+			}
 
 			return nil
 		},
@@ -554,5 +560,132 @@ func TestAMemberJournaledWithItsIDIsWithdrawnByThatID(t *testing.T) {
 	if !slices.Equal(reg.withdrawn, []int64{10899}) || f.destroyed != 1 {
 		t.Fatalf("withdrawn %v, destroyed %d; want 10899 withdrawn and its compute destroyed",
 			reg.withdrawn, f.destroyed)
+	}
+}
+
+// RETIRING THE RUNNER THAT COVERED AN ASSIGNED JOB LEAVES THE JOB COUNTED AS
+// WAITING, AND NEVER AS NONE ON THE WAY (#140). One job is assigned and one
+// idle member covers it, so the published count is none; GitHub then reports
+// the member offline and it is retired. Its lease is released before the next
+// publication, so a drain reading a quiet ledger beside that none would call
+// the deployment drained while the job has no runner. The count is said to be
+// unknown before the release and one afterwards.
+func TestRetiringTheRunnerThatCoveredAJobCountsItAsWaiting(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixture(t, reg)
+	f.l.observedAt = offlineEpoch
+
+	report := func() alloc.ListenerCapacity {
+		t.Helper()
+
+		r, err := f.a.CapacityReport(t.Context(), "billet-4vcpu-a")
+		if err != nil {
+			t.Fatalf("CapacityReport: %v", err)
+		}
+
+		return r.Listener
+	}
+
+	f.reconcileAt(t, 0)
+	f.l.reportCapacity(t.Context(), nil, "")
+
+	if before := report(); before.Unstarted == nil || *before.Unstarted != 0 {
+		t.Fatalf("the covered job was published as %v waiting, want none, before anything was retired",
+			before.Unstarted)
+	}
+
+	// THE JOURNAL'S RETRY INCLUDED: the first attempt's removal of the
+	// registration fails after the claim, so the lease still counts and the next
+	// reconciliation publishes the job as covered again; the retry that releases
+	// it goes through the journal, not the offline watch.
+	reg.err = errors.New("GitHub did not answer")
+
+	var during []*int
+
+	f.duringDestroy = func() {
+		during = append(during, report().Unstarted)
+	}
+
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{10899}) || len(reg.names) != 1 || len(during) != 0 ||
+		f.status(t) != alloc.PoolRunnerRetiring {
+		t.Fatalf("the first retirement did not stop at its removal (withdrawn %v, removals %d, destroys %d, "+
+			"status %s), so this case shows nothing", reg.withdrawn, len(reg.names), len(during), f.status(t))
+	}
+
+	f.l.reportCapacity(t.Context(), nil, "")
+
+	if between := report(); between.Unstarted == nil || *between.Unstarted != 0 {
+		t.Fatalf("between the attempts the job was published as %v waiting, want the none a held lease "+
+			"covers, or the retry has nothing to prove", between.Unstarted)
+	}
+
+	reg.err = nil
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace+time.Minute)
+
+	if len(during) != 1 || f.status(t) != "forgotten" {
+		t.Fatalf("the journal did not retry the retirement (destroys %d, status %s)", len(during), f.status(t))
+	}
+
+	if during[0] != nil {
+		t.Errorf("while the journal's retry destroyed the runner covering the job the published count "+
+			"was %d, want unknown", *during[0])
+	}
+
+	// AND COUNTED AGAIN AFTERWARDS against what the ledger holds now: the retry
+	// ran first in its reconciliation, which then bought the job a replacement
+	// where the room allowed.
+	f.l.reportCapacity(t.Context(), nil, "")
+
+	active, err := f.a.ActiveRunnerLeases(t.Context(), "billet-4vcpu-a")
+	if err != nil {
+		t.Fatalf("ActiveRunnerLeases: %v", err)
+	}
+
+	if after := report(); after.Unstarted == nil || *after.Unstarted != 1-active {
+		t.Errorf("after its runner was retired the job is published as %v waiting beside %d runner(s), "+
+			"want %d", after.Unstarted, active, 1-active)
+	}
+}
+
+// A RETIREMENT WHOSE "UNKNOWN" DID NOT REACH THE LEDGER RELEASES NOTHING: the
+// runner is not destroyed and the journal keeps the member retiring, so the
+// next reconciliation retries it, and a drain never reads the ledger quiet
+// beside the count of none that had the runner covering the job.
+func TestARetirementWhoseUnknownDidNotLandReleasesNothing(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixture(t, reg)
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+
+	// THE PUBLICATION'S OWN BOUND, which nothing else on this path uses.
+	grace := f.l.releaseGrace
+	f.l.releaseGrace = 0
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{10899}) {
+		t.Fatalf("GitHub was asked to withdraw %v, want the member's registration, or nothing was retired",
+			reg.withdrawn)
+	}
+
+	if f.destroyed != 0 || len(reg.names) != 0 || f.status(t) != alloc.PoolRunnerRetiring {
+		t.Fatalf("with the unknown unpublished the retirement went on: %d destroyed, %d removals, "+
+			"status %s; want none, none and still retiring", f.destroyed, len(reg.names), f.status(t))
+	}
+
+	f.l.releaseGrace = grace
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace+time.Minute)
+
+	if f.destroyed != 1 || f.status(t) != "forgotten" {
+		t.Errorf("once the publication landed the journal did not finish the retirement: %d destroyed, "+
+			"status %s", f.destroyed, f.status(t))
 	}
 }

@@ -58,19 +58,45 @@ func TestADeclaredTierUsesItsDeclaredRunnerGroup(t *testing.T) {
 	}
 }
 
-// A FLAG MUST NOT REDIRECT A DECLARED TIER. Deleting from a group the tier was
-// never in finds nothing, reports it, and leaves the real object in place —
-// which reads as "already gone".
-func TestARunnerGroupFlagCannotOverrideADeclaredTier(t *testing.T) {
-	_, _, err := teardownTargets(teardownTiers(), "billet-4vcpu", "somewhere-else", false)
-	if err == nil {
-		t.Fatal("a --runner-group contradicting the declared tier was accepted")
+// ANOTHER GROUP NAMES THE SET LEFT THERE, NEVER THE DECLARED ONE (#140). A
+// tier moved to a new runner group leaves a set of its name in the old one,
+// which a control plane refuses to start beside; that refusal names this
+// teardown. The flag addresses the old set as an undeclared one (by name,
+// behind the label check), and the declared tier's own set is not a target.
+func TestARunnerGroupFlagNamesASetLeftInAnotherGroup(t *testing.T) {
+	got, undeclared, err := teardownTargets(teardownTiers(), "billet-4vcpu", "retired", false)
+	if err != nil {
+		t.Fatalf("the teardown a refused start names was itself refused: %v", err)
 	}
 
-	for _, want := range []string{"billet-4vcpu", "trusted", "somewhere-else"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal does not name %q: %v", want, err)
+	if !undeclared {
+		t.Error("a set in a group no tier declares was not reported as undeclared, so the operator is " +
+			"not told the declared set is left alone")
+	}
+
+	if len(got) != 1 || got[0].Label != "billet-4vcpu" || got[0].RunnerGroup != "retired" {
+		t.Fatalf("the teardown targets %v, want only billet-4vcpu in the retired group", got)
+	}
+
+	// A CASE-ONLY DIFFERENCE IS THE DECLARED SET, which GitHub resolves to the
+	// same group and the same name; taken for another set it would be deleted
+	// after the notice said it was left alone.
+	for _, spelling := range [][2]string{{"billet-4vcpu", "Trusted"}, {"Billet-4vcpu", "trusted"}} {
+		got, undeclared, err := teardownTargets(teardownTiers(), spelling[0], spelling[1], false)
+		if err != nil {
+			t.Fatalf("--tier %s --runner-group %s: %v", spelling[0], spelling[1], err)
 		}
+
+		if undeclared || len(got) != 1 || got[0].RunnerGroup != "trusted" {
+			t.Errorf("--tier %s --runner-group %s took the declared set for another (undeclared=%v, %v)",
+				spelling[0], spelling[1], undeclared, got)
+		}
+	}
+
+	// --force skips the label check, and nothing else says this set is billet's.
+	if _, _, err := teardownTargets(teardownTiers(), "billet-4vcpu", "retired", true); err == nil ||
+		!strings.Contains(err.Error(), "--force") {
+		t.Errorf("--force on a set the config declares only in another group was accepted: %v", err)
 	}
 }
 

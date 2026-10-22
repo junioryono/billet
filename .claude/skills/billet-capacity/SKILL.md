@@ -42,6 +42,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Time warns; it does not authorise a teardown.**
 - **A listener's drain does not wait for an anonymous pool slot that never started a job (#220).**
 - **A drain is two barriers, and the second asks the machines.**
+- **A drain trusts a tier's count of assigned work only from an empty withdrawn poll after the seal and after the tier's last lease closed (#140).**
 - **An unsealed server stop is a handoff, not a drain (#365, #368).**
 - **A node hands over on a stop only when its config says so (#374).**
 - **A launch that has begun is finished, not cancelled, by a stop (#393).**
@@ -58,7 +59,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 **Adding a teardown path.** Only proof the compute is gone releases capacity; a timer never authorises a teardown, and `TestOnlyTheForceOperationDestroysRunningWork` holds who may destroy running work.
 
-**Changing a purchase.** Every purchase goes through `Allocator.Escrow`, whose headroom check and insert are one transaction, and asks the admission queue (`mayBuy`); `TestConcurrentReservationsNeverOvercommit` is the guard.
+**Changing a purchase.** Every purchase goes through `Allocator.Escrow`, whose headroom check and insert are one transaction, and asks the admission queue (`mayBuy`); `TestConcurrentReservationsNeverOvercommit` is the guard. The one purchase that is not an escrow is a remote fallback's growth: `Allocator.ResizeLeaving`, its own transaction, asked through `Server.ResizeAdmission` (#172).
 
 ## Where the tests are
 
