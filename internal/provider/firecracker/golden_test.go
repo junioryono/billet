@@ -38,9 +38,15 @@ func TestACaptureVisibleButNotDurableKeepsItsDisk(t *testing.T) {
 				}))
 			h.launch(t)
 
-			err := h.p.Capture(t.Context(), theInstance, "gold-1")
+			evidence, err := h.p.Capture(t.Context(), theInstance, "gold-1")
 			if !errors.Is(err, errPublishedNotDurable) || !errors.Is(err, failing) {
 				t.Fatalf("Capture = %v, want the sync's failure reported as not durable", err)
+			}
+
+			// A VISIBLE SNAPSHOT'S EVIDENCE COMES WITH THE ERROR, because a restore can
+			// already find it.
+			if want := h.capturedEvidence(); evidence != want {
+				t.Errorf("Capture answered the evidence %+v with the error, want %+v", evidence, want)
 			}
 
 			if _, err := os.Lstat(filepath.Join(h.p.snapshotsDir(), "gold-1")); err != nil {
@@ -71,9 +77,8 @@ func TestTheGoldenDiskPrefixMatchesTheStoreSpelling(t *testing.T) {
 type plainDisk struct{ RootDisk }
 
 // A CAPTURE THAT COULD NOT PUBLISH ITS SYSTEM DISK STOPS NO GUEST: a disk that keeps
-// no goldens, a snapshot name that cannot name one, and a jail launched before
-// billet recorded what it booted are each refused before the pause, with nothing
-// flushed or published.
+// no goldens and a jail launched before billet recorded what it booted are each
+// refused before the pause, with nothing flushed or published.
 func TestACaptureThatCannotPublishItsDiskLeavesTheGuestRunning(t *testing.T) {
 	t.Parallel()
 
@@ -87,11 +92,6 @@ func TestACaptureThatCannotPublishItsDiskLeavesTheGuestRunning(t *testing.T) {
 			name: "a disk that keeps no goldens", snapshot: "gold-1",
 			stage: func(_ *testing.T, h *harness) { h.p.disk = plainDisk{h.disk} },
 			want:  "cannot keep a golden's system disk",
-		},
-		{
-			name: "a snapshot name that cannot name a disk", snapshot: "gold@1",
-			stage: func(*testing.T, *harness) {},
-			want:  "cannot name a golden's system disk",
 		},
 		{
 			name: "a jail launched before billet recorded what it booted", snapshot: "gold-1",
@@ -113,7 +113,7 @@ func TestACaptureThatCannotPublishItsDiskLeavesTheGuestRunning(t *testing.T) {
 			_, vmm := h.launch(t)
 			tc.stage(t, h)
 
-			err := h.p.Capture(t.Context(), theInstance, tc.snapshot)
+			_, err := h.p.Capture(t.Context(), theInstance, tc.snapshot)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Capture = %v, want a refusal saying %q", err, tc.want)
 			}
@@ -142,7 +142,7 @@ func TestACaptureWhoseFlushFailsPublishesNoDisk(t *testing.T) {
 	h.launch(t)
 	h.flushErr = errors.New("input/output error")
 
-	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil ||
+	if _, err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil ||
 		!strings.Contains(err.Error(), "input/output error") {
 		t.Fatalf("Capture = %v, want the flush's failure", err)
 	}
@@ -177,12 +177,17 @@ func TestACaptureWhoseMemoryIsNotPublishedWithdrawsItsDisk(t *testing.T) {
 			h.launch(t)
 			h.disk.withdrawErr = tc.withdrawErr
 
-			err := h.p.Capture(t.Context(), theInstance, "gold-1")
+			evidence, err := h.p.Capture(t.Context(), theInstance, "gold-1")
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Capture = %v, want a failure saying %q", err, tc.want)
 			}
 
-			ref := "golden-gold-1@" + fakeGeneration
+			// NOTHING WAS PUBLISHED, so there is no evidence of it, withdrawn or not.
+			if evidence != (Evidence{}) {
+				t.Errorf("a capture whose snapshot was not published answered the evidence %+v", evidence)
+			}
+
+			ref := capturedDisk
 
 			published, withdrawn, _ := h.disk.goldenCalls()
 			if !slices.Equal(published, []string{theInstance + " -> " + ref}) ||
@@ -210,7 +215,7 @@ func TestARestoreClonesTheDiskItsSnapshotNames(t *testing.T) {
 	h.onJailer = func(id string) { h.serveVMM(t, id) }
 	h.mu.Unlock()
 
-	if _, err := h.p.Restore(t.Context(), spec, "gold-1"); err != nil {
+	if _, err := h.p.Restore(t.Context(), spec, "gold-1", h.theEvidence()); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 

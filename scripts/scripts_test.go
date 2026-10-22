@@ -251,6 +251,8 @@ func publishDir(t *testing.T, manifest string, assets ...string) string {
 		"manifest.json":          manifest,
 		"manifest.sigstore.json": "{}",
 		"release-notes.md":       "notes",
+		"image-sources.tsv": "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n" +
+			"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
@@ -303,7 +305,7 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 			wantSuccess: true,
 			wantUploads: []string{
-				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet",
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet", "image-sources.tsv",
 			},
 		},
 		{
@@ -328,6 +330,57 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			name: "no release notes stops the publish before the tag",
 			dir: without(t, publishDir(t, multipart,
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "release-notes.md"),
+			wantSuccess: false,
+		},
+		{
+			name: "no source manifest stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.tsv"),
+			wantSuccess: false,
+		},
+		{
+			name: "an empty source manifest stops the publish before the tag",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), ""),
+			wantSuccess: false,
+		},
+		{
+			name: "a source manifest naming no package stops the publish before the tag",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a source manifest of its header and a blank line stops the publish before the tag",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a source manifest with an incomplete row stops the publish before the tag",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
+					"bash\tamd64\t5.2.21-2ubuntu4\t\t\tarchive.ubuntu.com\tgnu\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a malformed row after a valid one stops the publish before the tag",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
+				"package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
+					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"+
+					"jq\tamd64\t1.7.1\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "a source manifest under another header stops the publish before the tag",
+			dir: withSources(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
+				"name\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
+					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"),
 			wantSuccess: false,
 		},
 		{
@@ -382,6 +435,10 @@ exit 0
 				if strings.Contains(readCalls(t, calls), "git push") {
 					t.Error("the tag was pushed for a publication that was then refused")
 				}
+				// AND NOT EVEN LOCALLY: every check precedes the tag.
+				if strings.Contains(readCalls(t, calls), "git tag") {
+					t.Error("the tag was made for a publication that was then refused")
+				}
 
 				return
 			}
@@ -412,6 +469,17 @@ func swapped(t *testing.T, dir, a, b string) string {
 		if err := os.Rename(filepath.Join(dir, move[0]), filepath.Join(dir, move[1])); err != nil {
 			t.Fatalf("swap %s and %s: %v", a, b, err)
 		}
+	}
+
+	return dir
+}
+
+// withSources rewrites a publication directory's image-sources.tsv with BODY.
+func withSources(t *testing.T, dir, body string) string {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, "image-sources.tsv"), []byte(body), 0o600); err != nil {
+		t.Fatalf("rewrite image-sources.tsv: %v", err)
 	}
 
 	return dir
