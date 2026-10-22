@@ -26,7 +26,7 @@ import (
 func Local(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New(
-			"usage: billet local <up|down|status|backup|restore|recover|uninstall|prepare>")
+			"usage: billet local <up|down|status|backup|restore|recover|uninstall|prepare|unit-paths>")
 	}
 
 	// THE PLATFORM CHECK STAYS ABOVE THE DISPATCH, so a subcommand added later
@@ -58,10 +58,12 @@ func Local(ctx context.Context, env cli.Env, args []string) error {
 		return cmdLocalUninstall(ctx, env, args[1:])
 	case "prepare":
 		return cmdLocalPrepare(ctx, env, args[1:])
+	case "unit-paths":
+		return cmdLocalUnitPaths(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("unknown local command %q; try up, down, status, backup, restore, "+
-		"recover, uninstall or prepare", args[0])
+		"recover, uninstall, prepare or unit-paths", args[0])
 }
 
 // addServiceConfigFlag is the same flag defaulted to the path the PACKAGED

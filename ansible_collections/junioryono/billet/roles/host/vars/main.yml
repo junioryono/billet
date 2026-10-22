@@ -108,6 +108,10 @@ billet_ordinary_config_path: /etc/billet/billet.yaml
 # before anything that requires the drain changes the host, removed only by a
 # converge that proved it (node-drain-owed.yml, account.yml, services.yml).
 billet_node_drain_owed_path: /etc/billet/node-drain-owed
+# Which release manifest produced the installed binary (internal/provenance's
+# Path on Linux), written by `billet release record` from record-provenance.yml
+# and journaled by the upgrade transaction with the other inputs it restores.
+billet_provenance_path: /var/lib/billet/installed.json
 billet_endpoint_temp_dir: /tmp
 billet_common_directories:
   - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }

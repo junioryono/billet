@@ -1,0 +1,297 @@
+// Package unitpath is how a command says which host paths it needs, so a
+// service manager's sandbox can be proved to permit them (#174).
+//
+// A UNIT'S SANDBOX IS JUDGED BY WHAT ITS COMMAND DOES, NEVER BY ITS TEXT.
+// billet-images-refresh.service failed twice on a real host past every test that
+// asserted its directives: once because it required a path under its own
+// PrivateTmp, so systemd refused to start it, and once because ProtectSystem=
+// strict left the lock it took under /run unwritable, after a five-gigabyte
+// download. So each command family declares the paths its command touches with
+// the same builders the command uses, `billet local unit-paths` reports them,
+// and the same command, as a unit's stub ExecStart, performs each access inside
+// the unit's real sandbox.
+//
+// A LEAF: the standard library and the one open of a file by pathname.
+package unitpath
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"syscall"
+
+	"github.com/junioryono/billet/internal/regularfile"
+)
+
+// Access is what a command does at a path.
+type Access string
+
+const (
+	// Read is a file the command opens for reading.
+	Read Access = "read"
+	// Write is a directory the command creates entries in.
+	Write Access = "write"
+	// Private is a directory in the unit's own private /tmp or /var/tmp
+	// (PrivateTmp=true): the command creates it and writes there, and nothing it
+	// writes may reach the host's.
+	Private Access = "private"
+	// Lock is a lock the command takes, which Take performs as the command does.
+	Lock Access = "lock"
+)
+
+// Need is one path a command needs, and how. A command's needs are exercised in
+// the order it declares them, which is the order it touches them.
+type Need struct {
+	Path   string `json:"path"`
+	Access Access `json:"access"`
+	// Why says what the command does there, in an operator's words.
+	Why string `json:"why"`
+	// Unknown says the path could not be derived on this host, and why: a lock
+	// named for a deployment identity the host has not minted yet. Path is then
+	// the directory the name would be in.
+	Unknown string `json:"unknown,omitempty"`
+	// Create says the command creates a Write directory when it is absent. A
+	// directory it does not create (a state directory systemd makes, or one an
+	// authority exclusion forbids recreating) must already be there, and an
+	// exercise never makes one.
+	Create bool `json:"create,omitempty"`
+	// Mode is the mode the command creates the directory with, 0755 unless it
+	// says otherwise.
+	Mode os.FileMode `json:"mode,omitempty"`
+	// Admits says the needs after this one are what the command does only once
+	// this one is held: an authority exclusion before the directory it guards.
+	// When it is refused, nothing after it is tried.
+	Admits bool `json:"admits,omitempty"`
+	// Take performs a Lock's acquisition the way the command does, and answers
+	// what it still holds. An authority exclusion the command holds across its
+	// work answers its release, called once every need after it has been
+	// exercised, so it is held across the exercise of that work. A lock taken and
+	// dropped is released inside Take, which answers NothingHeld, and so does a
+	// lock another process holds: the path was reached and the lock is real,
+	// which is what a sandbox is asked.
+	Take func(ctx context.Context) (release func() error, err error) `json:"-"`
+}
+
+// NothingHeld is the release a Take answers when it holds nothing once it
+// returns.
+func NothingHeld() error { return nil }
+
+// ErrUnknown is an exercise of a need whose path could not be derived.
+var ErrUnknown = errors.New("the path could not be derived on this host")
+
+// ErrNotAdmitted is a need not tried because a need it depends on was refused.
+var ErrNotAdmitted = errors.New("not tried: the exclusion before it was refused")
+
+// Unique is needs with every repeated path and access dropped, the first kept:
+// a directory two declarations name, however spelled (a certificate kept in a
+// state directory configured with a trailing slash), is one directory, written
+// once. ONLY A DIRECTORY'S SPELLING IS CLEANED, and only one with no `..`: there
+// cleaning drops nothing but separators and `.`, which name the same directory,
+// while `..` after a link is not the link's parent, and a file named with a
+// trailing slash is not the file (the command opens it as spelled, and fails).
+func Unique(needs []Need) []Need {
+	out := make([]Need, 0, len(needs))
+
+	for _, n := range needs {
+		if (n.Access == Write || n.Access == Private) && n.Path != "" && !hasDotDot(n.Path) {
+			n.Path = filepath.Clean(n.Path)
+		}
+
+		if !slices.ContainsFunc(out, func(o Need) bool { return o.Path == n.Path && o.Access == n.Access }) {
+			out = append(out, n)
+		}
+	}
+
+	return out
+}
+
+// hasDotDot reports whether a path has a `..` element.
+func hasDotDot(path string) bool {
+	return slices.Contains(strings.Split(path, string(filepath.Separator)), "..")
+}
+
+// ExerciseAll performs every need in order, reports each to report, releases
+// whatever was held in reverse order, and answers every refusal. A refused need
+// that Admits the rest leaves them untried.
+func ExerciseAll(ctx context.Context, needs []Need, marker string, report func(Need, error)) error {
+	var (
+		releases []func() error
+		refused  []error
+		blocked  bool
+	)
+
+	for _, n := range needs {
+		if blocked {
+			report(n, ErrNotAdmitted)
+			refused = append(refused, fmt.Errorf("%s: %w", n.Path, ErrNotAdmitted))
+
+			continue
+		}
+
+		release, err := Exercise(ctx, n, marker)
+		report(n, err)
+
+		if err != nil {
+			refused = append(refused, err)
+			blocked = n.Admits
+
+			continue
+		}
+
+		if release != nil {
+			releases = append(releases, release)
+		}
+	}
+
+	for i := len(releases) - 1; i >= 0; i-- {
+		if err := releases[i](); err != nil {
+			refused = append(refused, fmt.Errorf("release: %w", err))
+		}
+	}
+
+	return errors.Join(refused...)
+}
+
+// Exercise performs a need's access and answers what it holds. A writable
+// directory is given a file named marker, left there so a caller outside the
+// sandbox can see where the write landed; with no marker the file is created
+// and removed. A directory the command creates is created first; one it does
+// not must already exist. A lock the report could not name is still taken: its
+// Take resolves the name the way the command does, minting what the command
+// would mint, which is what a fresh host's first start does too.
+func Exercise(ctx context.Context, n Need, marker string) (func() error, error) {
+	if n.Unknown != "" && (n.Access != Lock || n.Take == nil) {
+		return nil, fmt.Errorf("%s: %w: %s", n.Path, ErrUnknown, n.Unknown)
+	}
+
+	switch n.Access {
+	case Read:
+		f, _, err := regularfile.Open(n.Path, regularfile.Options{})
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", n.Path, err)
+		}
+
+		return nil, f.Close()
+
+	case Write, Private:
+		// AN EMPTY NAME IS NO DIRECTORY: given the separator below, it would be
+		// written as the root.
+		if n.Path == "" {
+			return nil, fmt.Errorf("a writable directory with no name: %w: the configuration names none", ErrUnknown)
+		}
+
+		// A `..` AFTER A LINK NAMES ONE DIRECTORY TO THE KERNEL AND ANOTHER TO A
+		// JOIN, and a command reaches its directories both ways (an open of the
+		// path, a filepath.Join of a file in it), so which one it writes cannot
+		// be told from here: a refusal, never a yes.
+		if hasDotDot(n.Path) {
+			return nil, fmt.Errorf("%s: %w: a `..` in a directory's path can name two directories, "+
+				"and its command may write either; name it without one", n.Path, ErrUnknown)
+		}
+
+		if n.Access == Private || n.Create {
+			mode := n.Mode
+			if mode == 0 {
+				mode = 0o755
+			}
+
+			if err := os.MkdirAll(n.Path, mode); err != nil {
+				return nil, fmt.Errorf("create %s: %w", n.Path, err)
+			}
+		}
+
+		return nil, writeMarker(n.Path, marker)
+
+	case Lock:
+		if n.Take == nil {
+			return nil, fmt.Errorf("lock %s: the command declares no way to take it", n.Path)
+		}
+
+		release, err := n.Take(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("lock %s: %w", n.Path, err)
+		}
+
+		return release, nil
+
+	default:
+		return nil, fmt.Errorf("%s: unknown access %q", n.Path, n.Access)
+	}
+}
+
+// MarkerPrefix begins every marker's name, so a marker can never be the name of
+// a file a command keeps in the same directory (a ledger, a lock, an identity).
+const MarkerPrefix = "billet-unit-paths-"
+
+// ValidMarker reports whether name is one plain file name with MarkerPrefix.
+func ValidMarker(name string) bool {
+	return strings.HasPrefix(name, MarkerPrefix) && len(name) > len(MarkerPrefix) &&
+		name == filepath.Base(name) && !strings.ContainsAny(name, "/\x00")
+}
+
+// writeMarker creates a file in dir, synced, and removes it unless it was named.
+//
+// IT NEVER WRITES OVER ANYTHING: a named marker is created exclusively and not
+// through a link at its name, and an unnamed one has a name nobody else has, so
+// the exercise cannot truncate a file a command keeps where it writes.
+func writeMarker(dir, marker string) error {
+	name := marker
+
+	if name == "" {
+		var raw [8]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return fmt.Errorf("name a marker: %w", err)
+		}
+
+		name = "." + MarkerPrefix + hex.EncodeToString(raw[:])
+	} else if !ValidMarker(name) {
+		return fmt.Errorf("a marker is one plain file name beginning %s, not %q", MarkerPrefix, name)
+	}
+
+	// THE DIRECTORY, THROUGH A DESCRIPTOR, and the marker created in it and
+	// nowhere else, exclusively, never through a link at its name. The trailing
+	// separator makes the open itself refuse anything but a directory: a FIFO at
+	// the name would otherwise hold a plain open until something wrote to it,
+	// with whatever exclusion the exercise holds still held.
+	root, err := os.OpenRoot(strings.TrimRight(dir, string(filepath.Separator)) + string(filepath.Separator))
+	if err != nil {
+		return fmt.Errorf("write in %s: %w", dir, err)
+	}
+
+	defer func() { _ = root.Close() }()
+
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("write in %s: %w", dir, err)
+	}
+
+	path := dir + string(filepath.Separator) + name
+
+	if _, err := f.WriteString("written by billet local unit-paths --exercise\n"); err != nil {
+		_ = f.Close()
+
+		return fmt.Errorf("write in %s: %w", dir, err)
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+
+		return fmt.Errorf("flush %s: %w", path, err)
+	}
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+
+	if marker == "" {
+		return root.Remove(name)
+	}
+
+	return nil
+}

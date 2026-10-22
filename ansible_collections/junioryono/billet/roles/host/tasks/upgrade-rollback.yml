@@ -494,6 +494,11 @@
   when: not billet_upgrade_manifest.binary_existed | bool
   become: true
 
+# THE PROVENANCE RECORD COMES BACK WITH THE BINARY IT DESCRIBES (#91): see
+# restore-provenance.yml.
+- name: Restore the provenance record the transaction preserved
+  ansible.builtin.import_tasks: restore-provenance.yml
+
 - name: Durably flush every restored host filesystem before rollback commit
   ansible.builtin.command:
     argv:

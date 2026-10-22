@@ -59,6 +59,43 @@ def main():
             continue
         failures.append("%s: admitted as %r" % (name, got))
 
+    # THE PROVENANCE READER, which a backfill decides from: True only for the
+    # record billet writes for exactly these bytes, False (never an error) for
+    # everything else.
+    proves = mod.FilterModule().filters()["provenance_proves"]
+    sha = "a" * 64
+    record = '{\n  "version": "v0.10.1",\n  "manifest_digest": "%s",\n  "binary_sha256": "%s"\n}\n' % ("b" * 64, sha)
+    for name, (text, binary, want) in {
+        "the record of these bytes": (record, sha, True),
+        "a record of other bytes": (record, "c" * 64, False),
+        "no manifest digest": ('{"manifest_digest": "", "binary_sha256": "%s"}' % sha, sha, False),
+        "no binary hash": ('{"manifest_digest": "%s"}' % ("b" * 64), sha, False),
+        "a hash that is not text": ('{"manifest_digest": "x", "binary_sha256": 7}', sha, False),
+        "a repeated member": ('{"manifest_digest": "x", "binary_sha256": "%s", "binary_sha256": "%s"}' % ("c" * 64, sha), sha, False),
+        "not JSON": ("installed", sha, False),
+        "not an object": ('["%s"]' % sha, sha, False),
+        "an empty binary hash": ('{"manifest_digest": "x", "binary_sha256": ""}', "", False),
+        # What Go's typed decode refuses, so the node cannot use either.
+        "a version that is not text": ('{"version": 7, "manifest_digest": "x", "binary_sha256": "%s"}' % sha, sha, False),
+        "a digest that is not text": ('{"manifest_digest": 7, "binary_sha256": "%s"}' % sha, sha, False),
+        "a record over 64 KiB": ('{"manifest_digest": "x", "binary_sha256": "%s", "pad": "%s"}' % (sha, "x" * (64 << 10)), sha, False),
+        "deep nesting, which some decoders raise on": ('[' * 20000 + ']' * 20000, sha, False),
+        "a member Go decodes whatever its case": ('{"VERSION": 7, "manifest_digest": "x", "binary_sha256": "%s"}' % sha, sha, False),
+        "a member Go folds the long s into": ('{"ver\\u017fion": 7, "manifest_digest": "x", "binary_sha256": "%s"}' % sha, sha, False),
+        "a folded alias after the hash, which Go keeps": ('{"manifest_digest": "x", "binary_sha256": "%s", "binary_\\u017fha256": "%s"}' % (sha, "c" * 64), sha, False),
+        "a NaN, which is Python's and not JSON's": ('{"manifest_digest": "x", "binary_sha256": "%s", "note": NaN}' % sha, sha, False),
+        "not UTF-8": (b'{"manifest_digest": "x", "binary_sha256": "\xff"}', sha, False),
+        "bytes": (record.encode("utf-8"), sha, True),
+        "an unknown member, which Go ignores": ('{"manifest_digest": "x", "binary_sha256": "%s", "note": 1}' % sha, sha, True),
+    }.items():
+        try:
+            got = proves(text, binary)
+        except Exception as exc:  # the reader must never raise
+            failures.append("provenance_proves: %s: raised %r" % (name, exc))
+            continue
+        if got is not want:
+            failures.append("provenance_proves: %s: %r, want %r" % (name, got, want))
+
     if failures:
         for line in failures:
             print("strict_json_check: " + line, file=sys.stderr)
