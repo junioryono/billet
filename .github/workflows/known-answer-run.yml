@@ -10,9 +10,11 @@ name: Known-answer run
 # dispatch input reaches a reusable workflow as a string, and the kit's number
 # input refuses it (measured 2026-10-09, "Unexpected value '60'").
 #
-# THE NETWORK LOAD IS ONE OF BILLET'S OWN RELEASE ASSETS, whose size GitHub
-# publishes exactly: the Cloudflare speed endpoint answered a guest with 403
-# (measured 2026-10-09).
+# THE NETWORK LOAD IS THE LINUX TARBALL scripts/kernel/linux.pin names, from
+# kernel.org, a file that never changes at a size kernel.org serves exactly
+# (135390644 bytes, read 2026-10-22). The Cloudflare speed endpoint answered a
+# guest with 403 (measured 2026-10-09), and a part of one of billet's own guest
+# releases went with the release when the releases from before #584 were removed.
 #
 # THE MEMORY LOAD IS 8 GiB, because a microVM's host-side peak is all the guest
 # RAM it touched, setup's page cache included: an idle job on this tier peaked
@@ -31,6 +33,6 @@ jobs:
       seconds: 60
       cpu_workers: 4
       memory_bytes: 8589934592
-      network_url: https://github.com/junioryono/billet/releases/download/guest-20261005-070030/rootfs.img.zst.part010
-      network_bytes: 169258759
+      network_url: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.155.tar.xz
+      network_bytes: 135390644
       disk_bytes: 2147483648
