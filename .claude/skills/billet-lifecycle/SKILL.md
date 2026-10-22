@@ -48,7 +48,7 @@ Measured facts for both service managers, dated: [references/measured-facts.md](
 
 ## Checklists
 
-**A systemd unit change.** Change `deploy/` and the Ansible role's templates together (`make unit-parity` compares them), keep `deploy/units_test.go` green, and run `make systemd-lifecycle`, the only test of the lifecycle against a real service manager and the real package (it skips without a working App credential).
+**A systemd unit change.** Change `deploy/` and the Ansible role's templates together (`scripts/gates/scenario.sh unit-parity` compares them), keep `deploy/units_test.go` green, and run `scripts/gates/dist.sh && scripts/test-systemd-lifecycle.sh`, the only test of the lifecycle against a real service manager and the real package (it skips without a working App credential).
 
 **A plist change.** Nothing else renders a plist, so `deploy/`'s is the only copy; keep `deploy/units_test.go` green and run `internal/lifeops/launchd/reallaunchd_test.go` on a Mac, where every launchd fact was measured.
 

@@ -265,7 +265,7 @@ func TestJavaHomeVarsNameEveryJDKAndADefault(t *testing.T) {
 // is the only one that can catch a vendored copy that was transcribed rather than
 // downloaded.
 //
-// NETWORK-GATED, NOT SKIPPED BY DEFAULT WHERE IT MATTERS. `make check` runs offline
+// NETWORK-GATED, NOT SKIPPED BY DEFAULT WHERE IT MATTERS. `scripts/gates/check.sh` runs offline
 // on plenty of machines, so a hard failure there would make an ordinary local gate
 // depend on egress. CI has egress, so this runs there — which is where a wrong pin
 // must be caught, because everything downstream trusts this file to be what GitHub

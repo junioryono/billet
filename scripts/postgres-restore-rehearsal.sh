@@ -1,6 +1,8 @@
 #!/bin/sh
 # The restore rehearsal for a deployment whose LEDGER IS SOMEWHERE ELSE, inside a
-# fresh Linux machine with a real PostgreSQL beside it.
+# fresh Linux machine with a real PostgreSQL beside it. Its one entry point is
+# scripts/test-postgres-restore-rehearsal.sh, which starts that machine with the
+# package scripts/gates/dist.sh built; this half is never run on its own.
 #
 # WHAT THIS PROVES THAT scripts/restore-rehearsal.sh CANNOT, and it is not the
 # same operation with a different database underneath. On this profile billet

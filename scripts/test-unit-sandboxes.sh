@@ -19,8 +19,8 @@
 # and Restart) is replaced, by a drop-in; every other line is the package's.
 #
 # It needs no GitHub App, because nothing it starts contacts anything, and so CI
-# runs it. It needs privileged docker and the package `make dist` builds, which
-# is why it is outside `make check`.
+# runs it. It needs privileged docker and the package scripts/gates/dist.sh
+# builds, which is why it is outside scripts/gates/check.sh.
 #
 # IT IS SHOWN TO FAIL EVERY RUN: after the shipped units pass, the same
 # container installs billet-images-refresh.service with #169's, #175's and

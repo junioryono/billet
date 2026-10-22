@@ -148,7 +148,7 @@ func TestStringIsAlwaysReadable(t *testing.T) {
 // and without it, deleting either branch survived every test, which looks
 // identical to the branch being unnecessary.
 //
-// Restored after an edit deleted it. `make tests-kept` is what noticed; the
+// Restored after an edit deleted it. `python3 scripts/check-tests-kept.py` is what noticed; the
 // mutation run that had proved these branches were covered would otherwise have
 // been the last time anything did.
 func TestTheFallbackChain(t *testing.T) {

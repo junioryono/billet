@@ -20,8 +20,10 @@ import (
 
 // compatibilityFormat is the version of the compatibility record. A record of any
 // other version is refused rather than read, because a field this binary does not
-// know about is a condition it cannot check.
-const compatibilityFormat = 1
+// know about is a condition it cannot check. Format 2 added the golden's system
+// disk and the generation it was cloned from; a format 1 record names no disk, so
+// nothing a restore could clone is known to be the one its memory was taken with.
+const compatibilityFormat = 2
 
 // compatibilityFile is the record beside a published snapshot's state and memory.
 const compatibilityFile = "compatibility.json"
@@ -61,6 +63,12 @@ type compatibility struct {
 	// Not part of the host's description, so mismatch leaves them to the restore.
 	VCPUs  int   `json:"vcpus"`
 	Memory int64 `json:"memory_bytes"`
+	// Image is the generation the captured guest's root disk was cloned from, which
+	// pairs a restore with the kernel that guest was verified against.
+	Image string `json:"image"`
+	// Disk is the golden's system disk, written golden@generation: the disk this
+	// memory was taken with, and the only one a restore may put under it.
+	Disk string `json:"disk"`
 }
 
 // mismatch names the first field two records disagree on, or "" when they agree.

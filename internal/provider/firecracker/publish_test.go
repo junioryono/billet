@@ -98,18 +98,40 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 
 	host, err := h.p.hostCompatibility(guest)
 	host.VCPUs, host.Memory = aSpec().VCPU, int64(aSpec().Memory)
+	host.Image, host.Disk = aSpec().Image, "golden-gold-1@"+fakeGeneration
 
 	if err != nil || record != host {
 		t.Errorf("the published record = %+v (%v), want this host's %+v", record, err, host)
 	}
 
-	// AND IT RESTORES, as another lease.
+	// THE SYSTEM DISK, FLUSHED AND PUBLISHED AS THE GOLDEN'S, from the device and
+	// the clone the launch recorded.
+	h.mu.Lock()
+	flushed := append([]string(nil), h.flushed...)
+	h.mu.Unlock()
+
+	if !slices.Equal(flushed, []string{h.disk.device}) {
+		t.Errorf("the capture flushed %v, want the root disk's device %s", flushed, h.disk.device)
+	}
+
+	if published, withdrawn, _ := h.disk.goldenCalls(); !slices.Equal(published,
+		[]string{theInstance + " -> golden-gold-1@" + fakeGeneration}) || len(withdrawn) != 0 {
+		t.Errorf("the disk was published %v and withdrawn %v, want the builder's clone published once",
+			published, withdrawn)
+	}
+
+	// AND IT RESTORES, as another lease, onto a clone of that disk.
 	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("Destroy the golden: %v", err)
 	}
 
 	if _, _, err := h.restoreWith(t, "gold-1"); err != nil {
 		t.Errorf("a published capture would not restore: %v", err)
+	}
+
+	if _, _, cloned := h.disk.goldenCalls(); len(cloned) != 1 ||
+		!strings.HasPrefix(cloned[0], "golden-gold-1@"+fakeGeneration+" -> ") {
+		t.Errorf("the restore cloned %v, want the golden's system disk", cloned)
 	}
 }
 

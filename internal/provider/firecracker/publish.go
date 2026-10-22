@@ -57,8 +57,24 @@ const copyChunk = 64 << 20
 // staging directory in the store and renamed into place in one step that refuses an
 // existing name, so a restore never finds half of a snapshot and a capture never
 // replaces one somebody may be running from.
+//
+// AND WITH ITS OWN SYSTEM DISK. A restored kernel's page cache describes the disk it
+// was captured with, so while the guest is paused the root disk is flushed and
+// published as the golden's (goldenDisk.PublishRoot), and the record names it. A
+// publication of the memory that fails withdraws the disk, so the builder's
+// teardown discards it as it would any clone.
 func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 	if err := checkSnapshotName(snapshot); err != nil {
+		return err
+	}
+
+	goldenName, err := goldenNameFor(snapshot)
+	if err != nil {
+		return err
+	}
+
+	goldens, err := p.goldens()
+	if err != nil {
 		return err
 	}
 
@@ -108,6 +124,11 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 		return err
 	}
 
+	if shape.Image == "" || shape.Device == "" {
+		return fmt.Errorf("firecracker: %s was launched before billet recorded what it booted, so its "+
+			"system disk cannot be published as a golden's", id)
+	}
+
 	guest, err := p.jailKernelDigest(j)
 	if err != nil {
 		return err
@@ -151,8 +172,42 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 		return err
 	}
 
-	return p.publishCapture(ctx, j, res, shape, store, snapshot, record)
+	// THE DISK, WHILE THE GUEST IS PAUSED: flushed, so the cluster holds every write
+	// the memory remembers, then published in place.
+	if err := p.flushRoot(shape.Device); err != nil {
+		return err
+	}
+
+	disk, err := goldens.PublishRoot(ctx, id, goldenName)
+	if err != nil {
+		return err
+	}
+
+	record.Image, record.Disk = shape.Image, disk
+
+	if err := p.publishCapture(ctx, j, res, shape, store, snapshot, record); err != nil {
+		// A SNAPSHOT ALREADY VISIBLE KEEPS ITS DISK: a restore of it clones that disk,
+		// so only a publication that never reached its name is withdrawn.
+		if errors.Is(err, errPublishedNotDurable) {
+			return err
+		}
+
+		// ON A CONTEXT OF ITS OWN: the usual reason the publication failed is that
+		// the caller's context ended.
+		if withdrawErr := goldens.WithdrawRoot(context.WithoutCancel(ctx), disk, id); withdrawErr != nil {
+			return errors.Join(err, fmt.Errorf("firecracker: and the golden's system disk %s stays "+
+				"published with no snapshot naming it: %w", disk, withdrawErr))
+		}
+
+		return err
+	}
+
+	return nil
 }
+
+// errPublishedNotDurable is a snapshot renamed into place whose directories could not
+// be synced after: it is visible and may be restored, and may not survive a crash.
+var errPublishedNotDurable = errors.New("the snapshot is published and not yet durable")
 
 // heldStore is the snapshot store, open and locked for one publish.
 type heldStore struct {
@@ -301,11 +356,11 @@ func (p *Provider) publishCapture(
 	// THE NAME AND THE STORE BOTH DURABLE before success is reported: the store may
 	// have been created by this call, and its own entry is in the directory above.
 	if err := p.syncDir(store); err != nil {
-		return fmt.Errorf("firecracker: sync the published snapshot %s: %w", name, err)
+		return fmt.Errorf("firecracker: %w: sync the published snapshot %s: %w", errPublishedNotDurable, name, err)
 	}
 
 	if err := p.syncDir(filepath.Dir(store)); err != nil {
-		return fmt.Errorf("firecracker: sync the snapshot store %s: %w", store, err)
+		return fmt.Errorf("firecracker: %w: sync the snapshot store %s: %w", errPublishedNotDurable, store, err)
 	}
 
 	// THE JAIL'S COPIES GO, because each is the guest's whole memory again. Not a

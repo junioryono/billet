@@ -32,7 +32,7 @@ builds:
     goos: [linux, darwin]
     goarch: [amd64, arm64]
     ignore:
-      # macOS on Intel is not a platform billet targets. `make cross` builds the
+      # macOS on Intel is not a platform billet targets. `scripts/gates/cross.sh` builds the
       # same three, and the two lists must agree or CI proves something the
       # release does not ship.
       - goos: darwin
@@ -243,7 +243,7 @@ signs:
   # A SNAPSHOT WRITES THE MANIFEST AND DOES NOT SIGN IT, and that split is forced
   # rather than chosen. Keyless signing needs an OIDC identity, which exists only
   # in the tagged release workflow — so a snapshot cannot produce a signature no
-  # matter what is installed, and `make dist` on a laptop or in the
+  # matter what is installed, and `scripts/gates/dist.sh` on a laptop or in the
   # package-lifecycle job would fail on `cosign: not found` for a signature that
   # could never have been valid. Generating the manifest still runs, because that
   # is the half a local build can check.
@@ -267,7 +267,7 @@ signs:
     # expected `dist/checksums.txt.sig`, which this command has never produced.
     # That surfaced only at PUBLISH time, as
     # `failed to upload checksums.txt.sig: no such file or directory`, which is why
-    # `make dist` could never catch it: it runs `--skip=publish`, so the phantom
+    # `scripts/gates/dist.sh` could never catch it: it runs `--skip=publish`, so the phantom
     # artifact is registered and never uploaded. The local gate and the real path
     # diverged exactly where the bug was.
     signature: release-manifest.sigstore.json

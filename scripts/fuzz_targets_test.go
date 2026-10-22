@@ -23,7 +23,7 @@ var fuzzEntry = regexp.MustCompile(`(?m)^\s+- \{ package: (\./\S+), fuzz: (Fuzz\
 // EVERY FUZZ TARGET IS SEARCHED NIGHTLY, AND NOTHING ELSE IS. The seeds of a
 // Fuzz function run with every `go test`, but the search past them runs only
 // for the targets .github/workflows/fuzz.yml lists, which is also the list
-// `make fuzz` reads, so a target added without a row there is one nobody ever
+// `scripts/gates/fuzz.sh` reads, so a target added without a row there is one nobody ever
 // fuzzes. Found by parsing every test file of this module the nightly
 // platform builds, by Go's own rule for what a fuzz target is, whatever the
 // testing package is imported as.

@@ -10,7 +10,7 @@
 # a green check over an untested tree, and running one too many costs only time.
 #
 # EACH RULE IS A SAFE SUPERSET OF WHAT A FAMILY READS, derived from the jobs'
-# steps, the Makefile targets they run and the Go closures of what they build,
+# steps, the scripts they run and the Go closures of what they build,
 # not from names. A family is skipped only when no changed path can reach it.
 # A path may select several families; a path no rule names selects all of them.
 # The jobs that always run (changes, test, release-config, docs) are not
@@ -67,7 +67,7 @@ is_documentation() {
 	case "$1" in
 	docs/*.go) return 1 ;;
 	docs/*.md | docs/*.rst | docs/*.css | docs/*.html | docs/*.txt | docs/*.png | docs/*.svg | docs/*.jpg) return 0 ;;
-	docs/conf.py | docs/Makefile) return 0 ;;
+	docs/conf.py) return 0 ;;
 	.claude/*.md | CLAUDE.md) return 0 ;;
 	# NAMED, NOT */CLAUDE.md: a CLAUDE.md is an input where something reads every
 	# file in its directory (the collection's build hashes each file it packs, and
@@ -112,7 +112,9 @@ classify() {
 
 	# Global: what drives the jobs themselves, and the module graph.
 	case "$p" in
-	.github/* | Makefile | sqlc.yaml | go.mod | go.sum | go.work | go.work.sum | \
+	# The gate scripts are what every family's steps run; .github/ holds the
+	# workflows and the pinned tool versions.
+	.github/* | scripts/gates/* | sqlc.yaml | go.mod | go.sum | go.work | go.work.sum | \
 		*/go.mod | */go.sum | */go.work | */go.work.sum | scripts/ci-scope.sh)
 		select_families "${families[@]}"
 		return 0
@@ -171,7 +173,7 @@ classify() {
 		select_families package_lifecycle
 		;;
 	# THE MANIFEST WRITER is the release's, and the host role's provenance gate
-	# writes its test release's manifest with it (make provenance-check).
+	# writes its test release's manifest with it (scripts/gates/scenario.sh provenance-check).
 	scripts/mkreleasemanifest/*)
 		known=0
 		select_families package_lifecycle host_lifecycle
@@ -184,6 +186,11 @@ classify() {
 	scripts/hybrid-root-check.sh)
 		known=0
 		select_families terraform
+		;;
+	# The runner-usage sampler runs in gate-binaries and every host-lifecycle group.
+	scripts/ci-usage.sh)
+		known=0
+		select_families host_lifecycle
 		;;
 	tools/lint/* | .golangci.yml)
 		known=0

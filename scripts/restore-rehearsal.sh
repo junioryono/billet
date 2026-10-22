@@ -1,5 +1,7 @@
 #!/bin/sh
-# The restore rehearsal, INSIDE a fresh Linux machine.
+# The restore rehearsal, INSIDE a fresh Linux machine. Its one entry point is
+# scripts/test-restore-rehearsal.sh, which starts that machine with the package
+# scripts/gates/dist.sh built; this half is never run on its own.
 #
 # WHAT THIS PROVES THAT THE GO TEST CANNOT. internal/e2e's rehearsal assembles a
 # control plane in process, so it says nothing about the three things that are

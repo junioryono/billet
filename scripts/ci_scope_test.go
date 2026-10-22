@@ -470,6 +470,7 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"terraform/modules/fleet-ec2/main.tf", families("terraform", "terraform_lint")},
 		{"terraform/modules/billet/main.tf", families("terraform", "terraform_lint", "terraform_consumer_floor")},
 		{"scripts/hybrid-root-check.sh", "terraform"},
+		{"scripts/ci-usage.sh", "host_lifecycle"},
 		// The linter's own module and configuration.
 		{"tools/lint/rawsql/rawsql.go", families("lint", "postgres")},
 		{".golangci.yml", "lint"},
@@ -486,7 +487,7 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"scripts/power-summary.sh", "none"},
 		{"scripts/verify-changed.sh", "none"},
 		// The release scripts: test runs them against fixtures and release-config
-		// runs the resolver through make module-sources; cut-release.yml is not CI.
+		// runs the resolver through scripts/check-module-sources.sh; cut-release.yml is not CI.
 		{"scripts/release-ref.sh", "none"},
 		{"scripts/release-contents.sh", "none"},
 		{"scripts/plan-release.sh", "none"},
@@ -496,7 +497,8 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{".claude/hooks/guard.py", "none"},
 		// What drives the jobs, and the module graph: everything.
 		{".github/workflows/ci.yml", "all"},
-		{"Makefile", "all"},
+		{"scripts/gates/lint.sh", "all"},
+		{"scripts/gates/env.sh", "all"},
 		{"go.sum", "all"},
 		{"tools/lint/go.mod", "all"},
 		{"sqlc.yaml", "all"},
@@ -513,8 +515,16 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 
 				mustWrite(t, dir, tc.path, "changed\n")
 			})
-			if got, stderr := runScope(t, dir, "pull_request"); got != tc.want {
+			got, stderr := runScope(t, dir, "pull_request")
+			if got != tc.want {
 				t.Fatalf("%s selected %q (%q), want %q", tc.path, got, stderr, tc.want)
+			}
+
+			// A row that selects everything does so by the rule it names, not by
+			// falling through to the path no rule names, which answers the same.
+			unnamed := tc.path == "scripts/some-new-gate.sh" || tc.path == "vendor.txt"
+			if strings.Contains(stderr, "no rule names") != unnamed {
+				t.Errorf("%s: no rule names it is %v, want %v (%q)", tc.path, !unnamed, unnamed, stderr)
 			}
 		})
 	}

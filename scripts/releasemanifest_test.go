@@ -90,7 +90,7 @@ func TestTheReleaseManifestIsPublishedWithTheRelease(t *testing.T) {
 	//
 	// Keyless signing needs an OIDC identity that exists only in the tagged release
 	// workflow, so a snapshot cannot produce a signature whatever is installed —
-	// and with the two commands unconditionally joined, `make dist` failed on
+	// and with the two commands unconditionally joined, `scripts/gates/dist.sh` failed on
 	// `cosign: not found` for a signature that could never have been valid. That
 	// took the package-lifecycle job with it, which builds real .deb and .rpm
 	// packages and never gets near a signature.
@@ -103,7 +103,7 @@ func TestTheReleaseManifestIsPublishedWithTheRelease(t *testing.T) {
 
 	switch {
 	case guard < 0:
-		t.Error("the manifest step signs unconditionally, so `make dist` and the " +
+		t.Error("the manifest step signs unconditionally, so `scripts/gates/dist.sh` and the " +
 			"package-lifecycle job fail on `cosign: not found` for a signature a " +
 			"snapshot could never have produced")
 	case cosign < guard:
@@ -135,7 +135,7 @@ func TestTheReleaseManifestIsPublishedWithTheRelease(t *testing.T) {
 	// THE FIELD WHOSE ABSENCE BROKE THE RELEASE BUTTON. goreleaser looks for a
 	// signature file after running the sign command and defaults the name to
 	// `${artifact}.sig` -- with `artifacts: checksum` that is `checksums.txt.sig`,
-	// which this command has never produced. It fails at PUBLISH, so `make dist`
+	// which this command has never produced. It fails at PUBLISH, so `scripts/gates/dist.sh`
 	// cannot see it: that runs `--skip=publish`, registers the phantom artifact and
 	// never uploads it. This assertion is the only thing standing where the local
 	// gate does not reach.
