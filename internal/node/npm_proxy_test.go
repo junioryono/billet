@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -926,6 +927,23 @@ func assertNpmQuiet(t *testing.T, npm *npmCache) {
 	for _, leftover := range leftovers {
 		t.Errorf("a temporary file was left in the store: %s", leftover.Name())
 	}
+	// EVERY READER CLOSED AND EVERY RETIRED BODY GONE. A warm answer closes its
+	// body after its last byte reached the client, so this is waited for, not
+	// read once.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		npm.store.mu.Lock()
+		pins, retired, owed := len(npm.store.pins), len(npm.store.retired), npm.store.retiredBytes
+		npm.store.mu.Unlock()
+		if pins == 0 && retired == 0 && owed == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after 5s: %d bodies still pinned, %d retired bodies (%d bytes) still on disk",
+				pins, retired, owed)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // A REPLACEMENT THE STORE COULD NOT KEEP STILL REPLACES: the superseded entry
@@ -988,17 +1006,23 @@ func TestAHeld503IsRelayedWholeAfterARetryWhoseBodyStalled(t *testing.T) {
 
 // AN ANSWER OF UNKNOWN LENGTH IS CHUNKED, and one cut short never ends with the
 // last chunk, so the client cannot take it for whole; and its headers arrive
-// before the node waits on its body, even when the node decodes it.
+// before the node waits on its body, even when the node decodes it: the
+// registry sends no body byte until the client has the headers.
 func TestACutAnswerOfUnknownLengthIsNeverTakenForWhole(t *testing.T) {
 	t.Parallel()
 
 	encoded := gzipped(t, strings.Repeat("g", 64<<10))
+	headersSeen := make(chan struct{})
 	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
 		w.Header().Set("Cache-Control", "public, max-age=300")
 		w.Header().Set("Content-Encoding", "gzip")
 		w.WriteHeader(http.StatusOK)
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
+		}
+		select {
+		case <-headersSeen:
+		case <-time.After(5 * time.Second):
 		}
 		serveBytes(t, w, encoded[:len(encoded)/2])
 		if flusher, ok := w.(http.Flusher); ok {
@@ -1024,9 +1048,19 @@ func TestACutAnswerOfUnknownLengthIsNeverTakenForWhole(t *testing.T) {
 	if _, err := conn.Write([]byte(npmRequestLine("/cut/-/cut-1.0.0.tgz"))); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	// HEADERS BEFORE ANY BODY BYTE: the registry holds its body for 5 s or until
+	// this read returns, so a node that waited on the body first fails here.
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
-		t.Fatalf("an encoded tarball cut short sent no headers: %v", err)
+		t.Fatalf("an encoded tarball sent no headers before its body: %v", err)
+	}
+	close(headersSeen)
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
 	}
 	_, err = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -1082,4 +1116,62 @@ func TestATarballInAnUnsupportedCodingIsRefused(t *testing.T) {
 		t.Fatalf("a tarball in br = %d %q, want 502 and none of its bytes", resp.StatusCode, body)
 	}
 	assertNpmQuiet(t, service.npmCache())
+}
+
+// A HEAD THAT MAKES THE NODE FETCH IS ANSWERED AT THE REGISTRY'S HEADERS, not
+// after its body: the registry holds the body until the client has its answer,
+// and the body is then read only to keep it.
+func TestAHeadIsAnsweredBeforeTheBodyItKeeps(t *testing.T) {
+	t.Parallel()
+
+	answered := make(chan struct{})
+	tarball := strings.Repeat("h", 4096)
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		w.Header().Set("Cache-Control", "public, max-age=0")
+		w.Header().Set("ETag", `"v`+strconv.Itoa(n)+`"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(tarball)))
+		w.WriteHeader(http.StatusOK)
+		if n > 1 {
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			select {
+			case <-answered:
+			case <-time.After(5 * time.Second):
+			}
+		}
+		serveText(t, w, tarball)
+	})
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/headed/-/headed-1.0.0.tgz"))
+	waitForNpmFills(t, service.npmCache())
+	ageNpmEntry(t, service.npmCache().store, " /headed/-/headed-1.0.0.tgz", 25*time.Hour)
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte("HEAD /headed/-/headed-1.0.0.tgz HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodHead})
+	close(answered)
+	if err != nil {
+		t.Fatalf("a HEAD that made the node fetch was not answered before the body: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != `"v2"` ||
+		resp.ContentLength != int64(len(tarball)) {
+		t.Fatalf("a HEAD that fetched = %d, ETag %q, length %d", resp.StatusCode, resp.Header.Get("ETag"),
+			resp.ContentLength)
+	}
+	assertNpmQuiet(t, service.npmCache())
+	stored, body, ok := service.npmCache().store.acquire(" /headed/-/headed-1.0.0.tgz", time.Now())
+	if !ok {
+		t.Fatal("the tarball a HEAD fetched was not kept")
+	}
+	_ = body.Close()
+	if stored.ETag != `"v2"` {
+		t.Fatalf("the kept tarball is %s, want the one the HEAD fetched", stored.ETag)
+	}
 }

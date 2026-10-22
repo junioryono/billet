@@ -643,38 +643,44 @@ func entryFor(request npmRequest, f npmFetch, size int64) npmEntry {
 // previous is the body of the generation it replaces, which an answer that may
 // not be shared removes: the registry no longer shares what it held.
 func (n *npmCache) answerDocument(x npmExchange, f npmFetch, previous string) {
+	// A 200 REPLACES WHAT THE STORE HELD, kept or not, and on every way out: the
+	// generation it superseded never answers again, not even a silent registry.
+	keep := npmShareable(f.resp.Header) && f.keep
+	if !keep {
+		n.supersede(x, previous)
+	}
 	// OPENED BEFORE THE COMMIT, which consumes the file whether or not it
 	// succeeds: a store that refuses the document still answers the client.
 	document, err := os.Open(f.document)
 	if err != nil {
-		n.answerStatus(x, http.StatusBadGateway)
+		n.supersede(x, previous)
 		n.note(x.session, alloc.BuildCacheUnavailable)
+		n.answerStatus(x, http.StatusBadGateway)
 
 		return
 	}
 	defer document.Close()
-	// A 200 REPLACES WHAT THE STORE HELD, kept or not: the generation it
-	// superseded never answers again, not even a silent registry.
-	if !npmShareable(f.resp.Header) || !f.keep {
-		n.supersede(x, previous)
+	if !keep {
 		n.relayDocument(x, f, document)
 
 		return
 	}
-	entry := entryFor(x.request, f, f.size)
-	if err := n.store.commit(entry, f.document); err != nil {
+	// THE STORED BODY IS PINNED AS IT IS PUBLISHED, so an eviction the commit
+	// sets off can retire it but not delete it from under this answer.
+	stored, body, err := n.store.commitAndAcquire(entryFor(x.request, f, f.size), f.document)
+	if err != nil {
 		n.service.log.Warn("the npm store could not keep a document", "path", x.request.path, "error", err)
 		n.supersede(x, previous)
+		// THE FALLBACK'S BYTES ARE CHARGED while it is read: the file is gone
+		// from the store's directories, not from the disk.
+		if n.store.reserve(f.size) {
+			defer n.store.release(f.size)
+		}
 		n.relayDocument(x, f, document)
 
 		return
 	}
-	stored, body, ok := n.store.acquire(entry.Key, n.now())
-	if !ok {
-		n.relayDocument(x, f, document)
-
-		return
-	}
+	_ = document.Close()
 	defer body.Close()
 	n.answerEntry(x, stored, body, "filled")
 }
@@ -863,6 +869,12 @@ func (n *npmCache) answerRevalidated(ctx context.Context, x npmExchange, entry n
 		case !answered:
 			n.note(x.session, alloc.BuildCacheUnavailable)
 			n.relay(x, again, "failed")
+		case again.resp.StatusCode == http.StatusNotModified:
+			// THE SAME RULE AS THE FIRST ASK: this one sent no validator.
+			n.service.log.Warn("the npm registry answered 304 to a request without a validator",
+				"path", x.request.path)
+			n.note(x.session, alloc.BuildCacheUnavailable)
+			n.answerStatus(x, http.StatusBadGateway)
 		case again.resp.StatusCode == http.StatusOK && x.request.object == npmTarball:
 			n.answerTarball(x, again, "", false)
 		case again.resp.StatusCode == http.StatusOK && again.document != "":

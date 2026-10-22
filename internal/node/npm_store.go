@@ -248,30 +248,53 @@ func (s *npmStore) unpin(name string) {
 		return
 	}
 	delete(s.pins, name)
-	size, retired := s.retired[name]
-	if retired {
-		delete(s.retired, name)
-		s.retiredBytes -= size
-	}
+	_, retired := s.retired[name]
 	s.mu.Unlock()
 	if retired {
-		_ = os.Remove(filepath.Join(s.bodiesDir(), name))
+		s.deleteRetired(name)
 	}
 }
 
 // retire deletes a body no index entry names any more, or, while a reader
-// still holds it, leaves it to that reader's close.
+// still holds it, leaves it to that reader's close. Either way its bytes stay
+// counted until the file is gone.
 func (s *npmStore) retire(name string, size int64) {
+	s.owe(name, size)
 	s.mu.Lock()
-	if s.pins[name] > 0 {
-		s.retired[name] = size
-		s.retiredBytes += size
-		s.mu.Unlock()
+	pinned := s.pins[name] > 0
+	s.mu.Unlock()
+	if !pinned {
+		s.deleteRetired(name)
+	}
+}
 
+// owe counts a body that is on disk and that no index entry accounts for: one a
+// reader holds, or one a disk error kept. Its bytes are charged to the fill
+// budget until the file is deleted, so a disk that keeps refusing stops the
+// store keeping rather than letting kept bodies grow without bound.
+func (s *npmStore) owe(name string, size int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, owed := s.retired[name]; owed {
 		return
 	}
+	s.retired[name] = size
+	s.retiredBytes += size
+}
+
+// deleteRetired deletes an owed body and stops counting it, only once it is
+// gone. One the disk will not delete stays owed.
+func (s *npmStore) deleteRetired(name string) {
+	err := os.Remove(filepath.Join(s.bodiesDir(), name))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	s.mu.Lock()
+	if size, owed := s.retired[name]; owed && s.pins[name] == 0 {
+		delete(s.retired, name)
+		s.retiredBytes -= size
+	}
 	s.mu.Unlock()
-	_ = os.Remove(filepath.Join(s.bodiesDir(), name))
 }
 
 func entryName(key string) string {
@@ -429,7 +452,7 @@ func (s *npmStore) temp() (*os.File, error) {
 // replacing what the key held. The temporary file is consumed whether or not
 // commit succeeds.
 func (s *npmStore) commit(entry npmEntry, temp string) error {
-	if err := s.publishEntry(entry, temp); err != nil {
+	if _, err := s.publishEntry(entry, temp, false); err != nil {
 		return err
 	}
 	// AFTER THE PUBLICATION'S LOCK IS RELEASED: eviction removes, and a removal
@@ -439,12 +462,32 @@ func (s *npmStore) commit(entry npmEntry, temp string) error {
 	return nil
 }
 
-func (s *npmStore) publishEntry(entry npmEntry, temp string) error {
+// commitAndAcquire commits entry and returns its body already pinned, so an
+// eviction the commit triggers can retire it but never delete it from under
+// the reader that is about to serve it.
+func (s *npmStore) commitAndAcquire(entry npmEntry, temp string) (npmEntry, *npmBody, error) {
+	stored, err := s.publishEntry(entry, temp, true)
+	if err != nil {
+		return npmEntry{}, nil, err
+	}
+	file, err := os.Open(filepath.Join(s.bodiesDir(), stored.Body))
+	if err != nil {
+		s.unpin(stored.Body)
+		s.evict()
+
+		return npmEntry{}, nil, err
+	}
+	s.evict()
+
+	return stored, &npmBody{File: file, store: s, name: stored.Body}, nil
+}
+
+func (s *npmStore) publishEntry(entry npmEntry, temp string, pin bool) (npmEntry, error) {
 	var nonce [8]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		_ = os.Remove(temp)
 
-		return err
+		return npmEntry{}, err
 	}
 	entry.Body = entryName(entry.Key) + "-" + hex.EncodeToString(nonce[:])
 	body := filepath.Join(s.bodiesDir(), entry.Body)
@@ -456,13 +499,16 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string) error {
 		_ = os.Remove(temp)
 		_ = os.Remove(body)
 
-		return err
+		return npmEntry{}, err
 	}
 	if err := s.installEntry(entry); err != nil {
 		// THE BODY STAYS: a metadata install whose directory sync failed may still
 		// have put the metadata in place, and that metadata names this body. The
-		// next open keeps the pair or deletes a body nothing names.
-		return err
+		// next open keeps the pair or deletes a body nothing names; until then the
+		// body is owed, charged to the fill budget.
+		s.owe(entry.Body, entry.Size)
+
+		return npmEntry{}, err
 	}
 
 	s.mu.Lock()
@@ -471,6 +517,11 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string) error {
 	stored.lastServed = entry.Received
 	s.entries[entry.Key] = &stored
 	s.total += entry.Size
+	// PINNED IN THE SAME CRITICAL SECTION THAT PUBLISHES IT, before any eviction
+	// can choose it.
+	if pin {
+		s.pins[entry.Body]++
+	}
 	if previous != nil {
 		s.total -= previous.Size
 	}
@@ -479,7 +530,7 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string) error {
 		s.retire(previous.Body, previous.Size)
 	}
 
-	return nil
+	return entry, nil
 }
 
 func (s *npmStore) installBody(temp, body string) error {
@@ -564,9 +615,13 @@ func (s *npmStore) removeIf(key, body string) {
 	// nothing names.
 	if err := os.Remove(filepath.Join(s.entriesDir(), entryName(key)+".json")); err != nil &&
 		!errors.Is(err, os.ErrNotExist) {
+		s.owe(entry.Body, entry.Size)
+
 		return
 	}
 	if err := s.disk.SyncDirectory(s.entriesDir()); err != nil {
+		s.owe(entry.Body, entry.Size)
+
 		return
 	}
 	s.retire(entry.Body, entry.Size)

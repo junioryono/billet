@@ -314,6 +314,92 @@ func TestARetiredBodyIsDeletedOnlyWhenItsLastReaderCloses(t *testing.T) {
 	store.release(3)
 }
 
+// A BODY COMMITTED FOR AN ANSWER IS PINNED BEFORE ANY EVICTION CAN CHOOSE IT:
+// here the store's bound is smaller than the entry, so the commit's own
+// eviction retires it at once, and the answer still reads it whole.
+func TestACommittedAnswerIsReadableEvenWhenItsCommitEvictsIt(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 4)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	entry := npmEntry{Key: "full /big", Path: "/big", Object: npmPackageDocument, Variant: npmFull, Size: 9,
+		Received: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)}
+	stored, body, err := store.commitAndAcquire(entry, writeNpmTemp(t, store, "nine byte"))
+	if err != nil {
+		t.Fatalf("commitAndAcquire: %v", err)
+	}
+	if store.held(entry.Key) {
+		t.Fatal("an entry larger than the store's bound is still indexed")
+	}
+	// WHAT THE PIN BUYS IS THE ACCOUNTING, not the read: an open descriptor reads
+	// a deleted file too, but its blocks are then on disk and counted nowhere.
+	if _, err := os.Stat(filepath.Join(store.bodiesDir(), stored.Body)); err != nil {
+		t.Fatalf("the body an answer holds was deleted by its commit's eviction: %v", err)
+	}
+	store.mu.Lock()
+	owed := store.retiredBytes
+	store.mu.Unlock()
+	if owed != entry.Size {
+		t.Fatalf("the evicted body an answer holds is owed %d bytes, want %d", owed, entry.Size)
+	}
+	raw, err := io.ReadAll(body)
+	if err != nil || string(raw) != "nine byte" {
+		t.Fatalf("the answer read %q, %v from a body its commit evicted", raw, err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.bodiesDir(), stored.Body)); !os.IsNotExist(err) {
+		t.Fatalf("the evicted body survived its reader: %v", err)
+	}
+}
+
+// TWO READERS OF ONE RETIRED BODY: the first close leaves it, the last deletes
+// it, and a second close of the same reader changes nothing.
+func TestARetiredBodyOutlivesEveryReaderButTheLast(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	entry := npmEntry{Key: "full /two", Path: "/two", Object: npmPackageDocument, Variant: npmFull, Size: 3,
+		Received: now}
+	if err := store.commit(entry, writeNpmTemp(t, store, "two")); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	_, first, ok := store.acquire(entry.Key, now)
+	_, second, also := store.acquire(entry.Key, now)
+	if !ok || !also {
+		t.Fatal("the entry could not be read twice")
+	}
+	path := filepath.Join(store.bodiesDir(), first.name)
+	store.removeIf(entry.Key, first.name)
+	for range 2 {
+		if err := first.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("close the first reader: %v", err)
+		}
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the body went with its first reader, while a second still held it: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("close the second reader: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("the body outlived its last reader: %v", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.pins) != 0 || len(store.retired) != 0 || store.retiredBytes != 0 {
+		t.Fatalf("after the last reader: pins %v, retired %v, %d bytes owed", store.pins, store.retired,
+			store.retiredBytes)
+	}
+}
+
 // A METADATA INSTALL THAT FAILED AFTER ITS RENAME LEAVES THE PAIR: durablefile
 // may already have put the metadata in place, and that metadata names the body,
 // so the body stays and the next open finds a whole entry.
