@@ -58,18 +58,21 @@ The Actions cache and the npm cache are separate switches. A tier may have eithe
   - the full variant, for `application/json`, `*/*` or no `Accept` at all.
 
   Any other `Accept` is spliced. A tarball ignores `Accept`.
+- **The client accepts an unencoded answer.** The node serves every answer without an HTTP content coding (below), so a request whose `Accept-Encoding` refuses `identity` (`identity;q=0`, or `*;q=0` without `identity` named) is spliced.
+- **No `Range` header.** A partial answer is never served from the store.
 
 Everything else is spliced to the registry unchanged, for the whole connection: a publish, a login, an audit, a search, a dist-tag change, and every request the rules above do not admit. The node sees a spliced request in transit, as it sees the runner's own Actions token on the results host. It never stores it, never logs it, and forwards it unchanged.
 
 **What the store may hold is decided from the registry's answer alone.**
 
-- The node fills an entry with its own request, carrying none of the job's headers. A document is asked for with the variant's one canonical `Accept` (`application/vnd.npm.install-v1+json`, or `application/json`), so the variant is the only thing a job's request chooses. Each request also carries `Accept-Encoding: gzip`, and the node stores and serves the document decoded, so no encoding varies between jobs. A tarball is stored as its bytes.
+- The node fills and revalidates an entry with its own `GET`, carrying none of the job's headers, whatever method the client used. A document is asked for with the variant's one canonical `Accept` (`application/vnd.npm.install-v1+json`, or `application/json`), so the variant is the only thing a job's request chooses.
+- No answer the node serves carries an HTTP content coding. A document is asked for with `Accept-Encoding: gzip` and stored and served decoded. A tarball is asked for with `Accept-Encoding: identity` and stored as the registry's bytes, so its own gzip, which `integrity` covers, is what the client receives.
 - An answer is stored only when all of these hold:
   - its status is `200`;
   - it is complete: its declared length, or the end of its chunked body, was reached;
   - it sets no cookie;
-  - its `Cache-Control` names neither `private` nor `no-store`.
-- A `304` refreshes only an entry the store already holds with the `ETag` that was sent.
+  - its `Cache-Control` names none of `private`, `no-store` or `no-cache`.
+- A `304` refreshes only an entry the store already holds with the `ETag` that was sent. Its headers are merged into the entry's as RFC 9111 merges them, and the entry is held to the same conditions again: a `304` that sets a cookie or names `private`, `no-store` or `no-cache` removes the entry, and its answer is relayed. No cookie is ever stored or replayed.
 - A redirect is relayed to the client and never followed, so nothing in the store came from another origin.
 - Any other status is relayed and not stored.
 
@@ -82,22 +85,26 @@ Everything else is spliced to the registry unchanged, for the whole connection: 
 
 **An entry is served only while it is fresh, and freshness is counted from the registry's own clock.**
 
-- A document's freshness is its `max-age` less its current age, computed as RFC 9111 computes it from the answer's `Age` and `Date` and the time since the node received it. The node sends the client an `Age` that includes the time the entry spent in the store.
-- A tarball is fresh for 24 hours from when it was last fetched or revalidated: billet's own bound, far shorter than the registry's year, so that a version npm removes (a takedown, an unpublish within npm's policy window) stops being served within a day.
-- After that, an entry is revalidated with `If-None-Match`. A `304` makes it fresh again, a `200` replaces it, and a `401`, `403`, `404` or `410` removes it and is relayed. A definitive answer is never replaced by a stored one.
+- An entry's freshness lifetime is the answer's `s-maxage` if it has one (the store is a shared cache), else its `max-age`. Its current age is computed as RFC 9111 computes it, from the answer's `Age` and `Date` and the time since the node received it. The node sends the client an `Age` that includes the time the entry spent in the store.
+- A tarball's freshness lifetime is also capped at 24 hours from when it was last fetched or revalidated: billet's own ceiling, far shorter than the registry's year.
+- After that, an entry is revalidated with `If-None-Match`. A `304` makes it fresh again, under the merge above. A `200` replaces it. A `401`, `403`, `404` or `410` removes it and is relayed. A definitive answer is never replaced by a stored one.
+- What the ceiling bounds is how long billet goes on serving a tarball after npm's edge stops serving it, not after npm removes it. A revalidation reaches the registry's edge, which may answer from its own cache. So a version npm removes (a takedown, an unpublish within npm's policy window) stops being served at most a day after the edge answers it gone, or a day and an hour when the registry gives no answer during that hour (below).
 - An entry is evicted when the store passes its bound, least recently served first.
 
-**A stalled fetch is retried, and a stale entry is served only when the registry gave no answer at all.**
+**Every fetch from the registry, a fill or a revalidation, has one disposition, in order.**
 
-- One attempt at the registry has 8 seconds from the start of its connection to its response headers, counting DNS, the TCP connect and the TLS handshake. Once headers arrive, its body must keep moving: 10 seconds with no byte ends it. An attempt whose headers did not arrive in time is made once more on a new connection.
-- When both attempts gave no answer (no connection, no headers in time, or a `502`, `503` or `504`), an entry that expired less than one hour ago is served. Every such answer is recorded and logged. A stale answer is a policy choice, not a property of the registry. It can carry a version that was removed, or lack a deprecation that was added, within that hour. It is bounded to the hour because the failure it answers is a stall of seconds.
-- A body that stalls after headers arrived, or after bytes reached the client, fails that one request. It cannot be retried without sending the client the same bytes twice.
-- That budget is the node's alone. The guest's relay and the client's own connection to the node add to it, and whether a whole fetch fits inside the 30 seconds `pnpm/setup` waits is measured on a real guest before the cache is offered (below).
+1. **An attempt.** One attempt has 8 seconds from the start of its connection to its response headers, counting DNS, the TCP connect and the TLS handshake. Once headers arrive, its body must keep moving: 10 seconds with no byte ends it. A body that keeps moving is bounded only by the node's existing per-request limit for its caches, 12 minutes 45 seconds.
+2. **One retry, while nothing has reached the client.** An attempt that gave no answer (no connection, no headers in time, or a `502`, `503` or `504`) is made once more, on a new connection. An answer is held, not relayed, until the attempts are decided, so a retryable status is never sent to the client before the retry.
+3. **A stale entry, when both attempts gave no answer.** An entry that expired less than one hour ago is served, unless its answer carried `must-revalidate`, `proxy-revalidate` or `no-cache`. billet's own ceiling on a tarball is not the registry's expiry, so a tarball still fresh by the registry's own lifetime may be served this way. Every stale answer is recorded and logged. It is a policy choice, not a property of the registry: it can carry a version that was removed, or lack a deprecation that was added, within that hour. It is bounded to the hour because the failure it answers is a stall of seconds.
+4. **Otherwise the failure.** The registry's last `502`, `503` or `504` is relayed, or, when it gave no answer at all, the node answers `504`. The connection is then closed.
+5. **A body that stalls after bytes reached the client** fails that one request. It cannot be retried without sending the client the same bytes twice.
 
-**The remap reaches only clients the CA reaches.** A client that does not trust the node's authority fails its TLS handshake before the node sees a request, so it cannot be spliced: that is an error, not a miss. So `registry.npmjs.org` is remapped in the guest's `/etc/hosts` only, never by the resolver containers use. Then:
+That budget is the node's alone. The guest's relay and the client's own connection to the node add to it, and whether a whole fetch fits inside the 30 seconds `pnpm/setup` waits is measured on a real guest before the cache is offered (below).
+
+**The remap reaches only clients the CA reaches.** A client that does not trust the node's authority fails its TLS handshake before the node sees a request, so it cannot be spliced: that is an error, not a miss. So `registry.npmjs.org` is remapped in the guest's `/etc/hosts` only, never by the resolver containers use. That resolver is the guest's dnsmasq, which reads `/etc/hosts` unless told not to, so it runs with `--no-hosts` and keeps the Actions remap as its one explicit `--address`. Then:
 
 - the runner and its steps on the guest reach the node, and trust it through `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` and the guest's system store, as they do for the results host;
-- a job container, a service container, a `docker run` container and a Dockerfile `RUN` stage resolve through the container resolver, are not remapped, and reach the registry directly, as they did before this cache.
+- a job container, a service container, a `docker run` container and a Dockerfile `RUN` stage resolve through the container resolver, are not remapped, and reach the registry directly, as they did before this cache. Job and action containers do receive the CA through the job-started hook, but a `docker run` container or a build stage does not, and one resolver serves them all.
 
 A step that runs `sudo` loses the runner's environment unless the guest's `sudo` keeps it. A container on the host's network sees the guest's `/etc/hosts` without the guest's trust. Both are measured on a real guest before the cache is offered, and the image keeps what they need or the ADR is revisited.
 
@@ -109,7 +116,7 @@ A step that runs `sudo` loses the runner's environment unless the guest's `sudo`
 
 ## What is not decided here
 
-- **The guest under a real install.** The Actions interception's guest relay replaced an `HTTPS_PROXY` because bulk transfers through a catch-all relay stalled (2026-10-04). An `npm ci` of a large lockfile is thousands of requests and hundreds of megabytes through the same relay. The implementation measures one on a real guest, together with `pnpm/setup` against the 30-second budget, `sudo`, and a host-network container, before the cache is offered. If the relay is the limit, the relay changes, not the rule.
+- **The guest under a real install.** The Actions interception's guest relay replaced an `HTTPS_PROXY` because bulk transfers through a catch-all relay stalled (2026-10-04). An `npm ci` of a large lockfile is thousands of requests and hundreds of megabytes through the same relay. The implementation measures one on a real guest, together with `pnpm/setup` against the 30-second budget, `sudo`, a host-network container, and a container resolving the guest's own host name once the resolver stops reading `/etc/hosts`, before the cache is offered. If the relay is the limit, the relay changes, not the rule.
 - **Other registries.** PyPI, the Go module proxy and Ubuntu's archive fit the same shape, a public anonymous read with long-lived artifacts, and each would be its own host under this rule.
 - **A store shared by a site's nodes,** in Ceph as the other caches are.
 
@@ -122,3 +129,4 @@ A step that runs `sudo` loses the runner's environment unless the guest's `sudo`
 - **Remapping the host for containers too.** Neither a Dockerfile `RUN` stage nor an arbitrary container trusts the node's authority, so each would fail its TLS handshake instead of reaching the registry.
 - **Caching an authenticated request by its path.** billet cannot tell from an answer whether a package was private, so a private package's document or tarball could be served to another job.
 - **Keeping a tarball for the registry's year.** A version npm removes would go on being served from the store long after the registry stopped serving it.
+- **Relaying a `503` at once.** A retryable answer sent to the client could no longer be replaced by the retry or a stale entry, which is what the retry is for.
