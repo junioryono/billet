@@ -247,7 +247,7 @@ Notices for the billet guest image
 
 This image is based on Ubuntu 24.04. billet builds it by running GitHub's actions/runner-images template on that base; neither Canonical nor GitHub publishes it.
 
-Every package installed with apt carries its copyright and license in /usr/share/doc/<package>/copyright. billet's own third-party notices are in /opt/billet/THIRD_PARTY_NOTICES, and the container hook's in /usr/local/lib/billet/container-hook/.
+Every package installed with apt carries its copyright and license in /usr/share/doc/<package>/copyright, and /opt/billet/IMAGE_SOURCES.tsv lists each one with its source package and version, where apt could fetch that version when the image was built, and whether its copyright names a GNU license. billet's own third-party notices are in /opt/billet/THIRD_PARTY_NOTICES, and the container hook's in /usr/local/lib/billet/container-hook/.
 
 These tools are installed outside apt, under licenses that ask for their text with every copy:
 
@@ -887,12 +887,22 @@ run_runner_images_build() {
 	# has that CI jobs here installed every run. apt skips any GitHub already put in.
 	# IN THE BOOTED MACHINE, where the network is: a chroot has no resolver once
 	# the image's own is back.
+	#
+	# THE SOURCE MANIFEST IS WRITTEN HERE, after the last package lands and while apt
+	# still has the lists of every source the template left configured, which is
+	# the only point where apt can say where each installed version came from
+	# (#584): /opt/billet/IMAGE_SOURCES.tsv names every package, its source package
+	# and version, where apt can fetch it, and whether it is under a GNU license.
+	install -m 0644 "$SCRIPT_DIR/runner-images/source-manifest.py" "$rootfs/var/tmp/billet-source-manifest.py"
 	BILLET_RI_ROOTFS="$rootfs" "$driver" exec /bin/bash -euxc '
 		apt-get update -qq
 		apt-get install -y --no-install-recommends "$@"
+		install -d -m 0755 /opt/billet
+		python3 /var/tmp/billet-source-manifest.py /opt/billet/IMAGE_SOURCES.tsv
 		apt-get clean
 		rm -rf /var/lib/apt/lists/*' bash \
 		dnsmasq-base systemd-resolved netplan.io libicu74 e2fsprogs apparmor python3-apt
+	rm -f "$rootfs/var/tmp/billet-source-manifest.py"
 
 	stop_runner_images
 
@@ -2429,6 +2439,9 @@ NET
 	# mountpoint, and this is the one that had not moved with it.
 	local contract
 	contract=$(read_guest_contract "$rootfs")
+
+	# THE SOURCE MANIFEST, beside the image for its release to carry (#584).
+	install -m 0644 "$rootfs/opt/billet/IMAGE_SOURCES.tsv" "$WORK/image-sources.tsv"
 
 	unmount_rootfs
 

@@ -489,7 +489,7 @@ func (p *Provider) bridgeFor(trust provider.TrustClass) string {
 // this repository was bitten by, where every signal reported success and no runner
 // ever started.
 func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, error) {
-	return p.start(ctx, spec, "")
+	return p.start(ctx, spec, "", Evidence{})
 }
 
 // Restore starts one microVM from a snapshot this node has published, rather than
@@ -501,7 +501,13 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 // failure is the same set of things a launch does, and one path is what keeps them
 // accounted for. Only the last step differs: the snapshot is linked into the jail
 // and loaded through restore, in place of configuring and booting a kernel.
-func (p *Provider) Restore(ctx context.Context, spec provider.Spec, snapshot string) (*Instance, error) {
+//
+// ONLY THE GOLDEN want NAMES: the evidence its capture answered, which the caller
+// kept. A snapshot that is not that golden, and a restore given no evidence, are
+// refused before anything is claimed (see Evidence).
+func (p *Provider) Restore(
+	ctx context.Context, spec provider.Spec, snapshot string, want Evidence,
+) (*Instance, error) {
 	if snapshot == "" {
 		return nil, fmt.Errorf("firecracker: %w: a restore of %s names no snapshot",
 			errSnapshotNotPublished, spec.Name)
@@ -515,12 +521,14 @@ func (p *Provider) Restore(ctx context.Context, spec provider.Spec, snapshot str
 			"size the snapshot was taken at", spec.Name, spec.Disk)
 	}
 
-	return p.start(ctx, spec, snapshot)
+	return p.start(ctx, spec, snapshot, want)
 }
 
 // start is Launch and Restore: a cold boot when snapshot is empty, a restore of
-// that published snapshot otherwise.
-func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot string) (*Instance, error) {
+// that published snapshot, which must be the golden want names, otherwise.
+func (p *Provider) start(
+	ctx context.Context, spec provider.Spec, snapshot string, want Evidence,
+) (*Instance, error) {
 	if err := checkSpec(spec); err != nil {
 		return nil, err
 	}
@@ -545,7 +553,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 			return nil, err
 		}
 
-		if golden, err = p.goldenOf(snapshot, spec); err != nil {
+		if golden, err = p.goldenOf(snapshot, spec, want); err != nil {
 			return nil, err
 		}
 
@@ -676,7 +684,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 	// something started" and asks Find — so this is not the safety net, it is the
 	// ordinary case being tidy. What it must never do is replace the reason the
 	// launch failed with the reason a cleanup failed.
-	inst, err := p.launch(ctx, j, spec, device, kernel, res, snapshot)
+	inst, err := p.launch(ctx, j, spec, device, kernel, res, snapshot, want)
 	if err != nil {
 		return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
 	}
@@ -693,6 +701,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 // launch does the work Launch unwinds on failure.
 func (p *Provider) launch(
 	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources, snapshot string,
+	want Evidence,
 ) (*Instance, error) {
 	if err := p.build(j, device, kernel, res, spec.Volumes, spec.CacheEndpoint != ""); err != nil {
 		return nil, err
@@ -707,7 +716,7 @@ func (p *Provider) launch(
 	// AFTER build, WHICH CHOWNS THE CHROOT, for the reason the kernel is placed
 	// after it: a link is the published file itself, and must never be chowned.
 	if snapshot != "" {
-		if err := p.placeSnapshot(j, snapshot, kernel, spec); err != nil {
+		if err := p.placeSnapshot(j, snapshot, kernel, spec, want); err != nil {
 			return nil, err
 		}
 	}
