@@ -329,9 +329,7 @@ type fileIdentity struct {
 // modification time after writing would need that account. A file the jailed
 // account wrote is judged by its whole identity (copyOut).
 func (a fileIdentity) sameBytes(b fileIdentity) bool {
-	a.ctimeNsec, b.ctimeNsec = 0, 0
-
-	return a == b
+	return a.path == b.path && a.dev == b.dev && a.ino == b.ino && a.size == b.size && a.mtimeNsec == b.mtimeNsec
 }
 
 // of is the digest of the regular file at path, read through one descriptor.
