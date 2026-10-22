@@ -264,6 +264,7 @@ func publishDir(t *testing.T, manifest string, assets ...string) string {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
+	writeSourceArchive(t, dir, publishIndex, 0)
 
 	return dir
 }
@@ -290,7 +291,7 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
       {"name": "rootfs.img.zst.part001", "sha256": "DIGEST:rootfs.img.zst.part001", "size": 1}
     ]
   },
-  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1, "version": "6.1.155"}
 }`
 
 	for _, tc := range []struct {
@@ -306,6 +307,7 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			wantSuccess: true,
 			wantUploads: []string{
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet", "image-sources.tsv",
+				"image-sources-index.tsv", "image-sources.parts", "image-sources.tar",
 			},
 		},
 		{
@@ -381,6 +383,18 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 				"name\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n"+
 					"bash\tamd64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tarchive.ubuntu.com\tgnu\n"),
+			wantSuccess: false,
+		},
+		{
+			name: "no list of the source's parts stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources.parts"),
+			wantSuccess: false,
+		},
+		{
+			name: "no index of the source stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "image-sources-index.tsv"),
 			wantSuccess: false,
 		},
 		{
@@ -474,15 +488,22 @@ func swapped(t *testing.T, dir, a, b string) string {
 	return dir
 }
 
+// rewritten rewrites one file of a publication directory with BODY.
+func rewritten(t *testing.T, dir, name, body string) string {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+		t.Fatalf("rewrite %s: %v", name, err)
+	}
+
+	return dir
+}
+
 // withSources rewrites a publication directory's image-sources.tsv with BODY.
 func withSources(t *testing.T, dir, body string) string {
 	t.Helper()
 
-	if err := os.WriteFile(filepath.Join(dir, "image-sources.tsv"), []byte(body), 0o600); err != nil {
-		t.Fatalf("rewrite image-sources.tsv: %v", err)
-	}
-
-	return dir
+	return rewritten(t, dir, "image-sources.tsv", body)
 }
 
 // without removes one file from a publication directory.
@@ -548,7 +569,7 @@ exit 97
 			cmd := exec.CommandContext(t.Context(), publisher, publishDir(t, `{
   "schema": 1,
   "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST:rootfs.img.zst", "size": 1},
-  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1, "version": "6.1.155"}
 }`, "rootfs.img.zst", "vmlinux-billet"))
 			cmd.Env = append(os.Environ(),
 				"PATH="+tools+":"+os.Getenv("PATH"),
@@ -2473,7 +2494,7 @@ func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
 	buildBody = buildBody[checkout:]
 
 	scripts := map[string]bool{}
-	for _, m := range regexp.MustCompile(`scripts/[a-z0-9/-]+\.(?:sh|txt|config)`).FindAllString(buildBody, -1) {
+	for _, m := range regexp.MustCompile(`scripts/[a-z0-9/-]+\.(?:sh|txt|config|py|pin)`).FindAllString(buildBody, -1) {
 		scripts[m] = true
 	}
 	env := map[string]bool{}
@@ -2495,6 +2516,8 @@ func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
 		"scripts/write-image-manifest.sh":      true,
 		"scripts/guest-kernel.config":          true,
 		"scripts/kernel/required-builtins.txt": true,
+		"scripts/kernel/linux.pin":             true,
+		"scripts/fetch-image-sources.py":       true,
 		"IMAGE_NAME":                           true,
 		"WORK":                                 true,
 		"PUBLISH":                              true,

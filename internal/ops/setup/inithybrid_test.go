@@ -1,6 +1,8 @@
 package setup
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,11 +13,37 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// testGeneration is the fingerprint hybridArgs carries and the outputs
+// fixtures declare.
+const testGeneration = "0123-4567-89ab-cdef"
+
+// hybridTestAccount is the account the outputs fixtures were minted in.
+const hybridTestAccount = "123456789012"
+
+// errNoAWSInTheSuite is the suite's answer to "which account is this": no test
+// reaches STS, so the account comparison is could-not-tell unless a test says
+// otherwise.
+var errNoAWSInTheSuite = errors.New("the test suite reaches no AWS")
+
+func init() {
+	hybridAccount = func(context.Context, string) (string, error) { return "", errNoAWSInTheSuite }
+}
+
+// answerAccount makes the account comparison see account (or err) for one test.
+func answerAccount(t *testing.T, account string, err error) {
+	t.Helper()
+
+	prev := hybridAccount
+	hybridAccount = func(context.Context, string) (string, error) { return account, err }
+	t.Cleanup(func() { hybridAccount = prev })
+}
+
 // hybridArgs is the flag set every hybrid test shares: DECLARED shapes, so no
-// test reaches AWS, and a --config path the test owns.
+// test reaches AWS, a --config path the test owns, and the generation the
+// outputs fixtures declare.
 func hybridArgs(out, cfg string) []string {
 	return []string{
-		"--out", out, "--config", cfg,
+		"--out", out, "--config", cfg, "--generation", testGeneration,
 		"--name", "acme-ci", "--region", "us-west-2", "--org", "acme",
 		"--control-plane-private-ip", "10.60.0.10",
 		"--local-vcpu", "32", "--local-memory", "128GiB",
@@ -35,7 +63,9 @@ const hybridOutputsJSON = `{
   "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
   "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
   "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
-  "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"},
+  "generation": {"sensitive": false, "type": "string", "value": "0123-4567-89ab-cdef"},
+  "account_id": {"sensitive": false, "type": "string", "value": "123456789012"}
 }`
 
 // hybridCacheOutputsJSON adds the three facts a --cache root declares and a
@@ -51,7 +81,9 @@ const hybridCacheOutputsJSON = `{
   "cache_prefix": {"sensitive": false, "type": "string", "value": "billet-cache"},
   "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"},
   "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
-  "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"},
+  "generation": {"sensitive": false, "type": "string", "value": "0123-4567-89ab-cdef"},
+  "account_id": {"sensitive": false, "type": "string", "value": "123456789012"}
 }`
 
 var hybridFileNames = []string{

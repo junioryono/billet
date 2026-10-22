@@ -564,6 +564,18 @@
         mode: "0755"
       register: billet_binary_install
 
+    # WHICH MANIFEST PRODUCED IT, BEFORE ANYTHING STARTS ON IT (#91): the node
+    # reads the record once, when it starts, and the readiness probes below are
+    # its first start. Go's transaction orders it the same way (installed, then
+    # recorded, then migrated), and the rescue restores the previous record
+    # with the other inputs.
+    - name: Record which release manifest produced the candidate billet binary
+      ansible.builtin.include_tasks: record-provenance.yml
+      vars:
+        billet_provenance_replaces: true
+        billet_provenance_archive: "{{ billet_candidate_evidence_archive | default('') }}"
+        billet_provenance_manifest: "{{ billet_candidate_evidence_manifest | default('') }}"
+
     - name: Install candidate configuration after preserving the stopped ledger
       ansible.builtin.copy:
         src: "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
@@ -864,6 +876,21 @@
     - not ansible_check_mode
   become: true
 
+# A HOST WHOSE BINARY DID NOT CHANGE IS RECORDED TOO (#91): every host the role
+# installed before it recorded provenance reports NAMED NO MANIFEST until its
+# first rollout, and a fleet held on a pinned version never has one. Only when
+# the evidence is on the target and the record there does not already prove the
+# installed bytes; nothing is restarted, so a running node names the manifest
+# from its next start.
+- name: Record which release manifest produced the unchanged billet binary
+  ansible.builtin.import_tasks: backfill-provenance.yml
+  when:
+    - not billet_retirement_node_ordinary | bool
+    - not ansible_check_mode
+    - not billet_binary_upgrade | default(false)
+    - billet_candidate_evidence_archive | default('') | length > 0
+    - billet_installed_binary.stat.exists | default(false)
+
 - name: Validate a retained node with its installed environment
   junioryono.billet.environment_files:
     specs: "{{ billet_node_environment_files }}"
@@ -938,7 +965,8 @@
 # Firecracker chroot base, a state directory or the guests' cache endpoint. The
 # node's next stop drains, whether the endpoint migration below or the ordinary
 # restart makes it, and the final release withdraws the request once the node is
-# where this converge leaves it.
+# where this converge leaves it. A change billet says no running node reads
+# (node-config-verdict.yml: tiers or nodes: alone) is not a node change (#183).
 - name: Make a node restart for a changed config a drain
   ansible.builtin.include_tasks: request-node-drain.yml
   when:
@@ -946,6 +974,7 @@
     - not ansible_check_mode
     - not billet_binary_upgrade | default(false)
     - billet_config_install.changed | default(false)
+    - billet_node_config_changed | default(true) | bool
 
 # THE LOCK DIRECTORY THE NODE UNIT REQUIRES, MADE AGAIN BEFORE ANY OF THE NODE
 # STARTS BELOW (#175): a stop earlier in this converge (guest networking's
@@ -988,7 +1017,7 @@
     - not billet_binary_upgrade | default(false)
     - not billet_endpoint_migrated | default(false) | bool
     - >-
-      billet_config_install.changed | default(false) or
+      (billet_config_install.changed | default(false) and billet_node_config_changed | default(true) | bool) or
       billet_firecracker_install.changed | default(false) or
       billet_firecracker_links.changed | default(false) or
       (billet_server_environment | default({}) | length > 0 and

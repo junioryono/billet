@@ -225,6 +225,16 @@ func (f *fakeConverger) Identity(lifeops.UpRequest) (int, int, error) {
 	return 990, 991, nil
 }
 
+// ApplyDirectories records only a run that creates something, so every trace
+// of a host with nothing to create stays what it was.
+func (f *fakeConverger) ApplyDirectories(dirs []lifeops.DirectoryCreation) error {
+	for _, d := range dirs {
+		f.record("create " + d.Path)
+	}
+
+	return nil
+}
+
 func (f *fakeConverger) ApplyOwnership(changes []lifeops.OwnershipChange, _, _ int) error {
 	// THE RECORD STRING STAYS "ownership" because `up`'s ordering assertions read
 	// it; what each change NAMES is captured beside it, because a restore has to
@@ -923,14 +933,42 @@ func TestUpDryRunMutatesNothing(t *testing.T) {
 	asLinux(t)
 
 	cfg := serviceConfig(t)
-	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
+	plan := bothUnits()
+	plan.Directories = []lifeops.DirectoryCreation{{Path: "/Users/op/Library/LaunchAgents", Mode: 0o755}}
+	f := stageUp(t, &fakeConverger{plan: plan}, githubVerified)
 
-	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg, dryRun: true}); err != nil {
+	var out strings.Builder
+	env := processEnv()
+	env.Stdout = &out
+	if err := runLocalUp(t.Context(), env, upOptions{configPath: cfg, servicePath: cfg, dryRun: true}); err != nil {
 		t.Fatalf("--dry-run failed: %v", err)
 	}
 
 	if strings.Join(f.trace, " ") != "plan" {
 		t.Errorf("--dry-run did more than plan: %v", f.trace)
+	}
+	if !strings.Contains(out.String(), "plan     create /Users/op/Library/LaunchAgents 0755") {
+		t.Errorf("--dry-run does not say what it would create:\n%s", out.String())
+	}
+}
+
+// THE PLANNED DIRECTORIES ARE CREATED FIRST, under the lock and before anything
+// else is touched (#181): every later step reads or writes in them, and a
+// launch agent whose log directory is missing fails to spawn with no log.
+func TestUpCreatesThePlannedDirectoriesBeforeAnythingElse(t *testing.T) {
+	asLinux(t)
+
+	cfg := serviceConfig(t)
+	plan := bothUnits()
+	plan.Directories = []lifeops.DirectoryCreation{{Path: "/agents", Mode: 0o755}, {Path: "/state", Mode: 0o700}}
+	f := stageUp(t, &fakeConverger{plan: plan}, githubVerified)
+
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	if got := strings.Join(f.trace[:5], " → "); got != "plan → lock → create /agents → create /state → ownership" {
+		t.Errorf("up began:\n  %s\nwant the directories right after the lock", got)
 	}
 }
 

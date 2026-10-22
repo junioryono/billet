@@ -36,7 +36,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 ### The commands that write billet.yaml: [references/writers.md](references/writers.md)
 
-- **Two commands write `/etc/billet/billet.yaml` under different rules, and each says which; a third writes a directory.**
+- **Three commands write `/etc/billet/billet.yaml` under different rules, and each says which; a fourth writes a directory.**
 - **`billet init` refuses what it cannot measure.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).

@@ -16,6 +16,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
+	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -355,9 +356,18 @@ func CAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 
 	fmt.Fprintf(env.Stdout, "billet ca: wrote a bundle for node %q to %s\n\n", name, abs)
 	fmt.Fprintf(env.Stdout, "  fingerprint  %s\n\n", wirecert.Fingerprint(mustSPKI(bundle)))
-	fmt.Fprint(env.Stdout, "Copy that directory to the node, then point its config at the files:\n\n")
-	fmt.Fprintf(env.Stdout, "  node:\n    tls:\n      cert: /etc/billet/tls/node.crt\n"+
-		"      key:  /etc/billet/tls/node.key\n      ca:   /etc/billet/tls/ca.crt\n\n")
+	// BOTH PLATFORMS' PATHS, because the node this bundle is for is another
+	// machine, and the Linux path alone told a Mac to write into /etc, which its
+	// services never read (#181).
+	fmt.Fprint(env.Stdout, "Copy that directory to the node, into the tls directory beside the config its "+
+		"services read, then point its config at the files:\n\n")
+	for _, platform := range []struct{ name, goos string }{{"Linux", "linux"}, {"a Mac", "darwin"}} {
+		tls := filepath.Join(filepath.Dir(initconfig.ServiceConfigPathFor(platform.goos)), "tls")
+		fmt.Fprintf(env.Stdout, "  # on %s\n  node:\n    tls:\n      cert: %s\n      key:  %s\n      ca:   %s\n\n",
+			platform.name, filepath.Join(tls, "node.crt"), filepath.Join(tls, "node.key"), filepath.Join(tls, "ca.crt"))
+	}
+	fmt.Fprint(env.Stdout, "`billet init --join` and `billet join` already name these, under the config's own "+
+		"directory.\n")
 	fmt.Fprint(env.Stdout, "node.name comes from the certificate, so it does not have to be written.\n")
 	fmt.Fprint(env.Stdout, "node.key is a private key: keep it 0600 and do not copy it anywhere else.\n")
 

@@ -24,6 +24,8 @@
     billet_candidate_selected: false
     billet_candidate_binary: {}
     billet_candidate_source: ""
+    billet_candidate_evidence_archive: ""
+    billet_candidate_evidence_manifest: ""
 
 - name: Inspect the installed billet binary
   ansible.builtin.stat:

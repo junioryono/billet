@@ -511,6 +511,38 @@ func NodeDeploymentID(cfg *config.Config, bundle *wirecert.Bundle) (string, erro
 	return "", nil
 }
 
+// PeekNodeDeploymentID is the identity a node on this host would claim, read
+// without minting one: its certificate's, the control plane's beside it, or its
+// own state directory's, in NodeDeploymentID's order. It answers false when
+// none says yet, which is a fresh host's ordinary answer and an error's is not. A
+// bundle the node could not load is an error here, as it is to the node: the
+// next answer down is not the identity it would claim.
+func PeekNodeDeploymentID(cfg *config.Config) (string, bool, error) {
+	if cfg.Node == nil {
+		return "", false, nil
+	}
+
+	bundle, err := NodeBundle(cfg)
+	if err != nil {
+		return "", false, err
+	}
+
+	if bundle != nil {
+		deployment, err := bundle.Deployment()
+		if err != nil {
+			return "", false, err
+		}
+
+		return deployment, true, nil
+	}
+
+	if cfg.Server != nil {
+		return state.PeekDeploymentID(cfg.Server.IdentityDir)
+	}
+
+	return state.PeekDeploymentID(cfg.Node.StateDir)
+}
+
 // claimIdentity reads an installation identity and takes the host-wide lock.
 func claimIdentity(
 	stateDir, lockDir string, allowUnplaceable bool,

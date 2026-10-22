@@ -1,0 +1,7 @@
+source	license	evidence	reviewed
+adoptium-ca-certificates	Apache-2.0	https://github.com/adoptium/installer/blob/master/LICENSE	2026-10-21
+docker-ce	Apache-2.0	https://github.com/docker/docker-ce-packaging/blob/master/LICENSE https://github.com/moby/moby/blob/master/LICENSE https://github.com/docker/cli/blob/master/LICENSE	2026-10-21
+gh	MIT	https://github.com/cli/cli/blob/trunk/LICENSE	2026-10-21
+kubectl	Apache-2.0	https://github.com/kubernetes/kubernetes/blob/master/LICENSE	2026-10-21
+powershell	MIT	https://github.com/PowerShell/PowerShell/blob/master/LICENSE.txt	2026-10-21
+session-manager-plugin	Apache-2.0	https://github.com/aws/session-manager-plugin/blob/mainline/LICENSE	2026-10-21

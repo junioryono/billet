@@ -372,11 +372,20 @@ func TestAStartWhileADrainIsAskedForIsOverADrain(t *testing.T) {
 			account[render]["vars"], whenText(account[render]))
 	}
 
+	// THE VERDICT BETWEEN THEM (#183): billet says whether the node reads what
+	// the preview found changed, and the request is gated on that answer.
+	verdict := taskNamed(t, "account.yml", account, "Decide whether the node reads what this converge changes")
+	if verdict <= preview || verdict >= request ||
+		account[verdict]["ansible.builtin.import_tasks"] != "node-config-verdict.yml" {
+		t.Errorf("account.yml decides the node's verdict at %d (%v), between the preview at %d and the request at %d",
+			verdict, account[verdict]["ansible.builtin.import_tasks"], preview, request)
+	}
+
 	if got, want := normalized(whenText(account[request])), normalized(strings.Join([]string{
 		"billet_node_should_run",
 		"not ansible_check_mode",
 		"not billet_binary_upgrade | default(false)",
-		"billet_config_preview.changed | default(false)",
+		"billet_node_config_changed | default(true) | bool",
 	}, "\n")); got != want || account[request]["ansible.builtin.include_tasks"] != "request-node-drain.yml" {
 		t.Errorf("account.yml's drain request for a changed configuration is %v under %q, want request-node-drain.yml "+
 			"under %q", account[request]["ansible.builtin.include_tasks"], got, want)
@@ -529,7 +538,7 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 		copied["dest"] != "{{ billet_node_drain_owed_path }}" || account[record]["register"] != "billet_node_drain_owed_write" ||
 		normalized(whenText(account[record])) != normalized(strings.Join([]string{
 			"billet_previous_config.get('node') is mapping",
-			"billet_effective_config.get('node') is not mapping or billet_config_preview.changed | default(false)",
+			"billet_effective_config.get('node') is not mapping or billet_node_config_changed | default(billet_config_preview.changed | default(false)) | bool",
 			"not ansible_check_mode",
 		}, "\n")) {
 		t.Errorf("account.yml records the owed drain as %v (register %v) when %q, want the installed node state "+

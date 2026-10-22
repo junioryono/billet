@@ -365,6 +365,18 @@ linters:
             - github.com/junioryono/billet/internal/durablefile$
             - github.com/junioryono/billet/internal/regularfile$
 
+        # THE WORDS A COMMAND DECLARES ITS HOST PATHS IN (#174), which every
+        # command family and the host family's `local unit-paths` share: a leaf,
+        # so a declaration can be imported by any family without importing
+        # another's. The standard library and the one open of a file by name.
+        unitpath:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/unitpath/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/regularfile$
+
         # THE ASSEMBLY IS IMPORTED BY WHAT INVOKES IT, AND NOTHING IT ASSEMBLES.
         # internal/app builds the control plane and the node from a config, so a
         # package below it that imported it would import every role; the binary
@@ -923,6 +935,20 @@ linters:
       # vanish), so a nolint directive here would be reported unused on a
       # smaller build. Excluded by file and rule, like the resolver above.
       - path: (^|/)internal/ops/setup/githubapp\.go$
+        linters:
+          - gosec
+        text: G703
+
+      # THE SAME REACH, IN THE HOST FAMILY. reportNeedrestart stats fixed names
+      # under the root `billet check` inspects (`/` in production, a test's
+      # directory otherwise), and observeRetireAuthority stats the authority's
+      # fixed paths under the configured identity directory: no path is the
+      # operator's free text. gosec began reporting the three os.Lstat calls in
+      # these two files, unchanged since they were written, when `billet join`
+      # grew internal/ops/host's call graph (the lint of #620, 2026-10-21, with
+      # the cache off; main's lint passed on the same two files). A directive
+      # would be reported unused on a smaller build, as for the files above.
+      - path: (^|/)internal/ops/host/(checkneedrestart|serverretire)\.go$
         linters:
           - gosec
         text: G703

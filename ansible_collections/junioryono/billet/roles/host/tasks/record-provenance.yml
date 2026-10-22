@@ -1,0 +1,79 @@
+---
+# WHICH RELEASE MANIFEST PRODUCED THE INSTALLED BINARY, recorded by billet rather
+# than by the role (#91), exactly as install.sh records it: `billet release
+# record` parses the manifest, finds this platform's archive, and refuses unless
+# the archive hashes to what the manifest says and the binary is the one inside
+# it. A rollout treats the record as proof, so the role never writes one itself.
+#
+# Inputs: billet_provenance_archive and billet_provenance_manifest, the evidence
+# binary.yml kept beside the candidate (both empty when there is none: a
+# supplied binary, or a release that publishes no manifest), and
+# billet_provenance_replaces, true inside the upgrade transaction.
+#
+# IN THE TRANSACTION THE OLD RECORD GOES FIRST, as Go's RecordInstalled does: it
+# describes the bytes the transaction just replaced, and a record that survives
+# beside other bytes reads as a contradiction on every reconnect. So a binary
+# with no evidence leaves no record, and a refused record leaves none either.
+# Outside it (a backfill on a host whose binary did not change) nothing is
+# removed: what is there may prove these bytes for a reason this run cannot see.
+#
+# A REFUSAL IS REPORTED AND DECIDES NOTHING. The binary was verified against the
+# release's checksums.txt before anything was installed; the record is how a
+# rollout reads the host, and a host that records nothing reads as "cannot tell",
+# which a rollout already knows how to act on. The node reads the record once,
+# when it starts.
+- name: Remove the provenance record of the binary the transaction replaced
+  ansible.builtin.file:
+    path: "{{ billet_provenance_path }}"
+    state: absent
+  become: true
+  when: billet_provenance_replaces | default(false) | bool
+
+- name: Record which release manifest produced the installed binary
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - -k
+      - "10"
+      - "120"
+      - /usr/bin/billet
+      - release
+      - record
+      - --manifest
+      - "{{ billet_provenance_manifest }}"
+      - --archive
+      - "{{ billet_provenance_archive }}"
+      - --binary
+      - /usr/bin/billet
+  register: billet_provenance_record
+  changed_when: billet_provenance_record.rc == 0
+  failed_when: false
+  become: true
+  when:
+    - billet_provenance_archive | default('') | length > 0
+    - billet_provenance_manifest | default('') | length > 0
+
+- name: Say that nothing records which release manifest produced the binary
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'billet release record refused, so ' if billet_provenance_record.rc is defined else '' }}nothing
+      on this host records which release manifest produced /usr/bin/billet, and a
+      rollout reads its version rather than its bytes ("NAMED NO MANIFEST" in billet
+      status).
+      {{ ('It said: ' ~ ((billet_provenance_record.stderr | default('')) ~ ' ' ~ (billet_provenance_record.stdout | default(''))) | trim
+          ~ ' (a billet from before `release record` refuses on every converge, until the role installs a newer one.)')
+         if billet_provenance_record.rc is defined
+         else 'There is no release evidence to record from: the binary was supplied, or its release publishes no manifest.' }}
+  when: >-
+    (billet_provenance_record.rc | default(0)) != 0
+    or ((billet_provenance_replaces | default(false) | bool) and billet_provenance_record.rc is not defined)
+
+- name: Say when a backfilled record reaches the running node
+  ansible.builtin.debug:
+    msg: >-
+      Recorded which release manifest produced /usr/bin/billet. A running node reads
+      the record when it starts, so billet status names the manifest from this node's
+      next start; nothing was restarted for it.
+  when:
+    - not (billet_provenance_replaces | default(false) | bool)
+    - billet_provenance_record.rc | default(1) == 0

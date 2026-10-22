@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -381,6 +382,75 @@ func (c *Converger) ApplyOwnership(changes []lifeops.OwnershipChange, _, _ int) 
 		"cannot do without root — and these commands refuse to run as root because a launch "+
 		"agent lives in a logged-in user's domain. This is a bug in the plan rather than in the "+
 		"host", len(changes))
+}
+
+// ApplyDirectories creates each planned directory and every missing component
+// above it, then proves this account can write it (#181).
+//
+// EACH COMPONENT IS MADE ONE AT A TIME AND READ BACK WITHOUT FOLLOWING: a
+// component that turns out to be a symlink or a file is refused rather than
+// created through, so the directory made is the one the plan named.
+func (c *Converger) ApplyDirectories(dirs []lifeops.DirectoryCreation) error {
+	for _, d := range dirs {
+		if err := makeDirs(d.Path, d.Mode); err != nil {
+			return err
+		}
+
+		if err := c.writableDir(d.Path); err != nil {
+			return fmt.Errorf("launchd: created %s, and this account still cannot write it: %w", d.Path, err)
+		}
+	}
+
+	return nil
+}
+
+// makeDirs creates path and its missing ancestors, each with mode.
+//
+// THE PLANNED DIRECTORY ITSELF IS READ WITHOUT FOLLOWING: one that became a
+// link after it was planned is refused, never written through. Its ancestors
+// are followed, as the plan followed them (a Mac's /var and /tmp are links):
+// this runs as the account in directories that account owns, so a link there
+// redirects nothing it could not do itself.
+func makeDirs(path string, mode fs.FileMode) error {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("launchd: create %s: it is a symbolic link now, so nothing was created through it", path)
+	}
+
+	var missing []string
+
+	// THE FIRST COMPONENT THAT EXISTS ENDS THE WALK, whatever it is: one that
+	// is not a directory refuses the Mkdir below it, or, as the path itself,
+	// the writable proof after it.
+	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
+		_, err := os.Stat(p)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrNotExist) || p == filepath.Dir(p) {
+			return fmt.Errorf("launchd: create %s: %w", path, err)
+		}
+
+		missing = append(missing, p)
+	}
+
+	for i := len(missing) - 1; i >= 0; i-- {
+		p := missing[i]
+
+		if err := os.Mkdir(p, mode); err != nil && !errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("launchd: create %s: %w", p, err)
+		}
+
+		info, err := os.Lstat(p)
+		if err != nil {
+			return fmt.Errorf("launchd: create %s: %w", p, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("launchd: create %s: it is a %s now, not a directory, so nothing was "+
+				"created through it", p, info.Mode().Type())
+		}
+	}
+
+	return nil
 }
 
 // RepairServerState has nothing to repair on macOS.

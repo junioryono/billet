@@ -86,7 +86,7 @@
             - not billet_binary_upgrade | default(false)
             - not billet_endpoint_migrated | default(false) | bool
             - >-
-              billet_config_install.changed | default(false) or
+              (billet_config_install.changed | default(false) and billet_node_config_changed | default(true) | bool) or
               billet_firecracker_install.changed | default(false) or
               billet_firecracker_links.changed | default(false) or
               (billet_server_environment | default({}) | length > 0 and

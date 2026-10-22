@@ -91,6 +91,21 @@
           admit-start: {fixture: admit-start-proved, rc: 0}
         succeeds: true
         endings: ["{{ billet_gate_check_drain }}", "{{ billet_gate_admit }}"]
+      # A CHANGE BILLET SAYS THE NODE DOES NOT READ (#183: tiers or nodes:
+      # alone) asks no drain of a restart some other input made, so its stop
+      # is proved like any ordinary one, without --drain.
+      - name: config-changed-but-not-read-requires-no-drain
+        wait: 30
+        config_changed: true
+        node_reads: false
+        before: "{{ billet_gate_running }}"
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        ending:
+          check: {fixture: check-proved-handoff, rc: 0}
+          admit-start: {fixture: admit-start-proved, rc: 0}
+        succeeds: true
+        endings: ["{{ billet_gate_check }}", "{{ billet_gate_admit }}"]
       # AN ANSWER TO ANOTHER QUESTION: a proof of some other invocation, or of
       # a drain nobody asked about, is not a proof of this stop.
       - name: answer-about-another-invocation
@@ -568,4 +583,86 @@
     - name: Remove the case directory
       ansible.builtin.file:
         path: "{{ billet_gate_restart_root.path }}"
+        state: absent
+
+# BILLET'S VERDICT, READ BY THE PRODUCTION PARSER (node-config-answer.yml): keep
+# only on the exact answer billet writes for it, exit 0, and the restart for
+# everything else. None of these may fail the converge, which is the parser's
+# whole point: a template error here would stop it where the rule is to restart.
+- name: Prove the node's verdict is keep only on billet's keep
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_keep: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/fixtures/node-config-change/keep.json') }}"
+    billet_gate_restart: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/fixtures/node-config-change/restart.json') }}"
+    billet_gate_verdict_cases:
+      - {name: keep, raw: {rc: 0, stdout: "{{ billet_gate_keep }}\n"}, changed: false}
+      - {name: restart, raw: {rc: 0, stdout: "{{ billet_gate_restart }}\n"}, changed: true}
+      - {name: keep-from-a-failed-call, raw: {rc: 1, stdout: "{{ billet_gate_keep }}"}, changed: true}
+      - {name: keep-truncated, raw: {rc: 0, stdout: "{{ billet_gate_keep[:-2] }}"}, changed: true}
+      - {name: keep-then-more, raw: {rc: 0, stdout: "{{ billet_gate_keep }} {}"}, changed: true}
+      - {name: a-brace-alone, raw: {rc: 0, stdout: "{"}, changed: true}
+      - {name: an-invalid-escape, raw: {rc: 0, stdout: '{"schema":1,"verdict":"keep","why":"\q"}'}, changed: true}
+      - {name: not-json, raw: {rc: 0, stdout: "keep"}, changed: true}
+      - {name: empty, raw: {rc: 0, stdout: ""}, changed: true}
+      - {name: unknown-verb, raw: {rc: 2, stdout: "", stderr: 'billet: unknown command "config-change"'}, changed: true}
+      - {name: no-exit-status, raw: {stdout: "{{ billet_gate_keep }}"}, changed: true}
+  tasks:
+    - name: Read each answer through the production parser
+      ansible.builtin.include_tasks: node-config-answer-case.yml
+      loop: "{{ billet_gate_verdict_cases }}"
+      loop_control:
+        loop_var: billet_gate_verdict_case
+        label: "{{ billet_gate_verdict_case.name }}"
+
+# THE VERDICT TASK ITSELF (node-config-verdict.yml), against a scripted answerer:
+# it asks only when the configuration changes, the node will run and an
+# answerer is there; asks about the installed file and a candidate beside it
+# that is the rendering; keeps the node only on billet's keep; and leaves no
+# candidate behind. THE ZERO VALUE IS THE RESTART, so every case that does not
+# ask is the preview's change.
+- name: Prove the verdict task asks billet and restarts unless billet keeps
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # WHAT THE CONVERGE RENDERS, which the installed file below does not say.
+    billet_gate_verdict_rendering: {node: {name: gate-node, provider: docker, max_vcpu: 7}}
+    billet_gate_verdict_cases:
+      - {name: keep, verdict: keep, changed: false, asked: true}
+      - {name: restart, verdict: restart, changed: true, asked: true}
+      - {name: a-release-without-the-verb, verdict: absent, changed: true, asked: true}
+      - {name: no-answerer, answerer: false, changed: true, asked: false}
+      - {name: no-change, preview_changed: false, changed: false, asked: false}
+      - {name: a-node-that-will-not-run, should_run: false, changed: true, asked: false}
+  tasks:
+    - name: Create the case directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -node-config-verdict
+      register: billet_gate_verdict_root
+
+    - name: Create the configuration directory
+      ansible.builtin.file:
+        path: "{{ billet_gate_verdict_root.path }}/etc"
+        state: directory
+        mode: "0755"
+
+    - name: Install the configuration the node runs on
+      ansible.builtin.copy:
+        dest: "{{ billet_gate_verdict_root.path }}/etc/billet.yaml"
+        content: "node:\n  name: gate-node\n"
+        mode: "0600"
+
+    - name: Ask for each verdict through the production task file
+      ansible.builtin.include_tasks: node-config-verdict-case.yml
+      loop: "{{ billet_gate_verdict_cases }}"
+      loop_control:
+        loop_var: billet_gate_verdict_case
+        label: "{{ billet_gate_verdict_case.name }}"
+
+    - name: Remove the case directory
+      ansible.builtin.file:
+        path: "{{ billet_gate_verdict_root.path }}"
         state: absent

@@ -99,7 +99,7 @@
         that:
           - >-
             billet_gate_restart_task.when[-1] | regex_replace('\\s+', ' ') | trim ==
-            "billet_config_install.changed | default(false) or billet_firecracker_install.changed | default(false) or
+            "(billet_config_install.changed | default(false) and billet_node_config_changed | default(true) | bool) or billet_firecracker_install.changed | default(false) or
             billet_firecracker_links.changed | default(false) or (billet_server_environment | default({}) | length > 0 and
             billet_server_environment_install.changed | default(false)) or
             (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0) or
@@ -114,7 +114,7 @@
       ansible.builtin.assert:
         that:
           - >-
-            not (billet_config_install.changed | default(false) or billet_firecracker_install.changed | default(false) or
+            not ((billet_config_install.changed | default(false) and billet_node_config_changed | default(true) | bool) or billet_firecracker_install.changed | default(false) or
             billet_firecracker_links.changed | default(false) or (billet_server_environment | default({}) | length > 0 and
             billet_server_environment_install.changed | default(false)) or
             (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0) or

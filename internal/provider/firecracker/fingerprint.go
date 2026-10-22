@@ -23,7 +23,9 @@ import (
 // know about is a condition it cannot check. Format 2 added the golden's system
 // disk and the generation it was cloned from; a format 1 record names no disk, so
 // nothing a restore could clone is known to be the one its memory was taken with.
-const compatibilityFormat = 2
+// Format 3 added the evidence a restore is checked against (Evidence): the
+// deployment, the builder's lease and the digests of the state and memory.
+const compatibilityFormat = 3
 
 // compatibilityFile is the record beside a published snapshot's state and memory.
 const compatibilityFile = "compatibility.json"
@@ -69,6 +71,87 @@ type compatibility struct {
 	// Disk is the golden's system disk, written golden@generation: the disk this
 	// memory was taken with, and the only one a restore may put under it.
 	Disk string `json:"disk"`
+	// Deployment is the deployment whose node captured the golden, and Builder the
+	// lease whose microVM it was.
+	Deployment string `json:"deployment"`
+	Builder    string `json:"builder"`
+	// StateDigest and MemoryDigest are the SHA-256 of the published state and
+	// memory, computed as they were copied out of the jail.
+	StateDigest  string `json:"state_digest"`
+	MemoryDigest string `json:"memory_digest"`
+}
+
+// errSnapshotNotExpected is a published snapshot that is not the golden the restore
+// was told to expect, or a restore told nothing to expect.
+var errSnapshotNotExpected = errors.New("the snapshot is not the golden the restore expects")
+
+// Evidence is what a capture published, which the caller keeps and hands back to
+// every Restore of that golden.
+//
+// THE CALLER'S, NOT THE RECORD'S. A restore is checked against what the control
+// plane recorded when it admitted the golden's build, carried to the node by the
+// command that asks for the restore, so a snapshot of another deployment, another
+// build or other bytes under the same name is refused before it is loaded. Reading
+// the expectation from the record would check the record against itself.
+//
+// THE DIGESTS ARE TAKEN AT PUBLICATION, NOT AT EVERY RESTORE. The store is billet's,
+// writable by no one else and its files 0444, which is the host Firecracker's threat
+// model trusts; what crosses a trust boundary is a golden moved to another node,
+// and that is where its files are digested again (#508, item 5). A restore compares
+// the published record with the evidence, through the directory it links from,
+// because digesting the memory again would cost about 0.7 s per GiB (measured on
+// the reference node, 2026-10-22) of a restore that takes under half a second.
+type Evidence struct {
+	Deployment string
+	Builder    string
+	Disk       string
+	State      string
+	Memory     string
+}
+
+// evidence is what this record says its golden is.
+func (c compatibility) evidence() Evidence {
+	return Evidence{
+		Deployment: c.Deployment, Builder: c.Builder, Disk: c.Disk,
+		State: c.StateDigest, Memory: c.MemoryDigest,
+	}
+}
+
+// expected refuses a record that is not the golden want names, or that this
+// deployment (owner) did not publish.
+//
+// ZERO VALUES REFUSE: evidence with any field empty is no evidence of that field,
+// and a restore told nothing is a restore of whatever happens to hold the name.
+func (c compatibility) expected(want Evidence, owner, path string) error {
+	for _, f := range []struct{ name, value string }{
+		{"deployment", want.Deployment}, {"builder", want.Builder}, {"system disk", want.Disk},
+		{"state digest", want.State}, {"memory digest", want.Memory},
+	} {
+		if f.value == "" {
+			return fmt.Errorf("firecracker: %w: the restore of %s was given no %s to check it against",
+				errSnapshotNotExpected, path, f.name)
+		}
+	}
+
+	if c.Deployment != owner {
+		return fmt.Errorf("firecracker: %w: %s was published by deployment %s, not this one",
+			errSnapshotNotExpected, path, bounded(c.Deployment))
+	}
+
+	got := c.evidence()
+
+	for _, f := range []struct{ name, got, want string }{
+		{"deployment", got.Deployment, want.Deployment}, {"builder", got.Builder, want.Builder},
+		{"system disk", got.Disk, want.Disk}, {"state", got.State, want.State},
+		{"memory", got.Memory, want.Memory},
+	} {
+		if f.got != f.want {
+			return fmt.Errorf("firecracker: %w: %s has %s %s, and the restore expects %s",
+				errSnapshotNotExpected, path, f.name, bounded(f.got), bounded(f.want))
+		}
+	}
+
+	return nil
 }
 
 // mismatch names the first field two records disagree on, or "" when they agree.
@@ -212,12 +295,23 @@ func unameKernel() (string, error) {
 // equal the key after the next one. A digest is remembered only when the file's last
 // change is older than settledAfter, the way git treats a "racy" index entry; a file
 // still being written is digested every time.
+//
+// A LINK IS NOT A CHANGE. Every launch hard-links the guest kernel into its jail,
+// and a link moves the inode's change time, so a digest read while another launch
+// linked the file was refused as "changed while it was being read" (measured on the
+// reference node, 2026-10-22: 8 of 10 concurrent restores). The read is judged by
+// what a write moves, the size and the modification time; the change time stays in
+// the key, so a file linked since is digested again rather than trusted.
 type fileDigests struct {
 	mu   sync.Mutex
 	seen map[fileIdentity]string
 
 	// now is the clock a file's settling is judged by; nil is time.Now.
 	now func() time.Time
+
+	// afterRead runs between the read and the second look at the file, so a test
+	// can change the file at the one moment that matters; nil in production.
+	afterRead func()
 }
 
 type fileIdentity struct {
@@ -225,6 +319,17 @@ type fileIdentity struct {
 	dev, ino             uint64
 	size                 int64
 	mtimeNsec, ctimeNsec int64
+}
+
+// sameBytes reports whether two identities are of one file whose contents no write
+// has changed between them: everything but the change time, which a link moves too.
+//
+// ONLY FOR FILES BILLET'S OWN ACCOUNT WRITES, the kernel and the Firecracker binary,
+// whose installer writes a new file and renames it: a writer that reset the
+// modification time after writing would need that account. A file the jailed
+// account wrote is judged by its whole identity (copyOut).
+func (a fileIdentity) sameBytes(b fileIdentity) bool {
+	return a.path == b.path && a.dev == b.dev && a.ino == b.ino && a.size == b.size && a.mtimeNsec == b.mtimeNsec
 }
 
 // of is the digest of the regular file at path, read through one descriptor.
@@ -264,13 +369,17 @@ func (d *fileDigests) ofOpen(f *os.File, path string) (string, error) {
 		return "", err
 	}
 
-	// THE SAME FILE AFTER THE READ AS BEFORE IT, or the digest describes neither.
+	if d.afterRead != nil {
+		d.afterRead()
+	}
+
+	// THE SAME BYTES AFTER THE READ AS BEFORE IT, or the digest describes neither.
 	var after unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &after); err != nil {
 		return "", err
 	}
 
-	if identityOf(path, &after) != key {
+	if !identityOf(path, &after).sameBytes(key) {
 		return "", fmt.Errorf("%s changed while it was being read", path)
 	}
 
@@ -350,6 +459,12 @@ func readCompatibility(dir *os.File, path string) (compatibility, error) {
 	if err := decoder.Decode(&record); err != nil {
 		return compatibility{}, fmt.Errorf("firecracker: %w: %s is not a compatibility record: %w",
 			errSnapshotIncompatible, path, err)
+	}
+
+	if record.Format > 0 && record.Format < compatibilityFormat {
+		return compatibility{}, fmt.Errorf("firecracker: %w: %s is compatibility record format %d, written "+
+			"by an earlier billet, which recorded no evidence of what it published; capture the golden again",
+			errSnapshotIncompatible, path, record.Format)
 	}
 
 	if record.Format != compatibilityFormat {

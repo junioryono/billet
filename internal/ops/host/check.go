@@ -22,6 +22,7 @@ import (
 	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -153,6 +154,8 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 	if runtime.GOOS == "linux" {
 		reportNeedrestart(env.Stdout, "/")
 	}
+
+	reportInstalledProvenance(env.Stdout, version.Version())
 
 	if runtime.GOOS == "linux" && cfg.Node != nil {
 		reportLockDir(env.Stdout, cfg.Node.LockDir, checkUnitProperties(ctx))
@@ -348,6 +351,27 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		// (ADR-012), and its jobs wait however much else is free.
 		if shapeHosts, err = a.ShapeHosts(ctx); err != nil {
 			return report, err
+		}
+
+		// THE CEILING AGAINST EVERY REGISTERED HOST, offline ones included, because
+		// this judges the configuration: a host down for a reboot comes back with
+		// its whole contribution. ADVISORY, as in `billet status`; a host that has
+		// never registered is invisible here, and `billet join accept` is what
+		// raises the ceiling for one before it does.
+		contributing, err := a.RegisteredContribution(ctx)
+		if err != nil {
+			return report, err
+		}
+		var (
+			fleetVCPU   int
+			fleetMemory config.ByteSize
+		)
+		for _, c := range contributing {
+			fleetVCPU += c.VCPU
+			fleetMemory += c.Memory
+		}
+		if below := CeilingBelow("registered", len(contributing), fleetVCPU, fleetMemory, cfg.Server); below != "" {
+			fmt.Fprintf(env.Stdout, "ceiling  %s\n", below)
 		}
 	}
 

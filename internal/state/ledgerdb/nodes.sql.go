@@ -197,6 +197,50 @@ func (q *Queries) ListCodeBuildRegistrationPaths(ctx context.Context, provider s
 	return items, nil
 }
 
+const listContributingNodes = `-- name: ListContributingNodes :many
+SELECT name, total_vcpu, total_memory
+  FROM nodes
+ WHERE decommissioned_at = ''
+ ORDER BY name
+`
+
+type ListContributingNodesRow struct {
+	Name        string
+	TotalVcpu   int64
+	TotalMemory int64
+}
+
+// What every host the fleet still expects to answer contributes, offline ones
+// included: the hosts a deployment ceiling is sized for.
+//
+// OFFLINE COUNTS, unlike ListPlaceableNodes, because the question is whether
+// the configured ceiling covers the fleet, and a host that is down for a
+// reboot comes back with its whole contribution. A decommissioned host does
+// not count, proven or not: it is out of the fleet until it registers again,
+// which clears decommissioned_at.
+func (q *Queries) ListContributingNodes(ctx context.Context) ([]ListContributingNodesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listContributingNodes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListContributingNodesRow
+	for rows.Next() {
+		var i ListContributingNodesRow
+		if err := rows.Scan(&i.Name, &i.TotalVcpu, &i.TotalMemory); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listNodeRegistrations = `-- name: ListNodeRegistrations :many
 SELECT name, live, epoch, incarnation, node_release, node_digest, highest_release
   FROM nodes

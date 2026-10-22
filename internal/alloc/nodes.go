@@ -418,3 +418,40 @@ func (a *Allocator) PlaceableContribution(ctx context.Context) (int, config.Byte
 
 	return vcpu, memory, hosts, err
 }
+
+// Contribution is what one host told the control plane it contributes.
+type Contribution struct {
+	Node   string
+	VCPU   int
+	Memory config.ByteSize
+}
+
+// RegisteredContribution is what every host the fleet still expects to answer
+// contributes, offline ones included: the fleet a deployment ceiling is sized
+// for, where PlaceableContribution is the part of it that can take work now.
+//
+// BOTH ASK THE SAME QUESTION OF A CEILING and differ in which hosts it covers:
+// `billet status` compares the live, undrained hosts because it reports what
+// runs now, `billet check` and `billet join accept` compare every registered
+// host because they judge the configuration, and a host down for a reboot comes
+// back with its whole contribution.
+func (a *Allocator) RegisteredContribution(ctx context.Context) ([]Contribution, error) {
+	var out []Contribution
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListContributingNodes(ctx)
+		if err != nil {
+			return fmt.Errorf("alloc: list contributing nodes: %w", err)
+		}
+
+		for _, row := range rows {
+			out = append(out, Contribution{
+				Node: row.Name, VCPU: int(row.TotalVcpu), Memory: config.ByteSize(row.TotalMemory),
+			})
+		}
+
+		return nil
+	})
+
+	return out, err
+}

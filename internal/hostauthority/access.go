@@ -496,7 +496,7 @@ var repairPaths = func(dir string, targets []lifeops.RepairTarget, uid, gid int)
 
 // handBackSet gives the service account the artefacts a privileged command
 // created inside dir, through lifeops' descriptor-based repair: only root-owned
-// regular files with one link on the directory's filesystem, the two
+// regular files with one link on the directory's mount, the two
 // directories excepted, nothing walked. It is the one re-owning mechanism;
 // `local up`'s preflight repair is the same function over the ledger set.
 func handBackSet(dir string, acct retirement.ServiceAccount, set ArtefactSet) error {

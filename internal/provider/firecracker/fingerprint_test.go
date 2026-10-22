@@ -12,8 +12,22 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/provider"
 )
+
+// changeTime is a file's change time, in nanoseconds.
+func changeTime(t *testing.T, path string) int64 {
+	t.Helper()
+
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
+
+	return unix.TimespecToNsec(st.Ctim)
+}
 
 // A HOST'S CPU IS ITS IDENTITY AND ITS FEATURES, read the same however the cores are
 // listed: two cores reporting the same flags in a different order are one CPU, and a
@@ -123,6 +137,99 @@ func TestAFileDigestIsRecomputedWhenTheFileChanges(t *testing.T) {
 
 	if _, err := d.of(t.TempDir()); err == nil {
 		t.Error("a directory was digested as a file")
+	}
+}
+
+// A LINK MADE WHILE A FILE IS READ IS NOT A CHANGE, and a write is. Every launch
+// links the guest kernel into its jail, which moves the inode's change time; on the
+// reference node eight of ten concurrent restores were refused for it (2026-10-22).
+func TestALinkMadeWhileAFileIsDigestedIsNotAChange(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		change  func(t *testing.T, path string)
+		refused bool
+	}{
+		{"a hard link, as a launch makes", func(t *testing.T, path string) {
+			t.Helper()
+
+			// THE CHANGE TIME MUST ACTUALLY MOVE, or the old check passes too: a link
+			// in the same timestamp tick as the write leaves it where it was, so the
+			// link is made again across ticks until it has moved.
+			before := changeTime(t, path)
+
+			for range 200 {
+				if err := os.Remove(path + ".jailed"); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+
+				if err := os.Link(path, path+".jailed"); err != nil {
+					t.Fatal(err)
+				}
+
+				if changeTime(t, path) != before {
+					return
+				}
+
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			t.Fatal("linking the file never moved its change time, so this case would prove nothing")
+		}, false},
+		{"a write of more bytes", func(t *testing.T, path string) {
+			t.Helper()
+
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			if _, err := f.WriteString(" and more"); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a rewrite of the same size, later", func(t *testing.T, path string) {
+			t.Helper()
+
+			if err := os.WriteFile(path, []byte("kernel 2"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			later := time.Now().Add(time.Minute)
+			if err := os.Chtimes(path, later, later); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "vmlinux")
+			if err := os.WriteFile(path, []byte("kernel 1"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			d := fileDigests{afterRead: func() { tc.change(t, path) }}
+
+			got, err := d.of(path)
+			if tc.refused {
+				if err == nil || !strings.Contains(err.Error(), "changed while it was being read") {
+					t.Fatalf("of = %q, %v, want it refused as changed while it was read", got, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("of: %v, want the digest of the bytes read", err)
+			}
+
+			if want := digestOf("kernel 1"); got != want {
+				t.Errorf("of = %s, want %s", got, want)
+			}
+		})
 	}
 }
 
@@ -315,6 +422,9 @@ func hostRecordAnd(edit func([]byte) []byte) func(*testing.T, *harness, string) 
 
 		record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
 		record.Image, record.Disk = aRestoreSpec().Image, testGoldenDisk
+		record.Deployment, record.Builder = h.p.owner, theBuilder
+		record.StateDigest = digestOf("captured " + snapshotStateFile)
+		record.MemoryDigest = digestOf("captured " + snapshotMemoryFile)
 
 		raw, err := json.Marshal(record)
 		if err != nil {
@@ -387,7 +497,7 @@ func TestPlaceSnapshotLinksNothingForASnapshotTakenElsewhere(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := h.p.placeSnapshot(j, "gold-1", h.p.cfg.KernelImage, aRestoreSpec())
+	err := h.p.placeSnapshot(j, "gold-1", h.p.cfg.KernelImage, aRestoreSpec(), h.theEvidence())
 	if !errors.Is(err, errSnapshotIncompatible) {
 		t.Fatalf("placeSnapshot = %v, want errSnapshotIncompatible", err)
 	}
@@ -417,7 +527,7 @@ func TestARestoreRefusesASpecOfAnotherShape(t *testing.T) {
 			h := newHarness(t)
 			publish(t, h, "gold-1", 0o444)
 
-			_, err := h.p.Restore(t.Context(), spec(), "gold-1")
+			_, err := h.p.Restore(t.Context(), spec(), "gold-1", h.theEvidence())
 			if !errors.Is(err, errSnapshotIncompatible) {
 				t.Fatalf("Restore = %v, want errSnapshotIncompatible", err)
 			}

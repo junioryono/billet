@@ -165,7 +165,26 @@ func TestAnsibleVarReachesTheRoleTemplateThroughItsOperand(t *testing.T) {
 	// is one expression — `{{ <var> | to_nice_yaml(...) }}` — so the piped name is
 	// the whole contract, and a stale reference in a comment beside a renamed
 	// variable satisfies a substring check while emitting into nothing.
-	body := strings.TrimSpace(string(raw))
+	// THE MARKER FIRST, exactly the one billet looks for: `billet join accept`
+	// refuses to edit a file that begins with it, so a template whose first
+	// line drifted from the constant would let it edit what the next converge
+	// reverts.
+	marker, expression, found := strings.Cut(string(raw), "\n")
+	if !found || marker != RoleRenderedMarker {
+		t.Fatalf("the role template's first line is %q, want the marker %q", marker, RoleRenderedMarker)
+	}
+
+	// AND macos_node RENDERS THE SAME FIRST LINE, since it reproduces this
+	// template byte for byte rather than calling it.
+	mac, err := os.ReadFile(filepath.Join(role, "..", "macos_node", "tasks", "converge.yml"))
+	if err != nil {
+		t.Fatalf("read macos_node's converge: %v", err)
+	}
+	if !strings.Contains(string(mac), `billet_macos_node_marker: "`+RoleRenderedMarker+`"`) {
+		t.Errorf("macos_node does not render the marker %q", RoleRenderedMarker)
+	}
+
+	body := strings.TrimSpace(expression)
 	if !strings.HasPrefix(body, "{{") || !strings.HasSuffix(body, "}}") {
 		t.Fatalf("the role template is not the single expression this pins:\n%s", body)
 	}
