@@ -458,31 +458,32 @@ func (b gitBody) Read(p []byte) (int, error) {
 
 // serveGit answers one request under gitPathPrefix.
 func (s *CacheService) serveGit(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	// EVERY REQUEST IS COUNTED ONCE, these three before the line the rest end
-	// with; none of them reached a repository's grant.
+	// EVERY REQUEST IS COUNTED ONCE, these three once answered, apart from the
+	// line the rest end with; none of them reached a repository's grant.
+	entered := s.now()
 	refused := func(reason gitReason, status int) {
-		s.git.observe().GitRequest(gitRouteRefused, reason.label, gitStatusClass(status), 0)
+		s.git.observe().GitRequest(gitRouteRefused, reason.label, gitStatusClass(status), s.now().Sub(entered))
 	}
 	request, ok, authenticated := s.parseGitRequest(r)
 	if !ok {
-		refused(gitNotAGitPath, http.StatusNotFound)
 		http.NotFound(w, r)
+		refused(gitNotAGitPath, http.StatusNotFound)
 
 		return
 	}
 	// ASKED FOR CREDENTIALS, which makes git run the guest's helper: the first
 	// request of every fetch carries none, because the rewrite dropped them.
 	if !authenticated {
-		refused(gitCredentialsRequired, http.StatusUnauthorized)
 		w.Header().Set("WWW-Authenticate", `Basic realm="billet"`)
 		http.Error(w, "credentials required", http.StatusUnauthorized)
+		refused(gitCredentialsRequired, http.StatusUnauthorized)
 
 		return
 	}
 	ctx, cancel, err := extendTransferFor(ctx, w, gitRequestLife)
 	if err != nil {
-		refused(gitTransferRefused, http.StatusServiceUnavailable)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		refused(gitTransferRefused, http.StatusServiceUnavailable)
 
 		return
 	}
@@ -1068,13 +1069,16 @@ func (s *CacheService) gitAdvertise(ctx context.Context, exchange *gitExchange, 
 	s.gitBegin(request.session)
 	advertisement, existed, err := s.refreshMirror(ctx, request, repository, resp.Body)
 	s.noteGit(request.session, err, existed)
-	// THE GRANT STANDS WHEN THE MIRROR ANSWERS, not only when it was asked: a
-	// refusal GitHub gave this header meanwhile ends it.
-	if granted, ok := s.git.granted(request, s.now()); err == nil && (!ok || granted != repository) {
-		err = errors.New("github.com's grant ended while the mirror was refreshed")
-	}
 	if err != nil {
 		exchange.answered(gitRouteGitHub, gitMirrorUnavailable, err.Error())
+		s.relayGit(exchange, r, resp)
+
+		return
+	}
+	// THE GRANT STANDS WHEN THE MIRROR ANSWERS, not only when it was asked: a
+	// refusal GitHub gave this header meanwhile ends it.
+	if granted, ok := s.git.granted(request, s.now()); !ok || granted != repository {
+		exchange.answered(gitRouteGitHub, gitGrantEnded, "while the mirror was refreshed")
 		s.relayGit(exchange, r, resp)
 
 		return

@@ -16,14 +16,16 @@ import (
 type recordingGitObserver struct {
 	mu        sync.Mutex
 	requests  []string
+	took      []time.Duration
 	refreshes []string
 	lookups   []string
 }
 
-func (o *recordingGitObserver) GitRequest(route, reason, status string, _ time.Duration) {
+func (o *recordingGitObserver) GitRequest(route, reason, status string, took time.Duration) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.requests = append(o.requests, route+" "+reason+" "+status)
+	o.took = append(o.took, took)
 }
 
 func (o *recordingGitObserver) GitRefresh(outcome string, _ time.Duration) {
@@ -134,6 +136,91 @@ func TestEachGitRequestIsCountedOnce(t *testing.T) {
 	slices.Sort(requests)
 	if expected := []string{"mirror served 2xx", "mirror served 2xx", "refused credentials_required 4xx"}; !slices.Equal(requests, expected) {
 		t.Fatalf("the three requests were counted as %v, want %v", requests, expected)
+	}
+	// A REFUSAL IS TIMED like any other request, from the handler's start.
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	for i, request := range observer.requests {
+		if observer.took[i] <= 0 {
+			t.Errorf("%q was counted as taking %s", request, observer.took[i])
+		}
+	}
+}
+
+// A GRANT THAT ENDS WHILE THE MIRROR IS REFRESHED is counted as ended, not as
+// a mirror that could not answer: the mirror worked, and GitHub answers the
+// advertisement.
+func TestAnAdvertisementWhoseGrantEndedIsCountedAsSuch(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, token := gitNode(t, upstream)
+	observer := &recordingGitObserver{}
+	service.SetGitObserver(observer)
+	withdraw := func() {
+		service.git.mu.Lock()
+		defer service.git.mu.Unlock()
+		for key, held := range service.git.authorised {
+			service.git.authorised[key] = gitAuthorisation{sequence: held.sequence + 1, at: held.at}
+		}
+	}
+	upstream.onMirrorFetch.Store(&withdraw)
+
+	advertise(t, node, token, "api")
+	requests := gitWithin(t, "the counted advertisement", func() []string {
+		for t.Context().Err() == nil {
+			if requests, _, _ := observer.seen(); len(requests) > 0 {
+				return requests
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		return nil
+	})
+	if want := []string{"github grant_ended 2xx"}; !slices.Equal(requests, want) {
+		t.Fatalf("the advertisement was counted as %v, want %v", requests, want)
+	}
+	if _, refreshes, _ := observer.seen(); !slices.Equal(refreshes, []string{gitRefreshOK}) {
+		t.Fatalf("the refresh was counted as %v, want one ok: the mirror worked", refreshes)
+	}
+}
+
+// A REFRESH CUT BY CLOSE IS COUNTED AS CLOSED, not as whatever its killed fetch
+// looked like: the proxy closes while the mirror's fetch is held at GitHub.
+func TestARefreshCutByCloseIsCountedAsClosed(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, token := gitNode(t, upstream)
+	observer := &recordingGitObserver{}
+	service.SetGitObserver(observer)
+	upstream.holdMirrorFetches(t)
+	fetching := make(chan struct{}, 1)
+	signal := func() {
+		select {
+		case fetching <- struct{}{}:
+		default:
+		}
+	}
+	upstream.onMirrorFetch.Store(&signal)
+
+	advertised := make(chan error, 1)
+	go func() { advertised <- advertiseErr(t.Context(), node, token, "api") }()
+	gitWithin(t, "the mirror's fetch reaching GitHub", func() struct{} {
+		<-fetching
+
+		return struct{}{}
+	})
+	gitWithin(t, "close", func() struct{} {
+		service.git.close()
+
+		return struct{}{}
+	})
+	if err := gitWithin(t, "the advertisement", func() error { return <-advertised }); err != nil {
+		t.Fatalf("the advertisement beside a closed refresh: %v", err)
+	}
+	if _, refreshes, _ := observer.seen(); !slices.Equal(refreshes, []string{gitRefreshClosed}) {
+		t.Fatalf("the refresh close cut was counted as %v, want one closed", refreshes)
 	}
 }
 
