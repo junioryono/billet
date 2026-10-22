@@ -60,16 +60,34 @@ if [ -z "$assets" ]; then
     exit 2
 fi
 
-# THE SIGNATURE AND THE NOTES TOO, before any ref is written: gh reads the notes
-# only once the tag exists, so a missing file there would leave the tag behind.
-for file in manifest.sigstore.json release-notes.md; do
+# THE SIGNATURE, THE NOTES AND THE SOURCE MANIFEST TOO, before any ref is written:
+# gh reads the notes only once the tag exists, so a missing file there would leave
+# the tag behind. image-sources.tsv is the image's /opt/billet/IMAGE_SOURCES.tsv,
+# which the gate held to what the image installed: every package, its source and
+# where apt could fetch it, which a release that redistributes GNU-licensed
+# packages has to say (#584).
+for file in manifest.sigstore.json release-notes.md image-sources.tsv; do
     if [ ! -r "$out/$file" ]; then
         printf 'the publication has no %s, so nothing is tagged or released\n' "$file" >&2
         exit 2
     fi
 done
 
-set -- "$out/manifest.json" "$out/manifest.sigstore.json"
+# THE SOURCE MANIFEST IS ITS HEADER AND ONE OR MORE COMPLETE ROWS: seven cells,
+# none empty. The gate compared this copy with the image's own; this refuses an
+# empty, truncated or reformatted file handed over in its place.
+#
+# A BAD ROW IS RECORDED, NOT EXITED ON: awk runs END after an exit in a rule, and
+# an END that exits again replaces the status.
+if ! awk -F '\t' '
+    NR == 1 { if ($0 != "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense") bad = 1; next }
+    { if (NF != 7) bad = 1; for (i = 1; i <= 7; i++) if ($i == "") bad = 1; rows++ }
+    END { exit (bad || rows == 0) ? 1 : 0 }' "$out/image-sources.tsv"; then
+    printf 'the publication'"'"'s image-sources.tsv is not a source manifest naming a package, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+
+set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv"
 
 while read -r name want; do
     # A BARE FILE NAME, CHECKED HERE TOO. The Go reader validates this before a

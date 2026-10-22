@@ -315,6 +315,9 @@ jobs:
 
           sudo chown "$(id -u):$(id -g)" "$WORK/$IMAGE_NAME.ext4"
 
+          # THE SOURCE MANIFEST THE IMAGE CARRIES, published beside it (#584).
+          cp "$WORK/image-sources.tsv" out/image-sources.tsv
+
           # THE DEFAULT WINDOW, DELIBERATELY. `--long=27` compresses a little
           # better and requires every DECOMPRESSOR to allocate a 128 MB window --
           # a constraint on every future reader, including Go libraries that cap
@@ -405,7 +408,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo scripts/check-guest-image.sh \
+          # SOURCES_EXPORT: the copy of the image's source manifest the release
+          # carries, which the gate holds to the image's own byte for byte.
+          sudo SOURCES_EXPORT="${{ github.workspace }}/out/image-sources.tsv" \
+            scripts/check-guest-image.sh \
             "$WORK/$IMAGE_NAME.ext4" \
             "${{ github.workspace }}/out/manifest.json"
 
@@ -441,6 +447,7 @@ jobs:
           path: |
             out/manifest.json
             out/release-notes.md
+            out/image-sources.tsv
             out/rootfs.img.zst*
             out/vmlinux-billet
           # SHORT, because these are hundreds of megabytes and the default is
