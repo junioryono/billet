@@ -479,7 +479,7 @@ func writeSourceArchive(t *testing.T, dir, index string, parts int) {
 
 	list := fmt.Sprintf("image-sources.tar %s %d\n", digest(string(archive)), len(archive))
 	write := func(name string, body []byte) {
-		if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
@@ -570,7 +570,7 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 		if changed == string(body) {
 			t.Fatalf("the edit left %s unchanged", name)
 		}
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(changed), 0o600); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(dir, name), []byte(changed), 0o600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -646,7 +646,7 @@ func TestGuestReleasePublisherHoldsTheSourceArchiveWhole(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(dir, "elsewhere.tar"), body, 0o600); err != nil {
+				if err := forkSafeWriteFile(filepath.Join(dir, "elsewhere.tar"), body, 0o600); err != nil {
 					t.Fatal(err)
 				}
 				removeAll(t, filepath.Join(dir, "image-sources.tar"))

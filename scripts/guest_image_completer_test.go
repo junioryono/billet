@@ -59,14 +59,14 @@ func newCompleterFixture(t *testing.T) completerFixture {
 		}
 	}
 	for _, leftover := range []string{"var/lib/apt/lists/archive_ubuntu_dists", "tmp/download", "opt/billet/bin/billet"} {
-		if err := os.WriteFile(filepath.Join(fx.root, leftover), []byte("x\n"), 0o755); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(fx.root, leftover), []byte("x\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	copyScript := func(from, to string, mode os.FileMode) {
 		body := readScriptFile(t, from)
-		if err := os.WriteFile(to, []byte(body), mode); err != nil {
+		if err := forkSafeWriteFile(to, []byte(body), mode); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -90,17 +90,17 @@ func newCompleterFixture(t *testing.T) completerFixture {
 			body += "echo " + variable + " >>" + fx.environment + "\n"
 		}
 		body += "echo EARLIER=$(basename \"$0\") >>" + fx.environment + "\nexit 0\n"
-		if err := os.WriteFile(filepath.Join(fx.complete, "scripts", "build", script), []byte(body), 0o755); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(fx.complete, "scripts", "build", script), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	invoke := "#!/bin/sh\necho \"invoke_tests $*\" >>" + fx.calls + "\n[ -e \"" + dir + "/fail-tests-$1\" ] && exit 1\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(fx.complete, "scripts", "helpers", "invoke-tests.sh"), []byte(invoke), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fx.complete, "scripts", "helpers", "invoke-tests.sh"), []byte(invoke), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	apt := "#!/bin/sh\necho \"apt-get $*\" >>" + fx.calls + "\n[ -e \"" + dir + "/fail-apt-$1\" ] && exit 100\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(dir, "browsers", "apt-get"), []byte(apt), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, "browsers", "apt-get"), []byte(apt), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	for name, version := range map[string]string{
@@ -110,21 +110,21 @@ func newCompleterFixture(t *testing.T) completerFixture {
 		"firefox":        "Mozilla Firefox 144.0",
 	} {
 		body := "#!/bin/sh\n[ -e \"" + dir + "/garble-" + name + "\" ] && { echo 'not a version!'; exit 0; }\necho '" + version + "'\n"
-		if err := os.WriteFile(filepath.Join(dir, "browsers", name), []byte(body), 0o755); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(dir, "browsers", name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(fx.root, "usr", "local", "lib", "android", "sdk", "cmdline-tools", "latest",
+	if err := forkSafeWriteFile(filepath.Join(fx.root, "usr", "local", "lib", "android", "sdk", "cmdline-tools", "latest",
 		"source.properties"), []byte("Pkg.Desc=Android SDK Command-line Tools\nPkg.Revision=19.0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fx.root, "opt", "hostedtoolcache", "CodeQL", "2.23.3", "x64", "codeql", "codeql"),
+	if err := forkSafeWriteFile(filepath.Join(fx.root, "opt", "hostedtoolcache", "CodeQL", "2.23.3", "x64", "codeql", "codeql"),
 		[]byte("#!/bin/sh\necho 2.23.3\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	environment := "PATH=\"" + fx.bin + ":" + filepath.Join(dir, "browsers") + ":/usr/bin:/bin\"\nImageOS=ubuntu24\n"
-	if err := os.WriteFile(fx.environment, []byte(environment), 0o644); err != nil {
+	if err := forkSafeWriteFile(fx.environment, []byte(environment), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -244,7 +244,7 @@ func TestTheCompleterReportsEachFailureByComponent(t *testing.T) {
 
 			fx := newCompleterFixture(t)
 			if tc.marker != "" {
-				if err := os.WriteFile(filepath.Join(fx.dir, tc.marker), nil, 0o600); err != nil {
+				if err := forkSafeWriteFile(filepath.Join(fx.dir, tc.marker), nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -278,7 +278,7 @@ func TestTheCompleterFailsEverythingWhenTheJobEnvironmentCannotBeWritten(t *test
 	t.Parallel()
 
 	fx := newCompleterFixture(t)
-	if err := os.WriteFile(fx.environment, []byte("PATH=\""+filepath.Join(fx.dir, "browsers")+":/usr/bin:/bin\"\n"), 0o644); err != nil {
+	if err := forkSafeWriteFile(fx.environment, []byte("PATH=\""+filepath.Join(fx.dir, "browsers")+":/usr/bin:/bin\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if output, err := fx.run(t, true, "google-chrome", "firefox"); err != nil {
@@ -322,7 +322,7 @@ func TestTheCompleterInstallsWhatGitHubsOrderGivesTheBrowsers(t *testing.T) {
 			}
 
 			fx = newCompleterFixture(t)
-			if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-install"), nil, 0o600); err != nil {
+			if err := forkSafeWriteFile(filepath.Join(fx.dir, "fail-apt-install"), nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if output, err := fx.run(t, true, browser, "codeql"); err != nil {
@@ -348,7 +348,7 @@ func TestTheCompleterFailsEverythingWhenTheFinishFails(t *testing.T) {
 	t.Parallel()
 
 	fx := newCompleterFixture(t)
-	if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-clean"), nil, 0o600); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fx.dir, "fail-apt-clean"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if output, err := fx.run(t, true, "google-chrome", "firefox"); err != nil {
@@ -366,7 +366,7 @@ func TestTheCompleterFailsEverythingWhenAptCannotUpdate(t *testing.T) {
 	t.Parallel()
 
 	fx := newCompleterFixture(t)
-	if err := os.WriteFile(filepath.Join(fx.dir, "fail-apt-update"), nil, 0o600); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fx.dir, "fail-apt-update"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if output, err := fx.run(t, true, "google-chrome", "codeql"); err != nil {

@@ -63,7 +63,7 @@ func newTrialFixture(t *testing.T) trialFixture {
 		"else echo \"installed=$name 1.2.3\" >\"$BILLET_COMPLETION_REPORT\"; fi\n"+
 		// THE DISK SHRINKS AGAIN, as a completer cleaning up does: the peak is what counts.
 		"echo $(( $(cat "+fx.used+") - grow / 2 )) >"+fx.used+".new && mv "+fx.used+".new "+fx.used+"\n")
-	if err := os.WriteFile(fx.used, []byte("1000000000\n"), 0o600); err != nil {
+	if err := forkSafeWriteFile(fx.used, []byte("1000000000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -108,10 +108,10 @@ func TestATrialCompletionMeasuresEachComponentOnItsOwnCopy(t *testing.T) {
 	t.Parallel()
 
 	fx := newTrialFixture(t)
-	if err := os.WriteFile(filepath.Join(fx.dir, "grow-android-sdk"), []byte("8000000000\n"), 0o600); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fx.dir, "grow-android-sdk"), []byte("8000000000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fx.dir, "grow-codeql"), []byte("1000\n"), 0o600); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fx.dir, "grow-codeql"), []byte("1000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := fx.run(t); err != nil {
@@ -159,7 +159,7 @@ func TestATrialCompletionRefusesWhatItCannotProve(t *testing.T) {
 			t.Parallel()
 
 			fx := newTrialFixture(t)
-			if err := os.WriteFile(filepath.Join(fx.dir, tc.marker), nil, 0o600); err != nil {
+			if err := forkSafeWriteFile(filepath.Join(fx.dir, tc.marker), nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			out, err := fx.run(t)
@@ -174,7 +174,7 @@ func TestATrialCompletionRefusesWhatItCannotProve(t *testing.T) {
 
 	fx := newTrialFixture(t)
 	stuck := filepath.Join(fx.dir, "work", "trial", "merged", "dev")
-	if err := os.WriteFile(filepath.Join(fx.dir, "stuck"), []byte(stuck+"\n"), 0o600); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fx.dir, "stuck"), []byte(stuck+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	out, err := fx.run(t)
@@ -190,7 +190,7 @@ func TestUnmountUnderTakesDownOnlyWhatIsUnderTheDirectory(t *testing.T) {
 
 	fx := newTrialFixture(t)
 	mounts := "/w/trial/lower\n/w/trial/merged\n/w/trial/merged/proc\n/w/trial-other\n/elsewhere\n"
-	if err := os.WriteFile(fx.mounts, []byte(mounts), 0o600); err != nil {
+	if err := forkSafeWriteFile(fx.mounts, []byte(mounts), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	calls := filepath.Join(fx.dir, "calls")
