@@ -126,6 +126,80 @@ func TestAFileDigestIsRecomputedWhenTheFileChanges(t *testing.T) {
 	}
 }
 
+// A LINK MADE WHILE A FILE IS READ IS NOT A CHANGE, and a write is. Every launch
+// links the guest kernel into its jail, which moves the inode's change time; on the
+// reference node eight of ten concurrent restores were refused for it (2026-10-22).
+func TestALinkMadeWhileAFileIsDigestedIsNotAChange(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		change  func(t *testing.T, path string)
+		refused bool
+	}{
+		{"a hard link, as a launch makes", func(t *testing.T, path string) {
+			t.Helper()
+
+			if err := os.Link(path, path+".jailed"); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"a write of more bytes", func(t *testing.T, path string) {
+			t.Helper()
+
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			if _, err := f.WriteString(" and more"); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a rewrite of the same size, later", func(t *testing.T, path string) {
+			t.Helper()
+
+			if err := os.WriteFile(path, []byte("kernel 2"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			later := time.Now().Add(time.Minute)
+			if err := os.Chtimes(path, later, later); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "vmlinux")
+			if err := os.WriteFile(path, []byte("kernel 1"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			d := fileDigests{afterRead: func() { tc.change(t, path) }}
+
+			got, err := d.of(path)
+			if tc.refused {
+				if err == nil || !strings.Contains(err.Error(), "changed while it was being read") {
+					t.Fatalf("of = %q, %v, want it refused as changed while it was read", got, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("of: %v, want the digest of the bytes read", err)
+			}
+
+			if want := digestOf("kernel 1"); got != want {
+				t.Errorf("of = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
 // A SNAPSHOT TAKEN ANYWHERE ELSE IS REFUSED BEFORE IT IS LOADED: each field of the
 // record that differs from this host, and a record that is missing, of another
 // format, or not a record at all. Nothing is linked and the VMM is never asked to load.

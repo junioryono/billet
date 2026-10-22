@@ -58,3 +58,15 @@ Batches of 1, 5 and 10 forks ran concurrently, after the snapshot had aged about
 - **The memory file.** A golden's memory file can reach a jail exactly as the kernel does, by a root-owned, read-only hard link, with no bind mount. Rebuilds must write new files and rename, never rewrite one in place, because a running fork depends on the inode.
 
 Not measured here: an application stack's readiness after restore, the restore barrier itself, a suspension's crash matrix, home isolation, fork copying, the compatibility refusal and admission. Those need the implementation.
+
+## Through billet's provider, 2026-10-22
+
+The 2026-10-16 measurements above drove Firecracker by hand. This is the same primitive through billet's provider on the reference deployment's Firecracker node (`ubuntu-01`: 128 hardware threads, 499 GiB, Ceph 20.2.3, Firecracker v1.16.1, guest kernel 6.1.155), with production jobs running beside it (load average 37 to 58): `TestRealFirecrackerRestoresAGoldenAsManyForks` (#508, item 4) captures a 2 vCPU, 1 GiB guest of the `ubuntu-2404-x64` runner image once and restores it in concurrent batches, each fork through `Restore` with the evidence the capture answered, in its own jail with its own uid and tap, from the one published memory file, on its own clone of the golden's system disk. Times are from `Restore` being called to the VMM running, and include claiming the jail, the RBD clone and map, linking the snapshot and the load.
+
+| Batch | Run 1: batch, median fork | Run 2: batch, median fork |
+|---|---|---|
+| 1 fork | 0.88 s | 1.05 s |
+| 5 forks | 0.54 s, 0.51 s | 3.03 s, 1.90 s |
+| 10 forks | 1.31 s, 1.09 s | 1.95 s, 1.76 s |
+
+The spread between runs follows the node's production load and the cluster's, not the batch size: a single capture-and-restore run within the same hour took 4.3 s to capture and 0.44 s to restore, and another 9.2 s and 1.79 s while a clone took 5.2 s against 0.4 s. The first run of this test also found a defect, since fixed: every launch hard-links the guest kernel into its jail, which moves the kernel's change time, and the digest of the kernel a restore checks was refused as changed while it was read, so 8 of 10 concurrent restores failed. Go's SHA-256 ran at 1.4 to 1.5 GB/s on this node's EPYC 7713 from memory, which is why a restore checks the published record against its evidence rather than digesting the memory again.
