@@ -44,25 +44,28 @@ apt-get update -qq
 apt-get install -y -qq build-essential flex bison libelf-dev libssl-dev bc dwarves cpio >/dev/null
 
 cd "$WORK"
-V="${KERNEL_VERSION:-6.1.155}"
 
-# THE CHECKSUM OF THE KERNEL THIS BUILDS, taken from kernel.org's sha256sums.asc.
+# THE KERNEL THIS BUILDS AND ITS CHECKSUM, taken from kernel.org's sha256sums.asc,
+# in scripts/kernel/linux.pin: one line, version and sha256. The release workflow
+# reads the same line to publish this tarball as the kernel's corresponding source
+# (#584), so the two can never name different kernels.
 #
 # PINNED RATHER THAN FETCHED ALONGSIDE THE TARBALL, because a checksum downloaded
 # over the same connection from the same host proves only that the two agree. This
 # is the kernel every guest boots, so it is worth a line in the repository.
+read -r PINNED_VERSION PINNED_SHA256 <"$REPO_ROOT/scripts/kernel/linux.pin"
+V="${KERNEL_VERSION:-$PINNED_VERSION}"
 KERNEL_SHA256="${KERNEL_SHA256:-}"
 
 if [ -z "$KERNEL_SHA256" ]; then
-  case "$V" in
-    6.1.155) KERNEL_SHA256=c29387aeee085fbcbd91236224b9df805063bac43615e75cea2c6b29604a5c73 ;;
-    *)
-      echo "no pinned checksum for kernel $V. Take it from" >&2
-      echo "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc and either add it" >&2
-      echo "here or pass KERNEL_SHA256; this refuses to build an unverified kernel." >&2
-      exit 1
-      ;;
-  esac
+  if [ "$V" != "$PINNED_VERSION" ] || [ -z "$PINNED_SHA256" ]; then
+    echo "no pinned checksum for kernel $V. Take it from" >&2
+    echo "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc and either pin it" >&2
+    echo "in scripts/kernel/linux.pin or pass KERNEL_SHA256; this refuses to build an" >&2
+    echo "unverified kernel." >&2
+    exit 1
+  fi
+  KERNEL_SHA256=$PINNED_SHA256
 fi
 
 [ -d "linux-$V" ] || {

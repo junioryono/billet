@@ -30,6 +30,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The gate refuses an image that carries any of the five, and one without its completer or a manifest that declares them (#584).**
 - **The gate refuses an image that ships a tool without the license text the tool's license asks for (#584).**
 - **The source manifest is written while apt still has its lists, and the gate holds it to exactly what dpkg installed (#584).**
+- **Every guest release carries the corresponding source of what it redistributes under a GNU license, fetched at each exact version from where that version is kept (ADR-019).**
 - **Two halves of a gate before an image is published.**
 
 ### Publication, verification and pulling: [references/publication-and-pull.md](references/publication-and-pull.md)
