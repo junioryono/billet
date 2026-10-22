@@ -7,7 +7,7 @@
 // it for a CI gate would be the tail wagging the dog.
 //
 // Because it is a nested module, `go test ./...` from the repository root does
-// NOT reach the analyzers' own tests. Run them explicitly -- `make lint-custom`
+// NOT reach the analyzers' own tests. Run them explicitly -- `scripts/gates/lint-custom.sh`
 // does both halves, and CI runs the same target. Without that, an analyzer could
 // silently stop detecting anything and still report zero violations, which reads
 // exactly like a clean tree.

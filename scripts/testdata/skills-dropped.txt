@@ -123,4 +123,34 @@ d02ede176458 #127 now proves every node stop by the node's ending, the retiremen
 dffafcd4ce59 #127 now proves each node stop the role and the command perform by the node's ending; the sentence says it establishes the guarantee.
 b56657d3069e The images row gained `accept`, the components whose licenses a deployment accepts (#584); the row is otherwise unchanged.
 301e180e7feb An idle launch runner is no longer retired by a runner-less cancellation: the cancellation detaches it and the pool retires it, reinstating it busy when GitHub refuses its removal as running a job (#598); the sentence now ends at the job being marked finished and the next ones state that.
+03d258ac46b3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+082196a51ca3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+123d243341e8 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+1918e5ba469e The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+389dbc9f4136 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+58cb19d9a4c7 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+5e05b036b84f The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+5ebaeff24460 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+621ba627f213 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+63d139b6c793 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+672332008c0d The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+6d8589f81c50 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+75f1946d9ac7 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+790477238a7a The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+83468ce13d82 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+9398be8d2fc7 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+96132ed54604 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+9bc1a2a17663 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+9ecda6f7cd45 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+acdac2040cd6 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+afb67a1c721d The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+b2e778352c18 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+c988a633c788 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+d008423aaa5b The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+d12446e2e960 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+d6c1cc3aa66f The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+de65ee2d5832 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+e29c5205f066 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+f2b09ff92300 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+1c37e966cf7d The Makefile is gone (#78); the scenario tests run through scripts/gates/scenario.sh NAME, and the rule says so.
 e1d3650f30ef #93 records a runner's owner on the lease and the binding when it is minted, and the plane resolves removal and recovery from it; the gap is closed and the sentence now states the rule and what an unrecorded runner still does.

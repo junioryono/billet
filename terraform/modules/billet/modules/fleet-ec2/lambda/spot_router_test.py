@@ -428,7 +428,7 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
         self.assertEqual(spot_router.QUEUE_NAMES_ENV, "BILLET_INTERRUPTION_QUEUE_NAMES")
 
         # ...and this one catches spot.tf losing the variable on a machine with no
-        # terraform, which is where `make lambda-test` runs. It cannot say WHERE the
+        # terraform, which is where `scripts/gates/lambda-test.sh` runs. It cannot say WHERE the
         # name sits — a regex written to re-derive that only invents ways to fail on
         # valid HCL (a comment above `variables`, a one-line map, a brace inside a
         # heredoc), and the plan test already knows.

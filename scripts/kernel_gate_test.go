@@ -264,7 +264,7 @@ func TestTheVendoredKernelCheckerMatchesItsPin(t *testing.T) {
 }
 
 // THE CONFIG IN THE REPOSITORY PASSES ITS OWN GATE. This is the cheap half of the
-// release check, running at every `make check` instead of once a week: the base
+// release check, running at every `scripts/gates/check.sh` instead of once a week: the base
 // config is what a version bump starts from, and an option dropped from it would
 // otherwise be found by a kernel build an hour into a Monday morning.
 func TestTheCommittedKernelConfigSatisfiesEveryRequiredBuiltIn(t *testing.T) {
