@@ -127,6 +127,7 @@ b56657d3069e The images row gained `accept`, the components whose licenses a dep
 63530ec575db #183: macos_node drains only when billet node config-change says the node reads the change; fleet-and-connectors.md restates the order with the verdict between the check and the drain.
 82c3625c88c9 #183: a change only the control plane reads (tiers or nodes: alone) is installed without a drain; the rule now says a change the node reads is a drain.
 1911dca723a8 #183 added billet join accept, a third writer of billet.yaml (an in-place merge through the same writer as github-app create --config); the rule now counts three writers and a fourth that writes a directory.
+da96fb8352a7 ADR-018 (2026-10-21): GitHub serves an object no ref reaches by name, so the Git proxy serves any object a repository's mirror holds, falls back to GitHub on anything it cannot do, and refreshes off the request path; build-caches.md restates the rule.
 03d258ac46b3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 082196a51ca3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 123d243341e8 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.

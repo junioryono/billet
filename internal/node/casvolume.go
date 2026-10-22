@@ -344,8 +344,15 @@ func (s *CacheService) serveCAS(
 // that cannot move its deadlines (a test's recorder) keeps them, bounded by the
 // context all the same; any other refusal is a connection already gone.
 func extendTransfer(ctx context.Context, w http.ResponseWriter) (context.Context, context.CancelFunc, error) {
+	return extendTransferFor(ctx, w, casRequestLife)
+}
+
+// extendTransferFor is extendTransfer for a transfer that may last life.
+func extendTransferFor(
+	ctx context.Context, w http.ResponseWriter, life time.Duration,
+) (context.Context, context.CancelFunc, error) {
 	controller := http.NewResponseController(w)
-	deadline := time.Now().Add(casRequestLife)
+	deadline := time.Now().Add(life)
 	for _, extend := range []func(time.Time) error{controller.SetReadDeadline, controller.SetWriteDeadline} {
 		if err := extend(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
 			return nil, nil, fmt.Errorf("extend the transfer's deadline: %w", err)
