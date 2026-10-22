@@ -129,6 +129,12 @@ jobs:
           restore-keys: |
             go-race-cover-${{ hashFiles('go.sum') }}-
 
+      # AN INTERRUPTED MUTATION RUN CANNOT BE COMMITTED: a `.bak` beside a
+      # tracked file means the run left the ORIGINAL holding a mutant, which
+      # compiles and mostly passes, so every other gate would be happy to say so.
+      - name: Refuse a mutant an interrupted mutation run left behind
+        run: python3 scripts/check-no-mutants.py
+
       - name: Verify modules are tidy
         run: |
           go mod tidy
@@ -464,14 +470,27 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # THE PINNED TOOL VERSIONS, from the one file every gate reads.
+      - name: Load the pinned tool versions
+        run: grep -E '^[A-Z_]+=' .github/tool-versions.env >> "$GITHUB_ENV"
+
       - name: gofmt
-        run: make fmt-check
+        run: scripts/gates/fmt-check.sh
 
       - uses: golangci/golangci-lint-action@v9
         with:
           # Pinned, not `latest`: a linter that changes under you turns an
           # unrelated PR red and trains people to ignore the signal.
-          version: v2.12.2
+          version: ${{ env.GOLANGCI_VERSION }}
+          # NO RESTORED ANALYSIS CACHE. On 2026-10-21 every lint run whose key
+          # matched one restored cache entry exactly reported staticcheck SA5011
+          # (a nil dereference after `if x == nil { t.Fatal(...) }`) in 16 to 60
+          # untouched places, as if testing.T.Fatal could return, while every run
+          # that restored the same entry by prefix found 0 issues; the same tree
+          # linted clean on a test host with an empty cache. A gate whose verdict
+          # depends on which cache entry it restored is no gate, so the analysis
+          # runs whole every time (about five minutes rather than two).
+          skip-cache: true
 
       # billet's own analyzers, plus the tests that prove they still detect
       # anything. The second half is not optional: tools/lint is a nested module,
@@ -479,27 +498,30 @@ jobs:
       # suites — and an analyzer that silently stopped detecting would still
       # report zero violations, which reads exactly like a clean tree.
       - name: Run billet's own analyzers
-        run: make lint-custom
+        run: scripts/gates/lint-custom.sh
 
       # Every platform a node runs on, in one job rather than three: nodes are
       # deployed by copying one static file, and a build-tag mistake shows up
-      # here before it does on a Mac mini. `make cross` is the loop a developer
-      # runs, so the two cannot disagree about the target list.
+      # here before it does on a Mac mini. scripts/gates/cross.sh is the loop a
+      # developer runs, so the two cannot disagree about the target list.
       - name: Build every platform a node can run on
-        run: make cross
+        run: scripts/gates/cross.sh
 
       # The committed query code must be what sqlc produces from the query files
       # AND the migrations, because sqlc reads the migration history rather than
       # a flattened schema, so adding a migration can change generated code. The
       # generated code is committed precisely so an ordinary build never
-      # downloads sqlc, which is why this is a CI step and not part of `make
-      # check`. The version is pinned exactly and read from the Makefile, the way
-      # golangci-lint and goreleaser are: `@latest` would mean a new sqlc release
-      # fails an unrelated PR that touched no SQL.
+      # downloads sqlc, which is why this is a CI step and not part of
+      # scripts/gates/check.sh. The version is pinned exactly in
+      # .github/tool-versions.env, the way golangci-lint and goreleaser are:
+      # `@latest` would mean a new sqlc release fails an unrelated PR that
+      # touched no SQL. `sqlc diff` writes nothing and exits 1 on drift
+      # (measured). It cannot see a generated file ORPHANED by a deleted query,
+      # because sqlc never removes output; TestEveryGeneratedQueryIsNamedInASourceFile
+      # covers that direction.
       - name: Prove the committed queries are what sqlc generates
         run: |
-          version=$(make --no-print-directory print-sqlc-version)
-          go install "github.com/sqlc-dev/sqlc/cmd/sqlc@$version"
+          go install "github.com/sqlc-dev/sqlc/cmd/sqlc@$SQLC_VERSION"
           sqlc diff
 
       # A control plane that holds a GitHub App key and terminates TLS should
@@ -523,7 +545,7 @@ jobs:
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      # The whole history, for `make module-sources`: see the test job.
+      # The whole history, for scripts/check-module-sources.sh: see the test job.
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -533,12 +555,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Version pinned exactly, the way golangci-lint is, and read from the
-      # Makefile so the gate and `make tools` cannot drift to two goreleasers.
+      # THE PINNED TOOL VERSIONS, from the one file every gate reads.
+      - name: Load the pinned tool versions
+        run: grep -E '^[A-Z_]+=' .github/tool-versions.env >> "$GITHUB_ENV"
+
+      # Version pinned exactly, the way golangci-lint is, in the file
+      # scripts/gates/tools.sh installs from, so the two cannot drift to two
+      # goreleasers.
       - name: Validate the release config
         run: |
-          version=$(make --no-print-directory print-goreleaser-version)
-          go install "github.com/goreleaser/goreleaser/v2@$version"
+          go install "github.com/goreleaser/goreleaser/v2@$GORELEASER_VERSION"
           goreleaser check
 
       # `terraform/` was in no release for months and nothing said so: it simply
@@ -547,11 +573,11 @@ jobs:
       # documented source names a version and that git carries the path it
       # names; `cut-release.yml` runs the same script with the tag.
       #
-      # HERE RATHER THAN ONLY IN `make check`: CI runs build/vet/test/lint
-      # individually rather than the composite target, so a gate added to
-      # `check` alone runs on nobody's machine but the author's.
+      # HERE RATHER THAN ONLY IN scripts/gates/check.sh: CI runs
+      # build/vet/test/lint individually rather than the composite gate, so a
+      # gate added to check.sh alone runs on nobody's machine but the author's.
       - name: Prove every documented Terraform module source is pinnable
-        run: make module-sources
+        run: scripts/check-module-sources.sh
 
   # One Python script over the shards' reports: nothing here compiles.
   retirement-selection:
@@ -580,6 +606,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+      - name: Sample what this job uses of its runner
+        continue-on-error: true
+        run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -595,14 +624,35 @@ jobs:
           path: ${{ runner.temp }}/gate-binaries
           if-no-files-found: error
           retention-days: 1
+      - name: Report what this job used of its runner
+        if: always()
+        continue-on-error: true
+        run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" gate-binaries
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: ci-usage-gate-binaries
+          path: ${{ runner.temp }}/ci-usage/usage.json
+          if-no-files-found: ignore
 
   host-lifecycle:
     needs: [changes, gate-binaries]
     if: needs.changes.outputs.host_lifecycle == 'true'
-    # Every group compiles billet at least once except retirement-node-shape,
-    # which runs the shard checker and four plays, so it alone takes the small
-    # runner; the others hold the 8 vCPU one until a measured run says otherwise.
-    runs-on: ${{ matrix.group == 'retirement-node-shape' && 'billet-2vcpu-ubuntu-2404' || 'billet-8vcpu-ubuntu-2404' }}
+    # EVERY GROUP ON THE 2 vCPU RUNNER, FROM WHAT EACH MEASURABLY USES (#155).
+    # The groups run Ansible one case at a time on binaries gate-binaries built,
+    # so on the 8 vCPU runner (31 GiB) each used about one core: 0.76 to 1.29
+    # cores on average, a peak of 1.3 (3.4 in retirement-resume) and at most
+    # 1.4 GiB held, guard and retirement-parity-network included (run
+    # 39539367492, 2026-10-21, ci-usage-<group>). policy alone peaks at 7.7
+    # cores, compiling two test binaries for its real-systemd step, a few
+    # minutes of its eighteen. A 2 vCPU runner reserves a quarter of the vCPU
+    # and memory, and the fleet runs out of memory first. On it (run
+    # 39566892000, 2026-10-21) every group passed, none peaked above 2.0 cores
+    # or 1.9 GiB, policy took 22.6 minutes against 17.9, and the longest group,
+    # retirement-parity-network, took 32.0 against 31.9. ci-usage reports each
+    # group's use on every run, so a group that outgrows its runner shows there.
+    runs-on: billet-2vcpu-ubuntu-2404
     # The former retirement group reached 36 minutes before request coverage
     # on 46fcafa (2026-09-14). Partition its parser, routes, compatibility,
     # retained continuation, recovery and 3c settled callers. The 64 request
@@ -640,6 +690,15 @@ jobs:
         shell: env -u RUNNER_NAME bash -e {0}
     steps:
       - uses: actions/checkout@v6
+
+      # WHAT EACH GROUP USES OF ITS RUNNER, which is what its size is chosen
+      # from (#155): busy cores and held memory, sampled every five seconds and
+      # reported in the job's summary and the ci-usage-<group> artifact. A
+      # measurement, never a gate: the script exits 0 whatever it finds, and
+      # each of its steps continues on error, the upload included.
+      - name: Sample what this group uses of its runner
+        continue-on-error: true
+        run: scripts/ci-usage.sh start "$RUNNER_TEMP/ci-usage"
 
       - uses: actions/setup-python@v6
         with:
@@ -729,39 +788,39 @@ jobs:
 
       - name: Exercise alert ownership migration and teardown
         if: matrix.group == 'shape'
-        run: make alert-lifecycle
+        run: scripts/gates/scenario.sh alert-lifecycle
 
       - name: Exercise development-host check mode
         if: matrix.group == 'shape'
-        run: make development-check-mode
+        run: scripts/gates/scenario.sh development-check-mode
 
       - name: Guard transactional host-upgrade ordering
         if: matrix.group == 'shape'
-        run: make host-upgrade-order
+        run: scripts/gates/scenario.sh host-upgrade-order
 
       # The node drains before it restarts and the drain has no bound, so the
       # role hands the restart to systemd and polls for a new main process.
       # This drives that task file against a scripted systemctl.
       - name: Prove the node restart is polled rather than awaited
         if: matrix.group == 'shape'
-        run: make node-restart-check
+        run: scripts/gates/scenario.sh node-restart-check
 
       - name: Pin the fail-closed ledger mount units
         if: matrix.group == 'shape'
-        run: make ledger-mount-render
+        run: scripts/gates/scenario.sh ledger-mount-render
 
       # billet ships its units twice — the package installs deploy/*.service,
       # the role renders its own templates — and nothing compared them until
       # this. Hardening one and forgetting the other is the failure it catches.
       - name: Prove the packaged units and the role's templates agree
         if: matrix.group == 'shape'
-        run: make unit-parity
+        run: scripts/gates/scenario.sh unit-parity
 
       # An unattended library upgrade restarted billet-node through needrestart,
       # and a node's stop is a drain with no time limit. Escalated, as the role is.
       - name: Prove the host role keeps needrestart from restarting billet's services
         if: matrix.group == 'shape'
-        run: make needrestart-check
+        run: scripts/gates/scenario.sh needrestart-check
 
       # The PostgreSQL ledger shipped and the role read
       # server.state_dir, which such a config does not have — so every one of
@@ -769,14 +828,14 @@ jobs:
       # mounted somewhere the control plane does not use.
       - name: Prove the host role converges a PostgreSQL deployment
         if: matrix.group == 'shape'
-        run: make postgres-profile
+        run: scripts/gates/scenario.sh postgres-profile
 
       # The runner itself is the fresh host: no billet account, binary or
       # units. The packaged postinstall pre-creates the account everywhere
       # else, so this is the one place CI sees an operator's first dry run.
       - name: Dry-run the host role against a fresh machine
         if: matrix.group == 'shape'
-        run: make host-fresh-check
+        run: scripts/gates/scenario.sh host-fresh-check
 
       # The seam between the two suites: the Go tests prove the emission is a
       # correct CONFIG and the Ansible tests feed the role a config written by
@@ -784,7 +843,7 @@ jobs:
       # REFUSES. This puts a generated block through the real role.
       - name: Converge the host role with a generated block
         if: matrix.group == 'roles'
-        run: make emitted-block-check
+        run: scripts/gates/scenario.sh emitted-block-check
 
       # And the EXAMPLE a stranger copies, with a block generated the way its
       # README instructs. emitted-block-check converges the role with both
@@ -792,7 +851,7 @@ jobs:
       # that requires the App key.
       - name: Converge the shipped example with a generated block
         if: matrix.group == 'shape'
-        run: make example-check
+        run: scripts/gates/scenario.sh example-check
 
       # The other example, as far as a runner without /dev/kvm or a Ceph cluster
       # can take it: that the role ACCEPTS a firecracker emission. That is the
@@ -800,7 +859,7 @@ jobs:
       # rendering anything, which neither test suite could see.
       - name: Accept a firecracker emission through the role
         if: matrix.group == 'shape'
-        run: make firecracker-example-check
+        run: scripts/gates/scenario.sh firecracker-example-check
 
       # Both gates above carry the key path the role owns, so neither reaches
       # the half of the policy that governs a key the role does NOT manage —
@@ -808,7 +867,7 @@ jobs:
       # cases directly.
       - name: Prove the GitHub App key policy on both paths
         if: matrix.group == 'roles'
-        run: make key-policy-check
+        run: scripts/gates/scenario.sh key-policy-check
 
       # No other suite names a version, so none of them reaches binary.yml —
       # delete it and they all stay green. This also asks the release origin
@@ -826,14 +885,14 @@ jobs:
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
           BILLET_GATE_SKIP: endpoint,retirement
-        run: make converge-guard-check
+        run: scripts/gates/scenario.sh converge-guard-check
 
       - name: Prove the endpoint decision, migration and receipt entries
         if: matrix.group == 'endpoint'
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
           BILLET_GATE_ONLY: endpoint
-        run: make converge-guard-check
+        run: scripts/gates/scenario.sh converge-guard-check
 
       - name: Prove the selected retirement route or request section
         if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation", "retirement-request-retained"]'), matrix.group)
@@ -843,7 +902,7 @@ jobs:
           BILLET_GATE_SKIP: ${{ !startsWith(matrix.group, 'retirement-request-') && 'retirement-request' || '' }}
           BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled","retirement-parity-basic":"parity-basic","retirement-parity-network":"parity-network","retirement-parity-negative":"parity-negative","retirement-resume":"resume","retirement-request-evidence":"request-evidence","retirement-request-collection":"request-collection","retirement-request-windows":"request-windows","retirement-request-cancellation":"request-cancellation","retirement-request-retained":"request-retained"}')[matrix.group] }}
           BILLET_RETIREMENT_REPORT: ${{ runner.temp }}/retirement-selection.json
-        run: make converge-guard-check
+        run: scripts/gates/scenario.sh converge-guard-check
 
       - name: Record the completed retirement case inventory
         if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation", "retirement-request-retained"]'), matrix.group)
@@ -855,18 +914,18 @@ jobs:
 
       - name: Prove retirement shard coverage
         if: matrix.group == 'retirement-node-shape'
-        run: make retirement-shard-check
+        run: python3 scripts/check-retirement-shards.py
 
       - name: Prove retained ordinary operands and drift
         if: matrix.group == 'retirement-node-shape'
-        run: make retirement-node-shape
+        run: scripts/gates/scenario.sh retirement-node-shape
 
       # The ssh_access role's whole value is one refusal, and no other suite
       # configures a key, so every other gate takes its "nothing configured"
       # branch. This runs the refusals and the install against a fake sshd.
       - name: Prove the ssh_access role refuses to lock a host out
         if: matrix.group == 'roles'
-        run: make ssh-access-check
+        run: scripts/gates/scenario.sh ssh-access-check
 
       # The two connector roles are the host half of the documented reaching
       # routes, and no other suite sets a token, so every refusal in them could
@@ -874,35 +933,35 @@ jobs:
       # record every call, including that a token reaches no argv.
       - name: Prove the cloudflared connector role
         if: matrix.group == 'roles'
-        run: make cloudflared-connector-check
+        run: scripts/gates/scenario.sh cloudflared-connector-check
 
       - name: Prove the WARP connector role
         if: matrix.group == 'roles'
-        run: make warp-connector-check
+        run: scripts/gates/scenario.sh warp-connector-check
 
       # No other suite gives a Mac a billet_config, so the macos_node role's
       # order (check, drain, replace, up) and its refusals are proved here only.
       - name: Prove the macos_node role
         if: matrix.group == 'roles'
-        run: make macos-node-check
+        run: scripts/gates/scenario.sh macos-node-check
 
       # The fleet playbook runs ssh_access before the host role, so the role's
       # own converge guard would fire after a key was installed; the playbook
       # repeats the guard first in every play, and only this proves it.
       - name: Prove the fleet playbook's shape and its guard
         if: matrix.group == 'roles'
-        run: make fleet-playbook-check
+        run: scripts/gates/scenario.sh fleet-playbook-check
 
       - name: Prove the pinned-release fetch path
         if: matrix.group == 'policy'
-        run: make release-fetch-check
+        run: scripts/gates/scenario.sh release-fetch-check
 
       # Every fetch site was bounded and retried once, after one stalled
       # connection failed a converge behind an approval gate. This is what
       # keeps the next get_url or uri from shipping with the module defaults.
       - name: Prove every fetch is bounded and retried
         if: matrix.group == 'policy'
-        run: make fetch-retry-check
+        run: scripts/gates/scenario.sh fetch-retry-check
 
       # On systemd 255 the pending-reload flag is set for every unit by any
       # enable on the host, and the old dry run refused the whole fleet on it.
@@ -911,7 +970,7 @@ jobs:
       # ends with the reload its own enables left pending.
       - name: Prove the dry run compares across a pending daemon-reload
         if: matrix.group == 'policy'
-        run: make dryrun-policy-check
+        run: scripts/gates/scenario.sh dryrun-policy-check
 
       # The hybrid generator writes an inventory and a playbook that the Go
       # tests parse with a YAML library. Ansible is what has to read them, and
@@ -919,7 +978,7 @@ jobs:
       # library and Ansible could disagree on.
       - name: Prove the generated hybrid shape is one Ansible reads
         if: matrix.group == 'policy'
-        run: make hybrid-emission-check
+        run: scripts/gates/scenario.sh hybrid-emission-check
 
       # Measure unit effects and command readers against disposable systemd 255.
       # Compile as the runner; run as root from each package's directory.
@@ -955,9 +1014,21 @@ jobs:
           cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
 
-  # Both legs here need the real Debian package, so they share a job: `dist` is
-  # phony and runs again for the second target, but the Go build cache is warm
-  # by then and it costs about a minute.
+      - name: Report what this group used of its runner
+        if: always()
+        continue-on-error: true
+        run: scripts/ci-usage.sh report "$RUNNER_TEMP/ci-usage" "host-lifecycle (${{ matrix.group }})"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: ci-usage-${{ matrix.group }}
+          path: ${{ runner.temp }}/ci-usage/usage.json
+          if-no-files-found: ignore
+
+  # Every leg here needs the real Debian package, so they share a job and the
+  # packages are built once, before the first.
   package-lifecycle:
     needs: changes
     if: needs.changes.outputs.package_lifecycle == 'true'
@@ -971,13 +1042,20 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # THE PINNED TOOL VERSIONS, from the one file every gate reads.
+      - name: Load the pinned tool versions
+        run: grep -E '^[A-Z_]+=' .github/tool-versions.env >> "$GITHUB_ENV"
+
       - name: Install the pinned release builder
-        run: |
-          version=$(make --no-print-directory print-goreleaser-version)
-          go install "github.com/goreleaser/goreleaser/v2@$version"
+        run: go install "github.com/goreleaser/goreleaser/v2@$GORELEASER_VERSION"
+
+      # The real packages, built once for all three legs, exactly as a tag
+      # would build them and publishing nothing.
+      - name: Build the release artifacts
+        run: scripts/gates/dist.sh
 
       - name: Exercise package installation and removal
-        run: make package-lifecycle
+        run: scripts/test-package-lifecycle.sh
 
       # AN UNTESTED BACKUP IS NOT A BACKUP, which ADR-001 has said since before
       # backup existed. This is the packaged-Linux half of the rehearsal: a real
@@ -988,7 +1066,7 @@ jobs:
       # service-owned directory, so the restored control plane could not open
       # one of them — which nothing in the Go suite could see.
       - name: Rehearse a restore on a packaged Linux host
-        run: make restore-rehearsal
+        run: scripts/test-restore-rehearsal.sh
 
       # AND THE PROFILE WHERE THE ARCHIVE IS THE ONLY COPY THERE IS. A
       # PostgreSQL deployment archives HALF of itself on purpose — the ledger is
@@ -998,7 +1076,7 @@ jobs:
       # volume by design, which makes that archive the only copy of the
       # deployment identity a replacement controller can be built from.
       - name: Rehearse a restore of a PostgreSQL deployment
-        run: make postgres-restore-rehearsal
+        run: scripts/test-postgres-restore-rehearsal.sh
 
   # The Terraform module has no compiler, so fmt/validate/test in CI is the only
   # thing standing between a typo and an operator's plan. The tests run against
@@ -1047,8 +1125,9 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ matrix.terraform }}
-          # The wrapper shims terraform for plan-output capture, which breaks
-          # plain `make` invocations; these jobs only need the real binary.
+          # The wrapper shims terraform for plan-output capture, which breaks a
+          # script that reads terraform's own output; these jobs only need the
+          # real binary.
           terraform_wrapper: false
 
       # Before the classification gate below, which is a Go program: on the
@@ -1089,10 +1168,7 @@ jobs:
           key: terraform-providers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('terraform/modules/*/.terraform.lock.hcl') }}
 
       - name: Format, validate, and plan-test the module
-        run: |
-          make tf-fmt-check
-          make tf-validate
-          make tf-test
+        run: scripts/gates/terraform.sh fmt validate test
 
       # WHAT A CHANGE COSTS A RUNNING DEPLOYMENT is committed beside the module,
       # because a plan cannot say it: ADR-004 keeps live billet nodes outside
@@ -1101,24 +1177,24 @@ jobs:
       # entry — and an entry for a resource no module declares, which is how a
       # stale table goes on looking like coverage.
       #
-      # It needs no terraform at all, so it also runs in the Go job through
-      # `make test`; it is here because this is the job somebody adding a
-      # resource to the module will be watching.
+      # It needs no terraform at all, so it also runs in the Go job's suite; it
+      # is here because this is the job somebody adding a resource to the
+      # module will be watching.
       - name: Prove every module resource is classified
-        run: make tf-classify
+        run: scripts/gates/terraform.sh classify
 
       - name: Unit-test the spot-router Lambda
-        # Lives here, not in `check`'s Go jobs: this is the terraform module's
-        # code, and its drop-vs-re-raise classification decides whether a real
+        # Lives here, not in the Go jobs: this is the terraform module's code,
+        # and its drop-vs-re-raise classification decides whether a real
         # two-minute Spot warning is lost. Before this job existed it ran in no
         # CI job at all.
-        run: make lambda-test
+        run: scripts/gates/lambda-test.sh
 
       # The root `billet init hybrid` writes is HCL rendered as text, and only
       # terraform can read it: a module input renamed on one side and not the
       # other passes every Go test and fails an operator's first init.
       - name: Prove the generated hybrid root validates against the module
-        run: make hybrid-root-check
+        run: scripts/hybrid-root-check.sh
 
       # ONLY A PUSH TO MAIN OR A RELEASE BRANCH SAVES, and only a job that passed:
       # a pull request restores what its base branch saved, so it never writes an
@@ -1172,8 +1248,8 @@ jobs:
           terraform -chdir="$workdir/consumer" validate
 
   # Lint and config-scan are terraform-version-independent, so they run once.
-  # Versions are read from the Makefile, the way goreleaser's is, so the
-  # workflow and `make tf-lint`/`make tf-scan` cannot drift apart.
+  # Versions are read from .github/tool-versions.env, the way goreleaser's is,
+  # so the workflow and scripts/gates/tools.sh cannot drift apart.
   terraform-lint:
     needs: changes
     if: needs.changes.outputs.terraform_lint == 'true'
@@ -1182,32 +1258,30 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read the pinned scanner versions
-        id: pins
-        run: |
-          echo "tflint=$(make --no-print-directory print-tflint-version)" >> "$GITHUB_OUTPUT"
-          echo "trivy=$(make --no-print-directory print-trivy-version)" >> "$GITHUB_OUTPUT"
+      # THE PINNED TOOL VERSIONS, from the one file every gate reads.
+      - name: Load the pinned tool versions
+        run: grep -E '^[A-Z_]+=' .github/tool-versions.env >> "$GITHUB_ENV"
 
       - uses: terraform-linters/setup-tflint@v6
         with:
-          tflint_version: ${{ steps.pins.outputs.tflint }}
+          tflint_version: ${{ env.TFLINT_VERSION }}
 
       - name: tflint (aws ruleset pinned in .tflint.hcl)
         # The token keeps the ruleset download from tripping GitHub's
         # unauthenticated rate limit on busy days.
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: make tf-lint
+        run: scripts/gates/terraform.sh lint
 
       # Aqua's own setup action rather than curl-piping contrib/install.sh:
       # the pin above selects which trivy BINARY to fetch, but a piped script
       # from the main branch is unpinned code executing first.
       - uses: aquasecurity/setup-trivy@v0.3.1
         with:
-          version: ${{ steps.pins.outputs.trivy }}
+          version: ${{ env.TRIVY_VERSION }}
 
       - name: trivy config scan (ignores are justified in .trivyignore)
-        run: make tf-scan
+        run: scripts/gates/terraform.sh scan
 
   # THE ACCEPTANCE-SIZE REPLAY, IN A JOB OF ITS OWN. internal/replay drives a
   # trace of job arrivals through the real listener, allocator, placer and node
@@ -1249,7 +1323,7 @@ jobs:
       - run: python -m pip install --requirement docs/requirements.txt
       - env:
           SPHINXBUILD: sphinx-build
-        run: make docs
+        run: scripts/gates/docs.sh
 
   # A CONTRIBUTOR'S COMMITS ARE SIGNED OFF under the Developer Certificate of
   # Origin (scripts/dco.sh). KEPT rather than a family: whether a commit is signed

@@ -54,6 +54,7 @@ func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compati
 	}
 
 	record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
+	record.Image, record.Disk = aRestoreSpec().Image, testGoldenDisk
 
 	edit(&record)
 
@@ -75,6 +76,9 @@ func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compati
 		t.Fatalf("chmod the compatibility record: %v", err)
 	}
 }
+
+// testGoldenDisk is the system disk every staged snapshot names.
+const testGoldenDisk = "golden-gold-1@" + fakeGeneration
 
 // aRestoreSpec is a restore that should succeed: a launch's spec with the disk size
 // the snapshot already has.

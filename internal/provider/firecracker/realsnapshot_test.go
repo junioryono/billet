@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,8 +19,8 @@ import (
 // The fake VMM asserts what billet SAYS to Firecracker; this asserts that what it
 // says restores a guest. It launches a golden from the test image, lets it run,
 // captures it, publishes the capture the way a node will (root-owned, 0444, under
-// the snapshots directory), snapshots the golden's own disk so the fork's disk is
-// the one the memory was taken with, and restores a second lease from it.
+// the snapshots directory) with the golden's own system disk published beside it,
+// and restores a second lease from it onto a clone of that disk.
 //
 // It skips wherever requireRealHost does: everywhere but a prepared host.
 func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
@@ -33,6 +32,16 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	}
 
 	goldenName := provider.InstanceName(env.lease)
+	name := "selftest-" + env.lease[:12]
+
+	// THE GOLDEN'S SYSTEM DISK GOES LAST: it is the builder's clone, renamed, so the
+	// builder's mapping and every fork's clone of it have to be gone first. Cleanups
+	// run in reverse, so this is registered before the builder's Destroy.
+	t.Cleanup(func() {
+		if err := env.disk.removeGolden(context.WithoutCancel(t.Context()), goldenDiskPrefix+name); err != nil {
+			t.Errorf("remove the golden's system disk: %v", err)
+		}
+	})
 
 	t.Cleanup(func() {
 		if _, err := golden.Destroy(context.WithoutCancel(t.Context()), goldenName); err != nil {
@@ -55,7 +64,6 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 
 	// PUBLISHED AS A NODE WILL PUBLISH IT, by Capture: copied out of the jail into
 	// the store, owned by billet, read-only, with the host it was taken on.
-	name := "selftest-" + env.lease[:12]
 	published := filepath.Join(golden.snapshotsDir(), name)
 
 	// THE STORE AND ITS PUBLISH LOCK STAY. Every publisher on this node shares them,
@@ -82,36 +90,34 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 		}
 	}
 
-	// THE DISK THE MEMORY WAS TAKEN WITH, not a fresh golden: a restored kernel's
-	// page cache describes this disk, and another one under it is corruption.
-	captured := env.disk.cache + "/" + goldenName + "@cap"
+	// THE DISK THE MEMORY WAS TAKEN WITH, published by the capture itself: the
+	// builder's clone, flushed while the guest was paused and renamed to the
+	// golden's name, which the record names for every restore.
+	var record compatibility
+	if raw, err := os.ReadFile(filepath.Join(published, compatibilityFile)); err != nil {
+		t.Fatal(err)
+	} else if err := json.Unmarshal(raw, &record); err != nil {
+		t.Fatalf("the record a real capture wrote: %v", err)
+	}
 
-	// REGISTERED BEFORE THE CREATE, because a create cancelled after Ceph made the
-	// snapshot reports failure and would otherwise leave it, which then stops the
-	// golden's disk being removed. Only a confirmed absence counts as nothing to do.
+	if !strings.HasPrefix(record.Disk, goldenDiskPrefix+name+"@g") || record.Image != env.image {
+		t.Fatalf("the capture recorded disk %q from %q, want the golden's own disk from %q",
+			record.Disk, record.Image, env.image)
+	}
+
+	// THE SAME PROVIDER RESTORES: its restore clones the record's disk, wherever the
+	// image pool is.
+	forks := golden
+	forkName := provider.InstanceName(freshLease(t))
+	forkSnapshot := "selftest-fork-" + env.lease[:8]
+
+	// AFTER THE FORK, for the reason the golden's disk goes after its builder: the
+	// fork's capture publishes the fork's clone too.
 	t.Cleanup(func() {
-		out, err := exec.CommandContext(context.WithoutCancel(t.Context()), "rbd",
-			env.disk.args("snap", "rm", captured)...).CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "No such file or directory") {
-			t.Errorf("remove the golden's disk snapshot %s: %v: %s", captured, err, out)
+		if err := env.disk.removeGolden(context.WithoutCancel(t.Context()), goldenDiskPrefix+forkSnapshot); err != nil {
+			t.Errorf("remove the fork's system disk: %v", err)
 		}
 	})
-
-	if out, err := exec.CommandContext(t.Context(), "rbd",
-		env.disk.args("snap", "create", captured)...).CombinedOutput(); err != nil {
-		t.Fatalf("snapshot the golden's disk: %v: %s", err, out)
-	}
-
-	// A SECOND PROVIDER WHOSE "IMAGE POOL" IS THE CACHE POOL, so the clone it makes
-	// for the fork is of the captured disk. Same deployment, same host state.
-	forks, err := New(selftestDeployment, env.cfg,
-		rbdDisk{images: env.disk.cache, cache: env.disk.cache, id: env.disk.id},
-		WithBootWait(20*time.Second))
-	if err != nil {
-		t.Fatalf("New for the fork: %v", err)
-	}
-
-	forkName := provider.InstanceName(freshLease(t))
 
 	t.Cleanup(func() {
 		if _, err := forks.Destroy(context.WithoutCancel(t.Context()), forkName); err != nil {
@@ -120,7 +126,7 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	})
 
 	inst, err := forks.Restore(t.Context(), provider.Spec{
-		Name: forkName, Image: goldenName + "@cap", VCPU: 2, Memory: 1 * config.GiB,
+		Name: forkName, Image: env.image, VCPU: 2, Memory: 1 * config.GiB,
 		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
 	}, name)
@@ -156,8 +162,6 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	// AND THE FORK CAN BE CAPTURED IN TURN, which a capture writing over the
 	// read-only links its own restore placed could not, while the snapshot it came
 	// from stays the file it was.
-	forkSnapshot := "selftest-fork-" + env.lease[:8]
-
 	t.Cleanup(func() {
 		if err := os.RemoveAll(filepath.Join(golden.snapshotsDir(), forkSnapshot)); err != nil {
 			t.Errorf("remove the fork's snapshot: %v", err)
@@ -221,7 +225,7 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	})
 
 	_, err = forks.Restore(t.Context(), provider.Spec{
-		Name: elsewhereName, Image: goldenName + "@cap", VCPU: 2, Memory: 1 * config.GiB,
+		Name: elsewhereName, Image: env.image, VCPU: 2, Memory: 1 * config.GiB,
 		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
 	}, filepath.Base(incompatible))
@@ -267,7 +271,7 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	})
 
 	_, err = forks.Restore(t.Context(), provider.Spec{
-		Name: refusedName, Image: goldenName + "@cap", VCPU: 2, Memory: 1 * config.GiB,
+		Name: refusedName, Image: env.image, VCPU: 2, Memory: 1 * config.GiB,
 		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
 	}, filepath.Base(foreign))

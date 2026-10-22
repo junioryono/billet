@@ -8,7 +8,7 @@ Every write to the ledger takes its one writer slot: SQLite's write lock, or Pos
 
 ## How
 
-The benchmarks are in the tree and run against either engine: `make bench` on SQLite, and the same with `BILLET_TEST_LEDGER=postgres BILLET_TEST_POSTGRES_DSN=…` on PostgreSQL. The setup matches a running control plane in the ways that matter:
+The benchmarks are in the tree and run against either engine: `scripts/gates/bench.sh` on SQLite, and the same with `BILLET_TEST_LEDGER=postgres BILLET_TEST_POSTGRES_DSN=…` on PostgreSQL. The setup matches a running control plane in the ways that matter:
 
 - The ledger holds the controller claim, so every write reads the claim's epoch inside its transaction, as production writes do.
 - Setup is outside the timed region.

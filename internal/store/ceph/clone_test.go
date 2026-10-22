@@ -24,6 +24,9 @@ type cloneFake struct {
 	size    int64  // what `rbd info` reports, in bytes
 	failOn  string // a subcommand that fails
 	failErr error
+	// failSeq, when set, is what each call of failOn answers in turn, nil for
+	// success; once it is used up, failOn succeeds.
+	failSeq []error
 	// duringInfo runs while `rbd info` is answering, before its answer.
 	duringInfo func()
 }
@@ -51,6 +54,21 @@ func (f *cloneFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 	}
 
 	f.calls = append(f.calls, args)
+
+	if f.failOn != "" && f.failOn == sub && f.failSeq != nil {
+		if len(f.failSeq) == 0 {
+			return nil, nil
+		}
+
+		err := f.failSeq[0]
+		f.failSeq = f.failSeq[1:]
+
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, nil
+	}
 
 	if f.failOn != "" && f.failOn == sub {
 		err := f.failErr

@@ -10,7 +10,7 @@ about: it compiled, most of the suite passed, and the commit message would have
 described behaviour the code no longer had. A gate that ran earlier proves
 nothing, because the mutation landed after it.
 
-`make check` cannot notice, since the mutated tree is a perfectly valid tree. The
+`scripts/gates/check.sh` cannot notice, since the mutated tree is a perfectly valid tree. The
 only durable evidence is the leftover backup, so that is what this looks for.
 
 Exit non-zero if any `*.bak` sits beside a tracked Go file; print how to restore

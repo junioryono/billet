@@ -179,6 +179,9 @@ type Provider struct {
 	// which may no longer be the file at the configured path. A seam because it
 	// needs the kernel's socket credentials and /proc/<pid>/exe.
 	runningVMM func(ctx context.Context, j jail, res resources) (*os.File, error)
+	// flushRoot writes a mapped root disk's dirty host pages back before a capture
+	// publishes it (flushDevice). A seam because a test's root disk is no device.
+	flushRoot func(device string) error
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -359,6 +362,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	p.runningVMM = func(ctx context.Context, j jail, res resources) (*os.File, error) {
 		return apiPeerExecutable(ctx, j.socket(), res.UID)
 	}
+	p.flushRoot = flushDevice
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt
@@ -528,6 +532,26 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
+	// A RESTORE'S DISK IS THE SNAPSHOT'S, read before anything is claimed: the
+	// golden's system disk its memory was taken with, and the exact generation that
+	// disk was cloned from, which pairs the restore with the guest's kernel.
+	var golden compatibility
+
+	var goldens goldenDisk
+
+	if snapshot != "" {
+		var err error
+		if goldens, err = p.goldens(); err != nil {
+			return nil, err
+		}
+
+		if golden, err = p.goldenOf(snapshot, spec); err != nil {
+			return nil, err
+		}
+
+		spec.Image = golden.Image
+	}
+
 	// TIMED BY PHASE, because a node launches one guest at a time and the phases
 	// are what decide how many it can start a minute.
 	started := time.Now()
@@ -610,7 +634,13 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 
 	cloneStarted := time.Now()
 
-	device, err := p.cloneResolved(ctx, requested, &spec)
+	var device string
+	if snapshot != "" {
+		device, err = goldens.CloneGolden(ctx, golden.Disk, spec.Name)
+	} else {
+		device, err = p.cloneResolved(ctx, requested, &spec)
+	}
+
 	if err != nil {
 		// A CLONE ERROR DOES NOT PROVE NO CLONE EXISTS. `rbd clone` can be killed by
 		// a cancelled context after the cluster has already created the image, and
@@ -670,7 +700,7 @@ func (p *Provider) launch(
 
 	// THE SIZE BILLET ASKED FOR, where the guest cannot rewrite it: what a capture of
 	// this microVM is bounded by, and what a restore from it must ask for again.
-	if err := p.writeShape(j, spec); err != nil {
+	if err := p.writeShape(j, spec, device); err != nil {
 		return nil, err
 	}
 
