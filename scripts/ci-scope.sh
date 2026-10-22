@@ -143,9 +143,13 @@ classify() {
 		;;
 	esac
 
+	# What test-postgres runs, tests included: the ledger backend, the capacity
+	# suite, the archive's PostgreSQL dump and its client, and the restore
+	# rehearsal it runs against a real server.
 	case "$p" in
 	internal/alloc/* | internal/config/* | internal/deploymentid/* | internal/regularfile/* | \
-		internal/state/* | internal/version/*)
+		internal/state/* | internal/version/* | internal/deployarchive/* | internal/pgdump/* | \
+		internal/e2e/restore_test.go)
 		known=0
 		select_families postgres
 		;;

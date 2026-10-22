@@ -1,8 +1,8 @@
 #!/bin/bash
 # The rollout rehearsal: a packaged control plane and a packaged node, both on
 # release FROM under real systemd, moved to release TO by `billet rollout start`
-# and nothing else, then asked to take a candidate that cannot serve them and
-# proved to roll back.
+# and the controller's own upgrade unit, then asked to take a candidate that
+# cannot serve them and proved to refuse it before any host is touched.
 #
 # WHAT THIS PROVES THAT NO TEST DOES. `internal/ops/host/hostupgrade.go` stops a
 # service, replaces a binary and migrates a ledger; every test of it supplies a
@@ -10,18 +10,31 @@
 # the doing happens: systemd's `Type=notify` start, the packaged units, the
 # service account's ownership of the ledger, the detached updater surviving the
 # node that started it, the coordinator observing a real registration on the
-# target, and the controller's own upgrade through the root timer the package
-# enables (from v0.6.0; on an older FROM the controller is upgraded the way its
-# documentation of the day said, by running `billet host-upgrade` on it).
+# target, and the controller's own upgrade through the unit the package's root
+# timer runs, which the rehearsal starts rather than waiting up to five minutes
+# for the tick, so the timer's own firing is not what this proves (from v0.6.0;
+# on an older FROM the controller is upgraded the way its documentation of the
+# day said, by running `billet host-upgrade` on it).
 #
 # THE FAILING CANDIDATE IS A DOWNGRADE, because a rehearsal that runs on the day
-# a release is cut has exactly two releases to work with. A rollout back to FROM
-# with --allow-downgrade puts a binary on the controller that cannot open the
-# ledger TO migrated, so the candidate's own probe refuses, the transaction rolls
-# back and the host stays on TO. That is the rollback path under a real
-# service manager, and the watermark's own restore with it.
+# a release is cut has exactly two releases to work with. FROM cannot open the
+# ledger TO migrated, the signed manifest says so, and `rollout start` refuses it
+# while the control plane still runs: no host is stopped or touched. That gate
+# replaced the transaction's rollback as what stops such a candidate (see the
+# stage below), so the rollback after a failed probe is held by hostupgrade's
+# own tests and no longer by this rehearsal.
 #
-#   BILLET_REHEARSAL_FROM=v0.5.0 BILLET_REHEARSAL_TO=v0.6.0 \
+# A FROM BELOW v0.10.0 cannot complete it: every release through v0.9.2 launches
+# the node's updater inside the node service's sandbox, which refuses its first
+# write (host-rehearsals.md); the record names the pairs it has run with.
+#
+# AND THE PAIR MUST CROSS A LEDGER MIGRATION, or there is nothing to refuse:
+# FROM opens a ledger TO left at FROM's own schema, its probe passes, and the
+# downgrade commits (measured 2026-10-21 with v0.21.0 and v0.22.0, which share
+# migration 63). v0.19.0 and v0.20.0 are the newest pair that cross one (62 to
+# 63).
+#
+#   BILLET_REHEARSAL_FROM=v0.19.0 BILLET_REHEARSAL_TO=v0.20.0 \
 #   BILLET_REHEARSAL_APP_CONFIG=... BILLET_REHEARSAL_APP_KEY=... \
 #   scripts/rollout-rehearsal.sh
 set -euo pipefail
@@ -101,7 +114,11 @@ cleanup() {
         docker exec "${node}" journalctl -u billet-node -n 40 --no-pager -o cat 2>&1 | tail -40 || true
     fi
 
-    rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"
+    # A HOST, NETWORK OR STORAGE LEFT BEHIND FAILS THE RUN, so a green rehearsal
+    # never hides something an operator has to remove by hand.
+    if ! rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"; then
+        if [ "${status}" -eq 0 ]; then status=1; fi
+    fi
     rm -rf "${work}" || true
     exit "${status}"
 }
@@ -233,6 +250,10 @@ test "$(rehearsal_active "${controller}" billet-server.service)" = active ||
     rehearsal_fail "billet-server.service is not active on the controller after its upgrade"
 docker exec "${controller}" grep -qF "${to_digest}" /var/lib/billet/installed.json ||
     rehearsal_fail "the controller's provenance does not name ${TO}'s manifest"
+rehearsal_upgrade_units_done "${controller}" 300 ||
+    rehearsal_fail "the controller's upgrade transaction was still running after its upgrade"
+rehearsal_units_run_installed_binary "${controller}" billet-server.service ||
+    rehearsal_fail "a billet service on the controller is not running ${TO}'s binary after the upgrade"
 
 rehearsal_step "the coordinator moves the node"
 node_upgrade_started=$(date -u +%s)
@@ -248,6 +269,14 @@ test "$(rehearsal_active "${node}" billet-node.service)" = active ||
     rehearsal_fail "billet-node.service is not active on the node after its upgrade"
 docker exec "${node}" grep -qF "${to_digest}" /var/lib/billet/installed.json ||
     rehearsal_fail "the node's provenance does not name ${TO}'s manifest"
+# EVERY UNIT, NOT ONLY billet-node: the uplink shaper beside one is what #503 left
+# on the replaced binary while the node came back healthy. This node runs no
+# shaper, because shaping loads sch_cake and ifb into the kernel the rehearsal
+# host shares; its restart is held by hostupgrade's own tests.
+rehearsal_upgrade_units_done "${node}" 300 ||
+    rehearsal_fail "the node's upgrade transaction was still running after its upgrade"
+rehearsal_units_run_installed_binary "${node}" billet-node.service ||
+    rehearsal_fail "a billet service on the node is not running ${TO}'s binary after the upgrade"
 
 rehearsal_wait_for 300 "the rollout to complete" "${controller}" \
     runuser -u billet -- sh -c "/usr/bin/billet rollout status --config /etc/billet/billet.yaml | grep -q 'No rollout is running. The last one was .* completed'" ||
@@ -263,51 +292,56 @@ done
 test "$(docker exec "${controller}" systemctl is-enabled billet-upgrade.timer 2>/dev/null || true)" = enabled ||
     rehearsal_fail "billet-upgrade.timer is not enabled on the controller after moving to ${TO}"
 
-rehearsal_step "a candidate that cannot serve this ledger is rolled back"
-# FROM cannot open a ledger TO migrated. Recording the downgrade is the operator's
-# deliberate act (--allow-downgrade); what follows is the transaction refusing
-# to commit a binary whose own probe failed, and putting TO back.
-rehearsal_as_billet "${controller}" /usr/bin/billet rollout start --version "${FROM}" --allow-downgrade \
-    --config /etc/billet/billet.yaml 2>&1 | tail -6
-
+rehearsal_step "a candidate that cannot serve this ledger is refused before any host is touched"
+# THE GATE, NOT A ROLLBACK, IS WHAT STOPS IT NOW. FROM expects an older ledger
+# schema than the one TO left, and the signed manifest says so, so `rollout
+# start` refuses the downgrade while the control plane is still running
+# (releasesource.Compatibility): no service is stopped and no binary replaced.
+# Measured 2026-10-21: v0.19.0 was refused over v0.20.0's ledger ("expects
+# ledger schema 62 and this deployment is at 63"), and v0.21.0, which shares
+# v0.22.0's schema, was accepted and committed. A transaction rolling back after
+# its candidate's probe failed is therefore unreachable by a downgrade on a real
+# host, and stays held by internal/hostupgrade's ordering tests.
+controller_journals_before=$(docker exec "${controller}" sh -c 'ls -1d /var/lib/billet/upgrades/*/ 2>/dev/null | wc -l')
 journals_before=$(docker exec "${node}" sh -c 'ls -1d /var/lib/billet/upgrades/*/ 2>/dev/null | wc -l')
-rollback_started=$(date -u +%s)
-docker exec "${controller}" systemctl start billet-upgrade.service 2>&1 | tail -3 || true
+refusal_started=$(date -u +%s)
 
-rehearsal_wait_for 600 "the controller's candidate to be rolled back" "${controller}" \
-    sh -c 'j=$(ls -1dt /var/lib/billet/upgrades/*/journal.json | head -1); grep -qE "\"step\": *\"rolled_back\"" "$j"' ||
-    rehearsal_fail "the controller's journal never recorded a rollback"
-rollback_took=$(($(date -u +%s) - rollback_started))
+if refusal=$(rehearsal_as_billet "${controller}" /usr/bin/billet rollout start --version "${FROM}" \
+    --allow-downgrade --config /etc/billet/billet.yaml 2>&1); then
+    printf '%s\n' "${refusal}" | tail -6
+    rehearsal_fail "the downgrade to ${FROM} was accepted: either the pair crosses no ledger migration, or ${TO} predates the manifest's compatibility gate"
+fi
+printf '%s\n' "${refusal}" | tail -4
+grep -qF "expects ledger schema" <<<"${refusal}" ||
+    rehearsal_fail "the downgrade was refused, but not for the ledger schema it cannot open"
+refusal_took=$(($(date -u +%s) - refusal_started))
 
-test "$(rehearsal_version "${controller}")" = "${TO_VERSION}" ||
-    rehearsal_fail "after the rollback the controller reports $(rehearsal_version "${controller}"), not ${TO_VERSION}"
-rehearsal_wait_for 120 "the server to be back" "${controller}" systemctl is-active --quiet billet-server.service ||
-    rehearsal_fail "billet-server.service did not come back after the rollback"
-
-# THE GUARD IS GIVEN TIME TO BE VIOLATED. The coordinator looks every thirty
-# seconds; a check made the instant the controller rolled back proves nothing
-# about a coordinator that would dispatch the node on its next pass. The
-# rollout stays open across three passes while the node is watched.
+# NOTHING MOVED, and the coordinator is given time to move it anyway: it looks
+# every thirty seconds, so both hosts are watched across three passes.
 held=0
 while [ "${held}" -lt 90 ]; do
     sleep 15
     held=$((held + 15))
-    test "$(rehearsal_version "${node}")" = "${TO_VERSION}" ||
-        rehearsal_fail "the node moved to $(rehearsal_version "${node}") although the controller never converged"
-    journals_now=$(docker exec "${node}" sh -c 'ls -1d /var/lib/billet/upgrades/*/ 2>/dev/null | wc -l')
-    test "${journals_before}" = "${journals_now}" ||
-        rehearsal_fail "the node was dispatched an upgrade (${journals_before} -> ${journals_now} journals) before the controller converged"
+    for host in "${controller}" "${node}"; do
+        test "$(rehearsal_version "${host}")" = "${TO_VERSION}" ||
+            rehearsal_fail "${host} moved to $(rehearsal_version "${host}") after a refused downgrade"
+    done
+    test "$(docker exec "${controller}" sh -c 'ls -1d /var/lib/billet/upgrades/*/ 2>/dev/null | wc -l')" = "${controller_journals_before}" ||
+        rehearsal_fail "the controller began an upgrade transaction after a refused downgrade"
+    test "$(docker exec "${node}" sh -c 'ls -1d /var/lib/billet/upgrades/*/ 2>/dev/null | wc -l')" = "${journals_before}" ||
+        rehearsal_fail "the node was dispatched an upgrade after a refused downgrade"
 done
-echo "the node stayed on ${TO_VERSION} with ${journals_before} journal(s) through ${held}s of the failed rollout"
+test "$(rehearsal_active "${controller}" billet-server.service)" = active ||
+    rehearsal_fail "billet-server.service is not active after a refused downgrade"
+echo "both hosts stayed on ${TO_VERSION}, with no new upgrade journal, through ${held}s after the refusal"
 
-rehearsal_as_billet "${controller}" /usr/bin/billet rollout status --config /etc/billet/billet.yaml 2>&1 | tail -6
-rehearsal_as_billet "${controller}" /usr/bin/billet rollout abort \
-    --reason "rehearsal: the downgrade candidate was proved to roll back" \
-    --config /etc/billet/billet.yaml 2>&1 | tail -3
+rehearsal_wait_for 60 "no rollout to be running" "${controller}" \
+    runuser -u billet -- sh -c "/usr/bin/billet rollout status --config /etc/billet/billet.yaml | grep -q 'No rollout is running'" ||
+    rehearsal_fail "a rollout is running after the refused downgrade"
 
 echo
 echo "rollout rehearsal: PASSED"
-echo "  ${FROM} -> ${TO} on ${REHEARSAL_ARCH}; controller upgrade ${controller_upgrade_took}s (timer: ${controller_has_timer}); node converged ${node_upgrade_took}s after the controller; rollback ${rollback_took}s; total $(($(date -u +%s) - started_at))s"
+echo "  ${FROM} -> ${TO} on ${REHEARSAL_ARCH}; controller upgrade ${controller_upgrade_took}s (timer: ${controller_has_timer}); node converged ${node_upgrade_took}s after the controller; downgrade refused in ${refusal_took}s; total $(($(date -u +%s) - started_at))s"
 # THE LAST STATEMENT, after every line of output: a signal landing before this
 # still fails the run.
 REHEARSAL_PASSED=1

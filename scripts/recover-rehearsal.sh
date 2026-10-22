@@ -67,7 +67,11 @@ cleanup() {
         docker exec "${node}" journalctl -u billet-node -n 40 --no-pager -o cat 2>&1 | tail -40 || true
     fi
 
-    rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"
+    # A HOST, NETWORK OR STORAGE LEFT BEHIND FAILS THE RUN, so a green rehearsal
+    # never hides something an operator has to remove by hand.
+    if ! rehearsal_teardown_hosts "${network}" "${storage}" "${controller}" "${node}"; then
+        if [ "${status}" -eq 0 ]; then status=1; fi
+    fi
     rm -rf "${work}" || true
     exit "${status}"
 }
@@ -88,6 +92,18 @@ rehearsal_start_host "${node}" "${network}" yes "${storage}"
 rehearsal_install_package "${controller}" "${REHEARSAL_DIST_DEB}"
 rehearsal_install_package "${node}" "${REHEARSAL_DIST_DEB}"
 rehearsal_install_app_key "${controller}"
+
+# THE STATE DIRECTORY ON A FILESYSTEM OF ITS OWN SIZE, so the abandon stage below
+# can stop a recovery part-way the way a real host does: by running out of disk
+# while it copies the archive's ledger in, after it has already moved the live
+# one aside. Nothing in the shipped binary has a hook for that, and nothing here
+# needs one. Mounted before anything commissions the deployment, so the whole of
+# it lives there, owned by the service account as systemd would leave it.
+docker exec "${controller}" sh -c '
+    install -d -o billet -g billet -m 0700 /var/lib/billet/server &&
+    mount -t tmpfs -o "size=64m,mode=0700,uid=$(id -u billet),gid=$(id -g billet)" \
+        billet-rehearsal-state /var/lib/billet/server' ||
+    rehearsal_fail "could not mount a filesystem of its own under the controller's state directory"
 
 {
     cat <<EOF
@@ -170,6 +186,65 @@ docker exec "${controller}" /usr/bin/billet local down --timeout 10m \
     --reason "recover rehearsal" --config /etc/billet/billet.yaml 2>&1 | tail -8
 rehearsal_stopped "${controller}" billet-server.service ||
     rehearsal_fail "billet-server.service is $(rehearsal_active "${controller}" billet-server.service) after local down; only inactive or failed proves a stop"
+
+rehearsal_step "a recovery the disk stops part-way, and its --abandon"
+# FILLED SO THE ARCHIVE'S LEDGER CANNOT FIT and everything before it can: the
+# supersede is a rename and needs no space, the journal and the seal need a few
+# pages, and the copy of the archive's ledger needs its whole size. Half that
+# size free stops the run at exactly the boundary --abandon exists for: the live
+# ledger moved aside, the archive's not yet in place, the directory fenced.
+ledger_bytes=$(docker exec "${controller}" stat -c '%s' /var/backups/billet/a/ledger/billet.db) ||
+    rehearsal_fail "could not read the archived ledger's size"
+free_bytes=$(docker exec "${controller}" df --output=avail -B1 /var/lib/billet/server | tail -1 | tr -d ' ') ||
+    rehearsal_fail "could not read the state filesystem's free space"
+filler=$((free_bytes - ledger_bytes / 2))
+test "${filler}" -gt 0 || rehearsal_fail "the state filesystem has ${free_bytes} bytes free, too few to stage this"
+docker exec "${controller}" fallocate -l "${filler}" /var/lib/billet/server/.rehearsal-filler ||
+    rehearsal_fail "could not fill the state filesystem"
+echo "ledger ${ledger_bytes} bytes; left $((free_bytes - filler)) bytes free"
+
+if docker exec "${controller}" /usr/bin/billet local recover --config /etc/billet/billet.yaml \
+    --from /var/backups/billet/a --old-controller-fenced \
+    --reason "recover rehearsal: interrupted" >"${work}/interrupted.log" 2>&1; then
+    cat "${work}/interrupted.log" >&2
+    rehearsal_fail "the recovery succeeded on a filesystem that could not hold the archive's ledger"
+fi
+tail -12 "${work}/interrupted.log"
+
+# THE STATE IT HAD TO STOP IN, each part asked of the host: fenced by a recovery,
+# its journal present, the live ledger moved aside and nothing at its name.
+docker exec "${controller}" grep -qx 'billet local recover' /var/lib/billet/server/billet.maintenance ||
+    rehearsal_fail "the interrupted recovery did not leave the directory fenced as a recovery"
+docker exec "${controller}" test -f /var/lib/billet/server/restore.journal ||
+    rehearsal_fail "the interrupted recovery left no journal"
+interrupted_aside=$(docker exec "${controller}" sh -c 'find /var/lib/billet/server -maxdepth 1 -name "billet.db.superseded-*" -not -name "*-wal" -not -name "*-shm" -print')
+test -n "${interrupted_aside}" ||
+    rehearsal_fail "the interruption came before the live ledger was moved aside, so there is nothing to abandon"
+if docker exec "${controller}" test -e /var/lib/billet/server/billet.db; then
+    rehearsal_fail "a ledger is at billet.db although the disk stopped the copy of the archive's"
+fi
+
+docker exec "${controller}" rm -f /var/lib/billet/server/.rehearsal-filler
+docker exec "${controller}" /usr/bin/billet local recover --config /etc/billet/billet.yaml \
+    --from /var/backups/billet/a --abandon 2>&1 | tail -8
+
+# PUT BACK, AND IT IS THE LIVE LEDGER: it knows the admission taken after the
+# backup, which the archive's never did, and the directory is open again.
+docker exec "${controller}" test -f /var/lib/billet/server/billet.db ||
+    rehearsal_fail "the abandon left no ledger at billet.db"
+if docker exec "${controller}" test -e "${interrupted_aside}"; then
+    rehearsal_fail "the abandon left the live ledger at ${interrupted_aside}"
+fi
+if docker exec "${controller}" test -e /var/lib/billet/server/billet.maintenance; then
+    rehearsal_fail "the abandon left the directory fenced"
+fi
+if docker exec "${controller}" test -e /var/lib/billet/server/restore.journal; then
+    rehearsal_fail "the abandon left its journal behind"
+fi
+admissions=$(rehearsal_as_billet "${controller}" /usr/bin/billet nodes pending --all --config /etc/billet/billet.yaml 2>&1) ||
+    rehearsal_fail "billet nodes pending --all failed after the abandon: ${admissions}"
+grep -qF "${node}-later" <<<"${admissions}" ||
+    rehearsal_fail "the ledger the abandon put back does not know ${node}-later, so it is not the live one"
 
 rehearsal_step "billet local recover, as root, from the archive"
 docker exec "${controller}" /usr/bin/billet local recover --config /etc/billet/billet.yaml \

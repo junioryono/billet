@@ -88,7 +88,8 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 	})
 
 	for _, opener := range []string{"Open", "OpenPostgres", "OpenPostgresStandby", "OpenMaintenance",
-		"OpenPostgresProbe", "OpenAdmin", "OpenPostgresAdmin", "OpenInspect", "OpenPostgresInspect"} {
+		"OpenPostgresProbe", "OpenAdmin", "OpenPostgresAdmin", "OpenInspect", "OpenPostgresInspect",
+		"OpenPostgresRecovery"} {
 		if seen[opener] != 1 {
 			t.Errorf("ledger.go calls state.%s %d times outside the decision read, want exactly once",
 				opener, seen[opener])

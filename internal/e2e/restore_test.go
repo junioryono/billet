@@ -2,16 +2,21 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/pem"
 	"errors"
 	"log/slog"
 	"net"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +27,7 @@ import (
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
+	"github.com/junioryono/billet/internal/pgdump"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -84,6 +90,7 @@ type controlPlane struct {
 	alloc      *alloc.Allocator
 	authority  wirecert.Serving
 	url        string
+	side       ledgerSide
 }
 
 // startControlPlane brings one up over dir, the way `billet server` does.
@@ -93,16 +100,16 @@ type controlPlane struct {
 // what renewal SIGNS with are three answers that have to come from one read of
 // the restored authority, and a hand-assembled wire in a test is a different
 // program from the one an operator runs.
-func startControlPlane(t *testing.T, dir string) *controlPlane {
+func startControlPlane(t *testing.T, dir string, side ledgerSide) *controlPlane {
 	t.Helper()
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("create %s: %v", dir, err)
 	}
 
-	db, err := state.Open(t.Context(), dir)
+	db, err := side.open(t, dir)
 	if err != nil {
-		t.Fatalf("state.Open(%s): %v", dir, err)
+		t.Fatalf("open the %s ledger in %s: %v", side.name, dir, err)
 	}
 
 	closeDB := sync.OnceFunc(func() { _ = db.Close() })
@@ -167,8 +174,153 @@ func startControlPlane(t *testing.T, dir string) *controlPlane {
 
 	return &controlPlane{
 		dir: dir, deployment: deployment, db: db, alloc: a,
-		authority: authority, url: srv.URL,
+		authority: authority, url: srv.URL, side: side,
 	}
+}
+
+// ledgerSide is how one control plane in these tests keeps its ledger: a SQLite
+// file in its state directory, or a PostgreSQL database of its own.
+type ledgerSide struct {
+	name string
+	// dsn is the database, or empty for SQLite.
+	dsn state.DSN
+}
+
+func (s ledgerSide) open(t *testing.T, dir string) (*state.DB, error) {
+	t.Helper()
+
+	if s.dsn == "" {
+		return state.Open(t.Context(), dir)
+	}
+
+	return state.OpenPostgres(t.Context(), dir, s.dsn)
+}
+
+// client is the PostgreSQL client for this side's database, through the same
+// package `billet local backup` and `restore` use.
+func (s ledgerSide) client(t *testing.T) *pgdump.Client {
+	t.Helper()
+
+	c, err := pgdump.New(s.dsn)
+	if err != nil {
+		t.Fatalf("pgdump.New: %v", err)
+	}
+
+	return c
+}
+
+// sqliteSides is the ordinary rehearsal: a file on each machine.
+func sqliteSides(*testing.T) (ledgerSide, ledgerSide) {
+	return ledgerSide{name: "sqlite"}, ledgerSide{name: "sqlite"}
+}
+
+// postgresSides is the rehearsal for a deployment whose ledger is in
+// PostgreSQL: two databases, each with a schema of the same name, because
+// pg_restore puts a ledger back into the schema it came from. The target starts
+// EMPTY, so the dump really is what the restored control plane serves from.
+func postgresSides(t *testing.T) (ledgerSide, ledgerSide) {
+	t.Helper()
+
+	const schema = "billet_rehearsal"
+
+	source := requireRehearsalDatabase(t, "source", schema)
+	target := requireRehearsalDatabase(t, "target", schema)
+
+	return ledgerSide{name: "postgres", dsn: state.DSN(source)},
+		ledgerSide{name: "postgres", dsn: state.DSN(target)}
+}
+
+// requireRehearsalDatabase returns a DSN for a fresh database of this test's
+// own with schema in it, or skips — and refuses to skip under CI unless the run
+// names the job that runs it, the rule internal/state's suite states.
+func requireRehearsalDatabase(t *testing.T, suffix, schema string) string {
+	t.Helper()
+
+	dsn := os.Getenv("BILLET_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		if elsewhere := os.Getenv("BILLET_TEST_POSTGRES_ELSEWHERE"); elsewhere != "" {
+			t.Skipf("BILLET_TEST_POSTGRES_DSN is unset here; this run's %q job rehearses the "+
+				"PostgreSQL restore", elsewhere)
+		}
+
+		if os.Getenv("CI") != "" {
+			t.Fatal("BILLET_TEST_POSTGRES_DSN is unset under CI, so a PostgreSQL deployment's " +
+				"restore would go unrehearsed while the run reported success")
+		}
+
+		t.Skip("BILLET_TEST_POSTGRES_DSN is unset; start a PostgreSQL and set it to rehearse " +
+			"a PostgreSQL deployment's restore")
+	}
+
+	// A DATABASE WITHOUT ITS CLIENT IS THE SAME SILENCE: under CI the job that
+	// sets the DSN is the one that must also have installed the client.
+	for _, program := range []string{"pg_dump", "pg_restore"} {
+		if _, err := exec.LookPath(program); err != nil {
+			if os.Getenv("CI") != "" {
+				t.Fatalf("%s is not installed under CI, so a PostgreSQL deployment's restore "+
+					"would go unrehearsed", program)
+			}
+
+			t.Skipf("%s is not installed", program)
+		}
+	}
+
+	name := strings.ToLower("billet_e2e_" + strings.ReplaceAll(t.Name(), "/", "_") + "_" + suffix)
+	if len(name) > 60 {
+		name = name[len(name)-60:]
+	}
+
+	admin, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = admin.Close() }()
+
+	for _, stmt := range []string{
+		`DROP DATABASE IF EXISTS "` + name + `" WITH (FORCE)`,
+		`CREATE DATABASE "` + name + `"`,
+	} {
+		if _, err := admin.ExecContext(t.Context(), stmt); err != nil {
+			t.Fatalf("prepare database %s: %v", name, err)
+		}
+	}
+
+	t.Cleanup(func() {
+		cleanup, err := sql.Open("pgx", dsn)
+		if err != nil {
+			return
+		}
+
+		defer func() { _ = cleanup.Close() }()
+
+		//nolint:errcheck,noctx // teardown, after the test's context is gone.
+		_, _ = cleanup.Exec(`DROP DATABASE IF EXISTS "` + name + `" WITH (FORCE)`)
+	})
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse BILLET_TEST_POSTGRES_DSN: %v", err)
+	}
+
+	u.Path = "/" + name
+
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+
+	db, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open %s: %v", name, err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(t.Context(), `CREATE SCHEMA "`+schema+`"`); err != nil {
+		t.Fatalf("create schema %s: %v", schema, err)
+	}
+
+	return u.String()
 }
 
 // issueBundle mints a node bundle the way `billet ca issue` does, and records it
@@ -304,14 +456,7 @@ func backUp(t *testing.T, c *controlPlane, appKey []byte, dest string) deployarc
 		t.Fatalf("generate the second target's key: %v", err)
 	}
 
-	admin, err := state.OpenAdmin(t.Context(), c.dir)
-	if err != nil {
-		t.Fatalf("OpenAdmin: %v", err)
-	}
-
-	defer func() { _ = admin.Close() }()
-
-	m, err := deployarchive.Write(t.Context(), deployarchive.BackupRequest{
+	req := deployarchive.BackupRequest{
 		Dest:         dest,
 		StateDir:     c.dir,
 		DeploymentID: c.deployment,
@@ -320,10 +465,33 @@ func backUp(t *testing.T, c *controlPlane, appKey []byte, dest string) deployarc
 		Targets: []deployarchive.TargetKey{
 			{Name: rehearsalSecondTarget, GitHub: rehearsalSecondApp, AppKeyPEM: second},
 		},
-		Snapshot: admin.SnapshotInto,
 		Now:      time.Now,
 		Hostname: "rehearsal-source",
-	})
+	}
+
+	// THE LEDGER'S OWN COPY, taken the way `billet local backup` takes it: VACUUM
+	// INTO through an operator handle, or pg_dump of the snapshot billet read the
+	// ledger in, honouring the source's fence.
+	if c.side.dsn == "" {
+		admin, err := state.OpenAdmin(t.Context(), c.dir)
+		if err != nil {
+			t.Fatalf("OpenAdmin: %v", err)
+		}
+
+		defer func() { _ = admin.Close() }()
+
+		req.Snapshot = admin.SnapshotInto
+	} else {
+		client := c.side.client(t)
+
+		req.Dump = func(ctx context.Context, path string) (deployarchive.LedgerDump, error) {
+			d, err := client.Dump(ctx, c.dir, path)
+
+			return d.LedgerDump(), err
+		}
+	}
+
+	m, err := deployarchive.Write(t.Context(), req)
 	if err != nil {
 		t.Fatalf("deployarchive.Write: %v", err)
 	}
@@ -386,8 +554,9 @@ func restoreOnto(t *testing.T, archiveDir string, target deployarchive.Target) {
 }
 
 // newTarget is the other machine: a state directory that has never held a
-// deployment, beside a config naming the same App.
-func newTarget(t *testing.T, root string) deployarchive.Target {
+// deployment, beside a config naming the same App, and for PostgreSQL the
+// database its config names, reached the way `billet local restore` reaches it.
+func newTarget(t *testing.T, root string, side ledgerSide) deployarchive.Target {
 	t.Helper()
 
 	stateDir := filepath.Join(root, "state")
@@ -396,11 +565,22 @@ func newTarget(t *testing.T, root string) deployarchive.Target {
 		t.Fatalf("prepare the target: %v", err)
 	}
 
+	var (
+		backend  string
+		postgres deployarchive.PostgresLedger
+	)
+
+	if side.dsn != "" {
+		backend, postgres = "postgres", pgdump.Archive{Client: side.client(t)}
+	}
+
 	return deployarchive.Target{
-		ConfigPath: filepath.Join(root, "billet.yaml"),
-		StateDir:   stateDir,
-		AppKeyPath: filepath.Join(root, "app-private-key.pem"),
-		GitHub:     rehearsalApp,
+		LedgerBackend: backend,
+		Postgres:      postgres,
+		ConfigPath:    filepath.Join(root, "billet.yaml"),
+		StateDir:      stateDir,
+		AppKeyPath:    filepath.Join(root, "app-private-key.pem"),
+		GitHub:        rehearsalApp,
 		Targets: []deployarchive.TargetPath{{
 			Name:       rehearsalSecondTarget,
 			AppKeyPath: filepath.Join(root, "app-private-key-personal.pem"),
@@ -436,11 +616,28 @@ func installAppKeyExclusively(path string, body []byte) error {
 // seen it, and a control plane is started THERE. The same node, holding the
 // certificate the ORIGINAL deployment issued and having enrolled with nothing,
 // connects to it and is accepted.
+//
+// ON BOTH LEDGERS. A PostgreSQL deployment's archive carries pg_dump's copy of
+// the ledger, restored into a database that starts empty, so the restored plane
+// serves from the dump rather than from rows the source left behind.
 func TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne(t *testing.T) {
+	for name, sides := range map[string]func(*testing.T) (ledgerSide, ledgerSide){
+		"sqlite": sqliteSides, "postgres": postgresSides,
+	} {
+		t.Run(name, func(t *testing.T) {
+			sourceSide, targetSide := sides(t)
+			rehearseServingTheFleet(t, sourceSide, targetSide)
+		})
+	}
+}
+
+func rehearseServingTheFleet(t *testing.T, sourceSide, targetSide ledgerSide) {
+	t.Helper()
+
 	root := t.TempDir()
 
 	// ---- The deployment somebody is running.
-	source := startControlPlane(t, filepath.Join(root, "source"))
+	source := startControlPlane(t, filepath.Join(root, "source"), sourceSide)
 
 	bundle := source.issueBundle(t, rehearsalNode)
 
@@ -492,12 +689,12 @@ func TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne(t *testing.T) {
 	}
 
 	// ---- The other machine. Nothing here has ever heard of this deployment.
-	target := newTarget(t, filepath.Join(root, "elsewhere"))
+	target := newTarget(t, filepath.Join(root, "elsewhere"), targetSide)
 
 	restoreOnto(t, archiveDir, target)
 
 	// ---- And a control plane on it.
-	restored := startControlPlane(t, target.StateDir)
+	restored := startControlPlane(t, target.StateDir, targetSide)
 
 	if restored.deployment != source.deployment {
 		t.Fatalf("the restored control plane is deployment %s, not %s — every instance the old "+
@@ -559,8 +756,9 @@ func TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne(t *testing.T) {
 // which is why the assertion is on the transport error rather than on a status.
 func TestARestoredControlPlaneRefusesANodeFromAnotherDeployment(t *testing.T) {
 	root := t.TempDir()
+	sqliteSide, _ := sqliteSides(t)
 
-	source := startControlPlane(t, filepath.Join(root, "source"))
+	source := startControlPlane(t, filepath.Join(root, "source"), sqliteSide)
 
 	key, err := appKeyPEM()
 	if err != nil {
@@ -571,11 +769,11 @@ func TestARestoredControlPlaneRefusesANodeFromAnotherDeployment(t *testing.T) {
 
 	backUp(t, source, key, archiveDir)
 
-	target := newTarget(t, filepath.Join(root, "elsewhere"))
+	target := newTarget(t, filepath.Join(root, "elsewhere"), sqliteSide)
 
 	restoreOnto(t, archiveDir, target)
 
-	restored := startControlPlane(t, target.StateDir)
+	restored := startControlPlane(t, target.StateDir, sqliteSide)
 
 	// A whole other deployment, with its own authority — a second billet
 	// somewhere else rather than a forgery.

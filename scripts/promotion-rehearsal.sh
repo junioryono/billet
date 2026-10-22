@@ -89,7 +89,11 @@ cleanup() {
         done
     fi
 
-    rehearsal_teardown_hosts "${network}" "${storage}" "${controller_a}" "${controller_b}" "${node}" "${postgres}"
+    # A HOST, NETWORK OR STORAGE LEFT BEHIND FAILS THE RUN, so a green rehearsal
+    # never hides something an operator has to remove by hand.
+    if ! rehearsal_teardown_hosts "${network}" "${storage}" "${controller_a}" "${controller_b}" "${node}" "${postgres}"; then
+        if [ "${status}" -eq 0 ]; then status=1; fi
+    fi
     rm -rf "${work}" || true
     exit "${status}"
 }
