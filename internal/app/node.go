@@ -64,6 +64,9 @@ type Node struct {
 	// sampled is what the job sampler reports to, set by UsageMetrics' source
 	// when the node serves metrics and nil, which reports nowhere, when not.
 	sampled jobusage.Observer
+	// gitObserved is what the Git proxy reports to, set by GitMetrics' source
+	// when the node serves metrics and nil, which reports nowhere, when not.
+	gitObserved node.GitObserver
 }
 
 // OpenNode loads the certificate this node presents, claims the deployment
@@ -317,6 +320,9 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return err
 	}
 	defer stopCache()
+	if cacheService != nil {
+		cacheService.SetGitObserver(n.gitObserved)
+	}
 
 	maxCustody, err := cfg.Node.MaxCustodyDuration()
 	if err != nil {

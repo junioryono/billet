@@ -65,6 +65,16 @@ A node with `node.ceph` also reads its kernel's RBD mappings at every scrape, wi
 |---|---|
 | `billet_node_rbd_mappings{state}` | this host's kernel mappings of images in the site's pools, by what accounts for each: `root_disk` (a guest's root disk, which its microVM holds), `generation` (a read-only check of a cache generation), `session` (a cache volume a cache session on this node names), `recent` (a cache volume named less than six hours ago, whose custody record may not be written yet), `unaccounted` (a cache volume named longer ago that no cache session on this node names, held by no job of this node's; on a host that runs a second node identity, that one's volumes count here too), and `other` (anything else in those pools, such as a map an interrupted `billet images pull` left). The node's eviction pass, at start and every six hours, unmaps without force each `unaccounted` mapping that an earlier pass in the same process also found unaccounted, at least an hour before, and whose volume records this node as the one that mapped it, unless the kernel holds it open; a count that stays above zero is a mapping something on the host still has open, named in the node's `kept kernel mappings` warning |
 
+A node with `node.cache` counts what its Git proxy does ([ADR-018](../reference/decisions/adr-018-git-proxy-answers-as-github.md)), told by the proxy as it happens; every label value is reported from the start at zero, and one billet does not know is counted under `other`.
+
+| Metric | What it is |
+|---|---|
+| `billet_node_git_requests_total{route,reason,status}` | Git requests the proxy answered: `route` is `mirror`, `github` (forwarded) or `refused`; `reason` says why (`served` from the mirror, or the cause of a forward, such as `no_mirror`, `mirror_lacks_object`, `mirror_unavailable`, `no_repository_id` or `github_unreachable`); `status` is the class of the status answered (`2xx` to `5xx`, `none` for a request that ended first). A share of `github` that does not fall after a burst of new pushes is a mirror that is not keeping up |
+| `billet_node_git_request_seconds{route}` | how long each request took, by route (a histogram) |
+| `billet_node_git_refreshes_total{outcome}` | refreshes of a mirror by how each ended: `ok`, `unverified` (GitHub did not name the same repository after the fetch, so the mirror is replaced), `too_large`, `busy` (no fetch slot), `disk_full`, `closed` or `failed` |
+| `billet_node_git_refresh_seconds` | how long each refresh took (a histogram) |
+| `billet_node_git_repository_lookups_total{outcome}` | questions to GitHub's API about which repository a name is, one with every advertisement and after every refresh: `ok`, `refused`, `rate_limited` or `failed`; anything but `ok` sends that request to GitHub, so a rising `rate_limited` is the proxy spending the jobs' API budget |
+
 ## Reaching it from another host
 
 The endpoint has no authentication, and what it reports is the deployment's own business. So `listen` must be a literal loopback address, `127.0.0.1` or `[::1]`, unless `allow_remote: true` is set beside it. A name such as `localhost` is not accepted on its own, because the bind would resolve it again and a resolver could map it to another interface:

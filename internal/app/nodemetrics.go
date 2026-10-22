@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/junioryono/billet/internal/metrics"
+	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
@@ -109,3 +110,29 @@ func mappingSnapshot(hasCeph bool, open func() (kernelMappingReader, error),
 }
 
 var _ kernelMappingReader = (*ceph.Client)(nil)
+
+// The Git proxy reports through node.GitObserver, which the node package
+// declares and internal/metrics satisfies without either importing the other.
+var _ node.GitObserver = (*metrics.GitObserver)(nil)
+
+// GitMetrics is the node's Git proxy as metrics: each request by where it was
+// answered and why, each refresh of a mirror by how it ended, and each
+// question to GitHub's API about which repository a name is (ADR-018), told by
+// the proxy as they happen. A node with no node.cache counts none.
+func (n *Node) GitMetrics() MetricsSource {
+	return MetricsSource{
+		name: "git",
+		attach: func(reg *metrics.Registry) error {
+			o, err := reg.GitObserver(metrics.GitLabels{
+				Routes: node.GitRoutes(), Reasons: node.GitReasons(), Statuses: node.GitStatusClasses(),
+				RefreshOutcomes: node.GitRefreshOutcomes(), LookupOutcomes: node.GitLookupOutcomes(),
+			})
+			if err != nil {
+				return err
+			}
+			n.gitObserved = o
+
+			return nil
+		},
+	}
+}
