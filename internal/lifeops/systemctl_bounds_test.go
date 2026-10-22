@@ -169,7 +169,7 @@ func TestAnOutputHeldOpenByADescendantIsNotReadWhole(t *testing.T) {
 	// THE SLEEP OUTLASTS THE GUARD, so a run that returned only once the
 	// descendant let go is still waiting when the guard ends the test. A run
 	// that ends at the wait delay took about 0.75s alone and 5.3s to 6.1s under
-	// a full `make check` (2026-10-04, the process start being the slow part),
+	// a full `scripts/gates/check.sh` (2026-10-04, the process start being the slow part),
 	// which a 5s bound could not tell from the regression (#188). The sleep is
 	// ended by the test, never left to outlive it.
 	pidFile := filepath.Join(t.TempDir(), "descendant")

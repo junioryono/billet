@@ -118,7 +118,7 @@ func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
 
 	// THE LOOP BURNS USER CPU, NOT WALL TIME, until getrusage, the kernel's other
 	// account of this process, says 300ms more of it was used. A 300ms wall-clock
-	// loop on a machine starved by the rest of `make check` received 143ms to
+	// loop on a machine starved by the rest of `scripts/gates/check.sh` received 143ms to
 	// 194ms of CPU (2026-10-03 and 2026-10-05, #188) and failed the floor below
 	// while the reader was right. The work between polls is arithmetic with no
 	// system call, so the time waited for is user time and the reader's own user

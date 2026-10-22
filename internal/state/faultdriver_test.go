@@ -498,7 +498,7 @@ func TestEveryUntransactedReadIsAccountedFor(t *testing.T) {
 // have associated files by build tag either, and what this needs is EVERY file
 // whatever platform it compiles on. lock_unix.go is `//go:build unix`, and a
 // read added there owes the same decision as one added anywhere else. That is
-// the same reason `make lint` runs a second pass under GOOS=linux.
+// the same reason `scripts/gates/lint.sh` runs a second pass under GOOS=linux.
 func readerCallSites(t *testing.T) map[string]bool {
 	t.Helper()
 

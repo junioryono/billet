@@ -4,7 +4,7 @@ The host's commands: `billet check` and its preflights, `local up|down|status|ba
 
 - The order a command acts in is often its whole safety content, and structural tests (`upgradefence_test.go`, `downgrade_test.go`, `rolebudgets_test.go` and others) assert it by parsing this package's source. Move a call and its test together.
 - Every ledger open is a mode of `internal/app`'s `OpenLedger`; `ledger.go` names the modes for the commands that choose an opener as a value, and `ledgerrelease_test.go` holds each name to its mode. Retirement opens its own restricted handles (admin, inspection, completion) in `serverretire*.go`; never replace one with an ordinary helper.
-- `convergeguardgatecrash.go` builds only under the `billetgatecrash` tag the collection's gate uses, and `convergeguard_dev_linux.go`, `convergeguard_scan_linux.go` and `releaseinspect_linux.go` only on Linux: `make lint` and `make cross` see them, a darwin `go vet` does not.
+- `convergeguardgatecrash.go` builds only under the `billetgatecrash` tag the collection's gate uses, and `convergeguard_dev_linux.go`, `convergeguard_scan_linux.go` and `releaseinspect_linux.go` only on Linux: `scripts/gates/lint.sh` and `scripts/gates/cross.sh` see them, a darwin `go vet` does not.
 - The retirement tests (`^TestRetirement`) need PostgreSQL and run in CI's retirement shards, which `scripts/check-retirement-shards.py` partitions from this directory; the PostgreSQL command job runs the rest.
 
-Gates (CI runs them on every push; locally, `make verify`): `make check`; `make cross` for anything touching a build tag, which locally is `GOOS=linux GOARCH=amd64 go vet ./internal/ops/host`.
+Gates (CI runs them on every push; locally, `scripts/gates/verify.sh`): `scripts/gates/check.sh`; `scripts/gates/cross.sh` for anything touching a build tag, which locally is `GOOS=linux GOARCH=amd64 go vet ./internal/ops/host`.

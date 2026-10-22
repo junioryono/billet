@@ -7,4 +7,4 @@ The binary: `main`, the `server` and `node` roles' commands, and the two command
 - A test that drives a family's code through `status` or `acceptance` stays here; one that drives the family alone moves with it. Test helpers shared with a family are copied into each package (`*_helpers_test.go`), never exported from a test file.
 - Coverage ignores `main.go` (`.codecov.yml`), so new logic goes in another file, and usually in a family.
 
-Gates (CI runs them on every push; locally, `make verify`): `make check`; CI's lint job runs `make cross` for a change that touches a build tag.
+Gates (CI runs them on every push; locally, `scripts/gates/verify.sh`): `scripts/gates/check.sh`; CI's lint job runs `scripts/gates/cross.sh` for a change that touches a build tag.

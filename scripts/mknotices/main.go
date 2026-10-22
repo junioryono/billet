@@ -40,7 +40,7 @@ import (
 // embeds this file, so it is beside internal/notices/notices.go.
 const Output = "internal/notices/THIRD_PARTY_NOTICES"
 
-// targets are the platforms a release builds. .goreleaser.yaml and `make cross`
+// targets are the platforms a release builds. .goreleaser.yaml and `scripts/gates/cross.sh`
 // name the same three; a module linked only on one of them is still shipped.
 var targets = [][2]string{{"linux", "amd64"}, {"linux", "arm64"}, {"darwin", "arm64"}}
 

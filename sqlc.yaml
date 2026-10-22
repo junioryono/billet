@@ -49,7 +49,7 @@
 # NOT a migration: it is the table every migration is recorded in, bootstrapped
 # idempotently by the backend from those same bytes.
 #
-# PINNED at v1.31.1 (Makefile SQLC_VERSION). Generated code is committed, so an
+# PINNED at v1.31.1 (SQLC_VERSION in .github/tool-versions.env). Generated code is committed, so an
 # ordinary build never downloads sqlc; CI installs the pin and runs `sqlc diff`.
 version: "2"
 sql:

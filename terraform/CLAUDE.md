@@ -7,4 +7,4 @@ The AWS infrastructure modules. Load `billet-infra-terraform-ansible` before cha
 - The module's IAM stays equal to what `billet init iam` generates (`internal/tfpolicy`).
 - `terraform destroy` refuses under a running CodeBuild build, and it is the module that refuses.
 
-Gates: `make tf-fmt-check tf-validate tf-test tf-lint tf-scan` before pushing (`make tools` installs the pins), and `make tf-classify` to prove the committed `classification.json` describes every module resource. What a real plan costs a running deployment is `go run ./scripts/tfclassify -plan plan.json`, on the JSON of `terraform show -json <planfile>`; passing `make tf-classify` does not evaluate any plan.
+Gates: `scripts/gates/terraform.sh fmt validate test lint scan` before pushing (`scripts/gates/tools.sh` installs the pins), and `scripts/gates/terraform.sh classify` to prove the committed `classification.json` describes every module resource. What a real plan costs a running deployment is `go run ./scripts/tfclassify -plan plan.json`, on the JSON of `terraform show -json <planfile>`; passing `scripts/gates/terraform.sh classify` does not evaluate any plan.
