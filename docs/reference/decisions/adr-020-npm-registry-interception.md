@@ -12,75 +12,105 @@ What reaches the step that failed:
 - **GitHub's hosted runners fetch from the registry directly,** and GitHub publishes no registry cache for them.
 - **The hosted-runner services that cache npm ask the workflow to change.** Blacksmith's documented answer (read 2026-10-22) is a sticky disk mounted at `~/.npm` or `node_modules` through its own action. RunsOn's pull-through caches are an opt-in label extra, and they cover container registries. billet already ships a sticky disk (`actions/stickydisk`), and it has the same limit: it serves `npm ci` from a warm `~/.npm`, but not `pnpm/setup`'s download, and only in a workflow that adds the step.
 
-So only interception reaches every npm fetch without a workflow change. billet already intercepts one origin, the Actions results host. It does so with a DNS remap inside the guest, TLS terminated on the node by a CA the guest trusts (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`), and a choice made on each connection's first request to answer it or splice the connection to the real origin.
+So only interception reaches every npm fetch without a workflow change. billet already intercepts one origin, the Actions results host:
+
+- the guest remaps it in `/etc/hosts` for its own processes, and in a resolver on the Docker gateway for containers;
+- a relay in the guest tunnels the connection to the node;
+- the node terminates TLS with a CA the guest trusts (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, the guest's system store);
+- the node chooses, on the connection's first request, to answer it or to splice the connection to the real origin, and closes a connection it answered, so every request a client sends after an answer arrives on a new connection and is classified afresh.
 
 ## What was measured
 
 `registry.npmjs.org`, 2026-10-22 21:33 UTC, with curl from the development Mac:
 
-- **Package documents are fresh for five minutes, at npm's own edge too.**
+- **Package documents are fresh for five minutes, and npm's edge counts that time down.**
   - The full document (`/@pnpm/exe.linux-x64`) and the abbreviated one (`Accept: application/vnd.npm.install-v1+json`) both answer `cache-control: public, max-age=300`, with an `ETag`, a `Last-Modified` and `vary: accept-encoding, accept`.
-  - Cloudflare served both from its cache (`cf-cache-status: HIT`, `age` 63 and 72).
+  - Cloudflare served both from its cache (`cf-cache-status: HIT`), with `age` 63 and 72, so those answers had about 237 and 228 seconds of freshness left, not 300.
   - A request carrying the abbreviated document's `ETag` in `If-None-Match` is answered `304`.
-- **A tarball is a year-long object.** `/@pnpm/exe.linux-x64/-/exe.linux-x64-12.4.2.tgz` answers `cache-control: public, must-revalidate, max-age=31557600`, 21,062,701 bytes, an `age` of 1,588,966 seconds (18 days at Cloudflare).
-- **A version's tarball URL names the registry itself.** The version document's `dist.tarball` is `https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-12.4.2.tgz`, and its `dist` carries `integrity`, `shasum`, `signatures` and `attestations`. A remap of the one host therefore also catches every tarball a document names, with nothing rewritten.
-- **An answer does not say whether it was private.** A public package fetched with a bogus `Authorization: Bearer` header answers `200`, the same as without one. A missing package answers `404`.
+- **A tarball is a year-long object.** `/@pnpm/exe.linux-x64/-/exe.linux-x64-12.4.2.tgz` answers `cache-control: public, must-revalidate, max-age=31557600`, 21,062,701 bytes, `age` 1,588,966 seconds (18 days at Cloudflare).
+- **The measured version's tarball URL names the registry itself.** That version document's `dist.tarball` is `https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-12.4.2.tgz`, and its `dist` carries `integrity`, `shasum`, `signatures` and `attestations`. A tarball a document names on another host is simply not intercepted.
+- **A bogus credential changed nothing billet can see.** A public package fetched with a bogus `Authorization: Bearer` header answers `200`, the same as without one. A missing package answers `404`. A private package's answer was not measured.
+- **npm's own client sends one of two `Accept` headers for a package document** (`npm/pacote`, `lib/registry.js`, read 2026-10-22): `application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*` for the abbreviated document, `application/json` for the full one.
 
 ## Decision
 
 **A tier may have the node serve `registry.npmjs.org`** (`cache.npm`), through the interception the Actions cache uses:
 
-- the guest's DNS remap, of one more host;
+- the guest's DNS remap of one more host, in `/etc/hosts` only (below);
 - TLS terminated by the node's interception authority, with the host added to the node's leaf;
-- the per-connection choice to answer or to splice.
+- the per-connection choice to answer or to splice, and the close after every answer.
 
 The Actions cache and the npm cache are separate switches. A tier may have either without the other, and the guest installs the interception authority when either is on.
 
-**Only an anonymous read is ever answered from or written to the store.** A connection is answered by the node only when its first request is a `GET` or `HEAD` with no `Authorization`, `Cookie` or `npm-otp` header, for one of three shapes:
+**What may be answered from the store is a closed set, decided from the first request alone.** A connection is answered by the node only when its first request meets all of these:
 
-- a package document, `/<name>` or `/@<scope>%2f<name>` or `/@<scope>/<name>`;
-- a version document, `/<name>/<version>`;
-- a tarball, `/<name>/-/<file>.tgz`.
+- **The method is `GET`, or `HEAD` of an entry the store already holds.** A `HEAD` of an entry the store lacks is spliced, so a `HEAD` never creates an entry.
+- **No `Authorization`, `Cookie` or `npm-otp` header.** A job that configures a token for the registry sends it with its requests to it, and billet cannot tell from an answer whether the package behind it was private, so a request with a credential is never answered from the store and never fills it.
+- **No query string.** npm asks for `?write=true` when it needs a document fresh enough to update, and nothing with a query is ever answered from the store.
+- **The path is exactly one of three shapes, parsed once by one rule** that classification, the upstream fetch and the store's key all share:
+  - a package document, `/<name>` or `/@<scope>%2f<name>` (either case of the `2f`);
+  - a version document, `/<name>/<version>` or `/@<scope>/<name>/<version>`;
+  - a tarball, `/<name>/-/<file>.tgz` or `/@<scope>/<name>/-/<file>.tgz`.
 
-Each name must be a valid npm package name and each version a valid semantic version. Anything else is spliced to the registry unchanged, for the whole connection: a publish, a login, an audit, a search, a dist-tag change, and any request that carries a credential. A token is sent to the registry on every request once a job configures one, and an answer cannot say whether the package behind it was private, so an authenticated request is never cached. The node sees such a request in transit, as it sees the runner's own Actions token on the results host. It never stores it, never logs it, and forwards it unchanged.
+  Each name must be a valid npm package name and each version a valid semantic version. Any other percent-encoding, a dot segment, a repeated or trailing slash, or a double encoding is spliced, never normalised into something the store would answer.
+- **For a document, the `Accept` header is one of a closed set**, and its value chooses one of two variants:
+  - the abbreviated variant, for npm's exact abbreviated header or `application/vnd.npm.install-v1+json` alone;
+  - the full variant, for `application/json`, `*/*` or no `Accept` at all.
+
+  Any other `Accept` is spliced. A tarball ignores `Accept`.
+
+Everything else is spliced to the registry unchanged, for the whole connection: a publish, a login, an audit, a search, a dist-tag change, and every request the rules above do not admit. The node sees a spliced request in transit, as it sees the runner's own Actions token on the results host. It never stores it, never logs it, and forwards it unchanged.
+
+**What the store may hold is decided from the registry's answer alone.**
+
+- The node fills an entry with its own request, carrying none of the job's headers. A document is asked for with the variant's one canonical `Accept` (`application/vnd.npm.install-v1+json`, or `application/json`), so the variant is the only thing a job's request chooses. Each request also carries `Accept-Encoding: gzip`, and the node stores and serves the document decoded, so no encoding varies between jobs. A tarball is stored as its bytes.
+- An answer is stored only when all of these hold:
+  - its status is `200`;
+  - it is complete: its declared length, or the end of its chunked body, was reached;
+  - it sets no cookie;
+  - its `Cache-Control` names neither `private` nor `no-store`.
+- A `304` refreshes only an entry the store already holds with the `ETag` that was sent.
+- A redirect is relayed to the client and never followed, so nothing in the store came from another origin.
+- Any other status is relayed and not stored.
 
 **One store per node, shared by every tier on it, whatever its trust.**
 
-- Every answer in the store is what the public registry gives anyone who asks without a credential. The node fetches it itself over a verified TLS connection, with none of the job's headers but `Accept` and `Accept-Encoding`. So nothing a job sends, only the name it asks for, decides what another job reads.
+- Every entry in the store is what the public registry gives a request without a credential, fetched by the node itself over a verified TLS connection. Nothing a job sends decides what another job reads, beyond the name and the variant it asks for.
 - An untrusted pool may have it for the same reason: the cache serves nothing scoped to a pool. The Actions cache is different, because it serves the pool's own entries, and it keeps its trust rules.
 - A job can fill the store with real packages and evict others. That costs warm hits, not correctness, and the store's size bound limits it.
-- The store lives on the node's own disk, not in a site volume: the uplink cost is then one fetch per node rather than one per job. Sharing one store across a site's nodes is not decided here.
+- The store lives on the node's own disk, as the Git mirrors do, not in a site volume: the uplink cost is then one fetch per node rather than one per job. Sharing one store across a site's nodes is not decided here.
 
-**Package documents follow npm's own freshness; tarballs are kept.**
+**An entry is served only while it is fresh, and freshness is counted from the registry's own clock.**
 
-- A package or version document is stored per path and per `Accept` variant (full or abbreviated, which `vary: accept` names), with its `ETag`.
-- It is served from the store for the `max-age` the registry gave it (five minutes, as measured), and then revalidated with `If-None-Match`.
-- A tarball is stored once, by path, and served unchanged, so the client's own check of the document's `integrity` and npm's signature still holds. npm does not let a published version's tarball change: a version that has been unpublished cannot be published again.
-- A stored entry is evicted when the store passes its bound, least recently served first.
+- A document's freshness is its `max-age` less its current age, computed as RFC 9111 computes it from the answer's `Age` and `Date` and the time since the node received it. The node sends the client an `Age` that includes the time the entry spent in the store.
+- A tarball is fresh for 24 hours from when it was last fetched or revalidated: billet's own bound, far shorter than the registry's year, so that a version npm removes (a takedown, an unpublish within npm's policy window) stops being served within a day.
+- After that, an entry is revalidated with `If-None-Match`. A `304` makes it fresh again, a `200` replaces it, and a `401`, `403`, `404` or `410` removes it and is relayed. A definitive answer is never replaced by a stored one.
+- An entry is evicted when the store passes its bound, least recently served first.
 
-**A stalled upstream fetch is retried inside the client's patience, and an answer that went stale is better than none.**
+**A stalled fetch is retried, and a stale entry is served only when the registry gave no answer at all.**
 
-- The node gives one attempt at the registry 10 seconds to produce response headers. It then makes one more attempt on a new connection, so both fit inside the 30 seconds `pnpm/setup` waits.
-- When both fail and the store holds the document, the stale document is served, for up to 24 hours past its freshness. Every such answer is recorded.
-- A stale document can lack versions published in the last day. A job asking for one of those then fails as it would have failed against the stalled registry. An install from a lockfile, which names each version and its integrity, mostly fetches tarballs, not documents.
-- A missing tarball has no stale form: two failed attempts fail the request, as the registry would have.
+- One attempt at the registry has 8 seconds from the start of its connection to its response headers, counting DNS, the TCP connect and the TLS handshake. Once headers arrive, its body must keep moving: 10 seconds with no byte ends it. An attempt whose headers did not arrive in time is made once more on a new connection.
+- When both attempts gave no answer (no connection, no headers in time, or a `502`, `503` or `504`), an entry that expired less than one hour ago is served. Every such answer is recorded and logged. A stale answer is a policy choice, not a property of the registry. It can carry a version that was removed, or lack a deprecation that was added, within that hour. It is bounded to the hour because the failure it answers is a stall of seconds.
+- A body that stalls after headers arrived, or after bytes reached the client, fails that one request. It cannot be retried without sending the client the same bytes twice.
+- That budget is the node's alone. The guest's relay and the client's own connection to the node add to it, and whether a whole fetch fits inside the 30 seconds `pnpm/setup` waits is measured on a real guest before the cache is offered (below).
 
-**It is off by default for its first release.** ADR-013's rule is that every cache is on by default where a tier can have it. This one is the exception until it has served a real fleet, because it adds a second intercepted host to every guest of every tier that turns it on. A mistake in it breaks every npm install on that tier, where a mistake in the other caches costs a cold start. Turning it on by default is a later decision with its own evidence: a real fleet's jobs served through it, and the guest passthrough measured under a large `npm ci` (below).
+**The remap reaches only clients the CA reaches.** A client that does not trust the node's authority fails its TLS handshake before the node sees a request, so it cannot be spliced: that is an error, not a miss. So `registry.npmjs.org` is remapped in the guest's `/etc/hosts` only, never by the resolver containers use. Then:
 
-**A guest remaps a host only when the node names it.** The guest image is published and outlives node releases. A guest that remapped `registry.npmjs.org` on its own, under a node too old to serve it, would send every npm fetch to a proxy that refuses it. So the guest remaps the host only when its launch metadata names it, as the Actions remap already depends on the node naming its proxy. A node that does not name it leaves npm going direct. An older node reads the tier's `cache.npm` as absent, which is safe: doing less leaves the job on the registry.
+- the runner and its steps on the guest reach the node, and trust it through `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` and the guest's system store, as they do for the results host;
+- a job container, a service container, a `docker run` container and a Dockerfile `RUN` stage resolve through the container resolver, are not remapped, and reach the registry directly, as they did before this cache.
 
-**What each job's npm traffic did is an observation.** The node records it for the lease, in the closed vocabulary the other caches use, so `billet jobs show` names it for a job:
+A step that runs `sudo` loses the runner's environment unless the guest's `sudo` keeps it. A container on the host's network sees the guest's `/etc/hosts` without the guest's trust. Both are measured on a real guest before the cache is offered, and the image keeps what they need or the ADR is revisited.
 
-- how many requests it served warm, fetched or revalidated, and how many it spliced;
-- the stale answers it gave;
-- each upstream attempt that stalled.
+**It is off by default for its first release.** ADR-013's rule is that every cache is on by default where a tier can have it. This one is the exception until it has served a real fleet, because a client the CA does not reach fails rather than missing, and a mistake in it breaks every npm install on the tier, where a mistake in the other caches costs a cold start. Turning it on by default is a later decision with its own evidence: a real fleet's jobs served through it, and the measurements this record defers.
 
-That is the first half of #631's evidence for npm. The resolver and the guest's other connections are #631's second item and are not decided here.
+**A guest remaps the host only when its node names it.** The guest image is published and outlives node releases. A guest that remapped `registry.npmjs.org` on its own, under a node too old to serve it, would send every npm fetch to a proxy that refuses it. So the guest remaps the host only when its launch metadata names it, as the Actions remap depends on the node naming its proxy. A node that does not name it leaves npm going direct. An older node reads the tier's `cache.npm` as absent, which is safe: doing less leaves the job on the registry.
+
+**What the cache did is observed like the other caches.** For each job, the node records one outcome from the closed vocabulary the build caches share: warm, cold, disabled, unavailable or unused. `billet jobs show` prints it. The node also logs one line for every request: where it was answered, why it was not answered from the store, its status, its bytes and its time. Every stale answer and every stalled attempt is counted. Which counts travel with a job's report belongs to #631's evidence item, beside the resolver and the guest's other connections, and is not decided here.
 
 ## What is not decided here
 
-- **The guest passthrough under a large install.** The Actions interception's guest-side relay was chosen over an `HTTPS_PROXY` because bulk transfers through a catch-all relay stalled (2026-10-04). An `npm ci` of a large lockfile is thousands of requests and hundreds of megabytes through the same relay. The implementation measures one on a real guest before the cache is offered, and if the relay is the limit, the relay changes, not the rule.
-- **Other registries.** PyPI, the Go module proxy and Ubuntu's archive fit the same shape, a public anonymous read with immutable artifacts, and each would be its own host under this rule.
+- **The guest under a real install.** The Actions interception's guest relay replaced an `HTTPS_PROXY` because bulk transfers through a catch-all relay stalled (2026-10-04). An `npm ci` of a large lockfile is thousands of requests and hundreds of megabytes through the same relay. The implementation measures one on a real guest, together with `pnpm/setup` against the 30-second budget, `sudo`, and a host-network container, before the cache is offered. If the relay is the limit, the relay changes, not the rule.
+- **Other registries.** PyPI, the Go module proxy and Ubuntu's archive fit the same shape, a public anonymous read with long-lived artifacts, and each would be its own host under this rule.
 - **A store shared by a site's nodes,** in Ceph as the other caches are.
 
 ## Rejected
@@ -89,4 +119,6 @@ That is the first half of #631's evidence for npm. The resolver and the guest's 
 - **A sticky disk at `~/.npm`,** the hosted services' answer. It needs a workflow change and does not reach `pnpm/setup`.
 - **A separate registry proxy at the site,** such as a Verdaccio instance the Ansible role deploys, as #543 plans for container registries. Reaching `pnpm/setup` would still need the interception. It would add a service to deploy, upgrade and secure. And its usual configuration serves an authenticated request from a cache shared by every job, which this record refuses.
 - **An `HTTPS_PROXY` for every guest.** It routes all of a job's traffic through one relay, which stalled bulk transfers on 2026-10-04 (`scripts/build-guest-image.sh`).
-- **Caching an authenticated request by its path.** The registry's answer does not say whether the package was private, so a private package's document or tarball would be served to another job.
+- **Remapping the host for containers too.** Neither a Dockerfile `RUN` stage nor an arbitrary container trusts the node's authority, so each would fail its TLS handshake instead of reaching the registry.
+- **Caching an authenticated request by its path.** billet cannot tell from an answer whether a package was private, so a private package's document or tarball could be served to another job.
+- **Keeping a tarball for the registry's year.** A version npm removes would go on being served from the store long after the registry stopped serving it.
