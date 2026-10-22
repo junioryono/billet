@@ -1548,9 +1548,18 @@ actions_cache_url=""
 # unconditionally after Docker starts, and an untrusted job -- which gets no
 # interception metadata -- would otherwise hit it unset under `set -u` and die.
 container_dns_active=""
-if actions_proxy_candidate=$(fetch actions-proxy 2>/dev/null) &&
-	actions_ca_candidate=$(fetch actions-ca-pem 2>/dev/null) &&
-	[ -n "$actions_proxy_candidate" ] && [ -n "$actions_ca_candidate" ]; then
+# THE NPM REGISTRY IS A SECOND INTERCEPTED ORIGIN (ADR-020), named by its own key
+# so a node that does not serve it never names it, and the authority comes with
+# either. Each fetch is contained: a key that is absent is the ordinary case.
+npm_proxy=""
+if ! actions_proxy_candidate=$(fetch actions-proxy 2>/dev/null); then
+	actions_proxy_candidate=""
+fi
+if ! npm_proxy_candidate=$(fetch npm-proxy 2>/dev/null); then
+	npm_proxy_candidate=""
+fi
+if { [ -n "$actions_proxy_candidate" ] || [ -n "$npm_proxy_candidate" ]; } &&
+	actions_ca_candidate=$(fetch actions-ca-pem 2>/dev/null) && [ -n "$actions_ca_candidate" ]; then
 	actions_ca_dir=/home/runner/runner/_work/_billet
 	actions_ca_path="$actions_ca_dir/actions-cache-ca.pem"
 	actions_hook_path="$actions_ca_dir/actions-cache-job-started.sh"
@@ -1613,6 +1622,7 @@ ACTIONS_HOOK
 	chown runner:runner "$actions_hook_path"
 	chmod 0555 "$actions_hook_path"
 	actions_proxy=$actions_proxy_candidate
+	npm_proxy=$npm_proxy_candidate
 
 	# THE NODE CA JOINS THE GUEST SYSTEM TRUST STORE, not only the runner's env.
 	# The DNS remap captures EVERY process in the guest, including dockerd and the
@@ -1661,11 +1671,16 @@ ACTIONS_HOOK
 	# emitting nothing when no real upstream survives -- the one place a value dockerd
 	# would reject is kept out of daemon.json. Its filtering is behavior-tested; the
 	# guard here just refuses to touch daemon.json unless it produced a usable list.
+	#
+	# ONLY FOR THE RESULTS ORIGIN. The npm registry is never remapped for a
+	# container (ADR-020: a container does not trust the node's authority), so a
+	# tier with only the npm cache leaves container DNS as it was.
 	upstream_resolv=/run/systemd/resolve/resolv.conf
 	if [ ! -s "$upstream_resolv" ]; then
 		upstream_resolv=/etc/resolv.conf
 	fi
-	if dns_json=$(/usr/local/bin/billet-dns-upstreams "$docker_gateway" "$upstream_resolv" 2>/dev/null) &&
+	if [ -n "$actions_proxy" ] &&
+		dns_json=$(/usr/local/bin/billet-dns-upstreams "$docker_gateway" "$upstream_resolv" 2>/dev/null) &&
 		[ -n "$dns_json" ]; then
 		# Merge ONLY onto the existing config read successfully -- replacing an
 		# unreadable daemon.json with {} would discard the baked-in storage-driver,
@@ -1680,7 +1695,7 @@ ACTIONS_HOOK
 			container_dns_active=1
 		fi
 	fi
-	if [ -z "$container_dns_active" ]; then
+	if [ -z "$container_dns_active" ] && [ -n "$actions_proxy" ]; then
 		log "container cache DNS was not configured; containers will use GitHub's cache directly"
 	fi
 fi
@@ -1706,6 +1721,16 @@ fi
 # do not inherit /etc/hosts, so a guest dnsmasq bound to the same gateway answers
 # their queries and dockerd is pointed at it. Everything dnsmasq does not remap it
 # forwards to the real upstream, so container egress is unaffected.
+# THE SYSTEM INTERPRETER, NEVER ONE FROM THE TOOLCACHE, for every passthrough. A
+# job may free disk by deleting $AGENT_TOOLSDIRECTORY, as the guest-image build
+# itself does and as the common disk-reclaiming actions do; with the passthrough
+# running from a toolcache Python, its next restart or lazy import failed, the
+# remapped origin refused every connection, and the job's artifact upload failed
+# with ECONNREFUSED after a two-hour build (2026-10-04).
+python_runtime=""
+if [ -x /usr/bin/python3 ]; then
+	python_runtime=/usr/bin/python3
+fi
 actions_cache_active=""
 if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then
 	# These probes run under `set -o pipefail`, so a missing toolcache directory or a
@@ -1713,16 +1738,6 @@ if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_p
 	# `if ! x=$(...); then x=""` contains that AND guarantees the variable is empty on
 	# failure, so the guard below skips interception -- a job on GitHub's cache
 	# directly, never a dead job.
-	# THE SYSTEM INTERPRETER, NEVER ONE FROM THE TOOLCACHE. A job may free disk by
-	# deleting $AGENT_TOOLSDIRECTORY, as the guest-image build itself does and as
-	# the common disk-reclaiming actions do; with the passthrough running from a
-	# toolcache Python, its next restart or lazy import failed, the remapped origin
-	# refused every connection, and the job's artifact upload failed with
-	# ECONNREFUSED after a two-hour build (2026-10-04).
-	python_runtime=""
-	if [ -x /usr/bin/python3 ]; then
-		python_runtime=/usr/bin/python3
-	fi
 	# docker0 must carry the pinned gateway, or the listeners would bind an address
 	# daemon.json's dns list does not name and containers could not reach them.
 	if ! docker_bridge=$(ip -4 -o addr show docker0 2>/dev/null |
@@ -1837,6 +1852,47 @@ if [ -n "$actions_cache_active" ]; then
 	printf '%s results-receiver.actions.githubusercontent.com\n' "$docker_gateway" >>/etc/hosts
 fi
 
+# THE NPM REGISTRY IS REMAPPED FOR THE GUEST'S OWN PROCESSES ONLY (ADR-020). Its
+# passthrough listens on a loopback address, which no container on the bridge can
+# reach, and only /etc/hosts names it: a container does not trust the node's
+# authority and would fail its handshake rather than miss, so containers resolve
+# the registry through their own resolver, which never reads this file
+# (`--no-hosts` below), and go direct. The fallback addresses are the registry's
+# own, resolved before the remap, so a node that cannot take the tunnel leaves
+# npm reaching the registry, exactly as without the cache.
+#
+guest_hosts_file=/etc/hosts
+# BILLET_NPM_START_BEGIN — the block between these markers is extracted and
+# EXECUTED against fake service-manager commands by
+# TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes.
+npm_cache_active=""
+npm_loopback=127.0.2.1
+if [ -n "$npm_proxy" ] && [ -n "$actions_ca_path" ]; then
+	if ! npm_fallback=$(getent ahostsv4 registry.npmjs.org 2>/dev/null |
+		awk '$1 !~ /^127\./ {print $1}' | sort -u | paste -sd, -); then
+		npm_fallback=""
+	fi
+	if [ -n "$python_runtime" ] && [ -n "$npm_fallback" ] &&
+		systemd-run --quiet --unit=billet-npm-proxy --collect --uid=runner --gid=runner \
+			--property=Type=notify --property=NotifyAccess=main --property=TimeoutStartSec=5s \
+			--property=Restart=always --property=RestartSec=100ms \
+			--socket-property=ListenStream="$npm_loopback:443" \
+			--socket-property=Accept=no --socket-property=FlushPending=no \
+			"$python_runtime" /usr/local/bin/billet-actions-proxy \
+			--systemd-socket --upstream "$npm_proxy" --origin registry.npmjs.org \
+			--fallback-addr "$npm_fallback" &&
+		systemctl start billet-npm-proxy.service 2>/dev/null; then
+		npm_cache_active=1
+	else
+		log "the npm cache passthrough did not start (or the registry did not resolve); npm will reach the registry directly"
+		systemctl stop billet-npm-proxy.socket billet-npm-proxy.service 2>/dev/null || true
+	fi
+fi
+if [ -n "$npm_cache_active" ]; then
+	printf '%s registry.npmjs.org\n' "$npm_loopback" >>"$guest_hosts_file"
+fi
+# BILLET_NPM_START_END
+
 # CONTAINERS DO NOT INHERIT /etc/hosts, so a guest dnsmasq answers for them at the
 # gateway dockerd's dns list already names. It ALWAYS forwards; it adds the results
 # remap ONLY when the passthrough is up, so if the passthrough never started a
@@ -1853,7 +1909,10 @@ if [ -n "$container_dns_active" ]; then
 	# --no-resolv, which would win and leave it with none, failing every query it
 	# does not remap. --conf-file=/dev/null keeps it to these arguments alone, and
 	# -u root avoids dropping to a dnsmasq user that dnsmasq-base does not create.
-	dnsmasq_args=(--keep-in-foreground --no-daemon --conf-file=/dev/null -u root
+	# --no-hosts: dnsmasq answers from /etc/hosts unless told not to, and that file
+	# names the npm registry's loopback passthrough, which a container can neither
+	# reach nor trust. The Actions remap is its one explicit --address instead.
+	dnsmasq_args=(--keep-in-foreground --no-daemon --conf-file=/dev/null -u root --no-hosts
 		--listen-address="$docker_gateway" --bind-interfaces
 		--resolv-file="$upstream_resolv")
 	if [ -n "$actions_cache_active" ]; then
@@ -2183,6 +2242,15 @@ if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions
 	fi
 	# BILLET_ADAPTER_ENV_END
 fi
+# A TIER WITH ONLY THE NPM CACHE STILL NEEDS THE AUTHORITY IN THE RUNNER'S
+# ENVIRONMENT: Node reads NODE_EXTRA_CA_CERTS and never the system store, and the
+# remapped registry presents the node's leaf. The job-started hook is the Actions
+# cache's, for containers, which never meet the npm remap.
+# BILLET_NPM_ENV_BEGIN
+if [ -n "$npm_cache_active" ] && [ -z "$actions_cache_active" ]; then
+	runner_env+=("NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path")
+fi
+# BILLET_NPM_ENV_END
 if [ -n "$registry_mirrors_json" ]; then
 	runner_env+=("BILLET_REGISTRY_MIRRORS_JSON=$registry_mirrors_json")
 fi
