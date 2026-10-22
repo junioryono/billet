@@ -295,12 +295,23 @@ func unameKernel() (string, error) {
 // equal the key after the next one. A digest is remembered only when the file's last
 // change is older than settledAfter, the way git treats a "racy" index entry; a file
 // still being written is digested every time.
+//
+// A LINK IS NOT A CHANGE. Every launch hard-links the guest kernel into its jail,
+// and a link moves the inode's change time, so a digest read while another launch
+// linked the file was refused as "changed while it was being read" (measured on the
+// reference node, 2026-10-22: 8 of 10 concurrent restores). The read is judged by
+// what a write moves, the size and the modification time; the change time stays in
+// the key, so a file linked since is digested again rather than trusted.
 type fileDigests struct {
 	mu   sync.Mutex
 	seen map[fileIdentity]string
 
 	// now is the clock a file's settling is judged by; nil is time.Now.
 	now func() time.Time
+
+	// afterRead runs between the read and the second look at the file, so a test
+	// can change the file at the one moment that matters; nil in production.
+	afterRead func()
 }
 
 type fileIdentity struct {
@@ -308,6 +319,17 @@ type fileIdentity struct {
 	dev, ino             uint64
 	size                 int64
 	mtimeNsec, ctimeNsec int64
+}
+
+// sameBytes reports whether two identities are of one file whose contents no write
+// has changed between them: everything but the change time, which a link moves too.
+//
+// ONLY FOR FILES BILLET'S OWN ACCOUNT WRITES, the kernel and the Firecracker binary,
+// whose installer writes a new file and renames it: a writer that reset the
+// modification time after writing would need that account. A file the jailed
+// account wrote is judged by its whole identity (copyOut).
+func (a fileIdentity) sameBytes(b fileIdentity) bool {
+	return a.path == b.path && a.dev == b.dev && a.ino == b.ino && a.size == b.size && a.mtimeNsec == b.mtimeNsec
 }
 
 // of is the digest of the regular file at path, read through one descriptor.
@@ -347,13 +369,17 @@ func (d *fileDigests) ofOpen(f *os.File, path string) (string, error) {
 		return "", err
 	}
 
-	// THE SAME FILE AFTER THE READ AS BEFORE IT, or the digest describes neither.
+	if d.afterRead != nil {
+		d.afterRead()
+	}
+
+	// THE SAME BYTES AFTER THE READ AS BEFORE IT, or the digest describes neither.
 	var after unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &after); err != nil {
 		return "", err
 	}
 
-	if identityOf(path, &after) != key {
+	if !identityOf(path, &after).sameBytes(key) {
 		return "", fmt.Errorf("%s changed while it was being read", path)
 	}
 
