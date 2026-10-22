@@ -69,7 +69,7 @@ func runSourceManifest(t *testing.T, packages []fakePackage, docs map[string]str
 		t.Fatal(err)
 	}
 	listPath := filepath.Join(t.TempDir(), "packages.json")
-	if err := os.WriteFile(listPath, list, 0o644); err != nil {
+	if err := forkSafeWriteFile(listPath, list, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	doc := t.TempDir()

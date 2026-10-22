@@ -392,7 +392,7 @@ func TestTheGateHoldsTheManifestToWhatTheImageLeavesOut(t *testing.T) {
 			t.Parallel()
 
 			path := filepath.Join(t.TempDir(), "manifest.json")
-			if err := os.WriteFile(path, []byte(tc.manifest), 0o600); err != nil {
+			if err := forkSafeWriteFile(path, []byte(tc.manifest), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			out, failed := gateRun(t, "check_manifest_components", t.TempDir(), path, "check_manifest_components")
