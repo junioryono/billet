@@ -247,7 +247,7 @@ func TestNoRefreshStartsOnceTheProxyCloses(t *testing.T) {
 	service, _, _, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
 	service.git.close()
 	request := gitRequest{session: service.sessionOf(provider.InstanceName(scopedLease)), owner: "acme", repo: "api"}
-	refresh := service.startRefresh(t.Context(), request, 7, service.git.mirror(request.key()), "")
+	refresh := service.startRefresh(t.Context(), request, 7, service.git.mirror(request.key()), "", nil, 0)
 	select {
 	case <-refresh.done:
 	default:
