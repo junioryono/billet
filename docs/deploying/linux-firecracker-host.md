@@ -27,6 +27,8 @@ You supply what it cannot safely guess:
 | `billet_ledger_volume_id` | on AWS, the module's ledger volume, mounted fail-closed |
 | `billet_firecracker_version` and checksums | the Firecracker release to install |
 
+`billet join` ([One command on each machine](../operating/nodes.md#one-command-on-each-machine)) does not prepare a Firecracker host: on Linux it verifies `/dev/kvm`, `firecracker`, `jailer` and the `billet` account and refuses with this role as the fix, because the Ceph client, the bridges and the jailer's setup are the role's. The role also renders the host's `billet.yaml` from the inventory, so on a host it converges the converge is the join: `billet join` stops at the generation there, because `billet init` leaves a file it did not write alone. When the control plane's config is the role's too, `billet join accept` prints the node's half as inventory changes rather than editing the rendered file.
+
 The collection's [README](https://github.com/junioryono/billet/blob/main/ansible_collections/junioryono/billet/README.md) documents every variable and the [firecracker-host example](https://github.com/junioryono/billet/tree/main/ansible_collections/junioryono/billet/examples/firecracker-host) is a complete inventory. The first converge against a fresh machine is the documented first step (`--check --diff`, then apply).
 
 ## The config

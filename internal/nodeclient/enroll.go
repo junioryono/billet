@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -121,6 +122,101 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 	}
 
 	return []byte(body.CAPEM), body.Deployment, nil
+}
+
+// ConfirmAuthority asks the control plane at base for its authority again,
+// over a connection verified against the one authority in caPEM whose
+// fingerprint is the one the operator compared, and returns the deployment the
+// answer names and that authority's certificate.
+//
+// FetchCA'S ANSWER PROVES WHICH AUTHORITY, NOT WHO SENT IT: the certificate is
+// public, so anything that has seen it can replay it over an unverified
+// handshake and name any deployment beside it. Only the holder of a key the
+// authority signed completes this handshake, so the deployment read here is
+// the control plane's own. A caller that changes the machine before enrolling
+// confirms first (`billet join`).
+//
+// ONLY THE PINNED CERTIFICATE IS TRUSTED, never the rest of the bundle: FetchCA
+// fingerprints the first certificate of a bundle nothing has authenticated, so
+// a responder could append a root of its own and complete the handshake with a
+// certificate that root signed (Codex, 2026-10-21). During a rotation the
+// control plane presents a certificate the previous authority signed, which
+// this therefore refuses; the error says so, and the join waits for the
+// rotation to finish rather than trusting a root it cannot authenticate.
+func ConfirmAuthority(ctx context.Context, base string, caPEM []byte, fingerprint string) (string, []byte, error) {
+	pinned, err := pinnedAuthority(caPEM, fingerprint)
+	if err != nil {
+		return "", nil, err
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pinned) {
+		return "", nil, errors.New("nodeclient: the authority could not be parsed for verification")
+	}
+
+	endpoint, err := url.JoinPath(base, "/v1/ca")
+	if err != nil {
+		return "", nil, fmt.Errorf("nodeclient: build the ca url: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	if err != nil {
+		return "", nil, fmt.Errorf("nodeclient: build the ca request: %w", err)
+	}
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13},
+		},
+	}
+
+	res, err := client.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("nodeclient: the control plane at %s did not prove it holds a key the "+
+			"authority %s signed (a control plane in the middle of a CA rotation presents the previous "+
+			"authority's certificate; finish it with `billet ca retire` and join again): %w",
+			base, fingerprint, err)
+	}
+
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("nodeclient: the control plane returned %s for its authority", res.Status)
+	}
+
+	var body nodeapi.CAResponse
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
+		return "", nil, fmt.Errorf("nodeclient: decode the authority: %w", err)
+	}
+
+	return body.Deployment, pinned, nil
+}
+
+// pinnedAuthority is the one certificate in caPEM whose fingerprint is
+// fingerprint, as PEM.
+func pinnedAuthority(caPEM []byte, fingerprint string) ([]byte, error) {
+	for rest := caPEM; ; {
+		var block *pem.Block
+
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return nil, fmt.Errorf("nodeclient: the authority bundle holds no certificate with fingerprint %s",
+				fingerprint)
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("nodeclient: parse the authority bundle: %w", err)
+		}
+
+		if wirecert.SameFingerprint(wirecert.FingerprintOfCert(cert), fingerprint) {
+			return pem.EncodeToMemory(block), nil
+		}
+	}
 }
 
 // Enroll asks a control plane to admit this node, and reports what it said: the

@@ -58,6 +58,8 @@ const (
 	HybridOutputAMIPayloadBucket      = "ami_payload_bucket"
 	HybridOutputName                  = "name"
 	HybridOutputRegion                = "region"
+	HybridOutputGeneration            = "generation"
+	HybridOutputAccountID             = "account_id"
 	HybridOutputCacheBucket           = "cache_bucket"
 	HybridOutputCachePrefix           = "cache_prefix"
 	HybridOutputAvailabilityZone      = "availability_zone"
@@ -96,18 +98,21 @@ type HybridFacts struct {
 	RunnerSecurityGroupID          string
 	UntrustedRunnerSecurityGroupID string
 	AMIPayloadBucket               string
-	// Name and Region are consumed by no rendering — every one takes both from
-	// HybridParams. They are read so the two can be COMPARED, because outputs
-	// from another root otherwise render a config that signs against one
-	// deployment and names another's subnet, security group, buckets and
-	// controller, with nothing in the generation saying so.
+	// Generation, AccountID, Name and Region are consumed by no rendering. They
+	// are read so they can be COMPARED, because outputs from another root
+	// otherwise render a config that signs against one deployment and names
+	// another's subnet, security group, buckets and controller, with nothing in
+	// the generation saying so.
 	//
-	// THEY DO NOT BIND TO A ROOT, and nothing available here can. Two generations
-	// sharing a name and a region, in different accounts, are indistinguishable
-	// from these outputs. What this catches is the ordinary mistake — the wrong
-	// outputs.json, or a flag retyped — not a determined one.
-	Name   string
-	Region string
+	// THE GENERATION IS THE BINDING: the plan render minted it and the root
+	// declares it, so outputs carrying another value came from another root
+	// whatever its name and region. The account is compared with the
+	// credentials the render runs under, when it can be, which is the case two
+	// accounts sharing a name and a region would otherwise hide.
+	Generation string
+	AccountID  string
+	Name       string
+	Region     string
 	// The cache facts, demanded only of a generation that asked for one.
 	CacheBucket      string
 	CachePrefix      string
@@ -206,6 +211,12 @@ type HybridParams struct {
 	// Ref is the release every layer pins: the module's ?ref=, the collection's
 	// version and billet_version. `main` for a development build.
 	Ref string
+
+	// Generation is the fingerprint the root declares and every later render
+	// compares with the outputs. The CLI resolves it (flag, then the root
+	// already in the directory, then a fresh one), so a re-run of the plan
+	// render and --force both keep it.
+	Generation string
 
 	// Facts fill the placeholders; nil is the plan render.
 	Facts *HybridFacts
@@ -477,6 +488,10 @@ func checkHybridParams(p *HybridParams) error {
 
 	if p.Ref == "" {
 		return errors.New("initconfig: a hybrid generation needs the release every layer pins")
+	}
+
+	if err := CheckHybridGeneration(p.Generation); err != nil {
+		return err
 	}
 
 	if p.Commission && p.Facts == nil {
@@ -1303,8 +1318,18 @@ output "backup_prefix" {
 }
 
 output %[2]q {
-  description = "The generation these outputs belong to. billet init hybrid compares it and the region with its own flags before it fills a single placeholder, so another root's outputs are refused rather than quietly rendered. It does not identify the ACCOUNT, so two deployments sharing a name and a region are still indistinguishable from here."
+  description = "The name prefix these outputs belong to, compared with --name before billet init hybrid fills a single placeholder."
   value       = %[3]q
+}
+
+output %[5]q {
+  description = "The fingerprint this root was rendered with. Every later billet init hybrid render carries it as --generation and refuses outputs that name another, which binds the outputs to this root where a name and a region cannot."
+  value       = %[6]q
+}
+
+output %[7]q {
+  description = "The account the apply ran in, compared with the credentials a later render runs under whenever those resolve."
+  value       = data.aws_caller_identity.this.account_id
 }
 
 output %[4]q {
@@ -1321,7 +1346,8 @@ output %[1]q {
   description = "Pass to billet ami build --payload-bucket."
   value       = aws_s3_bucket.ami_payloads.id
 }
-`, HybridOutputAMIPayloadBucket, HybridOutputName, p.Name, HybridOutputRegion)
+`, HybridOutputAMIPayloadBucket, HybridOutputName, p.Name, HybridOutputRegion,
+		HybridOutputGeneration, p.Generation, HybridOutputAccountID)
 
 	return b.String()
 }

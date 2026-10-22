@@ -958,6 +958,20 @@ linters:
           - gosec
         text: G703
 
+      # THE SAME REACH, IN THE HOST FAMILY. reportNeedrestart stats fixed names
+      # under the root `billet check` inspects (`/` in production, a test's
+      # directory otherwise), and observeRetireAuthority stats the authority's
+      # fixed paths under the configured identity directory: no path is the
+      # operator's free text. gosec began reporting the three os.Lstat calls in
+      # these two files, unchanged since they were written, when `billet join`
+      # grew internal/ops/host's call graph (the lint of #620, 2026-10-21, with
+      # the cache off; main's lint passed on the same two files). A directive
+      # would be reported unused on a smaller build, as for the files above.
+      - path: (^|/)internal/ops/host/(checkneedrestart|serverretire)\.go$
+        linters:
+          - gosec
+        text: G703
+
       # ----- tests: relax noise-heavy rules -----
       #
       # errcheck is deliberately NOT in this list. It was, on the assumption that

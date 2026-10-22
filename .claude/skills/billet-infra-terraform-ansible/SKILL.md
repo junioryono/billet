@@ -32,6 +32,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **cephadm.log has one rotation rule, ceph-common's.**
 - **A converge restarts services, so never drive one from a runner billet manages.**
 - **The ordinary node restart is requested, never awaited.**
+- **A node is drained for a configuration change only when billet says the node reads it (`billet node config-change`, #183).**
 - **Every node stop the role performs is proved by the node's ending, and every node start is admitted.**
 - **The role's variables that must be supplied, never guessed.**
 - **The host role migrates a node's endpoint through billet's own commands, and infers nothing from the configurations.**
@@ -43,7 +44,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **Reaching hosts is configuration management, not scheduling.**
 - **The shipped playbook `junioryono.billet.fleet` is the consumer's `site.yml`, and it runs the converge guard first in every play.**
-- **A Mac's configuration is converged by `macos_node`, as the node account, and a change is a drain.**
+- **A Mac's configuration is converged by `macos_node`, as the node account, and a change the node reads is a drain.**
 - **The connector roles read a bearer token per host from the environment and refuse what a healthy-looking mistake would hide.**
 - **`actions/converge-fleet` is the consumer's one pin, and the collection it runs is the checkout it runs from.**
 - **`ssh_access` never hardens a host its own converge leaves with no way in, and that refusal is not gated.**

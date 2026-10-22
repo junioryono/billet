@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,7 +30,9 @@ var runningStates = map[string]bool{"running": true}
 func (c *Converger) Plan(ctx context.Context, req lifeops.UpRequest) (lifeops.UpPlan, error) {
 	var plan lifeops.UpPlan
 
-	plan.Refusals = append(plan.Refusals, c.hostRefusals(req)...)
+	refusals, dirs := c.hostRefusals(req)
+	plan.Refusals = append(plan.Refusals, refusals...)
+	plan.Directories = dirs
 
 	// THE SERVER FIRST, ALWAYS: a node that came up first has nothing to
 	// register with.
@@ -64,9 +67,13 @@ func (c *Converger) Plan(ctx context.Context, req lifeops.UpRequest) (lifeops.Up
 	return plan, nil
 }
 
-// hostRefusals are the things wrong with this Mac rather than with a service.
-func (c *Converger) hostRefusals(req lifeops.UpRequest) []lifeops.Refusal {
-	var refusals []lifeops.Refusal
+// hostRefusals are the things wrong with this Mac rather than with a service,
+// and the missing directories this account can create itself.
+func (c *Converger) hostRefusals(req lifeops.UpRequest) ([]lifeops.Refusal, []lifeops.DirectoryCreation) {
+	var (
+		refusals []lifeops.Refusal
+		dirs     []lifeops.DirectoryCreation
+	)
 
 	if os.Getuid() == 0 {
 		refusals = append(refusals, lifeops.Refusal{
@@ -82,19 +89,69 @@ func (c *Converger) hostRefusals(req lifeops.UpRequest) []lifeops.Refusal {
 	// THE DIRECTORIES launchd WILL NOT MAKE. A launch agent declares no
 	// StateDirectory the way a systemd unit does and creates nothing: an absent
 	// log directory makes the agent fail to spawn with no log to say so, which
-	// is the most confusing failure available here. /usr/local is root-owned on
-	// a stock Mac and these commands refuse root, so each of these is a refusal
-	// naming the command rather than something `up` does.
+	// is the most confusing failure available here. A missing one this account
+	// can create (its nearest existing ancestor is a directory it can write) is
+	// created by `up` (#181): on a fresh account ~/Library/LaunchAgents does not
+	// exist, and refusing with `mkdir -p` asked the operator to type what billet
+	// could do. /usr/local is root-owned on a stock Mac and these commands
+	// refuse root, so a directory there stays a refusal naming the command.
 	for _, dir := range c.requiredDirs(req) {
-		if err := c.writableDir(dir); err != nil {
-			refusals = append(refusals, lifeops.Refusal{
-				What:   fmt.Sprintf("%s is not a directory this account can write (%v)", dir, err),
-				Remedy: c.makeDirCommand(dir),
-			})
+		err := c.writableDir(dir)
+		if err == nil {
+			continue
+		}
+
+		if errors.Is(err, fs.ErrNotExist) && creatableBy(dir) {
+			dirs = append(dirs, lifeops.DirectoryCreation{Path: dir, Mode: dirMode(req, dir)})
+
+			continue
+		}
+
+		refusals = append(refusals, lifeops.Refusal{
+			What:   fmt.Sprintf("%s is not a directory this account can write (%v)", dir, err),
+			Remedy: c.makeDirCommand(dir),
+		})
+	}
+
+	return refusals, dirs
+}
+
+// creatableBy reports whether this account can create dir: its nearest
+// existing ancestor is a directory it can write and search.
+//
+// IT ASKS RATHER THAN PROBES, as makeDirCommand does and for its reason: this
+// runs under --dry-run too. Being wrong in the permissive direction costs a
+// creation that fails with the error saying why, before anything was started.
+func creatableBy(dir string) bool {
+	for parent := filepath.Dir(dir); ; parent = filepath.Dir(parent) {
+		info, err := os.Stat(parent)
+		switch {
+		case err == nil:
+			return info.IsDir() && unix.Access(parent, unix.W_OK|unix.X_OK) == nil
+		case !errors.Is(err, fs.ErrNotExist):
+			return false
+		case parent == filepath.Dir(parent):
+			return false
+		}
+	}
+}
+
+// dirMode is the mode a created directory gets: what holds the ledger, the
+// node's state, its locks or an App key is the account's alone.
+func dirMode(req lifeops.UpRequest, dir string) fs.FileMode {
+	private := make([]string, 0, 3+len(req.KeyPaths))
+	private = append(private, req.ServerStateDir, req.NodeStateDir, req.NodeLockDir)
+	for _, path := range req.KeyPaths {
+		private = append(private, filepath.Dir(path))
+	}
+
+	for _, p := range private {
+		if p != "" && p == dir {
+			return 0o700
 		}
 	}
 
-	return refusals
+	return 0o755
 }
 
 // makeDirCommand renders how to create a directory, asking for root ONLY where

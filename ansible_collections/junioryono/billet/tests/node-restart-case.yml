@@ -63,6 +63,12 @@
     billet_ending_become: false
     billet_config_install:
       changed: "{{ billet_gate_restart_case.config_changed | default(false) }}"
+    # BILLET'S VERDICT ON THE CHANGE (node-config-verdict.yml), as account.yml
+    # sets it: a changed configuration is a node change unless billet said
+    # keep, which a case states as node_reads: false.
+    billet_node_config_changed: >-
+      {{ (billet_gate_restart_case.config_changed | default(false) | bool)
+         and (billet_gate_restart_case.node_reads | default(true) | bool) }}
   block:
     - name: Include the node restart, asking this converge's answerer
       ansible.builtin.include_role:

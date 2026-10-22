@@ -59,6 +59,7 @@ type converger interface {
 	ManagerName() string
 	CollateralNote() string
 	Identity(req lifeops.UpRequest) (int, int, error)
+	ApplyDirectories(dirs []lifeops.DirectoryCreation) error
 	ApplyOwnership(changes []lifeops.OwnershipChange, uid, gid int) error
 	RepairServerState(dir string, uid, gid int) ([]string, error)
 	RepairPaths(dir string, targets []lifeops.RepairTarget, uid, gid int) ([]string, error)
@@ -219,6 +220,13 @@ func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
+
+	// THE DIRECTORIES FIRST, under the lock: everything after this reads or
+	// writes in them, and launchd fails to spawn an agent whose log directory
+	// is missing without a log to say so.
+	if err := c.ApplyDirectories(plan.Directories); err != nil {
+		return err
+	}
 
 	uid, gid, err := c.Identity(req)
 	if err != nil {
@@ -1009,12 +1017,15 @@ func refused(refusals []lifeops.Refusal) error {
 
 // printPlan reports what will change before anything does.
 func printPlan(env cli.Env, plan lifeops.UpPlan) {
-	if len(plan.Ownership) == 0 && len(plan.Units) == 0 {
+	if len(plan.Directories) == 0 && len(plan.Ownership) == 0 && len(plan.Units) == 0 {
 		fmt.Fprintln(env.Stdout, "plan     nothing to change")
 
 		return
 	}
 
+	for _, d := range plan.Directories {
+		fmt.Fprintf(env.Stdout, "plan     create %s %04o\n", d.Path, d.Mode.Perm())
+	}
 	for _, change := range plan.Ownership {
 		fmt.Fprintf(env.Stdout, "plan     %s -> %s:%s %04o\n", change.Path, change.Owner, change.Group, change.Mode.Perm())
 		fmt.Fprintf(env.Stdout, "         %s\n", change.Why)

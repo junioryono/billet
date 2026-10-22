@@ -53,6 +53,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: func(ctx context.Context, env cli.Env, args []string) error { return cmdNode(ctx, env, lc, args) }},
 		{Name: "nodes", Summary: "approve the machines asking to join this deployment",
 			Run: fleetops.Nodes},
+		{Name: "join", Summary: "join this machine to a deployment, or take a joining node's half on its control plane",
+			Run: host.Join},
 		{Name: "ca", Summary: "issue the certificates nodes authenticate with",
 			Run: fleetops.CA},
 		{Name: "leases", Summary: "show capacity held for compute nobody has accounted for",
@@ -174,6 +176,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 			return host.NodeReceipt(ctx, env, args[1:])
 		case "ending":
 			return host.NodeEnding(ctx, env, args[1:])
+		case "config-change":
+			return host.NodeConfigChange(ctx, env, args[1:])
 		}
 	}
 

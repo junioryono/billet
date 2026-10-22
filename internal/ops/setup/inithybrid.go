@@ -40,6 +40,7 @@ type hybridInputs struct {
 	cacheListen, cacheGuest                    string
 	cfgPath                                    string
 	out                                        string
+	generation                                 string
 }
 
 // cmdInitHybrid writes the hybrid shape -- a Terraform root, an inventory with
@@ -129,6 +130,10 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 			"(needs --terraform-output; run after billet ca issue)")
 	ami := fs.String("ami", "", "the AMI `billet ami build` produced, for every tier's launch.ec2 (with --commission)")
 	force := fs.Bool("force", false, "replace a file in --out even when it is not billet's own")
+	generation := fs.String("generation", "",
+		"the fingerprint the plan render minted and the root declares; the runbook carries it, "+
+			"and every later render refuses outputs that name another (default: read from "+
+			"--out's terraform/main.tf, or minted by a plan render)")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -199,6 +204,11 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 
 	untrusted := *group == "" && len(workflows) == 0
 
+	gen, err := resolveHybridGeneration(*out, *generation, setFlags["generation"], *tfOutput != "")
+	if err != nil {
+		return err
+	}
+
 	var facts *initconfig.HybridFacts
 	if *tfOutput != "" {
 		raw, err := os.ReadFile(*tfOutput)
@@ -212,24 +222,8 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 			return err
 		}
 
-		// THE OUTPUTS HAVE TO BE THIS GENERATION'S. Every rendering takes the name
-		// and region from the flags while every id here comes from an apply, so
-		// another root's outputs render a config that signs against one
-		// deployment and names another's subnet, security group, buckets and
-		// controller. Nothing downstream refuses it: a cache generation
-		// eventually trips over the availability zone, and a generation without
-		// one prints an AMI command that simply cannot work.
-		//
-		// THIS IS NOT A BINDING, and the message says which mistake it caught
-		// rather than claiming the file is now proved to be this root's. Two
-		// generations sharing a name and a region in different accounts are
-		// identical from here; #62 is what would actually bind them.
-		if f.Name != *name || f.Region != *region {
-			return fmt.Errorf("--terraform-output was written by the %q root in %s and this "+
-				"generation is %q in %s: every id in that file names another deployment's "+
-				"resources, so either re-render with --name %s --region %s or point "+
-				"--terraform-output at this generation's own outputs",
-				f.Name, f.Region, *name, *region, cli.ShellArg(f.Name), cli.ShellArg(f.Region))
+		if err := bindHybridOutputs(ctx, env, f, gen, *name, *region); err != nil {
+			return err
 		}
 
 		facts = &f
@@ -268,6 +262,7 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 			CacheGuestEndpoint: *cacheGuest,
 		},
 		Ref:        ref,
+		Generation: gen,
 		Facts:      facts,
 		Commission: *commission,
 		AMI:        *ami,
@@ -311,15 +306,35 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 		keyName: *keyName, localUser: *localUser, localImage: *localImage, builder: *builder,
 		cache: *cache, localSite: *localSite, cloudSite: *cloudSite,
 		kernelImage: *kernelImage, cephUser: *cephUser, cephKey: *cephKeyring,
-		cacheListen: *cacheListen, cacheGuest: *cacheGuest, out: *out,
+		cacheListen: *cacheListen, cacheGuest: *cacheGuest, out: *out, generation: gen,
 	}
 	if setFlags["config"] {
 		in.cfgPath = *cfgPath
 	}
 	files[HybridRunbookFile] = renderHybridRunbook(in, p, trusted, carried)
 
+	// HELD FROM HERE TO THE RECORD, AND THE GENERATION RESOLVED AGAIN UNDER IT,
+	// so two renders into one --out cannot interleave (see lockHybridOut), while
+	// every refusal above still writes nothing at all.
+	hybridBeforeLock()
+
+	unlock, err := lockHybridOut(*out)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if err := recheckHybridGeneration(*out, gen, setFlags["generation"]); err != nil {
+		return err
+	}
+
+	hybridLocked()
+
 	written, beside, err := writeHybridFiles(env, *out, files, *force)
 	if err != nil {
+		return err
+	}
+	if err := recordHybridGeneration(*out, gen); err != nil {
 		return err
 	}
 
@@ -542,6 +557,7 @@ func hybridFlags(in hybridInputs) []string {
 
 	add("name", in.name)
 	add("region", in.region)
+	add("generation", in.generation)
 	add("org", in.org)
 	add("repository", in.repository)
 	add("runner-group", in.runnerGroup)
@@ -648,6 +664,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	fmt.Fprintf(&b, "# Bringing up the %s hybrid deployment\n\n", p.Name)
 	b.WriteString("One `runs-on` label means the machine at home if it is up and EC2 if it is not, with a small always-on controller. These are the steps between the files billet wrote, in the order they depend on each other, and every command runs from this directory. Every converge names one host with `-l`, because a bare run reaching a host before its certificate exists fails at `billet check` after a wasted drain.\n\n")
 	fmt.Fprintf(&b, "The tiers are %s\n\n", trust)
+	fmt.Fprintf(&b, "This generation is `%s`, recorded in `%s` beside this file. The Terraform root declares it as the `generation` output and every render command below carries it as `--generation`, so a later render refuses outputs another root wrote even when their name and region match. A render also compares the `account_id` output with the account its own AWS credentials are in, and says so when it cannot ask.\n\n", p.Generation, HybridGenerationFile)
 
 	b.WriteString("## 1. Mint the GitHub App\n\n")
 	if carried {

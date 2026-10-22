@@ -23,10 +23,18 @@ type JoinResult struct {
 	// its tiers, its nodes: policy, and how far to raise the deployment ceiling.
 	// Printed, never written, because it belongs in another machine's file.
 	ControlPlane string
+	// Proposal is the same half as data, for `billet join accept` to apply on
+	// the control plane.
+	Proposal JoinProposal
 }
 
 // Join turns a single-machine generation into a node-only config for a control
-// plane at serverAddr, with its certificate bundle under tlsDir.
+// plane at serverAddr, with its certificate bundle under tlsDir, named nodeName
+// when it is given.
+//
+// THE NAME, BECAUSE THE NODE ENROLLS: `billet node --enroll` names the request
+// before any certificate exists to take a name from, and a generation for a
+// backend that carries no macOS tier writes no node.name of its own.
 //
 // A TRANSFORM OF Generate's OUTPUT, not a second generator, so what the machine
 // was measured to hold, and the tiers that fit it, have one author. What moves:
@@ -34,7 +42,7 @@ type JoinResult struct {
 // does not have, for node.max_vcpu/max_memory. Left unset there, a node
 // contributes its WHOLE machine, more than the ceiling the control plane was
 // sized for, and nothing says so; a hand-edited join lost it exactly that way.
-func Join(generated, serverAddr, tlsDir string) (JoinResult, error) {
+func Join(generated, serverAddr, tlsDir, nodeName string) (JoinResult, error) {
 	serverAddr = strings.TrimSpace(serverAddr)
 	if serverAddr == "" {
 		return JoinResult{}, errors.New("--join: the control plane's node-wire address is empty")
@@ -61,6 +69,23 @@ func Join(generated, serverAddr, tlsDir string) (JoinResult, error) {
 	maxMemory := mappingValue(server, "max_memory")
 	if maxVCPU == nil || maxMemory == nil {
 		return JoinResult{}, errors.New("the generated server block names no ceiling to carry to the node")
+	}
+
+	if nodeName != "" {
+		if err := config.ValidateNodeName("--node-name", nodeName); err != nil {
+			return JoinResult{}, err
+		}
+		if had := scalarValue(node, "name"); had != "" && had != nodeName {
+			return JoinResult{}, fmt.Errorf("the generation names this node %q and --node-name %q", had, nodeName)
+		}
+		setScalar(node, "name", nodeName)
+	}
+
+	// THE PROPOSAL BEFORE ANYTHING IS REMOVED, from the generation's own tiers,
+	// nodes: and measured ceiling.
+	proposal, err := proposalFrom(root, maxVCPU.Value, maxMemory.Value)
+	if err != nil {
+		return JoinResult{}, err
 	}
 
 	for _, key := range []string{"server", "github", "targets"} {
@@ -103,7 +128,7 @@ func Join(generated, serverAddr, tlsDir string) (JoinResult, error) {
 		return JoinResult{}, err
 	}
 
-	return JoinResult{Node: out.String(), ControlPlane: cp}, nil
+	return JoinResult{Node: out.String(), ControlPlane: cp, Proposal: proposal}, nil
 }
 
 // joinKeyOf names what identifies an entry in each list the control plane
