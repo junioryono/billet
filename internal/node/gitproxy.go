@@ -398,8 +398,10 @@ func (b gitUpstreamBody) Read(p []byte) (int, error) {
 
 func (e *gitExchange) touch() { e.moved.Store(time.Now().UnixNano()) }
 
+// WriteHeader sends status, and records the first final one: an interim 1xx a
+// forward relays is not what the request answered.
 func (e *gitExchange) WriteHeader(status int) {
-	if e.status == 0 {
+	if e.status == 0 && status >= http.StatusOK {
 		e.status = status
 	}
 	e.ResponseWriter.WriteHeader(status)
@@ -456,8 +458,14 @@ func (b gitBody) Read(p []byte) (int, error) {
 
 // serveGit answers one request under gitPathPrefix.
 func (s *CacheService) serveGit(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	// EVERY REQUEST IS COUNTED ONCE, these three before the line the rest end
+	// with; none of them reached a repository's grant.
+	refused := func(reason gitReason, status int) {
+		s.git.observe().GitRequest(gitRouteRefused, reason.label, gitStatusClass(status), 0)
+	}
 	request, ok, authenticated := s.parseGitRequest(r)
 	if !ok {
+		refused(gitNotAGitPath, http.StatusNotFound)
 		http.NotFound(w, r)
 
 		return
@@ -465,6 +473,7 @@ func (s *CacheService) serveGit(ctx context.Context, w http.ResponseWriter, r *h
 	// ASKED FOR CREDENTIALS, which makes git run the guest's helper: the first
 	// request of every fetch carries none, because the rewrite dropped them.
 	if !authenticated {
+		refused(gitCredentialsRequired, http.StatusUnauthorized)
 		w.Header().Set("WWW-Authenticate", `Basic realm="billet"`)
 		http.Error(w, "credentials required", http.StatusUnauthorized)
 
@@ -472,6 +481,7 @@ func (s *CacheService) serveGit(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	ctx, cancel, err := extendTransferFor(ctx, w, gitRequestLife)
 	if err != nil {
+		refused(gitTransferRefused, http.StatusServiceUnavailable)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 
 		return
@@ -751,7 +761,11 @@ func (s *CacheService) forwardGit(exchange *gitExchange, r *http.Request, reques
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			exchange.answered(gitRouteGitHub, gitGitHubUnreachable, reason.text+": "+err.Error())
+			why := reason.text
+			if detail != "" {
+				why += ": " + detail
+			}
+			exchange.answered(gitRouteGitHub, gitGitHubUnreachable, why+"; github.com did not answer: "+err.Error())
 			http.Error(w, "github.com is unreachable", http.StatusBadGateway)
 		},
 	}
@@ -1023,7 +1037,15 @@ func (s *CacheService) gitAdvertise(ctx context.Context, exchange *gitExchange, 
 	}
 	if resp.StatusCode != http.StatusOK {
 		s.git.remember(request, s.now(), sequence, false, 0)
-		exchange.answered(gitRouteGitHub, gitNotAuthorised, "")
+		switch {
+		case resp.StatusCode >= 300 && resp.StatusCode < 400:
+			exchange.answered(gitRouteGitHub, gitRedirected, "")
+		case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden,
+			resp.StatusCode == http.StatusNotFound:
+			exchange.answered(gitRouteGitHub, gitNotAuthorised, "")
+		default:
+			exchange.answered(gitRouteGitHub, gitGitHubFailed, strconv.Itoa(resp.StatusCode))
+		}
 		s.relayGit(exchange, r, resp)
 
 		return
@@ -1528,6 +1550,7 @@ func (s *CacheService) startRefresh(
 	s.git.lifecycle.Lock()
 	defer s.git.lifecycle.Unlock()
 	if s.git.closed {
+		s.git.observe().GitRefresh(gitRefreshClosed, 0)
 		refresh := &gitRefresh{done: make(chan struct{}), err: errGitClosed}
 		close(refresh.done)
 
@@ -1545,10 +1568,14 @@ func (s *CacheService) startRefresh(
 		defer s.git.background.Done()
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gitRefreshLife)
 		defer cancel()
+		// ENDED BY close WITH errGitClosed AS ITS CAUSE, so the refresh is
+		// counted as closed rather than as whatever its cut fetch looked like.
+		ctx, end := context.WithCancelCause(ctx)
+		defer end(nil)
 		go func() {
 			select {
 			case <-s.git.stopping:
-				cancel()
+				end(errGitClosed)
 			case <-ctx.Done():
 			}
 		}()
@@ -1590,6 +1617,9 @@ func (s *CacheService) refresh(
 			}
 			mirror.use.Unlock()
 		}
+	}
+	if err != nil && errors.Is(context.Cause(ctx), errGitClosed) {
+		err = errors.Join(errGitClosed, err)
 	}
 	took := s.now().Sub(started)
 	s.git.observe().GitRefresh(gitRefreshOutcome(err), took)
@@ -2009,13 +2039,17 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 	// STILL GRANTED AND STILL VERIFIED, read at the last moment: a refresh that
 	// shares this request's hold on the mirror can leave it unverified while
 	// the request waits.
-	stillGranted := func() bool {
-		again, ok := s.git.granted(request, s.now())
-		stamped, _, err := mirrorRepository(path)
+	servable := func() gitReason {
+		if again, ok := s.git.granted(request, s.now()); !ok || again != repository {
+			return gitGrantEnded
+		}
+		if stamped, _, err := mirrorRepository(path); err != nil || stamped != repository || s.git.quarantined(path) {
+			return gitMirrorNotServable
+		}
 
-		return ok && again == repository && err == nil && stamped == repository && !s.git.quarantined(path)
+		return gitReason{}
 	}
-	if served, reason, detail := s.serveUploadPack(ctx, exchange, path, negotiation, stillGranted); !served {
+	if served, reason, detail := s.serveUploadPack(ctx, exchange, path, negotiation, servable); !served {
 		s.forwardGit(exchange, r, request, reason, detail)
 
 		return
@@ -2035,7 +2069,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, exchange *gitExchange,
 // advertisement removes it and every fetch after goes to GitHub until it is
 // fetched again.
 func (s *CacheService) serveUploadPack(
-	ctx context.Context, exchange *gitExchange, path string, negotiation []byte, stillGranted func() bool,
+	ctx context.Context, exchange *gitExchange, path string, negotiation []byte, servable func() gitReason,
 ) (bool, gitReason, string) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -2062,19 +2096,24 @@ func (s *CacheService) serveUploadPack(
 	// A TIMER THAT FIRED HAS KILLED upload-pack, even one whose line arrived as
 	// it fired, so that answer is not served.
 	answeredInTime := quiet.Stop()
-	// THE GRANT ONCE MORE, at the last moment before an answer commits: the
-	// wait for the first line can outlast it, or meet a refusal GitHub gave
-	// this header meanwhile.
-	granted := err != nil || !answeredInTime || stillGranted()
-	if err != nil || !answeredInTime || !granted || bytes.HasPrefix(first[min(len(first), 4):], []byte("ERR ")) {
+	// THE GRANT AND THE MIRROR ONCE MORE, at the last moment before an answer
+	// commits: the wait for the first line can outlast the grant, meet a
+	// refusal GitHub gave this header meanwhile, or meet a refresh that marked
+	// the mirror.
+	var unservable gitReason
+	if err == nil && answeredInTime {
+		unservable = servable()
+	}
+	if err != nil || !answeredInTime || unservable != (gitReason{}) ||
+		bytes.HasPrefix(first[min(len(first), 4):], []byte("ERR ")) {
 		cancel()
 		waitErr := cmd.Wait()
 		reason, detail := gitMirrorDidNotAnswer, "the mirror's upload-pack said nothing"
 		switch {
 		case !answeredInTime:
 			detail = fmt.Sprintf("the mirror's upload-pack said nothing within %s", s.git.firstLineWait)
-		case !granted:
-			reason, detail = gitGrantEnded, ""
+		case unservable != (gitReason{}):
+			reason, detail = unservable, ""
 		case err == nil:
 			detail = "the mirror refused: " + strings.TrimSpace(string(first[4:]))
 		}

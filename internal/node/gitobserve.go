@@ -79,11 +79,17 @@ var (
 	gitGrantEnded            = gitReason{"grant_ended", "github.com's grant ended before the mirror answered"}
 	gitMirrorDidNotAnswer    = gitReason{"mirror_did_not_answer", "the mirror's upload-pack did not answer"}
 	gitUnanswered            = gitReason{"unanswered", "the request ended before it was answered"}
+	gitNotAGitPath           = gitReason{"not_a_git_path", "not a repository's git path"}
+	gitCredentialsRequired   = gitReason{"credentials_required", "credentials required"}
+	gitTransferRefused       = gitReason{"transfer_refused", "could not extend the transfer's deadline"}
+	gitRedirected            = gitReason{"redirected", "github.com redirected the request"}
+	gitGitHubFailed          = gitReason{"github_error", "github.com answered with an error"}
 	gitReasons               = []gitReason{gitServed, gitBusy, gitCacheOff, gitOutsideOwner, gitNotAFetch,
 		gitUnreadableRequest, gitRequestTooLarge, gitGitHubUnreachable, gitRenamedOutsideOwner, gitNotAuthorised,
 		gitNoRepositoryID, gitMirrorUnavailable, gitNoGrant, gitProtocolV2, gitMirrorBeingRemoved, gitNoMirror,
 		gitMirrorNotServable, gitNegotiationTooLarge, gitNegotiationUnreadable, gitMirrorLacksObject,
-		gitGrantEnded, gitMirrorDidNotAnswer, gitUnanswered}
+		gitGrantEnded, gitMirrorDidNotAnswer, gitUnanswered, gitNotAGitPath, gitCredentialsRequired,
+		gitTransferRefused, gitRedirected, gitGitHubFailed}
 )
 
 // GitReasons is every reason a request is counted under.
@@ -100,7 +106,7 @@ func GitReasons() []string {
 // is a request that ended before it answered.
 func gitStatusClass(status int) string {
 	switch {
-	case status == 0:
+	case status < 200:
 		return "none"
 	case status < 300:
 		return "2xx"
@@ -146,6 +152,10 @@ func gitRefreshOutcome(err error) string {
 	switch {
 	case err == nil:
 		return gitRefreshOK
+	// CLOSE FIRST: a refresh close cut ends with whatever its fetch looked like
+	// joined to errGitClosed.
+	case errors.Is(err, errGitClosed):
+		return gitRefreshClosed
 	case errors.Is(err, errFetchNotVerified):
 		return gitRefreshUnverified
 	case errors.Is(err, errMirrorTooLarge):
@@ -154,8 +164,6 @@ func gitRefreshOutcome(err error) string {
 		return gitRefreshBusy
 	case errors.Is(err, errGitDiskFull):
 		return gitRefreshFull
-	case errors.Is(err, errGitClosed):
-		return gitRefreshClosed
 	default:
 		return gitRefreshFailed
 	}

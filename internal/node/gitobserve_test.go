@@ -1,8 +1,13 @@
 package node
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -83,6 +88,93 @@ func TestTheGitProxyReportsWhatItDid(t *testing.T) {
 	}
 }
 
+// EACH REQUEST IS COUNTED EXACTLY ONCE, under its own labels: one served
+// advertisement and one served fetch are two counts and no more, and a request
+// without credentials, the first of every fetch, is counted once as refused.
+func TestEachGitRequestIsCountedOnce(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, token := gitNode(t, upstream)
+	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
+		"https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, output)
+	}
+	observer := &recordingGitObserver{}
+	service.SetGitObserver(observer)
+
+	advertise(t, node, token, "api")
+	if body := negotiate(t, node, token, githubBasic, runIn(t, upstream.repo, "rev-parse", "main")); !strings.Contains(string(body), "PACK") {
+		t.Fatalf("the fetch was not served: %q", body[:min(len(body), 80)])
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+		node.URL+"/v1/git/github.com/acme/api.git/info/refs?service=git-upload-pack", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// A REQUEST IS COUNTED AS ITS HANDLER ENDS, which can be just after the
+	// client has its answer, so the count is awaited before it is judged.
+	const want = 3
+	requests := gitWithin(t, "three counted requests", func() []string {
+		for t.Context().Err() == nil {
+			if requests, _, _ := observer.seen(); len(requests) >= want {
+				return requests
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		return nil
+	})
+	slices.Sort(requests)
+	if expected := []string{"mirror served 2xx", "mirror served 2xx", "refused credentials_required 4xx"}; !slices.Equal(requests, expected) {
+		t.Fatalf("the three requests were counted as %v, want %v", requests, expected)
+	}
+}
+
+// A REQUEST IS COUNTED UNDER ITS FINAL STATUS: an interim 1xx a forward relays
+// before GitHub's answer is not what the request answered, and a body written
+// with no header is a 200.
+func TestAnExchangeRecordsItsFinalStatus(t *testing.T) {
+	t.Parallel()
+
+	for name, c := range map[string]struct {
+		write func(*gitExchange) error
+		want  int
+	}{
+		"interim then final": {func(e *gitExchange) error {
+			e.WriteHeader(http.StatusEarlyHints)
+			e.WriteHeader(http.StatusForbidden)
+
+			return nil
+		}, http.StatusForbidden},
+		"body alone": {func(e *gitExchange) error {
+			_, err := e.Write([]byte("0000"))
+
+			return err
+		}, http.StatusOK},
+		"first final kept": {func(e *gitExchange) error {
+			e.WriteHeader(http.StatusBadGateway)
+			e.WriteHeader(http.StatusOK)
+
+			return nil
+		}, http.StatusBadGateway},
+	} {
+		exchange := &gitExchange{ResponseWriter: httptest.NewRecorder(), moved: &atomic.Int64{}}
+		if err := c.write(exchange); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if exchange.status != c.want {
+			t.Errorf("%s: the exchange recorded %d, want %d", name, exchange.status, c.want)
+		}
+	}
+}
+
 // splitThree is a recorded request's route, reason and status.
 func splitThree(request string) (string, string, string) {
 	var parts [3]string
@@ -105,13 +197,15 @@ func TestGitOutcomesAreReadFromWhatEndedThem(t *testing.T) {
 	t.Parallel()
 
 	for err, want := range map[error]string{
-		nil:                 gitRefreshOK,
-		errFetchNotVerified: gitRefreshUnverified,
-		errMirrorTooLarge:   gitRefreshTooLarge,
-		errFetchSlotsBusy:   gitRefreshBusy,
-		errGitDiskFull:      gitRefreshFull,
-		errGitClosed:        gitRefreshClosed,
-		errNotOurs:          gitRefreshFailed,
+		nil: gitRefreshOK,
+		// A FETCH CLOSE CUT is counted as closed whatever it looked like.
+		errors.Join(errGitClosed, errFetchNotVerified): gitRefreshClosed,
+		errFetchNotVerified:                            gitRefreshUnverified,
+		errMirrorTooLarge:                              gitRefreshTooLarge,
+		errFetchSlotsBusy:                              gitRefreshBusy,
+		errGitDiskFull:                                 gitRefreshFull,
+		errGitClosed:                                   gitRefreshClosed,
+		errNotOurs:                                     gitRefreshFailed,
 	} {
 		if got := gitRefreshOutcome(err); got != want {
 			t.Errorf("gitRefreshOutcome(%v) = %q, want %q", err, got, want)
