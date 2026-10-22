@@ -310,6 +310,38 @@ func (r *osRoot) OpenRegular(name string) (ownedFile, error) {
 	return f, nil
 }
 
+// mountedFile is an entry that says where it is mounted itself, which a test's
+// file does; a descriptor says so through regularfile.MountOf.
+type mountedFile interface {
+	Mount() (regularfile.Mount, error)
+}
+
+// mountOf reports where a repair target lives, and refuses an entry that cannot
+// say: a target whose mount is unknown cannot be told from one mounted onto its
+// name.
+func mountOf(f ownedFile) (regularfile.Mount, error) {
+	switch f := f.(type) {
+	case mountedFile:
+		return f.Mount()
+	case *os.File:
+		return regularfile.MountOf(f)
+	default:
+		return regularfile.Mount{}, errors.New("billet could not tell which mount it is on")
+	}
+}
+
+// directoryMount reports where the opened state directory itself lives.
+func directoryMount(root rootFS) (regularfile.Mount, error) {
+	d, err := root.OpenFile(".", os.O_RDONLY, 0)
+	if err != nil {
+		return regularfile.Mount{}, fmt.Errorf("open it to tell which mount it is on: %w", err)
+	}
+
+	defer func() { _ = d.Close() }()
+
+	return mountOf(d)
+}
+
 // Plan decides what `up` would do, and every reason it would not.
 //
 // IT COLLECTS REFUSALS RATHER THAN RETURNING THE FIRST. An operator who has to
@@ -1132,20 +1164,14 @@ func (c *Converger) RepairPaths(
 	}
 	defer func() { _ = root.Close() }()
 
-	// THE DIRECTORY'S OWN FILESYSTEM decides which files belong to it. Read from
-	// a descriptor on the directory rather than by path, for the same reason
-	// every other check here is.
-	// Kept as the platform's own stat rather than converted: the device field is
-	// uint64 on linux/amd64, uint32 on linux/arm64 and signed on darwin, and
-	// comparing two of the same kind needs no conversion on any of them.
-	var dirStat *syscall.Stat_t
-	if d, err := root.OpenFile(".", os.O_RDONLY, 0); err == nil {
-		if info, err := d.Stat(); err == nil {
-			if st, ok := info.Sys().(*syscall.Stat_t); ok {
-				dirStat = st
-			}
-		}
-		_ = d.Close()
+	// THE DIRECTORY'S OWN MOUNT decides which files belong to it. Read from a
+	// descriptor on the directory rather than by path, for the same reason every
+	// other check here is, and a directory whose mount cannot be read refuses:
+	// without it nothing below can tell a file of its own from one mounted onto
+	// its name.
+	dirMount, err := directoryMount(root)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", dir, err)
 	}
 
 	var repaired []string
@@ -1183,7 +1209,7 @@ func (c *Converger) RepairPaths(
 				"owned by root: %w", path.Join(dir, target.Name), err)
 		}
 
-		change, err := repairOne(f, uid, gid, dirStat, target.Dir)
+		change, err := repairOne(f, uid, gid, dirMount, target.Dir)
 		_ = f.Close()
 
 		if err != nil {
@@ -1203,7 +1229,7 @@ func (c *Converger) RepairPaths(
 // a state billet cannot account for is a host that will not come up, and saying
 // so quietly while starting the service anyway is the failure this whole
 // function exists to prevent.
-func repairOne(f ownedFile, uid, gid int, dirStat *syscall.Stat_t, wantDir bool) (bool, error) {
+func repairOne(f ownedFile, uid, gid int, dirMount regularfile.Mount, wantDir bool) (bool, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return false, err
@@ -1239,17 +1265,21 @@ func repairOne(f ownedFile, uid, gid int, dirStat *syscall.Stat_t, wantDir bool)
 			"this directory and changing its owner would change that too", st.Nlink)
 	}
 
-	// AND IT MUST BE ON THE SAME FILESYSTEM AS THE DIRECTORY IT IS IN. A file
-	// bind-mounted onto one of these names is an inode from somewhere else
-	// wearing an authorized name, and a chown here would land on it.
-	//
-	// THE RESIDUAL, STATED: a bind mount from the SAME filesystem shares this
-	// device and is not caught. Setting one up needs CAP_SYS_ADMIN, and anything
-	// holding that can chown the target directly — so what remains is a blast
-	// radius rather than an escalation.
-	if dirStat != nil && st.Dev != dirStat.Dev {
-		return false, errors.New("is on a different filesystem from the directory it is in, so " +
-			"it is not state this host's preflight created")
+	// AND IT MUST BE ON THE MOUNT OF THE DIRECTORY IT IS IN. A file bind-mounted
+	// onto one of these names is an inode from somewhere else wearing an
+	// authorized name, and a chown here would land on it. The mount rather than
+	// the device: a bind mount from the same filesystem shares the device, and on
+	// an overlay of more than one filesystem a file and its directory report
+	// different ones (#123). A kernel that reports no mount identity is answered
+	// by the device, which leaves the same-filesystem bind mount uncaught there.
+	entry, err := mountOf(f)
+	if err != nil {
+		return false, err
+	}
+
+	if !dirMount.Holds(entry) {
+		return false, errors.New("is not on the mount of the directory it is in, so it is not " +
+			"state this host's preflight created")
 	}
 
 	// Only the CHANGE depends on who owns it — but "not root" is not "the

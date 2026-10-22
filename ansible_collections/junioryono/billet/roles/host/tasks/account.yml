@@ -262,6 +262,14 @@
     - not ansible_check_mode
     - billet_installed_binary.stat.exists
 
+# THE PROVENANCE RECORD, BESIDE THE JOURNAL (#91): see preserve-provenance.yml.
+- name: Preserve the provenance record beside the journal before live mutation
+  ansible.builtin.import_tasks: preserve-provenance.yml
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
 # A CANDIDATE THAT DOES NOT KNOW THE HOLD FLAG REFUSES IT, in its own flag parser,
 # before it has probed anything. Releases through v0.9.0 hold under --upgrade-probe
 # alone; from v0.9.1 a probe exits once ready unless told to hold, and this unit

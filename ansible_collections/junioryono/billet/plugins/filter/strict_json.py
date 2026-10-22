@@ -47,6 +47,65 @@ def from_json_strict(text):
         raise AnsibleFilterError("from_json_strict: %s" % exc)
 
 
+# PROVENANCE_RECORD_LIMIT is provenance.maxRecordBytes: a longer file is one
+# billet refuses to read.
+PROVENANCE_RECORD_LIMIT = 64 << 10
+
+# PROVENANCE_MEMBERS are provenance.Record's members, as billet writes them.
+PROVENANCE_MEMBERS = ("version", "manifest_digest", "binary_sha256")
+
+
+def _refuse_constant(name):
+    """NaN and the infinities are Python's, not JSON's: Go refuses them."""
+    raise ValueError("%s is not JSON" % name)
+
+
+def provenance_proves(text, binary_sha256):
+    """Whether a provenance record proves which manifest produced these bytes.
+
+    billet's own reading (internal/provenance: Read, then Installed's hash
+    comparison): at most 64 KiB, an object whose version, manifest_digest and
+    binary_sha256 are text when present (Go's typed decode refuses anything
+    else), a manifest digest and the sha256 of exactly this binary. Anything
+    else is False, NEVER AN ERROR, deep nesting included: a record billet cannot
+    use is a host that reports nothing, which the backfill repairs by recording
+    afresh, and failing the converge over it would trade a working host for a
+    diagnostic. A repeated member is refused here where Go keeps the last, which
+    only ever answers False, so the cost is rewriting a record that was usable.
+    """
+    try:
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        if not isinstance(text, str) or len(text.encode("utf-8")) > PROVENANCE_RECORD_LIMIT:
+            return False
+        record = json.loads(text, object_pairs_hook=_one_of_each, parse_constant=_refuse_constant)
+    except (ValueError, RecursionError, MemoryError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    # GO MATCHES A MEMBER'S NAME WITHOUT REGARD TO CASE, by Unicode's simple
+    # folding (the long s, U+017F, is an s to it; the dotless and dotted i
+    # are not i), so "VERSION": 7 or "verſion": 7 is a version it refuses.
+    # casefold() folds every name Go's folding does and a few it does not
+    # (the st ligature, U+FB06, is "st"), so a spelling of the three but
+    # billet's own is never proved here, only refused (measured with Go
+    # 1.26.9's encoding/json, 2026-10-21).
+    for key in record:
+        if key.casefold() in PROVENANCE_MEMBERS and key not in PROVENANCE_MEMBERS:
+            return False
+    for member in PROVENANCE_MEMBERS:
+        if member in record and not isinstance(record[member], str):
+            return False
+    digest = record.get("manifest_digest", "")
+    recorded = record.get("binary_sha256", "")
+    return (
+        digest != ""
+        and isinstance(binary_sha256, str)
+        and binary_sha256 != ""
+        and recorded == binary_sha256
+    )
+
+
 class FilterModule(object):
     def filters(self):
-        return {"from_json_strict": from_json_strict}
+        return {"from_json_strict": from_json_strict, "provenance_proves": provenance_proves}

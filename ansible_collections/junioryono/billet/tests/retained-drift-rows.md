@@ -49,6 +49,8 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/upgrade-rollback.yml / Restore disabled service state | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Inspect restored service enablement | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Restore the previous billet binary | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
+| tasks/restore-provenance.yml / Restore the previous provenance record | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
+| tasks/restore-provenance.yml / Remove the provenance record a host that had none did not have | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Keep a failed first installation without an invented predecessor | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Durably flush every restored host filesystem before rollback commit | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Record the durable rollback commit before opening administration | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
@@ -85,6 +87,8 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/account.yml / Inspect billet service drop-ins before the upgrade transaction | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Preserve configuration and units before replacing them | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Preserve the previous billet binary before live mutation | parity:binary transaction only; retained binary changes refuse before ordinary work |
+| tasks/preserve-provenance.yml / Preserve the provenance record before live mutation | parity:binary transaction only; retained binary changes refuse before ordinary work |
+| tasks/preserve-provenance.yml / Record that there was no provenance record before live mutation | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Ask the candidate whether its probe can be told to hold | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Stage candidate systemd units for the upgrade transaction | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Install the billet systemd units | loop:billet_unit_operands |
@@ -196,6 +200,8 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/services.yml / Commit the durable ledger snapshot before exposing the candidate | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Durably publish ledger snapshot completion before exposing the candidate | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Install the candidate billet binary after fencing and ledger preservation | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
+| tasks/record-provenance.yml / Remove the provenance record of the binary the transaction replaced | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work, and the backfill include is gated off retained ordinary work |
+| tasks/record-provenance.yml / Record which release manifest produced the installed binary | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work, and the backfill include is gated off retained ordinary work |
 | tasks/services.yml / Install candidate configuration after preserving the stopped ledger | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Install candidate systemd units after preserving the stopped ledger | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Load candidate systemd units before starting either upgraded service | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |

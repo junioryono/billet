@@ -127,6 +127,9 @@ b56657d3069e The images row gained `accept`, the components whose licenses a dep
 705b3b1bd8f9 #19 carries a PostgreSQL ledger as pg_dump's copy (archive schema 4); the sentence now says which schema each archive is written at and that identity-only archives are still read.
 d60701766066 #19: `billet local backup` no longer records a PostgreSQL ledger as external, it carries pg_dump's copy; the host-transaction rule is restated without that clause and the dump has its own invariant.
 de65ee2d5832 #20: the rollout rehearsal's last stage asserted a rollback no downgrade can reach since the manifest compatibility gate refuses an incompatible candidate at rollout start (measured 2026-10-21); the sentence now says the candidate is refused before any host is touched and that a transaction's rollback is held by hostupgrade's tests. The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
+0edc679bef13 The ownership repair judges a file by its directory's mount, not its device (#123); the sentence now says so.
+16912ef35a29 reownLock refuses a lock that is not on its directory's mount rather than one on another filesystem (#123); the sentence now says so.
+2d282fadec67 The guard gate no longer binds a tmpfs over /var/lib/billet: its planted roots run inside the mixed overlay, where the mount rule is proved (#123); the sentence now says so.
 da96fb8352a7 ADR-018 (2026-10-21): GitHub serves an object no ref reaches by name, so the Git proxy serves any object a repository's mirror holds, falls back to GitHub on anything it cannot do, and refreshes off the request path; build-caches.md restates the rule.
 03d258ac46b3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 082196a51ca3 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.

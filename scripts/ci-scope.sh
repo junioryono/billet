@@ -169,11 +169,18 @@ classify() {
 		known=0
 		select_families host_lifecycle postgres_retirement
 		;;
-	.goreleaser.yaml | README.md | LICENSE | billet.example.yaml | scripts/mkreleasemanifest/* | \
+	.goreleaser.yaml | README.md | LICENSE | billet.example.yaml | \
 		scripts/test-package-lifecycle.sh | scripts/test-restore-rehearsal.sh | scripts/restore-rehearsal.sh | \
-		scripts/test-postgres-restore-rehearsal.sh | scripts/postgres-restore-rehearsal.sh)
+		scripts/test-postgres-restore-rehearsal.sh | scripts/postgres-restore-rehearsal.sh | \
+		scripts/test-unit-sandboxes.sh | scripts/unit-sandboxes.sh)
 		known=0
 		select_families package_lifecycle
+		;;
+	# THE MANIFEST WRITER is the release's, and the host role's provenance gate
+	# writes its test release's manifest with it (scripts/gates/scenario.sh provenance-check).
+	scripts/mkreleasemanifest/*)
+		known=0
+		select_families package_lifecycle host_lifecycle
 		;;
 	terraform/*)
 		known=0
