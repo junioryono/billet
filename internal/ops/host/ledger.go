@@ -32,6 +32,10 @@ func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, e
 	return app.OpenLedger(ctx, cfg, app.LedgerMaintenance)
 }
 
+func openStateRecovery(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	return app.OpenLedger(ctx, cfg, app.LedgerRecovery)
+}
+
 func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB) error {
 	return app.VerifyLedgerIdentity(ctx, cfg, db)
 }

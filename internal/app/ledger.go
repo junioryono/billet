@@ -36,6 +36,10 @@ const (
 	LedgerDecision
 	// LedgerInspect is a report: nothing created, locked, claimed or migrated.
 	LedgerInspect
+	// LedgerRecovery is `billet local recover` sealing the ledger it has just
+	// put back, across the fence that recovery raised: the one write it makes
+	// behind it.
+	LedgerRecovery
 )
 
 // OpenLedger opens the ledger in mode.
@@ -58,6 +62,8 @@ func OpenLedger(ctx context.Context, cfg *config.Config, mode LedgerMode) (*stat
 		}
 
 		return openInspectLedger(ctx, cfg, dsn)
+	case LedgerRecovery:
+		return openRecoveryLedger(ctx, cfg)
 	default:
 		return nil, fmt.Errorf("app: no ledger mode %d", mode)
 	}
@@ -134,6 +140,46 @@ func openMaintenanceLedger(ctx context.Context, cfg *config.Config) (*state.DB, 
 
 	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir,
 		state.WithRunningRelease(version.Version()))
+}
+
+// openRecoveryLedger opens the ledger a recovery has just put back, across the
+// fence that recovery raised, for the operator's seal.
+//
+// ON SQLITE IT IS THE MAINTENANCE OPEN, which crosses the fence and writes. On
+// PostgreSQL the maintenance open is the upgrade probe's and writes nothing, so
+// the seal there would be refused; state.OpenPostgresRecovery is the operator
+// handle that crosses this host's fence. Either way the rows are proved to be
+// this deployment's before anything writes to them.
+func openRecoveryLedger(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	if cfg.Server.LedgerBackend() != config.StatePostgres {
+		db, err := openMaintenanceLedger(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := VerifyLedgerIdentity(ctx, cfg, db); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
+	dsn, err := LedgerDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := state.OpenPostgresRecovery(ctx, cfg.Server.IdentityDir, dsn,
+		state.WithRunningRelease(version.Version()))
+	if err != nil {
+		return nil, err
+	}
+
+	if err := VerifyLedgerIdentity(ctx, cfg, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+
+	return db, nil
 }
 
 // LedgerDSN reads the connection string out of the environment.

@@ -56,7 +56,10 @@ func requiredEntries(m Manifest) []string {
 		AuthorityEntry("authority-created"),
 	}
 
-	if !m.Ledger.IsExternal() {
+	switch {
+	case m.Ledger.IsDump():
+		required = append(required, EntryLedgerDump)
+	case m.Ledger.IsFile():
 		required = append(required, EntryLedger)
 	}
 
@@ -91,7 +94,13 @@ func knownEntries(m Manifest) map[string]bool {
 		EntryConfig: true,
 	}
 
-	if !m.Ledger.IsExternal() {
+	// ONE LEDGER ENTRY, OF THE KIND THE MANIFEST CLAIMS. A dump archive declaring
+	// billet.db too, or a SQLite archive declaring a dump, is describing two
+	// ledgers, and a restore would install one and silently drop the other.
+	switch {
+	case m.Ledger.IsDump():
+		out[EntryLedgerDump] = true
+	case m.Ledger.IsFile():
 		out[EntryLedger] = true
 	}
 
@@ -174,7 +183,12 @@ func Open(ctx context.Context, dir string) (*Archive, error) {
 	// manifest to compare it against. What replaces it is loadDeclared and
 	// refuseUndeclared refusing any ledger entry or file at all, so "the manifest
 	// describes what is here" is still established — by there being nothing.
-	if !a.Manifest.Ledger.IsExternal() {
+	//
+	// AND FOR A DUMP, which nothing here can read without pg_restore. Its
+	// migrations were read in the snapshot the dump was taken in, so they are
+	// exact when written, the digest proves the dump is that one, and the restore
+	// reads them back from the database it filled before it lifts anything.
+	if a.Manifest.Ledger.IsFile() {
 		if err := a.checkManifestDescribesItsLedger(ctx); err != nil {
 			return nil, err
 		}
@@ -241,7 +255,7 @@ func (a *Archive) loadDeclared() error {
 			return err
 		}
 
-		if rec.Path == EntryLedger {
+		if rec.Path == EntryLedger || rec.Path == EntryLedgerDump {
 			sum, size, err := digestFile(path)
 			if err != nil {
 				return err
@@ -437,6 +451,17 @@ func (a *Archive) LedgerPath() string {
 		// has already resolved it. Returning the join keeps this total rather
 		// than panicking inside a control-plane binary.
 		return filepath.Join(a.Dir, filepath.FromSlash(EntryLedger))
+	}
+
+	return path
+}
+
+// DumpPath is where a PostgreSQL ledger's dump lives inside the archive.
+func (a *Archive) DumpPath() string {
+	path, err := entryPath(a.Dir, EntryLedgerDump)
+	if err != nil {
+		// Unreachable for the reason LedgerPath gives.
+		return filepath.Join(a.Dir, filepath.FromSlash(EntryLedgerDump))
 	}
 
 	return path

@@ -60,8 +60,10 @@ func TestABackupOfAnExternalLedgerCarriesEverythingElse(t *testing.T) {
 		t.Fatal("the manifest does not record the ledger as external")
 	}
 
-	if m.Schema != Schema {
-		t.Errorf("an external archive is schema %d, got %d", Schema, m.Schema)
+	// 3, NOT Schema: only an archive carrying a dump is written at 4, so every
+	// other archive stays readable by the billets that read 3.
+	if m.Schema != 3 {
+		t.Errorf("an external archive is schema 3, got %d", m.Schema)
 	}
 
 	if m.Ledger.Backend != "postgres" || m.Ledger.DSNEnv != "BILLET_STATE_DSN" {
@@ -131,7 +133,7 @@ func TestABackupCannotBothSnapshotAndDeclareExternal(t *testing.T) {
 		t.Fatal("a request naming both a snapshot and an external ledger was accepted")
 	}
 
-	if !strings.Contains(err.Error(), "never both") {
+	if !strings.Contains(err.Error(), "exactly one of those") {
 		t.Errorf("the refusal does not name the contradiction: %v", err)
 	}
 }

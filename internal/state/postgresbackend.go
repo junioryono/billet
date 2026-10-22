@@ -155,7 +155,9 @@ var errUnparsableDSN = errors.New(
 // hand is a parser billet would then own. RuntimeParams are sent as startup
 // parameters, which is also what keeps them out of reach of a later statement.
 //
-// The one place the connection string is read as text.
+// One of the two places the connection string is read as text, both in this
+// package; the other is LibpqEnv, which renders it for the PostgreSQL client
+// programs and is held to pgx's reading of the same text.
 func registerConn(dsn DSN, params map[string]string) (string, error) {
 	text := string(dsn)
 	if strings.TrimSpace(text) == "" {

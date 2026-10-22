@@ -430,6 +430,75 @@ rehearsal_stopped() {
     esac
 }
 
+# rehearsal_units_run_installed_binary proves every billet service running on a
+# host executes the binary installed at /usr/bin/billet NOW, not one an upgrade
+# replaced under it: rehearsal_units_run_installed_binary <host> <unit>...
+#
+# FOUND BY A REAL ROLLOUT (#503): the automatic v0.16.5 -> v0.16.6 rollout
+# committed on a node and left billet-uplink.service running the replaced binary
+# (/proc/<pid>/exe -> /usr/bin/billet (deleted)), because the transaction never
+# restarted it. "billet-node came back" was true and proved nothing about the
+# units beside it.
+#
+# BY INODE, NOT BY NAME: a process whose binary was replaced in place still
+# reads /usr/bin/billet through its exe link, suffixed " (deleted)"; one started
+# from the new binary resolves to the same file /usr/bin/billet does. Every unit
+# with a process is checked, whether active, starting, reloading or stopping,
+# because a unit caught mid-restart still runs whatever binary it runs. A
+# oneshot that has finished has no MainPID and is skipped, but each unit the
+# caller names must have been checked: a required unit with no process proves
+# nothing, so it fails.
+rehearsal_units_run_installed_binary() {
+    local name=$1
+    shift
+    # A CALL THAT NAMES NO UNIT WOULD PASS HAVING CHECKED NOTHING.
+    if [ "$#" -eq 0 ]; then
+        echo "rehearsal_units_run_installed_binary: name at least one unit that must be running" >&2
+        return 3
+    fi
+    docker exec "${name}" sh -c '
+        want=$(stat -L -c "%d:%i" /usr/bin/billet) || { echo "cannot stat /usr/bin/billet"; exit 2; }
+        # The listing status is captured before awk reads it: sh has no
+        # pipefail, so a failed systemctl would otherwise read as no units.
+        listing=$(systemctl list-units --type=service --state=active,activating,reloading,deactivating \
+            --no-legend --plain "billet*") || { echo "cannot list the billet units"; exit 2; }
+        units=$(printf "%s\n" "$listing" | awk "{print \$1}")
+        checked=" "
+        for u in $units; do
+            pid=$(systemctl show -p MainPID --value "$u") || { echo "$u: cannot read its MainPID"; exit 2; }
+            case "$pid" in "" | 0) continue ;; esac
+            exe=$(readlink "/proc/$pid/exe") || { echo "$u: could not read the binary of pid $pid"; exit 4; }
+            case "$exe" in
+                *" (deleted)") echo "$u (pid $pid) is running a replaced binary: $exe"; exit 1 ;;
+            esac
+            got=$(stat -L -c "%d:%i" "/proc/$pid/exe") || { echo "$u: could not stat pid $pid"; exit 4; }
+            test "$got" = "$want" || { echo "$u (pid $pid) runs $exe, not the installed /usr/bin/billet"; exit 1; }
+            echo "$u (pid $pid) runs the installed binary"
+            checked="$checked$u "
+        done
+        for required in "$@"; do
+            case "$checked" in
+                *" $required "*) ;;
+                *) echo "$required has no running process to check"; exit 3 ;;
+            esac
+        done
+    ' rehearsal_units_run_installed_binary "$@"
+}
+
+# rehearsal_upgrade_units_done waits until no upgrade transaction runs on a host:
+# billet-upgrade.service (the controller's root updater) and the transient
+# billet-host-upgrade-* unit a node starts its updater in. The transaction's own
+# process runs the binary it replaced until it exits, which is correct and is
+# not a unit left behind, so rehearsal_units_run_installed_binary is asked only
+# once it has. A systemctl that cannot list is not "nothing running".
+rehearsal_upgrade_units_done() {
+    rehearsal_wait_for "$2" "the upgrade transaction on $1 to exit" "$1" sh -c '
+        listing=$(systemctl list-units --type=service --state=active,activating,reloading,deactivating \
+            --no-legend --plain billet-upgrade.service "billet-host-upgrade-*") || exit 1
+        test -z "$listing"
+    '
+}
+
 # rehearsal_wait_for polls a command in a host until it succeeds or the
 # deadline (seconds) passes. The command's success is the condition.
 rehearsal_wait_for() {
@@ -460,6 +529,26 @@ rehearsal_journal_step() {
     ' 2>/dev/null || true
 }
 
+# rehearsal_absent succeeds only when the Docker daemon itself says that the
+# named container or network does not exist: rehearsal_absent container|network
+# <name>. An inspection that fails for any other reason (the daemon unreachable,
+# a missing context, whose message also says "not found") is "could not tell",
+# which teardown counts as left behind, never as gone. The two diagnostics are
+# the daemon's own, measured on Docker 29.9.2 (2026-10-21): `Error response from
+# daemon: No such container: <name>` and `... network <name> not found`.
+rehearsal_absent() {
+    local out
+    if out=$(docker "$1" inspect "$2" 2>&1 >/dev/null); then
+        return 1
+    fi
+    case "$1:${out}" in
+        "container:Error response from daemon: No such container: $2") return 0 ;;
+        "network:Error response from daemon: network $2 not found") return 0 ;;
+        "network:Error response from daemon: No such network: $2") return 0 ;;
+    esac
+    return 1
+}
+
 # rehearsal_teardown_hosts removes the containers, the network and the storage
 # a rehearsal created. Registered on EXIT by every driver, so a failed
 # assertion still leaves nothing running. Returns non-zero, having named each
@@ -480,16 +569,16 @@ rehearsal_teardown_hosts() {
         if ! docker rm -f -v "${name}" >/dev/null 2>&1; then
             # A removal of a container that was never created fails too, so the
             # survivor is what decides, never the removal's own status.
-            if docker container inspect "${name}" >/dev/null 2>&1; then
-                echo "TEARDOWN: container ${name} survived removal" >&2
+            if ! rehearsal_absent container "${name}"; then
+                echo "TEARDOWN: container ${name} survived removal, or Docker could not say" >&2
                 left=1
             fi
         fi
     done
 
     if ! docker network rm "${network}" >/dev/null 2>&1; then
-        if docker network inspect "${network}" >/dev/null 2>&1; then
-            echo "TEARDOWN: network ${network} survived removal" >&2
+        if ! rehearsal_absent network "${network}"; then
+            echo "TEARDOWN: network ${network} survived removal, or Docker could not say" >&2
             left=1
         fi
     fi

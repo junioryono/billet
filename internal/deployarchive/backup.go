@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
@@ -54,11 +55,18 @@ type BackupRequest struct {
 	// ConfigBody is the billet.yaml as it stands. Copied for REFERENCE; restore
 	// never installs it, because these paths are the source host's.
 	ConfigBody []byte
-	// Snapshot writes a consistent ledger copy to the absolute path it is given.
-	// Nil exactly when ExternalLedger is set.
+	// Snapshot writes a consistent SQLite ledger copy to the absolute path it is
+	// given.
+	//
+	// EXACTLY ONE OF Snapshot, Dump AND ExternalLedger IS SET: an archive carries
+	// its ledger as a file, carries it as a dump, or declares it external.
 	Snapshot func(ctx context.Context, dest string) error
-	// ExternalLedger says the ledger is not billet's to copy, and describes the
-	// one this identity belongs to. Set exactly when Snapshot is nil.
+	// Dump writes a PostgreSQL ledger's dump to the absolute path it is given,
+	// which must not exist, and says what it holds.
+	Dump func(ctx context.Context, dest string) (LedgerDump, error)
+	// ExternalLedger says the ledger is not in the archive, which is the schema 2
+	// and 3 shape for a PostgreSQL ledger. Kept so those archives can still be
+	// written for the tests of reading them; `billet local backup` writes a dump.
 	ExternalLedger *ExternalLedger
 	// Now is the clock, so a test can pin the manifest's timestamp.
 	Now func() time.Time
@@ -154,6 +162,20 @@ func (req BackupRequest) LogValue() slog.Value {
 	)
 }
 
+// LedgerDump is what a dump of a PostgreSQL ledger holds, read in the snapshot
+// it was taken in.
+type LedgerDump struct {
+	Facts      DumpFacts
+	Migrations []state.AppliedMigration
+	// DSNEnv is the environment variable the source config named for the
+	// connection string, recorded as LedgerFacts.DSNEnv: the NAME, never the
+	// value.
+	DSNEnv string
+	// Database is the database the dump is of, read in its own snapshot; not
+	// recorded in a manifest, and what a recovery holds its copy to.
+	Database string
+}
+
 // ExternalLedger describes a ledger the archive deliberately does not contain.
 //
 // THE CALLER ESTABLISHES ALL THREE, because each is a fact about the deployment
@@ -230,16 +252,18 @@ func (req BackupRequest) validate() error {
 		return errors.New(
 			"deployarchive: the GitHub App private key is part of the deployment unit and none " +
 				"was supplied; GitHub issues it exactly once and will not reissue it")
-	case req.Snapshot == nil && req.ExternalLedger == nil:
+	case req.Snapshot == nil && req.Dump == nil && req.ExternalLedger == nil:
 		return errors.New(
-			"deployarchive: a backup needs either a ledger snapshot function or a description " +
-				"of the external ledger this deployment uses")
-	case req.Snapshot != nil && req.ExternalLedger != nil:
-		// BOTH IS THE ONE COMBINATION THAT COULD LIE. It would write a snapshot
-		// into the archive AND declare the ledger external, producing a manifest
-		// that says the file beside it is not there.
+			"deployarchive: a backup needs a ledger snapshot function, a ledger dump function or " +
+				"a description of the external ledger this deployment uses")
+	case ledgerSources(req) > 1:
+		// MORE THAN ONE IS THE COMBINATION THAT COULD LIE. It would write a copy
+		// into the archive AND declare the ledger external, or carry two ledgers
+		// a restore would install one of, producing a manifest that misdescribes
+		// the files beside it.
 		return errors.New(
-			"deployarchive: a backup carries its ledger or declares it external, never both")
+			"deployarchive: a backup carries its ledger as a file, carries it as a dump, or " +
+				"declares it external, and exactly one of those")
 	case req.ExternalLedger != nil && !externalBackends[req.ExternalLedger.Backend]:
 		// THE CLOSED SET, NOT MERELY NON-EMPTY. An archive naming an engine
 		// nothing can restore is one an operator finds out about on the day they
@@ -272,6 +296,19 @@ func (req BackupRequest) validate() error {
 	}
 
 	return nil
+}
+
+// ledgerSources counts how many ledger sources a request names.
+func ledgerSources(req BackupRequest) int {
+	n := 0
+
+	for _, set := range []bool{req.Snapshot != nil, req.Dump != nil, req.ExternalLedger != nil} {
+		if set {
+			n++
+		}
+	}
+
+	return n
 }
 
 // defaultTargetName is the name the `github:` block's target carries in
@@ -463,7 +500,16 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 
 	ledger := LedgerFacts{}
 
-	if req.ExternalLedger != nil {
+	switch {
+	case req.Dump != nil:
+		dumped, rec, err := writeDump(ctx, req)
+		if err != nil {
+			return Manifest{}, err
+		}
+
+		records = append(records, rec)
+		ledger = dumped
+	case req.ExternalLedger != nil:
 		// NO ledger/ DIRECTORY IS CREATED AT ALL, not even an empty one. Open
 		// refuses an external archive that has anything there, so leaving the
 		// directory behind would make every such backup unreadable by the
@@ -474,7 +520,7 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 			DSNEnv:     req.ExternalLedger.DSNEnv,
 			Migrations: req.ExternalLedger.Migrations,
 		}
-	} else {
+	default:
 		ledgerPath, err := entryPath(req.Dest, EntryLedger)
 		if err != nil {
 			return Manifest{}, err
@@ -511,7 +557,7 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 	}
 
 	m := Manifest{
-		Schema:        Schema,
+		Schema:        schemaFor(ledger),
 		Kind:          Kind,
 		CreatedAt:     req.Now().UTC().Format(time.RFC3339),
 		BilletVersion: version.Version(),
@@ -555,6 +601,77 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 type entry struct {
 	name string
 	body []byte
+}
+
+// writeDump has the caller's dump written into the archive and describes it.
+//
+// THE BINDING MUST BE THIS DEPLOYMENT'S OR NONE. A dump of rows bound to another
+// deployment beside this identity is the pairing of two deployments the
+// deployment binding exists to refuse, and an archive is where it would travel
+// furthest before anybody noticed.
+func writeDump(ctx context.Context, req BackupRequest) (LedgerFacts, FileRecord, error) {
+	path, err := entryPath(req.Dest, EntryLedgerDump)
+	if err != nil {
+		return LedgerFacts{}, FileRecord{}, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return LedgerFacts{}, FileRecord{}, fmt.Errorf("deployarchive: create %s: %w", filepath.Dir(path), err)
+	}
+
+	dumped, err := req.Dump(ctx, path)
+	if err != nil {
+		return LedgerFacts{}, FileRecord{}, err
+	}
+
+	if b := dumped.Facts.Binding; b != "" && b != req.DeploymentID {
+		return LedgerFacts{}, FileRecord{}, fmt.Errorf(
+			"the ledger this deployment's config names is bound to deployment %s, and %s says this "+
+				"installation is %s. Backing both up as one unit would record a deployment that "+
+				"does not exist; resolve which is current before capturing it",
+			b, filepath.Join(req.StateDir, "deployment-id"), req.DeploymentID)
+	}
+
+	// 0600 AND DURABLE, the rules every other entry gets: the dump holds the same
+	// rows a SQLite snapshot does, and pg_dump creates it under the umask.
+	if err := os.Chmod(path, entryMode); err != nil {
+		return LedgerFacts{}, FileRecord{}, fmt.Errorf("deployarchive: tighten %s: %w", path, err)
+	}
+
+	if err := syncFile(path); err != nil {
+		return LedgerFacts{}, FileRecord{}, err
+	}
+
+	sum, size, err := digestFile(path)
+	if err != nil {
+		return LedgerFacts{}, FileRecord{}, err
+	}
+
+	facts := dumped.Facts
+	facts.Format = DumpFormat
+
+	return LedgerFacts{
+		Backend:    "postgres",
+		DSNEnv:     dumped.DSNEnv,
+		Dump:       &facts,
+		Migrations: dumped.Migrations,
+	}, FileRecord{Path: EntryLedgerDump, SHA256: sum, Size: size}, nil
+}
+
+// syncFile flushes a file something else wrote.
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("deployarchive: open %s to sync it: %w", path, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("deployarchive: sync %s: %w", path, err)
+	}
+
+	return nil
 }
 
 // authorityFacts summarises the captured authority for the manifest.

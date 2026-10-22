@@ -133,11 +133,11 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 		return err
 	}
 
-	// LedgerBackend TRAVELS HERE TOO, so the planner's external-ledger refusal
-	// can name what this host is configured for. Recover refuses such an archive
-	// outright — there is no billet operation that replaces an external ledger in
-	// place — and a refusal that could not say which engine would leave an
-	// operator guessing which half is wrong.
+	// LedgerBackend TRAVELS HERE TOO, so the planner can refuse an archive whose
+	// ledger this host is not configured for and name both sides. An older
+	// identity-only archive is refused outright — there is nothing in it to put
+	// the ledger back from — and an archive carrying a PostgreSQL dump recovers
+	// the database the config names, through Postgres.
 	target := deployarchive.Target{
 		ConfigPath:    o.configPath,
 		StateDir:      cfg.Server.IdentityDir,
@@ -145,6 +145,12 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 	}
 
 	archiveTargets(cfg, &target)
+
+	if reachesArchiveLedger(cfg, archive) {
+		if target.Postgres, err = archiveTargetLedger(cfg, !o.abandon); err != nil {
+			return err
+		}
+	}
 
 	if o.abandon {
 		return runRecoverAbandon(ctx, env, archive, target)
@@ -230,6 +236,10 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 		}
 	}()
 
+	if err := restageUnderLock(target.StateDir, archive, stage); err != nil {
+		return err
+	}
+
 	var res deployarchive.Result
 
 	// A PUBLICATION THAT FINISHED IS NOT RUN AGAIN, and skipping it is the whole
@@ -284,6 +294,13 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 	// and sealing afterwards leaves an interval in which a control plane can start
 	// on an open ledger; the fence is the only thing that refuses one, so it stays
 	// up until the seal is durable and Finish takes it down.
+	// AND ON POSTGRESQL, INTO THE DATABASE THE LEDGER WAS RESTORED INTO, proved
+	// before the seal's open, which writes and may migrate whatever schema the
+	// connection reaches by now.
+	if err := deployarchive.ProveRestoredLedger(ctx, plan); err != nil {
+		return err
+	}
+
 	if err := sealRecoveredDeployment(ctx, env, cfg, o); err != nil {
 		return err
 	}
@@ -305,6 +322,41 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 
 // recoveryStage is how far an earlier attempt at THIS recovery got.
 type recoveryStage int
+
+// String names a stage for a diagnostic.
+func (s recoveryStage) String() string {
+	switch s {
+	case recoverFresh:
+		return "fresh"
+	case recoverResume:
+		return "resuming"
+	case recoverPublished:
+		return "published"
+	}
+
+	return fmt.Sprintf("stage %d", int(s))
+}
+
+// restageUnderLock reads a recovery's stage again once the lifecycle lock is
+// held, and refuses a change.
+//
+// THE FIRST READ PRECEDES THE LOCK so the quiesce can run, and another command
+// (an abandon, above all) may change the journal while this one waits: acting
+// on the stale stage would skip Execute's re-plan and seal a ledger that command
+// is putting back.
+func restageUnderLock(stateDir string, a *deployarchive.Archive, stage recoveryStage) error {
+	again, err := recoveryStageOf(stateDir, a)
+	if err != nil {
+		return err
+	}
+
+	if again != stage {
+		return fmt.Errorf("another command changed this recovery while this one waited for the "+
+			"lifecycle lock (it was %v and is now %v); run it again", stage, again)
+	}
+
+	return nil
+}
 
 const (
 	// recoverFresh: nothing of this recovery is here. Seal, prove it quiet,
@@ -356,6 +408,14 @@ func recoveryStageOf(stateDir string, a *deployarchive.Archive) (recoveryStage, 
 		return recoverFresh, nil
 	}
 
+	// AN ABANDON THAT HAS BEGUN is the only way on: going forward would seal a
+	// ledger the abandon may already have put back. runLocalRecover reads this
+	// again under the lifecycle lock, where it decides.
+	if prog.Abandoning {
+		return recoverFresh, errors.New("an abandon of this recovery has already begun undoing " +
+			"it; run `billet local recover --abandon` again to finish it")
+	}
+
 	// THE FENCE IS NOT CONSULTED HERE, deliberately. A published recovery is
 	// finished the same way whether or not its fence is still standing: the last
 	// two steps take the fence down and then remove the journal, so a crash
@@ -391,11 +451,13 @@ func recoveryStageOf(stateDir string, a *deployarchive.Archive) (recoveryStage, 
 func sealRecoveredDeployment(ctx context.Context, env cli.Env, cfg *config.Config, o recoverOptions) error {
 	// THE ONE HANDLE THAT CROSSES A FENCE, and this process is the one that
 	// raised it. OpenAdmin honours the fence — correctly, since its whole job is
-	// keeping other commands out — so it cannot be used here; OpenMaintenance is
-	// the typed crossing, and it takes the directory lock, which Execute has by
-	// now released. It also migrates, which is what the next `billet server`
-	// start would do to an older archive's ledger anyway.
-	db, err := app.OpenLedger(ctx, cfg, app.LedgerMaintenance)
+	// keeping other commands out — so it cannot be used here; the recovery open
+	// is the typed crossing (OpenMaintenance on SQLite, which takes the directory
+	// lock Execute has by now released; OpenPostgresRecovery on PostgreSQL, whose
+	// maintenance open is the upgrade probe's and writes nothing). It also
+	// migrates, which is what the next `billet server` start would do to an older
+	// archive's ledger anyway.
+	db, err := openStateRecovery(ctx, cfg)
 	if err != nil {
 		return recoveredButOpen(env, fmt.Errorf("open the restored ledger to seal it: %w", err))
 	}
@@ -542,6 +604,15 @@ func printRecoverPlan(env cli.Env, p deployarchive.Plan) {
 		case deployarchive.AlreadyPresent:
 			fmt.Fprintf(env.Stdout, "plan     %s is already in place at %s\n", a.What, a.Path)
 		case deployarchive.SupersedeLedger:
+			if a.Entry == deployarchive.EntryLedgerDump {
+				fmt.Fprintf(env.Stdout, "plan     REPLACE the ledger in %s with this backup's, in one transaction\n", a.Path)
+				fmt.Fprintf(env.Stdout, "         a pg_dump copy of the one there now is kept at %s first, and\n",
+					p.Superseded)
+				fmt.Fprintf(env.Stdout, "         is never deleted — it is the only record of the work this recovery fails\n")
+
+				continue
+			}
+
 			fmt.Fprintf(env.Stdout, "plan     REPLACE the ledger at %s\n", a.Path)
 			fmt.Fprintf(env.Stdout, "         the one there now moves to %s and is never deleted — it is the\n",
 				p.Superseded)
@@ -564,6 +635,12 @@ func printRecovered(env cli.Env, a *deployarchive.Archive, t deployarchive.Targe
 		a.Manifest.DeploymentID, t.StateDir, a.Manifest.CreatedAt)
 
 	for _, path := range res.Superseded {
+		if a.Manifest.Ledger.IsDump() {
+			fmt.Fprintf(env.Stdout, "  a pg_dump copy of the ledger that was there is at %s\n", path)
+
+			continue
+		}
+
 		fmt.Fprintf(env.Stdout, "  the ledger that was there is at %s\n", path)
 	}
 
@@ -612,8 +689,16 @@ func runRecoverAbandon(ctx context.Context, env cli.Env, a *deployarchive.Archiv
 		fmt.Fprintf(env.Stdout, "remove   %s\n", path)
 	}
 
-	for _, path := range res.Restored {
-		fmt.Fprintf(env.Stdout, "restore  %s put back\n", path)
+	for _, what := range res.Restored {
+		// A DATABASE IS NOT A FILE MOVED BACK: the line names the schema and the
+		// copy it was restored from, and is complete as it stands.
+		if a.Manifest.Ledger.IsDump() {
+			fmt.Fprintf(env.Stdout, "restore  %s\n", what)
+
+			continue
+		}
+
+		fmt.Fprintf(env.Stdout, "restore  %s put back\n", what)
 	}
 
 	for _, path := range res.Kept {

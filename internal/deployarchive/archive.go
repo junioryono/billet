@@ -14,28 +14,25 @@
 // is why the requirement is worded as a REFUSAL rather than a warning. This
 // package refuses; it never repairs and never guesses.
 //
-// A POSTGRESQL LEDGER IS THE ONE PIECE BILLET DOES NOT CARRY, and saying so is
-// the whole of schema 2. SQLite's VACUUM INTO produces a consistent copy of the
-// entire ledger as one file; there is no equivalent billet should own for
-// PostgreSQL, because a consistent copy there is pg_dump or the provider's
-// snapshot — the operator's to run and to restore. Copying rows through billet's
-// own connection would produce an archive that LOOKS like a backup and is not.
+// A POSTGRESQL LEDGER TRAVELS AS PG_DUMP'S OWN COPY (schema 4). Copying rows
+// through billet's own connection would produce an archive that LOOKS like a
+// backup and is not (ADR-008), so the copy is the database's tool's: a
+// custom-format dump taken in the snapshot billet read the ledger's migrations
+// and binding in, which makes the manifest's description of it exact. The
+// command layer runs the tool (internal/pgdump) and this package is handed the
+// result, as it is handed a SQLite snapshot.
 //
-// SO THE ARCHIVE RECORDS THE LEDGER AS EXTERNAL RATHER THAN OMITTING IT
-// SILENTLY, and that distinction is the feature. Until this existed the command
-// FAILED OUTRIGHT on such a deployment, so the half billet does own was not
-// captured either — and for a control plane built by the control-plane-postgres
-// module that is the only recovery path there is: the module has no ledger volume
-// by design, its root volume is delete_on_termination, and the App private key is
-// issued exactly once. An identity-only archive is not a lesser backup of the
-// same thing; it is the whole of what billet is entitled to copy, paired with a
-// statement of where the rest lives.
+// AND IT IS PUT BACK ONLY WHERE NOTHING IS LOST BY IT. A restore installs the
+// dump into an empty or untouched schema; a database that still holds this
+// deployment's ledger — the host died, the database did not — keeps its own,
+// newer rows, and replacing them with the archive's is `billet local recover`'s
+// operation, which seals, quiesces and keeps a second dump of what it replaced.
 //
-// WHAT THE RESTORE SIDE OWES IN RETURN is a refusal. Pairing the two halves is
-// the invariant, so an identity-only archive may not be installed onto a target
-// whose config says the ledger is local, and may not be installed at all without
-// the operator asserting the ledger it belongs to is back — which is the one
-// thing billet cannot check, because the database is on the other end of a DSN.
+// SCHEMAS 2 AND 3 COULD ONLY RECORD SUCH A LEDGER AS EXTERNAL, and those
+// archives are still read: an identity-only archive may not be installed onto a
+// target whose config says the ledger is local, and may not be installed at all
+// without the operator asserting the ledger it belongs to is back, because that
+// archive carries nothing billet could check it against.
 //
 // It prints nothing. Every refusal is returned as a lifeops.Refusal so the
 // command layer renders them all at once — an operator who has to re-run a
@@ -67,7 +64,22 @@ import (
 // REQUIRES ledger/billet.db, so an archive without it is refused as incomplete —
 // correctly, on schema 1, where an absent ledger really is a missing piece
 // rather than a statement about where the ledger lives.
-const Schema = 3
+//
+// 4 ADDS A POSTGRESQL LEDGER'S DUMP (ledger/billet.pgdump), and only an archive
+// that carries one is written at 4: every other archive is written at 3, which
+// every billet since the targets release reads, so the bump costs an older
+// restore nothing it could read before. See schemaFor.
+const Schema = 4
+
+// schemaFor is the schema an archive with this ledger is written at: the lowest
+// that can express it.
+func schemaFor(l LedgerFacts) int {
+	if l.Dump != nil {
+		return 4
+	}
+
+	return 3
+}
 
 // readableSchemas is every version this build can restore FROM.
 //
@@ -82,7 +94,7 @@ const Schema = 3
 // identity-only archive would meet "an archive is not an archive without
 // ledger/billet.db" and send an operator looking for a file that was never
 // supposed to be there.
-var readableSchemas = map[int]bool{1: true, 2: true, 3: true}
+var readableSchemas = map[int]bool{1: true, 2: true, 3: true, 4: true}
 
 // externalBackends is every engine an archive may name as holding its ledger.
 //
@@ -109,9 +121,11 @@ const Kind = "billet-deployment-backup"
 const (
 	EntryManifest = "manifest.json"
 	EntryLedger   = "ledger/billet.db"
-	EntryIdentity = "identity/deployment-id"
-	EntryAppKey   = "github/app-private-key.pem"
-	EntryConfig   = "config/billet.yaml"
+	// EntryLedgerDump is a PostgreSQL ledger as pg_dump's custom format.
+	EntryLedgerDump = "ledger/billet.pgdump"
+	EntryIdentity   = "identity/deployment-id"
+	EntryAppKey     = "github/app-private-key.pem"
+	EntryConfig     = "config/billet.yaml"
 
 	authorityPrefix = "authority/"
 	appKeyPrefix    = "github/"

@@ -169,7 +169,7 @@ Say which host paths the command a shipped systemd unit runs needs, and how (Lin
 
 ### `billet local backup|restore|recover`
 
-Capture a deployment as one unit, put it back as one unit or not at all, or put it back over itself. [Backup, restore and recover](../operating/backup-restore-recover.md).
+Capture a deployment as one unit, put it back as one unit or not at all, or put it back over itself. On a PostgreSQL ledger the ledger travels as `pg_dump`'s copy, and restore and recover put it back with `pg_restore`: the PostgreSQL client must be installed at the server's major version or newer, and its absence is refused before anything is written. [Backup, restore and recover](../operating/backup-restore-recover.md).
 
 | Flag | Applies to | Meaning |
 |---|---|---|
@@ -180,11 +180,11 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `--into <dir>` | restore, recover | where a fetched archive is kept |
 | `--deployment <id>` | restore, recover | which deployment's archives to look at |
 | `--old-controller-fenced` | restore, recover | assert the controller this backup came from is stopped and disabled everywhere (required) |
-| `--external-ledger-attached` | restore | assert a PostgreSQL ledger has been restored and this host's config points at it |
+| `--external-ledger-attached` | restore | assert the PostgreSQL ledger this host's config points at is this deployment's: needed for an identity-only archive an older billet wrote, and for a dump-carrying archive only when the database holds rows bound to no deployment, which are then kept |
 | `--accept-failing-jobs` | recover | proceed even though work is outstanding; every job named fails |
 | `--reason`, `--timeout` | recover | recorded on the seal; give up waiting for quiescence |
 | `--dry-run` | restore, recover | report what would happen and every refusal, and change nothing |
-| `--abandon` | restore, recover | undo an interrupted run, removing only what it created; recover also puts the superseded ledger back |
+| `--abandon` | restore, recover | undo an interrupted run, removing only what it created; recover also puts the superseded ledger back (on PostgreSQL, restores it from the dump it kept); restore leaves a database it filled as it is and says so |
 
 ## Capacity and admission
 

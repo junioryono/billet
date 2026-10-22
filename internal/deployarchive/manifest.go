@@ -147,11 +147,46 @@ type LedgerFacts struct {
 	// and refusing that would be refusing a correct restore over a label.
 	DSNEnv string `json:"dsn_env,omitempty"`
 
+	// Dump says the ledger travels as a PostgreSQL dump (EntryLedgerDump), and
+	// describes it. Schema 4; nil on every other archive.
+	Dump *DumpFacts `json:"dump,omitempty"`
+
 	Migrations []state.AppliedMigration `json:"migrations"`
 }
 
+// DumpFacts is what a restore needs to know about a PostgreSQL ledger's dump
+// before it hands the dump to pg_restore.
+//
+// READ IN THE DUMP'S OWN SNAPSHOT, like Migrations beside it, so it describes the
+// dump rather than the database a moment later.
+type DumpFacts struct {
+	// Format is DumpFormat, the only one this package writes or reads.
+	Format string `json:"format"`
+	// Schema is the PostgreSQL schema the ledger was in, and the only one the
+	// dump holds. pg_restore installs into the schema of that name, so a target
+	// whose connection resolves to another is refused.
+	Schema string `json:"schema"`
+	// ServerVersion is the source server's server_version_num.
+	ServerVersion int `json:"server_version"`
+	// DumpVersion is the major version of the pg_dump that wrote it.
+	DumpVersion int `json:"dump_version"`
+	// Binding is the deployment the dumped rows are bound to, or empty for a
+	// ledger whose controller never claimed.
+	Binding string `json:"binding,omitempty"`
+}
+
+// DumpFormat is pg_dump's custom format, the one pg_restore can restore in a
+// single transaction with a filtered list.
+const DumpFormat = "pg_dump-custom"
+
 // IsExternal reports whether the ledger lives outside this archive.
 func (l LedgerFacts) IsExternal() bool { return l.External }
+
+// IsDump reports whether the ledger travels as a PostgreSQL dump.
+func (l LedgerFacts) IsDump() bool { return l.Dump != nil }
+
+// IsFile reports whether the ledger travels as a SQLite file.
+func (l LedgerFacts) IsFile() bool { return !l.External && l.Dump == nil }
 
 // HighestVersion is the newest migration the snapshot carries.
 func (l LedgerFacts) HighestVersion() int {
@@ -262,6 +297,10 @@ func decodeManifest(body []byte) (Manifest, error) {
 				"deployment with", errNotAnArchive, EntryManifest, orUnnamed(m.Ledger.Backend))
 	}
 
+	if m.Ledger.Dump != nil {
+		return m, checkDumpClaim(m)
+	}
+
 	// AND AN ARCHIVE CARRYING ITS LEDGER DOES NOT DESCRIBE ONE SOMEWHERE ELSE.
 	// The two fields exist to say where the ledger is; a manifest setting them
 	// while shipping the file is describing two different deployments.
@@ -272,6 +311,38 @@ func decodeManifest(body []byte) (Manifest, error) {
 	}
 
 	return m, nil
+}
+
+// checkDumpClaim refuses a dump claim a manifest cannot be making honestly.
+//
+// THE SAME RULE AS THE EXTERNAL LEDGER'S: a schema that cannot express the claim
+// must not be read as making it, and a claim that contradicts itself is refused
+// by naming the contradiction rather than resolving it.
+func checkDumpClaim(m Manifest) error {
+	d := m.Ledger.Dump
+
+	switch {
+	case m.Schema < 4:
+		return fmt.Errorf("%w: %s declares schema %d and also describes a ledger dump, which "+
+			"schema %d has no way to express", errNotAnArchive, EntryManifest, m.Schema, m.Schema)
+	case m.Ledger.External:
+		return fmt.Errorf("%w: %s says its ledger is external and also that it carries a dump of it",
+			errNotAnArchive, EntryManifest)
+	case !externalBackends[m.Ledger.Backend]:
+		return fmt.Errorf("%w: %s describes a ledger dump of %s, which this billet cannot restore",
+			errNotAnArchive, EntryManifest, orUnnamed(m.Ledger.Backend))
+	case d.Format != DumpFormat:
+		return fmt.Errorf("%w: %s describes a ledger dump in format %q, and this billet restores %q",
+			errNotAnArchive, EntryManifest, d.Format, DumpFormat)
+	case d.Schema == "" || d.DumpVersion <= 0:
+		return fmt.Errorf("%w: %s describes a ledger dump without its schema or the pg_dump "+
+			"version that wrote it", errNotAnArchive, EntryManifest)
+	case d.Binding != "" && d.Binding != m.DeploymentID:
+		return fmt.Errorf("%w: %s says the dumped ledger belongs to deployment %s and the archive "+
+			"is of %s", errNotAnArchive, EntryManifest, d.Binding, m.DeploymentID)
+	}
+
+	return nil
 }
 
 // orUnnamed renders a backend for a diagnostic, including the empty one.

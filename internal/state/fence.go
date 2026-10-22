@@ -389,35 +389,9 @@ func PeekLedger(ctx context.Context, dbPath string) (LedgerContents, error) {
 		return LedgerContents{}, err
 	}
 
-	var out LedgerContents
-
-	for _, table := range tables {
-		n, err := countTableRows(ctx, db, table)
-		if err != nil {
-			return LedgerContents{}, fmt.Errorf("state: count %s in %s: %w", table, dbPath, err)
-		}
-
-		switch {
-		case table == "schema_migrations":
-		case table == "admission":
-			// THE EXACT ROW ITS MIGRATION INSERTS, not merely one row. Counting
-			// to one exempts a SEALED admission, an advanced generation, or a
-			// provenance and reason an operator wrote — all of them deployment
-			// state, and all of them exempted by a count. A drain taken on a host
-			// somebody then decided to restore over would have read as pristine.
-			pristine, err := admissionIsPristine(ctx, db)
-			if err != nil {
-				return LedgerContents{}, err
-			}
-
-			if !pristine {
-				out.Populated = true
-				out.NonEmpty = append(out.NonEmpty, "admission (changed)")
-			}
-		case n > 0:
-			out.Populated = true
-			out.NonEmpty = append(out.NonEmpty, fmt.Sprintf("%s (%d)", table, n))
-		}
+	out, err := countLedger(ctx, sqliteBackendAt(dbPath), db, tables)
+	if err != nil {
+		return LedgerContents{}, fmt.Errorf("%w (in %s)", err, dbPath)
 	}
 
 	return out, nil
