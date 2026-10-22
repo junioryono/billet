@@ -1,0 +1,44 @@
+{
+  "CacheAuthority.proven": {
+    "lease_id": "CacheAuthority.lease_id",
+    "job_id": "CacheAuthority.job_id",
+    "run_id": 384715820,
+    "owner": "CacheAuthority.owner",
+    "repository": "CacheAuthority.repository",
+    "event": "CacheAuthority.event",
+    "ref": "CacheAuthority.ref",
+    "base_ref": "CacheAuthority.base_ref",
+    "default_ref": "CacheAuthority.default_ref",
+    "proven": true,
+    "write_own_ref": false,
+    "publish_default": false
+  },
+  "CacheAuthority.publish_default": {
+    "lease_id": "CacheAuthority.lease_id",
+    "job_id": "CacheAuthority.job_id",
+    "run_id": 384715820,
+    "owner": "CacheAuthority.owner",
+    "repository": "CacheAuthority.repository",
+    "event": "CacheAuthority.event",
+    "ref": "CacheAuthority.ref",
+    "base_ref": "CacheAuthority.base_ref",
+    "default_ref": "CacheAuthority.default_ref",
+    "proven": false,
+    "write_own_ref": false,
+    "publish_default": true
+  },
+  "CacheAuthority.write_own_ref": {
+    "lease_id": "CacheAuthority.lease_id",
+    "job_id": "CacheAuthority.job_id",
+    "run_id": 384715820,
+    "owner": "CacheAuthority.owner",
+    "repository": "CacheAuthority.repository",
+    "event": "CacheAuthority.event",
+    "ref": "CacheAuthority.ref",
+    "base_ref": "CacheAuthority.base_ref",
+    "default_ref": "CacheAuthority.default_ref",
+    "proven": false,
+    "write_own_ref": true,
+    "publish_default": false
+  }
+}

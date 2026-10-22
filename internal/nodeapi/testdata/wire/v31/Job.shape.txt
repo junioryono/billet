@@ -1,0 +1,8 @@
+Job.request_id int64
+Job.run_id int64
+Job.event string
+Job.owner string
+Job.repository string
+Job.workflow_ref string
+Job.job_id tag omitempty
+Job.job_id string

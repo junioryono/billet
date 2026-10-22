@@ -853,7 +853,7 @@ func checkSpec(spec provider.Spec) error {
 			"no cache", spec.Name)
 	}
 
-	if spec.ActionsProxy != "" || spec.ActionsCAPEM != "" {
+	if spec.ActionsProxy != "" || spec.NpmProxy != "" || spec.ActionsCAPEM != "" {
 		return fmt.Errorf("tart: %s asks for the actions results proxy, which this backend "+
 			"does not wire into a guest yet", spec.Name)
 	}

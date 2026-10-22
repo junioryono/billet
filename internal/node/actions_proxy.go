@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -83,6 +84,46 @@ func (s *CacheService) ensureActionsProxy() (*actionsProxy, error) {
 	}
 
 	return s.actions, nil
+}
+
+// ensureNpmCache makes the npm cache beside the Actions proxy, under the same
+// interception authority. Called with s.mu held.
+//
+// A STORE THAT CANNOT BE OPENED LEAVES THE CACHE SPLICING: the guest still
+// trusts the authority and reaches the registry through it, uncached, rather
+// than failing its handshake against a host it was told to remap.
+func (s *CacheService) ensureNpmCache() error {
+	if s.npm != nil {
+		return nil
+	}
+	proxy, err := s.ensureActionsProxy()
+	if err != nil {
+		return err
+	}
+	bundle, err := proxy.ca.IssueServer([]string{npmRegistryHost})
+	if err != nil {
+		return fmt.Errorf("node: issue the npm registry certificate: %w", err)
+	}
+	leaf, err := tls.X509KeyPair(bundle.CertPEM, bundle.KeyPEM)
+	if err != nil {
+		return fmt.Errorf("node: load the npm registry certificate: %w", err)
+	}
+	store, err := openNpmStore(filepath.Join(s.rootState, "npm-registry"), npmStoreLimit)
+	if err != nil {
+		s.log.Warn("the npm store could not be opened; npm requests will go to the registry uncached",
+			"error", err)
+		store = nil
+	}
+	s.npm = newNpmCache(s, leaf, store)
+
+	return nil
+}
+
+func (s *CacheService) npmCache() *npmCache {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.npm
 }
 
 // dialActionsUpstream opens the TLS connection a passthrough splices onto.
@@ -167,11 +208,15 @@ func (s *CacheService) authenticateProxy(
 	if err := lockCacheSession(ctx, session); err != nil {
 		return nil, false
 	}
-	allowed := session.intercept && !session.closed
+	allowed := (session.intercept || session.npmEnabled()) && !session.closed
 	session.mu.Unlock()
 
 	return session, allowed
 }
+
+// npmEnabled reports whether the session's tier has the npm cache. The spec is
+// fixed when the session is made.
+func (session *cacheSession) npmEnabled() bool { return session.cache != nil && session.cache.Npm }
 
 func (p *actionsProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	session, ok := p.service.authenticateProxy(r.Context(), r)
@@ -188,13 +233,22 @@ func (p *actionsProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
-	if host != actionsResultsHost || port != "443" {
-		http.Error(w, "only the Actions results origin is available", http.StatusForbidden)
+	// EACH HOST IS ITS OWN SWITCH: a session reaches only the origins its tier
+	// enables, whatever host it names.
+	switch {
+	case port != "443":
+	case host == actionsResultsHost && session.intercept:
+		p.intercept(r.Context(), w, session)
 
 		return
-	}
+	case host == npmRegistryHost && session.npmEnabled():
+		if npm := p.service.npmCache(); npm != nil {
+			npm.intercept(r.Context(), w, session)
 
-	p.intercept(r.Context(), w, session)
+			return
+		}
+	}
+	http.Error(w, "only the origins this guest's tier intercepts are available", http.StatusForbidden)
 }
 
 // actionsRequestTargetsResultsHost reports whether the inner request is
@@ -235,38 +289,57 @@ func hijack(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
 	return h.Hijack()
 }
 
+// openTunnel answers an authenticated CONNECT and completes the guest's TLS
+// handshake as leaf. The caller closes the returned raw connection.
+func openTunnel(ctx context.Context, w http.ResponseWriter, leaf tls.Certificate) (net.Conn, *tls.Conn, bool) {
+	client, buffered, err := hijack(w)
+	if err != nil {
+		return nil, nil, false
+	}
+	// The listener's ordinary request deadline remains attached after Hijack.
+	// Clear it before the TLS handshake and let the bounded handshake/request
+	// contexts govern this connection.
+	if err := client.SetDeadline(time.Time{}); err != nil {
+		_ = client.Close()
+
+		return nil, nil, false
+	}
+
+	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = client.Close()
+
+		return nil, nil, false
+	}
+	if err := buffered.Flush(); err != nil {
+		_ = client.Close()
+
+		return nil, nil, false
+	}
+
+	tlsConn := tls.Server(client, &tls.Config{
+		Certificates: []tls.Certificate{leaf}, MinVersion: tls.VersionTLS13,
+	})
+	handshakeCtx, cancel := context.WithTimeout(ctx, actionsConnectWait)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+		_ = client.Close()
+
+		return nil, nil, false
+	}
+
+	return client, tlsConn, true
+}
+
 func (p *actionsProxy) intercept(
 	ctx context.Context,
 	w http.ResponseWriter,
 	session *cacheSession,
 ) {
-	client, buffered, err := hijack(w)
-	if err != nil {
+	client, tlsConn, ok := openTunnel(ctx, w, p.leaf)
+	if !ok {
 		return
 	}
 	defer client.Close()
-	// The listener's ordinary request deadline remains attached after Hijack.
-	// Clear it before the TLS handshake and let the bounded handshake/request
-	// contexts below govern this connection.
-	if err := client.SetDeadline(time.Time{}); err != nil {
-		return
-	}
-
-	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		return
-	}
-	if err := buffered.Flush(); err != nil {
-		return
-	}
-
-	tlsConn := tls.Server(client, &tls.Config{
-		Certificates: []tls.Certificate{p.leaf}, MinVersion: tls.VersionTLS13,
-	})
-	handshakeCtx, cancel := context.WithTimeout(ctx, actionsConnectWait)
-	defer cancel()
-	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
-		return
-	}
 
 	// EVERY BYTE THE PARSER CONSUMES IS CAPTURED, so a request that turns out to
 	// be GitHub's rather than billet's can be replayed onto the upstream exactly
@@ -355,23 +428,36 @@ func (p *actionsProxy) splice(
 	guest net.Conn,
 	capture *actionsCaptureReader,
 ) {
+	spliceTo(ctx, p.service.log, guest, capture, p.dialUpstream, "GitHub's results service")
+}
+
+// spliceTo replays the captured request onto a connection dial opens and joins
+// the two until either side finishes.
+func spliceTo(
+	ctx context.Context,
+	log *slog.Logger,
+	guest net.Conn,
+	capture *actionsCaptureReader,
+	dial func(context.Context) (net.Conn, error),
+	origin string,
+) {
 	captured, ok := capture.take()
 	if !ok {
 		// The capture overflowed, so the request cannot be replayed faithfully.
-		// Refusing beats forwarding a truncated request GitHub would misread.
-		p.service.log.Warn("a passthrough request was too large to replay upstream")
+		// Refusing beats forwarding a truncated request the origin would misread.
+		log.Warn("a passthrough request was too large to replay upstream", "origin", origin)
 
 		return
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, actionsConnectWait)
-	upstream, err := p.dialUpstream(dialCtx)
+	upstream, err := dial(dialCtx)
 
 	cancel()
 
 	if err != nil {
-		p.service.log.Warn("the results passthrough could not reach GitHub", "error", err)
-		response := actionsBlobError(http.StatusBadGateway, "upstream results service unavailable")
+		log.Warn("a passthrough could not reach its origin", "origin", origin, "error", err)
+		response := actionsBlobError(http.StatusBadGateway, origin+" is unavailable")
 		response.Close = true
 		//nolint:errcheck // best-effort refusal on a connection being abandoned
 		_ = response.Write(guest)

@@ -187,7 +187,7 @@ func TestTheCacheBlockRefusesWhatItCannotHonour(t *testing.T) {
 func TestEveryNodeServedCacheRequiresAHostBackedCacheNode(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []string{"git", "bazel", "go"} {
+	for _, kind := range []string{"git", "bazel", "go", "npm"} {
 		block := "    cache:\n      " + kind + ": {enabled: true}\n"
 		without := strings.Replace(validConfig, "    image: ubuntu-2404-x64\n",
 			"    image: ubuntu-2404-x64\n"+block, 1)
@@ -202,6 +202,51 @@ func TestEveryNodeServedCacheRequiresAHostBackedCacheNode(t *testing.T) {
 			!strings.Contains(err.Error(), "only the firecracker provider") {
 			t.Errorf("%s on remote compute: %v", kind, err)
 		}
+	}
+}
+
+// THE NPM CACHE IS THE ONE CACHE OFF UNLESS A TIER NAMES IT (ADR-020): a client
+// the node's authority does not reach fails rather than missing. Named, it is on,
+// and a tier whose node cannot serve it is refused at load rather than left
+// quietly off; it has no size of its own because the store is the node's.
+func TestTheNpmCacheIsOffUnlessATierNamesIt(t *testing.T) {
+	t.Parallel()
+
+	linux := func(cache *TierCache) Tier {
+		return Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Trust: WorkloadTrusted, Cache: cache}
+	}
+	for name, tc := range map[string]struct {
+		tier Tier
+		want bool
+	}{
+		"a tier that says nothing":       {linux(nil), false},
+		"a cache block without npm":      {linux(&TierCache{Publish: CachePublishOff}), false},
+		"an npm block that says nothing": {linux(&TierCache{Npm: &NpmCache{}}), false},
+		"npm turned off":                 {linux(&TierCache{Npm: &NpmCache{Enabled: new(false)}}), false},
+		"npm turned on":                  {linux(&TierCache{Npm: &NpmCache{Enabled: new(true)}}), true},
+		"an untrusted tier with npm on": {Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux,
+			Trust: WorkloadUntrusted, Cache: &TierCache{Npm: &NpmCache{Enabled: new(true)}}}, true},
+		// NAMED WHERE IT CANNOT RUN, IT STAYS ON so the load refuses it, as
+		// TestEveryNodeServedCacheRequiresAHostBackedCacheNode proves.
+		"npm on a docker tier": {Tier{Provider: ProviderDocker, GuestOS: GuestLinux,
+			Cache: &TierCache{Npm: &NpmCache{Enabled: new(true)}}}, true},
+	} {
+		spec := tc.tier.EffectiveCache()
+		if spec.Npm != tc.want || spec.Setting(CacheNpm).Enabled != tc.want {
+			t.Errorf("%s: npm = %v (setting %+v), want %v", name, spec.Npm, spec.Setting(CacheNpm), tc.want)
+		}
+	}
+
+	sized := untrustedCacheTier("    cache:\n      npm: {enabled: true, max_size: 10GiB}\n")
+	if _, err := Load(writeConfig(t, sized)); err == nil || !strings.Contains(err.Error(), "max_size") {
+		t.Fatalf("an npm cache given a size of its own: %v", err)
+	}
+	cfg, err := Load(writeConfig(t, untrustedCacheTier("    cache:\n      npm: {enabled: true}\n")))
+	if err != nil {
+		t.Fatalf("Load an npm tier: %v", err)
+	}
+	if !cfg.Tiers[0].EffectiveCache().Npm {
+		t.Fatal("a loaded tier that names the npm cache does not have it")
 	}
 }
 
@@ -293,6 +338,10 @@ func TestOnlyATierAnOlderNodeWouldExceedNeedsACacheAwareNode(t *testing.T) {
 			&TierCache{Docker: &CacheToggle{MaxSize: small}}), true},
 		"a smaller actions archive": {firecracker(WorkloadUntrusted,
 			&TierCache{Actions: &ActionsCache{MaxArchive: 5 * GiB}}), true},
+		// AN OLDER NODE WITHOUT THE NPM CACHE LEAVES NPM ON THE REGISTRY, which is
+		// doing less, so the cache alone needs no newer node.
+		"a trusted tier with the npm cache": {firecracker(WorkloadTrusted,
+			&TierCache{Npm: &NpmCache{Enabled: new(true)}}), false},
 	} {
 		if got := tc.tier.NeedsCacheAwareNode(); got != tc.want {
 			t.Errorf("%s: NeedsCacheAwareNode = %v, want %v", name, got, tc.want)

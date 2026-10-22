@@ -133,7 +133,11 @@ func cacheSummary(spec config.CacheSpec) string {
 		if !setting.Enabled {
 			continue
 		}
-		part := string(kind) + "(" + setting.MaxSize.String() + ")"
+		part := string(kind)
+		// The npm store is the node's and has no per-tier ceiling to print.
+		if setting.MaxSize > 0 {
+			part += "(" + setting.MaxSize.String() + ")"
+		}
 		if kind == config.CacheGo && spec.GoTestResults {
 			part += "+tests"
 		}

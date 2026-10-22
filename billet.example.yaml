@@ -1095,6 +1095,7 @@ tiers:
     #   git:          { enabled: true, max_size: 50GiB }
     #   bazel:        { enabled: true, max_size: 50GiB }
     #   go:           { enabled: true, max_size: 20GiB, test_results: false }
+    #   npm:          { enabled: false }   # off unless named; the store is the node's (ADR-020)
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker

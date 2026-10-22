@@ -1,0 +1,18 @@
+{
+  "LaunchedResponse.lease_ids.value": {
+    "lease_ids": {
+      "LaunchedResponse.lease_ids.key": true
+    },
+    "quarantined": {
+      "LaunchedResponse.quarantined.key": false
+    }
+  },
+  "LaunchedResponse.quarantined.value": {
+    "lease_ids": {
+      "LaunchedResponse.lease_ids.key": false
+    },
+    "quarantined": {
+      "LaunchedResponse.quarantined.key": true
+    }
+  }
+}
