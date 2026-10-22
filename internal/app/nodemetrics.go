@@ -126,6 +126,7 @@ func (n *Node) GitMetrics() MetricsSource {
 			o, err := reg.GitObserver(metrics.GitLabels{
 				Routes: node.GitRoutes(), Reasons: node.GitReasons(), Statuses: node.GitStatusClasses(),
 				RefreshOutcomes: node.GitRefreshOutcomes(), LookupOutcomes: node.GitLookupOutcomes(),
+				MaintenanceKinds: node.GitMaintenanceKinds(), MaintenanceOutcomes: node.GitMaintenanceOutcomes(),
 			})
 			if err != nil {
 				return err

@@ -320,7 +320,7 @@ func NewCacheService(
 		guestDecode: make(chan struct{}, guestDecodeSlots),
 	}
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
-	service.git = newGitProxy(filepath.Join(stateDir, "git-mirrors"))
+	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
 	if err := service.loadSessions(); err != nil {
 		return nil, err

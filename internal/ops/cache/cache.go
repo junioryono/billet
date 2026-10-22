@@ -15,8 +15,8 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
-// Run is `billet cache`: the kill switch, its status, the orphan report, the
-// conformance gate, and the helpers a guest runs.
+// Run is `billet cache`: the kill switch, its status, the orphan report, the git
+// mirrors an operator drops, the conformance gate, and the helpers a guest runs.
 func Run(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) > 0 && args[0] == "conformance" {
 		return cmdCacheConformance(ctx, env, args[1:])
@@ -28,6 +28,10 @@ func Run(ctx context.Context, env cli.Env, args []string) error {
 
 	if len(args) > 0 && args[0] == "orphans" {
 		return cmdCacheOrphans(ctx, env, args[1:])
+	}
+
+	if len(args) > 0 && args[0] == "git" {
+		return cmdCacheGit(ctx, env, args[1:])
 	}
 
 	// Run inside a guest by the go command, bazel and git, never by a person.
@@ -42,7 +46,7 @@ func Run(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if len(args) == 0 || args[0] != "disable" && args[0] != "enable" {
-		return errors.New("usage: billet cache <disable|enable|status|orphans|conformance> [flags]")
+		return errors.New("usage: billet cache <disable|enable|status|orphans|git|conformance> [flags]")
 	}
 	action := args[0]
 	name := "billet cache disable"

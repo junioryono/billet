@@ -1,12 +1,15 @@
 package node
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/durablefile"
 )
 
 // FRESHNESS IS COUNTED FROM THE REGISTRY'S CLOCK (RFC 9111 4.2.3): an answer
@@ -107,7 +110,9 @@ func TestOnlyAShareableAnswerIsKept(t *testing.T) {
 		{"private", http.Header{"Cache-Control": {"private, max-age=300"}}, false},
 		{"no-store", http.Header{"Cache-Control": {"no-store"}}, false},
 		{"no-cache", http.Header{"Cache-Control": {"public, no-cache"}}, false},
-		{"a cookie", http.Header{"Cache-Control": {"public"}, "Set-Cookie": {"a=b"}}, false},
+		// THE REGISTRY'S CDN SETS ONE ON EVERY ANSWER (measured 2026-10-22): it is
+		// the node's, and confines nothing.
+		{"a cookie", http.Header{"Cache-Control": {"public"}, "Set-Cookie": {"__cf_bm=x"}}, true},
 	} {
 		if got := npmShareable(tc.header); got != tc.want {
 			t.Errorf("%s: shareable = %v, want %v", tc.name, got, tc.want)
@@ -268,6 +273,249 @@ func TestARemovalOfASupersededGenerationLeavesTheReplacement(t *testing.T) {
 	if !reopened.held(entry.Key) {
 		t.Fatal("the replacement's metadata did not survive the old generation's removal")
 	}
+}
+
+// A BODY A READER HOLDS OUTLIVES ITS ENTRY ON DISK, and its bytes stay counted
+// against the fill budget until that reader closes, so evicting under a slow
+// reader can never put more on the node's disk than the store says it holds.
+func TestARetiredBodyIsDeletedOnlyWhenItsLastReaderCloses(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.fillLimit = 10
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	entry := npmEntry{Key: "full /pinned", Path: "/pinned", Object: npmPackageDocument, Variant: npmFull,
+		Size: 8, Received: now}
+	if err := store.commit(entry, writeNpmTemp(t, store, "8 bytes!")); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	_, body, ok := store.acquire(entry.Key, now)
+	if !ok {
+		t.Fatal("the entry is not held")
+	}
+	path := filepath.Join(store.bodiesDir(), body.name)
+	store.removeIf(entry.Key, body.name)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a body its reader still holds was deleted: %v", err)
+	}
+	if store.reserve(3) {
+		t.Fatal("the fill budget did not count a retired body still on disk")
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a retired body survived its last reader: %v", err)
+	}
+	if !store.reserve(3) {
+		t.Fatal("the fill budget was not given back when the retired body went")
+	}
+	store.release(3)
+}
+
+// A BODY COMMITTED FOR AN ANSWER IS PINNED BEFORE ANY EVICTION CAN CHOOSE IT:
+// here the store's bound is smaller than the entry, so the commit's own
+// eviction retires it at once, and the answer still reads it whole.
+func TestACommittedAnswerIsReadableEvenWhenItsCommitEvictsIt(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 4)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	entry := npmEntry{Key: "full /big", Path: "/big", Object: npmPackageDocument, Variant: npmFull, Size: 9,
+		Received: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)}
+	stored, body, err := store.commitAndAcquire(entry, writeNpmTemp(t, store, "nine byte"))
+	if err != nil {
+		t.Fatalf("commitAndAcquire: %v", err)
+	}
+	if store.held(entry.Key) {
+		t.Fatal("an entry larger than the store's bound is still indexed")
+	}
+	// WHAT THE PIN BUYS IS THE ACCOUNTING, not the read: an open descriptor reads
+	// a deleted file too, but its blocks are then on disk and counted nowhere.
+	if _, err := os.Stat(filepath.Join(store.bodiesDir(), stored.Body)); err != nil {
+		t.Fatalf("the body an answer holds was deleted by its commit's eviction: %v", err)
+	}
+	store.mu.Lock()
+	owed := store.retiredBytes
+	store.mu.Unlock()
+	if owed != entry.Size {
+		t.Fatalf("the evicted body an answer holds is owed %d bytes, want %d", owed, entry.Size)
+	}
+	raw, err := io.ReadAll(body)
+	if err != nil || string(raw) != "nine byte" {
+		t.Fatalf("the answer read %q, %v from a body its commit evicted", raw, err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.bodiesDir(), stored.Body)); !os.IsNotExist(err) {
+		t.Fatalf("the evicted body survived its reader: %v", err)
+	}
+}
+
+// TWO READERS OF ONE RETIRED BODY: the first close leaves it, the last deletes
+// it, and a second close of the same reader changes nothing.
+func TestARetiredBodyOutlivesEveryReaderButTheLast(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	entry := npmEntry{Key: "full /two", Path: "/two", Object: npmPackageDocument, Variant: npmFull, Size: 3,
+		Received: now}
+	if err := store.commit(entry, writeNpmTemp(t, store, "two")); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	_, first, ok := store.acquire(entry.Key, now)
+	_, second, also := store.acquire(entry.Key, now)
+	if !ok || !also {
+		t.Fatal("the entry could not be read twice")
+	}
+	path := filepath.Join(store.bodiesDir(), first.name)
+	store.removeIf(entry.Key, first.name)
+	for range 2 {
+		if err := first.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("close the first reader: %v", err)
+		}
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the body went with its first reader, while a second still held it: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("close the second reader: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("the body outlived its last reader: %v", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.pins) != 0 || len(store.retired) != 0 || store.retiredBytes != 0 {
+		t.Fatalf("after the last reader: pins %v, retired %v, %d bytes owed", store.pins, store.retired,
+			store.retiredBytes)
+	}
+}
+
+// A BODY KEPT BECAUSE ITS METADATA'S REMOVAL WAS NOT MADE DURABLE IS DEBT, not
+// a retirement: a reader that held it across the removal does not delete it on
+// its close, because metadata a crash brings back may still name it, and it
+// stays charged to the fill budget.
+func TestABodyKeptByAFailedRemovalOutlivesItsReader(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.fillLimit = 10
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	entry := npmEntry{Key: "full /stuck", Path: "/stuck", Object: npmPackageDocument, Variant: npmFull, Size: 8,
+		Received: now}
+	if err := store.commit(entry, writeNpmTemp(t, store, "8 bytes!")); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	_, body, ok := store.acquire(entry.Key, now)
+	if !ok {
+		t.Fatal("the entry is not held")
+	}
+	path := filepath.Join(store.bodiesDir(), body.name)
+	store.disk = durablefile.Installer{SyncDir: func(string) error { return errors.New("the disk refused a flush") }}
+	store.removeIf(entry.Key, body.name)
+	if err := body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a body a failed removal kept was deleted by its reader's close: %v", err)
+	}
+	if store.reserve(3) {
+		t.Fatal("a body kept as debt is not charged to the fill budget")
+	}
+}
+
+// A BODY RENAMED INTO PLACE BEFORE ITS DIRECTORY SYNC FAILED, THAT THE DISK
+// THEN REFUSES TO DELETE, IS DEBT: charged once, against the fill budget, never
+// left on disk counted nowhere.
+func TestABodyRenamedBeforeAFailedSyncThatWillNotDeleteIsDebt(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.fillLimit = 10
+	store.disk = durablefile.Installer{SyncDir: func(dir string) error {
+		if dir == store.bodiesDir() {
+			return errors.New("the disk refused to flush the bodies directory")
+		}
+
+		return nil
+	}}
+	store.remove = func(path string) error {
+		if filepath.Dir(path) == store.bodiesDir() {
+			return errors.New("the disk refused to delete a body")
+		}
+
+		return os.Remove(path)
+	}
+	entry := npmEntry{Key: "full /orphan", Path: "/orphan", Object: npmPackageDocument, Variant: npmFull, Size: 8,
+		Received: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)}
+	if err := store.commit(entry, writeNpmTemp(t, store, "8 bytes!")); err == nil {
+		t.Fatal("a commit whose body could not be flushed reported success")
+	}
+	store.mu.Lock()
+	debt, owed, held := len(store.debt), store.retiredBytes, len(store.entries)
+	store.mu.Unlock()
+	if debt != 1 || owed != entry.Size || held != 0 {
+		t.Fatalf("after a body the disk kept: %d debts, %d bytes owed, %d entries; want 1, %d, 0", debt, owed, held,
+			entry.Size)
+	}
+	if store.reserve(3) {
+		t.Fatal("the fill budget did not count the body the disk kept")
+	}
+	if !store.reserve(2) {
+		t.Fatal("the body the disk kept was charged more than once")
+	}
+	store.release(2)
+}
+
+// A METADATA INSTALL THAT FAILED AFTER ITS RENAME LEAVES THE PAIR: durablefile
+// may already have put the metadata in place, and that metadata names the body,
+// so the body stays and the next open finds a whole entry.
+func TestAFailedMetadataInstallKeepsTheBodyItMayName(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := openNpmStore(root, 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.disk = durablefile.Installer{SyncDir: func(dir string) error {
+		if dir == store.entriesDir() {
+			return errors.New("the disk refused to flush the entries directory")
+		}
+
+		return nil
+	}}
+	entry := npmEntry{Key: "full /flaky", Path: "/flaky", Object: npmPackageDocument, Variant: npmFull, Size: 4,
+		Received: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)}
+	if err := store.commit(entry, writeNpmTemp(t, store, "four")); err == nil {
+		t.Fatal("a commit whose metadata could not be flushed reported success")
+	}
+	reopened, err := openNpmStore(root, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	_, body, ok := reopened.acquire(entry.Key, time.Now())
+	if !ok {
+		t.Fatal("the metadata in place names a body the failed commit deleted")
+	}
+	_ = body.Close()
 }
 
 // A FILL PAST ITS BUDGET IS NOT KEPT, and gives the budget back when it ends.

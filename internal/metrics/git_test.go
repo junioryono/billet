@@ -22,7 +22,8 @@ func TestTheGitProxysMetricsCountWhatTheyAreTold(t *testing.T) {
 	o, err := reg.GitObserver(GitLabels{
 		Routes: []string{"mirror", "github"}, Reasons: []string{"served", "no_mirror"},
 		Statuses: []string{"2xx", "5xx"}, RefreshOutcomes: []string{"ok", "unverified"},
-		LookupOutcomes: []string{"ok", "rate_limited"},
+		LookupOutcomes: []string{"ok", "rate_limited"}, MaintenanceKinds: []string{"geometric", "full"},
+		MaintenanceOutcomes: []string{"ok", "disk_full"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -34,6 +35,8 @@ func TestTheGitProxysMetricsCountWhatTheyAreTold(t *testing.T) {
 	o.GitRefresh("unverified", 3*time.Second)
 	o.GitLookup("rate_limited")
 	o.GitLookup("rate_limited")
+	o.GitMaintenance("full", "ok", 17*time.Second)
+	o.GitMaintenance("a kind from somewhere else", "ok", time.Second)
 
 	srv, err := Listen(t.Context(), "127.0.0.1:0", reg.Handler(false))
 	if err != nil {
@@ -62,6 +65,10 @@ func TestTheGitProxysMetricsCountWhatTheyAreTold(t *testing.T) {
 		"billet_node_git_refresh_seconds_count 1",
 		`billet_node_git_repository_lookups_total{outcome="rate_limited"} 2`,
 		`billet_node_git_repository_lookups_total{outcome="ok"} 0`,
+		`billet_node_git_maintenance_total{kind="full",outcome="ok"} 1`,
+		`billet_node_git_maintenance_total{kind="geometric",outcome="disk_full"} 0`,
+		`billet_node_git_maintenance_total{kind="other",outcome="ok"} 1`,
+		`billet_node_git_maintenance_seconds_count{kind="full"} 1`,
 	} {
 		if !strings.Contains(body, want+"\n") {
 			t.Errorf("/metrics does not carry %q", want)

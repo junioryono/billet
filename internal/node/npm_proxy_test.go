@@ -8,11 +8,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +23,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -558,6 +562,7 @@ func TestATarballIsKeptOnlyWhenItArrivesWhole(t *testing.T) {
 	if registry.count() != 2 {
 		t.Fatalf("the registry saw %d requests, want the whole tarball and the cut one", registry.count())
 	}
+	assertNpmQuiet(t, service.npmCache())
 }
 
 // waitForNpmFills waits until no fill is in flight: serve releases its fill
@@ -607,25 +612,34 @@ func TestAHeadIsAnsweredOnlyFromAHeldEntry(t *testing.T) {
 	}
 }
 
-// AN ANSWER THAT SETS A COOKIE IS RELAYED BUT NEVER KEPT, and the cookie stays
-// with the node.
-func TestAnAnswerThatSetsACookieIsNotKept(t *testing.T) {
+// A COOKIE THE REGISTRY SETS IS THE NODE'S: npm's CDN sets one on every answer
+// (measured 2026-10-22), so it confines nothing and the answer is kept, and it
+// reaches neither the client that caused the fill nor one answered from the
+// store.
+func TestACookieTheRegistrySetsIsTheNodesAndReachesNoClient(t *testing.T) {
 	t.Parallel()
 
 	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		if r.Header.Get("Cookie") != "" {
+			t.Errorf("the node sent a cookie back to the registry: %q", r.Header.Get("Cookie"))
+		}
 		w.Header().Set("Cache-Control", "public, max-age=300")
-		w.Header().Set("Set-Cookie", "session=node")
+		w.Header().Set("Set-Cookie", "__cf_bm=node; HttpOnly; Secure; Path=/; Domain=npmjs.org")
 		serveText(t, w, "{}")
 	})
 	service, credentials := npmService(t, registry)
 
-	resp, _ := npmGet(t, service, credentials, npmRequestLine("/cookie"))
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("Set-Cookie") != "" {
-		t.Fatalf("an answer with a cookie = %d, cookie %q", resp.StatusCode, resp.Header.Get("Set-Cookie"))
+	for i := range 2 {
+		resp, body := npmGet(t, service, credentials, npmRequestLine("/cookie"))
+		if resp.StatusCode != http.StatusOK || body != "{}" || resp.Header.Get("Set-Cookie") != "" {
+			t.Fatalf("answer %d to a registry that sets a cookie = %d %q, cookie %q", i+1, resp.StatusCode, body,
+				resp.Header.Get("Set-Cookie"))
+		}
 	}
-	if service.npmCache().store.held("full /cookie") {
-		t.Fatal("an answer that set a cookie was kept")
+	if registry.count() != 1 {
+		t.Fatalf("the registry was asked %d times; an answer it set a cookie on was not kept", registry.count())
 	}
+	assertNpmQuiet(t, service.npmCache())
 }
 
 // EACH HOST IS ITS OWN SWITCH: an npm-only session cannot reach the results
@@ -692,6 +706,23 @@ func TestTheKillSwitchSplicesTheNpmCache(t *testing.T) {
 	}
 	if got := noted(service, credentials); got != alloc.BuildCacheDisabled {
 		t.Fatalf("the npm cache's outcome = %q, want disabled", got)
+	}
+}
+
+// holdBackTheBody pins the client socket's receive buffer small, so a body far
+// larger than what the two sockets can hold keeps the node's write blocked until
+// the client reads: Linux caps a send buffer at tcp_wmem's maximum (4 MiB on the
+// shared test host, 2026-10-22), and an explicit receive buffer turns off the
+// autotuning that could otherwise grow to tcp_rmem's 32 MiB.
+func holdBackTheBody(t *testing.T, conn *tls.Conn) {
+	t.Helper()
+
+	raw, ok := conn.NetConn().(*net.TCPConn)
+	if !ok {
+		t.Fatalf("the tunnel is a %T, not a TCP connection", conn.NetConn())
+	}
+	if err := raw.SetReadBuffer(64 << 10); err != nil {
+		t.Fatalf("pin the client's receive buffer: %v", err)
 	}
 }
 
@@ -898,4 +929,389 @@ func TestATarballPastTheFillBudgetReachesItsClientWholeAndIsNotKept(t *testing.T
 	if service.npmCache().store.held(" /huge/-/huge-1.0.0.tgz") {
 		t.Fatal("a tarball past the fill budget was kept")
 	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// assertNpmQuiet holds that the node finished every request it was asked and
+// left nothing behind: no fill in flight or slot taken, no byte of the fill
+// budget still claimed, and no temporary file in the store.
+func assertNpmQuiet(t *testing.T, npm *npmCache) {
+	t.Helper()
+
+	waitForNpmFills(t, npm)
+	if taken := len(npm.slots); taken != 0 {
+		t.Errorf("%d fill slots are still taken", taken)
+	}
+	npm.store.mu.Lock()
+	filling := npm.store.filling
+	npm.store.mu.Unlock()
+	if filling != 0 {
+		t.Errorf("%d bytes of the fill budget are still claimed", filling)
+	}
+	leftovers, err := os.ReadDir(npm.store.tempDir())
+	if err != nil {
+		t.Fatalf("read the store's temporary directory: %v", err)
+	}
+	for _, leftover := range leftovers {
+		t.Errorf("a temporary file was left in the store: %s", leftover.Name())
+	}
+	// EVERY READER CLOSED AND EVERY RETIRED BODY GONE. A warm answer closes its
+	// body after its last byte reached the client, so this is waited for, not
+	// read once.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		npm.store.mu.Lock()
+		pins, retired, debt := len(npm.store.pins), len(npm.store.retired), len(npm.store.debt)
+		owed := npm.store.retiredBytes
+		npm.store.mu.Unlock()
+		if pins == 0 && retired == 0 && debt == 0 && owed == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after 5s: %d bodies still pinned, %d retired and %d kept as debt (%d bytes) still on disk",
+				pins, retired, debt, owed)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A REPLACEMENT THE STORE COULD NOT KEEP STILL REPLACES: the superseded entry
+// never answers a later silent registry.
+func TestAReplacementPastTheBudgetRetiresTheEntryItReplaced(t *testing.T) {
+	t.Parallel()
+
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", `"v1"`, `{"v":1}`),
+		answerWith(http.StatusOK, "public, max-age=300", `"v2"`, `{"v":2, "padding":"`+strings.Repeat("p", 4096)+`"}`),
+		answerWith(http.StatusServiceUnavailable, "", "", "down"))
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/replaced"))
+	service.npmCache().store.fillLimit = 100
+
+	if resp, body := npmGet(t, service, credentials, npmRequestLine("/replaced")); resp.StatusCode != http.StatusOK ||
+		!strings.HasPrefix(body, `{"v":2`) {
+		t.Fatalf("a replacement past the budget = %d %.20q", resp.StatusCode, body)
+	}
+	if service.npmCache().store.held("full /replaced") {
+		t.Fatal("the generation a 200 replaced is still stored")
+	}
+	if resp, body := npmGet(t, service, credentials, npmRequestLine("/replaced")); resp.StatusCode !=
+		http.StatusServiceUnavailable || body != "down" {
+		t.Fatalf("a silent registry after the replacement = %d %q, want its 503", resp.StatusCode, body)
+	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// A HELD 5XX IS STILL WHOLE WHEN THE RETRY ENDS: its idle clock is paused while
+// the node waits on the second attempt, here a document whose body stalls for
+// longer than the idle bound, and its body is larger than a transport buffers.
+func TestAHeld503IsRelayedWholeAfterARetryWhoseBodyStalled(t *testing.T) {
+	t.Parallel()
+
+	busy := strings.Repeat("b", 256<<10)
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 1 {
+			answerWith(http.StatusServiceUnavailable, "", "", busy)(w, r)
+
+			return
+		}
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Content-Length", "100")
+		serveText(t, w, "{")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	})
+	service, credentials := npmService(t, registry)
+	service.npmCache().bodyIdle = 300 * time.Millisecond
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/held"))
+	if resp.StatusCode != http.StatusServiceUnavailable || len(body) != len(busy) {
+		t.Fatalf("a held 503 after a stalled retry = %d, %d of %d bytes", resp.StatusCode, len(body), len(busy))
+	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// AN ANSWER OF UNKNOWN LENGTH IS CHUNKED, and one cut short never ends with the
+// last chunk, so the client cannot take it for whole; and its headers arrive
+// before the node waits on its body, even when the node decodes it: the
+// registry sends no body byte until the client has the headers.
+func TestACutAnswerOfUnknownLengthIsNeverTakenForWhole(t *testing.T) {
+	t.Parallel()
+
+	encoded := gzipped(t, strings.Repeat("g", 64<<10))
+	headersSeen := make(chan struct{})
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-headersSeen:
+		case <-time.After(5 * time.Second):
+		}
+		serveBytes(t, w, encoded[:len(encoded)/2])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("the test registry cannot cut its connection")
+
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("cut the test registry's connection: %v", err)
+
+			return
+		}
+		_ = conn.Close()
+	})
+	service, credentials := npmService(t, registry)
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte(npmRequestLine("/cut/-/cut-1.0.0.tgz"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// HEADERS BEFORE ANY BODY BYTE: the registry holds its body for 5 s or until
+	// this read returns, so a node that waited on the body first fails here.
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("an encoded tarball sent no headers before its body: %v", err)
+	}
+	close(headersSeen)
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	_, err = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(resp.TransferEncoding) != 1 || resp.TransferEncoding[0] != "chunked" ||
+		err == nil {
+		t.Fatalf("a cut answer of unknown length = %d, framing %v, read error %v; want chunked and cut",
+			resp.StatusCode, resp.TransferEncoding, err)
+	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// A 304 TO A REQUEST THAT SENT NO VALIDATOR PROVES NOTHING: the entry, which
+// had no ETag to send, is not refreshed and the client is not told 304.
+func TestAnUnsolicitedNotModifiedIsAnUpstreamFault(t *testing.T) {
+	t.Parallel()
+
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", "", "{}"),
+		answerWith(http.StatusNotModified, "public, max-age=300", "", ""))
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/untagged"))
+	before, body, ok := service.npmCache().store.acquire("full /untagged", time.Now())
+	if !ok {
+		t.Fatal("the untagged document was not kept")
+	}
+	_ = body.Close()
+
+	if resp, _ := npmGet(t, service, credentials, npmRequestLine("/untagged")); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("an unsolicited 304 = %d, want 502", resp.StatusCode)
+	}
+	after, body, ok := service.npmCache().store.acquire("full /untagged", time.Now())
+	if ok {
+		_ = body.Close()
+	}
+	if !ok || !after.Received.Equal(before.Received) || after.Lifetime != before.Lifetime {
+		t.Fatalf("an unsolicited 304 refreshed the entry: before %+v, after %+v", before, after)
+	}
+}
+
+// A TARBALL IN A CODING THE NODE CANNOT TAKE OFF IS NO ANSWER THE CLIENT ACCEPTED.
+func TestATarballInAnUnsupportedCodingIsRefused(t *testing.T) {
+	t.Parallel()
+
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Content-Encoding", "br")
+		serveText(t, w, "not brotli, but no matter")
+	})
+	service, credentials := npmService(t, registry)
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/br/-/br-1.0.0.tgz"))
+	if resp.StatusCode != http.StatusBadGateway || strings.Contains(body, "brotli") {
+		t.Fatalf("a tarball in br = %d %q, want 502 and none of its bytes", resp.StatusCode, body)
+	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// A HEAD THAT MAKES THE NODE FETCH IS ANSWERED AT THE REGISTRY'S HEADERS, not
+// after its body: the registry holds the body until the client has its answer,
+// and the body is then read only to keep it.
+func TestAHeadIsAnsweredBeforeTheBodyItKeeps(t *testing.T) {
+	t.Parallel()
+
+	answered := make(chan struct{})
+	tarball := strings.Repeat("h", 4096)
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		w.Header().Set("Cache-Control", "public, max-age=0")
+		w.Header().Set("ETag", `"v`+strconv.Itoa(n)+`"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(tarball)))
+		w.WriteHeader(http.StatusOK)
+		if n > 1 {
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			select {
+			case <-answered:
+			case <-time.After(5 * time.Second):
+			}
+		}
+		serveText(t, w, tarball)
+	})
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/headed/-/headed-1.0.0.tgz"))
+	waitForNpmFills(t, service.npmCache())
+	ageNpmEntry(t, service.npmCache().store, " /headed/-/headed-1.0.0.tgz", 25*time.Hour)
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte("HEAD /headed/-/headed-1.0.0.tgz HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodHead})
+	close(answered)
+	if err != nil {
+		t.Fatalf("a HEAD that made the node fetch was not answered before the body: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != `"v2"` ||
+		resp.ContentLength != int64(len(tarball)) {
+		t.Fatalf("a HEAD that fetched = %d, ETag %q, length %d", resp.StatusCode, resp.Header.Get("ETag"),
+			resp.ContentLength)
+	}
+	assertNpmQuiet(t, service.npmCache())
+	stored, body, ok := service.npmCache().store.acquire(" /headed/-/headed-1.0.0.tgz", time.Now())
+	if !ok {
+		t.Fatal("the tarball a HEAD fetched was not kept")
+	}
+	_ = body.Close()
+	if stored.ETag != `"v2"` {
+		t.Fatalf("the kept tarball is %s, want the one the HEAD fetched", stored.ETag)
+	}
+}
+
+// A DOCUMENT THE STORE COULD NOT KEEP IS ANSWERED FROM THE FILE IT WAS READ
+// INTO, and that file's bytes stay charged to the fill budget until the answer
+// ends: the commit failed, the file is gone from the store's directories, and
+// only the reservation the read made still counts it.
+func TestADocumentAnsweredAfterAFailedCommitStaysCharged(t *testing.T) {
+	t.Parallel()
+
+	document := `{"padding":"` + strings.Repeat("f", 16<<20) + `"}`
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, document)
+	})
+	service, credentials := npmService(t, registry)
+	npm := service.npmCache()
+	npm.store.fillLimit = int64(len(document)) + 1000
+	npm.store.disk = durablefile.Installer{SyncDir: func(dir string) error {
+		if dir == npm.store.bodiesDir() {
+			return errors.New("the disk refused to flush the bodies directory")
+		}
+
+		return nil
+	}}
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set a deadline: %v", err)
+	}
+	holdBackTheBody(t, conn)
+	if _, err := conn.Write([]byte(npmRequestLine("/unkept"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read the headers: %v", err)
+	}
+	// THE CLIENT HAS READ ONLY THE HEADERS, so the fallback is still answering.
+	npm.store.mu.Lock()
+	filling := npm.store.filling
+	npm.store.mu.Unlock()
+	if filling < int64(len(document)) {
+		t.Fatalf("while a fallback is answered, %d bytes of the fill budget are claimed, want its %d", filling,
+			len(document))
+	}
+	if npm.store.reserve(2000) {
+		t.Fatal("the fill budget admitted another fill while the fallback's bytes were on disk")
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || len(body) != len(document) {
+		t.Fatalf("the fallback read %d of %d bytes: %v", len(body), len(document), err)
+	}
+	if npm.store.held("full /unkept") {
+		t.Fatal("a document whose commit failed was indexed")
+	}
+	assertNpmQuiet(t, npm)
+}
+
+// A DOCUMENT ANSWERED FROM THE STORE THAT ITS OWN COMMIT EVICTED is pinned and
+// charged for as long as its client takes to read it: the store's bound is
+// smaller than the document, and the client stops after the headers, so the
+// answer is still being written while the store is looked at.
+func TestADocumentItsCommitEvictedStaysChargedWhileItIsAnswered(t *testing.T) {
+	t.Parallel()
+
+	document := `{"padding":"` + strings.Repeat("d", 16<<20) + `"}`
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, document)
+	})
+	service, credentials := npmService(t, registry)
+	npm := service.npmCache()
+	npm.store.mu.Lock()
+	npm.store.limit = 1024
+	npm.store.mu.Unlock()
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set a deadline: %v", err)
+	}
+	holdBackTheBody(t, conn)
+	if _, err := conn.Write([]byte(npmRequestLine("/huge"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read the headers: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		npm.store.mu.Lock()
+		pins, owed, held := len(npm.store.pins), npm.store.retiredBytes, len(npm.store.entries)
+		npm.store.mu.Unlock()
+		if pins == 1 && owed == int64(len(document)) && held == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("while answering a document its commit evicted: %d pinned, %d bytes owed, %d entries; "+
+				"want 1, %d, 0", pins, owed, held, len(document))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || len(body) != len(document) {
+		t.Fatalf("the document read %d of %d bytes: %v", len(body), len(document), err)
+	}
+	assertNpmQuiet(t, npm)
 }

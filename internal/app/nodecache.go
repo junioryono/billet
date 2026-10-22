@@ -444,6 +444,12 @@ func CacheSessionRecords(cfg *config.Config) (node.CacheSessionRecords, error) {
 	return records, nil
 }
 
+// ForgetGitMirrors marks every mirror of owner/repo this node keeps so nothing
+// more is served from it and the node removes it, and names those it marked.
+func ForgetGitMirrors(cfg *config.Config, owner, repo string) ([]string, error) {
+	return node.ForgetGitMirrors(cfg.Node.StateDir, owner, repo)
+}
+
 // CacheSessionNames reads this node's cache custody records afresh each time
 // eviction asks, so a volume a session names is never moved to the trash.
 func CacheSessionNames(cfg *config.Config) func() (func(name string) bool, error) {
