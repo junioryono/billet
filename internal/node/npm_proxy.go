@@ -368,6 +368,10 @@ type npmFetch struct {
 	// keep says a document's 200 was read within the fill budget, so it may be
 	// stored.
 	keep bool
+	// budget is what that read claimed of the fill budget, held until the
+	// request ends: through a commit (briefly charged twice, never not at all)
+	// or a fallback that streams the read file after the store let it go.
+	budget *npmBudget
 }
 
 func (f *npmFetch) close() {
@@ -379,6 +383,9 @@ func (f *npmFetch) close() {
 	}
 	if f.document != "" {
 		_ = os.Remove(f.document)
+	}
+	if f.budget != nil {
+		f.budget.done()
 	}
 }
 
@@ -416,7 +423,7 @@ func (n *npmCache) fetch(ctx context.Context, request npmRequest, validator stri
 			last.close()
 			last = f
 		case resp.StatusCode == http.StatusOK && request.object != npmTarball:
-			document, size, keep, err := n.readDocument(f)
+			document, size, budget, err := n.readDocument(f)
 			cancel()
 			if err != nil {
 				_ = resp.Body.Close()
@@ -425,7 +432,7 @@ func (n *npmCache) fetch(ctx context.Context, request npmRequest, validator stri
 
 				continue
 			}
-			f.document, f.size, f.keep = document, size, keep
+			f.document, f.size, f.keep, f.budget = document, size, budget.keep, budget
 			last.close()
 
 			return f, true
@@ -553,27 +560,26 @@ func npmGzip(encoding string) bool { return strings.EqualFold(strings.TrimSpace(
 // readDocument reads a document's 200 whole into a temporary file, decoded.
 // keep is false when the read went past the fill budget: the document still
 // answers its client, and is not stored.
-func (n *npmCache) readDocument(f npmFetch) (string, int64, bool, error) {
+func (n *npmCache) readDocument(f npmFetch) (string, int64, *npmBudget, error) {
 	body := io.Reader(f.resp.Body)
 	switch strings.ToLower(strings.TrimSpace(f.resp.Header.Get("Content-Encoding"))) {
 	case "", "identity":
 	case "gzip":
 		decoded, err := gzip.NewReader(f.resp.Body)
 		if err != nil {
-			return "", 0, false, err
+			return "", 0, nil, err
 		}
 		defer decoded.Close()
 		body = decoded
 	default:
-		return "", 0, false, fmt.Errorf("an encoding the node did not ask for: %q",
+		return "", 0, nil, fmt.Errorf("an encoding the node did not ask for: %q",
 			f.resp.Header.Get("Content-Encoding"))
 	}
 	temp, err := n.store.temp()
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, nil, err
 	}
 	budget := &npmBudget{store: n.store, keep: true}
-	defer budget.done()
 	size, err := io.Copy(io.MultiWriter(temp, budget), io.LimitReader(body, npmDocumentLimit+1))
 	if closeErr := temp.Close(); err == nil {
 		err = closeErr
@@ -588,11 +594,12 @@ func (n *npmCache) readDocument(f npmFetch) (string, int64, bool, error) {
 	}
 	if err != nil {
 		_ = os.Remove(temp.Name())
+		budget.done()
 
-		return "", 0, false, err
+		return "", 0, nil, err
 	}
 
-	return temp.Name(), size, budget.keep, nil
+	return temp.Name(), size, budget, nil
 }
 
 // npmBudget charges what a fill writes to the store's fill budget, and stops
@@ -671,11 +678,8 @@ func (n *npmCache) answerDocument(x npmExchange, f npmFetch, previous string) {
 	if err != nil {
 		n.service.log.Warn("the npm store could not keep a document", "path", x.request.path, "error", err)
 		n.supersede(x, previous)
-		// THE FALLBACK'S BYTES ARE CHARGED while it is read: the file is gone
-		// from the store's directories, not from the disk.
-		if n.store.reserve(f.size) {
-			defer n.store.release(f.size)
-		}
+		// THE FALLBACK'S BYTES STAY CHARGED while it is read, by the reservation
+		// the read made, which the fetch holds until the request ends.
 		n.relayDocument(x, f, document)
 
 		return
@@ -846,8 +850,7 @@ func (n *npmCache) answerRevalidated(ctx context.Context, x npmExchange, entry n
 	merged := entry.headers()
 	// MERGED AS RFC 9111 4.3.4 MERGES, by canonical name, so a 304 that changes
 	// the validator changes it.
-	for _, name := range []string{"Cache-Control", "ETag", "Last-Modified", "Date", "Age", "Expires",
-		"Set-Cookie"} {
+	for _, name := range []string{"Cache-Control", "ETag", "Last-Modified", "Date", "Age", "Expires"} {
 		if values := f.resp.Header.Values(name); len(values) > 0 {
 			merged.Del(name)
 			for _, value := range values {

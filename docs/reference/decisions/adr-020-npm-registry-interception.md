@@ -30,6 +30,7 @@ So only interception reaches every npm fetch without a workflow change. billet a
 - **A tarball is a year-long object.** `/@pnpm/exe.linux-x64/-/exe.linux-x64-12.4.2.tgz` answers `cache-control: public, must-revalidate, max-age=31557600`, 21,062,701 bytes, `age` 1,588,966 seconds (18 days at Cloudflare).
 - **The measured version's tarball URL names the registry itself.** That version document's `dist.tarball` is `https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-12.4.2.tgz`, and its `dist` carries `integrity`, `shasum`, `signatures` and `attestations`. A tarball a document names on another host is simply not intercepted.
 - **A bogus credential changed nothing billet can see.** A public package fetched with a bogus `Authorization: Bearer` header answers `200`, the same as without one. A missing package answers `404`. A private package's answer was not measured.
+- **Every answer sets a cookie of npm's CDN** (2026-10-22 23:27 UTC, from the development Mac and the shared test host). A document and a tarball each answer `set-cookie: __cf_bm=…; HttpOnly; Secure; Path=/; Domain=npmjs.org`, a bot-management cookie that expires after thirty minutes, while `cf-cache-status: HIT` says Cloudflare served the same answer from its own shared cache. The same measurement found a tarball's `cache-control` as `public, immutable, max-age=31557600`, where the one at 21:33 said `must-revalidate`: the directives vary by edge, and the store reads whichever it is given.
 - **npm's own client sends one of two `Accept` headers for a package document** (`npm/pacote`, `lib/registry.js`, read 2026-10-22): `application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*` for the abbreviated document, `application/json` for the full one.
 
 ## Decision
@@ -70,9 +71,9 @@ Everything else is spliced to the registry unchanged, for the whole connection: 
 - An answer is stored only when all of these hold:
   - its status is `200`;
   - it is complete: its declared length, or the end of its chunked body, was reached;
-  - it sets no cookie;
   - its `Cache-Control` names none of `private`, `no-store` or `no-cache`.
-- A `304` refreshes only an entry the store already holds with the `ETag` that was sent. Its headers are merged into the entry's as RFC 9111 merges them, and the entry is held to the same conditions again: a `304` that sets a cookie or names `private`, `no-store` or `no-cache` removes the entry. The validator was the node's, not the client's, so that `304` is never relayed: the node asks again without a validator, under the disposition below, and relays that answer to this one client without storing it. No cookie is ever stored or replayed.
+- A cookie the registry sets is the node's own. It answers the node's anonymous request, so it says nothing about whether the answer may be shared, and it is never stored, never relayed and never sent back. (An earlier form of this record refused to store any answer that set a cookie. The registry sets one on every answer, below, so that rule stored nothing at all.)
+- A `304` refreshes only an entry the store already holds with the `ETag` that was sent. Its headers are merged into the entry's as RFC 9111 merges them, and the entry is held to the same conditions again: a `304` that names `private`, `no-store` or `no-cache` removes the entry. The validator was the node's, not the client's, so that `304` is never relayed: the node asks again without a validator, under the disposition below, and relays that answer to this one client without storing it. No cookie is ever stored or replayed.
 - A redirect is relayed to the client and never followed, so nothing in the store came from another origin.
 - Any other status is relayed and not stored.
 

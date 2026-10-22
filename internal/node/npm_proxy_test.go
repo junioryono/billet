@@ -610,25 +610,34 @@ func TestAHeadIsAnsweredOnlyFromAHeldEntry(t *testing.T) {
 	}
 }
 
-// AN ANSWER THAT SETS A COOKIE IS RELAYED BUT NEVER KEPT, and the cookie stays
-// with the node.
-func TestAnAnswerThatSetsACookieIsNotKept(t *testing.T) {
+// A COOKIE THE REGISTRY SETS IS THE NODE'S: npm's CDN sets one on every answer
+// (measured 2026-10-22), so it confines nothing and the answer is kept, and it
+// reaches neither the client that caused the fill nor one answered from the
+// store.
+func TestACookieTheRegistrySetsIsTheNodesAndReachesNoClient(t *testing.T) {
 	t.Parallel()
 
 	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		if r.Header.Get("Cookie") != "" {
+			t.Errorf("the node sent a cookie back to the registry: %q", r.Header.Get("Cookie"))
+		}
 		w.Header().Set("Cache-Control", "public, max-age=300")
-		w.Header().Set("Set-Cookie", "session=node")
+		w.Header().Set("Set-Cookie", "__cf_bm=node; HttpOnly; Secure; Path=/; Domain=npmjs.org")
 		serveText(t, w, "{}")
 	})
 	service, credentials := npmService(t, registry)
 
-	resp, _ := npmGet(t, service, credentials, npmRequestLine("/cookie"))
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("Set-Cookie") != "" {
-		t.Fatalf("an answer with a cookie = %d, cookie %q", resp.StatusCode, resp.Header.Get("Set-Cookie"))
+	for i := range 2 {
+		resp, body := npmGet(t, service, credentials, npmRequestLine("/cookie"))
+		if resp.StatusCode != http.StatusOK || body != "{}" || resp.Header.Get("Set-Cookie") != "" {
+			t.Fatalf("answer %d to a registry that sets a cookie = %d %q, cookie %q", i+1, resp.StatusCode, body,
+				resp.Header.Get("Set-Cookie"))
+		}
 	}
-	if service.npmCache().store.held("full /cookie") {
-		t.Fatal("an answer that set a cookie was kept")
+	if registry.count() != 1 {
+		t.Fatalf("the registry was asked %d times; an answer it set a cookie on was not kept", registry.count())
 	}
+	assertNpmQuiet(t, service.npmCache())
 }
 
 // EACH HOST IS ITS OWN SWITCH: an npm-only session cannot reach the results
@@ -933,14 +942,15 @@ func assertNpmQuiet(t *testing.T, npm *npmCache) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		npm.store.mu.Lock()
-		pins, retired, owed := len(npm.store.pins), len(npm.store.retired), npm.store.retiredBytes
+		pins, retired, debt := len(npm.store.pins), len(npm.store.retired), len(npm.store.debt)
+		owed := npm.store.retiredBytes
 		npm.store.mu.Unlock()
-		if pins == 0 && retired == 0 && owed == 0 {
+		if pins == 0 && retired == 0 && debt == 0 && owed == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("after 5s: %d bodies still pinned, %d retired bodies (%d bytes) still on disk",
-				pins, retired, owed)
+			t.Fatalf("after 5s: %d bodies still pinned, %d retired and %d kept as debt (%d bytes) still on disk",
+				pins, retired, debt, owed)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1174,4 +1184,56 @@ func TestAHeadIsAnsweredBeforeTheBodyItKeeps(t *testing.T) {
 	if stored.ETag != `"v2"` {
 		t.Fatalf("the kept tarball is %s, want the one the HEAD fetched", stored.ETag)
 	}
+}
+
+// A DOCUMENT ANSWERED FROM THE STORE THAT ITS OWN COMMIT EVICTED is pinned and
+// charged for as long as its client takes to read it: the store's bound is
+// smaller than the document, and the client stops after the headers, so the
+// answer is still being written while the store is looked at.
+func TestADocumentItsCommitEvictedStaysChargedWhileItIsAnswered(t *testing.T) {
+	t.Parallel()
+
+	document := `{"padding":"` + strings.Repeat("d", 16<<20) + `"}`
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, document)
+	})
+	service, credentials := npmService(t, registry)
+	npm := service.npmCache()
+	npm.store.mu.Lock()
+	npm.store.limit = 1024
+	npm.store.mu.Unlock()
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set a deadline: %v", err)
+	}
+	if _, err := conn.Write([]byte(npmRequestLine("/huge"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read the headers: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		npm.store.mu.Lock()
+		pins, owed, held := len(npm.store.pins), npm.store.retiredBytes, len(npm.store.entries)
+		npm.store.mu.Unlock()
+		if pins == 1 && owed == int64(len(document)) && held == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("while answering a document its commit evicted: %d pinned, %d bytes owed, %d entries; "+
+				"want 1, %d, 0", pins, owed, held, len(document))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || len(body) != len(document) {
+		t.Fatalf("the document read %d of %d bytes: %v", len(body), len(document), err)
+	}
+	assertNpmQuiet(t, npm)
 }

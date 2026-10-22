@@ -155,11 +155,13 @@ func npmSeconds(value string) time.Duration {
 }
 
 // npmShareable reports whether an answer's headers let the store keep it for
-// every job: no cookie, and nothing in Cache-Control that confines it.
+// every job: nothing in Cache-Control that confines it.
+//
+// A COOKIE DOES NOT CONFINE IT. The registry's CDN sets a bot-management cookie
+// on every answer, documents and tarballs alike, while serving them from its
+// own shared cache (measured 2026-10-22); the cookie answers the node's own
+// anonymous request, and the node never stores, relays or sends it back.
 func npmShareable(header http.Header) bool {
-	if len(header.Values("Set-Cookie")) > 0 {
-		return false
-	}
 	cc := parseNpmCacheControl(header.Values("Cache-Control"))
 
 	return !cc.private && !cc.noStore && !cc.noCache
@@ -216,9 +218,13 @@ type npmStore struct {
 	filling int64
 	// pins counts the open readers of each body. A body removed while pinned is
 	// retired rather than deleted: its bytes stay on disk until its last reader
-	// closes, so they stay counted, in retired, against the fill budget.
+	// closes, which deletes it. A body a disk error kept is debt instead: it may
+	// still be named by metadata on disk, so nothing in this process deletes it,
+	// and the next open keeps the pair or removes what nothing names. Both are
+	// counted in retiredBytes, against the fill budget, until they are gone.
 	pins         map[string]int
 	retired      map[string]int64
+	debt         map[string]int64
 	retiredBytes int64
 }
 
@@ -257,10 +263,18 @@ func (s *npmStore) unpin(name string) {
 
 // retire deletes a body no index entry names any more, or, while a reader
 // still holds it, leaves it to that reader's close. Either way its bytes stay
-// counted until the file is gone.
+// counted until the file is gone. A body already kept as debt stays debt.
 func (s *npmStore) retire(name string, size int64) {
-	s.owe(name, size)
 	s.mu.Lock()
+	if _, owed := s.debt[name]; owed {
+		s.mu.Unlock()
+
+		return
+	}
+	if _, retired := s.retired[name]; !retired {
+		s.retired[name] = size
+		s.retiredBytes += size
+	}
 	pinned := s.pins[name] > 0
 	s.mu.Unlock()
 	if !pinned {
@@ -268,29 +282,42 @@ func (s *npmStore) retire(name string, size int64) {
 	}
 }
 
-// owe counts a body that is on disk and that no index entry accounts for: one a
-// reader holds, or one a disk error kept. Its bytes are charged to the fill
-// budget until the file is deleted, so a disk that keeps refusing stops the
-// store keeping rather than letting kept bodies grow without bound.
-func (s *npmStore) owe(name string, size int64) {
+// keepAsDebt counts a body a disk error left on disk, which metadata may still
+// name, so a disk that keeps refusing stops the store keeping rather than
+// letting such bodies grow without bound. Nothing in this process deletes it.
+func (s *npmStore) keepAsDebt(name string, size int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, owed := s.retired[name]; owed {
+	if _, owed := s.debt[name]; owed {
 		return
 	}
-	s.retired[name] = size
+	if retired, ok := s.retired[name]; ok {
+		delete(s.retired, name)
+		s.debt[name] = retired
+
+		return
+	}
+	s.debt[name] = size
 	s.retiredBytes += size
 }
 
-// deleteRetired deletes an owed body and stops counting it, only once it is
-// gone. One the disk will not delete stays owed.
+// deleteRetired deletes a retired body no reader holds and stops counting it,
+// only once it is gone. One the disk will not delete becomes debt.
 func (s *npmStore) deleteRetired(name string) {
-	err := os.Remove(filepath.Join(s.bodiesDir(), name))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	s.mu.Lock()
+	size, retired := s.retired[name]
+	pinned := s.pins[name] > 0
+	s.mu.Unlock()
+	if !retired || pinned {
+		return
+	}
+	if err := os.Remove(filepath.Join(s.bodiesDir(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.keepAsDebt(name, size)
+
 		return
 	}
 	s.mu.Lock()
-	if size, owed := s.retired[name]; owed && s.pins[name] == 0 {
+	if size, retired := s.retired[name]; retired && s.pins[name] == 0 {
 		delete(s.retired, name)
 		s.retiredBytes -= size
 	}
@@ -310,7 +337,7 @@ func (s *npmStore) tempDir() string    { return filepath.Join(s.root, "tmp") }
 // openNpmStore loads the store at root, removing what no entry names.
 func openNpmStore(root string, limit int64) (*npmStore, error) {
 	s := &npmStore{root: root, limit: limit, fillLimit: npmFillLimit, entries: make(map[string]*npmEntry),
-		pins: make(map[string]int), retired: make(map[string]int64)}
+		pins: make(map[string]int), retired: make(map[string]int64), debt: make(map[string]int64)}
 	for _, dir := range []string{s.entriesDir(), s.bodiesDir(), s.tempDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("node: create the npm store: %w", err)
@@ -497,7 +524,11 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string, pin bool) (npmEntry
 	// THE BODY IS WHOLE ON DISK, UNDER ITS NAME, BEFORE METADATA NAMES IT.
 	if err := s.installBody(temp, body); err != nil {
 		_ = os.Remove(temp)
-		_ = os.Remove(body)
+		// A RENAME THAT HAPPENED BEFORE A SYNC FAILED left the body under its name;
+		// one the disk then refuses to delete is debt, never silently dropped.
+		if removeErr := os.Remove(body); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			s.keepAsDebt(entry.Body, entry.Size)
+		}
 
 		return npmEntry{}, err
 	}
@@ -506,7 +537,7 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string, pin bool) (npmEntry
 		// have put the metadata in place, and that metadata names this body. The
 		// next open keeps the pair or deletes a body nothing names; until then the
 		// body is owed, charged to the fill budget.
-		s.owe(entry.Body, entry.Size)
+		s.keepAsDebt(entry.Body, entry.Size)
 
 		return npmEntry{}, err
 	}
@@ -615,12 +646,12 @@ func (s *npmStore) removeIf(key, body string) {
 	// nothing names.
 	if err := os.Remove(filepath.Join(s.entriesDir(), entryName(key)+".json")); err != nil &&
 		!errors.Is(err, os.ErrNotExist) {
-		s.owe(entry.Body, entry.Size)
+		s.keepAsDebt(entry.Body, entry.Size)
 
 		return
 	}
 	if err := s.disk.SyncDirectory(s.entriesDir()); err != nil {
-		s.owe(entry.Body, entry.Size)
+		s.keepAsDebt(entry.Body, entry.Size)
 
 		return
 	}

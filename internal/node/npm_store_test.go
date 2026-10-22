@@ -110,7 +110,9 @@ func TestOnlyAShareableAnswerIsKept(t *testing.T) {
 		{"private", http.Header{"Cache-Control": {"private, max-age=300"}}, false},
 		{"no-store", http.Header{"Cache-Control": {"no-store"}}, false},
 		{"no-cache", http.Header{"Cache-Control": {"public, no-cache"}}, false},
-		{"a cookie", http.Header{"Cache-Control": {"public"}, "Set-Cookie": {"a=b"}}, false},
+		// THE REGISTRY'S CDN SETS ONE ON EVERY ANSWER (measured 2026-10-22): it is
+		// the node's, and confines nothing.
+		{"a cookie", http.Header{"Cache-Control": {"public"}, "Set-Cookie": {"__cf_bm=x"}}, true},
 	} {
 		if got := npmShareable(tc.header); got != tc.want {
 			t.Errorf("%s: shareable = %v, want %v", tc.name, got, tc.want)
@@ -397,6 +399,42 @@ func TestARetiredBodyOutlivesEveryReaderButTheLast(t *testing.T) {
 	if len(store.pins) != 0 || len(store.retired) != 0 || store.retiredBytes != 0 {
 		t.Fatalf("after the last reader: pins %v, retired %v, %d bytes owed", store.pins, store.retired,
 			store.retiredBytes)
+	}
+}
+
+// A BODY KEPT BECAUSE ITS METADATA'S REMOVAL WAS NOT MADE DURABLE IS DEBT, not
+// a retirement: a reader that held it across the removal does not delete it on
+// its close, because metadata a crash brings back may still name it, and it
+// stays charged to the fill budget.
+func TestABodyKeptByAFailedRemovalOutlivesItsReader(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.fillLimit = 10
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	entry := npmEntry{Key: "full /stuck", Path: "/stuck", Object: npmPackageDocument, Variant: npmFull, Size: 8,
+		Received: now}
+	if err := store.commit(entry, writeNpmTemp(t, store, "8 bytes!")); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	_, body, ok := store.acquire(entry.Key, now)
+	if !ok {
+		t.Fatal("the entry is not held")
+	}
+	path := filepath.Join(store.bodiesDir(), body.name)
+	store.disk = durablefile.Installer{SyncDir: func(string) error { return errors.New("the disk refused a flush") }}
+	store.removeIf(entry.Key, body.name)
+	if err := body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a body a failed removal kept was deleted by its reader's close: %v", err)
+	}
+	if store.reserve(3) {
+		t.Fatal("a body kept as debt is not charged to the fill budget")
 	}
 }
 
