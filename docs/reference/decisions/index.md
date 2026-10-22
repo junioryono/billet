@@ -24,6 +24,7 @@ adr-016-prometheus-metrics
 adr-017-workspaces
 adr-018-git-proxy-answers-as-github
 adr-019-guest-image-corresponding-source
+adr-020-npm-registry-interception
 ```
 
 | Record | Decides |
@@ -47,3 +48,4 @@ adr-019-guest-image-corresponding-source
 | [ADR-017](adr-017-workspaces.md) | proposed: workspaces, long-lived environments forked from a warm Firecracker snapshot; why only an explicit request stops one, why nothing in a warmed stack runs until a fork is made unique, why a suspension is private and proved durable before its VM stops, why previews need no listener on a node and each workspace gets an origin of its own, and why repository access is a separate GitHub App that entitles no one by itself |
 | [ADR-018](adr-018-git-proxy-answers-as-github.md) | why the Git proxy serves a job GitHub authorised any object its repository's mirror holds, as GitHub does; why anything the mirror cannot do goes to GitHub, a refresh belongs to no request, and the proxy reaches GitHub over HTTP/1.1 with every request body whole |
 | [ADR-019](adr-019-guest-image-corresponding-source.md) | why every guest release carries the corresponding source of what it redistributes under a GNU license as its own assets, rather than a pointer to Launchpad or a written offer, where each source version is kept, and what that costs a release |
+| [ADR-020](adr-020-npm-registry-interception.md) | why the node may serve the public npm registry to its guests through the Actions cache's interception, a second intercepted host; why only an anonymous read is ever cached, why one store per node serves every trust class, how a stalled fetch is retried and a stale document served, and why it starts off by default |
