@@ -27,10 +27,11 @@ const (
 	// npmBodyIdle ends an attempt whose body stops moving for this long.
 	npmBodyIdle = 10 * time.Second
 	// npmDocumentLimit bounds a document the node reads whole before answering.
-	npmDocumentLimit = 512 << 20
-	// npmErrorBodyLimit bounds the body of an answer the node relays without
-	// storing it and without streaming it, such as an error.
-	npmErrorBodyLimit = 1 << 20
+	npmDocumentLimit = 256 << 20
+	// npmFills bounds the fills in flight at once, across every guest: with
+	// npmDocumentLimit it bounds the disk a burst of documents can take before
+	// the fill budget refuses to keep them.
+	npmFills = 32
 )
 
 // npmRelayedHeaders are the registry's headers a client is given. Everything
@@ -56,6 +57,7 @@ type npmCache struct {
 	now          func() time.Time
 	headerWait   time.Duration
 	bodyIdle     time.Duration
+	slots        chan struct{}
 
 	mu    sync.Mutex
 	fills map[string]chan struct{}
@@ -68,6 +70,7 @@ func newNpmCache(service *CacheService, leaf tls.Certificate, store *npmStore) *
 		pooled: newNpmClient(false), fresh: newNpmClient(true),
 		dialUpstream: dialNpmUpstream, now: time.Now,
 		headerWait: npmHeaderWait, bodyIdle: npmBodyIdle,
+		slots: make(chan struct{}, npmFills),
 		fills: make(map[string]chan struct{}),
 	}
 }
@@ -210,16 +213,29 @@ func (n *npmCache) note(session *cacheSession, outcome alloc.BuildCache) {
 	session.mu.Unlock()
 }
 
+// npmExchange is one request being answered: who asked, for what, and when.
+type npmExchange struct {
+	conn    net.Conn
+	req     *http.Request
+	request npmRequest
+	session *cacheSession
+	started time.Time
+}
+
 // serve answers one request the store may answer.
 func (n *npmCache) serve(ctx context.Context, conn net.Conn, req *http.Request, request npmRequest,
 	session *cacheSession,
 ) {
-	started := n.now()
+	x := npmExchange{conn: conn, req: req, request: request, session: session, started: n.now()}
 	key := request.key()
-	if entry, ok := n.store.lookup(key); ok && entry.fresh(n.now()) {
-		n.answerEntry(conn, req, request, entry, "warm", started, session)
+	if entry, body, ok := n.store.acquire(key, n.now()); ok {
+		if entry.fresh(n.now()) {
+			defer body.Close()
+			n.answerEntry(x, entry, body, "warm")
 
-		return
+			return
+		}
+		_ = body.Close()
 	}
 	// ONE FILL PER ENTRY AT A TIME: a second job asking for what is being filled
 	// waits for it, and is then answered from the store.
@@ -228,36 +244,64 @@ func (n *npmCache) serve(ctx context.Context, conn net.Conn, req *http.Request, 
 		return
 	}
 	defer release()
-	entry, held := n.store.lookup(key)
-	if held && entry.fresh(n.now()) {
-		n.answerEntry(conn, req, request, entry, "warm", started, session)
-
+	select {
+	case n.slots <- struct{}{}:
+		defer func() { <-n.slots }()
+	case <-ctx.Done():
 		return
+	}
+	// THE ENTRY AND ITS BODY ARE HELD TOGETHER FROM HERE, so the answer a stale
+	// fallback or a revalidation gives is the generation that was judged.
+	entry, body, held := n.store.acquire(key, n.now())
+	if held {
+		defer body.Close()
+		if entry.fresh(n.now()) {
+			n.answerEntry(x, entry, body, "warm")
+
+			return
+		}
 	}
 	validator := ""
 	if held {
 		validator = entry.ETag
 	}
 	fetch, answered := n.fetch(ctx, request, validator)
+	defer fetch.close()
 	if !answered {
-		n.answerNoAnswer(conn, req, request, entry, held, fetch, started, session)
+		if held && entry.staleUsable(n.now()) {
+			n.service.log.Warn("the npm registry gave no answer; serving a stale entry", "path", request.path,
+				"instance", session.instance, "expired", entry.expiry())
+			n.answerEntry(x, entry, body, "stale")
+
+			return
+		}
+		n.note(session, alloc.BuildCacheUnavailable)
+		if fetch.resp != nil {
+			n.relay(x, fetch, "failed")
+
+			return
+		}
+		n.answerStatus(x, http.StatusGatewayTimeout)
 
 		return
 	}
-	defer fetch.close()
+	previous := ""
+	if held {
+		previous = entry.Body
+	}
 	status := fetch.resp.StatusCode
 	switch {
-	case status == http.StatusNotModified && held && validator != "":
-		n.answerRevalidated(ctx, conn, req, request, entry, fetch, started, session)
+	case status == http.StatusNotModified && held:
+		n.answerRevalidated(ctx, x, entry, body, fetch)
 	case status == http.StatusOK && request.object != npmTarball:
-		n.answerDocument(conn, req, request, fetch, started, session)
+		n.answerDocument(x, fetch, previous)
 	case status == http.StatusOK:
-		n.answerTarball(conn, req, request, fetch, started, session)
+		n.answerTarball(x, fetch, previous, true)
 	default:
-		if npmDefinitive(status) {
-			n.store.remove(key)
+		if npmDefinitive(status) && held {
+			n.store.removeIf(key, previous)
 		}
-		n.relay(conn, req, request, fetch, started, session)
+		n.relay(x, fetch, "relayed")
 	}
 }
 
@@ -270,6 +314,11 @@ func npmDefinitive(status int) bool {
 	}
 
 	return false
+}
+
+func npmRetryable(status int) bool {
+	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
 }
 
 func (n *npmCache) lockFill(ctx context.Context, key string) (func(), bool) {
@@ -308,9 +357,12 @@ type npmFetch struct {
 	attempts  int
 	document  string
 	size      int64
+	// keep says a document's 200 was read within the fill budget, so it may be
+	// stored.
+	keep bool
 }
 
-func (f npmFetch) close() {
+func (f *npmFetch) close() {
 	if f.resp != nil {
 		_ = f.resp.Body.Close()
 	}
@@ -325,8 +377,8 @@ func (f npmFetch) close() {
 // fetch asks the registry, in the order ADR-020 gives: an attempt, one retry on
 // a new connection while nothing has reached the client, and otherwise no
 // answer. answered is false when neither attempt answered; fetch.resp is then
-// the second attempt's 5xx, if it gave one, for the caller to relay when no
-// stale entry may answer instead.
+// the last 5xx the registry gave, if it gave one, for the caller to relay when
+// no stale entry may answer instead.
 func (n *npmCache) fetch(ctx context.Context, request npmRequest, validator string) (npmFetch, bool) {
 	var last npmFetch
 	for attempt := 1; attempt <= 2; attempt++ {
@@ -344,18 +396,16 @@ func (n *npmCache) fetch(ctx context.Context, request npmRequest, validator stri
 		}
 		f := npmFetch{resp: resp, cancel: cancel, requested: requested, received: n.now(), attempts: attempt}
 		switch {
-		case resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable ||
-			resp.StatusCode == http.StatusGatewayTimeout:
+		case npmRetryable(resp.StatusCode):
+			// HELD, NOT RELAYED: the retry or a stale entry may still answer
+			// instead, and the last one the registry gave is relayed if neither
+			// does.
 			n.service.log.Info("the npm registry answered with a retryable status", "path", request.path,
 				"attempt", attempt, "status", resp.StatusCode)
-			if attempt == 1 {
-				f.close()
-
-				continue
-			}
+			last.close()
 			last = f
 		case resp.StatusCode == http.StatusOK && request.object != npmTarball:
-			document, size, err := n.readDocument(f)
+			document, size, keep, err := n.readDocument(f)
 			cancel()
 			if err != nil {
 				_ = resp.Body.Close()
@@ -364,10 +414,13 @@ func (n *npmCache) fetch(ctx context.Context, request npmRequest, validator stri
 
 				continue
 			}
-			f.document, f.size = document, size
+			f.document, f.size, f.keep = document, size, keep
+			last.close()
 
 			return f, true
 		default:
+			last.close()
+
 			return f, true
 		}
 	}
@@ -443,42 +496,80 @@ func (b *npmIdleBody) Close() error {
 }
 
 // readDocument reads a document's 200 whole into a temporary file, decoded.
-func (n *npmCache) readDocument(f npmFetch) (string, int64, error) {
+// keep is false when the read went past the fill budget: the document still
+// answers its client, and is not stored.
+func (n *npmCache) readDocument(f npmFetch) (string, int64, bool, error) {
 	body := io.Reader(f.resp.Body)
 	switch strings.ToLower(strings.TrimSpace(f.resp.Header.Get("Content-Encoding"))) {
 	case "", "identity":
 	case "gzip":
 		decoded, err := gzip.NewReader(f.resp.Body)
 		if err != nil {
-			return "", 0, err
+			return "", 0, false, err
 		}
 		defer decoded.Close()
 		body = decoded
 	default:
-		return "", 0, fmt.Errorf("an encoding the node did not ask for: %q", f.resp.Header.Get("Content-Encoding"))
+		return "", 0, false, fmt.Errorf("an encoding the node did not ask for: %q",
+			f.resp.Header.Get("Content-Encoding"))
 	}
 	temp, err := n.store.temp()
 	if err != nil {
-		return "", 0, err
+		return "", 0, false, err
 	}
-	size, err := io.Copy(temp, io.LimitReader(body, npmDocumentLimit+1))
+	budget := &npmBudget{store: n.store, keep: true}
+	defer budget.done()
+	size, err := io.Copy(io.MultiWriter(temp, budget), io.LimitReader(body, npmDocumentLimit+1))
 	if closeErr := temp.Close(); err == nil {
 		err = closeErr
 	}
 	if err == nil && size > npmDocumentLimit {
 		err = errors.New("the document is larger than the node reads whole")
 	}
-	if err == nil && f.resp.Header.Get("Content-Encoding") == "" && f.resp.ContentLength >= 0 &&
+	encoding := strings.TrimSpace(f.resp.Header.Get("Content-Encoding"))
+	if err == nil && (encoding == "" || strings.EqualFold(encoding, "identity")) && f.resp.ContentLength >= 0 &&
 		size != f.resp.ContentLength {
 		err = io.ErrUnexpectedEOF
 	}
 	if err != nil {
 		_ = os.Remove(temp.Name())
 
-		return "", 0, err
+		return "", 0, false, err
 	}
 
-	return temp.Name(), size, nil
+	return temp.Name(), size, budget.keep, nil
+}
+
+// npmBudget charges what a fill writes to the store's fill budget, and stops
+// keeping it, never stops the fill, once the budget refuses.
+type npmBudget struct {
+	store    *npmStore
+	reserved int64
+	keep     bool
+}
+
+func (b *npmBudget) Write(p []byte) (int, error) {
+	b.charge(len(p))
+
+	return len(p), nil
+}
+
+// charge claims n more bytes, reporting whether the fill may still be kept.
+func (b *npmBudget) charge(n int) bool {
+	if b.keep {
+		if b.store.reserve(int64(n)) {
+			b.reserved += int64(n)
+		} else {
+			b.keep = false
+		}
+	}
+
+	return b.keep
+}
+
+func (b *npmBudget) done() {
+	b.store.release(b.reserved)
+	b.reserved = 0
 }
 
 // entryFor is the store entry a 200 becomes.
@@ -493,97 +584,164 @@ func entryFor(request npmRequest, f npmFetch, size int64) npmEntry {
 	return entry
 }
 
-func (n *npmCache) answerDocument(conn net.Conn, req *http.Request, request npmRequest, f npmFetch,
-	started time.Time, session *cacheSession,
-) {
-	if !npmShareable(f.resp.Header) {
-		n.relayBody(conn, req, f, nil, started, request, "unshareable", session)
-
-		return
-	}
+// answerDocument answers a document's 200 and keeps it if it may be shared.
+// previous is the body of the generation it replaces, which an answer that may
+// not be shared removes: the registry no longer shares what it held.
+func (n *npmCache) answerDocument(x npmExchange, f npmFetch, previous string) {
 	// OPENED BEFORE THE COMMIT, which consumes the file whether or not it
 	// succeeds: a store that refuses the document still answers the client.
 	document, err := os.Open(f.document)
 	if err != nil {
-		n.answerStatus(conn, req, http.StatusBadGateway)
-		n.note(session, alloc.BuildCacheUnavailable)
+		n.answerStatus(x, http.StatusBadGateway)
+		n.note(x.session, alloc.BuildCacheUnavailable)
 
 		return
 	}
 	defer document.Close()
-	entry := entryFor(request, f, f.size)
-	if err := n.store.commit(entry, f.document); err == nil {
-		if stored, ok := n.store.lookup(entry.Key); ok && stored.Body != "" {
-			n.answerEntry(conn, req, request, stored, "filled", started, session)
-
-			return
-		}
-	} else {
-		n.service.log.Warn("the npm store could not keep a document", "path", request.path, "error", err)
+	shareable := npmShareable(f.resp.Header)
+	if !shareable && previous != "" {
+		n.store.removeIf(x.request.key(), previous)
 	}
-	n.relayBody(conn, req, f, document, started, request, "filled-unstored", session)
-}
-
-// answerTarball streams a tarball's 200 to the client as it arrives and keeps
-// it when it arrives whole and may be shared.
-func (n *npmCache) answerTarball(conn net.Conn, req *http.Request, request npmRequest, f npmFetch,
-	started time.Time, session *cacheSession,
-) {
-	keep := npmShareable(f.resp.Header) && f.resp.Header.Get("Content-Encoding") == ""
-	var temp *os.File
-	if keep {
-		var err error
-		if temp, err = n.store.temp(); err != nil {
-			keep = false
-		}
-	}
-	counted := &npmCountingReader{reader: f.resp.Body}
-	var body io.Reader = counted
-	if keep {
-		body = io.TeeReader(counted, temp)
-	}
-	if req.Method == http.MethodHead {
-		// A HEAD IS ANSWERED FROM A COMPLETE BODY: read it whole, keep it, and
-		// answer from the store.
-		_, err := io.Copy(io.Discard, body)
-		if keep {
-			n.keepTarball(request, f, temp, counted, err)
-		}
-		if stored, ok := n.store.lookup(request.key()); ok && err == nil {
-			n.answerEntry(conn, req, request, stored, "filled", started, session)
-
-			return
-		}
-		n.answerStatus(conn, req, http.StatusBadGateway)
+	if !shareable || !f.keep {
+		n.relayDocument(x, f, document)
 
 		return
 	}
+	entry := entryFor(x.request, f, f.size)
+	if err := n.store.commit(entry, f.document); err != nil {
+		n.service.log.Warn("the npm store could not keep a document", "path", x.request.path, "error", err)
+		n.relayDocument(x, f, document)
+
+		return
+	}
+	stored, body, ok := n.store.acquire(entry.Key, n.now())
+	if !ok {
+		n.relayDocument(x, f, document)
+
+		return
+	}
+	defer body.Close()
+	n.answerEntry(x, stored, body, "filled")
+}
+
+// answerTarball streams a tarball's 200 to the client as it arrives and keeps
+// it when it arrives whole, may be shared, is not encoded and fits the fill
+// budget. mayKeep false streams it and keeps nothing.
+func (n *npmCache) answerTarball(x npmExchange, f npmFetch, previous string, mayKeep bool) {
+	shareable := npmShareable(f.resp.Header)
+	if !shareable && previous != "" {
+		n.store.removeIf(x.request.key(), previous)
+	}
+	encoding := strings.ToLower(strings.TrimSpace(f.resp.Header.Get("Content-Encoding")))
 	header := relayedHeader(f.resp.Header)
-	err := n.writeAnswer(conn, req, http.StatusOK, header, body, f.resp.ContentLength)
+	length := f.resp.ContentLength
+	var source io.Reader = f.resp.Body
+	switch encoding {
+	case "", "identity":
+	case "gzip":
+		// AN HTTP CODING THE NODE DID NOT ASK FOR IS TAKEN OFF, so the client
+		// receives the tarball's own bytes, which its integrity covers.
+		decoded, err := gzip.NewReader(f.resp.Body)
+		if err != nil {
+			n.answerStatus(x, http.StatusBadGateway)
+			n.note(x.session, alloc.BuildCacheUnavailable)
+
+			return
+		}
+		defer decoded.Close()
+		source, length = decoded, -1
+	default:
+		header.Set("Content-Encoding", f.resp.Header.Get("Content-Encoding"))
+	}
+	keep := mayKeep && shareable && (encoding == "" || encoding == "identity")
+	counted := &npmCountingReader{reader: source}
+	var fill *npmKeeper
 	if keep {
-		n.keepTarball(request, f, temp, counted, err)
+		if temp, err := n.store.temp(); err == nil {
+			fill = &npmKeeper{file: temp, budget: &npmBudget{store: n.store, keep: true}}
+			defer fill.discard()
+		}
+	}
+	var body io.Reader = counted
+	if fill != nil {
+		body = io.TeeReader(counted, fill)
+	}
+	var err error
+	if x.req.Method == http.MethodHead {
+		// A HEAD IS ANSWERED FROM THIS ANSWER, read whole so it can be kept,
+		// never from an older generation the store may still hold.
+		if _, err = io.Copy(io.Discard, body); err == nil {
+			err = n.writeAnswer(x, http.StatusOK, header, nil, counted.count)
+		}
+	} else {
+		err = n.writeAnswer(x, http.StatusOK, header, body, length)
+	}
+	complete := err == nil && counted.eof && (f.resp.ContentLength < 0 || encoding != "" && encoding != "identity" ||
+		counted.count == f.resp.ContentLength)
+	if fill != nil && complete {
+		if path, ok := fill.finish(); ok {
+			if err := n.store.commit(entryFor(x.request, f, counted.count), path); err != nil {
+				n.service.log.Warn("the npm store could not keep a tarball", "path", x.request.path, "error", err)
+			}
+		}
 	}
 	outcome := alloc.BuildCacheCold
 	if err != nil {
 		outcome = alloc.BuildCacheUnavailable
 	}
-	n.note(session, outcome)
-	n.logAnswer(request, "filled", http.StatusOK, counted.count, started, f.attempts)
+	n.note(x.session, outcome)
+	n.logAnswer(x, "filled", http.StatusOK, counted.count, f.attempts)
 }
 
-func (n *npmCache) keepTarball(request npmRequest, f npmFetch, temp *os.File, counted *npmCountingReader,
-	readErr error,
-) {
-	closeErr := temp.Close()
-	complete := readErr == nil && closeErr == nil && counted.eof &&
-		(f.resp.ContentLength < 0 || counted.count == f.resp.ContentLength)
-	if !complete {
-		_ = os.Remove(temp.Name())
+// npmKeeper is a tarball's fill: its temporary file, charged to the budget,
+// given up the moment the budget or the disk refuses.
+type npmKeeper struct {
+	file   *os.File
+	budget *npmBudget
+	failed bool
+}
 
-		return
+// Write never fails the client's copy: a fill the store cannot keep stops
+// keeping.
+func (k *npmKeeper) Write(p []byte) (int, error) {
+	if k.failed {
+		return len(p), nil
 	}
-	if err := n.store.commit(entryFor(request, f, counted.count), temp.Name()); err != nil {
-		n.service.log.Warn("the npm store could not keep a tarball", "path", request.path, "error", err)
+	if !k.budget.charge(len(p)) {
+		k.failed = true
+
+		return len(p), nil
+	}
+	if _, err := k.file.Write(p); err != nil {
+		k.failed = true
+	}
+
+	return len(p), nil
+}
+
+// finish closes the fill and names its file, when it was kept whole.
+func (k *npmKeeper) finish() (string, bool) {
+	if k.file == nil || k.failed {
+		return "", false
+	}
+	if err := k.file.Close(); err != nil {
+		k.failed = true
+
+		return "", false
+	}
+	path := k.file.Name()
+	k.file = nil
+
+	return path, true
+}
+
+// discard gives back the budget and removes a fill nothing committed.
+func (k *npmKeeper) discard() {
+	k.budget.done()
+	if k.file != nil {
+		_ = k.file.Close()
+		_ = os.Remove(k.file.Name())
+		k.file = nil
 	}
 }
 
@@ -605,33 +763,49 @@ func (r *npmCountingReader) Read(p []byte) (int, error) {
 }
 
 // answerRevalidated handles a 304 to the node's own validator.
-func (n *npmCache) answerRevalidated(ctx context.Context, conn net.Conn, req *http.Request,
-	request npmRequest, entry npmEntry, f npmFetch, started time.Time, session *cacheSession,
+func (n *npmCache) answerRevalidated(ctx context.Context, x npmExchange, entry npmEntry, body *os.File,
+	f npmFetch,
 ) {
 	merged := entry.headers()
-	for _, name := range []string{"Cache-Control", "ETag", "Last-Modified", "Date", "Age", "Expires"} {
+	// MERGED AS RFC 9111 4.3.4 MERGES, by canonical name, so a 304 that changes
+	// the validator changes it.
+	for _, name := range []string{"Cache-Control", "ETag", "Last-Modified", "Date", "Age", "Expires",
+		"Set-Cookie"} {
 		if values := f.resp.Header.Values(name); len(values) > 0 {
-			merged[name] = values
+			merged.Del(name)
+			for _, value := range values {
+				merged.Add(name, value)
+			}
 		}
-	}
-	if values := f.resp.Header.Values("Set-Cookie"); len(values) > 0 {
-		merged["Set-Cookie"] = values
 	}
 	if !npmShareable(merged) {
 		// THE VALIDATOR WAS THE NODE'S, so this 304 is never the client's answer:
-		// ask again without one and relay that, unstored.
-		n.store.remove(entry.Key)
+		// ask again without one and relay that, unkept.
+		n.store.removeIf(entry.Key, entry.Body)
 		f.close()
-		again, answered := n.fetch(ctx, request, "")
+		again, answered := n.fetch(ctx, x.request, "")
 		defer again.close()
-		if !answered && again.resp == nil {
-			n.answerStatus(conn, req, http.StatusGatewayTimeout)
-			n.note(session, alloc.BuildCacheUnavailable)
-			n.logAnswer(request, "failed", http.StatusGatewayTimeout, 0, started, again.attempts)
+		switch {
+		case !answered && again.resp == nil:
+			n.note(x.session, alloc.BuildCacheUnavailable)
+			n.answerStatus(x, http.StatusGatewayTimeout)
+		case !answered:
+			n.note(x.session, alloc.BuildCacheUnavailable)
+			n.relay(x, again, "failed")
+		case again.resp.StatusCode == http.StatusOK && x.request.object == npmTarball:
+			n.answerTarball(x, again, "", false)
+		case again.resp.StatusCode == http.StatusOK && again.document != "":
+			document, err := os.Open(again.document)
+			if err != nil {
+				n.answerStatus(x, http.StatusBadGateway)
 
-			return
+				return
+			}
+			defer document.Close()
+			n.relayDocument(x, again, document)
+		default:
+			n.relay(x, again, "relayed")
 		}
-		n.relayBody(conn, req, again, nil, started, request, "unshareable", session)
 
 		return
 	}
@@ -640,31 +814,9 @@ func (n *npmCache) answerRevalidated(ctx context.Context, conn net.Conn, req *ht
 	refreshed.LastModified = merged.Get("Last-Modified")
 	npmFreshness(&refreshed, merged, f.requested, f.received)
 	if err := n.store.refresh(refreshed); err != nil {
-		n.service.log.Warn("the npm store could not keep a revalidation", "path", request.path, "error", err)
+		n.service.log.Warn("the npm store could not keep a revalidation", "path", x.request.path, "error", err)
 	}
-	n.answerEntry(conn, req, request, refreshed, "revalidated", started, session)
-}
-
-// answerNoAnswer is the end of a fetch neither attempt answered.
-func (n *npmCache) answerNoAnswer(conn net.Conn, req *http.Request, request npmRequest, entry npmEntry,
-	held bool, f npmFetch, started time.Time, session *cacheSession,
-) {
-	defer f.close()
-	if held && entry.staleUsable(n.now()) {
-		n.service.log.Warn("the npm registry gave no answer; serving a stale entry", "path", request.path,
-			"instance", session.instance, "expired", entry.expiry())
-		n.answerEntry(conn, req, request, entry, "stale", started, session)
-
-		return
-	}
-	n.note(session, alloc.BuildCacheUnavailable)
-	if f.resp != nil {
-		n.relayBody(conn, req, f, nil, started, request, "failed", session)
-
-		return
-	}
-	n.answerStatus(conn, req, http.StatusGatewayTimeout)
-	n.logAnswer(request, "failed", http.StatusGatewayTimeout, 0, started, 2)
+	n.answerEntry(x, refreshed, body, "revalidated")
 }
 
 // headers is what a stored entry tells a client of itself.
@@ -682,11 +834,9 @@ func (e npmEntry) headers() http.Header {
 	return header
 }
 
-// answerEntry answers from a stored entry, with a 304 when the client's own
-// validator names it.
-func (n *npmCache) answerEntry(conn net.Conn, req *http.Request, request npmRequest, entry npmEntry,
-	how string, started time.Time, session *cacheSession,
-) {
+// answerEntry answers from a stored entry and the body acquired with it, with
+// a 304 when the client's own validator names it.
+func (n *npmCache) answerEntry(x npmExchange, entry npmEntry, body *os.File, how string) {
 	now := n.now()
 	header := entry.headers()
 	header.Set("Age", strconv.FormatInt(int64(entry.age(now)/time.Second), 10))
@@ -695,100 +845,64 @@ func (n *npmCache) answerEntry(conn net.Conn, req *http.Request, request npmRequ
 	if how == "filled" {
 		outcome = alloc.BuildCacheCold
 	}
-	if request.ifNoneMatch != "" && npmETagMatches(request.ifNoneMatch, entry.ETag) {
-		err := n.writeAnswer(conn, req, http.StatusNotModified, header, nil, -1)
-		n.finishAnswer(session, outcome, err)
-		n.logAnswer(request, how, http.StatusNotModified, 0, started, 0)
-
-		return
+	var err error
+	status := http.StatusOK
+	if x.request.ifNoneMatch != "" && npmETagMatches(x.request.ifNoneMatch, entry.ETag) {
+		status = http.StatusNotModified
+		err = n.writeAnswer(x, status, header, nil, -1)
+	} else {
+		err = n.writeAnswer(x, status, header, body, entry.Size)
 	}
-	body, err := n.store.open(entry, now)
-	if err != nil {
-		n.service.log.Warn("an npm store entry could not be read", "path", request.path, "error", err)
-		n.store.remove(entry.Key)
-		n.answerStatus(conn, req, http.StatusBadGateway)
-		n.note(session, alloc.BuildCacheUnavailable)
-
-		return
-	}
-	defer body.Close()
-	err = n.writeAnswer(conn, req, http.StatusOK, header, body, entry.Size)
-	n.finishAnswer(session, outcome, err)
-	n.logAnswer(request, how, http.StatusOK, entry.Size, started, 0)
-}
-
-func (n *npmCache) finishAnswer(session *cacheSession, outcome alloc.BuildCache, err error) {
 	if err != nil {
 		outcome = alloc.BuildCacheUnavailable
 	}
-	n.note(session, outcome)
+	n.note(x.session, outcome)
+	n.logAnswer(x, how, status, entry.Size, 0)
 }
 
-// relay answers with the registry's own status and headers, its body decoded
-// if it was a document, and keeps nothing.
-//
-// document, when not nil, is a document's 200 already opened for reading.
-func (n *npmCache) relayBody(conn net.Conn, req *http.Request, f npmFetch, document *os.File,
-	started time.Time, request npmRequest, how string, session *cacheSession,
-) {
-	header := relayedHeader(f.resp.Header)
-	var (
-		body   io.Reader
-		length int64
-	)
-	switch {
-	case document != nil:
-		body, length = document, f.size
-	case f.document != "":
-		file, err := os.Open(f.document)
-		if err != nil {
-			n.answerStatus(conn, req, http.StatusBadGateway)
-			n.note(session, alloc.BuildCacheUnavailable)
-
-			return
-		}
-		defer file.Close()
-		body, length = file, f.size
-	default:
-		raw, err := io.ReadAll(io.LimitReader(decodedBody(f.resp), npmErrorBodyLimit))
-		if err != nil {
-			raw = nil
-		}
-		body, length = strings.NewReader(string(raw)), int64(len(raw))
-	}
-	err := n.writeAnswer(conn, req, f.resp.StatusCode, header, body, length)
+// relayDocument answers with a document's 200 read whole, without storing it.
+func (n *npmCache) relayDocument(x npmExchange, f npmFetch, document *os.File) {
+	err := n.writeAnswer(x, http.StatusOK, relayedHeader(f.resp.Header), document, f.size)
 	outcome := alloc.BuildCacheCold
-	if f.resp.StatusCode >= 500 {
+	if err != nil {
 		outcome = alloc.BuildCacheUnavailable
 	}
-	n.finishAnswer(session, outcome, err)
-	n.logAnswer(request, how, f.resp.StatusCode, length, started, f.attempts)
+	n.note(x.session, outcome)
+	n.logAnswer(x, "unkept", http.StatusOK, f.size, f.attempts)
 }
 
-// relay answers with an answer the store does not keep.
-func (n *npmCache) relay(conn net.Conn, req *http.Request, request npmRequest, f npmFetch,
-	started time.Time, session *cacheSession,
-) {
-	n.relayBody(conn, req, f, nil, started, request, "relayed", session)
-}
-
-// decodedBody is an answer's body without the gzip the node asked a document
-// for. Any other coding is passed on as it came; the node never asks for one.
-func decodedBody(resp *http.Response) io.Reader {
-	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip") {
-		if decoded, err := gzip.NewReader(resp.Body); err == nil {
-			return decoded
+// relay answers with the registry's own status, headers and body, streamed and
+// never cut short, a document's gzip taken off, and keeps nothing.
+func (n *npmCache) relay(x npmExchange, f npmFetch, how string) {
+	header := relayedHeader(f.resp.Header)
+	var body io.Reader = f.resp.Body
+	length := f.resp.ContentLength
+	switch encoding := strings.ToLower(strings.TrimSpace(f.resp.Header.Get("Content-Encoding"))); encoding {
+	case "", "identity":
+	case "gzip":
+		if decoded, err := gzip.NewReader(f.resp.Body); err == nil {
+			defer decoded.Close()
+			body, length = decoded, -1
+		} else {
+			header.Set("Content-Encoding", f.resp.Header.Get("Content-Encoding"))
 		}
+	default:
+		header.Set("Content-Encoding", f.resp.Header.Get("Content-Encoding"))
 	}
-
-	return resp.Body
+	err := n.writeAnswer(x, f.resp.StatusCode, header, body, length)
+	outcome := alloc.BuildCacheCold
+	if err != nil || f.resp.StatusCode >= 500 {
+		outcome = alloc.BuildCacheUnavailable
+	}
+	n.note(x.session, outcome)
+	n.logAnswer(x, how, f.resp.StatusCode, length, f.attempts)
 }
 
 func relayedHeader(upstream http.Header) http.Header {
 	header := http.Header{}
 	for _, name := range npmRelayedHeaders {
-		if values := upstream.Values(name); len(values) > 0 {
-			header[http.CanonicalHeaderKey(name)] = values
+		for _, value := range upstream.Values(name) {
+			header.Add(name, value)
 		}
 	}
 
@@ -801,22 +915,22 @@ func relayedHeader(upstream http.Header) http.Header {
 // WRITTEN BY HAND, so what a HEAD and a 304 carry is this function's to say: a
 // HEAD gets the length a GET would and no body, a 304 neither. A body of
 // unknown length (a negative length) is delimited by the connection's close.
-// A body shorter than its declared length is an error, and the caller's close
-// of the connection is what tells the client its answer was cut.
-func (n *npmCache) writeAnswer(conn net.Conn, req *http.Request, status int, header http.Header,
-	body io.Reader, length int64,
-) error {
+// THE HEADERS ARE SENT BEFORE THE BODY IS READ, so a client whose body then
+// stalls has its answer begun. A body shorter than its declared length is an
+// error, and the caller's close of the connection tells the client it was cut.
+func (n *npmCache) writeAnswer(x npmExchange, status int, header http.Header, body io.Reader, length int64) error {
 	header = header.Clone()
 	header.Set("Connection", "close")
 	header.Del("Content-Length")
 	header.Del("Transfer-Encoding")
-	if body == nil && status != http.StatusNotModified && req.Method != http.MethodHead {
+	head := x.req.Method == http.MethodHead
+	if body == nil && status != http.StatusNotModified && !head {
 		length = 0
 	}
 	if status != http.StatusNotModified && length >= 0 {
 		header.Set("Content-Length", strconv.FormatInt(length, 10))
 	}
-	buffered := bufio.NewWriter(conn)
+	buffered := bufio.NewWriter(x.conn)
 	if _, err := fmt.Fprintf(buffered, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status)); err != nil {
 		return err
 	}
@@ -826,14 +940,18 @@ func (n *npmCache) writeAnswer(conn net.Conn, req *http.Request, status int, hea
 	if _, err := buffered.WriteString("\r\n"); err != nil {
 		return err
 	}
-	if body != nil && status != http.StatusNotModified && req.Method != http.MethodHead {
-		written, err := io.Copy(buffered, body)
-		if err != nil {
-			return err
-		}
-		if length >= 0 && written != length {
-			return io.ErrUnexpectedEOF
-		}
+	if err := buffered.Flush(); err != nil {
+		return err
+	}
+	if body == nil || status == http.StatusNotModified || head {
+		return nil
+	}
+	written, err := io.Copy(buffered, body)
+	if err != nil {
+		return err
+	}
+	if length >= 0 && written != length {
+		return io.ErrUnexpectedEOF
 	}
 
 	return buffered.Flush()
@@ -841,10 +959,11 @@ func (n *npmCache) writeAnswer(conn net.Conn, req *http.Request, status int, hea
 
 // answerStatus answers with a bare status the node chose itself. Best effort:
 // the connection is closed after it either way.
-func (n *npmCache) answerStatus(conn net.Conn, req *http.Request, status int) {
-	if err := n.writeAnswer(conn, req, status, http.Header{}, nil, 0); err != nil {
+func (n *npmCache) answerStatus(x npmExchange, status int) {
+	if err := n.writeAnswer(x, status, http.Header{}, nil, 0); err != nil {
 		n.service.log.Debug("an npm answer could not be written", "status", status, "error", err)
 	}
+	n.logAnswer(x, "failed", status, 0, 0)
 }
 
 // npmETagMatches is If-None-Match's weak comparison against one stored tag.
@@ -863,10 +982,8 @@ func npmETagMatches(list, etag string) bool {
 	return false
 }
 
-func (n *npmCache) logAnswer(request npmRequest, how string, status int, bytes int64, started time.Time,
-	attempts int,
-) {
-	n.service.log.Debug("an npm request was answered", "path", request.path, "object", request.object,
+func (n *npmCache) logAnswer(x npmExchange, how string, status int, bytes int64, attempts int) {
+	n.service.log.Debug("an npm request was answered", "path", x.request.path, "object", x.request.object,
 		"how", how, "status", status, "bytes", bytes, "attempts", attempts,
-		"duration", n.now().Sub(started).Round(time.Millisecond))
+		"duration", n.now().Sub(x.started).Round(time.Millisecond))
 }

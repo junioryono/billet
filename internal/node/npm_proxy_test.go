@@ -108,8 +108,10 @@ func npmService(t *testing.T, registry *fakeRegistry) (*CacheService, CacheCrede
 
 		return dialer.DialContext(ctx, "tcp", strings.TrimPrefix(registry.server.URL, "https://"))
 	}
-	npm.headerWait = 300 * time.Millisecond
-	npm.bodyIdle = 300 * time.Millisecond
+	// GENEROUS BY DEFAULT, so an ordinary request under load is never an unintended
+	// retry; a test about a timeout shortens the one it is about.
+	npm.headerWait = 5 * time.Second
+	npm.bodyIdle = 5 * time.Second
 
 	return service, credentials
 }
@@ -334,6 +336,7 @@ func TestAnAttemptWithNoHeadersIsRetriedOnANewConnection(t *testing.T) {
 		serveText(t, w, `{"name":"left-pad"}`)
 	})
 	service, credentials := npmService(t, registry)
+	service.npmCache().headerWait = 300 * time.Millisecond
 
 	resp, body := npmGet(t, service, credentials, npmRequestLine("/left-pad"))
 	if resp.StatusCode != http.StatusOK || body != `{"name":"left-pad"}` || registry.count() != 2 {
@@ -390,6 +393,7 @@ func TestARegistryThatNeverAnswersIsA504(t *testing.T) {
 		<-r.Context().Done()
 	})
 	service, credentials := npmService(t, registry)
+	service.npmCache().headerWait = 300 * time.Millisecond
 
 	resp, _ := npmGet(t, service, credentials, npmRequestLine("/left-pad"))
 	if resp.StatusCode != http.StatusGatewayTimeout || registry.count() != 2 {
@@ -439,11 +443,7 @@ func TestARevalidationThatWithdrawsSharingIsAskedAgainAndNotStored(t *testing.T)
 		t.Fatalf("the revalidation carried %q, want the stored ETag", registry.request(1).Header.Get("If-None-Match"))
 	}
 	store := service.npmCache().store
-	entry, _ := store.lookup("full /doc")
-	entry.Received = entry.Received.Add(-time.Hour)
-	if err := store.refresh(entry); err != nil {
-		t.Fatalf("age the entry: %v", err)
-	}
+	ageNpmEntry(t, store, "full /doc", time.Hour)
 
 	mu.Lock()
 	withdraw = true
@@ -540,13 +540,16 @@ func TestATarballIsKeptOnlyWhenItArrivesWhole(t *testing.T) {
 	if _, err := conn.Write([]byte(npmRequestLine("/cut/-/cut-1.0.0.tgz"))); err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	// THE ANSWER BEGAN AT THE REGISTRY'S HEADERS, so the client reads them, and
+	// then a body that ends short.
 	cut, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err == nil {
-		_, err = io.ReadAll(cut.Body)
-		_ = cut.Body.Close()
-		if err == nil {
-			t.Fatal("a cut tarball reached the client whole")
-		}
+	if err != nil {
+		t.Fatalf("a tarball whose body was cut sent no headers: %v", err)
+	}
+	_, err = io.ReadAll(cut.Body)
+	_ = cut.Body.Close()
+	if cut.StatusCode != http.StatusOK || err == nil {
+		t.Fatalf("a cut tarball = %d, read error %v, want a 200 whose body ends short", cut.StatusCode, err)
 	}
 	waitForNpmFills(t, service.npmCache())
 	if service.npmCache().store.held(" /cut/-/cut-1.0.0.tgz") {
@@ -689,5 +692,210 @@ func TestTheKillSwitchSplicesTheNpmCache(t *testing.T) {
 	}
 	if got := noted(service, credentials); got != alloc.BuildCacheDisabled {
 		t.Fatalf("the npm cache's outcome = %q, want disabled", got)
+	}
+}
+
+// ageNpmEntry moves an entry's clock back by, so it expires as if time passed.
+func ageNpmEntry(t *testing.T, store *npmStore, key string, by time.Duration) {
+	t.Helper()
+
+	entry, body, ok := store.acquire(key, time.Now())
+	if !ok {
+		t.Fatalf("%s is not stored", key)
+	}
+	_ = body.Close()
+	entry.Received = entry.Received.Add(-by)
+	if err := store.refresh(entry); err != nil {
+		t.Fatalf("age %s: %v", key, err)
+	}
+}
+
+// scriptedRegistry answers each request with the step of steps its number
+// names, the last step repeating.
+func scriptedRegistry(t *testing.T, steps ...func(w http.ResponseWriter, r *http.Request)) *fakeRegistry {
+	t.Helper()
+
+	return newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		steps[min(n, len(steps))-1](w, r)
+	})
+}
+
+func answerWith(status int, cacheControl, etag, body string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cacheControl != "" {
+			w.Header().Set("Cache-Control", cacheControl)
+		}
+		if etag != "" {
+			w.Header().Set("ETag", etag)
+		}
+		w.WriteHeader(status)
+		if _, err := io.WriteString(w, body); err != nil {
+			return
+		}
+	}
+}
+
+// AN ANSWER THAT MAY NOT BE SHARED TAKES THE OLD ONE WITH IT: once the registry
+// withdraws sharing, a later silent registry is not answered from what it
+// shared before.
+func TestAnUnshareableReplacementRemovesTheEntry(t *testing.T) {
+	t.Parallel()
+
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", `"v1"`, `{"v":1}`),
+		answerWith(http.StatusOK, "private", `"v2"`, `{"v":2}`),
+		answerWith(http.StatusServiceUnavailable, "", "", "down"))
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/withdrawn"))
+
+	if resp, body := npmGet(t, service, credentials, npmRequestLine("/withdrawn")); resp.StatusCode != http.StatusOK ||
+		body != `{"v":2}` {
+		t.Fatalf("an unshareable replacement = %d %q", resp.StatusCode, body)
+	}
+	if service.npmCache().store.held("full /withdrawn") {
+		t.Fatal("the entry the registry stopped sharing is still stored")
+	}
+	if resp, body := npmGet(t, service, credentials, npmRequestLine("/withdrawn")); resp.StatusCode !=
+		http.StatusServiceUnavailable || body != "down" {
+		t.Fatalf("a silent registry after a withdrawal = %d %q, want its 503, never the old entry",
+			resp.StatusCode, body)
+	}
+}
+
+// A TARBALL FETCHED AGAIN AFTER A WITHDRAWING 304 ARRIVES WHOLE, however large,
+// streamed and not kept.
+func TestATarballAfterAWithdrawingRevalidationArrivesWhole(t *testing.T) {
+	t.Parallel()
+
+	tarball := strings.Repeat("z", 2<<20)
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", `"v1"`, "small"),
+		answerWith(http.StatusNotModified, "private", "", ""),
+		answerWith(http.StatusOK, "private", `"v2"`, tarball))
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/big/-/big-1.0.0.tgz"))
+	waitForNpmFills(t, service.npmCache())
+	ageNpmEntry(t, service.npmCache().store, " /big/-/big-1.0.0.tgz", 25*time.Hour)
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/big/-/big-1.0.0.tgz"))
+	if resp.StatusCode != http.StatusOK || len(body) != len(tarball) || body != tarball {
+		t.Fatalf("a tarball after a withdrawing 304 = %d, %d of %d bytes", resp.StatusCode, len(body), len(tarball))
+	}
+	waitForNpmFills(t, service.npmCache())
+	if service.npmCache().store.held(" /big/-/big-1.0.0.tgz") {
+		t.Fatal("a tarball the registry stopped sharing is still stored")
+	}
+}
+
+// A HEAD THAT MADE THE NODE FETCH IS ANSWERED FROM WHAT IT FETCHED, never from
+// the older generation the store still held.
+func TestAHeadAfterANewTarballAnswersTheNewOne(t *testing.T) {
+	t.Parallel()
+
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", `"v1"`, "ten bytes!"),
+		answerWith(http.StatusOK, "private", `"v2"`, "twenty bytes, a new 1"))
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/pkg/-/pkg-1.0.0.tgz"))
+	waitForNpmFills(t, service.npmCache())
+	ageNpmEntry(t, service.npmCache().store, " /pkg/-/pkg-1.0.0.tgz", 25*time.Hour)
+
+	resp, body := npmGet(t, service, credentials,
+		"HEAD /pkg/-/pkg-1.0.0.tgz HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n")
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != `"v2"` ||
+		resp.ContentLength != int64(len("twenty bytes, a new 1")) || body != "" {
+		t.Fatalf("a HEAD that fetched = %d, ETag %q, length %d, body %q", resp.StatusCode,
+			resp.Header.Get("ETag"), resp.ContentLength, body)
+	}
+}
+
+// THE REGISTRY'S LAST 5XX IS RELAYED when the retry gives no answer at all,
+// with its own body and Retry-After, not replaced by the node's 504.
+func TestARetryWithNoAnswerRelaysTheRegistrysLast503(t *testing.T) {
+	t.Parallel()
+
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 1 {
+			w.Header().Set("Retry-After", "7")
+			answerWith(http.StatusServiceUnavailable, "", "", "busy")(w, r)
+
+			return
+		}
+		<-r.Context().Done()
+	})
+	service, credentials := npmService(t, registry)
+	service.npmCache().headerWait = 300 * time.Millisecond
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/busy"))
+	if resp.StatusCode != http.StatusServiceUnavailable || body != "busy" || resp.Header.Get("Retry-After") != "7" ||
+		registry.count() != 2 {
+		t.Fatalf("a 503 then silence = %d %q (Retry-After %q) after %d attempts", resp.StatusCode, body,
+			resp.Header.Get("Retry-After"), registry.count())
+	}
+}
+
+// A 304 THAT CHANGES THE VALIDATOR CHANGES IT, so the next revalidation asks
+// with the new one.
+func TestARevalidationThatChangesTheValidatorKeepsTheNewOne(t *testing.T) {
+	t.Parallel()
+
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", `"v1"`, "{}"),
+		answerWith(http.StatusNotModified, "public, max-age=0", `"v2"`, ""))
+	service, credentials := npmService(t, registry)
+	for range 3 {
+		if resp, body := npmGet(t, service, credentials, npmRequestLine("/etag")); resp.StatusCode != http.StatusOK ||
+			body != "{}" {
+			t.Fatalf("a revalidated document = %d %q", resp.StatusCode, body)
+		}
+	}
+	if got := registry.request(2).Header.Get("If-None-Match"); got != `"v2"` {
+		t.Fatalf("the revalidation after a 304 that changed the ETag asked with %q, want the new one", got)
+	}
+}
+
+// A TARBALL THE REGISTRY ENCODED REACHES THE CLIENT AS ITS OWN BYTES, which its
+// integrity covers, and is not kept.
+func TestAnEncodedTarballIsDecodedForTheClient(t *testing.T) {
+	t.Parallel()
+
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Content-Encoding", "gzip")
+		serveBytes(t, w, gzipped(t, "the tarball's bytes"))
+	})
+	service, credentials := npmService(t, registry)
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/enc/-/enc-1.0.0.tgz"))
+	if resp.StatusCode != http.StatusOK || body != "the tarball's bytes" || resp.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("an encoded tarball = %d %q (encoding %q)", resp.StatusCode, body, resp.Header.Get("Content-Encoding"))
+	}
+	waitForNpmFills(t, service.npmCache())
+	if service.npmCache().store.held(" /enc/-/enc-1.0.0.tgz") {
+		t.Fatal("an encoded tarball was kept")
+	}
+}
+
+// A FILL PAST THE BUDGET REACHES ITS CLIENT WHOLE AND IS NOT KEPT, so a job
+// asking for more than the node may hold in flight costs warm hits, never its
+// answers.
+func TestATarballPastTheFillBudgetReachesItsClientWholeAndIsNotKept(t *testing.T) {
+	t.Parallel()
+
+	tarball := strings.Repeat("b", 64<<10)
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, tarball)
+	})
+	service, credentials := npmService(t, registry)
+	service.npmCache().store.fillLimit = 1000
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/huge/-/huge-1.0.0.tgz"))
+	if resp.StatusCode != http.StatusOK || body != tarball {
+		t.Fatalf("a tarball past the fill budget = %d, %d of %d bytes", resp.StatusCode, len(body), len(tarball))
+	}
+	waitForNpmFills(t, service.npmCache())
+	if service.npmCache().store.held(" /huge/-/huge-1.0.0.tgz") {
+		t.Fatal("a tarball past the fill budget was kept")
 	}
 }

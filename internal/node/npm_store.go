@@ -16,12 +16,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/junioryono/billet/internal/durablefile"
 )
 
 const (
-	// npmStoreLimit bounds the node's npm store. The store is the node's, shared
-	// by every tier on it, so the bound is the node's too.
+	// npmStoreLimit bounds what the node's npm store keeps. The store is the
+	// node's, shared by every tier on it, so the bound is the node's too.
 	npmStoreLimit = 10 << 30
+	// npmFillLimit bounds the bytes every fill in flight may have written toward
+	// an entry. A fill past it goes on to its client and keeps nothing, so a job
+	// asking for many large objects at once cannot fill the node's disk.
+	npmFillLimit = 2 << 30
 	// npmTarballCeiling is billet's own ceiling on how long a tarball is served
 	// without asking the registry again, far shorter than the registry's year, so
 	// a version npm's edge stops serving stops being served here within a day.
@@ -186,17 +192,28 @@ func npmFreshness(entry *npmEntry, header http.Header, requested, received time.
 
 // npmStore is the node's store of registry answers.
 //
-// A STORED ENTRY IS TWO FILES, its body and its metadata, and the metadata is
-// written last and names the body, so a crash between them leaves a body nothing
-// names, which the next open deletes. A body is never rewritten: a new answer
-// gets a new body file, and the old one is removed once nothing names it.
+// A STORED ENTRY IS TWO FILES, its body and its metadata, installed in that
+// order, each durably (durablefile's ordering), and the metadata names the body:
+// after a crash a body nothing names is deleted at the next open, and metadata
+// is never left naming a body that is not whole. A body is never rewritten: a
+// new answer gets a new body file.
+//
+// A BODY IS DELETED ONLY AFTER NO ENTRY IN THE INDEX NAMES IT, and an entry's
+// body is opened under the index's lock, so a reader that found an entry always
+// opens the body that entry names. Every publication and removal on disk holds
+// publish, so two of them never interleave their files.
 type npmStore struct {
-	root  string
-	limit int64
+	root      string
+	limit     int64
+	fillLimit int64
+	disk      durablefile.Installer
+
+	publish sync.Mutex
 
 	mu      sync.Mutex
 	entries map[string]*npmEntry
 	total   int64
+	filling int64
 }
 
 func entryName(key string) string {
@@ -211,7 +228,7 @@ func (s *npmStore) tempDir() string    { return filepath.Join(s.root, "tmp") }
 
 // openNpmStore loads the store at root, removing what no entry names.
 func openNpmStore(root string, limit int64) (*npmStore, error) {
-	s := &npmStore{root: root, limit: limit, entries: make(map[string]*npmEntry)}
+	s := &npmStore{root: root, limit: limit, fillLimit: npmFillLimit, entries: make(map[string]*npmEntry)}
 	for _, dir := range []string{s.entriesDir(), s.bodiesDir(), s.tempDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("node: create the npm store: %w", err)
@@ -281,18 +298,6 @@ func (s *npmStore) loadEntry(path string) (*npmEntry, bool) {
 	return &entry, true
 }
 
-// lookup returns a copy of the entry stored under key.
-func (s *npmStore) lookup(key string) (npmEntry, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.entries[key]
-	if !ok {
-		return npmEntry{}, false
-	}
-
-	return *entry, true
-}
-
 // held reports whether the store has an entry under key.
 func (s *npmStore) held(key string) bool {
 	s.mu.Lock()
@@ -302,25 +307,55 @@ func (s *npmStore) held(key string) bool {
 	return ok
 }
 
-// open opens an entry's body for reading, and marks it served.
-func (s *npmStore) open(entry npmEntry, now time.Time) (*os.File, error) {
-	file, err := os.Open(filepath.Join(s.bodiesDir(), entry.Body))
-	if err != nil {
-		return nil, err
-	}
-	info, err := file.Stat()
-	if err != nil || info.Size() != entry.Size {
-		_ = file.Close()
-
-		return nil, errors.New("node: an npm store entry's body is not the size it was stored at")
-	}
+// acquire returns the entry under key with its body open, the two read together
+// so that no replacement or eviction between them can hand the caller another
+// generation's body or none. The caller closes the body.
+func (s *npmStore) acquire(key string, now time.Time) (npmEntry, *os.File, bool) {
 	s.mu.Lock()
-	if current, ok := s.entries[entry.Key]; ok && current.Body == entry.Body {
-		current.lastServed = now
+	entry, ok := s.entries[key]
+	if !ok {
+		s.mu.Unlock()
+
+		return npmEntry{}, nil, false
+	}
+	snapshot := *entry
+	body, err := os.Open(filepath.Join(s.bodiesDir(), entry.Body))
+	if err == nil {
+		if info, statErr := body.Stat(); statErr != nil || info.Size() != entry.Size {
+			_ = body.Close()
+			err = errors.New("node: an npm store entry's body is not the size it was stored at")
+		}
+	}
+	if err == nil {
+		entry.lastServed = now
 	}
 	s.mu.Unlock()
+	if err != nil {
+		s.removeIf(key, snapshot.Body)
 
-	return file, nil
+		return npmEntry{}, nil, false
+	}
+
+	return snapshot, body, true
+}
+
+// reserve claims n bytes of the fill budget, reporting whether it could.
+func (s *npmStore) reserve(n int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.filling+n > s.fillLimit {
+		return false
+	}
+	s.filling += n
+
+	return true
+}
+
+// release returns n bytes of the fill budget.
+func (s *npmStore) release(n int64) {
+	s.mu.Lock()
+	s.filling -= n
+	s.mu.Unlock()
 }
 
 // temp is a new file a fill writes its body into before commit names it.
@@ -328,9 +363,21 @@ func (s *npmStore) temp() (*os.File, error) {
 	return os.CreateTemp(s.tempDir(), "fill-*")
 }
 
-// commit stores entry with the body written to temp, replacing what the key
-// held. The temporary file is consumed whether or not commit succeeds.
+// commit stores entry with the body written to the temporary file at temp,
+// replacing what the key held. The temporary file is consumed whether or not
+// commit succeeds.
 func (s *npmStore) commit(entry npmEntry, temp string) error {
+	if err := s.publishEntry(entry, temp); err != nil {
+		return err
+	}
+	// AFTER THE PUBLICATION'S LOCK IS RELEASED: eviction removes, and a removal
+	// takes the same lock.
+	s.evict()
+
+	return nil
+}
+
+func (s *npmStore) publishEntry(entry npmEntry, temp string) error {
 	var nonce [8]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		_ = os.Remove(temp)
@@ -339,12 +386,17 @@ func (s *npmStore) commit(entry npmEntry, temp string) error {
 	}
 	entry.Body = entryName(entry.Key) + "-" + hex.EncodeToString(nonce[:])
 	body := filepath.Join(s.bodiesDir(), entry.Body)
-	if err := os.Rename(temp, body); err != nil {
+
+	s.publish.Lock()
+	defer s.publish.Unlock()
+	// THE BODY IS WHOLE ON DISK, UNDER ITS NAME, BEFORE METADATA NAMES IT.
+	if err := s.installBody(temp, body); err != nil {
 		_ = os.Remove(temp)
+		_ = os.Remove(body)
 
 		return err
 	}
-	if err := s.writeEntry(entry); err != nil {
+	if err := s.installEntry(entry); err != nil {
 		_ = os.Remove(body)
 
 		return err
@@ -363,13 +415,48 @@ func (s *npmStore) commit(entry npmEntry, temp string) error {
 	if previous != nil && previous.Body != entry.Body {
 		_ = os.Remove(filepath.Join(s.bodiesDir(), previous.Body))
 	}
-	s.evict()
 
 	return nil
 }
 
+func (s *npmStore) installBody(temp, body string) error {
+	file, err := os.OpenFile(temp, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := s.disk.SyncFileHandle(file); err != nil {
+		_ = file.Close()
+
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temp, body); err != nil {
+		return err
+	}
+
+	return s.disk.SyncDirectory(s.bodiesDir())
+}
+
+func (s *npmStore) installEntry(entry npmEntry) error {
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	_, err = s.disk.Install(s.entriesDir(), entryName(entry.Key)+".json", 0o600, func(w io.Writer) error {
+		_, err := w.Write(raw)
+
+		return err
+	})
+
+	return err
+}
+
 // refresh rewrites an entry's metadata after a revalidation, keeping its body.
 func (s *npmStore) refresh(entry npmEntry) error {
+	s.publish.Lock()
+	defer s.publish.Unlock()
 	s.mu.Lock()
 	current, ok := s.entries[entry.Key]
 	if !ok || current.Body != entry.Body {
@@ -378,7 +465,7 @@ func (s *npmStore) refresh(entry npmEntry) error {
 		return errors.New("node: an npm store entry changed while it was revalidated")
 	}
 	s.mu.Unlock()
-	if err := s.writeEntry(entry); err != nil {
+	if err := s.installEntry(entry); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -392,53 +479,35 @@ func (s *npmStore) refresh(entry npmEntry) error {
 	return nil
 }
 
-// remove deletes the entry under key.
-func (s *npmStore) remove(key string) {
+// removeIf deletes the entry under key when it still names body, or whatever
+// it names when body is empty. A generation that replaced the one the caller
+// meant is left alone.
+func (s *npmStore) removeIf(key, body string) {
+	s.publish.Lock()
+	defer s.publish.Unlock()
 	s.mu.Lock()
 	entry, ok := s.entries[key]
-	if ok {
-		delete(s.entries, key)
-		s.total -= entry.Size
-	}
-	s.mu.Unlock()
-	if !ok {
+	if !ok || body != "" && entry.Body != body {
+		s.mu.Unlock()
+
 		return
 	}
+	delete(s.entries, key)
+	s.total -= entry.Size
+	s.mu.Unlock()
+	// THE METADATA GOES FIRST, DURABLY, so a crash never leaves it naming a body
+	// that was deleted.
 	_ = os.Remove(filepath.Join(s.entriesDir(), entryName(key)+".json"))
+	// A REMOVAL NOT YET DURABLE KEEPS ITS BODY: metadata a crash brings back
+	// still names a whole file, and the next open deletes a body nothing names.
+	if err := s.disk.SyncDirectory(s.entriesDir()); err != nil {
+		return
+	}
 	_ = os.Remove(filepath.Join(s.bodiesDir(), entry.Body))
 }
 
-func (s *npmStore) writeEntry(entry npmEntry) error {
-	raw, err := json.Marshal(entry)
-	if err != nil {
-		return err
-	}
-	file, err := os.CreateTemp(s.tempDir(), "entry-*")
-	if err != nil {
-		return err
-	}
-	if _, err := file.Write(raw); err != nil {
-		_ = file.Close()
-		_ = os.Remove(file.Name())
-
-		return err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(file.Name())
-
-		return err
-	}
-	if err := os.Rename(file.Name(), filepath.Join(s.entriesDir(), entryName(entry.Key)+".json")); err != nil {
-		_ = os.Remove(file.Name())
-
-		return err
-	}
-
-	return nil
-}
-
 // evict removes the least recently served entries until the store is back
-// under its bound.
+// under its bound, each only if it is still the generation chosen.
 func (s *npmStore) evict() {
 	s.mu.Lock()
 	if s.total <= s.limit {
@@ -446,22 +515,19 @@ func (s *npmStore) evict() {
 
 		return
 	}
-	order := make([]*npmEntry, 0, len(s.entries))
+	order := make([]npmEntry, 0, len(s.entries))
 	for _, entry := range s.entries {
-		order = append(order, entry)
-	}
-	slices.SortFunc(order, func(a, b *npmEntry) int { return a.lastServed.Compare(b.lastServed) })
-	var victims []string
-	total := s.total
-	for _, entry := range order {
-		if total <= s.limit {
-			break
-		}
-		victims = append(victims, entry.Key)
-		total -= entry.Size
+		order = append(order, *entry)
 	}
 	s.mu.Unlock()
-	for _, key := range victims {
-		s.remove(key)
+	slices.SortFunc(order, func(a, b npmEntry) int { return a.lastServed.Compare(b.lastServed) })
+	for i := range order {
+		s.mu.Lock()
+		over := s.total > s.limit
+		s.mu.Unlock()
+		if !over {
+			return
+		}
+		s.removeIf(order[i].Key, order[i].Body)
 	}
 }

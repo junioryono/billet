@@ -3,6 +3,7 @@ package node
 import (
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -63,9 +64,12 @@ var (
 	npmNamePart = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,213}$`)
 	// npmScopePart is a scope without its @. Scopes are lower case.
 	npmScopePart = regexp.MustCompile(`^[a-z0-9][a-z0-9._~-]{0,213}$`)
-	// npmVersion is a semantic version as the registry stores one, with no v.
+	// npmVersion is a semantic version as the registry stores one, with no v:
+	// SemVer 2.0.0's grammar, so a numeric prerelease identifier has no leading
+	// zero.
 	npmVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
-		`(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
+		`(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?` +
+		`(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 	// npmTarballFile is a tarball's file name.
 	npmTarballFile = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~+-]{0,250}\.tgz$`)
 )
@@ -138,14 +142,14 @@ func parseNpmPath(raw string) (npmRequest, bool) {
 		// escapes it, in either case; every other scoped object is unescaped.
 		if len(segments) == 1 {
 			scope, name, ok := cutScopeEscape(segments[0])
-			if !ok || !npmScopePart.MatchString(scope) || !npmNamePart.MatchString(name) {
+			if !ok || !npmScopedName(scope, name) {
 				return npmRequest{}, false
 			}
 
 			return npmRequest{object: npmPackageDocument, path: "/@" + scope + "%2f" + name}, true
 		}
 		scope := strings.TrimPrefix(segments[0], "@")
-		if !npmScopePart.MatchString(scope) || !npmNamePart.MatchString(segments[1]) {
+		if !npmScopedName(scope, segments[1]) {
 			return npmRequest{}, false
 		}
 		prefix := "/@" + scope + "/" + segments[1]
@@ -173,6 +177,12 @@ func parseNpmObject(prefix, name string, rest []string) (npmRequest, bool) {
 	default:
 		return npmRequest{}, false
 	}
+}
+
+// npmScopedName reports whether @scope/name is a package name: each part well
+// formed, and the whole within the registry's 214 characters.
+func npmScopedName(scope, name string) bool {
+	return npmScopePart.MatchString(scope) && npmNamePart.MatchString(name) && len(scope)+len(name)+2 <= 214
 }
 
 // cutScopeEscape splits "@scope%2fname" at its one escaped separator.
@@ -215,17 +225,29 @@ func npmDocumentVariant(values []string) (npmVariant, bool) {
 
 // npmAcceptsIdentity reports whether a client takes an answer with no content
 // coding, which is the only kind the node serves.
+//
+// A QUALITY IT CANNOT READ REFUSES: the request is spliced rather than answered
+// in a coding the client may have meant to refuse.
 func npmAcceptsIdentity(values []string) bool {
-	identity, wildcard := "", ""
+	identity, wildcard := -1.0, -1.0
 	for _, value := range values {
 		for _, part := range strings.Split(value, ",") {
 			coding, params, _ := strings.Cut(strings.TrimSpace(part), ";")
 			coding = strings.ToLower(strings.TrimSpace(coding))
-			q := "1"
+			if coding == "" {
+				continue
+			}
+			q := 1.0
 			for _, param := range strings.Split(params, ";") {
-				if v, ok := strings.CutPrefix(strings.TrimSpace(param), "q="); ok {
-					q = strings.TrimSpace(v)
+				name, raw, found := strings.Cut(strings.TrimSpace(param), "=")
+				if !found || !strings.EqualFold(strings.TrimSpace(name), "q") {
+					continue
 				}
+				parsed, ok := npmQuality(strings.TrimSpace(raw))
+				if !ok {
+					return false
+				}
+				q = parsed
 			}
 			switch coding {
 			case "identity":
@@ -236,15 +258,24 @@ func npmAcceptsIdentity(values []string) bool {
 		}
 	}
 	switch {
-	case identity != "":
-		return !npmQualityZero(identity)
-	case wildcard != "":
-		return !npmQualityZero(wildcard)
+	case identity >= 0:
+		return identity > 0
+	case wildcard >= 0:
+		return wildcard > 0
 	default:
 		return true
 	}
 }
 
-func npmQualityZero(q string) bool {
-	return strings.Trim(strings.TrimPrefix(q, "0"), ".0") == "" && strings.HasPrefix(q, "0")
+// npmQualityPattern is RFC 9110's qvalue: 0 or 1, with at most three decimals.
+var npmQualityPattern = regexp.MustCompile(`^(0(\.\d{0,3})?|1(\.0{0,3})?)$`)
+
+// npmQuality reads one qvalue, refusing any other spelling.
+func npmQuality(raw string) (float64, bool) {
+	if !npmQualityPattern.MatchString(raw) {
+		return 0, false
+	}
+	q, err := strconv.ParseFloat(raw, 64)
+
+	return q, err == nil
 }

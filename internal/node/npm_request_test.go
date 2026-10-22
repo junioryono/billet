@@ -86,6 +86,18 @@ func TestOnlyAnAnonymousReadOfANamedObjectIsCacheable(t *testing.T) {
 		{name: "a client refusing everything unnamed", raw: "GET /left-pad HTTP/1.1\r\n" + host +
 			"Accept-Encoding: gzip, *;q=0\r\n\r\n"},
 		{name: "an absolute target", raw: "GET https://registry.npmjs.org/left-pad HTTP/1.1\r\n" + host + "\r\n"},
+		{name: "a prerelease with a leading zero", raw: "GET /left-pad/1.0.0-01 HTTP/1.1\r\n" + host + "\r\n"},
+		{name: "a scoped name past 214 characters", raw: "GET /@" + strings.Repeat("s", 110) + "/" +
+			strings.Repeat("n", 110) + "/1.0.0 HTTP/1.1\r\n" + host + "\r\n"},
+		{name: "a refusal of identity in capitals", raw: "GET /left-pad HTTP/1.1\r\n" + host +
+			"Accept-Encoding: gzip, identity;Q=0\r\n\r\n"},
+		{name: "an unreadable quality", raw: "GET /left-pad HTTP/1.1\r\n" + host +
+			"Accept-Encoding: identity;q=none\r\n\r\n"},
+		{name: "a prerelease version", raw: "GET /left-pad/1.0.0-rc.1 HTTP/1.1\r\n" + host + "\r\n",
+			want: true, object: npmVersionDocument, variant: npmFull, path: "/left-pad/1.0.0-rc.1"},
+		{name: "a client that weighs identity low but not zero", raw: "GET /left-pad HTTP/1.1\r\n" + host +
+			"Accept-Encoding: gzip, identity;q=0.001\r\n\r\n", want: true, object: npmPackageDocument,
+			variant: npmFull, path: "/left-pad"},
 	} {
 		req := readNpmRequest(t, tc.raw)
 		got, ok := classifyNpmRequest(req, held)

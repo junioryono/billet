@@ -1,6 +1,7 @@
 package node
 
 import (
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -154,8 +155,8 @@ func TestTheStoreKeepsWhatItCommittedAndDropsWhatACrashLeft(t *testing.T) {
 	if err := store.commit(torn, writeNpmTemp(t, store, "four")); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	tornEntry, _ := store.lookup(torn.Key)
-	if err := os.WriteFile(filepath.Join(store.bodiesDir(), tornEntry.Body), []byte("cut"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(store.bodiesDir(), storedBody(t, store, torn.Key)), []byte("cut"),
+		0o600); err != nil {
 		t.Fatalf("tear a body: %v", err)
 	}
 	orphan := filepath.Join(store.bodiesDir(), "orphan")
@@ -168,13 +169,9 @@ func TestTheStoreKeepsWhatItCommittedAndDropsWhatACrashLeft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	entry, ok := reopened.lookup(kept.Key)
+	entry, body, ok := reopened.acquire(kept.Key, now)
 	if !ok || entry.Size != 5 {
 		t.Fatalf("a committed entry after reopen = %+v, %v", entry, ok)
-	}
-	body, err := reopened.open(entry, now)
-	if err != nil {
-		t.Fatalf("open the kept body: %v", err)
 	}
 	_ = body.Close()
 	if reopened.held(torn.Key) {
@@ -203,10 +200,9 @@ func TestTheStoreEvictsWhatWasServedLeastRecently(t *testing.T) {
 			t.Fatalf("commit %s: %v", name, err)
 		}
 	}
-	older, _ := store.lookup("full /a")
-	body, err := store.open(older, start.Add(time.Minute))
-	if err != nil {
-		t.Fatalf("serve a: %v", err)
+	_, body, ok := store.acquire("full /a", start.Add(time.Minute))
+	if !ok {
+		t.Fatal("serve a: not held")
 	}
 	_ = body.Close()
 	third := npmEntry{Key: "full /c", Path: "/c", Object: npmPackageDocument, Variant: npmFull, Size: 4,
@@ -218,4 +214,84 @@ func TestTheStoreEvictsWhatWasServedLeastRecently(t *testing.T) {
 		t.Fatalf("after eviction: a=%v b=%v c=%v, want b evicted",
 			store.held("full /a"), store.held("full /b"), store.held("full /c"))
 	}
+}
+
+// storedBody is the body file the index names for key.
+func storedBody(t *testing.T, store *npmStore, key string) string {
+	t.Helper()
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	entry, ok := store.entries[key]
+	if !ok {
+		t.Fatalf("%s is not stored", key)
+	}
+
+	return entry.Body
+}
+
+// A REMOVAL NAMES THE GENERATION IT MEANT: one that a replacement superseded
+// leaves the replacement, its metadata and its body alone, so an eviction or a
+// failed read of an old body can never take a newer answer with it.
+func TestARemovalOfASupersededGenerationLeavesTheReplacement(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := openNpmStore(root, 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	entry := npmEntry{Key: "full /x", Path: "/x", Object: npmPackageDocument, Variant: npmFull, Size: 3,
+		Received: now}
+	if err := store.commit(entry, writeNpmTemp(t, store, "old")); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	old := storedBody(t, store, entry.Key)
+	if err := store.commit(entry, writeNpmTemp(t, store, "new")); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	store.removeIf(entry.Key, old)
+	got, body, ok := store.acquire(entry.Key, now)
+	if !ok {
+		t.Fatal("removing the superseded generation removed its replacement")
+	}
+	defer body.Close()
+	raw, err := io.ReadAll(body)
+	if err != nil || string(raw) != "new" || got.Body == old {
+		t.Fatalf("after removing the old generation: body %q (%v), generation %s", raw, err, got.Body)
+	}
+	reopened, err := openNpmStore(root, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if !reopened.held(entry.Key) {
+		t.Fatal("the replacement's metadata did not survive the old generation's removal")
+	}
+}
+
+// A FILL PAST ITS BUDGET IS NOT KEPT, and gives the budget back when it ends.
+func TestTheFillBudgetRefusesToKeepAndIsGivenBack(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.fillLimit = 10
+	within := &npmBudget{store: store, keep: true}
+	if _, err := within.Write([]byte("six by")); err != nil || !within.keep {
+		t.Fatalf("a fill within the budget: keep %v, %v", within.keep, err)
+	}
+	past := &npmBudget{store: store, keep: true}
+	if _, err := past.Write([]byte("five!")); err != nil || past.keep {
+		t.Fatalf("a fill past the budget: keep %v, %v", past.keep, err)
+	}
+	within.done()
+	past.done()
+	again := &npmBudget{store: store, keep: true}
+	if _, err := again.Write([]byte("ten bytes!")); err != nil || !again.keep {
+		t.Fatal("the budget was not given back when its fills ended")
+	}
+	again.done()
 }
