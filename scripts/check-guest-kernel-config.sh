@@ -28,7 +28,7 @@
 # The checker is verified before it is used and run last, because running a script
 # is the one step that can do something; and billet's own rules come before it so
 # they can be exercised anywhere -- the vendored checker needs /proc, GNU sed and
-# GNU stat, so a macOS `make check` can reach step 2 and not step 3.
+# GNU stat, so a macOS `scripts/gates/check.sh` can reach step 2 and not step 3.
 #
 # Usage: scripts/check-guest-kernel-config.sh <path to a built .config>
 set -euo pipefail

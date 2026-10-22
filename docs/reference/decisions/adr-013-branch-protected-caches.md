@@ -37,7 +37,7 @@ Everything else, including a pull request, a tag, `pull_request_target`, any reu
 
 - An untrusted guest reaches the node cache listener and is refused without its session bearer (HTTP 401 in under a millisecond, reference deployment, 2026-09-25).
 - `url.insteadOf` drops the header `actions/checkout` scopes to `https://github.com/`, so a Git proxy reached that way never sees the job's token. After a 401, git runs the credential helper in the repository, where that header is readable (git 2.51.0, 2026-09-25). The Git proxy's credential helper is built on that.
-- `upload-pack` under protocol v2 serves an object no ref reaches even with `uploadpack.allowAnySHA1InWant=false`. Under v0 it refuses the commit, but still serves a tree or a blob, because its check walks commits. The proxy serves v0 from a mirror pruned to GitHub's refs, and sends any want that is not a commit or a current ref's object to GitHub (git 2.51.0, 2026-09-25).
+- `upload-pack` under protocol v2 serves an object no ref reaches even with `uploadpack.allowAnySHA1InWant=false`. Under v0 it refuses the commit, but still serves a tree or a blob, because its check walks commits. The proxy serves v0 from a mirror pruned to GitHub's refs, and sends any want that is not a commit or a current ref's object to GitHub (git 2.51.0, 2026-09-25). Superseded by [ADR-018](adr-018-git-proxy-answers-as-github.md): GitHub serves an object no ref reaches by its name (2026-10-21), so the proxy now serves any object a repository's mirror holds to a job GitHub authorised for it.
 - git keeps its old base URL when it follows a redirect on the retry after a 401, so the node follows a renamed repository's redirect itself.
 - The rest, with their dates, are in [Cache parity](../records/cache-parity.md).
 

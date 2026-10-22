@@ -119,7 +119,7 @@ Use one of these if it fits. [actions-runner-controller](https://github.com/acti
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). `make check` is the gate; the skills under `.claude/skills` are the project's written-down rules.
+See [CONTRIBUTING.md](CONTRIBUTING.md). `scripts/gates/check.sh` is the gate; the skills under `.claude/skills` are the project's written-down rules.
 
 ## License
 
@@ -131,4 +131,4 @@ billet is Apache-2.0 ([LICENSE](LICENSE)), with one exception:
 | [`ee/`](ee/) | [The billet Enterprise License](ee/LICENSE): free to read, and to modify and run to develop, test or evaluate it; any other use, including running it in your own CI, needs a subscription |
 | Third-party code billet carries | Its own license, kept beside it |
 
-Nothing outside `ee/` depends on it, so the Apache-licensed build is complete on its own. Copyright 2026 Junior Yono; [NOTICE](NOTICE) is the notice a redistribution carries. Apple Silicon support requires [Tart](https://tart.run), which is licensed FSL-1.1-ALv2 and is an external dependency you install yourself, like Docker or Ceph.
+Nothing outside `ee/` depends on it, so the Apache-licensed build is complete on its own. Copyright 2026 Junior Yono; [NOTICE](NOTICE) is the notice a redistribution carries. The licenses cover the code, not the name: [TRADEMARKS.md](TRADEMARKS.md) says how forks, packages and services may use "billet". Apple Silicon support requires [Tart](https://tart.run), which is licensed FSL-1.1-ALv2 and is an external dependency you install yourself, like Docker or Ceph.

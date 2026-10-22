@@ -54,7 +54,7 @@ func mknodBlock(path, hostDevice string, uid, gid int) error {
 	// conversion below is suppressed rather than deleted: Rdev is uint64 on linux
 	// and int32 on darwin, and this package must COMPILE for darwin because the
 	// cross-build matrix includes it. Deleting the conversion satisfies the linter
-	// on linux and breaks `make cross`.
+	// on linux and breaks `scripts/gates/cross.sh`.
 	//
 	// Two linters are suppressed because each platform provokes a different one: on
 	// linux the conversion is redundant, and on darwin it is real — which makes the
