@@ -315,7 +315,7 @@ func hostRecordAnd(edit func([]byte) []byte) func(*testing.T, *harness, string) 
 
 		record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
 		record.Image, record.Disk = aRestoreSpec().Image, testGoldenDisk
-		record.Deployment, record.Builder = h.p.owner, theLease
+		record.Deployment, record.Builder = h.p.owner, theBuilder
 		record.StateDigest = digestOf("captured " + snapshotStateFile)
 		record.MemoryDigest = digestOf("captured " + snapshotMemoryFile)
 

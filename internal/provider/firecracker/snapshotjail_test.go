@@ -57,7 +57,7 @@ func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compati
 
 	record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
 	record.Image, record.Disk = aRestoreSpec().Image, testGoldenDisk
-	record.Deployment, record.Builder = h.p.owner, theLease
+	record.Deployment, record.Builder = h.p.owner, theBuilder
 	record.StateDigest = digestOf("captured " + snapshotStateFile)
 	record.MemoryDigest = digestOf("captured " + snapshotMemoryFile)
 
@@ -82,9 +82,26 @@ func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compati
 	}
 }
 
-// testGoldenDisk is the system disk every staged snapshot names: the one a capture
-// of theInstance publishes.
-const testGoldenDisk = goldenDiskPrefix + theLease + "@" + fakeGeneration
+// theBuilder is the lease whose capture every staged snapshot is: another lease than
+// theLease, which a restore runs as, so a restored microVM captured again publishes
+// a disk of its own.
+const theBuilder = "4c1f0e3a9b2d48f6a7e5c3b1d9f2e8a0"
+
+// testGoldenDisk is the system disk every staged snapshot names.
+const testGoldenDisk = goldenDiskPrefix + theBuilder + "@" + fakeGeneration
+
+// capturedDisk is the system disk a capture of theInstance publishes.
+const capturedDisk = goldenDiskPrefix + theLease + "@" + fakeGeneration
+
+// capturedEvidence is what a capture of theInstance on this harness answers, worked
+// out from what the fake VMM writes and who captured it.
+func (h *harness) capturedEvidence() Evidence {
+	return Evidence{
+		Deployment: h.p.owner, Builder: theLease, Disk: capturedDisk,
+		State:  digestOf("written by the VMM at /" + captureStateFile),
+		Memory: digestOf("written by the VMM at /" + captureMemoryFile),
+	}
+}
 
 // digestOf is the digest a capture records for a file holding content.
 func digestOf(content string) string {
@@ -98,7 +115,7 @@ func digestOf(content string) string {
 // record a restore is checked against.
 func (h *harness) theEvidence() Evidence {
 	return Evidence{
-		Deployment: h.p.owner, Builder: theLease, Disk: testGoldenDisk,
+		Deployment: h.p.owner, Builder: theBuilder, Disk: testGoldenDisk,
 		State: digestOf("captured " + snapshotStateFile), Memory: digestOf("captured " + snapshotMemoryFile),
 	}
 }

@@ -38,9 +38,15 @@ func TestACaptureVisibleButNotDurableKeepsItsDisk(t *testing.T) {
 				}))
 			h.launch(t)
 
-			_, err := h.p.Capture(t.Context(), theInstance, "gold-1")
+			evidence, err := h.p.Capture(t.Context(), theInstance, "gold-1")
 			if !errors.Is(err, errPublishedNotDurable) || !errors.Is(err, failing) {
 				t.Fatalf("Capture = %v, want the sync's failure reported as not durable", err)
+			}
+
+			// A VISIBLE SNAPSHOT'S EVIDENCE COMES WITH THE ERROR, because a restore can
+			// already find it.
+			if want := h.capturedEvidence(); evidence != want {
+				t.Errorf("Capture answered the evidence %+v with the error, want %+v", evidence, want)
 			}
 
 			if _, err := os.Lstat(filepath.Join(h.p.snapshotsDir(), "gold-1")); err != nil {
@@ -171,12 +177,17 @@ func TestACaptureWhoseMemoryIsNotPublishedWithdrawsItsDisk(t *testing.T) {
 			h.launch(t)
 			h.disk.withdrawErr = tc.withdrawErr
 
-			_, err := h.p.Capture(t.Context(), theInstance, "gold-1")
+			evidence, err := h.p.Capture(t.Context(), theInstance, "gold-1")
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Capture = %v, want a failure saying %q", err, tc.want)
 			}
 
-			ref := testGoldenDisk
+			// NOTHING WAS PUBLISHED, so there is no evidence of it, withdrawn or not.
+			if evidence != (Evidence{}) {
+				t.Errorf("a capture whose snapshot was not published answered the evidence %+v", evidence)
+			}
+
+			ref := capturedDisk
 
 			published, withdrawn, _ := h.disk.goldenCalls()
 			if !slices.Equal(published, []string{theInstance + " -> " + ref}) ||

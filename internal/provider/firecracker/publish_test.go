@@ -99,7 +99,7 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 
 	host, err := h.p.hostCompatibility(guest)
 	host.VCPUs, host.Memory = aSpec().VCPU, int64(aSpec().Memory)
-	host.Image, host.Disk = aSpec().Image, testGoldenDisk
+	host.Image, host.Disk = aSpec().Image, capturedDisk
 	// THE EVIDENCE, worked out from what the VMM wrote and who captured it.
 	host.Deployment, host.Builder = h.p.owner, theLease
 	host.StateDigest = digestOf("written by the VMM at /" + captureStateFile)
@@ -124,7 +124,7 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 	}
 
 	if published, withdrawn, _ := h.disk.goldenCalls(); !slices.Equal(published,
-		[]string{theInstance + " -> " + testGoldenDisk}) || len(withdrawn) != 0 {
+		[]string{theInstance + " -> " + capturedDisk}) || len(withdrawn) != 0 {
 		t.Errorf("the disk was published %v and withdrawn %v, want the builder's clone published once",
 			published, withdrawn)
 	}
@@ -140,7 +140,7 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 	}
 
 	if _, _, cloned := h.disk.goldenCalls(); len(cloned) != 1 ||
-		!strings.HasPrefix(cloned[0], testGoldenDisk+" -> ") {
+		!strings.HasPrefix(cloned[0], capturedDisk+" -> ") {
 		t.Errorf("the restore cloned %v, want the golden's system disk", cloned)
 	}
 }
@@ -409,8 +409,17 @@ func TestARestoredMicroVMCanBeCapturedWithoutTouchingItsSnapshot(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 
+	// UNDER A DISK OF ITS OWN, named after the fork's lease: the golden it was
+	// restored from was built by another lease, and the fake disk refuses a second
+	// golden under one name as Ceph's rename does.
 	if _, err := h.p.Capture(t.Context(), theInstance, "gold-2"); err != nil {
 		t.Fatalf("Capture of a restored microVM: %v", err)
+	}
+
+	if published, _, _ := h.disk.goldenCalls(); !slices.Equal(published,
+		[]string{theInstance + " -> " + capturedDisk}) || capturedDisk == testGoldenDisk {
+		t.Errorf("the fork's capture published %v, want its own disk %s beside the golden's %s", published,
+			capturedDisk, testGoldenDisk)
 	}
 
 	after, err := os.ReadFile(filepath.Join(dir, snapshotMemoryFile))

@@ -161,7 +161,13 @@ func TestAGoldensDiskIsNamedAfterItsBuildersLease(t *testing.T) {
 		t.Fatalf("goldenNameFor(%s) = %q, %v, want %q", theInstance, got, err, goldenDiskPrefix+theLease)
 	}
 
-	if _, err := goldenNameFor("gold-1"); err == nil {
-		t.Error("goldenNameFor accepted a name that is not a lease's microVM")
+	for _, id := range []string{
+		"gold-1", "billet-x", "billet-9d7ab98c551bceec9a81e5da847f683",
+		"billet-9d7ab98c551bceec9a81e5da847f6837a", "billet-9D7AB98C551BCEEC9A81E5DA847F6837",
+		"billet-9d7ab98c551bceec9a81e5da847f68@7", "billet-9d7ab98c551bceec9a81e5da847f68/7",
+	} {
+		if got, err := goldenNameFor(id); err == nil {
+			t.Errorf("goldenNameFor(%q) = %q, want a refusal: it is not a lease's microVM", id, got)
+		}
 	}
 }

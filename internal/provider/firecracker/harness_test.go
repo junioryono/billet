@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -316,6 +317,8 @@ type fakeDisk struct {
 	// onCloneGolden runs inside CloneGolden, after the restore read the snapshot's
 	// record and before it links the snapshot, so a test can change it in between.
 	onCloneGolden func()
+	// goldens are the golden disk names published and not withdrawn.
+	goldens map[string]bool
 }
 
 // fakeGeneration is the generation every fake publication answers.
@@ -329,6 +332,18 @@ func (d *fakeDisk) PublishRoot(_ context.Context, name, golden string) (string, 
 		return "", d.publishErr
 	}
 
+	// A NAME ALREADY TAKEN IS REFUSED, as Ceph refuses a rename onto an image that
+	// exists, so a test cannot pass by publishing two goldens under one disk.
+	if d.goldens[golden] {
+		return "", fmt.Errorf("rbd: rename %s: (17) File exists", golden)
+	}
+
+	if d.goldens == nil {
+		d.goldens = map[string]bool{}
+	}
+
+	d.goldens[golden] = true
+
 	ref := golden + "@" + fakeGeneration
 	d.published = append(d.published, name+" -> "+ref)
 
@@ -340,6 +355,11 @@ func (d *fakeDisk) WithdrawRoot(_ context.Context, ref, name string) error {
 	defer d.mu.Unlock()
 
 	d.withdrawn = append(d.withdrawn, ref+" -> "+name)
+
+	if d.withdrawErr == nil {
+		golden, _, _ := strings.Cut(ref, "@")
+		delete(d.goldens, golden)
+	}
 
 	return d.withdrawErr
 }

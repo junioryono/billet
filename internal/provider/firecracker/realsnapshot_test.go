@@ -106,16 +106,23 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 			record.Disk, record.Image, env.image)
 	}
 
-	// THE EVIDENCE IS THE RECORD'S, with digests of the published files read back.
+	// THE EVIDENCE IS THE RECORD'S, and both are of the files published: each digest
+	// read back from the store, not from the record under test.
 	memory, err := golden.digests.of(filepath.Join(published, snapshotMemoryFile))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if evidence != record.evidence() || evidence.Memory != memory || evidence.Deployment != selftestDeployment ||
-		evidence.Builder != env.lease {
-		t.Fatalf("Capture answered %+v, want the published record's %+v with the memory's digest %s",
-			evidence, record.evidence(), memory)
+	state, err := golden.digests.of(filepath.Join(published, snapshotStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := Evidence{
+		Deployment: selftestDeployment, Builder: env.lease, Disk: record.Disk, State: state, Memory: memory,
+	}
+	if evidence != want || record.evidence() != want {
+		t.Fatalf("Capture answered %+v and recorded %+v, want %+v", evidence, record.evidence(), want)
 	}
 
 	// THE SAME PROVIDER RESTORES: its restore clones the record's disk, wherever the
