@@ -438,6 +438,52 @@ func TestABodyKeptByAFailedRemovalOutlivesItsReader(t *testing.T) {
 	}
 }
 
+// A BODY RENAMED INTO PLACE BEFORE ITS DIRECTORY SYNC FAILED, THAT THE DISK
+// THEN REFUSES TO DELETE, IS DEBT: charged once, against the fill budget, never
+// left on disk counted nowhere.
+func TestABodyRenamedBeforeAFailedSyncThatWillNotDeleteIsDebt(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.fillLimit = 10
+	store.disk = durablefile.Installer{SyncDir: func(dir string) error {
+		if dir == store.bodiesDir() {
+			return errors.New("the disk refused to flush the bodies directory")
+		}
+
+		return nil
+	}}
+	store.remove = func(path string) error {
+		if filepath.Dir(path) == store.bodiesDir() {
+			return errors.New("the disk refused to delete a body")
+		}
+
+		return os.Remove(path)
+	}
+	entry := npmEntry{Key: "full /orphan", Path: "/orphan", Object: npmPackageDocument, Variant: npmFull, Size: 8,
+		Received: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)}
+	if err := store.commit(entry, writeNpmTemp(t, store, "8 bytes!")); err == nil {
+		t.Fatal("a commit whose body could not be flushed reported success")
+	}
+	store.mu.Lock()
+	debt, owed, held := len(store.debt), store.retiredBytes, len(store.entries)
+	store.mu.Unlock()
+	if debt != 1 || owed != entry.Size || held != 0 {
+		t.Fatalf("after a body the disk kept: %d debts, %d bytes owed, %d entries; want 1, %d, 0", debt, owed, held,
+			entry.Size)
+	}
+	if store.reserve(3) {
+		t.Fatal("the fill budget did not count the body the disk kept")
+	}
+	if !store.reserve(2) {
+		t.Fatal("the body the disk kept was charged more than once")
+	}
+	store.release(2)
+}
+
 // A METADATA INSTALL THAT FAILED AFTER ITS RENAME LEAVES THE PAIR: durablefile
 // may already have put the metadata in place, and that metadata names the body,
 // so the body stays and the next open finds a whole entry.

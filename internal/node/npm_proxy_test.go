@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -1184,6 +1186,63 @@ func TestAHeadIsAnsweredBeforeTheBodyItKeeps(t *testing.T) {
 	if stored.ETag != `"v2"` {
 		t.Fatalf("the kept tarball is %s, want the one the HEAD fetched", stored.ETag)
 	}
+}
+
+// A DOCUMENT THE STORE COULD NOT KEEP IS ANSWERED FROM THE FILE IT WAS READ
+// INTO, and that file's bytes stay charged to the fill budget until the answer
+// ends: the commit failed, the file is gone from the store's directories, and
+// only the reservation the read made still counts it.
+func TestADocumentAnsweredAfterAFailedCommitStaysCharged(t *testing.T) {
+	t.Parallel()
+
+	document := `{"padding":"` + strings.Repeat("f", 16<<20) + `"}`
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, document)
+	})
+	service, credentials := npmService(t, registry)
+	npm := service.npmCache()
+	npm.store.fillLimit = int64(len(document)) + 1000
+	npm.store.disk = durablefile.Installer{SyncDir: func(dir string) error {
+		if dir == npm.store.bodiesDir() {
+			return errors.New("the disk refused to flush the bodies directory")
+		}
+
+		return nil
+	}}
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set a deadline: %v", err)
+	}
+	if _, err := conn.Write([]byte(npmRequestLine("/unkept"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read the headers: %v", err)
+	}
+	// THE CLIENT HAS READ ONLY THE HEADERS, so the fallback is still answering.
+	npm.store.mu.Lock()
+	filling := npm.store.filling
+	npm.store.mu.Unlock()
+	if filling < int64(len(document)) {
+		t.Fatalf("while a fallback is answered, %d bytes of the fill budget are claimed, want its %d", filling,
+			len(document))
+	}
+	if npm.store.reserve(2000) {
+		t.Fatal("the fill budget admitted another fill while the fallback's bytes were on disk")
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || len(body) != len(document) {
+		t.Fatalf("the fallback read %d of %d bytes: %v", len(body), len(document), err)
+	}
+	if npm.store.held("full /unkept") {
+		t.Fatal("a document whose commit failed was indexed")
+	}
+	assertNpmQuiet(t, npm)
 }
 
 // A DOCUMENT ANSWERED FROM THE STORE THAT ITS OWN COMMIT EVICTED is pinned and

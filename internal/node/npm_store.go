@@ -209,6 +209,9 @@ type npmStore struct {
 	limit     int64
 	fillLimit int64
 	disk      durablefile.Installer
+	// remove deletes a body file: os.Remove, a seam so a test can make the disk
+	// refuse a deletion, which nothing else provokes.
+	remove func(string) error
 
 	publish sync.Mutex
 
@@ -311,7 +314,7 @@ func (s *npmStore) deleteRetired(name string) {
 	if !retired || pinned {
 		return
 	}
-	if err := os.Remove(filepath.Join(s.bodiesDir(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := s.remove(filepath.Join(s.bodiesDir(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.keepAsDebt(name, size)
 
 		return
@@ -337,7 +340,7 @@ func (s *npmStore) tempDir() string    { return filepath.Join(s.root, "tmp") }
 // openNpmStore loads the store at root, removing what no entry names.
 func openNpmStore(root string, limit int64) (*npmStore, error) {
 	s := &npmStore{root: root, limit: limit, fillLimit: npmFillLimit, entries: make(map[string]*npmEntry),
-		pins: make(map[string]int), retired: make(map[string]int64), debt: make(map[string]int64)}
+		pins: make(map[string]int), retired: make(map[string]int64), debt: make(map[string]int64), remove: os.Remove}
 	for _, dir := range []string{s.entriesDir(), s.bodiesDir(), s.tempDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("node: create the npm store: %w", err)
@@ -526,7 +529,7 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string, pin bool) (npmEntry
 		_ = os.Remove(temp)
 		// A RENAME THAT HAPPENED BEFORE A SYNC FAILED left the body under its name;
 		// one the disk then refuses to delete is debt, never silently dropped.
-		if removeErr := os.Remove(body); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		if removeErr := s.remove(body); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			s.keepAsDebt(entry.Body, entry.Size)
 		}
 
