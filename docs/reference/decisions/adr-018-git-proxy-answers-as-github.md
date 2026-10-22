@@ -56,7 +56,7 @@ What is left is a name that passes from one repository to another and back withi
 
 ## What is not decided here
 
-- **Dropping a mirror at once.** An object GitHub has since removed (a sensitive-data removal through GitHub Support) stays in a mirror until a prune that runs at least fourteen days after the first pass that found it unreachable, which needs the mirror's refs to move, or until the mirror is reaped. `billet cache git forget`, to drop a mirror at once, is the next change.
+- **Dropping an object GitHub removed, on its own.** An object GitHub has since removed (a sensitive-data removal through GitHub Support) stays in a mirror until a prune that runs at least fourteen days after the first pass that found it unreachable, which needs the mirror's refs to move, or until the mirror is reaped. `billet cache git forget --repository <owner/repo>` stops the repository's mirrors being served at once, on the node it runs on, by the broken mark a failed serve writes; the running node removes them itself, at the next advertisement or its next reap, because only its own claim waits for the fetches being served before a mirror goes and another is made in its place. Nothing yet learns of a removal from GitHub or reaches every node.
 - **Protocol v2 to the guest.** The mirror still speaks v0 to guests; v2 would let the proxy forward GitHub's ref listing unchanged and serve only fetches.
 
 ## Rejected

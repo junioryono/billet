@@ -1389,19 +1389,10 @@ func (s *CacheService) claimMirror(
 	s.log.Info("removed a git mirror it could not serve", "repository", request.name(),
 		"stamped", stamped, "repository_id", repository, "error", err)
 	// RENAMED ASIDE AT ONCE, DELETED AFTER: deleting a large mirror takes as
-	// long as its files, which no advertisement waits for. It goes under a name
-	// no repository can have (gitSegment refuses a leading dot), and one whose
-	// deletion never finished is the reaper's.
-	discards := filepath.Join(s.git.root, gitDiscardDirectory)
-	if err := os.MkdirAll(discards, 0o700); err != nil {
-		return err
-	}
-	discarded, err := os.MkdirTemp(discards, "mirror-")
+	// long as its files, which no advertisement waits for.
+	discarded, err := discardGitMirror(s.git.root, path)
 	if err != nil {
 		return err
-	}
-	if err := os.Rename(path, filepath.Join(discarded, "mirror.git")); err != nil {
-		return errors.Join(err, os.Remove(discarded))
 	}
 	s.git.release(path)
 	s.git.goBackground(func() {
@@ -1416,6 +1407,26 @@ func (s *CacheService) claimMirror(
 // gitDiscardDirectory holds mirrors renamed aside to be deleted, under the
 // mirrors' root: no repository's mirror can be named so.
 const gitDiscardDirectory = ".discarded"
+
+// discardGitMirror renames the mirror at path aside under root, where no
+// request finds it, and returns the directory to delete. It goes under a name
+// no repository can have (gitSegment refuses a leading dot), and one whose
+// deletion never finished is the reaper's.
+func discardGitMirror(root, path string) (string, error) {
+	discards := filepath.Join(root, gitDiscardDirectory)
+	if err := os.MkdirAll(discards, 0o700); err != nil {
+		return "", err
+	}
+	discarded, err := os.MkdirTemp(discards, "mirror-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(path, filepath.Join(discarded, "mirror.git")); err != nil {
+		return "", errors.Join(err, os.Remove(discarded))
+	}
+
+	return discarded, nil
+}
 
 // gitUnverifiedStamp marks a mirror whose objects may not all be its
 // repository's: written before a fetch begins and removed only once GitHub
@@ -2519,14 +2530,41 @@ func (s *CacheService) mirrorHolds(ctx context.Context, path string, objects []s
 	return true
 }
 
-// ReapGitMirrors removes the mirrors no job has used within gitMirrorRetention,
-// then the least recently used while their filesystem is above gitFullFraction.
+// reapBrokenMirror removes the mirror of key if it is still marked broken once
+// no fetch is being served from it, and leaves it for a later pass if one is.
+//
+// THE MARK IS READ AGAIN UNDER THE HOLD: the walk that chose the mirror held
+// nothing, and a claim may have replaced it with a healthy one since. The
+// hold is the one requests take, under the key in its own case, whatever the
+// case path was found in.
+func (s *CacheService) reapBrokenMirror(ctx context.Context, key, path string) error {
+	held := s.git.mirror(key)
+	if !lockWithin(ctx, &held.use, time.Second) {
+		return nil
+	}
+	defer held.use.Unlock()
+	if _, err := os.Stat(filepath.Join(path, gitBrokenStamp)); err != nil {
+		return nil
+	}
+	aside, err := discardGitMirror(s.git.root, path)
+	if err != nil {
+		return err
+	}
+	s.git.release(s.git.mirrorPath(key))
+
+	return os.RemoveAll(aside)
+}
+
+// ReapGitMirrors removes the mirrors marked broken, a forgotten one among them,
+// whenever they were used; then the mirrors no job has used within
+// gitMirrorRetention, then the least recently used while their filesystem is
+// above gitFullFraction.
 func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 	type mirror struct {
-		key  string
-		used time.Time
+		key, path string
+		used      time.Time
 	}
-	var mirrors []mirror
+	var mirrors, broken []mirror
 	var discarded []string
 	err := filepath.WalkDir(s.git.root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -2546,18 +2584,31 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 
 			return fs.SkipDir
 		}
-		if !entry.IsDir() || !strings.HasSuffix(path, ".git") {
+		// A MIRROR IS FOUND IN ANY CASE AND HELD BY ITS KEY'S: requests hold the
+		// key as they spell it, lower case, and on a filesystem that ignores case
+		// a directory spelled otherwise is that mirror.
+		name := entry.Name()
+		if !entry.IsDir() || len(name) <= len(".git") || !strings.EqualFold(name[len(name)-len(".git"):], ".git") {
 			return nil
+		}
+		relative, err := filepath.Rel(s.git.root, path[:len(path)-len(".git")])
+		if err != nil {
+			return err
+		}
+		key := strings.ToLower(relative)
+		// THE BROKEN MARK IS READ ON ITS OWN, before any other stamp: a mirror
+		// forgotten after a failed refresh carries the unverified mark too, and
+		// one may lack its used stamp.
+		if _, err := os.Stat(filepath.Join(path, gitBrokenStamp)); err == nil {
+			broken = append(broken, mirror{key: key, path: path})
+
+			return fs.SkipDir
 		}
 		info, err := os.Stat(filepath.Join(path, gitUsedStamp))
 		if err != nil {
 			return fs.SkipDir
 		}
-		relative, err := filepath.Rel(s.git.root, strings.TrimSuffix(path, ".git"))
-		if err != nil {
-			return err
-		}
-		mirrors = append(mirrors, mirror{key: relative, used: info.ModTime()})
+		mirrors = append(mirrors, mirror{key: key, path: path, used: info.ModTime()})
 
 		return fs.SkipDir
 	})
@@ -2569,6 +2620,13 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 	var failures []error
 	for _, path := range discarded {
 		if err := os.RemoveAll(path); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	// A BROKEN MIRROR GOES HOWEVER RECENTLY IT WAS USED, once no fetch is being
+	// served from it; one in use is taken on a later pass.
+	for _, m := range broken {
+		if err := s.reapBrokenMirror(ctx, m.key, m.path); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -2590,7 +2648,7 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 		if !lockWithin(ctx, &held.use, time.Second) {
 			continue
 		}
-		err = os.RemoveAll(s.git.mirrorPath(m.key))
+		err = os.RemoveAll(m.path)
 		if err == nil {
 			s.git.release(s.git.mirrorPath(m.key))
 		}
