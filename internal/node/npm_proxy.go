@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"strconv"
 	"strings"
@@ -291,8 +292,15 @@ func (n *npmCache) serve(ctx context.Context, conn net.Conn, req *http.Request, 
 	}
 	status := fetch.resp.StatusCode
 	switch {
-	case status == http.StatusNotModified && held:
+	case status == http.StatusNotModified && held && validator != "":
 		n.answerRevalidated(ctx, x, entry, body, fetch)
+	case status == http.StatusNotModified:
+		// A 304 TO A REQUEST THAT SENT NO VALIDATOR proves nothing about any
+		// generation: it neither refreshes an entry nor reaches the client.
+		n.service.log.Warn("the npm registry answered 304 to a request without a validator",
+			"path", request.path)
+		n.note(session, alloc.BuildCacheUnavailable)
+		n.answerStatus(x, http.StatusBadGateway)
 	case status == http.StatusOK && request.object != npmTarball:
 		n.answerDocument(x, fetch, previous)
 	case status == http.StatusOK:
@@ -402,6 +410,9 @@ func (n *npmCache) fetch(ctx context.Context, request npmRequest, validator stri
 			// does.
 			n.service.log.Info("the npm registry answered with a retryable status", "path", request.path,
 				"attempt", attempt, "status", resp.StatusCode)
+			if body, ok := resp.Body.(*npmIdleBody); ok {
+				body.pause()
+			}
 			last.close()
 			last = f
 		case resp.StatusCode == http.StatusOK && request.object != npmTarball:
@@ -494,6 +505,50 @@ func (b *npmIdleBody) Close() error {
 
 	return b.body.Close()
 }
+
+// pause stops the idle clock of an answer the node holds without reading, a 5xx
+// kept across a retry, so it is still there to relay when the retry ends.
+func (b *npmIdleBody) pause() { b.timer.Stop() }
+
+// resume starts it again before the held answer is read.
+func (b *npmIdleBody) resume() { b.timer.Reset(b.idle) }
+
+// npmLazyGzip decodes gzip from its first Read, not before: gzip.NewReader reads
+// the stream's header, and an answer's headers must reach the client before any
+// body byte is waited for.
+type npmLazyGzip struct {
+	source io.Reader
+	reader *gzip.Reader
+	err    error
+}
+
+func (l *npmLazyGzip) Read(p []byte) (int, error) {
+	if l.reader == nil && l.err == nil {
+		l.reader, l.err = gzip.NewReader(l.source)
+	}
+	if l.err != nil {
+		return 0, l.err
+	}
+
+	return l.reader.Read(p)
+}
+
+func (l *npmLazyGzip) Close() {
+	if l.reader != nil {
+		_ = l.reader.Close()
+	}
+}
+
+// npmIdentity reports whether an HTTP content coding is none at all.
+func npmIdentity(encoding string) bool {
+	encoding = strings.ToLower(strings.TrimSpace(encoding))
+
+	return encoding == "" || encoding == "identity"
+}
+
+// npmGzip reports whether an HTTP content coding is gzip, the one the node
+// takes off.
+func npmGzip(encoding string) bool { return strings.EqualFold(strings.TrimSpace(encoding), "gzip") }
 
 // readDocument reads a document's 200 whole into a temporary file, decoded.
 // keep is false when the read went past the fill budget: the document still
@@ -598,11 +653,10 @@ func (n *npmCache) answerDocument(x npmExchange, f npmFetch, previous string) {
 		return
 	}
 	defer document.Close()
-	shareable := npmShareable(f.resp.Header)
-	if !shareable && previous != "" {
-		n.store.removeIf(x.request.key(), previous)
-	}
-	if !shareable || !f.keep {
+	// A 200 REPLACES WHAT THE STORE HELD, kept or not: the generation it
+	// superseded never answers again, not even a silent registry.
+	if !npmShareable(f.resp.Header) || !f.keep {
+		n.supersede(x, previous)
 		n.relayDocument(x, f, document)
 
 		return
@@ -610,6 +664,7 @@ func (n *npmCache) answerDocument(x npmExchange, f npmFetch, previous string) {
 	entry := entryFor(x.request, f, f.size)
 	if err := n.store.commit(entry, f.document); err != nil {
 		n.service.log.Warn("the npm store could not keep a document", "path", x.request.path, "error", err)
+		n.supersede(x, previous)
 		n.relayDocument(x, f, document)
 
 		return
@@ -628,32 +683,28 @@ func (n *npmCache) answerDocument(x npmExchange, f npmFetch, previous string) {
 // it when it arrives whole, may be shared, is not encoded and fits the fill
 // budget. mayKeep false streams it and keeps nothing.
 func (n *npmCache) answerTarball(x npmExchange, f npmFetch, previous string, mayKeep bool) {
-	shareable := npmShareable(f.resp.Header)
-	if !shareable && previous != "" {
-		n.store.removeIf(x.request.key(), previous)
-	}
-	encoding := strings.ToLower(strings.TrimSpace(f.resp.Header.Get("Content-Encoding")))
+	encoding := f.resp.Header.Get("Content-Encoding")
 	header := relayedHeader(f.resp.Header)
 	length := f.resp.ContentLength
 	var source io.Reader = f.resp.Body
-	switch encoding {
-	case "", "identity":
-	case "gzip":
+	switch {
+	case npmIdentity(encoding):
+	case npmGzip(encoding):
 		// AN HTTP CODING THE NODE DID NOT ASK FOR IS TAKEN OFF, so the client
 		// receives the tarball's own bytes, which its integrity covers.
-		decoded, err := gzip.NewReader(f.resp.Body)
-		if err != nil {
-			n.answerStatus(x, http.StatusBadGateway)
-			n.note(x.session, alloc.BuildCacheUnavailable)
-
-			return
-		}
+		decoded := &npmLazyGzip{source: f.resp.Body}
 		defer decoded.Close()
 		source, length = decoded, -1
 	default:
-		header.Set("Content-Encoding", f.resp.Header.Get("Content-Encoding"))
+		// A CODING THE CLIENT DID NOT ACCEPT AND THE NODE CANNOT TAKE OFF is no
+		// answer this client can use.
+		n.supersede(x, previous)
+		n.note(x.session, alloc.BuildCacheUnavailable)
+		n.answerStatus(x, http.StatusBadGateway)
+
+		return
 	}
-	keep := mayKeep && shareable && (encoding == "" || encoding == "identity")
+	keep := mayKeep && npmShareable(f.resp.Header) && npmIdentity(encoding)
 	counted := &npmCountingReader{reader: source}
 	var fill *npmKeeper
 	if keep {
@@ -667,23 +718,36 @@ func (n *npmCache) answerTarball(x npmExchange, f npmFetch, previous string, may
 		body = io.TeeReader(counted, fill)
 	}
 	var err error
+	read := true
 	if x.req.Method == http.MethodHead {
-		// A HEAD IS ANSWERED FROM THIS ANSWER, read whole so it can be kept,
-		// never from an older generation the store may still hold.
-		if _, err = io.Copy(io.Discard, body); err == nil {
-			err = n.writeAnswer(x, http.StatusOK, header, nil, counted.count)
+		// A HEAD IS ANSWERED FROM THIS ANSWER'S OWN HEADERS, at once, never from an
+		// older generation the store may still hold; the body is then read only to
+		// keep it.
+		err = n.writeAnswer(x, http.StatusOK, header, nil, length)
+		read = false
+		if fill != nil {
+			_, readErr := io.Copy(io.Discard, body)
+			read = readErr == nil
 		}
 	} else {
 		err = n.writeAnswer(x, http.StatusOK, header, body, length)
 	}
-	complete := err == nil && counted.eof && (f.resp.ContentLength < 0 || encoding != "" && encoding != "identity" ||
-		counted.count == f.resp.ContentLength)
+	complete := read && (err == nil || x.req.Method == http.MethodHead) && counted.eof &&
+		(f.resp.ContentLength < 0 || counted.count == f.resp.ContentLength)
+	committed := false
 	if fill != nil && complete {
 		if path, ok := fill.finish(); ok {
-			if err := n.store.commit(entryFor(x.request, f, counted.count), path); err != nil {
-				n.service.log.Warn("the npm store could not keep a tarball", "path", x.request.path, "error", err)
+			if commitErr := n.store.commit(entryFor(x.request, f, counted.count), path); commitErr != nil {
+				n.service.log.Warn("the npm store could not keep a tarball", "path", x.request.path,
+					"error", commitErr)
+			} else {
+				committed = true
 			}
 		}
+	}
+	// A 200 REPLACES WHAT THE STORE HELD, kept or not.
+	if !committed {
+		n.supersede(x, previous)
 	}
 	outcome := alloc.BuildCacheCold
 	if err != nil {
@@ -691,6 +755,13 @@ func (n *npmCache) answerTarball(x npmExchange, f npmFetch, previous string, may
 	}
 	n.note(x.session, outcome)
 	n.logAnswer(x, "filled", http.StatusOK, counted.count, f.attempts)
+}
+
+// supersede retires the generation an answer replaced, when there was one.
+func (n *npmCache) supersede(x npmExchange, previous string) {
+	if previous != "" {
+		n.store.removeIf(x.request.key(), previous)
+	}
 }
 
 // npmKeeper is a tarball's fill: its temporary file, charged to the budget,
@@ -763,7 +834,7 @@ func (r *npmCountingReader) Read(p []byte) (int, error) {
 }
 
 // answerRevalidated handles a 304 to the node's own validator.
-func (n *npmCache) answerRevalidated(ctx context.Context, x npmExchange, entry npmEntry, body *os.File,
+func (n *npmCache) answerRevalidated(ctx context.Context, x npmExchange, entry npmEntry, body *npmBody,
 	f npmFetch,
 ) {
 	merged := entry.headers()
@@ -836,7 +907,7 @@ func (e npmEntry) headers() http.Header {
 
 // answerEntry answers from a stored entry and the body acquired with it, with
 // a 304 when the client's own validator names it.
-func (n *npmCache) answerEntry(x npmExchange, entry npmEntry, body *os.File, how string) {
+func (n *npmCache) answerEntry(x npmExchange, entry npmEntry, body *npmBody, how string) {
 	now := n.now()
 	header := entry.headers()
 	header.Set("Age", strconv.FormatInt(int64(entry.age(now)/time.Second), 10))
@@ -875,19 +946,24 @@ func (n *npmCache) relayDocument(x npmExchange, f npmFetch, document *os.File) {
 // never cut short, a document's gzip taken off, and keeps nothing.
 func (n *npmCache) relay(x npmExchange, f npmFetch, how string) {
 	header := relayedHeader(f.resp.Header)
+	if idle, ok := f.resp.Body.(*npmIdleBody); ok {
+		idle.resume()
+	}
 	var body io.Reader = f.resp.Body
 	length := f.resp.ContentLength
-	switch encoding := strings.ToLower(strings.TrimSpace(f.resp.Header.Get("Content-Encoding"))); encoding {
-	case "", "identity":
-	case "gzip":
-		if decoded, err := gzip.NewReader(f.resp.Body); err == nil {
-			defer decoded.Close()
-			body, length = decoded, -1
-		} else {
-			header.Set("Content-Encoding", f.resp.Header.Get("Content-Encoding"))
-		}
+	switch encoding := f.resp.Header.Get("Content-Encoding"); {
+	case npmIdentity(encoding):
+	case npmGzip(encoding):
+		decoded := &npmLazyGzip{source: f.resp.Body}
+		defer decoded.Close()
+		body, length = decoded, -1
 	default:
-		header.Set("Content-Encoding", f.resp.Header.Get("Content-Encoding"))
+		// THE STATUS AND HEADERS STILL SAY WHAT THE REGISTRY SAID; a body in a
+		// coding the client did not accept and the node cannot take off is left
+		// out rather than passed on as if it were plain.
+		n.service.log.Warn("an npm answer came in a coding the node cannot take off; its body is withheld",
+			"path", x.request.path, "status", f.resp.StatusCode, "encoding", encoding)
+		body, length = nil, 0
 	}
 	err := n.writeAnswer(x, f.resp.StatusCode, header, body, length)
 	outcome := alloc.BuildCacheCold
@@ -927,8 +1003,18 @@ func (n *npmCache) writeAnswer(x npmExchange, status int, header http.Header, bo
 	if body == nil && status != http.StatusNotModified && !head {
 		length = 0
 	}
-	if status != http.StatusNotModified && length >= 0 {
-		header.Set("Content-Length", strconv.FormatInt(length, 10))
+	// A BODY OF UNKNOWN LENGTH IS CHUNKED, never delimited by the close: a close
+	// also ends a body cut short, and only a missing last chunk tells the client
+	// its answer did not arrive whole.
+	chunked := length < 0 && body != nil && status != http.StatusNotModified && !head
+	// THE ONE FRAMING LINE IS WRITTEN HERE, after every other header, so an
+	// answer can never carry both a length and a transfer coding.
+	framing := ""
+	switch {
+	case chunked:
+		framing = "Transfer-Encoding: chunked\r\n"
+	case status != http.StatusNotModified && length >= 0:
+		framing = "Content-Length: " + strconv.FormatInt(length, 10) + "\r\n"
 	}
 	buffered := bufio.NewWriter(x.conn)
 	if _, err := fmt.Fprintf(buffered, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status)); err != nil {
@@ -937,7 +1023,7 @@ func (n *npmCache) writeAnswer(x npmExchange, status int, header http.Header, bo
 	if err := header.Write(buffered); err != nil {
 		return err
 	}
-	if _, err := buffered.WriteString("\r\n"); err != nil {
+	if _, err := buffered.WriteString(framing + "\r\n"); err != nil {
 		return err
 	}
 	if err := buffered.Flush(); err != nil {
@@ -945,6 +1031,21 @@ func (n *npmCache) writeAnswer(x npmExchange, status int, header http.Header, bo
 	}
 	if body == nil || status == http.StatusNotModified || head {
 		return nil
+	}
+	if chunked {
+		writer := httputil.NewChunkedWriter(buffered)
+		if _, err := io.Copy(writer, body); err != nil {
+			return err
+		}
+		// THE LAST CHUNK ONLY AFTER THE WHOLE BODY, and then the empty trailer.
+		if err := writer.Close(); err != nil {
+			return err
+		}
+		if _, err := buffered.WriteString("\r\n"); err != nil {
+			return err
+		}
+
+		return buffered.Flush()
 	}
 	written, err := io.Copy(buffered, body)
 	if err != nil {

@@ -214,6 +214,64 @@ type npmStore struct {
 	entries map[string]*npmEntry
 	total   int64
 	filling int64
+	// pins counts the open readers of each body. A body removed while pinned is
+	// retired rather than deleted: its bytes stay on disk until its last reader
+	// closes, so they stay counted, in retired, against the fill budget.
+	pins         map[string]int
+	retired      map[string]int64
+	retiredBytes int64
+}
+
+// npmBody is an entry's body, open for one reader. Closing it unpins it.
+type npmBody struct {
+	*os.File
+	store *npmStore
+	name  string
+	once  sync.Once
+}
+
+func (b *npmBody) Close() error {
+	err := b.File.Close()
+	b.once.Do(func() { b.store.unpin(b.name) })
+
+	return err
+}
+
+// unpin ends one reader of a body, deleting it if it was retired and this was
+// its last.
+func (s *npmStore) unpin(name string) {
+	s.mu.Lock()
+	s.pins[name]--
+	if s.pins[name] > 0 {
+		s.mu.Unlock()
+
+		return
+	}
+	delete(s.pins, name)
+	size, retired := s.retired[name]
+	if retired {
+		delete(s.retired, name)
+		s.retiredBytes -= size
+	}
+	s.mu.Unlock()
+	if retired {
+		_ = os.Remove(filepath.Join(s.bodiesDir(), name))
+	}
+}
+
+// retire deletes a body no index entry names any more, or, while a reader
+// still holds it, leaves it to that reader's close.
+func (s *npmStore) retire(name string, size int64) {
+	s.mu.Lock()
+	if s.pins[name] > 0 {
+		s.retired[name] = size
+		s.retiredBytes += size
+		s.mu.Unlock()
+
+		return
+	}
+	s.mu.Unlock()
+	_ = os.Remove(filepath.Join(s.bodiesDir(), name))
 }
 
 func entryName(key string) string {
@@ -228,7 +286,8 @@ func (s *npmStore) tempDir() string    { return filepath.Join(s.root, "tmp") }
 
 // openNpmStore loads the store at root, removing what no entry names.
 func openNpmStore(root string, limit int64) (*npmStore, error) {
-	s := &npmStore{root: root, limit: limit, fillLimit: npmFillLimit, entries: make(map[string]*npmEntry)}
+	s := &npmStore{root: root, limit: limit, fillLimit: npmFillLimit, entries: make(map[string]*npmEntry),
+		pins: make(map[string]int), retired: make(map[string]int64)}
 	for _, dir := range []string{s.entriesDir(), s.bodiesDir(), s.tempDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("node: create the npm store: %w", err)
@@ -307,10 +366,10 @@ func (s *npmStore) held(key string) bool {
 	return ok
 }
 
-// acquire returns the entry under key with its body open, the two read together
-// so that no replacement or eviction between them can hand the caller another
-// generation's body or none. The caller closes the body.
-func (s *npmStore) acquire(key string, now time.Time) (npmEntry, *os.File, bool) {
+// acquire returns the entry under key with its body open and pinned, the two
+// read together so that no replacement or eviction between them can hand the
+// caller another generation's body or none. The caller closes the body.
+func (s *npmStore) acquire(key string, now time.Time) (npmEntry, *npmBody, bool) {
 	s.mu.Lock()
 	entry, ok := s.entries[key]
 	if !ok {
@@ -319,15 +378,16 @@ func (s *npmStore) acquire(key string, now time.Time) (npmEntry, *os.File, bool)
 		return npmEntry{}, nil, false
 	}
 	snapshot := *entry
-	body, err := os.Open(filepath.Join(s.bodiesDir(), entry.Body))
+	file, err := os.Open(filepath.Join(s.bodiesDir(), entry.Body))
 	if err == nil {
-		if info, statErr := body.Stat(); statErr != nil || info.Size() != entry.Size {
-			_ = body.Close()
+		if info, statErr := file.Stat(); statErr != nil || info.Size() != entry.Size {
+			_ = file.Close()
 			err = errors.New("node: an npm store entry's body is not the size it was stored at")
 		}
 	}
 	if err == nil {
 		entry.lastServed = now
+		s.pins[entry.Body]++
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -336,14 +396,16 @@ func (s *npmStore) acquire(key string, now time.Time) (npmEntry, *os.File, bool)
 		return npmEntry{}, nil, false
 	}
 
-	return snapshot, body, true
+	return snapshot, &npmBody{File: file, store: s, name: snapshot.Body}, true
 }
 
-// reserve claims n bytes of the fill budget, reporting whether it could.
+// reserve claims n bytes of the fill budget, reporting whether it could. The
+// bytes of retired bodies still held open count against it, since they are on
+// disk beyond the store's bound until their readers close.
 func (s *npmStore) reserve(n int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.filling+n > s.fillLimit {
+	if s.filling+s.retiredBytes+n > s.fillLimit {
 		return false
 	}
 	s.filling += n
@@ -397,8 +459,9 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string) error {
 		return err
 	}
 	if err := s.installEntry(entry); err != nil {
-		_ = os.Remove(body)
-
+		// THE BODY STAYS: a metadata install whose directory sync failed may still
+		// have put the metadata in place, and that metadata names this body. The
+		// next open keeps the pair or deletes a body nothing names.
 		return err
 	}
 
@@ -413,7 +476,7 @@ func (s *npmStore) publishEntry(entry npmEntry, temp string) error {
 	}
 	s.mu.Unlock()
 	if previous != nil && previous.Body != entry.Body {
-		_ = os.Remove(filepath.Join(s.bodiesDir(), previous.Body))
+		s.retire(previous.Body, previous.Size)
 	}
 
 	return nil
@@ -496,14 +559,17 @@ func (s *npmStore) removeIf(key, body string) {
 	s.total -= entry.Size
 	s.mu.Unlock()
 	// THE METADATA GOES FIRST, DURABLY, so a crash never leaves it naming a body
-	// that was deleted.
-	_ = os.Remove(filepath.Join(s.entriesDir(), entryName(key)+".json"))
-	// A REMOVAL NOT YET DURABLE KEEPS ITS BODY: metadata a crash brings back
-	// still names a whole file, and the next open deletes a body nothing names.
+	// that was deleted. A REMOVAL NOT YET DURABLE KEEPS ITS BODY: metadata a crash
+	// brings back still names a whole file, and the next open deletes a body
+	// nothing names.
+	if err := os.Remove(filepath.Join(s.entriesDir(), entryName(key)+".json")); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return
+	}
 	if err := s.disk.SyncDirectory(s.entriesDir()); err != nil {
 		return
 	}
-	_ = os.Remove(filepath.Join(s.bodiesDir(), entry.Body))
+	s.retire(entry.Body, entry.Size)
 }
 
 // evict removes the least recently served entries until the store is back

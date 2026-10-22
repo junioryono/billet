@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -558,6 +559,7 @@ func TestATarballIsKeptOnlyWhenItArrivesWhole(t *testing.T) {
 	if registry.count() != 2 {
 		t.Fatalf("the registry saw %d requests, want the whole tarball and the cut one", registry.count())
 	}
+	assertNpmQuiet(t, service.npmCache())
 }
 
 // waitForNpmFills waits until no fill is in flight: serve releases its fill
@@ -898,4 +900,186 @@ func TestATarballPastTheFillBudgetReachesItsClientWholeAndIsNotKept(t *testing.T
 	if service.npmCache().store.held(" /huge/-/huge-1.0.0.tgz") {
 		t.Fatal("a tarball past the fill budget was kept")
 	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// assertNpmQuiet holds that the node finished every request it was asked and
+// left nothing behind: no fill in flight or slot taken, no byte of the fill
+// budget still claimed, and no temporary file in the store.
+func assertNpmQuiet(t *testing.T, npm *npmCache) {
+	t.Helper()
+
+	waitForNpmFills(t, npm)
+	if taken := len(npm.slots); taken != 0 {
+		t.Errorf("%d fill slots are still taken", taken)
+	}
+	npm.store.mu.Lock()
+	filling := npm.store.filling
+	npm.store.mu.Unlock()
+	if filling != 0 {
+		t.Errorf("%d bytes of the fill budget are still claimed", filling)
+	}
+	leftovers, err := os.ReadDir(npm.store.tempDir())
+	if err != nil {
+		t.Fatalf("read the store's temporary directory: %v", err)
+	}
+	for _, leftover := range leftovers {
+		t.Errorf("a temporary file was left in the store: %s", leftover.Name())
+	}
+}
+
+// A REPLACEMENT THE STORE COULD NOT KEEP STILL REPLACES: the superseded entry
+// never answers a later silent registry.
+func TestAReplacementPastTheBudgetRetiresTheEntryItReplaced(t *testing.T) {
+	t.Parallel()
+
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", `"v1"`, `{"v":1}`),
+		answerWith(http.StatusOK, "public, max-age=300", `"v2"`, `{"v":2, "padding":"`+strings.Repeat("p", 4096)+`"}`),
+		answerWith(http.StatusServiceUnavailable, "", "", "down"))
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/replaced"))
+	service.npmCache().store.fillLimit = 100
+
+	if resp, body := npmGet(t, service, credentials, npmRequestLine("/replaced")); resp.StatusCode != http.StatusOK ||
+		!strings.HasPrefix(body, `{"v":2`) {
+		t.Fatalf("a replacement past the budget = %d %.20q", resp.StatusCode, body)
+	}
+	if service.npmCache().store.held("full /replaced") {
+		t.Fatal("the generation a 200 replaced is still stored")
+	}
+	if resp, body := npmGet(t, service, credentials, npmRequestLine("/replaced")); resp.StatusCode !=
+		http.StatusServiceUnavailable || body != "down" {
+		t.Fatalf("a silent registry after the replacement = %d %q, want its 503", resp.StatusCode, body)
+	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// A HELD 5XX IS STILL WHOLE WHEN THE RETRY ENDS: its idle clock is paused while
+// the node waits on the second attempt, here a document whose body stalls for
+// longer than the idle bound, and its body is larger than a transport buffers.
+func TestAHeld503IsRelayedWholeAfterARetryWhoseBodyStalled(t *testing.T) {
+	t.Parallel()
+
+	busy := strings.Repeat("b", 256<<10)
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 1 {
+			answerWith(http.StatusServiceUnavailable, "", "", busy)(w, r)
+
+			return
+		}
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Content-Length", "100")
+		serveText(t, w, "{")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	})
+	service, credentials := npmService(t, registry)
+	service.npmCache().bodyIdle = 300 * time.Millisecond
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/held"))
+	if resp.StatusCode != http.StatusServiceUnavailable || len(body) != len(busy) {
+		t.Fatalf("a held 503 after a stalled retry = %d, %d of %d bytes", resp.StatusCode, len(body), len(busy))
+	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// AN ANSWER OF UNKNOWN LENGTH IS CHUNKED, and one cut short never ends with the
+// last chunk, so the client cannot take it for whole; and its headers arrive
+// before the node waits on its body, even when the node decodes it.
+func TestACutAnswerOfUnknownLengthIsNeverTakenForWhole(t *testing.T) {
+	t.Parallel()
+
+	encoded := gzipped(t, strings.Repeat("g", 64<<10))
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		serveBytes(t, w, encoded[:len(encoded)/2])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("the test registry cannot cut its connection")
+
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("cut the test registry's connection: %v", err)
+
+			return
+		}
+		_ = conn.Close()
+	})
+	service, credentials := npmService(t, registry)
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte(npmRequestLine("/cut/-/cut-1.0.0.tgz"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("an encoded tarball cut short sent no headers: %v", err)
+	}
+	_, err = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(resp.TransferEncoding) != 1 || resp.TransferEncoding[0] != "chunked" ||
+		err == nil {
+		t.Fatalf("a cut answer of unknown length = %d, framing %v, read error %v; want chunked and cut",
+			resp.StatusCode, resp.TransferEncoding, err)
+	}
+	assertNpmQuiet(t, service.npmCache())
+}
+
+// A 304 TO A REQUEST THAT SENT NO VALIDATOR PROVES NOTHING: the entry, which
+// had no ETag to send, is not refreshed and the client is not told 304.
+func TestAnUnsolicitedNotModifiedIsAnUpstreamFault(t *testing.T) {
+	t.Parallel()
+
+	registry := scriptedRegistry(t,
+		answerWith(http.StatusOK, "public, max-age=0", "", "{}"),
+		answerWith(http.StatusNotModified, "public, max-age=300", "", ""))
+	service, credentials := npmService(t, registry)
+	npmGet(t, service, credentials, npmRequestLine("/untagged"))
+	before, body, ok := service.npmCache().store.acquire("full /untagged", time.Now())
+	if !ok {
+		t.Fatal("the untagged document was not kept")
+	}
+	_ = body.Close()
+
+	if resp, _ := npmGet(t, service, credentials, npmRequestLine("/untagged")); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("an unsolicited 304 = %d, want 502", resp.StatusCode)
+	}
+	after, body, ok := service.npmCache().store.acquire("full /untagged", time.Now())
+	if ok {
+		_ = body.Close()
+	}
+	if !ok || !after.Received.Equal(before.Received) || after.Lifetime != before.Lifetime {
+		t.Fatalf("an unsolicited 304 refreshed the entry: before %+v, after %+v", before, after)
+	}
+}
+
+// A TARBALL IN A CODING THE NODE CANNOT TAKE OFF IS NO ANSWER THE CLIENT ACCEPTED.
+func TestATarballInAnUnsupportedCodingIsRefused(t *testing.T) {
+	t.Parallel()
+
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("Content-Encoding", "br")
+		serveText(t, w, "not brotli, but no matter")
+	})
+	service, credentials := npmService(t, registry)
+
+	resp, body := npmGet(t, service, credentials, npmRequestLine("/br/-/br-1.0.0.tgz"))
+	if resp.StatusCode != http.StatusBadGateway || strings.Contains(body, "brotli") {
+		t.Fatalf("a tarball in br = %d %q, want 502 and none of its bytes", resp.StatusCode, body)
+	}
+	assertNpmQuiet(t, service.npmCache())
 }

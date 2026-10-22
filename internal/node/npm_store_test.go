@@ -1,12 +1,15 @@
 package node
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/durablefile"
 )
 
 // FRESHNESS IS COUNTED FROM THE REGISTRY'S CLOCK (RFC 9111 4.2.3): an answer
@@ -268,6 +271,81 @@ func TestARemovalOfASupersededGenerationLeavesTheReplacement(t *testing.T) {
 	if !reopened.held(entry.Key) {
 		t.Fatal("the replacement's metadata did not survive the old generation's removal")
 	}
+}
+
+// A BODY A READER HOLDS OUTLIVES ITS ENTRY ON DISK, and its bytes stay counted
+// against the fill budget until that reader closes, so evicting under a slow
+// reader can never put more on the node's disk than the store says it holds.
+func TestARetiredBodyIsDeletedOnlyWhenItsLastReaderCloses(t *testing.T) {
+	t.Parallel()
+
+	store, err := openNpmStore(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.fillLimit = 10
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	entry := npmEntry{Key: "full /pinned", Path: "/pinned", Object: npmPackageDocument, Variant: npmFull,
+		Size: 8, Received: now}
+	if err := store.commit(entry, writeNpmTemp(t, store, "8 bytes!")); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	_, body, ok := store.acquire(entry.Key, now)
+	if !ok {
+		t.Fatal("the entry is not held")
+	}
+	path := filepath.Join(store.bodiesDir(), body.name)
+	store.removeIf(entry.Key, body.name)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a body its reader still holds was deleted: %v", err)
+	}
+	if store.reserve(3) {
+		t.Fatal("the fill budget did not count a retired body still on disk")
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a retired body survived its last reader: %v", err)
+	}
+	if !store.reserve(3) {
+		t.Fatal("the fill budget was not given back when the retired body went")
+	}
+	store.release(3)
+}
+
+// A METADATA INSTALL THAT FAILED AFTER ITS RENAME LEAVES THE PAIR: durablefile
+// may already have put the metadata in place, and that metadata names the body,
+// so the body stays and the next open finds a whole entry.
+func TestAFailedMetadataInstallKeepsTheBodyItMayName(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := openNpmStore(root, 1<<20)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	store.disk = durablefile.Installer{SyncDir: func(dir string) error {
+		if dir == store.entriesDir() {
+			return errors.New("the disk refused to flush the entries directory")
+		}
+
+		return nil
+	}}
+	entry := npmEntry{Key: "full /flaky", Path: "/flaky", Object: npmPackageDocument, Variant: npmFull, Size: 4,
+		Received: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)}
+	if err := store.commit(entry, writeNpmTemp(t, store, "four")); err == nil {
+		t.Fatal("a commit whose metadata could not be flushed reported success")
+	}
+	reopened, err := openNpmStore(root, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	_, body, ok := reopened.acquire(entry.Key, time.Now())
+	if !ok {
+		t.Fatal("the metadata in place names a body the failed commit deleted")
+	}
+	_ = body.Close()
 }
 
 // A FILL PAST ITS BUDGET IS NOT KEPT, and gives the budget back when it ends.
