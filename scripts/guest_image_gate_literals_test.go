@@ -37,7 +37,7 @@ var gateSubjects = map[string]string{
 // about a missing feature that is present. It happened while the loopback adapter
 // was written: pulling `RESULTS_AUTHORITY` apart into a host plus a port removed
 // the literal `results-receiver.actions.githubusercontent.com:443` from the file
-// the gate greps, and nothing in `make check` could see it.
+// the gate greps, and nothing in `scripts/gates/check.sh` could see it.
 //
 // This asserts the relationship rather than the text: every literal the gate looks
 // for is present in the thing that will carry it.

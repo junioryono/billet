@@ -142,7 +142,7 @@ rehearsal_fetch_release() {
     echo "fetched ${tag}: ${deb} verified; manifest ${REHEARSAL_MANIFEST_SHA256}"
 }
 
-# rehearsal_require_dist_package finds the tree's own package (`make dist`) for
+# rehearsal_require_dist_package finds the tree's own package (scripts/gates/dist.sh) for
 # the daemon's architecture and sets REHEARSAL_DIST_DEB. Exactly one, or it
 # refuses: two snapshots in dist is a stale one waiting to be installed.
 rehearsal_require_dist_package() {
@@ -156,7 +156,7 @@ rehearsal_require_dist_package() {
     done
 
     test "${count}" -eq 1 ||
-        rehearsal_fail "expected exactly one linux/${REHEARSAL_ARCH} package in dist (run make dist), found ${count}"
+        rehearsal_fail "expected exactly one linux/${REHEARSAL_ARCH} package in dist (run scripts/gates/dist.sh), found ${count}"
 }
 
 # rehearsal_issue_bundle has the controller issue a node's certificate bundle

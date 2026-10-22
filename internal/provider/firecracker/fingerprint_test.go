@@ -141,7 +141,8 @@ func TestARestoreRefusesASnapshotTakenWhereItCannotRun(t *testing.T) {
 		{"another host kernel", editRecord(func(c *compatibility) { c.HostKernel = "5.10.0 #1" })},
 		{"another Firecracker build", editRecord(func(c *compatibility) { c.VMM = "sha256:00" })},
 		{"another guest kernel", editRecord(func(c *compatibility) { c.GuestKernel = "sha256:00" })},
-		{"another record format", editRecord(func(c *compatibility) { c.Format = 2 })},
+		{"another record format", editRecord(func(c *compatibility) { c.Format = compatibilityFormat + 1 })},
+		{"a format 1 record, which names no disk", editRecord(func(c *compatibility) { c.Format = 1 })},
 		{"no record", func(t *testing.T, _ *harness, dir string) {
 			t.Helper()
 
@@ -313,6 +314,7 @@ func hostRecordAnd(edit func([]byte) []byte) func(*testing.T, *harness, string) 
 		}
 
 		record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
+		record.Image, record.Disk = aRestoreSpec().Image, testGoldenDisk
 
 		raw, err := json.Marshal(record)
 		if err != nil {

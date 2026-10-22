@@ -90,7 +90,7 @@ func refuseTartOffAppleSilicon(profile initconfig.Profile, namedHost bool) error
 // not fit GitHub's 4-vCPU Linux runner: the macOS tier takes what there is and
 // the Linux one is correctly refused. Same commit, same test, opposite verdicts —
 // the rule that a probe on the development machine is not evidence about the
-// builder, arriving as a red CI run behind a green `make check`.
+// builder, arriving as a red CI run behind a green `scripts/gates/check.sh`.
 var detectHostCapacity = config.DetectHostCapacity
 
 // hostName is os.Hostname behind a seam.

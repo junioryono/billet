@@ -1774,7 +1774,7 @@ LEGACY_DIR=20260909T120000000000000
 # BILLET_GATE_SKIP accepts endpoint, retirement and retirement-request in any
 # order. Skipping retirement omits all of R, including requests. CI's guard
 # group skips endpoint,retirement; its retirement group skips retirement-request.
-# Neither set runs every section, as make converge-guard-check does locally.
+# Neither set runs every section, as scripts/gates/scenario.sh converge-guard-check does locally.
 # Unknown values, empty or repeated list members, and selecting and skipping
 # the same section together are refused, including ONLY=retirement-request
 # with SKIP=retirement. An unset or empty SKIP omits nothing.

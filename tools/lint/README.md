@@ -5,7 +5,7 @@ A `go/analysis` multichecker for rules golangci-lint cannot express, in its own 
 ## Running it
 
 ```bash
-make lint-custom          # builds the binary and runs it, then runs the analyzers' own tests
+scripts/gates/lint-custom.sh          # builds the binary and runs it, then runs the analyzers' own tests
 ```
 
 Or by hand, from the repository root:
@@ -17,7 +17,7 @@ Or by hand, from the repository root:
 
 Diagnostics go to **stderr** (standard `go/analysis` behaviour), so pipe with `2>&1` when grepping.
 
-**The analyzers' own tests are not reached by `go test ./...` from the root**, because this is a nested module. `make lint-custom` runs them, and so does CI. Without that step an analyzer could silently stop detecting anything and still report zero violations — which reads exactly like a clean tree, and is the failure this whole directory is arranged against.
+**The analyzers' own tests are not reached by `go test ./...` from the root**, because this is a nested module. `scripts/gates/lint-custom.sh` runs them, and so does CI. Without that step an analyzer could silently stop detecting anything and still report zero violations — which reads exactly like a clean tree, and is the failure this whole directory is arranged against.
 
 ## Suppression
 

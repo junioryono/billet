@@ -12,7 +12,7 @@
 # survive that start, `billet resume` lifts it, and the node that trusted the
 # old ledger is proved to be serving the recovered one.
 #
-# THE PACKAGE UNDER TEST IS THE TREE'S OWN (`make dist`), not a published
+# THE PACKAGE UNDER TEST IS THE TREE'S OWN (scripts/gates/dist.sh), not a published
 # release: this rehearsal is about what the code being changed does on a real
 # host, on every run.
 #

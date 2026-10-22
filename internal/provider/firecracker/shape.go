@@ -17,17 +17,28 @@ import (
 // memory file, and a VMM that has been taken over could make it any size; the shape
 // billet asked for is the bound the copy is held to, and the shape a restore must ask
 // for again, because admission charges a microVM by its spec.
+//
+// AND WHAT IT BOOTED, for the same reason: a capture publishes the root disk as a
+// golden's, so it flushes the host device that is that disk, and a restore picks
+// the kernel the guest was verified against from the generation it booted. Both
+// are read from here rather than from anything the guest can rename.
 type guestShape struct {
 	VCPUs  int   `json:"vcpus"`
 	Memory int64 `json:"memory_bytes"`
+	// Image is the exact generation the root disk was cloned from.
+	Image string `json:"image,omitempty"`
+	// Device is the host block device the root disk is mapped at.
+	Device string `json:"device,omitempty"`
 }
 
 func (j jail) shapeFile() string { return filepath.Join(j.dir(), "billet-shape") }
 
 // writeShape records the size a guest is launched at, staged and renamed like the
 // resource record, so it is whole or absent.
-func (p *Provider) writeShape(j jail, spec provider.Spec) error {
-	encoded, err := json.Marshal(guestShape{VCPUs: spec.VCPU, Memory: int64(spec.Memory)})
+func (p *Provider) writeShape(j jail, spec provider.Spec, device string) error {
+	encoded, err := json.Marshal(guestShape{
+		VCPUs: spec.VCPU, Memory: int64(spec.Memory), Image: spec.Image, Device: device,
+	})
 	if err != nil {
 		return fmt.Errorf("firecracker: encode the shape of %s: %w", j.id, err)
 	}

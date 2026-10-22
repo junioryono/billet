@@ -17,7 +17,7 @@
 # node keeps the address it was given (a network alias the restored host takes
 # over), so nothing about the node changes between the two controllers.
 #
-# THE PACKAGE UNDER TEST IS THE TREE'S OWN (`make dist`).
+# THE PACKAGE UNDER TEST IS THE TREE'S OWN (`scripts/gates/dist.sh`).
 #
 #   BILLET_REHEARSAL_APP_CONFIG=... BILLET_REHEARSAL_APP_KEY=... scripts/restore-first-start-rehearsal.sh
 set -euo pipefail

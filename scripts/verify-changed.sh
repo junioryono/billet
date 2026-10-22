@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # verify-changed.sh: check what this checkout changed, and nothing else.
 #
-# `make verify` runs it. It is the local check while working; CI runs the full
-# gate (`make check`'s steps, the race suite, the linux lint pass, billet's own
+# scripts/gates/verify.sh runs it, under the machine-wide lock. It is the local
+# check while working; CI runs the full gate (scripts/gates/check.sh's steps, the
+# race suite, the linux lint pass, billet's own
 # analyzers, the cross builds, PostgreSQL, the docs and terraform jobs) on every
 # push. A full gate on a shared Mac is what starved one into a kernel panic on
 # 2026-10-15, so this checks the changed packages and leaves the tree to CI.
@@ -21,7 +22,7 @@
 #     a changed .go file, or the nearest directory above a changed non-Go file
 #     that holds Go files (an embedded asset, a script a test executes), with
 #     any testdata component cut off first, because the go tool ignores
-#     testdata. .claude/, .github/ and the Makefile are read by the tests in
+#     testdata. .claude/ and .github/ are read by the tests in
 #     scripts/, so they select it; a directory's CLAUDE.md or AGENTS.md selects
 #     nothing. go test runs without -race, with the
 #     ordinary test cache, at -p 2 and GOMAXPROCS=4: -race made internal/alloc
@@ -31,7 +32,7 @@
 #     a second run without it fails rather than waits. Packages, never files: a
 #     single file is type-checked without the rest of its package (22 bogus
 #     `undefined` errors on one file, measured 2026-10-15).
-# A changed docs/ file runs `make docs` when sphinx-build is on PATH (15 s and
+# A changed docs/ file runs scripts/gates/docs.sh when sphinx-build is on PATH (15 s and
 # 150 MB, measured 2026-10-15) and otherwise says CI's docs job runs it. A
 # changed .tf file runs `terraform fmt -check` on it when terraform is on PATH
 # and names the terraform gates CI runs.
@@ -209,7 +210,7 @@ while IFS= read -r -d '' path; do
 		# Instructions for a session, which no package reads.
 		continue
 		;;
-	.claude/* | .github/* | Makefile)
+	.claude/* | .github/*)
 		if has_go scripts; then
 			add_pkg scripts "$path changed, and scripts/ tests what it says"
 		fi
@@ -305,9 +306,9 @@ for m in ${modules[@]+"${modules[@]}"}; do
 		fail "$label: go test"
 	fi
 
-	# golangci-lint runs for the root module, as make lint does; tools/lint is
+	# golangci-lint runs for the root module, as scripts/gates/lint.sh does; tools/lint is
 	# checked by its own tests and by billetlint in CI.
-	# As make lint does: from the physical path, and never from a path holding glob
+	# As lint.sh does: from the physical path, and never from a path holding glob
 	# syntax, which depguard reads as a pattern so a rule could check no file.
 	if [ "$m" = . ]; then
 		if ! here=$(pwd -P); then
@@ -318,23 +319,23 @@ for m in ${modules[@]+"${modules[@]}"}; do
 		elif command -v golangci-lint >/dev/null 2>&1; then
 			run "golangci-lint" env PWD="$here" golangci-lint run --allow-serial-runners --concurrency=4 "${pkgs[@]}"
 		else
-			say "golangci-lint is not installed; \`make tools\` installs the pinned version"
+			say "golangci-lint is not installed; scripts/gates/tools.sh installs the pinned version"
 			fail "golangci-lint (not installed)"
 		fi
 	fi
 done
 
 if [ "${#docs_files[@]}" -gt 0 ]; then
-	say "docs/ changed (${#docs_files[@]} files); CI's docs job builds them with \`make docs\` (Sphinx, warnings as errors)"
+	say "docs/ changed (${#docs_files[@]} files); CI's docs job builds them with scripts/gates/docs.sh (Sphinx, warnings as errors)"
 	if command -v sphinx-build >/dev/null 2>&1; then
-		run "make docs" make docs
+		run "docs" scripts/gates/docs.sh
 	else
 		say "sphinx-build is not on PATH, so the docs build was NOT checked here (pip install -r docs/requirements.txt)"
 	fi
 fi
 
 if [ "${#tf_files[@]}" -gt 0 ]; then
-	say "terraform changed (${#tf_files[@]} files); CI runs make tf-fmt-check, tf-validate, tf-test, tf-classify, lambda-test and hybrid-root-check (terraform), tf-lint and tf-scan (terraform-lint), and the 1.9 consumer floor"
+	say "terraform changed (${#tf_files[@]} files); CI runs scripts/gates/terraform.sh fmt, validate, test and classify, lambda-test.sh and hybrid-root-check.sh (terraform), terraform.sh lint and scan (terraform-lint), and the 1.9 consumer floor"
 	existing=()
 	for f in "${tf_files[@]}"; do
 		case "$f" in

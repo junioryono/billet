@@ -696,7 +696,7 @@ func newProvider(t *testing.T, s *stub) *Provider {
 	p.execRetry = time.Millisecond
 	p.proveRetry = time.Millisecond
 	// WIDE ENOUGH FOR TWO SAMPLES ON A BUSY MACHINE. proveSamples is 2 and each
-	// sample spawns the stub, so under a loaded `make check` a two-second
+	// sample spawns the stub, so under a loaded `scripts/gates/check.sh` a two-second
 	// window fits only ONE — and proveRunning then reports "never stayed
 	// running (the guest last said alive)", which is a true statement about a
 	// budget rather than about the code under test. Seen in another session's

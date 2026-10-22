@@ -1,6 +1,6 @@
 # Control-plane queries
 
-Named SQL statements, one file per domain, compiled by sqlc into `internal/state/ledgerdb`. The generated code is committed; `sqlc.yaml` at the repo root is the configuration and `make sqlc` regenerates.
+Named SQL statements, one file per domain, compiled by sqlc into `internal/state/ledgerdb`. The generated code is committed; `sqlc.yaml` at the repo root is the configuration and `sqlc generate` regenerates.
 
 **ALL LEDGER SQL LIVES HERE, including `internal/alloc`'s and `internal/rollout`'s.** One directory rather than one per owning package, because every guard below is written once against this directory and then covers every domain: the prepare-against-the-migrated-schema check, the read/write classification, the ASCII rule and the wildcard ban. Per-package query sets would have needed all four again each time, and the prepare check is the only thing in the tree that catches an `ON CONFLICT` whose unique index a migration removed.
 
@@ -31,7 +31,7 @@ It reads the *PostgreSQL* timeline because generation runs once, with that engin
 ## Adding a query
 
 1. Put it in the domain file, with a comment saying what invariant it carries.
-2. `make sqlc`.
+2. `sqlc generate`.
 3. List the new method in `ReadOps` or `WriteOps` in `internal/state/queryset.go` — exactly one of them. `TestEveryGeneratedQueryIsClaimedByExactlyOneHalf` fails if you skip it, and `TestReadOpsHoldsExactlyTheQueriesThatOnlyRead` fails if you put a mutation in `ReadOps`.
 4. Write the adapter method in the package that owns the operation, preserving the diagnostic the caller already depends on.
 
