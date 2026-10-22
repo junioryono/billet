@@ -15,6 +15,7 @@ type GitObserver interface {
 	GitRequest(route, reason, status string, took time.Duration)
 	GitRefresh(outcome string, took time.Duration)
 	GitLookup(outcome string)
+	GitMaintenance(kind, outcome string, took time.Duration)
 }
 
 // noGitObserver counts nothing, the observer of a node with no metrics.
@@ -23,6 +24,7 @@ type noGitObserver struct{}
 func (noGitObserver) GitRequest(string, string, string, time.Duration) {}
 func (noGitObserver) GitRefresh(string, time.Duration)                 {}
 func (noGitObserver) GitLookup(string)                                 {}
+func (noGitObserver) GitMaintenance(string, string, time.Duration)     {}
 
 // SetGitObserver sets what the Git proxy reports to; nil reports nowhere.
 func (s *CacheService) SetGitObserver(o GitObserver) {
@@ -84,12 +86,13 @@ var (
 	gitTransferRefused       = gitReason{"transfer_refused", "could not extend the transfer's deadline"}
 	gitRedirected            = gitReason{"redirected", "github.com redirected the request"}
 	gitGitHubFailed          = gitReason{"github_error", "github.com answered with an error"}
+	gitMirrorMaintaining     = gitReason{"mirror_maintaining", "the mirror is being repacked"}
 	gitReasons               = []gitReason{gitServed, gitBusy, gitCacheOff, gitOutsideOwner, gitNotAFetch,
 		gitUnreadableRequest, gitRequestTooLarge, gitGitHubUnreachable, gitRenamedOutsideOwner, gitNotAuthorised,
 		gitNoRepositoryID, gitMirrorUnavailable, gitNoGrant, gitProtocolV2, gitMirrorBeingRemoved, gitNoMirror,
 		gitMirrorNotServable, gitNegotiationTooLarge, gitNegotiationUnreadable, gitMirrorLacksObject,
 		gitGrantEnded, gitMirrorDidNotAnswer, gitUnanswered, gitNotAGitPath, gitCredentialsRequired,
-		gitTransferRefused, gitRedirected, gitGitHubFailed}
+		gitTransferRefused, gitRedirected, gitGitHubFailed, gitMirrorMaintaining}
 )
 
 // GitReasons is every reason a request is counted under.
@@ -166,6 +169,45 @@ func gitRefreshOutcome(err error) string {
 		return gitRefreshFull
 	default:
 		return gitRefreshFailed
+	}
+}
+
+// Kinds of maintenance pass, and how one ended.
+const (
+	gitMaintainGeometric = "geometric"
+	gitMaintainFull      = "full"
+	gitMaintainPrune     = "prune"
+	gitMaintainOK        = "ok"
+	gitMaintainBusy      = "busy"
+	gitMaintainDiskFull  = "disk_full"
+	gitMaintainClosed    = "closed"
+	gitMaintainFailed    = "failed"
+)
+
+// GitMaintenanceKinds is every kind a maintenance pass is counted under.
+func GitMaintenanceKinds() []string {
+	return []string{gitMaintainGeometric, gitMaintainFull, gitMaintainPrune}
+}
+
+// GitMaintenanceOutcomes is every outcome a maintenance pass is counted under.
+func GitMaintenanceOutcomes() []string {
+	return []string{gitMaintainOK, gitMaintainBusy, gitMaintainDiskFull, gitMaintainClosed, gitMaintainFailed}
+}
+
+// gitMaintenanceOutcome is how a maintenance pass that ended with err is
+// counted.
+func gitMaintenanceOutcome(err error) string {
+	switch {
+	case err == nil:
+		return gitMaintainOK
+	case errors.Is(err, errGitClosed):
+		return gitMaintainClosed
+	case errors.Is(err, errGitMaintainBusy):
+		return gitMaintainBusy
+	case errors.Is(err, errGitDiskFull):
+		return gitMaintainDiskFull
+	default:
+		return gitMaintainFailed
 	}
 }
 
