@@ -1,4 +1,4 @@
-# ADR-018: The guest image's corresponding source is published beside it
+# ADR-019: The guest image's corresponding source is published beside it
 
 Accepted, 2026-10-21. Issue #584 (step 3).
 

@@ -87,7 +87,7 @@ if ! awk -F '\t' '
     exit 2
 fi
 
-# THE CORRESPONDING SOURCE (#584, ADR-018), proved whole before anything is
+# THE CORRESPONDING SOURCE (#584, ADR-019), proved whole before anything is
 # tagged: a release is immutable, so a source missing from it can never be added.
 #
 # - image-sources.parts names the archive: its first line is the whole tar, its

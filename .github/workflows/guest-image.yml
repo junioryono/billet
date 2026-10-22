@@ -393,7 +393,7 @@ jobs:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
 
       # THE CORRESPONDING SOURCE OF WHAT THE IMAGE REDISTRIBUTES, published beside it
-      # (#584, ADR-018): every source package the image's source manifest marks gnu or
+      # (#584, ADR-019): every source package the image's source manifest marks gnu or
       # unclassified, at its exact version, and the Linux tarball and configuration
       # the kernel was built from. A source that cannot be fetched and verified fails
       # the build, because a published image without its source is what this
