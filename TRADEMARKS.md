@@ -1,12 +1,12 @@
 # Trademarks
 
-billet's code is yours to use under its licenses; its name is not. This file says what you may do with the name without asking, and what needs permission first. It grants nothing the licenses withhold, and it is not legal advice.
+billet's code is yours to use under its licenses; its name is not. This file says what you may do with the name without asking, and what needs permission first. It adds permissions to use the name; it does not change the software licenses or restrict anything they or the law already allow. It is not legal advice.
 
 ## What it covers
 
 The mark is the word **billet**, in any capitalisation, as the name of this software and of anything offered around it. It belongs to Junior Yono. It is not registered: where a symbol is used it is billet™, and never ®, which is reserved for a registered mark.
 
-Neither license passes it on. The Apache License 2.0 says so itself (section 6), and [the billet Enterprise License](ee/LICENSE) grants no right to the name either. The policy also covers names close enough to be mistaken for it: obvious variations, misspellings and abbreviations, and "billet" combined with other words.
+The licenses do not pass it on. The Apache License 2.0 (section 6) allows the name only as far as describing where the work came from and reproducing its `NOTICE` file need it, and [the billet Enterprise License](ee/LICENSE) grants no right to the name at all. The policy also covers names close enough to be mistaken for it: obvious variations, misspellings and abbreviations, and "billet" combined with other words.
 
 ## The one rule
 
@@ -23,7 +23,7 @@ Anyone who meets the name where you used it must be able to tell what they are g
 
 ## What needs written permission
 
-- **Using the name for your own product.** A fork, a modified distribution or another product may not be called billet, or by a name containing it ("billet Pro", "OpenBillet", "billet-ng").
+- **Using the name for your own product.** Apart from a distribution package that meets the packaging conditions above, a fork, a modified distribution or another product may not be called billet, or by a name containing it ("billet Pro", "OpenBillet", "billet-ng").
 - **A hosted or managed service under the name.** "billet Cloud", "Managed billet", or any name that suggests the official service. A service may say it runs billet, as above.
 - **The name in your own identity.** A company, domain, registry package, organisation, account or app name built on the name, beyond the packaging and the technical identifiers above.
 - **Merchandise for sale.**
@@ -31,7 +31,7 @@ Anyone who meets the name where you used it must be able to tell what they are g
 
 ## Forking
 
-Give the fork its own name, and use it in the repository's description, its documentation and its releases. Keep `LICENSE` and `NOTICE` as the Apache License requires, and say where it came from: "forked from billet", with a link. The technical identifiers may stay.
+Give the fork its own name, and use it in the repository's description, its documentation and its releases. The Apache License's own notice requirements still apply to the code. Saying where the fork came from ("forked from billet", with a link) is welcome and is one of the uses above, but this policy does not require it. The technical identifiers may stay.
 
 ## Asking for permission
 
