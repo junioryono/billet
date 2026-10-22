@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -160,14 +161,16 @@ type gitProxy struct {
 	binary string
 	client *http.Client
 	// fullFraction is gitFullFraction, refreshWait gitRefreshWait, idleLimit
-	// gitIdleLimit, firstLineWait gitFirstLineWait and requestLimit
-	// gitRequestLimit: fields so a test is decided by neither the fill of the
-	// disk it runs on nor the clock nor its memory.
+	// gitIdleLimit, firstLineWait gitFirstLineWait, requestLimit
+	// gitRequestLimit and narrowMost gitNarrowMost: fields so a test is decided
+	// by neither the fill of the disk it runs on nor the clock nor its memory,
+	// and can make a refresh whole.
 	fullFraction  float64
 	refreshWait   time.Duration
 	idleLimit     time.Duration
 	firstLineWait time.Duration
 	requestLimit  int64
+	narrowMost    int
 
 	fetches chan struct{}
 	work    chan struct{}
@@ -222,10 +225,13 @@ type gitAuthorisation struct {
 }
 
 type gitMirror struct {
-	// mu guards refreshing, the one refresh in flight; use is held for reading
-	// while a mirror is served or refreshed and for writing while it is removed.
+	// mu guards refreshing, the one refresh in flight, and fetchedAt, the last
+	// question to GitHub asked when a refresh last finished; use is held for
+	// reading while a mirror is served or refreshed and for writing while it is
+	// removed.
 	mu         sync.Mutex
 	refreshing *gitRefresh
+	fetchedAt  uint64
 	use        sync.RWMutex
 }
 
@@ -252,6 +258,7 @@ func newGitProxy(root string) *gitProxy {
 		idleLimit:     gitIdleLimit,
 		firstLineWait: gitFirstLineWait,
 		requestLimit:  gitRequestLimit,
+		narrowMost:    gitNarrowMost,
 		fetches:       make(chan struct{}, gitFetches),
 		work:          make(chan struct{}, gitWork),
 		mirrors:       make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
@@ -899,6 +906,15 @@ func (g *gitProxy) ask() uint64 {
 	return g.sequence
 }
 
+// asked is the number of the last question asked so far: every question asked
+// after this call is numbered above it.
+func (g *gitProxy) asked() uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.sequence
+}
+
 // remember records GitHub's answer to question sequence: a grant for
 // gitAuthorisationAge for the repository GitHub said the name is (zero when
 // that could not be learned), or, with granted false, the end of any earlier
@@ -1067,7 +1083,7 @@ func (s *CacheService) gitAdvertise(ctx context.Context, exchange *gitExchange, 
 	s.git.remember(request, s.now(), sequence, true, repository)
 
 	s.gitBegin(request.session)
-	advertisement, existed, err := s.refreshMirror(ctx, request, repository, resp.Body)
+	advertisement, existed, err := s.refreshMirror(ctx, request, repository, sequence, resp.Body)
 	s.noteGit(request.session, err, existed)
 	if err != nil {
 		exchange.answered(gitRouteGitHub, gitMirrorUnavailable, err.Error())
@@ -1201,7 +1217,7 @@ func (s *CacheService) gitBegin(session *cacheSession) {
 // before GitHub answered it may leave refs GitHub has since moved, so the refs
 // are compared again after it and another is started while time remains.
 func (s *CacheService) refreshMirror(
-	ctx context.Context, request gitRequest, repository int64, upstream []byte,
+	ctx context.Context, request gitRequest, repository int64, sequence uint64, upstream []byte,
 ) ([]byte, bool, error) {
 	key := request.key()
 	s.git.mu.Lock()
@@ -1243,7 +1259,7 @@ func (s *CacheService) refreshMirror(
 		if refreshes == 2 {
 			return nil, existed, errors.New("the mirror's refs still differ from github.com's after a refresh")
 		}
-		refresh := s.startRefresh(ctx, request, repository, mirror, head)
+		refresh := s.startRefresh(ctx, request, repository, mirror, head, refs, sequence)
 		select {
 		case <-refresh.done:
 			if refresh.err != nil {
@@ -1545,9 +1561,11 @@ var errGitClosed = errors.New("the git cache is closing")
 // startRefresh is the mirror's refresh in flight, or a new one started for
 // request: a fetch to GitHub's refs of the repository GitHub said the name is,
 // with request's header, which no client's departure ends; only gitRefreshLife
-// or the proxy's close does.
+// or the proxy's close does. refs is GitHub's advertisement to request, which
+// says what moved; nil fetches every ref.
 func (s *CacheService) startRefresh(
 	ctx context.Context, request gitRequest, repository int64, mirror *gitMirror, head string,
+	refs map[string]string, sequence uint64,
 ) *gitRefresh {
 	// NONE STARTS ONCE close HAS BEGUN TO WAIT, which would let it outlive the
 	// state directory it writes.
@@ -1583,7 +1601,7 @@ func (s *CacheService) startRefresh(
 			case <-ctx.Done():
 			}
 		}()
-		err := s.refresh(ctx, request, repository, mirror, head)
+		err := s.refresh(ctx, request, repository, mirror, head, refs, sequence)
 		// CLEARED BEFORE IT IS ANNOUNCED, so a waiter that finds the refs still
 		// short starts the next refresh rather than joining this finished one.
 		mirror.mu.Lock()
@@ -1597,16 +1615,33 @@ func (s *CacheService) startRefresh(
 }
 
 // refresh fetches the mirror to GitHub's refs with request's header, and
-// removes it, marked, once it passes the tier's ceiling.
+// removes it, marked, once it passes the tier's ceiling. sequence orders refs
+// among GitHub's answers.
+//
+// AN ADVERTISEMENT ASKED FOR BEFORE THE MIRROR'S LAST REFRESH FINISHED is
+// fetched whole, to GitHub's refs as they are now: that refresh may have
+// brought refs GitHub made after the advertisement was answered, and read
+// narrowly each would look dropped and be removed. Only an advertisement asked
+// for after it says what the mirror lacks.
 func (s *CacheService) refresh(
 	ctx context.Context, request gitRequest, repository int64, mirror *gitMirror, head string,
+	refs map[string]string, sequence uint64,
 ) error {
 	key := request.key()
 	path := s.git.mirrorPath(key)
 	started := s.now()
+	mirror.mu.Lock()
+	if sequence <= mirror.fetchedAt {
+		refs = nil
+	}
+	mirror.mu.Unlock()
 	mirror.use.RLock()
-	err := s.refreshHeld(ctx, request, repository, path, head)
+	plan, err := s.refreshHeld(ctx, request, repository, path, head, refs)
 	mirror.use.RUnlock()
+	// RECORDED WHATEVER THE OUTCOME: a failed fetch may have moved refs too.
+	mirror.mu.Lock()
+	mirror.fetchedAt = s.git.asked()
+	mirror.mu.Unlock()
 	// REMOVED UNDER THE EXCLUSIVE LOCK, once this refresh's own hold is gone,
 	// so no fetch being served loses its repository mid-pack.
 	if errors.Is(err, errMirrorTooLarge) {
@@ -1630,40 +1665,51 @@ func (s *CacheService) refresh(
 	took = took.Round(time.Millisecond)
 	if err != nil {
 		s.log.Info("could not refresh a git mirror; github.com serves what it lacks",
-			"repository", request.name(), "took", took, "error", err)
+			"repository", request.name(), "took", took, "fetched", plan, "error", err)
 
 		return err
 	}
-	s.log.Info("refreshed a git mirror", "repository", request.name(), "took", took)
+	s.log.Info("refreshed a git mirror", "repository", request.name(), "took", took, "fetched", plan)
 
 	return nil
 }
 
-// refreshHeld is refresh's work, with the mirror held for reading.
-func (s *CacheService) refreshHeld(ctx context.Context, request gitRequest, repository int64, path, head string) error {
+// refreshHeld is refresh's work, with the mirror held for reading, and what it
+// fetched.
+func (s *CacheService) refreshHeld(
+	ctx context.Context, request gitRequest, repository int64, path, head string, refs map[string]string,
+) (gitFetchPlan, error) {
+	plan := gitFetchPlan{}
 	if full, statErr := filledAbove(s.git.root, s.git.fullFraction); statErr == nil && full {
 		s.wakeGitReaper(ctx)
 
-		return errGitDiskFull
+		return plan, errGitDiskFull
 	}
 	// NEVER FETCHED INTO ANOTHER REPOSITORY'S MIRROR, nor one left unverified:
 	// the claim removes either, and a refresh that finds one meanwhile leaves
 	// it to be removed.
 	if stamped, exists, err := mirrorRepository(path); exists && (err != nil || stamped != repository) {
-		return errors.Join(errors.New("the mirror is another repository's or unverified"), err)
+		return plan, errors.Join(errors.New("the mirror is another repository's or unverified"), err)
 	}
 	// THE ONLY WRITER IS THIS REFRESH, one per mirror at a time, so a lock file
 	// or a half-written pack found now was left by one that was killed, and
 	// would refuse every fetch after it.
 	if err := clearStaleGitWrites(path); err != nil {
-		return err
+		return plan, err
 	}
-	err := s.fetchMirror(ctx, path, request, repository, volumeCeiling(sessionSetting(request.session, config.CacheGit)))
+	// THE MIRROR'S REFS ARE READ HERE, under the refresh that alone writes them,
+	// so what moved is measured against what the mirror holds now. A mirror
+	// whose refs cannot be read is fetched whole.
+	if current, err := s.mirrorRefs(ctx, path); err == nil && refs != nil {
+		plan = planGitFetch(current, refs, head, s.git.narrowMost)
+	}
+	plan, err := s.fetchMirror(ctx, path, request, repository,
+		volumeCeiling(sessionSetting(request.session, config.CacheGit)), plan)
 	if err == nil && head != "" && strings.HasPrefix(head, "refs/") {
 		_, err = s.runGit(ctx, path, nil, "symbolic-ref", "HEAD", head)
 	}
 	if err != nil {
-		return err
+		return plan, err
 	}
 	// THE NAME WAS FETCHED, NOT THE ID: GitHub serves git by name alone
 	// (`/repositories/<id>` is not found over git, 2026-10-21). The mirror
@@ -1674,17 +1720,107 @@ func (s *CacheService) refreshHeld(ctx context.Context, request gitRequest, repo
 	after, err := s.repositoryID(ctx, request)
 	switch {
 	case err != nil:
-		return fmt.Errorf("%w: could not verify which repository was fetched: %w", errFetchNotVerified, err)
+		return plan, fmt.Errorf("%w: could not verify which repository was fetched: %w", errFetchNotVerified, err)
 	case after != repository:
-		return fmt.Errorf("%w: the name became repository %d while the mirror of %d was fetched",
+		return plan, fmt.Errorf("%w: the name became repository %d while the mirror of %d was fetched",
 			errFetchNotVerified, after, repository)
 	}
 	if err := markVerified(path); err != nil {
-		return err
+		return plan, err
 	}
 	s.markMirrorUsed(path)
 
-	return nil
+	return plan, nil
+}
+
+// gitNarrowMost is the most refs a refresh fetches or removes by name; a mirror
+// further from GitHub's refs than that is fetched whole.
+const gitNarrowMost = 256
+
+// gitFetchPlan is what one refresh fetches: every ref, pruning what GitHub no
+// longer has; or, when narrow, only the refs GitHub's advertisement moved or
+// added, negotiated from tips, and the refs it dropped removed by name.
+type gitFetchPlan struct {
+	narrow bool
+	// moved is the refs to fetch, each by its own name.
+	moved []string
+	// tips is what the mirror held of the moved refs and of the default
+	// branch, the objects git offers GitHub as what it has.
+	tips []string
+	// gone is the refs GitHub no longer has, with the object each named.
+	gone map[string]string
+}
+
+// String is what the refresh's line says it fetched.
+func (p gitFetchPlan) String() string {
+	if !p.narrow {
+		return "every ref"
+	}
+
+	return fmt.Sprintf("%d refs moved, %d gone", len(p.moved), len(p.gone))
+}
+
+// planGitFetch is the fetch that brings a mirror holding current to GitHub's
+// refs, whose HEAD names head: only what moved, unless the mirror is empty, a
+// name is not one billet puts on a command line, or more than most refs differ.
+//
+// THE DEFAULT BRANCH IS ALWAYS A TIP, with the old value of every moved ref: a
+// new branch has no old value, and a rebased one shares no history with its
+// old value past where it left the default branch, so without the default
+// branch's tip git offers nothing GitHub can build on and the fetch brings the
+// whole history again.
+func planGitFetch(current, upstream map[string]string, head string, most int) gitFetchPlan {
+	if len(current) == 0 {
+		return gitFetchPlan{}
+	}
+	plan := gitFetchPlan{narrow: true, gone: make(map[string]string)}
+	tips := make(map[string]bool)
+	for name, object := range upstream {
+		if current[name] == object {
+			continue
+		}
+		if !narrowRefName(name) {
+			return gitFetchPlan{}
+		}
+		plan.moved = append(plan.moved, name)
+		if old, ok := current[name]; ok {
+			tips[old] = true
+		}
+	}
+	for name, object := range current {
+		if _, ok := upstream[name]; !ok {
+			plan.gone[name] = object
+		}
+	}
+	if len(plan.moved)+len(plan.gone) > most {
+		return gitFetchPlan{}
+	}
+	if old, ok := current[head]; ok {
+		tips[old] = true
+	}
+	slices.Sort(plan.moved)
+	plan.tips = slices.Sorted(maps.Keys(tips))
+
+	return plan
+}
+
+// narrowRefName is whether name is a ref billet fetches by name: a refspec on
+// git's command line, so nothing git would read as an option, a pattern, a
+// revision expression or the refspec's own separator.
+func narrowRefName(name string) bool {
+	rest, ok := strings.CutPrefix(name, "refs/")
+	if !ok || rest == "" || strings.HasSuffix(name, "/") || strings.HasSuffix(name, ".") ||
+		strings.HasSuffix(name, ".lock") || strings.Contains(name, "..") || strings.Contains(name, "@{") ||
+		strings.Contains(name, "//") {
+		return false
+	}
+	for _, r := range name {
+		if r <= ' ' || r == 0x7f || strings.ContainsRune(":~^?*[\\", r) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // clearStaleGitWrites removes what a killed git fetch leaves in a mirror: lock
@@ -1777,37 +1913,42 @@ func (s *CacheService) mirrorRefs(ctx context.Context, path string) (map[string]
 // BOUNDED WHILE IT RUNS, not only after: a node-wide slot caps the fetches in
 // flight, and a watchdog stops one whose mirror passes the tier's ceiling or
 // whose filesystem passes its fill, before either can exhaust the node's disk.
+//
+// A NARROW FETCH THAT FAILS IS DONE AGAIN WHOLE, which is what every refresh
+// did before there was a narrow one: a ref GitHub dropped after it advertised
+// it refuses a fetch that names it. The plan returned is what was fetched.
 func (s *CacheService) fetchMirror(
-	ctx context.Context, path string, request gitRequest, repository int64, ceiling int64,
-) error {
+	ctx context.Context, path string, request gitRequest, repository int64, ceiling int64, plan gitFetchPlan,
+) (gitFetchPlan, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, gitFetchWait)
 	release, err := admitGit(waitCtx, request.session.gitFetch, s.git.fetches)
 	cancel()
 	if err != nil {
-		return errFetchSlotsBusy
+		return plan, errFetchSlotsBusy
 	}
 	defer release()
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		plan = gitFetchPlan{}
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return err
+			return plan, err
 		}
 		if _, err := s.runGit(ctx, filepath.Dir(path), nil, "init", "--bare", "--quiet", path); err != nil {
-			return err
+			return plan, err
 		}
 		if err := os.WriteFile(filepath.Join(path, gitUsedStamp), nil, 0o600); err != nil {
-			return err
+			return plan, err
 		}
 		// STAMPED BEFORE ANY OBJECT ARRIVES, so a mirror is never without the
 		// repository it is; one a crash left unstamped is removed by the next claim.
 		if err := os.WriteFile(filepath.Join(path, gitIdentityStamp),
 			[]byte(strconv.FormatInt(repository, 10)+"\n"), 0o600); err != nil {
-			return err
+			return plan, err
 		}
 	}
 	// UNVERIFIED BEFORE A BYTE ARRIVES, verified by the caller only once GitHub
 	// names the same repository after the fetch.
 	if err := markUnverified(path); err != nil {
-		return err
+		return plan, err
 	}
 	var secret []string
 	if request.auth != "" {
@@ -1841,20 +1982,63 @@ func (s *CacheService) fetchMirror(
 			}
 		}
 	}()
-	_, err = s.runGit(watched, path, secret, append(slices.Clone(gitFetchConfig),
-		"fetch", "--prune", "--quiet", "--no-write-fetch-head", "--no-show-forced-updates",
-		s.git.upstream+"/"+request.owner+"/"+request.repo+".git", "+refs/*:refs/*")...)
+	remote := s.git.upstream + "/" + request.owner + "/" + request.repo + ".git"
+	err = s.fetchRefs(watched, path, secret, remote, plan)
+	if err != nil && plan.narrow && context.Cause(watched) == nil {
+		s.log.Info("a narrow git fetch failed; fetching every ref", "repository", request.name(), "error", err)
+		plan = gitFetchPlan{}
+		err = s.fetchRefs(watched, path, secret, remote, plan)
+	}
 	if cause := context.Cause(watched); cause != nil && !errors.Is(cause, context.Canceled) {
-		return cause
+		return plan, cause
 	}
 	if err != nil {
-		return err
+		return plan, err
 	}
 	if size, err := directorySize(path); err != nil || size > ceiling {
-		return errors.Join(errMirrorTooLarge, err)
+		return plan, errors.Join(errMirrorTooLarge, err)
 	}
 
-	return nil
+	return plan, nil
+}
+
+// fetchRefs runs plan's fetch from remote into the mirror at path.
+//
+// A NARROW PLAN REMOVES THE REFS GITHUB DROPPED FIRST, each only while it still
+// names what the plan saw, so a new ref can take the place of one dropped
+// (refs/heads/a/b where refs/heads/a was), as a pruning fetch's would.
+func (s *CacheService) fetchRefs(ctx context.Context, path string, secret []string, remote string, plan gitFetchPlan) error {
+	if !plan.narrow {
+		_, err := s.runGit(ctx, path, secret, append(slices.Clone(gitFetchConfig),
+			"fetch", "--prune", "--quiet", "--no-write-fetch-head", "--no-show-forced-updates",
+			remote, "+refs/*:refs/*")...)
+
+		return err
+	}
+	if len(plan.gone) > 0 {
+		var deletes bytes.Buffer
+		for _, name := range slices.Sorted(maps.Keys(plan.gone)) {
+			fmt.Fprintf(&deletes, "delete %s %s\n", name, plan.gone[name])
+		}
+		if _, err := s.runGitInput(ctx, path, nil, deletes.Bytes(), "update-ref", "--stdin"); err != nil {
+			return err
+		}
+	}
+	if len(plan.moved) == 0 {
+		return nil
+	}
+	args := append(slices.Clone(gitFetchConfig),
+		"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-show-forced-updates")
+	for _, tip := range plan.tips {
+		args = append(args, "--negotiation-tip="+tip)
+	}
+	args = append(args, "--", remote)
+	for _, name := range plan.moved {
+		args = append(args, "+"+name+":"+name)
+	}
+	_, err := s.runGit(ctx, path, secret, args...)
+
+	return err
 }
 
 // wakeGitReaper reaps unused mirrors now rather than at the next maintenance
@@ -1925,9 +2109,17 @@ func killGroup(cmd *exec.Cmd) {
 // runGit runs git in dir with a closed environment: no system or global
 // configuration, no prompt, protocol v0, and only what extra adds.
 func (s *CacheService) runGit(ctx context.Context, dir string, extra []string, args ...string) ([]byte, error) {
-	//nolint:gosec // G204: the node's configured git, with billet's own arguments and owner/repo segments gitSegment admitted
+	return s.runGitInput(ctx, dir, extra, nil, args...)
+}
+
+// runGitInput is runGit with input on git's standard input.
+func (s *CacheService) runGitInput(ctx context.Context, dir string, extra []string, input []byte, args ...string) ([]byte, error) {
+	//nolint:gosec // G204: the node's configured git, with billet's own arguments, owner/repo segments gitSegment admitted and ref names narrowRefName admitted
 	cmd := exec.CommandContext(ctx, s.git.binary, args...)
 	killGroup(cmd)
+	if input != nil {
+		cmd.Stdin = bytes.NewReader(input)
+	}
 	cmd.Dir = dir
 	cmd.Env = append([]string{
 		"PATH=" + os.Getenv("PATH"), "HOME=" + s.git.root, "GIT_CONFIG_NOSYSTEM=1",

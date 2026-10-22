@@ -83,6 +83,26 @@ type gitUpstream struct {
 	nextID   atomic.Int64
 	apiDown  atomic.Bool
 	apiCalls atomic.Int64
+	// mirrorRequests is the body of every request the node's own git made,
+	// ls-refs and fetch alike, in order.
+	mirrorMu       sync.Mutex
+	mirrorRequests []string
+}
+
+func (u *gitUpstream) recordMirrorRequest(body []byte) {
+	u.mirrorMu.Lock()
+	defer u.mirrorMu.Unlock()
+	u.mirrorRequests = append(u.mirrorRequests, string(body))
+}
+
+// takeMirrorRequests is what the node's own git asked since the last take.
+func (u *gitUpstream) takeMirrorRequests() []string {
+	u.mirrorMu.Lock()
+	defer u.mirrorMu.Unlock()
+	taken := u.mirrorRequests
+	u.mirrorRequests = nil
+
+	return taken
 }
 
 // repositoryID is the id GitHub's API gives a name, a new one the first time
@@ -271,6 +291,9 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 						return
 					}
 				}
+			}
+			if bytes.Contains(plain, []byte("command=")) {
+				upstream.recordMirrorRequest(plain)
 			}
 			if bytes.Contains(plain, []byte("command=fetch")) || bytes.Contains(plain, []byte("want ")) {
 				upstream.fetches.Add(1)
@@ -880,7 +903,9 @@ func TestAFetchIsStoppedWhileItRunsAtTheCeiling(t *testing.T) {
 		owner: "acme", repo: "api"}
 
 	err := gitWithin(t, "a fetch past its ceiling", func() error {
-		return service.fetchMirror(t.Context(), service.git.mirrorPath(request.key()), request, 7, 1)
+		_, err := service.fetchMirror(t.Context(), service.git.mirrorPath(request.key()), request, 7, 1, gitFetchPlan{})
+
+		return err
 	})
 	if !errors.Is(err, errMirrorTooLarge) {
 		t.Fatalf("fetchMirror = %v, want errMirrorTooLarge", err)
