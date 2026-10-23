@@ -49,6 +49,12 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 				note("defer stop", n.Pos())
 			}
 		case *ast.AssignStmt:
+			// THE OPTION IS KEPT IN THE SLICE THE RUNNER IS BUILT FROM, not discarded.
+			if n.Tok == token.ASSIGN && len(n.Lhs) == 1 && len(n.Rhs) == 1 &&
+				types.ExprString(n.Lhs[0]) == "runnerOpts" &&
+				types.ExprString(n.Rhs[0]) == "append(runnerOpts, node.WithPower(powerCtl))" {
+				note("node.WithPower", n.Pos())
+			}
 			// ASSIGNED TO THE closePower BOTH DEFERS CALL, not shadowed or discarded.
 			if n.Tok == token.ASSIGN && len(n.Lhs) == 1 && len(n.Rhs) == 1 &&
 				types.ExprString(n.Lhs[0]) == "closePower" {
@@ -63,8 +69,8 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 				if len(n.Args) == 5 && types.ExprString(n.Args[4]) == "n.powered" {
 					note(name, n.Pos())
 				}
-			case "node.WithPower":
-				if len(n.Args) == 1 && types.ExprString(n.Args[0]) == "powerCtl" {
+			case "NewNodeRunner":
+				if n.Ellipsis.IsValid() && types.ExprString(n.Args[len(n.Args)-1]) == "runnerOpts" {
 					note(name, n.Pos())
 				}
 			case "runNodePower":
@@ -72,7 +78,7 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 					types.ExprString(n.Args[3]) == "closePower" {
 					note(name, n.Pos())
 				}
-			case "startNodeCache", "NewNodeRunner", "RunNodeLoop":
+			case "startNodeCache", "RunNodeLoop":
 				note(name, n.Pos())
 			}
 		}
