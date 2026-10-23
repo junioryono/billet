@@ -7,6 +7,20 @@ import (
 	"testing"
 )
 
+// A RUN WITH ONE SHARED CPU IS REFUSED WHOLE: four guests, one overlapping
+// pair, and the answer names the cpu and both guests.
+func TestARunWithOneSharedCPUIsRefused(t *testing.T) {
+	t.Parallel()
+
+	if err := sharedCPUs([]string{"0-1", "8-9", "16-17", "24-25"}); err != nil {
+		t.Fatalf("disjoint guests refused: %v", err)
+	}
+	err := sharedCPUs([]string{"0-1", "1-2", "16-17", "24-25"})
+	if err == nil || !strings.Contains(err.Error(), "cpu 1 is placed under guest 0 and guest 1") {
+		t.Fatalf("one shared cpu answered %v, want it named with both guests", err)
+	}
+}
+
 // THE EXPERIMENT'S PINNING CHECK REFUSES A VMM OUTSIDE THE CGROUP IT NAMES,
 // even when that cgroup's cpuset matches the claim, and a cpuset that does not.
 func TestThePinningCheckProvesMembershipAndTheCPUSet(t *testing.T) {

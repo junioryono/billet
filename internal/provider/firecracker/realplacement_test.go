@@ -237,23 +237,16 @@ func TestRealPlacementExperiment(t *testing.T) {
 	wg.Wait()
 	finished := time.Now()
 	// NO CPU IS HELD BY TWO GUESTS AT ONCE, which is what a placement promises;
-	// a run that broke it is written as failed, so no comparison takes it in.
+	// a run that broke it is written as failed on every guest, since its energy
+	// is the whole host's and its load is every guest's.
 	if placement != "" {
-		owner := map[int]int{}
+		cpus := make([]string, len(guests))
 		for i, g := range guests {
-			cpus, err := parseCPUList(g.cpus)
-			if err != nil {
-				g.err = errors.Join(g.err, fmt.Errorf("its cpus %q: %w", g.cpus, err))
-
-				continue
-			}
-			for _, cpu := range cpus {
-				if j, held := owner[cpu]; held {
-					shared := fmt.Errorf("cpu %d is placed under guest %d and guest %d", cpu, j, i)
-					guests[j].err = errors.Join(guests[j].err, shared)
-					g.err = errors.Join(g.err, shared)
-				}
-				owner[cpu] = i
+			cpus[i] = g.cpus
+		}
+		if err := sharedCPUs(cpus); err != nil {
+			for _, g := range guests {
+				g.err = errors.Join(g.err, err)
 			}
 		}
 	}
@@ -413,6 +406,29 @@ func cgroupConfines(procRoot, cgroupRoot string, pid int, cgroupDir, claimed str
 	}
 
 	return nil
+}
+
+// sharedCPUs refuses a run in which a cpu is placed under two guests, or a
+// guest's cpu list cannot be read.
+func sharedCPUs(byGuest []string) error {
+	owner := map[int]int{}
+	var errs []error
+	for i, list := range byGuest {
+		cpus, err := parseCPUList(list)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("guest %d's cpus %q: %w", i, list, err))
+
+			continue
+		}
+		for _, cpu := range cpus {
+			if j, held := owner[cpu]; held {
+				errs = append(errs, fmt.Errorf("cpu %d is placed under guest %d and guest %d", cpu, j, i))
+			}
+			owner[cpu] = i
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // vmmCleanExit is the line a Firecracker VMM logs when it exits because its
