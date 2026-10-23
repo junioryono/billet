@@ -226,15 +226,23 @@ func pendingPublication(attachment *cacheAttachment) bool {
 func (s *CacheService) sessionKindAllowed(ctx context.Context, session *cacheSession,
 	kind config.CacheKind,
 ) bool {
+	return s.sessionKindPolicy(ctx, session, kind) == policyAllowed
+}
+
+// sessionKindPolicy is sessionKindAllowed's answer with could-not-tell kept
+// apart.
+func (s *CacheService) sessionKindPolicy(ctx context.Context, session *cacheSession,
+	kind config.CacheKind,
+) policyAnswer {
 	// A SESSION WITH NO REPOSITORY IS NOTHING A KILL SWITCH CAN NAME: blocks are
 	// by repository or by its owner, and the ledger answers only for a
 	// repository. A trusted-only tier without a cache scope is one.
 	owner, repository := session.cacheOwner(), session.cacheRepository()
 	if owner == "" || repository == "" {
-		return true
+		return policyAllowed
 	}
 
-	return s.kindAllowed(ctx, kind, owner, repository)
+	return s.kindPolicy(ctx, kind, owner, repository)
 }
 
 // volumeCeiling is the largest volume a cache setting admits.
@@ -302,25 +310,47 @@ func (s *CacheService) volumeSize(
 	return size, true
 }
 
+// policyAnswer is what the kill switch said about a cache. The zero value is
+// could-not-tell.
+type policyAnswer int
+
+const (
+	policyUnknown policyAnswer = iota
+	policyAllowed
+	policyRefused
+)
+
 // kindAllowed asks the kill switch about one cache for a repository. Could not
 // tell is refused: a publication the switch might forbid does not happen.
 func (s *CacheService) kindAllowed(ctx context.Context, kind config.CacheKind,
 	owner, repository string,
 ) bool {
+	return s.kindPolicy(ctx, kind, owner, repository) == policyAllowed
+}
+
+// kindPolicy is kindAllowed's answer with could-not-tell kept apart, for a
+// caller that records what the cache did: an unreadable switch is not one that
+// refused.
+func (s *CacheService) kindPolicy(ctx context.Context, kind config.CacheKind,
+	owner, repository string,
+) policyAnswer {
 	if s.policy == nil {
-		return true
+		return policyAllowed
 	}
 	policyCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
 	defer cancel()
 	allowed, err := s.policy.CacheAllowed(policyCtx, kind, owner, repository)
-	if err != nil {
-		s.log.Warn("the cache kill switch could not be read; the cache is treated as disabled",
+	switch {
+	case err != nil:
+		s.log.Warn("the cache kill switch could not be read; the cache is not used",
 			"kind", kind, "owner", owner, "repository", repository, "error", err)
 
-		return false
+		return policyUnknown
+	case allowed:
+		return policyAllowed
+	default:
+		return policyRefused
 	}
-
-	return allowed
 }
 
 func attachmentKind(attachment *cacheAttachment) config.CacheKind {
