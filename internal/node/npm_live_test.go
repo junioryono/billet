@@ -119,16 +119,11 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(work, "package.json"), []byte(npmLivePackages), 0o644); err != nil {
 		t.Fatalf("write package.json: %v", err)
 	}
-	addresses, err := net.DefaultResolver.LookupHost(t.Context(), npmRegistryHost)
-	if err != nil || len(addresses) == 0 {
-		t.Fatalf("resolve the registry for the relay's fallback: %v", err)
-	}
-	var fallback []string
-	for _, address := range addresses {
-		if ip := net.ParseIP(address); ip != nil && ip.To4() != nil {
-			fallback = append(fallback, address)
-		}
-	}
+	// THE RELAY IS GIVEN NOWHERE TO FAIL OPEN TO, unlike a guest's: a tunnel the
+	// node refused would otherwise reach the registry directly, make no request
+	// from the node and look exactly like a warm answer. Here every fetch goes
+	// through the node or fails the run.
+	fallback := ""
 
 	upstream := map[string]int64{}
 	answers := map[string]map[string]int{}
@@ -167,7 +162,16 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 		before := requests.Load()
 		logged := len(logs.String())
 		started := time.Now()
-		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Minute)
+		// BOUNDED BY THE TEST'S OWN DEADLINE, less a margin for the removal below:
+		// the test binary's watchdog ends the process without running cleanups.
+		limit := 15 * time.Minute
+		if deadline, ok := t.Deadline(); ok {
+			limit = min(limit, time.Until(deadline)-2*time.Minute)
+		}
+		if limit <= 0 {
+			t.Fatalf("%s: no time is left before the test's deadline to run and clean up a container", job)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), limit)
 		defer cancel()
 		// NAMED, AND REMOVED HOWEVER THE RUN ENDS: a cancelled docker CLI does not
 		// stop the container the daemon runs, which would keep the npm loopback
@@ -189,7 +193,7 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 			"-v", work+":/work",
 			"-e", "NODE_EXTRA_CA_CERTS=/work/ca.pem",
 			"-e", "BILLET_NPM_PROXY="+credentials.NpmProxy,
-			"-e", "BILLET_NPM_FALLBACK="+strings.Join(fallback, ","),
+			"-e", "BILLET_NPM_FALLBACK="+fallback,
 			"-e", "BILLET_OWNER="+strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
 			npmLiveImage, "bash", "-c", shell)
 		output, err := command.CombinedOutput()
