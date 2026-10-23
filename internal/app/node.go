@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeending"
+	"github.com/junioryono/billet/internal/power"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/codebuild"
 	"github.com/junioryono/billet/internal/provider/docker"
@@ -67,6 +69,10 @@ type Node struct {
 	// gitObserved is what the Git proxy reports to, set by GitMetrics' source
 	// when the node serves metrics and nil, which reports nowhere, when not.
 	gitObserved node.GitObserver
+	// powered is what the idle power policy reports to, set by PowerMetrics'
+	// source when the node serves metrics and nil, which reports nowhere, when
+	// not.
+	powered power.Observer
 }
 
 // OpenNode loads the certificate this node presents, claims the deployment
@@ -314,6 +320,13 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// bound out of a handover's leases.
 	drainRequested := latchedDrainRequest(host.DrainRequested)
 
+	// BEFORE ANYTHING ELSE TOUCHES THE HOST, a cap an earlier process left is
+	// restored, and a node.power this host cannot honour is refused.
+	powerCtl, err := openNodePower(ctx, cfg, sysfsRoot, runtime.GOOS, n.powered)
+	if err != nil {
+		return err
+	}
+
 	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, n.deployment, n.client,
 		nodeCacheSweepWaitFor(handOver, drainRequested), nodeCacheStopGrace(handOver))
 	if err != nil {
@@ -361,8 +374,17 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return err
 	}
 	runnerOpts = append(runnerOpts, monitorOpts...)
+	if powerCtl != nil {
+		runnerOpts = append(runnerOpts, node.WithPower(powerCtl))
+	}
 
 	runner := NewNodeRunner(n.client, cfg.Node.Name, p, slog.Default(), runnerOpts...)
+
+	// RESTORED ON EVERY RETURN FROM HERE, a drain, a handoff and a failure alike.
+	if powerCtl != nil {
+		stopPower := runNodePower(ctx, powerCtl, func() bool { return !runner.Holding() })
+		defer stopPower()
+	}
 
 	fmt.Fprintf(host.Out, "billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
 

@@ -146,6 +146,9 @@ type Runner struct {
 	// upgrader replaces this node's own billet. Nil means it cannot, which the
 	// upgrade command reports rather than silently ignoring.
 	upgrader Upgrader
+	// power puts back the host's full CPU ceiling before a launch; nil on a
+	// node with no idle power policy.
+	power PowerRestorer
 
 	// tending serializes Tend, which mutates custody entries in place and issues
 	// backend calls between reads. Separate from mu, which guards the map itself
@@ -294,6 +297,19 @@ func (r *Runner) leaseForInstance(name string) (string, int64, bool) {
 	return "", 0, false
 }
 
+// PowerRestorer puts back the host's full CPU ceiling before a launch starts
+// its compute. It waits a short bound at most and refuses nothing: a launch on
+// a host still capped runs slower, not wrong. internal/power satisfies it.
+type PowerRestorer interface {
+	RestoreBeforeLaunch(ctx context.Context, lease string)
+}
+
+// WithPower restores the host's CPU ceiling on every launch, before the
+// provider is asked to start anything.
+func WithPower(p PowerRestorer) Option {
+	return func(r *Runner) { r.power = p }
+}
+
 // WithRegistryMirrors gives managed guests their site's public pull-through caches.
 func WithRegistryMirrors(mirrors config.RegistryMirrors) Option {
 	return func(r *Runner) { r.registryMirrors = mirrors }
@@ -428,6 +444,13 @@ func (r *Runner) Launch(
 	// something with the lease.
 	stopHolding := r.holdWhileLaunching(lease, provider.InstanceName(lease.ID))
 	defer stopHolding()
+
+	// THE FULL CPU CEILING BEFORE THE VMM, and after the hold above: the hold is
+	// what makes this node busy to the idle policy, so no cap can land between
+	// this restore and the compute starting. Bounded, and never a refusal.
+	if r.power != nil {
+		r.power.RestoreBeforeLaunch(ctx, lease.ID)
+	}
 
 	setID, err := r.scaleSetID(ctx, tier)
 	if err != nil {
