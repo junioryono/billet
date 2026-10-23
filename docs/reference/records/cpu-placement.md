@@ -14,7 +14,7 @@ What placing microVMs on host cpus, and capping the cpu while a node is idle, di
   - `gostd` is `go build -a std` twice, each from an empty cache: a parallel compile.
   - `memory` is every vCPU copying a 256 MiB buffer 600 times: far larger than any L3.
   - A guest reboots when its workload succeeds, which ends its VMM, so run time is from launch returned to VMM exit.
-- **Power:** `scripts/power-log.sh --meter` logged package energy (RAPL), turbostat and the wall meter through each session: 3,633, 4,288 and 1,680 intervals, a row about every 1.15 s. A row's package power is its energy over its own interval, and wall energy is the meter's watts times that interval; the meter's own energy counter over the same intervals agrees with it per run within a median 1.3% and at most 5.1%. turbostat's energy agreed with RAPL's to 0.999, 0.999 and 1.000.
+- **Power:** `scripts/power-log.sh --meter` logged package energy (RAPL), turbostat and the wall meter through each session: 3,633, 4,288 and 1,680 intervals, a row about every 1.15 s. A row's package power is its energy over its own interval, and wall energy is the meter's watts times that interval; the meter's own energy counter over the same intervals agrees with it within a median 1.2% and at most 5.1% across the 112 runs. turbostat's energy agreed with RAPL's to 0.999, 0.999 and 1.000.
 - **Placements:**
   - `none` is today's unpinned guests.
   - `compact` gives a guest both threads of as few cores as it needs, in the lowest last-level-cache group with room for it.
@@ -40,7 +40,7 @@ Session 2 read each setting three times for 60 s, interleaved and shuffled, 10 s
 | Boost off, 2.0 GHz ceiling | 74.1, 71.8, 69.6 W | 158.9, 154.0, 148.8 W |
 | Boost off, 1.5 GHz ceiling | 72.1, 69.7, 69.5 W | 154.3, 148.7, 148.4 W |
 
-- **No setting showed a saving.** In the last round the four package readings were within 0.4 W of each other (69.5 to 69.9 W) and of the quiet minutes, and the wall readings within 1.2 W. Across all three rounds the differences are not significant (the default against the 1.5 GHz ceiling, 1.9 W apart on average, p 0.51), so a saving of a watt or two is not ruled out either; one this small would be under 3% of the host's idle package power. Whatever capping a node's frequency while it is idle, which `node.power` does, saves beyond that would have to show in how a host leaves and enters idle, which this did not measure.
+- **No setting showed a saving.** In the last round the four package readings were within 0.4 W of each other (69.5 to 69.9 W) and within 0.5 W of the quiet minutes, and the wall readings within 1.2 W. Across all three rounds the differences are not significant (the default against the 1.5 GHz ceiling, 1.9 W apart on average, p 0.51, a 95% interval of −7 to +11 W), so three readings a setting can neither show nor rule out a steady saving from capping a node's frequency while it is idle, which `node.power` does. How a host leaves and enters idle under each setting was not measured.
 - **Every setting read 2 to 7 W higher in the first round,** though the quiet minutes just before it read 70.0 W. What the host was doing then was not measured.
 - **That fits what is known of this chip:** an idle core sits in a C-state whatever its ceiling, and most of the idle draw is outside the cores (about 69 of 73.5 W was uncore in the package's own split in September).
 - **The host idled at 70.1 and 70.0 W in sessions 1 and 2,** as the calibration run at 02:50 had read (69.9 W). Session 3, which began seven minutes after session 2's last guest, read 76.3 W package and 161.3 W wall in its quiet minutes; why was not measured.
@@ -146,7 +146,7 @@ Session 3 then ran 12 guests of 8 vCPUs, 96 of 128 threads, on the compile. `spr
 
 - **Under `spread`, boost off made the compile 50% slower at 4 guests and 64% slower at 8, and it used 21% and 19% more package energy and 29% and 28% more at the wall** (p ≤ 0.013). The longer run cost more than the lower clock saved.
 - **Under `compact`, boost off saved 15% of package energy** (p 0.044, two runs each), and its run time was within 1.5% of boost on, with no difference detected (two runs cannot rule out one of a quarter either way). A guest whose cores share SMT siblings may gain little from boost to begin with.
-- **So turning boost off is not a saving on this host for a job that has whole cores to itself,** which is what `spread` gives it. `node.power` turns boost off only while a node is idle, where the section above found it saves next to nothing, and restores it before a launch.
+- **So turning boost off is not a saving on this host for a job that has whole cores to itself,** which is what `spread` gives it. `node.power` turns boost off only while a node is idle, where the section above found no saving, and restores it before a launch.
 
 ### Energy attribution
 
