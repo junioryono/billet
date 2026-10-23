@@ -155,6 +155,14 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	}
 
 	request, cacheable := classifyNpmRequest(req, n.held)
+	// ASKED BEFORE ANYTHING THAT CAN WAIT, the policy lookup included: from here
+	// the cache is not "unused" for the job, whether or not what it got is noted
+	// before the session settles.
+	if cacheable {
+		session.mu.Lock()
+		session.npmAsked = true
+		session.mu.Unlock()
+	}
 	switch {
 	case !cacheable:
 		n.service.log.Debug("an npm request was passed to the registry", "instance", session.instance,
@@ -177,14 +185,6 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, cacheHandlerLimit)
 	defer cancel()
-	session.mu.Lock()
-	session.npmPending++
-	session.mu.Unlock()
-	defer func() {
-		session.mu.Lock()
-		session.npmPending--
-		session.mu.Unlock()
-	}()
 	n.serve(requestCtx, tlsConn, req.WithContext(requestCtx), request, session)
 }
 
@@ -891,6 +891,7 @@ func (n *npmCache) answerRevalidated(ctx context.Context, x npmExchange, entry n
 		case again.resp.StatusCode == http.StatusOK && again.document != "":
 			document, err := os.Open(again.document)
 			if err != nil {
+				n.note(x.session, alloc.BuildCacheUnavailable)
 				n.answerStatus(x, http.StatusBadGateway)
 
 				return

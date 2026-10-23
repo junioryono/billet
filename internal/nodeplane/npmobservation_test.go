@@ -43,10 +43,16 @@ func TestAnNpmOutcomeFromAWireThatDoesNotCarryItIsDropped(t *testing.T) {
 			nodeapi.CacheObservationRequest{Epoch: 7, CacheGeneration: "g"}, http.StatusBadRequest, nil},
 		{nodeapi.VersionNpmObservation,
 			nodeapi.CacheObservationRequest{Epoch: 7, CacheGeneration: "g"}, http.StatusBadRequest, nil},
+		// AND ONE THE DROP LEAVES WITH ONLY A GENERATION is refused too: it is not
+		// emptied, and a generation alone names no warm store.
+		{nodeapi.VersionNpmObservation - 1,
+			nodeapi.CacheObservationRequest{Epoch: 7, CacheGeneration: "g", NpmCache: "warm"},
+			http.StatusBadRequest, nil},
 	} {
 		store := &fakeStore{}
 		_, base := serve(t, store)
-		incarnation := fmt.Sprintf("wire-%d-%s-%s", tc.version, tc.body.GitCache, tc.body.CacheGeneration)
+		incarnation := fmt.Sprintf("wire-%d-%s-%s-%s", tc.version, tc.body.GitCache, tc.body.CacheGeneration,
+			tc.body.NpmCache)
 		post := func(path string, body any) int {
 			t.Helper()
 			raw, err := json.Marshal(body)

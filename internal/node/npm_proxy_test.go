@@ -80,14 +80,26 @@ func (f cachePolicyFunc) CacheAllowed(ctx context.Context, kind config.CacheKind
 func npmService(t *testing.T, registry *fakeRegistry) (*CacheService, CacheCredentials) {
 	t.Helper()
 
+	return npmServiceWith(t, registry, nil, CacheSessionScope{
+		Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
+	})
+}
+
+// npmServiceWith is npmService with a kill switch, consulted when the scope
+// names a repository, and a scope of the test's own.
+func npmServiceWith(t *testing.T, registry *fakeRegistry, policy CachePolicy, scope CacheSessionScope,
+) (*CacheService, CacheCredentials) {
+	t.Helper()
+
 	service, err := NewCacheService("http://127.0.0.1:7718", "test-deployment", t.TempDir(),
 		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	credentials, err := service.PrepareScoped("billet-lease-npm", CacheSessionScope{
-		Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
-	})
+	if policy != nil {
+		service.SetCachePolicy(policy)
+	}
+	credentials, err := service.PrepareScoped("billet-lease-npm", scope)
 	if err != nil {
 		t.Fatalf("PrepareScoped: %v", err)
 	}
@@ -763,56 +775,90 @@ func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
 	}
 }
 
-// A FILL STILL IN FLIGHT WHEN THE JOB ENDS IS NOT "UNUSED": the guest asked, and
-// what the store did for it is not known yet, so the session reports nothing for
-// the npm cache rather than that it was never asked.
-func TestASessionThatEndsDuringAFillDoesNotCallTheNpmCacheUnused(t *testing.T) {
+// A REQUEST STILL BEING ANSWERED WHEN THE JOB ENDS IS NOT "UNUSED": the guest
+// asked, and what the store did for it is not known yet, so the session reports
+// nothing for the npm cache rather than that it was never asked. Whether the
+// request is waiting on the registry or on the kill switch.
+func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T) {
 	t.Parallel()
 
-	reached, release := make(chan struct{}), make(chan struct{})
-	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
-		if n == 1 {
-			close(reached)
+	for _, held := range []string{"the registry", "the kill switch"} {
+		reached, release := make(chan struct{}), make(chan struct{})
+		var reachedOnce, releaseOnce sync.Once
+		t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+		hold := func() {
+			reachedOnce.Do(func() { close(reached) })
 			select {
 			case <-release:
 			case <-time.After(5 * time.Second):
 			}
 		}
-		w.Header().Set("Cache-Control", "public, max-age=300")
-		serveText(t, w, "{}")
-	})
-	service, credentials := npmService(t, registry)
-	observer := &recordingObserver{}
-	service.SetCacheObserver(observer)
+		registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+			if held == "the registry" && n == 1 {
+				hold()
+			}
+			w.Header().Set("Cache-Control", "public, max-age=300")
+			serveText(t, w, "{}")
+		})
+		scope := CacheSessionScope{Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true}}
+		var policy CachePolicy
+		if held == "the kill switch" {
+			scope = CacheSessionScope{
+				Trust: provider.TrustUntrusted, Owner: "acme", Repository: "api",
+				Cache: &config.CacheSpec{Npm: true, Publish: config.CachePublishDefaultBranch, Owner: "acme",
+					Repository: "api"},
+			}
+			policy = cachePolicyFunc(func(_ context.Context, kind config.CacheKind, _, _ string) (bool, error) {
+				if kind == config.CacheNpm {
+					hold()
+				}
 
-	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
-	if _, err := conn.Write([]byte(npmRequestLine("/in-flight"))); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	select {
-	case <-reached:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the request never reached the registry")
-	}
-	if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	calls := observer.recorded()
-	close(release)
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("set a read deadline: %v", err)
-	}
-	if resp, err := http.ReadResponse(bufio.NewReader(conn), nil); err == nil {
+				return true, nil
+			})
+		}
+		service, credentials := npmServiceWith(t, registry, policy, scope)
+		observer := &recordingObserver{}
+		service.SetCacheObserver(observer)
+
+		conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+		if _, err := conn.Write([]byte(npmRequestLine("/in-flight"))); err != nil {
+			t.Fatalf("%s: write: %v", held, err)
+		}
+		select {
+		case <-reached:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the request was never held", held)
+		}
+		if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
+			t.Fatalf("%s: Close: %v", held, err)
+		}
+		calls := observer.recorded()
+		releaseOnce.Do(func() { close(release) })
+
+		// THE HANDLER IS JOINED: the node closes the connection once it has
+		// answered, so the end of the stream is the handler's return.
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("%s: set a read deadline: %v", held, err)
+		}
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatalf("%s: the held request was never answered: %v", held, err)
+		}
 		_ = resp.Body.Close()
-	}
-	assertNpmQuiet(t, service.npmCache())
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			t.Fatalf("%s: the node did not close the connection after answering: %v", held, err)
+		}
+		assertNpmQuiet(t, service.npmCache())
 
-	if len(calls) == 0 {
-		t.Fatal("the session's end reported nothing")
-	}
-	for _, call := range calls {
-		if call.obs.Npm != "" {
-			t.Errorf("a session that ended during a fill reported the npm cache %q, want nothing", call.obs.Npm)
+		if len(calls) == 0 {
+			t.Fatalf("%s: the session's end reported nothing", held)
+		}
+		for _, call := range calls {
+			if call.obs.Npm != "" {
+				t.Errorf("%s: a session that ended during a request reported the npm cache %q, want nothing",
+					held, call.obs.Npm)
+			}
 		}
 	}
 }
