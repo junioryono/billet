@@ -142,10 +142,14 @@ func TestRealPlacementExperiment(t *testing.T) {
 		teardown.Wait()
 	})
 
-	var wg sync.WaitGroup
+	// EVERY NAME FIRST, since minting one can skip the test, and a skip after
+	// the first worker started would leave it running.
 	for i := range vms {
-		g := &guest{name: provider.InstanceName(freshLease(t))}
-		guests[i] = g
+		guests[i] = &guest{name: provider.InstanceName(freshLease(t))}
+	}
+
+	var wg sync.WaitGroup
+	for _, g := range guests {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -192,13 +196,14 @@ func TestRealPlacementExperiment(t *testing.T) {
 
 					return
 				}
-				if time.Now().After(waitUntil) {
+				select {
+				case <-runCtx.Done():
 					g.err = fmt.Errorf("the guest did not power off by %s: its workload failed or "+
 						"never finished", waitUntil.Format(time.TimeOnly))
 
 					return
+				case <-time.After(250 * time.Millisecond):
 				}
-				time.Sleep(250 * time.Millisecond)
 			}
 		}()
 	}
