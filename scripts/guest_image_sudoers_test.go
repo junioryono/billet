@@ -12,9 +12,11 @@ import (
 // THE IMAGE'S SUDOERS DROP-IN IS INSTALLED, AND THE BUILD GOES ON ONLY IF SUDO
 // READS IT. The build's own function runs here against a fixture image, through
 // the real visudo, with chroot standing in by checking the fixture's whole
-// policy: the drop-in lands mode 0440 with exactly the cache's two variables,
-// one sudo cannot parse ends the build, and so does a policy that never
-// includes it, which would leave root's git without a session again.
+// policy: the drop-in lands mode 0440 with exactly the cache's two variables and
+// the four that name the trust bundle, kept only at billet's own two paths of it,
+// one sudo cannot parse ends the build, and
+// so does a policy that never includes it, which would leave root's git without
+// a session and root's npm without the node's authority again.
 func TestTheImagesSudoersKeepsTheCacheVariablesAcrossSudo(t *testing.T) {
 	t.Parallel()
 
@@ -73,7 +75,7 @@ func TestTheImagesSudoersKeepsTheCacheVariablesAcrossSudo(t *testing.T) {
 			if readErr != nil {
 				t.Fatal(readErr)
 			}
-			if want := "Defaults env_keep += \"BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN\"\n"; string(raw) != want {
+			if want := wantSudoersDropIn(); string(raw) != want {
 				t.Errorf("the drop-in is %q, want %q", raw, want)
 			}
 		}
@@ -85,7 +87,7 @@ func TestTheImagesSudoersKeepsTheCacheVariablesAcrossSudo(t *testing.T) {
 	if output, err := run(t, function, including); err != nil || !strings.Contains(output, "completed") {
 		t.Fatalf("installing the drop-in failed: %v\n%s", err, output)
 	}
-	broken := strings.Replace(function, `BILLET_CACHE_TOKEN"`, "BILLET_CACHE_TOKEN", 1)
+	broken := strings.Replace(function, `"%s"\nDefaults`, `"%s\nDefaults`, 1)
 	if broken == function {
 		t.Fatal("the drop-in could not be broken for the test, so it proves nothing")
 	}
@@ -95,5 +97,50 @@ func TestTheImagesSudoersKeepsTheCacheVariablesAcrossSudo(t *testing.T) {
 	const excluding = "Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n"
 	if output, err := run(t, function, excluding); err == nil || strings.Contains(output, "completed") {
 		t.Errorf("a policy that never reads the drop-in did not end the build: %v\n%s", err, output)
+	}
+}
+
+// wantSudoersDropIn is the drop-in the build must write: the cache's two
+// variables by name, and the four that name the trust bundle only at the two
+// paths billet puts it.
+func wantSudoersDropIn() string {
+	var keep []string
+	for _, name := range []string{"NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
+		keep = append(keep, name+"="+agentTrustBundle, name+"="+hookTrustBundle)
+	}
+
+	return "Defaults env_keep += \"BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN\"\n" +
+		"Defaults env_keep += \"" + strings.Join(keep, " ") + "\"\n"
+}
+
+// The two paths of the guest's trust bundle: the agent's, and the copy the
+// job-started hook makes in RUNNER_TEMP, which is the runner's _work/_temp
+// (read from a real job's environment, 2026-10-23).
+const (
+	agentTrustBundle = "/home/runner/runner/_work/_billet/actions-cache-ca.pem"
+	hookTrustBundle  = "/home/runner/runner/_work/_temp/billet-actions-cache-ca.pem"
+)
+
+// THE DROP-IN NAMES THE BUNDLE WHERE THE AGENT PUTS IT. sudo keeps a NAME=value
+// entry only for that exact value, so a bundle the agent moved would cross sudo
+// no more, silently; this holds the agent's two definitions to the drop-in's.
+func TestTheSudoersDropInNamesTheBundleWhereTheAgentPutsIt(t *testing.T) {
+	t.Parallel()
+
+	build := readScriptFile(t, "build-guest-image.sh")
+	dir, file, ok := strings.Cut(agentTrustBundle[1:], "/actions-cache-ca.pem")
+	if !ok || file != "" {
+		t.Fatalf("the agent's bundle path %q is not the directory and file this test reads", agentTrustBundle)
+	}
+	for _, definition := range []string{
+		"\tactions_ca_dir=/" + dir + "\n",
+		"\tactions_ca_path=\"$actions_ca_dir/actions-cache-ca.pem\"\n",
+		"\ntarget=\"$RUNNER_TEMP/billet-actions-cache-ca.pem\"\n",
+		"\tlocal agent_bundle=" + agentTrustBundle + "\n",
+		"\tlocal hook_bundle=" + hookTrustBundle + "\n",
+	} {
+		if !strings.Contains(build, definition) {
+			t.Errorf("the build does not define %q", strings.TrimSpace(definition))
+		}
 	}
 }
