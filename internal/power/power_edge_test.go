@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -328,9 +329,23 @@ func TestCloseIsBoundedByAStuckRestore(t *testing.T) {
 			t.Errorf("Close returned after %s, want its %s bound", took, DefaultStopBound)
 		}
 
+		// THE HOST STAYS CLAIMED WHILE THE WRITE IS STUCK: a controller that
+		// claimed it now would have its cap undone when the write returned.
+		next, err := New(Options{SysfsRoot: h.root, StateDir: t.TempDir(), Log: slog.New(slog.DiscardHandler)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := next.ClaimHost(); !errors.Is(err, ErrHostHeld) {
+			t.Fatalf("a claim while the closed controller's write was stuck: %v, want ErrHostHeld", err)
+		}
+
 		release()
 		synctest.Wait()
 		h.requireFull(stateDir)
+		if err := next.ClaimHost(); err != nil {
+			t.Fatalf("the claim once the stuck write returned: %v", err)
+		}
+		next.ReleaseHost()
 	})
 }
 

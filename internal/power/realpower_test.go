@@ -74,11 +74,17 @@ func TestRealCapAndRestoreOnThisHost(t *testing.T) {
 	if err := baseline.requireFull(probe); err != nil {
 		t.Fatal(err)
 	}
+	// NOTHING IS WRITTEN WHILE ANOTHER PROCESS HOLDS THE HOST: a node running
+	// node.power here would have its cap undone, or its baseline overwritten.
+	if err := probe.ClaimHost(); err != nil {
+		t.Fatalf("claim the host's cpufreq: %v", err)
+	}
+	probe.ReleaseHost()
 	// REGISTERED FIRST, SO IT RUNS LAST, after every run's own shutdown: the host
 	// leaves with the ceiling it came with, written in the kernel's order and read
-	// back.
+	// back, under a claim of its own.
 	t.Cleanup(func() {
-		if err := baseline.restore(); err != nil {
+		if err := withHostClaimed(sysfs, baseline.restore); err != nil {
 			t.Errorf("put the host's cpufreq baseline back: %v", err)
 		}
 	})
@@ -146,7 +152,7 @@ func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline c
 		cancel()
 		<-done
 		closeErr := c.Close(context.WithoutCancel(t.Context()))
-		restoreErr := baseline.restore()
+		restoreErr := withHostClaimed(sysfs, baseline.restore)
 		if closeErr == nil && restoreErr == nil {
 			_ = os.RemoveAll(stateDir)
 		}
@@ -226,6 +232,22 @@ type ceiling struct {
 	boostPath, boost string
 	policyBoost      map[string]string
 	ceilings         map[string]string
+}
+
+// withHostClaimed runs write under a claim of the host's cpufreq, and writes
+// nothing when another process holds it, a stuck write of this test's own
+// controller included.
+func withHostClaimed(sysfs string, write func() error) error {
+	holder, err := New(Options{SysfsRoot: sysfs, StateDir: os.TempDir()})
+	if err != nil {
+		return err
+	}
+	if err := holder.ClaimHost(); err != nil {
+		return fmt.Errorf("nothing was written: %w", err)
+	}
+	defer holder.ReleaseHost()
+
+	return write()
 }
 
 // requireFull refuses a baseline any of whose ceilings is below the full value

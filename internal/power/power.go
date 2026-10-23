@@ -206,15 +206,55 @@ func (c *Controller) ClaimHost() error {
 	return nil
 }
 
-// ReleaseHost gives the host's cpufreq back.
+// ReleaseHost gives the host's cpufreq back. The caller has no write in flight.
+//
+// UNLOCKED BEFORE IT IS CLOSED: a child forked meanwhile shares the open file
+// description, and closing this descriptor alone would leave the lock held
+// until that child exits.
 func (c *Controller) ReleaseHost() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.host != nil {
+		if err := syscall.Flock(int(c.host.Fd()), syscall.LOCK_UN); err != nil {
+			c.log.Error("could not unlock the host's cpufreq; closing it", "error", err)
+		}
 		_ = c.host.Close()
 		c.host = nil
 	}
+}
+
+// releaseWhenIdle gives the host back once no write is in flight: at once when
+// none is, or when a restore stuck in the kernel returns.
+//
+// NEVER WHILE ONE IS: another controller could claim the host and then have
+// its record or its cap undone by the write that resumed.
+func (c *Controller) releaseWhenIdle() {
+	select {
+	case c.sem <- struct{}{}:
+		c.ReleaseHost()
+		c.release()
+	default:
+		go func() {
+			c.sem <- struct{}{}
+			c.ReleaseHost()
+			c.release()
+		}()
+	}
+}
+
+// Outstanding answers whether a cap's record is here to restore, reading only
+// the state directory. A record that cannot be read is outstanding.
+func (c *Controller) Outstanding() bool {
+	_, found, err := c.loadRecord()
+
+	return found || err != nil
+}
+
+// claimIfFree claims the host when this controller has not and no other
+// process holds it, and answers whether this controller holds it now.
+func (c *Controller) claimIfFree() bool {
+	return c.claimed() || c.ClaimHost() == nil
 }
 
 func (c *Controller) claimed() bool {
@@ -1095,6 +1135,24 @@ func (c *Controller) step(ctx context.Context, idle func() bool) {
 	}
 	defer c.release()
 
+	// A CONTROLLER THAT COULD NOT CLAIM THE HOST AT ITS START, one that only
+	// restores, claims it once it is free, and gives it back once nothing is
+	// owed, so it never keeps another node from starting.
+	if !c.claimed() {
+		if err := c.ClaimHost(); err != nil {
+			c.restoreFailed("claim", err)
+
+			return
+		}
+	}
+	if !c.settings.caps() {
+		defer func() {
+			if state(c.st.Load()) == stateFull {
+				c.ReleaseHost()
+			}
+		}()
+	}
+
 	switch state(c.st.Load()) {
 	case stateUnknown:
 		// A FAILURE IS restoreFailed's TO SAY, at most once a minute, and the next
@@ -1150,12 +1208,16 @@ func (c *Controller) step(ctx context.Context, idle func() bool) {
 // it once its loop has returned.
 func (c *Controller) Close(ctx context.Context) error {
 	c.BeginStop()
-	defer c.ReleaseHost()
+	defer c.releaseWhenIdle()
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.stopBound)
 	defer cancel()
 
 	for {
+		// A CONTROLLER THAT NEVER CLAIMED THE HOST TRIES AGAIN: a restore owed is
+		// written only under the claim, and the holder may have gone.
+		// A claim that fails is the restore's errUnclaimed below.
+		c.claimIfFree()
 		run := c.restoreAsync("stop", time.Time{})
 
 		var err error

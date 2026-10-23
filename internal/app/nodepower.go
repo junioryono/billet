@@ -116,12 +116,21 @@ func openNodePower(ctx context.Context, cfg *config.Config, root, goos string, o
 	// second node on this host with node.power would fight it, and is refused.
 	if err := ctrl.ClaimHost(); err != nil {
 		if cfg.Node.Power != nil {
-			return nil, fmt.Errorf("node.power: %w; only one node on a host may run node.power", err)
-		}
-		slog.Default().Warn("another process on this host holds its cpufreq; a cap an earlier process of "+
-			"this node left stays recorded until this node can claim it", "error", err)
+			if errors.Is(err, power.ErrHostHeld) {
+				return nil, fmt.Errorf("node.power: %w; only one node on a host may run node.power", err)
+			}
 
-		return nil, nil //nolint:nilnil // no policy is a state, not an error
+			return nil, fmt.Errorf("node.power: %w", err)
+		}
+		if !ctrl.Outstanding() {
+			return nil, nil //nolint:nilnil // no policy is a state, not an error
+		}
+		// A LEFTOVER IS STILL OWED, so the policy runs to restore it: its loop
+		// claims the host once it can, and gives it back once nothing is owed.
+		slog.Default().Warn("could not claim this host's cpufreq to restore the cap an earlier process of "+
+			"this node left; this node retries while it runs", "error", err)
+
+		return ctrl, nil
 	}
 
 	restoreErr := ctrl.Restore(ctx, "start")

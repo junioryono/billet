@@ -319,3 +319,33 @@ func TestASecondNodeWithPowerOnAHostIsRefused(t *testing.T) {
 		t.Fatalf("openNodePower beside another holder: %v, %v; want a refusal naming the rule", ctrl, err)
 	}
 }
+
+// A NODE WITH NO node.power THAT FINDS A LEFTOVER WHILE ANOTHER PROCESS HOLDS
+// THE HOST keeps a policy that retries it, rather than none; with nothing left
+// it gets none.
+func TestALeftoverBesideAHolderKeepsARetryingPolicy(t *testing.T) {
+	t.Parallel()
+
+	root, _ := powerHost(t)
+	stateDir := t.TempDir()
+	capHost(t, root, stateDir)
+
+	holder, err := power.New(power.Options{SysfsRoot: root, StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.ClaimHost(); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.ReleaseHost()
+
+	ctrl, err := openNodePower(t.Context(), powerConfig(stateDir, nil), root, "linux", nil)
+	if ctrl == nil || err != nil {
+		t.Fatalf("openNodePower with a leftover beside a holder: %v, %v; want a policy that retries", ctrl, err)
+	}
+
+	ctrl, err = openNodePower(t.Context(), powerConfig(t.TempDir(), nil), root, "linux", nil)
+	if ctrl != nil || err != nil {
+		t.Fatalf("openNodePower with nothing left beside a holder: %v, %v; want no policy", ctrl, err)
+	}
+}
