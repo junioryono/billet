@@ -597,21 +597,67 @@ func TestARestoreRewritesACeilingTheBoostSwitchMoved(t *testing.T) {
 	h.requireFull(stateDir)
 }
 
-// A CAP NEVER RAISES A CEILING that is already at or below the setting.
+// A CAP IS TAKEN ONLY FROM CEILINGS AT THEIR FULL. One a firmware limit or an
+// operator holds lower reads as the effective limit, and writing it back as
+// the user's request would keep that limit after it lifts, so nothing is
+// capped, written or recorded until every ceiling is at its full again.
+func TestACapIsTakenOnlyFromCeilingsAtTheirFull(t *testing.T) {
+	h := newFakeHost(t, 2)
+	h.write(h.policyFile(1, "scaling_max_freq"), midKHz) // a _PPC limit in force
+	c, stateDir := newController(t, h, Settings{IdleAfter: time.Minute, MaxFreqKHz: 1500000}, nil)
+
+	c.step(t.Context(), func() bool { return true })
+	c.mu.Lock()
+	c.busyAt = time.Now().Add(-time.Hour)
+	c.mu.Unlock()
+	c.step(t.Context(), func() bool { return true })
+
+	if got := h.maxFreq(0); got != fullKHz {
+		t.Errorf("policy0 = %s, want it untouched while policy1 is held below its full", got)
+	}
+	if got := h.maxFreq(1); got != midKHz {
+		t.Errorf("policy1 = %s, want it untouched", got)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, RecordName)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a record was written from a ceiling below its full: %v", err)
+	}
+	if state(c.st.Load()) != stateFull {
+		t.Errorf("state %d, want full", c.st.Load())
+	}
+
+	// THE LIMIT LIFTS, and the next idle period caps from the full ceiling.
+	h.write(h.policyFile(1, "scaling_max_freq"), fullKHz)
+	capNow(t, c)
+	for i := range h.n {
+		if got := h.maxFreq(i); got != lowKHz {
+			t.Errorf("%s = %s, want capped to %s", policyName(i), got, lowKHz)
+		}
+	}
+	if err := c.Restore(t.Context(), "stop"); err != nil {
+		t.Fatal(err)
+	}
+	h.requireFull(stateDir)
+}
+
+// A CAP NEVER RAISES A CEILING: a setting at the full writes no ceiling.
 func TestACapNeverRaisesACeiling(t *testing.T) {
 	h := newFakeHost(t, 2)
-	h.write(h.policyFile(1, "scaling_max_freq"), lowKHz)
-	c, _ := newController(t, h, Settings{IdleAfter: time.Minute, MaxFreqKHz: 2000000}, nil)
+	c, _ := newController(t, h, Settings{IdleAfter: time.Minute, MaxFreqKHz: 2450000, DisableBoost: true}, nil)
 
+	var ceilings int
+	c.write = func(path, value string) error {
+		if strings.HasSuffix(path, "scaling_max_freq") {
+			ceilings++
+		}
+
+		return writeSysfs(path, value)
+	}
 	capNow(t, c)
-	if got := h.maxFreq(0); got != midKHz {
-		t.Errorf("policy0 = %s, want capped to %s", got, midKHz)
+	if ceilings != 0 {
+		t.Errorf("a ceiling at the setting was written %d times", ceilings)
 	}
-	if got := h.maxFreq(1); got != lowKHz {
-		t.Errorf("policy1 = %s, want left at %s", got, lowKHz)
-	}
-	if h.boost() != "1" {
-		t.Error("boost was turned off by a cap that only lowers the ceiling")
+	if h.boost() != "0" {
+		t.Error("boost was not turned off")
 	}
 }
 

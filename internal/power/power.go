@@ -368,6 +368,32 @@ func (c *Controller) checkCeiling(p string) []error {
 	return errs
 }
 
+// fullCeiling is the highest a policy's ceiling can be set to: the top of its
+// frequency table, or cpuinfo_max_freq for a driver that lists none.
+func (c *Controller) fullCeiling(p string) (int, error) {
+	avail, err := readSysfs(c.policyPath(p, "scaling_available_frequencies"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return readKHz(c.policyPath(p, "cpuinfo_max_freq"))
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	full := 0
+	for _, f := range strings.Fields(avail) {
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return 0, fmt.Errorf("power: %s lists %q, which is not a frequency in kHz", p, f)
+		}
+		full = max(full, n)
+	}
+	if full == 0 {
+		return 0, fmt.Errorf("power: %s lists no available frequency", p)
+	}
+
+	return full, nil
+}
+
 func readKHz(path string) (int, error) {
 	v, err := readSysfs(path)
 	if err != nil {
@@ -701,6 +727,22 @@ func (c *Controller) plan() (record, []write, error) {
 		current, err := readKHz(c.policyPath(p, "scaling_max_freq"))
 		if err != nil {
 			return record{}, nil, err
+		}
+
+		// ONLY FROM A CEILING AT ITS FULL. scaling_max_freq reads the effective
+		// limit, the least of every request on the policy, and a write sets
+		// only the user's: recording a value a firmware limit (_PPC) or an
+		// operator lowered, and writing it back, would keep that limit after
+		// it lifted. At the full, the user's request is at least that, and
+		// writing it back leaves the policy as it was.
+		full, err := c.fullCeiling(p)
+		if err != nil {
+			return record{}, nil, err
+		}
+		if current != full {
+			return record{}, nil, fmt.Errorf("power: %s's ceiling is %d, not its full %d: a firmware limit or "+
+				"an operator's setting may be in force, and restoring %d would keep it, so nothing is capped",
+				p, current, full, current)
 		}
 		pr := policyRecord{MaxFreq: strconv.Itoa(current)}
 		if c.settings.DisableBoost {
