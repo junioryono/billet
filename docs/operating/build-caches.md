@@ -1,6 +1,6 @@
 # Build caches
 
-A Firecracker node serves seven caches from the site's store, beside the compute that uses them: the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job.
+A Firecracker node serves seven caches from the site's store, beside the compute that uses them: the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job. An eighth, the npm registry cache, is served from the node's own disk and is the one that is off unless a tier names it.
 
 This page is the operator's view: what each cache is, what a tier gets without asking, how publication is decided, and how to see and stop a cache. [Trust and isolation](../concepts/trust-and-isolation.md) says what a cache can leak and to whom, and [ADR-013](../reference/decisions/adr-013-branch-protected-caches.md) records why publication is decided the way it is.
 
@@ -15,6 +15,7 @@ This page is the operator's view: what each cache is, what a tier gets without a
 | Bazel and Buck2 | on where the tier can publish it (below) | a Linux Firecracker tier |
 | Go build cache | on where the tier can publish it (below) | a Linux Firecracker tier |
 | Go test results | **off** | the Go build cache |
+| npm registry | **off** | a Linux Firecracker tier, and a guest image that knows the `npm-proxy` key |
 
 A cache that is on by default but cannot run on a tier is simply off there: a Docker tier gets the image store and sticky disks, and a Firecracker node without `node.cache` runs its jobs cold. Only a cache a tier turns on explicitly is refused where it cannot run, because then the operator asked for something the node cannot give.
 
@@ -50,6 +51,15 @@ Publication happens off the node's command path, after the compute is gone, jour
 
 **Go build cache.** The guest names `billet cache gocacheprog` as `GOCACHEPROG`. It keeps a local directory for the go command and shares objects with the node's content-addressed volume; a refused or unreachable node leaves it a plain local cache, never a failed build. A workflow opts out with `GOCACHEPROG=` (empty) in `env`, because the go command prefers `GOCACHEPROG` to `GOCACHE`. Concurrent jobs' writes are merged into the newest generation, so both survive.
 
+**npm registry.** With `cache.npm.enabled: true`, the node serves `registry.npmjs.org` to the tier's guests ([ADR-020](../reference/decisions/adr-020-npm-registry-interception.md)), with no workflow change and no registry setting, so `pnpm/setup`'s own download is served too.
+- **What it answers.** It answers from a store on its own disk only anonymous reads: a package document, a version document or a tarball, asked for with no credential and no query. Everything else (a publish, a login, an audit, a request carrying an `.npmrc` token) goes to the registry unchanged.
+- **One store per node.** The store holds only what the registry gives anyone without a credential, fetched by the node itself, so it serves every tier and trust class on the node. It keeps 10 GiB, least recently used first.
+- **How long an answer lasts.** A document is fresh for as long as the registry says (five minutes, counted down from its `Age`). A tarball is asked for again after a day.
+- **A registry that stalls.** A fetch that gets no headers within 8 seconds is tried once more on a new connection. If both attempts get no answer, an entry that expired within the last hour may be served instead, and the node logs a warning naming it. That happens only while the registry's own lifetime for it still holds, or when the registry's answer allowed reuse after it (it named none of `must-revalidate`, `proxy-revalidate` or `s-maxage`). So a tarball past billet's one-day ceiling but within the registry's year qualifies, and an entry the registry said to revalidate does not.
+- **Only the guest's own processes.** The registry is remapped in the guest's `/etc/hosts` only. Containers (`container:` jobs, service containers, `docker run`, Dockerfile `RUN` steps) resolve it through their own resolver and reach the registry directly, because they do not trust the node's interception authority.
+- **Not measured yet.** In a real microVM, a step under `sudo` and a container on the host's network are not measured yet; both reach the remapped registry without the authority's environment.
+- **An image that knows the key.** It needs a guest image that knows the `npm-proxy` metadata key; an older image leaves npm going direct.
+
 **Container jobs.** A job in `container:` gets the Go helper mounted read-only and its environment copied in, where the job's own `env` wins. The Bazel rc and the Git rewrite live in the guest and do not reach a job container.
 
 ## Configuration
@@ -68,6 +78,7 @@ tiers:
       git:          {enabled: true,  max_size: 50GiB}
       bazel:        {enabled: true,  max_size: 50GiB}
       go:           {enabled: true,  max_size: 20GiB, test_results: false}
+      npm:          {enabled: false}       # the one cache off unless named; no max_size, the store is the node's
 ```
 
 Everything above is what that tier gets with no `cache` block at all. [Configuration](../reference/configuration.md) has every field.
@@ -95,3 +106,5 @@ A node too old to read a tier's cache block (wire below 23) applies the rule eve
 - **An Actions archive** held below 10 GiB.
 
 During a rollout such a tier waits for the first of its own hosts to upgrade, and `billet status` names it as waiting.
+
+The npm cache needs no newer node: one below wire 31 ignores `cache.npm`, which leaves the tier's npm traffic going to the registry, as it always did.

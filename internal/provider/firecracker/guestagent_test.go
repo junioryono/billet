@@ -530,7 +530,7 @@ func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testin
 	// initialized BEFORE the interception conditional -- an untrusted job gets no
 	// interception metadata and would otherwise read it unset under `set -u` and die.
 	dnsInitAt := strings.Index(text, `container_dns_active=""`)
-	interceptCondAt := strings.Index(text, "if actions_proxy_candidate=$(fetch actions-proxy")
+	interceptCondAt := strings.Index(text, "BILLET_INTERCEPTION_METADATA_BEGIN")
 	if dnsInitAt < 0 || interceptCondAt < 0 || dnsInitAt >= interceptCondAt {
 		t.Fatal("container_dns_active is not initialized before the interception conditional")
 	}

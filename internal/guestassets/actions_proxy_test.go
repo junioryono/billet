@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/wirecert"
@@ -84,6 +85,20 @@ assert request.startswith(
 credential = base64.b64encode(b"billet:sesh").decode()
 assert ("Proxy-Authorization: Basic %s\r\n" % credential) in request, request
 conn.close()
+
+# THE NPM PASSTHROUGH NAMES ITS OWN ORIGIN (ADR-020), through handle as main
+# passes it, so the node grants it as the registry's and nothing else's.
+port, recorded = fake_node(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+client_a, client_b = socket.socketpair()
+client_b.sendall(b"\x16")
+worker, outcome = capture(proxy.handle, client_a, "http://billet:sesh@127.0.0.1:%d" % port, [],
+                          "registry.npmjs.org:443")
+client_b.close()
+worker.join(5)
+assert not worker.is_alive(), "handle did not return"
+request = recorded["request"].decode()
+assert request.startswith("CONNECT registry.npmjs.org:443 HTTP/1.1\r\n"), request
+assert "Host: registry.npmjs.org:443\r\n" in request, request
 
 # A refusal from the node is surfaced, never treated as an open tunnel.
 port, _ = fake_node(b"HTTP/1.1 403 Forbidden\r\n\r\n")
@@ -1144,5 +1159,38 @@ for name, argv in [
 	run := exec.CommandContext(t.Context(), python, "-c", probe, files.script, files.bundle)
 	if output, err := run.CombinedOutput(); err != nil {
 		t.Fatalf("guest cache adapter origin probe: %v\n%s", err, output)
+	}
+}
+
+// AN ORIGIN IS A PASSTHROUGH'S AND A HOST NAME'S: the adapter and the node
+// relay carry only what they were built for, and an argument that is not a bare
+// host name never reaches the CONNECT line, where a port or a line break would
+// ask the node for something else.
+func TestTheGuestPassthroughRefusesAnOriginItCannotCarry(t *testing.T) {
+	t.Parallel()
+
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not installed on this development host")
+	}
+	path := filepath.Join(t.TempDir(), "actions_proxy.py")
+	if err := os.WriteFile(path, []byte(ActionsProxyScript), 0o600); err != nil {
+		t.Fatalf("write proxy: %v", err)
+	}
+	for _, tc := range []struct {
+		name, mode, origin, want string
+	}{
+		{"the adapter", "cache-adapter", "registry.npmjs.org", "carries the results origin only"},
+		{"the node relay", "node-relay", "registry.npmjs.org", "carries the results origin only"},
+		{"a port", "passthrough", "registry.npmjs.org:80", "must be a host name"},
+		{"a line break", "passthrough", "registry.npmjs.org\r\nX-Injected: 1", "must be a host name"},
+		{"a capital", "passthrough", "Registry.npmjs.org", "must be a host name"},
+	} {
+		run := exec.CommandContext(t.Context(), python, path, "--mode", tc.mode, "--origin", tc.origin,
+			"--upstream", "http://billet:sesh@127.0.0.1:9", "--listen", "127.0.0.1:0")
+		output, err := run.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), tc.want) {
+			t.Errorf("%s: --origin %q = %v\n%s", tc.name, tc.origin, err, output)
+		}
 	}
 }

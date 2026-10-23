@@ -56,6 +56,7 @@ import argparse
 import base64
 import ipaddress
 import os
+import re
 import select
 import signal
 import socket
@@ -76,6 +77,9 @@ except ImportError:
 
 RESULTS_HOST = "results-receiver.actions.githubusercontent.com"
 RESULTS_AUTHORITY = RESULTS_HOST + ":443"
+# A host name as a CONNECT authority may carry one, so an argument can never
+# smuggle a port, a path or a second header line into the tunnel's request.
+ORIGIN_PATTERN = re.compile(r"\A[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+\Z")
 RESULTS_PORT = 443
 HEADER_LIMIT = 64 * 1024
 CONNECT_TIMEOUT = 10
@@ -181,16 +185,21 @@ def read_headers(connection):
     return headers, remainder
 
 
-def node_tunnel(upstream):
-    """Open a CONNECT tunnel to the node's authenticated cache proxy."""
+def node_tunnel(upstream, authority=RESULTS_AUTHORITY):
+    """Open a CONNECT tunnel to the node's authenticated cache proxy.
+
+    authority is the origin the node is asked to intercept: the results origin,
+    or, for the passthrough a guest runs for the npm registry (ADR-020), that
+    registry. The node grants each only to a session whose tier has it.
+    """
     parsed = urllib.parse.urlsplit(upstream)
     if parsed.scheme != "http" or not parsed.hostname or parsed.port is None:
         raise ValueError("the Billet node proxy must be an http URL with an explicit port")
     connection = socket.create_connection((parsed.hostname, parsed.port), CONNECT_TIMEOUT)
     try:
         headers = [
-            f"CONNECT {RESULTS_AUTHORITY} HTTP/1.1",
-            f"Host: {RESULTS_AUTHORITY}",
+            f"CONNECT {authority} HTTP/1.1",
+            f"Host: {authority}",
         ]
         if parsed.username is not None:
             username = urllib.parse.unquote(parsed.username)
@@ -632,7 +641,7 @@ def handle_adapter(client, upstream, fallback, ca_file, origin):
             peer.close()
 
 
-def handle(client, upstream, fallback):
+def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY):
     peer = None
     try:
         # WAIT FOR THE CLIENT'S FIRST BYTE before spending a tunnel. A bare connect
@@ -651,7 +660,7 @@ def handle(client, upstream, fallback):
         # fallback address is known -- and only then -- is a plain close the best
         # available outcome, degrading the cache call to its ordinary miss.
         try:
-            peer, buffered = node_tunnel(upstream)
+            peer, buffered = node_tunnel(upstream, authority)
         except (ConnectionError, OSError, UnicodeError, ValueError):
             if not fallback:
                 raise
@@ -819,7 +828,18 @@ def main():
     parser.add_argument("--upstream", required=True)
     parser.add_argument("--fallback-addr", default="")
     parser.add_argument("--ca-file", default="")
+    # THE ORIGIN A PASSTHROUGH CARRIES, and only a passthrough: the adapter speaks
+    # the results protocol and the node relay none. Its fallback addresses must be
+    # that origin's, resolved before the guest remapped it.
+    parser.add_argument("--origin", default=RESULTS_HOST)
     args = parser.parse_args()
+
+    if args.origin != RESULTS_HOST and args.mode != "passthrough":
+        raise SystemExit("--origin names what a passthrough carries; %s carries the results origin only"
+                         % args.mode)
+    if not ORIGIN_PATTERN.match(args.origin):
+        raise SystemExit("--origin must be a host name")
+    authority = args.origin + ":443"
 
     fallback = [addr for addr in args.fallback_addr.split(",") if addr]
 
@@ -893,7 +913,7 @@ def main():
                 continue
             worker, arguments = handle_node_relay, (client, node_address, slots)
         else:
-            worker, arguments = handle, (client, args.upstream, fallback)
+            worker, arguments = handle, (client, args.upstream, fallback, authority)
         # A THREAD THAT CANNOT START CLOSES ITS CONNECTION, never the process: every
         # other connection this listener carries is still worth finishing.
         try:
