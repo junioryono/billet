@@ -72,7 +72,7 @@ func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
 const cacheOutcomeRows = 100_000
 
 // cacheReportOrder is the order caches are reported in.
-var cacheReportOrder = []string{"image", "sticky", "actions", "git", "bazel", "go"}
+var cacheReportOrder = []string{"image", "sticky", "actions", "git", "bazel", "go", "npm"}
 
 // printCacheOutcomes renders what each cache did per tier. A cache with no
 // observation for any of a tier's jobs is left out; within one that has some,

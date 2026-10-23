@@ -15,13 +15,13 @@ INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
-      sticky_cache, git_cache, bazel_cache, go_cache, holder_incarnation, queued_at,
+      sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, holder_incarnation, queued_at,
       finished_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17,
-        $18, $19, $20, $21, $22,
-        $23, $24, $25)
+        $18, $19, $20, $21, $22, $23,
+        $24, $25, $26)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
@@ -53,6 +53,8 @@ ON CONFLICT (lease_id) DO UPDATE SET
                           THEN excluded.bazel_cache ELSE job_history.bazel_cache END,
   go_cache         = CASE WHEN job_history.go_cache = ''
                           THEN excluded.go_cache ELSE job_history.go_cache END,
+  npm_cache        = CASE WHEN job_history.npm_cache = ''
+                          THEN excluded.npm_cache ELSE job_history.npm_cache END,
   holder_incarnation = CASE WHEN excluded.holder_incarnation != ''
                             THEN excluded.holder_incarnation
                             ELSE job_history.holder_incarnation END
@@ -81,6 +83,7 @@ type ArchiveJobHistoryParams struct {
 	GitCache           string
 	BazelCache         string
 	GoCache            string
+	NpmCache           string
 	HolderIncarnation  string
 	QueuedAt           string
 	FinishedAt         sql.NullString
@@ -136,6 +139,7 @@ func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryPa
 		arg.GitCache,
 		arg.BazelCache,
 		arg.GoCache,
+		arg.NpmCache,
 		arg.HolderIncarnation,
 		arg.QueuedAt,
 		arg.FinishedAt,
@@ -244,7 +248,8 @@ func (q *Queries) ListAttributedFailures(ctx context.Context, arg ListAttributed
 }
 
 const listCacheOutcomes = `-- name: ListCacheOutcomes :many
-SELECT tier, image_cache, actions_cache, sticky_cache, git_cache, bazel_cache, go_cache
+SELECT tier, image_cache, actions_cache, sticky_cache, git_cache, bazel_cache, go_cache,
+       npm_cache
   FROM job_history
  WHERE assigned_at >= $1
  ORDER BY assigned_at DESC
@@ -264,6 +269,7 @@ type ListCacheOutcomesRow struct {
 	GitCache     string
 	BazelCache   string
 	GoCache      string
+	NpmCache     string
 }
 
 // What each cache did for the jobs assigned since a moment, one row per job.
@@ -289,6 +295,7 @@ func (q *Queries) ListCacheOutcomes(ctx context.Context, arg ListCacheOutcomesPa
 			&i.GitCache,
 			&i.BazelCache,
 			&i.GoCache,
+			&i.NpmCache,
 		); err != nil {
 			return nil, err
 		}
@@ -637,7 +644,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
-       sticky_cache, git_cache, bazel_cache, go_cache, launched_at, registered_at,
+       sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
        holder_incarnation
   FROM job_history WHERE lease_id = $1
@@ -681,6 +688,7 @@ type ReadJobRow struct {
 	GitCache                 string
 	BazelCache               string
 	GoCache                  string
+	NpmCache                 string
 	LaunchedAt               string
 	RegisteredAt             string
 	RunnerID                 int64
@@ -737,6 +745,7 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.GitCache,
 		&i.BazelCache,
 		&i.GoCache,
+		&i.NpmCache,
 		&i.LaunchedAt,
 		&i.RegisteredAt,
 		&i.RunnerID,
@@ -793,7 +802,7 @@ func (q *Queries) ReadJobNode(ctx context.Context, leaseID string) (sql.NullStri
 const readJobPlacement = `-- name: ReadJobPlacement :one
 SELECT chosen_provider, instance_type, vcpu, memory, site, price_micros_per_hour,
        image_cache, cache_generation, actions_cache, sticky_cache, git_cache,
-       bazel_cache, go_cache
+       bazel_cache, go_cache, npm_cache
   FROM job_history WHERE lease_id = $1
 `
 
@@ -811,6 +820,7 @@ type ReadJobPlacementRow struct {
 	GitCache           string
 	BazelCache         string
 	GoCache            string
+	NpmCache           string
 }
 
 // What one lease was charged for and what the cache did, from the row that
@@ -839,6 +849,7 @@ func (q *Queries) ReadJobPlacement(ctx context.Context, leaseID string) (ReadJob
 		&i.GitCache,
 		&i.BazelCache,
 		&i.GoCache,
+		&i.NpmCache,
 	)
 	return i, err
 }

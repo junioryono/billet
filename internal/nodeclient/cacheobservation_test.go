@@ -100,6 +100,58 @@ func (p *observationPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// THE NPM CACHE'S OUTCOME GOES ONLY TO A PLANE THAT KNOWS IT
+// (VersionNpmObservation): an older plane decodes strictly and would refuse the
+// whole observation over the field, so below it the rest is sent without it,
+// and an observation of nothing else is not sent at all.
+func TestTheNpmOutcomeIsNotSentToAPlaneTooOldForIt(t *testing.T) {
+	t.Parallel()
+
+	for version, want := range map[int][]string{
+		nodeapi.VersionNpmObservation - 1: {"git_cache"},
+		nodeapi.VersionNpmObservation:     {"git_cache", "npm_cache"},
+	} {
+		plane := &observationPlane{version: version, bodies: make(chan map[string]any, 4)}
+		srv := httptest.NewServer(plane)
+		t.Cleanup(srv.Close)
+		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		if err := c.Register(t.Context(), testRegistration()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		if err := c.RecordCacheObservation(t.Context(), "l1", 1, alloc.CacheObservation{
+			BuildCaches: alloc.BuildCaches{Git: alloc.BuildCacheWarm, Npm: alloc.BuildCacheCold},
+		}); err != nil {
+			t.Fatalf("v%d: RecordCacheObservation: %v", version, err)
+		}
+		body := <-plane.bodies
+		for _, field := range []string{"git_cache", "npm_cache"} {
+			if _, sent := body[field]; sent != slices.Contains(want, field) {
+				t.Errorf("v%d: %s sent = %v (%v)", version, field, sent, body)
+			}
+		}
+
+		if err := c.RecordCacheObservation(t.Context(), "l1", 1, alloc.CacheObservation{
+			BuildCaches: alloc.BuildCaches{Npm: alloc.BuildCacheCold},
+		}); err != nil {
+			t.Fatalf("v%d: RecordCacheObservation: %v", version, err)
+		}
+		select {
+		case body := <-plane.bodies:
+			if version < nodeapi.VersionNpmObservation {
+				t.Errorf("v%d: an observation with nothing an older plane records was sent: %v", version, body)
+			}
+		default:
+			if version >= nodeapi.VersionNpmObservation {
+				t.Errorf("v%d: an npm observation was not sent", version)
+			}
+		}
+	}
+}
+
 // THE BUILD CACHES GO ONLY TO A PLANE THAT KNOWS THEM. An older plane decodes
 // strictly, so a body carrying them would lose the image and Actions halves
 // too; one carrying nothing else is not sent at all.

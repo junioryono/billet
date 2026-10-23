@@ -218,7 +218,7 @@ func TestTheJobsLifeIsWordedFromWhatWasRecorded(t *testing.T) {
 		"held by|launched by process 333333333333, held at the end by process 555555555555, which replaced it",
 		`failure|reason "spot\ninterruption"; disrupted by billet: "spot-interruption" at 2026-10-20T12:03:00.000000000Z`,
 		`caches|image warm (generation "g7"), actions "from-a-newer-binary", sticky not observed, git not observed, ` +
-			"bazel not observed, go not observed",
+			"bazel not observed, go not observed, npm not observed",
 	}
 	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
 		t.Errorf("the job's life reads\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))

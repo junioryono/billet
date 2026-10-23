@@ -241,12 +241,12 @@ INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
-      sticky_cache, git_cache, bazel_cache, go_cache, holder_incarnation, queued_at,
+      sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, holder_incarnation, queued_at,
       finished_at)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @conclusion, @failure_reason,
         @disruption, @disrupted_at, @chosen_provider, @instance_type, @vcpu, @memory,
         @site, @price_micros_per_hour, @image_cache, @cache_generation,
-        @actions_cache, @sticky_cache, @git_cache, @bazel_cache, @go_cache,
+        @actions_cache, @sticky_cache, @git_cache, @bazel_cache, @go_cache, @npm_cache,
         @holder_incarnation, @queued_at, @finished_at)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
@@ -279,6 +279,8 @@ ON CONFLICT (lease_id) DO UPDATE SET
                           THEN excluded.bazel_cache ELSE job_history.bazel_cache END,
   go_cache         = CASE WHEN job_history.go_cache = ''
                           THEN excluded.go_cache ELSE job_history.go_cache END,
+  npm_cache        = CASE WHEN job_history.npm_cache = ''
+                          THEN excluded.npm_cache ELSE job_history.npm_cache END,
   holder_incarnation = CASE WHEN excluded.holder_incarnation != ''
                             THEN excluded.holder_incarnation
                             ELSE job_history.holder_incarnation END;
@@ -335,7 +337,7 @@ UPDATE job_history SET runner_id = @runner_id
 -- than dropped.
 SELECT chosen_provider, instance_type, vcpu, memory, site, price_micros_per_hour,
        image_cache, cache_generation, actions_cache, sticky_cache, git_cache,
-       bazel_cache, go_cache
+       bazel_cache, go_cache, npm_cache
   FROM job_history WHERE lease_id = @lease_id;
 
 -- name: ListJobConclusionsForRequest :many
@@ -403,7 +405,8 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
 -- build caches when a job's session ends, and a job whose lease is still being
 -- torn down has already been served by its caches. Empty tokens are jobs whose
 -- cache outcome was not observed, which a report counts as such.
-SELECT tier, image_cache, actions_cache, sticky_cache, git_cache, bazel_cache, go_cache
+SELECT tier, image_cache, actions_cache, sticky_cache, git_cache, bazel_cache, go_cache,
+       npm_cache
   FROM job_history
  WHERE assigned_at >= @since
  ORDER BY assigned_at DESC
@@ -424,7 +427,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
-       sticky_cache, git_cache, bazel_cache, go_cache, launched_at, registered_at,
+       sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
        holder_incarnation
   FROM job_history WHERE lease_id = @lease_id;

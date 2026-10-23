@@ -151,10 +151,11 @@ func describeCaches(c alloc.CacheObservation) string {
 		image += " (generation " + strconv.Quote(c.CacheGeneration) + ")"
 	}
 
-	return fmt.Sprintf("image %s, actions %s, sticky %s, git %s, bazel %s, go %s", image,
+	return fmt.Sprintf("image %s, actions %s, sticky %s, git %s, bazel %s, go %s, npm %s", image,
 		cacheToken(string(c.ActionsCache), c.ActionsCache.Valid()),
 		cacheToken(string(c.Sticky), c.Sticky.Valid()), cacheToken(string(c.Git), c.Git.Valid()),
-		cacheToken(string(c.Bazel), c.Bazel.Valid()), cacheToken(string(c.Go), c.Go.Valid()))
+		cacheToken(string(c.Bazel), c.Bazel.Valid()), cacheToken(string(c.Go), c.Go.Valid()),
+		cacheToken(string(c.Npm), c.Npm.Valid()))
 }
 
 func cacheToken(token string, known bool) string {

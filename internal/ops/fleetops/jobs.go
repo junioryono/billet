@@ -333,6 +333,7 @@ type cacheJSON struct {
 	Git             string `json:"git"`
 	Bazel           string `json:"bazel"`
 	Go              string `json:"go"`
+	Npm             string `json:"npm"`
 }
 
 // usageJSON is what the host measured. Groups answers for every group, with
@@ -379,6 +380,7 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 			Image: string(rec.Caches.ImageCache), ImageGeneration: rec.Caches.CacheGeneration,
 			Actions: string(rec.Caches.ActionsCache), Sticky: string(rec.Caches.Sticky),
 			Git: string(rec.Caches.Git), Bazel: string(rec.Caches.Bazel), Go: string(rec.Caches.Go),
+			Npm: string(rec.Caches.Npm),
 		},
 	}
 	if u != nil {

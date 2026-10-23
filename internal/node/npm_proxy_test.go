@@ -80,14 +80,26 @@ func (f cachePolicyFunc) CacheAllowed(ctx context.Context, kind config.CacheKind
 func npmService(t *testing.T, registry *fakeRegistry) (*CacheService, CacheCredentials) {
 	t.Helper()
 
+	return npmServiceWith(t, registry, nil, CacheSessionScope{
+		Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
+	})
+}
+
+// npmServiceWith is npmService with a kill switch, consulted when the scope
+// names a repository, and a scope of the test's own.
+func npmServiceWith(t *testing.T, registry *fakeRegistry, policy CachePolicy, scope CacheSessionScope,
+) (*CacheService, CacheCredentials) {
+	t.Helper()
+
 	service, err := NewCacheService("http://127.0.0.1:7718", "test-deployment", t.TempDir(),
 		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	credentials, err := service.PrepareScoped("billet-lease-npm", CacheSessionScope{
-		Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
-	})
+	if policy != nil {
+		service.SetCachePolicy(policy)
+	}
+	credentials, err := service.PrepareScoped("billet-lease-npm", scope)
 	if err != nil {
 		t.Fatalf("PrepareScoped: %v", err)
 	}
@@ -723,6 +735,217 @@ func holdBackTheBody(t *testing.T, conn *tls.Conn) {
 	}
 	if err := raw.SetReadBuffer(64 << 10); err != nil {
 		t.Fatalf("pin the client's receive buffer: %v", err)
+	}
+}
+
+// WHAT THE NPM CACHE DID IS REPORTED WITH THE SESSION'S OTHER CACHES when it
+// ends, for the lease's history: warm once the store answered from what it
+// held, unused when the tier had the cache and the guest never asked.
+func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		fetches int
+		extra   string
+		want    alloc.BuildCache
+	}{
+		"used, and answered from the store the second time": {fetches: 2, want: alloc.BuildCacheWarm},
+		"enabled and never asked":                           {fetches: 0, want: alloc.BuildCacheUnused},
+		// A REQUEST THE STORE NEVER ANSWERS is passed to the registry unread, and
+		// does not ask the cache.
+		"asked only what is passed to the registry": {fetches: 1, extra: "Authorization: Bearer npm_token\r\n",
+			want: alloc.BuildCacheUnused},
+	} {
+		registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+			w.Header().Set("Cache-Control", "public, max-age=300")
+			serveText(t, w, "{}")
+		})
+		service, credentials := npmService(t, registry)
+		observer := &recordingObserver{}
+		service.SetCacheObserver(observer)
+		for range tc.fetches {
+			npmGet(t, service, credentials, npmRequestLine("/reported", tc.extra))
+		}
+		assertNpmQuiet(t, service.npmCache())
+		if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
+			t.Fatalf("%s: Close: %v", name, err)
+		}
+		calls := observer.recorded()
+		if len(calls) == 0 {
+			t.Fatalf("%s: nothing was reported", name)
+		}
+		if got := calls[len(calls)-1].obs.Npm; got != tc.want {
+			t.Errorf("%s: the npm cache reported %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
+// A REQUEST STILL BEING ANSWERED WHEN THE JOB ENDS IS NOT "UNUSED": the guest
+// asked, and what the store did for it is not known yet, so the session reports
+// nothing for the npm cache rather than that it was never asked. Whether the
+// request is waiting on the registry or on the kill switch.
+func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T) {
+	t.Parallel()
+
+	for _, held := range []string{"the registry", "the kill switch"} {
+		reached, release := make(chan struct{}), make(chan struct{})
+		var reachedOnce, releaseOnce sync.Once
+		t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+		hold := func() {
+			reachedOnce.Do(func() { close(reached) })
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+			}
+		}
+		registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+			if held == "the registry" && n == 1 {
+				hold()
+			}
+			w.Header().Set("Cache-Control", "public, max-age=300")
+			serveText(t, w, "{}")
+		})
+		scope := CacheSessionScope{Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true}}
+		var policy CachePolicy
+		if held == "the kill switch" {
+			scope = CacheSessionScope{
+				Trust: provider.TrustUntrusted, Owner: "acme", Repository: "api",
+				Cache: &config.CacheSpec{Npm: true, Publish: config.CachePublishDefaultBranch, Owner: "acme",
+					Repository: "api"},
+			}
+			policy = cachePolicyFunc(func(_ context.Context, kind config.CacheKind, _, _ string) (bool, error) {
+				if kind == config.CacheNpm {
+					hold()
+				}
+
+				return true, nil
+			})
+		}
+		service, credentials := npmServiceWith(t, registry, policy, scope)
+		observer := &recordingObserver{}
+		service.SetCacheObserver(observer)
+
+		conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+		if _, err := conn.Write([]byte(npmRequestLine("/in-flight"))); err != nil {
+			t.Fatalf("%s: write: %v", held, err)
+		}
+		select {
+		case <-reached:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the request was never held", held)
+		}
+		if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
+			t.Fatalf("%s: Close: %v", held, err)
+		}
+		calls := observer.recorded()
+		releaseOnce.Do(func() { close(release) })
+
+		// THE HANDLER IS JOINED: the node closes the connection once it has
+		// answered, so the end of the stream is the handler's return.
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("%s: set a read deadline: %v", held, err)
+		}
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatalf("%s: the held request was never answered: %v", held, err)
+		}
+		_ = resp.Body.Close()
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			t.Fatalf("%s: the node did not close the connection after answering: %v", held, err)
+		}
+		assertNpmQuiet(t, service.npmCache())
+
+		if len(calls) == 0 {
+			t.Fatalf("%s: the session's end reported nothing", held)
+		}
+		for _, call := range calls {
+			if call.obs.Npm != "" {
+				t.Errorf("%s: a session that ended during a request reported the npm cache %q, want nothing",
+					held, call.obs.Npm)
+			}
+		}
+	}
+}
+
+// A REQUEST STILL BEING CLASSIFIED WHEN THE JOB ENDS IS NOT "UNUSED" either: a
+// HEAD asks the store whether it holds the entry, and the store's lock can keep
+// it waiting, so the session settles with nothing noted and the request not yet
+// known to be one the store answers.
+func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t *testing.T) {
+	t.Parallel()
+
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, `{"name":"held"}`)
+	})
+	service, credentials := npmService(t, registry)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	// ANOTHER JOB'S FILL, so the entry is held without this session noting it.
+	other, err := service.PrepareScoped("billet-lease-npm-other", CacheSessionScope{
+		Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	npmGet(t, service, other, npmRequestLine("/held"))
+	if got := noted(service, credentials); got != "" {
+		t.Fatalf("another job's fill noted %q for this one", got)
+	}
+
+	store := service.npmCache().store
+	var unlockOnce sync.Once
+	store.mu.Lock()
+	unlock := func() { unlockOnce.Do(store.mu.Unlock) }
+	t.Cleanup(unlock)
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte("HEAD /held HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	service.mu.Lock()
+	session := service.byToken[credentials.Token]
+	service.mu.Unlock()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		session.mu.Lock()
+		classifying := session.npmClassifying
+		session.mu.Unlock()
+		if classifying > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the HEAD never reached its classification")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	calls := observer.recorded()
+	unlock()
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodHead})
+	if err != nil {
+		t.Fatalf("the HEAD was never answered: %v", err)
+	}
+	_ = resp.Body.Close()
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("the node did not close the connection after answering: %v", err)
+	}
+	assertNpmQuiet(t, service.npmCache())
+
+	if len(calls) == 0 {
+		t.Fatal("the session's end reported nothing")
+	}
+	for _, call := range calls {
+		if call.obs.Npm != "" {
+			t.Errorf("a session that ended while a HEAD was classified reported the npm cache %q, want nothing",
+				call.obs.Npm)
+		}
 	}
 }
 

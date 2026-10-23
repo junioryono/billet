@@ -802,6 +802,9 @@ func (c *Client) RecordCacheObservation(
 		request.StickyCache, request.GitCache = string(obs.Sticky), string(obs.Git)
 		request.BazelCache, request.GoCache = string(obs.Bazel), string(obs.Go)
 	}
+	if c.WireVersion() >= nodeapi.VersionNpmObservation {
+		request.NpmCache = string(obs.Npm)
+	}
 	if request == (nodeapi.CacheObservationRequest{Epoch: epoch}) {
 		return nil
 	}

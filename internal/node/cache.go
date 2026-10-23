@@ -145,6 +145,13 @@ type cacheSession struct {
 	gitAdmit   chan struct{}
 	gitFetch   chan struct{}
 	gitPending int
+	// npmAsked says a request the npm store may answer arrived, under mu. What
+	// it got is noted when it is answered, a tarball fill's only once its body
+	// is in, and a request cut short notes nothing: either way the cache was
+	// asked, so it is never "unused". npmClassifying counts requests not yet
+	// known to be one or the other.
+	npmAsked       bool
+	npmClassifying int
 	// building is what each build cache did so far, under mu; reported when the
 	// session ends.
 	building map[config.CacheKind]alloc.BuildCache
@@ -241,6 +248,7 @@ type cacheObserved struct {
 	GitCache        string `json:"git_cache,omitempty"`
 	BazelCache      string `json:"bazel_cache,omitempty"`
 	GoCache         string `json:"go_cache,omitempty"`
+	NpmCache        string `json:"npm_cache,omitempty"`
 	// Reported says everything above has reached the control plane.
 	Reported bool `json:"reported,omitempty"`
 	// ActionsPending says the first CacheService call was dispatched and its
@@ -258,6 +266,7 @@ func (o cacheObserved) observation() alloc.CacheObservation {
 		BuildCaches: alloc.BuildCaches{
 			Sticky: alloc.BuildCache(o.StickyCache), Git: alloc.BuildCache(o.GitCache),
 			Bazel: alloc.BuildCache(o.BazelCache), Go: alloc.BuildCache(o.GoCache),
+			Npm: alloc.BuildCache(o.NpmCache),
 		},
 	}
 }
@@ -386,6 +395,7 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 	}{
 		{&session.observed.StickyCache, obs.Sticky}, {&session.observed.GitCache, obs.Git},
 		{&session.observed.BazelCache, obs.Bazel}, {&session.observed.GoCache, obs.Go},
+		{&session.observed.NpmCache, obs.Npm},
 	} {
 		if field.outcome != "" && *field.observed == "" {
 			*field.observed = string(field.outcome)
@@ -556,9 +566,11 @@ func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
 		if noted != "" {
 			return noted
 		}
-		// A REFRESH STILL IN FLIGHT IS NOT "UNUSED": its outcome is noted when
-		// it returns, after this report.
-		if kind == config.CacheGit && session.gitPending > 0 {
+		// A REFRESH STILL IN FLIGHT IS NOT "UNUSED": its outcome is noted when it
+		// returns, after this report. Nor is a cache asked for what it never
+		// noted, or one a request is still being classified for.
+		if kind == config.CacheGit && session.gitPending > 0 ||
+			kind == config.CacheNpm && (session.npmAsked || session.npmClassifying > 0) {
 			return ""
 		}
 		if sessionSetting(session, kind).Enabled {
@@ -571,6 +583,7 @@ func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
 	return alloc.BuildCaches{
 		Sticky: outcome(config.CacheSticky), Git: outcome(config.CacheGit),
 		Bazel: outcome(config.CacheBazel), Go: outcome(config.CacheGo),
+		Npm: outcome(config.CacheNpm),
 	}
 }
 

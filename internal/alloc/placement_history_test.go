@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -410,7 +411,7 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 	launched(t, a, lease, "cloud-1")
 
 	builds := BuildCaches{Sticky: BuildCacheWarm, Git: BuildCacheCold, Bazel: BuildCacheUnused,
-		Go: BuildCacheDisabled}
+		Go: BuildCacheDisabled, Npm: BuildCacheUnavailable}
 	first := CacheObservation{ImageCache: ImageCacheCold, ActionsCache: ActionsCacheDisabled,
 		BuildCaches: builds}
 	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, first); err != nil {
@@ -423,7 +424,7 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 	later := CacheObservation{
 		ImageCache: ImageCacheWarm, CacheGeneration: "gen-9", ActionsCache: ActionsCacheServed,
 		BuildCaches: BuildCaches{Sticky: BuildCacheCold, Git: BuildCacheWarm, Bazel: BuildCacheWarm,
-			Go: BuildCacheWarm},
+			Go: BuildCacheWarm, Npm: BuildCacheWarm},
 	}
 	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, later); err != nil {
 		t.Fatalf("a second observation was refused: %v", err)
@@ -469,6 +470,85 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 	if got.ImageCache != ImageCacheCold || got.CacheGeneration != "" ||
 		got.ActionsCache != ActionsCacheDisabled || got.BuildCaches != builds {
 		t.Fatalf("history after the reap = %+v, want the first observation kept", got)
+	}
+}
+
+// THE ARCHIVE COPIES THE NPM OUTCOME from the lease into a history row that
+// lacks it, on every way a lease ends, and keeps one the history already had:
+// the history row is written directly here, so what it holds afterwards is the
+// archive's doing and not the observation's. A lease that never launched is
+// archived by the reaper from its own projection; one that launched is
+// quarantined, and archived from a full load when the quarantine resolves.
+func TestTheArchiveCopiesTheNpmOutcomeOnlyIntoAnEmptyHistory(t *testing.T) {
+	t.Parallel()
+
+	for _, ending := range []string{"released", "reaped before launch", "quarantined"} {
+		for _, history := range []BuildCache{"", BuildCacheWarm} {
+			a := pricedCloudAllocator(t, 340_000)
+			lease, err := a.Reserve(t.Context(), "cloud")
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+			if ending == "reaped before launch" {
+				if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 1, 1); err != nil {
+					t.Fatalf("Assign: %v", err)
+				}
+				if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "cloud-1"); err != nil {
+					t.Fatalf("Bind: %v", err)
+				}
+			} else {
+				launched(t, a, lease, "cloud-1")
+			}
+			if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch,
+				CacheObservation{BuildCaches: BuildCaches{Npm: BuildCacheUnavailable}}); err != nil {
+				t.Fatalf("RecordCacheObservation: %v", err)
+			}
+			if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(t.Context(),
+					`UPDATE job_history SET npm_cache = $1 WHERE lease_id = $2`, string(history), lease.ID)
+
+				return err
+			}); err != nil {
+				t.Fatalf("write the history's npm outcome: %v", err)
+			}
+
+			switch ending {
+			case "released":
+				if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+					t.Fatalf("Release: %v", err)
+				}
+			default:
+				if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+					t.Fatalf("ExpireForTest: %v", err)
+				}
+				if _, err := a.Reap(t.Context()); err != nil {
+					t.Fatalf("Reap: %v", err)
+				}
+			}
+			if ending == "quarantined" {
+				if err := a.ResolveQuarantine(t.Context(), lease.ID, PhaseDone); err != nil {
+					t.Fatalf("ResolveQuarantine: %v", err)
+				}
+			}
+			// A TERMINAL LEASE IS ANSWERED AS NOT FOUND: the history is all that is
+			// left, so it is the archive's.
+			if live, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, ErrLeaseNotFound) {
+				t.Fatalf("%s: the lease did not end: %+v, %v", ending, live, err)
+			}
+
+			got, err := a.HistoryPlacement(t.Context(), lease.ID)
+			if err != nil {
+				t.Fatalf("HistoryPlacement: %v", err)
+			}
+			want := history
+			if want == "" {
+				want = BuildCacheUnavailable
+			}
+			if got.Npm != want {
+				t.Errorf("%s, history holding %q: the archived npm outcome is %q, want %q", ending, history,
+					got.Npm, want)
+			}
+		}
 	}
 }
 

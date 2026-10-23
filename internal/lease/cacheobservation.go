@@ -131,11 +131,13 @@ type BuildCaches struct {
 	Git    BuildCache `json:"git_cache,omitempty"`
 	Bazel  BuildCache `json:"bazel_cache,omitempty"`
 	Go     BuildCache `json:"go_cache,omitempty"`
+	// Npm is the node's npm registry cache (ADR-020), carried from wire 32.
+	Npm BuildCache `json:"npm_cache,omitempty"`
 }
 
 // each names every observation, for the loops that treat them alike.
 func (b BuildCaches) each() map[string]BuildCache {
-	return map[string]BuildCache{"sticky": b.Sticky, "git": b.Git, "bazel": b.Bazel, "go": b.Go}
+	return map[string]BuildCache{"sticky": b.Sticky, "git": b.Git, "bazel": b.Bazel, "go": b.Go, "npm": b.Npm}
 }
 
 // CacheObservation is what a node saw the cache do for one job. Either half

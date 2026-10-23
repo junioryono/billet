@@ -30,7 +30,9 @@ UPDATE leases
        bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST(@bazel_cache AS TEXT)
                                ELSE bazel_cache END,
        go_cache         = CASE WHEN go_cache = '' THEN CAST(@go_cache AS TEXT)
-                               ELSE go_cache END
+                               ELSE go_cache END,
+       npm_cache        = CASE WHEN npm_cache = '' THEN CAST(@npm_cache AS TEXT)
+                               ELSE npm_cache END
  WHERE id = @id AND epoch = @epoch;
 
 -- name: RecordHistoryCacheObservation :exec
@@ -56,5 +58,7 @@ UPDATE job_history
        bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST(@bazel_cache AS TEXT)
                                ELSE bazel_cache END,
        go_cache         = CASE WHEN go_cache = '' THEN CAST(@go_cache AS TEXT)
-                               ELSE go_cache END
+                               ELSE go_cache END,
+       npm_cache        = CASE WHEN npm_cache = '' THEN CAST(@npm_cache AS TEXT)
+                               ELSE npm_cache END
  WHERE lease_id = @lease_id;
