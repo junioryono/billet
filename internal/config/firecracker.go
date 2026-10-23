@@ -72,7 +72,21 @@ type FirecrackerConfig struct {
 	// arbitrary high port to every guest. Only one verification runs per host,
 	// enforced by the verification lock.
 	ImageVerifyPort int `yaml:"image_verify_port,omitempty"`
+	// CPUPlacement pins each microVM's vCPUs to host cpus when it fits:
+	// CPUPlacementCompact or CPUPlacementSpread. Empty, the default, lets every
+	// guest run on every cpu, as it always has.
+	CPUPlacement string `yaml:"cpu_placement,omitempty"`
 }
+
+// The cpu placements a Firecracker node may ask for. COMPACT gives a guest whole
+// cores, both SMT siblings, in the lowest last-level-cache group with room, so
+// busy guests share as few groups as they can and the rest of the host idles.
+// SPREAD gives it one thread per core in the group with the most free cores, so
+// guests share neither cores nor, until the host fills, a cache.
+const (
+	CPUPlacementCompact = "compact"
+	CPUPlacementSpread  = "spread"
+)
 
 // DefaultFirecrackerBinary and friends are where the reference host installs
 // these, which is also where each project's own instructions put them.
@@ -125,6 +139,7 @@ func (f *FirecrackerConfig) Normalize() {
 	f.ChrootBase = strings.TrimSpace(f.ChrootBase)
 	f.Bridge = strings.TrimSpace(f.Bridge)
 	f.UntrustedBridge = strings.TrimSpace(f.UntrustedBridge)
+	f.CPUPlacement = strings.TrimSpace(f.CPUPlacement)
 
 	for _, d := range []struct {
 		into  *string
@@ -207,6 +222,14 @@ func CheckFirecracker(f FirecrackerConfig) []error {
 	if f.ImageVerifyPort < 1 || f.ImageVerifyPort > 65535 {
 		errs = append(errs, fmt.Errorf("node.firecracker.image_verify_port is %d; expected 1-65535",
 			f.ImageVerifyPort))
+	}
+
+	switch f.CPUPlacement {
+	case "", CPUPlacementCompact, CPUPlacementSpread:
+	default:
+		errs = append(errs, fmt.Errorf("node.firecracker.cpu_placement is %q; expected %s or %s, or "+
+			"nothing for guests that run on every cpu", f.CPUPlacement, CPUPlacementCompact,
+			CPUPlacementSpread))
 	}
 
 	return errs

@@ -587,6 +587,19 @@ var theInstance = provider.InstanceName(theLease)
 func newHarness(t *testing.T, opts ...Option) *harness {
 	t.Helper()
 
+	h, err := tryHarness(t, opts...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	return h
+}
+
+// tryHarness is newHarness for a test about what the constructor refuses: it
+// returns New's error rather than failing.
+func tryHarness(t *testing.T, opts ...Option) (*harness, error) {
+	t.Helper()
+
 	base := t.TempDir()
 	bin := filepath.Join(base, "firecracker-v1.16.1")
 
@@ -670,7 +683,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 
 	p, err := New(testDeployment, cfg, h.disk, append(fixed, opts...)...)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		return nil, err
 	}
 
 	h.p = p
@@ -715,7 +728,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		return h.flushErr
 	}
 
-	return h
+	return h, nil
 }
 
 // aCPUInfo is two identical x86 cores, as /proc/cpuinfo lists them.

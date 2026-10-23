@@ -96,7 +96,9 @@ The per-sample series a node reports with each job records the wall time of its 
 
 ### `node.firecracker` (required for firecracker, refused otherwise)
 
-`binary_path`, `jailer_path`, `kernel_image` (required; the fallback for a generation that recorded no kernel), `kernel_dir`, `chroot_base`, `jail_uid_min`, `jail_uid_count`, `bridge` (required), `untrusted_bridge` (absent means untrusted work is refused), `image_verify_port`.
+`binary_path`, `jailer_path`, `kernel_image` (required; the fallback for a generation that recorded no kernel), `kernel_dir`, `chroot_base`, `jail_uid_min`, `jail_uid_count`, `bridge` (required), `untrusted_bridge` (absent means untrusted work is refused), `image_verify_port`, `cpu_placement`.
+
+`cpu_placement` pins each microVM's vCPUs to host cpus through its cgroup's `cpuset.cpus`, and is absent by default, which lets every guest run on every cpu. `compact` gives a guest whole cores, both SMT siblings, in the lowest last-level-cache group (an EPYC CCD) with room for it, so busy guests share as few groups as possible. `spread` gives it one thread per core, in the group with the most free cores. Each cpu is claimed for one guest at a time, like its uid and tap, and recorded in its jail, so a restarted node keeps what each running guest holds. A guest the placement cannot fit runs on every cpu, with a warning, rather than being refused. The node refuses to start when the host's cpus cannot be read or its cgroup hierarchy has no `cpuset` controller.
 
 ### `node.ceph` (required for firecracker, refused otherwise)
 

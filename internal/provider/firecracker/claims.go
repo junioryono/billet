@@ -452,6 +452,9 @@ type resources struct {
 	UID int    `json:"uid"`
 	GID int    `json:"gid"`
 	Tap string `json:"tap"`
+	// CPUs are the host cpus a placement pinned the guest to, in the kernel's
+	// cpu list form; empty for a guest that runs on every cpu.
+	CPUs string `json:"cpus,omitempty"`
 }
 
 // claimResources takes everything the host allocates for one microVM and records it
@@ -512,7 +515,8 @@ func (p *Provider) releaseResources(res resources, jailID string) error {
 
 // releaseResourcesLocked is releaseResources for a caller holding lockClaims.
 func (p *Provider) releaseResourcesLocked(res resources, jailID string) error {
-	return errors.Join(p.releaseUID(res.UID, jailID), p.releaseTap(res.Tap, jailID))
+	return errors.Join(p.releaseUID(res.UID, jailID), p.releaseTap(res.Tap, jailID),
+		p.releaseCPUs(res.CPUs, jailID))
 }
 
 // claimedBy finds what a microVM still holds when its jail is already gone.
@@ -528,10 +532,11 @@ func (p *Provider) releaseResourcesLocked(res resources, jailID string) error {
 func (p *Provider) claimedBy(jailID string) (resources, error) {
 	var (
 		res      resources
+		cpus     []int
 		failures []error
 	)
 
-	for _, kind := range []string{"uids", "taps"} {
+	for _, kind := range []string{"uids", "taps", "cpus"} {
 		entries, err := os.ReadDir(p.claimsDir(kind))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -568,14 +573,22 @@ func (p *Provider) claimedBy(jailID string) (resources, error) {
 				continue
 			}
 
-			uid, err := strconv.Atoi(entry.Name())
+			n, err := strconv.Atoi(entry.Name())
 			if err != nil {
 				continue
 			}
 
-			res.UID, res.GID = uid, uid
+			if kind == "cpus" {
+				cpus = append(cpus, n)
+
+				continue
+			}
+
+			res.UID, res.GID = n, n
 		}
 	}
+
+	res.CPUs = formatCPUList(cpus)
 
 	return res, errors.Join(failures...)
 }
