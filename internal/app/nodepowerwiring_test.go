@@ -1,10 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 )
 
@@ -33,80 +36,70 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 		t.Fatal("node.go has no (*Node).Run")
 	}
 
-	at := map[string]token.Pos{}
-	note := func(name string, pos token.Pos) {
-		if _, seen := at[name]; !seen {
-			at[name] = pos
+	// EACH STEP IS ONE OF Run's OWN STATEMENTS, or the whole body of a plain
+	// `if powerCtl != nil` among them, matched as printed: a step inside another
+	// condition, behind an init that shadows a name, or with its result
+	// discarded is not the step.
+	steps := make([]string, 0, len(run.Body.List))
+	for _, stmt := range run.Body.List {
+		if ifs, ok := stmt.(*ast.IfStmt); ok && ifs.Init == nil && ifs.Else == nil &&
+			types.ExprString(ifs.Cond) == "powerCtl != nil" {
+			body := make([]string, 0, len(ifs.Body.List))
+			for _, s := range ifs.Body.List {
+				body = append(body, render(t, fset, s))
+			}
+			steps = append(steps, "if powerCtl != nil { "+strings.Join(body, "; ")+" }")
+
+			continue
+		}
+		steps = append(steps, render(t, fset, stmt))
+	}
+
+	want := []string{
+		"powerCtl, err := openNodePower(ctx, cfg, sysfsRoot, runtime.GOOS, n.powered)",
+		"closePower := func() {}",
+		"if powerCtl != nil { closePower = sync.OnceFunc(func() { closeNodePower(ctx, powerCtl) }); defer closePower() }",
+		"cacheService, serveCache, stopCache, err := startNodeCache(",
+		"if powerCtl != nil { runnerOpts = append(runnerOpts, node.WithPower(powerCtl)) }",
+		"runner := NewNodeRunner(n.client, cfg.Node.Name, p, slog.Default(), runnerOpts...)",
+		"if powerCtl != nil { stopPower := runNodePower(ctx, powerCtl, runner.Idle, closePower); defer stopPower() }",
+		"err = RunNodeLoop(",
+	}
+	at := 0
+	for _, w := range want {
+		found := false
+		for ; at < len(steps); at++ {
+			if strings.HasPrefix(steps[at], w) {
+				found = true
+
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("(*Node).Run lacks, in order, the statement %q", w)
 		}
 	}
-	ast.Inspect(run.Body, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.DeferStmt:
-			switch types.ExprString(n.Call) {
-			case "closePower()":
-				note("defer close", n.Pos())
-			case "stopPower()":
-				note("defer stop", n.Pos())
-			}
-		case *ast.AssignStmt:
-			// THE OPTION IS KEPT IN THE SLICE THE RUNNER IS BUILT FROM, not discarded.
-			if n.Tok == token.ASSIGN && len(n.Lhs) == 1 && len(n.Rhs) == 1 &&
-				types.ExprString(n.Lhs[0]) == "runnerOpts" &&
-				types.ExprString(n.Rhs[0]) == "append(runnerOpts, node.WithPower(powerCtl))" {
-				note("node.WithPower", n.Pos())
-			}
-			// ASSIGNED TO THE closePower BOTH DEFERS CALL, not shadowed or discarded.
-			if n.Tok == token.ASSIGN && len(n.Lhs) == 1 && len(n.Rhs) == 1 &&
-				types.ExprString(n.Lhs[0]) == "closePower" {
-				if call, ok := n.Rhs[0].(*ast.CallExpr); ok && types.ExprString(call.Fun) == "sync.OnceFunc" &&
-					len(call.Args) == 1 && closesOnce(call.Args[0]) {
-					note("closePower = sync.OnceFunc", n.Pos())
-				}
-			}
-		case *ast.CallExpr:
-			switch name := types.ExprString(n.Fun); name {
-			case "openNodePower":
-				if len(n.Args) == 5 && types.ExprString(n.Args[4]) == "n.powered" {
-					note(name, n.Pos())
-				}
-			case "NewNodeRunner":
-				if n.Ellipsis.IsValid() && types.ExprString(n.Args[len(n.Args)-1]) == "runnerOpts" {
-					note(name, n.Pos())
-				}
-			case "runNodePower":
-				if len(n.Args) == 4 && types.ExprString(n.Args[2]) == "runner.Idle" &&
-					types.ExprString(n.Args[3]) == "closePower" {
-					note(name, n.Pos())
-				}
-			case "startNodeCache", "RunNodeLoop":
-				note(name, n.Pos())
-			}
-		}
 
-		return true
-	})
-
-	order := []string{"openNodePower", "closePower = sync.OnceFunc", "defer close", "startNodeCache", "node.WithPower",
-		"NewNodeRunner", "runNodePower", "defer stop", "RunNodeLoop"}
-	for i, name := range order {
-		if _, ok := at[name]; !ok {
-			t.Fatalf("(*Node).Run lost %s, or calls it with other arguments", name)
-		}
-		if i > 0 && at[order[i-1]] >= at[name] {
-			t.Errorf("(*Node).Run has %s before %s", name, order[i-1])
+	// NOTHING REPLACES WHAT THE STEPS BUILT between them.
+	for _, s := range steps {
+		for _, rebound := range []string{"runnerOpts = nil", "closePower = func", "runnerOpts = []"} {
+			if strings.HasPrefix(s, rebound) {
+				t.Errorf("(*Node).Run replaces what the power wiring built: %q", s)
+			}
 		}
 	}
 }
 
-// closesOnce reports whether e is func() { closeNodePower(ctx, powerCtl) }.
-func closesOnce(e ast.Expr) bool {
-	lit, ok := e.(*ast.FuncLit)
-	if !ok || len(lit.Body.List) != 1 {
-		return false
-	}
-	es, ok := lit.Body.List[0].(*ast.ExprStmt)
+// render prints one statement on one line, as the audit compares it.
+func render(t *testing.T, fset *token.FileSet, stmt ast.Stmt) string {
+	t.Helper()
 
-	return ok && types.ExprString(es.X) == "closeNodePower(ctx, powerCtl)"
+	var b bytes.Buffer
+	if err := format.Node(&b, fset, stmt); err != nil {
+		t.Fatal(err)
+	}
+
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 // OPENNODE RESTORES A LEFTOVER BEFORE IT BUILDS ANYTHING THAT CAN REFUSE THE
