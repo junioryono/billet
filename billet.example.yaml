@@ -499,7 +499,9 @@ node:
   # 10s). disable_boost writes 0 to /sys/devices/system/cpu/cpufreq/boost, and
   # idle_max_freq_khz is written to every policy's scaling_max_freq; it must be
   # one of each policy's scaling_available_frequencies, or the node refuses to
-  # start rather than let the kernel round it. Every launch restores what was
+  # start rather than let the kernel round it. A cap is taken only while every
+  # ceiling is at its full, so a firmware limit is never written back as
+  # yours. Every launch restores what was
   # there before the VMM starts, waiting at most 2s for it. What a cap changed
   # is recorded under state_dir (power-baseline.json) before the first write,
   # and a node that finds that record at its start restores it, whatever this
