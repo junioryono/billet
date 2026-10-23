@@ -383,13 +383,44 @@ func isolatedGitEnviron() []string {
 func gitNode(t *testing.T, upstream *gitUpstream) (*CacheService, *httptest.Server, string) {
 	t.Helper()
 
+	service, node, token, _ := gitNodeOnClock(t, upstream)
+
+	return service, node, token
+}
+
+// gitNodeOnClock is gitNode with the clock its handlers read, for a test that
+// moves the node's time while it serves.
+func gitNodeOnClock(t *testing.T, upstream *gitUpstream) (*CacheService, *httptest.Server, string, *gitClock) {
+	t.Helper()
+
 	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
 	service.git.upstream, service.git.api = upstream.URL, upstream.URL+"/api"
 	service.git.fullFraction = 1
+	clock := clockNode(service)
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 
-	return service, node, token
+	return service, node, token, clock
+}
+
+// gitClock is the node's time while its test moves it: real time plus an
+// offset, which the test sets while the node's handlers read it.
+type gitClock struct{ offset atomic.Int64 }
+
+func (c *gitClock) now() time.Time { return time.Now().Add(time.Duration(c.offset.Load())) }
+
+// set moves the clock to real time plus offset.
+func (c *gitClock) set(offset time.Duration) { c.offset.Store(int64(offset)) }
+
+// clockNode gives service a gitClock. THE CLOCK IS SET BEFORE THE NODE SERVES
+// and never replaced: a handler reads service.now with nothing ordering it
+// against a later assignment, which the race detector reported (CI,
+// 2026-10-23), however long after the request it came.
+func clockNode(service *CacheService) *gitClock {
+	clock := &gitClock{}
+	service.now = clock.now
+
+	return clock
 }
 
 // A SECOND CLONE IS SERVED FROM THE NODE'S MIRROR, fetching nothing from
@@ -633,6 +664,9 @@ func TestAFetchAStaleMirrorLacksGoesToGitHub(t *testing.T) {
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("clone: %v\n%s", err, output)
 	}
+	// THE CLONE'S REFRESH AND REPACK END FIRST: the repack reads the fraction,
+	// and the race detector reported the write beside it (2026-10-23).
+	awaitIdleMirror(t, service, "untrusted/acme/api")
 	service.git.fullFraction = 0
 	pushed := upstream.commitTo(t, "main", map[string]string{"new": "1\n"})
 	before := upstream.fetches.Load()

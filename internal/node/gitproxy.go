@@ -2050,6 +2050,9 @@ func (s *CacheService) fetchMirror(
 	defer stop(nil)
 	done := make(chan struct{})
 	defer close(done)
+	// READ ONCE, before the watchdog starts: the watchdog is not joined, so a
+	// tick that began before done closed may still read after this returns.
+	root, fraction := s.git.root, s.git.fullFraction
 	go func() {
 		ticker := time.NewTicker(gitWatchEvery)
 		defer ticker.Stop()
@@ -2066,7 +2069,7 @@ func (s *CacheService) fetchMirror(
 
 				return
 			}
-			if full, err := filledAbove(s.git.root, s.git.fullFraction); err == nil && full {
+			if full, err := filledAbove(root, fraction); err == nil && full {
 				stop(errGitDiskFull)
 
 				return

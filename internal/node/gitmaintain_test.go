@@ -61,7 +61,7 @@ func TestAnUnreachableObjectIsKeptForItsRetentionThenPruned(t *testing.T) {
 	t.Parallel()
 
 	upstream := newGitUpstream(t)
-	service, node, token := gitNode(t, upstream)
+	service, node, token, clock := gitNodeOnClock(t, upstream)
 	git := gitClient(t, node, token, githubBasic)
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("clone: %v\n%s", err, output)
@@ -118,10 +118,9 @@ func TestAnUnreachableObjectIsKeptForItsRetentionThenPruned(t *testing.T) {
 	// THE DAILY REPACK REMOVES NOTHING, even what is past the window: the first
 	// sets the commit aside, dated now, and one a window later keeps it.
 	maintain(gitMaintainFull)
-	later := time.Now().Add(gitPruneAfter + 24*time.Hour)
-	service.now = func() time.Time { return later }
+	clock.set(gitPruneAfter + 24*time.Hour)
 	maintain(gitMaintainFull)
-	service.now = time.Now
+	clock.set(0)
 	if !hasObject(t, path, orphan) {
 		t.Fatal("the daily repack removed an unreachable commit")
 	}
@@ -158,7 +157,7 @@ func TestAnUnreachableObjectIsKeptForItsRetentionThenPruned(t *testing.T) {
 		t.Errorf("a mirror just pruned is due %q, want nothing", due)
 	}
 
-	service.now = func() time.Time { return later }
+	clock.set(gitPruneAfter + 24*time.Hour)
 	maintain(gitMaintainPrune)
 	if hasObject(t, path, orphan) {
 		t.Fatal("pruning past the retention window kept the unreachable commit")
