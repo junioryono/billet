@@ -390,10 +390,18 @@ func TestTheProxyReachesGitHubOverHTTP1(t *testing.T) {
 
 // A GIT REQUEST ON WHICH NO BYTE MOVES ENDS AT THE IDLE LIMIT, however long its
 // deadline; one whose bytes keep moving runs past that limit to its end.
+//
+// THE MOVING ONE SENDS A BYTE EVERY 50 ms AGAINST A ONE-SECOND LIMIT, for longer
+// than the limit in all. Against a 300 ms limit, a pause of the test process under
+// -race in CI ended it after one byte (unexpected EOF, 2026-10-23); the same
+// cadence under a limit twenty times its gap leaves room for such a pause.
 func TestAStalledGitRequestEndsAndAMovingOneDoesNot(t *testing.T) {
 	t.Parallel()
 
-	const idle = 300 * time.Millisecond
+	const idle = time.Second
+	// 30 bytes 50 ms apart: the last at 1.45 s and the end at 1.5 s, past the
+	// 1 s limit, so the request cannot finish before the limit and prove nothing.
+	const movingBytes = 30
 	var stallEnded atomic.Bool
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
@@ -411,12 +419,12 @@ func TestAStalledGitRequestEndsAndAMovingOneDoesNot(t *testing.T) {
 			<-r.Context().Done()
 			stallEnded.Store(true)
 		case strings.HasPrefix(r.URL.Path, "/acme/moving"):
-			for range 24 {
+			for range movingBytes {
 				if _, err := io.WriteString(w, "x"); err != nil {
 					return
 				}
 				flusher.Flush()
-				time.Sleep(idle / 6)
+				time.Sleep(idle / 20)
 			}
 		}
 	}))
@@ -466,7 +474,7 @@ func TestAStalledGitRequestEndsAndAMovingOneDoesNot(t *testing.T) {
 
 		return answer{body, err}
 	})
-	if moving.err != nil || string(moving.body) != strings.Repeat("x", 24) {
+	if moving.err != nil || string(moving.body) != strings.Repeat("x", movingBytes) {
 		t.Fatalf("a request whose bytes kept moving past the idle limit ended with %q (%v)", moving.body, moving.err)
 	}
 }
