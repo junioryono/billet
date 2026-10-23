@@ -60,24 +60,27 @@ func TestRealCapAndRestoreOnThisHost(t *testing.T) {
 	}
 
 	const sysfs = "/sys"
+	// THE BASELINE IS READ UNDER THE HOST'S CLAIM: a node running node.power
+	// here could have a cap in force, which this test would take for the
+	// baseline and write back.
+	probe, err := New(Options{SysfsRoot: sysfs, StateDir: t.TempDir(), Settings: settings})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := probe.ClaimHost(); err != nil {
+		t.Fatalf("claim the host's cpufreq: %v", err)
+	}
 	baseline, err := readBaseline(sysfs)
 	if err != nil {
+		probe.ReleaseHost()
 		t.Fatalf("read the host's cpufreq baseline: %v", err)
 	}
 	// THE BASELINE IS PROVED FULL BEFORE ANYTHING CAN WRITE IT BACK, as the
 	// controller proves it before it caps: a ceiling firmware is holding low for
 	// a moment would otherwise be written back as a lasting cap.
-	probe, err := New(Options{SysfsRoot: sysfs, StateDir: t.TempDir(), Settings: settings})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
 	if err := baseline.requireFull(probe); err != nil {
+		probe.ReleaseHost()
 		t.Fatal(err)
-	}
-	// NOTHING IS WRITTEN WHILE ANOTHER PROCESS HOLDS THE HOST: a node running
-	// node.power here would have its cap undone, or its baseline overwritten.
-	if err := probe.ClaimHost(); err != nil {
-		t.Fatalf("claim the host's cpufreq: %v", err)
 	}
 	probe.ReleaseHost()
 	// REGISTERED FIRST, SO IT RUNS LAST, after every run's own shutdown: the host

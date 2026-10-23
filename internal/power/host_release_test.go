@@ -63,5 +63,38 @@ func TestARestoreOnlyControllerClaimsWhenItCanAndGivesTheHostBack(t *testing.T) 
 	if err := holder.ClaimHost(); err != nil {
 		t.Fatalf("the restore-only controller kept the host after restoring: %v", err)
 	}
+
+	// WITH NOTHING OWED IT NEITHER CLAIMS NOR REPORTS, however long another
+	// process holds the host.
+	c.step(t.Context(), func() bool { return true })
+	if c.claimed() || !c.failing.IsZero() {
+		t.Fatalf("a restore-only controller with nothing owed claimed (%v) or reported a failure (%v)",
+			c.claimed(), c.failing)
+	}
 	holder.ReleaseHost()
+}
+
+// A TICK THAT RUNS AFTER CLOSE DOES NOTHING: it neither claims the host back
+// nor writes, so a successor's claim is never refused by a closed controller.
+func TestATickAfterCloseLeavesTheHostFree(t *testing.T) {
+	h := newFakeHost(t, 1)
+	c, stateDir := newController(t, h, capBoth, nil)
+	capNow(t, c)
+	if err := c.Close(t.Context()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	h.requireFull(stateDir)
+
+	c.step(t.Context(), func() bool { return true })
+	if c.claimed() {
+		t.Fatal("a tick after Close claimed the host again")
+	}
+	other, err := New(Options{SysfsRoot: h.root, StateDir: t.TempDir(), Log: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.ClaimHost(); err != nil {
+		t.Fatalf("a successor's claim after the closed controller's tick: %v", err)
+	}
+	other.ReleaseHost()
 }

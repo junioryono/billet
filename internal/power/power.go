@@ -154,6 +154,8 @@ type Controller struct {
 	mu       sync.Mutex
 	busyAt   time.Time
 	stopping bool
+	// closed is set by Close: the loop does nothing more after it.
+	closed bool
 	// inflight is the background restore not yet ended; see restoreAsync.
 	inflight *restoreRun
 
@@ -997,6 +999,13 @@ func (c *Controller) busySince() time.Time {
 	return c.busyAt
 }
 
+func (c *Controller) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.closed
+}
+
 func (c *Controller) isStopping() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1135,9 +1144,23 @@ func (c *Controller) step(ctx context.Context, idle func() bool) {
 	}
 	defer c.release()
 
+	// A TICK THAT WON THE RACE WITH ITS STOP DOES NOTHING: select picks among
+	// ready cases at random, and a claim taken here after Close released the
+	// host would never be given back.
+	if ctx.Err() != nil || c.isClosed() {
+		return
+	}
+	// A RESTORE-ONLY CONTROLLER WITH NOTHING OWED neither claims nor reports,
+	// so it never keeps another node from starting.
+	if !c.settings.caps() && state(c.st.Load()) == stateFull {
+		c.ReleaseHost()
+
+		return
+	}
+
 	// A CONTROLLER THAT COULD NOT CLAIM THE HOST AT ITS START, one that only
 	// restores, claims it once it is free, and gives it back once nothing is
-	// owed, so it never keeps another node from starting.
+	// owed.
 	if !c.claimed() {
 		if err := c.ClaimHost(); err != nil {
 			c.restoreFailed("claim", err)
@@ -1208,6 +1231,9 @@ func (c *Controller) step(ctx context.Context, idle func() bool) {
 // it once its loop has returned.
 func (c *Controller) Close(ctx context.Context) error {
 	c.BeginStop()
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
 	defer c.releaseWhenIdle()
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.stopBound)
