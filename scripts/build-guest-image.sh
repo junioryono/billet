@@ -1551,7 +1551,12 @@ container_dns_active=""
 # THE NPM REGISTRY IS A SECOND INTERCEPTED ORIGIN (ADR-020), named by its own key
 # so a node that does not serve it never names it, and the authority comes with
 # either. Each fetch is contained: a key that is absent is the ordinary case.
+#
+# BILLET_INTERCEPTION_METADATA_BEGIN — the block between these markers is
+# extracted and EXECUTED against a fake metadata fetch by
+# TestTheAgentTakesUpEachInterceptedOriginOnlyWithItsAuthority.
 npm_proxy=""
+interception_named=""
 if ! actions_proxy_candidate=$(fetch actions-proxy 2>/dev/null); then
 	actions_proxy_candidate=""
 fi
@@ -1560,6 +1565,12 @@ if ! npm_proxy_candidate=$(fetch npm-proxy 2>/dev/null); then
 fi
 if { [ -n "$actions_proxy_candidate" ] || [ -n "$npm_proxy_candidate" ]; } &&
 	actions_ca_candidate=$(fetch actions-ca-pem 2>/dev/null) && [ -n "$actions_ca_candidate" ]; then
+	interception_named=1
+	actions_proxy=$actions_proxy_candidate
+	npm_proxy=$npm_proxy_candidate
+fi
+# BILLET_INTERCEPTION_METADATA_END
+if [ -n "$interception_named" ]; then
 	actions_ca_dir=/home/runner/runner/_work/_billet
 	actions_ca_path="$actions_ca_dir/actions-cache-ca.pem"
 	actions_hook_path="$actions_ca_dir/actions-cache-job-started.sh"
@@ -1621,8 +1632,6 @@ fi
 ACTIONS_HOOK
 	chown runner:runner "$actions_hook_path"
 	chmod 0555 "$actions_hook_path"
-	actions_proxy=$actions_proxy_candidate
-	npm_proxy=$npm_proxy_candidate
 
 	# THE NODE CA JOINS THE GUEST SYSTEM TRUST STORE, not only the runner's env.
 	# The DNS remap captures EVERY process in the guest, including dockerd and the
@@ -1900,6 +1909,10 @@ fi
 # to a dead listener. It runs whenever container DNS was configured -- which happens
 # only when a real upstream was found -- so a resolver outage falls through to those
 # upstreams rather than breaking container DNS.
+#
+# BILLET_CONTAINER_DNS_BEGIN — the block between these markers is extracted and
+# EXECUTED against a fake service manager by
+# TestTheContainerResolverNeverAnswersFromTheGuestsHostsFile.
 if [ -n "$container_dns_active" ]; then
 	upstream_resolv=/run/systemd/resolve/resolv.conf
 	if [ ! -s "$upstream_resolv" ]; then
@@ -1924,6 +1937,7 @@ if [ -n "$container_dns_active" ]; then
 		log "the container cache resolver did not start; containers will use GitHub's cache directly"
 	fi
 fi
+# BILLET_CONTAINER_DNS_END
 
 # THE COMMAND ARRIVES AS JSON IN A STRING, and both halves of that are deliberate.
 #
@@ -2248,7 +2262,12 @@ fi
 # cache's, for containers, which never meet the npm remap.
 # BILLET_NPM_ENV_BEGIN
 if [ -n "$npm_cache_active" ] && [ -z "$actions_cache_active" ]; then
-	runner_env+=("NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path")
+	# EVERY VARIABLE A CLIENT HONOURS, as the Actions hook publishes them: Python's
+	# requests reads its own bundle and never SSL_CERT_FILE, and curl prefers
+	# CURL_CA_BUNDLE where it is set. The bundle carries the distribution roots,
+	# so no client loses the trust it had.
+	runner_env+=("NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path"
+		"REQUESTS_CA_BUNDLE=$actions_ca_path" "CURL_CA_BUNDLE=$actions_ca_path")
 fi
 # BILLET_NPM_ENV_END
 if [ -n "$registry_mirrors_json" ]; then

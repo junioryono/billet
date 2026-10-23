@@ -131,6 +131,7 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 	}
 
 	upstream := map[string]int64{}
+	answers := map[string]map[string]int{}
 	var requests atomic.Int64
 	wrapped := false
 	run := func(job, step string) {
@@ -168,7 +169,22 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Minute)
 		defer cancel()
-		command := exec.CommandContext(ctx, docker, "run", "--rm", "--network", "host",
+		// NAMED, AND REMOVED HOWEVER THE RUN ENDS: a cancelled docker CLI does not
+		// stop the container the daemon runs, which would keep the npm loopback
+		// address on the shared host.
+		name := "billet-npm-live-" + strconv.Itoa(os.Getpid()) + "-" + job
+		t.Cleanup(func() {
+			// NOT the test's own context, which has ended by the time this runs.
+			removeCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
+			defer cancel()
+			// `docker rm -f` of a container --rm already removed answers "no such
+			// container", which is the ordinary case and not worth reporting.
+			if output, err := exec.CommandContext(removeCtx, docker, "rm", "-f", name).CombinedOutput(); err != nil &&
+				!strings.Contains(string(output), "No such container") {
+				t.Logf("remove %s: %v: %s", name, err, output)
+			}
+		})
+		command := exec.CommandContext(ctx, docker, "run", "--rm", "--name", name, "--network", "host",
 			"--add-host", npmRegistryHost+":127.0.2.1",
 			"-v", work+":/work",
 			"-e", "NODE_EXTRA_CA_CERTS=/work/ca.pem",
@@ -179,8 +195,9 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 		output, err := command.CombinedOutput()
 		elapsed := time.Since(started)
 		upstream[job] = requests.Load() - before
+		answers[job] = npmCounts(logs.String()[logged:])
 		t.Logf("%s: %s, %d requests to the registry from the node; answers %s\n%s", job,
-			elapsed.Round(time.Millisecond), upstream[job], npmTally(logs.String()[logged:]),
+			elapsed.Round(time.Millisecond), upstream[job], npmTally(answers[job]),
 			tail(string(output), 15))
 		if err != nil {
 			t.Fatalf("%s failed: %v\nnode log:\n%s", job, err, tail(logs.String(), 40))
@@ -202,10 +219,17 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 const started = Date.now();
 (async () => {
   for (let i = 0; i < 2; i++) {
-    const doc = await (await fetch("https://registry.npmjs.org/@pnpm/exe.linux-x64/12.4.2")).json();
+    const fetchStarted = Date.now();
+    const document = await fetch("https://registry.npmjs.org/@pnpm/exe.linux-x64/12.4.2");
+    if (document.status !== 200) throw new Error("the version document answered " + document.status);
+    const doc = await document.json();
     const tarball = await fetch(doc.dist.tarball);
+    if (tarball.status !== 200) throw new Error("the tarball answered " + tarball.status);
     const bytes = (await tarball.arrayBuffer()).byteLength;
-    console.log("pnpm exe fetch", i + 1, "status", tarball.status, "bytes", bytes, "ms", Date.now() - started);
+    const took = Date.now() - fetchStarted;
+    console.log("pnpm exe fetch", i + 1, "status", tarball.status, "bytes", bytes, "ms", took);
+    // THE BUDGET pnpm/setup GIVES ITS DOWNLOAD, the one #631 records it missing.
+    if (took > 30000) throw new Error("the download took " + took + " ms, past the 30 s pnpm/setup allows");
   }
 })().catch((e) => { console.error(e); process.exit(1); });'`
 	run("pnpm-setup", pnpm)
@@ -221,12 +245,19 @@ const started = Date.now();
 		t.Errorf("the second job made %d requests of the registry, more than a tenth of the first's %d",
 			upstream["warm-ci"], upstream["cold-install"])
 	}
+	// AND THE SECOND JOB WAS ANSWERED BY THE NODE, not by a relay that failed
+	// open past it: a refused tunnel would also make no request from the node.
+	warm := answers["warm-ci"]
+	if warm["tarball/warm/200"] == 0 || warm["tarball/filled/200"] != 0 || warm["spliced"] != 0 {
+		t.Errorf("the second job's answers from the node = %v; want every tarball warm, none filled or spliced",
+			warm)
+	}
 	t.Logf("node log (last lines):\n%s", tail(logs.String(), 20))
 }
 
-// npmTally counts the node's answers in a stretch of its log by what was asked
+// npmCounts counts the node's answers in a stretch of its log by what was asked
 // for and how it was answered, and the requests it passed to the registry.
-func npmTally(log string) string {
+func npmCounts(log string) map[string]int {
 	counts := map[string]int{}
 	for _, line := range strings.Split(log, "\n") {
 		switch {
@@ -236,6 +267,12 @@ func npmTally(log string) string {
 			counts["spliced"]++
 		}
 	}
+
+	return counts
+}
+
+// npmTally renders npmCounts in a stable order.
+func npmTally(counts map[string]int) string {
 	keys := make([]string, 0, len(counts))
 	for key := range counts {
 		keys = append(keys, key)
