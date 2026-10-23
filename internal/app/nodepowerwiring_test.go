@@ -63,7 +63,8 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 		"if powerCtl != nil { runnerOpts = append(runnerOpts, node.WithPower(powerCtl)) }",
 		"runner := NewNodeRunner(n.client, cfg.Node.Name, p, slog.Default(), runnerOpts...)",
 		"if powerCtl != nil { stopPower := runNodePower(ctx, powerCtl, runner.Idle, closePower); defer stopPower() }",
-		"err = RunNodeLoop(",
+		// THE LOOP RUNS THE RUNNER THE POLICY ASKS, or Idle never sees a recovery.
+		"err = RunNodeLoop(ctx, n.client, runner,",
 	}
 	at := 0
 	for _, w := range want {
