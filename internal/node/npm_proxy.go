@@ -177,6 +177,14 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, cacheHandlerLimit)
 	defer cancel()
+	session.mu.Lock()
+	session.npmPending++
+	session.mu.Unlock()
+	defer func() {
+		session.mu.Lock()
+		session.npmPending--
+		session.mu.Unlock()
+	}()
 	n.serve(requestCtx, tlsConn, req.WithContext(requestCtx), request, session)
 }
 

@@ -1596,13 +1596,15 @@ func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
 	// A PAIRING NEGOTIATED BELOW VersionNpmObservation carries no npm outcome:
 	// one that arrives anyway is dropped, not recorded as something its wire
 	// does not carry, and the rest of the observation is kept.
+	dropped := false
 	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
-		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionNpmObservation {
-		obs.Npm = ""
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionNpmObservation && obs.Npm != "" {
+		obs.Npm, dropped = "", true
 	}
 	// AN OBSERVATION THAT WAS ONLY THAT is answered as recorded: there is nothing
-	// its wire carries left to keep, and Validate refuses an empty one.
-	if obs.ImageCache == "" && obs.ActionsCache == "" && obs.BuildCaches == (alloc.BuildCaches{}) {
+	// its wire carries left to keep. Only one the drop emptied: an observation
+	// that came empty, or with only a generation, is still Validate's to refuse.
+	if dropped && obs == (alloc.CacheObservation{}) {
 		w.WriteHeader(http.StatusNoContent)
 
 		return

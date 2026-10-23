@@ -763,6 +763,60 @@ func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
 	}
 }
 
+// A FILL STILL IN FLIGHT WHEN THE JOB ENDS IS NOT "UNUSED": the guest asked, and
+// what the store did for it is not known yet, so the session reports nothing for
+// the npm cache rather than that it was never asked.
+func TestASessionThatEndsDuringAFillDoesNotCallTheNpmCacheUnused(t *testing.T) {
+	t.Parallel()
+
+	reached, release := make(chan struct{}), make(chan struct{})
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 1 {
+			close(reached)
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+			}
+		}
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, "{}")
+	})
+	service, credentials := npmService(t, registry)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte(npmRequestLine("/in-flight"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the registry")
+	}
+	if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	calls := observer.recorded()
+	close(release)
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	if resp, err := http.ReadResponse(bufio.NewReader(conn), nil); err == nil {
+		_ = resp.Body.Close()
+	}
+	assertNpmQuiet(t, service.npmCache())
+
+	if len(calls) == 0 {
+		t.Fatal("the session's end reported nothing")
+	}
+	for _, call := range calls {
+		if call.obs.Npm != "" {
+			t.Errorf("a session that ended during a fill reported the npm cache %q, want nothing", call.obs.Npm)
+		}
+	}
+}
+
 // ageNpmEntry moves an entry's clock back by, so it expires as if time passed.
 func ageNpmEntry(t *testing.T, store *npmStore, key string, by time.Duration) {
 	t.Helper()
