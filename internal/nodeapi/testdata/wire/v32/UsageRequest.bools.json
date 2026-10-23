@@ -1,0 +1,68 @@
+{
+  "UsageRequest.usage.destinations.incomplete": {
+    "epoch": 686326584,
+    "usage": {
+      "source": "UsageRequest.usage.source",
+      "unmeasured": [
+        "UsageRequest.usage.unmeasured[0]"
+      ],
+      "samples": 104754003,
+      "interval_ms": 1028526309,
+      "window_ms": 1412746877,
+      "cpu_user_us": 1062782212,
+      "cpu_system_us": 915030146,
+      "guest_cpu_us": 1481725054,
+      "vmm_cpu_us": 893080074,
+      "memory_peak_bytes": 1513763463,
+      "oom_kills": 1699009675,
+      "disk_read_bytes": 2110456338,
+      "disk_write_bytes": 1391601093,
+      "net_rx_bytes": 2090266746,
+      "net_tx_bytes": 2137657908,
+      "net_rx_packets": 2048929835,
+      "net_tx_packets": 1790037537,
+      "cpu_some_us": 1279976311,
+      "cpu_full_us": 307638794,
+      "memory_some_us": 975943420,
+      "memory_full_us": 42270614,
+      "io_some_us": 1970948865,
+      "io_full_us": 1465580281,
+      "energy_active_uj": 1019140487,
+      "energy_idle_uj": 805580667,
+      "energy_source": "UsageRequest.usage.energy_source",
+      "counters": {
+        "cycles": 1525179277,
+        "instructions": 1086809459,
+        "cache_references": 1789822056,
+        "cache_misses": 508672714,
+        "branch_misses": 171018709,
+        "frontend_stall_cycles": 1344685146
+      },
+      "destinations": {
+        "destinations": [
+          {
+            "addr": "UsageRequest.usage.destinations.destinations[0].addr",
+            "sent_bytes": 1519821621,
+            "received_bytes": 2114821098,
+            "connections": 1695491033
+          }
+        ],
+        "other": {
+          "addr": "UsageRequest.usage.destinations.other.addr",
+          "sent_bytes": 1426384486,
+          "received_bytes": 887061281,
+          "connections": 1130740818
+        },
+        "incomplete": true,
+        "tap": {
+          "sent_bytes": 434371545,
+          "received_bytes": 1076146878
+        }
+      }
+    },
+    "series": {
+      "codec": 1489049453,
+      "data": "VXNhZ2VSZXF1ZXN0LnNlcmllcy5kYXRh"
+    }
+  }
+}

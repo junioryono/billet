@@ -12,7 +12,7 @@ import (
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 66
+const newestMigration = 67
 
 // rewindNewest takes the newest migration back off a migrated ledger, so the
 // next migration has exactly one version to apply.
@@ -33,8 +33,9 @@ func rewindNewest(t *testing.T, db *DB) {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
-			`DROP TABLE tier_releases`,
-			`DELETE FROM schema_migrations WHERE version = 66`,
+			`ALTER TABLE leases DROP COLUMN npm_cache`,
+			`ALTER TABLE job_history DROP COLUMN npm_cache`,
+			`DELETE FROM schema_migrations WHERE version = 67`,
 		} {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)

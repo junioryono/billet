@@ -49,6 +49,7 @@ func (a *Allocator) RecordCacheObservation(
 			GitCache:        string(obs.Git),
 			BazelCache:      string(obs.Bazel),
 			GoCache:         string(obs.Go),
+			NpmCache:        string(obs.Npm),
 			ID:              lease.ID,
 			Epoch:           lease.Epoch,
 		}); err != nil {
@@ -63,6 +64,7 @@ func (a *Allocator) RecordCacheObservation(
 			GitCache:        string(obs.Git),
 			BazelCache:      string(obs.Bazel),
 			GoCache:         string(obs.Go),
+			NpmCache:        string(obs.Npm),
 			LeaseID:         lease.ID,
 		}); err != nil {
 			return fmt.Errorf("alloc: record the cache observation in the history of lease %s: %w",
@@ -96,7 +98,8 @@ func (a *Allocator) CacheOutcomes(
 		if err != nil {
 			return fmt.Errorf("alloc: list what the caches did: %w", err)
 		}
-		for _, row := range rows {
+		for i := range rows {
+			row := &rows[i]
 			tier := counts[row.Tier]
 			if tier == nil {
 				tier = map[string]map[string]int{}
@@ -104,7 +107,7 @@ func (a *Allocator) CacheOutcomes(
 			}
 			for cache, outcome := range map[string]string{
 				"image": row.ImageCache, "actions": row.ActionsCache, "sticky": row.StickyCache,
-				"git": row.GitCache, "bazel": row.BazelCache, "go": row.GoCache,
+				"git": row.GitCache, "bazel": row.BazelCache, "go": row.GoCache, "npm": row.NpmCache,
 			} {
 				if tier[cache] == nil {
 					tier[cache] = map[string]int{}
@@ -176,7 +179,8 @@ func (a *Allocator) HistoryPlacement(ctx context.Context, leaseID string) (JobPl
 			CacheGeneration: row.CacheGeneration,
 			ActionsCache:    ActionsCache(row.ActionsCache),
 			BuildCaches: BuildCaches{Sticky: BuildCache(row.StickyCache), Git: BuildCache(row.GitCache),
-				Bazel: BuildCache(row.BazelCache), Go: BuildCache(row.GoCache)},
+				Bazel: BuildCache(row.BazelCache), Go: BuildCache(row.GoCache),
+				Npm: BuildCache(row.NpmCache)},
 		}
 
 		return nil

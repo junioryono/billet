@@ -17,7 +17,7 @@ phases     bought      2026-10-09T11:59:57.000000000Z
 runner     not recorded, instance billet-6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64
 held by    not recorded
 failure    none recorded
-caches     image not observed, actions not observed, sticky not observed, git not observed, bazel not observed, go not observed
+caches     image not observed, actions not observed, sticky not observed, git not observed, bazel not observed, go not observed, npm not observed
 
 usage      measured by the host epyc-1, 169 samples every 1s over 2m47.5s
 cpu        user 193.3s, system 21.5s

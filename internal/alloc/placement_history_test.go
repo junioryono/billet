@@ -410,7 +410,7 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 	launched(t, a, lease, "cloud-1")
 
 	builds := BuildCaches{Sticky: BuildCacheWarm, Git: BuildCacheCold, Bazel: BuildCacheUnused,
-		Go: BuildCacheDisabled}
+		Go: BuildCacheDisabled, Npm: BuildCacheUnavailable}
 	first := CacheObservation{ImageCache: ImageCacheCold, ActionsCache: ActionsCacheDisabled,
 		BuildCaches: builds}
 	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, first); err != nil {
@@ -423,7 +423,7 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 	later := CacheObservation{
 		ImageCache: ImageCacheWarm, CacheGeneration: "gen-9", ActionsCache: ActionsCacheServed,
 		BuildCaches: BuildCaches{Sticky: BuildCacheCold, Git: BuildCacheWarm, Bazel: BuildCacheWarm,
-			Go: BuildCacheWarm},
+			Go: BuildCacheWarm, Npm: BuildCacheWarm},
 	}
 	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, later); err != nil {
 		t.Fatalf("a second observation was refused: %v", err)

@@ -185,7 +185,7 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 				ImageCache: ImageCache(row.ImageCache), CacheGeneration: row.CacheGeneration,
 				ActionsCache: ActionsCache(row.ActionsCache),
 				BuildCaches: BuildCaches{Sticky: BuildCache(row.StickyCache), Git: BuildCache(row.GitCache),
-					Bazel: BuildCache(row.BazelCache), Go: BuildCache(row.GoCache)},
+					Bazel: BuildCache(row.BazelCache), Go: BuildCache(row.GoCache), Npm: BuildCache(row.NpmCache)},
 			},
 			LaunchedAt: row.LaunchedAt, RegisteredAt: row.RegisteredAt, RunnerID: row.RunnerID,
 			CustodyAt: row.CustodyAt, TeardownAt: row.TeardownAt, QuarantinedAt: row.QuarantinedAt,

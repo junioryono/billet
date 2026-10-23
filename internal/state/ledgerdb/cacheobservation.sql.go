@@ -24,8 +24,10 @@ UPDATE job_history
        bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST($6 AS TEXT)
                                ELSE bazel_cache END,
        go_cache         = CASE WHEN go_cache = '' THEN CAST($7 AS TEXT)
-                               ELSE go_cache END
- WHERE lease_id = $8
+                               ELSE go_cache END,
+       npm_cache        = CASE WHEN npm_cache = '' THEN CAST($8 AS TEXT)
+                               ELSE npm_cache END
+ WHERE lease_id = $9
 `
 
 type RecordHistoryCacheObservationParams struct {
@@ -36,6 +38,7 @@ type RecordHistoryCacheObservationParams struct {
 	GitCache        string
 	BazelCache      string
 	GoCache         string
+	NpmCache        string
 	LeaseID         string
 }
 
@@ -56,6 +59,7 @@ func (q *Queries) RecordHistoryCacheObservation(ctx context.Context, arg RecordH
 		arg.GitCache,
 		arg.BazelCache,
 		arg.GoCache,
+		arg.NpmCache,
 		arg.LeaseID,
 	)
 	return err
@@ -77,8 +81,10 @@ UPDATE leases
        bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST($6 AS TEXT)
                                ELSE bazel_cache END,
        go_cache         = CASE WHEN go_cache = '' THEN CAST($7 AS TEXT)
-                               ELSE go_cache END
- WHERE id = $8 AND epoch = $9
+                               ELSE go_cache END,
+       npm_cache        = CASE WHEN npm_cache = '' THEN CAST($8 AS TEXT)
+                               ELSE npm_cache END
+ WHERE id = $9 AND epoch = $10
 `
 
 type RecordLeaseCacheObservationParams struct {
@@ -89,6 +95,7 @@ type RecordLeaseCacheObservationParams struct {
 	GitCache        string
 	BazelCache      string
 	GoCache         string
+	NpmCache        string
 	ID              string
 	Epoch           int64
 }
@@ -118,6 +125,7 @@ func (q *Queries) RecordLeaseCacheObservation(ctx context.Context, arg RecordLea
 		arg.GitCache,
 		arg.BazelCache,
 		arg.GoCache,
+		arg.NpmCache,
 		arg.ID,
 		arg.Epoch,
 	)

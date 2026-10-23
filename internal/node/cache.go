@@ -241,6 +241,7 @@ type cacheObserved struct {
 	GitCache        string `json:"git_cache,omitempty"`
 	BazelCache      string `json:"bazel_cache,omitempty"`
 	GoCache         string `json:"go_cache,omitempty"`
+	NpmCache        string `json:"npm_cache,omitempty"`
 	// Reported says everything above has reached the control plane.
 	Reported bool `json:"reported,omitempty"`
 	// ActionsPending says the first CacheService call was dispatched and its
@@ -258,6 +259,7 @@ func (o cacheObserved) observation() alloc.CacheObservation {
 		BuildCaches: alloc.BuildCaches{
 			Sticky: alloc.BuildCache(o.StickyCache), Git: alloc.BuildCache(o.GitCache),
 			Bazel: alloc.BuildCache(o.BazelCache), Go: alloc.BuildCache(o.GoCache),
+			Npm: alloc.BuildCache(o.NpmCache),
 		},
 	}
 }
@@ -386,6 +388,7 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 	}{
 		{&session.observed.StickyCache, obs.Sticky}, {&session.observed.GitCache, obs.Git},
 		{&session.observed.BazelCache, obs.Bazel}, {&session.observed.GoCache, obs.Go},
+		{&session.observed.NpmCache, obs.Npm},
 	} {
 		if field.outcome != "" && *field.observed == "" {
 			*field.observed = string(field.outcome)
@@ -571,6 +574,7 @@ func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
 	return alloc.BuildCaches{
 		Sticky: outcome(config.CacheSticky), Git: outcome(config.CacheGit),
 		Bazel: outcome(config.CacheBazel), Go: outcome(config.CacheGo),
+		Npm: outcome(config.CacheNpm),
 	}
 }
 

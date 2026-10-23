@@ -726,6 +726,43 @@ func holdBackTheBody(t *testing.T, conn *tls.Conn) {
 	}
 }
 
+// WHAT THE NPM CACHE DID IS REPORTED WITH THE SESSION'S OTHER CACHES when it
+// ends, for the lease's history: warm once the store answered from what it
+// held, unused when the tier had the cache and the guest never asked.
+func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		fetches int
+		want    alloc.BuildCache
+	}{
+		"used, and answered from the store the second time": {fetches: 2, want: alloc.BuildCacheWarm},
+		"enabled and never asked":                           {fetches: 0, want: alloc.BuildCacheUnused},
+	} {
+		registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+			w.Header().Set("Cache-Control", "public, max-age=300")
+			serveText(t, w, "{}")
+		})
+		service, credentials := npmService(t, registry)
+		observer := &recordingObserver{}
+		service.SetCacheObserver(observer)
+		for range tc.fetches {
+			npmGet(t, service, credentials, npmRequestLine("/reported"))
+		}
+		assertNpmQuiet(t, service.npmCache())
+		if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
+			t.Fatalf("%s: Close: %v", name, err)
+		}
+		calls := observer.recorded()
+		if len(calls) == 0 {
+			t.Fatalf("%s: nothing was reported", name)
+		}
+		if got := calls[len(calls)-1].obs.Npm; got != tc.want {
+			t.Errorf("%s: the npm cache reported %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
 // ageNpmEntry moves an entry's clock back by, so it expires as if time passed.
 func ageNpmEntry(t *testing.T, store *npmStore, key string, by time.Duration) {
 	t.Helper()

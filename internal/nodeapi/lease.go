@@ -80,6 +80,9 @@ type CacheObservationRequest struct {
 	GitCache    string `json:"git_cache,omitempty"`
 	BazelCache  string `json:"bazel_cache,omitempty"`
 	GoCache     string `json:"go_cache,omitempty"`
+	// NpmCache is the npm registry cache's outcome, sent from
+	// VersionNpmObservation for the same reason.
+	NpmCache string `json:"npm_cache,omitempty"`
 }
 
 // UsageRequest reports what the host measured a lease's job do, once, before

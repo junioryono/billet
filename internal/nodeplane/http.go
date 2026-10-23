@@ -1590,7 +1590,22 @@ func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
 		BuildCaches: alloc.BuildCaches{
 			Sticky: alloc.BuildCache(req.StickyCache), Git: alloc.BuildCache(req.GitCache),
 			Bazel: alloc.BuildCache(req.BazelCache), Go: alloc.BuildCache(req.GoCache),
+			Npm: alloc.BuildCache(req.NpmCache),
 		},
+	}
+	// A PAIRING NEGOTIATED BELOW VersionNpmObservation carries no npm outcome:
+	// one that arrives anyway is dropped, not recorded as something its wire
+	// does not carry, and the rest of the observation is kept.
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionNpmObservation {
+		obs.Npm = ""
+	}
+	// AN OBSERVATION THAT WAS ONLY THAT is answered as recorded: there is nothing
+	// its wire carries left to keep, and Validate refuses an empty one.
+	if obs.ImageCache == "" && obs.ActionsCache == "" && obs.BuildCaches == (alloc.BuildCaches{}) {
+		w.WriteHeader(http.StatusNoContent)
+
+		return
 	}
 	if err := obs.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())

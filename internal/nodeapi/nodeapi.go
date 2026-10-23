@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 31
+	Version = 32
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -420,6 +420,17 @@ const (
 	// to the registry, doing less and never something else. Nothing travels the
 	// other way, so there is nothing to gate where it is read.
 	VersionNpmCache = 31
+
+	// VersionNpmObservation is the version from which a cache observation may
+	// carry what the npm registry cache did for a job (CacheObservationRequest's
+	// npm_cache), which `billet jobs show` names beside the build caches.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT,
+	// because an older plane decodes the request strictly and would refuse the
+	// whole observation over the field: below it the node sends the rest. CHECKED
+	// WHERE IT IS READ too, so a pairing that negotiated below it and sends one
+	// anyway has the observation kept without it.
+	VersionNpmObservation = 32
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
