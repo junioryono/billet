@@ -379,8 +379,9 @@ func TestARequestPastTheWaitLeavesWhatWasNoted(t *testing.T) {
 
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
-		if n == 2 {
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		// EVERY ATTEMPT AT IT, so no retry can end the request inside the wait.
+		if r.URL.Path == "/second" {
 			<-release
 		}
 		w.Header().Set("Cache-Control", "public, max-age=300")
@@ -407,7 +408,14 @@ func TestARequestPastTheWaitLeavesWhatWasNoted(t *testing.T) {
 		}
 	}
 
+	started := time.Now()
 	service.SettleObservation(t.Context(), "billet-lease-npm")
+	if took := time.Since(started); took > 2*time.Second {
+		t.Fatalf("settlement took %s with a 200ms wait for npm", took)
+	}
+	if session.npmInflight.Load() == 0 {
+		t.Fatal("the held request ended before settlement returned, so the bound was not what ended the wait")
+	}
 	var got alloc.BuildCache
 	for _, call := range observer.recorded() {
 		if call.obs.Npm != "" {
