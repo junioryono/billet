@@ -489,13 +489,23 @@ func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testin
 		`--address="/results-receiver.actions.githubusercontent.com/$docker_gateway"`,
 		`'if type == "object" then . + {"dns": $dns} else error("not an object") end'`,
 		// The dns list is produced by the behavior-tested filter, which keeps only a
-		// real global upstream so no value dockerd rejects reaches daemon.json.
-		`dns_json=$(/usr/local/bin/billet-dns-upstreams "$docker_gateway" "$upstream_resolv"`,
+		// real global upstream so no value dockerd rejects reaches daemon.json. The
+		// block names it through a variable, so scripts' test can execute the block;
+		// that the variable names the installed filter, and nothing else, is below.
+		`dns_json=$("$dns_upstreams" "$docker_gateway" "$upstream_resolv"`,
 		`"$rootfs/usr/local/bin/billet-dns-upstreams"`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the guest agent does not establish %q", want)
 		}
+	}
+	// THE VARIABLE NAMES THE INSTALLED FILTER, as a whole line, and appears
+	// nowhere but there and in the call above: a longer path, an append or a
+	// second assignment would call something the behavior-tested filter is not.
+	if got := strings.Count(text, "dns_upstreams"); got != 2 ||
+		!strings.Contains(text, "\n\tdns_upstreams=/usr/local/bin/billet-dns-upstreams\n") {
+		t.Errorf("the guest agent names dns_upstreams %d times, want its one definition, "+
+			"as /usr/local/bin/billet-dns-upstreams, and its one call", got)
 	}
 
 	// A published proxy variable is exactly the catch-all funnel this design
