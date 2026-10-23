@@ -317,9 +317,9 @@ func TestNormalizingAnAbsentFirecrackerBlockIsSafe(t *testing.T) {
 	f.Normalize()
 }
 
-// A CPU PLACEMENT IS ONE OF TWO NAMED SHAPES, or none, and anything else is
+// A CPU PLACEMENT IS ONE OF THREE NAMED SHAPES, or none, and anything else is
 // refused here rather than reaching the provider as a placement it ignores.
-func TestACPUPlacementIsCompactSpreadOrNothing(t *testing.T) {
+func TestACPUPlacementIsCompactSpreadPackedOrNothing(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {

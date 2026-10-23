@@ -3,9 +3,12 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,10 +34,11 @@ import (
 // but the host's cpus are shared with whatever else runs.
 //
 // Settings, all from the environment:
-//   - BILLET_PLACEMENT_EXPERIMENT_PLACEMENT: none, compact or spread.
+//   - BILLET_PLACEMENT_EXPERIMENT_PLACEMENT: none, compact, spread or packed.
 //   - BILLET_PLACEMENT_EXPERIMENT_VMS and _VCPU: how many guests, of how many vCPUs.
 //   - BILLET_PLACEMENT_EXPERIMENT_WORKLOAD: gostd (`go build -a std`, a parallel
-//     compile) or memory (every vCPU copying a buffer far larger than an L3).
+//     compile), memory (every vCPU copying a buffer far larger than an L3) or noop
+//     (nothing but the boot and the clean exit, for a probe of the harness).
 //   - BILLET_PLACEMENT_EXPERIMENT_RUN: a label written on every line.
 //   - BILLET_PLACEMENT_EXPERIMENT_IDLE_WATTS: the package's idle power, so each
 //     guest's share of the energy above it is what the node would attribute.
@@ -54,7 +58,7 @@ func TestRealPlacementExperiment(t *testing.T) {
 	workload := os.Getenv("BILLET_PLACEMENT_EXPERIMENT_WORKLOAD")
 	command, ok := experimentWorkloads[workload]
 	if !ok {
-		t.Fatalf("BILLET_PLACEMENT_EXPERIMENT_WORKLOAD is %q; expected gostd or memory", workload)
+		t.Fatalf("BILLET_PLACEMENT_EXPERIMENT_WORKLOAD is %q; expected gostd, memory or noop", workload)
 	}
 	idle, err := strconv.ParseFloat(os.Getenv("BILLET_PLACEMENT_EXPERIMENT_IDLE_WATTS"), 64)
 	if err != nil {
@@ -106,7 +110,9 @@ func TestRealPlacementExperiment(t *testing.T) {
 		exited     time.Time
 		cpus       string
 		summary    usage.Summary
-		err        error
+		// final says the sampler answered for the guest's last point.
+		final bool
+		err   error
 	}
 	guests := make([]*guest, vms)
 	disk := env.disk.growthCapacity(t, env.image)
@@ -185,6 +191,20 @@ func TestRealPlacementExperiment(t *testing.T) {
 
 				return
 			}
+			// THE KERNEL'S PLACEMENT, NOT ONLY BILLET'S RECORD of it: what the
+			// guest's cgroup actually confines it to, so a claim that never reached
+			// the jailer is not measured as the placement it names.
+			if placement != "" {
+				cgroupRoot, err := cgroup2Mount(defaultProcMountsPath)
+				if err == nil {
+					err = cgroupConfines("/proc", cgroupRoot, target.PID, target.CgroupDir, g.cpus)
+				}
+				if err != nil {
+					g.err = err
+
+					return
+				}
+			}
 
 			// THE GUEST REBOOTS ONLY WHEN ITS WORKLOAD SUCCEEDED, and the VMM exits
 			// with it: that moment is the run's end. A workload that failed halts the
@@ -194,7 +214,12 @@ func TestRealPlacementExperiment(t *testing.T) {
 				pid, err := p.vmmPID(p.jailFor(g.name))
 				if err == nil && pid == 0 {
 					g.exited = time.Now()
-					g.summary, _ = monitor.Final(g.name)
+					g.summary, g.final = monitor.Final(g.name)
+					// A VMM THAT WAS KILLED OR CRASHED ALSO EXITS: only its own log
+					// says it ended because the guest rebooted.
+					if err := cleanExit(p.jailFor(g.name)); err != nil {
+						g.err = err
+					}
 
 					return
 				}
@@ -211,6 +236,19 @@ func TestRealPlacementExperiment(t *testing.T) {
 	}
 	wg.Wait()
 	finished := time.Now()
+	// NO CPU IS HELD BY TWO GUESTS AT ONCE, which is what a placement promises;
+	// a run that broke it is written as failed on every guest, since its energy
+	// is the whole host's and its load is every guest's.
+	if placement != "" {
+		cpus := make([]string, len(guests))
+		errs := make([]error, len(guests))
+		for i, g := range guests {
+			cpus[i], errs[i] = g.cpus, g.err
+		}
+		for i, err := range failRunOnSharedCPUs(cpus, errs) {
+			guests[i].err = err
+		}
+	}
 	// THE WHOLE HOST'S BUSY CPU OVER THE RUN, so what no guest's cgroup was
 	// charged with is a number beside the energy no guest was charged with.
 	hostBusySeconds := float64(hostBusyJiffies(t)-hostBusyBefore) / userHZ
@@ -236,18 +274,43 @@ func TestRealPlacementExperiment(t *testing.T) {
 			line["launched_epoch_ms"] = g.launched.UnixMilli()
 			line["exited_epoch_ms"] = g.exited.UnixMilli()
 			line["run_seconds"] = g.exited.Sub(g.launched).Seconds()
-			line["guest_cpu_seconds"] = float64(s.Latest.GuestCPU) / 1e6
-			line["vmm_cpu_seconds"] = float64(s.Latest.VMMCPU) / 1e6
-			line["cgroup_cpu_seconds"] = float64(s.Latest.CPUUsage) / 1e6
-			line["memory_peak_bytes"] = s.Latest.MemoryPeak
-			line["energy_active_joules"] = float64(s.EnergyActive) / 1e6
-			line["energy_idle_joules"] = float64(s.EnergyIdle) / 1e6
+			// WHAT WAS NOT MEASURED IS LEFT OUT, never written as zero: a reading
+			// the sampler could not take would otherwise compare as a fast, cheap
+			// run.
+			// SAMPLER_KNOWN IS WHETHER THE MONITOR KNEW THE GUEST AT ALL; how its
+			// last interval was seen, a stuck final read included, is in gaps.
+			line["sampler_known"] = g.final
+			gaps := map[string]bool{}
+			for _, point := range s.Points {
+				if point.Gap != usage.GapNone {
+					gaps[point.Gap.String()] = true
+				}
+			}
+			line["gaps"] = slices.Sorted(maps.Keys(gaps))
+			if s.Measured.Threads {
+				line["guest_cpu_seconds"] = float64(s.Latest.GuestCPU) / 1e6
+				line["vmm_cpu_seconds"] = float64(s.Latest.VMMCPU) / 1e6
+			}
+			if s.Measured.CPU {
+				line["cgroup_cpu_seconds"] = float64(s.Latest.CPUUsage) / 1e6
+			}
+			if s.Measured.Memory {
+				line["memory_peak_bytes"] = s.MemoryPeak
+			}
+			if s.Measured.Energy {
+				line["energy_active_joules"] = float64(s.EnergyActive) / 1e6
+				line["energy_idle_joules"] = float64(s.EnergyIdle) / 1e6
+			}
 			if c := s.Counters; c != nil {
-				line["cycles"] = c.Values[usage.Cycles]
-				line["instructions"] = c.Values[usage.Instructions]
-				line["cache_references"] = c.Values[usage.CacheReferences]
-				line["cache_misses"] = c.Values[usage.CacheMisses]
-				line["frontend_stalls"] = c.Values[usage.FrontendStalls]
+				for name, event := range map[string]usage.Event{
+					"cycles": usage.Cycles, "instructions": usage.Instructions,
+					"cache_references": usage.CacheReferences, "cache_misses": usage.CacheMisses,
+					"frontend_stalls": usage.FrontendStalls,
+				} {
+					if c.Measured[event] {
+						line[name] = c.Values[event]
+					}
+				}
 			}
 		}
 		if err := encoder.Encode(line); err != nil {
@@ -282,6 +345,7 @@ for build in 1 2; do
 	cache=$(mktemp -d)
 	GOCACHE=$cache "$gobin/go" build -a std
 done`},
+	"noop": {"/bin/bash", "-c", workloadEnd + `true`},
 	"memory": {"/bin/bash", "-c", workloadEnd + `python3 -c '
 import multiprocessing as m
 def copy(_):
@@ -292,6 +356,114 @@ def copy(_):
 n = m.cpu_count()
 m.Pool(n).map(copy, range(n))
 '`},
+}
+
+// cgroupConfines refuses a guest whose VMM, and every thread of it, is not in
+// cgroupDir, or whose cgroupDir does not confine it to exactly the cpus its
+// placement claimed. procRoot is /proc and cgroupRoot the cgroup2 mount on a
+// host.
+//
+// MEMBERSHIP FIRST: a cpuset proves nothing about a VMM that runs outside the
+// cgroup it names.
+func cgroupConfines(procRoot, cgroupRoot string, pid int, cgroupDir, claimed string) error {
+	tasks, err := os.ReadDir(filepath.Join(procRoot, strconv.Itoa(pid), "task"))
+	if err != nil {
+		return fmt.Errorf("list the VMM's threads: %w", err)
+	}
+	for _, task := range tasks {
+		path := filepath.Join(procRoot, strconv.Itoa(pid), "task", task.Name(), "cgroup")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		member := ""
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if rel, ok := strings.CutPrefix(line, "0::"); ok {
+				member = rel
+			}
+		}
+		if member == "" || filepath.Join(cgroupRoot, member) != filepath.Clean(cgroupDir) {
+			return fmt.Errorf("the VMM's thread %s is in cgroup %q, not %s", task.Name(), member, cgroupDir)
+		}
+	}
+
+	raw, err := os.ReadFile(filepath.Join(cgroupDir, "cpuset.cpus.effective"))
+	if err != nil {
+		return fmt.Errorf("read the guest's cpuset: %w", err)
+	}
+	effective, err := parseCPUList(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return fmt.Errorf("the guest's cpuset reads %q: %w", raw, err)
+	}
+	want, err := parseCPUList(claimed)
+	if err != nil {
+		return fmt.Errorf("the guest's claim %q: %w", claimed, err)
+	}
+	if formatCPUList(effective) != formatCPUList(want) {
+		return fmt.Errorf("the guest's cgroup confines it to %s, not the %s it claimed", formatCPUList(effective),
+			formatCPUList(want))
+	}
+
+	return nil
+}
+
+// sharedCPUs refuses a run in which a cpu is placed under two guests, or a
+// guest's cpu list cannot be read.
+func sharedCPUs(byGuest []string) error {
+	owner := map[int]int{}
+	var errs []error
+	for i, list := range byGuest {
+		cpus, err := parseCPUList(list)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("guest %d's cpus %q: %w", i, list, err))
+
+			continue
+		}
+		for _, cpu := range cpus {
+			if j, held := owner[cpu]; held {
+				errs = append(errs, fmt.Errorf("cpu %d is placed under guest %d and guest %d", cpu, j, i))
+			}
+			owner[cpu] = i
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// failRunOnSharedCPUs answers each guest's error with sharedCPUs' refusal
+// joined into every one when any cpu is shared, and the errors unchanged
+// otherwise.
+func failRunOnSharedCPUs(byGuest []string, errs []error) []error {
+	out := append([]error(nil), errs...)
+	if err := sharedCPUs(byGuest); err != nil {
+		for i := range out {
+			out[i] = errors.Join(out[i], err)
+		}
+	}
+
+	return out
+}
+
+// vmmCleanExit is the line a Firecracker VMM logs when it exits because its
+// guest rebooted (measured on the reference host, Firecracker v1.16.1,
+// 2026-10-23, with the noop workload); a VMM that is killed logs nothing more.
+const vmmCleanExit = "Firecracker exiting successfully"
+
+// cleanExit refuses a VMM that exited without logging a clean exit: one that
+// was killed or crashed ends with no such line.
+func cleanExit(j jail) error {
+	raw, err := os.ReadFile(filepath.Join(j.root(), vmmLog))
+	if err != nil {
+		return fmt.Errorf("read the VMM's log to tell how it exited: %w", err)
+	}
+	if !strings.Contains(string(raw), vmmCleanExit) {
+		lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+
+		return fmt.Errorf("the VMM exited without logging %q; its log ends %q", vmmCleanExit,
+			lines[max(0, len(lines)-3):])
+	}
+
+	return nil
 }
 
 func placementName(placement string) string {
