@@ -87,6 +87,16 @@ type Node struct {
 // built only after the lock is held, because nothing may touch a container
 // before the right to manage containers under this identity is established.
 func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
+	// A CAP AN EARLIER PROCESS LEFT GOES FIRST, before anything below can refuse
+	// this start: a certificate that will not load or a deployment lock held
+	// elsewhere must not leave the host capped. Its own proof is the host's
+	// cpufreq lock, which any process with a cap in force holds. Never from a
+	// probe, which runs beside such a process.
+	leftover := &heldPowerEvents{}
+	if !opts.Probe {
+		restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS, leftover)
+	}
+
 	bundle, err := NodeBundle(cfg)
 	if err != nil {
 		return nil, err
@@ -103,15 +113,7 @@ func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
 	}
 
 	n := &Node{cfg: cfg, deployment: deployment, lock: lock, upgrader: opts.Upgrader, probe: opts.Probe,
-		leftoverPower: &heldPowerEvents{}}
-
-	// A CAP AN EARLIER PROCESS LEFT, THE MOMENT THE LOCK IS HELD: before
-	// anything below can refuse this start, and not before the lock, since
-	// another node process holding it may have a cap in force. Never from a
-	// probe, which runs beside such a process.
-	if !opts.Probe {
-		restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS, n.leftoverPower)
-	}
+		leftoverPower: leftover}
 
 	// THE ENDING RECORD BEFORE THE PROVIDER (#127): no process touches compute
 	// without an entry, because a stop is later proved by this process's ending

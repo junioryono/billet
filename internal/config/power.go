@@ -9,7 +9,8 @@ import (
 
 // NodePowerConfig lowers this host's CPU ceiling while the node is idle: no
 // instance running, none launching and none held in custody, for IdleAfter. A
-// launch restores what was there before the VMM starts.
+// launch asks for what was there back before the VMM starts, waiting at most
+// 2 s. One node on a host may run it.
 //
 // ABSENT MEANS OFF, and off is the node it always was: nothing under
 // /sys/devices/system/cpu is read or written, except that a node finding the
@@ -25,10 +26,10 @@ type NodePowerConfig struct {
 	DisableBoost bool `yaml:"disable_boost,omitempty"`
 	// IdleMaxFreqKHz is the scaling_max_freq written to every cpufreq policy
 	// while idle, in kHz as sysfs spells it. Zero leaves the ceiling alone. A
-	// value the host cannot honour exactly (not one of a policy's
-	// scaling_available_frequencies, or outside its scaling range where the
-	// driver lists none) refuses the node's start rather than being rounded by
-	// the kernel to a frequency nobody wrote.
+	// value the host cannot honour exactly (not one of every policy's
+	// scaling_available_frequencies, or below its scaling_min_freq) refuses the
+	// node's start rather than being rounded by the kernel to a frequency nobody
+	// wrote, and so does a driver that lists no frequencies.
 	IdleMaxFreqKHz int `yaml:"idle_max_freq_khz,omitempty"`
 }
 

@@ -63,6 +63,11 @@ func capHost(t *testing.T, root, stateDir string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := ctrl.ClaimHost(); err != nil {
+		t.Fatal(err)
+	}
+	// ITS DEATH DROPS ITS LOCK, as the kernel drops a dead process's.
+	defer ctrl.ReleaseHost()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -216,6 +221,9 @@ func TestANodeStopRestoresTheCeiling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := ctrl.ClaimHost(); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, signal := context.WithCancel(t.Context())
 	closed := 0
@@ -252,5 +260,92 @@ func TestANodeStopRestoresTheCeiling(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(stateDir, power.RecordName)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the record is still there after the stop: %v", err)
+	}
+}
+
+// A LEFTOVER WAITS WHILE ANOTHER PROCESS HOLDS THE HOST'S CPUFREQ, whose cap
+// may be the one in force, and is restored once the host is free.
+func TestALeftoverWaitsWhileAnotherProcessHoldsTheHost(t *testing.T) {
+	t.Parallel()
+
+	root, get := powerHost(t)
+	stateDir := t.TempDir()
+	capHost(t, root, stateDir)
+	record := filepath.Join(stateDir, power.RecordName)
+
+	holder, err := power.New(power.Options{SysfsRoot: root, StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.ClaimHost(); err != nil {
+		t.Fatal(err)
+	}
+	restoreLeftoverPower(powerConfig(stateDir, nil), root, "linux", nil)
+	if _, err := os.Stat(record); err != nil {
+		t.Fatalf("the leftover's record is gone while another process held the host: %v", err)
+	}
+	if get("boost") != "0" {
+		t.Fatalf("boost reads %q while another process held the host; want the cap left alone", get("boost"))
+	}
+
+	holder.ReleaseHost()
+	restoreLeftoverPower(powerConfig(stateDir, nil), root, "linux", nil)
+	if _, err := os.Stat(record); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the leftover's record outlived its restore: %v", err)
+	}
+	if get("boost") != "1" || get("policy0/scaling_max_freq") != "2450000" {
+		t.Fatalf("after the restore boost reads %q and the ceiling %q", get("boost"),
+			get("policy0/scaling_max_freq"))
+	}
+}
+
+// A SECOND NODE WITH node.power ON A HOST IS REFUSED, saying why.
+func TestASecondNodeWithPowerOnAHostIsRefused(t *testing.T) {
+	t.Parallel()
+
+	root, _ := powerHost(t)
+	holder, err := power.New(power.Options{SysfsRoot: root, StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.ClaimHost(); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.ReleaseHost()
+
+	ctrl, err := openNodePower(t.Context(), powerConfig(t.TempDir(), &config.NodePowerConfig{DisableBoost: true}),
+		root, "linux", nil)
+	if ctrl != nil || !errors.Is(err, power.ErrHostHeld) || !strings.Contains(err.Error(), "only one node") {
+		t.Fatalf("openNodePower beside another holder: %v, %v; want a refusal naming the rule", ctrl, err)
+	}
+}
+
+// A NODE WITH NO node.power THAT FINDS A LEFTOVER WHILE ANOTHER PROCESS HOLDS
+// THE HOST keeps a policy that retries it, rather than none; with nothing left
+// it gets none.
+func TestALeftoverBesideAHolderKeepsARetryingPolicy(t *testing.T) {
+	t.Parallel()
+
+	root, _ := powerHost(t)
+	stateDir := t.TempDir()
+	capHost(t, root, stateDir)
+
+	holder, err := power.New(power.Options{SysfsRoot: root, StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.ClaimHost(); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.ReleaseHost()
+
+	ctrl, err := openNodePower(t.Context(), powerConfig(stateDir, nil), root, "linux", nil)
+	if ctrl == nil || err != nil {
+		t.Fatalf("openNodePower with a leftover beside a holder: %v, %v; want a policy that retries", ctrl, err)
+	}
+
+	ctrl, err = openNodePower(t.Context(), powerConfig(t.TempDir(), nil), root, "linux", nil)
+	if ctrl != nil || err != nil {
+		t.Fatalf("openNodePower with nothing left beside a holder: %v, %v; want no policy", ctrl, err)
 	}
 }

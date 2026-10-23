@@ -507,8 +507,11 @@ node:
   # What a cap changed is recorded under state_dir (power-baseline.json)
   # before the first write, a stop tries for at most 30s to restore it, and a
   # node that finds that record at its start tries to restore it, whatever
-  # this block says now (a failure is logged and retried while the node runs). The node runs as root and its unit leaves
-  # ProtectKernelTunables off, which is what keeps /sys writable. On the
+  # this block says now (a failure is logged and retried while the node runs).
+  # One node on a host may run this: it holds a lock on the cpufreq directory
+  # for its life, and a second is refused at its start. The node runs as root
+  # and its unit leaves ProtectKernelTunables off, which is what keeps /sys
+  # writable. On the
   # reference node a launch's restore took about 20 ms, and no ceiling showed
   # a saving in its idle power (docs/reference/records/cpu-placement.md).
   #

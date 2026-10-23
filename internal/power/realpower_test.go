@@ -60,25 +60,34 @@ func TestRealCapAndRestoreOnThisHost(t *testing.T) {
 	}
 
 	const sysfs = "/sys"
+	// THE BASELINE IS READ UNDER THE HOST'S CLAIM: a node running node.power
+	// here could have a cap in force, which this test would take for the
+	// baseline and write back.
+	probe, err := New(Options{SysfsRoot: sysfs, StateDir: t.TempDir(), Settings: settings})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := probe.ClaimHost(); err != nil {
+		t.Fatalf("claim the host's cpufreq: %v", err)
+	}
 	baseline, err := readBaseline(sysfs)
 	if err != nil {
+		probe.ReleaseHost()
 		t.Fatalf("read the host's cpufreq baseline: %v", err)
 	}
 	// THE BASELINE IS PROVED FULL BEFORE ANYTHING CAN WRITE IT BACK, as the
 	// controller proves it before it caps: a ceiling firmware is holding low for
 	// a moment would otherwise be written back as a lasting cap.
-	probe, err := New(Options{SysfsRoot: sysfs, StateDir: t.TempDir(), Settings: settings})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
 	if err := baseline.requireFull(probe); err != nil {
+		probe.ReleaseHost()
 		t.Fatal(err)
 	}
+	probe.ReleaseHost()
 	// REGISTERED FIRST, SO IT RUNS LAST, after every run's own shutdown: the host
 	// leaves with the ceiling it came with, written in the kernel's order and read
-	// back.
+	// back, under a claim of its own.
 	t.Cleanup(func() {
-		if err := baseline.restore(); err != nil {
+		if err := withHostClaimed(sysfs, baseline.restore); err != nil {
 			t.Errorf("put the host's cpufreq baseline back: %v", err)
 		}
 	})
@@ -124,6 +133,9 @@ func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline c
 	if err := c.CheckHost(); err != nil {
 		return nil, fmt.Errorf("CheckHost: %w", err)
 	}
+	if err := c.ClaimHost(); err != nil {
+		return nil, fmt.Errorf("ClaimHost: %w", err)
+	}
 
 	var idle atomic.Bool
 	idle.Store(true)
@@ -143,7 +155,7 @@ func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline c
 		cancel()
 		<-done
 		closeErr := c.Close(context.WithoutCancel(t.Context()))
-		restoreErr := baseline.restore()
+		restoreErr := withHostClaimed(sysfs, baseline.restore)
 		if closeErr == nil && restoreErr == nil {
 			_ = os.RemoveAll(stateDir)
 		}
@@ -223,6 +235,22 @@ type ceiling struct {
 	boostPath, boost string
 	policyBoost      map[string]string
 	ceilings         map[string]string
+}
+
+// withHostClaimed runs write under a claim of the host's cpufreq, and writes
+// nothing when another process holds it, a stuck write of this test's own
+// controller included.
+func withHostClaimed(sysfs string, write func() error) error {
+	holder, err := New(Options{SysfsRoot: sysfs, StateDir: os.TempDir()})
+	if err != nil {
+		return err
+	}
+	if err := holder.ClaimHost(); err != nil {
+		return fmt.Errorf("nothing was written: %w", err)
+	}
+	defer holder.ReleaseHost()
+
+	return write()
 }
 
 // requireFull refuses a baseline any of whose ceilings is below the full value

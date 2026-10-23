@@ -73,8 +73,8 @@ type FirecrackerConfig struct {
 	// enforced by the verification lock.
 	ImageVerifyPort int `yaml:"image_verify_port,omitempty"`
 	// CPUPlacement pins each microVM's vCPUs to host cpus when it fits:
-	// CPUPlacementCompact, CPUPlacementSpread or CPUPlacementPacked. Empty, the default, lets every
-	// guest run on every cpu, as it always has.
+	// CPUPlacementCompact, CPUPlacementSpread or CPUPlacementPacked. Empty, the
+	// default, lets every guest run on every cpu, as it always has.
 	CPUPlacement string `yaml:"cpu_placement,omitempty"`
 }
 
