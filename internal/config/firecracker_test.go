@@ -329,7 +329,8 @@ func TestACPUPlacementIsCompactSpreadOrNothing(t *testing.T) {
 		{"", false},
 		{CPUPlacementCompact, false},
 		{CPUPlacementSpread, false},
-		{"packed", true},
+		{CPUPlacementPacked, false},
+		{"packing", true},
 		{"Compact", true},
 	} {
 		f := validFirecracker()

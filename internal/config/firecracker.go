@@ -73,7 +73,7 @@ type FirecrackerConfig struct {
 	// enforced by the verification lock.
 	ImageVerifyPort int `yaml:"image_verify_port,omitempty"`
 	// CPUPlacement pins each microVM's vCPUs to host cpus when it fits:
-	// CPUPlacementCompact or CPUPlacementSpread. Empty, the default, lets every
+	// CPUPlacementCompact, CPUPlacementSpread or CPUPlacementPacked. Empty, the default, lets every
 	// guest run on every cpu, as it always has.
 	CPUPlacement string `yaml:"cpu_placement,omitempty"`
 }
@@ -83,9 +83,14 @@ type FirecrackerConfig struct {
 // busy guests share as few groups as they can and the rest of the host idles.
 // SPREAD gives it one thread per core in the group with the most free cores, so
 // guests share neither cores nor, until the host fills, a cache.
+//
+// PACKED gives a guest one thread per core, like spread, but from the lowest
+// group with a free core, like compact: guests share no cores, and fill as few
+// groups as they can.
 const (
 	CPUPlacementCompact = "compact"
 	CPUPlacementSpread  = "spread"
+	CPUPlacementPacked  = "packed"
 )
 
 // DefaultFirecrackerBinary and friends are where the reference host installs
@@ -225,11 +230,11 @@ func CheckFirecracker(f FirecrackerConfig) []error {
 	}
 
 	switch f.CPUPlacement {
-	case "", CPUPlacementCompact, CPUPlacementSpread:
+	case "", CPUPlacementCompact, CPUPlacementSpread, CPUPlacementPacked:
 	default:
-		errs = append(errs, fmt.Errorf("node.firecracker.cpu_placement is %q; expected %s or %s, or "+
-			"nothing for guests that run on every cpu", f.CPUPlacement, CPUPlacementCompact,
-			CPUPlacementSpread))
+		errs = append(errs, fmt.Errorf("node.firecracker.cpu_placement is %q; expected %s, %s or %s, "+
+			"or nothing for guests that run on every cpu", f.CPUPlacement, CPUPlacementCompact,
+			CPUPlacementSpread, CPUPlacementPacked))
 	}
 
 	return errs

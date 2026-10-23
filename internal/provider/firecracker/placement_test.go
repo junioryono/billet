@@ -100,6 +100,13 @@ func TestEachPlacementTakesTheCPUsItsShapeNames(t *testing.T) {
 		{"spread takes one thread per core", config.CPUPlacementSpread, 2, nil, []int{0, 1}},
 		{"spread goes where the most cores are free", config.CPUPlacementSpread, 2, []int{0}, []int{2, 3}},
 		{"spread spans groups by free cores", config.CPUPlacementSpread, 3, nil, []int{0, 1, 2}},
+		{"packed takes one thread per core from the lowest group", config.CPUPlacementPacked, 2, nil,
+			[]int{0, 1}},
+		{"packed stays in the lowest group with a free core", config.CPUPlacementPacked, 1, []int{0},
+			[]int{1}},
+		{"packed spills to the next group in order", config.CPUPlacementPacked, 3, nil, []int{0, 1, 2}},
+		{"packed skips a half-held core", config.CPUPlacementPacked, 2, []int{4}, []int{1, 2}},
+		{"packed refuses more vcpus than free cores", config.CPUPlacementPacked, 5, nil, nil},
 		{"spread refuses more vcpus than free cores", config.CPUPlacementSpread, 5, nil, nil},
 		{"no placement places nothing", "", 2, nil, nil},
 	} {

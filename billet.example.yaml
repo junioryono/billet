@@ -508,7 +508,9 @@ node:
   # before the first write, a stop tries for at most 30s to restore it, and a
   # node that finds that record at its start tries to restore it, whatever
   # this block says now (a failure is logged and retried while the node runs). The node runs as root and its unit leaves
-  # ProtectKernelTunables off, which is what keeps /sys writable.
+  # ProtectKernelTunables off, which is what keeps /sys writable. On the
+  # reference node a launch's restore took about 20 ms, and no ceiling showed
+  # a saving in its idle power (docs/reference/records/cpu-placement.md).
   #
   # power:
   #   idle_after: 60s
@@ -546,10 +548,16 @@ node:
     # WHICH HOST CPUS EACH GUEST RUNS ON. Absent, every guest floats over every
     # cpu. `compact` packs a guest onto whole cores in the fewest cache groups
     # (CCDs), so the rest of the host can idle; `spread` gives it one thread per
-    # core in the emptiest group, so guests share neither cores nor caches. A
-    # guest that does not fit runs unpinned rather than being refused.
+    # core in the emptiest group, so guests share neither cores nor caches;
+    # `packed` gives one thread per core from the lowest group on, so guests
+    # share no cores and fill few groups. On the reference node, compact ran up
+    # to 43% longer than spread, though it used less energy on a memory-bound
+    # load at half the threads, spread ran a parallel compile far more steadily
+    # than unpinned guests, and filling fewer groups (packed) showed no saving
+    # (docs/reference/records/cpu-placement.md). A guest that does not fit runs
+    # unpinned rather than being refused.
     #
-    # cpu_placement: compact
+    # cpu_placement: spread
 
     # WHERE THE BINARIES ARE, defaulted to where their own instructions put them
     # and where the reference host has them. The reference host installs them as

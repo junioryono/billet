@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,7 @@ func TestRealPlacementExperiment(t *testing.T) {
 	}
 	guests := make([]*guest, vms)
 	disk := env.disk.growthCapacity(t, env.image)
+	hostBusyBefore := hostBusyJiffies(t)
 	started := time.Now()
 	// THE WAIT ENDS WELL BEFORE THE TEST DOES, so the cleanups that destroy the
 	// guests run before the test binary's own timeout kills it and leaves them.
@@ -209,6 +211,9 @@ func TestRealPlacementExperiment(t *testing.T) {
 	}
 	wg.Wait()
 	finished := time.Now()
+	// THE WHOLE HOST'S BUSY CPU OVER THE RUN, so what no guest's cgroup was
+	// charged with is a number beside the energy no guest was charged with.
+	hostBusySeconds := float64(hostBusyJiffies(t)-hostBusyBefore) / userHZ
 
 	file, err := os.OpenFile(out, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -221,12 +226,15 @@ func TestRealPlacementExperiment(t *testing.T) {
 			"run": os.Getenv("BILLET_PLACEMENT_EXPERIMENT_RUN"), "placement": placementName(placement),
 			"workload": workload, "vms": vms, "vcpu": vcpu, "guest": i, "cpus": g.cpus,
 			"run_started_epoch": started.Unix(), "run_finished_epoch": finished.Unix(),
+			"host_busy_cpu_seconds": hostBusySeconds,
 		}
 		if g.err != nil {
 			line["error"] = g.err.Error()
 		} else {
 			s := g.summary
 			line["launch_seconds"] = g.launched.Sub(g.launchedAt).Seconds()
+			line["launched_epoch_ms"] = g.launched.UnixMilli()
+			line["exited_epoch_ms"] = g.exited.UnixMilli()
 			line["run_seconds"] = g.exited.Sub(g.launched).Seconds()
 			line["guest_cpu_seconds"] = float64(s.Latest.GuestCPU) / 1e6
 			line["vmm_cpu_seconds"] = float64(s.Latest.VMMCPU) / 1e6
@@ -307,4 +315,38 @@ func experimentInt(t *testing.T, name string, fallback int) int {
 	}
 
 	return n
+}
+
+// userHZ is the kernel's clock tick for /proc/stat, 100 on every Linux billet
+// runs on.
+const userHZ = 100
+
+// hostBusyJiffies is /proc/stat's cpu line less idle and iowait: everything
+// the whole host's cpus did.
+func hostBusyJiffies(t *testing.T) int64 {
+	t.Helper()
+
+	raw, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		t.Fatalf("read /proc/stat: %v", err)
+	}
+	line, _, _ := strings.Cut(string(raw), "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 8 || fields[0] != "cpu" {
+		t.Fatalf("/proc/stat begins %q", line)
+	}
+	var busy int64
+	for i, field := range fields[1:] {
+		n, err := strconv.ParseInt(field, 10, 64)
+		if err != nil {
+			t.Fatalf("/proc/stat cpu field %d is %q", i, field)
+		}
+		// idle and iowait are the fourth and fifth; guest time is already in user.
+		if i == 3 || i == 4 || i >= 8 {
+			continue
+		}
+		busy += n
+	}
+
+	return busy
 }
