@@ -160,7 +160,16 @@ func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline c
 	if err != nil {
 		return nil, fmt.Errorf("read the capped ceiling: %w", err)
 	}
-	// THE CAP WROTE WHAT WAS ASKED, not merely a state change.
+	// THE LOOP STOPS BEFORE THE LAUNCH, so the restore measured is the launch's
+	// own: a running loop restores a busy host by itself on its next tick.
+	cancel()
+	<-done
+
+	// THE CAP CHANGED THE HOST, and wrote what was asked, not merely a state
+	// change: settings the host already had would pass with nothing written.
+	if baseline.mismatches(during) == 0 {
+		result = errors.Join(result, errors.New("the cap changed none of the host's cpufreq values"))
+	}
 	if settings.DisableBoost && during.boost != "0" {
 		result = errors.Join(result, fmt.Errorf("boost reads %q while capped, want 0", during.boost))
 	}
@@ -177,7 +186,7 @@ func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline c
 
 	idle.Store(false)
 	asked := time.Now()
-	c.RestoreBeforeLaunch(ctx, "realpower")
+	c.RestoreBeforeLaunch(context.WithoutCancel(t.Context()), "realpower")
 	restoreTook := time.Since(asked)
 	// RestoreBeforeLaunch may return at its bound while the restore goes on, so
 	// the comparison waits out the kernel's own asynchronous read-back.
@@ -244,22 +253,28 @@ func readBaseline(sysfs string) (ceiling, error) {
 // reads it all back.
 func (c ceiling) restore() error {
 	var failures []error
-	write := func(path, value string) {
-		if now, err := readSysfs(path); err == nil && now == value {
-			return
+	write := func(path, value string, always bool) {
+		// A SWITCH ALREADY RIGHT IS LEFT ALONE, since the kernel refuses a
+		// policy's boost while the global switch is off. A CEILING IS ALWAYS
+		// WRITTEN, as the controller writes it: it can read the baseline while a
+		// lower request is still waiting to be applied.
+		if !always {
+			if now, err := readSysfs(path); err == nil && now == value {
+				return
+			}
 		}
 		if err := writeSysfs(path, value); err != nil {
 			failures = append(failures, fmt.Errorf("write %s: %w", path, err))
 		}
 	}
 	if c.boost != "" {
-		write(c.boostPath, c.boost)
+		write(c.boostPath, c.boost, false)
 	}
 	for _, path := range sortedKeys(c.policyBoost) {
-		write(path, c.policyBoost[path])
+		write(path, c.policyBoost[path], false)
 	}
 	for _, path := range sortedKeys(c.ceilings) {
-		write(path, c.ceilings[path])
+		write(path, c.ceilings[path], true)
 	}
 	if _, err := c.waitFor(c.root, 3*time.Second); err != nil {
 		failures = append(failures, err)
