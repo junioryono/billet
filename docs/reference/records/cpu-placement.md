@@ -18,12 +18,12 @@ What placing microVMs on host cpus, and capping the cpu while a node is idle, di
 - **The matrix:**
   - Placements: `none` (today's unpinned guests), `compact` and `spread`.
   - Loads: 4 and 8 guests, that is 32 and 64 vCPUs on 128 threads.
-  - Both workloads, three repeats, in a shuffled order within each repeat. 36 runs, 240 guests, none failed.
+  - Both workloads, three repeats, in a shuffled order within each repeat. 36 runs and 216 guests, and 40 runs and 232 guests with the boost runs below; none failed.
 - **Idle settings:** each held for two minutes, 15 s trimmed from each end, then two runs with boost off beside two with it on.
 
 ## Results
 
-### Idle power does not depend on the cpu's ceiling
+### No cpu ceiling lowered idle power
 
 | Setting | Package (RAPL) | Wall |
 |---|---|---|
@@ -32,8 +32,8 @@ What placing microVMs on host cpus, and capping the cpu while a node is idle, di
 | Boost off, 2.0 GHz ceiling | 82.7 W | 157.1 W |
 | Boost off, 1.5 GHz ceiling | 81.8 W | 154.4 W |
 
-- **Every setting is within noise of the default.** An idle core is in a C-state whatever its ceiling, and most of the idle draw is outside the cores, as the package's own split showed in September (about 69 of 73.5 W uncore).
-- **Capping a node's frequency while it is idle, which `node.power` (#651) does, saves no measurable power on this host.** Whatever it would save would show in how a host leaves and enters idle, not in idle itself.
+- **No setting lowered idle power.** Each capped setting read 1.7 to 3.9 W higher in the package and 1.6 to 6.6 W higher at the wall than the default. With one two-minute reading per setting and no measure of its spread, that difference is not shown to be real; what is shown is that none was lower. That fits what is known of this chip: an idle core sits in a C-state whatever its ceiling, and most of the idle draw is outside the cores (about 69 of 73.5 W was uncore in the package's own split in September).
+- **So capping a node's frequency while it is idle, which `node.power` (#651) does, showed no saving on this host.** Whatever it saves would have to show in how a host leaves and enters idle, which this did not measure.
 - **The idle package read about 79 W in this session**, against 69.9 W in the calibration run at 02:50 the same night. The difference is not explained here; background work after a busy night is the likeliest cause. Every setting above was read in the same half hour, so they compare with each other.
 
 ### Spread was fastest and used the least energy on the compile
@@ -56,14 +56,13 @@ Means of the three repeats. Run time is per guest. Energy is the whole host over
 | memory | 8 | spread | 148.5 s | 0.2 | 28.36 kJ | 38.10 kJ | 0.06 | 39.57 |
 
 - **`spread` compared with unpinned guests on the compile:**
-  - At 4 guests: 12% faster and 10% less package energy.
-  - At 8 guests: 7% faster and 8% less.
+  - At 4 guests: 12% shorter run time and 10% less package energy.
+  - At 8 guests: 7% shorter run time and 8% less package energy.
   - Its run times also varied far less, a standard deviation of 0.5 to 0.9 s against 3.7 to 6.6 s unpinned.
-- **`compact` was the slowest in every configuration.** It gives a guest's 8 vCPUs only 4 physical cores, both SMT siblings each, so the compile's IPC fell from 1.33 to 0.93 and it ran longer. At 4 guests it also used more energy than unpinned. Packing work onto fewer cores so the rest can sleep lost to finishing sooner, because the idle cores it frees save little: the idle result above.
-- **The memory workload is bound by memory bandwidth** (IPC 0.05 to 0.12, about 35 misses per 1,000 instructions).
-  - Unpinned and `spread` ran the same.
-  - `compact` was 30% slower at 4 guests.
-  - At 8 guests, `spread` used the least wall energy (38.1 kJ against 43.1 unpinned) though not the least package energy, so power outside the package (memory) differed between placements.
+- **`compact` was the slowest in every configuration.** It gives a guest's 8 vCPUs only 4 physical cores, both SMT siblings each, so the compile's IPC fell from 1.33 to 0.93 and it ran longer, and on the compile it used more package energy than unpinned at both loads. Here packing work onto fewer cores lost to finishing sooner. Why the freed cores saved too little to make up for it was not measured; the idle result above is consistent with idle cores costing little.
+- **The memory workload stalls on memory** (IPC 0.05 to 0.12, about 35 last-level misses per 1,000 instructions). That it is bound by memory bandwidth is an interpretation of those counters; the harness measures no bandwidth.
+  - At 4 guests, `spread` ran 3.5% longer than unpinned (82.2 s against 79.4 s) and `compact` 30% longer. At 8 guests unpinned and `spread` ran the same.
+  - At 8 guests, `spread` used the least wall energy (38.1 kJ against 43.1 unpinned) but not the least package energy (28.4 against 27.0 kJ). So the energy outside the package differed between placements; these instruments cannot say which part of the host it was.
 - **Not separated:** `compact` as built changes two things at once, sharing SMT siblings and using fewer CCDs. A placement that used fewer CCDs without sharing siblings was not run.
 ### Boost off cost the compile nothing and saved energy, in two runs
 
@@ -79,7 +78,11 @@ Means of the three repeats. Run time is per guest. Energy is the whole host over
 
 - **Over the 40 runs, the energy billet's sampler charged to the guests was a mean 0.890 of the package's energy above the configured idle baseline** (69.7 W), ranging from 0.763 to 0.980, all measured in the same window.
 - **This is the first check of attribution on a quiet host with jobs in it.** Earlier runs had other CI at both ends of the log (UNMEASURED) or a wrong baseline.
-- **The kit's tolerance is 0.85 to 1.02.** The unattributed tenth is the host's own work while guests ran, and the higher idle seen this session counts toward it.
+- **Against the kit's per-run tolerance of 0.85 to 1.02, 25 of the 40 runs were inside and 15 below it;** the mean is inside.
+- **The unattributed tenth has more than one candidate, and this did not separate them:**
+  - the host's own work while guests ran (the storage cluster serving their disks is outside every guest's cgroup);
+  - the idle baseline: this session idled about 9 W above the configured 69.7 W;
+  - the harness's windows: a run's window opens before its launches, and each guest joins the sampler only once its launch returns.
 
 ## What this does not establish
 
