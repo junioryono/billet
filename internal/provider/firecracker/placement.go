@@ -146,6 +146,8 @@ func place(topo topology, placement string, vcpus int, taken map[int]bool) []int
 		return placeCompact(topo, vcpus, taken)
 	case config.CPUPlacementSpread:
 		return placeSpread(topo, vcpus, taken)
+	case config.CPUPlacementPacked:
+		return placePacked(topo, vcpus, taken)
 	default:
 		return nil
 	}
@@ -224,6 +226,27 @@ func placeSpread(topo topology, vcpus int, taken map[int]bool) []int {
 	var cpus []int
 	for _, r := range rooms {
 		for _, core := range r.cores {
+			if len(cpus) == vcpus {
+				return cpus
+			}
+			cpus = append(cpus, core[0])
+		}
+	}
+	if len(cpus) == vcpus {
+		return cpus
+	}
+
+	return nil
+}
+
+// placePacked takes one thread per core, from the lowest group with a free core
+// onward: spread's shape, a core of its own per vCPU, in compact's order, so the
+// two effects compact combines (sharing SMT siblings, and filling as few groups
+// as possible) can be told apart.
+func placePacked(topo topology, vcpus int, taken map[int]bool) []int {
+	var cpus []int
+	for _, group := range topo {
+		for _, core := range freeCores(group, taken) {
 			if len(cpus) == vcpus {
 				return cpus
 			}
