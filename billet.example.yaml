@@ -506,8 +506,8 @@ node:
   # the launch, which may then start capped while the node retries every 5s.
   # What a cap changed is recorded under state_dir (power-baseline.json)
   # before the first write, a stop tries for at most 30s to restore it, and a
-  # node that finds that record at its start restores it, whatever this block
-  # says now. The node runs as root and its unit leaves
+  # node that finds that record at its start tries to restore it, whatever
+  # this block says now (a failure is logged and retried while the node runs). The node runs as root and its unit leaves
   # ProtectKernelTunables off, which is what keeps /sys writable.
   #
   # power:
