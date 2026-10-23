@@ -12,12 +12,20 @@ import (
 func TestARunWithOneSharedCPUIsRefused(t *testing.T) {
 	t.Parallel()
 
-	if err := sharedCPUs([]string{"0-1", "8-9", "16-17", "24-25"}); err != nil {
-		t.Fatalf("disjoint guests refused: %v", err)
+	for i, err := range failRunOnSharedCPUs([]string{"0-1", "8-9", "16-17", "24-25"}, make([]error, 4)) {
+		if err != nil {
+			t.Fatalf("a disjoint run failed guest %d: %v", i, err)
+		}
 	}
-	err := sharedCPUs([]string{"0-1", "1-2", "16-17", "24-25"})
-	if err == nil || !strings.Contains(err.Error(), "cpu 1 is placed under guest 0 and guest 1") {
-		t.Fatalf("one shared cpu answered %v, want it named with both guests", err)
+	errs := failRunOnSharedCPUs([]string{"0-1", "1-2", "16-17", "24-25"}, make([]error, 4))
+	if len(errs) != 4 {
+		t.Fatalf("answered %d errors for four guests", len(errs))
+	}
+	for i, err := range errs {
+		if err == nil || !strings.Contains(err.Error(), "cpu 1 is placed under guest 0 and guest 1") {
+			t.Fatalf("guest %d of a run with one shared cpu answered %v, want the run failed on every guest", i,
+				err)
+		}
 	}
 }
 

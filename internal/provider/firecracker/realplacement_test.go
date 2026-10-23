@@ -241,13 +241,12 @@ func TestRealPlacementExperiment(t *testing.T) {
 	// is the whole host's and its load is every guest's.
 	if placement != "" {
 		cpus := make([]string, len(guests))
+		errs := make([]error, len(guests))
 		for i, g := range guests {
-			cpus[i] = g.cpus
+			cpus[i], errs[i] = g.cpus, g.err
 		}
-		if err := sharedCPUs(cpus); err != nil {
-			for _, g := range guests {
-				g.err = errors.Join(g.err, err)
-			}
+		for i, err := range failRunOnSharedCPUs(cpus, errs) {
+			guests[i].err = err
 		}
 	}
 	// THE WHOLE HOST'S BUSY CPU OVER THE RUN, so what no guest's cgroup was
@@ -429,6 +428,20 @@ func sharedCPUs(byGuest []string) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// failRunOnSharedCPUs answers each guest's error with sharedCPUs' refusal
+// joined into every one when any cpu is shared, and the errors unchanged
+// otherwise.
+func failRunOnSharedCPUs(byGuest []string, errs []error) []error {
+	out := append([]error(nil), errs...)
+	if err := sharedCPUs(byGuest); err != nil {
+		for i := range out {
+			out[i] = errors.Join(out[i], err)
+		}
+	}
+
+	return out
 }
 
 // vmmCleanExit is the line a Firecracker VMM logs when it exits because its
