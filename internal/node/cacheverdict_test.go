@@ -16,6 +16,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -190,16 +191,31 @@ func TestAFailedCacheReportIsResentByTheNextSettlement(t *testing.T) {
 
 	npmGet(t, service, credentials, npmRequestLine("/resent"))
 	assertNpmQuiet(t, service.npmCache())
+	// THE REQUEST HAS ENDED, so the first settlement carries its verdict and
+	// nothing later changes it: the resend below is the unchanged one.
+	session := npmSession(service, credentials)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		session.mu.Lock()
+		inflight := session.npmInflight
+		session.mu.Unlock()
+		if inflight == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the request never ended")
+		}
+	}
 	service.SettleObservation(t.Context(), "billet-lease-npm")
-	if calls := observer.recorded(); len(calls) != 1 {
-		t.Fatalf("the first settlement made %d reports, want the one that failed", len(calls))
+	calls := observer.recorded()
+	if len(calls) != 1 || calls[0].obs.Npm != alloc.BuildCacheCold {
+		t.Fatalf("the first settlement reported %+v, want the one failed report carrying cold", calls)
 	}
 	if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	calls := observer.recorded()
-	if len(calls) < 2 || calls[len(calls)-1].obs.Npm != alloc.BuildCacheCold {
-		t.Fatalf("after the failed report, the reports were %+v; want the cold verdict sent again", calls)
+	calls = observer.recorded()
+	if len(calls) != 2 || calls[1].obs != calls[0].obs {
+		t.Fatalf("after the failed report, the reports were %+v; want the same observation sent again", calls)
 	}
 }
 
@@ -262,16 +278,18 @@ func TestAnUnreadableKillSwitchMakesACacheUnavailableNotDisabled(t *testing.T) {
 		t.Run("content-addressed "+name, func(t *testing.T) {
 			t.Parallel()
 
+			// THE GUEST IS REFUSED THE SAME WAY EITHER WAY, so its helper stops
+			// asking; only what is recorded differs.
 			service, session := switchedSession(t, config.CacheGo, answer.allowed, answer.err)
-			session.mu.Lock()
-			_, err := service.casVolume(t.Context(), session, config.CacheGo)
-			session.mu.Unlock()
-			want := errCacheOff
-			if answer.err != nil {
-				want = errCachePolicyUnknown
+			if _, err := service.openCASHandle(t.Context(), session, config.CacheGo, false); !errors.Is(err,
+				reapi.ErrOff) {
+				t.Fatalf("openCASHandle answered %v, want reapi.ErrOff", err)
 			}
-			if !errors.Is(err, want) {
-				t.Fatalf("casVolume answered %v, want %v", err, want)
+			session.mu.Lock()
+			got := session.building[config.CacheGo]
+			session.mu.Unlock()
+			if got != answer.want {
+				t.Fatalf("the Go cache noted %q, want %q", got, answer.want)
 			}
 		})
 	}
@@ -303,4 +321,48 @@ func switchedSession(t *testing.T, kind config.CacheKind, allowed bool, err erro
 	session := service.sessionOf(instance)
 
 	return service, session
+}
+
+// SETTLEMENT WAITS FOR AN NPM REQUEST STILL IN FLIGHT, for a short bound, so
+// the verdict it holds back reaches the plane before the teardown that called
+// it lets the lease go.
+func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
+	t.Parallel()
+
+	reached, release := make(chan struct{}), make(chan struct{})
+	var reachedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 1 {
+			reachedOnce.Do(func() { close(reached) })
+			<-release
+		}
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, "{}")
+	})
+	service, credentials := npmService(t, registry)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte(npmRequestLine("/settling"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the registry")
+	}
+	time.AfterFunc(200*time.Millisecond, func() { releaseOnce.Do(func() { close(release) }) })
+
+	service.SettleObservation(t.Context(), "billet-lease-npm")
+	var got alloc.BuildCache
+	for _, call := range observer.recorded() {
+		if call.obs.Npm != "" {
+			got = call.obs.Npm
+		}
+	}
+	if got != alloc.BuildCacheCold {
+		t.Fatalf("by the time settlement returned the npm cache was reported %q, want cold", got)
+	}
 }

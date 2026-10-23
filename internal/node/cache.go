@@ -687,6 +687,11 @@ func (s *CacheService) SettleObservation(ctx context.Context, instance string) {
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
 	defer cancel()
 
+	// AN NPM REQUEST STILL IN FLIGHT ENDS FIRST, for a short bound: its compute
+	// is gone, so its connection is, and the verdict it holds back reaches the
+	// plane while the lease can still take it.
+	awaitNpm(settleCtx, session, npmSettleWait)
+
 	if err := lockCacheSession(settleCtx, session); err != nil {
 		s.log.Warn("could not settle what the cache did for a job before its compute was "+
 			"forgotten; the session's cleanup will try once more",
@@ -697,6 +702,24 @@ func (s *CacheService) SettleObservation(ctx context.Context, instance string) {
 	defer session.mu.Unlock()
 
 	s.settleObservation(settleCtx, session)
+}
+
+// npmSettleWait bounds how long settlement waits for npm requests in flight.
+const npmSettleWait = 5 * time.Second
+
+// awaitNpm waits until the session has no npm request in flight, for at most
+// wait. Called without session.mu.
+func awaitNpm(ctx context.Context, session *cacheSession, wait time.Duration) {
+	deadline := time.Now().Add(wait)
+	for {
+		session.mu.Lock()
+		inflight := session.npmInflight
+		session.mu.Unlock()
+		if inflight == 0 || !time.Now().Before(deadline) || ctx.Err() != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Prepare creates one unguessable session credential before compute starts.
@@ -1619,16 +1642,11 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 		return
 	}
-	switch answer := s.sessionKindPolicy(ctx, session, config.CacheSticky); answer {
-	case policyAllowed:
-	case policyRefused:
+	// AN UNREADABLE SWITCH IS REFUSED AS AN OFF ONE IS; only what is recorded
+	// differs.
+	if answer := s.sessionKindPolicy(ctx, session, config.CacheSticky); answer != policyAllowed {
 		noteRefused(session, config.CacheSticky, answer)
 		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
-
-		return
-	default:
-		noteRefused(session, config.CacheSticky, answer)
-		http.Error(w, "the cache kill switch could not be read", http.StatusServiceUnavailable)
 
 		return
 	}

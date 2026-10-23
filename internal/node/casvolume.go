@@ -450,7 +450,10 @@ func (s *CacheService) openCASHandle(
 		noteBuildCache(session, kind, alloc.BuildCacheUnavailable)
 	}
 	session.mu.Unlock()
-	if errors.Is(err, errCacheOff) {
+	// AN UNREADABLE SWITCH IS REFUSED AS AN OFF ONE IS, so the guest's helper
+	// stops asking rather than paying the switch's wait on every miss; only what
+	// is recorded differs.
+	if errors.Is(err, errCacheOff) || errors.Is(err, errCachePolicyUnknown) {
 		admitted()
 
 		return nil, reapi.ErrOff
