@@ -73,6 +73,9 @@ type Node struct {
 	// source when the node serves metrics and nil, which reports nowhere, when
 	// not.
 	powered power.Observer
+	// leftoverPower holds what OpenNode's restore of an earlier process's cap
+	// did, for PowerMetrics to count once it attaches.
+	leftoverPower *heldPowerEvents
 }
 
 // OpenNode loads the certificate this node presents, claims the deployment
@@ -99,7 +102,16 @@ func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
 		return nil, err
 	}
 
-	n := &Node{cfg: cfg, deployment: deployment, lock: lock, upgrader: opts.Upgrader, probe: opts.Probe}
+	n := &Node{cfg: cfg, deployment: deployment, lock: lock, upgrader: opts.Upgrader, probe: opts.Probe,
+		leftoverPower: &heldPowerEvents{}}
+
+	// A CAP AN EARLIER PROCESS LEFT, THE MOMENT THE LOCK IS HELD: before
+	// anything below can refuse this start, and not before the lock, since
+	// another node process holding it may have a cap in force. Never from a
+	// probe, which runs beside such a process.
+	if !opts.Probe {
+		restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS, n.leftoverPower)
+	}
 
 	// THE ENDING RECORD BEFORE THE PROVIDER (#127): no process touches compute
 	// without an entry, because a stop is later proved by this process's ending
@@ -115,13 +127,6 @@ func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
 	}
 
 	n.ending = ending
-
-	// A CAP AN EARLIER PROCESS LEFT, before anything below can refuse this
-	// start, and never from a probe, which runs beside the node that may hold
-	// one in force.
-	if !opts.Probe {
-		restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS)
-	}
 
 	if err := n.open(bundle); err != nil {
 		n.endOnClose()
@@ -333,9 +338,13 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	if err != nil {
 		return err
 	}
-	// RESTORED ON A RETURN BEFORE THE POLICY'S LOOP STARTS, too.
+	// RESTORED ON A RETURN BEFORE THE POLICY'S LOOP STARTS, too, and ONCE: the
+	// loop's stop closes through the same call, so a restore that keeps failing
+	// spends one stop bound, not two.
+	closePower := func() {}
 	if powerCtl != nil {
-		defer closeNodePower(ctx, powerCtl)
+		closePower = sync.OnceFunc(func() { closeNodePower(ctx, powerCtl) })
+		defer closePower()
 	}
 
 	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, n.deployment, n.client,
@@ -393,7 +402,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 
 	// RESTORED ON EVERY RETURN FROM HERE, a drain, a handoff and a failure alike.
 	if powerCtl != nil {
-		stopPower := runNodePower(ctx, powerCtl, func() bool { return !runner.Holding() })
+		stopPower := runNodePower(ctx, powerCtl, runner.Idle, closePower)
 		defer stopPower()
 	}
 

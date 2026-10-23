@@ -3,7 +3,9 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,13 +126,40 @@ func TestALeftoverThatWillNotRestoreKeepsARetryingPolicy(t *testing.T) {
 	stateDir := t.TempDir()
 	capHost(t, root, stateDir)
 
-	restoreLeftoverPower(powerConfig(stateDir, nil), root, "darwin")
+	n := &Node{leftoverPower: &heldPowerEvents{}}
+	restoreLeftoverPower(powerConfig(stateDir, nil), root, "darwin", n.leftoverPower)
 	if get("boost") != "0" {
 		t.Fatal("a darwin node touched cpufreq")
 	}
-	restoreLeftoverPower(powerConfig(stateDir, nil), root, "linux")
+	restoreLeftoverPower(powerConfig(stateDir, nil), root, "linux", n.leftoverPower)
 	if get("boost") != "1" || get("policy0/scaling_max_freq") != "2450000" {
 		t.Fatalf("the lock-time restore left the host capped: boost %s", get("boost"))
+	}
+
+	// AND IT IS COUNTED once the node's metrics attach, which is after it.
+	m, err := ServeMetrics(t.Context(), "node", &config.MetricsConfig{Listen: "127.0.0.1:0"}, n.PowerMetrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close(t.Context()) })
+	ctx, cancel := context.WithTimeout(t.Context(), metricsTestWait)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+m.srv.Addr().String()+"/metrics",
+		http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `billet_node_power_changes_total{outcome="ok",transition="restore"} 1`; !strings.Contains(string(body), want+"\n") {
+		t.Errorf("the lock-time restore is not counted: /metrics lacks %q", want)
 	}
 
 	record := filepath.Join(stateDir, power.RecordName)
@@ -189,7 +218,11 @@ func TestANodeStopRestoresTheCeiling(t *testing.T) {
 	}
 
 	ctx, signal := context.WithCancel(t.Context())
-	stop := runNodePower(ctx, ctrl, func() bool { return true })
+	closed := 0
+	stop := runNodePower(ctx, ctrl, func() bool { return true }, func() {
+		closed++
+		closeNodePower(ctx, ctrl)
+	})
 	t.Cleanup(stop)
 	for deadline := time.Now().Add(10 * time.Second); get("boost") != "0"; time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
@@ -210,6 +243,9 @@ func TestANodeStopRestoresTheCeiling(t *testing.T) {
 		t.Fatal("the policy capped again after the node's stop began")
 	}
 	stop()
+	if closed != 1 {
+		t.Errorf("the stop closed the controller through the node's close %d times, want once", closed)
+	}
 
 	if get("boost") != "1" || get("policy0/scaling_max_freq") != "2450000" {
 		t.Errorf("the stop left the host capped: boost %s, ceiling %s", get("boost"), get("policy0/scaling_max_freq"))

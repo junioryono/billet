@@ -120,6 +120,8 @@ type Runner struct {
 	// purging is set while a background purge of discarded storage runs, so a
 	// sweep starts at most one.
 	purging atomic.Bool
+	// recovered is set by the first Recover that succeeds; see Idle.
+	recovered atomic.Bool
 	// spawn runs the purge in the background; a seam so a test controls when it
 	// runs instead of racing a goroutine. Nil is `go`.
 	spawn func(func())
@@ -1218,8 +1220,32 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (strayCleanup, e
 	return strayCleanup{confirmed: true, evidence: custodyEvidence{observed: true}}, nil
 }
 
-// Recover decides what to do with compute an earlier run left behind, once, at
-// startup and before any listener opens a session.
+// Recover is recoverLeftovers, and records the first that succeeds: until one
+// has, this process has not looked at what an earlier run left, so it cannot
+// call itself idle.
+func (r *Runner) Recover(ctx context.Context) error {
+	if err := r.recoverLeftovers(ctx); err != nil {
+		return err
+	}
+	r.recovered.Store(true)
+
+	return nil
+}
+
+// Idle reports whether this node holds nothing, as far as it can tell: it has
+// recovered what an earlier run left, and holds no compute (Holding). The idle
+// power policy asks it before lowering the CPU's ceiling.
+//
+// NOT IDLE BEFORE THE FIRST RECOVERY: a restarted node's maps are empty while
+// the guests an earlier process launched are still running, and a registration
+// that keeps failing delays the recovery that would adopt them for as long as
+// it fails.
+func (r *Runner) Idle() bool {
+	return r.recovered.Load() && !r.Holding()
+}
+
+// recoverLeftovers decides what to do with compute an earlier run left behind,
+// once, at startup and before any listener opens a session.
 //
 // IT DOES NOT DESTROY EVERYTHING. GitHub does not transparently retry a job a
 // runner has already started: the scale-set documentation describes reassignment
@@ -1237,7 +1263,7 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (strayCleanup, e
 // for its result and its capacity has already gone back to the budget. Those are
 // destroyed here rather than left for the first sweep, because until they are
 // gone the host is over-committed by exactly their size.
-func (r *Runner) Recover(ctx context.Context) error {
+func (r *Runner) recoverLeftovers(ctx context.Context) error {
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list what is already running: %w", err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -35,9 +36,44 @@ func (n *Node) PowerMetrics() MetricsSource {
 				return err
 			}
 			n.powered = o
+			// WHAT OPENNODE'S RESTORE DID before there was anything to count it.
+			n.leftoverPower.replay(o)
 
 			return nil
 		},
+	}
+}
+
+// heldPowerEvents keeps what a controller reports before the metrics it
+// reports to exist, for replay once they do.
+type heldPowerEvents struct {
+	mu      sync.Mutex
+	changes [][2]string
+}
+
+func (h *heldPowerEvents) PowerChanged(transition, outcome string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.changes = append(h.changes, [2]string{transition, outcome})
+}
+
+// PowerLaunchRestore is never told: nothing launches before OpenNode returns.
+func (*heldPowerEvents) PowerLaunchRestore(time.Duration) {}
+
+// replay tells o what was held, once.
+func (h *heldPowerEvents) replay(o power.Observer) {
+	if h == nil {
+		return
+	}
+
+	h.mu.Lock()
+	changes := h.changes
+	h.changes = nil
+	h.mu.Unlock()
+
+	for _, c := range changes {
+		o.PowerChanged(c[0], c[1])
 	}
 }
 
@@ -100,9 +136,10 @@ func openNodePower(ctx context.Context, cfg *config.Config, root, goos string, o
 
 // runNodePower runs the policy's loop until the returned stop is called, and
 // stops capping as soon as ctx ends, since the drain that follows a stop can
-// hold the host for hours. Stop waits for the loop, THEN restores: the other
-// order would let the loop cap the host again behind the restore.
-func runNodePower(ctx context.Context, ctrl *power.Controller, idle func() bool) func() {
+// hold the host for hours. Stop waits for the loop, THEN restores through
+// closePower: the other order would let the loop cap the host again behind the
+// restore.
+func runNodePower(ctx context.Context, ctrl *power.Controller, idle func() bool, closePower func()) func() {
 	loopCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	stopping := context.AfterFunc(ctx, ctrl.BeginStop)
 
@@ -128,19 +165,20 @@ func runNodePower(ctx context.Context, ctrl *power.Controller, idle func() bool)
 		}
 		timer.Stop()
 
-		closeNodePower(ctx, ctrl)
+		closePower()
 	}
 }
 
 // restoreLeftoverPower restores a cap an earlier node process left, on Linux,
-// the moment the node holds its lock. A failure is logged, and Node.Run's
-// policy retries it.
-func restoreLeftoverPower(cfg *config.Config, root, goos string) {
+// the moment the node holds its lock, telling observer what it did. A failure
+// is logged, and Node.Run's policy retries it.
+func restoreLeftoverPower(cfg *config.Config, root, goos string, observer power.Observer) {
 	if goos != "linux" {
 		return
 	}
 
-	ctrl, err := power.New(power.Options{SysfsRoot: root, StateDir: cfg.Node.StateDir, Log: slog.Default()})
+	ctrl, err := power.New(power.Options{SysfsRoot: root, StateDir: cfg.Node.StateDir, Log: slog.Default(),
+		Observer: observer})
 	if err == nil {
 		err = ctrl.RestoreLeftover()
 	}

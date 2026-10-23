@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -58,6 +59,45 @@ func TestALaunchHoldsBeforeItRestoresAndRestoresBeforeTheProvider(t *testing.T) 
 		if i > 0 && at[order[i-1]] >= at[name] {
 			t.Errorf("Launch calls %s before %s", name, order[i-1])
 		}
+	}
+}
+
+// A NODE IS NOT IDLE UNTIL IT HAS RECOVERED what an earlier run left, however
+// empty its own maps are, and not while it runs a job.
+func TestANodeIsNotIdleUntilItHasRecovered(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	if r.Idle() {
+		t.Fatal("a node that has not recovered calls itself idle")
+	}
+
+	// A RECOVERY THAT FAILS IS NOT ONE.
+	p.listErr = errors.New("injected: the daemon did not answer")
+	if err := r.Recover(t.Context()); err == nil {
+		t.Fatal("the injected list failure did not fail the recovery")
+	}
+	if r.Idle() {
+		t.Error("a node whose recovery failed calls itself idle")
+	}
+
+	p.listErr = nil
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !r.Idle() {
+		t.Fatal("a recovered node holding nothing is not idle")
+	}
+
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, RunID: 1, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if r.Idle() {
+		t.Error("a node running a job calls itself idle")
 	}
 }
 
@@ -125,12 +165,16 @@ func TestALaunchRestoresTheCPUCeilingBeforeTheProviderStarts(t *testing.T) {
 		}
 	}}, nil, WithPower(ctrl))
 
-	// CAPPED BY THE POLICY'S OWN LOOP, asking the runner as the node does.
+	// CAPPED BY THE POLICY'S OWN LOOP, asking the runner as the node does, once
+	// the runner has recovered, as a registration does first.
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	loop, stop := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ctrl.Run(loop, func() bool { return !r.Holding() })
+		ctrl.Run(loop, r.Idle)
 	}()
 	t.Cleanup(func() { stop(); <-done })
 	for deadline := time.Now().Add(10 * time.Second); get("boost") != "0"; {

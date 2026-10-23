@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -287,5 +288,74 @@ func TestCloseRetriesWithinItsBound(t *testing.T) {
 		if took := time.Since(started); took < DefaultStopBound || took > DefaultStopBound+2*time.Second {
 			t.Errorf("Close gave up after %s, want its %s bound", took, DefaultStopBound)
 		}
+
+		// THE ATTEMPT IN FLIGHT AT THE BOUND ends within its settle bound.
+		time.Sleep(2 * DefaultSettle)
+		synctest.Wait()
+	})
+}
+
+// stuckWrites holds every write until the returned release is called, as a
+// kernel that never finishes one would.
+func stuckWrites(c *Controller) (release func()) {
+	gate := make(chan struct{})
+	c.write = func(path, value string) error {
+		<-gate
+
+		return writeSysfs(path, value)
+	}
+
+	return func() { close(gate) }
+}
+
+// CLOSE IS BOUNDED BY ITS STOP BOUND even when the restore it starts is stuck
+// inside a write, and the restore still lands once the write returns.
+func TestCloseIsBoundedByAStuckRestore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newFakeHost(t, 1)
+		c, stateDir := newController(t, h, capBoth, nil)
+		capNow(t, c)
+
+		release := stuckWrites(c)
+		started := time.Now()
+		err := c.Close(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "did not finish within the stop's bound") {
+			t.Fatalf("Close answered %v, want the bound's refusal", err)
+		}
+		if took := time.Since(started); took < DefaultStopBound || took > DefaultStopBound+2*time.Second {
+			t.Errorf("Close returned after %s, want its %s bound", took, DefaultStopBound)
+		}
+
+		release()
+		synctest.Wait()
+		h.requireFull(stateDir)
+	})
+}
+
+// LAUNCHES BEHIND A STUCK RESTORE SHARE IT: each returns after its bound, and
+// none leaves a goroutine of its own behind.
+func TestLaunchesBehindAStuckRestoreShareIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newFakeHost(t, 1)
+		c, stateDir := newController(t, h, capBoth, nil)
+		capNow(t, c)
+
+		release := stuckWrites(c)
+		c.RestoreBeforeLaunch(t.Context(), "lease-0")
+		before := runtime.NumGoroutine()
+		for i := range 5 {
+			started := time.Now()
+			c.RestoreBeforeLaunch(t.Context(), "lease-"+itoa(i+1))
+			if waited := time.Since(started); waited != 2*time.Second {
+				t.Errorf("launch %d waited %s, want its 2s bound", i+1, waited)
+			}
+		}
+		if after := runtime.NumGoroutine(); after != before {
+			t.Errorf("five launches behind one stuck restore left %d goroutines more", after-before)
+		}
+
+		release()
+		synctest.Wait()
+		h.requireFull(stateDir)
 	})
 }

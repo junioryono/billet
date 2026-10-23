@@ -154,6 +154,8 @@ type Controller struct {
 	mu       sync.Mutex
 	busyAt   time.Time
 	stopping bool
+	// inflight is the background restore not yet ended; see restoreAsync.
+	inflight *restoreRun
 
 	// failing and logged date a streak of failed restores and its last line.
 	// Under sem.
@@ -826,37 +828,79 @@ func (c *Controller) RestoreBeforeLaunch(ctx context.Context, lease string) {
 		return
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		// NOT BOUND BY THE LAUNCH: a restore that has begun is finished, since the
-		// host is owed it whether or not this launch still waits.
-		c.sem <- struct{}{}
-		wrote, err := c.restoreLocked("launch")
-		c.release()
-
-		took := time.Since(asked)
-		if wrote && err == nil {
-			c.observer.PowerLaunchRestore(took)
-			c.log.Info("restored the CPU's full ceiling before a launch", "lease", lease,
-				"took", took.Round(time.Microsecond))
-		}
-		done <- err
-	}()
+	run := c.restoreAsync("launch", asked)
 
 	timer := time.NewTimer(c.launchBound)
 	defer timer.Stop()
 
 	select {
-	case err := <-done:
-		if err != nil {
+	case <-run.done:
+		if run.err != nil {
 			c.log.Error("launching on a host whose CPU ceiling could not be restored; the job may run slower",
-				"lease", lease, "error", err)
+				"lease", lease, "error", run.err)
+		} else if run.wrote {
+			c.log.Info("restored the CPU's full ceiling before a launch", "lease", lease,
+				"took", time.Since(asked).Round(time.Microsecond))
 		}
 	case <-timer.C:
 		c.log.Error("the CPU ceiling's restore did not finish within its bound; launching anyway, and it "+
 			"goes on in the background", "lease", lease, "bound", c.launchBound)
 	case <-ctx.Done():
 	}
+}
+
+// restoreRun is one restore in the background, which every caller that asks
+// while it has not yet begun shares: done closes when it ends, with wrote and
+// err set.
+type restoreRun struct {
+	done  chan struct{}
+	wrote bool
+	err   error
+	// launchAsked is when the first launch that shares it asked, zero when
+	// none has; a launch's latency runs from it.
+	launchAsked time.Time
+}
+
+// restoreAsync starts a restore in the background, or joins the one already
+// waiting to run. ONE AT A TIME, so a write stuck in the kernel leaves one
+// goroutine behind it, not one per launch.
+//
+// A RUN IS JOINED ONLY BEFORE IT RELEASES THE LOCK: it clears itself under the
+// lock, so a caller never shares a restore that ended before a cap it did not
+// see, and one that asks later starts a run of its own, after that cap.
+func (c *Controller) restoreAsync(reason string, launchAsked time.Time) *restoreRun {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if run := c.inflight; run != nil {
+		if run.launchAsked.IsZero() {
+			run.launchAsked = launchAsked
+		}
+
+		return run
+	}
+
+	run := &restoreRun{done: make(chan struct{}), launchAsked: launchAsked}
+	c.inflight = run
+	go func() {
+		defer close(run.done)
+
+		c.sem <- struct{}{}
+		wrote, err := c.restoreLocked(reason)
+
+		c.mu.Lock()
+		c.inflight = nil
+		run.wrote, run.err = wrote, err
+		asked := run.launchAsked
+		c.mu.Unlock()
+		c.release()
+
+		if wrote && err == nil && !asked.IsZero() {
+			c.observer.PowerLaunchRestore(time.Since(asked))
+		}
+	}()
+
+	return run
 }
 
 // Run looks at the node every tick until ctx ends: it retries a restore that
@@ -937,7 +981,8 @@ func (c *Controller) step(ctx context.Context, idle func() bool) {
 }
 
 // Close caps nothing more and restores the full ceiling, retrying for at most
-// the stop bound. A node calls it once its loop has returned.
+// the stop bound, which also bounds a restore stuck in the kernel. A node calls
+// it once its loop has returned.
 func (c *Controller) Close(ctx context.Context) error {
 	c.BeginStop()
 
@@ -945,9 +990,21 @@ func (c *Controller) Close(ctx context.Context) error {
 	defer cancel()
 
 	for {
-		err := c.Restore(ctx, "stop")
-		if err == nil {
-			return nil
+		run := c.restoreAsync("stop", time.Time{})
+
+		var err error
+		select {
+		case <-run.done:
+			if run.err == nil {
+				if run.wrote {
+					c.log.Info("restored the CPU's full ceiling", "reason", "stop")
+				}
+
+				return nil
+			}
+			err = run.err
+		case <-ctx.Done():
+			err = errors.New("power: the restore did not finish within the stop's bound")
 		}
 
 		timer := time.NewTimer(time.Second)

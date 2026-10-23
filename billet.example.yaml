@@ -493,8 +493,9 @@ node:
   #   guest: true
 
   # LOWER THE CPU'S CEILING WHILE THIS NODE IS IDLE (firecracker and docker
-  # on Linux only; absent means off). Idle is no instance running, none
-  # launching and none held in custody, for idle_after (default 60s, at least
+  # on Linux only; absent means off). Idle is a node that has recovered what
+  # an earlier process left and holds nothing (no instance running, launching
+  # or held in custody), for idle_after (default 60s, at least
   # 10s). disable_boost writes 0 to /sys/devices/system/cpu/cpufreq/boost, and
   # idle_max_freq_khz is written to every policy's scaling_max_freq; it must be
   # one of each policy's scaling_available_frequencies, or the node refuses to
