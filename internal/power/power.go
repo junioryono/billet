@@ -58,6 +58,10 @@ const (
 	DefaultStopBound = 30 * time.Second
 	// failureLogEvery spaces the lines a restore that keeps failing logs.
 	failureLogEvery = time.Minute
+	// DefaultSettle is how long a write may take to read back; settlePoll is
+	// how often it is read meanwhile.
+	DefaultSettle = time.Second
+	settlePoll    = 10 * time.Millisecond
 	// wOK is access(2)'s W_OK, which package syscall does not name everywhere.
 	wOK = 2
 )
@@ -135,7 +139,7 @@ type Controller struct {
 	log            *slog.Logger
 	observer       Observer
 
-	tick, launchBound, stopBound time.Duration
+	tick, launchBound, stopBound, settle time.Duration
 
 	// write is one sysfs write; a seam so a test can fail one.
 	write func(path, value string) error
@@ -188,6 +192,7 @@ func New(opts Options) (*Controller, error) {
 	if c.stopBound <= 0 {
 		c.stopBound = DefaultStopBound
 	}
+	c.settle = DefaultSettle
 
 	return c, nil
 }
@@ -392,9 +397,19 @@ func (c *Controller) loadRecord() (record, bool, error) {
 	if err := dec.Decode(&rec); err != nil {
 		return record{}, false, fmt.Errorf("power: %s is not a record this node wrote: %w", c.recordPath(), err)
 	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return record{}, false, fmt.Errorf("power: %s holds more than the one record this node writes",
+			c.recordPath())
+	}
 	if rec.Version != recordVersion {
 		return record{}, false, fmt.Errorf("power: %s is version %d, and this node reads version %d",
 			c.recordPath(), rec.Version, recordVersion)
+	}
+
+	// A RECORD OF NO POLICY RESTORES NOTHING, and taking it as a restore would
+	// call a capped host full: a cap always records every policy.
+	if len(rec.Policies) == 0 {
+		return record{}, false, fmt.Errorf("power: %s records no cpufreq policy", c.recordPath())
 	}
 
 	// WHAT A RESTORE WRITES AS ROOT, so it is held to what a cap records: a
@@ -463,7 +478,11 @@ func (c *Controller) removeRecord() error {
 }
 
 // write is one value to put at one path, and what it must read back as.
-type write struct{ path, value string }
+// isSwitch marks a boost switch, which the kernel applies at once.
+type write struct {
+	path, value string
+	isSwitch    bool
+}
 
 // restoreWrites is a record's values in the order they go back: the global
 // boost switch first, since turning it on can move every policy's own switch
@@ -471,7 +490,7 @@ type write struct{ path, value string }
 func (c *Controller) restoreWrites(rec record) []write {
 	var out []write
 	if rec.Boost != "" {
-		out = append(out, write{c.boostPath(), rec.Boost})
+		out = append(out, write{c.boostPath(), rec.Boost, true})
 	}
 
 	names := make([]string, 0, len(rec.Policies))
@@ -481,11 +500,11 @@ func (c *Controller) restoreWrites(rec record) []write {
 	slices.Sort(names)
 	for _, name := range names {
 		if b := rec.Policies[name].Boost; b != "" {
-			out = append(out, write{c.policyPath(name, "boost"), b})
+			out = append(out, write{c.policyPath(name, "boost"), b, true})
 		}
 	}
 	for _, name := range names {
-		out = append(out, write{c.policyPath(name, "scaling_max_freq"), rec.Policies[name].MaxFreq})
+		out = append(out, write{c.policyPath(name, "scaling_max_freq"), rec.Policies[name].MaxFreq, false})
 	}
 
 	return out
@@ -496,10 +515,40 @@ func (c *Controller) restoreWrites(rec record) []write {
 func (c *Controller) apply(writes []write) error {
 	var errs []error
 	for _, w := range writes {
+		// A SWITCH ALREADY AT ITS VALUE IS NOT WRITTEN: the kernel refuses a
+		// policy's own boost while the global switch is off, even to the value it
+		// already holds (store_local_boost, Linux 7.0). A ceiling is always
+		// written, since what it reads can be a write still being applied.
+		if w.isSwitch {
+			if got, err := readSysfs(w.path); err == nil && got == w.value {
+				continue
+			}
+		}
 		if err := c.write(w.path, w.value); err != nil {
 			errs = append(errs, err)
 		}
 	}
+
+	// READ BACK UNTIL IT SETTLES. A ceiling's store updates a frequency QoS
+	// request whose notifier only schedules the policy's update (Linux 7.0,
+	// cpufreq_notifier_max), so a value read at once can still be the old one.
+	deadline := time.Now().Add(c.settle)
+	for {
+		unsettled := c.unsettled(writes)
+		if unsettled == nil || !time.Now().Before(deadline) {
+			errs = append(errs, unsettled)
+
+			break
+		}
+		time.Sleep(settlePoll)
+	}
+
+	return errors.Join(errs...)
+}
+
+// unsettled says which written values do not read back yet, or nil.
+func (c *Controller) unsettled(writes []write) error {
+	var errs []error
 	for _, w := range writes {
 		got, err := readSysfs(w.path)
 		switch {
@@ -640,6 +689,9 @@ func (c *Controller) plan() (record, []write, error) {
 	if err != nil {
 		return record{}, nil, err
 	}
+	if len(policies) == 0 {
+		return record{}, nil, fmt.Errorf("power: %s holds no cpufreq policy", c.cpufreq())
+	}
 
 	rec := record{Version: recordVersion, Policies: make(map[string]policyRecord, len(policies))}
 	var writes []write
@@ -660,7 +712,7 @@ func (c *Controller) plan() (record, []write, error) {
 		rec.Policies[p] = pr
 
 		if want := c.settings.MaxFreqKHz; want > 0 && current > want {
-			writes = append(writes, write{c.policyPath(p, "scaling_max_freq"), strconv.Itoa(want)})
+			writes = append(writes, write{c.policyPath(p, "scaling_max_freq"), strconv.Itoa(want), false})
 		}
 	}
 
@@ -671,7 +723,7 @@ func (c *Controller) plan() (record, []write, error) {
 		}
 		rec.Boost = b
 		if b != "0" {
-			writes = append(writes, write{c.boostPath(), "0"})
+			writes = append(writes, write{c.boostPath(), "0", true})
 		}
 	}
 
@@ -697,6 +749,23 @@ func (c *Controller) Restore(ctx context.Context, reason string) error {
 	}
 	defer c.release()
 
+	return c.restoreSaying(reason)
+}
+
+// RestoreLeftover is Restore for a controller nothing else holds yet, which a
+// node builds the moment it holds its lock: before its provider or anything
+// else that can refuse its start, so a refusal never leaves an earlier
+// process's cap in place.
+func (c *Controller) RestoreLeftover() error {
+	c.sem <- struct{}{}
+	defer c.release()
+
+	return c.restoreSaying("start")
+}
+
+// restoreSaying is restoreLocked with the line a successful one logs.
+// Requires sem.
+func (c *Controller) restoreSaying(reason string) error {
 	wrote, err := c.restoreLocked(reason)
 	if wrote && err == nil {
 		c.log.Info("restored the CPU's full ceiling", "reason", reason)
@@ -803,14 +872,18 @@ func (c *Controller) Run(ctx context.Context, idle func() bool) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.step(idle)
+			c.step(ctx, idle)
 		}
 	}
 }
 
 // step is one look at the node.
-func (c *Controller) step(idle func() bool) {
-	c.sem <- struct{}{}
+func (c *Controller) step(ctx context.Context, idle func() bool) {
+	// CANCELLABLE, so a loop waiting behind a restore stuck in the kernel still
+	// returns when the node stops.
+	if c.acquire(ctx) != nil {
+		return
+	}
 	defer c.release()
 
 	switch state(c.st.Load()) {

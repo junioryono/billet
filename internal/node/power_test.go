@@ -2,6 +2,10 @@ package node
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +17,49 @@ import (
 	"github.com/junioryono/billet/internal/power"
 	"github.com/junioryono/billet/internal/provider"
 )
+
+// THE LAUNCH'S HOLD COMES BEFORE ITS RESTORE, and its restore before the
+// provider: the hold is what makes the node busy to the policy, so a restore
+// asked before it could be undone by a cap that never saw the launch. The
+// behavioural test below proves the restore lands; this proves the order the
+// race argument rests on.
+func TestALaunchHoldsBeforeItRestoresAndRestoresBeforeTheProvider(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "runner.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	at := map[string]token.Pos{}
+	for _, d := range file.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "Launch" || fn.Recv == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				name := types.ExprString(call.Fun)
+				if _, seen := at[name]; !seen {
+					at[name] = call.Pos()
+				}
+			}
+
+			return true
+		})
+	}
+
+	order := []string{"r.holdWhileLaunching", "r.power.RestoreBeforeLaunch", "r.provider.Launch"}
+	for i, name := range order {
+		if _, ok := at[name]; !ok {
+			t.Fatalf("Launch no longer calls %s", name)
+		}
+		if i > 0 && at[order[i-1]] >= at[name] {
+			t.Errorf("Launch calls %s before %s", name, order[i-1])
+		}
+	}
+}
 
 // probingProvider reads the host's CPU ceiling at the moment it is asked to
 // start the compute, which is the moment the restore has to have landed by.
@@ -85,6 +132,7 @@ func TestALaunchRestoresTheCPUCeilingBeforeTheProviderStarts(t *testing.T) {
 		defer close(done)
 		ctrl.Run(loop, func() bool { return !r.Holding() })
 	}()
+	t.Cleanup(func() { stop(); <-done })
 	for deadline := time.Now().Add(10 * time.Second); get("boost") != "0"; {
 		if time.Now().After(deadline) {
 			t.Fatal("the idle policy never capped an idle node")

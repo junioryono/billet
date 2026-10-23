@@ -114,6 +114,38 @@ func TestANodeStartRestoresALeftoverCapWhateverItsConfigSays(t *testing.T) {
 	}
 }
 
+// A LEFTOVER THAT CANNOT BE RESTORED AT THE START KEEPS A POLICY to retry it,
+// though this node has no node.power; and the lock-time restore puts back a
+// readable one before anything else.
+func TestALeftoverThatWillNotRestoreKeepsARetryingPolicy(t *testing.T) {
+	t.Parallel()
+
+	root, get := powerHost(t)
+	stateDir := t.TempDir()
+	capHost(t, root, stateDir)
+
+	restoreLeftoverPower(powerConfig(stateDir, nil), root, "darwin")
+	if get("boost") != "0" {
+		t.Fatal("a darwin node touched cpufreq")
+	}
+	restoreLeftoverPower(powerConfig(stateDir, nil), root, "linux")
+	if get("boost") != "1" || get("policy0/scaling_max_freq") != "2450000" {
+		t.Fatalf("the lock-time restore left the host capped: boost %s", get("boost"))
+	}
+
+	record := filepath.Join(stateDir, power.RecordName)
+	if err := os.WriteFile(record, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctrl, err := openNodePower(t.Context(), powerConfig(stateDir, nil), root, "linux", nil)
+	if err != nil || ctrl == nil {
+		t.Fatalf("a leftover that would not restore answered %v, %v; want a policy to retry it", ctrl, err)
+	}
+	if _, err := os.Stat(record); err != nil {
+		t.Errorf("the unreadable record was removed: %v", err)
+	}
+}
+
 // A node.power THE HOST CANNOT HONOUR IS REFUSED AT THE START, after the
 // leftover is restored, and on anything but Linux.
 func TestANodeStartRefusesAPowerBlockTheHostCannotHonour(t *testing.T) {
@@ -158,13 +190,25 @@ func TestANodeStopRestoresTheCeiling(t *testing.T) {
 
 	ctx, signal := context.WithCancel(t.Context())
 	stop := runNodePower(ctx, ctrl, func() bool { return true })
+	t.Cleanup(stop)
 	for deadline := time.Now().Add(10 * time.Second); get("boost") != "0"; time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("the policy never capped an idle node")
 		}
 	}
 
+	// THE SIGNAL ALONE RESTORES, through the loop, while a drain would still be
+	// holding the node, and nothing caps after it.
 	signal()
+	for deadline := time.Now().Add(10 * time.Second); get("boost") != "1"; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the node's stop signal did not restore the ceiling before the node returned")
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	if get("boost") != "1" {
+		t.Fatal("the policy capped again after the node's stop began")
+	}
 	stop()
 
 	if get("boost") != "1" || get("policy0/scaling_max_freq") != "2450000" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/metrics"
@@ -80,6 +81,12 @@ func openNodePower(ctx context.Context, cfg *config.Config, root, goos string, o
 	}
 
 	if err := ctrl.CheckHost(); err != nil {
+		// A REFUSAL STILL OWES A LEFTOVER ITS RESTORE, for as long as a stop
+		// would give it.
+		if restoreErr != nil {
+			closeNodePower(ctx, ctrl)
+		}
+
 		return nil, fmt.Errorf("node.power: %w", err)
 	}
 
@@ -107,11 +114,46 @@ func runNodePower(ctx context.Context, ctrl *power.Controller, idle func() bool)
 
 	return func() {
 		stopping()
+		ctrl.BeginStop()
 		cancel()
-		<-done
 
-		if err := ctrl.Close(ctx); err != nil {
-			slog.Default().Error("this node stopped with the CPU's ceiling still lowered", "error", err)
+		// BOUNDED: a loop held inside a sysfs write the kernel never finishes
+		// does not keep the node from stopping. It caps nothing more either way.
+		timer := time.NewTimer(power.DefaultStopBound)
+		select {
+		case <-done:
+		case <-timer.C:
+			slog.Default().Error("the idle power policy's loop did not stop within its bound; restoring anyway",
+				"bound", power.DefaultStopBound)
 		}
+		timer.Stop()
+
+		closeNodePower(ctx, ctrl)
+	}
+}
+
+// restoreLeftoverPower restores a cap an earlier node process left, on Linux,
+// the moment the node holds its lock. A failure is logged, and Node.Run's
+// policy retries it.
+func restoreLeftoverPower(cfg *config.Config, root, goos string) {
+	if goos != "linux" {
+		return
+	}
+
+	ctrl, err := power.New(power.Options{SysfsRoot: root, StateDir: cfg.Node.StateDir, Log: slog.Default()})
+	if err == nil {
+		err = ctrl.RestoreLeftover()
+	}
+	if err != nil {
+		slog.Default().Error("could not restore the CPU ceiling an earlier node process left; this node "+
+			"retries once it runs", "error", err)
+	}
+}
+
+// closeNodePower restores the full ceiling as the node stops, and says so when
+// it could not.
+func closeNodePower(ctx context.Context, ctrl *power.Controller) {
+	if err := ctrl.Close(ctx); err != nil {
+		slog.Default().Error("this node stopped with the CPU's ceiling still lowered", "error", err)
 	}
 }

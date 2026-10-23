@@ -116,6 +116,13 @@ func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
 
 	n.ending = ending
 
+	// A CAP AN EARLIER PROCESS LEFT, before anything below can refuse this
+	// start, and never from a probe, which runs beside the node that may hold
+	// one in force.
+	if !opts.Probe {
+		restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS)
+	}
+
 	if err := n.open(bundle); err != nil {
 		n.endOnClose()
 
@@ -325,6 +332,10 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	powerCtl, err := openNodePower(ctx, cfg, sysfsRoot, runtime.GOOS, n.powered)
 	if err != nil {
 		return err
+	}
+	// RESTORED ON A RETURN BEFORE THE POLICY'S LOOP STARTS, too.
+	if powerCtl != nil {
+		defer closeNodePower(ctx, powerCtl)
 	}
 
 	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, n.deployment, n.client,

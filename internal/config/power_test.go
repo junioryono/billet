@@ -44,6 +44,12 @@ func TestAPowerBlockIsReadWithItsDefaults(t *testing.T) {
 		t.Errorf("idle_after = %s, %v; want 5m", d, err)
 	}
 
+	// A CEILING ALONE CHANGES SOMETHING, and is admitted without boost.
+	cfg, err = Load(writeConfig(t, withPower(t, "  power:\n    idle_max_freq_khz: 1500000\n")))
+	if err != nil || cfg.Node.Power.DisableBoost || cfg.Node.Power.IdleMaxFreqKHz != 1500000 {
+		t.Fatalf("a ceiling-only block: %+v, %v", cfg.Node.Power, err)
+	}
+
 	// ABSENT IS OFF.
 	cfg, err = Load(writeConfig(t, validConfig))
 	if err != nil || cfg.Node.Power != nil {

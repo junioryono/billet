@@ -85,6 +85,17 @@ func (h *fakeHost) write(rel, value string) {
 	}
 }
 
+func (h *fakeHost) remove(rel string) {
+	h.t.Helper()
+
+	if err := os.RemoveAll(h.path(rel)); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := os.Stat(h.path(rel)); !errors.Is(err, fs.ErrNotExist) {
+		h.t.Fatalf("%s is still there: %v", rel, err)
+	}
+}
+
 func (h *fakeHost) read(rel string) string {
 	h.t.Helper()
 
@@ -205,11 +216,11 @@ func newController(t *testing.T, h *fakeHost, s Settings, o Observer) (*Controll
 func capNow(t *testing.T, c *Controller) {
 	t.Helper()
 
-	c.step(func() bool { return true }) // unknown -> full: no record
+	c.step(t.Context(), func() bool { return true }) // unknown -> full: no record
 	c.mu.Lock()
 	c.busyAt = time.Now().Add(-2 * c.settings.IdleAfter)
 	c.mu.Unlock()
-	c.step(func() bool { return true })
+	c.step(t.Context(), func() bool { return true })
 	if state(c.st.Load()) != stateCapped {
 		t.Fatalf("the controller did not cap an idle node; state %d", c.st.Load())
 	}
@@ -368,11 +379,11 @@ func TestACapThatFailsPartWayIsRestoredAtOnce(t *testing.T) {
 		return write(path, value)
 	}
 
-	c.step(func() bool { return true })
+	c.step(t.Context(), func() bool { return true })
 	c.mu.Lock()
 	c.busyAt = time.Now().Add(-time.Hour)
 	c.mu.Unlock()
-	c.step(func() bool { return true })
+	c.step(t.Context(), func() bool { return true })
 
 	h.requireFull(stateDir)
 	if state(c.st.Load()) != stateFull {
@@ -419,14 +430,14 @@ func TestAFailedRestoreIsRetriedUntilItHolds(t *testing.T) {
 	}
 
 	// THE LOOP RETRIES IT, busy or idle, and caps nothing in the meantime.
-	c.step(func() bool { return true })
+	c.step(t.Context(), func() bool { return true })
 	if h.boost() != "0" {
 		t.Fatal("a retry under the same failure reported success")
 	}
 	mu.Lock()
 	broken = false
 	mu.Unlock()
-	c.step(func() bool { return true })
+	c.step(t.Context(), func() bool { return true })
 	h.requireFull(stateDir)
 }
 
@@ -460,13 +471,21 @@ func TestAnUnreadableRecordIsNotAbsence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := c.Restore(t.Context(), "start"); err == nil {
-		t.Fatal("a record holding something that is not a frequency was restored from")
+	err := c.Restore(t.Context(), "start")
+	if err == nil || !strings.Contains(err.Error(), "is not a cpufreq policy's ceiling and switch") {
+		t.Fatalf("a record holding something that is not a frequency answered %v, want its refusal", err)
 	}
+
+	// AND A CAP FROM FULL REFUSES TO RECORD OVER IT: the state is put at full
+	// by hand, as a process that never read the record would have it.
+	c.st.Store(int32(stateFull))
 	c.mu.Lock()
 	c.busyAt = time.Now().Add(-time.Hour)
 	c.mu.Unlock()
-	c.step(func() bool { return true })
+	c.step(t.Context(), func() bool { return true })
+	if state(c.st.Load()) != stateUnknown {
+		t.Errorf("state %d after a cap met a record it could not read, want unknown", c.st.Load())
+	}
 
 	if got := h.maxFreq(0); got != lowKHz {
 		t.Errorf("scaling_max_freq = %s, want it untouched", got)
@@ -493,7 +512,7 @@ func TestCloseRestoresAndNothingCapsAfter(t *testing.T) {
 	c.mu.Lock()
 	c.busyAt = time.Now().Add(-time.Hour)
 	c.mu.Unlock()
-	c.step(func() bool { return true })
+	c.step(t.Context(), func() bool { return true })
 	h.requireFull(stateDir)
 }
 
@@ -503,7 +522,7 @@ func TestALaunchDuringACapWaitsItsBoundAndTheRestoreLandsAfter(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newFakeHost(t, 2)
 		c, stateDir := newController(t, h, capBoth, nil)
-		c.step(func() bool { return true })
+		c.step(t.Context(), func() bool { return true })
 		c.mu.Lock()
 		c.busyAt = time.Now().Add(-time.Hour)
 		c.mu.Unlock()
@@ -526,7 +545,7 @@ func TestALaunchDuringACapWaitsItsBoundAndTheRestoreLandsAfter(t *testing.T) {
 		capping := make(chan struct{})
 		go func() {
 			defer close(capping)
-			c.step(func() bool { busy.Lock(); defer busy.Unlock(); return idle })
+			c.step(t.Context(), func() bool { busy.Lock(); defer busy.Unlock(); return idle })
 		}()
 		<-entered
 
@@ -536,8 +555,8 @@ func TestALaunchDuringACapWaitsItsBoundAndTheRestoreLandsAfter(t *testing.T) {
 		busy.Unlock()
 		started := time.Now()
 		c.RestoreBeforeLaunch(t.Context(), "lease-1")
-		if waited := time.Since(started); waited != c.launchBound {
-			t.Errorf("the launch waited %s for a restore stuck behind a cap, want its %s bound", waited, c.launchBound)
+		if waited := time.Since(started); waited != 2*time.Second {
+			t.Errorf("the launch waited %s for a restore stuck behind a cap, want its 2s bound", waited)
 		}
 
 		close(gate)
@@ -558,10 +577,12 @@ func TestARestoreRewritesACeilingTheBoostSwitchMoved(t *testing.T) {
 		if err := write(path, value); err != nil {
 			return err
 		}
-		if path == h.path("devices/system/cpu/cpufreq/boost") && value == "0" {
+		// A STAND-IN DRIVER THAT MOVES EVERY CEILING WITH THE SWITCH, both ways,
+		// so a restore that writes the ceilings before the switch loses them.
+		if path == h.path("devices/system/cpu/cpufreq/boost") {
 			for i := range h.n {
 				h.write(h.policyFile(i, "scaling_max_freq"), midKHz)
-				h.write(h.policyFile(i, "boost"), "0")
+				h.write(h.policyFile(i, "boost"), value)
 			}
 		}
 
@@ -608,14 +629,24 @@ func TestCheckHostRefusesWhatTheHostCannotHonour(t *testing.T) {
 		{"a ceiling below the floor", Settings{IdleAfter: time.Minute, MaxFreqKHz: 1500000},
 			func(h *fakeHost) { h.write(h.policyFile(1, "scaling_min_freq"), midKHz) }, "below policy1's scaling_min_freq"},
 		{"a driver with no table", Settings{IdleAfter: time.Minute, MaxFreqKHz: 1500000},
-			func(h *fakeHost) { _ = os.Remove(h.path(h.policyFile(0, "scaling_available_frequencies"))) },
+			func(h *fakeHost) { h.remove(h.policyFile(0, "scaling_available_frequencies")) },
 			"could not be read"},
 		{"no boost switch", Settings{IdleAfter: time.Minute, DisableBoost: true},
-			func(h *fakeHost) { _ = os.Remove(h.path("devices/system/cpu/cpufreq/boost")) }, "has no"},
+			func(h *fakeHost) { h.remove("devices/system/cpu/cpufreq/boost") }, "billet writes no other boost switch"},
+		{"a boost switch that is not one", Settings{IdleAfter: time.Minute, DisableBoost: true},
+			func(h *fakeHost) { h.write("devices/system/cpu/cpufreq/boost", "on") }, "which is not 0 or 1"},
+		{"boost alone on the reference host", Settings{IdleAfter: time.Minute, DisableBoost: true}, nil, ""},
+		{"a ceiling alone on a host with no boost switch", Settings{IdleAfter: time.Minute, MaxFreqKHz: 1500000},
+			func(h *fakeHost) { h.remove("devices/system/cpu/cpufreq/boost") }, ""},
 		{"no cpufreq at all", capBoth,
-			func(h *fakeHost) { _ = os.RemoveAll(h.path("devices/system/cpu/cpufreq")) }, "cpufreq policies"},
+			func(h *fakeHost) { h.remove("devices/system/cpu/cpufreq") }, "cpufreq policies"},
+		{"an empty cpufreq directory", capBoth,
+			func(h *fakeHost) {
+				h.remove("devices/system/cpu/cpufreq")
+				h.write("devices/system/cpu/cpufreq/boost", "1")
+			}, "holds no cpufreq policy"},
 		{"a restore-only controller checks nothing", Settings{},
-			func(h *fakeHost) { _ = os.RemoveAll(h.path("devices/system/cpu/cpufreq")) }, ""},
+			func(h *fakeHost) { h.remove("devices/system/cpu/cpufreq") }, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newFakeHost(t, 2)
