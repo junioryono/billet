@@ -770,11 +770,9 @@ func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
 		if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
 			t.Fatalf("%s: Close: %v", name, err)
 		}
-		calls := observer.recorded()
-		if len(calls) == 0 {
-			t.Fatalf("%s: nothing was reported", name)
-		}
-		if got := calls[len(calls)-1].obs.Npm; got != tc.want {
+		// A SPLICE STILL ENDING WHEN THE SESSION CLOSED reports the verdict itself,
+		// a moment later.
+		if got := lastNpm(t, observer); got != tc.want {
 			t.Errorf("%s: the npm cache reported %q, want %q", name, got, tc.want)
 		}
 	}
@@ -865,6 +863,10 @@ func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T
 					held, call.obs.Npm)
 			}
 		}
+		// WHAT THE REQUEST GOT IS REPORTED ONCE IT ENDS, by the request itself.
+		if got := lastNpm(t, observer); got != alloc.BuildCacheCold {
+			t.Errorf("%s: after the request ended the npm cache was reported %q, want cold", held, got)
+		}
 	}
 }
 
@@ -908,9 +910,9 @@ func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t
 	service.mu.Unlock()
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		session.mu.Lock()
-		classifying := session.npmClassifying
+		inflight := session.npmInflight
 		session.mu.Unlock()
-		if classifying > 0 {
+		if inflight > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -946,6 +948,10 @@ func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t
 			t.Errorf("a session that ended while a HEAD was classified reported the npm cache %q, want nothing",
 				call.obs.Npm)
 		}
+	}
+	// WHAT THE HEAD GOT IS REPORTED ONCE IT ENDS, by the request itself.
+	if got := lastNpm(t, observer); got != alloc.BuildCacheWarm {
+		t.Errorf("after the HEAD ended the npm cache was reported %q, want warm", got)
 	}
 }
 

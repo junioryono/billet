@@ -148,10 +148,13 @@ type cacheSession struct {
 	// npmAsked says a request the npm store may answer arrived, under mu. What
 	// it got is noted when it is answered, a tarball fill's only once its body
 	// is in, and a request cut short notes nothing: either way the cache was
-	// asked, so it is never "unused". npmClassifying counts requests not yet
-	// known to be one or the other.
-	npmAsked       bool
-	npmClassifying int
+	// asked, so it is never "unused". npmInflight counts requests from the
+	// guest reaching the cache to their handling's return.
+	npmAsked    bool
+	npmInflight int
+	// settled says settlement has run, under mu: an npm verdict it held back
+	// for a request in flight is reported when the last one ends.
+	settled bool
 	// building is what each build cache did so far, under mu; reported when the
 	// session ends.
 	building map[config.CacheKind]alloc.BuildCache
@@ -403,7 +406,12 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 		}
 	}
 
+	// NOTHING NEW IS STILL A RESEND of what the plane has not acknowledged:
+	// settlement recomputes every build cache's verdict, so an observation
+	// whose report failed reaches here unchanged on every later attempt.
 	if !changed {
+		s.report(ctx, session)
+
 		return
 	}
 
@@ -487,6 +495,7 @@ func (s *CacheService) report(ctx context.Context, session *cacheSession) {
 // how the session was scoped rather than from a request: a guest with no proxy
 // can never make one.
 func (s *CacheService) settleObservation(ctx context.Context, session *cacheSession) {
+	session.settled = true
 	var obs alloc.CacheObservation
 
 	if session.observed.ImageCache == "" && !session.recovered {
@@ -538,6 +547,32 @@ func noteBuildCache(session *cacheSession, kind config.CacheKind, outcome alloc.
 	}
 }
 
+// npmVerdict is what the npm cache did for a session that saw the whole job
+// and has no request in flight: what was noted, else unused for a tier that
+// enables it and was never asked, else could-not-tell. Called with session.mu
+// held.
+func npmVerdict(session *cacheSession) alloc.BuildCache {
+	if noted := session.building[config.CacheNpm]; noted != "" {
+		return noted
+	}
+	if !session.npmAsked && sessionSetting(session, config.CacheNpm).Enabled {
+		return alloc.BuildCacheUnused
+	}
+
+	return ""
+}
+
+// noteRefused records what a cache the kill switch kept from the session's job
+// did: disabled when the switch refused it, unavailable when it could not be
+// read. Called with session.mu held.
+func noteRefused(session *cacheSession, kind config.CacheKind, answer policyAnswer) {
+	outcome := alloc.BuildCacheUnavailable
+	if answer == policyRefused {
+		outcome = alloc.BuildCacheDisabled
+	}
+	noteBuildCache(session, kind, outcome)
+}
+
 // settledBuildCaches is what each build cache did over the session, reported
 // once, when it ends. Called with session.mu held.
 //
@@ -563,14 +598,22 @@ func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
 
 			return ""
 		}
+		// A REQUEST STILL IN FLIGHT MAY OUTRANK WHAT IS NOTED, and the first
+		// observation is the one kept, so an npm verdict short of warm waits for
+		// the last of them, which reports it (npmCache.end).
+		if kind == config.CacheNpm {
+			if session.npmInflight > 0 && noted != alloc.BuildCacheWarm {
+				return ""
+			}
+
+			return npmVerdict(session)
+		}
 		if noted != "" {
 			return noted
 		}
 		// A REFRESH STILL IN FLIGHT IS NOT "UNUSED": its outcome is noted when it
-		// returns, after this report. Nor is a cache asked for what it never
-		// noted, or one a request is still being classified for.
-		if kind == config.CacheGit && session.gitPending > 0 ||
-			kind == config.CacheNpm && (session.npmAsked || session.npmClassifying > 0) {
+		// returns, after this report.
+		if kind == config.CacheGit && session.gitPending > 0 {
 			return ""
 		}
 		if sessionSetting(session, kind).Enabled {
@@ -1576,9 +1619,16 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 		return
 	}
-	if !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
-		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheDisabled)
+	switch answer := s.sessionKindPolicy(ctx, session, config.CacheSticky); answer {
+	case policyAllowed:
+	case policyRefused:
+		noteRefused(session, config.CacheSticky, answer)
 		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
+
+		return
+	default:
+		noteRefused(session, config.CacheSticky, answer)
+		http.Error(w, "the cache kill switch could not be read", http.StatusServiceUnavailable)
 
 		return
 	}

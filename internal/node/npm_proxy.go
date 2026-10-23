@@ -130,8 +130,19 @@ func (n *npmCache) held(key string) bool { return n.store != nil && n.store.held
 // and is classified afresh; anything else is spliced to the registry, whole,
 // with the guest's own bytes.
 func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session *cacheSession) {
+	// IN FLIGHT UNTIL WHAT IT GOT IS KNOWN: to the end of an answer, or to the
+	// start of a splice, which notes nothing and can last as long as the guest
+	// keeps the connection open.
+	n.begin(session)
+	ended := sync.OnceFunc(func() { n.end(ctx, session) })
+	defer ended()
+
 	client, tlsConn, ok := openTunnel(ctx, w, n.leaf)
 	if !ok {
+		// A GUEST THAT REACHED THE CACHE AND COULD NOT TALK TO IT, its handshake
+		// refused or cut short, was not served: unavailable, never unused.
+		n.note(session, alloc.BuildCacheUnavailable)
+
 		return
 	}
 	defer client.Close()
@@ -146,6 +157,12 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	}
 	req, err := http.ReadRequest(reader)
 	if err != nil {
+		// WHAT THE GUEST WANTED IS NOT KNOWN, so neither is what it got: asked,
+		// so never unused, and nothing noted.
+		session.mu.Lock()
+		session.npmAsked = true
+		session.mu.Unlock()
+
 		return
 	}
 	if !npmRequestTargetsRegistry(req) {
@@ -154,17 +171,12 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 		return
 	}
 
-	// ASKED BEFORE ANYTHING THAT CAN WAIT: classifying a HEAD waits on the store,
-	// and the policy lookup on the plane, so the request is counted while it is
-	// classified and the session marked asked as it leaves, under one lock. From
-	// there the cache is not "unused" for the job, whether or not what it got is
-	// noted before the session settles.
-	session.mu.Lock()
-	session.npmClassifying++
-	session.mu.Unlock()
+	// THE SESSION IS MARKED ASKED as classification leaves it, under the lock,
+	// for a request the store may answer. From there the cache is not "unused"
+	// for the job, whether or not what it got is noted before the session
+	// settles; the request itself is counted in flight until it returns.
 	request, cacheable := classifyNpmRequest(req, n.held)
 	session.mu.Lock()
-	session.npmClassifying--
 	session.npmAsked = session.npmAsked || cacheable
 	session.mu.Unlock()
 	switch {
@@ -174,11 +186,16 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	case n.store == nil:
 		cacheable = false
 		n.note(session, alloc.BuildCacheUnavailable)
-	case !n.service.sessionKindAllowed(ctx, session, config.CacheNpm):
-		cacheable = false
-		n.note(session, alloc.BuildCacheDisabled)
+	default:
+		if answer := n.service.sessionKindPolicy(ctx, session, config.CacheNpm); answer != policyAllowed {
+			cacheable = false
+			session.mu.Lock()
+			noteRefused(session, config.CacheNpm, answer)
+			session.mu.Unlock()
+		}
 	}
 	if !cacheable {
+		ended()
 		spliceTo(ctx, n.service.log, tlsConn, capture, n.dialUpstream, "the npm registry")
 
 		return
@@ -224,6 +241,38 @@ func (n *npmCache) note(session *cacheSession, outcome alloc.BuildCache) {
 	session.mu.Lock()
 	noteBuildCache(session, config.CacheNpm, outcome)
 	session.mu.Unlock()
+}
+
+// begin counts one request in flight for the session, from the moment the
+// guest reached the cache until its handling returns.
+func (n *npmCache) begin(session *cacheSession) {
+	session.mu.Lock()
+	session.npmInflight++
+	session.mu.Unlock()
+}
+
+// end counts the request out, and when it is the last of a session that has
+// already settled, reports what the cache did, which settlement left to it.
+//
+// A SESSION SETTLED WHILE REQUESTS WERE IN FLIGHT holds back an npm verdict
+// short of warm, since one of them may still outrank it, and the first
+// observation is the one kept; the last of them to end is what knows.
+func (n *npmCache) end(ctx context.Context, session *cacheSession) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	session.npmInflight--
+	if session.npmInflight > 0 || !session.settled || session.observed.NpmCache != "" {
+		return
+	}
+	// A RECOVERED SESSION SAW ONLY PART OF THE JOB, as settlement says.
+	outcome := npmVerdict(session)
+	if session.recovered && outcome != alloc.BuildCacheWarm {
+		return
+	}
+	if outcome != "" {
+		n.service.observe(ctx, session, alloc.CacheObservation{BuildCaches: alloc.BuildCaches{Npm: outcome}})
+	}
 }
 
 // npmExchange is one request being answered: who asked, for what, and when.
