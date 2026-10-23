@@ -97,6 +97,7 @@ func TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes(t *testing.T) 
 	for _, tc := range []struct {
 		name                    string
 		npmProxy, actionsActive string
+		noContainerDNS          bool
 		runFails, startFails    bool
 		noRegistry              bool
 		wantRemap, wantLaunched bool
@@ -105,6 +106,10 @@ func TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes(t *testing.T) 
 	}{
 		{name: "the passthrough serves and the registry is remapped",
 			npmProxy: "http://billet:sesh@10.9.8.7:9000", wantRemap: true, wantLaunched: true, wantEnv: everyBundle},
+		// A CONTAINER WOULD RESOLVE THE REMAP TO ITS OWN LOOPBACK through the
+		// guest's resolver, so without the container resolver nothing is started.
+		{name: "the container resolver was not configured", npmProxy: "http://billet:sesh@10.9.8.7:9000",
+			noContainerDNS: true},
 		// THE ACTIONS CACHE'S OWN ENVIRONMENT AND HOOK ALREADY CARRY THE
 		// AUTHORITY, so this block adds nothing beside it.
 		{name: "with the Actions cache too", npmProxy: "http://billet:sesh@10.9.8.7:9000", actionsActive: "1",
@@ -132,6 +137,10 @@ func TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes(t *testing.T) 
 			if tc.noRegistry {
 				noRegistry = "1"
 			}
+			containerDNS := "1"
+			if tc.noContainerDNS {
+				containerDNS = ""
+			}
 			script := strings.Join([]string{
 				"set -euo pipefail",
 				`PATH="` + resolvers + ":" + fakes + `:$PATH"`,
@@ -143,6 +152,7 @@ func TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes(t *testing.T) 
 				"python_runtime=/usr/bin/python3",
 				"npm_proxy=" + shellQuote(tc.npmProxy),
 				"actions_cache_active=" + shellQuote(tc.actionsActive),
+				"container_dns_active=" + shellQuote(containerDNS),
 				"actions_ca_path=" + ca,
 				"guest_hosts_file=" + shellQuote(hosts),
 				"runner_env=()",
@@ -198,6 +208,10 @@ func TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes(t *testing.T) 
 				{"--fallback-addr", "104.16.6.34,104.16.7.34"},
 				{"--upstream", "http://billet:sesh@10.9.8.7:9000"},
 				{"--uid=runner"},
+				// A --network host container shares the guest's /etc/hosts and so
+				// reaches this listener without the node's trust; it is relayed to
+				// the registry rather than tunnelled to a certificate it refuses.
+				{"--guest-processes-only"},
 			} {
 				if !containsArgv(launched, required) {
 					t.Errorf("the npm unit does not carry %q:\n%s", required, strings.Join(launched, " | "))
@@ -205,6 +219,90 @@ func TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes(t *testing.T) 
 			}
 			if tc.wantRemap && !containsArgv(serviced, []string{"start", "billet-npm-proxy.service"}) {
 				t.Error("the registry was remapped without the service being started")
+			}
+		})
+	}
+}
+
+// THE CONTAINER RESOLVER IS CONFIGURED FOR EITHER REMAPPED ORIGIN. The agent's
+// own block is executed against a scratch daemon.json and a fake upstream lister:
+// with the Actions cache, the npm cache or both, dockerd is pointed at the guest
+// resolver and the agent says so; with neither, daemon.json is left as it was.
+// Without it on an npm tier, a container on a user-defined network resolved the
+// registry's remap to its own loopback through systemd-resolved (2026-10-23).
+func TestTheContainerResolverIsConfiguredForEitherRemappedOrigin(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq is not installed here; the guest image carries it")
+	}
+	block := agentBlock(t, "BILLET_CONTAINER_DNS_CONFIG")
+	for _, tc := range []struct {
+		name              string
+		actionsProxy, npm string
+		wantContainerDNS  bool
+	}{
+		{name: "the Actions cache", actionsProxy: "http://node:1", wantContainerDNS: true},
+		{name: "the npm cache", npm: "http://node:1", wantContainerDNS: true},
+		{name: "both", actionsProxy: "http://node:1", npm: "http://node:1", wantContainerDNS: true},
+		{name: "neither"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			daemon := filepath.Join(dir, "daemon.json")
+			const before = `{"bip":"172.17.0.1/16","storage-driver":"overlay2"}` + "\n"
+			if err := os.WriteFile(daemon, []byte(before), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			lister := filepath.Join(dir, "dns-upstreams")
+			asked := filepath.Join(dir, "asked")
+			if err := forkSafeWriteFile(lister, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >"+shellQuote(asked)+
+				"\nprintf '[\"172.17.0.1\",\"172.31.1.1\"]'\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			script := strings.Join([]string{
+				"set -euo pipefail",
+				`log() { printf 'billet-agent: %s\n' "$*" >&2; }`,
+				"docker_gateway=172.17.0.1",
+				"container_dns_active=",
+				"actions_proxy=" + shellQuote(tc.actionsProxy),
+				"npm_proxy=" + shellQuote(tc.npm),
+				"docker_daemon_json=" + shellQuote(daemon),
+				"docker_daemon_staged=" + shellQuote(filepath.Join(dir, "staged.json")),
+				"dns_upstreams=" + shellQuote(lister),
+				block,
+				`printf 'active=%s\n' "$container_dns_active"`,
+			}, "\n")
+			output, err := exec.CommandContext(t.Context(), "bash", "-c", script).CombinedOutput()
+			if err != nil {
+				t.Fatalf("the container DNS block failed: %v\n%s", err, output)
+			}
+			active := strings.Contains(string(output), "active=1\n")
+			if active != tc.wantContainerDNS {
+				t.Errorf("container DNS active=%v, want %v:\n%s", active, tc.wantContainerDNS, output)
+			}
+			after, err := os.ReadFile(daemon)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantContainerDNS {
+				if string(after) != before {
+					t.Errorf("daemon.json changed with neither cache: %s", after)
+				}
+				if _, err := os.Stat(asked); err == nil {
+					t.Error("the upstreams were listed with neither cache on")
+				}
+
+				return
+			}
+			const want = `{"bip":"172.17.0.1/16","storage-driver":"overlay2","dns":["172.17.0.1","172.31.1.1"]}` + "\n"
+			if string(after) != want {
+				t.Errorf("daemon.json is %s, want %s", after, want)
+			}
+			if got, err := os.ReadFile(asked); err != nil || !strings.HasPrefix(string(got), "172.17.0.1 ") {
+				t.Errorf("the upstream lister was asked %q (%v), want the gateway first", got, err)
 			}
 		})
 	}

@@ -1739,32 +1739,45 @@ ACTIONS_HOOK
 	# would reject is kept out of daemon.json. Its filtering is behavior-tested; the
 	# guard here just refuses to touch daemon.json unless it produced a usable list.
 	#
-	# ONLY FOR THE RESULTS ORIGIN. The npm registry is never remapped for a
-	# container (ADR-020: a container does not trust the node's authority), so a
-	# tier with only the npm cache leaves container DNS as it was.
+	# FOR THE NPM CACHE TOO, which remaps nothing for a container (ADR-020: a
+	# container does not trust the node's authority) and needs the resolver for the
+	# opposite reason. Without "dns" here, a container on a user-defined network
+	# asks Docker's embedded resolver, which asks the guest's systemd-resolved,
+	# which reads /etc/hosts: it was answered 127.0.2.1, its own loopback, and npm
+	# in it failed ECONNREFUSED (measured in a guest, Docker 28.0.4, 2026-10-23).
+	# The guest resolver below never reads /etc/hosts, so the container reaches the
+	# registry directly; it also stops answering a job's own /etc/hosts entries to
+	# such a container, as it already does where the Actions cache is on.
+	docker_daemon_json=/etc/docker/daemon.json
+	docker_daemon_staged=/run/billet-docker-daemon.json
+	dns_upstreams=/usr/local/bin/billet-dns-upstreams
+	# BILLET_CONTAINER_DNS_CONFIG_BEGIN — the block between these markers is
+	# extracted and EXECUTED against a scratch daemon.json and a fake upstream
+	# lister by TestTheContainerResolverIsConfiguredForEitherRemappedOrigin.
 	upstream_resolv=/run/systemd/resolve/resolv.conf
 	if [ ! -s "$upstream_resolv" ]; then
 		upstream_resolv=/etc/resolv.conf
 	fi
-	if [ -n "$actions_proxy" ] &&
-		dns_json=$(/usr/local/bin/billet-dns-upstreams "$docker_gateway" "$upstream_resolv" 2>/dev/null) &&
+	if { [ -n "$actions_proxy" ] || [ -n "$npm_proxy" ]; } &&
+		dns_json=$("$dns_upstreams" "$docker_gateway" "$upstream_resolv" 2>/dev/null) &&
 		[ -n "$dns_json" ]; then
 		# Merge ONLY onto the existing config read successfully -- replacing an
 		# unreadable daemon.json with {} would discard the baked-in storage-driver,
 		# containerd-snapshotter and bip. On a read failure, leave it untouched and do
 		# not activate the container remap. (cat in the `if` keeps set -e from exiting.)
-		if daemon_base=$(cat /etc/docker/daemon.json 2>/dev/null) && [ -n "$daemon_base" ] &&
+		if daemon_base=$(cat "$docker_daemon_json" 2>/dev/null) && [ -n "$daemon_base" ] &&
 			rendered=$(jq -c --argjson dns "$dns_json" \
 				'if type == "object" then . + {"dns": $dns} else error("not an object") end' \
 				<<<"$daemon_base" 2>/dev/null) &&
-			printf '%s\n' "$rendered" >/run/billet-docker-daemon.json &&
-			install -m 0644 /run/billet-docker-daemon.json /etc/docker/daemon.json; then
+			printf '%s\n' "$rendered" >"$docker_daemon_staged" &&
+			install -m 0644 "$docker_daemon_staged" "$docker_daemon_json"; then
 			container_dns_active=1
 		fi
 	fi
 	if [ -z "$container_dns_active" ] && [ -n "$actions_proxy" ]; then
 		log "container cache DNS was not configured; containers will use GitHub's cache directly"
 	fi
+	# BILLET_CONTAINER_DNS_CONFIG_END
 fi
 
 # Docker is deliberately not enabled at boot. Starting it only after the cache
@@ -1928,13 +1941,24 @@ fi
 # own, resolved before the remap, so a node that cannot take the tunnel leaves
 # npm reaching the registry, exactly as without the cache.
 #
+# A CONTAINER ON THE GUEST'S OWN NETWORK STILL MEETS IT: Docker copies the guest's
+# /etc/hosts into a --network host container, which then reaches this listener
+# and refused the node's certificate (measured in a guest, 2026-10-23). So the
+# passthrough tunnels only the guest's own processes (--guest-processes-only) and
+# relays every other connection to the registry's own addresses.
 guest_hosts_file=/etc/hosts
 # BILLET_NPM_START_BEGIN — the block between these markers is extracted and
 # EXECUTED against fake service-manager commands by
 # TestTheAgentRemapsTheNpmRegistryOnlyWhenItsPassthroughServes.
 npm_cache_active=""
 npm_loopback=127.0.2.1
-if [ -n "$npm_proxy" ] && [ -n "$actions_ca_path" ]; then
+# ONLY WITH THE CONTAINER RESOLVER IN PLACE: without it a container on a
+# user-defined network resolves the registry through the guest's /etc/hosts to
+# its own loopback and fails, where without the cache it reached the registry.
+if [ -n "$npm_proxy" ] && [ -n "$actions_ca_path" ] && [ -z "$container_dns_active" ]; then
+	log "container DNS was not configured; npm will reach the registry directly"
+fi
+if [ -n "$npm_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$container_dns_active" ]; then
 	if ! npm_fallback=$(getent ahostsv4 registry.npmjs.org 2>/dev/null |
 		awk '$1 !~ /^127\./ {print $1}' | sort -u | paste -sd, -); then
 		npm_fallback=""
@@ -1947,7 +1971,7 @@ if [ -n "$npm_proxy" ] && [ -n "$actions_ca_path" ]; then
 			--socket-property=Accept=no --socket-property=FlushPending=no \
 			"$python_runtime" /usr/local/bin/billet-actions-proxy \
 			--systemd-socket --upstream "$npm_proxy" --origin registry.npmjs.org \
-			--fallback-addr "$npm_fallback" &&
+			--fallback-addr "$npm_fallback" --guest-processes-only &&
 		systemctl start billet-npm-proxy.service 2>/dev/null; then
 		npm_cache_active=1
 	else
