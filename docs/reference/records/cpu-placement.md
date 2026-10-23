@@ -119,7 +119,7 @@ Session 3 used 8 guests of 4 vCPUs, so each placement gives its guests a differe
 
 - **Sharing a CCD's L3 between two guests made no measurable difference on the compile** (`packed` 1.9% longer than `spread`, p 0.32), and cost 4.6% on the memory copy (p 0.001).
 - **`compact`, which adds shared cores and a more crowded L3, ran 14% and 29% longer than `packed`** on the compile and the memory copy (p ≤ 0.001), and 16% and 35% longer than `spread`. Sharing cores and crowding four guests into one L3 happen together in `compact`, so this does not say how much each one costs.
-- **Leaving whole CCDs idle showed no energy saving:** `packed` left four CCDs with nothing on them, and its package and wall energy were within 1.1% of `spread`'s, with no difference detected (p ≥ 0.24 on both workloads). That is consistent with the idle result above: on this host an idle core costs little whether or not its CCD has work.
+- **Leaving whole CCDs idle showed no energy saving:** `packed` left four CCDs with nothing on them, and its package and wall energy were within 1.1% of `spread`'s, with no difference detected (p ≥ 0.24 on both workloads). Why was not measured; that an idle core costs little here whether or not its CCD has work would fit the idle result above, but it was not tested.
 
 ### At 75% of the threads, compact and unpinned showed no difference
 
@@ -146,7 +146,7 @@ Session 3 then ran 12 guests of 8 vCPUs, 96 of 128 threads, on the compile. `spr
 
 - **Under `spread`, boost off made the compile 50% slower at 4 guests and 64% slower at 8, and it used 21% and 19% more package energy and 29% and 28% more at the wall** (p ≤ 0.013). The longer run cost more than the lower clock saved.
 - **Under `compact`, boost off saved 15% of package energy** (p 0.044, two runs each), and its run time was within 1.5% of boost on, with no difference detected (two runs cannot rule out one of a quarter either way). A guest whose cores share SMT siblings may gain little from boost to begin with.
-- **So turning boost off is not a saving on this host for a job that has whole cores to itself,** which is what `spread` gives it. `node.power` turns boost off only while a node is idle, where the section above found no saving, and restores it before a launch.
+- **So for this compile at 4 and 8 guests under `spread`, where each guest has whole cores, turning boost off was not a saving.** `node.power` turns boost off only while a node is idle, where the section above found no saving, and restores it before a launch.
 
 ### Energy attribution
 
