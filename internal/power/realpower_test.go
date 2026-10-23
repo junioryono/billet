@@ -64,6 +64,23 @@ func TestRealCapAndRestoreOnThisHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the host's cpufreq baseline: %v", err)
 	}
+	// THE BASELINE IS PROVED FULL BEFORE ANYTHING CAN WRITE IT BACK, as the
+	// controller proves it before it caps: a ceiling firmware is holding low for
+	// a moment would otherwise be written back as a lasting cap.
+	probe, err := New(Options{SysfsRoot: sysfs, StateDir: t.TempDir(), Settings: settings})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for path, value := range baseline.ceilings {
+		full, err := probe.fullCeiling(filepath.Base(filepath.Dir(path)))
+		if err != nil {
+			t.Fatalf("read %s's full ceiling: %v", filepath.Dir(path), err)
+		}
+		if value != strconv.Itoa(full) {
+			t.Fatalf("%s reads %s, not its full %d: refusing to run on a host held below its ceiling", path, value,
+				full)
+		}
+	}
 	// REGISTERED FIRST, SO IT RUNS LAST, after every run's own shutdown: the host
 	// leaves with the ceiling it came with, written in the kernel's order and read
 	// back.
