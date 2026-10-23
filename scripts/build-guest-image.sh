@@ -348,22 +348,48 @@ HELPER
 	echo "guest billet: built with go $newest"
 }
 
-# install_cache_sudoers keeps the node's endpoint and bearer across sudo in the
-# image at $1, and ends the build unless sudo's whole policy parses and reads
-# the drop-in: one it parses but never includes keeps nothing.
+# install_cache_sudoers keeps the node's endpoint and bearer, and the trust of
+# its authority, across sudo in the image at $1, and ends the build unless sudo's
+# whole policy parses and reads the drop-in: one it parses but never includes
+# keeps nothing.
 #
 # GIT UNDER sudo GOES THROUGH THE NODE TOO. sudo resets the environment, so
 # root's git, which the image's gitconfig also sends to the node, had no session
 # for the credential helper to give and failed a fetch GitHub would have
-# answered. The drop-in names the two variables, never their values, which stay
-# in the runner's environment (measured on ubuntu:24.04, sudo 1.9.15p5,
-# 2026-10-22: without it neither crossed; with it both crossed sudo, sudo -i,
-# sudo -u root and sudo sh -c, though not su -, which starts a login of its own).
+# answered. The drop-in names the variables, never their values, which stay in
+# the runner's environment (measured on ubuntu:24.04, sudo 1.9.15p5, 2026-10-22:
+# without it neither crossed; with it both crossed sudo, sudo -i, sudo -u root
+# and sudo sh -c, though not su -, which starts a login of its own).
+#
+# AND SO DOES npm, WHOSE REGISTRY IS REMAPPED FOR EVERY PROCESS IN THE GUEST
+# (ADR-020). The Node a guest carries did not take the node's authority from the
+# system store it also joins, so a root npm met the node's certificate without
+# the bundle and refused it; the four variables that name the bundle cross with
+# the bearer (measured in a guest on ubuntu-01, 2026-10-23, Node 22, against a
+# stand-in authority on the npm remap's own address: sudo node and sudo -i node
+# were refused UNABLE_TO_VERIFY_LEAF_SIGNATURE without them, and sudo node,
+# sudo -i node, sudo sh -c and sudo curl all completed with them). The Actions
+# cache's remap of the results host is the same case, and a root Node refused the
+# node's own certificate there too until this drop-in (measured the same day).
+#
+# ONLY AT BILLET'S OWN BUNDLE, the agent's and the copy the job-started hook
+# publishes, so a job that points one of them at a CA of its own leaves root's
+# tools on their own roots as before. The match is on the path, not the file: a
+# step that deletes the hook's copy from RUNNER_TEMP breaks root's tools as it
+# already breaks its own, which name the same path. sudo keeps
+# a NAME=value entry only for that exact value (measured on ubuntu:24.04, sudo
+# 1.9.15p5, 2026-10-23: both bundle paths crossed sudo and sudo -i, and a job's
+# own path and a longer one did not).
 install_cache_sudoers() {
-	local rootfs=$1 parsed
-	install -m 0440 /dev/stdin "$rootfs/etc/sudoers.d/billet-cache" <<'SUDOERS'
-Defaults env_keep += "BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN"
-SUDOERS
+	local rootfs=$1 parsed name keep=""
+	local agent_bundle=/home/runner/runner/_work/_billet/actions-cache-ca.pem
+	local hook_bundle=/home/runner/runner/_work/_temp/billet-actions-cache-ca.pem
+	for name in NODE_EXTRA_CA_CERTS SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE; do
+		keep+=" $name=$agent_bundle $name=$hook_bundle"
+	done
+	printf 'Defaults env_keep += "%s"\nDefaults env_keep += "%s"\n' \
+		"BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN" "${keep# }" |
+		install -m 0440 /dev/stdin "$rootfs/etc/sudoers.d/billet-cache"
 	if ! parsed=$(chroot "$rootfs" visudo -c 2>&1); then
 		printf '%s\n' "$parsed" >&2
 		echo "the image's sudoers policy does not parse with the build caches' drop-in" >&2
