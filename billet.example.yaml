@@ -501,11 +501,13 @@ node:
   # one of each policy's scaling_available_frequencies, or the node refuses to
   # start rather than let the kernel round it. A cap is taken only while every
   # ceiling is at its full, so a firmware limit is never written back as
-  # yours. Every launch restores what was
-  # there before the VMM starts, waiting at most 2s for it. What a cap changed
-  # is recorded under state_dir (power-baseline.json) before the first write,
-  # and a node that finds that record at its start restores it, whatever this
-  # block says now. The node runs as root and its unit leaves
+  # yours. Every launch asks for what was there back before the VMM starts and
+  # waits at most 2s for it; a restore that fails or overruns does not stop
+  # the launch, which may then start capped while the node retries every 5s.
+  # What a cap changed is recorded under state_dir (power-baseline.json)
+  # before the first write, a stop tries for at most 30s to restore it, and a
+  # node that finds that record at its start restores it, whatever this block
+  # says now. The node runs as root and its unit leaves
   # ProtectKernelTunables off, which is what keeps /sys writable.
   #
   # power:
