@@ -76,6 +76,8 @@ type CacheService struct {
 	byToken    map[string]*cacheSession
 	byInstance map[string]string
 	actions    *actionsProxy
+	// npm is the npm registry cache, made with the first session that enables it.
+	npm        *npmCache
 	actionIO   actionsVolumeManager
 	actionRule ActionsPolicy
 	policy     CachePolicy
@@ -175,6 +177,10 @@ type cacheSession struct {
 type CacheCredentials struct {
 	Token        string
 	ActionsProxy string
+	// NpmProxy is the same tunnel as ActionsProxy, named when the tier has the npm
+	// cache, so the guest remaps the registry only when its node serves it.
+	NpmProxy string
+	// ActionsCAPEM is the interception authority, given when either is named.
 	ActionsCAPEM string
 }
 
@@ -324,8 +330,11 @@ func NewCacheService(
 			if _, err := service.ensureActionsProxy(); err != nil {
 				return nil, err
 			}
-
-			break
+		}
+		if session.npmEnabled() {
+			if err := service.ensureNpmCache(); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -699,14 +708,23 @@ func (s *CacheService) PrepareScoped(
 			pathID:   sessionPathID(token),
 		}
 		credentials := CacheCredentials{Token: token}
-		if scope.Intercept {
+		if npm := session.npmEnabled(); scope.Intercept || npm {
 			proxy, err := s.ensureActionsProxy()
 			if err != nil {
 				return CacheCredentials{}, err
 			}
-			credentials.ActionsProxy, err = proxyURL(s.endpoint, token)
+			tunnel, err := proxyURL(s.endpoint, token)
 			if err != nil {
 				return CacheCredentials{}, err
+			}
+			if scope.Intercept {
+				credentials.ActionsProxy = tunnel
+			}
+			if npm {
+				if err := s.ensureNpmCache(); err != nil {
+					return CacheCredentials{}, err
+				}
+				credentials.NpmProxy = tunnel
 			}
 			credentials.ActionsCAPEM = string(proxy.ca.CertPEM())
 		}

@@ -918,18 +918,13 @@ func checkSpec(spec provider.Spec) error {
 		return fmt.Errorf("firecracker: %s has a BuildKit cache-mount ceiling but no cache endpoint",
 			spec.Name)
 	}
-	actionsFields := 0
-	for _, value := range []string{spec.ActionsProxy, spec.ActionsCAPEM} {
-		if value != "" {
-			actionsFields++
-		}
-	}
-	if actionsFields != 0 && actionsFields != 2 {
-		return fmt.Errorf("firecracker: %s needs an Actions proxy and interception CA together",
+	proxied := spec.ActionsProxy != "" || spec.NpmProxy != ""
+	if proxied != (spec.ActionsCAPEM != "") {
+		return fmt.Errorf("firecracker: %s needs an interception proxy and interception CA together",
 			spec.Name)
 	}
-	if spec.ActionsProxy != "" && spec.CacheEndpoint == "" {
-		return fmt.Errorf("firecracker: %s has an Actions proxy but no cache session", spec.Name)
+	if proxied && spec.CacheEndpoint == "" {
+		return fmt.Errorf("firecracker: %s has an interception proxy but no cache session", spec.Name)
 	}
 	if len(spec.GuestCaches) > 0 && spec.CacheEndpoint == "" {
 		return fmt.Errorf("firecracker: %s has guest build caches but no cache session", spec.Name)
@@ -944,7 +939,7 @@ func checkSpec(spec provider.Spec) error {
 				"repeated", spec.Name, cache)
 		}
 	}
-	for _, value := range []string{spec.ActionsProxy, spec.ActionsCAPEM} {
+	for _, value := range []string{spec.ActionsProxy, spec.NpmProxy, spec.ActionsCAPEM} {
 		if strings.ContainsRune(value, 0) {
 			return fmt.Errorf("firecracker: %s has Actions interception metadata containing a NUL",
 				spec.Name)
@@ -1137,6 +1132,14 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 	}
 	if spec.ActionsProxy != "" {
 		billet["actions-proxy"] = spec.ActionsProxy
+	}
+	// AN OPTIONAL KEY, so not a contract change: an agent that predates it reads
+	// no such key and leaves npm going to the registry, which is what a node
+	// that does not name it means.
+	if spec.NpmProxy != "" {
+		billet["npm-proxy"] = spec.NpmProxy
+	}
+	if spec.ActionsCAPEM != "" {
 		billet["actions-ca-pem"] = spec.ActionsCAPEM
 	}
 	if !spec.RegistryMirrors.Empty() {

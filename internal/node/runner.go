@@ -473,7 +473,7 @@ func (r *Runner) Launch(
 	}
 
 	cacheEndpoint, cacheToken := "", ""
-	actionsProxy, actionsCAPEM := "", ""
+	actionsProxy, npmProxy, actionsCAPEM := "", "", ""
 	var buildKitCacheMountLimit config.ByteSize
 	var guestCaches []provider.GuestCache
 	if r.cache != nil {
@@ -494,7 +494,7 @@ func (r *Runner) Launch(
 		} else {
 			cacheEndpoint = r.cache.Endpoint()
 			cacheToken = credentials.Token
-			actionsProxy = credentials.ActionsProxy
+			actionsProxy, npmProxy = credentials.ActionsProxy, credentials.NpmProxy
 			actionsCAPEM = credentials.ActionsCAPEM
 			buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
 			guestCaches = guestCachesFor(tier.Cache)
@@ -565,6 +565,7 @@ func (r *Runner) Launch(
 		// ONLY WITH A SESSION TO REPORT TO, whose bearer is the agent's.
 		GuestMonitor:            cacheToken != "" && r.cache.GuestMonitoring(),
 		ActionsProxy:            actionsProxy,
+		NpmProxy:                npmProxy,
 		ActionsCAPEM:            actionsCAPEM,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
 		RegistryMirrors:         r.registryMirrors,

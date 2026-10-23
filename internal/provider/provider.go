@@ -156,9 +156,12 @@ type Spec struct {
 	// guest is never told ignores it, and the node's record then says the guest
 	// never reported.
 	GuestMonitor bool
-	// ActionsProxy and ActionsCAPEM opt this guest into the authenticated results
-	// proxy. Both must be present or absent together.
+	// ActionsProxy and NpmProxy opt this guest into the node's interception of
+	// the Actions results origin and of the npm registry (ADR-020), each through
+	// the same authenticated tunnel, and ActionsCAPEM is the authority the guest
+	// trusts for them. The authority is present exactly when a proxy is.
 	ActionsProxy string
+	NpmProxy     string
 	ActionsCAPEM string
 	// BuildKitCacheMountLimit is the tier's byte ceiling for each persistent
 	// BuildKit cache-mount record. It is meaningful only with CacheEndpoint.

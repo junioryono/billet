@@ -39,13 +39,13 @@ func TestCacheStatusRendersWhatTheCachesDid(t *testing.T) {
 func TestTheKillSwitchKindIsACacheOrAll(t *testing.T) {
 	t.Parallel()
 
-	for flag, want := range map[string]string{"all": state.AllCaches, "docker": "docker", "go": "go"} {
+	for flag, want := range map[string]string{"all": state.AllCaches, "docker": "docker", "go": "go", "npm": "npm"} {
 		got, _, err := cachePolicyKind(flag)
 		if err != nil || got != want {
 			t.Errorf("--kind %s = %q, %v, want %q", flag, got, err, want)
 		}
 	}
-	for _, flag := range []string{"", "*", "Docker", "npm"} {
+	for _, flag := range []string{"", "*", "Docker", "pip"} {
 		if _, _, err := cachePolicyKind(flag); err == nil {
 			t.Errorf("--kind %q was accepted", flag)
 		}

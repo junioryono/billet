@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 30
+	Version = 31
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -410,6 +410,16 @@ const (
 	// has the report kept without its series rather than recorded as something
 	// its wire does not carry.
 	VersionSeriesGaps = 30
+
+	// VersionNpmCache is the version from which a tier's cache configuration
+	// may say the node serves the npm registry to its guests (config.CacheSpec's
+	// npm, ADR-020).
+	//
+	// NEITHER REFUSED NOR REPORTED: an older node decodes the plane's commands
+	// leniently and ignores the field, which leaves the tier's npm traffic going
+	// to the registry, doing less and never something else. Nothing travels the
+	// other way, so there is nothing to gate where it is read.
+	VersionNpmCache = 31
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
