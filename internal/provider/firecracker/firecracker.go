@@ -195,6 +195,10 @@ type Provider struct {
 	// construction, and only a present controller is ever asked of the jailer.
 	wantAccounting bool
 	accounting     Accounting
+	// cpuSysfs is where the host's cpus are described, and topology what a
+	// cpu placement read from it at construction (node.firecracker.cpu_placement).
+	cpuSysfs string
+	topology topology
 	// processStart reads a pid's start time; a seam for the tests, whose VMM
 	// pid is a process that has exited.
 	processStart func(pid int) (uint64, error)
@@ -367,6 +371,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt
 	p.procMountsPath = defaultProcMountsPath
+	p.cpuSysfs = cpuSysfs
 
 	for _, opt := range opts {
 		opt(p)
@@ -399,6 +404,15 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	// not prove is left off rather than attempted.
 	if p.wantAccounting {
 		p.accounting = p.hostAccounting()
+	}
+
+	// AND THE PLACEMENT'S TOPOLOGY, PROVED ONCE: a cpuset key the kernel cannot
+	// honour fails every launch, so a node asking for a placement this host
+	// cannot carry out does not start.
+	if p.cfg.CPUPlacement != "" {
+		if err := p.requireCPUPlacement(); err != nil {
+			return nil, fmt.Errorf("firecracker: %w", err)
+		}
 	}
 
 	return p, nil
@@ -610,6 +624,10 @@ func (p *Provider) start(
 	res, err := p.claimResources(j)
 	if err != nil {
 		return nil, errors.Join(err, j.remove())
+	}
+
+	if res, err = p.claimCPUs(j, res, spec.VCPU); err != nil {
+		return nil, errors.Join(err, p.unwindBeforeClone(j, res))
 	}
 
 	// KEPT SO A VANISHED GENERATION CAN BE RE-RESOLVED. A tier naming `@verified` is
@@ -1289,6 +1307,12 @@ func (p *Provider) jailerArgs(j jail, res resources) []string {
 		"--cgroup", "cpu.weight=100",
 	}
 	args = append(args, p.accounting.jailerAccountingArgs()...)
+	// A PLACEMENT IS A cpuset KEY BESIDE THE OTHERS, so the jailer enables the
+	// cpuset controller along the path as it does memory and io, and every launch
+	// keeps the one cgroup form a host may have.
+	if res.CPUs != "" {
+		args = append(args, "--cgroup", "cpuset.cpus="+res.CPUs)
+	}
 
 	return append(args,
 		// A PID NAMESPACE OF ITS OWN, and the reason is a pid FILE rather than the

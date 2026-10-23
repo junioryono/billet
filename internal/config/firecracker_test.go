@@ -316,3 +316,35 @@ func TestNormalizingAnAbsentFirecrackerBlockIsSafe(t *testing.T) {
 
 	f.Normalize()
 }
+
+// A CPU PLACEMENT IS ONE OF TWO NAMED SHAPES, or none, and anything else is
+// refused here rather than reaching the provider as a placement it ignores.
+func TestACPUPlacementIsCompactSpreadOrNothing(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		placement string
+		refused   bool
+	}{
+		{"", false},
+		{CPUPlacementCompact, false},
+		{CPUPlacementSpread, false},
+		{"packed", true},
+		{"Compact", true},
+	} {
+		f := validFirecracker()
+		f.CPUPlacement = tc.placement
+
+		got := firecrackerErrors(f)
+		if refused := strings.Contains(got, "cpu_placement"); refused != tc.refused {
+			t.Errorf("cpu_placement %q: refused %v, want %v (%s)", tc.placement, refused, tc.refused, got)
+		}
+	}
+
+	f := validFirecracker()
+	f.CPUPlacement = "  spread "
+	f.Normalize()
+	if f.CPUPlacement != CPUPlacementSpread {
+		t.Errorf("a padded placement normalized to %q, want %q", f.CPUPlacement, CPUPlacementSpread)
+	}
+}
