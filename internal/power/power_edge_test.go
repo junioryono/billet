@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,15 +106,22 @@ func TestACeilingThatAppliesLateIsWaitedFor(t *testing.T) {
 	})
 }
 
-// A HOST WHOSE BOOST WAS ALREADY OFF RESTORES WITHOUT WRITING A POLICY'S OWN
-// SWITCH, which the kernel refuses while the global one is off.
+// A RECORD WHOSE BASELINE HAD BOOST OFF RESTORES WITHOUT WRITING A POLICY'S OWN
+// SWITCH, which the kernel refuses while the global one is off. No cap is taken
+// from boost off any more, but a record an earlier release wrote can hold one.
 func TestABaselineWithBoostOffRestores(t *testing.T) {
 	h := newFakeHost(t, 2)
 	h.write(filepath.Join(cpufreqRel, "boost"), "0")
+	rec := record{Version: recordVersion, Boost: "0", Policies: map[string]policyRecord{}}
 	for i := range h.n {
 		h.write(h.policyFile(i, "boost"), "0")
+		h.write(h.policyFile(i, "scaling_max_freq"), lowKHz)
+		rec.Policies[policyName(i)] = policyRecord{MaxFreq: fullKHz, Boost: "0"}
 	}
 	c, stateDir := newController(t, h, capBoth, nil)
+	if err := c.installRecord(rec); err != nil {
+		t.Fatal(err)
+	}
 
 	c.write = func(path, value string) error {
 		if filepath.Base(path) == "boost" && filepath.Base(filepath.Dir(path)) != "cpufreq" && h.boost() == "0" {
@@ -123,10 +131,6 @@ func TestABaselineWithBoostOffRestores(t *testing.T) {
 		return writeSysfs(path, value)
 	}
 
-	capNow(t, c)
-	if got := h.maxFreq(0); got != lowKHz {
-		t.Fatalf("not capped: %s", got)
-	}
 	if err := c.Restore(t.Context(), "stop"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -325,9 +329,23 @@ func TestCloseIsBoundedByAStuckRestore(t *testing.T) {
 			t.Errorf("Close returned after %s, want its %s bound", took, DefaultStopBound)
 		}
 
+		// THE HOST STAYS CLAIMED WHILE THE WRITE IS STUCK: a controller that
+		// claimed it now would have its cap undone when the write returned.
+		next, err := New(Options{SysfsRoot: h.root, StateDir: t.TempDir(), Log: slog.New(slog.DiscardHandler)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := next.ClaimHost(); !errors.Is(err, ErrHostHeld) {
+			t.Fatalf("a claim while the closed controller's write was stuck: %v, want ErrHostHeld", err)
+		}
+
 		release()
 		synctest.Wait()
 		h.requireFull(stateDir)
+		if err := next.ClaimHost(); err != nil {
+			t.Fatalf("the claim once the stuck write returned: %v", err)
+		}
+		next.ReleaseHost()
 	})
 }
 
