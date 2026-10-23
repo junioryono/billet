@@ -131,7 +131,9 @@ func lastLevelCache(dir string) (string, error) {
 // COMPACT takes whole cores, both SMT siblings, in the lowest cache group with
 // room for the guest, so busy guests share as few groups as possible and the
 // rest of the host can sit idle; a guest larger than any group's free room takes
-// whole cores from the groups in order. SPREAD takes one thread per core, from
+// whole cores from the groups in order. A guest with an odd number of vCPUs
+// takes half its last core, and the other half stays idle: a core is free to the
+// next guest only when all of it is. SPREAD takes one thread per core, from
 // the group with the most free cores, so a guest's vCPUs share neither a core
 // nor, until the host fills, a cache with another guest's.
 func place(topo topology, placement string, vcpus int, taken map[int]bool) []int {

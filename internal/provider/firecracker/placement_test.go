@@ -295,6 +295,51 @@ func TestAPlacementNeedsACPUSetControllerAndAReadableTopology(t *testing.T) {
 	}
 }
 
+// THE TOPOLOGY THE CONSTRUCTOR READS IS THE ONE A LAUNCH PLACES ON: a provider
+// built from a host's cpus and a placement pins its first guest there, with no
+// test reaching in to hand it a topology.
+func TestTheConstructorsTopologyIsWhatALaunchIsPlacedOn(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpuset cpu io memory\n"),
+		0o600); err != nil {
+		t.Fatalf("write cgroup.controllers: %v", err)
+	}
+	sysfs := writeCPUSysfs(t)
+	h, err := tryHarness(t, withMounts(t, root), func(p *Provider) {
+		p.cpuSysfs = sysfs
+		p.cfg.CPUPlacement = config.CPUPlacementSpread
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	h.launch(t)
+
+	if keys := cgroupKeys(jailerArgv(t, h)); !slices.Contains(keys, "cpuset.cpus=0-1") {
+		t.Fatalf("jailer --cgroup keys = %q, want cpuset.cpus=0-1 from the host's own topology", keys)
+	}
+}
+
+// AN ODD GUEST UNDER COMPACT TAKES HALF ITS LAST CORE, and the other half is
+// never given to another guest, since a core is free only when all of it is.
+func TestAnOddCompactGuestsLastCoreIsNotShared(t *testing.T) {
+	t.Parallel()
+
+	first := place(twoGroups, config.CPUPlacementCompact, 3, map[int]bool{})
+	if !slices.Equal(first, []int{0, 4, 1}) {
+		t.Fatalf("a 3-vCPU compact guest = %v, want [0 4 1]", first)
+	}
+	taken := map[int]bool{}
+	for _, cpu := range first {
+		taken[cpu] = true
+	}
+	second := place(twoGroups, config.CPUPlacementCompact, 2, taken)
+	if slices.Contains(second, 5) {
+		t.Fatalf("the next guest %v was given cpu 5, the sibling of a core the first guest holds", second)
+	}
+}
+
 // THE KERNEL'S CPU LIST FORM, both ways.
 func TestCPUListsRoundTrip(t *testing.T) {
 	t.Parallel()

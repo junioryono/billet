@@ -110,6 +110,12 @@ func TestRealPlacementExperiment(t *testing.T) {
 	guests := make([]*guest, vms)
 	disk := env.disk.growthCapacity(t, env.image)
 	started := time.Now()
+	// THE WAIT ENDS WELL BEFORE THE TEST DOES, so the cleanups that destroy the
+	// guests run before the test binary's own timeout kills it and leaves them.
+	waitUntil := started.Add(30 * time.Minute)
+	if deadline, ok := t.Deadline(); ok && deadline.Add(-3*time.Minute).Before(waitUntil) {
+		waitUntil = deadline.Add(-3 * time.Minute)
+	}
 
 	var wg sync.WaitGroup
 	for i := range vms {
@@ -148,10 +154,17 @@ func TestRealPlacementExperiment(t *testing.T) {
 				g.cpus = res.CPUs
 			}
 
-			// THE GUEST POWERS ITSELF OFF when its workload ends, and the VMM exits
-			// with it: that moment is the run's end.
-			deadline := time.Now().Add(30 * time.Minute)
-			for time.Now().Before(deadline) {
+			if placement != "" && g.cpus == "" {
+				g.err = fmt.Errorf("the guest was placed on no cpus under %s", placement)
+
+				return
+			}
+
+			// THE GUEST REBOOTS ONLY WHEN ITS WORKLOAD SUCCEEDED, and the VMM exits
+			// with it: that moment is the run's end. A workload that failed halts the
+			// guest instead, which leaves the VMM running, so it is never read as a
+			// finished run.
+			for {
 				pid, err := p.vmmPID(p.jailFor(g.name))
 				if err == nil && pid == 0 {
 					g.exited = time.Now()
@@ -159,9 +172,14 @@ func TestRealPlacementExperiment(t *testing.T) {
 
 					return
 				}
+				if time.Now().After(waitUntil) {
+					g.err = fmt.Errorf("the guest did not power off by %s: its workload failed or "+
+						"never finished", waitUntil.Format(time.TimeOnly))
+
+					return
+				}
 				time.Sleep(250 * time.Millisecond)
 			}
-			g.err = fmt.Errorf("the guest did not power off within 30 minutes")
 		}()
 	}
 	wg.Wait()
@@ -210,16 +228,20 @@ func TestRealPlacementExperiment(t *testing.T) {
 		finished.Sub(started).Round(time.Second), filepath.Clean(out))
 }
 
-// experimentWorkloads are commands the runner image can run with no network,
-// each ending by powering the guest off so the VMM's exit marks the end.
+// experimentWorkloads are commands the runner image can run with no network.
+// Each reboots the guest when it succeeds, which is what ends a Firecracker
+// VMM, and halts it when it fails, which leaves the VMM running for the host to
+// time out.
+const workloadEnd = `trap 'if [ $? -eq 0 ]; then sudo -n reboot -f; else sudo -n halt -f; fi' EXIT
+set -e
+`
+
 var experimentWorkloads = map[string][]string{
-	"gostd": {"/bin/bash", "-c", `trap 'sudo -n reboot -f' EXIT
-export HOME=/tmp GOTOOLCHAIN=local GOFLAGS=-p=$(nproc) GOCACHE=$(mktemp -d)
+	"gostd": {"/bin/bash", "-c", workloadEnd + `export HOME=/tmp GOTOOLCHAIN=local GOFLAGS=-p=$(nproc) GOCACHE=$(mktemp -d)
 export PATH=$(ls -d /opt/hostedtoolcache/go/1.26*/x64/bin | tail -1):$PATH
 go build -a std
 GOCACHE=$(mktemp -d) go build -a std`},
-	"memory": {"/bin/bash", "-c", `trap 'sudo -n reboot -f' EXIT
-python3 -c '
+	"memory": {"/bin/bash", "-c", workloadEnd + `python3 -c '
 import multiprocessing as m
 def copy(_):
     a = bytearray(256 << 20)
