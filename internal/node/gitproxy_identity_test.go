@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,18 +17,6 @@ import (
 
 	"github.com/junioryono/billet/internal/provider"
 )
-
-// mirrorHas reports whether the mirror at path holds object, asked of git
-// directly rather than through the proxy.
-func mirrorHas(t *testing.T, path, object string) bool {
-	t.Helper()
-
-	cmd := exec.CommandContext(t.Context(), "git", "cat-file", "-e", object)
-	cmd.Dir = path
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+path)
-
-	return cmd.Run() == nil
-}
 
 // A REPOSITORY GIVEN A NAME ANOTHER ONE HAD IS NEVER SERVED THE FIRST ONE'S
 // OBJECTS: the mirror is stamped with the id GitHub gave the repository it was
@@ -52,7 +39,7 @@ func TestARecreatedRepositorysObjectsAreNeverServed(t *testing.T) {
 	if stamped, _, err := mirrorRepository(path); err != nil || stamped != first {
 		t.Fatalf("the mirror is stamped %d (%v), want the repository's id %d", stamped, err, first)
 	}
-	if !mirrorHas(t, path, secret) {
+	if !hasObject(t, path, secret) {
 		t.Fatal("the mirror never held the first repository's commit, so its absence below proves nothing")
 	}
 
@@ -66,7 +53,7 @@ func TestARecreatedRepositorysObjectsAreNeverServed(t *testing.T) {
 	if stamped, _, err := mirrorRepository(path); err != nil || stamped != second {
 		t.Fatalf("the mirror is stamped %d (%v) after the name changed hands, want %d", stamped, err, second)
 	}
-	if mirrorHas(t, path, secret) {
+	if hasObject(t, path, secret) {
 		t.Fatal("the mirror of the second repository still holds the first one's commit")
 	}
 	if body := negotiate(t, node, token, githubBasic, secret); bytes.Contains(body, []byte("PACK")) {
