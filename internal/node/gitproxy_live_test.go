@@ -244,15 +244,16 @@ func (l liveGit) cleanUp(t *testing.T, prefix string) {
 }
 
 // liveGitNode is the proxy pointed at github.com, as a node runs it.
-func liveGitNode(t *testing.T) (*CacheService, *httptest.Server, string) {
+func liveGitNode(t *testing.T) (*CacheService, *httptest.Server, string, *gitClock) {
 	t.Helper()
 
 	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
 	service.git.upstream, service.git.api, service.git.fullFraction = "https://github.com", "https://api.github.com", 1
+	clock := clockNode(service)
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 
-	return service, node, token
+	return service, node, token, clock
 }
 
 // liveCounts is the requests an observer was told of, by route, reason and
@@ -280,7 +281,7 @@ func TestLiveGitProxyAgainstGitHub(t *testing.T) {
 	live := liveGitTarget(t)
 	prefix := "b1t2-live-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	t.Cleanup(func() { live.cleanUp(t, prefix) })
-	service, node, session := liveGitNode(t)
+	service, node, session, clock := liveGitNode(t)
 	git := gitClient(t, node, session, live.header)
 	key := "untrusted/" + strings.ToLower(live.owner) + "/" + strings.ToLower(live.name)
 	work := t.TempDir()
@@ -499,10 +500,9 @@ func TestLiveGitProxyAgainstGitHub(t *testing.T) {
 		if !hasObject(t, path, superseded) {
 			t.Fatal("the daily repack removed the superseded merge commit")
 		}
-		later := time.Now().Add(gitPruneAfter + 24*time.Hour)
-		service.now = func() time.Time { return later }
+		clock.set(gitPruneAfter + 24*time.Hour)
 		service.maintain(t.Context(), request, repository.ID, service.git.mirror(key), gitMaintainPrune)
-		service.now = time.Now
+		clock.set(0)
 		if got := maintained.maintained(); !slices.Equal(got, []string{"full ok", "prune ok"}) {
 			t.Fatalf("the prune was counted %v", got)
 		}
@@ -580,7 +580,7 @@ func TestLiveGitProxyLoad(t *testing.T) {
 	}
 	prefix := "b1t2-load-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	t.Cleanup(func() { live.cleanUp(t, prefix) })
-	service, node, first := liveGitNode(t)
+	service, node, first, _ := liveGitNode(t)
 	sessions := []string{first}
 	for i := 1; i < checkouts; i++ {
 		credentials, err := service.PrepareScoped(provider.InstanceName(fmt.Sprintf("load-%d", i)), CacheSessionScope{
