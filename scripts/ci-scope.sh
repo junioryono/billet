@@ -97,7 +97,7 @@ is_replay_input() {
 		internal/hostauthority/* | internal/lifeops/* | \
 		internal/importcheck/* | internal/lease/* | internal/metrics/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeending/* | internal/nodeplane/* | \
-		internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
+		internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
 		internal/usage/* | internal/version/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;

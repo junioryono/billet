@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeending"
+	"github.com/junioryono/billet/internal/power"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/codebuild"
 	"github.com/junioryono/billet/internal/provider/docker"
@@ -67,6 +69,13 @@ type Node struct {
 	// gitObserved is what the Git proxy reports to, set by GitMetrics' source
 	// when the node serves metrics and nil, which reports nowhere, when not.
 	gitObserved node.GitObserver
+	// powered is what the idle power policy reports to, set by PowerMetrics'
+	// source when the node serves metrics and nil, which reports nowhere, when
+	// not.
+	powered power.Observer
+	// leftoverPower holds what OpenNode's restore of an earlier process's cap
+	// did, for PowerMetrics to count once it attaches.
+	leftoverPower *heldPowerEvents
 }
 
 // OpenNode loads the certificate this node presents, claims the deployment
@@ -93,7 +102,16 @@ func OpenNode(cfg *config.Config, opts NodeOptions) (*Node, error) {
 		return nil, err
 	}
 
-	n := &Node{cfg: cfg, deployment: deployment, lock: lock, upgrader: opts.Upgrader, probe: opts.Probe}
+	n := &Node{cfg: cfg, deployment: deployment, lock: lock, upgrader: opts.Upgrader, probe: opts.Probe,
+		leftoverPower: &heldPowerEvents{}}
+
+	// A CAP AN EARLIER PROCESS LEFT, THE MOMENT THE LOCK IS HELD: before
+	// anything below can refuse this start, and not before the lock, since
+	// another node process holding it may have a cap in force. Never from a
+	// probe, which runs beside such a process.
+	if !opts.Probe {
+		restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS, n.leftoverPower)
+	}
 
 	// THE ENDING RECORD BEFORE THE PROVIDER (#127): no process touches compute
 	// without an entry, because a stop is later proved by this process's ending
@@ -314,6 +332,21 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// bound out of a handover's leases.
 	drainRequested := latchedDrainRequest(host.DrainRequested)
 
+	// BEFORE ANYTHING ELSE TOUCHES THE HOST, a cap an earlier process left is
+	// restored, and a node.power this host cannot honour is refused.
+	powerCtl, err := openNodePower(ctx, cfg, sysfsRoot, runtime.GOOS, n.powered)
+	if err != nil {
+		return err
+	}
+	// RESTORED ON A RETURN BEFORE THE POLICY'S LOOP STARTS, too, and ONCE: the
+	// loop's stop closes through the same call, so a restore that keeps failing
+	// spends one stop bound, not two.
+	closePower := func() {}
+	if powerCtl != nil {
+		closePower = sync.OnceFunc(func() { closeNodePower(ctx, powerCtl) })
+		defer closePower()
+	}
+
 	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, n.deployment, n.client,
 		nodeCacheSweepWaitFor(handOver, drainRequested), nodeCacheStopGrace(handOver))
 	if err != nil {
@@ -361,8 +394,17 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return err
 	}
 	runnerOpts = append(runnerOpts, monitorOpts...)
+	if powerCtl != nil {
+		runnerOpts = append(runnerOpts, node.WithPower(powerCtl))
+	}
 
 	runner := NewNodeRunner(n.client, cfg.Node.Name, p, slog.Default(), runnerOpts...)
+
+	// RESTORED ON EVERY RETURN FROM HERE, a drain, a handoff and a failure alike.
+	if powerCtl != nil {
+		stopPower := runNodePower(ctx, powerCtl, runner.Idle, closePower)
+		defer stopPower()
+	}
 
 	fmt.Fprintf(host.Out, "billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
 

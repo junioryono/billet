@@ -492,6 +492,29 @@ node:
   #   perf: true
   #   guest: true
 
+  # LOWER THE CPU'S CEILING WHILE THIS NODE IS IDLE (firecracker and docker
+  # on Linux only; absent means off). Idle is a node that has recovered what
+  # an earlier process left and holds nothing (no instance running, launching
+  # or held in custody), for idle_after (default 60s, at least
+  # 10s). disable_boost writes 0 to /sys/devices/system/cpu/cpufreq/boost, and
+  # idle_max_freq_khz is written to every policy's scaling_max_freq; it must be
+  # one of each policy's scaling_available_frequencies, or the node refuses to
+  # start rather than let the kernel round it. A cap is taken only while every
+  # ceiling is at its full, so a firmware limit is never written back as
+  # yours. Every launch asks for what was there back before the VMM starts and
+  # waits at most 2s for it; a restore that fails or overruns does not stop
+  # the launch, which may then start capped while the node retries every 5s.
+  # What a cap changed is recorded under state_dir (power-baseline.json)
+  # before the first write, a stop tries for at most 30s to restore it, and a
+  # node that finds that record at its start tries to restore it, whatever
+  # this block says now (a failure is logged and retried while the node runs). The node runs as root and its unit leaves
+  # ProtectKernelTunables off, which is what keeps /sys writable.
+  #
+  # power:
+  #   idle_after: 60s
+  #   disable_boost: true
+  #   idle_max_freq_khz: 1500000
+
   firecracker:
     # The guest kernel must include everything Docker needs, or service
     # containers fail in ways that are hard to read. Validate with moby's

@@ -240,6 +240,9 @@ type NodeConfig struct {
 	// Monitoring measures each job from the host. Absent means off; see
 	// NodeMonitoringConfig.
 	Monitoring *NodeMonitoringConfig `yaml:"monitoring,omitempty"`
+	// Power lowers the CPU's ceiling while this node is idle. Absent means off;
+	// see NodePowerConfig.
+	Power *NodePowerConfig `yaml:"power,omitempty"`
 	// RegistryMirrors are three site-local Distribution pull-through caches. One
 	// instance per upstream is required because proxy mode has one remote URL.
 	RegistryMirrors *RegistryMirrors `yaml:"registry_mirrors,omitempty"`
@@ -753,6 +756,7 @@ func (c *Config) validateNode() []error {
 	errs = append(errs, c.validateEBSS3Node()...)
 	errs = append(errs, c.validateCacheNode()...)
 	errs = append(errs, c.validateMonitoringNode()...)
+	errs = append(errs, c.validatePowerNode()...)
 	if c.Node.Cache == nil {
 		for i := range c.Tiers {
 			if len(c.Tiers[i].explicitGuestCaches()) > 0 &&

@@ -377,6 +377,18 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/regularfile$
 
+        # THE IDLE POWER POLICY IS A LEAF. It writes a host's cpufreq ceiling as
+        # root, so what it imports is what can reach that write: the standard
+        # library and the two file primitives its record goes through.
+        power:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/power/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+
         # THE ASSEMBLY IS IMPORTED BY WHAT INVOKES IT, AND NOTHING IT ASSEMBLES.
         # internal/app builds the control plane and the node from a config, so a
         # package below it that imported it would import every role; the binary

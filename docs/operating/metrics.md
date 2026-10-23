@@ -77,6 +77,13 @@ A node with `node.cache` counts what its Git proxy does ([ADR-018](../reference/
 | `billet_node_git_maintenance_total{kind,outcome}` | passes keeping a mirror in few packs, run after a refresh: `kind` is `full` (the daily repack into one pack with a bitmap, removing nothing), `prune` (the weekly pass, when a refresh runs, that removes what a pass found unreachable at least fourteen days before, with the mirror to itself) or `geometric` (merging small packs once a mirror holds eight); `outcome` is `ok`, `busy` (fetches being served kept the mirror), `disk_full` (no room for a second copy of the mirror), `closed` or `failed`. A job whose refs moved while its mirror was maintained, past what it waits, and every request while a mirror is pruned, is counted in `billet_node_git_requests_total` under `reason="mirror_maintaining"` |
 | `billet_node_git_maintenance_seconds{kind}` | how long each pass took (a histogram) |
 
+A node with `node.power` counts what its idle power policy does to the host's CPU ceiling, told by the policy as it happens; a node that restores an earlier process's cap at its start counts that restore too. Without either it reports zeros and no latency.
+
+| Metric | What it is |
+|---|---|
+| `billet_node_power_changes_total{transition,outcome}` | changes the idle power policy (`node.power`) made to this host's CPU ceiling: `transition` is `cap` (a node idle for `idle_after`) or `restore` (before a launch, when the node became busy otherwise, at its start from an earlier process's record, or at its stop); `outcome` is `ok` or `failed`. Each is reported from the start at zero, and one that wrote nothing is not counted. A `failed` restore is retried every 5 s until one is `ok`, so a rising count with no `ok` after it is a host left capped |
+| `billet_node_power_last_launch_restore_seconds` | how long the latest restore before a launch took, from the launch asking for it to every value read back; absent until a launch has restored a cap |
+
 ## Reaching it from another host
 
 The endpoint has no authentication, and what it reports is the deployment's own business. So `listen` must be a literal loopback address, `127.0.0.1` or `[::1]`, unless `allow_remote: true` is set beside it. A name such as `localhost` is not accepted on its own, because the bind would resolve it again and a resolver could map it to another interface:
