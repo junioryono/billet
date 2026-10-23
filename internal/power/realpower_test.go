@@ -71,15 +71,8 @@ func TestRealCapAndRestoreOnThisHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	for path, value := range baseline.ceilings {
-		full, err := probe.fullCeiling(filepath.Base(filepath.Dir(path)))
-		if err != nil {
-			t.Fatalf("read %s's full ceiling: %v", filepath.Dir(path), err)
-		}
-		if value != strconv.Itoa(full) {
-			t.Fatalf("%s reads %s, not its full %d: refusing to run on a host held below its ceiling", path, value,
-				full)
-		}
+	if err := baseline.requireFull(probe); err != nil {
+		t.Fatal(err)
 	}
 	// REGISTERED FIRST, SO IT RUNS LAST, after every run's own shutdown: the host
 	// leaves with the ceiling it came with, written in the kernel's order and read
@@ -230,6 +223,54 @@ type ceiling struct {
 	boostPath, boost string
 	policyBoost      map[string]string
 	ceilings         map[string]string
+}
+
+// requireFull refuses a baseline any of whose ceilings is below the full value
+// the controller would restore it to.
+func (c ceiling) requireFull(probe *Controller) error {
+	paths := make([]string, 0, len(c.ceilings))
+	for path := range c.ceilings {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		full, err := probe.fullCeiling(filepath.Base(filepath.Dir(path)))
+		if err != nil {
+			return fmt.Errorf("read %s's full ceiling: %w", filepath.Dir(path), err)
+		}
+		if c.ceilings[path] != strconv.Itoa(full) {
+			return fmt.Errorf("%s reads %s, not its full %d: refusing to run on a host held below its ceiling",
+				path, c.ceilings[path], full)
+		}
+	}
+
+	return nil
+}
+
+func TestTheRealPowerTestRefusesABaselineBelowItsFullCeiling(t *testing.T) {
+	h := newFakeHost(t, 3)
+	probe, err := New(Options{SysfsRoot: h.root, StateDir: t.TempDir(), Settings: Settings{DisableBoost: true, IdleAfter: time.Minute}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	full, err := readBaseline(h.root)
+	if err != nil {
+		t.Fatalf("readBaseline: %v", err)
+	}
+	if err := full.requireFull(probe); err != nil {
+		t.Fatalf("a baseline at its full ceiling was refused: %v", err)
+	}
+
+	h.write(h.policyFile(1, "scaling_max_freq"), midKHz+"\n")
+	held, err := readBaseline(h.root)
+	if err != nil {
+		t.Fatalf("readBaseline: %v", err)
+	}
+	err = held.requireFull(probe)
+	if err == nil || !strings.Contains(err.Error(), "policy1") || !strings.Contains(err.Error(), "not its full 2450000") {
+		t.Fatalf("a baseline with policy1 at %s: got %v, want a refusal naming policy1's full ceiling", midKHz, err)
+	}
 }
 
 func readBaseline(sysfs string) (ceiling, error) {
