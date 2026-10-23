@@ -244,11 +244,10 @@ func (n *npmCache) note(session *cacheSession, outcome alloc.BuildCache) {
 }
 
 // begin counts one request in flight for the session, from the moment the
-// guest reached the cache until its handling returns.
+// guest reached the cache until what it got is known. One that begins after
+// settlement is end's to report.
 func (n *npmCache) begin(session *cacheSession) {
-	session.mu.Lock()
-	session.npmInflight++
-	session.mu.Unlock()
+	session.npmInflight.Add(1)
 }
 
 // end counts the request out, and when it is the last of a session that has
@@ -261,8 +260,9 @@ func (n *npmCache) end(ctx context.Context, session *cacheSession) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	session.npmInflight--
-	if session.npmInflight > 0 || !session.settled || session.observed.NpmCache != "" {
+	// DECREMENTED UNDER THE LOCK, so settlement and the last request to end
+	// never both miss the verdict.
+	if session.npmInflight.Add(-1) > 0 || !session.settled || session.observed.NpmCache != "" {
 		return
 	}
 	// A RECOVERED SESSION SAW ONLY PART OF THE JOB, as settlement says.

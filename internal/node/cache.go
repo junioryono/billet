@@ -90,6 +90,9 @@ type CacheService struct {
 	// casFill is casFillDefault, a field so a test is not decided by the fill
 	// of the disk it runs on.
 	casFill float64
+	// npmSettleWait is defaultNpmSettleWait, a field so a test can reach its
+	// bound without waiting it out.
+	npmSettleWait time.Duration
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
@@ -149,12 +152,17 @@ type cacheSession struct {
 	// it got is noted when it is answered, a tarball fill's only once its body
 	// is in, and a request cut short notes nothing: either way the cache was
 	// asked, so it is never "unused". npmInflight counts requests from the
-	// guest reaching the cache to their handling's return.
+	// guest reaching the cache until what each got is known; atomic, so a
+	// teardown can wait on it without the session's lock.
 	npmAsked    bool
-	npmInflight int
+	npmInflight atomic.Int32
 	// settled says settlement has run, under mu: an npm verdict it held back
 	// for a request in flight is reported when the last one ends.
 	settled bool
+	// npmFinal says the teardown's wait for npm requests is over, under mu:
+	// settlement holds nothing back any more, and a request still in flight
+	// leaves what was noted, or could-not-tell.
+	npmFinal bool
 	// building is what each build cache did so far, under mu; reported when the
 	// session ends.
 	building map[config.CacheKind]alloc.BuildCache
@@ -334,6 +342,7 @@ func NewCacheService(
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
+	service.npmSettleWait = defaultNpmSettleWait
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}
@@ -602,8 +611,12 @@ func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
 		// observation is the one kept, so an npm verdict short of warm waits for
 		// the last of them, which reports it (npmCache.end).
 		if kind == config.CacheNpm {
-			if session.npmInflight > 0 && noted != alloc.BuildCacheWarm {
-				return ""
+			if session.npmInflight.Load() > 0 && noted != alloc.BuildCacheWarm {
+				if !session.npmFinal {
+					return ""
+				}
+
+				return noted
 			}
 
 			return npmVerdict(session)
@@ -684,13 +697,14 @@ func (s *CacheService) SettleObservation(ctx context.Context, instance string) {
 	// the lock wait would let the runner forget the lease before the last
 	// report was attempted. The bound keeps a wedged session from holding the
 	// teardown.
+	// AN NPM REQUEST STILL IN FLIGHT ENDS FIRST, on a bound of its own and
+	// without the session's lock: its compute is gone, so its connection is, and
+	// the verdict it holds back reaches the plane while the lease can still take
+	// it. One still in flight at the bound holds nothing back.
+	awaitNpm(session, s.npmSettleWait)
+
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
 	defer cancel()
-
-	// AN NPM REQUEST STILL IN FLIGHT ENDS FIRST, for a short bound: its compute
-	// is gone, so its connection is, and the verdict it holds back reaches the
-	// plane while the lease can still take it.
-	awaitNpm(settleCtx, session, npmSettleWait)
 
 	if err := lockCacheSession(settleCtx, session); err != nil {
 		s.log.Warn("could not settle what the cache did for a job before its compute was "+
@@ -701,23 +715,19 @@ func (s *CacheService) SettleObservation(ctx context.Context, instance string) {
 	}
 	defer session.mu.Unlock()
 
+	session.npmFinal = true
 	s.settleObservation(settleCtx, session)
 }
 
-// npmSettleWait bounds how long settlement waits for npm requests in flight.
-const npmSettleWait = 5 * time.Second
+// defaultNpmSettleWait bounds how long a teardown's settlement waits for npm
+// requests in flight.
+const defaultNpmSettleWait = 5 * time.Second
 
 // awaitNpm waits until the session has no npm request in flight, for at most
-// wait. Called without session.mu.
-func awaitNpm(ctx context.Context, session *cacheSession, wait time.Duration) {
+// wait. It never takes session.mu, which a stalled storage operation can hold.
+func awaitNpm(session *cacheSession, wait time.Duration) {
 	deadline := time.Now().Add(wait)
-	for {
-		session.mu.Lock()
-		inflight := session.npmInflight
-		session.mu.Unlock()
-		if inflight == 0 || !time.Now().Before(deadline) || ctx.Err() != nil {
-			return
-		}
+	for session.npmInflight.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }

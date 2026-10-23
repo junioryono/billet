@@ -78,7 +78,7 @@ func TestAnEarlierColdRequestDoesNotSettleTheNpmCacheBeforeAWarmOneEnds(t *testi
 	session := npmSession(service, credentials)
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
 		session.mu.Lock()
-		inflight := session.npmInflight
+		inflight := session.npmInflight.Load()
 		session.mu.Unlock()
 		if inflight > 0 {
 			break
@@ -159,7 +159,7 @@ func TestAGuestThatRefusesTheNodesCertificateFindsTheNpmCacheUnavailable(t *test
 	session := npmSession(service, credentials)
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
 		session.mu.Lock()
-		inflight := session.npmInflight
+		inflight := session.npmInflight.Load()
 		session.mu.Unlock()
 		if inflight == 0 && noted(service, credentials) != "" {
 			break
@@ -196,7 +196,7 @@ func TestAFailedCacheReportIsResentByTheNextSettlement(t *testing.T) {
 	session := npmSession(service, credentials)
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
 		session.mu.Lock()
-		inflight := session.npmInflight
+		inflight := session.npmInflight.Load()
 		session.mu.Unlock()
 		if inflight == 0 {
 			break
@@ -331,7 +331,6 @@ func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
 
 	reached, release := make(chan struct{}), make(chan struct{})
 	var reachedOnce, releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
 		if n == 1 {
 			reachedOnce.Do(func() { close(reached) })
@@ -340,6 +339,9 @@ func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
 		w.Header().Set("Cache-Control", "public, max-age=300")
 		serveText(t, w, "{}")
 	})
+	// AFTER THE REGISTRY, so it runs before the registry's own cleanup, which
+	// waits for the handler this releases.
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	service, credentials := npmService(t, registry)
 	observer := &recordingObserver{}
 	service.SetCacheObserver(observer)
@@ -353,7 +355,9 @@ func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the request never reached the registry")
 	}
-	time.AfterFunc(200*time.Millisecond, func() { releaseOnce.Do(func() { close(release) }) })
+	// PAST SETTLEMENT'S OWN TWO-SECOND BUDGET and inside the wait's, which is
+	// where a shared budget lost the verdict.
+	time.AfterFunc(3*time.Second, func() { releaseOnce.Do(func() { close(release) }) })
 
 	service.SettleObservation(t.Context(), "billet-lease-npm")
 	var got alloc.BuildCache
@@ -365,4 +369,73 @@ func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
 	if got != alloc.BuildCacheCold {
 		t.Fatalf("by the time settlement returned the npm cache was reported %q, want cold", got)
 	}
+}
+
+// A REQUEST STILL IN FLIGHT AT THE WAIT'S BOUND HOLDS NOTHING BACK: the
+// teardown settles what was noted, rather than leaving a verdict for a report
+// the released lease would refuse.
+func TestARequestPastTheWaitLeavesWhatWasNoted(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 2 {
+			<-release
+		}
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, "{}")
+	})
+	// AFTER THE REGISTRY, so it runs before the registry's own cleanup, which
+	// waits for the handler this releases.
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	service, credentials := npmService(t, registry)
+	service.npmSettleWait = 200 * time.Millisecond
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+
+	npmGet(t, service, credentials, npmRequestLine("/first"))
+	assertNpmQuiet(t, service.npmCache())
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte(npmRequestLine("/second"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	session := npmSession(service, credentials)
+	for deadline := time.Now().Add(5 * time.Second); session.npmInflight.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the second request never reached the cache")
+		}
+	}
+
+	service.SettleObservation(t.Context(), "billet-lease-npm")
+	var got alloc.BuildCache
+	for _, call := range observer.recorded() {
+		if call.obs.Npm != "" {
+			got = call.obs.Npm
+		}
+	}
+	if got != alloc.BuildCacheCold {
+		t.Fatalf("with a request held past the wait, settlement reported %q, want the noted cold", got)
+	}
+}
+
+// A SESSION WHOSE LOCK A STALLED STORAGE OPERATION HOLDS DOES NOT HOLD ITS
+// TEARDOWN: settlement gives up within its bound, the npm wait included.
+func TestSettlementGivesUpOnAHeldSessionWithinItsBound(t *testing.T) {
+	t.Parallel()
+
+	service, session := switchedSession(t, config.CacheGo, true, nil)
+	session.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.SettleObservation(t.Context(), provider.InstanceName("lease-switched"))
+	}()
+	select {
+	case <-done:
+	case <-time.After(cacheReportLimit + 2*time.Second):
+		t.Error("settlement waited past its bound on a session whose lock was held")
+	}
+	session.mu.Unlock()
+	<-done
 }

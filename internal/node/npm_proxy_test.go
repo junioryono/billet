@@ -910,7 +910,7 @@ func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t
 	service.mu.Unlock()
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		session.mu.Lock()
-		inflight := session.npmInflight
+		inflight := session.npmInflight.Load()
 		session.mu.Unlock()
 		if inflight > 0 {
 			break
