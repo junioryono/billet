@@ -34,6 +34,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### The Actions cache, the kill switch and publication: [references/actions-cache-and-publication.md](references/actions-cache-and-publication.md)
 
 - **The Actions cache is a DNS remap of one origin, serving three methods.**
+- **The npm cache is a second remapped origin, off unless a tier names it, answering only anonymous reads from the node's own store (ADR-020).**
 - **A store and a listener are halves of one thing, and `billet check` is where the mirror is caught.**
 - **The kill switch is central, per cache, and consulted before every local operation.**
 - **What the cache did for a job is recorded as an observation, from a closed vocabulary, first observation kept.**
@@ -64,7 +65,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/store/ceph/*_test.go` and `internal/store/ebss3/*_test.go` (including each `writer_test.go`, the conformance shared by both backends), `internal/integration/firecracker_ceph_test.go` (real Ceph growth becomes guest capacity).
-- `internal/node/gitproxy_test.go` and `gitproxy_fallback_test.go` (real git against `git-http-backend` configured to answer as GitHub does, every fallback to GitHub, the refresh wait, the idle limit, HTTP/1.1 upstream); `internal/node/actions_*_test.go`; `internal/ops/cache/*_test.go` (`billet cache`, the conformance gate, the probe's verdict); `internal/ops/host/cephcheck_test.go`, `sitecheck_test.go`, `cachecheck_test.go`.
+- `internal/node/gitproxy_test.go` and `gitproxy_fallback_test.go` (real git against `git-http-backend` configured to answer as GitHub does, every fallback to GitHub, the refresh wait, the idle limit, HTTP/1.1 upstream); `gitproxy_live_test.go` (the same against github.com, and the load run, opt-in); `internal/node/actions_*_test.go`; `internal/ops/cache/*_test.go` (`billet cache`, the conformance gate, the probe's verdict); `internal/ops/host/cephcheck_test.go`, `sitecheck_test.go`, `cachecheck_test.go`.
 - `actions/actions_test.go`, `siblingrefs_test.go`, `scripts/cache_conformance_cached_test.go`; the live matrix in `.github/workflows/cache-conformance.yml`.
 
 ## Related skills

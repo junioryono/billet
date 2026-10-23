@@ -1,0 +1,9 @@
+RegisterResponse.version int
+RegisterResponse.min_version tag omitempty
+RegisterResponse.min_version int
+RegisterResponse.max_version tag omitempty
+RegisterResponse.max_version int
+RegisterResponse.deployment tag omitempty
+RegisterResponse.deployment string
+RegisterResponse.lease_ttl_seconds int
+RegisterResponse.poll_seconds int

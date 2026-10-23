@@ -1,0 +1,31 @@
+{
+  "CommandResult.custody": {
+    "id": "CommandResult.id",
+    "ok": false,
+    "error": "CommandResult.error",
+    "custody": true,
+    "barrier_id": "CommandResult.barrier_id",
+    "instances": [
+      "CommandResult.instances[0]"
+    ]
+  },
+  "CommandResult.draining": {
+    "id": "CommandResult.id",
+    "ok": false,
+    "error": "CommandResult.error",
+    "draining": true,
+    "barrier_id": "CommandResult.barrier_id",
+    "instances": [
+      "CommandResult.instances[0]"
+    ]
+  },
+  "CommandResult.ok": {
+    "id": "CommandResult.id",
+    "ok": true,
+    "error": "CommandResult.error",
+    "barrier_id": "CommandResult.barrier_id",
+    "instances": [
+      "CommandResult.instances[0]"
+    ]
+  }
+}

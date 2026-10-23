@@ -603,13 +603,28 @@ func packFiles(t *testing.T, path, pattern string) []string {
 	return files
 }
 
-// hasObject is whether the repository at path holds object.
+// hasObject is whether the repository at path holds object, by git's own
+// answer: a git that could not be asked fails the test rather than read as
+// missing.
 func hasObject(t *testing.T, path, object string) bool {
 	t.Helper()
 
-	cmd := exec.CommandContext(t.Context(), "git", "cat-file", "-e", object)
+	cmd := exec.CommandContext(t.Context(), "git", "cat-file", "--batch-check")
 	cmd.Dir = path
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+path)
+	cmd.Env = append(isolatedGitEnviron(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME="+path)
+	cmd.Stdin = strings.NewReader(object + "\n")
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("ask %s for %s: %v", path, object, err)
+	}
+	switch answer := strings.TrimSpace(string(output)); {
+	case answer == object+" missing":
+		return false
+	case strings.HasPrefix(answer, object+" "):
+		return true
+	default:
+		t.Fatalf("%s answered %q for %s", path, answer, object)
 
-	return cmd.Run() == nil
+		return false
+	}
 }

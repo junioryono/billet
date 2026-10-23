@@ -207,7 +207,8 @@ func runIn(t *testing.T, dir string, args ...string) string {
 
 	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+dir, "GIT_TERMINAL_PROMPT=0",
+	cmd.Env = append(isolatedGitEnviron(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME="+dir,
+		"GIT_TERMINAL_PROMPT=0",
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -220,7 +221,9 @@ func runIn(t *testing.T, dir string, args ...string) string {
 func newGitUpstream(t *testing.T) *gitUpstream {
 	t.Helper()
 
-	execPath, err := exec.CommandContext(t.Context(), "git", "--exec-path").Output()
+	probe := exec.CommandContext(t.Context(), "git", "--exec-path")
+	probe.Env = append(isolatedGitEnviron(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	execPath, err := probe.Output()
 	if err != nil {
 		t.Skip("no git on this host")
 	}
@@ -348,11 +351,33 @@ func gitClient(t *testing.T, node *httptest.Server, token, header string) func(a
 	return func(args ...string) (string, error) {
 		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = home
-		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+home, "GIT_TERMINAL_PROMPT=0")
+		cmd.Env = append(isolatedGitEnviron(), "GIT_CONFIG_NOSYSTEM=1",
+			"GIT_CONFIG_GLOBAL="+filepath.Join(home, ".gitconfig"), "HOME="+home, "GIT_TERMINAL_PROMPT=0")
 		output, err := cmd.CombinedOutput()
 
 		return string(output), err
 	}
+}
+
+// isolatedGitEnviron is this process's environment with nothing git reads
+// from it: no GIT_ variable, tracing and configuration included, no
+// XDG_CONFIG_HOME, and not the live tests' token. A caller names the
+// configuration its git reads, each a trace setting could otherwise come from
+// and print the credentials git sends.
+//
+// THE VARIABLES ARE LEFT OUT, NOT SET EMPTY: git turns curl's verbose trace on
+// when GIT_CURL_VERBOSE is set at all, empty included (measured, git 2.43,
+// 2026-10-22).
+func isolatedGitEnviron() []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(name, "GIT_") && name != "XDG_CONFIG_HOME" && name != "BILLET_LIVE_GIT_TOKEN" {
+			env = append(env, entry)
+		}
+	}
+
+	return env
 }
 
 func gitNode(t *testing.T, upstream *gitUpstream) (*CacheService, *httptest.Server, string) {

@@ -71,6 +71,7 @@ type TierCache struct {
 	Git         *CacheToggle  `yaml:"git,omitempty"`
 	Bazel       *CacheToggle  `yaml:"bazel,omitempty"`
 	Go          *GoCache      `yaml:"go,omitempty"`
+	Npm         *NpmCache     `yaml:"npm,omitempty"`
 }
 
 // CacheToggle turns one cache on or off and bounds its size.
@@ -84,6 +85,16 @@ type CacheToggle struct {
 type ActionsCache struct {
 	Enabled    *bool    `yaml:"enabled,omitempty"`
 	MaxArchive ByteSize `yaml:"max_archive,omitempty"`
+}
+
+// NpmCache configures the node's cache of the public npm registry (ADR-020).
+//
+// IT HAS NO SIZE OF ITS OWN: the store is the node's, shared by every tier on it,
+// because what it holds is what the registry gives anyone without a credential.
+type NpmCache struct {
+	// Enabled is off when omitted, unlike every other cache: a client the node's
+	// authority does not reach fails rather than missing, so a tier asks for it.
+	Enabled *bool `yaml:"enabled,omitempty"`
 }
 
 // GoCache configures the Go build cache and, opt-in, its test results.
@@ -106,10 +117,11 @@ const (
 	CacheGit     CacheKind = "git"
 	CacheBazel   CacheKind = "bazel"
 	CacheGo      CacheKind = "go"
+	CacheNpm     CacheKind = "npm"
 )
 
 // CacheKinds are every cache billet serves, in the order reports list them.
-var CacheKinds = []CacheKind{CacheDocker, CacheSticky, CacheActions, CacheGit, CacheBazel, CacheGo}
+var CacheKinds = []CacheKind{CacheDocker, CacheSticky, CacheActions, CacheGit, CacheBazel, CacheGo, CacheNpm}
 
 // Valid reports whether k names a cache.
 func (k CacheKind) Valid() bool {
@@ -145,6 +157,9 @@ type CacheSpec struct {
 	Bazel         CacheSetting `json:"bazel"`
 	Go            CacheSetting `json:"go"`
 	GoTestResults bool         `json:"go_test_results,omitempty"`
+	// Npm is the node's npm registry cache. A bool, omitted when off, so a tier
+	// without it encodes as it did before the field existed.
+	Npm bool `json:"npm,omitempty"`
 }
 
 // Setting is the effective setting of one kind.
@@ -162,6 +177,8 @@ func (s CacheSpec) Setting(kind CacheKind) CacheSetting {
 		return s.Bazel
 	case CacheGo:
 		return s.Go
+	case CacheNpm:
+		return CacheSetting{Enabled: s.Npm}
 	default:
 		return CacheSetting{}
 	}
@@ -253,6 +270,10 @@ func (t Tier) EffectiveCache() CacheSpec {
 	} else {
 		spec.Go = CacheSetting{Enabled: content, MaxSize: DefaultGoCacheSize}
 	}
+	// OFF UNLESS NAMED, and named it is on wherever the tier runs, as an explicit
+	// enable of any guest cache is: InterceptionErrors refuses it where the node
+	// cannot serve it, rather than its being quietly off.
+	spec.Npm = c.Npm != nil && c.Npm.Enabled != nil && *c.Npm.Enabled
 	if spec.Publish == CachePublishDefaultBranch && t.CacheScope != nil {
 		spec.Owner, spec.Repository = t.CacheScope.Owner, t.CacheScope.Repository
 	}
@@ -340,6 +361,9 @@ func (t Tier) explicitGuestCaches() []CacheKind {
 	if c.Go != nil && c.Go.Enabled != nil && *c.Go.Enabled {
 		kinds = append(kinds, CacheGo)
 	}
+	if c.Npm != nil && c.Npm.Enabled != nil && *c.Npm.Enabled {
+		kinds = append(kinds, CacheNpm)
+	}
 
 	return kinds
 }
@@ -388,9 +412,9 @@ func (c *Config) TargetNeedsRunEvidence(name string) bool {
 
 // needsGuestCacheServices reports whether a tier enables a cache that is
 // served by the node for a guest the node controls: the Actions cache, the Git
-// proxy, the Bazel and Go caches.
+// proxy, the Bazel and Go caches and the npm registry cache.
 func (s CacheSpec) needsGuestCacheServices() bool {
-	return s.Actions.Enabled || s.Git.Enabled || s.Bazel.Enabled || s.Go.Enabled
+	return s.Actions.Enabled || s.Git.Enabled || s.Bazel.Enabled || s.Go.Enabled || s.Npm
 }
 
 // materializeCacheScope writes a repository target's identity as the cache
