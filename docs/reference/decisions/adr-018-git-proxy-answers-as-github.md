@@ -54,13 +54,38 @@ What is left is a name that passes from one repository to another and back withi
 
 **Every git request ends with one line in the node's log:** where it was answered, why it was not answered from the mirror, its status, its bytes and how long it took. Every refresh logs its outcome and duration.
 
+**Measured against github.com itself.** On 2026-10-22, from the shared test host (16 vCPU, in AWS, git 2.43), the proxy ran against a private repository seeded with billet's own history (37.5 MiB packed). Through a real git, every case was answered from the mirror where it should be, and by GitHub where it should be:
+
+- a cold clone, then a moved branch (a fetch of 1.2 s), a rebased branch and a deleted branch;
+- a superseded pull-request merge commit fetched by id;
+- blobless and shallow checkouts, the lazy fetch included;
+- a daily repack and a prune, after which a fetch of what was pruned went to GitHub, which still served it;
+- a forgotten mirror, fetched anew.
+
+The load run cloned the repository many times at once, each clone under a session of its own, against the same clones straight to GitHub, with every client made before the clock started. The medians of three rounds:
+
+| | 16 at once, direct | 16 at once, through the proxy | 50 at once, direct | 50 at once, through the proxy |
+|---|---|---|---|---|
+| advertisement (`ls-remote`) | 0.23–0.28 s | 0.41–0.46 s | 0.28–0.38 s | 0.49–0.51 s |
+| shallow clone | 2.9–3.2 s | 2.0–3.2 s | 8.5–11.7 s | 6.1–8.1 s |
+| whole clone | 3.6–4.5 s | 3.8–4.7 s | 30.3–33.7 s | 13.9–16.2 s |
+
+In every round each phase through the proxy was served from the mirror alone, with no request of a client's sent on to GitHub, and with the repository's refs unchanged nothing was refreshed; the test asserts both. Every advertisement still asks GitHub for the repository and its refs, which is what authorises it. Each round then pushed a commit three times and sent a wave of advertisements through the proxy just after each push; every answer named the pushed commit, and the node reported a successful refresh for each wave. The median advertisement after a push took 0.9 to 1.3 s at sixteen at once and 1.2 to 1.5 s at fifty, 0.5 to 1.1 s more than the same round's advertisement with the refs unchanged. The run did not time which requests waited on the refresh, so that difference is end to end, and the refresh is its likely cause rather than a measured one.
+
+The run also read the CPU of every child process it waited for, which through the proxy is the clients' git and the node's upload-packs and pack-objects, and straight to GitHub the clients' git alone. The difference between the two is not a measurement of the node's git, in either direction: the proxy's own Go is in neither, and the clients' own work differs between the sides by an amount the run did not measure (HTTPS straight to GitHub, loopback through the proxy, and packs that need not be the same). For a whole clone the two were within 2% of each other and for a shallow clone about half a second a clone apart, which is all the run says about CPU.
+
+At fifty at once a whole clone straight to GitHub took twice as long as through the proxy in all three rounds, but earlier rounds that day, which timed each proxy client with its setup, found whole clones at fifty taking either about 19 s or about 35 s on both sides, and most often the longer time through the proxy. That comparison does not hold still from one run to the next, and nothing is claimed from it.
+
+At sixteen at once, about what a node runs, a whole clone through the proxy took as long as straight to GitHub, round for round within half a second either way, an advertisement about 0.2 s longer, and a shallow clone from 0.2 s longer to 1.3 s shorter, and every clone's pack came from the mirror, which fetched from GitHub once where sixteen clones would each have downloaded a pack from it. Parity is claimed for sixteen at once only.
+
 ## What is not decided here
 
 - **Dropping an object GitHub removed, on its own.** An object GitHub has since removed (a sensitive-data removal through GitHub Support) stays in a mirror until a prune that runs at least fourteen days after the first pass that found it unreachable, which needs the mirror's refs to move, or until the mirror is reaped. `billet cache git forget --repository <owner/repo>` stops the repository's mirrors being served at once, on the node it runs on, by the broken mark a failed serve writes; the running node removes them itself, at the next advertisement or its next reap, because only its own claim waits for the fetches being served before a mirror goes and another is made in its place. Nothing yet learns of a removal from GitHub or reaches every node.
-- **Protocol v2 to the guest.** The mirror still speaks v0 to guests; v2 would let the proxy forward GitHub's ref listing unchanged and serve only fetches.
 
 ## Rejected
 
+- **Protocol v2 to the guest,** GitHub's ref listing forwarded unchanged and only fetches served from the mirror. What it would save is an advertisement that waits for the mirror's refresh. With the refs unchanged the load run measured none, and an advertisement's own cost through the proxy, about 0.2 s more than GitHub's, is most likely the questions to GitHub that authorise it, which v2 would ask too, though the run did not time them apart. After a push an advertisement took 0.5 to 1.1 s longer, most likely waiting for the refresh, but under v2 the guest would then ask for the pushed commit, which the mirror would not yet have, so the wait moves to that fetch, behind the same refresh or straight to GitHub, rather than going away. That holds for the job a push starts, whose checkout asks for the commit the push made, and is inferred rather than measured, since the run timed advertisements alone; a job that fetches only refs that did not move would be spared the wait under v2 (2026-10-22). It costs a second protocol through every path of the proxy.
+- **A pack cache shared by identical fetches.** It pays only where pack-objects is the bottleneck, and at sixteen at once a whole clone through the proxy took as long as straight to GitHub and a shallow one at most 0.2 s longer. The run did not measure the node's pack-objects alone, so this rests on wall time, and the cache is worth measuring again only if a checkout through the proxy is found slow where it matters (2026-10-22).
 - **Keep the reachability rule and send what it refuses to GitHub.** It is correct, but every full-history checkout's lazy fetch and every superseded merge commit would go to GitHub, and the rule protects nothing GitHub does not already hand out.
 - **A checkout action that borrows objects from a mirror disk through alternates,** as several hosted runner services do. It keeps GitHub in every fetch and cannot refuse anything GitHub would serve, but it needs every workflow changed and a disk attached to every guest; billet's proxy needs neither.
 - **Waiting for the refresh, however long.** It is what made one slow fetch every job's ten minutes.

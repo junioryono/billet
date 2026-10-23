@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,6 +142,8 @@ func TestARefreshHoldsNoJobPastItsWait(t *testing.T) {
 	service.git.refreshWait = 300 * time.Millisecond
 	release := upstream.holdMirrorFetches(t)
 	git := gitClient(t, node, token, githubBasic)
+	observer := &recordingGitObserver{}
+	service.SetGitObserver(observer)
 
 	// HELD UNTIL EVERY CLONE HAS RETURNED, so a clone that waited for the
 	// refresh rather than for its bound never returns before the guard.
@@ -164,9 +167,6 @@ func TestARefreshHoldsNoJobPastItsWait(t *testing.T) {
 			t.Fatalf("clone %d beside a held refresh: %v", i, err)
 		}
 	}
-	if got := upstream.mirrorFetches.Load(); got != 1 {
-		t.Fatalf("the node made %d mirror fetches for %d jobs, want one refresh they shared", got, jobs)
-	}
 
 	release()
 	want := runIn(t, upstream.repo, "rev-parse", "main")
@@ -183,6 +183,24 @@ func TestARefreshHoldsNoJobPastItsWait(t *testing.T) {
 
 		return struct{}{}
 	})
+	// COUNTED ONCE THE MIRROR IS IDLE, not when the clones return: the upstream
+	// counts a fetch when the node's git sends it, after its handshake, which
+	// under -race came after all six had given up waiting (0 counted, CI,
+	// 2026-10-22). The wait is on every refresh's own goroutine, not on the
+	// mirror's refreshing mark, which a refresh that failed to join another
+	// would overwrite. The refreshes are counted as well as the fetches,
+	// because a second refresh behind the mirror's lock finds nothing to fetch.
+	gitWithin(t, "every refresh the jobs started", func() struct{} {
+		service.git.background.Wait()
+
+		return struct{}{}
+	})
+	if got := upstream.mirrorFetches.Load(); got != 1 {
+		t.Fatalf("the node made %d mirror fetches for %d jobs, want one refresh they shared", got, jobs)
+	}
+	if _, refreshes, _ := observer.seen(); !slices.Equal(refreshes, []string{gitRefreshOK}) {
+		t.Fatalf("the node refreshed %v for %d jobs, want one refresh they shared", refreshes, jobs)
+	}
 	before := upstream.guestFetches()
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "after"); err != nil {
 		t.Fatalf("the clone after the refresh: %v\n%s", err, output)
