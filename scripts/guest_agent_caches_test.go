@@ -59,6 +59,7 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 				"\tpushInsteadOf = https://github.com/",
 				`[credential "` + endpoint + `"]`,
 				"\thelper = " + billet + " cache git-credential",
+				"\tuseHttpPath = true",
 			},
 		},
 		{

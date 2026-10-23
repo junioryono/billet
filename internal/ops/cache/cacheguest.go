@@ -3,6 +3,7 @@ package cache
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/junioryono/billet/internal/cli"
 
@@ -19,7 +22,9 @@ import (
 )
 
 // The guest's view of the node cache. The runner's environment carries both;
-// neither is ever written to a file billet installs.
+// the bearer is never written to a file billet installs. The image's sudoers
+// names the two, without their values, so they cross sudo
+// (build-guest-image.sh).
 const (
 	envCacheEndpoint = "BILLET_CACHE_ENDPOINT"
 	envCacheToken    = "BILLET_CACHE_TOKEN"
@@ -77,7 +82,10 @@ func cmdCacheCredentialHelper(_ context.Context, env cli.Env, args []string) err
 // cmdCacheGitCredential is the git credential helper the guest's gitconfig
 // names for the node, which a github.com fetch reaches through url.insteadOf.
 // The rewrite drops the header actions/checkout scopes to github.com, so this
-// hands it to the node as the password, beside the session bearer.
+// hands it to the node as the password, beside the session bearer; and the
+// rewrite hides git's own github.com helpers, so without that header it hands
+// the user's own github.com credential. Under sudo it reads the same
+// environment: the image's sudoers keeps the two variables across it.
 func cmdCacheGitCredential(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: billet cache git-credential get (run by git)")
@@ -89,13 +97,64 @@ func cmdCacheGitCredential(ctx context.Context, env cli.Env, args []string) erro
 	if err != nil {
 		return err
 	}
-	answer, err := gitCredential(env.Stdin, env.Getenv(envCacheEndpoint), env.Getenv(envCacheToken), headers)
+	answer, err := gitCredential(env.Stdin, env.Getenv(envCacheEndpoint), env.Getenv(envCacheToken), headers,
+		func(path string) string { return githubCredential(ctx, "git", path) })
 	if err != nil {
 		return err
 	}
 	_, err = io.WriteString(env.Stdout, answer)
 
 	return err
+}
+
+// gitProxyPath is where the node serves github.com's repositories: a path git
+// hands this helper is the repository's github.com path behind it.
+const gitProxyPath = "/v1/git/github.com/"
+
+// githubCredentialWait bounds asking git for the user's own github.com
+// credential: a helper that hangs must not hold the fetch.
+const githubCredentialWait = 5 * time.Second
+
+// githubCredential is the user's own github.com credential for the repository
+// at path (owner/repo.git, or "" when git did not say) as an Authorization
+// header, from whatever helpers git has for github.com (a credential store,
+// `gh auth setup-git`), or "" when there is none or it cannot be had. git
+// applies the user's own github.com policy to the path, so a helper configured
+// for one repository is the one asked. The image's gitconfig names this helper
+// only for the node, so git never asks it here, and nothing prompts: the job
+// has no one to answer.
+func githubCredential(ctx context.Context, git, path string) string {
+	ctx, cancel := context.WithTimeout(ctx, githubCredentialWait)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, git, "credential", "fill")
+	// THE WHOLE GROUP ENDS WITH IT: a helper git started that hangs would
+	// otherwise outlive the fill, holding the environment it inherited.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	request := "protocol=https\nhost=github.com\n"
+	if path != "" && !strings.ContainsAny(path, "\r\n\x00") {
+		request += "path=" + path + "\n"
+	}
+	cmd.Stdin = strings.NewReader(request + "\n")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/false", "SSH_ASKPASS=",
+		"GCM_INTERACTIVE=never")
+	cmd.WaitDelay = time.Second
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	answer := map[string]string{}
+	for line := range strings.Lines(string(output)) {
+		if key, value, ok := strings.Cut(strings.TrimSuffix(line, "\n"), "="); ok {
+			answer[key] = value
+		}
+	}
+	user, password := answer["username"], answer["password"]
+	if user == "" || password == "" || strings.ContainsAny(user+password, "\r\n") {
+		return ""
+	}
+
+	return "basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+password))
 }
 
 // checkoutHeaders is every header actions/checkout configured for github.com in
@@ -127,10 +186,16 @@ func hostOf(raw string) (string, string) {
 }
 
 // gitCredential answers git's request for the node's host: the session bearer
-// as the user name, and the last Authorization header checkout configured for
-// github.com as the password, or "-" when there is none. A request for any
-// other host is answered with nothing.
-func gitCredential(in io.Reader, endpoint, token string, headers []string) (string, error) {
+// as the user name, and as the password the last Authorization header checkout
+// configured for github.com, else the user's own github.com credential own
+// finds, else "-". A request for any other host is answered with nothing.
+//
+// CHECKOUT'S HEADER FIRST, so a fetch in the workspace keeps using the token
+// the workflow gave checkout; the user's own credential is for what that
+// token does not reach, another private repository a job clones with its own.
+// own is handed the github.com path of the repository git is fetching, which
+// the image's gitconfig has git send.
+func gitCredential(in io.Reader, endpoint, token string, headers []string, own func(path string) string) (string, error) {
 	scheme, host := hostOf(endpoint)
 	if host == "" || token == "" {
 		return "", nil
@@ -158,6 +223,15 @@ func gitCredential(in io.Reader, endpoint, token string, headers []string) (stri
 		if ok && strings.EqualFold(strings.TrimSpace(name), "authorization") &&
 			strings.TrimSpace(value) != "" && !strings.ContainsAny(value, "\r\n") {
 			password = strings.TrimSpace(value)
+		}
+	}
+	if password == "-" && own != nil {
+		path, _ := strings.CutPrefix(asked["path"], strings.TrimPrefix(gitProxyPath, "/"))
+		if path == asked["path"] {
+			path = ""
+		}
+		if header := own(path); header != "" {
+			password = header
 		}
 	}
 

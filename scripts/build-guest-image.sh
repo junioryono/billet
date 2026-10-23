@@ -344,7 +344,39 @@ install_guest_billet() {
 #!/bin/sh
 exec /opt/billet/bin/billet cache credential-helper "$@"
 HELPER
+	install_cache_sudoers "$rootfs"
 	echo "guest billet: built with go $newest"
+}
+
+# install_cache_sudoers keeps the node's endpoint and bearer across sudo in the
+# image at $1, and ends the build unless sudo's whole policy parses and reads
+# the drop-in: one it parses but never includes keeps nothing.
+#
+# GIT UNDER sudo GOES THROUGH THE NODE TOO. sudo resets the environment, so
+# root's git, which the image's gitconfig also sends to the node, had no session
+# for the credential helper to give and failed a fetch GitHub would have
+# answered. The drop-in names the two variables, never their values, which stay
+# in the runner's environment (measured on ubuntu:24.04, sudo 1.9.15p5,
+# 2026-10-22: without it neither crossed; with it both crossed sudo, sudo -i,
+# sudo -u root and sudo sh -c, though not su -, which starts a login of its own).
+install_cache_sudoers() {
+	local rootfs=$1 parsed
+	install -m 0440 /dev/stdin "$rootfs/etc/sudoers.d/billet-cache" <<'SUDOERS'
+Defaults env_keep += "BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN"
+SUDOERS
+	if ! parsed=$(chroot "$rootfs" visudo -c 2>&1); then
+		printf '%s\n' "$parsed" >&2
+		echo "the image's sudoers policy does not parse with the build caches' drop-in" >&2
+		exit 1
+	fi
+	case "$parsed" in
+	*"/etc/sudoers.d/billet-cache: parsed OK"*) ;;
+	*)
+		printf '%s\n' "$parsed" >&2
+		echo "the image's sudoers policy does not read /etc/sudoers.d/billet-cache" >&2
+		exit 1
+		;;
+	esac
 }
 
 # THE COMPONENTS THE PUBLISHED IMAGE LEAVES OUT (#584), whose licenses forbid
@@ -2144,7 +2176,8 @@ if [ -n "$guest_git" ]; then
 	# drops the header actions/checkout scopes to github.com, so the credential
 	# helper hands it back to the node, which asks GitHub before serving a byte.
 	# Only https://github.com/ is rewritten: SSH and every other host are
-	# untouched.
+	# untouched. git hands the helper the repository's path, so a user's own
+	# credential is asked for that repository, as git would ask it of github.com.
 	git_origin=${cache_endpoint%/}
 	{
 		printf '%s\n' "[url \"$git_origin/v1/git/github.com/\"]"
@@ -2153,6 +2186,7 @@ if [ -n "$guest_git" ]; then
 		printf '\t%s\n' "pushInsteadOf = https://github.com/"
 		printf '%s\n' "[credential \"$git_origin\"]"
 		printf '\t%s\n' "helper = $GUEST_BILLET cache git-credential"
+		printf '\t%s\n' "useHttpPath = true"
 	} >>"$GITCONFIG_FILE"
 fi
 # BILLET_GUEST_CACHES_END
