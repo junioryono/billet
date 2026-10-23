@@ -369,7 +369,9 @@ func (c *Controller) checkCeiling(p string) []error {
 }
 
 // fullCeiling is the highest a policy's ceiling can be set to: the top of its
-// frequency table, or cpuinfo_max_freq for a driver that lists none.
+// frequency table, its boost entries with them while boost is on (the kernel
+// lists those apart, in scaling_boost_frequencies), or cpuinfo_max_freq for a
+// driver that lists none.
 func (c *Controller) fullCeiling(p string) (int, error) {
 	avail, err := readSysfs(c.policyPath(p, "scaling_available_frequencies"))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -377,6 +379,20 @@ func (c *Controller) fullCeiling(p string) (int, error) {
 	}
 	if err != nil {
 		return 0, err
+	}
+
+	switch boosted, err := readSysfs(c.policyPath(p, "scaling_boost_frequencies")); {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return 0, err
+	case strings.TrimSpace(boosted) != "":
+		on, err := c.boostOn(p)
+		if err != nil {
+			return 0, err
+		}
+		if on {
+			avail += " " + boosted
+		}
 	}
 
 	full := 0
@@ -392,6 +408,22 @@ func (c *Controller) fullCeiling(p string) (int, error) {
 	}
 
 	return full, nil
+}
+
+// boostOn reads whether a policy may boost: its own switch where it has one,
+// the global one where it has not, and off on a host with neither.
+func (c *Controller) boostOn(p string) (bool, error) {
+	for _, path := range []string{c.policyPath(p, "boost"), c.boostPath()} {
+		switch v, err := readSysfs(path); {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return false, err
+		default:
+			return v == "1", nil
+		}
+	}
+
+	return false, nil
 }
 
 func readKHz(path string) (int, error) {

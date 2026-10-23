@@ -639,6 +639,53 @@ func TestACapIsTakenOnlyFromCeilingsAtTheirFull(t *testing.T) {
 	h.requireFull(stateDir)
 }
 
+// A BOOSTED POLICY'S FULL INCLUDES ITS BOOST ENTRIES, which the kernel lists
+// apart from its table: a ceiling at the top boost entry is capped from, and
+// one held at the top of the plain table while boost is on is not.
+func TestABoostedPolicysFullIncludesItsBoostFrequencies(t *testing.T) {
+	const boostKHz = "3204000"
+	for _, tc := range []struct {
+		name, ceiling string
+		capped        bool
+	}{
+		{"at the top boost entry", boostKHz, true},
+		{"held at the top of the plain table", fullKHz, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFakeHost(t, 1)
+			h.write(h.policyFile(0, "scaling_boost_frequencies"), boostKHz+" ")
+			h.write(h.policyFile(0, "scaling_max_freq"), tc.ceiling)
+			c, stateDir := newController(t, h, Settings{IdleAfter: time.Minute, DisableBoost: true}, nil)
+
+			c.step(t.Context(), func() bool { return true })
+			c.mu.Lock()
+			c.busyAt = time.Now().Add(-time.Hour)
+			c.mu.Unlock()
+			c.step(t.Context(), func() bool { return true })
+
+			_, err := os.Stat(filepath.Join(stateDir, RecordName))
+			if capped := h.boost() == "0"; capped != tc.capped || (err == nil) != tc.capped {
+				t.Errorf("capped %v with a record %v, want %v", capped, err == nil, tc.capped)
+			}
+		})
+	}
+}
+
+// AND WITH BOOST OFF, the boost entries are no ceiling the policy can reach: a
+// ceiling at the top of the plain table is its full, and is capped from.
+func TestAnUnboostedPolicysFullIsItsTable(t *testing.T) {
+	h := newFakeHost(t, 1)
+	h.write(h.policyFile(0, "scaling_boost_frequencies"), "3204000 ")
+	h.write(h.policyFile(0, "boost"), "0")
+	h.write(filepath.Join(cpufreqRel, "boost"), "0")
+	c, _ := newController(t, h, Settings{IdleAfter: time.Minute, MaxFreqKHz: 1500000}, nil)
+
+	capNow(t, c)
+	if got := h.maxFreq(0); got != lowKHz {
+		t.Errorf("scaling_max_freq = %s, want capped to %s", got, lowKHz)
+	}
+}
+
 // A CAP NEVER RAISES A CEILING: a setting at the full writes no ceiling.
 func TestACapNeverRaisesACeiling(t *testing.T) {
 	h := newFakeHost(t, 2)
