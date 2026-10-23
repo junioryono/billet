@@ -510,7 +510,8 @@ node:
   # this block says now (a failure is logged and retried while the node runs). The node runs as root and its unit leaves
   # ProtectKernelTunables off, which is what keeps /sys writable. On the
   # reference node a launch's restore took about 20 ms, and no ceiling lowered
-  # its idle power (docs/reference/records/cpu-placement.md).
+  # its idle power by more than half a watt
+  # (docs/reference/records/cpu-placement.md).
   #
   # power:
   #   idle_after: 60s
@@ -550,11 +551,12 @@ node:
     # (CCDs), so the rest of the host can idle; `spread` gives it one thread per
     # core in the emptiest group, so guests share neither cores nor caches;
     # `packed` gives one thread per core from the lowest group on, so guests
-    # share no cores and fill few groups. On the reference node, spread ran a
-    # parallel compile fastest and on the least energy, sharing SMT siblings
-    # (compact) cost up to 35%, and filling fewer groups (packed) saved no
-    # energy (docs/reference/records/cpu-placement.md). A guest that does not
-    # fit runs unpinned rather than being refused.
+    # share no cores and fill few groups. On the reference node, compact ran up
+    # to 43% longer than spread, though it used less energy on a memory-bound
+    # load at half the threads, spread ran a parallel compile far more steadily
+    # than unpinned guests, and filling fewer groups (packed) saved no energy
+    # (docs/reference/records/cpu-placement.md). A guest that does not fit runs
+    # unpinned rather than being refused.
     #
     # cpu_placement: spread
 
