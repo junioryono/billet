@@ -3,6 +3,8 @@ package power
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,12 +16,16 @@ import (
 )
 
 // THE CONTROLLER ON A REAL HOST'S cpufreq, end to end: it caps an idle host
-// through the real sysfs, a launch's restore puts every value back, and each
-// cycle writes what it read and how long the restore took to a results file.
+// through the real sysfs, the cap writes what the settings ask, a launch's
+// restore puts every value back, and each cycle writes what it read and how long
+// the restore took to a results file.
 //
 // It skips unless BILLET_TEST_REAL_POWER_OUT names that file and the test runs
 // as root. It writes the host's live cpufreq ceiling, so it is meant for a
-// drained node; whatever happens, its cleanup writes back what it read first.
+// drained node; whatever happens inside the test, the controller is stopped and
+// the baseline the test read first is put back, in the order the kernel takes
+// it, and read back. Only a crash of the test binary itself escapes that, which
+// is why the session that runs it also restores cpufreq on exit.
 //
 // BILLET_TEST_REAL_POWER_RUNS (default 5), BILLET_TEST_REAL_POWER_DISABLE_BOOST
 // (1 to turn boost off) and BILLET_TEST_REAL_POWER_MAX_KHZ (a ceiling) choose the
@@ -54,16 +60,16 @@ func TestRealCapAndRestoreOnThisHost(t *testing.T) {
 	}
 
 	const sysfs = "/sys"
-	before := readCeiling(t, sysfs)
-	// WHATEVER HAPPENS, the host leaves with the ceiling it came with.
+	baseline, err := readBaseline(sysfs)
+	if err != nil {
+		t.Fatalf("read the host's cpufreq baseline: %v", err)
+	}
+	// REGISTERED FIRST, SO IT RUNS LAST, after every run's own shutdown: the host
+	// leaves with the ceiling it came with, written in the kernel's order and read
+	// back.
 	t.Cleanup(func() {
-		for path, value := range before {
-			if now, err := readSysfs(path); err == nil && now == value {
-				continue
-			}
-			if err := writeSysfs(path, value); err != nil {
-				t.Errorf("restore %s to %s by hand: %v", path, value, err)
-			}
+		if err := baseline.restore(); err != nil {
+			t.Errorf("put the host's cpufreq baseline back: %v", err)
 		}
 	})
 
@@ -75,90 +81,141 @@ func TestRealCapAndRestoreOnThisHost(t *testing.T) {
 	encoder := json.NewEncoder(file)
 
 	for run := range runs {
-		c, err := New(Options{SysfsRoot: sysfs, StateDir: t.TempDir(), Settings: settings,
-			Tick: 100 * time.Millisecond})
+		line, err := capAndRestoreOnce(t, sysfs, settings, baseline)
+		if line != nil {
+			line["run"] = run
+			if err := encoder.Encode(line); err != nil {
+				t.Fatalf("write the results: %v", err)
+			}
+		}
 		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-		if err := c.CheckHost(); err != nil {
-			t.Fatalf("CheckHost: %v", err)
-		}
-
-		var idle atomic.Bool
-		idle.Store(true)
-		ctx, cancel := context.WithCancel(t.Context())
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			c.Run(ctx, idle.Load)
-		}()
-
-		started := time.Now()
-		capped := false
-		for time.Since(started) < 30*time.Second {
-			if state(c.st.Load()) == stateCapped {
-				capped = true
-
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		capTook := time.Since(started)
-		during := readCeiling(t, sysfs)
-
-		idle.Store(false)
-		asked := time.Now()
-		c.RestoreBeforeLaunch(ctx, "realpower")
-		restoreTook := time.Since(asked)
-		after := readCeiling(t, sysfs)
-
-		cancel()
-		<-done
-		if err := c.Close(context.WithoutCancel(t.Context())); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-
-		mismatched := 0
-		for path, value := range before {
-			if after[path] != value {
-				mismatched++
-			}
-		}
-		policy0 := filepath.Join(sysfs, "devices", "system", "cpu", "cpufreq", "policy0", "scaling_max_freq")
-		boost := filepath.Join(sysfs, "devices", "system", "cpu", "cpufreq", "boost")
-		line := map[string]any{
-			"run": run, "disable_boost": settings.DisableBoost, "max_khz": settings.MaxFreqKHz,
-			"capped": capped, "cap_seconds": capTook.Seconds(), "restore_seconds": restoreTook.Seconds(),
-			"boost_before": before[boost], "boost_capped": during[boost], "boost_after": after[boost],
-			"policy0_max_before": before[policy0], "policy0_max_capped": during[policy0],
-			"policy0_max_after": after[policy0], "values": len(before), "mismatched_after": mismatched,
-		}
-		if err := encoder.Encode(line); err != nil {
-			t.Fatalf("write the results: %v", err)
-		}
-		if !capped {
-			t.Errorf("run %d: the controller did not cap the idle host within 30 s", run)
-		}
-		if mismatched > 0 {
-			t.Errorf("run %d: %d of %d cpufreq values differ after the launch's restore", run, mismatched,
-				len(before))
+			t.Fatalf("run %d: %v", run, err)
 		}
 	}
 }
 
-// readCeiling reads the global boost switch and every policy's
-// scaling_max_freq, keyed by path.
-func readCeiling(t *testing.T, sysfs string) map[string]string {
+// capAndRestoreOnce runs one controller through one cap and one launch's
+// restore, and always stops it and puts the baseline back before returning.
+func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline ceiling) (map[string]any, error) {
 	t.Helper()
 
+	// NOT t.TempDir: the controller's record must outlive a failed restore, so
+	// the directory is removed only once the baseline is proved back.
+	stateDir, err := os.MkdirTemp("", "billet-realpower-") //nolint:usetesting // t.TempDir's cleanup would delete the record before the baseline is proved back
+
+	if err != nil {
+		return nil, fmt.Errorf("make a state directory: %w", err)
+	}
+
+	c, err := New(Options{SysfsRoot: sysfs, StateDir: stateDir, Settings: settings, Tick: 100 * time.Millisecond})
+	if err != nil {
+		return nil, fmt.Errorf("New: %w", err)
+	}
+	if err := c.CheckHost(); err != nil {
+		return nil, fmt.Errorf("CheckHost: %w", err)
+	}
+
+	var idle atomic.Bool
+	idle.Store(true)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.Run(ctx, idle.Load)
+	}()
+
+	// WHATEVER HAPPENS BELOW: the node turns busy, the loop is stopped and
+	// joined, the controller restores and closes, and the baseline is proved
+	// back before the record's directory goes.
+	var result error
+	defer func() {
+		idle.Store(false)
+		cancel()
+		<-done
+		closeErr := c.Close(context.WithoutCancel(t.Context()))
+		restoreErr := baseline.restore()
+		if closeErr == nil && restoreErr == nil {
+			_ = os.RemoveAll(stateDir)
+		}
+		if err := errors.Join(closeErr, restoreErr); err != nil {
+			t.Errorf("after the run, the controller's record is kept in %s: %v", stateDir, err)
+		}
+	}()
+
+	started := time.Now()
+	capped := false
+	for time.Since(started) < 30*time.Second {
+		if state(c.st.Load()) == stateCapped {
+			capped = true
+
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	capTook := time.Since(started)
+	if !capped {
+		return nil, errors.New("the controller did not cap the idle host within 30 s")
+	}
+	during, err := readBaseline(sysfs)
+	if err != nil {
+		return nil, fmt.Errorf("read the capped ceiling: %w", err)
+	}
+	// THE CAP WROTE WHAT WAS ASKED, not merely a state change.
+	if settings.DisableBoost && during.boost != "0" {
+		result = errors.Join(result, fmt.Errorf("boost reads %q while capped, want 0", during.boost))
+	}
+	if settings.MaxFreqKHz > 0 {
+		want := strconv.Itoa(settings.MaxFreqKHz)
+		for path, value := range during.ceilings {
+			if value != want {
+				result = errors.Join(result, fmt.Errorf("%s reads %s while capped, want %s", path, value, want))
+
+				break
+			}
+		}
+	}
+
+	idle.Store(false)
+	asked := time.Now()
+	c.RestoreBeforeLaunch(ctx, "realpower")
+	restoreTook := time.Since(asked)
+	// RestoreBeforeLaunch may return at its bound while the restore goes on, so
+	// the comparison waits out the kernel's own asynchronous read-back.
+	after, err := baseline.waitFor(sysfs, 3*time.Second)
+	if err != nil {
+		result = errors.Join(result, err)
+	}
+
+	policy0 := filepath.Join(sysfs, "devices", "system", "cpu", "cpufreq", "policy0", "scaling_max_freq")
+	return map[string]any{
+		"disable_boost": settings.DisableBoost, "max_khz": settings.MaxFreqKHz,
+		"cap_seconds": capTook.Seconds(), "restore_seconds": restoreTook.Seconds(),
+		"boost_before": baseline.boost, "boost_capped": during.boost, "boost_after": after.boost,
+		"policy0_max_before": baseline.ceilings[policy0], "policy0_max_capped": during.ceilings[policy0],
+		"policy0_max_after": after.ceilings[policy0], "policies": len(baseline.ceilings),
+		"mismatched_after": baseline.mismatches(after),
+	}, result
+}
+
+// ceiling is a host's cpufreq ceiling: the global boost switch, each policy's
+// own boost switch and each policy's scaling_max_freq, keyed by path.
+type ceiling struct {
+	root             string
+	boostPath, boost string
+	policyBoost      map[string]string
+	ceilings         map[string]string
+}
+
+func readBaseline(sysfs string) (ceiling, error) {
 	cpufreq := filepath.Join(sysfs, "devices", "system", "cpu", "cpufreq")
-	values := map[string]string{}
-	if v, err := readSysfs(filepath.Join(cpufreq, "boost")); err == nil {
-		values[filepath.Join(cpufreq, "boost")] = v
+	c := ceiling{root: sysfs, boostPath: filepath.Join(cpufreq, "boost"), policyBoost: map[string]string{},
+		ceilings: map[string]string{}}
+	if v, err := readSysfs(c.boostPath); err == nil {
+		c.boost = v
 	}
 	entries, err := os.ReadDir(cpufreq)
 	if err != nil {
-		t.Fatalf("read %s: %v", cpufreq, err)
+		return ceiling{}, err
 	}
 	var names []string
 	for _, e := range entries {
@@ -168,13 +225,94 @@ func readCeiling(t *testing.T, sysfs string) map[string]string {
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if v, err := readSysfs(filepath.Join(cpufreq, name, "boost")); err == nil {
+			c.policyBoost[filepath.Join(cpufreq, name, "boost")] = v
+		}
 		path := filepath.Join(cpufreq, name, "scaling_max_freq")
 		v, err := readSysfs(path)
 		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
+			return ceiling{}, err
 		}
-		values[path] = v
+		c.ceilings[path] = v
 	}
 
-	return values
+	return c, nil
+}
+
+// restore writes the baseline back in the order the controller uses: the
+// global switch, each policy's switch where it differs, then each ceiling; and
+// reads it all back.
+func (c ceiling) restore() error {
+	var failures []error
+	write := func(path, value string) {
+		if now, err := readSysfs(path); err == nil && now == value {
+			return
+		}
+		if err := writeSysfs(path, value); err != nil {
+			failures = append(failures, fmt.Errorf("write %s: %w", path, err))
+		}
+	}
+	if c.boost != "" {
+		write(c.boostPath, c.boost)
+	}
+	for _, path := range sortedKeys(c.policyBoost) {
+		write(path, c.policyBoost[path])
+	}
+	for _, path := range sortedKeys(c.ceilings) {
+		write(path, c.ceilings[path])
+	}
+	if _, err := c.waitFor(c.root, 3*time.Second); err != nil {
+		failures = append(failures, err)
+	}
+
+	return errors.Join(failures...)
+}
+
+// waitFor reads the host until it matches the baseline or the bound passes.
+func (c ceiling) waitFor(sysfs string, bound time.Duration) (ceiling, error) {
+	deadline := time.Now().Add(bound)
+	for {
+		now, err := readBaseline(sysfs)
+		if err == nil && c.mismatches(now) == 0 {
+			return now, nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return now, err
+			}
+
+			return now, fmt.Errorf("%d cpufreq values still differ from the baseline after %s", c.mismatches(now),
+				bound)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (c ceiling) mismatches(other ceiling) int {
+	n := 0
+	if c.boost != other.boost {
+		n++
+	}
+	for path, v := range c.policyBoost {
+		if other.policyBoost[path] != v {
+			n++
+		}
+	}
+	for path, v := range c.ceilings {
+		if other.ceilings[path] != v {
+			n++
+		}
+	}
+
+	return n
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	return keys
 }
