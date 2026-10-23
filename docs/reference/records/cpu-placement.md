@@ -14,7 +14,7 @@ What placing microVMs on host cpus, and capping the cpu while a node is idle, di
   - `gostd` is `go build -a std` twice, each from an empty cache: a parallel compile.
   - `memory` is every vCPU copying a 256 MiB buffer 600 times: far larger than any L3.
   - A guest reboots when its workload succeeds, which ends its VMM, so run time is from launch returned to VMM exit.
-- **Power:** `scripts/power-log.sh --meter` logged package energy (RAPL), turbostat and the wall meter through each session: 3,633, 4,288 and 1,680 intervals, a row about every 1.15 s. A row's package power is its energy over its own interval, and wall energy is the meter's watts times that interval; the meter's own energy counter agrees within 5%. turbostat's energy agreed with RAPL's to 0.999, 0.999 and 1.000.
+- **Power:** `scripts/power-log.sh --meter` logged package energy (RAPL), turbostat and the wall meter through each session: 3,633, 4,288 and 1,680 intervals, a row about every 1.15 s. A row's package power is its energy over its own interval, and wall energy is the meter's watts times that interval; the meter's own energy counter over the same intervals agrees with it per run within a median 1.3% and at most 5.1%. turbostat's energy agreed with RAPL's to 0.999, 0.999 and 1.000.
 - **Placements:**
   - `none` is today's unpinned guests.
   - `compact` gives a guest both threads of as few cores as it needs, in the lowest last-level-cache group with room for it.
@@ -29,7 +29,7 @@ What placing microVMs on host cpus, and capping the cpu while a node is idle, di
 
 ## Results
 
-### No cpu ceiling lowered idle power by more than half a watt
+### No cpu ceiling showed an idle saving
 
 Session 2 read each setting three times for 60 s, interleaved and shuffled, 10 s trimmed from each end, after five quiet minutes that read 70.0 W in the package and 149.9 W at the wall.
 
@@ -40,7 +40,7 @@ Session 2 read each setting three times for 60 s, interleaved and shuffled, 10 s
 | Boost off, 2.0 GHz ceiling | 74.1, 71.8, 69.6 W | 158.9, 154.0, 148.8 W |
 | Boost off, 1.5 GHz ceiling | 72.1, 69.7, 69.5 W | 154.3, 148.7, 148.4 W |
 
-- **In the last round the four settings read within 0.4 W of each other** (69.5 to 69.9 W), and within 0.5 W of the quiet minutes. So capping a node's frequency while it is idle, which `node.power` does, saves under 1% of this host's idle package power. Whatever more it saves would have to show in how a host leaves and enters idle, which this did not measure.
+- **No setting showed a saving.** In the last round the four package readings were within 0.4 W of each other (69.5 to 69.9 W) and of the quiet minutes, and the wall readings within 1.2 W. Across all three rounds the differences are not significant (the default against the 1.5 GHz ceiling, 1.9 W apart on average, p 0.51), so a saving of a watt or two is not ruled out either; one this small would be under 3% of the host's idle package power. Whatever capping a node's frequency while it is idle, which `node.power` does, saves beyond that would have to show in how a host leaves and enters idle, which this did not measure.
 - **Every setting read 2 to 7 W higher in the first round,** though the quiet minutes just before it read 70.0 W. What the host was doing then was not measured.
 - **That fits what is known of this chip:** an idle core sits in a C-state whatever its ceiling, and most of the idle draw is outside the cores (about 69 of 73.5 W was uncore in the package's own split in September).
 - **The host idled at 70.1 and 70.0 W in sessions 1 and 2,** as the calibration run at 02:50 had read (69.9 W). Session 3, which began seven minutes after session 2's last guest, read 76.3 W package and 161.3 W wall in its quiet minutes; why was not measured.
@@ -119,9 +119,9 @@ Session 3 used 8 guests of 4 vCPUs, so each placement gives its guests a differe
 
 - **Sharing a CCD's L3 between two guests made no measurable difference on the compile** (`packed` 1.9% longer than `spread`, p 0.32), and cost 4.6% on the memory copy (p 0.001).
 - **`compact`, which adds shared cores and a more crowded L3, ran 14% and 29% longer than `packed`** on the compile and the memory copy (p ≤ 0.001), and 16% and 35% longer than `spread`. Sharing cores and crowding four guests into one L3 happen together in `compact`, so this does not say how much each one costs.
-- **Leaving whole CCDs idle saved no energy:** `packed` left four CCDs with nothing on them and used the same package and wall energy as `spread` (p ≥ 0.24 on both workloads). That is consistent with the idle result above: on this host an idle core costs little whether or not its CCD has work.
+- **Leaving whole CCDs idle showed no energy saving:** `packed` left four CCDs with nothing on them, and its package and wall energy were within 1.1% of `spread`'s, with no difference detected (p ≥ 0.24 on both workloads). That is consistent with the idle result above: on this host an idle core costs little whether or not its CCD has work.
 
-### At 75% of the threads, compact and unpinned tie
+### At 75% of the threads, compact and unpinned showed no difference
 
 Session 3 then ran 12 guests of 8 vCPUs, 96 of 128 threads, on the compile. `spread` and `packed` can give whole cores to only 8 such guests, and a guest the placement cannot fit runs unpinned, so they were not run; `compact` fits all 12.
 
@@ -130,7 +130,7 @@ Session 3 then ran 12 guests of 8 vCPUs, 96 of 128 threads, on the compile. `spr
 | none | 56.5 s | 6.2 | 11.18 kJ | 19.01 kJ | 1.00 |
 | compact | 55.4 s | 1.6 | 11.03 kJ | 18.77 kJ | 0.91 |
 
-- **At this load the two ran the same** (within 2% in time and energy, p ≥ 0.73): 96 vCPUs need more threads than the host has cores, so unpinned guests share SMT siblings too.
+- **At this load their means were within 2% in time and energy, and no difference was detected** (p ≥ 0.73), though with unpinned runs this variable the test could miss one of about a quarter either way. 96 vCPUs need more threads than the host has cores, so unpinned guests share SMT siblings too.
 - **`compact`'s run times varied a quarter as much,** a standard deviation of 1.6 s against 6.2 s.
 
 ### Boost off saved energy under compact and cost it under spread
@@ -145,7 +145,7 @@ Session 3 then ran 12 guests of 8 vCPUs, 96 of 128 threads, on the compile. `spr
 | 8 guests, `spread` (session 2) | off | 3 | 67.1 s | 9.30 kJ | 17.02 kJ |
 
 - **Under `spread`, boost off made the compile 50% slower at 4 guests and 64% slower at 8, and it used 21% and 19% more package energy and 29% and 28% more at the wall** (p ≤ 0.013). The longer run cost more than the lower clock saved.
-- **Under `compact`, boost off cost no time and saved 15% of package energy** (p 0.044, two runs each): a guest whose cores share SMT siblings gained little from boost to begin with.
+- **Under `compact`, boost off saved 15% of package energy** (p 0.044, two runs each), and its run time was within 1.5% of boost on, with no difference detected (two runs cannot rule out one of a quarter either way). A guest whose cores share SMT siblings may gain little from boost to begin with.
 - **So turning boost off is not a saving on this host for a job that has whole cores to itself,** which is what `spread` gives it. `node.power` turns boost off only while a node is idle, where the section above found it saves next to nothing, and restores it before a launch.
 
 ### Energy attribution
@@ -154,7 +154,7 @@ The harness charges each guest a share of the package energy above an idle basel
 
 - **Session 1 is the check:** its baseline was the configured 69.7 W, against 70.1 W measured. Over its 40 runs, the energy charged to guests was a mean 0.891 of the package's energy above the baseline (0.772 to 0.976), and 26 runs were inside the kit's per-run tolerance of 0.85 to 1.02.
 - **Sessions 2 and 3 were given baselines about 9 W too high,** 78.9 and 85.5 W against 70.0 and 76.3 W measured, by the analysis error described below. Their ratios (0.891 and 0.911) are against those baselines, so they are not what billet would attribute at the right one.
-- **What sessions 2 and 3 do show is where the shortfall goes.** Their ratio tracks the guests' share of the host's busy CPU run by run (r = 0.955 and 0.916), with the guests' cgroups using 0.932 and 0.937 of it. That follows from how the energy is shared, so it confirms the mechanism rather than testing it independently: the energy a job is not charged is the host CPU no job's cgroup used. The compile left more of it than the memory copy.
+- **What sessions 2 and 3 do show is that the shortfall tracks the host's own CPU.** Their ratio follows the guests' share of the host's busy CPU run by run (r = 0.955 and 0.916), with the guests' cgroups using 0.932 and 0.937 of it, and the compile left more outside them than the memory copy. That follows from how the energy is shared, so it confirms the mechanism rather than testing it independently. It is not the whole of the shortfall: the harness starts sampling a guest only once its launch returns, the sampler leaves a job's last interval unattributed, and it charges nothing for an interval it cannot read consistently, and these results do not record how much each of those missed.
 - **What used that CPU was not measured per process.** On this host the storage cluster serving the guests' disks runs outside every guest's cgroup, and the compile writes far more to disk than the memory copy, so it is the likeliest, but not shown.
 
 ### A correction in this record
@@ -166,5 +166,5 @@ An earlier revision of this record read each log row's energy as one second's po
 - **Real CI jobs were not run:** two synthetic workloads at a few loads, one host, one day.
 - **Few repeats:** three per configuration, two or three for boost, so differences of a few percent are often not significant.
 - **Why the first idle round, and session 3, read higher** than the quiet minutes that came before them.
-- **Which host process used the CPU** the attribution did not charge to a job, and billet's attribution at the right baseline in sessions 2 and 3.
+- **Which host process used the CPU** the attribution did not charge to a job, how much of the shortfall the harness's own windows account for, and billet's attribution at the right baseline in sessions 2 and 3.
 - **Not measured:** amd-pstate, BIOS power settings, C-state limits, and how fast a host leaves and enters idle under each setting.
