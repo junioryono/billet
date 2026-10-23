@@ -3,9 +3,12 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -192,7 +195,11 @@ func TestRealPlacementExperiment(t *testing.T) {
 			// guest's cgroup actually confines it to, so a claim that never reached
 			// the jailer is not measured as the placement it names.
 			if placement != "" {
-				if err := cgroupConfines(target.CgroupDir, g.cpus); err != nil {
+				cgroupRoot, err := cgroup2Mount(defaultProcMountsPath)
+				if err == nil {
+					err = cgroupConfines("/proc", cgroupRoot, target.PID, target.CgroupDir, g.cpus)
+				}
+				if err != nil {
 					g.err = err
 
 					return
@@ -229,19 +236,22 @@ func TestRealPlacementExperiment(t *testing.T) {
 	}
 	wg.Wait()
 	finished := time.Now()
-	// NO CPU IS HELD BY TWO GUESTS AT ONCE, which is what a placement promises.
+	// NO CPU IS HELD BY TWO GUESTS AT ONCE, which is what a placement promises;
+	// a run that broke it is written as failed, so no comparison takes it in.
 	if placement != "" {
 		owner := map[int]int{}
 		for i, g := range guests {
 			cpus, err := parseCPUList(g.cpus)
 			if err != nil {
-				t.Errorf("guest %d's cpus %q: %v", i, g.cpus, err)
+				g.err = errors.Join(g.err, fmt.Errorf("its cpus %q: %w", g.cpus, err))
 
 				continue
 			}
 			for _, cpu := range cpus {
 				if j, held := owner[cpu]; held {
-					t.Errorf("cpu %d is placed under guest %d and guest %d", cpu, j, i)
+					shared := fmt.Errorf("cpu %d is placed under guest %d and guest %d", cpu, j, i)
+					guests[j].err = errors.Join(guests[j].err, shared)
+					g.err = errors.Join(g.err, shared)
 				}
 				owner[cpu] = i
 			}
@@ -275,8 +285,17 @@ func TestRealPlacementExperiment(t *testing.T) {
 			// WHAT WAS NOT MEASURED IS LEFT OUT, never written as zero: a reading
 			// the sampler could not take would otherwise compare as a fast, cheap
 			// run.
-			line["sampler_final"] = g.final
-			if s.Measured.CPU && s.Measured.Threads {
+			// SAMPLER_KNOWN IS WHETHER THE MONITOR KNEW THE GUEST AT ALL; how its
+			// last interval was seen, a stuck final read included, is in gaps.
+			line["sampler_known"] = g.final
+			gaps := map[string]bool{}
+			for _, point := range s.Points {
+				if point.Gap != usage.GapNone {
+					gaps[point.Gap.String()] = true
+				}
+			}
+			line["gaps"] = slices.Sorted(maps.Keys(gaps))
+			if s.Measured.Threads {
 				line["guest_cpu_seconds"] = float64(s.Latest.GuestCPU) / 1e6
 				line["vmm_cpu_seconds"] = float64(s.Latest.VMMCPU) / 1e6
 			}
@@ -284,7 +303,7 @@ func TestRealPlacementExperiment(t *testing.T) {
 				line["cgroup_cpu_seconds"] = float64(s.Latest.CPUUsage) / 1e6
 			}
 			if s.Measured.Memory {
-				line["memory_peak_bytes"] = s.Latest.MemoryPeak
+				line["memory_peak_bytes"] = s.MemoryPeak
 			}
 			if s.Measured.Energy {
 				line["energy_active_joules"] = float64(s.EnergyActive) / 1e6
@@ -347,9 +366,35 @@ m.Pool(n).map(copy, range(n))
 '`},
 }
 
-// cgroupConfines refuses a guest whose cgroup does not confine it to exactly
-// the cpus its placement claimed.
-func cgroupConfines(cgroupDir, claimed string) error {
+// cgroupConfines refuses a guest whose VMM, and every thread of it, is not in
+// cgroupDir, or whose cgroupDir does not confine it to exactly the cpus its
+// placement claimed. procRoot is /proc and cgroupRoot the cgroup2 mount on a
+// host.
+//
+// MEMBERSHIP FIRST: a cpuset proves nothing about a VMM that runs outside the
+// cgroup it names.
+func cgroupConfines(procRoot, cgroupRoot string, pid int, cgroupDir, claimed string) error {
+	tasks, err := os.ReadDir(filepath.Join(procRoot, strconv.Itoa(pid), "task"))
+	if err != nil {
+		return fmt.Errorf("list the VMM's threads: %w", err)
+	}
+	for _, task := range tasks {
+		path := filepath.Join(procRoot, strconv.Itoa(pid), "task", task.Name(), "cgroup")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		member := ""
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if rel, ok := strings.CutPrefix(line, "0::"); ok {
+				member = rel
+			}
+		}
+		if member == "" || filepath.Join(cgroupRoot, member) != filepath.Clean(cgroupDir) {
+			return fmt.Errorf("the VMM's thread %s is in cgroup %q, not %s", task.Name(), member, cgroupDir)
+		}
+	}
+
 	raw, err := os.ReadFile(filepath.Join(cgroupDir, "cpuset.cpus.effective"))
 	if err != nil {
 		return fmt.Errorf("read the guest's cpuset: %w", err)

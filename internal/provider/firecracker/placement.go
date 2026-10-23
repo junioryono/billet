@@ -311,7 +311,7 @@ func (p *Provider) claimCPUs(j jail, res resources, vcpus int) (resources, error
 		// and run unpinned rather than share a cpu with it.
 		if !ok {
 			p.log.Warn("a cpu the placement chose was claimed by another process, so the microVM runs on every "+
-				"cpu", "jail", j.id, "cpu", cpu)
+				"cpu", "runner", j.id, "placement", p.cfg.CPUPlacement, "cpu", cpu)
 
 			return res, release()
 		}

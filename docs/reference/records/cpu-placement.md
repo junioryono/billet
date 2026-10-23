@@ -145,7 +145,7 @@ Session 3 then ran 12 guests of 8 vCPUs, 96 of 128 threads, on the compile. `spr
 | 8 guests, `spread` (session 2) | off | 3 | 67.1 s | 9.30 kJ | 17.02 kJ |
 
 - **Under `spread`, boost off made the compile 50% slower at 4 guests and 64% slower at 8, and it used 21% and 19% more package energy and 29% and 28% more at the wall** (p ≤ 0.013). The longer run cost more than the lower clock saved.
-- **Under `compact`, boost off saved 15% of package energy** (p 0.044, two runs each), and its run time was within 1.5% of boost on, with no difference detected (two runs cannot rule out one of a quarter either way). The cycle counters show the clock did drop: 2.42 GHz of cycles per guest-CPU-second with boost off against 3.07 with it on, while each guest used 232 guest-CPU seconds against 187 in the same wall time. So this compile's wall time under `compact` was set by something other than its clock, which may be its SMT siblings; that was not measured.
+- **Under `compact`, boost off saved 15% of package energy** (p 0.044, two runs each), and its run time was within 1.5% of boost on, with no difference detected (two runs cannot rule out one of a quarter either way). The cycle counters show the clock did drop: 2.42 GHz of cycles per guest-CPU-second with boost off against 3.07 with it on, and each guest used 232 guest-CPU seconds against 187, with no difference in wall time detected. What limited this compile's wall time under `compact` was not measured.
 - **So for this compile at 4 and 8 guests under `spread`, where each guest has whole cores, turning boost off was not a saving.** `node.power` turns boost off only while a node is idle, where the section above found no saving, and restores it before a launch.
 
 ### Energy attribution
