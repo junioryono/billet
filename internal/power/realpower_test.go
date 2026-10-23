@@ -216,6 +216,20 @@ func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline c
 	if err != nil {
 		result = errors.Join(result, err)
 	}
+	// THE CONTROLLER'S OWN RESTORE, NOT ONLY THE VALUES: it must end full with its
+	// record gone, or the next launch would restore again from a stale record.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		_, statErr := os.Stat(filepath.Join(stateDir, RecordName))
+		if state(c.st.Load()) == stateFull && errors.Is(statErr, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			result = errors.Join(result, fmt.Errorf("the controller's restore did not end full with its record "+
+				"gone (state %d, record %v)", c.st.Load(), statErr))
+
+			break
+		}
+	}
 
 	policy0 := filepath.Join(sysfs, "devices", "system", "cpu", "cpufreq", "policy0", "scaling_max_freq")
 	return map[string]any{

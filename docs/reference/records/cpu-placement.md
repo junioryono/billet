@@ -43,7 +43,7 @@ Session 2 read each setting three times for 60 s, interleaved and shuffled, 10 s
 - **No setting showed a saving.** In the last round the four package readings were within 0.4 W of each other (69.5 to 69.9 W) and within 0.5 W of the quiet minutes, and the wall readings within 1.2 W. Across all three rounds the differences are not significant (the default against the 1.5 GHz ceiling, 1.9 W apart on average, p 0.51, a 95% interval of −7 to +11 W), so three readings a setting can neither show nor rule out a steady saving from capping a node's frequency while it is idle, which `node.power` does. How a host leaves and enters idle under each setting was not measured.
 - **Every setting read 2 to 7 W higher in the first round,** though the quiet minutes just before it read 70.0 W. What the host was doing then was not measured.
 - **That fits what is known of this chip:** an idle core sits in a C-state whatever its ceiling, and most of the idle draw is outside the cores (about 69 of 73.5 W was uncore in the package's own split in September).
-- **The host idled at 70.1 and 70.0 W in sessions 1 and 2,** as the calibration run at 02:50 had read (69.9 W). Session 3, which began seven minutes after session 2's last guest, read 76.3 W package and 161.3 W wall in its quiet minutes; why was not measured.
+- **The host idled at 70.1 and 70.0 W in sessions 1 and 2,** as the calibration run at 02:50 had read (69.9 W). Session 3, whose quiet minutes began nine minutes after session 2's last guest exited (16:05:27), read 76.3 W package and 161.3 W wall in its quiet minutes; why was not measured.
 
 ### node.power's mechanism on the real host
 
@@ -98,15 +98,15 @@ Session 1, with unpinned guests in place of `packed`:
 - **On the memory copy at 8 guests, `compact` used less energy than `spread`:** 12 to 13% less package energy and 6 to 7% less wall energy for 4% more time, in both sessions (p ≤ 0.012). On this memory-bound load at half the host's threads, packing guests onto fewer cores saved energy, at a small cost in time. On the compile at 4 guests it cost both time and energy.
 - **`spread` against unpinned guests (session 1):** on the compile, `spread`'s mean was 12% shorter at 4 guests and 7% at 8, but unpinned runs varied so much (sd 3.7 to 6.6 s against 0.5 to 0.9 s) that neither difference is significant over three runs (p 0.36 and 0.28). What is shown is that `spread`'s run times were far steadier. On the memory copy at 4 guests, unpinned guests ran 3.5% faster than `spread` (p 0.009).
 - **With 8-vCPU guests, `packed` and `spread` are the same placement on this host:** each gives every guest the 8 cores of one whole CCD (the recorded cpu sets show it), and they ran the same. So this matrix separates nothing between them; session 3 does, below.
-- **The memory workload stalls on memory** (IPC 0.05 to 0.12, about 35 last-level misses per 1,000 instructions); that it is bound by memory bandwidth is an interpretation of those counters, since the harness measures no bandwidth.
+- **The memory workload stalls on memory** (IPC 0.05 to 0.12, and about 35 cache misses per 1,000 instructions as the kernel's generic cache-miss event counts them, which on this chip is not a last-level count); that it is bound by memory bandwidth is an interpretation of those counters, since the harness measures no bandwidth.
 
-### Sharing a CCD's L3 against sharing cores
+### Sharing a CCD against sharing cores
 
 Session 3 used 8 guests of 4 vCPUs, so each placement gives its guests a different layout, as the recorded cpu sets show:
 
-- `spread` gives each guest 4 cores of a CCD of its own: 8 CCDs, no shared L3, no shared cores.
-- `packed` puts two guests in each of 4 CCDs: a shared L3, no shared cores.
-- `compact` puts four guests in each of 2 CCDs, on both threads of 2 cores each: an L3 shared four ways, and shared cores.
+- `spread` gives each guest 4 cores of a CCD of its own: 8 CCDs, nothing of a CCD shared, no shared cores.
+- `packed` puts two guests in each of 4 CCDs: each pair shares its CCD's L3 and the CCD's one link to memory, and no cores.
+- `compact` puts four guests in each of 2 CCDs, on both threads of 2 cores each: a CCD shared four ways, and shared cores.
 
 | Workload | Placement | Run time | sd | Package | Wall | IPC |
 |---|---|---|---|---|---|---|
@@ -117,8 +117,8 @@ Session 3 used 8 guests of 4 vCPUs, so each placement gives its guests a differe
 | memory | packed | 80.0 s | 0.0 | 12.67 kJ | 23.67 kJ | 0.11 |
 | memory | spread | 76.5 s | 0.2 | 12.70 kJ | 23.55 kJ | 0.12 |
 
-- **Sharing a CCD's L3 between two guests made no measurable difference on the compile** (`packed` 1.9% longer than `spread`, p 0.32), and cost 4.6% on the memory copy (p 0.001).
-- **`compact`, which adds shared cores and a more crowded L3, ran 14% and 29% longer than `packed`** on the compile and the memory copy (p ≤ 0.001), and 16% and 35% longer than `spread`. Sharing cores and crowding four guests into one L3 happen together in `compact`, so this does not say how much each one costs.
+- **Sharing a CCD between two guests made no measurable difference on the compile** (`packed` 1.9% longer than `spread`, p 0.32), and cost 4.6% on the memory copy (p 0.001). A CCD shares both its L3 and its link to memory, and this does not say which the memory copy paid for; with a buffer far larger than any L3, the link is the likelier.
+- **`compact`, which adds shared cores and a more crowded CCD, ran 14% and 29% longer than `packed`** on the compile and the memory copy (p ≤ 0.001), and 16% and 35% longer than `spread`. Sharing cores and crowding four guests into one CCD happen together in `compact`, so this does not say how much each one costs.
 - **Leaving whole CCDs idle showed no energy saving:** `packed` left four CCDs with nothing on them, and its package and wall energy were within 1.1% of `spread`'s, with no difference detected (p ≥ 0.24 on both workloads). Why was not measured; that an idle core costs little here whether or not its CCD has work would fit the idle result above, but it was not tested.
 
 ### At 75% of the threads, compact and unpinned showed no difference
@@ -145,21 +145,21 @@ Session 3 then ran 12 guests of 8 vCPUs, 96 of 128 threads, on the compile. `spr
 | 8 guests, `spread` (session 2) | off | 3 | 67.1 s | 9.30 kJ | 17.02 kJ |
 
 - **Under `spread`, boost off made the compile 50% slower at 4 guests and 64% slower at 8, and it used 21% and 19% more package energy and 29% and 28% more at the wall** (p ≤ 0.013). The longer run cost more than the lower clock saved.
-- **Under `compact`, boost off saved 15% of package energy** (p 0.044, two runs each), and its run time was within 1.5% of boost on, with no difference detected (two runs cannot rule out one of a quarter either way). A guest whose cores share SMT siblings may gain little from boost to begin with.
+- **Under `compact`, boost off saved 15% of package energy** (p 0.044, two runs each), and its run time was within 1.5% of boost on, with no difference detected (two runs cannot rule out one of a quarter either way). The cycle counters show the clock did drop: 2.42 GHz of cycles per guest-CPU-second with boost off against 3.07 with it on, while each guest used 232 guest-CPU seconds against 187 in the same wall time. So this compile's wall time under `compact` was set by something other than its clock, which may be its SMT siblings; that was not measured.
 - **So for this compile at 4 and 8 guests under `spread`, where each guest has whole cores, turning boost off was not a saving.** `node.power` turns boost off only while a node is idle, where the section above found no saving, and restores it before a launch.
 
 ### Energy attribution
 
 The harness charges each guest a share of the package energy above an idle baseline it is given, as the node's sampler does: in each interval, the energy above the baseline is shared by each job's share of the host's busy CPU, and the host's own work is left unattributed by design ([measurement validation](../../operating/measurement-validation.md)).
 
-- **Session 1 is the check:** its baseline was the configured 69.7 W, against 70.1 W measured. Over its 40 runs, the energy charged to guests was a mean 0.891 of the package's energy above the baseline (0.772 to 0.976), and 26 runs were inside the kit's per-run tolerance of 0.85 to 1.02.
+- **Session 1 is the check:** its baseline was the configured 69.7 W, against 70.1 W measured. Over its 40 runs, the energy charged to guests was a mean 0.891 of the package's energy above the baseline (0.772 to 0.976), and 26 runs were inside a flat 0.85 to 1.02 band. The kit's own per-run bound is adjusted for each run ([measurement validation](../../operating/measurement-validation.md)) and was not computed here.
 - **Sessions 2 and 3 were given baselines about 9 W too high,** 78.9 and 85.5 W against 70.0 and 76.3 W measured, by the analysis error described below. Their ratios (0.891 and 0.911) are against those baselines, so they are not what billet would attribute at the right one.
 - **What sessions 2 and 3 do show is that the shortfall tracks the host's own CPU.** Their ratio follows the guests' share of the host's busy CPU run by run (r = 0.955 and 0.916), with the guests' cgroups using 0.932 and 0.937 of it, and the compile left more outside them than the memory copy. That follows from how the energy is shared, so it confirms the mechanism rather than testing it independently. It is not the whole of the shortfall: the harness starts sampling a guest only once its launch returns, the sampler leaves a job's last interval unattributed, and it charges nothing for an interval it cannot read consistently, and these results do not record how much each of those missed.
 - **What used that CPU was not measured per process.** On this host the storage cluster serving the guests' disks runs outside every guest's cgroup, and the compile writes far more to disk than the memory copy, so it is the likeliest, but not shown.
 
 ### A correction in this record
 
-An earlier revision of this record read each log row's energy as one second's power and summed the wall's watts as joules. The rows are about 1.15 s apart, so its idle readings were about 9 W too high (it reported a 79 W idle and an unexplained 9 W above the calibration run), and its wall energies were too low by as much as a quarter, which reversed its reading of the memory copy at 8 guests. The session scripts computed the harness's idle baseline the same way, which is why sessions 2 and 3 ran with the baselines above. Every figure here is recomputed with each row's own interval.
+An earlier revision of this record read each log row's energy as one second's power and summed the wall's watts as joules. The rows are about 1.15 s apart, so its idle readings were about 9 W too high (it reported a 79 W idle and an unexplained 9 W above the calibration run), and its wall energies were too low. The interval also stretches under load, to about 1.31 s at 8 guests on the memory copy, so the wall error was larger there than elsewhere, as much as a quarter, which reversed its reading of that configuration. The session scripts computed the harness's idle baseline the same way, which is why sessions 2 and 3 ran with the baselines above. Every figure here is recomputed with each row's own interval.
 
 ## What this does not establish
 
