@@ -746,10 +746,15 @@ func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
 
 	for name, tc := range map[string]struct {
 		fetches int
+		extra   string
 		want    alloc.BuildCache
 	}{
 		"used, and answered from the store the second time": {fetches: 2, want: alloc.BuildCacheWarm},
 		"enabled and never asked":                           {fetches: 0, want: alloc.BuildCacheUnused},
+		// A REQUEST THE STORE NEVER ANSWERS is passed to the registry unread, and
+		// does not ask the cache.
+		"asked only what is passed to the registry": {fetches: 1, extra: "Authorization: Bearer npm_token\r\n",
+			want: alloc.BuildCacheUnused},
 	} {
 		registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
 			w.Header().Set("Cache-Control", "public, max-age=300")
@@ -759,7 +764,7 @@ func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
 		observer := &recordingObserver{}
 		service.SetCacheObserver(observer)
 		for range tc.fetches {
-			npmGet(t, service, credentials, npmRequestLine("/reported"))
+			npmGet(t, service, credentials, npmRequestLine("/reported", tc.extra))
 		}
 		assertNpmQuiet(t, service.npmCache())
 		if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
@@ -859,6 +864,87 @@ func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T
 				t.Errorf("%s: a session that ended during a request reported the npm cache %q, want nothing",
 					held, call.obs.Npm)
 			}
+		}
+	}
+}
+
+// A REQUEST STILL BEING CLASSIFIED WHEN THE JOB ENDS IS NOT "UNUSED" either: a
+// HEAD asks the store whether it holds the entry, and the store's lock can keep
+// it waiting, so the session settles with nothing noted and the request not yet
+// known to be one the store answers.
+func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t *testing.T) {
+	t.Parallel()
+
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, `{"name":"held"}`)
+	})
+	service, credentials := npmService(t, registry)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	// ANOTHER JOB'S FILL, so the entry is held without this session noting it.
+	other, err := service.PrepareScoped("billet-lease-npm-other", CacheSessionScope{
+		Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	npmGet(t, service, other, npmRequestLine("/held"))
+	if got := noted(service, credentials); got != "" {
+		t.Fatalf("another job's fill noted %q for this one", got)
+	}
+
+	store := service.npmCache().store
+	var unlockOnce sync.Once
+	store.mu.Lock()
+	unlock := func() { unlockOnce.Do(store.mu.Unlock) }
+	t.Cleanup(unlock)
+	conn, _ := npmTunnel(t, service, credentials, npmRegistryHost)
+	if _, err := conn.Write([]byte("HEAD /held HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	service.mu.Lock()
+	session := service.byToken[credentials.Token]
+	service.mu.Unlock()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		session.mu.Lock()
+		classifying := session.npmClassifying
+		session.mu.Unlock()
+		if classifying > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the HEAD never reached its classification")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	calls := observer.recorded()
+	unlock()
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set a read deadline: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodHead})
+	if err != nil {
+		t.Fatalf("the HEAD was never answered: %v", err)
+	}
+	_ = resp.Body.Close()
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("the node did not close the connection after answering: %v", err)
+	}
+	assertNpmQuiet(t, service.npmCache())
+
+	if len(calls) == 0 {
+		t.Fatal("the session's end reported nothing")
+	}
+	for _, call := range calls {
+		if call.obs.Npm != "" {
+			t.Errorf("a session that ended while a HEAD was classified reported the npm cache %q, want nothing",
+				call.obs.Npm)
 		}
 	}
 }

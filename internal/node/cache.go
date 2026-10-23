@@ -148,8 +148,10 @@ type cacheSession struct {
 	// npmAsked says a request the npm store may answer arrived, under mu. What
 	// it got is noted when it is answered, a tarball fill's only once its body
 	// is in, and a request cut short notes nothing: either way the cache was
-	// asked, so it is never "unused".
-	npmAsked bool
+	// asked, so it is never "unused". npmClassifying counts requests not yet
+	// known to be one or the other.
+	npmAsked       bool
+	npmClassifying int
 	// building is what each build cache did so far, under mu; reported when the
 	// session ends.
 	building map[config.CacheKind]alloc.BuildCache
@@ -566,8 +568,9 @@ func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
 		}
 		// A REFRESH STILL IN FLIGHT IS NOT "UNUSED": its outcome is noted when it
 		// returns, after this report. Nor is a cache asked for what it never
-		// noted.
-		if kind == config.CacheGit && session.gitPending > 0 || kind == config.CacheNpm && session.npmAsked {
+		// noted, or one a request is still being classified for.
+		if kind == config.CacheGit && session.gitPending > 0 ||
+			kind == config.CacheNpm && (session.npmAsked || session.npmClassifying > 0) {
 			return ""
 		}
 		if sessionSetting(session, kind).Enabled {

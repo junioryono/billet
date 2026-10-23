@@ -154,15 +154,19 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 		return
 	}
 
+	// ASKED BEFORE ANYTHING THAT CAN WAIT: classifying a HEAD waits on the store,
+	// and the policy lookup on the plane, so the request is counted while it is
+	// classified and the session marked asked as it leaves, under one lock. From
+	// there the cache is not "unused" for the job, whether or not what it got is
+	// noted before the session settles.
+	session.mu.Lock()
+	session.npmClassifying++
+	session.mu.Unlock()
 	request, cacheable := classifyNpmRequest(req, n.held)
-	// ASKED BEFORE ANYTHING THAT CAN WAIT, the policy lookup included: from here
-	// the cache is not "unused" for the job, whether or not what it got is noted
-	// before the session settles.
-	if cacheable {
-		session.mu.Lock()
-		session.npmAsked = true
-		session.mu.Unlock()
-	}
+	session.mu.Lock()
+	session.npmClassifying--
+	session.npmAsked = session.npmAsked || cacheable
+	session.mu.Unlock()
 	switch {
 	case !cacheable:
 		n.service.log.Debug("an npm request was passed to the registry", "instance", session.instance,
