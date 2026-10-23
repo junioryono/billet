@@ -112,25 +112,45 @@ func TestRealPlacementExperiment(t *testing.T) {
 	started := time.Now()
 	// THE WAIT ENDS WELL BEFORE THE TEST DOES, so the cleanups that destroy the
 	// guests run before the test binary's own timeout kills it and leaves them.
+	// The launches are held to it too, so a launch stuck in its disk clone cannot
+	// keep the test running past it.
 	waitUntil := started.Add(30 * time.Minute)
-	if deadline, ok := t.Deadline(); ok && deadline.Add(-3*time.Minute).Before(waitUntil) {
-		waitUntil = deadline.Add(-3 * time.Minute)
+	if deadline, ok := t.Deadline(); ok && deadline.Add(-5*time.Minute).Before(waitUntil) {
+		waitUntil = deadline.Add(-5 * time.Minute)
 	}
+	runCtx, cancelRun := context.WithDeadline(ctx, waitUntil)
+	defer cancelRun()
+
+	// EVERY GUEST IS DESTROYED AT ONCE, each within its own bound, so one slow
+	// disk teardown cannot leave another guest's VMM running.
+	t.Cleanup(func() {
+		var teardown sync.WaitGroup
+		for _, g := range guests {
+			if g == nil {
+				continue
+			}
+			teardown.Add(1)
+			go func() {
+				defer teardown.Done()
+				destroyCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 3*time.Minute)
+				defer cancel()
+				if _, err := p.Destroy(destroyCtx, g.name); err != nil {
+					t.Errorf("destroy %s: %v", g.name, err)
+				}
+			}()
+		}
+		teardown.Wait()
+	})
 
 	var wg sync.WaitGroup
 	for i := range vms {
 		g := &guest{name: provider.InstanceName(freshLease(t))}
 		guests[i] = g
-		t.Cleanup(func() {
-			if _, err := p.Destroy(context.WithoutCancel(t.Context()), g.name); err != nil {
-				t.Errorf("destroy %s: %v", g.name, err)
-			}
-		})
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			g.launchedAt = time.Now()
-			inst, err := p.Launch(ctx, provider.Spec{
+			inst, err := p.Launch(runCtx, provider.Spec{
 				Name: g.name, Image: env.image, VCPU: vcpu, Memory: config.ByteSize(vcpu) * config.GiB,
 				Disk: disk, Command: command, Trust: provider.TrustTrusted,
 				JITConfig: "not-a-real-registration",
@@ -141,7 +161,7 @@ func TestRealPlacementExperiment(t *testing.T) {
 				return
 			}
 			g.launched = time.Now()
-			target, err := p.UsageTarget(ctx, inst.ID)
+			target, err := p.UsageTarget(runCtx, inst.ID)
 			if err != nil {
 				g.err = fmt.Errorf("usage target: %w", err)
 
@@ -232,15 +252,23 @@ func TestRealPlacementExperiment(t *testing.T) {
 // Each reboots the guest when it succeeds, which is what ends a Firecracker
 // VMM, and halts it when it fails, which leaves the VMM running for the host to
 // time out.
+//
+// EVERY FALLIBLE STEP IS ITS OWN ASSIGNMENT, under pipefail: `export X=$(...)`
+// answers with export's status and hides the substitution's, which set -e would
+// then never see.
 const workloadEnd = `trap 'if [ $? -eq 0 ]; then sudo -n reboot -f; else sudo -n halt -f; fi' EXIT
-set -e
+set -eo pipefail
 `
 
 var experimentWorkloads = map[string][]string{
-	"gostd": {"/bin/bash", "-c", workloadEnd + `export HOME=/tmp GOTOOLCHAIN=local GOFLAGS=-p=$(nproc) GOCACHE=$(mktemp -d)
-export PATH=$(ls -d /opt/hostedtoolcache/go/1.26*/x64/bin | tail -1):$PATH
-go build -a std
-GOCACHE=$(mktemp -d) go build -a std`},
+	"gostd": {"/bin/bash", "-c", workloadEnd + `gobin=$(ls -d /opt/hostedtoolcache/go/1.26*/x64/bin | tail -1)
+test -x "$gobin/go"
+procs=$(nproc)
+export HOME=/tmp GOTOOLCHAIN=local GOFLAGS=-p=$procs PATH=$gobin:$PATH
+for build in 1 2; do
+	cache=$(mktemp -d)
+	GOCACHE=$cache "$gobin/go" build -a std
+done`},
 	"memory": {"/bin/bash", "-c", workloadEnd + `python3 -c '
 import multiprocessing as m
 def copy(_):

@@ -334,9 +334,12 @@ func TestAnOddCompactGuestsLastCoreIsNotShared(t *testing.T) {
 	for _, cpu := range first {
 		taken[cpu] = true
 	}
-	second := place(twoGroups, config.CPUPlacementCompact, 2, taken)
-	if slices.Contains(second, 5) {
-		t.Fatalf("the next guest %v was given cpu 5, the sibling of a core the first guest holds", second)
+	// ONE vCPU, WHICH THE LEFTOVER SIBLING WOULD FIT, and in the lower group: an
+	// allocator that offered cpu 5 would take it, so only the second group's
+	// first cpu proves the half-held core is kept.
+	if second := place(twoGroups, config.CPUPlacementCompact, 1, taken); !slices.Equal(second, []int{2}) {
+		t.Fatalf("the next 1-vCPU guest = %v, want [2]: cpu 5 is the sibling of a core the first guest holds",
+			second)
 	}
 }
 
