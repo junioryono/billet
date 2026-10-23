@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -340,18 +339,28 @@ func TestLaunchesBehindAStuckRestoreShareIt(t *testing.T) {
 		c, stateDir := newController(t, h, capBoth, nil)
 		capNow(t, c)
 
+		inflight := func() *restoreRun {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+
+			return c.inflight
+		}
+
 		release := stuckWrites(c)
 		c.RestoreBeforeLaunch(t.Context(), "lease-0")
-		before := runtime.NumGoroutine()
+		first := inflight()
+		if first == nil {
+			t.Fatal("no restore is in flight behind the stuck write, so this test proves nothing")
+		}
 		for i := range 5 {
 			started := time.Now()
 			c.RestoreBeforeLaunch(t.Context(), "lease-"+itoa(i+1))
 			if waited := time.Since(started); waited != 2*time.Second {
 				t.Errorf("launch %d waited %s, want its 2s bound", i+1, waited)
 			}
-		}
-		if after := runtime.NumGoroutine(); after != before {
-			t.Errorf("five launches behind one stuck restore left %d goroutines more", after-before)
+			if run := inflight(); run != first {
+				t.Errorf("launch %d started a restore of its own behind the stuck one", i+1)
+			}
 		}
 
 		release()

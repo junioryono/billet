@@ -48,6 +48,15 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 			case "stopPower()":
 				note("defer stop", n.Pos())
 			}
+		case *ast.AssignStmt:
+			// ASSIGNED TO THE closePower BOTH DEFERS CALL, not shadowed or discarded.
+			if n.Tok == token.ASSIGN && len(n.Lhs) == 1 && len(n.Rhs) == 1 &&
+				types.ExprString(n.Lhs[0]) == "closePower" {
+				if call, ok := n.Rhs[0].(*ast.CallExpr); ok && types.ExprString(call.Fun) == "sync.OnceFunc" &&
+					len(call.Args) == 1 && closesOnce(call.Args[0]) {
+					note("closePower = sync.OnceFunc", n.Pos())
+				}
+			}
 		case *ast.CallExpr:
 			switch name := types.ExprString(n.Fun); name {
 			case "openNodePower":
@@ -63,10 +72,6 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 					types.ExprString(n.Args[3]) == "closePower" {
 					note(name, n.Pos())
 				}
-			case "sync.OnceFunc":
-				if len(n.Args) == 1 && closesOnce(n.Args[0]) {
-					note(name, n.Pos())
-				}
 			case "startNodeCache", "NewNodeRunner", "RunNodeLoop":
 				note(name, n.Pos())
 			}
@@ -75,7 +80,7 @@ func TestNodeRunWiresTheIdlePowerPolicy(t *testing.T) {
 		return true
 	})
 
-	order := []string{"openNodePower", "sync.OnceFunc", "defer close", "startNodeCache", "node.WithPower",
+	order := []string{"openNodePower", "closePower = sync.OnceFunc", "defer close", "startNodeCache", "node.WithPower",
 		"NewNodeRunner", "runNodePower", "defer stop", "RunNodeLoop"}
 	for i, name := range order {
 		if _, ok := at[name]; !ok {
