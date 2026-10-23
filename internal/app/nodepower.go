@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -111,8 +112,22 @@ func openNodePower(ctx context.Context, cfg *config.Config, root, goos string, o
 		return nil, err
 	}
 
+	// THE HOST'S CPUFREQ IS CLAIMED FOR THE NODE'S LIFE, by a node that caps: a
+	// second node on this host with node.power would fight it, and is refused.
+	if err := ctrl.ClaimHost(); err != nil {
+		if cfg.Node.Power != nil {
+			return nil, fmt.Errorf("node.power: %w; only one node on a host may run node.power", err)
+		}
+		slog.Default().Warn("another process on this host holds its cpufreq; a cap an earlier process of "+
+			"this node left stays recorded until this node can claim it", "error", err)
+
+		return nil, nil //nolint:nilnil // no policy is a state, not an error
+	}
+
 	restoreErr := ctrl.Restore(ctx, "start")
 	if cfg.Node.Power == nil && restoreErr == nil {
+		ctrl.ReleaseHost()
+
 		return nil, nil //nolint:nilnil // no policy is a state, not an error
 	}
 
@@ -121,6 +136,8 @@ func openNodePower(ctx context.Context, cfg *config.Config, root, goos string, o
 		// would give it.
 		if restoreErr != nil {
 			closeNodePower(ctx, ctrl)
+		} else {
+			ctrl.ReleaseHost()
 		}
 
 		return nil, fmt.Errorf("node.power: %w", err)
@@ -170,8 +187,13 @@ func runNodePower(ctx context.Context, ctrl *power.Controller, idle func() bool,
 }
 
 // restoreLeftoverPower restores a cap an earlier node process left, on Linux,
-// the moment the node holds its lock, telling observer what it did. A failure
-// is logged, and Node.Run's policy retries it.
+// telling observer what it did. A failure is logged, and Node.Run's policy
+// retries it.
+//
+// UNDER THE HOST'S CPUFREQ LOCK, which every live controller holds: taking it
+// proves no process on this host has a cap in force, so the record is this
+// node's leftover whatever else has not yet been proved about this start. One
+// that cannot be taken leaves the record for later.
 func restoreLeftoverPower(cfg *config.Config, root, goos string, observer power.Observer) {
 	if goos != "linux" {
 		return
@@ -180,7 +202,17 @@ func restoreLeftoverPower(cfg *config.Config, root, goos string, observer power.
 	ctrl, err := power.New(power.Options{SysfsRoot: root, StateDir: cfg.Node.StateDir, Log: slog.Default(),
 		Observer: observer})
 	if err == nil {
-		err = ctrl.RestoreLeftover()
+		err = ctrl.ClaimHost()
+		if err == nil {
+			defer ctrl.ReleaseHost()
+			err = ctrl.RestoreLeftover()
+		}
+	}
+	if errors.Is(err, power.ErrHostHeld) {
+		slog.Default().Warn("another process on this host holds its cpufreq; a cap an earlier process of this "+
+			"node left stays recorded until this node can claim it", "error", err)
+
+		return
 	}
 	if err != nil {
 		slog.Default().Error("could not restore the CPU ceiling an earlier node process left; this node "+

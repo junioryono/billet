@@ -124,6 +124,9 @@ func capAndRestoreOnce(t *testing.T, sysfs string, settings Settings, baseline c
 	if err := c.CheckHost(); err != nil {
 		return nil, fmt.Errorf("CheckHost: %w", err)
 	}
+	if err := c.ClaimHost(); err != nil {
+		return nil, fmt.Errorf("ClaimHost: %w", err)
+	}
 
 	var idle atomic.Bool
 	idle.Store(true)

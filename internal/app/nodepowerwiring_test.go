@@ -103,8 +103,9 @@ func render(t *testing.T, fset *token.FileSet, stmt ast.Stmt) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
-// OPENNODE RESTORES A LEFTOVER BEFORE IT BUILDS ANYTHING THAT CAN REFUSE THE
-// START, and only for a node that is not a probe.
+// OPENNODE RESTORES A LEFTOVER BEFORE ANYTHING THAT CAN REFUSE THE START, its
+// certificate and its deployment lock included, and only for a node that is not
+// a probe.
 func TestOpenNodeRestoresALeftoverBeforeTheProvider(t *testing.T) {
 	t.Parallel()
 
@@ -114,7 +115,7 @@ func TestOpenNodeRestoresALeftoverBeforeTheProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var restore, open, claim, ending token.Pos
+	var restore, bundle, open, claim, ending token.Pos
 	var guarded bool
 	for _, d := range file.Decls {
 		fn, ok := d.(*ast.FuncDecl)
@@ -125,7 +126,7 @@ func TestOpenNodeRestoresALeftoverBeforeTheProvider(t *testing.T) {
 			if ifs, ok := n.(*ast.IfStmt); ok && types.ExprString(ifs.Cond) == "!opts.Probe" {
 				for _, s := range ifs.Body.List {
 					if es, ok := s.(*ast.ExprStmt); ok &&
-						types.ExprString(es.X) == "restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS, n.leftoverPower)" {
+						types.ExprString(es.X) == "restoreLeftoverPower(cfg, sysfsRoot, runtime.GOOS, leftover)" {
 						guarded, restore = true, es.Pos()
 					}
 				}
@@ -136,6 +137,8 @@ func TestOpenNodeRestoresALeftoverBeforeTheProvider(t *testing.T) {
 					if open == 0 {
 						open = call.Pos()
 					}
+				case "NodeBundle":
+					bundle = call.Pos()
 				case "ClaimNodeDeployment":
 					claim = call.Pos()
 				case "beginNodeEnding":
@@ -146,12 +149,13 @@ func TestOpenNodeRestoresALeftoverBeforeTheProvider(t *testing.T) {
 			return true
 		})
 	}
-	if !guarded || open == 0 || claim == 0 || ending == 0 {
-		t.Fatalf("OpenNode lost its leftover restore under !opts.Probe (%v), its claim, ending or open "+
-			"(%v, %v, %v)", guarded, claim, ending, open)
+	if !guarded || bundle == 0 || open == 0 || claim == 0 || ending == 0 {
+		t.Fatalf("OpenNode lost its leftover restore under !opts.Probe (%v), its bundle, claim, ending or "+
+			"open (%v, %v, %v, %v)", guarded, bundle, claim, ending, open)
 	}
-	if restore <= claim {
-		t.Error("OpenNode restores a leftover cap before it holds the lock, while another node may hold it")
+	if restore >= bundle || restore >= claim {
+		t.Error("OpenNode reads its certificate or takes its deployment lock before it restores a leftover " +
+			"cap, so either refusing leaves the host capped")
 	}
 	if restore >= ending || restore >= open {
 		t.Error("OpenNode records its ending or builds its provider before it restores a leftover cap")

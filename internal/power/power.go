@@ -160,7 +160,72 @@ type Controller struct {
 	// failing and logged date a streak of failed restores and its last line.
 	// Under sem.
 	failing, logged time.Time
+	// owed is what this process's own cap in force recorded, so a record that
+	// vanishes or rots while it is in force is still restored. Under sem.
+	owed *record
+
+	// host holds the host's cpufreq lock once ClaimHost has taken it. Under mu.
+	host *os.File
 }
+
+// ErrHostHeld is ClaimHost's answer when another process holds the host's
+// cpufreq.
+var ErrHostHeld = errors.New("power: another process on this host holds its cpufreq")
+
+// ClaimHost takes the host's cpufreq for this controller until ReleaseHost or
+// Close: an exclusive flock on the cpufreq directory itself. A controller writes
+// nothing without it.
+//
+// ONE CONTROLLER PER HOST, WHATEVER ITS DEPLOYMENT: cpufreq is the host's, and a
+// second controller would record the first's cap as its baseline and write it
+// back. The lock is on the directory the writes go to, so it needs no path of
+// its own, and the kernel drops it with its holder (measured on the reference
+// host, Linux 7.0, 2026-10-23: a second process's LOCK_NB is refused with
+// EAGAIN, and granted once the first closes its descriptor).
+func (c *Controller) ClaimHost() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.host != nil {
+		return nil
+	}
+	f, err := os.Open(c.cpufreq())
+	if err != nil {
+		return fmt.Errorf("power: open %s to claim it: %w", c.cpufreq(), err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("%w: %s is locked", ErrHostHeld, c.cpufreq())
+		}
+
+		return fmt.Errorf("power: lock %s: %w", c.cpufreq(), err)
+	}
+	c.host = f
+
+	return nil
+}
+
+// ReleaseHost gives the host's cpufreq back.
+func (c *Controller) ReleaseHost() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.host != nil {
+		_ = c.host.Close()
+		c.host = nil
+	}
+}
+
+func (c *Controller) claimed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.host != nil
+}
+
+// errUnclaimed refuses a write by a controller that has not claimed the host.
+var errUnclaimed = errors.New("power: this controller has not claimed the host's cpufreq, so it writes nothing")
 
 // New builds a controller; it reads and writes nothing until asked.
 func New(opts Options) (*Controller, error) {
@@ -573,6 +638,10 @@ func (c *Controller) restoreWrites(rec record) []write {
 // apply writes every value, then reads every one back. A write that fails does
 // not stop the others: a restore puts back as much as it can.
 func (c *Controller) apply(writes []write) error {
+	if !c.claimed() {
+		return errUnclaimed
+	}
+
 	var errs []error
 	for _, w := range writes {
 		// A SWITCH ALREADY AT ITS VALUE IS NOT WRITTEN: the kernel refuses a
@@ -630,6 +699,14 @@ func (c *Controller) restoreLocked(reason string) (bool, error) {
 	}
 
 	rec, found, err := c.loadRecord()
+	// THIS PROCESS'S OWN CAP IS RESTORED FROM WHAT IT HOLDS when its record has
+	// gone or cannot be read: either would otherwise call a capped host full,
+	// or leave it capped until the record is mended.
+	if c.owed != nil && (err != nil || !found) {
+		c.log.Error("the record of the cap in force is missing or unreadable; restoring from what this "+
+			"process holds", "record", c.recordPath(), "error", err)
+		rec, found, err = *c.owed, true, nil
+	}
 	if err != nil {
 		c.st.Store(int32(stateUnknown))
 		c.restoreFailed(reason, err)
@@ -659,6 +736,7 @@ func (c *Controller) restoreLocked(reason string) (bool, error) {
 	}
 
 	c.st.Store(int32(stateFull))
+	c.owed = nil
 	c.observer.PowerChanged(TransitionRestore, OutcomeOK)
 	c.restoreSucceeded()
 
@@ -691,6 +769,9 @@ func (c *Controller) restoreSucceeded() {
 // capLocked lowers the ceiling: the record first, then the writes. Requires
 // sem and stateFull. A cap that fails part way is restored at once.
 func (c *Controller) capLocked(idleFor time.Duration) error {
+	if !c.claimed() {
+		return errUnclaimed
+	}
 	if _, found, err := c.loadRecord(); err != nil || found {
 		// A RECORD IS ALREADY THERE, or none can be read: either way the values
 		// on the host may not be the baseline, and capping now would record a
@@ -724,6 +805,7 @@ func (c *Controller) capLocked(idleFor time.Duration) error {
 
 		return err
 	}
+	c.owed = &rec
 
 	if err := c.apply(writes); err != nil {
 		c.observer.PowerChanged(TransitionCap, OutcomeFailed)
@@ -780,6 +862,13 @@ func (c *Controller) plan() (record, []write, error) {
 		if c.settings.DisableBoost {
 			switch b, err := readSysfs(c.policyPath(p, "boost")); {
 			case err == nil:
+				// BOOST OFF IS NOT ITS FULL, for the reason a lowered ceiling is not:
+				// another process's cap or an operator's setting, which recording
+				// would keep after it lifted.
+				if b != "1" {
+					return record{}, nil, fmt.Errorf("power: %s's boost reads %q, not on: another cap or an "+
+						"operator's setting may be in force, so nothing is capped", p, b)
+				}
 				pr.Boost = b
 			case !errors.Is(err, fs.ErrNotExist):
 				return record{}, nil, err
@@ -797,10 +886,12 @@ func (c *Controller) plan() (record, []write, error) {
 		if err != nil {
 			return record{}, nil, err
 		}
-		rec.Boost = b
-		if b != "0" {
-			writes = append(writes, write{c.boostPath(), "0", true})
+		if b != "1" {
+			return record{}, nil, fmt.Errorf("power: %s reads %q, not on: another cap or an operator's "+
+				"setting may be in force, so nothing is capped", c.boostPath(), b)
 		}
+		rec.Boost = b
+		writes = append(writes, write{c.boostPath(), "0", true})
 	}
 
 	return rec, writes, nil
@@ -1059,6 +1150,7 @@ func (c *Controller) step(ctx context.Context, idle func() bool) {
 // it once its loop has returned.
 func (c *Controller) Close(ctx context.Context) error {
 	c.BeginStop()
+	defer c.ReleaseHost()
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.stopBound)
 	defer cancel()

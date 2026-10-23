@@ -207,6 +207,11 @@ func newController(t *testing.T, h *fakeHost, s Settings, o Observer) (*Controll
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A HOST WITH NO CPUFREQ HAS NOTHING TO CLAIM, which CheckHost's cases need.
+	if err := c.ClaimHost(); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.ReleaseHost)
 
 	return c, stateDir
 }
@@ -449,11 +454,17 @@ func TestALeftoverCapIsRestoredAtStart(t *testing.T) {
 	capNow(t, first)
 	h.requireCapped(stateDir)
 
-	// THE FIRST PROCESS DIED HERE. Its successor has no node.power at all.
+	// THE FIRST PROCESS DIED HERE, and the kernel dropped its lock. Its
+	// successor has no node.power at all.
+	first.ReleaseHost()
 	next, err := New(Options{SysfsRoot: h.root, StateDir: stateDir, Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := next.ClaimHost(); err != nil {
+		t.Fatal(err)
+	}
+	defer next.ReleaseHost()
 	if err := next.Restore(t.Context(), "start"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
