@@ -74,6 +74,11 @@ type Destination struct {
 	// Sent and Received are from the guest's side.
 	Sent, Received uint64
 	Connections    uint64
+	// Unanswered is how many of those connections the guest sent on and got no
+	// packet back from: a TCP connect whose SYN nothing answered, or a datagram,
+	// a DNS query among them, that drew no reply. Where a job stalled before it
+	// reached anyone, this is the count that names the destination.
+	Unanswered uint64
 }
 
 // Result is what a job's flows came to.
@@ -89,6 +94,11 @@ type Result struct {
 	// guest's traffic joined an entry its address's previous holder left, or
 	// its address changed. The totals are then a lower bound, and say so.
 	Incomplete bool
+	// UnansweredUnknown says a flow of the job's, or an entry its address's
+	// previous holder left, carried no packet counts in either direction, which
+	// no flow has while the tracker keeps them, so no destination's Unanswered
+	// can be told from none.
+	UnansweredUnknown bool
 }
 
 // Accountant attributes flows to watched jobs. Safe for concurrent use: the
@@ -108,6 +118,10 @@ type Accountant struct {
 	// time: whose it was cannot be told, so every job granted before then may
 	// have lost it.
 	evictedUnstamped time.Time
+	// evictedCounterless is the latest start of a flow the ring dropped that
+	// carried no packet counts, or when it dropped one with no start: a job
+	// granted its address at or before it may have lost a stall with it.
+	evictedCounterless time.Time
 	// down says the tracker's events are not being read now, and lossEnded
 	// when the latest such gap closed: a job whose time overlaps either may be
 	// missing flows.
@@ -132,6 +146,11 @@ type watch struct {
 	// so it cannot be counted, only noticed.
 	inherited  map[entry]Flow
 	incomplete bool
+	// unansweredUnknown says a flow that could be the job's and was not
+	// counted carried no packet counts: an entry the previous holder left open,
+	// whose tuple the guest could reuse unnoticed, a flow with no start time,
+	// one past MaxFlows, or one the unclaimed ring dropped.
+	unansweredUnknown bool
 }
 
 // NewAccountant returns an Accountant watching nothing.
@@ -170,6 +189,9 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 	if a.down || !a.lossEnded.Before(since) || !a.evictedStart.Before(since) ||
 		!a.evictedUnstamped.Before(since) {
 		w.incomplete = true
+	}
+	if !a.evictedCounterless.Before(since) {
+		w.unansweredUnknown = true
 	}
 
 	for i := range open {
@@ -222,6 +244,7 @@ func (a *Accountant) observe(f Flow) {
 	// holder's, and counting it either way would be a guess.
 	if f.Start.IsZero() {
 		w.incomplete = true
+		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
 	}
@@ -233,8 +256,15 @@ func (a *Accountant) observe(f Flow) {
 		// TRAFFIC IS INSIDE IT: only the address's holder sends from it, and the
 		// old holder's VM is gone. What came back is no evidence, since a remote
 		// goes on answering a guest that has left.
-		if base, inherited := w.inherited[key]; inherited && f.OrigPackets > base.OrigPackets {
-			w.incomplete = true
+		// AN INHERITED ENTRY WITH NO PACKET COUNTS hides that reuse altogether,
+		// so a stall on its tuple could not be noticed. Only an entry open when
+		// the job was watched is inherited: one already destroyed is no tuple
+		// the guest can send on.
+		if base, inherited := w.inherited[key]; inherited {
+			if f.OrigPackets > base.OrigPackets {
+				w.incomplete = true
+			}
+			w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&base)
 		}
 
 		return
@@ -248,6 +278,7 @@ func (a *Accountant) observe(f Flow) {
 	prev, seen := w.counted[key]
 	if !seen && len(w.counted) >= MaxFlows {
 		w.incomplete = true
+		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
 	}
@@ -268,11 +299,21 @@ func (a *Accountant) keepUnclaimed(f Flow) {
 		return
 	}
 
-	switch dropped := a.unclaimed[a.next].Start; {
+	evicted := &a.unclaimed[a.next]
+	switch dropped := evicted.Start; {
 	case dropped.IsZero():
 		a.evictedUnstamped = a.now()
 	case dropped.After(a.evictedStart):
 		a.evictedStart = dropped
+	}
+	if uncountedPackets(evicted) {
+		at := evicted.Start
+		if at.IsZero() {
+			at = a.now()
+		}
+		if at.After(a.evictedCounterless) {
+			a.evictedCounterless = at
+		}
 	}
 
 	a.unclaimed[a.next] = f
@@ -348,8 +389,14 @@ func (a *Accountant) Final(key string, open []Flow, until time.Time) (Result, bo
 	return summarize(w), true
 }
 
+// uncountedPackets says the tracker kept no packet counts for f: a flow begins
+// with its originator's packet, so none counted in either direction is
+// accounting that was off, not traffic that was absent.
+func uncountedPackets(f *Flow) bool { return f.OrigPackets == 0 && f.ReplyPackets == 0 }
+
 func summarize(w *watch) Result {
 	byDest := map[netip.Addr]*Destination{}
+	unknown := w.unansweredUnknown
 
 	for id := range w.counted {
 		f := w.counted[id]
@@ -363,6 +410,16 @@ func summarize(w *watch) Result {
 		d.Sent += f.OrigBytes
 		d.Received += f.ReplyBytes
 		d.Connections++
+		// UNANSWERED ONLY WHERE THE GUEST'S OWN PACKETS WERE COUNTED: a flow
+		// begins with the guest's packet, so one with none counted either way is
+		// a tracker that kept no counts, and the whole result cannot say what
+		// went unanswered.
+		switch {
+		case uncountedPackets(&f):
+			unknown = true
+		case f.OrigPackets > 0 && f.ReplyPackets == 0:
+			d.Unanswered++
+		}
 	}
 
 	all := make([]Destination, 0, len(byDest))
@@ -380,13 +437,14 @@ func summarize(w *watch) Result {
 		return x.Addr.Compare(y.Addr)
 	})
 
-	r := Result{Incomplete: w.incomplete}
+	r := Result{Incomplete: w.incomplete, UnansweredUnknown: unknown}
 
 	if len(all) > MaxDestinations {
 		for _, d := range all[MaxDestinations:] {
 			r.Other.Sent += d.Sent
 			r.Other.Received += d.Received
 			r.Other.Connections += d.Connections
+			r.Other.Unanswered += d.Unanswered
 		}
 
 		all = all[:MaxDestinations]

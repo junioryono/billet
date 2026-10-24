@@ -167,12 +167,13 @@
 {{- else}}
 <p>{{.Summary}}</p>
 {{- if .Rows}}
+{{- $counted := .Counted}}
 <div class="scroll">
 <table>
-<thead><tr><th>Address</th><th>Sent</th><th>Received</th><th>Connections</th></tr></thead>
+<thead><tr><th>Address</th><th>Sent</th><th>Received</th><th>Connections</th>{{if $counted}}<th>Unanswered</th>{{end}}</tr></thead>
 <tbody>
 {{- range .Rows}}
-<tr><th scope="row">{{.Addr}}</th><td>{{.Sent}}</td><td>{{.Received}}</td><td>{{.Connections}}</td></tr>
+<tr><th scope="row">{{.Addr}}</th><td>{{.Sent}}</td><td>{{.Received}}</td><td>{{.Connections}}</td>{{if $counted}}<td>{{.Unanswered}}</td>{{end}}</tr>
 {{- end}}
 </tbody>
 </table>
@@ -183,6 +184,7 @@
 {{- end}}
 <dl class="fields">
 <dt>other</dt><dd>{{.Other}}</dd>
+<dt>unanswered</dt><dd>{{.Unanswered}}</dd>
 <dt>complete</dt><dd>{{.Complete}}</dd>
 <dt>tap</dt><dd>{{.Tap}}</dd>
 </dl>

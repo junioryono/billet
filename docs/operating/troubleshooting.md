@@ -64,6 +64,12 @@ The failure mode of this system is a job that queues rather than an error. Start
 | `ValidationException` from Parameter Store at staging | a standard parameter caps at 4096 characters and a JIT config exceeds it | billet asks for Intelligent-Tiering; a policy that forbids it breaks every launch |
 | `command-missing` in the node log | the tier's `command` does not exist in the guest | fix the tier's command; billet does not retry it, because a retry burns the node's slot for ten minutes |
 
+## A job stalls
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| a step waits minutes where it took seconds, or until its timeout, and its log names nothing it was waiting for | the guest sent on connections nothing answered: a SYN with no reply, or a datagram, a DNS query among them, that drew none | on a firecracker node with `node.monitoring.flows`, `billet jobs show <lease>`: its `unanswered` line names every destination with a connection that got nothing back, the most first, even one too small for the table; a resolver at the node's address is the job's DNS, and an address outside the site is the job's own traffic. `not counted` is a node, or a control plane, older than the count, or a connection tracker that kept no packet counts, and says nothing either way |
+
 ## Capacity that does not come back
 
 | Symptom | Cause | Fix |
