@@ -585,10 +585,21 @@ func (m *Monitor) tick() {
 		if c, ok := counted[key]; ok {
 			j.counters = c
 		}
+		// A TICK IS FOLDED only while the span since the last tick that read
+		// everything can still be shared, under staleAfter intervals; past that,
+		// the energy is broken, and the series keeps its points as ever.
+		folded := false
 		switch {
 		case !m.shares() || j.byProcess:
+		case readFailed && (m.energyTick.IsZero() || now.Sub(m.energyTick) >= staleAfter*m.opts.Interval):
+			j.energyBroken = true
 		case readFailed:
-			j.energyPending = true
+			j.energyPending, folded = true, true
+			// WHAT THE READS THAT DID ANSWER SHOW IS KEPT: a counter seen to fall,
+			// or a host seen to change shape, is not mended by folding the span.
+			if m.discontinuity(*s, j, host, hostErr, energy, energyErr) {
+				j.energyBroken = true
+			}
 		default:
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
@@ -620,6 +631,11 @@ func (m *Monitor) tick() {
 			cause = GapFailedRead
 		case stalled[key]:
 			cause = GapSlowRead
+		// A FOLDED TICK KEEPS NO POINT FOR THE JOB: the point would hold the
+		// energy before the span, and the next one all of it, so the interval is
+		// marked unseen and the recovery's point spans both.
+		case folded:
+			cause = GapFailedRead
 		}
 		if kept := j.keepPoint(cause, readAt[key], m.opts.Interval); kept != GapNone {
 			m.observeGaps(kept, 1)
@@ -669,6 +685,21 @@ var errNoRAPL = errors.New("usage: neither rapl nor a meter is configured")
 // shares reports whether the monitor reads an energy it shares among jobs: the
 // package counter or the wall.
 func (m *Monitor) shares() bool { return m.opts.RAPL || m.opts.Meter != nil }
+
+// discontinuity reports whether the reads a folded tick did take show the span
+// cannot be shared: the job's CPU fell below its baseline, the host's busy time
+// fell or its processor count changed, or the package counter's range changed.
+// Called with mu held.
+func (m *Monitor) discontinuity(s Sample, j *job, host HostCPU, hostErr error, e Energy, energyErr error) bool {
+	if s.CPUOK && j.lastCPUOK && s.CPUUsage < j.lastCPU {
+		return true
+	}
+	if hostErr == nil && m.hostOK && (host.CPUs != m.host.CPUs || host.Busy < m.host.Busy) {
+		return true
+	}
+
+	return m.opts.RAPL && m.opts.Meter == nil && energyErr == nil && m.energyOK && e.MaxRange != m.energy.MaxRange
+}
 
 // energySince returns the package energy between the last committed reading and
 // e, read at now; the tick commits e only if all its host-wide reads answered.
