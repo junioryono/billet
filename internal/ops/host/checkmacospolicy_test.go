@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // THE POLICY LINE SAYS WHAT A codebuild NODE CAN RUN, NOT WHAT A tart NODE CAN.
@@ -41,6 +43,12 @@ func TestTheCheckPolicyLineReportsACodeBuildMacOSLimit(t *testing.T) {
 	// A control-plane config that DESCRIBES a codebuild node without BEING one, so
 	// the policy line is rendered and no AWS call is made: the live CodeBuild check
 	// runs only for a config whose own node is codebuild.
+	//
+	// SEEDED, as writeCheckConfig's is: a check that migrated an empty ledger
+	// spent its open's thirty-second startup budget on a loaded runner (#188,
+	// CI 2026-10-09 and twice on 2026-10-11).
+	ledgertest.Seed(t, filepath.Join(dir, "server"))
+
 	cfgPath := filepath.Join(dir, "billet.yaml")
 	body := fmt.Sprintf(`server:
   listen: 127.0.0.1:7717

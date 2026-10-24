@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 32
+	Version = 33
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -431,6 +431,26 @@ const (
 	// WHERE IT IS READ too, so a pairing that negotiated below it and sends one
 	// anyway has the observation kept without it.
 	VersionNpmObservation = 32
+
+	// VersionImageAcceptance is the version from which a registration's answer
+	// carries the licensed image components the control plane's images.accept
+	// names (RegisterResponse's images_accept, #584), which the node records so a
+	// license accepted once in the control plane's config completes every node's
+	// generations.
+	//
+	// NEITHER REFUSED NOR REPORTED: an older node decodes the answer leniently and
+	// ignores the field, completing generations with its own images.accept as it
+	// always did. CHECKED WHERE IT IS SENT, so an answer below it stays the bytes it
+	// was, and WHERE IT IS READ, because an absent field is "accepts none" only from
+	// a plane that would have sent one: below it the node records that its control
+	// plane does not say.
+	//
+	// THE NAMES ARE WIRE VOCABULARY. A node refuses to complete or promote a
+	// generation while its control plane accepts a component its build does not
+	// install, so a new config.ImageComponent is accepted in a control plane's
+	// config only once every node runs a build that installs it; until then the
+	// image commands of an older node refuse, naming the component.
+	VersionImageAcceptance = 33
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -706,6 +726,9 @@ type RegisterResponse struct {
 	// PollSeconds bounds a command long-poll, so a node and a server agree on
 	// when silence means "nothing to do" rather than "the connection is dead".
 	PollSeconds int `json:"poll_seconds"`
+	// ImagesAccept is what the control plane's images.accept names, sorted, from
+	// VersionImageAcceptance. Absent at that version means it accepts none.
+	ImagesAccept []string `json:"images_accept,omitempty"`
 }
 
 // HeaderIncarnation carries the node process's identity on every request.

@@ -366,15 +366,19 @@ func TestCacheOutcomesAreCountedPerTier(t *testing.T) {
 
 	a := pricedCloudAllocator(t, 340_000)
 	before := time.Now().Add(-time.Minute)
-	for _, git := range []BuildCache{BuildCacheWarm, BuildCacheWarm, ""} {
+	for i, git := range []BuildCache{BuildCacheWarm, BuildCacheWarm, ""} {
 		lease, err := a.Reserve(t.Context(), "cloud")
 		if err != nil {
 			t.Fatalf("Reserve: %v", err)
 		}
 		launched(t, a, lease, "cloud-1")
 		if git != "" {
+			npm := BuildCacheCold
+			if i == 0 {
+				npm = BuildCacheUnavailable
+			}
 			if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch,
-				CacheObservation{BuildCaches: BuildCaches{Git: git}}); err != nil {
+				CacheObservation{BuildCaches: BuildCaches{Git: git, Npm: npm}}); err != nil {
 				t.Fatalf("RecordCacheObservation: %v", err)
 			}
 		}
@@ -387,7 +391,9 @@ func TestCacheOutcomesAreCountedPerTier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CacheOutcomes: %v", err)
 	}
-	if jobs != 3 || counts["cloud"]["git"][string(BuildCacheWarm)] != 2 || counts["cloud"]["git"][""] != 1 {
+	if jobs != 3 || counts["cloud"]["git"][string(BuildCacheWarm)] != 2 || counts["cloud"]["git"][""] != 1 ||
+		counts["cloud"]["npm"][string(BuildCacheCold)] != 1 ||
+		counts["cloud"]["npm"][string(BuildCacheUnavailable)] != 1 || counts["cloud"]["npm"][""] != 1 {
 		t.Fatalf("counted %d jobs: %v", jobs, counts)
 	}
 	if _, jobs, err := a.CacheOutcomes(t.Context(), time.Now().Add(time.Minute), 100); err != nil || jobs != 0 {

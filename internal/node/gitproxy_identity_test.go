@@ -36,6 +36,11 @@ func TestARecreatedRepositorysObjectsAreNeverServed(t *testing.T) {
 	}
 	path := service.git.mirrorPath("untrusted/acme/api")
 	first := upstream.repositoryID("api")
+	// READ ONCE THE MIRROR'S FETCH HAS ENDED, here and after the name changes
+	// hands: under refreshWait's two seconds a loaded runner answers the clone
+	// from upstream while the fetch goes on, and the stamp is not yet written
+	// (#188, CI 2026-10-23).
+	gitSettled(t, service, "the first mirror's refresh")
 	if stamped, _, err := mirrorRepository(path); err != nil || stamped != first {
 		t.Fatalf("the mirror is stamped %d (%v), want the repository's id %d", stamped, err, first)
 	}
@@ -50,6 +55,7 @@ func TestARecreatedRepositorysObjectsAreNeverServed(t *testing.T) {
 		t.Fatalf("ls-remote: %v\n%s", err, output)
 	}
 	second := upstream.repositoryID("api")
+	gitSettled(t, service, "the replacement mirror's refresh")
 	if stamped, _, err := mirrorRepository(path); err != nil || stamped != second {
 		t.Fatalf("the mirror is stamped %d (%v) after the name changed hands, want %d", stamped, err, second)
 	}
@@ -167,6 +173,10 @@ func failMidAnswer(t *testing.T, behaviour string) {
 	if output, err := git("-C", "c", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(output) != pushed {
 		t.Fatalf("the pull is at %q (%v), want %s", output, err, pushed)
 	}
+	// READ ONCE THE REPLACEMENT'S REFRESH HAS ENDED, not when the pull returns:
+	// the pull can be answered while the new mirror's fetch is still verifying
+	// it, which under CI's load read as an unverified mirror (#188, 2026-10-24).
+	gitSettled(t, service, "the replacement mirror's refresh")
 	if stamped, _, err := mirrorRepository(path); err != nil || stamped != upstream.repositoryID("api") {
 		t.Fatalf("the mirror after the broken one reads %d, %v; want a verified mirror of the repository", stamped, err)
 	}

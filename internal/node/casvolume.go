@@ -135,8 +135,11 @@ func (s *CacheService) casVolume(
 		return hv, nil
 	}
 	setting := sessionSetting(session, kind)
-	if !setting.Enabled || !s.sessionKindAllowed(ctx, session, kind) {
+	if !setting.Enabled {
 		return nil, errCacheOff
+	}
+	if err := casPolicyErr(s.sessionKindPolicy(ctx, session, kind)); err != nil {
+		return nil, err
 	}
 
 	if retryAt, failed := session.casRetryAt[kind]; failed && s.now().Before(retryAt) {
@@ -266,6 +269,23 @@ func (s *CacheService) startFresh(
 }
 
 var errCacheOff = errors.New("this cache is off for this job")
+
+// errCachePolicyUnknown is a kill switch that could not be read: the cache is
+// not used, and what it did is unavailable, not disabled.
+var errCachePolicyUnknown = errors.New("the cache kill switch could not be read")
+
+// casPolicyErr is the error a content-addressed cache answers for a kill
+// switch's answer, nil when it allows the cache.
+func casPolicyErr(answer policyAnswer) error {
+	switch answer {
+	case policyAllowed:
+		return nil
+	case policyRefused:
+		return errCacheOff
+	default:
+		return errCachePolicyUnknown
+	}
+}
 
 // serveCAS answers one content-addressed cache request:
 // `GET|HEAD|PUT /v1/cas/{kind}/{ac|cas}/{sha256}`.
@@ -412,9 +432,7 @@ func (s *CacheService) openCASHandle(
 		// THE KILL SWITCH IS ASKED AGAIN WHILE THE VOLUME IS IN USE, not only
 		// when it is attached, so disabling a cache stops a running job's use of
 		// it within casPolicyAge.
-		if !s.sessionKindAllowed(ctx, session, kind) {
-			err = errCacheOff
-		} else {
+		if err = casPolicyErr(s.sessionKindPolicy(ctx, session, kind)); err == nil {
 			hv.allowedAt = s.now()
 		}
 	}
@@ -432,7 +450,10 @@ func (s *CacheService) openCASHandle(
 		noteBuildCache(session, kind, alloc.BuildCacheUnavailable)
 	}
 	session.mu.Unlock()
-	if errors.Is(err, errCacheOff) {
+	// AN UNREADABLE SWITCH IS REFUSED AS AN OFF ONE IS, so the guest's helper
+	// stops asking rather than paying the switch's wait on every miss; only what
+	// is recorded differs.
+	if errors.Is(err, errCacheOff) || errors.Is(err, errCachePolicyUnknown) {
 		admitted()
 
 		return nil, reapi.ErrOff

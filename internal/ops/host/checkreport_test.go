@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // checkConfigFixture writes a control-plane config and its App key, and returns
@@ -34,6 +35,11 @@ func checkConfigFixture(t *testing.T) string {
 	}), 0o600); err != nil {
 		t.Fatalf("write the key: %v", err)
 	}
+
+	// SEEDED, as writeCheckConfig's is: a check that migrated an empty ledger
+	// spent its open's thirty-second startup budget on a loaded runner
+	// (TestAMaintenanceSkipIsNotAPass, #188, CI 2026-10-09 and 2026-10-11).
+	ledgertest.Seed(t, filepath.Join(dir, "server"))
 
 	cfgPath := filepath.Join(dir, "billet.yaml")
 	body := fmt.Sprintf(`server:

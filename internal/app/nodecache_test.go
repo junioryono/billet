@@ -391,9 +391,10 @@ func TestTheNodeCacheServesOnlyAfterRestoringItsMounts(t *testing.T) {
 	}
 }
 
-// THE NODE LOOP IS GIVEN THE STOP POLICY AND THE DRAIN REQUEST. The loop's
-// tests set both themselves, so only the source shows that Run passes what the
-// config said and what the host says a draining stop asks.
+// THE NODE LOOP IS GIVEN THE STOP POLICY, THE DRAIN REQUEST AND WHERE IT RECORDS
+// THE DEPLOYMENT'S IMAGE ACCEPTANCE. The loop's tests set each themselves, so
+// only the source shows that Run passes what the config said and what the host
+// says a draining stop asks.
 func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -435,13 +436,18 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 				if namesSelector(field.Value, "host", key.Name) {
 					found[key.Name] = true
 				}
+			case key.Name == "ImageAcceptanceDir":
+				// Where the image commands read the deployment's acceptance.
+				if types.ExprString(field.Value) == "cfg.Node.StateDir" {
+					found[key.Name] = true
+				}
 			}
 		}
 
 		return true
 	})
 
-	for _, key := range []string{"HandOverOnStop", "DrainRequested", "Hurry"} {
+	for _, key := range []string{"HandOverOnStop", "DrainRequested", "Hurry", "ImageAcceptanceDir"} {
 		if !found[key] {
 			t.Errorf("the node loop is not given %s from what the config and the host say", key)
 		}

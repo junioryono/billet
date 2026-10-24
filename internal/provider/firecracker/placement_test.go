@@ -236,6 +236,31 @@ func TestPlacedGuestsNeverShareACPUAndAGoneJailsCPUsAreReaped(t *testing.T) {
 	}
 }
 
+// A MICROVM WHOSE JAIL IS GONE GIVES ITS CPUS BACK through releaseOrphaned,
+// the path a Destroy interrupted after the jail's removal finishes on.
+func TestAnOrphanedMicroVMsCPUsAreReleased(t *testing.T) {
+	t.Parallel()
+
+	h := placedHarness(t, config.CPUPlacementCompact)
+	j := claimedJail(t, h, strings.Repeat("e", 32))
+	if _, err := h.p.claimCPUs(j, resources{}, 4); err != nil {
+		t.Fatalf("claimCPUs: %v", err)
+	}
+	if err := j.remove(); err != nil {
+		t.Fatalf("remove the jail: %v", err)
+	}
+	held, err := h.p.claimedBy(j.id)
+	if err != nil || held.CPUs != "0-1,4-5" {
+		t.Fatalf("claimedBy = %+v, %v; want the cpus the orphan still holds", held, err)
+	}
+	if err := h.p.releaseOrphaned(t.Context(), resources{CPUs: held.CPUs}, j.id); err != nil {
+		t.Fatalf("releaseOrphaned: %v", err)
+	}
+	if left, err := h.p.claimedBy(j.id); err != nil || left.CPUs != "" {
+		t.Fatalf("after releaseOrphaned the orphan still holds %+v, %v", left, err)
+	}
+}
+
 // A GUEST THAT DOES NOT FIT RUNS UNPINNED, holding no claim, rather than being
 // refused or given part of what it asked for.
 func TestAGuestThatDoesNotFitRunsOnEveryCPU(t *testing.T) {

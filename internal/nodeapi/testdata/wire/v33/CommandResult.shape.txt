@@ -1,0 +1,13 @@
+CommandResult.id string
+CommandResult.ok bool
+CommandResult.error tag omitempty
+CommandResult.error string
+CommandResult.custody tag omitempty
+CommandResult.custody bool
+CommandResult.draining tag omitempty
+CommandResult.draining bool
+CommandResult.barrier_id tag omitempty
+CommandResult.barrier_id string
+CommandResult.instances tag omitempty
+CommandResult.instances slice
+CommandResult.instances[] string

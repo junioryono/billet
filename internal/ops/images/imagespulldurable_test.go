@@ -1044,5 +1044,7 @@ tiers:
 		t.Fatalf("write the config: %v", err)
 	}
 
+	recordSilentControlPlane(t, filepath.Join(dir, "server"), filepath.Join(dir, "node"))
+
 	return cfgPath
 }

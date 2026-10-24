@@ -42,6 +42,53 @@ func (h *blockingNodeStopHost) StopNode(ctx context.Context) error {
 	return h.fakeHost.StopNode(ctx)
 }
 
+// stalledAfter is how long an upgrade meant to be walking its steps may go
+// without moving before it is judged stopped. The steps after the drain are
+// the journal's writes, each fsynced twice, and a loaded CI runner took more
+// than thirty seconds over them (#188, five times between 2026-10-06 and
+// 2026-10-23); a Run that never resumed moves nothing at all.
+const stalledAfter = 2 * time.Minute
+
+// awaitProgress waits for Run's answer on finished, failing only when the
+// journal in dir has said the same step for stalledAfter. It reads the journal
+// from disk, which Write replaces by a rename, rather than the struct Run is
+// writing.
+func awaitProgress(t *testing.T, finished <-chan error, dir string) error {
+	t.Helper()
+
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+
+	var (
+		step    Step
+		readErr error
+	)
+
+	moved := time.Now()
+
+	for {
+		select {
+		case err := <-finished:
+			return err
+		case <-tick.C:
+		}
+
+		read, err := ReadJournal(dir)
+		readErr = err
+
+		if err == nil && read.Step != step {
+			step, moved = read.Step, time.Now()
+
+			continue
+		}
+
+		if time.Since(moved) > stalledAfter {
+			t.Fatalf("the upgrade never finished after its drain returned: its journal has said %q "+
+				"for %s (the last read: %v)", step, stalledAfter, readErr)
+		}
+	}
+}
+
 // AN UPGRADE WAITS FOR THE NODE'S DRAIN, AND A DRAIN HAS NO BOUND.
 //
 // `Host.StopNode`'s contract says so in words — "UNBOUNDED: a drain waits for the
@@ -79,7 +126,7 @@ func TestAnUpgradeDoesNothingElseWhileTheNodeIsDraining(t *testing.T) {
 	case <-h.entered:
 	case err := <-finished:
 		t.Fatalf("the upgrade finished without ever stopping the node: %v", err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(stalledAfter):
 		t.Fatal("the upgrade never reached StopNode")
 	}
 
@@ -114,13 +161,8 @@ func TestAnUpgradeDoesNothingElseWhileTheNodeIsDraining(t *testing.T) {
 	// completion", at this layer.
 	close(h.release)
 
-	select {
-	case err := <-finished:
-		if err != nil {
-			t.Fatalf("the upgrade failed once the drain finished: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the upgrade never finished after its drain returned")
+	if err := awaitProgress(t, finished, j.Dir); err != nil {
+		t.Fatalf("the upgrade failed once the drain finished: %v", err)
 	}
 
 	if j.Step != StepCommitted {

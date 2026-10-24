@@ -12,6 +12,12 @@ import (
 	"github.com/junioryono/billet/internal/guestreport"
 )
 
+// unhurried is a clock the search's time budget never runs out on, for the
+// tests whose subject is something else: a loaded runner spent junitBudget's two
+// seconds of wall clock after four of twenty files (#188, CI 2026-10-12). The
+// budget itself is the "time" bound's case, on a clock that moves.
+func unhurried() time.Time { return at(0) }
+
 // The fixture holds a Go and a pytest result file three levels down, one six down
 // and one seven, a pom.xml with a testsuite inside, and result files under
 // node_modules and _actions that are other people's.
@@ -19,7 +25,7 @@ func TestTheJUnitSearchReadsTheJobsResultFiles(t *testing.T) {
 	t.Parallel()
 
 	log, _ := discardLog()
-	got := collectJUnit([]string{"testdata/junit", filepath.Join(t.TempDir(), "absent")}, time.Now, log)
+	got := collectJUnit([]string{"testdata/junit", filepath.Join(t.TempDir(), "absent")}, unhurried, log)
 
 	want := []guestreport.SuiteResult{
 		{Name: "github.com/acme/widget/internal/parse", Tests: 4, Failures: 1, Skipped: 1,
@@ -63,7 +69,7 @@ func TestTheJUnitSearchFollowsNoSymlinkOutOfARoot(t *testing.T) {
 	writeFile(t, filepath.Join(root, "inside.xml"), `<testsuite name="inside" tests="1"><testcase name="x"/></testsuite>`)
 
 	log, _ := discardLog()
-	got := collectJUnit([]string{root}, time.Now, log)
+	got := collectJUnit([]string{root}, unhurried, log)
 
 	if len(got) != 1 || got[0].Name != "inside" {
 		t.Fatalf("suites %+v, want the one inside the root alone", got)
@@ -110,7 +116,7 @@ func TestTheJUnitSearchKeepsItsBounds(t *testing.T) {
 		writeFile(t, filepath.Join(root, "small.xml"), suite("small"))
 
 		log, _ := discardLog()
-		got := collectJUnit([]string{root}, time.Now, log)
+		got := collectJUnit([]string{root}, unhurried, log)
 
 		if len(got) != 1 || got[0].Name != "small" {
 			t.Fatalf("suites %+v, want the small one alone", got)
@@ -187,10 +193,15 @@ func TestTheSuitesKeptAreABatchsWorthFailingFirst(t *testing.T) {
 	writeFile(t, filepath.Join(root, "fail.xml"), `<testsuite name="fail">`+cases.String()+`</testsuite>`)
 
 	log, _ := discardLog()
-	got := collectJUnit([]string{root}, time.Now, log)
+	got := collectJUnit([]string{root}, unhurried, log)
 
 	if len(got) != guestreport.MaxBatchSuites || got[0].Name != "fail" {
-		t.Fatalf("kept %d suites, the first %q; want %d, the failing one first", len(got), got[0].Name,
+		first := ""
+		if len(got) > 0 {
+			first = got[0].Name
+		}
+
+		t.Fatalf("kept %d suites, the first %q; want %d, the failing one first", len(got), first,
 			guestreport.MaxBatchSuites)
 	}
 

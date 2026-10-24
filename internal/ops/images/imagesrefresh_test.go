@@ -143,6 +143,11 @@ func firecrackerRefreshConfig(t *testing.T, automatic string) string {
 
 	body := strings.Replace(firecrackerNodeConfig, "node:", automatic+"node:", 1)
 
+	serverDir, nodeDir := t.TempDir(), t.TempDir()
+	body = strings.Replace(body, "state_dir: /var/lib/billet/server", "state_dir: "+serverDir, 1)
+	body = strings.Replace(body, "state_dir: /var/lib/billet/node", "state_dir: "+nodeDir, 1)
+	recordSilentControlPlane(t, serverDir, nodeDir)
+
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)

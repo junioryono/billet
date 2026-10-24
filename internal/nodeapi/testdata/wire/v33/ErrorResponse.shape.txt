@@ -1,0 +1,2 @@
+ErrorResponse.code string
+ErrorResponse.message string

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // A VMM'S OWN FAULT MESSAGE IS THE ACTIONABLE HALF. `Invalid request method and/or
@@ -255,6 +256,17 @@ func TestIndependentVMMClientsDoNotExhaustTheConnectionLimit(t *testing.T) {
 	for request := range limit + 2 {
 		if _, err := newVMMAPI(socket).info(t.Context()); err != nil {
 			t.Fatalf("independent client %d: %v", request+1, err)
+		}
+
+		// EACH CLIENT'S CONNECTION IS SEEN CLOSED BEFORE THE NEXT ONE DIALS. The
+		// server counts a close when its own goroutine notices it, which a loaded
+		// runner let fall behind the next clients' dials, so a client that kept
+		// nothing still read as one too many (#188, CI 2026-10-23). A client that
+		// keeps its connection idle never lets the count fall, and is caught here.
+		for deadline := time.Now().Add(time.Minute); open.Load() != 0; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("independent client %d left %d connection(s) open to the VMM", request+1, open.Load())
+			}
 		}
 	}
 }

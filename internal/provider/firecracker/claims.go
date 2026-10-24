@@ -14,9 +14,10 @@ import (
 	"github.com/junioryono/billet/internal/config"
 )
 
-// A microVM needs two things that are scarce on a host rather than derivable from
-// its lease: a uid to run as, and a network device name. Both are allocated here,
-// and both follow the same three rules — which is why they live together.
+// A microVM needs things that are scarce on a host rather than derivable from its
+// lease: a uid to run as, a network device name, and, under a cpu placement, the
+// cpus it is pinned to. They are allocated here, and all follow the same three
+// rules — which is why they live together.
 //
 //  1. THE CLAIM IS THE CREATE. A "is it free" check followed by a "take it" step is
 //     two operations, and two concurrent launches both pass the first. Every
@@ -501,8 +502,8 @@ func (p *Provider) claimResources(j jail) (resources, error) {
 
 // releaseResources gives back everything a microVM held.
 //
-// BOTH, WHATEVER EITHER DOES. Stopping at the first failure would leak the other,
-// and these are the two things a host runs out of.
+// EVERY ONE, WHATEVER ANOTHER DOES. Stopping at the first failure would leak the
+// rest, and these are the things a host runs out of.
 func (p *Provider) releaseResources(res resources, jailID string) error {
 	unlock, err := p.lockClaims()
 	if err != nil {

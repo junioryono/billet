@@ -51,8 +51,15 @@ func ReportImageComponents(ctx context.Context, env cli.Env, cfg *config.Config)
 		return
 	}
 
+	accepted, err := acceptedComponents(cfg)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "images   could not tell what this deployment accepts: %v\n", err)
+
+		return
+	}
+
 	for _, use := range uses {
-		for _, line := range componentLines(ctx, store, use, cfg.Images.Accepted(),
+		for _, line := range componentLines(ctx, store, use, accepted,
 			cfg.Release.AutomaticUpdates()) {
 			fmt.Fprintf(env.Stdout, "images   %s\n", line)
 		}

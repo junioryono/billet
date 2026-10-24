@@ -344,7 +344,22 @@ func TestStopDoesNotWaitForeverForAWrite(t *testing.T) {
 	r, _ := startFake(t, dir, w)
 	r.stopWait = 50 * time.Millisecond
 
-	t.Cleanup(func() { close(w.gate) })
+	// THE RELEASED WRITE IS JOINED BEFORE THE DIRECTORY GOES. Stop has given up
+	// on it by design, and its install outlasted the 50ms the cleanup's own Stop
+	// waits, so the directory was removed under it (#188, CI 2026-10-16).
+	t.Cleanup(func() {
+		close(w.gate)
+
+		// STOPPED HERE TOO, so the worker that closes stopDone exists on a path
+		// that failed before the test's own Stop.
+		r.Stop()
+
+		select {
+		case <-r.stopDone:
+		case <-time.After(liveness):
+			t.Error("the snapshot never finished writing once its gate opened")
+		}
+	})
 
 	r.Snapshot(HeartbeatOverrun)
 

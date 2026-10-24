@@ -119,6 +119,11 @@ type Client struct {
 	// on it would erase the one that does.
 	regMu      sync.Mutex
 	generation int64
+	// imagesAccept is what the last accepted registration's answer said the
+	// deployment accepts, and imagesAcceptCarried whether its wire carries that
+	// at all (nodeapi.VersionImageAcceptance); both under regMu.
+	imagesAccept        []string
+	imagesAcceptCarried bool
 
 	// guestUnsent is set the first time a guest report is not sent because the
 	// negotiated wire does not carry one, so that is said once and not once a
@@ -422,9 +427,25 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 	c.regMu.Lock()
 	c.generation++
 	c.wire.Store(int64(res.Version))
+	c.imagesAccept = slices.Clone(res.ImagesAccept)
+	c.imagesAcceptCarried = res.Version >= nodeapi.VersionImageAcceptance
 	c.regMu.Unlock()
 
 	return nil
+}
+
+// ImageAcceptance is what the last accepted registration said the deployment's
+// images.accept names, and false when its wire does not carry it: an answer below
+// nodeapi.VersionImageAcceptance is silent, which is not "accepts none".
+func (c *Client) ImageAcceptance() ([]string, bool) {
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	if !c.imagesAcceptCarried {
+		return nil, false
+	}
+
+	return slices.Clone(c.imagesAccept), true
 }
 
 // WireVersion is the protocol version this node's registration settled on.

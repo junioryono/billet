@@ -164,6 +164,11 @@ func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Conf
 		return err
 	}
 
+	accepted, err := acceptedComponents(cfg)
+	if err != nil {
+		return fmt.Errorf("billet images refresh: %w", err)
+	}
+
 	var problems []error
 
 	for _, configured := range configured {
@@ -172,7 +177,7 @@ func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Conf
 		// alias, exactly as `images pull` with no argument already does.
 		image, _, _ := strings.Cut(configured, "@")
 
-		due, why, err := refreshDue(ctx, store, image, manifest, cfg.Images.Accepted())
+		due, why, err := refreshDue(ctx, store, image, manifest, accepted)
 		if err != nil {
 			problems = append(problems, err)
 

@@ -57,6 +57,20 @@ func gitWithin[T any](t *testing.T, what string, call func() T) T {
 	}
 }
 
+// gitSettled waits, within gitGuard, until no refresh or maintenance the proxy
+// started is still running. A git command returns once it is answered, and a
+// request whose refresh outlives refreshWait is answered from upstream while
+// the mirror's fetch goes on, so what the mirror holds is read after this.
+func gitSettled(t *testing.T, service *CacheService, what string) {
+	t.Helper()
+
+	gitWithin(t, what, func() struct{} {
+		service.git.background.Wait()
+
+		return struct{}{}
+	})
+}
+
 // gitUpstream is github.com: git's own smart-HTTP server over private
 // repositories, refusing any request without githubBasic, counting fetches.
 // Like github.com it serves any object a repository holds, whether or not a ref
