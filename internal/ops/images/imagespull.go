@@ -295,8 +295,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 			}
 
 			return fmt.Errorf("billet images pull: installed the kernel %s, and imported no generation: %w; "+
-				"point node.firecracker.kernel_image at that kernel if it names none yet, so the node can "+
-				"start and register", kernel, err)
+				"point node.firecracker.kernel_image at that kernel unless the path it names already holds "+
+				"one, so the node can start and register", kernel, err)
 		}
 
 		plan = planCompletion(manifest, accepted)

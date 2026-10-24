@@ -349,7 +349,8 @@ func TestAFirstPullBeforeRegistrationInstallsTheKernelAndImportsNothing(t *testi
 	err := run.pull(t)
 	if err == nil || !strings.Contains(err.Error(), "installed the kernel "+kernel+", and imported no "+
 		"generation: this node has not recorded what its control plane accepts") ||
-		!strings.Contains(err.Error(), "point node.firecracker.kernel_image at that kernel") {
+		!strings.Contains(err.Error(), "point node.firecracker.kernel_image at that kernel unless the path it "+
+			"names already holds one, so the node can start and register") {
 		t.Fatalf("a first pull before registration answered %v, want the kernel installed and nothing imported", err)
 	}
 
