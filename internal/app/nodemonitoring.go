@@ -114,10 +114,10 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 	case p.Kind() == config.ProviderTart && m.Meter != nil:
 		slog.Info("measuring each job from the host", "interval", interval,
 			"source", "each VM's own process accounting", "energy", "the wall, from the power meter",
-			"meter", m.Meter.Shelly, "idle_watts", m.Meter.IdleWatts, "net", "not measured")
+			"meter", m.Meter.Shelly, "idle_watts", m.Meter.IdleWatts, "net", "each VM's own vmenet, from the host")
 	case p.Kind() == config.ProviderTart:
 		slog.Info("measuring each job from the host", "interval", interval,
-			"source", "each VM's own process accounting", "net", "not measured")
+			"source", "each VM's own process accounting", "net", "each VM's own vmenet, from the host")
 	default:
 		slog.Info("measuring each job from the host", "interval", interval, "rapl", m.RAPL,
 			"idle_package_watts", m.IdlePackageWatts)
