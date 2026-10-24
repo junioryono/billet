@@ -299,6 +299,12 @@ type Provider struct {
 	lsof         string
 	processPath  func(pid int) (string, error)
 	processStart func(pid int) (uint64, error)
+	// ps lists the host's processes, ifconfig reads a bridge's address table
+	// and bridges names the host's bridges: with lsof, how UsageTarget finds a
+	// VM's network device. Seams for the same reason.
+	ps       string
+	ifconfig string
+	bridges  func() ([]string, error)
 
 	// names serializes Launch and Destroy per VM name. Destroy's stop→prove→
 	// delete is not atomic, and a Launch admitted into that window could have
@@ -414,6 +420,9 @@ func New(owner string, opts ...Option) (*Provider, error) {
 		storeLockRetry:  25 * time.Millisecond,
 
 		lsof:         "/usr/sbin/lsof",
+		ps:           "/bin/ps",
+		ifconfig:     "/sbin/ifconfig",
+		bridges:      hostBridges,
 		processPath:  usage.ProcessPath,
 		processStart: hostProcessStart,
 	}

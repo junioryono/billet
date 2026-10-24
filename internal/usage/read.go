@@ -40,6 +40,12 @@ type Target struct {
 	// received is what the container received. The reading is kept only if PID
 	// still started at PIDStart after it.
 	NetNamespace bool
+	// NetPID and NetPIDStart are the process whose life NetDevice's is, when it
+	// is not PID's: a softnet process carrying a tart VM's frames. With Process,
+	// a reading of the device is kept only if PID and, when set, NetPID still
+	// started when they did after it.
+	NetPID      int
+	NetPIDStart uint64
 	// Process says the job is PID alone, with no cgroup: it is measured by the
 	// process's own accounting (ProcessCounters), checked against PIDStart on
 	// every read, and CgroupDir is not read.
@@ -127,6 +133,9 @@ func (r Reader) readListing(t Target, cpuRead func()) (Sample, []vcpuThread) {
 		s.readProcess(r, t)
 		if cpuRead != nil {
 			cpuRead()
+		}
+		if s.CPUOK {
+			s.readProcessNet(r, t)
 		}
 
 		return s, nil
@@ -331,9 +340,9 @@ func (s *Sample) readNet(r Reader, t Target) {
 	s.NetRx, s.NetTx, s.NetRxPackets, s.NetTxPackets, s.NetOK = v[0], v[1], v[2], v[3], true
 }
 
-// hostNet reads a device's rx and tx bytes and packets from the host's
+// sysfsNet reads a device's rx and tx bytes and packets from the host's
 // /sys/class/net.
-func (r Reader) hostNet(t Target) ([4]int64, bool) {
+func (r Reader) sysfsNet(t Target) ([4]int64, bool) {
 	var v [4]int64
 	for i, name := range []string{"rx_bytes", "tx_bytes", "rx_packets", "tx_packets"} {
 		raw, err := r.read("/sys/class/net/" + t.NetDevice + "/statistics/" + name)
