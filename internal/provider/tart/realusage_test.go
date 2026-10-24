@@ -40,8 +40,11 @@ func TestARealVMIsFoundAndMeasured(t *testing.T) {
 	if !strings.HasPrefix(target.NetDevice, "vmenet") || !target.NetHostView {
 		t.Fatalf("target %+v names no VM network device from the host's side", target)
 	}
-	if target.NetPID <= 0 || target.NetPIDStart == 0 {
-		t.Fatalf("target %+v names no proved process carrying the VM's link", target)
+	// THE VM'S OWN PROCESS CARRIES ITS LINK on tart's shared network and is not
+	// named again; under softnet the carrier is a process of its own, proved.
+	if ownLink := target.NetPID == 0 && target.NetPIDStart == 0; !ownLink &&
+		(target.NetPID <= 0 || target.NetPID == target.PID || target.NetPIDStart == 0) {
+		t.Fatalf("target %+v names a carrier for the VM's link that is not a proved process of its own", target)
 	}
 	s := usage.Reader{Root: "/"}.Read(usage.Target{PID: target.PID, PIDStart: target.PIDStart, Process: true,
 		NetDevice: target.NetDevice, NetHostView: target.NetHostView, NetPID: target.NetPID,
