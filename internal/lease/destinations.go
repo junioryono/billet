@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 )
 
 // MaxJobDestinations is how many destinations one report names. A node keeps
@@ -29,6 +30,10 @@ type JobDestinations struct {
 	// Tap is the guest's tap's own totals, read when the job's last sample was
 	// taken; nil when the tap was not read.
 	Tap *TapTotals `json:"tap,omitempty"`
+	// UnansweredCounted says each destination's Unanswered was counted, so a
+	// zero there is a destination that answered everything; false, from a node
+	// or a wire before it, says nothing about what went unanswered.
+	UnansweredCounted bool `json:"unanswered_counted,omitempty"`
 }
 
 // JobDestination is the traffic a job exchanged with one remote address, from
@@ -38,6 +43,24 @@ type JobDestination struct {
 	SentBytes     int64  `json:"sent_bytes"`
 	ReceivedBytes int64  `json:"received_bytes"`
 	Connections   int64  `json:"connections"`
+	// Unanswered is how many of Connections the guest sent on and got no packet
+	// back from: a SYN nothing answered, or a datagram, a DNS query among them,
+	// with no reply. Counted only where the report's UnansweredCounted says so.
+	Unanswered int64 `json:"unanswered,omitempty"`
+}
+
+// WithoutUnanswered is d as a wire before the unanswered counts carries it:
+// the counts and the mark that they were counted gone, which says less, never
+// something else.
+func (d JobDestinations) WithoutUnanswered() JobDestinations {
+	d.UnansweredCounted = false
+	d.Destinations = slices.Clone(d.Destinations)
+	for i := range d.Destinations {
+		d.Destinations[i].Unanswered = 0
+	}
+	d.Other.Unanswered = 0
+
+	return d
 }
 
 // TapTotals is what the guest's tap counted, from the guest's side, with each
@@ -71,7 +94,7 @@ func (d JobDestinations) Validate() error {
 			return fmt.Errorf("alloc: destination %s is named twice", dest.Addr)
 		}
 		seen[dest.Addr] = true
-		if err := dest.validateTotals(dest.Addr); err != nil {
+		if err := dest.validateTotals(dest.Addr, d.UnansweredCounted); err != nil {
 			return err
 		}
 	}
@@ -79,7 +102,7 @@ func (d JobDestinations) Validate() error {
 		return fmt.Errorf("alloc: the traffic beyond the named destinations names an address (%q)",
 			d.Other.Addr)
 	}
-	if err := d.Other.validateTotals("other"); err != nil {
+	if err := d.Other.validateTotals("other", d.UnansweredCounted); err != nil {
 		return err
 	}
 	if d.Tap != nil && (d.Tap.SentBytes < 0 || d.Tap.ReceivedBytes < 0) {
@@ -90,10 +113,21 @@ func (d JobDestinations) Validate() error {
 	return nil
 }
 
-func (d JobDestination) validateTotals(name string) error {
-	if d.SentBytes < 0 || d.ReceivedBytes < 0 || d.Connections < 0 {
+func (d JobDestination) validateTotals(name string, unansweredCounted bool) error {
+	if d.SentBytes < 0 || d.ReceivedBytes < 0 || d.Connections < 0 || d.Unanswered < 0 {
 		return fmt.Errorf("alloc: destination %s has a negative total (sent %d, received %d, "+
-			"connections %d)", name, d.SentBytes, d.ReceivedBytes, d.Connections)
+			"connections %d, unanswered %d)", name, d.SentBytes, d.ReceivedBytes, d.Connections, d.Unanswered)
+	}
+	// AN UNANSWERED COUNT IS A COUNT OF ITS CONNECTIONS, and only of a report
+	// that says it counted them: a count with no such mark could not be told
+	// from an uncounted zero once it was kept.
+	if d.Unanswered > d.Connections {
+		return fmt.Errorf("alloc: destination %s has %d unanswered of %d connections",
+			name, d.Unanswered, d.Connections)
+	}
+	if d.Unanswered > 0 && !unansweredCounted {
+		return fmt.Errorf("alloc: destination %s has %d unanswered in a report that did not count them",
+			name, d.Unanswered)
 	}
 
 	return nil

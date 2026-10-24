@@ -12,23 +12,27 @@ import (
 )
 
 // fullDestinations is the most a report can name: every destination the node
-// keeps by name, traffic beyond them, the tap read, and the totals incomplete.
+// keeps by name, traffic beyond them, the tap read, the totals incomplete, and
+// each destination's unanswered connections counted.
 func fullDestinations() *JobDestinations {
 	d := &JobDestinations{
-		Other:      JobDestination{SentBytes: 7, ReceivedBytes: 11, Connections: 3},
-		Incomplete: true,
-		Tap:        &TapTotals{SentBytes: 1 << 20, ReceivedBytes: 0},
+		Other:             JobDestination{SentBytes: 7, ReceivedBytes: 11, Connections: 3, Unanswered: 2},
+		Incomplete:        true,
+		Tap:               &TapTotals{SentBytes: 1 << 20, ReceivedBytes: 0},
+		UnansweredCounted: true,
 	}
 	for i := range MaxJobDestinations {
 		d.Destinations = append(d.Destinations, JobDestination{
 			Addr:      fmt.Sprintf("10.%d.%d.%d", i/65536, i/256%256, i%256),
 			SentBytes: int64(1000 - i), ReceivedBytes: int64(2 * i), Connections: int64(i % 5),
+			Unanswered: int64(i % 5 / 2),
 		})
 	}
 	// THE WIDEST ROW THE LEDGER'S RECORD HOLDS: the longest canonical address
 	// and the largest counts.
 	d.Destinations[0] = JobDestination{Addr: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe",
-		SentBytes: math.MaxInt64, ReceivedBytes: math.MaxInt64, Connections: math.MaxInt64}
+		SentBytes: math.MaxInt64, ReceivedBytes: math.MaxInt64, Connections: math.MaxInt64,
+		Unanswered: math.MaxInt64}
 	d.Destinations[1].Addr = "2001:db8::1"
 
 	return d
@@ -41,7 +45,13 @@ func fullDestinations() *JobDestinations {
 func TestDestinationsAreKeptAsSent(t *testing.T) {
 	for name, dests := range map[string]*JobDestinations{
 		"every destination named": fullDestinations(),
-		"none named, no tap":      {},
+		"every destination named, unanswered not counted": func() *JobDestinations {
+			d := fullDestinations().WithoutUnanswered()
+			return &d
+		}(),
+		"counted, and every connection answered": {Destinations: []JobDestination{{Addr: "10.0.0.1",
+			SentBytes: 1, Connections: 2}}, UnansweredCounted: true},
+		"none named, no tap": {},
 		"complete, the tap read": {Destinations: []JobDestination{{Addr: "140.82.112.3", SentBytes: 1,
 			ReceivedBytes: 2, Connections: 1}}, Tap: &TapTotals{SentBytes: 5, ReceivedBytes: 9}},
 		"not totalled": nil,
@@ -164,6 +174,31 @@ func TestDestinationsWithoutTheirRestAreNotGuessed(t *testing.T) {
 	}
 }
 
+// ONE REPORT WROTE EVERY ROW, so a ledger whose rows are part counted and part
+// not no longer holds what was written, and is read neither way.
+func TestDestinationsPartCountedAreNotGuessed(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+	lease := busyLease(t, a)
+	usage := measuredUsage()
+	usage.Destinations = &JobDestinations{Destinations: []JobDestination{{Addr: "10.0.0.1", Connections: 2,
+		Unanswered: 1}}, UnansweredCounted: true}
+	if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, usage, nil); err != nil {
+		t.Fatalf("RecordLeaseUsage: %v", err)
+	}
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_destinations SET unanswered = NULL
+			WHERE lease_id = $1 AND addr = ''`, lease.ID)
+		return err
+	}); err != nil {
+		t.Fatalf("uncount the rest's row: %v", err)
+	}
+	if _, err := a.LeaseUsage(t.Context(), lease.ID); err == nil ||
+		!strings.Contains(err.Error(), "an unanswered count for 1 of lease "+lease.ID+"'s destination rows and none for 1") {
+		t.Fatalf("LeaseUsage = %v, want it to say the rows are part counted", err)
+	}
+}
+
 func TestDestinationsTheLedgerCannotKeepAreRefused(t *testing.T) {
 	t.Parallel()
 
@@ -198,6 +233,19 @@ func TestDestinationsTheLedgerCannotKeepAreRefused(t *testing.T) {
 			u.Destinations.Other.Connections = -1
 		}, "destination other has a negative total"},
 		{"a negative tap", func(u *JobUsage) { u.Destinations.Tap.SentBytes = -1 }, "tap's totals are negative"},
+		{"a negative unanswered count", func(u *JobUsage) {
+			u.Destinations.Destinations[7].Unanswered = -1
+		}, "destination 10.0.0.7 has a negative total"},
+		{"more unanswered than connections", func(u *JobUsage) {
+			u.Destinations.Destinations[7].Unanswered = 3
+		}, "destination 10.0.0.7 has 3 unanswered of 2 connections"},
+		{"more unanswered beyond the named than connections", func(u *JobUsage) {
+			u.Destinations.Other.Unanswered = 4
+		}, "destination other has 4 unanswered of 3 connections"},
+		{"unanswered in a report that did not count them", func(u *JobUsage) {
+			u.Destinations.UnansweredCounted = false
+		}, "destination ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe has 9223372036854775807 unanswered in a " +
+			"report that did not count them"},
 		{"a tap beside a network unmeasured", func(u *JobUsage) {
 			u.Unmeasured = append(u.Unmeasured, UsageNet)
 			u.NetRxBytes, u.NetTxBytes, u.NetRxPackets, u.NetTxPackets = 0, 0, 0, 0

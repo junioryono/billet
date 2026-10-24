@@ -16,18 +16,30 @@ func TestDestinationsArePackedWholeOrNotAtAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the most a report can name was refused: %v", err)
 	}
-	if rows != MaxJobDestinations+1 || len(packed) != rows*packedRowWidth || packedRowWidth != 99 {
-		t.Fatalf("packed %d rows into %d characters, want %d rows of 99", rows, len(packed),
+	if rows != MaxJobDestinations+1 || len(packed) != rows*packedRowWidth || packedRowWidth != 118 {
+		t.Fatalf("packed %d rows into %d characters, want %d rows of 118", rows, len(packed),
 			MaxJobDestinations+1)
 	}
 	if first := packed[:packedRowWidth]; first != "000ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe"+
-		strings.Repeat("9223372036854775807", 3) {
+		strings.Repeat("9223372036854775807", 4) {
 		t.Errorf("the first row packs as %q", first)
 	}
 	zeros := strings.Repeat("0", 17)
 	if last := packed[len(packed)-packedRowWidth:]; last != "256"+strings.Repeat(" ", 39)+
-		zeros+"07"+zeros+"11"+zeros+"03" {
+		zeros+"07"+zeros+"11"+zeros+"03"+zeros+"02" {
 		t.Errorf("the rest packs as %q", last)
+	}
+
+	// NOT COUNTED IS SPACES, never a zero, which would read back as a
+	// destination that answered everything.
+	uncounted := fullDestinations().WithoutUnanswered()
+	packed, _, err = packDestinations(&uncounted)
+	if err != nil {
+		t.Fatalf("a report that did not count unanswered connections was refused: %v", err)
+	}
+	if last := packed[len(packed)-packedRowWidth:]; last != "256"+strings.Repeat(" ", 39)+
+		zeros+"07"+zeros+"11"+zeros+"03"+strings.Repeat(" ", 19) {
+		t.Errorf("the rest of a report that did not count packs as %q", last)
 	}
 
 	for name, dest := range map[string]JobDestination{
