@@ -94,9 +94,10 @@ type Result struct {
 	// guest's traffic joined an entry its address's previous holder left, or
 	// its address changed. The totals are then a lower bound, and say so.
 	Incomplete bool
-	// UnansweredUnknown says a flow carried no packet counts in either
-	// direction, which no guest flow has while the tracker keeps them, so no
-	// destination's Unanswered can be told from none.
+	// UnansweredUnknown says a flow of the job's, or an entry its address's
+	// previous holder left, carried no packet counts in either direction, which
+	// no flow has while the tracker keeps them, so no destination's Unanswered
+	// can be told from none.
 	UnansweredUnknown bool
 }
 
@@ -141,6 +142,10 @@ type watch struct {
 	// so it cannot be counted, only noticed.
 	inherited  map[entry]Flow
 	incomplete bool
+	// unansweredUnknown says an entry the previous holder left carried no
+	// packet counts, so the guest could reuse its tuple unnoticed and get
+	// nothing back on it.
+	unansweredUnknown bool
 }
 
 // NewAccountant returns an Accountant watching nothing.
@@ -245,6 +250,7 @@ func (a *Accountant) observe(f Flow) {
 		if base, inherited := w.inherited[key]; inherited && f.OrigPackets > base.OrigPackets {
 			w.incomplete = true
 		}
+		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
 	}
@@ -357,9 +363,14 @@ func (a *Accountant) Final(key string, open []Flow, until time.Time) (Result, bo
 	return summarize(w), true
 }
 
+// uncountedPackets says the tracker kept no packet counts for f: a flow begins
+// with its originator's packet, so none counted in either direction is
+// accounting that was off, not traffic that was absent.
+func uncountedPackets(f *Flow) bool { return f.OrigPackets == 0 && f.ReplyPackets == 0 }
+
 func summarize(w *watch) Result {
 	byDest := map[netip.Addr]*Destination{}
-	unknown := false
+	unknown := w.unansweredUnknown
 
 	for id := range w.counted {
 		f := w.counted[id]
@@ -378,7 +389,7 @@ func summarize(w *watch) Result {
 		// a tracker that kept no counts, and the whole result cannot say what
 		// went unanswered.
 		switch {
-		case f.OrigPackets == 0 && f.ReplyPackets == 0:
+		case uncountedPackets(&f):
 			unknown = true
 		case f.OrigPackets > 0 && f.ReplyPackets == 0:
 			d.Unanswered++

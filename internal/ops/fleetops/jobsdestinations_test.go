@@ -222,7 +222,9 @@ func TestJobsShowTellsNoneUnansweredFromNotCounted(t *testing.T) {
 
 // EVERY DESTINATION THAT GOT NOTHING BACK IS NAMED, however many there are,
 // since one left out of this line may be in no table either; and a result
-// that may have missed flows proves no "none" and counts at least what it saw.
+// that may have missed flows proves no "none", and its count is what it saw,
+// which a missed reply can make an over-count as well as a missed flow an
+// under-count.
 func TestJobsShowNamesEveryStalledDestinationAndQualifiesAnIncompleteOne(t *testing.T) {
 	t.Parallel()
 
@@ -238,8 +240,9 @@ func TestJobsShowNamesEveryStalledDestinationAndQualifiesAnIncompleteOne(t *test
 			t.Errorf("10.0.0.%d, which got nothing back once, is not named: %q", i, line)
 		}
 	}
-	if !strings.HasPrefix(line, "unanswered at least 25 connections got nothing back") {
-		t.Errorf("an incomplete result's count is not said as a lower bound: %q", line)
+	if !strings.HasPrefix(line, "unanswered 25 connections got nothing back") ||
+		!strings.HasSuffix(line, "so these are what was seen, not a bound") {
+		t.Errorf("an incomplete result's count is not said as what was seen: %q", line)
 	}
 
 	none := renderedDestinations(t, &alloc.JobDestinations{Destinations: manyDestinations(2),

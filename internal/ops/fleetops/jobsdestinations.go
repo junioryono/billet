@@ -96,12 +96,14 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 // destination nothing was measured against.
 func unansweredText(d *alloc.JobDestinations) string {
 	if !d.UnansweredCounted {
-		return "not counted (by a node, or over a node wire, older than the count), so this says " +
-			"nothing about a connection that got nothing back"
+		return "not counted (by a node, or over a node wire, older than the count, or because the " +
+			"host's connection tracker kept no packet counts), so this says nothing about a connection " +
+			"that got nothing back"
 	}
 	total := sumOf(append(slices.Clone(d.Destinations), d.Other)...).unanswered
-	// AN INCOMPLETE RESULT MAY HAVE MISSED THE ONE THAT STALLED, so it proves
-	// no "none" and its count is a lower bound.
+	// AN INCOMPLETE RESULT IS NEITHER BOUND: it may have missed the connection
+	// that stalled, and it may hold a reading taken before a reply it then
+	// missed, so it proves no "none" and its count may be over or under.
 	if total.Sign() == 0 && d.Incomplete {
 		return "none observed, but flows may have been missed, so this does not say every connection " +
 			"got something back"
@@ -109,9 +111,10 @@ func unansweredText(d *alloc.JobDestinations) string {
 	if total.Sign() == 0 {
 		return "none: every connection the guest sent on got something back"
 	}
-	count := bigCount(total)
+	count, seen := bigCount(total), ""
 	if d.Incomplete {
-		count = "at least " + count
+		seen = "; flows may have been missed, and a connection last seen unanswered may have been " +
+			"answered after, so these are what was seen, not a bound"
 	}
 	var stalled []alloc.JobDestination
 	for _, dest := range d.Destinations {
@@ -131,7 +134,7 @@ func unansweredText(d *alloc.JobDestinations) string {
 	}
 
 	return fmt.Sprintf("%s connections got nothing back (a SYN nothing answered, or a datagram, a DNS "+
-		"query among them, with no reply): %s", count, strings.Join(named, ", "))
+		"query among them, with no reply): %s%s", count, strings.Join(named, ", "), seen)
 }
 
 // traffic is destinations' totals summed exactly: up to 257 counts that each

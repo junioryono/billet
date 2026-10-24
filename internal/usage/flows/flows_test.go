@@ -340,6 +340,28 @@ func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.
 		t.Errorf("a result holding a flow with no packet counts says it could tell what went unanswered: %+v", r)
 	}
 
+	// AN ENTRY THE PREVIOUS HOLDER LEFT WITHOUT PACKET COUNTS hides the guest's
+	// reuse of its tuple, so a stall on it could not be noticed: whether it is
+	// open when the job is watched or seen only at Final, the result cannot say
+	// none went unanswered. One left with its counts says nothing of the kind.
+	counterless := startedAt(flow(6, guest, npm, 0, 0), began.Add(-time.Minute))
+	for name, tc := range map[string]struct {
+		atWatch, atFinal []Flow
+		unknown          bool
+	}{
+		"open when watched":      {atWatch: []Flow{counterless}, unknown: true},
+		"seen only at Final":     {atFinal: []Flow{counterless}, unknown: true},
+		"left with their counts": {atWatch: []Flow{startedAt(flow(6, guest, npm, 5, 5), began.Add(-time.Minute))}},
+	} {
+		inherits := NewAccountant()
+		inherits.Watch("lease-4", guest, began, tc.atWatch)
+		inherits.Observe(flow(1, guest, github, 120, 4000))
+		r, _ := inherits.Final("lease-4", tc.atFinal, ended)
+		if r.UnansweredUnknown != tc.unknown {
+			t.Errorf("an inherited entry %s: UnansweredUnknown = %v, want %v", name, r.UnansweredUnknown, tc.unknown)
+		}
+	}
+
 	beyond := NewAccountant()
 	beyond.Watch("lease-2", guest, began, nil)
 	for i := range MaxDestinations + 3 {
