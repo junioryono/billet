@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/imageaccept"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
@@ -40,6 +41,26 @@ func acceptanceConfig(t *testing.T, extra string) (string, string) {
 	return path, nodeDir
 }
 
+// recordSilentControlPlane gives a test's node the record a registration with a
+// control plane that does not say what it accepts leaves, under the deployment
+// the control plane's directory beside it holds, so the node completes with its
+// own images.accept alone, as every node did before the control plane said.
+func recordSilentControlPlane(t *testing.T, serverDir, nodeDir string) {
+	t.Helper()
+
+	if _, err := state.AdoptDeploymentID(serverDir, acceptanceDeployment); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(nodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := imageaccept.Write(nodeDir, acceptanceDeployment, false, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // recordFor writes the control plane's acceptance into the node state directory
 // a pull fixture's config names, under the deployment its server directory is
 // given.
@@ -62,9 +83,8 @@ func recordFor(t *testing.T, cfgPath string, components ...string) {
 }
 
 // WHAT THE CONTROL PLANE ACCEPTS IS ADDED TO WHAT THE NODE'S OWN CONFIG DOES,
-// for the deployment the node is in. A control plane that does not say, and a
-// node whose file describes the control plane beside it with no record of its
-// own, complete with the file's list.
+// for the deployment the node is in, and a control plane that does not say
+// leaves the file's list alone.
 func TestTheDeploymentsAcceptanceIsAddedToTheNodesOwn(t *testing.T) {
 	for name, tc := range map[string]struct {
 		local      string
@@ -80,18 +100,11 @@ func TestTheDeploymentsAcceptanceIsAddedToTheNodesOwn(t *testing.T) {
 			[]config.ImageComponent{config.ComponentAndroidSDK}},
 		"a control plane that does not say": {"images:\n  accept: [codeql]\n", acceptanceDeployment, false, nil,
 			[]config.ImageComponent{config.ComponentCodeQL}},
-		"another deployment's, beside its control plane": {"images:\n  accept: [codeql]\n",
-			"fedcba9876543210fedcba9876543210", true, []string{"android-sdk"},
-			[]config.ImageComponent{config.ComponentCodeQL}},
-		"nothing recorded, beside its control plane": {"images:\n  accept: [codeql]\n", "", false, nil,
-			[]config.ImageComponent{config.ComponentCodeQL}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			path, nodeDir := acceptanceConfig(t, tc.local)
-			if tc.deployment != "" {
-				if err := imageaccept.Write(nodeDir, tc.deployment, tc.carried, tc.recorded, time.Now()); err != nil {
-					t.Fatal(err)
-				}
+			if err := imageaccept.Write(nodeDir, tc.deployment, tc.carried, tc.recorded, time.Now()); err != nil {
+				t.Fatal(err)
 			}
 
 			cfg, err := config.Load(path)
@@ -107,10 +120,10 @@ func TestTheDeploymentsAcceptanceIsAddedToTheNodesOwn(t *testing.T) {
 	}
 }
 
-// WHAT CANNOT BE TOLD REFUSES, never the node's own list alone: a node that
-// dials a control plane elsewhere with no record of this deployment's, a record
-// that does not parse, a name this build does not install, and a record with no
-// deployment identity to compare it with.
+// WHAT CANNOT BE TOLD REFUSES, never the node's own list alone: no record of
+// this deployment's, whether or not the node's file describes a control plane
+// beside it, a record that does not parse, a name this build does not install,
+// and a record with no deployment identity to compare it with.
 func TestWhatCannotBeToldRefusesRatherThanInstallLess(t *testing.T) {
 	remote := func(t *testing.T, cfg *config.Config) {
 		t.Helper()
@@ -127,6 +140,19 @@ func TestWhatCannotBeToldRefusesRatherThanInstallLess(t *testing.T) {
 		stage func(t *testing.T, cfg *config.Config, nodeDir string)
 		says  string
 	}{
+		"no record, beside a control plane in the same file": {func(t *testing.T, _ *config.Config, _ string) {
+			t.Helper()
+		}, "has not recorded what its control plane accepts"},
+		"another deployment's record, beside a control plane in the same file": {func(t *testing.T,
+			_ *config.Config, nodeDir string,
+		) {
+			t.Helper()
+
+			if err := imageaccept.Write(nodeDir, "fedcba9876543210fedcba9876543210", true,
+				[]string{"codeql"}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, "has not recorded what its control plane accepts"},
 		"no record, dialing elsewhere": {func(t *testing.T, cfg *config.Config, _ string) {
 			t.Helper()
 
@@ -252,39 +278,58 @@ func TestAPullCompletesWithWhatOnlyTheControlPlaneAccepts(t *testing.T) {
 	}
 }
 
-// A PULL WHOSE ACCEPTANCE CHANGED DURING ITS COMPLETION IMPORTS NOTHING: the
-// control plane withdraws google-chrome while the image is being completed with
-// it, and the completed image is not published.
-func TestAPullWhoseAcceptanceChangedDuringItsCompletionImportsNothing(t *testing.T) {
-	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
-	run := newCompletionPull(t, "", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
-	recordFor(t, run.fixture.cfgPath, "google-chrome")
+// A PULL WHOSE ACCEPTANCE CHANGED BEFORE ITS IMPORT IMPORTS NOTHING: the control
+// plane withdraws google-chrome while the image is being completed with it, or
+// after, while the pull installs the kernel under the directory's lock, and the
+// completed image is not published either way.
+func TestAPullWhoseAcceptanceChangedBeforeItsImportImportsNothing(t *testing.T) {
+	for name, during := range map[string]func(withdraw func()){
+		// newCompletionPull's cleanup restores the seam.
+		"during the completion": func(withdraw func()) {
+			attach := attachLoop
+			attachLoop = func(ctx context.Context, path string) (string, func(context.Context) error, error) {
+				withdraw()
 
-	// THE WITHDRAWAL LANDS WHILE THE IMAGE IS ATTACHED, which is during the
-	// completion; newCompletionPull's cleanup restores the seam.
-	nodeDir := filepath.Join(filepath.Dir(run.fixture.cfgPath), "node")
-	attach := attachLoop
-	attachLoop = func(ctx context.Context, path string) (string, func(context.Context) error, error) {
-		if err := imageaccept.Write(nodeDir, acceptanceDeployment, true, nil, time.Now()); err != nil {
-			t.Fatal(err)
-		}
+				return attach(ctx, path)
+			}
+		},
+		// usePullSeams' cleanup restores the seam; the kernel is installed once,
+		// under the lock, after the completion.
+		"under the kernel directory's lock": func(withdraw func()) {
+			kernelInstaller = durablefile.Installer{Rename: func(from, to string) error {
+				withdraw()
 
-		return attach(ctx, path)
-	}
+				return os.Rename(from, to)
+			}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
+			run := newCompletionPull(t, "", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+			recordFor(t, run.fixture.cfgPath, "google-chrome")
 
-	err := run.pull(t)
-	if err == nil || !strings.Contains(err.Error(), "changed while ubuntu-2404-x64 was completed, from "+
-		"[google-chrome] to [], so nothing was imported") {
-		t.Fatalf("images pull answered %v, want it to import nothing", err)
-	}
+			nodeDir := filepath.Join(filepath.Dir(run.fixture.cfgPath), "node")
+			during(func() {
+				if err := imageaccept.Write(nodeDir, acceptanceDeployment, true, nil, time.Now()); err != nil {
+					t.Error(err)
+				}
+			})
 
-	if len(run.backend.launched) != 1 {
-		t.Fatalf("the completion ran %d times, want once before the acceptance was asked again",
-			len(run.backend.launched))
-	}
+			err := run.pull(t)
+			if err == nil || !strings.Contains(err.Error(), "changed while ubuntu-2404-x64 was completed, from "+
+				"[google-chrome] to [], so nothing was imported") {
+				t.Fatalf("images pull answered %v, want it to import nothing", err)
+			}
 
-	if got := run.fixture.publisher.calls(); got != 0 {
-		t.Fatalf("ImportGeneration was reached %d times, want never", got)
+			if len(run.backend.launched) != 1 {
+				t.Fatalf("the completion ran %d times, want once before the acceptance was asked again",
+					len(run.backend.launched))
+			}
+
+			if got := run.fixture.publisher.calls(); got != 0 {
+				t.Fatalf("ImportGeneration was reached %d times, want never", got)
+			}
+		})
 	}
 }
 

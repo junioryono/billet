@@ -10,8 +10,8 @@ import (
 	"github.com/junioryono/billet/internal/imageaccept"
 )
 
-// errAcceptanceUnknown is the refusal when a node that dials a control plane on
-// another machine holds no record of what that control plane accepts.
+// errAcceptanceUnknown is the refusal when a node holds no record of what its
+// deployment's control plane accepts.
 var errAcceptanceUnknown = errors.New("this node has not recorded what its control plane accepts " +
 	"for guest images, which it does at every registration; start the node (`billet local up`) " +
 	"and run this again once it has registered")
@@ -29,11 +29,10 @@ var errAcceptanceUnknown = errors.New("this node has not recorded what its contr
 // generation with less than was accepted and promoting it moves every tier onto
 // an image without what the deployment accepted. That is a record that cannot be
 // read, a deployment that cannot be told, a name this build does not install
-// (validateImages' reason), and no record of this deployment's control plane on
-// a node that may dial one elsewhere. A node with no certificate dials only this
-// machine (config's node.tls rule), so when its file also describes a control
-// plane, that is its control plane, whose list is in the same file and needs no
-// record; a server section beside a node with a certificate proves nothing.
+// (validateImages' reason), and no record of this deployment's control plane at
+// all. A server section in the node's file is no substitute: it proves neither
+// that the node dials that control plane nor that the control plane read this
+// file.
 func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	accepted := cfg.Images.Accepted()
 	if cfg.Node == nil {
@@ -63,8 +62,6 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	}
 
 	switch {
-	case !ok && cfg.Server != nil && cfg.Node.TLS == nil:
-		return accepted, nil
 	case !ok:
 		return nil, errAcceptanceUnknown
 	case !rec.Carried:

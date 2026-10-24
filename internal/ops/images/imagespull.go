@@ -262,7 +262,10 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	// node with no verified generation to boot the completion from imports the
 	// image as published first, as a completion root, which names the kernel, so
 	// that is the one part done under the lock.
-	var components *ceph.GenerationComponents
+	var (
+		components *ceph.GenerationComponents
+		plan       completionPlan
+	)
 
 	if manifest.Schema == imagesource.SchemaV3 {
 		accepted, err := acceptedComponents(cfg)
@@ -270,7 +273,7 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 			return fmt.Errorf("billet images pull: %w", err)
 		}
 
-		plan := planCompletion(manifest, accepted)
+		plan = planCompletion(manifest, accepted)
 
 		asPublished := func(ctx context.Context) (string, error) {
 			lock, err := takeKernelDirLock(ctx, env, *kernelDir,
@@ -300,20 +303,6 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		}
 		if err != nil {
 			return err
-		}
-
-		// ASKED AGAIN BEFORE THE IMPORT, which follows a completion that runs for
-		// as long as its downloads take, in which a registration may have recorded
-		// a different list or the record been withdrawn.
-		now, err := acceptedComponents(cfg)
-		if err != nil {
-			return fmt.Errorf("billet images pull: nothing was imported: %w", err)
-		}
-
-		if completed, wanted := plan.names(), planCompletion(manifest, now).names(); !slices.Equal(completed, wanted) {
-			return fmt.Errorf("billet images pull: what this deployment accepts changed while %s was "+
-				"completed, from %v to %v, so nothing was imported; the next `billet images refresh` "+
-				"completes it with what is accepted now", image, completed, wanted)
 		}
 
 		components = &ceph.GenerationComponents{LeftOut: plan.LeftOut, Installed: installed}
@@ -369,6 +358,23 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	kernel, err := installKernel(kernelInstaller, manifest, dir, *kernelDir)
 	if err != nil {
 		return fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
+	}
+
+	// ASKED AGAIN IMMEDIATELY BEFORE THE IMPORT, after the completion, which runs
+	// for as long as its downloads take, and the wait for the kernel directory,
+	// which another pull may hold for half an hour: in either a registration may
+	// have recorded a different list or the record been withdrawn.
+	if components != nil {
+		now, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("billet images pull: nothing was imported: %w", err)
+		}
+
+		if completed, wanted := plan.names(), planCompletion(manifest, now).names(); !slices.Equal(completed, wanted) {
+			return fmt.Errorf("billet images pull: what this deployment accepts changed while %s was "+
+				"completed, from %v to %v, so nothing was imported; the next `billet images refresh` "+
+				"completes it with what is accepted now", image, completed, wanted)
+		}
 	}
 
 	fmt.Fprintf(env.Stdout, "importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
