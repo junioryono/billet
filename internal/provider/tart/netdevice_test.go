@@ -103,10 +103,10 @@ func newNetworkHost(t *testing.T) usageHost {
 	return h
 }
 
-// A VM'S NETWORK IS THE VMENET ITS LINK'S SOCKET NAMES, and the bridge learned
-// its address on: the VM process's own socket on tart's shared network, and the
-// socket of the softnet its `tart run` started under softnet; counted from the
-// host's side, beside the process found as ever.
+// A VM'S NETWORK IS THE VMENET THE BRIDGE LEARNED ITS ADDRESS ON, carried by the
+// process its link's socket proves: the VM's own on tart's shared network, and
+// the softnet its `tart run` started under softnet; counted from the host's
+// side, beside the process found as ever.
 func TestAVMsNetworkIsTheVMNetItsLinksSocketNames(t *testing.T) {
 	t.Parallel()
 
@@ -118,6 +118,10 @@ func TestAVMsNetworkIsTheVMNetItsLinksSocketNames(t *testing.T) {
 	}{
 		"the shared network": {dev: "vmenet0", n: network{mac: sharedMAC,
 			tables: table, ps: psWith(), sockets: map[string]string{"74207": printed(unitLine("1"))}}},
+		// AS ON macos-01: a socket's unit 4 beside vmenet2, since units and interface
+		// numbers are allocated apart.
+		"a socket whose unit is not its interface's number": {dev: "vmenet0", n: network{mac: sharedMAC,
+			tables: table, ps: psWith(), sockets: map[string]string{"74207": printed(unitLine("4"))}}},
 		"softnet": {dev: "vmenet1", carrier: 62980, start: 16664085550000, n: network{mac: softMAC, tables: table,
 			ps:      psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun),
 			sockets: map[string]string{"74207": "true", "62980": printed(unitLine("2"))}}},
@@ -169,9 +173,6 @@ func TestAVMsDeviceThatCannotBeProvedCostsItsNetworkAlone(t *testing.T) {
 				"62990": printed(unitLine("2"))}}
 	}
 	for name, n := range map[string]network{
-		"the bridge learned the address on another member (a guest claiming it)": shared(network{
-			sockets: map[string]string{"74207": printed(unitLine("2"))},
-		}),
 		"no bridge learned the address": shared(network{mac: "02:00:00:00:00:01"}),
 		"two members hold the address": shared(network{tables: map[string]string{
 			"bridge100": table["bridge100"], "bridge101": printed(sharedMAC + " Vlan1 vmenet4 30 flags=0<>"),
@@ -189,9 +190,12 @@ func TestAVMsDeviceThatCannotBeProvedCostsItsNetworkAlone(t *testing.T) {
 		"the socket's unit cannot be read": shared(network{
 			sockets: map[string]string{"74207": printed("n[ctl com.apple.userspace_ethernet id 14 unit x]")},
 		}),
-		"the VM process holds two sockets": shared(network{
-			sockets: map[string]string{"74207": printed(unitLine("1")) + "; " + printed(unitLine("2"))},
-		}),
+		// WITH ITS OWN SOFTNET RUNNING TOO, so a process holding two is refused,
+		// not passed over for the softnet.
+		"the VM process holds two sockets": {mac: softMAC, tables: table,
+			ps: psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun),
+			sockets: map[string]string{"74207": printed(unitLine("1")) + "; " + printed(unitLine("2")),
+				"62980": printed(unitLine("3"))}},
 		"lsof warned": shared(network{
 			sockets: map[string]string{"74207": printed(unitLine("1")) + "; echo 'lsof: WARNING: x' >&2"},
 		}),
