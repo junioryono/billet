@@ -690,6 +690,10 @@ func (c *Client) RecordLeaseUsage(
 	if wire < nodeapi.VersionJobDestinations {
 		measured.Destinations = nil
 	}
+	if wire < nodeapi.VersionUnansweredFlows && measured.Destinations != nil {
+		without := measured.Destinations.WithoutUnanswered()
+		measured.Destinations = &without
+	}
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/usage"),
 		nodeapi.UsageRequest{Epoch: epoch, Usage: measured, Series: series}, nil)

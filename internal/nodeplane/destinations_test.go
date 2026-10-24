@@ -116,6 +116,11 @@ func TestUnkeepableDestinationsAreRefusedAtTheWire(t *testing.T) {
 			"negative total"},
 		"a tap beside a network unmeasured": {strings.Replace(accepted, `["energy"]`, `["energy","net"]`, 1),
 			"names net unmeasured and gives the tap's totals"},
+		"more unanswered than connections": {strings.Replace(strings.Replace(accepted, `"connections":1}`,
+			`"connections":1,"unanswered":2}`, 1), `"incomplete":false`, `"incomplete":false,"unanswered_counted":true`, 1),
+			"has 2 unanswered of 1 connections"},
+		"unanswered in a report that did not count them": {strings.Replace(accepted, `"connections":1}`,
+			`"connections":1,"unanswered":1}`, 1), "in a report that did not count them"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -176,13 +181,15 @@ func TestTheLargestUsageReportFitsOneRequest(t *testing.T) {
 	const most = int64(1<<63 - 1)
 	usage := aUsage()
 	usage.Destinations = &alloc.JobDestinations{
-		Other:      alloc.JobDestination{SentBytes: most, ReceivedBytes: most, Connections: most},
+		Other: alloc.JobDestination{SentBytes: most, ReceivedBytes: most, Connections: most,
+			Unanswered: most},
 		Incomplete: true, Tap: &alloc.TapTotals{SentBytes: most, ReceivedBytes: most},
+		UnansweredCounted: true,
 	}
 	for i := range alloc.MaxJobDestinations {
 		usage.Destinations.Destinations = append(usage.Destinations.Destinations, alloc.JobDestination{
 			Addr:      fmt.Sprintf("ffff:ffff:ffff:ffff:ffff:ffff:ffff:%x", 0xf000+i),
-			SentBytes: most, ReceivedBytes: most, Connections: most,
+			SentBytes: most, ReceivedBytes: most, Connections: most, Unanswered: most,
 		})
 	}
 	data := bytes.Repeat([]byte{0xff}, alloc.MaxUsageSeriesBytes)

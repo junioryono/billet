@@ -1,0 +1,4 @@
+ResizeRequest.epoch int64
+ResizeRequest.instance_type string
+ResizeRequest.vcpu int
+ResizeRequest.memory int64

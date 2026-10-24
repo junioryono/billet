@@ -122,12 +122,22 @@ type Monitor struct {
 	energy       Energy
 	energyOK     bool
 	energyReadAt time.Time
-	// watts is the meter's last reading, wattsAt when it answered, and wattsOK
-	// whether the last tick read it; a tick that did not leaves the interval
-	// after it unknown.
+	// watts is the meter's last committed reading, wattsAt when it answered,
+	// and wattsOK whether there is one.
 	watts   float64
 	wattsAt time.Time
 	wattsOK bool
+	// energyTick is the last tick whose host-wide reads all answered: the host's
+	// busy time (host), the package or the wall (energy, watts) and every job's
+	// CPU (lastCPU) are its readings, and the next tick that reads them all
+	// shares the energy since it. A tick whose reads did not all answer leaves
+	// it, so its interval is folded into the next one.
+	energyTick time.Time
+	// seenHost is the host's last successful read, from any tick, which a later
+	// read is checked against for a fall or a change of shape: a folded tick's
+	// reads are never committed, but what they saw still counts.
+	seenHost   HostCPU
+	seenHostOK bool
 
 	// counting holds each counted job's open groups. ONLY RUN TOUCHES IT, so
 	// every descriptor is opened, read and closed on one goroutine; a job
@@ -187,6 +197,14 @@ type job struct {
 	// energyBroken is set when any interval of the job's life could not be
 	// attributed, which makes its energy could-not-tell rather than too low.
 	energyBroken bool
+	// energyPending is set when the job lived through a tick whose host-wide
+	// reads did not all answer, until a later tick shares that interval's
+	// energy: a job that ends while it is set has energy no tick shared.
+	energyPending bool
+	// seenCPU is the job's last successful CPU read, from any tick, which a later
+	// read is checked against for a fall.
+	seenCPU   int64
+	seenCPUOK bool
 	// unseen is why the sampler has not seen an interval since the last point
 	// it kept, a read that failed or took a whole interval, so the next point it
 	// keeps is marked with it; GapNone when it has seen every one.
@@ -367,6 +385,7 @@ func (m *Monitor) start(key string, j *job) {
 	}
 	j.counters = counters
 	j.lastCPU, j.lastCPUOK, j.cpuFrom = s.CPUUsage, s.CPUOK, cpuAt
+	j.seenCPU, j.seenCPUOK = s.CPUUsage, s.CPUOK
 	if now.Sub(began) >= m.opts.Interval {
 		j.see(GapSlowRead)
 	}
@@ -494,21 +513,37 @@ func (m *Monitor) tick() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// A HOST-WIDE READ THAT DID NOT ANSWER FOLDS THIS INTERVAL INTO THE NEXT:
+	// the host's busy time, the package counter and the jobs' CPU are lifetime
+	// totals, and the wall is integrated between the readings either side, so
+	// the next tick that reads them all shares the whole span, provided it stays
+	// under staleAfter intervals. Nothing is committed from this tick's reads.
+	readFailed := hostErr != nil
+	var pkgDelta int64
+	var energyOK bool
+	switch {
+	case m.opts.Meter != nil:
+		readFailed = readFailed || wattsErr != nil
+		if wattsErr == nil {
+			pkgDelta, energyOK = m.wallSince(wattsAt, watts)
+		}
+	case m.opts.RAPL:
+		readFailed = readFailed || energyErr != nil
+		if energyErr == nil {
+			pkgDelta, energyOK = m.energySince(now, energy)
+		}
+	}
 	hostOK := hostErr == nil && m.hostOK && host.CPUs > 0 && host.CPUs == m.host.CPUs
 	busyDelta := int64(0)
 	if hostOK {
 		busyDelta = host.Busy - m.host.Busy
 	}
-	pkgDelta, energyOK := m.energySince(now, energy, energyErr)
-	if m.opts.Meter != nil {
-		pkgDelta, energyOK = m.wallSince(wattsAt, watts, wattsErr)
-	}
-	dt := now.Sub(m.lastTick)
+	dt := now.Sub(m.energyTick)
 
 	// THE IDLE POOL IS NEVER MORE THAN WAS MEASURED: a baseline above an
 	// interval's actual draw would otherwise hand out energy that never existed.
 	var idlePool float64
-	if m.opts.IdleWatts > 0 && !m.lastTick.IsZero() {
+	if m.opts.IdleWatts > 0 && !m.energyTick.IsZero() {
 		idlePool = min(m.opts.IdleWatts*dt.Seconds()*1e6, float64(pkgDelta))
 	}
 	activePool := float64(pkgDelta) - idlePool
@@ -526,7 +561,7 @@ func (m *Monitor) tick() {
 	// makes the interval could-not-tell for all of them.
 	deltas := make(map[string]int64, len(samples))
 	var total int64
-	consistent := energyOK && hostOK && busyDelta > 0 && dt > 0
+	consistent := !readFailed && energyOK && hostOK && busyDelta > 0 && dt > 0
 	for key, s := range samples {
 		j := m.jobs[key]
 		if j != snapshot[key] {
@@ -560,25 +595,50 @@ func (m *Monitor) tick() {
 		if c, ok := counted[key]; ok {
 			j.counters = c
 		}
-		if m.shares() && !j.byProcess {
+		// A TICK IS FOLDED only while the span since the last tick that read
+		// everything can still be shared, under staleAfter intervals; past that,
+		// the energy is broken, and the series keeps its points as ever.
+		// THE SPAN IS THE JOB'S: from the later of the last tick that read
+		// everything and its own baseline CPU, as the share that ends it counts.
+		folded := false
+		sharing := m.shares() && !j.byProcess
+		span := now.Sub(maxTime(m.energyTick, j.cpuFrom))
+		// WHAT THE READS THAT DID ANSWER SHOW IS KEPT, on every tick: a counter
+		// seen to fall, or a host seen to change shape, against its last
+		// successful read, is not mended by folding the span.
+		if sharing && m.discontinuity(*s, j, host, hostErr, energy, energyErr) {
+			j.energyBroken = true
+		}
+		switch {
+		case !sharing:
+		case readFailed && (m.energyTick.IsZero() || span >= staleAfter*m.opts.Interval):
+			j.energyBroken = true
+		case readFailed:
+			j.energyPending, folded = true, true
+		default:
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
-			// of the last tick and the job's own baseline CPU.
-			missed := !m.lastTick.IsZero() &&
-				now.Sub(maxTime(m.lastTick, j.cpuFrom)) >= staleAfter*m.opts.Interval
+			// of the last tick that read everything and the job's own baseline CPU.
+			missed := !m.energyTick.IsZero() && span >= staleAfter*m.opts.Interval
 			if !consistent || !measured || missed {
 				j.energyBroken = true
 			} else {
 				j.energyActive += activePool * min(float64(d)/float64(busyDelta), 1)
 				// IDLE ONLY FOR THE PART OF THE INTERVAL THE JOB EXISTED.
-				overlap := now.Sub(maxTime(m.lastTick, j.cpuFrom))
+				overlap := now.Sub(maxTime(m.energyTick, j.cpuFrom))
 				if overlap > 0 {
 					j.energyIdle += idlePool * (overlap.Seconds() / dt.Seconds()) *
 						float64(j.vcpus) / idleDenominator
 				}
 			}
+			j.energyPending = false
 		}
-		j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
+		if !readFailed {
+			j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
+		}
+		if s.CPUOK {
+			j.seenCPU, j.seenCPUOK = s.CPUUsage, true
+		}
 		m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(*s, before, j.byProcess)))
 		// A READ THAT TOOK A WHOLE INTERVAL IS UNSEEN: which of its counters were
 		// read when is not known.
@@ -588,6 +648,11 @@ func (m *Monitor) tick() {
 			cause = GapFailedRead
 		case stalled[key]:
 			cause = GapSlowRead
+		// A FOLDED TICK KEEPS NO POINT FOR THE JOB: the point would hold the
+		// energy before the span, and the next one all of it, so the interval is
+		// marked unseen and the recovery's point spans both.
+		case folded:
+			cause = GapFailedRead
 		}
 		if kept := j.keepPoint(cause, readAt[key], m.opts.Interval); kept != GapNone {
 			m.observeGaps(kept, 1)
@@ -595,7 +660,18 @@ func (m *Monitor) tick() {
 		m.readBounded(*s)
 	}
 
-	m.host, m.hostOK = host, hostErr == nil
+	if hostErr == nil {
+		m.seenHost, m.seenHostOK = host, true
+	}
+	if !readFailed {
+		m.host, m.hostOK, m.energyTick = host, true, now
+		switch {
+		case m.opts.Meter != nil:
+			m.watts, m.wattsAt, m.wattsOK = watts, wattsAt, true
+		case m.opts.RAPL:
+			m.energy, m.energyOK, m.energyReadAt = energy, true, now
+		}
+	}
 	m.lastTick = now
 	m.opts.Observer.TickTook(time.Since(took))
 }
@@ -630,16 +706,27 @@ var errNoRAPL = errors.New("usage: neither rapl nor a meter is configured")
 // package counter or the wall.
 func (m *Monitor) shares() bool { return m.opts.RAPL || m.opts.Meter != nil }
 
-// energySince records a package reading and returns the energy since the last
-// one. A gap long enough for the counter to have wrapped unseen is could not
-// tell, never a small number. Called with mu held.
-func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) {
-	if err != nil {
-		m.energyOK = false
-		return 0, false
+// discontinuity reports whether a tick's reads show the span cannot be shared:
+// the job's CPU fell below its last successful read, the host's busy time fell
+// or its processor count changed since its last successful read, or the package
+// counter's range changed. Called with mu held.
+func (m *Monitor) discontinuity(s Sample, j *job, host HostCPU, hostErr error, e Energy, energyErr error) bool {
+	if s.CPUOK && j.seenCPUOK && s.CPUUsage < j.seenCPU {
+		return true
 	}
+	if hostErr == nil && m.seenHostOK && (host.CPUs != m.seenHost.CPUs || host.Busy < m.seenHost.Busy) {
+		return true
+	}
+
+	return m.opts.RAPL && m.opts.Meter == nil && energyErr == nil && m.energyOK && e.MaxRange != m.energy.MaxRange
+}
+
+// energySince returns the package energy between the last committed reading and
+// e, read at now; the tick commits e only if all its host-wide reads answered.
+// A gap long enough for the counter to have wrapped unseen is could not tell,
+// never a small number. Called with mu held.
+func (m *Monitor) energySince(now time.Time, e Energy) (int64, bool) {
 	prev, prevOK, prevAt := m.energy, m.energyOK, m.energyReadAt
-	m.energy, m.energyOK, m.energyReadAt = e, true, now
 	if !prevOK || prev.MaxRange != e.MaxRange {
 		return 0, false
 	}
@@ -651,11 +738,11 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	return energyDelta(prev.Microjoules, e.Microjoules, e.MaxRange), true
 }
 
-// wallSince records a reading of the wall's power, taken at at, and returns the
-// energy since the last tick's, by the trapezoid between them: the interval the
-// jobs' CPU was read across, which begins just after each reading. A tick that could not read the meter leaves the interval
-// it ends and the one after it unknown, never nothing drawn. Called with mu
-// held.
+// wallSince returns the energy at the wall between the last committed reading
+// and w, taken at at, by the trapezoid between them: the interval the jobs' CPU
+// was read across, which begins just after each reading. A tick whose reading
+// failed commits nothing, so the next good one spans its interval too. Called
+// with mu held.
 //
 // READ ON EVERY TICK, NOT CACHED. A meter polled apart from the sampler answers
 // a total that stands still while its reads fail and then jumps, and charged
@@ -666,15 +753,13 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 // A LONG GAP BETWEEN TWO GOOD READINGS IS UNKNOWN TOO: the trapezoid across it
 // is a guess at what was drawn, and a job started near its end would be given a
 // share of the whole gap. The later reading still begins the next interval.
-func (m *Monitor) wallSince(at time.Time, w float64, err error) (int64, bool) {
-	prev, prevAt, prevOK := m.watts, m.wattsAt, m.wattsOK
-	m.watts, m.wattsAt, m.wattsOK = w, at, err == nil
-	gap := at.Sub(prevAt)
-	if err != nil || !prevOK || gap <= 0 || gap >= staleAfter*m.opts.Interval {
+func (m *Monitor) wallSince(at time.Time, w float64) (int64, bool) {
+	gap := at.Sub(m.wattsAt)
+	if !m.wattsOK || gap <= 0 || gap >= staleAfter*m.opts.Interval {
 		return 0, false
 	}
 
-	return int64((prev + w) / 2 * gap.Seconds() * 1e6), true
+	return int64((m.watts + w) / 2 * gap.Seconds() * 1e6), true
 }
 
 func (j *job) absorb(s Sample, now time.Time) {
@@ -971,7 +1056,7 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 		return sum
 	}
 	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) >= staleAfter*m.opts.Interval
-	sum.Measured.Energy = m.shares() && !j.energyBroken && len(j.points) > 1 && !stale
+	sum.Measured.Energy = m.shares() && !j.energyBroken && !j.energyPending && len(j.points) > 1 && !stale
 	sum.EnergySplit = m.opts.IdleWatts > 0
 	sum.EnergyMeter = m.opts.Meter != nil
 	sum.EnergyActive, sum.EnergyIdle = int64(j.energyActive), int64(j.energyIdle)

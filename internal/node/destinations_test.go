@@ -47,24 +47,28 @@ func TestTheRunnerReportsAJobsDestinationsWithItsUsage(t *testing.T) {
 		"totalled": {
 			result: flows.Result{
 				Destinations: []flows.Destination{
-					{Addr: netip.MustParseAddr("140.82.112.3"), Sent: 9_000, Received: 1_999_000, Connections: 4},
+					{Addr: netip.MustParseAddr("140.82.112.3"), Sent: 9_000, Received: 1_999_000, Connections: 4,
+						Unanswered: 1},
 					{Addr: netip.MustParseAddr("2001:db8::1"), Sent: 100, Received: 200, Connections: 1},
 				},
-				Other:      flows.Destination{Sent: 7, Received: 8, Connections: 2},
+				Other:      flows.Destination{Sent: 7, Received: 8, Connections: 2, Unanswered: 2},
 				Incomplete: true,
 			},
 			want: &alloc.JobDestinations{
 				Destinations: []alloc.JobDestination{
-					{Addr: "140.82.112.3", SentBytes: 9_000, ReceivedBytes: 1_999_000, Connections: 4},
+					{Addr: "140.82.112.3", SentBytes: 9_000, ReceivedBytes: 1_999_000, Connections: 4,
+						Unanswered: 1},
 					{Addr: "2001:db8::1", SentBytes: 100, ReceivedBytes: 200, Connections: 1},
 				},
-				Other:      alloc.JobDestination{SentBytes: 7, ReceivedBytes: 8, Connections: 2},
-				Incomplete: true,
-				Tap:        &alloc.TapTotals{SentBytes: 10_000, ReceivedBytes: 2_000_000},
+				Other:             alloc.JobDestination{SentBytes: 7, ReceivedBytes: 8, Connections: 2, Unanswered: 2},
+				Incomplete:        true,
+				Tap:               &alloc.TapTotals{SentBytes: 10_000, ReceivedBytes: 2_000_000},
+				UnansweredCounted: true,
 			},
 		},
 		"totalled and empty": {
-			want: &alloc.JobDestinations{Tap: &alloc.TapTotals{SentBytes: 10_000, ReceivedBytes: 2_000_000}},
+			want: &alloc.JobDestinations{Tap: &alloc.TapTotals{SentBytes: 10_000, ReceivedBytes: 2_000_000},
+				UnansweredCounted: true},
 		},
 		"not totalled": {unmeasured: true},
 	} {
@@ -112,22 +116,34 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 	}
 
 	res := flows.Result{Destinations: []flows.Destination{
-		{Addr: netip.MustParseAddr("10.0.0.1"), Sent: math.MaxUint64, Received: 1, Connections: 1},
-		{Sent: 5, Received: 6, Connections: 1},
-	}, Other: flows.Destination{Sent: 1, Received: 2, Connections: 3}}
+		{Addr: netip.MustParseAddr("10.0.0.1"), Sent: math.MaxUint64, Received: 1, Connections: 2, Unanswered: 1},
+		{Sent: 5, Received: 6, Connections: 1, Unanswered: 1},
+	}, Other: flows.Destination{Sent: 1, Received: 2, Connections: 3, Unanswered: 2}}
 
 	got := jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: -1, tapReceived: 4})
 	want := &alloc.JobDestinations{
 		Destinations: []alloc.JobDestination{{Addr: "10.0.0.1", SentBytes: math.MaxInt64, ReceivedBytes: 1,
-			Connections: 1}},
-		Other:      alloc.JobDestination{SentBytes: 6, ReceivedBytes: 8, Connections: 4},
-		Incomplete: true,
+			Connections: 2, Unanswered: 1}},
+		Other:             alloc.JobDestination{SentBytes: 6, ReceivedBytes: 8, Connections: 4, Unanswered: 3},
+		Incomplete:        true,
+		UnansweredCounted: true,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("the report carries %+v,\nwant %+v", got, want)
 	}
 	if err := got.Validate(); err != nil {
 		t.Errorf("what the node reports does not validate: %v", err)
+	}
+
+	// A RESULT THAT CANNOT TELL WHAT WENT UNANSWERED REPORTS IT NOT COUNTED,
+	// with no count left on any destination, rather than as the counts it saw.
+	res.UnansweredUnknown = true
+	got = jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: -1, tapReceived: 4})
+	if got.UnansweredCounted || got.Destinations[0].Unanswered != 0 || got.Other.Unanswered != 0 {
+		t.Errorf("a result that could not tell what went unanswered reports %+v", got)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("a report that did not count does not validate: %v", err)
 	}
 
 	// ONE MORE THAN THE LEDGER KEEPS BY NAME goes under Other, and the

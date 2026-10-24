@@ -75,33 +75,35 @@ SELECT codec, series FROM job_series WHERE lease_id = @lease_id;
 -- rows into one string of fixed-width records (internal/alloc
 -- packDestinations: a 3-digit ordinal, the address space-padded to 39
 -- characters, then the sent, received and connection counts as 19 zero-padded
--- digits each, 99 characters a row) and the recursive slot list below cuts one
--- record off the front at each step.
+-- digits each, then the unanswered count the same way or 19 spaces where the
+-- report did not count it (migration 68), 118 characters a row) and the
+-- recursive slot list below cuts one record off the front at each step.
 --
 -- EACH STEP CARRIES THE REST rather than indexing into the whole string,
 -- because both engines find a character offset in TEXT by scanning from its
 -- start: indexed, the same report took 57 ms on PostgreSQL.
 WITH RECURSIVE slot (n, rec, rest) AS (
-    SELECT 0, substr(CAST(@packed AS TEXT), 1, 99),
-           substr(CAST(@packed AS TEXT), 100)
+    SELECT 0, substr(CAST(@packed AS TEXT), 1, 118),
+           substr(CAST(@packed AS TEXT), 119)
      WHERE 0 < CAST(@row_count AS BIGINT)
     UNION ALL
-    SELECT n + 1, substr(rest, 1, 99), substr(rest, 100)
+    SELECT n + 1, substr(rest, 1, 118), substr(rest, 119)
       FROM slot WHERE n + 1 < CAST(@row_count AS BIGINT)
 )
 INSERT INTO job_destinations
-     (lease_id, ordinal, addr, sent_bytes, received_bytes, connections)
+     (lease_id, ordinal, addr, sent_bytes, received_bytes, connections, unanswered)
 SELECT CAST(@lease_id AS TEXT),
        CAST(substr(rec, 1, 3) AS BIGINT),
        rtrim(substr(rec, 4, 39)),
        CAST(substr(rec, 43, 19) AS BIGINT),
        CAST(substr(rec, 62, 19) AS BIGINT),
-       CAST(substr(rec, 81, 19) AS BIGINT)
+       CAST(substr(rec, 81, 19) AS BIGINT),
+       CAST(NULLIF(rtrim(substr(rec, 100, 19)), '') AS BIGINT)
   FROM slot;
 
 -- name: ReadJobDestinations :many
 -- One lease's destinations in the order the node gave them, the total beyond
 -- them last.
-SELECT ordinal, addr, sent_bytes, received_bytes, connections
+SELECT ordinal, addr, sent_bytes, received_bytes, connections, unanswered
   FROM job_destinations WHERE lease_id = @lease_id
  ORDER BY ordinal;

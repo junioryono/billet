@@ -1,0 +1,6 @@
+EnrollResponse.state string
+EnrollResponse.fingerprint string
+EnrollResponse.cert_pem tag omitempty
+EnrollResponse.cert_pem string
+EnrollResponse.ca_pem tag omitempty
+EnrollResponse.ca_pem string

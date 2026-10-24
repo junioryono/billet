@@ -136,10 +136,11 @@ func exampleUsage(points []usage.Point) alloc.JobUsage {
 			Destinations: []alloc.JobDestination{
 				{Addr: "140.82.112.4", SentBytes: 3_100_000, ReceivedBytes: 352_000_000, Connections: 4},
 				{Addr: "185.199.108.133", SentBytes: 410_000, ReceivedBytes: 61_000_000, Connections: 12},
-				{Addr: "10.0.0.2", SentBytes: 24_000, ReceivedBytes: 61_000, Connections: 310},
+				{Addr: "10.0.0.2", SentBytes: 24_000, ReceivedBytes: 61_000, Connections: 310, Unanswered: 2},
 			},
-			Other: alloc.JobDestination{SentBytes: 9_000, ReceivedBytes: 120_000, Connections: 3},
-			Tap:   &alloc.TapTotals{SentBytes: 3_560_000, ReceivedBytes: 413_400_000},
+			Other:             alloc.JobDestination{SentBytes: 9_000, ReceivedBytes: 120_000, Connections: 3},
+			Tap:               &alloc.TapTotals{SentBytes: 3_560_000, ReceivedBytes: 413_400_000},
+			UnansweredCounted: true,
 		},
 	}
 }

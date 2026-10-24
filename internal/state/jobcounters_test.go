@@ -28,6 +28,9 @@ func TestAUsageRowWrittenAtVersion57ReadsBackUncounted(t *testing.T) {
 			`ALTER TABLE job_usage DROP COLUMN tap_sent_bytes`,
 			`ALTER TABLE job_usage DROP COLUMN tap_received_bytes`,
 			`DELETE FROM schema_migrations WHERE version = 59`,
+			// MIGRATION 68 ADDED A COLUMN TO THE TABLE DROPPED ABOVE, so the reopen
+			// applies it again to the table 59 recreates.
+			`DELETE FROM schema_migrations WHERE version = 68`,
 			`ALTER TABLE job_usage DROP COLUMN cycles`,
 			`ALTER TABLE job_usage DROP COLUMN instructions`,
 			`ALTER TABLE job_usage DROP COLUMN cache_references`,
@@ -80,6 +83,11 @@ func TestAUsageRowWrittenAtVersion57ReadsBackUncounted(t *testing.T) {
 			if v.Valid {
 				t.Errorf("%s reads %d on a row written before it existed, want NULL", name, v.Int64)
 			}
+		}
+		// THE TABLES THE REWIND DROPPED ARE BACK WHOLE, the columns later
+		// migrations added to them included.
+		if _, err := ReadQueries(q).ReadJobDestinations(t.Context(), "l57"); err != nil {
+			return fmt.Errorf("ReadJobDestinations: %w", err)
 		}
 
 		return nil

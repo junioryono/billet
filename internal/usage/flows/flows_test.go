@@ -291,6 +291,149 @@ func TestDestinationsBeyondTheCapFoldIntoOther(t *testing.T) {
 	}
 }
 
+// A CONNECTION THAT GOT NOTHING BACK IS COUNTED AGAINST ITS DESTINATION: a SYN
+// no one answered, or a DNS query with no reply, is the stall a job's own log
+// cannot place. One that was answered, even with nothing but a reset, is not.
+// A flow the tracker kept no packet counts for says nothing either way, so a
+// result holding one cannot say what went unanswered anywhere. Beyond the cap
+// the count is kept in Other.
+func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.T) {
+	t.Parallel()
+
+	resolver := netip.MustParseAddr("172.31.1.1")
+	a := NewAccountant()
+	a.Watch("lease-1", guest, began, nil)
+
+	a.Observe(flow(1, guest, github, 120, 4000))
+	stalled := flow(2, guest, github, 180, 0)
+	stalled.OrigPackets = 3
+	a.Observe(stalled)
+	reset := flow(3, guest, github, 60, 40)
+	reset.OrigPackets, reset.ReplyPackets = 1, 1
+	a.Observe(reset)
+	query := flow(4, guest, resolver, 60, 0)
+	query.Protocol, query.DestPort, query.OrigPackets = 17, 53, 1
+	a.Observe(query)
+
+	r, _ := a.Final("lease-1", nil, ended)
+	if r.UnansweredUnknown {
+		t.Errorf("a result whose every flow carried packet counts says it cannot tell what went unanswered")
+	}
+	want := map[netip.Addr]Destination{
+		github:   {Addr: github, Sent: 360, Received: 4040, Connections: 3, Unanswered: 1},
+		resolver: {Addr: resolver, Sent: 60, Connections: 1, Unanswered: 1},
+	}
+	if len(r.Destinations) != len(want) {
+		t.Fatalf("destinations = %+v, want %+v", r.Destinations, want)
+	}
+	for _, d := range r.Destinations {
+		if d != want[d.Addr] {
+			t.Errorf("destination %s = %+v, want %+v", d.Addr, d, want[d.Addr])
+		}
+	}
+
+	unknown := NewAccountant()
+	unknown.Watch("lease-3", guest, began, nil)
+	unknown.Observe(stalled)
+	unknown.Observe(flow(5, guest, npm, 0, 0))
+	if r, _ := unknown.Final("lease-3", nil, ended); !r.UnansweredUnknown {
+		t.Errorf("a result holding a flow with no packet counts says it could tell what went unanswered: %+v", r)
+	}
+
+	// AN ENTRY THE PREVIOUS HOLDER LEFT OPEN WITHOUT PACKET COUNTS hides the
+	// guest's reuse of its tuple, so a stall on it could not be noticed and the
+	// result cannot say none went unanswered. One already destroyed before the
+	// job was watched, replayed from the unclaimed ring, is no tuple the guest
+	// can send on and takes nothing from the job's counts, and neither does one
+	// left open with its counts.
+	counterless := startedAt(flow(6, guest, npm, 0, 0), began.Add(-time.Minute))
+	for name, tc := range map[string]struct {
+		destroyedBefore, openAtWatch []Flow
+		unknown                      bool
+	}{
+		"open when watched":        {openAtWatch: []Flow{counterless}, unknown: true},
+		"destroyed before watched": {destroyedBefore: []Flow{counterless}},
+		"left open with counts": {openAtWatch: []Flow{
+			startedAt(flow(6, guest, npm, 5, 5), began.Add(-time.Minute))}},
+	} {
+		inherits := NewAccountant()
+		for _, f := range tc.destroyedBefore {
+			inherits.Observe(f)
+		}
+		inherits.Watch("lease-4", guest, began, tc.openAtWatch)
+		inherits.Observe(stalled)
+		r, _ := inherits.Final("lease-4", nil, ended)
+		if r.UnansweredUnknown != tc.unknown {
+			t.Errorf("an inherited entry %s: UnansweredUnknown = %v, want %v", name, r.UnansweredUnknown, tc.unknown)
+		}
+		if !tc.unknown && (len(r.Destinations) != 1 || r.Destinations[0].Unanswered != 1) {
+			t.Errorf("an inherited entry %s took the job's own stall from it: %+v", name, r.Destinations)
+		}
+	}
+
+	// A COUNTERLESS FLOW THE UNCLAIMED RING DROPPED before the job was
+	// watched, and after its grant, could have been its stall; one dropped
+	// from before the grant was another holder's.
+	for name, tc := range map[string]struct {
+		start   time.Time
+		unknown bool
+	}{
+		"started after the grant":  {started, true},
+		"started before the grant": {began.Add(-time.Minute), false},
+	} {
+		ring := NewAccountant()
+		ring.Observe(startedAt(flow(8, guest, npm, 0, 0), tc.start))
+		for i := range MaxUnclaimed {
+			ring.Observe(startedAt(flow(uint32(100+i), other, github, 1, 1), tc.start))
+		}
+		ring.Watch("lease-7", guest, began, nil)
+		if r, _ := ring.Final("lease-7", nil, ended); r.UnansweredUnknown != tc.unknown {
+			t.Errorf("a counterless flow the ring dropped, %s: UnansweredUnknown = %v, want %v", name,
+				r.UnansweredUnknown, tc.unknown)
+		}
+	}
+
+	// A FLOW DROPPED UNCOUNTED, for want of a start time or past MaxFlows, that
+	// carried no packet counts could have been the stall: the result says it
+	// cannot tell, not only that it is incomplete.
+	unstamped := flow(7, guest, npm, 0, 0)
+	unstamped.Start = time.Time{}
+	full := NewAccountant()
+	full.Watch("lease-5", guest, began, nil)
+	for i := range MaxFlows {
+		full.Observe(flow(uint32(i+1), guest, github, 1, 1))
+	}
+	full.Observe(flow(MaxFlows+1, guest, npm, 0, 0))
+	stampless := NewAccountant()
+	stampless.Watch("lease-6", guest, began, nil)
+	stampless.Observe(unstamped)
+	for name, r := range map[string]Result{
+		"past MaxFlows":      func() Result { r, _ := full.Final("lease-5", nil, ended); return r }(),
+		"with no start time": func() Result { r, _ := stampless.Final("lease-6", nil, ended); return r }(),
+	} {
+		if !r.Incomplete || !r.UnansweredUnknown {
+			t.Errorf("a counterless flow dropped %s: incomplete %v, unanswered unknown %v, want both", name,
+				r.Incomplete, r.UnansweredUnknown)
+		}
+	}
+
+	beyond := NewAccountant()
+	beyond.Watch("lease-2", guest, began, nil)
+	for i := range MaxDestinations + 3 {
+		dst := netip.AddrFrom4([4]byte{10, 2, byte(i / 256), byte(i % 256)})
+		// The answered ones are larger, so the three unanswered fall past the cap.
+		f := flow(uint32(i+1), guest, dst, 1000, 1000)
+		if i >= MaxDestinations {
+			f = flow(uint32(i+1), guest, dst, 1, 0)
+		}
+		beyond.Observe(f)
+	}
+	r, _ = beyond.Final("lease-2", nil, ended)
+	if r.Other.Unanswered != 3 || r.Other.Connections != 3 {
+		t.Errorf("Other = %+v, want the three unanswered connections beyond the cap", r.Other)
+	}
+}
+
 // PAST MaxFlows A JOB IS MARKED INCOMPLETE, never silently short.
 func TestAJobOpeningTooManyFlowsIsIncomplete(t *testing.T) {
 	t.Parallel()
