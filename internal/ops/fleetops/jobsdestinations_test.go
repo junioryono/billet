@@ -88,7 +88,7 @@ func TestJobsShowPrintsWhereAJobsTrafficWent(t *testing.T) {
 	for _, want := range []string{
 		"and 5 more: sent 0 B, received 15.0 KiB, 5 connections",
 		"other      sent 2.0 KiB, received 3.0 KiB, 4 connections (beyond the 256 destinations the node keeps by name)",
-		"complete   no: flows may have been missed, so every total here is a lower bound",
+		"complete   no: flows may have been missed, so every byte and connection total here is a lower bound",
 		// 325 KiB received across the named destinations and 3 KiB beyond them.
 		"tap        sent 10.0 KiB, received 300.0 KiB; tap minus attributed: sent +8.0 KiB, received -28.0 KiB",
 		"(a comparison of two counters read a moment apart, not a measurement of what was missed)",
@@ -250,6 +250,34 @@ func TestJobsShowNamesEveryStalledDestinationAndQualifiesAnIncompleteOne(t *test
 	if line := lineStarting(t, none, "unanswered"); !strings.HasPrefix(line, "unanswered none observed, but flows "+
 		"may have been missed") || strings.Contains(line, "every connection the guest sent on got something back") {
 		t.Errorf("an incomplete result that saw none unanswered reads %q", line)
+	}
+}
+
+// THE PAGE WORDS COMPLETENESS AND WHAT GOT NOTHING BACK AS THE TEXT REPORT
+// DOES, for each shape the count can take, so neither says a bound or a "none"
+// the other does not.
+func TestThePageWordsUnansweredAsTheTextReportDoes(t *testing.T) {
+	t.Parallel()
+
+	stalled := manyDestinations(3)
+	stalled[0].Unanswered = 1
+	for name, d := range map[string]*alloc.JobDestinations{
+		"counted, incomplete":     {Destinations: stalled, UnansweredCounted: true, Incomplete: true},
+		"counted, none, complete": {Destinations: manyDestinations(3), UnansweredCounted: true},
+		"counted, none, incomplete": {Destinations: manyDestinations(3), UnansweredCounted: true,
+			Incomplete: true},
+		"not counted": {Destinations: stalled[1:]},
+	} {
+		text := renderedDestinations(t, d)
+		page := destinationsSection(alloc.JobRecord{}, &alloc.RecordedUsage{JobUsage: alloc.JobUsage{Destinations: d}})
+		for label, said := range map[string]string{"complete": page.Complete, "unanswered": page.Unanswered} {
+			if line := lineStarting(t, text, label); line != fmt.Sprintf("%-11s%s", label, said) {
+				t.Errorf("%s: the page's %s says %q and the text report %q", name, label, said, line)
+			}
+		}
+		if page.Counted != d.UnansweredCounted {
+			t.Errorf("%s: the page draws the unanswered column %v, want %v", name, page.Counted, d.UnansweredCounted)
+		}
 	}
 }
 

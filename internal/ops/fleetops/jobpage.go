@@ -485,7 +485,7 @@ func destinationsSection(rec alloc.JobRecord, m *alloc.RecordedUsage) pageDestin
 		out.More = fmt.Sprintf("and %d more: %s", len(rest), sumOf(rest...).said(d.UnansweredCounted))
 	}
 	if d.Incomplete {
-		out.Complete = "no: flows may have been missed, so every total here is a lower bound"
+		out.Complete = "no: flows may have been missed, so every byte and connection total here is a lower bound"
 	}
 	if d.Tap == nil {
 		out.Tap = "not read, so there is nothing to compare the destinations with"

@@ -142,9 +142,10 @@ type watch struct {
 	// so it cannot be counted, only noticed.
 	inherited  map[entry]Flow
 	incomplete bool
-	// unansweredUnknown says an entry the previous holder left carried no
-	// packet counts, so the guest could reuse its tuple unnoticed and get
-	// nothing back on it.
+	// unansweredUnknown says a flow that could be the job's and was not
+	// counted carried no packet counts: an entry the previous holder left,
+	// whose tuple the guest could reuse unnoticed, a flow with no start time,
+	// or one past MaxFlows.
 	unansweredUnknown bool
 }
 
@@ -236,6 +237,7 @@ func (a *Accountant) observe(f Flow) {
 	// holder's, and counting it either way would be a guess.
 	if f.Start.IsZero() {
 		w.incomplete = true
+		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
 	}
@@ -263,6 +265,7 @@ func (a *Accountant) observe(f Flow) {
 	prev, seen := w.counted[key]
 	if !seen && len(w.counted) >= MaxFlows {
 		w.incomplete = true
+		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
 	}

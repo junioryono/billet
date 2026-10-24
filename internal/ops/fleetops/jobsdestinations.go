@@ -69,7 +69,7 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 		sumOf(d.Other).said(d.UnansweredCounted), alloc.MaxJobDestinations)
 	line("unanswered", "%s", unansweredText(d))
 	if d.Incomplete {
-		line("complete", "no: flows may have been missed, so every total here is a lower bound")
+		line("complete", "no: flows may have been missed, so every byte and connection total here is a lower bound")
 	} else {
 		line("complete", "yes")
 	}

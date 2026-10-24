@@ -362,6 +362,30 @@ func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.
 		}
 	}
 
+	// A FLOW DROPPED UNCOUNTED, for want of a start time or past MaxFlows, that
+	// carried no packet counts could have been the stall: the result says it
+	// cannot tell, not only that it is incomplete.
+	unstamped := flow(7, guest, npm, 0, 0)
+	unstamped.Start = time.Time{}
+	full := NewAccountant()
+	full.Watch("lease-5", guest, began, nil)
+	for i := range MaxFlows {
+		full.Observe(flow(uint32(i+1), guest, github, 1, 1))
+	}
+	full.Observe(flow(MaxFlows+1, guest, npm, 0, 0))
+	stampless := NewAccountant()
+	stampless.Watch("lease-6", guest, began, nil)
+	stampless.Observe(unstamped)
+	for name, r := range map[string]Result{
+		"past MaxFlows":      func() Result { r, _ := full.Final("lease-5", nil, ended); return r }(),
+		"with no start time": func() Result { r, _ := stampless.Final("lease-6", nil, ended); return r }(),
+	} {
+		if !r.Incomplete || !r.UnansweredUnknown {
+			t.Errorf("a counterless flow dropped %s: incomplete %v, unanswered unknown %v, want both", name,
+				r.Incomplete, r.UnansweredUnknown)
+		}
+	}
+
 	beyond := NewAccountant()
 	beyond.Watch("lease-2", guest, began, nil)
 	for i := range MaxDestinations + 3 {
