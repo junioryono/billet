@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -68,7 +69,7 @@ tiers:
 // because calling the helper directly would stay green with the production call
 // sites reverted to Open, which is exactly the regression this guards.
 func TestOperatorCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := ledgertest.Dir(t)
 	cfg := writeCAConfig(t, stateDir)
 	ctx := t.Context()
 
@@ -129,7 +130,10 @@ func TestOperatorCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 // either call site could be reverted to state.Open while everything else stayed
 // green, which is the regression this pair exists to catch.
 func TestTheDirectLedgerCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
-	stateDir := t.TempDir()
+	// SEEDED, here and in this file's other tests: the server's open migrating
+	// an empty ledger spent its thirty-second startup budget on a loaded runner
+	// (#188, CI 2026-10-22), and none of them is about migrating.
+	stateDir := ledgertest.Dir(t)
 	cfg := writeAdminConfig(t, stateDir)
 	ctx := t.Context()
 
@@ -196,7 +200,7 @@ func TestTheDirectLedgerCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 // server transaction genuinely open, which is what a reverted View migration
 // would fail.
 func TestAReadOnlyCommandRunsWhileTheServerHoldsTheWriteLock(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := ledgertest.Dir(t)
 	cfg := writeCAConfig(t, stateDir)
 	ctx := t.Context()
 
