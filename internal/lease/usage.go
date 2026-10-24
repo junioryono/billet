@@ -47,6 +47,11 @@ const (
 	// used over its life (macOS's per-process energy, for a tart VM): already
 	// attributed, with no idle share to report.
 	EnergyProcess = "process"
+	// EnergyMeter is the whole host's energy at the wall, from the power meter it
+	// is plugged into, split as EnergyRAPL is: the energy above the host's
+	// configured idle draw shared by CPU time, and the idle draw by reserved
+	// vCPUs.
+	EnergyMeter = "meter"
 )
 
 // UsageSeriesCodec is the series encoding with no clock: its points are
@@ -193,6 +198,20 @@ func (u JobUsage) Measured(group string) bool {
 	return !slices.Contains(u.Unmeasured, group)
 }
 
+// WithoutEnergyFrom is u with its energy named unmeasured when it came from
+// source, for a wire that does not know that source: it says less, never
+// something else. A report whose energy came from anything else is unchanged.
+func (u JobUsage) WithoutEnergyFrom(source string) JobUsage {
+	if u.EnergySource != source || !u.Measured(UsageEnergy) {
+		return u
+	}
+	u.EnergyActiveMicrojoules, u.EnergyIdleMicrojoules, u.EnergySource = 0, 0, ""
+	u.Unmeasured = append(slices.Clone(u.Unmeasured), UsageEnergy)
+	slices.Sort(u.Unmeasured)
+
+	return u
+}
+
 // Validate refuses a report the ledger could not keep faithfully.
 func (u JobUsage) Validate() error {
 	if u.Source != UsageSourceHost {
@@ -247,7 +266,7 @@ func (u JobUsage) Validate() error {
 		if u.EnergyIdleMicrojoules != 0 {
 			return fmt.Errorf("alloc: %s energy has no idle share, so it cannot report one", u.EnergySource)
 		}
-	case u.EnergySource != EnergyRAPL:
+	case u.EnergySource != EnergyRAPL && u.EnergySource != EnergyMeter:
 		return fmt.Errorf("alloc: energy source %q is not one this control plane records", u.EnergySource)
 	}
 	if u.Counters != nil {

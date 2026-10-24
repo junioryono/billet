@@ -12,8 +12,15 @@ type Options struct {
 	Interval time.Duration
 	// RAPL reads the package energy counter each tick.
 	RAPL bool
-	// IdleWatts is the host's measured idle package power; zero means no
-	// baseline, and the whole package is shared by CPU time.
+	// Meter reads the host's energy at the wall, as the power meter it is
+	// plugged into integrated it, in place of the package counter: set, it is
+	// what each tick shares, and RAPL is not read. A tart VM's energy is then a
+	// share of it rather than macOS's estimate for the VM's process. Nil reads
+	// none.
+	Meter func() (Energy, error)
+	// IdleWatts is the host's measured idle power for whichever is read, the
+	// package or the wall; zero means no baseline, and the whole of it is shared
+	// by CPU time.
 	IdleWatts float64
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
@@ -155,6 +162,9 @@ type job struct {
 	points     []Point
 
 	energyActive, energyIdle float64
+	// byProcess says the job's energy is the kernel's own estimate for its
+	// process (a tart VM with no meter), not a share of what the host read.
+	byProcess bool
 	// processEnergyAt is when the process's energy was last read: a lifetime
 	// total is the job's whole energy only if it is recent.
 	processEnergyAt time.Time
@@ -270,7 +280,8 @@ func (m *Monitor) ask(r request, limit time.Duration) (reply, bool) {
 // pending, which is known and never attributed.
 func (m *Monitor) Start(key string, target Target, vcpus int) {
 	now := m.opts.Now()
-	j := &job{target: target, vcpus: vcpus, first: now, pending: true}
+	j := &job{target: target, vcpus: vcpus, first: now, pending: true,
+		byProcess: target.Process && m.opts.Meter == nil}
 	j.points = append(j.points, j.point(now))
 	m.mu.Lock()
 	m.jobs[key] = j
@@ -330,8 +341,8 @@ func (m *Monitor) continueFrom(j *job, s Sample, now time.Time) {
 	before := j.seen
 	j.pending = false
 	j.absorb(s, now)
-	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
-	if unread(s, before, j.target.Process) {
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.byProcess)))
+	if unread(s, before, j.byProcess) {
 		j.see(GapFailedRead)
 
 		return
@@ -382,7 +393,10 @@ func (m *Monitor) tick() {
 	host, hostErr := m.reader.ReadHostCPU()
 	var energy Energy
 	energyErr := errNoRAPL
-	if m.opts.RAPL {
+	switch {
+	case m.opts.Meter != nil:
+		energy, energyErr = m.opts.Meter()
+	case m.opts.RAPL:
 		energy, energyErr = m.reader.ReadEnergy()
 	}
 	samples := make(map[string]*Sample, len(snapshot))
@@ -470,7 +484,7 @@ func (m *Monitor) tick() {
 		if c, ok := counted[key]; ok {
 			j.counters = c
 		}
-		if m.opts.RAPL {
+		if m.shares() && !j.byProcess {
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
 			// of the last tick and the job's own baseline.
@@ -489,12 +503,12 @@ func (m *Monitor) tick() {
 			}
 		}
 		j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
-		m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(*s, before, j.target.Process)))
+		m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(*s, before, j.byProcess)))
 		// A READ THAT TOOK A WHOLE INTERVAL IS UNSEEN: which of its counters were
 		// read when is not known.
 		cause := GapNone
 		switch {
-		case unread(*s, before, j.target.Process):
+		case unread(*s, before, j.byProcess):
 			cause = GapFailedRead
 		case stalled[key]:
 			cause = GapSlowRead
@@ -532,8 +546,13 @@ func maxTime(a, b time.Time) time.Time {
 	return b
 }
 
-// errNoRAPL stands in for a reading a monitor without RAPL never takes.
-var errNoRAPL = errors.New("usage: rapl is not configured")
+// errNoRAPL stands in for a reading a monitor without RAPL or a meter never
+// takes.
+var errNoRAPL = errors.New("usage: neither rapl nor a meter is configured")
+
+// shares reports whether the monitor reads an energy it shares among jobs: the
+// package counter or the wall.
+func (m *Monitor) shares() bool { return m.opts.RAPL || m.opts.Meter != nil }
 
 // energySince records a package reading and returns the energy since the last
 // one. A gap long enough for the counter to have wrapped unseen is could not
@@ -545,7 +564,7 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	}
 	prev, prevOK, prevAt := m.energy, m.energyOK, m.energyReadAt
 	m.energy, m.energyOK, m.energyReadAt = e, true, now
-	if !prevOK || prev.MaxRange != e.MaxRange {
+	if !prevOK || prev.MaxRange != e.MaxRange || prev.Epoch != e.Epoch {
 		return 0, false
 	}
 	wrapSeconds := float64(e.MaxRange) / 1e6 / maxPackageWatts
@@ -602,7 +621,7 @@ func (j *job) absorb(s Sample, now time.Time) {
 
 func (j *job) point(now time.Time) Point {
 	energy := int64(j.energyActive)
-	if j.target.Process {
+	if j.byProcess {
 		energy = j.latest.ProcessEnergy
 	}
 
@@ -726,7 +745,10 @@ type Summary struct {
 	EnergySplit bool
 	// EnergyProcess says EnergyActive is the kernel's own estimate for the job's
 	// process (Target.Process), not a share of the package counter.
-	EnergyProcess            bool
+	EnergyProcess bool
+	// EnergyMeter says the energy shared was the whole host's at the wall, read
+	// from its power meter, not the package counter.
+	EnergyMeter              bool
 	EnergyActive, EnergyIdle int64 // µJ
 	// Counters is what the hardware counters saw the job's vCPU threads do; nil
 	// when the job was not counted.
@@ -794,13 +816,13 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	if counting {
 		j.counters = counters
 	}
-	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.byProcess)))
 	// WHAT THIS READ COULD NOT SEE IS KEPT ON THE JOB, not only in the summary:
 	// a destroy that fails discards the summary, and the Final its retry asks
 	// for must still mark the interval. A read that failed, one that took a
 	// whole interval, and one that saw a counter fall all leave it unseen.
 	switch {
-	case unread(s, before, j.target.Process):
+	case unread(s, before, j.byProcess):
 		j.see(GapFailedRead)
 	case now.Sub(began) >= m.opts.Interval:
 		j.see(GapSlowRead)
@@ -820,7 +842,7 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	// energy. With energy shared from the package, that interval is unseen
 	// rather than shown using none.
 	unseen := GapNone
-	if m.opts.RAPL && !j.target.Process {
+	if m.shares() && !j.byProcess {
 		unseen = GapFinalEnergy
 	}
 	points := append(append([]Point(nil), j.points...), j.nextPoint(now, unseen, m.opts.Interval))
@@ -839,7 +861,7 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	// sampling loses any of it, but only a recent reading is the whole job's: one
 	// from the final read, or from a tick the job did not outlive by
 	// staleAfter intervals. An older one is could-not-tell, never a smaller total.
-	if j.target.Process {
+	if j.byProcess {
 		fresh := now.Sub(j.processEnergyAt) < staleAfter*m.opts.Interval
 		sum.Measured.Energy, sum.EnergyProcess = j.seen.processEnergy && fresh, true
 		sum.EnergyActive = j.latest.ProcessEnergy
@@ -847,8 +869,9 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 		return sum
 	}
 	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) >= staleAfter*m.opts.Interval
-	sum.Measured.Energy = m.opts.RAPL && !j.energyBroken && len(j.points) > 1 && !stale
+	sum.Measured.Energy = m.shares() && !j.energyBroken && len(j.points) > 1 && !stale
 	sum.EnergySplit = m.opts.IdleWatts > 0
+	sum.EnergyMeter = m.opts.Meter != nil
 	sum.EnergyActive, sum.EnergyIdle = int64(j.energyActive), int64(j.energyIdle)
 
 	return sum

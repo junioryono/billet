@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -46,6 +47,28 @@ type NodeMonitoringConfig struct {
 	// the job as the guest's own unverified view. Off unless true; it needs
 	// node.cache, whose listener and per-guest bearer the agent reports through.
 	Guest bool `yaml:"guest,omitempty"`
+	// Meter reads the whole host's power at the wall from the smart plug it is
+	// plugged into, and shares that energy among jobs in place of RAPL's: above
+	// its idle draw by CPU time, the idle draw by reserved vCPUs. It is the one
+	// energy source a Mac has. Exclusive with rapl.
+	Meter *MeterConfig `yaml:"meter,omitempty"`
+}
+
+// MeterConfig names the power meter a host is plugged into.
+type MeterConfig struct {
+	// Shelly is the base address of a Shelly Gen2 or later plug (Plus, Pro,
+	// Gen3, Gen4), such as http://192.168.1.246, read through its local RPC API.
+	// It has no authentication; a plug with authentication enabled is refused
+	// when read.
+	Shelly string `yaml:"shelly"`
+	// Switch is the plug's switch (output) id; 0, the default, on a
+	// single-outlet plug.
+	Switch int `yaml:"switch,omitempty"`
+	// IdleWatts is the host's power at the wall with no jobs running, measured
+	// by the operator from the same plug. Required: energy at the wall is mostly
+	// the machine idling, and with no baseline every joule of it would be
+	// charged to whatever jobs ran.
+	IdleWatts float64 `yaml:"idle_watts"`
 }
 
 const (
@@ -65,6 +88,8 @@ const (
 	// maxIdlePackageWatts is far above any socket's idle draw; it exists to
 	// refuse a unit mistake (milliwatts) rather than to model hardware.
 	maxIdlePackageWatts = 2000
+	// maxMeterSwitch bounds a plug's switch id; a Shelly Pro has at most four.
+	maxMeterSwitch = 15
 )
 
 // IntervalDuration is the sampling interval, with the default applied.
@@ -111,7 +136,8 @@ func (c *Config) validateMonitoringNode() []error {
 	case ProviderTart:
 		if m.RAPL || m.IdlePackageWatts != 0 {
 			errs = append(errs, errors.New("node.monitoring.rapl and idle_package_watts are Linux "+
-				"package counters, and a tart VM's energy is macOS's own estimate for its process"))
+				"package counters, and a tart VM's energy is macOS's own estimate for its process, or "+
+				"the wall's with node.monitoring.meter"))
 		}
 	default:
 		errs = append(errs, fmt.Errorf("node.monitoring is set but this node's provider is %s, "+
@@ -143,6 +169,46 @@ func (c *Config) validateMonitoringNode() []error {
 	case w > 0 && !m.RAPL:
 		errs = append(errs, errors.New("node.monitoring.idle_package_watts is set but rapl is not, "+
 			"and the baseline only splits the energy RAPL measures"))
+	}
+	if m.Meter != nil {
+		errs = append(errs, m.Meter.validate(m.RAPL)...)
+	}
+
+	return errs
+}
+
+// validate refuses a meter this node could not read, or one beside the package
+// counter.
+//
+// ONE ENERGY SOURCE A HOST: the wall includes the package, so sharing both
+// would charge every job twice.
+func (m *MeterConfig) validate(rapl bool) []error {
+	var errs []error
+	if rapl {
+		errs = append(errs, errors.New("node.monitoring.meter and rapl are both set, and a host's "+
+			"energy has one source: the wall includes the package, so keep one"))
+	}
+
+	u, err := url.Parse(strings.TrimSpace(m.Shelly))
+	switch {
+	case strings.TrimSpace(m.Shelly) == "":
+		errs = append(errs, errors.New("node.monitoring.meter.shelly is empty; name the plug's base "+
+			"address, such as http://192.168.1.246"))
+	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+		errs = append(errs, fmt.Errorf("node.monitoring.meter.shelly %q is not an http or https "+
+			"address with a host", m.Shelly))
+	case u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/"):
+		errs = append(errs, fmt.Errorf("node.monitoring.meter.shelly %q names more than the plug: "+
+			"give its base address alone, with no credentials, path or query", m.Shelly))
+	}
+	if m.Switch < 0 || m.Switch > maxMeterSwitch {
+		errs = append(errs, fmt.Errorf("node.monitoring.meter.switch %d is outside 0 to %d",
+			m.Switch, maxMeterSwitch))
+	}
+	if w := m.IdleWatts; math.IsNaN(w) || math.IsInf(w, 0) || w <= 0 || w > maxIdlePackageWatts {
+		errs = append(errs, fmt.Errorf("node.monitoring.meter.idle_watts %v is not a host's idle "+
+			"power above 0 and up to %d watts; measure it from the plug with no jobs running", w,
+			maxIdlePackageWatts))
 	}
 
 	return errs

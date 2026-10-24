@@ -365,6 +365,16 @@ linters:
             - github.com/junioryono/billet/internal/durablefile$
             - github.com/junioryono/billet/internal/regularfile$
 
+        # THE WALL METER IS A LEAF. The node reads it and nothing else does, and
+        # it talks to a plug on the network, so it imports nothing of billet's:
+        # the standard library only.
+        wallmeter:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/wallmeter/**"
+          allow:
+            - $gostd
+
         # THE DEPLOYMENT'S IMAGE ACCEPTANCE RECORD IS A LEAF. The node writes it and
         # the image commands read it, and neither may import the other. The
         # standard library and the two file primitives it writes and reads through

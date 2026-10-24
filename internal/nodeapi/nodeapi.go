@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 33
+	Version = 34
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -451,6 +451,18 @@ const (
 	// config only once every node runs a build that installs it; until then the
 	// image commands of an older node refuse, naming the component.
 	VersionImageAcceptance = 33
+
+	// VersionMeterEnergy is the version from which a usage report's energy may
+	// come from the power meter the host is plugged into (lease.EnergyMeter,
+	// node.monitoring.meter): the whole host at the wall, split by CPU time
+	// above its idle draw and by reserved vCPUs below it.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT,
+	// because an older plane validates the source strictly and would refuse the
+	// whole report over it: below it the node names energy unmeasured and sends
+	// the rest. CHECKED WHERE IT IS READ too, so a pairing that negotiated below
+	// it and sends one anyway has the report kept with its energy unmeasured.
+	VersionMeterEnergy = 34
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

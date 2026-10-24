@@ -629,6 +629,8 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 		switch {
 		case sum.EnergyProcess:
 			u.EnergySource = alloc.EnergyProcess
+		case sum.EnergyMeter:
+			u.EnergySource = alloc.EnergyMeter
 		case sum.EnergySplit:
 			u.EnergySource = alloc.EnergyRAPL
 		default:

@@ -65,6 +65,7 @@ const (
 	EnergyRAPL              = lease.EnergyRAPL
 	EnergyRAPLUnsplit       = lease.EnergyRAPLUnsplit
 	EnergyProcess           = lease.EnergyProcess
+	EnergyMeter             = lease.EnergyMeter
 	UsageSourceHost         = lease.UsageSourceHost
 	UsageSeriesCodec        = lease.UsageSeriesCodec
 	UsageSeriesCodecClocked = lease.UsageSeriesCodecClocked

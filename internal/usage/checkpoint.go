@@ -162,7 +162,8 @@ func (m *Monitor) Measuring(key string) bool {
 // job is not used, and the error says why; the job is measured from now.
 func (m *Monitor) Resume(key string, target Target, vcpus int, from *Checkpoint) error {
 	now := m.opts.Now()
-	j := &job{target: target, vcpus: vcpus, first: now, pending: true, resumed: true, energyBroken: true}
+	j := &job{target: target, vcpus: vcpus, first: now, pending: true, resumed: true, energyBroken: true,
+		byProcess: target.Process && m.opts.Meter == nil}
 	var why error
 	if from != nil {
 		why = from.continues(target, m.opts.Interval)

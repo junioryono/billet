@@ -673,6 +673,9 @@ func (c *Client) RecordLeaseUsage(
 	if wire < nodeapi.VersionProcessUsage {
 		measured = beforeProcessUsage(measured)
 	}
+	if wire < nodeapi.VersionMeterEnergy {
+		measured = measured.WithoutEnergyFrom(alloc.EnergyMeter)
+	}
 	switch {
 	case wire < nodeapi.VersionSeriesClock:
 		series = beforeSeriesClock(series)

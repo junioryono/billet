@@ -229,6 +229,23 @@ func TestAProcessMeasuredJobRendersWhatItsHostKept(t *testing.T) {
 	}
 }
 
+// A JOB MEASURED AT THE WALL RENDERS ITS SHARE AND ITS IDLE, named as the whole
+// host's from its power meter.
+func TestAMeterMeasuredJobRendersTheWalls(t *testing.T) {
+	usage := &alloc.RecordedUsage{Node: "mac-1", JobUsage: alloc.JobUsage{
+		Source: alloc.UsageSourceHost, Samples: 600, IntervalMillis: 1000,
+		Unmeasured:              []string{alloc.UsageNet, alloc.UsageOOM, alloc.UsagePressure, alloc.UsageThreads},
+		EnergyActiveMicrojoules: 9_000_000_000, EnergyIdleMicrojoules: 666_000_000, EnergySource: alloc.EnergyMeter,
+	}}
+	var out bytes.Buffer
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+
+	if line := lineStarting(t, out.String(), "energy"); !strings.Contains(line,
+		"9.0 kJ active, 666.0 J idle (the whole host at the wall, from its power meter)") {
+		t.Errorf("the energy line reads %q", line)
+	}
+}
+
 // --json CARRIES THE SAME RECORD THROUGH THE SAME LEDGER READ, and a string
 // GitHub or a workflow chose is data inside a JSON string, never structure.
 func TestJobsShowJSONIsTheRecordForAProgram(t *testing.T) {

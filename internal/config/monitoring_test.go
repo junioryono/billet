@@ -180,3 +180,63 @@ func TestGuestMonitoringNeedsTheGuestCacheServiceOnFirecracker(t *testing.T) {
 		}
 	}
 }
+
+// A METER IS A HOST'S ENERGY SOURCE, on any backend measured from the host and
+// the only one a Mac has: its base address alone, a switch a plug can have, a
+// measured idle draw, and never beside RAPL.
+func TestAMeterIsAdmittedOnlyWhenItCanBeRead(t *testing.T) {
+	plug := func(m MeterConfig) *MeterConfig { return &m }
+	good := MeterConfig{Shelly: "http://192.168.1.246", IdleWatts: 1.7}
+
+	for _, tc := range []struct {
+		name string
+		m    NodeMonitoringConfig
+		want string
+	}{
+		{"a plug", NodeMonitoringConfig{Meter: plug(good)}, ""},
+		{"a plug's second switch", NodeMonitoringConfig{Meter: plug(MeterConfig{
+			Shelly: "https://plug.example/", Switch: 1, IdleWatts: 1.7})}, ""},
+		{"beside rapl", NodeMonitoringConfig{RAPL: true, Meter: plug(good)}, "has one source"},
+		{"no address", NodeMonitoringConfig{Meter: plug(MeterConfig{IdleWatts: 1.7})}, "shelly is empty"},
+		{"not http", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: "ftp://192.168.1.246",
+			IdleWatts: 1.7})}, "not an http or https"},
+		{"a bare host", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: "192.168.1.246",
+			IdleWatts: 1.7})}, "not an http or https"},
+		{"credentials", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: "http://admin:pw@192.168.1.246",
+			IdleWatts: 1.7})}, "names more than the plug"},
+		{"a path", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: "http://192.168.1.246/rpc",
+			IdleWatts: 1.7})}, "names more than the plug"},
+		{"a switch no plug has", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: good.Shelly,
+			Switch: 16, IdleWatts: 1.7})}, "outside 0 to 15"},
+		{"no idle draw", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: good.Shelly})},
+			"not a host's idle power"},
+		{"a large host's idle draw", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: good.Shelly,
+			IdleWatts: 1700})}, ""},
+		{"an idle draw past any host", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: good.Shelly,
+			IdleWatts: 2001})}, "not a host's idle power"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Node: &NodeConfig{Provider: ProviderTart, Monitoring: &tc.m}}
+			got := errors.Join(c.validateMonitoringNode()...)
+			switch {
+			case tc.want == "" && got != nil:
+				t.Errorf("refused: %v", got)
+			case tc.want != "" && (got == nil || !strings.Contains(got.Error(), tc.want)):
+				t.Errorf("answered %v, want a refusal saying %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A METER IS READ FROM billet.yaml as written on a firecracker node too.
+func TestAMeterIsReadFromTheFile(t *testing.T) {
+	cfg, err := Load(writeConfig(t, withMonitoring(t,
+		"  monitoring:\n    meter:\n      shelly: http://192.168.1.245\n      idle_watts: 148\n")))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if m := cfg.Node.Monitoring.Meter; m == nil || m.Shelly != "http://192.168.1.245" || m.Switch != 0 ||
+		m.IdleWatts != 148 {
+		t.Fatalf("meter = %+v", m)
+	}
+}

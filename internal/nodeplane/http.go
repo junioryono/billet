@@ -1635,12 +1635,16 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// COUNTERS, DESTINATIONS AND CAUSES ONLY FROM A WIRE THAT CARRIES THEM: a
-	// pairing that negotiated below VersionJobCounters, VersionJobDestinations
-	// or VersionSeriesGaps has its report kept without them, the series whole,
-	// since the plane does not re-encode one.
+	// COUNTERS, DESTINATIONS, CAUSES AND METER ENERGY ONLY FROM A WIRE THAT
+	// CARRIES THEM: a pairing that negotiated below VersionJobCounters,
+	// VersionJobDestinations, VersionSeriesGaps or VersionMeterEnergy has its
+	// report kept without them, the series whole, since the plane does not
+	// re-encode one.
 	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
 		r.Header.Get(nodeapi.HeaderIncarnation)); known {
+		if wire < nodeapi.VersionMeterEnergy {
+			req.Usage = req.Usage.WithoutEnergyFrom(alloc.EnergyMeter)
+		}
 		if wire < nodeapi.VersionJobCounters {
 			req.Usage.Counters = nil
 		}

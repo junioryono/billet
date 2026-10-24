@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -14,6 +15,7 @@ import (
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	jobusage "github.com/junioryono/billet/internal/usage"
 	"github.com/junioryono/billet/internal/usage/flows"
+	"github.com/junioryono/billet/internal/wallmeter"
 )
 
 // FirecrackerOptions are the provider options node configuration implies
@@ -110,6 +112,10 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 		slog.Info("measuring each job from the host", "interval", interval, "rapl", m.RAPL,
 			"idle_package_watts", m.IdlePackageWatts, "memory", acct.Memory.String(),
 			"io", acct.IO.String(), "reason", acct.Reason)
+	case p.Kind() == config.ProviderTart && m.Meter != nil:
+		slog.Info("measuring each job from the host", "interval", interval,
+			"source", "each VM's own process accounting", "energy", "the wall, from the power meter",
+			"meter", m.Meter.Shelly, "idle_watts", m.Meter.IdleWatts, "net", "not measured")
 	case p.Kind() == config.ProviderTart:
 		slog.Info("measuring each job from the host", "interval", interval,
 			"source", "each VM's own process accounting", "net", "not measured")
@@ -125,6 +131,13 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 
 	sampling := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts,
 		Observer: observer}
+	if m.Meter != nil {
+		meter := wallmeter.New(wallmeter.Shelly{URL: m.Meter.Shelly, Switch: m.Meter.Switch}.Watts,
+			interval, slog.Default())
+		go meter.Run(ctx)
+
+		sampling.Meter, sampling.IdleWatts = meterEnergy(meter), m.Meter.IdleWatts
+	}
 	if m.Perf {
 		if sampling.Counters, err = counterSource(); err != nil {
 			return nil, err
@@ -145,6 +158,19 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 	}
 
 	return opts, nil
+}
+
+// meterEnergy is the sampler's reading of what meter integrated: a total that
+// never wraps, in the epoch the meter is in.
+func meterEnergy(meter *wallmeter.Meter) func() (jobusage.Energy, error) {
+	return func() (jobusage.Energy, error) {
+		uj, epoch, err := meter.Energy()
+		if err != nil {
+			return jobusage.Energy{}, err
+		}
+
+		return jobusage.Energy{Microjoules: uj, MaxRange: math.MaxInt64, Epoch: epoch}, nil
+	}
 }
 
 // startFlows starts following guests' connections from the host's connection

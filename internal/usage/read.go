@@ -473,14 +473,18 @@ func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, []vcpuThr
 	return ticksToMicros(guest), ticksToMicros(vmm), vcpus, nil
 }
 
-// HostCPU is the host's aggregate CPU counters from /proc/stat, in µs.
+// HostCPU is the host's aggregate CPU counters, in µs: /proc/stat on Linux, the
+// kernel's per-processor ticks on macOS.
 type HostCPU struct {
 	Busy, Total int64
 	CPUs        int
 }
 
 // ReadHostCPU reads the host's CPU counters.
-func (r Reader) ReadHostCPU() (HostCPU, error) {
+func (r Reader) ReadHostCPU() (HostCPU, error) { return readHostCPU(r) }
+
+// readProcStat reads the host's CPU counters from /proc/stat under Root.
+func (r Reader) readProcStat() (HostCPU, error) {
 	raw, err := r.read("/proc/stat")
 	if err != nil {
 		return HostCPU{}, err
@@ -505,9 +509,15 @@ const raplZone = "/sys/class/powercap/intel-rapl:0"
 // reports energy as could-not-tell instead.
 const secondPackage = "/sys/class/powercap/intel-rapl:1"
 
-// Energy is one reading of the package energy counter.
+// Energy is one reading of an energy counter: the package's, or the wall's as
+// a meter integrated it.
 type Energy struct {
 	Microjoules, MaxRange int64
+	// Epoch names an unbroken run of readings: two readings of different epochs
+	// have energy between them that was not counted, which is could-not-tell.
+	// The package counter is always epoch zero; a meter starts a new one when it
+	// misses a reading.
+	Epoch uint64
 }
 
 // ReadEnergy reads the package energy counter and its wrap point.

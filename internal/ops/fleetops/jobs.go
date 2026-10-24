@@ -526,6 +526,9 @@ func renderUsageGroups(line func(label, format string, args ...any), u *alloc.Re
 		case alloc.EnergyProcess:
 			return fmt.Sprintf("%s (macOS's own estimate for the VM's process; the machine's idle draw is not in it)",
 				joules(u.EnergyActiveMicrojoules))
+		case alloc.EnergyMeter:
+			return fmt.Sprintf("%s active, %s idle (the whole host at the wall, from its power meter)",
+				joules(u.EnergyActiveMicrojoules), joules(u.EnergyIdleMicrojoules))
 		}
 		return fmt.Sprintf("%s (package RAPL with no idle baseline, so idle is inside it; source %s)",
 			joules(u.EnergyActiveMicrojoules), strconv.Quote(u.EnergySource))
