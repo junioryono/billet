@@ -167,3 +167,55 @@ func TestAJobAfterAStallIsNotChargedTheStall(t *testing.T) {
 		t.Errorf("the job after the stall was charged %d µJ active, want 54000000", s.EnergyActive)
 	}
 }
+
+// THE WALL'S ENERGY IS SHARED OVER THE INTERVAL BETWEEN THE PLUG'S ANSWERS, the
+// one the CPU is read across just after each, however long the plug takes: an
+// answer that comes 400 ms later than the last makes that interval 1.4 s, of
+// both the wall's 20 W and the host's 2 W idle.
+func TestTheWallIsSharedOverTheIntervalItsReadingsSpan(t *testing.T) {
+	t.Parallel()
+
+	tr := newTree(t)
+	tr.write("/proc/stat", procStat(1000, 9000))
+	h := newProcessHost()
+	now := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
+	var latency time.Duration
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, IdleWatts: 2,
+		Meter: func() (float64, error) { now = now.Add(latency); return 20, nil },
+		Now:   func() time.Time { return now }})
+	m.reader.Process = h.reader.Process
+	m.Tick()
+	m.Start("vm", processTarget, 6)
+
+	now = now.Add(time.Second)
+	latency = 400 * time.Millisecond
+	tr.write("/proc/stat", procStat(1300, 10500))
+	h.counters.UserMicros += 1_500_000
+	m.Tick()
+
+	s := finalOf(t, m)
+	if !s.Measured.Energy {
+		t.Fatal("energy across a slow answer was not measured")
+	}
+	// (20 W - 2 W idle) * 1.4 s * 1.5 / 3.
+	if s.EnergyActive != 12_600_000 {
+		t.Errorf("active energy %d µJ, want 12600000 over the 1.4 s the readings span", s.EnergyActive)
+	}
+}
+
+// TWO GOOD READINGS FAR APART LEAVE THE GAP UNKNOWN: a job started a second
+// before the second reading is not given a share of the ten seconds the
+// trapezoid would guess at.
+func TestALongGapBetweenGoodReadingsIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	r := newMeterRun(t)
+	*r.now = r.now.Add(9 * time.Second)
+	r.m.Start("late", processTarget, 6)
+	r.advance()
+
+	if s, ok := r.m.Final("late"); !ok || s.Measured.Energy {
+		t.Errorf("a job started near the end of a 10 s gap measured %v (%d µJ), want its energy unmeasured",
+			s.Measured.Energy, s.EnergyActive)
+	}
+}

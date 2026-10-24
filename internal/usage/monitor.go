@@ -116,9 +116,11 @@ type Monitor struct {
 	energy       Energy
 	energyOK     bool
 	energyReadAt time.Time
-	// watts is the meter's last reading and wattsOK whether the last tick read
-	// it; a tick that did not leaves the interval after it unknown.
+	// watts is the meter's last reading, wattsAt when it answered, and wattsOK
+	// whether the last tick read it; a tick that did not leaves the interval
+	// after it unknown.
 	watts   float64
+	wattsAt time.Time
 	wattsOK bool
 
 	// counting holds each counted job's open groups. ONLY RUN TOUCHES IT, so
@@ -394,16 +396,23 @@ func (m *Monitor) tick() {
 	}
 	m.mu.Unlock()
 
+	// THE PLUG IS READ FIRST AND STAMPED WHEN IT ANSWERS, so the host's and the
+	// jobs' CPU are read together just after it, and the interval the wall's
+	// energy is shared over is the one their CPU was counted across, however
+	// long the plug took to answer.
+	var watts float64
+	wattsErr := errNoRAPL
+	var wattsAt time.Time
+	if m.opts.Meter != nil {
+		watts, wattsErr = m.opts.Meter()
+		wattsAt = m.opts.Now()
+	}
+
 	now := m.opts.Now()
 	host, hostErr := m.reader.ReadHostCPU()
 	var energy Energy
 	energyErr := errNoRAPL
-	var watts float64
-	wattsErr := errNoRAPL
-	switch {
-	case m.opts.Meter != nil:
-		watts, wattsErr = m.opts.Meter()
-	case m.opts.RAPL:
+	if m.opts.RAPL && m.opts.Meter == nil {
 		energy, energyErr = m.reader.ReadEnergy()
 	}
 	samples := make(map[string]*Sample, len(snapshot))
@@ -438,7 +447,7 @@ func (m *Monitor) tick() {
 	}
 	pkgDelta, energyOK := m.energySince(now, energy, energyErr)
 	if m.opts.Meter != nil {
-		pkgDelta, energyOK = m.wallSince(now, watts, wattsErr)
+		pkgDelta, energyOK = m.wallSince(wattsAt, watts, wattsErr)
 	}
 	dt := now.Sub(m.lastTick)
 
@@ -585,9 +594,9 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	return energyDelta(prev.Microjoules, e.Microjoules, e.MaxRange), true
 }
 
-// wallSince records a reading of the wall's power and returns the energy since
-// the last tick's, by the trapezoid between them over the interval the jobs'
-// CPU was read across. A tick that could not read the meter leaves the interval
+// wallSince records a reading of the wall's power, taken at at, and returns the
+// energy since the last tick's, by the trapezoid between them: the interval the
+// jobs' CPU was read across, which begins just after each reading. A tick that could not read the meter leaves the interval
 // it ends and the one after it unknown, never nothing drawn. Called with mu
 // held.
 //
@@ -596,14 +605,19 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 // against the sampler's intervals that puts energy in the wrong one: a job
 // ending in the stall is charged too little, and the one after the recovery
 // the stall's energy.
-func (m *Monitor) wallSince(now time.Time, w float64, err error) (int64, bool) {
-	prev, prevOK := m.watts, m.wattsOK
-	m.watts, m.wattsOK = w, err == nil
-	if err != nil || !prevOK || m.lastTick.IsZero() {
+//
+// A LONG GAP BETWEEN TWO GOOD READINGS IS UNKNOWN TOO: the trapezoid across it
+// is a guess at what was drawn, and a job started near its end would be given a
+// share of the whole gap. The later reading still begins the next interval.
+func (m *Monitor) wallSince(at time.Time, w float64, err error) (int64, bool) {
+	prev, prevAt, prevOK := m.watts, m.wattsAt, m.wattsOK
+	m.watts, m.wattsAt, m.wattsOK = w, at, err == nil
+	gap := at.Sub(prevAt)
+	if err != nil || !prevOK || gap <= 0 || gap >= staleAfter*m.opts.Interval {
 		return 0, false
 	}
 
-	return int64((prev + w) / 2 * now.Sub(m.lastTick).Seconds() * 1e6), true
+	return int64((prev + w) / 2 * gap.Seconds() * 1e6), true
 }
 
 func (j *job) absorb(s Sample, now time.Time) {
