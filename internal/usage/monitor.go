@@ -12,12 +12,13 @@ type Options struct {
 	Interval time.Duration
 	// RAPL reads the package energy counter each tick.
 	RAPL bool
-	// Meter reads the host's energy at the wall, as the power meter it is
-	// plugged into integrated it, in place of the package counter: set, it is
-	// what each tick shares, and RAPL is not read. A tart VM's energy is then a
-	// share of it rather than macOS's estimate for the VM's process. Nil reads
-	// none.
-	Meter func() (Energy, error)
+	// Meter reads the host's power at the wall now, in watts, from the power
+	// meter it is plugged into, in place of the package counter: set, each tick
+	// reads it and shares the energy between its reading and the last one, and
+	// RAPL is not read. A tart VM's energy is then a share of it rather than
+	// macOS's estimate for the VM's process. It runs on the sampler's goroutine,
+	// so it must bound itself well inside an interval. Nil reads none.
+	Meter func() (float64, error)
 	// IdleWatts is the host's measured idle power for whichever is read, the
 	// package or the wall; zero means no baseline, and the whole of it is shared
 	// by CPU time.
@@ -115,6 +116,10 @@ type Monitor struct {
 	energy       Energy
 	energyOK     bool
 	energyReadAt time.Time
+	// watts is the meter's last reading and wattsOK whether the last tick read
+	// it; a tick that did not leaves the interval after it unknown.
+	watts   float64
+	wattsOK bool
 
 	// counting holds each counted job's open groups. ONLY RUN TOUCHES IT, so
 	// every descriptor is opened, read and closed on one goroutine; a job
@@ -393,9 +398,11 @@ func (m *Monitor) tick() {
 	host, hostErr := m.reader.ReadHostCPU()
 	var energy Energy
 	energyErr := errNoRAPL
+	var watts float64
+	wattsErr := errNoRAPL
 	switch {
 	case m.opts.Meter != nil:
-		energy, energyErr = m.opts.Meter()
+		watts, wattsErr = m.opts.Meter()
 	case m.opts.RAPL:
 		energy, energyErr = m.reader.ReadEnergy()
 	}
@@ -430,6 +437,9 @@ func (m *Monitor) tick() {
 		busyDelta = host.Busy - m.host.Busy
 	}
 	pkgDelta, energyOK := m.energySince(now, energy, energyErr)
+	if m.opts.Meter != nil {
+		pkgDelta, energyOK = m.wallSince(now, watts, wattsErr)
+	}
 	dt := now.Sub(m.lastTick)
 
 	// THE IDLE POOL IS NEVER MORE THAN WAS MEASURED: a baseline above an
@@ -564,7 +574,7 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	}
 	prev, prevOK, prevAt := m.energy, m.energyOK, m.energyReadAt
 	m.energy, m.energyOK, m.energyReadAt = e, true, now
-	if !prevOK || prev.MaxRange != e.MaxRange || prev.Epoch != e.Epoch {
+	if !prevOK || prev.MaxRange != e.MaxRange {
 		return 0, false
 	}
 	wrapSeconds := float64(e.MaxRange) / 1e6 / maxPackageWatts
@@ -573,6 +583,27 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	}
 
 	return energyDelta(prev.Microjoules, e.Microjoules, e.MaxRange), true
+}
+
+// wallSince records a reading of the wall's power and returns the energy since
+// the last tick's, by the trapezoid between them over the interval the jobs'
+// CPU was read across. A tick that could not read the meter leaves the interval
+// it ends and the one after it unknown, never nothing drawn. Called with mu
+// held.
+//
+// READ ON EVERY TICK, NOT CACHED. A meter polled apart from the sampler answers
+// a total that stands still while its reads fail and then jumps, and charged
+// against the sampler's intervals that puts energy in the wrong one: a job
+// ending in the stall is charged too little, and the one after the recovery
+// the stall's energy.
+func (m *Monitor) wallSince(now time.Time, w float64, err error) (int64, bool) {
+	prev, prevOK := m.watts, m.wattsOK
+	m.watts, m.wattsOK = w, err == nil
+	if err != nil || !prevOK || m.lastTick.IsZero() {
+		return 0, false
+	}
+
+	return int64((prev + w) / 2 * now.Sub(m.lastTick).Seconds() * 1e6), true
 }
 
 func (j *job) absorb(s Sample, now time.Time) {

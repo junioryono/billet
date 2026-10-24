@@ -5,6 +5,7 @@ package usage
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -72,11 +73,23 @@ func readHostCPU(r Reader) (HostCPU, error) {
 	return HostCPU{Busy: busy * perTick, Total: total * perTick, CPUs: cpus}, nil
 }
 
+// machHost is this task's send right to the host port, taken once and kept for
+// the process's life.
+//
+// TAKEN ONCE BECAUSE EACH mach_host_self ADDS A REFERENCE to the right, which
+// only a mach_port_deallocate gives back: one taken per sample would add a
+// reference a second for as long as the node ran.
+var machHost = sync.OnceValue(func() uintptr {
+	host, _, _ := syscallSyscall(libc_mach_host_self_trampoline_addr, 0, 0, 0)
+
+	return host
+})
+
 // machProcessorTicks sums every processor's busy (user, system and nice) and
 // total ticks through host_processor_info, and frees what it was given. It
 // answers busy, total and the processor count.
 func machProcessorTicks() (int64, int64, int, error) {
-	host, _, _ := syscallSyscall(libc_mach_host_self_trampoline_addr, 0, 0, 0)
+	host := machHost()
 
 	// THE KERNEL WRITES A POINTER INTO info, an array it mapped into this task,
 	// so info is a pointer and never a uintptr turned back into one.

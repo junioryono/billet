@@ -1,14 +1,12 @@
 package wallmeter
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // shellyAnswer is Switch.GetStatus's answer from the Shelly Plug US Gen4 beside
@@ -75,75 +73,29 @@ func TestAnAnswerThatIsNotThisSwitchsPowerIsRefused(t *testing.T) {
 	}
 }
 
-// fakePlug answers each Poll with the next of watts, an error for a negative.
-type fakePlug struct {
-	watts []float64
-	at    int
-}
-
-var errUnplugged = errors.New("unplugged")
-
-func (p *fakePlug) read(context.Context) (float64, error) {
-	w := p.watts[p.at]
-	p.at++
-	if w < 0 {
-		return 0, errUnplugged
-	}
-
-	return w, nil
-}
-
-// meterAt is a meter reading p on a clock the test sets, each read taking no
-// time.
-func meterAt(p *fakePlug, now *time.Time) *Meter {
-	m := New(p.read, time.Second, nil)
-	m.now = func() time.Time { return *now }
-
-	return m
-}
-
-// ENERGY IS THE TRAPEZOID BETWEEN READINGS, one missed reading is bridged, and
-// a longer gap begins a new epoch with nothing added for it.
-func TestAMeterIntegratesItsReadingsAndBreaksOnAGap(t *testing.T) {
+// A REDIRECT IS A FAILED READING, never followed: the plug's answer cannot send
+// the node's request elsewhere on its network, or pass off another plug's power
+// as this host's.
+func TestARedirectIsNotFollowed(t *testing.T) {
 	t.Parallel()
 
-	now := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
-	// A negative reading is a failed one.
-	p := &fakePlug{watts: []float64{10, 20, -1, 30, -1, -1, -1, 40, 50}}
-	m := meterAt(p, &now)
+	var followed atomic.Bool
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		followed.Store(true)
+		_, _ = fmt.Fprintf(w, shellyAnswer, 0, "1.8")
+	}))
+	t.Cleanup(elsewhere.Close)
 
-	if _, _, err := m.Energy(); !errors.Is(err, ErrNoReading) {
-		t.Fatalf("Energy before any reading = %v, want ErrNoReading", err)
-	}
+	s, _ := plug(t, http.StatusOK, "")
+	redirecting := httptest.NewServer(http.RedirectHandler(elsewhere.URL+"/rpc/Switch.GetStatus?id=0",
+		http.StatusFound))
+	t.Cleanup(redirecting.Close)
+	s.URL = redirecting.URL
 
-	poll := func() { m.Poll(t.Context()); now = now.Add(time.Second) }
-
-	poll() // 10 W, the first reading: a new epoch, nothing to integrate.
-	_, first, err := m.Energy()
-	if err != nil {
-		t.Fatal(err)
+	if w, err := s.Watts(t.Context()); err == nil || !strings.Contains(err.Error(), "answered 302") {
+		t.Fatalf("Watts through a redirect = %v, %v; want the redirect refused", w, err)
 	}
-	poll() // 20 W a second later: 15 J.
-	poll() // failed.
-	poll() // 30 W two seconds after 20 W, bridged: 50 J.
-	uj, epoch, err := m.Energy()
-	if err != nil || uj != 65_000_000 || epoch != first {
-		t.Fatalf("after a bridged gap: %d µJ epoch %d (%v), want 65000000 in epoch %d", uj, epoch, err, first)
-	}
-
-	poll()
-	poll()
-	poll() // three failed readings: the last reading is now four seconds old.
-	if _, _, err := m.Energy(); !errors.Is(err, ErrNoReading) {
-		t.Fatalf("Energy with its last reading four intervals old = %v, want ErrNoReading", err)
-	}
-	poll() // 40 W four seconds after 30 W: not bridged, a new epoch.
-	uj, epoch, err = m.Energy()
-	if err != nil || uj != 65_000_000 || epoch == first {
-		t.Fatalf("after a long gap: %d µJ epoch %d (%v), want 65000000 in a new epoch", uj, epoch, err)
-	}
-	poll() // 50 W: 45 J more in the new epoch.
-	if uj, again, err := m.Energy(); err != nil || uj != 110_000_000 || again != epoch {
-		t.Fatalf("after the gap: %d µJ epoch %d (%v), want 110000000 in epoch %d", uj, again, err, epoch)
+	if followed.Load() {
+		t.Error("the redirect was followed")
 	}
 }

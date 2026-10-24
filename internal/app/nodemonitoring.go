@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -132,11 +131,9 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 	sampling := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts,
 		Observer: observer}
 	if m.Meter != nil {
-		meter := wallmeter.New(wallmeter.Shelly{URL: m.Meter.Shelly, Switch: m.Meter.Switch}.Watts,
-			interval, slog.Default())
-		go meter.Run(ctx)
-
-		sampling.Meter, sampling.IdleWatts = meterEnergy(meter), m.Meter.IdleWatts
+		plug := wallmeter.Shelly{URL: m.Meter.Shelly, Switch: m.Meter.Switch}
+		sampling.Meter, sampling.IdleWatts = meterReader(ctx, plug.Watts, interval, slog.Default()),
+			m.Meter.IdleWatts
 	}
 	if m.Perf {
 		if sampling.Counters, err = counterSource(); err != nil {
@@ -160,16 +157,29 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 	return opts, nil
 }
 
-// meterEnergy is the sampler's reading of what meter integrated: a total that
-// never wraps, in the epoch the meter is in.
-func meterEnergy(meter *wallmeter.Meter) func() (jobusage.Energy, error) {
-	return func() (jobusage.Energy, error) {
-		uj, epoch, err := meter.Energy()
-		if err != nil {
-			return jobusage.Energy{}, err
-		}
+// meterReader is the sampler's read of the plug: bounded to half an interval,
+// since it runs on the sampler's one goroutine, and logged when it starts and
+// stops failing rather than on every tick.
+func meterReader(ctx context.Context, watts func(context.Context) (float64, error), interval time.Duration,
+	log *slog.Logger,
+) func() (float64, error) {
+	failing := false
 
-		return jobusage.Energy{Microjoules: uj, MaxRange: math.MaxInt64, Epoch: epoch}, nil
+	return func() (float64, error) {
+		readCtx, cancel := context.WithTimeout(ctx, interval/2)
+		defer cancel()
+
+		w, err := watts(readCtx)
+		switch {
+		case err != nil && !failing:
+			log.Warn("could not read the power meter; the energy of every job running now is not measured",
+				"error", err)
+		case err == nil && failing:
+			log.Info("reading the power meter again")
+		}
+		failing = err != nil
+
+		return w, err
 	}
 }
 

@@ -189,17 +189,22 @@ func (m *MeterConfig) validate(rapl bool) []error {
 			"energy has one source: the wall includes the package, so keep one"))
 	}
 
-	u, err := url.Parse(strings.TrimSpace(m.Shelly))
+	// THE ADDRESS IS NEVER REPEATED IN A REFUSAL: one refused for carrying
+	// credentials would otherwise put them in the node's log.
+	u, err := url.Parse(m.Shelly)
 	switch {
 	case strings.TrimSpace(m.Shelly) == "":
 		errs = append(errs, errors.New("node.monitoring.meter.shelly is empty; name the plug's base "+
 			"address, such as http://192.168.1.246"))
+	case m.Shelly != strings.TrimSpace(m.Shelly):
+		errs = append(errs, errors.New("node.monitoring.meter.shelly has spaces around it, which the "+
+			"plug's address cannot have"))
 	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
-		errs = append(errs, fmt.Errorf("node.monitoring.meter.shelly %q is not an http or https "+
-			"address with a host", m.Shelly))
+		errs = append(errs, errors.New("node.monitoring.meter.shelly is not an http or https "+
+			"address with a host"))
 	case u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/"):
-		errs = append(errs, fmt.Errorf("node.monitoring.meter.shelly %q names more than the plug: "+
-			"give its base address alone, with no credentials, path or query", m.Shelly))
+		errs = append(errs, errors.New("node.monitoring.meter.shelly names more than the plug: "+
+			"give its base address alone, with no credentials, path or query"))
 	}
 	if m.Switch < 0 || m.Switch > maxMeterSwitch {
 		errs = append(errs, fmt.Errorf("node.monitoring.meter.switch %d is outside 0 to %d",

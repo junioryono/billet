@@ -45,7 +45,7 @@ func TestThisMacsCPUCountersAreRead(t *testing.T) {
 // test's /proc/stat is what answers on a Mac too.
 func TestAFixtureTreesCPUIsItsProcStat(t *testing.T) {
 	tr := newTree(t)
-	tr.write("/proc/stat", procStat(1300, 10500, 18))
+	tr.write("/proc/stat", procStat(1300, 10500))
 
 	host, err := Reader{Root: tr.root}.ReadHostCPU()
 	if err != nil || host.CPUs != 18 || host.Busy != 13_000_000 || host.Total != 118_000_000 {

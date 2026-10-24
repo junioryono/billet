@@ -5,66 +5,60 @@ import (
 	"errors"
 	"go/ast"
 	"go/types"
-	"math"
+	"log/slog"
 	"testing"
 	"time"
-
-	"github.com/junioryono/billet/internal/wallmeter"
 )
 
-// THE SAMPLER READS WHAT THE METER INTEGRATED, a total that never wraps in the
-// meter's epoch, and the meter's refusal as its own: a meter with no recent
-// reading is could-not-tell, never zero.
-func TestTheSamplerReadsTheMetersEnergy(t *testing.T) {
+// THE SAMPLER'S READ OF THE PLUG ANSWERS THE PLUG'S POWER, and its refusal as
+// its own, each within half an interval of the sampler's goroutine.
+func TestTheSamplersReadOfThePlugIsBoundedAndTrue(t *testing.T) {
 	t.Parallel()
 
-	watts := []float64{10, 20}
-	meter := wallmeter.New(func(context.Context) (float64, error) {
-		w := watts[0]
-		watts = watts[1:]
+	var left time.Duration
+	answer, answerErr := 17.5, error(nil)
+	read := meterReader(t.Context(), func(ctx context.Context) (float64, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Error("the plug was read with no deadline")
+		}
+		left = time.Until(deadline)
 
-		return w, nil
-	}, time.Hour, nil)
-	read := meterEnergy(meter)
+		return answer, answerErr
+	}, 2*time.Second, slog.New(slog.DiscardHandler))
 
-	if _, err := read(); !errors.Is(err, wallmeter.ErrNoReading) {
-		t.Fatalf("before any reading the sampler read %v, want the meter's ErrNoReading", err)
+	if w, err := read(); err != nil || w != 17.5 {
+		t.Fatalf("read %v, %v; want the plug's 17.5 W", w, err)
+	}
+	if left <= 0 || left > time.Second {
+		t.Errorf("the read had %s left, want at most half the 2s interval", left)
 	}
 
-	meter.Poll(t.Context())
-	e, err := read()
-	if err != nil || e.MaxRange != math.MaxInt64 || e.Epoch != 1 {
-		t.Fatalf("after one reading the sampler read %+v, %v; want epoch 1 and a range that never wraps",
-			e, err)
+	answerErr = errors.New("unplugged")
+	if _, err := read(); !errors.Is(err, answerErr) {
+		t.Fatalf("a failed read answered %v, want the plug's error", err)
 	}
 }
 
-// NODE MONITORING HANDS THE SAMPLER THE METER IT STARTED, with the meter's idle
-// draw as the baseline: only the source shows the configured block reaches the
-// sampler, since the node's tests build their own.
+// NODE MONITORING HANDS THE SAMPLER ITS PLUG AND THE PLUG'S IDLE DRAW: only the
+// source shows the configured block reaches the sampler, since the node's
+// tests build their own.
 func TestNodeMonitoringGivesTheSamplerItsMeter(t *testing.T) {
 	t.Parallel()
 
-	var started, wired bool
+	wired := false
 	ast.Inspect(nodeFunc(t, "nodemonitoring.go", "nodeMonitorOptions"), func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.GoStmt:
-			if sel, ok := x.Call.Fun.(*ast.SelectorExpr); ok && isIdent(sel.X, "meter") && sel.Sel.Name == "Run" {
-				started = true
-			}
-		case *ast.AssignStmt:
-			if len(x.Lhs) == 2 && len(x.Rhs) == 2 && types.ExprString(x.Lhs[0]) == "sampling.Meter" &&
-				types.ExprString(x.Rhs[0]) == "meterEnergy(meter)" &&
-				types.ExprString(x.Lhs[1]) == "sampling.IdleWatts" &&
-				types.ExprString(x.Rhs[1]) == "m.Meter.IdleWatts" {
-				wired = true
-			}
+		if x, ok := n.(*ast.AssignStmt); ok && len(x.Lhs) == 2 && len(x.Rhs) == 2 &&
+			types.ExprString(x.Lhs[0]) == "sampling.Meter" &&
+			types.ExprString(x.Rhs[0]) == "meterReader(ctx, plug.Watts, interval, slog.Default())" &&
+			types.ExprString(x.Lhs[1]) == "sampling.IdleWatts" &&
+			types.ExprString(x.Rhs[1]) == "m.Meter.IdleWatts" {
+			wired = true
 		}
 
 		return true
 	})
-	if !started || !wired {
-		t.Errorf("nodeMonitorOptions starts the meter %v and gives the sampler its energy and idle draw %v; "+
-			"want both", started, wired)
+	if !wired {
+		t.Error("nodeMonitorOptions does not give the sampler its plug's power and idle draw")
 	}
 }

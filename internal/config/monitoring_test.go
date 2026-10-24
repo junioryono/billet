@@ -204,6 +204,8 @@ func TestAMeterIsAdmittedOnlyWhenItCanBeRead(t *testing.T) {
 			IdleWatts: 1.7})}, "not an http or https"},
 		{"credentials", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: "http://admin:pw@192.168.1.246",
 			IdleWatts: 1.7})}, "names more than the plug"},
+		{"spaces around it", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: " http://192.168.1.246 ",
+			IdleWatts: 1.7})}, "spaces around it"},
 		{"a path", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: "http://192.168.1.246/rpc",
 			IdleWatts: 1.7})}, "names more than the plug"},
 		{"a switch no plug has", NodeMonitoringConfig{Meter: plug(MeterConfig{Shelly: good.Shelly,
@@ -225,6 +227,22 @@ func TestAMeterIsAdmittedOnlyWhenItCanBeRead(t *testing.T) {
 				t.Errorf("answered %v, want a refusal saying %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A REFUSED ADDRESS IS NEVER REPEATED, so credentials refused in it do not reach
+// the node's log by way of the refusal.
+func TestARefusedMeterAddressKeepsItsCredentials(t *testing.T) {
+	for _, address := range []string{"http://admin:hunter2@192.168.1.246", "hunter2://192.168.1.246",
+		"http://192.168.1.246/hunter2", "http://192.168.1.246/?key=hunter2"} {
+		errs := (&MeterConfig{Shelly: address, IdleWatts: 1.7}).validate(false)
+		got := errors.Join(errs...)
+		if got == nil {
+			t.Fatalf("%q was admitted", address)
+		}
+		if strings.Contains(got.Error(), "hunter2") {
+			t.Errorf("the refusal of an address repeats it: %v", got)
+		}
 	}
 }
 

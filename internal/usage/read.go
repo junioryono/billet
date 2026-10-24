@@ -509,15 +509,9 @@ const raplZone = "/sys/class/powercap/intel-rapl:0"
 // reports energy as could-not-tell instead.
 const secondPackage = "/sys/class/powercap/intel-rapl:1"
 
-// Energy is one reading of an energy counter: the package's, or the wall's as
-// a meter integrated it.
+// Energy is one reading of the package energy counter.
 type Energy struct {
 	Microjoules, MaxRange int64
-	// Epoch names an unbroken run of readings: two readings of different epochs
-	// have energy between them that was not counted, which is could-not-tell.
-	// The package counter is always epoch zero; a meter starts a new one when it
-	// misses a reading.
-	Epoch uint64
 }
 
 // ReadEnergy reads the package energy counter and its wrap point.
