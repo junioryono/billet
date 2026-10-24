@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -181,6 +182,12 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 		return "", 0, 0, fmt.Errorf("the bridges learned %s's address %s on %d members: [%s]", name, mac, len(found),
 			strings.Join(found, ", "))
 	}
+	// THE ACCOUNTS ARE COUNTED AGAIN, after the bridge is read: another
+	// account's VM started meanwhile could be the one the bridge learned this
+	// address from.
+	if err := p.vmsAreTheNodes(ctx); err != nil {
+		return "", 0, 0, err
+	}
 
 	return found[0], carrier, carrierStart, nil
 }
@@ -299,8 +306,14 @@ const maxStoreVMs = 256
 // a directory with no configuration (its compute is not proved stopped by the
 // file's absence), or one that is not a small regular file.
 func (p *Provider) addressIsOnlyIts(ctx context.Context, name string, mac net.HardwareAddr) error {
-	entries, err := os.ReadDir(filepath.Join(p.home, "vms"))
+	dir, err := os.Open(filepath.Join(p.home, "vms"))
 	if err != nil {
+		return fmt.Errorf("list the VMs in the store: %w", err)
+	}
+	// AT MOST ONE PAST THE BOUND IS READ, so a store of any size costs no more.
+	entries, err := dir.ReadDir(maxStoreVMs + 1)
+	_ = dir.Close()
+	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("list the VMs in the store: %w", err)
 	}
 	if len(entries) > maxStoreVMs {
@@ -318,7 +331,11 @@ func (p *Provider) addressIsOnlyIts(ctx context.Context, name string, mac net.Ha
 		if e.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("the store's %s is a symlink, so whose address it holds could not be told", other)
 		}
-		if !e.IsDir() {
+		// A STAGING CLONE WAS NEVER LAUNCHED, by the clone, mark and rename order
+		// List relies on too, so it sends nothing the bridge could learn; a
+		// crash leaves one with no configuration, and it must not cost every
+		// later job its network.
+		if !e.IsDir() || strings.HasSuffix(other, stagingSuffix) {
 			continue
 		}
 		theirs, err := p.vmMAC(other)

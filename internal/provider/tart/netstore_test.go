@@ -62,6 +62,61 @@ func TestAStoreThatCannotBeReadWholeNamesNoDevice(t *testing.T) {
 	}
 }
 
+// A STAGING CLONE A CRASH LEFT DOES NOT COST LATER JOBS THEIR NETWORK: it was
+// never launched, so it sends nothing the bridge could learn, though its
+// configuration is gone.
+func TestALeftoverStagingCloneLeavesTheNetworkMeasured(t *testing.T) {
+	t.Parallel()
+
+	h := newNetworkHost(t)
+	h.withNetwork(t, network{mac: sharedMAC, tables: table, ps: psWith(),
+		sockets: map[string]string{"74207": printed(unitLine("1"))}})
+	staging := filepath.Join(filepath.Dir(filepath.Dir(h.disk)), "billet-0123456789abcdef"+stagingSuffix)
+	if err := os.Mkdir(staging, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := h.p.UsageTarget(t.Context(), usageVM)
+	if err != nil {
+		t.Fatalf("UsageTarget: %v", err)
+	}
+	if target.NetDevice != "vmenet0" {
+		t.Errorf("with a staging clone left behind the VM is %+v, want its device vmenet0", target)
+	}
+}
+
+// ANOTHER ACCOUNT'S VM STARTED WHILE THE DEVICE IS FOUND IS SEEN: the accounts are
+// counted again after the bridge is read, so one that appeared after the first
+// count leaves the network unmeasured.
+func TestAnotherAccountsVMStartedMeanwhileNamesNoDevice(t *testing.T) {
+	t.Parallel()
+
+	h := newNetworkHost(t)
+	h.withNetwork(t, network{mac: sharedMAC, tables: table, ps: psWith(),
+		sockets: map[string]string{"74207": printed(unitLine("1"))}})
+	calls := filepath.Join(t.TempDir(), "calls")
+	me := fmt.Sprintf("%d %s", os.Getuid(), vmService)
+	foreign := fmt.Sprintf("%d %s", os.Getuid()+1, vmService)
+	script := "#!/bin/sh\ncase \"$*\" in\n" +
+		"  '-axo pid=,ppid=,args=') printf '%s' '" + psWith() + "' ;;\n" +
+		"  '-axo uid=,args=') if [ -e " + calls + " ]; then printf '%s\\n%s\\n' '" + me + "' '" + foreign + "'; " +
+		"else : > " + calls + "; printf '%s\\n' '" + me + "'; fi ;;\n" +
+		"  *) exit 2 ;;\nesac\n"
+	ps := filepath.Join(t.TempDir(), "ps")
+	if err := forkSafeWriteFile(ps, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h.p.ps = ps
+
+	target, err := h.p.UsageTarget(t.Context(), usageVM)
+	if err != nil {
+		t.Fatalf("UsageTarget: %v", err)
+	}
+	if want := (provider.UsageTarget{PID: 74207, PIDStart: 16664085551217, Process: true}); target != want {
+		t.Errorf("the VM is %+v, want %+v, with no device", target, want)
+	}
+}
+
 // A VM ANOTHER ACCOUNT RUNS ON THE HOST LEAVES EVERY VM'S NETWORK UNMEASURED: its
 // store is one billet cannot read, so an address it shares would not be seen. The
 // node account's own VMs, however many, do not.
