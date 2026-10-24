@@ -66,7 +66,10 @@ const (
 	// packedAddrWidth is the longest canonical IPv6 address with no zone.
 	packedAddrWidth  = 39
 	packedCountWidth = 19 // the digits of the largest int64
-	packedRowWidth   = packedOrdinalWidth + packedAddrWidth + 3*packedCountWidth
+	// packedRowWidth is the sent, received and connection counts, then the
+	// unanswered count, which is spaces where the report did not count it
+	// (migration 68).
+	packedRowWidth = packedOrdinalWidth + packedAddrWidth + 4*packedCountWidth
 )
 
 // packDestinations is a report's rows as RecordJobDestinations reads them, and
@@ -80,12 +83,19 @@ func packDestinations(d *JobDestinations) (string, int, error) {
 		if len(dest.Addr) > packedAddrWidth || strings.ContainsAny(dest.Addr, " \t\r\n") {
 			return fmt.Errorf("destination %q does not fit the ledger's record", dest.Addr)
 		}
-		if dest.SentBytes < 0 || dest.ReceivedBytes < 0 || dest.Connections < 0 {
+		if dest.SentBytes < 0 || dest.ReceivedBytes < 0 || dest.Connections < 0 || dest.Unanswered < 0 {
 			return fmt.Errorf("destination %q has a negative total", dest.Addr)
 		}
 		fmt.Fprintf(&b, "%0*d%-*s%0*d%0*d%0*d", packedOrdinalWidth, ordinal, packedAddrWidth, dest.Addr,
 			packedCountWidth, dest.SentBytes, packedCountWidth, dest.ReceivedBytes,
 			packedCountWidth, dest.Connections)
+		// NOT COUNTED IS SPACES, which the statement keeps as NULL: a zero here
+		// would say the destination answered everything.
+		if d.UnansweredCounted {
+			fmt.Fprintf(&b, "%0*d", packedCountWidth, dest.Unanswered)
+		} else {
+			fmt.Fprintf(&b, "%*s", packedCountWidth, "")
+		}
 
 		return nil
 	}
@@ -112,9 +122,16 @@ func readDestinations(ctx context.Context, q querier, leaseID string, row ledger
 	}
 	out := &JobDestinations{Incomplete: row.DestinationsIncomplete.Int64 == 1}
 	other := false
+	counted, uncounted := 0, 0
 	for _, r := range rows {
 		dest := JobDestination{
 			Addr: r.Addr, SentBytes: r.SentBytes, ReceivedBytes: r.ReceivedBytes, Connections: r.Connections,
+		}
+		if r.Unanswered.Valid {
+			dest.Unanswered = r.Unanswered.Int64
+			counted++
+		} else {
+			uncounted++
 		}
 		if r.Ordinal == otherOrdinal {
 			out.Other, other = dest, true
@@ -129,6 +146,14 @@ func readDestinations(ctx context.Context, q querier, leaseID string, row ledger
 		return nil, fmt.Errorf("alloc: the ledger records destinations for lease %s without the row "+
 			"for the traffic beyond them", leaseID)
 	}
+	// ONE REPORT WROTE EVERY ROW, so its rows are all counted or none are; a
+	// mix is a ledger that does not hold what was written, and reading it either
+	// way would be a guess.
+	if counted > 0 && uncounted > 0 {
+		return nil, fmt.Errorf("alloc: the ledger records an unanswered count for %d of lease %s's "+
+			"destination rows and none for %d", counted, leaseID, uncounted)
+	}
+	out.UnansweredCounted = counted > 0
 	if row.TapSentBytes.Valid && row.TapReceivedBytes.Valid {
 		out.Tap = &TapTotals{SentBytes: row.TapSentBytes.Int64, ReceivedBytes: row.TapReceivedBytes.Int64}
 	}

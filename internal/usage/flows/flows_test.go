@@ -291,6 +291,63 @@ func TestDestinationsBeyondTheCapFoldIntoOther(t *testing.T) {
 	}
 }
 
+// A CONNECTION THAT GOT NOTHING BACK IS COUNTED AGAINST ITS DESTINATION: a SYN
+// no one answered, or a DNS query with no reply, is the stall a job's own log
+// cannot place. One that was answered, even with nothing but a reset, is not,
+// and neither is a flow the tracker kept no packet counts for, which says
+// nothing either way. Beyond the cap the count is kept in Other.
+func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.T) {
+	t.Parallel()
+
+	resolver := netip.MustParseAddr("172.31.1.1")
+	a := NewAccountant()
+	a.Watch("lease-1", guest, began, nil)
+
+	a.Observe(flow(1, guest, github, 120, 4000))
+	stalled := flow(2, guest, github, 180, 0)
+	stalled.OrigPackets = 3
+	a.Observe(stalled)
+	reset := flow(3, guest, github, 60, 40)
+	reset.OrigPackets, reset.ReplyPackets = 1, 1
+	a.Observe(reset)
+	query := flow(4, guest, resolver, 60, 0)
+	query.Protocol, query.DestPort, query.OrigPackets = 17, 53, 1
+	a.Observe(query)
+	uncounted := flow(5, guest, npm, 0, 0)
+	a.Observe(uncounted)
+
+	r, _ := a.Final("lease-1", nil, ended)
+	want := map[netip.Addr]Destination{
+		github:   {Addr: github, Sent: 360, Received: 4040, Connections: 3, Unanswered: 1},
+		resolver: {Addr: resolver, Sent: 60, Connections: 1, Unanswered: 1},
+		npm:      {Addr: npm, Connections: 1},
+	}
+	if len(r.Destinations) != len(want) {
+		t.Fatalf("destinations = %+v, want %+v", r.Destinations, want)
+	}
+	for _, d := range r.Destinations {
+		if d != want[d.Addr] {
+			t.Errorf("destination %s = %+v, want %+v", d.Addr, d, want[d.Addr])
+		}
+	}
+
+	beyond := NewAccountant()
+	beyond.Watch("lease-2", guest, began, nil)
+	for i := range MaxDestinations + 3 {
+		dst := netip.AddrFrom4([4]byte{10, 2, byte(i / 256), byte(i % 256)})
+		// The answered ones are larger, so the three unanswered fall past the cap.
+		f := flow(uint32(i+1), guest, dst, 1000, 1000)
+		if i >= MaxDestinations {
+			f = flow(uint32(i+1), guest, dst, 1, 0)
+		}
+		beyond.Observe(f)
+	}
+	r, _ = beyond.Final("lease-2", nil, ended)
+	if r.Other.Unanswered != 3 || r.Other.Connections != 3 {
+		t.Errorf("Other = %+v, want the three unanswered connections beyond the cap", r.Other)
+	}
+}
+
 // PAST MaxFlows A JOB IS MARKED INCOMPLETE, never silently short.
 func TestAJobOpeningTooManyFlowsIsIncomplete(t *testing.T) {
 	t.Parallel()

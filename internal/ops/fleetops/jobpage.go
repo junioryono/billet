@@ -131,6 +131,10 @@ type pageDestinations struct {
 	Rows    []pageDestination
 	More    string
 	Other   string
+	// Counted says the rows carry an unanswered count, and Unanswered is which
+	// destinations got nothing back, or that the report did not count them.
+	Counted    bool
+	Unanswered string
 	// Complete answers whether the totals are complete.
 	Complete string
 	Tap      string
@@ -139,7 +143,7 @@ type pageDestinations struct {
 
 // pageDestination is one destination's row.
 type pageDestination struct {
-	Addr, Sent, Received, Connections string
+	Addr, Sent, Received, Connections, Unanswered string
 }
 
 // buildJobPage is the page for a job: its record, its usage report and the
@@ -466,16 +470,19 @@ func destinationsSection(rec alloc.JobRecord, m *alloc.RecordedUsage) pageDestin
 	out := pageDestinations{
 		Summary: fmt.Sprintf("%d destinations by total bytes, from the host's connection tracker "+
 			"(attributed by the guest's source address)", len(sorted)),
-		Other: fmt.Sprintf("%s (beyond the %d destinations the node keeps by name)", sumOf(d.Other),
-			alloc.MaxJobDestinations),
-		Complete: "yes",
+		Other: fmt.Sprintf("%s (beyond the %d destinations the node keeps by name)",
+			sumOf(d.Other).said(d.UnansweredCounted), alloc.MaxJobDestinations),
+		Counted:    d.UnansweredCounted,
+		Unanswered: unansweredText(d),
+		Complete:   "yes",
 	}
 	for _, dest := range shown {
 		out.Rows = append(out.Rows, pageDestination{Addr: dest.Addr, Sent: cli.HumanBytes(dest.SentBytes),
-			Received: cli.HumanBytes(dest.ReceivedBytes), Connections: groupDigits(dest.Connections)})
+			Received: cli.HumanBytes(dest.ReceivedBytes), Connections: groupDigits(dest.Connections),
+			Unanswered: groupDigits(dest.Unanswered)})
 	}
 	if rest := sorted[len(shown):]; len(rest) > 0 {
-		out.More = fmt.Sprintf("and %d more: %s", len(rest), sumOf(rest...))
+		out.More = fmt.Sprintf("and %d more: %s", len(rest), sumOf(rest...).said(d.UnansweredCounted))
 	}
 	if d.Incomplete {
 		out.Complete = "no: flows may have been missed, so every total here is a lower bound"

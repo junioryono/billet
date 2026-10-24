@@ -1,0 +1,25 @@
+-- migration 68: job_destination_unanswered
+--
+-- HOW MANY OF A DESTINATION'S CONNECTIONS GOT NOTHING BACK (#631), beside what
+-- migration 59 keeps of each destination's traffic: a TCP connect whose SYN
+-- nothing answered, or a datagram, a DNS query among them, that drew no reply,
+-- read from the host's connection tracker as a flow the guest sent on with no
+-- packet in the reply direction. It is where a job that stalled before it
+-- reached anyone stalled, which the job's own log cannot say.
+--
+-- NULL WHEN IT WAS NOT COUNTED, which is not a destination that answered
+-- everything: every row from before this migration, and every row of a report a
+-- node sent over a wire before VersionUnansweredFlows. A report that counted
+-- writes a number, 0 included, on every one of its rows, and the control plane
+-- reads the lease's report as counted only when all of its rows carry one.
+--
+-- NO CHECK AGAINST connections, which a column added here cannot name in
+-- SQLite; the bound is held in Go, by lease.JobDestination's validation, before
+-- a row is written.
+--
+-- Everything between the markers below is PUBLISHED BYTES; the prose is not.
+-- Reformat one tab and every ledger that applied this migration refuses to open.
+
+-- +billet:statement
+ALTER TABLE job_destinations ADD COLUMN unanswered INTEGER CHECK (unanswered >= 0)
+-- +billet:end

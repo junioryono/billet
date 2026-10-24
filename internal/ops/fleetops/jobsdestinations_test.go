@@ -155,3 +155,81 @@ func TestJobsShowListsEveryDestinationUpToTwenty(t *testing.T) {
 		t.Errorf("twenty destinations were reported as more than the table:\n%s", out)
 	}
 }
+
+// WHAT GOT NOTHING BACK IS NAMED, beside the table and beyond it: a column for
+// the destinations listed, the counts in the rest's and other's totals, and a
+// line naming every destination with an unanswered connection, the most
+// first, including one the table leaves out because it moved next to nothing,
+// which is the destination a stalled job was waiting on.
+func TestJobsShowNamesWhatGotNothingBack(t *testing.T) {
+	t.Parallel()
+
+	dests := manyDestinations(25)
+	dests[24].Unanswered = 1
+	dests = append(dests, alloc.JobDestination{Addr: "10.9.9.9", SentBytes: 120, Connections: 6, Unanswered: 6})
+	out := renderedDestinations(t, &alloc.JobDestinations{
+		Destinations:      dests,
+		Other:             alloc.JobDestination{SentBytes: 2 << 10, Connections: 4, Unanswered: 3},
+		UnansweredCounted: true,
+	})
+
+	if !strings.Contains(out, "connections  unanswered\n") {
+		t.Errorf("the table has no unanswered column:\n%s", out)
+	}
+	if !strings.HasSuffix(lineContaining(t, out, " 10.0.0.25 "), " 1") {
+		t.Errorf("the largest destination's row does not end in its one unanswered connection:\n%s", out)
+	}
+	if strings.Contains(out, "\n"+strings.Repeat(" ", 11)+"10.9.9.9 ") {
+		t.Errorf("the destination that moved least was listed in the table:\n%s", out)
+	}
+	for label, want := range map[string]string{
+		"other": "sent 2.0 KiB, received 0 B, 4 connections, 3 unanswered (beyond the 256",
+		"unanswered": "10 connections got nothing back (a SYN nothing answered, or a datagram, a DNS query " +
+			"among them, with no reply): 10.9.9.9 6, 10.0.0.25 1, other 3",
+	} {
+		if line := lineStarting(t, out, label); !strings.Contains(line, want) {
+			t.Errorf("the %s line reads %q, want it to say %q", label, line, want)
+		}
+	}
+	if !strings.Contains(out, "and 6 more: sent 120 B, received 15.0 KiB, 11 connections, 6 unanswered") {
+		t.Errorf("the rest's totals do not carry their unanswered count:\n%s", out)
+	}
+}
+
+// A REPORT THAT COUNTED AND FOUND NOTHING SAYS NONE; ONE THAT DID NOT COUNT
+// SAYS THAT, with no column and no count in any total, since a zero from a
+// node that never counted would clear a destination nothing was measured
+// against.
+func TestJobsShowTellsNoneUnansweredFromNotCounted(t *testing.T) {
+	t.Parallel()
+
+	counted := renderedDestinations(t, &alloc.JobDestinations{Destinations: manyDestinations(2),
+		UnansweredCounted: true})
+	if line := lineStarting(t, counted, "unanswered"); !strings.HasSuffix(line,
+		"none: every connection the guest sent on got something back") {
+		t.Errorf("a report that counted none unanswered reads %q", line)
+	}
+
+	uncounted := renderedDestinations(t, &alloc.JobDestinations{Destinations: manyDestinations(2)})
+	if line := lineStarting(t, uncounted, "unanswered"); !strings.Contains(line, "not counted") ||
+		strings.Contains(line, "none") {
+		t.Errorf("a report that did not count reads %q", line)
+	}
+	if strings.Contains(uncounted, "unanswered\n") || strings.Contains(uncounted, " unanswered (beyond") {
+		t.Errorf("a report that did not count printed an unanswered column or count:\n%s", uncounted)
+	}
+}
+
+// lineContaining is the report's line holding s.
+func lineContaining(t *testing.T, report, s string) string {
+	t.Helper()
+
+	for line := range strings.SplitSeq(report, "\n") {
+		if strings.Contains(line, s) {
+			return line
+		}
+	}
+	t.Fatalf("no line holds %q in:\n%s", s, report)
+
+	return ""
+}

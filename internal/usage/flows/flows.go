@@ -74,6 +74,11 @@ type Destination struct {
 	// Sent and Received are from the guest's side.
 	Sent, Received uint64
 	Connections    uint64
+	// Unanswered is how many of those connections the guest sent on and got no
+	// packet back from: a TCP connect whose SYN nothing answered, or a datagram,
+	// a DNS query among them, that drew no reply. Where a job stalled before it
+	// reached anyone, this is the count that names the destination.
+	Unanswered uint64
 }
 
 // Result is what a job's flows came to.
@@ -363,6 +368,12 @@ func summarize(w *watch) Result {
 		d.Sent += f.OrigBytes
 		d.Received += f.ReplyBytes
 		d.Connections++
+		// UNANSWERED ONLY WHERE THE GUEST'S OWN PACKETS WERE COUNTED: a tracker
+		// that kept no packet counts reports none either way, and that is not a
+		// destination that never answered.
+		if f.OrigPackets > 0 && f.ReplyPackets == 0 {
+			d.Unanswered++
+		}
 	}
 
 	all := make([]Destination, 0, len(byDest))
@@ -387,6 +398,7 @@ func summarize(w *watch) Result {
 			r.Other.Sent += d.Sent
 			r.Other.Received += d.Received
 			r.Other.Connections += d.Connections
+			r.Other.Unanswered += d.Unanswered
 		}
 
 		all = all[:MaxDestinations]

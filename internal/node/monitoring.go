@@ -396,15 +396,22 @@ func jobDestinationsOf(res flows.Result, c tapComparison) *alloc.JobDestinations
 		}
 		return a + b
 	}
+	// THE UNANSWERED COUNT NEVER PASSES ITS CONNECTIONS, even where both were
+	// clamped, which is what a report must hold to be kept.
+	unanswered := func(of, connections int64) int64 { return min(of, connections) }
+	out.UnansweredCounted = true
 	other := alloc.JobDestination{SentBytes: clamp(res.Other.Sent), ReceivedBytes: clamp(res.Other.Received),
 		Connections: clamp(res.Other.Connections)}
+	other.Unanswered = unanswered(clamp(res.Other.Unanswered), other.Connections)
 	for _, d := range res.Destinations {
 		dest := alloc.JobDestination{Addr: d.Addr.String(), SentBytes: clamp(d.Sent),
 			ReceivedBytes: clamp(d.Received), Connections: clamp(d.Connections)}
+		dest.Unanswered = unanswered(clamp(d.Unanswered), dest.Connections)
 		if !d.Addr.IsValid() || len(out.Destinations) == alloc.MaxJobDestinations {
 			other.SentBytes = add(other.SentBytes, dest.SentBytes)
 			other.ReceivedBytes = add(other.ReceivedBytes, dest.ReceivedBytes)
 			other.Connections = add(other.Connections, dest.Connections)
+			other.Unanswered = unanswered(add(other.Unanswered, dest.Unanswered), other.Connections)
 
 			continue
 		}
