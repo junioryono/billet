@@ -397,9 +397,15 @@ func TestASlowBaselineDoesNotHideAGap(t *testing.T) {
 		h.advance(100*time.Millisecond, "69571715")
 		h.m.Tick()
 
-		if s := finalOf(t, h.m); s.Measured.Energy != measured {
+		s := finalOf(t, h.m)
+		if s.Measured.Energy != measured {
 			t.Errorf("a job whose baseline's memory took %s measured energy %v (%d µJ), want %v",
 				slow, s.Measured.Energy, s.EnergyActive, measured)
+		}
+		// 73.5 W of idle for the 0.2 s since the baseline's CPU, 8 of 128 cpus;
+		// counted from when its memory answered it would be half that.
+		if measured && s.EnergyIdle != 918_750 {
+			t.Errorf("a job whose baseline's memory took %s holds %d µJ of idle, want 918750", slow, s.EnergyIdle)
 		}
 	}
 }
