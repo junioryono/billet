@@ -83,6 +83,20 @@ softnet blocks the private address space, which includes the guest's DHCP resolv
 
 `billet local status` reports what launchd actually has loaded, which is not the plist: launchd reads the file once at bootstrap, so `up` compares the loaded job's program, arguments, timeout and whole environment and names `billet local down` as the way through a drift. `billet local down` drains and stops; `billet local uninstall` removes the agents and leaves your config, App key, ledger, identity and CA where they are. [Draining and stopping](../operating/draining-and-stopping.md) has the details.
 
+## Measuring what a job used
+
+With `node.monitoring` on, a Mac measures each VM by its Virtualization.framework process (CPU, memory, disk) and, when its link can be told apart from every other VM's, by its own `vmenet` interface (network), as the [configuration reference](../reference/configuration.md) describes. A Mac has no package energy counter, so energy at the wall comes from the smart plug the Mac is plugged into: a Shelly Gen2 or later plug with authentication off, set as `node.monitoring.meter` with its address (`shelly`) and the Mac's idle draw measured from the same plug (`idle_watts`, 1.7 to 1.8 W for the reference mini).
+
+**macOS's Local Network privacy can keep the node from reaching the plug.** The node runs as a launch agent, and macOS holds a launch agent to that rule. On the reference mini, on 2026-10-24:
+- **It failed.** The node read the plug as `connect: no route to host` on every tick, while `curl` from an SSH session reached it. The unified log showed macOS evaluating the node each second under the name `a.out`, the identifier the release binary is ad-hoc signed with.
+- **It came back, with no restart and no setting changed,** as a Screen Sharing connection brought up the desktop of the account already logged in at the console. `loginwindow` was active for the few seconds before, and the network helper cached an identity for `a.out` in the same second the reads returned.
+- **The pane listed the node afterwards.** System Settings → Privacy & Security → Local Network showed it, turned on. Whether it was off before is not known.
+- **A locked screen did not stop it.** With the screen locked again after Screen Sharing disconnected, the node kept reading.
+
+What in that session admitted the node is not measured. Nor is whether a logout or an update (a binary with a new signature) blocks it again, or whether turning a listed node on fixes a failing one.
+
+The node logs `could not read the power meter` when its reads start failing and `reading the power meter again` when a failing read recovers. A node that has read the plug since it started logs neither. If the plug cannot be read, bringing up the desktop over Screen Sharing and looking at that pane is what has been seen to go with recovery.
+
 ## Headless operation
 
 Enable SSH first (System Settings → General → Sharing → Remote Login, or `sudo systemsetup -setremotelogin on`); on macOS 26, Screen Sharing after a reboot needs SSH already reachable, so it is what makes everything else recoverable. Harden with a drop-in that sorts ahead of Apple's own `/etc/ssh/sshd_config.d/100-macos.conf`, because the first value wins, and turn off `KbdInteractiveAuthentication` as well as `PasswordAuthentication`: keyboard-interactive is a second method that can take a password through PAM ([the drop-in](../reference/reference-hardware.md#headless-operation)). Do not reach for `pmset autorestart`: it is a silent no-op on Apple Silicon. What decides whether the Mac comes back is *Start up when power is connected* in System Settings → Energy (*Never*, *After power failure* or *Always*; Apple documents it for 2024-and-later minis under macOS 26.5 and later). Choose **Always**, which also starts a Mac that was shut down and then plugged back in (Apple advises leaving it unplugged for about 30 seconds first); from a shell, `sudo pmset -a autorestartatconnect 1` is what was set on the reference mini. Neither its effect nor recovery from a real power cut is measured on the reference mini yet.
