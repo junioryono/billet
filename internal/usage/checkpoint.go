@@ -210,7 +210,7 @@ func (m *Monitor) Resume(key string, target Target, vcpus int, from *Checkpoint)
 	m.jobs[key] = j
 	m.mu.Unlock()
 
-	m.ask(request{kind: requestStart, key: key, job: j}, m.limit)
+	m.begin(key, j)
 
 	if why != nil {
 		return fmt.Errorf("usage: not continuing the series from the checkpoint, because %w", why)

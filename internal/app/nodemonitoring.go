@@ -157,16 +157,21 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 	return opts, nil
 }
 
-// meterReader is the sampler's read of the plug: bounded to half an interval,
-// since it runs on the sampler's one goroutine, and logged when it starts and
-// stops failing rather than on every tick.
+// meterReadLimit bounds one read of the plug, so a plug that does not answer
+// holds the sampler's one goroutine well short of the 2 s a job's start waits
+// for it, at any interval. A plug on the LAN answers in tens of milliseconds.
+const meterReadLimit = 500 * time.Millisecond
+
+// meterReader is the sampler's read of the plug: bounded to half an interval
+// and to meterReadLimit, since it runs on the sampler's one goroutine, and
+// logged when it starts and stops failing rather than on every tick.
 func meterReader(ctx context.Context, watts func(context.Context) (float64, error), interval time.Duration,
 	log *slog.Logger,
 ) func() (float64, error) {
 	failing := false
 
 	return func() (float64, error) {
-		readCtx, cancel := context.WithTimeout(ctx, interval/2)
+		readCtx, cancel := context.WithTimeout(ctx, min(interval/2, meterReadLimit))
 		defer cancel()
 
 		w, err := watts(readCtx)

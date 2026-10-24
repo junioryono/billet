@@ -171,7 +171,8 @@ func TestAJobAfterAStallIsNotChargedTheStall(t *testing.T) {
 // THE WALL'S ENERGY IS SHARED OVER THE INTERVAL BETWEEN THE PLUG'S ANSWERS, the
 // one the CPU is read across just after each, however long the plug takes: an
 // answer that comes 400 ms later than the last makes that interval 1.4 s, of
-// both the wall's 20 W and the host's 2 W idle.
+// both the wall's 20 W and the host's 2 W idle. The host and the VM do their
+// work while the plug is answering, so only CPU read after it sees any.
 func TestTheWallIsSharedOverTheIntervalItsReadingsSpan(t *testing.T) {
 	t.Parallel()
 
@@ -179,18 +180,26 @@ func TestTheWallIsSharedOverTheIntervalItsReadingsSpan(t *testing.T) {
 	tr.write("/proc/stat", procStat(1000, 9000))
 	h := newProcessHost()
 	now := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
-	var latency time.Duration
+	var answering func()
 	m := runMonitor(t, tr.root, Options{Interval: time.Second, IdleWatts: 2,
-		Meter: func() (float64, error) { now = now.Add(latency); return 20, nil },
-		Now:   func() time.Time { return now }})
+		Meter: func() (float64, error) {
+			if answering != nil {
+				answering()
+			}
+
+			return 20, nil
+		},
+		Now: func() time.Time { return now }})
 	m.reader.Process = h.reader.Process
 	m.Tick()
 	m.Start("vm", processTarget, 6)
 
 	now = now.Add(time.Second)
-	latency = 400 * time.Millisecond
-	tr.write("/proc/stat", procStat(1300, 10500))
-	h.counters.UserMicros += 1_500_000
+	answering = func() {
+		now = now.Add(400 * time.Millisecond)
+		tr.write("/proc/stat", procStat(1300, 10500))
+		h.counters.UserMicros += 1_500_000
+	}
 	m.Tick()
 
 	s := finalOf(t, m)
@@ -200,6 +209,79 @@ func TestTheWallIsSharedOverTheIntervalItsReadingsSpan(t *testing.T) {
 	// (20 W - 2 W idle) * 1.4 s * 1.5 / 3.
 	if s.EnergyActive != 12_600_000 {
 		t.Errorf("active energy %d µJ, want 12600000 over the 1.4 s the readings span", s.EnergyActive)
+	}
+	// 2 W * 1.4 s * 6 / 18.
+	if s.EnergyIdle != 933_333 {
+		t.Errorf("idle energy %d µJ, want 933333 over the 1.4 s the readings span", s.EnergyIdle)
+	}
+}
+
+// A JOB WHOSE READ ENDS WELL AFTER THE HOST'S IS NOT SHARED THE INTERVAL: its CPU
+// runs past the one the plug and the host were read across. A read a little
+// after the host's, as every job's is, still is.
+func TestAJobReadLongAfterTheHostIsNotSharedTheInterval(t *testing.T) {
+	t.Parallel()
+
+	for late, measured := range map[time.Duration]bool{
+		50 * time.Millisecond:  true,
+		300 * time.Millisecond: false,
+	} {
+		r := newMeterRun(t)
+		process := r.m.reader.Process
+		r.m.reader.Process = func(pid int) (ProcessCounters, error) {
+			*r.now = r.now.Add(late)
+
+			return process(pid)
+		}
+		r.advance()
+
+		if s := finalOf(t, r.m); s.Measured.Energy != measured {
+			t.Errorf("a read %s after the host's measured %v (%d µJ), want %v",
+				late, s.Measured.Energy, s.EnergyActive, measured)
+		}
+	}
+}
+
+// A JOB WHOSE START THE SAMPLER NEVER TOOK, busy past the limit on a plug that
+// would not answer, is given its baseline by the next tick and sampled from
+// then, its energy unknown: it is never left pending, unsampled, for the rest of
+// its life.
+func TestAStartTheSamplerNeverTookIsBaselinedByTheNextTick(t *testing.T) {
+	t.Parallel()
+
+	r := newMeterRun(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	r.m.opts.Meter = func() (float64, error) {
+		entered <- struct{}{}
+		<-release
+
+		return 20, nil
+	}
+	ticked := make(chan struct{})
+	go func() {
+		defer close(ticked)
+		r.m.Tick()
+	}()
+	<-entered
+	r.m.limit = 10 * time.Millisecond
+	r.m.Start("late", processTarget, 6)
+	r.m.limit = lifecycleLimit
+	close(release)
+	<-ticked
+
+	r.m.opts.Meter = func() (float64, error) { return 20, nil }
+	r.advance()
+	r.advance()
+
+	// The baseline, the two ticks after it and the final read: a job left
+	// pending is read by its final alone, beside its placeholder.
+	s, ok := r.m.Final("late")
+	if !ok || len(s.Points) != 4 {
+		t.Fatalf("a start the sampler never took kept %d points (%v); want 4, sampled by the ticks after",
+			len(s.Points), ok)
+	}
+	if s.Measured.Energy {
+		t.Errorf("a start the sampler never took measured %d µJ; want its energy unknown", s.EnergyActive)
 	}
 }
 

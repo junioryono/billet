@@ -79,6 +79,12 @@ const lifecycleLimit = 2 * time.Second
 // share past it is could-not-tell, never clipped into a plausible number.
 const skewSlack = 0.05
 
+// lateAfter is the share of an interval a job's read may end after the host's
+// before its CPU is not shared that interval's energy: the jobs are read one
+// after another once the host is, so a read that ends past it holds CPU from an
+// interval the energy beside it does not cover.
+const lateAfter = 0.1
+
 // staleAfter is how many intervals without a tick make energy could-not-tell:
 // a sampler that stalled or stopped has missed intervals, and their energy is
 // in no job's total.
@@ -192,6 +198,10 @@ type job struct {
 	// not opened and its package energy is broken, since neither was counted
 	// before it. carried says its series so far came from a checkpoint.
 	resumed, carried bool
+	// untaken is a pending job whose baseline request Run never took, busy past
+	// the limit on a read: the next tick takes the baseline instead, so the job
+	// is not left unsampled for the rest of its life.
+	untaken bool
 }
 
 // see records that an interval since the last kept point went unseen, and why;
@@ -260,20 +270,41 @@ func (m *Monitor) serve(r request) {
 // limit, and reports whether the answer came in time. Run replies into a
 // buffered channel, so an answer nobody waits for any more never blocks it.
 func (m *Monitor) ask(r request, limit time.Duration) (reply, bool) {
+	a, _, answered := m.exchange(r, limit)
+
+	return a, answered
+}
+
+// exchange is ask, also reporting whether Run took the request at all (the
+// first bool) and answered it in time (the second): one it never took was never
+// served and never will be.
+func (m *Monitor) exchange(r request, limit time.Duration) (reply, bool, bool) {
 	r.reply = make(chan reply, 1)
 	deadline := time.NewTimer(limit)
 	defer deadline.Stop()
 	select {
 	case m.requests <- r:
 	case <-deadline.C:
-		return reply{}, false
+		return reply{}, false, false
 	}
 	select {
 	case a := <-r.reply:
-		return a, true
+		return a, true, true
 	case <-deadline.C:
-		return reply{}, false
+		return reply{}, true, false
 	}
+}
+
+// begin asks Run for a published job's baseline. A request Run never took is
+// left to the next tick, and the job's energy is not measured, since what it
+// drew before that baseline is in nobody's share.
+func (m *Monitor) begin(key string, j *job) {
+	if _, taken, _ := m.exchange(request{kind: requestStart, key: key, job: j}, m.limit); taken {
+		return
+	}
+	m.mu.Lock()
+	j.untaken = true
+	m.mu.Unlock()
 }
 
 // Start begins measuring a job. Run takes its first sample, so the CPU it used
@@ -294,7 +325,7 @@ func (m *Monitor) Start(key string, target Target, vcpus int) {
 	m.jobs[key] = j
 	m.mu.Unlock()
 
-	m.ask(request{kind: requestStart, key: key, job: j}, m.limit)
+	m.begin(key, j)
 }
 
 func (m *Monitor) start(key string, j *job) {
@@ -317,6 +348,9 @@ func (m *Monitor) start(key string, j *job) {
 	defer m.mu.Unlock()
 	if m.jobs[key] != j {
 		return
+	}
+	if j.untaken {
+		j.untaken, j.energyBroken = false, true
 	}
 	if j.carried {
 		m.continueFrom(j, s, now)
@@ -386,6 +420,18 @@ func (m *Monitor) Tick() {
 // Run.
 func (m *Monitor) tick() {
 	took := time.Now()
+	m.mu.Lock()
+	untaken := make(map[string]*job)
+	for key, j := range m.jobs {
+		if j.pending && j.untaken {
+			untaken[key] = j
+		}
+	}
+	m.mu.Unlock()
+	for key, j := range untaken {
+		m.start(key, j)
+	}
+
 	m.sweepCounters()
 	m.mu.Lock()
 	snapshot := make(map[string]*job, len(m.jobs))
@@ -478,7 +524,10 @@ func (m *Monitor) tick() {
 		if j != snapshot[key] {
 			continue
 		}
-		if !s.CPUOK || !j.lastCPUOK {
+		// A READ THAT ENDED WELL AFTER THE HOST'S is not measured, and nor is
+		// one held up behind another job's slow read: its CPU runs past the
+		// interval the host's busy time and the energy were read across.
+		if !s.CPUOK || !j.lastCPUOK || readAt[key].Sub(now) > time.Duration(lateAfter*float64(m.opts.Interval)) {
 			continue
 		}
 		d := s.CPUUsage - j.lastCPU

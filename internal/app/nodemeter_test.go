@@ -11,30 +11,36 @@ import (
 )
 
 // THE SAMPLER'S READ OF THE PLUG ANSWERS THE PLUG'S POWER, and its refusal as
-// its own, each within half an interval of the sampler's goroutine.
+// its own, each within half an interval of the sampler's goroutine and never
+// longer than meterReadLimit, however long the interval.
 func TestTheSamplersReadOfThePlugIsBoundedAndTrue(t *testing.T) {
 	t.Parallel()
 
-	var left time.Duration
-	answer, answerErr := 17.5, error(nil)
-	read := meterReader(t.Context(), func(ctx context.Context) (float64, error) {
-		deadline, ok := ctx.Deadline()
-		if !ok {
-			t.Error("the plug was read with no deadline")
+	for interval, most := range map[time.Duration]time.Duration{
+		500 * time.Millisecond: 250 * time.Millisecond,
+		30 * time.Second:       meterReadLimit,
+	} {
+		var left time.Duration
+		read := meterReader(t.Context(), func(ctx context.Context) (float64, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Error("the plug was read with no deadline")
+			}
+			left = time.Until(deadline)
+
+			return 17.5, nil
+		}, interval, slog.New(slog.DiscardHandler))
+		if w, err := read(); err != nil || w != 17.5 {
+			t.Fatalf("read %v, %v; want the plug's 17.5 W", w, err)
 		}
-		left = time.Until(deadline)
-
-		return answer, answerErr
-	}, 2*time.Second, slog.New(slog.DiscardHandler))
-
-	if w, err := read(); err != nil || w != 17.5 {
-		t.Fatalf("read %v, %v; want the plug's 17.5 W", w, err)
-	}
-	if left <= 0 || left > time.Second {
-		t.Errorf("the read had %s left, want at most half the 2s interval", left)
+		if left <= most/2 || left > most {
+			t.Errorf("at a %s interval the read had %s left, want at most %s", interval, left, most)
+		}
 	}
 
-	answerErr = errors.New("unplugged")
+	answer, answerErr := 0.0, errors.New("unplugged")
+	read := meterReader(t.Context(), func(context.Context) (float64, error) { return answer, answerErr },
+		2*time.Second, slog.New(slog.DiscardHandler))
 	if _, err := read(); !errors.Is(err, answerErr) {
 		t.Fatalf("a failed read answered %v, want the plug's error", err)
 	}
