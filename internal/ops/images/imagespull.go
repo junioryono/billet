@@ -273,15 +273,29 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 			return fmt.Errorf("billet images pull: %w", err)
 		}
 
-		// A NODE THAT HAS NOT REGISTERED IMPORTS THE IMAGE AS PUBLISHED, installing
-		// nothing, because its first pull is what puts the kernel on the host, and
-		// the node cannot start, so cannot register, until it has one. Nothing
-		// promotes that generation: verify --record and promote refuse until the
-		// node has registered, and the refresh then completes the image.
+		// A NODE THAT HAS NOT REGISTERED INSTALLS THE KERNEL AND IMPORTS NOTHING.
+		// Its first pull is what puts the kernel its configuration names on the
+		// host, and the node cannot start, so cannot register, without one; a
+		// generation imported without what the deployment accepts could be booted
+		// by a tier pinning it, so none is.
 		if err != nil {
-			fmt.Fprintf(env.Stdout, "%v.\nimporting the image as published, which installs the kernel "+
-				"and nothing it leaves out, and which nothing promotes until the node has registered; "+
-				"a pull after that completes it\n", err)
+			lock, lerr := takeKernelDirLock(ctx, env, *kernelDir,
+				"install the kernel a node that has not registered starts with")
+			if lerr != nil {
+				return lerr
+			}
+
+			kernel, kerr := installKernel(kernelInstaller, manifest, dir, *kernelDir)
+			if rerr := lock.release(); rerr != nil {
+				fmt.Fprintf(env.Stdout, "warning: the kernel directory lock was not released: %v\n", rerr)
+			}
+
+			if kerr != nil {
+				return fmt.Errorf("billet images pull: the kernel could not be kept: %w", kerr)
+			}
+
+			return fmt.Errorf("billet images pull: installed the kernel %s, so the node can start, and "+
+				"imported no generation: %w", kernel, err)
 		}
 
 		plan = planCompletion(manifest, accepted)
@@ -377,7 +391,7 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	// have recorded a different list or the record been withdrawn.
 	if components != nil {
 		now, err := acceptedComponents(cfg)
-		if err != nil && (!errors.Is(err, errAcceptanceUnknown) || len(plan.Install) > 0) {
+		if err != nil {
 			return fmt.Errorf("billet images pull: nothing was imported: %w", err)
 		}
 

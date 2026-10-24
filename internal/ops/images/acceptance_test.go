@@ -333,10 +333,10 @@ func TestAPullWhoseAcceptanceChangedBeforeItsImportImportsNothing(t *testing.T) 
 	}
 }
 
-// A NODE'S FIRST PULL, BEFORE IT HAS REGISTERED, IMPORTS THE IMAGE AS PUBLISHED:
-// the node cannot start without the kernel that pull installs, so the pull
-// imports what it can tell, completing nothing, and says so.
-func TestAFirstPullBeforeRegistrationImportsTheImageAsPublished(t *testing.T) {
+// A NODE'S FIRST PULL, BEFORE IT HAS REGISTERED, INSTALLS THE KERNEL AND IMPORTS
+// NOTHING: the node cannot start without the kernel, and a generation without
+// what the deployment accepts could be booted by a tier pinning it.
+func TestAFirstPullBeforeRegistrationInstallsTheKernelAndImportsNothing(t *testing.T) {
 	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
 	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
 
@@ -344,21 +344,24 @@ func TestAFirstPullBeforeRegistrationImportsTheImageAsPublished(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := run.pull(t); err != nil {
-		t.Fatalf("a first pull before registration answered %v, want the image imported as published", err)
+	kernel := filepath.Join(run.fixture.kernelDir, kernelFileName(run.fixture.manifest))
+
+	err := run.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "installed the kernel "+kernel+", so the node can start, "+
+		"and imported no generation: this node has not recorded what its control plane accepts") {
+		t.Fatalf("a first pull before registration answered %v, want the kernel installed and nothing imported", err)
+	}
+
+	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
+		t.Fatalf("the kernel %s is not installed: %v", kernel, err)
 	}
 
 	if len(run.backend.launched) != 0 {
 		t.Fatalf("a pull that cannot tell what is accepted completed %+v", run.backend.launched)
 	}
 
-	if got := run.fixture.publisher.calls(); got != 1 {
-		t.Fatalf("ImportGeneration was reached %d times, want once", got)
-	}
-
-	if got := run.fixture.publisher.last().components; got == nil ||
-		!slices.Equal(got.LeftOut, []string{"google-chrome"}) || len(got.Installed) != 0 {
-		t.Fatalf("the generation records %+v, want google-chrome left out and nothing installed", got)
+	if got := run.fixture.publisher.calls(); got != 0 {
+		t.Fatalf("ImportGeneration was reached %d times, want never", got)
 	}
 }
 
