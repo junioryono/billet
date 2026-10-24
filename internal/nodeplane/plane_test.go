@@ -475,9 +475,16 @@ func TestAProviderChangeAfterEnqueueRefusesTheStaleLaunch(t *testing.T) {
 		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
+	// GUARDS, NOT BOUNDS: an in-memory enqueue that never happens waits forever,
+	// and a correct one waits on nothing but the scheduler, which under CI's race
+	// detector once left the launch's goroutine unrun for two seconds (#188, main
+	// f87af79d, 2026-10-21). Both sit below the plane's ten-minute command
+	// timeout, so a launch left waiting reports as that and not as a timeout.
+	const launchGuard = 30 * time.Second
+
 	select {
 	case <-enqueued:
-	case <-time.After(2 * time.Second):
+	case <-time.After(launchGuard):
 		t.Fatal("the production launch path did not enqueue its command")
 	}
 
@@ -496,7 +503,7 @@ func TestAProviderChangeAfterEnqueueRefusesTheStaleLaunch(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "changed provider from docker to ec2") {
 			t.Errorf("stale launch result = %v, want a useful clean failure", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(launchGuard):
 		t.Fatal("the caller was left waiting for a stale launch that cannot be delivered")
 	}
 }

@@ -82,6 +82,10 @@ type stub struct {
 	// smallest thing that would put the runner's registration into a billet log
 	// if billet ever rendered a delivery's stderr.
 	execReflects string
+	// execReflected gains a line each time the reflecting guest is asked
+	// anything, so a test can tell an attempt has come back by the next one
+	// beginning.
+	execReflected string
 	// pullEvicts makes a pull exit 0 having left nothing in the store, which is
 	// what tart's automatic pruning does on a disk too full to hold the image.
 	pullEvicts  string
@@ -123,6 +127,7 @@ func newStub(t *testing.T) *stub {
 		runFails:         filepath.Join(dir, "run-fails"),
 		pullEvicts:       filepath.Join(dir, "pull-evicts"),
 		execReflects:     filepath.Join(dir, "exec-reflects"),
+		execReflected:    filepath.Join(dir, "exec-reflected"),
 		getBlind:         filepath.Join(dir, "get-blind"),
 		proveSays:        filepath.Join(dir, "prove-says"),
 		proveHold:        filepath.Join(dir, "prove-hold"),
@@ -395,6 +400,7 @@ exec)
     # RECORDED FIRST, so a test can prove the registration actually arrived —
     # otherwise "no secret in the error" is also true of a delivery that never
     # sent one.
+    echo asked >> "` + s.execReflected + `"
     cat > "` + s.execStdinTmp + `"
     if [ -s "` + s.execStdinTmp + `" ]; then cp "` + s.execStdinTmp + `" "` + s.execStdin + `"; fi
     cat "` + s.execStdinTmp + `" >&2
