@@ -103,13 +103,16 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 // shared network, and under softnet the softnet process its `tart run` started.
 //
 // THE DEVICE IS THE ONE MEMBER THE BRIDGE LEARNED THE VM'S CONFIGURED ADDRESS
-// ON. Nothing ties a socket to its interface: the socket's unit and the
-// interface's number are allocated apart, and diverge as VMs come and go
-// (measured on macOS 27.0.1, 2026-10-24). The table is what the guest sent, and
-// it holds under softnet, which drops a frame from any address but the one it
-// was told (measured the same day), so an untrusted guest cannot claim
-// another's; a guest on the shared network is trusted work. An address on no
-// member, or on more than one (two VMs cloned with one address), refuses.
+// ON. No mapping from a socket to its interface is established: the socket's
+// unit and the interface's number are allocated apart and diverge as VMs come
+// and go, and `ifconfig -v` names nothing that ties them (measured on macOS
+// 27.0.1, 2026-10-24). The table is what the guest sent, and it holds under
+// softnet, which drops a frame from any address but the one it was told
+// (measured the same day), so an untrusted guest cannot claim another's; a
+// guest on the shared network is trusted work. A member's entries leave the
+// table with it (measured). The address must be no other VM's in the store,
+// since a clone can keep its image's, and an address on no member or on more
+// than one refuses.
 //
 // THE CARRIER IS FOUND BY ITS SOCKET and returned with its start, read before
 // and after the socket is, so every later read of the device proves the process
@@ -119,6 +122,9 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 ) {
 	mac, err := p.vmMAC(name)
 	if err != nil {
+		return "", 0, 0, err
+	}
+	if err := p.addressIsOnlyIts(name, mac); err != nil {
 		return "", 0, 0, err
 	}
 	carrier, carrierStart := vm, vmStart
@@ -271,6 +277,35 @@ func (p *Provider) softnetOf(ctx context.Context, name string, mac net.HardwareA
 	default:
 		return 0, fmt.Errorf("%d softnet processes carry %s", len(carriers), name)
 	}
+}
+
+// addressIsOnlyIts refuses a VM whose configured address another VM in the store
+// is configured with too, billet's or not: the bridge could have learned it from
+// either, and nothing then says which member is this VM's. A configuration
+// that cannot be read is could-not-tell, and refuses too.
+func (p *Provider) addressIsOnlyIts(name string, mac net.HardwareAddr) error {
+	entries, err := os.ReadDir(filepath.Join(p.home, "vms"))
+	if err != nil {
+		return fmt.Errorf("list the VMs in the store: %w", err)
+	}
+	for _, e := range entries {
+		other := e.Name()
+		if other == name || !e.IsDir() {
+			continue
+		}
+		theirs, err := p.vmMAC(other)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("could not tell whether %s shares %s's address: %w", other, name, err)
+		}
+		if bytes.Equal(theirs, mac) {
+			return fmt.Errorf("%s and %s are both configured with address %s", name, other, mac)
+		}
+	}
+
+	return nil
 }
 
 // vmMAC is the hardware address tart gave a VM, from its config.json.
