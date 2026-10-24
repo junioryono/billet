@@ -88,9 +88,9 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 }
 
 // unansweredText says which destinations got nothing back on some of their
-// connections, the most first, by name and not only among the largest by
-// bytes: a destination a job stalled on moved next to nothing, so the table
-// may never list it.
+// connections, the most first, every one by name and not only among the
+// largest by bytes: a destination a job stalled on moved next to nothing, so
+// the table may never list it.
 //
 // A REPORT THAT DID NOT COUNT THEM SAYS SO, never "none", which would clear a
 // destination nothing was measured against.
@@ -100,8 +100,18 @@ func unansweredText(d *alloc.JobDestinations) string {
 			"nothing about a connection that got nothing back"
 	}
 	total := sumOf(append(slices.Clone(d.Destinations), d.Other)...).unanswered
+	// AN INCOMPLETE RESULT MAY HAVE MISSED THE ONE THAT STALLED, so it proves
+	// no "none" and its count is a lower bound.
+	if total.Sign() == 0 && d.Incomplete {
+		return "none observed, but flows may have been missed, so this does not say every connection " +
+			"got something back"
+	}
 	if total.Sign() == 0 {
 		return "none: every connection the guest sent on got something back"
+	}
+	count := bigCount(total)
+	if d.Incomplete {
+		count = "at least " + count
 	}
 	var stalled []alloc.JobDestination
 	for _, dest := range d.Destinations {
@@ -112,20 +122,16 @@ func unansweredText(d *alloc.JobDestinations) string {
 	slices.SortStableFunc(stalled, func(x, y alloc.JobDestination) int {
 		return cmp.Compare(y.Unanswered, x.Unanswered)
 	})
-	var named []string
-	for _, dest := range stalled[:min(len(stalled), shownDestinations)] {
+	named := make([]string, 0, len(stalled)+1)
+	for _, dest := range stalled {
 		named = append(named, dest.Addr+" "+groupDigits(dest.Unanswered))
-	}
-	if rest := stalled[min(len(stalled), shownDestinations):]; len(rest) > 0 {
-		named = append(named, fmt.Sprintf("%d more destinations %s", len(rest),
-			bigCount(sumOf(rest...).unanswered)))
 	}
 	if d.Other.Unanswered > 0 {
 		named = append(named, "other "+groupDigits(d.Other.Unanswered))
 	}
 
 	return fmt.Sprintf("%s connections got nothing back (a SYN nothing answered, or a datagram, a DNS "+
-		"query among them, with no reply): %s", bigCount(total), strings.Join(named, ", "))
+		"query among them, with no reply): %s", count, strings.Join(named, ", "))
 }
 
 // traffic is destinations' totals summed exactly: up to 257 counts that each

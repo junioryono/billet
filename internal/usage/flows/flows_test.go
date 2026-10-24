@@ -293,9 +293,10 @@ func TestDestinationsBeyondTheCapFoldIntoOther(t *testing.T) {
 
 // A CONNECTION THAT GOT NOTHING BACK IS COUNTED AGAINST ITS DESTINATION: a SYN
 // no one answered, or a DNS query with no reply, is the stall a job's own log
-// cannot place. One that was answered, even with nothing but a reset, is not,
-// and neither is a flow the tracker kept no packet counts for, which says
-// nothing either way. Beyond the cap the count is kept in Other.
+// cannot place. One that was answered, even with nothing but a reset, is not.
+// A flow the tracker kept no packet counts for says nothing either way, so a
+// result holding one cannot say what went unanswered anywhere. Beyond the cap
+// the count is kept in Other.
 func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.T) {
 	t.Parallel()
 
@@ -313,14 +314,14 @@ func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.
 	query := flow(4, guest, resolver, 60, 0)
 	query.Protocol, query.DestPort, query.OrigPackets = 17, 53, 1
 	a.Observe(query)
-	uncounted := flow(5, guest, npm, 0, 0)
-	a.Observe(uncounted)
 
 	r, _ := a.Final("lease-1", nil, ended)
+	if r.UnansweredUnknown {
+		t.Errorf("a result whose every flow carried packet counts says it cannot tell what went unanswered")
+	}
 	want := map[netip.Addr]Destination{
 		github:   {Addr: github, Sent: 360, Received: 4040, Connections: 3, Unanswered: 1},
 		resolver: {Addr: resolver, Sent: 60, Connections: 1, Unanswered: 1},
-		npm:      {Addr: npm, Connections: 1},
 	}
 	if len(r.Destinations) != len(want) {
 		t.Fatalf("destinations = %+v, want %+v", r.Destinations, want)
@@ -329,6 +330,14 @@ func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.
 		if d != want[d.Addr] {
 			t.Errorf("destination %s = %+v, want %+v", d.Addr, d, want[d.Addr])
 		}
+	}
+
+	unknown := NewAccountant()
+	unknown.Watch("lease-3", guest, began, nil)
+	unknown.Observe(stalled)
+	unknown.Observe(flow(5, guest, npm, 0, 0))
+	if r, _ := unknown.Final("lease-3", nil, ended); !r.UnansweredUnknown {
+		t.Errorf("a result holding a flow with no packet counts says it could tell what went unanswered: %+v", r)
 	}
 
 	beyond := NewAccountant()

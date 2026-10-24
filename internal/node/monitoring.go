@@ -418,6 +418,9 @@ func jobDestinationsOf(res flows.Result, c tapComparison) *alloc.JobDestinations
 		out.Destinations = append(out.Destinations, dest)
 	}
 	out.Other = other
+	if res.UnansweredUnknown {
+		*out = out.WithoutUnanswered()
+	}
 	if c.tapKnown && c.tapSent >= 0 && c.tapReceived >= 0 {
 		out.Tap = &alloc.TapTotals{SentBytes: c.tapSent, ReceivedBytes: c.tapReceived}
 	}

@@ -220,6 +220,36 @@ func TestJobsShowTellsNoneUnansweredFromNotCounted(t *testing.T) {
 	}
 }
 
+// EVERY DESTINATION THAT GOT NOTHING BACK IS NAMED, however many there are,
+// since one left out of this line may be in no table either; and a result
+// that may have missed flows proves no "none" and counts at least what it saw.
+func TestJobsShowNamesEveryStalledDestinationAndQualifiesAnIncompleteOne(t *testing.T) {
+	t.Parallel()
+
+	dests := manyDestinations(shownDestinations + 5)
+	for i := range dests {
+		dests[i].Unanswered = 1
+	}
+	out := renderedDestinations(t, &alloc.JobDestinations{Destinations: dests, UnansweredCounted: true,
+		Incomplete: true})
+	line := lineStarting(t, out, "unanswered")
+	for i := 1; i <= len(dests); i++ {
+		if !strings.Contains(line, fmt.Sprintf("10.0.0.%d 1", i)) {
+			t.Errorf("10.0.0.%d, which got nothing back once, is not named: %q", i, line)
+		}
+	}
+	if !strings.HasPrefix(line, "unanswered at least 25 connections got nothing back") {
+		t.Errorf("an incomplete result's count is not said as a lower bound: %q", line)
+	}
+
+	none := renderedDestinations(t, &alloc.JobDestinations{Destinations: manyDestinations(2),
+		UnansweredCounted: true, Incomplete: true})
+	if line := lineStarting(t, none, "unanswered"); !strings.HasPrefix(line, "unanswered none observed, but flows "+
+		"may have been missed") || strings.Contains(line, "every connection the guest sent on got something back") {
+		t.Errorf("an incomplete result that saw none unanswered reads %q", line)
+	}
+}
+
 // lineContaining is the report's line holding s.
 func lineContaining(t *testing.T, report, s string) string {
 	t.Helper()

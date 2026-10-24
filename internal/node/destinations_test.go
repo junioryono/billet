@@ -135,6 +135,17 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 		t.Errorf("what the node reports does not validate: %v", err)
 	}
 
+	// A RESULT THAT CANNOT TELL WHAT WENT UNANSWERED REPORTS IT NOT COUNTED,
+	// with no count left on any destination, rather than as the counts it saw.
+	res.UnansweredUnknown = true
+	got = jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: -1, tapReceived: 4})
+	if got.UnansweredCounted || got.Destinations[0].Unanswered != 0 || got.Other.Unanswered != 0 {
+		t.Errorf("a result that could not tell what went unanswered reports %+v", got)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("a report that did not count does not validate: %v", err)
+	}
+
 	// ONE MORE THAN THE LEDGER KEEPS BY NAME goes under Other, and the
 	// largest Other a sum can reach is held there rather than wrapping.
 	res = flows.Result{Other: flows.Destination{Sent: math.MaxInt64}}

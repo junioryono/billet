@@ -94,6 +94,10 @@ type Result struct {
 	// guest's traffic joined an entry its address's previous holder left, or
 	// its address changed. The totals are then a lower bound, and say so.
 	Incomplete bool
+	// UnansweredUnknown says a flow carried no packet counts in either
+	// direction, which no guest flow has while the tracker keeps them, so no
+	// destination's Unanswered can be told from none.
+	UnansweredUnknown bool
 }
 
 // Accountant attributes flows to watched jobs. Safe for concurrent use: the
@@ -355,6 +359,7 @@ func (a *Accountant) Final(key string, open []Flow, until time.Time) (Result, bo
 
 func summarize(w *watch) Result {
 	byDest := map[netip.Addr]*Destination{}
+	unknown := false
 
 	for id := range w.counted {
 		f := w.counted[id]
@@ -368,10 +373,14 @@ func summarize(w *watch) Result {
 		d.Sent += f.OrigBytes
 		d.Received += f.ReplyBytes
 		d.Connections++
-		// UNANSWERED ONLY WHERE THE GUEST'S OWN PACKETS WERE COUNTED: a tracker
-		// that kept no packet counts reports none either way, and that is not a
-		// destination that never answered.
-		if f.OrigPackets > 0 && f.ReplyPackets == 0 {
+		// UNANSWERED ONLY WHERE THE GUEST'S OWN PACKETS WERE COUNTED: a flow
+		// begins with the guest's packet, so one with none counted either way is
+		// a tracker that kept no counts, and the whole result cannot say what
+		// went unanswered.
+		switch {
+		case f.OrigPackets == 0 && f.ReplyPackets == 0:
+			unknown = true
+		case f.OrigPackets > 0 && f.ReplyPackets == 0:
 			d.Unanswered++
 		}
 	}
@@ -391,7 +400,7 @@ func summarize(w *watch) Result {
 		return x.Addr.Compare(y.Addr)
 	})
 
-	r := Result{Incomplete: w.incomplete}
+	r := Result{Incomplete: w.incomplete, UnansweredUnknown: unknown}
 
 	if len(all) > MaxDestinations {
 		for _, d := range all[MaxDestinations:] {
