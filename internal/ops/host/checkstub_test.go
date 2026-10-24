@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // stubGitHubUnverifiable points cmdCheck's App verification at a fake that
@@ -435,6 +436,12 @@ func writeCheckConfig(t *testing.T) string {
 		t.Fatalf("write the key: %v", err)
 	}
 
+	// THE LEDGER IS SEEDED FROM THE TEMPLATE, so a check opens a migrated one: a
+	// check migrating from an empty schema runs every migration inside its open's
+	// thirty-second startup budget, and under CI's race and coverage load that
+	// ran out (#188, 2026-10-24).
+	ledgertest.Seed(t, filepath.Join(dir, "server"))
+
 	cfgPath := filepath.Join(dir, "billet.yaml")
 	body := fmt.Sprintf(`server:
   listen: 127.0.0.1:7717
@@ -488,6 +495,12 @@ func writeUntrustedCheckConfig(t *testing.T, labels ...string) string {
 	}), 0o600); err != nil {
 		t.Fatalf("write the key: %v", err)
 	}
+
+	// THE LEDGER IS SEEDED FROM THE TEMPLATE, so a check opens a migrated one: a
+	// check migrating from an empty schema runs every migration inside its open's
+	// thirty-second startup budget, and under CI's race and coverage load that
+	// ran out (#188, 2026-10-24).
+	ledgertest.Seed(t, filepath.Join(dir, "server"))
 
 	cfgPath := filepath.Join(dir, "billet.yaml")
 	body := fmt.Sprintf(`server:

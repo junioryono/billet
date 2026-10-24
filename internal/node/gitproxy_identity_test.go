@@ -167,6 +167,14 @@ func failMidAnswer(t *testing.T, behaviour string) {
 	if output, err := git("-C", "c", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(output) != pushed {
 		t.Fatalf("the pull is at %q (%v), want %s", output, err, pushed)
 	}
+	// READ ONCE THE REPLACEMENT'S REFRESH HAS ENDED, not when the pull returns:
+	// the pull can be answered while the new mirror's fetch is still verifying
+	// it, which under CI's load read as an unverified mirror (#188, 2026-10-24).
+	gitWithin(t, "the replacement mirror's refresh", func() struct{} {
+		service.git.background.Wait()
+
+		return struct{}{}
+	})
 	if stamped, _, err := mirrorRepository(path); err != nil || stamped != upstream.repositoryID("api") {
 		t.Fatalf("the mirror after the broken one reads %d, %v; want a verified mirror of the repository", stamped, err)
 	}
