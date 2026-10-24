@@ -264,7 +264,12 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	var components *ceph.GenerationComponents
 
 	if manifest.Schema == imagesource.SchemaV3 {
-		plan := planCompletion(manifest, cfg.Images.Accepted())
+		accepted, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("billet images pull: %w", err)
+		}
+
+		plan := planCompletion(manifest, accepted)
 
 		asPublished := func(ctx context.Context) (string, error) {
 			lock, err := takeKernelDirLock(ctx, env, *kernelDir,

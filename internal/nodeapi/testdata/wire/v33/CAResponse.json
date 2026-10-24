@@ -1,0 +1,5 @@
+{
+  "ca_pem": "CAResponse.ca_pem",
+  "fingerprint": "CAResponse.fingerprint",
+  "deployment": "CAResponse.deployment"
+}

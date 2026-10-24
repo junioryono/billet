@@ -452,6 +452,9 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 		// The catalogue lives here, and a launch carries the shape a node needs, so
 		// no node keeps a copy that can drift from this one.
 		nodeplane.WithTierCatalog(cp.cfg.Tiers),
+		// The licenses this deployment accepts for its guest images, accepted once
+		// here and carried to every node at registration (#584).
+		nodeplane.WithImageAcceptance(cp.cfg.Images.Accepted()),
 		// The durable half of a compute barrier. `billet drain` and
 		// `billet local down` write a request into the ledger; this is what
 		// observes it, because a sealed idle deployment dispatches nothing at all

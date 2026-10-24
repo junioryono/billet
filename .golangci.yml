@@ -365,6 +365,19 @@ linters:
             - github.com/junioryono/billet/internal/durablefile$
             - github.com/junioryono/billet/internal/regularfile$
 
+        # THE DEPLOYMENT'S IMAGE ACCEPTANCE RECORD IS A LEAF. The node writes it and
+        # the image commands read it, and neither may import the other. The
+        # standard library and the two file primitives it writes and reads through
+        # (#584).
+        imageaccept:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/imageaccept/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+
         # THE WORDS A COMMAND DECLARES ITS HOST PATHS IN (#174), which every
         # command family and the host family's `local unit-paths` share: a leaf,
         # so a declaration can be imported by any family without importing

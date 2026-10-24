@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/imageaccept"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -194,6 +195,10 @@ type LoopOptions struct {
 	// publish nothing, which is what a Mac's launch agent passes: no manager
 	// makes a runtime directory there.
 	RegistrationRecordPath string
+	// ImageAcceptanceDir is node.state_dir, where the node records what its
+	// deployment accepts for its guest images after every accepted registration
+	// whose wire says (internal/imageaccept), or empty to record nothing.
+	ImageAcceptanceDir string
 	// Now is the clock the record's registered_at is read from. Nil is the
 	// wall clock.
 	Now func() time.Time
@@ -547,6 +552,19 @@ func recordRegistration(c *Client, log *slog.Logger, opts LoopOptions) {
 	if err := publishRegistration(c, opts); err != nil {
 		log.Error("could not record this registration; the node keeps serving and tries "+
 			"again at its next registration", "path", opts.RegistrationRecordPath, "error", err)
+	}
+
+	// THE DEPLOYMENT'S IMAGE ACCEPTANCE, from the same accepted registration. A
+	// wire that does not carry it leaves the record as it was: silence is not
+	// "accepts none".
+	accepted, known := c.ImageAcceptance()
+	if opts.ImageAcceptanceDir == "" || !known {
+		return
+	}
+
+	if err := imageaccept.Write(opts.ImageAcceptanceDir, opts.Deployment, accepted, opts.now()); err != nil {
+		log.Error("could not record which image components the deployment accepts; the node "+
+			"keeps serving and tries again at its next registration", "error", err)
 	}
 }
 

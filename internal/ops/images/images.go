@@ -671,9 +671,14 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 			return err
 		}
 
+		accepted, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("billet images verify: %w", err)
+		}
+
 		imageName, generation, _ := strings.Cut(rest, "@")
 		if err := refuseIncomplete(ctx, reader, "billet images verify", imageName, generation,
-			cfg.Images.Accepted()); err != nil {
+			accepted); err != nil {
 			return err
 		}
 	}
@@ -1498,8 +1503,13 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 			return err
 		}
 
+		accepted, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+
 		imageName, generation, _ := strings.Cut(rest, "@")
-		if err := refuseIncomplete(ctx, reader, name, imageName, generation, cfg.Images.Accepted()); err != nil {
+		if err := refuseIncomplete(ctx, reader, name, imageName, generation, accepted); err != nil {
 			return err
 		}
 	}
