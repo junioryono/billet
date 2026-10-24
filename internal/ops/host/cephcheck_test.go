@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
@@ -116,6 +117,12 @@ func TestBilletCheckActuallyChecksTheCluster(t *testing.T) {
 	}), 0o600); err != nil {
 		t.Fatalf("write the key: %v", err)
 	}
+
+	// SEEDED, as writeCheckConfig's is: a check that migrated an empty ledger
+	// spent its open's thirty-second startup budget on a loaded runner, which
+	// read as some other failure than the missing client (#188, CI 2026-10-04
+	// and 2026-10-12).
+	ledgertest.Seed(t, filepath.Join(dir, "server"))
 
 	cfgPath := filepath.Join(dir, "billet.yaml")
 	body := fmt.Sprintf(`server:
