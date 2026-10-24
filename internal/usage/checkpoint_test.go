@@ -331,3 +331,67 @@ func TestAMalformedCheckpointIsRefused(t *testing.T) {
 		t.Errorf("the checkpoint itself was refused: %v", err)
 	}
 }
+
+// ONE ENERGY SOURCE A SERIES: a VM's series whose energy is macOS's estimate for
+// its process is not continued by a node that shares the wall's, and one from a
+// billet before the meter, which names no source, is continued as the process's
+// by a node without a meter, as it always was.
+func TestASeriesIsContinuedOnlyFromItsOwnEnergySource(t *testing.T) {
+	t.Parallel()
+
+	checkpointed := func(t *testing.T, opts Options) (Checkpoint, *time.Time, processHost) {
+		t.Helper()
+
+		tr := newTree(t)
+		tr.write("/proc/stat", procStat(1000, 9000))
+		h := newProcessHost()
+		now := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
+		opts.Interval, opts.Now = time.Second, func() time.Time { return now }
+		a := runMonitor(t, tr.root, opts)
+		a.reader.Process = h.reader.Process
+		a.Start("vm", processTarget, 6)
+		now = now.Add(time.Second)
+		a.Tick()
+		cp, ok := a.Checkpoint("vm")
+		if !ok {
+			t.Fatal("no checkpoint of a measured VM")
+		}
+		data, err := json.Marshal(cp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		back, err := ReadCheckpoint(data)
+		if err != nil {
+			t.Fatalf("ReadCheckpoint: %v", err)
+		}
+
+		return back, &now, h
+	}
+	resume := func(t *testing.T, cp Checkpoint, now *time.Time, h processHost, opts Options) error {
+		t.Helper()
+
+		opts.Interval, opts.Now = time.Second, func() time.Time { return *now }
+		b := runMonitor(t, t.TempDir(), opts)
+		b.reader.Process = h.reader.Process
+
+		return b.Resume("vm", processTarget, 6, &cp)
+	}
+	meter := func() (float64, error) { return 20, nil }
+
+	cp, now, h := checkpointed(t, Options{})
+	if err := resume(t, cp, now, h, Options{Meter: meter}); err == nil ||
+		!strings.Contains(err.Error(), "another source") {
+		t.Errorf("a process-energy series resumed under a meter answered %v, want it refused", err)
+	}
+
+	cp, now, h = checkpointed(t, Options{})
+	cp.EnergyFromProcess = nil
+	if err := resume(t, cp, now, h, Options{}); err != nil {
+		t.Errorf("a series from before the meter, resumed without one, was refused: %v", err)
+	}
+
+	cp, now, h = checkpointed(t, Options{Meter: meter, IdleWatts: 2})
+	if err := resume(t, cp, now, h, Options{Meter: meter, IdleWatts: 2}); err != nil {
+		t.Errorf("a wall-energy series resumed under a meter was refused: %v", err)
+	}
+}

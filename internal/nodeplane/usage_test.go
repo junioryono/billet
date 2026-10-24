@@ -206,3 +206,73 @@ func TestCountersFromAWireThatDoesNotCarryThemAreDropped(t *testing.T) {
 		}
 	}
 }
+
+// A METER'S ENERGY FROM A PAIRING THAT NEGOTIATED BELOW ITS VERSION IS KEPT AS
+// UNMEASURED: that wire does not carry the source, so the plane keeps the rest
+// of the report and says the energy was not measured, rather than refuse the
+// report or record a source its wire never named.
+func TestMeterEnergyFromAWireThatDoesNotCarryItIsUnmeasured(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		version int
+		meter   bool
+	}{
+		{nodeapi.VersionMeterEnergy - 1, false},
+		{nodeapi.VersionMeterEnergy, true},
+	} {
+		store := &fakeStore{}
+		_, base := serve(t, store)
+		incarnation := fmt.Sprintf("wire-%d", tc.version)
+		post := func(path string, body any) int {
+			t.Helper()
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+path, bytes.NewReader(raw))
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			req.Header.Set(nodeapi.HeaderIncarnation, incarnation)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post %s: %v", path, err)
+			}
+			defer resp.Body.Close()
+
+			return resp.StatusCode
+		}
+
+		if status := post("/v1/register", nodeapi.RegisterRequest{
+			MinVersion: nodeapi.MinVersion, Version: tc.version, Incarnation: incarnation,
+			Node: "n1", Provider: config.ProviderDocker, GuestOS: []config.GuestOS{config.GuestLinux},
+			Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory,
+		}); status != http.StatusOK {
+			t.Fatalf("register at wire %d answered %d", tc.version, status)
+		}
+		usage := aUsage()
+		usage.EnergySource = alloc.EnergyMeter
+		if status := post("/v1/nodes/n1/leases/l1/usage",
+			nodeapi.UsageRequest{Epoch: 7, Usage: usage}); status != http.StatusNoContent {
+			t.Fatalf("a meter report at wire %d answered %d", tc.version, status)
+		}
+
+		store.mu.Lock()
+		got := store.usages
+		store.mu.Unlock()
+		if len(got) != 1 {
+			t.Fatalf("at wire %d the ledger was asked to record %d reports, want 1", tc.version, len(got))
+		}
+		kept, want := got[0].usage, usage
+		if !tc.meter {
+			want = usage.WithoutEnergyFrom(alloc.EnergyMeter)
+			if kept.Measured(alloc.UsageEnergy) || kept.EnergyActiveMicrojoules != 0 {
+				t.Errorf("at wire %d the ledger kept the meter's energy: %+v", tc.version, kept)
+			}
+		}
+		if !reflect.DeepEqual(kept, want) {
+			t.Errorf("at wire %d the ledger kept %+v,\nwant %+v", tc.version, kept, want)
+		}
+	}
+}

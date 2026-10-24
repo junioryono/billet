@@ -100,7 +100,7 @@ is_replay_input() {
 		internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
-		internal/usage/* | internal/version/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
+		internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
 	*) return 1 ;;
 	esac
 }

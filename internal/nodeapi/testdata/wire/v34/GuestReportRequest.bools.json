@@ -1,0 +1,53 @@
+{
+  "GuestReportRequest.report.final_seen": {
+    "epoch": 348920122,
+    "report": {
+      "agent_version": "GuestReportRequest.report.agent_version",
+      "schema": 409304141,
+      "codec": 1664590867,
+      "data": "R3Vlc3RSZXBvcnRSZXF1ZXN0LnJlcG9ydC5kYXRh",
+      "accepted": 1899723210,
+      "refused": 590211354,
+      "dropped_bytes": 406716895,
+      "hello": false,
+      "final_seen": true,
+      "node_restarted": false,
+      "first_received": "2027-02-20T12:52:28Z",
+      "last_received": "2055-02-16T23:16:26Z"
+    }
+  },
+  "GuestReportRequest.report.hello": {
+    "epoch": 348920122,
+    "report": {
+      "agent_version": "GuestReportRequest.report.agent_version",
+      "schema": 409304141,
+      "codec": 1664590867,
+      "data": "R3Vlc3RSZXBvcnRSZXF1ZXN0LnJlcG9ydC5kYXRh",
+      "accepted": 1899723210,
+      "refused": 590211354,
+      "dropped_bytes": 406716895,
+      "hello": true,
+      "final_seen": false,
+      "node_restarted": false,
+      "first_received": "2027-02-20T12:52:28Z",
+      "last_received": "2055-02-16T23:16:26Z"
+    }
+  },
+  "GuestReportRequest.report.node_restarted": {
+    "epoch": 348920122,
+    "report": {
+      "agent_version": "GuestReportRequest.report.agent_version",
+      "schema": 409304141,
+      "codec": 1664590867,
+      "data": "R3Vlc3RSZXBvcnRSZXF1ZXN0LnJlcG9ydC5kYXRh",
+      "accepted": 1899723210,
+      "refused": 590211354,
+      "dropped_bytes": 406716895,
+      "hello": false,
+      "final_seen": false,
+      "node_restarted": true,
+      "first_received": "2027-02-20T12:52:28Z",
+      "last_received": "2055-02-16T23:16:26Z"
+    }
+  }
+}

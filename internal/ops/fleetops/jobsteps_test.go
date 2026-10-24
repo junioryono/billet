@@ -328,6 +328,22 @@ func timedSteps(steps ...github.JobStep) jobSteps {
 		job: github.WorkflowJob{ID: 1, Name: "j", RunAttempt: 1, Steps: steps}}
 }
 
+// A STEP'S WALL ENERGY IS ITS ACTIVE SHARE, said so as RAPL's is, since the idle
+// draw is not in a series.
+func TestAStepsWallEnergyIsCalledActive(t *testing.T) {
+	t.Parallel()
+
+	steps := timedSteps(github.JobStep{Number: 1, Name: "covered", Conclusion: "success",
+		StartedAt: at(2), CompletedAt: at(5)})
+	steps.measured.EnergySource = alloc.EnergyMeter
+
+	var out bytes.Buffer
+	renderSteps(&out, steps)
+	if !strings.Contains(out.String(), "energy 3.0 J active\n") {
+		t.Errorf("a step's wall energy is not called active:\n%s", out.String())
+	}
+}
+
 // at is a step time this many seconds after the timed series' first sample.
 func at(seconds float64) time.Time {
 	return time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC).Add(time.Duration(seconds * float64(time.Second)))

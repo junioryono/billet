@@ -222,7 +222,7 @@ func windowText(u usage.WindowUsage, m *alloc.RecordedUsage) string {
 		memory = cli.HumanBytes(u.MemoryPeak)
 	}
 	energy := "energy " + text(alloc.UsageEnergy, joules(u.EnergyActive))
-	if m.EnergySource == alloc.EnergyRAPL && m.Measured(alloc.UsageEnergy) {
+	if (m.EnergySource == alloc.EnergyRAPL || m.EnergySource == alloc.EnergyMeter) && m.Measured(alloc.UsageEnergy) {
 		energy += " active"
 	}
 

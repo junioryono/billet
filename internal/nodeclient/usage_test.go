@@ -278,3 +278,59 @@ func TestASeriesReachesEachPlaneInTheCodecItKeeps(t *testing.T) {
 		t.Error("the downgrade changed the caller's series")
 	}
 }
+
+// A PLANE TOO OLD FOR METER ENERGY IS TOLD LESS, NEVER SOMETHING ELSE: the
+// wall's energy becomes unmeasured and the rest is sent, so what it validates is
+// true. A plane at the version is told the wall's energy as it was measured.
+func TestAMeterEnergyReportSaysOnlyWhatAnOlderPlaneCanKeep(t *testing.T) {
+	t.Parallel()
+
+	unmeasured := append(make([]string, 0, 8), alloc.UsageNet)
+	report := alloc.JobUsage{
+		Source: alloc.UsageSourceHost, Unmeasured: unmeasured,
+		Samples: 10, IntervalMillis: 1000, WindowMillis: 10_000, CPUUserMicros: 5,
+		EnergyActiveMicrojoules: 9_000_000, EnergyIdleMicrojoules: 666_666, EnergySource: alloc.EnergyMeter,
+	}
+	want := report
+	want.Unmeasured = []string{alloc.UsageNet}
+	older := report
+	older.Unmeasured = []string{alloc.UsageEnergy, alloc.UsageNet}
+	older.EnergyActiveMicrojoules, older.EnergyIdleMicrojoules, older.EnergySource = 0, 0, ""
+
+	for _, tc := range []struct {
+		version int
+		want    alloc.JobUsage
+	}{
+		{nodeapi.VersionMeterEnergy - 1, older},
+		{nodeapi.VersionMeterEnergy, want},
+	} {
+		plane := &usageRecordingPlane{version: tc.version}
+		srv := httptest.NewServer(plane)
+		t.Cleanup(srv.Close)
+		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		if err := c.Register(t.Context(), testRegistration()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if err := c.RecordLeaseUsage(t.Context(), "l1", 1, report, nil); err != nil {
+			t.Fatalf("RecordLeaseUsage on wire %d: %v", tc.version, err)
+		}
+		plane.mu.Lock()
+		got := plane.got
+		plane.mu.Unlock()
+		if got == nil {
+			t.Fatalf("nothing reached the wire-%d plane", tc.version)
+		}
+		if !reflect.DeepEqual(got.Usage, tc.want) {
+			t.Errorf("a wire-%d plane was told %+v,\nwant %+v", tc.version, got.Usage, tc.want)
+		}
+		if err := got.Usage.Validate(); err != nil {
+			t.Errorf("what a wire-%d plane was told does not validate: %v", tc.version, err)
+		}
+	}
+	if !slices.Equal(report.Unmeasured, []string{alloc.UsageNet}) || report.EnergySource != alloc.EnergyMeter {
+		t.Error("the downgrade changed the caller's report")
+	}
+}

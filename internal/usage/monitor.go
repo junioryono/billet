@@ -12,8 +12,16 @@ type Options struct {
 	Interval time.Duration
 	// RAPL reads the package energy counter each tick.
 	RAPL bool
-	// IdleWatts is the host's measured idle package power; zero means no
-	// baseline, and the whole package is shared by CPU time.
+	// Meter reads the host's power at the wall now, in watts, from the power
+	// meter it is plugged into, in place of the package counter: set, each tick
+	// reads it and shares the energy between its reading and the last one, and
+	// RAPL is not read. A tart VM's energy is then a share of it rather than
+	// macOS's estimate for the VM's process. It runs on the sampler's goroutine,
+	// so it must bound itself well inside an interval. Nil reads none.
+	Meter func() (float64, error)
+	// IdleWatts is the host's measured idle power for whichever is read, the
+	// package or the wall; zero means no baseline, and the whole of it is shared
+	// by CPU time.
 	IdleWatts float64
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
@@ -71,6 +79,12 @@ const lifecycleLimit = 2 * time.Second
 // share past it is could-not-tell, never clipped into a plausible number.
 const skewSlack = 0.05
 
+// lateAfter is the share of an interval a job's read may end after the host's
+// before its CPU is not shared that interval's energy: the jobs are read one
+// after another once the host is, so a read that ends past it holds CPU from an
+// interval the energy beside it does not cover.
+const lateAfter = 0.1
+
 // staleAfter is how many intervals without a tick make energy could-not-tell:
 // a sampler that stalled or stopped has missed intervals, and their energy is
 // in no job's total.
@@ -108,6 +122,12 @@ type Monitor struct {
 	energy       Energy
 	energyOK     bool
 	energyReadAt time.Time
+	// watts is the meter's last reading, wattsAt when it answered, and wattsOK
+	// whether the last tick read it; a tick that did not leaves the interval
+	// after it unknown.
+	watts   float64
+	wattsAt time.Time
+	wattsOK bool
 
 	// counting holds each counted job's open groups. ONLY RUN TOUCHES IT, so
 	// every descriptor is opened, read and closed on one goroutine; a job
@@ -155,6 +175,9 @@ type job struct {
 	points     []Point
 
 	energyActive, energyIdle float64
+	// byProcess says the job's energy is the kernel's own estimate for its
+	// process (a tart VM with no meter), not a share of what the host read.
+	byProcess bool
 	// processEnergyAt is when the process's energy was last read: a lifetime
 	// total is the job's whole energy only if it is recent.
 	processEnergyAt time.Time
@@ -175,6 +198,14 @@ type job struct {
 	// not opened and its package energy is broken, since neither was counted
 	// before it. carried says its series so far came from a checkpoint.
 	resumed, carried bool
+	// cpuFrom is when the baseline's CPU was read, which the energy checks count
+	// from: first is when the whole baseline ended, and the groups read after
+	// the CPU can take intervals.
+	cpuFrom time.Time
+	// untaken is a pending job whose baseline request Run never took, busy past
+	// the limit on a read: the next tick takes the baseline instead, so the job
+	// is not left unsampled for the rest of its life.
+	untaken bool
 }
 
 // see records that an interval since the last kept point went unseen, and why;
@@ -243,20 +274,41 @@ func (m *Monitor) serve(r request) {
 // limit, and reports whether the answer came in time. Run replies into a
 // buffered channel, so an answer nobody waits for any more never blocks it.
 func (m *Monitor) ask(r request, limit time.Duration) (reply, bool) {
+	a, _, answered := m.exchange(r, limit)
+
+	return a, answered
+}
+
+// exchange is ask, also reporting whether Run took the request at all (the
+// first bool) and answered it in time (the second): one it never took was never
+// served and never will be.
+func (m *Monitor) exchange(r request, limit time.Duration) (reply, bool, bool) {
 	r.reply = make(chan reply, 1)
 	deadline := time.NewTimer(limit)
 	defer deadline.Stop()
 	select {
 	case m.requests <- r:
 	case <-deadline.C:
-		return reply{}, false
+		return reply{}, false, false
 	}
 	select {
 	case a := <-r.reply:
-		return a, true
+		return a, true, true
 	case <-deadline.C:
-		return reply{}, false
+		return reply{}, true, false
 	}
+}
+
+// begin asks Run for a published job's baseline. A request Run never took is
+// left to the next tick, and the job's energy is not measured, since what it
+// drew before that baseline is in nobody's share.
+func (m *Monitor) begin(key string, j *job) {
+	if _, taken, _ := m.exchange(request{kind: requestStart, key: key, job: j}, m.limit); taken {
+		return
+	}
+	m.mu.Lock()
+	j.untaken = true
+	m.mu.Unlock()
 }
 
 // Start begins measuring a job. Run takes its first sample, so the CPU it used
@@ -270,13 +322,14 @@ func (m *Monitor) ask(r request, limit time.Duration) (reply, bool) {
 // pending, which is known and never attributed.
 func (m *Monitor) Start(key string, target Target, vcpus int) {
 	now := m.opts.Now()
-	j := &job{target: target, vcpus: vcpus, first: now, pending: true}
+	j := &job{target: target, vcpus: vcpus, first: now, pending: true,
+		byProcess: target.Process && m.opts.Meter == nil}
 	j.points = append(j.points, j.point(now))
 	m.mu.Lock()
 	m.jobs[key] = j
 	m.mu.Unlock()
 
-	m.ask(request{kind: requestStart, key: key, job: j}, m.limit)
+	m.begin(key, j)
 }
 
 func (m *Monitor) start(key string, j *job) {
@@ -284,7 +337,8 @@ func (m *Monitor) start(key string, j *job) {
 	// THE BASELINE HOLDS THE TIME ITS READ ENDED, as every point does, and a
 	// read that took a whole interval leaves the first interval unseen.
 	began := m.opts.Now()
-	s, vcpus := m.reader.readListing(j.target)
+	var cpuAt time.Time
+	s, vcpus := m.reader.readListing(j.target, func() { cpuAt = m.opts.Now() })
 	now := m.opts.Now()
 	var counters *Counters
 	if m.opts.Counters != nil && !j.resumed && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" &&
@@ -300,6 +354,9 @@ func (m *Monitor) start(key string, j *job) {
 	if m.jobs[key] != j {
 		return
 	}
+	if j.untaken {
+		j.untaken, j.energyBroken = false, true
+	}
 	if j.carried {
 		m.continueFrom(j, s, now)
 	} else {
@@ -309,7 +366,7 @@ func (m *Monitor) start(key string, j *job) {
 		j.unseen = GapNone
 	}
 	j.counters = counters
-	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
+	j.lastCPU, j.lastCPUOK, j.cpuFrom = s.CPUUsage, s.CPUOK, cpuAt
 	if now.Sub(began) >= m.opts.Interval {
 		j.see(GapSlowRead)
 	}
@@ -330,8 +387,8 @@ func (m *Monitor) continueFrom(j *job, s Sample, now time.Time) {
 	before := j.seen
 	j.pending = false
 	j.absorb(s, now)
-	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
-	if unread(s, before, j.target.Process) {
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.byProcess)))
+	if unread(s, before, j.byProcess) {
 		j.see(GapFailedRead)
 
 		return
@@ -368,6 +425,18 @@ func (m *Monitor) Tick() {
 // Run.
 func (m *Monitor) tick() {
 	took := time.Now()
+	m.mu.Lock()
+	untaken := make(map[string]*job)
+	for key, j := range m.jobs {
+		if j.pending && j.untaken {
+			untaken[key] = j
+		}
+	}
+	m.mu.Unlock()
+	for key, j := range untaken {
+		m.start(key, j)
+	}
+
 	m.sweepCounters()
 	m.mu.Lock()
 	snapshot := make(map[string]*job, len(m.jobs))
@@ -378,11 +447,23 @@ func (m *Monitor) tick() {
 	}
 	m.mu.Unlock()
 
+	// THE PLUG IS READ FIRST AND STAMPED WHEN IT ANSWERS, so the host's and the
+	// jobs' CPU are read together just after it, and the interval the wall's
+	// energy is shared over is the one their CPU was counted across, however
+	// long the plug took to answer.
+	var watts float64
+	wattsErr := errNoRAPL
+	var wattsAt time.Time
+	if m.opts.Meter != nil {
+		watts, wattsErr = m.opts.Meter()
+		wattsAt = m.opts.Now()
+	}
+
 	now := m.opts.Now()
 	host, hostErr := m.reader.ReadHostCPU()
 	var energy Energy
 	energyErr := errNoRAPL
-	if m.opts.RAPL {
+	if m.opts.RAPL && m.opts.Meter == nil {
 		energy, energyErr = m.reader.ReadEnergy()
 	}
 	samples := make(map[string]*Sample, len(snapshot))
@@ -391,10 +472,13 @@ func (m *Monitor) tick() {
 	// stalls must not have its counters backdated to the tick's start, where
 	// they would land in the interval before the stall.
 	readAt := make(map[string]time.Time, len(snapshot))
+	// WHEN EACH JOB'S CPU WAS READ, which is what its energy share is judged by:
+	// the groups read after it do not move the CPU it was counted to.
+	cpuAt := make(map[string]time.Time, len(snapshot))
 	stalled := make(map[string]bool, len(snapshot))
 	for key, j := range snapshot {
 		began := m.opts.Now()
-		s, vcpus := m.reader.readListing(j.target)
+		s, vcpus := m.reader.readListing(j.target, func() { cpuAt[key] = m.opts.Now() })
 		samples[key] = &s
 		readAt[key] = m.opts.Now()
 		stalled[key] = readAt[key].Sub(began) >= m.opts.Interval
@@ -416,6 +500,9 @@ func (m *Monitor) tick() {
 		busyDelta = host.Busy - m.host.Busy
 	}
 	pkgDelta, energyOK := m.energySince(now, energy, energyErr)
+	if m.opts.Meter != nil {
+		pkgDelta, energyOK = m.wallSince(wattsAt, watts, wattsErr)
+	}
 	dt := now.Sub(m.lastTick)
 
 	// THE IDLE POOL IS NEVER MORE THAN WAS MEASURED: a baseline above an
@@ -445,7 +532,10 @@ func (m *Monitor) tick() {
 		if j != snapshot[key] {
 			continue
 		}
-		if !s.CPUOK || !j.lastCPUOK {
+		// A READ THAT ENDED WELL AFTER THE HOST'S is not measured, and nor is
+		// one held up behind another job's slow read: its CPU runs past the
+		// interval the host's busy time and the energy were read across.
+		if !s.CPUOK || !j.lastCPUOK || cpuAt[key].Sub(now) > time.Duration(lateAfter*float64(m.opts.Interval)) {
 			continue
 		}
 		d := s.CPUUsage - j.lastCPU
@@ -470,18 +560,18 @@ func (m *Monitor) tick() {
 		if c, ok := counted[key]; ok {
 			j.counters = c
 		}
-		if m.opts.RAPL {
+		if m.shares() && !j.byProcess {
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
-			// of the last tick and the job's own baseline.
+			// of the last tick and the job's own baseline CPU.
 			missed := !m.lastTick.IsZero() &&
-				now.Sub(maxTime(m.lastTick, j.first)) >= staleAfter*m.opts.Interval
+				now.Sub(maxTime(m.lastTick, j.cpuFrom)) >= staleAfter*m.opts.Interval
 			if !consistent || !measured || missed {
 				j.energyBroken = true
 			} else {
 				j.energyActive += activePool * min(float64(d)/float64(busyDelta), 1)
 				// IDLE ONLY FOR THE PART OF THE INTERVAL THE JOB EXISTED.
-				overlap := now.Sub(maxTime(m.lastTick, j.first))
+				overlap := now.Sub(maxTime(m.lastTick, j.cpuFrom))
 				if overlap > 0 {
 					j.energyIdle += idlePool * (overlap.Seconds() / dt.Seconds()) *
 						float64(j.vcpus) / idleDenominator
@@ -489,12 +579,12 @@ func (m *Monitor) tick() {
 			}
 		}
 		j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
-		m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(*s, before, j.target.Process)))
+		m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(*s, before, j.byProcess)))
 		// A READ THAT TOOK A WHOLE INTERVAL IS UNSEEN: which of its counters were
 		// read when is not known.
 		cause := GapNone
 		switch {
-		case unread(*s, before, j.target.Process):
+		case unread(*s, before, j.byProcess):
 			cause = GapFailedRead
 		case stalled[key]:
 			cause = GapSlowRead
@@ -532,8 +622,13 @@ func maxTime(a, b time.Time) time.Time {
 	return b
 }
 
-// errNoRAPL stands in for a reading a monitor without RAPL never takes.
-var errNoRAPL = errors.New("usage: rapl is not configured")
+// errNoRAPL stands in for a reading a monitor without RAPL or a meter never
+// takes.
+var errNoRAPL = errors.New("usage: neither rapl nor a meter is configured")
+
+// shares reports whether the monitor reads an energy it shares among jobs: the
+// package counter or the wall.
+func (m *Monitor) shares() bool { return m.opts.RAPL || m.opts.Meter != nil }
 
 // energySince records a package reading and returns the energy since the last
 // one. A gap long enough for the counter to have wrapped unseen is could not
@@ -554,6 +649,32 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	}
 
 	return energyDelta(prev.Microjoules, e.Microjoules, e.MaxRange), true
+}
+
+// wallSince records a reading of the wall's power, taken at at, and returns the
+// energy since the last tick's, by the trapezoid between them: the interval the
+// jobs' CPU was read across, which begins just after each reading. A tick that could not read the meter leaves the interval
+// it ends and the one after it unknown, never nothing drawn. Called with mu
+// held.
+//
+// READ ON EVERY TICK, NOT CACHED. A meter polled apart from the sampler answers
+// a total that stands still while its reads fail and then jumps, and charged
+// against the sampler's intervals that puts energy in the wrong one: a job
+// ending in the stall is charged too little, and the one after the recovery
+// the stall's energy.
+//
+// A LONG GAP BETWEEN TWO GOOD READINGS IS UNKNOWN TOO: the trapezoid across it
+// is a guess at what was drawn, and a job started near its end would be given a
+// share of the whole gap. The later reading still begins the next interval.
+func (m *Monitor) wallSince(at time.Time, w float64, err error) (int64, bool) {
+	prev, prevAt, prevOK := m.watts, m.wattsAt, m.wattsOK
+	m.watts, m.wattsAt, m.wattsOK = w, at, err == nil
+	gap := at.Sub(prevAt)
+	if err != nil || !prevOK || gap <= 0 || gap >= staleAfter*m.opts.Interval {
+		return 0, false
+	}
+
+	return int64((prev + w) / 2 * gap.Seconds() * 1e6), true
 }
 
 func (j *job) absorb(s Sample, now time.Time) {
@@ -602,7 +723,7 @@ func (j *job) absorb(s Sample, now time.Time) {
 
 func (j *job) point(now time.Time) Point {
 	energy := int64(j.energyActive)
-	if j.target.Process {
+	if j.byProcess {
 		energy = j.latest.ProcessEnergy
 	}
 
@@ -726,7 +847,10 @@ type Summary struct {
 	EnergySplit bool
 	// EnergyProcess says EnergyActive is the kernel's own estimate for the job's
 	// process (Target.Process), not a share of the package counter.
-	EnergyProcess            bool
+	EnergyProcess bool
+	// EnergyMeter says the energy shared was the whole host's at the wall, read
+	// from its power meter, not the package counter.
+	EnergyMeter              bool
 	EnergyActive, EnergyIdle int64 // µJ
 	// Counters is what the hardware counters saw the job's vCPU threads do; nil
 	// when the job was not counted.
@@ -772,7 +896,7 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	}
 
 	began := m.opts.Now()
-	s, vcpus := m.reader.readListing(j.target)
+	s, vcpus := m.reader.readListing(j.target, nil)
 	now := m.opts.Now()
 	// THE GROUPS CLOSE AT FINAL, which precedes the destroy: what they counted
 	// is kept, and a Final asked again answers the same totals.
@@ -794,13 +918,13 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	if counting {
 		j.counters = counters
 	}
-	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.byProcess)))
 	// WHAT THIS READ COULD NOT SEE IS KEPT ON THE JOB, not only in the summary:
 	// a destroy that fails discards the summary, and the Final its retry asks
 	// for must still mark the interval. A read that failed, one that took a
 	// whole interval, and one that saw a counter fall all leave it unseen.
 	switch {
-	case unread(s, before, j.target.Process):
+	case unread(s, before, j.byProcess):
 		j.see(GapFailedRead)
 	case now.Sub(began) >= m.opts.Interval:
 		j.see(GapSlowRead)
@@ -820,7 +944,7 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	// energy. With energy shared from the package, that interval is unseen
 	// rather than shown using none.
 	unseen := GapNone
-	if m.opts.RAPL && !j.target.Process {
+	if m.shares() && !j.byProcess {
 		unseen = GapFinalEnergy
 	}
 	points := append(append([]Point(nil), j.points...), j.nextPoint(now, unseen, m.opts.Interval))
@@ -839,7 +963,7 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	// sampling loses any of it, but only a recent reading is the whole job's: one
 	// from the final read, or from a tick the job did not outlive by
 	// staleAfter intervals. An older one is could-not-tell, never a smaller total.
-	if j.target.Process {
+	if j.byProcess {
 		fresh := now.Sub(j.processEnergyAt) < staleAfter*m.opts.Interval
 		sum.Measured.Energy, sum.EnergyProcess = j.seen.processEnergy && fresh, true
 		sum.EnergyActive = j.latest.ProcessEnergy
@@ -847,8 +971,9 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 		return sum
 	}
 	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) >= staleAfter*m.opts.Interval
-	sum.Measured.Energy = m.opts.RAPL && !j.energyBroken && len(j.points) > 1 && !stale
+	sum.Measured.Energy = m.shares() && !j.energyBroken && len(j.points) > 1 && !stale
 	sum.EnergySplit = m.opts.IdleWatts > 0
+	sum.EnergyMeter = m.opts.Meter != nil
 	sum.EnergyActive, sum.EnergyIdle = int64(j.energyActive), int64(j.energyIdle)
 
 	return sum

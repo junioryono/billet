@@ -42,6 +42,11 @@ type Checkpoint struct {
 	EnergyActive    float64   `json:"energy_active"`
 	EnergyIdle      float64   `json:"energy_idle"`
 	ProcessEnergyAt time.Time `json:"process_energy_at"`
+	// EnergyFromProcess says the series' energy is the kernel's own estimate for
+	// the job's process rather than a share of what the host read; nil, from a
+	// billet before the meter, means what every such billet did: the process's
+	// estimate for a process target and a share otherwise.
+	EnergyFromProcess *bool `json:"energy_from_process,omitempty"`
 	// Unseen is why the sampler had not seen the time since its last point.
 	Unseen GapCause `json:"unseen"`
 	// Series is the job's points so far, SeriesCodecGaps, which also holds the
@@ -71,11 +76,12 @@ func (m *Monitor) Checkpoint(key string) (Checkpoint, bool) {
 		return Checkpoint{}, false
 	}
 
+	byProcess := j.byProcess
 	c := Checkpoint{
 		Schema: checkpointSchema, IntervalMillis: m.opts.Interval.Milliseconds(), Target: j.target,
 		Samples: j.samples, Latest: j.latest, PeakMemory: j.peakMemory,
 		EnergyActive: j.energyActive, EnergyIdle: j.energyIdle, ProcessEnergyAt: j.processEnergyAt,
-		Unseen: j.unseen, Series: series,
+		EnergyFromProcess: &byProcess, Unseen: j.unseen, Series: series,
 	}
 	c.Seen.CPU, c.Seen.Memory, c.Seen.OOM, c.Seen.IO = j.seen.cpu, j.seen.memory, j.seen.oom, j.seen.io
 	c.Seen.Net, c.Seen.Threads, c.Seen.Pressure = j.seen.net, j.seen.threads, j.seen.pressure
@@ -124,7 +130,12 @@ func ReadCheckpoint(data []byte) (Checkpoint, error) {
 // interval, or nil when it can: the same compute, measured the same way. A
 // target is the job's cgroup, its VMM's pid and that pid's start time, so a
 // checkpoint for another instance under the same name is refused.
-func (c Checkpoint) continues(target Target, interval time.Duration) error {
+func (c Checkpoint) continues(target Target, interval time.Duration, byProcess bool) error {
+	fromProcess := target.Process
+	if c.EnergyFromProcess != nil {
+		fromProcess = *c.EnergyFromProcess
+	}
+
 	switch {
 	case len(c.timeline.Points) == 0:
 		return errors.New("the checkpoint was not read back")
@@ -132,6 +143,12 @@ func (c Checkpoint) continues(target Target, interval time.Duration) error {
 		return errors.New("it names other compute than the job now runs on")
 	case c.IntervalMillis != interval.Milliseconds():
 		return fmt.Errorf("it was sampled every %dms and this node samples every %s", c.IntervalMillis, interval)
+	// ONE SOURCE A SERIES: a series whose earlier points hold the process's own
+	// estimate and whose later ones a share of the wall, or the other way, reads
+	// as one energy and is two.
+	case fromProcess != byProcess:
+		return errors.New("its energy came from another source than this node reads, the process's " +
+			"own estimate on one side and a share of what the host read on the other")
 	}
 
 	return nil
@@ -162,10 +179,11 @@ func (m *Monitor) Measuring(key string) bool {
 // job is not used, and the error says why; the job is measured from now.
 func (m *Monitor) Resume(key string, target Target, vcpus int, from *Checkpoint) error {
 	now := m.opts.Now()
-	j := &job{target: target, vcpus: vcpus, first: now, pending: true, resumed: true, energyBroken: true}
+	j := &job{target: target, vcpus: vcpus, first: now, pending: true, resumed: true, energyBroken: true,
+		byProcess: target.Process && m.opts.Meter == nil}
 	var why error
 	if from != nil {
-		why = from.continues(target, m.opts.Interval)
+		why = from.continues(target, m.opts.Interval, j.byProcess)
 	}
 	if from != nil && why == nil {
 		j.first, j.points, j.samples = from.timeline.First, from.timeline.Points, from.Samples
@@ -192,7 +210,7 @@ func (m *Monitor) Resume(key string, target Target, vcpus int, from *Checkpoint)
 	m.jobs[key] = j
 	m.mu.Unlock()
 
-	m.ask(request{kind: requestStart, key: key, job: j}, m.limit)
+	m.begin(key, j)
 
 	if why != nil {
 		return fmt.Errorf("usage: not continuing the series from the checkpoint, because %w", why)
