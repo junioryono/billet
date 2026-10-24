@@ -182,10 +182,13 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 		return "", 0, 0, fmt.Errorf("the bridges learned %s's address %s on %d members: [%s]", name, mac, len(found),
 			strings.Join(found, ", "))
 	}
-	// THE ACCOUNTS ARE COUNTED AGAIN, after the bridge is read: another
-	// account's VM started meanwhile could be the one the bridge learned this
-	// address from.
+	// THE ACCOUNTS ARE COUNTED AND THE STORE READ AGAIN, after the bridge is:
+	// another account's VM, or a clone published meanwhile with this address,
+	// could be the one the bridge learned it from.
 	if err := p.vmsAreTheNodes(ctx); err != nil {
+		return "", 0, 0, err
+	}
+	if err := p.addressIsOnlyIts(ctx, name, mac); err != nil {
 		return "", 0, 0, err
 	}
 
@@ -335,7 +338,7 @@ func (p *Provider) addressIsOnlyIts(ctx context.Context, name string, mac net.Ha
 		// List relies on too, so it sends nothing the bridge could learn; a
 		// crash leaves one with no configuration, and it must not cost every
 		// later job its network.
-		if !e.IsDir() || strings.HasSuffix(other, stagingSuffix) {
+		if !e.IsDir() || billetStaging(other) {
 			continue
 		}
 		theirs, err := p.vmMAC(other)
@@ -348,6 +351,18 @@ func (p *Provider) addressIsOnlyIts(ctx context.Context, name string, mac net.Ha
 	}
 
 	return nil
+}
+
+// billetStaging says a directory is billet's own staging clone, a lease's name
+// with the staging suffix: an operator's VM may end the same way and run.
+func billetStaging(name string) bool {
+	base, ok := strings.CutSuffix(name, stagingSuffix)
+	if !ok {
+		return false
+	}
+	_, ok = provider.LeaseOf(base)
+
+	return ok
 }
 
 // vmsAreTheNodes refuses when a Virtualization.framework VM on the host runs as

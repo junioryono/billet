@@ -85,6 +85,57 @@ func TestALeftoverStagingCloneLeavesTheNetworkMeasured(t *testing.T) {
 	}
 }
 
+// ONLY BILLET'S OWN STAGING NAMES ARE SKIPPED: an operator's VM whose name ends
+// the same way may run, and one with this VM's address leaves the network
+// unmeasured.
+func TestAnOperatorsStagingNamedVMIsComparedAsAnyOther(t *testing.T) {
+	t.Parallel()
+
+	h := newNetworkHost(t)
+	h.withNetwork(t, network{mac: sharedMAC, tables: table, ps: psWith(),
+		sockets: map[string]string{"74207": printed(unitLine("1"))}})
+	theirs := filepath.Join(filepath.Dir(filepath.Dir(h.disk)), "ubuntu"+stagingSuffix)
+	if err := os.Mkdir(theirs, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"macAddress":"` + sharedMAC + `"}`
+	if err := os.WriteFile(filepath.Join(theirs, "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := h.p.UsageTarget(t.Context(), usageVM)
+	if err != nil {
+		t.Fatalf("UsageTarget: %v", err)
+	}
+	if want := (provider.UsageTarget{PID: 74207, PIDStart: 16664085551217, Process: true}); target != want {
+		t.Errorf("the VM is %+v, want %+v, with no device", target, want)
+	}
+}
+
+// A CLONE PUBLISHED WITH THIS ADDRESS WHILE THE BRIDGE IS READ IS SEEN: the store
+// is read again after the bridge, so the device is not named.
+func TestACloneWithTheAddressPublishedMeanwhileNamesNoDevice(t *testing.T) {
+	t.Parallel()
+
+	h := newNetworkHost(t)
+	late := filepath.Join(filepath.Dir(filepath.Dir(h.disk)), "late-vm")
+	publish := "mkdir -p " + late + " && printf '%s' '{\"macAddress\":\"" + sharedMAC + "\"}' > " + late +
+		"/config.json; " + table["bridge100"]
+	h.withNetwork(t, network{mac: sharedMAC, ps: psWith(), tables: map[string]string{"bridge100": publish},
+		sockets: map[string]string{"74207": printed(unitLine("1"))}})
+
+	target, err := h.p.UsageTarget(t.Context(), usageVM)
+	if err != nil {
+		t.Fatalf("UsageTarget: %v", err)
+	}
+	if want := (provider.UsageTarget{PID: 74207, PIDStart: 16664085551217, Process: true}); target != want {
+		t.Errorf("the VM is %+v, want %+v, with no device", target, want)
+	}
+	if _, err := os.Stat(filepath.Join(late, "config.json")); err != nil {
+		t.Fatalf("the clone was not published while the bridge was read: %v", err)
+	}
+}
+
 // ANOTHER ACCOUNT'S VM STARTED WHILE THE DEVICE IS FOUND IS SEEN: the accounts are
 // counted again after the bridge is read, so one that appeared after the first
 // count leaves the network unmeasured.
