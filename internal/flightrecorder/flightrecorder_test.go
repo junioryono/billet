@@ -350,6 +350,10 @@ func TestStopDoesNotWaitForeverForAWrite(t *testing.T) {
 	t.Cleanup(func() {
 		close(w.gate)
 
+		// STOPPED HERE TOO, so the worker that closes stopDone exists on a path
+		// that failed before the test's own Stop.
+		r.Stop()
+
 		select {
 		case <-r.stopDone:
 		case <-time.After(liveness):
