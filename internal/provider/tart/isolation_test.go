@@ -519,10 +519,31 @@ func TestTheRegistrationNeverComesBackThroughStderr(t *testing.T) {
 
 	spec := validSpec("billet-lease1")
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	// ENDED ONCE A DELIVERY HAS COME BACK, not at a deadline. Launch retries a
+	// failed delivery until its context ends and reports the last attempt that
+	// returned before then, so it is ended when the guest is asked a second
+	// time: the first delivery has failed, with the guest's echo on its stderr,
+	// and is what the error is built from. A ten-second deadline did that on an
+	// idle machine and, on a loaded runner, ran out before the guest had been
+	// asked at all (#188, main 92e0210a, 2026-10-12).
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	retried := make(chan bool, 1)
+
+	go func() {
+		defer cancel()
+
+		retried <- linesWithin(ctx, s.execReflected, 2, time.Minute)
+	}()
+
 	_, err := p.Launch(ctx, spec)
+	cancel()
+
+	if !<-retried {
+		t.Fatalf("Launch returned (%v) before any delivery came back, so its error proves nothing", err)
+	}
+
 	if err == nil {
 		t.Fatal("Launch succeeded against a guest that only echoes its input")
 	}
@@ -539,6 +560,24 @@ func TestTheRegistrationNeverComesBackThroughStderr(t *testing.T) {
 	if strings.Contains(err.Error(), spec.JITConfig) {
 		t.Fatalf("the runner registration came back in the launch error, which the node "+
 			"logs: %v", err)
+	}
+}
+
+// linesWithin reports whether the file at path holds at least n lines before
+// ctx ends, waiting at most guard.
+func linesWithin(ctx context.Context, path string, n int, guard time.Duration) bool {
+	deadline := time.Now().Add(guard)
+
+	for {
+		if body, err := os.ReadFile(path); err == nil && strings.Count(string(body), "\n") >= n {
+			return true
+		}
+
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return false
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
