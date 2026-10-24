@@ -333,6 +333,35 @@ func TestAPullWhoseAcceptanceChangedBeforeItsImportImportsNothing(t *testing.T) 
 	}
 }
 
+// A NODE'S FIRST PULL, BEFORE IT HAS REGISTERED, IMPORTS THE IMAGE AS PUBLISHED:
+// the node cannot start without the kernel that pull installs, so the pull
+// imports what it can tell, completing nothing, and says so.
+func TestAFirstPullBeforeRegistrationImportsTheImageAsPublished(t *testing.T) {
+	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
+	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+
+	if err := imageaccept.Remove(filepath.Join(filepath.Dir(run.fixture.cfgPath), "node")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run.pull(t); err != nil {
+		t.Fatalf("a first pull before registration answered %v, want the image imported as published", err)
+	}
+
+	if len(run.backend.launched) != 0 {
+		t.Fatalf("a pull that cannot tell what is accepted completed %+v", run.backend.launched)
+	}
+
+	if got := run.fixture.publisher.calls(); got != 1 {
+		t.Fatalf("ImportGeneration was reached %d times, want once", got)
+	}
+
+	if got := run.fixture.publisher.last().components; got == nil ||
+		!slices.Equal(got.LeftOut, []string{"google-chrome"}) || len(got.Installed) != 0 {
+		t.Fatalf("the generation records %+v, want google-chrome left out and nothing installed", got)
+	}
+}
+
 // VERIFY AND PROMOTE REFUSE A GENERATION LACKING WHAT ONLY THE CONTROL PLANE
 // ACCEPTS.
 func TestVerifyAndPromoteRefuseWhatOnlyTheControlPlaneAccepts(t *testing.T) {

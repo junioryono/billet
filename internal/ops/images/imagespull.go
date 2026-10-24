@@ -269,8 +269,19 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 
 	if manifest.Schema == imagesource.SchemaV3 {
 		accepted, err := acceptedComponents(cfg)
-		if err != nil {
+		if err != nil && !errors.Is(err, errAcceptanceUnknown) {
 			return fmt.Errorf("billet images pull: %w", err)
+		}
+
+		// A NODE THAT HAS NOT REGISTERED IMPORTS THE IMAGE AS PUBLISHED, installing
+		// nothing, because its first pull is what puts the kernel on the host, and
+		// the node cannot start, so cannot register, until it has one. Nothing
+		// promotes that generation: verify --record and promote refuse until the
+		// node has registered, and the refresh then completes the image.
+		if err != nil {
+			fmt.Fprintf(env.Stdout, "%v.\nimporting the image as published, which installs the kernel "+
+				"and nothing it leaves out, and which nothing promotes until the node has registered; "+
+				"a pull after that completes it\n", err)
 		}
 
 		plan = planCompletion(manifest, accepted)
@@ -366,7 +377,7 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	// have recorded a different list or the record been withdrawn.
 	if components != nil {
 		now, err := acceptedComponents(cfg)
-		if err != nil {
+		if err != nil && (!errors.Is(err, errAcceptanceUnknown) || len(plan.Install) > 0) {
 			return fmt.Errorf("billet images pull: nothing was imported: %w", err)
 		}
 

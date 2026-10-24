@@ -13,8 +13,8 @@ import (
 // errAcceptanceUnknown is the refusal when a node holds no record of what its
 // deployment's control plane accepts.
 var errAcceptanceUnknown = errors.New("this node has not recorded what its control plane accepts " +
-	"for guest images, which it does at every registration; start the node (`billet local up`) " +
-	"and run this again once it has registered")
+	"for guest images, which it does at every registration; start the node and run this again " +
+	"once it has registered")
 
 // acceptedComponents is what a generation on this node is completed with: the
 // node's own images.accept together with what its deployment's control plane
