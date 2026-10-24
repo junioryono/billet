@@ -671,9 +671,14 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 			return err
 		}
 
+		accepted, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("billet images verify: %w", err)
+		}
+
 		imageName, generation, _ := strings.Cut(rest, "@")
 		if err := refuseIncomplete(ctx, reader, "billet images verify", imageName, generation,
-			cfg.Images.Accepted()); err != nil {
+			accepted); err != nil {
 			return err
 		}
 	}
@@ -792,6 +797,23 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 		// it up, and each boots it against its own kernel.
 		// `rest` is `<image>@<generation>`, which the check above proved.
 		imageName, generation, _ := strings.Cut(rest, "@")
+
+		// ASKED AGAIN AFTER THE BOOT, which takes minutes, in which a registration
+		// may have recorded a component the deployment now accepts.
+		accepted, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("billet images verify: %w", err)
+		}
+
+		reader, err := openComponentsReader(cfg)
+		if err != nil {
+			return err
+		}
+
+		if err := refuseIncomplete(ctx, reader, "billet images verify", imageName, generation,
+			accepted); err != nil {
+			return err
+		}
 
 		// WHAT THE LAUNCH ACTUALLY BOOTED, not what this node is configured with.
 		//
@@ -1498,8 +1520,13 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 			return err
 		}
 
+		accepted, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+
 		imageName, generation, _ := strings.Cut(rest, "@")
-		if err := refuseIncomplete(ctx, reader, name, imageName, generation, cfg.Images.Accepted()); err != nil {
+		if err := refuseIncomplete(ctx, reader, name, imageName, generation, accepted); err != nil {
 			return err
 		}
 	}

@@ -128,6 +128,9 @@ type Plane struct {
 	// is. The wire checks a JIT request against it, and a launch carries the
 	// shape a node needs so that no node keeps a copy of its own.
 	tiers map[string]config.Tier
+	// imagesAccept is the deployment's images.accept, which a registration's
+	// answer carries to the node from VersionImageAcceptance.
+	imagesAccept []string
 
 	// lateResults holds the tombstones of nodes whose record is gone — withdrawn
 	// or expired — so a result that was already on the wire when the node left
@@ -712,6 +715,18 @@ func WithTierCatalog(tiers []config.Tier) Option {
 		p.tiers = make(map[string]config.Tier, len(tiers))
 		for i := range tiers {
 			p.tiers[tiers[i].Label] = tiers[i]
+		}
+	}
+}
+
+// WithImageAcceptance gives the plane the licensed image components the
+// deployment's images.accept names, which every registration's answer carries so
+// a node completes its generations with them (#584).
+func WithImageAcceptance(accepted []config.ImageComponent) Option {
+	return func(p *Plane) {
+		p.imagesAccept = make([]string, 0, len(accepted))
+		for _, c := range accepted {
+			p.imagesAccept = append(p.imagesAccept, string(c))
 		}
 	}
 }
@@ -1367,13 +1382,25 @@ func (p *Plane) register(
 // implement — for the one registration that is least able to complain, since
 // nothing further in that path runs.
 func (p *Plane) wireResponse(negotiated int) nodeapi.RegisterResponse {
-	return nodeapi.RegisterResponse{
+	res := nodeapi.RegisterResponse{
 		Version:         negotiated,
 		MinVersion:      nodeapi.MinVersion,
 		MaxVersion:      nodeapi.Version,
 		LeaseTTLSeconds: int(p.ttl.Seconds()),
 		PollSeconds:     int(p.poll.Seconds()),
 	}
+
+	switch {
+	case len(p.imagesAccept) == 0:
+	case negotiated >= nodeapi.VersionImageAcceptance:
+		res.ImagesAccept = slices.Clone(p.imagesAccept)
+	default:
+		p.log.Warn("this node's wire does not carry the deployment's images.accept, so it completes "+
+			"guest images with its own list alone until it is upgraded", "protocol", negotiated,
+			"images_accept", p.imagesAccept)
+	}
+
+	return res
 }
 
 // answerLocked delivers a result to whoever is waiting, without blocking.

@@ -1,0 +1,2 @@
+ReleaseRequest.epoch int64
+ReleaseRequest.outcome string

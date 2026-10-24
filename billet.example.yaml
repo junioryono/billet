@@ -1302,6 +1302,10 @@ tiers:
 # installed from its vendor into every new image, inside a microVM, before the
 # image is used (#584).
 #
+# Written in the control plane's file, an acceptance reaches every node: the
+# control plane sends it at each registration and a node installs what either its
+# own list or its control plane's names.
+#
 # billet's published images leave all five out (an image built before that
 # carries them). A pull of an image that leaves components out installs the
 # accepted ones before importing it, and imports nothing if any fails to install.

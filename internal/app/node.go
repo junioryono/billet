@@ -467,6 +467,9 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		// registration, for the inspector to read: the one spelling, empty on a
 		// Mac.
 		RegistrationRecordPath: host.RegistrationRecordPath,
+		// Where the deployment's image acceptance is recorded for the image
+		// commands, which read it under the same directory.
+		ImageAcceptanceDir: cfg.Node.StateDir,
 		// How this process's stop ended, into the record a stop is proved by.
 		Ended: n.endNode,
 	})

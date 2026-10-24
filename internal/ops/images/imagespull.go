@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -261,10 +262,44 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	// node with no verified generation to boot the completion from imports the
 	// image as published first, as a completion root, which names the kernel, so
 	// that is the one part done under the lock.
-	var components *ceph.GenerationComponents
+	var (
+		components *ceph.GenerationComponents
+		plan       completionPlan
+	)
 
 	if manifest.Schema == imagesource.SchemaV3 {
-		plan := planCompletion(manifest, cfg.Images.Accepted())
+		accepted, err := acceptedComponents(cfg)
+		if err != nil && !errors.Is(err, errAcceptanceUnknown) {
+			return fmt.Errorf("billet images pull: %w", err)
+		}
+
+		// A NODE THAT HAS NOT REGISTERED INSTALLS THE KERNEL AND IMPORTS NOTHING.
+		// Its first pull is what puts the kernel its configuration names on the
+		// host, and the node cannot start, so cannot register, without one; a
+		// generation imported without what the deployment accepts could be booted
+		// by a tier pinning it, so none is.
+		if err != nil {
+			lock, lerr := takeKernelDirLock(ctx, env, *kernelDir,
+				"install the kernel a node that has not registered starts with")
+			if lerr != nil {
+				return lerr
+			}
+
+			kernel, kerr := installKernel(kernelInstaller, manifest, dir, *kernelDir)
+			if rerr := lock.release(); rerr != nil {
+				fmt.Fprintf(env.Stdout, "warning: the kernel directory lock was not released: %v\n", rerr)
+			}
+
+			if kerr != nil {
+				return fmt.Errorf("billet images pull: the kernel could not be kept: %w", kerr)
+			}
+
+			return fmt.Errorf("billet images pull: installed the kernel %s, and imported no generation: %w; "+
+				"point node.firecracker.kernel_image at that kernel unless the path it names already holds "+
+				"one, so the node can start and register", kernel, err)
+		}
+
+		plan = planCompletion(manifest, accepted)
 
 		asPublished := func(ctx context.Context) (string, error) {
 			lock, err := takeKernelDirLock(ctx, env, *kernelDir,
@@ -349,6 +384,23 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	kernel, err := installKernel(kernelInstaller, manifest, dir, *kernelDir)
 	if err != nil {
 		return fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
+	}
+
+	// ASKED AGAIN IMMEDIATELY BEFORE THE IMPORT, after the completion, which runs
+	// for as long as its downloads take, and the wait for the kernel directory,
+	// which another pull may hold for half an hour: in either a registration may
+	// have recorded a different list or the record been withdrawn.
+	if components != nil {
+		now, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("billet images pull: nothing was imported: %w", err)
+		}
+
+		if completed, wanted := plan.names(), planCompletion(manifest, now).names(); !slices.Equal(completed, wanted) {
+			return fmt.Errorf("billet images pull: what this deployment accepts changed while %s was "+
+				"completed, from %v to %v, so nothing was imported; the next `billet images refresh` "+
+				"completes it with what is accepted now", image, completed, wanted)
+		}
 	}
 
 	fmt.Fprintf(env.Stdout, "importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
