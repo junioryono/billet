@@ -40,14 +40,16 @@ func TestAnInterfacesCountersAreReadFromItsOwnMessage(t *testing.T) {
 	if _, found, err := countersIn(rib, 99); err != nil || found {
 		t.Errorf("an interface the list does not hold answered found %v, %v", found, err)
 	}
+	// WITH THE INTERFACE SOUGHT IN THE LIST, so nothing is answered from a list
+	// whose rest does not parse.
 	for name, bad := range map[string][]byte{
-		"a stray tail":           append(append([]byte(nil), rib...), 1, 2),
-		"a length past the list": {200, 0, 5, unix.RTM_IFINFO2},
-		"a short interface":      {8, 0, 5, unix.RTM_IFINFO2, 0, 0, 0, 0},
+		"a stray tail":               append(append([]byte(nil), rib...), 1, 2),
+		"a length past the list":     append(append([]byte(nil), rib...), 200, 0, 5, unix.RTM_IFINFO2),
+		"a short interface after it": append(append([]byte(nil), rib...), 8, 0, 5, unix.RTM_IFINFO2, 0, 0, 0, 0),
+		"the interface listed twice": append(append([]byte(nil), rib...), ifInfo2(25, 1, 1, 1, 1)...),
 	} {
-		// AN INDEX NOT IN THE LIST, so the whole of it is read.
-		if _, _, err := countersIn(bad, 99); err == nil {
-			t.Errorf("%s was read as a list", name)
+		if v, found, err := countersIn(bad, 25); err == nil || found {
+			t.Errorf("%s was read as a list: %v (found %v)", name, v, found)
 		}
 	}
 }

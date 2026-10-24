@@ -139,7 +139,7 @@ func (c Checkpoint) continues(target Target, interval time.Duration, byProcess b
 	switch {
 	case len(c.timeline.Points) == 0:
 		return errors.New("the checkpoint was not read back")
-	case c.Target != target:
+	case !c.sameCompute(target):
 		return errors.New("it names other compute than the job now runs on")
 	case c.IntervalMillis != interval.Milliseconds():
 		return fmt.Errorf("it was sampled every %dms and this node samples every %s", c.IntervalMillis, interval)
@@ -152,6 +152,23 @@ func (c Checkpoint) continues(target Target, interval time.Duration, byProcess b
 	}
 
 	return nil
+}
+
+// sameCompute says whether target is the compute the checkpoint was taken of. A
+// network device found since, for a series that named none, is the same compute
+// measured further, as a node that has learned to find a tart VM's link finds
+// it for a VM an older one measured; the group's first read then marks every
+// interval before it, as any late first read does. A device the series named
+// is kept to, since found's is cleared before the comparison.
+func (c Checkpoint) sameCompute(target Target) bool {
+	if c.Target == target {
+		return true
+	}
+	found := target
+	found.NetDevice, found.NetHostView, found.NetNamespace = "", c.Target.NetHostView, c.Target.NetNamespace
+	found.NetPID, found.NetPIDStart = c.Target.NetPID, c.Target.NetPIDStart
+
+	return found == c.Target
 }
 
 // Measuring reports whether the sampler measures a job under key.

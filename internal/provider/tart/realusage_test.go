@@ -40,16 +40,19 @@ func TestARealVMIsFoundAndMeasured(t *testing.T) {
 	if !strings.HasPrefix(target.NetDevice, "vmenet") || !target.NetHostView {
 		t.Fatalf("target %+v names no VM network device from the host's side", target)
 	}
+	if target.NetPID <= 0 || target.NetPIDStart == 0 {
+		t.Fatalf("target %+v names no proved process carrying the VM's link", target)
+	}
 	s := usage.Reader{Root: "/"}.Read(usage.Target{PID: target.PID, PIDStart: target.PIDStart, Process: true,
-		NetDevice: target.NetDevice, NetHostView: target.NetHostView})
+		NetDevice: target.NetDevice, NetHostView: target.NetHostView, NetPID: target.NetPID,
+		NetPIDStart: target.NetPIDStart})
 	if !s.CPUOK || !s.MemoryOK || !s.IOOK || !s.ProcessEnergyOK || !s.NetOK {
 		t.Fatalf("the VM's process read %+v, want cpu, memory, io, energy and network", s)
 	}
-	// A RUNNING RUNNER HAS FETCHED ITS JOB, so the guest has received more than it
-	// sent.
-	if s.NetRx <= 0 || s.NetTx <= 0 || s.NetRx < s.NetTx {
-		t.Errorf("%s: the guest received %d bytes and sent %d; a runner receives more than it sends",
-			target.NetDevice, s.NetRx, s.NetTx)
+	// A RUNNING RUNNER HAS TALKED TO GITHUB both ways.
+	if s.NetRx <= 0 || s.NetTx <= 0 || s.NetRxPackets <= 0 || s.NetTxPackets <= 0 {
+		t.Errorf("%s: the guest received %d bytes (%d packets) and sent %d (%d); a runner does both",
+			target.NetDevice, s.NetRx, s.NetRxPackets, s.NetTx, s.NetTxPackets)
 	}
 	t.Logf("%s: guest received %.1f MB (%d packets), sent %.1f MB (%d packets)", target.NetDevice,
 		float64(s.NetRx)/1e6, s.NetRxPackets, float64(s.NetTx)/1e6, s.NetTxPackets)

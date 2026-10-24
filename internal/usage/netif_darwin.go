@@ -49,8 +49,11 @@ func interfaceCounters(name string) ([4]int64, error) {
 }
 
 // countersIn finds the RTM_IFINFO2 message for the interface with index in an
-// interface list, and reads its counters.
+// interface list, and reads its counters. The whole list is read first: one
+// that does not parse, or that holds the interface twice, answers nothing.
 func countersIn(rib []byte, index int) ([4]int64, bool, error) {
+	var v [4]int64
+	found := false
 	for len(rib) > 0 {
 		if len(rib) < 4 {
 			return [4]int64{}, false, fmt.Errorf("usage: the interface list ends in %d stray bytes", len(rib))
@@ -76,10 +79,12 @@ func countersIn(rib []byte, index int) ([4]int64, bool, error) {
 		if int(h.Index) != index {
 			continue
 		}
+		if found {
+			return [4]int64{}, false, fmt.Errorf("usage: the interface list holds interface %d twice", index)
+		}
 		d := h.Data
-
-		return [4]int64{int64(d.Ibytes), int64(d.Obytes), int64(d.Ipackets), int64(d.Opackets)}, true, nil
+		v, found = [4]int64{int64(d.Ibytes), int64(d.Obytes), int64(d.Ipackets), int64(d.Opackets)}, true
 	}
 
-	return [4]int64{}, false, nil
+	return v, found, nil
 }

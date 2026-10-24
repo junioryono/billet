@@ -122,7 +122,8 @@ func usageTargetOf(target provider.UsageTarget) usage.Target {
 		VCPUThreadPrefix: target.VCPUThreadPrefix,
 		NetDevice:        target.NetDevice, NetHostView: target.NetHostView,
 		NetNamespace: target.NetNamespace,
-		Process:      target.Process,
+		NetPID:       target.NetPID, NetPIDStart: target.NetPIDStart,
+		Process: target.Process,
 	}
 }
 

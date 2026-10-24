@@ -76,7 +76,7 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 	target := provider.UsageTarget{PID: pid, PIDStart: start, Process: true}
 	// A DEVICE THAT CANNOT BE FOUND COSTS THE TRAFFIC ALONE: the rest of the VM
 	// is measured, and its network is reported unmeasured.
-	dev, err := p.netDevice(ctx, instanceID, pid)
+	dev, carrier, carrierStart, err := p.netDevice(ctx, instanceID, pid, start)
 	if err != nil {
 		p.log.Warn("could not find a VM's network device; its traffic will not be measured",
 			"vm", instanceID, "error", err)
@@ -86,6 +86,7 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 	// THE HOST'S END OF THE VM'S LINK: what the host sent on it is what the guest
 	// received (measured on macOS 27.0.1, 2026-10-24).
 	target.NetDevice, target.NetHostView = dev, true
+	target.NetPID, target.NetPIDStart = carrier, carrierStart
 
 	return target, nil
 }
@@ -102,47 +103,58 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 // and the kernel says who holds it; the bridge's address table must have
 // learned the VM's configured address on that same interface. The table alone
 // is what the guest sent, and a guest can claim another's address.
-func (p *Provider) netDevice(ctx context.Context, name string, vm int) (string, error) {
+//
+// THE CARRIER IS RETURNED WITH ITS START, read before and after its socket is,
+// so every later read of the device proves the process it lives as long as.
+func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart uint64) (string, int, uint64,
+	error,
+) {
 	mac, err := p.vmMAC(name)
 	if err != nil {
-		return "", err
+		return "", 0, 0, err
 	}
+	carrier, carrierStart := vm, vmStart
 	unit, err := p.ethernetUnit(ctx, vm)
 	if err != nil {
-		return "", err
+		return "", 0, 0, err
 	}
 	if unit == 0 {
-		carrier, err := p.softnetOf(ctx, name, mac)
-		if err != nil {
-			return "", err
+		if carrier, err = p.softnetOf(ctx, name, mac); err != nil {
+			return "", 0, 0, err
+		}
+		if carrierStart, err = p.processStart(carrier); err != nil {
+			return "", 0, 0, fmt.Errorf("read the start of %s's softnet (%d): %w", name, carrier, err)
 		}
 		if unit, err = p.ethernetUnit(ctx, carrier); err != nil {
-			return "", err
+			return "", 0, 0, err
 		}
 		if unit == 0 {
-			return "", fmt.Errorf("neither %s's VM process nor its softnet holds a VM network link", name)
+			return "", 0, 0, fmt.Errorf("neither %s's VM process nor its softnet holds a VM network link", name)
+		}
+		if again, err := p.processStart(carrier); err != nil || again != carrierStart {
+			return "", 0, 0, fmt.Errorf("%s's softnet (%d) changed while its link was being read", name, carrier)
 		}
 	}
 	dev := fmt.Sprintf("vmenet%d", unit-1)
 
 	bridges, err := p.bridges()
 	if err != nil {
-		return "", fmt.Errorf("list the host's bridges: %w", err)
+		return "", 0, 0, fmt.Errorf("list the host's bridges: %w", err)
 	}
 	var found []string
 	for _, bridge := range bridges {
 		members, err := p.bridgeMembers(ctx, bridge, mac)
 		if err != nil {
-			return "", err
+			return "", 0, 0, err
 		}
 		found = append(found, members...)
 	}
 	if len(found) != 1 || found[0] != dev {
-		return "", fmt.Errorf("%s's link is %s, but the bridges learned its address %s on [%s]", name, dev, mac,
-			strings.Join(found, ", "))
+		return "", 0, 0, fmt.Errorf("%s's link is %s, but the bridges learned its address %s on [%s]", name, dev,
+			mac, strings.Join(found, ", "))
 	}
 
-	return dev, nil
+	return dev, carrier, carrierStart, nil
 }
 
 // ethernetUnit is the unit of the one userspace_ethernet control socket pid

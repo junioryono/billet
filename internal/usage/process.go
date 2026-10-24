@@ -43,9 +43,10 @@ func (r Reader) ProcessCounters(pid int) (ProcessCounters, error) {
 }
 
 // readProcessNet reads the network device of a job that is one process (a tart
-// VM's vmenet), kept only if the process still started at PIDStart after it:
-// the device lives as long as the VM does, and a name the kernel has since
-// given to another VM's device is not this job's.
+// VM's vmenet), kept only if the process, and the one carrying its link when
+// that is another (NetPID), still started when they did after it: the device
+// lives as long as its carrier does, and a name the kernel has since given to
+// another VM's device is not this job's.
 func (s *Sample) readProcessNet(r Reader, t Target) {
 	var n Sample
 	n.readNet(r, t)
@@ -54,6 +55,11 @@ func (s *Sample) readProcessNet(r Reader, t Target) {
 	}
 	if c, err := r.ProcessCounters(t.PID); err != nil || c.Start != t.PIDStart {
 		return
+	}
+	if t.NetPID != 0 && t.NetPID != t.PID {
+		if c, err := r.ProcessCounters(t.NetPID); err != nil || c.Start != t.NetPIDStart {
+			return
+		}
 	}
 	s.NetRx, s.NetTx, s.NetRxPackets, s.NetTxPackets, s.NetOK = n.NetRx, n.NetTx, n.NetRxPackets, n.NetTxPackets, true
 }

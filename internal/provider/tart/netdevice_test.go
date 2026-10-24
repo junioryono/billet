@@ -98,6 +98,7 @@ func newNetworkHost(t *testing.T) usageHost {
 
 	h := newUsageHost(t, "echo 74207")
 	h.paths[74207], h.starts[74207] = vmService, 16664085551217
+	h.starts[62980], h.starts[62990] = 16664085550000, 16664085550001
 
 	return h
 }
@@ -110,12 +111,14 @@ func TestAVMsNetworkIsTheVMNetItsLinksSocketNames(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
-		n   network
-		dev string
+		n       network
+		dev     string
+		carrier int
+		start   uint64
 	}{
-		"the shared network": {dev: "vmenet0", n: network{mac: sharedMAC, tables: table, ps: psWith(),
-			sockets: map[string]string{"74207": printed(unitLine("1"))}}},
-		"softnet": {dev: "vmenet1", n: network{mac: softMAC, tables: table,
+		"the shared network": {dev: "vmenet0", carrier: 74207, start: 16664085551217, n: network{mac: sharedMAC,
+			tables: table, ps: psWith(), sockets: map[string]string{"74207": printed(unitLine("1"))}}},
+		"softnet": {dev: "vmenet1", carrier: 62980, start: 16664085550000, n: network{mac: softMAC, tables: table,
 			ps:      psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun),
 			sockets: map[string]string{"74207": "true", "62980": printed(unitLine("2"))}}},
 	} {
@@ -129,7 +132,7 @@ func TestAVMsNetworkIsTheVMNetItsLinksSocketNames(t *testing.T) {
 				t.Fatalf("UsageTarget: %v", err)
 			}
 			want := provider.UsageTarget{PID: 74207, PIDStart: 16664085551217, Process: true, NetDevice: tc.dev,
-				NetHostView: true}
+				NetHostView: true, NetPID: tc.carrier, NetPIDStart: tc.start}
 			if target != want {
 				t.Errorf("the VM is %+v, want %+v", target, want)
 			}
@@ -199,7 +202,10 @@ func TestAVMsDeviceThatCannotBeProvedCostsItsNetworkAlone(t *testing.T) {
 		"two softnets carry the VM":              soft("62978 61958 "+tartRun, "62980 62978 "+softnetRun, "62990 62978 "+softnetRun),
 		"the softnet holds no socket":            {mac: softMAC, tables: table, ps: psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun), sockets: map[string]string{"74207": "true", "62980": "true"}},
 		"a softnet whose parent is not tart run": soft("62978 61958 /bin/sh -c run "+usageVM, "62980 62978 "+softnetRun),
-		"ps answered a line billet cannot read":  soft("x y z"),
+		"the softnet's start cannot be read": {mac: softMAC, tables: table,
+			ps:      psWith("62978 61958 "+tartRun, "62970 62978 "+softnetRun),
+			sockets: map[string]string{"74207": "true", "62970": printed(unitLine("2"))}},
+		"ps answered a line billet cannot read": soft("x y z"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -230,5 +236,39 @@ func TestOnlyABridgesNameReachesIfconfig(t *testing.T) {
 			!strings.Contains(err.Error(), "not a bridge's name") {
 			t.Errorf("bridge %q answered %v, want it refused by name", name, err)
 		}
+	}
+}
+
+// A SOFTNET REPLACED WHILE ITS LINK IS READ IS NOT THE VM'S: its start is read
+// before and after its socket, and one that changed leaves the VM's network
+// unmeasured rather than tied to whatever took the pid.
+func TestASoftnetReplacedWhileItsLinkIsReadIsNotTheVMs(t *testing.T) {
+	t.Parallel()
+
+	h := newNetworkHost(t)
+	h.withNetwork(t, network{mac: softMAC, tables: table,
+		ps:      psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun),
+		sockets: map[string]string{"74207": "true", "62980": printed(unitLine("2"))}})
+	starts := h.p.processStart
+	reads := 0
+	h.p.processStart = func(pid int) (uint64, error) {
+		start, err := starts(pid)
+		if pid == 62980 {
+			reads++
+			start += uint64(reads)
+		}
+
+		return start, err
+	}
+
+	target, err := h.p.UsageTarget(t.Context(), usageVM)
+	if err != nil {
+		t.Fatalf("UsageTarget: %v", err)
+	}
+	if want := (provider.UsageTarget{PID: 74207, PIDStart: 16664085551217, Process: true}); target != want {
+		t.Errorf("the VM is %+v, want %+v, with no device", target, want)
+	}
+	if reads != 2 {
+		t.Errorf("the softnet's start was read %d times, want before and after its socket", reads)
 	}
 }

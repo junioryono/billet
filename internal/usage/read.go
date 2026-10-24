@@ -40,6 +40,12 @@ type Target struct {
 	// received is what the container received. The reading is kept only if PID
 	// still started at PIDStart after it.
 	NetNamespace bool
+	// NetPID and NetPIDStart are the process whose life NetDevice's is, when it
+	// is not PID's: a softnet process carrying a tart VM's frames. With Process,
+	// a reading of the device is kept only if PID and, when set, NetPID still
+	// started when they did after it.
+	NetPID      int
+	NetPIDStart uint64
 	// Process says the job is PID alone, with no cgroup: it is measured by the
 	// process's own accounting (ProcessCounters), checked against PIDStart on
 	// every read, and CgroupDir is not read.

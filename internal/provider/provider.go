@@ -497,6 +497,12 @@ type UsageTarget struct {
 	// network namespace, read through /proc/<PID>/net/dev while PID still
 	// started at PIDStart (a container's eth0, counted from inside it).
 	NetNamespace bool
+	// NetPID and NetPIDStart are the process whose life NetDevice's is, when it
+	// is not PID's (a softnet process carrying a tart VM's frames), checked on
+	// every read of the device so an interface the kernel has since given to
+	// another VM is never this instance's.
+	NetPID      int
+	NetPIDStart uint64
 	// Process says the instance is PID alone, with no cgroup of its own, and is
 	// measured by that process's own accounting (a Virtualization.framework VM).
 	Process bool
