@@ -1,12 +1,10 @@
 package deploy_test
 
 import (
-	"context"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // A REMOVAL'S NODE STOP IS PROVED BY THE NODE'S OWN ENDING (#127): the package
@@ -21,27 +19,13 @@ import (
 func TestPackageRemovalRequiresTheNodesDrain(t *testing.T) {
 	t.Parallel()
 
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("Docker is required to execute the package script on Linux")
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "docker", "image", "inspect", "ubuntu:24.04").Run(); err != nil {
-		t.Skipf("a local ubuntu:24.04 image and Docker daemon are required: %v", err)
-	}
+	ctx := packageDocker(t)
 	script, err := filepath.Abs("scripts/preremove.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	name := "billet-package-preremove-" + filepath.Base(filepath.Dir(t.TempDir()))
-	t.Cleanup(func() {
-		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
-		defer stop()
-		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "No such container:") {
-			t.Errorf("remove the package-test container: %v: %s", err, out)
-		}
-	})
+	removeOnCleanup(t, name)
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--pull=never", "--network=none",
 		"--name", name, "--mount", "type=bind,src="+script+",dst=/preremove.sh,readonly",
 		"-i", "ubuntu:24.04", "sh", "-eu")

@@ -9,30 +9,61 @@ import (
 	"time"
 )
 
+// packageGuard bounds a package test's use of Docker. It is a failure guard and
+// never a condition: a correct run takes under a second on an idle host and has
+// taken 59.8 s under CI's load (2026-10-22), against the minute these tests had,
+// which killed one 22 times between 2026-10-04 and 2026-10-14 (#188); a script
+// that hangs waits forever.
+const packageGuard = 10 * time.Minute
+
+// packageDocker skips the test where Docker or the ubuntu:24.04 image is absent,
+// and returns the guard's context for the test's container. A daemon that did
+// not answer within the guard is a failure, never an absence.
+func packageDocker(t *testing.T) context.Context {
+	t.Helper()
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("Docker is required to execute the package scripts on Linux")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), packageGuard)
+	t.Cleanup(cancel)
+	if err := exec.CommandContext(ctx, "docker", "image", "inspect", "ubuntu:24.04").Run(); err != nil {
+		if ctx.Err() != nil {
+			t.Fatalf("Docker did not say within %s whether ubuntu:24.04 is here: %v", packageGuard, err)
+		}
+		t.Skipf("a local ubuntu:24.04 image and Docker daemon are required: %v", err)
+	}
+
+	return ctx
+}
+
+// removeOnCleanup removes the named container once the test ends. A removal
+// already in progress is the run's own --rm, which a container killed by its
+// guard is also given.
+func removeOnCleanup(t *testing.T, name string) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
+		defer stop()
+		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "No such container:") &&
+			!strings.Contains(string(out), "is already in progress") {
+			t.Errorf("remove the package-test container: %v: %s", err, out)
+		}
+	})
+}
+
 func TestPackageKeepsPrivilegedStateOutsideTheServiceAccountsAuthority(t *testing.T) {
 	t.Parallel()
 
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("Docker is required to execute the package installer on Linux")
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "docker", "image", "inspect", "ubuntu:24.04").Run(); err != nil {
-		t.Skipf("a local ubuntu:24.04 image and Docker daemon are required: %v", err)
-	}
+	ctx := packageDocker(t)
 	script, err := filepath.Abs("scripts/postinstall.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	name := "billet-package-permissions-" + filepath.Base(filepath.Dir(t.TempDir()))
-	t.Cleanup(func() {
-		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
-		defer stop()
-		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "No such container:") {
-			t.Errorf("remove the package-test container: %v: %s", err, out)
-		}
-	})
+	removeOnCleanup(t, name)
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--pull=never", "--network=none",
 		"--name", name, "--mount", "type=bind,src="+script+",dst=/postinstall.sh,readonly",
 		"-i", "ubuntu:24.04", "sh", "-eu")
@@ -69,14 +100,7 @@ test -f /var/lib/billet/server/ledger-fixture
 func TestPackageSeedsTheNeedrestartExclusionOnlyWhereNeedrestartIs(t *testing.T) {
 	t.Parallel()
 
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("Docker is required to execute the package installer on Linux")
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "docker", "image", "inspect", "ubuntu:24.04").Run(); err != nil {
-		t.Skipf("a local ubuntu:24.04 image and Docker daemon are required: %v", err)
-	}
+	ctx := packageDocker(t)
 	script, err := filepath.Abs("scripts/postinstall.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -86,14 +110,7 @@ func TestPackageSeedsTheNeedrestartExclusionOnlyWhereNeedrestartIs(t *testing.T)
 		t.Fatal(err)
 	}
 	name := "billet-package-needrestart-" + filepath.Base(filepath.Dir(t.TempDir()))
-	t.Cleanup(func() {
-		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
-		defer stop()
-		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "No such container:") {
-			t.Errorf("remove the package-test container: %v: %s", err, out)
-		}
-	})
+	removeOnCleanup(t, name)
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--pull=never", "--network=none",
 		"--name", name,
 		"--mount", "type=bind,src="+script+",dst=/postinstall.sh,readonly",
@@ -193,27 +210,13 @@ test ! -s /etc/needrestart/conf.d
 func TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns(t *testing.T) {
 	t.Parallel()
 
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("Docker is required to execute the package installer on Linux")
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "docker", "image", "inspect", "ubuntu:24.04").Run(); err != nil {
-		t.Skipf("a local ubuntu:24.04 image and Docker daemon are required: %v", err)
-	}
+	ctx := packageDocker(t)
 	script, err := filepath.Abs("scripts/postinstall.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	name := "billet-package-tmpfiles-" + filepath.Base(filepath.Dir(t.TempDir()))
-	t.Cleanup(func() {
-		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
-		defer stop()
-		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "No such container:") {
-			t.Errorf("remove the package-test container: %v: %s", err, out)
-		}
-	})
+	removeOnCleanup(t, name)
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--pull=never", "--network=none",
 		"--name", name, "--mount", "type=bind,src="+script+",dst=/postinstall.sh,readonly",
 		"-i", "ubuntu:24.04", "sh", "-eu")
