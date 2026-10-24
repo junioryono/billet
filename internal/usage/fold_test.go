@@ -57,6 +57,24 @@ func TestAFoldedTickKeepsWhatItsReadsSaw(t *testing.T) {
 			// folded tick saw tells.
 			r.host.counters.UserMicros += 5_500_000
 		},
+		// THE FALL IS AFTER THE FOLDED TICK: it read 2 s on, the recovery reads
+		// 1 s back from that, still 1 s past the baseline.
+		"the job's counter fell after the folded tick": func(r meterRun) {
+			r.host.counters.UserMicros += 2_000_000
+			*r.now = r.now.Add(time.Second)
+			*r.busy, *r.idle = *r.busy+300, *r.idle+1500
+			r.tree.write("/proc/stat", procStat(*r.busy, *r.idle))
+			r.m.Tick()
+			r.host.counters.UserMicros -= 2_500_000
+		},
+		"the host's busy time fell after the folded tick": func(r meterRun) {
+			*r.now = r.now.Add(time.Second)
+			*r.busy, *r.idle = *r.busy+600, *r.idle+1200
+			r.tree.write("/proc/stat", procStat(*r.busy, *r.idle))
+			r.host.counters.UserMicros += 1_500_000
+			r.m.Tick()
+			*r.busy -= 400
+		},
 		"the host's processor count changed": func(r meterRun) {
 			*r.now = r.now.Add(time.Second)
 			*r.busy, *r.idle = *r.busy+300, *r.idle+1500
@@ -80,6 +98,27 @@ func TestAFoldedTickKeepsWhatItsReadsSaw(t *testing.T) {
 					s.EnergyActive)
 			}
 		})
+	}
+}
+
+// A JOB STARTED LATE IN A PACKAGE SPAN IS FOLDED BY ITS OWN SPAN: started two
+// intervals after the last good read, through a failed read at the third, it is
+// shared the fourth's recovery, as a job started late in an unbroken span is.
+func TestAJobStartedLateInAPackageSpanIsFoldedByItsOwnSpan(t *testing.T) {
+	t.Parallel()
+
+	h := newEnergyHost(t, 0)
+	*h.now = h.now.Add(20 * time.Second)
+	h.m.Start("vm", h.target, 8)
+	h.tr.remove(raplZone + "/energy_uj")
+	*h.now = h.now.Add(10 * time.Second)
+	h.m.Tick()
+	h.advance(10*time.Second, "69571715")
+	h.m.Tick()
+
+	if s := finalOf(t, h.m); !s.Measured.Energy || s.EnergyActive <= 0 {
+		t.Errorf("a job started late in a package span measured %v (%d µJ), want its share",
+			s.Measured.Energy, s.EnergyActive)
 	}
 }
 

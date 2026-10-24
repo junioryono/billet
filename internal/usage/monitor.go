@@ -133,6 +133,11 @@ type Monitor struct {
 	// shares the energy since it. A tick whose reads did not all answer leaves
 	// it, so its interval is folded into the next one.
 	energyTick time.Time
+	// seenHost is the host's last successful read, from any tick, which a later
+	// read is checked against for a fall or a change of shape: a folded tick's
+	// reads are never committed, but what they saw still counts.
+	seenHost   HostCPU
+	seenHostOK bool
 
 	// counting holds each counted job's open groups. ONLY RUN TOUCHES IT, so
 	// every descriptor is opened, read and closed on one goroutine; a job
@@ -196,6 +201,10 @@ type job struct {
 	// reads did not all answer, until a later tick shares that interval's
 	// energy: a job that ends while it is set has energy no tick shared.
 	energyPending bool
+	// seenCPU is the job's last successful CPU read, from any tick, which a later
+	// read is checked against for a fall.
+	seenCPU   int64
+	seenCPUOK bool
 	// unseen is why the sampler has not seen an interval since the last point
 	// it kept, a read that failed or took a whole interval, so the next point it
 	// keeps is marked with it; GapNone when it has seen every one.
@@ -376,6 +385,7 @@ func (m *Monitor) start(key string, j *job) {
 	}
 	j.counters = counters
 	j.lastCPU, j.lastCPUOK, j.cpuFrom = s.CPUUsage, s.CPUOK, cpuAt
+	j.seenCPU, j.seenCPUOK = s.CPUUsage, s.CPUOK
 	if now.Sub(began) >= m.opts.Interval {
 		j.see(GapSlowRead)
 	}
@@ -588,24 +598,28 @@ func (m *Monitor) tick() {
 		// A TICK IS FOLDED only while the span since the last tick that read
 		// everything can still be shared, under staleAfter intervals; past that,
 		// the energy is broken, and the series keeps its points as ever.
+		// THE SPAN IS THE JOB'S: from the later of the last tick that read
+		// everything and its own baseline CPU, as the share that ends it counts.
 		folded := false
+		sharing := m.shares() && !j.byProcess
+		span := now.Sub(maxTime(m.energyTick, j.cpuFrom))
+		// WHAT THE READS THAT DID ANSWER SHOW IS KEPT, on every tick: a counter
+		// seen to fall, or a host seen to change shape, against its last
+		// successful read, is not mended by folding the span.
+		if sharing && m.discontinuity(*s, j, host, hostErr, energy, energyErr) {
+			j.energyBroken = true
+		}
 		switch {
-		case !m.shares() || j.byProcess:
-		case readFailed && (m.energyTick.IsZero() || now.Sub(m.energyTick) >= staleAfter*m.opts.Interval):
+		case !sharing:
+		case readFailed && (m.energyTick.IsZero() || span >= staleAfter*m.opts.Interval):
 			j.energyBroken = true
 		case readFailed:
 			j.energyPending, folded = true, true
-			// WHAT THE READS THAT DID ANSWER SHOW IS KEPT: a counter seen to fall,
-			// or a host seen to change shape, is not mended by folding the span.
-			if m.discontinuity(*s, j, host, hostErr, energy, energyErr) {
-				j.energyBroken = true
-			}
 		default:
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
 			// of the last tick that read everything and the job's own baseline CPU.
-			missed := !m.energyTick.IsZero() &&
-				now.Sub(maxTime(m.energyTick, j.cpuFrom)) >= staleAfter*m.opts.Interval
+			missed := !m.energyTick.IsZero() && span >= staleAfter*m.opts.Interval
 			if !consistent || !measured || missed {
 				j.energyBroken = true
 			} else {
@@ -621,6 +635,9 @@ func (m *Monitor) tick() {
 		}
 		if !readFailed {
 			j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
+		}
+		if s.CPUOK {
+			j.seenCPU, j.seenCPUOK = s.CPUUsage, true
 		}
 		m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(*s, before, j.byProcess)))
 		// A READ THAT TOOK A WHOLE INTERVAL IS UNSEEN: which of its counters were
@@ -643,6 +660,9 @@ func (m *Monitor) tick() {
 		m.readBounded(*s)
 	}
 
+	if hostErr == nil {
+		m.seenHost, m.seenHostOK = host, true
+	}
 	if !readFailed {
 		m.host, m.hostOK, m.energyTick = host, true, now
 		switch {
@@ -686,15 +706,15 @@ var errNoRAPL = errors.New("usage: neither rapl nor a meter is configured")
 // package counter or the wall.
 func (m *Monitor) shares() bool { return m.opts.RAPL || m.opts.Meter != nil }
 
-// discontinuity reports whether the reads a folded tick did take show the span
-// cannot be shared: the job's CPU fell below its baseline, the host's busy time
-// fell or its processor count changed, or the package counter's range changed.
-// Called with mu held.
+// discontinuity reports whether a tick's reads show the span cannot be shared:
+// the job's CPU fell below its last successful read, the host's busy time fell
+// or its processor count changed since its last successful read, or the package
+// counter's range changed. Called with mu held.
 func (m *Monitor) discontinuity(s Sample, j *job, host HostCPU, hostErr error, e Energy, energyErr error) bool {
-	if s.CPUOK && j.lastCPUOK && s.CPUUsage < j.lastCPU {
+	if s.CPUOK && j.seenCPUOK && s.CPUUsage < j.seenCPU {
 		return true
 	}
-	if hostErr == nil && m.hostOK && (host.CPUs != m.host.CPUs || host.Busy < m.host.Busy) {
+	if hostErr == nil && m.seenHostOK && (host.CPUs != m.seenHost.CPUs || host.Busy < m.seenHost.Busy) {
 		return true
 	}
 
