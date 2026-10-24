@@ -39,30 +39,56 @@ func acceptanceConfig(t *testing.T, extra string) (string, string) {
 	return path, nodeDir
 }
 
+// recordFor writes the control plane's acceptance into the node state directory
+// a pull fixture's config names, under the deployment its server directory is
+// given.
+func recordFor(t *testing.T, cfgPath string, components ...string) {
+	t.Helper()
+
+	dir := filepath.Dir(cfgPath)
+	if _, err := state.AdoptDeploymentID(filepath.Join(dir, "server"), acceptanceDeployment); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeDir := filepath.Join(dir, "node")
+	if err := os.MkdirAll(nodeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := imageaccept.Write(nodeDir, acceptanceDeployment, true, components, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // WHAT THE CONTROL PLANE ACCEPTS IS ADDED TO WHAT THE NODE'S OWN CONFIG DOES,
-// only for the deployment the node is in; nothing recorded is the node's own
-// list alone.
+// for the deployment the node is in. A control plane that does not say, and a
+// node whose file describes the control plane beside it with no record of its
+// own, complete with the file's list.
 func TestTheDeploymentsAcceptanceIsAddedToTheNodesOwn(t *testing.T) {
 	for name, tc := range map[string]struct {
 		local      string
 		deployment string
+		carried    bool
 		recorded   []string
 		want       []config.ImageComponent
 	}{
-		"both, merged": {"images:\n  accept: [codeql]\n", acceptanceDeployment,
+		"both, merged": {"images:\n  accept: [codeql]\n", acceptanceDeployment, true,
 			[]string{"firefox", "android-sdk"},
 			[]config.ImageComponent{config.ComponentAndroidSDK, config.ComponentCodeQL, config.ComponentFirefox}},
-		"the deployment's alone": {"", acceptanceDeployment, []string{"android-sdk"},
+		"the deployment's alone": {"", acceptanceDeployment, true, []string{"android-sdk"},
 			[]config.ImageComponent{config.ComponentAndroidSDK}},
-		"another deployment's": {"images:\n  accept: [codeql]\n", "fedcba9876543210fedcba9876543210",
-			[]string{"android-sdk"}, []config.ImageComponent{config.ComponentCodeQL}},
-		"nothing recorded": {"images:\n  accept: [codeql]\n", "", nil,
+		"a control plane that does not say": {"images:\n  accept: [codeql]\n", acceptanceDeployment, false, nil,
+			[]config.ImageComponent{config.ComponentCodeQL}},
+		"another deployment's, beside its control plane": {"images:\n  accept: [codeql]\n",
+			"fedcba9876543210fedcba9876543210", true, []string{"android-sdk"},
+			[]config.ImageComponent{config.ComponentCodeQL}},
+		"nothing recorded, beside its control plane": {"images:\n  accept: [codeql]\n", "", false, nil,
 			[]config.ImageComponent{config.ComponentCodeQL}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			path, nodeDir := acceptanceConfig(t, tc.local)
 			if tc.deployment != "" {
-				if err := imageaccept.Write(nodeDir, tc.deployment, tc.recorded, time.Now()); err != nil {
+				if err := imageaccept.Write(nodeDir, tc.deployment, tc.carried, tc.recorded, time.Now()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -80,33 +106,79 @@ func TestTheDeploymentsAcceptanceIsAddedToTheNodesOwn(t *testing.T) {
 	}
 }
 
-// A RECORD THAT CANNOT BE USED IS NEVER THE NODE'S OWN LIST ALONE: one that does
-// not parse, and one naming a component this build does not install, each
-// refuse, the second saying to upgrade.
-func TestAnUnusableRecordRefusesRatherThanInstallLess(t *testing.T) {
-	path, nodeDir := acceptanceConfig(t, "images:\n  accept: [codeql]\n")
+// WHAT CANNOT BE TOLD REFUSES, never the node's own list alone: a node that
+// dials a control plane elsewhere with no record of this deployment's, a record
+// that does not parse, a name this build does not install, and a record with no
+// deployment identity to compare it with.
+func TestWhatCannotBeToldRefusesRatherThanInstallLess(t *testing.T) {
+	remote := func(t *testing.T, cfg *config.Config) {
+		t.Helper()
 
-	cfg, err := config.Load(path)
-	if err != nil {
-		t.Fatal(err)
+		// A NODE WHOSE FILE DOES NOT DESCRIBE ITS CONTROL PLANE: its deployment is
+		// the one its own state directory holds.
+		cfg.Server = nil
+		if _, err := state.AdoptDeploymentID(cfg.Node.StateDir, acceptanceDeployment); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if err := imageaccept.Write(nodeDir, acceptanceDeployment, []string{"android-sdk", "visual-studio"},
-		time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	for name, tc := range map[string]struct {
+		stage func(t *testing.T, cfg *config.Config, nodeDir string)
+		says  string
+	}{
+		"no record, dialing elsewhere": {func(t *testing.T, cfg *config.Config, _ string) {
+			t.Helper()
 
-	if got, err := acceptedComponents(cfg); err == nil || !strings.Contains(err.Error(), `"visual-studio"`) ||
-		!strings.Contains(err.Error(), "upgrade billet on this node") {
-		t.Fatalf("a component this build does not install answered %v, %v", got, err)
-	}
+			remote(t, cfg)
+		}, "has not recorded what its control plane accepts"},
+		"another deployment's record, dialing elsewhere": {func(t *testing.T, cfg *config.Config, nodeDir string) {
+			t.Helper()
 
-	if err := os.WriteFile(imageaccept.Path(nodeDir), []byte("{"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+			remote(t, cfg)
+			if err := imageaccept.Write(nodeDir, "fedcba9876543210fedcba9876543210", true,
+				[]string{"codeql"}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, "has not recorded what its control plane accepts"},
+		"a record that does not parse": {func(t *testing.T, _ *config.Config, nodeDir string) {
+			t.Helper()
 
-	if got, err := acceptedComponents(cfg); err == nil {
-		t.Fatalf("a record that does not parse answered %v", got)
+			if err := os.WriteFile(imageaccept.Path(nodeDir), []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, "is not a record this node wrote"},
+		"a component this build does not install": {func(t *testing.T, _ *config.Config, nodeDir string) {
+			t.Helper()
+
+			if err := imageaccept.Write(nodeDir, acceptanceDeployment, true,
+				[]string{"android-sdk", "visual-studio"}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, `"visual-studio", which this billet does not install; upgrade billet on this node`},
+		"no deployment identity": {func(t *testing.T, cfg *config.Config, nodeDir string) {
+			t.Helper()
+
+			cfg.Server.IdentityDir = t.TempDir()
+			if err := imageaccept.Write(nodeDir, acceptanceDeployment, true, []string{"codeql"},
+				time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, "has no deployment identity to compare it with"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path, nodeDir := acceptanceConfig(t, "images:\n  accept: [codeql]\n")
+
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			tc.stage(t, cfg, nodeDir)
+
+			if got, err := acceptedComponents(cfg); err == nil || !strings.Contains(err.Error(), tc.says) {
+				t.Fatalf("answered %v, %v; want a refusal saying %q", got, err, tc.says)
+			}
+		})
 	}
 }
 
@@ -117,7 +189,7 @@ func TestARefreshPullsForAComponentOnlyTheControlPlaneAccepts(t *testing.T) {
 	run := stageRefresh(t, fakeRefreshStore{newest: newer, found: true, components: &record}, channelBuilt)
 
 	path, nodeDir := acceptanceConfig(t, "")
-	if err := imageaccept.Write(nodeDir, acceptanceDeployment, []string{"android-sdk"}, time.Now()); err != nil {
+	if err := imageaccept.Write(nodeDir, acceptanceDeployment, true, []string{"android-sdk"}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -130,7 +202,81 @@ func TestARefreshPullsForAComponentOnlyTheControlPlaneAccepts(t *testing.T) {
 	}
 }
 
-// `billet check` DESCRIBES A GENERATION AGAINST THE DEPLOYMENT'S ACCEPTANCE TOO.
+// A REFRESH THAT CANNOT TELL WHAT IS ACCEPTED PULLS NOTHING and says why, rather
+// than complete with the node's own list.
+func TestARefreshThatCannotTellWhatIsAcceptedPullsNothing(t *testing.T) {
+	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
+
+	path, nodeDir := acceptanceConfig(t, "")
+	if err := os.WriteFile(imageaccept.Path(nodeDir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", path})
+	if err == nil || !strings.Contains(err.Error(), "billet images refresh: ") ||
+		!strings.Contains(err.Error(), "is not a record this node wrote") {
+		t.Fatalf("refresh answered %v, want the unreadable record named", err)
+	}
+
+	if len(run.pulled) != 0 {
+		t.Fatalf("pulled %v with acceptance unknown", run.pulled)
+	}
+}
+
+// A PULL COMPLETES WITH WHAT ONLY THE CONTROL PLANE ACCEPTS: the node's own list
+// is empty, and the record's google-chrome is installed before the import.
+func TestAPullCompletesWithWhatOnlyTheControlPlaneAccepts(t *testing.T) {
+	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
+	run := newCompletionPull(t, "", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+	recordFor(t, run.fixture.cfgPath, "google-chrome")
+
+	if err := run.pull(t); err != nil {
+		t.Fatalf("images pull: %v", err)
+	}
+
+	if len(run.backend.launched) != 1 ||
+		!strings.Contains(strings.Join(run.backend.launched[0].Command, " "), "/opt/billet/complete/run google-chrome") {
+		t.Fatalf("the pull did not complete google-chrome: %+v", run.backend.launched)
+	}
+
+	if got := run.fixture.publisher.last().components; got == nil || got.Installed["google-chrome"] != "155.0.8059.84" {
+		t.Fatalf("the generation records %+v", got)
+	}
+}
+
+// VERIFY AND PROMOTE REFUSE A GENERATION LACKING WHAT ONLY THE CONTROL PLANE
+// ACCEPTS.
+func TestVerifyAndPromoteRefuseWhatOnlyTheControlPlaneAccepts(t *testing.T) {
+	open := openComponentsReader
+	t.Cleanup(func() { openComponentsReader = open })
+	openComponentsReader = func(*config.Config) (componentsReader, error) {
+		return fakeComponentsReader{record: ceph.GenerationComponents{LeftOut: []string{"google-chrome"}}, found: true}, nil
+	}
+
+	for name, run := range map[string]func(cfgPath string) error{
+		"billet images verify": func(cfgPath string) error {
+			return cmdImagesVerify(t.Context(), processEnv(), []string{"--config", cfgPath,
+				"ubuntu-2404-x64@g20260901000000"})
+		},
+		"billet images promote": func(cfgPath string) error {
+			return cmdImagesPromote(t.Context(), processEnv(), []string{"--config", cfgPath,
+				"ubuntu-2404-x64@g20260901000000"}, true)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newPullFixture(t)
+			recordFor(t, fixture.cfgPath, "google-chrome")
+
+			err := run(fixture.cfgPath)
+			if err == nil || !strings.Contains(err.Error(), name+": ubuntu-2404-x64@g20260901000000 lacks google-chrome") {
+				t.Fatalf("got %v, want it refused for lacking what the control plane accepts", err)
+			}
+		})
+	}
+}
+
+// `billet check` DESCRIBES A GENERATION AGAINST THE DEPLOYMENT'S ACCEPTANCE TOO,
+// and says when it cannot tell what that is.
 func TestCheckCountsWhatTheControlPlaneAccepts(t *testing.T) {
 	store := fakeComponentsChecker{verified: completedGeneration, records: map[string]ceph.GenerationComponents{
 		completedGeneration: {LeftOut: []string{"android-sdk"}, Installed: map[string]string{}},
@@ -140,22 +286,34 @@ func TestCheckCountsWhatTheControlPlaneAccepts(t *testing.T) {
 	t.Cleanup(func() { openComponentsChecker = restore })
 	openComponentsChecker = func(*config.Config) (componentsChecker, error) { return store, nil }
 
-	path, nodeDir := acceptanceConfig(t, "")
-	if err := imageaccept.Write(nodeDir, acceptanceDeployment, []string{"android-sdk"}, time.Now()); err != nil {
-		t.Fatal(err)
+	check := func(t *testing.T, body string) string {
+		t.Helper()
+
+		path, nodeDir := acceptanceConfig(t, "")
+		if err := os.WriteFile(imageaccept.Path(nodeDir), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var out strings.Builder
+		env := processEnv()
+		env.Stdout = &out
+		ReportImageComponents(t.Context(), env, cfg)
+
+		return out.String()
 	}
 
-	cfg, err := config.Load(path)
-	if err != nil {
-		t.Fatal(err)
+	if out := check(t, `{"schema":1,"deployment":"`+acceptanceDeployment+
+		`","carried":true,"components":["android-sdk"],"received_at":""}`); !strings.Contains(out,
+		"lacks android-sdk, which this deployment accepts") {
+		t.Fatalf("the check left out what the control plane accepts:\n%s", out)
 	}
 
-	var out strings.Builder
-	env := processEnv()
-	env.Stdout = &out
-	ReportImageComponents(t.Context(), env, cfg)
-
-	if !strings.Contains(out.String(), "lacks android-sdk, which this deployment accepts") {
-		t.Fatalf("the check left out what the control plane accepts:\n%s", out.String())
+	if out := check(t, "{"); !strings.Contains(out, "images   could not tell what this deployment accepts: ") {
+		t.Fatalf("the check did not say it could not tell:\n%s", out)
 	}
 }

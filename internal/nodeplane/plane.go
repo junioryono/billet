@@ -1390,8 +1390,14 @@ func (p *Plane) wireResponse(negotiated int) nodeapi.RegisterResponse {
 		PollSeconds:     int(p.poll.Seconds()),
 	}
 
-	if negotiated >= nodeapi.VersionImageAcceptance && len(p.imagesAccept) > 0 {
+	switch {
+	case len(p.imagesAccept) == 0:
+	case negotiated >= nodeapi.VersionImageAcceptance:
 		res.ImagesAccept = slices.Clone(p.imagesAccept)
+	default:
+		p.log.Warn("this node's wire does not carry the deployment's images.accept, so it completes "+
+			"guest images with its own list alone until it is upgraded", "protocol", negotiated,
+			"images_accept", p.imagesAccept)
 	}
 
 	return res

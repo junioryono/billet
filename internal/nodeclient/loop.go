@@ -196,8 +196,9 @@ type LoopOptions struct {
 	// makes a runtime directory there.
 	RegistrationRecordPath string
 	// ImageAcceptanceDir is node.state_dir, where the node records what its
-	// deployment accepts for its guest images after every accepted registration
-	// whose wire says (internal/imageaccept), or empty to record nothing.
+	// deployment accepts for its guest images, or that its control plane does not
+	// say, after every accepted registration (internal/imageaccept); empty
+	// records nothing.
 	ImageAcceptanceDir string
 	// Now is the clock the record's registered_at is read from. Nil is the
 	// wall clock.
@@ -554,17 +555,23 @@ func recordRegistration(c *Client, log *slog.Logger, opts LoopOptions) {
 			"again at its next registration", "path", opts.RegistrationRecordPath, "error", err)
 	}
 
-	// THE DEPLOYMENT'S IMAGE ACCEPTANCE, from the same accepted registration. A
-	// wire that does not carry it leaves the record as it was: silence is not
-	// "accepts none".
-	accepted, known := c.ImageAcceptance()
-	if opts.ImageAcceptanceDir == "" || !known {
+	if opts.ImageAcceptanceDir == "" {
 		return
 	}
 
-	if err := imageaccept.Write(opts.ImageAcceptanceDir, opts.Deployment, accepted, opts.now()); err != nil {
-		log.Error("could not record which image components the deployment accepts; the node "+
-			"keeps serving and tries again at its next registration", "error", err)
+	// THE DEPLOYMENT'S IMAGE ACCEPTANCE, from the same accepted registration, or
+	// that its control plane does not say: silence is not "accepts none". A
+	// record that could not be replaced is removed, so the image commands refuse
+	// rather than complete a generation by an answer this node no longer holds.
+	accepted, carried := c.ImageAcceptance()
+	if err := imageaccept.Write(opts.ImageAcceptanceDir, opts.Deployment, carried, accepted, opts.now()); err != nil {
+		log.Error("could not record which image components the deployment accepts; the image "+
+			"commands refuse until the node records it at its next registration", "error", err)
+
+		if err := imageaccept.Remove(opts.ImageAcceptanceDir); err != nil {
+			log.Error("could not remove the earlier record of which image components the "+
+				"deployment accepts, which the image commands may still read", "error", err)
+		}
 	}
 }
 
@@ -1017,6 +1024,9 @@ func recoverBeforeDrain(
 		var err error
 		if c.WireVersion() == 0 {
 			err = c.Register(recoverCtx, registrationWithInventory(recoverCtx, compute, log, opts))
+			if err == nil {
+				recordRegistration(c, log, opts)
+			}
 		}
 		if err == nil {
 			startJanitor()

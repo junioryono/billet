@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"time"
@@ -40,9 +41,15 @@ type Record struct {
 	// Deployment is the identity of the control plane that said it, so a node
 	// that moved to another deployment never installs what the old one accepted.
 	Deployment string `json:"deployment"`
+	// Carried says whether that control plane's wire carries its acceptance at
+	// all. False is a control plane older than nodeapi.VersionImageAcceptance,
+	// whose node completes with its own images.accept alone; it is never "accepts
+	// none".
+	Carried bool `json:"carried"`
 	// Components is what the control plane's images.accept names, sorted, and
-	// empty when it accepts none. A name this build does not know is kept as
-	// written: the reader refuses it rather than install less than was accepted.
+	// empty when it accepts none or does not say. A name this build does not know
+	// is kept as written: the reader refuses it rather than install less than was
+	// accepted.
 	Components []string `json:"components"`
 	// ReceivedAt is when the registration that carried it was accepted.
 	ReceivedAt string `json:"received_at"`
@@ -57,11 +64,17 @@ var install = func(dir, name string, write func(io.Writer) error) (string, error
 	return durablefile.Installer{}.Install(dir, name, 0o600, write)
 }
 
-// Write records what the control plane of deployment accepts, replacing any
-// earlier record whole. An interruption leaves the previous record intact.
-func Write(stateDir, deployment string, components []string, at time.Time) error {
+// Write records what the control plane of deployment accepts, or that it does
+// not say when carried is false, replacing any earlier record whole. An
+// interruption leaves the previous record intact, so a caller whose write failed
+// removes it (Remove) rather than leave an answer it no longer holds.
+func Write(stateDir, deployment string, carried bool, components []string, at time.Time) error {
 	if deployment == "" {
 		return errors.New("the deployment's image acceptance is recorded only with the deployment that said it")
+	}
+
+	if !carried && len(components) > 0 {
+		return errors.New("a control plane that does not say what it accepts names no component")
 	}
 
 	sorted := slices.Clone(components)
@@ -74,6 +87,7 @@ func Write(stateDir, deployment string, components []string, at time.Time) error
 	body, err := json.Marshal(Record{
 		Schema:     schema,
 		Deployment: deployment,
+		Carried:    carried,
 		Components: sorted,
 		ReceivedAt: at.UTC().Format(time.RFC3339Nano),
 	})
@@ -89,6 +103,17 @@ func Write(stateDir, deployment string, components []string, at time.Time) error
 		return err
 	}); err != nil {
 		return fmt.Errorf("record the deployment's image acceptance in %s: %w", stateDir, err)
+	}
+
+	return nil
+}
+
+// Remove deletes the record under stateDir, so the image commands answer that
+// they cannot tell rather than read an earlier answer. A record already absent is
+// not an error.
+func Remove(stateDir string) error {
+	if err := os.Remove(Path(stateDir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the deployment's image acceptance from %s: %w", stateDir, err)
 	}
 
 	return nil
@@ -133,6 +158,9 @@ func Read(stateDir string) (Record, bool, error) {
 	case rec.Components == nil:
 		return Record{}, false, fmt.Errorf("the deployment's image acceptance at %s names no component "+
 			"list", path)
+	case !rec.Carried && len(rec.Components) > 0:
+		return Record{}, false, fmt.Errorf("the deployment's image acceptance at %s names components "+
+			"from a control plane that does not say what it accepts", path)
 	}
 
 	return rec, true, nil

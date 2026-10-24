@@ -442,8 +442,14 @@ const (
 	// ignores the field, completing generations with its own images.accept as it
 	// always did. CHECKED WHERE IT IS SENT, so an answer below it stays the bytes it
 	// was, and WHERE IT IS READ, because an absent field is "accepts none" only from
-	// a plane that would have sent one: below it the node leaves its record as it
-	// was.
+	// a plane that would have sent one: below it the node records that its control
+	// plane does not say.
+	//
+	// THE NAMES ARE WIRE VOCABULARY. A node refuses to complete or promote a
+	// generation while its control plane accepts a component its build does not
+	// install, so a new config.ImageComponent is accepted in a control plane's
+	// config only once every node runs a build that installs it; until then the
+	// image commands of an older node refuse, naming the component.
 	VersionImageAcceptance = 33
 )
 

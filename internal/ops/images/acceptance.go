@@ -1,6 +1,7 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 
@@ -8,6 +9,12 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imageaccept"
 )
+
+// errAcceptanceUnknown is the refusal when a node that dials a control plane on
+// another machine holds no record of what that control plane accepts.
+var errAcceptanceUnknown = errors.New("this node has not recorded what its control plane accepts " +
+	"for guest images, which it does at every registration; start the node (`billet local up`) " +
+	"and run this again once it has registered")
 
 // acceptedComponents is what a generation on this node is completed with: the
 // node's own images.accept together with what its deployment's control plane
@@ -18,12 +25,13 @@ import (
 // deployment that accepted a component on a node before its control plane said
 // anything keeps it there.
 //
-// A RECORD THAT CANNOT BE READ, OR WHOSE DEPLOYMENT CANNOT BE TOLD, IS AN ERROR,
-// never the node's own list alone: completing a generation with less than was
-// accepted and promoting it moves every tier onto an image without what the
-// deployment accepted. A record another deployment wrote is not this one's, and
-// is left out. A name this build does not install is refused rather than skipped,
-// for validateImages' reason.
+// WHAT CANNOT BE TOLD REFUSES, never the node's own list alone: completing a
+// generation with less than was accepted and promoting it moves every tier onto
+// an image without what the deployment accepted. That is a record that cannot be
+// read, a deployment that cannot be told, a name this build does not install
+// (validateImages' reason), and no record of this deployment's control plane on
+// a node that dials one elsewhere. A node whose file describes the control plane
+// beside it reads that control plane's list in its own file, so it needs none.
 func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	accepted := cfg.Images.Accepted()
 	if cfg.Node == nil {
@@ -35,22 +43,31 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 		return nil, err
 	}
 
-	if !ok {
+	if ok {
+		deployment, known, err := app.PeekNodeDeploymentID(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("could not tell which deployment this node is in, so not whether "+
+				"the image acceptance it recorded is its own: %w", err)
+		}
+
+		if !known {
+			return nil, fmt.Errorf("this node recorded the image acceptance of deployment %s and has "+
+				"no deployment identity to compare it with", rec.Deployment)
+		}
+
+		// ANOTHER DEPLOYMENT'S RECORD SAYS NOTHING ABOUT THIS ONE: the node has not
+		// registered with its own control plane since it moved.
+		ok = rec.Deployment == deployment
+	}
+
+	switch {
+	case !ok && cfg.Server != nil:
 		return accepted, nil
-	}
-
-	deployment, known, err := app.PeekNodeDeploymentID(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("could not tell which deployment this node is in, so not whether "+
-			"the image acceptance it recorded is its own: %w", err)
-	}
-
-	if !known {
-		return nil, fmt.Errorf("this node recorded the image acceptance of deployment %s and has "+
-			"no deployment identity to compare it with", rec.Deployment)
-	}
-
-	if rec.Deployment != deployment {
+	case !ok:
+		return nil, errAcceptanceUnknown
+	case !rec.Carried:
+		// A control plane older than the wire that carries it: this node's own list
+		// is all there is, as it was before.
 		return accepted, nil
 	}
 
