@@ -86,7 +86,11 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 	// THE HOST'S END OF THE VM'S LINK: what the host sent on it is what the guest
 	// received (measured on macOS 27.0.1, 2026-10-24).
 	target.NetDevice, target.NetHostView = dev, true
-	target.NetPID, target.NetPIDStart = carrier, carrierStart
+	// A CARRIER THAT IS THE VM'S OWN PROCESS IS NOT NAMED TWICE: PID's checks
+	// are already its.
+	if carrier != pid {
+		target.NetPID, target.NetPIDStart = carrier, carrierStart
+	}
 
 	return target, nil
 }
@@ -130,6 +134,14 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 		}
 		if unit == 0 {
 			return "", 0, 0, fmt.Errorf("neither %s's VM process nor its softnet holds a VM network link", name)
+		}
+		// THE PROCESS IS PROVED THE VM'S SOFTNET AGAIN, after its socket and
+		// before its start is read again: a softnet that exited between the
+		// first listing and the first start would otherwise have its successor
+		// under the pid read twice, consistently, as this VM's.
+		if again, err := p.softnetOf(ctx, name, mac); err != nil || again != carrier {
+			return "", 0, 0, fmt.Errorf("%s's softnet (%d) is not the one carrying it after its link was read",
+				name, carrier)
 		}
 		if again, err := p.processStart(carrier); err != nil || again != carrierStart {
 			return "", 0, 0, fmt.Errorf("%s's softnet (%d) changed while its link was being read", name, carrier)

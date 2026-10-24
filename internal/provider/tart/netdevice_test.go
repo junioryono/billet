@@ -116,7 +116,7 @@ func TestAVMsNetworkIsTheVMNetItsLinksSocketNames(t *testing.T) {
 		carrier int
 		start   uint64
 	}{
-		"the shared network": {dev: "vmenet0", carrier: 74207, start: 16664085551217, n: network{mac: sharedMAC,
+		"the shared network": {dev: "vmenet0", n: network{mac: sharedMAC,
 			tables: table, ps: psWith(), sockets: map[string]string{"74207": printed(unitLine("1"))}}},
 		"softnet": {dev: "vmenet1", carrier: 62980, start: 16664085550000, n: network{mac: softMAC, tables: table,
 			ps:      psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun),
@@ -239,36 +239,66 @@ func TestOnlyABridgesNameReachesIfconfig(t *testing.T) {
 	}
 }
 
-// A SOFTNET REPLACED WHILE ITS LINK IS READ IS NOT THE VM'S: its start is read
-// before and after its socket, and one that changed leaves the VM's network
-// unmeasured rather than tied to whatever took the pid.
-func TestASoftnetReplacedWhileItsLinkIsReadIsNotTheVMs(t *testing.T) {
+// A SOFTNET REPLACED WHILE ITS LINK IS FOUND IS NOT THE VM'S, whenever the pid
+// changes hands: during the read of its socket, which its start read on either
+// side catches, or between the first listing and the first start, which only
+// proving it the VM's softnet again after the socket catches, since every start
+// read after that is the successor's, or after it was proved again, which its
+// last start read catches. The VM's network is left unmeasured
+// rather than tied to whatever took the pid.
+func TestASoftnetReplacedWhileItsLinkIsFoundIsNotTheVMs(t *testing.T) {
 	t.Parallel()
 
-	h := newNetworkHost(t)
-	h.withNetwork(t, network{mac: softMAC, tables: table,
-		ps:      psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun),
-		sockets: map[string]string{"74207": "true", "62980": printed(unitLine("2"))}})
-	starts := h.p.processStart
-	reads := 0
-	h.p.processStart = func(pid int) (uint64, error) {
-		start, err := starts(pid)
-		if pid == 62980 {
-			reads++
-			start += uint64(reads)
-		}
+	for _, when := range []string{"while its socket is read", "before its start is first read",
+		"after it is proved again"} {
+		t.Run(when, func(t *testing.T) {
+			t.Parallel()
 
-		return start, err
-	}
+			h := newNetworkHost(t)
+			replaced := filepath.Join(t.TempDir(), "replaced")
+			socket := printed(unitLine("2"))
+			if when == "while its socket is read" {
+				socket += "; : > " + replaced
+			}
+			h.withNetwork(t, network{mac: softMAC, tables: table,
+				ps:      psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun),
+				sockets: map[string]string{"74207": "true", "62980": socket}})
+			// THE SUCCESSOR IS ANOTHER VM'S SOFTNET, told its own address.
+			successor := psWith("62978 61958 "+tartRun, "62979 61958 "+strings.Replace(tartRun, usageVM,
+				"billet-other", 1), "62980 62979 "+strings.Replace(softnetRun, softMAC, sharedMAC, 1))
+			ps := filepath.Join(t.TempDir(), "ps")
+			script := "#!/bin/sh\nif [ -e " + replaced + " ]; then printf '%s' '" + successor + "'; else " +
+				"printf '%s' '" + psWith("62978 61958 "+tartRun, "62980 62978 "+softnetRun) + "'; fi\n"
+			if err := forkSafeWriteFile(ps, []byte(script), 0o755); err != nil {
+				t.Fatalf("write the ps shim: %v", err)
+			}
+			h.p.ps = ps
+			starts := h.p.processStart
+			reads := 0
+			h.p.processStart = func(pid int) (uint64, error) {
+				if pid != 62980 {
+					return starts(pid)
+				}
+				reads++
+				if when == "before its start is first read" || when == "after it is proved again" && reads == 2 {
+					if err := os.WriteFile(replaced, nil, 0o600); err != nil {
+						t.Errorf("mark the softnet replaced: %v", err)
+					}
+				}
+				if _, err := os.Stat(replaced); err == nil {
+					return 16664085559999, nil
+				}
 
-	target, err := h.p.UsageTarget(t.Context(), usageVM)
-	if err != nil {
-		t.Fatalf("UsageTarget: %v", err)
-	}
-	if want := (provider.UsageTarget{PID: 74207, PIDStart: 16664085551217, Process: true}); target != want {
-		t.Errorf("the VM is %+v, want %+v, with no device", target, want)
-	}
-	if reads != 2 {
-		t.Errorf("the softnet's start was read %d times, want before and after its socket", reads)
+				return starts(pid)
+			}
+
+			target, err := h.p.UsageTarget(t.Context(), usageVM)
+			if err != nil {
+				t.Fatalf("UsageTarget: %v", err)
+			}
+			if want := (provider.UsageTarget{PID: 74207, PIDStart: 16664085551217, Process: true}); target != want {
+				t.Errorf("the VM is %+v, want %+v, with no device", target, want)
+			}
+		})
 	}
 }
