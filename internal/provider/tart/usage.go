@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/usage"
 )
 
@@ -102,14 +104,25 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 // the VM's frames and living as long as it does: the VM's own process on the
 // shared network, and under softnet the softnet process its `tart run` started.
 //
-// TWO FACTS MUST AGREE, and either alone is refused. The socket's unit names
-// the interface (unit N is vmenet N-1, measured on macOS 27.0.1, 2026-10-24),
-// and the kernel says who holds it; the bridge's address table must have
-// learned the VM's configured address on that same interface. The table alone
-// is what the guest sent, and a guest can claim another's address.
+// THE DEVICE IS THE ONE MEMBER THE BRIDGE LEARNED THE VM'S CONFIGURED ADDRESS
+// ON. No mapping from a socket to its interface is established: the socket's
+// unit and the interface's number are allocated apart and diverge as VMs come
+// and go, and `ifconfig -v` names nothing that ties them (measured on macOS
+// 27.0.1, 2026-10-24). The table is what the guest sent, and it holds under
+// softnet, which drops a frame from any address but the one it was told
+// (measured the same day), so an untrusted guest cannot claim another's; a
+// guest on the shared network is trusted work. A member's entries leave the
+// table with it (measured). The address must be no other VM's in the store,
+// since a clone can keep its image's, and every VM on the host must be the node
+// account's, since another account's store is one billet cannot read; an
+// address on no member or on more than one refuses.
 //
-// THE CARRIER IS RETURNED WITH ITS START, read before and after its socket is,
-// so every later read of the device proves the process it lives as long as.
+// THE NODE ACCOUNT IS TRUSTED, as it is for the disk: a second tart store it
+// keeps outside TART_HOME, holding a VM with this one's address, is not seen.
+//
+// THE CARRIER IS FOUND BY ITS SOCKET and returned with its start, read before
+// and after the socket is, so every later read of the device proves the process
+// it lives as long as.
 func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart uint64) (string, int, uint64,
 	error,
 ) {
@@ -117,22 +130,28 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 	if err != nil {
 		return "", 0, 0, err
 	}
+	if err := p.vmsAreTheNodes(ctx); err != nil {
+		return "", 0, 0, err
+	}
+	if err := p.addressIsOnlyIts(ctx, name, mac); err != nil {
+		return "", 0, 0, err
+	}
 	carrier, carrierStart := vm, vmStart
-	unit, err := p.ethernetUnit(ctx, vm)
+	holds, err := p.holdsLink(ctx, vm)
 	if err != nil {
 		return "", 0, 0, err
 	}
-	if unit == 0 {
+	if !holds {
 		if carrier, err = p.softnetOf(ctx, name, mac); err != nil {
 			return "", 0, 0, err
 		}
 		if carrierStart, err = p.processStart(carrier); err != nil {
 			return "", 0, 0, fmt.Errorf("read the start of %s's softnet (%d): %w", name, carrier, err)
 		}
-		if unit, err = p.ethernetUnit(ctx, carrier); err != nil {
+		if holds, err = p.holdsLink(ctx, carrier); err != nil {
 			return "", 0, 0, err
 		}
-		if unit == 0 {
+		if !holds {
 			return "", 0, 0, fmt.Errorf("neither %s's VM process nor its softnet holds a VM network link", name)
 		}
 		// THE PROCESS IS PROVED THE VM'S SOFTNET AGAIN, after its socket and
@@ -147,8 +166,6 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 			return "", 0, 0, fmt.Errorf("%s's softnet (%d) changed while its link was being read", name, carrier)
 		}
 	}
-	dev := fmt.Sprintf("vmenet%d", unit-1)
-
 	bridges, err := p.bridges()
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("list the host's bridges: %w", err)
@@ -161,21 +178,30 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 		}
 		found = append(found, members...)
 	}
-	if len(found) != 1 || found[0] != dev {
-		return "", 0, 0, fmt.Errorf("%s's link is %s, but the bridges learned its address %s on [%s]", name, dev,
-			mac, strings.Join(found, ", "))
+	if len(found) != 1 {
+		return "", 0, 0, fmt.Errorf("the bridges learned %s's address %s on %d members: [%s]", name, mac, len(found),
+			strings.Join(found, ", "))
+	}
+	// THE ACCOUNTS ARE COUNTED AND THE STORE READ AGAIN, after the bridge is:
+	// another account's VM, or a clone published meanwhile with this address,
+	// could be the one the bridge learned it from.
+	if err := p.vmsAreTheNodes(ctx); err != nil {
+		return "", 0, 0, err
+	}
+	if err := p.addressIsOnlyIts(ctx, name, mac); err != nil {
+		return "", 0, 0, err
 	}
 
-	return dev, carrier, carrierStart, nil
+	return found[0], carrier, carrierStart, nil
 }
 
-// ethernetUnit is the unit of the one userspace_ethernet control socket pid
-// holds, or zero when it holds none.
+// holdsLink says whether pid holds a VM's network link: one userspace_ethernet
+// control socket.
 //
 // lsof names one as "[ctl com.apple.userspace_ethernet id 14 unit 1]" (macOS
 // 27.0.1, 2026-10-24); its warnings are on, and any of them refuses, as for the
-// disk.
-func (p *Provider) ethernetUnit(ctx context.Context, pid int) (int, error) {
+// disk. A process holding two is not one VM's carrier.
+func (p *Provider) holdsLink(ctx context.Context, pid int) (bool, error) {
 	// #nosec G204 -- the binary is fixed and the one variable argument is a pid.
 	// No shell.
 	cmd := exec.CommandContext(ctx, p.lsof, "-nP", "+w", "-a", "-p", strconv.Itoa(pid), "-F", "n")
@@ -185,10 +211,10 @@ func (p *Provider) ethernetUnit(ctx context.Context, pid int) (int, error) {
 	err := cmd.Run()
 	complaint := strings.TrimSpace(stderr.String())
 	if err != nil {
-		return 0, fmt.Errorf("list process %d's sockets: %w: %s", pid, err, complaint)
+		return false, fmt.Errorf("list process %d's sockets: %w: %s", pid, err, complaint)
 	}
 	if complaint != "" {
-		return 0, fmt.Errorf("lsof warned listing process %d's sockets, so its answer may be short: %s", pid,
+		return false, fmt.Errorf("lsof warned listing process %d's sockets, so its answer may be short: %s", pid,
 			complaint)
 	}
 	var units []int
@@ -201,19 +227,16 @@ func (p *Provider) ethernetUnit(ctx context.Context, pid int) (int, error) {
 		digits, closed := strings.CutSuffix(after, "]")
 		unit, err := strconv.Atoi(digits)
 		if !found || !closed || err != nil || unit < 1 || unit > 9999 {
-			return 0, fmt.Errorf("process %d holds a VM network socket billet cannot read: %q", pid,
+			return false, fmt.Errorf("process %d holds a VM network socket billet cannot read: %q", pid,
 				strings.TrimSpace(line))
 		}
 		units = append(units, unit)
 	}
-	switch len(units) {
-	case 0:
-		return 0, nil
-	case 1:
-		return units[0], nil
-	default:
-		return 0, fmt.Errorf("process %d holds %d VM network sockets", pid, len(units))
+	if len(units) > 1 {
+		return false, fmt.Errorf("process %d holds %d VM network sockets", pid, len(units))
 	}
+
+	return len(units) == 1, nil
 }
 
 // softnetOf is the softnet process carrying a VM's frames: the one whose parent
@@ -274,9 +297,112 @@ func (p *Provider) softnetOf(ctx context.Context, name string, mac net.HardwareA
 	}
 }
 
-// vmMAC is the hardware address tart gave a VM, from its config.json.
+// maxStoreVMs bounds the store a VM's address is compared across: a store past
+// it is not scanned, and the network is left unmeasured.
+const maxStoreVMs = 256
+
+// addressIsOnlyIts refuses a VM whose configured address another VM in the store
+// is configured with too, billet's or not: the bridge could have learned it from
+// either, and nothing then says which member is this VM's.
+//
+// AN ENTRY THAT CANNOT BE READ AS A VM IS COULD-NOT-TELL, and refuses: a symlink,
+// a directory with no configuration (its compute is not proved stopped by the
+// file's absence), or one that is not a small regular file.
+func (p *Provider) addressIsOnlyIts(ctx context.Context, name string, mac net.HardwareAddr) error {
+	dir, err := os.Open(filepath.Join(p.home, "vms"))
+	if err != nil {
+		return fmt.Errorf("list the VMs in the store: %w", err)
+	}
+	// AT MOST ONE PAST THE BOUND IS READ, so a store of any size costs no more.
+	entries, err := dir.ReadDir(maxStoreVMs + 1)
+	_ = dir.Close()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("list the VMs in the store: %w", err)
+	}
+	if len(entries) > maxStoreVMs {
+		return fmt.Errorf("the store holds %d entries, more than the %d a VM's address is compared across",
+			len(entries), maxStoreVMs)
+	}
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		other := e.Name()
+		if other == name {
+			continue
+		}
+		if e.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("the store's %s is a symlink, so whose address it holds could not be told", other)
+		}
+		// A STAGING CLONE WAS NEVER LAUNCHED, by the clone, mark and rename order
+		// List relies on too, so it sends nothing the bridge could learn; a
+		// crash leaves one with no configuration, and it must not cost every
+		// later job its network.
+		if !e.IsDir() || billetStaging(other) {
+			continue
+		}
+		theirs, err := p.vmMAC(other)
+		if err != nil {
+			return fmt.Errorf("could not tell whether %s shares %s's address: %w", other, name, err)
+		}
+		if bytes.Equal(theirs, mac) {
+			return fmt.Errorf("%s and %s are both configured with address %s", name, other, mac)
+		}
+	}
+
+	return nil
+}
+
+// billetStaging says a directory is billet's own staging clone, a lease's name
+// with the staging suffix: an operator's VM may end the same way and run.
+func billetStaging(name string) bool {
+	base, ok := strings.CutSuffix(name, stagingSuffix)
+	if !ok {
+		return false
+	}
+	_, ok = provider.LeaseOf(base)
+
+	return ok
+}
+
+// vmsAreTheNodes refuses when a Virtualization.framework VM on the host runs as
+// another account than the node's: its store is one billet cannot read, so an
+// address it shares with this VM would not be seen.
+func (p *Provider) vmsAreTheNodes(ctx context.Context) error {
+	// #nosec G204 -- the binary and its arguments are fixed. No shell.
+	cmd := exec.CommandContext(ctx, p.ps, "-axo", "uid=,args=")
+	cmd.WaitDelay = commandWaitDelay
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("list the host's processes: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	for line := range strings.Lines(stdout.String()) {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[1] != vmService {
+			continue
+		}
+		uid, err := strconv.Atoi(f[0])
+		if err != nil {
+			return fmt.Errorf("ps answered a line billet cannot read: %q", strings.TrimSpace(line))
+		}
+		if uid != p.uid {
+			return fmt.Errorf("a VM on this host runs as uid %d, not the node's %d, and its addresses cannot be read",
+				uid, p.uid)
+		}
+	}
+
+	return nil
+}
+
+// maxVMConfig bounds a VM's config.json, a few hundred bytes as tart writes it.
+const maxVMConfig = 64 << 10
+
+// vmMAC is the hardware address tart gave a VM, from its config.json, read as a
+// small regular file and never through a symlink.
 func (p *Provider) vmMAC(name string) (net.HardwareAddr, error) {
-	raw, err := os.ReadFile(filepath.Join(p.vmDir(name), "config.json"))
+	raw, err := regularfile.ReadFile(filepath.Join(p.vmDir(name), "config.json"), maxVMConfig,
+		regularfile.Options{NoFollow: true})
 	if err != nil {
 		return nil, fmt.Errorf("read %s's configuration: %w", name, err)
 	}
