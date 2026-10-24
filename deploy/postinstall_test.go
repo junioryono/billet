@@ -37,19 +37,27 @@ func packageDocker(t *testing.T) context.Context {
 	return ctx
 }
 
-// removeOnCleanup removes the named container once the test ends. A removal
-// already in progress is the run's own --rm, which a container killed by its
-// guard is also given.
+// removeOnCleanup removes the named container once the test ends, and proves it
+// gone. A removal already in progress is the run's own --rm, which a container
+// killed by its guard is also given, and it can still fail, so it is asked
+// again until Docker says there is no such container.
 func removeOnCleanup(t *testing.T, name string) {
 	t.Helper()
 
 	t.Cleanup(func() {
 		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
 		defer stop()
-		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "No such container:") &&
-			!strings.Contains(string(out), "is already in progress") {
-			t.Errorf("remove the package-test container: %v: %s", err, out)
+		for {
+			out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
+			if err == nil || strings.Contains(string(out), "No such container:") {
+				return
+			}
+			if !strings.Contains(string(out), "is already in progress") || cleanup.Err() != nil {
+				t.Errorf("remove the package-test container %s: %v: %s", name, err, out)
+
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	})
 }
