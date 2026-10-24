@@ -340,25 +340,56 @@ func TestAConnectionThatGotNothingBackIsCountedAgainstItsDestination(t *testing.
 		t.Errorf("a result holding a flow with no packet counts says it could tell what went unanswered: %+v", r)
 	}
 
-	// AN ENTRY THE PREVIOUS HOLDER LEFT WITHOUT PACKET COUNTS hides the guest's
-	// reuse of its tuple, so a stall on it could not be noticed: whether it is
-	// open when the job is watched or seen only at Final, the result cannot say
-	// none went unanswered. One left with its counts says nothing of the kind.
+	// AN ENTRY THE PREVIOUS HOLDER LEFT OPEN WITHOUT PACKET COUNTS hides the
+	// guest's reuse of its tuple, so a stall on it could not be noticed and the
+	// result cannot say none went unanswered. One already destroyed before the
+	// job was watched, replayed from the unclaimed ring, is no tuple the guest
+	// can send on and takes nothing from the job's counts, and neither does one
+	// left open with its counts.
 	counterless := startedAt(flow(6, guest, npm, 0, 0), began.Add(-time.Minute))
 	for name, tc := range map[string]struct {
-		atWatch, atFinal []Flow
-		unknown          bool
+		destroyedBefore, openAtWatch []Flow
+		unknown                      bool
 	}{
-		"open when watched":      {atWatch: []Flow{counterless}, unknown: true},
-		"seen only at Final":     {atFinal: []Flow{counterless}, unknown: true},
-		"left with their counts": {atWatch: []Flow{startedAt(flow(6, guest, npm, 5, 5), began.Add(-time.Minute))}},
+		"open when watched":        {openAtWatch: []Flow{counterless}, unknown: true},
+		"destroyed before watched": {destroyedBefore: []Flow{counterless}},
+		"left open with counts": {openAtWatch: []Flow{
+			startedAt(flow(6, guest, npm, 5, 5), began.Add(-time.Minute))}},
 	} {
 		inherits := NewAccountant()
-		inherits.Watch("lease-4", guest, began, tc.atWatch)
-		inherits.Observe(flow(1, guest, github, 120, 4000))
-		r, _ := inherits.Final("lease-4", tc.atFinal, ended)
+		for _, f := range tc.destroyedBefore {
+			inherits.Observe(f)
+		}
+		inherits.Watch("lease-4", guest, began, tc.openAtWatch)
+		inherits.Observe(stalled)
+		r, _ := inherits.Final("lease-4", nil, ended)
 		if r.UnansweredUnknown != tc.unknown {
 			t.Errorf("an inherited entry %s: UnansweredUnknown = %v, want %v", name, r.UnansweredUnknown, tc.unknown)
+		}
+		if !tc.unknown && (len(r.Destinations) != 1 || r.Destinations[0].Unanswered != 1) {
+			t.Errorf("an inherited entry %s took the job's own stall from it: %+v", name, r.Destinations)
+		}
+	}
+
+	// A COUNTERLESS FLOW THE UNCLAIMED RING DROPPED before the job was
+	// watched, and after its grant, could have been its stall; one dropped
+	// from before the grant was another holder's.
+	for name, tc := range map[string]struct {
+		start   time.Time
+		unknown bool
+	}{
+		"started after the grant":  {started, true},
+		"started before the grant": {began.Add(-time.Minute), false},
+	} {
+		ring := NewAccountant()
+		ring.Observe(startedAt(flow(8, guest, npm, 0, 0), tc.start))
+		for i := range MaxUnclaimed {
+			ring.Observe(startedAt(flow(uint32(100+i), other, github, 1, 1), tc.start))
+		}
+		ring.Watch("lease-7", guest, began, nil)
+		if r, _ := ring.Final("lease-7", nil, ended); r.UnansweredUnknown != tc.unknown {
+			t.Errorf("a counterless flow the ring dropped, %s: UnansweredUnknown = %v, want %v", name,
+				r.UnansweredUnknown, tc.unknown)
 		}
 	}
 

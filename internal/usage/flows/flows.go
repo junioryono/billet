@@ -118,6 +118,10 @@ type Accountant struct {
 	// time: whose it was cannot be told, so every job granted before then may
 	// have lost it.
 	evictedUnstamped time.Time
+	// evictedCounterless is the latest start of a flow the ring dropped that
+	// carried no packet counts, or when it dropped one with no start: a job
+	// granted its address at or before it may have lost a stall with it.
+	evictedCounterless time.Time
 	// down says the tracker's events are not being read now, and lossEnded
 	// when the latest such gap closed: a job whose time overlaps either may be
 	// missing flows.
@@ -143,9 +147,9 @@ type watch struct {
 	inherited  map[entry]Flow
 	incomplete bool
 	// unansweredUnknown says a flow that could be the job's and was not
-	// counted carried no packet counts: an entry the previous holder left,
+	// counted carried no packet counts: an entry the previous holder left open,
 	// whose tuple the guest could reuse unnoticed, a flow with no start time,
-	// or one past MaxFlows.
+	// one past MaxFlows, or one the unclaimed ring dropped.
 	unansweredUnknown bool
 }
 
@@ -185,6 +189,9 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 	if a.down || !a.lossEnded.Before(since) || !a.evictedStart.Before(since) ||
 		!a.evictedUnstamped.Before(since) {
 		w.incomplete = true
+	}
+	if !a.evictedCounterless.Before(since) {
+		w.unansweredUnknown = true
 	}
 
 	for i := range open {
@@ -249,10 +256,16 @@ func (a *Accountant) observe(f Flow) {
 		// TRAFFIC IS INSIDE IT: only the address's holder sends from it, and the
 		// old holder's VM is gone. What came back is no evidence, since a remote
 		// goes on answering a guest that has left.
-		if base, inherited := w.inherited[key]; inherited && f.OrigPackets > base.OrigPackets {
-			w.incomplete = true
+		// AN INHERITED ENTRY WITH NO PACKET COUNTS hides that reuse altogether,
+		// so a stall on its tuple could not be noticed. Only an entry open when
+		// the job was watched is inherited: one already destroyed is no tuple
+		// the guest can send on.
+		if base, inherited := w.inherited[key]; inherited {
+			if f.OrigPackets > base.OrigPackets {
+				w.incomplete = true
+			}
+			w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&base)
 		}
-		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
 	}
@@ -286,11 +299,21 @@ func (a *Accountant) keepUnclaimed(f Flow) {
 		return
 	}
 
-	switch dropped := a.unclaimed[a.next].Start; {
+	evicted := &a.unclaimed[a.next]
+	switch dropped := evicted.Start; {
 	case dropped.IsZero():
 		a.evictedUnstamped = a.now()
 	case dropped.After(a.evictedStart):
 		a.evictedStart = dropped
+	}
+	if uncountedPackets(evicted) {
+		at := evicted.Start
+		if at.IsZero() {
+			at = a.now()
+		}
+		if at.After(a.evictedCounterless) {
+			a.evictedCounterless = at
+		}
 	}
 
 	a.unclaimed[a.next] = f
