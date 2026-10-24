@@ -305,6 +305,9 @@ type Provider struct {
 	ps       string
 	ifconfig string
 	bridges  func() ([]string, error)
+	// uid is the node account's, which every VM on the host must run as for a
+	// VM's address to be compared across every store that could hold it.
+	uid int
 
 	// names serializes Launch and Destroy per VM name. Destroy's stop→prove→
 	// delete is not atomic, and a Launch admitted into that window could have
@@ -421,6 +424,7 @@ func New(owner string, opts ...Option) (*Provider, error) {
 
 		lsof:         "/usr/sbin/lsof",
 		ps:           "/bin/ps",
+		uid:          os.Getuid(),
 		ifconfig:     "/sbin/ifconfig",
 		bridges:      hostBridges,
 		processPath:  usage.ProcessPath,

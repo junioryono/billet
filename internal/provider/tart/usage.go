@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/usage"
 )
 
@@ -111,8 +112,12 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 // (measured the same day), so an untrusted guest cannot claim another's; a
 // guest on the shared network is trusted work. A member's entries leave the
 // table with it (measured). The address must be no other VM's in the store,
-// since a clone can keep its image's, and an address on no member or on more
-// than one refuses.
+// since a clone can keep its image's, and every VM on the host must be the node
+// account's, since another account's store is one billet cannot read; an
+// address on no member or on more than one refuses.
+//
+// THE NODE ACCOUNT IS TRUSTED, as it is for the disk: a second tart store it
+// keeps outside TART_HOME, holding a VM with this one's address, is not seen.
 //
 // THE CARRIER IS FOUND BY ITS SOCKET and returned with its start, read before
 // and after the socket is, so every later read of the device proves the process
@@ -124,7 +129,10 @@ func (p *Provider) netDevice(ctx context.Context, name string, vm int, vmStart u
 	if err != nil {
 		return "", 0, 0, err
 	}
-	if err := p.addressIsOnlyIts(name, mac); err != nil {
+	if err := p.vmsAreTheNodes(ctx); err != nil {
+		return "", 0, 0, err
+	}
+	if err := p.addressIsOnlyIts(ctx, name, mac); err != nil {
 		return "", 0, 0, err
 	}
 	carrier, carrierStart := vm, vmStart
@@ -279,24 +287,41 @@ func (p *Provider) softnetOf(ctx context.Context, name string, mac net.HardwareA
 	}
 }
 
+// maxStoreVMs bounds the store a VM's address is compared across: a store past
+// it is not scanned, and the network is left unmeasured.
+const maxStoreVMs = 256
+
 // addressIsOnlyIts refuses a VM whose configured address another VM in the store
 // is configured with too, billet's or not: the bridge could have learned it from
-// either, and nothing then says which member is this VM's. A configuration
-// that cannot be read is could-not-tell, and refuses too.
-func (p *Provider) addressIsOnlyIts(name string, mac net.HardwareAddr) error {
+// either, and nothing then says which member is this VM's.
+//
+// AN ENTRY THAT CANNOT BE READ AS A VM IS COULD-NOT-TELL, and refuses: a symlink,
+// a directory with no configuration (its compute is not proved stopped by the
+// file's absence), or one that is not a small regular file.
+func (p *Provider) addressIsOnlyIts(ctx context.Context, name string, mac net.HardwareAddr) error {
 	entries, err := os.ReadDir(filepath.Join(p.home, "vms"))
 	if err != nil {
 		return fmt.Errorf("list the VMs in the store: %w", err)
 	}
+	if len(entries) > maxStoreVMs {
+		return fmt.Errorf("the store holds %d entries, more than the %d a VM's address is compared across",
+			len(entries), maxStoreVMs)
+	}
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		other := e.Name()
-		if other == name || !e.IsDir() {
+		if other == name {
+			continue
+		}
+		if e.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("the store's %s is a symlink, so whose address it holds could not be told", other)
+		}
+		if !e.IsDir() {
 			continue
 		}
 		theirs, err := p.vmMAC(other)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
 		if err != nil {
 			return fmt.Errorf("could not tell whether %s shares %s's address: %w", other, name, err)
 		}
@@ -308,9 +333,44 @@ func (p *Provider) addressIsOnlyIts(name string, mac net.HardwareAddr) error {
 	return nil
 }
 
-// vmMAC is the hardware address tart gave a VM, from its config.json.
+// vmsAreTheNodes refuses when a Virtualization.framework VM on the host runs as
+// another account than the node's: its store is one billet cannot read, so an
+// address it shares with this VM would not be seen.
+func (p *Provider) vmsAreTheNodes(ctx context.Context) error {
+	// #nosec G204 -- the binary and its arguments are fixed. No shell.
+	cmd := exec.CommandContext(ctx, p.ps, "-axo", "uid=,args=")
+	cmd.WaitDelay = commandWaitDelay
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("list the host's processes: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	for line := range strings.Lines(stdout.String()) {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[1] != vmService {
+			continue
+		}
+		uid, err := strconv.Atoi(f[0])
+		if err != nil {
+			return fmt.Errorf("ps answered a line billet cannot read: %q", strings.TrimSpace(line))
+		}
+		if uid != p.uid {
+			return fmt.Errorf("a VM on this host runs as uid %d, not the node's %d, and its addresses cannot be read",
+				uid, p.uid)
+		}
+	}
+
+	return nil
+}
+
+// maxVMConfig bounds a VM's config.json, a few hundred bytes as tart writes it.
+const maxVMConfig = 64 << 10
+
+// vmMAC is the hardware address tart gave a VM, from its config.json, read as a
+// small regular file and never through a symlink.
 func (p *Provider) vmMAC(name string) (net.HardwareAddr, error) {
-	raw, err := os.ReadFile(filepath.Join(p.vmDir(name), "config.json"))
+	raw, err := regularfile.ReadFile(filepath.Join(p.vmDir(name), "config.json"), maxVMConfig,
+		regularfile.Options{NoFollow: true})
 	if err != nil {
 		return nil, fmt.Errorf("read %s's configuration: %w", name, err)
 	}

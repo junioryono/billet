@@ -1,6 +1,7 @@
 package tart
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,9 @@ type network struct {
 	sockets map[string]string
 	ps      string
 	tables  map[string]string
+	// owners is `ps -axo uid=,args=`; empty is a host whose only VM is this one,
+	// the node account's.
+	owners string
 }
 
 // withNetwork gives h's VM and host the network n describes.
@@ -67,7 +71,14 @@ func (h usageHost) withNetwork(t *testing.T, n network) {
 	lsof.WriteString("  *\"-F n\"*) exit 1 ;;\nesac\nexec " + h.p.lsof + " \"$@\"\n")
 	h.p.lsof = write("lsof", lsof.String())
 
-	h.p.ps = write("ps", "#!/bin/sh\n[ \"$*\" = '-axo pid=,ppid=,args=' ] || exit 2\nprintf '%s' '"+n.ps+"'\n")
+	owners := n.owners
+	if owners == "" {
+		owners = fmt.Sprintf("%d %s\n", os.Getuid(), vmService)
+	}
+	h.p.ps = write("ps", "#!/bin/sh\ncase \"$*\" in\n"+
+		"  '-axo pid=,ppid=,args=') printf '%s' '"+n.ps+"' ;;\n"+
+		"  '-axo uid=,args=') printf '%s' '"+owners+"' ;;\n"+
+		"  *) exit 2 ;;\nesac\n")
 
 	var ifconfig strings.Builder
 	ifconfig.WriteString("#!/bin/sh\ncase \"$1 $2\" in\n")

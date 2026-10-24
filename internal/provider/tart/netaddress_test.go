@@ -3,6 +3,7 @@ package tart
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/provider"
@@ -11,7 +12,8 @@ import (
 // AN ADDRESS ANOTHER VM IN THE STORE IS CONFIGURED WITH IS NO VM'S DEVICE: a clone
 // keeps its image's address, so the bridge's one entry for it could be the other
 // VM's link, and the network is left unmeasured. Another VM with an address of
-// its own, or a directory with no configuration, changes nothing.
+// its own changes nothing; a directory with no configuration, or one that cannot
+// be read, is could-not-tell.
 func TestAnAddressAnotherVMSharesNamesNoDevice(t *testing.T) {
 	t.Parallel()
 
@@ -21,8 +23,10 @@ func TestAnAddressAnotherVMSharesNamesNoDevice(t *testing.T) {
 	}{
 		"another VM is configured with the same address": {config: `{"macAddress":"` + sharedMAC + `"}`},
 		"another VM has an address of its own":           {config: `{"macAddress":"02:00:00:00:00:09"}`, measured: true},
-		"another directory holds no configuration":       {measured: true},
-		"another VM's configuration cannot be read":      {config: `{`},
+		"another directory holds no configuration":       {},
+		"another VM's configuration does not parse":      {config: `{`},
+		"another VM's configuration is too large": {config: `{"macAddress":"02:00:00:00:00:09","pad":"` +
+			strings.Repeat("x", 64<<10) + `"}`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
