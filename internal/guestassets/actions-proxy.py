@@ -60,6 +60,8 @@ import re
 import select
 import signal
 import socket
+import struct
+import sys
 import threading
 import time
 import urllib.parse
@@ -165,6 +167,13 @@ BODY_UNREAD = "unread"
 # Marks every response the adapter composes itself rather than relays, so a reader
 # can tell one from the same status returned by GitHub.
 ADAPTER_REFUSED_HEADER = "X-Billet-Cache-Adapter"
+# How long, and over how many descriptors, the npm passthrough looks for the
+# process at the other end of a connection before it stops looking and relays the
+# connection to the registry. A guest has a few hundred descriptors a process of
+# the runner's can read (376 in a job on 2026-10-23), so this is never reached in
+# the ordinary case and only bounds a guest with far more.
+PEER_SCAN_SECONDS = 0.25
+PEER_SCAN_DESCRIPTORS = 20000
 # What a non-blocking read raises when the record it consumed held no application
 # data. Built here because the ssl import is optional: the passthrough runs
 # without it, and the adapter refuses to start without it.
@@ -641,7 +650,120 @@ def handle_adapter(client, upstream, fallback, ca_file, origin):
             peer.close()
 
 
-def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY):
+def proc_address(address):
+    """An address as /proc/net/tcp{,6} spells it: each 32-bit word of it in host
+    order, eight hex digits each, then the port, four. An IPv4 peer of an IPv6
+    socket is the mapped address in the tcp6 table."""
+    host, port = address[0], address[1]
+    packed = socket.inet_pton(socket.AF_INET6 if ":" in host else socket.AF_INET, host)
+    words = struct.unpack("<%dI" % (len(packed) // 4), packed)
+    return "".join("%08X" % word for word in words) + ":%04X" % port
+
+
+def mapped(host):
+    """The IPv4-mapped IPv6 spelling of an IPv4 address."""
+    return "::ffff:" + host
+
+
+def guest_process(client, proc="/proc", now=time.monotonic):
+    """Whether the process at the other end of client is one of the guest's own,
+    and what was found, for the log.
+
+    THE GUEST'S OWN IS WHAT TRUSTS THE NODE. A step on the guest has the bundle in
+    its environment; a container does not, whether it shares the guest's network
+    (`--network host`, which also copies the guest's /etc/hosts and so meets this
+    listener) or not, and root's tools have it only as far as sudo keeps it. So a
+    connection is the guest's own only when its socket is owned by this process's
+    user, the runner, and a process holding it shares this process's mount
+    namespace, read live from /proc/self/ns/mnt: the runner and its steps do,
+    a container's processes do not.
+
+    EVERYTHING ELSE IS COULD-NOT-TELL, AND COULD-NOT-TELL RELAYS: a socket the
+    tables do not list, a holder that exited or is not this user's to read (root,
+    or a container's), a scan that ran past its bound. A relayed connection reaches
+    the registry directly, exactly as it did without the cache; refusing it, or
+    tunnelling it to a certificate it does not trust, would fail it instead.
+    """
+    # THE BOUND COVERS ALL OF IT, the tables included, and is checked before every
+    # entry the walk reads, never after a whole directory has been listed.
+    deadline = now() + PEER_SCAN_SECONDS
+    try:
+        local = client.getsockname()
+        remote = client.getpeername()
+        ours = os.readlink(os.path.join(proc, "self/ns/mnt"))
+    except (OSError, TypeError, ValueError):
+        return False, "no peer address"
+    if not isinstance(remote, tuple):
+        return False, "no peer address"
+    # THE PEER'S SOCKET IS THE ROW WHOSE LOCAL END IS OUR REMOTE ONE. It may be an
+    # IPv4 socket in tcp, or an IPv6 one in tcp6 dialling the mapped address.
+    rows = [("net/tcp", proc_address(remote), proc_address(local))]
+    if ":" not in remote[0]:
+        rows.append(("net/tcp6", proc_address((mapped(remote[0]), remote[1])),
+                     proc_address((mapped(local[0]), local[1]))))
+    uid = inode = None
+    for table, want_local, want_remote in rows:
+        try:
+            with open(os.path.join(proc, table)) as listing:
+                next(listing, None)
+                for line in listing:
+                    if now() > deadline:
+                        return False, "scan bound reached"
+                    fields = line.split()
+                    if len(fields) > 9 and fields[1] == want_local and fields[2] == want_remote:
+                        uid, inode = int(fields[7]), fields[9]
+                        break
+        except (OSError, ValueError):
+            continue
+        if inode is not None:
+            break
+    if inode is None:
+        return False, "peer socket not listed"
+    if uid != os.getuid():
+        return False, "uid %d" % uid
+    target = "socket:[%s]" % inode
+    seen = 0
+
+    def spent():
+        # EVERY ENTRY COUNTS, a process whose descriptors cannot be read as much
+        # as a descriptor, so neither a guest of many processes nor one of many
+        # descriptors walks past the bound.
+        nonlocal seen
+        seen += 1
+        return seen > PEER_SCAN_DESCRIPTORS or now() > deadline
+
+    try:
+        processes = os.scandir(proc)
+    except OSError:
+        return False, "uid %d, processes unreadable" % uid
+    with processes:
+        for process in processes:
+            if not process.name.isdigit():
+                continue
+            if spent():
+                return False, "uid %d, scan bound reached" % uid
+            try:
+                descriptors = os.scandir(os.path.join(proc, process.name, "fd"))
+            except OSError:
+                continue
+            with descriptors:
+                for descriptor in descriptors:
+                    if spent():
+                        return False, "uid %d, scan bound reached" % uid
+                    try:
+                        if os.readlink(descriptor.path) != target:
+                            continue
+                        namespace = os.readlink(os.path.join(proc, process.name, "ns/mnt"))
+                    except OSError:
+                        continue
+                    if namespace == ours:
+                        return True, "uid %d, pid %s, namespace matched" % (uid, process.name)
+                    return False, "uid %d, pid %s, namespace %s not %s" % (
+                        uid, process.name, namespace, ours)
+    return False, "uid %d, holder not found" % uid
+
+
+def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None):
     peer = None
     try:
         # WAIT FOR THE CLIENT'S FIRST BYTE before spending a tunnel. A bare connect
@@ -652,6 +774,16 @@ def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY):
         ready, _, _ = select.select([client], [], [], CONNECT_TIMEOUT)
         if not ready or not client.recv(1, socket.MSG_PEEK):
             return
+        # ONLY A CLIENT admit VOUCHES FOR IS TUNNELLED, where one is given: the npm
+        # passthrough's, since the registry is remapped for processes that do not
+        # all trust the node. One it does not vouch for goes to the origin's own
+        # addresses, which it trusts, and is never answered here.
+        trusted = True
+        if admit is not None:
+            trusted, found = admit(client)
+            if not trusted:
+                print("relayed a connection to %s directly: %s" % (authority, found),
+                      file=sys.stderr, flush=True)
         # The node terminates TLS and decides per request whether to serve the
         # cache locally or splice the rest to GitHub. If it cannot take the tunnel
         # the client is failed OPEN to GitHub directly (direct_tunnel), never
@@ -659,11 +791,16 @@ def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY):
         # any byte this process writes to it reads as TLS corruption. Only when no
         # fallback address is known -- and only then -- is a plain close the best
         # available outcome, degrading the cache call to its ordinary miss.
-        try:
-            peer, buffered = node_tunnel(upstream, authority)
-        except (ConnectionError, OSError, UnicodeError, ValueError):
+        if trusted:
+            try:
+                peer, buffered = node_tunnel(upstream, authority)
+            except (ConnectionError, OSError, UnicodeError, ValueError):
+                if not fallback:
+                    raise
+                peer, buffered = direct_tunnel(fallback)
+        else:
             if not fallback:
-                raise
+                raise ConnectionError("no address of the origin to relay an untrusting client to")
             peer, buffered = direct_tunnel(fallback)
         # A finite timeout, not None: it bounds a sendall to a peer that has
         # stopped reading, which the idle select in relay cannot see.
@@ -832,11 +969,18 @@ def main():
     # the results protocol and the node relay none. Its fallback addresses must be
     # that origin's, resolved before the guest remapped it.
     parser.add_argument("--origin", default=RESULTS_HOST)
+    # TUNNEL ONLY THE GUEST'S OWN PROCESSES (guest_process), and relay the rest to
+    # the origin's own addresses. The npm passthrough's, because the registry is
+    # remapped for every process in the guest; never the results origin's, which
+    # dockerd and BuildKit reach as root and are served through the system store.
+    parser.add_argument("--guest-processes-only", action="store_true")
     args = parser.parse_args()
 
     if args.origin != RESULTS_HOST and args.mode != "passthrough":
         raise SystemExit("--origin names what a passthrough carries; %s carries the results origin only"
                          % args.mode)
+    if args.guest_processes_only and (args.mode != "passthrough" or args.origin == RESULTS_HOST):
+        raise SystemExit("--guest-processes-only is for a passthrough of an origin other than the results origin")
     if not ORIGIN_PATTERN.match(args.origin):
         raise SystemExit("--origin must be a host name")
     authority = args.origin + ":443"
@@ -913,7 +1057,8 @@ def main():
                 continue
             worker, arguments = handle_node_relay, (client, node_address, slots)
         else:
-            worker, arguments = handle, (client, args.upstream, fallback, authority)
+            worker, arguments = handle, (client, args.upstream, fallback, authority,
+                                         guest_process if args.guest_processes_only else None)
         # A THREAD THAT CANNOT START CLOSES ITS CONNECTION, never the process: every
         # other connection this listener carries is still worth finishing.
         try:
