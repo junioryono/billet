@@ -294,8 +294,9 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 				return fmt.Errorf("billet images pull: the kernel could not be kept: %w", kerr)
 			}
 
-			return fmt.Errorf("billet images pull: installed the kernel %s, so the node can start, and "+
-				"imported no generation: %w", kernel, err)
+			return fmt.Errorf("billet images pull: installed the kernel %s, and imported no generation: %w; "+
+				"point node.firecracker.kernel_image at that kernel if it names none yet, so the node can "+
+				"start and register", kernel, err)
 		}
 
 		plan = planCompletion(manifest, accepted)
