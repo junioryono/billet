@@ -88,19 +88,25 @@ func TestAProcessJobsEnergyIsItsShareOfTheWallWithAMeter(t *testing.T) {
 	}
 }
 
-// A READING THE SAMPLER COULD NOT TAKE LEAVES ITS JOBS' ENERGY UNMEASURED, the
-// interval it ends and the one after it alike, never charged as nothing drawn;
-// two good readings in a row are measured.
-func TestAReadingTheMeterMissedLeavesEnergyUnmeasured(t *testing.T) {
+// A READING THE SAMPLER MISSED IS FOLDED INTO THE NEXT: the good reading after it
+// shares the wall's energy across both intervals, by the trapezoid between the
+// readings either side, and the CPU counted across both, so one slow answer from
+// the plug costs no job its energy. A job that ends before a good reading follows
+// has energy no reading shared, and is unmeasured.
+func TestAReadingTheMeterMissedIsFoldedIntoTheNext(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
 		failed   []bool
 		measured bool
+		active   int64
 	}{
-		"nothing missed":                    {[]bool{false, false}, true},
-		"a failed reading":                  {[]bool{false, true}, false},
-		"a failed reading, then a good one": {[]bool{false, true, false}, false},
+		// 18 J above idle each second, the VM's half of it each time.
+		"nothing missed":   {failed: []bool{false, false}, measured: true, active: 18_000_000},
+		"a failed reading": {failed: []bool{false, true}},
+		// 9 J for the first second, then 36 J across the two the good reading
+		// spans, the VM's 3 s of the host's 6 s busy.
+		"a failed reading, then a good one": {failed: []bool{false, true, false}, measured: true, active: 27_000_000},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -114,17 +120,22 @@ func TestAReadingTheMeterMissedLeavesEnergyUnmeasured(t *testing.T) {
 				r.advance()
 			}
 
-			if s := finalOf(t, r.m); s.Measured.Energy != tc.measured {
-				t.Errorf("energy measured %v (%d µJ), want %v", s.Measured.Energy, s.EnergyActive, tc.measured)
+			s := finalOf(t, r.m)
+			if s.Measured.Energy != tc.measured {
+				t.Fatalf("energy measured %v (%d µJ), want %v", s.Measured.Energy, s.EnergyActive, tc.measured)
+			}
+			if tc.measured && s.EnergyActive != tc.active {
+				t.Errorf("active energy %d µJ, want %d", s.EnergyActive, tc.active)
 			}
 		})
 	}
 }
 
-// A JOB STARTED BETWEEN A FAILED READING AND THE NEXT GOOD ONE HAS ITS FIRST
-// INTERVAL UNKNOWN: no reading begins it, so the good one alone cannot say what
-// was drawn across it.
-func TestAJobStartedDuringAStallHasItsFirstIntervalUnknown(t *testing.T) {
+// A JOB STARTED BETWEEN A FAILED READING AND THE NEXT GOOD ONE IS SHARED THE SPAN
+// BY ITS CPU: the good reading's span begins at the last good one, before the job,
+// and the job's share is its CPU since its own start, so it is given nothing it
+// did not use; its idle share is for the part of the span it existed.
+func TestAJobStartedDuringAStallIsSharedTheSpanByItsCPU(t *testing.T) {
 	t.Parallel()
 
 	r := newMeterRun(t)
@@ -134,9 +145,34 @@ func TestAJobStartedDuringAStallHasItsFirstIntervalUnknown(t *testing.T) {
 	*r.wattsErr = nil
 	r.advance()
 
-	if s, ok := r.m.Final("late"); !ok || s.Measured.Energy {
-		t.Errorf("a job started during the stall measured %v (%d µJ), want its energy unmeasured",
-			s.Measured.Energy, s.EnergyActive)
+	s, ok := r.m.Final("late")
+	if !ok || !s.Measured.Energy {
+		t.Fatalf("a job started during the stall measured %v (%v), want its share", s.Measured.Energy, ok)
+	}
+	// 36 J above idle across the 2 s span, by its 1.5 s of the host's 6 s busy.
+	if s.EnergyActive != 9_000_000 {
+		t.Errorf("active energy %d µJ, want 9000000", s.EnergyActive)
+	}
+	// 2 W of idle for the 1 s of the 2 s span it existed, on 6 of 18 cpus.
+	if s.EnergyIdle != 666_666 {
+		t.Errorf("idle energy %d µJ, want 666666", s.EnergyIdle)
+	}
+}
+
+// A STALL OF THREE INTERVALS OR MORE IS NOT BRIDGED: the trapezoid across it is a
+// guess, so every job sampled through it is unmeasured.
+func TestAStallOfThreeIntervalsIsNotBridged(t *testing.T) {
+	t.Parallel()
+
+	r := newMeterRun(t)
+	*r.wattsErr = errors.New("the plug did not answer")
+	r.advance()
+	r.advance()
+	*r.wattsErr = nil
+	r.advance()
+
+	if s := finalOf(t, r.m); s.Measured.Energy {
+		t.Errorf("energy across a 3 s stall measured %d µJ, want it unmeasured", s.EnergyActive)
 	}
 }
 
