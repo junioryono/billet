@@ -3,6 +3,7 @@ package usage
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -216,9 +217,10 @@ func TestTheWallIsSharedOverTheIntervalItsReadingsSpan(t *testing.T) {
 	}
 }
 
-// A JOB WHOSE READ ENDS WELL AFTER THE HOST'S IS NOT SHARED THE INTERVAL: its CPU
-// runs past the one the plug and the host were read across. A read a little
-// after the host's, as every job's is, still is.
+// A JOB WHOSE CPU IS READ WELL AFTER THE HOST'S IS NOT SHARED THE INTERVAL: its
+// CPU runs past the one the plug and the host were read across, whether its own
+// read was slow or it waited behind another job's. Its other usage is measured
+// as ever; a CPU read a little after the host's, as every job's is, is shared.
 func TestAJobReadLongAfterTheHostIsNotSharedTheInterval(t *testing.T) {
 	t.Parallel()
 
@@ -226,18 +228,45 @@ func TestAJobReadLongAfterTheHostIsNotSharedTheInterval(t *testing.T) {
 		50 * time.Millisecond:  true,
 		300 * time.Millisecond: false,
 	} {
-		r := newMeterRun(t)
-		process := r.m.reader.Process
-		r.m.reader.Process = func(pid int) (ProcessCounters, error) {
-			*r.now = r.now.Add(late)
+		tr := newTree(t)
+		tr.write("/proc/stat", procStat(1000, 9000))
+		now := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
+		m := runMonitor(t, tr.root, Options{Interval: time.Second, IdleWatts: 2,
+			Meter: func() (float64, error) { return 20, nil },
+			Now:   func() time.Time { return now }})
+		// TWO VMS, AND WHICHEVER IS READ FIRST IN A TICK TAKES late: the second
+		// answers at once, after waiting behind it.
+		cpu := map[int]int64{1: 0, 2: 0}
+		var delayed bool
+		m.reader.Process = func(pid int) (ProcessCounters, error) {
+			c := refVMProcess
+			c.UserMicros, c.SystemMicros = cpu[pid], 0
+			if !delayed {
+				delayed = true
+				now = now.Add(late)
+			}
 
-			return process(pid)
+			return c, nil
 		}
-		r.advance()
+		m.Tick()
+		m.Start("vm1", Target{PID: 1, PIDStart: refVMProcess.Start, Process: true}, 6)
+		m.Start("vm2", Target{PID: 2, PIDStart: refVMProcess.Start, Process: true}, 6)
 
-		if s := finalOf(t, r.m); s.Measured.Energy != measured {
-			t.Errorf("a read %s after the host's measured %v (%d µJ), want %v",
-				late, s.Measured.Energy, s.EnergyActive, measured)
+		now = now.Add(time.Second)
+		tr.write("/proc/stat", procStat(1300, 10500))
+		cpu[1], cpu[2] = 1_000_000, 1_000_000
+		delayed = false
+		m.Tick()
+
+		for _, key := range []string{"vm1", "vm2"} {
+			s, ok := m.Final(key)
+			if !ok || !s.Measured.CPU {
+				t.Fatalf("%s's CPU was not measured (%v)", key, ok)
+			}
+			if s.Measured.Energy != measured {
+				t.Errorf("with the first read %s after the host's, %s measured energy %v (%d µJ), want %v",
+					late, key, s.Measured.Energy, s.EnergyActive, measured)
+			}
 		}
 	}
 }
@@ -299,5 +328,40 @@ func TestALongGapBetweenGoodReadingsIsUnknown(t *testing.T) {
 	if s, ok := r.m.Final("late"); !ok || s.Measured.Energy {
 		t.Errorf("a job started near the end of a 10 s gap measured %v (%d µJ), want its energy unmeasured",
 			s.Measured.Energy, s.EnergyActive)
+	}
+}
+
+// A JOB WHOSE CPU IS READ ON TIME IS SHARED THE INTERVAL however long the groups
+// read after it take: a VM's memory answering 300 ms late moves nothing its CPU
+// was counted to.
+func TestASlowReadAfterAJobsCPUStillSharesTheInterval(t *testing.T) {
+	t.Parallel()
+
+	tr, target := referenceVM(t)
+	tr.write("/proc/stat", procStat(1000, 9000))
+	now := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, IdleWatts: 2,
+		Meter: func() (float64, error) { return 20, nil },
+		Now:   func() time.Time { return now }})
+	var slow bool
+	m.reader.ReadFile = func(name string) ([]byte, error) {
+		if slow && strings.HasSuffix(name, "/memory.current") {
+			now = now.Add(300 * time.Millisecond)
+		}
+
+		return os.ReadFile(name)
+	}
+	m.Tick()
+	m.Start("vm", target, 6)
+
+	now = now.Add(time.Second)
+	tr.write("/proc/stat", procStat(1300, 10500))
+	tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 63338613", 1))
+	slow = true
+	m.Tick()
+	slow = false
+
+	if s := finalOf(t, m); !s.Measured.Energy {
+		t.Error("a VM whose memory answered late after its CPU measured no energy; want its share")
 	}
 }

@@ -333,7 +333,7 @@ func (m *Monitor) start(key string, j *job) {
 	// THE BASELINE HOLDS THE TIME ITS READ ENDED, as every point does, and a
 	// read that took a whole interval leaves the first interval unseen.
 	began := m.opts.Now()
-	s, vcpus := m.reader.readListing(j.target)
+	s, vcpus := m.reader.readListing(j.target, nil)
 	now := m.opts.Now()
 	var counters *Counters
 	if m.opts.Counters != nil && !j.resumed && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" &&
@@ -467,10 +467,13 @@ func (m *Monitor) tick() {
 	// stalls must not have its counters backdated to the tick's start, where
 	// they would land in the interval before the stall.
 	readAt := make(map[string]time.Time, len(snapshot))
+	// WHEN EACH JOB'S CPU WAS READ, which is what its energy share is judged by:
+	// the groups read after it do not move the CPU it was counted to.
+	cpuAt := make(map[string]time.Time, len(snapshot))
 	stalled := make(map[string]bool, len(snapshot))
 	for key, j := range snapshot {
 		began := m.opts.Now()
-		s, vcpus := m.reader.readListing(j.target)
+		s, vcpus := m.reader.readListing(j.target, func() { cpuAt[key] = m.opts.Now() })
 		samples[key] = &s
 		readAt[key] = m.opts.Now()
 		stalled[key] = readAt[key].Sub(began) >= m.opts.Interval
@@ -527,7 +530,7 @@ func (m *Monitor) tick() {
 		// A READ THAT ENDED WELL AFTER THE HOST'S is not measured, and nor is
 		// one held up behind another job's slow read: its CPU runs past the
 		// interval the host's busy time and the energy were read across.
-		if !s.CPUOK || !j.lastCPUOK || readAt[key].Sub(now) > time.Duration(lateAfter*float64(m.opts.Interval)) {
+		if !s.CPUOK || !j.lastCPUOK || cpuAt[key].Sub(now) > time.Duration(lateAfter*float64(m.opts.Interval)) {
 			continue
 		}
 		d := s.CPUUsage - j.lastCPU
@@ -888,7 +891,7 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	}
 
 	began := m.opts.Now()
-	s, vcpus := m.reader.readListing(j.target)
+	s, vcpus := m.reader.readListing(j.target, nil)
 	now := m.opts.Now()
 	// THE GROUPS CLOSE AT FINAL, which precedes the destroy: what they counted
 	// is kept, and a Final asked again answers the same totals.

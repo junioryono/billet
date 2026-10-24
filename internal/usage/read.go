@@ -106,7 +106,7 @@ func (r Reader) read(p string) (string, error) {
 // group reports its own verdict, because a host without the memory controller
 // still has CPU time worth reporting.
 func (r Reader) Read(t Target) Sample {
-	s, _ := r.readListing(t)
+	s, _ := r.readListing(t, nil)
 
 	return s
 }
@@ -119,14 +119,22 @@ type vcpuThread struct {
 }
 
 // readListing is Read, and the VMM's vCPU threads the sample's thread split was
-// read from: nil unless ThreadsOK.
-func (r Reader) readListing(t Target) (Sample, []vcpuThread) {
+// read from: nil unless ThreadsOK. cpuRead, if set, is called as soon as the CPU
+// is read, before the groups that follow it.
+func (r Reader) readListing(t Target, cpuRead func()) (Sample, []vcpuThread) {
 	var s Sample
 	if t.Process {
 		s.readProcess(r, t)
+		if cpuRead != nil {
+			cpuRead()
+		}
+
 		return s, nil
 	}
 	s.readCPU(r, t)
+	if cpuRead != nil {
+		cpuRead()
+	}
 	s.readMemory(r, t)
 	s.readIO(r, t)
 	s.readPressure(r, t)
