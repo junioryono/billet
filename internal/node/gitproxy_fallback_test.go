@@ -190,11 +190,7 @@ func TestARefreshHoldsNoJobPastItsWait(t *testing.T) {
 	// mirror's refreshing mark, which a refresh that failed to join another
 	// would overwrite. The refreshes are counted as well as the fetches,
 	// because a second refresh behind the mirror's lock finds nothing to fetch.
-	gitWithin(t, "every refresh the jobs started", func() struct{} {
-		service.git.background.Wait()
-
-		return struct{}{}
-	})
+	gitSettled(t, service, "every refresh the jobs started")
 	if got := upstream.mirrorFetches.Load(); got != 1 {
 		t.Fatalf("the node made %d mirror fetches for %d jobs, want one refresh they shared", got, jobs)
 	}

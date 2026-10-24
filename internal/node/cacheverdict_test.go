@@ -23,13 +23,26 @@ import (
 // lastNpm waits for the observer to have been told an npm verdict and answers
 // the latest; a verdict a request in flight left for later arrives after its
 // handler returns.
-func lastNpm(t *testing.T, observer *recordingObserver) alloc.BuildCache {
+func lastNpm(t *testing.T, service *CacheService, credentials CacheCredentials, observer *recordingObserver,
+) alloc.BuildCache {
 	t.Helper()
 
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
 		calls := observer.recorded()
 		for i := len(calls) - 1; i >= 0; i-- {
 			if calls[i].obs.Npm != "" {
+				// RETURNED ONCE ITS REPORTER HAS LET GO OF THE SESSION. The
+				// verdict is told under session.mu, and the request that tells it
+				// records that it was reported in the session's file before
+				// unlocking, so a test that ended at the telling had its
+				// directory removed under that write (#188, CI 2026-10-23).
+				if session := npmSession(service, credentials); session != nil {
+					if held := heldNpm(session); held != string(calls[i].obs.Npm) {
+						t.Fatalf("the session holds the npm verdict %q, and the plane was told %q", held,
+							calls[i].obs.Npm)
+					}
+				}
+
 				return calls[i].obs.Npm
 			}
 		}
@@ -44,6 +57,15 @@ func npmSession(service *CacheService, credentials CacheCredentials) *cacheSessi
 	defer service.mu.Unlock()
 
 	return service.byToken[credentials.Token]
+}
+
+// heldNpm is the npm verdict the session holds, read once whoever holds its
+// lock has let go of it.
+func heldNpm(session *cacheSession) string {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	return session.observed.NpmCache
 }
 
 // AN EARLIER COLD REQUEST DOES NOT SETTLE THE NPM CACHE WHILE A WARM ONE IS
@@ -107,7 +129,7 @@ func TestAnEarlierColdRequestDoesNotSettleTheNpmCacheBeforeAWarmOneEnds(t *testi
 		t.Fatalf("the HEAD was never answered: %v", err)
 	}
 	_ = resp.Body.Close()
-	if got := lastNpm(t, observer); got != alloc.BuildCacheWarm {
+	if got := lastNpm(t, service, credentials, observer); got != alloc.BuildCacheWarm {
 		t.Fatalf("the npm cache was reported %q after the warm request ended, want warm", got)
 	}
 }
@@ -171,7 +193,7 @@ func TestAGuestThatRefusesTheNodesCertificateFindsTheNpmCacheUnavailable(t *test
 	if err := service.Close(t.Context(), "billet-lease-npm"); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if got := lastNpm(t, observer); got != alloc.BuildCacheUnavailable {
+	if got := lastNpm(t, service, credentials, observer); got != alloc.BuildCacheUnavailable {
 		t.Fatalf("the npm cache was reported %q, want unavailable", got)
 	}
 }
