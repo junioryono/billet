@@ -772,7 +772,7 @@ func TestTheNpmOutcomeIsReportedWhenTheSessionEnds(t *testing.T) {
 		}
 		// A SPLICE STILL ENDING WHEN THE SESSION CLOSED reports the verdict itself,
 		// a moment later.
-		if got := lastNpm(t, observer); got != tc.want {
+		if got := lastNpm(t, service, credentials, observer); got != tc.want {
 			t.Errorf("%s: the npm cache reported %q, want %q", name, got, tc.want)
 		}
 	}
@@ -864,7 +864,7 @@ func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T
 			}
 		}
 		// WHAT THE REQUEST GOT IS REPORTED ONCE IT ENDS, by the request itself.
-		if got := lastNpm(t, observer); got != alloc.BuildCacheCold {
+		if got := lastNpm(t, service, credentials, observer); got != alloc.BuildCacheCold {
 			t.Errorf("%s: after the request ended the npm cache was reported %q, want cold", held, got)
 		}
 	}
@@ -950,7 +950,7 @@ func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t
 		}
 	}
 	// WHAT THE HEAD GOT IS REPORTED ONCE IT ENDS, by the request itself.
-	if got := lastNpm(t, observer); got != alloc.BuildCacheWarm {
+	if got := lastNpm(t, service, credentials, observer); got != alloc.BuildCacheWarm {
 		t.Errorf("after the HEAD ended the npm cache was reported %q, want warm", got)
 	}
 }
