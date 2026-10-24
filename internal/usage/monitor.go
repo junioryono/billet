@@ -198,6 +198,10 @@ type job struct {
 	// not opened and its package energy is broken, since neither was counted
 	// before it. carried says its series so far came from a checkpoint.
 	resumed, carried bool
+	// cpuFrom is when the baseline's CPU was read, which the energy checks count
+	// from: first is when the whole baseline ended, and the groups read after
+	// the CPU can take intervals.
+	cpuFrom time.Time
 	// untaken is a pending job whose baseline request Run never took, busy past
 	// the limit on a read: the next tick takes the baseline instead, so the job
 	// is not left unsampled for the rest of its life.
@@ -333,7 +337,8 @@ func (m *Monitor) start(key string, j *job) {
 	// THE BASELINE HOLDS THE TIME ITS READ ENDED, as every point does, and a
 	// read that took a whole interval leaves the first interval unseen.
 	began := m.opts.Now()
-	s, vcpus := m.reader.readListing(j.target, nil)
+	var cpuAt time.Time
+	s, vcpus := m.reader.readListing(j.target, func() { cpuAt = m.opts.Now() })
 	now := m.opts.Now()
 	var counters *Counters
 	if m.opts.Counters != nil && !j.resumed && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" &&
@@ -361,7 +366,7 @@ func (m *Monitor) start(key string, j *job) {
 		j.unseen = GapNone
 	}
 	j.counters = counters
-	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
+	j.lastCPU, j.lastCPUOK, j.cpuFrom = s.CPUUsage, s.CPUOK, cpuAt
 	if now.Sub(began) >= m.opts.Interval {
 		j.see(GapSlowRead)
 	}
@@ -558,15 +563,15 @@ func (m *Monitor) tick() {
 		if m.shares() && !j.byProcess {
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
-			// of the last tick and the job's own baseline.
+			// of the last tick and the job's own baseline CPU.
 			missed := !m.lastTick.IsZero() &&
-				now.Sub(maxTime(m.lastTick, j.first)) >= staleAfter*m.opts.Interval
+				now.Sub(maxTime(m.lastTick, j.cpuFrom)) >= staleAfter*m.opts.Interval
 			if !consistent || !measured || missed {
 				j.energyBroken = true
 			} else {
 				j.energyActive += activePool * min(float64(d)/float64(busyDelta), 1)
 				// IDLE ONLY FOR THE PART OF THE INTERVAL THE JOB EXISTED.
-				overlap := now.Sub(maxTime(m.lastTick, j.first))
+				overlap := now.Sub(maxTime(m.lastTick, j.cpuFrom))
 				if overlap > 0 {
 					j.energyIdle += idlePool * (overlap.Seconds() / dt.Seconds()) *
 						float64(j.vcpus) / idleDenominator

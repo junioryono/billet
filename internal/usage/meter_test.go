@@ -331,37 +331,75 @@ func TestALongGapBetweenGoodReadingsIsUnknown(t *testing.T) {
 	}
 }
 
-// A JOB WHOSE CPU IS READ ON TIME IS SHARED THE INTERVAL however long the groups
-// read after it take: a VM's memory answering 300 ms late moves nothing its CPU
-// was counted to.
-func TestASlowReadAfterAJobsCPUStillSharesTheInterval(t *testing.T) {
+// A CGROUP JOB IS JUDGED BY WHEN ITS CPU WAS READ: a VM whose cpu.stat answers
+// 300 ms after the host's is not shared the interval, and one whose memory,
+// read after its CPU, answers as late still is.
+func TestACgroupJobIsJudgedByWhenItsCPUWasRead(t *testing.T) {
 	t.Parallel()
 
-	tr, target := referenceVM(t)
-	tr.write("/proc/stat", procStat(1000, 9000))
-	now := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
-	m := runMonitor(t, tr.root, Options{Interval: time.Second, IdleWatts: 2,
-		Meter: func() (float64, error) { return 20, nil },
-		Now:   func() time.Time { return now }})
-	var slow bool
-	m.reader.ReadFile = func(name string) ([]byte, error) {
-		if slow && strings.HasSuffix(name, "/memory.current") {
-			now = now.Add(300 * time.Millisecond)
+	for file, measured := range map[string]bool{"/cpu.stat": false, "/memory.current": true} {
+		tr, target := referenceVM(t)
+		tr.write("/proc/stat", procStat(1000, 9000))
+		now := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
+		m := runMonitor(t, tr.root, Options{Interval: time.Second, IdleWatts: 2,
+			Meter: func() (float64, error) { return 20, nil },
+			Now:   func() time.Time { return now }})
+		var slow bool
+		m.reader.ReadFile = func(name string) ([]byte, error) {
+			if slow && strings.HasSuffix(name, file) {
+				now = now.Add(300 * time.Millisecond)
+			}
+
+			return os.ReadFile(name)
 		}
+		m.Tick()
+		m.Start("vm", target, 6)
 
-		return os.ReadFile(name)
+		now = now.Add(time.Second)
+		tr.write("/proc/stat", procStat(1300, 10500))
+		tr.write(refCgroup+"/cpu.stat",
+			strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 63338613", 1))
+		slow = true
+		m.Tick()
+		slow = false
+
+		if s := finalOf(t, m); s.Measured.Energy != measured {
+			t.Errorf("a VM whose %s answered 300 ms late measured energy %v (%d µJ), want %v",
+				file, s.Measured.Energy, s.EnergyActive, measured)
+		}
 	}
-	m.Tick()
-	m.Start("vm", target, 6)
+}
 
-	now = now.Add(time.Second)
-	tr.write("/proc/stat", procStat(1300, 10500))
-	tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 63338613", 1))
-	slow = true
-	m.Tick()
-	slow = false
+// A BASELINE WHOSE LATER GROUPS TAKE THREE INTERVALS LEAVES THE GAP UNKNOWN: the
+// job's CPU was read at its start, and the time to the next tick is counted from
+// then, not from when its memory answered. RAPL's, since a meter refuses so long
+// a gap between its own readings anyway; a baseline that is only a little slow
+// is measured.
+func TestASlowBaselineDoesNotHideAGap(t *testing.T) {
+	t.Parallel()
 
-	if s := finalOf(t, m); !s.Measured.Energy {
-		t.Error("a VM whose memory answered late after its CPU measured no energy; want its share")
+	for slow, measured := range map[time.Duration]bool{
+		100 * time.Millisecond: true,
+		31 * time.Second:       false,
+	} {
+		h := newEnergyHost(t, 73.5)
+		var slowing bool
+		h.m.reader.ReadFile = func(name string) ([]byte, error) {
+			if slowing && strings.HasSuffix(name, "/memory.current") {
+				*h.now = h.now.Add(slow)
+			}
+
+			return os.ReadFile(name)
+		}
+		slowing = true
+		h.m.Start("vm", h.target, 8)
+		slowing = false
+		h.advance(100*time.Millisecond, "69571715")
+		h.m.Tick()
+
+		if s := finalOf(t, h.m); s.Measured.Energy != measured {
+			t.Errorf("a job whose baseline's memory took %s measured energy %v (%d µJ), want %v",
+				slow, s.Measured.Energy, s.EnergyActive, measured)
+		}
 	}
 }
