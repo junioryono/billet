@@ -1,6 +1,7 @@
 package images
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -140,6 +141,13 @@ func TestWhatCannotBeToldRefusesRatherThanInstallLess(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "has not recorded what its control plane accepts"},
+		"no record, a certificate beside a server section": {func(t *testing.T, cfg *config.Config, _ string) {
+			t.Helper()
+
+			// A NODE WITH A CERTIFICATE MAY DIAL ANOTHER MACHINE'S CONTROL PLANE, so
+			// the server section in its file is not proved to be its own.
+			cfg.Node.TLS = &config.NodeTLS{CertPath: "node.crt", KeyPath: "node.key", CAPath: "ca.crt"}
+		}, "has not recorded what its control plane accepts"},
 		"a record that does not parse": {func(t *testing.T, _ *config.Config, nodeDir string) {
 			t.Helper()
 
@@ -241,6 +249,42 @@ func TestAPullCompletesWithWhatOnlyTheControlPlaneAccepts(t *testing.T) {
 
 	if got := run.fixture.publisher.last().components; got == nil || got.Installed["google-chrome"] != "155.0.8059.84" {
 		t.Fatalf("the generation records %+v", got)
+	}
+}
+
+// A PULL WHOSE ACCEPTANCE CHANGED DURING ITS COMPLETION IMPORTS NOTHING: the
+// control plane withdraws google-chrome while the image is being completed with
+// it, and the completed image is not published.
+func TestAPullWhoseAcceptanceChangedDuringItsCompletionImportsNothing(t *testing.T) {
+	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
+	run := newCompletionPull(t, "", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+	recordFor(t, run.fixture.cfgPath, "google-chrome")
+
+	// THE WITHDRAWAL LANDS WHILE THE IMAGE IS ATTACHED, which is during the
+	// completion; newCompletionPull's cleanup restores the seam.
+	nodeDir := filepath.Join(filepath.Dir(run.fixture.cfgPath), "node")
+	attach := attachLoop
+	attachLoop = func(ctx context.Context, path string) (string, func(context.Context) error, error) {
+		if err := imageaccept.Write(nodeDir, acceptanceDeployment, true, nil, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+
+		return attach(ctx, path)
+	}
+
+	err := run.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "changed while ubuntu-2404-x64 was completed, from "+
+		"[google-chrome] to [], so nothing was imported") {
+		t.Fatalf("images pull answered %v, want it to import nothing", err)
+	}
+
+	if len(run.backend.launched) != 1 {
+		t.Fatalf("the completion ran %d times, want once before the acceptance was asked again",
+			len(run.backend.launched))
+	}
+
+	if got := run.fixture.publisher.calls(); got != 0 {
+		t.Fatalf("ImportGeneration was reached %d times, want never", got)
 	}
 }
 

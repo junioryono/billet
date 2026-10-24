@@ -30,8 +30,10 @@ var errAcceptanceUnknown = errors.New("this node has not recorded what its contr
 // an image without what the deployment accepted. That is a record that cannot be
 // read, a deployment that cannot be told, a name this build does not install
 // (validateImages' reason), and no record of this deployment's control plane on
-// a node that dials one elsewhere. A node whose file describes the control plane
-// beside it reads that control plane's list in its own file, so it needs none.
+// a node that may dial one elsewhere. A node with no certificate dials only this
+// machine (config's node.tls rule), so when its file also describes a control
+// plane, that is its control plane, whose list is in the same file and needs no
+// record; a server section beside a node with a certificate proves nothing.
 func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	accepted := cfg.Images.Accepted()
 	if cfg.Node == nil {
@@ -61,7 +63,7 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	}
 
 	switch {
-	case !ok && cfg.Server != nil:
+	case !ok && cfg.Server != nil && cfg.Node.TLS == nil:
 		return accepted, nil
 	case !ok:
 		return nil, errAcceptanceUnknown

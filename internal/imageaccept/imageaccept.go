@@ -64,6 +64,9 @@ var install = func(dir, name string, write func(io.Writer) error) (string, error
 	return durablefile.Installer{}.Install(dir, name, 0o600, write)
 }
 
+// syncDir flushes the directory a removal changed, a seam so a test can fail it.
+var syncDir = durablefile.Installer{}.SyncDirectory
+
 // Write records what the control plane of deployment accepts, or that it does
 // not say when carried is false, replacing any earlier record whole. An
 // interruption leaves the previous record intact, so a caller whose write failed
@@ -112,8 +115,20 @@ func Write(stateDir, deployment string, carried bool, components []string, at ti
 // they cannot tell rather than read an earlier answer. A record already absent is
 // not an error.
 func Remove(stateDir string) error {
-	if err := os.Remove(Path(stateDir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	err := os.Remove(Path(stateDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
 		return fmt.Errorf("remove the deployment's image acceptance from %s: %w", stateDir, err)
+	}
+
+	// THE REMOVAL IS DURABLE BEFORE IT IS REPORTED, or a crash brings back the
+	// answer it withdrew for the refresh timer to read before the node registers.
+	if err := syncDir(stateDir); err != nil {
+		return fmt.Errorf("make the removal of the deployment's image acceptance durable in %s: %w",
+			stateDir, err)
 	}
 
 	return nil

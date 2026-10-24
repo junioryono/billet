@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -299,6 +300,20 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		}
 		if err != nil {
 			return err
+		}
+
+		// ASKED AGAIN BEFORE THE IMPORT, which follows a completion that runs for
+		// as long as its downloads take, in which a registration may have recorded
+		// a different list or the record been withdrawn.
+		now, err := acceptedComponents(cfg)
+		if err != nil {
+			return fmt.Errorf("billet images pull: nothing was imported: %w", err)
+		}
+
+		if completed, wanted := plan.names(), planCompletion(manifest, now).names(); !slices.Equal(completed, wanted) {
+			return fmt.Errorf("billet images pull: what this deployment accepts changed while %s was "+
+				"completed, from %v to %v, so nothing was imported; the next `billet images refresh` "+
+				"completes it with what is accepted now", image, completed, wanted)
 		}
 
 		components = &ceph.GenerationComponents{LeftOut: plan.LeftOut, Installed: installed}

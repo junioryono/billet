@@ -179,4 +179,19 @@ func TestAFailedWriteLeavesTheEarlierRecordAndRemoveTakesIt(t *testing.T) {
 	if err := Remove(dir); err != nil {
 		t.Fatalf("removing an absent record answered %v", err)
 	}
+
+	// A REMOVAL NOT MADE DURABLE IS NOT REPORTED AS DONE.
+	if err := Write(dir, "dep-a", true, []string{"codeql"}, at); err != nil {
+		t.Fatal(err)
+	}
+
+	savedSync := syncDir
+	t.Cleanup(func() { syncDir = savedSync })
+
+	syncDir = func(string) error { return errors.New("fsync failed") }
+
+	if err := Remove(dir); err == nil || !strings.Contains(err.Error(), "make the removal") ||
+		!strings.Contains(err.Error(), "fsync failed") {
+		t.Fatalf("a removal whose directory sync failed answered %v", err)
+	}
 }
