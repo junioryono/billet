@@ -313,8 +313,10 @@ func (l *Listener) backPoolSlotLeaving(ctx context.Context, protect []string) er
 // whose promise sits under another alias is idle afterwards, and the release after
 // the message hands it back. Not while draining, for backPoolSlot's reason.
 func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
+	lost := l.backingLostNow()
 	if l.isDraining() {
 		l.refuse(refusal{draining: true}, false)
+		l.backedBy(requestID, refusal{draining: true}, lost)
 
 		return nil
 	}
@@ -326,6 +328,8 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	l.mu.Unlock()
 
 	if ready {
+		l.backedBy(requestID, refusal{}, lost)
+
 		return nil
 	}
 
@@ -339,7 +343,9 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	// otherwise could not say whether the order or the allocator refused (#248).
 	where := l.admission(ctx)
 	if !l.order.mayBuy(l.tier, where) {
-		l.refuse(l.orderRefusal(where), false)
+		r := l.orderRefusal(where)
+		l.refuse(r, false)
+		l.backedBy(requestID, r, lost)
 
 		return nil
 	}
@@ -353,8 +359,13 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	l.mu.Unlock()
 
 	if !bought {
-		l.refuse(l.roomRefusal(ctx, nil), false)
+		r := l.roomRefusal(ctx, nil)
+		l.refuse(r, false)
+		l.backedBy(requestID, r, lost)
+
+		return nil
 	}
+	l.backedBy(requestID, refusal{}, lost)
 
 	return nil
 }

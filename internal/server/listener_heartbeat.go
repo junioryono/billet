@@ -170,6 +170,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 			kept = append(kept, lease)
 		} else {
 			delete(l.heldOrder, lease.ID)
+			l.backingLost++
 		}
 	}
 
@@ -237,6 +238,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 			delete(l.acquiring, id)
 			delete(l.confirmed, p.lease.ID)
 			delete(l.heldOrder, p.lease.ID)
+			l.backingLost++
 		}
 	}
 

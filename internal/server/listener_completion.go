@@ -136,9 +136,7 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) (bool, bo
 	}
 
 	delete(l.cleanup, requestID)
-	delete(l.running, requestID)
-	delete(l.runningJobs, requestID)
-	delete(l.acquiring, requestID)
+	l.forgetBacking(requestID)
 
 	return true, true
 }
@@ -973,18 +971,14 @@ func (l *Listener) complete(ctx context.Context, job dispatch.Job) {
 			"until this is retried",
 			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
 
-		delete(l.running, job.RequestID)
-		delete(l.runningJobs, job.RequestID)
-		delete(l.acquiring, job.RequestID)
+		l.forgetBacking(job.RequestID)
 		l.mu.Unlock()
 
 		return
 	}
 
 	// RELEASED, so the job is finally over and there is nothing to retry.
-	delete(l.running, job.RequestID)
-	delete(l.runningJobs, job.RequestID)
-	delete(l.acquiring, job.RequestID)
+	l.forgetBacking(job.RequestID)
 	l.mu.Unlock()
 	if l.forgetCompletion(ctx, job) {
 		l.deleteCompletionCleanup(job)
