@@ -762,45 +762,65 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 		}
 	}
 
-	// AN ID REUSED WITHIN A SECOND never lends one flow's wait to the other,
-	// whatever order its events and the two destructions are read in: with two
-	// generations of the id begun within a second of a flow's start, either
-	// could be its, answered or not, and both flows are left untimed. A flow
-	// whose destruction is read before its own reply, with no reuse, is still
-	// timed, because waits are matched when the job is summarized.
+	// AN ID REUSED IS NEVER TIMED, whatever order its events and the two
+	// destructions are read in, a new event missed, or read late: two flows of
+	// one id cannot be told apart by when they began, so neither takes a wait.
+	// A flow whose destruction is read before its own reply, with no reuse, is
+	// still timed, because waits are matched when the job is summarized.
 	type step func(*Accountant)
 	first := flow(9, guest, github, 100, 100)
-	second := startedAt(flow(9, guest, npm, 100, 100), started.Add(100*time.Millisecond))
+	second := startedAt(flow(9, guest, npm, 100, 100), started.Add(400*time.Millisecond))
 	newA := func(a *Accountant) { a.ObserveNew(9, guest, started) }
 	replyA := func(a *Accountant) { a.ObserveReply(9, guest, started.Add(20*time.Millisecond)) }
 	destroyA := func(a *Accountant) { a.Observe(first) }
 	newB := func(a *Accountant) { a.ObserveNew(9, guest, second.Start) }
 	replyB := func(a *Accountant) { a.ObserveReply(9, guest, second.Start.Add(1200*time.Millisecond)) }
 	destroyB := func(a *Accountant) { a.Observe(second) }
+	lateNewA := func(a *Accountant) { a.ObserveNew(9, guest, started.Add(1200*time.Millisecond)) }
+	lateReplyA := func(a *Accountant) { a.ObserveReply(9, guest, started.Add(1220*time.Millisecond)) }
+	lateNewB := func(a *Accountant) { a.ObserveNew(9, guest, second.Start.Add(1200*time.Millisecond)) }
 	for name, tc := range map[string]struct {
-		steps []step
-		timed map[netip.Addr]time.Duration
+		beforeWatch, steps []step
+		want               map[netip.Addr]time.Duration // the destinations returned, and their wait or 0
+		timed              netip.Addr
 	}{
-		"A destroyed before the reuse": {steps: []step{newA, replyA, destroyA, newB, replyB, destroyB}},
-		"A destroyed after B's reply":  {steps: []step{newA, replyA, newB, replyB, destroyA, destroyB}},
-		"B destroyed before its reply": {steps: []step{newA, replyA, destroyA, newB, destroyB, replyB}},
-		"B never answered, A after":    {steps: []step{newA, replyA, newB, destroyA}},
+		"A destroyed before the reuse": {steps: []step{newA, replyA, destroyA, newB, replyB, destroyB},
+			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
+		"A destroyed after B's reply": {steps: []step{newA, replyA, newB, replyB, destroyA, destroyB},
+			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
+		"B destroyed before its reply": {steps: []step{newA, replyA, destroyA, newB, destroyB, replyB},
+			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
+		"B never answered, A after": {steps: []step{newA, replyA, newB, destroyA},
+			want: map[netip.Addr]time.Duration{github: 0}},
+		"A's new event missed, its destruction replayed": {beforeWatch: []step{destroyA},
+			steps: []step{newB, replyB, destroyB}, want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
+		"both new events read late": {steps: []step{lateNewA, lateReplyA, lateNewB, replyB, destroyA, destroyB},
+			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
 		"no reuse, destroyed then reply": {steps: []step{newA, destroyA, replyA},
-			timed: map[netip.Addr]time.Duration{github: 20 * time.Millisecond}},
+			want: map[netip.Addr]time.Duration{github: 20 * time.Millisecond}, timed: github},
 	} {
 		reused := NewAccountant()
 		reused.RepliesUp(began.Add(-time.Hour))
+		for _, s := range tc.beforeWatch {
+			s(reused)
+		}
 		reused.Watch("lease-r", guest, began, nil)
 		for _, s := range tc.steps {
 			s(reused)
 		}
-		r, _ := reused.Final("lease-r", nil, ended)
+		r, ok := reused.Final("lease-r", nil, ended)
+		if !ok || !r.RepliesTimed || len(r.Destinations) != len(tc.want) {
+			t.Errorf("%s: Final = %+v, %v; want a timed result with %d destinations", name, r, ok, len(tc.want))
+			continue
+		}
 		for _, d := range r.Destinations {
-			wait, want := tc.timed[d.Addr]
+			wait, known := tc.want[d.Addr]
 			switch {
-			case want && (d.TimedReplies != 1 || d.SlowestReply != wait):
+			case !known || d.Connections != 1:
+				t.Errorf("%s: an unexpected destination %+v", name, d)
+			case d.Addr == tc.timed && (d.TimedReplies != 1 || d.SlowestReply != wait):
 				t.Errorf("%s: %s was not timed at its own %s: %+v", name, d.Addr, wait, d)
-			case !want && d.TimedReplies != 0:
+			case d.Addr != tc.timed && d.TimedReplies != 0:
 				t.Errorf("%s: %s was timed by a wait that may not be its: %+v", name, d.Addr, d)
 			}
 		}

@@ -49,20 +49,19 @@ const MaxUnclaimed = 4096
 // one a resolver answered after the guest's own first retry would be due.
 const SlowReply = time.Second
 
-// replyMatch bounds how far a counted flow's start may lie from the new event a
-// generation of its id was timed from. The kernel reuses an id for a later
-// entry at the same address with the same tuple once the first is gone, and
-// the events come on separate sockets, so a wait is a flow's only when exactly
-// one generation of its id began within replyMatch of the flow's start, and
-// that one saw a reply: a second generation there, answered or not, leaves the
-// flow untimed rather than timed by the other's wait.
+// replyMatch bounds how far a counted flow's start may lie from the new event
+// its wait was timed from: the reading of that event, on the node's clock, is
+// the moment the kernel created the entry, or the event is not that flow's.
 const replyMatch = time.Second
 
-// keptGenerations is how many generations one id keeps, newest last. An id
-// that has had one dropped is never timed again in that job: the generation
-// it lost could have been the one a destruction read later belongs to, and a
-// truncated history must not make a match look unique.
-const keptGenerations = 4
+// keptGenerations is how many generations of one id are kept. ONE IS ALL A WAIT
+// IS EVER TAKEN FROM: the kernel reuses an id for a later entry at the same
+// address with the same tuple once the first is gone, and with a new event
+// missed, or read late, or the two sockets read out of order, two flows of one
+// id cannot be told apart by when they began. So an id is timed only when the
+// job saw one generation of it and counted one flow with it; a second of
+// either, or one dropped past this bound, leaves the id untimed.
+const keptGenerations = 2
 
 // errRepliesUnproven says Sync proved every destruction read and could not
 // prove the same of the new and reply events: the job is untimed, and its
@@ -358,25 +357,19 @@ func (a *Accountant) observe(f Flow) {
 	w.counted[key] = f
 }
 
-// waitFor is the wait of f's first reply: the wait of the one generation of
-// its id that began within replyMatch of f's start, when that one saw a reply,
-// and none when no generation did, more than one did, or the id has lost one.
-func (w *watch) waitFor(f *Flow) (time.Duration, bool) {
-	if w.dropped[f.ID] {
+// waitFor is the wait of f's first reply, given how many counted flows carry
+// its id: the wait of the id's one generation, when the job saw just one and
+// counted just f with that id, the generation began within replyMatch of f's
+// start, and it saw a reply; none otherwise, since anything else is an id that
+// may have been reused.
+func (w *watch) waitFor(f *Flow, flowsWithID int) (time.Duration, bool) {
+	kept := w.generations[f.ID]
+	if w.dropped[f.ID] || len(kept) != 1 || flowsWithID != 1 {
 		return 0, false
 	}
+	g := kept[0]
 
-	var (
-		match generation
-		n     int
-	)
-	for _, g := range w.generations[f.ID] {
-		if f.Start.Sub(g.opened).Abs() <= replyMatch {
-			match, n = g, n+1
-		}
-	}
-
-	return match.wait, n == 1 && match.replied
+	return g.wait, g.replied && f.Start.Sub(g.opened).Abs() <= replyMatch
 }
 
 // ObserveNew records that the tracker created flow id from src, read at at: a
@@ -569,6 +562,13 @@ func summarize(w *watch) Result {
 	byDest := map[netip.Addr]*Destination{}
 	unknown := w.unansweredUnknown
 
+	// HOW MANY COUNTED FLOWS CARRY EACH ID: two are a reuse, and neither is
+	// timed.
+	flowsWithID := map[uint32]int{}
+	for key := range w.counted {
+		flowsWithID[key.id]++
+	}
+
 	for id := range w.counted {
 		f := w.counted[id]
 
@@ -594,7 +594,7 @@ func summarize(w *watch) Result {
 		// TIMED HERE, after the barrier proved both sockets read, so a flow whose
 		// destruction was read before its reply still takes its wait; and only a
 		// flow the reading says was answered.
-		if wait, timed := w.waitFor(&f); timed && f.ReplyPackets > 0 {
+		if wait, timed := w.waitFor(&f, flowsWithID[f.ID]); timed && f.ReplyPackets > 0 {
 			d.TimedReplies++
 			if wait > SlowReply {
 				d.SlowReplies++
