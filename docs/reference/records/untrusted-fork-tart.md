@@ -18,7 +18,7 @@ Every check prints one `PROBE <name> <value>` line. Both attempts printed the sa
 | `event`, `head_repo`, `base_repo` | `pull_request`, the fork, the base repository | the job is a fork's pull request |
 | `kernel` | `Linux 7.0.0-28-generic aarch64` | a guest kernel of its own, not the Mac's |
 | `gateway` | `192.168.2.1` | softnet's network, not tart's shared NAT (`192.168.64.0/24`) |
-| `gateway_22`, `gateway_5900`, `gateway_7717`, `gateway_7718` | every one `closed-or-timeout` | the gateway, which is the Mac, answers nothing |
+| `gateway_22`, `gateway_5900`, `gateway_7717`, `gateway_7718` | every one `closed-or-timeout` | the gateway, which is the Mac, answers nothing on these ports; nothing shows they listen, so this alone shows nothing (the control below does) |
 | `lan_192.168.1.254:80` (the LAN's router), `lan_192.168.1.126:22` (another host on the LAN) | `closed-or-timeout` | the private network is out of reach; both answer the Mac itself (below) |
 | `lan_192.168.1.103:22`, `lan_192.168.1.103:5900` (the Mac's own LAN address) | `closed-or-timeout` | see the control below: nothing listens there, so this alone shows nothing |
 | `internet_github`, `dns_github` | `200`, an address | the internet and name resolution still work |
