@@ -1151,7 +1151,7 @@ tiers:
     #   git:          { enabled: true, max_size: 50GiB }
     #   bazel:        { enabled: true, max_size: 50GiB }
     #   go:           { enabled: true, max_size: 20GiB, test_results: false }
-    #   npm:          { enabled: false }   # off unless named; the store is the node's (ADR-020)
+    #   npm:          { enabled: true }    # on, as every cache is; the store is the node's (ADR-020)
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker
@@ -1180,6 +1180,7 @@ tiers:
       git: { enabled: false }
       bazel: { enabled: false }
       go: { enabled: false }
+      npm: { enabled: false }
 
 # Apple Silicon, once a Mac mini joins the fleet. Such a host CAN serve both
 # macOS guests and native Linux arm64 guests, but whether it does is your

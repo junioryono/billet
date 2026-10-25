@@ -1,6 +1,6 @@
 # Build caches
 
-A Firecracker node serves seven caches from the site's store, beside the compute that uses them: the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job. An eighth, the npm registry cache, is served from the node's own disk and is the one that is off unless a tier names it.
+A Firecracker node serves seven caches from the site's store, beside the compute that uses them: the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job. An eighth, the npm registry cache, is served from the node's own disk and, since 2026-10-25, is on by default too; a tier whose jobs run a client in the runner's own process that ignores `NODE_EXTRA_CA_CERTS` and the system store fails TLS through it, and turns it off with `cache.npm.enabled: false`.
 
 This page is the operator's view: what each cache is, what a tier gets without asking, how publication is decided, and how to see and stop a cache. [Trust and isolation](../concepts/trust-and-isolation.md) says what a cache can leak and to whom, and [ADR-013](../reference/decisions/adr-013-branch-protected-caches.md) records why publication is decided the way it is.
 
@@ -15,7 +15,7 @@ This page is the operator's view: what each cache is, what a tier gets without a
 | Bazel and Buck2 | on where the tier can publish it (below) | a Linux Firecracker tier |
 | Go build cache | on where the tier can publish it (below) | a Linux Firecracker tier |
 | Go test results | **off** | the Go build cache |
-| npm registry | **off** | a Linux Firecracker tier, and a guest image that knows the `npm-proxy` key |
+| npm registry | on | a Linux Firecracker tier, and a guest image that knows the `npm-proxy` key |
 
 A cache that is on by default but cannot run on a tier is simply off there: a Docker tier gets the image store and sticky disks, and a Firecracker node without `node.cache` runs its jobs cold. Only a cache a tier turns on explicitly is refused where it cannot run, because then the operator asked for something the node cannot give.
 

@@ -254,15 +254,22 @@ func TestJudgeNpmCacheNamesTheTiersThatHaveIt(t *testing.T) {
 		want   []string
 		unwant []string
 	}{
-		"no tier enables it": {
-			tiers: []config.Tier{{Label: "a"}, {Label: "b", Cache: &config.TierCache{}}},
-			want:  []string{"NO NPM CACHE: no tier has the npm cache", "unless it writes cache.npm.enabled: false"},
+		"no tier has it": {
+			tiers: []config.Tier{{Label: "a"}, {Label: "b", Provider: config.ProviderFirecracker,
+				GuestOS: config.GuestLinux, Cache: &config.TierCache{Npm: &config.NpmCache{Enabled: new(false)}}}},
+			want: []string{"NO NPM CACHE: no tier has the npm cache", "unless it writes cache.npm.enabled: false"},
 		},
 		"two of three do": {
 			tiers: []config.Tier{{Label: "a", Cache: npm}, {Label: "b"}, {Label: "c", Cache: npm}},
 			want: []string{"2 of 3 tiers enable the npm cache: a, c (configured, not probed)",
 				"served it by a node with node.cache, and fetches registry.npmjs.org itself on a node without"},
 			unwant: []string{"NO NPM CACHE", ", b"},
+		},
+		"a firecracker Linux tier that says nothing has it": {
+			tiers: []config.Tier{{Label: "fc", Provider: config.ProviderFirecracker, GuestOS: config.GuestLinux},
+				{Label: "dk", Provider: config.ProviderDocker, GuestOS: config.GuestLinux}},
+			want:   []string{"1 of 2 tiers enable the npm cache: fc (configured, not probed)"},
+			unwant: []string{"NO NPM CACHE", "dk"},
 		},
 	}
 	for name, tc := range cases {
