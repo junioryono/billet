@@ -43,12 +43,14 @@ const (
 	// answer, so the acquisition stays well inside that token; newer images fetch
 	// six hours.
 	dockerStoreAttachLimit = 3 * time.Minute
-	// dockerStoreRequestLimit bounds the whole request, from its arrival to the
-	// answer: the session lock, the kill switch, the acquisition and the attach.
-	// The guest starts its runner only after this answer and waits a little longer
-	// than this for it (docker-cache.sh), so a store that is slow costs a cold job
-	// rather than a runner GitHub lists offline (#320). The minute beyond the
-	// acquisition is EC2's attach, which waits for AWS to report it attached.
+	// dockerStoreRequestLimit bounds every step toward the answer, from the
+	// request's arrival: the session lock, the kill switch, the acquisition and
+	// the attach. The guest starts its runner only after this answer and waits a
+	// little longer than this for it (docker-cache.sh), so a store that is slow
+	// costs a cold job rather than a runner GitHub lists offline (#320). The
+	// minute beyond the acquisition is EC2's attach, which waits for AWS to report
+	// it attached; an attach this cuts short leaves its volume in the session's
+	// custody rather than racing it with a detach.
 	dockerStoreRequestLimit = 4 * time.Minute
 	cacheWriterTTL          = 15 * time.Minute
 	cacheVolumeLimit        = int64(100 << 30)
@@ -1260,13 +1262,15 @@ func (s *CacheService) attachDockerStore(
 	session *cacheSession,
 ) {
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
-	defer cancel()
 	// EVERY STEP TOWARD THE ANSWER RUNS ON requestCtx, AND EVERY CLEANUP ON ctx.
-	// A cleanup that inherited the request's deadline would be cancelled by the
-	// very expiry that made it necessary, leaving a clone or an attachment that
-	// only the session's teardown would find.
-	requestCtx, cancelRequest := context.WithTimeout(ctx, dockerStoreRequestLimit)
+	// The answer is worth nothing once the guest has stopped waiting, so the
+	// forward steps end with the request's bound or the guest's connection. A
+	// cleanup ends with neither: the guest gives up just after the request's
+	// bound, and a cleanup cancelled by the expiry that made it necessary would
+	// leave a clone or an attachment that only the session's teardown would find.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), cacheWorkLimit)
+	defer cancel()
+	requestCtx, cancelRequest := context.WithTimeout(r.Context(), dockerStoreRequestLimit)
 	defer cancelRequest()
 
 	var request struct {
@@ -1368,6 +1372,22 @@ func (s *CacheService) attachDockerStore(
 	}
 
 	if err := s.attacher.AttachVolume(requestCtx, session.instance, 0, volume.Device); err != nil {
+		// AN ATTACH THE REQUEST'S END CUT SHORT IS NOT KNOWN TO HAVE FAILED. EC2
+		// may complete an attachment it accepted after billet stopped waiting, and
+		// its describe calls are eventually consistent, so a detach and discard now
+		// would race it on evidence that proves nothing. The volume stays in the
+		// session's custody, already durable, and the session's cleanup disposes
+		// of it once the compute is proved gone; the guest goes cold without it.
+		if requestCtx.Err() != nil {
+			s.log.Warn("Docker image store attach did not finish within the request's bound; "+
+				"the session keeps it until the compute is gone, and the job can continue cold",
+				"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+				"error", err)
+			s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
+			http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+			return
+		}
 		detachErr := s.attacher.DetachVolume(ctx, session.instance, 0, volume.Device)
 		var discardErr, clearErr error
 		if detachErr == nil {
@@ -1391,8 +1411,9 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 
-	// THE GUEST HAS ITS STORE, so what the store answered is what it saw. The
-	// time it took is logged once per job, which is what measures #320's wait.
+	// THE GUEST HAS ITS STORE, so what the store answered is what it saw. How
+	// long the whole request took is logged with each attach, which is what
+	// measures #320's wait.
 	s.observe(ctx, session, observed)
 	s.log.Info("attached a Docker image store", "instance", session.instance,
 		"cache", observed.ImageCache, "generation", volume.Generation,

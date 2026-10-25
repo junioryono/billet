@@ -346,11 +346,15 @@ type fakeVolumeAttacher struct {
 	detached  []int
 	attachErr error
 	detachErr error
-	// attachBudgets is the time each AttachVolume had left before its deadline,
-	// and blockAttach makes AttachVolume wait for its context to end.
+	// attachBudgets is the time each AttachVolume had left before its deadline.
+	// blockAttach makes AttachVolume wait for its context to end, and
+	// attachDelay makes it take that long before answering attachErr.
 	attachBudgets []time.Duration
 	blockAttach   bool
-	// detachContextErrs is what each DetachVolume's context said when called.
+	attachDelay   time.Duration
+	// detachDelay is how long each DetachVolume works, and detachContextErrs
+	// what its context said once that work was done.
+	detachDelay       time.Duration
 	detachContextErrs []error
 }
 
@@ -364,12 +368,14 @@ func (f *fakeVolumeAttacher) AttachVolume(ctx context.Context, _ string, slot in
 
 		return ctx.Err()
 	}
+	time.Sleep(f.attachDelay)
 
 	return f.attachErr
 }
 
 func (f *fakeVolumeAttacher) DetachVolume(ctx context.Context, _ string, slot int, _ string) error {
 	f.detached = append(f.detached, slot)
+	time.Sleep(f.detachDelay)
 	f.detachContextErrs = append(f.detachContextErrs, ctx.Err())
 
 	return f.detachErr
@@ -401,6 +407,20 @@ func cacheRequest(
 ) *httptest.ResponseRecorder {
 	t.Helper()
 
+	return cacheRequestWithin(t, t.Context(), service, token, path, body)
+}
+
+// cacheRequestWithin is cacheRequest on a request context the caller chooses,
+// which is how a guest that hangs up is staged.
+func cacheRequestWithin(
+	t *testing.T,
+	ctx context.Context,
+	service *CacheService,
+	token, path string,
+	body any,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
 	var input io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -411,7 +431,7 @@ func cacheRequest(
 		input = bytes.NewReader(encoded)
 	}
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, input)
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, path, input)
 	req.Header.Set("Authorization", "Bearer "+token)
 	response := httptest.NewRecorder()
 	service.ServeHTTP(response, req)
@@ -616,7 +636,7 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 // store acquired under the twelve-minute cache bound outlived it on 2026-10-03,
 // so the runner never started. The attach is bounded by the whole request's
 // limit, which the guest waits just past.
-func TestTheDockerStoreIsAcquiredWithinDockerStoreAttachLimit(t *testing.T) {
+func TestTheDockerStoreIsAcquiredAndAttachedWithinItsBounds(t *testing.T) {
 	t.Parallel()
 
 	storage := &fakeCacheStore{}
@@ -657,12 +677,11 @@ func TestTheDockerStoreIsAcquiredWithinDockerStoreAttachLimit(t *testing.T) {
 	}
 }
 
-// AN ATTACH THAT OUTLIVES THE REQUEST IS A COLD JOB, AND ITS CLEANUP STILL RUNS.
-// The request's deadline ends the attach; the detach and the discard that follow
-// run on the longer bound, because a cleanup cancelled by the expiry that made
-// it necessary would leave the clone attached to a guest that went cold. The
-// slot is then free, so the store is offered again.
-func TestADockerStoreAttachPastTheRequestLimitIsCleanedUp(t *testing.T) {
+// AN ATTACH THE REQUEST'S BOUND CUTS SHORT IS A COLD JOB WHOSE VOLUME STAYS IN
+// CUSTODY. Nothing proves such an attach failed, EC2 can finish one it accepted,
+// so the node answers at once and does not race it with a detach; the session's
+// cleanup, once the compute is gone, is what discards the volume.
+func TestADockerStoreAttachCutShortKeepsItsVolumeInCustody(t *testing.T) {
 	t.Parallel()
 
 	synctest.Test(t, func(t *testing.T) {
@@ -687,19 +706,70 @@ func TestADockerStoreAttachPastTheRequestLimitIsCleanedUp(t *testing.T) {
 		if waited := time.Since(start); waited != dockerStoreRequestLimit {
 			t.Fatalf("the request answered after %s, want exactly its limit, %s", waited, dockerStoreRequestLimit)
 		}
-		if len(attacher.detached) != 1 || attacher.detachContextErrs[0] != nil {
-			t.Fatalf("detached %v with context errors %v, want slot 0 on a live context",
-				attacher.detached, attacher.detachContextErrs)
+		if len(attacher.detached) != 0 || storage.discarded != 0 {
+			t.Fatalf("an attach of unknown outcome was raced: %d detach(es), %d discard(s)",
+				len(attacher.detached), storage.discarded)
+		}
+		if again := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); again.Code != http.StatusConflict {
+			t.Fatalf("a second request found the slot free (%d), so custody of the first volume was dropped: %s",
+				again.Code, again.Body.String())
+		}
+
+		if err := service.Cleanup(t.Context(), "billet-one"); err != nil {
+			t.Fatalf("Cleanup: %v", err)
+		}
+		if storage.discarded != 1 {
+			t.Fatalf("the session's cleanup discarded %d volume(s), want the one it kept", storage.discarded)
+		}
+	})
+}
+
+// A DEFINITE ATTACH FAILURE IS CLEANED UP AT ONCE, AND THE GUEST HANGING UP
+// DOES NOT STOP IT. The guest stops waiting just past the request's bound, which
+// cancels the request's context; a detach still running then must finish, or
+// the clone stays attached to a guest that went cold.
+func TestADockerStoreCleanupOutlivesTheGuestHangingUp(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := &fakeCacheStore{}
+		attacher := &fakeVolumeAttacher{
+			attachDelay: dockerStoreRequestLimit - 10*time.Second,
+			attachErr:   errors.New("the VMM refused the drive"),
+			detachDelay: time.Minute,
+		}
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			storage, attacher, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+
+		// The guest's curl gives up at 260 s, inside the minute-long detach.
+		guest, hangUp := context.WithTimeout(t.Context(), 260*time.Second)
+		defer hangUp()
+		response := cacheRequestWithin(t, guest, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"})
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("Docker store status = %d, want the cold 503: %s", response.Code, response.Body.String())
+		}
+		if guest.Err() == nil {
+			t.Fatal("the guest had not hung up by the time the cleanup ended, so this staged nothing")
+		}
+		if len(attacher.detachContextErrs) != 1 || attacher.detachContextErrs[0] != nil {
+			t.Fatalf("the detach finished on a context that said %v, want one still live", attacher.detachContextErrs)
 		}
 		if storage.discarded != 1 || storage.discardContextErrs[0] != nil {
 			t.Fatalf("discarded %d volume(s) with context errors %v, want 1 on a live context",
 				storage.discarded, storage.discardContextErrs)
 		}
-
-		attacher.blockAttach = false
 		if again := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
-			map[string]any{"architecture": "amd64"}); again.Code != http.StatusCreated {
-			t.Fatalf("the store was not offered again after the cleanup: %d %s", again.Code, again.Body.String())
+			map[string]any{"architecture": "amd64"}); again.Code == http.StatusConflict {
+			t.Fatalf("the slot was not freed after a cleanup that succeeded: %s", again.Body.String())
 		}
 	})
 }
@@ -737,6 +807,45 @@ func TestADockerStoreRequestWaitsForItsSessionOnlyUntilItsLimit(t *testing.T) {
 		if storage.cloned+storage.created != 0 {
 			t.Fatalf("the store was touched (%d clones, %d creates) by a request that never held its session",
 				storage.cloned, storage.created)
+		}
+	})
+}
+
+// THE ACQUISITION GETS WHAT IS LEFT OF THE REQUEST, NOT A FRESH THREE MINUTES.
+// A request that waited two minutes for its session has two left, and an
+// acquisition given its own whole bound would run past the guest's wait.
+func TestADockerStoreAcquisitionIsBoundedByWhatIsLeftOfTheRequest(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := &fakeCacheStore{}
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		session := service.byToken[credentials.Token]
+		session.mu.Lock()
+		held := 2 * time.Minute
+		time.AfterFunc(held, session.mu.Unlock)
+
+		if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+		}
+		budgets := append(append([]time.Duration{}, storage.cloneBudgets...), storage.createBudgets...)
+		if len(budgets) == 0 {
+			t.Fatal("the store was never asked for a volume with a deadline")
+		}
+		for _, budget := range budgets {
+			if budget > dockerStoreRequestLimit-held {
+				t.Fatalf("the acquisition had %s left after the session was held for %s; want at most %s",
+					budget, held, dockerStoreRequestLimit-held)
+			}
 		}
 	})
 }

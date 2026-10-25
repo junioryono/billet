@@ -151,8 +151,8 @@ prepare() {
 	# THE RUNNER STARTS ONLY AFTER THIS ANSWER, so the wait is how long GitHub can
 	# list this guest's runner offline (#320). The node bounds the whole request
 	# at four minutes (dockerStoreRequestLimit) and this waits twenty seconds
-	# past that; a node older than that bound may still be working when this
-	# gives up, and its teardown discards the attachment nobody mounted.
+	# past that. A node older than that bound is cut off mid-request when this
+	# gives up; whatever its session had recorded, its teardown discards.
 	if ! response=$(cache_call /v1/docker-store "$request" 260 2>/dev/null); then
 		log "the Docker image store is unavailable; pulling cold"
 		start_cold
