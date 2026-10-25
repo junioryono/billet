@@ -70,7 +70,7 @@ That makes it a second image pipeline, with a Mac in its publish path, for one t
   - The launch compares the stored deadline for its record's runner version with the clock, so it needs neither the network nor a refresh.
   - The daily refresh and `billet check` ask again for every record whatever `release.automatic` says, and report a runner whose window is unknown as unknown.
 - **Records under concurrency.** One lock file beside the record serialises the record's reads and commits, and is never held across a probe. A verification takes the record's generation number when it starts, and commits only if no unpromote of that image ran in between. An unpromote is never undone by a probe already in flight. A launch that has resolved its base before an unpromote still completes its clone, under the base's lock.
-- **Unpromote.** `images unpromote <image>@<base>` removes a record and its base.
+- **Unpromote is a rollback that holds.** `images unpromote <image>@<base>` removes a record and its base. It also records the withdrawal of the digest it was pulled as, keyed by the normalised image, in a file of its own beside the records that no base retention touches. The refresh never verifies a withdrawn digest again, so a tag that still names it does not bring it back. An operator clears a withdrawal with `images verify` of that digest by hand.
 
 **The refresh verifies new images only for `@verified` references.**
 - For a remote `@verified` reference whose tag now names a new digest, the refresh pulls that digest and verifies it, macOS included, under the slot lock.
