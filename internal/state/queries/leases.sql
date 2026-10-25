@@ -119,7 +119,10 @@ UPDATE leases SET heartbeat_at = @heartbeat_at, expires_at = @expires_at
 -- is cut at all, and only a part of at least two records is split, so each
 -- half is whole records and shorter than its part: a string that is not whole
 -- records renews nothing, rather than its valid prefix or a split that never
--- shrinks. The packer admits only printable ASCII, so a length is the same
+-- shrinks. A string of whole records the packer did not write can still fail
+-- the statement where an epoch is not digits (PostgreSQL refuses the cast),
+-- which fails its batch and renews nothing. The packer admits only printable
+-- ASCII and zero-padded epochs, so a length is the same
 -- count of characters on both engines; SQLite's length() stops at a NUL, so a
 -- string holding one is refused by its length not growing by the character
 -- appended to it (PostgreSQL refuses a NUL in text before the statement runs).

@@ -117,6 +117,40 @@ func TestAHeartbeatPassRenewsItsLeasesInOneCommit(t *testing.T) {
 	}
 }
 
+// A LEASE THE PASS DID NOT ASK ABOUT HAS NO ANSWER, not a renewal: a set the
+// pass judges and does not collect would otherwise read the map's missing
+// entry as success, confirm leases nothing renewed and keep them advertised
+// past their expiry.
+func TestALeaseThePassDidNotAskAboutIsNotRenewed(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	stray, err := a.Reserve(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	earlier := time.Now().Add(-time.Second)
+	l.confirmed[stray.ID] = earlier
+
+	renew := l.renewAll(t.Context())
+
+	if got := renew(stray); got != renewalUnknown {
+		t.Fatalf("a lease the pass never asked to renew was judged %v, want no answer (%v)", got, renewalUnknown)
+	}
+
+	if !l.confirmed[stray.ID].Equal(earlier) {
+		t.Fatalf("a lease the pass never asked to renew was confirmed at %v", l.confirmed[stray.ID])
+	}
+}
+
 // A RENEWAL IS CONFIRMED AS OF WHEN IT WAS ASKED FOR. The allocator writes a
 // lease's expiry from when its batch ran, and returns after its last batch;
 // confirming at the return would date an early batch's renewal after the

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +43,10 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 	// must not move.
 	stale := reserve(t, a, "linux")
 
+	// NAMED ONLY WITH A SPACE AFTER ITS ID, which is not its id: a packed
+	// record trimmed back to the real one would renew it.
+	spaced := reserve(t, a, "linux")
+
 	released := reserve(t, a, "linux")
 	if err := a.Release(ctx, released.ID, released.Epoch, PhaseDone); err != nil {
 		t.Fatalf("Release: %v", err)
@@ -67,6 +73,8 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 	}{
 		{"a stale epoch", LeaseRef{ID: stale.ID, Epoch: stale.Epoch + 1}, ErrFenced},
 		{"a stale epoch beside the current one", LeaseRef{ID: held[3].ID, Epoch: held[3].Epoch + 1}, ErrFenced},
+		{"a negative epoch", LeaseRef{ID: held[5].ID, Epoch: math.MinInt64}, ErrFenced},
+		{"an id with a space after it", LeaseRef{ID: spaced.ID + " ", Epoch: spaced.Epoch}, ErrLeaseNotFound},
 		{"an unknown id", LeaseRef{ID: "no-such-lease", Epoch: 1}, ErrLeaseNotFound},
 		{"an id holding a NUL", LeaseRef{ID: "x\x00", Epoch: 1}, ErrLeaseNotFound},
 		{"an id that is not UTF-8", LeaseRef{ID: "x\xff", Epoch: 1}, ErrLeaseNotFound},
@@ -79,7 +87,7 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 
 	// THE REFUSALS SIT BETWEEN RENEWALS, on both sides of the batch boundary,
 	// so an answer written at the wrong index would land on a renewal.
-	at := []int{1, 2, 40, 41, 42, 200, heartbeatBatch, heartbeatBatch + 5, len(refs)}
+	at := []int{1, 2, 3, 4, 40, 41, 42, 200, heartbeatBatch, heartbeatBatch + 5, len(refs)}
 	for i := len(cases) - 1; i >= 0; i-- {
 		refs = append(refs[:at[i]], append([]LeaseRef{cases[i].ref}, refs[at[i]:]...)...)
 	}
@@ -92,10 +100,20 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 	heartbeatAskedOne = func(ref LeaseRef) { askedOne[ref] = true }
 	t.Cleanup(func() { heartbeatAskedOne = nil })
 
+	// AND HOW MANY COMMITS IT TOOK: one a batch, and this is two batches.
+	commits := &commitCount{}
+	a.db.Observe(commits)
+
 	answers := a.HeartbeatMany(ctx, refs)
 	heartbeatAskedOne = nil
+	a.db.Observe(nil)
+
 	if len(answers) != len(refs) {
 		t.Fatalf("%d answers for %d leases", len(answers), len(refs))
+	}
+
+	if want := (len(refs) + heartbeatBatch - 1) / heartbeatBatch; commits.n.Load() != int64(want) || want != 2 {
+		t.Fatalf("%d leases took %d commits, want %d", len(refs), commits.n.Load(), want)
 	}
 
 	refused := map[LeaseRef]error{}
@@ -156,6 +174,10 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 
 	if _, err := a.Lease(ctx, stale.ID); !errors.Is(err, ErrLeaseNotFound) {
 		t.Fatalf("a lease named only at a stale epoch was renewed: %v", err)
+	}
+
+	if _, err := a.Lease(ctx, spaced.ID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("a lease named only with a space after its id was renewed: %v", err)
 	}
 
 	for _, l := range held {
@@ -222,6 +244,95 @@ func TestHeartbeatLeasesEndsOnAStringItCannotCut(t *testing.T) {
 
 		if renewed != 0 {
 			t.Fatalf("a string of %d characters that is not whole records renewed %d leases", len(packed), renewed)
+		}
+	}
+}
+
+// commitCount counts the write transactions a ledger committed.
+type commitCount struct{ n atomic.Int64 }
+
+func (c *commitCount) WriteWaited(time.Duration) {}
+func (c *commitCount) WriteRetried()             {}
+
+func (c *commitCount) WriteHeld(_ time.Duration, committed bool) {
+	if committed {
+		c.n.Add(1)
+	}
+}
+
+// A WRITE THAT FAILS INSIDE A LATER BATCH ENDS THAT BATCH ALONE. The first
+// batch's leases stay renewed and answered; every lease of the failed one
+// answers the failure and is not renewed, the statement's renewals in it
+// rolled back with the rest.
+func TestHeartbeatManyAFailedBatchCostsOnlyItself(t *testing.T) {
+	now := time.Date(2026, time.October, 25, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	a := newAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 1000 * config.GiB},
+		[]config.Tier{tier("linux", 1, config.GiB)},
+		WithClock(func() time.Time { return clock() }), WithLeaseTTL(30*time.Second))
+
+	held, err := a.Escrow(t.Context(), "linux", heartbeatBatch+20)
+	if err != nil || len(held) != heartbeatBatch+20 {
+		t.Fatalf("Escrow = %d leases, %v", len(held), err)
+	}
+
+	refs := make([]LeaseRef, 0, len(held)+1)
+	for _, l := range held {
+		refs = append(refs, LeaseRef{ID: l.ID, Epoch: l.Epoch})
+	}
+
+	// ONE REFUSAL, IN THE SECOND BATCH ONLY, whose one-lease renewal is asked
+	// under a context the test cancels at that moment: the write after it
+	// fails inside the transaction, as a lost connection would.
+	trip := LeaseRef{ID: "no-such-lease", Epoch: 1}
+	refs = append(refs[:heartbeatBatch+3], append([]LeaseRef{trip}, refs[heartbeatBatch+3:]...)...)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	heartbeatAskedOne = func(ref LeaseRef) {
+		if ref == trip {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { heartbeatAskedOne = nil })
+
+	now = now.Add(20 * time.Second)
+
+	answers := a.HeartbeatMany(ctx, refs)
+	heartbeatAskedOne = nil
+
+	for i, err := range answers {
+		switch {
+		case i < heartbeatBatch && err != nil:
+			t.Fatalf("lease %d in the first batch answered %v, want it renewed", i, err)
+		case i >= heartbeatBatch && !errors.Is(err, context.Canceled):
+			t.Fatalf("lease %d in the failed batch answered %v, want the failure", i, err)
+		}
+	}
+
+	now = now.Add(15 * time.Second)
+
+	for {
+		n, err := a.Reap(t.Context())
+		if err != nil {
+			t.Fatalf("Reap: %v", err)
+		}
+
+		if n == 0 {
+			break
+		}
+	}
+
+	for i, ref := range refs {
+		_, err := a.Lease(t.Context(), ref.ID)
+
+		switch {
+		case ref == trip:
+		case i < heartbeatBatch && err != nil:
+			t.Fatalf("lease %d of the batch that committed was reaped: %v", i, err)
+		case i >= heartbeatBatch && !errors.Is(err, ErrLeaseNotFound):
+			t.Fatalf("lease %d of the batch that failed is still open past its TTL (%v), so it was renewed", i, err)
 		}
 	}
 }

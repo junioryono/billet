@@ -34,7 +34,9 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 	// from the placement rather than assumed.
 	landed := map[string]map[string]int{}
 
-	for _, label := range []string{"reserved", "other", "reserved", "other", "reserved", "other"} {
+	for i := range 12 {
+		label := []string{"reserved", "other"}[i%2]
+
 		lease, err := a.Reserve(t.Context(), label)
 		if err != nil {
 			t.Fatalf("Reserve(%s): %v", label, err)
@@ -49,8 +51,15 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 
 	// THE CASES WERE MADE: leases on the host that goes, which the floors leave
 	// out, and on the one that drains, which they keep.
-	if len(landed["gone"]) == 0 || len(landed["draining"]) == 0 {
+	if len(landed["gone"]) == 0 || len(landed["draining"]) == 0 || len(landed["live"]) < 2 {
 		t.Fatalf("leases landed %v, so one of the hosts this is about holds none", landed)
+	}
+
+	// AND TWO OF ONE TIER ON THE HOST THE PURCHASE CAN USE, so a count of rows
+	// cannot pass for a count of leases, and two tiers' usage there, so the
+	// last tier's row cannot pass for the host's usage.
+	if slices.Max(slices.Collect(maps.Values(landed["live"]))) < 2 {
+		t.Fatalf("no tier holds two leases on the live host (%v)", landed["live"])
 	}
 
 	if err := a.NodeDraining(t.Context(), "draining", epochs["draining"], "p-draining"); err != nil {
@@ -71,6 +80,7 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 	var (
 		fromFleet, fromLedger, doctored map[string]int
 		heldOn                          map[string]map[string]int
+		liveLeft                        int
 	)
 
 	err := a.db.View(t.Context(), func(tx querier) error {
@@ -78,6 +88,8 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 		if err != nil {
 			return err
 		}
+
+		liveLeft = free.vcpu["live"]
 
 		if free.heldOn != nil {
 			heldOn = map[string]map[string]int{}
@@ -100,13 +112,25 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 			return nil
 		}
 
+		// AND A LEASE AIMED AT NO HOST COUNTS, as the ledger's count has it.
 		free.heldOn["live"]["reserved"] += 100
+		free.heldOn[""] = map[string]int{"reserved": 7}
 		doctored, err = free.floorLeases(t.Context(), tx, a)
 
 		return err
 	})
 	if err != nil {
 		t.Fatalf("read the counts: %v", err)
+	}
+
+	// THE HOST'S USAGE IS EVERY TIER'S LEASES THERE, summed from the tier rows.
+	charged := 0
+	for _, n := range landed["live"] {
+		charged += n
+	}
+
+	if liveLeft != 8-charged {
+		t.Fatalf("the live host has %d vCPU left of 8 after %d one-vCPU leases", liveLeft, charged)
 	}
 
 	// THE PURCHASE'S FLEET CARRIES WHAT EACH TIER HOLDS ON EACH HOST, the
@@ -121,7 +145,7 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 		}
 	}
 
-	if doctored["reserved"] != fromFleet["reserved"]+100 {
+	if doctored["reserved"] != fromFleet["reserved"]+107 {
 		t.Fatalf("a count the fleet alone holds moved the floors to %v from %v, so they were not read from it",
 			doctored, fromFleet)
 	}

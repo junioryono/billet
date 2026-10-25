@@ -1584,7 +1584,10 @@ const heartbeatBatch = 256
 // HeartbeatMany renews leases, heartbeatBatch to a transaction, and answers one
 // error a lease in refs' order: nil for one renewed, and for one that was not
 // exactly what Heartbeat would have answered for it. A transaction that fails
-// answers its error for every lease in it, none of which was renewed.
+// answers its error for every lease in it, none of which was renewed, so a
+// write that fails for one lease's own renewal costs the others in its batch
+// their answer for this pass, where one transaction a lease cost only that
+// lease's; a pass that hears nothing keeps what it holds.
 //
 // ONE COMMIT FOR MANY RENEWALS, because a renewal's cost is its commit. With
 // one transaction a lease, a control plane at the target fleet (4,096 open

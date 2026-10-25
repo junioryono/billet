@@ -354,12 +354,24 @@ func (l *Listener) renewAll(ctx context.Context) func(*alloc.Lease) renewal {
 			return r
 		}
 
-		r := l.renewed(lease, answers[lease], asked)
+		// A LEASE NOBODY ASKED ABOUT HAS NO ANSWER, never a renewal: a nil
+		// error read from a map that lacks it would confirm a lease no write
+		// renewed, and keep it advertised past its expiry.
+		err, ok := answers[lease]
+		if !ok {
+			err = errNotAsked
+		}
+
+		r := l.renewed(lease, err, asked)
 		judged[lease] = r
 
 		return r
 	}
 }
+
+// errNotAsked is the answer for a lease a heartbeat pass judges without having
+// asked the allocator to renew it, which renewed reads as no answer.
+var errNotAsked = errors.New("server: this lease was not in the pass's renewal")
 
 // renewed says what one lease's renewal answer means for this listener, the
 // renewal having been asked for at asked.
