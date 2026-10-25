@@ -11,7 +11,7 @@ import (
 )
 
 // Policy is one admission order and placement a comparison replays a trace
-// under, named as the table names it.
+// under, named as the table names it. An empty Placement keeps the fleet's.
 type Policy struct {
 	Name      string
 	Order     config.AdmissionOrder
@@ -35,6 +35,12 @@ type Comparison struct {
 // Compare replays trace against fleet under each policy, one replay after
 // another. Each replay is deterministic, so two comparisons of one trace give
 // the same table (TestAComparisonIsReproducible).
+//
+// A REPLAY THE REPORT CANNOT SPEAK FOR FAILS THE COMPARISON rather than giving
+// it numbers: a job the ledger lost, one that never started or finished with
+// no horizon to explain it, or an overcommit the ledger proves. A table built
+// over any of those would compare policies on the jobs that happened to
+// survive.
 func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Options) Comparison {
 	t.Helper()
 
@@ -42,9 +48,25 @@ func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Opt
 
 	for _, p := range policies {
 		f := fleet
-		f.AdmissionOrder, f.Placement = p.Order, p.Placement
+		f.AdmissionOrder = p.Order
 
-		c.Reports = append(c.Reports, Run(t, f, trace, opts))
+		if p.Placement != "" {
+			f.Placement = p.Placement
+		}
+
+		r := Run(t, f, trace, opts)
+
+		switch {
+		case len(r.Violations) > 0:
+			t.Fatalf("replay: under %s the ledger proves an overcommit: %v", p.Name, r.Violations)
+		case len(r.Missing) > 0:
+			t.Fatalf("replay: under %s the ledger has no row for jobs %v", p.Name, r.Missing)
+		case opts.Until.IsZero() && (len(r.Unstarted) > 0 || len(r.Unfinished) > 0):
+			t.Fatalf("replay: under %s jobs %v never started and %v never finished, with no horizon to say why",
+				p.Name, r.Unstarted, r.Unfinished)
+		}
+
+		c.Reports = append(c.Reports, r)
 	}
 
 	return c
@@ -73,8 +95,8 @@ func (c Comparison) Markdown() string {
 		}
 	}
 
-	b.WriteString("\n| Policy | Started | Still queued | Purchases refused | vCPU charged | Memory charged | " +
-		"Empty host-hours |\n")
+	b.WriteString("\n| Policy | Started | Still queued | Jobs refused at least once | vCPU charged | " +
+		"Memory charged | Empty host-hours |\n")
 	b.WriteString("|---|---|---|---|---|---|---|\n")
 
 	for i, r := range c.Reports {

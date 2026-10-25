@@ -16,11 +16,22 @@ import (
 	"github.com/junioryono/billet/internal/jobtrace"
 )
 
-// A REPLAYED DEPLOYMENT EXPORTS BACK ITS OWN TRACE AND FLEET: the ledger the
-// replay wrote is read as an operator's `billet jobs export` reads one, and
-// gives back every job as it arrived, ran and ended, and every host as it
-// registered.
+// A REPLAYED DEPLOYMENT EXPORTS BACK ITS OWN TRACE AND FLEET, under either
+// protocol: the ledger the replay wrote is read as an operator's `billet jobs
+// export` reads one, and gives back every job as it arrived, ran and ended,
+// its name or its lack of one, and every host as it registered.
 func TestTheLedgerExportRoundTrips(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		t.Run(map[bool]string{false: "offers", true: "direct-assignment"}[direct], func(t *testing.T) {
+			ledgerRoundTrip(t, direct)
+		})
+	}
+}
+
+// ledgerRoundTrip replays a trace under one protocol and exports it back.
+func ledgerRoundTrip(t *testing.T, direct bool) {
+	t.Helper()
+
 	trace := MorningBurst(5, Params{Jobs: 24})
 
 	// FOUR AT ONE INSTANT, each different, so the export's order for jobs that
@@ -36,8 +47,11 @@ func TestTheLedgerExportRoundTrips(t *testing.T) {
 
 	trace.Normalize()
 
+	// EVERY FIFTH JOB HAS NO NAME, which must come back as none.
 	for i := range trace.Arrivals {
-		trace.Arrivals[i].Job = fmt.Sprintf("build (shard %d)", i%3)
+		if i%5 != 0 {
+			trace.Arrivals[i].Job = fmt.Sprintf("build (shard %d)", i%3)
+		}
 	}
 
 	fleet := twoHosts(config.PlacementPack)
@@ -48,7 +62,7 @@ func TestTheLedgerExportRoundTrips(t *testing.T) {
 		gaps     alloc.ExportGaps
 	)
 
-	Run(t, fleet, trace, Options{AfterRun: func(a *alloc.Allocator) {
+	Run(t, fleet, trace, Options{DirectAssignment: direct, AfterRun: func(a *alloc.Allocator) {
 		ctx := context.WithoutCancel(t.Context())
 
 		var err error
@@ -62,8 +76,8 @@ func TestTheLedgerExportRoundTrips(t *testing.T) {
 		}
 	}})
 
-	if gaps.Read != len(trace.Arrivals) || gaps.NeverStarted+gaps.NeverFinished+gaps.NotARuntime+
-		gaps.AssignedAsArrival+gaps.Unidentified != 0 || gaps.Partial {
+	if gaps.Read != len(trace.Arrivals) || gaps.NeverStarted+gaps.NeverCompleted+gaps.NotARuntime+
+		gaps.UndeclaredTier+gaps.AssignedAsArrival+gaps.Unidentified != 0 || gaps.Partial {
 		t.Errorf("the export read %+v; want every job and no gap", gaps)
 	}
 
@@ -103,7 +117,8 @@ func TestTheAdversarialWorkloadsKeepEveryProof(t *testing.T) {
 	}{
 		{"burst", small, Burst(1, Params{Jobs: 30})},
 		{"idle-backlog", small, IdleBacklog(2, Params{Jobs: 30})},
-		{"quiet-beside-saturated", small, QuietBesideSaturated(3, Params{Jobs: 30})},
+		{"quiet-beside-saturated", small, QuietBesideSaturated(3, QuietParams{Params: Params{Jobs: 30},
+			Fleet: small})},
 		{"wide-shape-mix", WideFleet(), WideShapeMix(4, WideParams{Params: Params{Jobs: 30}, Fleet: WideFleet()})},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -170,41 +185,79 @@ func TestAHorizonCountsTheJobsStillQueued(t *testing.T) {
 	}
 }
 
-// A PURCHASE BILLET REFUSES IS COUNTED, per tier: a backlog larger than the
-// fleet has offers acknowledged unacquired, and a fleet with room for every
-// job refuses none.
+// A JOB BILLET REFUSES TO BUY FOR IS COUNTED ONCE, per tier, under either
+// protocol: a backlog larger than the fleet has jobs refused, never more than
+// it has jobs however often each is offered again, and a fleet with room for
+// every job refuses none.
 func TestRefusedPurchasesAreCounted(t *testing.T) {
-	crowded := Run(t, twoHosts(config.PlacementPack), IdleBacklog(5, Params{Jobs: 24}), Options{})
+	for _, direct := range []bool{false, true} {
+		opts := Options{DirectAssignment: direct}
 
-	refused := 0
-	for _, n := range crowded.Declined {
-		refused += n
-	}
+		crowded := Run(t, twoHosts(config.PlacementPack), IdleBacklog(5, Params{Jobs: 24}), opts)
 
-	if refused == 0 {
-		t.Errorf("a backlog of 24 jobs on a fleet holding 8 refused no purchase: %v", crowded.Declined)
-	}
-
-	// AND UNDER DIRECT ASSIGNMENT, where a refusal is an assignment billet
-	// acknowledged with no runner minted for it.
-	direct := Run(t, twoHosts(config.PlacementPack), IdleBacklog(5, Params{Jobs: 24}),
-		Options{DirectAssignment: true})
-
-	refused = 0
-	for _, n := range direct.Declined {
-		refused += n
-	}
-
-	if refused == 0 {
-		t.Errorf("a backlog of 24 directly assigned jobs on a fleet holding 8 refused no purchase: %v",
-			direct.Declined)
-	}
-
-	roomy := Run(t, twoHosts(config.PlacementPack), Burst(6, Params{Jobs: 4}), Options{})
-	for tier, n := range roomy.Declined {
-		if n != 0 {
-			t.Errorf("four jobs on a fleet with room for eight refused %d purchases on %s", n, tier)
+		refused := 0
+		for _, n := range crowded.Declined {
+			refused += n
 		}
+
+		if refused == 0 || refused > 24 {
+			t.Errorf("direct %v: a backlog of 24 jobs on a fleet holding 8 to 16 refused %d jobs (%v); want some, "+
+				"each counted once", direct, refused, crowded.Declined)
+		}
+
+		roomy := Run(t, twoHosts(config.PlacementPack), Burst(6, Params{Jobs: 4}), opts)
+		for tier, n := range roomy.Declined {
+			if n != 0 {
+				t.Errorf("direct %v: four jobs on a fleet with room for eight refused %d on %s", direct, n, tier)
+			}
+		}
+	}
+}
+
+// FAIR AND FILL ARE TOLD APART BY THE COMPARISON: a whole-host job waiting
+// behind a stream of small ones on one host starts once the room it held
+// frees under fair, and only when the stream ends under fill.
+func TestFairHoldsTheLineWhereFillDoesNot(t *testing.T) {
+	fleet := Fleet{
+		Hosts: []Host{{Name: "only", VCPU: 16, Memory: 64 * config.GiB}},
+		Tiers: []TierShape{
+			{Label: "billet-4vcpu", VCPU: 4, Memory: 16 * config.GiB},
+			{Label: "billet-16vcpu", VCPU: 16, Memory: 64 * config.GiB},
+		},
+		MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+	}
+
+	// Four 4 vCPU jobs fill the host, the wide job arrives a minute later, and
+	// a fresh 4 vCPU job arrives every two minutes for two hours, each running
+	// eight minutes: under fill the stream keeps every fragment taken.
+	var trace Trace
+
+	job := func(at time.Time, tier string, d time.Duration) Arrival {
+		return Arrival{At: at, Tier: tier, Repository: "web", Duration: Duration(d),
+			WorkflowRef: "acme/web/.github/workflows/ci.yml@refs/heads/main"}
+	}
+
+	for i := range 4 {
+		trace.Arrivals = append(trace.Arrivals, job(DefaultStart.Add(time.Duration(i)*time.Second), "billet-4vcpu",
+			8*time.Minute))
+	}
+
+	trace.Arrivals = append(trace.Arrivals, job(DefaultStart.Add(time.Minute), "billet-16vcpu", 5*time.Minute))
+
+	for i := range 60 {
+		trace.Arrivals = append(trace.Arrivals, job(DefaultStart.Add(time.Duration(2*i+2)*time.Minute),
+			"billet-4vcpu", 8*time.Minute))
+	}
+
+	trace.Normalize()
+
+	c := Compare(t, fleet, trace, DefaultPolicies, Options{DirectAssignment: true})
+	t.Log("\n" + c.Markdown())
+
+	fair, fill := c.Reports[0].QueueWaitByShape()[16], c.Reports[1].QueueWaitByShape()[16]
+	if fair.Count != 1 || fill.Count != 1 || fair.Max >= fill.Max {
+		t.Errorf("the wide job waited %s under fair and %s under fill; want fair to start it sooner", fair.Max,
+			fill.Max)
 	}
 }
 
@@ -243,9 +296,9 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 		MaxVCPU: 192, MaxMemory: 544 * config.GiB, AdmissionOrder: config.AdmissionFill,
 	}
 
-	f, err := FleetFromDocument(doc)
-	if err != nil {
-		t.Fatalf("FleetFromDocument: %v", err)
+	f, dropped, err := FleetFromDocument(doc)
+	if err != nil || len(dropped) != 0 {
+		t.Fatalf("FleetFromDocument: %v (dropped %v)", err, dropped)
 	}
 
 	want := Fleet{
@@ -259,10 +312,20 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 		t.Errorf("the fleet is\n%+v\nwant\n%+v", f, want)
 	}
 
+	// A REMOTE HOST IS LEFT OUT AND NAMED, and a tier pinned to one is refused.
 	doc.Hosts = append(doc.Hosts, jobtrace.Host{Name: "cloud", VCPU: 64, Memory: 256 * config.GiB,
 		Provider: config.ProviderEC2})
-	if _, err := FleetFromDocument(doc); err == nil || !strings.Contains(err.Error(), `host "cloud" runs ec2`) {
-		t.Errorf("a fleet with an EC2 host gave %v; want it refused naming the host", err)
+
+	f, dropped, err = FleetFromDocument(doc)
+	if err != nil || !reflect.DeepEqual(dropped, []string{"cloud (ec2)"}) || !reflect.DeepEqual(f, want) {
+		t.Errorf("a fleet with an EC2 host gave %+v, dropped %v, %v; want the EC2 host left out and named", f,
+			dropped, err)
+	}
+
+	doc.Tiers = append(doc.Tiers, jobtrace.Tier{Label: "billet-cloud", VCPU: 8, Memory: 32 * config.GiB,
+		Node: "cloud"})
+	if _, _, err := FleetFromDocument(doc); err == nil || !strings.Contains(err.Error(), `tier "billet-cloud"`) {
+		t.Errorf("a tier pinned to the EC2 host gave %v; want it refused by name", err)
 	}
 }
 
@@ -359,9 +422,13 @@ func readExported(t *testing.T, tracePath, fleetPath string) (Trace, Fleet) {
 		t.Fatal(err)
 	}
 
-	fleet, err := FleetFromDocument(doc)
+	fleet, dropped, err := FleetFromDocument(doc)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	if len(dropped) > 0 {
+		t.Logf("left out of the fleet, as remote backends the simulated one cannot model: %v", dropped)
 	}
 
 	return trace, fleet

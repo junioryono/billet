@@ -178,7 +178,8 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		opts.AfterRun(st.alloc)
 	}
 
-	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment, opts.Until)
+	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment, opts.Until,
+		actions.waitingJobs())
 	if err != nil {
 		t.Fatalf("replay: read the ledger back: %v", err)
 	}

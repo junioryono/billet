@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -170,8 +171,11 @@ func byJobID(byRequest map[int64]*Arrival, jobID string) (*Arrival, bool) {
 }
 
 // readReport reads job_history back and joins it to the trace. A trace job
-// arriving after until (when set) is outside the replay's window.
+// arriving after until (when set) is outside the replay's window, and one in it
+// that had not started is still queued when the ledger recorded it or GitHub
+// (waiting, the plane's books) still holds it, and lost otherwise.
 func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, direct bool, until time.Time,
+	waiting map[int64]bool,
 ) (*Report, error) {
 	bound := int64(len(trace.Arrivals)) + historyBound
 
@@ -356,7 +360,7 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 		switch {
 		case !until.IsZero() && a.At.After(until):
 			r.LaterArrivals++
-		case !until.IsZero() && !started[a.Seq]:
+		case !until.IsZero() && !started[a.Seq] && (seen[a.Seq] || waiting[a.Seq]):
 			r.StillQueued = append(r.StillQueued, a.Seq)
 			r.LongestQueued = max(r.LongestQueued, until.Sub(a.At))
 		case !seen[a.Seq]:
@@ -726,13 +730,10 @@ func (r *Report) QueueWaitBy(key func(*Record) string) map[string]Percentiles {
 }
 
 // percentile is the nearest-rank percentile of a sorted, non-empty slice, the
-// percentile given in parts per ten thousand: the smallest rank whose share
-// reaches it, ceil(p*n/10000), in integers, because a float rounding of
-// 0.9999*n is exactly where p99.99 would pick the wrong job.
+// percentile given in parts per ten thousand, as every percentile billet
+// reports is (alloc.NearestRank).
 func percentile(sorted []time.Duration, perTenThousand int) time.Duration {
-	rank := max((perTenThousand*len(sorted)+9999)/10000, 1)
-
-	return sorted[min(rank, len(sorted))-1]
+	return sorted[min(alloc.NearestRank(perTenThousand, len(sorted)), len(sorted))-1]
 }
 
 // text is the percentiles as the summary prints them.

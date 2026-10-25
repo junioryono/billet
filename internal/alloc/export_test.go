@@ -54,10 +54,11 @@ func TestAnExportsStandInsAreStableAndNameNothing(t *testing.T) {
 		}
 	}
 
-	// A RUN ID IS NUMBERED TOO, the jobs of one run still sharing one.
+	// A RUN ID IS NUMBERED TOO, the jobs of one run still sharing one, and a run
+	// not recorded taking the next number as its own.
 	if a, b, c, none := s.run(39165193253), s.run(39165200000), s.run(39165193253), s.run(0); a != 1 || b != 2 ||
-		c != 1 || none != 0 {
-		t.Errorf("run ids became %d, %d, %d and %d; want 1, 2, 1 and 0 for one not recorded", a, b, c, none)
+		c != 1 || none != 3 {
+		t.Errorf("run ids became %d, %d, %d and %d; want 1, 2, 1 and 3 for one not recorded", a, b, c, none)
 	}
 
 	// THE MATRIX FALLBACK STILL WORKS: a stand-in name's base is one name.
@@ -76,8 +77,35 @@ func TestAnExportsStandInsAreStableAndNameNothing(t *testing.T) {
 		t.Errorf("with names kept: %q %q %q %q", o, r, w, n)
 	}
 
+	// A RUN NOT RECORDED IS ITS OWN: a stand-in from the same count, never one
+	// a recorded run has, and with names kept zero, which the trace numbers.
+	fresh := newStandIns(false)
+	if recorded, unknown, other := fresh.run(77), fresh.run(0), fresh.run(-3); recorded != 1 || unknown != 2 ||
+		other != 3 {
+		t.Errorf("runs 77, unrecorded and unrecorded became %d, %d and %d; want 1, 2 and 3", recorded, unknown,
+			other)
+	}
+	if id := kept.run(0); id != 0 {
+		t.Errorf("with names kept an unrecorded run became %d, want 0", id)
+	}
+
 	if _, r, w, _ := kept.of("", "", ""); r != unrecorded || !strings.Contains(w, unrecorded) {
 		t.Errorf("a row with nothing recorded became repository %q, workflow %q; want the %q stand-in", r, w,
 			unrecorded)
+	}
+}
+
+// A TIME THAT DOES NOT READ IS AN ERROR, never a time not recorded.
+func TestAnExportsTimesAreReadStrictly(t *testing.T) {
+	if got, err := strictStamp(""); err != nil || !got.IsZero() {
+		t.Errorf("an empty time read as %v, %v; want not recorded", got, err)
+	}
+
+	if got, err := strictStamp("2026-10-20T09:00:00.000000000Z"); err != nil || got.IsZero() {
+		t.Errorf("a ledger time read as %v, %v", got, err)
+	}
+
+	if _, err := strictStamp("yesterday"); err == nil || !strings.Contains(err.Error(), `"yesterday"`) {
+		t.Errorf("an unreadable time gave %v; want an error naming it", err)
 	}
 }

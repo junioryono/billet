@@ -82,54 +82,33 @@ func cmdJobsExport(ctx context.Context, env cli.Env, args []string) error {
 	return nil
 }
 
-// exportGaps is what the export left out: the ledger's gaps, and the jobs of
-// tiers the configuration no longer declares, whose shape the fleet cannot
-// give, so a replay could not carry them.
-type exportGaps struct {
-	alloc.ExportGaps
-	UndeclaredTier int
-}
-
 // exportDeployment is the window's trace and the fleet the configuration and
-// the registrations describe.
+// the registrations describe: every host the deployment expects to answer now,
+// which for an --until in the past may not be the fleet of that window.
+//
+// BOTH VALIDATED BEFORE EITHER IS WRITTEN, so an export never leaves a file
+// the replay would refuse (a tier pinned to a host that is not registered).
 func exportDeployment(ctx context.Context, a *alloc.Allocator, cfg *config.Config, since, until time.Time,
 	names bool,
-) (jobtrace.Trace, jobtrace.Fleet, exportGaps, error) {
-	exported, ledgerGaps, err := a.ExportTrace(ctx, since, until, names)
+) (jobtrace.Trace, jobtrace.Fleet, alloc.ExportGaps, error) {
+	trace, gaps, err := a.ExportTrace(ctx, since, until, names)
 	if err != nil {
-		return jobtrace.Trace{}, jobtrace.Fleet{}, exportGaps{}, err
+		return jobtrace.Trace{}, jobtrace.Fleet{}, alloc.ExportGaps{}, err
 	}
-
-	gaps := exportGaps{ExportGaps: ledgerGaps}
-
-	declared := make(map[string]bool, len(cfg.Tiers))
-	for i := range cfg.Tiers {
-		declared[cfg.Tiers[i].Label] = true
-	}
-
-	var trace jobtrace.Trace
-
-	for i := range exported.Arrivals {
-		if !declared[exported.Arrivals[i].Tier] {
-			gaps.UndeclaredTier++
-
-			continue
-		}
-
-		trace.Arrivals = append(trace.Arrivals, exported.Arrivals[i])
-	}
-
-	trace.Normalize()
 
 	if len(trace.Arrivals) == 0 {
 		return jobtrace.Trace{}, jobtrace.Fleet{}, gaps, fmt.Errorf("billet jobs export: no job assigned "+
-			"from %s to %s started and finished, so there is nothing to replay", since.UTC().Format(time.RFC3339),
+			"from %s to %s started and completed, so there is nothing to replay", since.UTC().Format(time.RFC3339),
 			until.UTC().Format(time.RFC3339))
+	}
+
+	if err := trace.Validate(); err != nil {
+		return jobtrace.Trace{}, jobtrace.Fleet{}, gaps, fmt.Errorf("billet jobs export: %w", err)
 	}
 
 	hosts, err := a.ExportHosts(ctx)
 	if err != nil {
-		return jobtrace.Trace{}, jobtrace.Fleet{}, exportGaps{}, err
+		return jobtrace.Trace{}, jobtrace.Fleet{}, alloc.ExportGaps{}, err
 	}
 
 	fleet := jobtrace.Fleet{
@@ -140,6 +119,11 @@ func exportDeployment(ctx context.Context, a *alloc.Allocator, cfg *config.Confi
 	for i := range cfg.Tiers {
 		t := &cfg.Tiers[i]
 		fleet.Tiers = append(fleet.Tiers, jobtrace.Tier{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: t.Node})
+	}
+
+	if err := fleet.Validate(); err != nil {
+		return jobtrace.Trace{}, jobtrace.Fleet{}, gaps, fmt.Errorf("billet jobs export: the fleet is not one "+
+			"a replay can take: %w", err)
 	}
 
 	return trace, fleet, gaps, nil
@@ -183,20 +167,16 @@ func writeExport(dir string, trace jobtrace.Trace, fleet jobtrace.Fleet) error {
 }
 
 // renderExportGaps says what the export read and left out, on stderr.
-func renderExportGaps(env cli.Env, g exportGaps) {
-	fmt.Fprintf(env.Stderr, "billet jobs export: the window held %d jobs", g.Read)
+func renderExportGaps(env cli.Env, g alloc.ExportGaps) {
+	fmt.Fprintf(env.Stderr, "billet jobs export: the window held %d assigned jobs", g.Read)
 
-	if g.NeverStarted+g.NeverFinished+g.NotARuntime > 0 {
-		fmt.Fprintf(env.Stderr, "; left out %d that never started, %d not finished and %d whose end is not after "+
-			"their start", g.NeverStarted, g.NeverFinished, g.NotARuntime)
+	if left := g.NeverStarted + g.NeverCompleted + g.NotARuntime + g.UndeclaredTier; left > 0 {
+		fmt.Fprintf(env.Stderr, "; left out %d that never started, %d GitHub never reported complete, %d whose "+
+			"completion is not after their start and %d of tiers the configuration no longer declares, whose "+
+			"shape the fleet cannot give", g.NeverStarted, g.NeverCompleted, g.NotARuntime, g.UndeclaredTier)
 	}
 
 	fmt.Fprintln(env.Stderr)
-
-	if g.UndeclaredTier > 0 {
-		fmt.Fprintf(env.Stderr, "billet jobs export: left out %d jobs of tiers the configuration no longer "+
-			"declares, whose shape the fleet cannot give\n", g.UndeclaredTier)
-	}
 
 	if g.AssignedAsArrival > 0 {
 		fmt.Fprintf(env.Stderr, "billet jobs export: %d jobs had no GitHub queue time on record and arrive when "+
@@ -205,7 +185,7 @@ func renderExportGaps(env cli.Env, g exportGaps) {
 
 	if g.Unidentified > 0 {
 		fmt.Fprintf(env.Stderr, "billet jobs export: %d jobs had no repository or workflow on record and carry "+
-			"%q in its place\n", g.Unidentified, "unrecorded")
+			"a stand-in for it\n", g.Unidentified)
 	}
 
 	if g.Partial {

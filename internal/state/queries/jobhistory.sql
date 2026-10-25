@@ -471,9 +471,11 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name,
 --
 -- WINDOWED ON queued_at, billet's clock when the job was assigned, which every
 -- row has and the index covers; a job GitHub queued before the window and
--- billet was assigned inside it belongs to it, as its wait does. result_at is
--- when the completion arrived, so a job's runtime as GitHub ran it is
--- result_at less started_at, without the teardown that finished_at includes.
+-- billet was assigned inside it belongs to it, as its wait does. ONLY ROWS A
+-- JOB WAS ASSIGNED TO: the archive of a lease bought and never used writes a
+-- row too, with no assigned_at, and those would take the bound from real jobs.
+-- result_at is when the completion arrived, so a job's runtime as GitHub ran
+-- it is result_at less started_at, without the teardown finished_at includes.
 SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name, github_job_id,
        COALESCE(request_id, 0) AS request_id,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
@@ -481,6 +483,6 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name, githu
        github_queued_at, queued_at, COALESCE(started_at, '') AS started_at,
        result_at, COALESCE(finished_at, '') AS finished_at, result
   FROM job_history
- WHERE queued_at >= @since AND queued_at < @until
+ WHERE queued_at >= @since AND queued_at < @until AND assigned_at IS NOT NULL
  ORDER BY queued_at, lease_id
  LIMIT CAST(@max_rows AS BIGINT);

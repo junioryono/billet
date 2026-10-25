@@ -177,15 +177,18 @@ func (f Fleet) tiers(trace Trace) []config.Tier {
 
 // FleetFromDocument is the fleet a trace's document describes (billet jobs
 // export writes one), ready to replay against: every host simulated, every
-// tier on the simulated backend at its charged shape.
+// tier on the simulated backend at its charged shape. It returns the hosts it
+// left out, by name, for the replay's record to say.
 //
-// A REMOTE BACKEND IS REFUSED BY NAME. The simulated backend runs work on a
-// host it holds, so an EC2 or CodeBuild node, whose capacity is a catalogue
-// of shapes bought per job, cannot be modelled as one, and a replay that
-// pretended to would measure a fleet the deployment never had.
-func FleetFromDocument(doc jobtrace.Fleet) (Fleet, error) {
+// A REMOTE BACKEND IS LEFT OUT. The simulated backend runs work on a host it
+// holds, so an EC2 or CodeBuild node, whose capacity is a catalogue of shapes
+// bought per job, cannot be modelled as one, and a replay that pretended to
+// would measure a fleet the deployment never had; the jobs it served are
+// replayed on the hosts that remain. A tier pinned to a host left out cannot
+// be replayed at all, and is refused by name.
+func FleetFromDocument(doc jobtrace.Fleet) (Fleet, []string, error) {
 	if err := doc.Validate(); err != nil {
-		return Fleet{}, err
+		return Fleet{}, nil, err
 	}
 
 	f := Fleet{
@@ -193,12 +196,11 @@ func FleetFromDocument(doc jobtrace.Fleet) (Fleet, error) {
 		AdmissionOrder: doc.AdmissionOrder,
 	}
 
-	var errs []error
+	var dropped []string
 
 	for _, h := range doc.Hosts {
 		if h.Provider != "" && !h.Provider.RunsOnHost() {
-			errs = append(errs, fmt.Errorf("replay: host %q runs %s, a remote backend the simulated one cannot "+
-				"model; leave it out of the fleet or replay without it", h.Name, h.Provider))
+			dropped = append(dropped, fmt.Sprintf("%s (%s)", h.Name, h.Provider))
 
 			continue
 		}
@@ -206,15 +208,29 @@ func FleetFromDocument(doc jobtrace.Fleet) (Fleet, error) {
 		f.Hosts = append(f.Hosts, Host{Name: h.Name, VCPU: h.VCPU, Memory: h.Memory, Site: h.Site})
 	}
 
+	var errs []error
+
 	for _, t := range doc.Tiers {
+		if t.Node != "" && !slices.ContainsFunc(f.Hosts, func(h Host) bool { return h.Name == t.Node }) {
+			errs = append(errs, fmt.Errorf("replay: tier %q is pinned to %q, a remote host the simulated backend "+
+				"cannot model", t.Label, t.Node))
+
+			continue
+		}
+
 		f.Tiers = append(f.Tiers, TierShape{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: t.Node})
 	}
 
 	if err := errors.Join(errs...); err != nil {
-		return Fleet{}, err
+		return Fleet{}, nil, err
 	}
 
-	return f, nil
+	if len(f.Hosts) == 0 {
+		return Fleet{}, nil, fmt.Errorf("replay: every host of the fleet is remote (%v), and the simulated "+
+			"backend cannot model one", dropped)
+	}
+
+	return f, dropped, nil
 }
 
 // cost prices one record, and says which rate did it.

@@ -236,32 +236,70 @@ func IdleBacklog(seed uint64, p Params) Trace {
 	return t
 }
 
-// QuietBesideSaturated is one tier, the first of p.Tiers, kept saturated by a
-// steady stream of short jobs, beside a quiet tier, the last, that queues a
-// job every twenty minutes or so on the same hosts: the shape that shows
-// whether the quiet tier's few jobs wait behind the busy one's many.
-func QuietBesideSaturated(seed uint64, p Params) Trace {
-	g := newGenerator(seed, p)
+// QuietParams shape QuietBesideSaturated.
+type QuietParams struct {
+	Params
+	// Fleet is what the busy tier saturates; its tiers' first is the busy one
+	// and its last the quiet one.
+	Fleet Fleet
+	// Saturation is the share of the fleet's vCPU room the busy tier offers;
+	// zero means 1.5, a backlog that only grows.
+	Saturation float64
+}
 
-	busy, quiet := g.p.Tiers[0], g.p.Tiers[len(g.p.Tiers)-1]
+// quietMedian and busyMedian are the runtimes QuietBesideSaturated draws
+// around.
+const (
+	busyMedian  = 4 * time.Minute
+	quietMedian = 6 * time.Minute
+	quietSigma  = 0.3
+	busySigma   = 0.4
+)
 
-	var t Trace
+// QuietBesideSaturated is one tier, the fleet's first, offered more work than
+// the whole fleet holds (Saturation of its vCPU room), beside a quiet tier,
+// the fleet's last, whose few jobs arrive at random across the same span on
+// the same hosts: the shape that shows whether the quiet tier's jobs wait
+// behind the busy one's backlog. A tenth of the jobs are the quiet tier's.
+func QuietBesideSaturated(seed uint64, p QuietParams) Trace {
+	if p.Saturation <= 0 {
+		p.Saturation = 1.5
+	}
+
+	busy, quiet := p.Fleet.Tiers[0], p.Fleet.Tiers[len(p.Fleet.Tiers)-1]
+	p.Tiers = []string{busy.Label, quiet.Label}
+	g := newGenerator(seed, p.Params)
+
+	room := 0
+	for _, h := range p.Fleet.Hosts {
+		room += h.VCPU
+	}
+
+	room = min(room, p.Fleet.MaxVCPU)
 
 	quietJobs := max(g.p.Jobs/10, 1)
 	busyJobs := g.p.Jobs - quietJobs
 
+	// The busy tier's mean gap makes its offered vCPU-time Saturation of the
+	// room: a job's vCPU times its mean runtime, over the room's share.
+	meanBusy := float64(busyMedian) * math.Exp(busySigma*busySigma/2)
+	gap := float64(busy.VCPU) * meanBusy / (p.Saturation * float64(room))
+
+	var t Trace
+
 	at := g.p.Start
 	for i := range busyJobs {
-		at = at.Add(time.Duration(g.r.ExpFloat64() * float64(20*time.Second)))
-		t.Arrivals = append(t.Arrivals, g.arrival(at, busy, g.pick(g.p.Repositories), int64(40000+i),
-			g.lognormal(4*time.Minute, 0.4)))
+		at = at.Add(time.Duration(g.r.ExpFloat64() * gap))
+		t.Arrivals = append(t.Arrivals, g.arrival(at, busy.Label, g.pick(g.p.Repositories), int64(40000+i),
+			g.lognormal(busyMedian, busySigma)))
 	}
 
-	at = g.p.Start
+	span := at.Sub(g.p.Start)
+
 	for i := range quietJobs {
-		at = at.Add(time.Duration(g.r.ExpFloat64() * float64(20*time.Minute)))
-		t.Arrivals = append(t.Arrivals, g.arrival(at, quiet, g.pick(g.p.Repositories), int64(45000+i),
-			g.lognormal(6*time.Minute, 0.3)))
+		quietAt := g.p.Start.Add(time.Duration(g.r.Float64() * float64(span)))
+		t.Arrivals = append(t.Arrivals, g.arrival(quietAt, quiet.Label, g.pick(g.p.Repositories), int64(45000+i),
+			g.lognormal(quietMedian, quietSigma)))
 	}
 
 	t.Normalize()
@@ -309,7 +347,12 @@ func WideShapeMix(seed uint64, p WideParams) Trace {
 	tiers := slices.Clone(p.Fleet.Tiers)
 	slices.SortStableFunc(tiers, func(a, b TierShape) int { return a.VCPU - b.VCPU })
 
+	// A FLEET OF ONE TIER IS ALL WIDE: there is no narrower tier to mix in,
+	// and the one tier stands for both.
 	wide, narrow := tiers[len(tiers)-1], tiers[:len(tiers)-1]
+	if len(narrow) == 0 {
+		narrow = tiers
+	}
 
 	labels := make([]string, len(narrow))
 	for i := range narrow {

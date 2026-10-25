@@ -63,6 +63,17 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 		if err != nil {
 			t.Fatalf("Reserve: %v", err)
 		}
+
+		if j.escrowOnly {
+			now = j.start.Add(j.runtime)
+			if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+				t.Fatalf("Release an unused lease: %v", err)
+			}
+
+			leases = append(leases, lease.ID)
+
+			continue
+		}
 		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
 			t.Fatalf("Bind: %v", err)
 		}
@@ -83,7 +94,14 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 			}
 		}
 
+		// GITHUB'S COMPLETION AT THE JOB'S END, then the archive, as the listener
+		// records them.
 		now = j.start.Add(j.runtime)
+		if !j.noResult {
+			if err := a.RecordJobResult(t.Context(), lease.ID, "succeeded", 0); err != nil {
+				t.Fatalf("RecordJobResult: %v", err)
+			}
+		}
 		if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
 			t.Fatalf("Release: %v", err)
 		}
@@ -107,6 +125,9 @@ type ranHistoryJob struct {
 	start   time.Time
 	runtime time.Duration
 	tier    string
+	// noResult archives the lease with no completion from GitHub, as a job
+	// cancelled or lost is; escrowOnly buys a lease and archives it unused.
+	noResult, escrowOnly bool
 }
 
 // runtimeHistory is three 6m runs of a job three days ago, one 3m job of

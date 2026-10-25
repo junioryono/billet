@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // A trace survives a round trip through its file format unchanged.
@@ -203,14 +205,42 @@ func TestTheAdversarialGeneratorsHaveTheirShapes(t *testing.T) {
 	within("Burst", Burst(1, Params{Jobs: 50}), 10*time.Second)
 	within("IdleBacklog", IdleBacklog(1, Params{Jobs: 50}), 30*time.Second)
 
-	quiet := QuietBesideSaturated(1, Params{Jobs: 50, Tiers: []string{"busy", "quiet"}})
+	// THE QUIET TIER ARRIVES INSIDE THE BUSY ONE'S SPAN, and the busy one
+	// offers more than the fleet holds.
+	small := Fleet{
+		Hosts: []Host{{Name: "only", VCPU: 16, Memory: 64 * config.GiB}},
+		Tiers: []TierShape{{Label: "busy", VCPU: 2, Memory: 8 * config.GiB},
+			{Label: "quiet", VCPU: 4, Memory: 16 * config.GiB}},
+		MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+	}
+	quiet := QuietBesideSaturated(1, QuietParams{Params: Params{Jobs: 200}, Fleet: small})
 	counts := map[string]int{}
+
+	var busyAsked float64
+
+	var busyLast time.Time
+
 	for _, a := range quiet.Arrivals {
 		counts[a.Tier]++
+
+		if a.Tier == "busy" {
+			busyAsked += 2 * time.Duration(a.Duration).Seconds()
+			busyLast = a.At
+		}
 	}
 
-	if counts["busy"] != 45 || counts["quiet"] != 5 {
-		t.Errorf("QuietBesideSaturated put %v on its tiers; want 45 busy and 5 quiet", counts)
+	for _, a := range quiet.Arrivals {
+		if a.Tier == "quiet" && a.At.After(busyLast) {
+			t.Errorf("a quiet job arrives at %s, after the busy stream's last at %s", a.At, busyLast)
+		}
+	}
+
+	if counts["busy"] != 180 || counts["quiet"] != 20 {
+		t.Errorf("QuietBesideSaturated put %v on its tiers; want 180 busy and 20 quiet", counts)
+	}
+
+	if load := busyAsked / (16 * busyLast.Sub(quiet.Arrivals[0].At).Seconds()); load < 1.2 {
+		t.Errorf("the busy tier offers a load of %.2f of the room; want it saturated, about 1.5", load)
 	}
 
 	// THE WIDE MIX OFFERS ABOUT ITS LOAD: the vCPU-time its jobs ask for over
@@ -241,10 +271,20 @@ func TestTheAdversarialGeneratorsHaveTheirShapes(t *testing.T) {
 		t.Errorf("WideShapeMix made %.3f of its jobs whole-host; want about 0.05", share)
 	}
 
+	// A FLEET OF ONE TIER IS ALL WIDE.
+	one := Fleet{Hosts: fleet.Hosts, Tiers: fleet.Tiers[4:], MaxVCPU: fleet.MaxVCPU, MaxMemory: fleet.MaxMemory}
+	for _, a := range WideShapeMix(2, WideParams{Params: Params{Jobs: 20}, Fleet: one}).Arrivals {
+		if a.Tier != "billet-32vcpu" {
+			t.Errorf("a one-tier wide mix put a job on %q", a.Tier)
+		}
+	}
+
 	for name, gen := range map[string]func(uint64) Trace{
-		"Burst":                func(s uint64) Trace { return Burst(s, Params{Jobs: 20}) },
-		"IdleBacklog":          func(s uint64) Trace { return IdleBacklog(s, Params{Jobs: 20}) },
-		"QuietBesideSaturated": func(s uint64) Trace { return QuietBesideSaturated(s, Params{Jobs: 20}) },
+		"Burst":       func(s uint64) Trace { return Burst(s, Params{Jobs: 20}) },
+		"IdleBacklog": func(s uint64) Trace { return IdleBacklog(s, Params{Jobs: 20}) },
+		"QuietBesideSaturated": func(s uint64) Trace {
+			return QuietBesideSaturated(s, QuietParams{Params: Params{Jobs: 20}, Fleet: small})
+		},
 		"WideShapeMix": func(s uint64) Trace {
 			return WideShapeMix(s, WideParams{Params: Params{Jobs: 20}, Fleet: fleet})
 		},

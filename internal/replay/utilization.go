@@ -1,6 +1,8 @@
 package replay
 
 import (
+	"fmt"
+	"io"
 	"slices"
 	"time"
 )
@@ -182,6 +184,22 @@ func (r *Report) Utilization(bucket time.Duration) []UtilizationPoint {
 	}
 
 	return out
+}
+
+// WriteUtilization writes Utilization over bucket as CSV, one bucket a line:
+// its start in RFC 3339 and the shares of the room's vCPU and memory charged.
+func (r *Report) WriteUtilization(w io.Writer, bucket time.Duration) error {
+	if _, err := fmt.Fprintln(w, "from,vcpu,memory"); err != nil {
+		return fmt.Errorf("replay: write utilization: %w", err)
+	}
+
+	for _, p := range r.Utilization(bucket) {
+		if _, err := fmt.Fprintf(w, "%s,%.4f,%.4f\n", p.From.Format(time.RFC3339), p.VCPU, p.Memory); err != nil {
+			return fmt.Errorf("replay: write utilization: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // MeanUtilization is the share of the fleet's room charged over the whole

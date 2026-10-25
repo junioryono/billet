@@ -177,10 +177,14 @@ type plane struct {
 	// declinedThenRun counts assignments acknowledged with no runner minted for
 	// them that a later runner took: work billet declined and ran once it could.
 	declinedThenRun int
-	// declined counts, per tier, the purchases billet refused: an offer it
-	// acknowledged without acquiring, or a direct assignment it acknowledged
-	// with no runner minted for it. Each is work that waited on.
-	declined map[string]int
+	// declined counts, per tier, the jobs billet refused to buy for at least
+	// once: an offer it acknowledged without acquiring, or a direct assignment
+	// it acknowledged with no runner minted for it. Counted once a job, not
+	// once a refusal, because how often a waiting job is offered again is the
+	// harness's nudge cadence, which is not GitHub's; refusedJobs remembers
+	// which jobs were counted.
+	declined    map[string]int
+	refusedJobs map[int64]bool
 }
 
 var (
@@ -207,6 +211,7 @@ func newPlane(t *testing.T, clock *Clock, fleet Fleet, trace Trace) *plane {
 		runnersByID: map[int64]*runner{},
 		nextRunner:  1000,
 		declined:    map[string]int{},
+		refusedJobs: map[int64]bool{},
 	}
 	p.cond = sync.NewCond(&p.mu)
 
@@ -983,10 +988,17 @@ func (p *plane) ack(w http.ResponseWriter, s *scaleSet, msgID int) {
 	// An assignment the message carried and nothing minted for waits for the
 	// next runner on the set, and an offer it carried that billet did not
 	// acquire waits at GitHub: each a purchase billet refused.
-	p.declined[s.name] += len(s.inflight)
+	refused := slices.Clone(s.inflight)
 
 	for _, id := range s.queue[0].offered {
 		if _, waiting := s.available[id]; waiting {
+			refused = append(refused, id)
+		}
+	}
+
+	for _, id := range refused {
+		if !p.refusedJobs[id] {
+			p.refusedJobs[id] = true
 			p.declined[s.name]++
 		}
 	}
@@ -1035,7 +1047,14 @@ func (p *plane) jobJSON(kind string, a Arrival, fields fakeactions.JobFields) ma
 		fields.JobID = "job-" + itoa(a.Seq)
 	}
 
-	return fields.Apply(fakeactions.JobJSON(kind, request, "push", a.Tier))
+	job := fields.Apply(fakeactions.JobJSON(kind, request, "push", a.Tier))
+
+	// THE TRACE'S NAME, EMPTY INCLUDED: Apply leaves JobJSON's default in place
+	// for an empty one, and a name the trace does not have would be learned and
+	// exported as the job's.
+	job["jobDisplayName"] = a.Job
+
+	return job
 }
 
 // schedule adds an event the run loop will deliver.
@@ -1100,6 +1119,32 @@ func (p *plane) deliver(ev event) {
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name, Result: a.Result,
 		}))
 	}
+}
+
+// waitingJobs is every job GitHub still holds for a runner: offered or
+// assigned and not yet taken, in the plane's own books. A job the ledger has no
+// row for and the plane does not hold either is lost, not queued.
+func (p *plane) waitingJobs() map[int64]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := map[int64]bool{}
+
+	for _, s := range p.sets {
+		for id := range s.available {
+			out[id] = true
+		}
+
+		for _, id := range s.unpaired {
+			out[id] = true
+		}
+
+		for _, id := range s.inflight {
+			out[id] = true
+		}
+	}
+
+	return out
 }
 
 // AwaitIdle returns once every tier's session is open, its queue is empty and

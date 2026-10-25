@@ -20,6 +20,15 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 
 	runtimeHistory(t, stateDir)
 
+	// A JOB GITHUB NEVER REPORTED COMPLETE IS LEFT OUT, never exported as one
+	// that succeeded, and A LEASE NEVER ASSIGNED A JOB IS NOT A JOB AT ALL: its
+	// archive writes a history row too, which the export does not read.
+	recent := time.Now().Add(-12 * time.Hour).Truncate(time.Hour)
+	ranHistory(t, stateDir, []ranHistoryJob{
+		{name: "build (ubuntu)", start: recent.Add(time.Minute), runtime: 3 * time.Minute, noResult: true},
+		{start: recent.Add(10 * time.Minute), runtime: time.Minute, escrowOnly: true},
+	})
+
 	out := t.TempDir()
 	var stderr strings.Builder
 
@@ -33,7 +42,8 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	// does not declare: its shape is not the fleet's to give, so it is left out
 	// and said to be.
 	if !strings.Contains(stdout.String(), "7 jobs and 1 hosts written") ||
-		!strings.Contains(stderr.String(), "left out 1 jobs of tiers the configuration no longer declares") {
+		!strings.Contains(stderr.String(), "the window held 9 assigned jobs; left out 0 that never started, 1 "+
+			"GitHub never reported complete, 0 whose completion is not after their start and 1 of tiers") {
 		t.Errorf("the export says %q and %q; want 7 jobs and 1 host, and the one left out", stdout, &stderr)
 	}
 
@@ -50,6 +60,13 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 
 	if len(trace.Arrivals) != 7 {
 		t.Fatalf("the trace has %d jobs, want the 7 of a declared tier the ledger ran", len(trace.Arrivals))
+	}
+
+	// EVERY JOB RAN IN RUN 4242, which without names is the first run stand-in.
+	for _, a := range trace.Arrivals {
+		if a.RunID != 1 {
+			t.Errorf("job %d is in run %d; want run 4242 as its stand-in, 1", a.Seq, a.RunID)
+		}
 	}
 
 	first := trace.Arrivals[0]
@@ -104,7 +121,8 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), `"repository":"api"`) || !strings.Contains(string(body), `"job":"build (ubuntu)"`) {
+	if !strings.Contains(string(body), `"repository":"api"`) || !strings.Contains(string(body), `"job":"build (ubuntu)"`) ||
+		!strings.Contains(string(body), `"run_id":4242`) {
 		t.Errorf("an export with --names lost the names:\n%s", body)
 	}
 
