@@ -34,10 +34,38 @@ type refusal struct {
 }
 
 // explained reports whether the refusal names its cause: a drain, the admission
-// order, or the allocator's own reason. Under contention every decline is one
-// of these; one with no reason, or whose reason could not be read, is not.
+// order, or a limit the allocator says binds or the waiters it had to leave room
+// for. Under contention every decline is one of these; one with no reason, one
+// whose reason could not be read, and an allocator that says no limit binds are
+// not.
 func (r refusal) explained() bool {
-	return r.draining || r.waiter != "" || (r.room != nil && r.unread == nil)
+	return r.draining || r.waiter != "" ||
+		(r.room != nil && r.unread == nil && (r.room.Binds() || len(r.protecting) > 0))
+}
+
+// attrs is the refusal as log attributes.
+func (r refusal) attrs() []any {
+	args := []any{"reason", r.String()}
+	if r.waiter != "" {
+		args = append(args, "held_by", r.waiter)
+	}
+
+	return args
+}
+
+// assignmentBacking is what backAssignment found for one request: the refusal
+// its own purchase met, or none when backing was there or was bought.
+type assignmentBacking struct {
+	request int64
+	refused refusal
+	set     bool
+}
+
+// backedBy records what backAssignment found for request.
+func (l *Listener) backedBy(request int64, r refusal) {
+	l.mu.Lock()
+	l.backed = assignmentBacking{request: request, refused: r, set: true}
+	l.mu.Unlock()
 }
 
 // byOrder reports whether the admission order, not the allocator, refused.
@@ -123,12 +151,22 @@ func (l *Listener) refuse(r refusal, announce bool) {
 // one is said again.
 func (l *Listener) refusalServed() {
 	l.mu.Lock()
+	reason, unlogged := l.declineLogged, l.declinesUnlogged
 	l.refused, l.refusedLogged = refusal{}, ""
 	l.declineLogged, l.declinesUnlogged = "", 0
 	l.mu.Unlock()
+
+	if unlogged > 0 {
+		l.log.Info("the tier is served again; assignments were declined for want of escrow "+
+			"since the line that gave this reason",
+			"tier", l.tier, "reason", reason, "declined_under_previous_reason", unlogged)
+	}
 }
 
-// logDecline logs an assignment declined for want of escrow. It requires l.mu.
+// logDecline logs an assignment declined for want of escrow, explained only by
+// the refusal backAssignment met for this request: a refusal left from another
+// purchase says nothing about why backing this one found was gone. It requires
+// l.mu.
 //
 // AN EXPLAINED DECLINE IS CONTENTION, NOT A FAULT. The advertisement is never
 // gated, so on a full fleet GitHub assigns more than billet can buy, and every
@@ -139,13 +177,17 @@ func (l *Listener) refusalServed() {
 // said once per reason, with how many were declined under the reason before,
 // and one with no explanation (a promise lost to a race) is an error every time.
 func (l *Listener) logDecline(job dispatch.Job) {
-	args := append([]any{"tier", l.tier, "request", job.RequestID, "run", job.RunID}, l.declineReason()...)
-	if !l.refused.explained() {
+	var why refusal
+	if l.backed.set && l.backed.request == job.RequestID {
+		why = l.backed.refused
+	}
+	args := append([]any{"tier", l.tier, "request", job.RequestID, "run", job.RunID}, why.attrs()...)
+	if !why.explained() {
 		l.log.Error("assigned a request with no escrow to back it; declining it", args...)
 
 		return
 	}
-	reason := l.refused.String()
+	reason := why.String()
 	if reason == l.declineLogged {
 		l.declinesUnlogged++
 
@@ -159,10 +201,5 @@ func (l *Listener) logDecline(job dispatch.Job) {
 
 // declineReason is the last refusal as log attributes. It requires l.mu.
 func (l *Listener) declineReason() []any {
-	args := []any{"reason", l.refused.String()}
-	if l.refused.waiter != "" {
-		args = append(args, "held_by", l.refused.waiter)
-	}
-
-	return args
+	return l.refused.attrs()
 }
