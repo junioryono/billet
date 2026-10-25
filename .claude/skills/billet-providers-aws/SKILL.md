@@ -33,6 +33,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`awspolicy` is one generator with three consumers and a measured boundary.**
 - **`ec2:CreateVolume` from a snapshot authorises the snapshot as well**
 - **`ec2:RunInstances` on `*` authorises every snapshot a block-device mapping names**
+- **The runner has no sudo, and is in the docker group.**
 
 ### codebuild: [references/codebuild.md](references/codebuild.md)
 
