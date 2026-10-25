@@ -556,7 +556,10 @@ func lookupZoned(ctx context.Context, network, host string) ([]netip.Addr, error
 }
 
 // addrsIn is the addresses of a lookup's answer in network ("ip", "ip4" or
-// "ip6"), zones kept.
+// "ip6"), zones kept. The transport dials "tcp", so the lookup asks for both
+// families and nothing here is filtered in practice; a dial for one family
+// would still wait on the other's query, which is why the filter is no more
+// than a filter.
 func addrsIn(ips []net.IPAddr, network string) []netip.Addr {
 	addrs := make([]netip.Addr, 0, len(ips))
 

@@ -1080,6 +1080,13 @@ func TestTheAddressesOfANameShareOneBound(t *testing.T) {
 		t.Fatal("the attempts at the name's addresses had no deadline")
 	}
 
+	// THE FIRST ATTEMPT HAS THE STANDARD DIALER'S FLOOR, two seconds, where an
+	// equal share of three would be one; a policy that gave each address a
+	// second of its own would end within the bound too.
+	if got := deadlines[0].Sub(first); got < 2*time.Second-250*time.Millisecond {
+		t.Fatalf("the first of three addresses was given %v, want the two-second floor", got)
+	}
+
 	// THE LAST ATTEMPT ENDS WITHIN THE ONE BOUND of the first's start, with a
 	// little for the time between taking the bound and the first attempt.
 	limit := first.Add(3*time.Second + 250*time.Millisecond)
