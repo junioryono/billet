@@ -723,7 +723,7 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 
 	answer := func(id uint32, dst netip.Addr, wait time.Duration) Flow {
 		f := flow(id, guest, dst, 100, 100)
-		a.ObserveNew(f, started)
+		a.ObserveNew(f, started, false)
 		a.ObserveReply(f, started.Add(wait))
 		a.ObserveReply(f, started.Add(wait+time.Minute))
 
@@ -732,10 +732,10 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 	a.Observe(answer(1, github, 40*time.Millisecond))
 	a.Observe(answer(2, github, 2500*time.Millisecond))
 	a.Observe(answer(3, resolver, 1600*time.Millisecond))
-	a.ObserveNew(flow(4, guest, github, 0, 0), started)
+	a.ObserveNew(flow(4, guest, github, 0, 0), started, false)
 	a.Observe(flow(4, guest, github, 60, 0))
 	a.Observe(flow(5, guest, github, 100, 100))
-	a.ObserveNew(flow(6, guest, github, 0, 0), started.Add(10*time.Second))
+	a.ObserveNew(flow(6, guest, github, 0, 0), started.Add(10*time.Second), false)
 	a.ObserveReply(flow(6, guest, github, 0, 0), started.Add(10*time.Second+time.Millisecond))
 	a.Observe(flow(6, guest, github, 100, 100))
 	// A READING WITH NOTHING BACK IN IT, beside a reply event, is counted as the
@@ -773,15 +773,15 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 	type step func(*Accountant)
 	first := flow(9, guest, github, 100, 100)
 	second := startedAt(flow(9, guest, npm, 100, 100), started.Add(400*time.Millisecond))
-	newA := func(a *Accountant) { a.ObserveNew(first, started) }
+	newA := func(a *Accountant) { a.ObserveNew(first, started, false) }
 	replyA := func(a *Accountant) { a.ObserveReply(first, started.Add(20*time.Millisecond)) }
 	destroyA := func(a *Accountant) { a.Observe(first) }
-	newB := func(a *Accountant) { a.ObserveNew(second, second.Start) }
+	newB := func(a *Accountant) { a.ObserveNew(second, second.Start, false) }
 	replyB := func(a *Accountant) { a.ObserveReply(second, second.Start.Add(1200*time.Millisecond)) }
 	destroyB := func(a *Accountant) { a.Observe(second) }
-	lateNewA := func(a *Accountant) { a.ObserveNew(first, started.Add(1200*time.Millisecond)) }
+	lateNewA := func(a *Accountant) { a.ObserveNew(first, started.Add(1200*time.Millisecond), false) }
 	lateReplyA := func(a *Accountant) { a.ObserveReply(first, started.Add(1220*time.Millisecond)) }
-	lateNewB := func(a *Accountant) { a.ObserveNew(second, second.Start.Add(1200*time.Millisecond)) }
+	lateNewB := func(a *Accountant) { a.ObserveNew(second, second.Start.Add(1200*time.Millisecond), false) }
 	for name, tc := range map[string]struct {
 		beforeWatch, steps []step
 		open               []Flow
@@ -839,8 +839,8 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 	collide.Watch("lease-x", guest, began, nil)
 	slowFlow := flow(12, guest, github, 100, 100)
 	fastFlow := startedAt(flow(12, guest, npm, 100, 100), started.Add(5*time.Millisecond))
-	collide.ObserveNew(slowFlow, slowFlow.Start)
-	collide.ObserveNew(fastFlow, fastFlow.Start)
+	collide.ObserveNew(slowFlow, slowFlow.Start, false)
+	collide.ObserveNew(fastFlow, fastFlow.Start, false)
 	collide.ObserveReply(fastFlow, fastFlow.Start.Add(20*time.Millisecond))
 	collide.ObserveReply(slowFlow, slowFlow.Start.Add(3*time.Second))
 	collide.Observe(slowFlow)
@@ -879,7 +879,7 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 	replyA(dumped)
 	destroyA(dumped)
 	sameTuple := startedAt(flow(9, guest, github, 100, 100), started.Add(100*time.Millisecond))
-	dumped.ObserveNew(sameTuple, sameTuple.Start)
+	dumped.ObserveNew(sameTuple, sameTuple.Start, false)
 	dumped.ObserveReply(sameTuple, sameTuple.Start.Add(1200*time.Millisecond))
 	r, _ = dumped.Final("lease-s", []Flow{first}, started.Add(50*time.Millisecond))
 	if len(r.Destinations) != 1 || r.Destinations[0].TimedReplies != 1 ||
@@ -887,13 +887,70 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 		t.Errorf("a stale dump of a destroyed flow took its reuse's wait: %+v", r.Destinations)
 	}
 
-	// PAST MaxFlows GENERATIONS THE JOB IS UNTIMED, since one not kept would
-	// leave an earlier generation looking like the only candidate.
+	// PAST MaxFlows GENERATIONS THE JOB IS UNTIMED and no more are held, and a
+	// destruction gives its generation back.
 	capped := NewAccountant()
 	capped.Up(began.Add(-time.Hour))
 	capped.Watch("lease-c", guest, began, nil)
-	for i := range MaxFlows + 1 {
-		capped.ObserveNew(flow(uint32(100+i), guest, github, 0, 0), started)
+	distinct := func(i int) Flow {
+		f := flow(uint32(100+i), guest, github, 1, 1)
+		f.SourcePort = uint16(1024 + i%60000)
+		f.DestPort = uint16(443 + i/60000)
+
+		return f
+	}
+	for i := range MaxFlows + 5 {
+		capped.ObserveNew(distinct(i), started, false)
+	}
+	capped.mu.Lock()
+	held := len(capped.byKey["lease-c"].generations)
+	capped.mu.Unlock()
+	if held != MaxFlows {
+		t.Errorf("past the cap %d generations are held, want %d", held, MaxFlows)
+	}
+	capped.Observe(distinct(0))
+	capped.mu.Lock()
+	held = len(capped.byKey["lease-c"].generations)
+	capped.mu.Unlock()
+	if held != MaxFlows-1 {
+		t.Errorf("a destruction left %d generations held, want %d", held, MaxFlows-1)
+	}
+	if r, _ := capped.Final("lease-c", nil, ended); r.RepliesTimed {
+		t.Error("a job past MaxFlows generations is still timed")
+	}
+
+	// A NEW EVENT ANNOUNCED AGAIN for a flow already held is no creation time,
+	// and the job is untimed rather than timed from it; one that carries the
+	// reply already starts no wait; and a protocol whose identity the tuple's
+	// ports do not hold, ICMP, is never timed.
+	repeated := NewAccountant()
+	repeated.Up(began.Add(-time.Hour))
+	repeated.Watch("lease-n", guest, began, nil)
+	once := flow(13, guest, github, 100, 100)
+	repeated.ObserveNew(once, started, false)
+	repeated.ObserveNew(once, started.Add(100*time.Millisecond), true)
+	repeated.ObserveReply(once, started.Add(101*time.Millisecond))
+	repeated.Observe(once)
+	if r, _ := repeated.Final("lease-n", nil, ended); r.RepliesTimed {
+		t.Errorf("a job whose flow's creation was announced twice is timed: %+v", r)
+	}
+	others := NewAccountant()
+	others.Up(began.Add(-time.Hour))
+	others.Watch("lease-o", guest, began, nil)
+	late := flow(14, guest, github, 100, 100)
+	others.ObserveNew(late, started, true)
+	others.ObserveReply(late, started.Add(time.Millisecond))
+	others.Observe(late)
+	ping := flow(15, guest, npm, 64, 64)
+	ping.Protocol, ping.DestPort = 1, 0
+	others.ObserveNew(ping, started, false)
+	others.ObserveReply(ping, started.Add(3*time.Second))
+	others.Observe(ping)
+	r, _ = others.Final("lease-o", nil, ended)
+	for _, d := range r.Destinations {
+		if d.TimedReplies != 0 {
+			t.Errorf("an answered creation or an ICMP flow was timed: %+v", d)
+		}
 	}
 	if r, _ := capped.Final("lease-c", nil, ended); r.RepliesTimed {
 		t.Error("a job past MaxFlows generations is still timed")
@@ -909,7 +966,7 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 		f := flow(uint32(i+1), guest, dst, 1000, 1000)
 		if i >= MaxDestinations {
 			f = flow(uint32(i+1), guest, dst, 1, 1)
-			beyond.ObserveNew(f, started)
+			beyond.ObserveNew(f, started, false)
 			beyond.ObserveReply(f, started.Add(time.Duration(i-MaxDestinations)*time.Second+1))
 		}
 		beyond.Observe(f)

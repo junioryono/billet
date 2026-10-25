@@ -64,6 +64,7 @@ type Flow struct {
 	// zero when it did not say.
 	Start      time.Time
 	Protocol   uint8
+	Zone       uint16     // the tracker's zone, which keeps apart entries of one tuple
 	Source     netip.Addr // the original source: the guest, for a guest's flow
 	Dest       netip.Addr // the original destination, before any NAT
 	SourcePort uint16
@@ -82,19 +83,26 @@ type Flow struct {
 }
 
 // generationKey is a flow's identity as its events tell it: the tracker's id,
-// which is a 32-bit hash two live entries can share, and the original tuple,
-// which they cannot.
+// which is a 32-bit hash two live entries can share, and the original tuple and
+// zone, which they cannot. Complete only for TCP and UDP, whose tuple is the
+// ports; a protocol whose tuple has other fields (ICMP's id, type and code) is
+// never timed.
 type generationKey struct {
 	id                   uint32
 	protocol             uint8
+	zone                 uint16
 	dest                 netip.Addr
 	sourcePort, destPort uint16
 }
 
 func generationOf(f *Flow) generationKey {
-	return generationKey{id: f.ID, protocol: f.Protocol, dest: f.Dest.Unmap(), sourcePort: f.SourcePort,
-		destPort: f.DestPort}
+	return generationKey{id: f.ID, protocol: f.Protocol, zone: f.Zone, dest: f.Dest.Unmap(),
+		sourcePort: f.SourcePort, destPort: f.DestPort}
 }
+
+// timedProtocol reports whether a flow of protocol p can be timed: whether its
+// identity is whole in generationKey.
+func timedProtocol(p uint8) bool { return p == 6 || p == 17 }
 
 // entry is a flow's identity across readings.
 type entry struct {
@@ -325,7 +333,7 @@ func (a *Accountant) observe(f Flow, ended bool) {
 	if ended {
 		delete(w.generations, gk)
 	}
-	if generated && g.replied && f.Start.Sub(g.opened).Abs() <= replyMatch {
+	if generated && g.replied && timedProtocol(f.Protocol) && f.Start.Sub(g.opened).Abs() <= replyMatch {
 		f.ReplyWait, f.ReplyTimed = g.wait, true
 	}
 	f.ended = ended
@@ -393,10 +401,15 @@ func (a *Accountant) observe(f Flow, ended bool) {
 // generation of its id and tuple, whose wait for a first reply is timed from
 // here. Only f's identity is read; a new event carries no counts.
 //
+// A NEW EVENT FOR A GENERATION ALREADY HELD makes the job untimed: the kernel
+// announces an entry's creation again, beside a later event, when another
+// listener missed it, and its reading is then no creation time. One that
+// already carries the reply (answered) starts no generation either.
+//
 // PAST MaxFlows GENERATIONS THE JOB IS UNTIMED: one not kept would leave its
 // flow's destruction to find nothing, which is safe, but the job could no
 // longer say every answered connection it timed was all it could time.
-func (a *Accountant) ObserveNew(f Flow, at time.Time) {
+func (a *Accountant) ObserveNew(f Flow, at time.Time, answered bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -405,7 +418,15 @@ func (a *Accountant) ObserveNew(f Flow, at time.Time) {
 		return
 	}
 	gk := generationOf(&f)
-	if _, held := w.generations[gk]; !held && len(w.generations) >= MaxFlows {
+	if _, held := w.generations[gk]; held {
+		w.untimed = true
+
+		return
+	}
+	if answered {
+		return
+	}
+	if len(w.generations) >= MaxFlows {
 		w.untimed = true
 
 		return
