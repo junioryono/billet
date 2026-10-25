@@ -633,11 +633,15 @@ func (s *Server) reconcile(ctx context.Context) (map[string]*ScaleSet, map[strin
 //
 // A PACE, NOT A LIMIT. What is being waited for is GitHub expiring a session an
 // abandoned control plane left behind, and asking more often does not make that
-// happen sooner.
+// happen sooner; but asking less often opens it later, by up to the whole pace
+// after GitHub let it go, and after a promotion every tier waits here. Ten
+// seconds is at most ten seconds of that, for about nine more requests a tier
+// across the 60 to 92 seconds measured (2026-09-04), and a session opened is
+// one request whatever the pace.
 //
 // A VAR SO A TEST CAN DRIVE THE RETRY WITHOUT WAITING, which is the same seam
 // every other pace in this repository uses.
-var sessionRetryFor = 30 * time.Second
+var sessionRetryFor = 10 * time.Second
 
 // ErrSessionHeld means a message session for this scale set is already
 // outstanding, held by a control plane that did not close it.
@@ -717,6 +721,8 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 // measurement rather than a promise, which is why this is a loop and not a
 // sleep, and why nothing here assumes the redelivery.
 func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) (Session, error) {
+	began := time.Now()
+
 	for attempt := 1; ; attempt++ {
 		// BEFORE EVERY ATTEMPT, because a listener's recovery waits here too, and
 		// a process that is no longer the controller opens nothing.
@@ -726,6 +732,12 @@ func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet,
 
 		session, err := prov.Session(ctx, set.ID, s.owner)
 		if err == nil {
+			// SAID WHEN IT OPENS, and how long GitHub held it: after a promotion
+			// this is the one part of the failover billet does not own, and the
+			// rehearsal measures it from this line.
+			s.log.Info("opened this tier's message session", "tier", t.Label, "runs_on", t.ScaleSetName(),
+				"attempts", attempt, "waited", time.Since(began).Round(time.Millisecond))
+
 			return session, nil
 		}
 

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -77,6 +79,62 @@ func TestARestartWaitsForAnAbandonedSessionRatherThanFailing(t *testing.T) {
 	if got := held.attempts.Load(); got != held.refusals+1 {
 		t.Errorf("it tried %d times against %d refusals, so it is not retrying",
 			got, held.refusals)
+	}
+}
+
+// openingSessions refuses the first few sessions as held, then opens one.
+type openingSessions struct {
+	fakeProvisioner
+
+	refusals int
+	attempts atomic.Int32
+}
+
+func (o *openingSessions) Session(context.Context, int, string) (Session, error) {
+	if int(o.attempts.Add(1)) <= o.refusals {
+		return nil, fmt.Errorf("%w: scale set 1: 409 Conflict", ErrSessionHeld)
+	}
+
+	return &fakeSession{}, nil
+}
+
+// A SESSION THAT OPENS SAYS SO, with how many attempts it took: after a
+// promotion it is the part of the failover GitHub owns, and the rehearsal
+// reads it from this line.
+func TestAnOpenedSessionIsSaidWithItsWait(t *testing.T) {
+	original := sessionRetryFor
+	sessionRetryFor = time.Millisecond
+
+	t.Cleanup(func() { sessionRetryFor = original })
+
+	var logged bytes.Buffer
+
+	opening := &openingSessions{refusals: 2}
+	s := &Server{log: slog.New(slog.NewJSONHandler(&logged, nil)), owner: "billet"}
+
+	if _, err := s.openSession(t.Context(), &config.Tier{Label: "linux"}, &ScaleSet{ID: 1}, opening); err != nil {
+		t.Fatalf("openSession: %v", err)
+	}
+
+	var opened []map[string]any
+
+	for _, line := range bytes.Split(bytes.TrimSpace(logged.Bytes()), []byte("\n")) {
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("a log line is not JSON: %q", line)
+		}
+
+		if record["msg"] == "opened this tier's message session" {
+			opened = append(opened, record)
+		}
+	}
+
+	if len(opened) != 1 {
+		t.Fatalf("the session's opening was said %d times, want once:\n%s", len(opened), logged.String())
+	}
+
+	if opened[0]["tier"] != "linux" || opened[0]["attempts"] != float64(3) {
+		t.Fatalf("the opening says %v, want tier linux after 3 attempts", opened[0])
 	}
 }
 
