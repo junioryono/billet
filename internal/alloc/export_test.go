@@ -54,6 +54,11 @@ func TestAnExportsStandInsAreStableAndNameNothing(t *testing.T) {
 		}
 	}
 
+	// AN OWNER NOT RECORDED TAKES THE NEXT STAND-IN, never the trace's default.
+	if o, _, w, _ := s.of("", "", ""); o != "owner-3" || !strings.HasPrefix(w, "owner-3/") {
+		t.Errorf("an unrecorded owner became %q in %q; want owner-3", o, w)
+	}
+
 	// A RUN ID IS NUMBERED TOO, the jobs of one run still sharing one, and a run
 	// not recorded taking the next number as its own.
 	if a, b, c, none := s.run(39165193253), s.run(39165200000), s.run(39165193253), s.run(0); a != 1 || b != 2 ||

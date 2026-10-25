@@ -301,10 +301,9 @@ func (s *standIns) of(repo, workflowRef, name string) (string, string, string, s
 		return seen[key]
 	}
 
-	o := ""
-	if owner != "" {
-		o = numbered(s.owners, &s.nOwners, "owner", owner)
-	}
+	// AN OWNER NOT RECORDED IS A STAND-IN TOO, never the trace's default owner,
+	// which a reader could not tell from a name the ledger held.
+	o := numbered(s.owners, &s.nOwners, "owner", owner)
 
 	r := numbered(s.repos, &s.nRepos, "repo", owner+"/"+repository)
 	w := numbered(s.workflows, &s.nWorkflows, "workflow", workflow)
@@ -322,7 +321,7 @@ func (s *standIns) of(repo, workflowRef, name string) (string, string, string, s
 		}
 	}
 
-	return o, r, cmp.Or(o, jobtrace.DefaultOwner) + "/" + r + "/.github/workflows/" + w + ".yml", job
+	return o, r, o + "/" + r + "/.github/workflows/" + w + ".yml", job
 }
 
 // ExportHosts is every host the fleet still expects to answer, as a trace's

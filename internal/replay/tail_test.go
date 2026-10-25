@@ -228,3 +228,31 @@ func TestTheComparisonTableShowsAStarvedShapesBacklog(t *testing.T) {
 		t.Errorf("the table is\n%s\nwant the 16 vCPU shape with no waits and one job queued for 50m", table)
 	}
 }
+
+// A START DELIVERED AND NEVER RECORDED IS LOST, not still queued: neither in
+// the backlog the percentiles leave out nor in its count by shape.
+func TestADeliveredStartTheLedgerNeverSawIsLost(t *testing.T) {
+	t.Parallel()
+
+	horizon := DefaultStart.Add(time.Hour)
+	trace := Trace{Arrivals: []Arrival{
+		{Seq: 1, At: DefaultStart, Tier: "billet-4vcpu"},
+		{Seq: 2, At: DefaultStart, Tier: "billet-4vcpu"},
+		{Seq: 3, At: DefaultStart, Tier: "billet-4vcpu"},
+		{Seq: 4, At: DefaultStart, Tier: "billet-4vcpu"},
+	}}
+	r := &Report{Fleet: Fleet{Tiers: []TierShape{{Label: "billet-4vcpu", VCPU: 4}}}, Horizon: horizon,
+		Records: []Record{{Seq: 1}, {Seq: 2}}}
+
+	// 1: recorded, its start delivered and never written. 2: recorded, its
+	// runner still booting. 3: held by the scripted GitHub alone. 4: started
+	// and never recorded at all, which is a job the ledger lost.
+	r.classify(trace, horizon, map[int64]bool{1: true, 2: true}, map[int64]bool{2: true, 3: true},
+		map[int64]bool{1: true, 4: true})
+
+	if len(r.LostStarts) != 1 || r.LostStarts[0] != 1 || len(r.StillQueued) != 2 ||
+		r.QueuedByShape()[4].Count != 2 || len(r.Missing) != 1 || r.Missing[0] != 4 {
+		t.Errorf("lost starts %v, still queued %v (%v by shape), missing %v; want job 1 lost, 2 and 3 queued "+
+			"and 4 missing", r.LostStarts, r.StillQueued, r.QueuedByShape(), r.Missing)
+	}
+}

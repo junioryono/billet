@@ -364,6 +364,22 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 		r.Records = append(r.Records, rec)
 	}
 
+	r.classify(trace, until, seen, waiting, startsSent)
+
+	slices.SortFunc(r.Records, func(a, b Record) int { return int(a.Seq - b.Seq) })
+	r.deriveLocality()
+	r.Violations = r.checkCapacity()
+
+	return r, nil
+}
+
+// classify sorts every trace job the started records do not account for: a
+// later arrival past the horizon, a start the scripted GitHub delivered and
+// the ledger never recorded (lost), a job still queued at the horizon (arrived,
+// not started, and recorded or held by the plane), or one the ledger lost.
+// seen are the jobs the ledger recorded, waiting the jobs the plane still
+// holds, and startsSent the jobs whose start it delivered.
+func (r *Report) classify(trace Trace, until time.Time, seen, waiting, startsSent map[int64]bool) {
 	started := make(map[int64]bool, len(r.Records))
 	for i := range r.Records {
 		started[r.Records[i].Seq] = !r.Records[i].StartedAt.IsZero()
@@ -388,12 +404,6 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 			r.Missing = append(r.Missing, a.Seq)
 		}
 	}
-
-	slices.SortFunc(r.Records, func(a, b Record) int { return int(a.Seq - b.Seq) })
-	r.deriveLocality()
-	r.Violations = r.checkCapacity()
-
-	return r, nil
 }
 
 // noteLostCompletions records, from the completions the plane delivered, the
@@ -879,8 +889,8 @@ func (r *Report) Summary() string {
 	}
 
 	if !r.Horizon.IsZero() {
-		fmt.Fprintf(&b, "horizon %s: %d jobs still queued (the oldest for %s), kept out of every percentile "+
-			"and among those never started; %d arrive after it\n", r.Horizon.Format(time.RFC3339),
+		fmt.Fprintf(&b, "horizon %s: %d jobs still queued, recorded or held by the scripted GitHub (the "+
+			"oldest for %s), kept out of every percentile; %d arrive after it\n", r.Horizon.Format(time.RFC3339),
 			len(r.StillQueued), r.LongestQueued, r.LaterArrivals)
 	}
 

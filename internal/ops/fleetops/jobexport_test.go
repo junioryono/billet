@@ -36,6 +36,9 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		// job-1.
 		{name: "deploy", start: recent.Add(30 * time.Minute), runtime: 2 * time.Minute,
 			queued: recent.Add(-96 * time.Hour)},
+		// A POOL SLOT'S JOB WHOSE IDENTITY WAS NEVER WRITTEN STILL RAN, and is
+		// exported with what the ledger has.
+		{start: recent.Add(40 * time.Minute), runtime: 4 * time.Minute, noIdentity: true},
 	})
 
 	out := t.TempDir()
@@ -50,10 +53,10 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	// THE LEDGER RAN EIGHT, one of them on billet-4vcpu, which the configuration
 	// does not declare: its shape is not the fleet's to give, so it is left out
 	// and said to be.
-	if !strings.Contains(stdout.String(), "8 jobs and 1 hosts written") ||
-		!strings.Contains(stderr.String(), "the window held 10 assigned jobs; left out 0 that never started, 1 "+
+	if !strings.Contains(stdout.String(), "9 jobs and 1 hosts written") ||
+		!strings.Contains(stderr.String(), "the window held 11 assigned jobs; left out 0 that never started, 1 "+
 			"GitHub never reported complete, 0 whose completion is not after their start and 1 of tiers") {
-		t.Errorf("the export says %q and %q; want 8 jobs and 1 host, and the one left out", stdout, &stderr)
+		t.Errorf("the export says %q and %q; want 9 jobs and 1 host, and the one left out", stdout, &stderr)
 	}
 
 	for _, name := range []string{"trace.jsonl", "fleet.json"} {
@@ -73,8 +76,12 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		t.Fatalf("the exported trace does not read back: %v", err)
 	}
 
-	if len(trace.Arrivals) != 8 {
-		t.Fatalf("the trace has %d jobs, want the 8 of a declared tier the ledger ran", len(trace.Arrivals))
+	if len(trace.Arrivals) != 9 {
+		t.Fatalf("the trace has %d jobs, want the 9 of a declared tier the ledger ran", len(trace.Arrivals))
+	}
+
+	if a := trace.Arrivals[8]; time.Duration(a.Duration) != 4*time.Minute {
+		t.Errorf("the last arrival exported as %+v; want the 4m job with no identity", a)
 	}
 
 	if a := trace.Arrivals[0]; a.Job != "job-1" || time.Duration(a.Duration) != 2*time.Minute {
