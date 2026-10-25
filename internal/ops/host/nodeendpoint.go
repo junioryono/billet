@@ -354,7 +354,8 @@ func nodeEndpointOf(cfg *config.Config) (endpoint.Endpoint, bool, error) {
 // registration record names, so a node that dials whichever controller serves
 // is not one they can move or prove yet.
 var errSeveralControllers = errors.New("the node names several controllers in node.server_addrs, and " +
-	"migrate-endpoint, receipt, repair-unit and the installed endpoint describe a node that dials one")
+	"migrate-endpoint, receipt, repair-unit and the installed endpoint describe a node that dials one " +
+	"(#684 carries a list through them)")
 
 // unitObservation is one `systemctl show` of the node unit, the properties
 // the endpoint commands decide on.

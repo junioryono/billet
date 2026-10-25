@@ -1,6 +1,7 @@
 package nodeclient_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -238,6 +239,123 @@ func TestABlinkDoesNotSendTheNodeElsewhere(t *testing.T) {
 
 	if n := b.sent("/v1/register"); n != 0 {
 		t.Fatalf("a blink sent the node to B %d times", n)
+	}
+}
+
+// A NODE WITH SEVERAL CONTROLLERS ASKS AGAIN EVERY SECOND, because every round
+// it waits after a promotion is a round no node is registered; with one it
+// keeps the pace it always had, and a pace the operator set is kept either way.
+func TestANodeWithSeveralControllersRetriesSooner(t *testing.T) {
+	t.Parallel()
+
+	one, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: "http://" + deadAddress(t)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	two, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: "http://" + deadAddress(t)}, {Base: "http://" + deadAddress(t)},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		c       *nodeclient.Client
+		backoff time.Duration
+		want    time.Duration
+	}{
+		{"one controller", one, 0, 5 * time.Second},
+		{"two controllers", two, 0, time.Second},
+		{"two controllers, the operator's pace", two, 7 * time.Second, 7 * time.Second},
+	} {
+		if got := nodeclient.BackoffForTest(nodeclient.LoopOptions{Backoff: tc.backoff}, tc.c); got != tc.want {
+			t.Errorf("%s: the node waits %v after a failed registration, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// AND THE LOOP KEEPS THAT PACE: two controllers that both turn the
+// registration away, and the node's second round at the first comes about a
+// second after its first, not five. The bound is a failure guard well clear of
+// both paces.
+func TestTheLoopRetriesEverySecondWithSeveralControllers(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu     sync.Mutex
+		rounds []time.Time
+	)
+
+	unavailable := func(record bool) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if record && r.URL.Path == "/v1/register" {
+				mu.Lock()
+				rounds = append(rounds, time.Now())
+				mu.Unlock()
+			}
+
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(srv.Close)
+
+		return srv
+	}
+
+	a, b := unavailable(true), unavailable(false)
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: a.URL}, {Base: b.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		// THE DEFAULT PACE IS WHAT IS UNDER TEST, so Backoff is left zero.
+		err := nodeclient.Run(ctx, c, &fakeCompute{}, nodeclient.LoopOptions{
+			VCPU: testNodeVCPU, Memory: testNodeMemory, Provider: config.ProviderDocker,
+			GuestOS: []config.GuestOS{config.GuestLinux}, Deployment: deployment,
+			Log: slog.New(slog.DiscardHandler),
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the loop stopped for a reason other than shutdown: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	deadline := time.Now().Add(15 * time.Second)
+
+	for {
+		mu.Lock()
+		n := len(rounds)
+		mu.Unlock()
+
+		if n >= 2 {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("the node asked the first controller %d times in 15s", n)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	gap := rounds[1].Sub(rounds[0])
+	mu.Unlock()
+
+	if gap > 3*time.Second {
+		t.Fatalf("the node waited %v between rounds of two controllers, want about a second", gap)
 	}
 }
 

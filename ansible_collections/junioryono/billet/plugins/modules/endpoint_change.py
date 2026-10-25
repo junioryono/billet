@@ -93,7 +93,7 @@ def endpoint_of(cfg, where):
         # migration moves a node between two. A list of one is that one.
         if not isinstance(addrs, list) or len(addrs) != 1:
             raise Refusal("%s.node.server_addrs names %s; a node that dials several controllers is not "
-                          "moved by an endpoint migration" % (where, addrs if isinstance(addrs, list) else "no list"))
+                          "moved by an endpoint migration (#684)" % (where, addrs if isinstance(addrs, list) else "no list"))
         if addr not in (None, ""):
             raise Refusal("%s.node sets both server_addr and server_addrs" % where)
         addr = addrs[0]

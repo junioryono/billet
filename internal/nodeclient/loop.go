@@ -172,7 +172,7 @@ type LoopOptions struct {
 	// Nil is never.
 	DrainRequested func() bool
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
-	// a default.
+	// five seconds, or one with several controllers (backoffFor).
 	//
 	// It governs BOTH registration and poll failures, so a caller lengthening it
 	// to calm a flapping link is not left hammering the poll endpoint.
@@ -303,10 +303,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		log = slog.Default()
 	}
 
-	backoff := opts.Backoff
-	if backoff <= 0 {
-		backoff = 5 * time.Second
-	}
+	backoff := backoffFor(opts, c)
 
 	if opts.Ready == nil {
 		opts.Ready = func() {}
@@ -467,8 +464,8 @@ func register(
 		// node says which protocol it is actually serving on. A fleet mid-rollout
 		// is otherwise only visible from the control plane.
 		log.Info("registered with the control plane",
-			"node", c.node, "provider", opts.Provider, "lease_ttl", c.LeaseTTL(),
-			"protocol", c.WireVersion())
+			"node", c.node, "control_plane", c.Endpoint().String(), "provider", opts.Provider,
+			"lease_ttl", c.LeaseTTL(), "protocol", c.WireVersion())
 
 		// PUBLISHED RIGHT HERE, after the acceptance and before recovery: an
 		// accepted registration whose recovery then fails is still a registration
@@ -839,7 +836,7 @@ func stopGracefully(
 
 					log.Error("could not register again while draining", "error", err)
 
-					if !sleep(drainCtx, backoffFor(opts)) {
+					if !sleep(drainCtx, backoffFor(opts, c)) {
 						return
 					}
 				} else {
@@ -850,7 +847,7 @@ func stopGracefully(
 				continue
 			}
 
-			if !sleep(drainCtx, backoffFor(opts)) {
+			if !sleep(drainCtx, backoffFor(opts, c)) {
 				return
 			}
 		}
@@ -1061,7 +1058,7 @@ func recoverBeforeDrain(
 		log.Error("stopping before this process knew what its host runs; recovering before "+
 			"deciding whether it holds anything", "error", err)
 
-		if !sleep(recoverCtx, backoffFor(opts)) {
+		if !sleep(recoverCtx, backoffFor(opts, c)) {
 			return false
 		}
 	}
@@ -1070,9 +1067,20 @@ func recoverBeforeDrain(
 }
 
 // backoffFor is the pause after a failed registration or poll.
-func backoffFor(opts LoopOptions) time.Duration {
+//
+// A SECOND WITH SEVERAL CONTROLLERS, five with one. A failover is a node
+// registering with whichever controller serves, and every round of the backoff
+// is time after the promotion that no node is registered; a round costs little,
+// because a standby serves no wire and refuses the connection at once and a
+// controller that is gone is bounded by the dial timeout. With one controller
+// there is nowhere else to go and the pace stays what it was.
+func backoffFor(opts LoopOptions, c *Client) time.Duration {
 	if opts.Backoff > 0 {
 		return opts.Backoff
+	}
+
+	if c.Controllers() > 1 {
+		return time.Second
 	}
 
 	return 5 * time.Second

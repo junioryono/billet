@@ -1,6 +1,9 @@
 package nodeclient
 
-import "io"
+import (
+	"io"
+	"time"
+)
 
 // The record writer's two seams, for the fixtures in the external test
 // package. Each returns the function that restores the default; the fixtures
@@ -42,3 +45,6 @@ func SetDrainServingDoneForTest(f func()) func() {
 
 	return func() { drainServingDone = saved }
 }
+
+// BackoffForTest is the pause the loop takes after a failed registration.
+func BackoffForTest(opts LoopOptions, c *Client) time.Duration { return backoffFor(opts, c) }
