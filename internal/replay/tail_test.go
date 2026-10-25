@@ -116,31 +116,26 @@ func TestUtilizationAndEmptyHostTimeAreIntegratedFromTheCharges(t *testing.T) {
 	}
 }
 
-// A HORIZON EXCUSES ONLY A COMPLETION DUE AFTER IT: a job that started and was
-// due to finish before the horizon, and that the ledger never saw finish, is a
-// completion that was delivered and lost.
-func TestAHorizonExcusesOnlyCompletionsDueAfterIt(t *testing.T) {
+// A COMPLETION DELIVERED AND NEVER ARCHIVED IS LOST, whatever the horizon and
+// however the ledger dated the start: judged from what the scripted GitHub
+// sent, never from a deadline rebuilt from the ledger's times.
+func TestADeliveredCompletionTheLedgerNeverSawIsLost(t *testing.T) {
 	t.Parallel()
 
 	start := DefaultStart
-	trace := Trace{Arrivals: []Arrival{
-		{Seq: 1, At: start, Duration: Duration(time.Minute)},
-		{Seq: 2, At: start, Duration: Duration(time.Hour)},
-		{Seq: 3, At: start, Duration: Duration(time.Minute)},
-	}}
-
-	r := &Report{Horizon: start.Add(10 * time.Minute), Records: []Record{
-		{Seq: 1, StartedAt: start},
+	r := &Report{Horizon: start.Add(time.Minute), Records: []Record{
+		// Delivered, never archived: lost, though its start was dated a
+		// nanosecond late and a rebuilt deadline would fall past the horizon.
+		{Seq: 1, StartedAt: start.Add(time.Nanosecond)},
+		// Running at the horizon, its completion not yet delivered.
 		{Seq: 2, StartedAt: start},
+		// Delivered and archived.
 		{Seq: 3, StartedAt: start, FinishedAt: start.Add(time.Minute)},
 	}}
 
-	if got := r.finishedBeforeHorizon(trace); len(got) != 1 || got[0] != 1 {
-		t.Errorf("unfinished before the horizon: %v; want job 1 alone, whose minute ended before it", got)
-	}
+	r.noteLostCompletions(map[int64]bool{1: true, 3: true})
 
-	r.Horizon = time.Time{}
-	if got := r.finishedBeforeHorizon(trace); got != nil {
-		t.Errorf("with no horizon: %v; want nothing, Unfinished says it", got)
+	if len(r.LostCompletions) != 1 || r.LostCompletions[0] != 1 {
+		t.Errorf("lost completions %v; want job 1 alone", r.LostCompletions)
 	}
 }

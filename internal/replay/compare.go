@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -38,7 +39,8 @@ type Comparison struct {
 //
 // A REPLAY THE REPORT CANNOT SPEAK FOR FAILS THE COMPARISON rather than giving
 // it numbers: a job the ledger lost, one that never started or finished with
-// no horizon to explain it, or an overcommit the ledger proves. A table built
+// no horizon to explain it, a completion delivered and never archived, or an
+// overcommit the ledger proves. A table built
 // over any of those would compare policies on the jobs that happened to
 // survive.
 func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Options) Comparison {
@@ -66,9 +68,9 @@ func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Opt
 				p.Name, r.Unstarted, r.Unfinished)
 		}
 
-		if late := r.finishedBeforeHorizon(trace); len(late) > 0 {
-			t.Fatalf("replay: under %s jobs %v started and were due to finish by the horizon, and the ledger "+
-				"never saw them finish", p.Name, late)
+		if len(r.LostCompletions) > 0 {
+			t.Fatalf("replay: under %s jobs %v were completed by the scripted GitHub and the ledger never saw "+
+				"them finish", p.Name, r.LostCompletions)
 		}
 
 		c.Reports = append(c.Reports, r)
@@ -96,7 +98,8 @@ func (c Comparison) Markdown() string {
 		for i, r := range c.Reports {
 			p := r.QueueWaitByShape()[vcpu]
 			fmt.Fprintf(&b, "| %d vCPU | %s | %d | %s | %s | %s | %s | %s |\n", vcpu, c.Policies[i].Name,
-				p.Count, p.P50, p.P90, p.P99, p.P9999, p.Max)
+				p.Count, p.P50.Round(time.Second), p.P90.Round(time.Second), p.P99.Round(time.Second),
+				p.P9999.Round(time.Second), p.Max.Round(time.Second))
 		}
 	}
 

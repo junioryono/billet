@@ -122,6 +122,11 @@ type Report struct {
 	// LaterArrivals are trace jobs that arrive after the horizon: outside the
 	// window, neither missing nor queued.
 	LaterArrivals int
+	// LostCompletions are recorded jobs whose completion the scripted GitHub
+	// delivered and the ledger never archived: lost, whatever the horizon.
+	LostCompletions []int64
+	// delivered counts the completions the scripted GitHub sent.
+	delivered int
 	// ByJobID counts the jobs found by their GitHub job id because billet
 	// recorded them under a request id of its own, which is every job a
 	// direct-assignment replay ran and none an offered one did.
@@ -375,34 +380,19 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 	return r, nil
 }
 
-// finishedBeforeHorizon lists the started jobs the ledger never saw finish
-// although the trace has them complete by the horizon: a completion the
-// horizon cannot explain, because it was delivered. Nothing without a horizon,
-// where Unfinished says the same of every job.
-func (r *Report) finishedBeforeHorizon(trace Trace) []int64 {
-	if r.Horizon.IsZero() {
-		return nil
-	}
-
-	duration := make(map[int64]time.Duration, len(trace.Arrivals))
-	for i := range trace.Arrivals {
-		duration[trace.Arrivals[i].Seq] = time.Duration(trace.Arrivals[i].Duration)
-	}
-
-	var out []int64
-
+// noteLostCompletions records, from the completions the plane delivered, the
+// recorded jobs the ledger never saw finish although their completion was
+// delivered: a completion the harness sent and billet lost, which no horizon
+// explains, judged from what was sent rather than from a deadline the ledger's
+// own times would have to reconstruct.
+func (r *Report) noteLostCompletions(delivered map[int64]bool) {
+	r.delivered = len(delivered)
 	for i := range r.Records {
 		rec := &r.Records[i]
-		if rec.StartedAt.IsZero() || !rec.FinishedAt.IsZero() {
-			continue
-		}
-
-		if !rec.StartedAt.Add(duration[rec.Seq]).After(r.Horizon) {
-			out = append(out, rec.Seq)
+		if rec.FinishedAt.IsZero() && delivered[rec.Seq] {
+			r.LostCompletions = append(r.LostCompletions, rec.Seq)
 		}
 	}
-
-	return out
 }
 
 // complete refuses a history read that filled its bound: a truncated ledger

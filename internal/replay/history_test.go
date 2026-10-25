@@ -168,6 +168,13 @@ func TestTheAdversarialWorkloadsKeepEveryProof(t *testing.T) {
 				t.Errorf("recorded %d jobs for a trace of %d", len(report.Records), len(c.trace.Arrivals))
 			}
 
+			// Every job ran to its end, so the lost-completion check saw every
+			// completion the plane delivered.
+			if report.delivered != len(c.trace.Arrivals) || len(report.LostCompletions) != 0 {
+				t.Errorf("%d completions delivered for %d jobs, lost %v", report.delivered,
+					len(c.trace.Arrivals), report.LostCompletions)
+			}
+
 			if len(report.Violations) != 0 {
 				t.Errorf("the ledger proves an overcommit: %v", report.Violations)
 			}

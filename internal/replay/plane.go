@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
 	"slices"
@@ -187,8 +188,10 @@ type plane struct {
 	refusedJobs map[int64]bool
 	// booting are the jobs a minted runner has taken whose start has not been
 	// delivered: GitHub still holds them for the runner, which the ledger may
-	// not yet have named.
-	booting map[int64]bool
+	// not yet have named. completed are the jobs whose completion was
+	// delivered, which the ledger must have archived.
+	booting   map[int64]bool
+	completed map[int64]bool
 }
 
 var (
@@ -217,6 +220,7 @@ func newPlane(t *testing.T, clock *Clock, fleet Fleet, trace Trace) *plane {
 		declined:    map[string]int{},
 		refusedJobs: map[int64]bool{},
 		booting:     map[int64]bool{},
+		completed:   map[int64]bool{},
 	}
 	p.cond = sync.NewCond(&p.mu)
 
@@ -1121,6 +1125,7 @@ func (p *plane) deliver(ev event) {
 		}))
 
 	case eventCompleted:
+		p.completed[a.Seq] = true
 		delete(ev.runner.set.assigned, a.Seq)
 		p.pushLocked(ev.runner.set, nil, nil, p.jobJSON("JobCompleted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name, Result: a.Result,
@@ -1157,6 +1162,14 @@ func (p *plane) waitingJobs() map[int64]bool {
 	}
 
 	return out
+}
+
+// completedJobs is every job whose completion the plane delivered.
+func (p *plane) completedJobs() map[int64]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return maps.Clone(p.completed)
 }
 
 // AwaitIdle returns once every tier's session is open, its queue is empty and

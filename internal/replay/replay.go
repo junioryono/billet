@@ -189,6 +189,8 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	report.Declined = maps.Clone(actions.declined)
 	actions.mu.Unlock()
 
+	report.noteLostCompletions(actions.completedJobs())
+
 	st.closeDB()
 
 	return report
