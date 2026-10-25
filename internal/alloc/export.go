@@ -41,10 +41,11 @@ type ExportGaps struct {
 // ExportTrace writes the jobs assigned in [since, until) as a trace: each job
 // arriving when GitHub queued it (or, with no queue time on record, when billet
 // was assigned it) and running from its start to its completion. names keeps
-// owners, repositories, workflow files and job names as recorded; without it
-// each becomes a stand-in numbered in order of first appearance, so a trace
-// can be shared without naming anyone's code, and a job's matrix values get a
-// stand-in of their own so the runtime fallbacks still find a job's name.
+// owners, repositories, workflow files, job names and GitHub's run ids as
+// recorded; without it each becomes a stand-in numbered in order of first
+// appearance, so a trace can be shared without naming anyone's code or
+// pointing at their runs, and a job's matrix values get a stand-in of their
+// own so the runtime fallbacks still find a job's name.
 //
 // SAME-INSTANT ARRIVALS ARE ORDERED BY REQUEST ID, THEN GITHUB'S JOB ID, THEN
 // LEASE, so a trace exported twice, or a replayed trace exported back, numbers
@@ -129,7 +130,7 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 		out = append(out, keyed{
 			arrival: jobtrace.Arrival{
 				At: at, Tier: r.Tier, Owner: owner, Repository: repository, WorkflowRef: workflowRef,
-				Job: job, RunID: max(r.RunID, 0), Duration: jobtrace.Duration(end.Sub(started)),
+				Job: job, RunID: stand.run(r.RunID), Duration: jobtrace.Duration(end.Sub(started)),
 				Result: r.Result,
 			},
 			request: r.RequestID, job: r.GithubJobID, lease: r.LeaseID,
@@ -157,11 +158,35 @@ type standIns struct {
 	keep                                    bool
 	owners, repos, workflows, jobs, matrix  map[string]string
 	nOwners, nRepos, nWorkflows, nJobs, nMx int
+	runs                                    map[int64]int64
 }
 
 func newStandIns(keep bool) *standIns {
 	return &standIns{keep: keep, owners: map[string]string{}, repos: map[string]string{},
-		workflows: map[string]string{}, jobs: map[string]string{}, matrix: map[string]string{}}
+		workflows: map[string]string{}, jobs: map[string]string{}, matrix: map[string]string{},
+		runs: map[int64]int64{}}
+}
+
+// run is a GitHub run id as the trace carries it: as recorded with names kept,
+// otherwise numbered from 1 in order of first appearance, so the jobs of one
+// run still share one. An id not recorded (zero) stays zero, which the trace
+// reads as the job being its own run.
+func (s *standIns) run(id int64) int64 {
+	if id <= 0 {
+		return 0
+	}
+
+	if s.keep {
+		return id
+	}
+
+	if n, ok := s.runs[id]; ok {
+		return n
+	}
+
+	s.runs[id] = int64(len(s.runs) + 1)
+
+	return s.runs[id]
 }
 
 // unrecorded stands in for a repository or workflow a row does not record,

@@ -54,6 +54,12 @@ func TestAnExportsStandInsAreStableAndNameNothing(t *testing.T) {
 		}
 	}
 
+	// A RUN ID IS NUMBERED TOO, the jobs of one run still sharing one.
+	if a, b, c, none := s.run(39165193253), s.run(39165200000), s.run(39165193253), s.run(0); a != 1 || b != 2 ||
+		c != 1 || none != 0 {
+		t.Errorf("run ids became %d, %d, %d and %d; want 1, 2, 1 and 0 for one not recorded", a, b, c, none)
+	}
+
 	// THE MATRIX FALLBACK STILL WORKS: a stand-in name's base is one name.
 	if base, ok := matrixBase(got[0].name); !ok || base != "job-1" {
 		t.Errorf("a stand-in's base name is %q, %v; want job-1", base, ok)
@@ -61,6 +67,10 @@ func TestAnExportsStandInsAreStableAndNameNothing(t *testing.T) {
 
 	// KEPT, NOTHING IS REPLACED but what was not recorded.
 	kept := newStandIns(true)
+	if id := kept.run(39165193253); id != 39165193253 {
+		t.Errorf("with names kept a run id became %d", id)
+	}
+
 	if o, r, w, n := kept.of("acme/api", "acme/api/.github/workflows/ci.yml@refs/heads/main", "test (x)"); o != "acme" ||
 		r != "api" || w != "acme/api/.github/workflows/ci.yml@refs/heads/main" || n != "test (x)" {
 		t.Errorf("with names kept: %q %q %q %q", o, r, w, n)
