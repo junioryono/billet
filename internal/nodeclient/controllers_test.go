@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/nodeplane"
 )
 
@@ -461,18 +463,25 @@ func TestTheLoopRetriesEverySecondWithSeveralControllers(t *testing.T) {
 }
 
 // runDraining runs the loop with a drain requested at every stop, and returns
-// the cancellation that begins the stop and the channel Run's error arrives on.
-// A DRAIN OUTLIVES ITS CALLER'S CONTEXT by design, so the test's cleanup also
-// hurries it and joins it, before the controllers it talks to are closed: a
-// test that fails mid-drain leaves nothing running.
-func runDraining(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute) (context.CancelFunc, <-chan error) {
+// the cancellation that begins the stop, the channel Run's error arrives on and
+// the endings the stop recorded. A DRAIN OUTLIVES ITS CALLER'S CONTEXT by
+// design, so the test's cleanup also hurries it and joins it, before the
+// controllers it talks to are closed: a test that fails mid-drain leaves
+// nothing running.
+func runDraining(
+	t *testing.T, c *nodeclient.Client, compute nodeclient.Compute,
+) (context.CancelFunc, <-chan error, func() []nodeending.Ending) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	hurry := make(chan struct{})
 	done := make(chan error, 1)
 
-	var wg sync.WaitGroup
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		endings []nodeending.Ending
+	)
 
 	wg.Go(func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
@@ -486,6 +495,11 @@ func runDraining(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute)
 			DrainTimeout:   time.Hour,
 			DrainRequested: func() bool { return true },
 			Hurry:          hurry,
+			Ended: func(ending nodeending.Ending, _ bool) {
+				mu.Lock()
+				endings = append(endings, ending)
+				mu.Unlock()
+			},
 		})
 	})
 	t.Cleanup(func() {
@@ -494,7 +508,12 @@ func runDraining(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute)
 		wg.Wait()
 	})
 
-	return cancel, done
+	return cancel, done, func() []nodeending.Ending {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return slices.Clone(endings)
+	}
 }
 
 // askingCompute recovers the way the node runtime does, by asking the control
@@ -541,7 +560,7 @@ func TestADrainRecoveringAcrossAFailoverRegistersWithTheOther(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	cancel, done := runDraining(t, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c})
+	cancel, done, _ := runDraining(t, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c})
 
 	waitFor(t, func() bool { return a.sent(launched) >= 2 })
 
@@ -587,35 +606,52 @@ func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	cancel, done := runDraining(t, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c})
+	cancel, done, endings := runDraining(t, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c})
 
 	waitFor(t, func() bool { return a.sent(launched) >= 2 })
 	cancel()
 
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the stop ended with %v", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("the stop was still recovering 10s after it was superseded; it asked %d times", a.sent(launched))
+	}
+
+	assertSupersededStop(t, a, endings())
+}
+
+// assertSupersededStop holds a stop superseded before its drain to what it
+// may and may not have done: no withdrawal, since the name is another
+// process's and the plane places on it, and one ending, superseded.
+func assertSupersededStop(t *testing.T, a *controller, endings []nodeending.Ending) {
+	t.Helper()
+
+	if n := a.sent("/v1/nodes/n1/withdraw"); n != 0 {
+		t.Fatalf("a superseded stop asked %d times to withdraw a name another process holds", n)
+	}
+
+	if !slices.Equal(endings, []nodeending.Ending{nodeending.Superseded}) {
+		t.Fatalf("the stop recorded %v, want one superseded ending", endings)
 	}
 }
 
 // AND A STOP SUPERSEDED THERE STAYS SUPERSEDED. The process holds compute when
-// its recovery is superseded, so it waits for what runs here; then its
-// controller goes. It hands what it runs to custody once and registers with
-// no controller, where a registration after the failover would take the name
-// back from the process that holds it.
+// its recovery is superseded, so it waits for what runs here. It hands what it
+// runs to custody once, and its drain serves nothing: a worker that polled
+// would, after a failover, register with the next controller and take the
+// name back from the process that holds it.
+//
+// SERIAL, because the drain worker's completion hook is the package's.
 func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
-	t.Parallel()
-
 	a, b := newController(t), newController(t)
 
 	const launched = "/v1/nodes/n1/launched"
 
-	var gone atomic.Bool
-
 	a.mu.Lock()
 	a.supersede = func(path string, _ int) bool { return path == launched }
-	a.drop = func(string, int) bool { return gone.Load() }
 	a.mu.Unlock()
 
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
@@ -625,42 +661,50 @@ func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
+	served := make(chan struct{})
+	t.Cleanup(nodeclient.SetDrainServingDoneForTest(sync.OnceFunc(func() { close(served) })))
+
 	compute := &askingCompute{fakeCompute: &fakeCompute{holding: true}, c: c}
-	cancel, done := runDraining(t, c, compute)
+	cancel, done, endings := runDraining(t, c, compute)
 
 	waitFor(t, func() bool { return a.sent(launched) >= 2 })
-	cancel()
-
-	waitFor(t, func() bool { return compute.supersededCount() >= 1 })
 
 	polls := a.sent("/v1/nodes/n1/poll")
-	gone.Store(true)
+	cancel()
 
-	// LONG ENOUGH FOR A DRAIN THAT SERVES to find A gone (two unanswered polls
-	// a second apart at most) and register with B, which answers at once.
-	time.Sleep(3 * time.Second)
-
-	if n := b.sent("/v1/register"); n != 0 {
-		t.Fatalf("a superseded stop registered with B %d times after A went", n)
+	// THE DRAIN'S WORKER RETURNS WHILE WHAT RUNS HERE IS STILL HELD, which it
+	// does only when it serves nothing: one that served would return only when
+	// the drain ended.
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain's worker was still serving 10s into a stop superseded before it")
 	}
 
 	if n := a.sent("/v1/nodes/n1/poll") - polls; n != 0 {
-		t.Fatalf("a superseded stop polled %d times after it was superseded", n)
+		t.Fatalf("a superseded stop polled %d times", n)
+	}
+
+	if n := b.sent("/v1/register"); n != 0 {
+		t.Fatalf("a superseded stop registered with B %d times", n)
 	}
 
 	if n := compute.supersededCount(); n != 1 {
 		t.Fatalf("what runs here was handed to custody %d times, want once", n)
 	}
 
-	compute.mu.Lock()
-	compute.holding = false
-	compute.mu.Unlock()
+	compute.setHolding(false)
 
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the stop ended with %v", err)
+		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("the stop did not end once nothing was held")
 	}
+
+	assertSupersededStop(t, a, endings())
 }
 
 // A DRAIN THAT LOSES ITS CONTROLLER IS SERVED BY THE OTHER. The node is
@@ -688,7 +732,7 @@ func TestADrainThatLosesItsControllerIsServedByTheOther(t *testing.T) {
 
 	compute := &fakeCompute{holding: true}
 
-	cancel, done := runDraining(t, c, compute)
+	cancel, done, _ := runDraining(t, c, compute)
 
 	poll := "/v1/nodes/n1/poll"
 
