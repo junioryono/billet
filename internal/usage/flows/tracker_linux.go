@@ -161,10 +161,12 @@ func (t *Tracker) listen(ctx context.Context, a *Accountant) error {
 
 			switch ev.Type {
 			case conntrack.EventNew:
-				a.ObserveNew(ev.Flow.ID, ev.Flow.TupleOrig.IP.SourceAddress, at)
+				if f, ok := fromConntrack(ev.Flow); ok {
+					a.ObserveNew(f, at)
+				}
 			case conntrack.EventUpdate:
-				if ev.Flow.Status.SeenReply() {
-					a.ObserveReply(ev.Flow.ID, ev.Flow.TupleOrig.IP.SourceAddress, at)
+				if f, ok := fromConntrack(ev.Flow); ok && ev.Flow.Status.SeenReply() {
+					a.ObserveReply(f, at)
 				}
 			case conntrack.EventDestroy:
 				if t.sentinel(ev.Flow) {
@@ -358,6 +360,7 @@ func fromConntrack(cf *conntrack.Flow) (Flow, bool) {
 		Protocol:     cf.TupleOrig.Proto.Protocol,
 		Source:       src,
 		Dest:         dst,
+		SourcePort:   cf.TupleOrig.Proto.SourcePort,
 		DestPort:     cf.TupleOrig.Proto.DestinationPort,
 		OrigBytes:    cf.CountersOrig.Bytes,
 		ReplyBytes:   cf.CountersReply.Bytes,

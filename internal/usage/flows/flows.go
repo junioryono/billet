@@ -62,11 +62,12 @@ type Flow struct {
 	ID uint32
 	// Start is when the tracker created the entry (nf_conntrack_timestamp);
 	// zero when it did not say.
-	Start    time.Time
-	Protocol uint8
-	Source   netip.Addr // the original source: the guest, for a guest's flow
-	Dest     netip.Addr // the original destination, before any NAT
-	DestPort uint16
+	Start      time.Time
+	Protocol   uint8
+	Source     netip.Addr // the original source: the guest, for a guest's flow
+	Dest       netip.Addr // the original destination, before any NAT
+	SourcePort uint16
+	DestPort   uint16
 	// OrigBytes is what the guest sent, ReplyBytes what it received.
 	OrigBytes, ReplyBytes     uint64
 	OrigPackets, ReplyPackets uint64
@@ -75,15 +76,35 @@ type Flow struct {
 	// saw a reply. ReplyTimed says it was; the entry itself carries neither.
 	ReplyWait  time.Duration
 	ReplyTimed bool
+	// ended says this reading is the flow's destruction, its last: a dump of
+	// the same entry read before it and applied after is stale.
+	ended bool
+}
+
+// generationKey is a flow's identity as its events tell it: the tracker's id,
+// which is a 32-bit hash two live entries can share, and the original tuple,
+// which they cannot.
+type generationKey struct {
+	id                   uint32
+	protocol             uint8
+	dest                 netip.Addr
+	sourcePort, destPort uint16
+}
+
+func generationOf(f *Flow) generationKey {
+	return generationKey{id: f.ID, protocol: f.Protocol, dest: f.Dest.Unmap(), sourcePort: f.SourcePort,
+		destPort: f.DestPort}
 }
 
 // entry is a flow's identity across readings.
 type entry struct {
-	id    uint32
-	start int64
+	generation generationKey
+	start      int64
 }
 
-func entryOf(f *Flow) entry { return entry{id: f.ID, start: f.Start.UnixNano()} }
+// entryOf is f's entry: its id and tuple, since two live entries can share an
+// id, and its start, since a later entry can reuse both.
+func entryOf(f *Flow) entry { return entry{generation: generationOf(f), start: f.Start.UnixNano()} }
 
 // Destination is one remote address a job exchanged traffic with.
 type Destination struct {
@@ -187,12 +208,11 @@ type watch struct {
 	unansweredUnknown bool
 	// untimed says the tracker's events were not all read while the job held
 	// its address, so its first replies cannot all be told. generations holds,
-	// by the tracker's id, the latest flow of each id as its new and reply
-	// events told it; the flow's own destruction, read after them on the same
-	// socket in the kernel's order, takes it, and so does a dump of a flow
-	// still open.
+	// by id and tuple, the latest flow of each as its new and reply events told
+	// it; the flow's own destruction, read after them on the same socket in the
+	// kernel's order, takes it, and so does a dump of a flow still open.
 	untimed     bool
-	generations map[uint32]generation
+	generations map[generationKey]generation
 }
 
 // generation is one flow of an id as its events told it: when its new event
@@ -234,7 +254,7 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 	}
 
 	w := &watch{addr: addr, since: since, counted: map[entry]Flow{}, inherited: map[entry]Flow{},
-		generations: map[uint32]generation{}}
+		generations: map[generationKey]generation{}}
 
 	// A GAP IN THE EVENTS, OR A FLOW THE RING DROPPED, SINCE THE GRANT: either
 	// may have been this guest's.
@@ -300,13 +320,15 @@ func (a *Accountant) observe(f Flow, ended bool) {
 	// events come before its destruction on the one socket, and an id is
 	// reused only after it, so the generation held now is this flow's. A
 	// destruction takes it, counted or not, so no later flow can.
-	g, generated := w.generations[f.ID]
+	gk := generationOf(&f)
+	g, generated := w.generations[gk]
 	if ended {
-		delete(w.generations, f.ID)
+		delete(w.generations, gk)
 	}
 	if generated && g.replied && f.Start.Sub(g.opened).Abs() <= replyMatch {
 		f.ReplyWait, f.ReplyTimed = g.wait, true
 	}
+	f.ended = ended
 
 	// NO START TIME, NO OWNER. The flow could be this guest's or the previous
 	// holder's, and counting it either way would be a guess.
@@ -352,8 +374,10 @@ func (a *Accountant) observe(f Flow, ended bool) {
 	}
 
 	// A flow's counters only grow. A reading behind the one held is an older
-	// report arriving late, and is not allowed to shrink the total.
-	if seen && f.OrigBytes+f.ReplyBytes < prev.OrigBytes+prev.ReplyBytes {
+	// report arriving late, and is not allowed to shrink the total; and after
+	// the flow's destruction nothing is newer, so a dump of it taken before and
+	// applied after changes nothing, its timing included.
+	if seen && (prev.ended && !ended || f.OrigBytes+f.ReplyBytes < prev.OrigBytes+prev.ReplyBytes) {
 		return
 	}
 
@@ -365,42 +389,45 @@ func (a *Accountant) observe(f Flow, ended bool) {
 	w.counted[key] = f
 }
 
-// ObserveNew records that the tracker created flow id from src, read at at: the
-// id's new generation, whose wait for a first reply is timed from here.
+// ObserveNew records that the tracker created flow f, read at at: a new
+// generation of its id and tuple, whose wait for a first reply is timed from
+// here. Only f's identity is read; a new event carries no counts.
 //
 // PAST MaxFlows GENERATIONS THE JOB IS UNTIMED: one not kept would leave its
 // flow's destruction to find nothing, which is safe, but the job could no
 // longer say every answered connection it timed was all it could time.
-func (a *Accountant) ObserveNew(id uint32, src netip.Addr, at time.Time) {
+func (a *Accountant) ObserveNew(f Flow, at time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	w, ok := a.byAddr[src.Unmap()]
+	w, ok := a.byAddr[f.Source.Unmap()]
 	if !ok {
 		return
 	}
-	if _, held := w.generations[id]; !held && len(w.generations) >= MaxFlows {
+	gk := generationOf(&f)
+	if _, held := w.generations[gk]; !held && len(w.generations) >= MaxFlows {
 		w.untimed = true
 
 		return
 	}
-	w.generations[id] = generation{opened: at}
+	w.generations[gk] = generation{opened: at}
 }
 
-// ObserveReply records that flow id from src first saw a reply, read at at.
+// ObserveReply records that flow f first saw a reply, read at at.
 // Only the first reply after its new event is its wait; every later event is
 // the flow's state moving on.
-func (a *Accountant) ObserveReply(id uint32, src netip.Addr, at time.Time) {
+func (a *Accountant) ObserveReply(f Flow, at time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	w, ok := a.byAddr[src.Unmap()]
+	w, ok := a.byAddr[f.Source.Unmap()]
 	if !ok {
 		return
 	}
-	if g, ok := w.generations[id]; ok && !g.replied {
+	gk := generationOf(&f)
+	if g, ok := w.generations[gk]; ok && !g.replied {
 		g.wait, g.replied = max(at.Sub(g.opened), 0), true
-		w.generations[id] = g
+		w.generations[gk] = g
 	}
 }
 
