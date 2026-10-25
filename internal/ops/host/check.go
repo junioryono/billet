@@ -650,6 +650,8 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		}
 	}
 
+	printFinding(env, "npm", judgeNpmCache(cfg))
+
 	// HOW MUCH OF THE MACHINE IS SPOKEN FOR, shown whenever anything is reserved.
 	//
 	// A reservation is held back for as long as it is UNMET, which for a tier

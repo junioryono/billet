@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"github.com/junioryono/billet/internal/cli"
 
@@ -116,7 +117,7 @@ func judgeNodeCache(cfg *config.Config) ([]string, error) {
 			// without this listener, so actions/cache reaches GitHub exactly as it
 			// does on a hosted runner. The loss is the local one.
 			"a job placed on THIS NODE gets no billet cache volume: no sticky disk, no " +
-				"local Actions-cache interception, and no published generation " +
+				"local Actions-cache interception, no npm registry cache, and no published generation " +
 				"(actions/cache still reaches GitHub, and the guest's image store starts " +
 				"at whatever the golden image baked in)",
 			fmt.Sprintf("image_pool %s is unaffected: every guest still boots a clone of "+
@@ -151,16 +152,58 @@ func servedFrom(n *config.NodeConfig) string {
 		"node.ceph, and will refuse to start"
 }
 
-// printNodeCache renders the report in the column `billet check` uses.
+// judgeNpmCache says which tiers fetch from the npm registry through their
+// node's cache (ADR-020), and says so plainly when none does: the registry is
+// then every job's own fetch, and a stall on the way to it fails each job that
+// meets it, which is the failure #631 was opened for.
+//
+// ABOUT TIERS, NOT A SITE'S NODES. A tier's cache policy is the control plane's,
+// and every node with node.cache serves the npm cache to a tier that asks for
+// it, so the tiers are where an absence is decided. A file with no tiers, a
+// fleet node's, has nothing to say.
+func judgeNpmCache(cfg *config.Config) []string {
+	if len(cfg.Tiers) == 0 {
+		return nil
+	}
+
+	var on []string
+	for i := range cfg.Tiers {
+		if cfg.Tiers[i].EffectiveCache().Npm {
+			on = append(on, cfg.Tiers[i].Label)
+		}
+	}
+	if len(on) == 0 {
+		return []string{
+			"NO NPM CACHE: no tier enables cache.npm, which is off unless a tier turns it on, so " +
+				"every job fetches registry.npmjs.org itself and a stall on the way fails each job " +
+				"that meets it",
+			"a firecracker Linux tier turns it on with cache.npm.enabled: true (ADR-020)",
+		}
+	}
+
+	// WHAT THE TIERS ASK FOR, NOT WHAT A NODE SERVES: a node with no node.cache
+	// serves no npm cache, and which node a tier's job lands on is placement's.
+	return []string{
+		fmt.Sprintf("%d of %d tiers enable the npm cache: %s (configured, not probed)", len(on),
+			len(cfg.Tiers), strings.Join(on, ", ")),
+		"a job of one is served it by a node with node.cache, and fetches registry.npmjs.org " +
+			"itself on a node without",
+	}
+}
+
+// printNodeCache renders the node's cache verdict in the column `billet check`
+// uses.
+func printNodeCache(env cli.Env, lines []string) { printFinding(env, "cache", lines) }
+
+// printFinding renders one finding under its label.
 //
 // THE LABEL IS WRITTEN ONCE and the continuations are indented under it, because
 // a finding that repeats its label on every line reads as several findings —
 // which is how the surrounding report already treats a multi-sentence verdict.
-func printNodeCache(env cli.Env, lines []string) {
+func printFinding(env cli.Env, label string, lines []string) {
 	for i, line := range lines {
-		label := ""
-		if i == 0 {
-			label = "cache"
+		if i > 0 {
+			label = ""
 		}
 
 		fmt.Fprintf(env.Stdout, "%-8s %s\n", label, line)
