@@ -87,11 +87,11 @@ type acceptanceJob struct {
 	StartedAt  string `json:"started_at,omitempty"`
 	FinishedAt string `json:"finished_at,omitempty"`
 
-	// Trust is the class the job's tier declares in the config this run used,
-	// which is the class its compute was launched under. The ledger keeps none
-	// per lease, because trust belongs to the pool and not to the job that ran on
-	// it, so this is read from the config and is empty for a tier the config does
-	// not name.
+	// Trust is the class the job's tier declares in the config the evidence is
+	// written from. The ledger keeps none per lease, because trust belongs to the
+	// pool and not to the job that ran on it, so this is the config's word and
+	// not a record of the launch (the node's `trust=` line in its log is that),
+	// and it is empty for a tier the config does not name.
 	Trust string `json:"trust,omitempty"`
 	// Repository, Event, WorkflowRef and JobName are what GitHub's own message
 	// said the job was; a fork's pull request reads as the BASE repository and
@@ -106,6 +106,9 @@ type acceptanceJob struct {
 	// Cache is what each cache did for the job as its node observed it; an empty
 	// token was not observed.
 	Cache acceptanceCache `json:"cache"`
+	// Unread says the job's history row could not be read, so its placement,
+	// GitHub run and caches are unknown rather than empty.
+	Unread string `json:"unread,omitempty"`
 }
 
 // acceptanceCache is a job's cache observations, one closed-vocabulary token
@@ -247,9 +250,7 @@ func collectAcceptanceEvidence(
 		return acceptanceEvidenceDoc{}, err
 	}
 
-	if err := describeAcceptanceJobs(ctx, db, cfg, jobs); err != nil {
-		return acceptanceEvidenceDoc{}, err
-	}
+	describeAcceptanceJobs(ctx, db, cfg, jobs)
 
 	doc.Jobs = jobs
 
@@ -368,10 +369,12 @@ func readJobHistory(ctx context.Context, db *state.DB) ([]acceptanceJob, error) 
 
 // describeAcceptanceJobs adds to each job its tier's trust class, what billet
 // placed it on and what its caches did. An acceptance ledger holds a run's few
-// jobs, so each history row is read whole, as `billet jobs show` reads one.
+// jobs, so each history row is read whole, as `billet jobs show` reads one. A
+// row that cannot be read is said so on its job, as the barrier's is: evidence
+// that names what it could not read beats no evidence.
 func describeAcceptanceJobs(
 	ctx context.Context, db *state.DB, cfg *config.Config, jobs []acceptanceJob,
-) error {
+) {
 	reads := state.ReadQueries(db.Reader())
 
 	for i := range jobs {
@@ -383,7 +386,9 @@ func describeAcceptanceJobs(
 
 		row, err := reads.ReadJob(ctx, job.LeaseID)
 		if err != nil {
-			return fmt.Errorf("read the history of lease %s: %w", job.LeaseID, err)
+			job.Unread = "its history could not be read: " + err.Error()
+
+			continue
 		}
 
 		job.GitHubRunID = row.GithubRunID
@@ -400,8 +405,6 @@ func describeAcceptanceJobs(
 			Npm:         row.NpmCache,
 		}
 	}
-
-	return nil
 }
 
 // readAcceptanceJobs is what the wait loop asks.

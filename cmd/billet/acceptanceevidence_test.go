@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -114,5 +115,45 @@ func TestTheEvidenceSaysEachJobsTrustOriginPlacementAndCaches(t *testing.T) {
 	}
 	if image := jobs[orphan].Cache.Image; image != "cold" {
 		t.Errorf("the second job's image cache = %q, want its own observation, cold", image)
+	}
+	for id, job := range jobs {
+		if job.Unread != "" {
+			t.Errorf("job %s says it could not be read: %s", id, job.Unread)
+		}
+	}
+}
+
+// A HISTORY ROW THAT CANNOT BE READ IS SAID SO ON ITS JOB, and the rest of the
+// evidence is still written: a lease listed in one read and gone by the next
+// must not cost the run the document that says what it held.
+func TestTheEvidenceNamesAJobWhoseHistoryCouldNotBeRead(t *testing.T) {
+	t.Parallel()
+
+	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
+	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
+	ledgertest.Seed(t, stateDir)
+
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		t.Fatalf("load the derived config: %v", err)
+	}
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close the ledger: %v", err)
+		}
+	})
+
+	jobs := []acceptanceJob{{LeaseID: "a-lease-with-no-history", Tier: cfg.Tiers[0].Label}}
+	describeAcceptanceJobs(t.Context(), db, cfg, jobs)
+
+	if !strings.HasPrefix(jobs[0].Unread, "its history could not be read: ") {
+		t.Errorf("unread = %q, want the job to say its history could not be read", jobs[0].Unread)
+	}
+	if want := string(cfg.Tiers[0].Trust.Effective()); jobs[0].Trust != want {
+		t.Errorf("trust = %q, want the config's %q even with the history unread", jobs[0].Trust, want)
 	}
 }
