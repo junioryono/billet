@@ -437,6 +437,72 @@ func (q *Queries) ListJobHistory(ctx context.Context, maxRows int64) ([]ListJobH
 	return items, nil
 }
 
+const listJobRuntimes = `-- name: ListJobRuntimes :many
+SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name,
+       COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= $1 AND started_at < $2
+   AND finished_at IS NOT NULL AND finished_at < $2
+ ORDER BY started_at DESC, lease_id DESC
+ LIMIT CAST($3 AS BIGINT)
+`
+
+type ListJobRuntimesParams struct {
+	Since   sql.NullString
+	Until   sql.NullString
+	MaxRows int64
+}
+
+type ListJobRuntimesRow struct {
+	LeaseID     string
+	Tier        string
+	Repo        string
+	WorkflowRef string
+	JobName     string
+	StartedAt   string
+	FinishedAt  string
+}
+
+// The jobs that started in [since, until) and finished before until, with the
+// names their runtime is learned under, newest start first, bounded: a window
+// past the bound loses its oldest jobs, never the newest.
+//
+// FINISHED BEFORE until, because a job still running at until was not known to
+// have finished then: a prediction made at until could not have used it, and a
+// backtest that did would be graded against its own answer. The runtime is
+// finished_at less started_at, both billet's clock: the archive is when the
+// lease's room comes back, which is what a host freeing up means.
+func (q *Queries) ListJobRuntimes(ctx context.Context, arg ListJobRuntimesParams) ([]ListJobRuntimesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listJobRuntimes, arg.Since, arg.Until, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListJobRuntimesRow
+	for rows.Next() {
+		var i ListJobRuntimesRow
+		if err := rows.Scan(
+			&i.LeaseID,
+			&i.Tier,
+			&i.Repo,
+			&i.WorkflowRef,
+			&i.JobName,
+			&i.StartedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJobWaits = `-- name: ListJobWaits :many
 SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
        github_runner_assigned_at, bought_at, COALESCE(assigned_at, '') AS assigned_at,

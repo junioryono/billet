@@ -205,6 +205,9 @@ type Allocator struct {
 	// waits is told each job's queue wait; see ObserveQueueWaits. Atomic,
 	// because it is set once the metrics endpoint serves, while writes run.
 	waits atomic.Pointer[QueueWaitObserver]
+
+	// runtimes is what the history taught of how long jobs run (RuntimePriors).
+	runtimes runtimeBook
 }
 
 // Option configures an Allocator.

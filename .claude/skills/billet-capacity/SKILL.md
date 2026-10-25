@@ -21,6 +21,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Status separates ownership from phase.**
 - **A commitment made to a remote service cannot be revoked by a local timer.**
 - **A pool member GitHub cannot route work to is retired on GitHub's per-registration word, never on the aggregate.**
+- **A runtime prediction may choose a host and decides nothing else (#524).**
 
 ### Leases: [references/leases.md](references/leases.md)
 

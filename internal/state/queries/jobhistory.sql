@@ -445,3 +445,21 @@ SELECT lease_id FROM job_history
  WHERE github_run_id = @run_id OR (github_run_id = 0 AND run_id = @run_id)
  ORDER BY COALESCE(assigned_at, queued_at), lease_id
  LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListJobRuntimes :many
+-- The jobs that started in [since, until) and finished before until, with the
+-- names their runtime is learned under, newest start first, bounded: a window
+-- past the bound loses its oldest jobs, never the newest.
+--
+-- FINISHED BEFORE until, because a job still running at until was not known to
+-- have finished then: a prediction made at until could not have used it, and a
+-- backtest that did would be graded against its own answer. The runtime is
+-- finished_at less started_at, both billet's clock: the archive is when the
+-- lease's room comes back, which is what a host freeing up means.
+SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name,
+       COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= @since AND started_at < @until
+   AND finished_at IS NOT NULL AND finished_at < @until
+ ORDER BY started_at DESC, lease_id DESC
+ LIMIT CAST(@max_rows AS BIGINT);
