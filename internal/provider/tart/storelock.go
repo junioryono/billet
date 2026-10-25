@@ -71,6 +71,9 @@ const (
 	storeStateDir = ".billet"
 	// storeLockName is the file flocked inside it.
 	storeLockName = "store.lock"
+	// deleteWindow bounds one `tart delete` once it has begun, sized like the
+	// store lock's wait because that delete is the longest thing the lock covers.
+	deleteWindow = 2 * time.Minute
 )
 
 // errStoreLockBusy is contention, as distinct from every other reason a lock
@@ -269,7 +272,18 @@ func (p *Provider) deleteProvenOurs(ctx context.Context, id string) error {
 		return err
 	}
 
-	if _, err := p.run(ctx, "delete", id); err != nil {
+	// A DELETE THAT HAS BEGUN IS LET FINISH. Killed part-way, `tart delete`
+	// leaves a lease-named directory missing its disk, which tart cannot read
+	// and List refuses to guess about, so every sweep and custody pass on the
+	// node fails until an operator removes it: the stray cleanup's thirty-second
+	// bound killed one on 2026-10-25 (tart 2.36.0, macOS 26, a VM stopped moments
+	// before) and left exactly that. The caller's cancellation still ends
+	// everything before this point; this command gets its own bound, the one
+	// the store lock is sized for.
+	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteWindow)
+	defer cancel()
+
+	if _, err := p.run(deleteCtx, "delete", id); err != nil {
 		// A MISSING VM HERE IS NOT SUCCESS: it was observed stopped and proved
 		// ours moments ago, so its absence means something else acted on this
 		// store and billet cannot claim it destroyed anything.

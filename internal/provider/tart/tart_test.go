@@ -104,6 +104,13 @@ type stub struct {
 	cloneBlocks  string
 	cloneReached string
 	cloneRelease string
+	// deleteBlocks holds a delete open the same way: announced (deleteReached),
+	// then released (deleteRelease). A real `tart delete` of a VM that has just
+	// stopped took long enough to be killed part-way (2026-10-25), and this is
+	// how a test cancels the caller inside one.
+	deleteBlocks  string
+	deleteReached string
+	deleteRelease string
 }
 
 func newStub(t *testing.T) *stub {
@@ -144,6 +151,9 @@ func newStub(t *testing.T) *stub {
 		cloneBlocks:      filepath.Join(dir, "clone-blocks"),
 		cloneReached:     filepath.Join(dir, "clone-reached"),
 		cloneRelease:     filepath.Join(dir, "clone-release"),
+		deleteBlocks:     filepath.Join(dir, "delete-blocks"),
+		deleteReached:    filepath.Join(dir, "delete-reached"),
+		deleteRelease:    filepath.Join(dir, "delete-release"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -280,6 +290,14 @@ delete)
   if [ ! -d "$vms/$name" ]; then
     echo "the specified VM \"$name\" does not exist" >&2
     exit 1
+  fi
+  if [ -s "` + s.deleteBlocks + `" ]; then
+    printf 'reached\n' > "` + s.deleteReached + `"
+    n=0
+    while [ ! -f "` + s.deleteRelease + `" ] && [ "$n" -lt 600 ]; do
+      sleep 0.05
+      n=$((n + 1))
+    done
   fi
   rm -rf "$vms/$name"
   ;;
@@ -1053,6 +1071,53 @@ func TestDestroyStopsDeletesAndConfirms(t *testing.T) {
 	}
 }
 
+// A DELETE THAT HAS BEGUN FINISHES, EVEN WHEN ITS CALLER STOPS WAITING. Killed
+// part-way, a real `tart delete` left a lease-named directory without its disk,
+// which no inventory can classify and which stopped every sweep on the node
+// (2026-10-25). The caller is cancelled inside the delete, and the delete must
+// still remove the whole directory and say so.
+func TestADeleteThatHasBegunFinishesWhenItsCallerStopsWaiting(t *testing.T) {
+	s := newStub(t)
+	s.vm(t, "billet-lease1", "running", testOwner)
+
+	if err := os.WriteFile(s.deleteBlocks, []byte("1"), 0o600); err != nil {
+		t.Fatalf("arm delete-blocks: %v", err)
+	}
+
+	p := newProvider(t, s)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	type result struct {
+		teardown provider.Teardown
+		err      error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		teardown, err := p.Destroy(ctx, "billet-lease1")
+		done <- result{teardown, err}
+	}()
+
+	waitForFile(t, s.deleteReached)
+	cancel()
+
+	if err := os.WriteFile(s.deleteRelease, []byte("1"), 0o600); err != nil {
+		t.Fatalf("release the delete: %v", err)
+	}
+
+	got := <-done
+	if got.err != nil || got.teardown != provider.TeardownStopped {
+		t.Fatalf("Destroy = %v, %v; want the delete that had begun to finish and be reported", got.teardown, got.err)
+	}
+
+	if s.dirExists("billet-lease1") {
+		t.Error("the VM directory survived a delete whose caller stopped waiting")
+	}
+}
+
 // A missing directory is only "already gone" when tart AGREES. A listing that
 // still reports the name while billet sees no directory means the two are
 // reading different stores — and answering TeardownStopped there frees the
@@ -1164,6 +1229,81 @@ func TestRegistrationDeliveryRetriesWhileTheGuestBoots(t *testing.T) {
 
 	if !strings.Contains(string(stdin), validSpec("billet-lease1").JITConfig) {
 		t.Error("the registration never arrived despite retries")
+	}
+}
+
+// AN ISOLATED GUEST'S FIRST QUESTION IS ITS RESOLVER, and the agent is no
+// readier for it than for the registration: a guest that refused the first
+// three attempts while it booted failed every untrusted launch on a Mac whose
+// guests took longer than tart's 30-second wait (2026-10-25). The guest's
+// resolution is a getent that answers, so the script's verdict is the stub's,
+// not the test host's DNS.
+func TestAnIsolatedLaunchWaitsForTheGuestAgentBeforeItsResolver(t *testing.T) {
+	s := newStub(t)
+
+	if err := os.WriteFile(s.execFails, []byte("3"), 0o600); err != nil {
+		t.Fatalf("arm exec-fails: %v", err)
+	}
+
+	resolves := t.TempDir()
+	if err := forkSafeWriteFile(filepath.Join(resolves, "getent"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write the guest's getent: %v", err)
+	}
+	t.Setenv("PATH", resolves+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	p := newProvider(t, s)
+	WithConfig(config.TartConfig{
+		UntrustedIsolation: config.IsolationSoftnet, UntrustedDNS: []string{"1.1.1.1"},
+	})(p)
+
+	spec := validSpec("billet-lease1")
+	spec.Trust = provider.TrustUntrusted
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// ALL THREE REFUSALS WERE SPENT, and the resolver is the first exec of an
+	// isolated launch, so it is what waited them out.
+	left, err := os.ReadFile(s.execFails)
+	if err != nil || strings.TrimSpace(string(left)) != "0" {
+		t.Fatalf("the guest's refusals left = %q (%v), want all three spent", left, err)
+	}
+
+	stdin, err := os.ReadFile(s.execStdin)
+	if err != nil || !strings.Contains(string(stdin), spec.JITConfig) {
+		t.Fatalf("the registration never arrived after the resolver (%v)", err)
+	}
+}
+
+// AND ONLY THE AGENT'S ABSENCE IS RETRIED. Any other failure reached the guest
+// or says something retrying will not change, so the launch reports it at once.
+func TestAnIsolatedLaunchDoesNotRetryAResolverThatReachedTheGuest(t *testing.T) {
+	s := newStub(t)
+
+	// The first exec fails for a reason of its own; any second one hangs.
+	if err := os.WriteFile(s.execHang, []byte("1"), 0o600); err != nil {
+		t.Fatalf("arm exec-hang: %v", err)
+	}
+
+	p := newProvider(t, s)
+	WithConfig(config.TartConfig{
+		UntrustedIsolation: config.IsolationSoftnet, UntrustedDNS: []string{"1.1.1.1"},
+	})(p)
+
+	spec := validSpec("billet-lease1")
+	spec.Trust = provider.TrustUntrusted
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+
+	_, err := p.Launch(ctx, spec)
+	if err == nil || !strings.Contains(err.Error(), "configure the isolated guest's resolver") ||
+		!strings.Contains(err.Error(), "exit status 3") {
+		t.Fatalf("Launch = %v, want the resolver's own failure reported", err)
+	}
+	if _, statErr := os.Stat(s.execHanging); statErr == nil {
+		t.Fatal("the resolver was asked again after a failure that had reached the guest")
 	}
 }
 

@@ -1116,10 +1116,41 @@ func (p *Provider) configureResolver(ctx context.Context, spec provider.Spec) er
 		return nil
 	}
 
-	out, err := p.run(ctx, "exec", spec.Name, "/bin/sh", "-c",
-		resolverScript(p.cfg.UntrustedDNS, p.resolverWaits))
-	if err != nil {
-		return fmt.Errorf("configure the isolated guest's resolver: %w", err)
+	// THE FIRST THING AN ISOLATED LAUNCH ASKS THE GUEST, so it waits for the
+	// guest agent the way the registration's delivery does. A VM tart lists as
+	// running has not started its agent yet, and a `tart exec` that finds none
+	// blocks for 30 seconds and then fails: measured with tart 2.36.0 on macOS
+	// 26 (M2 Max, ubuntu-runner-arm64, 2026-10-25), the agent answered 30.7,
+	// 40.5 and 30.8 seconds after the VM was listed, so a single attempt failed
+	// every untrusted launch there. Only that refusal is retried, because the
+	// script never reached the guest; the caller's deadline bounds the wait.
+	script := resolverScript(p.cfg.UntrustedDNS, p.resolverWaits)
+
+	retry := time.NewTimer(p.execRetry)
+	defer retry.Stop()
+
+	var out string
+
+	for {
+		var err error
+
+		out, err = p.run(ctx, "exec", spec.Name, "/bin/sh", "-c", script)
+		if err == nil {
+			break
+		}
+
+		if !isAgentNotListening(err) || ctx.Err() != nil {
+			return fmt.Errorf("configure the isolated guest's resolver: %w", err)
+		}
+
+		retry.Reset(p.execRetry)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("configure the isolated guest's resolver: the guest agent never "+
+				"answered: %w (last attempt: %w)", ctx.Err(), err)
+		case <-retry.C:
+		}
 	}
 
 	if !strings.Contains(out, "ok") {
@@ -2540,6 +2571,14 @@ func (p *Provider) run(ctx context.Context, args ...string) (string, error) {
 	}
 
 	return stdout.String(), nil
+}
+
+// isAgentNotListening reports whether a `tart exec` failed before reaching the
+// guest because its agent is not answering yet. Pinned to tart's own rendering
+// in its exec command, "Failed to connect to the VM using its control socket",
+// as tart 2.36.0 printed it on 2026-10-25.
+func isAgentNotListening(err error) bool {
+	return strings.Contains(err.Error(), "Failed to connect to the VM using its control socket")
 }
 
 // isMissingVM reports whether a command failed because the VM does not exist.
