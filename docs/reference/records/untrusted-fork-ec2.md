@@ -1,6 +1,6 @@
 # An untrusted fork pull request on EC2
 
-A pull request from a fork ran on an untrusted EC2 tier on 2026-10-25, green each time, and every isolation rule billet states for that tier held inside the job and from outside it. Default-branch jobs ran on the same pool: their Docker image store was published into the pool's own scope and read back by the fork, and nothing the fork wrote was ever published. This is #23's EC2 half. It also found that sticky disks cannot work on an EC2 guest: one defect is fixed in the same change, and one is a design question this record leaves open.
+A pull request from a fork ran on an untrusted EC2 tier on 2026-10-25, green each time, and every isolation check it made held, inside the job and from outside it. Reachability between two guests, and the node's cache listener refusing another guest, were not probed here. Default-branch jobs ran on the same pool: their Docker image store was published into the pool's own scope and read back by the fork, and nothing the fork wrote was ever published. This is #23's EC2 half. It also found that sticky disks cannot work on an EC2 guest: one defect is fixed in the same change, and one is a design question this record leaves open.
 
 ## What ran
 
@@ -18,7 +18,7 @@ A pull request from a fork ran on an untrusted EC2 tier on 2026-10-25, green eac
 | `40212082871` | `push` to `main` | the first default-branch job: a cold image store, published afterwards |
 | `40213645726` | `push` to `main` | a second default-branch job, the image store warm from the first |
 | `40214025831` | `pull_request` from the fork, attempts 1 and 2 | the fork, the image store warm from the default branch |
-| `40214476753` | `workflow_dispatch` on `main` | the published-port measurement for #163 ([Docker's published ports](docker-published-ports.md)) |
+| `40214476753` | `workflow_dispatch` on `main` | the published-port measurement for [#163](https://github.com/junioryono/billet/issues/163) |
 | `40217214502` | `push` to `main`, attempt 2 | a default-branch job that tags the image store (below) |
 | `40219948619` | `pull_request` from the fork, attempts 1 and 2 | the fork again, on a new commit carrying the tagging step |
 | `40220843182` | `push` to `main` | the last default-branch job, which reads what the fork left |
@@ -32,7 +32,7 @@ Every check prints one `PROBE <name> <value>` line. The fork's two attempts prin
 | `event`, `head_repo`, `base_repo` | `pull_request`, the fork, the base repository | the job is a fork's pull request |
 | `imds_security_groups` | `b1t12-untrusted` | the instance is on the untrusted group, and only that one |
 | `imds_iam_info_status`, `imds_iam_credentials_status` | `404`, `404` | no instance profile: there is no credential to take |
-| `imds_in_container` | unreachable | a container in the job cannot reach the metadata service at all (one hop) |
+| `imds_in_container` | `000unreachable` | curl ran in a container in the job and had no answer from the metadata service in 5 s (code `000`, then its failure's `unreachable`): one hop |
 | `action_results_host`, `action_results_resolves` | `results-receiver.actions.githubusercontent.com`, a GitHub address | the runner talks to GitHub's own results origin |
 | `hosts_remap`, `billet_ca_installed`, `action_ssl_cert_file`, `action_node_extra_ca_certs` | `0`, `no`, `unset`, `unset` | no interception: nothing remapped, no billet authority in the job |
 | `results_tls_issuer` | a public CA's | the origin's certificate is GitHub's, not a node's |
@@ -52,9 +52,10 @@ Every check prints one `PROBE <name> <value>` line. The fork's two attempts prin
 ## Whose writes the pool kept
 
 **The image store, by the node's log:**
-- The first default-branch job got a cold store and wrote to it. It was published as `snap-00adf0207995e4eb6` under `…scoped/untrusted/billet-testbed/b1t12-fork-target/amd64/docker`: an untrusted pool's own namespace, which no trusted key reaches.
-- Every later job, the fork's included, attached that generation warm.
-- The `workflow_dispatch` job's writes were published as `snap-0db26ddb05277b740`. A dispatch on the default branch is a writing event under ADR-013.
+- The first default-branch job got a cold store and wrote to it. It was published as `snap-00adf0207995e4eb6` under `…scoped/untrusted/<test organization>/<probe repository>/amd64/docker`: an untrusted pool's own namespace, which no trusted key reaches.
+- Every later job attached the pool's newest generation at the time it started, warm. The second default-branch job and both attempts of the fork's first run (`40214025831`) attached `snap-00adf0207995e4eb6`, and so did the `workflow_dispatch` job.
+- The `workflow_dispatch` job's writes were published as `snap-0db26ddb05277b740`, which `40217214502` attached. A dispatch on the default branch is a writing event under ADR-013.
+- The node logged a publication for four jobs: the first default-branch job, the dispatch, `40217214502` and `40220843182`. It logged neither a publication nor an abandonment for the second default-branch job (`40213645726`), whose store was settled; an authority billet could not prove writes nothing and logs nothing, so this record cannot say which held.
 - No job's writes from the fork were ever published.
 
 **And by a tag each job wrote.** From run `40217214502` on, the probe tags an image `b1t12-written-by:<event>-<run>-<attempt>` into the store, after listing every such tag it finds there:
@@ -68,7 +69,7 @@ Every check prints one `PROBE <name> <value>` line. The fork's two attempts prin
 
 - **The pool's reads:** the fork read the default branch's tag, because every job of the pool attaches the pool's newest generation.
 - **The fork's writes:** the fork's re-run did not find what its first attempt wrote, and the last default-branch job did not find what either attempt wrote. Each fork job's store was settled and then discarded.
-- **Every attach after `40217214502`** used its generation, `snap-00039f729a12da102`: the fork's writes never became one.
+- **Every attach after `40217214502`** used its generation, `snap-00039f729a12da102`, until the last default-branch job published `snap-07f71fa4c68e5af24`: the fork's writes never became one.
 - **The rule:** a fork's pull request is not a writing event, and its head repository is not the pool's, so `server.DecideCacheAuthority` refuses it publication (ADR-013).
 
 ## What the run found about sticky disks
@@ -76,7 +77,7 @@ Every check prints one `PROBE <name> <value>` line. The fork's two attempts prin
 **Node did not trust the cache endpoint's issuer. Fixed here.**
 - **The failure:** the first runs' `stickydisk` steps failed with "unable to verify the first certificate" and ran cold.
 - **The cause:** the AMI installs the cache endpoint's issuer in the distribution's trust store, and the image-store helper's curl reads that store. The sticky-disk action is Node, whose `https` trusts only the roots it was built with.
-- **The fix:** the action now adds `/etc/ssl/certs/ca-certificates.crt` to Node's roots for an HTTPS request. From then on its cache call succeeded and the node attached the disk; the evidence records the sticky disk `cold`, not `unused`.
+- **The fix:** the action now adds `/etc/ssl/certs/ca-certificates.crt` to what Node trusts by default (its bundled roots and `NODE_EXTRA_CA_CERTS`) for an HTTPS request. From then on its cache call succeeded and the node attached the disk; the evidence records the sticky disk `cold`, not `unused`.
 
 **The runner cannot mount it. Not fixed here.**
 - **The failure:** the action formats and mounts the disk with `sudo`. On this guest that failed with "sudo: a password is required".

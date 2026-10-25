@@ -1,6 +1,6 @@
 # An untrusted fork pull request on Tart
 
-A pull request from a fork ran on an untrusted Tart tier on 2026-10-25, twice, green both times, and every isolation rule billet states for that tier held inside the job and from outside it. This is #23's Tart half. On the way it found two defects that every stub had accepted, both fixed in the same change, without which no untrusted launch on that Mac could succeed.
+A pull request from a fork ran on an untrusted Tart tier on 2026-10-25, twice, green both times, and every isolation check it made held, inside the job and from outside it. Reachability between two guests was not probed. This is #23's Tart half. On the way it found two defects that every stub had accepted, both fixed in the same change, without which no untrusted launch on that Mac could succeed.
 
 ## What ran
 
