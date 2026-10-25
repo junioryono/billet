@@ -163,7 +163,9 @@ func TestCIScopeReplayRuleCoversTheReplayClosure(t *testing.T) {
 	const module = "github.com/junioryono/billet/"
 	seen := 0
 	for _, pkg := range strings.Fields(string(out)) {
-		if !strings.HasPrefix(pkg, module+"internal/") {
+		// Every package of billet's, not only internal/: deploy is in the
+		// closure through internal/lifeops.
+		if !strings.HasPrefix(pkg, module) {
 			continue
 		}
 		// A test binary appears as "pkg.test" and its package as "pkg [pkg.test]".
@@ -459,7 +461,7 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"internal/pgdump/pgdump_test.go", families(append([]string{"postgres"}, application...)...)},
 		{"internal/e2e/restore_test.go", families(append([]string{"postgres"}, application...)...)},
 		{"internal/e2e/lifecycle_test.go", families(application...)},
-		{"deploy/billet-server.service", families(application...)},
+		{"deploy/billet-server.service", families(append([]string{"replay"}, application...)...)},
 		// The collection and the retirement shard checker.
 		{"ansible_collections/junioryono/billet/roles/host/tasks/main.yml",
 			families("host_lifecycle", "postgres_command", "postgres_retirement")},
