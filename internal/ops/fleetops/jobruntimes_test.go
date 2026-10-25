@@ -77,12 +77,29 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
 			t.Fatalf("Bind: %v", err)
 		}
+
+		if j.poolSlot {
+			// As the pool listener assigns a slot: no run, billet's own request id.
+			if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, int64(-1-i)); err != nil {
+				t.Fatalf("Assign a pool slot: %v", err)
+			}
+
+			now = j.start.Add(j.runtime)
+			if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+				t.Fatalf("Release a pool slot: %v", err)
+			}
+
+			leases = append(leases, lease.ID)
+
+			continue
+		}
+
 		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 4242, int64(100+i)); err != nil {
 			t.Fatalf("Assign: %v", err)
 		}
 		if err := a.RecordJobIdentity(t.Context(), lease.ID, alloc.HistoryJob{
 			JobID: fmt.Sprintf("job-%d", i), Owner: "acme", Repository: "api",
-			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", Name: j.name,
+			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", Name: j.name, QueuedAt: j.queued,
 		}); err != nil {
 			t.Fatalf("RecordJobIdentity: %v", err)
 		}
@@ -125,9 +142,12 @@ type ranHistoryJob struct {
 	start   time.Time
 	runtime time.Duration
 	tier    string
+	// queued is GitHub's queue time, unrecorded when zero.
+	queued time.Time
 	// noResult archives the lease with no completion from GitHub, as a job
-	// cancelled or lost is; escrowOnly buys a lease and archives it unused.
-	noResult, escrowOnly bool
+	// cancelled or lost is; escrowOnly buys a lease and archives it unused;
+	// poolSlot assigns it as a direct-assignment pool slot no job reached.
+	noResult, escrowOnly, poolSlot bool
 }
 
 // runtimeHistory is three 6m runs of a job three days ago, one 3m job of

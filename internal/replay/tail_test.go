@@ -161,10 +161,70 @@ func TestAComparisonRefusesAnUnspeakableReport(t *testing.T) {
 		{"cut short by the horizon", Report{Horizon: horizon, Unstarted: []int64{5}, Unfinished: []int64{6}}, ""},
 		{"lost at the horizon", Report{Horizon: horizon, Unfinished: []int64{6}, LostCompletions: []int64{6}},
 			"jobs [6] were completed"},
+		{"start lost at the horizon", Report{Horizon: horizon, Unstarted: []int64{7}, LostStarts: []int64{7}},
+			"jobs [7] were started"},
+		// The specific cause is named before the general one.
+		{"lost with no horizon", Report{Unfinished: []int64{6}, LostCompletions: []int64{6}},
+			"jobs [6] were completed"},
 	} {
 		got := c.report.unspeakable()
 		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
 			t.Errorf("%s: unspeakable says %q; want %q", c.name, got, c.want)
 		}
+	}
+}
+
+// A COMPARISON MEASURES EVERY POLICY OVER ONE SPAN: a policy that drains later
+// is not averaged over more hours, and a host empty while another policy still
+// ran counts as empty.
+func TestAComparisonMeasuresEveryPolicyOverOneSpan(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+	fleet := Fleet{Hosts: []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}}, MaxVCPU: 8,
+		MaxMemory: 32 * config.GiB}
+
+	// 4 of 8 vCPU: the first for one hour from the start, the second for two
+	// from an hour in.
+	soon := &Report{Fleet: fleet, Records: []Record{chargeAt(start, start.Add(time.Hour))}}
+	late := &Report{Fleet: fleet, Records: []Record{chargeAt(start.Add(time.Hour), start.Add(3*time.Hour))}}
+
+	Comparison{Reports: []*Report{soon, late}}.shareSpan()
+
+	for _, c := range []struct {
+		name        string
+		r           *Report
+		mean, empty float64
+	}{
+		{"soon", soon, 4.0 / 24, 2},
+		{"late", late, 8.0 / 24, 1},
+	} {
+		vcpu, _ := c.r.MeanUtilization()
+		if math.Abs(vcpu-c.mean) > 1e-9 || math.Abs(c.r.EmptyHostHours()-c.empty) > 1e-9 {
+			t.Errorf("%s: %.4f vCPU charged and %.2f empty host-hours over the shared three hours; want %.4f and "+
+				"%.0f", c.name, vcpu, c.r.EmptyHostHours(), c.mean, c.empty)
+		}
+	}
+}
+
+// A SHAPE THAT STARTED NOTHING SHOWS NO WAITS, and its backlog at the horizon
+// is in the table beside the waits it leaves out.
+func TestTheComparisonTableShowsAStarvedShapesBacklog(t *testing.T) {
+	t.Parallel()
+
+	horizon := DefaultStart.Add(time.Hour)
+	fleet := Fleet{Tiers: []TierShape{{Label: "billet-4vcpu", VCPU: 4}, {Label: "billet-16vcpu", VCPU: 16}}}
+
+	wide := Arrival{Seq: 2, At: DefaultStart.Add(10 * time.Minute), Tier: "billet-16vcpu"}
+	starved := &Report{Fleet: fleet, Horizon: horizon, StillQueued: []int64{2},
+		queued: map[int64]Arrival{2: wide},
+		Records: []Record{{Seq: 1, Tier: "billet-4vcpu", VCPU: 4, Arrival: DefaultStart,
+			StartedAt: DefaultStart.Add(time.Minute), QueueWait: Duration(time.Minute)}}}
+
+	table := Comparison{Policies: []Policy{{Name: "fill"}}, Reports: []*Report{starved}}.Markdown()
+
+	if !strings.Contains(table, "| 16 vCPU | fill | 0 | — | — | — | — | — | 1 | 50m0s |") ||
+		!strings.Contains(table, "| 4 vCPU | fill | 1 | 1m0s |") {
+		t.Errorf("the table is\n%s\nwant the 16 vCPU shape with no waits and one job queued for 50m", table)
 	}
 }

@@ -130,8 +130,10 @@ func exportDeployment(ctx context.Context, a *alloc.Allocator, cfg *config.Confi
 }
 
 // writeExport writes the two files, refusing to replace either: an export
-// that overwrote an earlier one would lose the window it covered.
-func writeExport(dir string, trace jobtrace.Trace, fleet jobtrace.Fleet) error {
+// that overwrote an earlier one would lose the window it covered. Both are
+// created before either is written, and a failure removes what this call
+// created, so an export leaves both files or neither of its own.
+func writeExport(dir string, trace jobtrace.Trace, fleet jobtrace.Fleet) (err error) {
 	var traceBody, fleetBody bytes.Buffer
 
 	if err := trace.Write(&traceBody); err != nil {
@@ -142,24 +144,60 @@ func writeExport(dir string, trace jobtrace.Trace, fleet jobtrace.Fleet) error {
 		return err
 	}
 
-	for name, body := range map[string][]byte{"trace.jsonl": traceBody.Bytes(), "fleet.json": fleetBody.Bytes()} {
-		path := filepath.Join(dir, name)
+	files := []struct {
+		path string
+		body []byte
+		// f is open from its creation until it is closed; created holds
+		// until the export succeeds, so a failure removes the file.
+		f       *os.File
+		created bool
+	}{
+		{path: filepath.Join(dir, "trace.jsonl"), body: traceBody.Bytes()},
+		{path: filepath.Join(dir, "fleet.json"), body: fleetBody.Bytes()},
+	}
 
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		for i := range files {
+			if files[i].f != nil {
+				err = errors.Join(err, files[i].f.Close())
+			}
+
+			if files[i].created {
+				err = errors.Join(err, os.Remove(files[i].path))
+			}
+		}
+	}()
+
+	for i := range files {
 		// 0600: even with stand-ins a trace says when the deployment worked.
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		f, err := os.OpenFile(files[i].path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("billet jobs export: %s already exists; export into a directory without one", path)
+			return fmt.Errorf("billet jobs export: %s already exists; export into a directory without one",
+				files[i].path)
 		}
 		if err != nil {
-			return fmt.Errorf("billet jobs export: create %s: %w", path, err)
+			return fmt.Errorf("billet jobs export: create %s: %w", files[i].path, err)
 		}
 
-		if _, err := f.Write(body); err != nil {
-			return errors.Join(fmt.Errorf("billet jobs export: write %s: %w", path, err), f.Close())
+		files[i].f, files[i].created = f, true
+	}
+
+	for i := range files {
+		if _, err := files[i].f.Write(files[i].body); err != nil {
+			return fmt.Errorf("billet jobs export: write %s: %w", files[i].path, err)
 		}
+	}
+
+	for i := range files {
+		f := files[i].f
+		files[i].f = nil
 
 		if err := f.Close(); err != nil {
-			return fmt.Errorf("billet jobs export: write %s: %w", path, err)
+			return fmt.Errorf("billet jobs export: write %s: %w", files[i].path, err)
 		}
 	}
 

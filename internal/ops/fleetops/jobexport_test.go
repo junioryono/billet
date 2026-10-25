@@ -1,6 +1,7 @@
 package fleetops
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,11 +23,19 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 
 	// A JOB GITHUB NEVER REPORTED COMPLETE IS LEFT OUT, never exported as one
 	// that succeeded, and A LEASE NEVER ASSIGNED A JOB IS NOT A JOB AT ALL: its
-	// archive writes a history row too, which the export does not read.
+	// archive writes a history row too, which the export does not read, and
+	// neither is A POOL SLOT RETIRED BEFORE A JOB REACHED IT, assigned to
+	// GitHub's count and to no job.
 	recent := time.Now().Add(-12 * time.Hour).Truncate(time.Hour)
 	ranHistory(t, stateDir, []ranHistoryJob{
 		{name: "build (ubuntu)", start: recent.Add(time.Minute), runtime: 3 * time.Minute, noResult: true},
 		{start: recent.Add(10 * time.Minute), runtime: time.Minute, escrowOnly: true},
+		{start: recent.Add(20 * time.Minute), runtime: time.Minute, poolSlot: true},
+		// GitHub queued this one before every other, and billet was assigned
+		// it last: THE STAND-INS ARE NUMBERED IN THE TRACE'S ORDER, so it is
+		// job-1.
+		{name: "deploy", start: recent.Add(30 * time.Minute), runtime: 2 * time.Minute,
+			queued: recent.Add(-96 * time.Hour)},
 	})
 
 	out := t.TempDir()
@@ -41,10 +50,16 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	// THE LEDGER RAN EIGHT, one of them on billet-4vcpu, which the configuration
 	// does not declare: its shape is not the fleet's to give, so it is left out
 	// and said to be.
-	if !strings.Contains(stdout.String(), "7 jobs and 1 hosts written") ||
-		!strings.Contains(stderr.String(), "the window held 9 assigned jobs; left out 0 that never started, 1 "+
+	if !strings.Contains(stdout.String(), "8 jobs and 1 hosts written") ||
+		!strings.Contains(stderr.String(), "the window held 10 assigned jobs; left out 0 that never started, 1 "+
 			"GitHub never reported complete, 0 whose completion is not after their start and 1 of tiers") {
-		t.Errorf("the export says %q and %q; want 7 jobs and 1 host, and the one left out", stdout, &stderr)
+		t.Errorf("the export says %q and %q; want 8 jobs and 1 host, and the one left out", stdout, &stderr)
+	}
+
+	for _, name := range []string{"trace.jsonl", "fleet.json"} {
+		if info, err := os.Stat(filepath.Join(out, name)); err != nil || info.Mode().Perm() != 0o600 {
+			t.Errorf("%s: %v, %v; want it written 0600", name, info, err)
+		}
 	}
 
 	tf, err := os.Open(filepath.Join(out, "trace.jsonl"))
@@ -58,8 +73,12 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		t.Fatalf("the exported trace does not read back: %v", err)
 	}
 
-	if len(trace.Arrivals) != 7 {
-		t.Fatalf("the trace has %d jobs, want the 7 of a declared tier the ledger ran", len(trace.Arrivals))
+	if len(trace.Arrivals) != 8 {
+		t.Fatalf("the trace has %d jobs, want the 8 of a declared tier the ledger ran", len(trace.Arrivals))
+	}
+
+	if a := trace.Arrivals[0]; a.Job != "job-1" || time.Duration(a.Duration) != 2*time.Minute {
+		t.Errorf("the first arrival exported as %+v; want deploy, 2m, as job-1", a)
 	}
 
 	// EVERY JOB RAN IN RUN 4242, which without names is the first run stand-in.
@@ -69,12 +88,12 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		}
 	}
 
-	first := trace.Arrivals[0]
-	if first.Owner != "owner-1" || first.Repository != "repo-1" ||
-		first.WorkflowRef != "owner-1/repo-1/.github/workflows/workflow-1.yml" || first.Job != "job-1 (matrix-1)" ||
-		first.Tier != "billet-2vcpu" || time.Duration(first.Duration) != 6*time.Minute {
-		t.Errorf("the first job exported as %+v; want stand-ins for acme/api's build (ubuntu), 6m on billet-2vcpu",
-			first)
+	build := trace.Arrivals[1]
+	if build.Owner != "owner-1" || build.Repository != "repo-1" ||
+		build.WorkflowRef != "owner-1/repo-1/.github/workflows/workflow-1.yml" || build.Job != "job-2 (matrix-1)" ||
+		build.Tier != "billet-2vcpu" || time.Duration(build.Duration) != 6*time.Minute {
+		t.Errorf("the build job exported as %+v; want stand-ins for acme/api's build (ubuntu), 6m on billet-2vcpu",
+			build)
 	}
 
 	for _, a := range trace.Arrivals {
@@ -109,6 +128,19 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	if err := Jobs(t.Context(), env, []string{"export", "--config", cfg, "--out", out}); err == nil ||
 		!strings.Contains(err.Error(), "already exists") {
 		t.Errorf("a second export into the same directory gave %v; want it refused", err)
+	}
+
+	// AN EXPORT REFUSED FOR ONE FILE WRITES NEITHER.
+	half := t.TempDir()
+	if err := os.WriteFile(filepath.Join(half, "fleet.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Jobs(t.Context(), env, []string{"export", "--config", cfg, "--out", half}); err == nil ||
+		!strings.Contains(err.Error(), "fleet.json already exists") {
+		t.Errorf("an export beside an earlier fleet.json gave %v; want it refused", err)
+	}
+	if _, err := os.Stat(filepath.Join(half, "trace.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a refused export left trace.jsonl behind (%v)", err)
 	}
 
 	// --names KEEPS WHAT WAS RECORDED.

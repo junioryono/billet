@@ -18,9 +18,19 @@ type UtilizationPoint struct {
 }
 
 // span is the interval a report's figures over time cover: from the first
-// charge to the last end, or to the horizon when the replay had one. A charge
-// the ledger never ended runs to the span's end.
+// charge to the last end, or to the horizon when the replay had one, unless a
+// comparison set one for every policy (shareSpan). A charge the ledger never
+// ended runs to the span's end.
 func (r *Report) span() (time.Time, time.Time, bool) {
+	if r.spanTo.After(r.spanFrom) && !r.spanFrom.IsZero() {
+		return r.spanFrom, r.spanTo, true
+	}
+
+	return r.ownSpan()
+}
+
+// ownSpan is the span the report's own charges and horizon give.
+func (r *Report) ownSpan() (time.Time, time.Time, bool) {
 	var from, to time.Time
 
 	for _, c := range r.charges() {
@@ -76,7 +86,9 @@ func (r *Report) steps(from, to time.Time) []loadStep {
 		node   string
 	}
 
-	var changes []change
+	// A step of nothing at the span's start, so a span set before the first
+	// charge counts its empty hosts too.
+	changes := []change{{at: from}}
 
 	for _, c := range r.charges() {
 		changes = append(changes, change{c.from, c.vcpu, int64(c.memory), c.node})

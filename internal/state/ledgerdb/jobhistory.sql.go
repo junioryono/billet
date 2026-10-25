@@ -666,6 +666,7 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name, githu
        result_at, COALESCE(finished_at, '') AS finished_at, result
   FROM job_history
  WHERE queued_at >= $1 AND queued_at < $2 AND assigned_at IS NOT NULL
+   AND (github_job_id != '' OR COALESCE(request_id, 0) > 0)
  ORDER BY queued_at, lease_id
  LIMIT CAST($3 AS BIGINT)
 `
@@ -701,9 +702,13 @@ type ListJobsForExportRow struct {
 // row has and the index covers; a job GitHub queued before the window and
 // billet was assigned inside it belongs to it, as its wait does. ONLY ROWS A
 // JOB WAS ASSIGNED TO: the archive of a lease bought and never used writes a
-// row too, with no assigned_at, and those would take the bound from real jobs.
-// result_at is when the completion arrived, so a job's runtime as GitHub ran
-// it is result_at less started_at, without the teardown finished_at includes.
+// row too, with no assigned_at, and so does a pool slot billet started for
+// GitHub's assigned count and retired before a job reached it, with
+// assigned_at but neither GitHub's job id nor its request id; either would
+// take the bound from real jobs. result_at is when billet handled the
+// completion, so a job's runtime as GitHub ran it is result_at less
+// started_at, without the teardown finished_at includes; a completion
+// redelivered after an outage makes it longer than the job ran.
 func (q *Queries) ListJobsForExport(ctx context.Context, arg ListJobsForExportParams) ([]ListJobsForExportRow, error) {
 	rows, err := q.db.QueryContext(ctx, listJobsForExport, arg.Since, arg.Until, arg.MaxRows)
 	if err != nil {

@@ -45,8 +45,8 @@ type ExportGaps struct {
 // arriving when GitHub queued it (or, with no queue time on record, when billet
 // was assigned it) and running from its start to GitHub's completion of it.
 // names keeps owners, repositories, workflow files, job names and GitHub's run
-// ids as recorded; without it each becomes a stand-in numbered in order of
-// first appearance, so a trace can be shared without naming anyone's code or
+// ids as recorded; without it each becomes a stand-in numbered in the order the
+// trace carries the jobs, so a trace can be shared without naming anyone's code or
 // pointing at their runs, and a job's matrix values get a stand-in of their
 // own so the runtime fallbacks still find a job's name. Only jobs of tiers in
 // this allocator's catalogue are carried, since a replay needs their shape.
@@ -98,6 +98,9 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 		request       int64
 		job           string
 		lease         string
+		// What the stand-ins replace, numbered once the trace is in order.
+		repo, workflow, name string
+		run                  int64
 	}
 
 	stand := newStandIns(names)
@@ -154,15 +157,12 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 			gaps.Unidentified++
 		}
 
-		owner, repository, workflowRef, job := stand.of(repo, workflow, r.JobName)
-
 		out = append(out, keyed{
 			arrival: jobtrace.Arrival{
-				At: at, Tier: r.Tier, Owner: owner, Repository: repository, WorkflowRef: workflowRef,
-				Job: job, RunID: stand.run(r.RunID), Duration: jobtrace.Duration(completed.Sub(started)),
-				Result: r.Result,
+				At: at, Tier: r.Tier, Duration: jobtrace.Duration(completed.Sub(started)), Result: r.Result,
 			},
 			firstAssigned: firstAssigned, request: r.RequestID, job: r.GithubJobID, lease: r.LeaseID,
+			repo: repo, workflow: workflow, name: r.JobName, run: r.RunID,
 		})
 	}
 
@@ -171,9 +171,15 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 			requestOrder(x.request, y.request), cmp.Compare(x.job, y.job), cmp.Compare(x.lease, y.lease))
 	})
 
+	// THE STAND-INS ARE NUMBERED IN THE TRACE'S ORDER, not the read's, whose ties
+	// fall to random lease ids: two exports of one history number them alike.
 	trace := jobtrace.Trace{Arrivals: make([]jobtrace.Arrival, 0, len(out))}
 	for i := range out {
-		trace.Arrivals = append(trace.Arrivals, out[i].arrival)
+		k := &out[i]
+		k.arrival.Owner, k.arrival.Repository, k.arrival.WorkflowRef, k.arrival.Job = stand.of(k.repo, k.workflow,
+			k.name)
+		k.arrival.RunID = stand.run(k.run)
+		trace.Arrivals = append(trace.Arrivals, k.arrival)
 	}
 
 	trace.Normalize()

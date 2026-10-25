@@ -61,25 +61,57 @@ func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Opt
 		c.Reports = append(c.Reports, r)
 	}
 
+	c.shareSpan()
+
 	return c
 }
 
+// shareSpan measures every report's figures over time across one interval:
+// from the earliest first charge to the latest end of any of them. A policy
+// that drains later would otherwise be averaged over more hours than one
+// that drains sooner, and its empty hosts counted over a longer time.
+func (c Comparison) shareSpan() {
+	var from, to time.Time
+
+	for _, r := range c.Reports {
+		f, t, ok := r.ownSpan()
+		if !ok {
+			continue
+		}
+
+		if from.IsZero() || f.Before(from) {
+			from = f
+		}
+
+		if t.After(to) {
+			to = t
+		}
+	}
+
+	for _, r := range c.Reports {
+		r.spanFrom, r.spanTo = from, to
+	}
+}
+
 // unspeakable says why the report cannot speak for its replay, or "" when it
-// can: an overcommit the ledger proves, a job the ledger lost, one that never
-// started or finished with no horizon to explain it, or a completion delivered
-// and never archived.
+// can: an overcommit the ledger proves, a job the ledger lost, a start or a
+// completion delivered and never recorded, or a job that never started or
+// finished with no horizon to explain it.
 func (r *Report) unspeakable() string {
 	switch {
 	case len(r.Violations) > 0:
 		return fmt.Sprintf("the ledger proves an overcommit: %v", r.Violations)
 	case len(r.Missing) > 0:
 		return fmt.Sprintf("the ledger has no row for jobs %v", r.Missing)
-	case r.Horizon.IsZero() && (len(r.Unstarted) > 0 || len(r.Unfinished) > 0):
-		return fmt.Sprintf("jobs %v never started and %v never finished, with no horizon to say why",
-			r.Unstarted, r.Unfinished)
+	case len(r.LostStarts) > 0:
+		return fmt.Sprintf("jobs %v were started by the scripted GitHub and the ledger never saw them start",
+			r.LostStarts)
 	case len(r.LostCompletions) > 0:
 		return fmt.Sprintf("jobs %v were completed by the scripted GitHub and the ledger never saw them finish",
 			r.LostCompletions)
+	case r.Horizon.IsZero() && (len(r.Unstarted) > 0 || len(r.Unfinished) > 0):
+		return fmt.Sprintf("jobs %v never started and %v never finished, with no horizon to say why",
+			r.Unstarted, r.Unfinished)
 	}
 
 	return ""
@@ -95,17 +127,34 @@ func (c Comparison) Markdown() string {
 		for vcpu := range r.QueueWaitByShape() {
 			shapes[vcpu] = true
 		}
+
+		for vcpu := range r.QueuedByShape() {
+			shapes[vcpu] = true
+		}
 	}
 
-	b.WriteString("| Shape | Policy | Jobs | p50 | p90 | p99 | p99.99 | Max |\n")
-	b.WriteString("|---|---|---|---|---|---|---|---|\n")
+	b.WriteString("| Shape | Policy | Started | p50 | p90 | p99 | p99.99 | Max | Still queued | Oldest queued |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|---|---|\n")
 
 	for _, vcpu := range slices.Sorted(maps.Keys(shapes)) {
 		for i, r := range c.Reports {
 			p := r.QueueWaitByShape()[vcpu]
-			fmt.Fprintf(&b, "| %d vCPU | %s | %d | %s | %s | %s | %s | %s |\n", vcpu, c.Policies[i].Name,
-				p.Count, p.P50.Round(time.Second), p.P90.Round(time.Second), p.P99.Round(time.Second),
-				p.P9999.Round(time.Second), p.Max.Round(time.Second))
+			q := r.QueuedByShape()[vcpu]
+
+			// A SHAPE THAT STARTED NOTHING HAS NO WAITS, not waits of zero.
+			waits := "| — | — | — | — | —"
+			if p.Count > 0 {
+				waits = fmt.Sprintf("| %s | %s | %s | %s | %s", p.P50.Round(time.Second), p.P90.Round(time.Second),
+					p.P99.Round(time.Second), p.P9999.Round(time.Second), p.Max.Round(time.Second))
+			}
+
+			oldest := "—"
+			if q.Count > 0 {
+				oldest = q.Oldest.Round(time.Second).String()
+			}
+
+			fmt.Fprintf(&b, "| %d vCPU | %s | %d %s | %d | %s |\n", vcpu, c.Policies[i].Name, p.Count, waits,
+				q.Count, oldest)
 		}
 	}
 
@@ -129,6 +178,13 @@ func (c Comparison) Markdown() string {
 		vcpu, memory := r.MeanUtilization()
 		fmt.Fprintf(&b, "| %s | %d | %d | %d | %.0f%% | %.0f%% | %.1f |\n", c.Policies[i].Name, started,
 			len(r.StillQueued), declined, 100*vcpu, 100*memory, r.EmptyHostHours())
+	}
+
+	if len(c.Reports) > 0 {
+		if from, to, ok := c.Reports[0].span(); ok {
+			fmt.Fprintf(&b, "\nThe charged shares and the empty host-hours are over the same %.1f hours for every "+
+				"policy.\n", to.Sub(from).Hours())
+		}
 	}
 
 	return b.String()

@@ -168,11 +168,12 @@ func TestTheAdversarialWorkloadsKeepEveryProof(t *testing.T) {
 				t.Errorf("recorded %d jobs for a trace of %d", len(report.Records), len(c.trace.Arrivals))
 			}
 
-			// Every job ran to its end, so the lost-completion check saw every
-			// completion the plane delivered.
-			if report.delivered != len(c.trace.Arrivals) || len(report.LostCompletions) != 0 {
-				t.Errorf("%d completions delivered for %d jobs, lost %v", report.delivered,
-					len(c.trace.Arrivals), report.LostCompletions)
+			// Every job ran to its end, so the lost-start and lost-completion
+			// checks saw every start and completion the plane delivered.
+			if report.startsSent != len(c.trace.Arrivals) || report.completionsSent != len(c.trace.Arrivals) ||
+				len(report.LostStarts) != 0 || len(report.LostCompletions) != 0 {
+				t.Errorf("%d starts and %d completions delivered for %d jobs, lost %v and %v", report.startsSent,
+					report.completionsSent, len(c.trace.Arrivals), report.LostStarts, report.LostCompletions)
 			}
 
 			if len(report.Violations) != 0 {
@@ -212,6 +213,19 @@ func TestAHorizonCountsTheJobsStillQueued(t *testing.T) {
 			len(report.Records)-len(report.Unstarted))
 	}
 
+	// THE BACKLOG BY SHAPE IS THE BACKLOG: every job still queued, in its tier's
+	// shape, the oldest of them the oldest overall.
+	queued, oldest := 0, time.Duration(0)
+	for _, q := range report.QueuedByShape() {
+		queued += q.Count
+		oldest = max(oldest, q.Oldest)
+	}
+
+	if queued != len(report.StillQueued) || oldest != report.LongestQueued {
+		t.Errorf("the backlog by shape holds %d jobs, the oldest %s; want the %d still queued, the oldest %s",
+			queued, oldest, len(report.StillQueued), report.LongestQueued)
+	}
+
 	started := 0
 	for i := range report.Records {
 		if !report.Records[i].StartedAt.IsZero() {
@@ -228,12 +242,27 @@ func TestAHorizonCountsTheJobsStillQueued(t *testing.T) {
 	// A JOB A RUNNER HAS TAKEN AND NOT YET STARTED IS QUEUED, NOT LOST: under
 	// direct assignment ten seconds in, every runner minted is still in its
 	// thirty-second boot, and its pool lease names no job yet.
-	booting := Run(t, twoHosts(config.PlacementPack), IdleBacklog(9, Params{Jobs: 24}),
+	backlog := IdleBacklog(9, Params{Jobs: 24})
+	booting := Run(t, twoHosts(config.PlacementPack), backlog,
 		Options{DirectAssignment: true, Until: DefaultStart.Add(10 * time.Second)})
 
-	if len(booting.Missing) != 0 || len(booting.StillQueued) == 0 {
-		t.Errorf("inside the boot: missing %v, %d still queued; want every arrived job still queued",
-			booting.Missing, len(booting.StillQueued))
+	arrived := 0
+	for i := range backlog.Arrivals {
+		if !backlog.Arrivals[i].At.After(booting.Horizon) {
+			arrived++
+		}
+	}
+
+	if len(booting.Missing) != 0 || arrived == 0 || len(booting.StillQueued) != arrived ||
+		len(booting.StillQueued)+booting.LaterArrivals != 24 {
+		t.Errorf("inside the boot: missing %v, %d still queued and %d later of 24, %d arrived; want every "+
+			"arrived job still queued", booting.Missing, len(booting.StillQueued), booting.LaterArrivals, arrived)
+	}
+
+	for i := range booting.Records {
+		if !booting.Records[i].StartedAt.IsZero() {
+			t.Errorf("job %d started inside the boot", booting.Records[i].Seq)
+		}
 	}
 }
 
@@ -252,9 +281,18 @@ func TestRefusedPurchasesAreCounted(t *testing.T) {
 			refused += n
 		}
 
-		if refused == 0 || refused > 24 {
-			t.Errorf("direct %v: a backlog of 24 jobs on a fleet holding 8 to 16 refused %d jobs (%v); want some, "+
-				"each counted once", direct, refused, crowded.Declined)
+		// A JOB REFUSED HAD TO WAIT for room past its runner's boot, so counted
+		// once the refusals are at most the jobs that waited longer.
+		waited := 0
+		for i := range crowded.Records {
+			if r := &crowded.Records[i]; r.StartedAt.Sub(r.Arrival) > DefaultBoot+time.Second {
+				waited++
+			}
+		}
+
+		if refused == 0 || refused > waited {
+			t.Errorf("direct %v: a backlog of 24 jobs on a fleet holding 8 to 16 refused %d jobs (%v), and %d "+
+				"waited past the boot; want some, each counted once", direct, refused, crowded.Declined, waited)
 		}
 
 		roomy := Run(t, twoHosts(config.PlacementPack), Burst(6, Params{Jobs: 4}), opts)

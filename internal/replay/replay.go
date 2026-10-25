@@ -178,8 +178,10 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		opts.AfterRun(st.alloc)
 	}
 
+	startsSent, completionsSent := actions.deliveredJobs()
+
 	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment, opts.Until,
-		actions.waitingJobs())
+		actions.waitingJobs(), startsSent)
 	if err != nil {
 		t.Fatalf("replay: read the ledger back: %v", err)
 	}
@@ -189,7 +191,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	report.Declined = maps.Clone(actions.declined)
 	actions.mu.Unlock()
 
-	report.noteLostCompletions(actions.completedJobs())
+	report.noteLostCompletions(completionsSent)
 
 	st.closeDB()
 
