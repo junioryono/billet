@@ -11,18 +11,22 @@ import (
 )
 
 const readJobDestinations = `-- name: ReadJobDestinations :many
-SELECT ordinal, addr, sent_bytes, received_bytes, connections, unanswered
+SELECT ordinal, addr, sent_bytes, received_bytes, connections, unanswered,
+       timed_replies, slow_replies, slowest_reply_ms
   FROM job_destinations WHERE lease_id = $1
  ORDER BY ordinal
 `
 
 type ReadJobDestinationsRow struct {
-	Ordinal       int64
-	Addr          string
-	SentBytes     int64
-	ReceivedBytes int64
-	Connections   int64
-	Unanswered    sql.NullInt64
+	Ordinal        int64
+	Addr           string
+	SentBytes      int64
+	ReceivedBytes  int64
+	Connections    int64
+	Unanswered     sql.NullInt64
+	TimedReplies   sql.NullInt64
+	SlowReplies    sql.NullInt64
+	SlowestReplyMs sql.NullInt64
 }
 
 // One lease's destinations in the order the node gave them, the total beyond
@@ -43,6 +47,9 @@ func (q *Queries) ReadJobDestinations(ctx context.Context, leaseID string) ([]Re
 			&i.ReceivedBytes,
 			&i.Connections,
 			&i.Unanswered,
+			&i.TimedReplies,
+			&i.SlowReplies,
+			&i.SlowestReplyMs,
 		); err != nil {
 			return nil, err
 		}
@@ -137,22 +144,26 @@ func (q *Queries) ReadJobUsage(ctx context.Context, leaseID string) (JobUsage, e
 
 const recordJobDestinations = `-- name: RecordJobDestinations :exec
 WITH RECURSIVE slot (n, rec, rest) AS (
-    SELECT 0, substr(CAST($2 AS TEXT), 1, 118),
-           substr(CAST($2 AS TEXT), 119)
+    SELECT 0, substr(CAST($2 AS TEXT), 1, 175),
+           substr(CAST($2 AS TEXT), 176)
      WHERE 0 < CAST($3 AS BIGINT)
     UNION ALL
-    SELECT n + 1, substr(rest, 1, 118), substr(rest, 119)
+    SELECT n + 1, substr(rest, 1, 175), substr(rest, 176)
       FROM slot WHERE n + 1 < CAST($3 AS BIGINT)
 )
 INSERT INTO job_destinations
-     (lease_id, ordinal, addr, sent_bytes, received_bytes, connections, unanswered)
+     (lease_id, ordinal, addr, sent_bytes, received_bytes, connections, unanswered,
+      timed_replies, slow_replies, slowest_reply_ms)
 SELECT CAST($1 AS TEXT),
        CAST(substr(rec, 1, 3) AS BIGINT),
        rtrim(substr(rec, 4, 39)),
        CAST(substr(rec, 43, 19) AS BIGINT),
        CAST(substr(rec, 62, 19) AS BIGINT),
        CAST(substr(rec, 81, 19) AS BIGINT),
-       CAST(NULLIF(rtrim(substr(rec, 100, 19)), '') AS BIGINT)
+       CAST(NULLIF(rtrim(substr(rec, 100, 19)), '') AS BIGINT),
+       CAST(NULLIF(rtrim(substr(rec, 119, 19)), '') AS BIGINT),
+       CAST(NULLIF(rtrim(substr(rec, 138, 19)), '') AS BIGINT),
+       CAST(NULLIF(rtrim(substr(rec, 157, 19)), '') AS BIGINT)
   FROM slot
 `
 
@@ -176,8 +187,10 @@ type RecordJobDestinationsParams struct {
 // packDestinations: a 3-digit ordinal, the address space-padded to 39
 // characters, then the sent, received and connection counts as 19 zero-padded
 // digits each, then the unanswered count the same way or 19 spaces where the
-// report did not count it (migration 68), 118 characters a row) and the
-// recursive slot list below cuts one record off the front at each step.
+// report did not count it (migration 68), then the timed replies, the slow
+// replies and the slowest reply's milliseconds the same way or 19 spaces each
+// where the report did not time them (migration 69), 175 characters a row) and
+// the recursive slot list below cuts one record off the front at each step.
 //
 // EACH STEP CARRIES THE REST rather than indexing into the whole string,
 // because both engines find a character offset in TEXT by scanning from its

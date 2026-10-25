@@ -68,8 +68,10 @@ const (
 	packedCountWidth = 19 // the digits of the largest int64
 	// packedRowWidth is the sent, received and connection counts, then the
 	// unanswered count, which is spaces where the report did not count it
-	// (migration 68).
-	packedRowWidth = packedOrdinalWidth + packedAddrWidth + 4*packedCountWidth
+	// (migration 68), then the timed replies, the slow replies and the slowest
+	// reply's milliseconds, spaces where the report did not time them
+	// (migration 69).
+	packedRowWidth = packedOrdinalWidth + packedAddrWidth + 7*packedCountWidth
 )
 
 // packDestinations is a report's rows as RecordJobDestinations reads them, and
@@ -83,7 +85,8 @@ func packDestinations(d *JobDestinations) (string, int, error) {
 		if len(dest.Addr) > packedAddrWidth || strings.ContainsAny(dest.Addr, " \t\r\n") {
 			return fmt.Errorf("destination %q does not fit the ledger's record", dest.Addr)
 		}
-		if dest.SentBytes < 0 || dest.ReceivedBytes < 0 || dest.Connections < 0 || dest.Unanswered < 0 {
+		if dest.SentBytes < 0 || dest.ReceivedBytes < 0 || dest.Connections < 0 || dest.Unanswered < 0 ||
+			dest.TimedReplies < 0 || dest.SlowReplies < 0 || dest.SlowestReplyMillis < 0 {
 			return fmt.Errorf("destination %q has a negative total", dest.Addr)
 		}
 		fmt.Fprintf(&b, "%0*d%-*s%0*d%0*d%0*d", packedOrdinalWidth, ordinal, packedAddrWidth, dest.Addr,
@@ -95,6 +98,13 @@ func packDestinations(d *JobDestinations) (string, int, error) {
 			fmt.Fprintf(&b, "%0*d", packedCountWidth, dest.Unanswered)
 		} else {
 			fmt.Fprintf(&b, "%*s", packedCountWidth, "")
+		}
+		// NOT TIMED IS SPACES TOO: zeros would say nothing answered slowly.
+		if d.RepliesTimed {
+			fmt.Fprintf(&b, "%0*d%0*d%0*d", packedCountWidth, dest.TimedReplies, packedCountWidth,
+				dest.SlowReplies, packedCountWidth, dest.SlowestReplyMillis)
+		} else {
+			fmt.Fprintf(&b, "%*s", 3*packedCountWidth, "")
 		}
 
 		return nil
@@ -123,6 +133,7 @@ func readDestinations(ctx context.Context, q querier, leaseID string, row ledger
 	out := &JobDestinations{Incomplete: row.DestinationsIncomplete.Int64 == 1}
 	other := false
 	counted, uncounted := 0, 0
+	timed, untimed := 0, 0
 	for _, r := range rows {
 		dest := JobDestination{
 			Addr: r.Addr, SentBytes: r.SentBytes, ReceivedBytes: r.ReceivedBytes, Connections: r.Connections,
@@ -132,6 +143,17 @@ func readDestinations(ctx context.Context, q querier, leaseID string, row ledger
 			counted++
 		} else {
 			uncounted++
+		}
+		switch {
+		case r.TimedReplies.Valid && r.SlowReplies.Valid && r.SlowestReplyMs.Valid:
+			dest.TimedReplies, dest.SlowReplies = r.TimedReplies.Int64, r.SlowReplies.Int64
+			dest.SlowestReplyMillis = r.SlowestReplyMs.Int64
+			timed++
+		case !r.TimedReplies.Valid && !r.SlowReplies.Valid && !r.SlowestReplyMs.Valid:
+			untimed++
+		default:
+			return nil, fmt.Errorf("alloc: the ledger records part of a reply time for lease %s's "+
+				"destination %q", leaseID, r.Addr)
 		}
 		if r.Ordinal == otherOrdinal {
 			out.Other, other = dest, true
@@ -154,6 +176,11 @@ func readDestinations(ctx context.Context, q querier, leaseID string, row ledger
 			"destination rows and none for %d", counted, leaseID, uncounted)
 	}
 	out.UnansweredCounted = counted > 0
+	if timed > 0 && untimed > 0 {
+		return nil, fmt.Errorf("alloc: the ledger records reply times for %d of lease %s's "+
+			"destination rows and none for %d", timed, leaseID, untimed)
+	}
+	out.RepliesTimed = timed > 0
 	if row.TapSentBytes.Valid && row.TapReceivedBytes.Valid {
 		out.Tap = &TapTotals{SentBytes: row.TapSentBytes.Int64, ReceivedBytes: row.TapReceivedBytes.Int64}
 	}

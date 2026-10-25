@@ -362,6 +362,39 @@ func TestFinalCountsOpenFlowsOrSaysItCouldNot(t *testing.T) {
 	}
 }
 
+// A JOB'S END THAT SYNC CANNOT PROVE READ PROVES NEITHER ITS BYTES NOR ITS
+// FIRST REPLIES, which come on one socket: the job is incomplete and untimed.
+func TestFinalIsTimedOnlyWhenSyncProvedTheEventsRead(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+	table := &fakeTable{}
+	w, _ := newTestWatcher(table, l)
+
+	for name, tc := range map[string]struct {
+		syncErr           error
+		timed, incomplete bool
+	}{
+		"proved":   {timed: true},
+		"unproved": {syncErr: errors.New("the listener is not reading"), incomplete: true},
+	} {
+		table.mu.Lock()
+		table.syncErr = tc.syncErr
+		table.mu.Unlock()
+
+		w.Watch(name, guestMACAddr, "leases", launched)
+		r, measured, err := w.Final(t.Context(), name, ended)
+		if (err != nil) != (tc.syncErr != nil) {
+			t.Errorf("%s: Final answered %v for a sync that answered %v", name, err, tc.syncErr)
+		}
+		if !measured || r.RepliesTimed != tc.timed || r.Incomplete != tc.incomplete {
+			t.Errorf("%s: Final = %+v, measured %v; want timed %v, incomplete %v", name, r, measured, tc.timed,
+				tc.incomplete)
+		}
+	}
+}
+
 // AN ADDRESS THAT CHANGES MID-JOB marks the job incomplete: its new address's
 // traffic was never followed.
 func TestAnAddressThatChangesMarksTheJobIncomplete(t *testing.T) {

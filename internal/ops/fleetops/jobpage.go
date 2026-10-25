@@ -135,6 +135,10 @@ type pageDestinations struct {
 	// destinations got nothing back, or that the report did not count them.
 	Counted    bool
 	Unanswered string
+	// Timed says the rows carry a slowest reply, and Slow is which destinations
+	// answered late, or that the report did not time them.
+	Timed bool
+	Slow  string
 	// Complete answers whether the totals are complete.
 	Complete string
 	Tap      string
@@ -143,7 +147,7 @@ type pageDestinations struct {
 
 // pageDestination is one destination's row.
 type pageDestination struct {
-	Addr, Sent, Received, Connections, Unanswered string
+	Addr, Sent, Received, Connections, Unanswered, SlowestReply string
 }
 
 // buildJobPage is the page for a job: its record, its usage report and the
@@ -474,12 +478,14 @@ func destinationsSection(rec alloc.JobRecord, m *alloc.RecordedUsage) pageDestin
 			sumOf(d.Other).said(d.UnansweredCounted), alloc.MaxJobDestinations),
 		Counted:    d.UnansweredCounted,
 		Unanswered: unansweredText(d),
+		Timed:      d.RepliesTimed,
+		Slow:       slowText(d),
 		Complete:   "yes",
 	}
 	for _, dest := range shown {
 		out.Rows = append(out.Rows, pageDestination{Addr: dest.Addr, Sent: cli.HumanBytes(dest.SentBytes),
 			Received: cli.HumanBytes(dest.ReceivedBytes), Connections: groupDigits(dest.Connections),
-			Unanswered: groupDigits(dest.Unanswered)})
+			Unanswered: groupDigits(dest.Unanswered), SlowestReply: slowestReply(dest)})
 	}
 	if rest := sorted[len(shown):]; len(rest) > 0 {
 		out.More = fmt.Sprintf("and %d more: %s", len(rest), sumOf(rest...).said(d.UnansweredCounted))

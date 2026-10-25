@@ -372,6 +372,21 @@ func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, s
 	return jobDestinationsOf(res, c)
 }
 
+// replies sets dest's reply times to what a report may say of them: no more
+// timed than answered, no more slow than timed, and a slowest wait only beside
+// a timed reply, and never short of the slow ones it stands for.
+func replies(dest *alloc.JobDestination, timed, slow int64, slowest time.Duration) {
+	dest.TimedReplies = min(timed, dest.Connections-dest.Unanswered)
+	dest.SlowReplies = min(slow, dest.TimedReplies)
+	dest.SlowestReplyMillis = 0
+	if dest.TimedReplies > 0 {
+		dest.SlowestReplyMillis = max(slowest.Milliseconds(), 0)
+	}
+	if dest.SlowReplies > 0 {
+		dest.SlowestReplyMillis = max(dest.SlowestReplyMillis, alloc.SlowReplyMillis)
+	}
+}
+
 // jobDestinationsOf is the report's destinations: each one as the tracker
 // totalled it, largest first, the rest under Other, and the tap's totals when
 // they were read and are not negative.
@@ -403,23 +418,31 @@ func jobDestinationsOf(res flows.Result, c tapComparison) *alloc.JobDestinations
 	other := alloc.JobDestination{SentBytes: clamp(res.Other.Sent), ReceivedBytes: clamp(res.Other.Received),
 		Connections: clamp(res.Other.Connections)}
 	other.Unanswered = unanswered(clamp(res.Other.Unanswered), other.Connections)
+	replies(&other, clamp(res.Other.TimedReplies), clamp(res.Other.SlowReplies), res.Other.SlowestReply)
 	for _, d := range res.Destinations {
 		dest := alloc.JobDestination{Addr: d.Addr.String(), SentBytes: clamp(d.Sent),
 			ReceivedBytes: clamp(d.Received), Connections: clamp(d.Connections)}
 		dest.Unanswered = unanswered(clamp(d.Unanswered), dest.Connections)
+		replies(&dest, clamp(d.TimedReplies), clamp(d.SlowReplies), d.SlowestReply)
 		if !d.Addr.IsValid() || len(out.Destinations) == alloc.MaxJobDestinations {
 			other.SentBytes = add(other.SentBytes, dest.SentBytes)
 			other.ReceivedBytes = add(other.ReceivedBytes, dest.ReceivedBytes)
 			other.Connections = add(other.Connections, dest.Connections)
 			other.Unanswered = unanswered(add(other.Unanswered, dest.Unanswered), other.Connections)
+			replies(&other, add(other.TimedReplies, dest.TimedReplies), add(other.SlowReplies, dest.SlowReplies),
+				time.Duration(max(other.SlowestReplyMillis, dest.SlowestReplyMillis))*time.Millisecond)
 
 			continue
 		}
 		out.Destinations = append(out.Destinations, dest)
 	}
 	out.Other = other
+	out.RepliesTimed = true
 	if res.UnansweredUnknown {
 		*out = out.WithoutUnanswered()
+	}
+	if !res.RepliesTimed {
+		*out = out.WithoutReplyTimes()
 	}
 	if c.tapKnown && c.tapSent >= 0 && c.tapReceived >= 0 {
 		out.Tap = &alloc.TapTotals{SentBytes: c.tapSent, ReceivedBytes: c.tapReceived}

@@ -261,16 +261,25 @@ func TestThePageWordsUnansweredAsTheTextReportDoes(t *testing.T) {
 
 	stalled := manyDestinations(3)
 	stalled[0].Unanswered = 1
+	late := timedDestinations(3)
+	late[1].SlowReplies, late[1].SlowestReplyMillis = 1, 2300
 	for name, d := range map[string]*alloc.JobDestinations{
 		"counted, incomplete":     {Destinations: stalled, UnansweredCounted: true, Incomplete: true},
 		"counted, none, complete": {Destinations: manyDestinations(3), UnansweredCounted: true},
 		"counted, none, incomplete": {Destinations: manyDestinations(3), UnansweredCounted: true,
 			Incomplete: true},
 		"not counted": {Destinations: stalled[1:]},
+		"timed, one late, incomplete": {Destinations: late, UnansweredCounted: true, RepliesTimed: true,
+			Incomplete: true},
+		"timed, none late": {Destinations: timedDestinations(2), UnansweredCounted: true, RepliesTimed: true},
 	} {
 		text := renderedDestinations(t, d)
 		page := destinationsSection(alloc.JobRecord{}, &alloc.RecordedUsage{JobUsage: alloc.JobUsage{Destinations: d}})
-		for label, said := range map[string]string{"complete": page.Complete, "unanswered": page.Unanswered} {
+		if page.Timed != d.RepliesTimed {
+			t.Errorf("%s: the page draws the slowest-reply column %v, want %v", name, page.Timed, d.RepliesTimed)
+		}
+		for label, said := range map[string]string{"complete": page.Complete, "unanswered": page.Unanswered,
+			"slow": page.Slow} {
 			if line := lineStarting(t, text, label); line != fmt.Sprintf("%-11s%s", label, said) {
 				t.Errorf("%s: the page's %s says %q and the text report %q", name, label, said, line)
 			}
@@ -278,6 +287,75 @@ func TestThePageWordsUnansweredAsTheTextReportDoes(t *testing.T) {
 		if page.Counted != d.UnansweredCounted {
 			t.Errorf("%s: the page draws the unanswered column %v, want %v", name, page.Counted, d.UnansweredCounted)
 		}
+	}
+}
+
+// timedDestinations is manyDestinations with each connection answered and its
+// first reply timed at 30 ms.
+func timedDestinations(n int) []alloc.JobDestination {
+	dests := manyDestinations(n)
+	for i := range dests {
+		dests[i].TimedReplies, dests[i].SlowestReplyMillis = 1, 30
+	}
+
+	return dests
+}
+
+// WHAT ANSWERED LATE IS NAMED, every destination with a slow first reply by
+// name, the slowest first, beside the table's slowest-reply column: the
+// resolver that answered after a second, even when it moved too little to be
+// listed by bytes. Answered connections left untimed are counted, a report
+// that did not time replies says so and draws no column, and one that timed
+// them and found none late says none.
+func TestJobsShowNamesWhatAnsweredLate(t *testing.T) {
+	t.Parallel()
+
+	dests := timedDestinations(25)
+	dests[24].SlowReplies, dests[24].SlowestReplyMillis = 1, 1400
+	dests = append(dests, alloc.JobDestination{Addr: "172.31.1.1", SentBytes: 80, Connections: 3,
+		TimedReplies: 2, SlowReplies: 2, SlowestReplyMillis: 4200})
+	out := renderedDestinations(t, &alloc.JobDestinations{Destinations: dests, UnansweredCounted: true,
+		RepliesTimed: true, Other: alloc.JobDestination{Connections: 2, TimedReplies: 2, SlowReplies: 1,
+			SlowestReplyMillis: 1100}})
+
+	if !strings.Contains(out, "connections  unanswered  slowest reply\n") {
+		t.Errorf("the table has no slowest-reply column:\n%s", out)
+	}
+	if !strings.HasSuffix(lineContaining(t, out, " 10.0.0.25 "), " 1.4 s") ||
+		!strings.HasSuffix(lineContaining(t, out, " 10.0.0.24 "), " 30 ms") {
+		t.Errorf("the rows do not end in their slowest reply:\n%s", out)
+	}
+	want := "4 of 29 timed replies came after more than 1 s, TCP's first retransmission (a resolver that " +
+		"answered late, or an uplink slow enough that the guest sent its SYN again): 172.31.1.1 2 " +
+		"(slowest 4.2 s), 10.0.0.25 1 (slowest 1.4 s), other 1 (slowest 1.1 s); 1 answered connections " +
+		"were not timed, so their waits are not known"
+	if line := lineStarting(t, out, "slow"); line != "slow       "+want {
+		t.Errorf("the slow line reads %q,\nwant %q", line, "slow       "+want)
+	}
+
+	none := renderedDestinations(t, &alloc.JobDestinations{Destinations: timedDestinations(2),
+		UnansweredCounted: true, RepliesTimed: true})
+	if line := lineStarting(t, none, "slow"); !strings.HasSuffix(line, "none: each of 2 timed replies came within 1 s") {
+		t.Errorf("a report that timed and found nothing late reads %q", line)
+	}
+
+	// WITHOUT THE UNANSWERED COUNTS no connection is known answered, so none is
+	// said to have been left untimed.
+	uncounted := timedDestinations(2)
+	uncounted[0].TimedReplies = 0
+	if line := lineStarting(t, renderedDestinations(t, &alloc.JobDestinations{Destinations: uncounted,
+		RepliesTimed: true}), "slow"); strings.Contains(line, "not timed") {
+		t.Errorf("a report that did not count unanswered connections claims untimed answered ones: %q", line)
+	}
+
+	untimed := renderedDestinations(t, &alloc.JobDestinations{Destinations: manyDestinations(2),
+		UnansweredCounted: true})
+	if line := lineStarting(t, untimed, "slow"); !strings.Contains(line, "not timed") ||
+		strings.Contains(line, "none") {
+		t.Errorf("a report that did not time replies reads %q", line)
+	}
+	if strings.Contains(untimed, "slowest reply") {
+		t.Errorf("a report that did not time replies drew the column:\n%s", untimed)
 	}
 }
 

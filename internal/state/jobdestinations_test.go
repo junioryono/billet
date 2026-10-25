@@ -28,9 +28,9 @@ func TestAUsageRowWrittenAtVersion58ReadsBackWithoutDestinations(t *testing.T) {
 			`ALTER TABLE job_usage DROP COLUMN tap_sent_bytes`,
 			`ALTER TABLE job_usage DROP COLUMN tap_received_bytes`,
 			`DELETE FROM schema_migrations WHERE version = 59`,
-			// MIGRATION 68 ADDED A COLUMN TO THE TABLE DROPPED ABOVE, so the reopen
-			// applies it again to the table 59 recreates.
-			`DELETE FROM schema_migrations WHERE version = 68`,
+			// MIGRATIONS 68 AND 69 ADDED COLUMNS TO THE TABLE DROPPED ABOVE, so the
+			// reopen applies them again to the table 59 recreates.
+			`DELETE FROM schema_migrations WHERE version IN (68, 69)`,
 			`INSERT INTO job_usage
 			 (lease_id, node, recorded_at, source, unmeasured, samples, interval_ms,
 			  window_ms, cpu_user_us, cpu_system_us, guest_cpu_us, vmm_cpu_us,

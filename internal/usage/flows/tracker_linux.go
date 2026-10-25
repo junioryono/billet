@@ -44,8 +44,9 @@ const (
 // so a destruction from an earlier Sync is never taken for a later one's.
 type sentinelID struct{ sport, dport uint16 }
 
-// Tracker reads the kernel's connection tracker: destructions as they happen,
-// and the whole table on demand.
+// Tracker reads the kernel's connection tracker: each flow's creation, its
+// first reply and its destruction as they happen, and the whole table on
+// demand.
 type Tracker struct {
 	log *slog.Logger
 
@@ -60,10 +61,18 @@ func NewTracker(log *slog.Logger) *Tracker {
 	return &Tracker{log: log, waiters: map[sentinelID]chan struct{}{}}
 }
 
-// Run reports every destroyed flow to a until ctx ends. The kernel drops
-// events it cannot deliver; while the listener is not reading, for that or
-// any other reason, a is told the events are down, and every job whose time
-// overlaps the gap is marked incomplete.
+// Run reports every flow's creation, first reply and destruction to a until ctx
+// ends. The kernel drops events it cannot deliver; while the listener is not
+// reading, for that or any other reason, a is told the events are down, and
+// every job whose time overlaps the gap is marked incomplete and untimed.
+//
+// ONE SOCKET FOR ALL THREE, because its order is the kernel's: a flow's
+// creation and reply come before its destruction, and an id is reused only
+// after it, so each destruction takes its own flow's wait and no other's; on
+// two sockets that pairing is a guess about their relative order. Measured
+// 2026-10-25 at a 4 MiB buffer: 60,000 short
+// connections in 7.6 s raised 60,001 new and 300,382 update events on one
+// socket with none dropped.
 func (t *Tracker) Run(ctx context.Context, a *Accountant) {
 	a.Down()
 
@@ -115,11 +124,12 @@ func (t *Tracker) listen(ctx context.Context, a *Accountant) error {
 
 	events := make(chan conntrack.Event, 1024)
 
-	errs, err := conn.Listen(events, 1, []netfilter.NetlinkGroup{netfilter.GroupCTDestroy})
+	errs, err := conn.Listen(events, 1, []netfilter.NetlinkGroup{netfilter.GroupCTNew, netfilter.GroupCTUpdate,
+		netfilter.GroupCTDestroy})
 	if err != nil {
 		_ = conn.Close()
 
-		return fmt.Errorf("listen for destroyed flows: %w", err)
+		return fmt.Errorf("listen for flows: %w", err)
 	}
 
 	// CLOSED WHILE THE CHANNELS ARE DRAINED: the library's worker blocks
@@ -134,18 +144,38 @@ func (t *Tracker) listen(ctx context.Context, a *Accountant) error {
 		case <-ctx.Done():
 			return nil
 		case err := <-errs:
+			// DOWN AS IT FAILS, before the socket is drained and closed: a job
+			// finished in that time must not read as complete or timed.
+			a.Down()
+
 			return err
 		case ev := <-events:
-			if ev.Type != conntrack.EventDestroy || ev.Flow == nil {
+			// READ TIME IS THE WAIT'S CLOCK: neither a new nor an update event
+			// carries the entry's own timestamps or counters (measured
+			// 2026-10-25).
+			at := time.Now()
+
+			if ev.Flow == nil {
 				continue
 			}
 
-			if t.sentinel(ev.Flow) {
-				continue
-			}
+			switch ev.Type {
+			case conntrack.EventNew:
+				if f, ok := fromConntrack(ev.Flow); ok {
+					a.ObserveNew(f, at, ev.Flow.Status.SeenReply())
+				}
+			case conntrack.EventUpdate:
+				if f, ok := fromConntrack(ev.Flow); ok && ev.Flow.Status.SeenReply() {
+					a.ObserveReply(f, at)
+				}
+			case conntrack.EventDestroy:
+				if t.sentinel(ev.Flow) {
+					continue
+				}
 
-			if f, ok := fromConntrack(ev.Flow); ok {
-				a.Observe(f)
+				if f, ok := fromConntrack(ev.Flow); ok {
+					a.Observe(f)
+				}
 			}
 		}
 	}
@@ -328,8 +358,10 @@ func fromConntrack(cf *conntrack.Flow) (Flow, bool) {
 		ID:           cf.ID,
 		Start:        cf.Timestamp.Start,
 		Protocol:     cf.TupleOrig.Proto.Protocol,
+		Zone:         cf.Zone,
 		Source:       src,
 		Dest:         dst,
+		SourcePort:   cf.TupleOrig.Proto.SourcePort,
 		DestPort:     cf.TupleOrig.Proto.DestinationPort,
 		OrigBytes:    cf.CountersOrig.Bytes,
 		ReplyBytes:   cf.CountersReply.Bytes,

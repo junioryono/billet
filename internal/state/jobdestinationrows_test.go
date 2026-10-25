@@ -11,12 +11,15 @@ import (
 )
 
 // destRow is one row of job_destinations as RecordJobDestinations reads it:
-// the unanswered count is packed only where counted says so.
+// the unanswered count is packed only where counted says so, and the reply
+// times only where timed does.
 type destRow struct {
 	ordinal                                 int64
 	addr                                    string
 	sent, received, connections, unanswered int64
 	counted                                 bool
+	timedReplies, slowReplies, slowestMs    int64
+	timed                                   bool
 }
 
 // packRows packs rows into the fixed-width records RecordJobDestinations cuts
@@ -30,6 +33,11 @@ func packRows(rows ...destRow) string {
 			fmt.Fprintf(&b, "%019d", r.unanswered)
 		} else {
 			b.WriteString(strings.Repeat(" ", 19))
+		}
+		if r.timed {
+			fmt.Fprintf(&b, "%019d%019d%019d", r.timedReplies, r.slowReplies, r.slowestMs)
+		} else {
+			b.WriteString(strings.Repeat(" ", 3*19))
 		}
 	}
 
@@ -47,8 +55,8 @@ func writeRows(ctx context.Context, db *DB, lease string, rows ...destRow) error
 
 // THE ONE STATEMENT WRITES EVERY ROW IT IS GIVEN EXACTLY: each field cut from
 // its place in the record, the longest address and the largest counts whole,
-// an address's padding trimmed, an unanswered count of spaces kept as NULL and
-// one of zero as zero, and nothing at all for no rows.
+// an address's padding trimmed, an unanswered count or reply times of spaces
+// kept as NULL and ones of zero as zero, and nothing at all for no rows.
 func TestEveryPackedDestinationIsWrittenAsPacked(t *testing.T) {
 	t.Parallel()
 
@@ -60,10 +68,10 @@ func TestEveryPackedDestinationIsWrittenAsPacked(t *testing.T) {
 
 	const most = int64(1<<63 - 1)
 	want := []destRow{
-		{0, "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe", most, most, most, most, true},
-		{1, "140.82.112.3", 1, 22, 333, 0, false},
-		{2, "::ffff:1.2.3.4", 0, 0, 0, 0, true},
-		{256, "", 4444, 55555, 7, 6, true},
+		{0, "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe", most, most, most, most, true, most, most, most, true},
+		{1, "140.82.112.3", 1, 22, 333, 0, false, 0, 0, 0, false},
+		{2, "::ffff:1.2.3.4", 0, 0, 0, 0, true, 0, 0, 0, true},
+		{256, "", 4444, 55555, 7, 6, true, 1, 1, 2500, true},
 	}
 	if err := writeRows(t.Context(), db, "l1", want...); err != nil {
 		t.Fatalf("RecordJobDestinations: %v", err)
@@ -81,8 +89,12 @@ func TestEveryPackedDestinationIsWrittenAsPacked(t *testing.T) {
 			t.Fatalf("read back %d rows, want %d: %+v", len(got), len(want), got)
 		}
 		for i, r := range got {
+			if r.SlowReplies.Valid != r.TimedReplies.Valid || r.SlowestReplyMs.Valid != r.TimedReplies.Valid {
+				t.Errorf("row %d reads part of a reply time: %+v", i, r)
+			}
 			if (destRow{r.Ordinal, r.Addr, r.SentBytes, r.ReceivedBytes, r.Connections, r.Unanswered.Int64,
-				r.Unanswered.Valid}) != want[i] {
+				r.Unanswered.Valid, r.TimedReplies.Int64, r.SlowReplies.Int64, r.SlowestReplyMs.Int64,
+				r.TimedReplies.Valid}) != want[i] {
 				t.Errorf("row %d reads %+v, want %+v", i, r, want[i])
 			}
 		}
@@ -132,6 +144,8 @@ func TestTheDestinationsTableRefusesWhatNoReportCanSay(t *testing.T) {
 	negative.received = -1
 	unanswered := named(0, "10.0.0.1")
 	unanswered.unanswered, unanswered.counted = -1, true
+	slowest := named(0, "10.0.0.1")
+	slowest.slowestMs, slowest.timed = -1, true
 	for name, tc := range map[string]struct {
 		lease string
 		rows  []destRow
@@ -144,6 +158,7 @@ func TestTheDestinationsTableRefusesWhatNoReportCanSay(t *testing.T) {
 		"two rows at one ordinal":        {"l", []destRow{named(0, "10.0.0.1"), named(0, "10.0.0.2")}},
 		"a negative total":               {"l", []destRow{negative}},
 		"a negative unanswered count":    {"l", []destRow{unanswered}},
+		"a negative slowest reply":       {"l", []destRow{slowest}},
 		"a 258th row for a full lease":   {"full", []destRow{named(255, "10.9.9.9")}},
 		"a second rest for a full lease": {"full", []destRow{named(256, "")}},
 	} {

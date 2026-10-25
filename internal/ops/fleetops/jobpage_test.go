@@ -134,13 +134,18 @@ func exampleUsage(points []usage.Point) alloc.JobUsage {
 		},
 		Destinations: &alloc.JobDestinations{
 			Destinations: []alloc.JobDestination{
-				{Addr: "140.82.112.4", SentBytes: 3_100_000, ReceivedBytes: 352_000_000, Connections: 4},
-				{Addr: "185.199.108.133", SentBytes: 410_000, ReceivedBytes: 61_000_000, Connections: 12},
-				{Addr: "10.0.0.2", SentBytes: 24_000, ReceivedBytes: 61_000, Connections: 310, Unanswered: 2},
+				{Addr: "140.82.112.4", SentBytes: 3_100_000, ReceivedBytes: 352_000_000, Connections: 4,
+					TimedReplies: 4, SlowestReplyMillis: 62},
+				{Addr: "185.199.108.133", SentBytes: 410_000, ReceivedBytes: 61_000_000, Connections: 12,
+					TimedReplies: 12, SlowestReplyMillis: 41},
+				{Addr: "10.0.0.2", SentBytes: 24_000, ReceivedBytes: 61_000, Connections: 310, Unanswered: 2,
+					TimedReplies: 308, SlowReplies: 3, SlowestReplyMillis: 2600},
 			},
-			Other:             alloc.JobDestination{SentBytes: 9_000, ReceivedBytes: 120_000, Connections: 3},
+			Other: alloc.JobDestination{SentBytes: 9_000, ReceivedBytes: 120_000, Connections: 3,
+				TimedReplies: 3, SlowestReplyMillis: 80},
 			Tap:               &alloc.TapTotals{SentBytes: 3_560_000, ReceivedBytes: 413_400_000},
 			UnansweredCounted: true,
+			RepliesTimed:      true,
 		},
 	}
 }

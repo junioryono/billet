@@ -704,3 +704,307 @@ func TestReadyNeedsBothSwitchesAndTellsUnreadableFromOff(t *testing.T) {
 		}
 	}
 }
+
+// A FLOW'S WAIT FOR ITS FIRST REPLY IS TIMED FROM ITS NEW EVENT TO ITS FIRST
+// EVENT THAT SAW A REPLY, and counted against its destination: a slow answer
+// is the stall nothing else records, because nothing went unanswered. A flow
+// that was never answered, one whose new event was not read, and one whose
+// start is not the moment its new event was read (an id reused across the two
+// sockets) are left untimed rather than given a wait that is not theirs; and
+// only the first reply is the wait, every later update being the flow moving
+// on.
+func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
+	t.Parallel()
+
+	resolver := netip.MustParseAddr("172.31.1.1")
+	a := NewAccountant()
+	a.Up(began.Add(-time.Hour))
+	a.Watch("lease-1", guest, began, nil)
+
+	answer := func(id uint32, dst netip.Addr, wait time.Duration) Flow {
+		f := flow(id, guest, dst, 100, 100)
+		a.ObserveNew(f, started, false)
+		a.ObserveReply(f, started.Add(wait))
+		a.ObserveReply(f, started.Add(wait+time.Minute))
+
+		return f
+	}
+	a.Observe(answer(1, github, 40*time.Millisecond))
+	a.Observe(answer(2, github, 2500*time.Millisecond))
+	a.Observe(answer(3, resolver, 1600*time.Millisecond))
+	a.ObserveNew(flow(4, guest, github, 0, 0), started, false)
+	a.Observe(flow(4, guest, github, 60, 0))
+	a.Observe(flow(5, guest, github, 100, 100))
+	a.ObserveNew(flow(6, guest, github, 0, 0), started.Add(10*time.Second), false)
+	a.ObserveReply(flow(6, guest, github, 0, 0), started.Add(10*time.Second+time.Millisecond))
+	a.Observe(flow(6, guest, github, 100, 100))
+	// A READING WITH NOTHING BACK IN IT, beside a reply event, is counted as the
+	// reading says, unanswered, and not also as a timed reply.
+	stale := answer(7, resolver, 50*time.Millisecond)
+	stale.ReplyBytes, stale.ReplyPackets = 0, 0
+	a.Observe(stale)
+
+	r, _ := a.Final("lease-1", nil, ended)
+	if !r.RepliesTimed {
+		t.Fatal("a job watched while the reply events were read is not timed")
+	}
+	want := map[netip.Addr]Destination{
+		github: {Addr: github, Sent: 460, Received: 400, Connections: 5, Unanswered: 1,
+			TimedReplies: 2, SlowReplies: 1, SlowestReply: 2500 * time.Millisecond},
+		resolver: {Addr: resolver, Sent: 200, Received: 100, Connections: 2, Unanswered: 1,
+			TimedReplies: 1, SlowReplies: 1, SlowestReply: 1600 * time.Millisecond},
+	}
+	if len(r.Destinations) != len(want) {
+		t.Fatalf("destinations = %+v, want %+v", r.Destinations, want)
+	}
+	for _, d := range r.Destinations {
+		if d != want[d.Addr] {
+			t.Errorf("destination %s = %+v,\nwant %+v", d.Addr, d, want[d.Addr])
+		}
+	}
+
+	// EACH FLOW TAKES ITS OWN GENERATION, in the kernel's order on the one
+	// socket: a flow's new and reply events come before its destruction, and an
+	// id is reused only after it. A flow whose new event was not read, its
+	// destruction replayed from before the job was watched, takes nothing, and
+	// neither a later flow of its id nor a cutoff can lend it one; a new event
+	// read more than replyMatch after its flow began leaves the flow untimed;
+	// and a flow still open at Final takes its generation from the dump.
+	type step func(*Accountant)
+	first := flow(9, guest, github, 100, 100)
+	second := startedAt(flow(9, guest, npm, 100, 100), started.Add(400*time.Millisecond))
+	newA := func(a *Accountant) { a.ObserveNew(first, started, false) }
+	replyA := func(a *Accountant) { a.ObserveReply(first, started.Add(20*time.Millisecond)) }
+	destroyA := func(a *Accountant) { a.Observe(first) }
+	newB := func(a *Accountant) { a.ObserveNew(second, second.Start, false) }
+	replyB := func(a *Accountant) { a.ObserveReply(second, second.Start.Add(1200*time.Millisecond)) }
+	destroyB := func(a *Accountant) { a.Observe(second) }
+	lateNewA := func(a *Accountant) { a.ObserveNew(first, started.Add(1200*time.Millisecond), false) }
+	lateReplyA := func(a *Accountant) { a.ObserveReply(first, started.Add(1220*time.Millisecond)) }
+	lateNewB := func(a *Accountant) { a.ObserveNew(second, second.Start.Add(1200*time.Millisecond), false) }
+	for name, tc := range map[string]struct {
+		beforeWatch, steps []step
+		open               []Flow
+		until              time.Time
+		want               map[netip.Addr]time.Duration // returned, with its wait; 0 is untimed
+	}{
+		"an id reused, each its own": {steps: []step{newA, replyA, destroyA, newB, replyB, destroyB},
+			want: map[netip.Addr]time.Duration{github: 20 * time.Millisecond, npm: 1200 * time.Millisecond}},
+		"the first's new event missed": {beforeWatch: []step{destroyA}, steps: []step{newB, replyB, destroyB},
+			want: map[netip.Addr]time.Duration{github: 0, npm: 1200 * time.Millisecond}},
+		"the reuse past the cutoff": {beforeWatch: []step{destroyA}, steps: []step{newB, replyB, destroyB},
+			until: started.Add(200 * time.Millisecond), want: map[netip.Addr]time.Duration{github: 0}},
+		"new events read late": {steps: []step{lateNewA, lateReplyA, destroyA, lateNewB, replyB, destroyB},
+			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
+		"the reuse still open at Final": {steps: []step{newA, replyA, destroyA, newB, replyB},
+			open: []Flow{second},
+			want: map[netip.Addr]time.Duration{github: 20 * time.Millisecond, npm: 1200 * time.Millisecond}},
+	} {
+		reused := NewAccountant()
+		reused.Up(began.Add(-time.Hour))
+		for _, s := range tc.beforeWatch {
+			s(reused)
+		}
+		reused.Watch("lease-r", guest, began, nil)
+		for _, s := range tc.steps {
+			s(reused)
+		}
+		until := ended
+		if !tc.until.IsZero() {
+			until = tc.until
+		}
+		r, ok := reused.Final("lease-r", tc.open, until)
+		if !ok || !r.RepliesTimed || len(r.Destinations) != len(tc.want) {
+			t.Errorf("%s: Final = %+v, %v; want a timed result with %d destinations", name, r, ok, len(tc.want))
+			continue
+		}
+		for _, d := range r.Destinations {
+			wait, known := tc.want[d.Addr]
+			switch {
+			case !known || d.Connections != 1:
+				t.Errorf("%s: an unexpected destination %+v", name, d)
+			case wait != 0 && (d.TimedReplies != 1 || d.SlowestReply != wait):
+				t.Errorf("%s: %s was not timed at its own %s: %+v", name, d.Addr, wait, d)
+			case wait == 0 && d.TimedReplies != 0:
+				t.Errorf("%s: %s was timed by a wait that is not its: %+v", name, d.Addr, d)
+			}
+		}
+	}
+
+	// TWO LIVE FLOWS THAT SHARE AN ID, which a 32-bit hash allows, are told
+	// apart by their tuples: each takes its own wait, whatever order their
+	// events interleave in.
+	collide := NewAccountant()
+	collide.Up(began.Add(-time.Hour))
+	collide.Watch("lease-x", guest, began, nil)
+	slowFlow := flow(12, guest, github, 100, 100)
+	fastFlow := startedAt(flow(12, guest, npm, 100, 100), started.Add(5*time.Millisecond))
+	collide.ObserveNew(slowFlow, slowFlow.Start, false)
+	collide.ObserveNew(fastFlow, fastFlow.Start, false)
+	collide.ObserveReply(fastFlow, fastFlow.Start.Add(20*time.Millisecond))
+	collide.ObserveReply(slowFlow, slowFlow.Start.Add(3*time.Second))
+	collide.Observe(slowFlow)
+	collide.Observe(fastFlow)
+	r, _ = collide.Final("lease-x", nil, ended)
+	if len(r.Destinations) != 2 {
+		t.Errorf("two flows sharing an id came back as %+v, want both", r.Destinations)
+	}
+	for _, d := range r.Destinations {
+		if want := map[netip.Addr]time.Duration{github: 3 * time.Second, npm: 20 * time.Millisecond}[d.Addr]; d.TimedReplies != 1 || d.SlowestReply != want {
+			t.Errorf("a flow sharing its id with another live one reads %+v, want its own %s", d, want)
+		}
+	}
+
+	// A DESTRUCTION TAKES ITS GENERATION WITH IT, so a later flow of the same id
+	// and tuple, whose own new event was not read, takes nothing; and a dump of
+	// the destroyed flow taken before and applied after, with the same counts
+	// and the reuse already timed, keeps the destroyed flow's own wait.
+	consume := NewAccountant()
+	consume.Up(began.Add(-time.Hour))
+	consume.Watch("lease-d", guest, began, nil)
+	reuse := startedAt(flow(9, guest, github, 100, 100), started.Add(300*time.Millisecond))
+	newA(consume)
+	replyA(consume)
+	destroyA(consume)
+	consume.Observe(reuse)
+	r, _ = consume.Final("lease-d", nil, ended)
+	if len(r.Destinations) != 1 || r.Destinations[0].Connections != 2 || r.Destinations[0].TimedReplies != 1 ||
+		r.Destinations[0].SlowestReply != 20*time.Millisecond {
+		t.Errorf("a reuse whose new event was missed took the destroyed flow's wait: %+v", r.Destinations)
+	}
+	dumped := NewAccountant()
+	dumped.Up(began.Add(-time.Hour))
+	dumped.Watch("lease-s", guest, began, nil)
+	newA(dumped)
+	replyA(dumped)
+	destroyA(dumped)
+	sameTuple := startedAt(flow(9, guest, github, 100, 100), started.Add(100*time.Millisecond))
+	dumped.ObserveNew(sameTuple, sameTuple.Start, false)
+	dumped.ObserveReply(sameTuple, sameTuple.Start.Add(1200*time.Millisecond))
+	r, _ = dumped.Final("lease-s", []Flow{first}, started.Add(50*time.Millisecond))
+	if len(r.Destinations) != 1 || r.Destinations[0].TimedReplies != 1 ||
+		r.Destinations[0].SlowestReply != 20*time.Millisecond {
+		t.Errorf("a stale dump of a destroyed flow took its reuse's wait: %+v", r.Destinations)
+	}
+
+	// PAST MaxFlows GENERATIONS THE JOB IS UNTIMED and no more are held, and a
+	// destruction gives its generation back.
+	capped := NewAccountant()
+	capped.Up(began.Add(-time.Hour))
+	capped.Watch("lease-c", guest, began, nil)
+	distinct := func(i int) Flow {
+		f := flow(uint32(100+i), guest, github, 1, 1)
+		f.SourcePort = uint16(1024 + i%60000)
+		f.DestPort = uint16(443 + i/60000)
+
+		return f
+	}
+	for i := range MaxFlows + 5 {
+		capped.ObserveNew(distinct(i), started, false)
+	}
+	capped.mu.Lock()
+	held := len(capped.byKey["lease-c"].generations)
+	capped.mu.Unlock()
+	if held != MaxFlows {
+		t.Errorf("past the cap %d generations are held, want %d", held, MaxFlows)
+	}
+	capped.Observe(distinct(0))
+	capped.mu.Lock()
+	held = len(capped.byKey["lease-c"].generations)
+	capped.mu.Unlock()
+	if held != MaxFlows-1 {
+		t.Errorf("a destruction left %d generations held, want %d", held, MaxFlows-1)
+	}
+	if r, _ := capped.Final("lease-c", nil, ended); r.RepliesTimed {
+		t.Error("a job past MaxFlows generations is still timed")
+	}
+
+	// A NEW EVENT ANNOUNCED AGAIN for a flow already held is no creation time,
+	// and the job is untimed rather than timed from it; one that carries the
+	// reply already starts no wait; and a protocol whose identity the tuple's
+	// ports do not hold, ICMP, is never timed.
+	repeated := NewAccountant()
+	repeated.Up(began.Add(-time.Hour))
+	repeated.Watch("lease-n", guest, began, nil)
+	once := flow(13, guest, github, 100, 100)
+	repeated.ObserveNew(once, started, false)
+	repeated.ObserveNew(once, started.Add(100*time.Millisecond), true)
+	repeated.ObserveReply(once, started.Add(101*time.Millisecond))
+	repeated.Observe(once)
+	if r, _ := repeated.Final("lease-n", nil, ended); r.RepliesTimed {
+		t.Errorf("a job whose flow's creation was announced twice is timed: %+v", r)
+	}
+	others := NewAccountant()
+	others.Up(began.Add(-time.Hour))
+	others.Watch("lease-o", guest, began, nil)
+	late := flow(14, guest, github, 100, 100)
+	others.ObserveNew(late, started, true)
+	others.ObserveReply(late, started.Add(time.Millisecond))
+	others.Observe(late)
+	ping := flow(15, guest, npm, 64, 64)
+	ping.Protocol, ping.DestPort = 1, 0
+	others.ObserveNew(ping, started, false)
+	others.ObserveReply(ping, started.Add(3*time.Second))
+	others.Observe(ping)
+	r, _ = others.Final("lease-o", nil, ended)
+	for _, d := range r.Destinations {
+		if d.TimedReplies != 0 {
+			t.Errorf("an answered creation or an ICMP flow was timed: %+v", d)
+		}
+	}
+	if r, _ := capped.Final("lease-c", nil, ended); r.RepliesTimed {
+		t.Error("a job past MaxFlows generations is still timed")
+	}
+
+	// BEYOND THE CAP the timed counts are summed under Other and its slowest
+	// wait is the slowest of theirs.
+	beyond := NewAccountant()
+	beyond.Up(began.Add(-time.Hour))
+	beyond.Watch("lease-2", guest, began, nil)
+	for i := range MaxDestinations + 2 {
+		dst := netip.AddrFrom4([4]byte{10, 3, byte(i / 256), byte(i % 256)})
+		f := flow(uint32(i+1), guest, dst, 1000, 1000)
+		if i >= MaxDestinations {
+			f = flow(uint32(i+1), guest, dst, 1, 1)
+			beyond.ObserveNew(f, started, false)
+			beyond.ObserveReply(f, started.Add(time.Duration(i-MaxDestinations)*time.Second+1))
+		}
+		beyond.Observe(f)
+	}
+	r, _ = beyond.Final("lease-2", nil, ended)
+	if r.Other.TimedReplies != 2 || r.Other.SlowReplies != 1 || r.Other.SlowestReply != time.Second+1 {
+		t.Errorf("Other = %+v, want two timed replies beyond the cap, one slow, the slowest just over 1s",
+			r.Other)
+	}
+}
+
+// A JOB IS TIMED ONLY WHILE THE REPLY EVENTS WERE READ FOR ALL OF ITS TIME: an
+// accountant no listener ever fed, a gap that closed after the job's grant,
+// and a gap during the job each leave it untimed, which a report says as not
+// timed rather than as no slow replies.
+func TestAJobIsTimedOnlyWhileTheReplyEventsWereRead(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		prepare, during func(*Accountant)
+		timed           bool
+	}{
+		"read throughout":                   {prepare: func(a *Accountant) { a.Up(began.Add(-time.Hour)) }, timed: true},
+		"no listener ever read them":        {},
+		"a gap that closed after the grant": {prepare: func(a *Accountant) { a.Up(began.Add(time.Second)) }},
+		"a gap during the job": {prepare: func(a *Accountant) { a.Up(began.Add(-time.Hour)) },
+			during: func(a *Accountant) { a.Down(); a.Up(started.Add(time.Minute)) }},
+	} {
+		a := NewAccountant()
+		if tc.prepare != nil {
+			tc.prepare(a)
+		}
+		a.Watch("lease", guest, began, nil)
+		if tc.during != nil {
+			tc.during(a)
+		}
+		if r, _ := a.Final("lease", nil, ended); r.RepliesTimed != tc.timed {
+			t.Errorf("%s: RepliesTimed = %v, want %v", name, r.RepliesTimed, tc.timed)
+		}
+	}
+}

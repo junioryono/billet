@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 35
+	Version = 36
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -477,6 +477,20 @@ const (
 	// sends them anyway has the report kept with the counts dropped, which reads
 	// as not counted rather than as nothing unanswered.
 	VersionUnansweredFlows = 35
+
+	// VersionReplyTimes is the version from which a usage report's destinations
+	// say how long their connections waited for a first reply
+	// (lease.JobDestination.TimedReplies, SlowReplies and SlowestReplyMillis,
+	// under JobDestinations.RepliesTimed): a resolver that answered late, or an
+	// uplink shaped until a SYN-ACK came after the guest's first retransmit,
+	// which is a stall where nothing went unanswered.
+	//
+	// A DIAGNOSTIC, reported rather than refused, for VersionUnansweredFlows'
+	// reason and CHECKED at both of its places: below it the node sends the
+	// destinations without the four fields, and a pairing that negotiated below
+	// it and sends them anyway has the report kept with the times dropped, which
+	// reads as not timed rather than as nothing slow.
+	VersionReplyTimes = 36
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

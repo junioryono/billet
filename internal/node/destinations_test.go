@@ -48,22 +48,24 @@ func TestTheRunnerReportsAJobsDestinationsWithItsUsage(t *testing.T) {
 			result: flows.Result{
 				Destinations: []flows.Destination{
 					{Addr: netip.MustParseAddr("140.82.112.3"), Sent: 9_000, Received: 1_999_000, Connections: 4,
-						Unanswered: 1},
+						Unanswered: 1, TimedReplies: 3, SlowReplies: 1, SlowestReply: 2400 * time.Millisecond},
 					{Addr: netip.MustParseAddr("2001:db8::1"), Sent: 100, Received: 200, Connections: 1},
 				},
-				Other:      flows.Destination{Sent: 7, Received: 8, Connections: 2, Unanswered: 2},
-				Incomplete: true,
+				Other:        flows.Destination{Sent: 7, Received: 8, Connections: 2, Unanswered: 2},
+				Incomplete:   true,
+				RepliesTimed: true,
 			},
 			want: &alloc.JobDestinations{
 				Destinations: []alloc.JobDestination{
 					{Addr: "140.82.112.3", SentBytes: 9_000, ReceivedBytes: 1_999_000, Connections: 4,
-						Unanswered: 1},
+						Unanswered: 1, TimedReplies: 3, SlowReplies: 1, SlowestReplyMillis: 2400},
 					{Addr: "2001:db8::1", SentBytes: 100, ReceivedBytes: 200, Connections: 1},
 				},
 				Other:             alloc.JobDestination{SentBytes: 7, ReceivedBytes: 8, Connections: 2, Unanswered: 2},
 				Incomplete:        true,
 				Tap:               &alloc.TapTotals{SentBytes: 10_000, ReceivedBytes: 2_000_000},
 				UnansweredCounted: true,
+				RepliesTimed:      true,
 			},
 		},
 		"totalled and empty": {
@@ -114,6 +116,10 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 		t.Fatalf("the ledger keeps %d destinations by name and the node %d", alloc.MaxJobDestinations,
 			flows.MaxDestinations)
 	}
+	if time.Duration(alloc.SlowReplyMillis)*time.Millisecond != flows.SlowReply {
+		t.Fatalf("a report calls a reply slow past %d ms and the node past %s", alloc.SlowReplyMillis,
+			flows.SlowReply)
+	}
 
 	res := flows.Result{Destinations: []flows.Destination{
 		{Addr: netip.MustParseAddr("10.0.0.1"), Sent: math.MaxUint64, Received: 1, Connections: 2, Unanswered: 1},
@@ -133,6 +139,32 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 	}
 	if err := got.Validate(); err != nil {
 		t.Errorf("what the node reports does not validate: %v", err)
+	}
+
+	// REPLY TIMES ARE CARRIED WHERE THE RESULT TIMED THEM, held to what a report
+	// may say: no more timed than answered, no more slow than timed, and the
+	// slowest wait in milliseconds; and a destination merged into Other brings
+	// its times with it. Where the result did not time replies, none are sent.
+	timed := flows.Result{RepliesTimed: true, Destinations: []flows.Destination{
+		{Addr: netip.MustParseAddr("10.0.0.1"), Connections: 3, Unanswered: 1, TimedReplies: 5, SlowReplies: 9,
+			SlowestReply: 1500*time.Millisecond + 900*time.Microsecond},
+		{Connections: 2, TimedReplies: 2, SlowReplies: 1, SlowestReply: 4 * time.Second},
+	}, Other: flows.Destination{Connections: 1, TimedReplies: 1, SlowestReply: 30 * time.Millisecond}}
+	got = jobDestinationsOf(timed, tapComparison{})
+	if !got.RepliesTimed || len(got.Destinations) != 1 ||
+		got.Destinations[0] != (alloc.JobDestination{Addr: "10.0.0.1", Connections: 3, Unanswered: 1,
+			TimedReplies: 2, SlowReplies: 2, SlowestReplyMillis: 1500}) ||
+		got.Other != (alloc.JobDestination{Connections: 3, TimedReplies: 3, SlowReplies: 1,
+			SlowestReplyMillis: 4000}) {
+		t.Errorf("the timed result reports %+v", got)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("a timed report does not validate: %v", err)
+	}
+	timed.RepliesTimed = false
+	if got = jobDestinationsOf(timed, tapComparison{}); got.RepliesTimed || got.Destinations[0].TimedReplies != 0 ||
+		got.Other.SlowestReplyMillis != 0 {
+		t.Errorf("a result that did not time replies reports %+v", got)
 	}
 
 	// A RESULT THAT CANNOT TELL WHAT WENT UNANSWERED REPORTS IT NOT COUNTED,

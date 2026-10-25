@@ -12,27 +12,39 @@ import (
 )
 
 // fullDestinations is the most a report can name: every destination the node
-// keeps by name, traffic beyond them, the tap read, the totals incomplete, and
-// each destination's unanswered connections counted.
+// keeps by name, traffic beyond them, the tap read, the totals incomplete, each
+// destination's unanswered connections counted and its first replies timed.
 func fullDestinations() *JobDestinations {
 	d := &JobDestinations{
-		Other:             JobDestination{SentBytes: 7, ReceivedBytes: 11, Connections: 3, Unanswered: 2},
+		Other: JobDestination{SentBytes: 7, ReceivedBytes: 11, Connections: 3, Unanswered: 2,
+			TimedReplies: 1, SlowestReplyMillis: 300},
 		Incomplete:        true,
 		Tap:               &TapTotals{SentBytes: 1 << 20, ReceivedBytes: 0},
 		UnansweredCounted: true,
+		RepliesTimed:      true,
 	}
 	for i := range MaxJobDestinations {
-		d.Destinations = append(d.Destinations, JobDestination{
+		dest := JobDestination{
 			Addr:      fmt.Sprintf("10.%d.%d.%d", i/65536, i/256%256, i%256),
 			SentBytes: int64(1000 - i), ReceivedBytes: int64(2 * i), Connections: int64(i % 5),
 			Unanswered: int64(i % 5 / 2),
-		})
+		}
+		dest.TimedReplies = dest.Connections - dest.Unanswered
+		dest.SlowReplies = dest.TimedReplies / 2
+		switch {
+		case dest.SlowReplies > 0:
+			dest.SlowestReplyMillis = 1500
+		case dest.TimedReplies > 0:
+			dest.SlowestReplyMillis = 200
+		}
+		d.Destinations = append(d.Destinations, dest)
 	}
 	// THE WIDEST ROW THE LEDGER'S RECORD HOLDS: the longest canonical address
-	// and the largest counts.
+	// and the largest counts, all of its connections answered so every reply
+	// time can be at its largest too.
 	d.Destinations[0] = JobDestination{Addr: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe",
 		SentBytes: math.MaxInt64, ReceivedBytes: math.MaxInt64, Connections: math.MaxInt64,
-		Unanswered: math.MaxInt64}
+		TimedReplies: math.MaxInt64, SlowReplies: math.MaxInt64, SlowestReplyMillis: math.MaxInt64}
 	d.Destinations[1].Addr = "2001:db8::1"
 
 	return d
@@ -49,6 +61,12 @@ func TestDestinationsAreKeptAsSent(t *testing.T) {
 			d := fullDestinations().WithoutUnanswered()
 			return &d
 		}(),
+		"every destination named, replies not timed": func() *JobDestinations {
+			d := fullDestinations().WithoutReplyTimes()
+			return &d
+		}(),
+		"timed, and nothing answered slowly": {Destinations: []JobDestination{{Addr: "10.0.0.1",
+			SentBytes: 1, Connections: 2, TimedReplies: 2, SlowestReplyMillis: 40}}, RepliesTimed: true},
 		"counted, and every connection answered": {Destinations: []JobDestination{{Addr: "10.0.0.1",
 			SentBytes: 1, Connections: 2}}, UnansweredCounted: true},
 		"none named, no tap": {},
@@ -174,6 +192,42 @@ func TestDestinationsWithoutTheirRestAreNotGuessed(t *testing.T) {
 	}
 }
 
+// ONE REPORT WROTE EVERY ROW, so a ledger whose rows are part timed and part not,
+// or whose row holds only some of a reply time, no longer holds what was
+// written, and is read neither way.
+func TestReplyTimesPartKeptAreNotGuessed(t *testing.T) {
+	for name, tc := range map[string]struct{ forget, says string }{
+		"one row untimed": {`UPDATE job_destinations SET timed_replies = NULL, slow_replies = NULL,
+			slowest_reply_ms = NULL WHERE lease_id = $1 AND addr = ''`,
+			"reply times for 1 of lease LEASE's destination rows and none for 1"},
+		"part of one row's time": {`UPDATE job_destinations SET slowest_reply_ms = NULL
+			WHERE lease_id = $1 AND addr = '10.0.0.1'`,
+			`part of a reply time for lease LEASE's destination "10.0.0.1"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().UTC()
+			a := quarantineFleet(t, &now)
+			lease := busyLease(t, a)
+			usage := measuredUsage()
+			usage.Destinations = &JobDestinations{Destinations: []JobDestination{{Addr: "10.0.0.1",
+				Connections: 2, TimedReplies: 2, SlowReplies: 1, SlowestReplyMillis: 1200}}, RepliesTimed: true}
+			if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, usage, nil); err != nil {
+				t.Fatalf("RecordLeaseUsage: %v", err)
+			}
+			if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(t.Context(), tc.forget, lease.ID)
+				return err
+			}); err != nil {
+				t.Fatalf("forget part of the reply times: %v", err)
+			}
+			want := strings.ReplaceAll(tc.says, "LEASE", lease.ID)
+			if _, err := a.LeaseUsage(t.Context(), lease.ID); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("LeaseUsage = %v, want it to say %q", err, want)
+			}
+		})
+	}
+}
+
 // ONE REPORT WROTE EVERY ROW, so a ledger whose rows are part counted and part
 // not no longer holds what was written, and is read neither way.
 func TestDestinationsPartCountedAreNotGuessed(t *testing.T) {
@@ -244,8 +298,26 @@ func TestDestinationsTheLedgerCannotKeepAreRefused(t *testing.T) {
 		}, "destination other has 4 unanswered of 3 connections"},
 		{"unanswered in a report that did not count them", func(u *JobUsage) {
 			u.Destinations.UnansweredCounted = false
-		}, "destination ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe has 9223372036854775807 unanswered in a " +
-			"report that did not count them"},
+		}, "destination 10.0.0.2 has 1 unanswered in a report that did not count them"},
+		{"more timed replies than answered connections", func(u *JobUsage) {
+			u.Destinations.Destinations[7].TimedReplies = 2
+		}, "destination 10.0.0.7 has 2 timed replies of 1 answered connections"},
+		{"more slow replies than timed", func(u *JobUsage) {
+			u.Destinations.Destinations[3].SlowReplies = 3
+		}, "destination 10.0.0.3 has 3 slow replies of 2 timed"},
+		{"a slowest reply with nothing timed", func(u *JobUsage) {
+			u.Destinations.Other.TimedReplies, u.Destinations.Other.SlowestReplyMillis = 0, 300
+		}, "destination other has a slowest reply of 300 ms and no timed reply"},
+		{"slow replies whose slowest was not slow", func(u *JobUsage) {
+			u.Destinations.Destinations[3].SlowestReplyMillis = 999
+		}, "destination 10.0.0.3 has 1 slow replies and its slowest took 999 ms, under 1000"},
+		{"a negative slowest reply", func(u *JobUsage) {
+			u.Destinations.Destinations[3].SlowestReplyMillis = -1
+		}, "destination 10.0.0.3 has a negative total"},
+		{"reply times in a report that did not time them", func(u *JobUsage) {
+			u.Destinations.RepliesTimed = false
+		}, "destination ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe has reply times in a report that did not " +
+			"time replies"},
 		{"a tap beside a network unmeasured", func(u *JobUsage) {
 			u.Unmeasured = append(u.Unmeasured, UsageNet)
 			u.NetRxBytes, u.NetTxBytes, u.NetRxPackets, u.NetTxPackets = 0, 0, 0, 0

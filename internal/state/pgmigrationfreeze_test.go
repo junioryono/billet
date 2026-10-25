@@ -81,4 +81,5 @@ var pgMigrationsAreFrozen = map[int]struct{ Name, Sum string }{
 	66: {"tier_releases", "e5f6568ff604242167a937c08400ea0e00e9925dc41de4ae6b015e73841c4067"},
 	67: {"npm_cache_observation", "2efc7b4c659c99619e25fdb33a608ca6ae1c3136cc7a5c4d5527f94f376e883e"},
 	68: {"job_destination_unanswered", "efc8f117e8e274904f5399ba9d7758982df5331459de14a29a3d0d8144273101"},
+	69: {"job_destination_reply_times", "47a35920be15508fc5652320ee78c65505b084677d8712f8609fc26c01b884b2"},
 }
