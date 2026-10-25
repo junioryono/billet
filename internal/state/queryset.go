@@ -235,6 +235,7 @@ type WriteOps interface {
 	FinishRollout(ctx context.Context, arg ledgerdb.FinishRolloutParams) error
 	ForgetEveryNode(ctx context.Context) error
 	HeartbeatLease(ctx context.Context, arg ledgerdb.HeartbeatLeaseParams) error
+	HeartbeatLeases(ctx context.Context, arg ledgerdb.HeartbeatLeasesParams) ([]ledgerdb.HeartbeatLeasesRow, error)
 	HoldLease(ctx context.Context, arg ledgerdb.HoldLeaseParams) error
 	InsertEnrollment(ctx context.Context, arg ledgerdb.InsertEnrollmentParams) error
 	InsertForceDestroy(ctx context.Context, arg ledgerdb.InsertForceDestroyParams) error

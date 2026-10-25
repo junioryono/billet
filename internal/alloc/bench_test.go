@@ -102,9 +102,9 @@ func benchFleetOf(
 		}
 	}
 
-	for _, reg := range extra {
-		if _, err := a.RegisterNode(b.Context(), reg); err != nil {
-			b.Fatalf("register %s: %v", reg.Name, err)
+	for i := range extra {
+		if _, err := a.RegisterNode(b.Context(), extra[i]); err != nil {
+			b.Fatalf("register %s: %v", extra[i].Name, err)
 		}
 	}
 
@@ -238,6 +238,39 @@ func BenchmarkHeartbeatContended(b *testing.B) {
 
 			obs.report(b)
 		})
+	}
+}
+
+// BenchmarkHeartbeatMany is a listener's pass over the target's 4,096 leases,
+// renewed heartbeatBatch to a transaction. ns/op is the whole pass, and
+// slot-µs/lease what each lease's renewal held the writer slot for.
+func BenchmarkHeartbeatMany(b *testing.B) {
+	a, _, leases, obs := targetFleet(b, targetTierSet(), nil)
+
+	refs := make([]LeaseRef, len(leases))
+	for i, l := range leases {
+		refs[i] = LeaseRef{ID: l.ID, Epoch: l.Epoch}
+	}
+
+	obs.measuring.Store(true)
+
+	passes := 0
+
+	for b.Loop() {
+		for i, err := range a.HeartbeatMany(b.Context(), refs) {
+			if err != nil {
+				b.Fatalf("lease %d: %v", i, err)
+			}
+		}
+
+		passes++
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+
+	if passes > 0 {
+		b.ReportMetric(float64(obs.held.Microseconds())/float64(passes*len(refs)), "slot-µs/lease")
 	}
 }
 

@@ -279,6 +279,80 @@ func (q *Queries) HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) 
 	return err
 }
 
+const heartbeatLeases = `-- name: HeartbeatLeases :many
+WITH RECURSIVE part (rec) AS (
+    SELECT CAST($3 AS TEXT) WHERE length(CAST($3 AS TEXT)) >= 83
+    UNION ALL
+    SELECT CASE h.side WHEN 0 THEN substr(rec, 1, length(rec) / 166 * 83)
+                       ELSE substr(rec, length(rec) / 166 * 83 + 1) END
+      FROM part CROSS JOIN (SELECT 0 AS side UNION ALL SELECT 1) AS h
+     WHERE length(rec) > 83
+)
+UPDATE leases SET heartbeat_at = $1, expires_at = $2
+ WHERE phase NOT IN ('done','failed')
+   AND force_release = 0
+   AND (id, epoch) IN (SELECT rtrim(substr(rec, 1, 64)), CAST(substr(rec, 65, 19) AS BIGINT)
+                         FROM part WHERE length(rec) = 83)
+RETURNING id, epoch
+`
+
+type HeartbeatLeasesParams struct {
+	HeartbeatAt string
+	ExpiresAt   string
+	Packed      string
+}
+
+type HeartbeatLeasesRow struct {
+	ID    string
+	Epoch int64
+}
+
+// Push out the expiry of every lease named, at the epoch named beside it, that
+// is still open and that no operator has asked to be released, and return the
+// ones it renewed; the caller says why each other one was not, as one renewal
+// would (internal/alloc HeartbeatMany).
+//
+// ONE STATEMENT FOR A WHOLE PASS, because a renewal's cost is its commit: on a
+// ledger whose commit waits for network block storage, one transaction a lease
+// held the writer slot for 3.0 to 4.1 ms each on either engine (2026-10-25,
+// docs/reference/records/ledger-write-budget.md), and a control plane renews
+// every open lease once a third of its TTL. The leases are packed into one
+// string of fixed-width records, the id space-padded to 64 characters and the
+// epoch as 19 zero-padded digits (internal/alloc packLeaseRefs).
+//
+// CUT IN HALVES, NOT ONE RECORD OFF THE FRONT. The destinations' statement
+// (RecordJobDestinations) carries the rest of its string at every step, which
+// copies it once a row; for 256 renewals that was 30 ms a statement on SQLite
+// against 3.5 ms halving it, each part split into its first half of records and
+// the rest until every part is one record (measured 2026-10-25 on an M2 Max).
+// One recursive reference, joined to the two halves, because PostgreSQL refuses
+// a recursive term that names the query twice.
+//
+// THE ROW VALUE KEEPS EACH EPOCH BESIDE THE ID IT CAME WITH, for an id named
+// twice, and the IN still narrows by the primary key.
+func (q *Queries) HeartbeatLeases(ctx context.Context, arg HeartbeatLeasesParams) ([]HeartbeatLeasesRow, error) {
+	rows, err := q.db.QueryContext(ctx, heartbeatLeases, arg.HeartbeatAt, arg.ExpiresAt, arg.Packed)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []HeartbeatLeasesRow
+	for rows.Next() {
+		var i HeartbeatLeasesRow
+		if err := rows.Scan(&i.ID, &i.Epoch); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const holdLease = `-- name: HoldLease :exec
 UPDATE leases
    SET phase = $1, held_at = $2, heartbeat_at = $3,
