@@ -192,8 +192,16 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			waitFor(t, func() bool { return h.count("/v1/register") > regs })
 			regGate <- struct{}{}
 
-			// The failure backs off and polls again.
-			waitFor(t, func() bool { return h.count(pollPath) > polls })
+			// The failure backs off and REGISTERS AGAIN, the next registration
+			// held at the gate, without polling a control plane that has just
+			// said it does not know this node.
+			waitFor(t, func() bool { return h.count("/v1/register") > regs+1 })
+
+			// THE POLL RELEASED ABOVE WAS COUNTED WHEN IT ARRIVED, before polls
+			// was read, so any poll since is one the drain made after failing.
+			if got := h.count(pollPath); got != polls {
+				t.Errorf("the drain polled %d times after its registration failed, want none", got-polls)
+			}
 
 			if installs.Load() != baseline || inodeOf(t, path) != inode {
 				t.Errorf("a failed drain registration published")
@@ -209,17 +217,25 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 
 			switch supersededBy {
 			case "the registration":
+				// THE REGISTRATION HELD AT THE GATE is the one superseded.
 				h.answerRegister(func(w http.ResponseWriter, _ *http.Request) bool {
 					superseded(w)
 
 					return true
 				})
-				h.answerPollsUnregistered(t, 1)
-				regs = h.count("/v1/register")
-				pollGate <- struct{}{}
-				waitFor(t, func() bool { return h.count("/v1/register") > regs })
 				regGate <- struct{}{}
 			case "a poll":
+				// THE HELD REGISTRATION IS ACCEPTED, and publishes; the poll after
+				// it is the one superseded, so the baseline is taken after it.
+				h.answerRegister(func(http.ResponseWriter, *http.Request) bool { return false })
+				polls = h.count(pollPath)
+				regGate <- struct{}{}
+				waitFor(t, func() bool { return h.count(pollPath) > polls })
+
+				baseline, inode = installs.Load(), inodeOf(t, path)
+				body, err = os.ReadFile(path)
+				mustOK(t, err)
+
 				h.mu.Lock()
 				h.answer[pollPath] = func(w http.ResponseWriter, _ *http.Request) bool {
 					superseded(w)

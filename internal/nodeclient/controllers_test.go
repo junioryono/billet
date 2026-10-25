@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -68,7 +69,15 @@ func newController(t *testing.T) *controller {
 		}
 
 		if drop != nil && drop(r.URL.Path, n) {
-			conn, _, err := w.(http.Hijacker).Hijack()
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("the test server's writer cannot be hijacked, so %s was answered", r.URL.Path)
+				http.Error(w, "cannot cut this connection", http.StatusInternalServerError)
+
+				return
+			}
+
+			conn, _, err := hijacker.Hijack()
 			if err == nil {
 				_ = conn.Close()
 			}
@@ -108,7 +117,7 @@ func endpointOf(t *testing.T, base string) string {
 func deadAddress(t *testing.T) string {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -437,6 +446,43 @@ func TestTheLoopRetriesEverySecondWithSeveralControllers(t *testing.T) {
 	}
 }
 
+// runDraining runs the loop with a drain requested at every stop, and returns
+// the cancellation that begins the stop and the channel Run's error arrives on.
+// A DRAIN OUTLIVES ITS CALLER'S CONTEXT by design, so the test's cleanup also
+// hurries it and joins it, before the controllers it talks to are closed: a
+// test that fails mid-drain leaves nothing running.
+func runDraining(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute) (context.CancelFunc, <-chan error) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	hurry := make(chan struct{})
+	done := make(chan error, 1)
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			DrainRequested: func() bool { return true },
+			Hurry:          hurry,
+		})
+	})
+	t.Cleanup(func() {
+		cancel()
+		close(hurry)
+		wg.Wait()
+	})
+
+	return cancel, done
+}
+
 // askingCompute recovers the way the node runtime does, by asking the control
 // plane which leases this node launched, so a controller that gives no answer
 // fails the recovery with the client's own error.
@@ -481,24 +527,7 @@ func TestADrainRecoveringAcrossAFailoverRegistersWithTheOther(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	done := make(chan error, 1)
-
-	go func() {
-		done <- nodeclient.Run(ctx, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c}, nodeclient.LoopOptions{
-			VCPU:           testNodeVCPU,
-			Memory:         testNodeMemory,
-			Provider:       config.ProviderDocker,
-			Deployment:     deployment,
-			Log:            slog.New(slog.DiscardHandler),
-			Backoff:        20 * time.Millisecond,
-			SweepEvery:     10 * time.Millisecond,
-			DrainTimeout:   time.Hour,
-			DrainRequested: func() bool { return true },
-		})
-	}()
+	cancel, done := runDraining(t, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c})
 
 	waitFor(t, func() bool { return a.sent(launched) >= 2 })
 
@@ -548,24 +577,7 @@ func TestADrainThatLosesItsControllerIsServedByTheOther(t *testing.T) {
 
 	compute := &fakeCompute{holding: true}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	done := make(chan error, 1)
-
-	go func() {
-		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
-			VCPU:           testNodeVCPU,
-			Memory:         testNodeMemory,
-			Provider:       config.ProviderDocker,
-			Deployment:     deployment,
-			Log:            slog.New(slog.DiscardHandler),
-			Backoff:        20 * time.Millisecond,
-			SweepEvery:     10 * time.Millisecond,
-			DrainTimeout:   time.Hour,
-			DrainRequested: func() bool { return true },
-		})
-	}()
+	cancel, done := runDraining(t, c, compute)
 
 	poll := "/v1/nodes/n1/poll"
 
@@ -614,12 +626,16 @@ func TestADrainThatLosesItsControllerIsServedByTheOther(t *testing.T) {
 func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 	t.Parallel()
 
+	b := newController(t)
+
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
-		{Base: "http://control-a.example:7717"}, {Base: "http://control-b.example:7717"},
+		{Base: "http://" + deadAddress(t)}, {Base: b.srv.URL},
 	}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
+	dialled := make([]atomic.Int32, c.Controllers())
 
 	// THE DIALER EACH CONTROLLER'S TRANSPORT DIALS WITH, as the client built it.
 	for i := range c.Controllers() {
@@ -645,6 +661,25 @@ func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 
 		if d.Timeout <= 0 || d.Timeout > 5*time.Second {
 			t.Fatalf("a dial waits %v for an address that does not answer, want a bound within 5s", d.Timeout)
+		}
+
+		// MARKED, so the requests below can show this is the dialer they use:
+		// the transport holds a method of this same dialer, not a copy of it.
+		d.Control = func(string, string, syscall.RawConn) error {
+			dialled[i].Add(1)
+
+			return nil
+		}
+	}
+
+	// A REGISTRATION DIALS THE FIRST, which does not answer, then the second.
+	if err := c.Register(t.Context(), registration); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	for i := range dialled {
+		if dialled[i].Load() == 0 {
+			t.Fatalf("controller %d was dialled without the dialer inspected above", i)
 		}
 	}
 }
@@ -938,6 +973,8 @@ func TestOnlySilenceIsNoAnswer(t *testing.T) {
 	}
 
 	t.Run("an answered error", func(t *testing.T) {
+		t.Parallel()
+
 		err := ask(t, t.Context(), nodeclient.Target{Base: answering.srv.URL}, nodeclient.Target{Base: "http://" + deadAddress(t)})
 		if nodeclient.IsNoAnswerForTest(err) {
 			t.Fatalf("a 503 counted as no answer: %v", err)
@@ -945,6 +982,8 @@ func TestOnlySilenceIsNoAnswer(t *testing.T) {
 	})
 
 	t.Run("the caller's cancellation", func(t *testing.T) {
+		t.Parallel()
+
 		ctx, cancel := context.WithCancel(t.Context())
 
 		go func() {
@@ -966,6 +1005,8 @@ func TestOnlySilenceIsNoAnswer(t *testing.T) {
 		"silence, with none":               {0, false},
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
 			lost := &closeCounter{RoundTripper: http.DefaultTransport}
 
 			targets := []nodeclient.Target{{Base: "http://" + deadAddress(t), HTTP: &http.Client{Transport: lost}}}

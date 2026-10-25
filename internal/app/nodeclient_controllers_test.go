@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
 	"net/http"
@@ -74,11 +75,22 @@ func TestEachControllerIsVerifiedAgainstItsOwnName(t *testing.T) {
 	// against the first one's name, refuses the handshake.
 	misnamed := &http.Client{Transport: &http.Transport{TLSClientConfig: identity.ClientTLS("localhost")}}
 
-	res, err := misnamed.Get(addressed.URL + "/v1/register")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, addressed.URL+"/v1/register", http.NoBody)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+
+	res, err := misnamed.Do(req)
 	if err == nil {
 		_ = res.Body.Close()
 
 		t.Fatal("the second controller was trusted under the first one's name, so this proves nothing")
+	}
+
+	// REFUSED FOR ITS NAME, not for anything else a handshake can fail on.
+	var misnamedErr x509.HostnameError
+	if !errors.As(err, &misnamedErr) {
+		t.Fatalf("the handshake under the wrong name failed with %v, want a hostname mismatch", err)
 	}
 
 	_ = client.Register(t.Context(), nodeclient.Registration{ //nolint:errcheck // the stand-in answers 503; what is asserted is that it was reached

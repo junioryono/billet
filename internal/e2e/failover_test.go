@@ -50,7 +50,7 @@ func TestANodeFollowsTheDeploymentToTheControllerServingIt(t *testing.T) {
 
 	// THE SECOND CONTROLLER'S ADDRESS, known to the node before that controller
 	// exists, as a standby's is.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve the second address: %v", err)
 	}
