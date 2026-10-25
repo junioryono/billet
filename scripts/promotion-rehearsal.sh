@@ -72,6 +72,22 @@ active_controller() {
         awk '/^claim / { print $2; exit }'
 }
 
+# partition drops every packet a controller sends or receives on the rehearsal
+# network, and heal lets them through again.
+#
+# PACKETS DROPPED, NOT THE NETWORK DISCONNECTED. A container taken off its
+# network stops resolving, so every dial to it failed at once on the name and
+# the dial timeout a real partition meets was never exercised; the first run of
+# this rehearsal measured that way (2026-10-25). The rules name the rehearsal
+# network's interface, so the controller's own loopback still works.
+partition() {
+    docker exec "$1" sh -c 'iptables -I INPUT 1 -i eth0 -j DROP && iptables -I OUTPUT 1 -o eth0 -j DROP'
+}
+
+heal() {
+    docker exec "$1" sh -c 'iptables -D INPUT -i eth0 -j DROP && iptables -D OUTPUT -o eth0 -j DROP'
+}
+
 # mark_at prints a host's clock as seconds since the epoch, to the microsecond.
 # Every container reads the one kernel clock of the machine running them, so a
 # mark taken in one host and a journal timestamp read in another are on one
@@ -123,7 +139,7 @@ span() {
 # sets the summary line the PASSED line repeats.
 measure_failover() {
     local name=$1 successor=$2 failed_at=$3
-    local promoted wire first='' last='' at n label lost
+    local promoted wire first='' last='' at n label lost accepted
 
     echo "--- ${name}: segments, in seconds"
     promoted=$(wait_line 300 "${successor}" billet-server "${failed_at}" 'promoted to this deployment.s controller') ||
@@ -134,17 +150,24 @@ measure_failover() {
     echo "promoted -> serving the node wire: $(span "${promoted}" "${wire}")"
 
     for n in "${nodes[@]}"; do
-        at=$(wait_line 120 "${successor}" billet-server "${failed_at}" "node registered node=${n}( |$)") ||
+        # THE NODE'S OWN LINE, written once it has read the acceptance and made
+        # that controller the one it dials. The controller logs its side before
+        # it answers, so its line alone could stand for a registration the
+        # node never received.
+        at=$(wait_line 120 "${n}" billet-node "${failed_at}" \
+            "registered with the control plane .*control_plane=https://${successor}:7717( |$)") ||
             rehearsal_fail "${n} never registered with ${successor} after the ${name}"
-        # READ AFTER THE REGISTRATION, which the node logs only once it has
+        accepted=$(line_at "${successor}" billet-server "${failed_at}" "node registered node=${n}( |$)") ||
+            rehearsal_fail "could not read ${successor}'s journal"
+        test -n "${accepted}" ||
+            rehearsal_fail "${n} says it registered with ${successor}, whose journal records no such registration"
+        # READ AFTER THE REGISTRATION, which the node makes only once it has
         # given up on the controller it had, so the line is there if it ever is.
         lost=$(line_at "${n}" billet-node "${failed_at}" 'lost the control plane') ||
             rehearsal_fail "could not read ${n}'s journal"
-        if [ -n "${lost}" ]; then
-            echo "${n}: failure -> lost the control plane $(span "${failed_at}" "${lost}"), registered with ${successor} $(span "${failed_at}" "${at}")"
-        else
-            echo "${n}: registered with ${successor} $(span "${failed_at}" "${at}") after the failure (no lost line: its own poll was answered by a refusal first)"
-        fi
+        test -n "${lost}" ||
+            rehearsal_fail "${n} registered with ${successor} without saying it lost the controller it had"
+        echo "${n}: failure -> lost the control plane $(span "${failed_at}" "${lost}"), accepted by ${successor} $(span "${failed_at}" "${accepted}"), registered $(span "${failed_at}" "${at}")"
         if [ -z "${first}" ] || awk -v a="${at}" -v b="${first}" 'BEGIN { exit !(a < b) }'; then
             first=${at}
         fi
@@ -249,6 +272,12 @@ for h in "${controller_a}" "${controller_b}" "${nodes[@]}"; do
 done
 rehearsal_install_app_key "${controller_a}"
 rehearsal_install_app_key "${controller_b}"
+for c in "${controller_a}" "${controller_b}"; do
+    docker exec "${c}" sh -c 'timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt install -y -qq iptables >/dev/null' ||
+        rehearsal_fail "iptables would not install in ${c}, so it cannot be partitioned"
+    docker exec "${c}" test -d /sys/class/net/eth0 ||
+        rehearsal_fail "${c} has no eth0, the interface the partition drops"
+done
 
 # THE DSN REACHES THE UNIT THE WAY THE HOST ROLE DELIVERS IT: an environment
 # file the unit imports, never a value in billet.yaml, which names only the
@@ -390,6 +419,14 @@ done
 test "$(active_controller "${controller_b}")" = "${controller_a}" ||
     rehearsal_fail "billet status does not name A as the claim holder before the partition"
 echo "claim held by: ${controller_a}"
+# AND HOLDING BOTH SESSIONS, which it opens after it is ready: a partition
+# before then leaves B nothing to wait out, and its session segment would
+# measure an uncontended open rather than a failover.
+for label in "${labels[@]}"; do
+    rehearsal_wait_for 300 "A to open ${label}'s message session" "${controller_a}" \
+        sh -c "journalctl -u billet-server --since '${since_a}' --no-pager -o cat | grep -q 'opened this tier.s message session tier=${label} '" ||
+        rehearsal_fail "controller A never opened ${label}'s message session"
+done
 
 rehearsal_step "partition A; measure the failover to B"
 # EVERY TIME FROM HERE ON IS READ FROM A JOURNAL AFTER A MARK taken before the
@@ -397,7 +434,7 @@ rehearsal_step "partition A; measure the failover to B"
 # the failure (B's own startup, A's first "standing by"), and the second review
 # round found the post-heal wait below being answered by exactly that line.
 partitioned_at=$(mark_at "${controller_b}")
-docker network disconnect "${network}" "${controller_a}"
+partition "${controller_a}" || rehearsal_fail "could not partition ${controller_a}"
 measure_failover "partition of A" "${controller_b}" "${partitioned_at}"
 test "$(active_controller "${controller_b}")" = "${controller_b}" ||
     rehearsal_fail "billet status on B does not name B as the claim holder after the promotion"
@@ -406,7 +443,7 @@ rehearsal_step "heal the partition; the old leader stops and stands by"
 restarts_before=$(docker exec "${controller_a}" systemctl show -p NRestarts --value billet-server.service)
 since_heal=$(rehearsal_clock "${controller_a}")
 healed_at=$(mark_at "${controller_a}")
-docker network connect "${network}" "${controller_a}"
+heal "${controller_a}" || rehearsal_fail "could not heal ${controller_a}'s partition"
 rehearsal_wait_for 300 "A to notice it was replaced" "${controller_a}" \
     sh -c "journalctl -u billet-server --since '${since_heal}' --no-pager -o cat | grep -q 'no longer this deployment.s controller'" ||
     rehearsal_fail "controller A never noticed it had been replaced"
