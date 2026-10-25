@@ -43,6 +43,9 @@ type placer struct {
 	rank map[string]int
 	// policy decides between hosts that preference cannot separate.
 	policy config.PlacementPolicy
+	// committed is what every open lease in the deployment holds, from the
+	// fleet this placer was made from (fleet.committedVCPU).
+	committed Usage
 }
 
 // fleet is what every machine has left, measured once.
@@ -57,6 +60,21 @@ type fleet struct {
 	vcpu   map[string]int
 	memory map[string]config.ByteSize
 	macOS  map[string]int
+	// rows are the hosts measured, read once per question: every tier's
+	// candidates, the asking tier's and each floor's, are filtered from them
+	// rather than read from the ledger again.
+	rows []nodeRow
+	// heldOn is how many open leases each tier holds on each host, keyed by the
+	// host a lease is attributed to ("" for one aimed at none), read in the same
+	// pass as the usage; nil for a fleet that did not read the ledger's leases,
+	// whose floors are counted by the ledger instead (floorLeases).
+	heldOn map[string]map[string]int
+	// committedVCPU and committedMemory are what every open lease holds across
+	// the deployment, summed from the same pass as each host's usage, which is
+	// TotalUsage's answer without its own pass over the leases; zero for a fleet
+	// that read no leases.
+	committedVCPU   int
+	committedMemory config.ByteSize
 }
 
 type placementCost struct {
@@ -117,6 +135,7 @@ func (a *Allocator) fleetResources(ctx context.Context, tx querier) (*fleet, err
 		vcpu:   make(map[string]int, len(nodes)),
 		memory: make(map[string]config.ByteSize, len(nodes)),
 		macOS:  make(map[string]int, len(nodes)),
+		rows:   nodes,
 	}
 
 	// ONE QUERY FOR THE WHOLE FLEET, not two per host.
@@ -126,9 +145,18 @@ func (a *Allocator) fleetResources(ctx context.Context, tx querier) (*fleet, err
 	// of statements is O(nodes) round trips holding the one connection every
 	// listener needs. The arithmetic is identical; only the number of statements
 	// changes.
-	used, err := a.usageByNode(ctx, tx)
+	used, held, err := a.usageByNode(ctx, tx)
 	if err != nil {
 		return nil, err
+	}
+
+	f.heldOn = held
+
+	// EVERY HOLDER'S, not only the placeable hosts': a lease on a host that is
+	// gone, or aimed at none, is charged to the deployment all the same.
+	for _, u := range used {
+		f.committedVCPU += u.VCPU
+		f.committedMemory += u.Memory
 	}
 
 	for _, n := range nodes {
@@ -150,25 +178,94 @@ type nodeUsage struct {
 }
 
 // usageByNode is every host's committed capacity, keyed the way the rest of the
-// arithmetic attributes a lease.
+// arithmetic attributes a lease, and, where some tier keeps a floor, how many
+// open leases each tier holds on each host (nil where none does).
 //
 // COALESCE(node, target_node), the same expression usageOn uses one host at a
 // time. A lease that has been bound is
 // charged to the host running it; one only AIMED at a host is charged there too,
 // because escrow commits a machine's room before any container starts.
-func (a *Allocator) usageByNode(ctx context.Context, tx querier) (map[string]nodeUsage, error) {
-	rows, err := state.ReadQueries(tx).UsageByNode(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("alloc: measure the fleet's committed capacity: %w", err)
+//
+// BY TIER ONLY WHERE A FLOOR NEEDS IT: the floors then count from the same
+// pass rather than another one, and without a floor the tier rows are only
+// more rows to read (UsageByNodeAndTier).
+func (a *Allocator) usageByNode(
+	ctx context.Context, tx querier,
+) (map[string]nodeUsage, map[string]map[string]int, error) {
+	used := map[string]nodeUsage{}
+
+	if !slices.ContainsFunc(slices.Collect(maps.Values(a.tiers)), func(t config.Tier) bool {
+		return t.Reserved > 0
+	}) {
+		rows, err := state.ReadQueries(tx).UsageByNode(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("alloc: measure the fleet's committed capacity: %w", err)
+		}
+
+		for _, row := range rows {
+			used[row.Node] = nodeUsage{
+				VCPU:   int(row.Vcpu),
+				Memory: config.ByteSize(row.Memory),
+				MacOS:  int(row.MacosSlots),
+			}
+		}
+
+		return used, nil, nil
 	}
 
-	out := map[string]nodeUsage{}
+	rows, err := state.ReadQueries(tx).UsageByNodeAndTier(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("alloc: measure the fleet's committed capacity: %w", err)
+	}
+
+	held := map[string]map[string]int{}
 
 	for _, row := range rows {
-		out[row.Node] = nodeUsage{
-			VCPU:   int(row.Vcpu),
-			Memory: config.ByteSize(row.Memory),
-			MacOS:  int(row.MacosSlots),
+		u := used[row.Node]
+		u.VCPU += int(row.Vcpu)
+		u.Memory += config.ByteSize(row.Memory)
+		u.MacOS += int(row.MacosSlots)
+		used[row.Node] = u
+
+		if held[row.Node] == nil {
+			held[row.Node] = map[string]int{}
+		}
+
+		held[row.Node][row.Tier] += int(row.Leases)
+	}
+
+	return used, held, nil
+}
+
+// floorLeases reports what each tier holds toward its reserved floor: every
+// open lease on a host still in contact, draining or not, and every one aimed
+// at no host (countFloorLeasesPerTier says why). From the leases this fleet
+// already counted when it has them, which costs the purchase one read of the
+// live hosts rather than another pass over every open lease.
+func (f *fleet) floorLeases(ctx context.Context, tx querier, a *Allocator) (map[string]int, error) {
+	if f.heldOn == nil {
+		return a.countFloorLeasesPerTier(ctx, tx)
+	}
+
+	names, err := state.ReadQueries(tx).ListLiveNodeNames(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("alloc: list the hosts in contact: %w", err)
+	}
+
+	live := make(map[string]bool, len(names))
+	for _, name := range names {
+		live[name] = true
+	}
+
+	out := make(map[string]int, len(a.tiers))
+
+	for holder, byTier := range f.heldOn {
+		if holder != "" && !live[holder] {
+			continue
+		}
+
+		for tier, n := range byTier {
+			out[tier] += n
 		}
 	}
 
@@ -180,13 +277,8 @@ func (a *Allocator) usageByNode(ctx context.Context, tx querier) (map[string]nod
 //
 // SHARED ON PURPOSE: whatever one tier's floor takes is gone from the machines
 // every other tier is offered, because they are the same machines.
-func (f *fleet) forTier(
-	ctx context.Context, tx querier, a *Allocator, t config.Tier,
-) (*placer, error) {
-	nodes, err := a.eligibleNodes(ctx, tx, t)
-	if err != nil {
-		return nil, err
-	}
+func (f *fleet) forTier(a *Allocator, t config.Tier) *placer {
+	nodes := a.eligibleFrom(f.rows, t, t.NeedsCacheAwareNode())
 
 	p := &placer{
 		order:            nodes,
@@ -198,6 +290,7 @@ func (f *fleet) forTier(
 		deploymentMemory: config.ByteSize(1<<63 - 1),
 		rank:             make(map[string]int, len(nodes)),
 		policy:           a.placement.Or(),
+		committed:        Usage{VCPU: f.committedVCPU, Memory: f.committedMemory},
 	}
 
 	for _, n := range nodes {
@@ -209,7 +302,7 @@ func (f *fleet) forTier(
 
 	p.rankBy(t)
 
-	return p, nil
+	return p
 }
 
 // placerWithFloors measures the fleet for a tier, with other tiers' outstanding
@@ -232,9 +325,7 @@ func (a *Allocator) placerWithFloors(
 		return nil, floorCharge{}, err
 	}
 
-	p, err := free.forTier(ctx, tx, a, t)
-
-	return p, floors, err
+	return free.forTier(a, t), floors, nil
 }
 
 // rankBy scores the hosts against one tier's provider preference.
@@ -269,72 +360,101 @@ func (p *placer) roomFor(node string, t config.Tier) int {
 
 // total is how many of a tier the candidate set can hold between them.
 //
-// COUNTED, NOT PLACED, WHEN EVERY CANDIDATE CHARGES THE SAME. Placing the jobs
-// one at a time costs the hosts times the free slots, and it runs inside the
+// COUNTED, NOT PLACED, ONE PREFERENCE RANK AT A TIME. Placing the jobs one at
+// a time costs the hosts times the free slots, and it runs inside the
 // purchase's write transaction: 30 ms of the ledger's one writer slot per
-// purchase over 128 hosts (docs/reference/records/ledger-write-budget.md).
-// With one cost for every candidate, each placement takes exactly one off its
-// host's room and one off the deployment's, so the greedy count is the smaller
-// of the two sums and the order it would have chosen does not matter.
-// Candidates that charge differently (remote shapes, a tier spanning
-// backends) spend the deployment's room unevenly, so the order does matter,
-// and they are placed one at a time as before.
+// purchase over 128 hosts, and 68 ms over 256 for a tier falling back to a
+// remote shape (docs/reference/records/ledger-write-budget.md). next prefers
+// rank above everything else, so the greedy count fills every host of one rank
+// before it takes any of the next, and comes back to none: what moves it on
+// is the rank's hosts having no room, and nothing it spends afterwards gives
+// any back. Within a rank whose candidates charge the same, each placement
+// takes exactly one off its host's room and one cost off the deployment's, so
+// the rank's count is the smaller of the two and the order it would have
+// chosen does not matter. A rank whose candidates charge differently (remote
+// nodes of one backend with different shapes) spends the deployment's room
+// unevenly, so its order does matter, and its hosts alone are placed one at a
+// time.
 func (p *placer) total(t config.Tier) int {
-	if n, ok := p.uniformTotal(t); ok {
-		return n
-	}
+	n, _ := p.countByRank(t)
 
-	return p.greedyTotal(t)
+	return n
 }
 
-// greedyTotal counts by placing the tier's jobs one at a time, as next would,
-// on a copy of the placer.
-func (p *placer) greedyTotal(t config.Tier) int {
-	clone := p.clone()
-	sum := 0
-	for {
-		if _, _, ok := clone.next(t); !ok {
-			return sum
-		}
-		sum++
-	}
-}
-
-// uniformTotal is greedyTotal's answer in one pass, when every candidate with
-// a cost charges the same one, and false when they do not. order holds each
-// host once, as eligibleNodes reads it: one row per registered name.
-func (p *placer) uniformTotal(t config.Tier) (int, bool) {
-	var (
-		cost placementCost
-		seen bool
-	)
+// countByRank is total, and how many ranks it counted in one pass rather than
+// placing one job at a time, which a test reads to know which way it went.
+func (p *placer) countByRank(t config.Tier) (int, int) {
+	var ranks []int
 
 	for _, n := range p.order {
-		c, ok := p.cost[n.name]
-		if !ok {
+		if _, ok := p.cost[n.name]; ok && !slices.Contains(ranks, p.rank[n.name]) {
+			ranks = append(ranks, p.rank[n.name])
+		}
+	}
+
+	slices.Sort(ranks)
+
+	deploymentVCPU, deploymentMemory := p.deploymentVCPU, p.deploymentMemory
+	sum, counted := 0, 0
+
+	for _, rank := range ranks {
+		var group []nodeRow
+
+		for _, n := range p.order {
+			if _, ok := p.cost[n.name]; ok && p.rank[n.name] == rank {
+				group = append(group, n)
+			}
+		}
+
+		if cost, ok := p.oneCost(group); ok {
+			n := p.uniformCount(t, group, cost, deploymentVCPU, deploymentMemory)
+			sum += n
+			counted++
+			deploymentVCPU -= n * cost.vcpu
+			deploymentMemory -= config.ByteSize(n) * cost.memory
+
 			continue
 		}
 
-		if !seen {
-			cost, seen = c, true
+		// PLACED ONE AT A TIME, over this rank's hosts alone: every rank before
+		// it has no room left and none after it is chosen while it has some.
+		placed := p.clone()
+		placed.order = group
+		placed.deploymentVCPU, placed.deploymentMemory = deploymentVCPU, deploymentMemory
 
-			continue
+		for {
+			if _, _, ok := placed.next(t); !ok {
+				break
+			}
+			sum++
 		}
 
-		if c.vcpu != cost.vcpu || c.memory != cost.memory {
-			return 0, false
+		deploymentVCPU, deploymentMemory = placed.deploymentVCPU, placed.deploymentMemory
+	}
+
+	return sum, counted
+}
+
+// oneCost is the cost every host of group charges, and false when they charge
+// differently or the cost has a dimension no room can be divided by.
+func (p *placer) oneCost(group []nodeRow) (placementCost, bool) {
+	cost := p.cost[group[0].name]
+
+	for _, n := range group[1:] {
+		if c := p.cost[n.name]; c.vcpu != cost.vcpu || c.memory != cost.memory {
+			return placementCost{}, false
 		}
 	}
 
-	if !seen {
-		return 0, true
-	}
+	return cost, cost.vcpu > 0 && cost.memory > 0
+}
 
-	if cost.vcpu <= 0 || cost.memory <= 0 {
-		return 0, false
-	}
-
-	deployment := max(min(p.deploymentVCPU/cost.vcpu, int(p.deploymentMemory/cost.memory)), 0)
+// uniformCount is how many of a tier group holds between its hosts when every
+// one of them charges cost, under the deployment room given.
+func (p *placer) uniformCount(
+	t config.Tier, group []nodeRow, cost placementCost, deploymentVCPU int, deploymentMemory config.ByteSize,
+) int {
+	deployment := max(min(deploymentVCPU/cost.vcpu, int(deploymentMemory/cost.memory)), 0)
 
 	// EACH HOST'S OWN ROOM, which roomFor computes before the deployment's
 	// ceiling: one placement takes exactly one off it, since every term of the
@@ -343,11 +463,7 @@ func (p *placer) uniformTotal(t config.Tier) (int, bool) {
 	// overflow an int from summing past it.
 	hosts := 0
 
-	for _, n := range p.order {
-		if _, ok := p.cost[n.name]; !ok {
-			continue
-		}
-
+	for _, n := range group {
 		room := min(p.freeVCPU[n.name]/cost.vcpu, int(p.freeMemory[n.name]/cost.memory))
 		if t.GuestOS == config.GuestMacOS {
 			room = min(room, p.freeMacOS[n.name])
@@ -356,7 +472,7 @@ func (p *placer) uniformTotal(t config.Tier) (int, bool) {
 		hosts += min(max(room, 0), deployment-hosts)
 	}
 
-	return hosts, true
+	return hosts
 }
 
 // next picks the machine a reservation should be aimed at, and spends it.
@@ -373,16 +489,20 @@ func (p *placer) uniformTotal(t config.Tier) (int, bool) {
 // and it is not cosmetic — Go map iteration is randomised, so without a total
 // order one fleet gives different answers on different runs, which cannot be
 // reproduced from a log or tested at all.
+//
+// EACH HOST'S ROOM IS WORKED OUT ONCE A CHOICE, and the best one's carried, so
+// a choice over a fleet costs one roomFor a host rather than three.
 func (p *placer) next(t config.Tier) (string, placementCost, bool) {
-	best := ""
+	best, bestRoom := "", 0
 
 	for _, n := range p.order {
-		if p.roomFor(n.name, t) <= 0 {
+		room := p.roomFor(n.name, t)
+		if room <= 0 {
 			continue
 		}
 
-		if best == "" || p.better(n.name, best, t) {
-			best = n.name
+		if best == "" || p.better(n.name, room, best, bestRoom) {
+			best, bestRoom = n.name, room
 		}
 	}
 
@@ -432,13 +552,14 @@ func (p *placer) clone() *placer {
 	return &clone
 }
 
-// better reports whether a should be chosen over b for this tier.
-func (p *placer) better(a, b string, t config.Tier) bool {
+// better reports whether a, with roomA left for the tier, should be chosen over
+// b, with roomB.
+func (p *placer) better(a string, roomA int, b string, roomB int) bool {
 	if p.rank[a] != p.rank[b] {
 		return p.rank[a] < p.rank[b]
 	}
 
-	if roomA, roomB := p.roomFor(a, t), p.roomFor(b, t); roomA != roomB {
+	if roomA != roomB {
 		if p.policy == config.PlacementSpread {
 			return roomA > roomB
 		}

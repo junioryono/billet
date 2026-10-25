@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -934,11 +935,6 @@ func (a *Allocator) headroom(ctx context.Context, tx querier, t config.Tier) (in
 func (a *Allocator) headroomWithPlacer(
 	ctx context.Context, tx querier, t config.Tier,
 ) (int, *placer, error) {
-	used, err := a.usage(ctx, tx)
-	if err != nil {
-		return 0, nil, err
-	}
-
 	// FLOORS ARE NOT DEDUCTED HERE. They are held against the machines that could
 	// keep them, in reserveFloors, which is where the promise lives and the only
 	// place it can be checked honestly; deducting in both would double-count.
@@ -951,6 +947,10 @@ func (a *Allocator) headroomWithPlacer(
 	if err != nil {
 		return 0, nil, err
 	}
+
+	// WHAT THE DEPLOYMENT HAS COMMITTED, from the pass that measured each host,
+	// rather than a second pass over every open lease.
+	used := place.committed
 
 	place.deploymentVCPU = max(a.limits.MaxVCPU-used.VCPU-floors.vcpu, 0)
 	place.deploymentMemory = max(a.limits.MaxMemory-used.Memory-floors.memory, 0)
@@ -1538,23 +1538,171 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 // lease to Reap.
 func (a *Allocator) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		lease, err := a.load(ctx, tx, leaseID, epoch)
+		return a.heartbeatTx(ctx, tx, leaseID, epoch, a.now().UTC())
+	})
+}
+
+// heartbeatTx renews one lease inside the caller's transaction.
+//
+// AN ID BILLET NEVER MINTS IS NOT ASKED ABOUT. PostgreSQL refuses a NUL or
+// invalid UTF-8 in a text parameter as an error, and inside HeartbeatMany that
+// error would end the transaction and every other lease's renewal with it.
+// Every lease id is newLeaseID's hexadecimal, so such an id names no lease.
+func (a *Allocator) heartbeatTx(ctx context.Context, tx *sql.Tx, leaseID string, epoch int64, now time.Time) error {
+	if strings.ContainsRune(leaseID, 0) || !utf8.ValidString(leaseID) {
+		return fmt.Errorf("%w: %q", ErrLeaseNotFound, leaseID)
+	}
+
+	lease, err := a.load(ctx, tx, leaseID, epoch)
+	if err != nil {
+		return err
+	}
+	if lease.ForceRelease {
+		return fmt.Errorf("%w: lease %s on node %s", ErrForceRelease, leaseID, lease.Node)
+	}
+
+	return state.WriteQueries(tx).HeartbeatLease(ctx, ledgerdb.HeartbeatLeaseParams{
+		HeartbeatAt: ts(now),
+		ExpiresAt:   ts(now.Add(a.leaseTTL)),
+		ID:          leaseID,
+		Epoch:       epoch,
+	})
+}
+
+// LeaseRef names a lease at the epoch its holder presents.
+type LeaseRef struct {
+	ID    string
+	Epoch int64
+}
+
+// heartbeatBatch is the most leases one HeartbeatMany transaction renews, so a
+// pass over a large fleet holds the writer slot in pieces and every other
+// write waits behind one piece rather than the whole pass.
+const heartbeatBatch = 256
+
+// HeartbeatMany renews leases, heartbeatBatch to a transaction, and answers one
+// error a lease in refs' order: nil for one renewed, and for one that was not
+// exactly what Heartbeat would have answered for it. A transaction that fails
+// answers its error for every lease in it, none of which was renewed, so a
+// write that fails for one lease's own renewal costs the others in its batch
+// their answer for this pass, where one transaction a lease cost only that
+// lease's; a pass that hears nothing keeps what it holds.
+//
+// ONE COMMIT FOR MANY RENEWALS, because a renewal's cost is its commit. With
+// one transaction a lease, a control plane at the target fleet (4,096 open
+// leases, ADR-021) committed 137 times a second only to say its leases were
+// still held, and on a ledger whose commit waits for network block storage
+// that alone held the writer slot half the time (2026-10-25,
+// docs/reference/records/ledger-write-budget.md).
+func (a *Allocator) HeartbeatMany(ctx context.Context, refs []LeaseRef) []error {
+	out := make([]error, len(refs))
+
+	for start := 0; start < len(refs); start += heartbeatBatch {
+		end := min(start+heartbeatBatch, len(refs))
+		answers := out[start:end]
+
+		err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+			return a.heartbeatManyTx(ctx, tx, refs[start:end], answers)
+		})
 		if err != nil {
-			return err
+			for i := range answers {
+				answers[i] = err
+			}
 		}
-		if lease.ForceRelease {
-			return fmt.Errorf("%w: lease %s on node %s", ErrForceRelease, leaseID, lease.Node)
-		}
+	}
 
-		now := a.now().UTC()
+	return out
+}
 
-		return state.WriteQueries(tx).HeartbeatLease(ctx, ledgerdb.HeartbeatLeaseParams{
+// heartbeatManyTx renews refs in one statement inside the caller's
+// transaction, writing each lease's answer into answers, and asks the one-lease
+// renewal of every lease the statement did not renew: it says why, exactly as
+// Heartbeat would, and renews any the statement could not name.
+func (a *Allocator) heartbeatManyTx(ctx context.Context, tx *sql.Tx, refs []LeaseRef, answers []error) error {
+	now := a.now().UTC()
+
+	packed, count, packable := packLeaseRefs(refs)
+
+	renewed := make(map[LeaseRef]bool, count)
+
+	if count > 0 {
+		rows, err := state.WriteQueries(tx).HeartbeatLeases(ctx, ledgerdb.HeartbeatLeasesParams{
 			HeartbeatAt: ts(now),
 			ExpiresAt:   ts(now.Add(a.leaseTTL)),
-			ID:          leaseID,
-			Epoch:       epoch,
+			Packed:      packed,
 		})
-	})
+		if err != nil {
+			return fmt.Errorf("alloc: renew %d leases: %w", count, err)
+		}
+
+		for _, row := range rows {
+			renewed[LeaseRef{ID: row.ID, Epoch: row.Epoch}] = true
+		}
+	}
+
+	for i, ref := range refs {
+		if packable[i] && renewed[ref] {
+			answers[i] = nil
+
+			continue
+		}
+
+		if heartbeatAskedOne != nil {
+			heartbeatAskedOne(ref)
+		}
+
+		// A FAILED WRITE ENDS THE TRANSACTION and every answer with it; a
+		// refusal is this lease's answer and the others go on.
+		err := a.heartbeatTx(ctx, tx, ref.ID, ref.Epoch, now)
+		if err != nil && !errors.Is(err, ErrLeaseNotFound) && !errors.Is(err, ErrFenced) &&
+			!errors.Is(err, ErrForceRelease) {
+			return err
+		}
+
+		answers[i] = err
+	}
+
+	return nil
+}
+
+// heartbeatAskedOne is told of every lease HeartbeatMany asks the one-lease
+// renewal about rather than renewing it in the batch's statement. TEST-ONLY,
+// nil in production: it is how a test proves the statement, and not the
+// fallback beside it, renewed what the batch says it did.
+var heartbeatAskedOne func(LeaseRef)
+
+// The width of a packed lease reference: the id space-padded, then the epoch
+// as zero-padded digits (HeartbeatLeases).
+const (
+	packedLeaseIDWidth = 64
+	packedEpochWidth   = 19
+)
+
+// packLeaseRefs packs the references the statement can carry, saying which
+// ones those were. Only an id of printable ASCII without a space, no wider than
+// the record, is packed, so every record is exactly its width in characters on
+// both engines (SQLite's length() stops at a NUL); any other id, and a negative
+// epoch, is left to the one-lease renewal.
+func packLeaseRefs(refs []LeaseRef) (string, int, []bool) {
+	var b strings.Builder
+	b.Grow(len(refs) * (packedLeaseIDWidth + packedEpochWidth))
+
+	packable := make([]bool, len(refs))
+	count := 0
+
+	for i, ref := range refs {
+		if ref.ID == "" || len(ref.ID) > packedLeaseIDWidth || ref.Epoch < 0 ||
+			strings.ContainsFunc(ref.ID, func(r rune) bool { return r <= ' ' || r > '~' }) {
+			continue
+		}
+
+		fmt.Fprintf(&b, "%-*s%0*d", packedLeaseIDWidth, ref.ID, packedEpochWidth, ref.Epoch)
+
+		packable[i] = true
+		count++
+	}
+
+	return b.String(), count, packable
 }
 
 // Failure reasons billet writes for ITSELF, as opposed to the free-form text an

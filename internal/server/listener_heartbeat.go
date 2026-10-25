@@ -161,12 +161,14 @@ func (r renewal) advertisable() bool {
 // A lease that cannot be renewed is DROPPED rather than retried — failure means the
 // allocator no longer agrees this listener owns it.
 func (l *Listener) heartbeatHeld(ctx context.Context) {
+	renew := l.renewAll(ctx)
+
 	kept := l.held[:0]
 
 	for _, lease := range l.held {
 		// Escrow only: nothing has been launched against it, so dropping one owes
 		// nobody anything. The ledger entry is left to the reaper.
-		if l.renew(ctx, lease).advertisable() {
+		if renew(lease).advertisable() {
 			kept = append(kept, lease)
 		} else {
 			delete(l.heldOrder, lease.ID)
@@ -180,7 +182,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 	// and counted until Release confirms otherwise, so it needs the same heartbeat
 	// protection as ordinary idle escrow while that call is in flight.
 	for id, lease := range l.releasing {
-		if l.renew(ctx, lease).advertisable() {
+		if renew(lease).advertisable() {
 			continue
 		}
 
@@ -195,7 +197,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 	// then be escrowed by another tier while GitHub still believes this scale set
 	// has the job.
 	for id, lease := range l.running {
-		if l.renew(ctx, lease).advertisable() {
+		if renew(lease).advertisable() {
 			continue
 		}
 
@@ -234,7 +236,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		// NOTHING WAS LAUNCHED for a promise, so unlike a running lease there is no
 		// compute to owe anyone. The acquisition billet made to GitHub cannot be
 		// honoured without capacity, and no local record makes it honourable.
-		if !l.renew(ctx, p.lease).advertisable() {
+		if !renew(p.lease).advertisable() {
 			delete(l.acquiring, id)
 			delete(l.confirmed, p.lease.ID)
 			delete(l.heldOrder, p.lease.ID)
@@ -284,11 +286,98 @@ func (l *Listener) pruneConfirmed() {
 	}
 }
 
-// renew heartbeats one lease and reports whether it is still this listener's.
-func (l *Listener) renew(ctx context.Context, lease *alloc.Lease) renewal {
-	err := l.alloc.Heartbeat(ctx, lease.ID, lease.Epoch)
+// renewAll renews every lease this listener holds in one call, and answers
+// each lease's renewal when asked for it, once.
+//
+// ONE CALL FOR THE PASS, because a renewal's cost is its commit, and one
+// transaction a lease committed once for every lease the listener holds every
+// pass: at the target fleet of ADR-021, 4,096 leases, that held the ledger's
+// writer slot half the time on storage whose commit waits for the network
+// (docs/reference/records/ledger-write-budget.md). The allocator answers each
+// lease exactly as its own renewal would, so what each answer means here does
+// not change.
+//
+// JUDGED WHERE IT IS ASKED, in the order the pass asks, so the log and the
+// confirmations read as they did when each lease was renewed by itself; and
+// once, because a lease in two sets is one lease.
+func (l *Listener) renewAll(ctx context.Context) func(*alloc.Lease) renewal {
+	var (
+		leases []*alloc.Lease
+		refs   []alloc.LeaseRef
+		seen   = map[*alloc.Lease]bool{}
+	)
+
+	add := func(lease *alloc.Lease) {
+		if !seen[lease] {
+			seen[lease] = true
+			leases = append(leases, lease)
+			refs = append(refs, alloc.LeaseRef{ID: lease.ID, Epoch: lease.Epoch})
+		}
+	}
+
+	for _, lease := range l.held {
+		add(lease)
+	}
+	for _, lease := range l.releasing {
+		add(lease)
+	}
+	for _, lease := range l.running {
+		add(lease)
+	}
+	for _, p := range l.acquiring {
+		add(p.lease)
+	}
+
+	// CONFIRMED AS OF WHEN IT WAS ASKED, never as of when the call returned. A
+	// lease's expiry is pushed out from when its batch was written, which is no
+	// earlier than this; the call returns after its last batch, which can be
+	// much later. Confirming at the return would date an early batch's renewal
+	// after the expiry it actually wrote, and keep a lease advertised past the
+	// moment the reaper may take it.
+	asked := time.Now()
+
+	if l.heartbeatRenew != nil {
+		l.heartbeatRenew()
+	}
+
+	answers := make(map[*alloc.Lease]error, len(leases))
+	if len(refs) > 0 {
+		for i, err := range l.alloc.HeartbeatMany(ctx, refs) {
+			answers[leases[i]] = err
+		}
+	}
+
+	judged := make(map[*alloc.Lease]renewal, len(leases))
+
+	return func(lease *alloc.Lease) renewal {
+		if r, ok := judged[lease]; ok {
+			return r
+		}
+
+		// A LEASE NOBODY ASKED ABOUT HAS NO ANSWER, never a renewal: a nil
+		// error read from a map that lacks it would confirm a lease no write
+		// renewed, and keep it advertised past its expiry.
+		err, ok := answers[lease]
+		if !ok {
+			err = errNotAsked
+		}
+
+		r := l.renewed(lease, err, asked)
+		judged[lease] = r
+
+		return r
+	}
+}
+
+// errNotAsked is the answer for a lease a heartbeat pass judges without having
+// asked the allocator to renew it, which renewed reads as no answer.
+var errNotAsked = errors.New("server: this lease was not in the pass's renewal")
+
+// renewed says what one lease's renewal answer means for this listener, the
+// renewal having been asked for at asked.
+func (l *Listener) renewed(lease *alloc.Lease, err error, asked time.Time) renewal {
 	if err == nil {
-		l.confirmed[lease.ID] = time.Now()
+		l.confirmed[lease.ID] = asked
 
 		return renewalOwned
 	}

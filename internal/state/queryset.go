@@ -103,6 +103,7 @@ type ReadOps interface {
 	ListJoinTokenHashes(ctx context.Context) ([]string, error)
 	ListJoinTokens(ctx context.Context) ([]ledgerdb.ListJoinTokensRow, error)
 	ListLeaseIDsOnNode(ctx context.Context, arg ledgerdb.ListLeaseIDsOnNodeParams) ([]string, error)
+	ListLiveNodeNames(ctx context.Context) ([]string, error)
 	ListNodeInventories(ctx context.Context) ([]ledgerdb.ListNodeInventoriesRow, error)
 	ListNodeRegistrations(ctx context.Context) ([]ledgerdb.ListNodeRegistrationsRow, error)
 	ListNodeWireVersions(ctx context.Context) ([]ledgerdb.ListNodeWireVersionsRow, error)
@@ -186,6 +187,7 @@ type ReadOps interface {
 	ReadRolloutNodeProgress(ctx context.Context, arg ledgerdb.ReadRolloutNodeProgressParams) (ledgerdb.ReadRolloutNodeProgressRow, error)
 	TotalUsage(ctx context.Context) (ledgerdb.TotalUsageRow, error)
 	UsageByNode(ctx context.Context) ([]ledgerdb.UsageByNodeRow, error)
+	UsageByNodeAndTier(ctx context.Context) ([]ledgerdb.UsageByNodeAndTierRow, error)
 	UsageByTier(ctx context.Context) ([]ledgerdb.UsageByTierRow, error)
 	UsageOnNode(ctx context.Context, node string) (ledgerdb.UsageOnNodeRow, error)
 }
@@ -235,6 +237,7 @@ type WriteOps interface {
 	FinishRollout(ctx context.Context, arg ledgerdb.FinishRolloutParams) error
 	ForgetEveryNode(ctx context.Context) error
 	HeartbeatLease(ctx context.Context, arg ledgerdb.HeartbeatLeaseParams) error
+	HeartbeatLeases(ctx context.Context, arg ledgerdb.HeartbeatLeasesParams) ([]ledgerdb.HeartbeatLeasesRow, error)
 	HoldLease(ctx context.Context, arg ledgerdb.HoldLeaseParams) error
 	InsertEnrollment(ctx context.Context, arg ledgerdb.InsertEnrollmentParams) error
 	InsertForceDestroy(ctx context.Context, arg ledgerdb.InsertForceDestroyParams) error
