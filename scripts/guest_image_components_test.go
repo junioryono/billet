@@ -357,6 +357,7 @@ func TestTheGatePassesTheCompleterTheBuildInstalls(t *testing.T) {
 	}
 	root := t.TempDir()
 	script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nCOMPONENTS='android-sdk codeql '\n" +
+		"TOOLSET_FILE=" + filepath.Join(here, "..", "internal", "runnerimages", "toolset-2404.json") + "\n" +
 		guestImageFunction(t, "install_completer") + "\ninstall_completer \"$1\"\n"
 	path := filepath.Join(t.TempDir(), "install.sh")
 	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
@@ -437,4 +438,51 @@ func writeTreeFile(t *testing.T, root, path, body string) {
 	if err := forkSafeWriteFile(filepath.Join(root, path), []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// toolsetPathForTest is the pinned declaration, relative to scripts/.
+const toolsetPathForTest = "../internal/runnerimages/toolset-2404.json"
+
+// readScriptFile is a file under scripts/, or the test fails.
+func readScriptFile(t *testing.T, path string) string {
+	t.Helper()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	return string(raw)
+}
+
+// shellQuote single-quotes s for a shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// readBuildScript returns the guest build script.
+func readBuildScript(t *testing.T) string {
+	t.Helper()
+
+	return readScriptFile(t, "build-guest-image.sh")
+}
+
+// guestImageFunction returns one shell function from build-guest-image.sh, from
+// its definition to the brace that closes it.
+func guestImageFunction(t *testing.T, name string) string {
+	t.Helper()
+
+	source := readScriptFile(t, "build-guest-image.sh")
+
+	start := strings.Index(source, name+"() {")
+	if start < 0 {
+		t.Fatalf("build-guest-image.sh has no %s function", name)
+	}
+
+	end := strings.Index(source[start:], "\n}\n")
+	if end < 0 {
+		t.Fatalf("could not find the end of %s in build-guest-image.sh", name)
+	}
+
+	return source[start : start+end+2]
 }

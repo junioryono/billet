@@ -68,6 +68,7 @@ func (b *buildFake) console() string {
 		reportBegin + " " + b.nonce + "\n" +
 		reportVerdictKey + "=" + verdict + "\n" +
 		reportStepKey + "=done\n" +
+		buildComponentsKey + "=" + b.recorded() + "\n" +
 		"docker_driver=overlay2\n" +
 		"docker_root=/var/lib/docker\n" +
 		"root_free_kib=20971520\n" +
@@ -76,10 +77,19 @@ func (b *buildFake) console() string {
 	return base64.StdEncoding.EncodeToString([]byte(body))
 }
 
+// recorded is the components record the verified image carries.
+func (b *buildFake) recorded() string {
+	if b.recordedComponents != nil {
+		return *b.recordedComponents
+	}
+
+	return b.builtComponents
+}
+
 // verifyingBuild is a BuildSpec with the verification turned on, which is what
 // `billet ami build` passes by default.
 func verifyingBuild() BuildSpec {
-	return BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	return BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 		Verify: true,
@@ -97,7 +107,7 @@ func TestABuildVerifiesTheImageItProduced(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
@@ -170,7 +180,7 @@ func TestAFailedVerificationStampsNothing(t *testing.T) {
 	}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
@@ -206,7 +216,7 @@ func TestAnImageThatSaysNothingDoesNotPass(t *testing.T) {
 	}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
@@ -253,7 +263,7 @@ func TestAPassingVerificationPromotesTheContract(t *testing.T) {
 			}
 
 			f := newFakeEC2(t)
-			f.respond = b.reply
+			f.respond = b.serve(f)
 
 			p := newTestProvider(t, f, nil)
 
@@ -298,7 +308,7 @@ func TestAnUnverifiedBuildIsNotStamped(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
@@ -333,6 +343,7 @@ func TestAPromotionIsReadBack(t *testing.T) {
 	// THE TAG IS SWALLOWED, which is what a CreateTags on the wrong resource, or
 	// against a policy that answers success and applies nothing, looks like from
 	// here.
+	b.server = f
 	f.respond = func(action string, params url.Values) (int, string) {
 		status, body := b.reply(action, params)
 
@@ -666,6 +677,7 @@ func TestTheVerifierIsTerminatedOnceItIsVisible(t *testing.T) {
 	// instance happened to be visible immediately.
 	var invisible int
 
+	b.server = f
 	f.respond = func(action string, params url.Values) (int, string) {
 		if action == "DescribeInstances" && params.Get("InstanceId.1") == "i-verify" &&
 			invisible < 2 {
@@ -721,6 +733,7 @@ func TestAnAmbiguousPromotionIsSettledByTheReadBack(t *testing.T) {
 	// NOT A 200 WITH A BAD BODY, which was the first version of this fixture and
 	// staged nothing: CreateTags is called with a nil target, so the client returns
 	// success without parsing anything and the ambiguous branch is never reached.
+	b.server = f
 	f.respond = func(action string, params url.Values) (int, string) {
 		status, body := b.reply(action, params)
 
@@ -759,6 +772,7 @@ func TestAPromotionToleratesADelayedTag(t *testing.T) {
 	// so this cannot pass by never staging the delay.
 	var withheld int
 
+	b.server = f
 	f.respond = func(action string, params url.Values) (int, string) {
 		if action == "DescribeImages" && b.promoted != "" && withheld == 0 {
 			withheld++

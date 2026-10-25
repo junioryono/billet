@@ -168,3 +168,29 @@ e29c5205f066 The Makefile is gone (#78); the sentence names the script under scr
 f2b09ff92300 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 1c37e966cf7d The Makefile is gone (#78); the scenario tests run through scripts/gates/scenario.sh NAME, and the rule says so.
 e1d3650f30ef #93 records a runner's owner on the lease and the binding when it is minted, and the plane resolves removal and recovery from it; the gap is closed and the sentence now states the rule and what an unrecorded runner still does.
+0294906e817a The provisioning script and its installers left user data for the staged payload (ADR-022); builds-and-installers.md now says what user data carries.
+08bef6648548 toolcache_gate_test.go went with the toolcache installers (ADR-022); the list now names amibuild_test.go, verifyscript_test.go and scripts/ami_build_test.go.
+0d03f4d5e99d The unpublished record went with install-toolcache.sh (ADR-022); GitHub's template and its tests now decide the toolcache.
+1631c57fafe9 The EC2 toolcache installer is gone (ADR-022); the sentence now names both vendored declarations.
+2e8d940a1b18 The provisioning script no longer travels in user data (ADR-022); the rule now says packUserData gates what user data still carries.
+333c8dfb8b4f install-toolcache.sh and its chroot seam are gone (ADR-022): both backends run GitHub's template.
+53889536e450 guest_image_pipefail_test.go tested install-toolcache.sh and went with it (ADR-022); the list now names scripts/ami_build_test.go.
+5f657868d6c2 The AMI rule in publication-and-pull.md now says billet check names what an older image lacks as well.
+665dc76232a6 The AMI is now the same build, not only the same contract (ADR-022); the rule is restated under that name.
+6ecf3e04c231 The AMI build is staged in S3 and user data is a bootstrap (ADR-022); restated as the rule about the bootstrap.
+7ddf728c53e8 toolcache_gate_test.go is gone with the installers (ADR-022); the list now names amibuild_test.go and verifyscript_test.go.
+8d59ef7dc7c6 install-toolcache.sh is gone (ADR-022); the rule about the AMI build driver replaces it.
+969f33968aad The comment strip went with the embedded installers (ADR-022).
+9b22b45b4c47 The AMI is no longer built from the declaration by billet's installers but by GitHub's template (ADR-022); restated so.
+a197babab3bc The CA bundle no longer shares user data with the installers (ADR-022); maxCACertPEM is bounded as a trust store, in build.go.
+ace5d326f13a The unpublished record went with install-toolcache.sh (ADR-022).
+ade5d3c35a5e install-toolcache.sh and its bash driver are gone (ADR-022).
+bced6d28079a Contract 4 replaced the toolcache contract (ADR-022); GitHub's arm64 template carries no CodeQL, so nothing is recorded as unpublished.
+ccd875e3f505 Contract 4 is GitHub's template build (ADR-022); the rule now says what contract 4 records.
+d1e942f77102 install-toolcache.sh is gone and the AMI build lives in scripts/ami (ADR-022); the sentence names where the shell is now.
+d3b1d96a9708 install-toolcache.sh and billet_tc_run are gone (ADR-022): both backends run GitHub's template.
+d45e830a2053 Contract 4's verifier runs each architecture's toolchains and the recorded components rather than the toolcache gate (ADR-022); the sentence says so.
+d851b91c2981 The provisioning script became the AMI build (ADR-022); the related-skills line says so.
+dc3c19371fda The toolcache installers' architecture spellings went with them (ADR-022).
+de2880c55834 BILLET_TC_ARCH went with install-toolcache.sh (ADR-022); the build's scope (ami-x64, ami-arm64) chooses the template.
+f9290014add1 The provisioning script became the AMI build (ADR-022); the related-skills line says so.

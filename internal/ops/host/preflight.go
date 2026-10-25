@@ -237,13 +237,32 @@ func ec2Preflight(
 					"cache token in an argument list, which any process in the instance "+
 					"can read until the runner starts")
 			}
+			if img.Contract < 4 {
+				gaps = append(gaps, "it was built by billet's own installers rather than "+
+					"GitHub's template, so it lacks much of what GitHub's image carries (Rust, "+
+					"Swift, Haskell, the browsers among it) and carries the Android SDK, and on "+
+					"x64 CodeQL, whatever images.accept says; a rebuild installs only what "+
+					"images.accept names, and on arm64 leaves the Android SDK and PyPy out as "+
+					"GitHub's arm64 image does")
+			}
 			missing := strings.Join(gaps, "; ")
 
 			fmt.Fprintf(env.Stdout, "image    %s meets AMI contract %d and this billet wants %d (built by "+
 				"%s) — %s; rebuild with `billet ami build`\n",
 				img.ImageID, img.Contract, ec2.AMIContract, built, missing)
 		default:
-			fmt.Fprintf(env.Stdout, "image    %s available (AMI contract %d)\n", img.ImageID, img.Contract)
+			// QUOTED, as the built-by tag is: an operator-editable value printed into
+			// a report read as billet's own.
+			components := "completed with none of the license-restricted components"
+			switch {
+			case !img.HasComponents:
+				components = "with no record of its components"
+			case img.Components != "":
+				components = "completed with " + strconv.Quote(img.Components)
+			}
+
+			fmt.Fprintf(env.Stdout, "image    %s available (AMI contract %d, %s)\n",
+				img.ImageID, img.Contract, components)
 		}
 	}
 

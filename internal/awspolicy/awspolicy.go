@@ -626,8 +626,8 @@ func (in Inputs) Build() (Policy, error) {
 				Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
 				Condition: builderOwnerCondition(in.Owner),
 			},
-			// A build boots the image it produced and reads the verifier's report off
-			// the serial console. Scoped to instances carrying the builder tag: console
+			// A build reads its builder's verdict, and then the verifier's report on the
+			// image it produced, off the serial console. Scoped to instances carrying the builder tag: console
 			// output is whatever the machine printed, and on a job instance that is a
 			// runner's own log rather than anything this role has business reading.
 			//

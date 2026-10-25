@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -66,12 +67,17 @@ const (
 // caller may use it, because a schema is only meaningful beside the script it was
 // built from. Every caller discards it when generation fails.
 type reportSchema struct {
+	// begin and end frame the block: the verifier's report or the build's verdict.
+	begin string
+	end   string
 	keys  map[string]struct{}
 	steps map[string]struct{}
 }
 
-func newReportSchema() reportSchema {
+func newReportSchema(begin, end string) reportSchema {
 	return reportSchema{
+		begin: begin,
+		end:   end,
 		keys:  map[string]struct{}{},
 		steps: map[string]struct{}{},
 	}
@@ -204,13 +210,67 @@ var verifyNonce = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // it. Lowercase, because the toolcache names it is derived from are not.
 var reportKey = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 
+// toolcacheName is what a toolcache directory named by the declaration may be
+// before it is interpolated into the script. The digest on the declaration proves
+// provenance, not that its strings are safe shell syntax.
+var toolcacheName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_+-]{0,31}$`)
+
+// componentsFile is where the build records the components it installed, one
+// line of `name:version` joined by commas; the verifier reports it back and the
+// promotion stamps it.
+const componentsFile = "/etc/billet-image-components"
+
+// componentPaths is what each component leaves in an image that a job runs or
+// reads: an executable marked x, a directory d. A test holds it to
+// check-guest-component.sh's own list, which the build's `present` asked.
+var componentPaths = map[string][]string{
+	"android-sdk": {"d /usr/local/lib/android/sdk", "x /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"},
+	"codeql":      {"d /opt/hostedtoolcache/CodeQL"},
+	"firefox":     {"x /usr/bin/firefox", "d /usr/local/share/gecko_driver", "x /usr/bin/geckodriver"},
+	"google-chrome": {"x /usr/bin/google-chrome", "d /opt/google/chrome",
+		"d /usr/local/share/chromedriver-linux64", "x /usr/bin/chromedriver",
+		"d /usr/local/share/chromium", "x /usr/bin/chromium"},
+	"microsoft-edge": {"x /usr/bin/microsoft-edge", "d /usr/local/share/edge_driver", "x /usr/bin/msedgedriver"},
+}
+
+// toolchain is one toolchain a job finds on PATH, and the arguments that make it
+// say its version.
+type toolchain struct {
+	name string
+	args string
+}
+
+// toolchainsFor is what the verifier runs through the job's own path on an image
+// of arch: the languages GitHub's template installs that a workflow calls by name
+// rather than through a setup action (ADR-022). Haskell is x64's alone, because
+// GitHub's arm64 image has none.
+func toolchainsFor(arch string) []toolchain {
+	out := []toolchain{
+		{"rustc", "--version"},
+		{"cargo", "--version"},
+		{"swift", "--version"},
+		{"go", "version"},
+		{"node", "--version"},
+		{"python3", "--version"},
+		{"java", "-version"},
+		{"dotnet", "--version"},
+		{"pwsh", "--version"},
+	}
+
+	if arch == "x64" {
+		out = append(out, toolchain{"ghc", "--version"})
+	}
+
+	return out
+}
+
 // verifyScript is what a machine booted from the produced AMI runs.
 //
 // NO `set -x`, AND THAT IS NOT A STYLE CHOICE. EC2 keeps the last 64 KiB of
 // console output; a trace of the toolcache gate would push the report out of that
 // window and leave billet reading a boot log with no answer in it.
 func verifyScript(arch string, contract int, nonce string) (string, reportSchema, error) {
-	schema := newReportSchema()
+	schema := newReportSchema(reportBegin, reportEnd)
 
 	if arch != "x64" && arch != "arm64" {
 		return "", schema, fmt.Errorf("ec2: cannot verify an image for architecture %q, which "+
@@ -223,13 +283,12 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 
 	var (
 		b     strings.Builder
-		ts    runnerimages.Toolset
 		tools []toolReport
-		err   error
 	)
 
 	if contract >= 2 {
-		if ts, err = runnerimages.Load(); err != nil {
+		ts, err := runnerimages.LoadFor(arch)
+		if err != nil {
 			return "", schema, fmt.Errorf("ec2: %w", err)
 		}
 
@@ -318,18 +377,12 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 		b.WriteString("billet_toolcache_kib=$(du -sk " + toolcacheDir +
 			" 2>/dev/null | awk '{ print $1 }')\n")
 
-		// THE SAME GATE THE BUILD RUNS, WITH THE TWO DIFFERENCES THAT MATTER: every
-		// tool is executed through the privilege drop, and each check names itself
-		// first so a failure can be reported as the declared line it was about.
-		if err := writeToolcacheGate(&b, ts, arch, gateOptions{
-			RunPrefix: verifyRunAsRunner + " ",
-			StepVar:   verifyStepVar,
-			Record:    func(label string) { schema.steps[label] = struct{}{} },
-		}); err != nil {
-			return "", schema, err
-		}
-
 		writeVerifyToolcacheInventory(&b, tools)
+	}
+
+	if contract >= 4 {
+		writeVerifyToolchains(&b, step, arch)
+		writeVerifyComponents(&b, step)
 	}
 
 	step("done")
@@ -355,16 +408,12 @@ func toolReports(ts runnerimages.Toolset) ([]toolReport, error) {
 	names := make([]string, 0, len(ts.Toolcache)+1)
 
 	for _, entry := range ts.Toolcache {
-		// ONLY WHAT THE INSTALLERS BAKE, matching the gate: listing a tool billet does
-		// not install would report an empty line as though something were missing.
-		if toolcacheBinary(entry.Name) == "" {
-			continue
+		if !slices.Contains(names, entry.Name) {
+			names = append(names, entry.Name)
 		}
-
-		names = append(names, entry.Name)
 	}
 
-	if len(ts.Java.Versions) > 0 {
+	if len(ts.Java.Versions) > 0 && !slices.Contains(names, "Java_Temurin-Hotspot_jdk") {
 		names = append(names, "Java_Temurin-Hotspot_jdk")
 	}
 
@@ -508,12 +557,69 @@ func writeVerifyEntryPoint(b *strings.Builder, step func(string)) {
 	}
 }
 
+// writeVerifyToolchains runs each of arch's toolchains the way a job's step
+// does: as the runner, under `env -i`, finding it on the image's own PATH.
+//
+// GITHUB'S PESTER SUITE, RUN DURING THE BUILD, IS THE PARITY GATE (ADR-014). This
+// is the other half, which no build-time test can be: the toolchains on a machine
+// booted from the produced image, reached through the entry point's privilege
+// drop and environment rather than root's.
+//
+// `sh -c`, BECAUSE THE PREFIX ENDS IN env, WHICH CAN ONLY EXEC A FILE: the command
+// word is resolved by a shell inside the runner's environment, which is the lookup
+// a workflow's `run:` makes.
+func writeVerifyToolchains(b *strings.Builder, step func(string), arch string) {
+	for _, tc := range toolchainsFor(arch) {
+		step("toolchain " + tc.name)
+
+		b.WriteString(verifyRunAsRunner + " sh -c '" + tc.name + " " + tc.args +
+			"' >/dev/null 2>&1 || { echo '" + tc.name + " does not run as the runner' >&2; exit 1; }\n")
+	}
+}
+
+// writeVerifyComponents reports the components the build recorded and proves each
+// one is there for the runner: its executables run-ready and its directories
+// readable, through the job's own path.
+//
+// THE RECORD MUST EXIST, EMPTY OR NOT. An image with no record is one no contract-4
+// build finished, and "none" and "unknown" are different answers.
+func writeVerifyComponents(b *strings.Builder, step func(string)) {
+	step("components")
+
+	b.WriteString("test -r " + componentsFile + "\n")
+	b.WriteString("billet_components=$(cat " + componentsFile + ")\n")
+	b.WriteString("for billet_c in $(printf '%s' \"$billet_components\" | tr ',' ' '); do\n")
+	b.WriteString("  case \"${billet_c%%:*}\" in\n")
+
+	names := make([]string, 0, len(componentPaths))
+	for name := range componentPaths {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	for _, name := range names {
+		var checks []string
+
+		for _, entry := range componentPaths[name] {
+			kind, path, _ := strings.Cut(entry, " ")
+			checks = append(checks, verifyRunAsRunner+" test -"+kind+" "+path)
+		}
+
+		b.WriteString("    " + name + ") " + strings.Join(checks, " && ") + " ;;\n")
+	}
+
+	b.WriteString("    *) false ;;\n")
+	b.WriteString("  esac || { echo \"the image records $billet_c and the runner cannot reach it\" >&2; exit 1; }\n")
+	b.WriteString("done\n")
+}
+
 // writeVerifyToolcacheInventory records what the image holds, per tool.
 //
-// FOR THE OPERATOR TO READ, NOT FOR THE VERDICT. The gate above decides whether a
-// declared line resolves and runs; this lists the entries beside it so a report
-// says "node 22.23.2 24.20.0" rather than only "ok", which is the difference
-// between a check and something worth looking at.
+// FOR THE OPERATOR TO READ, NOT FOR THE VERDICT. GitHub's own tests decided, during
+// the build, whether each declared line resolves and runs; this lists the entries so
+// a report says "node 22.23.2 24.20.0" rather than only "ok", which is the
+// difference between a check and something worth looking at.
 func writeVerifyToolcacheInventory(b *strings.Builder, tools []toolReport) {
 	for _, t := range tools {
 		b.WriteString("billet_" + t.key + "=$(ls " + toolcacheDir + "/" + t.dir +
@@ -549,7 +655,7 @@ func writeVerifyReport(b *strings.Builder, schema reportSchema, nonce string, to
 	for _, field := range []string{
 		"root_total_kib", "root_used_kib", "root_free_kib",
 		"docker_server", "docker_driver", "docker_root",
-		"toolcache_kib", "runner",
+		"toolcache_kib", "runner", buildComponentsKey,
 	} {
 		schema.keys[field] = struct{}{}
 		b.WriteString("  echo \"" + field + "=${billet_" + field + ":-}\"\n")

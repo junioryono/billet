@@ -41,7 +41,7 @@ func TestTheAnchorProofRefusesABundleWithoutTheAnchor(t *testing.T) {
 
 	ca := mintCert(t, true)
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: ca})
+	script, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: ca})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestTheAnchorProofFailsClosedOnAnUnusableAnchor(t *testing.T) {
 
 	ca := mintCert(t, true)
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: ca})
+	script, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: ca})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}

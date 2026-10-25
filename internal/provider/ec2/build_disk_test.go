@@ -22,11 +22,11 @@ func TestTheBuilderRootIsSized(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	if _, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
@@ -68,11 +68,11 @@ func TestAnExplicitBuilderDiskIsWhatIsRequested(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	if _, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: want,
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
@@ -113,11 +113,11 @@ func TestABuilderDiskTooSmallForTheImageIsRefusedBeforeAnyLaunch(t *testing.T) {
 			b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 			f := newFakeEC2(t)
-			f.respond = b.reply
+			f.respond = b.serve(f)
 
 			p := newTestProvider(t, f, nil)
 
-			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+			_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: tc.gib,
 				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
@@ -143,26 +143,26 @@ func TestABuilderDiskTooSmallForTheImageIsRefusedBeforeAnyLaunch(t *testing.T) {
 	}
 }
 
-// THE SCRIPT LOOKS BEFORE IT INSTALLS, because growing an EBS volume does not
-// grow the filesystem on it.
+// THE BOOTSTRAP LOOKS BEFORE THE BUILD STARTS, because growing an EBS volume
+// does not grow the filesystem on it.
 //
 // cloud-init's growpart runs in the `init` stage and user data in `final`, so it
 // should already have happened — but that is an ordering somebody else owns, and
-// the failure if it did not is dpkg complaining about disk space with nothing
-// naming the volume.
+// the failure if it did not is an install hours in complaining about disk space
+// with nothing naming the volume.
 func TestTheScriptRefusesToProvisionOntoADiskThatDidNotGrow(t *testing.T) {
 	t.Parallel()
 
-	script := mustScript(t)
+	script := mustBootstrap(t)
 
 	lines := strings.Split(script, "\n")
 
 	check := lineOf(t, lines, "billet_free_kib=$(df -Pk /")
-	apt := firstLineOf(t, lines, "apt-get -o DPkg::Lock::Timeout=600 update")
+	fetch := firstLineOf(t, lines, "curl -fsSL --retry 5")
 
-	if check >= apt {
-		t.Errorf("the free-space check is at line %d and the first apt transaction at %d; "+
-			"checking after installing is checking after the failure", check, apt)
+	if check >= fetch {
+		t.Errorf("the free-space check is at line %d and the payload is fetched at %d; "+
+			"checking after the build starts is checking after the failure", check, fetch)
 	}
 
 	// THE THRESHOLD IS THE CONSTANT, not a number typed twice. A script asserting
@@ -221,7 +221,7 @@ func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 
 			p := newTestProvider(t, f, nil)
 
-			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+			_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: tc.ask,
 				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
@@ -270,7 +270,7 @@ func TestTheBaseImageFloorSurvivesTheLayoutCache(t *testing.T) {
 
 	p := newTestProvider(t, f, nil)
 
-	spec := BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	spec := BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: baseGiB - 1,
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}

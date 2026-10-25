@@ -4,12 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/guestassets"
-	"github.com/junioryono/billet/internal/runnerimages"
 )
 
 // verifyProbeNonce is a well-formed nonce for a script under test.
@@ -36,6 +37,15 @@ func substitute(t *testing.T, script, old, replacement string) string {
 	}
 
 	return strings.ReplaceAll(script, old, replacement)
+}
+
+// writeFile writes a fixture file with a mode.
+func writeFile(t *testing.T, path, body string, mode os.FileMode) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }
 
 // writeExecutableFile writes a fake the verifier executes, through
@@ -68,68 +78,27 @@ func execEnvForTest(t *testing.T) string {
 	return dash + " " + path
 }
 
-// declaredGlobals is every command the declaration says a global package
-// provides, in the order the gate checks them.
-func declaredGlobals(ts runnerimages.Toolset) []string {
-	var out []string
-
-	for _, e := range ts.Pipx {
-		if e.Cmd != "" {
-			out = append(out, e.Cmd)
-		}
-	}
-
-	for _, e := range ts.NodeModules {
-		if e.Command != "" {
-			out = append(out, e.Command)
-		}
-	}
-
-	return out
-}
-
-// toolchainBins are the absolute paths the gate executes for tools that are NOT
-// toolcache entries — they go on PATH rather than under <tool>/<version>/<arch>,
-// so the fixture tree cannot supply them and the fake bin has to.
-//
-// A LIST RATHER THAN A PREFIX SUBSTITUTION. Rewriting every "/usr/bin/" in the
-// script would also rewrite the PATH the privilege drop builds, which is a
-// different thing that happens to share a spelling. And because substitute() is
-// fatal when its target is absent, adding a tool to the gate without adding it
-// here fails this file rather than silently going unexercised — which is the same
-// iterate-the-expected-set rule the gate itself is built on.
-var toolchainBins = []string{
-	"/usr/local/bin/cmake",
-	"/usr/bin/pwsh",
-	"/usr/bin/dotnet",
-	"/usr/bin/clang",
-	"/usr/bin/clang++",
-	"/usr/local/bin/node",
-	"/usr/local/bin/npm",
-	"/usr/local/bin/ruby",
-	"/usr/local/bin/gem",
-}
-
 // verifyProbe is one run of the emitted verification script against a fake
 // machine.
 type verifyProbe struct {
-	// fixture is the toolcache tree the image is pretending to carry.
-	fixture toolcacheFixture
+	// arch is the image's architecture; empty is x64.
+	arch string
 	// dockerDriver is what the fake daemon reports; empty means overlay2.
 	dockerDriver string
 	// dockerRoot is where the fake daemon says its data lives; empty means
 	// /var/lib/docker.
 	dockerRoot string
-	// brokenToolchain, when set to one of toolchainBins, makes exactly that command
-	// exit non-zero. One at a time, because the point is which step gets reported.
-	brokenToolchain string
-	// brokenGlobal does the same for one declared pipx or node_modules command.
-	brokenGlobal string
-	// brokenAndroid removes one of the two android paths the gate stats, which is
-	// what an image built without the licence acceptance actually looks like.
-	brokenAndroid string
-	// brokenPSModule makes the pwsh stub report exactly that module unavailable.
-	brokenPSModule string
+	// brokenToolchain, when set to one of the architecture's toolchains, makes
+	// exactly that command exit non-zero; missingToolchain leaves it off the
+	// runner's PATH. One at a time, because the point is which step gets reported.
+	brokenToolchain  string
+	missingToolchain string
+	// components is the image's components record; empty is a record of none.
+	components string
+	// noComponentsRecord leaves the record out of the image entirely.
+	noComponentsRecord bool
+	// missingComponentPath is one path of a recorded component the image lacks.
+	missingComponentPath string
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -180,18 +149,24 @@ const legacyEntryPoint = "#!/bin/sh\nset -eu\n" +
 func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string) {
 	t.Helper()
 
-	ts, err := runnerimages.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	arch := p.arch
+	if arch == "" {
+		arch = "x64"
 	}
 
-	script, schema, err := verifyScript("x64", AMIContract, verifyProbeNonce)
+	script, schema, err := verifyScript(arch, AMIContract, verifyProbeNonce)
 	if err != nil {
 		t.Fatalf("verifyScript: %v", err)
 	}
 
 	root := t.TempDir()
-	tcDir, envFile := p.fixture.build(t, ts)
+
+	// THE TOOLCACHE THE REPORT LISTS, one entry, so an inventory that reads the
+	// wrong directory comes back empty.
+	tcDir := filepath.Join(root, "hostedtoolcache")
+	if err := os.MkdirAll(filepath.Join(tcDir, "node", "22.11.0"), 0o755); err != nil {
+		t.Fatalf("make the toolcache: %v", err)
+	}
 
 	runnerDir := filepath.Join(root, "actions-runner")
 	if err := os.MkdirAll(filepath.Join(runnerDir, "bin"), 0o755); err != nil {
@@ -212,21 +187,76 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		}
 	}
 
-	// ONE FAKE MACHINE, NAMED ONCE. Calling fakeBin twice built two directories with
-	// identical contents, so the root-side PATH and the runner-side PATH pointed at
-	// different copies — which works, and would go on working if one of them were
-	// wrong, because nothing could tell them apart.
-	bin := p.fakeBin(t)
+	// ONE FAKE MACHINE, NAMED ONCE, so the root-side PATH and the runner-side PATH
+	// are the same directory and a fake that is wrong is wrong for both.
+	bin := p.fakeBin(t, arch)
 
 	// THE IMAGE'S OWN PATH, THROUGH THE MECHANISM THE SCRIPT ALREADY READS. Under
 	// `env -i` the runner gets the fixed PATH privilegeDrop states, and on a real
-	// image `docker` is on it; here the daemon is a script in this test's fake bin.
-	// /etc/billet-image-env is exactly how an image adds to a job's environment, so
-	// the fixture uses it rather than a fake that reimplements `env`.
-	appendFile(t, envFile, "PATH="+bin+":/usr/bin:/bin\n")
+	// image the toolchains are on the one GitHub's /etc/environment names; here they
+	// are scripts in this test's fake bin, reached through /etc/billet-image-env.
+	//
+	// THE FAKE BIN ALONE, with links to the two system commands the runner side
+	// runs: a host that has a toolchain of its own (a Mac has /usr/bin/swift)
+	// would otherwise answer for one a case left off the image.
+	for _, name := range []string{"sh", "test"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Fatalf("no %s on PATH: %v", name, err)
+		}
 
-	script = substitute(t, script, toolcacheDir, tcDir)
+		if err := os.Symlink(path, filepath.Join(bin, name)); err != nil {
+			t.Fatalf("link %s: %v", name, err)
+		}
+	}
+
+	envFile := filepath.Join(root, "billet-image-env")
+	writeFile(t, envFile, "PATH="+bin+"\n", 0o644)
+
+	script = substitute(t, script, "du -sk "+toolcacheDir, "du -sk "+tcDir)
+	script = substitute(t, script, "ls "+toolcacheDir+"/", "ls "+tcDir+"/")
 	script = substitute(t, script, imageEnvFile, envFile)
+
+	// THE COMPONENTS RECORD, AND WHAT EACH RECORDED COMPONENT LEAVES, under a root
+	// of its own: the script's runner-side tests are rewritten onto it, and the
+	// fixture builds the paths of every recorded component but the one a case
+	// breaks.
+	record := filepath.Join(root, "billet-image-components")
+	if !p.noComponentsRecord {
+		writeFile(t, record, p.components+"\n", 0o644)
+	}
+
+	script = substitute(t, script, componentsFile, record)
+
+	croot := filepath.Join(root, "c")
+	for _, item := range strings.Split(p.components, ",") {
+		name, _, _ := strings.Cut(item, ":")
+
+		for _, entry := range componentPaths[name] {
+			kind, path, _ := strings.Cut(entry, " ")
+			if path == p.missingComponentPath {
+				continue
+			}
+
+			if kind == "d" {
+				if err := os.MkdirAll(croot+path, 0o755); err != nil {
+					t.Fatalf("make %s: %v", path, err)
+				}
+
+				continue
+			}
+
+			if err := os.MkdirAll(filepath.Dir(croot+path), 0o755); err != nil {
+				t.Fatalf("make %s: %v", path, err)
+			}
+
+			writeFile(t, croot+path, "#!/bin/sh\nexit 0\n", 0o755)
+		}
+	}
+
+	script = substitute(t, script, verifyRunAsRunner+" test -x /", verifyRunAsRunner+" test -x "+croot+"/")
+	script = substitute(t, script, verifyRunAsRunner+" test -d /", verifyRunAsRunner+" test -d "+croot+"/")
+
 	// THE HELPER AS THE IMAGE CARRIES IT, an executable file whose bytes the
 	// verifier compares, so it is guestassets' own unless a case tampers with it.
 	helper := p.execEnv
@@ -239,8 +269,8 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	}
 	script = substitute(t, script, execEnvPath, helperFile)
 
-	// THE BUILD'S OWN BYTES, out of the provisioning script rather than the
-	// function the verifier compares against, so the two are proved to agree.
+	// THE BUILD'S OWN BYTES, out of the layer rather than the function the
+	// verifier compares against, so the two are proved to agree.
 	entry := p.entryPoint
 	if entry == "" {
 		entry = entryPoint(t, mustScript(t))
@@ -254,38 +284,6 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	script = substitute(t, script, entryPointPath, entryFile)
 	script = substitute(t, script, "/opt/actions-runner", runnerDir)
 	script = substitute(t, script, "/dev/console", console)
-
-	for _, path := range toolchainBins {
-		script = substitute(t, script, path+" ", filepath.Join(bin, filepath.Base(path))+" ")
-	}
-
-	// THE ANDROID SDK IS A TREE, NOT A COMMAND. The gate stats sdkmanager and the
-	// ndk directory, so the fixture builds those two paths rather than a stub on
-	// PATH — and brokenAndroid omits one, which is what an image built without the
-	// licence acceptance looks like from the gate's side.
-	sdk := filepath.Join(root, "android-sdk")
-
-	// THE PARENTS ARE MADE FIRST. writeFile does not create them, and a fixture
-	// that fails to build reads as the gate refusing a correct image.
-	for _, d := range []string{
-		filepath.Join(sdk, "ndk", "27.0.12077973"),
-		filepath.Join(sdk, "cmdline-tools", "latest", "bin"),
-	} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatalf("make the android fixture: %v", err)
-		}
-	}
-
-	if p.brokenAndroid != androidSDKRoot+"/ndk" {
-		writeFile(t, filepath.Join(sdk, "ndk", "27.0.12077973", ".keep"), "", 0o644)
-	}
-
-	if p.brokenAndroid != androidSDKRoot {
-		writeFile(t, filepath.Join(sdk, "cmdline-tools", "latest", "bin", "sdkmanager"),
-			"#!/bin/sh\nexit 0\n", 0o755)
-	}
-
-	script = substitute(t, script, androidSDKRoot, sdk)
 
 	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
 	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
@@ -324,24 +322,6 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	return report, stdout
 }
 
-// appendFile adds a line to a fixture file that already exists.
-func appendFile(t *testing.T, path, line string) {
-	t.Helper()
-
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatalf("open %s: %v", path, err)
-	}
-
-	if _, err := f.WriteString(line); err != nil {
-		t.Fatalf("append to %s: %v", path, err)
-	}
-
-	if err := f.Close(); err != nil {
-		t.Fatalf("close %s: %v", path, err)
-	}
-}
-
 // fakeBin is the machine the script thinks it is running on.
 //
 // THE COMMANDS, NOT THE FILESYSTEM. docker, jq and realpath speak about paths a
@@ -349,7 +329,7 @@ func appendFile(t *testing.T, path, line string) {
 // from a fixture instead, exactly as the in-build image-store test does. sleep
 // and poweroff are stubbed because the dwell is twenty-four rounds of twenty
 // seconds and this is a unit test.
-func (p verifyProbe) fakeBin(t *testing.T) string {
+func (p verifyProbe) fakeBin(t *testing.T, arch string) string {
 	t.Helper()
 
 	dir := filepath.Join(t.TempDir(), "bin")
@@ -442,51 +422,22 @@ func (p verifyProbe) fakeBin(t *testing.T) string {
 		writeExecutableFile(t, filepath.Join(dir, name), body)
 	}
 
-	// THE TOOLCHAINS THAT ARE NOT TOOLCACHE ENTRIES. Each is present unless this
-	// probe was asked to break exactly one of them, which is how a test proves the
-	// gate reports the RIGHT step rather than merely reporting some failure.
-	for _, path := range toolchainBins {
-		status := "0"
-		if p.brokenToolchain == path {
-			status = "1"
-		}
-
-		body := "#!/bin/sh\nexit " + status + "\n"
-
-		// pwsh IS ASKED ABOUT ONE MODULE AT A TIME, so its stub needs to answer
-		// differently per module rather than uniformly. It does not parse
-		// PowerShell: it looks for the name in its arguments, which is the only
-		// distinction the fixture has to make.
-		if filepath.Base(path) == "pwsh" && p.brokenPSModule != "" {
-			body = "#!/bin/sh\ncase \"$*\" in\n  *" + p.brokenPSModule +
-				"*) exit 1 ;;\nesac\nexit " + status + "\n"
-		}
-
-		writeExecutableFile(t, filepath.Join(dir, filepath.Base(path)), body)
-	}
-
-	// AND THE GLOBALS, READ FROM THE DECLARATION RATHER THAN LISTED HERE. The gate
-	// iterates every pipx and node_modules entry the toolset names, so a fixture
-	// with a hand-written list would go stale the next time upstream adds one and
-	// the failure would look like a broken gate rather than a stale fixture. These
-	// are found through PATH by the emitted billet_need, so no substitution is
-	// needed — only that a command of the name exists.
-	ts, err := runnerimages.Load()
-	if err != nil {
-		t.Fatalf("load the declaration: %v", err)
-	}
-
-	for _, cmd := range declaredGlobals(ts) {
-		// ABSENT, NOT FAILING. The gate asks `command -v`, which reports whether the
-		// command EXISTS; a stub that exits non-zero is still found, so writing one
-		// would leave this case green against a gate that checks nothing. The real
-		// failure is a package manager that installed into a prefix nothing puts on
-		// PATH, and absence is exactly what that looks like.
-		if p.brokenGlobal == cmd {
+	// THE TOOLCHAINS, each answering only through the privilege drop: one found as
+	// root and not as the runner would otherwise pass a check that asked the wrong
+	// account. Each is present unless this probe breaks exactly one of them.
+	for _, tc := range toolchainsFor(arch) {
+		if p.missingToolchain == tc.name {
 			continue
 		}
 
-		writeExecutableFile(t, filepath.Join(dir, cmd), "#!/bin/sh\nexit 0\n")
+		status := "0"
+		if p.brokenToolchain == tc.name {
+			status = "1"
+		}
+
+		writeExecutableFile(t, filepath.Join(dir, tc.name), "#!/bin/sh\n"+
+			"[ -n \"${"+droppedMarker+":-}\" ] || exit 1\n"+
+			"exit "+status+"\n")
 	}
 
 	return dir
@@ -500,35 +451,64 @@ func (p verifyProbe) fakeBin(t *testing.T) string {
 func TestTheVerifierScriptRunsAndReports(t *testing.T) {
 	t.Parallel()
 
+	for _, arch := range []string{"x64", "arm64"} {
+		t.Run(arch, func(t *testing.T) {
+			t.Parallel()
+
+			report, stdout := verifyProbe{arch: arch, components: "firefox:140.0.4"}.run(t)
+
+			if got := report[reportVerdictKey]; got != "ok" {
+				t.Fatalf("a complete image reported %s=%q at step %q, so every build would fail\n"+
+					"--- it printed ---\n%s", reportVerdictKey, got, report[reportStepKey], stdout)
+			}
+
+			if got := report[reportStepKey]; got != "done" {
+				t.Errorf("the passing report stopped at step %q, want done", got)
+			}
+
+			// AND THE FACTS ARE IN IT. A verdict with an empty report is a check nobody
+			// can act on, and every one of these is a value the operator asked for by
+			// hand.
+			for _, key := range []string{
+				"root_free_kib", "root_total_kib", "docker_driver", "docker_root", "runner",
+				"toolcache_kib", "tc_node",
+			} {
+				if report[key] == "" {
+					t.Errorf("the report carries no %s: %v", key, report)
+				}
+			}
+
+			if got := report["docker_driver"]; got != "overlay2" {
+				t.Errorf("docker_driver=%q, want overlay2", got)
+			}
+
+			if got := report["runner"]; got != "2.328.0" {
+				t.Errorf("runner=%q, want 2.328.0: the version is read through the privilege "+
+					"drop a job takes, so an empty one means that path did not run", got)
+			}
+
+			if got := report[buildComponentsKey]; got != "firefox:140.0.4" {
+				t.Errorf("%s=%q, want the record the image carries", buildComponentsKey, got)
+			}
+		})
+	}
+}
+
+// AN IMAGE THAT RECORDS NO COMPONENTS PASSES AND SAYS SO: none accepted is an
+// answer, and the report carries it as an empty record rather than a missing one.
+func TestTheVerifierReportsAnEmptyComponentsRecord(t *testing.T) {
+	t.Parallel()
+
 	report, stdout := verifyProbe{}.run(t)
 
 	if got := report[reportVerdictKey]; got != "ok" {
-		t.Fatalf("a complete image reported %s=%q at step %q, so every build would fail\n"+
-			"--- it printed ---\n%s", reportVerdictKey, got, report[reportStepKey], stdout)
+		t.Fatalf("an image completed with nothing reported %s=%q at %q\n%s",
+			reportVerdictKey, got, report[reportStepKey], stdout)
 	}
 
-	if got := report[reportStepKey]; got != "done" {
-		t.Errorf("the passing report stopped at step %q, want done", got)
-	}
-
-	// AND THE FACTS ARE IN IT. A verdict with an empty report is a check nobody can
-	// act on, and every one of these is a value the operator asked for by hand.
-	for _, key := range []string{
-		"root_free_kib", "root_total_kib", "docker_driver", "docker_root", "runner",
-		"toolcache_kib", "tc_node", "tc_java_temurin_hotspot_jdk",
-	} {
-		if report[key] == "" {
-			t.Errorf("the report carries no %s: %v", key, report)
-		}
-	}
-
-	if got := report["docker_driver"]; got != "overlay2" {
-		t.Errorf("docker_driver=%q, want overlay2", got)
-	}
-
-	if got := report["runner"]; got != "2.328.0" {
-		t.Errorf("runner=%q, want 2.328.0: the version is read through the privilege drop a "+
-			"job takes, so an empty one means that path did not run", got)
+	got, ok := report[buildComponentsKey]
+	if !ok || got != "" {
+		t.Errorf("%s=%q (present %v), want an empty record", buildComponentsKey, got, ok)
 	}
 }
 
@@ -548,37 +528,48 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 		wantStep string
 	}{
 		{
-			// A TOOLCHAIN THAT IS NOT A TOOLCACHE ENTRY. cmake, pwsh, dotnet and
-			// clang go on PATH, so the toolcache loop cannot see them and a separate
-			// check has to — and it has to name ITSELF, or an operator learns only
-			// that something in a twenty-check block failed.
-			name:     "a declared toolchain does not run",
-			probe:    verifyProbe{brokenToolchain: "/usr/local/bin/cmake"},
-			wantStep: "cmake",
+			// A TOOLCHAIN A WORKFLOW CALLS BY NAME. GitHub's tests proved it on the
+			// builder as root; only a machine booted from the image, asked as the
+			// runner under `env -i`, says a job finds it.
+			name:     "a toolchain does not run",
+			probe:    verifyProbe{brokenToolchain: "rustc"},
+			wantStep: "toolchain rustc",
 		},
 		{
-			// clang SPECIFICALLY, because it is the one whose presence depends on a
-			// symlink the build makes rather than on a package apt installed: the
-			// versioned packages are co-installable and none of them owns the bare
-			// name. An image can carry clang-18 and have no `clang`.
-			name:     "the default clang symlink is missing",
-			probe:    verifyProbe{brokenToolchain: "/usr/bin/clang"},
-			wantStep: "clang",
+			name:     "a toolchain is not on the runner's PATH",
+			probe:    verifyProbe{missingToolchain: "swift"},
+			wantStep: "toolchain swift",
 		},
 		{
-			// A GLOBAL THE DECLARATION NAMES. These are the checks that catch a
-			// package manager which reported success and installed into a prefix
-			// nothing puts on PATH -- npm's default is a toolcache directory, which
-			// is exactly how an image shipped with every node module installed and
-			// none of their commands runnable.
-			name:     "a declared node module provides no command",
-			probe:    verifyProbe{brokenGlobal: "tsc"},
-			wantStep: "npm tsc",
+			// HASKELL IS x64's ALONE, and an x64 image without it is short of
+			// GitHub's.
+			name:     "an x64 image has no ghc",
+			probe:    verifyProbe{missingToolchain: "ghc"},
+			wantStep: "toolchain ghc",
 		},
 		{
-			name:     "a declared pipx package provides no command",
-			probe:    verifyProbe{brokenGlobal: "yamllint"},
-			wantStep: "pipx yamllint",
+			name:     "an arm64 toolchain does not run",
+			probe:    verifyProbe{arch: "arm64", brokenToolchain: "dotnet"},
+			wantStep: "toolchain dotnet",
+		},
+		{
+			// NO RECORD IS NOT "NONE": it is an image no contract-4 build finished.
+			name:     "the image carries no components record",
+			probe:    verifyProbe{noComponentsRecord: true},
+			wantStep: "components",
+		},
+		{
+			name: "a recorded component is missing a driver",
+			probe: verifyProbe{
+				components:           "firefox:140.0.4",
+				missingComponentPath: "/usr/bin/geckodriver",
+			},
+			wantStep: "components",
+		},
+		{
+			name:     "the record names a component billet does not install",
+			probe:    verifyProbe{components: "netscape:4.0"},
+			wantStep: "components",
 		},
 		{
 			// THE BUG THIS WHOLE CHANGE IS ABOUT. The in-build gate asserted this
@@ -610,7 +601,7 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			// THE DAEMON IS UP AND THE JOB CANNOT REACH IT. Every value the other
 			// docker cases assert is correct here; what is missing is the runner
 			// account's membership of the docker group, which no check running as
-			// root can see — and which the in-build gate structurally cannot ask.
+			// root can see.
 			//
 			// THE FAKE SERVES ROOT PERFECTLY, so this case can only fail if the
 			// assertion went through the privilege drop. Asking as root would find a
@@ -682,22 +673,6 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			},
 			wantStep: "entrypoint",
 		},
-		{
-			// A DECLARED LINE THE IMAGE DOES NOT CARRY. The build gate would have
-			// caught this too; what only the artifact can answer is whether the
-			// entry is reachable as the runner account under `env -i`, and this
-			// exercises the same path.
-			name:     "a declared node line is missing",
-			probe:    verifyProbe{fixture: toolcacheFixture{omitNode: firstNodeGlob(t)}},
-			wantStep: "node " + firstNodeGlob(t),
-		},
-		{
-			name: "a per-version JAVA_HOME names nothing",
-			probe: verifyProbe{
-				fixture: toolcacheFixture{versionedJDKPath: "/usr/lib/jvm/nothing"},
-			},
-			wantStep: "JAVA_HOME_" + firstJavaVersion(t) + "_X64",
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -715,6 +690,80 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 					"instead of a console that no longer exists", got, tc.wantStep)
 			}
 		})
+	}
+}
+
+// EACH COMPONENT THE VERIFIER RECOGNISES IS PROVED BY WHAT check-guest-component.sh
+// SAYS IT LEAVES, the list the build's `present` asked: a path one names and the
+// other does not is a component proved on the builder and not on the image, or
+// the reverse.
+func TestTheVerifiersComponentPathsAreTheComponentChecks(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "check-guest-component.sh"))
+	if err != nil {
+		t.Fatalf("read check-guest-component.sh: %v", err)
+	}
+
+	_, body, ok := strings.Cut(string(raw), "\npaths() {\n")
+	if !ok {
+		t.Fatal("check-guest-component.sh defines no paths()")
+	}
+
+	body, _, _ = strings.Cut(body, "\n}\n")
+
+	arm := regexp.MustCompile(`^\t([a-z][a-z-]*)\)`)
+	echo := regexp.MustCompile(`echo "([xd] /[^"]+)"`)
+	want := map[string][]string{}
+	current := ""
+
+	for _, line := range strings.Split(body, "\n") {
+		if m := arm.FindStringSubmatch(line); m != nil {
+			current = m[1]
+		}
+
+		for _, m := range echo.FindAllStringSubmatch(line, -1) {
+			want[current] = append(want[current], m[1])
+		}
+	}
+
+	if len(want) != len(componentPaths) {
+		t.Errorf("check-guest-component.sh lists %d components and the verifier %d", len(want), len(componentPaths))
+	}
+
+	for name, paths := range want {
+		if !slices.Equal(componentPaths[name], paths) {
+			t.Errorf("%s: the verifier checks %q and check-guest-component.sh lists %q",
+				name, componentPaths[name], paths)
+		}
+	}
+}
+
+// THE TOOLCHAINS ARE EACH ARCHITECTURE'S OWN: Haskell on x64 alone, because
+// GitHub's arm64 image has none, and every other one on both.
+func TestTheToolchainsAreEachArchitecturesOwn(t *testing.T) {
+	t.Parallel()
+
+	names := func(arch string) []string {
+		var out []string
+		for _, tc := range toolchainsFor(arch) {
+			out = append(out, tc.name)
+		}
+
+		return out
+	}
+
+	x64, arm := names("x64"), names("arm64")
+
+	if !slices.Contains(x64, "ghc") || slices.Contains(arm, "ghc") {
+		t.Errorf("ghc is asked of x64=%v arm64=%v; GitHub installs it on x64 alone",
+			slices.Contains(x64, "ghc"), slices.Contains(arm, "ghc"))
+	}
+
+	for _, want := range []string{"rustc", "cargo", "swift", "go", "node", "python3", "java", "dotnet", "pwsh"} {
+		if !slices.Contains(x64, want) || !slices.Contains(arm, want) {
+			t.Errorf("%s is not asked of both architectures (x64 %v, arm64 %v)", want, x64, arm)
+		}
 	}
 }
 
@@ -742,10 +791,9 @@ func TestTheReportSurvivesAnUnwritableConsole(t *testing.T) {
 
 // THE SCRIPT FITS IN USER DATA, WITH ROOM.
 //
-// packUserData is the real gate for the builder's script and it is the real gate
-// here too. This one is far smaller — it carries the assertions and none of the
-// installers — and saying so with a number is what turns a future gate that
-// doubles in size into a failing test rather than a launch that AWS refuses.
+// packUserData is the real gate, and saying so with a number is what turns a
+// script that doubles in size into a failing test rather than a launch that AWS
+// refuses.
 func TestTheVerifierScriptIsDeliverable(t *testing.T) {
 	t.Parallel()
 
@@ -769,27 +817,13 @@ func TestTheVerifierScriptIsDeliverable(t *testing.T) {
 				"it should be small enough to read", arch, len(script))
 		}
 
-		// AND IT KEEPS A RESERVE. Most of this script is one line per declared
-		// toolcache version, so it grows when GitHub's declaration does — and the
+		// AND IT KEEPS A RESERVE. The toolcache inventory is one line per tool the
+		// declaration names, so it grows when GitHub's declaration does — and the
 		// failure at the ceiling is not a compile error, it is a launch AWS refuses
-		// with a parameter error naming neither the script nor why. 4 KiB is what
-		// the next several declared lines would cost; the measured size when this
-		// was written was 9418 bytes for x64.
-		// AND WHEN IT FAILS, IT NAMES THE LIKELY CAUSE RATHER THAN THIS FILE. Most
-		// of this script is writeToolcacheGate's output, which is SHARED with the
-		// in-build gate -- so a check added to the declaration two files away lands
-		// here and consumes the reserve, while the failure reads as though
-		// verifyscript.go grew. Measured: the toolchains, the globals and the
-		// PowerShell and Android checks cost 2006 bytes of it.
+		// with a parameter error naming neither the script nor why.
 		if reserve := 4 << 10; len(script) > maxUserData-reserve {
 			t.Errorf("the %s verification script is %d bytes and leaves under %d of EC2's %d "+
-				"limit.\n\nMost of this script is writeToolcacheGate's output, which the "+
-				"in-build gate shares — so the cause is usually a check added there or a "+
-				"section added to the pinned declaration, not a change to verifyscript.go. "+
-				"Either shrink what the gate emits (the billet_need and billet_psmod "+
-				"pattern is ~20 bytes a check against ~105 written out), or stage this "+
-				"script's payload the way the provisioning script's is — noting that it "+
-				"must stay UNCOMPRESSED, because an operator reads it out of "+
+				"limit; it must stay UNCOMPRESSED, because an operator reads it out of "+
 				"describe-instance-attribute exactly when a verification has failed",
 				arch, len(script), reserve, maxUserData)
 		}
@@ -818,93 +852,6 @@ func TestTheVerifierScriptRefusesWhatItCannotWrite(t *testing.T) {
 				t.Errorf("verifyScript accepted arch=%q nonce=%q", tc.arch, tc.nonce)
 			}
 		})
-	}
-}
-
-// firstNodeGlob is the declaration's first node line, so a fixture naming one
-// cannot drift from what the gate checks.
-func firstNodeGlob(t *testing.T) string {
-	t.Helper()
-
-	ts, err := runnerimages.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	for _, e := range ts.Toolcache {
-		if e.Name == "node" && len(e.Versions) > 0 {
-			return e.Versions[0]
-		}
-	}
-
-	t.Fatal("the declaration names no node versions")
-
-	return ""
-}
-
-// ZERO GATE OPTIONS ARE THE BUILD'S BEHAVIOUR, IN BOTH DIRECTIONS.
-//
-// The toolcache gate grew two knobs so the artifact check could run each tool
-// through the runner's privilege drop and name the line it is checking. Neither
-// may touch the in-build script: its compressed size is what decides whether a CA
-// bundle fits at all, and every measurement in this package was taken against
-// exactly those bytes. (Confirmed once by generating the whole provisioning
-// script from this branch and from main and diffing: byte-identical.)
-//
-// BOTH DIRECTIONS, because a step assignment that never emitted anything and a
-// RunPrefix that was ignored would also leave the build alone — and would quietly
-// make the verification's two distinguishing properties decoration.
-func TestZeroGateOptionsLeaveTheBuildScriptAlone(t *testing.T) {
-	t.Parallel()
-
-	build := gateBlock(t, mustScript(t))
-
-	verify, _, err := verifyScript("x64", AMIContract, verifyProbeNonce)
-	if err != nil {
-		t.Fatalf("verifyScript: %v", err)
-	}
-
-	artifact := gateBlock(t, verify)
-
-	// THE INVOCATION LINE IS THE ONE THAT MATTERS. In the build it runs whatever
-	// the builder's root shell can see; in the artifact it goes through the same
-	// setpriv the image's entry point uses.
-	if !strings.Contains(build, "    \"$billet_entry/") {
-		t.Errorf("the in-build gate no longer runs a tool unprefixed:\n%s", build)
-	}
-
-	if strings.Contains(build, verifyRunAsRunner) {
-		t.Errorf("the in-build gate goes through %s; the builder is root with an inherited "+
-			"environment and every measurement here was taken without it", verifyRunAsRunner)
-	}
-
-	if strings.Contains(build, verifyStepVar) {
-		t.Errorf("the in-build gate assigns %s; nothing reads it there and it costs the "+
-			"user-data budget the CA bundle competes for", verifyStepVar)
-	}
-
-	if !strings.Contains(artifact, "    "+verifyRunAsRunner+" \"$billet_entry/") {
-		t.Errorf("the artifact gate does not run its tools as the runner, so it asks the same "+
-			"question the build already asked:\n%s", artifact)
-	}
-
-	// THE LABEL IS COMPUTED NOW, NOT WRITTEN OUT, so this asks for both halves.
-	//
-	// It used to assert `billet_step='node ` -- a literal assignment per call site.
-	// The repeated shape is an emitted function, so the assignment happens once
-	// from its arguments and the call site carries the name and the glob. Either
-	// half alone is satisfiable by an accident: a function that assigns from $1 $2
-	// proves nothing if no call passes a declared line, and a call passing one
-	// proves nothing if the label is never assigned. Together they are the same
-	// property the original asserted -- a failure can say WHICH declared line.
-	if !strings.Contains(artifact, verifyStepVar+"=\"$1 $2\"") {
-		t.Errorf("the artifact gate never assigns %s from the line it was handed, so a "+
-			"failure cannot say which one:\n%s", verifyStepVar, artifact)
-	}
-
-	if !strings.Contains(artifact, "billet_tc node ") {
-		t.Errorf("the artifact gate does not check a declared node line by name, so the "+
-			"label above is assigned from nothing:\n%s", artifact)
 	}
 }
 
@@ -1001,31 +948,20 @@ func TestNothingRunAsTheRunnerIsAShellBuiltin(t *testing.T) {
 		}
 	}
 
-	// THE SITES AT THE TIME OF WRITING: the runner version twice, docker ps, the
-	// toolcache entry, the two JAVA_HOME checks, the toolchains that are not
-	// toolcache entries (cmake, pwsh, dotnet, clang, clang++), the default
-	// runtimes, the globals through billet_need, and the PowerShell modules
-	// through billet_psmod. Asserting the floor rather than the exact number
-	// leaves room for a check to be added without editing a test, while still
-	// refusing a script that dropped the drop entirely.
+	// THE SITES AT THE TIME OF WRITING, ON x64: the runner version twice, docker
+	// ps, the ten toolchains, and fifteen component paths. Asserting the floor
+	// rather than the exact number leaves room for a check to be added without
+	// editing a test, while still refusing a script that dropped the drop.
 	//
 	// THE FLOOR SITS AT THE CURRENT COUNT, not below it. A floor under the real
 	// number lets that many sites be deleted with the test still green, which is
-	// the vacuous-by-emptiness shape the count exists to prevent, arrived at by
-	// neglect rather than design. At the exact count it still permits an addition
-	// -- seventeen is not fewer than sixteen -- and refuses a removal, which is the
-	// asymmetry worth having.
-	//
-	// IT WENT DOWN ONCE, LEGITIMATELY, AND THAT IS WORTH KNOWING BEFORE SOMEBODY
-	// LOWERS IT AGAIN. Compacting the repeated JDK-variable block into one emitted
-	// shell function turned five textual drop sites into one that runs five times:
-	// the same checks, executed the same number of times, through fewer lines. This
-	// counts LINES, so it fell from 21 to 16 while nothing stopped being asked.
-	// Lowering it is correct only alongside a compaction of that kind, and never
-	// because a check was removed.
-	if seen < 16 {
+	// the vacuous-by-emptiness shape the count exists to prevent. It fell from 16
+	// when contract 4 replaced the toolcache gate with the toolchains and the
+	// components; lowering it is correct only when a check moves, never because one
+	// was removed.
+	if seen < 28 {
 		t.Errorf("only %d command(s) go through the privilege drop; the artifact gate's whole "+
 			"point is that a job reaches these as the runner, so a script emitting fewer than "+
-			"sixteen has stopped asking the question rather than passing it", seen)
+			"twenty-eight has stopped asking the question rather than passing it", seen)
 	}
 }

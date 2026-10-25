@@ -57,7 +57,10 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ami build", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	base := fs.String("base-image", "", "AMI to provision from (an EBS-backed Ubuntu 24.04 image)")
-	shape := fs.String("instance-type", "c7i.xlarge", "shape of the BUILDER, not of your jobs")
+	shape := fs.String("instance-type", "",
+		"shape of the BUILDER, not of your jobs; a Nitro shape, whose live console billet "+
+			"reads the build's verdict from (default: "+ec2.DefaultBuilderType("x64")+" for x64, "+
+			ec2.DefaultBuilderType("arm64")+" for arm64)")
 	disk := fs.Int64("builder-disk", 0,
 		"root volume for the BUILDER in GiB, which becomes the image's root (default: "+
 			strconv.Itoa(ec2.DefaultBuilderDiskGiB)+")")
@@ -70,9 +73,8 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	caCert := fs.String("ca-cert", "",
 		"PEM file of CA(s) to trust in the image's host store — the cache endpoint's issuer")
 	payloadBucket := fs.String("payload-bucket", "",
-		"REQUIRED. S3 bucket to stage the shared installers in, fetched by the builder "+
-			"through a presigned URL. They no longer fit EC2's 16 KiB user data and "+
-			"cannot be embedded")
+		"REQUIRED. S3 bucket to stage the build in (GitHub's template, the scripts that "+
+			"run it and billet's layer), fetched by the builder through a presigned URL")
 	deployment := fs.String("deployment", "",
 		"this deployment's identity, which scopes the builder's owner tag so a "+
 			"value-scoped IAM policy admits this build and no other deployment's "+
@@ -121,16 +123,18 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 			"halfway through a build you paid for")
 	}
 
-	// REFUSED HERE, BEFORE A MACHINE IS BOUGHT. Without a bucket the provisioning
-	// script cannot be rendered at all, and finding that out after launching a
-	// builder costs an instance and the time to notice. The reason is arithmetic:
-	// the installers and the pinned declaration are 17077 bytes compressed against
-	// EC2's 16384-byte cap, and parity only grows.
+	// REFUSED HERE, BEFORE A MACHINE IS BOUGHT. The build is GitHub's template and
+	// the scripts that run it, hundreds of kilobytes against EC2's 16384 bytes of
+	// user data, so it is staged in S3 and fetched by a bootstrap.
 	if *payloadBucket == "" {
-		return errors.New("--payload-bucket is required: the shared installers and the " +
-			"pinned declaration no longer compress into EC2's 16 KiB user data, so they " +
-			"are staged in S3 and fetched by a bootstrap. Any bucket the builder's region " +
-			"can reach will do; billet writes one object and deletes it when the build ends")
+		return errors.New("--payload-bucket is required: the build (GitHub's template and " +
+			"the scripts that run it) is far past EC2's 16 KiB of user data, so it is staged " +
+			"in S3 and fetched by a bootstrap. Any bucket the builder's region can reach will " +
+			"do; billet writes one object and deletes it when the build ends")
+	}
+
+	if *shape == "" {
+		*shape = ec2.DefaultBuilderType(*arch)
 	}
 
 	// RESOLVED BEFORE THE CONFIG IS READ OR ANYTHING IS BOUGHT, for the reason the
@@ -155,6 +159,11 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 
 	if *name == "" {
 		*name = "billet-runner-" + time.Now().UTC().Format("20060102-150405")
+	}
+
+	accept, err := amiAccept(env, *cfgPath)
+	if err != nil {
+		return err
 	}
 
 	// READ BEFORE THE BUILD STARTS, so a missing or unreadable file fails now
@@ -204,6 +213,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		RunnerSHA256:       digest,
 		Name:               *name,
 		CACertPEM:          caCertPEM,
+		Accept:             accept,
 		PayloadBucket:      *payloadBucket,
 		Verify:             *verify,
 		VerifyInstanceType: *verifyShape,
@@ -232,6 +242,40 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
 
 	return nil
+}
+
+// amiAccept is the components the image is completed with: what the config's
+// images.accept names, with what the deployment's control plane accepts on a node
+// that has recorded it, by the rule a guest image's completion follows
+// (acceptedComponents).
+//
+// NO CONFIG ACCEPTS NOTHING, and says so: a build run with only --region,
+// --subnet and --security-group has no images.accept to read, and an image
+// without the components is the safe answer to a question nobody was asked.
+func amiAccept(env cli.Env, cfgPath string) ([]string, error) {
+	cfg, err := config.Load(cfgPath)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(env.Stderr, "NOTE: no config at %s, so this image is completed with none of "+
+			"the license-restricted components images.accept names.\n\n", cfgPath)
+
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("--config %s: %w", cfgPath, err)
+	}
+
+	accepted, err := acceptedComponents(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("which components to complete the image with: %w", err)
+	}
+
+	out := make([]string, 0, len(accepted))
+	for _, c := range accepted {
+		out = append(out, string(c))
+	}
+
+	return out, nil
 }
 
 // runnerDigest is the sha256 the build checks the runner tarball against.

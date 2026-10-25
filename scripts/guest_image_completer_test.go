@@ -484,6 +484,20 @@ func TestTheCompletedComponentsAreConfigsList(t *testing.T) {
 	if !slices.Equal(completed, want) {
 		t.Errorf("the completer installs %q, want config's %q", completed, want)
 	}
+	// AND EACH WITH THE SAME INSTALLER, which the AMI build asks
+	// check-guest-component.sh for to learn whether its template offers a component.
+	for _, c := range cases {
+		got, err := exec.CommandContext(t.Context(), "bash", "check-guest-component.sh", "installer", c[1]).Output()
+		if err != nil {
+			t.Fatalf("check-guest-component.sh installer %s: %v", c[1], err)
+		}
+		if strings.TrimSpace(string(got)) != c[2] {
+			t.Errorf("check-guest-component.sh says %s installs with %q, the completer with %q", c[1], got, c[2])
+		}
+	}
+	if err := exec.CommandContext(t.Context(), "bash", "check-guest-component.sh", "installer", "nothing").Run(); err == nil {
+		t.Error("check-guest-component.sh named an installer for a component it does not know")
+	}
 
 	// THE ONE LIST IS check-guest-component.sh's, which the build and the gate read.
 	names, err := exec.CommandContext(t.Context(), "bash", "check-guest-component.sh", "names").Output()
@@ -496,6 +510,12 @@ func TestTheCompletedComponentsAreConfigsList(t *testing.T) {
 	build := readScriptFile(t, "build-guest-image.sh")
 	if !strings.Contains(build, `COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" names`) {
 		t.Error("build-guest-image.sh does not read its components from check-guest-component.sh")
+	}
+	// THE ONE INSTALLER OF THE COMPLETER, which the guest build and the AMI build
+	// both run (ADR-022).
+	installer := readScriptFile(t, filepath.Join("runner-images", "install-completer.sh"))
+	if !strings.Contains(build, `"$SCRIPT_DIR/runner-images/install-completer.sh" "$1" "$TOOLSET_FILE"`) {
+		t.Error("build-guest-image.sh does not install its completer through install-completer.sh")
 	}
 
 	// THE PUBLISHED GUEST'S DIFFERENCES, the x64 guest's: an entry that skips a
@@ -511,8 +531,8 @@ func TestTheCompletedComponentsAreConfigsList(t *testing.T) {
 		if !skipped[script] {
 			t.Errorf("the completer runs %s, which differences.tsv does not skip for #584", script)
 		}
-		if !strings.Contains(build, script) {
-			t.Errorf("build-guest-image.sh does not install %s into the completer", script)
+		if !strings.Contains(installer, script) {
+			t.Errorf("install-completer.sh does not install %s into the completer", script)
 		}
 	}
 	for script := range skipped {

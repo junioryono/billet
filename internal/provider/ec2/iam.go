@@ -160,9 +160,9 @@ func BuilderIAMActions() []string {
 	return []string{IAMCreateImage}
 }
 
-// BuilderVerifyIAMActions is how a build reads the verdict off the image it just
-// made: the verifier instance prints its report to the serial console and billet
-// reads it back. There is no other channel that needs no key pair, no agent and
+// BuilderVerifyIAMActions is how a build reads its verdicts: the builder prints
+// its own to the serial console, and so does the verifier booted from the image it
+// made, and billet reads each back. There is no other channel that needs no key pair, no agent and
 // no inbound access.
 func BuilderVerifyIAMActions() []string {
 	return []string{IAMGetConsoleOutput}

@@ -55,7 +55,7 @@ func TestARealPresignedURLIsFetchable(t *testing.T) {
 	// THE REAL ARCHIVE, not a fixture. Its size and content are what a build
 	// actually stages, so a limit or an encoding problem shows up here rather than
 	// on a builder.
-	body, digest, err := payloadArchive()
+	body, digest, err := payloadArchive(BuildSpec{Arch: "x64", nonce: verifyProbeNonce}, testLayer)
 	if err != nil {
 		t.Fatalf("payloadArchive: %v", err)
 	}

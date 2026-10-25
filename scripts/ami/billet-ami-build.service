@@ -1,0 +1,25 @@
+[Unit]
+Description=billet: build a runner AMI from GitHub's template on this machine
+# AFTER cloud-init's last stage, which starts this unit on the first boot without
+# waiting for it, so the build never competes with cloud-init's own work; and after
+# the network, which every step of GitHub's template downloads over.
+After=network-online.target cloud-final.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/billet-ami/repo/scripts/ami/build-ami.sh run
+# THE BUILD TAKES HOURS, and a start timeout would end it partway.
+TimeoutStartSec=infinity
+# THE JOURNAL, NEVER THE CONSOLE: billet reads the build's verdict off the serial
+# console, and the template's output there could push it out of EC2's 64 KiB tail.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# CLOUD-INIT'S TARGET, NOT multi-user.target. cloud-final.service is ordered after
+# multi-user.target, so a unit that multi-user.target wants and that runs after
+# cloud-final is an ordering cycle, and systemd breaks it by deleting this unit's
+# start job: the boot after the template's reboot ran nothing (measured on real
+# builders, x64 and arm64, 2026-10-25).
+WantedBy=cloud-init.target

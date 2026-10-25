@@ -2,6 +2,7 @@
 #
 # check-guest-component.sh present|absent NAME ROOT
 # check-guest-component.sh names
+# check-guest-component.sh installer NAME
 #
 # THE COMPONENTS BILLET MAY NOT SHIP (#584), and what each one leaves in an image:
 # its paths and the variables it adds to the job's environment. One list, read two
@@ -14,6 +15,8 @@
 #            trial completion asks this of a copy completed with each component,
 #            after GitHub's own tests for it passed.
 #   names    prints the components, one a line.
+#   installer prints GitHub's template step that installs NAME, which the
+#            completer runs; a template that has no such step does not offer NAME.
 #
 # ROOT is a directory holding the image's tree. `present` executes inside it with
 # chroot, so it needs root; `absent` only looks.
@@ -22,12 +25,25 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: check-guest-component.sh present|absent NAME ROOT, or names" >&2
+	echo "usage: check-guest-component.sh present|absent NAME ROOT, names, or installer NAME" >&2
 	exit 2
 }
 
 # THE NAMES ARE config.ImageComponents', which a test holds this list to.
 names() { printf '%s\n' android-sdk codeql firefox google-chrome microsoft-edge; }
+
+# installer prints the template step that installs NAME, the one the completer
+# runs, which a test holds it to.
+installer() {
+	case "$1" in
+	android-sdk) echo install-android-sdk.sh ;;
+	codeql) echo install-codeql-bundle.sh ;;
+	firefox) echo install-firefox.sh ;;
+	google-chrome) echo install-google-chrome.sh ;;
+	microsoft-edge) echo install-microsoft-edge.sh ;;
+	*) return 2 ;;
+	esac
+}
 
 # paths prints what NAME installs, one a line: an executable is marked x, a
 # directory d.
@@ -166,6 +182,14 @@ case "${1:-}" in
 names)
 	[ "$#" -eq 1 ] || usage
 	names
+	exit 0
+	;;
+installer)
+	[ "$#" -eq 2 ] || usage
+	installer "$2" || {
+		echo "check-guest-component.sh: $2 is not a component billet completes" >&2
+		exit 2
+	}
 	exit 0
 	;;
 present | absent)

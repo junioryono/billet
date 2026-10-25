@@ -25,6 +25,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`ClientToken` is durable.**
 - **`TerminateInstances` returns when the request is accepted.**
 - **The AMI is verified by booting it, and the tag is the promotion.**
+- **AMI contract 4 is GitHub's template build with billet's EC2 layer, completed with what `images.accept` names (ADR-022).**
 - **User data is 16384 bytes, gzipped, and `packUserData` is the gate.**
 - **The provisioning script exports `HOME=/root`, because cloud-init runs user data with no HOME.**
 - **The builder checks the runner tarball against the pin before it unpacks it, and an unpinned release needs `--runner-sha256` (#180).**
@@ -54,10 +55,10 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 ## Where the tests are
 
-- `internal/provider/ec2/*_test.go` (`sign_test.go`, `payload_test.go`, `userdata_test.go`, `authorize_test.go`, `build_freespace_test.go`, `toolcache_gate_test.go`, `sqs_test.go`, `reals3_test.go`, `live_test.go`).
+- `internal/provider/ec2/*_test.go` (`sign_test.go`, `payload_test.go`, `userdata_test.go`, `authorize_test.go`, `build_freespace_test.go`, `amibuild_test.go`, `verifyscript_test.go`, `sqs_test.go`, `reals3_test.go`, `live_test.go`); `scripts/ami_build_test.go` executes the builder's own driver.
 - `internal/provider/codebuild/*_test.go` (`harness_test.go`, `api_test.go`, `sweep_test.go`, `buildspec_test.go`, `quota_test.go`, `realcodebuild_test.go`, `realwalk_test.go`).
 - `internal/awssig`, `awsjson`, `awscreds`, `awspolicy`, `awsssm`, `awsquota`, `awssts` tests; `internal/tfpolicy` (drift), `internal/e2e/ec2_test.go`, `codebuild_test.go`, `holdergone_test.go`, `holdergone_live_test.go`; `internal/ops/images/ami_test.go`, `internal/ops/setup/initiam_test.go`, `initiamcodebuild_test.go`, `internal/ops/host/credentialsweep_test.go`; `internal/app/credentialsweep_test.go`.
 
 ## Related skills
 
-`billet-capacity` (shapes, budgets, the fleet claim), `billet-security` (what a build can read), `billet-shell-gates` (the provisioning script and buildspec), `billet-storage-and-cache` (ebs-s3), `billet-infra-terraform-ansible` (the modules and IAM renderings).
+`billet-capacity` (shapes, budgets, the fleet claim), `billet-security` (what a build can read), `billet-shell-gates` (the AMI build and buildspec), `billet-storage-and-cache` (ebs-s3), `billet-infra-terraform-ansible` (the modules and IAM renderings).

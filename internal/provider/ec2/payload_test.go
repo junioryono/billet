@@ -65,9 +65,9 @@ func TestStagingWorksThroughAProviderRatherThanALiteral(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	spec := BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, PayloadBucket: "billet-payload-test", Arch: "x64"}
+	spec := BuildSpec{nonce: verifyProbeNonce, PayloadBucket: "billet-payload-test", Arch: "x64"}
 
-	key, cleanup, err := p.stagePayload(t.Context(), &spec)
+	key, cleanup, err := p.stagePayload(t.Context(), &spec, testLayer)
 	if err != nil {
 		t.Fatalf("stagePayload through a Provider: %v", err)
 	}
@@ -129,10 +129,10 @@ func TestTwoBuildsDoNotShareOnePayloadObject(t *testing.T) {
 
 	// THE SAME PAYLOAD, TWICE. payloadArchive is deterministic, so both stagings
 	// produce one digest and the digest cannot be what separates them.
-	first := BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, PayloadBucket: "billet-payload-test", Arch: "x64"}
-	second := BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, PayloadBucket: "billet-payload-test", Arch: "x64"}
+	first := BuildSpec{nonce: verifyProbeNonce, PayloadBucket: "billet-payload-test", Arch: "x64"}
+	second := BuildSpec{nonce: verifyProbeNonce, PayloadBucket: "billet-payload-test", Arch: "x64"}
 
-	keyA, cleanupA, err := p.stagePayload(t.Context(), &first)
+	keyA, cleanupA, err := p.stagePayload(t.Context(), &first, testLayer)
 	if err != nil {
 		t.Fatalf("stage the first payload: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestTwoBuildsDoNotShareOnePayloadObject(t *testing.T) {
 		}
 	})
 
-	keyB, cleanupB, err := p.stagePayload(t.Context(), &second)
+	keyB, cleanupB, err := p.stagePayload(t.Context(), &second, testLayer)
 	if err != nil {
 		t.Fatalf("stage the second payload: %v", err)
 	}
@@ -205,9 +205,9 @@ func TestAnAmbiguousUploadIsStillCleanedUp(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	p := stagingProvider(t, srv)
-	spec := BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, PayloadBucket: "billet-payload-test", Arch: "x64"}
+	spec := BuildSpec{nonce: verifyProbeNonce, PayloadBucket: "billet-payload-test", Arch: "x64"}
 
-	if _, _, err := p.stagePayload(t.Context(), &spec); err == nil {
+	if _, _, err := p.stagePayload(t.Context(), &spec, testLayer); err == nil {
 		t.Fatal("a 500 from the upload was reported as a successful staging")
 	}
 

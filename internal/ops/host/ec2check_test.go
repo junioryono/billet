@@ -228,7 +228,8 @@ func fakeEC2With(t *testing.T, topo fakeEC2Topology) string {
 			}
 			tags := `<tagSet><item><key>sh.billet.ami-contract</key><value>` +
 				strconv.Itoa(ec2.AMIContract) + `</value></item>` +
-				`<item><key>sh.billet.built-by</key><value>v9.9.9-test</value></item></tagSet>`
+				`<item><key>sh.billet.built-by</key><value>v9.9.9-test</value></item>` +
+				`<item><key>sh.billet.components</key><value>firefox:140.0.4</value></item></tagSet>`
 			if topo.untaggedImage {
 				tags = ""
 			}
@@ -584,8 +585,9 @@ func TestPreflightReportsTierImages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight with an available image failed: %v", err)
 	}
-	if !strings.Contains(out, "ami-good available (AMI contract ") {
-		t.Errorf("an available AMI was not reported ok:\n%s", out)
+	if !strings.Contains(out, "ami-good available (AMI contract "+strconv.Itoa(ec2.AMIContract)+
+		`, completed with "firefox:140.0.4")`) {
+		t.Errorf("an available AMI was not reported ok with what it was completed with:\n%s", out)
 	}
 
 	// A not-built AMI is a warning, not an error.
@@ -1457,7 +1459,8 @@ func TestAnImageBelowTheContractIsReported(t *testing.T) {
 
 	// EVERY GAP AN UNSTAMPED IMAGE MAY HAVE, the credential exposure among them:
 	// naming only one would present the others as absent.
-	for _, want := range []string{"containerd one", "carries no toolcache", "in an argument list"} {
+	for _, want := range []string{"containerd one", "carries no toolcache", "in an argument list",
+		"rather than GitHub's template"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the report for an unstamped image does not name %q:\n%s", want, out)
 		}

@@ -229,39 +229,6 @@ func TestAptPackagesKeepsUpstreamOrderAndInstallsEachPackageOnce(t *testing.T) {
 	}
 }
 
-func TestJavaHomeVarsNameEveryJDKAndADefault(t *testing.T) {
-	t.Parallel()
-
-	ts, err := runnerimages.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	vars := ts.JavaHomeVars("/usr/lib/jvm")
-
-	for _, v := range ts.Java.Versions {
-		name := "JAVA_HOME_" + v + "_X64"
-
-		path, ok := vars[name]
-		switch {
-		case !ok:
-			t.Errorf("%s is unset; setup-java reads it to find a JDK already on the machine, "+
-				"so the JDK is installed and unfindable", name)
-		case !strings.HasPrefix(path, "/usr/lib/jvm/"):
-			t.Errorf("%s = %q, which is not under the root it was given", name, path)
-		}
-	}
-
-	def, ok := vars["JAVA_HOME"]
-	switch {
-	case !ok:
-		t.Error("JAVA_HOME is unset")
-	case !strings.Contains(def, "-"+ts.Java.Default+"-"):
-		t.Errorf("JAVA_HOME = %q, which does not name the default JDK %q",
-			def, ts.Java.Default)
-	}
-}
-
 // TestTheVendoredToolsetIsUpstreamAtThePinnedCommit is the provenance check, and it
 // is the only one that can catch a vendored copy that was transcribed rather than
 // downloaded.

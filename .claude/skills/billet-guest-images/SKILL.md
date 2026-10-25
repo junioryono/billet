@@ -7,7 +7,7 @@ description: "Load when touching the vendored runner-images template or its nspa
 
 ## What this area is
 
-A Firecracker job boots a golden image: an Ubuntu 24.04 rootfs with Docker, the Actions runner and a small agent that reads its registration from the metadata service. It lives in Ceph as an RBD image with immutable snapshots called generations, and every job gets a copy-on-write clone. billet builds it once, centrally (`.github/workflows/guest-image.yml`, weekly), signs the manifest with Sigstore, publishes a dated `guest-YYYYMMDD-HHMMSS` prerelease and advances a signed pointer on the `release-channel` branch; a deployment pulls it with `billet images pull`. The EC2 backend boots an AMI built by `billet ami build` from the same declaration. `scripts/runner-images` vendors GitHub's `actions/runner-images` tree at one commit and the guest build runs it; `internal/runnerimages` vendors GitHub's `toolset-2404.json` and the EC2 toolcache installer; `internal/imagesource` fetches and verifies; `internal/runnerrelease` knows which `actions/runner` is installed and how close to refusal it is. `docs/reference/decisions/adr-005-runner-image-parity.md` records what parity costs.
+A Firecracker job boots a golden image: an Ubuntu 24.04 rootfs with Docker, the Actions runner and a small agent that reads its registration from the metadata service. It lives in Ceph as an RBD image with immutable snapshots called generations, and every job gets a copy-on-write clone. billet builds it once, centrally (`.github/workflows/guest-image.yml`, weekly), signs the manifest with Sigstore, publishes a dated `guest-YYYYMMDD-HHMMSS` prerelease and advances a signed pointer on the `release-channel` branch; a deployment pulls it with `billet images pull`. The EC2 backend boots an AMI `billet ami build` makes by running the same template on an EC2 builder (ADR-022). `scripts/runner-images` vendors GitHub's `actions/runner-images` tree at one commit and the guest build runs it; `internal/runnerimages` vendors GitHub's `toolset-2404.json` and `toolset-2404-arm64.json`; `internal/imagesource` fetches and verifies; `internal/runnerrelease` knows which `actions/runner` is installed and how close to refusal it is. `docs/reference/decisions/adr-005-runner-image-parity.md` records what parity costs.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -44,7 +44,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`billet check` describes each tier's generation against `images.accept`, and an image that needs a newer billet says so (#584).**
 - **A license accepted in the control plane's `images.accept` reaches every node at registration, and either list accepts (#584).**
 - **A per-node rebuild timer is gone on purpose.**
-- **The AMI is the same contract on the other backend.**
+- **The AMI is the same build on the other backend (ADR-022).**
 
 ### The runner-release deadline: [references/runner-deadline.md](references/runner-deadline.md)
 
