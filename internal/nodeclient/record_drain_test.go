@@ -120,8 +120,14 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 				})
 			}()
 
+			// RECOVERY IS RELEASED ONCE, by the test or by its cleanup: a test
+			// failing before it releases it would otherwise leave the stop's own
+			// recovery waiting at the gate, and the cleanup waiting on the loop.
+			releaseRecovery := sync.OnceFunc(func() { close(compute.recoverGate) })
+
 			t.Cleanup(func() {
 				cancel()
+				releaseRecovery()
 				compute.setHolding(false)
 				<-loopDone
 			})
@@ -144,7 +150,7 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			}
 
 			cancel()
-			close(compute.recoverGate)
+			releaseRecovery()
 
 			// The drain's first poll waits at the gate.
 			waitFor(t, func() bool { return h.count(pollPath) > polls })

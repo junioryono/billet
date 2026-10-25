@@ -38,6 +38,9 @@ type controller struct {
 	// unavailable, when it returns true for a request, answers 503, as a
 	// controller whose ledger blinked does.
 	unavailable func(path string, n int) bool
+	// supersede, when it returns true for a request, answers that another
+	// process has registered as this node.
+	supersede func(path string, n int) bool
 }
 
 func newController(t *testing.T) *controller {
@@ -59,8 +62,19 @@ func newController(t *testing.T) *controller {
 		c.mu.Lock()
 		c.requests[r.URL.Path]++
 		n := c.requests[r.URL.Path]
-		drop, unavailable := c.drop, c.unavailable
+		drop, unavailable, supersede := c.drop, c.unavailable, c.supersede
 		c.mu.Unlock()
+
+		if supersede != nil && supersede(r.URL.Path, n) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+
+			_ = json.NewEncoder(w).Encode(nodeapi.ErrorResponse{ //nolint:errcheck // the test's own server
+				Code: nodeapi.CodeSuperseded, Message: "another process is this node",
+			})
+
+			return
+		}
 
 		if unavailable != nil && unavailable(r.URL.Path, n) {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -552,6 +566,39 @@ func TestADrainRecoveringAcrossAFailoverRegistersWithTheOther(t *testing.T) {
 	}
 }
 
+// A RECOVERY SUPERSEDED BEFORE A DRAIN STOPS ASKING. Another process took this
+// node's name while this one was still recovering, and the recovery a
+// requested drain insists on stops at that verdict: asking again would be
+// refused for as long as the drain lasted, and registering again would take
+// the name back from the host that holds it.
+func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
+	t.Parallel()
+
+	a := newController(t)
+
+	const launched = "/v1/nodes/n1/launched"
+
+	a.mu.Lock()
+	a.supersede = func(path string, _ int) bool { return path == launched }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	cancel, done := runDraining(t, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c})
+
+	waitFor(t, func() bool { return a.sent(launched) >= 2 })
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the stop was still recovering 10s after it was superseded; it asked %d times", a.sent(launched))
+	}
+}
+
 // A DRAIN THAT LOSES ITS CONTROLLER IS SERVED BY THE OTHER. The node is
 // draining compute that is still running, which only a destroy from the control
 // plane ends, so it keeps polling; A goes, and the drain registers with B and
@@ -628,14 +675,20 @@ func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 
 	b := newController(t)
 
+	addrs := []string{deadAddress(t), strings.TrimPrefix(b.srv.URL, "http://")}
+
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
-		{Base: "http://" + deadAddress(t)}, {Base: b.srv.URL},
+		{Base: "http://" + addrs[0]}, {Base: "http://" + addrs[1]},
 	}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	dialled := make([]atomic.Int32, c.Controllers())
+	// WHERE EACH CONTROLLER'S DIALER DIALLED, by the controller's index.
+	var (
+		mu      sync.Mutex
+		dialled = map[int][]string{}
+	)
 
 	// THE DIALER EACH CONTROLLER'S TRANSPORT DIALS WITH, as the client built it.
 	for i := range c.Controllers() {
@@ -665,8 +718,10 @@ func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 
 		// MARKED, so the requests below can show this is the dialer they use:
 		// the transport holds a method of this same dialer, not a copy of it.
-		d.Control = func(string, string, syscall.RawConn) error {
-			dialled[i].Add(1)
+		d.Control = func(_, address string, _ syscall.RawConn) error {
+			mu.Lock()
+			dialled[i] = append(dialled[i], address)
+			mu.Unlock()
 
 			return nil
 		}
@@ -677,9 +732,18 @@ func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	for i := range dialled {
-		if dialled[i].Load() == 0 {
+	mu.Lock()
+	defer mu.Unlock()
+
+	for i, addr := range addrs {
+		if len(dialled[i]) == 0 {
 			t.Fatalf("controller %d was dialled without the dialer inspected above", i)
+		}
+
+		for _, got := range dialled[i] {
+			if got != addr {
+				t.Fatalf("controller %d's dialer dialled %s, want only its own controller %s", i, got, addr)
+			}
 		}
 	}
 }

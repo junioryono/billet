@@ -1070,6 +1070,18 @@ func recoverBeforeDrain(
 			return true
 		}
 
+		// SUPERSEDED IS A VERDICT, NOT AN OUTAGE. Another process holds this
+		// name, so registering again would take it back from the host that has
+		// it, and asking again would be refused for as long as the drain lasts.
+		// This process never learned what its host runs; the drain that follows
+		// meets the same verdict at its poll and hands its custody over.
+		if errors.Is(err, ErrSuperseded) {
+			log.Warn("another process registered as this node before this one knew what its host "+
+				"runs; not recovering further", "error", err)
+
+			return false
+		}
+
 		lost = c.Controllers() > 1 && errors.Is(err, errNoAnswer)
 
 		if attempts > 0 && attempt >= attempts {
