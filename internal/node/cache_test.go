@@ -52,8 +52,10 @@ type fakeCacheStore struct {
 	// left before its deadline.
 	createBudgets []time.Duration
 	cloneBudgets  []time.Duration
-	// discardContextErrs is what each Discard's context said when it was
-	// called: a cleanup handed a context that had already ended does nothing.
+	// discardDelay is how long each Discard works, and discardContextErrs what
+	// its context said once that work was done: a cleanup whose context ended
+	// part-way did not finish.
+	discardDelay       time.Duration
 	discardContextErrs []error
 	snapshotVolumes    []storecontract.Volume
 	snapshotErr        error
@@ -322,6 +324,7 @@ func (f *fakeCacheStore) ReleaseWriter(
 func (f *fakeCacheStore) Discard(ctx context.Context, volume storecontract.Volume) error {
 	f.discarded++
 	f.discardedVolumes = append(f.discardedVolumes, volume)
+	time.Sleep(f.discardDelay)
 	f.discardContextErrs = append(f.discardContextErrs, ctx.Err())
 	if f.discardFailures > 0 {
 		f.discardFailures--
@@ -716,6 +719,20 @@ func TestADockerStoreAttachCutShortKeepsItsVolumeInCustody(t *testing.T) {
 				again.Code, again.Body.String())
 		}
 
+		// NOTHING WAITS TO SETTLE IT. The guest never mounted the store, so it
+		// will never prove it quiesced; a settlement that waited for that held
+		// the job's teardown for the whole settle window.
+		settling := time.Now()
+		if err := service.SettleDocker(t.Context(), "billet-one", true); err != nil {
+			t.Fatalf("SettleDocker: %v", err)
+		}
+		if waited := time.Since(settling); waited != 0 {
+			t.Fatalf("the settlement of a store the guest never mounted waited %s", waited)
+		}
+		if storage.published != 0 {
+			t.Fatalf("a store the guest never mounted was published %d time(s)", storage.published)
+		}
+
 		if err := service.Cleanup(t.Context(), "billet-one"); err != nil {
 			t.Fatalf("Cleanup: %v", err)
 		}
@@ -725,22 +742,65 @@ func TestADockerStoreAttachCutShortKeepsItsVolumeInCustody(t *testing.T) {
 	})
 }
 
-// A DEFINITE ATTACH FAILURE IS CLEANED UP AT ONCE, AND THE GUEST HANGING UP
-// DOES NOT STOP IT. The guest stops waiting just past the request's bound, which
-// cancels the request's context; a detach still running then must finish, or
-// the clone stays attached to a guest that went cold.
-func TestADockerStoreCleanupOutlivesTheGuestHangingUp(t *testing.T) {
+// AN ATTACH THAT FAILED OUTRIGHT IS NO MORE PROOF THAN ONE CUT SHORT. EC2's
+// own timeouts and describes can fail after it accepted the attach, so the
+// volume stays in custody, the guest is answered at once, and the session's
+// cleanup is what discards it.
+func TestAFailedDockerStoreAttachKeepsItsVolumeInCustody(t *testing.T) {
 	t.Parallel()
 
+	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{attachErr: errors.New("the VMM refused the drive")}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, attacher, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"})
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Docker store status = %d, want the cold 503: %s", response.Code, response.Body.String())
+	}
+	if len(attacher.attached) != 1 || len(attacher.detached) != 0 || storage.discarded != 0 {
+		t.Fatalf("attached %d, detached %d, discarded %d: want one failed attach and the volume kept",
+			len(attacher.attached), len(attacher.detached), storage.discarded)
+	}
+	if readiness := cacheRequest(t, service, credentials.Token, "/v1/docker-store/ready", map[string]any{
+		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+	}); readiness.Code != http.StatusNotFound {
+		t.Fatalf("readiness for a store the guest never mounted = %d, want 404: %s",
+			readiness.Code, readiness.Body.String())
+	}
+
+	if err := service.Cleanup(t.Context(), "billet-one"); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if storage.discarded != 1 {
+		t.Fatalf("the session's cleanup discarded %d volume(s), want the one it kept", storage.discarded)
+	}
+}
+
+// THE ONE CLEANUP LEFT IN THE HANDLER OUTLIVES THE GUEST HANGING UP. A clone
+// the session could not record is discarded before the answer, and the guest
+// stops waiting twenty seconds past the request's bound, which ends the
+// request's context; a discard cancelled with it leaves a volume nothing
+// records.
+func TestADockerStoreDiscardOutlivesTheGuestHangingUp(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a directory without write permission, so the session cannot be made to fail to persist")
+	}
+
 	synctest.Test(t, func(t *testing.T) {
-		storage := &fakeCacheStore{}
-		attacher := &fakeVolumeAttacher{
-			attachDelay: dockerStoreRequestLimit - 10*time.Second,
-			attachErr:   errors.New("the VMM refused the drive"),
-			detachDelay: time.Minute,
-		}
-		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
-			storage, attacher, slog.New(slog.DiscardHandler))
+		storage := &fakeCacheStore{discardDelay: time.Minute}
+		stateDir := t.TempDir()
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
+			storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
 		if err != nil {
 			t.Fatalf("NewCacheService: %v", err)
 		}
@@ -748,9 +808,19 @@ func TestADockerStoreCleanupOutlivesTheGuestHangingUp(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
+		// THE SESSION CAN NO LONGER BE PERSISTED, so the clone is discarded.
+		sessions := filepath.Join(stateDir, cacheSessionDirectory)
+		if err := os.Chmod(sessions, 0o500); err != nil {
+			t.Fatalf("make the session directory read-only: %v", err)
+		}
+		t.Cleanup(func() {
+			// Writable again, or the temporary directory cannot be removed.
+			if err := os.Chmod(sessions, 0o700); err != nil {
+				t.Errorf("make the session directory writable again: %v", err)
+			}
+		})
 
-		// The guest's curl gives up at 260 s, inside the minute-long detach.
-		guest, hangUp := context.WithTimeout(t.Context(), 260*time.Second)
+		guest, hangUp := context.WithTimeout(t.Context(), 10*time.Second)
 		defer hangUp()
 		response := cacheRequestWithin(t, guest, service, credentials.Token, "/v1/docker-store",
 			map[string]any{"architecture": "amd64"})
@@ -758,18 +828,11 @@ func TestADockerStoreCleanupOutlivesTheGuestHangingUp(t *testing.T) {
 			t.Fatalf("Docker store status = %d, want the cold 503: %s", response.Code, response.Body.String())
 		}
 		if guest.Err() == nil {
-			t.Fatal("the guest had not hung up by the time the cleanup ended, so this staged nothing")
-		}
-		if len(attacher.detachContextErrs) != 1 || attacher.detachContextErrs[0] != nil {
-			t.Fatalf("the detach finished on a context that said %v, want one still live", attacher.detachContextErrs)
+			t.Fatal("the guest had not hung up by the time the discard ended, so this staged nothing")
 		}
 		if storage.discarded != 1 || storage.discardContextErrs[0] != nil {
-			t.Fatalf("discarded %d volume(s) with context errors %v, want 1 on a live context",
+			t.Fatalf("discarded %d volume(s) with context errors %v, want 1 finished on a live context",
 				storage.discarded, storage.discardContextErrs)
-		}
-		if again := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
-			map[string]any{"architecture": "amd64"}); again.Code == http.StatusConflict {
-			t.Fatalf("the slot was not freed after a cleanup that succeeded: %s", again.Body.String())
 		}
 	})
 }

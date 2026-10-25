@@ -52,23 +52,23 @@ All 26 fell between 2026-10-23 20:27Z and 2026-10-24 13:50Z. In those same hours
 - the acquisition, which keeps its three-minute bound but gets no more than what is left of the four;
 - the attach, which on EC2 waits for AWS to report the volume attached.
 
-**After a failure:**
-- **An attach that four minutes cut short** is not known to have failed (EC2 can complete an attachment it accepted), so the node answers at once and does not race it with a detach. The volume stays in the session's custody, and the session's cleanup discards it once the compute is proved gone.
-- **A definite failure** is detached and discarded before the answer, on a context the guest hanging up cannot cancel. Before this change the cleanup inherited the guest's connection, which the guest now closes twenty seconds after the node's bound.
+**A failed attach keeps its volume.** This includes an attach the four minutes cut short. Nothing proves such an attach left the volume free: EC2 can complete an attachment it accepted after billet stopped waiting, its own timeouts and describe calls can fail after it did, and its describes are eventually consistent. So the node answers at once and does not race the attach with a detach. The volume stays in the session's custody, marked as never mounted, so no settlement waits for a readiness proof the cold guest will never send. The session's cleanup discards it once the compute is proved gone.
+
+**A clone the session could not record** is discarded before the answer, on a context the guest hanging up cannot cancel. Before this change the cleanup inherited the guest's connection, which the guest now closes twenty seconds after the node's bound.
 
 **The guest waits 260 seconds for the answer** (`internal/guestassets/docker-cache.sh`), twenty seconds past the node's bound, and then pulls cold. `TestTheGuestWaitsJustPastTheNodesDockerStoreBound` executes the guest's script to hold the two numbers together.
 
-**So what holds the runner back before Docker starts is:**
+**So the waits the agent can spend before Docker starts are:**
 - that request, at most 260 seconds;
 - then the wait for the device, at most 100 seconds, which is EC2's udev link (a Firecracker slot's device exists from boot);
 - and, only on a path where the store arrived but cannot be used, one discard call of at most 120 seconds.
 
-That is at most eight minutes in the worst case, against about seventeen before (780, 100 and 120 seconds). The common case is the table's first row.
+Those explicit waits add up to eight minutes at most, against about seventeen before (780, 100 and 120 seconds). On top of them come the filesystem check, the mount and Docker's own start, none of which has a deadline of its own. The common case is the table's first row.
 
 **Each attach is logged with how long the whole request took:** `attached a Docker image store … cache=warm took=…`. The warnings for a store that was unavailable carry `took` too. The next measurement is therefore a `journalctl` query on the node, not a ledger query.
 
 **Older and newer pieces together:**
-- **An image built before this change** still waits 780 seconds. A newer node answers it at its four-minute bound, or after a definite failure's cleanup.
+- **An image built before this change** still waits 780 seconds. A newer node answers it within its four-minute bound.
 - **A node older than this change** keeps its twelve-minute handler. A newer image hangs up on it at 260 seconds, which cancels that node's request mid-way. Whatever its session had recorded, the session's teardown discards.
 
 ## What this does not establish
