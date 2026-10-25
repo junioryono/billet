@@ -241,6 +241,35 @@ func (q *Queries) ListContributingNodes(ctx context.Context) ([]ListContributing
 	return items, nil
 }
 
+const listLiveNodeNames = `-- name: ListLiveNodeNames :many
+SELECT name FROM nodes WHERE live = 1 ORDER BY name
+`
+
+// Every host still in contact, draining or not: where a lease counts toward
+// its tier's floor (CountOpenPerTierOnLiveHosts says why a draining one does).
+func (q *Queries) ListLiveNodeNames(ctx context.Context) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listLiveNodeNames)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		items = append(items, name)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listNodeRegistrations = `-- name: ListNodeRegistrations :many
 SELECT name, live, epoch, incarnation, node_release, node_digest, highest_release
   FROM nodes
@@ -883,38 +912,51 @@ func (q *Queries) UpsertNodeRegistration(ctx context.Context, arg UpsertNodeRegi
 	return epoch, err
 }
 
-const usageByNode = `-- name: UsageByNode :many
+const usageByNodeAndTier = `-- name: UsageByNodeAndTier :many
 SELECT COALESCE(node, target_node, '') AS node,
+       tier,
        CAST(COALESCE(SUM(vcpu), 0) AS BIGINT) AS vcpu,
        CAST(COALESCE(SUM(memory), 0) AS BIGINT) AS memory,
-       CAST(COALESCE(SUM(macos_slot), 0) AS BIGINT) AS macos_slots
+       CAST(COALESCE(SUM(macos_slot), 0) AS BIGINT) AS macos_slots,
+       CAST(COUNT(*) AS BIGINT) AS leases
   FROM leases
  WHERE phase NOT IN ('done','failed')
- GROUP BY COALESCE(node, target_node, '')
+ GROUP BY COALESCE(node, target_node, ''), tier
 `
 
-type UsageByNodeRow struct {
+type UsageByNodeAndTierRow struct {
 	Node       string
+	Tier       string
 	Vcpu       int64
 	Memory     int64
 	MacosSlots int64
+	Leases     int64
 }
 
-// Every host's committed capacity, keyed the way a lease is attributed.
-func (q *Queries) UsageByNode(ctx context.Context) ([]UsageByNodeRow, error) {
-	rows, err := q.db.QueryContext(ctx, usageByNode)
+// Every host's committed capacity, by tier, keyed the way a lease is
+// attributed, and how many leases each tier holds there.
+//
+// BY TIER AS WELL AS BY HOST, because a purchase needs both from the same open
+// leases: what each host has left, and what each tier holds toward its floor
+// (internal/alloc fleet.floorLeases). Two aggregations were two passes over
+// every open lease inside the purchase's write transaction, a quarter of its
+// time each at 4,096 leases (2026-10-25).
+func (q *Queries) UsageByNodeAndTier(ctx context.Context) ([]UsageByNodeAndTierRow, error) {
+	rows, err := q.db.QueryContext(ctx, usageByNodeAndTier)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []UsageByNodeRow
+	var items []UsageByNodeAndTierRow
 	for rows.Next() {
-		var i UsageByNodeRow
+		var i UsageByNodeAndTierRow
 		if err := rows.Scan(
 			&i.Node,
+			&i.Tier,
 			&i.Vcpu,
 			&i.Memory,
 			&i.MacosSlots,
+			&i.Leases,
 		); err != nil {
 			return nil, err
 		}

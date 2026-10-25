@@ -52,7 +52,7 @@ func (a *Allocator) reserveFloors(
 		return held, nil
 	}
 
-	open, err := a.countFloorLeasesPerTier(ctx, tx)
+	open, err := free.floorLeases(ctx, tx, a)
 	if err != nil {
 		return floorCharge{}, err
 	}
