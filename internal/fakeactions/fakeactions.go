@@ -338,7 +338,9 @@ func JitConfigJSON(runnerID int, name, encoded string) map[string]any {
 // other message does. A zero field leaves JobJSON's value in place.
 type JobFields struct {
 	Owner, Repository, WorkflowRef, JobID string
-	RunID                                 int64
+	// Name is the job's display name, which JobJSON otherwise fixes.
+	Name  string
+	RunID int64
 	// RunnerID and RunnerName identify the pool member, and Result is GitHub's
 	// conclusion. All three are read only from started and completed messages.
 	RunnerID   int64
@@ -365,6 +367,10 @@ func (f JobFields) Apply(job map[string]any) map[string]any {
 
 	if f.JobID != "" {
 		job["jobId"] = f.JobID
+	}
+
+	if f.Name != "" {
+		job["jobDisplayName"] = f.Name
 	}
 
 	if f.RunID != 0 {

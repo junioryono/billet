@@ -177,6 +177,10 @@ type plane struct {
 	// declinedThenRun counts assignments acknowledged with no runner minted for
 	// them that a later runner took: work billet declined and ran once it could.
 	declinedThenRun int
+	// declined counts, per tier, the purchases billet refused: an offer it
+	// acknowledged without acquiring, or a direct assignment it acknowledged
+	// with no runner minted for it. Each is work that waited on.
+	declined map[string]int
 }
 
 var (
@@ -202,6 +206,7 @@ func newPlane(t *testing.T, clock *Clock, fleet Fleet, trace Trace) *plane {
 		runners:     map[string]*runner{},
 		runnersByID: map[int64]*runner{},
 		nextRunner:  1000,
+		declined:    map[string]int{},
 	}
 	p.cond = sync.NewCond(&p.mu)
 
@@ -976,7 +981,16 @@ func (p *plane) ack(w http.ResponseWriter, s *scaleSet, msgID int) {
 	}
 
 	// An assignment the message carried and nothing minted for waits for the
-	// next runner on the set.
+	// next runner on the set, and an offer it carried that billet did not
+	// acquire waits at GitHub: each a purchase billet refused.
+	p.declined[s.name] += len(s.inflight)
+
+	for _, id := range s.queue[0].offered {
+		if _, waiting := s.available[id]; waiting {
+			p.declined[s.name]++
+		}
+	}
+
 	s.unpaired = append(s.unpaired, s.inflight...)
 	s.inflight = nil
 	s.queue = s.queue[1:]
@@ -999,11 +1013,19 @@ func (p *plane) pushLocked(s *scaleSet, assigned, offered []int64, jobs ...map[s
 }
 
 // jobJSON is one job entry with the trace's own facts on it.
+//
+// GITHUB'S QUEUE TIME IS THE ARRIVAL, on every message. A deployment reads it
+// from GitHub's REST record of the run (#582), which the scripted service does
+// not serve; carried on the message, it lands in the same column, so a
+// replayed deployment's ledger holds the arrival a trace exported from it
+// (billet jobs export) reads back.
 func (p *plane) jobJSON(kind string, a Arrival, fields fakeactions.JobFields) map[string]any {
 	fields.Owner = a.Owner
 	fields.Repository = a.Repository
 	fields.WorkflowRef = a.WorkflowRef
 	fields.RunID = a.RunID
+	fields.Name = a.Job
+	fields.QueuedAt = a.At
 
 	// UNDER DIRECT ASSIGNMENT NO RUNNER REQUEST ID, as on GitHub.com: the job
 	// is named by its own id, and billet gives it an identity of its own.

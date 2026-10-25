@@ -186,3 +186,71 @@ func TestAFleetMustDeclareEveryTierTheTraceUses(t *testing.T) {
 		t.Fatalf("a fleet without the trace's tier was accepted, or the refusal did not name it: %v", err)
 	}
 }
+
+// THE ADVERSARIAL GENERATORS HAVE THEIR SHAPES, and one seed is one trace.
+func TestTheAdversarialGeneratorsHaveTheirShapes(t *testing.T) {
+	t.Parallel()
+
+	within := func(name string, trace Trace, d time.Duration) {
+		t.Helper()
+
+		first, last := trace.Arrivals[0].At, trace.Arrivals[len(trace.Arrivals)-1].At
+		if last.Sub(first) > d {
+			t.Errorf("%s spreads its jobs over %s; want them within %s", name, last.Sub(first), d)
+		}
+	}
+
+	within("Burst", Burst(1, Params{Jobs: 50}), 10*time.Second)
+	within("IdleBacklog", IdleBacklog(1, Params{Jobs: 50}), 30*time.Second)
+
+	quiet := QuietBesideSaturated(1, Params{Jobs: 50, Tiers: []string{"busy", "quiet"}})
+	counts := map[string]int{}
+	for _, a := range quiet.Arrivals {
+		counts[a.Tier]++
+	}
+
+	if counts["busy"] != 45 || counts["quiet"] != 5 {
+		t.Errorf("QuietBesideSaturated put %v on its tiers; want 45 busy and 5 quiet", counts)
+	}
+
+	// THE WIDE MIX OFFERS ABOUT ITS LOAD: the vCPU-time its jobs ask for over
+	// the room times the span they arrive in, near 0.85, and about one job in
+	// twenty of the whole-host shape.
+	fleet := WideFleet()
+	wide := WideShapeMix(1, WideParams{Params: Params{Jobs: 2000}, Fleet: fleet})
+
+	vcpuOf := map[string]int{}
+	for _, s := range fleet.Tiers {
+		vcpuOf[s.Label] = s.VCPU
+	}
+
+	asked, widest := 0.0, 0
+	for _, a := range wide.Arrivals {
+		asked += float64(vcpuOf[a.Tier]) * time.Duration(a.Duration).Seconds()
+		if a.Tier == "billet-32vcpu" {
+			widest++
+		}
+	}
+
+	span := wide.Arrivals[len(wide.Arrivals)-1].At.Sub(wide.Arrivals[0].At).Seconds()
+	if load := asked / (128 * span); load < 0.7 || load > 1.0 {
+		t.Errorf("WideShapeMix offers a load of %.2f; want about 0.85", load)
+	}
+
+	if share := float64(widest) / 2000; share < 0.03 || share > 0.07 {
+		t.Errorf("WideShapeMix made %.3f of its jobs whole-host; want about 0.05", share)
+	}
+
+	for name, gen := range map[string]func(uint64) Trace{
+		"Burst":                func(s uint64) Trace { return Burst(s, Params{Jobs: 20}) },
+		"IdleBacklog":          func(s uint64) Trace { return IdleBacklog(s, Params{Jobs: 20}) },
+		"QuietBesideSaturated": func(s uint64) Trace { return QuietBesideSaturated(s, Params{Jobs: 20}) },
+		"WideShapeMix": func(s uint64) Trace {
+			return WideShapeMix(s, WideParams{Params: Params{Jobs: 20}, Fleet: fleet})
+		},
+	} {
+		if !reflect.DeepEqual(gen(3), gen(3)) || reflect.DeepEqual(gen(3), gen(4)) {
+			t.Errorf("%s is not one trace per seed", name)
+		}
+	}
+}

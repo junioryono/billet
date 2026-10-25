@@ -99,11 +99,12 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 
 	cfg := &config.Config{
 		Server: &config.ServerConfig{
-			IdentityDir: t.TempDir(),
-			Listen:      "127.0.0.1:0",
-			MaxVCPU:     fleet.MaxVCPU,
-			MaxMemory:   fleet.MaxMemory,
-			Placement:   fleet.Placement,
+			IdentityDir:    t.TempDir(),
+			Listen:         "127.0.0.1:0",
+			MaxVCPU:        fleet.MaxVCPU,
+			MaxMemory:      fleet.MaxMemory,
+			Placement:      fleet.Placement,
+			AdmissionOrder: fleet.AdmissionOrder,
 		},
 		Release: &config.ReleaseConfig{Automatic: &automatic},
 		Tiers:   tiers,

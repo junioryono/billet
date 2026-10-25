@@ -22,8 +22,11 @@ package replay
 
 import (
 	"log/slog"
+	"maps"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
 )
 
 // Options vary a replay beyond its fleet and trace.
@@ -39,6 +42,14 @@ type Options struct {
 	// for it, nothing is offered or acquired, and an assignment billet cannot
 	// back waits at GitHub for the next runner the tier starts (#140).
 	DirectAssignment bool
+	// Until is the replay's horizon: no event after it is delivered, and a job
+	// that arrived by it and had not started is reported as still queued, with
+	// its wait kept out of every percentile. Zero replays every event.
+	Until time.Time
+	// AfterRun is handed the replayed deployment's allocator after the last
+	// event and before its ledger closes, so a test can read the ledger as an
+	// operator would (billet jobs export).
+	AfterRun func(*alloc.Allocator)
 }
 
 func (o Options) settleWithin() time.Duration {
@@ -124,7 +135,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 
 	for {
 		ev, ok := actions.next()
-		if !ok {
+		if !ok || (!opts.Until.IsZero() && ev.at.After(opts.Until)) {
 			break
 		}
 
@@ -163,13 +174,18 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	stop()
 	st.stopNodes()
 
-	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment)
+	if opts.AfterRun != nil {
+		opts.AfterRun(st.alloc)
+	}
+
+	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment, opts.Until)
 	if err != nil {
 		t.Fatalf("replay: read the ledger back: %v", err)
 	}
 
 	actions.mu.Lock()
 	report.DeclinedThenRun = actions.declinedThenRun
+	report.Declined = maps.Clone(actions.declined)
 	actions.mu.Unlock()
 
 	st.closeDB()
