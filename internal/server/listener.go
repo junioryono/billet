@@ -306,6 +306,11 @@ type Listener struct {
 	// logged, never scheduled on.
 	refused       refusal
 	refusedLogged string
+	// declineLogged is the explained refusal the last assignment decline was
+	// logged under, and declinesUnlogged how many have been declined under it
+	// since that line. Guarded by mu.
+	declineLogged    string
+	declinesUnlogged int
 
 	stalePromise time.Duration
 

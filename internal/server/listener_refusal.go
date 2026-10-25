@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // refusal is why a purchase this listener asked for bought nothing.
@@ -30,6 +31,13 @@ type refusal struct {
 	// unread is why the allocator's reason could not be read, said rather than
 	// taken for no reason at all.
 	unread error
+}
+
+// explained reports whether the refusal names its cause: a drain, the admission
+// order, or the allocator's own reason. Under contention every decline is one
+// of these; one with no reason, or whose reason could not be read, is not.
+func (r refusal) explained() bool {
+	return r.draining || r.waiter != "" || (r.room != nil && r.unread == nil)
 }
 
 // byOrder reports whether the admission order, not the allocator, refused.
@@ -116,7 +124,37 @@ func (l *Listener) refuse(r refusal, announce bool) {
 func (l *Listener) refusalServed() {
 	l.mu.Lock()
 	l.refused, l.refusedLogged = refusal{}, ""
+	l.declineLogged, l.declinesUnlogged = "", 0
 	l.mu.Unlock()
+}
+
+// logDecline logs an assignment declined for want of escrow. It requires l.mu.
+//
+// AN EXPLAINED DECLINE IS CONTENTION, NOT A FAULT. The advertisement is never
+// gated, so on a full fleet GitHub assigns more than billet can buy, and every
+// such assignment is declined with the order's or the allocator's reason: on
+// 2026-10-24 one controller logged 4,049 of these at error in eight and a half
+// hours, nine in ten of them the order holding freed room for a larger waiter,
+// and they were most of its errors and warnings. So an explained decline is
+// said once per reason, with how many were declined under the reason before,
+// and one with no explanation (a promise lost to a race) is an error every time.
+func (l *Listener) logDecline(job dispatch.Job) {
+	args := append([]any{"tier", l.tier, "request", job.RequestID, "run", job.RunID}, l.declineReason()...)
+	if !l.refused.explained() {
+		l.log.Error("assigned a request with no escrow to back it; declining it", args...)
+
+		return
+	}
+	reason := l.refused.String()
+	if reason == l.declineLogged {
+		l.declinesUnlogged++
+
+		return
+	}
+	args = append(args, "declined_under_previous_reason", l.declinesUnlogged)
+	l.declineLogged, l.declinesUnlogged = reason, 0
+	l.log.Info("assigned a request with no escrow to back it; declining it, and the others "+
+		"declined for this reason until it changes or the tier is served", args...)
 }
 
 // declineReason is the last refusal as log attributes. It requires l.mu.
