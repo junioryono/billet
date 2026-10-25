@@ -1325,9 +1325,9 @@ func TestADockerStoreRequestWaitsForItsSessionOnlyUntilItsLimit(t *testing.T) {
 		if waited := time.Since(start); waited != dockerStoreRequestLimit {
 			t.Fatalf("the request answered after %s, want exactly its limit, %s", waited, dockerStoreRequestLimit)
 		}
-		if storage.cloned+storage.created != 0 {
-			t.Fatalf("the store was touched (%d clones, %d creates) by a request that never held its session",
-				storage.cloned, storage.created)
+		if len(storage.keys) != 0 || storage.created != 0 {
+			t.Fatalf("the store was asked for %v and created %d volume(s) by a request that never held its session",
+				storage.keys, storage.created)
 		}
 	})
 }
@@ -1340,8 +1340,9 @@ func TestADockerStoreAcquisitionIsBoundedByWhatIsLeftOfTheRequest(t *testing.T) 
 
 	synctest.Test(t, func(t *testing.T) {
 		storage := &fakeCacheStore{}
+		attacher := &fakeVolumeAttacher{}
 		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
-			storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+			storage, attacher, slog.New(slog.DiscardHandler))
 		if err != nil {
 			t.Fatalf("NewCacheService: %v", err)
 		}
@@ -1367,6 +1368,11 @@ func TestADockerStoreAcquisitionIsBoundedByWhatIsLeftOfTheRequest(t *testing.T) 
 				t.Fatalf("the acquisition had %s left after the session was held for %s; want at most %s",
 					budget, held, dockerStoreRequestLimit-held)
 			}
+		}
+		// AND THE ATTACH THE SAME DEADLINE, not a fresh four minutes of its own.
+		if len(attacher.attachBudgets) != 1 || attacher.attachBudgets[0] != dockerStoreRequestLimit-held {
+			t.Fatalf("the attach had %v left after the session was held for %s; want exactly %s",
+				attacher.attachBudgets, held, dockerStoreRequestLimit-held)
 		}
 	})
 }
