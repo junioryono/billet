@@ -205,11 +205,13 @@ func TestEveryNodeServedCacheRequiresAHostBackedCacheNode(t *testing.T) {
 	}
 }
 
-// THE NPM CACHE IS THE ONE CACHE OFF UNLESS A TIER NAMES IT (ADR-020): a client
-// the node's authority does not reach fails rather than missing. Named, it is on,
-// and a tier whose node cannot serve it is refused at load rather than left
-// quietly off; it has no size of its own because the store is the node's.
-func TestTheNpmCacheIsOffUnlessATierNamesIt(t *testing.T) {
+// THE NPM CACHE IS ON BY DEFAULT WHERE THE TIER CAN HAVE IT (ADR-020, since
+// 2026-10-25): a firecracker Linux tier that says nothing has it, and one that
+// says false does not, for a job whose client the node's authority does not
+// reach. A tier that cannot have it says nothing and has none; named on there,
+// it stays on so the load refuses it rather than leaving it quietly off; it
+// has no size of its own because the store is the node's.
+func TestTheNpmCacheIsOnWhereATierCanHaveIt(t *testing.T) {
 	t.Parallel()
 
 	linux := func(cache *TierCache) Tier {
@@ -219,11 +221,17 @@ func TestTheNpmCacheIsOffUnlessATierNamesIt(t *testing.T) {
 		tier Tier
 		want bool
 	}{
-		"a tier that says nothing":       {linux(nil), false},
-		"a cache block without npm":      {linux(&TierCache{Publish: CachePublishOff}), false},
-		"an npm block that says nothing": {linux(&TierCache{Npm: &NpmCache{}}), false},
+		"a tier that says nothing":       {linux(nil), true},
+		"a cache block without npm":      {linux(&TierCache{Publish: CachePublishOff}), true},
+		"an npm block that says nothing": {linux(&TierCache{Npm: &NpmCache{}}), true},
 		"npm turned off":                 {linux(&TierCache{Npm: &NpmCache{Enabled: new(false)}}), false},
 		"npm turned on":                  {linux(&TierCache{Npm: &NpmCache{Enabled: new(true)}}), true},
+		"an untrusted tier that says nothing": {Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux,
+			Trust: WorkloadUntrusted}, true},
+		"a docker tier that says nothing": {Tier{Provider: ProviderDocker, GuestOS: GuestLinux}, false},
+		"a macOS tier that says nothing":  {Tier{Provider: ProviderTart, GuestOS: GuestMacOS}, false},
+		"a tier with a fallback provider": {Tier{Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
+			GuestOS: GuestLinux}, false},
 		"an untrusted tier with npm on": {Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux,
 			Trust: WorkloadUntrusted, Cache: &TierCache{Npm: &NpmCache{Enabled: new(true)}}}, true},
 		// NAMED WHERE IT CANNOT RUN, IT STAYS ON so the load refuses it, as

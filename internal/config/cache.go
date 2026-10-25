@@ -92,8 +92,10 @@ type ActionsCache struct {
 // IT HAS NO SIZE OF ITS OWN: the store is the node's, shared by every tier on it,
 // because what it holds is what the registry gives anyone without a credential.
 type NpmCache struct {
-	// Enabled is off when omitted, unlike every other cache: a client the node's
-	// authority does not reach fails rather than missing, so a tier asks for it.
+	// Enabled, when omitted, is on wherever the tier can have it, a firecracker
+	// Linux tier, as every other cache is; false turns it off for a tier whose
+	// jobs run a client the node's authority does not reach, which fails rather
+	// than missing (ADR-020).
 	Enabled *bool `yaml:"enabled,omitempty"`
 }
 
@@ -270,10 +272,14 @@ func (t Tier) EffectiveCache() CacheSpec {
 	} else {
 		spec.Go = CacheSetting{Enabled: content, MaxSize: DefaultGoCacheSize}
 	}
-	// OFF UNLESS NAMED, and named it is on wherever the tier runs, as an explicit
-	// enable of any guest cache is: InterceptionErrors refuses it where the node
-	// cannot serve it, rather than its being quietly off.
-	spec.Npm = c.Npm != nil && c.Npm.Enabled != nil && *c.Npm.Enabled
+	// ON BY DEFAULT WHERE THE TIER CAN HAVE IT, as ADR-013 has every cache, since
+	// 2026-10-25 (ADR-020). Named, it is what it says wherever the tier runs, as
+	// an explicit enable of any guest cache is: InterceptionErrors refuses it
+	// where the node cannot serve it, rather than its being quietly off.
+	spec.Npm = guest
+	if c.Npm != nil && c.Npm.Enabled != nil {
+		spec.Npm = *c.Npm.Enabled
+	}
 	if spec.Publish == CachePublishDefaultBranch && t.CacheScope != nil {
 		spec.Owner, spec.Repository = t.CacheScope.Owner, t.CacheScope.Repository
 	}

@@ -51,7 +51,7 @@ Publication happens off the node's command path, after the compute is gone, jour
 
 **Go build cache.** The guest names `billet cache gocacheprog` as `GOCACHEPROG`. It keeps a local directory for the go command and shares objects with the node's content-addressed volume; a refused or unreachable node leaves it a plain local cache, never a failed build. A workflow opts out with `GOCACHEPROG=` (empty) in `env`, because the go command prefers `GOCACHEPROG` to `GOCACHE`. Concurrent jobs' writes are merged into the newest generation, so both survive.
 
-**npm registry.** With `cache.npm.enabled: true`, the node serves `registry.npmjs.org` to the tier's guests ([ADR-020](../reference/decisions/adr-020-npm-registry-interception.md)), with no workflow change and no registry setting, so `pnpm/setup`'s own download is served too.
+**npm registry.** On every firecracker Linux tier unless it writes `cache.npm.enabled: false`, the node serves `registry.npmjs.org` to the tier's guests ([ADR-020](../reference/decisions/adr-020-npm-registry-interception.md)), with no workflow change and no registry setting, so `pnpm/setup`'s own download is served too.
 - **What it answers.** It answers from a store on its own disk only anonymous reads: a package document, a version document or a tarball, asked for with no credential and no query. Everything else (a publish, a login, an audit, a request carrying an `.npmrc` token) goes to the registry unchanged.
 - **One store per node.** The store holds only what the registry gives anyone without a credential, fetched by the node itself, so it serves every tier and trust class on the node. It keeps 10 GiB, least recently used first.
 - **How long an answer lasts.** A document is fresh for as long as the registry says (five minutes, counted down from its `Age`). A tarball is asked for again after a day.
@@ -78,7 +78,7 @@ tiers:
       git:          {enabled: true,  max_size: 50GiB}
       bazel:        {enabled: true,  max_size: 50GiB}
       go:           {enabled: true,  max_size: 20GiB, test_results: false}
-      npm:          {enabled: false}       # the one cache off unless named; no max_size, the store is the node's
+      npm:          {enabled: true}        # on, as every cache is; no max_size, the store is the node's
 ```
 
 Everything above is what that tier gets with no `cache` block at all. [Configuration](../reference/configuration.md) has every field.

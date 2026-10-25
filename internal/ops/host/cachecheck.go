@@ -158,8 +158,8 @@ func servedFrom(n *config.NodeConfig) string {
 // meets it, which is the failure #631 was opened for.
 //
 // ABOUT TIERS, NOT A SITE'S NODES. A tier's cache policy is the control plane's,
-// and every node with node.cache serves the npm cache to a tier that asks for
-// it, so the tiers are where an absence is decided. A file with no tiers, a
+// and every node with node.cache serves the npm cache to a tier that has it, so
+// the tiers are where an absence is decided. A file with no tiers, a
 // fleet node's, has nothing to say.
 func judgeNpmCache(cfg *config.Config) []string {
 	if len(cfg.Tiers) == 0 {
@@ -174,10 +174,9 @@ func judgeNpmCache(cfg *config.Config) []string {
 	}
 	if len(on) == 0 {
 		return []string{
-			"NO NPM CACHE: no tier enables cache.npm, which is off unless a tier turns it on, so " +
-				"every job fetches registry.npmjs.org itself and a stall on the way fails each job " +
-				"that meets it",
-			"a firecracker Linux tier turns it on with cache.npm.enabled: true (ADR-020)",
+			"NO NPM CACHE: no tier has the npm cache, so every job fetches registry.npmjs.org itself " +
+				"and a stall on the way fails each job that meets it",
+			"a firecracker Linux tier has it unless it writes cache.npm.enabled: false (ADR-020)",
 		}
 	}
 
