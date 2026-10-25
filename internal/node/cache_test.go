@@ -649,42 +649,45 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 func TestTheDockerStoreIsAcquiredAndAttachedWithinItsBounds(t *testing.T) {
 	t.Parallel()
 
-	storage := &fakeCacheStore{}
-	attacher := &fakeVolumeAttacher{}
-	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
-		storage, attacher, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatalf("NewCacheService: %v", err)
-	}
-
-	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
-	if err != nil {
-		t.Fatalf("Prepare: %v", err)
-	}
-
-	if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
-		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
-		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
-	}
-
-	// THE CLONE TOO, which is where the store waited behind the cache index lock.
-	for name, budgets := range map[string][]time.Duration{
-		"cloned": storage.cloneBudgets, "created": storage.createBudgets,
-	} {
-		if len(budgets) != 1 {
-			t.Fatalf("the store was %s %d time(s) with a deadline, want 1", name, len(budgets))
+	// IN A BUBBLE, so the budgets are exact: the custody write before the
+	// attach takes real time on a slow disk, and fake time does not move for it.
+	synctest.Test(t, func(t *testing.T) {
+		storage := &fakeCacheStore{}
+		attacher := &fakeVolumeAttacher{}
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			storage, attacher, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
 		}
-		if got := budgets[0]; got > dockerStoreAttachLimit || got < dockerStoreAttachLimit-5*time.Second {
-			t.Fatalf("the Docker store was %s with %s left, want about %s", name, got, dockerStoreAttachLimit)
+
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
 		}
-	}
-	if len(attacher.attachBudgets) != 1 {
-		t.Fatalf("the store was attached %d time(s) with a deadline, want 1", len(attacher.attachBudgets))
-	}
-	if got := attacher.attachBudgets[0]; got > dockerStoreRequestLimit ||
-		got < dockerStoreRequestLimit-5*time.Second {
-		t.Fatalf("the Docker store was attached with %s left, want about %s", got, dockerStoreRequestLimit)
-	}
+
+		if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+		}
+
+		// THE CLONE TOO, which is where the store waited behind the cache index lock.
+		for name, budgets := range map[string][]time.Duration{
+			"cloned": storage.cloneBudgets, "created": storage.createBudgets,
+		} {
+			if len(budgets) != 1 {
+				t.Fatalf("the store was %s %d time(s) with a deadline, want 1", name, len(budgets))
+			}
+			if got := budgets[0]; got != dockerStoreAttachLimit {
+				t.Fatalf("the Docker store was %s with %s left, want %s", name, got, dockerStoreAttachLimit)
+			}
+		}
+		if len(attacher.attachBudgets) != 1 {
+			t.Fatalf("the store was attached %d time(s) with a deadline, want 1", len(attacher.attachBudgets))
+		}
+		if got := attacher.attachBudgets[0]; got != dockerStoreRequestLimit {
+			t.Fatalf("the Docker store was attached with %s left, want %s", got, dockerStoreRequestLimit)
+		}
+	})
 }
 
 // AN ATTACH THE REQUEST'S BOUND CUTS SHORT IS A COLD JOB WHOSE VOLUME STAYS IN
