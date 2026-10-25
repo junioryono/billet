@@ -72,3 +72,6 @@ func SetLookupForTest(c *Client, i int, f func(ctx context.Context, network, hos
 func SetConnectForTest(c *Client, i int, f func(ctx context.Context, network, address string) (net.Conn, error)) {
 	c.targets[i].resolving.connect = f
 }
+
+// AddrsInForTest is addrsIn: a lookup's answer in a network, zones kept.
+func AddrsInForTest(ips []net.IPAddr, network string) []netip.Addr { return addrsIn(ips, network) }

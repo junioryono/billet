@@ -333,7 +333,7 @@ func newTarget(spec Target, several bool) (*target, error) {
 
 		if several {
 			t.dialer = newDialer()
-			t.resolving = &controllerDialer{connect: t.dialer.DialContext, lookup: net.DefaultResolver.LookupNetIP}
+			t.resolving = &controllerDialer{connect: t.dialer.DialContext, lookup: lookupZoned}
 			dial = t.resolving.DialContext
 		}
 
@@ -400,6 +400,12 @@ func (d *controllerDialer) DialContext(ctx context.Context, network, address str
 		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
 	}
 
+	// ONE BOUND FOR EVERY ADDRESS, from here, as the standard dialer shares its
+	// timeout among the addresses a name answers: five addresses that do not
+	// answer cost the dial's three seconds, not fifteen.
+	ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+
 	var primaries, fallbacks []netip.Addr
 
 	for _, addr := range addrs {
@@ -417,12 +423,17 @@ func (d *controllerDialer) DialContext(ctx context.Context, network, address str
 	return d.race(ctx, network, primaries, fallbacks, port)
 }
 
-// inTurn connects to each address in turn until one answers.
+// inTurn connects to each address in turn until one answers, each given its
+// share of what is left of the context's deadline.
 func (d *controllerDialer) inTurn(ctx context.Context, network string, addrs []netip.Addr, port string) (net.Conn, error) {
 	var errs []error
 
-	for _, addr := range addrs {
-		conn, err := d.connect(ctx, network, net.JoinHostPort(addr.Unmap().String(), port))
+	for i, addr := range addrs {
+		attemptCtx, cancel := context.WithDeadline(ctx, partialDeadline(ctx, len(addrs)-i))
+		conn, err := d.connect(attemptCtx, network, net.JoinHostPort(addr.Unmap().String(), port))
+
+		cancel()
+
 		if err == nil {
 			return conn, nil
 		}
@@ -507,6 +518,67 @@ func (d *controllerDialer) race(
 			}
 		}
 	}
+}
+
+// minimumAttempt is the least an address is given while the deadline allows it,
+// the standard dialer's own floor.
+const minimumAttempt = 2 * time.Second
+
+// partialDeadline is the deadline of one of remaining addresses still to try
+// before ctx's: an equal share of the time left, at least minimumAttempt while
+// that much is left, as the standard dialer gives each address.
+func partialDeadline(ctx context.Context, remaining int) time.Time {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return time.Now().Add(dialTimeout)
+	}
+
+	left := time.Until(deadline)
+	share := left / time.Duration(remaining)
+
+	if share < minimumAttempt {
+		share = min(minimumAttempt, left)
+	}
+
+	return time.Now().Add(share)
+}
+
+// lookupZoned looks a name up as net.DefaultResolver does, keeping each IPv6
+// address's zone, which LookupNetIP drops: a link-local controller named in
+// the hosts file is reached only through its interface.
+func lookupZoned(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	return addrsIn(ips, network), nil
+}
+
+// addrsIn is the addresses of a lookup's answer in network ("ip", "ip4" or
+// "ip6"), zones kept.
+func addrsIn(ips []net.IPAddr, network string) []netip.Addr {
+	addrs := make([]netip.Addr, 0, len(ips))
+
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip.IP)
+		if !ok {
+			continue
+		}
+
+		addr = addr.Unmap()
+
+		switch {
+		case network == "ip4" && !addr.Is4(), network == "ip6" && !addr.Is6():
+			continue
+		case addr.Is6() && ip.Zone != "":
+			addr = addr.WithZone(ip.Zone)
+		}
+
+		addrs = append(addrs, addr)
+	}
+
+	return addrs
 }
 
 // lookupNetwork is the network a name is looked up in for a dial in network.

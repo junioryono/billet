@@ -996,7 +996,13 @@ func TestAnAddressFamilyThatDoesNotRouteIsRaced(t *testing.T) {
 			return nil, ctx.Err()
 		}
 
-		raced.Store(v6Waiting.Load())
+		// STILL WAITING, not only started: a dial that gave IPv6 a bound of its
+		// own and tried IPv4 after it would have ended the IPv6 attempt first.
+		select {
+		case <-v6Ended:
+		default:
+			raced.Store(v6Waiting.Load())
+		}
 
 		return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, address)
 	})
@@ -1013,6 +1019,103 @@ func TestAnAddressFamilyThatDoesNotRouteIsRaced(t *testing.T) {
 	case <-v6Ended:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the IPv6 attempt was still waiting after IPv4 connected")
+	}
+}
+
+// THE ADDRESSES A NAME ANSWERS SHARE ONE BOUND, as the standard dialer's do: a
+// name whose three addresses never answer costs the dial's three seconds
+// before the next controller is tried, not three seconds an address.
+func TestTheAddressesOfANameShareOneBound(t *testing.T) {
+	t.Parallel()
+
+	b := newController(t)
+
+	c, err := nodeclient.New(nodeclient.Options{
+		Node: "n1", RequestTimeout: 15 * time.Second,
+		Targets: []nodeclient.Target{{Base: "http://control-a.example:7717"}, {Base: b.srv.URL}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	nodeclient.SetLookupForTest(c, 0, func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{
+			netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.3"),
+		}, nil
+	})
+
+	var (
+		mu        sync.Mutex
+		first     time.Time
+		deadlines []time.Time
+	)
+
+	nodeclient.SetConnectForTest(c, 0, func(ctx context.Context, _, _ string) (net.Conn, error) {
+		deadline, ok := ctx.Deadline()
+
+		mu.Lock()
+		if first.IsZero() {
+			first = time.Now()
+		}
+
+		if ok {
+			deadlines = append(deadlines, deadline)
+		}
+		mu.Unlock()
+
+		// A BLACKHOLE: nothing answers until the attempt's bound.
+		<-ctx.Done()
+
+		return nil, ctx.Err()
+	})
+
+	if err := c.Register(t.Context(), registration); err != nil {
+		t.Fatalf("Register past a name whose addresses never answer: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(deadlines) == 0 {
+		t.Fatal("the attempts at the name's addresses had no deadline")
+	}
+
+	// THE LAST ATTEMPT ENDS WITHIN THE ONE BOUND of the first's start, with a
+	// little for the time between taking the bound and the first attempt.
+	limit := first.Add(3*time.Second + 250*time.Millisecond)
+	for i, deadline := range deadlines {
+		if deadline.After(limit) {
+			t.Fatalf("attempt %d of %d was bounded %v after the first began, past the shared 3s",
+				i+1, len(deadlines), deadline.Sub(first))
+		}
+	}
+}
+
+// A LINK-LOCAL CONTROLLER KEEPS ITS INTERFACE. A name the hosts file gives an
+// IPv6 address with a zone is reached only through that zone, which the
+// resolver's netip answer drops; a lookup for one family answers that family.
+func TestALookupKeepsZonesAndFamilies(t *testing.T) {
+	t.Parallel()
+
+	ips := []net.IPAddr{
+		{IP: net.ParseIP("fe80::1234"), Zone: "eth0"},
+		{IP: net.ParseIP("10.0.0.1")},
+		{IP: net.ParseIP("::ffff:10.0.0.2")},
+	}
+
+	for network, want := range map[string][]string{
+		"ip":  {"fe80::1234%eth0", "10.0.0.1", "10.0.0.2"},
+		"ip4": {"10.0.0.1", "10.0.0.2"},
+		"ip6": {"fe80::1234%eth0"},
+	} {
+		var got []string
+		for _, addr := range nodeclient.AddrsInForTest(ips, network) {
+			got = append(got, addr.String())
+		}
+
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: the lookup answered %v, want %v", network, got, want)
+		}
 	}
 }
 
