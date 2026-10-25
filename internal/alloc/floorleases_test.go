@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"database/sql"
 	"maps"
 	"slices"
 	"testing"
@@ -168,6 +169,49 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 
 	if !maps.Equal(fromFleet, fromLedger) {
 		t.Fatalf("the fleet counts floors %v, the ledger %v", fromFleet, fromLedger)
+	}
+}
+
+// A LEASE AIMED AT NO HOST IS STILL THE DEPLOYMENT'S. A row from before every
+// lease named a host holds three vCPU of a four-vCPU ceiling while the one host
+// has room to spare: the purchase, which takes the deployment's commitment
+// from the pass that measures each host, must charge it there too and offer
+// one, on both readings of that pass.
+func TestALeaseAimedAtNoHostIsChargedToTheDeployment(t *testing.T) {
+	for name, reserved := range map[string]int{"no floor": 0, "a floor": 1} {
+		t.Run(name, func(t *testing.T) {
+			ts := []config.Tier{tier("linux", 1, config.GiB), tier("kept", 1, config.GiB)}
+			ts[1].Reserved = reserved
+
+			db := openState(t)
+
+			a, err := New(db, Limits{MaxVCPU: 4 + reserved, MaxMemory: 64 * config.GiB}, ts)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+				t.Fatalf("RegisterNode: %v", err)
+			}
+
+			if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(t.Context(),
+					`INSERT INTO leases
+					   (id, tier, node, macos_slot, guest_os, provider, providers, chosen_provider,
+					    phase, vcpu, memory, epoch, created_at, heartbeat_at, expires_at)
+					 VALUES ('aimed-nowhere', 'linux', NULL, 0, 'linux', 'firecracker', 'firecracker', '',
+					         'capacity', 3, 3221225472, 0, '2026-01-01T00:00:00Z',
+					         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')`)
+
+				return err
+			}); err != nil {
+				t.Fatalf("write a lease aimed at no host: %v", err)
+			}
+
+			if got := headroom(t, a, "linux"); got != 1 {
+				t.Fatalf("headroom = %d with 3 of 4 vCPU held by a lease aimed at no host, want 1", got)
+			}
+		})
 	}
 }
 

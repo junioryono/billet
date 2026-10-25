@@ -17,7 +17,7 @@ The [write budget record](../records/ledger-write-budget.md) measured the slot o
 | Hosts | 256 | |
 | Open leases | 4,096 | sixteen a host |
 | Purchases, sustained | 14 a second | 4,096 leases turned over every 300 s, a five-minute median job |
-| Purchases, burst | 26 a second for 10 s | a 256-job matrix bought within ten seconds of arriving |
+| A burst | a 256-job matrix started within 10 s | its 256 purchases and the five writes each of its jobs makes as it starts, beside the steady state |
 | A job's writes after its purchase | 6 transactions | assigned, bound, launching, online, busy, released (`BenchmarkLeaseLife`) |
 | Renewals | 137 leases a second | every open lease once a third of its 90 s TTL, by its listener |
 
@@ -25,15 +25,15 @@ The writes a job makes besides these (its usage report, its cache observation, i
 
 ### What each may take of the slot
 
-- **A purchase at the target holds the slot for at most 10 ms**, so the sustained purchases take at most 14% of it and a burst at most 26%.
+- **A purchase at the target holds the slot for at most 10 ms on average**, so the sustained purchases take at most 14% of it.
 - **Renewals take at most a quarter of the slot**, the threshold the write budget record already reopened its decision at.
-- **The steady state, renewals, purchases and every job's writes together, takes at most half**, which leaves the slot free half the time for a burst, an operator's command and the reaper. A burst on top of it may take the rest for its ten seconds.
+- **The steady state, renewals, purchases and every job's writes together, takes at most half**, which leaves the slot free half the time for a burst, an operator's command and the reaper. A burst may take the rest, for as long as it needs within its ten seconds.
 
 These are measured on the hardware the record names, with the commit as the storage under the ledger makes it. A slot hold is billet's own work plus one commit, and on network block storage the commit is most of it: an `fdatasync` on the test host's EBS gp3 volume took 3.6 ms at the median, and on an instance-store NVMe 0.14 ms.
 
 ### What the target decided
 
-- **Placement grows linearly with the fleet, and is counted rather than placed.** Headroom is counted one preference rank at a time: a rank whose hosts all charge the same is counted in one pass, and only a rank whose hosts charge differently is placed job by job, over its own hosts. A tier falling back from its hosts to a remote shape took 68 ms of the slot per purchase over 256 hosts before this; the count is held to the greedy one it replaces by a randomized test.
+- **Placement grows linearly with the fleet, and is counted rather than placed.** Headroom is counted one preference rank at a time: a rank whose hosts all charge the same is counted in one pass, and only a rank whose hosts charge differently is placed job by job, over its own hosts. Every host of a host-backed backend charges a tier the same, so the one rank still placed job by job is several remote nodes with different cheapest shapes, and its cost grows with those nodes, not with the fleet. A tier falling back from its hosts to a remote shape took 68 ms of the slot per purchase over 256 hosts before this; the count is held to the greedy one it replaces by a randomized test.
 - **One transaction reads the fleet once.** The placeable hosts are read once per question and every tier's candidates filtered from them, and the floors' counts come from the same pass as the usage when a floor needs them.
 - **A listener renews its leases in one commit a pass, up to 256 to a transaction.** One transaction a lease was half the slot at the target on network block storage before anything was scheduled. The statement answers each lease exactly as its own renewal would, so nothing that reads a renewal's answer changed, and no wire change was needed: the listener renews in process.
 - **A node's renewals stay one transaction a lease.** A node renews only what it is launching and what it holds in custody, a small fraction of the fleet, and batching them would need a route and a protocol version.
@@ -47,8 +47,11 @@ These are measured on the hardware the record names, with the commit as the stor
 - **On NVMe:** 11% on SQLite and 23% on PostgreSQL.
 
 Against the budget:
-- **A purchase within 10 ms:** met everywhere; the slowest is 9.3 ms, with two floors outstanding on SQLite over gp3.
-- **The steady state within half the slot:** met everywhere except PostgreSQL over gp3, at 50.4%, four fifths of it a job's own six commits. That is where this decision is next reopened: fewer commits in a job's life, or faster storage under the ledger.
+- **A purchase within 10 ms on average:** met everywhere; the slowest mean is 9.3 ms, with two floors outstanding on SQLite over gp3.
+- **The steady state within half the slot:** met everywhere except PostgreSQL over gp3, at 50.4%, four fifths of it a job's own six commits.
+- **A 256-job matrix started within ten seconds:** met on NVMe (2.0 s SQLite, 4.9 s PostgreSQL), missed on gp3 (12.4 s SQLite, 16.2 s PostgreSQL), for the same reason: five of a job's six commits come as it starts.
+
+Both misses are a job's own commits on network block storage, and that is where this decision is next reopened: fewer commits in a job's life, or faster storage under the ledger.
 
 ## Reopen when
 

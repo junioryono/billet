@@ -302,6 +302,10 @@ func TestHeartbeatManyAFailedBatchCostsOnlyItself(t *testing.T) {
 	answers := a.HeartbeatMany(ctx, refs)
 	heartbeatAskedOne = nil
 
+	if len(answers) != len(refs) {
+		t.Fatalf("%d answers for %d leases", len(answers), len(refs))
+	}
+
 	for i, err := range answers {
 		switch {
 		case i < heartbeatBatch && err != nil:

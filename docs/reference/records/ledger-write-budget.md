@@ -81,7 +81,7 @@ Closed: the one-pass count landed the same day for a tier whose candidates all c
 
 ### Why it was measured again
 
-Issue #528 asked what fleet one control plane must schedule, and for that target to be measured on server hardware, with PostgreSQL on its own machine rather than in Docker on a laptop. [ADR-021](../decisions/adr-021-fleet-envelope.md) sets the target: 256 hosts and 4,096 open leases, 14 purchases a second sustained and 26 in a ten-second burst, six writes in each job's life after its purchase, and 137 renewals a second. It also sets what each may take of the writer slot. A laptop could not answer that, because macOS's `fsync` does not wait for the disk, so a commit there costs almost nothing. On the server hardware below, a commit is most of what a write costs.
+Issue #528 asked what fleet one control plane must schedule, and for that target to be measured on server hardware, with PostgreSQL on its own machine rather than in Docker on a laptop. [ADR-021](../decisions/adr-021-fleet-envelope.md) sets the target: 256 hosts and 4,096 open leases, 14 purchases a second sustained, a 256-job matrix started within ten seconds, six writes in each job's life after its purchase, and 137 renewals a second. It also sets what each may take of the writer slot. A laptop could not answer that, because macOS's `fsync` does not wait for the disk, so a commit there costs almost nothing. On the server hardware below, a commit is most of what a write costs.
 
 ### How
 
@@ -117,7 +117,7 @@ The `fdatasync` column is a probe, 300 4 KiB writes each followed by `fdatasync`
 | One renewal, its own transaction | 3.83 | 0.093 | 0.248 | 3.64 | 1.31 |
 | One renewal in a batch | 0.040 | 0.022 | 0.028 | 0.037 | 0.031 |
 
-**A purchase grows linearly with the fleet, and a tier with a remote fallback no longer costs ten times as much.** Slot time of one purchase, in milliseconds:
+**A purchase grows linearly with the fleet, and a tier with a remote fallback no longer costs ten times as much.** Mean slot time of one purchase, in milliseconds (each benchmark reports the slot it held, summed, over the purchases it made):
 
 | Purchase | SQLite gp3 | SQLite tmpfs | SQLite NVMe | PostgreSQL gp3 | PostgreSQL NVMe |
 |---|---|---|---|---|---|
@@ -130,7 +130,7 @@ The `fdatasync` column is a probe, 300 4 KiB writes each followed by `fdatasync`
 | the target, two floors outstanding | 14.08 → 9.32 | 10.19 → 5.71 | 13.66 → 7.35 | 12.59 → 8.08 | 10.21 → 5.89 |
 
 From 128 to 256 hosts, twice the fleet, billet's own work (tmpfs) went from 1.29 to 2.32 ms, 1.8 times: linear. The same doubling cost 1.9 times before this change, and on 2026-10-08, before the one-pass count, four times the fleet (32 to 128 hosts) cost twelve times. What moved it:
-- headroom is counted one preference rank at a time, so only a rank whose hosts charge differently is placed job by job, over its own hosts;
+- headroom is counted one preference rank at a time, so only a rank whose hosts charge differently is placed job by job, over its own hosts. Every host of a host-backed backend charges a tier the same, so only a rank of several remote nodes with different cheapest shapes is placed job by job, and that rank costs its nodes times the jobs they hold;
 - the placeable hosts are read once a transaction rather than once for every tier asked about;
 - the floors' reads are skipped where no other tier keeps a floor, and where one does, they come from the same pass as the hosts' usage;
 - the deployment's commitment is summed from that pass rather than read again;
@@ -140,22 +140,23 @@ From 128 to 256 hosts, twice the fleet, billet's own work (tmpfs) went from 1.29
 
 ### The target's arithmetic
 
-The share of the writer slot each kind of write takes at the target: 13.7 purchases, 13.7 jobs' six writes and 137 renewals a second, then a burst of 26 purchases a second on top.
+The share of the writer slot each kind of write takes at the target: 13.7 purchases, 13.7 jobs' six writes and 137 renewals a second. Then a 256-job matrix arriving at once: its purchases and the five writes each of its jobs makes as it starts (its release comes at its end), in the slot the steady state leaves free.
 
-| | Purchases | A job's writes | Renewals | Steady state | With the burst |
+| | Purchases | A job's writes | Renewals | Steady state | A 256-job matrix started in |
 |---|---|---|---|---|---|
-| SQLite gp3, before | 16.4% | 32.8% | 54.8% | **104%** | 135% |
-| SQLite gp3, after | 10.2% | 32.7% | 0.5% | 43.5% | 62.6% |
-| SQLite tmpfs, after | 5.1% | 1.7% | 0.3% | 7.1% | 16.7% |
-| SQLite NVMe, after | 6.7% | 3.5% | 0.4% | 10.6% | 23.2% |
-| PostgreSQL gp3, before | 14.1% | 39.7% | 51.3% | **105%** | 132% |
-| PostgreSQL gp3, after | 8.2% | 41.7% | 0.5% | **50.4%** | 65.8% |
-| PostgreSQL NVMe, after | 5.7% | 17.3% | 0.4% | 23.4% | 34.0% |
+| SQLite gp3, before | 16.4% | 32.8% | 54.8% | **104%** | never |
+| SQLite gp3, after | 10.2% | 32.7% | 0.5% | 43.5% | **12.4 s** |
+| SQLite tmpfs, after | 5.1% | 1.7% | 0.3% | 7.1% | 1.3 s |
+| SQLite NVMe, after | 6.7% | 3.5% | 0.4% | 10.6% | 2.0 s |
+| PostgreSQL gp3, before | 14.1% | 39.7% | 51.3% | **105%** | never |
+| PostgreSQL gp3, after | 8.2% | 41.7% | 0.5% | **50.4%** | **16.2 s** |
+| PostgreSQL NVMe, after | 5.7% | 17.3% | 0.4% | 23.4% | 4.9 s |
 
 Against the budget ADR-021 set before these were measured:
 - **Renewals within a quarter of the slot:** met everywhere, at under 1%.
-- **A purchase within 10 ms:** met on every configuration, for the target, a tier falling back to ec2, and two floors outstanding. The slowest is 9.3 ms, with floors on SQLite on gp3.
+- **A purchase within 10 ms on average:** met on every configuration, for the target, a tier falling back to ec2, and two floors outstanding. The slowest mean is 9.3 ms, with floors on SQLite on gp3. A benchmark reports a mean, not a distribution of single purchases.
 - **The steady state within half the slot:** met everywhere except PostgreSQL on gp3, at 50.4% (the three runs of a job's writes put it between 49.9% and 50.6%). Four fifths of that is a job's own six commits, at a network round trip and a gp3 `fdatasync` each. Storage that commits faster is what brings it down: on NVMe the same PostgreSQL is at 23%.
+- **A 256-job matrix started within ten seconds:** met on NVMe (2.0 s SQLite, 4.9 s PostgreSQL), missed on gp3 (12.4 s SQLite, 16.2 s PostgreSQL). There, too, a job's own commits are most of it: five of a job's six writes come as it starts.
 
 Before this change, neither engine on gp3 could have scheduled the target at all: renewals alone took half the slot, and the steady state needed more than all of it.
 
