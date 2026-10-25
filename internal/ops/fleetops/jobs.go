@@ -220,8 +220,10 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
 	if err != nil {
 		return "", err
 	}
+	// A PREDICTION THAT CANNOT BE READ IS SAID, NOT FATAL: the record is the
+	// ledger's, and what the history would have predicted is a figure beside it.
 	if err := alloc.PredictJob(&rec, priors); err != nil {
-		return "", err
+		rec.NotPredicted = err.Error()
 	}
 	var measured *alloc.RecordedUsage
 	switch u, err := a.LeaseUsage(ctx, leaseID); {
@@ -330,6 +332,9 @@ type jobJSON struct {
 	// the job's runtime to be when it started, beside the runtime and the
 	// error once it finished; null for a job that never started.
 	Prediction *predictionJSON `json:"prediction"`
+	// PredictionUnavailable is why there is no prediction when the history
+	// could not be read, and absent otherwise.
+	PredictionUnavailable string `json:"prediction_unavailable,omitempty"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
 	// Window is present only when --window asked for one.
@@ -380,7 +385,7 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
 		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
-		Prediction:     predictionJSONOf(rec),
+		Prediction: predictionJSONOf(rec), PredictionUnavailable: rec.NotPredicted,
 		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
 		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
 		DetailRetiredAt: rec.DetailRetiredAt,

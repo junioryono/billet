@@ -6,7 +6,7 @@ How well a job's runtime is predicted from the deployment's own history (#524, A
 
 Every job that started from 2026-10-11 15:42 to 2026-10-25 15:42 UTC and had finished: 30,253 jobs on 17 tiers, none left out by the read's bound. Each was predicted as a controller refreshing hourly would have predicted it, from the snapshot as of the hour it started in. That snapshot learned from the jobs that started in the 14 days before that hour and had finished by it, so no job was graded against itself or against a job still running when it started. The runtime is from the job's start to its lease's archive, both on billet's clock, so it includes the guest's teardown.
 
-The error is the predicted median less the runtime, and **within 2x** means the runtime was between half and twice the prediction.
+The error is the runtime less the predicted median, so a positive one ran longer than predicted, and the table gives its absolute value's median. **Within 2x** means the runtime was between half and twice the prediction.
 
 ## The result
 
@@ -34,7 +34,7 @@ Across all 30,253 jobs, 78% ran within 2x of the prediction. 30,058 (99.4%) were
 
 ## What it says
 
-- **The wide shapes are the ones predicted best.** Every 8 and 16 vCPU tier ran 84% to 96% of its jobs within 2x, with a median error of one to three minutes. Those are the leases whose ends decide when a host has room for a whole-host shape, which is what #527 asks the prediction for.
+- **The wide shapes are the ones predicted best.** Every 8 and 16 vCPU tier with more than a handful of jobs ran 84% to 96% of its jobs within 2x, with a median error of one to three minutes (the smaller target's 8 vCPU tier, with six jobs, ran all six within 2x). Those are the leases whose ends decide when a host has room for a whole-host shape, which is what #527 asks the prediction for.
 - **The 2 vCPU tiers are close in time and loose in ratio.** The organization target's 2 vCPU tier is off by a median of 8.4 seconds but only 61% within 2x: its jobs are seconds long, so a few seconds' difference is a large ratio. For choosing a host that difference does not matter, because a host's room comes back in the order its long leases end.
 - **The fallbacks are rarely needed on a busy deployment.** Fewer than 1% of predictions came from the tier or the default. The ones that did are on tiers with a handful of jobs: a target that runs a few jobs a day, and another session's test tier. There the 10 minute default is far off (8m50s on the test tier), and that error is visible per job in `billet jobs show`.
 - **The matrix level earns its place, narrowly.** 101 jobs had fewer than three runs of their own matrix cell and three or more across the matrix: new matrix values, mostly on billet's own 2 vCPU tier.
@@ -42,6 +42,6 @@ Across all 30,253 jobs, 78% ran within 2x of the prediction. 30,058 (99.4%) were
 
 ## What it does not say
 
-- It grades the median alone. The overdue rule (half a median from now, once a job is past its median) and the p90 are not graded here; #527's replay judges whether they choose better hosts.
+- It grades the median alone. The overdue rule (once a job is past its median, half its median again or as long again as it has overrun, whichever is longer) and the p90 are not graded here; #527's replay judges whether they choose better hosts.
 - A job's runtime is its lease's, from start to archive. A job whose teardown was slow looks longer than the job itself, and the record does not separate the two.
 - The window holds two weeks of one deployment's work. A deployment whose jobs change shape week to week would predict worse, and the report on that deployment would say so.

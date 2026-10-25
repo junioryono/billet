@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"syscall"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -23,6 +26,31 @@ import (
 // copy of this open is how two commands end up disagreeing about which limits a
 // deployment has, and the limits are the control plane's own (allocatorLimits).
 func OpenOperator(ctx context.Context, cfgPath string) (*alloc.Allocator, *state.DB, func(), error) {
+	return openAllocator(ctx, cfgPath, LedgerOperator)
+}
+
+// OpenReport is OpenOperator for a command that only reads: the ledger in
+// LedgerInspect mode, which creates, locks, claims and migrates nothing and
+// refuses a schema that is not exactly this binary's, so a report run beside
+// a control plane of another release can neither move its ledger nor misread
+// it. The returned allocator can answer reads only.
+//
+// ON SQLITE, ONLY AS THE LEDGER'S OWNER. A read-only open of a stopped SQLite
+// ledger creates its sidecar files owned by whoever opened it, and a service
+// account that cannot write them cannot reopen its own ledger; so a report
+// run as anyone but the identity directory's owner, root included, is refused
+// before the ledger is opened (the rule `billet rollout status` holds, which
+// re-executes itself as the owner instead). A PostgreSQL ledger has no sidecar.
+func OpenReport(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
+	a, _, closeDB, err := openAllocator(ctx, cfgPath, LedgerInspect)
+
+	return a, closeDB, err
+}
+
+// openAllocator is OpenOperator and OpenReport: the configuration, the ledger
+// in mode, and the allocator over it.
+func openAllocator(ctx context.Context, cfgPath string, mode LedgerMode,
+) (*alloc.Allocator, *state.DB, func(), error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, nil, nil, err
@@ -33,7 +61,13 @@ func OpenOperator(ctx context.Context, cfgPath string) (*alloc.Allocator, *state
 			"config has no server section")
 	}
 
-	db, err := OpenLedger(ctx, cfg, LedgerOperator)
+	if mode == LedgerInspect {
+		if err := reportRunsAsOwner(cfg); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	db, err := OpenLedger(ctx, cfg, mode)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("server state: %w", err)
 	}
@@ -48,35 +82,39 @@ func OpenOperator(ctx context.Context, cfgPath string) (*alloc.Allocator, *state
 	return a, db, func() { db.Close() }, nil
 }
 
-// OpenReport is OpenOperator for a command that only reads: the ledger in
-// LedgerInspect mode, which creates, locks, claims and migrates nothing and
-// refuses a schema that is not exactly this binary's, so a report run beside
-// a control plane of another release can neither move its ledger nor misread
-// it. The returned allocator can answer reads only.
-func OpenReport(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		return nil, nil, err
+// reportEUID is who this process runs as; a test stands another in.
+var reportEUID = os.Geteuid
+
+// reportRunsAsOwner refuses a report on a SQLite ledger from any account but
+// the identity directory's owner (OpenReport). A directory that does not
+// exist is left for the open to refuse with its own diagnostic, and an owner
+// that cannot be read refuses, since could-not-tell is not the owner.
+func reportRunsAsOwner(cfg *config.Config) error {
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		return nil
 	}
 
-	if cfg.Server == nil {
-		return nil, nil, errors.New("this command runs on the control plane, and this " +
-			"config has no server section")
+	info, err := os.Lstat(cfg.Server.IdentityDir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("read who owns %s: %w", cfg.Server.IdentityDir, err)
 	}
 
-	db, err := OpenLedger(ctx, cfg, LedgerInspect)
-	if err != nil {
-		return nil, nil, fmt.Errorf("server state: %w", err)
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s carries no owner this platform reports, so this report cannot tell whether "+
+			"reading it would leave files its owner cannot write", cfg.Server.IdentityDir)
 	}
 
-	a, err := NewAllocator(cfg, db)
-	if err != nil {
-		db.Close()
-
-		return nil, nil, fmt.Errorf("capacity allocator: %w", err)
+	if euid := reportEUID(); int(st.Uid) != euid {
+		return fmt.Errorf("%s is owned by uid %d and this process runs as uid %d; a report on a SQLite "+
+			"ledger leaves files owned by whoever read it, so run it as the ledger's owner (for example "+
+			"sudo -u billet)", cfg.Server.IdentityDir, st.Uid, euid)
 	}
 
-	return a, func() { db.Close() }, nil
+	return nil
 }
 
 // NewAllocator is the capacity allocator an operator command works with over a

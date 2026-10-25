@@ -187,7 +187,8 @@ type RuntimePriors struct {
 
 // LearnRuntimes builds a snapshot as of asOf from samples. Only the samples
 // that started inside the window before asOf and finished before it are
-// learned from; a runtime that is not positive (two writes out of order on
+// learned from (one that finished before asOf started before it, its runtime
+// being positive); a runtime that is not positive (two writes out of order on
 // one clock) is not a runtime and is left out.
 func LearnRuntimes(samples []RuntimeSample, asOf time.Time) *RuntimePriors {
 	from := asOf.Add(-RuntimeWindow)
@@ -195,8 +196,7 @@ func LearnRuntimes(samples []RuntimeSample, asOf time.Time) *RuntimePriors {
 
 	for i := range samples {
 		s := &samples[i]
-		if s.Started.Before(from) || !s.Started.Before(asOf) || !s.Finished.Before(asOf) ||
-			s.Runtime() <= 0 {
+		if s.Started.Before(from) || !s.Finished.Before(asOf) || s.Runtime() <= 0 {
 			continue
 		}
 
@@ -255,17 +255,20 @@ func (p *RuntimePriors) Tiers() map[string]RuntimeDistribution {
 // at now.
 //
 // AN OVERDUE JOB IS NEVER ABOUT TO END. Once now is past start plus the
-// median, the job is predicted to need half its median again from now, and
-// overdue is true: a job that has already outrun what its kind usually takes
-// is the one most likely to run long, and a host running it must not look
-// like the one about to free up.
+// median, the job is predicted to need half its median again from now, or as
+// long again as it has already overrun its median when that is longer, and
+// overdue is true. A job that has outrun what its kind usually takes is the
+// one most likely to run long, and the further it has overrun the longer it is
+// likely to run on: half a median alone would predict a five-second job an
+// hour overdue to end in under three seconds, and its host would look like the
+// one about to free up.
 func PredictEnd(est RuntimeEstimate, start, now time.Time) (time.Time, bool) {
 	end := start.Add(est.Median)
-	if now.After(end) {
-		return now.Add(est.Median / 2), true
+	if !now.After(end) {
+		return end, false
 	}
 
-	return end, false
+	return now.Add(max(est.Median/2, now.Sub(end))), true
 }
 
 // runtimeBook is the allocator's copy of what the history taught: one
@@ -275,14 +278,29 @@ func PredictEnd(est RuntimeEstimate, start, now time.Time) (time.Time, bool) {
 // history through the reader pool, so it costs nothing while nothing asks, and
 // on the allocator's clock a replay or a test moves it by moving time. One
 // rebuild runs at a time, and once a snapshot exists nobody waits for the next:
-// a caller arriving during a rebuild is answered from the one it replaces.
+// a caller arriving during a rebuild is answered from the one it replaces. With
+// none yet, a caller waits for the rebuild in flight, or for its own context.
 type runtimeBook struct {
 	snapshot atomic.Pointer[RuntimePriors]
-	building sync.Mutex
-	// failedAt is when the last rebuild failed, on the allocator's clock, in
-	// Unix nanoseconds; zero before any has. A success needs no reset: the
-	// snapshot it stores is fresh for an hour, far past runtimeRetry.
-	failedAt atomic.Int64
+
+	mu sync.Mutex
+	// building is closed when the rebuild in flight ends, and nil while none is.
+	building chan struct{}
+	// failedAt is when the last rebuild failed reading the ledger, on the
+	// allocator's clock; zero once one succeeds. A rebuild that failed because
+	// its caller's context ended is not a failure of the ledger's, and holds
+	// nobody else's rebuild off.
+	failedAt time.Time
+	// read learns a snapshot as of an instant; nil reads the ledger
+	// (learnRuntimesAt). A test stands in one that fails, blocks or counts.
+	read func(ctx context.Context, asOf time.Time) (*RuntimePriors, error)
+}
+
+// retrying requires b.mu. It reports that a rebuild failed within runtimeRetry
+// before now; a failure dated after now, on a clock that moved back, holds no
+// rebuild off.
+func (b *runtimeBook) retrying(now time.Time) bool {
+	return !b.failedAt.IsZero() && !now.Before(b.failedAt) && now.Sub(b.failedAt) < runtimeRetry
 }
 
 // ErrRuntimesStale means the history could not be read to rebuild what was
@@ -294,54 +312,85 @@ var ErrRuntimesStale = errors.New("alloc: the learned runtimes could not be refr
 //
 // A REBUILD THAT FAILS KEEPS THE LAST SNAPSHOT: it is returned with an error
 // wrapping ErrRuntimesStale, which a caller logs and predicts from anyway,
-// since a prediction is an optimisation, and the rebuild is not tried again
-// for runtimeRetry, the last snapshot answering meanwhile. With no snapshot to
-// keep, the error alone is returned, and the next caller tries again.
+// since a prediction is an optimisation, and a rebuild that failed reading the
+// ledger is not tried again for runtimeRetry, the last snapshot answering
+// meanwhile. With no snapshot to keep, the error alone is returned, and the
+// next caller tries again.
 func (a *Allocator) RuntimePriors(ctx context.Context) (*RuntimePriors, error) {
-	now := a.now()
+	b := &a.runtimes
 
-	current := a.runtimes.snapshot.Load()
-	if current.freshAt(now) {
-		return current, nil
-	}
-
-	if failed := a.runtimes.failedAt.Load(); current != nil && failed != 0 &&
-		now.Sub(time.Unix(0, failed)) < runtimeRetry {
-		return current, nil
-	}
-
-	if current != nil {
-		if !a.runtimes.building.TryLock() {
+	for {
+		if current := b.snapshot.Load(); current.freshAt(a.now()) {
 			return current, nil
 		}
-	} else {
-		a.runtimes.building.Lock()
-	}
-	defer a.runtimes.building.Unlock()
 
-	// ANOTHER CALLER MAY HAVE REBUILT IT while this one waited for the lock.
-	if latest := a.runtimes.snapshot.Load(); latest.freshAt(now) {
-		return latest, nil
-	}
+		b.mu.Lock()
 
-	built, err := a.learnRuntimesAt(ctx, now)
-	if err != nil {
-		if current != nil {
-			a.runtimes.failedAt.Store(now.UnixNano())
+		// EVERYTHING READ AGAIN UNDER THE LOCK: another rebuild may have ended,
+		// or failed, since the look above.
+		now, current := a.now(), b.snapshot.Load()
 
-			return current, fmt.Errorf("%w: %w", ErrRuntimesStale, err)
+		switch {
+		case current.freshAt(now):
+			b.mu.Unlock()
+
+			return current, nil
+		case b.building != nil && current != nil:
+			b.mu.Unlock()
+
+			return current, nil
+		case b.building != nil:
+			done := b.building
+			b.mu.Unlock()
+
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		case current != nil && b.retrying(now):
+			b.mu.Unlock()
+
+			return current, nil
 		}
 
-		return nil, err
+		done := make(chan struct{})
+		b.building = done
+
+		read := b.read
+		if read == nil {
+			read = a.learnRuntimesAt
+		}
+		b.mu.Unlock()
+
+		built, err := read(ctx, now)
+
+		b.mu.Lock()
+		switch {
+		case err == nil:
+			b.snapshot.Store(built)
+			b.failedAt = time.Time{}
+		case ctx.Err() == nil:
+			b.failedAt = now
+		}
+		b.building = nil
+		close(done)
+		b.mu.Unlock()
+
+		switch {
+		case err == nil:
+			return built, nil
+		case current != nil:
+			return current, fmt.Errorf("%w: %w", ErrRuntimesStale, err)
+		default:
+			return nil, err
+		}
 	}
-
-	a.runtimes.snapshot.Store(built)
-
-	return built, nil
 }
 
 // freshAt reports whether a snapshot may still answer at now. A clock that
-// moved back past it is a reason to rebuild, not to trust it.
+// moved back before it is a reason to rebuild, not to trust it.
 func (p *RuntimePriors) freshAt(now time.Time) bool {
 	return p != nil && !now.Before(p.AsOf) && now.Sub(p.AsOf) < RuntimeRefresh
 }
@@ -452,25 +501,24 @@ type LeasePrediction struct {
 }
 
 // PredictLease predicts when one lease's job ends, from what this allocator
-// has learned. A lease whose job has not started is predicted from now, and a
-// lease with no job recorded yet (bought, not yet assigned) from its tier.
-// A refresh that failed is ErrRuntimesStale beside a prediction from the older
-// snapshot.
+// has learned. A lease whose job has not started is predicted from now, a
+// lease with no job recorded yet (bought, not yet assigned) from its tier, and
+// a lease whose job has finished ends when it did. A refresh that failed is
+// returned beside a prediction from what there is: the older snapshot
+// (ErrRuntimesStale), or with no snapshot at all, the default, since a
+// prediction is an optimisation and the caller decides what an error means.
 func (a *Allocator) PredictLease(ctx context.Context, leaseID string) (LeasePrediction, error) {
 	priors, refreshErr := a.RuntimePriors(ctx)
-	if priors == nil {
-		return LeasePrediction{}, refreshErr
-	}
 
 	var (
-		key     JobKey
-		started time.Time
+		key               JobKey
+		started, finished time.Time
 	)
 
 	switch rec, err := a.Job(ctx, leaseID); {
 	case err == nil:
 		key = JobKeyOf(rec.Tier, rec.Repo, rec.Job.WorkflowRef, rec.Job.Name)
-		started = parseStamp(rec.StartedAt)
+		started, finished = parseStamp(rec.StartedAt), parseStamp(rec.FinishedAt)
 	case errors.Is(err, ErrLeaseNotFound):
 		lease, err := a.Lease(ctx, leaseID)
 		if err != nil {
@@ -486,11 +534,14 @@ func (a *Allocator) PredictLease(ctx context.Context, leaseID string) (LeasePred
 	est := priors.Estimate(key)
 	out := LeasePrediction{Started: !started.IsZero(), RuntimeEstimate: est}
 
-	if started.IsZero() {
-		started = now
+	switch {
+	case !started.IsZero() && !finished.IsZero():
+		out.End = finished
+	case started.IsZero():
+		out.End, out.Overdue = PredictEnd(est, now, now)
+	default:
+		out.End, out.Overdue = PredictEnd(est, started, now)
 	}
-
-	out.End, out.Overdue = PredictEnd(est, started, now)
 
 	return out, refreshErr
 }
@@ -522,7 +573,12 @@ func (r RuntimeAccuracy) Within2xShare() float64 {
 // have made for the jobs that started in [from, to): each job is predicted
 // from a snapshot as of the hour it started in, learned from the window before
 // that hour, so it never learns from itself or from anything that had not yet
-// finished. samples must cover RuntimeWindow before from as well.
+// finished. samples must cover RuntimeWindow before the hour from falls in
+// (BacktestSince).
+//
+// ONE SNAPSHOT AT A TIME, built for an hour's jobs and dropped once they are
+// graded: a fortnight is over three hundred hours, and keeping every hour's
+// snapshot to the end held all of them at once.
 func BacktestRuntimes(samples []RuntimeSample, from, to time.Time) []RuntimeAccuracy {
 	type graded struct {
 		err    time.Duration
@@ -530,8 +586,7 @@ func BacktestRuntimes(samples []RuntimeSample, from, to time.Time) []RuntimeAccu
 		level  RuntimeLevel
 	}
 
-	byTier := map[string][]graded{}
-	snapshots := map[time.Time]*RuntimePriors{}
+	byHour := map[time.Time][]int{}
 
 	for i := range samples {
 		s := &samples[i]
@@ -540,20 +595,24 @@ func BacktestRuntimes(samples []RuntimeSample, from, to time.Time) []RuntimeAccu
 		}
 
 		hour := s.Started.Truncate(RuntimeRefresh)
+		byHour[hour] = append(byHour[hour], i)
+	}
 
-		priors, ok := snapshots[hour]
-		if !ok {
-			priors = LearnRuntimes(samples, hour)
-			snapshots[hour] = priors
+	byTier := map[string][]graded{}
+
+	for _, hour := range slices.SortedFunc(maps.Keys(byHour), time.Time.Compare) {
+		priors := LearnRuntimes(samples, hour)
+
+		for _, i := range byHour[hour] {
+			s := &samples[i]
+			est := priors.Estimate(s.Key)
+			runtime := s.Runtime()
+			byTier[s.Key.Tier] = append(byTier[s.Key.Tier], graded{
+				err:    absDuration(est.Median - runtime),
+				within: runtime*2 >= est.Median && runtime <= est.Median*2,
+				level:  est.Level,
+			})
 		}
-
-		est := priors.Estimate(s.Key)
-		runtime := s.Runtime()
-		byTier[s.Key.Tier] = append(byTier[s.Key.Tier], graded{
-			err:    absDuration(est.Median - runtime),
-			within: runtime*2 >= est.Median && runtime <= est.Median*2,
-			level:  est.Level,
-		})
 	}
 
 	out := make([]RuntimeAccuracy, 0, len(byTier))
@@ -578,6 +637,13 @@ func BacktestRuntimes(samples []RuntimeSample, from, to time.Time) []RuntimeAccu
 	}
 
 	return out
+}
+
+// BacktestSince is where a backtest of the jobs from from on must read the
+// history from: a fortnight before the hour from falls in, which is what that
+// hour's snapshot learns from.
+func BacktestSince(from time.Time) time.Time {
+	return from.Truncate(RuntimeRefresh).Add(-RuntimeWindow)
 }
 
 func absDuration(d time.Duration) time.Duration {

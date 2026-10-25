@@ -157,6 +157,9 @@ type JobRecord struct {
 	// job's runtime to be when it started (PredictJob). Never read from the row:
 	// nil unless a reader asked, and for a job that never started.
 	Predicted *RuntimeEstimate
+	// NotPredicted is why a reader that asked got no prediction, when the
+	// history could not be read; empty otherwise.
+	NotPredicted string
 }
 
 // Runtime is how long the job held its lease, from its start to the lease's

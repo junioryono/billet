@@ -76,14 +76,14 @@ type runtimeReport struct {
 }
 
 // buildRuntimeReport grades the jobs that started in the window before now.
-// The read reaches RuntimeWindow further back, since the first hour's
-// predictions learn from the fortnight before it.
+// The read reaches a fortnight before the hour the window begins in, which is
+// what that hour's predictions learn from (alloc.BacktestSince).
 func buildRuntimeReport(ctx context.Context, a *alloc.Allocator, tier string, now time.Time,
 	since time.Duration,
 ) (runtimeReport, error) {
 	from := now.Add(-since)
 
-	samples, partial, err := a.RuntimeSamples(ctx, from.Add(-alloc.RuntimeWindow), now)
+	samples, partial, err := a.RuntimeSamples(ctx, alloc.BacktestSince(from), now)
 	if err != nil {
 		return runtimeReport{}, err
 	}
@@ -224,6 +224,10 @@ func runtimeLine(rec alloc.JobRecord) string {
 
 	p := rec.Predicted
 	if p == nil {
+		if rec.NotPredicted != "" {
+			return ran + "; not predicted: " + rec.NotPredicted
+		}
+
 		return ran + "; not predicted"
 	}
 
