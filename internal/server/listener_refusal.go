@@ -55,7 +55,7 @@ func (r refusal) attrs() []any {
 
 // assignmentBacking is what backAssignment found for one request: the refusal
 // its own purchase met, or none when backing was there or was bought, and how
-// many leases and promises the heartbeat had dropped when it began.
+// many leases and promises had been dropped when it began.
 type assignmentBacking struct {
 	request int64
 	refused refusal
@@ -63,7 +63,22 @@ type assignmentBacking struct {
 	set     bool
 }
 
-// backingLostNow is how many leases and promises the heartbeat has dropped.
+// forgetBacking removes request's running lease and promise, counting either it
+// held as backing dropped: the cleanup loop releases on a goroutine of its own,
+// so a promise backAssignment found can go before the assignment reads it. It
+// requires l.mu.
+func (l *Listener) forgetBacking(request int64) {
+	_, promised := l.acquiring[request]
+	_, running := l.running[request]
+	if promised || running {
+		l.backingLost++
+	}
+	delete(l.running, request)
+	delete(l.runningJobs, request)
+	delete(l.acquiring, request)
+}
+
+// backingLostNow is how many leases and promises have been dropped.
 func (l *Listener) backingLostNow() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -175,8 +190,8 @@ func (l *Listener) refusalServed() {
 }
 
 // logDecline logs an assignment declined for want of escrow, explained only by
-// the refusal backAssignment met for this request, and only when the heartbeat
-// dropped nothing since it began: a refusal left from another purchase says
+// the refusal backAssignment met for this request, and only when no lease or
+// promise was dropped since it began: a refusal left from another purchase says
 // nothing about why backing this one found was gone, and a lease or promise
 // dropped meanwhile may have been this request's own (bought and lost, held under
 // another alias, or promised while draining). It requires l.mu.

@@ -313,7 +313,8 @@ type Listener struct {
 	declinesUnlogged int
 	// backed is what backAssignment found for the request it last ran for, the
 	// only refusal that may explain that request's decline, and backingLost how
-	// many held leases and promises the heartbeat has dropped. Guarded by mu.
+	// many held leases, promises and running leases the heartbeat or a release
+	// has dropped. Guarded by mu.
 	backed      assignmentBacking
 	backingLost uint64
 

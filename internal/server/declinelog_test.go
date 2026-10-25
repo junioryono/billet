@@ -222,6 +222,80 @@ func TestADeclineAfterTheHeartbeatDroppedBackingIsAnError(t *testing.T) {
 	}
 }
 
+// A PROMISE A RELEASE DROPPED MEANWHILE IS LOST BACKING TOO. A draining listener
+// records its drain for a request whose promise is still there, and the cleanup
+// loop, on its own goroutine, releases that promise before the assignment.
+func TestADeclineAfterAReleaseDroppedThePromiseIsAnError(t *testing.T) {
+	t.Parallel()
+
+	a, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFill)
+	l := listeners[0]
+
+	lease := holdRunning(t, l, a, l.tier, 5)
+	l.mu.Lock()
+	delete(l.running, 5)
+	l.acquiring[5] = &promise{lease: lease, at: time.Now()}
+	l.cleanup[5] = &pendingCleanup{
+		job: dispatch.Job{RequestID: 5}, lease: lease, outcome: alloc.PhaseDone, releaseOnly: true,
+	}
+	l.draining = true
+	l.mu.Unlock()
+
+	if err := l.backAssignment(t.Context(), 5); err != nil {
+		t.Fatalf("back assignment: %v", err)
+	}
+
+	l.mu.Lock()
+	if !l.backed.refused.draining {
+		t.Fatalf("a draining listener recorded %v, so this test proves nothing", l.backed.refused)
+	}
+	l.mu.Unlock()
+
+	if handled, released := l.releaseParked(t.Context(), 5); !handled || !released {
+		t.Fatalf("releaseParked = %v, %v; want the parked release handled and settled", handled, released)
+	}
+	l.mu.Lock()
+	_, promised := l.acquiring[5]
+	l.mu.Unlock()
+	if promised {
+		t.Fatal("the settled release left its promise behind")
+	}
+
+	assertDeclinedAsAnError(t, l, lines, 5)
+}
+
+// A DROP BEFORE backAssignment BEGAN IS NOT THIS REQUEST'S: a tier that lost a
+// lease earlier still says its contention at info.
+func TestADropBeforeTheRequestDoesNotUnexplainIt(t *testing.T) {
+	t.Parallel()
+
+	_, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFill)
+	l := listeners[0]
+
+	if err := l.reconcilePool(t.Context(), 2); err != nil {
+		t.Fatalf("small tier reconcile: %v", err)
+	}
+	l.mu.Lock()
+	l.backingLost = 3
+	l.mu.Unlock()
+
+	if err := l.backAssignment(t.Context(), 5); err != nil {
+		t.Fatalf("back assignment: %v", err)
+	}
+	lease, needsCompute, err := l.assign(t.Context(), dispatch.Job{JobID: "J", RequestID: 5, RunID: 905})
+	if err != nil || lease != nil || needsCompute {
+		t.Fatalf("assign = %v, %v, %v; want a decline (nil, false, nil)", lease, needsCompute, err)
+	}
+
+	declines := lines.with(t, declineMessage)
+	if len(declines) != 1 {
+		t.Fatalf("the decline logged %d lines, want one: %v", len(declines), declines)
+	}
+	if got := stringAttr(declines[0], "level"); got != slog.LevelInfo.String() {
+		t.Errorf("contention after an earlier drop was logged at %q, want INFO: %v", got, declines[0])
+	}
+}
+
 // assertDeclinedAsAnError assigns request to l with no backing and asserts it is
 // declined with one error line.
 func assertDeclinedAsAnError(t *testing.T, l *Listener, lines *logLines, request int64) {
