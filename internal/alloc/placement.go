@@ -162,22 +162,46 @@ type nodeUsage struct {
 }
 
 // usageByNode is every host's committed capacity, keyed the way the rest of the
-// arithmetic attributes a lease, and how many open leases each tier holds on
-// each host.
+// arithmetic attributes a lease, and, where some tier keeps a floor, how many
+// open leases each tier holds on each host (nil where none does).
 //
 // COALESCE(node, target_node), the same expression usageOn uses one host at a
 // time. A lease that has been bound is
 // charged to the host running it; one only AIMED at a host is charged there too,
 // because escrow commits a machine's room before any container starts.
+//
+// BY TIER ONLY WHERE A FLOOR NEEDS IT: the floors then count from the same
+// pass rather than another one, and without a floor the tier rows are only
+// more rows to read (UsageByNodeAndTier).
 func (a *Allocator) usageByNode(
 	ctx context.Context, tx querier,
 ) (map[string]nodeUsage, map[string]map[string]int, error) {
+	used := map[string]nodeUsage{}
+
+	if !slices.ContainsFunc(slices.Collect(maps.Values(a.tiers)), func(t config.Tier) bool {
+		return t.Reserved > 0
+	}) {
+		rows, err := state.ReadQueries(tx).UsageByNode(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("alloc: measure the fleet's committed capacity: %w", err)
+		}
+
+		for _, row := range rows {
+			used[row.Node] = nodeUsage{
+				VCPU:   int(row.Vcpu),
+				Memory: config.ByteSize(row.Memory),
+				MacOS:  int(row.MacosSlots),
+			}
+		}
+
+		return used, nil, nil
+	}
+
 	rows, err := state.ReadQueries(tx).UsageByNodeAndTier(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("alloc: measure the fleet's committed capacity: %w", err)
 	}
 
-	used := map[string]nodeUsage{}
 	held := map[string]map[string]int{}
 
 	for _, row := range rows {

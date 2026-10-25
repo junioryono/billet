@@ -186,6 +186,7 @@ type ReadOps interface {
 	ReadRolloutInState(ctx context.Context, state string) (ledgerdb.Rollout, error)
 	ReadRolloutNodeProgress(ctx context.Context, arg ledgerdb.ReadRolloutNodeProgressParams) (ledgerdb.ReadRolloutNodeProgressRow, error)
 	TotalUsage(ctx context.Context) (ledgerdb.TotalUsageRow, error)
+	UsageByNode(ctx context.Context) ([]ledgerdb.UsageByNodeRow, error)
 	UsageByNodeAndTier(ctx context.Context) ([]ledgerdb.UsageByNodeAndTierRow, error)
 	UsageByTier(ctx context.Context) ([]ledgerdb.UsageByTierRow, error)
 	UsageOnNode(ctx context.Context, node string) (ledgerdb.UsageOnNodeRow, error)

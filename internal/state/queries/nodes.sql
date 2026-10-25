@@ -162,15 +162,28 @@ SELECT COALESCE(l.node, l.target_node) AS node, l.instance_type,
  WHERE n.provider IN ('ec2','codebuild') AND l.phase NOT IN ('done','failed')
  GROUP BY COALESCE(l.node, l.target_node), l.instance_type;
 
+-- name: UsageByNode :many
+-- Every host's committed capacity, keyed the way a lease is attributed.
+SELECT COALESCE(node, target_node, '') AS node,
+       CAST(COALESCE(SUM(vcpu), 0) AS BIGINT) AS vcpu,
+       CAST(COALESCE(SUM(memory), 0) AS BIGINT) AS memory,
+       CAST(COALESCE(SUM(macos_slot), 0) AS BIGINT) AS macos_slots
+  FROM leases
+ WHERE phase NOT IN ('done','failed')
+ GROUP BY COALESCE(node, target_node, '');
+
 -- name: UsageByNodeAndTier :many
 -- Every host's committed capacity, by tier, keyed the way a lease is
 -- attributed, and how many leases each tier holds there.
 --
--- BY TIER AS WELL AS BY HOST, because a purchase needs both from the same open
--- leases: what each host has left, and what each tier holds toward its floor
--- (internal/alloc fleet.floorLeases). Two aggregations were two passes over
--- every open lease inside the purchase's write transaction, a quarter of its
--- time each at 4,096 leases (2026-10-25).
+-- BY TIER AS WELL AS BY HOST, for a deployment where a tier keeps a floor: a
+-- purchase there needs both from the same open leases, what each host has left
+-- and what each tier holds toward its floor (internal/alloc
+-- fleet.floorLeases), and two aggregations were two passes over every open
+-- lease inside the purchase's write transaction, a quarter of its time each
+-- at 4,096 leases. Without a floor UsageByNode is cheaper: four tiers' rows
+-- for every host cost the purchase more to read than the second pass saved
+-- (2026-10-25).
 SELECT COALESCE(node, target_node, '') AS node,
        tier,
        CAST(COALESCE(SUM(vcpu), 0) AS BIGINT) AS vcpu,

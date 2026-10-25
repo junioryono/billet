@@ -912,6 +912,52 @@ func (q *Queries) UpsertNodeRegistration(ctx context.Context, arg UpsertNodeRegi
 	return epoch, err
 }
 
+const usageByNode = `-- name: UsageByNode :many
+SELECT COALESCE(node, target_node, '') AS node,
+       CAST(COALESCE(SUM(vcpu), 0) AS BIGINT) AS vcpu,
+       CAST(COALESCE(SUM(memory), 0) AS BIGINT) AS memory,
+       CAST(COALESCE(SUM(macos_slot), 0) AS BIGINT) AS macos_slots
+  FROM leases
+ WHERE phase NOT IN ('done','failed')
+ GROUP BY COALESCE(node, target_node, '')
+`
+
+type UsageByNodeRow struct {
+	Node       string
+	Vcpu       int64
+	Memory     int64
+	MacosSlots int64
+}
+
+// Every host's committed capacity, keyed the way a lease is attributed.
+func (q *Queries) UsageByNode(ctx context.Context) ([]UsageByNodeRow, error) {
+	rows, err := q.db.QueryContext(ctx, usageByNode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []UsageByNodeRow
+	for rows.Next() {
+		var i UsageByNodeRow
+		if err := rows.Scan(
+			&i.Node,
+			&i.Vcpu,
+			&i.Memory,
+			&i.MacosSlots,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const usageByNodeAndTier = `-- name: UsageByNodeAndTier :many
 SELECT COALESCE(node, target_node, '') AS node,
        tier,
@@ -936,11 +982,14 @@ type UsageByNodeAndTierRow struct {
 // Every host's committed capacity, by tier, keyed the way a lease is
 // attributed, and how many leases each tier holds there.
 //
-// BY TIER AS WELL AS BY HOST, because a purchase needs both from the same open
-// leases: what each host has left, and what each tier holds toward its floor
-// (internal/alloc fleet.floorLeases). Two aggregations were two passes over
-// every open lease inside the purchase's write transaction, a quarter of its
-// time each at 4,096 leases (2026-10-25).
+// BY TIER AS WELL AS BY HOST, for a deployment where a tier keeps a floor: a
+// purchase there needs both from the same open leases, what each host has left
+// and what each tier holds toward its floor (internal/alloc
+// fleet.floorLeases), and two aggregations were two passes over every open
+// lease inside the purchase's write transaction, a quarter of its time each
+// at 4,096 leases. Without a floor UsageByNode is cheaper: four tiers' rows
+// for every host cost the purchase more to read than the second pass saved
+// (2026-10-25).
 func (q *Queries) UsageByNodeAndTier(ctx context.Context) ([]UsageByNodeAndTierRow, error) {
 	rows, err := q.db.QueryContext(ctx, usageByNodeAndTier)
 	if err != nil {
