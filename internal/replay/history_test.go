@@ -45,6 +45,28 @@ func ledgerRoundTrip(t *testing.T, direct bool) {
 		})
 	}
 
+	// A BACKLOG LAUNCHED TOGETHER: eight 4 vCPU jobs fill both hosts, then four
+	// 2 vCPU jobs arrive at one instant and wait; each 4 vCPU completion frees
+	// room for two of them, which one reconciliation launches in one step, so
+	// billet dates both identically and the export orders them by the identities
+	// it allocated them, downwards under direct assignment.
+	full := trace.Arrivals[len(trace.Arrivals)-1].At.Add(time.Hour)
+	for i := range 8 {
+		trace.Arrivals = append(trace.Arrivals, Arrival{
+			At: full, Tier: "billet-4vcpu", Repository: "api", RunID: int64(950 + i),
+			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+			Duration:    Duration(time.Duration(10+i) * time.Minute),
+		})
+	}
+
+	for i := range 4 {
+		trace.Arrivals = append(trace.Arrivals, Arrival{
+			At: full.Add(time.Second), Tier: "billet-2vcpu", Repository: "api", RunID: int64(970 + i),
+			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+			Duration:    Duration(time.Duration(1+i) * time.Minute),
+		})
+	}
+
 	trace.Normalize()
 
 	// EVERY FIFTH JOB HAS NO NAME, which must come back as none.
@@ -79,6 +101,18 @@ func ledgerRoundTrip(t *testing.T, direct bool) {
 	if gaps.Read != len(trace.Arrivals) || gaps.NeverStarted+gaps.NeverCompleted+gaps.NotARuntime+
 		gaps.UndeclaredTier+gaps.AssignedAsArrival+gaps.Unidentified != 0 || gaps.Partial {
 		t.Errorf("the export read %+v; want every job and no gap", gaps)
+	}
+
+	// THE HARNESS'S NANOSECOND: two events at one instant are dated a
+	// nanosecond apart (Clock.Step), so a job started in the same step as
+	// another is recorded a nanosecond late while its completion is where the
+	// trace put it, and its runtime reads that much short. Within a microsecond
+	// a duration is the trace's; anything more is the export's.
+	for i := range min(len(exported.Arrivals), len(trace.Arrivals)) {
+		got, want := &exported.Arrivals[i].Duration, trace.Arrivals[i].Duration
+		if d := time.Duration(*got - want); d != 0 && d > -time.Microsecond && d < time.Microsecond {
+			*got = want
+		}
 	}
 
 	if !reflect.DeepEqual(exported, trace) {
@@ -183,6 +217,17 @@ func TestAHorizonCountsTheJobsStillQueued(t *testing.T) {
 		t.Errorf("the percentiles cover %d jobs, %d started, %d still queued, of %d in the window", got,
 			started, len(report.StillQueued), len(trace.Arrivals)-1)
 	}
+
+	// A JOB A RUNNER HAS TAKEN AND NOT YET STARTED IS QUEUED, NOT LOST: under
+	// direct assignment ten seconds in, every runner minted is still in its
+	// thirty-second boot, and its pool lease names no job yet.
+	booting := Run(t, twoHosts(config.PlacementPack), IdleBacklog(9, Params{Jobs: 24}),
+		Options{DirectAssignment: true, Until: DefaultStart.Add(10 * time.Second)})
+
+	if len(booting.Missing) != 0 || len(booting.StillQueued) == 0 {
+		t.Errorf("inside the boot: missing %v, %d still queued; want every arrived job still queued",
+			booting.Missing, len(booting.StillQueued))
+	}
 }
 
 // A JOB BILLET REFUSES TO BUY FOR IS COUNTED ONCE, per tier, under either
@@ -254,10 +299,14 @@ func TestFairHoldsTheLineWhereFillDoesNot(t *testing.T) {
 	c := Compare(t, fleet, trace, DefaultPolicies, Options{DirectAssignment: true})
 	t.Log("\n" + c.Markdown())
 
+	// UNDER FAIR IT STARTS WHEN THE FIRST FOUR END, eight minutes in, plus the
+	// boot: the small jobs that arrived meanwhile were held. UNDER FILL THE
+	// STREAM BACKFILLS every fragment, and it starts only once the stream ends,
+	// two hours in.
 	fair, fill := c.Reports[0].QueueWaitByShape()[16], c.Reports[1].QueueWaitByShape()[16]
-	if fair.Count != 1 || fill.Count != 1 || fair.Max >= fill.Max {
-		t.Errorf("the wide job waited %s under fair and %s under fill; want fair to start it sooner", fair.Max,
-			fill.Max)
+	if fair.Count != 1 || fill.Count != 1 || fair.Max > 10*time.Minute || fill.Max < time.Hour {
+		t.Errorf("the wide job waited %s under fair and %s under fill; want under ten minutes and over an hour",
+			fair.Max, fill.Max)
 	}
 }
 

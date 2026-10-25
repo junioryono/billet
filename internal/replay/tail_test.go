@@ -115,3 +115,32 @@ func TestUtilizationAndEmptyHostTimeAreIntegratedFromTheCharges(t *testing.T) {
 		t.Errorf("to the horizon, mean utilization %.4f; want 8 of 18 vCPU-hours", vcpu)
 	}
 }
+
+// A HORIZON EXCUSES ONLY A COMPLETION DUE AFTER IT: a job that started and was
+// due to finish before the horizon, and that the ledger never saw finish, is a
+// completion that was delivered and lost.
+func TestAHorizonExcusesOnlyCompletionsDueAfterIt(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+	trace := Trace{Arrivals: []Arrival{
+		{Seq: 1, At: start, Duration: Duration(time.Minute)},
+		{Seq: 2, At: start, Duration: Duration(time.Hour)},
+		{Seq: 3, At: start, Duration: Duration(time.Minute)},
+	}}
+
+	r := &Report{Horizon: start.Add(10 * time.Minute), Records: []Record{
+		{Seq: 1, StartedAt: start},
+		{Seq: 2, StartedAt: start},
+		{Seq: 3, StartedAt: start, FinishedAt: start.Add(time.Minute)},
+	}}
+
+	if got := r.finishedBeforeHorizon(trace); len(got) != 1 || got[0] != 1 {
+		t.Errorf("unfinished before the horizon: %v; want job 1 alone, whose minute ended before it", got)
+	}
+
+	r.Horizon = time.Time{}
+	if got := r.finishedBeforeHorizon(trace); got != nil {
+		t.Errorf("with no horizon: %v; want nothing, Unfinished says it", got)
+	}
+}

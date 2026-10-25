@@ -185,6 +185,10 @@ type plane struct {
 	// which jobs were counted.
 	declined    map[string]int
 	refusedJobs map[int64]bool
+	// booting are the jobs a minted runner has taken whose start has not been
+	// delivered: GitHub still holds them for the runner, which the ledger may
+	// not yet have named.
+	booting map[int64]bool
 }
 
 var (
@@ -212,6 +216,7 @@ func newPlane(t *testing.T, clock *Clock, fleet Fleet, trace Trace) *plane {
 		nextRunner:  1000,
 		declined:    map[string]int{},
 		refusedJobs: map[int64]bool{},
+		booting:     map[int64]bool{},
 	}
 	p.cond = sync.NewCond(&p.mu)
 
@@ -582,6 +587,7 @@ func (p *plane) mint(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 	}
 
 	if rn.job != 0 {
+		p.booting[rn.job] = true
 		started := p.clock.Now().Add(p.boot)
 		heap.Push(&p.events, event{at: started, kind: eventStarted, seq: rn.job, runner: rn})
 		heap.Push(&p.events, event{
@@ -1109,6 +1115,7 @@ func (p *plane) deliver(ev event) {
 		p.pushLocked(s, nil, []int64{a.Seq}, p.jobJSON("JobAvailable", a, fakeactions.JobFields{}))
 
 	case eventStarted:
+		delete(p.booting, a.Seq)
 		p.pushLocked(ev.runner.set, nil, nil, p.jobJSON("JobStarted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name,
 		}))
@@ -1122,8 +1129,9 @@ func (p *plane) deliver(ev event) {
 }
 
 // waitingJobs is every job GitHub still holds for a runner: offered or
-// assigned and not yet taken, in the plane's own books. A job the ledger has no
-// row for and the plane does not hold either is lost, not queued.
+// assigned and not yet taken, or taken by a runner still booting, in the
+// plane's own books. A job the ledger has no row for and the plane does not
+// hold either is lost, not queued.
 func (p *plane) waitingJobs() map[int64]bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1142,6 +1150,10 @@ func (p *plane) waitingJobs() map[int64]bool {
 		for _, id := range s.inflight {
 			out[id] = true
 		}
+	}
+
+	for id := range p.booting {
+		out[id] = true
 	}
 
 	return out

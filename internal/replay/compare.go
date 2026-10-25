@@ -66,6 +66,11 @@ func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Opt
 				p.Name, r.Unstarted, r.Unfinished)
 		}
 
+		if late := r.finishedBeforeHorizon(trace); len(late) > 0 {
+			t.Fatalf("replay: under %s jobs %v started and were due to finish by the horizon, and the ledger "+
+				"never saw them finish", p.Name, late)
+		}
+
 		c.Reports = append(c.Reports, r)
 	}
 

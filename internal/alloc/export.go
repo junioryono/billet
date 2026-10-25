@@ -51,11 +51,13 @@ type ExportGaps struct {
 // own so the runtime fallbacks still find a job's name. Only jobs of tiers in
 // this allocator's catalogue are carried, since a replay needs their shape.
 //
-// SAME-INSTANT ARRIVALS ARE ORDERED AS BILLET WAS ASSIGNED THEM, then by
-// request id, GitHub's job id and lease, so a trace exported twice, or a
-// replayed trace exported back, numbers its jobs the same way under either
-// protocol: a direct assignment's request id is billet's own, allocated
-// downwards, and says nothing of the order the jobs arrived in.
+// SAME-INSTANT ARRIVALS ARE ORDERED AS BILLET WAS FIRST ASSIGNED THEM
+// (queued_at, which the row keeps from its first assignment, where assigned_at
+// moves on a reassignment), then by request id in the order it was allocated,
+// GitHub's job id and lease, so a trace exported twice, or a replayed trace
+// exported back, numbers its jobs the same way under either protocol: GitHub's
+// request ids rise, and billet's own, which a direct assignment and a pool slot
+// carry, are negative and allocated downwards (requestOrder).
 //
 // A TIME THAT DOES NOT READ IS AN ERROR naming the lease and the column, never
 // a time not recorded: read as absent, an unreadable start would drop the job
@@ -91,11 +93,11 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 	gaps.Read = len(rows)
 
 	type keyed struct {
-		arrival  jobtrace.Arrival
-		assigned time.Time
-		request  int64
-		job      string
-		lease    string
+		arrival       jobtrace.Arrival
+		firstAssigned time.Time
+		request       int64
+		job           string
+		lease         string
 	}
 
 	stand := newStandIns(names)
@@ -118,7 +120,7 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 			times[j] = t
 		}
 
-		started, completed, queued, assigned := times[0], times[1], times[2], times[3]
+		started, completed, queued, firstAssigned := times[0], times[1], times[2], times[3]
 
 		switch {
 		case started.IsZero():
@@ -143,7 +145,7 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 
 		at := queued
 		if at.IsZero() {
-			at = assigned
+			at = firstAssigned
 			gaps.AssignedAsArrival++
 		}
 
@@ -160,13 +162,13 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 				Job: job, RunID: stand.run(r.RunID), Duration: jobtrace.Duration(completed.Sub(started)),
 				Result: r.Result,
 			},
-			assigned: assigned, request: r.RequestID, job: r.GithubJobID, lease: r.LeaseID,
+			firstAssigned: firstAssigned, request: r.RequestID, job: r.GithubJobID, lease: r.LeaseID,
 		})
 	}
 
 	slices.SortStableFunc(out, func(x, y keyed) int {
-		return cmp.Or(x.arrival.At.Compare(y.arrival.At), x.assigned.Compare(y.assigned),
-			cmp.Compare(x.request, y.request), cmp.Compare(x.job, y.job), cmp.Compare(x.lease, y.lease))
+		return cmp.Or(x.arrival.At.Compare(y.arrival.At), x.firstAssigned.Compare(y.firstAssigned),
+			requestOrder(x.request, y.request), cmp.Compare(x.job, y.job), cmp.Compare(x.lease, y.lease))
 	})
 
 	trace := jobtrace.Trace{Arrivals: make([]jobtrace.Arrival, 0, len(out))}
@@ -177,6 +179,22 @@ func (a *Allocator) ExportTrace(ctx context.Context, since, until time.Time, nam
 	trace.Normalize()
 
 	return trace, gaps, nil
+}
+
+// requestOrder compares two request ids in the order they were allocated:
+// GitHub's, positive, rise; billet's own, negative, fall from -1; and
+// GitHub's come before billet's.
+func requestOrder(x, y int64) int {
+	switch {
+	case x < 0 && y < 0:
+		return cmp.Compare(y, x)
+	case x < 0:
+		return 1
+	case y < 0:
+		return -1
+	default:
+		return cmp.Compare(x, y)
+	}
 }
 
 // strictStamp reads a time the ledger wrote: the empty string is a time not

@@ -375,6 +375,36 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 	return r, nil
 }
 
+// finishedBeforeHorizon lists the started jobs the ledger never saw finish
+// although the trace has them complete by the horizon: a completion the
+// horizon cannot explain, because it was delivered. Nothing without a horizon,
+// where Unfinished says the same of every job.
+func (r *Report) finishedBeforeHorizon(trace Trace) []int64 {
+	if r.Horizon.IsZero() {
+		return nil
+	}
+
+	duration := make(map[int64]time.Duration, len(trace.Arrivals))
+	for i := range trace.Arrivals {
+		duration[trace.Arrivals[i].Seq] = time.Duration(trace.Arrivals[i].Duration)
+	}
+
+	var out []int64
+
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.StartedAt.IsZero() || !rec.FinishedAt.IsZero() {
+			continue
+		}
+
+		if !rec.StartedAt.Add(duration[rec.Seq]).After(r.Horizon) {
+			out = append(out, rec.Seq)
+		}
+	}
+
+	return out
+}
+
 // complete refuses a history read that filled its bound: a truncated ledger
 // proves less than it seems to, and nothing in the rows says they are all.
 func complete(rows int, bound int64) error {
