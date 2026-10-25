@@ -42,6 +42,18 @@ const MaxFlows = 1 << 16
 // to an interval later, and the tracker reports a flow's end only once.
 const MaxUnclaimed = 4096
 
+// SlowReply is the wait for a flow's first packet back past which it is slow:
+// TCP's initial retransmission timeout (RFC 6298), so a connect slower than it
+// is one whose SYN the guest was already sending again. A DNS query over it is
+// one a resolver answered after the guest's own first retry would be due.
+const SlowReply = time.Second
+
+// replyMatch bounds how far a counted flow's start may lie from the new event a
+// wait was timed from. The two events come on separate sockets and an id is
+// reused once its entry is gone, so a wait is a flow's only when its start is
+// the moment that new event was read; otherwise the flow is left untimed.
+const replyMatch = time.Second
+
 // Flow is one tracked connection, in the tracker's own terms: Orig is the
 // direction the guest opened, Reply the other.
 type Flow struct {
@@ -58,6 +70,12 @@ type Flow struct {
 	// OrigBytes is what the guest sent, ReplyBytes what it received.
 	OrigBytes, ReplyBytes     uint64
 	OrigPackets, ReplyPackets uint64
+	// ReplyWait is how long the flow waited for its first packet back: from
+	// the tracker's event creating it to its first event that saw a reply,
+	// both read on the node's clock. ReplyTimed says it was; the entry itself
+	// carries neither.
+	ReplyWait  time.Duration
+	ReplyTimed bool
 }
 
 // entry is a flow's identity across readings.
@@ -79,6 +97,12 @@ type Destination struct {
 	// a DNS query among them, that drew no reply. Where a job stalled before it
 	// reached anyone, this is the count that names the destination.
 	Unanswered uint64
+	// TimedReplies is how many of the answered connections had their first
+	// reply timed, SlowReplies how many of those waited longer than SlowReply,
+	// and SlowestReply the longest of their waits. A slow resolver or a shaped
+	// uplink shows here, where nothing went unanswered.
+	TimedReplies, SlowReplies uint64
+	SlowestReply              time.Duration
 }
 
 // Result is what a job's flows came to.
@@ -99,6 +123,11 @@ type Result struct {
 	// no flow has while the tracker keeps them, so no destination's Unanswered
 	// can be told from none.
 	UnansweredUnknown bool
+	// RepliesTimed says the tracker's new and reply events were read for the
+	// whole of the job's time, so a destination's TimedReplies and its waits
+	// are measured; a connection still left untimed then is one whose new
+	// event came before the job was watched or could not be matched.
+	RepliesTimed bool
 }
 
 // Accountant attributes flows to watched jobs. Safe for concurrent use: the
@@ -127,6 +156,11 @@ type Accountant struct {
 	// missing flows.
 	down      bool
 	lossEnded time.Time
+	// repliesDown says the new and reply events are not being read now, and
+	// repliesLossEnded when the latest such gap closed. It starts down: no job
+	// is timed until a listener is proved reading.
+	repliesDown      bool
+	repliesLossEnded time.Time
 	// now is the clock an unstamped flow's eviction is dated by.
 	now func() time.Time
 }
@@ -151,11 +185,26 @@ type watch struct {
 	// whose tuple the guest could reuse unnoticed, a flow with no start time,
 	// one past MaxFlows, or one the unclaimed ring dropped.
 	unansweredUnknown bool
+	// untimed says the new and reply events were not all read while the job
+	// held its address. pending holds when each flow's new event was read, and
+	// waits each first reply's wait, by the tracker's id, until a counted flow
+	// whose start matches takes it.
+	untimed bool
+	pending map[uint32]time.Time
+	waits   map[uint32]replyWait
+}
+
+// replyWait is one flow's wait for its first reply, and when its new event
+// was read.
+type replyWait struct {
+	opened time.Time
+	wait   time.Duration
 }
 
 // NewAccountant returns an Accountant watching nothing.
 func NewAccountant() *Accountant {
-	return &Accountant{byKey: map[string]*watch{}, byAddr: map[netip.Addr]*watch{}, now: time.Now}
+	return &Accountant{byKey: map[string]*watch{}, byAddr: map[netip.Addr]*watch{}, now: time.Now,
+		repliesDown: true}
 }
 
 // Watch starts attributing flows from addr to the job named key, counting only
@@ -182,7 +231,8 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 		delete(a.byAddr, old.addr)
 	}
 
-	w := &watch{addr: addr, since: since, counted: map[entry]Flow{}, inherited: map[entry]Flow{}}
+	w := &watch{addr: addr, since: since, counted: map[entry]Flow{}, inherited: map[entry]Flow{},
+		pending: map[uint32]time.Time{}, waits: map[uint32]replyWait{}}
 
 	// A GAP IN THE EVENTS, OR A FLOW THE RING DROPPED, SINCE THE GRANT: either
 	// may have been this guest's.
@@ -192,6 +242,9 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 	}
 	if !a.evictedCounterless.Before(since) {
 		w.unansweredUnknown = true
+	}
+	if a.repliesDown || !a.repliesLossEnded.Before(since) {
+		w.untimed = true
 	}
 
 	for i := range open {
@@ -289,7 +342,52 @@ func (a *Accountant) observe(f Flow) {
 		return
 	}
 
+	switch r, ok := w.waits[f.ID]; {
+	case ok && f.Start.Sub(r.opened).Abs() <= replyMatch:
+		f.ReplyWait, f.ReplyTimed = r.wait, true
+	case seen && prev.ReplyTimed:
+		f.ReplyWait, f.ReplyTimed = prev.ReplyWait, true
+	}
+
 	w.counted[key] = f
+}
+
+// ObserveNew records that the tracker created flow id from src, read at at.
+// Its wait for a first reply is timed from here. An id is reused only once its
+// entry is gone, so a new event for an id drops whatever an earlier flow left.
+func (a *Accountant) ObserveNew(id uint32, src netip.Addr, at time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	w, ok := a.byAddr[src.Unmap()]
+	if !ok {
+		return
+	}
+	delete(w.waits, id)
+	if len(w.pending) < MaxFlows {
+		w.pending[id] = at
+	}
+}
+
+// ObserveReply records that flow id from src first saw a reply, read at at.
+// Only the first reply after its new event is its wait; every later event is
+// the flow's state moving on.
+func (a *Accountant) ObserveReply(id uint32, src netip.Addr, at time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	w, ok := a.byAddr[src.Unmap()]
+	if !ok {
+		return
+	}
+	opened, ok := w.pending[id]
+	if !ok {
+		return
+	}
+	delete(w.pending, id)
+	if len(w.waits) < MaxFlows {
+		w.waits[id] = replyWait{opened: opened, wait: max(at.Sub(opened), 0)}
+	}
 }
 
 func (a *Accountant) keepUnclaimed(f Flow) {
@@ -341,6 +439,31 @@ func (a *Accountant) Up(now time.Time) {
 
 	if a.down {
 		a.down, a.lossEnded = false, now
+	}
+}
+
+// RepliesDown says the tracker's new and reply events stopped being read at the
+// moment it is called: no job watched now, or started before RepliesUp, is
+// timed.
+func (a *Accountant) RepliesDown() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.repliesDown = true
+
+	for _, w := range a.byKey {
+		w.untimed = true
+	}
+}
+
+// RepliesUp says the tracker's new and reply events are being read again, from
+// now.
+func (a *Accountant) RepliesUp(now time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.repliesDown {
+		a.repliesDown, a.repliesLossEnded = false, now
 	}
 }
 
@@ -420,6 +543,13 @@ func summarize(w *watch) Result {
 		case f.OrigPackets > 0 && f.ReplyPackets == 0:
 			d.Unanswered++
 		}
+		if f.ReplyTimed && f.ReplyPackets > 0 {
+			d.TimedReplies++
+			if f.ReplyWait > SlowReply {
+				d.SlowReplies++
+			}
+			d.SlowestReply = max(d.SlowestReply, f.ReplyWait)
+		}
 	}
 
 	all := make([]Destination, 0, len(byDest))
@@ -437,7 +567,7 @@ func summarize(w *watch) Result {
 		return x.Addr.Compare(y.Addr)
 	})
 
-	r := Result{Incomplete: w.incomplete, UnansweredUnknown: unknown}
+	r := Result{Incomplete: w.incomplete, UnansweredUnknown: unknown, RepliesTimed: !w.untimed}
 
 	if len(all) > MaxDestinations {
 		for _, d := range all[MaxDestinations:] {
@@ -445,6 +575,9 @@ func summarize(w *watch) Result {
 			r.Other.Received += d.Received
 			r.Other.Connections += d.Connections
 			r.Other.Unanswered += d.Unanswered
+			r.Other.TimedReplies += d.TimedReplies
+			r.Other.SlowReplies += d.SlowReplies
+			r.Other.SlowestReply = max(r.Other.SlowestReply, d.SlowestReply)
 		}
 
 		all = all[:MaxDestinations]

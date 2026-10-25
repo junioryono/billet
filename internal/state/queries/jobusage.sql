@@ -76,34 +76,41 @@ SELECT codec, series FROM job_series WHERE lease_id = @lease_id;
 -- packDestinations: a 3-digit ordinal, the address space-padded to 39
 -- characters, then the sent, received and connection counts as 19 zero-padded
 -- digits each, then the unanswered count the same way or 19 spaces where the
--- report did not count it (migration 68), 118 characters a row) and the
--- recursive slot list below cuts one record off the front at each step.
+-- report did not count it (migration 68), then the timed replies, the slow
+-- replies and the slowest reply's milliseconds the same way or 19 spaces each
+-- where the report did not time them (migration 69), 175 characters a row) and
+-- the recursive slot list below cuts one record off the front at each step.
 --
 -- EACH STEP CARRIES THE REST rather than indexing into the whole string,
 -- because both engines find a character offset in TEXT by scanning from its
 -- start: indexed, the same report took 57 ms on PostgreSQL.
 WITH RECURSIVE slot (n, rec, rest) AS (
-    SELECT 0, substr(CAST(@packed AS TEXT), 1, 118),
-           substr(CAST(@packed AS TEXT), 119)
+    SELECT 0, substr(CAST(@packed AS TEXT), 1, 175),
+           substr(CAST(@packed AS TEXT), 176)
      WHERE 0 < CAST(@row_count AS BIGINT)
     UNION ALL
-    SELECT n + 1, substr(rest, 1, 118), substr(rest, 119)
+    SELECT n + 1, substr(rest, 1, 175), substr(rest, 176)
       FROM slot WHERE n + 1 < CAST(@row_count AS BIGINT)
 )
 INSERT INTO job_destinations
-     (lease_id, ordinal, addr, sent_bytes, received_bytes, connections, unanswered)
+     (lease_id, ordinal, addr, sent_bytes, received_bytes, connections, unanswered,
+      timed_replies, slow_replies, slowest_reply_ms)
 SELECT CAST(@lease_id AS TEXT),
        CAST(substr(rec, 1, 3) AS BIGINT),
        rtrim(substr(rec, 4, 39)),
        CAST(substr(rec, 43, 19) AS BIGINT),
        CAST(substr(rec, 62, 19) AS BIGINT),
        CAST(substr(rec, 81, 19) AS BIGINT),
-       CAST(NULLIF(rtrim(substr(rec, 100, 19)), '') AS BIGINT)
+       CAST(NULLIF(rtrim(substr(rec, 100, 19)), '') AS BIGINT),
+       CAST(NULLIF(rtrim(substr(rec, 119, 19)), '') AS BIGINT),
+       CAST(NULLIF(rtrim(substr(rec, 138, 19)), '') AS BIGINT),
+       CAST(NULLIF(rtrim(substr(rec, 157, 19)), '') AS BIGINT)
   FROM slot;
 
 -- name: ReadJobDestinations :many
 -- One lease's destinations in the order the node gave them, the total beyond
 -- them last.
-SELECT ordinal, addr, sent_bytes, received_bytes, connections, unanswered
+SELECT ordinal, addr, sent_bytes, received_bytes, connections, unanswered,
+       timed_replies, slow_replies, slowest_reply_ms
   FROM job_destinations WHERE lease_id = @lease_id
  ORDER BY ordinal;

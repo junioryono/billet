@@ -16,17 +16,19 @@ func TestDestinationsArePackedWholeOrNotAtAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the most a report can name was refused: %v", err)
 	}
-	if rows != MaxJobDestinations+1 || len(packed) != rows*packedRowWidth || packedRowWidth != 118 {
-		t.Fatalf("packed %d rows into %d characters, want %d rows of 118", rows, len(packed),
+	if rows != MaxJobDestinations+1 || len(packed) != rows*packedRowWidth || packedRowWidth != 175 {
+		t.Fatalf("packed %d rows into %d characters, want %d rows of 175", rows, len(packed),
 			MaxJobDestinations+1)
 	}
+	most := strings.Repeat("9223372036854775807", 3)
 	if first := packed[:packedRowWidth]; first != "000ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe"+
-		strings.Repeat("9223372036854775807", 4) {
+		most+strings.Repeat("0", 19)+most {
 		t.Errorf("the first row packs as %q", first)
 	}
 	zeros := strings.Repeat("0", 17)
+	times := zeros + "01" + zeros + "00" + strings.Repeat("0", 16) + "300"
 	if last := packed[len(packed)-packedRowWidth:]; last != "256"+strings.Repeat(" ", 39)+
-		zeros+"07"+zeros+"11"+zeros+"03"+zeros+"02" {
+		zeros+"07"+zeros+"11"+zeros+"03"+zeros+"02"+times {
 		t.Errorf("the rest packs as %q", last)
 	}
 
@@ -38,8 +40,20 @@ func TestDestinationsArePackedWholeOrNotAtAll(t *testing.T) {
 		t.Fatalf("a report that did not count unanswered connections was refused: %v", err)
 	}
 	if last := packed[len(packed)-packedRowWidth:]; last != "256"+strings.Repeat(" ", 39)+
-		zeros+"07"+zeros+"11"+zeros+"03"+strings.Repeat(" ", 19) {
+		zeros+"07"+zeros+"11"+zeros+"03"+strings.Repeat(" ", 19)+times {
 		t.Errorf("the rest of a report that did not count packs as %q", last)
+	}
+
+	// NOT TIMED IS SPACES TOO, never zeros, which would read back as a
+	// destination that never answered slowly.
+	untimed := fullDestinations().WithoutReplyTimes()
+	packed, _, err = packDestinations(&untimed)
+	if err != nil {
+		t.Fatalf("a report that did not time replies was refused: %v", err)
+	}
+	if last := packed[len(packed)-packedRowWidth:]; last != "256"+strings.Repeat(" ", 39)+
+		zeros+"07"+zeros+"11"+zeros+"03"+zeros+"02"+strings.Repeat(" ", 3*19) {
+		t.Errorf("the rest of a report that did not time packs as %q", last)
 	}
 
 	for name, dest := range map[string]JobDestination{

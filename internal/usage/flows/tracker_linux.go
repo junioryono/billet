@@ -64,7 +64,26 @@ func NewTracker(log *slog.Logger) *Tracker {
 // events it cannot deliver; while the listener is not reading, for that or
 // any other reason, a is told the events are down, and every job whose time
 // overlaps the gap is marked incomplete.
+//
+// BESIDE IT, ON A SOCKET OF ITS OWN, every new flow and every update that saw a
+// reply, which time each flow's wait for its first answer. Its own socket, so
+// the far busier stream (measured 2026-10-25: 20,000 connections in 2.4 s
+// raised 20,000 new and 100,003 update events, against one destruction each)
+// can fill and drop without marking a single byte total incomplete; a gap in
+// it leaves the jobs it overlapped untimed instead.
 func (t *Tracker) Run(ctx context.Context, a *Accountant) {
+	var replies sync.WaitGroup
+
+	replies.Add(1)
+
+	go func() {
+		defer replies.Done()
+
+		t.runReplies(ctx, a)
+	}()
+
+	defer replies.Wait()
+
 	a.Down()
 
 	backoff := time.Second
@@ -93,6 +112,91 @@ func (t *Tracker) Run(ctx context.Context, a *Accountant) {
 		}
 
 		backoff = min(2*backoff, time.Minute)
+	}
+}
+
+// runReplies reports new flows and first replies to a until ctx ends, saying
+// the timing is down while it is not reading.
+func (t *Tracker) runReplies(ctx context.Context, a *Accountant) {
+	a.RepliesDown()
+
+	backoff := time.Second
+
+	for ctx.Err() == nil {
+		err := t.listenReplies(ctx, a)
+
+		a.RepliesDown()
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		t.log.Warn("the connection-tracking listener for first replies stopped; jobs running now "+
+			"report their destinations without reply times", "error", err, "retry_in", backoff)
+
+		wait := time.NewTimer(backoff)
+
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+
+			return
+		case <-wait.C:
+		}
+
+		backoff = min(2*backoff, time.Minute)
+	}
+}
+
+// listenReplies reads one connection's new and update events. Each is timed
+// as it is read: neither carries the entry's own timestamps or counters
+// (measured 2026-10-25), so the wait is the time between reading a flow's new
+// event and reading its first update that saw a reply, on one clock.
+func (t *Tracker) listenReplies(ctx context.Context, a *Accountant) error {
+	conn, err := conntrack.Dial(nil)
+	if err != nil {
+		return fmt.Errorf("open the connection tracker: %w", err)
+	}
+
+	if err := conn.SetReadBuffer(readBuffer); err != nil {
+		t.log.Debug("could not raise the connection tracker's read buffer for first replies", "error", err)
+	}
+
+	events := make(chan conntrack.Event, 1024)
+
+	errs, err := conn.Listen(events, 1, []netfilter.NetlinkGroup{netfilter.GroupCTNew, netfilter.GroupCTUpdate})
+	if err != nil {
+		_ = conn.Close()
+
+		return fmt.Errorf("listen for new flows and their replies: %w", err)
+	}
+
+	defer closeDraining(conn, events, errs)
+
+	a.RepliesUp(time.Now())
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-errs:
+			return err
+		case ev := <-events:
+			at := time.Now()
+
+			if ev.Flow == nil {
+				continue
+			}
+
+			src := ev.Flow.TupleOrig.IP.SourceAddress
+
+			switch {
+			case ev.Type == conntrack.EventNew:
+				a.ObserveNew(ev.Flow.ID, src, at)
+			case ev.Type == conntrack.EventUpdate && ev.Flow.Status.SeenReply():
+				a.ObserveReply(ev.Flow.ID, src, at)
+			}
+		}
 	}
 }
 

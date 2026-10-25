@@ -704,3 +704,113 @@ func TestReadyNeedsBothSwitchesAndTellsUnreadableFromOff(t *testing.T) {
 		}
 	}
 }
+
+// A FLOW'S WAIT FOR ITS FIRST REPLY IS TIMED FROM ITS NEW EVENT TO ITS FIRST
+// EVENT THAT SAW A REPLY, and counted against its destination: a slow answer
+// is the stall nothing else records, because nothing went unanswered. A flow
+// that was never answered, one whose new event was not read, and one whose
+// start is not the moment its new event was read (an id reused across the two
+// sockets) are left untimed rather than given a wait that is not theirs; and
+// only the first reply is the wait, every later update being the flow moving
+// on.
+func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
+	t.Parallel()
+
+	resolver := netip.MustParseAddr("172.31.1.1")
+	a := NewAccountant()
+	a.RepliesUp(began.Add(-time.Hour))
+	a.Watch("lease-1", guest, began, nil)
+
+	answer := func(id uint32, dst netip.Addr, wait time.Duration) Flow {
+		a.ObserveNew(id, guest, started)
+		a.ObserveReply(id, guest, started.Add(wait))
+		a.ObserveReply(id, guest, started.Add(wait+time.Minute))
+
+		return flow(id, guest, dst, 100, 100)
+	}
+	a.Observe(answer(1, github, 40*time.Millisecond))
+	a.Observe(answer(2, github, 2500*time.Millisecond))
+	a.Observe(answer(3, resolver, 1600*time.Millisecond))
+	a.ObserveNew(4, guest, started)
+	a.Observe(flow(4, guest, github, 60, 0))
+	a.Observe(flow(5, guest, github, 100, 100))
+	a.ObserveNew(6, guest, started.Add(10*time.Second))
+	a.ObserveReply(6, guest, started.Add(10*time.Second+time.Millisecond))
+	a.Observe(flow(6, guest, github, 100, 100))
+	// A READING WITH NOTHING BACK IN IT, beside a reply event, is counted as the
+	// reading says, unanswered, and not also as a timed reply.
+	stale := answer(7, resolver, 50*time.Millisecond)
+	stale.ReplyBytes, stale.ReplyPackets = 0, 0
+	a.Observe(stale)
+
+	r, _ := a.Final("lease-1", nil, ended)
+	if !r.RepliesTimed {
+		t.Fatal("a job watched while the reply events were read is not timed")
+	}
+	want := map[netip.Addr]Destination{
+		github: {Addr: github, Sent: 460, Received: 400, Connections: 5, Unanswered: 1,
+			TimedReplies: 2, SlowReplies: 1, SlowestReply: 2500 * time.Millisecond},
+		resolver: {Addr: resolver, Sent: 200, Received: 100, Connections: 2, Unanswered: 1,
+			TimedReplies: 1, SlowReplies: 1, SlowestReply: 1600 * time.Millisecond},
+	}
+	if len(r.Destinations) != len(want) {
+		t.Fatalf("destinations = %+v, want %+v", r.Destinations, want)
+	}
+	for _, d := range r.Destinations {
+		if d != want[d.Addr] {
+			t.Errorf("destination %s = %+v,\nwant %+v", d.Addr, d, want[d.Addr])
+		}
+	}
+
+	// BEYOND THE CAP the timed counts are summed under Other and its slowest
+	// wait is the slowest of theirs.
+	beyond := NewAccountant()
+	beyond.RepliesUp(began.Add(-time.Hour))
+	beyond.Watch("lease-2", guest, began, nil)
+	for i := range MaxDestinations + 2 {
+		dst := netip.AddrFrom4([4]byte{10, 3, byte(i / 256), byte(i % 256)})
+		f := flow(uint32(i+1), guest, dst, 1000, 1000)
+		if i >= MaxDestinations {
+			f = flow(uint32(i+1), guest, dst, 1, 1)
+			beyond.ObserveNew(f.ID, guest, started)
+			beyond.ObserveReply(f.ID, guest, started.Add(time.Duration(i-MaxDestinations)*time.Second+1))
+		}
+		beyond.Observe(f)
+	}
+	r, _ = beyond.Final("lease-2", nil, ended)
+	if r.Other.TimedReplies != 2 || r.Other.SlowReplies != 1 || r.Other.SlowestReply != time.Second+1 {
+		t.Errorf("Other = %+v, want two timed replies beyond the cap, one slow, the slowest just over 1s",
+			r.Other)
+	}
+}
+
+// A JOB IS TIMED ONLY WHILE THE REPLY EVENTS WERE READ FOR ALL OF ITS TIME: an
+// accountant no listener ever fed, a gap that closed after the job's grant,
+// and a gap during the job each leave it untimed, which a report says as not
+// timed rather than as no slow replies.
+func TestAJobIsTimedOnlyWhileTheReplyEventsWereRead(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		prepare, during func(*Accountant)
+		timed           bool
+	}{
+		"read throughout":                   {prepare: func(a *Accountant) { a.RepliesUp(began.Add(-time.Hour)) }, timed: true},
+		"no listener ever read them":        {},
+		"a gap that closed after the grant": {prepare: func(a *Accountant) { a.RepliesUp(began.Add(time.Second)) }},
+		"a gap during the job": {prepare: func(a *Accountant) { a.RepliesUp(began.Add(-time.Hour)) },
+			during: func(a *Accountant) { a.RepliesDown(); a.RepliesUp(started.Add(time.Minute)) }},
+	} {
+		a := NewAccountant()
+		if tc.prepare != nil {
+			tc.prepare(a)
+		}
+		a.Watch("lease", guest, began, nil)
+		if tc.during != nil {
+			tc.during(a)
+		}
+		if r, _ := a.Final("lease", nil, ended); r.RepliesTimed != tc.timed {
+			t.Errorf("%s: RepliesTimed = %v, want %v", name, r.RepliesTimed, tc.timed)
+		}
+	}
+}

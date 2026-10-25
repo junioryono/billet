@@ -36,12 +36,13 @@ branches   4.2 mispredicted per 1,000 instructions
 frontend   stalled 27.9% of cycles
 
 destinations 3 by total bytes, from the host's connection tracker (attributed by the guest's source address)
-           address                sent    received  connections  unanswered
-           140.82.112.4        3.0 MiB   335.7 MiB            4           0
-           185.199.108.133   400.4 KiB    58.2 MiB           12           0
-           10.0.0.2           23.4 KiB    59.6 KiB          310           2
+           address                sent    received  connections  unanswered  slowest reply
+           140.82.112.4        3.0 MiB   335.7 MiB            4           0          62 ms
+           185.199.108.133   400.4 KiB    58.2 MiB           12           0          41 ms
+           10.0.0.2           23.4 KiB    59.6 KiB          310           2          2.6 s
 other      sent 8.8 KiB, received 117.2 KiB, 3 connections, 0 unanswered (beyond the 256 destinations the node keeps by name)
 unanswered 2 connections got nothing back (a SYN nothing answered, or a datagram, a DNS query among them, with no reply): 10.0.0.2 2
+slow       3 of 327 timed replies came after more than 1 s, TCP's first retransmission (a resolver that answered late, or an uplink slow enough that the guest sent its SYN again): 10.0.0.2 3 (slowest 2.6 s)
 complete   yes
 tap        sent 3.4 MiB, received 394.2 MiB; tap minus attributed: sent +16.6 KiB, received +213.9 KiB
            (a comparison of two counters read a moment apart, not a measurement of what was missed)

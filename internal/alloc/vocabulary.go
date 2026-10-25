@@ -72,6 +72,7 @@ const (
 	UsageSeriesCodecGaps    = lease.UsageSeriesCodecGaps
 	MaxUsageSeriesBytes     = lease.MaxUsageSeriesBytes
 	MaxJobDestinations      = lease.MaxJobDestinations
+	SlowReplyMillis         = lease.SlowReplyMillis
 	GuestReportCodec        = lease.GuestReportCodec
 	MaxGuestReportBytes     = lease.MaxGuestReportBytes
 )
