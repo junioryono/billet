@@ -312,8 +312,10 @@ type Listener struct {
 	declineLogged    string
 	declinesUnlogged int
 	// backed is what backAssignment found for the request it last ran for, the
-	// only refusal that may explain that request's decline. Guarded by mu.
-	backed assignmentBacking
+	// only refusal that may explain that request's decline, and backingLost how
+	// many held leases and promises the heartbeat has dropped. Guarded by mu.
+	backed      assignmentBacking
+	backingLost uint64
 
 	stalePromise time.Duration
 

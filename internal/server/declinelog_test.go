@@ -3,7 +3,9 @@ package server
 import (
 	"errors"
 	"log/slog"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -43,7 +45,7 @@ func TestAnExplainedDeclineIsSaidOncePerReason(t *testing.T) {
 
 	decline := func(request int64, r refusal) {
 		small.mu.Lock()
-		small.backed = assignmentBacking{request: request, refused: r, set: true}
+		small.backed = assignmentBacking{request: request, refused: r, lost: small.backingLost, set: true}
 		small.logDecline(dispatch.Job{JobID: "J", RequestID: request})
 		small.mu.Unlock()
 	}
@@ -86,7 +88,8 @@ func TestAnExplainedDeclineIsSaidOncePerReason(t *testing.T) {
 
 // A DECLINE NOBODY CAN EXPLAIN IS AN ERROR EVERY TIME: no reason recorded for
 // this request, one that could not be read, an allocator that says no limit
-// binds, or a refusal met by another request's purchase is the race the line
+// binds, a refusal met by another request's purchase, or one met before the
+// heartbeat dropped a lease or a promise is the race the line
 // exists for (a promise lost, a lease dropped under an acquisition), never
 // contention.
 func TestAnUnexplainedDeclineIsAnErrorEveryTime(t *testing.T) {
@@ -102,6 +105,7 @@ func TestAnUnexplainedDeclineIsAnErrorEveryTime(t *testing.T) {
 		{request: 3, refused: refusal{unread: errors.New("the ledger did not answer")}, set: true},
 		{request: 4, refused: refusal{room: &alloc.RoomRefusal{}}, set: true},
 		{request: 99, refused: explained, set: true},
+		{request: 6, refused: explained, lost: 1, set: true},
 	}
 	for i, b := range backings {
 		l.mu.Lock()
@@ -122,46 +126,118 @@ func TestAnUnexplainedDeclineIsAnErrorEveryTime(t *testing.T) {
 	}
 }
 
-// BACKING FOUND, THEN GONE, IS NOT EXPLAINED BY AN OLDER REFUSAL. backAssignment
-// finds a lease to take the request, or buys one, and the heartbeat drops it
-// before the assignment: the tier's last refusal belongs to another purchase,
-// and the decline is the race, an error.
+// BACKING FOUND, THEN GONE, IS NOT EXPLAINED BY AN OLDER REFUSAL. The request
+// was declined for an explained reason before; this time backAssignment finds a
+// lease to take it, and the heartbeat drops that lease before the assignment.
+// Neither the tier's last refusal nor the request's own earlier one is why, and
+// the decline is the race, an error.
 func TestBackingThatVanishedIsAnError(t *testing.T) {
 	t.Parallel()
 
 	_, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFill)
 	l := listeners[0]
 
-	vanish := func(request int64, hold bool) {
-		l.mu.Lock()
-		l.refused = refusal{waiter: "b-large"}
-		if hold {
-			l.held = append(l.held, &alloc.Lease{ID: "found"})
-		}
-		l.mu.Unlock()
+	l.mu.Lock()
+	l.refused = refusal{waiter: "b-large"}
+	l.backed = assignmentBacking{request: 1, refused: l.refused, lost: l.backingLost, set: true}
+	l.held = append(l.held, &alloc.Lease{ID: "found"})
+	l.mu.Unlock()
 
-		if err := l.backAssignment(t.Context(), request); err != nil {
-			t.Fatalf("back assignment %d: %v", request, err)
-		}
-
-		l.mu.Lock()
-		if len(l.held) == 0 {
-			t.Errorf("request %d: backAssignment found or bought no lease", request)
-		}
-		l.held = nil
-		l.logDecline(dispatch.Job{JobID: "J", RequestID: request})
-		l.mu.Unlock()
+	if err := l.backAssignment(t.Context(), 1); err != nil {
+		t.Fatalf("back assignment: %v", err)
 	}
-	vanish(1, true)
-	vanish(2, false)
+
+	l.mu.Lock()
+	l.held = nil
+	l.mu.Unlock()
+
+	assertDeclinedAsAnError(t, l, lines, 1)
+
+	// BOUGHT, THEN GONE, the same: the fleet has room, so backAssignment buys.
+	l.mu.Lock()
+	l.backed = assignmentBacking{request: 2, refused: l.refused, lost: l.backingLost, set: true}
+	l.mu.Unlock()
+
+	if err := l.backAssignment(t.Context(), 2); err != nil {
+		t.Fatalf("back assignment: %v", err)
+	}
+
+	l.mu.Lock()
+	if len(l.held) == 0 {
+		t.Fatal("backAssignment bought nothing in an empty fleet, so this case proves nothing")
+	}
+	l.held = nil
+	l.mu.Unlock()
+
+	assertDeclinedAsAnError(t, l, lines, 2)
+}
+
+// A LEASE OR PROMISE THE HEARTBEAT DROPPED MEANWHILE MAY HAVE BEEN THIS
+// REQUEST'S OWN: a promise filed under another alias, a lease bought and lost, a
+// promise held while draining. backAssignment meets an explained refusal (the
+// fleet is full), the heartbeat then drops a promise, and the decline that
+// follows is an error, not contention.
+func TestADeclineAfterTheHeartbeatDroppedBackingIsAnError(t *testing.T) {
+	t.Parallel()
+
+	for _, dropped := range []string{"promise", "held"} {
+		t.Run(dropped, func(t *testing.T) {
+			t.Parallel()
+
+			_, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFill)
+			l := listeners[0]
+
+			if err := l.reconcilePool(t.Context(), 2); err != nil {
+				t.Fatalf("small tier reconcile: %v", err)
+			}
+			if err := l.backAssignment(t.Context(), 5); err != nil {
+				t.Fatalf("back assignment: %v", err)
+			}
+
+			gone := &alloc.Lease{ID: "dropped"}
+			l.mu.Lock()
+			if !l.backed.refused.explained() {
+				t.Fatalf("a full fleet's refusal is not explained, so this test proves nothing: %v",
+					l.backed.refused)
+			}
+			if dropped == "promise" {
+				l.acquiring[77] = &promise{lease: gone, at: time.Now()}
+			} else {
+				l.held = append(l.held, gone)
+			}
+			l.mu.Unlock()
+
+			l.heartbeatPass(t.Context())
+
+			l.mu.Lock()
+			_, kept := l.acquiring[77]
+			kept = kept || slices.Contains(l.held, gone)
+			l.mu.Unlock()
+			if kept {
+				t.Fatalf("the heartbeat kept a %s whose lease the allocator does not know", dropped)
+			}
+
+			assertDeclinedAsAnError(t, l, lines, 5)
+		})
+	}
+}
+
+// assertDeclinedAsAnError assigns request to l with no backing and asserts it is
+// declined with one error line.
+func assertDeclinedAsAnError(t *testing.T, l *Listener, lines *logLines, request int64) {
+	t.Helper()
+
+	before := len(lines.with(t, declineMessage))
+	lease, needsCompute, err := l.assign(t.Context(), dispatch.Job{JobID: "J", RequestID: request, RunID: 900 + request})
+	if err != nil || lease != nil || needsCompute {
+		t.Fatalf("assign %d = %v, %v, %v; want a decline (nil, false, nil)", request, lease, needsCompute, err)
+	}
 
 	declines := lines.with(t, declineMessage)
-	if len(declines) != 2 {
-		t.Fatalf("two declines logged %d lines: %v", len(declines), declines)
+	if len(declines) != before+1 {
+		t.Fatalf("the decline of %d logged %d lines, want one: %v", request, len(declines)-before, declines)
 	}
-	for _, d := range declines {
-		if got := stringAttr(d, "level"); got != slog.LevelError.String() {
-			t.Errorf("a decline whose backing vanished was logged at %q, want ERROR: %v", got, d)
-		}
+	if got := stringAttr(declines[before], "level"); got != slog.LevelError.String() {
+		t.Errorf("the decline of %d was logged at %q, want ERROR: %v", request, got, declines[before])
 	}
 }

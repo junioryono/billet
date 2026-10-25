@@ -54,17 +54,28 @@ func (r refusal) attrs() []any {
 }
 
 // assignmentBacking is what backAssignment found for one request: the refusal
-// its own purchase met, or none when backing was there or was bought.
+// its own purchase met, or none when backing was there or was bought, and how
+// many leases and promises the heartbeat had dropped when it began.
 type assignmentBacking struct {
 	request int64
 	refused refusal
+	lost    uint64
 	set     bool
 }
 
-// backedBy records what backAssignment found for request.
-func (l *Listener) backedBy(request int64, r refusal) {
+// backingLostNow is how many leases and promises the heartbeat has dropped.
+func (l *Listener) backingLostNow() uint64 {
 	l.mu.Lock()
-	l.backed = assignmentBacking{request: request, refused: r, set: true}
+	defer l.mu.Unlock()
+
+	return l.backingLost
+}
+
+// backedBy records what backAssignment, begun when lost leases and promises had
+// been dropped, found for request.
+func (l *Listener) backedBy(request int64, r refusal, lost uint64) {
+	l.mu.Lock()
+	l.backed = assignmentBacking{request: request, refused: r, lost: lost, set: true}
 	l.mu.Unlock()
 }
 
@@ -164,9 +175,11 @@ func (l *Listener) refusalServed() {
 }
 
 // logDecline logs an assignment declined for want of escrow, explained only by
-// the refusal backAssignment met for this request: a refusal left from another
-// purchase says nothing about why backing this one found was gone. It requires
-// l.mu.
+// the refusal backAssignment met for this request, and only when the heartbeat
+// dropped nothing since it began: a refusal left from another purchase says
+// nothing about why backing this one found was gone, and a lease or promise
+// dropped meanwhile may have been this request's own (bought and lost, held under
+// another alias, or promised while draining). It requires l.mu.
 //
 // AN EXPLAINED DECLINE IS CONTENTION, NOT A FAULT. The advertisement is never
 // gated, so on a full fleet GitHub assigns more than billet can buy, and every
@@ -178,7 +191,7 @@ func (l *Listener) refusalServed() {
 // and one with no explanation (a promise lost to a race) is an error every time.
 func (l *Listener) logDecline(job dispatch.Job) {
 	var why refusal
-	if l.backed.set && l.backed.request == job.RequestID {
+	if l.backed.set && l.backed.request == job.RequestID && l.backed.lost == l.backingLost {
 		why = l.backed.refused
 	}
 	args := append([]any{"tier", l.tier, "request", job.RequestID, "run", job.RunID}, why.attrs()...)
