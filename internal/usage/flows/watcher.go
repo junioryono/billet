@@ -243,13 +243,11 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 
 	cancel()
 
-	// A FAILURE TO PROVE THE REPLY EVENTS leaves the job untimed and its byte
-	// totals as they are; any other failure proves neither.
+	// ONE SOCKET CARRIES BOTH, so an end that cannot be proved read proves
+	// neither the bytes nor the first replies.
 	if syncErr != nil {
+		w.acct.MarkIncomplete(p.acctKey)
 		w.acct.MarkUntimed(p.acctKey)
-		if !errors.Is(syncErr, errRepliesUnproven) {
-			w.acct.MarkIncomplete(p.acctKey)
-		}
 	}
 
 	r, ok := w.acct.Final(p.acctKey, open, until)

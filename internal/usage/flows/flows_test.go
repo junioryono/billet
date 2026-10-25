@@ -718,7 +718,7 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 
 	resolver := netip.MustParseAddr("172.31.1.1")
 	a := NewAccountant()
-	a.RepliesUp(began.Add(-time.Hour))
+	a.Up(began.Add(-time.Hour))
 	a.Watch("lease-1", guest, began, nil)
 
 	answer := func(id uint32, dst netip.Addr, wait time.Duration) Flow {
@@ -762,11 +762,13 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 		}
 	}
 
-	// AN ID REUSED IS NEVER TIMED, whatever order its events and the two
-	// destructions are read in, a new event missed, or read late: two flows of
-	// one id cannot be told apart by when they began, so neither takes a wait.
-	// A flow whose destruction is read before its own reply, with no reuse, is
-	// still timed, because waits are matched when the job is summarized.
+	// EACH FLOW TAKES ITS OWN GENERATION, in the kernel's order on the one
+	// socket: a flow's new and reply events come before its destruction, and an
+	// id is reused only after it. A flow whose new event was not read, its
+	// destruction replayed from before the job was watched, takes nothing, and
+	// neither a later flow of its id nor a cutoff can lend it one; a new event
+	// read more than replyMatch after its flow began leaves the flow untimed;
+	// and a flow still open at Final takes its generation from the dump.
 	type step func(*Accountant)
 	first := flow(9, guest, github, 100, 100)
 	second := startedAt(flow(9, guest, npm, 100, 100), started.Add(400*time.Millisecond))
@@ -781,26 +783,27 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 	lateNewB := func(a *Accountant) { a.ObserveNew(9, guest, second.Start.Add(1200*time.Millisecond)) }
 	for name, tc := range map[string]struct {
 		beforeWatch, steps []step
-		want               map[netip.Addr]time.Duration // the destinations returned, and their wait or 0
-		timed              netip.Addr
+		open               []Flow
+		until              time.Time
+		want               map[netip.Addr]time.Duration // returned, with its wait; 0 is untimed
 	}{
-		"A destroyed before the reuse": {steps: []step{newA, replyA, destroyA, newB, replyB, destroyB},
+		"an id reused, each its own": {steps: []step{newA, replyA, destroyA, newB, replyB, destroyB},
+			want: map[netip.Addr]time.Duration{github: 20 * time.Millisecond, npm: 1200 * time.Millisecond}},
+		"the first's new event missed": {beforeWatch: []step{destroyA}, steps: []step{newB, replyB, destroyB},
+			want: map[netip.Addr]time.Duration{github: 0, npm: 1200 * time.Millisecond}},
+		"the reuse past the cutoff": {beforeWatch: []step{destroyA}, steps: []step{newB, replyB, destroyB},
+			until: started.Add(200 * time.Millisecond), want: map[netip.Addr]time.Duration{github: 0}},
+		"new events read late": {steps: []step{lateNewA, lateReplyA, destroyA, lateNewB, replyB, destroyB},
 			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
-		"A destroyed after B's reply": {steps: []step{newA, replyA, newB, replyB, destroyA, destroyB},
-			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
-		"B destroyed before its reply": {steps: []step{newA, replyA, destroyA, newB, destroyB, replyB},
-			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
-		"B never answered, A after": {steps: []step{newA, replyA, newB, destroyA},
-			want: map[netip.Addr]time.Duration{github: 0}},
-		"A's new event missed, its destruction replayed": {beforeWatch: []step{destroyA},
-			steps: []step{newB, replyB, destroyB}, want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
-		"both new events read late": {steps: []step{lateNewA, lateReplyA, lateNewB, replyB, destroyA, destroyB},
-			want: map[netip.Addr]time.Duration{github: 0, npm: 0}},
-		"no reuse, destroyed then reply": {steps: []step{newA, destroyA, replyA},
-			want: map[netip.Addr]time.Duration{github: 20 * time.Millisecond}, timed: github},
+		"a reuse whose new event was missed": {steps: []step{newA, replyA, destroyA, func(a *Accountant) {
+			a.Observe(startedAt(flow(9, guest, npm, 100, 100), started.Add(300*time.Millisecond)))
+		}}, want: map[netip.Addr]time.Duration{github: 20 * time.Millisecond, npm: 0}},
+		"the reuse still open at Final": {steps: []step{newA, replyA, destroyA, newB, replyB},
+			open: []Flow{second},
+			want: map[netip.Addr]time.Duration{github: 20 * time.Millisecond, npm: 1200 * time.Millisecond}},
 	} {
 		reused := NewAccountant()
-		reused.RepliesUp(began.Add(-time.Hour))
+		reused.Up(began.Add(-time.Hour))
 		for _, s := range tc.beforeWatch {
 			s(reused)
 		}
@@ -808,7 +811,11 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 		for _, s := range tc.steps {
 			s(reused)
 		}
-		r, ok := reused.Final("lease-r", nil, ended)
+		until := ended
+		if !tc.until.IsZero() {
+			until = tc.until
+		}
+		r, ok := reused.Final("lease-r", tc.open, until)
 		if !ok || !r.RepliesTimed || len(r.Destinations) != len(tc.want) {
 			t.Errorf("%s: Final = %+v, %v; want a timed result with %d destinations", name, r, ok, len(tc.want))
 			continue
@@ -818,34 +825,18 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 			switch {
 			case !known || d.Connections != 1:
 				t.Errorf("%s: an unexpected destination %+v", name, d)
-			case d.Addr == tc.timed && (d.TimedReplies != 1 || d.SlowestReply != wait):
+			case wait != 0 && (d.TimedReplies != 1 || d.SlowestReply != wait):
 				t.Errorf("%s: %s was not timed at its own %s: %+v", name, d.Addr, wait, d)
-			case d.Addr != tc.timed && d.TimedReplies != 0:
-				t.Errorf("%s: %s was timed by a wait that may not be its: %+v", name, d.Addr, d)
+			case wait == 0 && d.TimedReplies != 0:
+				t.Errorf("%s: %s was timed by a wait that is not its: %+v", name, d.Addr, d)
 			}
 		}
-	}
-
-	// AN ID THAT LOST A GENERATION TO THE BOUND IS NEVER TIMED AGAIN: a
-	// destruction read late could belong to the generation it lost, and the
-	// ones it kept would make a wrong match look unique.
-	evicted := NewAccountant()
-	evicted.RepliesUp(began.Add(-time.Hour))
-	evicted.Watch("lease-e", guest, began, nil)
-	for i := range keptGenerations + 1 {
-		at := started.Add(time.Duration(i) * 1500 * time.Millisecond)
-		evicted.ObserveNew(11, guest, at)
-		evicted.ObserveReply(11, guest, at.Add(30*time.Millisecond))
-	}
-	evicted.Observe(startedAt(flow(11, guest, github, 100, 100), started.Add(1500*time.Millisecond)))
-	if r, _ := evicted.Final("lease-e", nil, ended); r.Destinations[0].TimedReplies != 0 {
-		t.Errorf("an id that lost a generation was timed: %+v", r.Destinations[0])
 	}
 
 	// PAST MaxFlows GENERATIONS THE JOB IS UNTIMED, since one not kept would
 	// leave an earlier generation looking like the only candidate.
 	capped := NewAccountant()
-	capped.RepliesUp(began.Add(-time.Hour))
+	capped.Up(began.Add(-time.Hour))
 	capped.Watch("lease-c", guest, began, nil)
 	for i := range MaxFlows + 1 {
 		capped.ObserveNew(uint32(100+i), guest, started)
@@ -857,7 +848,7 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 	// BEYOND THE CAP the timed counts are summed under Other and its slowest
 	// wait is the slowest of theirs.
 	beyond := NewAccountant()
-	beyond.RepliesUp(began.Add(-time.Hour))
+	beyond.Up(began.Add(-time.Hour))
 	beyond.Watch("lease-2", guest, began, nil)
 	for i := range MaxDestinations + 2 {
 		dst := netip.AddrFrom4([4]byte{10, 3, byte(i / 256), byte(i % 256)})
@@ -887,11 +878,11 @@ func TestAJobIsTimedOnlyWhileTheReplyEventsWereRead(t *testing.T) {
 		prepare, during func(*Accountant)
 		timed           bool
 	}{
-		"read throughout":                   {prepare: func(a *Accountant) { a.RepliesUp(began.Add(-time.Hour)) }, timed: true},
+		"read throughout":                   {prepare: func(a *Accountant) { a.Up(began.Add(-time.Hour)) }, timed: true},
 		"no listener ever read them":        {},
-		"a gap that closed after the grant": {prepare: func(a *Accountant) { a.RepliesUp(began.Add(time.Second)) }},
-		"a gap during the job": {prepare: func(a *Accountant) { a.RepliesUp(began.Add(-time.Hour)) },
-			during: func(a *Accountant) { a.RepliesDown(); a.RepliesUp(started.Add(time.Minute)) }},
+		"a gap that closed after the grant": {prepare: func(a *Accountant) { a.Up(began.Add(time.Second)) }},
+		"a gap during the job": {prepare: func(a *Accountant) { a.Up(began.Add(-time.Hour)) },
+			during: func(a *Accountant) { a.Down(); a.Up(started.Add(time.Minute)) }},
 	} {
 		a := NewAccountant()
 		if tc.prepare != nil {

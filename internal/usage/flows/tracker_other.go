@@ -20,10 +20,7 @@ type Tracker struct{}
 func NewTracker(*slog.Logger) *Tracker { return &Tracker{} }
 
 // Run marks the events down and returns: there is nothing to listen to.
-func (*Tracker) Run(_ context.Context, a *Accountant) {
-	a.Down()
-	a.RepliesDown()
-}
+func (*Tracker) Run(_ context.Context, a *Accountant) { a.Down() }
 
 // Flows reports that it could not read any.
 func (*Tracker) Flows(netip.Addr) ([]Flow, error) { return nil, errNoTracker }

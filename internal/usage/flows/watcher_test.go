@@ -362,25 +362,22 @@ func TestFinalCountsOpenFlowsOrSaysItCouldNot(t *testing.T) {
 	}
 }
 
-// A SYNC THAT CANNOT PROVE THE REPLY EVENTS READ LEAVES THE JOB UNTIMED AND ITS
-// BYTES AS THEY WERE; one that cannot prove the destructions read proves
-// neither, and the job is both untimed and incomplete.
-func TestFinalIsTimedOnlyWhenSyncProvedTheReplyEvents(t *testing.T) {
+// A JOB'S END THAT SYNC CANNOT PROVE READ PROVES NEITHER ITS BYTES NOR ITS
+// FIRST REPLIES, which come on one socket: the job is incomplete and untimed.
+func TestFinalIsTimedOnlyWhenSyncProvedTheEventsRead(t *testing.T) {
 	t.Parallel()
 
 	l := &leases{}
 	l.set(leaseLine(began, guest))
 	table := &fakeTable{}
-	w, acct := newTestWatcher(table, l)
-	acct.RepliesUp(launched.Add(-time.Hour))
+	w, _ := newTestWatcher(table, l)
 
 	for name, tc := range map[string]struct {
 		syncErr           error
 		timed, incomplete bool
 	}{
-		"both proved":          {timed: true},
-		"the replies unproved": {syncErr: fmt.Errorf("%w: it is not reading", errRepliesUnproven)},
-		"nothing proved":       {syncErr: errors.New("the listener is not reading"), incomplete: true},
+		"proved":   {timed: true},
+		"unproved": {syncErr: errors.New("the listener is not reading"), incomplete: true},
 	} {
 		table.mu.Lock()
 		table.syncErr = tc.syncErr
