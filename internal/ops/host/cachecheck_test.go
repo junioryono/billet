@@ -319,8 +319,10 @@ func TestCheckPrintsTheNpmFindingAfterTheTiers(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "node.ebs_s3 names a cache store nothing can reach") {
 		t.Errorf("the fleet node's check answered %v, want only its cache refusal", err)
 	}
-	if !strings.Contains(out, "node     aws-1") {
-		t.Fatalf("the fleet node's check did not reach its node section:\n%s", out)
+	// PAST THE TIERS, where the npm finding is printed, so its absence is the
+	// rule's and not an earlier return's.
+	if !strings.Contains(out, "node     aws-1") || !strings.Contains(out, "\ntiers    0\n") {
+		t.Fatalf("the fleet node's check did not reach its tiers:\n%s", out)
 	}
 	if strings.Contains(out, "\nnpm ") {
 		t.Errorf("a file with no tiers printed an npm finding:\n%s", out)
