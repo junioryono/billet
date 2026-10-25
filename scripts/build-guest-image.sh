@@ -934,6 +934,7 @@ run_runner_images_build() {
 
 	BILLET_RI_ROOTFS="$rootfs" \
 		BILLET_RI_TARGET="$driver" \
+		BILLET_RI_SCOPE=guest-x64 \
 		BILLET_RI_IMAGE_VERSION="$(date -u +%Y%m%d).billet" \
 		BILLET_RI_OUT="$WORK/runner-images" \
 		"$SCRIPT_DIR/run-runner-images.sh"

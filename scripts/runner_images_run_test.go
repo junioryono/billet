@@ -42,7 +42,7 @@ copy-in)
 	cp -R "$2" "$BILLET_TEST_ROOT$3"
 	;;
 copy-out) cp -R "$BILLET_TEST_ROOT$2" "$3" ;;
-reboot) ;;
+reboot) printf 'next=%s\n' "${BILLET_RI_NEXT_STEP:-}" >>"$log" ;;
 *) exit 64 ;;
 esac
 `
@@ -76,7 +76,7 @@ func runRunner(t *testing.T, fx runnerFixture) (string, []string, error) {
 	cmd := exec.CommandContext(t.Context(), "./run-runner-images.sh")
 	cmd.Env = append(os.Environ(),
 		"BILLET_RI_TARGET="+driver, "BILLET_RI_IMAGE_VERSION=20260927.1", "BILLET_RI_OUT="+fx.out,
-		"BILLET_RI_DIR="+fx.dir, "BILLET_RI_NO_PAUSE=1", "BILLET_TEST_ROOT="+fx.root,
+		"BILLET_RI_DIR="+fx.dir, "BILLET_RI_SCOPE=guest-x64", "BILLET_RI_NO_PAUSE=1", "BILLET_TEST_ROOT="+fx.root,
 		"BILLET_TEST_LOG="+filepath.Join(fx.root, "steps.log"))
 	cmd.Env = append(cmd.Env, fx.env...)
 	output, runErr := cmd.CombinedOutput()
@@ -252,8 +252,9 @@ func TestDifferencesSkipAndPrepare(t *testing.T) {
 	t.Parallel()
 
 	fx := newRunnerFixture(t)
-	fx.differences = "# a comment\nskip\tsecond.sh\tnot for billet\n" +
-		"prepare:waagent-conf\tthird.sh\tthird assumes Azure\n"
+	fx.differences = "# a comment\nskip\tsecond.sh\t*\tnot for billet\n" +
+		"prepare:waagent-conf\tthird.sh\tguest-x64,ami-x64\tthird assumes Azure\n" +
+		"skip\tthird.sh\tguest-arm64\tanother target's difference\n"
 	output, calls, err := runRunner(t, fx)
 	if err != nil {
 		t.Fatalf("run-runner-images.sh: %v\n%s", err, output)
@@ -285,15 +286,19 @@ func TestADifferenceThatNamesNothingStopsTheBuild(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct{ differences, clause string }{
-		"a step gone":        {"skip\tgone.sh\twas removed upstream\n", "which the plan does not have"},
-		"an unknown prepare": {"prepare:nothing\tfirst.sh\tno such prepare\n", "does not implement"},
-		"an unknown action":  {"rewrite\tfirst.sh\tno such action\n", "an action nobody implements"},
-		"no reason":          {"skip\tfirst.sh\n", "want three tab-separated fields"},
-		"a fourth field":     {"skip\tfirst.sh\ta reason\tmore\n", "want three tab-separated fields"},
-		"an empty field":     {"skip\t\tfirst.sh\n", "want three tab-separated fields"},
-		"a carriage return":  {"skip\tfirst.sh\ta reason\r\n", "carriage return"},
-		"said twice":         {"skip\tfirst.sh\tone\nskip\tfirst.sh\ttwo\n", "listed twice"},
-		"skipped and prepared": {"skip\tthird.sh\tnot run\nprepare:waagent-conf\tthird.sh\tprepared\n",
+		"a step gone":                {"skip\tgone.sh\t*\twas removed upstream\n", "which plan.json does not have"},
+		"a step gone for this build": {"skip\tgone.sh\tguest-x64\twas removed upstream\n", "which plan.json does not have"},
+		"an unknown prepare":         {"prepare:nothing\tfirst.sh\t*\tno such prepare\n", "does not implement"},
+		"an unknown action":          {"rewrite\tfirst.sh\t*\tno such action\n", "an action nobody implements"},
+		"no targets":                 {"skip\tfirst.sh\ta reason\n", "want four tab-separated fields"},
+		"no reason":                  {"skip\tfirst.sh\t*\n", "want four tab-separated fields"},
+		"a fifth field":              {"skip\tfirst.sh\t*\ta reason\tmore\n", "want four tab-separated fields"},
+		"an empty field":             {"skip\t\t*\tfirst.sh\n", "want four tab-separated fields"},
+		"an unknown target":          {"skip\tfirst.sh\tguest-riscv\ta reason\n", "guest-riscv is not a target"},
+		"another target misspelt":    {"skip\tgone.sh\tami-x46\ta reason\n", "ami-x46 is not a target"},
+		"a carriage return":          {"skip\tfirst.sh\t*\ta reason\r\n", "carriage return"},
+		"said twice":                 {"skip\tfirst.sh\t*\tone\nskip\tfirst.sh\tami-x64\ttwo\n", "listed twice"},
+		"skipped and prepared": {"skip\tthird.sh\t*\tnot run\nprepare:waagent-conf\tthird.sh\t*\tprepared\n",
 			"so one of them would be ignored"},
 	} {
 		fx := newRunnerFixture(t)
@@ -315,40 +320,177 @@ func TestADifferenceThatNamesNothingStopsTheBuild(t *testing.T) {
 func TestTheRealDifferenceListIsAccepted(t *testing.T) {
 	t.Parallel()
 
-	dir, root := t.TempDir(), t.TempDir()
-	driver := filepath.Join(dir, "driver")
-	if err := forkSafeWriteFile(driver, []byte("#!/bin/sh\necho \"$*\" >>\""+root+"/calls\"\nexit 9\n"), 0o755); err != nil {
-		t.Fatal(err)
+	for _, sc := range runnerImagesScopes {
+		dir, root := t.TempDir(), t.TempDir()
+		driver := filepath.Join(dir, "driver")
+		if err := forkSafeWriteFile(driver, []byte("#!/bin/sh\necho \"$*\" >>\""+root+"/calls\"\nexit 9\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(t.Context(), "./run-runner-images.sh")
+		cmd.Env = append(os.Environ(), "BILLET_RI_TARGET="+driver, "BILLET_RI_IMAGE_VERSION=1",
+			"BILLET_RI_OUT="+t.TempDir(), "BILLET_RI_SCOPE="+sc.name)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("%s: a driver that refuses everything let the build finish:\n%s", sc.name, output)
+		}
+		calls, readErr := os.ReadFile(filepath.Join(root, "calls"))
+		if readErr != nil || !strings.HasPrefix(string(calls), "exec mkdir -p /var/tmp/billet-ri") {
+			t.Fatalf("%s: the real difference list was refused before the target was reached (%v):\n%s",
+				sc.name, readErr, output)
+		}
+
+		_, skipped := scopedDifferences(t, sc.name)
+		deprovision := regexp.MustCompile(`waagent\s+-force\s+-deprovision`)
+		for _, step := range readTemplatePlan(t, vendoredTemplateNamed(t, sc.template)) {
+			if deprovision.MatchString(strings.Join(step.Inline, "\n")) && !skipped[step.ID] {
+				t.Errorf("%s: step %s deprovisions the VM for Azure and is not skipped", sc.name, step.ID)
+			}
+		}
 	}
-	cmd := exec.CommandContext(t.Context(), "./run-runner-images.sh")
-	cmd.Env = append(os.Environ(), "BILLET_RI_TARGET="+driver, "BILLET_RI_IMAGE_VERSION=1",
-		"BILLET_RI_OUT="+t.TempDir())
-	output, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("a driver that refuses everything let the build finish:\n%s", output)
-	}
-	calls, readErr := os.ReadFile(filepath.Join(root, "calls"))
-	if readErr != nil || !strings.HasPrefix(string(calls), "exec mkdir -p /var/tmp/billet-ri") {
-		t.Fatalf("the real difference list was refused before the target was reached (%v):\n%s",
-			readErr, output)
-	}
+}
+
+// runnerImagesScopes are the targets differences.tsv names, each with the template
+// its plan comes from.
+var runnerImagesScopes = []struct{ name, template string }{
+	{"guest-x64", "build.ubuntu-24_04.pkr.hcl"},
+	{"guest-arm64", "build.ubuntu-24_04-arm64.pkr.hcl"},
+	{"ami-x64", "build.ubuntu-24_04.pkr.hcl"},
+	{"ami-arm64", "build.ubuntu-24_04-arm64.pkr.hcl"},
+}
+
+// scopedDifferences reads the real difference list as the runner does for scope:
+// the prepares by name and the steps they are on, and the skipped steps.
+func scopedDifferences(t *testing.T, scope string) (map[string]map[string]bool, map[string]bool) {
+	t.Helper()
 
 	differences, err := os.ReadFile(filepath.Join(runnerImagesDir, "differences.tsv"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	preparedOn := map[string]map[string]bool{}
 	skipped := map[string]bool{}
 	for _, line := range strings.Split(string(differences), "\n") {
-		if fields := strings.Split(line, "\t"); len(fields) == 3 && fields[0] == "skip" {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 4 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		applies := fields[2] == "*"
+		for _, target := range strings.Split(fields[2], ",") {
+			applies = applies || target == scope
+		}
+		if !applies {
+			continue
+		}
+		switch {
+		case fields[0] == "skip":
 			skipped[fields[1]] = true
+		case strings.HasPrefix(fields[0], "prepare:"):
+			name := strings.TrimPrefix(fields[0], "prepare:")
+			if preparedOn[name] == nil {
+				preparedOn[name] = map[string]bool{}
+			}
+			preparedOn[name][fields[1]] = true
 		}
 	}
-	deprovision := regexp.MustCompile(`waagent\s+-force\s+-deprovision`)
-	for _, step := range readTemplatePlan(t, vendoredTemplate(t)) {
-		if deprovision.MatchString(strings.Join(step.Inline, "\n")) && !skipped[step.ID] {
-			t.Errorf("step %s deprovisions the VM for Azure and is not skipped", step.ID)
+
+	return preparedOn, skipped
+}
+
+// THE SCOPE IS REQUIRED AND CHECKED before the target is touched: a build that
+// named none, or one the runner does not know, would otherwise take a default plan
+// and difference set written for another image.
+func TestTheRunnerRefusesAMissingOrUnknownScope(t *testing.T) {
+	t.Parallel()
+
+	for _, scope := range []string{"", "guest-x86_64", "ami", "*"} {
+		fx := newRunnerFixture(t)
+		fx.env = []string{"BILLET_RI_SCOPE=" + scope}
+		output, calls, err := runRunner(t, fx)
+		if err == nil || !strings.Contains(output, "BILLET_RI_SCOPE") {
+			t.Errorf("scope %q: answered %v, want a refusal naming BILLET_RI_SCOPE:\n%s", scope, err, output)
+		}
+		if len(calls) != 0 {
+			t.Errorf("scope %q: the target was touched before the refusal: %v", scope, calls)
 		}
 	}
+}
+
+// A DIFFERENCE FOR ANOTHER TARGET IS NOT APPLIED, even when it names this plan's
+// step, and a difference for another target whose step this plan lacks does not
+// stop this build.
+func TestADifferenceAppliesOnlyToItsTargets(t *testing.T) {
+	t.Parallel()
+
+	fx := newRunnerFixture(t)
+	fx.differences = "skip\tsecond.sh\tguest-arm64,ami-arm64\tnot on x64\n" +
+		"skip\tonly-on-arm64.sh\tguest-arm64\tthis plan has no such step\n"
+	output, _, err := runRunner(t, fx)
+	if err != nil {
+		t.Fatalf("run-runner-images.sh: %v\n%s", err, output)
+	}
+	if strings.Contains(output, "not on x64") || !strings.Contains(readSteps(t, fx), "4 ") {
+		t.Fatalf("another target's skip was applied:\n%s", output)
+	}
+}
+
+// A RESUMED BUILD STARTS AT ITS STEP: nothing before it runs again, its own
+// prepares included, and the steps from it on run in order. A reboot hands the
+// driver the step after it, which is where a driver whose reboot ends the run
+// resumes it.
+func TestABuildResumesAtItsStepAndARebootTellsTheDriverWhere(t *testing.T) {
+	t.Parallel()
+
+	fx := newRunnerFixture(t)
+	_, calls, err := runRunner(t, fx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slicesContains(calls, "next=4") {
+		t.Fatalf("the reboot at step 3 did not tell the driver to resume at 4:\n%s", strings.Join(calls, "\n"))
+	}
+
+	fx = newRunnerFixture(t)
+	fx.differences = "prepare:waagent-conf\tfirst.sh\t*\tbefore the resume point\n"
+	fx.env = []string{"BILLET_RI_FROM=4"}
+	output, calls, err := runRunner(t, fx)
+	if err != nil {
+		t.Fatalf("run-runner-images.sh: %v\n%s", err, output)
+	}
+	steps := readSteps(t, fx)
+	if strings.Contains(steps, "2 ") || !strings.Contains(steps, "4 ") || !strings.Contains(steps, "5 ") {
+		t.Fatalf("resumed at 4, the steps that ran were:\n%s", steps)
+	}
+	for _, call := range calls {
+		if strings.Contains(call, "/etc/waagent.conf") || strings.HasPrefix(call, "reboot") ||
+			strings.HasPrefix(call, "copy-in|"+filepath.Join(fx.dir, "upstream")) {
+			t.Fatalf("a step before the resume point acted: %s\n%s", call, strings.Join(calls, "\n"))
+		}
+	}
+	if !strings.Contains(output, "ran before the reboot this build resumed from") {
+		t.Errorf("the resumed steps were not said:\n%s", output)
+	}
+
+	for _, from := range []string{"0", "07", "x", "-1", "7"} {
+		fx := newRunnerFixture(t)
+		fx.env = []string{"BILLET_RI_FROM=" + from}
+		output, calls, err := runRunner(t, fx)
+		if err == nil || !strings.Contains(output, "BILLET_RI_FROM") {
+			t.Errorf("BILLET_RI_FROM=%s: answered %v, want a refusal naming it:\n%s", from, err, output)
+		}
+		if from != "7" && len(calls) != 0 {
+			t.Errorf("BILLET_RI_FROM=%s: the target was touched before the refusal: %v", from, calls)
+		}
+	}
+}
+
+func slicesContains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+
+	return false
 }
 
 // A STEP STARTS IN THE ENVIRONMENT THE STEPS BEFORE IT WROTE, as a Packer step

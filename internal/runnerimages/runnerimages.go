@@ -44,6 +44,11 @@ import (
 // the digest names a file nobody has, or the commit claims a revision the bytes did
 // not come from. Together, a refresh is one line and cannot be half done.
 //
+// THE ARM64 DECLARATION IS THE SECOND LINE, `arm64 <sha256>`, at the same commit:
+// GitHub's arm64 template reads a toolset of its own (ADR-022), and one commit for
+// both keeps the two architectures' images from two upstream revisions. The first
+// line stays exactly what it was, because the guest build reads it.
+//
 //go:embed pinned.txt
 var pinned string
 
@@ -51,6 +56,11 @@ var pinned string
 //
 //go:embed toolset-2404.json
 var toolset []byte
+
+// toolsetArm64 is GitHub's declaration of the ubuntu-24.04 arm64 image, verbatim.
+//
+//go:embed toolset-2404-arm64.json
+var toolsetArm64 []byte
 
 // aptAliases maps a declared package name to one apt can actually install.
 //
@@ -75,11 +85,74 @@ func PinnedCommit() string {
 	return commit
 }
 
-// PinnedSHA256 is the digest of the vendored toolset as it should be on disk.
+// PinnedSHA256 is the digest of the vendored x64 toolset as it should be on disk.
 func PinnedSHA256() string {
-	_, sum, _ := strings.Cut(strings.TrimSpace(pinned), " ")
+	first, _, _ := strings.Cut(strings.TrimSpace(pinned), "\n")
+	_, sum, _ := strings.Cut(strings.TrimSpace(first), " ")
 
 	return strings.TrimSpace(sum)
+}
+
+// The architectures GitHub publishes an ubuntu-24.04 declaration for, spelled as
+// billet's AMI and the tool cache spell them.
+const (
+	ArchX64   = "x64"
+	ArchArm64 = "arm64"
+)
+
+// PinnedSHA256For is the digest the vendored toolset of arch must have, or an
+// error for an architecture billet vendors no declaration for.
+func PinnedSHA256For(arch string) (string, error) {
+	switch arch {
+	case ArchX64:
+		return PinnedSHA256(), nil
+	case ArchArm64:
+		for _, line := range strings.Split(strings.TrimSpace(pinned), "\n")[1:] {
+			name, sum, ok := strings.Cut(strings.TrimSpace(line), " ")
+			if ok && name == ArchArm64 {
+				return strings.TrimSpace(sum), nil
+			}
+		}
+
+		return "", fmt.Errorf("runnerimages: pinned.txt names no digest for the arm64 toolset")
+	default:
+		return "", fmt.Errorf("runnerimages: %q is not an architecture billet vendors a toolset for", arch)
+	}
+}
+
+// ToolsetFileFor is the vendored declaration's file name for arch, as GitHub names it.
+func ToolsetFileFor(arch string) (string, error) {
+	switch arch {
+	case ArchX64:
+		return "toolset-2404.json", nil
+	case ArchArm64:
+		return "toolset-2404-arm64.json", nil
+	default:
+		return "", fmt.Errorf("runnerimages: %q is not an architecture billet vendors a toolset for", arch)
+	}
+}
+
+// ToolsetBytesFor is the vendored declaration of arch, verified against its pin and
+// returned as a copy.
+func ToolsetBytesFor(arch string) ([]byte, error) {
+	data := toolset
+	if arch == ArchArm64 {
+		data = toolsetArm64
+	}
+
+	want, err := PinnedSHA256For(arch)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := VerifyToolset(data, want); err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, len(data))
+	copy(out, data)
+
+	return out, nil
 }
 
 // ToolsetBytes is the vendored file exactly as it is on disk.
@@ -98,6 +171,17 @@ func ToolsetBytes() []byte {
 func SourceURL() string {
 	return "https://raw.githubusercontent.com/actions/runner-images/" + PinnedCommit() +
 		"/images/ubuntu/toolsets/toolset-2404.json"
+}
+
+// SourceURLFor names where the vendored declaration of arch came from.
+func SourceURLFor(arch string) (string, error) {
+	file, err := ToolsetFileFor(arch)
+	if err != nil {
+		return "", err
+	}
+
+	return "https://raw.githubusercontent.com/actions/runner-images/" + PinnedCommit() +
+		"/images/ubuntu/toolsets/" + file, nil
 }
 
 // Toolset is the half of GitHub's declaration billet acts on.

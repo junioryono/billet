@@ -1,6 +1,7 @@
 package runnerimages_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -311,5 +312,113 @@ func TestTheVendoredToolsetIsUpstreamAtThePinnedCommit(t *testing.T) {
 			"then put its sha256 in pinned.txt beside the same commit.",
 			runnerimages.PinnedCommit(), got, runnerimages.PinnedSHA256(),
 			runnerimages.SourceURL())
+	}
+}
+
+// EACH ARCHITECTURE'S DECLARATION IS HELD TO ITS OWN PIN, and the x64 line is
+// still the first one, which the guest build reads with `NR==1`.
+func TestEachArchitecturesToolsetIsItsPinnedFile(t *testing.T) {
+	t.Parallel()
+
+	for _, arch := range []string{runnerimages.ArchX64, runnerimages.ArchArm64} {
+		want, err := runnerimages.PinnedSHA256For(arch)
+		if err != nil {
+			t.Fatalf("PinnedSHA256For(%s): %v", arch, err)
+		}
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(want) {
+			t.Fatalf("PinnedSHA256For(%s) = %q, want a hex sha256", arch, want)
+		}
+		data, err := runnerimages.ToolsetBytesFor(arch)
+		if err != nil {
+			t.Fatalf("ToolsetBytesFor(%s): %v", arch, err)
+		}
+		file, err := runnerimages.ToolsetFileFor(arch)
+		if err != nil {
+			t.Fatalf("ToolsetFileFor(%s): %v", arch, err)
+		}
+		onDisk, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		if !bytes.Equal(onDisk, data) {
+			t.Fatalf("ToolsetBytesFor(%s) is not %s", arch, file)
+		}
+		sum := sha256.Sum256(onDisk)
+		if got := hex.EncodeToString(sum[:]); got != want {
+			t.Fatalf("%s hashes to %s and pinned.txt names %s", file, got, want)
+		}
+	}
+
+	x64, err := runnerimages.PinnedSHA256For(runnerimages.ArchX64)
+	if err != nil || x64 != runnerimages.PinnedSHA256() {
+		t.Fatalf("the x64 pin %q (%v) is not PinnedSHA256 %q", x64, err, runnerimages.PinnedSHA256())
+	}
+	arm64, err := runnerimages.PinnedSHA256For(runnerimages.ArchArm64)
+	if err != nil || arm64 == x64 {
+		t.Fatalf("the arm64 pin %q (%v) must be its own digest", arm64, err)
+	}
+
+	pin, err := os.ReadFile("pinned.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, _ := strings.Cut(string(pin), "\n")
+	if fields := strings.Fields(first); len(fields) != 2 || fields[1] != x64 {
+		t.Fatalf("pinned.txt's first line is %q; the guest build reads the x64 digest from it", first)
+	}
+}
+
+func TestAnArchitectureWithNoDeclarationIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, arch := range []string{"", "amd64", "aarch64", "riscv64"} {
+		if _, err := runnerimages.PinnedSHA256For(arch); err == nil {
+			t.Errorf("PinnedSHA256For(%q) answered, want a refusal", arch)
+		}
+		if _, err := runnerimages.ToolsetBytesFor(arch); err == nil {
+			t.Errorf("ToolsetBytesFor(%q) answered, want a refusal", arch)
+		}
+		if _, err := runnerimages.ToolsetFileFor(arch); err == nil {
+			t.Errorf("ToolsetFileFor(%q) answered, want a refusal", arch)
+		}
+	}
+}
+
+// THE ARM64 DECLARATION IS UPSTREAM'S AT THE PINNED COMMIT, checked the way the x64
+// one is, and network-gated the same way.
+func TestTheVendoredArm64ToolsetIsUpstreamAtThePinnedCommit(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv("BILLET_OFFLINE") != "" {
+		t.Skip("BILLET_OFFLINE is set")
+	}
+
+	url, err := runnerimages.SourceURLFor(runnerimages.ArchArm64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		t.Skipf("could not reach upstream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upstream answered %s for %s", resp.Status, url)
+	}
+	upstream, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		t.Fatalf("read upstream: %v", err)
+	}
+	want, err := runnerimages.PinnedSHA256For(runnerimages.ArchArm64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(upstream)
+	if got := hex.EncodeToString(sum[:]); got != want {
+		t.Errorf("upstream %s hashes to %s and pinned.txt names %s", url, got, want)
 	}
 }

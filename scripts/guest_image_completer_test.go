@@ -501,7 +501,7 @@ func TestTheCompletedComponentsAreConfigsList(t *testing.T) {
 	differences := readScriptFile(t, filepath.Join("runner-images", "differences.tsv"))
 	skipped := map[string]bool{}
 	for _, line := range strings.Split(differences, "\n") {
-		if fields := strings.Split(line, "\t"); len(fields) == 3 && fields[0] == "skip" && strings.Contains(fields[2], "#584") {
+		if fields := strings.Split(line, "\t"); len(fields) == 4 && fields[0] == "skip" && strings.Contains(fields[3], "#584") {
 			skipped[fields[1]] = true
 		}
 	}

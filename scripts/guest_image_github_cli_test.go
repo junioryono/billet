@@ -113,7 +113,7 @@ func planInstalls(t *testing.T, installer string) {
 	}
 
 	for line := range strings.Lines(string(differences)) {
-		if fields := strings.Split(strings.TrimSuffix(line, "\n"), "\t"); len(fields) == 3 &&
+		if fields := strings.Split(strings.TrimSuffix(line, "\n"), "\t"); len(fields) == 4 &&
 			fields[0] == "skip" && fields[1] == installer {
 			t.Errorf("differences.tsv skips %s, so the guest image lacks what it installs", installer)
 		}

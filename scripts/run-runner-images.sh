@@ -8,39 +8,70 @@
 # failing. Running the scripts themselves makes parity hold by construction; what
 # billet does differently is one reviewed file, differences.tsv.
 #
-# WHAT IT RUNS. scripts/runner-images/plan.json, which a test derives from the
-# vendored template (upstream/images/ubuntu/templates/build.ubuntu-24_04.pkr.hcl)
-# at the pinned commit, in the template's order, with the template's environment.
+# WHAT IT RUNS. The plan for its target: scripts/runner-images/plan.json, which a
+# test derives from the vendored x64 template
+# (upstream/images/ubuntu/templates/build.ubuntu-24_04.pkr.hcl), or plan-arm64.json
+# from the arm64 one, at the pinned commit, in the template's order, with the
+# template's environment (ADR-022).
 #
 # WHERE IT RUNS IT. A target driver, BILLET_RI_TARGET, an executable taking:
 #   exec ARGV...        run ARGV as root in the target; its status is the step's
 #   copy-in SRC DEST    copy a host path into the target with `cp -R` semantics
 #                       (DEST an existing directory gets SRC inside it)
 #   copy-out SRC DIR    copy a target path into a host directory
-#   reboot              reboot the target and return once it runs commands again
+#   reboot              reboot the target and return once it runs commands again;
+#                       BILLET_RI_NEXT_STEP names the step the build continues from,
+#                       for a driver whose reboot ends this process (the AMI's)
 # so the same plan runs in a VM, a booted container or a test's fixture.
 #
 # Environment:
 #   BILLET_RI_TARGET         the driver (required)
+#   BILLET_RI_SCOPE          what is built: guest-x64, guest-arm64, ami-x64 or
+#                            ami-arm64 (required); it chooses the plan, the toolset
+#                            and the differences that apply
+#   BILLET_RI_FROM           the step to start at, 1 for the first (default 1): a
+#                            build resumed after its driver's reboot ended it
 #   BILLET_RI_IMAGE_VERSION  the image version GitHub's scripts record (required)
 #   BILLET_RI_OUT            where downloads land (required)
 #   BILLET_RI_DIR            the vendored tree (default: beside this script)
-#   BILLET_RI_TOOLSET        the toolset declaration (default: billet's vendored copy)
-#   BILLET_RI_PLAN           the plan (default: $BILLET_RI_DIR/plan.json)
+#   BILLET_RI_TOOLSET        the toolset declaration (default: billet's vendored copy
+#                            for the scope's architecture)
+#   BILLET_RI_PLAN           the plan (default: the scope's, in $BILLET_RI_DIR)
 #   BILLET_RI_DIFFERENCES    the difference list (default: $BILLET_RI_DIR/differences.tsv)
 #   BILLET_RI_NO_PAUSE=1     skip the template's pause_before sleeps (tests only)
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-dir=${BILLET_RI_DIR:-$here/runner-images}
-plan=${BILLET_RI_PLAN:-$dir/plan.json}
-differences=${BILLET_RI_DIFFERENCES:-$dir/differences.tsv}
-toolset=${BILLET_RI_TOOLSET:-$here/../internal/runnerimages/toolset-2404.json}
-
 fail() {
 	echo "run-runner-images: $*" >&2
 	exit 1
 }
+
+# THE SCOPE IS REQUIRED, not defaulted: a guest build that ran the AMI's differences,
+# or an arm64 machine that ran the x64 plan, builds an image no gate was written for.
+scope=${BILLET_RI_SCOPE:-}
+case "$scope" in
+guest-x64 | ami-x64)
+	scope_plan=plan.json
+	scope_toolset=toolset-2404.json
+	;;
+guest-arm64 | ami-arm64)
+	scope_plan=plan-arm64.json
+	scope_toolset=toolset-2404-arm64.json
+	;;
+'') fail "BILLET_RI_SCOPE names nothing to build; say guest-x64, guest-arm64, ami-x64 or ami-arm64" ;;
+*) fail "BILLET_RI_SCOPE is $scope, which is not guest-x64, guest-arm64, ami-x64 or ami-arm64" ;;
+esac
+
+dir=${BILLET_RI_DIR:-$here/runner-images}
+plan=${BILLET_RI_PLAN:-$dir/$scope_plan}
+differences=${BILLET_RI_DIFFERENCES:-$dir/differences.tsv}
+toolset=${BILLET_RI_TOOLSET:-$here/../internal/runnerimages/$scope_toolset}
+
+from=${BILLET_RI_FROM:-1}
+case "$from" in
+'' | *[!0-9]* | 0*) fail "BILLET_RI_FROM is '$from', which is not a step number counted from 1" ;;
+esac
 
 [ -n "${BILLET_RI_TARGET:-}" ] || fail "BILLET_RI_TARGET names no target driver"
 [ -x "$BILLET_RI_TARGET" ] || fail "the target driver $BILLET_RI_TARGET is not executable"
@@ -271,36 +302,57 @@ prepare_steps=$staging/prepares
 : >"$prepare_steps"
 ids=$(jq -r '.[].id' "$plan")
 
-# EXACTLY THREE FIELDS, EACH SAID ONCE. A read that collapses tabs would take a
+# EXACTLY FOUR FIELDS, EACH SAID ONCE. A read that collapses tabs would take a
 # missing field from the next one; a step named twice, or skipped and prepared,
-# would have one of its entries silently ignored.
+# would have one of its entries silently ignored. Every entry's targets are checked
+# whichever target this build is, so a misspelt one fails every build, not only the
+# build it would have applied to.
 problems=$(awk -F'\t' '
 	/\r/ { printf "line %d carries a carriage return\n", NR; next }
 	/^#/ || /^$/ { next }
-	NF != 3 || $1 == "" || $2 == "" || $3 == "" {
-		printf "line %d: want three tab-separated fields, an action, a step and a reason\n", NR
+	NF != 4 || $1 == "" || $2 == "" || $3 == "" || $4 == "" {
+		printf "line %d: want four tab-separated fields, an action, a step, its targets and a reason\n", NR
 		next
 	}
+	$3 != "*" {
+		n = split($3, targets, ",")
+		for (i = 1; i <= n; i++) {
+			if (targets[i] !~ /^(guest-x64|guest-arm64|ami-x64|ami-arm64)$/) {
+				printf "line %d: %s is not a target (guest-x64, guest-arm64, ami-x64, ami-arm64, or *)\n", NR, targets[i]
+			}
+		}
+	}
 	seen[$1 FS $2]++ { printf "line %d: %s for %s is listed twice\n", NR, $1, $2 }
-	$1 == "skip" { skipped[$2] = 1 }
-	{ entries[$2]++ }
+	{
+		n = split($3 == "*" ? "guest-x64,guest-arm64,ami-x64,ami-arm64" : $3, targets, ",")
+		for (i = 1; i <= n; i++) {
+			if ($1 == "skip") skipped[targets[i] FS $2] = 1
+			entries[targets[i] FS $2]++
+		}
+	}
 	END {
-		for (id in skipped) {
-			if (entries[id] > 1) {
-				printf "%s is skipped and given another difference, so one of them would be ignored\n", id
+		for (key in skipped) {
+			if (entries[key] > 1) {
+				split(key, part, FS)
+				printf "%s is skipped and given another difference for %s, so one of them would be ignored\n", part[2], part[1]
 			}
 		}
 	}
 ' "$differences")
 [ -z "$problems" ] || fail "differences.tsv: $problems"
 
-while IFS=$'\t' read -r action id reason || [ -n "$action" ]; do
+while IFS=$'\t' read -r action id targets reason || [ -n "$action" ]; do
 	case "$action" in
 	'' | '#'*) continue ;;
 	esac
-	[ -n "$id" ] && [ -n "$reason" ] || fail "a difference without a step or a reason: $action"
+	[ -n "$id" ] && [ -n "$targets" ] && [ -n "$reason" ] ||
+		fail "a difference without a step, its targets or a reason: $action"
+	case ",$targets," in
+	*",$scope,"* | ",*,") ;;
+	*) continue ;;
+	esac
 	if ! grep -qxF -- "$id" <<<"$ids"; then
-		fail "differences.tsv names $id, which the plan does not have"
+		fail "differences.tsv names $id for $scope, which $(basename "$plan") does not have"
 	fi
 	case "$action" in
 	skip) printf '%s\t%s\n' "$id" "$reason" >>"$skips" ;;
@@ -325,7 +377,8 @@ lookup() {
 # copy for a file billet already vendors and verifies elsewhere.
 source_path() {
 	case "$1" in
-	images/ubuntu/toolsets/toolset-2404.json) printf '%s\n' "$toolset" ;;
+	images/ubuntu/toolsets/"$scope_toolset") printf '%s\n' "$toolset" ;;
+	images/ubuntu/toolsets/*) fail "the plan names $1, which is not $scope's declaration" ;;
 	*) printf '%s\n' "$dir/upstream/$1" ;;
 	esac
 }
@@ -379,6 +432,7 @@ target copy-in "$dir/pam-environment.awk" /var/tmp/billet-ri/pam-environment.awk
 	fail "could not stage the environment reader"
 
 total=$(jq 'length' "$plan")
+[ "$from" -le "$total" ] || fail "BILLET_RI_FROM is $from and $(basename "$plan") has $total steps"
 n=0
 # THE PLAN IS READ ON ITS OWN DESCRIPTOR, never on stdin, which the steps must not
 # be able to reach.
@@ -387,6 +441,13 @@ while IFS= read -r step <&3; do
 	id=$(jq -r .id <<<"$step")
 	kind=$(jq -r .kind <<<"$step")
 	echo "=== [$n/$total] $id ==="
+
+	# A RESUMED BUILD STARTS WHERE THE REBOOT LEFT IT. What came before ran in the
+	# boot that ended at the reboot; nothing of it, a prepare included, runs twice.
+	if [ "$n" -lt "$from" ]; then
+		echo "ran before the reboot this build resumed from"
+		continue
+	fi
 
 	reason=$(lookup "$skips" "$id")
 	if [ -n "$reason" ]; then
@@ -418,7 +479,11 @@ while IFS= read -r step <&3; do
 		# the connection it runs over and only the driver knows how to wait for the
 		# target to come back.
 		if [ "$(jq -r '.reboots // false' <<<"$step")" = true ]; then
-			target reboot || fail "step $n $id: the target did not come back from its reboot"
+			# THE NEXT STEP TRAVELS WITH THE REBOOT, for a driver whose reboot ends
+			# this process and resumes the build at the next boot. Exported only to
+			# the driver: a prefix on a function call outlives the call in dash.
+			BILLET_RI_NEXT_STEP=$((n + 1)) "$BILLET_RI_TARGET" reboot </dev/null ||
+				fail "step $n $id: the target did not come back from its reboot"
 			continue
 		fi
 
