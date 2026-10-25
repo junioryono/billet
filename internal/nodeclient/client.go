@@ -215,7 +215,7 @@ type target struct {
 // first nameserver would never connect to anything.
 //
 // ONLY FOR SEVERAL CONTROLLERS. A node that names one has nowhere else to go,
-// and dials as it always did (singleDialTimeout, the system's probes).
+// and dials as it always did (singleDialTimeout, Go's default keepalive).
 const (
 	keepAliveIdle     = 5 * time.Second
 	keepAliveInterval = 2 * time.Second
@@ -333,7 +333,7 @@ func newTarget(spec Target, several bool) (*target, error) {
 
 		if several {
 			t.dialer = newDialer()
-			t.resolving = &controllerDialer{connect: t.dialer, lookup: net.DefaultResolver.LookupNetIP}
+			t.resolving = &controllerDialer{connect: t.dialer.DialContext, lookup: net.DefaultResolver.LookupNetIP}
 			dial = t.resolving.DialContext
 		}
 
@@ -363,12 +363,19 @@ func newDialer() *net.Dialer {
 }
 
 // controllerDialer reaches one of several controllers: the name looked up under
-// lookupTimeout, then each address it answers dialled in turn under the
-// connecting dialer's own bound, until one connects.
+// lookupTimeout, then its addresses connected to under the connecting dialer's
+// own bound. The addresses of the family the lookup answered first are tried
+// in turn, and those of the other family beside them from fallbackDelay on,
+// as the standard dialer does, so a family that does not route costs a
+// fraction of a second rather than the dial's bound for every address in it.
 type controllerDialer struct {
-	connect *net.Dialer
+	connect func(ctx context.Context, network, address string) (net.Conn, error)
 	lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
+
+// fallbackDelay is how long the first family's addresses have to themselves
+// before the other family's are tried beside them: the standard dialer's.
+const fallbackDelay = 300 * time.Millisecond
 
 func (d *controllerDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
@@ -377,7 +384,7 @@ func (d *controllerDialer) DialContext(ctx context.Context, network, address str
 	}
 
 	if _, err := netip.ParseAddr(host); err == nil {
-		return d.connect.DialContext(ctx, network, address)
+		return d.connect(ctx, network, address)
 	}
 
 	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
@@ -393,10 +400,29 @@ func (d *controllerDialer) DialContext(ctx context.Context, network, address str
 		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
 	}
 
+	var primaries, fallbacks []netip.Addr
+
+	for _, addr := range addrs {
+		if addr.Unmap().Is4() == addrs[0].Unmap().Is4() {
+			primaries = append(primaries, addr)
+		} else {
+			fallbacks = append(fallbacks, addr)
+		}
+	}
+
+	if len(fallbacks) == 0 {
+		return d.inTurn(ctx, network, primaries, port)
+	}
+
+	return d.race(ctx, network, primaries, fallbacks, port)
+}
+
+// inTurn connects to each address in turn until one answers.
+func (d *controllerDialer) inTurn(ctx context.Context, network string, addrs []netip.Addr, port string) (net.Conn, error) {
 	var errs []error
 
 	for _, addr := range addrs {
-		conn, err := d.connect.DialContext(ctx, network, net.JoinHostPort(addr.Unmap().String(), port))
+		conn, err := d.connect(ctx, network, net.JoinHostPort(addr.Unmap().String(), port))
 		if err == nil {
 			return conn, nil
 		}
@@ -409,6 +435,78 @@ func (d *controllerDialer) DialContext(ctx context.Context, network, address str
 	}
 
 	return nil, errors.Join(errs...)
+}
+
+// race tries the primaries, and the fallbacks beside them once fallbackDelay
+// has passed or the primaries have all failed, and answers the first
+// connection either makes. The other attempt is cancelled as it returns, and a
+// connection it makes after all is closed.
+func (d *controllerDialer) race(
+	ctx context.Context, network string, primaries, fallbacks []netip.Addr, port string,
+) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type attempt struct {
+		conn net.Conn
+		err  error
+	}
+
+	results := make(chan attempt, 2)
+	try := func(addrs []netip.Addr) {
+		go func() {
+			conn, err := d.inTurn(ctx, network, addrs, port)
+			results <- attempt{conn, err}
+		}()
+	}
+
+	try(primaries)
+
+	fallback := time.NewTimer(fallbackDelay)
+	defer fallback.Stop()
+
+	started, finished := 1, 0
+
+	var errs []error
+
+	for {
+		select {
+		case <-fallback.C:
+			if started == 1 {
+				try(fallbacks)
+				started++
+			}
+		case r := <-results:
+			finished++
+
+			if r.err == nil {
+				if pending := started - finished; pending > 0 {
+					go func() {
+						for range pending {
+							if late := <-results; late.conn != nil {
+								_ = late.conn.Close()
+							}
+						}
+					}()
+				}
+
+				return r.conn, nil
+			}
+
+			errs = append(errs, r.err)
+
+			if started == 1 {
+				try(fallbacks)
+				started++
+
+				continue
+			}
+
+			if finished == started {
+				return nil, errors.Join(errs...)
+			}
+		}
+	}
 }
 
 // lookupNetwork is the network a name is looked up in for a dial in network.

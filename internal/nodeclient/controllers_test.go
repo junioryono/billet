@@ -858,12 +858,14 @@ func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 }
 
 // A NODE WITH ONE CONTROLLER DIALS AS IT ALWAYS DID: ten seconds for the whole
-// dial, its name included, and the system's own probes. The bounds a failover
+// dial, its name included, and Go's default keepalive. The bounds a failover
 // needs are for a node that has somewhere else to go.
 func TestANodeWithOneControllerDialsAsItAlwaysDid(t *testing.T) {
 	t.Parallel()
 
-	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: "http://control-a.example:7717"})
+	b := newController(t)
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: b.srv.URL})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -874,8 +876,26 @@ func TestANodeWithOneControllerDialsAsItAlwaysDid(t *testing.T) {
 	}
 
 	if d.Timeout != 10*time.Second || d.KeepAliveConfig != (net.KeepAliveConfig{}) || d.KeepAlive != 0 {
-		t.Fatalf("a node with one controller dials with %v and probes %+v (%v), want 10s and the system's",
+		t.Fatalf("a node with one controller dials with %v and keepalive %+v (%v), want 10s and Go's default",
 			d.Timeout, d.KeepAliveConfig, d.KeepAlive)
+	}
+
+	// AND IT IS THE DIALER THE TRANSPORT DIALS WITH: the transport holds a
+	// method of this same dialer, so a mark on it shows on a real connection.
+	var dialled atomic.Int32
+
+	d.Control = func(string, string, syscall.RawConn) error {
+		dialled.Add(1)
+
+		return nil
+	}
+
+	if err := c.Register(t.Context(), registration); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if dialled.Load() == 0 {
+		t.Fatal("the transport dialled without the dialer inspected above")
 	}
 }
 
@@ -924,6 +944,75 @@ func TestASlowLookupIsNotCutByTheDialBound(t *testing.T) {
 
 	if n := b.sent("/v1/register"); n != 1 {
 		t.Fatalf("the controller behind the slow lookup was asked %d times, want once", n)
+	}
+}
+
+// A FAMILY THAT DOES NOT ROUTE IS RACED, NOT WAITED OUT. The name answers an
+// IPv6 address first, which never answers, and an IPv4 one that does: the
+// IPv4 attempt starts while the IPv6 one is still waiting, as the standard
+// dialer's would, and the IPv6 attempt is ended once IPv4 connects, rather
+// than every new connection waiting out the dial's bound for each address
+// that does not route.
+func TestAnAddressFamilyThatDoesNotRouteIsRaced(t *testing.T) {
+	t.Parallel()
+
+	b := newController(t)
+
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(b.srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split %s: %v", b.srv.URL, err)
+	}
+
+	c, err := nodeclient.New(nodeclient.Options{
+		Node: "n1", RequestTimeout: 5 * time.Second,
+		Targets: []nodeclient.Target{{Base: "http://control-b.example:" + port}, {Base: "http://" + deadAddress(t)}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	nodeclient.SetLookupForTest(c, 0, func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("127.0.0.1")}, nil
+	})
+
+	var (
+		v6Waiting, raced atomic.Bool
+		v6Ended          = make(chan struct{})
+	)
+
+	nodeclient.SetConnectForTest(c, 0, func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+
+		if host == "2001:db8::1" {
+			v6Waiting.Store(true)
+
+			// A BLACKHOLE: nothing answers until the attempt is called off.
+			<-ctx.Done()
+			close(v6Ended)
+
+			return nil, ctx.Err()
+		}
+
+		raced.Store(v6Waiting.Load())
+
+		return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, address)
+	})
+
+	if err := c.Register(t.Context(), registration); err != nil {
+		t.Fatalf("Register behind an IPv6 address that does not route: %v", err)
+	}
+
+	if !raced.Load() {
+		t.Fatal("the IPv4 address was tried only after the IPv6 one gave up, not beside it")
+	}
+
+	select {
+	case <-v6Ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the IPv6 attempt was still waiting after IPv4 connected")
 	}
 }
 

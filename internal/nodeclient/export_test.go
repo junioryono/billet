@@ -66,3 +66,9 @@ func IsNoAnswerForTest(err error) bool { return errors.Is(err, errNoAnswer) }
 func SetLookupForTest(c *Client, i int, f func(ctx context.Context, network, host string) ([]netip.Addr, error)) {
 	c.targets[i].resolving.lookup = f
 }
+
+// SetConnectForTest replaces how the controller at index i of a client of
+// several connects to one address its name was looked up to.
+func SetConnectForTest(c *Client, i int, f func(ctx context.Context, network, address string) (net.Conn, error)) {
+	c.targets[i].resolving.connect = f
+}
