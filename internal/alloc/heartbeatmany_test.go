@@ -69,6 +69,7 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 		{"a stale epoch beside the current one", LeaseRef{ID: held[3].ID, Epoch: held[3].Epoch + 1}, ErrFenced},
 		{"an unknown id", LeaseRef{ID: "no-such-lease", Epoch: 1}, ErrLeaseNotFound},
 		{"an id holding a NUL", LeaseRef{ID: "x\x00", Epoch: 1}, ErrLeaseNotFound},
+		{"an id that is not UTF-8", LeaseRef{ID: "x\xff", Epoch: 1}, ErrLeaseNotFound},
 		{"a released lease", LeaseRef{ID: released.ID, Epoch: released.Epoch}, ErrLeaseNotFound},
 		{"a force-released lease", LeaseRef{ID: forced.ID, Epoch: forced.Epoch}, ErrForceRelease},
 		{"an id wider than the record", LeaseRef{ID: strings.Repeat("a", packedLeaseIDWidth+1), Epoch: 1},
@@ -78,7 +79,7 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 
 	// THE REFUSALS SIT BETWEEN RENEWALS, on both sides of the batch boundary,
 	// so an answer written at the wrong index would land on a renewal.
-	at := []int{1, 2, 40, 41, 200, heartbeatBatch, heartbeatBatch + 5, len(refs)}
+	at := []int{1, 2, 40, 41, 42, 200, heartbeatBatch, heartbeatBatch + 5, len(refs)}
 	for i := len(cases) - 1; i >= 0; i-- {
 		refs = append(refs[:at[i]], append([]LeaseRef{cases[i].ref}, refs[at[i]:]...)...)
 	}
@@ -114,6 +115,10 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 			t.Errorf("lease %d (%s): answered %v, want it renewed", i, ref.ID, answers[i])
 		case !isRefused && askedOne[ref]:
 			t.Errorf("lease %d (%s) was renewed by the one-lease renewal, not by the batch's statement", i, ref.ID)
+		case isRefused && !askedOne[ref]:
+			// THE OBSERVER SEES THE FALLBACK, so its silence about a renewal
+			// means something: every refusal was answered there.
+			t.Errorf("lease %d (%s) was refused without the one-lease renewal being asked", i, ref.ID)
 		}
 
 		// THE SAME REFUSAL ONE RENEWAL GIVES, asked before the clock moves. Only
@@ -191,6 +196,7 @@ func TestHeartbeatLeasesEndsOnAStringItCannotCut(t *testing.T) {
 	for _, packed := range []string{
 		record + "x",
 		record + record + "x",
+		record + "\x00",
 		record + strings.Repeat("y", 82),
 		record + "x\x00" + strings.Repeat(" ", packedLeaseIDWidth-2) + strings.Repeat("0", packedEpochWidth),
 		strings.Repeat("z", 165),

@@ -120,13 +120,16 @@ UPDATE leases SET heartbeat_at = @heartbeat_at, expires_at = @expires_at
 -- half is whole records and shorter than its part: a string that is not whole
 -- records renews nothing, rather than its valid prefix or a split that never
 -- shrinks. The packer admits only printable ASCII, so a length is the same
--- count of characters on both engines (SQLite's length() stops at a NUL).
+-- count of characters on both engines; SQLite's length() stops at a NUL, so a
+-- string holding one is refused by its length not growing by the character
+-- appended to it (PostgreSQL refuses a NUL in text before the statement runs).
 --
 -- THE ROW VALUE KEEPS EACH EPOCH BESIDE THE ID IT CAME WITH, for an id named
 -- twice, and the IN still narrows by the primary key.
 WITH RECURSIVE part (rec) AS (
     SELECT CAST(@packed AS TEXT)
      WHERE length(CAST(@packed AS TEXT)) >= 83 AND length(CAST(@packed AS TEXT)) % 83 = 0
+       AND length(CAST(@packed AS TEXT) || 'x') = length(CAST(@packed AS TEXT)) + 1
     UNION ALL
     SELECT CASE h.side WHEN 0 THEN substr(rec, 1, length(rec) / 166 * 83)
                        ELSE substr(rec, length(rec) / 166 * 83 + 1) END

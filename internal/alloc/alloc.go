@@ -1545,10 +1545,10 @@ func (a *Allocator) Heartbeat(ctx context.Context, leaseID string, epoch int64) 
 
 // heartbeatTx renews one lease inside the caller's transaction.
 //
-// AN ID NO LEASE CAN CARRY IS NOT ASKED ABOUT. PostgreSQL refuses a NUL or
+// AN ID BILLET NEVER MINTS IS NOT ASKED ABOUT. PostgreSQL refuses a NUL or
 // invalid UTF-8 in a text parameter as an error, and inside HeartbeatMany that
-// error would end the transaction and every other lease's renewal with it;
-// SQLite would answer that there is no such lease, which is the truth on both.
+// error would end the transaction and every other lease's renewal with it.
+// Every lease id is newLeaseID's hexadecimal, so such an id names no lease.
 func (a *Allocator) heartbeatTx(ctx context.Context, tx *sql.Tx, leaseID string, epoch int64, now time.Time) error {
 	if strings.ContainsRune(leaseID, 0) || !utf8.ValidString(leaseID) {
 		return fmt.Errorf("%w: %q", ErrLeaseNotFound, leaseID)
