@@ -213,8 +213,9 @@ func TestRefusedPurchasesAreCounted(t *testing.T) {
 func TestAComparisonIsReproducible(t *testing.T) {
 	trace := WideShapeMix(12, WideParams{Params: Params{Jobs: 30}, Fleet: WideFleet()})
 
-	first := Compare(t, WideFleet(), trace, DefaultPolicies, Options{}).Markdown()
-	second := Compare(t, WideFleet(), trace, DefaultPolicies, Options{}).Markdown()
+	opts := Options{DirectAssignment: true}
+	first := Compare(t, WideFleet(), trace, DefaultPolicies, opts).Markdown()
+	second := Compare(t, WideFleet(), trace, DefaultPolicies, opts).Markdown()
 
 	if first != second {
 		t.Fatalf("two comparisons of one trace differ:\n%s\n%s", first, second)
@@ -270,6 +271,12 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 // and =file replays the trace and fleet `billet jobs export` wrote, named by
 // BILLET_REPLAY_TRACE and BILLET_REPLAY_FLEET. The table goes to the test log
 // and, with -replay.out, to a file beside the records.
+//
+// GITHUB.COM'S PROTOCOL BY DEFAULT, direct assignment, which is the one the
+// admission order judges by: under GHES's offers a tier's unmet demand is the
+// offers it did not acquire, which no reconciliation counts, so no tier ever
+// waits and fair cannot be told from fill (measured 2026-10-25, the first wide
+// run). BILLET_REPLAY_PROTOCOL=offer replays the offers anyway.
 func TestComparePolicies(t *testing.T) {
 	var (
 		fleet Fleet
@@ -295,6 +302,14 @@ func TestComparePolicies(t *testing.T) {
 		opts.SettleWithin = 5 * time.Minute
 	default:
 		t.Fatalf("BILLET_REPLAY_COMPARE=%q; want wide or file", os.Getenv("BILLET_REPLAY_COMPARE"))
+	}
+
+	switch os.Getenv("BILLET_REPLAY_PROTOCOL") {
+	case "", "direct":
+		opts.DirectAssignment = true
+	case "offer":
+	default:
+		t.Fatalf("BILLET_REPLAY_PROTOCOL=%q; want direct or offer", os.Getenv("BILLET_REPLAY_PROTOCOL"))
 	}
 
 	opts.Log = discardLogger()
