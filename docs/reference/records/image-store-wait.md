@@ -46,7 +46,7 @@ All 26 fell between 2026-10-23 20:27Z and 2026-10-24 13:50Z. In those same hours
 
 ## The bound billet now keeps
 
-**The node bounds every step toward the answer at four minutes** (`dockerStoreRequestLimit` in `internal/node/cache.go`):
+**The node bounds the steps toward the answer that take a context at four minutes** (`dockerStoreRequestLimit` in `internal/node/cache.go`). The session's own writes and the report to the control plane (at most two seconds) are outside it. The steps inside it are:
 - the session lock;
 - the kill switch;
 - the acquisition, which keeps its three-minute bound but gets no more than what is left of the four;
@@ -71,6 +71,7 @@ Those explicit waits add up to eight minutes at most, against about seventeen be
 
 **Older and newer pieces together:**
 - **An image built before this change** still waits 780 seconds. A newer node answers it once the steps the four minutes bound have run. Outside those minutes are the session's own writes, the report to the control plane (at most two seconds) and, when the session could not record the clone at all, the clone's discard, all before the answer.
+- **Rolling a node back** past this change loses the never-mounted mark: an older binary reads a session's record without it, so a store still in custody reads as mounted, its settlement waits, and the guest's discard of it is allowed again. Drain a node before rolling it back, as a host upgrade already does.
 - **A node older than this change** keeps its twelve-minute handler. A newer image hangs up on it at 260 seconds, which cancels that node's request mid-way. Whatever its session had recorded, the session's teardown discards.
 
 ## What this does not establish

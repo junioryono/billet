@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -926,8 +927,8 @@ func TestARestartedNodeKeepsANeverMountedStoreOutOfSettlement(t *testing.T) {
 
 // A SETTLEMENT FOLLOWS THE STORE IT OPENED AND NO OTHER. The guest can discard
 // that store and ask for another while settlement waits; the replacement was
-// never opened for settlement, and one whose attach failed can never prove
-// readiness, so waiting on it would hold the job's teardown for the whole
+// never opened for settlement, so the readiness route refuses it as not
+// settling, and waiting on it would hold the job's teardown for the whole
 // settle window.
 func TestASettlementStopsWaitingWhenItsStoreIsReplaced(t *testing.T) {
 	t.Parallel()
@@ -957,10 +958,11 @@ func TestASettlementStopsWaitingWhenItsStoreIsReplaced(t *testing.T) {
 		if discard := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/discard", nil); discard.Code != http.StatusOK {
 			t.Fatalf("the guest's discard of its mounted store = %d: %s", discard.Code, discard.Body.String())
 		}
-		attacher.attachErr = errors.New("the VMM refused the drive")
+		// THE REPLACEMENT MOUNTS. It is not never-mounted, so only following the
+		// store the settlement opened tells the two apart.
 		if again := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
-			map[string]any{"architecture": "amd64"}); again.Code != http.StatusServiceUnavailable {
-			t.Fatalf("the replacement's status = %d, want the cold 503: %s", again.Code, again.Body.String())
+			map[string]any{"architecture": "amd64"}); again.Code != http.StatusCreated {
+			t.Fatalf("the replacement's status = %d, want 201: %s", again.Code, again.Body.String())
 		}
 
 		if err := <-settled; err != nil {
@@ -972,6 +974,150 @@ func TestASettlementStopsWaitingWhenItsStoreIsReplaced(t *testing.T) {
 		if storage.published != 0 {
 			t.Fatalf("published %d store(s); neither the discarded nor the failed one was the guest's to publish",
 				storage.published)
+		}
+	})
+}
+
+// A SETTLEMENT'S WAIT FOR THE SESSION IS INSIDE ITS WINDOW. A replacement
+// request holds the session through its acquisition and attach, which can run
+// for minutes, and the job's teardown waits on the settlement; waiting for the
+// lock on the caller's context outlasted the two minutes the settlement is
+// allowed.
+func TestASettlementWaitsForTheSessionOnlyWithinItsWindow(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := &fakeCacheStore{}
+		attacher := &fakeVolumeAttacher{}
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			storage, attacher, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+		}
+
+		start := time.Now()
+		settled := make(chan error, 1)
+		go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
+		synctest.Wait()
+
+		if discard := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/discard", nil); discard.Code != http.StatusOK {
+			t.Fatalf("the guest's discard of its mounted store = %d: %s", discard.Code, discard.Body.String())
+		}
+		// THE REPLACEMENT HOLDS THE SESSION FOR THREE MINUTES, past the window.
+		attacher.attachDelay = 3 * time.Minute
+		replaced := make(chan int, 1)
+		go func() {
+			replaced <- cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+				map[string]any{"architecture": "amd64"}).Code
+		}()
+
+		<-settled
+		if waited := time.Since(start); waited > dockerSettleWait {
+			t.Fatalf("the settlement waited %s behind a request holding its session; its window is %s",
+				waited, dockerSettleWait)
+		}
+		if code := <-replaced; code != http.StatusCreated {
+			t.Fatalf("the replacement's status = %d, want 201", code)
+		}
+	})
+}
+
+// A RECORD INSTALLED AS MOUNTED, WHOSE WRITE THEN FAILED, IS WRITTEN BACK AS
+// NEVER MOUNTED. The write failed at the directory sync, after its rename, so
+// "mounted" was already the record on disk while the guest was sent cold; a
+// restart reading it would wait on a readiness proof that cannot come. The
+// image observation is already recorded, so nothing else rewrites the session
+// and the record a restart reads is the one the failure path left.
+func TestAMountedRecordThatCouldNotBeSyncedIsWrittenBackAsNeverMounted(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		stateDir := t.TempDir()
+		var failSync atomic.Bool
+		attacher := &fakeVolumeAttacher{onAttach: func() { failSync.Store(true) }}
+		first, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
+			&fakeCacheStore{}, attacher, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		first.syncDir = func(path string) error {
+			if failSync.CompareAndSwap(true, false) {
+				return errors.New("the directory could not be synced")
+			}
+
+			return syncDirectory(path)
+		}
+		credentials, err := first.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		first.byToken[credentials.Token].observed.ImageCache = string(alloc.ImageCacheWarm)
+
+		if response := cacheRequest(t, first, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("Docker store status = %d, want the cold 503: %s", response.Code, response.Body.String())
+		}
+		if failSync.Load() {
+			t.Fatal("the directory sync was never failed, so this staged nothing")
+		}
+
+		restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
+			&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService after the restart: %v", err)
+		}
+		settling := time.Now()
+		if err := restarted.SettleDocker(t.Context(), "billet-one", true); err != nil {
+			t.Fatalf("SettleDocker after the restart: %v", err)
+		}
+		if waited := time.Since(settling); waited != 0 {
+			t.Fatalf("the restarted node waited %s on a store the guest was sent cold from", waited)
+		}
+	})
+}
+
+// AN ATTACH THAT SUCCEEDS AFTER THE REQUEST'S BOUND IS NOT HANDED OVER. The
+// guest gives up twenty seconds later, so a store recorded as mounted then is
+// one a cold guest never proves ready; it stays never mounted, in custody.
+func TestADockerStoreAttachedAfterTheRequestsBoundIsAnsweredCold(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := &fakeCacheStore{}
+		attacher := &fakeVolumeAttacher{attachDelay: dockerStoreRequestLimit + time.Second}
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			storage, attacher, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+
+		response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"})
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("Docker store status = %d, want the cold 503 for an attach past the bound: %s",
+				response.Code, response.Body.String())
+		}
+		if readiness := cacheRequest(t, service, credentials.Token, "/v1/docker-store/ready", map[string]any{
+			"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+		}); readiness.Code != http.StatusNotFound {
+			t.Fatalf("readiness for a store attached past the bound = %d, want 404: %s",
+				readiness.Code, readiness.Body.String())
+		}
+		if len(attacher.detached) != 0 || storage.discarded != 0 {
+			t.Fatalf("detached %d, discarded %d before the compute was gone; want the store kept",
+				len(attacher.detached), storage.discarded)
 		}
 	})
 }

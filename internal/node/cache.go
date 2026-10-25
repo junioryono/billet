@@ -43,9 +43,10 @@ const (
 	// answer, so the acquisition stays well inside that token; newer images fetch
 	// six hours.
 	dockerStoreAttachLimit = 3 * time.Minute
-	// dockerStoreRequestLimit bounds every step toward the answer, from the
-	// request's arrival: the session lock, the kill switch, the acquisition and
-	// the attach. The guest starts its runner only after this answer and waits a
+	// dockerStoreRequestLimit bounds the steps toward the answer that take a
+	// context, from the request's arrival: the session lock, the kill switch, the
+	// acquisition and the attach. The session's writes and the report to the
+	// control plane are outside it. The guest starts its runner only after this answer and waits a
 	// little longer than this for it (docker-cache.sh), so a store that is slow
 	// costs a cold job rather than a runner GitHub lists offline (#320). The
 	// minute beyond the acquisition is EC2's attach, which waits for AWS to report
@@ -78,11 +79,14 @@ type CacheService struct {
 	namespace string
 	rootState string
 	stateDir  string
-	store     storecontract.Store
-	attacher  provider.VolumeAttacher
-	log       *slog.Logger
-	wait      func(ctx context.Context, d time.Duration) error
-	now       func() time.Time
+	// syncDir makes a session's installed record durable; a seam so a test can
+	// fail the write after its rename, where the record has already changed.
+	syncDir  func(string) error
+	store    storecontract.Store
+	attacher provider.VolumeAttacher
+	log      *slog.Logger
+	wait     func(ctx context.Context, d time.Duration) error
+	now      func() time.Time
 
 	mu         sync.Mutex
 	byToken    map[string]*cacheSession
@@ -348,6 +352,7 @@ func NewCacheService(
 		endpoint: endpoint, namespace: namespace, store: storage, attacher: attacher, log: log,
 		rootState:  stateDir,
 		stateDir:   filepath.Join(stateDir, cacheSessionDirectory),
+		syncDir:    syncDirectory,
 		byToken:    make(map[string]*cacheSession),
 		byInstance: make(map[string]string),
 		actionIO:   hostActionsVolumeManager{},
@@ -1268,7 +1273,8 @@ func (s *CacheService) attachDockerStore(
 	session *cacheSession,
 ) {
 	started := time.Now()
-	// EVERY STEP TOWARD THE ANSWER RUNS ON requestCtx, AND EVERY CLEANUP ON ctx.
+	// EVERY STEP TOWARD THE ANSWER THAT TAKES A CONTEXT RUNS ON requestCtx, AND
+	// EVERY CLEANUP ON ctx.
 	// The answer is worth nothing once the guest has stopped waiting, so the
 	// forward steps end with the request's bound or the guest's connection. A
 	// cleanup ends with neither: the guest gives up just after the request's
@@ -1393,6 +1399,19 @@ func (s *CacheService) attachDockerStore(
 			"compute is gone, and the job can continue cold",
 			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
 			"error", err)
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	// AN ATTACH THAT RETURNED AFTER THE REQUEST ENDED is answered cold: the guest
+	// gives up twenty seconds after this bound, and a store recorded as mounted
+	// for a guest that went cold is one settlement waits on.
+	if requestCtx.Err() != nil {
+		s.log.Warn("the Docker image store attached after the request's bound; the session keeps "+
+			"it until the compute is gone, and the job can continue cold",
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond))
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
@@ -1548,11 +1567,19 @@ func (s *CacheService) awaitDockerReady(
 	}
 	session.mu.Unlock()
 
-	deadline := time.NewTimer(dockerSettleWait)
-	defer deadline.Stop()
+	// THE WHOLE WAIT IS INSIDE THE SETTLE WINDOW, the session lock included: a
+	// replacement request holds that lock through its acquisition and attach,
+	// and the job's teardown waits on this.
+	settleCtx, cancelSettle := context.WithTimeout(ctx, dockerSettleWait)
+	defer cancelSettle()
+	notReady := errors.New("docker image store did not become ready before teardown")
 
 	for {
-		if err := lockCacheSession(ctx, session); err != nil {
+		if err := lockCacheSession(settleCtx, session); err != nil {
+			if ctx.Err() == nil {
+				return nil, notReady
+			}
+
 			return nil, err
 		}
 		// THE STORE THIS SETTLEMENT OPENED, OR NONE. A guest can discard it and
@@ -1576,10 +1603,10 @@ func (s *CacheService) awaitDockerReady(
 			timer.Stop()
 
 			return nil, ctx.Err()
-		case <-deadline.C:
+		case <-settleCtx.Done():
 			timer.Stop()
 
-			return nil, errors.New("docker image store did not become ready before teardown")
+			return nil, notReady
 		case <-timer.C:
 		}
 	}
