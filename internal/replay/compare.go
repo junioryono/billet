@@ -146,13 +146,20 @@ func (c Comparison) Markdown() string {
 			declined += n
 		}
 
-		vcpu, memory := r.MeanUtilization()
-		fmt.Fprintf(&b, "| %s | %d | %d | %d | %.0f%% | %.0f%% | %.1f | %.1f |\n", c.Policies[i].Name, started,
-			len(r.StillQueued), declined, 100*vcpu, 100*memory, r.EmptyHostHours(), r.SpanHours())
+		// A REPLAY THAT CHARGED NOTHING HAS NO SHARES, not shares of zero.
+		overTime := "| — | — | — | —"
+		if _, _, ok := r.span(); ok {
+			vcpu, memory := r.MeanUtilization()
+			overTime = fmt.Sprintf("| %.0f%% | %.0f%% | %.1f | %.2f", 100*vcpu, 100*memory, r.EmptyHostHours(),
+				r.SpanHours())
+		}
+
+		fmt.Fprintf(&b, "| %s | %d | %d | %d %s |\n", c.Policies[i].Name, started, len(r.StillQueued), declined,
+			overTime)
 	}
 
 	b.WriteString("\nThe charged shares and the empty host-hours are over each policy's own span, from its first " +
-		"charge to its last end (or the horizon): the same jobs over a longer span charge a smaller share.\n")
+		"charge to its last end (or the horizon): the same charged hours over a longer span are a smaller share.\n")
 
 	return b.String()
 }

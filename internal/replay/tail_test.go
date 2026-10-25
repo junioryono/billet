@@ -192,14 +192,19 @@ func TestAComparisonPrintsEachPolicysSpan(t *testing.T) {
 		MaxMemory: 32 * config.GiB}
 
 	// 4 of 8 vCPU and 8 of 32 GiB: one policy for an hour, the other for two.
+	// A replay that charged nothing has no span and no shares.
 	soon := &Report{Fleet: fleet, Records: []Record{chargeAt(start, start.Add(time.Hour))}}
 	late := &Report{Fleet: fleet, Records: []Record{chargeAt(start, start.Add(2*time.Hour))}}
+	idle := &Report{Fleet: fleet}
 
-	table := Comparison{Policies: []Policy{{Name: "soon"}, {Name: "late"}}, Reports: []*Report{soon, late}}.Markdown()
+	table := Comparison{Policies: []Policy{{Name: "soon"}, {Name: "late"}, {Name: "idle"}},
+		Reports: []*Report{soon, late, idle}}.Markdown()
 
-	if !strings.Contains(table, "| soon | 0 | 0 | 0 | 50% | 25% | 0.0 | 1.0 |") ||
-		!strings.Contains(table, "| late | 0 | 0 | 0 | 50% | 25% | 0.0 | 2.0 |") {
-		t.Errorf("the table is\n%s\nwant each policy's figures over its own span, one hour and two", table)
+	if !strings.Contains(table, "| soon | 0 | 0 | 0 | 50% | 25% | 0.0 | 1.00 |") ||
+		!strings.Contains(table, "| late | 0 | 0 | 0 | 50% | 25% | 0.0 | 2.00 |") ||
+		!strings.Contains(table, "| idle | 0 | 0 | 0 | — | — | — | — |") {
+		t.Errorf("the table is\n%s\nwant each policy's figures over its own span, one hour and two, and none "+
+			"for a replay that charged nothing", table)
 	}
 }
 

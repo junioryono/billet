@@ -23,8 +23,9 @@ type UtilizationPoint struct {
 //
 // EACH REPLAY IS MEASURED OVER ITS OWN SPAN, and a comparison prints it beside
 // the figures (SpanHours). Two policies replay the same jobs, so over one
-// shared span they would charge the same share by construction, and the
-// policy that finished sooner would be counted empty while the other drained.
+// shared span they would charge nearly the same share (all but escrow and
+// what a horizon cut short), and the policy that finished sooner would be
+// counted empty while the other drained.
 func (r *Report) span() (time.Time, time.Time, bool) {
 	var from, to time.Time
 
