@@ -54,7 +54,7 @@ All 26 fell between 2026-10-23 20:27Z and 2026-10-24 13:50Z. In those same hours
 
 **A failed attach keeps its volume.** This includes an attach the four minutes cut short. Nothing proves such an attach left the volume free: EC2 can complete an attachment it accepted after billet stopped waiting, its own timeouts and describe calls can fail after it did, and its describes are eventually consistent. So the node answers at once and does not race the attach with a detach. The volume stays in the session's custody, marked as never mounted, so no settlement waits for a readiness proof the cold guest will never send, and the guest's own discard of it is refused. The session's cleanup discards it once the compute is proved gone.
 
-**A volume is recorded as never mounted from the moment it is in custody**, and only a successful attach, recorded durably, makes it the guest's. A restart in between, or a write that fails after the attach, leaves a record that still says never mounted. If that write fails, the guest is sent cold even though the attach succeeded.
+**A volume is recorded as never mounted from the moment it is in custody**, and only a successful attach, recorded durably, makes it the guest's. A restart in between, or a write that fails after the attach, leaves a record that still says never mounted. If that write fails, the guest is sent cold even though the attach succeeded, and the never-mounted state is written again. A write can fail after its rename, at the directory sync, and leave "mounted" installed. So a node that also crashed before the second write could reach the disk would find a store its settlement waits two minutes on.
 
 **A clone the session could not record** is discarded before the answer, on a context the guest hanging up cannot cancel. Before this change the cleanup inherited the guest's connection, which the guest now closes twenty seconds after the node's bound.
 
@@ -70,7 +70,7 @@ Those explicit waits add up to eight minutes at most, against about seventeen be
 **Each attach is logged with how long the whole request took:** `attached a Docker image store … cache=warm took=…`. The warnings for a store that was unavailable carry `took` too. The next measurement is therefore a `journalctl` query on the node, not a ledger query.
 
 **Older and newer pieces together:**
-- **An image built before this change** still waits 780 seconds. A newer node answers it within its four-minute bound, with one exception: when the session could not record the clone at all, the clone's discard runs before the answer.
+- **An image built before this change** still waits 780 seconds. A newer node answers it once the steps the four minutes bound have run. Outside those minutes are the session's own writes, the report to the control plane (at most two seconds) and, when the session could not record the clone at all, the clone's discard, all before the answer.
 - **A node older than this change** keeps its twelve-minute handler. A newer image hangs up on it at 260 seconds, which cancels that node's request mid-way. Whatever its session had recorded, the session's teardown discards.
 
 ## What this does not establish

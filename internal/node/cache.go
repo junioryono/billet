@@ -1405,11 +1405,15 @@ func (s *CacheService) attachDockerStore(
 	// stays in custody for the cleanup.
 	session.slots[0].Unmounted = false
 	if err := s.persistSession(session); err != nil {
+		// A WRITE CAN FAIL AFTER ITS RENAME, at the directory sync, and leave
+		// "mounted" installed; the never-mounted state is written again so the
+		// record matches the cold answer, as far as a second write can.
 		session.slots[0].Unmounted = true
+		restoreErr := s.persistSession(session)
 		s.log.Warn("the attached Docker image store could not be recorded as mounted; the session "+
 			"keeps it until the compute is gone, and the job can continue cold",
 			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
-			"error", err)
+			"error", errors.Join(err, restoreErr))
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
@@ -1513,7 +1517,8 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 }
 
 // errNoDockerStore is awaitDockerReady's answer for a session with no Docker
-// image store, or one its guest never mounted: there is nothing to settle.
+// image store, one its guest never mounted, or one replaced while settlement
+// waited: there is nothing to settle.
 var errNoDockerStore = errors.New("this session has no Docker image store")
 
 // awaitDockerReady opens the Docker store's settlement and waits for the guest
@@ -1525,16 +1530,16 @@ func (s *CacheService) awaitDockerReady(
 	if err := lockCacheSession(ctx, session); err != nil {
 		return nil, err
 	}
-	attachment := session.slots[0]
-	if attachment == nil || !attachment.Docker || attachment.Unmounted {
+	opened := session.slots[0]
+	if opened == nil || !opened.Docker || opened.Unmounted {
 		session.mu.Unlock()
 
 		return nil, errNoDockerStore
 	}
-	if !attachment.Settling {
-		attachment.Settling = true
-		attachment.Ready = false
-		attachment.Volume.Filesystem = storecontract.Filesystem{}
+	if !opened.Settling {
+		opened.Settling = true
+		opened.Ready = false
+		opened.Volume.Filesystem = storecontract.Filesystem{}
 		if err := s.persistSession(session); err != nil {
 			session.mu.Unlock()
 
@@ -1550,8 +1555,11 @@ func (s *CacheService) awaitDockerReady(
 		if err := lockCacheSession(ctx, session); err != nil {
 			return nil, err
 		}
+		// THE STORE THIS SETTLEMENT OPENED, OR NONE. A guest can discard it and
+		// ask for another while this waits, and the replacement, mounted or not,
+		// was never opened for settlement, so no readiness for it can arrive.
 		attachment := session.slots[0]
-		if attachment == nil || !attachment.Docker {
+		if attachment != opened {
 			session.mu.Unlock()
 
 			return nil, errNoDockerStore

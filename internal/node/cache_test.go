@@ -924,6 +924,58 @@ func TestARestartedNodeKeepsANeverMountedStoreOutOfSettlement(t *testing.T) {
 	})
 }
 
+// A SETTLEMENT FOLLOWS THE STORE IT OPENED AND NO OTHER. The guest can discard
+// that store and ask for another while settlement waits; the replacement was
+// never opened for settlement, and one whose attach failed can never prove
+// readiness, so waiting on it would hold the job's teardown for the whole
+// settle window.
+func TestASettlementStopsWaitingWhenItsStoreIsReplaced(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := &fakeCacheStore{}
+		attacher := &fakeVolumeAttacher{}
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			storage, attacher, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+		}
+
+		start := time.Now()
+		settled := make(chan error, 1)
+		go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
+		synctest.Wait()
+
+		if discard := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/discard", nil); discard.Code != http.StatusOK {
+			t.Fatalf("the guest's discard of its mounted store = %d: %s", discard.Code, discard.Body.String())
+		}
+		attacher.attachErr = errors.New("the VMM refused the drive")
+		if again := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); again.Code != http.StatusServiceUnavailable {
+			t.Fatalf("the replacement's status = %d, want the cold 503: %s", again.Code, again.Body.String())
+		}
+
+		if err := <-settled; err != nil {
+			t.Fatalf("SettleDocker: %v", err)
+		}
+		if waited := time.Since(start); waited >= dockerSettleWait {
+			t.Fatalf("the settlement waited %s on a store it never opened", waited)
+		}
+		if storage.published != 0 {
+			t.Fatalf("published %d store(s); neither the discarded nor the failed one was the guest's to publish",
+				storage.published)
+		}
+	})
+}
+
 // THE ONE CLEANUP LEFT IN THE HANDLER OUTLIVES THE GUEST HANGING UP. A clone
 // the session could not record is discarded before the answer, and the guest
 // stops waiting twenty seconds past the request's bound, which ends the
