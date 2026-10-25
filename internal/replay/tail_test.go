@@ -2,6 +2,7 @@ package replay
 
 import (
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -235,8 +236,10 @@ func TestADeliveredStartTheLedgerNeverSawIsLost(t *testing.T) {
 	t.Parallel()
 
 	horizon := DefaultStart.Add(time.Hour)
+	// The lost job arrived first, so counting it as queued would make it the
+	// oldest.
 	trace := Trace{Arrivals: []Arrival{
-		{Seq: 1, At: DefaultStart, Tier: "billet-4vcpu"},
+		{Seq: 1, At: DefaultStart.Add(-30 * time.Minute), Tier: "billet-4vcpu"},
 		{Seq: 2, At: DefaultStart, Tier: "billet-4vcpu"},
 		{Seq: 3, At: DefaultStart, Tier: "billet-4vcpu"},
 		{Seq: 4, At: DefaultStart, Tier: "billet-4vcpu"},
@@ -250,9 +253,11 @@ func TestADeliveredStartTheLedgerNeverSawIsLost(t *testing.T) {
 	r.classify(trace, horizon, map[int64]bool{1: true, 2: true}, map[int64]bool{2: true, 3: true},
 		map[int64]bool{1: true, 4: true})
 
-	if len(r.LostStarts) != 1 || r.LostStarts[0] != 1 || len(r.StillQueued) != 2 ||
-		r.QueuedByShape()[4].Count != 2 || len(r.Missing) != 1 || r.Missing[0] != 4 {
-		t.Errorf("lost starts %v, still queued %v (%v by shape), missing %v; want job 1 lost, 2 and 3 queued "+
-			"and 4 missing", r.LostStarts, r.StillQueued, r.QueuedByShape(), r.Missing)
+	if len(r.LostStarts) != 1 || r.LostStarts[0] != 1 || !slices.Equal(r.StillQueued, []int64{2, 3}) ||
+		r.QueuedByShape()[4] != (Backlog{Count: 2, Oldest: time.Hour}) || r.LongestQueued != time.Hour ||
+		len(r.Missing) != 1 || r.Missing[0] != 4 {
+		t.Errorf("lost starts %v, still queued %v (%v by shape, the oldest %s), missing %v; want job 1 lost, 2 "+
+			"and 3 queued for an hour and 4 missing", r.LostStarts, r.StillQueued, r.QueuedByShape(),
+			r.LongestQueued, r.Missing)
 	}
 }
