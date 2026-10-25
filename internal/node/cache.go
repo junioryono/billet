@@ -298,9 +298,11 @@ type cacheAttachment struct {
 	Volume      storecontract.Volume `json:"volume"`
 	Publication string               `json:"publication,omitempty"`
 	Docker      bool                 `json:"docker,omitempty"`
-	// Unmounted says the attach of this Docker image store failed, so the guest
-	// went cold without it: nothing settles or publishes it, and the session's
-	// cleanup discards it once the compute is gone.
+	// Unmounted says this Docker image store was never durably handed to the
+	// guest: its attach has not succeeded, failed, or could not be recorded, so
+	// the guest went cold without it. Nothing settles, publishes or lets the
+	// guest discard it, and the session's cleanup discards it once the compute
+	// is gone.
 	Unmounted bool `json:"unmounted,omitempty"`
 	Settling  bool `json:"settling,omitempty"`
 	Ready     bool `json:"ready,omitempty"`
@@ -1355,8 +1357,11 @@ func (s *CacheService) attachDockerStore(
 		}
 	}
 
+	// RECORDED AS NEVER MOUNTED UNTIL THE ATTACH HAS SUCCEEDED AND THAT IS
+	// DURABLE, so no path that loses track of the attach (a failed write, a
+	// restart, a failed attach) leaves a store settlement would wait for.
 	session.slots[0] = &cacheAttachment{
-		Volume: volume, Publication: publicationLWW, Docker: true,
+		Volume: volume, Publication: publicationLWW, Docker: true, Unmounted: true,
 	}
 	if err := s.persistSession(session); err != nil {
 		discardErr := s.store.Discard(ctx, volume)
@@ -1381,15 +1386,30 @@ func (s *CacheService) attachDockerStore(
 		// and describe calls can fail after it did, and its describes are
 		// eventually consistent, so a detach and discard now would race it on
 		// evidence that proves nothing. The volume stays in the session's
-		// custody, already durable, marked as never mounted so nothing waits to
-		// settle it, and the session's cleanup discards it once the compute is
-		// proved gone; the guest goes cold without it.
-		session.slots[0].Unmounted = true
-		persistErr := s.persistSession(session)
+		// custody, already durable and still marked as never mounted, so
+		// nothing waits to settle it, and the session's cleanup discards it once
+		// the compute is proved gone; the guest goes cold without it.
 		s.log.Warn("Docker image store could not be attached; the session keeps it until the "+
 			"compute is gone, and the job can continue cold",
 			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
-			"error", errors.Join(err, persistErr))
+			"error", err)
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	// MOUNTABLE ONLY ONCE THAT IS DURABLE. A store answered to the guest but
+	// recorded as never mounted would be refused its readiness at settlement,
+	// so a write that fails here sends the guest cold instead, and the store
+	// stays in custody for the cleanup.
+	session.slots[0].Unmounted = false
+	if err := s.persistSession(session); err != nil {
+		session.slots[0].Unmounted = true
+		s.log.Warn("the attached Docker image store could not be recorded as mounted; the session "+
+			"keeps it until the compute is gone, and the job can continue cold",
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+			"error", err)
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
@@ -2083,6 +2103,15 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 	attachment := session.slots[slot]
 	if attachment == nil {
 		http.Error(w, "cache slot is not attached", http.StatusNotFound)
+
+		return
+	}
+	// A STORE WHOSE ATTACH NEVER SUCCEEDED IS NOT THE GUEST'S TO DISCARD: a
+	// detach now would race an attach EC2 may still complete, on evidence that
+	// proves nothing. The session's cleanup takes it once the compute is gone.
+	if attachment.Unmounted {
+		http.Error(w, "this Docker image store was never mounted; it is discarded once the compute is gone",
+			http.StatusConflict)
 
 		return
 	}

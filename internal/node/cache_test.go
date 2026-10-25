@@ -355,6 +355,9 @@ type fakeVolumeAttacher struct {
 	attachBudgets []time.Duration
 	blockAttach   bool
 	attachDelay   time.Duration
+	// onAttach runs inside a successful AttachVolume, which is how a test makes
+	// what follows the attach fail.
+	onAttach func()
 	// detachDelay is how long each DetachVolume works, and detachContextErrs
 	// what its context said once that work was done.
 	detachDelay       time.Duration
@@ -372,6 +375,9 @@ func (f *fakeVolumeAttacher) AttachVolume(ctx context.Context, _ string, slot in
 		return ctx.Err()
 	}
 	time.Sleep(f.attachDelay)
+	if f.attachErr == nil && f.onAttach != nil {
+		f.onAttach()
+	}
 
 	return f.attachErr
 }
@@ -783,6 +789,139 @@ func TestAFailedDockerStoreAttachKeepsItsVolumeInCustody(t *testing.T) {
 	if storage.discarded != 1 {
 		t.Fatalf("the session's cleanup discarded %d volume(s), want the one it kept", storage.discarded)
 	}
+}
+
+// A STORE WHOSE ATTACH FAILED IS NOT THE GUEST'S TO DISCARD. The guest's
+// discard detaches and discards at once, which for an attach EC2 may still
+// complete is the race the attach handler stopped running; the session's
+// cleanup takes the store once the compute is gone.
+func TestAGuestCannotDiscardAStoreThatWasNeverMounted(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{attachErr: errors.New("the VMM refused the drive")}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, attacher, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"}); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Docker store status = %d, want the cold 503: %s", response.Code, response.Body.String())
+	}
+
+	discard := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/discard", nil)
+	if discard.Code != http.StatusConflict {
+		t.Fatalf("the guest's discard of a never-mounted store = %d, want 409: %s", discard.Code, discard.Body.String())
+	}
+	if len(attacher.detached) != 0 || storage.discarded != 0 {
+		t.Fatalf("the guest's discard detached %d and discarded %d; want the store left in custody",
+			len(attacher.detached), storage.discarded)
+	}
+}
+
+// A STORE THE GUEST WAS NOT DURABLY GIVEN IS ONE IT DOES NOT GET. The attach
+// succeeded but recording it as mounted failed, so a restart would not know
+// the guest has it; the guest is sent cold, and the store stays out of
+// settlement and in custody.
+func TestAStoreThatCouldNotBeRecordedAsMountedSendsTheGuestCold(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a directory without write permission, so the session cannot be made to fail to persist")
+	}
+
+	storage := &fakeCacheStore{}
+	stateDir := t.TempDir()
+	sessions := filepath.Join(stateDir, cacheSessionDirectory)
+	attacher := &fakeVolumeAttacher{onAttach: func() {
+		if err := os.Chmod(sessions, 0o500); err != nil {
+			t.Errorf("make the session directory read-only: %v", err)
+		}
+	}}
+	t.Cleanup(func() {
+		if err := os.Chmod(sessions, 0o700); err != nil {
+			t.Errorf("make the session directory writable again: %v", err)
+		}
+	})
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
+		storage, attacher, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"})
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Docker store status = %d, want the cold 503 for a store not recorded as mounted: %s",
+			response.Code, response.Body.String())
+	}
+	if len(attacher.attached) != 1 {
+		t.Fatalf("attached %d time(s), want the one attach that succeeded", len(attacher.attached))
+	}
+	if readiness := cacheRequest(t, service, credentials.Token, "/v1/docker-store/ready", map[string]any{
+		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+	}); readiness.Code != http.StatusNotFound {
+		t.Fatalf("readiness for a store the guest was sent cold from = %d, want 404: %s",
+			readiness.Code, readiness.Body.String())
+	}
+	if storage.discarded != 0 {
+		t.Fatalf("discarded %d volume(s) before the compute was gone, want the store kept", storage.discarded)
+	}
+}
+
+// A RESTARTED NODE KEEPS A NEVER-MOUNTED STORE OUT OF SETTLEMENT. The store is
+// recorded as never mounted from the moment it is in custody, so the record a
+// restart reads says so whatever happened to the attach, and nothing waits for
+// a readiness proof a cold guest will never send.
+func TestARestartedNodeKeepsANeverMountedStoreOutOfSettlement(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		stateDir := t.TempDir()
+		first, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
+			&fakeCacheStore{}, &fakeVolumeAttacher{attachErr: errors.New("the VMM refused the drive")},
+			slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		credentials, err := first.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if response := cacheRequest(t, first, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("Docker store status = %d, want the cold 503: %s", response.Code, response.Body.String())
+		}
+
+		storage := &fakeCacheStore{}
+		restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
+			storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService after the restart: %v", err)
+		}
+
+		settling := time.Now()
+		if err := restarted.SettleDocker(t.Context(), "billet-one", true); err != nil {
+			t.Fatalf("SettleDocker after the restart: %v", err)
+		}
+		if waited := time.Since(settling); waited != 0 {
+			t.Fatalf("the restarted node waited %s to settle a store the guest never mounted", waited)
+		}
+		if err := restarted.Cleanup(t.Context(), "billet-one"); err != nil {
+			t.Fatalf("Cleanup after the restart: %v", err)
+		}
+		if storage.discarded != 1 {
+			t.Fatalf("the restarted node's cleanup discarded %d volume(s), want the one recorded", storage.discarded)
+		}
+	})
 }
 
 // THE ONE CLEANUP LEFT IN THE HANDLER OUTLIVES THE GUEST HANGING UP. A clone
