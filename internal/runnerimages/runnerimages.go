@@ -31,6 +31,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -78,7 +79,7 @@ var toolsetArm64 []byte
 //go:embed apt-aliases.json
 var aptAliases []byte
 
-// PinnedCommit is the actions/runner-images revision toolset-2404.json came from.
+// PinnedCommit is the actions/runner-images revision both vendored toolsets came from.
 func PinnedCommit() string {
 	commit, _, _ := strings.Cut(strings.TrimSpace(pinned), " ")
 
@@ -145,8 +146,13 @@ func ToolsetBytesFor(arch string) ([]byte, error) {
 		return nil, err
 	}
 
-	if err := VerifyToolset(data, want); err != nil {
-		return nil, err
+	if err := verifyToolsetBytes(data, want); err != nil {
+		source, urlErr := SourceURLFor(arch)
+		if urlErr != nil {
+			return nil, errors.Join(err, urlErr)
+		}
+
+		return nil, fmt.Errorf("%w; refresh both together from %s, or restore the file", err, source)
 	}
 
 	out := make([]byte, len(data))
@@ -343,12 +349,20 @@ type NodeModule struct {
 // duplicate comparison worked. A guard nothing can drive with wrong input is a
 // guard nothing has checked.
 func VerifyToolset(data []byte, wantDigest string) error {
+	if err := verifyToolsetBytes(data, wantDigest); err != nil {
+		return fmt.Errorf("%w; refresh both together from %s, or restore the file", err, SourceURL())
+	}
+
+	return nil
+}
+
+// verifyToolsetBytes is the comparison alone, naming no architecture's source.
+func verifyToolsetBytes(data []byte, wantDigest string) error {
 	sum := sha256.Sum256(data)
 
 	if got := hex.EncodeToString(sum[:]); got != wantDigest {
-		return fmt.Errorf("runnerimages: the vendored toolset hashes to %s and pinned.txt "+
-			"names %s; refresh both together from %s, or restore the file",
-			got, wantDigest, SourceURL())
+		return fmt.Errorf("runnerimages: the vendored toolset hashes to %s and pinned.txt names %s",
+			got, wantDigest)
 	}
 
 	return nil

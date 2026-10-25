@@ -36,6 +36,9 @@
 #   BILLET_RI_DIR            the vendored tree (default: beside this script)
 #   BILLET_RI_TOOLSET        the toolset declaration (default: billet's vendored copy
 #                            for the scope's architecture)
+#   BILLET_RI_TOOLSET_PIN    the file naming its digest (default: billet's
+#                            internal/runnerimages/pinned.txt, the x64 digest on its
+#                            first line and the arm64 one on its `arm64` line)
 #   BILLET_RI_PLAN           the plan (default: the scope's, in $BILLET_RI_DIR)
 #   BILLET_RI_DIFFERENCES    the difference list (default: $BILLET_RI_DIR/differences.tsv)
 #   BILLET_RI_NO_PAUSE=1     skip the template's pause_before sleeps (tests only)
@@ -67,6 +70,7 @@ dir=${BILLET_RI_DIR:-$here/runner-images}
 plan=${BILLET_RI_PLAN:-$dir/$scope_plan}
 differences=${BILLET_RI_DIFFERENCES:-$dir/differences.tsv}
 toolset=${BILLET_RI_TOOLSET:-$here/../internal/runnerimages/$scope_toolset}
+toolset_pin=${BILLET_RI_TOOLSET_PIN:-$here/../internal/runnerimages/pinned.txt}
 
 from=${BILLET_RI_FROM:-1}
 case "$from" in
@@ -398,6 +402,22 @@ pause() {
 	sleep $((minutes * 60 + seconds))
 }
 
+# THE DECLARATION IS THE PINNED ONE before anything reads it, on this path as on
+# the Go side: it decides what every image built from it contains, and a target
+# that is not the guest build (whose own check reads only the x64 line) would
+# otherwise install whatever is on disk.
+case "$scope_toolset" in
+toolset-2404.json) want_toolset=$(awk 'NR == 1 { print $2 }' "$toolset_pin") ;;
+*) want_toolset=$(awk '$1 == "arm64" { print $2 }' "$toolset_pin") ;;
+esac
+[ -n "$want_toolset" ] || fail "$toolset_pin names no digest for $scope_toolset"
+got_toolset=$(sha256sum "$toolset" | cut -d ' ' -f 1) || fail "could not hash $toolset"
+[ "$got_toolset" = "$want_toolset" ] ||
+	fail "$toolset hashes to $got_toolset and $toolset_pin names $want_toolset for $scope_toolset"
+
+total=$(jq 'length' "$plan")
+[ "$from" -le "$total" ] || fail "BILLET_RI_FROM is $from and $(basename "$plan") has $total steps"
+
 mkdir -p "$BILLET_RI_OUT"
 target exec mkdir -p /var/tmp/billet-ri
 
@@ -431,8 +451,6 @@ target copy-in "$staging/with-environment" "$with_environment" || fail "could no
 target copy-in "$dir/pam-environment.awk" /var/tmp/billet-ri/pam-environment.awk ||
 	fail "could not stage the environment reader"
 
-total=$(jq 'length' "$plan")
-[ "$from" -le "$total" ] || fail "BILLET_RI_FROM is $from and $(basename "$plan") has $total steps"
 n=0
 # THE PLAN IS READ ON ITS OWN DESCRIPTOR, never on stdin, which the steps must not
 # be able to reach.
@@ -469,7 +487,10 @@ while IFS= read -r step <&3; do
 			continue
 		fi
 		while IFS= read -r source; do
-			target copy-in "$(source_path "$source")" "$destination" ||
+			# RESOLVED APART FROM THE COPY: a refusal inside a command substitution
+			# ends only the substitution, and the copy would run with no source.
+			path=$(source_path "$source") || fail "step $n $id: $source has no source here"
+			target copy-in "$path" "$destination" ||
 				fail "step $n $id: copy $source to $destination failed"
 		done < <(jq -r '.sources[]' <<<"$step")
 		;;
@@ -480,8 +501,8 @@ while IFS= read -r step <&3; do
 		# target to come back.
 		if [ "$(jq -r '.reboots // false' <<<"$step")" = true ]; then
 			# THE NEXT STEP TRAVELS WITH THE REBOOT, for a driver whose reboot ends
-			# this process and resumes the build at the next boot. Exported only to
-			# the driver: a prefix on a function call outlives the call in dash.
+			# this process and resumes the build at the next boot. Only the driver
+			# needs it, so it is set on the driver's own command.
 			BILLET_RI_NEXT_STEP=$((n + 1)) "$BILLET_RI_TARGET" reboot </dev/null ||
 				fail "step $n $id: the target did not come back from its reboot"
 			continue
@@ -489,7 +510,8 @@ while IFS= read -r step <&3; do
 
 		script=$staging/$n
 		if [ "$(jq -r '.script // ""' <<<"$step")" != "" ]; then
-			cp "$(source_path "$(jq -r .script <<<"$step")")" "$script"
+			path=$(source_path "$(jq -r .script <<<"$step")") || fail "step $n $id: its script has no source here"
+			cp "$path" "$script"
 		else
 			# INLINE COMMANDS AS PACKER RUNS THEM: one script, stopping at the first
 			# command that fails.

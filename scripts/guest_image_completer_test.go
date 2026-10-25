@@ -498,11 +498,13 @@ func TestTheCompletedComponentsAreConfigsList(t *testing.T) {
 		t.Error("build-guest-image.sh does not read its components from check-guest-component.sh")
 	}
 
-	differences := readScriptFile(t, filepath.Join("runner-images", "differences.tsv"))
+	// THE PUBLISHED GUEST'S DIFFERENCES, the x64 guest's: an entry that skips a
+	// component only for the AMI leaves it in the image billet publishes.
+	_, reasons := scopedDifferences(t, "guest-x64")
 	skipped := map[string]bool{}
-	for _, line := range strings.Split(differences, "\n") {
-		if fields := strings.Split(line, "\t"); len(fields) == 4 && fields[0] == "skip" && strings.Contains(fields[3], "#584") {
-			skipped[fields[1]] = true
+	for step, reason := range reasons {
+		if strings.Contains(reason, "#584") {
+			skipped[step] = true
 		}
 	}
 	for script := range scripts {

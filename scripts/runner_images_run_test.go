@@ -4,10 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -38,6 +40,7 @@ exec)
 		BILLET_RI_ENVIRONMENT_READER=$BILLET_TEST_ROOT/var/tmp/billet-ri/pam-environment.awk "$@"
 	;;
 copy-in)
+	if [ -z "$2" ] && [ "${BILLET_TEST_PERMISSIVE_COPY:-}" = 1 ]; then exit 0; fi
 	mkdir -p "$(dirname "$BILLET_TEST_ROOT$3")"
 	cp -R "$2" "$BILLET_TEST_ROOT$3"
 	;;
@@ -50,7 +53,9 @@ esac
 type runnerFixture struct {
 	dir, root, out string
 	plan           []planStep
-	differences    string
+	// armPlan is plan-arm64.json, for an arm64 target; plan when it is nil.
+	armPlan     []planStep
+	differences string
 	// env is added to the runner's environment, for what the fake target reads.
 	env []string
 }
@@ -64,7 +69,14 @@ func runRunner(t *testing.T, fx runnerFixture) (string, []string, error) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{"plan.json": string(plan), "differences.tsv": fx.differences} {
+	armPlan := plan
+	if fx.armPlan != nil {
+		if armPlan, err = json.Marshal(fx.armPlan); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, body := range map[string]string{"plan.json": string(plan), "plan-arm64.json": string(armPlan),
+		"differences.tsv": fx.differences} {
 		if err := os.WriteFile(filepath.Join(fx.dir, name), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -110,10 +122,15 @@ func newRunnerFixture(t *testing.T) runnerFixture {
 	if err := os.MkdirAll(build, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	record := "#!/bin/sh\necho \"$(basename \"$0\") HELPER_SCRIPTS=${HELPER_SCRIPTS:-} " +
-		"IMAGE_VERSION=${IMAGE_VERSION:-}\" >>\"$BILLET_TEST_LOG\"\n"
+	// EACH SCRIPT LOGS ITS STEP NUMBER, the name it was staged as, and writes its own
+	// name to names.log, so a wrong script staged at the right step shows.
+	record := func(name string) string {
+		return "#!/bin/sh\necho \"$(basename \"$0\") HELPER_SCRIPTS=${HELPER_SCRIPTS:-} " +
+			"IMAGE_VERSION=${IMAGE_VERSION:-}\" >>\"$BILLET_TEST_LOG\"\n" +
+			"echo " + name + " >>\"$BILLET_TEST_ROOT/names.log\"\n"
+	}
 	for name, body := range map[string]string{
-		"first.sh": record, "second.sh": record, "third.sh": record,
+		"first.sh": record("first.sh"), "second.sh": record("second.sh"), "third.sh": record("third.sh"),
 		"fails.sh": "#!/bin/sh\nexit 3\n", "asset.txt": "asset\n",
 	} {
 		if err := forkSafeWriteFile(filepath.Join(build, name), []byte(body), 0o755); err != nil {
@@ -342,7 +359,7 @@ func TestTheRealDifferenceListIsAccepted(t *testing.T) {
 		_, skipped := scopedDifferences(t, sc.name)
 		deprovision := regexp.MustCompile(`waagent\s+-force\s+-deprovision`)
 		for _, step := range readTemplatePlan(t, vendoredTemplateNamed(t, sc.template)) {
-			if deprovision.MatchString(strings.Join(step.Inline, "\n")) && !skipped[step.ID] {
+			if deprovision.MatchString(strings.Join(step.Inline, "\n")) && skipped[step.ID] == "" {
 				t.Errorf("%s: step %s deprovisions the VM for Azure and is not skipped", sc.name, step.ID)
 			}
 		}
@@ -359,8 +376,8 @@ var runnerImagesScopes = []struct{ name, template string }{
 }
 
 // scopedDifferences reads the real difference list as the runner does for scope:
-// the prepares by name and the steps they are on, and the skipped steps.
-func scopedDifferences(t *testing.T, scope string) (map[string]map[string]bool, map[string]bool) {
+// the prepares by name and the steps they are on, and each skipped step's reason.
+func scopedDifferences(t *testing.T, scope string) (map[string]map[string]bool, map[string]string) {
 	t.Helper()
 
 	differences, err := os.ReadFile(filepath.Join(runnerImagesDir, "differences.tsv"))
@@ -368,7 +385,7 @@ func scopedDifferences(t *testing.T, scope string) (map[string]map[string]bool, 
 		t.Fatal(err)
 	}
 	preparedOn := map[string]map[string]bool{}
-	skipped := map[string]bool{}
+	skipped := map[string]string{}
 	for _, line := range strings.Split(string(differences), "\n") {
 		fields := strings.Split(line, "\t")
 		if len(fields) != 4 || strings.HasPrefix(fields[0], "#") {
@@ -383,7 +400,7 @@ func scopedDifferences(t *testing.T, scope string) (map[string]map[string]bool, 
 		}
 		switch {
 		case fields[0] == "skip":
-			skipped[fields[1]] = true
+			skipped[fields[1]] = fields[3]
 		case strings.HasPrefix(fields[0], "prepare:"):
 			name := strings.TrimPrefix(fields[0], "prepare:")
 			if preparedOn[name] == nil {
@@ -415,6 +432,155 @@ func TestTheRunnerRefusesAMissingOrUnknownScope(t *testing.T) {
 	}
 }
 
+// namesRan is the fixture scripts' own names in the order they ran, each script
+// writing its name rather than the number it was staged under, so a wrong script
+// staged at the right step shows.
+func namesRan(t *testing.T, fx runnerFixture) []string {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join(fx.root, "names.log"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	return strings.Fields(string(raw))
+}
+
+// EACH TARGET RUNS ITS OWN PLAN WITH ITS OWN TOOLSET, and a difference applies to a
+// target wherever the target sits in its list: first, in the middle or last.
+func TestEachTargetRunsItsOwnPlanToolsetAndDifferences(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		scope, toolset string
+		ran            []string
+		prepared       bool
+	}{
+		{"guest-x64", "toolset-2404.json", []string{"third.sh"}, false},
+		{"ami-x64", "toolset-2404.json", []string{"first.sh", "third.sh"}, true},
+		{"guest-arm64", "toolset-2404-arm64.json", []string{"first.sh", "third.sh"}, true},
+		{"ami-arm64", "toolset-2404-arm64.json", []string{"second.sh", "third.sh"}, false},
+	} {
+		fx := newRunnerFixture(t)
+		x64 := []planStep{
+			{ID: "file:/imagegeneration/installers/toolset.json", Kind: "file",
+				Sources:     []string{"images/ubuntu/toolsets/toolset-2404.json"},
+				Destination: "/imagegeneration/installers/toolset.json"},
+			{ID: "first.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/first.sh"},
+			{ID: "second.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/second.sh"},
+			{ID: "third.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/third.sh"},
+		}
+		arm64 := []planStep{
+			{ID: "file:/imagegeneration/installers/toolset.json", Kind: "file",
+				Sources:     []string{"images/ubuntu/toolsets/toolset-2404-arm64.json"},
+				Destination: "/imagegeneration/installers/toolset.json"},
+			{ID: "second.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/second.sh"},
+			{ID: "first.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/first.sh"},
+			{ID: "third.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/third.sh"},
+		}
+		fx.plan = x64
+		fx.armPlan = arm64
+		fx.differences = "skip\tfirst.sh\tguest-x64,ami-arm64\tfirst in its list\n" +
+			"prepare:waagent-conf\tfirst.sh\tguest-arm64,ami-x64\tlast in its list\n" +
+			"skip\tsecond.sh\tami-x64,guest-arm64,guest-x64\tin the middle of its list\n"
+		fx.env = []string{"BILLET_RI_SCOPE=" + tc.scope}
+		output, calls, err := runRunner(t, fx)
+		if err != nil {
+			t.Fatalf("%s: run-runner-images.sh: %v\n%s", tc.scope, err, output)
+		}
+		if got := namesRan(t, fx); !slices.Equal(got, tc.ran) {
+			t.Errorf("%s: ran %v, want %v", tc.scope, got, tc.ran)
+		}
+		joined := strings.Join(calls, "\n")
+		copied := false
+		for _, call := range calls {
+			if strings.HasPrefix(call, "copy-in|") && strings.HasSuffix(call, "|/imagegeneration/installers/toolset.json") {
+				copied = strings.HasSuffix(strings.Split(call, "|")[1], "/internal/runnerimages/"+tc.toolset)
+			}
+		}
+		if !copied {
+			t.Errorf("%s: the toolset copied in was not %s:\n%s", tc.scope, tc.toolset, joined)
+		}
+		if got := strings.Contains(joined, "/etc/waagent.conf"); got != tc.prepared {
+			t.Errorf("%s: the prepare ran %v, want %v:\n%s", tc.scope, got, tc.prepared, joined)
+		}
+	}
+}
+
+// THE TOOLSET IS THE PINNED ONE BEFORE THE TARGET IS TOUCHED: a declaration that
+// does not hash to the line of pinned.txt for its architecture, or a pin with no
+// line for it, stops every target, not only the guest build that checks it itself.
+func TestATargetRefusesAToolsetThatIsNotThePinnedOne(t *testing.T) {
+	t.Parallel()
+
+	vendored, err := os.ReadFile(filepath.Join("..", "internal", "runnerimages", "toolset-2404-arm64.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, err := os.ReadFile(filepath.Join("..", "internal", "runnerimages", "pinned.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, _ := strings.Cut(string(pin), "\n")
+	for name, tc := range map[string]struct{ scope, toolset, pin, clause string }{
+		"a tampered arm64 declaration": {"ami-arm64", string(vendored) + " ", string(pin), "hashes to"},
+		"the x64 declaration on arm64": {"guest-arm64", "", string(pin), "hashes to"},
+		"no arm64 line":                {"ami-arm64", string(vendored), first + "\n", "names no digest"},
+	} {
+		fx := newRunnerFixture(t)
+		env := []string{"BILLET_RI_SCOPE=" + tc.scope}
+		if tc.toolset != "" {
+			path := filepath.Join(t.TempDir(), "toolset.json")
+			if err := os.WriteFile(path, []byte(tc.toolset), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			env = append(env, "BILLET_RI_TOOLSET="+path)
+		} else {
+			env = append(env, "BILLET_RI_TOOLSET="+filepath.Join("..", "internal", "runnerimages", "toolset-2404.json"))
+		}
+		pinPath := filepath.Join(t.TempDir(), "pinned.txt")
+		if err := os.WriteFile(pinPath, []byte(tc.pin), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		env = append(env, "BILLET_RI_TOOLSET_PIN="+pinPath)
+		fx.env = env
+		fx.armPlan = fx.plan
+		output, calls, err := runRunner(t, fx)
+		if err == nil || !strings.Contains(output, tc.clause) {
+			t.Errorf("%s: answered %v, want a refusal saying %q:\n%s", name, err, tc.clause, output)
+		}
+		if len(calls) != 0 {
+			t.Errorf("%s: the target was touched before the refusal: %v", name, calls)
+		}
+	}
+}
+
+// A PLAN FILE WITH NO SOURCE STOPS THE BUILD AT ITS STEP, even under a driver that
+// would accept a copy with no source: the toolset of another architecture is not
+// copied in as an empty path.
+func TestAPlanFileWithNoSourceStopsTheBuild(t *testing.T) {
+	t.Parallel()
+
+	fx := newRunnerFixture(t)
+	fx.plan = append([]planStep{{ID: "file:/imagegeneration/installers/toolset.json", Kind: "file",
+		Sources:     []string{"images/ubuntu/toolsets/toolset-2404-arm64.json"},
+		Destination: "/imagegeneration/installers/toolset.json"}}, fx.plan...)
+	fx.env = []string{"BILLET_TEST_PERMISSIVE_COPY=1"}
+	output, calls, err := runRunner(t, fx)
+	if err == nil || !strings.Contains(output, "step 1 file:/imagegeneration/installers/toolset.json: "+
+		"images/ubuntu/toolsets/toolset-2404-arm64.json has no source here") {
+		t.Fatalf("answered %v, want the step's refusal:\n%s", err, output)
+	}
+	for _, call := range calls {
+		if strings.HasPrefix(call, "copy-in||") || strings.HasSuffix(call, "|/imagegeneration/installers/toolset.json") {
+			t.Fatalf("the copy ran anyway: %s", call)
+		}
+	}
+	if got := namesRan(t, fx); len(got) != 0 {
+		t.Fatalf("steps ran after the refusal: %v", got)
+	}
+}
+
 // A DIFFERENCE FOR ANOTHER TARGET IS NOT APPLIED, even when it names this plan's
 // step, and a difference for another target whose step this plan lacks does not
 // stop this build.
@@ -428,46 +594,62 @@ func TestADifferenceAppliesOnlyToItsTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run-runner-images.sh: %v\n%s", err, output)
 	}
-	if strings.Contains(output, "not on x64") || !strings.Contains(readSteps(t, fx), "4 ") {
-		t.Fatalf("another target's skip was applied:\n%s", output)
+	if got, want := namesRan(t, fx), []string{"first.sh", "second.sh", "third.sh"}; strings.Contains(output, "not on x64") ||
+		!slices.Equal(got, want) {
+		t.Fatalf("another target's skip was applied: ran %v, want %v\n%s", got, want, output)
 	}
 }
 
-// A RESUMED BUILD STARTS AT ITS STEP: nothing before it runs again, its own
-// prepares included, and the steps from it on run in order. A reboot hands the
-// driver the step after it, which is where a driver whose reboot ends the run
-// resumes it.
+// A RESUMED BUILD STARTS AT ITS STEP: nothing before it runs again, the steps from
+// it on run in order, and a prepare on the resume step itself runs. A reboot hands
+// the driver the step after it, wherever the reboot is, which is where a driver
+// whose reboot ends the run resumes it.
 func TestABuildResumesAtItsStepAndARebootTellsTheDriverWhere(t *testing.T) {
 	t.Parallel()
 
-	fx := newRunnerFixture(t)
-	_, calls, err := runRunner(t, fx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slicesContains(calls, "next=4") {
-		t.Fatalf("the reboot at step 3 did not tell the driver to resume at 4:\n%s", strings.Join(calls, "\n"))
+	for _, at := range []int{2, 4} {
+		fx := newRunnerFixture(t)
+		reboot := fx.plan[2]
+		rest := append(append([]planStep{}, fx.plan[:2]...), fx.plan[3:]...)
+		fx.plan = append(append(append([]planStep{}, rest[:at]...), reboot), rest[at:]...)
+		_, calls, err := runRunner(t, fx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := fmt.Sprintf("next=%d", at+2); !slices.Contains(calls, want) {
+			t.Fatalf("the reboot at step %d did not tell the driver %s:\n%s", at+1, want, strings.Join(calls, "\n"))
+		}
 	}
 
-	fx = newRunnerFixture(t)
-	fx.differences = "prepare:waagent-conf\tfirst.sh\t*\tbefore the resume point\n"
+	fx := newRunnerFixture(t)
+	fx.differences = "prepare:waagent-conf\tfirst.sh\t*\tbefore the resume point\n" +
+		"prepare:docker-daemon\tsecond.sh\t*\ton the resume step\n"
 	fx.env = []string{"BILLET_RI_FROM=4"}
 	output, calls, err := runRunner(t, fx)
 	if err != nil {
 		t.Fatalf("run-runner-images.sh: %v\n%s", err, output)
 	}
-	steps := readSteps(t, fx)
-	if strings.Contains(steps, "2 ") || !strings.Contains(steps, "4 ") || !strings.Contains(steps, "5 ") {
-		t.Fatalf("resumed at 4, the steps that ran were:\n%s", steps)
+	if got, want := namesRan(t, fx), []string{"second.sh", "third.sh"}; !slices.Equal(got, want) {
+		t.Fatalf("resumed at 4, ran %v, want %v", got, want)
 	}
+	joined := strings.Join(calls, "\n")
 	for _, call := range calls {
 		if strings.Contains(call, "/etc/waagent.conf") || strings.HasPrefix(call, "reboot") ||
-			strings.HasPrefix(call, "copy-in|"+filepath.Join(fx.dir, "upstream")) {
-			t.Fatalf("a step before the resume point acted: %s\n%s", call, strings.Join(calls, "\n"))
+			strings.HasSuffix(call, "|/imagegeneration/asset.txt") {
+			t.Fatalf("a step before the resume point acted: %s\n%s", call, joined)
 		}
 	}
-	if !strings.Contains(output, "ran before the reboot this build resumed from") {
-		t.Errorf("the resumed steps were not said:\n%s", output)
+	if !strings.Contains(joined, "/etc/docker") {
+		t.Fatalf("the prepare on the resume step itself did not run:\n%s", joined)
+	}
+	if strings.Count(output, "ran before the reboot this build resumed from") != 3 {
+		t.Errorf("the three steps before the resume point were not each said:\n%s", output)
+	}
+
+	fx = newRunnerFixture(t)
+	fx.env = []string{"BILLET_RI_FROM=6"}
+	if output, _, err := runRunner(t, fx); err != nil || !strings.Contains(output, "=== [6/6] download:/report.md ===") {
+		t.Fatalf("resuming at the last step answered %v:\n%s", err, output)
 	}
 
 	for _, from := range []string{"0", "07", "x", "-1", "7"} {
@@ -477,20 +659,10 @@ func TestABuildResumesAtItsStepAndARebootTellsTheDriverWhere(t *testing.T) {
 		if err == nil || !strings.Contains(output, "BILLET_RI_FROM") {
 			t.Errorf("BILLET_RI_FROM=%s: answered %v, want a refusal naming it:\n%s", from, err, output)
 		}
-		if from != "7" && len(calls) != 0 {
+		if len(calls) != 0 {
 			t.Errorf("BILLET_RI_FROM=%s: the target was touched before the refusal: %v", from, calls)
 		}
 	}
-}
-
-func slicesContains(list []string, want string) bool {
-	for _, item := range list {
-		if item == want {
-			return true
-		}
-	}
-
-	return false
 }
 
 // A STEP STARTS IN THE ENVIRONMENT THE STEPS BEFORE IT WROTE, as a Packer step
