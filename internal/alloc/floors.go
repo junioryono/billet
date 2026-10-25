@@ -2,6 +2,7 @@ package alloc
 
 import (
 	"context"
+	"maps"
 	"slices"
 
 	"github.com/junioryono/billet/internal/config"
@@ -39,6 +40,18 @@ import (
 func (a *Allocator) reserveFloors(
 	ctx context.Context, tx querier, forTier string, free *fleet, returned placementCost,
 ) (floorCharge, error) {
+	held := floorCharge{byTarget: map[string]placementCost{}}
+
+	// NOTHING TO HOLD, NOTHING TO READ. Counting what every tier holds is a pass
+	// over every open lease inside the purchase's write transaction, and a
+	// deployment where no other tier keeps a floor would pay it for an answer
+	// that is always nothing.
+	if !slices.ContainsFunc(slices.Collect(maps.Values(a.tiers)), func(t config.Tier) bool {
+		return t.Label != forTier && t.Reserved > 0
+	}) {
+		return held, nil
+	}
+
 	open, err := a.countFloorLeasesPerTier(ctx, tx)
 	if err != nil {
 		return floorCharge{}, err
@@ -49,7 +62,6 @@ func (a *Allocator) reserveFloors(
 		return floorCharge{}, err
 	}
 
-	held := floorCharge{byTarget: map[string]placementCost{}}
 	budget := map[string]placementCost{}
 
 	returnedTo := ""
@@ -97,10 +109,7 @@ func (a *Allocator) reserveFloors(
 			limit = placementCost{vcpu: unboundedVCPU, memory: unboundedMemory}
 		}
 
-		cost, err := a.holdFloor(ctx, tx, t, missing, free, limit)
-		if err != nil {
-			return floorCharge{}, err
-		}
+		cost := a.holdFloor(t, missing, free, limit)
 
 		if shared {
 			budget[target] = placementCost{
@@ -141,19 +150,13 @@ type floorCharge struct {
 // is kept on the Mac, and holding it anywhere else would reserve room that tier
 // could never use. Only the hosts they SHARE are actually affected, which is
 // exactly the contention a floor is meant to survive.
-func (a *Allocator) holdFloor(
-	ctx context.Context, tx querier, t config.Tier, missing int, free *fleet,
-	limit placementCost,
-) (placementCost, error) {
+func (a *Allocator) holdFloor(t config.Tier, missing int, free *fleet, limit placementCost) placementCost {
 	// ITS OWN CANDIDATES, SPENDING THE SHARED FLEET. A floor on a macOS tier is
 	// kept on the Mac; holding it against whichever machines the ASKING tier
 	// happens to use is wrong twice — it denies them room to protect a
 	// reservation that could never be kept there, and leaves the only host that
 	// matters untouched.
-	held, err := free.forTier(ctx, tx, a, t)
-	if err != nil {
-		return placementCost{}, err
-	}
+	held := free.forTier(a, t)
 
 	// The placer bounds every placement by its deployment room, so the share is
 	// that room here and a remote floor is spent at the shape it buys.
@@ -173,5 +176,5 @@ func (a *Allocator) holdFloor(
 		cost.memory += one.memory
 	}
 
-	return cost, nil
+	return cost
 }
