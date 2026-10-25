@@ -115,7 +115,11 @@ UPDATE leases SET heartbeat_at = @heartbeat_at, expires_at = @expires_at
 -- against 3.5 ms halving it, each part split into its first half of records and
 -- the rest until every part is one record (measured 2026-10-25 on an M2 Max).
 -- One recursive reference, joined to the two halves, because PostgreSQL refuses
--- a recursive term that names the query twice.
+-- a recursive term that names the query twice. Only a part of at least two
+-- records is split, so each half is at least one record and shorter than its
+-- part, and a malformed string ends in parts that renew nothing rather than in
+-- a split that never shrinks; the packer admits only printable ASCII, so a
+-- length is the same count of characters on both engines.
 --
 -- THE ROW VALUE KEEPS EACH EPOCH BESIDE THE ID IT CAME WITH, for an id named
 -- twice, and the IN still narrows by the primary key.
@@ -125,7 +129,7 @@ WITH RECURSIVE part (rec) AS (
     SELECT CASE h.side WHEN 0 THEN substr(rec, 1, length(rec) / 166 * 83)
                        ELSE substr(rec, length(rec) / 166 * 83 + 1) END
       FROM part CROSS JOIN (SELECT 0 AS side UNION ALL SELECT 1) AS h
-     WHERE length(rec) > 83
+     WHERE length(rec) >= 166
 )
 UPDATE leases SET heartbeat_at = @heartbeat_at, expires_at = @expires_at
  WHERE phase NOT IN ('done','failed')

@@ -215,6 +215,13 @@ type Listener struct {
 	// wrong ordering fail causally rather than usually.
 	heartbeatLock func()
 
+	// heartbeatRenew runs between the moment a heartbeat pass asks for its
+	// renewals and the call that makes them. TEST-ONLY and nil in every
+	// deployment, and it replaces nothing: a test spends time in it that a pass
+	// would spend waiting on the allocator, to prove a renewal is confirmed as
+	// of when it was asked for and not as of when the last batch answered.
+	heartbeatRenew func()
+
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()

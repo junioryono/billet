@@ -3,6 +3,7 @@ package server
 import (
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -114,4 +115,41 @@ func TestAHeartbeatPassRenewsItsLeasesInOneCommit(t *testing.T) {
 	if _, owed := l.cleanup[41]; !owed {
 		t.Fatal("a running lease that was lost was not owed a destroy")
 	}
+}
+
+// A RENEWAL IS CONFIRMED AS OF WHEN IT WAS ASKED FOR. The allocator writes a
+// lease's expiry from when its batch ran, and returns after its last batch;
+// confirming at the return would date an early batch's renewal after the
+// expiry it wrote, and keep a lease advertised past the moment the reaper may
+// take it. In a bubble, twenty seconds pass between the asking and the answer,
+// and the confirmation must not move with them.
+func TestARenewalIsConfirmedAsOfWhenItWasAskedFor(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+		lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+		const answeredAfter = 20 * time.Second
+
+		l.heartbeatRenew = func() { time.Sleep(answeredAfter) }
+
+		asked := time.Now()
+
+		l.mu.Lock()
+		l.heartbeatHeld(t.Context())
+		confirmed, seen := l.confirmed[lease.ID]
+		l.mu.Unlock()
+
+		if answered := time.Since(asked); answered < answeredAfter {
+			t.Fatalf("the pass answered %v after it asked, so the delay it is about never happened", answered)
+		}
+
+		if !seen || !confirmed.Equal(asked) {
+			t.Fatalf("the renewal was confirmed at %v (seen %v), want %v, when it was asked for", confirmed, seen, asked)
+		}
+	})
 }

@@ -328,6 +328,18 @@ func (l *Listener) renewAll(ctx context.Context) func(*alloc.Lease) renewal {
 		add(p.lease)
 	}
 
+	// CONFIRMED AS OF WHEN IT WAS ASKED, never as of when the call returned. A
+	// lease's expiry is pushed out from when its batch was written, which is no
+	// earlier than this; the call returns after its last batch, which can be
+	// much later. Confirming at the return would date an early batch's renewal
+	// after the expiry it actually wrote, and keep a lease advertised past the
+	// moment the reaper may take it.
+	asked := time.Now()
+
+	if l.heartbeatRenew != nil {
+		l.heartbeatRenew()
+	}
+
 	answers := make(map[*alloc.Lease]error, len(leases))
 	if len(refs) > 0 {
 		for i, err := range l.alloc.HeartbeatMany(ctx, refs) {
@@ -342,17 +354,18 @@ func (l *Listener) renewAll(ctx context.Context) func(*alloc.Lease) renewal {
 			return r
 		}
 
-		r := l.renewed(lease, answers[lease])
+		r := l.renewed(lease, answers[lease], asked)
 		judged[lease] = r
 
 		return r
 	}
 }
 
-// renewed says what one lease's renewal answer means for this listener.
-func (l *Listener) renewed(lease *alloc.Lease, err error) renewal {
+// renewed says what one lease's renewal answer means for this listener, the
+// renewal having been asked for at asked.
+func (l *Listener) renewed(lease *alloc.Lease, err error, asked time.Time) renewal {
 	if err == nil {
-		l.confirmed[lease.ID] = time.Now()
+		l.confirmed[lease.ID] = asked
 
 		return renewalOwned
 	}

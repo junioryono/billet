@@ -1657,8 +1657,10 @@ const (
 )
 
 // packLeaseRefs packs the references the statement can carry, saying which
-// ones those were: an id wider than the record or holding a space, or a
-// negative epoch, is left to the one-lease renewal.
+// ones those were. Only an id of printable ASCII without a space, no wider than
+// the record, is packed, so every record is exactly its width in characters on
+// both engines (SQLite's length() stops at a NUL); any other id, and a negative
+// epoch, is left to the one-lease renewal.
 func packLeaseRefs(refs []LeaseRef) (string, int, []bool) {
 	var b strings.Builder
 	b.Grow(len(refs) * (packedLeaseIDWidth + packedEpochWidth))
@@ -1667,8 +1669,8 @@ func packLeaseRefs(refs []LeaseRef) (string, int, []bool) {
 	count := 0
 
 	for i, ref := range refs {
-		if ref.ID == "" || len(ref.ID) > packedLeaseIDWidth || strings.ContainsAny(ref.ID, " \t\r\n") ||
-			ref.Epoch < 0 {
+		if ref.ID == "" || len(ref.ID) > packedLeaseIDWidth || ref.Epoch < 0 ||
+			strings.ContainsFunc(ref.ID, func(r rune) bool { return r <= ' ' || r > '~' }) {
 			continue
 		}
 

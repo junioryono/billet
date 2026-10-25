@@ -2,12 +2,16 @@ package alloc
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
 // ONE BATCH ANSWERS EVERY LEASE AS ITS OWN RENEWAL WOULD. Across more leases
@@ -64,6 +68,7 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 		{"a stale epoch", LeaseRef{ID: stale.ID, Epoch: stale.Epoch + 1}, ErrFenced},
 		{"a stale epoch beside the current one", LeaseRef{ID: held[3].ID, Epoch: held[3].Epoch + 1}, ErrFenced},
 		{"an unknown id", LeaseRef{ID: "no-such-lease", Epoch: 1}, ErrLeaseNotFound},
+		{"an id holding a NUL", LeaseRef{ID: "x\x00", Epoch: 1}, ErrLeaseNotFound},
 		{"a released lease", LeaseRef{ID: released.ID, Epoch: released.Epoch}, ErrLeaseNotFound},
 		{"a force-released lease", LeaseRef{ID: forced.ID, Epoch: forced.Epoch}, ErrForceRelease},
 		{"an id wider than the record", LeaseRef{ID: strings.Repeat("a", packedLeaseIDWidth+1), Epoch: 1},
@@ -73,7 +78,7 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 
 	// THE REFUSALS SIT BETWEEN RENEWALS, on both sides of the batch boundary,
 	// so an answer written at the wrong index would land on a renewal.
-	at := []int{1, 2, 40, 200, heartbeatBatch, heartbeatBatch + 5, len(refs)}
+	at := []int{1, 2, 40, 41, 200, heartbeatBatch, heartbeatBatch + 5, len(refs)}
 	for i := len(cases) - 1; i >= 0; i-- {
 		refs = append(refs[:at[i]], append([]LeaseRef{cases[i].ref}, refs[at[i]:]...)...)
 	}
@@ -102,8 +107,13 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 			t.Errorf("lease %d (%s): answered %v, want it renewed", i, ref.ID, answers[i])
 		}
 
-		// THE SAME ANSWER ONE RENEWAL GIVES, for every lease, read before the
-		// clock moves so a renewal here changes nothing.
+		// THE SAME REFUSAL ONE RENEWAL GIVES, asked before the clock moves. Only
+		// a refusal is compared here, because one renewal of a lease the batch
+		// renewed would renew it again and hide a batch that wrote nothing.
+		if answers[i] == nil {
+			continue
+		}
+
 		if one := a.Heartbeat(ctx, ref.ID, ref.Epoch); !sameRenewalAnswer(one, answers[i]) {
 			t.Errorf("lease %d (%s): the batch answered %v and one renewal %v", i, ref.ID, answers[i], one)
 		}
@@ -113,8 +123,17 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 	// for: the reaper takes the control and leaves every renewed lease.
 	now = now.Add(15 * time.Second)
 
-	if _, err := a.Reap(ctx); err != nil {
-		t.Fatalf("Reap: %v", err)
+	// UNTIL A PASS TAKES NOTHING, because one pass takes a bounded number and a
+	// batch that wrote nothing leaves every lease here expired.
+	for {
+		n, err := a.Reap(ctx)
+		if err != nil {
+			t.Fatalf("Reap: %v", err)
+		}
+
+		if n == 0 {
+			break
+		}
 	}
 
 	if _, err := a.Lease(ctx, unrenewed.ID); !errors.Is(err, ErrLeaseNotFound) {
@@ -128,6 +147,65 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 	for _, l := range held {
 		if _, err := a.Lease(ctx, l.ID); err != nil {
 			t.Fatalf("renewed lease %s was reaped: %v", l.ID, err)
+		}
+	}
+
+	// AND THE RENEWALS ARE WHAT ONE RENEWAL ANSWERS, asked only now that the
+	// reap has shown the batch's own writes kept them.
+	for i, ref := range refs {
+		if answers[i] != nil {
+			continue
+		}
+
+		if one := a.Heartbeat(ctx, ref.ID, ref.Epoch); !sameRenewalAnswer(one, answers[i]) {
+			t.Errorf("lease %d (%s): the batch renewed it and one renewal answered %v", i, ref.ID, one)
+		}
+	}
+}
+
+// A PACKED STRING THE STATEMENT CANNOT CUT INTO RECORDS ENDS, and renews
+// nothing. The packer admits no such string, but the statement must not rely
+// on it: SQLite's length() stops at a NUL, so a record holding one reads
+// short, and a split that never shrinks would hold the writer slot until the
+// transaction's deadline.
+func TestHeartbeatLeasesEndsOnAStringItCannotCut(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("linux", 1, config.GiB)})
+
+	lease := reserve(t, a, "linux")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	record := fmt.Sprintf("%-*s%0*d", packedLeaseIDWidth, lease.ID, packedEpochWidth, lease.Epoch)
+
+	for _, packed := range []string{
+		record + "x",
+		record + strings.Repeat("y", 82),
+		record + "x\x00" + strings.Repeat(" ", packedLeaseIDWidth-2) + strings.Repeat("0", packedEpochWidth),
+		strings.Repeat("z", 165),
+	} {
+		// PostgreSQL refuses a NUL in text outright, which is its own answer.
+		if testingPostgres() && strings.ContainsRune(packed, 0) {
+			continue
+		}
+
+		var renewed int
+
+		err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+			rows, err := state.WriteQueries(tx).HeartbeatLeases(ctx, ledgerdb.HeartbeatLeasesParams{
+				HeartbeatAt: ts(time.Now()), ExpiresAt: ts(time.Now().Add(time.Minute)), Packed: packed,
+			})
+			renewed = len(rows)
+
+			return err
+		})
+		if err != nil {
+			t.Fatalf("a string of %d characters: %v", len(packed), err)
+		}
+
+		if renewed != 0 {
+			t.Fatalf("a string of %d characters that is not whole records renewed %d leases", len(packed), renewed)
 		}
 	}
 }
