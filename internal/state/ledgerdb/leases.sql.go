@@ -281,7 +281,8 @@ func (q *Queries) HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) 
 
 const heartbeatLeases = `-- name: HeartbeatLeases :many
 WITH RECURSIVE part (rec) AS (
-    SELECT CAST($3 AS TEXT) WHERE length(CAST($3 AS TEXT)) >= 83
+    SELECT CAST($3 AS TEXT)
+     WHERE length(CAST($3 AS TEXT)) >= 83 AND length(CAST($3 AS TEXT)) % 83 = 0
     UNION ALL
     SELECT CASE h.side WHEN 0 THEN substr(rec, 1, length(rec) / 166 * 83)
                        ELSE substr(rec, length(rec) / 166 * 83 + 1) END
@@ -326,11 +327,12 @@ type HeartbeatLeasesRow struct {
 // against 3.5 ms halving it, each part split into its first half of records and
 // the rest until every part is one record (measured 2026-10-25 on an M2 Max).
 // One recursive reference, joined to the two halves, because PostgreSQL refuses
-// a recursive term that names the query twice. Only a part of at least two
-// records is split, so each half is at least one record and shorter than its
-// part, and a malformed string ends in parts that renew nothing rather than in
-// a split that never shrinks; the packer admits only printable ASCII, so a
-// length is the same count of characters on both engines.
+// a recursive term that names the query twice. Only a string of whole records
+// is cut at all, and only a part of at least two records is split, so each
+// half is whole records and shorter than its part: a string that is not whole
+// records renews nothing, rather than its valid prefix or a split that never
+// shrinks. The packer admits only printable ASCII, so a length is the same
+// count of characters on both engines (SQLite's length() stops at a NUL).
 //
 // THE ROW VALUE KEEPS EACH EPOCH BESIDE THE ID IT CAME WITH, for an id named
 // twice, and the IN still narrows by the primary key.

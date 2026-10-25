@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -1543,7 +1544,16 @@ func (a *Allocator) Heartbeat(ctx context.Context, leaseID string, epoch int64) 
 }
 
 // heartbeatTx renews one lease inside the caller's transaction.
+//
+// AN ID NO LEASE CAN CARRY IS NOT ASKED ABOUT. PostgreSQL refuses a NUL or
+// invalid UTF-8 in a text parameter as an error, and inside HeartbeatMany that
+// error would end the transaction and every other lease's renewal with it;
+// SQLite would answer that there is no such lease, which is the truth on both.
 func (a *Allocator) heartbeatTx(ctx context.Context, tx *sql.Tx, leaseID string, epoch int64, now time.Time) error {
+	if strings.ContainsRune(leaseID, 0) || !utf8.ValidString(leaseID) {
+		return fmt.Errorf("%w: %q", ErrLeaseNotFound, leaseID)
+	}
+
 	lease, err := a.load(ctx, tx, leaseID, epoch)
 	if err != nil {
 		return err
@@ -1635,6 +1645,10 @@ func (a *Allocator) heartbeatManyTx(ctx context.Context, tx *sql.Tx, refs []Leas
 			continue
 		}
 
+		if heartbeatAskedOne != nil {
+			heartbeatAskedOne(ref)
+		}
+
 		// A FAILED WRITE ENDS THE TRANSACTION and every answer with it; a
 		// refusal is this lease's answer and the others go on.
 		err := a.heartbeatTx(ctx, tx, ref.ID, ref.Epoch, now)
@@ -1648,6 +1662,12 @@ func (a *Allocator) heartbeatManyTx(ctx context.Context, tx *sql.Tx, refs []Leas
 
 	return nil
 }
+
+// heartbeatAskedOne is told of every lease HeartbeatMany asks the one-lease
+// renewal about rather than renewing it in the batch's statement. TEST-ONLY,
+// nil in production: it is how a test proves the statement, and not the
+// fallback beside it, renewed what the batch says it did.
+var heartbeatAskedOne func(LeaseRef)
 
 // The width of a packed lease reference: the id space-padded, then the epoch
 // as zero-padded digits (HeartbeatLeases).

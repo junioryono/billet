@@ -85,7 +85,14 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 
 	now = now.Add(20 * time.Second)
 
+	// WHAT THE ONE-LEASE RENEWAL WAS ASKED ABOUT, so a lease the batch says it
+	// renewed is known to have been renewed by the batch's statement.
+	askedOne := map[LeaseRef]bool{}
+	heartbeatAskedOne = func(ref LeaseRef) { askedOne[ref] = true }
+	t.Cleanup(func() { heartbeatAskedOne = nil })
+
 	answers := a.HeartbeatMany(ctx, refs)
+	heartbeatAskedOne = nil
 	if len(answers) != len(refs) {
 		t.Fatalf("%d answers for %d leases", len(answers), len(refs))
 	}
@@ -105,6 +112,8 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 			t.Errorf("lease %d (%s): answered %v, want %v", i, ref.ID, answers[i], want)
 		case !isRefused && answers[i] != nil:
 			t.Errorf("lease %d (%s): answered %v, want it renewed", i, ref.ID, answers[i])
+		case !isRefused && askedOne[ref]:
+			t.Errorf("lease %d (%s) was renewed by the one-lease renewal, not by the batch's statement", i, ref.ID)
 		}
 
 		// THE SAME REFUSAL ONE RENEWAL GIVES, asked before the clock moves. Only
@@ -164,10 +173,10 @@ func TestHeartbeatManyAnswersEachLeaseAsItsOwnRenewalWould(t *testing.T) {
 }
 
 // A PACKED STRING THE STATEMENT CANNOT CUT INTO RECORDS ENDS, and renews
-// nothing. The packer admits no such string, but the statement must not rely
-// on it: SQLite's length() stops at a NUL, so a record holding one reads
-// short, and a split that never shrinks would hold the writer slot until the
-// transaction's deadline.
+// nothing, not even a whole record at its front. The packer admits no such
+// string, but the statement must not rely on it: SQLite's length() stops at a
+// NUL, so a record holding one reads short, and a split that never shrinks
+// would hold the writer slot until the transaction's deadline.
 func TestHeartbeatLeasesEndsOnAStringItCannotCut(t *testing.T) {
 	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 16 * config.GiB},
 		[]config.Tier{tier("linux", 1, config.GiB)})
@@ -181,6 +190,7 @@ func TestHeartbeatLeasesEndsOnAStringItCannotCut(t *testing.T) {
 
 	for _, packed := range []string{
 		record + "x",
+		record + record + "x",
 		record + strings.Repeat("y", 82),
 		record + "x\x00" + strings.Repeat(" ", packedLeaseIDWidth-2) + strings.Repeat("0", packedEpochWidth),
 		strings.Repeat("z", 165),

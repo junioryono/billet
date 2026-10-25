@@ -133,6 +133,16 @@ func TestARenewalIsConfirmedAsOfWhenItWasAskedFor(t *testing.T) {
 		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
 		lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
+		// AN EARLIER CONFIRMATION THE RENEWAL MUST REPLACE, as every pass after
+		// a lease's first replaces the one before it.
+		earlier := time.Now()
+
+		l.mu.Lock()
+		l.confirmed[lease.ID] = earlier
+		l.mu.Unlock()
+
+		time.Sleep(10 * time.Second)
+
 		const answeredAfter = 20 * time.Second
 
 		l.heartbeatRenew = func() { time.Sleep(answeredAfter) }
@@ -149,7 +159,8 @@ func TestARenewalIsConfirmedAsOfWhenItWasAskedFor(t *testing.T) {
 		}
 
 		if !seen || !confirmed.Equal(asked) {
-			t.Fatalf("the renewal was confirmed at %v (seen %v), want %v, when it was asked for", confirmed, seen, asked)
+			t.Fatalf("the renewal was confirmed at %v (seen %v), want %v, when it was asked for, not %v before it",
+				confirmed, seen, asked, earlier)
 		}
 	})
 }
