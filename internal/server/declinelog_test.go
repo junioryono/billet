@@ -296,6 +296,41 @@ func TestADropBeforeTheRequestDoesNotUnexplainIt(t *testing.T) {
 	}
 }
 
+// A DROP WHILE backAssignment RUNS IS COUNTED AGAINST IT: the count is taken
+// when it begins, so backing lost during the purchase (a lease bought and dropped
+// before it is checked) makes the explained refusal that follows an error.
+func TestADropDuringBackAssignmentIsAnError(t *testing.T) {
+	t.Parallel()
+
+	_, lines, listeners := loggedListeners(t, contenders(), 8, config.AdmissionFill)
+	l := listeners[0]
+
+	if err := l.reconcilePool(t.Context(), 2); err != nil {
+		t.Fatalf("small tier reconcile: %v", err)
+	}
+	dropped := false
+	l.beforeEscrowRefill = func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.acquiring[77] = &promise{lease: &alloc.Lease{ID: "dropped"}, at: time.Now()}
+		l.forgetBacking(77)
+		dropped = true
+	}
+
+	if err := l.backAssignment(t.Context(), 5); err != nil {
+		t.Fatalf("back assignment: %v", err)
+	}
+	l.mu.Lock()
+	refused := l.backed.refused
+	l.mu.Unlock()
+	if !dropped || !refused.explained() {
+		t.Fatalf("dropped %v, refusal %v: the purchase never ran or met no explained refusal, so "+
+			"this test proves nothing", dropped, refused)
+	}
+
+	assertDeclinedAsAnError(t, l, lines, 5)
+}
+
 // assertDeclinedAsAnError assigns request to l with no backing and asserts it is
 // declined with one error line.
 func assertDeclinedAsAnError(t *testing.T, l *Listener, lines *logLines, request int64) {
