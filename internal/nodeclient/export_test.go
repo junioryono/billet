@@ -1,9 +1,11 @@
 package nodeclient
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -58,3 +60,9 @@ func DialerForTest(c *Client, i int) *net.Dialer { return c.targets[i].dialer }
 
 // IsNoAnswerForTest reports whether an error says the controller gave no answer.
 func IsNoAnswerForTest(err error) bool { return errors.Is(err, errNoAnswer) }
+
+// SetLookupForTest replaces how the controller at index i of a client of
+// several looks its name up.
+func SetLookupForTest(c *Client, i int, f func(ctx context.Context, network, host string) ([]netip.Addr, error)) {
+	c.targets[i].resolving.lookup = f
+}

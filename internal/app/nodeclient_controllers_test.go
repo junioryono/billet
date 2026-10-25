@@ -20,9 +20,9 @@ import (
 // EACH CONTROLLER IS VERIFIED AGAINST THE NAME THE NODE DIALLED FOR IT. Two
 // controllers of one deployment, one certified only for `localhost` and the
 // other only for 127.0.0.1; the node dials the first by name and the second by
-// address. The first is down, so the registration goes to the second, and its
-// handshake succeeds only if it was checked against 127.0.0.1: checked against
-// the first controller's name it fails, which the test proves it would.
+// address. Both answer 503, so a registration round asks both, and each is
+// reached only if its handshake was checked against its own name: checked
+// against the other's it fails, which the test proves it would.
 func TestEachControllerIsVerifiedAgainstItsOwnName(t *testing.T) {
 	t.Parallel()
 
@@ -47,11 +47,9 @@ func TestEachControllerIsVerifiedAgainstItsOwnName(t *testing.T) {
 		t.Fatalf("the node's identity: %v", err)
 	}
 
-	named := controllerServing(t, ca, "localhost", nil)
-	named.Close()
+	var namedReached, reached atomic.Int32
 
-	var reached atomic.Int32
-
+	named := controllerServing(t, ca, "localhost", &namedReached)
 	addressed := controllerServing(t, ca, "127.0.0.1", &reached)
 
 	_, namedPort, err := net.SplitHostPort(named.Listener.Addr().String())
@@ -97,6 +95,10 @@ func TestEachControllerIsVerifiedAgainstItsOwnName(t *testing.T) {
 		Provider: config.ProviderDocker, GuestOS: []config.GuestOS{config.GuestLinux},
 		Deployment: "0123456789abcdef0123456789abcdef", VCPU: 2, Memory: 2 * config.GiB,
 	})
+
+	if namedReached.Load() == 0 {
+		t.Fatal("the registration never reached the controller certified for the name the node dialled")
+	}
 
 	if reached.Load() == 0 {
 		t.Fatal("the registration never reached the controller certified for the address the node dialled")

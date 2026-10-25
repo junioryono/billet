@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -856,6 +857,76 @@ func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 	}
 }
 
+// A NODE WITH ONE CONTROLLER DIALS AS IT ALWAYS DID: ten seconds for the whole
+// dial, its name included, and the system's own probes. The bounds a failover
+// needs are for a node that has somewhere else to go.
+func TestANodeWithOneControllerDialsAsItAlwaysDid(t *testing.T) {
+	t.Parallel()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: "http://control-a.example:7717"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	d := nodeclient.DialerForTest(c, 0)
+	if d == nil {
+		t.Fatal("the client built no dialer of its own")
+	}
+
+	if d.Timeout != 10*time.Second || d.KeepAliveConfig != (net.KeepAliveConfig{}) || d.KeepAlive != 0 {
+		t.Fatalf("a node with one controller dials with %v and probes %+v (%v), want 10s and the system's",
+			d.Timeout, d.KeepAliveConfig, d.KeepAlive)
+	}
+}
+
+// A NAME SLOW TO LOOK UP IS NOT A CONTROLLER THAT DOES NOT ANSWER. The static
+// build's resolver waits five seconds on a nameserver that is down before it
+// asks the next, which is past the dial's three; the lookup has a bound of its
+// own, so the controller behind it is still reached.
+func TestASlowLookupIsNotCutByTheDialBound(t *testing.T) {
+	t.Parallel()
+
+	b := newController(t)
+
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(b.srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split %s: %v", b.srv.URL, err)
+	}
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: "http://control-b.example:" + port}, {Base: "http://" + deadAddress(t)},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// PAST THE DIAL'S BOUND AND WITHIN THE LOOKUP'S, as a dead first nameserver
+	// is.
+	nodeclient.SetLookupForTest(c, 0, func(ctx context.Context, _, host string) ([]netip.Addr, error) {
+		if host != "control-b.example" {
+			return nil, fmt.Errorf("looked up %q", host)
+		}
+
+		slow := time.NewTimer(4 * time.Second)
+		defer slow.Stop()
+
+		select {
+		case <-slow.C:
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+
+	if err := c.Register(t.Context(), registration); err != nil {
+		t.Fatalf("Register behind a four-second lookup: %v", err)
+	}
+
+	if n := b.sent("/v1/register"); n != 1 {
+		t.Fatalf("the controller behind the slow lookup was asked %d times, want once", n)
+	}
+}
+
 // gate is a transport that can hold a request to one path and answer it as the
 // test chooses, or fail every request as a controller that has gone does.
 type gate struct {
@@ -1150,6 +1221,27 @@ func TestOnlySilenceIsNoAnswer(t *testing.T) {
 		err := ask(t, t.Context(), nodeclient.Target{Base: answering.srv.URL}, nodeclient.Target{Base: "http://" + deadAddress(t)})
 		if nodeclient.IsNoAnswerForTest(err) {
 			t.Fatalf("a 503 counted as no answer: %v", err)
+		}
+	})
+
+	// A REFUSED REDIRECT is the one error net/http returns with a response:
+	// the controller answered, with a redirect the client would not follow.
+	t.Run("an error that came with an answer", func(t *testing.T) {
+		t.Parallel()
+
+		redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+		}))
+		t.Cleanup(redirecting.Close)
+
+		refuses := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("this client follows no redirect")
+		}}
+
+		err := ask(t, t.Context(),
+			nodeclient.Target{Base: redirecting.URL, HTTP: refuses}, nodeclient.Target{Base: "http://" + deadAddress(t)})
+		if nodeclient.IsNoAnswerForTest(err) {
+			t.Fatalf("a redirect the client refused counted as no answer: %v", err)
 		}
 	})
 

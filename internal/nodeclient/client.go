@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"sync"
@@ -185,9 +186,12 @@ type target struct {
 	// base at construction and fixed for the client's life.
 	endpoint endpoint.Endpoint
 	http     *http.Client
-	// dialer is the dialer the client's own transport dials with; nil for a
+	// dialer is the dialer the client's own transport connects with; nil for a
 	// caller's HTTP client, whose transport is the caller's.
 	dialer *net.Dialer
+	// resolving is how the transport reaches one of several controllers, nil
+	// for a client of one.
+	resolving *controllerDialer
 }
 
 // Dead-peer detection on the node's connections.
@@ -204,11 +208,21 @@ type target struct {
 // partition that drops packets: nodes said they had lost their controller 13.9
 // to 14.3 seconds after it, and every node was registered with the promoted
 // one 0.3 to 2.7 seconds after its promotion.
+//
+// THE NAME IS LOOKED UP OUTSIDE THE DIAL'S BOUND, under its own. A dialer's
+// timeout covers its lookup too, and this static build's resolver waits five
+// seconds on each nameserver it tries, so a three-second dial behind a dead
+// first nameserver would never connect to anything.
+//
+// ONLY FOR SEVERAL CONTROLLERS. A node that names one has nowhere else to go,
+// and dials as it always did (singleDialTimeout, the system's probes).
 const (
 	keepAliveIdle     = 5 * time.Second
 	keepAliveInterval = 2 * time.Second
 	keepAliveCount    = 3
 	dialTimeout       = 3 * time.Second
+	lookupTimeout     = 10 * time.Second
+	singleDialTimeout = 10 * time.Second
 )
 
 // New builds a Client. It does not dial; Register does.
@@ -251,7 +265,7 @@ func New(opts Options) (*Client, error) {
 	}
 
 	for i, spec := range targets {
-		t, err := newTarget(spec)
+		t, err := newTarget(spec, len(targets) > 1)
 		if err != nil {
 			return nil, err
 		}
@@ -270,8 +284,9 @@ func New(opts Options) (*Client, error) {
 	return c, nil
 }
 
-// newTarget builds one controller's request base and transport.
-func newTarget(spec Target) (*target, error) {
+// newTarget builds one controller's request base and transport, as one of
+// several when several is true.
+func newTarget(spec Target, several bool) (*target, error) {
 	if spec.Base == "" {
 		return nil, errors.New("nodeclient: a control plane address is required")
 	}
@@ -313,10 +328,18 @@ func newTarget(spec Target) (*target, error) {
 		// open. A dial or a TLS handshake that never completes is never a healthy
 		// poll, and leaving those unbounded means a wedged network holds a
 		// goroutine and a socket indefinitely.
-		t.dialer = newDialer()
+		t.dialer = &net.Dialer{Timeout: singleDialTimeout}
+		dial := t.dialer.DialContext
+
+		if several {
+			t.dialer = newDialer()
+			t.resolving = &controllerDialer{connect: t.dialer, lookup: net.DefaultResolver.LookupNetIP}
+			dial = t.resolving.DialContext
+		}
+
 		t.http = &http.Client{
 			Transport: &http.Transport{
-				DialContext:           t.dialer.DialContext,
+				DialContext:           dial,
 				TLSClientConfig:       spec.TLS,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 0, // a long poll withholds headers on purpose
@@ -336,6 +359,67 @@ func newDialer() *net.Dialer {
 		KeepAliveConfig: net.KeepAliveConfig{
 			Enable: true, Idle: keepAliveIdle, Interval: keepAliveInterval, Count: keepAliveCount,
 		},
+	}
+}
+
+// controllerDialer reaches one of several controllers: the name looked up under
+// lookupTimeout, then each address it answers dialled in turn under the
+// connecting dialer's own bound, until one connects.
+type controllerDialer struct {
+	connect *net.Dialer
+	lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
+func (d *controllerDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := netip.ParseAddr(host); err == nil {
+		return d.connect.DialContext(ctx, network, address)
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+	addrs, err := d.lookup(lookupCtx, lookupNetwork(network), host)
+
+	cancel()
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(addrs) == 0 {
+		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
+	}
+
+	var errs []error
+
+	for _, addr := range addrs {
+		conn, err := d.connect.DialContext(ctx, network, net.JoinHostPort(addr.Unmap().String(), port))
+		if err == nil {
+			return conn, nil
+		}
+
+		errs = append(errs, err)
+
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	return nil, errors.Join(errs...)
+}
+
+// lookupNetwork is the network a name is looked up in for a dial in network.
+func lookupNetwork(network string) string {
+	switch network {
+	case "tcp4":
+		return "ip4"
+	case "tcp6":
+		return "ip6"
+	default:
+		return "ip"
 	}
 }
 
