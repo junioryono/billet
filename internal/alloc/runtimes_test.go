@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,7 +44,7 @@ var ranJobs atomic.Int64
 // start, and archived after runtime (never, for a negative runtime). It
 // returns the lease and leaves the clock at the archive.
 func ranJob(t *testing.T, a *Allocator, now *time.Time, repo, name string,
-	start time.Time, runtime time.Duration,
+	start time.Time, ran time.Duration,
 ) string {
 	t.Helper()
 
@@ -77,8 +78,8 @@ func ranJob(t *testing.T, a *Allocator, now *time.Time, repo, name string,
 		}
 	}
 
-	if runtime >= 0 {
-		*now = start.Add(runtime)
+	if ran >= 0 {
+		*now = start.Add(ran)
 		if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
 			t.Fatalf("Release: %v", err)
 		}
@@ -110,10 +111,10 @@ func TestAMatrixJobsBaseNameIsItsNameWithoutTheLastParentheses(t *testing.T) {
 }
 
 // sample is one finished job, given directly rather than run through a ledger.
-func sample(tier, repo, name string, started time.Time, runtime time.Duration) RuntimeSample {
+func sample(tier, repo, name string, started time.Time, ran time.Duration) RuntimeSample {
 	return RuntimeSample{
 		Key:     JobKeyOf(tier, repo, repo+"/.github/workflows/ci.yml@refs/heads/main", name),
-		Started: started, Finished: started.Add(runtime),
+		Started: started, Finished: started.Add(ran),
 	}
 }
 
@@ -198,8 +199,8 @@ func TestAPredictionFallsBackFromTheJobToItsNameToItsTierToTheDefault(t *testing
 // one that started exactly at the window's start does.
 func TestOnlyJobsFinishedInsideTheWindowAreLearned(t *testing.T) {
 	asOf := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
-	build := func(started time.Time, runtime time.Duration) RuntimeSample {
-		return sample("small", "acme/api", "build (x)", started, runtime)
+	build := func(started time.Time, ran time.Duration) RuntimeSample {
+		return sample("small", "acme/api", "build (x)", started, ran)
 	}
 
 	samples := []RuntimeSample{
@@ -461,29 +462,42 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 	now := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
 	a := runtimeFleet(t, &now)
 
-	entered, release := make(chan struct{}), make(chan struct{})
+	// The workers below report through channels and never call t, and every
+	// gate is released at cleanup, so a test that fails early leaves nothing
+	// blocked behind it and nothing that reports after it has returned.
+	workers, stop := context.WithCancel(t.Context())
+	t.Cleanup(stop)
 
-	var reads atomic.Int32
+	var (
+		gate  atomic.Pointer[readGate]
+		reads atomic.Int32
+	)
+
+	gate.Store(newReadGate(t))
 
 	a.runtimes.read = func(ctx context.Context, asOf time.Time) (*RuntimePriors, error) {
 		if reads.Add(1) == 1 {
-			close(entered)
-			<-release
+			g := gate.Load()
+			close(g.entered)
+			<-g.release
 		}
 
 		return a.learnRuntimesAt(ctx, asOf)
 	}
 
-	built, waited := make(chan *RuntimePriors, 1), make(chan *RuntimePriors, 1)
+	ask := func() <-chan priorsResult {
+		out := make(chan priorsResult, 1)
 
-	go func() {
-		p, err := a.RuntimePriors(t.Context())
-		if err != nil {
-			t.Errorf("the first rebuild: %v", err)
-		}
-		built <- p
-	}()
-	within(t, entered, "the first rebuild to begin its read")
+		go func() {
+			p, err := a.RuntimePriors(workers)
+			out <- priorsResult{p, err}
+		}()
+
+		return out
+	}
+
+	built := ask()
+	within(t, gate.Load().entered, "the first rebuild to begin its read")
 
 	gone, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -494,13 +508,7 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 
 	// A CALLER WITH NO SNAPSHOT AND A LIVE CONTEXT WAITS, and is answered with
 	// what the rebuild in flight built.
-	go func() {
-		p, err := a.RuntimePriors(t.Context())
-		if err != nil {
-			t.Errorf("a caller waiting on the rebuild: %v", err)
-		}
-		waited <- p
-	}()
+	waited := ask()
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -517,41 +525,78 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 		runtime.Gosched()
 	}
 
-	close(release)
-	first := <-built
+	gate.Load().free()
 
-	if got := <-waited; got != first || reads.Load() != 1 {
-		t.Errorf("the waiting caller got %p after %d reads; want the snapshot %p from one read", got,
-			reads.Load(), first)
+	first := receive(t, built, "the first rebuild")
+	if first.err != nil {
+		t.Fatalf("the first rebuild: %v", first.err)
 	}
 
-	if got, err := a.RuntimePriors(t.Context()); err != nil || got != first {
+	if got := receive(t, waited, "the waiting caller"); got.err != nil || got.p != first.p || reads.Load() != 1 {
+		t.Errorf("the waiting caller got %p, %v after %d reads; want the snapshot %p from one read", got.p,
+			got.err, reads.Load(), first.p)
+	}
+
+	if got, err := a.RuntimePriors(t.Context()); err != nil || got != first.p {
 		t.Errorf("after the rebuild: %p, %v; want the snapshot it built", got, err)
 	}
 
 	// A STALE SNAPSHOT, A REBUILD IN FLIGHT, AND A CALLER ANSWERED AT ONCE.
 	now = now.Add(2 * RuntimeRefresh)
-	entered, release = make(chan struct{}), make(chan struct{})
+	gate.Store(newReadGate(t))
 	reads.Store(0)
 
-	go func() {
-		p, err := a.RuntimePriors(t.Context())
-		if err != nil {
-			t.Errorf("the second rebuild: %v", err)
-		}
-		built <- p
-	}()
-	within(t, entered, "the second rebuild to begin its read")
+	second := ask()
+	within(t, gate.Load().entered, "the second rebuild to begin its read")
 
-	if got, err := a.RuntimePriors(t.Context()); err != nil || got != first {
+	if got, err := a.RuntimePriors(t.Context()); err != nil || got != first.p {
 		t.Errorf("during a rebuild a caller with a snapshot got %p, %v; want the stale one at once", got, err)
 	}
 
-	close(release)
+	gate.Load().free()
 
-	if second := <-built; second == first || reads.Load() != 1 {
-		t.Errorf("the rebuild returned %p after %d reads; want a new snapshot from one read", second,
+	if got := receive(t, second, "the second rebuild"); got.err != nil || got.p == first.p || reads.Load() != 1 {
+		t.Errorf("the rebuild returned %p, %v after %d reads; want a new snapshot from one read", got.p, got.err,
 			reads.Load())
+	}
+}
+
+// readGate holds a read until the test lets it go, and lets it go at the
+// test's cleanup whatever happened.
+type readGate struct {
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func newReadGate(t *testing.T) *readGate {
+	t.Helper()
+
+	g := &readGate{entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(g.free)
+
+	return g
+}
+
+func (g *readGate) free() { g.once.Do(func() { close(g.release) }) }
+
+// priorsResult is what one RuntimePriors call answered.
+type priorsResult struct {
+	p   *RuntimePriors
+	err error
+}
+
+// receive waits for a worker's answer, and fails the test rather than hanging
+// it when none comes.
+func receive(t *testing.T, ch <-chan priorsResult, what string) priorsResult {
+	t.Helper()
+
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+
+		return priorsResult{}
 	}
 }
 

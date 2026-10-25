@@ -39,8 +39,8 @@ func OpenOperator(ctx context.Context, cfgPath string) (*alloc.Allocator, *state
 // ON SQLITE, ONLY AS THE LEDGER'S OWNER. A read-only open of a stopped SQLite
 // ledger creates its sidecar files owned by whoever opened it, and a service
 // account that cannot write them cannot reopen its own ledger; so a report
-// run as anyone but the identity directory's owner, root included, is refused
-// before the ledger is opened (the rule `billet rollout status` holds, which
+// run as anyone but the owner of the directory the ledger file is in
+// (reportLedgerDir), root included, is refused before the ledger is opened (the rule `billet rollout status` holds, which
 // re-executes itself as the owner instead). A PostgreSQL ledger has no sidecar.
 func OpenReport(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
 	a, _, closeDB, err := openAllocator(ctx, cfgPath, LedgerInspect)
