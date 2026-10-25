@@ -93,7 +93,7 @@ With `node.monitoring` on, a Mac measures each VM by its Virtualization.framewor
 - **The pane listed the node afterwards.** System Settings → Privacy & Security → Local Network showed it, turned on. Whether it was off before is not known.
 - **A locked screen did not stop it.** With the screen locked again after Screen Sharing disconnected, the node kept reading.
 
-What in that session admitted the node is not measured. Nor is whether a logout or an update (a binary with a new signature) blocks it again, or whether turning a listed node on fixes a failing one.
+What in that session admitted the node is not measured. An update did not block it again: after the v0.26.0 to v0.27.0 rollout replaced the binary with one of a new signature (2026-10-25), the node's first read was refused with `no route to host` and the next, a second later, answered, with nothing done at the Mac. Whether a logout blocks it, or whether turning a listed node on fixes a failing one, is not measured.
 
 The node logs `could not read the power meter` when its reads start failing and `reading the power meter again` when a failing read recovers. A node that has read the plug since it started logs neither. If the plug cannot be read, bringing up the desktop over Screen Sharing and looking at that pane is what has been seen to go with recovery.
 
