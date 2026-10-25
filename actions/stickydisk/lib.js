@@ -13,16 +13,20 @@ const MMDS = "http://169.254.169.254";
 // that store: its https trusts only the roots it was built with. Every request
 // to an EC2 node's https cache endpoint failed its handshake ("unable to verify
 // the first certificate", an untrusted EC2 guest, 2026-10-25), so every sticky
-// disk there ran cold. The distribution's bundle is added to Node's own roots,
-// never put in their place, and a guest without one keeps Node's defaults.
+// disk there ran cold. The distribution's bundle is added to what Node trusts
+// by default, never put in its place: an explicit `ca` replaces Node's own
+// choice, so the base is its effective default set (node24's
+// `tls.getCACertificates("default")`), which carries NODE_EXTRA_CA_CERTS as
+// well as its bundled roots. A guest without a bundle keeps Node's defaults
+// untouched.
 const systemCABundles = ["/etc/ssl/certs/ca-certificates.crt"];
 
 function trustedCAs() {
   for (const path of module.exports.systemCABundles) {
     try {
-      return [...tls.rootCertificates, fs.readFileSync(path, "utf8")];
+      return [...tls.getCACertificates("default"), fs.readFileSync(path, "utf8")];
     } catch (_) {
-      // Absent or unreadable: the next candidate, then Node's own roots.
+      // Absent or unreadable: the next candidate, then Node's own defaults.
     }
   }
   return undefined;
