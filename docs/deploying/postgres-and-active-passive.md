@@ -72,7 +72,7 @@ On AWS, `terraform/modules/billet/modules/state-rds-postgres` provisions the dat
 - **`synchronous_commit` not `off`.** With it off, PostgreSQL acknowledges a commit before the record is on disk, so a crash can lose scheduling decisions billet has already acted on. billet checks this at startup and refuses.
 - **A role that can create tables** in that schema, because billet migrates it.
 - **PostgreSQL 13 or later.** Nothing here needs anything newer; the test suite runs 18.
-- **Storage whose commit is fast, for a large fleet.** Every billet write is one commit through a single writer, so a commit's latency is most of what a write costs. On a PostgreSQL on its own EBS gp3 volume, the fleet [ADR-021](../reference/decisions/adr-021-fleet-envelope.md) commits to (256 hosts, 4,096 open leases) kept the writer busy 52% of the time, against 23% with the database on NVMe ([the write budget record](../reference/records/ledger-write-budget.md), 2026-10-25). A smaller fleet needs nothing special.
+- **Storage whose commit is fast, for a large fleet.** Every billet write is one commit through a single writer, so a commit's latency is most of what a write costs. On a PostgreSQL on its own EBS gp3 volume, the fleet [ADR-021](../reference/decisions/adr-021-fleet-envelope.md) commits to (256 hosts, 4,096 open leases) kept the writer busy 50% of the time, against 23% with the database on NVMe ([the write budget record](../reference/records/ledger-write-budget.md), 2026-10-25). A smaller fleet needs nothing special.
 
 billet does **not** need any extension.
 

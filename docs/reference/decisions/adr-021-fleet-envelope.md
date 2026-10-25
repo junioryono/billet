@@ -43,12 +43,12 @@ These are measured on the hardware the record names, with the commit as the stor
 
 [The write budget record](../records/ledger-write-budget.md) has every number, the hardware and the method (2026-10-25). In short:
 - **Before:** on network block storage the target took more than the whole slot on either engine (104% SQLite, 105% PostgreSQL), and renewals alone took half of it.
-- **After:** 45% on SQLite, 52% on PostgreSQL, and renewals under 1%.
-- **On NVMe:** 12% on SQLite and 23% on PostgreSQL.
+- **After:** 44% on SQLite, 50% on PostgreSQL, and renewals under 1%.
+- **On NVMe:** 11% on SQLite and 23% on PostgreSQL.
 
 Against the budget:
-- **A purchase within 10 ms:** met everywhere, except with two floors outstanding on SQLite over gp3, 0.06 ms over.
-- **The steady state within half the slot:** met everywhere except PostgreSQL over gp3, whose 52% is four fifths a job's own six commits. That is where this decision is next reopened: fewer commits in a job's life, or faster storage under the ledger.
+- **A purchase within 10 ms:** met everywhere; the slowest is 9.3 ms, with two floors outstanding on SQLite over gp3.
+- **The steady state within half the slot:** met everywhere except PostgreSQL over gp3, at 50.4%, four fifths of it a job's own six commits. That is where this decision is next reopened: fewer commits in a job's life, or faster storage under the ledger.
 
 ## Reopen when
 

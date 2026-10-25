@@ -108,35 +108,35 @@ The `fdatasync` column is a probe, 300 4 KiB writes each followed by `fdatasync`
 
 ### What it found
 
-**A commit is what a write costs on network block storage.** One renewal held the slot 3.8 to 4.1 ms on SQLite on gp3 and 3.0 to 3.8 ms on PostgreSQL on gp3, against 0.09 ms of billet's own work (tmpfs). On NVMe it held the slot 0.25 ms (SQLite) and 1.3 to 1.6 ms (PostgreSQL, a network round trip per statement). The 2026-10-08 laptop's 0.1 ms was its `fsync`, not the ledger.
+**A commit is what a write costs on network block storage.** One renewal held the slot 3.8 to 4.1 ms on SQLite on gp3 and 3.0 to 3.8 ms on PostgreSQL on gp3, against 0.09 ms of billet's own work (tmpfs). On NVMe it held the slot 0.25 ms (SQLite) and 1.1 to 1.4 ms (PostgreSQL, a network round trip per statement). The 2026-10-08 laptop's 0.1 ms was its `fsync`, not the ledger.
 
 **One renewal at a time was half the slot at the target, on either engine on gp3**, before anything was scheduled: 137 renewals a second at about 4 ms each. A listener's pass now renews its leases 256 to a transaction, in one statement that answers each lease exactly as its own renewal would. Per lease, that holds the slot for:
 
 | | SQLite gp3 | SQLite tmpfs | SQLite NVMe | PostgreSQL gp3 | PostgreSQL NVMe |
 |---|---|---|---|---|---|
-| One renewal, its own transaction | 3.81 | 0.093 | 0.249 | 3.38 | 1.40 |
-| One renewal in a batch | 0.040 | 0.022 | 0.028 | 0.038 | 0.031 |
+| One renewal, its own transaction | 3.83 | 0.093 | 0.248 | 3.64 | 1.31 |
+| One renewal in a batch | 0.040 | 0.022 | 0.028 | 0.037 | 0.031 |
 
 **A purchase grows linearly with the fleet, and a tier with a remote fallback no longer costs ten times as much.** Slot time of one purchase, in milliseconds:
 
 | Purchase | SQLite gp3 | SQLite tmpfs | SQLite NVMe | PostgreSQL gp3 | PostgreSQL NVMe |
 |---|---|---|---|---|---|
-| 4 hosts, before → after | 4.08 → 4.19 | 0.38 → 0.29 | 0.64 → 0.51 | 6.76 → 5.38 | 3.33 → 2.86 |
-| 32 hosts | 4.87 → 4.36 | 0.86 → 0.57 | 1.36 → 0.93 | 7.33 → 5.93 | 3.62 → 3.03 |
-| 128 hosts | 6.77 → 5.23 | 2.44 → 1.49 | 3.42 → 2.06 | 7.99 → 6.40 | 4.84 → 3.76 |
-| 256 hosts | 8.39 → 6.35 | 4.64 → 2.66 | 6.26 → 3.51 | 8.49 → 7.08 | 5.88 → 4.41 |
-| the target fleet | 11.99 → 8.28 | 8.31 → 4.60 | 10.70 → 5.81 | 10.36 → 7.34 | 7.75 → 5.35 |
-| the target, a tier falling back to ec2 | 69.04 → 8.31 | 64.78 → 4.58 | 95.62 → 5.81 | 68.28 → 8.00 | 65.14 → 5.43 |
-| the target, two floors outstanding | 14.08 → 10.06 | 10.19 → 6.45 | 13.66 → 8.22 | 12.59 → 9.40 | 10.21 → 7.00 |
+| 4 hosts, before → after | 4.08 → 4.12 | 0.38 → 0.26 | 0.64 → 0.46 | 6.76 → 5.29 | 3.33 → 2.48 |
+| 32 hosts | 4.87 → 4.32 | 0.86 → 0.51 | 1.36 → 0.84 | 7.33 → 5.06 | 3.62 → 2.64 |
+| 128 hosts | 6.77 → 5.06 | 2.44 → 1.29 | 3.42 → 1.81 | 7.99 → 5.21 | 4.84 → 3.12 |
+| 256 hosts | 8.39 → 6.16 | 4.64 → 2.32 | 6.26 → 3.05 | 8.49 → 5.92 | 5.88 → 3.64 |
+| the target fleet | 11.99 → 7.48 | 8.31 → 3.73 | 10.70 → 4.91 | 10.36 → 6.01 | 7.75 → 4.17 |
+| the target, a tier falling back to ec2 | 69.04 → 7.51 | 64.78 → 3.80 | 95.62 → 4.94 | 68.28 → 6.88 | 65.14 → 3.75 |
+| the target, two floors outstanding | 14.08 → 9.32 | 10.19 → 5.71 | 13.66 → 7.35 | 12.59 → 8.08 | 10.21 → 5.89 |
 
-From 128 to 256 hosts, twice the fleet, billet's own work (tmpfs) went from 1.49 to 2.66 ms, 1.8 times: linear. The same doubling cost 1.9 times before this change, and on 2026-10-08, before the one-pass count, four times the fleet (32 to 128 hosts) cost twelve times. What moved it:
+From 128 to 256 hosts, twice the fleet, billet's own work (tmpfs) went from 1.29 to 2.32 ms, 1.8 times: linear. The same doubling cost 1.9 times before this change, and on 2026-10-08, before the one-pass count, four times the fleet (32 to 128 hosts) cost twelve times. What moved it:
 - headroom is counted one preference rank at a time, so only a rank whose hosts charge differently is placed job by job, over its own hosts;
 - the placeable hosts are read once a transaction rather than once for every tier asked about;
 - the floors' reads are skipped where no other tier keeps a floor, and where one does, they come from the same pass as the hosts' usage;
 - the deployment's commitment is summed from that pass rather than read again;
 - choosing a host works each candidate's room out once rather than three times.
 
-**A job's six writes after its purchase are most of the slot at the target** on network block storage: 24.1 ms a job on SQLite on gp3 and 30.2 ms on PostgreSQL on gp3, against 1.5 ms of work (tmpfs), 2.6 ms on SQLite on NVMe and 11.2 ms on PostgreSQL on NVMe. Nothing here changed them.
+**A job's six writes after its purchase are most of the slot at the target** on network block storage: 24.0 ms a job on SQLite on gp3 and 30.6 ms on PostgreSQL on gp3, against 1.3 ms of work (tmpfs), 2.6 ms on SQLite on NVMe and 12.6 ms on PostgreSQL on NVMe. Nothing here changed them.
 
 ### The target's arithmetic
 
@@ -145,17 +145,17 @@ The share of the writer slot each kind of write takes at the target: 13.7 purcha
 | | Purchases | A job's writes | Renewals | Steady state | With the burst |
 |---|---|---|---|---|---|
 | SQLite gp3, before | 16.4% | 32.8% | 54.8% | **104%** | 135% |
-| SQLite gp3, after | 11.3% | 32.9% | 0.5% | 44.8% | 66.0% |
-| SQLite tmpfs, after | 6.3% | 2.0% | 0.3% | 8.6% | 20.4% |
-| SQLite NVMe, after | 7.9% | 3.5% | 0.4% | 11.8% | 26.7% |
+| SQLite gp3, after | 10.2% | 32.7% | 0.5% | 43.5% | 62.6% |
+| SQLite tmpfs, after | 5.1% | 1.7% | 0.3% | 7.1% | 16.7% |
+| SQLite NVMe, after | 6.7% | 3.5% | 0.4% | 10.6% | 23.2% |
 | PostgreSQL gp3, before | 14.1% | 39.7% | 51.3% | **105%** | 132% |
-| PostgreSQL gp3, after | 10.0% | 41.2% | 0.5% | **51.8%** | 70.6% |
-| PostgreSQL NVMe, after | 7.3% | 15.3% | 0.4% | 23.1% | 36.8% |
+| PostgreSQL gp3, after | 8.2% | 41.7% | 0.5% | **50.4%** | 65.8% |
+| PostgreSQL NVMe, after | 5.7% | 17.3% | 0.4% | 23.4% | 34.0% |
 
 Against the budget ADR-021 set before these were measured:
 - **Renewals within a quarter of the slot:** met everywhere, at under 1%.
-- **A purchase within 10 ms:** met for the target and for a tier falling back to ec2 on every configuration. With two floors outstanding it is met everywhere except SQLite on gp3, which is 0.06 ms over.
-- **The steady state within half the slot:** met everywhere except PostgreSQL on gp3, at 51.8% (the three runs of a job's writes put it between 47% and 52%). Four fifths of that is a job's own six commits, at a network round trip and a gp3 `fdatasync` each. Storage that commits faster is what brings it down: on NVMe the same PostgreSQL is at 23%.
+- **A purchase within 10 ms:** met on every configuration, for the target, a tier falling back to ec2, and two floors outstanding. The slowest is 9.3 ms, with floors on SQLite on gp3.
+- **The steady state within half the slot:** met everywhere except PostgreSQL on gp3, at 50.4% (the three runs of a job's writes put it between 49.9% and 50.6%). Four fifths of that is a job's own six commits, at a network round trip and a gp3 `fdatasync` each. Storage that commits faster is what brings it down: on NVMe the same PostgreSQL is at 23%.
 
 Before this change, neither engine on gp3 could have scheduled the target at all: renewals alone took half the slot, and the steady state needed more than all of it.
 
