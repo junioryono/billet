@@ -762,37 +762,76 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 		}
 	}
 
-	// AN ID REUSED WITHIN A SECOND never lends one flow's wait to the other. An
-	// earlier flow destroyed before the reuse was read is timed by the only wait
-	// there was, its own; once both waits are held, either could be either
-	// flow's, so a flow read then is left untimed.
-	for name, order := range map[string]bool{"destroy first": true, "reply first": false} {
+	// AN ID REUSED WITHIN A SECOND never lends one flow's wait to the other,
+	// whatever order its events and the two destructions are read in: with two
+	// generations of the id begun within a second of a flow's start, either
+	// could be its, answered or not, and both flows are left untimed. A flow
+	// whose destruction is read before its own reply, with no reuse, is still
+	// timed, because waits are matched when the job is summarized.
+	type step func(*Accountant)
+	first := flow(9, guest, github, 100, 100)
+	second := startedAt(flow(9, guest, npm, 100, 100), started.Add(100*time.Millisecond))
+	newA := func(a *Accountant) { a.ObserveNew(9, guest, started) }
+	replyA := func(a *Accountant) { a.ObserveReply(9, guest, started.Add(20*time.Millisecond)) }
+	destroyA := func(a *Accountant) { a.Observe(first) }
+	newB := func(a *Accountant) { a.ObserveNew(9, guest, second.Start) }
+	replyB := func(a *Accountant) { a.ObserveReply(9, guest, second.Start.Add(1200*time.Millisecond)) }
+	destroyB := func(a *Accountant) { a.Observe(second) }
+	for name, tc := range map[string]struct {
+		steps []step
+		timed map[netip.Addr]time.Duration
+	}{
+		"A destroyed before the reuse": {steps: []step{newA, replyA, destroyA, newB, replyB, destroyB}},
+		"A destroyed after B's reply":  {steps: []step{newA, replyA, newB, replyB, destroyA, destroyB}},
+		"B destroyed before its reply": {steps: []step{newA, replyA, destroyA, newB, destroyB, replyB}},
+		"B never answered, A after":    {steps: []step{newA, replyA, newB, destroyA}},
+		"no reuse, destroyed then reply": {steps: []step{newA, destroyA, replyA},
+			timed: map[netip.Addr]time.Duration{github: 20 * time.Millisecond}},
+	} {
 		reused := NewAccountant()
 		reused.RepliesUp(began.Add(-time.Hour))
 		reused.Watch("lease-r", guest, began, nil)
-		first := flow(9, guest, github, 100, 100)
-		second := startedAt(flow(9, guest, npm, 100, 100), started.Add(100*time.Millisecond))
-		reused.ObserveNew(9, guest, started)
-		reused.ObserveReply(9, guest, started.Add(20*time.Millisecond))
-		if order {
-			reused.Observe(first)
+		for _, s := range tc.steps {
+			s(reused)
 		}
-		reused.ObserveNew(9, guest, second.Start)
-		reused.ObserveReply(9, guest, second.Start.Add(50*time.Millisecond))
-		if !order {
-			reused.Observe(first)
-		}
-		reused.Observe(second)
 		r, _ := reused.Final("lease-r", nil, ended)
 		for _, d := range r.Destinations {
-			ownWait := d.Addr == github && order
+			wait, want := tc.timed[d.Addr]
 			switch {
-			case ownWait && (d.TimedReplies != 1 || d.SlowestReply != 20*time.Millisecond):
-				t.Errorf("%s: the flow destroyed before the reuse lost its own wait: %+v", name, d)
-			case !ownWait && d.TimedReplies != 0:
-				t.Errorf("%s: an id reused within a second left %s timed: %+v", name, d.Addr, d)
+			case want && (d.TimedReplies != 1 || d.SlowestReply != wait):
+				t.Errorf("%s: %s was not timed at its own %s: %+v", name, d.Addr, wait, d)
+			case !want && d.TimedReplies != 0:
+				t.Errorf("%s: %s was timed by a wait that may not be its: %+v", name, d.Addr, d)
 			}
 		}
+	}
+
+	// AN ID THAT LOST A GENERATION TO THE BOUND IS NEVER TIMED AGAIN: a
+	// destruction read late could belong to the generation it lost, and the
+	// ones it kept would make a wrong match look unique.
+	evicted := NewAccountant()
+	evicted.RepliesUp(began.Add(-time.Hour))
+	evicted.Watch("lease-e", guest, began, nil)
+	for i := range keptGenerations + 1 {
+		at := started.Add(time.Duration(i) * 1500 * time.Millisecond)
+		evicted.ObserveNew(11, guest, at)
+		evicted.ObserveReply(11, guest, at.Add(30*time.Millisecond))
+	}
+	evicted.Observe(startedAt(flow(11, guest, github, 100, 100), started.Add(1500*time.Millisecond)))
+	if r, _ := evicted.Final("lease-e", nil, ended); r.Destinations[0].TimedReplies != 0 {
+		t.Errorf("an id that lost a generation was timed: %+v", r.Destinations[0])
+	}
+
+	// PAST MaxFlows GENERATIONS THE JOB IS UNTIMED, since one not kept would
+	// leave an earlier generation looking like the only candidate.
+	capped := NewAccountant()
+	capped.RepliesUp(began.Add(-time.Hour))
+	capped.Watch("lease-c", guest, began, nil)
+	for i := range MaxFlows + 1 {
+		capped.ObserveNew(uint32(100+i), guest, started)
+	}
+	if r, _ := capped.Final("lease-c", nil, ended); r.RepliesTimed {
+		t.Error("a job past MaxFlows generations is still timed")
 	}
 
 	// BEYOND THE CAP the timed counts are summed under Other and its slowest

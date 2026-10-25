@@ -50,16 +50,19 @@ const MaxUnclaimed = 4096
 const SlowReply = time.Second
 
 // replyMatch bounds how far a counted flow's start may lie from the new event a
-// wait was timed from. The two events come on separate sockets, and the kernel
-// reuses an id for a later entry at the same address with the same tuple once
-// the first is gone, so a wait is a flow's only when its start is the moment
-// that new event was read and no other wait on that id is: two candidates
-// leave the flow untimed rather than timed by the other's wait.
+// generation of its id was timed from. The kernel reuses an id for a later
+// entry at the same address with the same tuple once the first is gone, and
+// the events come on separate sockets, so a wait is a flow's only when exactly
+// one generation of its id began within replyMatch of the flow's start, and
+// that one saw a reply: a second generation there, answered or not, leaves the
+// flow untimed rather than timed by the other's wait.
 const replyMatch = time.Second
 
-// keptWaits is how many waits one id keeps, newest last, for a destruction
-// that arrives after the id was reused to be matched to its own.
-const keptWaits = 4
+// keptGenerations is how many generations one id keeps, newest last. An id
+// that has had one dropped is never timed again in that job: the generation
+// it lost could have been the one a destruction read later belongs to, and a
+// truncated history must not make a match look unique.
+const keptGenerations = 4
 
 // errRepliesUnproven says Sync proved every destruction read and could not
 // prove the same of the new and reply events: the job is untimed, and its
@@ -83,12 +86,6 @@ type Flow struct {
 	// OrigBytes is what the guest sent, ReplyBytes what it received.
 	OrigBytes, ReplyBytes     uint64
 	OrigPackets, ReplyPackets uint64
-	// ReplyWait is how long the flow waited for its first packet back: from
-	// the tracker's event creating it to its first event that saw a reply,
-	// both read on the node's clock. ReplyTimed says it was; the entry itself
-	// carries neither.
-	ReplyWait  time.Duration
-	ReplyTimed bool
 }
 
 // entry is a flow's identity across readings.
@@ -199,20 +196,22 @@ type watch struct {
 	// one past MaxFlows, or one the unclaimed ring dropped.
 	unansweredUnknown bool
 	// untimed says the new and reply events were not all read while the job
-	// held its address. pending holds when each flow's new event was read, and
-	// waits each id's latest first-reply waits, for a counted flow whose start
-	// matches exactly one of them to take; kept counts every wait held.
-	untimed bool
-	pending map[uint32]time.Time
-	waits   map[uint32][]replyWait
-	kept    int
+	// held its address. generations holds each id's latest flows as their new
+	// and reply events told them, matched to the counted flows only when the
+	// job is summarized, after the barrier that proved both read; dropped
+	// marks an id that lost one, and held counts every generation kept.
+	untimed     bool
+	generations map[uint32][]generation
+	dropped     map[uint32]bool
+	held        int
 }
 
-// replyWait is one flow's wait for its first reply, and when its new event
-// was read.
-type replyWait struct {
-	opened time.Time
-	wait   time.Duration
+// generation is one flow of an id as its events told it: when its new event
+// was read, and, once its first reply was, how long it waited.
+type generation struct {
+	opened  time.Time
+	wait    time.Duration
+	replied bool
 }
 
 // NewAccountant returns an Accountant watching nothing.
@@ -246,7 +245,7 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 	}
 
 	w := &watch{addr: addr, since: since, counted: map[entry]Flow{}, inherited: map[entry]Flow{},
-		pending: map[uint32]time.Time{}, waits: map[uint32][]replyWait{}}
+		generations: map[uint32][]generation{}, dropped: map[uint32]bool{}}
 
 	// A GAP IN THE EVENTS, OR A FLOW THE RING DROPPED, SINCE THE GRANT: either
 	// may have been this guest's.
@@ -356,35 +355,35 @@ func (a *Accountant) observe(f Flow) {
 		return
 	}
 
-	f.ReplyWait, f.ReplyTimed = 0, false
-	if wait, ok := w.waitFor(&f); ok {
-		f.ReplyWait, f.ReplyTimed = wait, true
-	}
-
 	w.counted[key] = f
 }
 
-// waitFor is the wait of f's first reply: the one wait on its id whose new
-// event was read within replyMatch of f's start, or none when there is no such
-// wait or more than one.
+// waitFor is the wait of f's first reply: the wait of the one generation of
+// its id that began within replyMatch of f's start, when that one saw a reply,
+// and none when no generation did, more than one did, or the id has lost one.
 func (w *watch) waitFor(f *Flow) (time.Duration, bool) {
+	if w.dropped[f.ID] {
+		return 0, false
+	}
+
 	var (
-		found time.Duration
+		match generation
 		n     int
 	)
-	for _, r := range w.waits[f.ID] {
-		if f.Start.Sub(r.opened).Abs() <= replyMatch {
-			found, n = r.wait, n+1
+	for _, g := range w.generations[f.ID] {
+		if f.Start.Sub(g.opened).Abs() <= replyMatch {
+			match, n = g, n+1
 		}
 	}
 
-	return found, n == 1
+	return match.wait, n == 1 && match.replied
 }
 
-// ObserveNew records that the tracker created flow id from src, read at at.
-// Its wait for a first reply is timed from here. An id is unique while its
-// entry lives, so a new event for an id whose earlier flow never saw a reply
-// replaces that flow's start, which leaves it untimed.
+// ObserveNew records that the tracker created flow id from src, read at at: a
+// new generation of the id, whose wait for a first reply is timed from here.
+//
+// PAST MaxFlows GENERATIONS THE JOB IS UNTIMED: a generation not kept would
+// leave an earlier one of its id looking like the only candidate.
 func (a *Accountant) ObserveNew(id uint32, src netip.Addr, at time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -393,9 +392,20 @@ func (a *Accountant) ObserveNew(id uint32, src netip.Addr, at time.Time) {
 	if !ok {
 		return
 	}
-	if _, held := w.pending[id]; held || len(w.pending) < MaxFlows {
-		w.pending[id] = at
+	if w.held >= MaxFlows {
+		w.untimed = true
+
+		return
 	}
+
+	kept := w.generations[id]
+	if len(kept) == keptGenerations {
+		kept = kept[1:]
+		w.held--
+		w.dropped[id] = true
+	}
+	w.generations[id] = append(kept, generation{opened: at})
+	w.held++
 }
 
 // ObserveReply records that flow id from src first saw a reply, read at at.
@@ -409,22 +419,12 @@ func (a *Accountant) ObserveReply(id uint32, src netip.Addr, at time.Time) {
 	if !ok {
 		return
 	}
-	opened, ok := w.pending[id]
-	if !ok {
+	kept := w.generations[id]
+	if len(kept) == 0 || kept[len(kept)-1].replied {
 		return
 	}
-	delete(w.pending, id)
-
-	held := w.waits[id]
-	if len(held) == keptWaits {
-		held = held[1:]
-		w.kept--
-	}
-	if w.kept >= MaxFlows {
-		return
-	}
-	w.waits[id] = append(held, replyWait{opened: opened, wait: max(at.Sub(opened), 0)})
-	w.kept++
+	latest := &kept[len(kept)-1]
+	latest.wait, latest.replied = max(at.Sub(latest.opened), 0), true
 }
 
 func (a *Accountant) keepUnclaimed(f Flow) {
@@ -591,12 +591,15 @@ func summarize(w *watch) Result {
 		case f.OrigPackets > 0 && f.ReplyPackets == 0:
 			d.Unanswered++
 		}
-		if f.ReplyTimed && f.ReplyPackets > 0 {
+		// TIMED HERE, after the barrier proved both sockets read, so a flow whose
+		// destruction was read before its reply still takes its wait; and only a
+		// flow the reading says was answered.
+		if wait, timed := w.waitFor(&f); timed && f.ReplyPackets > 0 {
 			d.TimedReplies++
-			if f.ReplyWait > SlowReply {
+			if wait > SlowReply {
 				d.SlowReplies++
 			}
-			d.SlowestReply = max(d.SlowestReply, f.ReplyWait)
+			d.SlowestReply = max(d.SlowestReply, wait)
 		}
 	}
 
