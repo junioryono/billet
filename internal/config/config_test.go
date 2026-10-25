@@ -797,6 +797,23 @@ func TestExampleConfigIsValid(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Errorf("billet.example.yaml does not validate: %v", err)
 	}
+
+	// THE EXAMPLE'S RELEASE TIER READS NO CACHE, as its comment promises, so a
+	// cache that becomes on by default cannot join it unnoticed.
+	release := -1
+	for i := range c.Tiers {
+		if c.Tiers[i].Label == "billet-4vcpu-ubuntu-2404-release" {
+			release = i
+		}
+	}
+	if release < 0 {
+		t.Fatal("billet.example.yaml no longer has its release tier")
+	}
+	for _, kind := range CacheKinds {
+		if setting := c.Tiers[release].EffectiveCache().Setting(kind); setting.Enabled {
+			t.Errorf("the example's release tier reads the %s cache", kind)
+		}
+	}
 }
 
 // THE PACKAGED CONFIG IS SHIPPED TOO, and nothing was checking it.

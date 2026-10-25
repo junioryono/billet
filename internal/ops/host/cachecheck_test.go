@@ -254,15 +254,22 @@ func TestJudgeNpmCacheNamesTheTiersThatHaveIt(t *testing.T) {
 		want   []string
 		unwant []string
 	}{
-		"no tier enables it": {
-			tiers: []config.Tier{{Label: "a"}, {Label: "b", Cache: &config.TierCache{}}},
-			want:  []string{"NO NPM CACHE: no tier enables cache.npm", "cache.npm.enabled: true"},
+		"no tier has it": {
+			tiers: []config.Tier{{Label: "a"}, {Label: "b", Provider: config.ProviderFirecracker,
+				GuestOS: config.GuestLinux, Cache: &config.TierCache{Npm: &config.NpmCache{Enabled: new(false)}}}},
+			want: []string{"NO NPM CACHE: no tier has the npm cache", "unless it writes cache.npm.enabled: false"},
 		},
 		"two of three do": {
 			tiers: []config.Tier{{Label: "a", Cache: npm}, {Label: "b"}, {Label: "c", Cache: npm}},
 			want: []string{"2 of 3 tiers enable the npm cache: a, c (configured, not probed)",
 				"served it by a node with node.cache, and fetches registry.npmjs.org itself on a node without"},
 			unwant: []string{"NO NPM CACHE", ", b"},
+		},
+		"a firecracker Linux tier that says nothing has it": {
+			tiers: []config.Tier{{Label: "fc", Provider: config.ProviderFirecracker, GuestOS: config.GuestLinux},
+				{Label: "dk", Provider: config.ProviderDocker, GuestOS: config.GuestLinux}},
+			want:   []string{"1 of 2 tiers enable the npm cache: fc (configured, not probed)"},
+			unwant: []string{"NO NPM CACHE", "dk"},
 		},
 	}
 	for name, tc := range cases {
@@ -296,7 +303,7 @@ func TestCheckPrintsTheNpmFindingAfterTheTiers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a control plane with an unreachable GitHub failed the check: %v\n%s", err, out)
 	}
-	printedOnce(t, out, "npm      NO NPM CACHE: no tier enables cache.npm")
+	printedOnce(t, out, "npm      NO NPM CACHE: no tier has the npm cache")
 	if at, last := strings.Index(out, "npm      NO NPM CACHE"), strings.Index(out, "  billet-second "); last < 0 ||
 		at < last {
 		t.Errorf("the npm finding was not printed after the last tier:\n%s", out)
@@ -359,7 +366,7 @@ func TestCheckRefusesAnEBSStoreWithNoCacheListener(t *testing.T) {
 	}
 	printedOnce(t, out, "cache    NONE: node.ebs_s3 names a cache store")
 	// THE NPM FINDING IS THE COMMAND'S, said once after the tiers it is about.
-	printedOnce(t, out, "npm      NO NPM CACHE: no tier enables cache.npm")
+	printedOnce(t, out, "npm      NO NPM CACHE: no tier has the npm cache")
 	if strings.Index(out, "npm      NO NPM CACHE") < strings.Index(out, "tiers    ") {
 		t.Errorf("the npm finding was printed before the tiers it is about:\n%s", out)
 	}
