@@ -1546,7 +1546,18 @@ var errNoDockerStore = errors.New("this session has no Docker image store")
 func (s *CacheService) awaitDockerReady(
 	ctx context.Context, session *cacheSession,
 ) (*cacheAttachment, error) {
-	if err := lockCacheSession(ctx, session); err != nil {
+	// THE WHOLE WAIT IS INSIDE THE SETTLE WINDOW, every wait for the session
+	// lock included: a replacement request holds that lock through its
+	// acquisition and attach, and the job's teardown waits on this.
+	settleCtx, cancelSettle := context.WithTimeout(ctx, dockerSettleWait)
+	defer cancelSettle()
+	notReady := errors.New("docker image store did not become ready before teardown")
+
+	if err := lockCacheSession(settleCtx, session); err != nil {
+		if ctx.Err() == nil {
+			return nil, notReady
+		}
+
 		return nil, err
 	}
 	opened := session.slots[0]
@@ -1566,13 +1577,6 @@ func (s *CacheService) awaitDockerReady(
 		}
 	}
 	session.mu.Unlock()
-
-	// THE WHOLE WAIT IS INSIDE THE SETTLE WINDOW, the session lock included: a
-	// replacement request holds that lock through its acquisition and attach,
-	// and the job's teardown waits on this.
-	settleCtx, cancelSettle := context.WithTimeout(ctx, dockerSettleWait)
-	defer cancelSettle()
-	notReady := errors.New("docker image store did not become ready before teardown")
 
 	for {
 		if err := lockCacheSession(settleCtx, session); err != nil {

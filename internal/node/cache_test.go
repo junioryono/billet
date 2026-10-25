@@ -980,54 +980,80 @@ func TestASettlementStopsWaitingWhenItsStoreIsReplaced(t *testing.T) {
 
 // A SETTLEMENT'S WAIT FOR THE SESSION IS INSIDE ITS WINDOW. A replacement
 // request holds the session through its acquisition and attach, which can run
-// for minutes, and the job's teardown waits on the settlement; waiting for the
+// for minutes, and the job's teardown waits on the settlement; a wait for the
 // lock on the caller's context outlasted the two minutes the settlement is
-// allowed.
+// allowed. Two orders: the replacement takes the session while the settlement
+// waits, and before the settlement has begun.
 func TestASettlementWaitsForTheSessionOnlyWithinItsWindow(t *testing.T) {
 	t.Parallel()
 
-	synctest.Test(t, func(t *testing.T) {
-		storage := &fakeCacheStore{}
-		attacher := &fakeVolumeAttacher{}
-		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
-			storage, attacher, slog.New(slog.DiscardHandler))
-		if err != nil {
-			t.Fatalf("NewCacheService: %v", err)
+	for _, replacementFirst := range []bool{false, true} {
+		name := "replacement while settling"
+		if replacementFirst {
+			name = "replacement before settling"
 		}
-		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
-		if err != nil {
-			t.Fatalf("Prepare: %v", err)
-		}
-		if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
-			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
-			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
-		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-		start := time.Now()
-		settled := make(chan error, 1)
-		go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
-		synctest.Wait()
+			synctest.Test(t, func(t *testing.T) {
+				storage := &fakeCacheStore{}
+				attacher := &fakeVolumeAttacher{}
+				service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+					storage, attacher, slog.New(slog.DiscardHandler))
+				if err != nil {
+					t.Fatalf("NewCacheService: %v", err)
+				}
+				credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+				if err != nil {
+					t.Fatalf("Prepare: %v", err)
+				}
+				if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+					map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+					t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+				}
 
-		if discard := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/discard", nil); discard.Code != http.StatusOK {
-			t.Fatalf("the guest's discard of its mounted store = %d: %s", discard.Code, discard.Body.String())
-		}
-		// THE REPLACEMENT HOLDS THE SESSION FOR THREE MINUTES, past the window.
-		attacher.attachDelay = 3 * time.Minute
-		replaced := make(chan int, 1)
-		go func() {
-			replaced <- cacheRequest(t, service, credentials.Token, "/v1/docker-store",
-				map[string]any{"architecture": "amd64"}).Code
-		}()
+				settled := make(chan error, 1)
+				var start time.Time
+				settle := func() {
+					start = time.Now()
+					go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
+					synctest.Wait()
+				}
+				replaced := make(chan int, 1)
+				replace := func() {
+					if discard := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/discard", nil); discard.Code != http.StatusOK {
+						t.Fatalf("the guest's discard of its mounted store = %d: %s", discard.Code, discard.Body.String())
+					}
+					// THE REPLACEMENT HOLDS THE SESSION FOR THREE MINUTES, past the window.
+					attacher.attachDelay = 3 * time.Minute
+					go func() {
+						replaced <- cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+							map[string]any{"architecture": "amd64"}).Code
+					}()
+					synctest.Wait()
+				}
+				if replacementFirst {
+					replace()
+					settle()
+				} else {
+					settle()
+					replace()
+				}
 
-		<-settled
-		if waited := time.Since(start); waited > dockerSettleWait {
-			t.Fatalf("the settlement waited %s behind a request holding its session; its window is %s",
-				waited, dockerSettleWait)
-		}
-		if code := <-replaced; code != http.StatusCreated {
-			t.Fatalf("the replacement's status = %d, want 201", code)
-		}
-	})
+				err = <-settled
+				if err == nil || err.Error() != "docker image store did not become ready before teardown" {
+					t.Fatalf("SettleDocker = %v, want the settle window's own refusal", err)
+				}
+				if waited := time.Since(start); waited != dockerSettleWait {
+					t.Fatalf("the settlement waited %s behind a request holding its session; want exactly its window, %s",
+						waited, dockerSettleWait)
+				}
+				if code := <-replaced; code != http.StatusCreated {
+					t.Fatalf("the replacement's status = %d, want 201", code)
+				}
+			})
+		})
+	}
 }
 
 // A RECORD INSTALLED AS MOUNTED, WHOSE WRITE THEN FAILED, IS WRITTEN BACK AS
