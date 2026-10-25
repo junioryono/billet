@@ -762,6 +762,39 @@ func TestAFlowsFirstReplyIsTimedAgainstItsDestination(t *testing.T) {
 		}
 	}
 
+	// AN ID REUSED WITHIN A SECOND never lends one flow's wait to the other. An
+	// earlier flow destroyed before the reuse was read is timed by the only wait
+	// there was, its own; once both waits are held, either could be either
+	// flow's, so a flow read then is left untimed.
+	for name, order := range map[string]bool{"destroy first": true, "reply first": false} {
+		reused := NewAccountant()
+		reused.RepliesUp(began.Add(-time.Hour))
+		reused.Watch("lease-r", guest, began, nil)
+		first := flow(9, guest, github, 100, 100)
+		second := startedAt(flow(9, guest, npm, 100, 100), started.Add(100*time.Millisecond))
+		reused.ObserveNew(9, guest, started)
+		reused.ObserveReply(9, guest, started.Add(20*time.Millisecond))
+		if order {
+			reused.Observe(first)
+		}
+		reused.ObserveNew(9, guest, second.Start)
+		reused.ObserveReply(9, guest, second.Start.Add(50*time.Millisecond))
+		if !order {
+			reused.Observe(first)
+		}
+		reused.Observe(second)
+		r, _ := reused.Final("lease-r", nil, ended)
+		for _, d := range r.Destinations {
+			ownWait := d.Addr == github && order
+			switch {
+			case ownWait && (d.TimedReplies != 1 || d.SlowestReply != 20*time.Millisecond):
+				t.Errorf("%s: the flow destroyed before the reuse lost its own wait: %+v", name, d)
+			case !ownWait && d.TimedReplies != 0:
+				t.Errorf("%s: an id reused within a second left %s timed: %+v", name, d.Addr, d)
+			}
+		}
+	}
+
 	// BEYOND THE CAP the timed counts are summed under Other and its slowest
 	// wait is the slowest of theirs.
 	beyond := NewAccountant()

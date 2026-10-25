@@ -19,6 +19,7 @@ package flows
 
 import (
 	"cmp"
+	"errors"
 	"net/netip"
 	"slices"
 	"sync"
@@ -49,10 +50,22 @@ const MaxUnclaimed = 4096
 const SlowReply = time.Second
 
 // replyMatch bounds how far a counted flow's start may lie from the new event a
-// wait was timed from. The two events come on separate sockets and an id is
-// reused once its entry is gone, so a wait is a flow's only when its start is
-// the moment that new event was read; otherwise the flow is left untimed.
+// wait was timed from. The two events come on separate sockets, and the kernel
+// reuses an id for a later entry at the same address with the same tuple once
+// the first is gone, so a wait is a flow's only when its start is the moment
+// that new event was read and no other wait on that id is: two candidates
+// leave the flow untimed rather than timed by the other's wait.
 const replyMatch = time.Second
+
+// keptWaits is how many waits one id keeps, newest last, for a destruction
+// that arrives after the id was reused to be matched to its own.
+const keptWaits = 4
+
+// errRepliesUnproven says Sync proved every destruction read and could not
+// prove the same of the new and reply events: the job is untimed, and its
+// byte totals are as complete as they were.
+var errRepliesUnproven = errors.New("flows: the listener for first replies did not prove it had read " +
+	"every event")
 
 // Flow is one tracked connection, in the tracker's own terms: Orig is the
 // direction the guest opened, Reply the other.
@@ -187,11 +200,12 @@ type watch struct {
 	unansweredUnknown bool
 	// untimed says the new and reply events were not all read while the job
 	// held its address. pending holds when each flow's new event was read, and
-	// waits each first reply's wait, by the tracker's id, until a counted flow
-	// whose start matches takes it.
+	// waits each id's latest first-reply waits, for a counted flow whose start
+	// matches exactly one of them to take; kept counts every wait held.
 	untimed bool
 	pending map[uint32]time.Time
-	waits   map[uint32]replyWait
+	waits   map[uint32][]replyWait
+	kept    int
 }
 
 // replyWait is one flow's wait for its first reply, and when its new event
@@ -232,7 +246,7 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 	}
 
 	w := &watch{addr: addr, since: since, counted: map[entry]Flow{}, inherited: map[entry]Flow{},
-		pending: map[uint32]time.Time{}, waits: map[uint32]replyWait{}}
+		pending: map[uint32]time.Time{}, waits: map[uint32][]replyWait{}}
 
 	// A GAP IN THE EVENTS, OR A FLOW THE RING DROPPED, SINCE THE GRANT: either
 	// may have been this guest's.
@@ -342,19 +356,35 @@ func (a *Accountant) observe(f Flow) {
 		return
 	}
 
-	switch r, ok := w.waits[f.ID]; {
-	case ok && f.Start.Sub(r.opened).Abs() <= replyMatch:
-		f.ReplyWait, f.ReplyTimed = r.wait, true
-	case seen && prev.ReplyTimed:
-		f.ReplyWait, f.ReplyTimed = prev.ReplyWait, true
+	f.ReplyWait, f.ReplyTimed = 0, false
+	if wait, ok := w.waitFor(&f); ok {
+		f.ReplyWait, f.ReplyTimed = wait, true
 	}
 
 	w.counted[key] = f
 }
 
+// waitFor is the wait of f's first reply: the one wait on its id whose new
+// event was read within replyMatch of f's start, or none when there is no such
+// wait or more than one.
+func (w *watch) waitFor(f *Flow) (time.Duration, bool) {
+	var (
+		found time.Duration
+		n     int
+	)
+	for _, r := range w.waits[f.ID] {
+		if f.Start.Sub(r.opened).Abs() <= replyMatch {
+			found, n = r.wait, n+1
+		}
+	}
+
+	return found, n == 1
+}
+
 // ObserveNew records that the tracker created flow id from src, read at at.
-// Its wait for a first reply is timed from here. An id is reused only once its
-// entry is gone, so a new event for an id drops whatever an earlier flow left.
+// Its wait for a first reply is timed from here. An id is unique while its
+// entry lives, so a new event for an id whose earlier flow never saw a reply
+// replaces that flow's start, which leaves it untimed.
 func (a *Accountant) ObserveNew(id uint32, src netip.Addr, at time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -363,8 +393,7 @@ func (a *Accountant) ObserveNew(id uint32, src netip.Addr, at time.Time) {
 	if !ok {
 		return
 	}
-	delete(w.waits, id)
-	if len(w.pending) < MaxFlows {
+	if _, held := w.pending[id]; held || len(w.pending) < MaxFlows {
 		w.pending[id] = at
 	}
 }
@@ -385,9 +414,17 @@ func (a *Accountant) ObserveReply(id uint32, src netip.Addr, at time.Time) {
 		return
 	}
 	delete(w.pending, id)
-	if len(w.waits) < MaxFlows {
-		w.waits[id] = replyWait{opened: opened, wait: max(at.Sub(opened), 0)}
+
+	held := w.waits[id]
+	if len(held) == keptWaits {
+		held = held[1:]
+		w.kept--
 	}
+	if w.kept >= MaxFlows {
+		return
+	}
+	w.waits[id] = append(held, replyWait{opened: opened, wait: max(at.Sub(opened), 0)})
+	w.kept++
 }
 
 func (a *Accountant) keepUnclaimed(f Flow) {
@@ -464,6 +501,17 @@ func (a *Accountant) RepliesUp(now time.Time) {
 
 	if a.repliesDown {
 		a.repliesDown, a.repliesLossEnded = false, now
+	}
+}
+
+// MarkUntimed says key's first replies can no longer all be told: the listener
+// for them could not prove it had read every event.
+func (a *Accountant) MarkUntimed(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if w, ok := a.byKey[key]; ok {
+		w.untimed = true
 	}
 }
 

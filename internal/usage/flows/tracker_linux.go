@@ -53,11 +53,16 @@ type Tracker struct {
 	listening bool
 	nonce     uint32
 	waiters   map[sentinelID]chan struct{}
+	// repliesListening and replyWaiters are the reply listener's: a Sync
+	// proves it read up to a moment by its reading the sentinel's new event.
+	repliesListening bool
+	replyWaiters     map[sentinelID]chan struct{}
 }
 
 // NewTracker returns a Tracker that logs to log.
 func NewTracker(log *slog.Logger) *Tracker {
-	return &Tracker{log: log, waiters: map[sentinelID]chan struct{}{}}
+	return &Tracker{log: log, waiters: map[sentinelID]chan struct{}{},
+		replyWaiters: map[sentinelID]chan struct{}{}}
 }
 
 // Run reports every destroyed flow to a until ctx ends. The kernel drops
@@ -173,6 +178,9 @@ func (t *Tracker) listenReplies(ctx context.Context, a *Accountant) error {
 
 	defer closeDraining(conn, events, errs)
 
+	t.setRepliesListening(true)
+	defer t.setRepliesListening(false)
+
 	a.RepliesUp(time.Now())
 
 	for {
@@ -180,11 +188,19 @@ func (t *Tracker) listenReplies(ctx context.Context, a *Accountant) error {
 		case <-ctx.Done():
 			return nil
 		case err := <-errs:
+			// DOWN AS IT FAILS, before the socket is drained and closed: a job
+			// finished in that time must not read as timed.
+			a.RepliesDown()
+
 			return err
 		case ev := <-events:
 			at := time.Now()
 
 			if ev.Flow == nil {
+				continue
+			}
+
+			if ev.Type == conntrack.EventNew && t.replySentinel(ev.Flow) {
 				continue
 			}
 
@@ -198,6 +214,32 @@ func (t *Tracker) listenReplies(ctx context.Context, a *Accountant) error {
 			}
 		}
 	}
+}
+
+func (t *Tracker) setRepliesListening(on bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.repliesListening = on
+}
+
+// replySentinel reports whether f is a Sync's sentinel, read by the reply
+// listener, waking its waiter.
+func (t *Tracker) replySentinel(f *conntrack.Flow) bool {
+	id, ok := sentinelOf(f)
+	if !ok {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if w, ok := t.replyWaiters[id]; ok {
+		close(w)
+		delete(t.replyWaiters, id)
+	}
+
+	return true
 }
 
 func (t *Tracker) setListening(on bool) {
@@ -278,13 +320,10 @@ func closeDraining(conn *conntrack.Conn, events <-chan conntrack.Event, errs <-c
 // whole identity is checked: the mark, both addresses, the protocol and the
 // nonce in the ports.
 func (t *Tracker) sentinel(f *conntrack.Flow) bool {
-	orig := f.TupleOrig
-	if f.Mark != sentinelMark || orig.IP.SourceAddress.Unmap() != sentinelSource ||
-		orig.IP.DestinationAddress.Unmap() != sentinelDest || orig.Proto.Protocol != sentinelProtocol {
+	id, ok := sentinelOf(f)
+	if !ok {
 		return false
 	}
-
-	id := sentinelID{sport: orig.Proto.SourcePort, dport: orig.Proto.DestinationPort}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -297,10 +336,24 @@ func (t *Tracker) sentinel(f *conntrack.Flow) bool {
 	return true
 }
 
+// sentinelOf is f's sentinel identity, when f is a sentinel: the mark, both
+// addresses and the protocol, and the nonce in its ports.
+func sentinelOf(f *conntrack.Flow) (sentinelID, bool) {
+	orig := f.TupleOrig
+	if f.Mark != sentinelMark || orig.IP.SourceAddress.Unmap() != sentinelSource ||
+		orig.IP.DestinationAddress.Unmap() != sentinelDest || orig.Proto.Protocol != sentinelProtocol {
+		return sentinelID{}, false
+	}
+
+	return sentinelID{sport: orig.Proto.SourcePort, dport: orig.Proto.DestinationPort}, true
+}
+
 // Sync returns once the listener has read every destruction the kernel
-// reported before the call, proved by a sentinel entry of its own, or with an
-// error saying it could not prove it. Cancelling ctx ends it, the netlink calls
-// included.
+// reported before the call, and the reply listener every new flow and reply,
+// proved by a sentinel entry of its own: its destruction read by the one, its
+// creation by the other. It answers with an error saying what it could not
+// prove, errRepliesUnproven when only the reply listener's reading is in
+// doubt. Cancelling ctx ends it, the netlink calls included.
 func (t *Tracker) Sync(ctx context.Context) error {
 	t.mu.Lock()
 
@@ -323,12 +376,23 @@ func (t *Tracker) Sync(ctx context.Context) error {
 
 	seen := make(chan struct{})
 	t.waiters[id] = seen
+
+	// A REPLY LISTENER NOT READING NOW proves nothing, and its waiter is never
+	// registered.
+	var replySeen chan struct{}
+	if t.repliesListening {
+		replySeen = make(chan struct{})
+		t.replyWaiters[id] = replySeen
+	}
 	t.mu.Unlock()
 
 	defer func() {
 		t.mu.Lock()
 		if t.waiters[id] == seen {
 			delete(t.waiters, id)
+		}
+		if replySeen != nil && t.replyWaiters[id] == replySeen {
+			delete(t.replyWaiters, id)
 		}
 		t.mu.Unlock()
 	}()
@@ -385,9 +449,20 @@ func (t *Tracker) Sync(ctx context.Context) error {
 
 	select {
 	case <-seen:
-		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("flows: the listener did not report the sentinel's destruction: %w", ctx.Err())
+	}
+
+	// THE CREATION IS READ BEFORE THE DESTRUCTION in the kernel's order, but on
+	// another socket, so it is waited for in its own right.
+	if replySeen == nil {
+		return fmt.Errorf("%w: it is not reading", errRepliesUnproven)
+	}
+	select {
+	case <-replySeen:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: it did not report the sentinel's creation: %w", errRepliesUnproven, ctx.Err())
 	}
 }
 

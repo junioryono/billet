@@ -362,6 +362,42 @@ func TestFinalCountsOpenFlowsOrSaysItCouldNot(t *testing.T) {
 	}
 }
 
+// A SYNC THAT CANNOT PROVE THE REPLY EVENTS READ LEAVES THE JOB UNTIMED AND ITS
+// BYTES AS THEY WERE; one that cannot prove the destructions read proves
+// neither, and the job is both untimed and incomplete.
+func TestFinalIsTimedOnlyWhenSyncProvedTheReplyEvents(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+	table := &fakeTable{}
+	w, acct := newTestWatcher(table, l)
+	acct.RepliesUp(launched.Add(-time.Hour))
+
+	for name, tc := range map[string]struct {
+		syncErr           error
+		timed, incomplete bool
+	}{
+		"both proved":          {timed: true},
+		"the replies unproved": {syncErr: fmt.Errorf("%w: it is not reading", errRepliesUnproven)},
+		"nothing proved":       {syncErr: errors.New("the listener is not reading"), incomplete: true},
+	} {
+		table.mu.Lock()
+		table.syncErr = tc.syncErr
+		table.mu.Unlock()
+
+		w.Watch(name, guestMACAddr, "leases", launched)
+		r, measured, err := w.Final(t.Context(), name, ended)
+		if (err != nil) != (tc.syncErr != nil) {
+			t.Errorf("%s: Final answered %v for a sync that answered %v", name, err, tc.syncErr)
+		}
+		if !measured || r.RepliesTimed != tc.timed || r.Incomplete != tc.incomplete {
+			t.Errorf("%s: Final = %+v, measured %v; want timed %v, incomplete %v", name, r, measured, tc.timed,
+				tc.incomplete)
+		}
+	}
+}
+
 // AN ADDRESS THAT CHANGES MID-JOB marks the job incomplete: its new address's
 // traffic was never followed.
 func TestAnAddressThatChangesMarksTheJobIncomplete(t *testing.T) {

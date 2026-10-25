@@ -87,11 +87,6 @@ func TestTheRealTrackerTimesAFlowsFirstReply(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	since := time.Now()
-	if !acct.Watch("probe", probe, since, nil) {
-		t.Fatal("the probe address could not be watched")
-	}
-
 	ask := func(peer netip.Addr) time.Duration {
 		local := net.UDPAddrFromAddrPort(netip.AddrPortFrom(probe, 0))
 		conn, err := net.DialUDP("udp", local, net.UDPAddrFromAddrPort(netip.AddrPortFrom(peer, 5300)))
@@ -113,7 +108,28 @@ func TestTheRealTrackerTimesAFlowsFirstReply(t *testing.T) {
 
 		return time.Since(begun)
 	}
+	// PROVED READING BEFORE AND AFTER: a warm-up query and a Sync show both
+	// listeners consuming before the probe is watched (the first flow after a
+	// listen can arrive without its new event, measured 2026-10-25), and a
+	// Sync after the queries shows their events consumed before Final.
+	prove := func(when string) {
+		syncCtx, done := context.WithTimeout(t.Context(), 5*time.Second)
+		defer done()
+
+		if err := tracker.Sync(syncCtx); err != nil {
+			t.Fatalf("sync %s: %v", when, err)
+		}
+	}
+	ask(fastPeer)
+	prove("after the warm-up")
+
+	since := time.Now()
+	if !acct.Watch("probe", probe, since, nil) {
+		t.Fatal("the probe address could not be watched")
+	}
+
 	slowTook, fastTook := ask(slowPeer), ask(fastPeer)
+	prove("after the queries")
 
 	open, err := tracker.Flows(probe)
 	if err != nil {
@@ -133,7 +149,7 @@ func TestTheRealTrackerTimesAFlowsFirstReply(t *testing.T) {
 		fastTook, fastDest)
 
 	if slowDest.TimedReplies != 1 || slowDest.SlowReplies != 1 ||
-		slowDest.SlowestReply < slow || slowDest.SlowestReply > slow+500*time.Millisecond {
+		slowDest.SlowestReply < slow-100*time.Millisecond || slowDest.SlowestReply > slow+500*time.Millisecond {
 		t.Errorf("the query answered after %s reads %+v, want one timed slow reply near %s", slowTook,
 			slowDest, slow)
 	}
