@@ -368,6 +368,30 @@ func TestEachArchitecturesToolsetIsItsPinnedFile(t *testing.T) {
 	}
 }
 
+// WHAT THE GETTER RETURNS IS A COPY: a caller that writes into it cannot change
+// what the next caller, or the next digest check, reads.
+func TestAToolsetCopyCannotChangeTheNextOne(t *testing.T) {
+	t.Parallel()
+
+	for _, arch := range []string{runnerimages.ArchX64, runnerimages.ArchArm64} {
+		first, err := runnerimages.ToolsetBytesFor(arch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := append([]byte{}, first...)
+		for i := range first {
+			first[i] = 'x'
+		}
+		second, err := runnerimages.ToolsetBytesFor(arch)
+		if err != nil {
+			t.Fatalf("%s: a caller's write into its copy reached the embedded declaration: %v", arch, err)
+		}
+		if !bytes.Equal(second, want) {
+			t.Fatalf("%s: the second copy is not the declaration", arch)
+		}
+	}
+}
+
 func TestAnArchitectureWithNoDeclarationIsRefused(t *testing.T) {
 	t.Parallel()
 

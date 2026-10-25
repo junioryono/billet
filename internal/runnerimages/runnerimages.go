@@ -146,6 +146,13 @@ func ToolsetBytesFor(arch string) ([]byte, error) {
 		return nil, err
 	}
 
+	return verifiedCopy(arch, data, want)
+}
+
+// verifiedCopy is data held to want and copied, or an error naming where arch's
+// declaration comes from: the check ToolsetBytesFor makes, apart from the embedded
+// bytes so a test can hand it wrong ones.
+func verifiedCopy(arch string, data []byte, want string) ([]byte, error) {
 	if err := verifyToolsetBytes(data, want); err != nil {
 		source, urlErr := SourceURLFor(arch)
 		if urlErr != nil {

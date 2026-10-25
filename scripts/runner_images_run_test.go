@@ -521,11 +521,18 @@ func TestATargetRefusesAToolsetThatIsNotThePinnedOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, _, _ := strings.Cut(string(pin), "\n")
+	first, rest, _ := strings.Cut(string(pin), "\n")
+	armLine := strings.TrimSpace(rest)
+	x64Vendored, err := os.ReadFile(filepath.Join("..", "internal", "runnerimages", "toolset-2404.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, tc := range map[string]struct{ scope, toolset, pin, clause string }{
 		"a tampered arm64 declaration": {"ami-arm64", string(vendored) + " ", string(pin), "hashes to"},
 		"the x64 declaration on arm64": {"guest-arm64", "", string(pin), "hashes to"},
 		"no arm64 line":                {"ami-arm64", string(vendored), first + "\n", "names no digest"},
+		"a tampered x64 declaration":   {"ami-x64", string(x64Vendored) + " ", string(pin), "hashes to"},
+		"the arm64 line first":         {"ami-x64", string(x64Vendored), armLine + "\n" + first + "\n", "hashes to"},
 	} {
 		fx := newRunnerFixture(t)
 		env := []string{"BILLET_RI_SCOPE=" + tc.scope}
@@ -648,8 +655,27 @@ func TestABuildResumesAtItsStepAndARebootTellsTheDriverWhere(t *testing.T) {
 
 	fx = newRunnerFixture(t)
 	fx.env = []string{"BILLET_RI_FROM=6"}
-	if output, _, err := runRunner(t, fx); err != nil || !strings.Contains(output, "=== [6/6] download:/report.md ===") {
+	output, calls, err = runRunner(t, fx)
+	if err != nil {
 		t.Fatalf("resuming at the last step answered %v:\n%s", err, output)
+	}
+	if got := namesRan(t, fx); len(got) != 0 {
+		t.Fatalf("resumed at the last step, and earlier steps ran: %v", got)
+	}
+	acted := 0
+	for _, call := range calls {
+		switch {
+		case call == "copy-out|/report.md|"+fx.out:
+			acted++
+		case strings.HasPrefix(call, "reboot"), strings.HasSuffix(call, "|/imagegeneration/asset.txt"):
+			t.Fatalf("a step before the resume point acted: %s", call)
+		}
+	}
+	if acted != 1 {
+		t.Fatalf("the last step's download ran %d times, want once:\n%s", acted, strings.Join(calls, "\n"))
+	}
+	if report, err := os.ReadFile(filepath.Join(fx.out, "report.md")); err != nil || string(report) != "report\n" {
+		t.Fatalf("the download did not arrive (%v): %q", err, report)
 	}
 
 	for _, from := range []string{"0", "07", "x", "-1", "7"} {
