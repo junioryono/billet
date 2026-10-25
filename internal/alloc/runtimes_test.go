@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -34,7 +35,8 @@ func runtimeFleet(t *testing.T, now *time.Time) *Allocator {
 	return a
 }
 
-var ranJobs int
+// ranJobs numbers the jobs ranJob runs, so each has its own request and job id.
+var ranJobs atomic.Int64
 
 // ranJob runs one job of tier small through the ledger as a deployment would:
 // bought and assigned a second before start, named by a JobStarted, busy at
@@ -45,7 +47,7 @@ func ranJob(t *testing.T, a *Allocator, now *time.Time, repo, name string,
 ) string {
 	t.Helper()
 
-	ranJobs++
+	n := ranJobs.Add(1)
 
 	*now = start.Add(-time.Second)
 
@@ -56,13 +58,13 @@ func ranJob(t *testing.T, a *Allocator, now *time.Time, repo, name string,
 	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, int64(ranJobs)); err != nil {
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, n); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
 
 	owner, repository, _ := strings.Cut(repo, "/")
 	if err := a.RecordJobIdentity(t.Context(), lease.ID, HistoryJob{
-		JobID: fmt.Sprintf("job-%d", ranJobs), Owner: owner, Repository: repository,
+		JobID: fmt.Sprintf("job-%d", n), Owner: owner, Repository: repository,
 		WorkflowRef: repo + "/.github/workflows/ci.yml@refs/heads/main", Name: name,
 	}); err != nil {
 		t.Fatalf("RecordJobIdentity: %v", err)
@@ -406,8 +408,9 @@ func TestARefreshThatFailsKeepsTheLastSnapshot(t *testing.T) {
 	}
 }
 
-// WITH NO SNAPSHOT YET, A FAILED REBUILD IS AN ERROR AND NOTHING ELSE, and the
-// next caller tries again.
+// WITH NO SNAPSHOT YET, A FAILED REBUILD IS AN ERROR AND NOTHING ELSE, and it
+// is held for runtimeRetry like any other: a caller inside it is answered with
+// the recorded failure at once, without reading again.
 func TestAFirstRefreshThatFailsReturnsTheError(t *testing.T) {
 	now := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
 	a := runtimeFleet(t, &now)
@@ -416,27 +419,35 @@ func TestAFirstRefreshThatFailsReturnsTheError(t *testing.T) {
 	reads := readsCounted(a, &fail)
 
 	for range 2 {
-		if got, err := a.RuntimePriors(t.Context()); got != nil || err == nil || errors.Is(err, ErrRuntimesStale) {
+		got, err := a.RuntimePriors(t.Context())
+		if got != nil || err == nil || errors.Is(err, ErrRuntimesStale) ||
+			!strings.Contains(err.Error(), "the ledger could not be read") {
 			t.Errorf("a first refresh that failed returned %p, %v; want only the ledger's error", got, err)
 		}
 	}
-	if *reads != 2 {
-		t.Errorf("two callers with no snapshot made %d reads; want each to try", *reads)
+	if *reads != 1 {
+		t.Errorf("two callers with no snapshot inside the retry made %d reads; want one", *reads)
+	}
+
+	failedAt := now
+	now = failedAt.Add(runtimeRetry)
+	if _, err := a.RuntimePriors(t.Context()); err == nil || *reads != 2 {
+		t.Errorf("after the retry: %v after %d reads; want the ledger read again, and its failure", err, *reads)
 	}
 
 	// A SUCCESS CLEARS THE FAILURE: with the clock then moved back between the
 	// two, the snapshot from after it is rebuilt rather than kept as if the
 	// failure were still being waited out.
-	failedAt := now
+	failedAt = now
 	fail = false
-	now = failedAt.Add(time.Second)
+	now = failedAt.Add(runtimeRetry)
 
 	built, err := a.RuntimePriors(t.Context())
 	if err != nil {
 		t.Fatalf("RuntimePriors: %v", err)
 	}
 
-	now = failedAt.Add(time.Second / 2)
+	now = failedAt.Add(time.Second)
 	if back, err := a.RuntimePriors(t.Context()); err != nil || back == built || !back.AsOf.Equal(now) {
 		t.Errorf("a clock moved back between a failure and a success was answered %p, %v; want a rebuild",
 			back, err)
@@ -463,7 +474,7 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 		return a.learnRuntimesAt(ctx, asOf)
 	}
 
-	built := make(chan *RuntimePriors, 1)
+	built, waited := make(chan *RuntimePriors, 1), make(chan *RuntimePriors, 1)
 
 	go func() {
 		p, err := a.RuntimePriors(t.Context())
@@ -472,7 +483,7 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 		}
 		built <- p
 	}()
-	<-entered
+	within(t, entered, "the first rebuild to begin its read")
 
 	gone, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -481,8 +492,38 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 		t.Errorf("a caller with no snapshot whose context ended got %p, %v; want its context's error", got, err)
 	}
 
+	// A CALLER WITH NO SNAPSHOT AND A LIVE CONTEXT WAITS, and is answered with
+	// what the rebuild in flight built.
+	go func() {
+		p, err := a.RuntimePriors(t.Context())
+		if err != nil {
+			t.Errorf("a caller waiting on the rebuild: %v", err)
+		}
+		waited <- p
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		a.runtimes.mu.Lock()
+		n := a.runtimes.waiting
+		a.runtimes.mu.Unlock()
+
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the second caller never waited on the rebuild in flight (%d waiting)", n)
+		}
+		runtime.Gosched()
+	}
+
 	close(release)
 	first := <-built
+
+	if got := <-waited; got != first || reads.Load() != 1 {
+		t.Errorf("the waiting caller got %p after %d reads; want the snapshot %p from one read", got,
+			reads.Load(), first)
+	}
 
 	if got, err := a.RuntimePriors(t.Context()); err != nil || got != first {
 		t.Errorf("after the rebuild: %p, %v; want the snapshot it built", got, err)
@@ -500,7 +541,7 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 		}
 		built <- p
 	}()
-	<-entered
+	within(t, entered, "the second rebuild to begin its read")
 
 	if got, err := a.RuntimePriors(t.Context()); err != nil || got != first {
 		t.Errorf("during a rebuild a caller with a snapshot got %p, %v; want the stale one at once", got, err)
@@ -511,6 +552,18 @@ func TestOneRebuildRunsAtATime(t *testing.T) {
 	if second := <-built; second == first || reads.Load() != 1 {
 		t.Errorf("the rebuild returned %p after %d reads; want a new snapshot from one read", second,
 			reads.Load())
+	}
+}
+
+// within waits for ch to close, and fails the test rather than hanging it
+// when it does not.
+func within(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
 	}
 }
 
@@ -594,6 +647,7 @@ func TestALeasePredictionSurvivesAFailedRefresh(t *testing.T) {
 	}
 
 	fail = false
+	now = now.Add(runtimeRetry)
 	if _, err := a.RuntimePriors(t.Context()); err != nil {
 		t.Fatalf("RuntimePriors: %v", err)
 	}
@@ -717,10 +771,18 @@ func TestARebuildEndsOnEveryPath(t *testing.T) {
 
 	var reads int
 
+	// fails, while set, is what the read fails of, after its side effects; with
+	// it unset the read behaves as behave says.
+	var fails func() error
+
 	behave := func(context.Context, time.Time) (*RuntimePriors, error) { return nil, nil }
 
 	a.runtimes.read = func(ctx context.Context, asOf time.Time) (*RuntimePriors, error) {
 		reads++
+
+		if fails != nil {
+			return nil, fails()
+		}
 
 		return behave(ctx, asOf)
 	}
@@ -729,13 +791,20 @@ func TestARebuildEndsOnEveryPath(t *testing.T) {
 		return a.learnRuntimesAt(ctx, asOf)
 	}
 
-	// A PANIC: recovered by its caller, and the next caller is not left waiting.
-	behave = func(context.Context, time.Time) (*RuntimePriors, error) { panic("the read panicked") }
+	// A PANIC: carried to its caller, and the next caller is not left waiting.
+	type readPanicked struct{}
+
+	behave = func(context.Context, time.Time) (*RuntimePriors, error) { panic(readPanicked{}) }
 
 	func() {
-		defer func() { _ = recover() }()
+		defer func() {
+			if got := recover(); got != (readPanicked{}) {
+				t.Errorf("the read's panic reached its caller as %v; want the read's own", got)
+			}
+		}()
 
-		_, _ = a.RuntimePriors(t.Context())
+		p, err := a.RuntimePriors(t.Context())
+		t.Errorf("RuntimePriors returned %p, %v from a read that panicked", p, err)
 	}()
 
 	behave = learn
@@ -760,10 +829,10 @@ func TestARebuildEndsOnEveryPath(t *testing.T) {
 	// A FAILURE IS DATED WHEN THE READ ENDED: a read that took six minutes and
 	// failed holds the next rebuild off for five minutes from its end.
 	now = now.Add(2 * RuntimeRefresh)
-	behave = func(context.Context, time.Time) (*RuntimePriors, error) {
+	fails = func() error {
 		now = now.Add(6 * time.Minute)
 
-		return nil, errors.New("the ledger could not be read")
+		return errors.New("the ledger could not be read")
 	}
 
 	if _, err := a.RuntimePriors(t.Context()); !errors.Is(err, ErrRuntimesStale) {
@@ -780,10 +849,10 @@ func TestARebuildEndsOnEveryPath(t *testing.T) {
 	// it failed: it is not what the read failed of.
 	now = now.Add(2 * RuntimeRefresh)
 	gone, end := context.WithCancel(t.Context())
-	behave = func(context.Context, time.Time) (*RuntimePriors, error) {
+	fails = func() error {
 		end()
 
-		return nil, errors.New("the ledger could not be read")
+		return errors.New("the ledger could not be read")
 	}
 
 	if _, err := a.RuntimePriors(gone); !errors.Is(err, ErrRuntimesStale) {
@@ -799,6 +868,7 @@ func TestARebuildEndsOnEveryPath(t *testing.T) {
 	// A CLOCK MOVED BACK DURING THE READ: the snapshot as of the later instant
 	// is dropped, and the rebuild runs again as of the clock's now.
 	now = now.Add(2 * RuntimeRefresh)
+	fails = nil
 	movedBack := false
 	behave = func(ctx context.Context, asOf time.Time) (*RuntimePriors, error) {
 		if !movedBack {

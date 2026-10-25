@@ -286,11 +286,15 @@ type runtimeBook struct {
 	mu sync.Mutex
 	// building is closed when the rebuild in flight ends, and nil while none is.
 	building chan struct{}
+	// waiting counts the callers waiting on the rebuild in flight, which a test
+	// reads to know one is.
+	waiting int
 	// failedAt is when the last rebuild failed reading the ledger, on the
-	// allocator's clock; zero once one succeeds. A rebuild that failed because
-	// its caller's context ended is not a failure of the ledger's, and holds
-	// nobody else's rebuild off.
+	// allocator's clock, and failed what it failed of; both zero once one
+	// succeeds. A rebuild that failed because its caller's context ended is not
+	// a failure of the ledger's, and holds nobody else's rebuild off.
 	failedAt time.Time
+	failed   error
 	// read learns a snapshot as of an instant; nil reads the ledger
 	// (learnRuntimesAt). A test stands in one that fails, blocks or counts.
 	read func(ctx context.Context, asOf time.Time) (*RuntimePriors, error)
@@ -310,12 +314,14 @@ var ErrRuntimesStale = errors.New("alloc: the learned runtimes could not be refr
 // RuntimePriors is what this allocator has learned of its jobs' runtimes,
 // rebuilt from the ledger when the snapshot is RuntimeRefresh old.
 //
-// A REBUILD THAT FAILS KEEPS THE LAST SNAPSHOT: it is returned with an error
-// wrapping ErrRuntimesStale, which a caller logs and predicts from anyway,
-// since a prediction is an optimisation, and a rebuild that failed reading the
-// ledger is not tried again for runtimeRetry, the last snapshot answering
-// meanwhile. With no snapshot to keep, the error alone is returned, and the
-// next caller tries again.
+// A REBUILD THAT FAILS KEEPS THE LAST SNAPSHOT: the call whose rebuild failed
+// is answered with it and an error wrapping ErrRuntimesStale, which a caller
+// logs and predicts from anyway, since a prediction is an optimisation. A
+// rebuild that failed reading the ledger is not tried again for runtimeRetry:
+// meanwhile the last snapshot answers without an error (its AsOf says how old
+// it is), and with no snapshot to keep, every caller is answered at once with
+// the recorded failure rather than reading again, so callers do not queue a
+// fortnight's read each behind a ledger that is failing.
 func (a *Allocator) RuntimePriors(ctx context.Context) (*RuntimePriors, error) {
 	b := &a.runtimes
 
@@ -341,18 +347,33 @@ func (a *Allocator) RuntimePriors(ctx context.Context) (*RuntimePriors, error) {
 			return current, nil
 		case b.building != nil:
 			done := b.building
+			b.waiting++
 			b.mu.Unlock()
 
 			select {
 			case <-done:
-				continue
 			case <-ctx.Done():
-				return nil, ctx.Err()
 			}
-		case current != nil && b.retrying(now):
+
+			b.mu.Lock()
+			b.waiting--
+			b.mu.Unlock()
+
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+
+			continue
+		case b.retrying(now) && current != nil:
 			b.mu.Unlock()
 
 			return current, nil
+		case b.retrying(now):
+			failed := b.failed
+			b.mu.Unlock()
+
+			return nil, fmt.Errorf("alloc: the learned runtimes are not read again until %s after a "+
+				"failure: %w", runtimeRetry, failed)
 		}
 
 		read := b.read
@@ -390,7 +411,7 @@ func (a *Allocator) RuntimePriors(ctx context.Context) (*RuntimePriors, error) {
 // recorded when the caller's own context ending is what the read failed of.
 func (a *Allocator) rebuildRuntimes(ctx context.Context,
 	read func(context.Context, time.Time) (*RuntimePriors, error), asOf time.Time,
-) (built *RuntimePriors, again bool, err error) {
+) (*RuntimePriors, bool, error) {
 	b := &a.runtimes
 
 	defer func() {
@@ -401,7 +422,7 @@ func (a *Allocator) rebuildRuntimes(ctx context.Context,
 		b.building = nil
 	}()
 
-	built, err = read(ctx, asOf)
+	built, err := read(ctx, asOf)
 	if err == nil && built == nil {
 		err = errors.New("alloc: a rebuild of the learned runtimes returned no snapshot")
 	}
@@ -416,10 +437,10 @@ func (a *Allocator) rebuildRuntimes(ctx context.Context,
 		return nil, true, nil
 	case err == nil:
 		b.snapshot.Store(built)
-		b.failedAt = time.Time{}
+		b.failedAt, b.failed = time.Time{}, nil
 	case ctx.Err() != nil && errors.Is(err, ctx.Err()):
 	default:
-		b.failedAt = ended
+		b.failedAt, b.failed = ended, err
 	}
 
 	return built, false, err
@@ -528,7 +549,7 @@ func (a *Allocator) runtimeSamples(ctx context.Context, since, until time.Time, 
 type LeasePrediction struct {
 	End time.Time
 	// Overdue is true when the job has outrun its median, and End is then half
-	// a median from now (PredictEnd).
+	// its median, or as long again as it has overrun it, from now (PredictEnd).
 	Overdue bool
 	// Started is false for a lease whose job has not started, which is
 	// predicted as if it started now.

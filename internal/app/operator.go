@@ -83,6 +83,16 @@ func openAllocator(ctx context.Context, cfgPath string, mode LedgerMode,
 	return a, db, func() { db.Close() }, nil
 }
 
+// reportLedgerDir is the directory a SQLite ledger is opened in, and its
+// sidecars created in: the parent of the ledger's joined path. It is not
+// always the identity directory as spelled, whose own check (state's
+// requireLedgerFile) resolves it as the kernel does: a link followed by `..`
+// there resolves beside the link's target, while the join cleans the `..`
+// away and opens beside the link.
+func reportLedgerDir(cfg *config.Config) string {
+	return filepath.Dir(cfg.Server.LedgerPath())
+}
+
 // reportEUID is who this process runs as; a test stands another in.
 var reportEUID = os.Geteuid
 
@@ -92,16 +102,14 @@ var reportEUID = os.Geteuid
 // with its own diagnostic, and an owner that cannot be read refuses, since
 // could-not-tell is not the owner.
 //
-// THE DIRECTORY THE LEDGER IS OPENED IN, NOT THE ONE THE CONFIG SPELLS: the
-// ledger's path is joined, which cleans a `..` out of it, and a link is
-// followed when it is opened, so the check stats the ledger path's directory
-// and follows a link, as the open will.
+// THE DIRECTORY THE LEDGER IS OPENED IN, NOT THE ONE THE CONFIG SPELLS
+// (reportLedgerDir), followed if a link, as the ledger's own open follows it.
 func reportRunsAsOwner(cfg *config.Config) error {
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
 		return nil
 	}
 
-	dir := filepath.Dir(cfg.Server.LedgerPath())
+	dir := reportLedgerDir(cfg)
 
 	info, err := os.Stat(dir)
 	switch {

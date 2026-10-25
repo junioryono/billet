@@ -40,13 +40,45 @@ func TestAReportOnASQLiteLedgerRunsOnlyAsItsOwner(t *testing.T) {
 		}
 	}
 
-	// JUDGED WHERE THE LEDGER IS OPENED: the path as spelled names a directory
-	// that does not exist, and the ledger's joined path cleans it to one that
-	// does, which another account owns.
+	// JUDGED WHERE THE LEDGER IS OPENED: a link followed by `..` in the path as
+	// spelled resolves beside the link's target, while the ledger's joined path
+	// cleans the `..` away and opens beside the link. The second is where the
+	// sidecars would be created.
+	elsewhere := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(elsewhere, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(elsewhere, "child"), filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	spelled := &config.Config{Server: &config.ServerConfig{IdentityDir: filepath.Join(dir, "link") + "/.."}}
+
+	got, err := os.Stat(reportLedgerDir(spelled))
+	if err != nil {
+		t.Fatalf("stat the directory the report judges: %v", err)
+	}
+	opened, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := os.Stat(spelled.Server.IdentityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(got, opened) || os.SameFile(got, resolved) {
+		t.Errorf("the report judges %s; want %s, where the ledger is opened, not %s, where the spelled path "+
+			"resolves", reportLedgerDir(spelled), dir, elsewhere)
+	}
+
+	// AND THE CHECK ASKS THAT DIRECTORY. The ledger's own open would refuse
+	// this path anyway (its spelled directory does not exist); it is here
+	// because it tells the two directories apart without a second account: as
+	// spelled, nothing is there to judge, and where the ledger would be opened,
+	// another account owns the directory.
 	reportEUID = func() int { return owner + 1 }
-	spelled := &config.Config{Server: &config.ServerConfig{IdentityDir: filepath.Join(dir, "absent") + "/.."}}
-	if err := reportRunsAsOwner(spelled); err == nil || !strings.Contains(err.Error(), "run it as the ledger's owner") {
-		t.Errorf("a path whose ledger is in another account's directory gave %v; want it refused", err)
+	cleaned := &config.Config{Server: &config.ServerConfig{IdentityDir: filepath.Join(dir, "absent") + "/.."}}
+	if err := reportRunsAsOwner(cleaned); err == nil || !strings.Contains(err.Error(), "run it as the ledger's owner") {
+		t.Errorf("a path whose ledger would be opened in another account's directory gave %v; want it refused", err)
 	}
 	reportEUID = os.Geteuid
 
@@ -66,7 +98,7 @@ func TestAReportOnASQLiteLedgerRunsOnlyAsItsOwner(t *testing.T) {
 func TestOpenReportRefusesAnotherAccountBeforeOpening(t *testing.T) {
 	dir, conf := t.TempDir(), t.TempDir()
 	keyPath := filepath.Join(conf, "app.pem")
-	if err := os.WriteFile(keyPath, []byte("not read before the refusal"), 0o600); err != nil {
+	if err := os.WriteFile(keyPath, []byte("a key nothing here reads"), 0o600); err != nil {
 		t.Fatalf("write the key: %v", err)
 	}
 	cfgPath := filepath.Join(conf, "billet.yaml")
@@ -99,8 +131,11 @@ tiers:
 		t.Errorf("OpenReport as another account gave %v; want the owner refusal", err)
 	}
 
-	if _, _, _, err := OpenOperator(t.Context(), cfgPath); err != nil &&
-		strings.Contains(err.Error(), "run it as the ledger's owner") {
-		t.Errorf("the operator open, which keeps its own rules, was refused as a report: %v", err)
+	// THE OPERATOR OPEN KEEPS ITS OWN RULES, which create the ledger in an empty
+	// directory.
+	_, _, closeDB, err := OpenOperator(t.Context(), cfgPath)
+	if err != nil {
+		t.Fatalf("the operator open as another account failed: %v", err)
 	}
+	closeDB()
 }
