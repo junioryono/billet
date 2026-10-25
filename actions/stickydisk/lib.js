@@ -3,9 +3,30 @@
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const tls = require("tls");
 const { spawnSync } = require("child_process");
 
 const MMDS = "http://169.254.169.254";
+
+// THE CACHE ENDPOINT'S ISSUER IS IN THE GUEST'S SYSTEM TRUST STORE, where an
+// EC2 image installs it (`billet ami build --ca-cert`), and Node never reads
+// that store: its https trusts only the roots it was built with. Every request
+// to an EC2 node's https cache endpoint failed its handshake ("unable to verify
+// the first certificate", an untrusted EC2 guest, 2026-10-25), so every sticky
+// disk there ran cold. The distribution's bundle is added to Node's own roots,
+// never put in their place, and a guest without one keeps Node's defaults.
+const systemCABundles = ["/etc/ssl/certs/ca-certificates.crt"];
+
+function trustedCAs() {
+  for (const path of module.exports.systemCABundles) {
+    try {
+      return [...tls.rootCertificates, fs.readFileSync(path, "utf8")];
+    } catch (_) {
+      // Absent or unreadable: the next candidate, then Node's own roots.
+    }
+  }
+  return undefined;
+}
 
 function warning(message) {
   const safe = String(message).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
@@ -46,11 +67,13 @@ function request(url, options = {}, body) {
       reject(new Error("cache metadata named a non-HTTP(S) endpoint"));
       return;
     }
-    const transport = parsed.protocol === "https:" ? https : http;
+    const secure = parsed.protocol === "https:";
+    const transport = secure ? https : http;
     const req = transport.request(parsed, {
       method: options.method || "GET",
       headers: options.headers || {},
       timeout: options.timeout || 10000,
+      ...(secure ? { ca: trustedCAs() } : {}),
     }, (res) => {
       let response = "";
       res.setEncoding("utf8");
@@ -101,4 +124,4 @@ async function cacheCall(endpoint, token, path, body, timeout = 120000) {
   return JSON.parse(response);
 }
 
-module.exports = { cacheCall, credentials, output, run, saveState, warning };
+module.exports = { cacheCall, credentials, output, run, saveState, systemCABundles, warning };
