@@ -91,6 +91,18 @@ func TestAFleetCountsAFloorsLeasesAsTheLedgerDoes(t *testing.T) {
 
 		liveLeft = free.vcpu["live"]
 
+		// THE DEPLOYMENT'S COMMITMENT IS THE LEDGER'S TOTAL, the host that is
+		// gone included, summed from the rows the fleet read.
+		total, err := a.usage(t.Context(), tx)
+		if err != nil {
+			return err
+		}
+
+		if free.committedVCPU != total.VCPU || free.committedMemory != total.Memory {
+			t.Errorf("the fleet says the deployment holds %d vCPU and %v, the ledger %d and %v",
+				free.committedVCPU, free.committedMemory, total.VCPU, total.Memory)
+		}
+
 		if free.heldOn != nil {
 			heldOn = map[string]map[string]int{}
 			for host, byTier := range free.heldOn {
@@ -191,6 +203,11 @@ func TestAFleetWithoutAFloorReadsNoTierRows(t *testing.T) {
 
 		if left, total := free.vcpu[free.rows[i].name], free.rows[i].vcpu; left != total-2 {
 			t.Errorf("the host has %d vCPU left of %d after two one-vCPU leases", left, total)
+		}
+
+		if free.committedVCPU != 2 || free.committedMemory != 2*config.GiB {
+			t.Errorf("the fleet says the deployment holds %d vCPU and %v, want the two leases'",
+				free.committedVCPU, free.committedMemory)
 		}
 
 		return nil

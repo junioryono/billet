@@ -43,6 +43,9 @@ type placer struct {
 	rank map[string]int
 	// policy decides between hosts that preference cannot separate.
 	policy config.PlacementPolicy
+	// committed is what every open lease in the deployment holds, from the
+	// fleet this placer was made from (fleet.committedVCPU).
+	committed Usage
 }
 
 // fleet is what every machine has left, measured once.
@@ -66,6 +69,12 @@ type fleet struct {
 	// pass as the usage; nil for a fleet that did not read the ledger's leases,
 	// whose floors are counted by the ledger instead (floorLeases).
 	heldOn map[string]map[string]int
+	// committedVCPU and committedMemory are what every open lease holds across
+	// the deployment, summed from the same pass as each host's usage, which is
+	// TotalUsage's answer without its own pass over the leases; zero for a fleet
+	// that read no leases.
+	committedVCPU   int
+	committedMemory config.ByteSize
 }
 
 type placementCost struct {
@@ -142,6 +151,13 @@ func (a *Allocator) fleetResources(ctx context.Context, tx querier) (*fleet, err
 	}
 
 	f.heldOn = held
+
+	// EVERY HOLDER'S, not only the placeable hosts': a lease on a host that is
+	// gone, or aimed at none, is charged to the deployment all the same.
+	for _, u := range used {
+		f.committedVCPU += u.VCPU
+		f.committedMemory += u.Memory
+	}
 
 	for _, n := range nodes {
 		u := used[n.name]
@@ -274,6 +290,7 @@ func (f *fleet) forTier(a *Allocator, t config.Tier) *placer {
 		deploymentMemory: config.ByteSize(1<<63 - 1),
 		rank:             make(map[string]int, len(nodes)),
 		policy:           a.placement.Or(),
+		committed:        Usage{VCPU: f.committedVCPU, Memory: f.committedMemory},
 	}
 
 	for _, n := range nodes {

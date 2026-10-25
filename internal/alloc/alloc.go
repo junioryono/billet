@@ -935,11 +935,6 @@ func (a *Allocator) headroom(ctx context.Context, tx querier, t config.Tier) (in
 func (a *Allocator) headroomWithPlacer(
 	ctx context.Context, tx querier, t config.Tier,
 ) (int, *placer, error) {
-	used, err := a.usage(ctx, tx)
-	if err != nil {
-		return 0, nil, err
-	}
-
 	// FLOORS ARE NOT DEDUCTED HERE. They are held against the machines that could
 	// keep them, in reserveFloors, which is where the promise lives and the only
 	// place it can be checked honestly; deducting in both would double-count.
@@ -952,6 +947,10 @@ func (a *Allocator) headroomWithPlacer(
 	if err != nil {
 		return 0, nil, err
 	}
+
+	// WHAT THE DEPLOYMENT HAS COMMITTED, from the pass that measured each host,
+	// rather than a second pass over every open lease.
+	used := place.committed
 
 	place.deploymentVCPU = max(a.limits.MaxVCPU-used.VCPU-floors.vcpu, 0)
 	place.deploymentMemory = max(a.limits.MaxMemory-used.Memory-floors.memory, 0)
