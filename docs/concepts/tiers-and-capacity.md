@@ -59,9 +59,12 @@ Most of that gap is per-core speed. The node's own cores are 1.5 times slower th
 
 Two consequences follow:
 - **For a CPU-bound suite, a 16-vCPU tier roughly matched a commercial 8-vCPU runner here.** Size a tier by timing your own suite on both, not by matching the number in the label.
-- **Pinning guests to host CPUs bought no speed.** It was measured in [CPU placement](../reference/records/cpu-placement.md): `compact` was slower than `spread` on every load `spread` could hold, and no different from unpinned guests at three quarters of the threads.
+- **Pinning guests to host CPUs established no speed gain** ([CPU placement](../reference/records/cpu-placement.md)):
+  - `compact` was slower than `spread` on every load `spread` could hold;
+  - `spread`'s compile ran 7 to 12% faster than unpinned guests on average, a difference those runs could not establish;
+  - at three quarters of the threads, `compact` and unpinned guests were within 2%, where the test could have missed a difference of about a quarter.
 
-A service container published on a port is slower to reach than one reached by its container address, because Docker relays the port through a userland proxy. Turning that proxy off made the published path nearly as fast, but broke `localhost` for Node 18 and `[::1]` for every client. So billet's images keep the proxy, as GitHub's do ([Docker's published ports](../reference/records/docker-published-ports.md)).
+A service container published on a port is slower to reach than one reached by its container address, because Docker relays the port through a userland proxy. Turning that proxy off made the published path nearly as fast, but broke `localhost` for Node 18 and `[::1]` for every client tested. So billet's images keep the proxy, which GitHub's runner image template also leaves at Docker's default ([Docker's published ports](../reference/records/docker-published-ports.md)).
 
 ## Cost
 

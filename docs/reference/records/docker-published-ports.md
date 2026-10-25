@@ -28,20 +28,23 @@ The same services, reached by every name a job uses, under each setting. "ok" is
 
 | Client | `localhost`, proxy on | `127.0.0.1`, proxy on | `[::1]`, proxy on | `localhost`, proxy off | `127.0.0.1`, proxy off | `[::1]`, proxy off |
 |---|---|---|---|---|---|---|
-| curl | ok | ok | ok | ok | ok | refused |
-| psql | ok | ok | ok | ok | ok | refused |
-| Python `socket.create_connection`, `urllib` | ok (via `::1`) | ok | ok | ok (via `127.0.0.1`) | ok | refused |
-| Go `net.Dial` | ok (via `[::1]`) | ok | ok | ok (via `127.0.0.1`) | ok | refused |
-| Node 18 `net.connect`, `fetch` | ok (via `::1`) | ok | ok | **refused** (`ECONNREFUSED`) | ok | refused |
-| Node 20 and 22 `net.connect`, `fetch` | ok (via `::1`) | ok | ok | ok (via `127.0.0.1`) | ok | refused |
+| curl | ok | ok | ok | ok | ok | failed |
+| psql | ok | ok | ok | ok | ok | failed |
+| Python `socket.create_connection`, `urllib` | ok (via `::1`) | ok | ok | ok (via `127.0.0.1`) | ok | refused (`ConnectionRefusedError`); `urllib` failed |
+| Go `net.Dial` | ok (via `[::1]`) | ok | ok | ok (via `127.0.0.1`) | ok | failed |
+| Node 18 `net.connect`, `fetch` | ok (via `::1`) | ok | ok | **refused** (`ECONNREFUSED`) | ok | refused (`ECONNREFUSED`) |
+| Node 20 and 22 `net.connect`, `fetch` | ok (via `::1`) | ok | ok | ok (via `127.0.0.1`) | ok | refused (`ECONNREFUSED`) |
 
-**Why `[::1]` breaks.** With the proxy, Docker listens on the published port for both address families, so `localhost` resolves to `::1` first and connects there. Without it, Docker publishes the port by rewriting IPv4 traffic only, so nothing answers on `::1`.
+"Failed" is a client that reported only that it could not connect; "refused" is one that said the connection was refused.
 
-**Why `localhost` breaks only for Node 18.** Every client but Node 18 tries the next address when `::1` refuses: curl, psql, Python, Go, and Node 20 and later. Node 18 tries `::1` alone and fails.
+Three separate facts explain the matrix:
+- **Resolution:** `localhost` resolved to `::1` first for every client that reported its peer: with the proxy, Python, Go and Node all connected through `::1`.
+- **Who answers on `::1`:** with the proxy, Docker also listens on the IPv6 loopback and forwards those connections to the container's IPv4 address. Without it, this guest's bridge is IPv4 only, and the port is published by an IPv4 rule alone, so nothing answers on `::1`. A bridge with IPv6 enabled would publish differently, and was not tested.
+- **What a client does next:** when `::1` refused, every client tested tried `127.0.0.1` next, except Node 18 in its default configuration, which tried `::1` alone and failed. Node 18 can be told to try both families; a workflow that never asked for that cannot be assumed to have.
 
 ## The decision
 
-**Not adopted.** A workflow that reaches its service container on `localhost` from Node 18, or on `[::1]` from anything, works on GitHub's hosted runners and would fail on billet's. GitHub's runners keep the proxy: the runner-images template billet vendors writes no `daemon.json` (`images/ubuntu/scripts/build/install-docker.sh` at `e7563390`, the commit in `scripts/runner-images/COMMIT`), so Docker runs with its default. The published path's speed is a real cost: up to a third of a round-trip-bound workload on this guest. But it is a cost GitHub's runners pay too, and a broken service connection is not a slower one. A workflow that wants the fast path can reach its service by the container's address, or run its client in the service's network, without billet changing what `localhost` means for everyone else.
+**Not adopted.** On this guest, turning the proxy off broke a workflow that reaches its service container on `localhost` from Node 18, or on `[::1]` from anything, and that is a regression measured on billet. It is also very likely a difference from GitHub's hosted runners. The runner-images template billet vendors writes no `daemon.json` (`images/ubuntu/scripts/build/install-docker.sh` at `e7563390`, the commit in `scripts/runner-images/COMMIT`), so its Docker runs with the default, the proxy on. That was read from the template, not measured on a hosted runner. The published path's speed is a real cost: up to a third of a round-trip-bound workload on this guest. But a broken service connection is not a slower one. A workflow that wants the fast path can reach its service by the container's address, or run its client in the service's network, without billet changing what `localhost` means for everyone else.
 
 ## The workflow, exactly as it ran
 
