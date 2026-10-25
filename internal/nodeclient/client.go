@@ -185,6 +185,9 @@ type target struct {
 	// base at construction and fixed for the client's life.
 	endpoint endpoint.Endpoint
 	http     *http.Client
+	// dialer is the dialer the client's own transport dials with; nil for a
+	// caller's HTTP client, whose transport is the caller's.
+	dialer *net.Dialer
 }
 
 // Dead-peer detection on the node's connections.
@@ -307,9 +310,10 @@ func newTarget(spec Target) (*target, error) {
 		// open. A dial or a TLS handshake that never completes is never a healthy
 		// poll, and leaving those unbounded means a wedged network holds a
 		// goroutine and a socket indefinitely.
+		t.dialer = newDialer()
 		t.http = &http.Client{
 			Transport: &http.Transport{
-				DialContext:           newDialer().DialContext,
+				DialContext:           t.dialer.DialContext,
 				TLSClientConfig:       spec.TLS,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 0, // a long poll withholds headers on purpose
@@ -378,10 +382,6 @@ func ReplaceTransportForTest(c *Client, rt http.RoundTripper) {
 // Exported for tests because the failure it guards is invisible from outside:
 // a base without a scheme builds a request that never leaves the process.
 func (c *Client) BaseForTest() string { return c.at().base }
-
-// DialerForTest is the dialer the client's own transports dial with, so a test
-// can hold its bounds to the ones a failover depends on.
-func DialerForTest() *net.Dialer { return newDialer() }
 
 // Registration is what this node says about itself when it introduces itself.
 //
@@ -659,7 +659,11 @@ func (c *Client) currentTarget() (*target, int64) {
 
 // errNoAnswer is what an error wraps when the controller gave no answer at
 // all: the connection failed, was cut, or the request's deadline passed with
-// nothing heard. A refusal is an answer, and never wraps it.
+// nothing heard. A refusal is an answer, and never wraps it, and neither does
+// the caller's own cancellation. A TLS handshake the node cannot complete (a
+// certificate it does not trust, or an alert) is counted as no answer: the
+// node cannot use that controller, and with another to try it tries it, as a
+// node with one controller retries the one it has.
 var errNoAnswer = errors.New("nodeclient: the control plane did not answer")
 
 // noAnswer carries a transport's error, and says it is errNoAnswer.
@@ -1303,6 +1307,21 @@ func (c *Client) doStatus(ctx context.Context, at *target, method, path string, 
 
 	resp, err := at.http.Do(req)
 	if err != nil {
+		// A CANCELLATION IS THE CALLER'S, and an error that came with a response
+		// (a redirect refused, whose body the client has already closed) came
+		// from a controller that answered: neither says the controller is gone.
+		if resp != nil || errors.Is(err, context.Canceled) {
+			return 0, fmt.Errorf("nodeclient: %s %s%s: %w", method, at.base, path, err)
+		}
+
+		// AND ITS IDLE CONNECTIONS ARE CLOSED, where the node knows another
+		// controller: one opened before a partition is ended only by its own
+		// keepalive probes, and a request that borrowed it would wait out its
+		// whole deadline where a new dial gives up in seconds.
+		if len(c.targets) > 1 {
+			at.http.CloseIdleConnections()
+		}
+
 		// NO ANSWER, as distinct from a refusal: the controller was not reached,
 		// or stopped answering, which is what a node with another controller to
 		// try acts on (errNoAnswer).

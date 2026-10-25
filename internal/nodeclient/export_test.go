@@ -1,7 +1,9 @@
 package nodeclient
 
 import (
+	"errors"
 	"io"
+	"net"
 	"time"
 )
 
@@ -48,3 +50,11 @@ func SetDrainServingDoneForTest(f func()) func() {
 
 // BackoffForTest is the pause the loop takes after a failed registration.
 func BackoffForTest(opts LoopOptions, c *Client) time.Duration { return backoffFor(opts, c) }
+
+// DialerForTest is the dialer the transport of a built client's controller at
+// index i dials with, so a test can hold its bounds to the ones a failover
+// depends on.
+func DialerForTest(c *Client, i int) *net.Dialer { return c.targets[i].dialer }
+
+// IsNoAnswerForTest reports whether an error says the controller gave no answer.
+func IsNoAnswerForTest(err error) bool { return errors.Is(err, errNoAnswer) }

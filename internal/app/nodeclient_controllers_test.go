@@ -76,7 +76,7 @@ func TestEachControllerIsVerifiedAgainstItsOwnName(t *testing.T) {
 
 	res, err := misnamed.Get(addressed.URL + "/v1/register")
 	if err == nil {
-		_ = res.Body.Close() //nolint:errcheck // a response is already the failure
+		_ = res.Body.Close()
 
 		t.Fatal("the second controller was trusted under the first one's name, so this proves nothing")
 	}

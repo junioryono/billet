@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +34,9 @@ type controller struct {
 	// drop, when it returns true for a request, cuts the connection without an
 	// answer, as a controller that has gone does.
 	drop func(path string, n int) bool
+	// unavailable, when it returns true for a request, answers 503, as a
+	// controller whose ledger blinked does.
+	unavailable func(path string, n int) bool
 }
 
 func newController(t *testing.T) *controller {
@@ -53,13 +58,19 @@ func newController(t *testing.T) *controller {
 		c.mu.Lock()
 		c.requests[r.URL.Path]++
 		n := c.requests[r.URL.Path]
-		drop := c.drop
+		drop, unavailable := c.drop, c.unavailable
 		c.mu.Unlock()
+
+		if unavailable != nil && unavailable(r.URL.Path, n) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+
+			return
+		}
 
 		if drop != nil && drop(r.URL.Path, n) {
 			conn, _, err := w.(http.Hijacker).Hijack()
 			if err == nil {
-				_ = conn.Close() //nolint:errcheck // the point is that nothing answers
+				_ = conn.Close()
 			}
 
 			return
@@ -91,7 +102,9 @@ func endpointOf(t *testing.T, base string) string {
 	return e.String()
 }
 
-// deadAddress is an address nothing listens on: bound, then released.
+// deadAddress is an address that answers nothing: every connection is closed
+// as it opens. HELD FOR THE TEST rather than bound and released, so no other
+// test's server can take the port and answer for it.
 func deadAddress(t *testing.T) string {
 	t.Helper()
 
@@ -100,12 +113,25 @@ func deadAddress(t *testing.T) string {
 		t.Fatalf("listen: %v", err)
 	}
 
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	var wg sync.WaitGroup
 
-	return addr
+	wg.Go(func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			_ = conn.Close()
+		}
+	})
+	t.Cleanup(func() {
+		_ = ln.Close()
+
+		wg.Wait()
+	})
+
+	return ln.Addr().String()
 }
 
 var registration = nodeclient.Registration{
@@ -137,6 +163,15 @@ func TestARegistrationPassesOverAControllerThatDoesNotAnswer(t *testing.T) {
 
 	if nodes := b.plane.Nodes(); len(nodes) != 1 || nodes[0] != "n1" {
 		t.Fatalf("the controller that answered knows %v", nodes)
+	}
+
+	// AND THE REQUESTS AFTER IT GO THERE, not to the first controller named.
+	if _, err := c.LaunchedLeaseIDs(t.Context(), "n1"); err != nil {
+		t.Fatalf("LaunchedLeaseIDs: %v", err)
+	}
+
+	if n := b.sent("/v1/nodes/n1/launched"); n != 1 {
+		t.Fatalf("the controller that accepted was asked %d times, want once", n)
 	}
 }
 
@@ -200,11 +235,17 @@ func TestANodeLeavesALostControllerForTheOther(t *testing.T) {
 	a.srv.CloseClientConnections()
 	a.srv.Close()
 
-	waitFor(t, func() bool { return len(b.plane.Nodes()) == 1 })
+	// THE CLIENT'S SIDE, not B's: B records the registration before the
+	// client has read its answer and made B the controller it dials.
+	want := endpointOf(t, b.srv.URL)
+	waitFor(t, func() bool { return c.Endpoint().String() == want })
 
-	if got, want := c.Endpoint().String(), endpointOf(t, b.srv.URL); got != want {
-		t.Fatalf("the client dials %s, want %s", got, want)
+	if nodes := b.plane.Nodes(); len(nodes) != 1 || nodes[0] != "n1" {
+		t.Fatalf("B knows %v after the node moved there", nodes)
 	}
+
+	// AND IT POLLS B, where its commands now come from.
+	waitFor(t, func() bool { return b.sent("/v1/nodes/n1/poll") >= 1 })
 }
 
 // A BLINK IS NOT A LOSS. One poll the controller does not answer, then answers,
@@ -239,6 +280,41 @@ func TestABlinkDoesNotSendTheNodeElsewhere(t *testing.T) {
 
 	if n := b.sent("/v1/register"); n != 0 {
 		t.Fatalf("a blink sent the node to B %d times", n)
+	}
+}
+
+// AN ANSWER BETWEEN TWO SILENCES IS AN ANSWER. A poll the controller does not
+// answer, one it answers with a 503, and another it does not answer are not
+// two in a row: the controller said it was there, and the node stays.
+func TestAnAnsweredErrorBetweenTwoSilencesIsNotALoss(t *testing.T) {
+	t.Parallel()
+
+	a, b := newController(t), newController(t)
+
+	poll := "/v1/nodes/n1/poll"
+
+	a.mu.Lock()
+	a.drop = func(path string, n int) bool { return path == poll && (n == 2 || n == 4) }
+	a.unavailable = func(path string, n int) bool { return path == poll && n == 3 }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: a.srv.URL}, {Base: b.srv.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	runLoop(t, c, &fakeCompute{})
+
+	waitFor(t, func() bool { return a.sent(poll) >= 7 })
+
+	if n := a.sent("/v1/register"); n != 1 {
+		t.Fatalf("the node registered with A %d times when A answered between two silences, want once", n)
+	}
+
+	if n := b.sent("/v1/register"); n != 0 {
+		t.Fatalf("an answered error between two silences sent the node to B %d times", n)
 	}
 }
 
@@ -354,8 +430,178 @@ func TestTheLoopRetriesEverySecondWithSeveralControllers(t *testing.T) {
 	gap := rounds[1].Sub(rounds[0])
 	mu.Unlock()
 
-	if gap > 3*time.Second {
+	// AT LEAST THE SECOND, which load can only lengthen, so a loop that does not
+	// wait at all fails here; the upper bound is the guard against five.
+	if gap < time.Second || gap > 3*time.Second {
 		t.Fatalf("the node waited %v between rounds of two controllers, want about a second", gap)
+	}
+}
+
+// askingCompute recovers the way the node runtime does, by asking the control
+// plane which leases this node launched, so a controller that gives no answer
+// fails the recovery with the client's own error.
+type askingCompute struct {
+	*fakeCompute
+
+	c *nodeclient.Client
+}
+
+func (a *askingCompute) Recover(ctx context.Context) error {
+	if _, err := a.c.LaunchedLeaseIDs(ctx, "n1"); err != nil {
+		return fmt.Errorf("list the leases this node launched: %w", err)
+	}
+
+	return a.fakeCompute.Recover(ctx)
+}
+
+// A DRAIN THAT RECOVERS ACROSS A FAILOVER RECOVERS FROM THE OTHER CONTROLLER.
+// The process registered with A and stopped before its first recovery, and A
+// then went: the recovery a requested drain insists on registers again, which
+// passes over A to B, rather than asking A for as long as the drain lasts.
+func TestADrainRecoveringAcrossAFailoverRegistersWithTheOther(t *testing.T) {
+	t.Parallel()
+
+	a, b := newController(t), newController(t)
+
+	const launched = "/v1/nodes/n1/launched"
+
+	// A ACCEPTS THE REGISTRATION AND NEVER ANSWERS THE RECOVERY, so the process
+	// is registered with A and has never recovered; then, once gone is set,
+	// A answers nothing at all.
+	var gone atomic.Bool
+
+	a.mu.Lock()
+	a.drop = func(path string, _ int) bool { return gone.Load() || path == launched }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: a.srv.URL}, {Base: b.srv.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, &askingCompute{fakeCompute: &fakeCompute{}, c: c}, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			DrainRequested: func() bool { return true },
+		})
+	}()
+
+	waitFor(t, func() bool { return a.sent(launched) >= 2 })
+
+	// STOPPED BEFORE A GOES, so the stop is what recovers: had A gone first, the
+	// ordinary loop would have registered with B and recovered there.
+	cancel()
+	gone.Store(true)
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("the drain ended with %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("the drain was still recovering after 15s; it asked A %d times and B %d",
+			a.sent(launched), b.sent(launched))
+	}
+
+	if b.sent("/v1/register") == 0 || b.sent(launched) == 0 {
+		t.Fatalf("the drain recovered without B: B was asked to register %d times and to list leases %d",
+			b.sent("/v1/register"), b.sent(launched))
+	}
+}
+
+// A DRAIN THAT LOSES ITS CONTROLLER IS SERVED BY THE OTHER. The node is
+// draining compute that is still running, which only a destroy from the control
+// plane ends, so it keeps polling; A goes, and the drain registers with B and
+// polls there, where the destroy will come from, asking B again when its first
+// registration fails rather than going back to A.
+func TestADrainThatLosesItsControllerIsServedByTheOther(t *testing.T) {
+	t.Parallel()
+
+	a, b := newController(t), newController(t)
+
+	var gone atomic.Bool
+
+	a.mu.Lock()
+	a.drop = func(string, int) bool { return gone.Load() }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: a.srv.URL}, {Base: b.srv.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			DrainRequested: func() bool { return true },
+		})
+	}()
+
+	poll := "/v1/nodes/n1/poll"
+
+	waitFor(t, func() bool { return a.sent(poll) >= 1 })
+
+	// THE DRAIN BEGINS, and polls A while what runs here keeps running.
+	cancel()
+
+	polled := a.sent(poll)
+	waitFor(t, func() bool { return a.sent(poll) > polled })
+
+	// B TURNS THE FIRST ROUND AWAY, so the drain has a failed registration to
+	// answer: it asks again rather than going back to polling A, which would
+	// take two more unanswered polls to give up on a second time.
+	b.mu.Lock()
+	b.unavailable = func(path string, n int) bool { return path == "/v1/register" && n == 1 }
+	b.mu.Unlock()
+
+	atGone := a.sent(poll)
+	gone.Store(true)
+
+	waitFor(t, func() bool { return b.sent("/v1/register") >= 2 && b.sent(poll) >= 1 })
+
+	// THE POLL IN FLIGHT WHEN A WENT, AND THE TWO THAT FOUND IT GONE.
+	if n := a.sent(poll) - atGone; n > 3 {
+		t.Fatalf("the drain polled A %d times after it went, so a failed registration sent it back to A", n)
+	}
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the drain did not end once nothing was held")
 	}
 }
 
@@ -368,19 +614,38 @@ func TestTheLoopRetriesEverySecondWithSeveralControllers(t *testing.T) {
 func TestTheNodesDialerNoticesASilentController(t *testing.T) {
 	t.Parallel()
 
-	d := nodeclient.DialerForTest()
-
-	if !d.KeepAliveConfig.Enable {
-		t.Fatal("the node's connections are not probed, so a silent controller holds a poll for its whole window")
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: "http://control-a.example:7717"}, {Base: "http://control-b.example:7717"},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
 
-	silent := d.KeepAliveConfig.Idle + d.KeepAliveConfig.Interval*time.Duration(d.KeepAliveConfig.Count)
-	if silent <= 0 || silent > 15*time.Second {
-		t.Fatalf("a silent controller is noticed after %v, want within 15s", silent)
-	}
+	// THE DIALER EACH CONTROLLER'S TRANSPORT DIALS WITH, as the client built it.
+	for i := range c.Controllers() {
+		d := nodeclient.DialerForTest(c, i)
+		if d == nil {
+			t.Fatalf("controller %d's transport dials with no dialer of the client's", i)
+		}
 
-	if d.Timeout <= 0 || d.Timeout > 5*time.Second {
-		t.Fatalf("a dial waits %v for an address that does not answer, want a bound within 5s", d.Timeout)
+		k := d.KeepAliveConfig
+		if !k.Enable {
+			t.Fatal("the node's connections are not probed, so a silent controller holds a poll for its whole window")
+		}
+
+		// EACH VALUE SET, because zero is the system's default (15s, 15s and 9),
+		// which would read here as a bound it is not.
+		if k.Idle <= 0 || k.Interval <= 0 || k.Count <= 0 {
+			t.Fatalf("the probes are %+v; a zero is the system's default, not this bound", k)
+		}
+
+		if silent := k.Idle + k.Interval*time.Duration(k.Count); silent > 15*time.Second {
+			t.Fatalf("a silent controller is noticed after %v, want within 15s", silent)
+		}
+
+		if d.Timeout <= 0 || d.Timeout > 5*time.Second {
+			t.Fatalf("a dial waits %v for an address that does not answer, want a bound within 5s", d.Timeout)
+		}
 	}
 }
 
@@ -404,7 +669,12 @@ func (g *gate) RoundTrip(r *http.Request) (*http.Response, error) {
 	if hold {
 		close(g.held)
 
-		return <-g.release, nil
+		select {
+		case res := <-g.release:
+			return res, nil
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
 	}
 
 	if down {
@@ -446,12 +716,26 @@ func TestALateAnswerFromTheOldControllerLeavesTheNewRegistration(t *testing.T) {
 
 	late := make(chan error, 1)
 
-	go func() {
-		_, err := c.LaunchedLeaseIDs(t.Context(), "n1")
-		late <- err
-	}()
+	// ITS OWN CONTEXT, ended when the test is, so a test that fails before it
+	// releases the held request does not leave this goroutine waiting on it.
+	lateCtx, endLate := context.WithCancel(t.Context())
 
-	<-toA.held
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		_, err := c.LaunchedLeaseIDs(lateCtx, "n1")
+		late <- err
+	})
+	t.Cleanup(func() {
+		endLate()
+		wg.Wait()
+	})
+
+	select {
+	case <-toA.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request to A was never held, so there is no late answer to give")
+	}
 
 	toA.mu.Lock()
 	toA.holding, toA.down = "", true
@@ -484,5 +768,218 @@ func TestALateAnswerFromTheOldControllerLeavesTheNewRegistration(t *testing.T) {
 
 	if wire == 0 || c.WireVersion() != wire {
 		t.Fatalf("B's registration negotiated wire %d and now holds %d after A's late answer", wire, c.WireVersion())
+	}
+}
+
+// A ROUND STARTS AT THE CONTROLLER THE NODE IS REGISTERED WITH. The node is
+// registered with B, the second named, after A turned it away; asked again,
+// it asks B first, and A, which would accept now, is not asked.
+func TestARoundStartsAtTheCurrentController(t *testing.T) {
+	t.Parallel()
+
+	a, b := newController(t), newController(t)
+
+	var refusing atomic.Bool
+
+	refusing.Store(true)
+
+	a.mu.Lock()
+	a.unavailable = func(path string, _ int) bool { return refusing.Load() && path == "/v1/register" }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: a.srv.URL}, {Base: b.srv.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := c.Register(t.Context(), registration); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if got, want := c.Endpoint().String(), endpointOf(t, b.srv.URL); got != want {
+		t.Fatalf("registered with %s, want B (%s)", got, want)
+	}
+
+	refusing.Store(false)
+
+	if err := c.Register(t.Context(), registration); err != nil {
+		t.Fatalf("Register again: %v", err)
+	}
+
+	if n := a.sent("/v1/register"); n != 1 {
+		t.Fatalf("A was asked %d times; the second round started there rather than at B", n)
+	}
+
+	if got, want := c.Endpoint().String(), endpointOf(t, b.srv.URL); got != want {
+		t.Fatalf("registered with %s after the second round, want B (%s)", got, want)
+	}
+}
+
+// SUPERSESSION IS A VERDICT TOO: another process holds the name, which no other
+// controller can change, so the round stops where it is said.
+func TestASupersessionStopsTheRound(t *testing.T) {
+	t.Parallel()
+
+	superseding := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+
+		_ = json.NewEncoder(w).Encode(nodeapi.ErrorResponse{ //nolint:errcheck // the test's own server
+			Code: nodeapi.CodeSuperseded, Message: "another process is this node",
+		})
+	}))
+	t.Cleanup(superseding.Close)
+
+	b := newController(t)
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: superseding.URL}, {Base: b.srv.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := c.Register(t.Context(), registration); !errors.Is(err, nodeclient.ErrSuperseded) {
+		t.Fatalf("Register = %v, want the supersession", err)
+	}
+
+	if n := b.sent("/v1/register"); n != 0 {
+		t.Fatalf("the next controller was asked %d times after a supersession", n)
+	}
+}
+
+// THE CONTROLLERS ARE NAMED ONE WAY, AND EACH ONCE. Targets beside the
+// one-controller form, an empty list, and one controller spelled twice are
+// each refused, the last by the one representation of an endpoint, which
+// sees through spellings the configuration's own check does not.
+func TestTheControllersAreNamedOnceAndOneWay(t *testing.T) {
+	t.Parallel()
+
+	two := []nodeclient.Target{{Base: "http://control-a.example:7717"}, {Base: "http://control-b.example:7717"}}
+
+	for name, tc := range map[string]struct {
+		opts nodeclient.Options
+		want string
+	}{
+		"targets beside a base": {
+			nodeclient.Options{Node: "n1", Targets: two, Base: "http://control-a.example:7717"},
+			"both Targets and Base, TLS or HTTP",
+		},
+		"targets beside a client": {
+			nodeclient.Options{Node: "n1", Targets: two, HTTP: http.DefaultClient},
+			"both Targets and Base, TLS or HTTP",
+		},
+		"an empty list": {
+			nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{}},
+			"a control plane address is required",
+		},
+		"one controller twice": {
+			nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+				{Base: "http://control-a.example:7717"}, {Base: "http://CONTROL-A.example:7717"},
+			}},
+			"is named twice",
+		},
+	} {
+		if _, err := nodeclient.New(tc.opts); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: New = %v, want an error saying %q", name, err, tc.want)
+		}
+	}
+}
+
+// closeCounter is a transport that counts the times its idle connections were
+// closed.
+type closeCounter struct {
+	http.RoundTripper
+
+	closed atomic.Int32
+}
+
+func (c *closeCounter) CloseIdleConnections() { c.closed.Add(1) }
+
+// ONLY SILENCE IS NO ANSWER. A controller that answers with an error answered;
+// the caller's own cancellation says nothing about the controller; a
+// connection cut with nothing said is no answer, and where the node knows
+// another controller the lost one's idle connections are closed with it, so
+// the next request dials rather than borrowing one a partition left open.
+func TestOnlySilenceIsNoAnswer(t *testing.T) {
+	t.Parallel()
+
+	answering := newController(t)
+
+	answering.mu.Lock()
+	answering.unavailable = func(path string, _ int) bool { return path == "/v1/nodes/n1/launched" }
+	answering.mu.Unlock()
+
+	arrived := make(chan struct{}, 1)
+
+	hanging := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+
+		<-r.Context().Done()
+	}))
+	t.Cleanup(hanging.Close)
+
+	ask := func(t *testing.T, ctx context.Context, targets ...nodeclient.Target) error {
+		t.Helper()
+
+		c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: targets})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		_, err = c.LaunchedLeaseIDs(ctx, "n1")
+		if err == nil {
+			t.Fatal("the request succeeded; each case here is a failure")
+		}
+
+		return err
+	}
+
+	t.Run("an answered error", func(t *testing.T) {
+		err := ask(t, t.Context(), nodeclient.Target{Base: answering.srv.URL}, nodeclient.Target{Base: "http://" + deadAddress(t)})
+		if nodeclient.IsNoAnswerForTest(err) {
+			t.Fatalf("a 503 counted as no answer: %v", err)
+		}
+	})
+
+	t.Run("the caller's cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+
+		go func() {
+			<-arrived
+			cancel()
+		}()
+
+		err := ask(t, ctx, nodeclient.Target{Base: hanging.URL}, nodeclient.Target{Base: "http://" + deadAddress(t)})
+		if nodeclient.IsNoAnswerForTest(err) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("a cancelled request answered %v, want the cancellation and not no answer", err)
+		}
+	})
+
+	for name, tc := range map[string]struct {
+		others int
+		closes bool
+	}{
+		"silence, with another controller": {1, true},
+		"silence, with none":               {0, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lost := &closeCounter{RoundTripper: http.DefaultTransport}
+
+			targets := []nodeclient.Target{{Base: "http://" + deadAddress(t), HTTP: &http.Client{Transport: lost}}}
+			for range tc.others {
+				targets = append(targets, nodeclient.Target{Base: "http://" + deadAddress(t)})
+			}
+
+			if err := ask(t, t.Context(), targets...); !nodeclient.IsNoAnswerForTest(err) {
+				t.Fatalf("a cut connection answered %v, want no answer", err)
+			}
+
+			if closed := lost.closed.Load() > 0; closed != tc.closes {
+				t.Fatalf("the lost controller's idle connections closed: %v, want %v", closed, tc.closes)
+			}
+		})
 	}
 }

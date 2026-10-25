@@ -101,4 +101,14 @@ func TestANodeFollowsTheDeploymentToTheControllerServingIt(t *testing.T) {
 
 		time.Sleep(20 * time.Millisecond)
 	}
+
+	// AND POLLS IT, which is where its commands now come from: a registration
+	// alone says the node reached it once, not that the node dials it.
+	for promoted.wire.Plane().WaitersForTest(host) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the node registered with the second controller and never polled it")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
 }

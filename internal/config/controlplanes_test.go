@@ -39,9 +39,15 @@ func TestANodeNamesEveryControllerItDials(t *testing.T) {
 			withAddrs("  server_addrs: [control-b.example:7717, 10.0.0.4:7717]\n"),
 			[]string{"control-b.example:7717", "10.0.0.4:7717"},
 		},
-		"a list of one":    {withAddrs("  server_addrs: [10.0.0.4:7717]\n"), []string{"10.0.0.4:7717"}},
-		"server_addr":      {remoteNode, []string{"10.0.0.4:7717"}},
-		"the server's own": {validConfig, []string{"127.0.0.1:7717"}},
+		"a list of one": {withAddrs("  server_addrs: [10.0.0.4:7717]\n"), []string{"10.0.0.4:7717"}},
+		"server_addr":   {remoteNode, []string{"10.0.0.4:7717"}},
+		// NAMING NONE, beside a server on another port, so the answer can only
+		// have come from the server's listen address.
+		"the server's own": {
+			strings.Replace(strings.Replace(validConfig, "  server_addr: 127.0.0.1:7717\n", "", 1),
+				"listen: 127.0.0.1:7717", "listen: 127.0.0.1:7799", 1),
+			[]string{"127.0.0.1:7799"},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

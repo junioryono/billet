@@ -796,7 +796,45 @@ func stopGracefully(
 			}
 		}()
 
+		// register is a registration this drain still needs: once the control
+		// plane forgot this node or its controller stopped answering, it asks
+		// again until one accepts, and polls only then. Polling the controller it
+		// lost between two failed rounds would take two more unanswered polls to
+		// notice it again.
+		register := false
+
 		for drainCtx.Err() == nil {
+			if register {
+				if err := c.Register(drainCtx, opts.registration()); err != nil {
+					// SUPERSEDED BY THE REGISTRATION ITSELF IS STILL SUPERSESSION: the
+					// plane rejecting this registration because another process
+					// holds the name is the same fact a poll answers with, and is
+					// handled the same way, at once, rather than retried into a
+					// second refusal.
+					if errors.Is(err, ErrSuperseded) {
+						log.Warn("another process registered as this node while it was draining; " +
+							"keeping its leases renewed until what is running here finishes")
+						compute.Superseded()
+						superseded.Store(true)
+
+						return
+					}
+
+					log.Error("could not register again while draining", "error", err)
+
+					if !sleep(drainCtx, backoffFor(opts, c)) {
+						return
+					}
+
+					continue
+				}
+
+				// A DRAIN'S RE-REGISTRATION IS A REGISTRATION, and publishes.
+				recordRegistration(c, log, opts)
+
+				register = false
+			}
+
 			err := serve(drainCtx, c, compute, log, opts, true)
 			if drainCtx.Err() != nil {
 				return
@@ -819,30 +857,7 @@ func stopGracefully(
 				log.Warn("the control plane no longer knows this node, or stopped answering; registering " +
 					"again so it can still be told to destroy what is running here")
 
-				if err := c.Register(drainCtx, opts.registration()); err != nil {
-					// SUPERSEDED BY THE REGISTRATION ITSELF IS STILL SUPERSESSION: the
-					// plane rejecting this registration because another process
-					// holds the name is the same fact a poll answers with, and is
-					// handled the same way, at once, rather than retried into a
-					// second refusal.
-					if errors.Is(err, ErrSuperseded) {
-						log.Warn("another process registered as this node while it was draining; " +
-							"keeping its leases renewed until what is running here finishes")
-						compute.Superseded()
-						superseded.Store(true)
-
-						return
-					}
-
-					log.Error("could not register again while draining", "error", err)
-
-					if !sleep(drainCtx, backoffFor(opts, c)) {
-						return
-					}
-				} else {
-					// A DRAIN'S RE-REGISTRATION IS A REGISTRATION, and publishes.
-					recordRegistration(c, log, opts)
-				}
+				register = true
 
 				continue
 			}
@@ -1032,9 +1047,16 @@ func recoverBeforeDrain(
 		}()
 	}
 
+	// lost is a controller that gave no answer to the last attempt, where the
+	// node knows another: the registration it holds is with a controller that
+	// may be gone, so it registers again, which tries every controller from that
+	// one. Without it a drain recovering across a failover asks the dead one for
+	// as long as the drain lasts.
+	lost := false
+
 	for attempt := 1; recoverCtx.Err() == nil; attempt++ {
 		var err error
-		if c.WireVersion() == 0 {
+		if c.WireVersion() == 0 || lost {
 			err = c.Register(recoverCtx, registrationWithInventory(recoverCtx, compute, log, opts))
 			if err == nil {
 				recordRegistration(c, log, opts)
@@ -1047,6 +1069,8 @@ func recoverBeforeDrain(
 		if err == nil {
 			return true
 		}
+
+		lost = c.Controllers() > 1 && errors.Is(err, errNoAnswer)
 
 		if attempts > 0 && attempt >= attempts {
 			log.Error("could not learn what this host runs before stopping; stopping anyway, "+
@@ -1319,7 +1343,12 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// once, so a blink costs a retry rather than a registration; with one
 			// controller there is nowhere else to go and the poll is asked again
 			// as it always was.
-			if c.Controllers() > 1 && errors.Is(err, errNoAnswer) {
+			//
+			// IN A ROW MEANS WITH NO ANSWER BETWEEN THEM, and an error the
+			// controller answered with is an answer: a 503 from a controller whose
+			// ledger blinked says it is there.
+			switch {
+			case c.Controllers() > 1 && errors.Is(err, errNoAnswer):
 				unanswered++
 
 				if unanswered >= lostAfter {
@@ -1328,6 +1357,8 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 
 					return fmt.Errorf("%w: %w", errControlPlaneLost, err)
 				}
+			default:
+				unanswered = 0
 			}
 
 			// A POLL THAT FAILS IS ORDINARY. The control plane may be restarting or

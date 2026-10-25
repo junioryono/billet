@@ -102,6 +102,13 @@ func (o *openingSessions) Session(context.Context, int, string) (Session, error)
 // promotion it is the part of the failover GitHub owns, and the rehearsal
 // reads it from this line.
 func TestAnOpenedSessionIsSaidWithItsWait(t *testing.T) {
+	// TEN SECONDS IN PRODUCTION: GitHub expires a held session 60 to 92 s
+	// after its holder went, and every second of the pace is time after that
+	// with no session, at about nine calls a tier a failover.
+	if sessionRetryFor != 10*time.Second {
+		t.Fatalf("a held session is asked for again every %v, want 10s", sessionRetryFor)
+	}
+
 	original := sessionRetryFor
 	sessionRetryFor = time.Millisecond
 
@@ -135,6 +142,11 @@ func TestAnOpenedSessionIsSaidWithItsWait(t *testing.T) {
 
 	if opened[0]["tier"] != "linux" || opened[0]["attempts"] != float64(3) {
 		t.Fatalf("the opening says %v, want tier linux after 3 attempts", opened[0])
+	}
+
+	// AND HOW LONG IT WAITED, which is GitHub's segment of a failover.
+	if waited, ok := opened[0]["waited"].(float64); !ok || waited <= 0 {
+		t.Fatalf("the opening does not say how long it waited: %v", opened[0])
 	}
 }
 
