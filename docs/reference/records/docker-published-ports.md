@@ -37,10 +37,10 @@ The same services, reached by every name a job uses, under each setting. "ok" is
 
 "Failed" is a client that reported only that it could not connect; "refused" is one that said the connection was refused.
 
-Three separate facts explain the matrix:
-- **Resolution:** `localhost` resolved to `::1` first for every client that reported its peer: with the proxy, Python, Go and Node all connected through `::1`.
-- **Who answers on `::1`:** with the proxy, Docker also listens on the IPv6 loopback and forwards those connections to the container's IPv4 address. Without it, this guest's bridge is IPv4 only, and the port is published by an IPv4 rule alone, so nothing answers on `::1`. A bridge with IPv6 enabled would publish differently, and was not tested.
-- **What a client does next:** when `::1` refused, every client tested tried `127.0.0.1` next, except Node 18 in its default configuration, which tried `::1` alone and failed. Node 18 can be told to try both families; a workflow that never asked for that cannot be assumed to have.
+What was observed, and the explanation that fits it:
+- **Observed:** with the proxy, every client that reports the peer it reached (Python, Go and Node) reached `localhost` through `::1`. Without the proxy, the same clients reached it through `127.0.0.1`, except Node 18, which reported `ECONNREFUSED`. curl and psql report no peer, only that they connected. Nothing answered on `[::1]` without the proxy.
+- **The explanation, inferred rather than traced:** with the proxy, Docker also listens on the IPv6 loopback and forwards those connections to the container's IPv4 address. Without it, this guest's bridge is IPv4 only and the port is published by an IPv4 rule alone, so nothing answers on `::1`. The clients that still connected by `localhost` would then have moved on to `127.0.0.1` after `::1` was refused. Node 18 in its default configuration tries one address only. It can be told to try both families, but a workflow that never asked for that cannot be assumed to have.
+- **Not traced:** the probe recorded the final peer or error, not each connection attempt. A bridge with IPv6 enabled would publish differently, and was not tested.
 
 ## The decision
 
