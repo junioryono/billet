@@ -355,30 +355,19 @@ func (a *Allocator) RuntimePriors(ctx context.Context) (*RuntimePriors, error) {
 			return current, nil
 		}
 
-		done := make(chan struct{})
-		b.building = done
-
 		read := b.read
 		if read == nil {
 			read = a.learnRuntimesAt
 		}
+
+		b.building = make(chan struct{})
 		b.mu.Unlock()
 
-		built, err := read(ctx, now)
-
-		b.mu.Lock()
-		switch {
-		case err == nil:
-			b.snapshot.Store(built)
-			b.failedAt = time.Time{}
-		case ctx.Err() == nil:
-			b.failedAt = now
-		}
-		b.building = nil
-		close(done)
-		b.mu.Unlock()
+		built, again, err := a.rebuildRuntimes(ctx, read, now)
 
 		switch {
+		case again:
+			continue
 		case err == nil:
 			return built, nil
 		case current != nil:
@@ -387,6 +376,53 @@ func (a *Allocator) RuntimePriors(ctx context.Context) (*RuntimePriors, error) {
 			return nil, err
 		}
 	}
+}
+
+// rebuildRuntimes runs the rebuild as of asOf that the caller marked in flight
+// and ends it, under b.mu: the snapshot stored or the failure recorded, then
+// the mark cleared and its waiters woken, on every path, a read that panics
+// included, so no later caller waits on a rebuild that is not running.
+//
+// again is true when the clock moved back before asOf while the read ran: the
+// result may hold history not yet known at the clock's now, so it is dropped
+// and the caller starts over. A failure is dated when the read ended, so the
+// retry is runtimeRetry from then, however long the read took; and it is not
+// recorded when the caller's own context ending is what the read failed of.
+func (a *Allocator) rebuildRuntimes(ctx context.Context,
+	read func(context.Context, time.Time) (*RuntimePriors, error), asOf time.Time,
+) (built *RuntimePriors, again bool, err error) {
+	b := &a.runtimes
+
+	defer func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
+		close(b.building)
+		b.building = nil
+	}()
+
+	built, err = read(ctx, asOf)
+	if err == nil && built == nil {
+		err = errors.New("alloc: a rebuild of the learned runtimes returned no snapshot")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	ended := a.now()
+
+	switch {
+	case err == nil && ended.Before(built.AsOf):
+		return nil, true, nil
+	case err == nil:
+		b.snapshot.Store(built)
+		b.failedAt = time.Time{}
+	case ctx.Err() != nil && errors.Is(err, ctx.Err()):
+	default:
+		b.failedAt = ended
+	}
+
+	return built, false, err
 }
 
 // freshAt reports whether a snapshot may still answer at now. A clock that
@@ -503,10 +539,11 @@ type LeasePrediction struct {
 // PredictLease predicts when one lease's job ends, from what this allocator
 // has learned. A lease whose job has not started is predicted from now, a
 // lease with no job recorded yet (bought, not yet assigned) from its tier, and
-// a lease whose job has finished ends when it did. A refresh that failed is
-// returned beside a prediction from what there is: the older snapshot
-// (ErrRuntimesStale), or with no snapshot at all, the default, since a
-// prediction is an optimisation and the caller decides what an error means.
+// a lease that has ended (its job finished, or it was archived before one
+// started) ended when it did. A refresh that failed is returned beside a
+// prediction from what there is: the older snapshot (ErrRuntimesStale), or
+// with no snapshot at all, the default, since a prediction is an optimisation
+// and the caller decides what an error means.
 func (a *Allocator) PredictLease(ctx context.Context, leaseID string) (LeasePrediction, error) {
 	priors, refreshErr := a.RuntimePriors(ctx)
 
@@ -535,7 +572,7 @@ func (a *Allocator) PredictLease(ctx context.Context, leaseID string) (LeasePred
 	out := LeasePrediction{Started: !started.IsZero(), RuntimeEstimate: est}
 
 	switch {
-	case !started.IsZero() && !finished.IsZero():
+	case !finished.IsZero():
 		out.End = finished
 	case started.IsZero():
 		out.End, out.Overdue = PredictEnd(est, now, now)

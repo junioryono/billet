@@ -704,3 +704,145 @@ func TestTheBacktestGradesEachJobAgainstWhatWasKnownBeforeIt(t *testing.T) {
 			from.Add(-RuntimeWindow))
 	}
 }
+
+// A REBUILD ENDS ON EVERY PATH: a read that panics leaves no rebuild marked in
+// flight, a read that returns nothing is a failure and keeps the snapshot, a
+// failure is dated when the read ended, a ledger failure is recorded even when
+// the caller's context ended after it, and a snapshot from before the clock
+// moved back is dropped and the rebuild started over.
+func TestARebuildEndsOnEveryPath(t *testing.T) {
+	start := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
+	now := start
+	a := runtimeFleet(t, &now)
+
+	var reads int
+
+	behave := func(context.Context, time.Time) (*RuntimePriors, error) { return nil, nil }
+
+	a.runtimes.read = func(ctx context.Context, asOf time.Time) (*RuntimePriors, error) {
+		reads++
+
+		return behave(ctx, asOf)
+	}
+
+	learn := func(ctx context.Context, asOf time.Time) (*RuntimePriors, error) {
+		return a.learnRuntimesAt(ctx, asOf)
+	}
+
+	// A PANIC: recovered by its caller, and the next caller is not left waiting.
+	behave = func(context.Context, time.Time) (*RuntimePriors, error) { panic("the read panicked") }
+
+	func() {
+		defer func() { _ = recover() }()
+
+		_, _ = a.RuntimePriors(t.Context())
+	}()
+
+	behave = learn
+
+	bounded, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	first, err := a.RuntimePriors(bounded)
+	if err != nil || first == nil {
+		t.Fatalf("after a read that panicked, the next caller got %p, %v; want a rebuild", first, err)
+	}
+
+	// NOTHING RETURNED is a failure, and the snapshot is kept.
+	now = now.Add(2 * RuntimeRefresh)
+	behave = func(context.Context, time.Time) (*RuntimePriors, error) { return nil, nil }
+
+	if kept, err := a.RuntimePriors(t.Context()); kept != first || !errors.Is(err, ErrRuntimesStale) {
+		t.Errorf("a read that returned nothing gave %p, %v; want the last snapshot and ErrRuntimesStale", kept,
+			err)
+	}
+
+	// A FAILURE IS DATED WHEN THE READ ENDED: a read that took six minutes and
+	// failed holds the next rebuild off for five minutes from its end.
+	now = now.Add(2 * RuntimeRefresh)
+	behave = func(context.Context, time.Time) (*RuntimePriors, error) {
+		now = now.Add(6 * time.Minute)
+
+		return nil, errors.New("the ledger could not be read")
+	}
+
+	if _, err := a.RuntimePriors(t.Context()); !errors.Is(err, ErrRuntimesStale) {
+		t.Fatalf("a slow failed read gave %v; want ErrRuntimesStale", err)
+	}
+
+	before := reads
+	now = now.Add(runtimeRetry - time.Second)
+	if _, err := a.RuntimePriors(t.Context()); err != nil || reads != before {
+		t.Errorf("inside the retry from the read's end: %v after %d reads; want no read", err, reads-before)
+	}
+
+	// A LEDGER FAILURE IS RECORDED even when the caller's context ended after
+	// it failed: it is not what the read failed of.
+	now = now.Add(2 * RuntimeRefresh)
+	gone, end := context.WithCancel(t.Context())
+	behave = func(context.Context, time.Time) (*RuntimePriors, error) {
+		end()
+
+		return nil, errors.New("the ledger could not be read")
+	}
+
+	if _, err := a.RuntimePriors(gone); !errors.Is(err, ErrRuntimesStale) {
+		t.Fatalf("a ledger failure then an ended context gave %v; want ErrRuntimesStale", err)
+	}
+
+	before = reads
+	if _, err := a.RuntimePriors(t.Context()); err != nil || reads != before {
+		t.Errorf("after a ledger failure whose caller then left: %v after %d reads; want the retry held off",
+			err, reads-before)
+	}
+
+	// A CLOCK MOVED BACK DURING THE READ: the snapshot as of the later instant
+	// is dropped, and the rebuild runs again as of the clock's now.
+	now = now.Add(2 * RuntimeRefresh)
+	movedBack := false
+	behave = func(ctx context.Context, asOf time.Time) (*RuntimePriors, error) {
+		if !movedBack {
+			movedBack = true
+			now = asOf.Add(-time.Hour)
+		}
+
+		return learn(ctx, asOf)
+	}
+
+	before = reads
+	got, err := a.RuntimePriors(t.Context())
+	if err != nil || got == nil || !got.AsOf.Equal(now) || reads != before+2 {
+		t.Errorf("a clock moved back during the read gave %v, %v after %d reads; want a second rebuild as of %s",
+			got, err, reads-before, now)
+	}
+}
+
+// A LEASE ARCHIVED BEFORE ITS JOB STARTED HAS ENDED: its room came back when it
+// was archived, and it is never predicted to hold it on.
+func TestALeaseArchivedBeforeItStartedHasEnded(t *testing.T) {
+	now := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
+	a := runtimeFleet(t, &now)
+
+	lease, err := a.Reserve(t.Context(), "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, 1); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	archived := now.Add(time.Minute)
+	now = archived
+	if err := a.ReleaseFailed(t.Context(), lease.ID, lease.Epoch, "the launch failed"); err != nil {
+		t.Fatalf("ReleaseFailed: %v", err)
+	}
+
+	now = archived.Add(time.Hour)
+	got, err := a.PredictLease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("PredictLease: %v", err)
+	}
+	if !got.End.Equal(archived) || got.Started || got.Overdue {
+		t.Errorf("a lease archived before it started predicted %+v; want it ended at %s", got, archived)
+	}
+}

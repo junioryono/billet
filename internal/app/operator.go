@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"syscall"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -86,32 +87,40 @@ func openAllocator(ctx context.Context, cfgPath string, mode LedgerMode,
 var reportEUID = os.Geteuid
 
 // reportRunsAsOwner refuses a report on a SQLite ledger from any account but
-// the identity directory's owner (OpenReport). A directory that does not
-// exist is left for the open to refuse with its own diagnostic, and an owner
-// that cannot be read refuses, since could-not-tell is not the owner.
+// the owner of the directory the ledger's sidecars would be created in
+// (OpenReport). A directory that does not exist is left for the open to refuse
+// with its own diagnostic, and an owner that cannot be read refuses, since
+// could-not-tell is not the owner.
+//
+// THE DIRECTORY THE LEDGER IS OPENED IN, NOT THE ONE THE CONFIG SPELLS: the
+// ledger's path is joined, which cleans a `..` out of it, and a link is
+// followed when it is opened, so the check stats the ledger path's directory
+// and follows a link, as the open will.
 func reportRunsAsOwner(cfg *config.Config) error {
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
 		return nil
 	}
 
-	info, err := os.Lstat(cfg.Server.IdentityDir)
+	dir := filepath.Dir(cfg.Server.LedgerPath())
+
+	info, err := os.Stat(dir)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil
 	case err != nil:
-		return fmt.Errorf("read who owns %s: %w", cfg.Server.IdentityDir, err)
+		return fmt.Errorf("read who owns %s: %w", dir, err)
 	}
 
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fmt.Errorf("%s carries no owner this platform reports, so this report cannot tell whether "+
-			"reading it would leave files its owner cannot write", cfg.Server.IdentityDir)
+			"reading it would leave files its owner cannot write", dir)
 	}
 
 	if euid := reportEUID(); int(st.Uid) != euid {
 		return fmt.Errorf("%s is owned by uid %d and this process runs as uid %d; a report on a SQLite "+
 			"ledger leaves files owned by whoever read it, so run it as the ledger's owner (for example "+
-			"sudo -u billet)", cfg.Server.IdentityDir, st.Uid, euid)
+			"sudo -u billet)", dir, st.Uid, euid)
 	}
 
 	return nil

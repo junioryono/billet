@@ -40,6 +40,16 @@ func TestAReportOnASQLiteLedgerRunsOnlyAsItsOwner(t *testing.T) {
 		}
 	}
 
+	// JUDGED WHERE THE LEDGER IS OPENED: the path as spelled names a directory
+	// that does not exist, and the ledger's joined path cleans it to one that
+	// does, which another account owns.
+	reportEUID = func() int { return owner + 1 }
+	spelled := &config.Config{Server: &config.ServerConfig{IdentityDir: filepath.Join(dir, "absent") + "/.."}}
+	if err := reportRunsAsOwner(spelled); err == nil || !strings.Contains(err.Error(), "run it as the ledger's owner") {
+		t.Errorf("a path whose ledger is in another account's directory gave %v; want it refused", err)
+	}
+	reportEUID = os.Geteuid
+
 	postgres := &config.Config{Server: &config.ServerConfig{IdentityDir: dir,
 		State: &config.StateConfig{Backend: config.StatePostgres}}}
 	if err := reportRunsAsOwner(postgres); err != nil {
