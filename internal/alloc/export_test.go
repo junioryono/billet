@@ -1,8 +1,10 @@
 package alloc
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A STAND-IN IS STABLE AND NAMES NOTHING: one name is one stand-in wherever it
@@ -93,6 +95,12 @@ func TestAnExportsStandInsAreStableAndNameNothing(t *testing.T) {
 	if id := kept.run(0); id != 0 {
 		t.Errorf("with names kept an unrecorded run became %d, want 0", id)
 	}
+	if id := kept.run(-3); id != 0 {
+		t.Errorf("with names kept a run id of -3 became %d, want 0", id)
+	}
+	if a, b := fresh.run(0), fresh.run(0); a == b {
+		t.Errorf("two unrecorded runs share stand-in %d; want each its own", a)
+	}
 
 	if _, r, w, _ := kept.of("", "", ""); r != unrecorded || !strings.Contains(w, unrecorded) {
 		t.Errorf("a row with nothing recorded became repository %q, workflow %q; want the %q stand-in", r, w,
@@ -112,5 +120,27 @@ func TestAnExportsTimesAreReadStrictly(t *testing.T) {
 
 	if _, err := strictStamp("yesterday"); err == nil || !strings.Contains(err.Error(), `"yesterday"`) {
 		t.Errorf("an unreadable time gave %v; want an error naming it", err)
+	}
+}
+
+// A TIME THE LEDGER HOLDS THAT DOES NOT READ FAILS THE EXPORT, naming the lease
+// and the column, never a job dropped or a time read as not recorded.
+func TestAnExportRefusesATimeItCannotRead(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	a := runtimeFleet(t, &now)
+	lease := ranJob(t, a, &now, "acme/api", "build", now.Add(time.Minute), 3*time.Minute)
+
+	ctx := t.Context()
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE job_history SET started_at = 'yesterday' WHERE lease_id = $1`, lease)
+
+		return err
+	}); err != nil {
+		t.Fatalf("write an unreadable start: %v", err)
+	}
+
+	_, _, err := a.ExportTrace(ctx, now.Add(-time.Hour), now.Add(time.Hour), false)
+	if err == nil || !strings.Contains(err.Error(), lease) || !strings.Contains(err.Error(), "started_at") {
+		t.Errorf("an unreadable start gave %v; want an error naming lease %s and started_at", err, lease)
 	}
 }

@@ -18,19 +18,14 @@ type UtilizationPoint struct {
 }
 
 // span is the interval a report's figures over time cover: from the first
-// charge to the last end, or to the horizon when the replay had one, unless a
-// comparison set one for every policy (shareSpan). A charge the ledger never
-// ended runs to the span's end.
+// charge to the last end, or to the horizon when the replay had one. A charge
+// the ledger never ended runs to the span's end.
+//
+// EACH REPLAY IS MEASURED OVER ITS OWN SPAN, and a comparison prints it beside
+// the figures (SpanHours). Two policies replay the same jobs, so over one
+// shared span they would charge the same share by construction, and the
+// policy that finished sooner would be counted empty while the other drained.
 func (r *Report) span() (time.Time, time.Time, bool) {
-	if r.spanTo.After(r.spanFrom) && !r.spanFrom.IsZero() {
-		return r.spanFrom, r.spanTo, true
-	}
-
-	return r.ownSpan()
-}
-
-// ownSpan is the span the report's own charges and horizon give.
-func (r *Report) ownSpan() (time.Time, time.Time, bool) {
 	var from, to time.Time
 
 	for _, c := range r.charges() {
@@ -86,9 +81,7 @@ func (r *Report) steps(from, to time.Time) []loadStep {
 		node   string
 	}
 
-	// A step of nothing at the span's start, so a span set before the first
-	// charge counts its empty hosts too.
-	changes := []change{{at: from}}
+	var changes []change
 
 	for _, c := range r.charges() {
 		changes = append(changes, change{c.from, c.vcpu, int64(c.memory), c.node})
@@ -156,6 +149,16 @@ func cloneLoad(m map[string]int) map[string]int {
 	}
 
 	return out
+}
+
+// SpanHours is the length of the span the figures over time cover, in hours.
+func (r *Report) SpanHours() float64 {
+	from, to, ok := r.span()
+	if !ok {
+		return 0
+	}
+
+	return to.Sub(from).Hours()
 }
 
 // Utilization is the time-weighted share of the fleet's room the ledger

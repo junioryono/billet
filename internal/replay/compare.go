@@ -61,36 +61,7 @@ func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Opt
 		c.Reports = append(c.Reports, r)
 	}
 
-	c.shareSpan()
-
 	return c
-}
-
-// shareSpan measures every report's figures over time across one interval:
-// from the earliest first charge to the latest end of any of them. A policy
-// that drains later would otherwise be averaged over more hours than one
-// that drains sooner, and its empty hosts counted over a longer time.
-func (c Comparison) shareSpan() {
-	var from, to time.Time
-
-	for _, r := range c.Reports {
-		f, t, ok := r.ownSpan()
-		if !ok {
-			continue
-		}
-
-		if from.IsZero() || f.Before(from) {
-			from = f
-		}
-
-		if t.After(to) {
-			to = t
-		}
-	}
-
-	for _, r := range c.Reports {
-		r.spanFrom, r.spanTo = from, to
-	}
 }
 
 // unspeakable says why the report cannot speak for its replay, or "" when it
@@ -159,8 +130,8 @@ func (c Comparison) Markdown() string {
 	}
 
 	b.WriteString("\n| Policy | Started | Still queued | Jobs refused at least once | vCPU charged | " +
-		"Memory charged | Empty host-hours |\n")
-	b.WriteString("|---|---|---|---|---|---|---|\n")
+		"Memory charged | Empty host-hours | Over (hours) |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|\n")
 
 	for i, r := range c.Reports {
 		started := 0
@@ -176,16 +147,12 @@ func (c Comparison) Markdown() string {
 		}
 
 		vcpu, memory := r.MeanUtilization()
-		fmt.Fprintf(&b, "| %s | %d | %d | %d | %.0f%% | %.0f%% | %.1f |\n", c.Policies[i].Name, started,
-			len(r.StillQueued), declined, 100*vcpu, 100*memory, r.EmptyHostHours())
+		fmt.Fprintf(&b, "| %s | %d | %d | %d | %.0f%% | %.0f%% | %.1f | %.1f |\n", c.Policies[i].Name, started,
+			len(r.StillQueued), declined, 100*vcpu, 100*memory, r.EmptyHostHours(), r.SpanHours())
 	}
 
-	if len(c.Reports) > 0 {
-		if from, to, ok := c.Reports[0].span(); ok {
-			fmt.Fprintf(&b, "\nThe charged shares and the empty host-hours are over the same %.1f hours for every "+
-				"policy.\n", to.Sub(from).Hours())
-		}
-	}
+	b.WriteString("\nThe charged shares and the empty host-hours are over each policy's own span, from its first " +
+		"charge to its last end (or the horizon): the same jobs over a longer span charge a smaller share.\n")
 
 	return b.String()
 }

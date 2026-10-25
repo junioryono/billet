@@ -49,7 +49,7 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 		t.Fatalf("alloc.New: %v", err)
 	}
 	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
-		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB,
+		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB, Site: "home",
 	}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
@@ -110,6 +110,17 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 			}
 		}
 
+		if j.neverStarted {
+			now = j.start.Add(j.runtime)
+			if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+				t.Fatalf("Release a job that never started: %v", err)
+			}
+
+			leases = append(leases, lease.ID)
+
+			continue
+		}
+
 		now = j.start
 		for _, phase := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
 			if err := a.Advance(t.Context(), lease.ID, lease.Epoch, phase); err != nil {
@@ -153,8 +164,9 @@ type ranHistoryJob struct {
 	// noResult archives the lease with no completion from GitHub, as a job
 	// cancelled or lost is; escrowOnly buys a lease and archives it unused;
 	// poolSlot assigns it as a direct-assignment pool slot no job reached;
-	// noIdentity runs a pool slot's job whose identity was never written.
-	noResult, escrowOnly, poolSlot, noIdentity bool
+	// noIdentity runs a pool slot's job whose identity was never written;
+	// neverStarted assigns and names a job and archives it before it was busy.
+	noResult, escrowOnly, poolSlot, noIdentity, neverStarted bool
 }
 
 // runtimeHistory is three 6m runs of a job three days ago, one 3m job of

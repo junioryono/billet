@@ -208,7 +208,7 @@ func TestAHorizonCountsTheJobsStillQueued(t *testing.T) {
 	// Two 16 vCPU hosts hold eight to sixteen of these jobs at a time, each
 	// about ten minutes long, so five minutes in the first of them are running
 	// and the rest wait.
-	if len(report.StillQueued) == 0 || report.LongestQueued <= 0 {
+	if len(report.StillQueued) == 0 || report.LongestQueued <= 0 || len(report.Records) == len(report.Unstarted) {
 		t.Fatalf("no job is still queued at the horizon (%d started); the backlog cannot have drained",
 			len(report.Records)-len(report.Unstarted))
 	}
@@ -388,6 +388,7 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 			{Label: "billet-macos", VCPU: 6, Memory: 24 * config.GiB, Node: "macos-01"},
 		},
 		MaxVCPU: 192, MaxMemory: 544 * config.GiB, AdmissionOrder: config.AdmissionFill,
+		Placement: config.PlacementSpread,
 	}
 
 	f, dropped, err := FleetFromDocument(doc)
@@ -401,6 +402,7 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 		Tiers: []TierShape{{Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB},
 			{Label: "billet-macos", VCPU: 6, Memory: 24 * config.GiB, Node: "macos-01"}},
 		MaxVCPU: 192, MaxMemory: 544 * config.GiB, AdmissionOrder: config.AdmissionFill,
+		Placement: config.PlacementSpread,
 	}
 	if !reflect.DeepEqual(f, want) {
 		t.Errorf("the fleet is\n%+v\nwant\n%+v", f, want)
@@ -420,6 +422,22 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 		Node: "cloud"})
 	if _, _, err := FleetFromDocument(doc); err == nil || !strings.Contains(err.Error(), `tier "billet-cloud"`) {
 		t.Errorf("a tier pinned to the EC2 host gave %v; want it refused by name", err)
+	}
+
+	// A FLEET OF REMOTE HOSTS ALONE IS NOTHING TO REPLAY ON.
+	remote := jobtrace.Fleet{Hosts: []jobtrace.Host{{Name: "cloud", VCPU: 64, Memory: 256 * config.GiB,
+		Provider: config.ProviderEC2}}, Tiers: []jobtrace.Tier{{Label: "billet-8vcpu", VCPU: 8,
+		Memory: 32 * config.GiB}}, MaxVCPU: 64, MaxMemory: 256 * config.GiB}
+	if _, _, err := FleetFromDocument(remote); err == nil || !strings.Contains(err.Error(), "every host") {
+		t.Errorf("a fleet of one EC2 host gave %v; want it refused", err)
+	}
+
+	// THE DOCUMENT IS VALIDATED FIRST: a tier with no shape is refused.
+	shapeless := remote
+	shapeless.Hosts = doc.Hosts[:1]
+	shapeless.Tiers = []jobtrace.Tier{{Label: "billet-none"}}
+	if _, _, err := FleetFromDocument(shapeless); err == nil || !strings.Contains(err.Error(), "billet-none") {
+		t.Errorf("a tier with no shape gave %v; want it refused by name", err)
 	}
 }
 

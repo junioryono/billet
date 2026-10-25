@@ -239,8 +239,29 @@ func TestTheAdversarialGeneratorsHaveTheirShapes(t *testing.T) {
 		t.Errorf("QuietBesideSaturated put %v on its tiers; want 180 busy and 20 quiet", counts)
 	}
 
-	if load := busyAsked / (16 * busyLast.Sub(quiet.Arrivals[0].At).Seconds()); load < 1.2 {
+	if load := busyAsked / (16 * busyLast.Sub(quiet.Arrivals[0].At).Seconds()); load < 1.2 || load > 2 {
 		t.Errorf("the busy tier offers a load of %.2f of the room; want it saturated, about 1.5", load)
+	}
+
+	// THE ROOM IS THE CEILING when it is below the hosts': the busy tier offers
+	// about 1.5 of eight vCPU, not of sixteen.
+	cappedSmall := small
+	cappedSmall.MaxVCPU, cappedSmall.MaxMemory = 8, 32*config.GiB
+
+	var cappedAsked float64
+
+	var cappedLast time.Time
+
+	cappedTrace := QuietBesideSaturated(1, QuietParams{Params: Params{Jobs: 200}, Fleet: cappedSmall})
+	for _, a := range cappedTrace.Arrivals {
+		if a.Tier == "busy" {
+			cappedAsked += 2 * time.Duration(a.Duration).Seconds()
+			cappedLast = a.At
+		}
+	}
+
+	if load := cappedAsked / (8 * cappedLast.Sub(cappedTrace.Arrivals[0].At).Seconds()); load < 1.2 || load > 2 {
+		t.Errorf("under an 8 vCPU ceiling the busy tier offers a load of %.2f of it; want about 1.5", load)
 	}
 
 	// THE WIDE MIX OFFERS ABOUT ITS LOAD: the vCPU-time its jobs ask for over
@@ -269,6 +290,22 @@ func TestTheAdversarialGeneratorsHaveTheirShapes(t *testing.T) {
 
 	if share := float64(widest) / 2000; share < 0.03 || share > 0.07 {
 		t.Errorf("WideShapeMix made %.3f of its jobs whole-host; want about 0.05", share)
+	}
+
+	// THE ROOM IS THE CEILING when it is below the hosts': half of it offers the
+	// same load to half the room, so the jobs arrive about half as fast.
+	capped := WideFleet()
+	capped.MaxVCPU, capped.MaxMemory = 64, 256*config.GiB
+	slow := WideShapeMix(1, WideParams{Params: Params{Jobs: 2000}, Fleet: capped})
+
+	slowAsked := 0.0
+	for _, a := range slow.Arrivals {
+		slowAsked += float64(vcpuOf[a.Tier]) * time.Duration(a.Duration).Seconds()
+	}
+
+	slowSpan := slow.Arrivals[len(slow.Arrivals)-1].At.Sub(slow.Arrivals[0].At).Seconds()
+	if load := slowAsked / (64 * slowSpan); load < 0.7 || load > 1.0 {
+		t.Errorf("WideShapeMix under a 64 vCPU ceiling offers a load of %.2f of it; want about 0.85", load)
 	}
 
 	// A FLEET OF ONE TIER IS ALL WIDE.

@@ -32,6 +32,13 @@ func TestTheTailPercentilesAreNearestRank(t *testing.T) {
 		}
 	}
 
+	// 0.07 x 100 is 7.000000000000001 in float64, so a ceiling in floats takes
+	// the eighth of a hundred where the nearest rank is the seventh.
+	hundred := sorted[:100]
+	if got := percentile(hundred, 700); got != 7*time.Second {
+		t.Errorf("percentile(700) of 100 = %s, want the seventh, 7s", got)
+	}
+
 	if got := percentile([]time.Duration{time.Minute}, 5000); got != time.Minute {
 		t.Errorf("the median of one wait is %s, want it", got)
 	}
@@ -175,36 +182,24 @@ func TestAComparisonRefusesAnUnspeakableReport(t *testing.T) {
 	}
 }
 
-// A COMPARISON MEASURES EVERY POLICY OVER ONE SPAN: a policy that drains later
-// is not averaged over more hours, and a host empty while another policy still
-// ran counts as empty.
-func TestAComparisonMeasuresEveryPolicyOverOneSpan(t *testing.T) {
+// A COMPARISON MEASURES EACH POLICY OVER ITS OWN SPAN, AND SAYS WHICH: the
+// same share of the room over a longer span is printed with that span.
+func TestAComparisonPrintsEachPolicysSpan(t *testing.T) {
 	t.Parallel()
 
 	start := DefaultStart
 	fleet := Fleet{Hosts: []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}}, MaxVCPU: 8,
 		MaxMemory: 32 * config.GiB}
 
-	// 4 of 8 vCPU: the first for one hour from the start, the second for two
-	// from an hour in.
+	// 4 of 8 vCPU and 8 of 32 GiB: one policy for an hour, the other for two.
 	soon := &Report{Fleet: fleet, Records: []Record{chargeAt(start, start.Add(time.Hour))}}
-	late := &Report{Fleet: fleet, Records: []Record{chargeAt(start.Add(time.Hour), start.Add(3*time.Hour))}}
+	late := &Report{Fleet: fleet, Records: []Record{chargeAt(start, start.Add(2*time.Hour))}}
 
-	Comparison{Reports: []*Report{soon, late}}.shareSpan()
+	table := Comparison{Policies: []Policy{{Name: "soon"}, {Name: "late"}}, Reports: []*Report{soon, late}}.Markdown()
 
-	for _, c := range []struct {
-		name        string
-		r           *Report
-		mean, empty float64
-	}{
-		{"soon", soon, 4.0 / 24, 2},
-		{"late", late, 8.0 / 24, 1},
-	} {
-		vcpu, _ := c.r.MeanUtilization()
-		if math.Abs(vcpu-c.mean) > 1e-9 || math.Abs(c.r.EmptyHostHours()-c.empty) > 1e-9 {
-			t.Errorf("%s: %.4f vCPU charged and %.2f empty host-hours over the shared three hours; want %.4f and "+
-				"%.0f", c.name, vcpu, c.r.EmptyHostHours(), c.mean, c.empty)
-		}
+	if !strings.Contains(table, "| soon | 0 | 0 | 0 | 50% | 25% | 0.0 | 1.0 |") ||
+		!strings.Contains(table, "| late | 0 | 0 | 0 | 50% | 25% | 0.0 | 2.0 |") {
+		t.Errorf("the table is\n%s\nwant each policy's figures over its own span, one hour and two", table)
 	}
 }
 
@@ -259,5 +254,49 @@ func TestADeliveredStartTheLedgerNeverSawIsLost(t *testing.T) {
 		t.Errorf("lost starts %v, still queued %v (%v by shape, the oldest %s), missing %v; want job 1 lost, 2 "+
 			"and 3 queued for an hour and 4 missing", r.LostStarts, r.StillQueued, r.QueuedByShape(),
 			r.LongestQueued, r.Missing)
+	}
+}
+
+// THE SUMMARY SAYS WHAT WAS LOST, WHAT THE HORIZON LEFT QUEUED, WHAT WAS
+// REFUSED AND WHAT WAS CHARGED, and the utilization CSV is the same figures by
+// bucket.
+func TestTheSummaryAndTheUtilizationSayWhatTheReportHolds(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+	horizon := start.Add(time.Hour)
+	r := &Report{
+		Fleet: Fleet{Hosts: []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}}, MaxVCPU: 8,
+			MaxMemory: 32 * config.GiB},
+		Horizon: horizon, StillQueued: []int64{5}, LongestQueued: 10 * time.Minute, LaterArrivals: 2,
+		LostStarts: []int64{7}, Declined: map[string]int{"billet-4vcpu": 3},
+		Records: []Record{{Seq: 1, Tier: "billet-4vcpu", Node: "only", VCPU: 4, Memory: 8 * config.GiB,
+			Arrival: start, ChargedFrom: start, StartedAt: start.Add(time.Minute), QueueWait: Duration(time.Minute),
+			FinishedAt: horizon}},
+	}
+
+	summary := r.Summary()
+	for _, want := range []string{
+		"LOST: the scripted GitHub delivered the start of [7] and the completion of []",
+		"horizon " + horizon.Format(time.RFC3339) + ": 1 jobs still queued, recorded or held by the scripted " +
+			"GitHub (the oldest for 10m0s), kept out of every percentile; 2 arrive after it",
+		"tier billet-4vcpu: 1 jobs, queue wait",
+		"; 3 jobs refused at least once",
+		"shape 4 vCPU: 1 jobs, queue wait",
+		"utilization (charged, escrow included): 50% of the room's vCPU, 25% of its memory; 0.0 host-hours empty",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("the summary lacks %q:\n%s", want, summary)
+		}
+	}
+
+	var csv strings.Builder
+	if err := r.WriteUtilization(&csv, 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	row := start.Format(time.RFC3339) + ",0.5000,0.2500\n"
+	if want := "from,vcpu,memory\n" + row + start.Add(30*time.Minute).Format(time.RFC3339) + ",0.5000,0.2500\n"; csv.String() != want {
+		t.Errorf("the utilization CSV is\n%s\nwant\n%s", csv.String(), want)
 	}
 }

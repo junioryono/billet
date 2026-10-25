@@ -131,10 +131,6 @@ type Report struct {
 	// startsSent and completionsSent count the jobs whose start and whose
 	// completion the scripted GitHub delivered.
 	startsSent, completionsSent int
-	// spanFrom and spanTo, when set, are the interval the figures over time
-	// cover in place of the report's own span: Compare sets one for every
-	// policy, so a policy that drains later is not measured over more time.
-	spanFrom, spanTo time.Time
 	// queued are the arrivals of the jobs still queued, by Seq.
 	queued map[int64]Arrival
 	// ByJobID counts the jobs found by their GitHub job id because billet
@@ -897,8 +893,8 @@ func (r *Report) Summary() string {
 	byTier := r.QueueWaitBy(func(rec *Record) string { return rec.Tier })
 	for _, tier := range slices.Sorted(maps.Keys(byTier)) {
 		p := byTier[tier]
-		fmt.Fprintf(&b, "tier %s: %d jobs, queue wait %s; %d purchases refused\n", tier, p.Count, p.text(),
-			r.Declined[tier])
+		fmt.Fprintf(&b, "tier %s: %d jobs, queue wait %s; %d jobs refused at least once\n", tier, p.Count,
+			p.text(), r.Declined[tier])
 	}
 
 	byShape := r.QueueWaitByShape()

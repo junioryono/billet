@@ -19,6 +19,18 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	stateDir := t.TempDir()
 	cfg := writeJobsConfig(t, stateDir)
 
+	// THE FLEET CARRIES THE CONFIGURATION'S PLACEMENT, ORDER AND PINS.
+	body, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := strings.Replace(strings.Replace(string(body), "  max_memory: 32GiB\n",
+		"  max_memory: 32GiB\n  placement: spread\n  admission_order: fill\n", 1),
+		"    image: ubuntu:24.04\n", "    image: ubuntu:24.04\n    node: epyc-1\n", 1)
+	if err := os.WriteFile(cfg, []byte(configured), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	runtimeHistory(t, stateDir)
 
 	// A JOB GITHUB NEVER REPORTED COMPLETE IS LEFT OUT, never exported as one
@@ -39,6 +51,10 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		// A POOL SLOT'S JOB WHOSE IDENTITY WAS NEVER WRITTEN STILL RAN, and is
 		// exported with what the ledger has.
 		{start: recent.Add(40 * time.Minute), runtime: 4 * time.Minute, noIdentity: true},
+		// A JOB THAT NEVER STARTED, and one whose completion is its start, are
+		// left out and counted.
+		{name: "cancelled", start: recent.Add(50 * time.Minute), runtime: time.Minute, neverStarted: true},
+		{name: "instant", start: recent.Add(55 * time.Minute)},
 	})
 
 	out := t.TempDir()
@@ -53,10 +69,14 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	// THE LEDGER RAN EIGHT, one of them on billet-4vcpu, which the configuration
 	// does not declare: its shape is not the fleet's to give, so it is left out
 	// and said to be.
+	// AND SAYS WHAT IT COULD NOT READ: every job but deploy had no GitHub queue
+	// time, and the one with no identity no repository.
 	if !strings.Contains(stdout.String(), "9 jobs and 1 hosts written") ||
-		!strings.Contains(stderr.String(), "the window held 11 assigned jobs; left out 0 that never started, 1 "+
-			"GitHub never reported complete, 0 whose completion is not after their start and 1 of tiers") {
-		t.Errorf("the export says %q and %q; want 9 jobs and 1 host, and the one left out", stdout, &stderr)
+		!strings.Contains(stderr.String(), "the window held 13 assigned jobs; left out 1 that never started, 1 "+
+			"GitHub never reported complete, 1 whose completion is not after their start and 1 of tiers") ||
+		!strings.Contains(stderr.String(), "8 jobs had no GitHub queue time on record") ||
+		!strings.Contains(stderr.String(), "1 jobs had no repository or workflow on record") {
+		t.Errorf("the export says %q and %q; want 9 jobs and 1 host, and what was left out", stdout, &stderr)
 	}
 
 	for _, name := range []string{"trace.jsonl", "fleet.json"} {
@@ -122,19 +142,25 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		t.Fatalf("the exported fleet does not read back: %v", err)
 	}
 
-	if len(fleet.Hosts) != 1 || fleet.Hosts[0].Name != "epyc-1" || fleet.Hosts[0].VCPU != 8 ||
-		fleet.Hosts[0].Memory != 32*config.GiB || fleet.Hosts[0].Provider != config.ProviderDocker {
+	if len(fleet.Hosts) != 1 || fleet.Hosts[0] != (jobtrace.Host{Name: "epyc-1", VCPU: 8, Memory: 32 * config.GiB,
+		Site: "home", Provider: config.ProviderDocker}) {
 		t.Errorf("the fleet's hosts are %+v; want epyc-1 as it registered", fleet.Hosts)
 	}
 
 	if len(fleet.Tiers) != 1 || fleet.Tiers[0] != (jobtrace.Tier{Label: "billet-2vcpu", VCPU: 2,
-		Memory: 8 * config.GiB}) || fleet.MaxVCPU != 8 || fleet.MaxMemory != 32*config.GiB {
-		t.Errorf("the fleet is %+v; want the configured tier and ceiling", fleet)
+		Memory: 8 * config.GiB, Node: "epyc-1"}) || fleet.MaxVCPU != 8 || fleet.MaxMemory != 32*config.GiB ||
+		fleet.Placement != config.PlacementSpread || fleet.AdmissionOrder != config.AdmissionFill {
+		t.Errorf("the fleet is %+v; want the configured tier, ceiling, placement and order", fleet)
 	}
 
+	// A REFUSED EXPORT LEAVES AN EARLIER ONE AS IT WAS.
+	before := readExport(t, out)
 	if err := Jobs(t.Context(), env, []string{"export", "--config", cfg, "--out", out}); err == nil ||
 		!strings.Contains(err.Error(), "already exists") {
 		t.Errorf("a second export into the same directory gave %v; want it refused", err)
+	}
+	if after := readExport(t, out); after != before {
+		t.Errorf("a refused export changed the earlier one")
 	}
 
 	// AN EXPORT REFUSED FOR ONE FILE WRITES NEITHER.
@@ -149,6 +175,9 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(half, "trace.jsonl")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("a refused export left trace.jsonl behind (%v)", err)
 	}
+	if _, err := os.Stat(filepath.Join(half, "fleet.json")); err != nil {
+		t.Errorf("a refused export removed the fleet.json it found: %v", err)
+	}
 
 	// --names KEEPS WHAT WAS RECORDED.
 	named := t.TempDir()
@@ -156,7 +185,7 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		t.Fatalf("billet jobs export --names: %v", err)
 	}
 
-	body, err := os.ReadFile(filepath.Join(named, "trace.jsonl"))
+	body, err = os.ReadFile(filepath.Join(named, "trace.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,5 +199,43 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	if err := Jobs(t.Context(), env, []string{"export", "--config", cfg, "--out", empty, "--since", "1h"}); err == nil ||
 		!strings.Contains(err.Error(), "nothing to replay") {
 		t.Errorf("an export of an empty window gave %v; want it refused", err)
+	}
+}
+
+// readExport is an export directory's two files, joined.
+func readExport(t *testing.T, dir string) string {
+	t.Helper()
+
+	var out strings.Builder
+
+	for _, name := range []string{"trace.jsonl", "fleet.json"} {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+
+		out.Write(body)
+	}
+
+	return out.String()
+}
+
+// THE FLAGS ARE CHECKED BEFORE THE LEDGER IS OPENED.
+func TestJobsExportRefusesItsFlags(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--out", "x", "--since", "0s"}, "--since must be positive"},
+		{[]string{"--since", "1h"}, "--out names the directory"},
+		{[]string{"--out", "x", "--until", "yesterday"}, `--until "yesterday" is not RFC 3339`},
+	} {
+		env, _ := bufferedEnv()
+		err := Jobs(t.Context(), env, append([]string{"export", "--config", "/nonexistent/billet.yaml"}, c.args...))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("billet jobs export %v gave %v; want %q", c.args, err, c.want)
+		}
 	}
 }
