@@ -38,11 +38,8 @@ type Comparison struct {
 // the same table (TestAComparisonIsReproducible).
 //
 // A REPLAY THE REPORT CANNOT SPEAK FOR FAILS THE COMPARISON rather than giving
-// it numbers: a job the ledger lost, one that never started or finished with
-// no horizon to explain it, a completion delivered and never archived, or an
-// overcommit the ledger proves. A table built
-// over any of those would compare policies on the jobs that happened to
-// survive.
+// it numbers (unspeakable says which). A table built over a lost job would
+// compare policies on the jobs that happened to survive.
 func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Options) Comparison {
 	t.Helper()
 
@@ -57,26 +54,35 @@ func Compare(t *testing.T, fleet Fleet, trace Trace, policies []Policy, opts Opt
 		}
 
 		r := Run(t, f, trace, opts)
-
-		switch {
-		case len(r.Violations) > 0:
-			t.Fatalf("replay: under %s the ledger proves an overcommit: %v", p.Name, r.Violations)
-		case len(r.Missing) > 0:
-			t.Fatalf("replay: under %s the ledger has no row for jobs %v", p.Name, r.Missing)
-		case opts.Until.IsZero() && (len(r.Unstarted) > 0 || len(r.Unfinished) > 0):
-			t.Fatalf("replay: under %s jobs %v never started and %v never finished, with no horizon to say why",
-				p.Name, r.Unstarted, r.Unfinished)
-		}
-
-		if len(r.LostCompletions) > 0 {
-			t.Fatalf("replay: under %s jobs %v were completed by the scripted GitHub and the ledger never saw "+
-				"them finish", p.Name, r.LostCompletions)
+		if why := r.unspeakable(); why != "" {
+			t.Fatalf("replay: under %s %s", p.Name, why)
 		}
 
 		c.Reports = append(c.Reports, r)
 	}
 
 	return c
+}
+
+// unspeakable says why the report cannot speak for its replay, or "" when it
+// can: an overcommit the ledger proves, a job the ledger lost, one that never
+// started or finished with no horizon to explain it, or a completion delivered
+// and never archived.
+func (r *Report) unspeakable() string {
+	switch {
+	case len(r.Violations) > 0:
+		return fmt.Sprintf("the ledger proves an overcommit: %v", r.Violations)
+	case len(r.Missing) > 0:
+		return fmt.Sprintf("the ledger has no row for jobs %v", r.Missing)
+	case r.Horizon.IsZero() && (len(r.Unstarted) > 0 || len(r.Unfinished) > 0):
+		return fmt.Sprintf("jobs %v never started and %v never finished, with no horizon to say why",
+			r.Unstarted, r.Unfinished)
+	case len(r.LostCompletions) > 0:
+		return fmt.Sprintf("jobs %v were completed by the scripted GitHub and the ledger never saw them finish",
+			r.LostCompletions)
+	}
+
+	return ""
 }
 
 // Markdown is the comparison as tables a record can carry: per charged shape,

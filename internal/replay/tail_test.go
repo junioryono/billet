@@ -2,6 +2,7 @@ package replay
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,5 +138,33 @@ func TestADeliveredCompletionTheLedgerNeverSawIsLost(t *testing.T) {
 
 	if len(r.LostCompletions) != 1 || r.LostCompletions[0] != 1 {
 		t.Errorf("lost completions %v; want job 1 alone", r.LostCompletions)
+	}
+}
+
+// A COMPARISON REFUSES A REPORT THAT CANNOT SPEAK FOR ITS REPLAY, each reason
+// on its own, and a horizon excuses only the jobs it cut short.
+func TestAComparisonRefusesAnUnspeakableReport(t *testing.T) {
+	t.Parallel()
+
+	horizon := DefaultStart.Add(time.Hour)
+
+	for _, c := range []struct {
+		name   string
+		report Report
+		want   string
+	}{
+		{"sound", Report{}, ""},
+		{"overcommit", Report{Violations: []string{"host-1 over by 2 vCPU"}}, "overcommit"},
+		{"missing", Report{Missing: []int64{4}}, "no row for jobs [4]"},
+		{"unstarted without a horizon", Report{Unstarted: []int64{5}}, "with no horizon"},
+		{"unfinished without a horizon", Report{Unfinished: []int64{6}}, "with no horizon"},
+		{"cut short by the horizon", Report{Horizon: horizon, Unstarted: []int64{5}, Unfinished: []int64{6}}, ""},
+		{"lost at the horizon", Report{Horizon: horizon, Unfinished: []int64{6}, LostCompletions: []int64{6}},
+			"jobs [6] were completed"},
+	} {
+		got := c.report.unspeakable()
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: unspeakable says %q; want %q", c.name, got, c.want)
+		}
 	}
 }
