@@ -599,6 +599,70 @@ func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
 	}
 }
 
+// AND A STOP SUPERSEDED THERE STAYS SUPERSEDED. The process holds compute when
+// its recovery is superseded, so it waits for what runs here; then its
+// controller goes. It hands what it runs to custody once and registers with
+// no controller, where a registration after the failover would take the name
+// back from the process that holds it.
+func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
+	t.Parallel()
+
+	a, b := newController(t), newController(t)
+
+	const launched = "/v1/nodes/n1/launched"
+
+	var gone atomic.Bool
+
+	a.mu.Lock()
+	a.supersede = func(path string, _ int) bool { return path == launched }
+	a.drop = func(string, int) bool { return gone.Load() }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: a.srv.URL}, {Base: b.srv.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	compute := &askingCompute{fakeCompute: &fakeCompute{holding: true}, c: c}
+	cancel, done := runDraining(t, c, compute)
+
+	waitFor(t, func() bool { return a.sent(launched) >= 2 })
+	cancel()
+
+	waitFor(t, func() bool { return compute.supersededCount() >= 1 })
+
+	polls := a.sent("/v1/nodes/n1/poll")
+	gone.Store(true)
+
+	// LONG ENOUGH FOR A DRAIN THAT SERVES to find A gone (two unanswered polls
+	// a second apart at most) and register with B, which answers at once.
+	time.Sleep(3 * time.Second)
+
+	if n := b.sent("/v1/register"); n != 0 {
+		t.Fatalf("a superseded stop registered with B %d times after A went", n)
+	}
+
+	if n := a.sent("/v1/nodes/n1/poll") - polls; n != 0 {
+		t.Fatalf("a superseded stop polled %d times after it was superseded", n)
+	}
+
+	if n := compute.supersededCount(); n != 1 {
+		t.Fatalf("what runs here was handed to custody %d times, want once", n)
+	}
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the stop did not end once nothing was held")
+	}
+}
+
 // A DRAIN THAT LOSES ITS CONTROLLER IS SERVED BY THE OTHER. The node is
 // draining compute that is still running, which only a destroy from the control
 // plane ends, so it keeps polling; A goes, and the drain registers with B and

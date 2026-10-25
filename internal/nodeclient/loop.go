@@ -690,12 +690,23 @@ func stopGracefully(
 	// forgotten was, which is why this asks EverRegistered and not the wire
 	// version a forgotten registration clears. A second signal ends the attempt
 	// either way.
+	//
+	// SUPERSEDED THERE IS SUPERSEDED FOR THE REST OF THE STOP. Another process
+	// holds the name, so this one hands what it runs to custody once, here, and
+	// neither polls, registers nor withdraws again: a registration after a
+	// failover would take the name back from the process that holds it.
+	supersededBefore := false
+
 	if !recovered && (drainRequested || c.EverRegistered()) {
 		attempts := 0
 		if !drainRequested {
 			attempts = unrecoveredStopAttempts
 		}
-		recovered = recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
+		recovered, supersededBefore = recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
+	}
+
+	if supersededBefore {
+		compute.Superseded()
 	}
 
 	// A node holding nothing stops at once. The drain is for work in flight, not
@@ -708,7 +719,9 @@ func stopGracefully(
 	// Nil for the same reason as the two paths below: this is the shutdown
 	// succeeding, and the caller turns what comes back into a process exit status.
 	if !compute.Holding() {
-		withdraw(ctx, c, log, opts)
+		if !supersededBefore {
+			withdraw(ctx, c, log, opts)
+		}
 
 		// HOLDING NOTHING IS A DRAIN ONLY WHEN THIS PROCESS KNEW WHAT ITS HOST RUNS.
 		// One that never registered was given nothing; one that registered and
@@ -716,6 +729,8 @@ func stopGracefully(
 		switch {
 		case recovered:
 			opts.ended(nodeending.Drained, drainRequested)
+		case supersededBefore:
+			opts.ended(nodeending.Superseded, drainRequested)
 		case !c.EverRegistered():
 			opts.ended(nodeending.Idle, drainRequested)
 		default:
@@ -784,6 +799,8 @@ func stopGracefully(
 	// replacement, and asking would only be refused.
 	var superseded atomic.Bool
 
+	superseded.Store(supersededBefore)
+
 	serving.Add(1)
 
 	go func() {
@@ -795,6 +812,13 @@ func stopGracefully(
 				drainServingDone()
 			}
 		}()
+
+		// A PROCESS SUPERSEDED BEFORE THE DRAIN SERVES NOTHING: its commands go to
+		// the process that holds the name, and what it runs is custody, which
+		// the wait below tends.
+		if supersededBefore {
+			return
+		}
 
 		// register is a registration this drain still needs: once the control
 		// plane forgot this node or its controller stopped answering, it asks
@@ -1024,8 +1048,9 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 const unrecoveredStopAttempts = 3
 
 // recoverBeforeDrain registers if this process never did and recovers, until it
-// succeeds, a second signal arrives or, when attempts is positive, that many
-// attempts have failed, and says whether it recovered. The janitor starts once a
+// succeeds, a second signal arrives, another process is found to hold this
+// node's name or, when attempts is positive, that many attempts have failed,
+// and says whether it recovered and whether it was superseded. The janitor starts once a
 // registration has told it the lease TTL and before anything is recovered,
 // exactly as at an ordinary registration: recovery adopts leases, and a drain
 // can outlast their TTL many times over while Tend's provider calls are not
@@ -1033,7 +1058,7 @@ const unrecoveredStopAttempts = 3
 func recoverBeforeDrain(
 	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions,
 	startJanitor func(), attempts int,
-) bool {
+) (bool, bool) {
 	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
@@ -1067,19 +1092,17 @@ func recoverBeforeDrain(
 			err = compute.Recover(recoverCtx)
 		}
 		if err == nil {
-			return true
+			return true, false
 		}
 
 		// SUPERSEDED IS A VERDICT, NOT AN OUTAGE. Another process holds this
 		// name, so registering again would take it back from the host that has
 		// it, and asking again would be refused for as long as the drain lasts.
-		// This process never learned what its host runs; the drain that follows
-		// meets the same verdict at its poll and hands its custody over.
 		if errors.Is(err, ErrSuperseded) {
 			log.Warn("another process registered as this node before this one knew what its host "+
-				"runs; not recovering further", "error", err)
+				"runs; not recovering further, and keeping what runs here in custody", "error", err)
 
-			return false
+			return false, true
 		}
 
 		lost = c.Controllers() > 1 && errors.Is(err, errNoAnswer)
@@ -1088,18 +1111,18 @@ func recoverBeforeDrain(
 			log.Error("could not learn what this host runs before stopping; stopping anyway, "+
 				"and the next node process adopts what it finds", "attempts", attempt, "error", err)
 
-			return false
+			return false, false
 		}
 
 		log.Error("stopping before this process knew what its host runs; recovering before "+
 			"deciding whether it holds anything", "error", err)
 
 		if !sleep(recoverCtx, backoffFor(opts, c)) {
-			return false
+			return false, false
 		}
 	}
 
-	return false
+	return false, false
 }
 
 // backoffFor is the pause after a failed registration or poll.
