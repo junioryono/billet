@@ -1,6 +1,6 @@
 # ADR-020: The node serves the public npm registry to its guests
 
-Accepted, 2026-10-22. Issue #631. Widens the rule that interception terminates TLS for one host (`billet-security`, "Interception terminates TLS for one host and serves three methods") to a second host, `registry.npmjs.org`, under the conditions below.
+Accepted, 2026-10-22; on by default since 2026-10-25 (below). Issue #631. Widens the rule that interception terminates TLS for one host (`billet-security`, "Interception terminates TLS for one host and serves three methods") to a second host, `registry.npmjs.org`, under the conditions below.
 
 ## Context
 
@@ -100,7 +100,7 @@ Everything else is spliced to the registry unchanged, for the whole connection: 
 4. **Otherwise the failure.** The registry's last `502`, `503` or `504` is relayed, or, when it gave no answer at all, the node answers `504`. The connection is then closed.
 5. **A body that stalls after bytes reached the client** fails that one request: the node closes the connection mid-answer and discards the partial fill. A tarball's `200` begins as soon as its headers arrive (a `502`, `503` or `504` is still held for the retry), so a tarball's body is never retried. It cannot be, without sending the client the same bytes twice.
 
-That budget is the node's alone. The guest's relay and the client's own connection to the node add to it. Measured through a real guest, `pnpm/action-setup` took 8 to 10 seconds through the cache and 10 straight to the registry (below). That is well inside the 30 seconds `pnpm/setup` waits for its fetch, though `pnpm/setup` itself, the action that failed, was not run.
+That budget is the node's alone. The guest's relay and the client's own connection to the node add to it. Measured through a real guest, `pnpm/action-setup` took 8 to 10 seconds through the cache and 10 straight to the registry (below). That is well inside the 30 seconds `pnpm/setup` waits for its fetch. `pnpm/setup` itself, the action that failed, was run through the cache on 2026-10-25 (below).
 
 **The remap reaches only clients the CA reaches.** A client that does not trust the node's authority fails its TLS handshake before the node sees a request, so it cannot be spliced: that is an error, not a miss. So `registry.npmjs.org` is remapped in the guest's `/etc/hosts` only, never by the resolver containers use. That resolver is the guest's dnsmasq, which reads `/etc/hosts` unless told not to, so it runs with `--no-hosts` and keeps the Actions remap as its one explicit `--address`. Then:
 
@@ -125,7 +125,12 @@ Every job completed, and the three through the cache each recorded `npm: warm` o
 
 **And on the published image.** The sudo, host-network and resolver measurements above were made with a stand-in node, apart from the results-host check. On 2026-10-24 the cases below were checked against the real node, on the guest image built from v0.26.0 (`guest-20261024-221601`, imported as `g20261024231158`), with the test-only tier's Actions cache off so the npm cache stood alone. That tier's guest started the container resolver (`daemon.json` naming it), remapped `registry.npmjs.org` to `127.0.2.1`, and ran the relay with `--guest-processes-only`. The runner's own Node was served by the node (the certificate issued by billet's node wire CA). Each of these reached the registry itself, its Node fetches showing the registry's own WE1 certificate and HTTP 200 and its npm commands the package's version: `sudo node`, `sudo -i node`, `sudo npm view`, a `--network host` container's Node and npm, a user-defined network's Node, and the default bridge's npm. The relay logged six connections passed through for uid 0. A user-defined network's `npm view` ended on an npm notice, so its result was not captured. Every root and container probe whose result was captured missed the cache rather than failing. On a tier with the Actions cache, the image's sudoers drop-in kept the four variables naming billet's bundle, and a root Node under `sudo` and `sudo -i` completed TLS against the live remap of the results host.
 
-**It is off by default for its first release.** ADR-013's rule is that every cache is on by default where a tier can have it. This one is the exception until it has served a real fleet, because a client the CA does not reach fails rather than missing, and a mistake in it breaks every npm install on the tier, where a mistake in the other caches costs a cold start. Turning it on by default is a later decision with its own evidence: a real fleet's jobs served through it, and the measurements this record defers.
+**It was off by default for its first release, and is on by default since 2026-10-25.** ADR-013's rule is that every cache is on by default where a tier can have it. This one was the exception at first, because a client the CA does not reach fails rather than missing, and a mistake in it breaks every npm install on the tier, where a mistake in the other caches costs a cold start. The record set turning it on as a later decision with its own evidence. That evidence came on 2026-10-24 and 2026-10-25, on the reference deployment:
+- the large install above;
+- the published image's checks above;
+- `pnpm/setup@v3`, the action that failed in #631, through the cache in two jobs on v0.27.0. Both recorded `npm: warm`, and the second was served the 21 MB `@pnpm/exe.linux-x64` tarball from the node's store.
+
+On that evidence, the owner turned it on for every tier that can have it: a firecracker Linux tier. A tier whose jobs run a client in the runner's own process that ignores `NODE_EXTRA_CA_CERTS` and the system store turns it off with `cache.npm.enabled: false`. Only npm, pnpm and Node were measured, so such a client stays the known risk. Root and containers are not one: they bypass the cache and reach the registry, as measured above. A request with a credential is spliced uncached, so a private package is never served from the store.
 
 **A guest remaps the host only when its node names it.** The guest image is published and outlives node releases. A guest that remapped `registry.npmjs.org` on its own, under a node too old to serve it, would send every npm fetch to a proxy that refuses it. So the guest remaps the host only when its launch metadata names it, as the Actions remap depends on the node naming its proxy. A node that does not name it leaves npm going direct. An older node reads the tier's `cache.npm` as absent, which is safe: doing less leaves the job on the registry.
 
@@ -133,7 +138,7 @@ Every job completed, and the three through the cache each recorded `npm: warm` o
 
 ## What is not decided here
 
-- **`pnpm/setup`'s own fetch through the cache.** The action that failed was not run; `pnpm/action-setup` was, in 8 to 10 seconds against the 30 seconds `pnpm/setup` waits, which does not show that `pnpm/setup`'s fetch path takes the same time.
+- **`pnpm/setup` against a stalled registry.** It ran through the cache on 2026-10-25 and was served, but its version document has a lifetime of 0, so each job fetches it from the registry again; what covers a stall on it is the attempt, the retry and the stale answer above, which no run has yet met.
 - **The install on a slower uplink.** A large `npm ci` and `pnpm/action-setup` through the cache were measured on 2026-10-24 (above). So were `sudo`, a host-network container and the container resolver: the day before with a stand-in node, and that day on the published image against the real node. The relay carried the install whole, in times comparable to the registry's. What the cache saves in time on a site whose uplink is slower or metered than the reference deployment's is not measured.
 - **Other registries.** PyPI, the Go module proxy and Ubuntu's archive fit the same shape, a public anonymous read with long-lived artifacts, and each would be its own host under this rule.
 - **A store shared by a site's nodes,** in Ceph as the other caches are.
