@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -110,14 +109,14 @@ func exportDeployment(ctx context.Context, a *alloc.Allocator, cfg *config.Confi
 
 	var trace jobtrace.Trace
 
-	for _, a := range exported.Arrivals {
-		if !declared[a.Tier] {
+	for i := range exported.Arrivals {
+		if !declared[exported.Arrivals[i].Tier] {
 			gaps.UndeclaredTier++
 
 			continue
 		}
 
-		trace.Arrivals = append(trace.Arrivals, a)
+		trace.Arrivals = append(trace.Arrivals, exported.Arrivals[i])
 	}
 
 	trace.Normalize()
@@ -164,7 +163,7 @@ func writeExport(dir string, trace jobtrace.Trace, fleet jobtrace.Fleet) error {
 
 		// 0600: even with stand-ins a trace says when the deployment worked.
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if errors.Is(err, fs.ErrExist) {
+		if errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("billet jobs export: %s already exists; export into a directory without one", path)
 		}
 		if err != nil {

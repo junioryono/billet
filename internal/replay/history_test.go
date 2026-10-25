@@ -3,7 +3,6 @@ package replay
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -355,4 +354,4 @@ func readExported(t *testing.T, tracePath, fleetPath string) (Trace, Fleet) {
 
 // discardLogger keeps a record-size replay's diagnostics out of the test log,
 // which would otherwise hold millions of lines.
-func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
