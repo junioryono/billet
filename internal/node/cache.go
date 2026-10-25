@@ -1524,13 +1524,7 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	if err != nil {
 		return err
 	}
-	if err := lockCacheSession(ctx, session); err != nil {
-		return err
-	}
 	defer session.mu.Unlock()
-	if session.slots[0] != attachment || !attachment.Ready {
-		return nil
-	}
 
 	return s.publishDocker(ctx, session, attachment)
 }
@@ -1541,8 +1535,10 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 var errNoDockerStore = errors.New("this session has no Docker image store")
 
 // awaitDockerReady opens the Docker store's settlement and waits for the guest
-// to prove it quiesced, returning the ready attachment, or errNoDockerStore
-// when the session has none.
+// to prove it quiesced, returning the ready attachment with the session still
+// locked, which the caller unlocks, or errNoDockerStore when the session has
+// none. Returning it locked is what keeps the whole settlement inside the
+// window: a lock taken again afterwards could wait behind another request.
 func (s *CacheService) awaitDockerReady(
 	ctx context.Context, session *cacheSession,
 ) (*cacheAttachment, error) {
@@ -1595,11 +1591,10 @@ func (s *CacheService) awaitDockerReady(
 
 			return nil, errNoDockerStore
 		}
-		ready := attachment.Ready
-		session.mu.Unlock()
-		if ready {
+		if attachment.Ready {
 			return attachment, nil
 		}
+		session.mu.Unlock()
 
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
@@ -1609,6 +1604,11 @@ func (s *CacheService) awaitDockerReady(
 			return nil, ctx.Err()
 		case <-settleCtx.Done():
 			timer.Stop()
+			// A CALLER THAT GAVE UP IS NOT A WINDOW THAT RAN OUT: the caller's
+			// end ends the settle window too, and says more.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 
 			return nil, notReady
 		case <-timer.C:

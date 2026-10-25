@@ -423,13 +423,8 @@ func (s *CacheService) SettleCompleted(
 	if err != nil {
 		return err
 	}
-	if err := lockCacheSession(ctx, session); err != nil {
-		return err
-	}
 	defer session.mu.Unlock()
-	if session.slots[0] == attachment && attachment.Ready {
-		attachment.Intent = intent
-	}
+	attachment.Intent = intent
 
 	return s.persistSession(session)
 }

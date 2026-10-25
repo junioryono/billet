@@ -1068,6 +1068,7 @@ func TestAMountedRecordThatCouldNotBeSyncedIsWrittenBackAsNeverMounted(t *testin
 	synctest.Test(t, func(t *testing.T) {
 		stateDir := t.TempDir()
 		var failSync atomic.Bool
+		var injected atomic.Int32
 		attacher := &fakeVolumeAttacher{onAttach: func() { failSync.Store(true) }}
 		first, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
 			&fakeCacheStore{}, attacher, slog.New(slog.DiscardHandler))
@@ -1076,6 +1077,8 @@ func TestAMountedRecordThatCouldNotBeSyncedIsWrittenBackAsNeverMounted(t *testin
 		}
 		first.syncDir = func(path string) error {
 			if failSync.CompareAndSwap(true, false) {
+				injected.Add(1)
+
 				return errors.New("the directory could not be synced")
 			}
 
@@ -1091,14 +1094,18 @@ func TestAMountedRecordThatCouldNotBeSyncedIsWrittenBackAsNeverMounted(t *testin
 			map[string]any{"architecture": "amd64"}); response.Code != http.StatusServiceUnavailable {
 			t.Fatalf("Docker store status = %d, want the cold 503: %s", response.Code, response.Body.String())
 		}
-		if failSync.Load() {
-			t.Fatal("the directory sync was never failed, so this staged nothing")
+		if n := injected.Load(); n != 1 {
+			t.Fatalf("the directory sync was failed %d time(s) after the attach, want once", n)
 		}
 
 		restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
 			&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
 		if err != nil {
 			t.Fatalf("NewCacheService after the restart: %v", err)
+		}
+		reloaded := restarted.byToken[credentials.Token].slots[0]
+		if reloaded == nil || !reloaded.Docker || !reloaded.Unmounted {
+			t.Fatalf("the record a restart reads holds slot 0 = %+v, want the store, never mounted", reloaded)
 		}
 		settling := time.Now()
 		if err := restarted.SettleDocker(t.Context(), "billet-one", true); err != nil {
@@ -1145,6 +1152,91 @@ func TestADockerStoreAttachedAfterTheRequestsBoundIsAnsweredCold(t *testing.T) {
 			t.Fatalf("detached %d, discarded %d before the compute was gone; want the store kept",
 				len(attacher.detached), storage.discarded)
 		}
+	})
+}
+
+// A READY STORE COMES BACK WITH ITS SESSION STILL LOCKED. Handing it back
+// unlocked left a gap in which a discard or a replacement could take the
+// session, and the caller's own lock then waited behind it outside the settle
+// window.
+func TestAReadyDockerStoreIsHandedBackLocked(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+	}
+	session := service.byToken[credentials.Token]
+	session.mu.Lock()
+	session.slots[0].Settling = true
+	session.slots[0].Ready = true
+	session.mu.Unlock()
+
+	attachment, err := service.awaitDockerReady(t.Context(), session)
+	if err != nil {
+		t.Fatalf("awaitDockerReady: %v", err)
+	}
+	if session.mu.TryLock() {
+		session.mu.Unlock()
+		t.Fatal("the ready store came back with its session unlocked")
+	}
+	if attachment != session.slots[0] {
+		t.Errorf("the attachment handed back is not the session's slot 0")
+	}
+	session.mu.Unlock()
+}
+
+// A CALLER THAT GAVE UP IS TOLD SO, NOT THAT THE WINDOW RAN OUT. The caller's
+// end ends the settle window too, so a wait for the session lock that fails
+// then must say which of the two ended it; here a replacement holds the
+// session while the caller gives up thirty seconds in.
+func TestACancelledSettlementSaysItWasCancelled(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		attacher := &fakeVolumeAttacher{}
+		service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			&fakeCacheStore{}, attacher, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+		}
+		if discard := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/discard", nil); discard.Code != http.StatusOK {
+			t.Fatalf("the guest's discard of its mounted store = %d: %s", discard.Code, discard.Body.String())
+		}
+		attacher.attachDelay = 3 * time.Minute
+		replaced := make(chan int, 1)
+		go func() {
+			replaced <- cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+				map[string]any{"architecture": "amd64"}).Code
+		}()
+		synctest.Wait()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		time.AfterFunc(30*time.Second, cancel)
+		if err := service.SettleDocker(ctx, "billet-one", true); !errors.Is(err, context.Canceled) {
+			t.Fatalf("a settlement whose caller gave up while it waited for the session returned %v, "+
+				"want context.Canceled", err)
+		}
+		<-replaced
 	})
 }
 
