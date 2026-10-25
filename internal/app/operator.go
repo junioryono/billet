@@ -48,6 +48,37 @@ func OpenOperator(ctx context.Context, cfgPath string) (*alloc.Allocator, *state
 	return a, db, func() { db.Close() }, nil
 }
 
+// OpenReport is OpenOperator for a command that only reads: the ledger in
+// LedgerInspect mode, which creates, locks, claims and migrates nothing and
+// refuses a schema that is not exactly this binary's, so a report run beside
+// a control plane of another release can neither move its ledger nor misread
+// it. The returned allocator can answer reads only.
+func OpenReport(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if cfg.Server == nil {
+		return nil, nil, errors.New("this command runs on the control plane, and this " +
+			"config has no server section")
+	}
+
+	db, err := OpenLedger(ctx, cfg, LedgerInspect)
+	if err != nil {
+		return nil, nil, fmt.Errorf("server state: %w", err)
+	}
+
+	a, err := NewAllocator(cfg, db)
+	if err != nil {
+		db.Close()
+
+		return nil, nil, fmt.Errorf("capacity allocator: %w", err)
+	}
+
+	return a, func() { db.Close() }, nil
+}
+
 // NewAllocator is the capacity allocator an operator command works with over a
 // ledger it opened: the control plane's own limits and tiers, so a command and
 // the plane it runs beside never disagree about what the deployment may hold.

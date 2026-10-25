@@ -153,6 +153,16 @@ type JobRecord struct {
 	// HolderIncarnation the one that held the compute when the lease ended.
 	LaunchIncarnation string
 	HolderIncarnation string
+	// Predicted is what a controller refreshing hourly would have predicted the
+	// job's runtime to be when it started (PredictJob). Never read from the row:
+	// nil unless a reader asked, and for a job that never started.
+	Predicted *RuntimeEstimate
+}
+
+// Runtime is how long the job held its lease, from its start to the lease's
+// archive, and false while either is not recorded.
+func (r JobRecord) Runtime() (time.Duration, bool) {
+	return between(parseStamp(r.StartedAt), parseStamp(r.FinishedAt))
 }
 
 // Job reads one lease's history row. A lease that was never assigned a job is

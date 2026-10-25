@@ -21,16 +21,19 @@ import (
 // cmdJobs is the operator's view of what jobs did.
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait")
+		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait | " +
+			"billet jobs runtimes")
 	}
 	switch args[0] {
 	case "show":
 		return cmdJobsShow(ctx, env, args[1:])
 	case "wait":
 		return cmdJobsWait(ctx, env, args[1:])
+	case "runtimes":
+		return cmdJobsRuntimes(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("unknown jobs command %q; try show or wait", args[0])
+	return fmt.Errorf("unknown jobs command %q; try show, wait or runtimes", args[0])
 }
 
 // cmdJobsShow prints one job's history and what the host measured it do, or
@@ -89,8 +92,9 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	// A RUN'S JOBS ARE SHOWN WITHOUT THEIR STEPS: reading them asks GitHub for
 	// each job in turn, with the App's installation the control plane also
 	// polls through, and a wide matrix would spend a share of its budget.
+	priors := jobPriors(ctx, a)
 	show := func(leaseID string) ([]byte, error) {
-		return showJobOnce(ctx, a, *cfgPath, leaseID, *asJSON, *asHTML, w, !runGiven)
+		return showJobOnce(ctx, a, priors, *cfgPath, leaseID, *asJSON, *asHTML, w, !runGiven)
 	}
 	if !runGiven {
 		out, err := show(fs.Arg(0))
@@ -166,11 +170,11 @@ func showRun(ctx context.Context, env cli.Env, a *alloc.Allocator, run int64, as
 // meanwhile, the report is built once more, now with the marker, which is never
 // unset. A report is therefore never missing detail it does not say was
 // retired.
-func showJobOnce(ctx context.Context, a *alloc.Allocator, cfgPath, leaseID string, asJSON, asHTML bool,
-	w *window, readSteps bool,
+func showJobOnce(ctx context.Context, a *alloc.Allocator, priors func(time.Time) (*alloc.RuntimePriors, error),
+	cfgPath, leaseID string, asJSON, asHTML bool, w *window, readSteps bool,
 ) ([]byte, error) {
 	show := func(out io.Writer) (string, error) {
-		return showJob(ctx, out, a, cfgPath, leaseID, asJSON, asHTML, w, readSteps)
+		return showJob(ctx, out, a, priors, cfgPath, leaseID, asJSON, asHTML, w, readSteps)
 	}
 	// A BUILD THAT FAILED is rebuilt too when the job is now retired: on
 	// PostgreSQL a usage summary and its destinations are two reads at read
@@ -208,11 +212,15 @@ var afterJobShown func(a *alloc.Allocator)
 // showJob writes one job's report to out in the form asked for, and says the
 // retirement marker it was built with. readSteps is whether the text report
 // and the page read the job's steps from GitHub.
-func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, leaseID string,
+func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
+	priors func(time.Time) (*alloc.RuntimePriors, error), cfgPath, leaseID string,
 	asJSON, asHTML bool, w *window, readSteps bool,
 ) (string, error) {
 	rec, err := a.Job(ctx, leaseID)
 	if err != nil {
+		return "", err
+	}
+	if err := alloc.PredictJob(&rec, priors); err != nil {
 		return "", err
 	}
 	var measured *alloc.RecordedUsage
@@ -318,6 +326,10 @@ type jobJSON struct {
 	// were deleted past the deployment's retention, empty while they are kept.
 	DetailRetiredAt string     `json:"detail_retired_at"`
 	Usage           *usageJSON `json:"usage"`
+	// Prediction is what a controller refreshing hourly would have predicted
+	// the job's runtime to be when it started, beside the runtime and the
+	// error once it finished; null for a job that never started.
+	Prediction *predictionJSON `json:"prediction"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
 	// Window is present only when --window asked for one.
@@ -368,6 +380,7 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
 		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
+		Prediction:     predictionJSONOf(rec),
 		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
 		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
 		DetailRetiredAt: rec.DetailRetiredAt,
@@ -441,6 +454,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		orUnknown(rec.AssignedAt), orUnknown(rec.StartedAt), orUnknown(rec.FinishedAt))
 	line("github", "%s", githubTimes(rec, orUnknown))
 	line("waited", "%s", waitedLine(rec))
+	line("runtime", "%s", runtimeLine(rec))
 	if rec.DetailRetiredAt != "" {
 		line("detail", "%s", detailRetired(rec))
 	}

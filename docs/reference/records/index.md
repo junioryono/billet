@@ -19,6 +19,7 @@ ci-capacity
 assignment-protocol
 guest-release-removal
 cpu-placement
+runtime-predictions
 ```
 
 | Record | Covers |
@@ -37,3 +38,4 @@ cpu-placement
 | [What GitHub.com does with an assignment](assignment-protocol.md) | the protocol facts the steady advertisement rests on, measured 2026-10-21: how long an unrun assignment is kept (cancelled twice after about five minutes, then held at least 80 minutes), what the advertised ceiling counts, that lowering it to zero did not revoke fresh assignments early, how fast capacity is used, what a cancellation looks like, what a new session restores, and how many sessions one installation holds |
 | [Removing the guest releases published before #584](guest-release-removal.md) | the 19 `guest-*` releases removed on 2026-10-22 because they carried components billet may not redistribute and no corresponding source, the release that replaced them, and what that does to a deployment |
 | [CPU placement and idle power](cpu-placement.md) | what pinning microVMs to host cpus (`compact`, `spread`, `packed`) and capping the cpu while idle did to run time and power on the reference node on 2026-10-23, in three drained sessions with the wall meter beside RAPL: compact slower than spread on every load spread could hold, but using less energy on a memory-bound load at half the threads; sharing a CCD's L3 costing little and idle CCDs showing no energy saving; no cpu ceiling showing an idle saving; boost off saving energy under compact and costing it under spread; `node.power` restoring a launch's ceiling in about 20 ms; and billet's energy attribution at a mean 0.89 of the package's energy above idle, the shortfall tracking the host's own CPU |
+| [Runtime predictions](runtime-predictions.md) | how well a job's runtime is predicted from the deployment's own history, measured on the reference deployment's fortnight to 2026-10-25: 30,253 jobs graded as an hourly-refreshing controller would have predicted them, 78% within 2x and 99.4% from the job's own runs, the wide shapes best (84 to 96% within 2x), the 2 vCPU tiers close in seconds and loose in ratio, and what the record does not grade |

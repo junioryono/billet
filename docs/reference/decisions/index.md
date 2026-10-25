@@ -25,6 +25,7 @@ adr-017-workspaces
 adr-018-git-proxy-answers-as-github
 adr-019-guest-image-corresponding-source
 adr-020-npm-registry-interception
+adr-021-scheduling-from-measured-history
 ```
 
 | Record | Decides |
@@ -49,3 +50,4 @@ adr-020-npm-registry-interception
 | [ADR-018](adr-018-git-proxy-answers-as-github.md) | why the Git proxy serves a job GitHub authorised any object its repository's mirror holds, as GitHub does; why anything the mirror cannot do goes to GitHub, a refresh belongs to no request, and the proxy reaches GitHub over HTTP/1.1 with every request body whole |
 | [ADR-019](adr-019-guest-image-corresponding-source.md) | why every guest release carries the corresponding source of what it redistributes under a GNU license as its own assets, rather than a pointer to Launchpad or a written offer, where each source version is kept, and what that costs a release |
 | [ADR-020](adr-020-npm-registry-interception.md) | why the node may serve the public npm registry to its guests through the Actions cache's interception, a second intercepted host; why only an anonymous read is ever cached, why one store per node serves every trust class, how a stalled fetch is retried and a stale document served, and why it starts off by default |
+| [ADR-021](adr-021-scheduling-from-measured-history.md) | why scheduling learns each job's runtime from the deployment's own history, under which key and with which fallbacks, why an overdue job is never predicted to end soon, and why a prediction may choose a host but never decides whether capacity is bought, held or released |
