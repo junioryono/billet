@@ -39,7 +39,7 @@ Publication happens off the node's command path, after the compute is gone, jour
 
 ## The caches
 
-**Docker image store.** Each job's `/var/lib/docker` is a clone of the newest generation for its deployment, site and architecture, attached before the runner starts so service containers are pulled from it. `cache.docker.max_size` (100 GiB) bounds the clone; a baseline larger than that is not cloned, and the job starts cold at its own size.
+**Docker image store.** Each job's `/var/lib/docker` is a clone of the newest generation for its deployment, site and architecture, attached before the runner starts so service containers are pulled from it. The guest waits for it at most 260 seconds, just past the node's four-minute bound on the whole request, and starts Docker on its root disk if the store has not arrived, so a slow store costs a cold job rather than a runner GitHub lists offline ([How long a guest waits for its Docker image store](../reference/records/image-store-wait.md)). `cache.docker.max_size` (100 GiB) bounds the clone; a baseline larger than that is not cloned, and the job starts cold at its own size.
 
 **Sticky disks.** `actions/stickydisk` attaches a volume by key; it is committed when the job ends and published under the tier's rule. Under `default-branch` the commit is deferred to the completion, which decides it. `cache.sticky_disks.max_size` clamps what a job may ask for.
 

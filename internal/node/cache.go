@@ -37,15 +37,25 @@ const (
 	// minutes, so this renews each about once an hour and leaves six hours of
 	// margin against eviction.
 	cacheRenewWithin = 6 * time.Hour
-	// dockerStoreAttachLimit bounds acquiring a guest's Docker image store, well
-	// inside the five-minute metadata token the guest agent fetched at boot.
+	// dockerStoreAttachLimit bounds acquiring a guest's Docker image store: the
+	// clone or the fresh volume. An image built before #320's fix fetched a
+	// five-minute metadata token at boot and reads its registration after this
+	// answer, so the acquisition stays well inside that token; newer images fetch
+	// six hours.
 	dockerStoreAttachLimit = 3 * time.Minute
-	cacheWriterTTL         = 15 * time.Minute
-	cacheVolumeLimit       = int64(100 << 30)
-	dockerSettleWait       = 2 * time.Minute
-	dockerStoreKey         = "docker-images/"
-	publicationCAS         = "cas"
-	publicationLWW         = "last-write-wins"
+	// dockerStoreRequestLimit bounds the whole request, from its arrival to the
+	// answer: the session lock, the kill switch, the acquisition and the attach.
+	// The guest starts its runner only after this answer and waits a little longer
+	// than this for it (docker-cache.sh), so a store that is slow costs a cold job
+	// rather than a runner GitHub lists offline (#320). The minute beyond the
+	// acquisition is EC2's attach, which waits for AWS to report it attached.
+	dockerStoreRequestLimit = 4 * time.Minute
+	cacheWriterTTL          = 15 * time.Minute
+	cacheVolumeLimit        = int64(100 << 30)
+	dockerSettleWait        = 2 * time.Minute
+	dockerStoreKey          = "docker-images/"
+	publicationCAS          = "cas"
+	publicationLWW          = "last-write-wins"
 
 	// A last-write-wins writer waiting on a live holder polls on this schedule,
 	// never past the holder's expiry. Measured before it existed: 100ms flat
@@ -1249,8 +1259,15 @@ func (s *CacheService) attachDockerStore(
 	r *http.Request,
 	session *cacheSession,
 ) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
 	defer cancel()
+	// EVERY STEP TOWARD THE ANSWER RUNS ON requestCtx, AND EVERY CLEANUP ON ctx.
+	// A cleanup that inherited the request's deadline would be cancelled by the
+	// very expiry that made it necessary, leaving a clone or an attachment that
+	// only the session's teardown would find.
+	requestCtx, cancelRequest := context.WithTimeout(ctx, dockerStoreRequestLimit)
+	defer cancelRequest()
 
 	var request struct {
 		Architecture string `json:"architecture"`
@@ -1265,7 +1282,9 @@ func (s *CacheService) attachDockerStore(
 
 		return
 	}
-	if err := lockCacheSession(ctx, session); err != nil {
+	if err := lockCacheSession(requestCtx, session); err != nil {
+		s.log.Warn("Docker image store request could not take its cache session; the job can continue cold",
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond), "error", err)
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
@@ -1282,22 +1301,23 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 	setting := sessionSetting(session, config.CacheDocker)
-	if !setting.Enabled || !s.sessionKindAllowed(ctx, session, config.CacheDocker) {
+	if !setting.Enabled || !s.sessionKindAllowed(requestCtx, session, config.CacheDocker) {
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "the Docker image store is off for this job", http.StatusForbidden)
 
 		return
 	}
 
-	// THE ACQUISITION IS BOUNDED BY dockerStoreAttachLimit, not cacheWorkLimit,
-	// and the cleanup below keeps the longer bound. The guest asks for its store
-	// before it starts its runner, on a metadata token it fetched at boot that
-	// lives five minutes, so an answer later than that left it unable to read its
-	// own registration: on 2026-10-03 a store that took eight and a half minutes,
-	// queued behind the cache index lock, ended with "no command in the metadata"
-	// and a runner that never connected (#320). A store not ready in time is a
-	// cold job, which pulls its images; the store is offered again to the next.
-	acquireCtx, cancelAcquire := context.WithTimeout(ctx, dockerStoreAttachLimit)
+	// THE ACQUISITION IS BOUNDED BY dockerStoreAttachLimit, inside the request's
+	// own bound, and the cleanup below keeps the longer one. The guest asks for
+	// its store before it starts its runner, and an image built before #320's fix
+	// does so on a metadata token that lives five minutes, so an answer later than
+	// that left it unable to read its own registration: on 2026-10-03 a store that
+	// took eight and a half minutes, queued behind the cache index lock, ended with
+	// "no command in the metadata" and a runner that never connected. A store not
+	// ready in time is a cold job, which pulls its images; the store is offered
+	// again to the next.
+	acquireCtx, cancelAcquire := context.WithTimeout(requestCtx, dockerStoreAttachLimit)
 	defer cancelAcquire()
 
 	key := s.cacheKeyFor(session, config.CacheDocker, request.Architecture, "")
@@ -1307,7 +1327,8 @@ func (s *CacheService) attachDockerStore(
 	}
 	if err != nil {
 		s.log.Warn("Docker image store is unavailable; the job can continue cold",
-			"instance", session.instance, "error", err)
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+			"error", err)
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
@@ -1338,14 +1359,15 @@ func (s *CacheService) attachDockerStore(
 			retryErr = s.persistSession(session)
 		}
 		s.log.Warn("Docker image-store custody could not be made durable; the job can continue cold",
-			"instance", session.instance, "error", errors.Join(err, discardErr, retryErr))
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+			"error", errors.Join(err, discardErr, retryErr))
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
 	}
 
-	if err := s.attacher.AttachVolume(ctx, session.instance, 0, volume.Device); err != nil {
+	if err := s.attacher.AttachVolume(requestCtx, session.instance, 0, volume.Device); err != nil {
 		detachErr := s.attacher.DetachVolume(ctx, session.instance, 0, volume.Device)
 		var discardErr, clearErr error
 		if detachErr == nil {
@@ -1361,7 +1383,7 @@ func (s *CacheService) attachDockerStore(
 			}
 		}
 		s.log.Warn("Docker image store could not be attached; the job can continue cold",
-			"instance", session.instance,
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
 			"error", errors.Join(err, detachErr, discardErr, clearErr))
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
@@ -1369,8 +1391,12 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 
-	// THE GUEST HAS ITS STORE, so what the store answered is what it saw.
+	// THE GUEST HAS ITS STORE, so what the store answered is what it saw. The
+	// time it took is logged once per job, which is what measures #320's wait.
 	s.observe(ctx, session, observed)
+	s.log.Info("attached a Docker image store", "instance", session.instance,
+		"cache", observed.ImageCache, "generation", volume.Generation,
+		"took", time.Since(started).Round(time.Millisecond))
 
 	guestDevice := guestVolumeDevice(0)
 	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {
