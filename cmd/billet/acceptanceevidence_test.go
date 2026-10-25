@@ -66,7 +66,7 @@ func TestTheEvidenceSaysEachJobsTrustOriginPlacementAndCaches(t *testing.T) {
 		return lease.ID
 	}
 	fork := stage(derived.Label, 7, alloc.HistoryJob{
-		JobID: "1", Owner: "acme", Repository: "repo", Event: "pull_request",
+		JobID: "1", RunID: 9001, Owner: "acme", Repository: "repo", Event: "pull_request",
 		WorkflowRef: "acme/repo/.github/workflows/probe.yml@refs/pull/1/merge", Name: "probe",
 	}, alloc.CacheObservation{
 		ImageCache: alloc.ImageCacheWarm, CacheGeneration: "g7",
@@ -100,6 +100,10 @@ func TestTheEvidenceSaysEachJobsTrustOriginPlacementAndCaches(t *testing.T) {
 		got.WorkflowRef != "acme/repo/.github/workflows/probe.yml@refs/pull/1/merge" || got.JobName != "probe" {
 		t.Errorf("origin = %q %q %q %q, want what GitHub's message recorded",
 			got.Repository, got.Event, got.WorkflowRef, got.JobName)
+	}
+	// A POOL RUNNER RAN ANOTHER RUN'S JOB: its lease was bought by run 4242.
+	if got.RunID != 4242 || got.GitHubRunID != 9001 {
+		t.Errorf("runs = bought by %d, started %d; want 4242 and 9001", got.RunID, got.GitHubRunID)
 	}
 	if got.Cache.Image != "warm" || got.Cache.Generation != "g7" || got.Cache.StickyDisks != "cold" {
 		t.Errorf("cache = %+v, want image warm from g7 and sticky disks cold", got.Cache)

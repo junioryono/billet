@@ -68,7 +68,11 @@ type acceptanceJob struct {
 	LeaseID string `json:"lease_id"`
 	Tier    string `json:"tier"`
 	Node    string `json:"node,omitempty"`
-	RunID   int64  `json:"run_id,omitempty"`
+	// RunID is the run whose assignment bought the lease. A pool runner is
+	// handed whichever job GitHub chooses, so the run that actually started on
+	// it, GitHubRunID, can be another; zero is not recorded.
+	RunID       int64 `json:"run_id,omitempty"`
+	GitHubRunID int64 `json:"github_run_id,omitempty"`
 	// GitHub is GitHub's own reported result for the job.
 	GitHub string `json:"github,omitempty"`
 	// Billet is what billet's lifecycle concluded about the lease.
@@ -382,6 +386,7 @@ func describeAcceptanceJobs(
 			return fmt.Errorf("read the history of lease %s: %w", job.LeaseID, err)
 		}
 
+		job.GitHubRunID = row.GithubRunID
 		job.Provider = row.ChosenProvider
 		job.InstanceType = row.InstanceType
 		job.Cache = acceptanceCache{
