@@ -535,6 +535,12 @@ func register(
 			continue
 		}
 
+		// AND TO A CONTROLLER THAT STOPPED ANSWERING, when there is another: the
+		// registration tries each in turn. serve said so when it returned.
+		if errors.Is(err, errControlPlaneLost) {
+			continue
+		}
+
 		log.Error("the command loop stopped; registering again", "error", err)
 
 		if !sleep(ctx, backoff) {
@@ -542,6 +548,15 @@ func register(
 		}
 	}
 }
+
+// errControlPlaneLost ends serve when the controller a node is registered with
+// has stopped answering and the node knows another: the answer is to register
+// again, which tries each controller in turn.
+var errControlPlaneLost = errors.New("nodeclient: the control plane stopped answering")
+
+// lostAfter is how many polls in a row must go unanswered before a node with
+// another controller to try registers again.
+const lostAfter = 2
 
 // drainServingDone is a test hook the drain's serving worker calls as it
 // returns; nil in production.
@@ -803,9 +818,9 @@ func stopGracefully(
 				return
 			}
 
-			if errors.Is(err, ErrUnregistered) {
-				log.Warn("the control plane no longer knows this node; registering again " +
-					"so it can still be told to destroy what is running here")
+			if errors.Is(err, ErrUnregistered) || errors.Is(err, errControlPlaneLost) {
+				log.Warn("the control plane no longer knows this node, or stopped answering; registering " +
+					"again so it can still be told to destroy what is running here")
 
 				if err := c.Register(drainCtx, opts.registration()); err != nil {
 					// SUPERSEDED BY THE REGISTRATION ITSELF IS STILL SUPERSESSION: the
@@ -1236,6 +1251,10 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// at once; Tend and Sweep, on this loop, read and settle the same entries.
 	// Before launches overlapped all three ran on this goroutine.
 	var custody sync.Mutex
+
+	// unanswered counts the polls in a row the controller gave no answer to.
+	unanswered := 0
+
 	tend := func() error {
 		custody.Lock()
 		defer custody.Unlock()
@@ -1286,6 +1305,23 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 				return err
 			}
 
+			// A CONTROLLER THAT TWICE GIVES NO ANSWER IS LOST, where the node knows
+			// another: it registers again, which tries every controller from this
+			// one, and the one that accepts is the one serving. Twice rather than
+			// once, so a blink costs a retry rather than a registration; with one
+			// controller there is nowhere else to go and the poll is asked again
+			// as it always was.
+			if c.Controllers() > 1 && errors.Is(err, errNoAnswer) {
+				unanswered++
+
+				if unanswered >= lostAfter {
+					log.Warn("lost the control plane; registering again, with whichever controller serves",
+						"control_plane", c.Endpoint().String(), "error", err)
+
+					return fmt.Errorf("%w: %w", errControlPlaneLost, err)
+				}
+			}
+
 			// A POLL THAT FAILS IS ORDINARY. The control plane may be restarting or
 			// the network may have blinked, and the node's job is to keep asking.
 			log.Warn("command poll failed; retrying", "error", err, "retry_in", opts.pollBackoff())
@@ -1296,6 +1332,8 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 
 			continue
 		}
+
+		unanswered = 0
 
 		if !ok {
 			// A LONG POLL IS ALSO THE CUSTODY CLOCK. Whole-host orphan inventory is

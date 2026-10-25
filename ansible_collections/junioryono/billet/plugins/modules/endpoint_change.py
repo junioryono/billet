@@ -11,9 +11,10 @@ node endpoint with the rendering's through the one endpoint representation
 (`module_utils/endpoint.py`, held to the same vector table as the Go one) and
 refuses a difference before anything is stopped. Each side's endpoint is
 derived as billet's config loader derives it: `node.server_addr` when it is
-written, else the server section's `listen` (which itself defaults to
-127.0.0.1:7717) when a server section exists, else none; the scheme is
-`node.tls`'s. A CHANGE IS TWO ENDPOINTS THAT DIFFER: a side without a node
+written (or `node.server_addrs` when it names exactly one controller; a node
+that names several is not moved by an endpoint migration, and is refused),
+else the server section's `listen` (which itself defaults to 127.0.0.1:7717)
+when a server section exists, else none; the scheme is `node.tls`'s. A CHANGE IS TWO ENDPOINTS THAT DIFFER: a side without a node
 section (no node installed yet, or the node removed) names none, and a node's
 first start or its removal is not a migration, so those compare as unchanged.
 
@@ -86,6 +87,16 @@ def endpoint_of(cfg, where):
         return None
     node = _mapping(node, where + ".node")
     addr = node.get("server_addr")
+    addrs = node.get("server_addrs")
+    if addrs is not None:
+        # EVERY CONTROLLER OF A PAIR IS NOT ONE ENDPOINT, and an endpoint
+        # migration moves a node between two. A list of one is that one.
+        if not isinstance(addrs, list) or len(addrs) != 1:
+            raise Refusal("%s.node.server_addrs names %s; a node that dials several controllers is not "
+                          "moved by an endpoint migration" % (where, addrs if isinstance(addrs, list) else "no list"))
+        if addr not in (None, ""):
+            raise Refusal("%s.node sets both server_addr and server_addrs" % where)
+        addr = addrs[0]
     if addr is None or addr == "":
         if "server" in cfg and cfg["server"] is not None:
             server = _mapping(cfg["server"], where + ".server")

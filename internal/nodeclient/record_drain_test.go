@@ -606,9 +606,10 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	}
 
 	// THE CLIENT IS BUILT WHERE THE NODE IS ASSEMBLED, through the shared
-	// constructor and with the TLS the identity gave: one NewNodeClient(cfg,
-	// tlsConf) in (*Node).open, and no nodeclient.New anywhere in node.go but
-	// the constructor itself.
+	// constructor and with the identity the certificate gave, from which it
+	// makes each controller's TLS: one NewNodeClient(cfg, identity) in
+	// (*Node).open, and no nodeclient.New anywhere in node.go but the
+	// constructor itself.
 	for name, fn := range app {
 		if n := calls(fn, "nodeclient", "New"); name != "NewNodeClient" && n != 0 {
 			t.Errorf("internal/app's %s calls nodeclient.New %d times beside NewNodeClient", name, n)
@@ -635,7 +636,7 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 			cfg, cfgOK := call.Args[0].(*ast.Ident)
 			conf, confOK := call.Args[1].(*ast.Ident)
 
-			if cfgOK && confOK && cfg.Name == "cfg" && conf.Name == "tlsConf" {
+			if cfgOK && confOK && cfg.Name == "cfg" && conf.Name == "identity" {
 				shared++
 			}
 		}
@@ -644,7 +645,7 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	})
 
 	if shared != 1 {
-		t.Errorf("(*Node).open builds its client with NewNodeClient(cfg, tlsConf) %d times, want once", shared)
+		t.Errorf("(*Node).open builds its client with NewNodeClient(cfg, identity) %d times, want once", shared)
 	}
 
 	// THE PATH REACHES THE LOOP, link by link: cmdNode hands Run the host

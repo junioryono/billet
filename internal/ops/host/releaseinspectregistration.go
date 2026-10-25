@@ -475,13 +475,13 @@ func installedEndpoint(cfg *config.Config, readable bool) maybe {
 		return unknown("the configuration could not be read")
 	}
 
-	if cfg == nil || cfg.Node == nil {
-		return known(nil)
-	}
-
-	e, err := endpoint.Parse(cfg.Node.ServerAddr, cfg.Node.TLS != nil)
+	e, hasNode, err := nodeEndpointOf(cfg)
 	if err != nil {
 		return unknown(err.Error())
+	}
+
+	if !hasNode {
+		return known(nil)
 	}
 
 	return known(e.String())

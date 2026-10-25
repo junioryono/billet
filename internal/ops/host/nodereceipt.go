@@ -210,7 +210,11 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 	}
 
 	installedEP, hasNode, err := nodeEndpointOf(installed.cfg)
-	if err != nil || !hasNode {
+	if err != nil {
+		return nil, endpointRefuse(endpointReasonConfig, "the installed configuration's node endpoint: "+err.Error(), "", "")
+	}
+
+	if !hasNode {
 		return nil, endpointRefuse(endpointReasonConfig, "the installed configuration names no node endpoint", "", "")
 	}
 

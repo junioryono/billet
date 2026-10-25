@@ -56,13 +56,15 @@ def load():
 def main():
     mod = load()
 
-    def node(addr=None, tls=False, server_listen=None, with_server=True):
+    def node(addr=None, tls=False, server_listen=None, with_server=True, addrs=None):
         cfg = {}
         if with_server:
             cfg["server"] = {"listen": server_listen} if server_listen else {"state_dir": "/var/lib/billet/server"}
         n = {"name": "node-a"}
         if addr is not None:
             n["server_addr"] = addr
+        if addrs is not None:
+            n["server_addrs"] = addrs
         if tls:
             n["tls"] = {"cert": "/c", "key": "/k", "ca": "/ca"}
         cfg["node"] = n
@@ -87,6 +89,10 @@ def main():
          node(addr="127.0.0.1:7717"), {"server": {}}, False),
         ("no installed configuration beside a rendering with a node is a first start",
          {}, node(addr="127.0.0.1:7717"), False),
+        ("a list of one controller is that controller",
+         node(addr="127.0.0.1:7717"), node(addrs=["127.0.0.1:7717"]), False),
+        ("a list of one other controller is a change",
+         node(addr="127.0.0.1:7717"), node(addrs=["127.0.0.1:7719"]), True),
     ]
     for name, a, b, want in cases:
         try:
@@ -108,6 +114,12 @@ def main():
          node(addr="[fe80::1%eth0]:7717"), node(addr="127.0.0.1:7717")),
         ("a node section that is not a mapping is refused",
          {"server": {}, "node": "nope"}, node(addr="127.0.0.1:7717")),
+        ("a node that names several controllers is refused",
+         node(addr="127.0.0.1:7717"), node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"])),
+        ("an installed node that names several controllers is refused",
+         node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), node(addr="127.0.0.1:7717")),
+        ("both server_addr and server_addrs is refused",
+         node(addr="127.0.0.1:7717", addrs=["127.0.0.1:7717"]), node(addr="127.0.0.1:7717")),
     ]
     for name, a, b in refused:
         try:
