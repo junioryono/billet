@@ -111,6 +111,12 @@ type stub struct {
 	deleteBlocks  string
 	deleteReached string
 	deleteRelease string
+	// guestSaysRefusal is a guest whose every command but the agent probe
+	// fails with tart's own words for an absent agent, each asking recorded in
+	// guestAsked: what a resolver script that reached the guest and failed
+	// while printing that phrase looks like to billet.
+	guestSaysRefusal string
+	guestAsked       string
 }
 
 func newStub(t *testing.T) *stub {
@@ -154,6 +160,8 @@ func newStub(t *testing.T) *stub {
 		deleteBlocks:     filepath.Join(dir, "delete-blocks"),
 		deleteReached:    filepath.Join(dir, "delete-reached"),
 		deleteRelease:    filepath.Join(dir, "delete-release"),
+		guestSaysRefusal: filepath.Join(dir, "guest-says-refusal"),
+		guestAsked:       filepath.Join(dir, "guest-asked"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -384,6 +392,11 @@ exec)
       echo "Failed to connect to the VM using its control socket, is the Tart Guest Agent running?" >&2
       exit 1
     fi
+  fi
+  if [ -s "` + s.guestSaysRefusal + `" ] && [ "$*" != "/bin/sh -c :" ]; then
+    echo asked >> "` + s.guestAsked + `"
+    echo "Failed to connect to the VM using its control socket, is the Tart Guest Agent running?" >&2
+    exit 1
   fi
   # A delivery carries stdin; a query (proveRunning) does not. Only the
   # delivery's stdin is recorded, so a later query cannot erase the credential
@@ -1118,6 +1131,72 @@ func TestADeleteThatHasBegunFinishesWhenItsCallerStopsWaiting(t *testing.T) {
 	}
 }
 
+// AND A DELETE THAT HAS BEGUN IS STILL BOUNDED. Off its caller's context, a
+// hung `tart delete` would hold the host-wide store lock and the node's command
+// slot for good; its own window ends it, and the VM it could not prove gone is
+// not reported destroyed.
+func TestADeleteThatHangsEndsAtItsOwnWindow(t *testing.T) {
+	s := newStub(t)
+	s.vm(t, "billet-lease1", "stopped", testOwner)
+
+	// Armed and never released: the stub's delete holds for thirty seconds.
+	if err := os.WriteFile(s.deleteBlocks, []byte("1"), 0o600); err != nil {
+		t.Fatalf("arm delete-blocks: %v", err)
+	}
+
+	p := newProvider(t, s)
+	p.deleteWindow = 200 * time.Millisecond
+
+	start := time.Now()
+	err := p.deleteProvenOurs(t.Context(), "billet-lease1")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("deleteProvenOurs = nil for a delete that never finished inside its window")
+	}
+	// A failure guard, not the condition: the stub would have finished at 30 s.
+	if elapsed > 15*time.Second {
+		t.Fatalf("the hung delete held its caller for %v, past its window and the kill's wait", elapsed)
+	}
+}
+
+// THE DELETE'S WINDOW ENDS INSIDE THE LOCK'S, kill included, so a peer waiting
+// on the store lock as a delete begins is never refused by a delete that ran
+// to its bound.
+func TestTheDeleteWindowEndsInsideTheStoreLocksWindow(t *testing.T) {
+	p, err := New(testOwner)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if p.deleteWindow+commandWaitDelay >= p.storeLockWindow {
+		t.Fatalf("delete window %v + kill wait %v does not end inside the store lock's %v",
+			p.deleteWindow, commandWaitDelay, p.storeLockWindow)
+	}
+}
+
+// A CANCELLATION BEFORE THE DELETE BEGINS STILL STOPS IT. Only a delete that
+// has begun runs on past its caller; one cancelled while the store lock was
+// taken or ownership re-proved never starts, and leaves the VM where it was.
+func TestADeleteCancelledBeforeItBeginsNeverStarts(t *testing.T) {
+	s := newStub(t)
+	s.vm(t, "billet-lease1", "stopped", testOwner)
+
+	p := newProvider(t, s)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := p.deleteProvenOurs(ctx, "billet-lease1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("deleteProvenOurs = %v, want the caller's cancellation", err)
+	}
+	if !s.dirExists("billet-lease1") {
+		t.Error("a delete cancelled before it began removed the VM")
+	}
+	if strings.Contains(s.argv(t), "delete") {
+		t.Errorf("a delete cancelled before it began still ran:\n%s", s.argv(t))
+	}
+}
+
 // A missing directory is only "already gone" when tart AGREES. A listing that
 // still reports the name while billet sees no directory means the two are
 // reading different stores — and answering TeardownStopped there frees the
@@ -1263,11 +1342,24 @@ func TestAnIsolatedLaunchWaitsForTheGuestAgentBeforeItsResolver(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	// ALL THREE REFUSALS WERE SPENT, and the resolver is the first exec of an
-	// isolated launch, so it is what waited them out.
+	// ALL THREE REFUSALS WERE SPENT ON THE AGENT PROBE, then the resolver ran,
+	// then the registration was delivered. Counting refusals alone is not
+	// enough: the delivery retries the same refusal, so a launch that skipped
+	// the resolver altogether would spend them too.
 	left, err := os.ReadFile(s.execFails)
 	if err != nil || strings.TrimSpace(string(left)) != "0" {
 		t.Fatalf("the guest's refusals left = %q (%v), want all three spent", left, err)
+	}
+
+	argv := s.argv(t)
+	probe := "exec billet-lease1 /bin/sh -c :\n"
+	if n := strings.Count(argv, probe); n != 4 {
+		t.Fatalf("the agent was probed %d times, want three refusals and one answer:\n%s", n, argv)
+	}
+	lastProbe, resolver, delivery := strings.LastIndex(argv, probe), strings.Index(argv, "resolves()"),
+		strings.Index(argv, "exec -i ")
+	if lastProbe < 0 || resolver < lastProbe || delivery < resolver {
+		t.Fatalf("want the probe answered, then the resolver, then the delivery; got:\n%s", argv)
 	}
 
 	stdin, err := os.ReadFile(s.execStdin)
@@ -1276,12 +1368,14 @@ func TestAnIsolatedLaunchWaitsForTheGuestAgentBeforeItsResolver(t *testing.T) {
 	}
 }
 
-// AND ONLY THE AGENT'S ABSENCE IS RETRIED. Any other failure reached the guest
-// or says something retrying will not change, so the launch reports it at once.
-func TestAnIsolatedLaunchDoesNotRetryAResolverThatReachedTheGuest(t *testing.T) {
+// AND ONLY THE AGENT'S ABSENCE IS RETRIED. Any other failure of the probe
+// reached the guest or says something retrying will not change, so the launch
+// reports it at once.
+func TestAnIsolatedLaunchRetriesOnlyTheAgentsAbsence(t *testing.T) {
 	s := newStub(t)
 
-	// The first exec fails for a reason of its own; any second one hangs.
+	// The first exec, the agent probe, fails for a reason of its own; any
+	// second one hangs.
 	if err := os.WriteFile(s.execHang, []byte("1"), 0o600); err != nil {
 		t.Fatalf("arm exec-hang: %v", err)
 	}
@@ -1300,10 +1394,51 @@ func TestAnIsolatedLaunchDoesNotRetryAResolverThatReachedTheGuest(t *testing.T) 
 	_, err := p.Launch(ctx, spec)
 	if err == nil || !strings.Contains(err.Error(), "configure the isolated guest's resolver") ||
 		!strings.Contains(err.Error(), "exit status 3") {
-		t.Fatalf("Launch = %v, want the resolver's own failure reported", err)
+		t.Fatalf("Launch = %v, want the probe's own failure reported", err)
 	}
 	if _, statErr := os.Stat(s.execHanging); statErr == nil {
-		t.Fatal("the resolver was asked again after a failure that had reached the guest")
+		t.Fatal("the guest was asked again after a failure that had reached it")
+	}
+}
+
+// THE RESOLVER IS ASKED ONCE, WHATEVER IT SAYS. Its error carries the guest's
+// stderr, so a script that reached the guest and failed while printing tart's
+// words for an absent agent would read as that refusal; retrying it would
+// repeat the script's changes until the deadline. Once the probe has been
+// answered, the resolver's failure is the launch's.
+func TestAnIsolatedLaunchDoesNotRetryAResolverThatReachedTheGuest(t *testing.T) {
+	s := newStub(t)
+
+	if err := os.WriteFile(s.guestSaysRefusal, []byte("1"), 0o600); err != nil {
+		t.Fatalf("arm guest-says-refusal: %v", err)
+	}
+
+	p := newProvider(t, s)
+	p.execRetry = time.Millisecond
+	WithConfig(config.TartConfig{
+		UntrustedIsolation: config.IsolationSoftnet, UntrustedDNS: []string{"1.1.1.1"},
+	})(p)
+
+	spec := validSpec("billet-lease1")
+	spec.Trust = provider.TrustUntrusted
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	_, err := p.Launch(ctx, spec)
+	if err == nil || !strings.Contains(err.Error(), "configure the isolated guest's resolver") {
+		t.Fatalf("Launch = %v, want the resolver's failure reported", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Launch = %v: the resolver was retried until the deadline", err)
+	}
+
+	asked, readErr := os.ReadFile(s.guestAsked)
+	if readErr != nil {
+		t.Fatalf("read what the guest was asked: %v", readErr)
+	}
+	if n := strings.Count(string(asked), "asked"); n != 1 {
+		t.Fatalf("the resolver reached the guest %d times, want once", n)
 	}
 }
 

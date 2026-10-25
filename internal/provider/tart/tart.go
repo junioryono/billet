@@ -272,6 +272,11 @@ type Provider struct {
 	// Seams for the reason the others are.
 	storeLockWindow time.Duration
 	storeLockRetry  time.Duration
+	// deleteWindow bounds one `tart delete` once it has begun, on its own
+	// rather than the caller's context. It ends, with the kill's wait, inside
+	// storeLockWindow, so a peer that began waiting as the delete began still
+	// gets the lock rather than a refusal. A seam for the reason the others are.
+	deleteWindow time.Duration
 	// resolverWaits is how many one-second checks the guest's resolver script
 	// makes before calling the configuration failed. A seam for the reason
 	// execRetry is one: the failure paths are the interesting ones to test, and
@@ -421,6 +426,7 @@ func New(owner string, opts ...Option) (*Provider, error) {
 
 		storeLockWindow: 2 * time.Minute,
 		storeLockRetry:  25 * time.Millisecond,
+		deleteWindow:    100 * time.Second,
 
 		lsof:         "/usr/sbin/lsof",
 		ps:           "/bin/ps",
@@ -1116,41 +1122,14 @@ func (p *Provider) configureResolver(ctx context.Context, spec provider.Spec) er
 		return nil
 	}
 
-	// THE FIRST THING AN ISOLATED LAUNCH ASKS THE GUEST, so it waits for the
-	// guest agent the way the registration's delivery does. A VM tart lists as
-	// running has not started its agent yet, and a `tart exec` that finds none
-	// blocks for 30 seconds and then fails: measured with tart 2.36.0 on macOS
-	// 26 (M2 Max, ubuntu-runner-arm64, 2026-10-25), the agent answered 30.7,
-	// 40.5 and 30.8 seconds after the VM was listed, so a single attempt failed
-	// every untrusted launch there. Only that refusal is retried, because the
-	// script never reached the guest; the caller's deadline bounds the wait.
-	script := resolverScript(p.cfg.UntrustedDNS, p.resolverWaits)
+	if err := p.awaitAgent(ctx, spec.Name); err != nil {
+		return fmt.Errorf("configure the isolated guest's resolver: %w", err)
+	}
 
-	retry := time.NewTimer(p.execRetry)
-	defer retry.Stop()
-
-	var out string
-
-	for {
-		var err error
-
-		out, err = p.run(ctx, "exec", spec.Name, "/bin/sh", "-c", script)
-		if err == nil {
-			break
-		}
-
-		if !isAgentNotListening(err) || ctx.Err() != nil {
-			return fmt.Errorf("configure the isolated guest's resolver: %w", err)
-		}
-
-		retry.Reset(p.execRetry)
-
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("configure the isolated guest's resolver: the guest agent never "+
-				"answered: %w (last attempt: %w)", ctx.Err(), err)
-		case <-retry.C:
-		}
+	out, err := p.run(ctx, "exec", spec.Name, "/bin/sh", "-c",
+		resolverScript(p.cfg.UntrustedDNS, p.resolverWaits))
+	if err != nil {
+		return fmt.Errorf("configure the isolated guest's resolver: %w", err)
 	}
 
 	if !strings.Contains(out, "ok") {
@@ -2571,6 +2550,40 @@ func (p *Provider) run(ctx context.Context, args ...string) (string, error) {
 	}
 
 	return stdout.String(), nil
+}
+
+// awaitAgent waits for a guest's agent to answer, the first thing an isolated
+// launch asks of a guest.
+//
+// A VM tart lists as running has not started its agent yet, and a `tart exec`
+// that finds none blocks for 30 seconds and then fails: measured with tart
+// 2.36.0 on macOS 26 (M2 Max, ubuntu-runner-arm64, 2026-10-25), the agent
+// answered 30.7, 40.5 and 30.8 seconds after the VM was listed, so asking once
+// failed every untrusted launch there. The question is a command that prints
+// nothing, so the refusal it retries can only be tart's own, never words a
+// guest wrote, and no work is repeated by asking again. The caller's deadline
+// bounds the wait.
+func (p *Provider) awaitAgent(ctx context.Context, name string) error {
+	retry := time.NewTimer(p.execRetry)
+	defer retry.Stop()
+
+	for {
+		_, err := p.run(ctx, "exec", name, "/bin/sh", "-c", ":")
+		if err == nil {
+			return nil
+		}
+		if !isAgentNotListening(err) || ctx.Err() != nil {
+			return fmt.Errorf("ask the guest agent whether it is listening: %w", err)
+		}
+
+		retry.Reset(p.execRetry)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("the guest agent never answered: %w", ctx.Err())
+		case <-retry.C:
+		}
+	}
 }
 
 // isAgentNotListening reports whether a `tart exec` failed before reaching the
