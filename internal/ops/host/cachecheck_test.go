@@ -173,6 +173,7 @@ func TestJudgeNodeCache(t *testing.T) {
 				// on a hosted runner — and a report that called it unavailable
 				// would send an operator to debug a step that works.
 				"actions/cache still reaches GitHub",
+				"no npm registry cache",
 				"image_pool billet-images is unaffected",
 			},
 			unwant: []string{"NONE", "billet-4vcpu"},
@@ -238,6 +239,50 @@ func TestJudgeNodeCache(t *testing.T) {
 	}
 }
 
+// A DEPLOYMENT WITH NO NPM CACHE SAYS SO, since its jobs then each meet a
+// registry stall themselves (#631); one with the cache names the tiers that
+// have it, and claims no more than the configuration; and a file with no
+// tiers, a fleet node's, says nothing, because the tiers are the control
+// plane's.
+func TestJudgeNpmCacheNamesTheTiersThatHaveIt(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	npm := &config.TierCache{Npm: &config.NpmCache{Enabled: &enabled}}
+	cases := map[string]struct {
+		tiers  []config.Tier
+		want   []string
+		unwant []string
+	}{
+		"no tier enables it": {
+			tiers: []config.Tier{{Label: "a"}, {Label: "b", Cache: &config.TierCache{}}},
+			want:  []string{"NO NPM CACHE: no tier enables cache.npm", "cache.npm.enabled: true"},
+		},
+		"two of three do": {
+			tiers: []config.Tier{{Label: "a", Cache: npm}, {Label: "b"}, {Label: "c", Cache: npm}},
+			want: []string{"2 of 3 tiers fetch registry.npmjs.org through their node's npm cache: a, c",
+				"(configured, not probed)"},
+			unwant: []string{"NO NPM CACHE", ", b"},
+		},
+	}
+	for name, tc := range cases {
+		report := strings.Join(judgeNpmCache(&config.Config{Tiers: tc.tiers}), "\n")
+		for _, want := range tc.want {
+			if !strings.Contains(report, want) {
+				t.Errorf("%s: the report does not say %q:\n%s", name, want, report)
+			}
+		}
+		for _, unwant := range tc.unwant {
+			if strings.Contains(report, unwant) {
+				t.Errorf("%s: the report says %q:\n%s", name, unwant, report)
+			}
+		}
+	}
+	if lines := judgeNpmCache(&config.Config{Node: &config.NodeConfig{Name: "fleet-1"}}); lines != nil {
+		t.Errorf("a file with no tiers said %q", lines)
+	}
+}
+
 // THE JUDGE IS REACHED BY THE COMMAND, which is the half a unit test on the
 // function cannot establish: the verdict existed and nothing called it would
 // leave `billet check` exactly as silent as the deployment this fixes.
@@ -267,6 +312,11 @@ func TestCheckRefusesAnEBSStoreWithNoCacheListener(t *testing.T) {
 		}
 	}
 	printedOnce(t, out, "cache    NONE: node.ebs_s3 names a cache store")
+	// THE NPM FINDING IS THE COMMAND'S, said once after the tiers it is about.
+	printedOnce(t, out, "npm      NO NPM CACHE: no tier enables cache.npm")
+	if strings.Index(out, "npm      NO NPM CACHE") < strings.Index(out, "tiers    ") {
+		t.Errorf("the npm finding was printed before the tiers it is about:\n%s", out)
+	}
 	if !strings.Contains(out, "instance's ROOT VOLUME") {
 		t.Errorf("the report does not say what the jobs get instead:\n%s", out)
 	}

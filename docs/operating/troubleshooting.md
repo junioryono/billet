@@ -68,6 +68,7 @@ The failure mode of this system is a job that queues rather than an error. Start
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `npm`, `pnpm` or `pnpm/setup` times out reaching `registry.npmjs.org` on some jobs and not their siblings | each job fetches the registry itself, so a stall on the site's way out fails every job that meets it; `billet check` says `NO NPM CACHE` after the tiers | turn on the npm cache for the tier (`cache.npm.enabled: true`, a firecracker Linux tier, [ADR-020](../reference/decisions/adr-020-npm-registry-interception.md)): a package one job fetched is then served from the node, and the node retries a fetch that gets no answer |
 | a step waits minutes where it took seconds, or until its timeout, and its log names nothing it was waiting for | the guest sent on connections nothing answered: a SYN with no reply, or a datagram, a DNS query among them, that drew none | on a firecracker node with `node.monitoring.flows`, `billet jobs show <lease>`: its `unanswered` line names every destination with a connection that got nothing back, the most first, even one too small for the table; a resolver at the node's address is the job's DNS, and an address outside the site is the job's own traffic. `not counted` is a node, or a control plane, older than the count, or a connection tracker that kept no packet counts, and says nothing either way |
 
 ## Capacity that does not come back
