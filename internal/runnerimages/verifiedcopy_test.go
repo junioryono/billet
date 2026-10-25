@@ -36,3 +36,30 @@ func TestAToolsetThatIsNotItsPinIsRefusedNamingItsSource(t *testing.T) {
 		}
 	}
 }
+
+// THE GETTER ITSELF REFUSES AN EMBEDDED DECLARATION THAT IS NOT ITS PIN, for each
+// architecture. Not parallel: it swaps the package's embedded bytes, and Go runs
+// every parallel test only after the sequential ones have returned.
+func TestToolsetBytesForRefusesAnEmbeddedDeclarationThatIsNotItsPin(t *testing.T) {
+	for _, arch := range []string{ArchX64, ArchArm64} {
+		embedded := &toolset
+		if arch == ArchArm64 {
+			embedded = &toolsetArm64
+		}
+		original := *embedded
+		*embedded = append(append([]byte{}, original...), ' ')
+		_, err := ToolsetBytesFor(arch)
+		*embedded = original
+		file, fileErr := ToolsetFileFor(arch)
+		if fileErr != nil {
+			t.Fatal(fileErr)
+		}
+		if err == nil || !strings.Contains(err.Error(), "/"+file) {
+			t.Fatalf("%s: ToolsetBytesFor answered %v for bytes that are not the pinned ones, want a "+
+				"refusal naming %s", arch, err, file)
+		}
+		if _, err := ToolsetBytesFor(arch); err != nil {
+			t.Fatalf("%s: the restored declaration was refused: %v", arch, err)
+		}
+	}
+}

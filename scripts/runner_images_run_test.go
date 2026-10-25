@@ -678,12 +678,18 @@ func TestABuildResumesAtItsStepAndARebootTellsTheDriverWhere(t *testing.T) {
 		t.Fatalf("the download did not arrive (%v): %q", err, report)
 	}
 
-	for _, from := range []string{"0", "07", "x", "-1", "7"} {
+	for from, clause := range map[string]string{
+		"0":  "which is not a step number",
+		"04": "which is not a step number",
+		"x":  "which is not a step number",
+		"-1": "which is not a step number",
+		"7":  "has 6 steps",
+	} {
 		fx := newRunnerFixture(t)
 		fx.env = []string{"BILLET_RI_FROM=" + from}
 		output, calls, err := runRunner(t, fx)
-		if err == nil || !strings.Contains(output, "BILLET_RI_FROM") {
-			t.Errorf("BILLET_RI_FROM=%s: answered %v, want a refusal naming it:\n%s", from, err, output)
+		if err == nil || !strings.Contains(output, clause) {
+			t.Errorf("BILLET_RI_FROM=%s: answered %v, want a refusal saying %q:\n%s", from, err, clause, output)
 		}
 		if len(calls) != 0 {
 			t.Errorf("BILLET_RI_FROM=%s: the target was touched before the refusal: %v", from, calls)
