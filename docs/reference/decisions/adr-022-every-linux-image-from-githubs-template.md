@@ -16,7 +16,7 @@ ADR-005 lists these as still to come (#25). #212 reimplemented nine of them and 
 **arm64** has an AMI, built with the same installers, and no published Firecracker guest. At the commit billet pins (`e75633902841`, the `ubuntu24/20260920.314` image release), GitHub's repository carries an arm64 build of its own. Read from the vendored tree and from upstream at that commit, 2026-10-25:
 - `images/ubuntu/templates/build.ubuntu-24_04-arm64.pkr.hcl` reads `images/ubuntu/toolsets/toolset-2404-arm64.json`. billet vendors that toolset nowhere yet; it vendors only `toolset-2404.json`, into `internal/runnerimages`.
 - The arm64 template runs the x64 template's steps except nine: Bicep, the CodeQL bundle, Microsoft Edge, Google Chrome, Haskell, Miniconda, Julia, the Android SDK and PyPy.
-- 23 of the 83 build scripts branch on the architecture (`is_arm64`, `Test-IsArm64` or `aarch64`), mostly to pick a download. The rest are architecture-neutral.
+- Many build scripts pick an architecture-specific download through `is_arm64`. Some download x64 artifacts with no such branch, such as CodeQL and Miniconda, which is why the arm64 template leaves them out.
 - GitHub's tests skip Chrome, Edge, Chromium, Android, Haskell and Bicep on arm64 (`Test-IsArm64`). Firefox's are not skipped.
 
 So "parity on arm64" has a definition GitHub wrote: its own arm64 image, which carries Rust and Swift and has no Haskell.
@@ -39,12 +39,12 @@ So "parity on arm64" has a definition GitHub wrote: its own arm64 image, which c
   - The Azure agent's differences, Docker's classic store and the build user Homebrew runs as apply everywhere.
   - An entry naming a step that one of its targets' plans lacks stops the build before anything runs, as it does today.
 - **The AMI builder has a stated end state.**
-  - The template reboots once, mid-build. The build runs as a oneshot systemd unit that knows a build identity from its user data: a nonce billet invents per build.
-  - Before the reboot, the build writes that identity, the next step and the phase it is in. At the next boot it continues from that record.
-  - A boot that finds the unit enabled and no record carrying its identity is an unplanned restart. The build reports failure and stops.
-  - It ends one of two ways. It prints a nonce-bound verdict to the console and powers off. Or it prints a nonce-bound failure and halts without powering off, so billet's poll reads the failure while the machine is still there to debug.
-  - Before the success verdict, it disables and removes its own unit and inputs. An instance launched from the AMI therefore never runs the build.
-  - billet images a stopped builder only after reading the success verdict for this build's nonce on its console. A stop alone is no longer success. The template's own output goes to the journal and not to the serial console, so it cannot push the verdict out of EC2's 64 KiB console tail, and nothing it prints carries the nonce.
+  - The template reboots once, mid-build. The build runs as a oneshot systemd unit that knows a build identity from its user data: a nonce billet invents per build. The nonce guards against accidental output. It is not a secret from a hostile build step, which as root can read the user data.
+  - The build keeps a record of its identity, its phase (`started`, `rebooting`, `resumed`), the step it reached and the boot it ran in. The step before the reboot writes the phase `rebooting` and the next step. The next boot continues only from `rebooting`, and records `resumed` with its own boot id.
+  - Any other boot that finds the unit enabled is an unplanned restart, and the build reports failure and stops: a record in another phase, a phase of `resumed` under a different boot, or no record after the first boot. The first boot is the one that writes `started`.
+  - The build ends one of two ways. On success it prints a nonce-bound verdict to the console, again and again for a dwell, as the verifier does, and then powers off. On failure it prints a nonce-bound failure and halts without powering off, so billet's poll reads the failure while the machine is still there to debug.
+  - Before the success verdict, the build disables and removes its own unit, its inputs and cloud-init's copies of the user data. An instance launched from the AMI therefore never runs the build.
+  - billet images a stopped builder only after reading the success verdict for this build's nonce on its live console while the builder ran. A stop alone is no longer success. The template's own output goes to the journal and not to the serial console, so it cannot push the verdict out of EC2's 64 KiB console tail.
   - The builder is a Nitro type, which serves the live console read the verifier already uses.
 - **What the AMI is checked with.** GitHub's own Pester suite, run by the template during the build, checks what GitHub's image carries. It runs with the template's environment, though, and a job on an AMI starts under `env -i` with `/etc/billet-image-env`.
   - The boot verifier therefore keeps a check through the job's own path: on a machine booted from the AMI, `billet_as_runner` runs each architecture's toolchains (`rustc`, `cargo`, `swift`, `go`, `node`, `python3`, `java`, `dotnet`, `pwsh`, `ghc` on x64) and each accepted component's binary.
@@ -67,18 +67,20 @@ So "parity on arm64" has a definition GitHub wrote: its own arm64 image, which c
   - The channel pointer is unchanged.
 - **No flag day.** Neither schema changes. An older billet on arm64 reads `manifest.json` and `Usable` refuses it, as it does today.
 - **How a newer billet reads it.** It reads the manifest named for its own architecture.
-  - A release is immutable once the channel names it, so a release that has no such file never will. The answer is final: "the channel's current release carries no image for aarch64".
-  - Any other failure is retried as today, and then is could-not-tell.
+  - A release is immutable once the channel names it, so the release's own asset list, which the reader fetches, settles whether it carries an aarch64 set. An answer that the list lacks one is final: "the channel's current release carries no image for aarch64".
+  - A failure to read the list or the manifest is retried as today, and then is could-not-tell.
+- **An operator's own source keeps working.** A deployment that points `images.source` or `--from` at a source of its own reads the manifest named for its architecture, and falls back to `manifest.json` when there is none. `Usable` judges whatever it read, so a mirror that publishes a single arm64 `manifest.json` keeps working, as it does today.
 - **Generations record their architecture.**
-  - An import records the manifest's architecture on the generation. `@verified` and an exact generation resolve only among generations of the node's own architecture.
+  - An import records the manifest's architecture on the generation, checked and written under the image's publish lock. `@verified` and an exact generation resolve only among generations of the node's own architecture.
   - A pull refuses to import into an image whose existing generations are another architecture's, so one site's x64 and arm64 nodes cannot share a Ceph image by naming the same one.
-  - The node's image is `ubuntu-2404-arm64`, and a tier names `ubuntu-2404-arm64@verified`.
-  - A generation imported before this change, which records nothing, is read as x86_64, the only architecture billet has published.
+  - A generation imported before this change records no architecture. The node reads it from the generation's paired kernel, which it holds on disk: an ELF `vmlinux` for x86-64 is x86_64, and a PE `Image` for arm64 is aarch64. It records that under the same lock. A generation whose kernel the node does not hold stays unknown, and no node resolves to it.
+  - A node's image for arm64 is `ubuntu-2404-arm64`, and a tier names `ubuntu-2404-arm64@verified`.
+- **Tiers are placed by architecture.** A tier may say `arch: x64` or `arch: arm64`. Each node reports its own architecture when it registers, from the wire version that carries it, and the control plane places a tier that names an architecture only on nodes reporting it. A tier without `arch` places as it does today. A node from before that wire version reports nothing, and is not eligible for a tier that names an architecture. A Firecracker node also refuses to launch a generation of another architecture, so a tier placed wrongly fails closed.
 
 **The x64 build gates the release; the arm64 build joins it, or its last good image is carried forward.**
 - **The builders.** Both legs run in one workflow run, each on a builder of its own architecture: `billet-image-builder-ubuntu-2404`, and `billet-image-builder-ubuntu-2404-arm64`, an EC2 tier on the reference deployment.
 - **x64 fails.** Nothing is published.
-- **arm64 fails.** The run is red, and the release carries the previous release's aarch64 set unchanged: its signed manifest, its bundle, its parts and its corresponding source, each held to the manifest's digests before upload. An arm64 node or a new one still finds the last good image through the one channel. The image's `built_at` says how old it is, and `billet check` reports its runner's window. When no previous release carries an aarch64 set, x64 is published alone.
+- **arm64 fails.** The run is red, and the release carries the previous release's aarch64 set unchanged: its signed manifest, its bundle, its parts and its corresponding source. Before upload, the manifest is verified against `imagesource`'s signing policy, each image asset against the manifest's digests, and each source part against that set's own parts list and index. The aarch64 set's provenance stays the release it was first published in, whose tag points at the commit that built it. The new release's notes name that release, since the new tag points at the x64 build's commit. An arm64 node, or a new one, still finds the last good image through the one channel. The image's `built_at` says how old it is, and `billet check` reports its runner's window. When no previous release carries an aarch64 set, x64 is published alone.
 - **Boot checks.** Each leg passes its own architecture's gates. Each image is proved to boot by `billet images pull --verify` on a node of its architecture before any tier resolves `@verified` to it. On arm64 that is a Firecracker host with KVM, which on AWS means a metal Graviton instance. Virtualised Graviton instances expose no `/dev/kvm`.
 
 **The arm64 guest kernel is built for Firecracker's aarch64 boot protocol.** Firecracker loads a PE `Image` on aarch64 and an ELF `vmlinux` on x86_64 (Firecracker's `docs/rootfs-and-kernel-setup.md`). The aarch64 kernel starts from Firecracker's own aarch64 CI config and carries the same `required-builtins.txt`, plus a per-architecture file that the build and the gate both read.
