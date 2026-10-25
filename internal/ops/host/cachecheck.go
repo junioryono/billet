@@ -181,8 +181,14 @@ func judgeNpmCache(cfg *config.Config) []string {
 		}
 	}
 
-	return []string{fmt.Sprintf("%d of %d tiers fetch registry.npmjs.org through their node's npm "+
-		"cache: %s (configured, not probed)", len(on), len(cfg.Tiers), strings.Join(on, ", "))}
+	// WHAT THE TIERS ASK FOR, NOT WHAT A NODE SERVES: a node with no node.cache
+	// serves no npm cache, and which node a tier's job lands on is placement's.
+	return []string{
+		fmt.Sprintf("%d of %d tiers enable the npm cache: %s (configured, not probed)", len(on),
+			len(cfg.Tiers), strings.Join(on, ", ")),
+		"a job of one is served it by a node with node.cache, and fetches registry.npmjs.org " +
+			"itself on a node without",
+	}
 }
 
 // printNodeCache renders the node's cache verdict in the column `billet check`

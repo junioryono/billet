@@ -260,8 +260,8 @@ func TestJudgeNpmCacheNamesTheTiersThatHaveIt(t *testing.T) {
 		},
 		"two of three do": {
 			tiers: []config.Tier{{Label: "a", Cache: npm}, {Label: "b"}, {Label: "c", Cache: npm}},
-			want: []string{"2 of 3 tiers fetch registry.npmjs.org through their node's npm cache: a, c",
-				"(configured, not probed)"},
+			want: []string{"2 of 3 tiers enable the npm cache: a, c (configured, not probed)",
+				"served it by a node with node.cache, and fetches registry.npmjs.org itself on a node without"},
 			unwant: []string{"NO NPM CACHE", ", b"},
 		},
 	}
@@ -280,6 +280,50 @@ func TestJudgeNpmCacheNamesTheTiersThatHaveIt(t *testing.T) {
 	}
 	if lines := judgeNpmCache(&config.Config{Node: &config.NodeConfig{Name: "fleet-1"}}); lines != nil {
 		t.Errorf("a file with no tiers said %q", lines)
+	}
+}
+
+// THE NPM FINDING IS PRINTED BY THE COMMAND IN EVERY ROLE THAT HAS TIERS, once,
+// after the last of them; and a file with no tiers, a fleet node's, prints none.
+func TestCheckPrintsTheNpmFindingAfterTheTiers(t *testing.T) {
+	stubGitHubUnverifiable(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+	cfgPath := writeUntrustedCheckConfig(t, "billet-first", "billet-second")
+	var err error
+	out := capture(t, func() { err = Check(t.Context(), processEnv(), []string{"--config", cfgPath}) })
+	if err != nil {
+		t.Fatalf("a control plane with an unreachable GitHub failed the check: %v\n%s", err, out)
+	}
+	printedOnce(t, out, "npm      NO NPM CACHE: no tier enables cache.npm")
+	if at, last := strings.Index(out, "npm      NO NPM CACHE"), strings.Index(out, "  billet-second "); last < 0 ||
+		at < last {
+		t.Errorf("the npm finding was not printed after the last tier:\n%s", out)
+	}
+
+	full, readErr := os.ReadFile(writeCacheCheckConfig(t, fakeEC2(t, "AKIDEXAMPLE"), ""))
+	if readErr != nil {
+		t.Fatalf("read the node fixture: %v", readErr)
+	}
+	body, _, found := strings.Cut(string(full), "tiers:")
+	if !found {
+		t.Fatalf("the node fixture has no tiers to cut:\n%s", full)
+	}
+	fleetNode := filepath.Join(t.TempDir(), "billet.yaml")
+	if writeErr := os.WriteFile(fleetNode, []byte(body), 0o600); writeErr != nil {
+		t.Fatalf("write the fleet node's file: %v", writeErr)
+	}
+	out = capture(t, func() { err = Check(t.Context(), processEnv(), []string{"--config", fleetNode}) })
+	// THE FIXTURE'S OWN REFUSAL, a store with no listener, and nothing else.
+	if err == nil || !strings.Contains(err.Error(), "node.ebs_s3 names a cache store nothing can reach") {
+		t.Errorf("the fleet node's check answered %v, want only its cache refusal", err)
+	}
+	if !strings.Contains(out, "node     aws-1") {
+		t.Fatalf("the fleet node's check did not reach its node section:\n%s", out)
+	}
+	if strings.Contains(out, "\nnpm ") {
+		t.Errorf("a file with no tiers printed an npm finding:\n%s", out)
 	}
 }
 
