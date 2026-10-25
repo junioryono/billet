@@ -48,13 +48,14 @@ The router's port 80 and the other host's SSH both answered from the Mac, so the
 - **The cause:** billet configures an isolated guest's resolver before it delivers the registration, and it asked once. tart lists a VM as running before the guest has started its agent, and a `tart exec` that finds no agent blocks for 30 seconds and then fails.
 - **Measured on this Mac:** three boots of this image, the agent answered 30.7, 40.5 and 30.8 seconds after the VM was listed, and each failed exec had blocked 30.0 to 30.1 seconds. So every untrusted launch here failed.
 - **Why it had not shown before:** the registration's delivery already retried this refusal. A faster Mac's guest wins the race, which may be why the reference Mac never showed it.
-- **The fix:** the resolver now retries that refusal, and only that one, until the caller's deadline. The first green launch reported `took=1m19.68s`.
+- **The fix, as measured:** the resolver retried that refusal, and only that one, until the caller's deadline. The first green launch reported `took=1m19.68s`.
+- **The fix, as merged:** review found the resolver's error carries the guest's stderr, so a retry keyed on the phrase could be set off by guest output. A launch now probes the agent with a command that prints nothing, retrying only that refusal, and then runs the resolver once. Both runs above used the measured version.
 
 **A failed launch's cleanup killed `tart delete` part-way.**
 - **The failure:** the stray cleanup after the failed launch has a 30-second bound. It ran out during the delete (`tart delete: signal: killed`).
 - **What it left:** a lease-named directory holding `config.json`, `nvram.bin`, the control socket and the ownership marker, but no disk.
 - **Why that stops the node:** tart cannot read the directory (`VM is missing files for a supported layout`), and billet's `List` rightly refuses to guess what it is. So every sweep and custody pass on the node failed until the directory was removed by hand. Before removing it, `lsof +D` and the process table showed no opener and no VM process.
-- **The fix:** a delete that has begun now finishes on its own two-minute bound, the store lock's, whatever its caller does.
+- **The fix:** a delete that has begun now finishes on its own bound, whatever its caller does. The runs above used two minutes; review lowered it to 100 s, so that with the kill's wait it ends inside the store lock's two-minute window. A cancellation that lands before the delete begins still stops it.
 
 **And one operator trap the run walked into, not fixed here.** On macOS a unix socket path is at most 103 bytes. A workspace under a long temporary directory made the node's upgrade socket 167 bytes, and the node refused to start ("use a shorter node.state_dir path"). `billet acceptance up` does not check this; a short `--workspace` avoids it.
 

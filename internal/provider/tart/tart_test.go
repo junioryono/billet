@@ -117,6 +117,9 @@ type stub struct {
 	// while printing that phrase looks like to billet.
 	guestSaysRefusal string
 	guestAsked       string
+	// probeSays is a guest whose shell answers the agent probe with these
+	// bytes on stderr and a failure: what billet must never quote.
+	probeSays string
 }
 
 func newStub(t *testing.T) *stub {
@@ -162,6 +165,7 @@ func newStub(t *testing.T) *stub {
 		deleteRelease:    filepath.Join(dir, "delete-release"),
 		guestSaysRefusal: filepath.Join(dir, "guest-says-refusal"),
 		guestAsked:       filepath.Join(dir, "guest-asked"),
+		probeSays:        filepath.Join(dir, "probe-says"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -392,6 +396,10 @@ exec)
       echo "Failed to connect to the VM using its control socket, is the Tart Guest Agent running?" >&2
       exit 1
     fi
+  fi
+  if [ -s "` + s.probeSays + `" ] && [ "$*" = "/bin/sh -c :" ]; then
+    cat "` + s.probeSays + `" >&2
+    exit 1
   fi
   if [ -s "` + s.guestSaysRefusal + `" ] && [ "$*" != "/bin/sh -c :" ]; then
     echo asked >> "` + s.guestAsked + `"
@@ -1145,19 +1153,35 @@ func TestADeleteThatHangsEndsAtItsOwnWindow(t *testing.T) {
 	}
 
 	p := newProvider(t, s)
-	p.deleteWindow = 200 * time.Millisecond
+	// LONG ENOUGH FOR THE STUB TO REACH ITS DELETE: a window shorter than the
+	// stub's own start kills it first, and the test then proves nothing.
+	p.deleteWindow = 3 * time.Second
 
 	start := time.Now()
 	err := p.deleteProvenOurs(t.Context(), "billet-lease1")
 	elapsed := time.Since(start)
 
-	if err == nil {
-		t.Fatal("deleteProvenOurs = nil for a delete that never finished inside its window")
+	if _, statErr := os.Stat(s.deleteReached); statErr != nil {
+		t.Fatalf("the delete never began (%v), so its bound was not what ended it: %v", statErr, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "delete billet-lease1:") ||
+		!strings.Contains(err.Error(), "signal: killed") {
+		t.Fatalf("deleteProvenOurs = %v, want the begun delete killed at its window and reported", err)
 	}
 	// A failure guard, not the condition: the stub would have finished at 30 s.
 	if elapsed > 15*time.Second {
 		t.Fatalf("the hung delete held its caller for %v, past its window and the kill's wait", elapsed)
 	}
+	if !s.dirExists("billet-lease1") {
+		t.Error("a delete killed at its window is reported failed, so the VM must still be there")
+	}
+
+	// THE STORE LOCK CAME BACK with the delete's end, not with the stub's.
+	unlock, lockErr := p.lockStore(t.Context(), "prove the lock was released")
+	if lockErr != nil {
+		t.Fatalf("the store lock was still held after the bounded delete returned: %v", lockErr)
+	}
+	unlock()
 }
 
 // THE DELETE'S WINDOW ENDS INSIDE THE LOCK'S, kill included, so a peer waiting
@@ -1398,6 +1422,34 @@ func TestAnIsolatedLaunchRetriesOnlyTheAgentsAbsence(t *testing.T) {
 	}
 	if _, statErr := os.Stat(s.execHanging); statErr == nil {
 		t.Fatal("the guest was asked again after a failure that had reached it")
+	}
+}
+
+// A PROBE THAT FAILS IS REPORTED BY ITS STATUS, NEVER BY WHAT THE GUEST WROTE.
+// The probe's error carries the guest shell's stderr, and nothing a guest
+// writes may reach a billet error.
+func TestAFailedAgentProbeDoesNotQuoteTheGuest(t *testing.T) {
+	s := newStub(t)
+
+	const hostile = "GUEST-CHOSEN-TEXT"
+	if err := os.WriteFile(s.probeSays, []byte(hostile), 0o600); err != nil {
+		t.Fatalf("arm probe-says: %v", err)
+	}
+
+	p := newProvider(t, s)
+	WithConfig(config.TartConfig{
+		UntrustedIsolation: config.IsolationSoftnet, UntrustedDNS: []string{"1.1.1.1"},
+	})(p)
+
+	spec := validSpec("billet-lease1")
+	spec.Trust = provider.TrustUntrusted
+
+	_, err := p.Launch(t.Context(), spec)
+	if err == nil || !strings.Contains(err.Error(), "ask the guest agent whether it is listening: exit status 1") {
+		t.Fatalf("Launch = %v, want the probe's failure reported by its exit status", err)
+	}
+	if strings.Contains(err.Error(), hostile) {
+		t.Fatalf("Launch = %v: the guest's own words reached the error", err)
 	}
 }
 

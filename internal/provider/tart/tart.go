@@ -2560,9 +2560,11 @@ func (p *Provider) run(ctx context.Context, args ...string) (string, error) {
 // 2.36.0 on macOS 26 (M2 Max, ubuntu-runner-arm64, 2026-10-25), the agent
 // answered 30.7, 40.5 and 30.8 seconds after the VM was listed, so asking once
 // failed every untrusted launch there. The question is a command that prints
-// nothing, so the refusal it retries can only be tart's own, never words a
-// guest wrote, and no work is repeated by asking again. The caller's deadline
-// bounds the wait.
+// nothing and changes nothing, so asking again repeats no work: a guest whose
+// shell answered it with tart's words for an absent agent would only hold its
+// own launch until the caller's deadline, which bounds the wait. A probe that
+// fails otherwise is reported by its exit status alone, never by what the
+// guest wrote.
 func (p *Provider) awaitAgent(ctx context.Context, name string) error {
 	retry := time.NewTimer(p.execRetry)
 	defer retry.Stop()
@@ -2573,7 +2575,14 @@ func (p *Provider) awaitAgent(ctx context.Context, name string) error {
 			return nil
 		}
 		if !isAgentNotListening(err) || ctx.Err() != nil {
-			return fmt.Errorf("ask the guest agent whether it is listening: %w", err)
+			// p.run wraps exactly one error, the command's own, which carries
+			// no stderr.
+			cause := errors.Unwrap(err)
+			if cause == nil {
+				cause = errors.New("tart exec failed")
+			}
+
+			return fmt.Errorf("ask the guest agent whether it is listening: %w", cause)
 		}
 
 		retry.Reset(p.execRetry)

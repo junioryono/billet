@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -147,13 +148,55 @@ func TestTheEvidenceNamesAJobWhoseHistoryCouldNotBeRead(t *testing.T) {
 		}
 	})
 
-	jobs := []acceptanceJob{{LeaseID: "a-lease-with-no-history", Tier: cfg.Tiers[0].Label}}
+	tier := cfg.Tiers[0]
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: tier.Node, Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 4242, 7); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, tier.Node); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch,
+		alloc.CacheObservation{ImageCache: alloc.ImageCacheWarm, CacheGeneration: "g1"}); err != nil {
+		t.Fatalf("RecordCacheObservation: %v", err)
+	}
+
+	// THE UNREADABLE JOB COMES FIRST, so a describe that stopped at it would
+	// leave the readable one after it bare.
+	jobs := []acceptanceJob{
+		{LeaseID: "a-lease-with-no-history", Tier: tier.Label},
+		{LeaseID: lease.ID, Tier: tier.Label},
+	}
 	describeAcceptanceJobs(t.Context(), db, cfg, jobs)
 
 	if !strings.HasPrefix(jobs[0].Unread, "its history could not be read: ") {
 		t.Errorf("unread = %q, want the job to say its history could not be read", jobs[0].Unread)
 	}
-	if want := string(cfg.Tiers[0].Trust.Effective()); jobs[0].Trust != want {
+	if want := string(tier.Trust.Effective()); jobs[0].Trust != want {
 		t.Errorf("trust = %q, want the config's %q even with the history unread", jobs[0].Trust, want)
+	}
+	if jobs[1].Unread != "" || jobs[1].Cache.Image != "warm" || jobs[1].Cache.Generation != "g1" {
+		t.Errorf("the readable job after it = unread %q, image %q from %q; want it read whole, warm from g1",
+			jobs[1].Unread, jobs[1].Cache.Image, jobs[1].Cache.Generation)
+	}
+
+	body, err := json.Marshal(jobs)
+	if err != nil {
+		t.Fatalf("render the jobs: %v", err)
+	}
+	if n := strings.Count(string(body), `"unread":`); n != 1 {
+		t.Errorf("the rendered jobs carry %d unread fields, want only the unreadable job's:\n%s", n, body)
 	}
 }

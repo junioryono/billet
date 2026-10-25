@@ -15,16 +15,32 @@ const MMDS = "http://169.254.169.254";
 // the first certificate", an untrusted EC2 guest, 2026-10-25), so every sticky
 // disk there ran cold. The distribution's bundle is added to what Node trusts
 // by default, never put in its place: an explicit `ca` replaces Node's own
-// choice, so the base is its effective default set (node24's
-// `tls.getCACertificates("default")`), which carries NODE_EXTRA_CA_CERTS as
-// well as its bundled roots. A guest without a bundle keeps Node's defaults
-// untouched.
+// choice, so the base is its effective default set, which carries
+// NODE_EXTRA_CA_CERTS as well as its bundled roots: node24's
+// `tls.getCACertificates("default")`, and on a Node without that call the same
+// set built the way Node builds it. A guest without a bundle keeps Node's
+// defaults untouched.
 const systemCABundles = ["/etc/ssl/certs/ca-certificates.crt"];
 
+function nodeDefaultCAs() {
+  if (typeof tls.getCACertificates === "function") return tls.getCACertificates("default");
+  const roots = [...tls.rootCertificates];
+  const extra = process.env.NODE_EXTRA_CA_CERTS;
+  if (extra) {
+    try {
+      roots.push(fs.readFileSync(extra, "utf8"));
+    } catch (_) {
+      // Node itself only warns about an extra bundle it cannot read.
+    }
+  }
+  return roots;
+}
+
 function trustedCAs() {
+  const defaults = nodeDefaultCAs();
   for (const path of module.exports.systemCABundles) {
     try {
-      return [...tls.getCACertificates("default"), fs.readFileSync(path, "utf8")];
+      return [...defaults, fs.readFileSync(path, "utf8")];
     } catch (_) {
       // Absent or unreadable: the next candidate, then Node's own defaults.
     }

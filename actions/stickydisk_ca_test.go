@@ -26,7 +26,10 @@ import (
 // without the bundle the same call must fail, or the success proves nothing.
 // Adding the bundle keeps what Node already trusted: an issuer named only by
 // NODE_EXTRA_CA_CERTS is still trusted beside a readable bundle that lacks it,
-// because an explicit `ca` replaces Node's whole default set.
+// because an explicit `ca` replaces Node's whole default set. Both ways the
+// library finds that set are driven: node24's `tls.getCACertificates`, when
+// this Node has it, and the fallback a Node without it takes. Every TLS setting
+// of the host's environment is withheld, so each case says what it trusts.
 func TestTheStickyDiskTrustsTheGuestSystemBundle(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -56,6 +59,8 @@ func TestTheStickyDiskTrustsTheGuestSystemBundle(t *testing.T) {
 		t.Fatalf("resolve lib.js: %v", err)
 	}
 	script := `
+if (process.argv[4] === "fallback") delete require("tls").getCACertificates;
+else if (typeof require("tls").getCACertificates !== "function") { console.log("unsupported"); process.exit(0); }
 const lib = require(process.argv[1]);
 lib.systemCABundles.splice(0, lib.systemCABundles.length, process.argv[2]);
 lib.cacheCall(process.argv[3], "token", "/v1/volumes", { key: "k" }).then(
@@ -63,23 +68,48 @@ lib.cacheCall(process.argv[3], "token", "/v1/volumes", { key: "k" }).then(
   (e) => console.log("failed " + e.message));
 `
 
-	call := func(bundlePath string, env ...string) string {
-		t.Helper()
-
-		cmd := exec.CommandContext(t.Context(), node, "-e", script, lib, bundlePath, server.URL)
-		cmd.Env = append(os.Environ(), env...)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("node: %v\n%s", err, out)
+	var base []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, "NODE_") || strings.HasPrefix(name, "SSL_CERT_") {
+			continue
 		}
-
-		return strings.TrimSpace(string(out))
+		base = append(base, kv)
 	}
 
-	if got := call(bundle); got != "ok slot=1" {
+	for _, mode := range []string{"native", "fallback"} {
+		t.Run(mode, func(t *testing.T) {
+			call := func(bundlePath string, env ...string) string {
+				t.Helper()
+
+				cmd := exec.CommandContext(t.Context(), node, "-e", script, lib, bundlePath, server.URL, mode)
+				cmd.Env = append(append([]string{}, base...), env...)
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("node: %v\n%s", err, out)
+				}
+
+				return strings.TrimSpace(string(out))
+			}
+
+			trustsTheGuestSystemBundle(t, call, bundle, unrelated, filepath.Join(dir, "absent.crt"))
+		})
+	}
+}
+
+// trustsTheGuestSystemBundle runs every case through one way of finding Node's
+// defaults.
+func trustsTheGuestSystemBundle(
+	t *testing.T, call func(string, ...string) string, bundle, unrelated, absent string,
+) {
+	t.Helper()
+
+	if got := call(bundle); got == "unsupported" {
+		t.Skip("this Node has no tls.getCACertificates; the fallback case covers it")
+	} else if got != "ok slot=1" {
 		t.Fatalf("with the issuer in the system bundle the cache call said %q, want ok slot=1", got)
 	}
-	if got := call(filepath.Join(dir, "absent.crt")); !strings.HasPrefix(got, "failed ") {
+	if got := call(absent); !strings.HasPrefix(got, "failed ") {
 		t.Fatalf("with no system bundle the cache call said %q; Node's own roots cannot know this issuer, "+
 			"so the first case proves nothing", got)
 	}
