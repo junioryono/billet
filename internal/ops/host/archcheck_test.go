@@ -68,22 +68,28 @@ func TestArchIsRefusedWhileARegisteredHostPredatesIt(t *testing.T) {
 		name    string
 		cfg     *config.Config
 		hosts   []alloc.NodeWire
-		gone    map[string]bool
 		wantErr []string
 	}{
 		{name: "every host current", cfg: named, hosts: []alloc.NodeWire{current}},
 		{name: "an older host", cfg: named, hosts: []alloc.NodeWire{current, older},
-			wantErr: []string{"1 registered host(s)", "old-1 (v0.29.0)", "every controller"}},
+			wantErr: []string{"this file names an architecture", "1 registered host(s)", "old-1 (v0.29.0)",
+				"every controller"}},
 		{name: "a host that cannot say", cfg: named, hosts: []alloc.NodeWire{unsaid},
 			wantErr: []string{"unsaid-1 (a release it did not name)"}},
-		{name: "an older host decommissioned", cfg: named, hosts: []alloc.NodeWire{current, older},
-			gone: map[string]bool{"old-1": true}},
+		{name: "an older host decommissioned", cfg: named,
+			hosts: []alloc.NodeWire{current, {Name: "old-1", Max: nodeapi.VersionArchitectures - 1,
+				Decommissioned: "2026-10-26T00:00:00Z"}}},
 		{name: "no tier names one", cfg: unnamed, hosts: []alloc.NodeWire{older}},
+		// A SHAPE'S ARCH IS AN ARCH TOO: an older billet refuses it in the node block.
+		{name: "only a shape names one", cfg: &config.Config{Tiers: unnamed.Tiers,
+			Node: &config.NodeConfig{Provider: config.ProviderEC2, EC2: &config.EC2Config{
+				InstanceTypes: []config.EC2InstanceType{{Type: "c7g.2xlarge", Arch: config.ArchARM64}}}}},
+			hosts: []alloc.NodeWire{older}, wantErr: []string{"old-1 (v0.29.0)"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := archBeforeEveryHost(tc.cfg, tc.hosts, tc.gone)
+			err := archBeforeEveryHost(tc.cfg, tc.hosts)
 
 			if len(tc.wantErr) == 0 {
 				if err != nil {

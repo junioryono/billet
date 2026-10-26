@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -108,8 +109,10 @@ func TestAnEC2TierIsBoughtOnlyAShapeOfItsArchitecture(t *testing.T) {
 		Name: "cloud-1", Provider: config.ProviderEC2, VCPU: 16, Memory: 64 * config.GiB,
 		EC2Shapes: []config.EC2InstanceType{
 			{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB, Arch: config.ArchX64},
-			{Type: "c7g.2xlarge", VCPU: 8, Memory: 16 * config.GiB, Arch: config.ArchARM64},
+			// DECLARING NONE, AND BEFORE THE arm64 ONE, so a filter that kept a shape
+			// it cannot tell about would buy this.
 			{Type: "unsaid", VCPU: 8, Memory: 16 * config.GiB},
+			{Type: "c7g.2xlarge", VCPU: 8, Memory: 16 * config.GiB, Arch: config.ArchARM64},
 		},
 		Architectures: []config.Arch{config.ArchX64, config.ArchARM64},
 	}); err != nil {
@@ -171,5 +174,131 @@ func TestANodesArchitectureReportIsHeldToItsProvider(t *testing.T) {
 				t.Fatalf("answered %v, want %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// A CODEBUILD TIER NAMING AN ARCHITECTURE IS PLACED BY ITS NODE'S ENVIRONMENT: a
+// compute type names none, so the per-shape rule is EC2's alone, or every
+// CodeBuild tier would place nowhere once a catalogue named arch.
+func TestACodeBuildTierIsPlacedByItsEnvironmentsArchitecture(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label: "cb-arm", Provider: config.ProviderCodeBuild, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 7 * config.GiB, Image: "img", Arch: config.ArchARM64,
+	}
+	a := newBareAllocator(t, Limits{MaxVCPU: 128, MaxMemory: 512 * config.GiB}, []config.Tier{tier})
+
+	if _, err := a.RegisterNode(t.Context(), NodeRegistration{
+		Name: "cb-1", Provider: config.ProviderCodeBuild, VCPU: 64, Memory: 256 * config.GiB,
+		EC2Shapes: codeBuildShapes(), Architectures: []config.Arch{config.ArchARM64},
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	if got := targets(t, a, "cb-arm"); len(got) == 0 {
+		t.Error("a CodeBuild tier of its environment's architecture was placed nowhere")
+	}
+}
+
+// A HOST DOES NOT DROP AN ARCHITECTURE WHILE WORK IS OUTSTANDING ON IT, and adding
+// one, or reporting none, as a node rolled back to an older wire does, is free.
+func TestAHostMayNotDropAnArchitectureUnderOutstandingWork(t *testing.T) {
+	t.Parallel()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 128, MaxMemory: 512 * config.GiB},
+		[]config.Tier{archTier("intel", config.ArchX64)})
+
+	registerArchNode(t, a, "host-1", config.ArchX64)
+
+	if got := targets(t, a, "intel"); len(got) == 0 {
+		t.Fatal("nothing was escrowed on the host")
+	}
+
+	reg := func(archs ...config.Arch) error {
+		_, err := a.RegisterNode(t.Context(), NodeRegistration{
+			Name: "host-1", Provider: config.ProviderFirecracker,
+			VCPU: 8, Memory: 32 * config.GiB, Architectures: archs,
+		})
+
+		return err
+	}
+
+	if err := reg(config.ArchARM64); err == nil || !strings.Contains(err.Error(), "now does not launch x64") {
+		t.Errorf("a host that dropped x64 under escrowed work was answered %v", err)
+	}
+
+	if err := reg(); err != nil {
+		t.Errorf("a host reporting none, as an older wire does, was refused: %v", err)
+	}
+
+	if err := reg(config.ArchX64); err != nil {
+		t.Errorf("the same architecture again was refused: %v", err)
+	}
+}
+
+// A FALLBACK DOES NOT CROSS THE TIER'S ARCHITECTURE, and is refused as no capacity,
+// so the node tries its next shape rather than giving the launch up.
+func TestAnEC2FallbackDoesNotCrossItsTiersArchitecture(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label: "cloud-arm", Provider: config.ProviderEC2, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 4 * config.GiB, Image: "ami-arm", Arch: config.ArchARM64,
+	}
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	if _, err := a.RegisterNode(t.Context(), NodeRegistration{
+		Name: "cloud-1", Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
+		EC2Shapes: []config.EC2InstanceType{
+			{Type: "c7g.2xlarge", VCPU: 8, Memory: 16 * config.GiB, Arch: config.ArchARM64},
+			{Type: "c7i.4xlarge", VCPU: 16, Memory: 32 * config.GiB, Arch: config.ArchX64},
+			{Type: "unsaid", VCPU: 16, Memory: 32 * config.GiB},
+			{Type: "c7g.4xlarge", VCPU: 16, Memory: 32 * config.GiB, Arch: config.ArchARM64},
+		},
+		Architectures: []config.Arch{config.ArchARM64, config.ArchX64},
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	leases, err := a.Escrow(t.Context(), "cloud-arm", 1)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("Escrow = %v, %v", leases, err)
+	}
+
+	l := leases[0]
+	if err := a.Assign(t.Context(), l.ID, l.Epoch, 1, 1); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), l.ID, l.Epoch, "cloud-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	if err := a.Advance(t.Context(), l.ID, l.Epoch, PhaseLaunching); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	for _, shape := range []string{"c7i.4xlarge", "unsaid"} {
+		if err := a.Resize(t.Context(), l.ID, l.Epoch, shape, 16, 32*config.GiB); !errors.Is(err, ErrNoCapacity) {
+			t.Errorf("a fallback to %s was answered %v, want ErrNoCapacity", shape, err)
+		}
+	}
+
+	if err := a.Resize(t.Context(), l.ID, l.Epoch, "c7g.4xlarge", 16, 32*config.GiB); err != nil {
+		t.Errorf("a fallback of the tier's architecture was refused: %v", err)
+	}
+}
+
+// A CATALOGUE BUILT IN CODE IS HELD TO THE ARCHITECTURE RULE TOO.
+func TestTheAllocatorRefusesACatalogueNamingArchOnSomeTiers(t *testing.T) {
+	t.Parallel()
+
+	db := openTestLedger(t)
+
+	_, err := New(db, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+		[]config.Tier{archTier("intel", config.ArchX64), archTier("any", "")})
+	if err == nil || !strings.Contains(err.Error(), "arch is named on 1 of 2 tiers") {
+		t.Fatalf("New = %v, want the all-or-none refusal", err)
 	}
 }

@@ -300,21 +300,22 @@ func (q *Queries) ListNodeRegistrations(ctx context.Context) ([]ListNodeRegistra
 
 const listNodeWireVersions = `-- name: ListNodeWireVersions :many
 SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
-       node_digest, highest_release
+       node_digest, highest_release, decommissioned_at
   FROM nodes
  ORDER BY name
 `
 
 type ListNodeWireVersionsRow struct {
-	Name           string
-	Live           int64
-	NodeRelease    string
-	WireMin        int64
-	WireMax        int64
-	WireVersion    int64
-	Epoch          int64
-	NodeDigest     string
-	HighestRelease string
+	Name             string
+	Live             int64
+	NodeRelease      string
+	WireMin          int64
+	WireMax          int64
+	WireVersion      int64
+	Epoch            int64
+	NodeDigest       string
+	HighestRelease   string
+	DecommissionedAt string
 }
 
 // What each host's registration said about its build, and what was negotiated.
@@ -341,6 +342,7 @@ func (q *Queries) ListNodeWireVersions(ctx context.Context) ([]ListNodeWireVersi
 			&i.Epoch,
 			&i.NodeDigest,
 			&i.HighestRelease,
+			&i.DecommissionedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -754,7 +756,7 @@ func (q *Queries) ReadNodeProvider(ctx context.Context, name string) (string, er
 }
 
 const readNodeRegistration = `-- name: ReadNodeRegistration :one
-SELECT provider, site, ec2_shapes, codebuild_fleet FROM nodes WHERE name = $1
+SELECT provider, site, ec2_shapes, codebuild_fleet, architectures FROM nodes WHERE name = $1
 `
 
 type ReadNodeRegistrationRow struct {
@@ -762,6 +764,7 @@ type ReadNodeRegistrationRow struct {
 	Site           string
 	Ec2Shapes      string
 	CodebuildFleet string
+	Architectures  string
 }
 
 // The facts a re-registration has to be checked against.
@@ -773,6 +776,7 @@ func (q *Queries) ReadNodeRegistration(ctx context.Context, name string) (ReadNo
 		&i.Site,
 		&i.Ec2Shapes,
 		&i.CodebuildFleet,
+		&i.Architectures,
 	)
 	return i, err
 }

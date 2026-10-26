@@ -48,5 +48,6 @@
     },
     "go_test_results": true,
     "npm": true
-  }
+  },
+  "arch": "TierSpec.arch"
 }

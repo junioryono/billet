@@ -50,3 +50,5 @@ TierSpec.cache.go_test_results tag omitempty
 TierSpec.cache.go_test_results bool
 TierSpec.cache.npm tag omitempty
 TierSpec.cache.npm bool
+TierSpec.arch tag omitempty
+TierSpec.arch string

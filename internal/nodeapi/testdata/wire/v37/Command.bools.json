@@ -96,7 +96,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -219,7 +220,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -342,7 +344,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -465,7 +468,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -588,7 +592,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -711,7 +716,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -834,7 +840,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -957,7 +964,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1080,7 +1088,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1203,7 +1212,8 @@
           "enabled": true,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1327,7 +1337,8 @@
           "max_size": 156615474
         },
         "go_test_results": true
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1451,7 +1462,8 @@
           "max_size": 156615474
         },
         "npm": true
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1574,7 +1586,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1698,7 +1711,8 @@
           "enabled": false,
           "max_size": 156615474
         }
-      }
+      },
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,

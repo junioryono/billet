@@ -106,6 +106,8 @@ Command.tier.cache.go_test_results tag omitempty
 Command.tier.cache.go_test_results bool
 Command.tier.cache.npm tag omitempty
 Command.tier.cache.npm bool
+Command.tier.arch tag omitempty
+Command.tier.arch string
 Command.barrier_id tag omitempty
 Command.barrier_id string
 Command.request_id tag omitempty

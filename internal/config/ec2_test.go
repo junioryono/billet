@@ -553,6 +553,65 @@ func TestATierNoDeclaredShapeCanHoldIsRefusedAtLoad(t *testing.T) {
 	}
 }
 
+// AN EC2 TIER NAMING AN ARCHITECTURE IS JUDGED AGAINST THE SHAPES OF IT ALONE,
+// because those are all it is bought (ADR-022): a larger shape of the other
+// architecture does not let it load, and a node declaring none of its architecture
+// is never given it, so it is not refused there.
+func TestAnArchTierIsHeldToTheShapesOfItsArchitecture(t *testing.T) {
+	t.Parallel()
+
+	const shapes = `    instance_types:
+      - type: c7i.8xlarge
+        vcpu: 32
+        memory: 64GiB
+        price_usd_per_hour: 1.36
+        arch: x64
+      - type: c7g.2xlarge
+        vcpu: 8
+        memory: 16GiB
+        price_usd_per_hour: 0.29
+        arch: arm64
+`
+	declared := func(t *testing.T, tierArch, shapes string) string {
+		t.Helper()
+
+		body := cloudConfig(t, ec2Block, strings.Replace(ec2Block,
+			"    instance_types:\n      - type: c7i.2xlarge\n        vcpu: 8\n        memory: 16GiB\n        price_usd_per_hour: 0.34\n",
+			shapes, 1))
+		body = strings.Replace(body,
+			"  - label: billet-8vcpu-ubuntu-2404\n    provider: firecracker\n    vcpu: 8\n",
+			"  - label: billet-8vcpu-ubuntu-2404\n    provider: ec2\n    vcpu: 32\n", 1)
+
+		return strings.ReplaceAll(body, "    image: ubuntu-2404-x64\n",
+			"    image: ubuntu-2404-x64\n    arch: "+tierArch+"\n")
+	}
+
+	got := loadErr(t, declared(t, "arm64", shapes))
+	for _, want := range []string{"billet-8vcpu-ubuntu-2404", "no arm64 shape", "c7g.2xlarge"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the error does not mention %q: %s", want, got)
+		}
+	}
+
+	if strings.Contains(got, "c7i.8xlarge") {
+		t.Errorf("the error lists a shape the tier is never bought: %s", got)
+	}
+
+	if _, err := Load(writeConfig(t, declared(t, "x64", shapes))); err != nil {
+		t.Errorf("a tier its architecture's shape holds was refused: %v", err)
+	}
+
+	onlyX64 := strings.Replace(shapes,
+		"      - type: c7g.2xlarge\n        vcpu: 8\n        memory: 16GiB\n        price_usd_per_hour: 0.29\n        arch: arm64\n", "", 1)
+	if onlyX64 == shapes {
+		t.Fatal("removing the arm64 shape changed nothing; the fixture has drifted")
+	}
+
+	if _, err := Load(writeConfig(t, declared(t, "arm64", onlyX64))); err != nil {
+		t.Errorf("a tier this node is never given, declaring no shape of its architecture, was refused: %v", err)
+	}
+}
+
 // A URL is a thing that gets logged, so a credential must not live in one.
 // billet authenticates with a request signature, so userinfo authenticates
 // nothing and is pure exposure.

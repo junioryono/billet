@@ -98,7 +98,8 @@
       },
       "go_test_results": true,
       "npm": true
-    }
+    },
+    "arch": "Command.tier.arch"
   },
   "barrier_id": "Command.barrier_id",
   "request_id": 341765293,

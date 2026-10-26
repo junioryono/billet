@@ -20,7 +20,7 @@ SELECT name, provider, site, live,
 -- beside node_release so a report can say a host is running something older than
 -- it once did. It decides nothing: a rolled-back host is exactly that shape.
 SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
-       node_digest, highest_release
+       node_digest, highest_release, decommissioned_at
   FROM nodes
  ORDER BY name;
 
@@ -205,7 +205,7 @@ SELECT total_vcpu, total_memory, ec2_shapes FROM nodes WHERE name = @name;
 
 -- name: ReadNodeRegistration :one
 -- The facts a re-registration has to be checked against.
-SELECT provider, site, ec2_shapes, codebuild_fleet FROM nodes WHERE name = @name;
+SELECT provider, site, ec2_shapes, codebuild_fleet, architectures FROM nodes WHERE name = @name;
 
 -- name: ListCodeBuildRegistrationPaths :many
 -- Every codebuild host and the Parameter Store path it stages registrations under.

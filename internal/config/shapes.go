@@ -196,9 +196,27 @@ func (c *Config) validateRemoteShapes() []error {
 			continue
 		}
 
+		// AN EC2 TIER NAMING AN ARCHITECTURE IS BOUGHT ONLY A SHAPE DECLARED WITH IT
+		// (ADR-022), so only those can hold it; and a node declaring none of that
+		// architecture is never given the tier, which is the case above.
+		candidates := shapes
+		if kind == ProviderEC2 && t.Arch != "" {
+			candidates = nil
+
+			for _, shape := range shapes {
+				if shape.Arch == t.Arch {
+					candidates = append(candidates, shape)
+				}
+			}
+
+			if len(candidates) == 0 {
+				continue
+			}
+		}
+
 		fits := false
 
-		for _, shape := range shapes {
+		for _, shape := range candidates {
 			if shape.VCPU >= t.VCPU && shape.Memory >= t.Memory {
 				fits = true
 
@@ -210,16 +228,21 @@ func (c *Config) validateRemoteShapes() []error {
 			continue
 		}
 
-		declared := make([]string, 0, len(shapes))
-		for _, shape := range shapes {
+		declared := make([]string, 0, len(candidates))
+		for _, shape := range candidates {
 			declared = append(declared,
 				fmt.Sprintf("%s (%d vCPU, %s)", shape.Type, shape.VCPU, shape.Memory))
 		}
 
+		which := "no shape"
+		if len(candidates) != len(shapes) {
+			which = "no " + string(t.Arch) + " shape"
+		}
+
 		errs = append(errs, fmt.Errorf(
-			"tier %q requests %d vCPU and %s, which no shape in %s can hold (%s); a job on this "+
+			"tier %q requests %d vCPU and %s, which %s in %s can hold (%s); a job on this "+
 				"tier would be admitted and then fail to launch",
-			t.Label, t.VCPU, t.Memory, kind.ShapeField(), strings.Join(declared, ", ")))
+			t.Label, t.VCPU, t.Memory, which, kind.ShapeField(), strings.Join(declared, ", ")))
 	}
 
 	return errs

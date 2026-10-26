@@ -132,9 +132,20 @@ func TierArchErrors(tiers []Tier) []error {
 	if named > 0 && named < len(tiers) {
 		var without []string
 
+		// AS THE OPERATOR WROTE THEM: a tier expanded from `sizes` or `targets`
+		// is named by its declaration, once.
 		for i := range tiers {
-			if tiers[i].Arch == "" {
-				without = append(without, tiers[i].Label)
+			if tiers[i].Arch != "" {
+				continue
+			}
+
+			name := tiers[i].Label
+			if tiers[i].Declaration != "" {
+				name = tiers[i].Declaration
+			}
+
+			if !slices.Contains(without, name) {
+				without = append(without, name)
 			}
 		}
 

@@ -430,14 +430,19 @@ func (p *Provider) instanceTypesFor(spec provider.Spec) ([]config.EC2InstanceTyp
 }
 
 // shapesForImage drops the shapes declared with another architecture than the
-// tier's AMI, and refuses the launch when none is left (ADR-022).
+// tier's AMI or the tier itself, and refuses the launch when none is left
+// (ADR-022).
 //
-// THE AMI SAYS WHAT IT BOOTS ON, so it is the authority here whatever the tier
-// says: an x64 instance cannot boot an arm64 AMI, and before this the launch
-// started and failed at boot, or a fallback crossed architectures. A shape
-// declared with no architecture is kept, as every shape was: billet cannot tell,
-// and that refusal is EC2's. An AMI whose architecture billet does not know
-// narrows nothing.
+// THE AMI SAYS WHAT IT BOOTS ON, and EC2 refuses a RunInstances whose shape is
+// of another architecture synchronously with InvalidParameterValue (measured
+// with a dry run, us-west-2, 2026-10-26), which is no capacity refusal: before
+// this, the first such shape in order failed the whole launch, though a later
+// shape could have run it. AND THE TIER SAYS WHAT ITS JOBS RUN ON: a tier naming one is
+// launched only on a shape declared with it, as placement bought it, and an AMI
+// known to be of the other is refused outright rather than worked around by a
+// fallback. For a tier naming none, a shape declared with no architecture is
+// kept, as every shape was: billet cannot tell, and that refusal is EC2's. An AMI
+// whose architecture billet does not know narrows nothing.
 func (p *Provider) shapesForImage(
 	ctx context.Context, spec provider.Spec, shapes []config.EC2InstanceType,
 ) ([]config.EC2InstanceType, error) {
@@ -447,7 +452,19 @@ func (p *Provider) shapesForImage(
 	}
 
 	image, known := config.ArchFromEC2(layout.arch)
-	if !known {
+
+	if spec.Arch != "" && known && image != spec.Arch {
+		return nil, fmt.Errorf("ec2: %s is a tier of %s and its image %s is %s, so no shape "+
+			"can run it; build the AMI with `billet ami build --arch %s`",
+			spec.Name, spec.Arch, spec.Image, image, spec.Arch)
+	}
+
+	want := spec.Arch
+	if want == "" && known {
+		want = image
+	}
+
+	if want == "" {
 		return shapes, nil
 	}
 
@@ -456,8 +473,10 @@ func (p *Provider) shapesForImage(
 	var dropped []string
 
 	for _, s := range shapes {
-		if s.Arch != "" && s.Arch != image {
-			dropped = append(dropped, s.Type+" ("+string(s.Arch)+")")
+		// A TIER NAMING AN ARCHITECTURE NEEDS A SHAPE DECLARED WITH IT; one naming
+		// none keeps a shape that declares none.
+		if s.Arch != want && (spec.Arch != "" || s.Arch != "") {
+			dropped = append(dropped, s.Type+" ("+describeArch(s.Arch)+")")
 
 			continue
 		}
@@ -466,18 +485,27 @@ func (p *Provider) shapesForImage(
 	}
 
 	if len(kept) == 0 {
-		return nil, fmt.Errorf("ec2: %s boots image %s, which is %s, and every declared shape "+
-			"that holds it runs another architecture (%s); declare a %s shape in "+
+		return nil, fmt.Errorf("ec2: %s needs a shape of %s, and every declared shape that holds it "+
+			"runs another architecture or declares none (%s); declare a shape of %s in "+
 			"node.ec2.instance_types, or give the tier an image of its shapes' architecture",
-			spec.Name, spec.Image, image, strings.Join(dropped, ", "), image)
+			spec.Name, want, strings.Join(dropped, ", "), want)
 	}
 
 	if len(dropped) > 0 {
-		p.log.Info("skipping shapes of another architecture than the image's",
-			"runner", spec.Name, "image", spec.Image, "arch", image, "skipped", strings.Join(dropped, ", "))
+		p.log.Info("skipping shapes of another architecture than the launch's",
+			"runner", spec.Name, "image", spec.Image, "arch", want, "skipped", strings.Join(dropped, ", "))
 	}
 
 	return kept, nil
+}
+
+// describeArch names a shape's declared architecture, or says it declares none.
+func describeArch(a config.Arch) string {
+	if a == "" {
+		return "no arch declared"
+	}
+
+	return string(a)
 }
 
 // clientTokenFor is the idempotency key for one lease on one shape.

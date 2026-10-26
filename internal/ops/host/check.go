@@ -353,16 +353,14 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			return report, err
 		}
 
-		decommissioned := map[string]bool{}
-		for _, member := range registered {
-			if member.Decommissioned != "" {
-				decommissioned[member.Name] = true
-			}
-		}
-
-		if err := archBeforeEveryHost(cfg, hostWires, decommissioned); err != nil {
+		if err := archBeforeEveryHost(cfg, hostWires); err != nil {
 			return report, err
 		}
+
+		// AN AMI'S ARCHITECTURE IS READ WHERE THE AWS CREDENTIALS ARE. A control
+		// plane whose file names no EC2 node cannot resolve its tiers' AMIs, so it
+		// says who does rather than reading as if they were checked.
+		reportUncheckedTierAMIs(env, cfg)
 
 		// WHICH LIVE HOSTS EACH SHAPE FITS, for the tier lines below: a tier no
 		// live host can place advertises and is assigned work all the same

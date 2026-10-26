@@ -292,6 +292,13 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 
 	limits.Shares = maps.Clone(limits.Shares)
 
+	// THE ARCHITECTURE RULE, re-applied as every catalogue rule is here: a
+	// catalogue built in code that names arch on some tiers would place the rest
+	// on hosts of either architecture (ADR-022).
+	if errs := config.TierArchErrors(tiers); len(errs) > 0 {
+		return nil, fmt.Errorf("alloc: %w", errors.Join(errs...))
+	}
+
 	a := &Allocator{
 		db:       db,
 		limits:   limits,
@@ -1318,12 +1325,15 @@ func (a *Allocator) ResizeLeaving(
 
 		declared := false
 
-		var price config.USDPerHour
+		var (
+			price config.USDPerHour
+			arch  config.Arch
+		)
 
 		for _, shape := range shapes {
 			if shape.Type == instanceType && shape.VCPU == vcpu && shape.Memory == memory {
 				declared = true
-				price = shape.PriceUSDPerHour
+				price, arch = shape.PriceUSDPerHour, shape.Arch
 
 				break
 			}
@@ -1332,6 +1342,20 @@ func (a *Allocator) ResizeLeaving(
 		if !declared {
 			return fmt.Errorf("%w: node %s did not register EC2 shape %q (%d vCPU, %s)",
 				ErrNotPlaceable, lease.Node, instanceType, vcpu, memory)
+		}
+
+		// A FALLBACK DOES NOT CROSS THE TIER'S ARCHITECTURE, by the rule placement
+		// bought the first shape under (ADR-022): authorised by name and size alone, a
+		// fallback to a larger shape of the other architecture would be a purchase
+		// EC2 refuses or one a multi-architecture image runs on the wrong machine. An
+		// EC2 SHAPE'S ALONE, as in placement. A tier this catalogue no longer has
+		// cannot say, so it is refused too. ErrNoCapacity, so the node tries its next
+		// shape rather than giving the launch up.
+		if lease.Provider == config.ProviderEC2 {
+			if tier, ok := a.tiers[lease.Tier]; !ok || (tier.Arch != "" && arch != tier.Arch) {
+				return fmt.Errorf("%w: EC2 shape %q is declared %q and lease %s's tier %q is not "+
+					"known to run on it", ErrNoCapacity, instanceType, arch, leaseID, lease.Tier)
+			}
 		}
 
 		if vcpu < lease.RequestedVCPU || memory < lease.RequestedMemory {
@@ -1916,6 +1940,25 @@ type NodeRegistration struct {
 	WireVersion int
 }
 
+// droppedArchitectures is what a non-empty report leaves out of the recorded list,
+// in the recorded list's order. A report of none drops nothing: it is a node that
+// says nothing, not one that launches nothing.
+func droppedArchitectures(recorded string, reported []config.Arch) []string {
+	if len(reported) == 0 || recorded == "" {
+		return nil
+	}
+
+	var dropped []string
+
+	for part := range strings.SplitSeq(recorded, ",") {
+		if !slices.Contains(reported, config.Arch(part)) {
+			dropped = append(dropped, part)
+		}
+	}
+
+	return dropped
+}
+
 // checkWireTuple refuses a wire record that cannot describe any real build.
 //
 // TWO SHAPES ARE LEGAL AND NOTHING BETWEEN THEM. All zero is "not recorded",
@@ -2214,6 +2257,33 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 						"jobs finish (or their leases expire) the host is free to change",
 					ErrFleetHeld, name, describeFleet(currentFleet), describeFleet(fleet),
 					outstanding, restoreFleetRemedy(currentFleet))
+			}
+		}
+
+		// A HOST DOES NOT DROP AN ARCHITECTURE WHILE WORK IS OUTSTANDING ON IT, as it
+		// may not change its backend: a lease escrowed for a tier of that
+		// architecture names this host, and nothing after escrow asks again, so a
+		// machine replaced under the same name would run it on the other one.
+		// ADDING ONE IS FREE, and so is a report of none, which is a node on a wire
+		// from before it (a rollback): the plane refuses that node every tier that
+		// names an architecture, at dispatch and again at delivery.
+		if dropped := droppedArchitectures(existing.Architectures, reg.Architectures); existed && len(dropped) > 0 {
+			outstanding, err := q.CountLiveWorkOnNode(ctx, ledgerdb.CountLiveWorkOnNodeParams{
+				Node: name,
+				Now:  now,
+			})
+			if err != nil {
+				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
+			}
+
+			if outstanding > 0 {
+				return fmt.Errorf(
+					"%w: node %s reported launching %s and now does not launch %s, while %d "+
+						"lease(s) are still outstanding against it; a lease placed for that "+
+						"architecture would run on another. Restore the host or its shapes until "+
+						"those jobs finish (or their leases expire), then it is free to change",
+					ErrWrongProvider, name, existing.Architectures, strings.Join(dropped, ", "),
+					outstanding)
 			}
 		}
 
