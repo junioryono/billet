@@ -610,6 +610,21 @@ func TestAnArchTierIsHeldToTheShapesOfItsArchitecture(t *testing.T) {
 	if _, err := Load(writeConfig(t, declared(t, "arm64", onlyX64))); err != nil {
 		t.Errorf("a tier this node is never given, declaring no shape of its architecture, was refused: %v", err)
 	}
+
+	// UNLESS THE TIER IS PINNED HERE, where it can run nowhere else.
+	pinned := strings.Replace(declared(t, "arm64", onlyX64),
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: ec2\n",
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: ec2\n    node: aws-1\n", 1)
+	if !strings.Contains(pinned, "    node: aws-1\n") {
+		t.Fatal("pinning the tier changed nothing; the fixture has drifted")
+	}
+
+	got = loadErr(t, pinned)
+	for _, want := range []string{"billet-8vcpu-ubuntu-2404", "no arm64 shape", "none is declared"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the pinned tier's error does not mention %q: %s", want, got)
+		}
+	}
 }
 
 // A URL is a thing that gets logged, so a credential must not live in one.

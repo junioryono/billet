@@ -197,8 +197,9 @@ func (c *Config) validateRemoteShapes() []error {
 		}
 
 		// AN EC2 TIER NAMING AN ARCHITECTURE IS BOUGHT ONLY A SHAPE DECLARED WITH IT
-		// (ADR-022), so only those can hold it; and a node declaring none of that
-		// architecture is never given the tier, which is the case above.
+		// (ADR-022), so only those can hold it. A node declaring none of that
+		// architecture is never given the tier, so it is another machine's job like
+		// an oversized one above, unless the tier is pinned here.
 		candidates := shapes
 		if kind == ProviderEC2 && t.Arch != "" {
 			candidates = nil
@@ -209,7 +210,7 @@ func (c *Config) validateRemoteShapes() []error {
 				}
 			}
 
-			if len(candidates) == 0 {
+			if len(candidates) == 0 && t.Node == "" {
 				continue
 			}
 		}
@@ -237,6 +238,10 @@ func (c *Config) validateRemoteShapes() []error {
 		which := "no shape"
 		if len(candidates) != len(shapes) {
 			which = "no " + string(t.Arch) + " shape"
+		}
+
+		if len(declared) == 0 {
+			declared = append(declared, "none is declared")
 		}
 
 		errs = append(errs, fmt.Errorf(

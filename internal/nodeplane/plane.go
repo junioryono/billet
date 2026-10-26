@@ -240,7 +240,12 @@ type node struct {
 	// inventory command to a host whose wire has none, and that choice is made
 	// here, while the queue is held.
 	wireVersion int
-	lastSeen    time.Time
+	// architectures is what this registration reported its provider launches,
+	// none below VersionArchitectures. Dispatch and delivery hold a launch of a
+	// tier naming an architecture to it: placement chose the node from the ledger
+	// at escrow, and the host may have re-registered since (ADR-022).
+	architectures []config.Arch
+	lastSeen      time.Time
 	// inventoryKnown says this incarnation supplied the complete provider inventory
 	// in inventory. The set is evidence about one lease only by membership, never
 	// merely because some inventory exists.
@@ -362,6 +367,9 @@ type pending struct {
 	// at delivery: a process that re-registered under the same name after
 	// dispatch on an older wire must not take a command it cannot honour.
 	minWire int
+	// arch is the architecture the taking process must have reported, checked
+	// again at delivery for the same reason. Empty means the command does not care.
+	arch config.Arch
 	// expectedIncarnation fences a bound destroy to the process that adopted its
 	// lease. A replacement sharing the node name must never take that command.
 	expectedIncarnation string
@@ -1356,6 +1364,7 @@ func (p *Plane) register(
 	// in a separate process with no view of this map; this copy is what dispatch
 	// consults before sending a command a host's wire may not have.
 	n.wireVersion = negotiated
+	n.architectures = negotiatedArchitectures(req.Architectures, negotiated)
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
@@ -2301,6 +2310,16 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 				ID: pend.cmd.ID,
 				Error: fmt.Sprintf("node %q now speaks wire %d, and this command needs %d; "+
 					"it was not delivered", n.name, n.wireVersion, pend.minWire),
+			})
+
+			continue
+		}
+
+		if pend.arch != "" && !slices.Contains(n.architectures, pend.arch) {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q now reports launching %v, and this command needs %s; "+
+					"it was not delivered", n.name, n.architectures, pend.arch),
 			})
 
 			continue

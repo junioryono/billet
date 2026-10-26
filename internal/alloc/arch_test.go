@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // archTier is a two-vCPU Firecracker tier of arch, or of none.
@@ -242,11 +243,82 @@ func TestAHostMayNotDropAnArchitectureUnderOutstandingWork(t *testing.T) {
 func TestAnEC2FallbackDoesNotCrossItsTiersArchitecture(t *testing.T) {
 	t.Parallel()
 
+	a, l := launchingArmLease(t, openTestLedger(t))
+
+	for _, shape := range []string{"c7i.4xlarge", "unsaid"} {
+		if err := a.Resize(t.Context(), l.ID, l.Epoch, shape, 16, 32*config.GiB); !errors.Is(err, ErrNoCapacity) {
+			t.Errorf("a fallback to %s was answered %v, want ErrNoCapacity", shape, err)
+		}
+	}
+
+	if err := a.Resize(t.Context(), l.ID, l.Epoch, "c7g.4xlarge", 16, 32*config.GiB); err != nil {
+		t.Errorf("a fallback of the tier's architecture was refused: %v", err)
+	}
+}
+
+// AND A LEASE WHOSE TIER A RESTARTED CONTROLLER'S CATALOGUE NO LONGER HAS keeps the
+// shape it was charged, which the node asks about first; a fallback is refused only
+// where the catalogue names architectures, since only there could the tier have
+// named one.
+func TestAFallbackForATierTheCatalogueDroppedIsRefusedOnlyWhereArchIsNamed(t *testing.T) {
+	t.Parallel()
+
+	limits := Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}
+
+	for _, tc := range []struct {
+		name     string
+		other    config.Arch
+		fallback bool
+	}{
+		{name: "a catalogue naming architectures", other: config.ArchARM64, fallback: false},
+		{name: "a catalogue naming none", other: "", fallback: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := openTestLedger(t)
+			_, l := launchingArmLease(t, db)
+
+			other := archTier("other", tc.other)
+			other.Provider, other.Image = config.ProviderEC2, "ami-other"
+
+			restarted, err := New(db, limits, []config.Tier{other})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			if err := restarted.Resize(t.Context(), l.ID, l.Epoch, "c7g.2xlarge", 8, 16*config.GiB); err != nil {
+				t.Errorf("the shape the lease was charged was refused: %v", err)
+			}
+
+			err = restarted.Resize(t.Context(), l.ID, l.Epoch, "c7g.4xlarge", 16, 32*config.GiB)
+			if tc.fallback && err != nil {
+				t.Errorf("a fallback in a catalogue naming no architecture was refused: %v", err)
+			}
+
+			if !tc.fallback && !errors.Is(err, ErrNoCapacity) {
+				t.Errorf("a fallback for a tier that cannot say its architecture was answered %v, "+
+					"want ErrNoCapacity", err)
+			}
+		})
+	}
+}
+
+// launchingArmLease escrows one lease of an arm64 EC2 tier on a node declaring
+// shapes of both architectures and of none, and takes it to launching on the
+// first arm64 shape.
+func launchingArmLease(t *testing.T, db *state.DB) (*Allocator, *Lease) {
+	t.Helper()
+
 	tier := config.Tier{
 		Label: "cloud-arm", Provider: config.ProviderEC2, GuestOS: config.GuestLinux,
 		VCPU: 2, Memory: 4 * config.GiB, Image: "ami-arm", Arch: config.ArchARM64,
 	}
-	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	a, err := New(db, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
 	if _, err := a.RegisterNode(t.Context(), NodeRegistration{
 		Name: "cloud-1", Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
@@ -267,6 +339,10 @@ func TestAnEC2FallbackDoesNotCrossItsTiersArchitecture(t *testing.T) {
 	}
 
 	l := leases[0]
+	if l.InstanceType != "c7g.2xlarge" {
+		t.Fatalf("escrowed on %q, want c7g.2xlarge", l.InstanceType)
+	}
+
 	if err := a.Assign(t.Context(), l.ID, l.Epoch, 1, 1); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
@@ -279,15 +355,7 @@ func TestAnEC2FallbackDoesNotCrossItsTiersArchitecture(t *testing.T) {
 		t.Fatalf("Advance: %v", err)
 	}
 
-	for _, shape := range []string{"c7i.4xlarge", "unsaid"} {
-		if err := a.Resize(t.Context(), l.ID, l.Epoch, shape, 16, 32*config.GiB); !errors.Is(err, ErrNoCapacity) {
-			t.Errorf("a fallback to %s was answered %v, want ErrNoCapacity", shape, err)
-		}
-	}
-
-	if err := a.Resize(t.Context(), l.ID, l.Epoch, "c7g.4xlarge", 16, 32*config.GiB); err != nil {
-		t.Errorf("a fallback of the tier's architecture was refused: %v", err)
-	}
+	return a, l
 }
 
 // A CATALOGUE BUILT IN CODE IS HELD TO THE ARCHITECTURE RULE TOO.

@@ -79,16 +79,38 @@ func archTierForPlane() config.Tier {
 	return tier
 }
 
+// archNode is a registration of n1 by process incarnation, at the current wire,
+// reporting archs.
+func archNode(incarnation string, archs ...config.Arch) nodeapi.RegisterRequest {
+	req := releasedNode()
+	req.Version, req.MinVersion = nodeapi.Version, nodeapi.MinVersion
+	req.Incarnation = incarnation
+	req.Architectures = archs
+
+	return req
+}
+
+// archPlane is a plane whose catalogue is the arm64 test tier, with n1 registered
+// as req.
+func archPlane(t *testing.T, req nodeapi.RegisterRequest) *Plane {
+	t.Helper()
+
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
+		WithTierCatalog([]config.Tier{archTierForPlane()}), WithRegistrar(&recordingRegistrar{}),
+		WithCommandTimeout(5*time.Second))
+	if _, err := p.Register(t.Context(), req); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	return p
+}
+
 // A TIER NAMING AN ARCHITECTURE IS NOT SENT TO A NODE THAT CANNOT BE HELD TO IT: an
 // older node ignores the launch's arch and launches on whatever it has.
 func TestAnArchTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	t.Parallel()
 
-	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
-		WithTierCatalog([]config.Tier{archTierForPlane()}), WithRegistrar(&recordingRegistrar{}))
-	if _, err := p.Register(t.Context(), releasedNode()); err != nil {
-		t.Fatalf("register: %v", err)
-	}
+	p := archPlane(t, releasedNode())
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -97,42 +119,85 @@ func TestAnArchTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	if !errors.Is(err, ErrNoNode) || !strings.Contains(err.Error(), "cannot be held to") {
 		t.Fatalf("launch = %v, want ErrNoNode naming the architecture", err)
 	}
+
+	if n := p.QueuedForTest("n1"); n != 0 {
+		t.Errorf("%d commands were queued for a node the launch was refused", n)
+	}
 }
 
-// AND A PROCESS THAT RE-REGISTERS ON AN OLDER WIRE AFTER DISPATCH DOES NOT TAKE IT.
-func TestAnOlderProcessCannotTakeAnArchLaunchQueuedForANewerOne(t *testing.T) {
+// NOR TO A CURRENT NODE THAT NOW REPORTS ANOTHER: placement chose it from the ledger
+// at escrow, and a host that re-registered as another machine since, through a
+// report of none (a rollback) that the ledger lets pass, is held here.
+func TestAnArchTierIsNotLaunchedOnANodeNowReportingAnother(t *testing.T) {
 	t.Parallel()
 
-	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
-		WithTierCatalog([]config.Tier{archTierForPlane()}), WithRegistrar(&recordingRegistrar{}),
-		WithCommandTimeout(5*time.Second))
-	current := releasedNode()
-	current.Version, current.MinVersion = nodeapi.Version, nodeapi.MinVersion
-	current.Incarnation = "new"
+	p := archPlane(t, archNode("n1-1", config.ArchX64))
 
-	if _, err := p.Register(t.Context(), current); err != nil {
-		t.Fatalf("register the current process: %v", err)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	err := p.NewRunner().Launch(ctx, testLease(), dispatch.Job{RequestID: 7})
+	if !errors.Is(err, ErrNoNode) || !strings.Contains(err.Error(), "now reports launching [x64]") {
+		t.Fatalf("launch = %v, want ErrNoNode naming what the node reports", err)
 	}
 
-	launched := make(chan error, 1)
-	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
-	}()
-	waitForQueued(t, p, "n1")
-
-	older := releasedNode()
-	older.Incarnation = "old"
-
-	if _, err := p.Register(t.Context(), older); err != nil {
-		t.Fatalf("register the older process: %v", err)
+	if n := p.QueuedForTest("n1"); n != 0 {
+		t.Errorf("%d commands were queued for a node the launch was refused", n)
 	}
+}
 
-	if cmd, took, err := p.Poll(t.Context(), "n1", "old"); err == nil && took {
-		t.Fatalf("the older process took %s", cmd.Kind)
-	}
+// AND A PROCESS THAT RE-REGISTERS AFTER DISPATCH, ON AN OLDER WIRE OR REPORTING
+// ANOTHER ARCHITECTURE, DOES NOT TAKE IT.
+func TestAProcessThatCannotRunAnArchLaunchQueuedBeforeItDoesNotTakeIt(t *testing.T) {
+	t.Parallel()
 
-	if err := <-launched; err == nil {
-		t.Fatal("the launch reported success though nothing took it")
+	for _, tc := range []struct {
+		name string
+		then nodeapi.RegisterRequest
+		want string
+	}{
+		{name: "an older wire", then: func() nodeapi.RegisterRequest {
+			req := releasedNode()
+			req.Incarnation = "n1-2"
+
+			return req
+		}(), want: "now speaks wire"},
+		{name: "another architecture", then: archNode("n1-2", config.ArchX64), want: "now reports launching [x64]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := archPlane(t, archNode("n1-1", config.ArchARM64))
+
+			launched := make(chan error, 1)
+			go func() {
+				launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
+			}()
+			waitForQueued(t, p, "n1")
+
+			if _, err := p.Register(t.Context(), tc.then); err != nil {
+				t.Fatalf("re-register: %v", err)
+			}
+
+			// THE POLL IS WHAT DELIVERY REFUSES IN, and with nothing left to give it
+			// long-polls, so its own deadline ends it.
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+
+			cmd, took, err := p.Poll(ctx, "n1", "n1-2")
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("poll: %v", err)
+			}
+
+			if took {
+				t.Fatalf("the re-registered process took %s", cmd.Kind)
+			}
+
+			err = <-launched
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("launch = %v, want the delivery refusal naming %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -141,16 +206,14 @@ func TestAnOlderProcessCannotTakeAnArchLaunchQueuedForANewerOne(t *testing.T) {
 func TestACurrentNodeReceivesTheTiersArchitecture(t *testing.T) {
 	t.Parallel()
 
-	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
-		WithTierCatalog([]config.Tier{archTierForPlane()}), WithCommandTimeout(5*time.Second))
-	register(t, p, "n1", config.ProviderDocker)
+	p := archPlane(t, archNode("n1-1", config.ArchARM64))
 
 	launched := make(chan error, 1)
 	go func() {
 		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
-	cmd, took, err := p.Poll(t.Context(), "n1", "")
+	cmd, took, err := p.Poll(t.Context(), "n1", "n1-1")
 	if err != nil || !took || cmd.Kind != nodeapi.CommandLaunch {
 		t.Fatalf("poll = %+v, %v, %v", cmd, took, err)
 	}
@@ -159,7 +222,7 @@ func TestACurrentNodeReceivesTheTiersArchitecture(t *testing.T) {
 		t.Fatalf("launched tier = %+v, want arch arm64", cmd.Tier)
 	}
 
-	if err := p.Result("n1", "", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+	if err := p.Result("n1", "n1-1", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
 		t.Fatalf("result: %v", err)
 	}
 

@@ -190,6 +190,10 @@ type Allocator struct {
 	limits Limits
 	tiers  map[string]config.Tier
 
+	// namesArch is whether the catalogue names architectures, on every tier as
+	// config requires, so a lease whose tier it no longer has cannot say its own.
+	namesArch bool
+
 	// leaseTTL is how long a lease survives without a heartbeat. A holder that stops
 	// heartbeating has crashed, been partitioned, or been stopped; either way its
 	// capacity must come back or the host slowly fills with ghosts.
@@ -305,6 +309,8 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		tiers:    make(map[string]config.Tier, len(tiers)),
 		leaseTTL: DefaultLeaseTTL,
 		now:      time.Now,
+
+		namesArch: config.CatalogueNamesArch(tiers),
 	}
 
 	// Validate every precondition the allocator's arithmetic depends on. config.Load
@@ -1344,20 +1350,6 @@ func (a *Allocator) ResizeLeaving(
 				ErrNotPlaceable, lease.Node, instanceType, vcpu, memory)
 		}
 
-		// A FALLBACK DOES NOT CROSS THE TIER'S ARCHITECTURE, by the rule placement
-		// bought the first shape under (ADR-022): authorised by name and size alone, a
-		// fallback to a larger shape of the other architecture would be a purchase
-		// EC2 refuses or one a multi-architecture image runs on the wrong machine. An
-		// EC2 SHAPE'S ALONE, as in placement. A tier this catalogue no longer has
-		// cannot say, so it is refused too. ErrNoCapacity, so the node tries its next
-		// shape rather than giving the launch up.
-		if lease.Provider == config.ProviderEC2 {
-			if tier, ok := a.tiers[lease.Tier]; !ok || (tier.Arch != "" && arch != tier.Arch) {
-				return fmt.Errorf("%w: EC2 shape %q is declared %q and lease %s's tier %q is not "+
-					"known to run on it", ErrNoCapacity, instanceType, arch, leaseID, lease.Tier)
-			}
-		}
-
 		if vcpu < lease.RequestedVCPU || memory < lease.RequestedMemory {
 			return fmt.Errorf("%w: EC2 shape %q (%d vCPU, %s) does not hold lease %s's "+
 				"requested %d vCPU and %s", ErrNotPlaceable, instanceType, vcpu, memory,
@@ -1366,6 +1358,22 @@ func (a *Allocator) ResizeLeaving(
 
 		if lease.InstanceType == instanceType && lease.VCPU == vcpu && lease.Memory == memory {
 			return nil
+		}
+
+		// A FALLBACK DOES NOT CROSS THE TIER'S ARCHITECTURE, by the rule placement
+		// bought the first shape under (ADR-022): authorised by name and size alone, a
+		// fallback to a larger shape of the other architecture would be a purchase
+		// EC2 refuses or one a multi-architecture image runs on the wrong machine. An
+		// EC2 shape's alone, as in placement, and after the shape already charged,
+		// which the node asks about too. A tier this catalogue no longer has cannot
+		// say, so in a catalogue naming architectures it is refused. ErrNoCapacity,
+		// so the node tries its next shape rather than giving the launch up.
+		if lease.Provider == config.ProviderEC2 {
+			tier, known := a.tiers[lease.Tier]
+			if (!known && a.namesArch) || (known && tier.Arch != "" && arch != tier.Arch) {
+				return fmt.Errorf("%w: EC2 shape %q is declared %q and lease %s's tier %q is not "+
+					"known to run on it", ErrNoCapacity, instanceType, arch, leaseID, lease.Tier)
+			}
 		}
 
 		// ONLY A GROWTH IS JUDGED, and only after it is charged: a larger shape
@@ -2280,8 +2288,9 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				return fmt.Errorf(
 					"%w: node %s reported launching %s and now does not launch %s, while %d "+
 						"lease(s) are still outstanding against it; a lease placed for that "+
-						"architecture would run on another. Restore the host or its shapes until "+
-						"those jobs finish (or their leases expire), then it is free to change",
+						"architecture would run on another. Restore what the host reports until "+
+						"those jobs finish; a host replaced under the same name has lost them, "+
+						"and `billet force-destroy` settles each lease it held",
 					ErrWrongProvider, name, existing.Architectures, strings.Join(dropped, ", "),
 					outstanding)
 			}
