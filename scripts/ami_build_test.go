@@ -646,9 +646,9 @@ func TestARebootIsRecordedOnlyForThisBuild(t *testing.T) {
 	}
 }
 
-// ANY OTHER START WITH A RECORD IS AN UNPLANNED RESTART, AND FAILS without running
-// the template again: a build resumed from a record no reboot wrote installs onto
-// a machine in a state nothing knows.
+// A FAILED BUILD STAYS FAILED: a reboot request that failed leaves the record
+// saying failed and the unit disabled, so a later boot of any kind fails at resume
+// and the template runs once.
 func TestAFailedRebootRequestIsNotResumedByALaterBoot(t *testing.T) {
 	t.Parallel()
 
@@ -687,6 +687,9 @@ func TestAFailedRebootRequestIsNotResumedByALaterBoot(t *testing.T) {
 	}
 }
 
+// ANY OTHER START WITH A RECORD IS AN UNPLANNED RESTART, AND FAILS without running
+// the template again: a build resumed from a record no reboot wrote installs onto
+// a machine in a state nothing knows.
 func TestTheAMIBuildRefusesAnUnplannedRestart(t *testing.T) {
 	t.Parallel()
 
@@ -731,6 +734,14 @@ func TestTheAMIBuildRefusesAnUnplannedRestart(t *testing.T) {
 
 			if strings.Contains(fx.calls(t), "runner ") {
 				t.Errorf("the template ran again:\n%s", fx.calls(t))
+			}
+
+			// ANOTHER BUILD'S RECORD IS LEFT AS IT WAS: this build's failure is not
+			// that build's to write down.
+			if !strings.HasPrefix(tc.record, "nonce="+amiBuildNonce+"\n") {
+				if got := fx.state(t); got != tc.record {
+					t.Errorf("another build's record became\n%s", got)
+				}
 			}
 		})
 	}

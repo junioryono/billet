@@ -668,8 +668,8 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 	b.WriteString("billet_says() { [ \"$(" + verifyRunAsRunner + " printenv \"$1\")\" = \"$2\" ]; }\n")
 	b.WriteString("billet_sets() { billet_v=$(" + verifyRunAsRunner + " printenv \"$1\") || return 1; " +
 		"case \"$billet_v\" in \"$2\".|\"$2\"..|\"$2\"*/*) false ;; \"$2\"?*) " + verifyRunAsRunner +
-		" sh -c 'test ! -L \"$1\" && test -r \"$1/source.properties\"' sh \"$billet_root$billet_v\" ;; " +
-		"*) false ;; esac; }\n")
+		" test ! -L \"$billet_root$billet_v\" && " + verifyRunAsRunner +
+		" test -r \"$billet_root$billet_v/source.properties\" ;; *) false ;; esac; }\n")
 
 	// SPLIT BY THE SHELL ITSELF: a command splitting it could fail with nothing
 	// printed, and `for` would then check no component and fail nothing. The list's

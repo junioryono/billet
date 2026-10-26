@@ -478,8 +478,8 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 	// refusal stays the rule and this one only saves the launch.
 	if layout.billet {
 		return "", fmt.Errorf("ec2: the base image %s is an image billet built, and a build "+
-			"runs GitHub's template on a machine once; build from the distribution's own "+
-			"image (the default) instead", spec.BaseImage)
+			"runs GitHub's template on a machine once; pass Canonical's Ubuntu 24.04 image as "+
+			"--base-image instead", spec.BaseImage)
 	}
 
 	rootDevice := layout.root

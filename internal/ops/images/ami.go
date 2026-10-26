@@ -119,7 +119,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 
 	if *base == "" {
 		return errors.New("--base-image is required: billet does not guess which distribution " +
-			"you want, because the provisioning script assumes Ubuntu 24.04 and a wrong guess fails " +
+			"you want, because GitHub's template assumes Ubuntu 24.04 and a wrong guess fails " +
 			"halfway through a build you paid for")
 	}
 

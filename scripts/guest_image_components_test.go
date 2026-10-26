@@ -12,14 +12,19 @@ import (
 // componentCheck runs check-guest-component.sh MODE NAME ROOT, with `chroot` and
 // `id` stood in for so `present` runs without root: the stand-in chroot runs its
 // command with paths moved under the root, which follows no symlink the way a
-// real chroot would but asks the same questions.
+// real chroot would but asks the same questions. Asked as the runner
+// (--userspec=runner:runner), it refuses each path the tree's .closed-to-runner
+// lists, as a mode the runner cannot pass would.
 func componentCheck(t *testing.T, mode, name, root string) (string, int) {
 	t.Helper()
 
 	fakes := t.TempDir()
 	for file, body := range map[string]string{
-		"id":     "#!/bin/sh\n[ \"$1\" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id \"$@\"\n",
-		"chroot": "#!/bin/bash\nroot=$1; shift\nargs=()\nfor a in \"$@\"; do case $a in /*) args+=(\"$root$a\") ;; *) args+=(\"$a\") ;; esac; done\nexec \"${args[@]}\"\n",
+		"id": "#!/bin/sh\n[ \"$1\" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id \"$@\"\n",
+		"chroot": "#!/bin/bash\nrunner=\ncase $1 in --userspec=runner:runner) runner=1; shift ;; --userspec=*) exit 125 ;; esac\n" +
+			"root=$1; shift\nargs=()\nfor a in \"$@\"; do\n" +
+			"\tif [ -n \"$runner\" ] && grep -qxF -- \"$a\" \"$root/.closed-to-runner\" 2>/dev/null; then exit 1; fi\n" +
+			"\tcase $a in /*) args+=(\"$root$a\") ;; *) args+=(\"$a\") ;; esac\ndone\nexec \"${args[@]}\"\n",
 	} {
 		if err := forkSafeWriteFile(filepath.Join(fakes, file), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -190,7 +195,14 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 			t.Helper()
 
 			removeAll(t, filepath.Join(root, "usr", "local", "lib", "android", "sdk", "ndk", "27.3.13750724", "source.properties"))
-		}, "present", "has no source.properties, so it is no NDK"},
+		}, "present", "in which the runner reads no source.properties"},
+		// ROOT READS WHAT THE RUNNER CANNOT: the NDK is a job's only if the runner
+		// can read it.
+		"an NDK closed to the runner": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			writeTreeFile(t, root, ".closed-to-runner", "/usr/local/lib/android/sdk/ndk/27.3.13750724/source.properties\n")
+		}, "present", "ANDROID_NDK names /usr/local/lib/android/sdk/ndk/27.3.13750724, in which the runner reads no source.properties"},
 		// A LINK IS NOT THE NDK'S OWN DIRECTORY.
 		"an NDK variable naming a link": {"android-sdk", func(t *testing.T, root string) {
 			t.Helper()

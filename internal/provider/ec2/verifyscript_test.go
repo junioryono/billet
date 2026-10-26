@@ -249,7 +249,7 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	// THE FAKE BIN ALONE, with links to the two system commands the runner side
 	// runs: a host that has a toolchain of its own (a Mac has /usr/bin/swift)
 	// would otherwise answer for one a case left off the image.
-	for _, name := range []string{"sh", "test", "printenv"} {
+	for _, name := range []string{"sh", "printenv"} {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			t.Fatalf("no %s on PATH: %v", name, err)
@@ -259,6 +259,27 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 			t.Fatalf("link %s: %v", name, err)
 		}
 	}
+
+	// test IS THE SYSTEM'S, BUT THE RUNNER CANNOT READ WHAT closed-to-runner LISTS:
+	// a path refused only when the call arrived through the privilege drop, so a
+	// check that skipped billet_as_runner reads it and its case goes green.
+	// BY ABSOLUTE PATH, because the runner's PATH is the fake bin alone.
+	realTest, err := exec.LookPath("test")
+	if err != nil {
+		t.Fatalf("no test on PATH: %v", err)
+	}
+
+	realGrep, err := exec.LookPath("grep")
+	if err != nil {
+		t.Fatalf("no grep on PATH: %v", err)
+	}
+
+	closed := filepath.Join(root, "closed-to-runner")
+	writeFile(t, filepath.Join(bin, "test"), "#!/bin/sh\n"+
+		"if [ -n \"${"+droppedMarker+":-}\" ] && [ -f '"+closed+"' ]; then\n"+
+		"  for a in \"$@\"; do '"+realGrep+"' -qxF -- \"$a\" '"+closed+"' && exit 1; done\n"+
+		"fi\n"+
+		"exec '"+realTest+"' \"$@\"\n", 0o755)
 
 	// THE JOB'S ENVIRONMENT CARRIES WHAT EACH RECORDED COMPONENT'S INSTALLER SET,
 	// but the variable a case drops or points elsewhere.
@@ -396,17 +417,10 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 			writeFile(t, filepath.Join(elsewhere, "source.properties"), "Pkg.Revision = 1.0\n", 0o644)
 		}
 
-		// CLOSED TO THE RUNNER, as a root-owned 0700 directory is to a job.
+		// CLOSED TO THE RUNNER, as a root-owned 0700 directory is to a job, and
+		// to the runner alone, so only a check made as the runner refuses it.
 		if p.closedNDK {
-			if err := os.Chmod(ndk, 0o600); err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(func() {
-				if err := os.Chmod(ndk, 0o755); err != nil {
-					t.Errorf("reopen %s: %v", ndk, err)
-				}
-			})
+			writeFile(t, filepath.Join(root, "closed-to-runner"), filepath.Join(ndk, "source.properties")+"\n", 0o644)
 		}
 	}
 
@@ -850,7 +864,6 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			probe:    verifyProbe{components: "android-sdk:12.0", closedNDK: true},
 			wantStep: "components",
 			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
-			asUser:   true,
 		},
 		{
 			// AND ONE LEFT BEHIND BY AN SDK THAT IS GONE.

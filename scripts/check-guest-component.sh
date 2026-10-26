@@ -99,8 +99,8 @@ variables() {
 # with a version the build resolves: the Android NDK's, which GitHub's installer
 # sets because many builds read them. present asks that each value starts with its
 # prefix, compared as text, and is one directory directly under it, not a link,
-# holding the source.properties every NDK package has; absent that the name is
-# not there at all.
+# holding the source.properties every NDK package has, which the runner can read;
+# absent that the name is not there at all.
 versioned() {
 	case "$1" in
 	android-sdk)
@@ -171,8 +171,8 @@ present() {
 		"${variable#*=}"?*)
 			if ! chroot "$root" test -d "$value" || chroot "$root" test -L "$value"; then
 				fail "$name: ${variable%%=*} names $value, which is not a directory in the completed image"
-			elif ! chroot "$root" test -r "$value/source.properties"; then
-				fail "$name: ${variable%%=*} names $value, which has no source.properties, so it is no NDK"
+			elif ! chroot --userspec=runner:runner "$root" test -r "$value/source.properties"; then
+				fail "$name: ${variable%%=*} names $value, in which the runner reads no source.properties, so it is no NDK a job can use"
 			fi
 			;;
 		*) fail "$name: the job's environment does not set ${variable%%=*} to a path under ${variable#*=}" ;;
