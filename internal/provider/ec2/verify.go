@@ -237,7 +237,7 @@ func checkRecordedComponents(report map[string]string, contract int, built *stri
 		known = append(known, name)
 	}
 
-	if _, err := checkBuildComponents(recorded, known); err != nil {
+	if err := checkBuildComponents(recorded, known); err != nil {
 		return "", fmt.Errorf("records components billet cannot read: %w", err)
 	}
 

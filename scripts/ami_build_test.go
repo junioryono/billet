@@ -13,18 +13,24 @@ const amiBuildNonce = "0123456789abcdef0123456789abcdef"
 
 // The stand-ins build-ami.sh runs beside, in a repository of their own. Each logs
 // what it was asked to $FAKE/calls; the runner announces its steps as the real one
-// does, fails at FAKE_FAIL_AT, and reboots once at FAKE_REBOOT_AT through the real
-// ami-target.sh, after which it exits as the reboot's SIGTERM would end it.
+// does, leaves what GitHub's template leaves (configure-system.sh's world-writable
+// /opt, its staging under /var/tmp/billet-ri), fails at FAKE_FAIL_AT, and reboots
+// once at FAKE_REBOOT_AT through the real ami-target.sh, after which it exits as
+// the reboot's SIGTERM would end it.
 const (
 	fakeAMIRunner = `#!/bin/bash
 set -eu
 echo "runner scope=$BILLET_RI_SCOPE from=$BILLET_RI_FROM tmp=${TMPDIR:-}" >>"$FAKE/calls"
+[ -z "${FAKE_FAIL_FIRST:-}" ] || exit 1
+chmod -R 777 "$BILLET_AMI_ROOT/opt"
+mkdir -p "$BILLET_AMI_ROOT/var/tmp/billet-ri"
+echo staged >"$BILLET_AMI_ROOT/var/tmp/billet-ri/step.sh"
 for n in $(seq "$BILLET_RI_FROM" 9); do
 	echo "=== [$n/9] step-$n ==="
 	[ "$n" != "${FAKE_FAIL_AT:-}" ] || exit 1
 	if [ "$n" = "${FAKE_REBOOT_AT:-}" ] && [ ! -e "$FAKE/rebooted" ]; then
 		touch "$FAKE/rebooted"
-		BILLET_RI_NEXT_STEP=$((n + 1)) "$BILLET_RI_TARGET" reboot </dev/null
+		BILLET_RI_NEXT_STEP=$((n + 1)) "$BILLET_RI_TARGET" reboot </dev/null || exit 1
 		exit 143
 	fi
 done
@@ -56,9 +62,60 @@ if [ "$1" = present ]; then
 fi
 exec bash "$REAL_CHECK_COMPONENT" "$@"
 `
-	fakeLayer = "#!/bin/sh\necho layer >>\"$FAKE/calls\"\nexit \"${FAKE_LAYER_STATUS:-0}\"\n"
+	// The layer says whether anything of the build was writable by another
+	// account when root came to run it.
+	fakeLayer = `#!/bin/sh
+echo layer >>"$FAKE/calls"
+if [ -n "$(find "$BILLET_AMI_ROOT/opt/billet-ami" -perm -o+w -print -quit)" ] ||
+	[ -n "$(find "$BILLET_AMI_ROOT/opt/billet-ami/build.env" -perm -g+r -print -quit)" ]; then
+	echo "layer found the build open to other accounts" >>"$FAKE/calls"
+fi
+exit "${FAKE_LAYER_STATUS:-0}"
+`
+	// tee WRITES LATE, as a real one may: the build must wait for it before it
+	// reads its own log.
+	fakeTee = `#!/bin/bash
+# tee -a FILE, a line at a time, each a little late.
+while IFS= read -r line; do
+	/bin/sleep 0.1
+	printf '%s\n' "$line"
+	printf '%s\n' "$line" >>"$2"
+done
+`
 	// A command the build runs on the machine: logged, and successful.
 	fakeMachineCommand = "#!/bin/sh\necho \"$(basename \"$0\") $*\" >>\"$FAKE/calls\"\n"
+	// systemctl is logged too, and says the machine is going down once a reboot
+	// was asked for and did not fail (FAKE_REBOOT_FAILS refuses it).
+	fakeSystemctl = `#!/bin/sh
+case "$1" in
+is-system-running)
+	if [ -e "$FAKE/rebooting" ]; then echo stopping; else echo running; fi
+	exit 0
+	;;
+enable)
+	echo "systemctl $*" >>"$FAKE/calls"
+	if ! grep -qx phase=rebooting "$BILLET_AMI_ROOT/var/lib/billet-ami-build/state" 2>/dev/null; then
+		echo "enabled before the reboot was recorded" >>"$FAKE/calls"
+	fi
+	exit 0
+	;;
+reboot)
+	echo "systemctl $*" >>"$FAKE/calls"
+	[ -z "${FAKE_REBOOT_FAILS:-}" ] || exit 1
+	touch "$FAKE/rebooting"
+	exit 0
+	;;
+esac
+echo "systemctl $*" >>"$FAKE/calls"
+`
+	// poweroff records whether the success verdict was already on the console.
+	fakePoweroff = `#!/bin/sh
+if grep -q '^verdict=ok$' "$BILLET_AMI_CONSOLE" 2>/dev/null; then
+	echo "poweroff after the verdict" >>"$FAKE/calls"
+else
+	echo "poweroff before any verdict" >>"$FAKE/calls"
+fi
+`
 	// sleep ENDS A FAILED BUILD'S VERDICT LOOP, which on a real builder runs until
 	// billet terminates it: after a few rounds it signals the build's shell, as the
 	// termination would.
@@ -120,7 +177,19 @@ func newAMIBuildFixture(t *testing.T, scope, accept string) amiBuildFixture {
 		}
 	}
 
-	for _, name := range []string{"systemctl", "cloud-init", "poweroff", "sync"} {
+	if err := forkSafeWriteFile(filepath.Join(dir, "bin", "systemctl"), []byte(fakeSystemctl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := forkSafeWriteFile(filepath.Join(dir, "bin", "poweroff"), []byte(fakePoweroff), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := forkSafeWriteFile(filepath.Join(dir, "bin", "tee"), []byte(fakeTee), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"cloud-init", "sync"} {
 		if err := forkSafeWriteFile(filepath.Join(dir, "bin", name), []byte(fakeMachineCommand), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -143,8 +212,10 @@ func (fx amiBuildFixture) boot(t *testing.T, id string) {
 		t.Fatal(err)
 	}
 
-	if err := os.Remove(filepath.Join(fx.fake, "sleeps")); err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
+	for _, name := range []string{"sleeps", "rebooting"} {
+		if err := os.Remove(filepath.Join(fx.fake, name)); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -266,12 +337,21 @@ func TestTheAMIBuildRunsTheTemplateCompletesAndAnnounces(t *testing.T) {
 		t.Errorf("the builder powered off at %d, before the image was cleaned at %d:\n%s", j, i, calls)
 	}
 
+	if strings.Contains(calls, "layer found the build open to other accounts") {
+		t.Errorf("root ran the layer from files GitHub's template left writable by everyone:\n%s", calls)
+	}
+
+	if !strings.Contains(calls, "poweroff after the verdict\n") {
+		t.Errorf("the builder powered off before announcing its verdict:\n%s", calls)
+	}
+
 	record, err := os.ReadFile(filepath.Join(fx.root, "etc", "billet-image-components"))
 	if err != nil || string(record) != "android-sdk:140.0,firefox:140.0\n" {
 		t.Errorf("the image records %q (%v)", record, err)
 	}
 
 	for _, gone := range []string{"opt/billet-ami", "var/lib/billet-ami-build", "opt/billet/complete",
+		"var/tmp/billet-ri",
 		"etc/systemd/system/billet-ami-build.service"} {
 		if _, err := os.Stat(filepath.Join(fx.root, gone)); !os.IsNotExist(err) {
 			t.Errorf("the image keeps %s (%v)", gone, err)
@@ -312,22 +392,46 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 
 	for _, tc := range []struct {
 		name         string
+		scope        string
 		accept       string
 		env          []string
+		removePlan   bool
 		wantStep     string
 		wantTemplate string
 	}{
+		// A BUILD THAT CANNOT READ ITS OWN SETTINGS STILL SAYS SO, rather than
+		// leaving billet to its deadline.
+		{name: "the settings name no scope", scope: "ami-riscv64", wantStep: "start"},
+		{name: "the runner fails before its first step", env: []string{"FAKE_FAIL_FIRST=1"}, wantStep: "template"},
+		// A PLAN THAT CANNOT BE READ IS NOT A PLAN WITHOUT THE STEP: the accepted
+		// component would be dropped and the build would succeed without it.
+		{name: "the plan cannot be read", accept: "firefox", removePlan: true, wantStep: "components"},
 		{name: "a template step fails", env: []string{"FAKE_FAIL_AT=4"}, wantStep: "template", wantTemplate: "4"},
 		{name: "the completer installs nothing", accept: "firefox",
 			env: []string{"FAKE_COMPLETION_FAILS=firefox"}, wantStep: "components"},
 		{name: "a completed component is not present", accept: "firefox",
 			env: []string{"FAKE_PRESENT_STATUS=1"}, wantStep: "components"},
 		{name: "the layer fails", env: []string{"FAKE_LAYER_STATUS=1"}, wantStep: "layer"},
+		// THE RECORD SAYS REBOOTING AND THE MACHINE IS NOT GOING DOWN: a reboot
+		// request that failed is a failure, not the planned path.
+		{name: "the reboot request fails", env: []string{"FAKE_REBOOT_AT=5", "FAKE_REBOOT_FAILS=1"},
+			wantStep: "template", wantTemplate: "5"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			fx := newAMIBuildFixture(t, "ami-x64", tc.accept)
+			scope := tc.scope
+			if scope == "" {
+				scope = "ami-x64"
+			}
+
+			fx := newAMIBuildFixture(t, scope, tc.accept)
+
+			if tc.removePlan {
+				if err := os.Remove(filepath.Join(fx.repo, "scripts", "runner-images", "plan.json")); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			out, err := fx.run(t, tc.env...)
 			if err == nil {
@@ -379,6 +483,12 @@ func TestTheAMIBuildResumesAfterItsPlannedReboot(t *testing.T) {
 		t.Errorf("the unit was enabled at %d and the reboot asked at %d:\n%s", enable, reboot, calls)
 	}
 
+	// THE RECORD BEFORE THE UNIT: a crash between them leaves a record no boot
+	// acts on, where the other order leaves an enabled unit with no record.
+	if strings.Contains(calls, "enabled before the reboot was recorded") {
+		t.Errorf("the unit was enabled before the reboot was recorded:\n%s", calls)
+	}
+
 	fx.boot(t, "boot-two")
 
 	out, err = fx.run(t)
@@ -421,6 +531,72 @@ func TestTheAMIBuildUnitResumesWithoutAnOrderingCycle(t *testing.T) {
 	}
 }
 
+// A RESUMED RUN THAT FAILS BEFORE ITS FIRST STEP NAMES NO STEP: the log of the
+// boot before is not this run's, and its last step is not where this one failed.
+func TestAResumedFailureNamesOnlyItsOwnSteps(t *testing.T) {
+	t.Parallel()
+
+	fx := newAMIBuildFixture(t, "ami-x64", "")
+
+	work := filepath.Join(fx.root, "var", "lib", "billet-ami-build")
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, body := range map[string]string{
+		"state":     "nonce=" + amiBuildNonce + "\nphase=rebooting\nnext=6\nboot=boot-zero\n",
+		"build.log": "=== [5/9] step-5 ===\n",
+	} {
+		if err := os.WriteFile(filepath.Join(work, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := fx.run(t, "FAKE_FAIL_FIRST=1")
+	if err == nil {
+		t.Fatalf("a failed build exited 0:\n%s", out)
+	}
+
+	if v := fx.verdict(t); v["verdict"] != "fail" || v["step"] != "template" || v["template_step"] != "" {
+		t.Errorf("the verdict is %v, want fail at template naming no step\n%s", v, out)
+	}
+}
+
+// record-reboot WRITES ONLY THIS BUILD'S RECORD: a record of another build is
+// left as it was and the reboot is refused.
+func TestARebootIsRecordedOnlyForThisBuild(t *testing.T) {
+	t.Parallel()
+
+	fx := newAMIBuildFixture(t, "ami-x64", "")
+
+	state := filepath.Join(fx.root, "var", "lib", "billet-ami-build", "state")
+	if err := os.MkdirAll(filepath.Dir(state), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	other := "nonce=fedcba9876543210fedcba9876543210\nphase=started\nboot=boot-one\n"
+	if err := os.WriteFile(state, []byte(other), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join(fx.repo, "scripts", "ami", "build-ami.sh"),
+		"record-reboot", "5")
+	cmd.Env = append(os.Environ(), "BILLET_AMI_ROOT="+fx.root, "BILLET_AMI_BOOT_ID="+fx.bootID,
+		"BILLET_AMI_CONSOLE="+fx.console, "FAKE="+fx.fake, "PATH="+filepath.Join(fx.dir, "bin")+":"+os.Getenv("PATH"))
+
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("a reboot was recorded over another build's record:\n%s", out)
+	}
+
+	if got := fx.state(t); got != other {
+		t.Errorf("the record became %q", got)
+	}
+
+	if v := fx.verdict(t); v != nil {
+		t.Errorf("record-reboot announced a verdict of its own: %v", v)
+	}
+}
+
 // ANY OTHER START WITH A RECORD IS AN UNPLANNED RESTART, AND FAILS without running
 // the template again: a build resumed from a record no reboot wrote installs onto
 // a machine in a state nothing knows.
@@ -436,6 +612,12 @@ func TestTheAMIBuildRefusesAnUnplannedRestart(t *testing.T) {
 			record: "nonce=" + amiBuildNonce + "\nphase=rebooting\nnext=3\nboot=boot-one\n"},
 		{name: "another build's record",
 			record: "nonce=fedcba9876543210fedcba9876543210\nphase=rebooting\nnext=3\nboot=boot-zero\n"},
+		// AN INCOMPLETE RECORD IS NOT A PLANNED REBOOT: no boot reads as "another
+		// boot", and no step would restart the template from the first.
+		{name: "a reboot recorded in no boot", record: "nonce=" + amiBuildNonce + "\nphase=rebooting\nnext=3\n"},
+		{name: "a reboot recorded at no step", record: "nonce=" + amiBuildNonce + "\nphase=rebooting\nboot=boot-zero\n"},
+		{name: "a reboot recorded at step zero",
+			record: "nonce=" + amiBuildNonce + "\nphase=rebooting\nnext=0\nboot=boot-zero\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

@@ -222,7 +222,9 @@ const componentsFile = "/etc/billet-image-components"
 
 // componentPaths is what each component leaves in an image that a job runs or
 // reads: an executable marked x, a directory d. A test holds it to
-// check-guest-component.sh's own list, which the build's `present` asked.
+// check-guest-component.sh's own list, which the build's `present` asked; the
+// verifier asks the runner to execute each x and read each d, and componentRuns
+// what a path alone cannot prove.
 var componentPaths = map[string][]string{
 	"android-sdk": {"d /usr/local/lib/android/sdk", "x /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"},
 	"codeql":      {"d /opt/hostedtoolcache/CodeQL"},
@@ -231,6 +233,14 @@ var componentPaths = map[string][]string{
 		"d /usr/local/share/chromedriver-linux64", "x /usr/bin/chromedriver",
 		"d /usr/local/share/chromium", "x /usr/bin/chromium"},
 	"microsoft-edge": {"x /usr/bin/microsoft-edge", "d /usr/local/share/edge_driver", "x /usr/bin/msedgedriver"},
+}
+
+// componentRuns is what the runner executes for a component whose paths prove
+// nothing about whether it works. CodeQL's only path is the toolcache directory,
+// which an empty or broken entry also satisfies, so its bundle is run.
+var componentRuns = map[string]string{
+	"codeql": "for c in /opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql; do " +
+		"\"$c\" version >/dev/null 2>&1 && exit 0; done; exit 1",
 }
 
 // toolchain is one toolchain a job finds on PATH, and the arguments that make it
@@ -604,6 +614,15 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 		for _, entry := range componentPaths[name] {
 			kind, path, _ := strings.Cut(entry, " ")
 			checks = append(checks, verifyRunAsRunner+" test -"+kind+" "+path)
+
+			// A DIRECTORY THE RUNNER CANNOT READ IS STILL A DIRECTORY.
+			if kind == "d" {
+				checks = append(checks, verifyRunAsRunner+" test -r "+path)
+			}
+		}
+
+		if run, ok := componentRuns[name]; ok {
+			checks = append(checks, verifyRunAsRunner+" sh -c '"+run+"'")
 		}
 
 		b.WriteString("    " + name + ") " + strings.Join(checks, " && ") + " ;;\n")

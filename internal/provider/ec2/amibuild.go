@@ -3,6 +3,7 @@ package ec2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -38,10 +39,13 @@ const (
 	buildComponentsKey   = "components"
 )
 
-// buildSteps are the parts of build-ami.sh a verdict may name, the labels it
-// assigns to `at`, which a test holds to the script.
+// bootstrapStep is the part a failure of the user-data bootstrap names.
+const bootstrapStep = "bootstrap"
+
+// buildSteps are the parts of the build a verdict may name: the bootstrap's, and
+// the labels build-ami.sh assigns to `at`, which a test holds to the script.
 var buildSteps = []string{
-	"start", "resume", "template", "components", "environment", "layer", "cleanup", "done",
+	bootstrapStep, "start", "resume", "template", "components", "environment", "layer", "cleanup", "done",
 }
 
 // DefaultBuilderType is the builder's shape when nobody says: Nitro on both
@@ -54,6 +58,12 @@ func DefaultBuilderType(arch string) string {
 
 	return "c7i.4xlarge"
 }
+
+// maxBuildPollFailures is how many polls in a row may fail before the wait gives
+// up. Each poll's calls are already retried by the client; what this survives is
+// the orchestrator's network going away for a few minutes in a build of hours, which
+// would otherwise terminate a builder that was doing nothing wrong.
+const maxBuildPollFailures = 5
 
 // buildPoll is how often the build's state and console are read. The build takes
 // hours and its success verdict dwells for two minutes, so this reads it several
@@ -146,10 +156,28 @@ func bootstrapScript(spec BuildSpec) (string, error) {
 		return "", fmt.Errorf("ec2: the payload URL is not one this build will quote")
 	}
 
+	if !verifyNonce.MatchString(spec.nonce) {
+		return "", fmt.Errorf("ec2: %q is not a build nonce", spec.nonce)
+	}
+
 	var b strings.Builder
 
 	b.WriteString("#!/bin/sh\nset -eu\n")
 	b.WriteString("export HOME=/root\n")
+
+	// A BOOTSTRAP THAT FAILS SAYS SO, with this build's nonce, in the verdict
+	// build-ami.sh would have printed, so a payload that did not arrive ends the
+	// wait at once rather than at billet's deadline. It never powers off.
+	b.WriteString("billet_fail() {\n")
+	b.WriteString("  while :; do\n")
+	b.WriteString("    printf '%s\\n' '" + buildBegin + " " + spec.nonce + "' '" + reportVerdictKey +
+		"=" + verdictFail + "' '" + reportStepKey + "=" + bootstrapStep + "' '" +
+		buildTemplateStepKey + "=' '" + buildComponentsKey + "=' '" + buildEnd + " " +
+		spec.nonce + "' >/dev/console 2>/dev/null || true\n")
+	b.WriteString("    sleep 15\n")
+	b.WriteString("  done\n")
+	b.WriteString("}\n")
+	b.WriteString("trap 'billet_status=$?; trap - EXIT; [ \"$billet_status\" -eq 0 ] || billet_fail' EXIT\n")
 
 	// THE DISK IS THERE BEFORE ANYTHING TRIES TO USE IT.
 	//
@@ -226,14 +254,19 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 	schema := newBuildSchema()
 
 	var (
-		verdict map[string]string
-		latest  = true
+		verdict  map[string]string
+		latest   = true
+		failures int
 	)
 
 	for {
+		// A POLL FAILS IF EITHER OF ITS READS DOES, and only a poll whose reads all
+		// answered resets the count.
+		var pollErr error
+
 		st, err := p.describeRaw(ctx, id)
 		if err != nil {
-			return "", err
+			pollErr, st = err, builderState{}
 		}
 
 		switch st.state {
@@ -269,12 +302,19 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 						return "", buildFailure(id, spec.Arch, report)
 					}
 
-					components, err := checkBuildComponents(report[buildComponentsKey], spec.Accept)
-					if err != nil {
+					// A SUCCESS IS WHOLE OR IT IS NOT ONE. The parser drops a line it
+					// will not render, so a components line that was too long or not
+					// printable arrives as no line, and "none" is not what it said.
+					components, ok := report[buildComponentsKey]
+					if !ok || report[reportStepKey] != "done" {
+						return "", fmt.Errorf("ec2: the builder %s announced success without "+
+							"finishing its report, so billet cannot tell what it built", id)
+					}
+
+					if err := checkBuildComponents(components, spec.Accept); err != nil {
 						return "", fmt.Errorf("ec2: the builder %s: %w", id, err)
 					}
 
-					report[buildComponentsKey] = components
 					verdict = report
 				}
 
@@ -286,8 +326,20 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 			case isInstanceNotFound(err):
 
 			default:
-				return "", err
+				pollErr = err
 			}
+		}
+
+		if pollErr == nil {
+			failures = 0
+		} else {
+			failures++
+			if failures >= maxBuildPollFailures {
+				return "", pollErr
+			}
+
+			p.log.Warn("could not ask how the build is doing; asking again",
+				"instance", id, "error", pollErr)
 		}
 
 		if err := p.sleep(ctx, buildPoll); err != nil {
@@ -357,9 +409,11 @@ func planStepName(arch, n string) (string, bool) {
 // A SUBSET, NOT THE SET. An accepted component this architecture's template does
 // not install is left out by the build and said in its journal; one billet did
 // not accept is a build that installed something the deployment never agreed to.
-func checkBuildComponents(value string, accept []string) (string, error) {
+//
+// THE ERRORS NAME NOTHING THE MACHINE WROTE, only a name billet already holds.
+func checkBuildComponents(value string, accept []string) error {
 	if value == "" {
-		return "", nil
+		return nil
 	}
 
 	var seen []string
@@ -367,19 +421,19 @@ func checkBuildComponents(value string, accept []string) (string, error) {
 	for _, item := range strings.Split(value, ",") {
 		name, version, ok := strings.Cut(item, ":")
 		if !ok || !componentVersion.MatchString(version) {
-			return "", fmt.Errorf("the build reported a component %q that is not name:version", item)
+			return errors.New("the reported components are not a list of name:version")
 		}
 
 		if !slices.Contains(accept, name) {
-			return "", fmt.Errorf("the build reported installing %q, which was not accepted", name)
+			return errors.New("the reported components name one that was not accepted")
 		}
 
 		if slices.Contains(seen, name) {
-			return "", fmt.Errorf("the build reported %q twice", name)
+			return fmt.Errorf("the reported components name %s twice", name)
 		}
 
 		seen = append(seen, name)
 	}
 
-	return value, nil
+	return nil
 }

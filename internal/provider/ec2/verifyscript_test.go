@@ -97,8 +97,13 @@ type verifyProbe struct {
 	components string
 	// noComponentsRecord leaves the record out of the image entirely.
 	noComponentsRecord bool
-	// missingComponentPath is one path of a recorded component the image lacks.
-	missingComponentPath string
+	// missingComponentPath is one path of a recorded component the image lacks,
+	// and unreadableComponentDir one of its directories the runner cannot read.
+	missingComponentPath   string
+	unreadableComponentDir string
+	// noCodeQLBundle leaves a recorded CodeQL's toolcache directory with no bundle
+	// in it that runs.
+	noCodeQLBundle bool
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -243,6 +248,19 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 					t.Fatalf("make %s: %v", path, err)
 				}
 
+				if path == p.unreadableComponentDir {
+					if err := os.Chmod(croot+path, 0o311); err != nil {
+						t.Fatal(err)
+					}
+
+					// OPENED AGAIN, or the temporary directory cannot be removed.
+					t.Cleanup(func() {
+						if err := os.Chmod(croot+path, 0o755); err != nil {
+							t.Errorf("reopen %s: %v", path, err)
+						}
+					})
+				}
+
 				continue
 			}
 
@@ -254,8 +272,19 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		}
 	}
 
+	if strings.Contains(p.components, "codeql:") && !p.noCodeQLBundle {
+		bundle := filepath.Join(croot, "opt", "hostedtoolcache", "CodeQL", "2.23.1", "x64", "codeql")
+		if err := os.MkdirAll(bundle, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		writeFile(t, filepath.Join(bundle, "codeql"), "#!/bin/sh\n[ \"$1\" = version ]\n", 0o755)
+	}
+
+	script = substitute(t, script, "for c in /opt/hostedtoolcache/CodeQL/", "for c in "+croot+"/opt/hostedtoolcache/CodeQL/")
 	script = substitute(t, script, verifyRunAsRunner+" test -x /", verifyRunAsRunner+" test -x "+croot+"/")
 	script = substitute(t, script, verifyRunAsRunner+" test -d /", verifyRunAsRunner+" test -d "+croot+"/")
+	script = substitute(t, script, verifyRunAsRunner+" test -r /", verifyRunAsRunner+" test -r "+croot+"/")
 
 	// THE HELPER AS THE IMAGE CARRIES IT, an executable file whose bytes the
 	// verifier compares, so it is guestassets' own unless a case tampers with it.
@@ -455,7 +484,12 @@ func TestTheVerifierScriptRunsAndReports(t *testing.T) {
 		t.Run(arch, func(t *testing.T) {
 			t.Parallel()
 
-			report, stdout := verifyProbe{arch: arch, components: "firefox:140.0.4"}.run(t)
+			components := "firefox:140.0.4"
+			if arch == "x64" {
+				components += ",codeql:2.23.1"
+			}
+
+			report, stdout := verifyProbe{arch: arch, components: components}.run(t)
 
 			if got := report[reportVerdictKey]; got != "ok" {
 				t.Fatalf("a complete image reported %s=%q at step %q, so every build would fail\n"+
@@ -487,7 +521,7 @@ func TestTheVerifierScriptRunsAndReports(t *testing.T) {
 					"drop a job takes, so an empty one means that path did not run", got)
 			}
 
-			if got := report[buildComponentsKey]; got != "firefox:140.0.4" {
+			if got := report[buildComponentsKey]; got != components {
 				t.Errorf("%s=%q, want the record the image carries", buildComponentsKey, got)
 			}
 		})
@@ -563,6 +597,21 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			probe: verifyProbe{
 				components:           "firefox:140.0.4",
 				missingComponentPath: "/usr/bin/geckodriver",
+			},
+			wantStep: "components",
+		},
+		{
+			// A DIRECTORY IS NOT A COMPONENT: CodeQL's only path is the toolcache
+			// directory, which an empty entry satisfies.
+			name:     "a recorded CodeQL has no bundle that runs",
+			probe:    verifyProbe{components: "codeql:2.23.1", noCodeQLBundle: true},
+			wantStep: "components",
+		},
+		{
+			name: "a recorded component's directory is closed to the runner",
+			probe: verifyProbe{
+				components:             "firefox:140.0.4",
+				unreadableComponentDir: "/usr/local/share/gecko_driver",
 			},
 			wantStep: "components",
 		},

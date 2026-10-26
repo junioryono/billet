@@ -55,6 +55,29 @@ nonce=${BILLET_AMI_NONCE:-}
 [[ $nonce =~ ^[0-9a-f]{32}$ ]] || die "$env_file names no build nonce"
 work=$(dirname "$state")
 
+# THE VERDICT, to the console only, over and over: EC2 posts its console in
+# snapshots, and a single block can be missed between two of them.
+verdict() {
+	local round=0
+	while :; do
+		{
+			printf 'billet-build-begin %s\n' "$nonce"
+			printf '%s\n' "$@"
+			printf 'billet-build-end %s\n' "$nonce"
+		} >"$console" 2>/dev/null || printf '%s\n' "$@"
+		round=$((round + 1))
+		if [ "$1" = verdict=ok ] && [ "$round" -ge "$dwell_rounds" ]; then
+			return 0
+		fi
+		sleep "$dwell_seconds"
+	done
+}
+
+# template_step prints the number of the last template step the log announced.
+template_step() {
+	sed -n 's/^=== \[\([0-9][0-9]*\)\/[0-9][0-9]*\] .* ===$/\1/p' "$log" | tail -n 1
+}
+
 # read_state prints the record's value for KEY, or nothing.
 read_state() {
 	[ -f "$state" ] || return 0
@@ -83,6 +106,32 @@ run) ;;
 *) die "unknown command ${1:-}; want run or record-reboot" ;;
 esac
 
+at=start
+# A FAILURE IS SAID AND THE MACHINE KEPT, except when this process is ending
+# because the template rebooted on purpose: the record says this boot's run asked
+# for the reboot, and systemd says the machine is going down. A record alone is not
+# that proof, because the reboot request after it can fail.
+on_exit() {
+	local status=$? n=
+	[ "$status" -eq 0 ] && return 0
+	if [ "$at" = template ] && [ "$(read_state phase)" = rebooting ] &&
+		[ "$(read_state boot)" = "$(cat "$boot_id")" ] &&
+		[ "$(systemctl is-system-running 2>/dev/null || true)" = stopping ]; then
+		return 0
+	fi
+	trap - EXIT
+	# THE LOG IS WHOLE BEFORE IT IS READ: tee writes it asynchronously, so the
+	# build's output is closed and tee waited for, or a step that failed at once
+	# could be missing from it.
+	if [ -n "${tee_pid:-}" ]; then
+		exec >/dev/null 2>&1
+		wait "$tee_pid" 2>/dev/null || true
+	fi
+	[ "$at" = template ] && n=$(template_step)
+	verdict verdict=fail "step=$at" "template_step=$n" components=
+}
+trap on_exit EXIT
+
 scope=${BILLET_AMI_SCOPE:-}
 case "$scope" in
 ami-x64) toolset=toolset-2404.json plan=plan.json ;;
@@ -94,51 +143,13 @@ layer=$root/opt/billet-ami/ec2-layer.sh
 accept=(${BILLET_AMI_ACCEPT:-})
 
 # THE BUILD'S OWN OUTPUT IS KEPT BESIDE ITS RECORD as well as in the journal, so a
-# failure can say which template step was running.
+# failure can say which template step was running: this run's output alone, so a
+# resumed run that fails before its first step names no step of the boot before.
 install -d -m 0700 "$work"
 log=$work/build.log
+: >"$log"
 exec > >(tee -a "$log") 2>&1
-
-# THE VERDICT, to the console only, over and over: EC2 posts its console in
-# snapshots, and a single block can be missed between two of them.
-verdict() {
-	local round=0
-	while :; do
-		{
-			printf 'billet-build-begin %s\n' "$nonce"
-			printf '%s\n' "$@"
-			printf 'billet-build-end %s\n' "$nonce"
-		} >"$console" 2>/dev/null || printf '%s\n' "$@"
-		round=$((round + 1))
-		if [ "$1" = verdict=ok ] && [ "$round" -ge "$dwell_rounds" ]; then
-			return 0
-		fi
-		sleep "$dwell_seconds"
-	done
-}
-
-# template_step prints the number of the last template step the log announced.
-template_step() {
-	sed -n 's/^=== \[\([0-9][0-9]*\)\/[0-9][0-9]*\] .* ===$/\1/p' "$log" | tail -n 1
-}
-
-at=start
-# A FAILURE IS SAID AND THE MACHINE KEPT, except when this process is ending
-# because the template rebooted on purpose in this boot: that is the planned path,
-# and the next boot carries on. A record of a reboot this boot's run did not make
-# is a failure like any other.
-on_exit() {
-	local status=$? n=
-	[ "$status" -eq 0 ] && return 0
-	if [ "$at" = template ] && [ "$(read_state phase)" = rebooting ] &&
-		[ "$(read_state boot)" = "$(cat "$boot_id")" ]; then
-		return 0
-	fi
-	trap - EXIT
-	[ "$at" = template ] && n=$(template_step)
-	verdict verdict=fail "step=$at" "template_step=$n" components=
-}
-trap on_exit EXIT
+tee_pid=$!
 
 boot=$(cat "$boot_id")
 if [ ! -f "$state" ]; then
@@ -151,10 +162,13 @@ else
 	if [ "$phase" != rebooting ]; then
 		die "this boot found the build in phase '$phase', so it restarted without its planned reboot"
 	fi
-	if [ "$(read_state boot)" = "$boot" ]; then
+	recorded=$(read_state boot)
+	[ -n "$recorded" ] || die "the record names no boot it was written in"
+	if [ "$recorded" = "$boot" ]; then
 		die "the build started again in the boot that was to reboot"
 	fi
 	from=$(read_state next)
+	[[ $from =~ ^[1-9][0-9]*$ ]] || die "the record names no step to resume at"
 	write_state "nonce=$nonce" "phase=resumed" "boot=$boot"
 fi
 
@@ -164,6 +178,12 @@ fi
 # them on the build host, outside the image.
 at=template
 install -d -m 0700 "$work/tmp"
+# THE RUNNER READS ITS PLAN WITH jq, which Canonical's image carries and an
+# operator's base image may not; GitHub's template installs it again later.
+if ! command -v jq >/dev/null; then
+	apt-get -o DPkg::Lock::Timeout=600 update
+	DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends jq
+fi
 TMPDIR="$work/tmp" \
 	BILLET_RI_TARGET="$here/ami-target.sh" \
 	BILLET_AMI_STATE="$state" \
@@ -173,6 +193,12 @@ TMPDIR="$work/tmp" \
 	BILLET_RI_OUT="$work/out" \
 	"$repo/scripts/run-runner-images.sh"
 
+# THE BUILD'S OWN FILES ARE ROOT'S AGAIN. GitHub's configure-system.sh makes
+# everything under /opt writable by everyone, and root runs the layer and the
+# completer from here next.
+chmod -R go-w "$root/opt/billet-ami"
+chmod 0600 "$env_file"
+
 # THE COMPONENTS THE DEPLOYMENT ACCEPTS AND THIS TEMPLATE OFFERS, through the
 # completer and GitHub's own installers and tests the guest carries (#584). A
 # component whose installer is no step of this architecture's template is one
@@ -180,13 +206,16 @@ TMPDIR="$work/tmp" \
 at=components
 "$repo/scripts/runner-images/install-completer.sh" "$root/" "$repo/internal/runnerimages/$toolset"
 offered=()
+plan_file=$repo/scripts/runner-images/$plan
 for name in "${accept[@]}"; do
 	script=$("$repo/scripts/check-guest-component.sh" installer "$name")
-	if grep -qF "\"id\": \"$script\"" "$repo/scripts/runner-images/$plan"; then
-		offered+=("$name")
-	else
-		echo "build-ami: $name is accepted and GitHub's template for $scope does not install it, so this image does not carry it"
-	fi
+	found=0
+	grep -qF "\"id\": \"$script\"" "$plan_file" || found=$?
+	case "$found" in
+	0) offered+=("$name") ;;
+	1) echo "build-ami: $name is accepted and GitHub's template for $scope does not install it, so this image does not carry it" ;;
+	*) die "could not read $plan_file to tell whether it installs $name" ;;
+	esac
 done
 components=()
 if [ "${#offered[@]}" -gt 0 ]; then
@@ -220,7 +249,7 @@ bash "$layer"
 at=cleanup
 systemctl disable billet-ami-build.service >/dev/null 2>&1 || true
 rm -f "$root/etc/systemd/system/billet-ami-build.service"
-rm -rf "$root/opt/billet-ami" "$work"
+rm -rf "$root/opt/billet-ami" "$work" "$root/var/tmp/billet-ri"
 cloud-init clean --logs --machine-id
 sync
 

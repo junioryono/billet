@@ -61,7 +61,7 @@ func decodeUserData(t *testing.T, encoded string) string {
 func mustBootstrap(t *testing.T) string {
 	t.Helper()
 
-	script, err := bootstrapScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest})
+	script, err := bootstrapScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, nonce: verifyProbeNonce})
 	if err != nil {
 		t.Fatalf("bootstrapScript: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestTheRunnerAcceptsThePayloadsTree(t *testing.T) {
 func TestTheBootstrapChecksThePayloadBeforeItUnpacksIt(t *testing.T) {
 	t.Parallel()
 
-	script, err := bootstrapScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest})
+	script, err := bootstrapScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, nonce: verifyProbeNonce})
 	if err != nil {
 		t.Fatalf("bootstrapScript: %v", err)
 	}
@@ -435,13 +435,16 @@ func TestTheBootstrapRefusesWhatItCannotQuote(t *testing.T) {
 	t.Parallel()
 
 	for name, spec := range map[string]BuildSpec{
-		"nothing staged":   {},
-		"no digest":        {payloadURL: testPayloadURL},
-		"a short digest":   {payloadURL: testPayloadURL, payloadSHA256: "abc"},
-		"a quote":          {payloadURL: testPayloadURL + "'; poweroff; '", payloadSHA256: testPayloadDigest},
-		"a newline in it":  {payloadURL: testPayloadURL + "\npoweroff", payloadSHA256: testPayloadDigest},
-		"a backslash":      {payloadURL: testPayloadURL + "\\", payloadSHA256: testPayloadDigest},
-		"no url, a digest": {payloadSHA256: testPayloadDigest},
+		"nothing staged":   {nonce: verifyProbeNonce},
+		"no digest":        {payloadURL: testPayloadURL, nonce: verifyProbeNonce},
+		"a short digest":   {payloadURL: testPayloadURL, payloadSHA256: "abc", nonce: verifyProbeNonce},
+		"a quote":          {payloadURL: testPayloadURL + "'; poweroff; '", payloadSHA256: testPayloadDigest, nonce: verifyProbeNonce},
+		"a newline in it":  {payloadURL: testPayloadURL + "\npoweroff", payloadSHA256: testPayloadDigest, nonce: verifyProbeNonce},
+		"a backslash":      {payloadURL: testPayloadURL + "\\", payloadSHA256: testPayloadDigest, nonce: verifyProbeNonce},
+		"no url, a digest": {payloadSHA256: testPayloadDigest, nonce: verifyProbeNonce},
+		"no nonce":         {payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest},
+		"an injected nonce": {payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+			nonce: "'; poweroff; echo '"},
 	} {
 		if _, err := bootstrapScript(spec); err == nil {
 			t.Errorf("%s: the bootstrap rendered", name)
@@ -476,7 +479,13 @@ func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 			staged := filepath.Join(dir, "staged")
 			writeFile(t, staged, tc.payload, 0o644)
 
+			console := filepath.Join(dir, "console")
+
 			for name, body := range map[string]string{
+				// sleep ENDS THE FAILURE VERDICT'S LOOP, which on a builder runs until
+				// billet terminates it.
+				"sleep": "#!/bin/sh\nn=$(($(cat '" + dir + "/sleeps' 2>/dev/null || echo 0) + 1))\n" +
+					"echo $n >'" + dir + "/sleeps'\n[ $n -lt 3 ] || kill -TERM $PPID\n",
 				"curl":      "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && cp '" + staged + "' \"$2\"; shift; done\n",
 				"tar":       "#!/bin/sh\necho tar >>'" + calls + "'\n",
 				"systemctl": "#!/bin/sh\necho \"systemctl $*\" >>'" + calls + "'\n",
@@ -489,12 +498,14 @@ func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 
 			sum := sha256Hex([]byte("the payload\n"))
 
-			script, err := bootstrapScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: sum})
+			script, err := bootstrapScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: sum,
+				nonce: verifyProbeNonce})
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			script = substitute(t, script, payloadPath, filepath.Join(dir, "payload.tar.gz"))
+			script = substitute(t, script, "/dev/console", console)
 
 			cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
 			cmd.Env = append(os.Environ(), "PATH="+bin+":/usr/bin:/bin")
@@ -510,6 +521,22 @@ func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 
 			if ran != tc.wantRun || (runErr == nil) != tc.wantRun {
 				t.Errorf("unpacked and started %v, exited %v; want %v\n%s\n%s", ran, runErr, tc.wantRun, got, out)
+			}
+
+			// AND A REFUSAL IS A VERDICT BILLET READS, through its own parser.
+			said, err := os.ReadFile(console)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+
+			report, found := parseReport(string(said), verifyProbeNonce, newBuildSchema())
+			switch {
+			case tc.wantRun && found:
+				t.Errorf("a bootstrap that succeeded announced %v", report)
+			case !tc.wantRun && (!found || report[reportVerdictKey] != verdictFail ||
+				report[reportStepKey] != bootstrapStep):
+				t.Errorf("a refused payload announced %v (found %v), want a failure at %s",
+					report, found, bootstrapStep)
 			}
 		})
 	}
@@ -555,7 +582,7 @@ func TestAReportedComponentsListIsHeldToTheAcceptance(t *testing.T) {
 		"firefox:1 2":                         false,
 		"firefox:140.0.4,":                    false,
 	} {
-		_, err := checkBuildComponents(value, accept)
+		err := checkBuildComponents(value, accept)
 		if (err == nil) != ok {
 			t.Errorf("checkBuildComponents(%q) = %v, want accepted %v", value, err, ok)
 		}
@@ -583,6 +610,10 @@ func TestTheBuildStepsAreTheScriptsOwn(t *testing.T) {
 
 	if strings.Contains(string(raw), "verdict verdict=ok step=done") {
 		got = append(got, "done")
+	}
+
+	if strings.Contains(mustBootstrap(t), "'"+reportStepKey+"="+bootstrapStep+"'") {
+		got = append(got, bootstrapStep)
 	}
 
 	slices.Sort(got)
@@ -655,6 +686,57 @@ func TestAFailedBuildIsReportedWithItsStep(t *testing.T) {
 
 	if n := f.countOf("CreateImage"); n != 0 {
 		t.Errorf("%d images were registered from a failed build", n)
+	}
+}
+
+// A SUCCESS VERDICT THAT IS NOT WHOLE IS NOT A SUCCESS: one that never reached
+// `done`, and one whose components line the parser dropped, end the build before
+// anything is imaged rather than reading as "installed nothing".
+func TestAnIncompleteSuccessIsNotImaged(t *testing.T) {
+	t.Parallel()
+
+	for name, b := range map[string]*buildFake{
+		"short of done":                 {buildVerdict: verdictOK, buildStep: "layer"},
+		"no components":                 {omitBuildComponents: true},
+		"components too long to render": {builtComponents: "firefox:" + strings.Repeat("1", 300)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			b.stopReason, b.imageState = "Client.InstanceInitiatedShutdown", "available"
+
+			f := newFakeEC2(t)
+			f.respond = b.serve(f)
+
+			spec := verifyingBuild()
+			spec.Accept = []string{"firefox"}
+
+			_, err := newTestProvider(t, f, nil).BuildImage(t.Context(), spec)
+			if err == nil || !strings.Contains(err.Error(), "without finishing its report") {
+				t.Fatalf("an incomplete success was answered %v", err)
+			}
+
+			if n := f.countOf("CreateImage"); n != 0 {
+				t.Errorf("%d images were registered from an incomplete success", n)
+			}
+		})
+	}
+}
+
+// A REPORTED COMPONENTS LIST IS REFUSED IN BILLET'S OWN WORDS: the machine's text
+// reaches no error.
+func TestAComponentsRefusalQuotesNothingTheMachineWrote(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"secret-token-123:1", "firefox:1,secret-token-123", "firefox:secret token"} {
+		err := checkBuildComponents(value, []string{"firefox"})
+		if err == nil {
+			t.Fatalf("%q was accepted", value)
+		}
+
+		if strings.Contains(err.Error(), "secret") {
+			t.Errorf("the refusal quotes the machine: %v", err)
+		}
 	}
 }
 
@@ -788,6 +870,108 @@ func TestABuildStagesWhatItsBootstrapFetches(t *testing.T) {
 
 	if len(payloadMember(staged, amiLayerPath)) == 0 {
 		t.Error("the staged payload carries no EC2 layer")
+	}
+}
+
+// A FEW FAILED POLLS IN A ROW ARE A NETWORK THAT WENT AWAY, NOT A BUILD THAT
+// FAILED; past maxBuildPollFailures the wait gives up, and nothing is imaged.
+func TestAFewFailedPollsDoNotEndABuild(t *testing.T) {
+	t.Parallel()
+
+	short := strings.Repeat("R", maxBuildPollFailures-1)
+
+	for _, tc := range []struct {
+		reads  string
+		wantOK bool
+	}{
+		{reads: short, wantOK: true},
+		{reads: short + "R"},
+		// IN A ROW: an answered read between two runs of refusals starts the count
+		// again, however many there are in all.
+		{reads: short + "Q" + short, wantOK: true},
+	} {
+		b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available",
+			consoleReads: tc.reads}
+
+		f := newFakeEC2(t)
+		f.respond = b.serve(f)
+
+		_, err := newTestProvider(t, f, nil).BuildImage(t.Context(), verifyingBuild())
+		if (err == nil) != tc.wantOK {
+			t.Errorf("console reads %s: the build answered %v, want success %v",
+				tc.reads, err, tc.wantOK)
+		}
+
+		if n := f.countOf("CreateImage"); (n == 1) != tc.wantOK {
+			t.Errorf("console reads %s: %d images were registered", tc.reads, n)
+		}
+	}
+}
+
+// THE VERDICT build-ami.sh PRINTS IS ONE BILLET READS: the script's own verdict
+// function, executed, through the parser and schema awaitBuild uses, rather than two
+// copies of one format that agree only because both were typed the same way.
+func TestTheBuildsVerdictRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "ami", "build-ami.sh"))
+	if err != nil {
+		t.Fatalf("read build-ami.sh: %v", err)
+	}
+
+	source := string(raw)
+
+	start := strings.Index(source, "verdict() {\n")
+	if start < 0 {
+		t.Fatal("build-ami.sh defines no verdict function")
+	}
+
+	end := strings.Index(source[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("build-ami.sh's verdict function is not closed")
+	}
+
+	fn := source[start : start+end+3]
+
+	for _, tc := range []struct {
+		args []string
+		want map[string]string
+	}{
+		{
+			args: []string{"verdict=ok", "step=done", "template_step=", "components=firefox:158.0.1"},
+			want: map[string]string{reportVerdictKey: verdictOK, reportStepKey: "done",
+				buildTemplateStepKey: "", buildComponentsKey: "firefox:158.0.1"},
+		},
+		{
+			args: []string{"verdict=fail", "step=template", "template_step=42", "components="},
+			want: map[string]string{reportVerdictKey: verdictFail, reportStepKey: "template",
+				buildTemplateStepKey: "42", buildComponentsKey: ""},
+		},
+	} {
+		console := filepath.Join(t.TempDir(), "console")
+		script := "set -eu\nnonce=" + verifyProbeNonce + "\nconsole=" + console +
+			"\ndwell_rounds=1\ndwell_seconds=0\nsleep() { exit 0; }\n" + fn + "verdict \"$@\"\n"
+
+		args := append([]string{"-c", script, "verdict"}, tc.args...)
+		if out, err := exec.CommandContext(t.Context(), "bash", args...).CombinedOutput(); err != nil {
+			t.Fatalf("the verdict function failed: %v\n%s", err, out)
+		}
+
+		said, err := os.ReadFile(console)
+		if err != nil {
+			t.Fatalf("the verdict function wrote no console: %v", err)
+		}
+
+		got, found := parseReport(string(said), verifyProbeNonce, newBuildSchema())
+		if !found || len(got) != len(tc.want) {
+			t.Fatalf("billet read %v (found %v) from:\n%s", got, found, said)
+		}
+
+		for k, v := range tc.want {
+			if got[k] != v {
+				t.Errorf("billet read %s=%q, the script said %q", k, got[k], v)
+			}
+		}
 	}
 }
 

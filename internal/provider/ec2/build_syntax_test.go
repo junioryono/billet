@@ -51,7 +51,7 @@ func TestTheGeneratedScriptParses(t *testing.T) {
 				t.Fatalf("layerScript: %v", err)
 			}
 
-			s.payloadURL, s.payloadSHA256 = testPayloadURL, testPayloadDigest
+			s.payloadURL, s.payloadSHA256, s.nonce = testPayloadURL, testPayloadDigest, verifyProbeNonce
 
 			bootstrap, err := bootstrapScript(s)
 			if err != nil {
@@ -133,10 +133,7 @@ func TestTheDockerDaemonIsRestartedAfterItsConfigIsWritten(t *testing.T) {
 func TestTheBuildScriptsHaveAHomeFirst(t *testing.T) {
 	t.Parallel()
 
-	bootstrap, err := bootstrapScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest})
-	if err != nil {
-		t.Fatalf("bootstrapScript: %v", err)
-	}
+	bootstrap := mustBootstrap(t)
 
 	for _, tc := range []struct {
 		name, script, later string

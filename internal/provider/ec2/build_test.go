@@ -487,6 +487,12 @@ type buildFake struct {
 	// builder stops only after it, unless stopsUnread makes it stop before.
 	verdictRead bool
 	stopsUnread bool
+	// omitBuildComponents leaves the components line out of the verdict.
+	omitBuildComponents bool
+	// consoleReads is how the builder's first console reads are answered, one
+	// letter a read: R refuses it, Q answers with nothing printed yet. Every read
+	// after them sees the verdict.
+	consoleReads string
 }
 
 // serve wires the fake to its server, which holds the payload the build staged,
@@ -535,9 +541,13 @@ func (b *buildFake) buildConsole() string {
 		buildBegin + " " + nonce + "\n" +
 		reportVerdictKey + "=" + verdict + "\n" +
 		reportStepKey + "=" + step + "\n" +
-		buildTemplateStepKey + "=" + b.buildTemplateStep + "\n" +
-		buildComponentsKey + "=" + b.builtComponents + "\n" +
-		buildEnd + " " + nonce + "\n"
+		buildTemplateStepKey + "=" + b.buildTemplateStep + "\n"
+
+	if !b.omitBuildComponents {
+		body += buildComponentsKey + "=" + b.builtComponents + "\n"
+	}
+
+	body += buildEnd + " " + nonce + "\n"
 
 	b.verdictRead = true
 
@@ -616,6 +626,20 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 			`</item></instancesSet></RunInstancesResponse>`
 
 	case "GetConsoleOutput":
+		if params.Get("InstanceId") == "i-builder" && b.consoleReads != "" {
+			read := b.consoleReads[0]
+			b.consoleReads = b.consoleReads[1:]
+
+			if read == 'Q' {
+				return http.StatusOK, `<GetConsoleOutputResponse><instanceId>i-builder</instanceId>` +
+					`<output></output></GetConsoleOutputResponse>`
+			}
+
+			return http.StatusForbidden, `<Response><Errors><Error>` +
+				`<Code>UnauthorizedOperation</Code><Message>not now</Message>` +
+				`</Error></Errors></Response>`
+		}
+
 		if params.Get("InstanceId") == "i-builder" {
 			return http.StatusOK, `<GetConsoleOutputResponse><instanceId>i-builder</instanceId>` +
 				`<output>` + b.buildConsole() + `</output></GetConsoleOutputResponse>`
