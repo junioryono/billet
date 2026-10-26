@@ -626,10 +626,11 @@ func (in Inputs) Build() (Policy, error) {
 				Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
 				Condition: builderOwnerCondition(in.Owner),
 			},
-			// A build reads its builder's verdict, and then the verifier's report on the
-			// image it produced, off the serial console. Scoped to instances carrying the builder tag: console
-			// output is whatever the machine printed, and on a job instance that is a
-			// runner's own log rather than anything this role has business reading.
+			// A build reads its builder's verdict, and then the verifier's report on
+			// the image it produced, off the serial console. Scoped to instances
+			// carrying the builder tag: console output is whatever the machine
+			// printed, and on a job instance that is a runner's own log rather than
+			// anything this role has business reading.
 			//
 			// AND THAT SCOPING WORKS, WHICH IS WORTH RECORDING BECAUSE A REVIEW SAID IT
 			// DOES NOT. The claim was that GetConsoleOutput supports no resource type,

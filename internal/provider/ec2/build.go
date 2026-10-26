@@ -88,10 +88,10 @@ const (
 // MEASURED ON REAL BUILDERS, 2026-10-25, running GitHub's whole template
 // (ADR-022): a prototype on a 200 GiB root used at most 42 GiB on x64 (c7i.4xlarge,
 // before the template's reboot) and 35 GiB on arm64 (c7g.4xlarge); the images
-// `billet ami build` then made on this default hold 51 GiB on x64, with the Android SDK,
-// Firefox and billet's layer, leaving a job 64 free, and 33 on arm64. GitHub's hosted runner
-// leaves a job tens of gigabytes; 80, the default for billet's own installers,
-// would have left a job under 30.
+// `billet ami build` then made on this default hold 51 GiB on x64, with the Android
+// SDK, Firefox and billet's layer, leaving 64 available to a job by df, and 33 on
+// arm64. GitHub's hosted runner leaves a job tens of gigabytes; 80, the default for
+// billet's own installers, would have left a job under 30.
 //
 // The figure this replaced was 80 for an image of 26.8 GiB, and its comment's
 // lesson stands: the number that matters is the PEAK during the build, which the

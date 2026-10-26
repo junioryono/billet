@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/guestassets"
+	"github.com/junioryono/billet/internal/runnerimages"
 )
 
 // verifyProbeNonce is a well-formed nonce for a script under test.
@@ -37,6 +38,22 @@ func substitute(t *testing.T, script, old, replacement string) string {
 	}
 
 	return strings.ReplaceAll(script, old, replacement)
+}
+
+// variableLine is a component's variable line as the job's environment carries it:
+// line with suffix after it, nothing when it is dropped, and another value when it
+// is wrong.
+func variableLine(line, suffix, drop, wrong string) string {
+	name, _, _ := strings.Cut(line, "=")
+
+	switch name {
+	case drop:
+		return ""
+	case wrong:
+		return name + "=/elsewhere\n"
+	default:
+		return line + suffix + "\n"
+	}
 }
 
 // writeFile writes a fixture file with a mode.
@@ -115,6 +132,10 @@ type verifyProbe struct {
 	// noAbsenceEnv leaves the job's environment unreadable where the absence check
 	// reads it.
 	noAbsenceEnv bool
+	// dropVariable is a recorded component's variable the job's environment leaves
+	// out, and wrongVariable one it points somewhere else.
+	dropVariable  string
+	wrongVariable string
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -226,8 +247,24 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		}
 	}
 
+	// THE JOB'S ENVIRONMENT CARRIES WHAT EACH RECORDED COMPONENT'S INSTALLER SET,
+	// but the variable a case drops or points elsewhere.
+	env := "PATH=" + bin + "\n"
+
+	for _, item := range strings.Split(p.components, ",") {
+		name, _, _ := strings.Cut(item, ":")
+
+		for _, line := range componentVariables[name] {
+			env += variableLine(line, "", p.dropVariable, p.wrongVariable)
+		}
+
+		for _, line := range componentVariablePrefixes[name] {
+			env += variableLine(line, "27.3.13750724", p.dropVariable, p.wrongVariable)
+		}
+	}
+
 	envFile := filepath.Join(root, "billet-image-env")
-	writeFile(t, envFile, "PATH="+bin+"\n", 0o644)
+	writeFile(t, envFile, env, 0o644)
 
 	// THE SAME FILE UNDER billet_root, where the absence check reads it: the
 	// substitution below moves the check's imageEnvFile to envFile as well.
@@ -242,7 +279,7 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	}
 
 	if !p.noAbsenceEnv {
-		writeFile(t, croot+envFile, "PATH="+bin+"\n"+stray, 0o644)
+		writeFile(t, croot+envFile, env+stray, 0o644)
 	}
 
 	script = substitute(t, script, "du -sk "+toolcacheDir, "du -sk "+tcDir)
@@ -528,7 +565,7 @@ func TestTheVerifierScriptRunsAndReports(t *testing.T) {
 
 			components := "firefox:140.0.4"
 			if arch == "x64" {
-				components += ",codeql:2.23.1"
+				components += ",codeql:2.23.1,android-sdk:12.0"
 			}
 
 			report, stdout := verifyProbe{arch: arch, components: components}.run(t)
@@ -680,6 +717,28 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			// told where Chrome is.
 			name:     "the job's environment names a component the image does not record",
 			probe:    verifyProbe{strayVariable: "CHROME_BIN"},
+			wantStep: "components",
+		},
+		{
+			// A COMPONENT A JOB CANNOT FIND THROUGH ITS VARIABLE IS NOT ONE IT HAS.
+			name:     "the job's environment does not name a recorded component's variable",
+			probe:    verifyProbe{components: "firefox:140.0.4", dropVariable: "GECKOWEBDRIVER"},
+			wantStep: "components",
+		},
+		{
+			name:     "a recorded component's variable points somewhere else",
+			probe:    verifyProbe{components: "firefox:140.0.4", wrongVariable: "GECKOWEBDRIVER"},
+			wantStep: "components",
+		},
+		{
+			name:     "a recorded component's versioned variable points somewhere else",
+			probe:    verifyProbe{components: "android-sdk:12.0", wrongVariable: "ANDROID_NDK_LATEST_HOME"},
+			wantStep: "components",
+		},
+		{
+			// AND ONE LEFT BEHIND BY AN SDK THAT IS GONE.
+			name:     "the job's environment names an NDK the image does not record",
+			probe:    verifyProbe{strayVariable: "ANDROID_NDK"},
 			wantStep: "components",
 		},
 		{
@@ -878,7 +937,8 @@ func TestTheVerifiersComponentPathsAreTheComponentChecks(t *testing.T) {
 	}
 }
 
-// AND THE VARIABLES ARE check-guest-component.sh's, which the build's `absent` asked.
+// AND THE VARIABLES ARE check-guest-component.sh's, which the build's `present` and
+// `absent` asked: both its lists, line for line.
 func TestTheVerifiersComponentVariablesAreTheComponentChecks(t *testing.T) {
 	t.Parallel()
 
@@ -887,40 +947,69 @@ func TestTheVerifiersComponentVariablesAreTheComponentChecks(t *testing.T) {
 		t.Fatalf("read check-guest-component.sh: %v", err)
 	}
 
-	_, body, ok := strings.Cut(string(raw), "\nvariables() {\n")
-	if !ok {
-		t.Fatal("check-guest-component.sh defines no variables()")
-	}
+	for function, verifier := range map[string]map[string][]string{
+		"variables": componentVariables,
+		"versioned": componentVariablePrefixes,
+	} {
+		_, body, ok := strings.Cut(string(raw), "\n"+function+"() {\n")
+		if !ok {
+			t.Fatalf("check-guest-component.sh defines no %s()", function)
+		}
 
-	body, _, _ = strings.Cut(body, "\n}\n")
+		body, _, _ = strings.Cut(body, "\n}\n")
 
-	arm := regexp.MustCompile(`^\t([a-z][a-z-]*)\)`)
-	echo := regexp.MustCompile(`echo "([A-Z_]+)=`)
-	want := map[string][]string{}
-	current := ""
+		arm := regexp.MustCompile(`^\t([a-z][a-z |-]*)\)`)
+		echo := regexp.MustCompile(`echo "([A-Z_]+=[^"]*)"`)
+		want := map[string][]string{}
 
-	for _, line := range strings.Split(body, "\n") {
-		if m := arm.FindStringSubmatch(line); len(m) == 2 && m[1] != "" {
-			current = m[1]
-			if _, ok := want[current]; !ok {
-				want[current] = nil
+		var current []string
+
+		for _, line := range strings.Split(body, "\n") {
+			if m := arm.FindStringSubmatch(line); len(m) == 2 {
+				current = strings.Split(m[1], " | ")
+				for _, name := range current {
+					if _, ok := want[name]; !ok {
+						want[name] = nil
+					}
+				}
+			}
+
+			for _, m := range echo.FindAllStringSubmatch(line, -1) {
+				for _, name := range current {
+					want[name] = append(want[name], m[1])
+				}
 			}
 		}
 
-		for _, m := range echo.FindAllStringSubmatch(line, -1) {
-			want[current] = append(want[current], m[1])
+		if len(want) != len(verifier) {
+			t.Errorf("%s(): check-guest-component.sh lists %d components and the verifier %d",
+				function, len(want), len(verifier))
+		}
+
+		for name, lines := range want {
+			got, ok := verifier[name]
+			if !ok || !slices.Equal(got, lines) {
+				t.Errorf("%s() %s: the verifier checks %q and check-guest-component.sh lists %q",
+					function, name, got, lines)
+			}
 		}
 	}
+}
 
-	if len(want) != len(componentVariables) {
-		t.Errorf("check-guest-component.sh lists %d components and the verifier %d", len(want), len(componentVariables))
+// TWO TOOLS ONE REPORT KEY IS REFUSED BEFORE ANYTHING LAUNCHES: the parser refuses a
+// report naming a key twice, so the collision would otherwise end every verification
+// with no report.
+func TestTwoToolsSharingAReportKeyAreRefused(t *testing.T) {
+	t.Parallel()
+
+	ts := runnerimages.Toolset{Toolcache: []runnerimages.ToolcacheEntry{{Name: "Py-Py"}, {Name: "Py_Py"}}}
+
+	if tools, err := toolReports(ts); err == nil || !strings.Contains(err.Error(), "both become the report key") {
+		t.Fatalf("two names that share tc_py_py were answered %v, %v", tools, err)
 	}
 
-	for name, vars := range want {
-		got, ok := componentVariables[name]
-		if !ok || !slices.Equal(got, vars) {
-			t.Errorf("%s: the verifier checks %q and check-guest-component.sh lists %q", name, got, vars)
-		}
+	if _, err := toolReports(runnerimages.Toolset{Toolcache: []runnerimages.ToolcacheEntry{{Name: "PyPy"}, {Name: "Python"}}}); err != nil {
+		t.Fatalf("two names with keys of their own were refused: %v", err)
 	}
 }
 

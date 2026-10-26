@@ -235,15 +235,45 @@ var componentPaths = map[string][]string{
 	"microsoft-edge": {"x /usr/bin/microsoft-edge", "d /usr/local/share/edge_driver", "x /usr/bin/msedgedriver"},
 }
 
-// componentVariables is what each component adds to the job's environment, which
-// an image that does not carry it must not name. A test holds it to
-// check-guest-component.sh's own list, which the build's `absent` asked.
-var componentVariables = map[string][]string{
-	"android-sdk":    {"ANDROID_HOME", "ANDROID_SDK_ROOT"},
-	"codeql":         nil,
-	"firefox":        {"GECKOWEBDRIVER"},
-	"google-chrome":  {"CHROME_BIN", "CHROMEWEBDRIVER"},
-	"microsoft-edge": {"EDGEWEBDRIVER"},
+// componentVariables is what each component's installer adds to the job's
+// environment, line for line, and componentVariablePrefixes the lines whose value
+// goes on with a version, by the path it starts with. An image that records the
+// component carries each; one that does not names none of them. A test holds both
+// to check-guest-component.sh's own lists, which the build's `present` and `absent`
+// asked.
+var (
+	componentVariables = map[string][]string{
+		"android-sdk": {"ANDROID_HOME=/usr/local/lib/android/sdk",
+			"ANDROID_SDK_ROOT=/usr/local/lib/android/sdk"},
+		"codeql":  nil,
+		"firefox": {"GECKOWEBDRIVER=/usr/local/share/gecko_driver"},
+		"google-chrome": {"CHROME_BIN=/usr/bin/google-chrome",
+			"CHROMEWEBDRIVER=/usr/local/share/chromedriver-linux64"},
+		"microsoft-edge": {"EDGEWEBDRIVER=/usr/local/share/edge_driver"},
+	}
+	componentVariablePrefixes = map[string][]string{
+		"android-sdk": {"ANDROID_NDK=/usr/local/lib/android/sdk/ndk/",
+			"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/",
+			"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/",
+			"ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/"},
+		"codeql":         nil,
+		"firefox":        nil,
+		"google-chrome":  nil,
+		"microsoft-edge": nil,
+	}
+)
+
+// componentVariableNames is every variable a component's installer sets.
+func componentVariableNames(name string) []string {
+	lines := slices.Concat(componentVariables[name], componentVariablePrefixes[name])
+	out := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		variable, _, _ := strings.Cut(line, "=")
+		out = append(out, variable)
+	}
+
+	return out
 }
 
 // componentRuns is what the runner executes for a component whose paths prove
@@ -465,6 +495,16 @@ func toolReports(ts runnerimages.Toolset) ([]toolReport, error) {
 				"billet will not render", name, key)
 		}
 
+		// AND REFUSED WHEN TWO NAMES SHARE A KEY. The parser refuses a report that
+		// names a key twice, so a collision would leave every verification with no
+		// report at all, timing out rather than saying why.
+		for _, earlier := range out {
+			if earlier.key == key {
+				return nil, fmt.Errorf("ec2: the toolcache names %q and %q both become the report "+
+					"key %q", earlier.dir, name, key)
+			}
+		}
+
 		out = append(out, toolReport{dir: name, key: key})
 	}
 
@@ -599,8 +639,8 @@ func writeVerifyToolchains(b *strings.Builder, step func(string), arch string) {
 }
 
 // writeVerifyComponents reports the components the build recorded and proves each
-// one is there for the runner: its executables run-ready and its directories
-// readable, through the job's own path.
+// one is there for the runner: its executables run-ready, its directories readable,
+// through the job's own path, and its variables in the job's environment.
 //
 // THE RECORD MUST EXIST, EMPTY OR NOT. An image with no record is one no contract-4
 // build finished, and "none" and "unknown" are different answers.
@@ -616,7 +656,20 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 	b.WriteString("case \"$billet_record\" in *[!A-Za-z0-9:.,+~_-]*) " +
 		"echo 'the components record is not a list of name:version' >&2; exit 1 ;; esac\n")
 	b.WriteString("billet_components=$billet_record\n")
-	b.WriteString("for billet_c in $(printf '%s' \"$billet_components\" | tr ',' ' '); do\n")
+
+	// TWO QUESTIONS OF THE JOB'S ENVIRONMENT, asked once each per variable: whether
+	// it says a line exactly, and whether it sets a name to a path under a prefix.
+	// Functions, because the script has a size to keep.
+	b.WriteString("billet_says() { grep -qxF \"$1\" " + imageEnvFile + "; }\n")
+	b.WriteString("billet_sets() { grep -q \"^$1[^/]\" " + imageEnvFile + "; }\n")
+
+	// SPLIT BY THE SHELL ITSELF: a command splitting it could fail with nothing
+	// printed, and `for` would then check no component and fail nothing. The list's
+	// characters hold no glob, and IFS is the shell's own again inside the loop.
+	b.WriteString("billet_ifs=$IFS\n")
+	b.WriteString("IFS=,\n")
+	b.WriteString("for billet_c in $billet_components; do\n")
+	b.WriteString("  IFS=$billet_ifs\n")
 	b.WriteString("  case \"${billet_c%%:*}\" in\n")
 
 	names := make([]string, 0, len(componentPaths))
@@ -649,12 +702,23 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 			checks = append(checks, verifyRunAsRunner+" sh -c '"+run+"'")
 		}
 
+		// AND THE JOB IS TOLD WHERE IT IS, as GitHub's installer tells it: a
+		// component a workflow cannot find through its variable is not one it has.
+		for _, line := range componentVariables[name] {
+			checks = append(checks, "billet_says "+line)
+		}
+
+		for _, line := range componentVariablePrefixes[name] {
+			checks = append(checks, "billet_sets "+line)
+		}
+
 		b.WriteString("    " + name + ") " + strings.Join(checks, " && ") + " ;;\n")
 	}
 
 	b.WriteString("    *) false ;;\n")
-	b.WriteString("  esac || { echo \"the image records $billet_c and the runner cannot reach it\" >&2; exit 1; }\n")
+	b.WriteString("  esac || { echo \"the image records $billet_c and does not carry it for the runner\" >&2; exit 1; }\n")
 	b.WriteString("done\n")
+	b.WriteString("IFS=$billet_ifs\n")
 
 	// AND WHAT IT DOES NOT RECORD, IT DOES NOT CARRY. A base image may hold a
 	// component nobody accepted, and the record would then be a claim the image
@@ -666,6 +730,7 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 	// only by accident, so the file is proved readable and a status 2 is present.
 	b.WriteString("test -r \"$billet_root\"" + imageEnvFile + " || " +
 		"{ echo 'the job environment cannot be read' >&2; exit 1; }\n")
+	b.WriteString("billet_names() { grep -q \"^$1=\" \"$billet_root\"" + imageEnvFile + "; [ $? -ne 1 ]; }\n")
 
 	for _, name := range names {
 		var present []string
@@ -677,8 +742,8 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 
 		// AND THE JOB'S ENVIRONMENT NAMES NONE OF ITS VARIABLES, as the build's own
 		// absence check asked: a variable pointing at nothing is what a job reads.
-		for _, variable := range componentVariables[name] {
-			present = append(present, "{ grep -q '^"+variable+"=' \"$billet_root\""+imageEnvFile+"; [ $? -ne 1 ]; }")
+		for _, variable := range componentVariableNames(name) {
+			present = append(present, "billet_names "+variable)
 		}
 
 		b.WriteString("case \",$billet_components,\" in *\"," + name + ":\"*) ;; *) if " +

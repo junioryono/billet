@@ -27,7 +27,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The AMI is verified by booting it, and the tag is the promotion.**
 - **AMI contract 4 is GitHub's template build with billet's EC2 layer, completed with what `images.accept` names (ADR-022).**
 - **User data is 16384 bytes, gzipped, and `packUserData` is the gate.**
-- **Everything the AMI build runs exports `HOME=/root`, because neither cloud-init's user data nor a system unit has a HOME.**
+- **The AMI build's bootstrap, template steps, component installers and layer run with `HOME=/root`, because neither cloud-init's user data nor a system unit has a HOME.**
 - **The builder checks the runner tarball against the pin before it unpacks it, and an unpinned release needs `--runner-sha256` (#180).**
 - **Spot warnings are one queue per node.**
 - **The builder's owner tag is the deployment's, and the policy's pattern comes from the same function that stamps it.**

@@ -17,8 +17,9 @@ const amiBuildNonce = "0123456789abcdef0123456789abcdef"
 // The stand-ins build-ami.sh runs beside, in a repository of their own. Each logs
 // what it was asked to $FAKE/calls; the runner announces its steps as the real one
 // does, leaves what GitHub's template leaves (its staging under
-// /var/tmp/billet-ri), fails at FAKE_FAIL_AT, and reboots once at FAKE_REBOOT_AT through the real ami-target.sh, after which it exits as
-// the reboot's SIGTERM would end it.
+// /var/tmp/billet-ri), fails at FAKE_FAIL_AT, and reboots once at FAKE_REBOOT_AT
+// through the real ami-target.sh, after which it exits as the reboot's SIGTERM
+// would end it.
 const (
 	fakeAMIRunner = `#!/bin/bash
 set -eu

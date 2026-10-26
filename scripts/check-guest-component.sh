@@ -95,6 +95,23 @@ variables() {
 	esac
 }
 
+# versioned prints the NAME=PREFIX lines NAME's installer writes whose value goes on
+# with a version the build resolves: the Android NDK's, which GitHub's installer
+# sets because many builds read them. present asks that each value starts with its
+# prefix and names something under it; absent that the name is not there at all.
+versioned() {
+	case "$1" in
+	android-sdk)
+		echo "ANDROID_NDK=/usr/local/lib/android/sdk/ndk/"
+		echo "ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/"
+		echo "ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/"
+		echo "ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/"
+		;;
+	codeql | firefox | google-chrome | microsoft-edge) ;;
+	*) return 1 ;;
+	esac
+}
+
 pass() { echo "  ok    $*"; }
 
 FAILED=0
@@ -121,7 +138,10 @@ absent() {
 		1) ;;
 		*) fail "could not read $env to see whether it names ${variable%%=*}" ;;
 		esac
-	done < <(variables "$name")
+	done < <(
+		variables "$name"
+		versioned "$name"
+	)
 	[ "$FAILED" -ne 0 ] || pass "$name is not in the image"
 }
 
@@ -139,6 +159,11 @@ present() {
 		[ -n "$variable" ] || continue
 		grep -qxF -- "$variable" "$env" || fail "$name: the job's environment does not say $variable"
 	done < <(variables "$name")
+	while IFS= read -r variable; do
+		[ -n "$variable" ] || continue
+		grep -q "^${variable}[^/]" "$env" ||
+			fail "$name: the job's environment does not set ${variable%%=*} to a path under ${variable#*=}"
+	done < <(versioned "$name")
 
 	case "$name" in
 	android-sdk) present_android_sdk "$root" ;;

@@ -71,7 +71,11 @@ func completedTree(t *testing.T, name string) string {
 		write("usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager", "#!/bin/sh\n", 0o755)
 		dir("usr/local/lib/android/sdk/platforms/android-35", 0o777)
 		dir("usr/local/lib/android/sdk", 0o777)
-		env += "ANDROID_HOME=/usr/local/lib/android/sdk\nANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n"
+		env += "ANDROID_HOME=/usr/local/lib/android/sdk\nANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n" +
+			"ANDROID_NDK=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
+			"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
+			"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
+			"ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/28.2.13676358\n"
 	case "codeql":
 		write("opt/hostedtoolcache/CodeQL/2.23.3/x64/codeql/codeql", "#!/bin/sh\necho 2.23.3\n", 0o755)
 		write("opt/hostedtoolcache/CodeQL/2.23.3/x64/pinned-version", "", 0o644)
@@ -154,6 +158,18 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 
 			writeTreeFile(t, root, "etc/billet-image-env", "ImageOS=ubuntu24\n")
 		}, "present", "does not say EDGEWEBDRIVER=/usr/local/share/edge_driver"},
+		// A VERSIONED VARIABLE IS ASKED FOR TOO, by the path its value starts with.
+		"an NDK variable pointing elsewhere": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			env, err := os.ReadFile(filepath.Join(root, "etc", "billet-image-env"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writeTreeFile(t, root, "etc/billet-image-env", strings.Replace(string(env),
+				"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724", "ANDROID_NDK_ROOT=/opt/ndk", 1))
+		}, "present", "does not set ANDROID_NDK_ROOT to a path under /usr/local/lib/android/sdk/ndk/"},
 		"an SDK Gradle cannot write": {"android-sdk", func(t *testing.T, root string) {
 			t.Helper()
 
@@ -195,6 +211,15 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 	if out, status := componentCheck(t, "absent", "google-chrome", root); status != 1 ||
 		!strings.Contains(out, "the image carries /usr/bin/google-chrome") {
 		t.Errorf("a dangling link read as absent (%d):\n%s", status, out)
+	}
+
+	// AN NDK VARIABLE LEFT BEHIND STILL TELLS A JOB WHERE ANDROID IS, though the SDK
+	// is gone.
+	root = completedTree(t, "none")
+	writeTreeFile(t, root, "etc/billet-image-env", "ImageOS=ubuntu24\nANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/28.2.13676358\n")
+	if out, status := componentCheck(t, "absent", "android-sdk", root); status != 1 ||
+		!strings.Contains(out, "names ANDROID_NDK_LATEST_HOME, which only android-sdk sets") {
+		t.Errorf("a leftover NDK variable read as absent (%d):\n%s", status, out)
 	}
 
 	// A JOB ENVIRONMENT THAT CANNOT BE READ CANNOT SAY A VARIABLE IS ABSENT.
