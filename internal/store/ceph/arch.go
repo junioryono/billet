@@ -285,6 +285,10 @@ type ArchLearned struct {
 	// for a generation whose machine was read.
 	Recorded    bool
 	NotRecorded error
+
+	// id is the snapshot the machine was read from, which the record requires
+	// still holds the name.
+	id uint64
 }
 
 // LearnArchitectures reads the architecture of each generation of image that
@@ -358,7 +362,7 @@ func (c *Client) LearnArchitectures(ctx context.Context, image string) ([]ArchLe
 			c.rememberRead(image, gen.Name, machine, snap.ID)
 		}
 
-		learned = append(learned, ArchLearned{Generation: gen.Name, Machine: machine, Err: readErr})
+		learned = append(learned, ArchLearned{Generation: gen.Name, Machine: machine, Err: readErr, id: snap.ID})
 	}
 
 	if slices.ContainsFunc(learned, func(l ArchLearned) bool { return l.Err == nil }) {
@@ -399,11 +403,16 @@ func (c *Client) recordLearnedArches(ctx context.Context, image string, learned 
 		}
 	}()
 
-	generations, listErr := c.Generations(ctx, image)
+	snaps, listErr := c.snapshotList(ctx, image)
 	if listErr != nil {
 		notRecorded(listErr)
 
 		return nil
+	}
+
+	ids := map[string]uint64{}
+	for _, snap := range snaps {
+		ids[snap.Name] = snap.ID
 	}
 
 	arches, listErr := c.GenerationArches(ctx, image)
@@ -418,11 +427,16 @@ func (c *Client) recordLearnedArches(ctx context.Context, image string, learned 
 			continue
 		}
 
-		switch present := slices.ContainsFunc(generations, func(g Generation) bool {
-			return g.Name == l.Generation
-		}); {
+		// THE SNAPSHOT THAT WAS READ, NOT ONLY ITS NAME: one removed and made again
+		// under the name by a publisher that records nothing is another snapshot.
+		id, present := ids[l.Generation]
+
+		switch {
 		case !present:
 			learned[i].NotRecorded = errors.New("it was removed since it was read")
+		case id != l.id:
+			learned[i].NotRecorded = errors.New("it was removed and made again under its name since " +
+				"it was read")
 		case arches[l.Generation] != "":
 			learned[i].NotRecorded = fmt.Errorf("it was recorded as %s since it was read",
 				arches[l.Generation])

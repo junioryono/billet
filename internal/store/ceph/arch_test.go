@@ -687,3 +687,29 @@ func TestARecordedArchitectureBeatsWhatThisClientRead(t *testing.T) {
 		t.Errorf("another node's record was overwritten with this client's read; billet ran %v", f.calls)
 	}
 }
+
+// NOR IS A SNAPSHOT MADE AGAIN UNDER THE NAME WHILE IT WAS READ GIVEN WHAT WAS READ
+// of the one before it: the record is held to the snapshot read, not to its name.
+func TestLearnArchitecturesRecordsNothingForASnapshotMadeAgainUnderItsName(t *testing.T) {
+	t.Parallel()
+
+	const gen = "g20260802000000"
+
+	f := &importFake{device: "/dev/rbd7", snapshots: []string{gen}, snapIDs: map[string]int{gen: 4}}
+	c := learnClient(t, f)
+	c.readProbe = func(context.Context, string) ([]byte, error) {
+		f.snapIDs[gen] = 9
+
+		return elfHead(62), nil
+	}
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil || len(learned) != 1 || learned[0].Recorded || learned[0].NotRecorded == nil ||
+		!strings.Contains(learned[0].NotRecorded.Error(), "made again") {
+		t.Fatalf("LearnArchitectures = %+v, %v, want it not recorded, saying why", learned, err)
+	}
+
+	if f.appliedMetadata[ArchKey+"."+gen] {
+		t.Error("a snapshot made again under the name was given what was read of the one before it")
+	}
+}
