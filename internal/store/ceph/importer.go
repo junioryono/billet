@@ -236,7 +236,7 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 	}
 
 	// ONE ARCHITECTURE AN IMAGE, judged under the lock, before the head is touched.
-	if err := c.checkImportArch(ctx, image, machine); err != nil {
+	if err := c.checkImportArch(ctx, image, machine, true); err != nil {
 		return "", err
 	}
 

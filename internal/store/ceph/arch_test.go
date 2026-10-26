@@ -246,8 +246,8 @@ func TestAnExactGenerationOfAnotherMachineIsRefused(t *testing.T) {
 	c.machine = "x86_64"
 
 	_, err := c.ResolveGeneration(t.Context(), "ubuntu-2404-x64@g20260801000000", "7")
-	if err == nil || !strings.Contains(err.Error(), "was built for aarch64 and this host is x86_64") {
-		t.Fatalf("ResolveGeneration = %v, want a refusal naming both machines", err)
+	if !errors.Is(err, ErrOtherMachine) || !strings.Contains(err.Error(), "was built for aarch64 and this host is x86_64") {
+		t.Fatalf("ResolveGeneration = %v, want ErrOtherMachine naming both machines", err)
 	}
 
 	for _, ref := range []string{"ubuntu-2404-x64@g20260802000000", "ubuntu-2404-x64@g20260803000000"} {
@@ -504,5 +504,106 @@ func TestAnImportWhoseArchitectureCannotBeRecordedMakesNothing(t *testing.T) {
 
 	if f.appliedMetadata[ArchKey+"."+generation] {
 		t.Error("the architecture written before the failure was left behind")
+	}
+}
+
+// WHAT A HELD LOCK KEPT FROM BEING RECORDED, THIS CLIENT'S IMPORT RECORDS UNDER ITS
+// OWN: the pull read the generation as its machine, and the import, holding the
+// publish lock and finding it still unrecorded, writes it before it judges.
+func TestAnImportRecordsWhatItsPullReadAndCouldNotRecord(t *testing.T) {
+	t.Parallel()
+
+	const old = "g20260801000000"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: "/dev/rbd7", infoJSON: `{"size": 8388608}`, snapshots: []string{old},
+		lockHeld: fmt.Sprintf("billet-build-otherhost-123-%d", time.Now().Add(-time.Minute).Unix())}
+	c := learnClient(t, f)
+	c.readProbe = func(context.Context, string) ([]byte, error) { return elfHead(62), nil }
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil || len(learned) != 1 || learned[0].Recorded || learned[0].NotRecorded == nil {
+		t.Fatalf("LearnArchitectures = %+v, %v, want it read and kept from being recorded", learned, err)
+	}
+
+	if err := c.CheckImportArch(t.Context(), "ubuntu-2404-x64", "x86_64"); err != nil {
+		t.Errorf("the pre-check refused a generation this client read as its own machine: %v", err)
+	}
+
+	if f.ranWith("image-meta", "set") {
+		t.Fatalf("the pre-check recorded something without the publish lock; billet ran %v", f.calls)
+	}
+
+	f.lockHeld, f.device = "", device
+
+	if _, err := c.ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7",
+		importAt); err != nil {
+		t.Fatalf("an import into an image this client read was refused: %v", err)
+	}
+
+	set := slices.IndexFunc(f.calls, func(call []string) bool {
+		return matchesCall(call, []string{"image-meta", "set", "ubuntu-2404-x64", ArchKey + "." + old})
+	})
+	added := slices.IndexFunc(f.calls, func(call []string) bool { return matchesCall(call, []string{"lock", "add"}) })
+
+	if set < 0 || f.calls[set][len(f.calls[set])-1] != "x86_64" || added < 0 || added > set {
+		t.Errorf("the import did not record what was read, under its lock (lock add at %d, set at %d); "+
+			"billet ran %v", added, set, f.calls)
+	}
+}
+
+// AND WHAT IT READ AS ANOTHER MACHINE'S REFUSES THE IMPORT, as a record would.
+func TestAnImportIsRefusedWhatItsPullReadAsAnotherMachine(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{device: "/dev/rbd7", infoJSON: `{"size": 8388608}`, snapshots: []string{"g20260801000000"}}
+	c := learnClient(t, f)
+	c.rememberRead("ubuntu-2404-x64", "g20260801000000", "aarch64")
+
+	if err := c.CheckImportArch(t.Context(), "ubuntu-2404-x64", "x86_64"); err == nil ||
+		!strings.Contains(err.Error(), "g20260801000000 (aarch64)") {
+		t.Fatalf("CheckImportArch = %v, want the generation read as aarch64 refused", err)
+	}
+}
+
+// A CREATE WHOSE OUTCOME CANNOT BE READ KEEPS THE ARCHITECTURE IT RECORDED: the
+// snapshot may exist, and one without its record would resolve on any host.
+func TestACreateWhoseOutcomeCannotBeReadKeepsItsArchitecture(t *testing.T) {
+	t.Parallel()
+
+	const generation = "g20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device, failSnapCreateApplied: true, failSnapListAfterCreate: true}
+
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
+		"2.336.0", "", "7", importAt)
+	if err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("ImportGeneration = %v, want the import refused as could-not-tell", err)
+	}
+
+	if !f.appliedMetadata[ArchKey+"."+generation] || f.ranWith("image-meta", "remove", ArchKey+"."+generation) {
+		t.Error("the architecture of a snapshot that may exist was taken away")
+	}
+}
+
+// A PUBLISH LOCK TAKEN TO RECORD AND NOT RELEASED IS SAID, beside what was recorded:
+// every publisher in the deployment meets it next, and the entries still say what
+// was written.
+func TestLearnArchitecturesSaysAPublishLockItCouldNotRelease(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{device: "/dev/rbd7", snapshots: []string{"g20260802000000"},
+		lockRmErr: errors.New("rbd: lock rm timed out")}
+	c := learnClient(t, f)
+	c.readProbe = func(context.Context, string) ([]byte, error) { return elfHead(62), nil }
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err == nil || !strings.Contains(err.Error(), "was not released") {
+		t.Fatalf("LearnArchitectures = %v, want the unreleased lock said", err)
+	}
+
+	if len(learned) != 1 || !learned[0].Recorded || learned[0].NotRecorded != nil {
+		t.Errorf("learned %+v, want the record that was written said as written", learned)
 	}
 }

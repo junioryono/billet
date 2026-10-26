@@ -101,6 +101,10 @@ type Client struct {
 	// readProbe reads the head of archProbePath on a mapped root filesystem;
 	// readProbeWithDebugfs outside tests.
 	readProbe func(ctx context.Context, device string) ([]byte, error)
+	// read is the machine LearnArchitectures read of each generation, by
+	// image@generation, which this client's next import records under its lock.
+	readMu sync.Mutex
+	read   map[string]string
 	// trashHeld remembers each trash entry a deletion found still read by a
 	// copy-on-write child, so PurgeTrash asks again only when trashHeldDue says.
 	trashHeldMu sync.Mutex

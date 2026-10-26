@@ -723,6 +723,11 @@ type recordingPublisher struct {
 	learnedEntries []ceph.ArchLearned
 	checkErr       error
 	learned        []string
+
+	// onLearn and onCheck run inside LearnArchitectures and CheckImportArch, so a
+	// test can see what the pull had done at that instant: whether it had staged
+	// anything is gone again by the time the pull returns.
+	onLearn, onCheck func()
 }
 
 type publishedGeneration struct {
@@ -741,6 +746,10 @@ func (p *recordingPublisher) SweepGenerationMaps(context.Context) error {
 }
 
 func (p *recordingPublisher) LearnArchitectures(_ context.Context, image string) ([]ceph.ArchLearned, error) {
+	if p.onLearn != nil {
+		p.onLearn()
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -750,6 +759,10 @@ func (p *recordingPublisher) LearnArchitectures(_ context.Context, image string)
 }
 
 func (p *recordingPublisher) CheckImportArch(_ context.Context, _, machine string) error {
+	if p.onCheck != nil {
+		p.onCheck()
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1119,6 +1132,7 @@ func TestAPullLearnsTheImagesArchitecturesThenImportsItsOwn(t *testing.T) {
 func TestAPullThatCannotReadTheImagesArchitecturesImportsNothing(t *testing.T) {
 	fixture := newPullFixture(t)
 	fixture.publisher.learnErr = errors.New("the publish lock is held")
+	fixture.publisher.onLearn = func() { fixture.stagedNothingYet(t) }
 
 	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
 
@@ -1139,6 +1153,7 @@ func TestAPullThatCannotReadTheImagesArchitecturesImportsNothing(t *testing.T) {
 func TestAPullAnImportWouldBeRefusedDownloadsNothing(t *testing.T) {
 	fixture := newPullFixture(t)
 	fixture.publisher.checkErr = errors.New("ubuntu-2404-x64 holds generations built for another machine")
+	fixture.publisher.onCheck = func() { fixture.stagedNothingYet(t) }
 
 	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
 
@@ -1153,6 +1168,24 @@ func TestAPullAnImportWouldBeRefusedDownloadsNothing(t *testing.T) {
 	}
 
 	assertNothingStaged(t, fixture)
+}
+
+// stagedNothingYet fails when the pull has staged anything or installed a kernel
+// by now: called from inside the fake, before the pull's cleanup could remove it.
+func (f *pullFixture) stagedNothingYet(t *testing.T) {
+	t.Helper()
+
+	for _, dir := range []string{f.staging, f.kernelDir} {
+		entries, err := os.ReadDir(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("read %s: %v", dir, err)
+		}
+
+		if len(entries) != 0 {
+			t.Errorf("%s already holds %d entries when the pull asks about architectures; it staged "+
+				"or installed before it asked", dir, len(entries))
+		}
+	}
 }
 
 // assertNothingStaged fails when a pull put anything in its staging directory or

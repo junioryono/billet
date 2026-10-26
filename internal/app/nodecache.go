@@ -107,7 +107,9 @@ func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store,
 		// mapping this node's rather than another identity's on the same host.
 		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg)),
 			ceph.WithMapOwner(deployment + "/" + cfg.Node.Name)}
-		options = append(options, GenerationMapLock(cfg)...)
+		if path := GenerationMapLockPath(cfg); path != "" {
+			options = append(options, ceph.WithGenerationMapLock(path))
+		}
 
 		return ceph.New(*cfg.Node.Ceph, options...)
 	case config.ProviderEC2:

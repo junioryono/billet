@@ -209,8 +209,17 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	// BEFORE ANYTHING IS DOWNLOADED: an import the image's generations refuse is
 	// known now, and a refresh that would meet it every day costs a gigabytes-long
 	// download each time otherwise. The import judges again under the publish lock.
+	//
+	// EXCEPT ON A NODE THAT HAS NOT REGISTERED, whose first pull must still install
+	// the kernel it needs to start, which imports nothing: there it is said, and the
+	// pull goes on.
 	if err := learnImageArchitectures(ctx, env, store, image); err != nil {
-		return err
+		if _, acceptErr := acceptedComponents(cfg); !errors.Is(acceptErr, errAcceptanceUnknown) {
+			return err
+		}
+
+		fmt.Fprintf(env.Stdout, "warning: %v; this node has not registered, so the pull goes on to "+
+			"install the kernel it needs to start, and any import judges again\n", err)
 	}
 
 	manifest, dir, cleanup, err := stageImage(ctx, env, cfg, stageOptions{
@@ -476,11 +485,7 @@ func learnImageArchitectures(ctx context.Context, env cli.Env, store generationP
 			"host were not swept: %v\n", err)
 	}
 
-	learned, err := store.LearnArchitectures(ctx, image)
-	if err != nil {
-		return fmt.Errorf("billet images pull: the architectures of %s's generations could not be "+
-			"read, so nothing was downloaded: %w", image, err)
-	}
+	learned, learnErr := store.LearnArchitectures(ctx, image)
 
 	for _, l := range learned {
 		switch {
@@ -494,6 +499,11 @@ func learnImageArchitectures(ctx context.Context, env cli.Env, store generationP
 			fmt.Fprintf(env.Stdout, "%s@%s records no architecture; read %s from it and did not record "+
 				"it: %v\n", image, l.Generation, l.Machine, l.NotRecorded)
 		}
+	}
+
+	if learnErr != nil {
+		return fmt.Errorf("billet images pull: the architectures of %s's generations could not be "+
+			"read or recorded, so nothing was downloaded: %w", image, learnErr)
 	}
 
 	if err := store.CheckImportArch(ctx, image, hostArch()); err != nil {

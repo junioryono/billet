@@ -137,21 +137,40 @@ func cmdImagesCompatible(ctx context.Context, env cli.Env, args []string) error 
 	return &cli.ExitError{Code: 2, Msg: fmt.Sprintf("%d configured guest image(s) need a compatible generation", len(refresh))}
 }
 
-// pinResolver is what refuseForeignPin asks of the cluster.
-type pinResolver interface {
+// compatibleStore is what checkImageCompatible asks of the cluster.
+type compatibleStore interface {
+	NewestVerifiedForContract(ctx context.Context, image, contract string) (ceph.Generation, bool, error)
+	NewestForContract(ctx context.Context, image, contract string) (ceph.Generation, bool, error)
+	NewestVerified(ctx context.Context, image string) (ceph.Generation, bool, error)
+	Generations(ctx context.Context, image string) ([]ceph.Generation, error)
+	VerifiedGenerations(ctx context.Context, image string) (map[string]bool, error)
+	GuestContract(ctx context.Context, image, generation string) (string, bool, error)
 	ResolveGeneration(ctx context.Context, image, guestContract string) (string, error)
+}
+
+// openCompatibleStore is a variable so a test can answer for the cluster.
+var openCompatibleStore = func(cfg *config.Config) (compatibleStore, error) {
+	return ceph.New(*cfg.Node.Ceph)
 }
 
 // refuseForeignPin refuses an exact pin a launch on this host would refuse: one
 // recorded as another machine's (ADR-022). Its contract may match, so without this
-// the upgrade would commit and every launch of the tier fail after it.
-func refuseForeignPin(ctx context.Context, store pinResolver, exact string) error {
-	if _, err := store.ResolveGeneration(ctx, exact, firecracker.GuestContract); err != nil {
+// the upgrade would commit and every launch of the tier fail after it. A record
+// that could not be read is could-not-tell, said as such: it is no reason to move
+// a pin.
+func refuseForeignPin(ctx context.Context, store compatibleStore, exact string) error {
+	_, err := store.ResolveGeneration(ctx, exact, firecracker.GuestContract)
+
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ceph.ErrOtherMachine):
 		return fmt.Errorf("billet images compatible: the pinned generation %s cannot be launched on "+
 			"this host: %w; update the exact pin before upgrading", exact, err)
+	default:
+		return fmt.Errorf("billet images compatible: could not tell whether this host can launch the "+
+			"pinned generation %s: %w", exact, err)
 	}
-
-	return nil
 }
 
 func checkImageCompatible(
@@ -166,7 +185,7 @@ func checkImageCompatible(
 			image, ceph.Verified)
 	}
 
-	store, err := ceph.New(*cfg.Node.Ceph)
+	store, err := openCompatibleStore(cfg)
 	if err != nil {
 		return err
 	}

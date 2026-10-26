@@ -65,8 +65,10 @@ type importFake struct {
 	lockTaken        string
 	lockAddErr       error
 	lockAddAmbiguous bool
-	unmapErr         error
-	poolMissing      bool
+	// lockRmErr is what `lock rm` answers, leaving the lock where it was.
+	lockRmErr   error
+	unmapErr    error
+	poolMissing bool
 
 	// onSnapRemove fires once, when a withdrawal issues its `snap rm`. It is how a
 	// test marks that instant from INSIDE the call, which is the only place the
@@ -342,6 +344,10 @@ func (f *importFake) lock(args []string) ([]byte, error) {
 
 		return []byte(fmt.Sprintf(`[{"id":%q,"locker":"client.4242"}]`, held)), nil
 	case "rm":
+		if f.lockRmErr != nil {
+			return nil, f.lockRmErr
+		}
+
 		if cookie == f.lockTaken {
 			f.lockTaken = ""
 		}

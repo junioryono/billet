@@ -2,6 +2,7 @@ package images
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -330,6 +331,33 @@ func TestAPullWhoseAcceptanceChangedBeforeItsImportImportsNothing(t *testing.T) 
 				t.Fatalf("ImportGeneration was reached %d times, want never", got)
 			}
 		})
+	}
+}
+
+// AND A FIRST PULL WHOSE IMAGE'S ARCHITECTURES CANNOT BE TOLD STILL INSTALLS THE
+// KERNEL, which imports nothing and without which the node cannot register.
+func TestAFirstPullBeforeRegistrationInstallsTheKernelThoughArchitecturesCannotBeTold(t *testing.T) {
+	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
+	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+	run.fixture.publisher.learnErr = errors.New("rbd: the cluster could not be reached")
+
+	if err := imageaccept.Remove(filepath.Join(filepath.Dir(run.fixture.cfgPath), "node")); err != nil {
+		t.Fatal(err)
+	}
+
+	kernel := filepath.Join(run.fixture.kernelDir, kernelFileName(run.fixture.manifest))
+
+	err := run.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "installed the kernel "+kernel+", and imported no generation") {
+		t.Fatalf("a first pull whose architectures could not be told answered %v, want the kernel installed", err)
+	}
+
+	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
+		t.Fatalf("the kernel %s is not installed: %v", kernel, err)
+	}
+
+	if got := run.fixture.publisher.calls(); got != 0 {
+		t.Fatalf("ImportGeneration was reached %d times, want never", got)
 	}
 }
 
