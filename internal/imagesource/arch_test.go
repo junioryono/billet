@@ -189,20 +189,28 @@ func TestTheBundleFetchedIsTheOneBesideTheManifestRead(t *testing.T) {
 }
 
 // THE CHANNEL'S ARCHITECTURES ARE READ WHEN IT HAS THEM, and a pointer published
-// before the member existed says nothing, which is not an empty list.
+// before the member existed says nothing; a list this reader cannot take at its
+// word refuses the channel rather than telling every node there is nothing.
 func TestResolveReadsTheChannelsArchitectures(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name  string
-		extra map[string]any
-		said  bool
-		list  []string
+		name    string
+		extra   map[string]any
+		said    bool
+		list    []string
+		refused bool
 	}{
 		{name: "listed", extra: map[string]any{"architectures": []string{"x86_64", "aarch64"}}, said: true,
 			list: []string{"x86_64", "aarch64"}},
-		{name: "an empty list", extra: map[string]any{"architectures": []string{}}, said: true, list: []string{}},
+		{name: "x86_64 alone", extra: map[string]any{"architectures": []string{"x86_64"}}, said: true,
+			list: []string{"x86_64"}},
 		{name: "unsaid", extra: map[string]any{}},
+		{name: "an empty list", extra: map[string]any{"architectures": []string{}}, refused: true},
+		{name: "billet's spelling", extra: map[string]any{"architectures": []string{"x64", "arm64"}}, refused: true},
+		{name: "manifest names", extra: map[string]any{"architectures": []string{"manifest.json"}}, refused: true},
+		{name: "no x86_64", extra: map[string]any{"architectures": []string{"aarch64"}}, refused: true},
+		{name: "x86_64 and a misspelling", extra: map[string]any{"architectures": []string{"x86_64", "arm64"}}, refused: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -231,7 +239,17 @@ func TestResolveReadsTheChannelsArchitectures(t *testing.T) {
 
 			c := &Client{HTTP: srv.Client(), Source: Source{channelURL: srv.URL + "/current.json",
 				channelPolicy: &Policy{}, official: true}}
-			if err := c.Resolve(t.Context()); err != nil {
+
+			err = c.Resolve(t.Context())
+			if tc.refused {
+				if err == nil || !strings.Contains(err.Error(), "lists architectures") {
+					t.Fatalf("Resolve = %v, want the channel refused for its list", err)
+				}
+
+				return
+			}
+
+			if err != nil {
 				t.Fatalf("Resolve: %v", err)
 			}
 
@@ -245,5 +263,109 @@ func TestResolveReadsTheChannelsArchitectures(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// AND SO IS ITS X86_64 MANIFEST, OR A BUNDLE, NOT FOUND: billet's own release is
+// immutable and signed, so a 404 from it is never what it publishes.
+func TestAnyNotFoundFromBilletsOwnReleaseIsCouldNotTell(t *testing.T) {
+	t.Parallel()
+
+	x64, _ := serveMachine(t, map[string][]byte{}, true, "x86_64")
+	if _, err := x64.Manifest(t.Context(), Policy{}); err == nil || errors.Is(err, ErrNotFound) ||
+		!strings.Contains(err.Error(), "could not tell") {
+		t.Errorf("an x86_64 manifest not found on billet's release = %v, want could-not-tell", err)
+	}
+
+	unsigned, _ := serveMachine(t, map[string][]byte{"manifest-aarch64.json": manifestOf(t, "aarch64")}, true, "aarch64")
+	if _, err := unsigned.Manifest(t.Context(), Policy{Required: true, Identity: "x", Issuer: "y"}); err == nil ||
+		errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "could not tell") {
+		t.Errorf("a bundle not found on billet's release = %v, want could-not-tell", err)
+	}
+
+	// WHILE AN OPERATOR'S SOURCE THAT PUBLISHES NOTHING SAYS SO.
+	mirror, _ := serveMachine(t, map[string][]byte{}, false, "x86_64")
+	if _, err := mirror.Manifest(t.Context(), Policy{}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an operator's source publishing nothing = %v, want ErrNotFound", err)
+	}
+}
+
+// AN OPERATOR'S SOURCE THAT REFUSES A KEY IT DOES NOT HOLD, as S3 does to a reader
+// that may not list the bucket, falls back too; one that fails otherwise does not,
+// and a fallback that also fails names both attempts.
+func TestAnOperatorsSourceFallsBackOnAForbiddenAndNothingElse(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		status   int
+		fallback bool
+	}{
+		{"403", http.StatusForbidden, true},
+		{"500", http.StatusInternalServerError, false},
+	} {
+		asked := &requests{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			asked.record(r.URL.Path)
+
+			if r.URL.Path == "/manifest.json" {
+				if _, err := w.Write(manifestOf(t, "aarch64")); err != nil {
+					t.Errorf("write: %v", err)
+				}
+
+				return
+			}
+
+			w.WriteHeader(tc.status)
+		}))
+		t.Cleanup(srv.Close)
+
+		c := &Client{HTTP: srv.Client(), Source: Source{BaseURL: srv.URL}, Machine: "aarch64"}
+
+		_, err := c.Manifest(t.Context(), Policy{})
+		if tc.fallback && err != nil {
+			t.Errorf("%s: a mirror refusing the aarch64 manifest did not fall back: %v", tc.name, err)
+		}
+
+		if !tc.fallback && (err == nil || len(asked.all()) != 1) {
+			t.Errorf("%s: Manifest = %v after asking %v, want the failure and no fallback", tc.name, err, asked.all())
+		}
+	}
+
+	c, _ := serveMachine(t, map[string][]byte{}, false, "aarch64")
+	if _, err := c.Manifest(t.Context(), Policy{}); err == nil ||
+		!strings.Contains(err.Error(), "manifest.json") || !strings.Contains(err.Error(), "manifest-aarch64.json") {
+		t.Errorf("a fallback that also failed = %v, want both attempts named", err)
+	}
+}
+
+// AND THE BUNDLE A FALLBACK FETCHES IS manifest.json'S.
+func TestAFallbackFetchesTheBundleBesideManifestJSON(t *testing.T) {
+	t.Parallel()
+
+	c, asked := serveMachine(t, map[string][]byte{ManifestName: manifestOf(t, "aarch64")}, false, "aarch64")
+
+	if _, err := c.Manifest(t.Context(), Policy{Required: true, Identity: "x", Issuer: "y"}); err == nil {
+		t.Fatal("a manifest whose required signature is absent was accepted")
+	}
+
+	if got := asked.all(); len(got) != 3 || got[2] != "/manifest.sigstore.json" {
+		t.Errorf("asked for %v, want the aarch64 manifest, manifest.json, and then its bundle", got)
+	}
+}
+
+// A CLIENT NAMING NO MACHINE IS AN X86_64 ONE, which a channel listing x86_64 serves.
+func TestAClientNamingNoMachineIsX86(t *testing.T) {
+	t.Parallel()
+
+	c, asked := serveMachine(t, map[string][]byte{ManifestName: manifestOf(t, "x86_64")}, true, "")
+	c.channelArchitectures, c.channelSaid = []string{"x86_64"}, true
+
+	if _, err := c.Manifest(t.Context(), Policy{}); err != nil {
+		t.Fatalf("an x86_64 client was refused by a channel listing x86_64: %v", err)
+	}
+
+	if got := asked.all(); len(got) != 1 || got[0] != "/manifest.json" {
+		t.Errorf("asked for %v, want manifest.json", got)
 	}
 }

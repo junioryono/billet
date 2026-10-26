@@ -42,6 +42,16 @@ const (
 // with an instruction attached, while a network failure is a retry.
 var ErrNotFound = errors.New("imagesource: no such artifact at this source")
 
+// errForbidden is a source answering 403, which an S3 bucket the reader may not
+// list, or CloudFront in front of one, answers for a key that is not there: on
+// an operator's own source it is as good as a 404 for falling back, and on
+// billet's own it is a refusal like any other.
+var errForbidden = errors.New("imagesource: the source refused the request")
+
+// channelMachines are the names a channel's architectures may list, as `uname -m`
+// spells them.
+var channelMachines = []string{manifestMachine, "aarch64"}
+
 // ErrNoImageForMachine is the signed channel saying its current release carries no
 // image for this machine: final until the channel moves, unlike a manifest that
 // could not be fetched, which says nothing about whether one exists.
@@ -247,7 +257,18 @@ func (c *Client) Resolve(ctx context.Context) error {
 	}
 
 	if channel.Architectures != nil {
-		c.channelArchitectures, c.channelSaid = *channel.Architectures, true
+		// A LIST THIS READER CANNOT TAKE AT ITS WORD IS REFUSED, never read as a
+		// final no: an empty one, a name spelled other than `uname -m` spells it,
+		// or one leaving out x86_64, which every release carries as manifest.json,
+		// would otherwise tell every node of the fleet there is nothing to take up.
+		list := *channel.Architectures
+		if !slices.Contains(list, manifestMachine) ||
+			slices.ContainsFunc(list, func(m string) bool { return !slices.Contains(channelMachines, m) }) {
+			return fmt.Errorf("imagesource: the guest-image channel lists architectures %v, which is "+
+				"not a list of %v that includes %s", list, channelMachines, manifestMachine)
+		}
+
+		c.channelArchitectures, c.channelSaid = list, true
 	}
 
 	return nil
@@ -281,22 +302,31 @@ func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 
 	machine := c.machine()
 	if c.channelSaid && !slices.Contains(c.channelArchitectures, machine) {
-		return nil, fmt.Errorf("%w: %s lists %v, and this is %s", ErrNoImageForMachine,
-			c.Source.BaseURL, c.channelArchitectures, machine)
+		return nil, fmt.Errorf("%w: the channel lists %v for %s, and this is %s", ErrNoImageForMachine,
+			c.channelArchitectures, c.Source.BaseURL, machine)
 	}
 
 	name, bundle := ManifestNamesFor(machine)
 
 	body, err := c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes)
-	if err != nil && name != ManifestName && errors.Is(err, ErrNotFound) {
-		if c.Source.official {
-			return nil, fmt.Errorf("imagesource: could not tell whether %s carries an image for %s: "+
-				"it publishes no %s, and nothing signed says whether it should: %v", c.Source.BaseURL,
-				machine, name, err)
-		}
-
+	switch {
+	case err != nil && c.Source.official && errors.Is(err, ErrNotFound):
+		// BILLET'S OWN RELEASE IS IMMUTABLE AND SIGNED, so a 404 from it, which a
+		// cache or a moment can produce, is never taken for what it publishes.
+		return nil, fmt.Errorf("imagesource: could not tell whether %s carries an image for %s: "+
+			"%s was not found, and only the channel's signed list says what a release carries: %v",
+			c.Source.BaseURL, machine, name, err)
+	case err != nil && !c.Source.official && name != ManifestName &&
+		(errors.Is(err, ErrNotFound) || errors.Is(err, errForbidden)):
+		// AN OPERATOR'S OWN SOURCE THAT HAS NONE FOR THIS MACHINE is read from
+		// manifest.json, which Usable and the policy then judge; both attempts are
+		// named if that fails too.
+		first := err
 		name, bundle = ManifestName, BundleName
-		body, err = c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes)
+
+		if body, err = c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes); err != nil {
+			err = fmt.Errorf("%w (and before it: %w)", err, first)
+		}
 	}
 
 	if err != nil {
@@ -308,7 +338,11 @@ func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 	if p.Required {
 		signature, err = c.get(ctx, c.Source.BaseURL+"/"+bundle, MaxBundleBytes)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			switch {
+			case errors.Is(err, ErrNotFound) && c.Source.official:
+				return nil, fmt.Errorf("imagesource: could not tell whether %s signed %s: %s was not "+
+					"found: %v", c.Source.BaseURL, name, bundle, err)
+			case errors.Is(err, ErrNotFound):
 				return nil, fmt.Errorf("imagesource: this source requires a signature and %s "+
 					"publishes none: %w", c.Source.BaseURL, err)
 			}
@@ -340,6 +374,10 @@ func (c *Client) get(ctx context.Context, url string, limit int64) ([]byte, erro
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, url)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: %s answered %s", errForbidden, url, resp.Status)
 	}
 
 	if resp.StatusCode != http.StatusOK {

@@ -189,6 +189,11 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if image == "" {
+		if only, err := onlyOtherMachinesTiers(cfg); err == nil && only {
+			return fmt.Errorf("billet images pull: no image name given, and every firecracker tier on "+
+				"this node is another machine's than this %s host's, so it boots no image here", hostArch())
+		}
+
 		return errors.New("billet images pull: no image name given and no firecracker tier " +
 			"names one")
 	}
@@ -474,32 +479,48 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	return nil
 }
 
-// refuseImageOfAnotherMachine refuses to pull image on this host when the tiers
-// that name it run on another machine (ADR-022): a pull imports this host's
-// architecture, so an x64 refresh at a site with arm64 tiers never seeds
-// ubuntu-2404-arm64 with x64 bytes, the first import included, which no
-// generation of the image is there yet to refuse.
+// refuseImageOfAnotherMachine refuses to pull image on this host unless every
+// Firecracker tier that names it in this node's image pool runs on this host's
+// machine (ADR-022): a pull imports this host's architecture, so an x64 refresh at
+// a site with arm64 tiers never seeds ubuntu-2404-arm64 with x64 bytes, the first
+// import included, which no generation of the image is there yet to refuse. Tiers
+// naming one image with two architectures are refused on every host, since one
+// image holds one. A tier of another site is another pool's; one pinned to
+// another node of this site shares this one.
 func refuseImageOfAnotherMachine(cfg *config.Config, image string) error {
 	var machines []string
 
 	for i := range cfg.Tiers {
-		ref := cfg.Tiers[i].ImageFor(config.ProviderFirecracker)
-		if name, _, _ := strings.Cut(ref, "@"); name != image || cfg.Tiers[i].Arch == "" {
+		tier := &cfg.Tiers[i]
+		if !tier.AcceptsProvider(config.ProviderFirecracker) || tier.Arch == "" {
 			continue
 		}
 
-		if machine := cfg.Tiers[i].Arch.Machine(); !slices.Contains(machines, machine) {
+		if cfg.Node != nil && tier.Site != "" && tier.Site != cfg.Node.Site {
+			continue
+		}
+
+		if name, _, _ := strings.Cut(tier.ImageFor(config.ProviderFirecracker), "@"); name != image {
+			continue
+		}
+
+		if machine := tier.Arch.Machine(); !slices.Contains(machines, machine) {
 			machines = append(machines, machine)
 		}
 	}
 
-	if len(machines) == 0 || slices.Contains(machines, hostArch()) {
+	switch {
+	case len(machines) > 1:
+		return fmt.Errorf("billet images pull: the tiers that name %s run on %s, and one image holds "+
+			"one architecture; give the tiers of each architecture an image of their own, such as "+
+			"ubuntu-2404-arm64", image, strings.Join(machines, " and "))
+	case len(machines) == 1 && machines[0] != hostArch():
+		return fmt.Errorf("billet images pull: the tiers that name %s run on %s, and this host is %s, "+
+			"so it imports nothing into it; pull it on a node of that architecture, or name an image "+
+			"of this one's", image, machines[0], hostArch())
+	default:
 		return nil
 	}
-
-	return fmt.Errorf("billet images pull: the tiers that name %s run on %s, and this host is %s, so "+
-		"it imports nothing into it; pull it on a node of that architecture, or name an image of "+
-		"this one's", image, strings.Join(machines, ", "), hostArch())
 }
 
 // learnImageArchitectures sweeps the read-only generation maps a crash left on this
@@ -855,7 +876,7 @@ func resolveImageManifest(
 		return nil, nil, err
 	}
 
-	fmt.Fprintf(env.Stdout, "fetching %s\n", src.ManifestURLFor(hostArch()))
+	fmt.Fprintf(env.Stdout, "fetching the %s guest image's manifest from %s\n", hostArch(), src.BaseURL)
 
 	if policy.Required {
 		fmt.Fprintf(env.Stdout, "requiring a signature from %s\n", policy.Identity)

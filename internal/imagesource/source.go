@@ -184,11 +184,6 @@ func (s Source) AssetURL(name string) (string, error) {
 	return s.BaseURL + "/" + name, nil
 }
 
-// ManifestURL is where the index for the current release lives.
-func (s Source) ManifestURL() string {
-	return s.BaseURL + "/" + ManifestName
-}
-
 // ManifestURLFor is where the index for machine's image in the current release
 // lives.
 func (s Source) ManifestURLFor(machine string) string {

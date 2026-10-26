@@ -248,3 +248,119 @@ func TestCheckSaysTheChannelCarriesNoImageForThisMachine(t *testing.T) {
 		t.Errorf("the check said:\n%s\nwant the channel's answer for this machine", out.String())
 	}
 }
+
+// TIERS NAMING ONE IMAGE WITH TWO ARCHITECTURES ARE REFUSED ON EVERY HOST, pinned to
+// different nodes of the site or not, since one image holds one; a tier of
+// another site, another pool's, and a tier of another backend naming the same
+// word, do not count.
+func TestAnImageWhoseTiersNameTwoArchitecturesIsRefusedEverywhere(t *testing.T) {
+	cfg := archConfig(t)
+
+	shared := func(label string, arch config.Arch, node, site string, provider config.ProviderKind) config.Tier {
+		return config.Tier{Label: label, Provider: provider, Arch: arch, Node: node, Site: site,
+			Image: "shared@verified"}
+	}
+
+	for _, machine := range []string{"x86_64", "aarch64"} {
+		standOn(t, machine)
+
+		cfg.Tiers = []config.Tier{
+			shared("a", config.ArchX64, "node-a", "", config.ProviderFirecracker),
+			shared("b", config.ArchARM64, "node-b", "", config.ProviderFirecracker),
+		}
+		if err := refuseImageOfAnotherMachine(cfg, "shared"); err == nil ||
+			!strings.Contains(err.Error(), "one image holds one architecture") {
+			t.Errorf("on %s, tiers naming shared with two architectures = %v, want refused", machine, err)
+		}
+	}
+
+	standOn(t, "x86_64")
+
+	cfg.Tiers = []config.Tier{
+		shared("here", config.ArchX64, "", "", config.ProviderFirecracker),
+		shared("elsewhere", config.ArchARM64, "", "another-site", config.ProviderFirecracker),
+		shared("docker", config.ArchARM64, "", "", config.ProviderDocker),
+	}
+	if err := refuseImageOfAnotherMachine(cfg, "shared"); err != nil {
+		t.Errorf("another site's tier, or another backend's, was counted: %v", err)
+	}
+
+	cfg.Tiers = []config.Tier{shared("docker", config.ArchARM64, "", "", config.ProviderDocker)}
+	if err := refuseImageOfAnotherMachine(cfg, "shared"); err != nil {
+		t.Errorf("a docker tier's image refused a firecracker pull: %v", err)
+	}
+}
+
+// A SIDELOADED DIRECTORY'S SIGNATURE IS THE ONE BESIDE THE MANIFEST READ: the
+// machine's own, or manifest.json's when that is what was read.
+func TestASideloadsSignatureIsTheOneBesideTheManifestRead(t *testing.T) {
+	standOn(t, "aarch64")
+
+	for _, tc := range []struct {
+		name, manifest, bundle string
+	}{
+		{"named", "manifest-aarch64.json", "manifest-aarch64.sigstore.json"},
+		{"fallback", imagesource.ManifestName, imagesource.BundleName},
+	} {
+		fixture := newPullFixture(t)
+		if tc.manifest != imagesource.ManifestName {
+			if err := os.Rename(filepath.Join(fixture.from, imagesource.ManifestName),
+				filepath.Join(fixture.from, tc.manifest)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		cfg, err := config.Load(fixture.cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, _, _, err = stageImage(t.Context(), processEnv(), cfg, stageOptions{
+			from: fixture.from, staging: fixture.staging,
+		})
+		if err == nil || !strings.Contains(err.Error(), "holds no "+tc.bundle) {
+			t.Errorf("%s: stageImage = %v, want it to ask for %s", tc.name, err, tc.bundle)
+		}
+	}
+}
+
+// THE PULL'S OWN MANIFEST FETCH ASKS FOR THIS MACHINE'S MANIFEST.
+func TestThePullsManifestFetchAsksForThisMachinesManifest(t *testing.T) {
+	standOn(t, "aarch64")
+	cfg := archConfig(t)
+
+	_, _, err := resolveImageManifest(t.Context(), cli.Env{Stdout: &strings.Builder{}, Stderr: &strings.Builder{}},
+		cfg, stageOptions{source: "https://127.0.0.1:1/images", skipSig: true})
+	if err == nil || !strings.Contains(err.Error(), "/images/manifest-aarch64.json") {
+		t.Fatalf("resolveImageManifest = %v, want the fetch of this machine's manifest", err)
+	}
+}
+
+// A NODE WHOSE TIERS ARE ALL ANOTHER MACHINE'S HAS NOTHING TO PREPARE for a host
+// upgrade, and says so; one with no tiers at all is still asked to name an image.
+func TestImagesCompatibleOnANodeWhoseTiersAreAllAnotherMachinesPreparesNothing(t *testing.T) {
+	standOn(t, "x86_64")
+
+	path := firecrackerRefreshConfig(t, "")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	head, _, _ := strings.Cut(string(body), "tiers:\n")
+	armOnly := "  - label: on-arm64\n    provider: firecracker\n    vcpu: 2\n    memory: 4GiB\n" +
+		"    arch: arm64\n    image: ubuntu-2404-arm64@verified\n"
+
+	if err := os.WriteFile(path, []byte(head+"tiers:\n"+armOnly), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	if err := cmdImagesCompatible(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, []string{"--config", path}); err != nil {
+		t.Fatalf("images compatible on a node whose tiers are all arm64 = %v, want nothing to prepare", err)
+	}
+
+	if !strings.Contains(out.String(), "nothing to prepare") {
+		t.Errorf("it said:\n%s\nwant nothing to prepare", out.String())
+	}
+}
