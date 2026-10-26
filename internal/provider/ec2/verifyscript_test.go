@@ -141,8 +141,14 @@ type verifyProbe struct {
 	wrongVariable        string
 	overriddenVariable   string
 	unterminatedVariable string
-	// noNDK leaves out the NDK a recorded Android SDK's variables name.
-	noNDK bool
+	// climbingVariable is a versioned variable that starts with its prefix and
+	// climbs back out of it, to /opt/ndk, which the fixture makes an NDK, so only
+	// the climb can refuse it.
+	climbingVariable string
+	// noNDK leaves out the NDK a recorded Android SDK's variables name, and
+	// closedNDK leaves it where the runner cannot enter it.
+	noNDK     bool
+	closedNDK bool
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -274,6 +280,10 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		env += p.overriddenVariable + "=/usr\n"
 	}
 
+	if p.climbingVariable != "" {
+		env += p.climbingVariable + "=/usr/local/lib/android/sdk/ndk/../../../../../../opt/ndk\n"
+	}
+
 	if p.unterminatedVariable != "" {
 		var kept []string
 
@@ -370,8 +380,33 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 
 	// THE NDK THE VERSIONED VARIABLES NAME, unless a case removes it.
 	if strings.Contains(p.components, "android-sdk:") && !p.noNDK {
-		if err := os.MkdirAll(filepath.Join(croot, "usr", "local", "lib", "android", "sdk", "ndk", "27.3.13750724"), 0o755); err != nil {
+		ndk := filepath.Join(croot, "usr", "local", "lib", "android", "sdk", "ndk", "27.3.13750724")
+		if err := os.MkdirAll(ndk, 0o755); err != nil {
 			t.Fatal(err)
+		}
+
+		writeFile(t, filepath.Join(ndk, "source.properties"), "Pkg.Revision = 27.3.13750724\n", 0o644)
+
+		if p.climbingVariable != "" {
+			elsewhere := filepath.Join(croot, "opt", "ndk")
+			if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			writeFile(t, filepath.Join(elsewhere, "source.properties"), "Pkg.Revision = 1.0\n", 0o644)
+		}
+
+		// CLOSED TO THE RUNNER, as a root-owned 0700 directory is to a job.
+		if p.closedNDK {
+			if err := os.Chmod(ndk, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() {
+				if err := os.Chmod(ndk, 0o755); err != nil {
+					t.Errorf("reopen %s: %v", ndk, err)
+				}
+			})
 		}
 	}
 
@@ -791,6 +826,12 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
 		},
 		{
+			name:     "a recorded component's versioned variable climbs out of its prefix",
+			probe:    verifyProbe{components: "android-sdk:12.0", climbingVariable: "ANDROID_NDK_HOME"},
+			wantStep: "components",
+			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
+		},
+		{
 			name:     "a recorded component's versioned variable points somewhere else",
 			probe:    verifyProbe{components: "android-sdk:12.0", wrongVariable: "ANDROID_NDK_LATEST_HOME"},
 			wantStep: "components",
@@ -802,6 +843,14 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			probe:    verifyProbe{components: "android-sdk:12.0", noNDK: true},
 			wantStep: "components",
 			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
+		},
+		{
+			// A DIRECTORY THE RUNNER CANNOT ENTER IS NOT AN NDK A JOB CAN USE.
+			name:     "a recorded component's NDK is closed to the runner",
+			probe:    verifyProbe{components: "android-sdk:12.0", closedNDK: true},
+			wantStep: "components",
+			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
+			asUser:   true,
 		},
 		{
 			// AND ONE LEFT BEHIND BY AN SDK THAT IS GONE.

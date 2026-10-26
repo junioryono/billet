@@ -991,7 +991,8 @@ func TestAFailureAfterTheSuccessEndsTheBuild(t *testing.T) {
 	f.respond = b.serve(f)
 
 	if _, err := newTestProvider(t, f, nil).BuildImage(t.Context(), verifyingBuild()); err == nil ||
-		!strings.Contains(err.Error(), "failed in "+bootstrapStep) {
+		!strings.Contains(err.Error(), "failed in "+bootstrapStep) ||
+		!strings.Contains(err.Error(), "/var/log/cloud-init-output.log") {
 		t.Fatalf("a failure after the success was answered %v", err)
 	}
 

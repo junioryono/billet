@@ -472,6 +472,16 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 		return "", err
 	}
 
+	// NOT AN IMAGE BILLET BUILT, which its bootstrap would refuse only after a
+	// builder was bought: GitHub's template runs once per machine. The tags are
+	// what is read here and an operator can remove them, so the bootstrap's own
+	// refusal stays the rule and this one only saves the launch.
+	if layout.billet {
+		return "", fmt.Errorf("ec2: the base image %s is an image billet built, and a build "+
+			"runs GitHub's template on a machine once; build from the distribution's own "+
+			"image (the default) instead", spec.BaseImage)
+	}
+
 	rootDevice := layout.root
 
 	userData, err := packUserData(script)

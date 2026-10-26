@@ -308,6 +308,57 @@ func builderImageWithRoot(t *testing.T, gib int) func(string, url.Values) (int, 
 	}
 }
 
+// AN IMAGE BILLET BUILT IS NOT A BASE: its bootstrap would refuse it, and refusing
+// it here saves the builder. The tag is what says so.
+func TestABuildFromAnImageBilletBuiltIsRefusedBeforeLaunch(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		tags   string
+		refuse bool
+	}{
+		{tags: "", refuse: false},
+		{tags: `<item><key>Name</key><value>noble</value></item>`, refuse: false},
+		{tags: `<item><key>` + amiContractTag + `</key><value>4</value></item>`, refuse: true},
+		{tags: `<item><key>` + amiBuiltByTag + `</key><value>billet v0.9.0</value></item>`, refuse: true},
+		{tags: `<item><key>` + amiComponentsTag + `</key><value></value></item>`, refuse: true},
+	} {
+		f := newFakeEC2(t)
+		f.respond = func(action string, _ url.Values) (int, string) {
+			if action == "DescribeImages" {
+				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+					`<imageId>ami-base</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<rootDeviceType>ebs</rootDeviceType>` +
+					`<blockDeviceMapping><item><deviceName>/dev/xvda</deviceName><ebs>` +
+					`<deleteOnTermination>true</deleteOnTermination><volumeSize>8</volumeSize>` +
+					`</ebs></item></blockDeviceMapping><tagSet>` + tc.tags + `</tagSet>` +
+					`</item></imagesSet></DescribeImagesResponse>`
+			}
+
+			if action == "RunInstances" {
+				return http.StatusInternalServerError, "<Response><Errors><Error><Code>Stop</Code>" +
+					"<Message>the test ends here</Message></Error></Errors></Response>"
+			}
+
+			return 0, ""
+		}
+
+		p := newTestProvider(t, f, nil)
+
+		_, err := p.launchBuilder(t.Context(), BuildSpec{BaseImage: "ami-base", InstanceType: "c7i.4xlarge",
+			Name: "test-image"}, "#!/bin/sh\n")
+
+		refused := err != nil && strings.Contains(err.Error(), "is an image billet built")
+		if refused != tc.refuse {
+			t.Errorf("tags %q: refused %v, want %v (%v)", tc.tags, refused, tc.refuse, err)
+		}
+
+		if launched := f.countOf("RunInstances"); (launched == 0) != tc.refuse {
+			t.Errorf("tags %q: %d launches, refuse %v", tc.tags, launched, tc.refuse)
+		}
+	}
+}
+
 // firstLineOf is lineOf for a marker that legitimately recurs.
 //
 // lineOf REFUSES AN AMBIGUOUS MARKER, which is right and is how this was caught:

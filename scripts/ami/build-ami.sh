@@ -122,6 +122,15 @@ on_exit() {
 		return 0
 	fi
 	trap - EXIT
+	# A FAILED BUILD IS NOT RESUMED BY A LATER BOOT. A reboot request that failed
+	# left a record saying rebooting and an enabled unit, which the next boot of
+	# any kind would take as the planned one; so this build's record says failed
+	# and the unit is disabled again. Best effort: this is every failure's path, an
+	# unwritable record's included.
+	if [ "$(read_state nonce 2>/dev/null)" = "$nonce" ]; then
+		write_state "nonce=$nonce" "phase=failed" "boot=$(cat "$boot_id" 2>/dev/null)" 2>/dev/null || true
+	fi
+	systemctl disable billet-ami-build.service >/dev/null 2>&1 || true
 	# THE LOG IS WHOLE BEFORE IT IS READ: tee writes it asynchronously, so the
 	# build's output goes back to the journal and tee is waited for, or a step that
 	# failed at once could be missing from it. FOR A WHILE, NOT FOR EVER: a process a
@@ -186,10 +195,13 @@ fi
 # THE BUILD IS NOT A SERVICE AN UPGRADE RESTARTS. GitHub's template upgrades every
 # package before it exempts its own provisioner from needrestart, and a restart of
 # this unit kills the build mid-step, which the record then rightly refuses to
-# resume. Written each run, before any apt transaction, and removed with the build.
+# resume. Written each run, before any apt transaction, where needrestart is, and
+# removed with the build.
 nr_exempt=$root/etc/needrestart/conf.d/billet-ami-build.conf
-install -d -m 0755 "$(dirname "$nr_exempt")"
-printf '%s\n' '$nrconf{override_rc}{qr(^billet-ami-build)} = 0;' >"$nr_exempt"
+if [ -d "$root/etc/needrestart" ]; then
+	install -d -m 0755 "$(dirname "$nr_exempt")"
+	printf '%s\n' '$nrconf{override_rc}{qr(^billet-ami-build)} = 0;' >"$nr_exempt"
+fi
 
 # THE RUNNER'S OWN FILES OUTSIDE /tmp. The builder is the target, and GitHub's
 # cleanup.sh empties /tmp, so the runner's working files there were gone by the

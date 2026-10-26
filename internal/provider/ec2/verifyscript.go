@@ -660,13 +660,15 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 	// TWO QUESTIONS OF THE JOB'S ENVIRONMENT, asked of the runner, so the answer is
 	// the value a job receives rather than a line of the file, which a later line or
 	// a last line without its newline would make a different thing: whether NAME is
-	// VALUE, and whether it is a directory the runner reaches under PREFIX, the
-	// prefix compared as text. Functions, because the script has a size to keep.
+	// VALUE, and whether it is one directory directly under PREFIX, compared as
+	// text, that is not a link and whose source.properties (every NDK package has
+	// one) the runner can read, which a directory closed to it is not. Functions, because the script has a size to keep.
 	// billet_root is empty here and lets a test point the paths at a fixture.
 	b.WriteString("billet_root=''\n")
 	b.WriteString("billet_says() { [ \"$(" + verifyRunAsRunner + " printenv \"$1\")\" = \"$2\" ]; }\n")
 	b.WriteString("billet_sets() { billet_v=$(" + verifyRunAsRunner + " printenv \"$1\") || return 1; " +
-		"case \"$billet_v\" in \"$2\"?*) " + verifyRunAsRunner + " test -d \"$billet_root$billet_v\" ;; " +
+		"case \"$billet_v\" in \"$2\".|\"$2\"..|\"$2\"*/*) false ;; \"$2\"?*) " + verifyRunAsRunner +
+		" sh -c 'test ! -L \"$1\" && test -r \"$1/source.properties\"' sh \"$billet_root$billet_v\" ;; " +
 		"*) false ;; esac; }\n")
 
 	// SPLIT BY THE SHELL ITSELF: a command splitting it could fail with nothing

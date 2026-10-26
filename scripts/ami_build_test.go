@@ -161,7 +161,7 @@ func newAMIBuildFixture(t *testing.T, scope, accept string) amiBuildFixture {
 	for _, d := range []string{
 		filepath.Join(fx.repo, "scripts", "ami"), filepath.Join(fx.repo, "scripts", "runner-images"),
 		filepath.Join(fx.root, "var", "lib", "billet-ami"), filepath.Join(fx.root, "etc", "systemd", "system"),
-		fx.fake, filepath.Join(dir, "bin"),
+		filepath.Join(fx.root, "etc", "needrestart"), fx.fake, filepath.Join(dir, "bin"),
 	} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -649,6 +649,44 @@ func TestARebootIsRecordedOnlyForThisBuild(t *testing.T) {
 // ANY OTHER START WITH A RECORD IS AN UNPLANNED RESTART, AND FAILS without running
 // the template again: a build resumed from a record no reboot wrote installs onto
 // a machine in a state nothing knows.
+func TestAFailedRebootRequestIsNotResumedByALaterBoot(t *testing.T) {
+	t.Parallel()
+
+	fx := newAMIBuildFixture(t, "ami-x64", "")
+
+	if out, err := fx.run(t, "FAKE_REBOOT_AT=5", "FAKE_REBOOT_FAILS=1"); err == nil {
+		t.Fatalf("a failed reboot request exited 0:\n%s", out)
+	}
+
+	if v := fx.verdict(t); v["verdict"] != "fail" || v["step"] != "template" {
+		t.Fatalf("the first boot's verdict is %v, want fail in the template", v)
+	}
+
+	if state := fx.state(t); !strings.Contains(state, "phase=failed\n") {
+		t.Errorf("a failed build left the record\n%s", state)
+	}
+
+	if !strings.Contains(fx.calls(t), "systemctl disable billet-ami-build.service\n") {
+		t.Errorf("a failed build left its unit enabled:\n%s", fx.calls(t))
+	}
+
+	// ANY LATER BOOT, the unit started by hand or by a unit file left behind.
+	fx.boot(t, "boot-two")
+
+	out, err := fx.run(t)
+	if err == nil {
+		t.Fatalf("a later boot of a failed build exited 0:\n%s", out)
+	}
+
+	if v := fx.verdict(t); v["verdict"] != "fail" || v["step"] != "resume" {
+		t.Errorf("a later boot's verdict is %v, want fail at resume\n%s", v, out)
+	}
+
+	if n := strings.Count(fx.calls(t), "runner scope="); n != 1 {
+		t.Errorf("the template ran %d times; a failed build resumed:\n%s", n, fx.calls(t))
+	}
+}
+
 func TestTheAMIBuildRefusesAnUnplannedRestart(t *testing.T) {
 	t.Parallel()
 

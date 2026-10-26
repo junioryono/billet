@@ -98,8 +98,9 @@ variables() {
 # versioned prints the NAME=PREFIX lines NAME's installer writes whose value goes on
 # with a version the build resolves: the Android NDK's, which GitHub's installer
 # sets because many builds read them. present asks that each value starts with its
-# prefix, compared as text, and is a directory in the image; absent that the name
-# is not there at all.
+# prefix, compared as text, and is one directory directly under it, not a link,
+# holding the source.properties every NDK package has; absent that the name is
+# not there at all.
 versioned() {
 	case "$1" in
 	android-sdk)
@@ -164,9 +165,15 @@ present() {
 		[ -n "$variable" ] || continue
 		value=$(sed -n "s|^${variable%%=*}=||p" "$env") || value=
 		case "$value" in
+		"${variable#*=}". | "${variable#*=}".. | "${variable#*=}"*/*)
+			fail "$name: ${variable%%=*} names $value, which is not one directory directly under ${variable#*=}"
+			;;
 		"${variable#*=}"?*)
-			chroot "$root" test -d "$value" ||
+			if ! chroot "$root" test -d "$value" || chroot "$root" test -L "$value"; then
 				fail "$name: ${variable%%=*} names $value, which is not a directory in the completed image"
+			elif ! chroot "$root" test -r "$value/source.properties"; then
+				fail "$name: ${variable%%=*} names $value, which has no source.properties, so it is no NDK"
+			fi
 			;;
 		*) fail "$name: the job's environment does not set ${variable%%=*} to a path under ${variable#*=}" ;;
 		esac

@@ -70,8 +70,8 @@ func completedTree(t *testing.T, name string) string {
 	case "android-sdk":
 		write("usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager", "#!/bin/sh\n", 0o755)
 		dir("usr/local/lib/android/sdk/platforms/android-35", 0o777)
-		dir("usr/local/lib/android/sdk/ndk/27.3.13750724", 0o755)
-		dir("usr/local/lib/android/sdk/ndk/28.2.13676358", 0o755)
+		write("usr/local/lib/android/sdk/ndk/27.3.13750724/source.properties", "Pkg.Revision = 27.3.13750724\n", 0o644)
+		write("usr/local/lib/android/sdk/ndk/28.2.13676358/source.properties", "Pkg.Revision = 28.2.13676358\n", 0o644)
 		dir("usr/local/lib/android/sdk", 0o777)
 		env += "ANDROID_HOME=/usr/local/lib/android/sdk\nANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n" +
 			"ANDROID_NDK=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
@@ -172,6 +172,35 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 			writeTreeFile(t, root, "etc/billet-image-env", strings.Replace(string(env),
 				"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724", "ANDROID_NDK_ROOT=/opt/ndk", 1))
 		}, "present", "does not set ANDROID_NDK_ROOT to a path under /usr/local/lib/android/sdk/ndk/"},
+		// A PREFIX COMPARED AS TEXT IS STILL CLIMBED OUT OF WITH `..`.
+		"an NDK variable climbing out of the SDK": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			env, err := os.ReadFile(filepath.Join(root, "etc", "billet-image-env"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writeTreeFile(t, root, "etc/billet-image-env", strings.Replace(string(env),
+				"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724",
+				"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/../../../../../../usr", 1))
+		}, "present", "is not one directory directly under /usr/local/lib/android/sdk/ndk/"},
+		// A DIRECTORY WITHOUT AN NDK IN IT IS NOT ONE.
+		"an NDK directory with no NDK in it": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			removeAll(t, filepath.Join(root, "usr", "local", "lib", "android", "sdk", "ndk", "27.3.13750724", "source.properties"))
+		}, "present", "has no source.properties, so it is no NDK"},
+		// A LINK IS NOT THE NDK'S OWN DIRECTORY.
+		"an NDK variable naming a link": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			ndk := filepath.Join(root, "usr", "local", "lib", "android", "sdk", "ndk")
+			removeAll(t, filepath.Join(ndk, "28.2.13676358"))
+			if err := os.Symlink("27.3.13750724", filepath.Join(ndk, "28.2.13676358")); err != nil {
+				t.Fatal(err)
+			}
+		}, "present", "ANDROID_NDK_LATEST_HOME names /usr/local/lib/android/sdk/ndk/28.2.13676358, which is not a directory"},
 		// AND UNDER IT IS NOT ENOUGH: the NDK it names must be there.
 		"an NDK variable naming an NDK that is not there": {"android-sdk", func(t *testing.T, root string) {
 			t.Helper()

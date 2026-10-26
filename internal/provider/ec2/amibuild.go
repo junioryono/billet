@@ -408,6 +408,17 @@ func buildFailure(id, arch string, report map[string]string) error {
 		}
 	}
 
+	// THE BOOTSTRAP IS NO STEP OF THE UNIT, which never started: what it said is in
+	// cloud-init's output, and what it refuses is a short list.
+	if where == bootstrapStep {
+		return fmt.Errorf("ec2: the builder %s reported that its build failed in %s, before "+
+			"the build started: its root had too little free space, the payload could not be "+
+			"fetched or was not the one staged, its settings named another build, or the "+
+			"machine already records a finished billet build; billet terminates it, so rerun "+
+			"the build to see which in cloud-init's output (/var/log/cloud-init-output.log)",
+			id, where)
+	}
+
 	return fmt.Errorf("ec2: the builder %s reported that its build failed in %s; billet "+
 		"terminates it, so rerun the build to see the step's own output in its journal "+
 		"(journalctl -u %s)", id, where, amiUnitName)
