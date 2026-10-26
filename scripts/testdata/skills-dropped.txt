@@ -168,3 +168,5 @@ e29c5205f066 The Makefile is gone (#78); the sentence names the script under scr
 f2b09ff92300 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 1c37e966cf7d The Makefile is gone (#78); the scenario tests run through scripts/gates/scenario.sh NAME, and the rule says so.
 e1d3650f30ef #93 records a runner's owner on the lease and the binding when it is minted, and the plane resolves removal and recovery from it; the gap is closed and the sentence now states the rule and what an unrecorded runner still does.
+4e1cc90afe54 #688 adds `targets` to the tier keys; the sentence now lists it with its expansion, beside `sizes`.
+f8453d8ae0f0 #689 moves the helper's local cache into the go command's own GOCACHE and layout; the sentence now says so, with why.
