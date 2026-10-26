@@ -251,7 +251,8 @@ func TestADamagedLocalObjectIsAMiss(t *testing.T) {
 	exchange(t, Config{Dir: dir},
 		request{ID: 1, Command: "put", ActionID: action, OutputID: sum[:], BodySize: int64(len(body))}, body,
 		request{ID: 2, Command: "close"})
-	if err := os.WriteFile(filepath.Join(dir, "o", hex.EncodeToString(sum[:])), body[:3], 0o600); err != nil {
+	output := hex.EncodeToString(sum[:])
+	if err := os.WriteFile(filepath.Join(dir, output[:2], output+"-d"), body[:3], 0o600); err != nil {
 		t.Fatal(err)
 	}
 	answers := exchange(t, Config{Dir: dir},
@@ -348,8 +349,110 @@ func TestARefusingNodeLeavesAWorkingLocalCache(t *testing.T) {
 	t.Cleanup(node.Close)
 	dir := t.TempDir()
 	build(t, node, probeModule(t), dir)
-	entries, err := os.ReadDir(filepath.Join(dir, "o"))
-	if err != nil || len(entries) == 0 {
+	outputs, err := filepath.Glob(filepath.Join(dir, "*", "*-d"))
+	if err != nil || len(outputs) == 0 {
 		t.Fatalf("the local cache holds nothing after a build: %v", err)
+	}
+}
+
+// compiles builds module against dir as the build cache, through the helper
+// (with a refusing node) or not, and counts the compiler runs `go build -x`
+// reports: none means every package was served from the cache.
+func compiles(t *testing.T, module, dir string, throughHelper bool) int {
+	t.Helper()
+
+	env := append(os.Environ(), "GOFLAGS=", "GOTOOLCHAIN=local", "GOWORK=off", "GOCACHE="+dir)
+	if throughHelper {
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := httptest.NewServer(&fakeNode{objects: map[string][]byte{}, refuse: true})
+		t.Cleanup(node.Close)
+		env = append(env, "GOCACHEPROG="+executable, "BILLET_GOCACHEPROG_TEST_HELPER=1",
+			"BILLET_GOCACHE_DIR="+dir, "BILLET_CACHE_ENDPOINT="+node.URL, "BILLET_CACHE_TOKEN=token")
+	} else {
+		env = append(env, "GOCACHEPROG=")
+	}
+	cmd := exec.CommandContext(t.Context(), "go", "build", "-x", "-o", filepath.Join(t.TempDir(), "probe"), ".")
+	cmd.Dir, cmd.Env = module, env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	n := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "/compile ") {
+			n++
+		}
+	}
+
+	return n
+}
+
+// THE HELPER AND THE GO COMMAND SHARE ONE CACHE, in both directions, so the
+// helper is never worse than none (#689): a cache the go command built (the one
+// a workflow restores with actions/cache) serves a build through a helper the
+// node refuses, and what the helper built is the go command's to read, and so
+// the workflow's to save.
+func TestTheHelperAndTheGoCommandShareOneCache(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go command to drive the helper")
+	}
+
+	for _, first := range []bool{false, true} {
+		name := map[bool]string{false: "the go command's cache serves the helper",
+			true: "the helper's cache serves the go command"}[first]
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			module, dir := probeModule(t), t.TempDir()
+			if n := compiles(t, module, dir, first); n == 0 {
+				t.Fatal("a build into an empty cache compiled nothing, so this proves nothing")
+			}
+			if n := compiles(t, module, dir, !first); n != 0 {
+				t.Errorf("the second build compiled %d packages the first had cached", n)
+			}
+		})
+	}
+}
+
+// AN ENTRY FILE THAT NAMES ANOTHER ACTION IS A MISS, as the go command treats
+// one: a file at one action's path is not that action's answer.
+func TestANativeEntryForAnotherActionIsAMiss(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, other := bytes.Repeat([]byte{4}, 32), bytes.Repeat([]byte{6}, 32)
+	body := []byte("an object")
+	sum := sha256.Sum256(body)
+	exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "put", ActionID: other, OutputID: sum[:], BodySize: int64(len(body))}, body,
+		request{ID: 2, Command: "close"})
+
+	ours, theirs := hex.EncodeToString(action), hex.EncodeToString(other)
+	raw, err := os.ReadFile(filepath.Join(dir, theirs[:2], theirs+"-a"))
+	if err != nil {
+		t.Fatalf("the put wrote no entry in the go command's layout: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ours[:2]), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ours[:2], ours+"-a"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	answers := exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "get", ActionID: action},
+		request{ID: 2, Command: "get", ActionID: other},
+		request{ID: 3, Command: "close"})
+	if !answers[0].Miss {
+		t.Errorf("an entry naming another action was answered %+v", answers[0])
+	}
+	if answers[1].Miss {
+		t.Errorf("the action the entry names was a miss: %+v", answers[1])
 	}
 }

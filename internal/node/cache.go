@@ -1118,12 +1118,18 @@ func (s *CacheService) cleanupSession(
 				session.instance, slot, err)
 		}
 	}
+	// A VOLUME NOT DONE KEEPS THE SESSION OPEN, with or without an error: one
+	// waiting its turn to publish answers not done and no error, and a session
+	// finished around it would forget the volume and never publish it.
+	pending := false
 	for kind, hv := range session.hosts {
 		done, err := s.releaseCASVolume(ctx, session, hv)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s cache: %w", kind, err))
 		}
 		if !done {
+			pending = true
+
 			continue
 		}
 		delete(session.hosts, kind)
@@ -1161,6 +1167,9 @@ func (s *CacheService) cleanupSession(
 
 	if err := errors.Join(failures...); err != nil {
 		return fmt.Errorf("node: discard cache volumes of %s: %w", session.instance, err)
+	}
+	if pending {
+		return nil
 	}
 	if err := s.finishSession(session); err != nil {
 		return fmt.Errorf("node: finish cache cleanup of %s: %w", session.instance, err)
