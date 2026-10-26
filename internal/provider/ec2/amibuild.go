@@ -393,14 +393,20 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 		// builder is still running is not known here, and BuildImage terminates it.
 		if err := p.sleep(ctx, buildPoll); err != nil {
 			if verdict != nil {
-				return "", fmt.Errorf("ec2: the builder %s announced its build's success and had "+
-					"not powered itself off when the wait ended, so no image was made; billet "+
-					"terminates it: %w", id, err)
+				return "", fmt.Errorf("ec2: the builder %s announced its build's success and billet "+
+					"had not seen it power itself off when the wait ended, so no image was made; "+
+					"billet terminates it: %w", id, err)
 			}
 
-			return "", fmt.Errorf("ec2: the builder %s gave no verdict before the wait ended; billet "+
-				"terminates it, so rerun the build with a longer --timeout and read its console "+
-				"or its journal (journalctl -u %s) while it runs: %w", id, amiUnitName, err)
+			// A LONGER --timeout ANSWERS A DEADLINE, not a cancel.
+			advice := "rerun the build and read"
+			if errors.Is(err, context.DeadlineExceeded) {
+				advice = "rerun the build with a longer --timeout and read"
+			}
+
+			return "", fmt.Errorf("ec2: billet had read no verdict from the builder %s when the wait "+
+				"ended; billet terminates it, so %s its console or its journal (journalctl -u %s) "+
+				"while it runs: %w", id, advice, amiUnitName, err)
 		}
 	}
 }

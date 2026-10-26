@@ -262,9 +262,11 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		}
 	}
 
-	// test IS THE SYSTEM'S, BUT THE RUNNER CANNOT READ WHAT closed-to-runner LISTS:
-	// a path refused only when the call arrived through the privilege drop, so a
-	// check that skipped billet_as_runner reads it and its case goes green.
+	// test IS THE SYSTEM'S, BUT THE RUNNER MAY NOT READ, RUN OR WRITE WHAT
+	// closed-to-runner LISTS: refused only when the call arrived through the
+	// privilege drop, so a check that skipped billet_as_runner passes it, and only
+	// for those predicates, as a real mode is, so -d or -L of a closed directory
+	// still answers and a check that asked only those passes it too.
 	// BY ABSOLUTE PATH, because the runner's PATH is the fake bin alone.
 	realTest, err := exec.LookPath("test")
 	if err != nil {
@@ -277,11 +279,11 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	}
 
 	closed := filepath.Join(root, "closed-to-runner")
-	writeFile(t, filepath.Join(bin, "test"), "#!/bin/sh\n"+
+	writeExecutableFile(t, filepath.Join(bin, "test"), "#!/bin/sh\n"+
 		"if [ -n \"${"+droppedMarker+":-}\" ] && [ -f '"+closed+"' ]; then\n"+
-		"  for a in \"$@\"; do '"+realGrep+"' -qxF -- \"$a\" '"+closed+"' && exit 1; done\n"+
+		"  case \"$1\" in -r|-x|-w) '"+realGrep+"' -qxF -- \"$2\" '"+closed+"' && exit 1 ;; esac\n"+
 		"fi\n"+
-		"exec '"+realTest+"' \"$@\"\n", 0o755)
+		"exec '"+realTest+"' \"$@\"\n")
 
 	// THE JOB'S ENVIRONMENT CARRIES WHAT EACH RECORDED COMPONENT'S INSTALLER SET,
 	// but the variable a case drops or points elsewhere.
@@ -392,7 +394,7 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 				body = "#!/bin/sh\nexit 1\n"
 			}
 
-			writeFile(t, croot+path, body, 0o755)
+			writeExecutableFile(t, croot+path, body)
 
 			// CLOSED TO THE RUNNER ALONE, as an executable only root may run is.
 			if path == p.closedExecutable {
@@ -432,8 +434,8 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 			t.Fatal(err)
 		}
 
-		writeFile(t, filepath.Join(bundle, "codeql"), "#!/bin/sh\n[ -n \"${"+droppedMarker+":-}\" ] || exit 1\n"+
-			"[ \"$1\" = version ]\n", 0o755)
+		writeExecutableFile(t, filepath.Join(bundle, "codeql"), "#!/bin/sh\n[ -n \"${"+droppedMarker+":-}\" ] || exit 1\n"+
+			"[ \"$1\" = version ]\n")
 	}
 
 	if p.strayComponent != "" {

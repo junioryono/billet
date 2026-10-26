@@ -13,8 +13,9 @@ import (
 // `id` stood in for so `present` runs without root: the stand-in chroot runs its
 // command with paths moved under the root, which follows no symlink the way a
 // real chroot would but asks the same questions. Asked as the runner
-// (--userspec=runner:runner), it refuses each path the tree's .closed-to-runner
-// lists, as a mode the runner cannot pass would.
+// (--userspec=runner:runner) whether it may read, run or write a path the tree's
+// .closed-to-runner lists, it says no, as a mode the runner cannot pass would;
+// -d and the rest still answer, as they do for a real closed directory.
 func componentCheck(t *testing.T, mode, name, root string) (string, int) {
 	t.Helper()
 
@@ -22,8 +23,10 @@ func componentCheck(t *testing.T, mode, name, root string) (string, int) {
 	for file, body := range map[string]string{
 		"id": "#!/bin/sh\n[ \"$1\" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id \"$@\"\n",
 		"chroot": "#!/bin/bash\nrunner=\ncase $1 in --userspec=runner:runner) runner=1; shift ;; --userspec=*) exit 125 ;; esac\n" +
-			"root=$1; shift\nargs=()\nfor a in \"$@\"; do\n" +
-			"\tif [ -n \"$runner\" ] && grep -qxF -- \"$a\" \"$root/.closed-to-runner\" 2>/dev/null; then exit 1; fi\n" +
+			"root=$1; shift\n" +
+			"if [ -n \"$runner\" ] && [ \"$1\" = test ]; then\n" +
+			"\tcase $2 in -r | -x | -w) ! grep -qxF -- \"$3\" \"$root/.closed-to-runner\" 2>/dev/null || exit 1 ;; esac\n" +
+			"fi\nargs=()\nfor a in \"$@\"; do\n" +
 			"\tcase $a in /*) args+=(\"$root$a\") ;; *) args+=(\"$a\") ;; esac\ndone\nexec \"${args[@]}\"\n",
 	} {
 		if err := forkSafeWriteFile(filepath.Join(fakes, file), []byte(body), 0o755); err != nil {

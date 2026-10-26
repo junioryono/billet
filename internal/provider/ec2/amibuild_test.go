@@ -989,14 +989,21 @@ func TestAWaitThatEndsSaysWhatItHadRead(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		build     *buildFake
+		ended     error
 		want, not string
 	}{
-		{name: "no verdict", build: &buildFake{stopReason: "Client.InstanceInitiatedShutdown",
-			imageState: "available", buildSilent: true},
-			want: "gave no verdict before the wait ended", not: "announced"},
+		{name: "no verdict by the deadline", build: &buildFake{stopReason: "Client.InstanceInitiatedShutdown",
+			imageState: "available", buildSilent: true}, ended: context.DeadlineExceeded,
+			want: "when the wait ended; billet terminates it, so rerun the build with a longer --timeout",
+			not:  "announced"},
+		// A CANCEL IS NOT A DEADLINE, and a longer one would not have helped.
+		{name: "no verdict when cancelled", build: &buildFake{stopReason: "Client.InstanceInitiatedShutdown",
+			imageState: "available", buildSilent: true}, ended: context.Canceled,
+			want: "when the wait ended; billet terminates it, so rerun the build and read",
+			not:  "--timeout"},
 		{name: "a success that did not stop", build: &buildFake{stopReason: "Client.InstanceInitiatedShutdown",
-			imageState: "available", dwellPolls: 1000},
-			want: "announced its build's success and had not powered itself off", not: "gave no verdict"},
+			imageState: "available", dwellPolls: 1000}, ended: context.DeadlineExceeded,
+			want: "announced its build's success and billet had not seen it power itself off", not: "read no verdict"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1009,7 +1016,7 @@ func TestAWaitThatEndsSaysWhatItHadRead(t *testing.T) {
 			// THE WAIT ENDS once the builder has been asked three times.
 			p.sleep = func(context.Context, time.Duration) error {
 				if f.countOf("GetConsoleOutput") >= 3 {
-					return context.DeadlineExceeded
+					return tc.ended
 				}
 
 				return nil
