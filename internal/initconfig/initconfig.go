@@ -1084,8 +1084,9 @@ func imagesAcceptYAML() string {
 #
 #   accept: [android-sdk, codeql, firefox, google-chrome, microsoft-edge]
 #
-# Anything not named is missing from every generation this deployment imports,
-# and a job that uses it fails or fetches it itself. ` + "`billet check`" + ` says what
+# Anything not named is missing from every generation this deployment completes
+# from billet's published image, and a job that uses it fails or fetches it
+# itself. ` + "`billet check`" + ` says what
 # each tier's image left out that is not accepted here.
 images:
   accept: []

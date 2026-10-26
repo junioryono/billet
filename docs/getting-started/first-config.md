@@ -49,7 +49,7 @@ The shape is the whole product in miniature: a `server` block for the control pl
 
 ## Accept the licensed image components (Linux)
 
-A Linux guest boots GitHub's own runner image, built from its template, except for five parts whose licenses forbid billet redistributing them: the Android SDK, the CodeQL bundle, Firefox, Google Chrome and Microsoft Edge. Your deployment installs the ones it accepts, from their vendors, on its own nodes. **Decide this while you set up, before the first image is pulled**: a component you do not accept is missing from every image this deployment imports, and a job that uses it fails, or downloads it itself on every run.
+A Linux guest boots GitHub's own runner image, built from its template, except for five parts whose licenses forbid billet redistributing them: the Android SDK, the CodeQL bundle, Firefox, Google Chrome and Microsoft Edge. Your deployment installs the ones it accepts, from their vendors, on its own nodes. **Decide this while you set up, before the first image is pulled**: a component you do not accept is missing from every image this deployment builds from billet's published image, and a job that uses it fails, or downloads it itself on every run.
 
 Read each license in the [table of components](../operating/guest-images.md#components-the-image-leaves-out). To boot the same image GitHub's hosted `ubuntu-24.04` runner does, accept all five, if you agree to them:
 
@@ -58,7 +58,10 @@ images:
   accept: [android-sdk, codeql, firefox, google-chrome, microsoft-edge]
 ```
 
-Writing a name is accepting that component's license for this deployment, so billet never writes one for you: `billet init` writes the list empty, with each name and its license above it. Put it in the control plane's file, which hands the list to every node when it registers. A Firecracker node installs what is accepted in a microVM before it imports each new generation, and an EC2 image installs it during `billet ami build`. Accepting later is fine too: the node's next pull or daily refresh completes a new generation with what was added, and `billet check` names what each tier's image left out that is not accepted.
+Writing a name is accepting that component's license for this deployment, so billet never writes one for you: `billet init` writes the list empty, with each name and its license above it. Put it in the control plane's file, which hands the list to every node when it registers; a node also installs what its own file names.
+
+- **Firecracker.** A node installs what is accepted in a microVM before it imports each new generation, and `billet check` names what each tier's image left out that is not accepted. To accept more later, add the names and restart `billet server`, so that each node registers again and records the new list (or write them in the node's own file as well). The node's next `billet images pull --verify`, or its daily refresh where automatic updates are on, then completes a new generation with what was added.
+- **EC2.** `billet ami build` installs what is accepted into the AMI. To accept more later, build a new AMI and point the tiers at it; nothing refreshes an AMI by itself.
 
 A Mac is different. billet publishes no macOS image, and a Mac's tart image is whatever you give it ([Run jobs on a Mac](../deploying/mac-tart.md)), so `images.accept` installs nothing there.
 
