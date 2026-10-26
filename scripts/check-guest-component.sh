@@ -147,14 +147,22 @@ absent() {
 	[ "$FAILED" -ne 0 ] || pass "$name is not in the image"
 }
 
-# present fails on every path NAME installs that ROOT lacks or cannot run, and
-# every variable of it the job's environment does not name exactly.
+# present fails on every path NAME installs that ROOT lacks or the runner cannot
+# run or read, as a job is the runner, and every variable of it the job's
+# environment does not name exactly.
 present() {
 	local name=$1 root=$2 kind path variable value env="$2/etc/billet-image-env"
 	while read -r kind path; do
 		case "$kind" in
-		x) chroot "$root" test -x "$path" || fail "$name: $path is not an executable in the completed image" ;;
-		d) chroot "$root" test -d "$path" || fail "$name: $path is not a directory in the completed image" ;;
+		x)
+			chroot --userspec=runner:runner "$root" test -x "$path" ||
+				fail "$name: $path is not an executable the runner can run in the completed image"
+			;;
+		d)
+			{ chroot --userspec=runner:runner "$root" test -d "$path" &&
+				chroot --userspec=runner:runner "$root" test -r "$path"; } ||
+				fail "$name: $path is not a directory the runner can read in the completed image"
+			;;
 		esac
 	done < <(paths "$name")
 	while IFS= read -r variable; do

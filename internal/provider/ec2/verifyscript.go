@@ -671,6 +671,16 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 		" test ! -L \"$billet_root$billet_v\" && " + verifyRunAsRunner +
 		" test -r \"$billet_root$billet_v/source.properties\" ;; *) false ;; esac; }\n")
 
+	// A PATH, AS THE RUNNER, under billet_root: an executable that runs (an
+	// executable that does not is still executable, so each says its version) and a
+	// directory it can read (one it cannot is still a directory). Functions, for the
+	// script's size, and so a test points every path at its fixture through
+	// billet_root alone, whoever asks.
+	b.WriteString("billet_x() { " + verifyRunAsRunner + " test -x \"$billet_root$1\" && " +
+		verifyRunAsRunner + " \"$billet_root$1\" --version >/dev/null 2>&1; }\n")
+	b.WriteString("billet_d() { " + verifyRunAsRunner + " test -d \"$billet_root$1\" && " +
+		verifyRunAsRunner + " test -r \"$billet_root$1\"; }\n")
+
 	// SPLIT BY THE SHELL ITSELF: a command splitting it could fail with nothing
 	// printed, and `for` would then check no component and fail nothing. The list's
 	// characters hold no glob, and IFS is the shell's own again inside the loop.
@@ -692,17 +702,16 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 
 		for _, entry := range componentPaths[name] {
 			kind, path, _ := strings.Cut(entry, " ")
-			checks = append(checks, verifyRunAsRunner+" test -"+kind+" "+path)
 
 			switch {
-			// A DIRECTORY THE RUNNER CANNOT READ IS STILL A DIRECTORY.
 			case kind == "d":
-				checks = append(checks, verifyRunAsRunner+" test -r "+path)
-			// AN EXECUTABLE THAT DOES NOT RUN IS STILL EXECUTABLE: each says its
-			// version as the runner. sdkmanager is the exception, a script whose
-			// --version needs the network and a JDK it finds on its own.
-			case !strings.HasSuffix(path, "/sdkmanager"):
-				checks = append(checks, verifyRunAsRunner+" "+path+" --version >/dev/null 2>&1")
+				checks = append(checks, "billet_d "+path)
+			// sdkmanager IS THE EXCEPTION, a script whose --version needs the
+			// network and a JDK it finds on its own.
+			case strings.HasSuffix(path, "/sdkmanager"):
+				checks = append(checks, verifyRunAsRunner+" test -x \"$billet_root\""+path)
+			default:
+				checks = append(checks, "billet_x "+path)
 			}
 		}
 

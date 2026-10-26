@@ -27,6 +27,9 @@ echo "runner scope=$BILLET_RI_SCOPE from=$BILLET_RI_FROM tmp=${TMPDIR:-}" >>"$FA
 grep -qxF '$nrconf{override_rc}{qr(^billet-ami-build)} = 0;' "$BILLET_AMI_ROOT/etc/needrestart/conf.d/billet-ami-build.conf" &&
 	echo "runner needrestart-exempt" >>"$FAKE/calls"
 [ -z "${FAKE_FAIL_FIRST:-}" ] || exit 1
+# A LOG THAT IS GONE when the failure handler reads it, as a real tee goes on
+# writing to the file it opened (the stand-in tee writes nothing more).
+[ -z "${FAKE_REMOVE_LOG:-}" ] || rm -f "$BILLET_AMI_ROOT/var/lib/billet-ami-build/build.log"
 mkdir -p "$BILLET_AMI_ROOT/var/tmp/billet-ri"
 echo staged >"$BILLET_AMI_ROOT/var/tmp/billet-ri/step.sh"
 # A STEP THAT LEAVES A PROCESS BEHIND holding the build's output.
@@ -90,7 +93,7 @@ exec bash "$REAL_CHECK_COMPONENT" "$@"
 while IFS= read -r line; do
 	/bin/sleep 0.1
 	printf '%s\n' "$line"
-	printf '%s\n' "$line" >>"$2"
+	[ -n "${FAKE_REMOVE_LOG:-}" ] || printf '%s\n' "$line" >>"$2"
 done
 `
 	// A command the build runs on the machine: logged, and successful.
@@ -441,6 +444,10 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 		// request that failed is a failure, not the planned path.
 		{name: "the reboot request fails", env: []string{"FAKE_REBOOT_AT=5", "FAKE_REBOOT_FAILS=1"},
 			wantStep: "template", wantTemplate: "5"},
+		// A STEP NOBODY CAN NAME IS STILL A FAILURE SAID: the log the step is read
+		// from is gone, and the verdict goes out without it.
+		{name: "the build's log cannot be read when it fails", env: []string{"FAKE_FAIL_AT=4", "FAKE_REMOVE_LOG=1"},
+			wantStep: "template", wantTemplate: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

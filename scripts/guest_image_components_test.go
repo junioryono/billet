@@ -160,6 +160,17 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 
 			removeAll(t, filepath.Join(root, "usr", "bin", "chromedriver"))
 		}, "present", "/usr/bin/chromedriver is not an executable"},
+		// AS THE RUNNER, as a job is: root runs and reads what the runner cannot.
+		"a driver closed to the runner": {"google-chrome", func(t *testing.T, root string) {
+			t.Helper()
+
+			writeTreeFile(t, root, ".closed-to-runner", "/usr/bin/chromedriver\n")
+		}, "present", "/usr/bin/chromedriver is not an executable the runner can run"},
+		"a component's directory closed to the runner": {"microsoft-edge", func(t *testing.T, root string) {
+			t.Helper()
+
+			writeTreeFile(t, root, ".closed-to-runner", "/usr/local/share/edge_driver\n")
+		}, "present", "/usr/local/share/edge_driver is not a directory the runner can read"},
 		"a variable missing": {"microsoft-edge", func(t *testing.T, root string) {
 			t.Helper()
 

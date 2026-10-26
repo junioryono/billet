@@ -370,17 +370,10 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 					t.Fatalf("make %s: %v", path, err)
 				}
 
+				// CLOSED TO THE RUNNER ALONE, so only a check made as the runner
+				// refuses it.
 				if path == p.unreadableComponentDir {
-					if err := os.Chmod(croot+path, 0o311); err != nil {
-						t.Fatal(err)
-					}
-
-					// OPENED AGAIN, or the temporary directory cannot be removed.
-					t.Cleanup(func() {
-						if err := os.Chmod(croot+path, 0o755); err != nil {
-							t.Errorf("reopen %s: %v", path, err)
-						}
-					})
+					writeFile(t, filepath.Join(root, "closed-to-runner"), croot+path+"\n", 0o644)
 				}
 
 				continue
@@ -444,10 +437,6 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	}
 
 	script = substitute(t, script, "billet_root=''", "billet_root='"+croot+"'")
-	script = substitute(t, script, verifyRunAsRunner+" /usr/", verifyRunAsRunner+" "+croot+"/usr/")
-	script = substitute(t, script, verifyRunAsRunner+" test -x /", verifyRunAsRunner+" test -x "+croot+"/")
-	script = substitute(t, script, verifyRunAsRunner+" test -d /", verifyRunAsRunner+" test -d "+croot+"/")
-	script = substitute(t, script, verifyRunAsRunner+" test -r /", verifyRunAsRunner+" test -r "+croot+"/")
 
 	// THE HELPER AS THE IMAGE CARRIES IT, an executable file whose bytes the
 	// verifier compares, so it is guestassets' own unless a case tampers with it.
@@ -726,8 +715,6 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 		// wantSays is what the refusal must say, where a case is about one reason
 		// of the several its step refuses for.
 		wantSays string
-		// asUser is a case only an account without root's override can stage.
-		asUser bool
 	}{
 		{
 			// A TOOLCHAIN A WORKFLOW CALLS BY NAME. GitHub's tests proved it on the
@@ -782,7 +769,7 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 				unreadableComponentDir: "/usr/local/share/gecko_driver",
 			},
 			wantStep: "components",
-			asUser:   true,
+			wantSays: "the image records firefox:140.0.4 and does not carry it for the runner",
 		},
 		{
 			name: "a recorded component's executable does not run",
@@ -1000,12 +987,6 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
-			// ROOT READS A DIRECTORY WHATEVER ITS MODE, so the case cannot be staged
-			// by a suite run as root, as it is on the shared Linux host.
-			if tc.asUser && os.Geteuid() == 0 {
-				t.Skip("root reads every directory")
-			}
 
 			report, stdout := tc.probe.run(t)
 
@@ -1361,19 +1342,22 @@ func TestNothingRunAsTheRunnerIsAShellBuiltin(t *testing.T) {
 	}
 
 	// THE SITES AT THE TIME OF WRITING, ON x64: the runner version twice, docker
-	// ps, the ten toolchains, and fifteen component paths. Asserting the floor
-	// rather than the exact number leaves room for a check to be added without
-	// editing a test, while still refusing a script that dropped the drop.
+	// ps, the ten toolchains, the component functions' bodies (billet_says once,
+	// billet_sets three times, billet_x and billet_d twice each), sdkmanager and
+	// CodeQL. Asserting the floor rather than the exact number leaves room for a
+	// check to be added without editing a test, while still refusing a script that
+	// dropped the drop.
 	//
 	// THE FLOOR SITS AT THE CURRENT COUNT, not below it. A floor under the real
 	// number lets that many sites be deleted with the test still green, which is
-	// the vacuous-by-emptiness shape the count exists to prevent. It fell from 16
-	// when contract 4 replaced the toolcache gate with the toolchains and the
-	// components; lowering it is correct only when a check moves, never because one
-	// was removed.
-	if seen < 28 {
+	// the vacuous-by-emptiness shape the count exists to prevent. It rose from 16
+	// to 28 when contract 4 replaced the toolcache gate with the toolchains and the
+	// components, and fell to 23 when the component paths moved into billet_x and
+	// billet_d, each asked once per path; lowering it is correct only when a check
+	// moves, never because one was removed.
+	if seen < 23 {
 		t.Errorf("only %d command(s) go through the privilege drop; the artifact gate's whole "+
 			"point is that a job reaches these as the runner, so a script emitting fewer than "+
-			"twenty-eight has stopped asking the question rather than passing it", seen)
+			"twenty-three has stopped asking the question rather than passing it", seen)
 	}
 }

@@ -146,7 +146,11 @@ on_exit() {
 		wait "$tee_pid" 2>/dev/null || true
 		kill "$killer" 2>/dev/null || true
 	fi
-	[ "$at" = template ] && n=$(template_step)
+	# THE STEP IS A DIAGNOSTIC, AND THE VERDICT IS NOT: a log that cannot be read
+	# names no step rather than ending this handler before it announces anything.
+	if [ "$at" = template ]; then
+		n=$(template_step 2>/dev/null) || n=
+	fi
 	verdict verdict=fail "step=$at" "template_step=$n" components=
 }
 trap on_exit EXIT
