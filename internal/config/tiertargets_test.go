@@ -383,3 +383,66 @@ func TestTierTargetsWritesBackAsWritten(t *testing.T) {
 		}
 	}
 }
+
+// A NODE'S FILE LOADS A KEPT TIER WHOSE CACHE SCOPE ONLY ITS TARGET COULD SAY: a
+// declaration for every target under `publish: default-branch` is derived its
+// scope from a repository target on the control plane, and a node's file, which
+// declares none, must not be refused for lacking it.
+func TestANodesFileLoadsADefaultBranchDeclaration(t *testing.T) {
+	const server = "server:\n  listen: 127.0.0.1:7717\n  state_dir: /var/lib/billet/server\n" +
+		"  max_vcpu: 120\n  max_memory: 480GiB\n"
+	const github = "github:\n  org: acme\n  app_id: 12345\n  installation_id: 67890\n" +
+		"  private_key_path: /etc/billet/app.pem\n"
+
+	declaration := strings.Replace(everyTarget, "    targets: all\n",
+		"    targets: all\n    cache:\n      publish: default-branch\n", 1)
+	nodeOnly := validConfig + declaration
+	for _, block := range []string{server, github} {
+		if !strings.Contains(nodeOnly, block) {
+			t.Fatalf("the fixture no longer contains %q, so this case removes nothing", block)
+		}
+
+		nodeOnly = strings.Replace(nodeOnly, block, "", 1)
+	}
+
+	if _, err := Load(writeConfig(t, nodeOnly)); err != nil {
+		t.Fatalf("a node's file with a default-branch declaration was refused: %v", err)
+	}
+
+	// THE CONTROL PLANE'S FILE, with a repository target, loads it too, and
+	// derives the scope.
+	controller := strings.Replace(validConfig, "  org: acme\n", "  repository: acme/widgets\n", 1) + declaration
+	cfg, err := Load(writeConfig(t, controller))
+	if err != nil {
+		t.Fatalf("the control plane's file was refused: %v", err)
+	}
+
+	if tier, ok := cfg.TierByLabel("default-1vcpu"); !ok || tier.CacheScope == nil ||
+		tier.CacheScope.Repository != "widgets" {
+		t.Errorf("the control plane's expanded tier is %+v, want its scope derived", tier)
+	}
+
+	// AND THE CONTROL PLANE STILL REFUSES IT where no scope can be derived: an
+	// organization target names no repository.
+	if _, err := Load(writeConfig(t, validConfig+declaration)); err == nil ||
+		!strings.Contains(err.Error(), "needs a static repository") {
+		t.Errorf("an organization target's default-branch declaration loaded: %v", err)
+	}
+}
+
+// OVERLAPPING LADDERS ARE REFUSED NAMING THE DECLARATION AS WRITTEN, not the
+// suffix the ladder gave it.
+func TestOverlappingLaddersNameTheirDeclaration(t *testing.T) {
+	ladder := `  - label: ${target}-web
+    runs_on: billet-web
+    targets: [personal]
+    provider: firecracker
+    sizes: [2]
+    image: ubuntu-2404-x64
+`
+
+	_, err := Load(writeConfig(t, threeTargetConfig(t, ladder+ladder)))
+	if err == nil || !strings.Contains(err.Error(), `made twice, by "${target}-web" and "${target}-web"`) {
+		t.Errorf("Load = %v, want the collision blamed on the declaration as written", err)
+	}
+}

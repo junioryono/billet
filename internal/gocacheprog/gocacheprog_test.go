@@ -491,3 +491,42 @@ func TestAHitMarksItsFilesUsed(t *testing.T) {
 		}
 	}
 }
+
+// A REMOTE HIT THAT REUSES AN OUTPUT ALREADY ON DISK MARKS IT USED, as a local
+// hit does: the entry came from the node, the bytes from a restored cache.
+func TestARemoteHitReusingALocalOutputMarksItUsed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, body := bytes.Repeat([]byte{2}, 32), []byte("restored bytes")
+	output := digest(body)
+	path := filepath.Join(dir, output[:2], output+"-d")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-6 * 24 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeNode{objects: map[string][]byte{
+		"ac/" + hex.EncodeToString(action): entry{output: output, size: int64(len(body)), at: time.Unix(1, 0)}.encode(),
+	}}
+	node := httptest.NewServer(fake)
+	t.Cleanup(node.Close)
+
+	answers := exchange(t, Config{Dir: dir, Endpoint: node.URL, Token: "token"},
+		request{ID: 1, Command: "get", ActionID: action}, request{ID: 2, Command: "close"})
+	if answers[0].Miss || answers[0].DiskPath != path {
+		t.Fatalf("the remote hit answered %+v, want the output already on disk", answers[0])
+	}
+	if fake.casHits.Load() != 0 {
+		t.Errorf("the node was asked for bytes already on disk %d times", fake.casHits.Load())
+	}
+	if info, err := os.Stat(path); err != nil || time.Since(info.ModTime()) > time.Hour {
+		t.Errorf("the reused output still reads as unused: %v", err)
+	}
+}

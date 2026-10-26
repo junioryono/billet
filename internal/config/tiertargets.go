@@ -151,6 +151,7 @@ func ExpandTierTargets(tiers []Tier, targets []string) ([]Tier, error) {
 			one := t
 			one.Targets = TierTargets{}
 			one.Target = name
+			one.inventoryOnly = len(targets) == 0
 			// THE LABEL AS WRITTEN, which `sizes` has already suffixed when the
 			// entry was a ladder; expandOne kept the written one.
 			one.Declaration = t.Declaration
@@ -169,10 +170,10 @@ func ExpandTierTargets(tiers []Tier, targets []string) ([]Tier, error) {
 
 			if other, dup := fromDeclaration[one.Label]; dup {
 				errs = append(errs, fmt.Errorf("tier %q is made twice, by %q and %q; each target's "+
-					"tier needs a label of its own", one.Label, other, t.Label))
+					"tier needs a label of its own", one.Label, other, one.Declaration))
 			}
 
-			fromDeclaration[one.Label] = t.Label
+			fromDeclaration[one.Label] = one.Declaration
 
 			out = append(out, one)
 		}

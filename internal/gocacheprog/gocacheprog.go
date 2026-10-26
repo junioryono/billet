@@ -314,8 +314,11 @@ func (h *helper) fetch(ctx context.Context, action string) (entry, bool) {
 		return entry{}, false
 	}
 	// AN OUTPUT ALREADY ON DISK IS REUSED ONLY WHEN IT IS THE ENTRY'S: a damaged
-	// one, which local() refused, is fetched again rather than named.
-	if !h.holds(found) {
+	// one, which local() refused, is fetched again rather than named. One reused
+	// is marked used, as a local hit's is.
+	if h.holds(found) {
+		h.markUsed(h.outputPath(found.output))
+	} else {
 		body, ok := h.call(ctx, http.MethodGet, "cas/"+found.output, nil)
 		if !ok || int64(len(body)) != found.size || digest(body) != found.output {
 			return entry{}, false
