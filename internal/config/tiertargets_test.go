@@ -442,9 +442,11 @@ func TestANodesFileLoadsADefaultBranchDeclaration(t *testing.T) {
 
 	// AND THE CONTROL PLANE STILL REFUSES IT where no scope can be derived: an
 	// organization target names no repository.
-	if _, err := Load(writeConfig(t, withCache+declaration)); err == nil ||
-		!strings.Contains(err.Error(), "needs a static repository") {
-		t.Errorf("an organization target's default-branch declaration loaded: %v", err)
+	_, err = Load(writeConfig(t, withCache+declaration))
+	for _, want := range []string{"needs a static repository", "the Actions cache requires a static cache_scope"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("an organization target's default-branch declaration was answered %v, want %q", err, want)
+		}
 	}
 }
 

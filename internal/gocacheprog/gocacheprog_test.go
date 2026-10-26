@@ -530,3 +530,32 @@ func TestARemoteHitReusingALocalOutputMarksItUsed(t *testing.T) {
 		t.Errorf("the reused output still reads as unused: %v", err)
 	}
 }
+
+// A HIT ON A FILE USED WITHIN THE HOUR LEAVES ITS TIME ALONE, as the go
+// command's markUsed does, so a busy build is not a write per object.
+func TestAHitOnARecentlyUsedFileLeavesItsTime(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, body := bytes.Repeat([]byte{1}, 32), []byte("a fresh object")
+	sum := sha256.Sum256(body)
+	exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "put", ActionID: action, OutputID: sum[:], BodySize: int64(len(body))}, body,
+		request{ID: 2, Command: "close"})
+
+	o := hex.EncodeToString(sum[:])
+	path := filepath.Join(dir, o[:2], o+"-d")
+	recent := time.Now().Add(-30 * time.Minute).Truncate(time.Second)
+	if err := os.Chtimes(path, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	answers := exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "get", ActionID: action}, request{ID: 2, Command: "close"})
+	if answers[0].Miss {
+		t.Fatalf("the object was a miss: %+v", answers[0])
+	}
+	if info, err := os.Stat(path); err != nil || !info.ModTime().Equal(recent) {
+		t.Errorf("a file used within the hour had its time rewritten: %v", err)
+	}
+}
