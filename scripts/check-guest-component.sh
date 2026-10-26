@@ -2,6 +2,7 @@
 #
 # check-guest-component.sh present|absent NAME ROOT
 # check-guest-component.sh names
+# check-guest-component.sh installer NAME
 #
 # THE COMPONENTS BILLET MAY NOT SHIP (#584), and what each one leaves in an image:
 # its paths and the variables it adds to the job's environment. One list, read two
@@ -14,6 +15,8 @@
 #            trial completion asks this of a copy completed with each component,
 #            after GitHub's own tests for it passed.
 #   names    prints the components, one a line.
+#   installer prints GitHub's template step that installs NAME, which the
+#            completer runs; a template that has no such step does not offer NAME.
 #
 # ROOT is a directory holding the image's tree. `present` executes inside it with
 # chroot, so it needs root; `absent` only looks.
@@ -22,12 +25,25 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: check-guest-component.sh present|absent NAME ROOT, or names" >&2
+	echo "usage: check-guest-component.sh present|absent NAME ROOT, names, or installer NAME" >&2
 	exit 2
 }
 
 # THE NAMES ARE config.ImageComponents', which a test holds this list to.
 names() { printf '%s\n' android-sdk codeql firefox google-chrome microsoft-edge; }
+
+# installer prints the template step that installs NAME, the one the completer
+# runs, which a test holds it to.
+installer() {
+	case "$1" in
+	android-sdk) echo install-android-sdk.sh ;;
+	codeql) echo install-codeql-bundle.sh ;;
+	firefox) echo install-firefox.sh ;;
+	google-chrome) echo install-google-chrome.sh ;;
+	microsoft-edge) echo install-microsoft-edge.sh ;;
+	*) return 2 ;;
+	esac
+}
 
 # paths prints what NAME installs, one a line: an executable is marked x, a
 # directory d.
@@ -79,6 +95,25 @@ variables() {
 	esac
 }
 
+# versioned prints the NAME=PREFIX lines NAME's installer writes whose value goes on
+# with a version the build resolves: the Android NDK's, which GitHub's installer
+# sets because many builds read them. present asks that each value starts with its
+# prefix, compared as text, and is one directory directly under it, not a link,
+# holding the source.properties every NDK package has, which the runner can read;
+# absent that the name is not there at all.
+versioned() {
+	case "$1" in
+	android-sdk)
+		echo "ANDROID_NDK=/usr/local/lib/android/sdk/ndk/"
+		echo "ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/"
+		echo "ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/"
+		echo "ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/"
+		;;
+	codeql | firefox | google-chrome | microsoft-edge) ;;
+	*) return 1 ;;
+	esac
+}
+
 pass() { echo "  ok    $*"; }
 
 FAILED=0
@@ -105,24 +140,52 @@ absent() {
 		1) ;;
 		*) fail "could not read $env to see whether it names ${variable%%=*}" ;;
 		esac
-	done < <(variables "$name")
+	done < <(
+		variables "$name"
+		versioned "$name"
+	)
 	[ "$FAILED" -ne 0 ] || pass "$name is not in the image"
 }
 
-# present fails on every path NAME installs that ROOT lacks or cannot run, and
-# every variable of it the job's environment does not name exactly.
+# present fails on every path NAME installs that ROOT lacks or the runner cannot
+# run or read, as a job is the runner, and every variable of it the job's
+# environment does not name exactly.
 present() {
-	local name=$1 root=$2 kind path variable env="$2/etc/billet-image-env"
+	local name=$1 root=$2 kind path variable value env="$2/etc/billet-image-env"
 	while read -r kind path; do
 		case "$kind" in
-		x) chroot "$root" test -x "$path" || fail "$name: $path is not an executable in the completed image" ;;
-		d) chroot "$root" test -d "$path" || fail "$name: $path is not a directory in the completed image" ;;
+		x)
+			chroot --userspec=runner:runner "$root" test -x "$path" ||
+				fail "$name: $path is not an executable the runner can run in the completed image"
+			;;
+		d)
+			{ chroot --userspec=runner:runner "$root" test -d "$path" &&
+				chroot --userspec=runner:runner "$root" test -r "$path"; } ||
+				fail "$name: $path is not a directory the runner can read in the completed image"
+			;;
 		esac
 	done < <(paths "$name")
 	while IFS= read -r variable; do
 		[ -n "$variable" ] || continue
 		grep -qxF -- "$variable" "$env" || fail "$name: the job's environment does not say $variable"
 	done < <(variables "$name")
+	while IFS= read -r variable; do
+		[ -n "$variable" ] || continue
+		value=$(sed -n "s|^${variable%%=*}=||p" "$env") || value=
+		case "$value" in
+		"${variable#*=}". | "${variable#*=}".. | "${variable#*=}"*/*)
+			fail "$name: ${variable%%=*} names $value, which is not one directory directly under ${variable#*=}"
+			;;
+		"${variable#*=}"?*)
+			if ! chroot "$root" test -d "$value" || chroot "$root" test -L "$value"; then
+				fail "$name: ${variable%%=*} names $value, which is not a directory in the completed image"
+			elif ! chroot --userspec=runner:runner "$root" test -r "$value/source.properties"; then
+				fail "$name: ${variable%%=*} names $value, in which the runner reads no source.properties, so it is no NDK a job can use"
+			fi
+			;;
+		*) fail "$name: the job's environment does not set ${variable%%=*} to a path under ${variable#*=}" ;;
+		esac
+	done < <(versioned "$name")
 
 	case "$name" in
 	android-sdk) present_android_sdk "$root" ;;
@@ -166,6 +229,14 @@ case "${1:-}" in
 names)
 	[ "$#" -eq 1 ] || usage
 	names
+	exit 0
+	;;
+installer)
+	[ "$#" -eq 2 ] || usage
+	installer "$2" || {
+		echo "check-guest-component.sh: $2 is not a component billet completes" >&2
+		exit 2
+	}
 	exit 0
 	;;
 present | absent)

@@ -12,14 +12,22 @@ import (
 // componentCheck runs check-guest-component.sh MODE NAME ROOT, with `chroot` and
 // `id` stood in for so `present` runs without root: the stand-in chroot runs its
 // command with paths moved under the root, which follows no symlink the way a
-// real chroot would but asks the same questions.
+// real chroot would but asks the same questions. Asked as the runner
+// (--userspec=runner:runner) whether it may read, run or write a path the tree's
+// .closed-to-runner lists, it says no, as a mode the runner cannot pass would;
+// -d and the rest still answer, as they do for a real closed directory.
 func componentCheck(t *testing.T, mode, name, root string) (string, int) {
 	t.Helper()
 
 	fakes := t.TempDir()
 	for file, body := range map[string]string{
-		"id":     "#!/bin/sh\n[ \"$1\" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id \"$@\"\n",
-		"chroot": "#!/bin/bash\nroot=$1; shift\nargs=()\nfor a in \"$@\"; do case $a in /*) args+=(\"$root$a\") ;; *) args+=(\"$a\") ;; esac; done\nexec \"${args[@]}\"\n",
+		"id": "#!/bin/sh\n[ \"$1\" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id \"$@\"\n",
+		"chroot": "#!/bin/bash\nrunner=\ncase $1 in --userspec=runner:runner) runner=1; shift ;; --userspec=*) exit 125 ;; esac\n" +
+			"root=$1; shift\n" +
+			"if [ -n \"$runner\" ] && [ \"$1\" = test ]; then\n" +
+			"\tcase $2 in -r | -x | -w) ! grep -qxF -- \"$3\" \"$root/.closed-to-runner\" 2>/dev/null || exit 1 ;; esac\n" +
+			"fi\nargs=()\nfor a in \"$@\"; do\n" +
+			"\tcase $a in /*) args+=(\"$root$a\") ;; *) args+=(\"$a\") ;; esac\ndone\nexec \"${args[@]}\"\n",
 	} {
 		if err := forkSafeWriteFile(filepath.Join(fakes, file), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -70,8 +78,14 @@ func completedTree(t *testing.T, name string) string {
 	case "android-sdk":
 		write("usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager", "#!/bin/sh\n", 0o755)
 		dir("usr/local/lib/android/sdk/platforms/android-35", 0o777)
+		write("usr/local/lib/android/sdk/ndk/27.3.13750724/source.properties", "Pkg.Revision = 27.3.13750724\n", 0o644)
+		write("usr/local/lib/android/sdk/ndk/28.2.13676358/source.properties", "Pkg.Revision = 28.2.13676358\n", 0o644)
 		dir("usr/local/lib/android/sdk", 0o777)
-		env += "ANDROID_HOME=/usr/local/lib/android/sdk\nANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n"
+		env += "ANDROID_HOME=/usr/local/lib/android/sdk\nANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n" +
+			"ANDROID_NDK=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
+			"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
+			"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
+			"ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/28.2.13676358\n"
 	case "codeql":
 		write("opt/hostedtoolcache/CodeQL/2.23.3/x64/codeql/codeql", "#!/bin/sh\necho 2.23.3\n", 0o755)
 		write("opt/hostedtoolcache/CodeQL/2.23.3/x64/pinned-version", "", 0o644)
@@ -149,11 +163,76 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 
 			removeAll(t, filepath.Join(root, "usr", "bin", "chromedriver"))
 		}, "present", "/usr/bin/chromedriver is not an executable"},
+		// AS THE RUNNER, as a job is: root runs and reads what the runner cannot.
+		"a driver closed to the runner": {"google-chrome", func(t *testing.T, root string) {
+			t.Helper()
+
+			writeTreeFile(t, root, ".closed-to-runner", "/usr/bin/chromedriver\n")
+		}, "present", "/usr/bin/chromedriver is not an executable the runner can run"},
+		"a component's directory closed to the runner": {"microsoft-edge", func(t *testing.T, root string) {
+			t.Helper()
+
+			writeTreeFile(t, root, ".closed-to-runner", "/usr/local/share/edge_driver\n")
+		}, "present", "/usr/local/share/edge_driver is not a directory the runner can read"},
 		"a variable missing": {"microsoft-edge", func(t *testing.T, root string) {
 			t.Helper()
 
 			writeTreeFile(t, root, "etc/billet-image-env", "ImageOS=ubuntu24\n")
 		}, "present", "does not say EDGEWEBDRIVER=/usr/local/share/edge_driver"},
+		// A VERSIONED VARIABLE IS ASKED FOR TOO, by the path its value starts with.
+		"an NDK variable pointing elsewhere": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			env, err := os.ReadFile(filepath.Join(root, "etc", "billet-image-env"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writeTreeFile(t, root, "etc/billet-image-env", strings.Replace(string(env),
+				"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724", "ANDROID_NDK_ROOT=/opt/ndk", 1))
+		}, "present", "does not set ANDROID_NDK_ROOT to a path under /usr/local/lib/android/sdk/ndk/"},
+		// A PREFIX COMPARED AS TEXT IS STILL CLIMBED OUT OF WITH `..`.
+		"an NDK variable climbing out of the SDK": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			env, err := os.ReadFile(filepath.Join(root, "etc", "billet-image-env"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writeTreeFile(t, root, "etc/billet-image-env", strings.Replace(string(env),
+				"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724",
+				"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/../../../../../../usr", 1))
+		}, "present", "is not one directory directly under /usr/local/lib/android/sdk/ndk/"},
+		// A DIRECTORY WITHOUT AN NDK IN IT IS NOT ONE.
+		"an NDK directory with no NDK in it": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			removeAll(t, filepath.Join(root, "usr", "local", "lib", "android", "sdk", "ndk", "27.3.13750724", "source.properties"))
+		}, "present", "in which the runner reads no source.properties"},
+		// ROOT READS WHAT THE RUNNER CANNOT: the NDK is a job's only if the runner
+		// can read it.
+		"an NDK closed to the runner": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			writeTreeFile(t, root, ".closed-to-runner", "/usr/local/lib/android/sdk/ndk/27.3.13750724/source.properties\n")
+		}, "present", "ANDROID_NDK names /usr/local/lib/android/sdk/ndk/27.3.13750724, in which the runner reads no source.properties"},
+		// A LINK IS NOT THE NDK'S OWN DIRECTORY.
+		"an NDK variable naming a link": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			ndk := filepath.Join(root, "usr", "local", "lib", "android", "sdk", "ndk")
+			removeAll(t, filepath.Join(ndk, "28.2.13676358"))
+			if err := os.Symlink("27.3.13750724", filepath.Join(ndk, "28.2.13676358")); err != nil {
+				t.Fatal(err)
+			}
+		}, "present", "ANDROID_NDK_LATEST_HOME names /usr/local/lib/android/sdk/ndk/28.2.13676358, which is not a directory"},
+		// AND UNDER IT IS NOT ENOUGH: the NDK it names must be there.
+		"an NDK variable naming an NDK that is not there": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			removeAll(t, filepath.Join(root, "usr", "local", "lib", "android", "sdk", "ndk", "28.2.13676358"))
+		}, "present", "ANDROID_NDK_LATEST_HOME names /usr/local/lib/android/sdk/ndk/28.2.13676358, which is not a directory"},
 		"an SDK Gradle cannot write": {"android-sdk", func(t *testing.T, root string) {
 			t.Helper()
 
@@ -195,6 +274,15 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 	if out, status := componentCheck(t, "absent", "google-chrome", root); status != 1 ||
 		!strings.Contains(out, "the image carries /usr/bin/google-chrome") {
 		t.Errorf("a dangling link read as absent (%d):\n%s", status, out)
+	}
+
+	// AN NDK VARIABLE LEFT BEHIND STILL TELLS A JOB WHERE ANDROID IS, though the SDK
+	// is gone.
+	root = completedTree(t, "none")
+	writeTreeFile(t, root, "etc/billet-image-env", "ImageOS=ubuntu24\nANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/28.2.13676358\n")
+	if out, status := componentCheck(t, "absent", "android-sdk", root); status != 1 ||
+		!strings.Contains(out, "names ANDROID_NDK_LATEST_HOME, which only android-sdk sets") {
+		t.Errorf("a leftover NDK variable read as absent (%d):\n%s", status, out)
 	}
 
 	// A JOB ENVIRONMENT THAT CANNOT BE READ CANNOT SAY A VARIABLE IS ABSENT.
@@ -357,6 +445,7 @@ func TestTheGatePassesTheCompleterTheBuildInstalls(t *testing.T) {
 	}
 	root := t.TempDir()
 	script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nCOMPONENTS='android-sdk codeql '\n" +
+		"TOOLSET_FILE=" + filepath.Join(here, "..", "internal", "runnerimages", "toolset-2404.json") + "\n" +
 		guestImageFunction(t, "install_completer") + "\ninstall_completer \"$1\"\n"
 	path := filepath.Join(t.TempDir(), "install.sh")
 	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
@@ -437,4 +526,51 @@ func writeTreeFile(t *testing.T, root, path, body string) {
 	if err := forkSafeWriteFile(filepath.Join(root, path), []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// toolsetPathForTest is the pinned declaration, relative to scripts/.
+const toolsetPathForTest = "../internal/runnerimages/toolset-2404.json"
+
+// readScriptFile is a file under scripts/, or the test fails.
+func readScriptFile(t *testing.T, path string) string {
+	t.Helper()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	return string(raw)
+}
+
+// shellQuote single-quotes s for a shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// readBuildScript returns the guest build script.
+func readBuildScript(t *testing.T) string {
+	t.Helper()
+
+	return readScriptFile(t, "build-guest-image.sh")
+}
+
+// guestImageFunction returns one shell function from build-guest-image.sh, from
+// its definition to the brace that closes it.
+func guestImageFunction(t *testing.T, name string) string {
+	t.Helper()
+
+	source := readScriptFile(t, "build-guest-image.sh")
+
+	start := strings.Index(source, name+"() {")
+	if start < 0 {
+		t.Fatalf("build-guest-image.sh has no %s function", name)
+	}
+
+	end := strings.Index(source[start:], "\n}\n")
+	if end < 0 {
+		t.Fatalf("could not find the end of %s in build-guest-image.sh", name)
+	}
+
+	return source[start : start+end+2]
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -66,12 +67,17 @@ const (
 // caller may use it, because a schema is only meaningful beside the script it was
 // built from. Every caller discards it when generation fails.
 type reportSchema struct {
+	// begin and end frame the block: the verifier's report or the build's verdict.
+	begin string
+	end   string
 	keys  map[string]struct{}
 	steps map[string]struct{}
 }
 
-func newReportSchema() reportSchema {
+func newReportSchema(begin, end string) reportSchema {
 	return reportSchema{
+		begin: begin,
+		end:   end,
 		keys:  map[string]struct{}{},
 		steps: map[string]struct{}{},
 	}
@@ -204,13 +210,120 @@ var verifyNonce = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // it. Lowercase, because the toolcache names it is derived from are not.
 var reportKey = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 
+// toolcacheName is what a toolcache directory named by the declaration may be
+// before it is interpolated into the script. The digest on the declaration proves
+// provenance, not that its strings are safe shell syntax.
+var toolcacheName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_+-]{0,31}$`)
+
+// componentsFile is where the build records the components it installed, one
+// line of `name:version` joined by commas; the verifier reports it back and the
+// promotion stamps it.
+const componentsFile = "/etc/billet-image-components"
+
+// componentPaths is what each component leaves in an image that a job runs or
+// reads: an executable marked x, a directory d. A test holds it to
+// check-guest-component.sh's own list, which the build's `present` asked; the
+// verifier asks the runner to execute each x and read each d, and componentRuns
+// what a path alone cannot prove.
+var componentPaths = map[string][]string{
+	"android-sdk": {"d /usr/local/lib/android/sdk", "x /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"},
+	"codeql":      {"d /opt/hostedtoolcache/CodeQL"},
+	"firefox":     {"x /usr/bin/firefox", "d /usr/local/share/gecko_driver", "x /usr/bin/geckodriver"},
+	"google-chrome": {"x /usr/bin/google-chrome", "d /opt/google/chrome",
+		"d /usr/local/share/chromedriver-linux64", "x /usr/bin/chromedriver",
+		"d /usr/local/share/chromium", "x /usr/bin/chromium"},
+	"microsoft-edge": {"x /usr/bin/microsoft-edge", "d /usr/local/share/edge_driver", "x /usr/bin/msedgedriver"},
+}
+
+// componentVariables is what each component's installer adds to the job's
+// environment, line for line, and componentVariablePrefixes the lines whose value
+// goes on with a version, by the path it starts with. An image that records the
+// component carries each; one that does not names none of them. A test holds both
+// to check-guest-component.sh's own lists, which the build's `present` and `absent`
+// asked.
+var (
+	componentVariables = map[string][]string{
+		"android-sdk": {"ANDROID_HOME=/usr/local/lib/android/sdk",
+			"ANDROID_SDK_ROOT=/usr/local/lib/android/sdk"},
+		"codeql":  nil,
+		"firefox": {"GECKOWEBDRIVER=/usr/local/share/gecko_driver"},
+		"google-chrome": {"CHROME_BIN=/usr/bin/google-chrome",
+			"CHROMEWEBDRIVER=/usr/local/share/chromedriver-linux64"},
+		"microsoft-edge": {"EDGEWEBDRIVER=/usr/local/share/edge_driver"},
+	}
+	componentVariablePrefixes = map[string][]string{
+		"android-sdk": {"ANDROID_NDK=/usr/local/lib/android/sdk/ndk/",
+			"ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/",
+			"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/",
+			"ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/"},
+		"codeql":         nil,
+		"firefox":        nil,
+		"google-chrome":  nil,
+		"microsoft-edge": nil,
+	}
+)
+
+// componentVariableNames is every variable a component's installer sets.
+func componentVariableNames(name string) []string {
+	lines := slices.Concat(componentVariables[name], componentVariablePrefixes[name])
+	out := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		variable, _, _ := strings.Cut(line, "=")
+		out = append(out, variable)
+	}
+
+	return out
+}
+
+// componentRuns is what the runner executes for a component whose paths prove
+// nothing about whether it works. CodeQL's only path is the toolcache directory,
+// which an empty or broken entry also satisfies, so its bundle is run.
+//
+// EACH RUNS AS `sh -c RUN sh "$billet_root"`, so a path in it is under "$1".
+var componentRuns = map[string]string{
+	"codeql": "for c in \"$1\"/opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql; do " +
+		"\"$c\" version >/dev/null 2>&1 && exit 0; done; exit 1",
+}
+
+// toolchain is one toolchain a job finds on PATH, and the arguments that make it
+// say its version.
+type toolchain struct {
+	name string
+	args string
+}
+
+// toolchainsFor is what the verifier runs through the job's own path on an image
+// of arch: the languages GitHub's template installs that a workflow calls by name
+// rather than through a setup action (ADR-022). Haskell is x64's alone, because
+// GitHub's arm64 image has none.
+func toolchainsFor(arch string) []toolchain {
+	out := []toolchain{
+		{"rustc", "--version"},
+		{"cargo", "--version"},
+		{"swift", "--version"},
+		{"go", "version"},
+		{"node", "--version"},
+		{"python3", "--version"},
+		{"java", "-version"},
+		{"dotnet", "--version"},
+		{"pwsh", "--version"},
+	}
+
+	if arch == "x64" {
+		out = append(out, toolchain{"ghc", "--version"})
+	}
+
+	return out
+}
+
 // verifyScript is what a machine booted from the produced AMI runs.
 //
 // NO `set -x`, AND THAT IS NOT A STYLE CHOICE. EC2 keeps the last 64 KiB of
 // console output; a trace of the toolcache gate would push the report out of that
 // window and leave billet reading a boot log with no answer in it.
 func verifyScript(arch string, contract int, nonce string) (string, reportSchema, error) {
-	schema := newReportSchema()
+	schema := newReportSchema(reportBegin, reportEnd)
 
 	if arch != "x64" && arch != "arm64" {
 		return "", schema, fmt.Errorf("ec2: cannot verify an image for architecture %q, which "+
@@ -223,13 +336,12 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 
 	var (
 		b     strings.Builder
-		ts    runnerimages.Toolset
 		tools []toolReport
-		err   error
 	)
 
 	if contract >= 2 {
-		if ts, err = runnerimages.Load(); err != nil {
+		ts, err := runnerimages.LoadFor(arch)
+		if err != nil {
 			return "", schema, fmt.Errorf("ec2: %w", err)
 		}
 
@@ -318,18 +430,12 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 		b.WriteString("billet_toolcache_kib=$(du -sk " + toolcacheDir +
 			" 2>/dev/null | awk '{ print $1 }')\n")
 
-		// THE SAME GATE THE BUILD RUNS, WITH THE TWO DIFFERENCES THAT MATTER: every
-		// tool is executed through the privilege drop, and each check names itself
-		// first so a failure can be reported as the declared line it was about.
-		if err := writeToolcacheGate(&b, ts, arch, gateOptions{
-			RunPrefix: verifyRunAsRunner + " ",
-			StepVar:   verifyStepVar,
-			Record:    func(label string) { schema.steps[label] = struct{}{} },
-		}); err != nil {
-			return "", schema, err
-		}
-
 		writeVerifyToolcacheInventory(&b, tools)
+	}
+
+	if contract >= 4 {
+		writeVerifyToolchains(&b, step, arch)
+		writeVerifyComponents(&b, step)
 	}
 
 	step("done")
@@ -355,16 +461,12 @@ func toolReports(ts runnerimages.Toolset) ([]toolReport, error) {
 	names := make([]string, 0, len(ts.Toolcache)+1)
 
 	for _, entry := range ts.Toolcache {
-		// ONLY WHAT THE INSTALLERS BAKE, matching the gate: listing a tool billet does
-		// not install would report an empty line as though something were missing.
-		if toolcacheBinary(entry.Name) == "" {
-			continue
+		if !slices.Contains(names, entry.Name) {
+			names = append(names, entry.Name)
 		}
-
-		names = append(names, entry.Name)
 	}
 
-	if len(ts.Java.Versions) > 0 {
+	if len(ts.Java.Versions) > 0 && !slices.Contains(names, "Java_Temurin-Hotspot_jdk") {
 		names = append(names, "Java_Temurin-Hotspot_jdk")
 	}
 
@@ -393,6 +495,16 @@ func toolReports(ts runnerimages.Toolset) ([]toolReport, error) {
 		if !reportKey.MatchString(key) {
 			return nil, fmt.Errorf("ec2: the toolcache name %q becomes the report key %q, which "+
 				"billet will not render", name, key)
+		}
+
+		// AND REFUSED WHEN TWO NAMES SHARE A KEY. The parser refuses a report that
+		// names a key twice, so a collision would leave every verification with no
+		// report at all, timing out rather than saying why.
+		for _, earlier := range out {
+			if earlier.key == key {
+				return nil, fmt.Errorf("ec2: the toolcache names %q and %q both become the report "+
+					"key %q", earlier.dir, name, key)
+			}
 		}
 
 		out = append(out, toolReport{dir: name, key: key})
@@ -508,12 +620,164 @@ func writeVerifyEntryPoint(b *strings.Builder, step func(string)) {
 	}
 }
 
+// writeVerifyToolchains runs each of arch's toolchains the way a job's step
+// does: as the runner, under `env -i`, finding it on the image's own PATH.
+//
+// GITHUB'S PESTER SUITE, RUN DURING THE BUILD, IS THE PARITY GATE (ADR-014). This
+// is the other half, which no build-time test can be: the toolchains on a machine
+// booted from the produced image, reached through the entry point's privilege
+// drop and environment rather than root's.
+//
+// `sh -c`, BECAUSE THE PREFIX ENDS IN env, WHICH CAN ONLY EXEC A FILE: the command
+// word is resolved by a shell inside the runner's environment, which is the lookup
+// a workflow's `run:` makes.
+func writeVerifyToolchains(b *strings.Builder, step func(string), arch string) {
+	for _, tc := range toolchainsFor(arch) {
+		step("toolchain " + tc.name)
+
+		b.WriteString(verifyRunAsRunner + " sh -c '" + tc.name + " " + tc.args +
+			"' >/dev/null 2>&1 || { echo '" + tc.name + " does not run as the runner' >&2; exit 1; }\n")
+	}
+}
+
+// writeVerifyComponents reports the components the build recorded and proves each
+// one is there for the runner: its executables run-ready, its directories readable,
+// through the job's own path, and its variables in the job's environment.
+//
+// THE RECORD MUST EXIST, EMPTY OR NOT. An image with no record is one no contract-4
+// build finished, and "none" and "unknown" are different answers.
+func writeVerifyComponents(b *strings.Builder, step func(string)) {
+	step("components")
+
+	b.WriteString("test -r " + componentsFile + "\n")
+
+	// ONE LINE OF A LIST OR NOTHING REACHES THE REPORT: the record is the image's
+	// text, and a second line of it would be a report line of its own choosing. A
+	// newline is outside the list's characters, so the one check refuses both.
+	b.WriteString("billet_record=$(cat " + componentsFile + ")\n")
+	b.WriteString("case \"$billet_record\" in *[!A-Za-z0-9:.,+~_-]*) " +
+		"echo 'the components record is not a list of name:version' >&2; exit 1 ;; esac\n")
+	b.WriteString("billet_components=$billet_record\n")
+
+	// TWO QUESTIONS OF THE JOB'S ENVIRONMENT, asked of the runner, so the answer is
+	// the value a job receives rather than a line of the file, which a later line or
+	// a last line without its newline would make a different thing: whether NAME is
+	// VALUE, and whether it is one directory directly under PREFIX, compared as
+	// text, that is not a link and whose source.properties (every NDK package has
+	// one) the runner can read, which a directory closed to it is not. Functions, because the script has a size to keep.
+	// billet_root is empty here and lets a test point the paths at a fixture.
+	b.WriteString("billet_root=''\n")
+	b.WriteString("billet_says() { [ \"$(" + verifyRunAsRunner + " printenv \"$1\")\" = \"$2\" ]; }\n")
+	b.WriteString("billet_sets() { billet_v=$(" + verifyRunAsRunner + " printenv \"$1\") || return 1; " +
+		"case \"$billet_v\" in \"$2\".|\"$2\"..|\"$2\"*/*) false ;; \"$2\"?*) " + verifyRunAsRunner +
+		" test ! -L \"$billet_root$billet_v\" && " + verifyRunAsRunner +
+		" test -r \"$billet_root$billet_v/source.properties\" ;; *) false ;; esac; }\n")
+
+	// A PATH, AS THE RUNNER, under billet_root: an executable that runs (an
+	// executable that does not is still executable, so each says its version) and a
+	// directory it can read (one it cannot is still a directory). Functions, for the
+	// script's size, and so a test points every path at its fixture through
+	// billet_root alone, whoever asks.
+	b.WriteString("billet_x() { " + verifyRunAsRunner + " test -x \"$billet_root$1\" && " +
+		verifyRunAsRunner + " \"$billet_root$1\" --version >/dev/null 2>&1; }\n")
+	b.WriteString("billet_d() { " + verifyRunAsRunner + " test -d \"$billet_root$1\" && " +
+		verifyRunAsRunner + " test -r \"$billet_root$1\"; }\n")
+
+	// SPLIT BY THE SHELL ITSELF: a command splitting it could fail with nothing
+	// printed, and `for` would then check no component and fail nothing. The list's
+	// characters hold no glob, and IFS is the shell's own again inside the loop.
+	b.WriteString("billet_ifs=$IFS\n")
+	b.WriteString("IFS=,\n")
+	b.WriteString("for billet_c in $billet_components; do\n")
+	b.WriteString("  IFS=$billet_ifs\n")
+	b.WriteString("  case \"${billet_c%%:*}\" in\n")
+
+	names := make([]string, 0, len(componentPaths))
+	for name := range componentPaths {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	for _, name := range names {
+		var checks []string
+
+		for _, entry := range componentPaths[name] {
+			kind, path, _ := strings.Cut(entry, " ")
+
+			switch {
+			case kind == "d":
+				checks = append(checks, "billet_d "+path)
+			// sdkmanager IS THE EXCEPTION, a script whose --version needs the
+			// network and a JDK it finds on its own.
+			case strings.HasSuffix(path, "/sdkmanager"):
+				checks = append(checks, verifyRunAsRunner+" test -x \"$billet_root\""+path)
+			default:
+				checks = append(checks, "billet_x "+path)
+			}
+		}
+
+		if run, ok := componentRuns[name]; ok {
+			checks = append(checks, verifyRunAsRunner+" sh -c '"+run+"' sh \"$billet_root\"")
+		}
+
+		// AND THE JOB IS TOLD WHERE IT IS, as GitHub's installer tells it: a
+		// component a workflow cannot find through its variable is not one it has.
+		for _, line := range componentVariables[name] {
+			variable, value, _ := strings.Cut(line, "=")
+			checks = append(checks, "billet_says "+variable+" "+value)
+		}
+
+		for _, line := range componentVariablePrefixes[name] {
+			variable, prefix, _ := strings.Cut(line, "=")
+			checks = append(checks, "billet_sets "+variable+" "+prefix)
+		}
+
+		b.WriteString("    " + name + ") " + strings.Join(checks, " && ") + " ;;\n")
+	}
+
+	b.WriteString("    *) false ;;\n")
+	b.WriteString("  esac || { echo \"the image records $billet_c and does not carry it for the runner\" >&2; exit 1; }\n")
+	b.WriteString("done\n")
+	b.WriteString("IFS=$billet_ifs\n")
+
+	// AND WHAT IT DOES NOT RECORD, IT DOES NOT CARRY. A base image may hold a
+	// component nobody accepted, and the record would then be a claim the image
+	// does not meet. Looked for as root, under billet_root.
+
+	// grep's status is three-valued, and a file it could not read names nothing
+	// only by accident, so the file is proved readable and a status 2 is present.
+	b.WriteString("test -r \"$billet_root\"" + imageEnvFile + " || " +
+		"{ echo 'the job environment cannot be read' >&2; exit 1; }\n")
+	b.WriteString("billet_names() { grep -q \"^$1=\" \"$billet_root\"" + imageEnvFile + "; [ $? -ne 1 ]; }\n")
+	b.WriteString("billet_has() { [ -e \"$billet_root$1\" ] || [ -L \"$billet_root$1\" ]; }\n")
+
+	for _, name := range names {
+		var present []string
+
+		for _, entry := range componentPaths[name] {
+			_, path, _ := strings.Cut(entry, " ")
+			present = append(present, "billet_has "+path)
+		}
+
+		// AND THE JOB'S ENVIRONMENT NAMES NONE OF ITS VARIABLES, as the build's own
+		// absence check asked: a variable pointing at nothing is what a job reads.
+		for _, variable := range componentVariableNames(name) {
+			present = append(present, "billet_names "+variable)
+		}
+
+		b.WriteString("case \",$billet_components,\" in *\"," + name + ":\"*) ;; *) if " +
+			strings.Join(present, " || ") + "; then echo \"the image carries " + name +
+			", which it does not record\" >&2; exit 1; fi ;; esac\n")
+	}
+}
+
 // writeVerifyToolcacheInventory records what the image holds, per tool.
 //
-// FOR THE OPERATOR TO READ, NOT FOR THE VERDICT. The gate above decides whether a
-// declared line resolves and runs; this lists the entries beside it so a report
-// says "node 22.23.2 24.20.0" rather than only "ok", which is the difference
-// between a check and something worth looking at.
+// FOR THE OPERATOR TO READ, NOT FOR THE VERDICT. GitHub's own tests decided, during
+// the build, whether each declared line resolves and runs; this lists the entries so
+// a report says "node 22.23.2 24.20.0" rather than only "ok", which is the
+// difference between a check and something worth looking at.
 func writeVerifyToolcacheInventory(b *strings.Builder, tools []toolReport) {
 	for _, t := range tools {
 		b.WriteString("billet_" + t.key + "=$(ls " + toolcacheDir + "/" + t.dir +
@@ -549,7 +813,7 @@ func writeVerifyReport(b *strings.Builder, schema reportSchema, nonce string, to
 	for _, field := range []string{
 		"root_total_kib", "root_used_kib", "root_free_kib",
 		"docker_server", "docker_driver", "docker_root",
-		"toolcache_kib", "runner",
+		"toolcache_kib", "runner", buildComponentsKey,
 	} {
 		schema.keys[field] = struct{}{}
 		b.WriteString("  echo \"" + field + "=${billet_" + field + ":-}\"\n")

@@ -151,7 +151,7 @@ func TestAScriptTooLargeEvenCompressedIsRefusedBeforeABuilderExists(t *testing.T
 func TestTheRealProvisionScriptReportsItsUserDataHeadroom(t *testing.T) {
 	t.Parallel()
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.336.0", Arch: "x64"})
+	script, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.336.0", Arch: "x64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -277,11 +277,11 @@ func TestLaunchBuilderRefusesAnUndeliverableScriptBeforeRunInstances(t *testing.
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	_, err := p.launchBuilder(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	_, err := p.launchBuilder(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}, script)

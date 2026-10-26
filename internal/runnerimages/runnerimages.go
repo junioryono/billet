@@ -17,8 +17,9 @@
 // ONE MANIFEST, TWO BACKENDS. The firecracker guest image and the ec2 AMI used to
 // carry two hand-maintained package lists in two languages, which is the same shape
 // as the runner-version bug `runnerrelease` exists to prevent: two pins is one pin
-// that is wrong. The shell build reads this same file through `jq`, so a package
-// added for one backend cannot silently miss the other.
+// that is wrong. Both now run GitHub's own template against these declarations
+// (ADR-022), the guest gate reads them through `jq`, and the AMI verifier lists the
+// toolcache they name.
 //
 // PINNED, NOT TRACKED. An image is a thing you reproduce. Reading upstream `main` at
 // build time would make two runs of the same command produce different images, and
@@ -31,6 +32,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -44,6 +46,11 @@ import (
 // the digest names a file nobody has, or the commit claims a revision the bytes did
 // not come from. Together, a refresh is one line and cannot be half done.
 //
+// THE ARM64 DECLARATION IS THE SECOND LINE, `arm64 <sha256>`, at the same commit:
+// GitHub's arm64 template reads a toolset of its own (ADR-022), and one commit for
+// both keeps the two architectures' images from two upstream revisions. The first
+// line stays exactly what it was, because the guest build reads it.
+//
 //go:embed pinned.txt
 var pinned string
 
@@ -51,6 +58,11 @@ var pinned string
 //
 //go:embed toolset-2404.json
 var toolset []byte
+
+// toolsetArm64 is GitHub's declaration of the ubuntu-24.04 arm64 image, verbatim.
+//
+//go:embed toolset-2404-arm64.json
+var toolsetArm64 []byte
 
 // aptAliases maps a declared package name to one apt can actually install.
 //
@@ -60,26 +72,106 @@ var toolset []byte
 // every deviation from what GitHub declared is one line in a file that exists to
 // list deviations.
 //
-// APPLIED HERE AS WELL AS IN THE SHELL BUILD, because this is what will drive the
-// ec2 AMI. A mapping applied to one backend and not the other is the two-pins
-// problem this package was created to remove — the ec2 build would hit the exact
-// failure that took down the first end-to-end guest build.
+// APPLIED HERE AS WELL AS IN THE GUEST GATE, so the gate's own reading of the
+// declaration is held to this one by test: a mapping applied by one reader and not
+// the other is the two-pins problem this package was created to remove.
 //
 //go:embed apt-aliases.json
 var aptAliases []byte
 
-// PinnedCommit is the actions/runner-images revision toolset-2404.json came from.
+// PinnedCommit is the actions/runner-images revision both vendored toolsets came from.
 func PinnedCommit() string {
 	commit, _, _ := strings.Cut(strings.TrimSpace(pinned), " ")
 
 	return commit
 }
 
-// PinnedSHA256 is the digest of the vendored toolset as it should be on disk.
+// PinnedFile is pinned.txt as it is vendored, which the template runner checks a
+// toolset against when it runs from the EC2 builder's payload rather than a checkout.
+func PinnedFile() []byte {
+	return []byte(pinned)
+}
+
+// PinnedSHA256 is the digest of the vendored x64 toolset as it should be on disk.
 func PinnedSHA256() string {
-	_, sum, _ := strings.Cut(strings.TrimSpace(pinned), " ")
+	first, _, _ := strings.Cut(strings.TrimSpace(pinned), "\n")
+	_, sum, _ := strings.Cut(strings.TrimSpace(first), " ")
 
 	return strings.TrimSpace(sum)
+}
+
+// The architectures GitHub publishes an ubuntu-24.04 declaration for, spelled as
+// billet's AMI and the tool cache spell them.
+const (
+	ArchX64   = "x64"
+	ArchArm64 = "arm64"
+)
+
+// PinnedSHA256For is the digest the vendored toolset of arch must have, or an
+// error for an architecture billet vendors no declaration for.
+func PinnedSHA256For(arch string) (string, error) {
+	switch arch {
+	case ArchX64:
+		return PinnedSHA256(), nil
+	case ArchArm64:
+		for _, line := range strings.Split(strings.TrimSpace(pinned), "\n")[1:] {
+			name, sum, ok := strings.Cut(strings.TrimSpace(line), " ")
+			if ok && name == ArchArm64 {
+				return strings.TrimSpace(sum), nil
+			}
+		}
+
+		return "", fmt.Errorf("runnerimages: pinned.txt names no digest for the arm64 toolset")
+	default:
+		return "", fmt.Errorf("runnerimages: %q is not an architecture billet vendors a toolset for", arch)
+	}
+}
+
+// ToolsetFileFor is the vendored declaration's file name for arch, as GitHub names it.
+func ToolsetFileFor(arch string) (string, error) {
+	switch arch {
+	case ArchX64:
+		return "toolset-2404.json", nil
+	case ArchArm64:
+		return "toolset-2404-arm64.json", nil
+	default:
+		return "", fmt.Errorf("runnerimages: %q is not an architecture billet vendors a toolset for", arch)
+	}
+}
+
+// ToolsetBytesFor is the vendored declaration of arch, verified against its pin and
+// returned as a copy.
+func ToolsetBytesFor(arch string) ([]byte, error) {
+	data := toolset
+	if arch == ArchArm64 {
+		data = toolsetArm64
+	}
+
+	want, err := PinnedSHA256For(arch)
+	if err != nil {
+		return nil, err
+	}
+
+	return verifiedCopy(arch, data, want)
+}
+
+// verifiedCopy is data held to want and copied, or an error naming where arch's
+// declaration comes from: the check ToolsetBytesFor makes, apart from the embedded
+// bytes so a test can hand it wrong ones.
+func verifiedCopy(arch string, data []byte, want string) ([]byte, error) {
+	if err := verifyToolsetBytes(data, want); err != nil {
+		source, urlErr := SourceURLFor(arch)
+		if urlErr != nil {
+			return nil, errors.Join(err, urlErr)
+		}
+
+		return nil, fmt.Errorf("%w; refresh both together from %s, or restore the file", err, source)
+	}
+
+	out := make([]byte, len(data))
+	copy(out, data)
+
+	return out, nil
 }
 
 // ToolsetBytes is the vendored file exactly as it is on disk.
@@ -98,6 +190,17 @@ func ToolsetBytes() []byte {
 func SourceURL() string {
 	return "https://raw.githubusercontent.com/actions/runner-images/" + PinnedCommit() +
 		"/images/ubuntu/toolsets/toolset-2404.json"
+}
+
+// SourceURLFor names where the vendored declaration of arch came from.
+func SourceURLFor(arch string) (string, error) {
+	file, err := ToolsetFileFor(arch)
+	if err != nil {
+		return "", err
+	}
+
+	return "https://raw.githubusercontent.com/actions/runner-images/" + PinnedCommit() +
+		"/images/ubuntu/toolsets/" + file, nil
 }
 
 // Toolset is the half of GitHub's declaration billet acts on.
@@ -259,12 +362,20 @@ type NodeModule struct {
 // duplicate comparison worked. A guard nothing can drive with wrong input is a
 // guard nothing has checked.
 func VerifyToolset(data []byte, wantDigest string) error {
+	if err := verifyToolsetBytes(data, wantDigest); err != nil {
+		return fmt.Errorf("%w; refresh both together from %s, or restore the file", err, SourceURL())
+	}
+
+	return nil
+}
+
+// verifyToolsetBytes is the comparison alone, naming no architecture's source.
+func verifyToolsetBytes(data []byte, wantDigest string) error {
 	sum := sha256.Sum256(data)
 
 	if got := hex.EncodeToString(sum[:]); got != wantDigest {
-		return fmt.Errorf("runnerimages: the vendored toolset hashes to %s and pinned.txt "+
-			"names %s; refresh both together from %s, or restore the file",
-			got, wantDigest, SourceURL())
+		return fmt.Errorf("runnerimages: the vendored toolset hashes to %s and pinned.txt names %s",
+			got, wantDigest)
 	}
 
 	return nil
@@ -306,6 +417,23 @@ func Load() (Toolset, error) {
 	// to, with no error anywhere.
 	if err := ValidateAptAliases(); err != nil {
 		return Toolset{}, err
+	}
+
+	return out, nil
+}
+
+// LoadFor is the vendored declaration of arch, verified against its pin and
+// parsed, with unknown fields allowed for the reason Load gives.
+func LoadFor(arch string) (Toolset, error) {
+	data, err := ToolsetBytesFor(arch)
+	if err != nil {
+		return Toolset{}, err
+	}
+
+	var out Toolset
+
+	if err := json.Unmarshal(data, &out); err != nil {
+		return Toolset{}, fmt.Errorf("runnerimages: parse the vendored %s toolset: %w", arch, err)
 	}
 
 	return out, nil
@@ -498,154 +626,4 @@ func ValidateAptAliases() error {
 	return fmt.Errorf("runnerimages: apt-aliases.json maps %s to nothing installable; an "+
 		"entry needs a non-empty \"install\", and a comment key must start with \"_\"",
 		strings.Join(bad, ", "))
-}
-
-// JavaHomeVars is the JAVA_HOME_<version>_X64 environment every hosted image sets.
-//
-// THESE ARE NOT DECORATION. setup-java reads JAVA_HOME_<version>_X64 to find a JDK
-// already on the machine, and a workflow that pins a toolchain by environment
-// variable rather than by action reads them directly. An image carrying the JDKs
-// without the variables has them installed and unfindable, which is the toolcache
-// failure one directory over: nothing errors, the job just does the slow thing.
-func (t Toolset) JavaHomeVars(root string) map[string]string {
-	out := make(map[string]string, len(t.Java.Versions)+1)
-
-	for _, v := range t.Java.Versions {
-		if v == "" {
-			continue
-		}
-
-		out["JAVA_HOME_"+v+"_X64"] = root + "/temurin-" + v + "-jdk-amd64"
-	}
-
-	if t.Java.Default != "" {
-		out["JAVA_HOME"] = root + "/temurin-" + t.Java.Default + "-jdk-amd64"
-	}
-
-	return out
-}
-
-// InstallToolcacheScript is the toolcache installers both backends run.
-//
-// EMBEDDED AND ALSO SOURCED FROM DISK, deliberately: scripts/build-guest-image.sh
-// dots this same file in by path, so there is one implementation rather than a Go
-// copy and a shell copy that drift. The EC2 backend has no path to it on the
-// builder, so it carries these bytes in the provisioning script.
-//
-//go:embed install-toolcache.sh
-var InstallToolcacheScript string
-
-// installerKeys are the top-level sections install-toolcache.sh reads.
-//
-// EVERY ONE IS A jq EXPRESSION IN THAT FILE, and a section missing here reaches
-// the builder as an empty answer -- which the installers treat as "the toolset
-// declares no cmake version" and refuse. That is not hypothetical: shipping only
-// toolcache and java, while the installers had grown to read seven more, failed a
-// real build four minutes in, immediately after the last toolcache entry, with a
-// message about a declaration rather than about a projection.
-//
-// TestTheProjectionAnswersEveryReaderTheSameWay is what keeps this honest, because
-// it RUNS each reader against both the full file and this subset and requires the
-// same answer. A key added to the shell without being added here fails it.
-var installerKeys = []string{
-	"toolcache",         // every tool's version globs, and Ruby's platform_version
-	"java",              // the JDK versions and the default
-	"cmake",             // a pinned version, not apt's
-	"pwsh",              // a line, resolved to the newest non-prerelease tag
-	"dotnet",            // the SDK channels
-	"node",              // which line a bare `node` on PATH should be
-	"pipx",              // the packages and the commands they provide
-	"node_modules",      // the globals installed through the default node
-	"rubygems",          // the gems installed through the default ruby
-	"clang",             // WHICH major the unsuffixed clang must be; apt creates none
-	"powershellModules", // installed through PSGallery, two of the four pinned
-	"azureModules",      // the same mechanism, a second list upstream maintains apart
-	"android",           // the SDK, its platforms, build-tools and NDKs
-	"php",               // the versions whose extension set the hosted tools install
-	"postgresql",        // the server major the hosted tools install from PGDG
-}
-
-// InstallerToolset is the declaration the installers read, and nothing else.
-//
-// THE APT SECTIONS STAY BEHIND. `.apt` and the compiler sections are read on THIS
-// side and interpolated as a command rather than shipped as data, and the dozen
-// upstream keys nothing reads -- android, brew, selenium and the rest -- are what
-// makes the full file cost five times this one.
-//
-// IT EXISTS FOR A BUDGET, AND THE BUDGET IS THE REASON TO BE CAREFUL. The EC2
-// backend delivers the whole provisioning script through user data, which EC2
-// caps at 16384 bytes; the full declaration costs 1673 of those compressed and
-// this costs 329. That is the difference between an image that can carry a
-// toolcache for both architectures and one that cannot.
-//
-// A SUBSET IS A SECOND REPRESENTATION, WHICH IS THE RISK. If this ever drops a key
-// an installer reads, the installer sees an empty answer -- and read_toolset_versions
-// refuses an empty answer loudly, which is the shape that saves it. The stronger
-// guard is TestTheProjectionAnswersEveryReaderTheSameWay, which runs the shell's
-// own readers against both this and the full file and requires identical answers.
-func InstallerToolset() ([]byte, error) {
-	var full map[string]json.RawMessage
-
-	if err := json.Unmarshal(toolset, &full); err != nil {
-		return nil, fmt.Errorf("runnerimages: parse the vendored toolset: %w", err)
-	}
-
-	// SORTED, SO THE OUTPUT IS THE SAME EVERY TIME. This is hashed and the digest
-	// travels beside it; a map iteration order would make the digest differ
-	// between two runs of the same build and turn the check into a coin toss.
-	out := make(map[string]json.RawMessage, len(installerKeys))
-
-	for _, key := range installerKeys {
-		v, ok := full[key]
-		if !ok {
-			return nil, fmt.Errorf("runnerimages: the vendored toolset has no %q section, "+
-				"which an installer reads", key)
-		}
-
-		out[key] = v
-	}
-
-	// json.Marshal on a map sorts keys, so this is deterministic.
-	b, err := json.Marshal(out)
-	if err != nil {
-		return nil, fmt.Errorf("runnerimages: render the installer toolset: %w", err)
-	}
-
-	// A TRAILING NEWLINE, BECAUSE THE THING THAT GETS HASHED IS A FILE.
-	//
-	// This travels in a heredoc, which ends the document on a line of its own and
-	// therefore terminates the payload's last line whether or not it had one. So a
-	// projection without a newline is hashed here as N bytes and lands on the
-	// builder as N+1 -- the digests disagree, and the check refuses EVERY build
-	// rather than a tampered one. The full declaration ends with a newline the way
-	// files do, which is why nothing noticed until it was replaced.
-	return append(b, '\n'), nil
-}
-
-// InstallerToolsetSHA256 is the digest of what InstallerToolset returns.
-//
-// NOT PinnedSHA256, AND THE DIFFERENCE IS WORTH STATING. The pinned digest proves
-// the vendored file is upstream's; this one proves the script received exactly
-// what billet sent. Load has already checked the first before this can be called,
-// so the chain is: upstream's file, verified here, projected here, and the
-// projection verified on the builder.
-func InstallerToolsetSHA256() (string, error) {
-	b, err := InstallerToolset()
-	if err != nil {
-		return "", err
-	}
-
-	sum := sha256.Sum256(b)
-
-	return hex.EncodeToString(sum[:]), nil
-}
-
-// ToolsetJSON is the pinned declaration, verbatim.
-//
-// VERBATIM IS THE POINT. The EC2 build carries these bytes to its builder and
-// checks PinnedSHA256 against them THERE, so what the installers read is what the
-// pin names rather than something billet reshaped in transit. Callers that want
-// the parsed form use Load; this is for delivery.
-func ToolsetJSON() string {
-	return string(toolset)
 }

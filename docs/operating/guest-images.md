@@ -129,7 +129,7 @@ GitHub refuses a self-hosted runner about thirty days after a newer `actions/run
 
 ## On EC2
 
-The `ec2` backend boots an AMI built by `billet ami build` from the same declaration, verified by booting it, and stamped with a contract tag only after the boot proved the properties. An AMI is region-scoped. [AWS with EC2](../deploying/aws-ec2.md) covers it; `billet images` does not manage AMIs.
+The `ec2` backend boots an AMI `billet ami build` makes by running the same template on an EC2 builder, completed with the components `images.accept` names, verified by booting it, and stamped with a contract tag only after the boot proved the properties. An AMI is region-scoped. [AWS with EC2](../deploying/aws-ec2.md) covers it; `billet images` does not manage AMIs.
 
 ## On a Mac
 

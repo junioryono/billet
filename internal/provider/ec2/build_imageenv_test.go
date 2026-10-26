@@ -10,51 +10,6 @@ import (
 	"testing"
 )
 
-// THE IMAGE DECLARES WHAT IT IS, in the file and the format the guest uses.
-//
-// One contract across both backends: /etc/billet-image-env, KEY=VALUE per line,
-// read into the job's environment. A different spelling here would make a
-// workflow's toolcache lookup a per-backend question, which is the asymmetry this
-// work exists to remove.
-func TestTheImageDeclaresItsToolcacheAndIdentity(t *testing.T) {
-	t.Parallel()
-
-	script := mustScript(t)
-
-	for _, want := range []struct {
-		line string
-		why  string
-	}{
-		{"RUNNER_TOOL_CACHE=" + toolcacheDir, "setup-* actions read only this one"},
-		{"AGENT_TOOLSDIRECTORY=" + toolcacheDir, "and the runner itself honours this one"},
-		{"ImageOS=ubuntu24", "third-party actions branch on it"},
-		{"ImageVersion=billet", "and on this"},
-	} {
-		if !strings.Contains(script, want.line+"\n") {
-			t.Errorf("the image env file is missing %q — %s", want.line, want.why)
-		}
-	}
-
-	// THE DIRECTORY IS CREATED, AND WRITABLE. Exporting RUNNER_TOOL_CACHE without
-	// it is WORSE than exporting neither: it points every setup action at a path
-	// under root-owned /opt that the unprivileged runner cannot create, so an
-	// action that would have fallen back to its own location fails outright.
-	if !strings.Contains(script, "install -d -m 0777 "+toolcacheDir+"\n") {
-		t.Errorf("the toolcache directory is not created writable, so the runner cannot add " +
-			"to it and the variables above point at nothing")
-	}
-
-	// AND IT IS CREATED BEFORE IT IS DECLARED, since a job that starts between the
-	// two would be told about a directory that is not there.
-	lines := strings.Split(script, "\n")
-	mk := lineOf(t, lines, "install -d -m 0777 "+toolcacheDir)
-	declare := lineOf(t, lines, "RUNNER_TOOL_CACHE="+toolcacheDir)
-
-	if mk >= declare {
-		t.Errorf("the toolcache is declared at line %d and created at %d", declare, mk)
-	}
-}
-
 // THE ENTRY POINT ACTUALLY READS THE FILE, and this runs the emitted shell rather
 // than looking for it.
 //

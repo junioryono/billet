@@ -57,7 +57,10 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ami build", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	base := fs.String("base-image", "", "AMI to provision from (an EBS-backed Ubuntu 24.04 image)")
-	shape := fs.String("instance-type", "c7i.xlarge", "shape of the BUILDER, not of your jobs")
+	shape := fs.String("instance-type", "",
+		"shape of the BUILDER, not of your jobs; a Nitro shape, whose live console billet "+
+			"reads the build's verdict from (default: "+ec2.DefaultBuilderType("x64")+" for x64, "+
+			ec2.DefaultBuilderType("arm64")+" for arm64)")
 	disk := fs.Int64("builder-disk", 0,
 		"root volume for the BUILDER in GiB, which becomes the image's root (default: "+
 			strconv.Itoa(ec2.DefaultBuilderDiskGiB)+")")
@@ -70,9 +73,8 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	caCert := fs.String("ca-cert", "",
 		"PEM file of CA(s) to trust in the image's host store — the cache endpoint's issuer")
 	payloadBucket := fs.String("payload-bucket", "",
-		"REQUIRED. S3 bucket to stage the shared installers in, fetched by the builder "+
-			"through a presigned URL. They no longer fit EC2's 16 KiB user data and "+
-			"cannot be embedded")
+		"REQUIRED. S3 bucket to stage the build in (GitHub's template, the scripts that "+
+			"run it and billet's layer), fetched by the builder through a presigned URL")
 	deployment := fs.String("deployment", "",
 		"this deployment's identity, which scopes the builder's owner tag so a "+
 			"value-scoped IAM policy admits this build and no other deployment's "+
@@ -81,21 +83,23 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	region := fs.String("region", "", "override the region from the config")
 	subnet := fs.String("subnet", "", "override the subnet from the config")
 	group := fs.String("security-group", "", "override the security group from the config")
-	// THE WHOLE BUILD: provisioning, CreateImage, waiting for the image to become
-	// launchable, and the verifier's boot. Timed on a real build in us-west-2 on
-	// 2026-10-17, with the parity toolcache:
+	// THE WHOLE BUILD: GitHub's template and billet's layer on the builder,
+	// CreateImage, waiting for the image to become launchable, and the verifier's
+	// boot. Timed on real builds in us-west-2, 2026-10-25 and 26, on the default
+	// builder and disk (build is the template and layer, snapshot is to available):
 	//
-	//	13m50s  provisioning, including the whole toolcache
-	//	38m46s  snapshot to available
-	//	52m37s  launch to the verifier's launch
+	//	                build   snapshot  verify  whole
+	//	x64, two        40m     59m30s    4m38s   1h44m
+	//	x64, all five   42m43s  59m59s    6m26s   1h49m
+	//	arm64, first    38m     45m30s    4m30s   1h29m
+	//	arm64, second   39m16s  48m11s    4m53s   1h32m
 	//
-	// That run's own timeout ended it there, and `billet ami verify`, run on its
-	// own, then booted the image and stamped it in 6m13s, so a whole build is
-	// about 59 minutes by the sum of the two. The snapshot of a larger image is
-	// what grew: it was 9m20s when the image was smaller, and the default of 60
-	// minutes, chosen then with room, now leaves almost none. The cost of a
-	// generous bound is nothing: it is a deadline, not a wait.
-	timeout := fs.Duration("timeout", 90*time.Minute, "how long to wait for the whole build")
+	// The snapshot is the largest part and the least predictable, since it grows
+	// with the image and with the region's load, so three hours leaves the x64
+	// build over an hour's room. The cost of a generous bound is nothing: it is
+	// a deadline, not a wait, and a build that fails says so on its console within
+	// a poll.
+	timeout := fs.Duration("timeout", 3*time.Hour, "how long to wait for the whole build")
 	public := fs.Bool("public-ip", false,
 		"give the builder a public address, for a subnet with no NAT gateway")
 	// ON BY DEFAULT, AND THE DEFAULT IS THE WHOLE POINT. A gate nobody remembers to
@@ -117,20 +121,22 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 
 	if *base == "" {
 		return errors.New("--base-image is required: billet does not guess which distribution " +
-			"you want, because the provisioning script assumes Ubuntu 24.04 and a wrong guess fails " +
+			"you want, because GitHub's template assumes Ubuntu 24.04 and a wrong guess fails " +
 			"halfway through a build you paid for")
 	}
 
-	// REFUSED HERE, BEFORE A MACHINE IS BOUGHT. Without a bucket the provisioning
-	// script cannot be rendered at all, and finding that out after launching a
-	// builder costs an instance and the time to notice. The reason is arithmetic:
-	// the installers and the pinned declaration are 17077 bytes compressed against
-	// EC2's 16384-byte cap, and parity only grows.
+	// REFUSED HERE, BEFORE A MACHINE IS BOUGHT. The build is GitHub's template and
+	// the scripts that run it, hundreds of kilobytes against EC2's 16384 bytes of
+	// user data, so it is staged in S3 and fetched by a bootstrap.
 	if *payloadBucket == "" {
-		return errors.New("--payload-bucket is required: the shared installers and the " +
-			"pinned declaration no longer compress into EC2's 16 KiB user data, so they " +
-			"are staged in S3 and fetched by a bootstrap. Any bucket the builder's region " +
-			"can reach will do; billet writes one object and deletes it when the build ends")
+		return errors.New("--payload-bucket is required: the build (GitHub's template and " +
+			"the scripts that run it) is far past EC2's 16 KiB of user data, so it is staged " +
+			"in S3 and fetched by a bootstrap. Any bucket the builder's region can reach will " +
+			"do; billet writes one object and deletes it when the build ends")
+	}
+
+	if *shape == "" {
+		*shape = ec2.DefaultBuilderType(*arch)
 	}
 
 	// RESOLVED BEFORE THE CONFIG IS READ OR ANYTHING IS BOUGHT, for the reason the
@@ -155,6 +161,11 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 
 	if *name == "" {
 		*name = "billet-runner-" + time.Now().UTC().Format("20060102-150405")
+	}
+
+	accept, err := amiAccept(env, *cfgPath)
+	if err != nil {
+		return err
 	}
 
 	// READ BEFORE THE BUILD STARTS, so a missing or unreadable file fails now
@@ -204,6 +215,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		RunnerSHA256:       digest,
 		Name:               *name,
 		CACertPEM:          caCertPEM,
+		Accept:             accept,
 		PayloadBucket:      *payloadBucket,
 		Verify:             *verify,
 		VerifyInstanceType: *verifyShape,
@@ -232,6 +244,40 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
 
 	return nil
+}
+
+// amiAccept is the components the image is completed with: what the config's
+// images.accept names, with what the deployment's control plane accepts on a node
+// that has recorded it, by the rule a guest image's completion follows
+// (acceptedComponents).
+//
+// NO CONFIG ACCEPTS NOTHING, and says so: a build run with only --region,
+// --subnet and --security-group has no images.accept to read, and an image
+// without the components is the safe answer to a question nobody was asked.
+func amiAccept(env cli.Env, cfgPath string) ([]string, error) {
+	cfg, err := config.Load(cfgPath)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(env.Stderr, "NOTE: no config at %s, so this image is completed with none of "+
+			"the license-restricted components images.accept names.\n\n", cfgPath)
+
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("--config %s: %w", cfgPath, err)
+	}
+
+	accepted, err := acceptedComponents(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("which components to complete the image with: %w", err)
+	}
+
+	out := make([]string, 0, len(accepted))
+	for _, c := range accepted {
+		out = append(out, string(c))
+	}
+
+	return out, nil
 }
 
 // runnerDigest is the sha256 the build checks the runner tarball against.

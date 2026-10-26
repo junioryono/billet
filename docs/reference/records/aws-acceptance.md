@@ -115,6 +115,21 @@ Whether a subnet's `MapPublicIpOnLaunch` can substitute for the flag is **not es
 
 `--security-group` is required and billet deliberately does not fall back to the VPC's default group, which allows all traffic between its members.
 
+### From GitHub's template, on both architectures (2026-10-25)
+
+Contract 4 ([ADR-022](../decisions/adr-022-every-linux-image-from-githubs-template.md)) builds the AMI by running GitHub's `actions/runner-images` template on the builder itself. It was first run by hand on a 200 GiB root in a test account in us-west-2, without the guest-only differences, to learn whether the template needs any EC2-specific change: it did not. GitHub's whole template, its own Pester tests included, passed on Canonical's Ubuntu 24.04 AMI on c7i.4xlarge (x64) and c7g.4xlarge (arm64), peaking at 42 GiB used on x64, before the template's reboot, and 35 GiB on arm64.
+
+Then `billet ami build` ran from an `ec2` orchestrator instance in the same account, through billet's own code path end to end: staging, the bootstrap, the build unit across the template's reboot, the console verdict, `CreateImage`, the verifier's boot and the promotion.
+
+| | template and layer | snapshot to available | verifier | whole | image |
+|---|---|---|---|---|---|
+| x64, c7i.4xlarge, the Android SDK and Firefox accepted | 40 min | 59 min 30 s | 4 min 38 s | 1 h 44 min | 51 GiB used, 64 free of 120 |
+| arm64, c7g.4xlarge, Firefox accepted | 38 min | 45 min 30 s | about 4 min 30 s | 1 h 29 min | 33 GiB used |
+| x64 again, 2026-10-26, all five components accepted | 42 min 43 s | 59 min 59 s | 6 min 26 s | 1 h 49 min | 54 GiB used, 61 free of 115 |
+| arm64 again, 2026-10-26, all five accepted | 39 min 16 s | 48 min 11 s | 4 min 53 s | 1 h 32 min | 33 GiB used |
+
+The two builds of 2026-10-25 ran the tree of the change's first commit (935643f4), whose verifier proved each recorded component by its path and ran every toolchain as the runner account under the job's environment; both images were stamped contract 4, with `sh.billet.components` naming what each accepted (`android-sdk:12.0,firefox:158.0.1` on x64, `firefox:158.0.1` on arm64). The arm64 image was verified again by the verifier of 2eadf929, which also runs each component's `--version` as the runner and proves every unrecorded component absent, and passed. The x64 image was verified again on 2026-10-26 by the verifier of 981388b0, which also asks the runner for each recorded component's variables (the Android NDK's four by prefix, each one version directory under the NDK's root, not a link, whose `source.properties` the runner reads) and refuses those variables for any component not recorded, and passed in 4 min 22 s, with 64 GiB of 115 free on the verifier's root; the review rounds after it changed how those questions are put to the runner, not which are asked. The review fixes after the first commit changed how `build-ami.sh` stages, resumes and reports, so the two builds of 2026-10-26 ran that reviewed path as it stood at c193af7d, but for that commit's rephrasing of the verifier's NDK question, on the default builders, disk and three-hour `--timeout`, with all five components accepted. x64 completed and recorded all five (`android-sdk:12.0,codeql:2.27.3,firefox:158.0.1,google-chrome:156.0.8078.47,microsoft-edge:156.0.4314.42`); arm64 owed and recorded Firefox alone, since its template installs none of the other four. Both were stamped contract 4 by their builds' verifiers, and verified again by the verifier of 9c5c4ca4, which asks every recorded component's executables, directories and variables as the runner, in 5 min 55 s on x64 and 4 min 7 s on arm64, and both passed. Two changes to the build path came after those builds and have not run on a builder: the failure handler that names no template step when the log cannot be read, and the build-time `present` asking each component's executables and directories as the runner, which the verifier of 9c5c4ca4 then asked of the same paths on both finished images. The snapshot is the largest and least predictable part, which is why `--timeout` defaults to three hours; the x64 image's 54 GiB with all five components is why the bootstrap insists on 65 GiB free and `--builder-disk` on at least 75. Cancelling a build while its verifier ran terminated the verifier.
+
 
 ## Workflow coverage
 

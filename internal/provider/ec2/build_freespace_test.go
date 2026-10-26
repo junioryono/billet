@@ -17,7 +17,7 @@ import (
 func TestTheFreeSpaceGuardRefusesWhatItCannotRead(t *testing.T) {
 	t.Parallel()
 
-	block := freeSpaceBlock(t, mustScript(t))
+	block := freeSpaceBlock(t, mustBootstrap(t))
 
 	for _, tc := range []struct {
 		name   string

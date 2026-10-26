@@ -863,6 +863,8 @@ type imageLayout struct {
 	// verification has to ask the ARTIFACT which architecture's toolcache spellings
 	// and which instance shape it is talking about rather than take a caller's word.
 	arch string
+	// billet is whether the image carries a tag billet stamps on what it builds.
+	billet bool
 	// devices are the non-root EBS mappings, each carrying the flag billet will
 	// send for it, in whatever order DescribeImages returned them. AWS does not
 	// promise that order is stable and nothing here depends on it: every entry
@@ -1170,6 +1172,13 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 	}
 
 	layout := imageLayout{root: out.Images[0].RootDeviceName, arch: out.Images[0].Architecture}
+
+	for _, tag := range out.Images[0].Tags {
+		switch tag.Key {
+		case amiContractTag, amiBuiltByTag, amiComponentsTag:
+			layout.billet = true
+		}
+	}
 	if layout.root == "" {
 		return imageLayout{}, fmt.Errorf("ec2: image %s reports no root device name, so billet "+
 			"cannot say what becomes of its root volume, and guessing one is not an option: a "+
