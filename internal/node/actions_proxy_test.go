@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -367,6 +368,196 @@ func TestPassthroughRefusesAForeignInnerHost(t *testing.T) {
 				t.Fatal("a foreign inner host reached the upstream dial rather than being refused")
 			}
 		})
+	}
+}
+
+// AN ANSWER OF THE NODE'S OWN ON THE RESULTS ORIGIN IS FRAMED BY ITS LENGTH AND
+// ENDED BY ITS CLIENT (#697), as the npm cache's are: a refusal, a blob answer
+// and a HEAD each declare their length, the body ends at it with the connection
+// still open, and the client's close ends the connection.
+func TestAnActionsAnswerIsFramedByItsLengthAndEndedByItsClient(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		request string
+		method  string
+		status  int
+	}{
+		"refusal": {"GET /twirp/x HTTP/1.1\r\nHost: evil.example.com\r\n\r\n", http.MethodGet,
+			http.StatusMisdirectedRequest},
+		"blob answer": {"GET " + actionsBlobPrefix + "unknown HTTP/1.1\r\nHost: " + actionsResultsHost + "\r\n\r\n",
+			http.MethodGet, http.StatusForbidden},
+		"HEAD": {"HEAD " + actionsBlobPrefix + "unknown HTTP/1.1\r\nHost: " + actionsResultsHost + "\r\n\r\n",
+			http.MethodHead, http.StatusForbidden},
+		// REFUSED BEFORE respond(), so only the writer keeps a body off a HEAD:
+		// one it wrote would be read past the answer below, and the connection
+		// would not read as still open.
+		"HEAD refusal": {"HEAD /twirp/x HTTP/1.1\r\nHost: evil.example.com\r\n\r\n", http.MethodHead,
+			http.StatusMisdirectedRequest},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			service, credentials := interceptService(t)
+			service.actions.dialUpstream = func(context.Context) (net.Conn, error) {
+				return nil, errors.New("the node's own answer reached the upstream dial")
+			}
+			tlsConn := connectTunnel(t, service, credentials)
+			if _, err := tlsConn.Write([]byte(tc.request)); err != nil {
+				t.Fatalf("write the request: %v", err)
+			}
+			reader := bufio.NewReader(tlsConn)
+			response, err := http.ReadResponse(reader, &http.Request{Method: tc.method})
+			if err != nil {
+				t.Fatalf("read the answer: %v", err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			declared := response.Header.Get("Content-Length")
+			switch {
+			case err != nil || response.StatusCode != tc.status || !response.Close:
+				t.Fatalf("the answer = %d (Connection: close %v): %v", response.StatusCode, response.Close, err)
+			case response.ContentLength <= 0 || declared != strconv.FormatInt(response.ContentLength, 10):
+				t.Fatalf("the answer declared %q, framed %d; want a length", declared, response.ContentLength)
+			case tc.method == http.MethodGet && int64(len(body)) != response.ContentLength:
+				t.Fatalf("the body was %d bytes of a declared %d", len(body), response.ContentLength)
+			case tc.method == http.MethodHead && len(body) != 0:
+				t.Fatalf("a HEAD's answer carried %d bytes of body", len(body))
+			}
+			assertStillOpen(t, name, tlsConn, reader, 300*time.Millisecond)
+			if err := tlsConn.CloseWrite(); err != nil {
+				t.Fatalf("the client's close: %v", err)
+			}
+			assertEnded(t, name+" after the client's close", tlsConn, reader, time.Second)
+		})
+	}
+}
+
+// A STORED ARCHIVE'S DOWNLOAD THROUGH THE TUNNEL is its exact bytes, framed by
+// their length, and the connection is left for its client to close: the answer
+// whose undici client the node's close would crash is a large warm download.
+func TestAStoredArchiveIsDownloadedThroughTheTunnelAndEndedByItsClient(t *testing.T) {
+	t.Parallel()
+
+	service, credentials := interceptService(t)
+	service.actions.dialUpstream = func(context.Context) (net.Conn, error) {
+		return nil, errors.New("a download of the node's own archive reached the upstream dial")
+	}
+	service.mu.Lock()
+	session := service.byToken[credentials.Token]
+	service.mu.Unlock()
+	archive := strings.Repeat("archive-", 4096)
+	// ask makes one call of the node's own and returns its status and, for a
+	// twirp call, its decoded answer.
+	ask := func(method, target, body string) (int, map[string]any) {
+		t.Helper()
+		request := actionsRequestForTest(t, method, target, body)
+		if method == http.MethodPut {
+			request.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+		}
+		response, handled, err := service.actionsResponse(request, session)
+		if err != nil || !handled {
+			t.Fatalf("%s %s handled=%t error=%v", method, target, handled, err)
+		}
+		defer response.Body.Close()
+		if method == http.MethodPut {
+			return response.StatusCode, nil
+		}
+		var value map[string]any
+		if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+			t.Fatalf("%s %s: decode the answer: %v", method, target, err)
+		}
+
+		return response.StatusCode, value
+	}
+	_, created := ask(http.MethodPost, "https://"+actionsResultsHost+actionsCreatePath,
+		`{"key":"linux-tunnel","version":"v1"}`)
+	uploadURL, ok := created["signed_upload_url"].(string)
+	if !ok {
+		t.Fatalf("CreateCacheEntry = %v", created)
+	}
+	uploaded, _ := ask(http.MethodPut, uploadURL, archive)
+	_, finalized := ask(http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"linux-tunnel","version":"v1","size_bytes":"`+strconv.Itoa(len(archive))+`"}`)
+	_, found := ask(http.MethodPost, "https://"+actionsResultsHost+actionsDownloadPath,
+		`{"key":"linux-tunnel","version":"v1"}`)
+	downloadURL, ok := found["signed_download_url"].(string)
+	parsed, err := url.Parse(downloadURL)
+	if !ok || err != nil || finalized["ok"] != true || uploaded != http.StatusCreated {
+		t.Fatalf("the archive was not stored: upload %d, finalized %v, download URL %q (%v)",
+			uploaded, finalized, downloadURL, err)
+	}
+
+	tlsConn := connectTunnel(t, service, credentials)
+	if _, err := tlsConn.Write([]byte("GET " + parsed.RequestURI() + " HTTP/1.1\r\nHost: " + actionsResultsHost +
+		"\r\n\r\n")); err != nil {
+		t.Fatalf("write the download: %v", err)
+	}
+	reader := bufio.NewReader(tlsConn)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read the download: %v", err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil || response.StatusCode != http.StatusOK || response.ContentLength != int64(len(archive)) ||
+		string(body) != archive {
+		t.Fatalf("the download = %d, framed %d, %d bytes (%v); want 200 and the archive's %d bytes framed by them",
+			response.StatusCode, response.ContentLength, len(body), err, len(archive))
+	}
+	assertStillOpen(t, "a whole download", tlsConn, reader, 300*time.Millisecond)
+	if err := tlsConn.CloseWrite(); err != nil {
+		t.Fatalf("the client's close: %v", err)
+	}
+	assertEnded(t, "a whole download after the client's close", tlsConn, reader, time.Second)
+}
+
+// AN ANSWER CUT SHORT, OR ONE WHOSE LENGTH IS NOT KNOWN, IS NOT WHOLE, so the
+// node closes it at once rather than leaving it for its client: the close is
+// how its client learns where it ended.
+func TestAnActionsAnswerIsWholeOnlyWhenItsLengthWasWritten(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		method string
+		length string
+		body   string
+		whole  bool
+		framed string
+	}{
+		"whole":          {length: "5", body: "whole", whole: true, framed: "Content-Length: 5\r\n"},
+		"cut short":      {length: "10", body: "short", whole: false, framed: "Content-Length: 10\r\n"},
+		"length unknown": {body: "unknown", whole: false},
+		// A HEAD'S ANSWER CARRIES THE LENGTH A GET'S WOULD, AND NO BODY: a body
+		// after it would be read as the start of another answer.
+		"HEAD": {method: http.MethodHead, length: "4", body: "body", whole: true, framed: "Content-Length: 4\r\n"},
+		// AN ANSWER WITH NO BODY AND NO LENGTH, as a block upload's 201 is, is
+		// framed by its length of zero.
+		"empty": {method: http.MethodPut, body: "-", whole: true, framed: "Content-Length: 0\r\n"},
+	} {
+		response := actionsBlobResponse(http.StatusOK)
+		if tc.length != "" {
+			response.Header.Set("Content-Length", tc.length)
+		}
+		if tc.body != "-" {
+			response.Body = io.NopCloser(strings.NewReader(tc.body))
+		}
+		var request *http.Request
+		if tc.method != "" {
+			request = &http.Request{Method: tc.method}
+		}
+		var wire bytes.Buffer
+		whole := writeActionsAnswer(&wire, request, response)
+		_ = response.Body.Close()
+		if whole != tc.whole {
+			t.Errorf("%s: whole = %v, want %v\n%s", name, whole, tc.whole, wire.String())
+		}
+		if tc.framed != "" && !strings.Contains(wire.String(), tc.framed) {
+			t.Errorf("%s: the answer did not declare %q:\n%s", name, tc.framed, wire.String())
+		}
+		if _, sent, _ := strings.Cut(wire.String(), "\r\n\r\n"); tc.method == http.MethodHead && sent != "" {
+			t.Errorf("%s: the answer carried a body %q", name, sent)
+		}
 	}
 }
 

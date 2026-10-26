@@ -35,7 +35,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The Actions cache is a DNS remap of one origin, serving three methods.**
 - **The npm cache is a second remapped origin, on by default for every firecracker Linux tier since 2026-10-25, answering only anonymous reads from the node's own store (ADR-020).**
-- **An npm answer's connection is ended by the client's close, never the node's, and only a length-framed answer may wait for it (`closeAfterClient`).**
+- **A tunnel the node answered is ended by the client's close, never the node's, and only a whole answer framed by its length may wait for it (`closeAfterClient`, #697).**
 - **A store and a listener are halves of one thing, and `billet check` is where the mirror is caught.**
 - **The kill switch is central, per cache, and consulted before every local operation.**
 - **What the cache did for a job is recorded as an observation, from a closed vocabulary, first observation kept.**

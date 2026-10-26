@@ -103,7 +103,7 @@ func assertClientsClosed(t *testing.T, what string, run npmLiveRun) {
 	answered -= run.answers["spliced"]
 	closed, slowest := 0, time.Duration(0)
 	for _, line := range strings.Split(run.log, "\n") {
-		if !strings.Contains(line, `msg="an npm client closed its answered connection"`) {
+		if !strings.Contains(line, `msg="a client closed its answered connection"`) {
 			continue
 		}
 		closed++
