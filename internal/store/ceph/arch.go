@@ -150,26 +150,39 @@ func (c *Client) CheckImportArch(ctx context.Context, image, machine string) err
 	return c.checkImportArch(ctx, image, machine, false)
 }
 
-// rememberRead keeps what LearnArchitectures read of a generation, for the import
-// this client makes next: another node's publish lock may have kept it from
-// being recorded.
-func (c *Client) rememberRead(image, generation, machine string) {
+// archRead is what LearnArchitectures read of one snapshot.
+type archRead struct {
+	machine string
+	id      uint64
+}
+
+// rememberRead keeps what LearnArchitectures read of a generation, with the id of
+// the snapshot it read, for the import this client makes next: another node's
+// publish lock may have kept it from being recorded.
+func (c *Client) rememberRead(image, generation, machine string, id uint64) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
 	if c.read == nil {
-		c.read = map[string]string{}
+		c.read = map[string]archRead{}
 	}
 
-	c.read[image+"@"+generation] = machine
+	c.read[image+"@"+generation] = archRead{machine: machine, id: id}
 }
 
-// readOf is what this client read of a generation, empty for nothing.
-func (c *Client) readOf(image, generation string) string {
+// readOf is what this client read of a generation, empty unless it was read from
+// the snapshot that holds the name now: one removed and made again under the
+// same name is another snapshot, which nobody has read.
+func (c *Client) readOf(image, generation string, id uint64) string {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	return c.read[image+"@"+generation]
+	read, ok := c.read[image+"@"+generation]
+	if !ok || read.id != id {
+		return ""
+	}
+
+	return read.machine
 }
 
 // checkImportArch refuses an import of machine into an image unless every
@@ -185,9 +198,20 @@ func (c *Client) readOf(image, generation string) string {
 // it: then that is its machine, and under the lock (record) it is written first,
 // since the generation is listed there and still records none.
 func (c *Client) checkImportArch(ctx context.Context, image, machine string, record bool) error {
-	generations, err := c.Generations(ctx, image)
+	snaps, err := c.snapshotList(ctx, image)
 	if err != nil {
 		return err
+	}
+
+	ids := map[string]uint64{}
+
+	var generations []Generation
+
+	for _, snap := range snaps {
+		if gen, ok := ParseGeneration(snap.Name); ok {
+			generations = append(generations, gen)
+			ids[gen.Name] = snap.ID
+		}
 	}
 
 	if len(generations) == 0 {
@@ -204,7 +228,7 @@ func (c *Client) checkImportArch(ctx context.Context, image, machine string, rec
 	for _, gen := range generations {
 		recorded := arches[gen.Name]
 		if recorded == "" {
-			if read := c.readOf(image, gen.Name); read != "" {
+			if read := c.readOf(image, gen.Name, ids[gen.Name]); read != "" {
 				if record {
 					if err := c.SetArch(ctx, image, gen.Name, read); err != nil {
 						return fmt.Errorf("ceph: %s@%s was read as %s and could not be recorded: %w",
@@ -286,7 +310,7 @@ func (c *Client) LearnArchitectures(ctx context.Context, image string) ([]ArchLe
 		return nil, err
 	}
 
-	generations, err := c.Generations(ctx, image)
+	snaps, err := c.snapshotList(ctx, image)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +322,12 @@ func (c *Client) LearnArchitectures(ctx context.Context, image string) ([]ArchLe
 
 	var learned []ArchLearned
 
-	for _, gen := range generations {
+	for _, snap := range snaps {
+		gen, isGeneration := ParseGeneration(snap.Name)
+		if !isGeneration {
+			continue
+		}
+
 		if arches[gen.Name] != "" {
 			continue
 		}
@@ -326,7 +355,7 @@ func (c *Client) LearnArchitectures(ctx context.Context, image string) ([]ArchLe
 		if readErr != nil {
 			machine = ""
 		} else {
-			c.rememberRead(image, gen.Name, machine)
+			c.rememberRead(image, gen.Name, machine, snap.ID)
 		}
 
 		learned = append(learned, ArchLearned{Generation: gen.Name, Machine: machine, Err: readErr})

@@ -1137,7 +1137,7 @@ func TestAPullThatCannotReadTheImagesArchitecturesImportsNothing(t *testing.T) {
 	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
 
 	err := fixture.pull(t)
-	if err == nil || !strings.Contains(err.Error(), "architectures of ubuntu-2404-x64's generations") {
+	if err == nil || !strings.Contains(err.Error(), "learning the architectures of ubuntu-2404-x64's generations failed") {
 		t.Fatalf("images pull = %v, want the pull refused for the architectures it could not read", err)
 	}
 

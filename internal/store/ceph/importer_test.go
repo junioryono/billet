@@ -90,6 +90,15 @@ type importFake struct {
 	metadata  string
 	contract  string
 
+	// snapIDs, when set, is the id `rbd snap ls` gives each snapshot, which
+	// otherwise is its place in the list; a snapshot made again under a name keeps
+	// the name and not the id.
+	snapIDs map[string]int
+
+	// onMetaSet runs inside every `image-meta set`, with its key, so a test can
+	// see what was true at the instant of the write (the publish lock held).
+	onMetaSet func(key string)
+
 	// heartbeat, if non-nil, is what `image-meta get` answers for a liveness key,
 	// and it is called once per read so a test can make the counter move.
 	heartbeat func() (string, bool)
@@ -147,6 +156,10 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 	if sub == "image-meta" && len(args) >= 2 {
 		key := args[len(args)-2]
 		if slices.Contains(args, "set") {
+			if f.onMetaSet != nil {
+				f.onMetaSet(key)
+			}
+
 			if f.appliedMetadata == nil {
 				f.appliedMetadata = make(map[string]bool)
 			}
@@ -259,7 +272,12 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 			}
 			entries := make([]string, 0, len(f.snapshots))
 			for i, name := range f.snapshots {
-				entries = append(entries, fmt.Sprintf(`{"id":%d,"name":%q}`, i+1, name))
+				id := i + 1
+				if assigned, ok := f.snapIDs[name]; ok {
+					id = assigned
+				}
+
+				entries = append(entries, fmt.Sprintf(`{"id":%d,"name":%q}`, id, name))
 			}
 
 			return []byte("[" + strings.Join(entries, ",") + "]"), nil

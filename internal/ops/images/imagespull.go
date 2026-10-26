@@ -502,8 +502,8 @@ func learnImageArchitectures(ctx context.Context, env cli.Env, store generationP
 	}
 
 	if learnErr != nil {
-		return fmt.Errorf("billet images pull: the architectures of %s's generations could not be "+
-			"read or recorded, so nothing was downloaded: %w", image, learnErr)
+		return fmt.Errorf("billet images pull: learning the architectures of %s's generations failed, "+
+			"so nothing was downloaded: %w", image, learnErr)
 	}
 
 	if err := store.CheckImportArch(ctx, image, hostArch()); err != nil {

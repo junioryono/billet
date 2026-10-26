@@ -534,7 +534,17 @@ func TestAnImportRecordsWhatItsPullReadAndCouldNotRecord(t *testing.T) {
 		t.Fatalf("the pre-check recorded something without the publish lock; billet ran %v", f.calls)
 	}
 
-	f.lockHeld, f.device = "", device
+	// THE IMPORT'S CALLS ALONE from here, so its own lock is the one the write is
+	// held to, not the learning's refused attempt; and whether that lock is held at
+	// the instant of the write is asked inside it.
+	f.lockHeld, f.device, f.calls, f.deadlines = "", device, nil, nil
+
+	heldAtWrite := false
+	f.onMetaSet = func(key string) {
+		if key == ArchKey+"."+old {
+			heldAtWrite = f.lockTaken != ""
+		}
+	}
 
 	if _, err := c.ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7",
 		importAt); err != nil {
@@ -546,9 +556,17 @@ func TestAnImportRecordsWhatItsPullReadAndCouldNotRecord(t *testing.T) {
 	})
 	added := slices.IndexFunc(f.calls, func(call []string) bool { return matchesCall(call, []string{"lock", "add"}) })
 
-	if set < 0 || f.calls[set][len(f.calls[set])-1] != "x86_64" || added < 0 || added > set {
-		t.Errorf("the import did not record what was read, under its lock (lock add at %d, set at %d); "+
-			"billet ran %v", added, set, f.calls)
+	if set < 0 || f.calls[set][len(f.calls[set])-1] != "x86_64" {
+		t.Fatalf("the import did not record what was read; billet ran %v", f.calls)
+	}
+
+	if added < 0 || added > set || !heldAtWrite {
+		t.Errorf("the import recorded what was read without holding the publish lock (lock add at %d, "+
+			"set at %d, held at the write: %v)", added, set, heldAtWrite)
+	}
+
+	if f.lockTaken != "" {
+		t.Error("the import's publish lock is still held after it returned")
 	}
 }
 
@@ -556,13 +574,47 @@ func TestAnImportRecordsWhatItsPullReadAndCouldNotRecord(t *testing.T) {
 func TestAnImportIsRefusedWhatItsPullReadAsAnotherMachine(t *testing.T) {
 	t.Parallel()
 
-	f := &importFake{device: "/dev/rbd7", infoJSON: `{"size": 8388608}`, snapshots: []string{"g20260801000000"}}
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device, infoJSON: `{"size": 8388608}`, snapshots: []string{"g20260801000000"}}
 	c := learnClient(t, f)
-	c.rememberRead("ubuntu-2404-x64", "g20260801000000", "aarch64")
+	c.rememberRead("ubuntu-2404-x64", "g20260801000000", "aarch64", 1)
 
 	if err := c.CheckImportArch(t.Context(), "ubuntu-2404-x64", "x86_64"); err == nil ||
 		!strings.Contains(err.Error(), "g20260801000000 (aarch64)") {
 		t.Fatalf("CheckImportArch = %v, want the generation read as aarch64 refused", err)
+	}
+
+	if _, err := c.ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7",
+		importAt); err == nil || !strings.Contains(err.Error(), "g20260801000000 (aarch64)") {
+		t.Fatalf("ImportGeneration = %v, want the generation read as aarch64 refused", err)
+	}
+
+	if f.ranWith("device", "map") || f.ranWith("snap", "create") {
+		t.Errorf("a refused import wrote into the image; billet ran %v", f.calls)
+	}
+}
+
+// AND WHAT IT READ OF A SNAPSHOT SINCE REMOVED AND MADE AGAIN UNDER THE SAME NAME
+// SAYS NOTHING OF THE NEW ONE: the import is refused as could-not-tell, and the
+// replacement is not given the old snapshot's machine.
+func TestARememberedReadDoesNotDescribeASnapshotMadeAgainUnderItsName(t *testing.T) {
+	t.Parallel()
+
+	const gen = "g20260801000000"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device, infoJSON: `{"size": 8388608}`, snapshots: []string{gen},
+		snapIDs: map[string]int{gen: 9}}
+	c := learnClient(t, f)
+	c.rememberRead("ubuntu-2404-x64", gen, "x86_64", 4)
+
+	_, err := c.ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
+	if err == nil || !strings.Contains(err.Error(), "not recorded and was not read on this host") {
+		t.Fatalf("ImportGeneration = %v, want the replacement refused as unread", err)
+	}
+
+	if f.ranWith("image-meta", "set", "ubuntu-2404-x64", ArchKey+"."+gen) {
+		t.Errorf("the replacement was given what was read of the snapshot before it; billet ran %v", f.calls)
 	}
 }
 
@@ -605,5 +657,33 @@ func TestLearnArchitecturesSaysAPublishLockItCouldNotRelease(t *testing.T) {
 
 	if len(learned) != 1 || !learned[0].Recorded || learned[0].NotRecorded != nil {
 		t.Errorf("learned %+v, want the record that was written said as written", learned)
+	}
+}
+
+// A RECORD BEATS A READ: what this client read never overwrites, or outvotes,
+// what another node recorded for the same generation meanwhile.
+func TestARecordedArchitectureBeatsWhatThisClientRead(t *testing.T) {
+	t.Parallel()
+
+	const gen = "g20260801000000"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device, infoJSON: `{"size": 8388608}`, snapshots: []string{gen},
+		metadata: archMeta(ArchKey + "." + gen + "  aarch64")}
+	c := learnClient(t, f)
+	c.rememberRead("ubuntu-2404-x64", gen, "x86_64", 1)
+
+	if err := c.CheckImportArch(t.Context(), "ubuntu-2404-x64", "x86_64"); err == nil ||
+		!strings.Contains(err.Error(), gen+" (aarch64)") {
+		t.Errorf("CheckImportArch = %v, want the recorded aarch64 to refuse", err)
+	}
+
+	if _, err := c.ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7",
+		importAt); err == nil || !strings.Contains(err.Error(), gen+" (aarch64)") {
+		t.Errorf("ImportGeneration = %v, want the recorded aarch64 to refuse", err)
+	}
+
+	if f.ranWith("image-meta", "set", "ubuntu-2404-x64", ArchKey+"."+gen) {
+		t.Errorf("another node's record was overwritten with this client's read; billet ran %v", f.calls)
 	}
 }
