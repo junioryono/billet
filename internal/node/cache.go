@@ -1201,7 +1201,13 @@ func (s *CacheService) cleanupSession(
 	// A FAILURE MARKED AFTER SETTLEMENT IS REPORTED BEFORE THE RECORD GOES: a
 	// download read, or an observation that waited out this cleanup's hold, was
 	// written by the discards above and would otherwise be deleted unreported.
-	if absorbActionsFailure(session) || !session.observed.Reported {
+	// Twice, because the report's own write of the record takes up a failure
+	// marked while the plane was being told. Best effort: a plane that refuses
+	// the report, as it does once the lease has ended, is not waited for.
+	for range 2 {
+		if !absorbActionsFailure(session) && session.observed.Reported {
+			break
+		}
 		s.report(ctx, session)
 	}
 	if err := s.finishSession(session); err != nil {

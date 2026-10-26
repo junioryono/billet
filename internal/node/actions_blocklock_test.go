@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,6 +264,16 @@ func TestAWaitingCommitAdmitsNoNewBlock(t *testing.T) {
 	}()
 	commitDone := serveInBackground(t, service, session, actionsBlockRequest(t, uploadURL, "blocklist", "",
 		bytes.NewBufferString(`<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>YQ==</Latest></BlockList>`)))
+	joined := false
+	defer func() {
+		if !joined {
+			if held {
+				archive.mu.RUnlock()
+				held = false
+			}
+			<-commitDone
+		}
+	}()
 	awaitCondition(t, "the commit waiting for the archive", func() bool {
 		return archive.exclusiveWaiting.Load() == 1
 	})
@@ -276,7 +287,9 @@ func TestAWaitingCommitAdmitsNoNewBlock(t *testing.T) {
 
 	archive.mu.RUnlock()
 	held = false
-	if result := <-commitDone; result.err == nil && result.status == 0 {
+	result := <-commitDone
+	joined = true
+	if result.err == nil && result.status == 0 {
 		t.Fatalf("the commit was never answered: %+v", result)
 	}
 }
@@ -299,6 +312,16 @@ func TestABlobRequestAfterItsSessionClosedIsRefused(t *testing.T) {
 	}()
 	done := serveInBackground(t, service, session,
 		actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")))
+	joined := false
+	defer func() {
+		if !joined {
+			if held {
+				archive.mu.Unlock()
+				held = false
+			}
+			<-done
+		}
+	}()
 	awaitCondition(t, "the block waiting for the archive", func() bool {
 		return archive.sharedWaiting.Load() == 1
 	})
@@ -306,7 +329,9 @@ func TestABlobRequestAfterItsSessionClosedIsRefused(t *testing.T) {
 	archive.mu.Unlock()
 	held = false
 
-	if result := <-done; result.err != nil || result.status != http.StatusForbidden {
+	result := <-done
+	joined = true
+	if result.err != nil || result.status != http.StatusForbidden {
 		t.Fatalf("a block let in after its session closed: %+v; want 403", result)
 	}
 }
@@ -604,6 +629,20 @@ func TestAReservedBlobWhosePolicyCannotBeReadIsRecordedAsUnavailable(t *testing.
 				return tc.allowed, tc.err
 			}))
 
+			// A PATH BILLET NEVER SIGNED IS NOT BILLET'S TO FAIL, however the
+			// policy reads: a forged signature, and an archive never reserved.
+			for _, foreign := range []string{
+				strings.Replace(uploadURL, "sig=", "sig=forged", 1),
+				"https://" + actionsResultsHost + actionsBlobPrefix + "never-reserved",
+			} {
+				response, _ := service.actionsProxy().respond(
+					actionsBlockRequest(t, foreign, "block", "YQ==", bytes.NewBufferString("a")), session)
+				closeActionsResponse(t, response)
+			}
+			if told := observedActions(observer); len(told) != 1 || told[0] != alloc.ActionsCacheServed {
+				t.Fatalf("a URL billet never signed changed what the observer was told: %v", told)
+			}
+
 			response, handled := service.actionsProxy().respond(
 				actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")), session)
 			if !handled || response.StatusCode != http.StatusBadGateway {
@@ -635,6 +674,14 @@ func TestACutOrCancelledCallIsNotRecordedAsAFailure(t *testing.T) {
 
 			return request
 		},
+		"oversized metadata on a cancelled request": func(t *testing.T) *http.Request {
+			t.Helper()
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			return actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+				strings.Repeat(" ", actionsRequestLimit+1)).WithContext(ctx)
+		},
 		"cancelled finalization": func(t *testing.T) *http.Request {
 			t.Helper()
 			ctx, cancel := context.WithCancel(t.Context())
@@ -658,5 +705,74 @@ func TestACutOrCancelledCallIsNotRecordedAsAFailure(t *testing.T) {
 				t.Fatalf("observer was told %v, want only the reservation's served", told)
 			}
 		})
+	}
+}
+
+// A FINALIZATION WHOSE REQUEST IS CANCELLED WHILE IT TRIMS IS NOT BILLET'S
+// FAILURE, though the trim answers with an exit status rather than the context's
+// own error.
+func TestAFinalizationCancelledInItsTrimIsNotRecordedAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, volumes := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	uploadURL, _ := reserveActionsUpload(t, service, session, "trimmed")
+	upload := actionsBlockRequest(t, uploadURL, "", "", bytes.NewBufferString("body"))
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, handled := service.actionsProxy().respond(upload, session)
+	if !handled || response.StatusCode != http.StatusCreated {
+		t.Fatalf("upload handled=%t status=%v", handled, response)
+	}
+	closeActionsResponse(t, response)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	trimmed := false
+	volumes.trimCheck = func(string) error {
+		trimmed = true
+		cancel()
+
+		return errors.New("fstrim: exit status 1")
+	}
+	finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"trimmed","version":"v2","size_bytes":"4"}`).WithContext(ctx)
+	response, _ = service.actionsProxy().respond(finalize, session)
+	closeActionsResponse(t, response)
+
+	if !trimmed {
+		t.Fatal("the finalization never reached its trim")
+	}
+	if told := observedActions(observer); len(told) != 1 || told[0] != alloc.ActionsCacheServed {
+		t.Fatalf("observer was told %v, want only the reservation's served", told)
+	}
+}
+
+// A FAILURE MARKED WHILE CLEANUP'S LAST REPORT IS BEING SENT IS REPORTED TOO: the
+// report's own write of the record takes it up, after the plane was told.
+func TestAFailureMarkedDuringTheLastReportIsReported(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	calls := 0
+	observer := &recordingObserver{refuse: 2}
+	observer.inspect = func(alloc.CacheObservation) {
+		calls++
+		// The first call is the reservation's and the second settlement's, both refused;
+		// the third is cleanup's own report of what was still unreported.
+		if calls == 3 {
+			session.actionsFailed.Store(true)
+		}
+	}
+	service.SetCacheObserver(observer)
+	reserveActionsUpload(t, service, session, "racing")
+
+	if err := service.Cleanup(t.Context(), session.instance); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	told := observedActions(observer)
+	if calls < 4 || told[len(told)-1] != alloc.ActionsCacheUnavailable {
+		t.Fatalf("observer was told %v over %d calls, want the failure marked during the last report last",
+			told, calls)
 	}
 }

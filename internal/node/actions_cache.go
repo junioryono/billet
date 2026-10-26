@@ -248,7 +248,7 @@ func (s *CacheService) actionsResponse(
 		// A BLOB URL BILLET SIGNED IS BILLET'S TO ANSWER, and GitHub knows nothing
 		// of it: a policy or an authority that could not be read for one is a
 		// local failure, not a splice (#694). The kill switch stays a refusal.
-		if disposition == alloc.ActionsCacheSpliced && strings.HasPrefix(req.URL.Path, actionsBlobPrefix) {
+		if disposition == alloc.ActionsCacheSpliced && s.ownsActionsBlob(req, session) {
 			return nil, true, errActionsPolicyUnreadable
 		}
 
@@ -1260,6 +1260,22 @@ func actionsJSONResponse(value any) (*http.Response, error) {
 		},
 		Body: io.NopCloser(bytes.NewReader(body)),
 	}, nil
+}
+
+// ownsActionsBlob says req names an archive this session holds, by a URL it
+// signed. A path it never issued is not billet's to fail.
+func (s *CacheService) ownsActionsBlob(req *http.Request, session *cacheSession) bool {
+	id, ok := strings.CutPrefix(req.URL.Path, actionsBlobPrefix)
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return false
+	}
+	if err := lockCacheSession(req.Context(), session); err != nil {
+		return false
+	}
+	defer session.mu.Unlock()
+	archive := session.actions[id]
+
+	return !session.closed && archive != nil && req.URL.Query().Get("sig") == archive.Signature
 }
 
 func (s *CacheService) serveActionsBlob(

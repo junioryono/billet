@@ -607,7 +607,7 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 	}
 	// billets says a failure is billet's own to record: not the guest's body, and
 	// not the request's time, whose meaning is not known; `unavailable` outlasts
-	// any later success.
+	// any later success. A refusal billet decided itself passes nil.
 	billets := func(err error) bool {
 		return !errors.Is(err, errActionsBodyCut) && !errors.Is(err, context.Canceled) &&
 			!errors.Is(err, context.DeadlineExceeded) && req.Context().Err() == nil
@@ -626,7 +626,9 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 				"Actions cache metadata request could not be read"), true
 		}
 		if len(replay) > actionsRequestLimit {
-			observe(req.Context(), alloc.ActionsCacheUnavailable)
+			if billets(nil) {
+				observe(req.Context(), alloc.ActionsCacheUnavailable)
+			}
 
 			return actionsBlobError(http.StatusRequestEntityTooLarge,
 				"Actions cache metadata request is too large"), true
