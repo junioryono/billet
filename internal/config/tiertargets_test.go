@@ -167,10 +167,12 @@ func TestALadderForEveryTargetMakesEverySizeOnEach(t *testing.T) {
 	}
 }
 
-// A NODE'S FILE DECLARES NO TARGETS, and a declaration there expands to nothing:
-// the node never reads the catalogue to launch, and there are no targets to
-// name.
-func TestANodesFileExpandsADeclarationToNothing(t *testing.T) {
+// A NODE'S FILE DECLARES NO TARGETS, and keeps one tier per target a
+// declaration names, or one for the default target under `all`: the node never
+// launches from the catalogue, but its image reaper protects what the tiers pin
+// and its preflight sizes their disks, so a declaration dropped there would
+// leave a pinned generation unprotected.
+func TestANodesFileKeepsADeclarationsShapes(t *testing.T) {
 	const server = "server:\n  listen: 127.0.0.1:7717\n  state_dir: /var/lib/billet/server\n" +
 		"  max_vcpu: 120\n  max_memory: 480GiB\n"
 	const github = "github:\n  org: acme\n  app_id: 12345\n  installation_id: 67890\n" +
@@ -196,14 +198,59 @@ func TestANodesFileExpandsADeclarationToNothing(t *testing.T) {
 		t.Fatalf("the node's file still declares targets: %+v", cfg.GitHubTargets())
 	}
 
+	var got []string
+
 	for _, tier := range cfg.Tiers {
-		if tier.Declaration != "" || strings.Contains(tier.Label, TargetPlaceholder) {
-			t.Errorf("a node's file kept a tier from the declaration: %+v", tier)
+		if strings.Contains(tier.Label, TargetPlaceholder) {
+			t.Errorf("a node's file kept an unexpanded label: %+v", tier)
+		}
+
+		if tier.Declaration != "" {
+			got = append(got, tier.Label+"="+tier.Image)
 		}
 	}
 
-	if len(cfg.Tiers) != 2 {
-		t.Errorf("the node's file has %d tiers, want its two hand-written ones", len(cfg.Tiers))
+	want := []string{"default-1vcpu=ubuntu-2404-x64", "default-named=ubuntu-2404-x64",
+		"elsewhere-named=ubuntu-2404-x64"}
+	if !slices.Equal(got, want) {
+		t.Errorf("the node's file kept %v from its declarations, want %v", got, want)
+	}
+
+	if len(cfg.Tiers) != 2+len(want) {
+		t.Errorf("the node's file has %d tiers, want its two hand-written ones and %d declared",
+			len(cfg.Tiers), len(want))
+	}
+}
+
+// TWO LADDERS FOR DISJOINT TARGETS share a label only before targets expand it,
+// and load; each tier says the declaration as written, not the ladder's suffix.
+func TestLaddersForDisjointTargetsLoad(t *testing.T) {
+	ladder := func(target string) string {
+		return `  - label: ${target}-web
+    runs_on: billet-web
+    targets: [` + target + `]
+    provider: firecracker
+    sizes: [2]
+    image: ubuntu-2404-x64
+`
+	}
+
+	cfg, err := Load(writeConfig(t, threeTargetConfig(t, ladder("personal")+ladder("beta"))))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	var got []string
+
+	for _, tier := range cfg.Tiers {
+		if tier.Declaration != "" {
+			got = append(got, tier.Label+" from "+tier.Declaration)
+		}
+	}
+
+	want := []string{"personal-web-2vcpu from ${target}-web", "beta-web-2vcpu from ${target}-web"}
+	if !slices.Equal(got, want) {
+		t.Errorf("the ladders made %v, want %v", got, want)
 	}
 }
 

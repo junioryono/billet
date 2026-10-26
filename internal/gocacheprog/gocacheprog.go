@@ -275,8 +275,29 @@ func (h *helper) local(action string) (entry, bool) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() != found.size {
 		return entry{}, false
 	}
+	h.markUsed(h.actionPath(action), h.outputPath(found.output))
 
 	return found, true
+}
+
+// markUsed refreshes the times of a hit's entry and output, as the go command's
+// own reader does (cmd/go/internal/cache's markUsed), because the directory is
+// the go command's and so is its trimming: an object served here and never
+// marked would age out of a restored cache under a go command trimming it.
+// Like the go command, it writes only a time more than an hour old.
+func (h *helper) markUsed(paths ...string) {
+	now := time.Now()
+	// A TIME THAT CANNOT BE WRITTEN costs a later miss, never this hit, so it is
+	// not an error.
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || now.Sub(info.ModTime()) <= time.Hour {
+			continue
+		}
+		if err := os.Chtimes(path, now, now); err != nil {
+			continue
+		}
+	}
 }
 
 // fetch asks the node for an action's entry and output, and keeps both.

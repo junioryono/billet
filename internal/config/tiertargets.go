@@ -83,11 +83,15 @@ func (s TierTargets) MarshalYAML() (any, error) {
 // tiers that will exist. A method, because which targets there are is the
 // config's to say.
 //
-// A FILE THAT DECLARES NO TARGETS EXPANDS A DECLARATION TO NOTHING. A node's
-// file carries no github block, the node never reads the catalogue to launch
-// (the control plane sends each launch's tier), and validateTierTargets already
-// leaves a node-only file's tiers to the control plane; a declaration there
-// would otherwise have no targets to name and nothing to check them against.
+// A FILE THAT DECLARES NO TARGETS KEEPS ONE TIER PER TARGET THE DECLARATION
+// NAMES, or one for the default target under `all`. A node's file carries no
+// github block and the node never launches from the catalogue (the control
+// plane sends each launch's tier), but it does read it: the image reaper
+// protects the generations its tiers pin, and the host's preflight sizes their
+// disks. Dropping the declaration there would leave a pinned generation
+// unprotected, so the node keeps a tier of each shape under names it can hold,
+// and validateTierTargets leaves their targets to the control plane as it does
+// a node-only file's other tiers.
 func (c *Config) expandTierTargets() error {
 	declared := c.GitHubTargets()
 
@@ -147,7 +151,12 @@ func ExpandTierTargets(tiers []Tier, targets []string) ([]Tier, error) {
 			one := t
 			one.Targets = TierTargets{}
 			one.Target = name
-			one.Declaration = t.Label
+			// THE LABEL AS WRITTEN, which `sizes` has already suffixed when the
+			// entry was a ladder; expandOne kept the written one.
+			one.Declaration = t.Declaration
+			if one.Declaration == "" {
+				one.Declaration = t.Label
+			}
 			one.Label = strings.ReplaceAll(t.Label, TargetPlaceholder, name)
 			one.RunsOn = strings.ReplaceAll(t.RunsOn, TargetPlaceholder, name)
 
@@ -232,10 +241,11 @@ func declarationTargets(where string, t Tier, targets []string) ([]string, error
 	var serves []string
 
 	switch {
+	case len(targets) == 0 && t.Targets.All:
+		// A node's file: see expandTierTargets.
+		serves = []string{DefaultTargetName}
 	case t.Targets.All:
 		serves = slices.Clone(targets)
-	case len(targets) == 0:
-		// A node's file: see expandTierTargets.
 	default:
 		seen := make(map[string]bool, len(t.Targets.Names))
 
@@ -243,7 +253,7 @@ func declarationTargets(where string, t Tier, targets []string) ([]string, error
 			switch {
 			case seen[name]:
 				errs = append(errs, fmt.Errorf("%s: targets lists %q twice", where, name))
-			case !slices.Contains(targets, name):
+			case len(targets) > 0 && !slices.Contains(targets, name):
 				errs = append(errs, fmt.Errorf("%s: targets names %q, which is not one this config "+
 					"declares (%s)", where, name, strings.Join(targets, ", ")))
 			default:

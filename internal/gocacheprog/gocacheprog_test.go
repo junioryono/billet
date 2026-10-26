@@ -456,3 +456,38 @@ func TestANativeEntryForAnotherActionIsAMiss(t *testing.T) {
 		t.Errorf("the action the entry names was a miss: %+v", answers[1])
 	}
 }
+
+// A HIT REFRESHES ITS FILES' TIMES, as the go command's own reader does, so an
+// object served from a restored cache does not age out under a go command's
+// trim of the same directory.
+func TestAHitMarksItsFilesUsed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, body := bytes.Repeat([]byte{8}, 32), []byte("an old object")
+	sum := sha256.Sum256(body)
+	exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "put", ActionID: action, OutputID: sum[:], BodySize: int64(len(body))}, body,
+		request{ID: 2, Command: "close"})
+
+	a, o := hex.EncodeToString(action), hex.EncodeToString(sum[:])
+	paths := []string{filepath.Join(dir, a[:2], a+"-a"), filepath.Join(dir, o[:2], o+"-d")}
+	old := time.Now().Add(-6 * 24 * time.Hour)
+	for _, path := range paths {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	answers := exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "get", ActionID: action}, request{ID: 2, Command: "close"})
+	if answers[0].Miss {
+		t.Fatalf("the restored object was a miss: %+v", answers[0])
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || time.Since(info.ModTime()) > time.Hour {
+			t.Errorf("%s still reads as unused after a hit: %v", path, err)
+		}
+	}
+}
