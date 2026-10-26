@@ -1353,7 +1353,11 @@ func TestADockerStoreAcquisitionIsBoundedByWhatIsLeftOfTheRequest(t *testing.T) 
 		session := service.byToken[credentials.Token]
 		session.mu.Lock()
 		held := 2 * time.Minute
-		time.AfterFunc(held, session.mu.Unlock)
+		// RELEASED BETWEEN TWO OF lockCacheMutex's 10 ms POLLS, so the request
+		// takes the session at exactly `held`. Released ON a poll, the two
+		// timers fire at the same instant in either order, and the request
+		// took it 10 ms late about once in a CI run.
+		time.AfterFunc(held-time.Millisecond, session.mu.Unlock)
 
 		if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
 			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
