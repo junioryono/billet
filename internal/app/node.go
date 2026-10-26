@@ -444,6 +444,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		Memory:         contribution.Memory,
 		GuestOS:        nodeGuestOS(cfg),
 		EC2Shapes:      RemoteShapes(cfg),
+		Architectures:  NodeArchitectures(cfg, runtime.GOARCH),
 		CodeBuildFleet: codeBuildFleet(cfg),
 
 		CodeBuildJITParameterPath: codeBuildJITPath(cfg),
@@ -960,6 +961,42 @@ func nodeGuestOS(cfg *config.Config) []config.GuestOS {
 	}
 
 	return []config.GuestOS{cfg.Node.CodeBuild.EnvironmentType.GuestOS()}
+}
+
+// NodeArchitectures is what this node's provider can launch (ADR-022): the
+// host's own for a provider that runs work on it, an EC2 node's shapes' declared
+// architectures, a CodeBuild node's environment's. A host whose architecture
+// billet builds no images for reports none, and so does an EC2 node whose shapes
+// declare none; either is placed only for tiers that name no architecture.
+//
+// GOARCH AS A PARAMETER so a test can ask for a host it is not running on.
+func NodeArchitectures(cfg *config.Config, goarch string) []config.Arch {
+	switch p := cfg.Node.Provider; {
+	case p == config.ProviderEC2:
+		var archs []config.Arch
+
+		for _, s := range RemoteShapes(cfg) {
+			if s.Arch != "" {
+				archs = append(archs, s.Arch)
+			}
+		}
+
+		return config.SortedArchs(archs)
+
+	case p == config.ProviderCodeBuild:
+		if cfg.Node.CodeBuild == nil || !cfg.Node.CodeBuild.EnvironmentType.Valid() {
+			return nil
+		}
+
+		return []config.Arch{cfg.Node.CodeBuild.EnvironmentType.Arch()}
+
+	case p.RunsOnHost():
+		if a, ok := config.HostArch(goarch); ok {
+			return []config.Arch{a}
+		}
+	}
+
+	return nil
 }
 
 // codeBuildFleet is the reserved-capacity fleet this node draws on, or empty.

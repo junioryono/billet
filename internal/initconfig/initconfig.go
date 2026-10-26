@@ -1478,6 +1478,10 @@ func ec2InstanceTypesYAML(shapes []config.EC2InstanceType) string {
 		fmt.Fprintf(&b, "      - type: %s\n        vcpu: %d\n        memory: %s\n"+
 			"        price_usd_per_hour: %s\n",
 			yamlScalar(s.Type), s.VCPU, s.Memory, price.Decimal())
+
+		if s.Arch != "" {
+			fmt.Fprintf(&b, "        arch: %s\n", s.Arch)
+		}
 	}
 
 	return b.String()

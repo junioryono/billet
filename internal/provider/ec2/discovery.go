@@ -20,6 +20,10 @@ type InstanceTypeInfo struct {
 	Type      string
 	VCPU      int
 	MemoryMiB int64
+	// Arch is the architecture the shape runs, read from the first of its
+	// supported architectures billet launches images for (x86_64 shapes also list
+	// i386), or empty when it lists none of them (ADR-022).
+	Arch config.Arch
 }
 
 // discoveryClient builds a signed-API client for the read-only describes that
@@ -76,6 +80,7 @@ type describeInstanceTypesResponse struct {
 		MemoryInfo struct {
 			SizeInMiB int64 `xml:"sizeInMiB"`
 		} `xml:"memoryInfo"`
+		SupportedArchitectures []string `xml:"processorInfo>supportedArchitectures>item"`
 	} `xml:"instanceTypeSet>item"`
 	NextToken string `xml:"nextToken"`
 }
@@ -120,11 +125,21 @@ func DescribeInstanceTypes(
 		}
 
 		for _, it := range out.InstanceTypes {
-			infos = append(infos, InstanceTypeInfo{
+			info := InstanceTypeInfo{
 				Type:      it.InstanceType,
 				VCPU:      it.VCPUInfo.DefaultVCPUs,
 				MemoryMiB: it.MemoryInfo.SizeInMiB,
-			})
+			}
+
+			for _, name := range it.SupportedArchitectures {
+				if arch, ok := config.ArchFromEC2(name); ok {
+					info.Arch = arch
+
+					break
+				}
+			}
+
+			infos = append(infos, info)
 		}
 
 		if out.NextToken == "" {

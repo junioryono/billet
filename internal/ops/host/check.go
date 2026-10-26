@@ -346,6 +346,22 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 				member.Provider, liveness)
 		}
 
+		// AN ARCHITECTURE IS WRITTEN ONLY ONCE EVERY HOST CAN READ IT (ADR-022).
+		// REFUSED, not reported: an older host stops on the file.
+		hostWires, err := a.NodeWireVersions(ctx)
+		if err != nil {
+			return report, err
+		}
+
+		if err := archBeforeEveryHost(cfg, hostWires); err != nil {
+			return report, err
+		}
+
+		// AN AMI'S ARCHITECTURE IS READ WHERE THE AWS CREDENTIALS ARE. A control
+		// plane whose file names no EC2 node cannot resolve its tiers' AMIs, so it
+		// says who does rather than reading as if they were checked.
+		reportUncheckedTierAMIs(env, cfg)
+
 		// WHICH LIVE HOSTS EACH SHAPE FITS, for the tier lines below: a tier no
 		// live host can place advertises and is assigned work all the same
 		// (ADR-012), and its jobs wait however much else is free.

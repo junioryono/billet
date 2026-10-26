@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -72,8 +73,23 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 	// before anything is sent, the lease is released and the job waits for a
 	// node that understands it.
 	r.plane.mu.Lock()
-	wire := n.wireVersion
+	wire, archs := n.wireVersion, n.architectures
 	r.plane.mu.Unlock()
+	// NOR IS A TIER NAMING AN ARCHITECTURE, which an older node would launch on
+	// whatever its shapes or host are (ADR-022); and a current node is held to
+	// what it reported, since placement read the ledger at escrow and the host may
+	// have re-registered as another machine since.
+	if tier.Arch != "" && wire < nodeapi.VersionArchitectures {
+		return fmt.Errorf("%w: tier %s runs on %s, which node %s cannot be held to: it speaks "+
+			"wire %d and an architecture needs %d, so upgrade the node",
+			ErrNoNode, tier.Label, tier.Arch, n.name, wire, nodeapi.VersionArchitectures)
+	}
+
+	if tier.Arch != "" && !slices.Contains(archs, tier.Arch) {
+		return fmt.Errorf("%w: tier %s runs on %s, and node %s now reports launching %v",
+			ErrNoNode, tier.Label, tier.Arch, n.name, archs)
+	}
+
 	if tier.NeedsCacheAwareNode() && wire < nodeapi.VersionCacheAuthority {
 		return fmt.Errorf("%w: tier %s configures its caches, which node %s cannot honour: it "+
 			"speaks wire %d and a cache block needs %d, so upgrade the node",
@@ -106,6 +122,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 	}
 	if tier.NeedsCacheAwareNode() {
 		pend.minWire = nodeapi.VersionCacheAuthority
+	}
+
+	if tier.Arch != "" {
+		pend.minWire = max(pend.minWire, nodeapi.VersionArchitectures)
+		pend.arch = tier.Arch
 	}
 
 	res, err := r.plane.dispatch(ctx, n, pend)

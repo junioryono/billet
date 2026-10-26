@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/config"
 )
 
 // A DESCRIBE READS BACK WHAT THE SHAPE HOLDS, and follows pagination — the vcpu
@@ -36,6 +37,10 @@ func TestDescribeInstanceTypesPaginates(t *testing.T) {
 				`<instanceType>c7i.xlarge</instanceType>`+
 				`<vCpuInfo><defaultVCpus>4</defaultVCpus></vCpuInfo>`+
 				`<memoryInfo><sizeInMiB>8192</sizeInMiB></memoryInfo>`+
+				// i386 FIRST, as some x86 shapes list it: billet launches no image for
+				// it, so the architecture read is the next one.
+				`<processorInfo><supportedArchitectures><item>i386</item>`+
+				`<item>x86_64</item></supportedArchitectures></processorInfo>`+
 				`</item></instanceTypeSet>`+
 				`<nextToken>page2</nextToken>`+
 				`</DescribeInstanceTypesResponse>`)
@@ -52,9 +57,11 @@ func TestDescribeInstanceTypesPaginates(t *testing.T) {
 
 		fmt.Fprint(w, `<DescribeInstanceTypesResponse>`+
 			`<instanceTypeSet><item>`+
-			`<instanceType>c7i.2xlarge</instanceType>`+
+			`<instanceType>c7g.2xlarge</instanceType>`+
 			`<vCpuInfo><defaultVCpus>8</defaultVCpus></vCpuInfo>`+
 			`<memoryInfo><sizeInMiB>16384</sizeInMiB></memoryInfo>`+
+			`<processorInfo><supportedArchitectures><item>arm64</item>`+
+			`</supportedArchitectures></processorInfo>`+
 			`</item></instanceTypeSet>`+
 			`</DescribeInstanceTypesResponse>`)
 	}))
@@ -62,7 +69,7 @@ func TestDescribeInstanceTypesPaginates(t *testing.T) {
 
 	infos, err := DescribeInstanceTypes(t.Context(), "us-west-2", srv.URL,
 		awscreds.Static{AccessKeyID: "AKID", SecretAccessKey: "s"},
-		[]string{"c7i.xlarge", "c7i.2xlarge"})
+		[]string{"c7i.xlarge", "c7g.2xlarge"})
 	if err != nil {
 		t.Fatalf("DescribeInstanceTypes: %v", err)
 	}
@@ -73,10 +80,10 @@ func TestDescribeInstanceTypesPaginates(t *testing.T) {
 	if len(infos) != 2 {
 		t.Fatalf("got %d shapes, want 2: %+v", len(infos), infos)
 	}
-	if infos[0] != (InstanceTypeInfo{Type: "c7i.xlarge", VCPU: 4, MemoryMiB: 8192}) {
+	if infos[0] != (InstanceTypeInfo{Type: "c7i.xlarge", VCPU: 4, MemoryMiB: 8192, Arch: config.ArchX64}) {
 		t.Errorf("shape[0] = %+v", infos[0])
 	}
-	if infos[1] != (InstanceTypeInfo{Type: "c7i.2xlarge", VCPU: 8, MemoryMiB: 16384}) {
+	if infos[1] != (InstanceTypeInfo{Type: "c7g.2xlarge", VCPU: 8, MemoryMiB: 16384, Arch: config.ArchARM64}) {
 		t.Errorf("shape[1] = %+v", infos[1])
 	}
 }

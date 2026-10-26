@@ -240,7 +240,12 @@ type node struct {
 	// inventory command to a host whose wire has none, and that choice is made
 	// here, while the queue is held.
 	wireVersion int
-	lastSeen    time.Time
+	// architectures is what this registration reported its provider launches,
+	// none below VersionArchitectures. Dispatch and delivery hold a launch of a
+	// tier naming an architecture to it: placement chose the node from the ledger
+	// at escrow, and the host may have re-registered since (ADR-022).
+	architectures []config.Arch
+	lastSeen      time.Time
 	// inventoryKnown says this incarnation supplied the complete provider inventory
 	// in inventory. The set is evidence about one lease only by membership, never
 	// merely because some inventory exists.
@@ -362,6 +367,9 @@ type pending struct {
 	// at delivery: a process that re-registered under the same name after
 	// dispatch on an older wire must not take a command it cannot honour.
 	minWire int
+	// arch is the architecture the taking process must have reported, checked
+	// again at delivery for the same reason. Empty means the command does not care.
+	arch config.Arch
 	// expectedIncarnation fences a bound destroy to the process that adopted its
 	// lease. A replacement sharing the node name must never take that command.
 	expectedIncarnation string
@@ -962,6 +970,15 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 		}
 	}
 
+	// AN ARCHITECTURE REPORT PLACEMENT COULD BE MISLED BY IS REFUSED HERE,
+	// PERMANENTLY, rather than by the ledger, whose errors this plane answers as an
+	// outage the node retries forever. The same rule runs again where the row is
+	// written, because that half is exported.
+	if err := config.CheckNodeArchitectures(req.Provider,
+		negotiatedArchitectures(req.Architectures, negotiated), req.EC2Shapes); err != nil {
+		return 0, nodeWire, fmt.Errorf("%w: node %q: %w", ErrRefused, req.Node, err)
+	}
+
 	// A CODEBUILD NODE SERVES ONE TRUST CLASS. Config load refuses the pairing
 	// where the file is written; this is the same rule where the catalogue lives,
 	// because the node's file may be the node's alone. PERMANENT, like the site
@@ -1123,6 +1140,17 @@ func safeDigest(raw string) string {
 // sha256HexLen is how long a sha256 is when written as hex.
 const sha256HexLen = 64
 
+// negotiatedArchitectures is what a registration's architectures mean at the wire
+// it was served at: nothing below VersionArchitectures, where a node reports none
+// and is placed only for tiers that name no architecture, as every node was.
+func negotiatedArchitectures(archs []config.Arch, negotiated int) []config.Arch {
+	if negotiated < nodeapi.VersionArchitectures {
+		return nil
+	}
+
+	return archs
+}
+
 // negotiatedDigest takes a manifest digest only from a pairing that has one.
 //
 // CHECKED WHERE IT IS READ, which is the rule the wire's own documentation states
@@ -1202,6 +1230,7 @@ func (p *Plane) register(
 			CodeBuildRegion:  req.CodeBuildRegion,
 			Release:          safeRelease(req.Release),
 			Digest:           negotiatedDigest(req.InstalledDigest, negotiated),
+			Architectures:    negotiatedArchitectures(req.Architectures, negotiated),
 			WireMin:          nodeWire.Min,
 			WireMax:          nodeWire.Max,
 			WireVersion:      negotiated,
@@ -1335,6 +1364,12 @@ func (p *Plane) register(
 	// in a separate process with no view of this map; this copy is what dispatch
 	// consults before sending a command a host's wire may not have.
 	n.wireVersion = negotiated
+	// NOR DOES IT SAY WHAT THE NAME'S PROCESS LAUNCHES, which a registration
+	// claiming no incarnation does not replace. Below VersionArchitectures it
+	// still clears the list, the direction that refuses rather than misplaces.
+	if req.Incarnation != "" || negotiated < nodeapi.VersionArchitectures {
+		n.architectures = negotiatedArchitectures(req.Architectures, negotiated)
+	}
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
@@ -2280,6 +2315,16 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 				ID: pend.cmd.ID,
 				Error: fmt.Sprintf("node %q now speaks wire %d, and this command needs %d; "+
 					"it was not delivered", n.name, n.wireVersion, pend.minWire),
+			})
+
+			continue
+		}
+
+		if pend.arch != "" && !slices.Contains(n.architectures, pend.arch) {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q now reports launching %v, and this command needs %s; "+
+					"it was not delivered", n.name, n.architectures, pend.arch),
 			})
 
 			continue
