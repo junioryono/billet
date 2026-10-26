@@ -3,10 +3,24 @@ package ceph
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
+
+// learnClient is importClient holding a generation-map lock of its own, which
+// LearnArchitectures needs before it maps anything.
+func learnClient(t *testing.T, f *importFake) *Client {
+	t.Helper()
+
+	c := importClient(t, f)
+	c.mapLock = filepath.Join(t.TempDir(), "ceph-generation-maps.lock")
+
+	return c
+}
 
 // elfHead is the first bytes of a little-endian 64-bit ELF executable for the
 // given machine number, as far as elfMachine reads.
@@ -269,7 +283,7 @@ func TestLearnArchitecturesReadsEachGenerationThatRecordsNone(t *testing.T) {
 	const device = "/dev/rbd7"
 	f := &importFake{device: device, snapshots: []string{known, readable, unreadable},
 		metadata: archMeta(ArchKey + "." + known + "  x86_64")}
-	c := importClient(t, f)
+	c := learnClient(t, f)
 
 	var probed []string
 
@@ -288,8 +302,10 @@ func TestLearnArchitecturesReadsEachGenerationThatRecordsNone(t *testing.T) {
 	}
 
 	if len(learned) != 2 || learned[0].Generation != readable || learned[0].Machine != "aarch64" ||
-		learned[0].Err != nil || learned[1].Generation != unreadable || learned[1].Err == nil {
-		t.Fatalf("learned %+v, want %s read as aarch64 and %s unreadable", learned, readable, unreadable)
+		learned[0].Err != nil || !learned[0].Recorded || learned[1].Generation != unreadable ||
+		learned[1].Err == nil || learned[1].Recorded {
+		t.Fatalf("learned %+v, want %s read and recorded as aarch64 and %s unreadable", learned,
+			readable, unreadable)
 	}
 
 	for _, gen := range []string{readable, unreadable} {
@@ -302,12 +318,24 @@ func TestLearnArchitecturesReadsEachGenerationThatRecordsNone(t *testing.T) {
 		t.Errorf("a generation that records its architecture was mapped")
 	}
 
-	if !f.appliedMetadata[ArchKey+"."+readable] || f.appliedMetadata[ArchKey+"."+unreadable] {
-		t.Errorf("recorded %v, want only %s's architecture", f.appliedMetadata, readable)
+	if f.appliedMetadata[ArchKey+"."+unreadable] {
+		t.Errorf("an unreadable generation's architecture was recorded: %v", f.appliedMetadata)
 	}
 
-	if !f.ranWith("lock", "add") {
-		t.Errorf("what was read was not recorded under the publish lock; billet ran %v", f.calls)
+	// THE VALUE READ, WRITTEN WHILE THE PUBLISH LOCK IS HELD.
+	set := slices.IndexFunc(f.calls, func(call []string) bool {
+		return matchesCall(call, []string{"image-meta", "set", "ubuntu-2404-x64", ArchKey + "." + readable})
+	})
+	added := slices.IndexFunc(f.calls, func(call []string) bool { return matchesCall(call, []string{"lock", "add"}) })
+	removed := slices.IndexFunc(f.calls, func(call []string) bool { return matchesCall(call, []string{"lock", "rm"}) })
+
+	if set < 0 || f.calls[set][len(f.calls[set])-1] != "aarch64" {
+		t.Fatalf("%s's architecture was not recorded as aarch64; billet ran %v", readable, f.calls)
+	}
+
+	if added < 0 || removed < 0 || added > set || set > removed {
+		t.Errorf("the record was not written while the publish lock was held (lock add at %d, "+
+			"set at %d, lock rm at %d)", added, set, removed)
 	}
 }
 
@@ -320,7 +348,7 @@ func TestLearnArchitecturesRecordsNothingForAGenerationGoneSinceItWasRead(t *tes
 
 	const device = "/dev/rbd7"
 	f := &importFake{device: device, snapshots: []string{gone}}
-	c := importClient(t, f)
+	c := learnClient(t, f)
 	c.readProbe = func(context.Context, string) ([]byte, error) {
 		f.snapshots = nil
 
@@ -328,8 +356,9 @@ func TestLearnArchitecturesRecordsNothingForAGenerationGoneSinceItWasRead(t *tes
 	}
 
 	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
-	if err != nil || len(learned) != 1 || learned[0].Machine != "x86_64" {
-		t.Fatalf("LearnArchitectures = %+v, %v", learned, err)
+	if err != nil || len(learned) != 1 || learned[0].Machine != "x86_64" || learned[0].Recorded ||
+		learned[0].NotRecorded == nil || !strings.Contains(learned[0].NotRecorded.Error(), "removed") {
+		t.Fatalf("LearnArchitectures = %+v, %v, want it read, not recorded, and saying why", learned, err)
 	}
 
 	if f.appliedMetadata[ArchKey+"."+gone] {
@@ -346,15 +375,17 @@ func TestLearnArchitecturesKeepsARecordWrittenWhileItRead(t *testing.T) {
 	const gen = "g20260802000000"
 
 	f := &importFake{device: "/dev/rbd7", snapshots: []string{gen}}
-	c := importClient(t, f)
+	c := learnClient(t, f)
 	c.readProbe = func(context.Context, string) ([]byte, error) {
 		f.metadata = archMeta(ArchKey + "." + gen + "  aarch64")
 
 		return elfHead(62), nil
 	}
 
-	if _, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64"); err != nil {
-		t.Fatalf("LearnArchitectures: %v", err)
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil || len(learned) != 1 || learned[0].Recorded || learned[0].NotRecorded == nil ||
+		!strings.Contains(learned[0].NotRecorded.Error(), "recorded as aarch64") {
+		t.Fatalf("LearnArchitectures = %+v, %v, want it not recorded, saying why", learned, err)
 	}
 
 	if f.appliedMetadata[ArchKey+"."+gen] {
@@ -368,7 +399,7 @@ func TestLearnArchitecturesKeepsAGenerationItCouldNotMapUnknown(t *testing.T) {
 
 	f := &importFake{snapshots: []string{"g20260802000000"}, failOn: "device map",
 		failErr: errors.New("rbd: map failed: (110) Connection timed out")}
-	c := importClient(t, f)
+	c := learnClient(t, f)
 
 	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
 	if err != nil || len(learned) != 1 || learned[0].Err == nil || learned[0].Machine != "" {
@@ -377,5 +408,101 @@ func TestLearnArchitecturesKeepsAGenerationItCouldNotMapUnknown(t *testing.T) {
 
 	if f.ranWith("image-meta", "set") || f.ranWith("lock", "add") {
 		t.Errorf("nothing was read and something was recorded; billet ran %v", f.calls)
+	}
+}
+
+// WITHOUT THE HOST'S GENERATION-MAP LOCK NOTHING IS MAPPED, SWEPT OR LEARNED: another
+// process could unmap the device between the map and the read, and a device reused
+// for its next map would be read as this generation.
+func TestWithoutTheHostsMapLockNothingIsMappedOrSwept(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{device: "/dev/rbd7", snapshots: []string{"g20260802000000"}}
+	c := importClient(t, f)
+	c.readProbe = func(context.Context, string) ([]byte, error) { return elfHead(62), nil }
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil || len(learned) != 1 || !errors.Is(learned[0].Err, errNoMapLock) {
+		t.Fatalf("LearnArchitectures = %+v, %v, want the generation unknown for want of the lock", learned, err)
+	}
+
+	if err := c.SweepGenerationMaps(t.Context()); !errors.Is(err, errNoMapLock) {
+		t.Errorf("SweepGenerationMaps = %v, want it refused for want of the lock", err)
+	}
+
+	if f.ranWith("device") || f.ranWith("image-meta", "set") {
+		t.Errorf("a client without the lock touched a mapping or recorded something; billet ran %v", f.calls)
+	}
+}
+
+// ANOTHER NODE'S PUBLISH LOCK DOES NOT FAIL THE PULL: what was read goes unrecorded
+// and says why, and the import judges again under the lock it takes itself.
+func TestLearnArchitecturesLeavesUnrecordedWhatAHeldLockKeepsOut(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{device: "/dev/rbd7", snapshots: []string{"g20260802000000"},
+		lockHeld: fmt.Sprintf("billet-build-otherhost-123-%d", time.Now().Add(-time.Minute).Unix())}
+	c := learnClient(t, f)
+	c.readProbe = func(context.Context, string) ([]byte, error) { return elfHead(62), nil }
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil {
+		t.Fatalf("a held publish lock failed the learning: %v", err)
+	}
+
+	if len(learned) != 1 || learned[0].Machine != "x86_64" || learned[0].Recorded ||
+		learned[0].NotRecorded == nil || !strings.Contains(learned[0].NotRecorded.Error(), "publish lock") {
+		t.Fatalf("learned %+v, want it read and not recorded for the held lock", learned)
+	}
+
+	if f.ranWith("image-meta", "set") {
+		t.Errorf("something was recorded without the publish lock; billet ran %v", f.calls)
+	}
+}
+
+// AN IMPORT'S ANSWER CAN BE HAD BEFORE ANYTHING IS DOWNLOADED, from the same rule.
+func TestCheckImportArchAnswersAsTheImportWould(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{infoJSON: `{"size": 8388608}`, snapshots: []string{"g20260801000000"},
+		metadata: archMeta(ArchKey + ".g20260801000000  aarch64")}
+	c := importClient(t, f)
+
+	if err := c.CheckImportArch(t.Context(), "ubuntu-2404-x64", "x86_64"); err == nil ||
+		!strings.Contains(err.Error(), "one image holds one architecture") {
+		t.Fatalf("CheckImportArch = %v, want the refusal an import would give", err)
+	}
+
+	if err := c.CheckImportArch(t.Context(), "ubuntu-2404-x64", "aarch64"); err != nil {
+		t.Errorf("an import of the image's own machine was refused: %v", err)
+	}
+
+	if f.ranWith("lock", "add") {
+		t.Errorf("the advisory check took the publish lock; billet ran %v", f.calls)
+	}
+}
+
+// AN ARCHITECTURE THAT COULD NOT BE RECORDED STOPS THE IMPORT BEFORE THE SNAPSHOT IS
+// MADE, and the write, which may have committed, is taken back.
+func TestAnImportWhoseArchitectureCannotBeRecordedMakesNothing(t *testing.T) {
+	t.Parallel()
+
+	const generation = "g20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device, failMetaSetKey: ArchKey + "." + generation}
+
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
+		"2.336.0", "", "7", importAt)
+	if err == nil || !strings.Contains(err.Error(), "its architecture could not be recorded") {
+		t.Fatalf("ImportGeneration = %v, want the import refused for its architecture", err)
+	}
+
+	if f.ranWith("snap", "create") {
+		t.Errorf("a snapshot was made without its architecture; billet ran %v", f.calls)
+	}
+
+	if f.appliedMetadata[ArchKey+"."+generation] {
+		t.Error("the architecture written before the failure was left behind")
 	}
 }

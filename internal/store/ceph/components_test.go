@@ -63,7 +63,7 @@ func TestAGenerationWhoseComponentsCannotBeRecordedIsWithdrawn(t *testing.T) {
 	if !f.ranWith("snap", "rm", "ubuntu-2404-x64@"+generation) {
 		t.Fatalf("the generation was not withdrawn; billet ran %v", f.calls)
 	}
-	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey, ComponentsKey} {
+	for _, key := range []string{ArchKey, KernelKey, RunnerVersionKey, GuestContractKey, ComponentsKey} {
 		if !f.ranWith("image-meta", "remove", key+"."+generation) {
 			t.Errorf("the withdrawn generation kept %s; billet ran %v", key, f.calls)
 		}
@@ -196,7 +196,7 @@ func TestOnlyTheCompletionResolverReachesACompletionRoot(t *testing.T) {
 // A NODE REMOVES ONLY THE COMPLETION ROOTS IT MADE: another node's may be booting
 // that node's completion, and one whose owner cannot be read is not this node's.
 func TestRemoveCompletionRootsRemovesOnlyTheOwnersRoots(t *testing.T) {
-	var removed, cleared []string
+	var removed, cleared, archCleared []string
 	c := componentsClient(t, func(_ context.Context, _ string, args []string) ([]byte, error) {
 		joined := strings.Join(args, " ")
 		switch {
@@ -215,6 +215,8 @@ func TestRemoveCompletionRootsRemovesOnlyTheOwnersRoots(t *testing.T) {
 			removed = append(removed, args[len(args)-1])
 		case strings.Contains(joined, "image-meta remove") && strings.Contains(joined, CompletionRootOwnerKey):
 			cleared = append(cleared, args[len(args)-1])
+		case strings.Contains(joined, "image-meta remove") && strings.Contains(joined, ArchKey):
+			archCleared = append(archCleared, args[len(args)-1])
 		}
 
 		return nil, nil
@@ -230,6 +232,9 @@ func TestRemoveCompletionRootsRemovesOnlyTheOwnersRoots(t *testing.T) {
 	// between its owner write and its snapshot.
 	if want := []string{CompletionRootOwnerKey + ".c20260815041710"}; !slices.Equal(cleared, want) {
 		t.Fatalf("cleared owner keys %v, want only epyc-1's listed root's", cleared)
+	}
+	if want := []string{ArchKey + ".c20260815041710"}; !slices.Equal(archCleared, want) {
+		t.Fatalf("cleared architecture keys %v, want only the removed root's", archCleared)
 	}
 }
 
@@ -343,7 +348,7 @@ func TestAReservationClearsOwnerKeysWhoseSnapshotIsGone(t *testing.T) {
 		t.Fatalf("import: %v", err)
 	}
 
-	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey} {
+	for _, key := range []string{ArchKey, KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey} {
 		for _, gone := range []string{mine, theirs} {
 			if !f.ranWith("image-meta", "remove", "ubuntu-2404-x64", key+"."+gone) {
 				t.Errorf("%s of %s, whose snapshot is gone, was kept; billet ran %v", key, gone, f.calls)
@@ -458,7 +463,7 @@ func TestACompletionRootThatCouldNotBeWithdrawnKeepsItsOwner(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "could not be withdrawn") {
 		t.Fatalf("got %v, want the root reported as still there", err)
 	}
-	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey} {
+	for _, key := range []string{ArchKey, KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey} {
 		if f.ranWith("image-meta", "remove", key+"."+root) {
 			t.Errorf("rollback removed %s from a completion root that still exists", key)
 		}

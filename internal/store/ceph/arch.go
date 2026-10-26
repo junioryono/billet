@@ -133,6 +133,18 @@ func (c *Client) refuseOtherMachine(ctx context.Context, image, snapshot string)
 	return nil
 }
 
+// CheckImportArch is what an import of machine into image would answer about the
+// generations already there, read without the publish lock: a pull asks before it
+// downloads anything, and the import asks again under the lock, which is the one
+// that decides.
+func (c *Client) CheckImportArch(ctx context.Context, image, machine string) error {
+	if err := checkCloneName(image); err != nil {
+		return err
+	}
+
+	return c.checkImportArch(ctx, image, machine)
+}
+
 // checkImportArch refuses an import of machine into an image unless every
 // generation the image holds is known to be of it. Called under the publish lock,
 // so no generation appears or loses its record between the check and the import.
@@ -177,20 +189,34 @@ func (c *Client) checkImportArch(ctx context.Context, image, machine string) err
 
 	if len(unknown) > 0 {
 		return fmt.Errorf("ceph: %s holds generations whose architecture is not recorded and could "+
-			"not be read from them (%s), so this %s image cannot be shown to be of theirs; "+
-			"unpromote and reap them (`billet images unpromote`, `billet images reap`), or "+
-			"import under a new image name", image, strings.Join(unknown, ", "), machine)
+			"not be read from them (%s), so this %s image cannot be shown to be of theirs. A pull "+
+			"says why it could not read each (a host without debugfs installs e2fsprogs, one without "+
+			"node.lock_dir sets it); otherwise unpromote and reap them (`billet images unpromote`, "+
+			"`billet images reap`; reap keeps a generation a tier pins exactly until the pin moves), "+
+			"or import under a new image name", image, strings.Join(unknown, ", "), machine)
 	}
 
 	return nil
 }
 
+// errNoMapLock is why a client without the host's generation-map lock neither
+// sweeps nor reads a golden image's generation: another process on the host could
+// unmap its device between the map and the read, and a device the kernel reuses
+// for the next map would then be read as this generation.
+var errNoMapLock = errors.New("node.lock_dir is not set, so nothing keeps another process on " +
+	"this host from unmapping a read-only generation map while it is read; set it")
+
 // ArchLearned is what LearnArchitectures made of one generation that recorded no
-// architecture: the machine it read and recorded, or why it could not.
+// architecture.
 type ArchLearned struct {
 	Generation string
-	Machine    string
-	Err        error
+	// Machine is what was read from it, empty when Err says why nothing was.
+	Machine string
+	Err     error
+	// Recorded is whether Machine was written; NotRecorded says why it was not,
+	// for a generation whose machine was read.
+	Recorded    bool
+	NotRecorded error
 }
 
 // LearnArchitectures reads the architecture of each generation of image that
@@ -205,8 +231,11 @@ type ArchLearned struct {
 // publish lock, only for a generation that is still there and still records none.
 //
 // A GENERATION THAT CANNOT BE READ STAYS UNKNOWN, reported in its entry, and the
-// next import into its image refuses with the remedies. Only a failure to list the
-// image or to take a lock is an error.
+// next import into its image refuses with the remedies; so does every one on a
+// client without the host's generation-map lock (errNoMapLock). One read and not
+// recorded says why: another node may hold the publish lock, which is never waited
+// for, and the import judges again under it. Only a failure to list the image is
+// an error.
 func (c *Client) LearnArchitectures(ctx context.Context, image string) ([]ArchLearned, error) {
 	if err := checkCloneName(image); err != nil {
 		return nil, err
@@ -229,12 +258,23 @@ func (c *Client) LearnArchitectures(ctx context.Context, image string) ([]ArchLe
 			continue
 		}
 
+		if c.mapLock == "" {
+			learned = append(learned, ArchLearned{Generation: gen.Name, Err: errNoMapLock})
+
+			continue
+		}
+
 		var machine string
 
 		readErr := c.withGenerationMap(ctx, c.cfg.ImagePool+"/"+image, gen.Name,
 			func(device string) error {
+				// BOUNDED, because the host's generation-map lock is held across it and
+				// the node's own generation checks wait on that lock.
+				probeCtx, cancel := context.WithTimeout(ctx, c.wait)
+				defer cancel()
+
 				var err error
-				machine, err = c.readMachine(ctx, device)
+				machine, err = c.readMachine(probeCtx, device)
 
 				return err
 			})
@@ -245,39 +285,53 @@ func (c *Client) LearnArchitectures(ctx context.Context, image string) ([]ArchLe
 		learned = append(learned, ArchLearned{Generation: gen.Name, Machine: machine, Err: readErr})
 	}
 
-	if !slices.ContainsFunc(learned, func(l ArchLearned) bool { return l.Err == nil }) {
-		return learned, nil
+	if slices.ContainsFunc(learned, func(l ArchLearned) bool { return l.Err == nil }) {
+		c.recordLearnedArches(ctx, image, learned)
 	}
 
-	return learned, c.recordLearnedArches(ctx, image, learned)
+	return learned, nil
 }
 
 // recordLearnedArches writes each learned machine under the publish lock, having
-// proved the generation is still there and still records none.
-func (c *Client) recordLearnedArches(ctx context.Context, image string, learned []ArchLearned) (err error) {
-	lock, lockErr := c.TakePublishLock(ctx, time.Now())
-	if lockErr != nil {
-		return fmt.Errorf("ceph: could not record the architectures read from %s because the "+
-			"publish lock is held; a reap, verification or publish is in progress: %w", image, lockErr)
+// proved the generation is still there and still records none, and says in each
+// entry whether it did and why not.
+func (c *Client) recordLearnedArches(ctx context.Context, image string, learned []ArchLearned) {
+	notRecorded := func(err error) {
+		for i := range learned {
+			if learned[i].Err == nil {
+				learned[i].NotRecorded = err
+			}
+		}
+	}
+
+	lock, err := c.TakePublishLock(ctx, time.Now())
+	if err != nil {
+		notRecorded(fmt.Errorf("the publish lock is held, by a reap, a verification or a publish: %w", err))
+
+		return
 	}
 
 	defer func() {
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
 		defer cancel()
 
-		if releaseErr := lock.Release(releaseCtx); releaseErr != nil && err == nil {
-			err = releaseErr
+		if err := lock.Release(releaseCtx); err != nil {
+			notRecorded(fmt.Errorf("the publish lock was not released: %w", err))
 		}
 	}()
 
 	generations, err := c.Generations(ctx, image)
 	if err != nil {
-		return err
+		notRecorded(err)
+
+		return
 	}
 
 	arches, err := c.GenerationArches(ctx, image)
 	if err != nil {
-		return err
+		notRecorded(err)
+
+		return
 	}
 
 	for i, l := range learned {
@@ -285,17 +339,22 @@ func (c *Client) recordLearnedArches(ctx context.Context, image string, learned 
 			continue
 		}
 
-		present := slices.ContainsFunc(generations, func(g Generation) bool { return g.Name == l.Generation })
-		if !present || arches[l.Generation] != "" {
-			continue
-		}
-
-		if err := c.SetArch(ctx, image, l.Generation, l.Machine); err != nil {
-			learned[i].Err = err
+		switch present := slices.ContainsFunc(generations, func(g Generation) bool {
+			return g.Name == l.Generation
+		}); {
+		case !present:
+			learned[i].NotRecorded = errors.New("it was removed since it was read")
+		case arches[l.Generation] != "":
+			learned[i].NotRecorded = fmt.Errorf("it was recorded as %s since it was read",
+				arches[l.Generation])
+		default:
+			if err := c.SetArch(ctx, image, l.Generation, l.Machine); err != nil {
+				learned[i].NotRecorded = err
+			} else {
+				learned[i].Recorded = true
+			}
 		}
 	}
-
-	return nil
 }
 
 // readMachine reads the ELF machine of archProbePath on a mapped root filesystem.
@@ -340,7 +399,7 @@ func elfMachine(head []byte) (string, error) {
 // device, read by debugfs, which opens a filesystem read-only unless told
 // otherwise and mounts nothing.
 //
-// ITS EXIT STATUS SAYS NOTHING. debugfs -R answers 0 for a path it could not find,
+// AN EXIT OF 0 PROVES NOTHING. debugfs -R answers 0 for a path it could not find,
 // printing the complaint to stderr, so only the bytes it wrote are evidence, and
 // elfMachine refuses anything that is not an ELF header.
 func readProbeWithDebugfs(ctx context.Context, device string) ([]byte, error) {

@@ -71,6 +71,7 @@ type generationPublisher interface {
 	) (string, error)
 	SweepGenerationMaps(ctx context.Context) error
 	LearnArchitectures(ctx context.Context, image string) ([]ceph.ArchLearned, error)
+	CheckImportArch(ctx context.Context, image, machine string) error
 }
 
 // openGenerationPublisher builds the cluster client this config names, holding
@@ -200,6 +201,18 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 			"own; give the image name alone", image)
 	}
 
+	store, err := openGenerationPublisher(cfg)
+	if err != nil {
+		return err
+	}
+
+	// BEFORE ANYTHING IS DOWNLOADED: an import the image's generations refuse is
+	// known now, and a refresh that would meet it every day costs a gigabytes-long
+	// download each time otherwise. The import judges again under the publish lock.
+	if err := learnImageArchitectures(ctx, env, store, image); err != nil {
+		return err
+	}
+
 	manifest, dir, cleanup, err := stageImage(ctx, env, cfg, stageOptions{
 		from:     *from,
 		source:   *source,
@@ -248,15 +261,6 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 
 	raw, err := unpackRootfs(ctx, env, manifest, dir)
 	if err != nil {
-		return err
-	}
-
-	store, err := openGenerationPublisher(cfg)
-	if err != nil {
-		return err
-	}
-
-	if err := learnImageArchitectures(ctx, env, store, image); err != nil {
 		return err
 	}
 
@@ -458,35 +462,43 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 }
 
 // learnImageArchitectures sweeps the read-only generation maps a crash left on this
-// host, then reads the architecture of each generation of image that records none
-// (ADR-022), before anything is imported into it: an import is refused unless
-// every generation the image holds is known to be of its own.
+// host, reads the architecture of each generation of image that records none
+// (ADR-022), and refuses the pull when the import it would make is one the
+// image's generations refuse: an import is refused unless every generation the
+// image holds is known to be of its own machine, which is this host's.
 //
-// A GENERATION THAT CANNOT BE READ IS SAID, NOT FATAL, here: it stays unknown, and
-// the import names the remedies if it meets one. A sweep that could not unmap is a
-// warning, since what it leaves is a mapping, not a decision.
+// A GENERATION THAT CANNOT BE READ IS SAID HERE, with why, and the refusal that
+// follows names the remedies. A sweep that could not unmap is a warning, since what
+// it leaves is a mapping, not a decision.
 func learnImageArchitectures(ctx context.Context, env cli.Env, store generationPublisher, image string) error {
 	if err := store.SweepGenerationMaps(ctx); err != nil {
-		fmt.Fprintf(env.Stdout, "warning: a read-only generation mapping left on this host could "+
-			"not be unmapped: %v\n", err)
+		fmt.Fprintf(env.Stdout, "warning: the read-only generation maps a crash may have left on this "+
+			"host were not swept: %v\n", err)
 	}
 
 	learned, err := store.LearnArchitectures(ctx, image)
 	if err != nil {
 		return fmt.Errorf("billet images pull: the architectures of %s's generations could not be "+
-			"read, so nothing was imported: %w", image, err)
+			"read, so nothing was downloaded: %w", image, err)
 	}
 
 	for _, l := range learned {
-		if l.Err != nil {
-			fmt.Fprintf(env.Stdout, "%s@%s records no architecture and it could not be read from "+
-				"it: %v\n", image, l.Generation, l.Err)
-
-			continue
+		switch {
+		case l.Err != nil:
+			fmt.Fprintf(env.Stdout, "%s@%s records no architecture, and it could not be read from it: %v\n",
+				image, l.Generation, l.Err)
+		case l.Recorded:
+			fmt.Fprintf(env.Stdout, "%s@%s recorded no architecture; read %s from it and recorded it\n",
+				image, l.Generation, l.Machine)
+		default:
+			fmt.Fprintf(env.Stdout, "%s@%s records no architecture; read %s from it and did not record "+
+				"it: %v\n", image, l.Generation, l.Machine, l.NotRecorded)
 		}
+	}
 
-		fmt.Fprintf(env.Stdout, "%s@%s records no architecture; read %s from it and recorded it\n",
-			image, l.Generation, l.Machine)
+	if err := store.CheckImportArch(ctx, image, hostArch()); err != nil {
+		return fmt.Errorf("billet images pull: nothing was downloaded, because an import into %s "+
+			"would be refused: %w", image, err)
 	}
 
 	return nil

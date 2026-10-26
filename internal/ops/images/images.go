@@ -137,6 +137,23 @@ func cmdImagesCompatible(ctx context.Context, env cli.Env, args []string) error 
 	return &cli.ExitError{Code: 2, Msg: fmt.Sprintf("%d configured guest image(s) need a compatible generation", len(refresh))}
 }
 
+// pinResolver is what refuseForeignPin asks of the cluster.
+type pinResolver interface {
+	ResolveGeneration(ctx context.Context, image, guestContract string) (string, error)
+}
+
+// refuseForeignPin refuses an exact pin a launch on this host would refuse: one
+// recorded as another machine's (ADR-022). Its contract may match, so without this
+// the upgrade would commit and every launch of the tier fail after it.
+func refuseForeignPin(ctx context.Context, store pinResolver, exact string) error {
+	if _, err := store.ResolveGeneration(ctx, exact, firecracker.GuestContract); err != nil {
+		return fmt.Errorf("billet images compatible: the pinned generation %s cannot be launched on "+
+			"this host: %w; update the exact pin before upgrading", exact, err)
+	}
+
+	return nil
+}
+
 func checkImageCompatible(
 	ctx context.Context, env cli.Env,
 	cfg *config.Config,
@@ -203,6 +220,10 @@ func checkImageCompatible(
 		if !present {
 			return fmt.Errorf("billet images compatible: pinned generation %s@%s no longer exists; update the exact pin before upgrading",
 				name, generation)
+		}
+
+		if err := refuseForeignPin(ctx, store, name+"@"+generation); err != nil {
+			return err
 		}
 
 		verifiedGenerations, err := store.VerifiedGenerations(ctx, name)

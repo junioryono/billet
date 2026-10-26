@@ -206,7 +206,7 @@ func TestASweepStartsNoUnmapPastItsBudget(t *testing.T) {
 			return f.run(ctx, bin, args)
 		}
 
-		if err := c.sweepGenerationMaps(t.Context()); err == nil {
+		if err := c.sweepGenerationMaps(t.Context(), c.cfg.CachePool); err == nil {
 			t.Fatal("a sweep that ran out of time reported nothing left")
 		}
 		if unmaps != 2 || len(f.mappings) != 2 {

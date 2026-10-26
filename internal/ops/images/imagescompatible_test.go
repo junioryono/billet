@@ -1,6 +1,8 @@
 package images
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -236,5 +238,32 @@ func TestImageResultCanRecordEveryConfiguredRefresh(t *testing.T) {
 	}
 	if string(body) != strings.Join(want, "\n")+"\n" {
 		t.Fatalf("refresh result = %q, want one image per line", body)
+	}
+}
+
+// pinResolverFunc answers ResolveGeneration with a function.
+type pinResolverFunc func(image string) (string, error)
+
+func (f pinResolverFunc) ResolveGeneration(_ context.Context, image, _ string) (string, error) {
+	return f(image)
+}
+
+// AN EXACT PIN OF ANOTHER MACHINE'S GENERATION IS NOT COMPATIBLE, though its
+// contract matches: every launch of the tier would refuse it after the upgrade
+// committed.
+func TestAnExactPinOfAnotherMachinesGenerationIsRefused(t *testing.T) {
+	foreign := pinResolverFunc(func(string) (string, error) {
+		return "", errors.New("ceph: ubuntu-2404-x64@g20260815033431 was built for aarch64 and this host is x86_64")
+	})
+
+	err := refuseForeignPin(t.Context(), foreign, "ubuntu-2404-x64@g20260815033431")
+	if err == nil || !strings.Contains(err.Error(), "built for aarch64") ||
+		!strings.Contains(err.Error(), "update the exact pin") {
+		t.Fatalf("refuseForeignPin = %v, want the pin refused with the operator's action", err)
+	}
+
+	own := pinResolverFunc(func(image string) (string, error) { return image, nil })
+	if err := refuseForeignPin(t.Context(), own, "ubuntu-2404-x64@g20260815033431"); err != nil {
+		t.Errorf("a pin this host can launch was refused: %v", err)
 	}
 }

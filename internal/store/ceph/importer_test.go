@@ -952,16 +952,65 @@ func TestImportGenerationRoundsUpToWholeMegabytes(t *testing.T) {
 func TestImportGenerationRefusesToRepublishAnExistingGenerationName(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 
-	f := &importFake{device: device, failSnapCreate: true}
+	// THE SAME SECOND'S NAME, ALREADY TAKEN, and its generation's own architecture.
+	f := &importFake{device: device, infoJSON: `{"size": 8388608}`,
+		snapshots: []string{"g20260815041709"}, metadata: archMeta(ArchKey + ".g20260815041709  x86_64")}
 
 	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
-	if err == nil {
-		t.Fatal("a colliding snapshot name was reported as a successful publish")
+	if err == nil || !strings.Contains(err.Error(), "already taken") {
+		t.Fatalf("a colliding generation name was answered %v, want the name refused", err)
 	}
 
-	if f.ranWith("image-meta", "set") {
-		t.Error("the runner version was recorded against a snapshot that was not created; " +
-			"on a real collision that would overwrite the existing generation's version")
+	if f.ranWith("image-meta", "set") || f.ranWith("device", "map") || f.ranWith("snap", "rm") {
+		t.Errorf("a colliding name reached the existing generation; billet ran %v", f.calls)
+	}
+}
+
+// AND A CREATE THAT MADE NOTHING TAKES BACK WHAT WAS RECORDED FOR IT, the
+// architecture written before the snapshot, so no key describes a generation that
+// does not exist; nothing else was written.
+func TestARefusedCreateRemovesTheArchitectureRecordedBeforeIt(t *testing.T) {
+	const generation = "g20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device, failSnapCreate: true}
+
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt); err == nil {
+		t.Fatal("a generation whose create was refused was reported published")
+	}
+
+	if f.appliedMetadata[ArchKey+"."+generation] {
+		t.Error("the architecture recorded before a create that made nothing was left behind")
+	}
+
+	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey} {
+		if f.ranWith("image-meta", "set", "ubuntu-2404-x64", key+"."+generation) {
+			t.Errorf("%s was recorded for a snapshot that was never made", key)
+		}
+	}
+}
+
+// AND ONE WHOSE ANSWER WAS LOST AFTER IT MADE THE SNAPSHOT WITHDRAWS IT: nothing but
+// the architecture describes it, and a generation without its runner version is
+// one `images due` counts as current.
+func TestACreateThatMadeTheSnapshotThoughItFailedIsWithdrawn(t *testing.T) {
+	const generation = "g20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device, failSnapCreateApplied: true}
+
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
+		"2.336.0", "", "7", importAt); err == nil {
+		t.Fatal("a generation whose create answered an error was reported published")
+	}
+
+	if !f.ranWith("snap", "rm", "ubuntu-2404-x64@"+generation) || slices.Contains(f.snapshots, generation) {
+		t.Errorf("the snapshot the failed create made is still there; billet ran %v", f.calls)
+	}
+
+	if f.appliedMetadata[ArchKey+"."+generation] {
+		t.Error("the withdrawn generation's architecture was left behind")
 	}
 }
 
@@ -1410,13 +1459,13 @@ func TestImportGenerationRemovesMetadataForAWithdrawnSnapshot(t *testing.T) {
 		{
 			name:       "runner version fails after kernel",
 			failKey:    RunnerVersionKey + "." + generation,
-			wantRemove: []string{KernelKey, RunnerVersionKey},
+			wantRemove: []string{ArchKey, KernelKey, RunnerVersionKey},
 			wantKeep:   []string{GuestContractKey},
 		},
 		{
 			name:       "guest contract fails after kernel and runner version",
 			failKey:    GuestContractKey + "." + generation,
-			wantRemove: []string{KernelKey, RunnerVersionKey, GuestContractKey},
+			wantRemove: []string{ArchKey, KernelKey, RunnerVersionKey, GuestContractKey},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

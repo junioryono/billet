@@ -8,6 +8,7 @@ import (
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/store/ceph"
 	"github.com/junioryono/billet/internal/unitpath"
 )
 
@@ -74,7 +75,36 @@ func RefreshPaths(env cli.Env, cfg *config.Config, cfgPath string) []unitpath.Ne
 			Why: "where a node with no certificate keeps its deployment identity"})
 	}
 
-	return append(needs, probeLockNeed(cfg))
+	needs = append(needs, probeLockNeed(cfg))
+
+	// THE HOST'S GENERATION-MAP LOCK, which a pull holds while it reads a golden
+	// image's generation, as the node's cache store holds it for its own checks.
+	// IN node.lock_dir, which it does not make: the node's unit and the probe lock
+	// declared above both do.
+	if lock := app.GenerationMapLockPath(cfg); lock != "" {
+		needs = append(needs, unitpath.Need{Path: lock, Access: unitpath.Lock,
+			Why: "the lock every read-only generation map on the host is held under, which a pull " +
+				"takes to read a generation's architecture",
+			Take: func(ctx context.Context) (func() error, error) {
+				ctx, cancel := context.WithTimeout(ctx, unitPathLockWait)
+				defer cancel()
+
+				release, err := ceph.TakeGenerationMapLock(ctx, lock)
+				if errors.Is(err, context.DeadlineExceeded) {
+					return unitpath.NothingHeld, nil
+				}
+
+				if err != nil {
+					return nil, err
+				}
+
+				release()
+
+				return unitpath.NothingHeld, nil
+			}})
+	}
+
+	return needs
 }
 
 // certificateLoads reports whether the node has a certificate bundle the

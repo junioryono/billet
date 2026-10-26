@@ -40,11 +40,22 @@ const generationMapLockName = "ceph-generation-maps.lock"
 // file another account could create could be held to stop every generation check
 // on the host.
 func GenerationMapLock(cfg *config.Config) []ceph.Option {
-	if cfg.Node == nil || cfg.Node.LockDir == "" {
+	path := GenerationMapLockPath(cfg)
+	if path == "" {
 		return nil
 	}
 
-	return []ceph.Option{ceph.WithGenerationMapLock(filepath.Join(cfg.Node.LockDir, generationMapLockName))}
+	return []ceph.Option{ceph.WithGenerationMapLock(path)}
+}
+
+// GenerationMapLockPath is the file GenerationMapLock holds a client's maps under,
+// empty when the node names no lock_dir.
+func GenerationMapLockPath(cfg *config.Config) string {
+	if cfg.Node == nil || cfg.Node.LockDir == "" {
+		return ""
+	}
+
+	return filepath.Join(cfg.Node.LockDir, generationMapLockName)
 }
 
 // NodeCacheControl is what the node's cache service asks the control plane:
@@ -94,8 +105,9 @@ func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store,
 		// THE NODE IT MAPS FOR, recorded on every writable volume it maps: the
 		// mapping table is the host's, so only that record proves a leftover
 		// mapping this node's rather than another identity's on the same host.
-		options := append([]ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg)),
-			ceph.WithMapOwner(deployment + "/" + cfg.Node.Name)}, GenerationMapLock(cfg)...)
+		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg)),
+			ceph.WithMapOwner(deployment + "/" + cfg.Node.Name)}
+		options = append(options, GenerationMapLock(cfg)...)
 
 		return ceph.New(*cfg.Node.Ceph, options...)
 	case config.ProviderEC2:

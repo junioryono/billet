@@ -1687,7 +1687,7 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 
 	// A GENERATION MAPPING A CRASH LEFT BEHIND GOES FIRST, because eviction
 	// keeps every image this host maps.
-	sweep := c.sweepGenerationMaps(ctx)
+	sweep := c.sweepGenerationMaps(ctx, c.cfg.CachePool)
 	generations := c.withCacheLock(ctx, time.Now(), func(now time.Time) error {
 		return c.evictGenerations(ctx, olderThan, now)
 	})
