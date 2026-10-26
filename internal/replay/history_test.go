@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -489,7 +490,19 @@ func TestComparePolicies(t *testing.T) {
 
 	opts.Log = discardLogger()
 
-	table := Compare(t, fleet, trace, DefaultPolicies, opts).Markdown()
+	// BILLET_REPLAY_POLICY replays one policy alone, so the policies of a long
+	// comparison can run as processes side by side.
+	policies, only := DefaultPolicies, os.Getenv("BILLET_REPLAY_POLICY")
+	if only != "" {
+		i := slices.IndexFunc(DefaultPolicies, func(p Policy) bool { return p.Name == only })
+		if i < 0 {
+			t.Fatalf("BILLET_REPLAY_POLICY=%q is none of the default policies", only)
+		}
+
+		policies = DefaultPolicies[i : i+1]
+	}
+
+	table := Compare(t, fleet, trace, policies, opts).Markdown()
 	t.Log("\n" + table)
 
 	if *outDir != "" {
@@ -497,7 +510,12 @@ func TestComparePolicies(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		name := "compare-" + os.Getenv("BILLET_REPLAY_COMPARE") + ".md"
+		name := "compare-" + os.Getenv("BILLET_REPLAY_COMPARE")
+		if only != "" {
+			name += "-" + only
+		}
+
+		name += ".md"
 		if err := os.WriteFile(filepath.Join(*outDir, name), []byte(table), 0o644); err != nil {
 			t.Fatal(err)
 		}
