@@ -37,15 +37,28 @@ const (
 	// minutes, so this renews each about once an hour and leaves six hours of
 	// margin against eviction.
 	cacheRenewWithin = 6 * time.Hour
-	// dockerStoreAttachLimit bounds acquiring a guest's Docker image store, well
-	// inside the five-minute metadata token the guest agent fetched at boot.
+	// dockerStoreAttachLimit bounds acquiring a guest's Docker image store: the
+	// clone or the fresh volume. An image built before #320's fix fetched a
+	// five-minute metadata token at boot and reads its registration after this
+	// answer, so the acquisition stays well inside that token; newer images fetch
+	// six hours.
 	dockerStoreAttachLimit = 3 * time.Minute
-	cacheWriterTTL         = 15 * time.Minute
-	cacheVolumeLimit       = int64(100 << 30)
-	dockerSettleWait       = 2 * time.Minute
-	dockerStoreKey         = "docker-images/"
-	publicationCAS         = "cas"
-	publicationLWW         = "last-write-wins"
+	// dockerStoreRequestLimit bounds the steps toward the answer that take a
+	// context, from the request's arrival: the session lock, the kill switch, the
+	// acquisition and the attach. The session's writes and the report to the
+	// control plane are outside it. The guest starts its runner only after this answer and waits a
+	// little longer than this for it (docker-cache.sh), so a store that is slow
+	// costs a cold job rather than a runner GitHub lists offline (#320). The
+	// minute beyond the acquisition is EC2's attach, which waits for AWS to report
+	// it attached; an attach that fails, this bound included, leaves its volume in
+	// the session's custody rather than racing it with a detach.
+	dockerStoreRequestLimit = 4 * time.Minute
+	cacheWriterTTL          = 15 * time.Minute
+	cacheVolumeLimit        = int64(100 << 30)
+	dockerSettleWait        = 2 * time.Minute
+	dockerStoreKey          = "docker-images/"
+	publicationCAS          = "cas"
+	publicationLWW          = "last-write-wins"
 
 	// A last-write-wins writer waiting on a live holder polls on this schedule,
 	// never past the holder's expiry. Measured before it existed: 100ms flat
@@ -66,11 +79,14 @@ type CacheService struct {
 	namespace string
 	rootState string
 	stateDir  string
-	store     storecontract.Store
-	attacher  provider.VolumeAttacher
-	log       *slog.Logger
-	wait      func(ctx context.Context, d time.Duration) error
-	now       func() time.Time
+	// syncDir makes a session's installed record durable; a seam so a test can
+	// fail the write after its rename, where the record has already changed.
+	syncDir  func(string) error
+	store    storecontract.Store
+	attacher provider.VolumeAttacher
+	log      *slog.Logger
+	wait     func(ctx context.Context, d time.Duration) error
+	now      func() time.Time
 
 	mu         sync.Mutex
 	byToken    map[string]*cacheSession
@@ -286,8 +302,14 @@ type cacheAttachment struct {
 	Volume      storecontract.Volume `json:"volume"`
 	Publication string               `json:"publication,omitempty"`
 	Docker      bool                 `json:"docker,omitempty"`
-	Settling    bool                 `json:"settling,omitempty"`
-	Ready       bool                 `json:"ready,omitempty"`
+	// Unmounted says this Docker image store was never durably handed to the
+	// guest: its attach has not succeeded, failed, or could not be recorded, so
+	// the guest went cold without it. Nothing settles, publishes or lets the
+	// guest discard it, and the session's cleanup discards it once the compute
+	// is gone.
+	Unmounted bool `json:"unmounted,omitempty"`
+	Settling  bool `json:"settling,omitempty"`
+	Ready     bool `json:"ready,omitempty"`
 	// Deferred says the guest committed a default-branch sticky disk, which
 	// publishes only once the job's completion authorises it.
 	Deferred bool `json:"deferred,omitempty"`
@@ -330,6 +352,7 @@ func NewCacheService(
 		endpoint: endpoint, namespace: namespace, store: storage, attacher: attacher, log: log,
 		rootState:  stateDir,
 		stateDir:   filepath.Join(stateDir, cacheSessionDirectory),
+		syncDir:    syncDirectory,
 		byToken:    make(map[string]*cacheSession),
 		byInstance: make(map[string]string),
 		actionIO:   hostActionsVolumeManager{},
@@ -1249,8 +1272,18 @@ func (s *CacheService) attachDockerStore(
 	r *http.Request,
 	session *cacheSession,
 ) {
-	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
+	started := time.Now()
+	// EVERY STEP TOWARD THE ANSWER THAT TAKES A CONTEXT RUNS ON requestCtx, AND
+	// EVERY CLEANUP ON ctx.
+	// The answer is worth nothing once the guest has stopped waiting, so the
+	// forward steps end with the request's bound or the guest's connection. A
+	// cleanup ends with neither: the guest gives up just after the request's
+	// bound, and the discard of a clone the session could not record, cancelled
+	// by the hang-up, would leave a volume nothing knows about.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), cacheWorkLimit)
 	defer cancel()
+	requestCtx, cancelRequest := context.WithTimeout(r.Context(), dockerStoreRequestLimit)
+	defer cancelRequest()
 
 	var request struct {
 		Architecture string `json:"architecture"`
@@ -1265,7 +1298,9 @@ func (s *CacheService) attachDockerStore(
 
 		return
 	}
-	if err := lockCacheSession(ctx, session); err != nil {
+	if err := lockCacheSession(requestCtx, session); err != nil {
+		s.log.Warn("Docker image store request could not take its cache session; the job can continue cold",
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond), "error", err)
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
@@ -1282,22 +1317,23 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 	setting := sessionSetting(session, config.CacheDocker)
-	if !setting.Enabled || !s.sessionKindAllowed(ctx, session, config.CacheDocker) {
+	if !setting.Enabled || !s.sessionKindAllowed(requestCtx, session, config.CacheDocker) {
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "the Docker image store is off for this job", http.StatusForbidden)
 
 		return
 	}
 
-	// THE ACQUISITION IS BOUNDED BY dockerStoreAttachLimit, not cacheWorkLimit,
-	// and the cleanup below keeps the longer bound. The guest asks for its store
-	// before it starts its runner, on a metadata token it fetched at boot that
-	// lives five minutes, so an answer later than that left it unable to read its
-	// own registration: on 2026-10-03 a store that took eight and a half minutes,
-	// queued behind the cache index lock, ended with "no command in the metadata"
-	// and a runner that never connected (#320). A store not ready in time is a
-	// cold job, which pulls its images; the store is offered again to the next.
-	acquireCtx, cancelAcquire := context.WithTimeout(ctx, dockerStoreAttachLimit)
+	// THE ACQUISITION IS BOUNDED BY dockerStoreAttachLimit, inside the request's
+	// own bound, and the cleanup below keeps the longer one. The guest asks for
+	// its store before it starts its runner, and an image built before #320's fix
+	// does so on a metadata token that lives five minutes, so an answer later than
+	// that left it unable to read its own registration: on 2026-10-03 a store that
+	// took eight and a half minutes, queued behind the cache index lock, ended with
+	// "no command in the metadata" and a runner that never connected. A store not
+	// ready in time is a cold job, which pulls its images; the store is offered
+	// again to the next.
+	acquireCtx, cancelAcquire := context.WithTimeout(requestCtx, dockerStoreAttachLimit)
 	defer cancelAcquire()
 
 	key := s.cacheKeyFor(session, config.CacheDocker, request.Architecture, "")
@@ -1307,7 +1343,8 @@ func (s *CacheService) attachDockerStore(
 	}
 	if err != nil {
 		s.log.Warn("Docker image store is unavailable; the job can continue cold",
-			"instance", session.instance, "error", err)
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+			"error", err)
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
@@ -1326,8 +1363,11 @@ func (s *CacheService) attachDockerStore(
 		}
 	}
 
+	// RECORDED AS NEVER MOUNTED UNTIL THE ATTACH HAS SUCCEEDED AND THAT IS
+	// DURABLE, so no path that loses track of the attach (a failed write, a
+	// restart, a failed attach) leaves a store settlement would wait for.
 	session.slots[0] = &cacheAttachment{
-		Volume: volume, Publication: publicationLWW, Docker: true,
+		Volume: volume, Publication: publicationLWW, Docker: true, Unmounted: true,
 	}
 	if err := s.persistSession(session); err != nil {
 		discardErr := s.store.Discard(ctx, volume)
@@ -1338,39 +1378,74 @@ func (s *CacheService) attachDockerStore(
 			retryErr = s.persistSession(session)
 		}
 		s.log.Warn("Docker image-store custody could not be made durable; the job can continue cold",
-			"instance", session.instance, "error", errors.Join(err, discardErr, retryErr))
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+			"error", errors.Join(err, discardErr, retryErr))
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
 	}
 
-	if err := s.attacher.AttachVolume(ctx, session.instance, 0, volume.Device); err != nil {
-		detachErr := s.attacher.DetachVolume(ctx, session.instance, 0, volume.Device)
-		var discardErr, clearErr error
-		if detachErr == nil {
-			discardErr = s.store.Discard(ctx, volume)
-			if discardErr == nil {
-				session.slots[0] = nil
-				clearErr = s.persistSession(session)
-				if clearErr != nil {
-					session.slots[0] = &cacheAttachment{
-						Volume: volume, Publication: publicationLWW, Docker: true,
-					}
-				}
-			}
-		}
-		s.log.Warn("Docker image store could not be attached; the job can continue cold",
-			"instance", session.instance,
-			"error", errors.Join(err, detachErr, discardErr, clearErr))
+	if err := s.attacher.AttachVolume(requestCtx, session.instance, 0, volume.Device); err != nil {
+		// A FAILED ATTACH IS NOT PROOF THE VOLUME IS FREE. EC2 may complete an
+		// attachment it accepted after billet stopped waiting, its own timeouts
+		// and describe calls can fail after it did, and its describes are
+		// eventually consistent, so a detach and discard now would race it on
+		// evidence that proves nothing. The volume stays in the session's
+		// custody, already durable and still marked as never mounted, so
+		// nothing waits to settle it, and the session's cleanup discards it once
+		// the compute is proved gone; the guest goes cold without it.
+		s.log.Warn("Docker image store could not be attached; the session keeps it until the "+
+			"compute is gone, and the job can continue cold",
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+			"error", err)
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
 	}
 
-	// THE GUEST HAS ITS STORE, so what the store answered is what it saw.
+	// AN ATTACH THAT RETURNED AFTER THE REQUEST ENDED is answered cold: the guest
+	// gives up twenty seconds after this bound, and a store recorded as mounted
+	// for a guest that went cold is one settlement waits on.
+	if requestCtx.Err() != nil {
+		s.log.Warn("the Docker image store attached after the request's bound; the session keeps "+
+			"it until the compute is gone, and the job can continue cold",
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond))
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	// MOUNTABLE ONLY ONCE THAT IS DURABLE. A store answered to the guest but
+	// recorded as never mounted would be refused its readiness at settlement,
+	// so a write that fails here sends the guest cold instead, and the store
+	// stays in custody for the cleanup.
+	session.slots[0].Unmounted = false
+	if err := s.persistSession(session); err != nil {
+		// A WRITE CAN FAIL AFTER ITS RENAME, at the directory sync, and leave
+		// "mounted" installed; the never-mounted state is written again so the
+		// record matches the cold answer, as far as a second write can.
+		session.slots[0].Unmounted = true
+		restoreErr := s.persistSession(session)
+		s.log.Warn("the attached Docker image store could not be recorded as mounted; the session "+
+			"keeps it until the compute is gone, and the job can continue cold",
+			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
+			"error", errors.Join(err, restoreErr))
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	// THE GUEST HAS ITS STORE, so what the store answered is what it saw. How
+	// long the whole request took is logged with each attach, which is what
+	// measures #320's wait.
 	s.observe(ctx, session, observed)
+	s.log.Info("attached a Docker image store", "instance", session.instance,
+		"cache", observed.ImageCache, "generation", volume.Generation,
+		"took", time.Since(started).Round(time.Millisecond))
 
 	guestDevice := guestVolumeDevice(0)
 	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {
@@ -1406,7 +1481,7 @@ func (s *CacheService) markDockerStoreReady(
 	}
 	defer session.mu.Unlock()
 	attachment := session.slots[0]
-	if session.closed || attachment == nil || !attachment.Docker {
+	if session.closed || attachment == nil || !attachment.Docker || attachment.Unmounted {
 		http.Error(w, "Docker image store is not attached", http.StatusNotFound)
 
 		return
@@ -1449,40 +1524,48 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	if err != nil {
 		return err
 	}
-	if err := lockCacheSession(ctx, session); err != nil {
-		return err
-	}
 	defer session.mu.Unlock()
-	if session.slots[0] != attachment || !attachment.Ready {
-		return nil
-	}
 
 	return s.publishDocker(ctx, session, attachment)
 }
 
 // errNoDockerStore is awaitDockerReady's answer for a session with no Docker
-// image store: there is nothing to settle.
+// image store, one its guest never mounted, or one replaced while settlement
+// waited: there is nothing to settle.
 var errNoDockerStore = errors.New("this session has no Docker image store")
 
 // awaitDockerReady opens the Docker store's settlement and waits for the guest
-// to prove it quiesced, returning the ready attachment, or errNoDockerStore
-// when the session has none.
+// to prove it quiesced, returning the ready attachment with the session still
+// locked, which the caller unlocks, or errNoDockerStore when the session has
+// none. Returning it locked is what keeps the whole settlement inside the
+// window: a lock taken again afterwards could wait behind another request.
 func (s *CacheService) awaitDockerReady(
 	ctx context.Context, session *cacheSession,
 ) (*cacheAttachment, error) {
-	if err := lockCacheSession(ctx, session); err != nil {
+	// THE WHOLE WAIT IS INSIDE THE SETTLE WINDOW, every wait for the session
+	// lock included: a replacement request holds that lock through its
+	// acquisition and attach, and the job's teardown waits on this.
+	settleCtx, cancelSettle := context.WithTimeout(ctx, dockerSettleWait)
+	defer cancelSettle()
+	notReady := errors.New("docker image store did not become ready before teardown")
+
+	if err := lockCacheSession(settleCtx, session); err != nil {
+		if ctx.Err() == nil {
+			return nil, notReady
+		}
+
 		return nil, err
 	}
-	attachment := session.slots[0]
-	if attachment == nil || !attachment.Docker {
+	opened := session.slots[0]
+	if opened == nil || !opened.Docker || opened.Unmounted {
 		session.mu.Unlock()
 
 		return nil, errNoDockerStore
 	}
-	if !attachment.Settling {
-		attachment.Settling = true
-		attachment.Ready = false
-		attachment.Volume.Filesystem = storecontract.Filesystem{}
+	if !opened.Settling {
+		opened.Settling = true
+		opened.Ready = false
+		opened.Volume.Filesystem = storecontract.Filesystem{}
 		if err := s.persistSession(session); err != nil {
 			session.mu.Unlock()
 
@@ -1491,24 +1574,27 @@ func (s *CacheService) awaitDockerReady(
 	}
 	session.mu.Unlock()
 
-	deadline := time.NewTimer(dockerSettleWait)
-	defer deadline.Stop()
-
 	for {
-		if err := lockCacheSession(ctx, session); err != nil {
+		if err := lockCacheSession(settleCtx, session); err != nil {
+			if ctx.Err() == nil {
+				return nil, notReady
+			}
+
 			return nil, err
 		}
+		// THE STORE THIS SETTLEMENT OPENED, OR NONE. A guest can discard it and
+		// ask for another while this waits, and the replacement, mounted or not,
+		// was never opened for settlement, so no readiness for it can arrive.
 		attachment := session.slots[0]
-		if attachment == nil || !attachment.Docker {
+		if attachment != opened {
 			session.mu.Unlock()
 
 			return nil, errNoDockerStore
 		}
-		ready := attachment.Ready
-		session.mu.Unlock()
-		if ready {
+		if attachment.Ready {
 			return attachment, nil
 		}
+		session.mu.Unlock()
 
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
@@ -1516,10 +1602,15 @@ func (s *CacheService) awaitDockerReady(
 			timer.Stop()
 
 			return nil, ctx.Err()
-		case <-deadline.C:
+		case <-settleCtx.Done():
 			timer.Stop()
+			// A CALLER THAT GAVE UP IS NOT A WINDOW THAT RAN OUT: the caller's
+			// end ends the settle window too, and says more.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 
-			return nil, errors.New("docker image store did not become ready before teardown")
+			return nil, notReady
 		case <-timer.C:
 		}
 	}
@@ -2051,6 +2142,15 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 	attachment := session.slots[slot]
 	if attachment == nil {
 		http.Error(w, "cache slot is not attached", http.StatusNotFound)
+
+		return
+	}
+	// A STORE WHOSE ATTACH NEVER SUCCEEDED IS NOT THE GUEST'S TO DISCARD: a
+	// detach now would race an attach EC2 may still complete, on evidence that
+	// proves nothing. The session's cleanup takes it once the compute is gone.
+	if attachment.Unmounted {
+		http.Error(w, "this Docker image store was never mounted; it is discarded once the compute is gone",
+			http.StatusConflict)
 
 		return
 	}
