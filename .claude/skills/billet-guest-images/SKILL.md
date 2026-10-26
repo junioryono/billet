@@ -37,6 +37,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The manifest is the only thing that needs signing, and it is verified before it is parsed.**
 - **Manifest schema 2 splits the rootfs into ordered parts, and the reader shipped before the writer.**
+- **A reader reads the manifest named for its machine, and the channel's list of architectures is final (ADR-022).**
 - **A verification acts as the probe's holder only while its lock's name still leads to the file it locked.**
 - **A tier says `@verified` or an exact generation, never a bare name.**
 - **A generation records its machine, an image holds one, and nothing resolves to another's (ADR-022).**

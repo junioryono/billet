@@ -107,6 +107,15 @@ func cmdImagesCompatible(ctx context.Context, env cli.Env, args []string) error 
 		}
 	}
 	if len(images) == 0 {
+		// A NODE WHOSE TIERS ARE ALL ANOTHER MACHINE'S HAS NOTHING TO PREPARE, and a
+		// host upgrade asking must not read that as could-not-tell.
+		if only, err := onlyOtherMachinesTiers(cfg); err == nil && only {
+			fmt.Fprintf(env.Stdout, "every firecracker tier on this node is another machine's than "+
+				"this %s host's, so it boots no image here; nothing to prepare\n", hostArch())
+
+			return nil
+		}
+
 		return errors.New("billet images compatible: no image given and no firecracker tier names one")
 	}
 
@@ -474,16 +483,34 @@ type tierImageUse struct {
 // firecrackerTierUses are the distinct images this node's microVM tiers boot, in
 // the order the tiers first name them, each with the tiers that name it.
 func firecrackerTierUses(cfg *config.Config) ([]tierImageUse, error) {
+	uses, _, err := firecrackerTierSelection(cfg)
+
+	return uses, err
+}
+
+// onlyOtherMachinesTiers reports whether every microVM tier on this node is
+// another machine's, which leaves it no image to take up and nothing wrong: the
+// file names its tiers for a fleet of both architectures.
+func onlyOtherMachinesTiers(cfg *config.Config) (bool, error) {
+	uses, other, err := firecrackerTierSelection(cfg)
+
+	return len(uses) == 0 && other > 0, err
+}
+
+// firecrackerTierSelection is firecrackerTierUses, with how many tiers it left out
+// for being another machine's.
+func firecrackerTierSelection(cfg *config.Config) ([]tierImageUse, int, error) {
 	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	if _, err := app.NodeBundle(cfg); err != nil {
-		return nil, fmt.Errorf("select firecracker tier images: resolve node identity: %w", err)
+		return nil, 0, fmt.Errorf("select firecracker tier images: resolve node identity: %w", err)
 	}
 
 	var uses []tierImageUse
 	at := map[string]int{}
+	other := 0
 
 	for i := range cfg.Tiers {
 		if cfg.Tiers[i].Node != "" && cfg.Tiers[i].Node != cfg.Node.Name {
@@ -496,6 +523,13 @@ func firecrackerTierUses(cfg *config.Config) ([]tierImageUse, error) {
 		if !cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) || image == "" {
 			continue
 		}
+		// ANOTHER MACHINE'S TIER IS NOT THIS NODE'S (ADR-022): in a file naming arch,
+		// a node pulls, refreshes and checks only the images of tiers of its own.
+		if cfg.Tiers[i].Arch != "" && cfg.Tiers[i].Arch.Machine() != hostArch() {
+			other++
+
+			continue
+		}
 
 		j, seen := at[image]
 		if !seen {
@@ -506,7 +540,7 @@ func firecrackerTierUses(cfg *config.Config) ([]tierImageUse, error) {
 		uses[j].tiers = append(uses[j].tiers, cfg.Tiers[i].Label)
 	}
 
-	return uses, nil
+	return uses, other, nil
 }
 
 // tartTierImages are the distinct images this node's tart tiers boot.

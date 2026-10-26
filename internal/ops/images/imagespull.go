@@ -189,6 +189,11 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if image == "" {
+		if only, err := onlyOtherMachinesTiers(cfg); err == nil && only {
+			return fmt.Errorf("billet images pull: no image name given, and every firecracker tier on "+
+				"this node is another machine's than this %s host's, so it boots no image here", hostArch())
+		}
+
 		return errors.New("billet images pull: no image name given and no firecracker tier " +
 			"names one")
 	}
@@ -199,6 +204,10 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	if strings.Contains(image, "@") {
 		return fmt.Errorf("billet images pull: %q names a generation, and a pull assigns its "+
 			"own; give the image name alone", image)
+	}
+
+	if err := refuseImageOfAnotherMachine(cfg, image); err != nil {
+		return err
 	}
 
 	store, err := openGenerationPublisher(cfg)
@@ -470,6 +479,50 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	return nil
 }
 
+// refuseImageOfAnotherMachine refuses to pull image on this host unless every
+// Firecracker tier that names it in this node's image pool runs on this host's
+// machine (ADR-022): a pull imports this host's architecture, so an x64 refresh at
+// a site with arm64 tiers never seeds ubuntu-2404-arm64 with x64 bytes, the first
+// import included, which no generation of the image is there yet to refuse. Tiers
+// naming one image with two architectures are refused on every host, since one
+// image holds one. A tier of another site is another pool's; one pinned to
+// another node of this site shares this one.
+func refuseImageOfAnotherMachine(cfg *config.Config, image string) error {
+	var machines []string
+
+	for i := range cfg.Tiers {
+		tier := &cfg.Tiers[i]
+		if !tier.AcceptsProvider(config.ProviderFirecracker) || tier.Arch == "" {
+			continue
+		}
+
+		if cfg.Node != nil && tier.Site != "" && tier.Site != cfg.Node.Site {
+			continue
+		}
+
+		if name, _, _ := strings.Cut(tier.ImageFor(config.ProviderFirecracker), "@"); name != image {
+			continue
+		}
+
+		if machine := tier.Arch.Machine(); !slices.Contains(machines, machine) {
+			machines = append(machines, machine)
+		}
+	}
+
+	switch {
+	case len(machines) > 1:
+		return fmt.Errorf("billet images pull: the tiers that name %s run on %s, and one image holds "+
+			"one architecture; give the tiers of each architecture an image of their own, such as "+
+			"ubuntu-2404-arm64", image, strings.Join(machines, " and "))
+	case len(machines) == 1 && machines[0] != hostArch():
+		return fmt.Errorf("billet images pull: the tiers that name %s run on %s, and this host is %s, "+
+			"so it imports nothing into it; pull it on a node of that architecture, or name an image "+
+			"of this one's", image, machines[0], hostArch())
+	default:
+		return nil
+	}
+}
+
 // learnImageArchitectures sweeps the read-only generation maps a crash left on this
 // host, reads the architecture of each generation of image that records none
 // (ADR-022), and refuses the pull when the import it would make is one the
@@ -672,7 +725,17 @@ func stageImage(
 	// Present from the first release rather than added later, because the seam it
 	// needs is the one being built right now.
 	if from != "" {
-		data, err := os.ReadFile(filepath.Join(from, imagesource.ManifestName))
+		// THE MANIFEST NAMED FOR THIS MACHINE, as a release names it, or else the
+		// one manifest.json a directory of an operator's own may hold, which Usable
+		// then judges (ADR-022).
+		manifestName, bundleName := imagesource.ManifestNamesFor(hostArch())
+
+		data, err := os.ReadFile(filepath.Join(from, manifestName))
+		if errors.Is(err, os.ErrNotExist) && manifestName != imagesource.ManifestName {
+			manifestName, bundleName = imagesource.ManifestName, imagesource.BundleName
+			data, err = os.ReadFile(filepath.Join(from, manifestName))
+		}
+
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("billet images pull: cannot read a manifest in %s: %w",
 				from, err)
@@ -694,12 +757,12 @@ func stageImage(
 		var signature []byte
 
 		if policy.Required {
-			signature, err = os.ReadFile(filepath.Join(from, imagesource.BundleName))
+			signature, err = os.ReadFile(filepath.Join(from, bundleName))
 			if err != nil {
 				return nil, "", nil, fmt.Errorf("billet images pull: %s holds no %s, and this "+
 					"source requires a signature. Copy it from the release alongside the "+
 					"manifest, or pass --skip-signature-verification if this directory is "+
-					"trusted by other means: %w", from, imagesource.BundleName, err)
+					"trusted by other means: %w", from, bundleName, err)
 			}
 		}
 
@@ -789,7 +852,7 @@ func resolveImageManifest(
 		return nil, nil, err
 	}
 
-	client := &imagesource.Client{Source: src}
+	client := imageClient(src)
 	if err := client.Resolve(ctx); err != nil {
 		return nil, nil, err
 	}
@@ -813,7 +876,7 @@ func resolveImageManifest(
 		return nil, nil, err
 	}
 
-	fmt.Fprintf(env.Stdout, "fetching %s\n", src.ManifestURL())
+	fmt.Fprintf(env.Stdout, "fetching the %s guest image's manifest from %s\n", hostArch(), src.BaseURL)
 
 	if policy.Required {
 		fmt.Fprintf(env.Stdout, "requiring a signature from %s\n", policy.Identity)
@@ -827,6 +890,12 @@ func resolveImageManifest(
 	}
 
 	return manifest, client, nil
+}
+
+// imageClient is the client a pull fetches src's image through: the image named
+// for this host's machine (ADR-022).
+func imageClient(src imagesource.Source) *imagesource.Client {
+	return &imagesource.Client{Source: src, Machine: hostArch()}
 }
 
 // sideloadPolicy decides what a directory on disk must prove.
@@ -931,8 +1000,8 @@ func unpackRootfs(ctx context.Context, env cli.Env, manifest *imagesource.Manife
 //
 // TRANSLATED FROM GO'S NAMES, which are not uname's: Go calls x86-64 "amd64" and
 // aarch64 "arm64". A manifest records what `uname -m` says, because that is what
-// the build recorded.
-func hostArch() string {
+// the build recorded. A variable so a test can stand on either machine.
+var hostArch = func() string {
 	return config.HostMachine(runtime.GOARCH)
 }
 

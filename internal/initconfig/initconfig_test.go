@@ -309,6 +309,28 @@ func firecrackerParams() Params {
 		Provider: config.ProviderFirecracker,
 		VCPU:     8,
 		Memory:   16 * config.GiB,
+		GOARCH:   "amd64",
+	}
+}
+
+// AN ARM64 HOST'S TIERS NAME AN ARM64 IMAGE, an image of its own, since one image
+// holds one architecture (ADR-022); every other machine keeps the x64 one.
+func TestGenerateNamesTheImageOfTheHostsArchitecture(t *testing.T) {
+	t.Parallel()
+
+	for goarch, want := range map[string]string{
+		"arm64": DefaultFirecrackerARM64Image,
+		"amd64": DefaultFirecrackerImage,
+	} {
+		p := firecrackerParams()
+		p.GOARCH = goarch
+
+		cfg := parse(t, mustGenerate(t, p))
+		for i := range cfg.Tiers {
+			if got := cfg.Tiers[i].Image; got != want {
+				t.Errorf("%s: tier %q names %q, want %q", goarch, cfg.Tiers[i].Label, got, want)
+			}
+		}
 	}
 }
 

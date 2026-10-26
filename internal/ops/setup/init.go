@@ -555,6 +555,7 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 		// falls back to its own view of runtime.GOOS, which is the same answer
 		// in production and a different one in every test that pins a platform.
 		GOOS:   targetOS,
+		GOARCH: hostGOARCH,
 		Listen: *listen,
 		State:  stateParams(setFlags, *stateBackend, *stateDSNEnv),
 		// WHAT THIS HOST PROVIDES AND BILLET CANNOT DETECT. Every one is
