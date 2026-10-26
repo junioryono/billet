@@ -2289,8 +2289,9 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 					"%w: node %s reported launching %s and now does not launch %s, while %d "+
 						"lease(s) are still outstanding against it; a lease placed for that "+
 						"architecture would run on another. Restore what the host reports until "+
-						"those jobs finish; a host replaced under the same name has lost them, "+
-						"and `billet force-destroy` settles each lease it held",
+						"those jobs finish; once you know a lease's compute is gone, as on a "+
+						"machine replaced under the same name, `billet leases release <lease> "+
+						"--force` hands it back",
 					ErrWrongProvider, name, existing.Architectures, strings.Join(dropped, ", "),
 					outstanding)
 			}

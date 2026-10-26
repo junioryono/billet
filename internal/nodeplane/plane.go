@@ -1364,7 +1364,12 @@ func (p *Plane) register(
 	// in a separate process with no view of this map; this copy is what dispatch
 	// consults before sending a command a host's wire may not have.
 	n.wireVersion = negotiated
-	n.architectures = negotiatedArchitectures(req.Architectures, negotiated)
+	// NOR DOES IT SAY WHAT THE NAME'S PROCESS LAUNCHES, which a registration
+	// claiming no incarnation does not replace. Below VersionArchitectures it
+	// still clears the list, the direction that refuses rather than misplaces.
+	if req.Incarnation != "" || negotiated < nodeapi.VersionArchitectures {
+		n.architectures = negotiatedArchitectures(req.Architectures, negotiated)
+	}
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()

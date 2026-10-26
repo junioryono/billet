@@ -230,3 +230,37 @@ func TestACurrentNodeReceivesTheTiersArchitecture(t *testing.T) {
 		t.Fatalf("launch: %v", err)
 	}
 }
+
+// A REGISTRATION CLAIMING NO INCARNATION DOES NOT SAY WHAT THE NAME'S PROCESS
+// LAUNCHES, as it does not take the name: the live arm64 process keeps its launch,
+// and is not judged against another machine's list.
+func TestARegistrationWithNoIncarnationDoesNotReplaceTheArchitectures(t *testing.T) {
+	t.Parallel()
+
+	p := archPlane(t, archNode("n1-1", config.ArchARM64))
+
+	if _, err := p.Register(t.Context(), archNode("", config.ArchX64)); err != nil {
+		t.Fatalf("register with no incarnation: %v", err)
+	}
+
+	launched := make(chan error, 1)
+	go func() {
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	cmd, took, err := p.Poll(ctx, "n1", "n1-1")
+	if err != nil || !took || cmd.Kind != nodeapi.CommandLaunch {
+		t.Fatalf("poll = %+v, %v, %v; the arm64 process was not given its launch", cmd, took, err)
+	}
+
+	if err := p.Result("n1", "n1-1", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+
+	if err := <-launched; err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+}
