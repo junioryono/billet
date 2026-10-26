@@ -46,6 +46,26 @@ A completion asks the node to destroy the compute; capacity is released when the
 
 A stop never destroys a running job, and nothing times one out. `billet drain` seals admission and waits for what is running, for as long as it runs; `drain_timeout` only decides when billet starts saying the drain is long. The one operation that ends running work is `billet force-destroy`, which names every affected job before it acts.
 
+## Size a tier by what it measured, not by its label
+
+A vCPU is a share of whatever core it runs on, so an 8-vCPU tier on your hardware is not a commercial runner's 8 vCPU. On the reference deployment's node (AMD EPYC 7763, 2026-09-21), the same probe ran on a billet 8-vCPU Firecracker guest and on a commercial 8-vCPU runner:
+
+| | Commercial 8 vCPU | billet 8 vCPU |
+|---|---|---|
+| sha256 of 2 GiB, one thread | 0.82 s | 1.42 s (the node itself: 1.24 s) |
+| pgbench tpcb over the socket (scale 32, 16 clients) | 59,600 tps | 17,000 tps |
+
+Most of that gap is per-core speed. The node's own cores are 1.5 times slower than the commercial runner's on this hash, and a guest adds about 15% on top. The CPU frequency governor is not the lever: busy vCPUs already ran at the node's all-core boost under `schedutil`.
+
+Two consequences follow:
+- **For a CPU-bound suite, a 16-vCPU tier roughly matched a commercial 8-vCPU runner here.** Size a tier by timing your own suite on both, not by matching the number in the label.
+- **Pinning guests to host CPUs established no speed gain** ([CPU placement](../reference/records/cpu-placement.md)):
+  - `compact` was slower than `spread` on every load `spread` could hold;
+  - `spread`'s mean compile time was 7 to 12% shorter than unpinned guests', a difference those runs could not establish;
+  - at three quarters of the threads, `compact` and unpinned guests were within 2%, where the test could have missed a difference of about a quarter.
+
+A service container published on a port is slower to reach than one reached by its container address, because Docker relays the port through a userland proxy. Turning that proxy off made the published path nearly as fast, but broke `localhost` for Node 18 and `[::1]` for every client tested. So billet's images keep the proxy, which GitHub's runner image template also leaves at Docker's default ([Docker's published ports](../reference/records/docker-published-ports.md)).
+
 ## Cost
 
 Declared prices on cloud shapes report exposure; they do not gate admission. The enforceable policy is the shape allowlist and the resource ceilings; `billet check` reports one node's conservative peak and `billet status` the deployment-wide peak. An AWS budget is the account-wide backstop.
