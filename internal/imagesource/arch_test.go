@@ -211,6 +211,9 @@ func TestResolveReadsTheChannelsArchitectures(t *testing.T) {
 		{name: "manifest names", extra: map[string]any{"architectures": []string{"manifest.json"}}, refused: true},
 		{name: "no x86_64", extra: map[string]any{"architectures": []string{"aarch64"}}, refused: true},
 		{name: "x86_64 and a misspelling", extra: map[string]any{"architectures": []string{"x86_64", "arm64"}}, refused: true},
+		{name: "a file", extra: map[string]any{"architectures": []string{"x86_64", "manifest-aarch64.json"}}, refused: true},
+		{name: "a machine this reader does not know", extra: map[string]any{"architectures": []string{"x86_64", "riscv64"}},
+			said: true, list: []string{"x86_64", "riscv64"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -244,6 +247,12 @@ func TestResolveReadsTheChannelsArchitectures(t *testing.T) {
 			if tc.refused {
 				if err == nil || !strings.Contains(err.Error(), "lists architectures") {
 					t.Fatalf("Resolve = %v, want the channel refused for its list", err)
+				}
+
+				// NOTHING IS ADOPTED FROM A REFUSED CHANNEL: the client is not moved
+				// onto its release, so it is not taken for resolved.
+				if c.Source.BaseURL != "" || c.channelSaid {
+					t.Errorf("a refused channel was adopted: %+v, said %v", c.Source, c.channelSaid)
 				}
 
 				return
@@ -367,5 +376,70 @@ func TestAClientNamingNoMachineIsX86(t *testing.T) {
 
 	if got := asked.all(); len(got) != 1 || got[0] != "/manifest.json" {
 		t.Errorf("asked for %v, want manifest.json", got)
+	}
+}
+
+// A FALLBACK THAT FAILS OTHERWISE IS NOT ABSENCE because the attempt before it was:
+// only both not found is.
+func TestAFailedFallbackIsAbsenceOnlyWhenItWasNotFoundToo(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		status int
+		absent bool
+	}{
+		{"404 then 404", http.StatusNotFound, true},
+		{"404 then 500", http.StatusInternalServerError, false},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/manifest.json" {
+				w.WriteHeader(tc.status)
+
+				return
+			}
+
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		t.Cleanup(srv.Close)
+
+		c := &Client{HTTP: srv.Client(), Source: Source{BaseURL: srv.URL}, Machine: "aarch64"}
+
+		_, err := c.Manifest(t.Context(), Policy{})
+		if err == nil || errors.Is(err, ErrNotFound) != tc.absent {
+			t.Errorf("%s: Manifest = %v, want absence %v", tc.name, err, tc.absent)
+		}
+	}
+}
+
+// AND A CLIENT THAT REFUSED A CHANNEL REFUSES IT AGAIN when asked again, rather than
+// taking itself for resolved.
+func TestARefusedChannelIsRefusedAgainOnTheSameClient(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	body, err := json.Marshal(map[string]any{
+		"schema": channelSchema, "tag": "guest-20260821-000000",
+		"published_at": now.Add(-time.Hour), "expires_at": now.Add(9 * 24 * time.Hour),
+		"release_immutable": true, "architectures": []string{"aarch64"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := w.Write(body); err != nil {
+			t.Errorf("write channel: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &Client{HTTP: srv.Client(), Source: Source{channelURL: srv.URL + "/current.json",
+		channelPolicy: &Policy{}, official: true}, Machine: "aarch64"}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, err := c.Manifest(t.Context(), Policy{}); err == nil || !strings.Contains(err.Error(), "lists architectures") {
+			t.Fatalf("attempt %d: Manifest = %v, want the channel refused", attempt, err)
+		}
 	}
 }

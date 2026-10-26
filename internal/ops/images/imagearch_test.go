@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,8 +319,11 @@ func TestASideloadsSignatureIsTheOneBesideTheManifestRead(t *testing.T) {
 		_, _, _, err = stageImage(t.Context(), processEnv(), cfg, stageOptions{
 			from: fixture.from, staging: fixture.staging,
 		})
-		if err == nil || !strings.Contains(err.Error(), "holds no "+tc.bundle) {
-			t.Errorf("%s: stageImage = %v, want it to ask for %s", tc.name, err, tc.bundle)
+
+		// THE FILE IT OPENED, not the name its message gives.
+		var opened *fs.PathError
+		if !errors.As(err, &opened) || opened.Path != filepath.Join(fixture.from, tc.bundle) {
+			t.Errorf("%s: stageImage = %v, want it to have opened %s", tc.name, err, tc.bundle)
 		}
 	}
 }
@@ -362,5 +366,56 @@ func TestImagesCompatibleOnANodeWhoseTiersAreAllAnotherMachinesPreparesNothing(t
 
 	if !strings.Contains(out.String(), "nothing to prepare") {
 		t.Errorf("it said:\n%s\nwant nothing to prepare", out.String())
+	}
+}
+
+// AND ONE WITH NO FIRECRACKER TIER AT ALL IS STILL ASKED TO NAME AN IMAGE: nothing
+// says this node needs none.
+func TestImagesCompatibleOnANodeWithNoTiersStillAsksForAnImage(t *testing.T) {
+	standOn(t, "x86_64")
+
+	path := firecrackerRefreshConfig(t, "")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	head, _, _ := strings.Cut(string(body), "tiers:\n")
+	docker := "  - label: dockerish\n    provider: docker\n    vcpu: 2\n    memory: 4GiB\n    image: busybox\n"
+
+	if err := os.WriteFile(path, []byte(head+"tiers:\n"+docker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	if err := cmdImagesCompatible(t.Context(), cli.Env{Stdout: &out, Stderr: &out},
+		[]string{"--config", path}); err == nil || !strings.Contains(err.Error(), "no firecracker tier names one") {
+		t.Fatalf("images compatible on a node with no firecracker tier = %v, want it asked for an image", err)
+	}
+}
+
+// AND A PULL WITH NO ARGUMENT ON SUCH A NODE SAYS WHY IT HAS NOTHING TO PULL.
+func TestAPullWithNoArgumentOnANodeOfOnlyAnotherMachinesTiersSaysWhy(t *testing.T) {
+	standOn(t, "x86_64")
+
+	fixture := newPullFixture(t)
+
+	body, err := os.ReadFile(fixture.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	head, _, _ := strings.Cut(string(body), "tiers:\n")
+	armOnly := "  - label: on-arm64\n    provider: firecracker\n    vcpu: 2\n    memory: 4GiB\n" +
+		"    arch: arm64\n    image: ubuntu-2404-arm64@verified\n"
+
+	if err := os.WriteFile(fixture.cfgPath, []byte(head+"tiers:\n"+armOnly), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = cmdImagesPull(t.Context(), processEnv(), []string{"--config", fixture.cfgPath, "--from", fixture.from,
+		"--staging-dir", fixture.staging, "--kernel-dir", fixture.kernelDir, "--skip-signature-verification"})
+	if err == nil || !strings.Contains(err.Error(), "every firecracker tier on this node is another machine's") {
+		t.Fatalf("a pull with no argument = %v, want why it has nothing to pull", err)
 	}
 }

@@ -48,9 +48,10 @@ var ErrNotFound = errors.New("imagesource: no such artifact at this source")
 // billet's own it is a refusal like any other.
 var errForbidden = errors.New("imagesource: the source refused the request")
 
-// channelMachines are the names a channel's architectures may list, as `uname -m`
-// spells them.
-var channelMachines = []string{manifestMachine, "aarch64"}
+// misspelledMachines are names a channel's architectures must never carry, since
+// they are some other vocabulary's (billet's, Go's) for a machine `uname -m` spells
+// otherwise, and a reader would take each for a machine the release leaves out.
+var misspelledMachines = []string{"x64", "arm64", "amd64"}
 
 // ErrNoImageForMachine is the signed channel saying its current release carries no
 // image for this machine: final until the channel moves, unlike a manifest that
@@ -251,24 +252,38 @@ func (c *Client) Resolve(ctx context.Context) error {
 			channel.ExpiresAt.Format(time.RFC3339))
 	}
 
+	return c.adoptChannel(channel.Tag, channel.Architectures)
+}
+
+// adoptChannel moves the client onto the release the channel names, with the
+// architectures it lists, having refused a list this reader cannot take at its
+// word: nothing is adopted from a channel that is refused.
+//
+// A LIST THAT WOULD TELL EVERY NODE THERE IS NOTHING TO TAKE UP is refused, never
+// read as a final no: one leaving out x86_64, which every release carries as
+// manifest.json (an empty one among them), and one naming a machine in another
+// vocabulary's spelling or a file. A well-formed `uname -m` name this reader does
+// not know is let through, so a release adding a machine is not a flag day for
+// readers of this one (ADR-022).
+func (c *Client) adoptChannel(tag string, architectures *[]string) error {
+	if architectures != nil {
+		list := *architectures
+		if !slices.Contains(list, manifestMachine) || slices.ContainsFunc(list, func(m string) bool {
+			return slices.Contains(misspelledMachines, m) || !archPattern.MatchString(m)
+		}) {
+			return fmt.Errorf("imagesource: the guest-image channel lists architectures %v, which a "+
+				"reader cannot take at its word: they are `uname -m` names and include %s", list,
+				manifestMachine)
+		}
+	}
+
 	c.Source = Source{
-		BaseURL:  defaultDownloadPrefix + channel.Tag,
+		BaseURL:  defaultDownloadPrefix + tag,
 		official: true,
 	}
 
-	if channel.Architectures != nil {
-		// A LIST THIS READER CANNOT TAKE AT ITS WORD IS REFUSED, never read as a
-		// final no: an empty one, a name spelled other than `uname -m` spells it,
-		// or one leaving out x86_64, which every release carries as manifest.json,
-		// would otherwise tell every node of the fleet there is nothing to take up.
-		list := *channel.Architectures
-		if !slices.Contains(list, manifestMachine) ||
-			slices.ContainsFunc(list, func(m string) bool { return !slices.Contains(channelMachines, m) }) {
-			return fmt.Errorf("imagesource: the guest-image channel lists architectures %v, which is "+
-				"not a list of %v that includes %s", list, channelMachines, manifestMachine)
-		}
-
-		c.channelArchitectures, c.channelSaid = list, true
+	if architectures != nil {
+		c.channelArchitectures, c.channelSaid = *architectures, true
 	}
 
 	return nil
@@ -325,7 +340,9 @@ func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 		name, bundle = ManifestName, BundleName
 
 		if body, err = c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes); err != nil {
-			err = fmt.Errorf("%w (and before it: %w)", err, first)
+			// ONLY THE FALLBACK'S OWN FAILURE IS WRAPPED: a 404 before it must not
+			// make a 500 after it read as absence.
+			err = fmt.Errorf("%w (and before it: %s)", err, first.Error())
 		}
 	}
 
