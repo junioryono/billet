@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -229,32 +230,65 @@ func TestAWithdrawalBeforeTheWatchRanSurvivesAFailedClaim(t *testing.T) {
 	}
 }
 
-// A BURST PAST ONE MESSAGE'S BUDGET LEAVES THE REST TO THE OFFLINE WATCH: the
-// withdrawals run on the message path, and a slow GitHub must not hold every
-// other completion behind them.
+// A BURST PAST ONE MESSAGE'S BUDGET LEAVES THE REST TO THE OFFLINE WATCH, and no
+// withdrawal begun near the end runs past it: the withdrawals run on the message
+// path, and a slow GitHub must not hold every other completion behind them.
+//
+// IN A BUBBLE, because the deadlines are the thing under test. At 14 seconds a
+// lookup, two answer by 28 seconds, a third begun then is cut at the batch's 30
+// (fresh per-withdrawal deadlines with only a start check ran it to 42), and a
+// fourth is never begun. At 25 seconds a lookup, the first is cut at its own 20
+// and the second at the batch's 30, so none is withdrawn.
 func TestABurstOfCancellationsStopsAtItsBudget(t *testing.T) {
 	t.Parallel()
 
-	reg := &inspectingRegistry{githubIDs: map[string]int64{}, byName: map[string][]RunnerState{}}
-	p := newCancelPool(t, reg, job11, job12)
-	now := time.Now()
-	p.l.now = func() time.Time { return now }
-	for _, request := range []int64{11, 12} {
-		runner := p.launchedFor(t, request)
-		reg.githubIDs[runner.RunnerName] = 4400 + request
+	for name, tc := range map[string]struct {
+		lookup           time.Duration
+		asked, withdrawn int
+	}{
+		"lookups inside their own bound": {lookup: 14 * time.Second, asked: 3, withdrawn: 2},
+		"lookups past their own bound":   {lookup: 25 * time.Second, asked: 2, withdrawn: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				burstWithin(t, tc.lookup, tc.asked, tc.withdrawn)
+			})
+		})
+	}
+}
+
+func burstWithin(t *testing.T, lookup time.Duration, asked, withdrawn int) {
+	t.Helper()
+
+	jobs := []dispatch.Job{job11, job12, job13, {RequestID: 14, RunID: 104, JobID: "job-14"}}
+	reg := &inspectingRegistry{githubIDs: map[string]int64{}, byName: map[string][]RunnerState{},
+		lookup: lookup}
+	p := newCancelPool(t, reg, jobs...)
+	for i := range jobs {
+		runner := p.launchedFor(t, jobs[i].RequestID)
+		reg.githubIDs[runner.RunnerName] = 4400 + jobs[i].RequestID
 		reg.byName[runner.RunnerName] = []RunnerState{{Present: true}}
 	}
-	// THE FIRST INSPECTION SPENDS THE WHOLE BUDGET.
-	reg.during = func() { now = now.Add(cancelledWithdrawBudget) }
 
-	c11, c12 := job11, job12
-	c11.Result, c12.Result = "Canceled", "Canceled"
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{c11, c12}}); err != nil {
+	cancelled := make([]dispatch.Job, 0, len(jobs))
+	for i := range jobs {
+		job := jobs[i]
+		job.Result = "Canceled"
+		cancelled = append(cancelled, job)
+	}
+
+	began := time.Now()
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: cancelled}); err != nil {
 		t.Fatalf("the cancellations were refused: %v", err)
 	}
 
-	if len(reg.askedFor) != 1 || len(reg.withdrawn) != 1 {
-		t.Errorf("asked about %v and withdrew %v, want one of the two before the budget ran out",
-			reg.askedFor, reg.withdrawn)
+	if took := time.Since(began); took > cancelledWithdrawBudget {
+		t.Errorf("the message took %s, past its %s withdrawal budget", took, cancelledWithdrawBudget)
+	}
+	if len(reg.askedFor) != asked || len(reg.withdrawn) != withdrawn {
+		t.Errorf("asked about %d runners and withdrew %v, want %d asked and %d withdrawn",
+			len(reg.askedFor), reg.withdrawn, asked, withdrawn)
 	}
 }

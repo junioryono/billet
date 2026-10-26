@@ -47,8 +47,9 @@ const (
 	// cancelledWithdrawWait bounds one cancelled job's runner's inspection and
 	// withdrawal, and cancelledWithdrawBudget all of one message's: the
 	// withdrawal runs on the message path, and a runner not reached in time is
-	// the offline watch's, as every one was before it.
-	cancelledWithdrawWait   = 15 * time.Second
+	// the offline watch's, as every one was before it. Not a divisor of the
+	// budget, so a withdrawal's own deadline never ties with the batch's.
+	cancelledWithdrawWait   = 20 * time.Second
 	cancelledWithdrawBudget = 30 * time.Second
 )
 
@@ -270,17 +271,23 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 // gave another job (whose JobStarted has not arrived) is kept for it. A runner
 // GitHub reports busy is not asked, an absent or unreadable one is left to the
 // offline watch, and a refusal leaves the member idle and unjournaled, as there.
-func (l *Listener) withdrawCancelledRunner(ctx context.Context, member alloc.PoolRunner) {
+//
+// THE DEADLINE BOUNDS ONLY THE TWO CALLS TO GITHUB, by cancelledWithdrawWait and
+// by the message's batch, whichever is sooner. The retirement after an
+// acknowledged DELETE is the offline watch's own (retireWithdrawn), under the
+// caller's context as the watch runs it: cut short, it would leave the member
+// retiring for the same message's reconcile to retry without any bound.
+func (l *Listener) withdrawCancelledRunner(ctx, batch context.Context, member alloc.PoolRunner) {
 	inspector, ok := l.registry.(RunnerInspector)
 	if !ok || l.alloc == nil || member.RunnerName == "" || member.ActualRequestID != 0 ||
 		member.Status != alloc.PoolRunnerIdle {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, cancelledWithdrawWait)
+	asking, cancel := context.WithTimeout(batch, cancelledWithdrawWait)
 	defer cancel()
 
-	state, err := inspector.InspectRunner(ctx, member.RunnerName, member.RunnerID)
+	state, err := inspector.InspectRunner(asking, member.RunnerName, member.RunnerID)
 	if err != nil {
 		l.log.Debug("could not read a cancelled job's runner at GitHub; the pool keeps it",
 			"tier", l.tier, "runner", member.RunnerName, "error", err)
@@ -300,7 +307,7 @@ func (l *Listener) withdrawCancelledRunner(ctx context.Context, member alloc.Poo
 		return
 	}
 
-	if err := inspector.WithdrawRunner(ctx, state.ID); err != nil {
+	if err := inspector.WithdrawRunner(asking, state.ID); err != nil {
 		l.log.Info("GitHub kept a cancelled job's runner, which may have taken another job; "+
 			"the pool keeps it", "tier", l.tier, "runner", member.RunnerName,
 			"runner_id", state.ID, "error", err)
