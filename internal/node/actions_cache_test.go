@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -270,6 +271,47 @@ func TestActionsCacheRoundTripPublishesAndServesRanges(t *testing.T) {
 	response.Body.Close()
 	if err != nil || string(body) != "chive-b" || response.Header.Get("Content-Range") != "bytes 2-8/12" {
 		t.Fatalf("range body=%q header=%q error=%v", body, response.Header.Get("Content-Range"), err)
+	}
+
+	// AND ON THE WIRE EACH IS FRAMED BY ITS LENGTH (#697): the whole archive, a
+	// range and a HEAD, read back as their client reads them, with nothing after
+	// the declared length, a HEAD's body included.
+	for _, read := range []struct {
+		method, rangeHeader, body string
+		status                    int
+	}{
+		{http.MethodGet, "", "archive-body", http.StatusOK},
+		{http.MethodGet, "bytes=2-8", "chive-b", http.StatusPartialContent},
+		{http.MethodHead, "", "", http.StatusOK},
+	} {
+		request := actionsRequestForTest(t, read.method, downloadURL, "")
+		if read.rangeHeader != "" {
+			request.Header.Set("Range", read.rangeHeader)
+		}
+		response, handled, err := service.actionsResponse(request, session)
+		if err != nil || !handled {
+			t.Fatalf("%s %q handled=%t error=%v", read.method, read.rangeHeader, handled, err)
+		}
+		var wire bytes.Buffer
+		whole := writeActionsAnswer(&wire, request, response)
+		_ = response.Body.Close()
+		reader := bufio.NewReader(&wire)
+		answer, err := http.ReadResponse(reader, request)
+		if err != nil || !whole {
+			t.Fatalf("%s %q went out whole=%t, read back: %v", read.method, read.rangeHeader, whole, err)
+		}
+		got, err := io.ReadAll(answer.Body)
+		_ = answer.Body.Close()
+		wantLength := int64(len(read.body))
+		if read.method == http.MethodHead {
+			wantLength = int64(len("archive-body"))
+		}
+		if err != nil || answer.StatusCode != read.status || string(got) != read.body ||
+			answer.ContentLength != wantLength || reader.Buffered() != 0 {
+			t.Fatalf("%s %q on the wire = %d, %q framed %d with %d bytes after it (%v); want %d, %q framed %d",
+				read.method, read.rangeHeader, answer.StatusCode, got, answer.ContentLength, reader.Buffered(), err,
+				read.status, read.body, wantLength)
+		}
 	}
 }
 

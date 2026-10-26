@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,11 @@ const (
 	actionsProxyUser   = "billet"
 	actionsConnectWait = 10 * time.Second
 	actionsHeaderLimit = 64 << 10
+	// defaultAnswerCloseWait bounds how long a tunnel the node answered waits for
+	// its client to close it, and answerCloseDiscard what it reads from the
+	// client meanwhile.
+	defaultAnswerCloseWait = 30 * time.Second
+	answerCloseDiscard     = 4 << 10
 )
 
 type actionsProxy struct {
@@ -330,6 +336,50 @@ func openTunnel(ctx context.Context, w http.ResponseWriter, leaf tls.Certificate
 	return client, tlsConn, true
 }
 
+// closeAfterClient holds a tunnel the node has answered open until its client
+// closes it, up to the service's answerCloseWait, reading and discarding at most
+// answerCloseDiscard bytes meanwhile. The caller closes the connection after it.
+// origin names the intercepted host in the log.
+//
+// THE CLIENT ENDS AN ANSWERED CONNECTION, NEVER THE NODE. The answer says
+// Connection: close, and undici (Node's fetch, and the copy pnpm/setup bundles)
+// asserts that its parser is not paused when its socket ends. A node that closed
+// on the answer's last byte ended the socket under a client that had paused a
+// body it was given all at once, and the assertion crashed it: pnpm/setup v3.1.2
+// on Node 24 failed one warm install in a few on the test host, and most warm
+// Platform jobs that set up pnpm (2026-10-26). A TLS close_notify or a FIN from
+// the node is that same end, so neither is sent before the client's close.
+//
+// ONLY A WHOLE ANSWER FRAMED BY ITS OWN LENGTH OR CHUNKS MAY WAIT. One delimited
+// by the connection's end is not whole until the node closes, and one cut short
+// is told to its client only by the close.
+func (s *CacheService) closeAfterClient(conn net.Conn, origin string) {
+	wait := s.answerCloseWait
+	started := s.now()
+	// BOTH DIRECTIONS, because a TLS read can write: it answers a key update or
+	// sends an alert, and that write must not outlive the wait either.
+	if err := conn.SetDeadline(time.Now().Add(wait)); err != nil {
+		return
+	}
+	read, err := io.Copy(io.Discard, io.LimitReader(conn, answerCloseDiscard))
+	timeout, isNet := errors.AsType[net.Error](err)
+	switch {
+	case err == nil && read == answerCloseDiscard:
+		s.log.Debug("a client went on sending after its answer; the node closes the connection",
+			"origin", origin)
+	// A CLIENT THAT DROPS ITS SOCKET WITHOUT A close_notify, as Node's do, reads
+	// here as an unexpected EOF: that is its close too.
+	case err == nil, errors.Is(err, io.ErrUnexpectedEOF):
+		s.log.Debug("a client closed its answered connection", "origin", origin,
+			"waited", s.now().Sub(started).Round(time.Millisecond))
+	case isNet && timeout.Timeout():
+		s.log.Debug("a client did not close its answered connection in time; the node closes it",
+			"origin", origin, "wait", wait)
+	default:
+		s.log.Debug("an answered connection ended in an error", "origin", origin, "error", err)
+	}
+}
+
 func (p *actionsProxy) intercept(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -375,13 +425,10 @@ func (p *actionsProxy) intercept(
 	// TCP connection, so this is hardening rather than an escape — but "exactly
 	// one host" should hold at the HTTP layer too, and the check is one line.
 	if !actionsRequestTargetsResultsHost(req) {
-		misdirected := actionsBlobError(http.StatusMisdirectedRequest,
-			"only the Actions results origin is available")
-		misdirected.Close = true
-		misdirected.Proto, misdirected.ProtoMajor, misdirected.ProtoMinor = "HTTP/1.1", 1, 1
-		//nolint:errcheck // best-effort refusal before anything is forwarded
-		_ = misdirected.Write(tlsConn)
-		_ = misdirected.Body.Close()
+		requestCancel()
+		if refuseMisdirected(tlsConn, req, "only the Actions results origin is available") {
+			p.service.closeAfterClient(tlsConn, actionsResultsHost)
+		}
 
 		return
 	}
@@ -400,15 +447,53 @@ func (p *actionsProxy) intercept(
 		return
 	}
 
-	defer resp.Body.Close()
 	// One request per intercepted tunnel keeps a local framing mistake or a
 	// partially consumed body from contaminating the next results operation; the
 	// toolkit clients reconnect, and each fresh connection classifies afresh.
+	whole := writeActionsAnswer(tlsConn, req, resp)
+	_ = resp.Body.Close()
+	requestCancel()
+	if whole {
+		p.service.closeAfterClient(tlsConn, actionsResultsHost)
+	}
+}
+
+// writeActionsAnswer writes an answer of the node's own on an intercepted
+// connection, with Connection: close, and reports whether it went out whole and
+// framed by its length, so that its client may be left to close the connection.
+//
+// THE LENGTH IN THE HEADER MAP IS THE FRAMING. http.Response.Write drops a
+// Content-Length header and frames by the ContentLength field alone, which the
+// node's answers leave at zero, so every one went out delimited by the
+// connection's end: a download cut short read as whole, and no client could be
+// left to close (#697). The request is attached so that a HEAD's answer carries
+// its length and no body. An answer whose header names no length and whose body
+// is not known to be empty still goes out delimited by the end, and is not whole
+// until the node closes.
+func writeActionsAnswer(conn io.Writer, req *http.Request, resp *http.Response) bool {
 	resp.Close = true
 	resp.Proto, resp.ProtoMajor, resp.ProtoMinor = "HTTP/1.1", 1, 1
-	if err := resp.Write(tlsConn); err != nil {
-		return
+	resp.Request = req
+	framed := false
+	switch length, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64); {
+	case err == nil && length >= 0:
+		resp.ContentLength, framed = length, true
+	// A BODY KNOWN TO BE EMPTY, as a block upload's 201 is, is framed by its
+	// length of zero.
+	case resp.Header.Get("Content-Length") == "" && (resp.Body == nil || resp.Body == http.NoBody):
+		resp.ContentLength, framed = 0, true
 	}
+
+	return resp.Write(conn) == nil && framed
+}
+
+// refuseMisdirected answers a request for a host the tunnel does not serve with
+// a 421, and reports whether the refusal went out whole.
+func refuseMisdirected(conn net.Conn, req *http.Request, message string) bool {
+	misdirected := actionsBlobError(http.StatusMisdirectedRequest, message)
+	defer misdirected.Body.Close()
+
+	return writeActionsAnswer(conn, req, misdirected)
 }
 
 // splice joins the guest's connection to GitHub's edge and copies bytes both
@@ -457,10 +542,9 @@ func spliceTo(
 
 	if err != nil {
 		log.Warn("a passthrough could not reach its origin", "origin", origin, "error", err)
+		// BEST EFFORT, on a connection being abandoned, so it is closed at once.
 		response := actionsBlobError(http.StatusBadGateway, origin+" is unavailable")
-		response.Close = true
-		//nolint:errcheck // best-effort refusal on a connection being abandoned
-		_ = response.Write(guest)
+		writeActionsAnswer(guest, nil, response)
 		_ = response.Body.Close()
 
 		return
