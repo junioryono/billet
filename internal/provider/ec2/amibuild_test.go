@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/guestassets"
@@ -975,6 +977,54 @@ func TestADamagedRepeatOfTheSuccessDoesNotEndTheBuild(t *testing.T) {
 
 	if _, err := newTestProvider(t, f, nil).BuildImage(t.Context(), verifyingBuild()); err != nil {
 		t.Fatalf("a damaged repeat of a success already read ended the build: %v", err)
+	}
+}
+
+// A WAIT THAT ENDS SAYS WHAT IT HAD READ, and nothing it had not: a builder that
+// announced its success and had not stopped is not one that gave no verdict, and
+// neither is said to be running, since billet terminates it.
+func TestAWaitThatEndsSaysWhatItHadRead(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		build     *buildFake
+		want, not string
+	}{
+		{name: "no verdict", build: &buildFake{stopReason: "Client.InstanceInitiatedShutdown",
+			imageState: "available", buildSilent: true},
+			want: "gave no verdict before the wait ended", not: "announced"},
+		{name: "a success that did not stop", build: &buildFake{stopReason: "Client.InstanceInitiatedShutdown",
+			imageState: "available", dwellPolls: 1000},
+			want: "announced its build's success and had not powered itself off", not: "gave no verdict"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFakeEC2(t)
+			f.respond = tc.build.serve(f)
+
+			p := newTestProvider(t, f, nil)
+
+			// THE WAIT ENDS once the builder has been asked three times.
+			p.sleep = func(context.Context, time.Duration) error {
+				if f.countOf("GetConsoleOutput") >= 3 {
+					return context.DeadlineExceeded
+				}
+
+				return nil
+			}
+
+			_, err := p.BuildImage(t.Context(), verifyingBuild())
+			if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), tc.not) ||
+				strings.Contains(err.Error(), "still running") {
+				t.Errorf("the ended wait said %v, want %q", err, tc.want)
+			}
+
+			if n := f.countOf("CreateImage"); n != 0 {
+				t.Errorf("%d images were made from a wait that ended", n)
+			}
+		})
 	}
 }
 

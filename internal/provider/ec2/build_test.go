@@ -497,6 +497,8 @@ type buildFake struct {
 	// verdict after the first, as a kernel line interleaved into it would.
 	dwellPolls     int
 	damagedRepeats bool
+	// buildSilent has the builder print nothing billet reads, and run on.
+	buildSilent bool
 	// failsAfterSuccess has every read after the success say the bootstrap failed,
 	// as a builder rebooted during its dwell would.
 	failsAfterSuccess bool
@@ -542,7 +544,7 @@ func (b *buildFake) buildNonce() string {
 // buildConsole is what the builder is pretending to have printed.
 func (b *buildFake) buildConsole() string {
 	nonce := b.buildNonce()
-	if nonce == "" {
+	if nonce == "" || b.buildSilent {
 		return ""
 	}
 

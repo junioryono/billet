@@ -124,6 +124,8 @@ type verifyProbe struct {
 	// and fails when run.
 	noCodeQLBundle    bool
 	failingExecutable string
+	// closedExecutable is a recorded executable the runner may not run.
+	closedExecutable string
 	// recordTail follows the record's line in the file.
 	recordTail string
 	// strayComponent is a component the image carries and does not record, and
@@ -383,12 +385,19 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 				t.Fatalf("make %s: %v", path, err)
 			}
 
-			body := "#!/bin/sh\nexit 0\n"
+			// ONLY THE RUNNER GETS AN ANSWER, as the toolchains' stand-ins give it, so
+			// a check that skipped the privilege drop fails the passing case.
+			body := "#!/bin/sh\n[ -n \"${" + droppedMarker + ":-}\" ] || exit 1\nexit 0\n"
 			if path == p.failingExecutable {
 				body = "#!/bin/sh\nexit 1\n"
 			}
 
 			writeFile(t, croot+path, body, 0o755)
+
+			// CLOSED TO THE RUNNER ALONE, as an executable only root may run is.
+			if path == p.closedExecutable {
+				writeFile(t, filepath.Join(root, "closed-to-runner"), croot+path+"\n", 0o644)
+			}
 		}
 	}
 
@@ -423,10 +432,10 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 			t.Fatal(err)
 		}
 
-		writeFile(t, filepath.Join(bundle, "codeql"), "#!/bin/sh\n[ \"$1\" = version ]\n", 0o755)
+		writeFile(t, filepath.Join(bundle, "codeql"), "#!/bin/sh\n[ -n \"${"+droppedMarker+":-}\" ] || exit 1\n"+
+			"[ \"$1\" = version ]\n", 0o755)
 	}
 
-	script = substitute(t, script, "for c in /opt/hostedtoolcache/CodeQL/", "for c in "+croot+"/opt/hostedtoolcache/CodeQL/")
 	if p.strayComponent != "" {
 		_, stray, _ := strings.Cut(componentPaths[p.strayComponent][0], " ")
 		if err := os.MkdirAll(filepath.Dir(croot+stray), 0o755); err != nil {
@@ -767,6 +776,15 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			probe: verifyProbe{
 				components:             "firefox:140.0.4",
 				unreadableComponentDir: "/usr/local/share/gecko_driver",
+			},
+			wantStep: "components",
+			wantSays: "the image records firefox:140.0.4 and does not carry it for the runner",
+		},
+		{
+			name: "a recorded component's executable is closed to the runner",
+			probe: verifyProbe{
+				components:       "firefox:140.0.4",
+				closedExecutable: "/usr/bin/geckodriver",
 			},
 			wantStep: "components",
 			wantSays: "the image records firefox:140.0.4 and does not carry it for the runner",

@@ -279,8 +279,10 @@ func componentVariableNames(name string) []string {
 // componentRuns is what the runner executes for a component whose paths prove
 // nothing about whether it works. CodeQL's only path is the toolcache directory,
 // which an empty or broken entry also satisfies, so its bundle is run.
+//
+// EACH RUNS AS `sh -c RUN sh "$billet_root"`, so a path in it is under "$1".
 var componentRuns = map[string]string{
-	"codeql": "for c in /opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql; do " +
+	"codeql": "for c in \"$1\"/opt/hostedtoolcache/CodeQL/*/x64/codeql/codeql; do " +
 		"\"$c\" version >/dev/null 2>&1 && exit 0; done; exit 1",
 }
 
@@ -716,7 +718,7 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 		}
 
 		if run, ok := componentRuns[name]; ok {
-			checks = append(checks, verifyRunAsRunner+" sh -c '"+run+"'")
+			checks = append(checks, verifyRunAsRunner+" sh -c '"+run+"' sh \"$billet_root\"")
 		}
 
 		// AND THE JOB IS TOLD WHERE IT IS, as GitHub's installer tells it: a

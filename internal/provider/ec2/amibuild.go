@@ -389,10 +389,18 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 				"instance", id, "error", pollErr)
 		}
 
+		// WHAT THE WAIT HAD PROVED WHEN IT ENDED, and nothing more: whether the
+		// builder is still running is not known here, and BuildImage terminates it.
 		if err := p.sleep(ctx, buildPoll); err != nil {
-			return "", fmt.Errorf("ec2: the builder %s gave no verdict in time; it is still "+
-				"running, and its journal (journalctl -u %s) is where the build is: %w",
-				id, amiUnitName, err)
+			if verdict != nil {
+				return "", fmt.Errorf("ec2: the builder %s announced its build's success and had "+
+					"not powered itself off when the wait ended, so no image was made; billet "+
+					"terminates it: %w", id, err)
+			}
+
+			return "", fmt.Errorf("ec2: the builder %s gave no verdict before the wait ended; billet "+
+				"terminates it, so rerun the build with a longer --timeout and read its console "+
+				"or its journal (journalctl -u %s) while it runs: %w", id, amiUnitName, err)
 		}
 	}
 }
