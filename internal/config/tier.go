@@ -20,6 +20,19 @@ type Tier struct {
 	// the credential that creates it is that target's.
 	Target string `yaml:"target,omitempty"`
 
+	// Targets makes this one declaration a tier on each target it names, or on
+	// every target (`all`), in place of Target. Parse expands it, after `sizes`
+	// and before anything else reads the catalogue, into one tier per target:
+	// Label and RunsOn with TargetPlaceholder replaced by the target's name, and
+	// Target set. A GitHub scale set belongs to one organization or repository,
+	// so one per target is what GitHub requires; the declaration is what spares
+	// the operator writing each.
+	Targets TierTargets `yaml:"targets,omitempty"`
+
+	// Declaration is the label of the multi-target declaration this tier was
+	// expanded from, as written, or empty for a tier written out by hand.
+	Declaration string `yaml:"-"`
+
 	// RunsOn is the name of this tier's scale set on its target, the value a
 	// workflow puts in `runs-on`. It defaults to Label. It exists so tiers on
 	// different targets can answer to one name: Label identifies the tier inside
