@@ -273,6 +273,11 @@ func ec2Preflight(
 		}
 	}
 
+	// AND WHAT EACH IMAGE BOOTS ON, against the tiers that name it (ADR-022).
+	if err := ec2TierArchMismatch(cfg, images); err != nil {
+		return err
+	}
+
 	// THE SPOT QUEUE, READ WITHOUT CONSUMING: a deployment whose interruption
 	// queue is missing or unreadable silently loses every two-minute warning,
 	// so the probe is fatal — and it is GetQueueAttributes, never

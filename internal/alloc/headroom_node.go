@@ -23,6 +23,8 @@ type nodeRow struct {
 	shapes   []config.EC2InstanceType
 	// wire is the protocol the host's registration settled on.
 	wire int
+	// architectures are what the host reported it launches, or none.
+	architectures []config.Arch
 }
 
 // CacheAuthorityWireVersion is the oldest wire a node can honour a tier's cache
@@ -119,6 +121,14 @@ func (a *Allocator) eligibleNodesFor(
 			continue
 		}
 
+		// AN ARCHITECTURE IS PLACED ONLY WHERE IT WAS REPORTED (ADR-022). A node
+		// that reports none, from before the wire that carries it, serves only
+		// tiers that name none, as every node did; an EC2 node is narrowed again
+		// in cost, to the shapes of the tier's architecture.
+		if t.Arch != "" && !slices.Contains(n.architectures, t.Arch) {
+			continue
+		}
+
 		if _, ok := n.cost(t); !ok {
 			continue
 		}
@@ -149,6 +159,13 @@ func nodeRowFrom(row *ledgerdb.ListPlaceableNodesRow) (nodeRow, error) {
 		memory:   config.ByteSize(row.TotalMemory),
 		wire:     int(row.WireVersion),
 	}
+
+	archs, err := config.SplitArchs(row.Architectures)
+	if err != nil {
+		return nodeRow{}, fmt.Errorf("alloc: read architectures for node %s: %w", n.name, err)
+	}
+
+	n.architectures = archs
 
 	shapes, err := decodeRemoteShapes(n.provider, row.Ec2Shapes)
 	if err != nil {

@@ -29,6 +29,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **User data is 16384 bytes, gzipped, and `packUserData` is the gate.**
 - **The AMI build's bootstrap, template steps, component installers and layer run with `HOME=/root`, because neither cloud-init's user data nor a system unit has a HOME.**
 - **The builder checks the runner tarball against the pin before it unpacks it, and an unpinned release needs `--runner-sha256` (#180).**
+- **A shape's architecture is declared, never looked up at runtime, and a launch never crosses it (ADR-022).**
 - **Spot warnings are one queue per node.**
 - **The builder's owner tag is the deployment's, and the policy's pattern comes from the same function that stamps it.**
 - **`awspolicy` is one generator with three consumers and a measured boundary.**

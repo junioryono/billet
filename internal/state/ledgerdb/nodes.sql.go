@@ -399,20 +399,21 @@ func (q *Queries) ListOutstandingRemoteShapes(ctx context.Context) ([]ListOutsta
 }
 
 const listPlaceableNodes = `-- name: ListPlaceableNodes :many
-SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version
+SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version, architectures
   FROM nodes
  WHERE live = 1 AND drained = 0
  ORDER BY name
 `
 
 type ListPlaceableNodesRow struct {
-	Name        string
-	Provider    string
-	Site        string
-	TotalVcpu   int64
-	TotalMemory int64
-	Ec2Shapes   string
-	WireVersion int64
+	Name          string
+	Provider      string
+	Site          string
+	TotalVcpu     int64
+	TotalMemory   int64
+	Ec2Shapes     string
+	WireVersion   int64
+	Architectures string
 }
 
 // The hosts a lease may be placed on at all.
@@ -449,6 +450,7 @@ func (q *Queries) ListPlaceableNodes(ctx context.Context) ([]ListPlaceableNodesR
 			&i.TotalMemory,
 			&i.Ec2Shapes,
 			&i.WireVersion,
+			&i.Architectures,
 		); err != nil {
 			return nil, err
 		}
@@ -796,11 +798,11 @@ const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, highest_release, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch)
 VALUES ($1, $2, $3, $4, $5, $6, $7, 1,
         $8, $9, $10, $11, $12,
         $13, $14, $15, $16,
-        $17, 1)
+        $17, $18, 1)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,
@@ -819,6 +821,7 @@ ON CONFLICT (name) DO UPDATE SET
    codebuild_region   = excluded.codebuild_region,
    incarnation  = excluded.incarnation,
    highest_release = excluded.highest_release,
+   architectures   = excluded.architectures,
    epoch        = nodes.epoch + 1,
    decommissioned_at   = '',
    decommission_proven = 0,
@@ -845,6 +848,7 @@ type UpsertNodeRegistrationParams struct {
 	CodebuildRegion  string
 	Incarnation      string
 	HighestRelease   string
+	Architectures    string
 }
 
 // Register a host, or re-register one, and return its new fence.
@@ -877,6 +881,7 @@ func (q *Queries) UpsertNodeRegistration(ctx context.Context, arg UpsertNodeRegi
 		arg.CodebuildRegion,
 		arg.Incarnation,
 		arg.HighestRelease,
+		arg.Architectures,
 	)
 	var epoch int64
 	err := row.Scan(&epoch)

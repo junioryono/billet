@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 36
+	Version = 37
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -491,6 +491,20 @@ const (
 	// it and sends them anyway has the report kept with the times dropped, which
 	// reads as not timed rather than as nothing slow.
 	VersionReplyTimes = 36
+
+	// VersionArchitectures is the version from which a registration names the
+	// architectures its provider launches (RegisterRequest's architectures), and
+	// an EC2 node's shapes may each carry one (config.RemoteShape's arch), so the
+	// control plane places a tier that names an architecture only on a node that
+	// can launch it (ADR-022).
+	//
+	// REFUSED BY AN OLDER PLANE, and that is what makes this upgrade server first:
+	// its strict decoder refuses a registration carrying either field, so a node
+	// upgraded before its control plane is refused at registration with the range
+	// named. CHECKED WHERE IT IS READ: a pairing that negotiated below it records
+	// the node as reporting no architecture, which places it only for tiers that
+	// name none, as every node was placed before.
+	VersionArchitectures = 37
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -654,6 +668,12 @@ type RegisterRequest struct {
 	// sending it lets the server refuse an obviously wrong pairing at
 	// registration instead of at the first launch.
 	GuestOS []config.GuestOS `json:"guest_os,omitempty"`
+	// Architectures are the processor architectures this node's provider can
+	// launch: the host's own for a provider that runs work on it, an EC2 node's
+	// shapes' (each declared with its arch), a CodeBuild node's environment's.
+	// From VersionArchitectures; empty is "reports none", which places the node
+	// only for tiers that name no architecture.
+	Architectures []config.Arch `json:"architectures,omitempty"`
 	// Site is where this machine is, or empty in a deployment that has one place.
 	Site string `json:"site,omitempty"`
 	// VCPU and Memory are what this host CONTRIBUTES, which is what it detected

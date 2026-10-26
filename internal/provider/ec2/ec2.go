@@ -429,6 +429,57 @@ func (p *Provider) instanceTypesFor(spec provider.Spec) ([]config.EC2InstanceTyp
 		spec.VCPU, spec.Memory, strings.Join(declared, ", "))
 }
 
+// shapesForImage drops the shapes declared with another architecture than the
+// tier's AMI, and refuses the launch when none is left (ADR-022).
+//
+// THE AMI SAYS WHAT IT BOOTS ON, so it is the authority here whatever the tier
+// says: an x64 instance cannot boot an arm64 AMI, and before this the launch
+// started and failed at boot, or a fallback crossed architectures. A shape
+// declared with no architecture is kept, as every shape was: billet cannot tell,
+// and that refusal is EC2's. An AMI whose architecture billet does not know
+// narrows nothing.
+func (p *Provider) shapesForImage(
+	ctx context.Context, spec provider.Spec, shapes []config.EC2InstanceType,
+) ([]config.EC2InstanceType, error) {
+	layout, err := p.imageLayout(ctx, spec.Image)
+	if err != nil {
+		return nil, err
+	}
+
+	image, known := config.ArchFromEC2(layout.arch)
+	if !known {
+		return shapes, nil
+	}
+
+	kept := make([]config.EC2InstanceType, 0, len(shapes))
+
+	var dropped []string
+
+	for _, s := range shapes {
+		if s.Arch != "" && s.Arch != image {
+			dropped = append(dropped, s.Type+" ("+string(s.Arch)+")")
+
+			continue
+		}
+
+		kept = append(kept, s)
+	}
+
+	if len(kept) == 0 {
+		return nil, fmt.Errorf("ec2: %s boots image %s, which is %s, and every declared shape "+
+			"that holds it runs another architecture (%s); declare a %s shape in "+
+			"node.ec2.instance_types, or give the tier an image of its shapes' architecture",
+			spec.Name, spec.Image, image, strings.Join(dropped, ", "), image)
+	}
+
+	if len(dropped) > 0 {
+		p.log.Info("skipping shapes of another architecture than the image's",
+			"runner", spec.Name, "image", spec.Image, "arch", image, "skipped", strings.Join(dropped, ", "))
+	}
+
+	return kept, nil
+}
+
 // clientTokenFor is the idempotency key for one lease on one shape.
 //
 // THE NAME ALONE WAS NOT ENOUGH ONCE A LAUNCH COULD TRY A SECOND SHAPE.
@@ -520,6 +571,12 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	if len(userData) > maxUserData {
 		return nil, fmt.Errorf("ec2: the boot script for %s is %d bytes and ec2 accepts %d; "+
 			"the tier's command is too long to carry", spec.Name, len(userData), maxUserData)
+	}
+
+	// AFTER THE LOCAL REFUSALS, which send nothing; this one reads the image.
+	instanceTypes, err = p.shapesForImage(ctx, spec, instanceTypes)
+	if err != nil {
+		return nil, err
 	}
 
 	// EACH DECLARED SHAPE THAT FITS, IN ORDER, UNTIL ONE STARTS.

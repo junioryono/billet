@@ -130,6 +130,9 @@ type LoopOptions struct {
 	// EC2Shapes are the ordered purchasable shapes of whichever REMOTE backend this
 	// node runs. Empty for a host-backed provider.
 	EC2Shapes []config.RemoteShape
+	// Architectures are what this node's provider can launch, reported at every
+	// registration so placement matches a tier's arch against them (ADR-022).
+	Architectures []config.Arch
 	// CodeBuildFleet is the reserved-capacity CodeBuild fleet this node draws on,
 	// or empty for on-demand compute.
 	CodeBuildFleet string
@@ -233,6 +236,9 @@ func (o LoopOptions) registration() Registration {
 		VCPU:       o.VCPU,
 		Memory:     o.Memory,
 		EC2Shapes:  o.EC2Shapes,
+		// THE SAME MACHINE ON EVERY RE-REGISTRATION, for this function's reason:
+		// placement reads the list the host last reported.
+		Architectures: o.Architectures,
 		// CARRIED ON EVERY RE-REGISTRATION, not just the first, for the reason this
 		// function exists: a node that reconnected without it would look like an
 		// on-demand host to the uniqueness check and free the fleet for a second

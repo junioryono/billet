@@ -1849,6 +1849,10 @@ type NodeRegistration struct {
 	//
 	// The name is the wire's and the ledger column's; see nodeapi.RegisterRequest.
 	EC2Shapes []config.RemoteShape
+	// Architectures are what this node's provider can launch, as it reported them
+	// (nodeapi.VersionArchitectures), or empty for a node that reports none, which
+	// is placed only for tiers that name no architecture (ADR-022).
+	Architectures []config.Arch
 	// Incarnation is the value this node PROCESS minted for its whole life and
 	// presents on every request, or empty for a host that presented none.
 	//
@@ -2067,6 +2071,12 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 	encodedShapes, err := encodeEC2Shapes(shapes)
 	if err != nil {
 		return 0, err
+	}
+
+	// RE-APPLIED HERE BECAUSE THIS IS EXPORTED, as the shapes are: placement
+	// matches the list as written.
+	if err := config.CheckNodeArchitectures(kind, reg.Architectures, shapes); err != nil {
+		return 0, fmt.Errorf("alloc: node %s: %w", name, err)
 	}
 
 	var epoch int64
@@ -2351,6 +2361,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 			TotalVcpu:      int64(reg.VCPU),
 			TotalMemory:    int64(reg.Memory),
 			Ec2Shapes:      encodedShapes,
+			Architectures:  config.JoinArchs(reg.Architectures),
 			LastSeenAt:     now,
 			NodeRelease:    strings.TrimSpace(reg.Release),
 			WireMin:        int64(max(reg.WireMin, 0)),

@@ -962,6 +962,15 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 		}
 	}
 
+	// AN ARCHITECTURE REPORT PLACEMENT COULD BE MISLED BY IS REFUSED HERE,
+	// PERMANENTLY, rather than by the ledger, whose errors this plane answers as an
+	// outage the node retries forever. The same rule runs again where the row is
+	// written, because that half is exported.
+	if err := config.CheckNodeArchitectures(req.Provider,
+		negotiatedArchitectures(req.Architectures, negotiated), req.EC2Shapes); err != nil {
+		return 0, nodeWire, fmt.Errorf("%w: node %q: %w", ErrRefused, req.Node, err)
+	}
+
 	// A CODEBUILD NODE SERVES ONE TRUST CLASS. Config load refuses the pairing
 	// where the file is written; this is the same rule where the catalogue lives,
 	// because the node's file may be the node's alone. PERMANENT, like the site
@@ -1123,6 +1132,17 @@ func safeDigest(raw string) string {
 // sha256HexLen is how long a sha256 is when written as hex.
 const sha256HexLen = 64
 
+// negotiatedArchitectures is what a registration's architectures mean at the wire
+// it was served at: nothing below VersionArchitectures, where a node reports none
+// and is placed only for tiers that name no architecture, as every node was.
+func negotiatedArchitectures(archs []config.Arch, negotiated int) []config.Arch {
+	if negotiated < nodeapi.VersionArchitectures {
+		return nil
+	}
+
+	return archs
+}
+
 // negotiatedDigest takes a manifest digest only from a pairing that has one.
 //
 // CHECKED WHERE IT IS READ, which is the rule the wire's own documentation states
@@ -1202,6 +1222,7 @@ func (p *Plane) register(
 			CodeBuildRegion:  req.CodeBuildRegion,
 			Release:          safeRelease(req.Release),
 			Digest:           negotiatedDigest(req.InstalledDigest, negotiated),
+			Architectures:    negotiatedArchitectures(req.Architectures, negotiated),
 			WireMin:          nodeWire.Min,
 			WireMax:          nodeWire.Max,
 			WireVersion:      negotiated,

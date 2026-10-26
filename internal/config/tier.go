@@ -83,6 +83,12 @@ type Tier struct {
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.
 	GuestOS GuestOS `yaml:"guest_os,omitempty"`
+	// Arch is the processor architecture this tier's jobs run on (x64 or arm64),
+	// or empty to place on a node of any, as a tier always did (ADR-022). Named on
+	// every tier or on none (TierArchErrors). A tier naming one is placed only on
+	// nodes that report it at registration, and an EC2 node buys it only a shape
+	// declared with it.
+	Arch Arch `yaml:"arch,omitempty"`
 	// Node optionally pins this tier to a named node. Required when only one
 	// node can serve it — macOS tiers, for example.
 	Node string `yaml:"node,omitempty"`
@@ -853,6 +859,8 @@ func (c *Config) validateTiers() []error {
 	if c.Server != nil {
 		errs = append(errs, c.floorFitErrors()...)
 	}
+
+	errs = append(errs, TierArchErrors(c.Tiers)...)
 
 	return errs
 }

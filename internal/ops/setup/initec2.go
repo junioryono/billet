@@ -143,6 +143,10 @@ func resolveEC2Shapes(
 			VCPU:            info.VCPU,
 			Memory:          config.ByteSize(info.MemoryMiB) * config.MiB,
 			PriceUSDPerHour: price,
+			// WRITTEN, as the vCPU and memory are, so the node never needs
+			// ec2:DescribeInstanceTypes at runtime: the shape's architecture is what
+			// placement and the launch match a tier's arch and an AMI against.
+			Arch: info.Arch,
 		})
 	}
 

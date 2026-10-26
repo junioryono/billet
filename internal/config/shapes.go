@@ -37,6 +37,12 @@ type EC2InstanceType struct {
 	// an admission gate and cannot make an already-accepted job wait because a
 	// copied price went stale.
 	PriceUSDPerHour USDPerHour `yaml:"price_usd_per_hour" json:"price_usd_per_hour"`
+	// Arch is the architecture this EC2 shape runs, which `billet init` reads from
+	// DescribeInstanceTypes and writes, or empty when nobody said (ADR-022). A tier
+	// naming an architecture is bought only a shape declared with it, so a shape
+	// with none serves only tiers that name none. A CodeBuild compute type names
+	// none: its environment type decides (CodeBuildEnvironment.Arch).
+	Arch Arch `yaml:"arch,omitempty" json:"arch,omitempty"`
 }
 
 // CheckRemoteShapes validates one remote backend's ordered shape catalogue.
@@ -89,6 +95,15 @@ func CheckRemoteShapes(p ProviderKind, types []RemoteShape) []error {
 		if it.Memory <= 0 {
 			errs = append(errs, fmt.Errorf("%s: memory must be more than zero; it is what "+
 				"billet matches an already-reserved lease against", where))
+		}
+
+		switch {
+		case it.Arch == "":
+		case p != ProviderEC2:
+			errs = append(errs, fmt.Errorf("%s: arch is an EC2 shape's; a %s shape runs on "+
+				"whatever its environment type does, so it names none", where, p))
+		case !it.Arch.Valid():
+			errs = append(errs, fmt.Errorf("%s: arch %q is not one of %v", where, it.Arch, allArchs))
 		}
 	}
 

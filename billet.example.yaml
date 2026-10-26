@@ -808,15 +808,20 @@ node:
   #   # charges the first shape that fits, and a capacity refusal from AWS may move
   #   # to a later shape only after billet confirms that shape still fits the node
   #   # and deployment budgets.
+  #   # arch is what the shape runs (x64 or arm64), which `billet init` writes: a
+  #   # tier that names an architecture is bought only a shape declared with it,
+  #   # and no launch uses a shape whose architecture differs from the AMI's.
   #   instance_types:
   #     - type: c7i.2xlarge
   #       vcpu: 8
   #       memory: 16GiB
   #       price_usd_per_hour: 0.357
+  #       arch: x64
   #     - type: c7i.8xlarge
   #       vcpu: 32
   #       memory: 64GiB
   #       price_usd_per_hour: 1.428
+  #       arch: x64
   #
   #   # SPOT DEFAULTS OFF. GitHub does not requeue a job whose runner vanished
   #   # mid-execution, so a reclaimed spot instance is a failed build rather than a
@@ -1219,6 +1224,10 @@ tiers:
 # guest_os is what the licence check keys off — not the label — so a macOS tier
 # named anything at all is still capped, and a Linux tier with "macos" in its
 # name is not.
+#
+# arch (x64 or arm64) places a tier only on nodes that launch that architecture.
+# Name it on every tier or on none, and only once every host runs a billet that
+# reads it; a macOS tier is arm64.
 #
 #  - label: billet-6vcpu-macos-26
 #    provider: tart

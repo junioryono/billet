@@ -346,6 +346,24 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 				member.Provider, liveness)
 		}
 
+		// AN ARCHITECTURE IS WRITTEN ONLY ONCE EVERY HOST CAN READ IT (ADR-022).
+		// REFUSED, not reported: an older host stops on the file.
+		hostWires, err := a.NodeWireVersions(ctx)
+		if err != nil {
+			return report, err
+		}
+
+		decommissioned := map[string]bool{}
+		for _, member := range registered {
+			if member.Decommissioned != "" {
+				decommissioned[member.Name] = true
+			}
+		}
+
+		if err := archBeforeEveryHost(cfg, hostWires, decommissioned); err != nil {
+			return report, err
+		}
+
 		// WHICH LIVE HOSTS EACH SHAPE FITS, for the tier lines below: a tier no
 		// live host can place advertises and is assigned work all the same
 		// (ADR-012), and its jobs wait however much else is free.

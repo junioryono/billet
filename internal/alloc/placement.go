@@ -92,6 +92,13 @@ func (n nodeRow) cost(t config.Tier) (placementCost, bool) {
 	}
 
 	for _, shape := range n.shapes {
+		// A SHAPE OF ANOTHER ARCHITECTURE BOOTS NONE OF THIS TIER'S IMAGE, and one
+		// declared with none is not known to: a tier naming an architecture is
+		// bought only a shape declared with it (ADR-022).
+		if t.Arch != "" && shape.Arch != t.Arch {
+			continue
+		}
+
 		if shape.VCPU >= t.VCPU && shape.Memory >= t.Memory {
 			return placementCost{
 				vcpu: shape.VCPU, memory: shape.Memory, instanceType: shape.Type,
