@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"strconv"
@@ -200,9 +201,15 @@ func (p *Provider) VerifyImage(ctx context.Context, spec VerifySpec) error {
 	}
 
 	if verdict := report[reportVerdictKey]; verdict != verdictOK {
+		// THE COMPONENTS ARE LEFT OUT: unlike the other fields, the record is not
+		// held to a vocabulary until checkRecordedComponents, which a failed
+		// verification never reaches.
+		shown := maps.Clone(report)
+		delete(shown, buildComponentsKey)
+
 		return fmt.Errorf("ec2: %s reported %s=%q at step %q, so it does not meet AMI contract "+
 			"%d and has NOT been stamped\n\n  %s", spec.Image, reportVerdictKey, verdict,
-			report[reportStepKey], contract, strings.Join(reportLines(report), "\n  "))
+			report[reportStepKey], contract, strings.Join(reportLines(shown), "\n  "))
 	}
 
 	components, err := checkRecordedComponents(report, contract, spec.Components)

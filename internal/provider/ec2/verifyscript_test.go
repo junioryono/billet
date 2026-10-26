@@ -560,6 +560,8 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 		name     string
 		probe    verifyProbe
 		wantStep string
+		// asUser is a case only an account without root's override can stage.
+		asUser bool
 	}{
 		{
 			// A TOOLCHAIN A WORKFLOW CALLS BY NAME. GitHub's tests proved it on the
@@ -614,6 +616,7 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 				unreadableComponentDir: "/usr/local/share/gecko_driver",
 			},
 			wantStep: "components",
+			asUser:   true,
 		},
 		{
 			name:     "the record names a component billet does not install",
@@ -725,6 +728,12 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+
+			// ROOT READS A DIRECTORY WHATEVER ITS MODE, so the case cannot be staged
+			// by a suite run as root, as it is on the shared Linux host.
+			if tc.asUser && os.Geteuid() == 0 {
+				t.Skip("root reads every directory")
+			}
 
 			report, stdout := tc.probe.run(t)
 

@@ -31,18 +31,20 @@
 #
 # Environment, for tests only: BILLET_AMI_ROOT prefixes every path the build reads
 # or changes on the machine, and BILLET_AMI_CONSOLE, BILLET_AMI_BOOT_ID and
-# BILLET_AMI_DWELL_* replace the console, the boot id and the dwell.
+# BILLET_AMI_DWELL_* and BILLET_AMI_TEE_WAIT replace the console, the boot id, the
+# dwell and how long a failure waits for the log.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 root=${BILLET_AMI_ROOT:-}
-env_file=$root/opt/billet-ami/build.env
+env_file=$root/var/lib/billet-ami/build.env
 state=${BILLET_AMI_STATE:-$root/var/lib/billet-ami-build/state}
 console=${BILLET_AMI_CONSOLE:-/dev/console}
 dwell_rounds=${BILLET_AMI_DWELL_ROUNDS:-8}
 dwell_seconds=${BILLET_AMI_DWELL_SECONDS:-15}
 boot_id=${BILLET_AMI_BOOT_ID:-/proc/sys/kernel/random/boot_id}
+tee_wait=${BILLET_AMI_TEE_WAIT:-10}
 
 die() {
 	echo "build-ami: $*" >&2
@@ -121,11 +123,19 @@ on_exit() {
 	fi
 	trap - EXIT
 	# THE LOG IS WHOLE BEFORE IT IS READ: tee writes it asynchronously, so the
-	# build's output is closed and tee waited for, or a step that failed at once
-	# could be missing from it.
+	# build's output goes back to the journal and tee is waited for, or a step that
+	# failed at once could be missing from it. FOR A WHILE, NOT FOR EVER: a process a
+	# step left behind can hold the pipe open, and a verdict nobody prints is a
+	# build that waits out billet's deadline.
 	if [ -n "${tee_pid:-}" ]; then
-		exec >/dev/null 2>&1
+		exec 1>&3 2>&4 3>&- 4>&-
+		(
+			/bin/sleep "$tee_wait"
+			kill "$tee_pid" 2>/dev/null
+		) >/dev/null 2>&1 &
+		local killer=$!
 		wait "$tee_pid" 2>/dev/null || true
+		kill "$killer" 2>/dev/null || true
 	fi
 	[ "$at" = template ] && n=$(template_step)
 	verdict verdict=fail "step=$at" "template_step=$n" components=
@@ -138,7 +148,7 @@ ami-x64) toolset=toolset-2404.json plan=plan.json ;;
 ami-arm64) toolset=toolset-2404-arm64.json plan=plan-arm64.json ;;
 *) die "$env_file names no AMI scope (ami-x64 or ami-arm64)" ;;
 esac
-layer=$root/opt/billet-ami/ec2-layer.sh
+layer=$root/var/lib/billet-ami/ec2-layer.sh
 # shellcheck disable=SC2206 # the accepted names are words, split on purpose
 accept=(${BILLET_AMI_ACCEPT:-})
 
@@ -148,6 +158,7 @@ accept=(${BILLET_AMI_ACCEPT:-})
 install -d -m 0700 "$work"
 log=$work/build.log
 : >"$log"
+exec 3>&1 4>&2
 exec > >(tee -a "$log") 2>&1
 tee_pid=$!
 
@@ -191,13 +202,7 @@ TMPDIR="$work/tmp" \
 	BILLET_RI_FROM="$from" \
 	BILLET_RI_IMAGE_VERSION="$(date -u +%Y%m%d).billet" \
 	BILLET_RI_OUT="$work/out" \
-	"$repo/scripts/run-runner-images.sh"
-
-# THE BUILD'S OWN FILES ARE ROOT'S AGAIN. GitHub's configure-system.sh makes
-# everything under /opt writable by everyone, and root runs the layer and the
-# completer from here next.
-chmod -R go-w "$root/opt/billet-ami"
-chmod 0600 "$env_file"
+	"$repo/scripts/run-runner-images.sh" 3>&- 4>&-
 
 # THE COMPONENTS THE DEPLOYMENT ACCEPTS AND THIS TEMPLATE OFFERS, through the
 # completer and GitHub's own installers and tests the guest carries (#584). A
@@ -249,7 +254,7 @@ bash "$layer"
 at=cleanup
 systemctl disable billet-ami-build.service >/dev/null 2>&1 || true
 rm -f "$root/etc/systemd/system/billet-ami-build.service"
-rm -rf "$root/opt/billet-ami" "$work" "$root/var/tmp/billet-ri"
+rm -rf "$root/var/lib/billet-ami" "$work" "$root/var/tmp/billet-ri"
 cloud-init clean --logs --machine-id
 sync
 

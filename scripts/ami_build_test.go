@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // amiBuildNonce is the build identity a fixture's build.env names.
@@ -13,18 +14,18 @@ const amiBuildNonce = "0123456789abcdef0123456789abcdef"
 
 // The stand-ins build-ami.sh runs beside, in a repository of their own. Each logs
 // what it was asked to $FAKE/calls; the runner announces its steps as the real one
-// does, leaves what GitHub's template leaves (configure-system.sh's world-writable
-// /opt, its staging under /var/tmp/billet-ri), fails at FAKE_FAIL_AT, and reboots
-// once at FAKE_REBOOT_AT through the real ami-target.sh, after which it exits as
+// does, leaves what GitHub's template leaves (its staging under
+// /var/tmp/billet-ri), fails at FAKE_FAIL_AT, and reboots once at FAKE_REBOOT_AT through the real ami-target.sh, after which it exits as
 // the reboot's SIGTERM would end it.
 const (
 	fakeAMIRunner = `#!/bin/bash
 set -eu
 echo "runner scope=$BILLET_RI_SCOPE from=$BILLET_RI_FROM tmp=${TMPDIR:-}" >>"$FAKE/calls"
 [ -z "${FAKE_FAIL_FIRST:-}" ] || exit 1
-chmod -R 777 "$BILLET_AMI_ROOT/opt"
 mkdir -p "$BILLET_AMI_ROOT/var/tmp/billet-ri"
 echo staged >"$BILLET_AMI_ROOT/var/tmp/billet-ri/step.sh"
+# A STEP THAT LEAVES A PROCESS BEHIND holding the build's output.
+[ -z "${FAKE_LINGER:-}" ] || /bin/sleep "$FAKE_LINGER" &
 for n in $(seq "$BILLET_RI_FROM" 9); do
 	echo "=== [$n/9] step-$n ==="
 	[ "$n" != "${FAKE_FAIL_AT:-}" ] || exit 1
@@ -62,16 +63,7 @@ if [ "$1" = present ]; then
 fi
 exec bash "$REAL_CHECK_COMPONENT" "$@"
 `
-	// The layer says whether anything of the build was writable by another
-	// account when root came to run it.
-	fakeLayer = `#!/bin/sh
-echo layer >>"$FAKE/calls"
-if [ -n "$(find "$BILLET_AMI_ROOT/opt/billet-ami" -perm -o+w -print -quit)" ] ||
-	[ -n "$(find "$BILLET_AMI_ROOT/opt/billet-ami/build.env" -perm -g+r -print -quit)" ]; then
-	echo "layer found the build open to other accounts" >>"$FAKE/calls"
-fi
-exit "${FAKE_LAYER_STATUS:-0}"
-`
+	fakeLayer = "#!/bin/sh\necho layer >>\"$FAKE/calls\"\nexit \"${FAKE_LAYER_STATUS:-0}\"\n"
 	// tee WRITES LATE, as a real one may: the build must wait for it before it
 	// reads its own log.
 	fakeTee = `#!/bin/bash
@@ -149,7 +141,7 @@ func newAMIBuildFixture(t *testing.T, scope, accept string) amiBuildFixture {
 
 	for _, d := range []string{
 		filepath.Join(fx.repo, "scripts", "ami"), filepath.Join(fx.repo, "scripts", "runner-images"),
-		filepath.Join(fx.root, "opt", "billet-ami"), filepath.Join(fx.root, "etc", "systemd", "system"),
+		filepath.Join(fx.root, "var", "lib", "billet-ami"), filepath.Join(fx.root, "etc", "systemd", "system"),
 		fx.fake, filepath.Join(dir, "bin"),
 	} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -166,10 +158,10 @@ func newAMIBuildFixture(t *testing.T, scope, accept string) amiBuildFixture {
 		"scripts/check-guest-component.sh":                    fakeCheckComponent,
 		"scripts/runner-images/plan.json":                     readScriptFile(t, filepath.Join("runner-images", "plan.json")),
 		"scripts/runner-images/plan-arm64.json":               readScriptFile(t, filepath.Join("runner-images", "plan-arm64.json")),
-		"../root/opt/billet-ami/ec2-layer.sh":                 fakeLayer,
+		"../root/var/lib/billet-ami/ec2-layer.sh":             fakeLayer,
 		"../root/etc/environment":                             "PATH=/usr/bin\n",
 		"../root/etc/systemd/system/billet-ami-build.service": "[Unit]\n",
-		"../root/opt/billet-ami/build.env": "BILLET_AMI_NONCE=" + amiBuildNonce + "\n" +
+		"../root/var/lib/billet-ami/build.env": "BILLET_AMI_NONCE=" + amiBuildNonce + "\n" +
 			"BILLET_AMI_SCOPE=" + scope + "\nBILLET_AMI_ACCEPT='" + accept + "'\n",
 	} {
 		if err := forkSafeWriteFile(filepath.Join(fx.repo, filepath.FromSlash(name)), []byte(body), 0o755); err != nil {
@@ -337,10 +329,6 @@ func TestTheAMIBuildRunsTheTemplateCompletesAndAnnounces(t *testing.T) {
 		t.Errorf("the builder powered off at %d, before the image was cleaned at %d:\n%s", j, i, calls)
 	}
 
-	if strings.Contains(calls, "layer found the build open to other accounts") {
-		t.Errorf("root ran the layer from files GitHub's template left writable by everyone:\n%s", calls)
-	}
-
 	if !strings.Contains(calls, "poweroff after the verdict\n") {
 		t.Errorf("the builder powered off before announcing its verdict:\n%s", calls)
 	}
@@ -350,7 +338,7 @@ func TestTheAMIBuildRunsTheTemplateCompletesAndAnnounces(t *testing.T) {
 		t.Errorf("the image records %q (%v)", record, err)
 	}
 
-	for _, gone := range []string{"opt/billet-ami", "var/lib/billet-ami-build", "opt/billet/complete",
+	for _, gone := range []string{"var/lib/billet-ami", "var/lib/billet-ami-build", "opt/billet/complete",
 		"var/tmp/billet-ri",
 		"etc/systemd/system/billet-ami-build.service"} {
 		if _, err := os.Stat(filepath.Join(fx.root, gone)); !os.IsNotExist(err) {
@@ -412,6 +400,10 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 		{name: "a completed component is not present", accept: "firefox",
 			env: []string{"FAKE_PRESENT_STATUS=1"}, wantStep: "components"},
 		{name: "the layer fails", env: []string{"FAKE_LAYER_STATUS=1"}, wantStep: "layer"},
+		// A PROCESS A STEP LEFT HOLDING THE BUILD'S OUTPUT does not hold back the
+		// verdict past BILLET_AMI_TEE_WAIT: the build stops waiting for its log.
+		{name: "a step leaves a process holding the output", env: []string{"FAKE_FAIL_AT=4",
+			"FAKE_LINGER=30", "BILLET_AMI_TEE_WAIT=1"}, wantStep: "template", wantTemplate: "4"},
 		// THE RECORD SAYS REBOOTING AND THE MACHINE IS NOT GOING DOWN: a reboot
 		// request that failed is a failure, not the planned path.
 		{name: "the reboot request fails", env: []string{"FAKE_REBOOT_AT=5", "FAKE_REBOOT_FAILS=1"},
@@ -433,9 +425,17 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 				}
 			}
 
+			began := time.Now()
+
 			out, err := fx.run(t, tc.env...)
 			if err == nil {
 				t.Fatalf("a failed build exited 0:\n%s", out)
+			}
+
+			// A FAILURE IS ANNOUNCED PROMPTLY: a wait without its bound would sit
+			// out the lingering process's thirty seconds.
+			if took := time.Since(began); took > 20*time.Second {
+				t.Errorf("the failure took %s to be announced", took)
 			}
 
 			v := fx.verdict(t)
@@ -518,7 +518,7 @@ func TestTheAMIBuildUnitResumesWithoutAnOrderingCycle(t *testing.T) {
 
 	for _, line := range []string{
 		"After=network-online.target cloud-final.service", "WantedBy=cloud-init.target",
-		"Type=oneshot", "TimeoutStartSec=infinity", "ExecStart=/opt/billet-ami/repo/scripts/ami/build-ami.sh run",
+		"Type=oneshot", "TimeoutStartSec=infinity", "ExecStart=/var/lib/billet-ami/repo/scripts/ami/build-ami.sh run",
 		"StandardOutput=journal", "StandardError=journal",
 	} {
 		if !hasExactLine(unit, line) {

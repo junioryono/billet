@@ -8,7 +8,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/billet-ami/repo/scripts/ami/build-ami.sh run
+ExecStart=/var/lib/billet-ami/repo/scripts/ami/build-ami.sh run
 # THE BUILD TAKES HOURS, and a start timeout would end it partway.
 TimeoutStartSec=infinity
 # THE JOURNAL, NEVER THE CONSOLE: billet reads the build's verdict off the serial

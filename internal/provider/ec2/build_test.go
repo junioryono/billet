@@ -489,6 +489,14 @@ type buildFake struct {
 	stopsUnread bool
 	// omitBuildComponents leaves the components line out of the verdict.
 	omitBuildComponents bool
+	// dwellPolls is how many more polls the builder runs after its verdict was
+	// read, as the dwell keeps it up; damagedRepeats breaks every repeat of the
+	// verdict after the first, as a kernel line interleaved into it would.
+	dwellPolls     int
+	damagedRepeats bool
+	// describeReads is how the builder's first DescribeInstances are answered, one
+	// letter a call: R refuses it. Every call after them answers as usual.
+	describeReads string
 	// consoleReads is how the builder's first console reads are answered, one
 	// letter a read: R refuses it, Q answers with nothing printed yet. Every read
 	// after them sees the verdict.
@@ -543,7 +551,7 @@ func (b *buildFake) buildConsole() string {
 		reportStepKey + "=" + step + "\n" +
 		buildTemplateStepKey + "=" + b.buildTemplateStep + "\n"
 
-	if !b.omitBuildComponents {
+	if !b.omitBuildComponents && (!b.damagedRepeats || !b.verdictRead) {
 		body += buildComponentsKey + "=" + b.builtComponents + "\n"
 	}
 
@@ -663,6 +671,14 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 	case "DescribeInstances":
 		b.describes++
 
+		if params.Get("InstanceId.1") == "i-builder" && b.describeReads != "" {
+			b.describeReads = b.describeReads[1:]
+
+			return http.StatusForbidden, `<Response><Errors><Error>` +
+				`<Code>UnauthorizedOperation</Code><Message>not now</Message>` +
+				`</Error></Errors></Response>`
+		}
+
 		// NOT VISIBLE YET, ON THE FIRST ASK. This is the only bug in this PR that a
 		// real machine demonstrated: the first live build called DescribeInstances
 		// the instant RunInstances returned an id, got InvalidInstanceID.NotFound,
@@ -688,7 +704,11 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 
 		// THE BUILDER RUNS UNTIL ITS VERDICT HAS BEEN READ, as a real one dwells
 		// on it before it powers off.
-		if !b.verdictRead && !b.stopsUnread {
+		if b.verdictRead && b.dwellPolls > 0 {
+			b.dwellPolls--
+		}
+
+		if (!b.verdictRead || b.dwellPolls > 0) && !b.stopsUnread {
 			return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item>` +
 				`<instancesSet><item><instanceId>i-builder</instanceId>` +
 				`<instanceState><name>running</name></instanceState>` +

@@ -290,6 +290,17 @@ func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
 	zw := gzip.NewWriter(&raw)
 	tw := tar.NewWriter(zw)
 
+	// THE BUILD'S DIRECTORY FIRST, root's alone: tar creates it with this mode
+	// before anything is unpacked into it.
+	if err := tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeDir,
+		Name:     strings.TrimPrefix(amiBuildDir, "/") + "/",
+		Mode:     0o700,
+		ModTime:  payloadModTime,
+	}); err != nil {
+		return nil, "", fmt.Errorf("ec2: build the payload archive: %w", err)
+	}
+
 	for _, f := range files {
 		hdr := &tar.Header{
 			Typeflag: tar.TypeReg,

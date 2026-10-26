@@ -193,7 +193,7 @@ func TestThePayloadLaysTheBuildOutAsTheTreeDoes(t *testing.T) {
 			t.Fatalf("ToolsetFileFor(%s): %v", arch, err)
 		}
 
-		want["opt/billet-ami/repo/internal/runnerimages/"+file] = struct {
+		want["var/lib/billet-ami/repo/internal/runnerimages/"+file] = struct {
 			mode int64
 			body []byte
 		}{0o644, body}
@@ -208,10 +208,10 @@ func TestThePayloadLaysTheBuildOutAsTheTreeDoes(t *testing.T) {
 		mode int64
 		body []byte
 	}{
-		"opt/billet-ami/repo/internal/runnerimages/pinned.txt":        {0o644, runnerimages.PinnedFile()},
-		"opt/billet-ami/repo/internal/guestassets/docker-daemon.json": {0o644, []byte(guestassets.DockerDaemonJSON)},
-		"opt/billet-ami/build.env":                                    {0o600, []byte(env)},
-		"opt/billet-ami/ec2-layer.sh":                                 {0o755, []byte(testLayer)},
+		"var/lib/billet-ami/repo/internal/runnerimages/pinned.txt":        {0o644, runnerimages.PinnedFile()},
+		"var/lib/billet-ami/repo/internal/guestassets/docker-daemon.json": {0o644, []byte(guestassets.DockerDaemonJSON)},
+		"var/lib/billet-ami/build.env":                                    {0o600, []byte(env)},
+		"var/lib/billet-ami/ec2-layer.sh":                                 {0o755, []byte(testLayer)},
 	} {
 		want[name] = m
 	}
@@ -234,8 +234,15 @@ func TestThePayloadLaysTheBuildOutAsTheTreeDoes(t *testing.T) {
 		}
 	}
 
+	// THE BUILD'S DIRECTORY IS ROOT'S ALONE, because GitHub's template opens /opt to
+	// everyone and root runs what is in here after it.
+	dir, ok := headers["var/lib/billet-ami/"]
+	if !ok || dir.Typeflag != tar.TypeDir || dir.Mode != 0o700 || dir.Uid != 0 || dir.Gid != 0 {
+		t.Errorf("the build's directory is %+v, want a directory of mode 700 owned by root", dir)
+	}
+
 	for name := range headers {
-		if _, ok := want[name]; !ok {
+		if _, ok := want[name]; !ok && name != "var/lib/billet-ami/" {
 			t.Errorf("the payload carries %s, which nothing names", name)
 		}
 	}
@@ -264,7 +271,7 @@ func TestThePayloadCarriesEverySourceThePlansCopy(t *testing.T) {
 	}
 
 	headers, bodies := payloadMembers(t, archive)
-	upstream := "opt/billet-ami/repo/scripts/runner-images/upstream/"
+	upstream := "var/lib/billet-ami/repo/scripts/runner-images/upstream/"
 
 	for _, plan := range []string{"plan.json", "plan-arm64.json"} {
 		var steps []struct {
@@ -274,7 +281,7 @@ func TestThePayloadCarriesEverySourceThePlansCopy(t *testing.T) {
 			Sources []string `json:"sources"`
 		}
 
-		if err := json.Unmarshal(bodies["opt/billet-ami/repo/scripts/runner-images/"+plan], &steps); err != nil {
+		if err := json.Unmarshal(bodies["var/lib/billet-ami/repo/scripts/runner-images/"+plan], &steps); err != nil {
 			t.Fatalf("%s in the payload: %v", plan, err)
 		}
 
@@ -338,6 +345,10 @@ func TestTheRunnerAcceptsThePayloadsTree(t *testing.T) {
 			headers, bodies := payloadMembers(t, archive)
 
 			for name, hdr := range headers {
+				if hdr.Typeflag == tar.TypeDir {
+					continue
+				}
+
 				path := filepath.Join(root, filepath.FromSlash(name))
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 					t.Fatal(err)
@@ -362,7 +373,7 @@ func TestTheRunnerAcceptsThePayloadsTree(t *testing.T) {
 			}
 
 			cmd := exec.CommandContext(t.Context(), "bash",
-				filepath.Join(root, "opt", "billet-ami", "repo", "scripts", "run-runner-images.sh"))
+				filepath.Join(root, "var", "lib", "billet-ami", "repo", "scripts", "run-runner-images.sh"))
 			cmd.Env = append(os.Environ(), "BILLET_RI_TARGET="+driver, "BILLET_RI_IMAGE_VERSION=1",
 				"BILLET_RI_OUT="+t.TempDir(), "BILLET_RI_SCOPE="+scope)
 
@@ -401,6 +412,7 @@ func TestTheBootstrapChecksThePayloadBeforeItUnpacksIt(t *testing.T) {
 		"curl -fsSL --retry 5 --retry-all-errors -o " + payloadPath + " '" + testPayloadURL + "'",
 		"echo '" + testPayloadDigest + "  " + payloadPath + "' | sha256sum -c -",
 		"tar --no-overwrite-dir -xzf " + payloadPath + " -C /",
+		"grep -qx 'BILLET_AMI_NONCE=" + verifyProbeNonce + "' " + amiBuildEnv,
 		"systemctl daemon-reload",
 		"systemctl start --no-block " + amiUnitName,
 	}
@@ -452,19 +464,25 @@ func TestTheBootstrapRefusesWhatItCannotQuote(t *testing.T) {
 	}
 }
 
-// THE BOOTSTRAP IS EXECUTED, against a payload that is and is not the one staged.
-// A digest check that a pipeline or a missing `-c` turned into a no-op passes the
-// first and the second alike; only running both tells them apart.
+// THE BOOTSTRAP IS EXECUTED, against a payload that is and is not the one staged,
+// and settings that do and do not name this build. A digest check that a pipeline
+// or a missing `-c` turned into a no-op passes the first and the second alike; only
+// running both tells them apart.
 func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name    string
-		payload string
-		wantRun bool
+		name     string
+		payload  string
+		settings string
+		wantRun  bool
 	}{
 		{name: "the staged payload", payload: "the payload\n", wantRun: true},
 		{name: "another payload", payload: "someone else's payload\n"},
+		// SETTINGS THAT DO NOT NAME THIS BUILD: build-ami.sh could not say anything
+		// billet would read, so the unit is never started and the bootstrap says it.
+		{name: "settings of another build", payload: "the payload\n",
+			settings: "BILLET_AMI_NONCE=fedcba9876543210fedcba9876543210\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -507,6 +525,15 @@ func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 			script = substitute(t, script, payloadPath, filepath.Join(dir, "payload.tar.gz"))
 			script = substitute(t, script, "/dev/console", console)
 
+			settings := tc.settings
+			if settings == "" {
+				settings = "BILLET_AMI_NONCE=" + verifyProbeNonce + "\nBILLET_AMI_SCOPE=ami-x64\n"
+			}
+
+			env := filepath.Join(dir, "build.env")
+			writeFile(t, env, settings, 0o600)
+			script = substitute(t, script, amiBuildEnv, env)
+
 			cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
 			cmd.Env = append(os.Environ(), "PATH="+bin+":/usr/bin:/bin")
 			out, runErr := cmd.CombinedOutput()
@@ -539,6 +566,38 @@ func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 					report, found, bootstrapStep)
 			}
 		})
+	}
+}
+
+// A BUILD OWES WHAT WAS ACCEPTED AND ITS TEMPLATE INSTALLS: on arm64, whose
+// template has no Android SDK, CodeQL, Chrome or Edge, Firefox alone.
+func TestABuildOwesWhatItsTemplateOffers(t *testing.T) {
+	t.Parallel()
+
+	all := []string{"android-sdk", "codeql", "firefox", "google-chrome", "microsoft-edge"}
+
+	for arch, want := range map[string][]string{"x64": all, "arm64": {"firefox"}} {
+		got, err := offeredComponents(arch, all)
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("%s owes %q (%v), want %q", arch, got, err, want)
+		}
+	}
+
+	if got, err := offeredComponents("x64", nil); err != nil || len(got) != 0 {
+		t.Errorf("a build that accepted nothing owes %q (%v)", got, err)
+	}
+
+	// THE INSTALLERS ARE check-guest-component.sh's, which the build asks.
+	for name, installer := range componentInstallers {
+		out, err := exec.CommandContext(t.Context(), "bash",
+			filepath.Join("..", "..", "..", "scripts", "check-guest-component.sh"), "installer", name).Output()
+		if err != nil || strings.TrimSpace(string(out)) != installer {
+			t.Errorf("%s: billet says %s and check-guest-component.sh %q (%v)", name, installer, out, err)
+		}
+	}
+
+	if len(componentInstallers) != len(all) {
+		t.Errorf("billet knows %d installers for %d components", len(componentInstallers), len(all))
 	}
 }
 
@@ -812,6 +871,26 @@ func TestTheBuildsComponentsAreVerifiedAndStamped(t *testing.T) {
 		}
 	})
 
+	// OWED AND LEFT OUT: the template offers Firefox on x64 and the build reported
+	// none, which is a deployment short of what it accepted.
+	t.Run("accepted, offered and left out", func(t *testing.T) {
+		t.Parallel()
+
+		b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
+
+		f := newFakeEC2(t)
+		f.respond = b.serve(f)
+
+		if _, err := newTestProvider(t, f, nil).BuildImage(t.Context(), accepted()); err == nil ||
+			!strings.Contains(err.Error(), "this build owes") {
+			t.Fatalf("a build that left out an owed component was answered %v", err)
+		}
+
+		if n := f.countOf("CreateImage"); n != 0 {
+			t.Errorf("%d images were registered", n)
+		}
+	})
+
 	t.Run("installed without acceptance", func(t *testing.T) {
 		t.Parallel()
 
@@ -873,6 +952,22 @@ func TestABuildStagesWhatItsBootstrapFetches(t *testing.T) {
 	}
 }
 
+// THE SUCCESS IS READ ONCE: the dwell repeats it until the builder powers off, and
+// a repeat that arrives damaged is not a reason to terminate a build that finished.
+func TestADamagedRepeatOfTheSuccessDoesNotEndTheBuild(t *testing.T) {
+	t.Parallel()
+
+	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available",
+		dwellPolls: 3, damagedRepeats: true}
+
+	f := newFakeEC2(t)
+	f.respond = b.serve(f)
+
+	if _, err := newTestProvider(t, f, nil).BuildImage(t.Context(), verifyingBuild()); err != nil {
+		t.Fatalf("a damaged repeat of a success already read ended the build: %v", err)
+	}
+}
+
 // A FEW FAILED POLLS IN A ROW ARE A NETWORK THAT WENT AWAY, NOT A BUILD THAT
 // FAILED; past maxBuildPollFailures the wait gives up, and nothing is imaged.
 func TestAFewFailedPollsDoNotEndABuild(t *testing.T) {
@@ -881,29 +976,32 @@ func TestAFewFailedPollsDoNotEndABuild(t *testing.T) {
 	short := strings.Repeat("R", maxBuildPollFailures-1)
 
 	for _, tc := range []struct {
-		reads  string
-		wantOK bool
+		reads, describes string
+		wantOK           bool
 	}{
 		{reads: short, wantOK: true},
 		{reads: short + "R"},
 		// IN A ROW: an answered read between two runs of refusals starts the count
 		// again, however many there are in all.
 		{reads: short + "Q" + short, wantOK: true},
+		// AND A REFUSED STATE IS A FAILED POLL TOO.
+		{describes: short, wantOK: true},
+		{describes: short + "R"},
 	} {
 		b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available",
-			consoleReads: tc.reads}
+			consoleReads: tc.reads, describeReads: tc.describes}
 
 		f := newFakeEC2(t)
 		f.respond = b.serve(f)
 
 		_, err := newTestProvider(t, f, nil).BuildImage(t.Context(), verifyingBuild())
 		if (err == nil) != tc.wantOK {
-			t.Errorf("console reads %s: the build answered %v, want success %v",
-				tc.reads, err, tc.wantOK)
+			t.Errorf("console reads %q, describes %q: the build answered %v, want success %v",
+				tc.reads, tc.describes, err, tc.wantOK)
 		}
 
 		if n := f.countOf("CreateImage"); (n == 1) != tc.wantOK {
-			t.Errorf("console reads %s: %d images were registered", tc.reads, n)
+			t.Errorf("console reads %q, describes %q: %d images were registered", tc.reads, tc.describes, n)
 		}
 	}
 }
@@ -990,5 +1088,33 @@ func TestABuildWithoutAPayloadBucketIsRefused(t *testing.T) {
 
 	if n := f.countOf("RunInstances"); n != 0 {
 		t.Errorf("%d instances were launched", n)
+	}
+}
+
+// A FAILED VERIFICATION QUOTES NO COMPONENTS: unlike the report's other fields the
+// record is held to a vocabulary only once the image has passed, so a failed
+// report's record is the machine's text and stays out of billet's error.
+func TestAFailedVerificationQuotesNoComponents(t *testing.T) {
+	t.Parallel()
+
+	secret := "secret-token-123"
+	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available",
+		verdict: verdictFail, recordedComponents: &secret}
+
+	f := newFakeEC2(t)
+	f.respond = b.serve(f)
+
+	err := newTestProvider(t, f, nil).VerifyImage(t.Context(), VerifySpec{Image: "ami-new"})
+	if err == nil {
+		t.Fatal("a failed verification stamped the image")
+	}
+
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("the failure quotes the image's components record: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "docker_driver=overlay2") {
+		t.Errorf("the failure no longer renders the report's other fields, so this test proves "+
+			"nothing about the components alone: %v", err)
 	}
 }

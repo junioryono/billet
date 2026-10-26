@@ -18,8 +18,13 @@ import (
 // Where the payload puts the build on the builder. build-ami.sh finds the tree at
 // the paths it has in billet's repository, under amiRepoDir, and reads its
 // settings from amiBuildEnv.
+//
+// UNDER /var/lib AND ROOT'S ALONE, NOT UNDER /opt. GitHub's configure-system.sh
+// makes everything under /opt writable by everyone, on the builder that is its
+// target, and root goes on running the build's scripts after it; restoring the
+// modes afterwards would not restore what another account wrote in between.
 const (
-	amiBuildDir  = "/opt/billet-ami"
+	amiBuildDir  = "/var/lib/billet-ami"
 	amiRepoDir   = amiBuildDir + "/repo"
 	amiBuildEnv  = amiBuildDir + "/build.env"
 	amiLayerPath = amiBuildDir + "/ec2-layer.sh"
@@ -220,6 +225,12 @@ func bootstrapScript(spec BuildSpec) (string, error) {
 	// directory keeps its own mode rather than taking one from the archive.
 	b.WriteString("tar --no-overwrite-dir -xzf " + payloadPath + " -C /\n")
 	b.WriteString("rm -f " + payloadPath + "\n")
+
+	// THE BUILD'S SETTINGS NAME THIS BUILD, or the unit is never started: build-ami.sh
+	// can announce a failure only once it has read the nonce from them, so a
+	// payload whose settings do not is refused here, where this bootstrap's own
+	// verdict says so.
+	b.WriteString("grep -qx 'BILLET_AMI_NONCE=" + spec.nonce + "' " + amiBuildEnv + "\n")
 	b.WriteString("systemctl daemon-reload\n")
 	b.WriteString("systemctl start --no-block " + amiUnitName + "\n")
 
@@ -292,6 +303,13 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 				"image was made", id)
 
 		case "running":
+			// THE SUCCESS IS READ ONCE. The dwell repeats it until the builder powers
+			// off, and a repeat a kernel line broke is not a reason to terminate a
+			// build that finished.
+			if verdict != nil {
+				break
+			}
+
 			out, err := p.consoleOutput(ctx, id, latest)
 
 			switch {
@@ -313,6 +331,20 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 
 					if err := checkBuildComponents(components, spec.Accept); err != nil {
 						return "", fmt.Errorf("ec2: the builder %s: %w", id, err)
+					}
+
+					// EXACTLY WHAT WAS OWED, read from billet's own plan rather than
+					// taken on the build's word: an accepted component the template
+					// offers and the build left out is a deployment short of what it
+					// accepted.
+					want, err := offeredComponents(spec.Arch, spec.Accept)
+					if err != nil {
+						return "", err
+					}
+
+					if got := componentNames(components); !slices.Equal(got, want) {
+						return "", fmt.Errorf("ec2: the builder %s reported the components %q and "+
+							"this build owes %q", id, got, want)
 					}
 
 					verdict = report
@@ -366,21 +398,70 @@ func buildFailure(id, arch string, report map[string]string) error {
 		"(journalctl -u %s)", id, where, amiUnitName)
 }
 
-// planStepName is the id of step n (counted from 1) of arch's plan.
-func planStepName(arch, n string) (string, bool) {
-	i, err := strconv.Atoi(n)
-	if err != nil || i < 1 {
-		return "", false
+// componentInstallers is GitHub's template step that installs each component,
+// the one the completer runs; a test holds it to check-guest-component.sh's own.
+var componentInstallers = map[string]string{
+	"android-sdk":    "install-android-sdk.sh",
+	"codeql":         "install-codeql-bundle.sh",
+	"firefox":        "install-firefox.sh",
+	"google-chrome":  "install-google-chrome.sh",
+	"microsoft-edge": "install-microsoft-edge.sh",
+}
+
+// offeredComponents is the accepted components arch's template installs, sorted:
+// what a build of arch owes the deployment.
+func offeredComponents(arch string, accept []string) ([]string, error) {
+	ids, err := planStepIDs(arch)
+	if err != nil {
+		return nil, err
 	}
 
+	out := []string{}
+
+	for _, name := range accept {
+		installer, ok := componentInstallers[name]
+		if !ok {
+			return nil, fmt.Errorf("ec2: billet knows no installer for the component %s", name)
+		}
+
+		if slices.Contains(ids, installer) {
+			out = append(out, name)
+		}
+	}
+
+	slices.Sort(out)
+
+	return out, nil
+}
+
+// componentNames is the names in a components list, sorted.
+func componentNames(value string) []string {
+	out := []string{}
+
+	if value == "" {
+		return out
+	}
+
+	for _, item := range strings.Split(value, ",") {
+		name, _, _ := strings.Cut(item, ":")
+		out = append(out, name)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// planStepIDs is every step id of arch's plan, in order.
+func planStepIDs(arch string) ([]string, error) {
 	_, plan, err := scopeFor(arch)
 	if err != nil {
-		return "", false
+		return nil, err
 	}
 
 	files, err := scripts.AMIBuild()
 	if err != nil {
-		return "", false
+		return nil, fmt.Errorf("ec2: read the build's scripts: %w", err)
 	}
 
 	for _, f := range files {
@@ -392,14 +473,34 @@ func planStepName(arch, n string) (string, bool) {
 			ID string `json:"id"`
 		}
 
-		if err := json.Unmarshal(f.Body, &steps); err != nil || i > len(steps) {
-			return "", false
+		if err := json.Unmarshal(f.Body, &steps); err != nil {
+			return nil, fmt.Errorf("ec2: read %s: %w", plan, err)
 		}
 
-		return steps[i-1].ID, true
+		ids := make([]string, 0, len(steps))
+		for _, s := range steps {
+			ids = append(ids, s.ID)
+		}
+
+		return ids, nil
 	}
 
-	return "", false
+	return nil, fmt.Errorf("ec2: the build carries no %s", plan)
+}
+
+// planStepName is the id of step n (counted from 1) of arch's plan.
+func planStepName(arch, n string) (string, bool) {
+	i, err := strconv.Atoi(n)
+	if err != nil || i < 1 {
+		return "", false
+	}
+
+	ids, err := planStepIDs(arch)
+	if err != nil || i > len(ids) {
+		return "", false
+	}
+
+	return ids[i-1], true
 }
 
 // checkBuildComponents is a reported components list, `name:version` joined by
