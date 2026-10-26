@@ -85,19 +85,18 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	group := fs.String("security-group", "", "override the security group from the config")
 	// THE WHOLE BUILD: GitHub's template and billet's layer on the builder,
 	// CreateImage, waiting for the image to become launchable, and the verifier's
-	// boot. Timed on real builds in us-west-2, on the default builder and disk:
+	// boot. Timed on real builds in us-west-2, 2026-10-25 and 26, on the default
+	// builder and disk (build is the template and layer, snapshot is to available):
 	//
-	//	                         template+layer  snapshot to available  verify  whole
-	//	x64, two components      40m             59m30s                 4m38s   1h44m
-	//	x64, all five            42m43s          59m59s                 6m26s   1h49m
-	//	arm64, first             38m             45m30s                 4m30s   1h29m
-	//	arm64, second            39m16s          48m11s                 4m53s   1h32m
-	//
-	// (2026-10-25 and 26).
+	//	                build   snapshot  verify  whole
+	//	x64, two        40m     59m30s    4m38s   1h44m
+	//	x64, all five   42m43s  59m59s    6m26s   1h49m
+	//	arm64, first    38m     45m30s    4m30s   1h29m
+	//	arm64, second   39m16s  48m11s    4m53s   1h32m
 	//
 	// The snapshot is the largest part and the least predictable, since it grows
 	// with the image and with the region's load, so three hours leaves the x64
-	// build most of an hour's room. The cost of a generous bound is nothing: it is
+	// build over an hour's room. The cost of a generous bound is nothing: it is
 	// a deadline, not a wait, and a build that fails says so on its console within
 	// a poll.
 	timeout := fs.Duration("timeout", 3*time.Hour, "how long to wait for the whole build")

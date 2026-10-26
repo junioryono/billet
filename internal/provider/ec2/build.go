@@ -85,7 +85,7 @@ const (
 // clamps a job's root up to the image's, so what is left after the image is what a
 // job has to build in.
 //
-// MEASURED ON REAL BUILDERS, 2026-10-25, running GitHub's whole template
+// MEASURED ON REAL BUILDERS, 2026-10-25 and 26, running GitHub's whole template
 // (ADR-022): a prototype on a 200 GiB root used at most 42 GiB on x64 (c7i.4xlarge,
 // before the template's reboot) and 35 GiB on arm64 (c7g.4xlarge); the images
 // `billet ami build` then made on this default hold 51 GiB on x64 with the Android
@@ -109,10 +109,11 @@ const DefaultBuilderDiskGiB = 120
 // the base image's footprint added back.
 //
 // 65 FREE BECAUSE A FINISHED x64 IMAGE WITH ALL FIVE COMPONENTS HOLDS 54
-// (measured 2026-10-26, the base image's own two gigabytes in it), so the peak is
-// at least that and a build admitted at the floor has about ten to spare; 75 for
-// the flag adds the base image and the filesystem's own share of a volume. It is a
-// floor rather than a recommendation: the default is what leaves a job room.
+// (measured 2026-10-26, the base image's own two gigabytes in it), so a build
+// admitted at the floor ends 13 above its finished image; the peak with all five
+// was not measured and is higher, so the spare at the high-water mark is less. 75
+// for the flag adds the base image and the filesystem's own share of a volume. It
+// is a floor rather than a recommendation: the default is what leaves a job room.
 const (
 	minBuilderFreeGiB = 65
 	minBuilderDiskGiB = 75
