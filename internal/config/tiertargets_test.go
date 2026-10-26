@@ -330,9 +330,19 @@ func TestAHandWrittenTierThatCollidesWithADeclarationSaysSo(t *testing.T) {
     image: ubuntu-2404-x64
 `
 
-	_, err := Load(writeConfig(t, threeTargetConfig(t, handWritten+everyTarget)))
-	if err == nil || !strings.Contains(err.Error(), `the declaration "${target}-1vcpu" makes it for target "beta"`) {
-		t.Errorf("Load = %v, want the collision blamed on the declaration", err)
+	// IN EITHER ORDER, and naming the target the declaration made it for, not
+	// the hand-written tier's.
+	handWrittenElsewhere := strings.Replace(handWritten, "    target: beta\n", "    target: personal\n", 1)
+	for name, body := range map[string]string{
+		"hand-written first": handWrittenElsewhere + everyTarget,
+		"declaration first":  everyTarget + handWrittenElsewhere,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, threeTargetConfig(t, body)))
+			if err == nil || !strings.Contains(err.Error(), `the declaration "${target}-1vcpu" makes it for target "beta"`) {
+				t.Errorf("Load = %v, want the collision blamed on the declaration for beta", err)
+			}
+		})
 	}
 }
 
@@ -395,8 +405,16 @@ func TestANodesFileLoadsADefaultBranchDeclaration(t *testing.T) {
 		"  private_key_path: /etc/billet/app.pem\n"
 
 	declaration := strings.Replace(everyTarget, "    targets: all\n",
-		"    targets: all\n    cache:\n      publish: default-branch\n", 1)
-	nodeOnly := validConfig + declaration
+		"    targets: all\n    cache:\n      publish: default-branch\n      actions:\n        enabled: true\n", 1)
+	// THE NODE SERVES THE CACHES ITS TIERS ENABLE, which is the node's own rule
+	// and not this one.
+	withCache := strings.Replace(validConfig, "  ceph:\n",
+		"  cache:\n    listen: 172.20.0.1:7718\n    guest_endpoint: http://172.20.0.1:7718\n  ceph:\n", 1)
+	if withCache == validConfig {
+		t.Fatal("the fixture has no ceph block, so the cache was not added")
+	}
+
+	nodeOnly := withCache + declaration
 	for _, block := range []string{server, github} {
 		if !strings.Contains(nodeOnly, block) {
 			t.Fatalf("the fixture no longer contains %q, so this case removes nothing", block)
@@ -411,7 +429,7 @@ func TestANodesFileLoadsADefaultBranchDeclaration(t *testing.T) {
 
 	// THE CONTROL PLANE'S FILE, with a repository target, loads it too, and
 	// derives the scope.
-	controller := strings.Replace(validConfig, "  org: acme\n", "  repository: acme/widgets\n", 1) + declaration
+	controller := strings.Replace(withCache, "  org: acme\n", "  repository: acme/widgets\n", 1) + declaration
 	cfg, err := Load(writeConfig(t, controller))
 	if err != nil {
 		t.Fatalf("the control plane's file was refused: %v", err)
@@ -424,7 +442,7 @@ func TestANodesFileLoadsADefaultBranchDeclaration(t *testing.T) {
 
 	// AND THE CONTROL PLANE STILL REFUSES IT where no scope can be derived: an
 	// organization target names no repository.
-	if _, err := Load(writeConfig(t, validConfig+declaration)); err == nil ||
+	if _, err := Load(writeConfig(t, withCache+declaration)); err == nil ||
 		!strings.Contains(err.Error(), "needs a static repository") {
 		t.Errorf("an organization target's default-branch declaration loaded: %v", err)
 	}

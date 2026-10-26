@@ -262,7 +262,7 @@ func (t Tier) PoolPolicyErrors(where string) []error {
 		errs = append(errs, fmt.Errorf("%s: an untrusted pool can enable the Actions cache "+
 			"only with cache.publish: default-branch", where))
 	}
-	if cache.Actions.Enabled && t.CacheScope == nil {
+	if cache.Actions.Enabled && t.CacheScope == nil && !t.inventoryOnly {
 		errs = append(errs, fmt.Errorf("%s: the Actions cache requires a static cache_scope because JobStarted arrives after launch", where))
 	}
 	if scope := t.CacheScope; scope != nil {

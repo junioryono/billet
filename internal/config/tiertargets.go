@@ -121,7 +121,10 @@ func ExpandTierTargets(tiers []Tier, targets []string) ([]Tier, error) {
 
 	var errs []error
 
-	fromDeclaration := make(map[string]string)
+	// made is which declaration made a label, and for which target.
+	type made struct{ declaration, target string }
+
+	fromDeclaration := make(map[string]made)
 
 	for i := range tiers {
 		t := tiers[i]
@@ -170,10 +173,10 @@ func ExpandTierTargets(tiers []Tier, targets []string) ([]Tier, error) {
 
 			if other, dup := fromDeclaration[one.Label]; dup {
 				errs = append(errs, fmt.Errorf("tier %q is made twice, by %q and %q; each target's "+
-					"tier needs a label of its own", one.Label, other, one.Declaration))
+					"tier needs a label of its own", one.Label, other.declaration, one.Declaration))
 			}
 
-			fromDeclaration[one.Label] = one.Declaration
+			fromDeclaration[one.Label] = made{declaration: one.Declaration, target: name}
 
 			out = append(out, one)
 		}
@@ -190,9 +193,9 @@ func ExpandTierTargets(tiers []Tier, targets []string) ([]Tier, error) {
 	for i := range out {
 		label := out[i].Label
 		if seen[label] {
-			if decl, made := fromDeclaration[label]; made {
+			if by, ok := fromDeclaration[label]; ok {
 				return nil, fmt.Errorf("tier %q is defined more than once: the declaration %q makes "+
-					"it for target %q, and another tier is spelled that way", label, decl, out[i].Target)
+					"it for target %q, and another tier is spelled that way", label, by.declaration, by.target)
 			}
 		}
 
