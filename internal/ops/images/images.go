@@ -496,6 +496,11 @@ func firecrackerTierUses(cfg *config.Config) ([]tierImageUse, error) {
 		if !cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) || image == "" {
 			continue
 		}
+		// ANOTHER MACHINE'S TIER IS NOT THIS NODE'S (ADR-022): in a file naming arch,
+		// a node pulls, refreshes and checks only the images of tiers of its own.
+		if cfg.Tiers[i].Arch != "" && cfg.Tiers[i].Arch.Machine() != hostArch() {
+			continue
+		}
 
 		j, seen := at[image]
 		if !seen {

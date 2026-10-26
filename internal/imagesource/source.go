@@ -56,6 +56,23 @@ const ManifestName = "manifest.json"
 // gapped cannot reach Rekor.
 const BundleName = "manifest.sigstore.json"
 
+// manifestMachine is the machine whose manifest is ManifestName: the only one a
+// release carried before ADR-022, and the one every reader before it reads.
+const manifestMachine = "x86_64"
+
+// ManifestNamesFor is the manifest and its signature bundle a release carries for
+// machine, as `uname -m` spells it (ADR-022): ManifestName and BundleName for
+// x86_64, and manifest-<machine>.json and manifest-<machine>.sigstore.json for any
+// other, so a reader that predates the split goes on reading the x86_64 image it
+// always read. Empty is x86_64.
+func ManifestNamesFor(machine string) (string, string) {
+	if machine == "" || machine == manifestMachine {
+		return ManifestName, BundleName
+	}
+
+	return "manifest-" + machine + ".json", "manifest-" + machine + ".sigstore.json"
+}
+
 // Source names where images are fetched from.
 type Source struct {
 	// BaseURL is the directory the manifest and its assets sit in, without a
@@ -170,4 +187,12 @@ func (s Source) AssetURL(name string) (string, error) {
 // ManifestURL is where the index for the current release lives.
 func (s Source) ManifestURL() string {
 	return s.BaseURL + "/" + ManifestName
+}
+
+// ManifestURLFor is where the index for machine's image in the current release
+// lives.
+func (s Source) ManifestURLFor(machine string) string {
+	name, _ := ManifestNamesFor(machine)
+
+	return s.BaseURL + "/" + name
 }

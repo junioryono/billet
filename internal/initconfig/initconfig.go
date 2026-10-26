@@ -77,10 +77,13 @@ const (
 	// verified one. Unlike a docker image it is not pulled from a registry — it
 	// comes from `billet images pull`.
 	DefaultFirecrackerImage = "ubuntu-2404-x64@verified"
-	defaultBridge           = "billet0"
-	defaultUntrustedBridge  = "billet1"
-	defaultImagePool        = "billet-images"
-	defaultCachePool        = "billet-cache"
+	// DefaultFirecrackerARM64Image is DefaultFirecrackerImage for an arm64 host,
+	// an image of its own, since one image holds one architecture (ADR-022).
+	DefaultFirecrackerARM64Image = "ubuntu-2404-arm64@verified"
+	defaultBridge                = "billet0"
+	defaultUntrustedBridge       = "billet1"
+	defaultImagePool             = "billet-images"
+	defaultCachePool             = "billet-cache"
 )
 
 // Profile selects the path shape a generated config is written for.
@@ -147,6 +150,20 @@ const (
 	macServiceKeyPath    = macServiceConfDir + "/app-private-key.pem"
 	macServiceConfigPath = macServiceConfDir + "/billet.yaml"
 )
+
+// DefaultFirecrackerImageFor is the guest image a Firecracker tier names on a host
+// whose Go runtime reports goarch, empty for this machine's.
+func DefaultFirecrackerImageFor(goarch string) string {
+	if goarch == "" {
+		goarch = runtime.GOARCH
+	}
+
+	if arch, _ := config.HostArch(goarch); arch == config.ArchARM64 {
+		return DefaultFirecrackerARM64Image
+	}
+
+	return DefaultFirecrackerImage
+}
 
 // serviceOS is runtime.GOOS behind a seam, so the platform-derived service
 // shape can be asserted from either side on one machine.
@@ -323,6 +340,9 @@ type Params struct {
 
 	// Profile selects the path shape (see Profile). Empty means ProfileLocal.
 	Profile Profile
+	// GOARCH is the machine whose guest image a Firecracker tier names when none
+	// is given (DefaultFirecrackerImageFor). Empty means this machine's.
+	GOARCH string
 	// GOOS is the platform whose SERVICE shape a local-service generation is
 	// for. Empty means this machine's, which is what a real run wants; a caller
 	// generating for another host — or a test asserting both shapes on one
@@ -488,7 +508,7 @@ func Generate(p Params) (string, bool, error) {
 		// on the untrusted bridge — the default. A trusted policy is accepted if
 		// given (it was validated above), but not required.
 		if p.Image == "" {
-			p.Image = DefaultFirecrackerImage
+			p.Image = DefaultFirecrackerImageFor(p.GOARCH)
 		}
 	case config.ProviderTart:
 		// A tart guest is a real VM with its own kernel, so tart (like firecracker)

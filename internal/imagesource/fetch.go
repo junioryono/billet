@@ -12,6 +12,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 )
 
@@ -41,6 +42,11 @@ const (
 // with an instruction attached, while a network failure is a retry.
 var ErrNotFound = errors.New("imagesource: no such artifact at this source")
 
+// ErrNoImageForMachine is the signed channel saying its current release carries no
+// image for this machine: final until the channel moves, unlike a manifest that
+// could not be fetched, which says nothing about whether one exists.
+var ErrNoImageForMachine = errors.New("imagesource: the channel's current release carries no image for this machine")
+
 // Client fetches artifacts from a source and proves they are what was
 // published before letting anything else see them.
 type Client struct {
@@ -50,7 +56,26 @@ type Client struct {
 	// Source is where artifacts are fetched from.
 	Source Source
 
+	// Machine is the machine whose image is fetched, as `uname -m` spells it;
+	// empty is x86_64, which every release carries as ManifestName.
+	Machine string
+
 	verifyChannel func([]byte, []byte, Policy) error
+
+	// channelArchitectures is what the resolved channel pointer said its release
+	// carries, and channelSaid whether it said: a pointer published before the
+	// member existed says nothing, which is not the same as an empty list.
+	channelArchitectures []string
+	channelSaid          bool
+}
+
+// machine is c.Machine, with empty read as the x86_64 every release carries.
+func (c *Client) machine() string {
+	if c.Machine == "" {
+		return manifestMachine
+	}
+
+	return c.Machine
 }
 
 // defaultHTTP is used when a caller supplies none.
@@ -177,12 +202,16 @@ func (c *Client) Resolve(ctx context.Context) error {
 		}
 	}
 
+	// ARCHITECTURES IS OPTIONAL, and schema 1 is unchanged by it (ADR-022): a
+	// reader before it ignores the member, and a pointer before it says nothing,
+	// which leaves the reader to try the manifest named for its machine.
 	var channel struct {
 		Schema           int       `json:"schema"`
 		Tag              string    `json:"tag"`
 		PublishedAt      time.Time `json:"published_at"`
 		ExpiresAt        time.Time `json:"expires_at"`
 		ReleaseImmutable bool      `json:"release_immutable"`
+		Architectures    *[]string `json:"architectures"`
 	}
 	if err := json.Unmarshal(body, &channel); err != nil {
 		return fmt.Errorf("imagesource: the guest-image channel is invalid: %w", err)
@@ -217,6 +246,10 @@ func (c *Client) Resolve(ctx context.Context) error {
 		official: true,
 	}
 
+	if channel.Architectures != nil {
+		c.channelArchitectures, c.channelSaid = *channel.Architectures, true
+	}
+
 	return nil
 }
 
@@ -232,12 +265,40 @@ func (c *Client) Resolve(ctx context.Context) error {
 // out of them. Verifying a re-serialised manifest would verify a document this
 // program produced rather than the one that was signed, and the two can differ in
 // whitespace, key order, or any field a future reader drops.
+//
+// THE MANIFEST NAMED FOR THIS CLIENT'S MACHINE (ADR-022). A channel that lists its
+// release's architectures and leaves this one out is final (ErrNoImageForMachine).
+// One that does not say, and a dated release of billet's own, leave the reader to
+// try the manifest, and a failure there, a 404 included, is could-not-tell: a 404
+// can be temporary or cached, and GitHub's API, which could say more, is not asked.
+// An operator's own source that publishes no manifest for this machine is read
+// from ManifestName instead, which Usable then judges, so a mirror publishing a
+// single arm64 manifest.json keeps working.
 func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 	if err := c.Resolve(ctx); err != nil {
 		return nil, err
 	}
 
-	body, err := c.get(ctx, c.Source.ManifestURL(), MaxManifestBytes)
+	machine := c.machine()
+	if c.channelSaid && !slices.Contains(c.channelArchitectures, machine) {
+		return nil, fmt.Errorf("%w: %s lists %v, and this is %s", ErrNoImageForMachine,
+			c.Source.BaseURL, c.channelArchitectures, machine)
+	}
+
+	name, bundle := ManifestNamesFor(machine)
+
+	body, err := c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes)
+	if err != nil && name != ManifestName && errors.Is(err, ErrNotFound) {
+		if c.Source.official {
+			return nil, fmt.Errorf("imagesource: could not tell whether %s carries an image for %s: "+
+				"it publishes no %s, and nothing signed says whether it should: %v", c.Source.BaseURL,
+				machine, name, err)
+		}
+
+		name, bundle = ManifestName, BundleName
+		body, err = c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +306,7 @@ func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 	var signature []byte
 
 	if p.Required {
-		signature, err = c.get(ctx, c.Source.BaseURL+"/"+BundleName, MaxBundleBytes)
+		signature, err = c.get(ctx, c.Source.BaseURL+"/"+bundle, MaxBundleBytes)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return nil, fmt.Errorf("imagesource: this source requires a signature and %s "+
