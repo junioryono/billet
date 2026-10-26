@@ -64,22 +64,24 @@ func (c *countingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	return c.next.RoundTrip(req)
 }
 
-// THE NPM CACHE MEASURED UNDER A REAL INSTALL (ADR-020's deferred measurement,
-// #631): the real node cache, against the real registry, reached by a real npm
-// through the real guest relay on the npm loopback address, with the registry
-// remapped to it as the guest remaps it. Each run is a fresh container, as each
-// job is a fresh guest, sharing only the node.
-//
-// It is a container on the shared test host, not a Firecracker guest: what it
-// proves is the relay, the node and the registry's own behaviour under npm and
-// a pnpm/setup-shaped fetch; what it does not is a microVM's network path, sudo
-// under the guest image's sudoers, or a host-network container in the guest.
-//
-// Run it there, never on the development Mac, and only by name:
-// BILLET_TEST_NPM_LIVE=1 go test -run '^TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime$' ./internal/node
-func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
+// npmLive is a live test's node: the real cache service on a loopback listener,
+// the guest relay's script, and a count of what the node asked the registry for.
+type npmLive struct {
+	t        *testing.T
+	docker   string
+	service  *CacheService
+	logs     *lockedBuffer
+	work     string
+	requests atomic.Int64
+	wrapped  bool
+}
+
+// newNpmLive starts the node's cache for a live test, or skips the test unless
+// BILLET_TEST_NPM_LIVE is 1 and Docker is installed.
+func newNpmLive(t *testing.T) *npmLive {
+	t.Helper()
 	if os.Getenv("BILLET_TEST_NPM_LIVE") != "1" {
-		t.Skip("BILLET_TEST_NPM_LIVE=1 runs a real npm install against registry.npmjs.org in Docker")
+		t.Skip("BILLET_TEST_NPM_LIVE=1 runs real clients against registry.npmjs.org in Docker")
 	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
@@ -91,10 +93,10 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	var logs lockedBuffer
+	logs := &lockedBuffer{}
 	service, err := NewCacheService("http://"+listener.Addr().String(), "npm-live", t.TempDir(),
 		&fakeCacheStore{}, &fakeVolumeAttacher{},
-		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
@@ -116,95 +118,132 @@ func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(work, "actions-proxy.py"), script, 0o644); err != nil {
 		t.Fatalf("write the guest relay: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(work, "package.json"), []byte(npmLivePackages), 0o644); err != nil {
+
+	return &npmLive{t: t, docker: docker, service: service, logs: logs, work: work}
+}
+
+// npmLiveRun is what one job did: its output, the requests the node made of the
+// registry while it ran, the node's answers to it and its log while it ran, and
+// how it ended.
+type npmLiveRun struct {
+	output   string
+	upstream int64
+	answers  map[string]int
+	log      string
+	err      error
+}
+
+// run runs step in a fresh container of image, as one job in a fresh guest: the
+// guest relay on the npm loopback address, the registry remapped to it, and the
+// job's own session authority trusted.
+//
+// THE RELAY IS GIVEN NOWHERE TO FAIL OPEN TO, unlike a guest's: a tunnel the
+// node refused would otherwise reach the registry directly, make no request
+// from the node and look exactly like a warm answer. Here every fetch goes
+// through the node or fails the run.
+func (l *npmLive) run(job, image, step string) npmLiveRun {
+	t := l.t
+	t.Helper()
+
+	credentials, err := l.service.PrepareScoped("billet-npm-live-"+job, CacheSessionScope{
+		Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	if !l.wrapped {
+		npm := l.service.npmCache()
+		npm.pooled.Transport = &countingTransport{next: npm.pooled.Transport, count: &l.requests}
+		npm.fresh.Transport = &countingTransport{next: npm.fresh.Transport, count: &l.requests}
+		l.wrapped = true
+	}
+	if err := os.WriteFile(filepath.Join(l.work, "ca.pem"), []byte(credentials.ActionsCAPEM), 0o644); err != nil {
+		t.Fatalf("write the authority: %v", err)
+	}
+	shell := strings.Join([]string{
+		"set -euo pipefail",
+		// What the container writes under /work goes back to the test's own
+		// account, so its temporary directory can be removed.
+		`trap 'chown -R "$BILLET_OWNER" /work' EXIT`,
+		"python3 /work/actions-proxy.py --mode passthrough --listen 127.0.2.1:443 " +
+			"--upstream \"$BILLET_NPM_PROXY\" --origin registry.npmjs.org --fallback-addr '' &",
+		"sleep 1",
+		step,
+	}, "\n")
+	before := l.requests.Load()
+	logged := len(l.logs.String())
+	started := time.Now()
+	// BOUNDED BY THE TEST'S OWN DEADLINE, less a margin for the removal below:
+	// the test binary's watchdog ends the process without running cleanups.
+	limit := 15 * time.Minute
+	if deadline, ok := t.Deadline(); ok {
+		limit = min(limit, time.Until(deadline)-2*time.Minute)
+	}
+	if limit <= 0 {
+		t.Fatalf("%s: no time is left before the test's deadline to run and clean up a container", job)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), limit)
+	defer cancel()
+	// NAMED, AND REMOVED HOWEVER THE RUN ENDS: a cancelled docker CLI does not
+	// stop the container the daemon runs, which would keep the npm loopback
+	// address on the shared host.
+	name := "billet-npm-live-" + strconv.Itoa(os.Getpid()) + "-" + job
+	t.Cleanup(func() {
+		// NOT the test's own context, which has ended by the time this runs.
+		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
+		defer cancel()
+		// `docker rm -f` of a container --rm already removed answers "no such
+		// container", which is the ordinary case and not worth reporting.
+		if output, err := exec.CommandContext(removeCtx, l.docker, "rm", "-f", name).CombinedOutput(); err != nil &&
+			!strings.Contains(string(output), "No such container") {
+			t.Logf("remove %s: %v: %s", name, err, output)
+		}
+	})
+	command := exec.CommandContext(ctx, l.docker, "run", "--rm", "--name", name, "--network", "host",
+		"--add-host", npmRegistryHost+":127.0.2.1",
+		"-v", l.work+":/work",
+		"-e", "NODE_EXTRA_CA_CERTS=/work/ca.pem",
+		"-e", "BILLET_NPM_PROXY="+credentials.NpmProxy,
+		"-e", "BILLET_OWNER="+strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
+		image, "bash", "-c", shell)
+	output, err := command.CombinedOutput()
+	log := l.logs.String()[logged:]
+	run := npmLiveRun{
+		output: string(output), upstream: l.requests.Load() - before,
+		answers: npmCounts(log), log: log, err: err,
+	}
+	t.Logf("%s: %s, %d requests to the registry from the node; answers %s\n%s", job,
+		time.Since(started).Round(time.Millisecond), run.upstream, npmTally(run.answers), tail(run.output, 15))
+
+	return run
+}
+
+// THE NPM CACHE MEASURED UNDER A REAL INSTALL (ADR-020's deferred measurement,
+// #631): the real node cache, against the real registry, reached by a real npm
+// through the real guest relay on the npm loopback address, with the registry
+// remapped to it as the guest remaps it. Each run is a fresh container, as each
+// job is a fresh guest, sharing only the node.
+//
+// It is a container on the shared test host, not a Firecracker guest: what it
+// proves is the relay, the node and the registry's own behaviour under npm and
+// a pnpm/setup-shaped fetch; what it does not is a microVM's network path, sudo
+// under the guest image's sudoers, or a host-network container in the guest.
+//
+// Run it there, never on the development Mac, and only by name:
+// BILLET_TEST_NPM_LIVE=1 go test -run '^TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime$' ./internal/node
+func TestLiveAnNpmInstallIsServedFromTheNodeTheSecondTime(t *testing.T) {
+	live := newNpmLive(t)
+	if err := os.WriteFile(filepath.Join(live.work, "package.json"), []byte(npmLivePackages), 0o644); err != nil {
 		t.Fatalf("write package.json: %v", err)
 	}
-	// THE RELAY IS GIVEN NOWHERE TO FAIL OPEN TO, unlike a guest's: a tunnel the
-	// node refused would otherwise reach the registry directly, make no request
-	// from the node and look exactly like a warm answer. Here every fetch goes
-	// through the node or fails the run.
-	fallback := ""
-
-	upstream := map[string]int64{}
-	answers := map[string]map[string]int{}
-	var requests atomic.Int64
-	wrapped := false
+	app := "cp -r /work/app-src /tmp/app 2>/dev/null || { mkdir -p /tmp/app && cp /work/package.json /tmp/app/; }\n" +
+		"cd /tmp/app\n"
+	runs := map[string]npmLiveRun{}
 	run := func(job, step string) {
 		t.Helper()
-
-		credentials, err := service.PrepareScoped("billet-npm-live-"+job, CacheSessionScope{
-			Trust: provider.TrustUntrusted, Cache: &config.CacheSpec{Npm: true},
-		})
-		if err != nil {
-			t.Fatalf("PrepareScoped: %v", err)
-		}
-		if !wrapped {
-			npm := service.npmCache()
-			npm.pooled.Transport = &countingTransport{next: npm.pooled.Transport, count: &requests}
-			npm.fresh.Transport = &countingTransport{next: npm.fresh.Transport, count: &requests}
-			wrapped = true
-		}
-		if err := os.WriteFile(filepath.Join(work, "ca.pem"), []byte(credentials.ActionsCAPEM), 0o644); err != nil {
-			t.Fatalf("write the authority: %v", err)
-		}
-		shell := strings.Join([]string{
-			"set -euo pipefail",
-			// What the container writes under /work goes back to the test's own
-			// account, so its temporary directory can be removed.
-			`trap 'chown -R "$BILLET_OWNER" /work' EXIT`,
-			"python3 /work/actions-proxy.py --mode passthrough --listen 127.0.2.1:443 " +
-				"--upstream \"$BILLET_NPM_PROXY\" --origin registry.npmjs.org --fallback-addr \"$BILLET_NPM_FALLBACK\" &",
-			"sleep 1",
-			"cp -r /work/app-src /tmp/app 2>/dev/null || { mkdir -p /tmp/app && cp /work/package.json /tmp/app/; }",
-			"cd /tmp/app",
-			step,
-		}, "\n")
-		before := requests.Load()
-		logged := len(logs.String())
-		started := time.Now()
-		// BOUNDED BY THE TEST'S OWN DEADLINE, less a margin for the removal below:
-		// the test binary's watchdog ends the process without running cleanups.
-		limit := 15 * time.Minute
-		if deadline, ok := t.Deadline(); ok {
-			limit = min(limit, time.Until(deadline)-2*time.Minute)
-		}
-		if limit <= 0 {
-			t.Fatalf("%s: no time is left before the test's deadline to run and clean up a container", job)
-		}
-		ctx, cancel := context.WithTimeout(t.Context(), limit)
-		defer cancel()
-		// NAMED, AND REMOVED HOWEVER THE RUN ENDS: a cancelled docker CLI does not
-		// stop the container the daemon runs, which would keep the npm loopback
-		// address on the shared host.
-		name := "billet-npm-live-" + strconv.Itoa(os.Getpid()) + "-" + job
-		t.Cleanup(func() {
-			// NOT the test's own context, which has ended by the time this runs.
-			removeCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
-			defer cancel()
-			// `docker rm -f` of a container --rm already removed answers "no such
-			// container", which is the ordinary case and not worth reporting.
-			if output, err := exec.CommandContext(removeCtx, docker, "rm", "-f", name).CombinedOutput(); err != nil &&
-				!strings.Contains(string(output), "No such container") {
-				t.Logf("remove %s: %v: %s", name, err, output)
-			}
-		})
-		command := exec.CommandContext(ctx, docker, "run", "--rm", "--name", name, "--network", "host",
-			"--add-host", npmRegistryHost+":127.0.2.1",
-			"-v", work+":/work",
-			"-e", "NODE_EXTRA_CA_CERTS=/work/ca.pem",
-			"-e", "BILLET_NPM_PROXY="+credentials.NpmProxy,
-			"-e", "BILLET_NPM_FALLBACK="+fallback,
-			"-e", "BILLET_OWNER="+strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
-			npmLiveImage, "bash", "-c", shell)
-		output, err := command.CombinedOutput()
-		elapsed := time.Since(started)
-		upstream[job] = requests.Load() - before
-		answers[job] = npmCounts(logs.String()[logged:])
-		t.Logf("%s: %s, %d requests to the registry from the node; answers %s\n%s", job,
-			elapsed.Round(time.Millisecond), upstream[job], npmTally(answers[job]),
-			tail(string(output), 15))
-		if err != nil {
-			t.Fatalf("%s failed: %v\nnode log:\n%s", job, err, tail(logs.String(), 40))
+		runs[job] = live.run(job, npmLiveImage, app+step)
+		if runs[job].err != nil {
+			t.Fatalf("%s failed: %v\nnode log:\n%s", job, runs[job].err, tail(live.logs.String(), 40))
 		}
 	}
 
@@ -238,25 +277,25 @@ const started = Date.now();
 })().catch((e) => { console.error(e); process.exit(1); });'`
 	run("pnpm-setup", pnpm)
 
-	if upstream["cold-install"] == 0 {
+	if runs["cold-install"].upstream == 0 {
 		t.Fatal("the cold install made no request of the registry: the node was not on its path")
 	}
 	// A lockfile's install needs only tarballs, and every one the cold install
 	// fetched is in the store; a revalidation of a document npm still asks for is
 	// a conditional request, which is still one leaving the node, so the bound is
 	// a small fraction rather than zero.
-	if limit := upstream["cold-install"] / 10; upstream["warm-ci"] > limit {
+	if limit := runs["cold-install"].upstream / 10; runs["warm-ci"].upstream > limit {
 		t.Errorf("the second job made %d requests of the registry, more than a tenth of the first's %d",
-			upstream["warm-ci"], upstream["cold-install"])
+			runs["warm-ci"].upstream, runs["cold-install"].upstream)
 	}
 	// AND THE SECOND JOB WAS ANSWERED BY THE NODE, not by a relay that failed
 	// open past it: a refused tunnel would also make no request from the node.
-	warm := answers["warm-ci"]
+	warm := runs["warm-ci"].answers
 	if warm["tarball/warm/200"] == 0 || warm["tarball/filled/200"] != 0 || warm["spliced"] != 0 {
 		t.Errorf("the second job's answers from the node = %v; want every tarball warm, none filled or spliced",
 			warm)
 	}
-	t.Logf("node log (last lines):\n%s", tail(logs.String(), 20))
+	t.Logf("node log (last lines):\n%s", tail(live.logs.String(), 20))
 }
 
 // npmCounts counts the node's answers in a stretch of its log by what was asked

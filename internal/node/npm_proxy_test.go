@@ -564,7 +564,7 @@ func TestATarballIsKeptOnlyWhenItArrivesWhole(t *testing.T) {
 	}
 	_, err = io.ReadAll(cut.Body)
 	_ = cut.Body.Close()
-	if cut.StatusCode != http.StatusOK || err == nil {
+	if cut.StatusCode != http.StatusOK || !npmCut(err) {
 		t.Fatalf("a cut tarball = %d, read error %v, want a 200 whose body ends short", cut.StatusCode, err)
 	}
 	waitForNpmFills(t, service.npmCache())
@@ -838,8 +838,9 @@ func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T
 		calls := observer.recorded()
 		releaseOnce.Do(func() { close(release) })
 
-		// THE HANDLER IS JOINED: the node closes the connection once it has
-		// answered, so the end of the stream is the handler's return.
+		// THE HANDLER IS JOINED: the client closes the connection once it has its
+		// answer, and the node closes it after, so the end of the stream is the
+		// handler's return.
 		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			t.Fatalf("%s: set a read deadline: %v", held, err)
 		}
@@ -849,11 +850,6 @@ func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T
 			t.Fatalf("%s: the held request was never answered: %v", held, err)
 		}
 		_ = resp.Body.Close()
-		if _, err := io.Copy(io.Discard, reader); err != nil {
-			t.Fatalf("%s: the node did not close the connection after answering: %v", held, err)
-		}
-		assertNpmQuiet(t, service.npmCache())
-
 		if len(calls) == 0 {
 			t.Fatalf("%s: the session's end reported nothing", held)
 		}
@@ -863,9 +859,18 @@ func TestASessionThatEndsDuringARequestDoesNotCallTheNpmCacheUnused(t *testing.T
 					held, call.obs.Npm)
 			}
 		}
-		// WHAT THE REQUEST GOT IS REPORTED ONCE IT ENDS, by the request itself.
+		// WHAT THE REQUEST GOT IS REPORTED ONCE ITS ANSWER IS WRITTEN, by the
+		// request itself, while the client still holds the connection: never held
+		// back for the client's close.
 		if got := lastNpm(t, service, credentials, observer); got != alloc.BuildCacheCold {
-			t.Errorf("%s: after the request ended the npm cache was reported %q, want cold", held, got)
+			t.Errorf("%s: after the request was answered the npm cache was reported %q, want cold", held, got)
+		}
+		assertNpmQuiet(t, service.npmCache())
+		if err := conn.CloseWrite(); err != nil {
+			t.Fatalf("%s: the client's close: %v", held, err)
+		}
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			t.Fatalf("%s: the node did not close the connection after the client: %v", held, err)
 		}
 	}
 }
@@ -935,11 +940,6 @@ func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t
 		t.Fatalf("the HEAD was never answered: %v", err)
 	}
 	_ = resp.Body.Close()
-	if _, err := io.Copy(io.Discard, reader); err != nil {
-		t.Fatalf("the node did not close the connection after answering: %v", err)
-	}
-	assertNpmQuiet(t, service.npmCache())
-
 	if len(calls) == 0 {
 		t.Fatal("the session's end reported nothing")
 	}
@@ -949,9 +949,17 @@ func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t
 				call.obs.Npm)
 		}
 	}
-	// WHAT THE HEAD GOT IS REPORTED ONCE IT ENDS, by the request itself.
+	// WHAT THE HEAD GOT IS REPORTED ONCE ITS ANSWER IS WRITTEN, by the request
+	// itself, while the client still holds the connection.
 	if got := lastNpm(t, service, credentials, observer); got != alloc.BuildCacheWarm {
-		t.Errorf("after the HEAD ended the npm cache was reported %q, want warm", got)
+		t.Errorf("after the HEAD was answered the npm cache was reported %q, want warm", got)
+	}
+	assertNpmQuiet(t, service.npmCache())
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatalf("the client's close: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("the node did not close the connection after the client: %v", err)
 	}
 }
 
@@ -1323,7 +1331,7 @@ func TestACutAnswerOfUnknownLengthIsNeverTakenForWhole(t *testing.T) {
 	_, err = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || len(resp.TransferEncoding) != 1 || resp.TransferEncoding[0] != "chunked" ||
-		err == nil {
+		!npmCut(err) {
 		t.Fatalf("a cut answer of unknown length = %d, framing %v, read error %v; want chunked and cut",
 			resp.StatusCode, resp.TransferEncoding, err)
 	}
@@ -1543,4 +1551,122 @@ func TestADocumentItsCommitEvictedStaysChargedWhileItIsAnswered(t *testing.T) {
 		t.Fatalf("the document read %d of %d bytes: %v", len(body), len(document), err)
 	}
 	assertNpmQuiet(t, npm)
+}
+
+// AN ANSWERED CONNECTION IS ENDED BY ITS CLIENT, NEVER BY THE NODE: undici
+// asserts that its parser is not paused when its socket ends, and a node that
+// closed on the last byte of a warm answer crashed pnpm/setup (2026-10-26). The
+// client here reads each answer whole, cold and warm, finds the connection still
+// open, and its own close ends it within a second: one client closes after three
+// seconds and the other after a tenth of one, so no delay of the node's own ends
+// both in time. It is the client's close that ends it.
+func TestAnAnsweredConnectionIsEndedByItsClient(t *testing.T) {
+	t.Parallel()
+
+	const document = `{"name":"left-pad","versions":{}}`
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, document)
+	})
+	service, credentials := npmService(t, registry)
+
+	for _, fetch := range []struct {
+		name string
+		open time.Duration
+	}{{"cold", 3 * time.Second}, {"warm", 100 * time.Millisecond}} {
+		conn, reader := npmAnswered(t, service, credentials, npmRequestLine("/left-pad"), document)
+		assertStillOpen(t, fetch.name, conn, reader, fetch.open)
+		if err := conn.CloseWrite(); err != nil {
+			t.Fatalf("%s: the client's close: %v", fetch.name, err)
+		}
+		assertEnded(t, fetch.name+" after the client's close", conn, reader, time.Second)
+	}
+	if registry.count() != 1 {
+		t.Fatalf("the registry was asked %d times, want once: the second fetch was not warm", registry.count())
+	}
+}
+
+// A CLIENT THAT NEVER CLOSES costs the node the wait it is given and no more.
+func TestAnAnsweredConnectionWhoseClientNeverClosesEndsAfterTheWait(t *testing.T) {
+	t.Parallel()
+
+	const document = `{"name":"left-pad","versions":{}}`
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		serveText(t, w, document)
+	})
+	service, credentials := npmService(t, registry)
+	const wait = time.Second
+	service.npmCloseWait = wait
+
+	conn, reader := npmAnswered(t, service, credentials, npmRequestLine("/left-pad"), document)
+	// THE WAIT BEGAN BEFORE THE ANSWER WAS READ, so the connection is open for
+	// half of it after, and ended within two seconds of that.
+	assertStillOpen(t, "a client that never closes", conn, reader, wait/2)
+	assertEnded(t, "a client that never closes", conn, reader, 2*time.Second)
+}
+
+// npmAnswered sends one request through a new tunnel and reads its answer whole,
+// leaving the connection as the answer left it.
+func npmAnswered(t *testing.T, service *CacheService, credentials CacheCredentials, request, want string,
+) (*tls.Conn, *bufio.Reader) {
+	t.Helper()
+
+	conn, status := npmTunnel(t, service, credentials, npmRegistryHost)
+	if conn == nil {
+		t.Fatalf("CONNECT to the registry was answered %q", status)
+	}
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("write the request: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read the answer: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || string(body) != want || !resp.Close {
+		t.Fatalf("the answer = %d %q (Connection: close %v): %v", resp.StatusCode, body, resp.Close, err)
+	}
+
+	return conn, reader
+}
+
+// assertStillOpen reads past a whole answer for wait and requires the read to
+// time out, rather than find the connection ended.
+func assertStillOpen(t *testing.T, what string, conn net.Conn, reader *bufio.Reader, wait time.Duration) {
+	t.Helper()
+
+	if err := conn.SetReadDeadline(time.Now().Add(wait)); err != nil {
+		t.Fatalf("%s: set a deadline: %v", what, err)
+	}
+	_, err := reader.ReadByte()
+	if timeout, ok := errors.AsType[net.Error](err); !ok || !timeout.Timeout() {
+		t.Fatalf("%s: past its whole answer the connection read %v; want it left open for the client to close",
+			what, err)
+	}
+}
+
+// assertEnded requires the connection to end within limit: an end of stream,
+// with or without the node's close_notify, never a timeout.
+func assertEnded(t *testing.T, what string, conn net.Conn, reader *bufio.Reader, limit time.Duration) {
+	t.Helper()
+
+	if err := conn.SetReadDeadline(time.Now().Add(limit)); err != nil {
+		t.Fatalf("%s: set a deadline: %v", what, err)
+	}
+	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("%s: the connection read %v within %s; want it ended", what, err, limit)
+	}
+}
+
+// npmCut reports whether a body read ended because the connection ended short,
+// as the node's close of a cut answer makes it end, and not on a read deadline.
+func npmCut(err error) bool {
+	if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
+		return false
+	}
+
+	return errors.Is(err, io.ErrUnexpectedEOF)
 }
