@@ -244,6 +244,69 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	l.retireWithdrawn(ctx, *candidate)
 }
 
+// withdrawCancelledRunner withdraws the runner launched for a job cancelled
+// before any runner took it, at once, and retires it.
+//
+// ONE RUNNER FOR ONE JOB. A runner is single-use, and the one launched for a job
+// is that job's; once the job is cancelled the runner has no work of its own,
+// and left in the pool it held its lease until the offline watch reached it,
+// offlineIdleAfter and offlineGrace later. On 2026-10-26 a burst of superseded
+// runs left one tier with 25 such members idle, every one offline at GitHub,
+// while 62 jobs waited for the room they held, and the admission order held
+// other tiers behind it (#690). The wait added no safety: the permission to
+// retire a member was always GitHub acknowledging the DELETE of its exact id,
+// which GitHub refuses while the runner is running a job, so a runner GitHub
+// gave another job (whose JobStarted has not arrived) is kept for it. A runner
+// GitHub reports busy is not asked, an absent or unreadable one is left to the
+// offline watch, and a refusal leaves the member idle and unjournaled, as there.
+func (l *Listener) withdrawCancelledRunner(ctx context.Context, member alloc.PoolRunner) {
+	inspector, ok := l.registry.(RunnerInspector)
+	if !ok || l.alloc == nil || member.RunnerName == "" || member.ActualRequestID != 0 ||
+		member.Status != alloc.PoolRunnerIdle {
+		return
+	}
+
+	state, err := inspector.InspectRunner(ctx, member.RunnerName, member.RunnerID)
+	if err != nil {
+		l.log.Debug("could not read a cancelled job's runner at GitHub; the pool keeps it",
+			"tier", l.tier, "runner", member.RunnerName, "error", err)
+
+		return
+	}
+
+	if !state.Present || state.Busy {
+		return
+	}
+
+	if state.ID <= 0 || (member.RunnerID > 0 && state.ID != member.RunnerID) {
+		l.log.Warn("GitHub's answer for a cancelled job's runner named no id or another one; "+
+			"keeping it", "tier", l.tier, "runner", member.RunnerName,
+			"pool_id", member.RunnerID, "github_id", state.ID)
+
+		return
+	}
+
+	if err := inspector.WithdrawRunner(ctx, state.ID); err != nil {
+		l.log.Info("GitHub kept a cancelled job's runner, which may have taken another job; "+
+			"the pool keeps it", "tier", l.tier, "runner", member.RunnerName,
+			"runner_id", state.ID, "error", err)
+
+		return
+	}
+
+	l.log.Info("withdrew the runner launched for a cancelled job; retiring it",
+		"tier", l.tier, "runner", member.RunnerName, "runner_id", state.ID)
+
+	if l.offline.withdrawn == nil {
+		l.offline.withdrawn = map[string]alloc.PoolRunner{}
+	}
+
+	member.RunnerID = state.ID
+	l.offline.withdrawn[member.LeaseID] = member
+
+	l.retireWithdrawn(ctx, member)
+}
+
 // retireWithdrawn journals and tears down a member whose registration GitHub
 // has deleted. A failed claim keeps it in the watch, so the next reconcile
 // retries the ledger without inspecting again; a controller restart in that
