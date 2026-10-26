@@ -605,13 +605,22 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 			p.service.observeActions(ctx, session, outcome)
 		}
 	}
+	// billets says a failure is billet's own to record: not the guest's body, and
+	// not the request's time, whose meaning is not known; `unavailable` outlasts
+	// any later success.
+	billets := func(err error) bool {
+		return !errors.Is(err, errActionsBodyCut) && !errors.Is(err, context.Canceled) &&
+			!errors.Is(err, context.DeadlineExceeded) && req.Context().Err() == nil
+	}
 
 	var replay []byte
 	if actionsLocalRequest(req) && cacheCall {
 		var err error
-		replay, err = io.ReadAll(io.LimitReader(req.Body, actionsRequestLimit+1))
+		replay, err = io.ReadAll(io.LimitReader(actionsGuestBody{req.Body}, actionsRequestLimit+1))
 		if err != nil {
-			observe(req.Context(), alloc.ActionsCacheUnavailable)
+			if billets(err) {
+				observe(req.Context(), alloc.ActionsCacheUnavailable)
+			}
 
 			return actionsBlobError(http.StatusBadRequest,
 				"Actions cache metadata request could not be read"), true
@@ -630,7 +639,9 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 		var err error
 		reservationBound, err = p.service.actionsFinalizeReserved(req.Context(), replay, session)
 		if err != nil {
-			observe(req.Context(), alloc.ActionsCacheUnavailable)
+			if billets(err) {
+				observe(req.Context(), alloc.ActionsCacheUnavailable)
+			}
 
 			return actionsBlobError(http.StatusBadGateway,
 				"Actions cache storage is unavailable"), true
@@ -639,7 +650,9 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 			if err != nil {
 				p.service.log.Warn("a reserved Actions cache finalization failed locally",
 					"instance", session.instance, "path", req.URL.Path, "error", err)
-				observe(req.Context(), alloc.ActionsCacheUnavailable)
+				if billets(err) {
+					observe(req.Context(), alloc.ActionsCacheUnavailable)
+				}
 
 				return actionsBlobError(http.StatusBadGateway,
 					"Actions cache storage is unavailable"), true
@@ -664,8 +677,7 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 			// otherwise recorded as whatever its reservation was (#694). A body the
 			// guest cut short, or a request that ran out of time, is not billet's
 			// failure to record; what it says is not known.
-			if !errors.Is(err, errActionsBodyCut) && !errors.Is(err, context.Canceled) &&
-				!errors.Is(err, context.DeadlineExceeded) {
+			if billets(err) {
 				p.service.observeActions(req.Context(), session, alloc.ActionsCacheUnavailable)
 			}
 

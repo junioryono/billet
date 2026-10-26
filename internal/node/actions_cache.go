@@ -114,6 +114,10 @@ func (a *actionsArchive) lockShared(ctx context.Context) error {
 // mount again after a restart: billet's own failure, not an unknown archive.
 var errActionsArchiveLost = errors.New("the Actions cache archive could not be mounted again after a restart")
 
+// errActionsPolicyUnreadable is a blob request on a URL billet signed whose
+// cache policy or job authority could not be read.
+var errActionsPolicyUnreadable = errors.New("the Actions cache policy for this archive could not be read")
+
 // errActionsBodyCut is the guest's request body ending or failing before it was
 // whole: the client's doing, or its network's, never billet's storage.
 var errActionsBodyCut = errors.New("the guest's request body was cut short")
@@ -240,6 +244,12 @@ func (s *CacheService) actionsResponse(
 	if disposition != "" {
 		if cacheCall {
 			s.observeActions(req.Context(), session, disposition)
+		}
+		// A BLOB URL BILLET SIGNED IS BILLET'S TO ANSWER, and GitHub knows nothing
+		// of it: a policy or an authority that could not be read for one is a
+		// local failure, not a splice (#694). The kill switch stays a refusal.
+		if disposition == alloc.ActionsCacheSpliced && strings.HasPrefix(req.URL.Path, actionsBlobPrefix) {
+			return nil, true, errActionsPolicyUnreadable
 		}
 
 		return nil, false, nil
@@ -924,13 +934,24 @@ func (s *CacheService) finalizeActionsCache(
 		return s.publishActionsReceipt(ctx, session, receipt)
 	}
 	var archive *actionsArchive
+	lost := false
 	for _, candidate := range session.actions {
 		if candidate.Mode == actionsModeUpload && candidate.CacheKey == request.Key &&
-			candidate.Version == request.Version && !candidate.lost {
+			candidate.Version == request.Version {
+			if candidate.lost {
+				lost = true
+
+				continue
+			}
 			archive = candidate
 
 			break
 		}
+	}
+	if archive == nil && lost && !session.closed {
+		session.mu.Unlock()
+
+		return nil, errActionsArchiveLost
 	}
 	if archive == nil || session.closed {
 		session.mu.Unlock()

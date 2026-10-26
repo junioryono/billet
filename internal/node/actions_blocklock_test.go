@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -199,6 +201,17 @@ func TestABlockInTransferHoldsNeitherTheSessionNorTheOtherBlocks(t *testing.T) {
 	// THE COMMIT WAITS FOR THE ARCHIVE ALONE, and the session's lock, which a
 	// CONNECT, an observation and a renewal wait on, is free while it does.
 	commitDone := serveInBackground(t, service, session, commitRequest)
+	committed := false
+	defer func() {
+		if !committed {
+			if !released {
+				close(stalled.release)
+				released = true
+				<-firstDone
+			}
+			<-commitDone
+		}
+	}()
 	awaitCondition(t, "the commit waiting for the archive", func() bool {
 		return archive.exclusiveWaiting.Load() == 1
 	})
@@ -211,6 +224,7 @@ func TestABlockInTransferHoldsNeitherTheSessionNorTheOtherBlocks(t *testing.T) {
 	session.mu.Unlock()
 	select {
 	case result := <-commitDone:
+		committed = true
 		t.Fatalf("the block list was committed while a block was still arriving: %+v", result)
 	default:
 	}
@@ -220,7 +234,9 @@ func TestABlockInTransferHoldsNeitherTheSessionNorTheOtherBlocks(t *testing.T) {
 	if result := <-firstDone; result.err != nil || result.status != http.StatusCreated {
 		t.Fatalf("the first block: %+v", result)
 	}
-	if result := <-commitDone; result.err != nil || result.status != http.StatusCreated {
+	result := <-commitDone
+	committed = true
+	if result.err != nil || result.status != http.StatusCreated {
 		t.Fatalf("the block list: %+v", result)
 	}
 	body, err := os.ReadFile(service.actionsArchivePath(session, archive))
@@ -307,11 +323,27 @@ func TestActionsProxyAuthenticationAnswersWhileTheSessionIsBusy(t *testing.T) {
 	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString(
 		[]byte(actionsProxyUser+":"+session.token)))
 
+	type answer struct {
+		session *cacheSession
+		ok      bool
+	}
 	session.mu.Lock()
-	got, ok := service.authenticateProxy(request)
-	session.mu.Unlock()
-	if !ok || got != session {
-		t.Fatalf("a CONNECT for a busy session was refused (ok=%t)", ok)
+	answered := make(chan answer, 1)
+	go func() {
+		got, ok := service.authenticateProxy(request)
+		answered <- answer{got, ok}
+	}()
+	var got answer
+	select {
+	case got = <-answered:
+		session.mu.Unlock()
+	case <-time.After(5 * time.Second):
+		session.mu.Unlock()
+		<-answered
+		t.Fatal("a CONNECT for a busy session waited on the session's lock")
+	}
+	if !got.ok || got.session != session {
+		t.Fatalf("a CONNECT for a busy session was refused (ok=%t)", got.ok)
 	}
 
 	session.closing.Store(true)
@@ -497,5 +529,134 @@ func TestADownloadThatFailsToReadIsRecordedAsUnavailable(t *testing.T) {
 	if told := observedActions(observer); len(told) != 2 || told[0] != alloc.ActionsCacheServed ||
 		told[1] != alloc.ActionsCacheUnavailable {
 		t.Fatalf("observer was told %v, want served and then unavailable", told)
+	}
+}
+
+// A FAILURE MARKED AFTER CLEANUP SETTLED IS STILL REPORTED: cleanup settles the
+// session before it unmounts and discards, and a download read or an
+// observation that waited out its hold lands in between. The record that took
+// it up was about to be deleted unreported.
+func TestAFailureMarkedDuringCleanupIsReportedBeforeTheRecordGoes(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, volumes := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	reserveActionsUpload(t, service, session, "late")
+	volumes.unmountHook = func() { session.actionsFailed.Store(true) }
+
+	if err := service.Cleanup(t.Context(), session.instance); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	told := observedActions(observer)
+	if len(told) == 0 || told[len(told)-1] != alloc.ActionsCacheUnavailable {
+		t.Fatalf("observer was told %v, want the failure marked during cleanup last", told)
+	}
+}
+
+// A FINALIZATION OF AN ARCHIVE THIS PROCESS COULD NOT MOUNT AGAIN IS BILLET'S
+// FAILURE: it answered {"ok": false} and kept the reservation's served.
+func TestFinalizingALostArchiveIsRecordedAsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	_, archive := reserveActionsUpload(t, service, session, "lost-final")
+	session.mu.Lock()
+	archive.lost = true
+	session.mu.Unlock()
+
+	finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"lost-final","version":"v2","size_bytes":"4"}`)
+	response, handled := service.actionsProxy().respond(finalize, session)
+	if !handled || response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("finalizing a lost archive handled=%t status=%v; want a local 502", handled, response)
+	}
+	closeActionsResponse(t, response)
+	if told := observedActions(observer); len(told) != 2 || told[1] != alloc.ActionsCacheUnavailable {
+		t.Fatalf("observer was told %v, want served and then unavailable", told)
+	}
+}
+
+// A RESERVED BLOB WHOSE POLICY CANNOT BE READ IS BILLET'S FAILURE: GitHub knows
+// nothing of the URL, so it is not a splice, and the kill switch is a refusal.
+func TestAReservedBlobWhosePolicyCannotBeReadIsRecordedAsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		allowed bool
+		err     error
+		want    []alloc.ActionsCache
+	}{
+		"unreadable": {err: errors.New("the policy service did not answer"),
+			want: []alloc.ActionsCache{alloc.ActionsCacheServed, alloc.ActionsCacheUnavailable}},
+		"disabled": {allowed: false, want: []alloc.ActionsCache{alloc.ActionsCacheServed}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			service, _, session, _ := testActionsService(t)
+			observer := &recordingObserver{}
+			service.SetCacheObserver(observer)
+			uploadURL, _ := reserveActionsUpload(t, service, session, "policy")
+			service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+				return tc.allowed, tc.err
+			}))
+
+			response, handled := service.actionsProxy().respond(
+				actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")), session)
+			if !handled || response.StatusCode != http.StatusBadGateway {
+				t.Fatalf("a reserved block handled=%t status=%v; want a local 502", handled, response)
+			}
+			closeActionsResponse(t, response)
+			if told := observedActions(observer); !slices.Equal(told, tc.want) {
+				t.Fatalf("observer was told %v, want %v", told, tc.want)
+			}
+		})
+	}
+}
+
+// NEITHER A METADATA BODY THE GUEST CUT SHORT NOR A REQUEST THAT RAN OUT OF TIME
+// IS BILLET'S FAILURE, on any branch: `unavailable` outlasts a later success.
+func TestACutOrCancelledCallIsNotRecordedAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	for name, request := range map[string]func(t *testing.T) *http.Request{
+		"cut metadata": func(t *testing.T) *http.Request {
+			t.Helper()
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+				"https://"+actionsResultsHost+actionsFinalizePath, &cutBlockBody{})
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("User-Agent", actionsUserAgent+"test")
+
+			return request
+		},
+		"cancelled finalization": func(t *testing.T) *http.Request {
+			t.Helper()
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			return actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+				`{"key":"cancelled","version":"v2","size_bytes":"4"}`).WithContext(ctx)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			service, _, session, _ := testActionsService(t)
+			observer := &recordingObserver{}
+			service.SetCacheObserver(observer)
+			reserveActionsUpload(t, service, session, "cancelled")
+
+			response, _ := service.actionsProxy().respond(request(t), session)
+			closeActionsResponse(t, response)
+			if told := observedActions(observer); len(told) != 1 || told[0] != alloc.ActionsCacheServed {
+				t.Fatalf("observer was told %v, want only the reservation's served", told)
+			}
+		})
 	}
 }

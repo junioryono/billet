@@ -1198,6 +1198,12 @@ func (s *CacheService) cleanupSession(
 	if pending {
 		return nil
 	}
+	// A FAILURE MARKED AFTER SETTLEMENT IS REPORTED BEFORE THE RECORD GOES: a
+	// download read, or an observation that waited out this cleanup's hold, was
+	// written by the discards above and would otherwise be deleted unreported.
+	if absorbActionsFailure(session) || !session.observed.Reported {
+		s.report(ctx, session)
+	}
 	if err := s.finishSession(session); err != nil {
 		return fmt.Errorf("node: finish cache cleanup of %s: %w", session.instance, err)
 	}
