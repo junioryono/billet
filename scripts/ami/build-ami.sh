@@ -183,6 +183,14 @@ else
 	write_state "nonce=$nonce" "phase=resumed" "boot=$boot"
 fi
 
+# THE BUILD IS NOT A SERVICE AN UPGRADE RESTARTS. GitHub's template upgrades every
+# package before it exempts its own provisioner from needrestart, and a restart of
+# this unit kills the build mid-step, which the record then rightly refuses to
+# resume. Written each run, before any apt transaction, and removed with the build.
+nr_exempt=$root/etc/needrestart/conf.d/billet-ami-build.conf
+install -d -m 0755 "$(dirname "$nr_exempt")"
+printf '%s\n' '$nrconf{override_rc}{qr(^billet-ami-build)} = 0;' >"$nr_exempt"
+
 # THE RUNNER'S OWN FILES OUTSIDE /tmp. The builder is the target, and GitHub's
 # cleanup.sh empties /tmp, so the runner's working files there were gone by the
 # step after it (measured on a real builder, 2026-10-25); the guest build keeps
@@ -277,6 +285,7 @@ bash "$layer"
 at=cleanup
 systemctl disable billet-ami-build.service >/dev/null 2>&1 || true
 rm -f "$root/etc/systemd/system/billet-ami-build.service"
+rm -f "$nr_exempt"
 rm -rf "$root/var/lib/billet-ami" "$work" "$root/var/tmp/billet-ri"
 cloud-init clean --logs --machine-id
 sync

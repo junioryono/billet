@@ -98,7 +98,8 @@ variables() {
 # versioned prints the NAME=PREFIX lines NAME's installer writes whose value goes on
 # with a version the build resolves: the Android NDK's, which GitHub's installer
 # sets because many builds read them. present asks that each value starts with its
-# prefix and names something under it; absent that the name is not there at all.
+# prefix, compared as text, and is a directory in the image; absent that the name
+# is not there at all.
 versioned() {
 	case "$1" in
 	android-sdk)
@@ -148,7 +149,7 @@ absent() {
 # present fails on every path NAME installs that ROOT lacks or cannot run, and
 # every variable of it the job's environment does not name exactly.
 present() {
-	local name=$1 root=$2 kind path variable env="$2/etc/billet-image-env"
+	local name=$1 root=$2 kind path variable value env="$2/etc/billet-image-env"
 	while read -r kind path; do
 		case "$kind" in
 		x) chroot "$root" test -x "$path" || fail "$name: $path is not an executable in the completed image" ;;
@@ -161,8 +162,14 @@ present() {
 	done < <(variables "$name")
 	while IFS= read -r variable; do
 		[ -n "$variable" ] || continue
-		grep -q "^${variable}[^/]" "$env" ||
-			fail "$name: the job's environment does not set ${variable%%=*} to a path under ${variable#*=}"
+		value=$(sed -n "s|^${variable%%=*}=||p" "$env") || value=
+		case "$value" in
+		"${variable#*=}"?*)
+			chroot "$root" test -d "$value" ||
+				fail "$name: ${variable%%=*} names $value, which is not a directory in the completed image"
+			;;
+		*) fail "$name: the job's environment does not set ${variable%%=*} to a path under ${variable#*=}" ;;
+		esac
 	done < <(versioned "$name")
 
 	case "$name" in

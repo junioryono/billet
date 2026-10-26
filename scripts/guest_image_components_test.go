@@ -70,6 +70,8 @@ func completedTree(t *testing.T, name string) string {
 	case "android-sdk":
 		write("usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager", "#!/bin/sh\n", 0o755)
 		dir("usr/local/lib/android/sdk/platforms/android-35", 0o777)
+		dir("usr/local/lib/android/sdk/ndk/27.3.13750724", 0o755)
+		dir("usr/local/lib/android/sdk/ndk/28.2.13676358", 0o755)
 		dir("usr/local/lib/android/sdk", 0o777)
 		env += "ANDROID_HOME=/usr/local/lib/android/sdk\nANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n" +
 			"ANDROID_NDK=/usr/local/lib/android/sdk/ndk/27.3.13750724\n" +
@@ -170,6 +172,12 @@ func TestOnePieceOfAComponentDecidesBothWays(t *testing.T) {
 			writeTreeFile(t, root, "etc/billet-image-env", strings.Replace(string(env),
 				"ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724", "ANDROID_NDK_ROOT=/opt/ndk", 1))
 		}, "present", "does not set ANDROID_NDK_ROOT to a path under /usr/local/lib/android/sdk/ndk/"},
+		// AND UNDER IT IS NOT ENOUGH: the NDK it names must be there.
+		"an NDK variable naming an NDK that is not there": {"android-sdk", func(t *testing.T, root string) {
+			t.Helper()
+
+			removeAll(t, filepath.Join(root, "usr", "local", "lib", "android", "sdk", "ndk", "28.2.13676358"))
+		}, "present", "ANDROID_NDK_LATEST_HOME names /usr/local/lib/android/sdk/ndk/28.2.13676358, which is not a directory"},
 		"an SDK Gradle cannot write": {"android-sdk", func(t *testing.T, root string) {
 			t.Helper()
 

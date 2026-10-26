@@ -24,6 +24,8 @@ const (
 	fakeAMIRunner = `#!/bin/bash
 set -eu
 echo "runner scope=$BILLET_RI_SCOPE from=$BILLET_RI_FROM tmp=${TMPDIR:-}" >>"$FAKE/calls"
+grep -qxF '$nrconf{override_rc}{qr(^billet-ami-build)} = 0;' "$BILLET_AMI_ROOT/etc/needrestart/conf.d/billet-ami-build.conf" &&
+	echo "runner needrestart-exempt" >>"$FAKE/calls"
 [ -z "${FAKE_FAIL_FIRST:-}" ] || exit 1
 mkdir -p "$BILLET_AMI_ROOT/var/tmp/billet-ri"
 echo staged >"$BILLET_AMI_ROOT/var/tmp/billet-ri/step.sh"
@@ -333,7 +335,8 @@ func TestTheAMIBuildRunsTheTemplateCompletesAndAnnounces(t *testing.T) {
 
 	calls := fx.calls(t)
 	for _, want := range []string{
-		"runner scope=ami-x64 from=1 tmp=" + fx.root + "/var/lib/billet-ami-build/tmp", "complete android-sdk firefox", "present android-sdk",
+		"runner scope=ami-x64 from=1 tmp=" + fx.root + "/var/lib/billet-ami-build/tmp", "runner needrestart-exempt",
+		"complete android-sdk firefox", "present android-sdk",
 		"absent codeql", "absent google-chrome", "absent microsoft-edge",
 		"present firefox", "write-image-env " + fx.root + "/etc/environment " + fx.root + "/etc/billet-image-env",
 		"layer", "systemctl disable billet-ami-build.service", "cloud-init clean --logs --machine-id",
@@ -362,7 +365,7 @@ func TestTheAMIBuildRunsTheTemplateCompletesAndAnnounces(t *testing.T) {
 	}
 
 	for _, gone := range []string{"var/lib/billet-ami", "var/lib/billet-ami-build", "opt/billet/complete",
-		"var/tmp/billet-ri",
+		"var/tmp/billet-ri", "etc/needrestart/conf.d/billet-ami-build.conf",
 		"etc/systemd/system/billet-ami-build.service"} {
 		if _, err := os.Stat(filepath.Join(fx.root, gone)); !os.IsNotExist(err) {
 			t.Errorf("the image keeps %s (%v)", gone, err)

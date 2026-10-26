@@ -42,7 +42,8 @@ func substitute(t *testing.T, script, old, replacement string) string {
 
 // variableLine is a component's variable line as the job's environment carries it:
 // line with suffix after it, nothing when it is dropped, and another value when it
-// is wrong.
+// is wrong: a directory the fixture makes, so only the value's comparison can
+// refuse it.
 func variableLine(line, suffix, drop, wrong string) string {
 	name, _, _ := strings.Cut(line, "=")
 
@@ -50,7 +51,7 @@ func variableLine(line, suffix, drop, wrong string) string {
 	case drop:
 		return ""
 	case wrong:
-		return name + "=/elsewhere\n"
+		return name + "=/usr\n"
 	default:
 		return line + suffix + "\n"
 	}
@@ -133,9 +134,15 @@ type verifyProbe struct {
 	// reads it.
 	noAbsenceEnv bool
 	// dropVariable is a recorded component's variable the job's environment leaves
-	// out, and wrongVariable one it points somewhere else.
-	dropVariable  string
-	wrongVariable string
+	// out, and wrongVariable one it points somewhere else; overriddenVariable one a
+	// later line of the file sets again, and unterminatedVariable one that is the
+	// file's last line with no newline, which the runner's environment drops.
+	dropVariable         string
+	wrongVariable        string
+	overriddenVariable   string
+	unterminatedVariable string
+	// noNDK leaves out the NDK a recorded Android SDK's variables name.
+	noNDK bool
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -236,7 +243,7 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	// THE FAKE BIN ALONE, with links to the two system commands the runner side
 	// runs: a host that has a toolchain of its own (a Mac has /usr/bin/swift)
 	// would otherwise answer for one a case left off the image.
-	for _, name := range []string{"sh", "test"} {
+	for _, name := range []string{"sh", "test", "printenv"} {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			t.Fatalf("no %s on PATH: %v", name, err)
@@ -261,6 +268,27 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		for _, line := range componentVariablePrefixes[name] {
 			env += variableLine(line, "27.3.13750724", p.dropVariable, p.wrongVariable)
 		}
+	}
+
+	if p.overriddenVariable != "" {
+		env += p.overriddenVariable + "=/usr\n"
+	}
+
+	if p.unterminatedVariable != "" {
+		var kept []string
+
+		last := ""
+
+		for _, line := range strings.SplitAfter(env, "\n") {
+			if strings.HasPrefix(line, p.unterminatedVariable+"=") {
+				last = strings.TrimSuffix(line, "\n")
+				continue
+			}
+
+			kept = append(kept, line)
+		}
+
+		env = strings.Join(kept, "") + last
 	}
 
 	envFile := filepath.Join(root, "billet-image-env")
@@ -337,6 +365,13 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 			}
 
 			writeFile(t, croot+path, body, 0o755)
+		}
+	}
+
+	// THE NDK THE VERSIONED VARIABLES NAME, unless a case removes it.
+	if strings.Contains(p.components, "android-sdk:") && !p.noNDK {
+		if err := os.MkdirAll(filepath.Join(croot, "usr", "local", "lib", "android", "sdk", "ndk", "27.3.13750724"), 0o755); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -639,6 +674,9 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 		name     string
 		probe    verifyProbe
 		wantStep string
+		// wantSays is what the refusal must say, where a case is about one reason
+		// of the several its step refuses for.
+		wantSays string
 		// asUser is a case only an account without root's override can stage.
 		asUser bool
 	}{
@@ -724,28 +762,60 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			name:     "the job's environment does not name a recorded component's variable",
 			probe:    verifyProbe{components: "firefox:140.0.4", dropVariable: "GECKOWEBDRIVER"},
 			wantStep: "components",
+			wantSays: "the image records firefox:140.0.4 and does not carry it for the runner",
 		},
 		{
 			name:     "a recorded component's variable points somewhere else",
 			probe:    verifyProbe{components: "firefox:140.0.4", wrongVariable: "GECKOWEBDRIVER"},
 			wantStep: "components",
+			wantSays: "the image records firefox:140.0.4 and does not carry it for the runner",
+		},
+		{
+			// THE VALUE A JOB RECEIVES, not a line of the file: a later line wins,
+			// and a last line without its newline is never read.
+			name:     "a later line sets a recorded component's variable again",
+			probe:    verifyProbe{components: "firefox:140.0.4", overriddenVariable: "GECKOWEBDRIVER"},
+			wantStep: "components",
+			wantSays: "the image records firefox:140.0.4 and does not carry it for the runner",
+		},
+		{
+			name:     "a recorded component's variable is a last line the runner never reads",
+			probe:    verifyProbe{components: "firefox:140.0.4", unterminatedVariable: "GECKOWEBDRIVER"},
+			wantStep: "components",
+			wantSays: "the image records firefox:140.0.4 and does not carry it for the runner",
+		},
+		{
+			name:     "a later line sets a recorded component's versioned variable again",
+			probe:    verifyProbe{components: "android-sdk:12.0", overriddenVariable: "ANDROID_NDK_HOME"},
+			wantStep: "components",
+			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
 		},
 		{
 			name:     "a recorded component's versioned variable points somewhere else",
 			probe:    verifyProbe{components: "android-sdk:12.0", wrongVariable: "ANDROID_NDK_LATEST_HOME"},
 			wantStep: "components",
+			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
+		},
+		{
+			// UNDER THE PREFIX IS NOT ENOUGH: the NDK it names must be there.
+			name:     "a recorded component's versioned variable names nothing",
+			probe:    verifyProbe{components: "android-sdk:12.0", noNDK: true},
+			wantStep: "components",
+			wantSays: "the image records android-sdk:12.0 and does not carry it for the runner",
 		},
 		{
 			// AND ONE LEFT BEHIND BY AN SDK THAT IS GONE.
 			name:     "the job's environment names an NDK the image does not record",
 			probe:    verifyProbe{strayVariable: "ANDROID_NDK"},
 			wantStep: "components",
+			wantSays: "the image carries android-sdk, which it does not record",
 		},
 		{
 			// AN UNREADABLE ENVIRONMENT IS NOT ONE THAT NAMES NOTHING.
 			name:     "the absence check cannot read the job's environment",
 			probe:    verifyProbe{noAbsenceEnv: true},
 			wantStep: "components",
+			wantSays: "the job environment cannot be read",
 		},
 		{
 			// A SECOND LINE IS A REPORT LINE OF THE IMAGE'S CHOOSING.
@@ -886,6 +956,12 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			if got := report[reportStepKey]; got != tc.wantStep {
 				t.Errorf("the failure is reported at step %q, want %q; an operator reads this "+
 					"instead of a console that no longer exists", got, tc.wantStep)
+			}
+
+			// REFUSED FOR ITS OWN REASON, where a case names one: a step refuses for
+			// many, and the case is about one of them.
+			if tc.wantSays != "" && !strings.Contains(stdout, tc.wantSays) {
+				t.Errorf("the refusal does not say %q\n--- it printed ---\n%s", tc.wantSays, stdout)
 			}
 		})
 	}

@@ -657,11 +657,17 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 		"echo 'the components record is not a list of name:version' >&2; exit 1 ;; esac\n")
 	b.WriteString("billet_components=$billet_record\n")
 
-	// TWO QUESTIONS OF THE JOB'S ENVIRONMENT, asked once each per variable: whether
-	// it says a line exactly, and whether it sets a name to a path under a prefix.
-	// Functions, because the script has a size to keep.
-	b.WriteString("billet_says() { grep -qxF \"$1\" " + imageEnvFile + "; }\n")
-	b.WriteString("billet_sets() { grep -q \"^$1[^/]\" " + imageEnvFile + "; }\n")
+	// TWO QUESTIONS OF THE JOB'S ENVIRONMENT, asked of the runner, so the answer is
+	// the value a job receives rather than a line of the file, which a later line or
+	// a last line without its newline would make a different thing: whether NAME is
+	// VALUE, and whether it is a directory the runner reaches under PREFIX, the
+	// prefix compared as text. Functions, because the script has a size to keep.
+	// billet_root is empty here and lets a test point the paths at a fixture.
+	b.WriteString("billet_root=''\n")
+	b.WriteString("billet_says() { [ \"$(" + verifyRunAsRunner + " printenv \"$1\")\" = \"$2\" ]; }\n")
+	b.WriteString("billet_sets() { billet_v=$(" + verifyRunAsRunner + " printenv \"$1\") || return 1; " +
+		"case \"$billet_v\" in \"$2\"?*) " + verifyRunAsRunner + " test -d \"$billet_root$billet_v\" ;; " +
+		"*) false ;; esac; }\n")
 
 	// SPLIT BY THE SHELL ITSELF: a command splitting it could fail with nothing
 	// printed, and `for` would then check no component and fail nothing. The list's
@@ -705,11 +711,13 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 		// AND THE JOB IS TOLD WHERE IT IS, as GitHub's installer tells it: a
 		// component a workflow cannot find through its variable is not one it has.
 		for _, line := range componentVariables[name] {
-			checks = append(checks, "billet_says "+line)
+			variable, value, _ := strings.Cut(line, "=")
+			checks = append(checks, "billet_says "+variable+" "+value)
 		}
 
 		for _, line := range componentVariablePrefixes[name] {
-			checks = append(checks, "billet_sets "+line)
+			variable, prefix, _ := strings.Cut(line, "=")
+			checks = append(checks, "billet_sets "+variable+" "+prefix)
 		}
 
 		b.WriteString("    " + name + ") " + strings.Join(checks, " && ") + " ;;\n")
@@ -722,22 +730,21 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 
 	// AND WHAT IT DOES NOT RECORD, IT DOES NOT CARRY. A base image may hold a
 	// component nobody accepted, and the record would then be a claim the image
-	// does not meet. Looked for as root, under billet_root, which is empty here and
-	// lets a test point the paths at a fixture.
-	b.WriteString("billet_root=''\n")
+	// does not meet. Looked for as root, under billet_root.
 
 	// grep's status is three-valued, and a file it could not read names nothing
 	// only by accident, so the file is proved readable and a status 2 is present.
 	b.WriteString("test -r \"$billet_root\"" + imageEnvFile + " || " +
 		"{ echo 'the job environment cannot be read' >&2; exit 1; }\n")
 	b.WriteString("billet_names() { grep -q \"^$1=\" \"$billet_root\"" + imageEnvFile + "; [ $? -ne 1 ]; }\n")
+	b.WriteString("billet_has() { [ -e \"$billet_root$1\" ] || [ -L \"$billet_root$1\" ]; }\n")
 
 	for _, name := range names {
 		var present []string
 
 		for _, entry := range componentPaths[name] {
 			_, path, _ := strings.Cut(entry, " ")
-			present = append(present, "[ -e \"$billet_root\""+path+" ] || [ -L \"$billet_root\""+path+" ]")
+			present = append(present, "billet_has "+path)
 		}
 
 		// AND THE JOB'S ENVIRONMENT NAMES NONE OF ITS VARIABLES, as the build's own

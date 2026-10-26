@@ -475,9 +475,13 @@ func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 		name     string
 		payload  string
 		settings string
+		finished bool
 		wantRun  bool
 	}{
 		{name: "the staged payload", payload: "the payload\n", wantRun: true},
+		// A MACHINE THAT ALREADY FINISHED A BUILD, rebooted during its success: the
+		// bootstrap runs again and must not build again.
+		{name: "a machine that finished a build", payload: "the payload\n", finished: true},
 		{name: "another payload", payload: "someone else's payload\n"},
 		// SETTINGS THAT DO NOT NAME THIS BUILD: build-ami.sh could not say anything
 		// billet would read, so the unit is never started and the bootstrap says it.
@@ -522,6 +526,12 @@ func TestTheBootstrapRefusesAPayloadThatIsNotTheStagedOne(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			record := filepath.Join(dir, "billet-image-components")
+			if tc.finished {
+				writeFile(t, record, "firefox:140.0\n", 0o644)
+			}
+
+			script = substitute(t, script, componentsFile, record)
 			script = substitute(t, script, payloadPath, filepath.Join(dir, "payload.tar.gz"))
 			script = substitute(t, script, "/dev/console", console)
 

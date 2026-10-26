@@ -184,6 +184,20 @@ func bootstrapScript(spec BuildSpec) (string, error) {
 	b.WriteString("}\n")
 	b.WriteString("trap 'billet_status=$?; trap - EXIT; [ \"$billet_status\" -eq 0 ] || billet_fail' EXIT\n")
 
+	// ONE BUILD PER MACHINE. A finished build cleans cloud-init before it announces
+	// its success, so a reboot during the announcement runs this again with the
+	// same nonce, and after the stop billet cannot see what it said: a stopped
+	// instance's console reads empty (measured 2026-10-26, us-west-2, with and
+	// without Latest, for a minute after the stop). So a machine whose image
+	// records a finished build fails here, at once and on the console billet is
+	// still reading, and a base image that is already a billet AMI is refused the
+	// same way.
+	b.WriteString("if [ -e " + componentsFile + " ]; then\n")
+	b.WriteString("  echo 'this machine already records a finished billet build, and a build " +
+		"runs once' >&2\n")
+	b.WriteString("  exit 1\n")
+	b.WriteString("fi\n")
+
 	// THE DISK IS THERE BEFORE ANYTHING TRIES TO USE IT.
 	//
 	// billet asks for a larger root than the base image declares, and growing an
@@ -290,6 +304,9 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 					"whatever is on its disk is not a finished image", id, st.reason)
 			}
 
+			// THE CONSOLE IS NOT READ AGAIN HERE: a stopped instance's reads empty, so
+			// a later failure is kept from happening rather than looked for (the
+			// bootstrap's ONE BUILD PER MACHINE).
 			if verdict == nil {
 				return "", fmt.Errorf("ec2: the builder %s powered itself off without billet "+
 					"having read its success verdict on the console, so billet cannot tell "+
