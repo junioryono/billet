@@ -3,9 +3,50 @@
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const tls = require("tls");
 const { spawnSync } = require("child_process");
 
 const MMDS = "http://169.254.169.254";
+
+// THE CACHE ENDPOINT'S ISSUER IS IN THE GUEST'S SYSTEM TRUST STORE, where an
+// EC2 image installs it (`billet ami build --ca-cert`), and Node never reads
+// that store: its https trusts only the roots it was built with. Every request
+// to an EC2 node's https cache endpoint failed its handshake ("unable to verify
+// the first certificate", an untrusted EC2 guest, 2026-10-25), so every sticky
+// disk there ran cold. The distribution's bundle is added to what Node trusts
+// by default, never put in its place: an explicit `ca` replaces Node's own
+// choice, so the base is its effective default set, which carries
+// NODE_EXTRA_CA_CERTS as well as its bundled roots: node24's
+// `tls.getCACertificates("default")`, and on a Node without that call the same
+// set built the way Node builds it. A guest without a bundle keeps Node's
+// defaults untouched.
+const systemCABundles = ["/etc/ssl/certs/ca-certificates.crt"];
+
+function nodeDefaultCAs() {
+  if (typeof tls.getCACertificates === "function") return tls.getCACertificates("default");
+  const roots = [...tls.rootCertificates];
+  const extra = process.env.NODE_EXTRA_CA_CERTS;
+  if (extra) {
+    try {
+      roots.push(fs.readFileSync(extra, "utf8"));
+    } catch (_) {
+      // Node itself only warns about an extra bundle it cannot read.
+    }
+  }
+  return roots;
+}
+
+function trustedCAs() {
+  const defaults = nodeDefaultCAs();
+  for (const path of module.exports.systemCABundles) {
+    try {
+      return [...defaults, fs.readFileSync(path, "utf8")];
+    } catch (_) {
+      // Absent or unreadable: the next candidate, then Node's own defaults.
+    }
+  }
+  return undefined;
+}
 
 function warning(message) {
   const safe = String(message).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
@@ -46,11 +87,13 @@ function request(url, options = {}, body) {
       reject(new Error("cache metadata named a non-HTTP(S) endpoint"));
       return;
     }
-    const transport = parsed.protocol === "https:" ? https : http;
+    const secure = parsed.protocol === "https:";
+    const transport = secure ? https : http;
     const req = transport.request(parsed, {
       method: options.method || "GET",
       headers: options.headers || {},
       timeout: options.timeout || 10000,
+      ...(secure ? { ca: trustedCAs() } : {}),
     }, (res) => {
       let response = "";
       res.setEncoding("utf8");
@@ -101,4 +144,4 @@ async function cacheCall(endpoint, token, path, body, timeout = 120000) {
   return JSON.parse(response);
 }
 
-module.exports = { cacheCall, credentials, output, run, saveState, warning };
+module.exports = { cacheCall, credentials, output, run, saveState, systemCABundles, warning };

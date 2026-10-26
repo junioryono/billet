@@ -68,7 +68,11 @@ type acceptanceJob struct {
 	LeaseID string `json:"lease_id"`
 	Tier    string `json:"tier"`
 	Node    string `json:"node,omitempty"`
-	RunID   int64  `json:"run_id,omitempty"`
+	// RunID is the run whose assignment bought the lease. A pool runner is
+	// handed whichever job GitHub chooses, so the run that actually started on
+	// it, GitHubRunID, can be another; zero is not recorded.
+	RunID       int64 `json:"run_id,omitempty"`
+	GitHubRunID int64 `json:"github_run_id,omitempty"`
 	// GitHub is GitHub's own reported result for the job.
 	GitHub string `json:"github,omitempty"`
 	// Billet is what billet's lifecycle concluded about the lease.
@@ -82,6 +86,42 @@ type acceptanceJob struct {
 	QueuedAt   string `json:"queued_at,omitempty"`
 	StartedAt  string `json:"started_at,omitempty"`
 	FinishedAt string `json:"finished_at,omitempty"`
+
+	// Trust is the class the job's tier declares in the config the evidence is
+	// written from. The ledger keeps none per lease, because trust belongs to the
+	// pool and not to the job that ran on it, so this is the config's word and
+	// not a record of the launch (the node's `trust=` line in its log is that),
+	// and it is empty for a tier the config does not name.
+	Trust string `json:"trust,omitempty"`
+	// Repository, Event, WorkflowRef and JobName are what GitHub's own message
+	// said the job was; a fork's pull request reads as the BASE repository and
+	// the event `pull_request`. Empty is not recorded.
+	Repository  string `json:"repository,omitempty"`
+	Event       string `json:"event,omitempty"`
+	WorkflowRef string `json:"workflow_ref,omitempty"`
+	JobName     string `json:"job_name,omitempty"`
+	// Provider and InstanceType are what billet placed the job on.
+	Provider     string `json:"provider,omitempty"`
+	InstanceType string `json:"instance_type,omitempty"`
+	// Cache is what each cache did for the job as its node observed it; an empty
+	// token was not observed.
+	Cache acceptanceCache `json:"cache"`
+	// Unread says the job's history row could not be read, so its placement,
+	// GitHub run and caches are unknown rather than empty.
+	Unread string `json:"unread,omitempty"`
+}
+
+// acceptanceCache is a job's cache observations, one closed-vocabulary token
+// per cache, as `billet jobs show` reads them.
+type acceptanceCache struct {
+	Image       string `json:"image,omitempty"`
+	Generation  string `json:"generation,omitempty"`
+	Actions     string `json:"actions,omitempty"`
+	StickyDisks string `json:"sticky_disks,omitempty"`
+	Git         string `json:"git,omitempty"`
+	Bazel       string `json:"bazel,omitempty"`
+	Go          string `json:"go,omitempty"`
+	Npm         string `json:"npm,omitempty"`
 }
 
 type acceptanceHold struct {
@@ -210,6 +250,8 @@ func collectAcceptanceEvidence(
 		return acceptanceEvidenceDoc{}, err
 	}
 
+	describeAcceptanceJobs(ctx, db, cfg, jobs)
+
 	doc.Jobs = jobs
 
 	allocator, err := acceptanceAllocator(db, cfg)
@@ -315,10 +357,54 @@ func readJobHistory(ctx context.Context, db *state.DB) ([]acceptanceJob, error) 
 			QueuedAt:      r.QueuedAt,
 			StartedAt:     r.StartedAt,
 			FinishedAt:    r.FinishedAt,
+			Repository:    r.Repo,
+			Event:         r.Event,
+			WorkflowRef:   r.WorkflowRef,
+			JobName:       r.JobName,
 		})
 	}
 
 	return jobs, nil
+}
+
+// describeAcceptanceJobs adds to each job its tier's trust class, what billet
+// placed it on and what its caches did. An acceptance ledger holds a run's few
+// jobs, so each history row is read whole, as `billet jobs show` reads one. A
+// row that cannot be read is said so on its job, as the barrier's is: evidence
+// that names what it could not read beats no evidence.
+func describeAcceptanceJobs(
+	ctx context.Context, db *state.DB, cfg *config.Config, jobs []acceptanceJob,
+) {
+	reads := state.ReadQueries(db.Reader())
+
+	for i := range jobs {
+		job := &jobs[i]
+
+		if tier, ok := cfg.TierByLabel(job.Tier); ok {
+			job.Trust = string(tier.Trust.Effective())
+		}
+
+		row, err := reads.ReadJob(ctx, job.LeaseID)
+		if err != nil {
+			job.Unread = "its history could not be read: " + err.Error()
+
+			continue
+		}
+
+		job.GitHubRunID = row.GithubRunID
+		job.Provider = row.ChosenProvider
+		job.InstanceType = row.InstanceType
+		job.Cache = acceptanceCache{
+			Image:       row.ImageCache,
+			Generation:  row.CacheGeneration,
+			Actions:     row.ActionsCache,
+			StickyDisks: row.StickyCache,
+			Git:         row.GitCache,
+			Bazel:       row.BazelCache,
+			Go:          row.GoCache,
+			Npm:         row.NpmCache,
+		}
+	}
 }
 
 // readAcceptanceJobs is what the wait loop asks.

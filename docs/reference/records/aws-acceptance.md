@@ -597,5 +597,6 @@ So an on-demand Linux build is a per-job boundary the way an `ec2` instance is: 
 
 ## What this does not prove
 
+- Untrusted fork work, which is not in this record: [An untrusted fork pull request on EC2](untrusted-fork-ec2.md) ran a fork's pull request on an untrusted EC2 tier on 2026-10-25, with the tier's isolation checked from inside the job and from outside it.
 - The shape allowlist and resource ceilings are the enforceable cost policy. `billet check` reports a node's conservative compute-only peak, `billet status` aggregates registered EC2 nodes under the deployment ceiling, and AWS Budgets is the account-wide backstop rather than a stale copied price becoming a runtime admission gate.
 - EBS/S3 cache reuse is measured in [`site-acceptance.md`](site-acceptance.md) (2026-09-03): a Docker image-store generation published from one instance came up warm on another, after the two defects that run found were fixed. Failure recovery of that store — a settlement interrupted mid-snapshot, a lost pointer write — remains unmeasured on real AWS.
