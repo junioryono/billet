@@ -35,7 +35,7 @@ jobs:
   # pull request whose paths cannot reach a family skips its jobs. A push, and
   # anything the script cannot establish, selects every family.
   changes:
-    runs-on: billet-2vcpu-ubuntu-2404
+    runs-on: billet-1vcpu-ubuntu-2404
     outputs:
       schema: ${{ steps.scope.outputs.schema }}
       host_lifecycle: ${{ steps.scope.outputs.host_lifecycle }}
@@ -630,7 +630,7 @@ jobs:
   retirement-selection:
     needs: [changes, host-lifecycle]
     if: needs.changes.outputs.host_lifecycle == 'true'
-    runs-on: billet-2vcpu-ubuntu-2404
+    runs-on: billet-1vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
@@ -1289,7 +1289,7 @@ jobs:
   terraform-consumer-floor:
     needs: changes
     if: needs.changes.outputs.terraform_consumer_floor == 'true'
-    runs-on: billet-2vcpu-ubuntu-2404
+    runs-on: billet-1vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -1324,7 +1324,7 @@ jobs:
   terraform-lint:
     needs: changes
     if: needs.changes.outputs.terraform_lint == 'true'
-    runs-on: billet-2vcpu-ubuntu-2404
+    runs-on: billet-1vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -1381,7 +1381,7 @@ jobs:
   # broken cross-reference or a page missing from the toctree fails here rather
   # than publishing.
   docs:
-    runs-on: billet-2vcpu-ubuntu-2404
+    runs-on: billet-1vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1401,7 +1401,7 @@ jobs:
   # off has nothing to do with the paths it touches. A push, and a pull request the
   # owner or a bot opened, pass at once, so the job costs only a clone there.
   dco:
-    runs-on: billet-2vcpu-ubuntu-2404
+    runs-on: billet-1vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1431,7 +1431,7 @@ jobs:
   # required check blocks the merge with nothing saying why.
   verify-all-checks:
     name: Verify All Checks Passed
-    runs-on: billet-2vcpu-ubuntu-2404
+    runs-on: billet-1vcpu-ubuntu-2404
     needs:
       [
         changes,

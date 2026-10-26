@@ -281,6 +281,17 @@ github:
 # `runs_on: billet-2vcpu-ubuntu-2404` answers to the same name as the default
 # target's `billet-2vcpu-ubuntu-2404` tier.
 #
+# Or write such a tier once, for every target: `targets: all` (or a list of
+# target names) in place of `target:`, `${target}` in the label where each
+# target's name goes, and `runs_on:` written. It becomes one tier per target,
+# because a scale set belongs to one organization or repository:
+#
+#   - label: ${target}-1vcpu-ubuntu-2404   # default-1vcpu-ubuntu-2404, personal-...
+#     runs_on: billet-1vcpu-ubuntu-2404    # the one runs-on name on every target
+#     targets: all
+#     vcpu: 1
+#     memory: 4GiB
+#
 # targets:
 #   - name: personal
 #     repository: your-account/your-repo

@@ -333,6 +333,15 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 				"config.ExpandTierSizes first; the sizes it declares would otherwise be a "+
 				"field nothing reads, and this tier would be one of zero vCPU", t.Label)
 
+		// AN UNEXPANDED MULTI-TARGET DECLARATION, for the same reason: it is one
+		// tier per target only after config.Parse, and as written its label holds
+		// a placeholder and its target is none of them.
+		case t.WritesTargets():
+			return nil, fmt.Errorf("alloc: tier %q still carries `targets`, so this catalogue "+
+				"never went through config.Parse. Expand it with config.ExpandTierTargets "+
+				"first; as written it is one tier for several targets, and a scale set "+
+				"belongs to exactly one", t.Label)
+
 		case t.VCPU <= 0:
 			return nil, fmt.Errorf("alloc: tier %q has vcpu %d; headroom divides by it", t.Label, t.VCPU)
 		case t.Memory <= 0:

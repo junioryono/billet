@@ -20,6 +20,23 @@ type Tier struct {
 	// the credential that creates it is that target's.
 	Target string `yaml:"target,omitempty"`
 
+	// Targets makes this one declaration a tier on each target it names, or on
+	// every target (`all`), in place of Target. Parse expands it, after `sizes`
+	// and before anything else reads the catalogue, into one tier per target:
+	// Label and RunsOn with TargetPlaceholder replaced by the target's name, and
+	// Target set. A GitHub scale set belongs to one organization or repository,
+	// so one per target is what GitHub requires; the declaration is what spares
+	// the operator writing each.
+	Targets TierTargets `yaml:"targets,omitempty"`
+
+	// Declaration is the label of the multi-target declaration this tier was
+	// expanded from, as written, or empty for a tier written out by hand.
+	Declaration string `yaml:"-"`
+	// inventoryOnly is a declaration's tier in a file that declares no targets
+	// (a node's), kept for what the node reads of its catalogue and never run:
+	// what only a target can supply, a derived cache scope, is not asked of it.
+	inventoryOnly bool
+
 	// RunsOn is the name of this tier's scale set on its target, the value a
 	// workflow puts in `runs-on`. It defaults to Label. It exists so tiers on
 	// different targets can answer to one name: Label identifies the tier inside
@@ -245,7 +262,7 @@ func (t Tier) PoolPolicyErrors(where string) []error {
 		errs = append(errs, fmt.Errorf("%s: an untrusted pool can enable the Actions cache "+
 			"only with cache.publish: default-branch", where))
 	}
-	if cache.Actions.Enabled && t.CacheScope == nil {
+	if cache.Actions.Enabled && t.CacheScope == nil && !t.inventoryOnly {
 		errs = append(errs, fmt.Errorf("%s: the Actions cache requires a static cache_scope because JobStarted arrives after launch", where))
 	}
 	if scope := t.CacheScope; scope != nil {

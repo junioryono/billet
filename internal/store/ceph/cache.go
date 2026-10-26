@@ -2088,9 +2088,17 @@ func verifyFilesystem(ctx context.Context, device string) (storecontract.Filesys
 			device, filesystem.Type)
 	}
 
-	if err := exec.CommandContext(ctx, e2fsck, "-f", "-n", device).Run(); err != nil {
-		return storecontract.Filesystem{}, fmt.Errorf("the ext4 filesystem on %s is not clean: %w",
-			device, err)
+	// E2FSCK'S OWN WORDS ARE KEPT, the tail of them. Every Go cache publication
+	// on one deployment was refused here from 2026-10-18 to 2026-10-26 with an
+	// exit status alone, and a refusal that cannot say what e2fsck found cannot
+	// be told from a journal awaiting replay, a damaged bitmap or a device that
+	// was not the volume (#689).
+	report := &tailWriter{limit: filesystemProbeLimit}
+	check := exec.CommandContext(ctx, e2fsck, "-f", "-n", device)
+	check.Stdout, check.Stderr = report, report
+	if err := check.Run(); err != nil {
+		return storecontract.Filesystem{}, fmt.Errorf("the ext4 filesystem on %s is not clean: %w: %s",
+			device, err, bounded(strings.TrimSpace(report.String())))
 	}
 
 	filesystem.Clean = true

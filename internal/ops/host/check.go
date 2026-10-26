@@ -581,6 +581,12 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			onTarget = "  target:" + t.Target
 		}
 
+		// WHICH DECLARATION MADE IT, so the scale sets one `targets:` tier became
+		// are never a surprise.
+		if t.Declaration != "" {
+			onTarget += "  from:" + t.Declaration
+		}
+
 		fmt.Fprintf(env.Stdout, "  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
 			fleetops.TierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
 			reserved, intercept, onTarget)
