@@ -776,3 +776,45 @@ func TestAFailureMarkedDuringTheLastReportIsReported(t *testing.T) {
 			told, calls)
 	}
 }
+
+// A POLICY REFUSAL OF A BLOB IS ANSWERED WITHIN AN OBSERVATION'S WAIT WHILE THE
+// SESSION'S LOCK IS HELD: asking whether the archive is the session's must not
+// hold the refused request for the whole of its budget behind a renewal.
+func TestAPolicyRefusalIsAnsweredPromptlyUnderABusyLock(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	uploadURL, _ := reserveActionsUpload(t, service, session, "busy-policy")
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return false, errors.New("the policy service did not answer")
+	}))
+
+	type answer struct {
+		status  int
+		handled bool
+	}
+	session.mu.Lock()
+	answered := make(chan answer, 1)
+	go func() {
+		response, handled := service.actionsProxy().respond(
+			actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")), session)
+		got := answer{handled: handled}
+		if response != nil {
+			got.status = response.StatusCode
+			response.Body.Close()
+		}
+		answered <- got
+	}()
+	var got answer
+	select {
+	case got = <-answered:
+		session.mu.Unlock()
+	case <-time.After(3 * cacheReportLimit):
+		session.mu.Unlock()
+		<-answered
+		t.Fatal("a policy refusal waited on the session's lock for longer than an observation does")
+	}
+	if !got.handled || got.status != http.StatusBadGateway {
+		t.Fatalf("a refused blob under a busy lock: %+v; want a local 502", got)
+	}
+}

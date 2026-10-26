@@ -1264,12 +1264,21 @@ func actionsJSONResponse(value any) (*http.Response, error) {
 
 // ownsActionsBlob says req names an archive this session holds, by a URL it
 // signed. A path it never issued is not billet's to fail.
+//
+// THE LOCK IS WAITED FOR AS LONG AS AN OBSERVATION WAITS, not for the request's
+// budget: the answer is already a refusal, and a renewal holds the lock across
+// storage. One that cannot be had says it could not tell, and nothing is marked.
 func (s *CacheService) ownsActionsBlob(req *http.Request, session *cacheSession) bool {
 	id, ok := strings.CutPrefix(req.URL.Path, actionsBlobPrefix)
-	if !ok || id == "" || strings.Contains(id, "/") {
+	if !ok || id == "" || strings.Contains(id, "/") || session.closing.Load() {
 		return false
 	}
-	if err := lockCacheSession(req.Context(), session); err != nil {
+	lockCtx, cancel := context.WithTimeout(req.Context(), cacheReportLimit)
+	defer cancel()
+	if err := lockCacheSession(lockCtx, session); err != nil {
+		s.log.Warn("could not tell whether a blob request the policy refused is this session's; "+
+			"it is not recorded", "instance", session.instance, "path", req.URL.Path, "error", err)
+
 		return false
 	}
 	defer session.mu.Unlock()
