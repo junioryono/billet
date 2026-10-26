@@ -117,7 +117,7 @@ Whether a subnet's `MapPublicIpOnLaunch` can substitute for the flag is **not es
 
 ### From GitHub's template, on both architectures (2026-10-25)
 
-Contract 4 (ADR-022) builds the AMI by running GitHub's `actions/runner-images` template on the builder itself. It was first run by hand on a 200 GiB root in a test account in us-west-2, without the guest-only differences, to learn whether the template needs any EC2-specific change: it did not. GitHub's whole template, its own Pester tests included, passed on Canonical's Ubuntu 24.04 AMI on c7i.4xlarge (x64) and c7g.4xlarge (arm64), peaking at 42 GiB used on x64, before the template's reboot, and 35 GiB on arm64.
+Contract 4 ([ADR-022](../decisions/adr-022-every-linux-image-from-githubs-template.md)) builds the AMI by running GitHub's `actions/runner-images` template on the builder itself. It was first run by hand on a 200 GiB root in a test account in us-west-2, without the guest-only differences, to learn whether the template needs any EC2-specific change: it did not. GitHub's whole template, its own Pester tests included, passed on Canonical's Ubuntu 24.04 AMI on c7i.4xlarge (x64) and c7g.4xlarge (arm64), peaking at 42 GiB used on x64, before the template's reboot, and 35 GiB on arm64.
 
 Then `billet ami build` ran from an `ec2` orchestrator instance in the same account, through billet's own code path end to end: staging, the bootstrap, the build unit across the template's reboot, the console verdict, `CreateImage`, the verifier's boot and the promotion.
 
