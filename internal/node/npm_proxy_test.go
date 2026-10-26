@@ -1597,7 +1597,7 @@ func TestAnAnsweredConnectionWhoseClientNeverClosesEndsAfterTheWait(t *testing.T
 	})
 	service, credentials := npmService(t, registry)
 	const wait = time.Second
-	service.npmCloseWait = wait
+	service.answerCloseWait = wait
 
 	conn, reader := npmAnswered(t, service, credentials, npmRequestLine("/left-pad"), document)
 	// THE WAIT BEGAN BEFORE THE ANSWER WAS READ, so the connection is open for

@@ -33,11 +33,6 @@ const (
 	// npmDocumentLimit it bounds the disk a burst of documents can take before
 	// the fill budget refuses to keep them.
 	npmFills = 32
-	// defaultNpmCloseWait bounds how long an answered connection waits for its
-	// client to close it, and npmCloseDiscard what it reads from the client
-	// meanwhile.
-	defaultNpmCloseWait = 30 * time.Second
-	npmCloseDiscard     = 4 << 10
 )
 
 // npmRelayedHeaders are the registry's headers a client is given. Everything
@@ -171,7 +166,10 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 		return
 	}
 	if !npmRequestTargetsRegistry(req) {
-		refuseMisdirected(tlsConn, "only the npm registry is available")
+		if refuseMisdirected(tlsConn, req, "only the npm registry is available") {
+			ended()
+			n.service.closeAfterClient(tlsConn, npmRegistryHost)
+		}
 
 		return
 	}
@@ -221,50 +219,7 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	// WHAT IT GOT IS KNOWN once the answer is written, so the wait for the client
 	// to close is never counted in flight.
 	ended()
-	n.closeAfterClient(tlsConn)
-}
-
-// closeAfterClient holds a connection the node has answered open until its
-// client closes it, up to the service's npmCloseWait, reading and discarding at
-// most npmCloseDiscard bytes meanwhile. The caller closes the connection after
-// it.
-//
-// THE CLIENT ENDS AN ANSWERED CONNECTION, NEVER THE NODE. The answer says
-// Connection: close, and undici (Node's fetch, and the copy pnpm/setup bundles)
-// asserts that its parser is not paused when its socket ends. A node that closed
-// on the answer's last byte ended the socket under a client that had paused a
-// body it was given all at once, and the assertion crashed it: pnpm/setup v3.1.2
-// on Node 24 failed one warm install in a few on the test host, and most warm
-// Platform jobs that set up pnpm (2026-10-26). A TLS close_notify or a FIN from
-// the node is that same end, so neither is sent before the client's close.
-//
-// ONLY AN ANSWER FRAMED BY ITS OWN LENGTH OR CHUNKS MAY WAIT, as every one
-// writeAnswer writes is. One delimited by the connection's end, as
-// http.Response.Write makes of refuseMisdirected's, is not whole until the node
-// closes.
-func (n *npmCache) closeAfterClient(conn net.Conn) {
-	wait := n.service.npmCloseWait
-	started := n.now()
-	// BOTH DIRECTIONS, because a TLS read can write: it answers a key update or
-	// sends an alert, and that write must not outlive the wait either.
-	if err := conn.SetDeadline(time.Now().Add(wait)); err != nil {
-		return
-	}
-	read, err := io.Copy(io.Discard, io.LimitReader(conn, npmCloseDiscard))
-	timeout, isNet := errors.AsType[net.Error](err)
-	switch {
-	case err == nil && read == npmCloseDiscard:
-		n.service.log.Debug("an npm client went on sending after its answer")
-	// A CLIENT THAT DROPS ITS SOCKET WITHOUT A close_notify, as Node's do, reads
-	// here as an unexpected EOF: that is its close too.
-	case err == nil, errors.Is(err, io.ErrUnexpectedEOF):
-		n.service.log.Debug("an npm client closed its answered connection",
-			"waited", n.now().Sub(started).Round(time.Millisecond))
-	case isNet && timeout.Timeout():
-		n.service.log.Debug("an npm client did not close its answered connection in time", "wait", wait)
-	default:
-		n.service.log.Debug("an npm answered connection ended in an error", "error", err)
-	}
+	n.service.closeAfterClient(tlsConn, npmRegistryHost)
 }
 
 // npmRequestTargetsRegistry reports whether the inner request names the
@@ -283,15 +238,6 @@ func npmRequestTargetsRegistry(req *http.Request) bool {
 	}
 
 	return strings.EqualFold(host, npmRegistryHost)
-}
-
-func refuseMisdirected(conn net.Conn, message string) {
-	misdirected := actionsBlobError(http.StatusMisdirectedRequest, message)
-	misdirected.Close = true
-	misdirected.Proto, misdirected.ProtoMajor, misdirected.ProtoMinor = "HTTP/1.1", 1, 1
-	//nolint:errcheck // best-effort refusal before anything is forwarded
-	_ = misdirected.Write(conn)
-	_ = misdirected.Body.Close()
 }
 
 // note records what the cache did for the session's job.
