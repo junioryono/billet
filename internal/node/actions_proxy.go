@@ -181,10 +181,15 @@ func (s *CacheService) actionsProxy() *actionsProxy {
 	return s.actions
 }
 
-func (s *CacheService) authenticateProxy(
-	ctx context.Context,
-	r *http.Request,
-) (*cacheSession, bool) {
+// authenticateProxy names the session a CONNECT belongs to.
+//
+// IT NEVER WAITS ON THE SESSION'S LOCK. A guest's relay gives the node ten
+// seconds to answer a CONNECT and then dials GitHub instead, and the lock is held
+// for as long as a block upload, a finalization or a renewal through the site's
+// cache index takes; a tunnel for a blob URL billet signed, reaching GitHub that
+// way, was answered "404 page not found" and failed the job's save (#694). What
+// it reads is fixed when the session is made, and closing mirrors closed.
+func (s *CacheService) authenticateProxy(r *http.Request) (*cacheSession, bool) {
 	value := r.Header.Get("Proxy-Authorization")
 	scheme, encoded, ok := strings.Cut(value, " ")
 	if !ok || !strings.EqualFold(scheme, "basic") {
@@ -205,13 +210,8 @@ func (s *CacheService) authenticateProxy(
 	if session == nil {
 		return nil, false
 	}
-	if err := lockCacheSession(ctx, session); err != nil {
-		return nil, false
-	}
-	allowed := (session.intercept || session.npmEnabled()) && !session.closed
-	session.mu.Unlock()
 
-	return session, allowed
+	return session, (session.intercept || session.npmEnabled()) && !session.closing.Load()
 }
 
 // npmEnabled reports whether the session's tier has the npm cache. The spec is
@@ -219,7 +219,7 @@ func (s *CacheService) authenticateProxy(
 func (session *cacheSession) npmEnabled() bool { return session.cache != nil && session.cache.Npm }
 
 func (p *actionsProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
-	session, ok := p.service.authenticateProxy(r.Context(), r)
+	session, ok := p.service.authenticateProxy(r)
 	if !ok {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="billet"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
@@ -588,7 +588,8 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 	// call the handler answered was served; one the handler failed is either
 	// retried through GitHub (a splice, whatever billet intended) or, when it is
 	// bound to a reservation only billet holds, refused to the guest as
-	// unavailable; one refused before it was read is unavailable too. The calls
+	// unavailable, and so is a blob leg; one refused before it was read is
+	// unavailable too. The calls
 	// actionsResponse decides on its own -- refused by the kill switch, or from
 	// a client billet does not serve -- are recorded there.
 	//
@@ -658,7 +659,10 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 		if reservationBound {
 			p.service.log.Warn("a reserved Actions cache request failed locally",
 				"instance", session.instance, "path", req.URL.Path, "error", err)
-			observe(req.Context(), alloc.ActionsCacheUnavailable)
+			// A BLOB LEG'S FAILURE IS RECORDED TOO, though a blob leg is not a
+			// CacheService call: a save whose blocks failed on the node was
+			// otherwise recorded as whatever its reservation was (#694).
+			p.service.observeActions(req.Context(), session, alloc.ActionsCacheUnavailable)
 
 			return actionsBlobError(http.StatusBadGateway, "Actions cache storage is unavailable"), true
 		}

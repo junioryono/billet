@@ -218,8 +218,9 @@ func TestTheActionsObservationNamesWhatInterceptionDid(t *testing.T) {
 				t.Fatalf("observer was told %+v, want one observation %+v", calls, want)
 			}
 
-			// A BLOB LEG IS NOT A CacheService CALL and observes nothing more; nor
-			// does a second call, because the first observation is kept.
+			// A BLOB LEG BILLET ANSWERED IS NOT A CacheService CALL and observes
+			// nothing more; nor does a second call, because the first observation
+			// is kept.
 			blob := actionsRequestForTest(t, http.MethodHead,
 				"https://"+actionsResultsHost+actionsBlobPrefix+"nothing", "")
 			blobResponse, _ := proxy.respond(blob, session)

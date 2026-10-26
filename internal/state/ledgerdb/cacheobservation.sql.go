@@ -15,7 +15,8 @@ UPDATE job_history
                                ELSE image_cache END,
        cache_generation = CASE WHEN image_cache = '' THEN CAST($2 AS TEXT)
                                ELSE cache_generation END,
-       actions_cache    = CASE WHEN actions_cache = '' THEN CAST($3 AS TEXT)
+       actions_cache    = CASE WHEN actions_cache = '' OR CAST($3 AS TEXT) = 'unavailable'
+                               THEN CAST($3 AS TEXT)
                                ELSE actions_cache END,
        sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST($4 AS TEXT)
                                ELSE sticky_cache END,
@@ -72,7 +73,8 @@ UPDATE leases
                                ELSE image_cache END,
        cache_generation = CASE WHEN image_cache = '' THEN CAST($2 AS TEXT)
                                ELSE cache_generation END,
-       actions_cache    = CASE WHEN actions_cache = '' THEN CAST($3 AS TEXT)
+       actions_cache    = CASE WHEN actions_cache = '' OR CAST($3 AS TEXT) = 'unavailable'
+                               THEN CAST($3 AS TEXT)
                                ELSE actions_cache END,
        sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST($4 AS TEXT)
                                ELSE sticky_cache END,
@@ -111,10 +113,13 @@ type RecordLeaseCacheObservationParams struct {
 // THE FIRST OBSERVATION IS KEPT, and the guard is in the statement rather than in
 // a branch above it: each column is written only while it is empty, so a repeat
 // from a node retrying a lost response changes nothing and a later, different
-// observation cannot replace what the guest first saw. The generation moves with
-// the image-cache token so a report never shows a generation with nothing to
-// attribute it to. TestBothCacheObservationStatementsKeepTheFirst pins the guard
-// on both statements.
+// observation cannot replace what the guest first saw. The one exception is the
+// Actions half's 'unavailable', a call billet failed locally, which replaces what
+// came before it: a save lost after a served restore was otherwise recorded as
+// served (#694). The generation moves with the image-cache token so a report
+// never shows a generation with nothing to attribute it to.
+// TestBothCacheObservationStatementsKeepTheFirst pins the guard on both
+// statements.
 // Write the observation onto the live lease, fenced on its epoch.
 func (q *Queries) RecordLeaseCacheObservation(ctx context.Context, arg RecordLeaseCacheObservationParams) error {
 	_, err := q.db.ExecContext(ctx, recordLeaseCacheObservation,

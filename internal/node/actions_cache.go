@@ -65,7 +65,11 @@ const (
 )
 
 type actionsArchive struct {
-	mu        sync.Mutex           `json:"-"`
+	// mu is held shared by a blob request and alone by whatever changes the
+	// archive's file or its mount: a single-shot upload, the block list's commit,
+	// the finalization and the session's cleanup. A block is its own file, so the
+	// client's concurrent blocks are written side by side.
+	mu        sync.RWMutex         `json:"-"`
 	ID        string               `json:"id"`
 	Signature string               `json:"signature"`
 	Mode      string               `json:"mode"`
@@ -1202,13 +1206,28 @@ func (s *CacheService) serveActionsBlob(
 
 		return actionsBlobError(http.StatusForbidden, "cache archive is unavailable"), nil
 	}
-	if err := lockCacheMutex(req.Context(), &archive.mu); err != nil {
-		session.mu.Unlock()
-
-		return nil, err
-	}
+	exclusive := archive.Mode == actionsModeUpload && req.Method == http.MethodPut &&
+		req.URL.Query().Get("comp") != "block"
+	// THE SESSION'S LOCK IS LET GO BEFORE THE ARCHIVE'S IS WAITED FOR. A block
+	// waiting behind another block's transfer held it for the whole transfer, and
+	// everything else of the job's queued behind that wait (#694).
 	session.mu.Unlock()
-	defer archive.mu.Unlock()
+	if exclusive {
+		if err := lockCacheMutex(req.Context(), &archive.mu); err != nil {
+			return nil, err
+		}
+		defer archive.mu.Unlock()
+	} else {
+		if err := pollCacheLock(req.Context(), archive.mu.TryRLock); err != nil {
+			return nil, err
+		}
+		defer archive.mu.RUnlock()
+	}
+	// The session may have closed while this waited; its cleanup holds the
+	// archive alone to unmount it, so a request let in after that finds it shut.
+	if session.closing.Load() {
+		return actionsBlobError(http.StatusForbidden, "cache archive is unavailable"), nil
+	}
 	if archive.Mode == actionsModeUpload {
 		return s.uploadActionsBlob(req, session, archive)
 	}

@@ -38,6 +38,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A store and a listener are halves of one thing, and `billet check` is where the mirror is caught.**
 - **The kill switch is central, per cache, and consulted before every local operation.**
 - **What the cache did for a job is recorded as an observation, from a closed vocabulary, first observation kept.**
+- **A CONNECT never waits on a session's lock, and a block in transfer holds only its archive, shared (#694).**
 - **The conformance workflow is consumer-owned and pinned.**
 - **Caches are a deliberate cross-job channel, and `tiers[].cache.publish` gates publication (#226, ADR-013).**
 - **Guest volumes never become host file authority.**

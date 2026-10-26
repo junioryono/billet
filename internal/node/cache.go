@@ -249,8 +249,8 @@ type CacheObserver interface {
 // DURABLE WITH THE SESSION, because the report is best effort at the moment of
 // observation and is resent when the compute ends; a restart in between must
 // not forget what the guest saw. The first observation of each half is kept,
-// which is the same rule the ledger applies, so the two cannot disagree about
-// which observation was first.
+// except that the Actions half's `unavailable` replaces whatever came before it,
+// which is the same rule the ledger applies, so the two cannot disagree.
 type cacheObserved struct {
 	ImageCache      string `json:"image_cache,omitempty"`
 	CacheGeneration string `json:"cache_generation,omitempty"`
@@ -395,7 +395,12 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 		changed = true
 	}
 
-	if obs.ActionsCache != "" && session.observed.ActionsCache == "" {
+	// A LOCAL FAILURE IS NOT HIDDEN BEHIND AN EARLIER SUCCESS: a job whose restore
+	// was served and whose save then failed on the node was recorded as served,
+	// and nothing showed the save was lost (#694).
+	if obs.ActionsCache != "" && (session.observed.ActionsCache == "" ||
+		obs.ActionsCache == alloc.ActionsCacheUnavailable &&
+			session.observed.ActionsCache != string(alloc.ActionsCacheUnavailable)) {
 		session.observed.ActionsCache = string(obs.ActionsCache)
 		session.observed.ActionsPending = false
 		changed = true
@@ -1142,6 +1147,12 @@ func (s *CacheService) cleanupSession(
 			failures = append(failures, fmt.Errorf("actions cache %s wait for archive: %w", id, err))
 
 			break
+		}
+		// A finalization takes its archive out of the session, so one still here
+		// was reserved and never finalized: the job's save published nothing.
+		if archive.Mode == actionsModeUpload {
+			s.log.Warn("an Actions cache save was reserved and never finalized; nothing was published",
+				"instance", session.instance, "key", archive.CacheKey, "version", archive.Version)
 		}
 		if !archive.Unmounted {
 			if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {
@@ -1930,13 +1941,18 @@ func lockCacheSession(ctx context.Context, session *cacheSession) error {
 	return lockCacheMutex(ctx, &session.mu)
 }
 
-func lockCacheMutex(ctx context.Context, mutex *sync.Mutex) error {
+func lockCacheMutex(ctx context.Context, mutex interface{ TryLock() bool }) error {
+	return pollCacheLock(ctx, mutex.TryLock)
+}
+
+// pollCacheLock takes a lock through try until ctx ends.
+func pollCacheLock(ctx context.Context, try func() bool) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
-	for !mutex.TryLock() {
+	for !try() {
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
