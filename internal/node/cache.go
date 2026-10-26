@@ -93,6 +93,8 @@ type CacheService struct {
 	// npmSettleWait is defaultNpmSettleWait, a field so a test can reach its
 	// bound without waiting it out.
 	npmSettleWait time.Duration
+	// npmCloseWait is defaultNpmCloseWait, a field for the same reason.
+	npmCloseWait time.Duration
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
@@ -347,6 +349,7 @@ func NewCacheService(
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
 	service.npmSettleWait = defaultNpmSettleWait
+	service.npmCloseWait = defaultNpmCloseWait
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}

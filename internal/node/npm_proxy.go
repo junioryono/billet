@@ -33,6 +33,11 @@ const (
 	// npmDocumentLimit it bounds the disk a burst of documents can take before
 	// the fill budget refuses to keep them.
 	npmFills = 32
+	// defaultNpmCloseWait bounds how long an answered connection waits for its
+	// client to close it, and npmCloseDiscard what it reads from the client
+	// meanwhile.
+	defaultNpmCloseWait = 30 * time.Second
+	npmCloseDiscard     = 4 << 10
 )
 
 // npmRelayedHeaders are the registry's headers a client is given. Everything
@@ -126,9 +131,9 @@ func (n *npmCache) held(key string) bool { return n.store != nil && n.store.held
 // the npm cache.
 //
 // THE FIRST REQUEST DECIDES THE CONNECTION. One the store may answer is answered
-// and the connection closed, so every later request arrives on a new connection
-// and is classified afresh; anything else is spliced to the registry, whole,
-// with the guest's own bytes.
+// with Connection: close, and the client's close ends the connection, so every
+// later request arrives on a new connection and is classified afresh; anything
+// else is spliced to the registry, whole, with the guest's own bytes.
 func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session *cacheSession) {
 	// IN FLIGHT UNTIL WHAT IT GOT IS KNOWN: to the end of an answer, or to the
 	// start of a splice, which notes nothing and can last as long as the guest
@@ -206,7 +211,60 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, cacheHandlerLimit)
 	defer cancel()
-	n.serve(requestCtx, tlsConn, req.WithContext(requestCtx), request, session)
+	whole := n.serve(requestCtx, tlsConn, req.WithContext(requestCtx), request, session)
+	cancel()
+	// AN ANSWER CUT SHORT IS CLOSED AT ONCE, before what it got is reported: the
+	// close is how its client learns that it ended short.
+	if !whole {
+		return
+	}
+	// WHAT IT GOT IS KNOWN once the answer is written, so the wait for the client
+	// to close is never counted in flight.
+	ended()
+	n.closeAfterClient(tlsConn)
+}
+
+// closeAfterClient holds a connection the node has answered open until its
+// client closes it, up to the service's npmCloseWait, reading and discarding at
+// most npmCloseDiscard bytes meanwhile. The caller closes the connection after
+// it.
+//
+// THE CLIENT ENDS AN ANSWERED CONNECTION, NEVER THE NODE. The answer says
+// Connection: close, and undici (Node's fetch, and the copy pnpm/setup bundles)
+// asserts that its parser is not paused when its socket ends. A node that closed
+// on the answer's last byte ended the socket under a client that had paused a
+// body it was given all at once, and the assertion crashed it: pnpm/setup v3.1.2
+// on Node 24 failed one warm install in a few on the test host, and most warm
+// Platform jobs that set up pnpm (2026-10-26). A TLS close_notify or a FIN from
+// the node is that same end, so neither is sent before the client's close.
+//
+// ONLY AN ANSWER FRAMED BY ITS OWN LENGTH OR CHUNKS MAY WAIT, as every one
+// writeAnswer writes is. One delimited by the connection's end, as
+// http.Response.Write makes of refuseMisdirected's, is not whole until the node
+// closes.
+func (n *npmCache) closeAfterClient(conn net.Conn) {
+	wait := n.service.npmCloseWait
+	started := n.now()
+	// BOTH DIRECTIONS, because a TLS read can write: it answers a key update or
+	// sends an alert, and that write must not outlive the wait either.
+	if err := conn.SetDeadline(time.Now().Add(wait)); err != nil {
+		return
+	}
+	read, err := io.Copy(io.Discard, io.LimitReader(conn, npmCloseDiscard))
+	timeout, isNet := errors.AsType[net.Error](err)
+	switch {
+	case err == nil && read == npmCloseDiscard:
+		n.service.log.Debug("an npm client went on sending after its answer")
+	// A CLIENT THAT DROPS ITS SOCKET WITHOUT A close_notify, as Node's do, reads
+	// here as an unexpected EOF: that is its close too.
+	case err == nil, errors.Is(err, io.ErrUnexpectedEOF):
+		n.service.log.Debug("an npm client closed its answered connection",
+			"waited", n.now().Sub(started).Round(time.Millisecond))
+	case isNet && timeout.Timeout():
+		n.service.log.Debug("an npm client did not close its answered connection in time", "wait", wait)
+	default:
+		n.service.log.Debug("an npm answered connection ended in an error", "error", err)
+	}
 }
 
 // npmRequestTargetsRegistry reports whether the inner request names the
@@ -275,20 +333,32 @@ func (n *npmCache) end(ctx context.Context, session *cacheSession) {
 	}
 }
 
-// npmExchange is one request being answered: who asked, for what, and when.
+// npmExchange is one request being answered: who asked, for what, and when, and
+// whether its answer went out whole.
 type npmExchange struct {
 	conn    net.Conn
 	req     *http.Request
 	request npmRequest
 	session *cacheSession
 	started time.Time
+	whole   *bool
 }
 
-// serve answers one request the store may answer.
+// serve answers one request the store may answer, and reports whether a whole
+// answer was written.
 func (n *npmCache) serve(ctx context.Context, conn net.Conn, req *http.Request, request npmRequest,
 	session *cacheSession,
-) {
-	x := npmExchange{conn: conn, req: req, request: request, session: session, started: n.now()}
+) bool {
+	whole := false
+	x := npmExchange{conn: conn, req: req, request: request, session: session, started: n.now(), whole: &whole}
+	n.answer(ctx, x)
+
+	return whole
+}
+
+// answer answers x by the rules ADR-020 gives.
+func (n *npmCache) answer(ctx context.Context, x npmExchange) {
+	request, session := x.request, x.session
 	key := request.key()
 	if entry, body, ok := n.store.acquire(key, n.now()); ok {
 		if entry.fresh(n.now()) {
@@ -1067,11 +1137,24 @@ func relayedHeader(upstream http.Header) http.Header {
 //
 // WRITTEN BY HAND, so what a HEAD and a 304 carry is this function's to say: a
 // HEAD gets the length a GET would and no body, a 304 neither. A body of
-// unknown length (a negative length) is delimited by the connection's close.
-// THE HEADERS ARE SENT BEFORE THE BODY IS READ, so a client whose body then
-// stalls has its answer begun. A body shorter than its declared length is an
-// error, and the caller's close of the connection tells the client it was cut.
+// unknown length (a negative length) is chunked, so no answer is delimited by
+// the connection's close. THE HEADERS ARE SENT BEFORE THE BODY IS READ, so a
+// client whose body then stalls has its answer begun. A body shorter than its
+// declared length is an error, and the caller's immediate close of the
+// connection tells the client it was cut.
+//
+// It records in the exchange whether the answer went out whole.
 func (n *npmCache) writeAnswer(x npmExchange, status int, header http.Header, body io.Reader, length int64) error {
+	err := n.writeFramed(x, status, header, body, length)
+	if x.whole != nil {
+		*x.whole = err == nil
+	}
+
+	return err
+}
+
+// writeFramed is writeAnswer's write.
+func (n *npmCache) writeFramed(x npmExchange, status int, header http.Header, body io.Reader, length int64) error {
 	header = header.Clone()
 	header.Set("Connection", "close")
 	header.Del("Content-Length")
