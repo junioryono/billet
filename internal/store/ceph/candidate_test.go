@@ -335,8 +335,10 @@ func TestAGenerationMapThatLandsAsItsCallerGivesUpIsUnmapped(t *testing.T) {
 	}
 }
 
-// Eviction first unmaps a read-only generation mapping a crash left behind, and
-// no other mapping.
+// Eviction first unmaps a read-only generation mapping a crash left behind, a
+// cache generation's or a golden image's (which LearnArchitectures makes), and no
+// other mapping: not a golden image's head, a completion root or a snapshot an
+// operator named.
 func TestEvictionUnmapsAGenerationMappingACrashLeftBehind(t *testing.T) {
 	t.Parallel()
 
@@ -350,15 +352,24 @@ func TestEvictionUnmapsAGenerationMappingACrashLeftBehind(t *testing.T) {
 	f.mappings["/dev/rbd45"] = "billet-images/ubuntu-2404-x64@g20261013005155"
 	f.mappings["/dev/rbd46"] = "billet-cache/cache-g-1791000000-by-hand@backup"
 	f.mappings["/dev/rbd47"] = "other-cache/cache-g-1791233900-6916d9e459925223c4c82c1b@1791233900-7f26324f3e5fd2d379cf1af8"
+	f.mappings["/dev/rbd48"] = "billet-images/ubuntu-2404-x64"
+	f.mappings["/dev/rbd49"] = "billet-images/ubuntu-2404-x64@c20261013005155"
+	f.mappings["/dev/rbd50"] = "billet-images/ubuntu-2404-x64@backup"
+	f.mappings["/dev/rbd51"] = "other-images/ubuntu-2404-x64@g20261013005155"
 
 	if err := c.Evict(t.Context(), time.Hour); err != nil {
 		t.Fatalf("Evict: %v", err)
 	}
 
-	if _, ok := f.mappings["/dev/rbd40"]; ok {
-		t.Error("the generation mapping a crash left behind is still mapped")
+	for _, device := range []string{"/dev/rbd40", "/dev/rbd45"} {
+		if _, ok := f.mappings[device]; ok {
+			t.Errorf("the generation mapping %s a crash left behind is still mapped", device)
+		}
 	}
-	for _, device := range []string{"/dev/rbd41", "/dev/rbd42", "/dev/rbd43", "/dev/rbd44", "/dev/rbd45", "/dev/rbd46", "/dev/rbd47"} {
+	for _, device := range []string{
+		"/dev/rbd41", "/dev/rbd42", "/dev/rbd43", "/dev/rbd44", "/dev/rbd46", "/dev/rbd47",
+		"/dev/rbd48", "/dev/rbd49", "/dev/rbd50", "/dev/rbd51",
+	} {
 		if _, ok := f.mappings[device]; !ok {
 			t.Errorf("eviction unmapped %s, which is no generation's snapshot", device)
 		}

@@ -1,0 +1,381 @@
+package ceph
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"testing"
+)
+
+// elfHead is the first bytes of a little-endian 64-bit ELF executable for the
+// given machine number, as far as elfMachine reads.
+func elfHead(machine uint16) []byte {
+	head := make([]byte, 64)
+	copy(head, "\x7fELF")
+	head[4], head[5] = 2, 1 // ELFCLASS64, ELFDATA2LSB
+	head[18], head[19] = byte(machine), byte(machine>>8)
+
+	return head
+}
+
+// archMeta is an `image-meta list` table of the given rows.
+func archMeta(rows ...string) string {
+	return "Key  Value\n" + strings.Join(rows, "\n") + "\n"
+}
+
+func TestTheELFMachineIsReadFromTheHeader(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		head []byte
+		want string
+	}{
+		{"x86-64", elfHead(62), "x86_64"},
+		{"aarch64", elfHead(183), "aarch64"},
+		{"big-endian aarch64", func() []byte {
+			h := elfHead(0)
+			h[5], h[18], h[19] = 2, 0, 183
+
+			return h
+		}(), "aarch64"},
+	} {
+		got, err := elfMachine(tc.head)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: elfMachine = %q, %v, want %q", tc.name, got, err, tc.want)
+		}
+	}
+
+	// COULD-NOT-TELL, NEVER A GUESS: debugfs answers 0 for a path it could not
+	// find, so nothing, a stray complaint, a short read, another machine and an
+	// unknown byte order are each refused.
+	for name, head := range map[string][]byte{
+		"nothing":      nil,
+		"not an ELF":   []byte("File not found by ext2_lookup while dumping"),
+		"a short read": elfHead(62)[:12],
+		"riscv":        elfHead(243),
+		"a damaged magic": func() []byte {
+			h := elfHead(62)
+			h[0] = 0
+
+			return h
+		}(),
+		"no byte order": func() []byte { h := elfHead(62); h[5] = 0; return h }(),
+	} {
+		if got, err := elfMachine(head); err == nil {
+			t.Errorf("%s: elfMachine = %q, want a refusal", name, got)
+		}
+	}
+}
+
+// AN IMPORT RECORDS ITS ARCHITECTURE on the generation it makes, first among the
+// generation's fields.
+func TestAnImportRecordsTheMachineItsImageWasBuiltFor(t *testing.T) {
+	t.Parallel()
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device}
+
+	gen, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-arm64", raw, "aarch64",
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
+	if err != nil {
+		t.Fatalf("ImportGeneration: %v", err)
+	}
+
+	if !f.ranWith("image-meta", "set", "ubuntu-2404-arm64", ArchKey+"."+gen, "aarch64") {
+		t.Fatalf("the import did not record its architecture; billet ran %v", f.calls)
+	}
+
+	sets := slices.IndexFunc(f.calls, func(call []string) bool {
+		return matchesCall(call, []string{"image-meta", "set"})
+	})
+	if sets < 0 || !slices.Contains(f.calls[sets], ArchKey+"."+gen) {
+		t.Errorf("the first field recorded was not the architecture: %v", f.calls[sets])
+	}
+}
+
+// AND AN IMPORT THAT CANNOT SAY WHAT IT IS IS REFUSED, before anything is written.
+func TestAnImportNamingNoMachineIsRefused(t *testing.T) {
+	t.Parallel()
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{device: device}
+
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, " ",
+		"2.336.0", "", "7", importAt)
+	if err == nil || !strings.Contains(err.Error(), "needs the machine") {
+		t.Fatalf("ImportGeneration = %v, want a refusal naming the missing machine", err)
+	}
+
+	if f.ranWith("device", "map") || f.ranWith("lock", "add") {
+		t.Errorf("a refused import touched the cluster; billet ran %v", f.calls)
+	}
+}
+
+// ONE ARCHITECTURE AN IMAGE: an import is refused unless every generation the
+// image holds is known to be of its own, judged under the publish lock and before
+// the head is touched.
+func TestAnImportIsRefusedUnlessEveryGenerationIsKnownToBeOfItsMachine(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		snaps    []string
+		meta     string
+		want     string
+		accepted bool
+	}{
+		{
+			name: "another machine's", snaps: []string{"g20260801000000", "g20260802000000"},
+			meta: archMeta(ArchKey+".g20260801000000  x86_64", ArchKey+".g20260802000000  aarch64"),
+			want: "g20260802000000 (aarch64)",
+		},
+		{
+			name: "one that records none", snaps: []string{"g20260801000000", "g20260802000000"},
+			meta: archMeta(ArchKey + ".g20260801000000  x86_64"),
+			want: "billet images unpromote",
+		},
+		{
+			name: "all of its own", snaps: []string{"g20260801000000"},
+			meta:     archMeta(ArchKey + ".g20260801000000  x86_64"),
+			accepted: true,
+		},
+		{name: "none at all", accepted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, device := stageRaw(t, "content")
+			f := &importFake{device: device, infoJSON: `{"size": 8388608}`, snapshots: tc.snaps,
+				metadata: tc.meta}
+
+			_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
+				"2.336.0", "", "7", importAt)
+
+			if tc.accepted {
+				if err != nil {
+					t.Fatalf("an import into an image of its own machine was refused: %v", err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ImportGeneration = %v, want a refusal naming %q", err, tc.want)
+			}
+
+			if f.ranWith("device", "map") || f.ranWith("snap", "create") {
+				t.Errorf("a refused import wrote into the image; billet ran %v", f.calls)
+			}
+
+			if !f.ranWith("lock", "add") {
+				t.Errorf("the image's generations were not judged under the publish lock; billet ran %v",
+					f.calls)
+			}
+		})
+	}
+}
+
+// @VERIFIED NEVER RESOLVES TO ANOTHER MACHINE'S GENERATION, and one that records
+// none resolves as it always did.
+func TestVerifiedNeverResolvesToAnotherMachinesGeneration(t *testing.T) {
+	t.Parallel()
+
+	const older, newer, newest = "g20260801000000", "g20260802000000", "g20260803000000"
+
+	for _, tc := range []struct {
+		name string
+		meta []string
+		want string
+	}{
+		{
+			name: "the newest is another machine's",
+			meta: []string{ArchKey + "." + older + "  x86_64", ArchKey + "." + newer + "  x86_64",
+				ArchKey + "." + newest + "  aarch64"},
+			want: newer,
+		},
+		{
+			name: "the newest records none",
+			meta: []string{ArchKey + "." + older + "  x86_64", ArchKey + "." + newer + "  aarch64"},
+			want: newest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rows := slices.Concat(tc.meta, []string{
+				VerifiedKey + "." + older + "  2026-08-01T00:00:00Z", GuestContractKey + "." + older + "  7",
+				VerifiedKey + "." + newer + "  2026-08-02T00:00:00Z", GuestContractKey + "." + newer + "  7",
+				VerifiedKey + "." + newest + "  2026-08-03T00:00:00Z", GuestContractKey + "." + newest + "  7",
+			})
+			f := &importFake{snapshots: []string{older, newer, newest}, metadata: archMeta(rows...)}
+			c := importClient(t, f)
+			c.machine = "x86_64"
+
+			got, err := c.ResolveGeneration(t.Context(), "ubuntu-2404-x64@verified", "7")
+			if err != nil || got != "ubuntu-2404-x64@"+tc.want {
+				t.Fatalf("@verified resolved to %q, %v, want %s", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// NOR DOES AN EXACT GENERATION: pinning another machine's is refused by name, and
+// a pinned generation that records none, or this host's, is returned unchanged.
+func TestAnExactGenerationOfAnotherMachineIsRefused(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{metadata: archMeta(ArchKey+".g20260801000000  aarch64",
+		ArchKey+".g20260802000000  x86_64")}
+	c := importClient(t, f)
+	c.machine = "x86_64"
+
+	_, err := c.ResolveGeneration(t.Context(), "ubuntu-2404-x64@g20260801000000", "7")
+	if err == nil || !strings.Contains(err.Error(), "was built for aarch64 and this host is x86_64") {
+		t.Fatalf("ResolveGeneration = %v, want a refusal naming both machines", err)
+	}
+
+	for _, ref := range []string{"ubuntu-2404-x64@g20260802000000", "ubuntu-2404-x64@g20260803000000"} {
+		if got, err := c.ResolveGeneration(t.Context(), ref, "7"); err != nil || got != ref {
+			t.Errorf("ResolveGeneration(%s) = %q, %v, want it unchanged", ref, got, err)
+		}
+	}
+}
+
+// AND A COMPLETION ROOT OF ANOTHER MACHINE IS NOT BOOTED to complete an image.
+func TestACompletionRootOfAnotherMachineIsRefused(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{contract: "7", metadata: archMeta(ArchKey + ".c20260801000000  aarch64")}
+	c := importClient(t, f)
+	c.machine = "x86_64"
+
+	_, err := c.ResolveCompletionRoot(t.Context(), "ubuntu-2404-x64@c20260801000000", "7")
+	if err == nil || !strings.Contains(err.Error(), "was built for aarch64") {
+		t.Fatalf("ResolveCompletionRoot = %v, want a refusal naming its machine", err)
+	}
+}
+
+// A GENERATION THAT RECORDS NO ARCHITECTURE IS READ FROM ITSELF: mapped read-only,
+// its probe binary's ELF header read, and what was read recorded under the publish
+// lock. One that cannot be read stays unknown and says why; one that already
+// records one is not mapped.
+func TestLearnArchitecturesReadsEachGenerationThatRecordsNone(t *testing.T) {
+	t.Parallel()
+
+	const known, readable, unreadable = "g20260801000000", "g20260802000000", "g20260803000000"
+
+	const device = "/dev/rbd7"
+	f := &importFake{device: device, snapshots: []string{known, readable, unreadable},
+		metadata: archMeta(ArchKey + "." + known + "  x86_64")}
+	c := importClient(t, f)
+
+	var probed []string
+
+	c.readProbe = func(_ context.Context, dev string) ([]byte, error) {
+		probed = append(probed, dev)
+		if len(probed) == 1 {
+			return elfHead(183), nil
+		}
+
+		return []byte("File not found by ext2_lookup"), nil
+	}
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil {
+		t.Fatalf("LearnArchitectures: %v", err)
+	}
+
+	if len(learned) != 2 || learned[0].Generation != readable || learned[0].Machine != "aarch64" ||
+		learned[0].Err != nil || learned[1].Generation != unreadable || learned[1].Err == nil {
+		t.Fatalf("learned %+v, want %s read as aarch64 and %s unreadable", learned, readable, unreadable)
+	}
+
+	for _, gen := range []string{readable, unreadable} {
+		if !f.ranWith("device", "map", "billet-images/ubuntu-2404-x64@"+gen, "--read-only") {
+			t.Errorf("%s was not mapped read-only; billet ran %v", gen, f.calls)
+		}
+	}
+
+	if f.ranWith("device", "map", "billet-images/ubuntu-2404-x64@"+known) {
+		t.Errorf("a generation that records its architecture was mapped")
+	}
+
+	if !f.appliedMetadata[ArchKey+"."+readable] || f.appliedMetadata[ArchKey+"."+unreadable] {
+		t.Errorf("recorded %v, want only %s's architecture", f.appliedMetadata, readable)
+	}
+
+	if !f.ranWith("lock", "add") {
+		t.Errorf("what was read was not recorded under the publish lock; billet ran %v", f.calls)
+	}
+}
+
+// AND A GENERATION REAPED WHILE IT WAS READ IS NOT DESCRIBED AFTERWARDS, which
+// would leave a key nothing reaps.
+func TestLearnArchitecturesRecordsNothingForAGenerationGoneSinceItWasRead(t *testing.T) {
+	t.Parallel()
+
+	const gone = "g20260802000000"
+
+	const device = "/dev/rbd7"
+	f := &importFake{device: device, snapshots: []string{gone}}
+	c := importClient(t, f)
+	c.readProbe = func(context.Context, string) ([]byte, error) {
+		f.snapshots = nil
+
+		return elfHead(62), nil
+	}
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil || len(learned) != 1 || learned[0].Machine != "x86_64" {
+		t.Fatalf("LearnArchitectures = %+v, %v", learned, err)
+	}
+
+	if f.appliedMetadata[ArchKey+"."+gone] {
+		t.Error("a generation reaped while it was read was described afterwards")
+	}
+}
+
+// NOR IS ONE ANOTHER NODE RECORDED WHILE THIS ONE READ IT overwritten: the record
+// that is there was written under the same lock, by a reader of the same bytes or
+// by the import itself.
+func TestLearnArchitecturesKeepsARecordWrittenWhileItRead(t *testing.T) {
+	t.Parallel()
+
+	const gen = "g20260802000000"
+
+	f := &importFake{device: "/dev/rbd7", snapshots: []string{gen}}
+	c := importClient(t, f)
+	c.readProbe = func(context.Context, string) ([]byte, error) {
+		f.metadata = archMeta(ArchKey + "." + gen + "  aarch64")
+
+		return elfHead(62), nil
+	}
+
+	if _, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64"); err != nil {
+		t.Fatalf("LearnArchitectures: %v", err)
+	}
+
+	if f.appliedMetadata[ArchKey+"."+gen] {
+		t.Error("a record written while the generation was read was overwritten")
+	}
+}
+
+// A MAP THAT FAILED IS COULD-NOT-TELL for that generation alone.
+func TestLearnArchitecturesKeepsAGenerationItCouldNotMapUnknown(t *testing.T) {
+	t.Parallel()
+
+	f := &importFake{snapshots: []string{"g20260802000000"}, failOn: "device map",
+		failErr: errors.New("rbd: map failed: (110) Connection timed out")}
+	c := importClient(t, f)
+
+	learned, err := c.LearnArchitectures(t.Context(), "ubuntu-2404-x64")
+	if err != nil || len(learned) != 1 || learned[0].Err == nil || learned[0].Machine != "" {
+		t.Fatalf("LearnArchitectures = %+v, %v, want the generation unknown with its reason", learned, err)
+	}
+
+	if f.ranWith("image-meta", "set") || f.ranWith("lock", "add") {
+		t.Errorf("nothing was read and something was recorded; billet ran %v", f.calls)
+	}
+}

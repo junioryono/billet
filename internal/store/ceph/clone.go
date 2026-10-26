@@ -71,7 +71,20 @@ func (c *Client) ResolveGeneration(ctx context.Context, image, guestContract str
 			"deployment accepted, and no tier boots one", bounded(image))
 	}
 
-	if !found || generation != Verified {
+	if !found {
+		return image, nil
+	}
+
+	// AN EXACT GENERATION IS NEVER ANOTHER MACHINE'S EITHER: pinning is a decision,
+	// and one a host of the other architecture cannot carry out, so it is refused
+	// here rather than booting into a kernel panic inside somebody's job.
+	if generation != Verified {
+		if _, isGeneration := ParseGeneration(generation); isGeneration {
+			if err := c.refuseOtherMachine(ctx, name, generation); err != nil {
+				return "", err
+			}
+		}
+
 		return image, nil
 	}
 

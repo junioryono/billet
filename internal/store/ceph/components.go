@@ -74,6 +74,10 @@ func (c *Client) ResolveCompletionRoot(ctx context.Context, ref, guestContract s
 		return "", fmt.Errorf("ceph: %s is not a completion root", bounded(ref))
 	}
 
+	if err := c.refuseOtherMachine(ctx, image, snapshot); err != nil {
+		return "", err
+	}
+
 	contract, ok, err := c.GuestContract(ctx, image, snapshot)
 	if err != nil {
 		return "", err
@@ -133,7 +137,7 @@ func (c *Client) RemoveCompletionRoots(ctx context.Context, image, owner string)
 		}
 
 		c.removeGenerationMetadata(ctx, image, snap,
-			KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
+			ArchKey, KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
 	}
 
 	return errors.Join(errs...)

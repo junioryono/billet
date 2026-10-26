@@ -31,6 +31,22 @@ const cacheConnectionLimit = 128
 // processes on a host from unmapping each other's read-only generation maps.
 const generationMapLockName = "ceph-generation-maps.lock"
 
+// GenerationMapLock is the option that holds a Ceph client's read-only generation
+// maps under this host's generation-map lock, or none when the node names no
+// lock_dir: the node's cache store and a pull reading a golden image's generations
+// take the same lock, so neither unmaps what the other is reading.
+//
+// THE NODE'S LOCK DIRECTORY, because only billet's account can write it: a lock
+// file another account could create could be held to stop every generation check
+// on the host.
+func GenerationMapLock(cfg *config.Config) []ceph.Option {
+	if cfg.Node == nil || cfg.Node.LockDir == "" {
+		return nil
+	}
+
+	return []ceph.Option{ceph.WithGenerationMapLock(filepath.Join(cfg.Node.LockDir, generationMapLockName))}
+}
+
 // NodeCacheControl is what the node's cache service asks the control plane:
 // the kill switch, and what a job may publish. The node client is both.
 type NodeCacheControl interface {
@@ -78,15 +94,8 @@ func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store,
 		// THE NODE IT MAPS FOR, recorded on every writable volume it maps: the
 		// mapping table is the host's, so only that record proves a leftover
 		// mapping this node's rather than another identity's on the same host.
-		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg)),
-			ceph.WithMapOwner(deployment + "/" + cfg.Node.Name)}
-		// THE NODE'S LOCK DIRECTORY, because only billet's account can write it:
-		// a lock file another account could create could be held to stop every
-		// generation check on the host.
-		if cfg.Node.LockDir != "" {
-			options = append(options,
-				ceph.WithGenerationMapLock(filepath.Join(cfg.Node.LockDir, generationMapLockName)))
-		}
+		options := append([]ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg)),
+			ceph.WithMapOwner(deployment + "/" + cfg.Node.Name)}, GenerationMapLock(cfg)...)
 
 		return ceph.New(*cfg.Node.Ceph, options...)
 	case config.ProviderEC2:

@@ -713,17 +713,40 @@ type recordingPublisher struct {
 	// published -- the pull must still hold it then -- and a check made after
 	// cmdImagesPull returns cannot see that at all.
 	onImport func()
+
+	// learnErr is what LearnArchitectures answers; learned is the image of each
+	// call, in order, with "sweep" for each SweepGenerationMaps.
+	learnErr error
+	learned  []string
 }
 
 type publishedGeneration struct {
-	image, rawPath, runnerVersion, kernel, guestContract string
-	components                                           *ceph.GenerationComponents
-	completionRootOwner                                  string
+	image, rawPath, machine, runnerVersion, kernel, guestContract string
+	components                                                    *ceph.GenerationComponents
+	completionRootOwner                                           string
+}
+
+func (p *recordingPublisher) SweepGenerationMaps(context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.learned = append(p.learned, "sweep")
+
+	return nil
+}
+
+func (p *recordingPublisher) LearnArchitectures(_ context.Context, image string) ([]ceph.ArchLearned, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.learned = append(p.learned, image)
+
+	return nil, p.learnErr
 }
 
 func (p *recordingPublisher) ImportCompletedGeneration(
 	_ context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	components *ceph.GenerationComponents,
 	_ time.Time,
 ) (string, error) {
@@ -737,7 +760,7 @@ func (p *recordingPublisher) ImportCompletedGeneration(
 	defer p.mu.Unlock()
 
 	p.seen = append(p.seen, publishedGeneration{
-		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
+		image: image, rawPath: rawPath, machine: machine, runnerVersion: runnerVersion,
 		kernel: kernel, guestContract: guestContract, components: components,
 	})
 
@@ -752,7 +775,7 @@ func (p *recordingPublisher) ImportCompletedGeneration(
 // the image name and the c snapshot it answers.
 func (p *recordingPublisher) ImportCompletionRoot(
 	_ context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract, owner string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract, owner string,
 	_ time.Time,
 ) (string, error) {
 	if p.onImport != nil {
@@ -763,7 +786,7 @@ func (p *recordingPublisher) ImportCompletionRoot(
 	defer p.mu.Unlock()
 
 	p.seen = append(p.seen, publishedGeneration{
-		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
+		image: image, rawPath: rawPath, machine: machine, runnerVersion: runnerVersion,
 		kernel: kernel, guestContract: guestContract, completionRootOwner: owner,
 	})
 
@@ -1047,4 +1070,50 @@ tiers:
 	recordSilentControlPlane(t, filepath.Join(dir, "server"), filepath.Join(dir, "node"))
 
 	return cfgPath
+}
+
+// A PULL READS THE ARCHITECTURE OF EVERY GENERATION THAT RECORDS NONE BEFORE IT
+// IMPORTS, having swept the read-only maps a crash left, and records its own
+// manifest's on the generation it makes (ADR-022).
+func TestAPullLearnsTheImagesArchitecturesThenImportsItsOwn(t *testing.T) {
+	fixture := newPullFixture(t)
+
+	var learnedBeforeImport []string
+
+	fixture.publisher.onImport = func() {
+		fixture.publisher.mu.Lock()
+		learnedBeforeImport = slices.Clone(fixture.publisher.learned)
+		fixture.publisher.mu.Unlock()
+	}
+
+	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
+
+	if err := fixture.pull(t); err != nil {
+		t.Fatalf("images pull: %v", err)
+	}
+
+	if want := []string{"sweep", "ubuntu-2404-x64"}; !slices.Equal(learnedBeforeImport, want) {
+		t.Errorf("before the import the pull had %v, want %v", learnedBeforeImport, want)
+	}
+
+	if got := fixture.publisher.last().machine; got != fixture.manifest.Arch || got == "" {
+		t.Errorf("the generation was imported as %q, want its manifest's %q", got, fixture.manifest.Arch)
+	}
+}
+
+// AND A PULL THAT CANNOT READ THEM IMPORTS NOTHING.
+func TestAPullThatCannotReadTheImagesArchitecturesImportsNothing(t *testing.T) {
+	fixture := newPullFixture(t)
+	fixture.publisher.learnErr = errors.New("the publish lock is held")
+
+	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
+
+	err := fixture.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "nothing was imported") {
+		t.Fatalf("images pull = %v, want the pull refused before the import", err)
+	}
+
+	if got := fixture.publisher.calls(); got != 0 {
+		t.Errorf("the import was reached %d times", got)
+	}
 }

@@ -12,7 +12,7 @@ func TestACompletedGenerationRecordsItsComponentsSorted(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 	f := &importFake{device: device}
 
-	gen, err := importClient(t, f).ImportCompletedGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	gen, err := importClient(t, f).ImportCompletedGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "", "7", &GenerationComponents{
 			LeftOut:   []string{"google-chrome", "android-sdk"},
 			Installed: map[string]string{"google-chrome": "155.0.8059.84"},
@@ -33,7 +33,7 @@ func TestAGenerationThatLeftNothingOutRecordsNoComponents(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 	f := &importFake{device: device}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "", "7", importAt); err != nil {
 		t.Fatalf("import: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestAGenerationWhoseComponentsCannotBeRecordedIsWithdrawn(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 	f := &importFake{device: device, failMetaSetKey: ComponentsKey + "." + generation}
 
-	_, err := importClient(t, f).ImportCompletedGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	_, err := importClient(t, f).ImportCompletedGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7",
 		&GenerationComponents{LeftOut: []string{"codeql"}}, importAt)
 	if err == nil || !strings.Contains(err.Error(), "its components could not be recorded") {
@@ -88,7 +88,7 @@ func TestAComponentsRecordIsRefusedUnlessItReadsBackAsItself(t *testing.T) {
 			f := &importFake{device: device}
 
 			_, err := importClient(t, f).ImportCompletedGeneration(t.Context(), "ubuntu-2404-x64",
-				raw, "2.336.0", "", "7", &tc.record, importAt)
+				raw, "x86_64", "2.336.0", "", "7", &tc.record, importAt)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("got %v, want a refusal containing %q", err, tc.want)
 			}
@@ -137,7 +137,7 @@ func TestACompletionRootIsImportedUnderItsOwnPrefix(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 	f := &importFake{device: device}
 
-	snap, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0",
+	snap, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0",
 		"vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
 	if err != nil {
 		t.Fatalf("import: %v", err)
@@ -157,7 +157,7 @@ func TestACompletionRootIsImportedUnderItsOwnPrefix(t *testing.T) {
 	}
 
 	if _, err := importClient(t, &importFake{device: device}).ImportCompletionRoot(t.Context(),
-		"ubuntu-2404-x64", raw, "2.336.0", "", "7", " ", importAt); err == nil {
+		"ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", " ", importAt); err == nil {
 		t.Fatal("a completion root with no owner was imported")
 	}
 }
@@ -240,7 +240,7 @@ func TestACompletionRootsOwnerIsRecordedBeforeItsSnapshot(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 	f := &importFake{device: device}
 
-	snap, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "",
+	snap, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "",
 		"7", "epyc-1", importAt)
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +277,7 @@ func TestACompletionRootsOwnerIsRecordedBeforeItsSnapshot(t *testing.T) {
 			f := tc.fake
 			f.device = device
 
-			if _, err := importClient(t, &f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0",
+			if _, err := importClient(t, &f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0",
 				"", "7", "epyc-1", importAt); err == nil {
 				t.Fatal("a completion root whose create failed was reported as made")
 			}
@@ -305,7 +305,7 @@ func TestACompletionRootNameAlreadyTakenIsRefused(t *testing.T) {
 			raw, device := stageRaw(t, "content")
 			f.device = device
 
-			_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "2.336.0",
+			_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0",
 				"", "7", "epyc-1", importAt)
 			if err == nil || !strings.Contains(err.Error(), "is already taken") {
 				t.Fatalf("got %v, want the taken name refused", err)
@@ -338,7 +338,7 @@ func TestAReservationClearsOwnerKeysWhoseSnapshotIsGone(t *testing.T) {
 			CompletionRootOwnerKey + "." + theirs + "  epyc-3\n",
 	}
 
-	if _, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+	if _, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt); err != nil {
 		t.Fatalf("import: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestAReservationOnAListingThatAnswersENOENTClearsNothing(t *testing.T) {
 		metadata:       "Key  Value\n" + CompletionRootOwnerKey + "." + live + "  epyc-1\n",
 	}
 
-	_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+	_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
 	if err == nil || !strings.Contains(err.Error(), "list the snapshots") {
 		t.Fatalf("got %v, want the import refused on a listing that could not be read", err)
@@ -417,7 +417,7 @@ func TestAListingThatAnswersENOENTIsAbsenceOnlyWhenTheImageIs(t *testing.T) {
 				metadata:       "Key  Value\n" + CompletionRootOwnerKey + "." + orphan + "  epyc-1\n",
 			}
 
-			_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+			_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 				"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
 			if tc.published {
 				if err != nil {
@@ -453,7 +453,7 @@ func TestACompletionRootThatCouldNotBeWithdrawnKeepsItsOwner(t *testing.T) {
 		failSnapRemove: true,
 	}
 
-	_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw,
+	_, err := importClient(t, f).ImportCompletionRoot(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", "epyc-1", importAt)
 	if err == nil || !strings.Contains(err.Error(), "could not be withdrawn") {
 		t.Fatalf("got %v, want the root reported as still there", err)

@@ -46,13 +46,16 @@ const MaxImageBytes = 1 << 40
 // snapshots OF one head image, so a pull that imported to a fresh image would
 // publish a generation of something else, which no tier could name and no clone
 // could descend from.
+//
+// machine is what the image was built for, as its manifest spells it, and is
+// recorded on the generation (ArchKey).
 func (c *Client) ImportGeneration(
 	ctx context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	now time.Time,
 ) (string, error) {
-	return c.ImportCompletedGeneration(ctx, image, rawPath, runnerVersion, kernel, guestContract,
-		nil, now)
+	return c.ImportCompletedGeneration(ctx, image, rawPath, machine, runnerVersion, kernel,
+		guestContract, nil, now)
 }
 
 // ImportCompletedGeneration is ImportGeneration for an image that left components
@@ -61,11 +64,11 @@ func (c *Client) ImportGeneration(
 // that left nothing out, and records nothing.
 func (c *Client) ImportCompletedGeneration(
 	ctx context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	components *GenerationComponents,
 	now time.Time,
 ) (string, error) {
-	return c.importSnapshot(ctx, GenerationPrefix, image, rawPath, runnerVersion, kernel,
+	return c.importSnapshot(ctx, GenerationPrefix, image, rawPath, machine, runnerVersion, kernel,
 		guestContract, components, "", now)
 }
 
@@ -75,14 +78,14 @@ func (c *Client) ImportCompletedGeneration(
 // kernel and contract a launch reads and owner, the node that may remove it.
 func (c *Client) ImportCompletionRoot(
 	ctx context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract, owner string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract, owner string,
 	now time.Time,
 ) (string, error) {
 	if strings.TrimSpace(owner) == "" {
 		return "", fmt.Errorf("ceph: a completion root needs an owner, or no pull could remove it")
 	}
 
-	return c.importSnapshot(ctx, CompletionRootPrefix, image, rawPath, runnerVersion, kernel,
+	return c.importSnapshot(ctx, CompletionRootPrefix, image, rawPath, machine, runnerVersion, kernel,
 		guestContract, nil, owner, now)
 }
 
@@ -113,7 +116,7 @@ func (c *Client) reserveCompletionRoot(ctx context.Context, image, name string) 
 	for snap := range owners {
 		if !slices.Contains(names, snap) {
 			c.removeGenerationMetadata(ctx, image, snap,
-				KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
+				ArchKey, KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
 		}
 	}
 
@@ -124,11 +127,16 @@ func (c *Client) reserveCompletionRoot(ctx context.Context, image, name string) 
 // with its metadata, inside the publish lock.
 func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap reports through the return value; a local set inside a defer is read after the return value has already been computed, which is the dead-code bug this shape replaced
 	ctx context.Context,
-	prefix, image, rawPath, runnerVersion, kernel, guestContract string,
+	prefix, image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	components *GenerationComponents,
 	owner string,
 	now time.Time,
 ) (generation string, err error) {
+	if strings.TrimSpace(machine) == "" {
+		return "", fmt.Errorf("ceph: an import into %s needs the machine its image was built for, "+
+			"or the generation could not be held to the hosts that may boot it", image)
+	}
+
 	if components != nil {
 		if err := components.validate(); err != nil {
 			return "", err
@@ -205,6 +213,11 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 		if err := c.reserveCompletionRoot(ctx, image, generation); err != nil {
 			return "", err
 		}
+	}
+
+	// ONE ARCHITECTURE AN IMAGE, judged under the lock, before the head is touched.
+	if err := c.checkImportArch(ctx, image, machine); err != nil {
+		return "", err
 	}
 
 	if err := c.ensureHead(ctx, image, wantMB); err != nil {
@@ -319,9 +332,23 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 
 		return "", fmt.Errorf("ceph: could not publish %s@%s: %w", image, generation, err)
 	}
-	attemptedMetadata := make([]string, 0, 5)
+	attemptedMetadata := make([]string, 0, 6)
 	if owner != "" {
 		attemptedMetadata = append(attemptedMetadata, CompletionRootOwnerKey)
+	}
+
+	// THE ARCHITECTURE FIRST, so the moment the generation exists without it, when
+	// it would resolve on a host of either, is as short as it can be; withdrawn
+	// without it, like every other field.
+	attemptedMetadata = append(attemptedMetadata, ArchKey)
+	if setErr := c.SetArch(ctx, image, generation, machine); setErr != nil {
+		if rmErr := c.withdrawGeneration(ctx, image, generation, attemptedMetadata); rmErr != nil {
+			return "", fmt.Errorf("ceph: %s@%s was published, its architecture could not be "+
+				"recorded (%w), and it could not be withdrawn (%w)", image, generation, setErr, rmErr)
+		}
+
+		return "", fmt.Errorf("ceph: %s could not be published because its architecture could "+
+			"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
 	}
 
 	// RECORDED PER GENERATION, because a tier boots a generation rather than the

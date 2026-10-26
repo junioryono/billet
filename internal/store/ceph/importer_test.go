@@ -233,6 +233,17 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 
 			return []byte(f.contract + "\n"), nil
 		}
+		// AN ARCHITECTURE IS READ FROM THE TABLE a listing answers, so one fixture
+		// says the same thing to `get` and to `list`.
+		if slices.Contains(args, "get") && strings.Contains(args[len(args)-1], ArchKey+".") {
+			for line := range strings.SplitSeq(f.metadata, "\n") {
+				if key, value, ok := strings.Cut(strings.TrimSpace(line), " "); ok && key == args[len(args)-1] {
+					return []byte(strings.TrimSpace(value) + "\n"), nil
+				}
+			}
+
+			return nil, errors.New("rbd: (2) No such file or directory")
+		}
 
 		return []byte(""), nil
 	case "snap":
@@ -389,6 +400,25 @@ func (f *importFake) deadlineOf(fragments ...string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// lastDeadlineOf is deadlineOf for the last invocation matching fragments, for a
+// command an import issues before the step under test as well as in it (the
+// snapshot listing its architecture check reads under the lock).
+func (f *importFake) lastDeadlineOf(fragments ...string) (time.Time, bool) {
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		if !matchesCall(f.calls[i], fragments) {
+			continue
+		}
+
+		if f.deadlines[i].IsZero() {
+			return time.Time{}, false
+		}
+
+		return f.deadlines[i], true
+	}
+
+	return time.Time{}, false
+}
+
 // matchesCall is the predicate ranWith and deadlineOf share, so the two cannot
 // disagree about which invocation a test is naming.
 func matchesCall(call, fragments []string) bool {
@@ -470,7 +500,7 @@ func TestImportGenerationWritesTheImageAndPublishesIt(t *testing.T) {
 
 	f := &importFake{device: device}
 
-	gen, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	gen, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
@@ -508,7 +538,7 @@ func TestImportGenerationCreatesTheHeadWhenItIsAbsent(t *testing.T) {
 
 	f := &importFake{device: device} // infoJSON empty: rbd answers ENOENT
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err != nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 
@@ -535,7 +565,7 @@ func TestImportGenerationSeparatesAnAbsentImageFromABrokenCluster(t *testing.T) 
 		failErr: errors.New("rbd: couldn't connect to the cluster"),
 	}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("an unreachable cluster was treated as an absent image")
 	}
@@ -553,7 +583,7 @@ func TestImportGenerationGrowsAHeadThatIsTooSmall(t *testing.T) {
 
 	f := &importFake{device: device, infoJSON: `{"size": 2097152}`} // 2 MiB
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err != nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 
@@ -569,7 +599,7 @@ func TestImportGenerationLeavesALargerHeadAlone(t *testing.T) {
 
 	f := &importFake{device: device, infoJSON: fmt.Sprintf(`{"size": %d}`, 8*1024*1024)}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err != nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 
@@ -586,7 +616,7 @@ func TestImportGenerationUnmapsBeforeItSnapshots(t *testing.T) {
 
 	f := &importFake{device: device}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err != nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 
@@ -627,7 +657,7 @@ func TestImportGenerationUnmapsEvenWhenTheWriteFails(t *testing.T) {
 	// A directory cannot be opened for writing, so the write fails after the map.
 	f := &importFake{device: filepath.Dir(device)}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err == nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err == nil {
 		t.Fatal("writing to a directory was reported as a successful import")
 	}
 
@@ -641,7 +671,7 @@ func TestImportGenerationRefusesAnEmptyImage(t *testing.T) {
 
 	f := &importFake{device: device}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("an empty file was published as a generation")
 	}
@@ -676,7 +706,7 @@ func TestImportGenerationRefusesAnUnaddressableImageName(t *testing.T) {
 		f := &importFake{device: device}
 
 		if _, err := importClient(t, f).ImportGeneration(
-			t.Context(), name, raw, "2.336.0", "", "7", importAt); err == nil {
+			t.Context(), name, raw, "x86_64", "2.336.0", "", "7", importAt); err == nil {
 			t.Errorf("%q was accepted as an image name", name)
 		}
 	}
@@ -695,7 +725,7 @@ func TestImportGenerationStandsDownWhileAnotherPublisherHoldsTheLock(t *testing.
 		lockHeld: fmt.Sprintf("billet-build-otherhost-123-%d", importAt.Add(-time.Minute).Unix()),
 	}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("an import proceeded while another publisher held the lock")
 	}
@@ -721,7 +751,7 @@ func TestImportGenerationBreaksALockNoRunCouldStillBeHolding(t *testing.T) {
 			importAt.Add(-StaleLockAfter-time.Hour).Unix()),
 	}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err != nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err != nil {
 		t.Fatalf("a lock older than any run could be was not broken: %v", err)
 	}
 
@@ -741,7 +771,7 @@ func TestImportGenerationDoesNotBreakALockJustUnderTheBound(t *testing.T) {
 			importAt.Add(-StaleLockAfter+time.Minute).Unix()),
 	}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err == nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err == nil {
 		t.Fatal("a lock just inside the bound was broken")
 	}
 
@@ -757,7 +787,7 @@ func TestImportGenerationNeverBreaksALockItCannotDate(t *testing.T) {
 
 	f := &importFake{device: device, lockHeld: "somebody-elses-tool"}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err == nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err == nil {
 		t.Fatal("a lock of unknown age was broken")
 	}
 
@@ -783,7 +813,7 @@ func TestImportGenerationReleasesTheLockOnBothPaths(t *testing.T) {
 
 			f := &importFake{device: device}
 
-			_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+			_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 
 			if tc.wantErr && err == nil {
 				t.Fatal("expected a failure")
@@ -809,7 +839,7 @@ func TestImportGenerationReportsAnUnmapThatFailedAfterAGoodWrite(t *testing.T) {
 
 	f := &importFake{device: device, unmapErr: errors.New("exit status 16")}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("an import whose head could not be unmapped was reported as a success; the " +
 			"next import would map the same head a second time")
@@ -831,9 +861,9 @@ func TestImportGenerationReportsAnUnmapThatFailedAfterAGoodWrite(t *testing.T) {
 func TestImportGenerationWithdrawsASnapshotItCannotDescribe(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 
-	f := &importFake{device: device, failOn: "image-meta"}
+	f := &importFake{device: device, failMetaSetKey: RunnerVersionKey + ".g20260815041709"}
 
-	gen, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	gen, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("a generation whose runner version could not be recorded was published")
 	}
@@ -872,7 +902,7 @@ func TestImportGenerationSaysWhenItIsThePoolThatIsMissing(t *testing.T) {
 
 	f := &importFake{device: device, poolMissing: true}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("an import into a pool that does not exist reported success")
 	}
@@ -904,7 +934,7 @@ func TestImportGenerationRoundsUpToWholeMegabytes(t *testing.T) {
 
 			f := &importFake{device: device}
 
-			if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err != nil {
+			if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err != nil {
 				t.Fatalf("import: %v", err)
 			}
 
@@ -922,9 +952,9 @@ func TestImportGenerationRoundsUpToWholeMegabytes(t *testing.T) {
 func TestImportGenerationRefusesToRepublishAnExistingGenerationName(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 
-	f := &importFake{device: device, failOn: "snap"}
+	f := &importFake{device: device, failSnapCreate: true}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("a colliding snapshot name was reported as a successful publish")
 	}
@@ -947,7 +977,7 @@ func TestImportGenerationReportsTheWriteFailureNotTheCleanupFailure(t *testing.T
 		unmapErr: errors.New("exit status 16"),
 	}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("writing to a directory was reported as a successful import")
 	}
@@ -1020,7 +1050,7 @@ func TestImportGenerationReleasesTheLockEvenWhenTheContextIsDone(t *testing.T) {
 	// real deadline expires: during the multi-gigabyte write that follows.
 	f := &importFake{device: device, cancelOn: "device map", cancel: cancel}
 
-	_, err := importClient(t, f).ImportGeneration(ctx, "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(ctx, "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("an import whose context expired partway through reported success")
 	}
@@ -1063,7 +1093,7 @@ func TestImportGenerationWillNotBreakALockWhoseHolderIsStillAlive(t *testing.T) 
 		},
 	}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt)
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt)
 	if err == nil {
 		t.Fatal("an import broke the lock of a holder that was still heartbeating; that " +
 			"puts two writers on one head image")
@@ -1099,7 +1129,7 @@ func TestImportGenerationStillBreaksASilentLockPastTheBound(t *testing.T) {
 		heartbeat: func() (string, bool) { return "42", true }, // frozen: not counting
 	}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "2.336.0", "", "7", importAt); err != nil {
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64", "2.336.0", "", "7", importAt); err != nil {
 		t.Fatalf("a silent lock past the bound was not reclaimed: %v", err)
 	}
 
@@ -1311,7 +1341,7 @@ func TestImportGenerationRecordsTheKernelBeforeReleasingTheLock(t *testing.T) {
 
 	f := &importFake{device: device}
 
-	gen, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	gen, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
 	if err != nil {
 		t.Fatalf("import: %v", err)
@@ -1352,9 +1382,9 @@ func TestImportGenerationRecordsTheKernelBeforeReleasingTheLock(t *testing.T) {
 func TestImportGenerationWithdrawsASnapshotWhoseKernelCannotBeRecorded(t *testing.T) {
 	raw, device := stageRaw(t, "content")
 
-	f := &importFake{device: device, failOn: "image-meta"}
+	f := &importFake{device: device, failMetaSetKey: KernelKey + ".g20260815041709"}
 
-	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt); err == nil {
 		t.Fatal("a generation whose kernel could not be recorded was published")
 	}
@@ -1394,7 +1424,7 @@ func TestImportGenerationRemovesMetadataForAWithdrawnSnapshot(t *testing.T) {
 			f := &importFake{device: device, failMetaSetKey: tc.failKey}
 
 			if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64",
-				raw, "2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt); err == nil {
+				raw, "x86_64", "2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt); err == nil {
 				t.Fatal("an import whose generation metadata failed was reported as published")
 			}
 			if !f.ranWith("snap", "rm", "ubuntu-2404-x64@"+generation) {
@@ -1428,7 +1458,7 @@ func TestImportGenerationKeepsMetadataWhenSnapshotWithdrawalFails(t *testing.T) 
 		failSnapRemove: true,
 	}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
 	if err == nil {
 		t.Fatal("an import whose incomplete snapshot could not be withdrawn reported success")
@@ -1453,7 +1483,7 @@ func TestImportGenerationCleansMetadataWhenSnapshotRemovalResponseIsLost(t *test
 		failSnapRemoveApplied: true,
 	}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
 	if err == nil {
 		t.Fatal("an import whose guest contract failed reported success")
@@ -1523,7 +1553,7 @@ func TestImportGenerationConfirmsRemovalAfterCallerAndRemovalDeadlinesExpire(t *
 		widened = true
 	}
 
-	_, err := c.ImportGeneration(ctx, "ubuntu-2404-x64", raw,
+	_, err := c.ImportGeneration(ctx, "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("metadata cancellation returned %v, want context cancellation", err)
@@ -1569,7 +1599,7 @@ func TestImportGenerationConfirmsRemovalAfterCallerAndRemovalDeadlinesExpire(t *
 			[]string{"image-meta", "remove", RunnerVersionKey + "." + generation},
 		},
 	} {
-		at, ok := f.deadlineOf(step.fragments...)
+		at, ok := f.lastDeadlineOf(step.fragments...)
 		if !ok {
 			t.Errorf("%s never ran under a deadline of any kind; billet ran %v", step.what, f.calls)
 
@@ -1594,7 +1624,7 @@ func TestImportGenerationMetadataCleanupIsBestEffortAfterWithdrawal(t *testing.T
 		failMetaRemove: true,
 	}
 
-	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
 	if err == nil {
 		t.Fatal("an import with no runner version reported success")
@@ -1619,7 +1649,7 @@ func TestImportGenerationWithdrawsAfterMetadataCancellation(t *testing.T) {
 		cancel:           cancel,
 	}
 
-	_, err := importClient(t, f).ImportGeneration(ctx, "ubuntu-2404-x64", raw,
+	_, err := importClient(t, f).ImportGeneration(ctx, "ubuntu-2404-x64", raw, "x86_64",
 		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("metadata cancellation returned %v, want context cancellation", err)

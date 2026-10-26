@@ -147,11 +147,7 @@ func (c *Client) unmapGenerationMaps(ctx context.Context) error {
 
 	var failures []error
 	for _, d := range devices {
-		// A NAME BILLET GIVES A GENERATION, EXACTLY, as every destructive pass
-		// requires: a lookalike an operator mapped by hand is not billet's to unmap.
-		kind, _, named := cacheImageName(d.Name)
-		if d.Pool != c.cfg.CachePool || !named || kind != "g" ||
-			d.Snap == "" || d.Snap == "-" || d.Device == "" {
+		if !c.generationMap(d) {
 			continue
 		}
 		// NO UNMAP STARTS PAST THE BUDGET. One already started runs to its own
@@ -169,6 +165,40 @@ func (c *Client) unmapGenerationMaps(ctx context.Context) error {
 	}
 
 	return errors.Join(failures...)
+}
+
+// generationMap reports whether a kernel mapping is a read-only map of a
+// generation's snapshot, which only withGenerationMap makes: a cache generation's,
+// or a golden image's that LearnArchitectures reads.
+//
+// A NAME BILLET GIVES A GENERATION, EXACTLY, as every destructive pass requires: a
+// lookalike an operator mapped by hand is not billet's to unmap. A head (`-`), which
+// an import writes through, and a completion root are neither.
+func (c *Client) generationMap(d mappedDevice) bool {
+	if d.Snap == "" || d.Snap == "-" || d.Device == "" || d.Namespace != "" {
+		return false
+	}
+
+	switch d.Pool {
+	case c.cfg.CachePool:
+		kind, _, named := cacheImageName(d.Name)
+
+		return named && kind == "g"
+	case c.cfg.ImagePool:
+		_, isGeneration := ParseGeneration(d.Snap)
+
+		return isGeneration && checkCloneName(d.Name) == nil
+	default:
+		return false
+	}
+}
+
+// SweepGenerationMaps unmaps the read-only generation mappings a crash or a failed
+// unmap left behind, under the host's generation-map lock: a pull or refresh runs
+// it first, so a golden image's snapshot LearnArchitectures left mapped is not
+// mapped twice.
+func (c *Client) SweepGenerationMaps(ctx context.Context) error {
+	return c.sweepGenerationMaps(ctx)
 }
 
 // sweepGenerationMaps unmaps the read-only generation mappings a crash or a

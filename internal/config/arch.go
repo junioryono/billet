@@ -38,6 +38,31 @@ func HostArch(goarch string) (Arch, bool) {
 	}
 }
 
+// Machine is the architecture as `uname -m` spells it, which is what a guest
+// image's manifest records and what a generation imported from one records
+// (ADR-022); empty for a name billet does not know.
+func (a Arch) Machine() string {
+	switch a {
+	case ArchX64:
+		return "x86_64"
+	case ArchARM64:
+		return "aarch64"
+	default:
+		return ""
+	}
+}
+
+// HostMachine is the machine a host whose Go runtime reports goarch is, as
+// `uname -m` spells it, or goarch itself on one billet builds no images for, so
+// a comparison with a manifest still fails rather than matching nothing.
+func HostMachine(goarch string) string {
+	if a, ok := HostArch(goarch); ok {
+		return a.Machine()
+	}
+
+	return goarch
+}
+
 // ArchFromEC2 is the architecture EC2 names x86_64 or arm64 (an AMI's
 // Architecture, an instance type's supported architectures), and false for
 // every other name (i386, the Mac forms), which billet launches no Linux image

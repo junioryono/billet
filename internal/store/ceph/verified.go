@@ -227,6 +227,7 @@ func (c *Client) newestGeneration(
 
 	verified := map[string]bool{}
 	contracts := map[string]string{}
+	arches := parseGenerationArches(out)
 
 	// THE TABLE IS PARSED RATHER THAN ASKED PER KEY, because the generations are not
 	// known in advance. `image-meta list` prints a heading and then `key<spaces>value`
@@ -265,6 +266,11 @@ func (c *Client) newestGeneration(
 			continue
 		}
 		if contract != "" && contracts[gen.Name] != contract {
+			continue
+		}
+		// NEVER ANOTHER MACHINE'S (ADR-022). One that records none resolves as it
+		// always did, on any host.
+		if c.otherMachine(arches[gen.Name]) {
 			continue
 		}
 

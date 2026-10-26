@@ -491,6 +491,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			// firing, which looks exactly like one that is working.
 			reportGuestImageFreshness(ctx, env, cfg)
 			opsimages.ReportImageComponents(ctx, env, cfg)
+			opsimages.ReportImageArchitectures(ctx, env, cfg)
 			if !skipNetworkProbes {
 				opsimages.ReportChannelImage(ctx, env, cfg)
 			}
