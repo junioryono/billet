@@ -211,6 +211,8 @@ func TestResolveReadsTheChannelsArchitectures(t *testing.T) {
 		{name: "manifest names", extra: map[string]any{"architectures": []string{"manifest.json"}}, refused: true},
 		{name: "no x86_64", extra: map[string]any{"architectures": []string{"aarch64"}}, refused: true},
 		{name: "x86_64 and a misspelling", extra: map[string]any{"architectures": []string{"x86_64", "arm64"}}, refused: true},
+		{name: "another case", extra: map[string]any{"architectures": []string{"x86_64", "ARM64"}}, refused: true},
+		{name: "a known name in another case", extra: map[string]any{"architectures": []string{"x86_64", "AARCH64"}}, refused: true},
 		{name: "a file", extra: map[string]any{"architectures": []string{"x86_64", "manifest-aarch64.json"}}, refused: true},
 		{name: "a machine this reader does not know", extra: map[string]any{"architectures": []string{"x86_64", "riscv64"}},
 			said: true, list: []string{"x86_64", "riscv64"}},

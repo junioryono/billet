@@ -12,6 +12,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"time"
 )
@@ -52,6 +53,10 @@ var errForbidden = errors.New("imagesource: the source refused the request")
 // they are some other vocabulary's (billet's, Go's) for a machine `uname -m` spells
 // otherwise, and a reader would take each for a machine the release leaves out.
 var misspelledMachines = []string{"x64", "arm64", "amd64"}
+
+// unameMachine is the shape of a `uname -m` name, lowercase as uname prints it, so
+// a channel list in another case (ARM64) is refused with the other spellings.
+var unameMachine = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
 
 // ErrNoImageForMachine is the signed channel saying its current release carries no
 // image for this machine: final until the channel moves, unlike a manifest that
@@ -269,7 +274,7 @@ func (c *Client) adoptChannel(tag string, architectures *[]string) error {
 	if architectures != nil {
 		list := *architectures
 		if !slices.Contains(list, manifestMachine) || slices.ContainsFunc(list, func(m string) bool {
-			return slices.Contains(misspelledMachines, m) || !archPattern.MatchString(m)
+			return slices.Contains(misspelledMachines, m) || !unameMachine.MatchString(m)
 		}) {
 			return fmt.Errorf("imagesource: the guest-image channel lists architectures %v, which a "+
 				"reader cannot take at its word: they are `uname -m` names and include %s", list,

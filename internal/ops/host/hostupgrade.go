@@ -2312,7 +2312,7 @@ func (h *systemdHost) PrepareImages(ctx context.Context) error {
 	err := h.runStaged(ctx, "images", "compatible", "--config", h.configPath(),
 		"--result-file", result)
 	if err == nil {
-		fmt.Fprintf(h.env.Stdout, "  the candidate has no guest image to prepare on this host\n")
+		fmt.Fprintf(h.env.Stdout, "  the candidate has nothing to prepare among this host's guest images\n")
 
 		return nil
 	}
