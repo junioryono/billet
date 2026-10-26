@@ -230,7 +230,7 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		listener = "#!/bin/sh\nexit 1\n"
 	}
 
-	writeFile(t, filepath.Join(runnerDir, "bin", "Runner.Listener"), listener, 0o755)
+	writeExecutableFile(t, filepath.Join(runnerDir, "bin", "Runner.Listener"), listener)
 
 	console := filepath.Join(root, "console")
 	if p.unwritableConsole {
