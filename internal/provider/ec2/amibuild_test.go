@@ -968,6 +968,28 @@ func TestADamagedRepeatOfTheSuccessDoesNotEndTheBuild(t *testing.T) {
 	}
 }
 
+// A FAILURE SAID AFTER THE SUCCESS STILL ENDS THE BUILD: a builder rebooted during
+// its dwell runs the bootstrap again, and nothing it says next is ignored because a
+// success came first.
+func TestAFailureAfterTheSuccessEndsTheBuild(t *testing.T) {
+	t.Parallel()
+
+	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available",
+		dwellPolls: 3, failsAfterSuccess: true}
+
+	f := newFakeEC2(t)
+	f.respond = b.serve(f)
+
+	if _, err := newTestProvider(t, f, nil).BuildImage(t.Context(), verifyingBuild()); err == nil ||
+		!strings.Contains(err.Error(), "failed in "+bootstrapStep) {
+		t.Fatalf("a failure after the success was answered %v", err)
+	}
+
+	if n := f.countOf("CreateImage"); n != 0 {
+		t.Errorf("%d images were registered from a builder that failed after its success", n)
+	}
+}
+
 // A FEW FAILED POLLS IN A ROW ARE A NETWORK THAT WENT AWAY, NOT A BUILD THAT
 // FAILED; past maxBuildPollFailures the wait gives up, and nothing is imaged.
 func TestAFewFailedPollsDoNotEndABuild(t *testing.T) {
@@ -1131,6 +1153,19 @@ func TestThePayloadUnpacksIntoARootOnlyDirectory(t *testing.T) {
 	env, err := os.Stat(filepath.Join(root, "var", "lib", "billet-ami", "build.env"))
 	if err != nil || env.Mode().Perm() != 0o600 {
 		t.Errorf("build.env unpacked as %v (%v), want 600", env, err)
+	}
+}
+
+// A KEY TWICE IS NO REPORT: billet writes each once, so a second is the machine's,
+// and which of the two is billet's cannot be told.
+func TestAReportWithAKeyTwiceIsNoReport(t *testing.T) {
+	t.Parallel()
+
+	block := buildBegin + " " + verifyProbeNonce + "\nverdict=ok\nstep=done\ntemplate_step=\n" +
+		"components=\ncomponents=firefox:1\n" + buildEnd + " " + verifyProbeNonce + "\n"
+
+	if report, found := parseReport(block, verifyProbeNonce, newBuildSchema()); found {
+		t.Errorf("a block naming components twice was read as %v", report)
 	}
 }
 

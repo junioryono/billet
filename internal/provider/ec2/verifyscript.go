@@ -235,6 +235,17 @@ var componentPaths = map[string][]string{
 	"microsoft-edge": {"x /usr/bin/microsoft-edge", "d /usr/local/share/edge_driver", "x /usr/bin/msedgedriver"},
 }
 
+// componentVariables is what each component adds to the job's environment, which
+// an image that does not carry it must not name. A test holds it to
+// check-guest-component.sh's own list, which the build's `absent` asked.
+var componentVariables = map[string][]string{
+	"android-sdk":    {"ANDROID_HOME", "ANDROID_SDK_ROOT"},
+	"codeql":         nil,
+	"firefox":        {"GECKOWEBDRIVER"},
+	"google-chrome":  {"CHROME_BIN", "CHROMEWEBDRIVER"},
+	"microsoft-edge": {"EDGEWEBDRIVER"},
+}
+
 // componentRuns is what the runner executes for a component whose paths prove
 // nothing about whether it works. CodeQL's only path is the toolcache directory,
 // which an empty or broken entry also satisfies, so its bundle is run.
@@ -597,7 +608,14 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 	step("components")
 
 	b.WriteString("test -r " + componentsFile + "\n")
-	b.WriteString("billet_components=$(cat " + componentsFile + ")\n")
+
+	// ONE LINE OF A LIST OR NOTHING REACHES THE REPORT: the record is the image's
+	// text, and a second line of it would be a report line of its own choosing. A
+	// newline is outside the list's characters, so the one check refuses both.
+	b.WriteString("billet_record=$(cat " + componentsFile + ")\n")
+	b.WriteString("case \"$billet_record\" in *[!A-Za-z0-9:.,+~_-]*) " +
+		"echo 'the components record is not a list of name:version' >&2; exit 1 ;; esac\n")
+	b.WriteString("billet_components=$billet_record\n")
 	b.WriteString("for billet_c in $(printf '%s' \"$billet_components\" | tr ',' ' '); do\n")
 	b.WriteString("  case \"${billet_c%%:*}\" in\n")
 
@@ -644,12 +662,23 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 	// lets a test point the paths at a fixture.
 	b.WriteString("billet_root=''\n")
 
+	// grep's status is three-valued, and a file it could not read names nothing
+	// only by accident, so the file is proved readable and a status 2 is present.
+	b.WriteString("test -r \"$billet_root\"" + imageEnvFile + " || " +
+		"{ echo 'the job environment cannot be read' >&2; exit 1; }\n")
+
 	for _, name := range names {
 		var present []string
 
 		for _, entry := range componentPaths[name] {
 			_, path, _ := strings.Cut(entry, " ")
 			present = append(present, "[ -e \"$billet_root\""+path+" ] || [ -L \"$billet_root\""+path+" ]")
+		}
+
+		// AND THE JOB'S ENVIRONMENT NAMES NONE OF ITS VARIABLES, as the build's own
+		// absence check asked: a variable pointing at nothing is what a job reads.
+		for _, variable := range componentVariables[name] {
+			present = append(present, "{ grep -q '^"+variable+"=' \"$billet_root\""+imageEnvFile+"; [ $? -ne 1 ]; }")
 		}
 
 		b.WriteString("case \",$billet_components,\" in *\"," + name + ":\"*) ;; *) if " +

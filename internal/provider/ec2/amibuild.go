@@ -303,21 +303,24 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 				"image was made", id)
 
 		case "running":
-			// THE SUCCESS IS READ ONCE. The dwell repeats it until the builder powers
-			// off, and a repeat a kernel line broke is not a reason to terminate a
-			// build that finished.
-			if verdict != nil {
-				break
-			}
-
 			out, err := p.consoleOutput(ctx, id, latest)
 
 			switch {
 			case err == nil:
 				report, found := parseReport(out, spec.nonce, schema)
 				if found {
+					// A FAILURE IS A FAILURE WHENEVER IT IS SAID, a success already
+					// read included: a reboot during the success's dwell runs the
+					// bootstrap again, and what it says next is about this builder.
 					if report[reportVerdictKey] != verdictOK {
 						return "", buildFailure(id, spec.Arch, report)
+					}
+
+					// THE SUCCESS IS READ ONCE. The dwell repeats it until the builder
+					// powers off, and a repeat a kernel line broke is not a reason to
+					// terminate a build that finished.
+					if verdict != nil {
+						break
 					}
 
 					// A SUCCESS IS WHOLE OR IT IS NOT ONE. The parser drops a line it

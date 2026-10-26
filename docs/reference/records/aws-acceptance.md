@@ -115,6 +115,19 @@ Whether a subnet's `MapPublicIpOnLaunch` can substitute for the flag is **not es
 
 `--security-group` is required and billet deliberately does not fall back to the VPC's default group, which allows all traffic between its members.
 
+### From GitHub's template, on both architectures (2026-10-25)
+
+Contract 4 (ADR-022) builds the AMI by running GitHub's `actions/runner-images` template on the builder itself. It was first run by hand on a 200 GiB root in a test account in us-west-2, without the guest-only differences, to learn whether the template needs any EC2-specific change: it did not. GitHub's whole template, its own Pester tests included, passed on Canonical's Ubuntu 24.04 AMI on c7i.4xlarge (x64) and c7g.4xlarge (arm64), peaking at 42 GiB used on x64, before the template's reboot, and 35 GiB on arm64.
+
+Then `billet ami build` ran from an `ec2` orchestrator instance in the same account, through billet's own code path end to end: staging, the bootstrap, the build unit across the template's reboot, the console verdict, `CreateImage`, the verifier's boot and the promotion.
+
+| | template and layer | snapshot to available | verifier | whole | image |
+|---|---|---|---|---|---|
+| x64, c7i.4xlarge, the Android SDK and Firefox accepted | 40 min | 59 min 30 s | 4 min 38 s | 1 h 44 min | 51 GiB used, 64 free of 120 |
+| arm64, c7g.4xlarge, Firefox accepted | 38 min | 45 min 30 s | about 4 min 30 s | 1 h 29 min | 33 GiB used |
+
+Both images were stamped contract 4, with `sh.billet.components` naming what each accepted (`android-sdk:12.0,firefox:158.0.1` on x64, `firefox:158.0.1` on arm64), after the verifier ran every toolchain and each component as the runner account under the job's environment. The snapshot is the largest and least predictable part, which is why `--timeout` defaults to three hours; the x64 image's 51 GiB is why the bootstrap insists on 60 GiB free and `--builder-disk` on at least 70. Cancelling a build while its verifier ran terminated the verifier.
+
 
 ## Workflow coverage
 

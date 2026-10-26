@@ -83,21 +83,21 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	region := fs.String("region", "", "override the region from the config")
 	subnet := fs.String("subnet", "", "override the subnet from the config")
 	group := fs.String("security-group", "", "override the security group from the config")
-	// THE WHOLE BUILD: provisioning, CreateImage, waiting for the image to become
-	// launchable, and the verifier's boot. Timed on a real build in us-west-2 on
-	// 2026-10-17, with the parity toolcache:
+	// THE WHOLE BUILD: GitHub's template and billet's layer on the builder,
+	// CreateImage, waiting for the image to become launchable, and the verifier's
+	// boot. Timed on real builds in us-west-2, 2026-10-25, on the default builder
+	// and disk:
 	//
-	//	13m50s  provisioning, including the whole toolcache
-	//	38m46s  snapshot to available
-	//	52m37s  launch to the verifier's launch
+	//	         template+layer  snapshot to available  verify  whole
+	//	x64      40m             59m30s                 4m38s   1h44m
+	//	arm64    38m             45m30s                 4m30s   1h29m
 	//
-	// That run's own timeout ended it there, and `billet ami verify`, run on its
-	// own, then booted the image and stamped it in 6m13s, so a whole build is
-	// about 59 minutes by the sum of the two. The snapshot of a larger image is
-	// what grew: it was 9m20s when the image was smaller, and the default of 60
-	// minutes, chosen then with room, now leaves almost none. The cost of a
-	// generous bound is nothing: it is a deadline, not a wait.
-	timeout := fs.Duration("timeout", 90*time.Minute, "how long to wait for the whole build")
+	// The snapshot is the largest part and the least predictable, since it grows
+	// with the image and with the region's load, so three hours leaves the x64
+	// build most of an hour's room. The cost of a generous bound is nothing: it is
+	// a deadline, not a wait, and a build that fails says so on its console within
+	// a poll.
+	timeout := fs.Duration("timeout", 3*time.Hour, "how long to wait for the whole build")
 	public := fs.Bool("public-ip", false,
 		"give the builder a public address, for a subnet with no NAT gateway")
 	// ON BY DEFAULT, AND THE DEFAULT IS THE WHOLE POINT. A gate nobody remembers to

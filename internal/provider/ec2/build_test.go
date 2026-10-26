@@ -497,6 +497,9 @@ type buildFake struct {
 	// verdict after the first, as a kernel line interleaved into it would.
 	dwellPolls     int
 	damagedRepeats bool
+	// failsAfterSuccess has every read after the success say the bootstrap failed,
+	// as a builder rebooted during its dwell would.
+	failsAfterSuccess bool
 	// describeReads is how the builder's first DescribeInstances are answered, one
 	// letter a call: R refuses it. Every call after them answers as usual.
 	describeReads string
@@ -546,6 +549,10 @@ func (b *buildFake) buildConsole() string {
 	verdict, step := b.buildVerdict, b.buildStep
 	if verdict == "" {
 		verdict, step = verdictOK, "done"
+	}
+
+	if b.failsAfterSuccess && b.verdictRead {
+		verdict, step = verdictFail, bootstrapStep
 	}
 
 	body := "[ 12.3] cloud-init: a boot log\n" +

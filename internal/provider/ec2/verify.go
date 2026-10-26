@@ -664,6 +664,12 @@ func parseReport(console, nonce string, schema reportSchema) (map[string]string,
 			continue
 		}
 
+		// A KEY TWICE IS NO REPORT: billet wrote each once, so a second is a line
+		// the machine added, and which of the two is billet's cannot be told.
+		if _, twice := report[key]; twice {
+			return nil, false
+		}
+
 		report[key] = value
 	}
 

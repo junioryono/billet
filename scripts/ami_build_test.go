@@ -1,9 +1,11 @@
 package scripts_test
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +27,10 @@ echo "runner scope=$BILLET_RI_SCOPE from=$BILLET_RI_FROM tmp=${TMPDIR:-}" >>"$FA
 mkdir -p "$BILLET_AMI_ROOT/var/tmp/billet-ri"
 echo staged >"$BILLET_AMI_ROOT/var/tmp/billet-ri/step.sh"
 # A STEP THAT LEAVES A PROCESS BEHIND holding the build's output.
-[ -z "${FAKE_LINGER:-}" ] || /bin/sleep "$FAKE_LINGER" &
+if [ -n "${FAKE_LINGER:-}" ]; then
+	/bin/sleep "$FAKE_LINGER" &
+	echo $! >"$FAKE/linger.pid"
+fi
 for n in $(seq "$BILLET_RI_FROM" 9); do
 	echo "=== [$n/9] step-$n ==="
 	[ "$n" != "${FAKE_FAIL_AT:-}" ] || exit 1
@@ -61,6 +66,11 @@ chmod 0755 "$1/opt/billet/complete/run"
 if [ "$1" = present ]; then
 	echo "present $2" >>"$FAKE/calls"
 	exit "${FAKE_PRESENT_STATUS:-0}"
+fi
+if [ "$1" = names ] && [ -n "${FAKE_NAMES:-}" ]; then
+	# fail: the list fails part way, after a name; empty: it loads and names nothing.
+	[ "$FAKE_NAMES" = empty ] || { echo firefox; exit 1; }
+	exit 0
 fi
 if [ "$1" = absent ]; then
 	echo "absent $2" >>"$FAKE/calls"
@@ -416,6 +426,9 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 		// be a claim the image does not meet.
 		{name: "the base image carries a component nobody accepted", env: []string{"FAKE_CARRIED=google-chrome"},
 			wantStep: "components"},
+		// A LIST THAT CANNOT BE LOADED PROVES NOTHING ABSENT, failed or empty.
+		{name: "the component list cannot be loaded", env: []string{"FAKE_NAMES=fail"}, wantStep: "components"},
+		{name: "the component list names nothing", env: []string{"FAKE_NAMES=empty"}, wantStep: "components"},
 		// A PROCESS A STEP LEFT HOLDING THE BUILD'S OUTPUT does not hold back the
 		// verdict past BILLET_AMI_TEE_WAIT: the build stops waiting for its log.
 		{name: "a step leaves a process holding the output", env: []string{"FAKE_FAIL_AT=4",
@@ -440,6 +453,22 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+
+			// THE LINGERING PROCESS IS THE TEST'S TO END, not left running after it.
+			t.Cleanup(func() {
+				raw, err := os.ReadFile(filepath.Join(fx.fake, "linger.pid"))
+				if err != nil {
+					return
+				}
+
+				if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+					if p, err := os.FindProcess(pid); err == nil {
+						if err := p.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+							t.Logf("the lingering process %d: %v", pid, err)
+						}
+					}
+				}
+			})
 
 			began := time.Now()
 

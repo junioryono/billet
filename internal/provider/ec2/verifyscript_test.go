@@ -106,8 +106,15 @@ type verifyProbe struct {
 	// and fails when run.
 	noCodeQLBundle    bool
 	failingExecutable string
-	// strayComponent is a component the image carries and does not record.
+	// recordTail follows the record's line in the file.
+	recordTail string
+	// strayComponent is a component the image carries and does not record, and
+	// strayVariable a variable of one the job's environment names.
 	strayComponent string
+	strayVariable  string
+	// noAbsenceEnv leaves the job's environment unreadable where the absence check
+	// reads it.
+	noAbsenceEnv bool
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -222,6 +229,22 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	envFile := filepath.Join(root, "billet-image-env")
 	writeFile(t, envFile, "PATH="+bin+"\n", 0o644)
 
+	// THE SAME FILE UNDER billet_root, where the absence check reads it: the
+	// substitution below moves the check's imageEnvFile to envFile as well.
+	croot := filepath.Join(root, "c")
+	if err := os.MkdirAll(filepath.Dir(croot+envFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	stray := ""
+	if p.strayVariable != "" {
+		stray = p.strayVariable + "=/somewhere\n"
+	}
+
+	if !p.noAbsenceEnv {
+		writeFile(t, croot+envFile, "PATH="+bin+"\n"+stray, 0o644)
+	}
+
 	script = substitute(t, script, "du -sk "+toolcacheDir, "du -sk "+tcDir)
 	script = substitute(t, script, "ls "+toolcacheDir+"/", "ls "+tcDir+"/")
 	script = substitute(t, script, imageEnvFile, envFile)
@@ -232,12 +255,11 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	// breaks.
 	record := filepath.Join(root, "billet-image-components")
 	if !p.noComponentsRecord {
-		writeFile(t, record, p.components+"\n", 0o644)
+		writeFile(t, record, p.components+"\n"+p.recordTail, 0o644)
 	}
 
 	script = substitute(t, script, componentsFile, record)
 
-	croot := filepath.Join(root, "c")
 	for _, item := range strings.Split(p.components, ",") {
 		name, _, _ := strings.Cut(item, ":")
 
@@ -654,6 +676,30 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			wantStep: "components",
 		},
 		{
+			// AND ONE IT ONCE CARRIED: the binaries are gone and the job is still
+			// told where Chrome is.
+			name:     "the job's environment names a component the image does not record",
+			probe:    verifyProbe{strayVariable: "CHROME_BIN"},
+			wantStep: "components",
+		},
+		{
+			// AN UNREADABLE ENVIRONMENT IS NOT ONE THAT NAMES NOTHING.
+			name:     "the absence check cannot read the job's environment",
+			probe:    verifyProbe{noAbsenceEnv: true},
+			wantStep: "components",
+		},
+		{
+			// A SECOND LINE IS A REPORT LINE OF THE IMAGE'S CHOOSING.
+			name:     "the record runs to a second line",
+			probe:    verifyProbe{components: "firefox:140.0.4", recordTail: "runner=secret-token-123\n"},
+			wantStep: "components",
+		},
+		{
+			name:     "the record is not a list",
+			probe:    verifyProbe{components: "firefox:140.0.4 secret"},
+			wantStep: "components",
+		},
+		{
 			name:     "the record names a component billet does not install",
 			probe:    verifyProbe{components: "netscape:4.0"},
 			wantStep: "components",
@@ -828,6 +874,52 @@ func TestTheVerifiersComponentPathsAreTheComponentChecks(t *testing.T) {
 		if !slices.Equal(componentPaths[name], paths) {
 			t.Errorf("%s: the verifier checks %q and check-guest-component.sh lists %q",
 				name, componentPaths[name], paths)
+		}
+	}
+}
+
+// AND THE VARIABLES ARE check-guest-component.sh's, which the build's `absent` asked.
+func TestTheVerifiersComponentVariablesAreTheComponentChecks(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "check-guest-component.sh"))
+	if err != nil {
+		t.Fatalf("read check-guest-component.sh: %v", err)
+	}
+
+	_, body, ok := strings.Cut(string(raw), "\nvariables() {\n")
+	if !ok {
+		t.Fatal("check-guest-component.sh defines no variables()")
+	}
+
+	body, _, _ = strings.Cut(body, "\n}\n")
+
+	arm := regexp.MustCompile(`^\t([a-z][a-z-]*)\)`)
+	echo := regexp.MustCompile(`echo "([A-Z_]+)=`)
+	want := map[string][]string{}
+	current := ""
+
+	for _, line := range strings.Split(body, "\n") {
+		if m := arm.FindStringSubmatch(line); len(m) == 2 && m[1] != "" {
+			current = m[1]
+			if _, ok := want[current]; !ok {
+				want[current] = nil
+			}
+		}
+
+		for _, m := range echo.FindAllStringSubmatch(line, -1) {
+			want[current] = append(want[current], m[1])
+		}
+	}
+
+	if len(want) != len(componentVariables) {
+		t.Errorf("check-guest-component.sh lists %d components and the verifier %d", len(want), len(componentVariables))
+	}
+
+	for name, vars := range want {
+		got, ok := componentVariables[name]
+		if !ok || !slices.Equal(got, vars) {
+			t.Errorf("%s: the verifier checks %q and check-guest-component.sh lists %q", name, got, vars)
 		}
 	}
 }

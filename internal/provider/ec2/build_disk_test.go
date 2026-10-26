@@ -63,7 +63,7 @@ func TestTheBuilderRootIsSized(t *testing.T) {
 func TestAnExplicitBuilderDiskIsWhatIsRequested(t *testing.T) {
 	t.Parallel()
 
-	const want = 64
+	const want = 80
 
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
@@ -195,7 +195,7 @@ func TestTheScriptRefusesToProvisionOntoADiskThatDidNotGrow(t *testing.T) {
 func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 	t.Parallel()
 
-	const baseGiB = 64
+	const baseGiB = 90
 
 	for _, tc := range []struct {
 		name    string
@@ -204,7 +204,7 @@ func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 	}{
 		// AN UNSET SIZE ADAPTS. Somebody whose base AMI declares a large root and
 		// who passes no flag had a working build before this; refusing it would
-		// have told them to pass at least `--builder-disk 64` for a flag they
+		// have told them to pass at least `--builder-disk 90` for a flag they
 		// never used, about a number the default chose for them.
 		{name: "the default, under a large base image", ask: 0},
 		// AN EXPLICIT ONE IS REFUSED, because they typed it and are present to
@@ -263,7 +263,7 @@ func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 func TestTheBaseImageFloorSurvivesTheLayoutCache(t *testing.T) {
 	t.Parallel()
 
-	const baseGiB = 64
+	const baseGiB = 90
 
 	f := newFakeEC2(t)
 	f.respond = builderImageWithRoot(t, baseGiB)

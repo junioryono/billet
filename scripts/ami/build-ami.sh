@@ -254,7 +254,11 @@ at=environment
 # then be a claim the image does not meet. Asked once the job's environment is
 # written, which the check reads too.
 at=components
-for name in $("$repo/scripts/check-guest-component.sh" names); do
+# AN ASSIGNMENT, so a list that fails to load ends the build rather than leaving a
+# loop that proves nothing absent.
+names=$("$repo/scripts/check-guest-component.sh" names)
+[ -n "$names" ] || die "check-guest-component.sh names no components"
+for name in $names; do
 	case ",$(
 		IFS=,
 		printf '%s' "${components[*]}"
