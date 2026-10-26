@@ -44,6 +44,12 @@ const (
 	// offlineInspectEvery bounds the lookups one tier makes: one member per
 	// interval, oldest-inspected first.
 	offlineInspectEvery = time.Minute
+	// cancelledWithdrawWait bounds one cancelled job's runner's inspection and
+	// withdrawal, and cancelledWithdrawBudget all of one message's: the
+	// withdrawal runs on the message path, and a runner not reached in time is
+	// the offline watch's, as every one was before it.
+	cancelledWithdrawWait   = 15 * time.Second
+	cancelledWithdrawBudget = 30 * time.Second
 )
 
 // offlineWatch is one listener's memory of its idle members. It lives only in
@@ -100,6 +106,11 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 		w.offlineSince = map[string]time.Time{}
 		w.offlineID = map[string]int64{}
 		w.inspectedAt = map[string]time.Time{}
+	}
+	// KEPT IF IT EXISTS: a cancelled job's runner withdrawn before the watch
+	// first ran is recorded here, and GitHub's acknowledgement is the only
+	// evidence of it (withdrawCancelledRunner).
+	if w.withdrawn == nil {
 		w.withdrawn = map[string]alloc.PoolRunner{}
 	}
 
@@ -265,6 +276,9 @@ func (l *Listener) withdrawCancelledRunner(ctx context.Context, member alloc.Poo
 		member.Status != alloc.PoolRunnerIdle {
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, cancelledWithdrawWait)
+	defer cancel()
 
 	state, err := inspector.InspectRunner(ctx, member.RunnerName, member.RunnerID)
 	if err != nil {

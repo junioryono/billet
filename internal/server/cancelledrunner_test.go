@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -181,5 +182,79 @@ func TestACancelledJobsRunnerThatTookAnotherJobIsKept(t *testing.T) {
 				t.Errorf("the kept runner is %q, want idle, so a late JobStarted still binds it", got)
 			}
 		})
+	}
+}
+
+// A WITHDRAWAL BEFORE THE OFFLINE WATCH FIRST RAN SURVIVES A FAILED CLAIM: GitHub
+// has deleted the runner, its acknowledgement is the only evidence, and the
+// watch's first run must not forget it, or the member stays idle with no
+// registration behind it.
+func TestAWithdrawalBeforeTheWatchRanSurvivesAFailedClaim(t *testing.T) {
+	t.Parallel()
+
+	reg := &inspectingRegistry{githubIDs: map[string]int64{}, byName: map[string][]RunnerState{}}
+	p := newCancelPool(t, reg, job11, job12)
+	cancelled := p.launchedFor(t, 11)
+	reg.githubIDs[cancelled.RunnerName] = 4411
+	reg.byName[cancelled.RunnerName] = []RunnerState{{Present: true}}
+
+	// A fresh listener over the same ledger, as a restart leaves it: its offline
+	// watch has never run.
+	p.l = NewListener(p.a, p.l.tier, &fakeSession{}, WithRunner(p.l.runner), WithRunnerRegistry(reg))
+	p.l.writeJobResult = func(context.Context, string, string, int64) error { return nil }
+	failures := 1
+	p.l.claimRetirement = func(ctx context.Context, lease string) error {
+		if failures > 0 {
+			failures--
+
+			return errors.New("the ledger did not answer")
+		}
+
+		return p.a.RetirePoolRunner(ctx, lease)
+	}
+
+	p.cancel(t, job11, -1)
+	if got := p.status(t, cancelled.LeaseID); got != alloc.PoolRunnerIdle {
+		t.Fatalf("after a failed claim the member is %q, want idle until the claim is retried", got)
+	}
+
+	if err := p.l.reconcilePool(t.Context(), 5); err != nil {
+		t.Fatalf("reconcilePool: %v", err)
+	}
+	if !slices.Equal(reg.withdrawn, []int64{4411}) {
+		t.Errorf("withdrawn ids = %v, want the one deletion, not asked again", reg.withdrawn)
+	}
+	if got := p.status(t, cancelled.LeaseID); got == alloc.PoolRunnerIdle {
+		t.Errorf("the withdrawn member is still idle after the watch's first run")
+	}
+}
+
+// A BURST PAST ONE MESSAGE'S BUDGET LEAVES THE REST TO THE OFFLINE WATCH: the
+// withdrawals run on the message path, and a slow GitHub must not hold every
+// other completion behind them.
+func TestABurstOfCancellationsStopsAtItsBudget(t *testing.T) {
+	t.Parallel()
+
+	reg := &inspectingRegistry{githubIDs: map[string]int64{}, byName: map[string][]RunnerState{}}
+	p := newCancelPool(t, reg, job11, job12)
+	now := time.Now()
+	p.l.now = func() time.Time { return now }
+	for _, request := range []int64{11, 12} {
+		runner := p.launchedFor(t, request)
+		reg.githubIDs[runner.RunnerName] = 4400 + request
+		reg.byName[runner.RunnerName] = []RunnerState{{Present: true}}
+	}
+	// THE FIRST INSPECTION SPENDS THE WHOLE BUDGET.
+	reg.during = func() { now = now.Add(cancelledWithdrawBudget) }
+
+	c11, c12 := job11, job12
+	c11.Result, c12.Result = "Canceled", "Canceled"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{c11, c12}}); err != nil {
+		t.Fatalf("the cancellations were refused: %v", err)
+	}
+
+	if len(reg.askedFor) != 1 || len(reg.withdrawn) != 1 {
+		t.Errorf("asked about %v and withdrew %v, want one of the two before the budget ran out",
+			reg.askedFor, reg.withdrawn)
 	}
 }

@@ -122,8 +122,18 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	}
 
 	// BEFORE THE ACQUISITIONS AND THE POOL'S RECONCILE, so the room a cancelled
-	// job's runner held is the next job's in this same message.
+	// job's runner held is the next job's in this same message. BOUNDED, because
+	// it runs on the message path: a burst past the budget is left to the
+	// offline watch, which every cancelled job's runner waited for before.
+	budget := l.clock().Add(cancelledWithdrawBudget)
 	for i := range cancelled {
+		if !l.clock().Before(budget) {
+			l.log.Info("left the runners of the rest of a burst of cancelled jobs to the pool's "+
+				"offline watch, past this message's withdrawal budget",
+				"tier", l.tier, "left", len(cancelled)-i)
+
+			break
+		}
 		l.withdrawCancelledRunner(ctx, cancelled[i])
 	}
 
