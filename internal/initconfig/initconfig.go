@@ -1079,8 +1079,14 @@ func imagesAcceptYAML() string {
 #   microsoft-edge  Microsoft Edge and its WebDriver
 #                   (https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/eula)
 #
-# For example: accept: [google-chrome, codeql]. ` + "`billet check`" + ` says what each
-# tier's image left out that is not accepted here.
+# To boot the same image GitHub's hosted ubuntu-24.04 runner does, accept all
+# five, once you agree to each license:
+#
+#   accept: [android-sdk, codeql, firefox, google-chrome, microsoft-edge]
+#
+# Anything not named is missing from every generation this deployment imports,
+# and a job that uses it fails or fetches it itself. ` + "`billet check`" + ` says what
+# each tier's image left out that is not accepted here.
 images:
   accept: []
 `
