@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/imagesource"
@@ -713,17 +714,66 @@ type recordingPublisher struct {
 	// published -- the pull must still hold it then -- and a check made after
 	// cmdImagesPull returns cannot see that at all.
 	onImport func()
+
+	// learnErr and learnedEntries are what LearnArchitectures answers, checkErr
+	// what CheckImportArch does; learned is the image of each LearnArchitectures
+	// call, in order, with "sweep" for each SweepGenerationMaps and "check" for
+	// each CheckImportArch.
+	learnErr       error
+	learnedEntries []ceph.ArchLearned
+	checkErr       error
+	learned        []string
+
+	// onLearn and onCheck run inside LearnArchitectures and CheckImportArch, so a
+	// test can see what the pull had done at that instant: whether it had staged
+	// anything is gone again by the time the pull returns.
+	onLearn, onCheck func()
 }
 
 type publishedGeneration struct {
-	image, rawPath, runnerVersion, kernel, guestContract string
-	components                                           *ceph.GenerationComponents
-	completionRootOwner                                  string
+	image, rawPath, machine, runnerVersion, kernel, guestContract string
+	components                                                    *ceph.GenerationComponents
+	completionRootOwner                                           string
+}
+
+func (p *recordingPublisher) SweepGenerationMaps(context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.learned = append(p.learned, "sweep")
+
+	return nil
+}
+
+func (p *recordingPublisher) LearnArchitectures(_ context.Context, image string) ([]ceph.ArchLearned, error) {
+	if p.onLearn != nil {
+		p.onLearn()
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.learned = append(p.learned, image)
+
+	return p.learnedEntries, p.learnErr
+}
+
+func (p *recordingPublisher) CheckImportArch(_ context.Context, _, machine string) error {
+	if p.onCheck != nil {
+		p.onCheck()
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.learned = append(p.learned, "check "+machine)
+
+	return p.checkErr
 }
 
 func (p *recordingPublisher) ImportCompletedGeneration(
 	_ context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	components *ceph.GenerationComponents,
 	_ time.Time,
 ) (string, error) {
@@ -737,7 +787,7 @@ func (p *recordingPublisher) ImportCompletedGeneration(
 	defer p.mu.Unlock()
 
 	p.seen = append(p.seen, publishedGeneration{
-		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
+		image: image, rawPath: rawPath, machine: machine, runnerVersion: runnerVersion,
 		kernel: kernel, guestContract: guestContract, components: components,
 	})
 
@@ -752,7 +802,7 @@ func (p *recordingPublisher) ImportCompletedGeneration(
 // the image name and the c snapshot it answers.
 func (p *recordingPublisher) ImportCompletionRoot(
 	_ context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract, owner string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract, owner string,
 	_ time.Time,
 ) (string, error) {
 	if p.onImport != nil {
@@ -763,7 +813,7 @@ func (p *recordingPublisher) ImportCompletionRoot(
 	defer p.mu.Unlock()
 
 	p.seen = append(p.seen, publishedGeneration{
-		image: image, rawPath: rawPath, runnerVersion: runnerVersion,
+		image: image, rawPath: rawPath, machine: machine, runnerVersion: runnerVersion,
 		kernel: kernel, guestContract: guestContract, completionRootOwner: owner,
 	})
 
@@ -1047,4 +1097,174 @@ tiers:
 	recordSilentControlPlane(t, filepath.Join(dir, "server"), filepath.Join(dir, "node"))
 
 	return cfgPath
+}
+
+// A PULL READS THE ARCHITECTURE OF EVERY GENERATION THAT RECORDS NONE BEFORE IT
+// IMPORTS, having swept the read-only maps a crash left, and records its own
+// manifest's on the generation it makes (ADR-022).
+func TestAPullLearnsTheImagesArchitecturesThenImportsItsOwn(t *testing.T) {
+	fixture := newPullFixture(t)
+
+	var learnedBeforeImport []string
+
+	fixture.publisher.onImport = func() {
+		fixture.publisher.mu.Lock()
+		learnedBeforeImport = slices.Clone(fixture.publisher.learned)
+		fixture.publisher.mu.Unlock()
+	}
+
+	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
+
+	if err := fixture.pull(t); err != nil {
+		t.Fatalf("images pull: %v", err)
+	}
+
+	if want := []string{"sweep", "ubuntu-2404-x64", "check " + hostArch()}; !slices.Equal(learnedBeforeImport, want) {
+		t.Errorf("before the import the pull had %v, want %v", learnedBeforeImport, want)
+	}
+
+	if got := fixture.publisher.last().machine; got != fixture.manifest.Arch || got == "" {
+		t.Errorf("the generation was imported as %q, want its manifest's %q", got, fixture.manifest.Arch)
+	}
+}
+
+// AND A PULL THAT CANNOT READ THEM IMPORTS NOTHING.
+func TestAPullThatCannotReadTheImagesArchitecturesImportsNothing(t *testing.T) {
+	fixture := newPullFixture(t)
+	fixture.publisher.learnErr = errors.New("the publish lock is held")
+	fixture.publisher.onLearn = func() { fixture.stagedNothingYet(t) }
+
+	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
+
+	err := fixture.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "learning the architectures of ubuntu-2404-x64's generations failed") {
+		t.Fatalf("images pull = %v, want the pull refused for the architectures it could not read", err)
+	}
+
+	if got := fixture.publisher.calls(); got != 0 {
+		t.Errorf("the import was reached %d times", got)
+	}
+
+	assertNothingStaged(t, fixture)
+}
+
+// AND ONE WHOSE IMPORT THE IMAGE'S GENERATIONS WOULD REFUSE DOWNLOADS NOTHING: a
+// refresh meeting it every day would otherwise fetch gigabytes each time.
+func TestAPullAnImportWouldBeRefusedDownloadsNothing(t *testing.T) {
+	fixture := newPullFixture(t)
+	fixture.publisher.checkErr = errors.New("ubuntu-2404-x64 holds generations built for another machine")
+	fixture.publisher.onCheck = func() { fixture.stagedNothingYet(t) }
+
+	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
+
+	err := fixture.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "nothing was downloaded") ||
+		!strings.Contains(err.Error(), "another machine") {
+		t.Fatalf("images pull = %v, want the pull refused before it downloaded, with the reason", err)
+	}
+
+	if got := fixture.publisher.calls(); got != 0 {
+		t.Errorf("the import was reached %d times", got)
+	}
+
+	assertNothingStaged(t, fixture)
+}
+
+// stagedNothingYet fails when the pull has staged anything or installed a kernel
+// by now: called from inside the fake, before the pull's cleanup could remove it.
+func (f *pullFixture) stagedNothingYet(t *testing.T) {
+	t.Helper()
+
+	for _, dir := range []string{f.staging, f.kernelDir} {
+		entries, err := os.ReadDir(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("read %s: %v", dir, err)
+		}
+
+		if len(entries) != 0 {
+			t.Errorf("%s already holds %d entries when the pull asks about architectures; it staged "+
+				"or installed before it asked", dir, len(entries))
+		}
+	}
+}
+
+// assertNothingStaged fails when a pull put anything in its staging directory or
+// installed a kernel.
+func assertNothingStaged(t *testing.T, fixture *pullFixture) {
+	t.Helper()
+
+	for _, dir := range []string{fixture.staging, fixture.kernelDir} {
+		entries, err := os.ReadDir(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+
+		if len(entries) != 0 {
+			t.Errorf("%s holds %d entries; the pull staged or installed something before it refused",
+				dir, len(entries))
+		}
+	}
+}
+
+// WHAT LEARNING DID IS SAID AS IT HAPPENED: read and recorded, read and not
+// recorded with why, or not read with why.
+func TestAPullSaysWhatItLearnedOfEachGeneration(t *testing.T) {
+	t.Parallel()
+
+	store := &recordingPublisher{learnedEntries: []ceph.ArchLearned{
+		{Generation: "g20260801000000", Machine: "x86_64", Recorded: true},
+		{Generation: "g20260802000000", Machine: "x86_64", NotRecorded: errors.New("the publish lock is held")},
+		{Generation: "g20260803000000", Err: errors.New("debugfs is required")},
+	}}
+
+	var out strings.Builder
+	if err := learnImageArchitectures(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, store,
+		"ubuntu-2404-x64"); err != nil {
+		t.Fatalf("learnImageArchitectures: %v", err)
+	}
+
+	for _, want := range []string{
+		"ubuntu-2404-x64@g20260801000000 recorded no architecture; read x86_64 from it and recorded it",
+		"ubuntu-2404-x64@g20260802000000 records no architecture; read x86_64 from it and did not record it: the publish lock is held",
+		"ubuntu-2404-x64@g20260803000000 records no architecture, and it could not be read from it: debugfs is required",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the pull did not say %q; it said:\n%s", want, out.String())
+		}
+	}
+}
+
+// THE PULL'S OWN CLIENT HOLDS THE HOST'S GENERATION-MAP LOCK, the one the node's
+// cache store takes, so neither unmaps what the other reads.
+func TestThePullsClientHoldsTheHostsGenerationMapLock(t *testing.T) {
+	bin := t.TempDir()
+	for _, name := range []string{"rbd", "ceph"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Setenv("PATH", bin)
+
+	cfg, err := config.Load(firecrackerRefreshConfig(t, ""))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	lockDir := t.TempDir()
+	cfg.Node.LockDir = lockDir
+
+	store, err := openGenerationPublisher(cfg)
+	if err != nil {
+		t.Fatalf("openGenerationPublisher: %v", err)
+	}
+
+	client, ok := store.(*ceph.Client)
+	if !ok {
+		t.Fatalf("the pull's publisher is %T, not the cluster client", store)
+	}
+
+	if got, want := client.GenerationMapLockPath(), filepath.Join(lockDir, "ceph-generation-maps.lock"); got != want {
+		t.Errorf("the pull's client holds %q, want the node's %q", got, want)
+	}
 }

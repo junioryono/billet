@@ -74,6 +74,10 @@ func (c *Client) ResolveCompletionRoot(ctx context.Context, ref, guestContract s
 		return "", fmt.Errorf("ceph: %s is not a completion root", bounded(ref))
 	}
 
+	if err := c.refuseOtherMachine(ctx, image, snapshot); err != nil {
+		return "", err
+	}
+
 	contract, ok, err := c.GuestContract(ctx, image, snapshot)
 	if err != nil {
 		return "", err
@@ -133,7 +137,7 @@ func (c *Client) RemoveCompletionRoots(ctx context.Context, image, owner string)
 		}
 
 		c.removeGenerationMetadata(ctx, image, snap,
-			KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
+			ArchKey, KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
 	}
 
 	return errors.Join(errs...)
@@ -190,6 +194,22 @@ func (c *Client) completionRootOwners(ctx context.Context, image string) (map[st
 // fails the whole listing with ENOENT; read as no snapshots, it would let a caller
 // clear the metadata of a root that is still there.
 func (c *Client) snapshotNames(ctx context.Context, image string) ([]string, error) {
+	snaps, err := c.snapshotList(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(snaps))
+	for _, snap := range snaps {
+		names = append(names, snap.Name)
+	}
+
+	return names, nil
+}
+
+// snapshotList is every snapshot of image with its id, read as snapshotNames
+// reads it.
+func (c *Client) snapshotList(ctx context.Context, image string) ([]snapshot, error) {
 	out, err := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "snap", "ls", image)
 	if err != nil {
 		if isNoSuchFile(err) {
@@ -211,12 +231,7 @@ func (c *Client) snapshotNames(ctx context.Context, image string) ([]string, err
 		return nil, fmt.Errorf("ceph: %s did not answer with a json snapshot list; is it the rbd command?", c.bin)
 	}
 
-	names := make([]string, 0, len(snaps))
-	for _, snap := range snaps {
-		names = append(names, snap.Name)
-	}
-
-	return names, nil
+	return snaps, nil
 }
 
 // SetComponents records what a generation left out and what was installed.

@@ -56,7 +56,9 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 
 	for _, n := range needs {
 		if n.Access == unitpath.Lock && strings.HasPrefix(n.Path, dirs["locks"]) {
-			probe = n
+			if filepath.Base(n.Path) != "ceph-generation-maps.lock" {
+				probe = n
+			}
 
 			continue
 		}
@@ -89,6 +91,19 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 		t.Errorf("the kernel lock was not taken where it is declared: %v", err)
 	}
 
+	// THE HOST'S GENERATION-MAP LOCK, which a pull holds to read a generation's
+	// architecture, is declared and taken where the node's cache store takes it.
+	mapLock := filepath.Join(dirs["locks"], "ceph-generation-maps.lock")
+	if !slices.ContainsFunc(needs, func(n unitpath.Need) bool {
+		return n.Path == mapLock && n.Access == unitpath.Lock && n.Take != nil
+	}) {
+		t.Errorf("the generation-map lock %s is not declared as a lock the pull takes", mapLock)
+	}
+
+	if _, err := os.Stat(mapLock); err != nil {
+		t.Errorf("the generation-map lock was not taken where it is declared: %v", err)
+	}
+
 	// AN ABSENT CHROOT BASE IS CREATED, as the firecracker provider creates it
 	// (0700) before the probe boots, so a fresh custom one is not a refusal.
 	for _, n := range needs {
@@ -109,7 +124,8 @@ func TestRefreshPathsNameWhatThePullTouches(t *testing.T) {
 	// THE EXERCISE MINTED THE IDENTITY WHERE THE VERIFICATION DOES, and the
 	// lock it then took is the file the declaration now names.
 	for _, n := range RefreshPaths(processEnv(), cfg, cfgPath) {
-		if n.Access != unitpath.Lock || !strings.HasPrefix(n.Path, dirs["locks"]) {
+		if n.Access != unitpath.Lock || !strings.HasPrefix(n.Path, dirs["locks"]) ||
+			filepath.Base(n.Path) == "ceph-generation-maps.lock" {
 			continue
 		}
 
@@ -244,7 +260,8 @@ func TestRefreshPathsDeclareWhereTheIdentityIsWritten(t *testing.T) {
 		taken := false
 
 		for _, n := range RefreshPaths(processEnv(), certified, cfgPath) {
-			if n.Access != unitpath.Lock || !strings.HasPrefix(n.Path, filepath.Join(root, "locks")) {
+			if n.Access != unitpath.Lock || !strings.HasPrefix(n.Path, filepath.Join(root, "locks")) ||
+				filepath.Base(n.Path) == "ceph-generation-maps.lock" {
 				continue
 			}
 

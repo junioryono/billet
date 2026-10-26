@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
@@ -59,20 +60,24 @@ const DefaultKernelDir = config.DefaultKernelDir
 type generationPublisher interface {
 	ImportCompletedGeneration(
 		ctx context.Context,
-		image, rawPath, runnerVersion, kernel, guestContract string,
+		image, rawPath, machine, runnerVersion, kernel, guestContract string,
 		components *ceph.GenerationComponents,
 		now time.Time,
 	) (string, error)
 	ImportCompletionRoot(
 		ctx context.Context,
-		image, rawPath, runnerVersion, kernel, guestContract, owner string,
+		image, rawPath, machine, runnerVersion, kernel, guestContract, owner string,
 		now time.Time,
 	) (string, error)
+	SweepGenerationMaps(ctx context.Context) error
+	LearnArchitectures(ctx context.Context, image string) ([]ceph.ArchLearned, error)
+	CheckImportArch(ctx context.Context, image, machine string) error
 }
 
-// openGenerationPublisher builds the cluster client this config names.
+// openGenerationPublisher builds the cluster client this config names, holding
+// the host's generation-map lock the node's own read-only maps are taken under.
 var openGenerationPublisher = func(cfg *config.Config) (generationPublisher, error) {
-	return ceph.New(*cfg.Node.Ceph)
+	return ceph.New(*cfg.Node.Ceph, app.GenerationMapLock(cfg)...)
 }
 
 // kernelInstaller is the durable install the pull performs before it publishes.
@@ -196,6 +201,27 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 			"own; give the image name alone", image)
 	}
 
+	store, err := openGenerationPublisher(cfg)
+	if err != nil {
+		return err
+	}
+
+	// BEFORE ANYTHING IS DOWNLOADED: an import the image's generations refuse is
+	// known now, and a refresh that would meet it every day costs a gigabytes-long
+	// download each time otherwise. The import judges again under the publish lock.
+	//
+	// EXCEPT ON A NODE THAT HAS NOT REGISTERED, whose first pull must still install
+	// the kernel it needs to start, which imports nothing: there it is said, and the
+	// pull goes on.
+	if err := learnImageArchitectures(ctx, env, store, image); err != nil {
+		if _, acceptErr := acceptedComponents(cfg); !errors.Is(acceptErr, errAcceptanceUnknown) {
+			return err
+		}
+
+		fmt.Fprintf(env.Stdout, "warning: %v; this node has not registered, so the pull goes on to "+
+			"install the kernel it needs to start, and any import judges again\n", err)
+	}
+
 	manifest, dir, cleanup, err := stageImage(ctx, env, cfg, stageOptions{
 		from:     *from,
 		source:   *source,
@@ -243,11 +269,6 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	raw, err := unpackRootfs(ctx, env, manifest, dir)
-	if err != nil {
-		return err
-	}
-
-	store, err := openGenerationPublisher(cfg)
 	if err != nil {
 		return err
 	}
@@ -318,7 +339,7 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 				return "", fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
 			}
 
-			return store.ImportCompletionRoot(ctx, image, raw, manifest.RunnerVersion,
+			return store.ImportCompletionRoot(ctx, image, raw, manifest.Arch, manifest.RunnerVersion,
 				kernelFileName(manifest), manifest.GuestContract, cfg.Node.Name, time.Now())
 		}
 
@@ -405,8 +426,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 
 	fmt.Fprintf(env.Stdout, "importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
 
-	generation, err := store.ImportCompletedGeneration(ctx, image, raw, manifest.RunnerVersion,
-		kernelFileName(manifest), manifest.GuestContract, components, time.Now())
+	generation, err := store.ImportCompletedGeneration(ctx, image, raw, manifest.Arch,
+		manifest.RunnerVersion, kernelFileName(manifest), manifest.GuestContract, components, time.Now())
 	if err != nil {
 		return err
 	}
@@ -445,6 +466,50 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "The kernel it is paired with is kept at:\n\n    %s\n\n", kernel)
 	fmt.Fprintln(env.Stdout, "Point node.firecracker.kernel_image at that path. The two are a matched pair,")
 	fmt.Fprintln(env.Stdout, "and a guest booted with a different kernel fails in the middle of somebody's job.")
+
+	return nil
+}
+
+// learnImageArchitectures sweeps the read-only generation maps a crash left on this
+// host, reads the architecture of each generation of image that records none
+// (ADR-022), and refuses the pull when the import it would make is one the
+// image's generations refuse: an import is refused unless every generation the
+// image holds is known to be of its own machine, which is this host's.
+//
+// A GENERATION THAT CANNOT BE READ IS SAID HERE, with why, and the refusal that
+// follows names the remedies. A sweep that could not unmap is a warning, since what
+// it leaves is a mapping, not a decision.
+func learnImageArchitectures(ctx context.Context, env cli.Env, store generationPublisher, image string) error {
+	if err := store.SweepGenerationMaps(ctx); err != nil {
+		fmt.Fprintf(env.Stdout, "warning: the read-only generation maps a crash may have left on this "+
+			"host were not swept: %v\n", err)
+	}
+
+	learned, learnErr := store.LearnArchitectures(ctx, image)
+
+	for _, l := range learned {
+		switch {
+		case l.Err != nil:
+			fmt.Fprintf(env.Stdout, "%s@%s records no architecture, and it could not be read from it: %v\n",
+				image, l.Generation, l.Err)
+		case l.Recorded:
+			fmt.Fprintf(env.Stdout, "%s@%s recorded no architecture; read %s from it and recorded it\n",
+				image, l.Generation, l.Machine)
+		default:
+			fmt.Fprintf(env.Stdout, "%s@%s records no architecture; read %s from it and did not record "+
+				"it: %v\n", image, l.Generation, l.Machine, l.NotRecorded)
+		}
+	}
+
+	if learnErr != nil {
+		return fmt.Errorf("billet images pull: learning the architectures of %s's generations failed, "+
+			"so nothing was downloaded: %w", image, learnErr)
+	}
+
+	if err := store.CheckImportArch(ctx, image, hostArch()); err != nil {
+		return fmt.Errorf("billet images pull: nothing was downloaded, because an import into %s "+
+			"would be refused: %w", image, err)
+	}
 
 	return nil
 }
@@ -868,14 +933,7 @@ func unpackRootfs(ctx context.Context, env cli.Env, manifest *imagesource.Manife
 // aarch64 "arm64". A manifest records what `uname -m` says, because that is what
 // the build recorded.
 func hostArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x86_64"
-	case "arm64":
-		return "aarch64"
-	default:
-		return runtime.GOARCH
-	}
+	return config.HostMachine(runtime.GOARCH)
 }
 
 // installKernel copies the pulled kernel somewhere it will outlive the pull.

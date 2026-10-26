@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,6 +95,17 @@ type Client struct {
 	mapLock string
 	// damaged checks a mapped generation's filesystem; checkDamage outside tests.
 	damaged func(ctx context.Context, device string) (bool, error)
+	// machine is this host as `uname -m` spells it, which a generation's ArchKey
+	// is held to wherever one is resolved.
+	machine string
+	// readProbe reads the head of archProbePath on a mapped root filesystem;
+	// readProbeWithDebugfs outside tests.
+	readProbe func(ctx context.Context, device string) ([]byte, error)
+	// read is the machine LearnArchitectures read of each generation, by
+	// image@generation, with the snapshot id it was read from, which this
+	// client's next import records under its lock.
+	readMu sync.Mutex
+	read   map[string]archRead
 	// trashHeld remembers each trash entry a deletion found still read by a
 	// copy-on-write child, so PurgeTrash asks again only when trashHeldDue says.
 	trashHeldMu sync.Mutex
@@ -266,7 +278,8 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 
 	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem,
 		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor,
-		purgeSlot: make(chan struct{}, 1), checkSlot: generationMapSlot, damaged: checkDamage}
+		purgeSlot: make(chan struct{}, 1), checkSlot: generationMapSlot, damaged: checkDamage,
+		machine: config.HostMachine(runtime.GOARCH), readProbe: readProbeWithDebugfs}
 	for _, opt := range opts {
 		opt(c)
 	}
