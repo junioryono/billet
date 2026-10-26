@@ -194,3 +194,5 @@ d851b91c2981 The provisioning script became the AMI build (ADR-022); the related
 dc3c19371fda The toolcache installers' architecture spellings went with them (ADR-022).
 de2880c55834 BILLET_TC_ARCH went with install-toolcache.sh (ADR-022); the build's scope (ami-x64, ami-arm64) chooses the template.
 f9290014add1 The provisioning script became the AMI build (ADR-022); the related-skills line says so.
+4e1cc90afe54 #688 adds `targets` to the tier keys; the sentence now lists it with its expansion, beside `sizes`.
+f8453d8ae0f0 #689 moves the helper's local cache into the go command's own GOCACHE and layout; the sentence now says so, with why.

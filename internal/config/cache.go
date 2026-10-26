@@ -491,7 +491,7 @@ func (t Tier) cachePolicyErrors(where string) []error {
 	}
 
 	spec := t.EffectiveCache()
-	if spec.Publish == CachePublishDefaultBranch &&
+	if spec.Publish == CachePublishDefaultBranch && !t.inventoryOnly &&
 		(t.CacheScope == nil || t.CacheScope.Owner == "" || t.CacheScope.Repository == "") {
 		errs = append(errs, fmt.Errorf("%s: cache.publish: default-branch needs a static "+
 			"repository, a repository target or cache_scope.owner and cache_scope.repository, "+

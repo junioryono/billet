@@ -242,6 +242,12 @@ func ParseUnvalidated(name string, data []byte) (*Config, error) {
 
 	c.Tiers = expanded
 
+	// AFTER `sizes`, so a ladder written once for every target makes each size
+	// on each target.
+	if err := c.expandTierTargets(); err != nil {
+		return nil, fmt.Errorf("invalid config %s: %w", name, err)
+	}
+
 	c.applyDefaults()
 
 	return &c, nil

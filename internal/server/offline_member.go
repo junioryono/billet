@@ -44,6 +44,13 @@ const (
 	// offlineInspectEvery bounds the lookups one tier makes: one member per
 	// interval, oldest-inspected first.
 	offlineInspectEvery = time.Minute
+	// cancelledWithdrawWait bounds one cancelled job's runner's inspection and
+	// withdrawal, and cancelledWithdrawBudget all of one message's: the
+	// withdrawal runs on the message path, and a runner not reached in time is
+	// the offline watch's, as every one was before it. Not a divisor of the
+	// budget, so a withdrawal's own deadline never ties with the batch's.
+	cancelledWithdrawWait   = 20 * time.Second
+	cancelledWithdrawBudget = 30 * time.Second
 )
 
 // offlineWatch is one listener's memory of its idle members. It lives only in
@@ -100,6 +107,11 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 		w.offlineSince = map[string]time.Time{}
 		w.offlineID = map[string]int64{}
 		w.inspectedAt = map[string]time.Time{}
+	}
+	// KEPT IF IT EXISTS: a cancelled job's runner withdrawn before the watch
+	// first ran is recorded here, and GitHub's acknowledgement is the only
+	// evidence of it (withdrawCancelledRunner).
+	if w.withdrawn == nil {
 		w.withdrawn = map[string]alloc.PoolRunner{}
 	}
 
@@ -242,6 +254,78 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	w.withdrawn[candidate.LeaseID] = *candidate
 
 	l.retireWithdrawn(ctx, *candidate)
+}
+
+// withdrawCancelledRunner withdraws the runner launched for a job cancelled
+// before any runner took it, at once, and retires it.
+//
+// ONE RUNNER FOR ONE JOB. A runner is single-use, and the one launched for a job
+// is that job's; once the job is cancelled the runner has no work of its own,
+// and left in the pool it held its lease until the offline watch reached it,
+// offlineIdleAfter and offlineGrace later. On 2026-10-26 a burst of superseded
+// runs left one tier with 25 such members idle, every one offline at GitHub,
+// while 62 jobs waited for the room they held, and the admission order held
+// other tiers behind it (#690). The wait added no safety: the permission to
+// retire a member was always GitHub acknowledging the DELETE of its exact id,
+// which GitHub refuses while the runner is running a job, so a runner GitHub
+// gave another job (whose JobStarted has not arrived) is kept for it. A runner
+// GitHub reports busy is not asked, an absent or unreadable one is left to the
+// offline watch, and a refusal leaves the member idle and unjournaled, as there.
+//
+// THE DEADLINE BOUNDS ONLY THE TWO CALLS TO GITHUB, by cancelledWithdrawWait and
+// by the message's batch, whichever is sooner. The retirement after an
+// acknowledged DELETE is the offline watch's own (retireWithdrawn), under the
+// caller's context as the watch runs it: cut short, it would leave the member
+// retiring for the same message's reconcile to retry without any bound.
+func (l *Listener) withdrawCancelledRunner(ctx, batch context.Context, member alloc.PoolRunner) {
+	inspector, ok := l.registry.(RunnerInspector)
+	if !ok || l.alloc == nil || member.RunnerName == "" || member.ActualRequestID != 0 ||
+		member.Status != alloc.PoolRunnerIdle {
+		return
+	}
+
+	asking, cancel := context.WithTimeout(batch, cancelledWithdrawWait)
+	defer cancel()
+
+	state, err := inspector.InspectRunner(asking, member.RunnerName, member.RunnerID)
+	if err != nil {
+		l.log.Debug("could not read a cancelled job's runner at GitHub; the pool keeps it",
+			"tier", l.tier, "runner", member.RunnerName, "error", err)
+
+		return
+	}
+
+	if !state.Present || state.Busy {
+		return
+	}
+
+	if state.ID <= 0 || (member.RunnerID > 0 && state.ID != member.RunnerID) {
+		l.log.Warn("GitHub's answer for a cancelled job's runner named no id or another one; "+
+			"keeping it", "tier", l.tier, "runner", member.RunnerName,
+			"pool_id", member.RunnerID, "github_id", state.ID)
+
+		return
+	}
+
+	if err := inspector.WithdrawRunner(asking, state.ID); err != nil {
+		l.log.Info("GitHub kept a cancelled job's runner, which may have taken another job; "+
+			"the pool keeps it", "tier", l.tier, "runner", member.RunnerName,
+			"runner_id", state.ID, "error", err)
+
+		return
+	}
+
+	l.log.Info("withdrew the runner launched for a cancelled job; retiring it",
+		"tier", l.tier, "runner", member.RunnerName, "runner_id", state.ID)
+
+	if l.offline.withdrawn == nil {
+		l.offline.withdrawn = map[string]alloc.PoolRunner{}
+	}
+
+	member.RunnerID = state.ID
+	l.offline.withdrawn[member.LeaseID] = member
+
+	l.retireWithdrawn(ctx, member)
 }
 
 // retireWithdrawn journals and tears down a member whose registration GitHub
