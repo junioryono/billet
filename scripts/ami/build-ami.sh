@@ -209,7 +209,11 @@ TMPDIR="$work/tmp" \
 # component whose installer is no step of this architecture's template is one
 # GitHub's image for it does not carry either, so it is left out and said.
 at=components
-"$repo/scripts/runner-images/install-completer.sh" "$root/" "$repo/internal/runnerimages/$toolset"
+# THE COMPLETER RUNS FROM THE BUILD'S OWN DIRECTORY, root's alone, not from the
+# /opt GitHub's template has opened to everyone: it finds everything it runs from
+# where it is.
+completer=$work/completer
+"$repo/scripts/runner-images/install-completer.sh" "$completer" "$repo/internal/runnerimages/$toolset"
 offered=()
 plan_file=$repo/scripts/runner-images/$plan
 for name in "${accept[@]}"; do
@@ -225,7 +229,7 @@ done
 components=()
 if [ "${#offered[@]}" -gt 0 ]; then
 	report=$work/completion
-	BILLET_COMPLETION_REPORT="$report" "$root/opt/billet/complete/run" "${offered[@]}"
+	BILLET_COMPLETION_REPORT="$report" "$completer/opt/billet/complete/run" "${offered[@]}"
 	for name in "${offered[@]}"; do
 		version=$(awk -v name="$name" '$1 == "installed=" name { print $2; exit }' "$report")
 		[ -n "$version" ] || die "the completer did not install $name"
@@ -233,7 +237,7 @@ if [ "${#offered[@]}" -gt 0 ]; then
 		components+=("$name:$version")
 	done
 fi
-rm -rf "$root/opt/billet/complete"
+rm -rf "$completer"
 (
 	IFS=,
 	printf '%s\n' "${components[*]}"
@@ -244,6 +248,21 @@ chmod 0644 "$root/etc/billet-image-components"
 # the guest uses too.
 at=environment
 "$repo/scripts/runner-images/write-image-env.sh" "$root/etc/environment" "$root/etc/billet-image-env"
+
+# AND WHAT THE IMAGE DOES NOT RECORD, IT DOES NOT CARRY: a base image an operator
+# chose may already hold a component nobody accepted, and a record of none would
+# then be a claim the image does not meet. Asked once the job's environment is
+# written, which the check reads too.
+at=components
+for name in $("$repo/scripts/check-guest-component.sh" names); do
+	case ",$(
+		IFS=,
+		printf '%s' "${components[*]}"
+	)," in
+	*",$name:"*) ;;
+	*) "$repo/scripts/check-guest-component.sh" absent "$name" "$root/" ;;
+	esac
+done
 
 at=layer
 bash "$layer"

@@ -337,14 +337,9 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 					// taken on the build's word: an accepted component the template
 					// offers and the build left out is a deployment short of what it
 					// accepted.
-					want, err := offeredComponents(spec.Arch, spec.Accept)
-					if err != nil {
-						return "", err
-					}
-
-					if got := componentNames(components); !slices.Equal(got, want) {
+					if got := componentNames(components); !slices.Equal(got, spec.owed) {
 						return "", fmt.Errorf("ec2: the builder %s reported the components %q and "+
-							"this build owes %q", id, got, want)
+							"this build owes %q", id, got, spec.owed)
 					}
 
 					verdict = report

@@ -1091,6 +1091,49 @@ func TestABuildWithoutAPayloadBucketIsRefused(t *testing.T) {
 	}
 }
 
+// THE PAYLOAD UNPACKS AS ROOT'S: GNU tar, as the bootstrap runs it, makes the
+// build's directory mode 700 from the archive's own header, so nothing GitHub's
+// template opens up and no other account reaches what root runs from it. Only
+// GNU tar has --no-overwrite-dir, so a machine without it skips.
+func TestThePayloadUnpacksIntoARootOnlyDirectory(t *testing.T) {
+	t.Parallel()
+
+	version, err := exec.CommandContext(t.Context(), "tar", "--version").Output()
+	if err != nil || !strings.Contains(string(version), "GNU tar") {
+		t.Skip("no GNU tar here; the builder's tar is GNU's")
+	}
+
+	archive, _, err := payloadArchive(BuildSpec{Arch: "x64", nonce: verifyProbeNonce}, testLayer)
+	if err != nil {
+		t.Fatalf("payloadArchive: %v", err)
+	}
+
+	root := t.TempDir()
+
+	// THE MODES AS ROOT KEEPS THEM: root's tar preserves an archive's permissions
+	// by default, and an ordinary account's needs to be told to.
+	cmd := exec.CommandContext(t.Context(), "tar", "--no-overwrite-dir", "--same-permissions", "-xzf", "-", "-C", root)
+	cmd.Stdin = bytes.NewReader(archive)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("tar: %v\n%s", err, out)
+	}
+
+	info, err := os.Stat(filepath.Join(root, "var", "lib", "billet-ami"))
+	if err != nil {
+		t.Fatalf("the payload made no build directory: %v", err)
+	}
+
+	if mode := info.Mode().Perm(); mode != 0o700 {
+		t.Errorf("the build's directory unpacked as %o, want 700", mode)
+	}
+
+	env, err := os.Stat(filepath.Join(root, "var", "lib", "billet-ami", "build.env"))
+	if err != nil || env.Mode().Perm() != 0o600 {
+		t.Errorf("build.env unpacked as %v (%v), want 600", env, err)
+	}
+}
+
 // A FAILED VERIFICATION QUOTES NO COMPONENTS: unlike the report's other fields the
 // record is held to a vocabulary only once the image has passed, so a failed
 // report's record is the machine's text and stays out of billet's error.

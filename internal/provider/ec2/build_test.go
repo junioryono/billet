@@ -489,6 +489,9 @@ type buildFake struct {
 	stopsUnread bool
 	// omitBuildComponents leaves the components line out of the verdict.
 	omitBuildComponents bool
+	// builderStopped is whether the builder was last reported stopped; the fake
+	// refuses CreateImage otherwise, as an image of a running builder is no build.
+	builderStopped bool
 	// dwellPolls is how many more polls the builder runs after its verdict was
 	// read, as the dwell keeps it up; damagedRepeats breaks every repeat of the
 	// verdict after the first, as a kernel line interleaved into it would.
@@ -708,7 +711,9 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 			b.dwellPolls--
 		}
 
-		if (!b.verdictRead || b.dwellPolls > 0) && !b.stopsUnread {
+		b.builderStopped = (b.verdictRead && b.dwellPolls == 0) || b.stopsUnread
+
+		if !b.builderStopped {
 			return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item>` +
 				`<instancesSet><item><instanceId>i-builder</instanceId>` +
 				`<instanceState><name>running</name></instanceState>` +
@@ -722,6 +727,12 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 			`</item></instancesSet></item></reservationSet></DescribeInstancesResponse>`
 
 	case "CreateImage":
+		if !b.builderStopped {
+			return http.StatusBadRequest, `<Response><Errors><Error>` +
+				`<Code>IncorrectInstanceState</Code><Message>imaged before it stopped</Message>` +
+				`</Error></Errors></Response>`
+		}
+
 		return http.StatusOK, `<CreateImageResponse><imageId>ami-new</imageId></CreateImageResponse>`
 
 	default:

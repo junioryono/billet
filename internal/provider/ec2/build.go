@@ -264,6 +264,9 @@ type BuildSpec struct {
 	payloadURL    string
 	payloadSHA256 string
 	nonce         string
+	// owed is the accepted components spec.Arch's template installs, which the
+	// build's verdict must name exactly.
+	owed []string
 }
 
 // BuildImage produces an AMI from GitHub's template for the spec's architecture,
@@ -307,6 +310,15 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 	}
 
 	spec.Accept = accept
+
+	// WHAT THE BUILD OWES, decided before anything is bought: a component billet
+	// cannot place in the template is refused now rather than after hours.
+	owed, err := offeredComponents(spec.Arch, accept)
+	if err != nil {
+		return "", err
+	}
+
+	spec.owed = owed
 
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {

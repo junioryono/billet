@@ -615,9 +615,15 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 			kind, path, _ := strings.Cut(entry, " ")
 			checks = append(checks, verifyRunAsRunner+" test -"+kind+" "+path)
 
+			switch {
 			// A DIRECTORY THE RUNNER CANNOT READ IS STILL A DIRECTORY.
-			if kind == "d" {
+			case kind == "d":
 				checks = append(checks, verifyRunAsRunner+" test -r "+path)
+			// AN EXECUTABLE THAT DOES NOT RUN IS STILL EXECUTABLE: each says its
+			// version as the runner. sdkmanager is the exception, a script whose
+			// --version needs the network and a JDK it finds on its own.
+			case !strings.HasSuffix(path, "/sdkmanager"):
+				checks = append(checks, verifyRunAsRunner+" "+path+" --version >/dev/null 2>&1")
 			}
 		}
 
@@ -631,6 +637,25 @@ func writeVerifyComponents(b *strings.Builder, step func(string)) {
 	b.WriteString("    *) false ;;\n")
 	b.WriteString("  esac || { echo \"the image records $billet_c and the runner cannot reach it\" >&2; exit 1; }\n")
 	b.WriteString("done\n")
+
+	// AND WHAT IT DOES NOT RECORD, IT DOES NOT CARRY. A base image may hold a
+	// component nobody accepted, and the record would then be a claim the image
+	// does not meet. Looked for as root, under billet_root, which is empty here and
+	// lets a test point the paths at a fixture.
+	b.WriteString("billet_root=''\n")
+
+	for _, name := range names {
+		var present []string
+
+		for _, entry := range componentPaths[name] {
+			_, path, _ := strings.Cut(entry, " ")
+			present = append(present, "[ -e \"$billet_root\""+path+" ] || [ -L \"$billet_root\""+path+" ]")
+		}
+
+		b.WriteString("case \",$billet_components,\" in *\"," + name + ":\"*) ;; *) if " +
+			strings.Join(present, " || ") + "; then echo \"the image carries " + name +
+			", which it does not record\" >&2; exit 1; fi ;; esac\n")
+	}
 }
 
 // writeVerifyToolcacheInventory records what the image holds, per tool.

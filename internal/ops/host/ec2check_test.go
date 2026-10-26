@@ -40,6 +40,8 @@ type fakeEC2Topology struct {
 	// billet stamped its output — the state every AMI in service was in when this
 	// was written.
 	untaggedImage bool
+	// imageContract stamps the image with this contract instead of the current one.
+	imageContract string
 	authzCode     string          // the code a RunInstances DryRun answers ("DryRunOperation")
 	unavailAMI    map[string]bool // AMIs that answer InvalidAMIID.NotFound; others are available
 	instances     []fakeInstance  // running instances DescribeInstances reports
@@ -226,8 +228,13 @@ func fakeEC2With(t *testing.T, topo fakeEC2Topology) string {
 
 				return
 			}
+			contract := topo.imageContract
+			if contract == "" {
+				contract = strconv.Itoa(ec2.AMIContract)
+			}
+
 			tags := `<tagSet><item><key>sh.billet.ami-contract</key><value>` +
-				strconv.Itoa(ec2.AMIContract) + `</value></item>` +
+				contract + `</value></item>` +
 				`<item><key>sh.billet.built-by</key><value>v9.9.9-test</value></item>` +
 				`<item><key>sh.billet.components</key><value>firefox:140.0.4</value></item></tagSet>`
 			if topo.untaggedImage {
@@ -1432,7 +1439,7 @@ func TestAnImageBelowTheContractIsReported(t *testing.T) {
 	}
 
 	ec2cfg.Endpoint = fakeEC2With(t, fakeEC2Topology{
-		accept: "AKIDEXAMPLE", imageState: "available", untaggedImage: true,
+		accept: "AKIDEXAMPLE", imageState: "available", imageContract: "3",
 	})
 
 	var err error
@@ -1457,13 +1464,38 @@ func TestAnImageBelowTheContractIsReported(t *testing.T) {
 		}
 	}
 
-	// EVERY GAP AN UNSTAMPED IMAGE MAY HAVE, the credential exposure among them:
-	// naming only one would present the others as absent.
-	for _, want := range []string{"containerd one", "carries no toolcache", "in an argument list",
-		"rather than GitHub's template"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("the report for an unstamped image does not name %q:\n%s", want, out)
+	// THE GAP A CONTRACT-3 IMAGE HAS, and none of the older ones it does not.
+	if !strings.Contains(out, "rather than GitHub's template") {
+		t.Errorf("the report for a contract-3 image does not name what it lacks:\n%s", out)
+	}
+
+	for _, older := range []string{"containerd one", "carries no toolcache", "in an argument list"} {
+		if strings.Contains(out, older) {
+			t.Errorf("the report for a contract-3 image names %q, which contract 3 does not lack:\n%s", older, out)
 		}
+	}
+
+	// AND AN UNSTAMPED IMAGE IS NOT AN OLD ONE: a current build run with
+	// --verify=false is unstamped too, so what it carries is unknown, and the remedy
+	// is a verification before a rebuild.
+	ec2cfg.Endpoint = fakeEC2With(t, fakeEC2Topology{
+		accept: "AKIDEXAMPLE", imageState: "available", untaggedImage: true,
+	})
+
+	unstamped := capture(t, func() {
+		err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg, tier), nil, false, false)
+	})
+	if err != nil {
+		t.Fatalf("an unstamped image made the preflight fail: %v", err)
+	}
+
+	if !strings.Contains(unstamped, "carries no AMI contract tag") ||
+		!strings.Contains(unstamped, "billet ami verify ami-good") {
+		t.Errorf("an unstamped image is not reported as unknown with a verification to run:\n%s", unstamped)
+	}
+
+	if strings.Contains(unstamped, "rather than GitHub's template") {
+		t.Errorf("an unstamped image is described as an old build:\n%s", unstamped)
 	}
 
 	// And a stamped image must NOT produce it.

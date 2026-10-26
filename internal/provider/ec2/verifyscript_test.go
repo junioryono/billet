@@ -102,8 +102,12 @@ type verifyProbe struct {
 	missingComponentPath   string
 	unreadableComponentDir string
 	// noCodeQLBundle leaves a recorded CodeQL's toolcache directory with no bundle
-	// in it that runs.
-	noCodeQLBundle bool
+	// in it that runs, and failingExecutable is a recorded executable that exists
+	// and fails when run.
+	noCodeQLBundle    bool
+	failingExecutable string
+	// strayComponent is a component the image carries and does not record.
+	strayComponent string
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -268,7 +272,12 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 				t.Fatalf("make %s: %v", path, err)
 			}
 
-			writeFile(t, croot+path, "#!/bin/sh\nexit 0\n", 0o755)
+			body := "#!/bin/sh\nexit 0\n"
+			if path == p.failingExecutable {
+				body = "#!/bin/sh\nexit 1\n"
+			}
+
+			writeFile(t, croot+path, body, 0o755)
 		}
 	}
 
@@ -282,6 +291,17 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	}
 
 	script = substitute(t, script, "for c in /opt/hostedtoolcache/CodeQL/", "for c in "+croot+"/opt/hostedtoolcache/CodeQL/")
+	if p.strayComponent != "" {
+		_, stray, _ := strings.Cut(componentPaths[p.strayComponent][0], " ")
+		if err := os.MkdirAll(filepath.Dir(croot+stray), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		writeFile(t, croot+stray, "#!/bin/sh\nexit 0\n", 0o755)
+	}
+
+	script = substitute(t, script, "billet_root=''", "billet_root='"+croot+"'")
+	script = substitute(t, script, verifyRunAsRunner+" /usr/", verifyRunAsRunner+" "+croot+"/usr/")
 	script = substitute(t, script, verifyRunAsRunner+" test -x /", verifyRunAsRunner+" test -x "+croot+"/")
 	script = substitute(t, script, verifyRunAsRunner+" test -d /", verifyRunAsRunner+" test -d "+croot+"/")
 	script = substitute(t, script, verifyRunAsRunner+" test -r /", verifyRunAsRunner+" test -r "+croot+"/")
@@ -617,6 +637,21 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			},
 			wantStep: "components",
 			asUser:   true,
+		},
+		{
+			name: "a recorded component's executable does not run",
+			probe: verifyProbe{
+				components:        "firefox:140.0.4",
+				failingExecutable: "/usr/bin/geckodriver",
+			},
+			wantStep: "components",
+		},
+		{
+			// A BASE IMAGE THAT ALREADY HELD ONE: the record of none is a claim the
+			// image does not meet.
+			name:     "the image carries a component it does not record",
+			probe:    verifyProbe{strayComponent: "google-chrome"},
+			wantStep: "components",
 		},
 		{
 			name:     "the record names a component billet does not install",

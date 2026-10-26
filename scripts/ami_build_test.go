@@ -39,6 +39,7 @@ done
 	fakeInstallCompleter = `#!/bin/bash
 set -eu
 echo "install-completer $*" >>"$FAKE/calls"
+case "$1" in "$BILLET_AMI_ROOT"/var/lib/billet-ami-build/*) ;; *) echo "completer outside the build's directory" >>"$FAKE/calls" ;; esac
 mkdir -p "$1/opt/billet/complete"
 cat >"$1/opt/billet/complete/run" <<'EOF'
 #!/bin/bash
@@ -60,6 +61,11 @@ chmod 0755 "$1/opt/billet/complete/run"
 if [ "$1" = present ]; then
 	echo "present $2" >>"$FAKE/calls"
 	exit "${FAKE_PRESENT_STATUS:-0}"
+fi
+if [ "$1" = absent ]; then
+	echo "absent $2" >>"$FAKE/calls"
+	[ "$2" != "${FAKE_CARRIED:-}" ] || exit 1
+	exit 0
 fi
 exec bash "$REAL_CHECK_COMPONENT" "$@"
 `
@@ -317,6 +323,7 @@ func TestTheAMIBuildRunsTheTemplateCompletesAndAnnounces(t *testing.T) {
 	calls := fx.calls(t)
 	for _, want := range []string{
 		"runner scope=ami-x64 from=1 tmp=" + fx.root + "/var/lib/billet-ami-build/tmp", "complete android-sdk firefox", "present android-sdk",
+		"absent codeql", "absent google-chrome", "absent microsoft-edge",
 		"present firefox", "write-image-env " + fx.root + "/etc/environment " + fx.root + "/etc/billet-image-env",
 		"layer", "systemctl disable billet-ami-build.service", "cloud-init clean --logs --machine-id",
 	} {
@@ -327,6 +334,11 @@ func TestTheAMIBuildRunsTheTemplateCompletesAndAnnounces(t *testing.T) {
 
 	if i, j := strings.Index(calls, "cloud-init clean"), strings.Index(calls, "poweroff"); j < 0 || j < i {
 		t.Errorf("the builder powered off at %d, before the image was cleaned at %d:\n%s", j, i, calls)
+	}
+
+	if strings.Contains(calls, "completer outside the build's directory") || strings.Contains(calls, "absent android-sdk") {
+		t.Errorf("the completer ran outside the build's own directory, or a recorded component was "+
+			"asked to be absent:\n%s", calls)
 	}
 
 	if !strings.Contains(calls, "poweroff after the verdict\n") {
@@ -400,6 +412,10 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 		{name: "a completed component is not present", accept: "firefox",
 			env: []string{"FAKE_PRESENT_STATUS=1"}, wantStep: "components"},
 		{name: "the layer fails", env: []string{"FAKE_LAYER_STATUS=1"}, wantStep: "layer"},
+		// THE BASE IMAGE CARRIES A COMPONENT NOBODY ACCEPTED: a record of none would
+		// be a claim the image does not meet.
+		{name: "the base image carries a component nobody accepted", env: []string{"FAKE_CARRIED=google-chrome"},
+			wantStep: "components"},
 		// A PROCESS A STEP LEFT HOLDING THE BUILD'S OUTPUT does not hold back the
 		// verdict past BILLET_AMI_TEE_WAIT: the build stops waiting for its log.
 		{name: "a step leaves a process holding the output", env: []string{"FAKE_FAIL_AT=4",

@@ -201,6 +201,13 @@ func ec2Preflight(
 				"and paste the id\n", img.ImageID, reason)
 		case img.State != "available":
 			fmt.Fprintf(env.Stdout, "image    %s is %s, not yet available\n", img.ImageID, img.State)
+		case img.Contract == 0:
+			// NO STAMP IS NOT AN OLD BUILD. A current build run with --verify=false,
+			// or one whose verification failed, is unstamped as well, so what it
+			// carries is unknown rather than what an old contract implies.
+			fmt.Fprintf(env.Stdout, "image    %s carries no AMI contract tag, so nothing billet booted "+
+				"says what it carries; `billet ami verify %s` boots it and stamps it if it meets "+
+				"contract %d, or rebuild with `billet ami build`\n", img.ImageID, img.ImageID, ec2.AMIContract)
 		case img.Contract < ec2.AMIContract:
 			// A WARNING, NOT A REFUSAL. An image below the contract still runs jobs
 			// correctly; what it loses is the Docker cache, silently — every job
