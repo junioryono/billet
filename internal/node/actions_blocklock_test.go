@@ -15,19 +15,6 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 )
 
-// cutBlockBody is a block's body whose sender went away partway.
-type cutBlockBody struct{ sent bool }
-
-func (b *cutBlockBody) Read(buffer []byte) (int, error) {
-	if !b.sent {
-		b.sent = true
-
-		return copy(buffer, "part"), nil
-	}
-
-	return 0, io.ErrUnexpectedEOF
-}
-
 // stalledBody is a block's body the guest is still sending: its first read
 // says so and then waits until released.
 type stalledBody struct {
@@ -46,6 +33,19 @@ func (b *stalledBody) Read(buffer []byte) (int, error) {
 	}
 
 	return 0, io.EOF
+}
+
+// cutBlockBody is a block's body whose sender went away partway.
+type cutBlockBody struct{ sent bool }
+
+func (b *cutBlockBody) Read(buffer []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+
+		return copy(buffer, "part"), nil
+	}
+
+	return 0, io.ErrUnexpectedEOF
 }
 
 func actionsBlockRequest(t *testing.T, uploadURL, comp, blockID string, body io.Reader) *http.Request {
@@ -69,6 +69,91 @@ func actionsBlockRequest(t *testing.T, uploadURL, comp, blockID string, body io.
 	return request
 }
 
+// reserveActionsUpload reserves a save through the proxy, as the toolkit does,
+// and returns its signed upload URL and the session's archive for it.
+func reserveActionsUpload(
+	t *testing.T,
+	service *CacheService,
+	session *cacheSession,
+	key string,
+) (string, *actionsArchive) {
+	t.Helper()
+
+	proxy := service.actionsProxy()
+	if proxy == nil {
+		t.Fatal("the intercepting session has no proxy")
+	}
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"`+key+`","version":"v2"}`)
+	response, handled := proxy.respond(create, session)
+	if !handled || response.StatusCode != http.StatusOK {
+		t.Fatalf("CreateCacheEntry handled=%t status=%v", handled, response)
+	}
+	created := responseJSON(t, response)
+	uploadURL, ok := created["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatalf("CreateCacheEntry response = %v", created)
+	}
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for _, archive := range session.actions {
+		if archive.CacheKey == key {
+			return uploadURL, archive
+		}
+	}
+	t.Fatalf("no archive was reserved for %q", key)
+
+	return "", nil
+}
+
+// awaitCondition waits for done, failing the test after ten seconds.
+func awaitCondition(t *testing.T, what string, done func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !done() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not happen", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type blobResult struct {
+	status int
+	err    error
+}
+
+// serveInBackground answers request through the blob handler on a goroutine of
+// its own, joined before the test ends.
+func serveInBackground(t *testing.T, service *CacheService, session *cacheSession, request *http.Request) <-chan blobResult {
+	t.Helper()
+
+	done := make(chan blobResult, 1)
+	go func() {
+		response, err := service.serveActionsBlob(request, session)
+		result := blobResult{err: err}
+		if response != nil {
+			result.status = response.StatusCode
+			response.Body.Close()
+		}
+		done <- result
+	}()
+
+	return done
+}
+
+func observedActions(observer *recordingObserver) []alloc.ActionsCache {
+	var told []alloc.ActionsCache
+	calls := observer.recorded()
+	for index := range calls {
+		told = append(told, calls[index].obs.ActionsCache)
+	}
+
+	return told
+}
+
 // A BLOCK IN TRANSFER HOLDS NEITHER THE SESSION NOR THE OTHER BLOCKS (#694). The
 // client uploads an archive's blocks side by side; each held the archive alone
 // for its whole transfer, and the one waiting behind it held the session's lock
@@ -78,40 +163,20 @@ func TestABlockInTransferHoldsNeitherTheSessionNorTheOtherBlocks(t *testing.T) {
 	t.Parallel()
 
 	service, _, session, _ := testActionsService(t)
-	create := actionsRequestForTest(t, http.MethodPost,
-		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"blocks","version":"v2"}`)
-	response, _, err := service.actionsResponse(create, session)
-	if err != nil {
-		t.Fatalf("CreateCacheEntry: %v", err)
-	}
-	created := responseJSON(t, response)
-	uploadURL, ok := created["signed_upload_url"].(string)
-	if !ok || uploadURL == "" {
-		t.Fatalf("CreateCacheEntry response = %v", created)
-	}
+	uploadURL, archive := reserveActionsUpload(t, service, session, "blocks")
 
 	first := base64.StdEncoding.EncodeToString([]byte("block-1"))
 	second := base64.StdEncoding.EncodeToString([]byte("block-2"))
 	stalled := &stalledBody{reading: make(chan struct{}), release: make(chan struct{})}
-	firstRequest := actionsBlockRequest(t, uploadURL, "block", first, stalled)
 	list := `<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>` + first +
 		`</Latest><Latest>` + second + `</Latest></BlockList>`
 	commitRequest := actionsBlockRequest(t, uploadURL, "blocklist", "", bytes.NewBufferString(list))
-	firstDone := make(chan error, 1)
-	go func() {
-		response, _, err := service.actionsResponse(firstRequest, session)
-		if err == nil && response.StatusCode != http.StatusCreated {
-			err = io.ErrUnexpectedEOF
-		}
-		if response != nil {
-			response.Body.Close()
-		}
-		firstDone <- err
-	}()
+	firstDone := serveInBackground(t, service, session, actionsBlockRequest(t, uploadURL, "block", first, stalled))
 	released := false
 	defer func() {
 		if !released {
 			close(stalled.release)
+			<-firstDone
 		}
 	}()
 	select {
@@ -120,24 +185,10 @@ func TestABlockInTransferHoldsNeitherTheSessionNorTheOtherBlocks(t *testing.T) {
 		t.Fatal("the first block's body was never read")
 	}
 
-	// THE COMMIT WAITS FOR THE ARCHIVE ALONE, and must not hold the session's
-	// lock while it does.
-	commitDone := make(chan error, 1)
-	go func() {
-		response, _, err := service.actionsResponse(commitRequest, session)
-		if err == nil && response.StatusCode != http.StatusCreated {
-			err = io.ErrUnexpectedEOF
-		}
-		if response != nil {
-			response.Body.Close()
-		}
-		commitDone <- err
-	}()
-
 	// A SECOND BLOCK IS WRITTEN while the first is still arriving.
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	response, _, err = service.actionsResponse(
+	response, err := service.serveActionsBlob(
 		actionsBlockRequest(t, uploadURL, "block", second, bytes.NewBufferString("two")).WithContext(ctx),
 		session)
 	if err != nil || response.StatusCode != http.StatusCreated {
@@ -145,71 +196,103 @@ func TestABlockInTransferHoldsNeitherTheSessionNorTheOtherBlocks(t *testing.T) {
 	}
 	response.Body.Close()
 
-	// AND THE SESSION'S LOCK IS FREE: what a CONNECT, an observation or a renewal
-	// waits on. Asked repeatedly, so a commit that takes it between polls of the
-	// archive's lock and holds it there is caught.
-	for range 20 {
-		lockCtx, lockCancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
-		err := lockCacheSession(lockCtx, session)
-		lockCancel()
-		if err != nil {
-			t.Fatalf("the session's lock was held while blocks were in transfer: %v", err)
-		}
-		session.mu.Unlock()
-		time.Sleep(5 * time.Millisecond)
+	// THE COMMIT WAITS FOR THE ARCHIVE ALONE, and the session's lock, which a
+	// CONNECT, an observation and a renewal wait on, is free while it does.
+	commitDone := serveInBackground(t, service, session, commitRequest)
+	awaitCondition(t, "the commit waiting for the archive", func() bool {
+		return archive.exclusiveWaiting.Load() == 1
+	})
+	lockCtx, lockCancel := context.WithTimeout(t.Context(), time.Second)
+	err = lockCacheSession(lockCtx, session)
+	lockCancel()
+	if err != nil {
+		t.Fatalf("the session's lock was held while the commit waited for a block: %v", err)
 	}
+	session.mu.Unlock()
 	select {
-	case err := <-commitDone:
-		t.Fatalf("the block list was committed while a block was still arriving: %v", err)
+	case result := <-commitDone:
+		t.Fatalf("the block list was committed while a block was still arriving: %+v", result)
 	default:
 	}
 
 	close(stalled.release)
 	released = true
-	if err := <-firstDone; err != nil {
-		t.Fatalf("the first block: %v", err)
+	if result := <-firstDone; result.err != nil || result.status != http.StatusCreated {
+		t.Fatalf("the first block: %+v", result)
 	}
-	if err := <-commitDone; err != nil {
-		t.Fatalf("the block list: %v", err)
+	if result := <-commitDone; result.err != nil || result.status != http.StatusCreated {
+		t.Fatalf("the block list: %+v", result)
 	}
-	session.mu.Lock()
-	var archive *actionsArchive
-	for _, candidate := range session.actions {
-		archive = candidate
-	}
-	session.mu.Unlock()
 	body, err := os.ReadFile(service.actionsArchivePath(session, archive))
 	if err != nil || string(body) != "onetwo" {
 		t.Fatalf("assembled archive = %q, error=%v", body, err)
 	}
 }
 
+// A WAITING COMMIT ADMITS NO NEW BLOCK, so blocks arriving one after another
+// cannot keep it out until its request expires: a lock taken by polling
+// announces no waiting writer of its own.
+func TestAWaitingCommitAdmitsNoNewBlock(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	uploadURL, archive := reserveActionsUpload(t, service, session, "starve")
+
+	archive.mu.RLock()
+	held := true
+	defer func() {
+		if held {
+			archive.mu.RUnlock()
+		}
+	}()
+	commitDone := serveInBackground(t, service, session, actionsBlockRequest(t, uploadURL, "blocklist", "",
+		bytes.NewBufferString(`<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>YQ==</Latest></BlockList>`)))
+	awaitCondition(t, "the commit waiting for the archive", func() bool {
+		return archive.exclusiveWaiting.Load() == 1
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	if err := archive.lockShared(ctx); err == nil {
+		archive.mu.RUnlock()
+		t.Fatal("a block was let in beside a block in transfer while a commit waited")
+	}
+
+	archive.mu.RUnlock()
+	held = false
+	if result := <-commitDone; result.err == nil && result.status == 0 {
+		t.Fatalf("the commit was never answered: %+v", result)
+	}
+}
+
 // A BLOB REQUEST LET IN AFTER ITS SESSION CLOSED FINDS THE ARCHIVE SHUT: it no
 // longer holds the session's lock while it waits for the archive, so the close
-// can come in between.
+// comes in between, which is staged here.
 func TestABlobRequestAfterItsSessionClosedIsRefused(t *testing.T) {
 	t.Parallel()
 
 	service, _, session, _ := testActionsService(t)
-	create := actionsRequestForTest(t, http.MethodPost,
-		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"closing","version":"v2"}`)
-	response, _, err := service.actionsResponse(create, session)
-	if err != nil {
-		t.Fatalf("CreateCacheEntry: %v", err)
-	}
-	created := responseJSON(t, response)
-	uploadURL, ok := created["signed_upload_url"].(string)
-	if !ok || uploadURL == "" {
-		t.Fatalf("CreateCacheEntry response = %v", created)
-	}
+	uploadURL, archive := reserveActionsUpload(t, service, session, "closing")
 
+	archive.mu.Lock()
+	held := true
+	defer func() {
+		if held {
+			archive.mu.Unlock()
+		}
+	}()
+	done := serveInBackground(t, service, session,
+		actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")))
+	awaitCondition(t, "the block waiting for the archive", func() bool {
+		return archive.sharedWaiting.Load() == 1
+	})
 	session.closing.Store(true)
-	response, err = service.serveActionsBlob(
-		actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")), session)
-	if err != nil || response.StatusCode != http.StatusForbidden {
-		t.Fatalf("a block for a closing session: status=%v error=%v; want 403", response, err)
+	archive.mu.Unlock()
+	held = false
+
+	if result := <-done; result.err != nil || result.status != http.StatusForbidden {
+		t.Fatalf("a block let in after its session closed: %+v; want 403", result)
 	}
-	response.Body.Close()
 }
 
 // THE CONNECT IS ANSWERED WHILE THE SESSION IS BUSY (#694), and refused once it
@@ -257,53 +340,162 @@ func TestAnActionsFailureReplacesAnEarlierServedOutcome(t *testing.T) {
 	if record.Observed.ActionsCache != string(alloc.ActionsCacheUnavailable) || !record.Observed.Reported {
 		t.Fatalf("session record = %+v, want the failure kept and reported", record.Observed)
 	}
-	var told []alloc.ActionsCache
-	for _, call := range observer.recorded() {
-		told = append(told, call.obs.ActionsCache)
-	}
-	if len(told) != 2 || told[0] != alloc.ActionsCacheServed || told[1] != alloc.ActionsCacheUnavailable {
+	if told := observedActions(observer); len(told) != 2 || told[0] != alloc.ActionsCacheServed ||
+		told[1] != alloc.ActionsCacheUnavailable {
 		t.Fatalf("observer was told %v, want served and then unavailable, each once", told)
+	}
+}
+
+// A FAILURE OBSERVED WHILE THE SESSION'S LOCK IS BUSY IS NOT LOST: a renewal
+// holds it across storage for longer than an observation waits, and the job
+// was then settled with its earlier served.
+func TestAnActionsFailureObservedUnderABusyLockIsSettled(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	service.observeActions(t.Context(), session, alloc.ActionsCacheServed)
+
+	session.mu.Lock()
+	service.observeActions(t.Context(), session, alloc.ActionsCacheUnavailable)
+	if session.observed.ActionsCache != string(alloc.ActionsCacheServed) {
+		session.mu.Unlock()
+		t.Fatal("the observation was written without the session's lock")
+	}
+	session.mu.Unlock()
+
+	if err := service.Cleanup(t.Context(), session.instance); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	told := observedActions(observer)
+	if len(told) == 0 || told[len(told)-1] != alloc.ActionsCacheUnavailable {
+		t.Fatalf("observer was told %v, want the failure last", told)
 	}
 }
 
 // A SAVE WHOSE BLOCK FAILED ON THE NODE IS NOT RECORDED AS SERVED (#694). A blob
 // leg is not a CacheService call, and only those were observed, so the job
-// carried its reservation's `served`.
+// carried its reservation's `served`. Storage that refuses the block is
+// billet's failure.
 func TestABlobLegThatFailsLocallyRecordsTheJobAsUnavailable(t *testing.T) {
 	t.Parallel()
 
 	service, _, session, _ := testActionsService(t)
 	observer := &recordingObserver{}
 	service.SetCacheObserver(observer)
-	proxy := service.actionsProxy()
-	if proxy == nil {
-		t.Fatal("the intercepting session has no proxy")
+	uploadURL, archive := reserveActionsUpload(t, service, session, "broken")
+	if err := os.RemoveAll(service.actionsStagingPath(session, archive)); err != nil {
+		t.Fatalf("remove the staging directory: %v", err)
 	}
 
-	create := actionsRequestForTest(t, http.MethodPost,
-		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"cut","version":"v2"}`)
-	response, handled := proxy.respond(create, session)
-	if !handled || response.StatusCode != http.StatusOK {
-		t.Fatalf("CreateCacheEntry handled=%t status=%v", handled, response)
+	response, handled := service.actionsProxy().respond(
+		actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")), session)
+	if !handled || response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("a block storage refused: handled=%t status=%v; want a local 502", handled, response)
 	}
-	created := responseJSON(t, response)
-	uploadURL, ok := created["signed_upload_url"].(string)
-	if !ok || uploadURL == "" {
-		t.Fatalf("CreateCacheEntry response = %v", created)
-	}
+	closeActionsResponse(t, response)
 
-	response, handled = proxy.respond(
+	if told := observedActions(observer); len(told) != 2 || told[0] != alloc.ActionsCacheServed ||
+		told[1] != alloc.ActionsCacheUnavailable {
+		t.Fatalf("observer was told %v, want served for the reservation and then unavailable", told)
+	}
+}
+
+// A BODY THE GUEST CUT SHORT IS NOT BILLET'S FAILURE, and does not replace the
+// reservation's outcome: a client that retries and succeeds would otherwise be
+// recorded as failed.
+func TestABlockTheGuestCutShortIsNotRecordedAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	uploadURL, _ := reserveActionsUpload(t, service, session, "cut")
+
+	response, handled := service.actionsProxy().respond(
 		actionsBlockRequest(t, uploadURL, "block", "YQ==", &cutBlockBody{}), session)
 	if !handled || response.StatusCode != http.StatusBadGateway {
 		t.Fatalf("a cut block handled=%t status=%v; want a local 502", handled, response)
 	}
 	closeActionsResponse(t, response)
 
-	var told []alloc.ActionsCache
-	for _, call := range observer.recorded() {
-		told = append(told, call.obs.ActionsCache)
+	if told := observedActions(observer); len(told) != 1 || told[0] != alloc.ActionsCacheServed {
+		t.Fatalf("observer was told %v, want only the reservation's served", told)
 	}
-	if len(told) != 2 || told[0] != alloc.ActionsCacheServed || told[1] != alloc.ActionsCacheUnavailable {
-		t.Fatalf("observer was told %v, want served for the reservation and then unavailable", told)
+}
+
+// AN ARCHIVE THIS PROCESS COULD NOT MOUNT AGAIN IS BILLET'S FAILURE, answered as
+// one and recorded, not refused as if the URL were unknown.
+func TestALostArchiveIsRecordedAsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	uploadURL, archive := reserveActionsUpload(t, service, session, "lost")
+	session.mu.Lock()
+	archive.lost = true
+	session.mu.Unlock()
+
+	response, handled := service.actionsProxy().respond(
+		actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")), session)
+	if !handled || response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("a block for a lost archive handled=%t status=%v; want a local 502", handled, response)
+	}
+	closeActionsResponse(t, response)
+
+	if told := observedActions(observer); len(told) != 2 || told[1] != alloc.ActionsCacheUnavailable {
+		t.Fatalf("observer was told %v, want served and then unavailable", told)
+	}
+}
+
+// AN ARCHIVE THAT FAILS TO READ WHILE IT IS SERVED IS RECORDED, when the session
+// settles: the read happens as the answer is written, after the request's
+// disposition was recorded.
+func TestADownloadThatFailsToReadIsRecordedAsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	service, storage, session, volumes := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	storage.current = "g1"
+	volumes.published = []byte("archive-body")
+	proxy := service.actionsProxy()
+	lookup := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsDownloadPath,
+		`{"key":"reads","restore_keys":[],"version":"v1"}`)
+	response, handled := proxy.respond(lookup, session)
+	if !handled || response.StatusCode != http.StatusOK {
+		t.Fatalf("GetCacheEntryDownloadURL handled=%t status=%v", handled, response)
+	}
+	found := responseJSON(t, response)
+	downloadURL, ok := found["signed_download_url"].(string)
+	if !ok || downloadURL == "" {
+		t.Fatalf("GetCacheEntryDownloadURL response = %v", found)
+	}
+
+	response, handled = proxy.respond(actionsRequestForTest(t, http.MethodGet, downloadURL, ""), session)
+	if !handled || response.StatusCode != http.StatusOK {
+		t.Fatalf("download handled=%t status=%v", handled, response)
+	}
+	defer response.Body.Close()
+	file, ok := response.Body.(*limitedFile)
+	if !ok {
+		t.Fatalf("the download's body is a %T, not the archive", response.Body)
+	}
+	if err := file.file.Close(); err != nil {
+		t.Fatalf("close the archive under the answer: %v", err)
+	}
+	if _, err := io.ReadAll(response.Body); err == nil {
+		t.Fatal("reading a closed archive succeeded")
+	}
+	if err := service.Cleanup(t.Context(), session.instance); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	if told := observedActions(observer); len(told) != 2 || told[0] != alloc.ActionsCacheServed ||
+		told[1] != alloc.ActionsCacheUnavailable {
+		t.Fatalf("observer was told %v, want served and then unavailable", told)
 	}
 }

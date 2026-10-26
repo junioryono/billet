@@ -661,8 +661,13 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 				"instance", session.instance, "path", req.URL.Path, "error", err)
 			// A BLOB LEG'S FAILURE IS RECORDED TOO, though a blob leg is not a
 			// CacheService call: a save whose blocks failed on the node was
-			// otherwise recorded as whatever its reservation was (#694).
-			p.service.observeActions(req.Context(), session, alloc.ActionsCacheUnavailable)
+			// otherwise recorded as whatever its reservation was (#694). A body the
+			// guest cut short, or a request that ran out of time, is not billet's
+			// failure to record; what it says is not known.
+			if !errors.Is(err, errActionsBodyCut) && !errors.Is(err, context.Canceled) &&
+				!errors.Is(err, context.DeadlineExceeded) {
+				p.service.observeActions(req.Context(), session, alloc.ActionsCacheUnavailable)
+			}
 
 			return actionsBlobError(http.StatusBadGateway, "Actions cache storage is unavailable"), true
 		}

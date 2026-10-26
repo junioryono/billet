@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -68,8 +69,13 @@ type actionsArchive struct {
 	// mu is held shared by a blob request and alone by whatever changes the
 	// archive's file or its mount: a single-shot upload, the block list's commit,
 	// the finalization and the session's cleanup. A block is its own file, so the
-	// client's concurrent blocks are written side by side.
-	mu        sync.RWMutex         `json:"-"`
+	// client's concurrent blocks are written side by side. Taken only through
+	// lockShared and lockExclusive.
+	mu sync.RWMutex `json:"-"`
+	// exclusiveWaiting and sharedWaiting count who is waiting for mu.
+	exclusiveWaiting atomic.Int32 `json:"-"`
+	sharedWaiting    atomic.Int32 `json:"-"`
+
 	ID        string               `json:"id"`
 	Signature string               `json:"signature"`
 	Mode      string               `json:"mode"`
@@ -82,6 +88,47 @@ type actionsArchive struct {
 	// restart (RestoreMounts); it is served and finalized as if absent. Never
 	// recorded.
 	lost bool
+}
+
+// lockExclusive takes the archive alone. AN EXCLUSIVE WAITER ADMITS NO NEW
+// SHARED HOLDER: a lock taken by polling announces no waiting writer, so blocks
+// arriving one after another would otherwise keep a commit, a finalization or a
+// cleanup out until its request expired.
+func (a *actionsArchive) lockExclusive(ctx context.Context) error {
+	a.exclusiveWaiting.Add(1)
+	defer a.exclusiveWaiting.Add(-1)
+
+	return lockCacheMutex(ctx, &a.mu)
+}
+
+// lockShared takes the archive beside the other blob requests, once nothing
+// waits to hold it alone.
+func (a *actionsArchive) lockShared(ctx context.Context) error {
+	a.sharedWaiting.Add(1)
+	defer a.sharedWaiting.Add(-1)
+
+	return pollCacheLock(ctx, func() bool { return a.exclusiveWaiting.Load() == 0 && a.mu.TryRLock() })
+}
+
+// errActionsArchiveLost is a blob request for an archive this process could not
+// mount again after a restart: billet's own failure, not an unknown archive.
+var errActionsArchiveLost = errors.New("the Actions cache archive could not be mounted again after a restart")
+
+// errActionsBodyCut is the guest's request body ending or failing before it was
+// whole: the client's doing, or its network's, never billet's storage.
+var errActionsBodyCut = errors.New("the guest's request body was cut short")
+
+// actionsGuestBody marks a failure reading the guest's request body as the
+// guest's.
+type actionsGuestBody struct{ io.Reader }
+
+func (b actionsGuestBody) Read(buffer []byte) (int, error) {
+	count, err := b.Reader.Read(buffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		err = fmt.Errorf("%w: %w", errActionsBodyCut, err)
+	}
+
+	return count, err
 }
 
 type actionsReceipt struct {
@@ -258,6 +305,12 @@ func actionsCacheCall(req *http.Request) bool {
 func (s *CacheService) observeActions(
 	ctx context.Context, session *cacheSession, outcome alloc.ActionsCache,
 ) {
+	// A FAILURE IS KEPT EVEN WHEN THE LOCK IS NOT HAD: the next write of the
+	// record takes it up (absorbActionsFailure), so a renewal holding the lock
+	// across storage cannot leave the job recorded as served.
+	if outcome == alloc.ActionsCacheUnavailable {
+		session.actionsFailed.Store(true)
+	}
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
 	defer cancel()
 
@@ -884,7 +937,7 @@ func (s *CacheService) finalizeActionsCache(
 
 		return actionsJSONResponse(map[string]any{"ok": false})
 	}
-	if err := lockCacheMutex(ctx, &archive.mu); err != nil {
+	if err := archive.lockExclusive(ctx); err != nil {
 		session.mu.Unlock()
 
 		return nil, err
@@ -1200,11 +1253,15 @@ func (s *CacheService) serveActionsBlob(
 		return nil, err
 	}
 	archive := session.actions[id]
-	if session.closed || archive == nil || archive.lost ||
-		req.URL.Query().Get("sig") != archive.Signature {
+	if session.closed || archive == nil || req.URL.Query().Get("sig") != archive.Signature {
 		session.mu.Unlock()
 
 		return actionsBlobError(http.StatusForbidden, "cache archive is unavailable"), nil
+	}
+	if archive.lost {
+		session.mu.Unlock()
+
+		return nil, errActionsArchiveLost
 	}
 	exclusive := archive.Mode == actionsModeUpload && req.Method == http.MethodPut &&
 		req.URL.Query().Get("comp") != "block"
@@ -1213,12 +1270,12 @@ func (s *CacheService) serveActionsBlob(
 	// everything else of the job's queued behind that wait (#694).
 	session.mu.Unlock()
 	if exclusive {
-		if err := lockCacheMutex(req.Context(), &archive.mu); err != nil {
+		if err := archive.lockExclusive(req.Context()); err != nil {
 			return nil, err
 		}
 		defer archive.mu.Unlock()
 	} else {
-		if err := pollCacheLock(req.Context(), archive.mu.TryRLock); err != nil {
+		if err := archive.lockShared(req.Context()); err != nil {
 			return nil, err
 		}
 		defer archive.mu.RUnlock()
@@ -1246,6 +1303,7 @@ func (s *CacheService) uploadActionsBlob(
 	if req.Method != http.MethodPut || archive.Unmounted {
 		return actionsBlobError(http.StatusMethodNotAllowed, "upload method is unavailable"), nil
 	}
+	body := actionsGuestBody{req.Body}
 
 	switch req.URL.Query().Get("comp") {
 	case "":
@@ -1253,7 +1311,7 @@ func (s *CacheService) uploadActionsBlob(
 			return actionsBlobError(http.StatusBadRequest, "blob type must be BlockBlob"), nil
 		}
 		if err := writeActionsFile(req.Context(), s.actionsArchivePath(session, archive),
-			s.actionsStagingPath(session, archive), req.Body, actionsArchiveLimit); err != nil {
+			s.actionsStagingPath(session, archive), body, actionsArchiveLimit); err != nil {
 			return nil, err
 		}
 	case "block":
@@ -1262,11 +1320,11 @@ func (s *CacheService) uploadActionsBlob(
 			return actionsBlobError(http.StatusBadRequest, "block id is invalid"), nil
 		}
 		if err := writeActionsFile(req.Context(), s.actionsBlockPath(session, archive, blockID),
-			s.actionsStagingPath(session, archive), req.Body, actionsArchiveLimit); err != nil {
+			s.actionsStagingPath(session, archive), body, actionsArchiveLimit); err != nil {
 			return nil, err
 		}
 	case "blocklist":
-		if err := s.commitActionsBlockList(req.Context(), req.Body, session, archive); err != nil {
+		if err := s.commitActionsBlockList(req.Context(), body, session, archive); err != nil {
 			return nil, err
 		}
 	default:
@@ -1560,14 +1618,35 @@ func (s *CacheService) downloadActionsBlob(
 
 		return nil, err
 	}
-	response.Body = &limitedFile{Reader: io.LimitReader(file, length), file: file}
+	response.Body = &limitedFile{Reader: io.LimitReader(file, length), file: file,
+		service: s, session: session, archive: archive.ID}
 
 	return response, nil
 }
 
+// limitedFile is an archive's answer, read as it is written to the guest. A
+// read of the archive that fails is billet's failure, marked on the session for
+// the next write of its record to take up (absorbActionsFailure): it happens
+// after the request's disposition was recorded, and outside its lock.
 type limitedFile struct {
 	io.Reader
-	file *os.File
+	file    *os.File
+	service *CacheService
+	session *cacheSession
+	archive string
+	told    bool
+}
+
+func (f *limitedFile) Read(buffer []byte) (int, error) {
+	count, err := f.Reader.Read(buffer)
+	if err != nil && !errors.Is(err, io.EOF) && !f.told && f.session != nil {
+		f.told = true
+		f.session.actionsFailed.Store(true)
+		f.service.log.Warn("an Actions cache archive could not be read while it was being served",
+			"instance", f.session.instance, "archive", f.archive, "error", err)
+	}
+
+	return count, err
 }
 
 func (f *limitedFile) Close() error { return f.file.Close() }

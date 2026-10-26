@@ -171,6 +171,10 @@ type cacheSession struct {
 	// answered.
 	inflight int
 	closed   bool
+	// actionsFailed says a call or a blob leg billet owned failed locally, set
+	// without the session lock so a busy lock cannot lose it; absorbActionsFailure
+	// moves it into observed.
+	actionsFailed atomic.Bool
 	// closing mirrors closed without the session lock, which RetryClosed holds
 	// for the whole of a discard. Closing an already closed session must not
 	// wait on storage.
@@ -387,7 +391,7 @@ func (s *CacheService) SetCacheObserver(observer CacheObserver) { s.observer = o
 // costs nothing and a later, different observation cannot replace what the
 // guest first saw.
 func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs alloc.CacheObservation) {
-	changed := false
+	changed := absorbActionsFailure(session)
 
 	if obs.ImageCache != "" && session.observed.ImageCache == "" {
 		session.observed.ImageCache = string(obs.ImageCache)
@@ -395,12 +399,9 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 		changed = true
 	}
 
-	// A LOCAL FAILURE IS NOT HIDDEN BEHIND AN EARLIER SUCCESS: a job whose restore
-	// was served and whose save then failed on the node was recorded as served,
-	// and nothing showed the save was lost (#694).
-	if obs.ActionsCache != "" && (session.observed.ActionsCache == "" ||
-		obs.ActionsCache == alloc.ActionsCacheUnavailable &&
-			session.observed.ActionsCache != string(alloc.ActionsCacheUnavailable)) {
+	// A local failure has already replaced the Actions half above, whatever came
+	// before it: observeActions marks it on the session (#694).
+	if obs.ActionsCache != "" && session.observed.ActionsCache == "" {
 		session.observed.ActionsCache = string(obs.ActionsCache)
 		session.observed.ActionsPending = false
 		changed = true
@@ -534,13 +535,28 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 
 	obs.BuildCaches = settledBuildCaches(session)
 
-	if obs != (alloc.CacheObservation{}) {
+	if obs != (alloc.CacheObservation{}) || session.actionsFailed.Load() {
 		s.observe(ctx, session, obs)
 
 		return
 	}
 
 	s.report(ctx, session)
+}
+
+// absorbActionsFailure records a local Actions failure observeActions could not
+// write under the lock, and says whether the record changed. Called with
+// session.mu held.
+func absorbActionsFailure(session *cacheSession) bool {
+	if !session.actionsFailed.Load() ||
+		session.observed.ActionsCache == string(alloc.ActionsCacheUnavailable) {
+		return false
+	}
+	session.observed.ActionsCache = string(alloc.ActionsCacheUnavailable)
+	session.observed.ActionsPending = false
+	session.observed.Reported = false
+
+	return true
 }
 
 // buildCacheRank orders what a build cache did by how much it says: a cache
@@ -1143,7 +1159,7 @@ func (s *CacheService) cleanupSession(
 		}
 	}
 	for id, archive := range session.actions {
-		if err := lockCacheMutex(ctx, &archive.mu); err != nil {
+		if err := archive.lockExclusive(ctx); err != nil {
 			failures = append(failures, fmt.Errorf("actions cache %s wait for archive: %w", id, err))
 
 			break
