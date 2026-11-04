@@ -3587,9 +3587,15 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 		return fmt.Errorf("alloc: number lease %s's usage: %w", l.ID, err)
 	}
 
+	mark, err := newUsageMark()
+	if err != nil {
+		return err
+	}
+
 	err = state.WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
 		LeaseID:            l.ID,
 		UsageSeq:           sequence,
+		UsageMark:          mark,
 		Tier:               l.Tier,
 		Node:               node,
 		RunID:              nullableID(l.RunID),
@@ -3655,6 +3661,16 @@ const timestampFormat = "2006-01-02T15:04:05.000000000Z07:00"
 
 // ts renders a timestamp so string comparison matches chronological order.
 func ts(t time.Time) string { return t.UTC().Format(timestampFormat) }
+
+// newUsageMark is drawn each time a number is written. Migration 71 says what it is for.
+func newUsageMark() (string, error) {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("alloc: draw a usage mark: %w", err)
+	}
+
+	return hex.EncodeToString(buf), nil
+}
 
 func newLeaseID() (string, error) {
 	buf := make([]byte, 16)

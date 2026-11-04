@@ -157,12 +157,12 @@ func TestALeaseIsExportedExactlyOnceAcrossARestart(t *testing.T) {
 }
 
 type stubUsageLedger struct {
-	closed state.UsageClose
-	err    error
+	place state.UsagePlace
+	err   error
 }
 
-func (s stubUsageLedger) UsageRecordAt(context.Context, int64) (state.UsageClose, error) {
-	return s.closed, s.err
+func (s stubUsageLedger) UsageRecordAt(context.Context, int64) (state.UsagePlace, error) {
+	return s.place, s.err
 }
 
 // A CURSOR THAT CANNOT BE TRUSTED IS REFUSED BY NAME, because the alternative is
@@ -172,11 +172,10 @@ func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
 	t.Parallel()
 
 	const (
-		lease  = "feedfacefeedfacefeedfacefeedface"
-		closed = "2026-11-03T10:04:00.000000000Z"
+		lease = "feedfacefeedfacefeedfacefeedface"
+		mark  = "0123456789abcdef"
 	)
 
-	mark := usageCloseMark(closed)
 	good := usageCursor{usageDeployment, 7, lease, mark}.String()
 	readFailed := errors.New("the database went away")
 
@@ -189,26 +188,24 @@ func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
 		"not a cursor":       {since: "yesterday", want: "not a cursor this billet wrote"},
 		"a later format":     {since: strings.Replace(good, "u1.", "u2.", 1), want: "not a cursor this billet wrote"},
 		"a zero place":       {since: "u1." + usageDeployment + ".0." + lease + "." + mark, want: "not a cursor this billet wrote"},
-		"no close":           {since: "u1." + usageDeployment + ".7." + lease, want: "not a cursor this billet wrote"},
+		"no mark":            {since: "u1." + usageDeployment + ".7." + lease, want: "not a cursor this billet wrote"},
 		"another deployment": {since: usageCursor{"ffffffffffffffffffffffffffffffff", 7, lease, mark}.String(), want: "deployment ffffffffffffffffffffffffffffffff's cursor"},
 		"restored, shorter": {
 			since: good, ledger: stubUsageLedger{err: state.ErrNoUsageRecord},
 			want: "holds no record 7",
 		},
 		"restored, numbered over": {
-			since: good, ledger: stubUsageLedger{closed: state.UsageClose{
-				LeaseID: "badbadbadbadbadbadbadbadbadbadba", FinishedAt: closed,
+			since: good, ledger: stubUsageLedger{place: state.UsagePlace{
+				LeaseID: "badbadbadbadbadbadbadbadbadbadba", Mark: mark,
 			}},
-			want: "is not the close --since names",
+			want: "is not the one --since names",
 		},
-		// THE LEASE AGREES AND THE CLOSE DOES NOT: a restored ledger closed this
-		// lease again at this number, and may have closed another before it that
-		// the exporter would skip.
-		"restored, the same lease closed again": {
-			since: good, ledger: stubUsageLedger{closed: state.UsageClose{
-				LeaseID: lease, FinishedAt: "2026-11-04T01:02:03.000000000Z",
-			}},
-			want: "is not the close --since names",
+		// THE LEASE AGREES AND THE MARK DOES NOT: a restored ledger gave this lease this
+		// number again, and may have given another a lower one that the exporter would
+		// skip.
+		"restored, the same lease numbered again": {
+			since: good, ledger: stubUsageLedger{place: state.UsagePlace{LeaseID: lease, Mark: "fedcba9876543210"}},
+			want: "is not the one --since names",
 		},
 		"could not read": {since: good, ledger: stubUsageLedger{err: readFailed}, wantIs: readFailed},
 	} {
@@ -237,7 +234,7 @@ func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
 		})
 	}
 
-	after, err := resumeUsage(t.Context(), stubUsageLedger{closed: state.UsageClose{LeaseID: lease, FinishedAt: closed}},
+	after, err := resumeUsage(t.Context(), stubUsageLedger{place: state.UsagePlace{LeaseID: lease, Mark: mark}},
 		usageDeployment, good)
 	if err != nil || after != 7 {
 		t.Fatalf("a cursor this ledger holds resumed at %d, %v; want 7", after, err)
@@ -257,7 +254,7 @@ func usageConfig(t *testing.T, weight config.MinuteWeight) *config.Config {
 
 func knownUsageRow() *state.UsageRow {
 	return &state.UsageRow{
-		Sequence: 9, LeaseID: "feedface", Tier: "plain", Target: "acme", Repository: "acme/api",
+		Sequence: 9, Mark: "0123456789abcdef", LeaseID: "feedface", Tier: "plain", Target: "acme", Repository: "acme/api",
 		Provider: string(config.ProviderEC2), InstanceType: "c7i.xlarge", Site: "us-west-2",
 		VCPU: 4, Memory: 16 << 30, PriceMicrosPerHour: 360_000,
 		BoughtAt:   "2026-11-03T10:00:00.000000000Z",
@@ -282,7 +279,7 @@ func TestAKnownLeaseReportsEveryNumber(t *testing.T) {
 	if r.Ownership != usageBought {
 		t.Errorf("ownership = %q, want %q", r.Ownership, usageBought)
 	}
-	if want := "u1." + usageDeployment + ".9.feedface." + usageCloseMark(knownUsageRow().FinishedAt); r.Cursor != want {
+	if want := "u1." + usageDeployment + ".9.feedface.0123456789abcdef"; r.Cursor != want {
 		t.Errorf("cursor = %q, want %q", r.Cursor, want)
 	}
 	if r.VCPU == nil || *r.VCPU != 4 || r.MemoryBytes == nil || *r.MemoryBytes != 16<<30 {
@@ -753,6 +750,141 @@ func TestAnExportSaysWhenOlderLeasesAreStillBeingNumbered(t *testing.T) {
 	}
 	if strings.Contains(out, strings.Repeat("a", 32)) || strings.Contains(out, "still being numbered") {
 		t.Errorf("the waiting lease reached the records:\n%s", out)
+	}
+}
+
+// stagedUsagePage is a ledger whose last batch commits between two reads, whichever
+// comes first: the page is empty and nothing is waiting once it has been asked.
+type stagedUsagePage struct{ paged bool }
+
+func (s *stagedUsagePage) UsageStillNumbering(context.Context) (bool, error) { return !s.paged, nil }
+
+func (s *stagedUsagePage) UsageSince(context.Context, int64, int) ([]state.UsageRow, error) {
+	s.paged = true
+
+	return nil, nil
+}
+
+// THE LAST BATCH CANNOT MAKE AN EMPTY PAGE LOOK LIKE THE END. Read the other way round,
+// this interleaving prints nothing and says nothing, and a reader stops short of it.
+func TestAnEmptyPageBesideABatchCommittingStillSaysSo(t *testing.T) {
+	t.Parallel()
+
+	rows, waiting, err := readUsagePage(t.Context(), &stagedUsagePage{}, 0, 10)
+	if err != nil {
+		t.Fatalf("readUsagePage: %v", err)
+	}
+	if len(rows) != 0 || !waiting {
+		t.Fatalf("rows %d, waiting %v; an empty page read as the end of a history still being numbered", len(rows), waiting)
+	}
+}
+
+// A BACKUP TAKEN WHILE A LEASE WAITED FOR ITS NUMBER CANNOT PASS AN OLD CURSOR. Restored,
+// the ledger closes a lease nobody read and gives the waiting lease the number and the
+// time it had, so only the mark tells the two histories apart.
+func TestACursorFromBeforeARestoreIsRefusedWhenTheSameLeaseTookTheSameNumber(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeJobsConfig(t, stateDir)
+
+	finishUsageLeases(t, stateDir, 0)
+
+	waiting := strings.Repeat("b", 32)
+
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `INSERT INTO job_history (lease_id, tier, queued_at, finished_at)
+			VALUES ('`+waiting+`', 'billet-2vcpu', 't', '2026-01-01T00:00:00.000000000Z')`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the ledger: %v", err)
+	}
+
+	backup := t.TempDir()
+	copyLedger(t, stateDir, backup)
+
+	number := func() {
+		t.Helper()
+
+		db, err := state.Open(t.Context(), stateDir)
+		if err != nil {
+			t.Fatalf("open the ledger: %v", err)
+		}
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Fatalf("close the ledger: %v", err)
+			}
+		}()
+
+		a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+		if err != nil {
+			t.Fatalf("alloc.New: %v", err)
+		}
+
+		if n, err := a.NumberUsage(t.Context(), []string{waiting}); err != nil || n != 1 {
+			t.Fatalf("NumberUsage = %d, %v", n, err)
+		}
+	}
+
+	finishUsageLeases(t, stateDir, 1)
+	number()
+
+	records := exportUsage(t, cfg, "", "10")
+	if len(records) != 2 || records[1].LeaseID != waiting || records[1].Sequence != 2 {
+		t.Fatalf("before the restore the export read %+v", records)
+	}
+
+	cursor := records[1].Cursor
+
+	copyLedger(t, backup, stateDir)
+
+	unread := finishUsageLeases(t, stateDir, 1)
+	number()
+
+	env, out := bufferedEnv()
+
+	err = Usage(t.Context(), env, []string{"export", "--config", cfg, "--json", "--since", cursor})
+	if err == nil || !strings.Contains(err.Error(), "is not the one --since names") {
+		t.Fatalf("got %v and printed %q; the cursor would skip %s, which nobody has read", err, out.String(), unread[0])
+	}
+	if out.Len() != 0 {
+		t.Errorf("a refused resume printed:\n%s", out.String())
+	}
+}
+
+// copyLedger replaces what is in to with the closed ledger in from, sidecars included.
+func copyLedger(t *testing.T, from, to string) {
+	t.Helper()
+
+	stale, err := filepath.Glob(state.LedgerPath(to) + "*")
+	if err != nil {
+		t.Fatalf("list the ledger's files: %v", err)
+	}
+	for _, path := range stale {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+	}
+
+	files, err := filepath.Glob(state.LedgerPath(from) + "*")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no ledger in %s (%v)", from, err)
+	}
+	for _, path := range files {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		name := strings.TrimPrefix(path, state.LedgerPath(from))
+		if err := os.WriteFile(state.LedgerPath(to)+name, body, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
 	}
 }
 
