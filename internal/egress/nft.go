@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -111,6 +112,13 @@ func bounded(s string) string {
 	}
 
 	return s
+}
+
+// validMark says a mark is one a guest could hold. Zero matters most: it is what every
+// packet and connection nobody marked carries, so rules or a deletion naming it reach all
+// of them.
+func validMark(mark uint32) bool {
+	return mark&^uint32(maxSlot) == markBase && mark&maxSlot != 0
 }
 
 // absent reports whether an nft listing failed because the object is not there,
@@ -357,18 +365,42 @@ func redirectRules(key string, mark uint32, port uint16) string {
 		"add rule %[1]s dns_%[2]s tcp dport 53 ct mark set %#[3]x redirect to :%[4]d\n", natTable, key, mark, port)
 }
 
-// retargetScript points a guest's redirect at a new socket, for a process that
-// adopted it. The chain and its sets are kept, so what its names admitted stays
-// admitted across the change of process.
-func retargetScript(key string, mark uint32, port uint16) string {
-	return fmt.Sprintf("flush chain %s dns_%s\n", natTable, key) + redirectRules(key, mark, port)
-}
-
 // quarantineScript sends a guest's DNS nowhere, for a guest no resolver here will serve:
 // its redirect names a port this process does not hold, which the kernel can give the next
-// guest's resolver, whose policy would then answer it.
-func quarantineScript(key string) string {
-	return fmt.Sprintf("flush chain %[1]s dns_%[2]s\nadd rule %[1]s dns_%[2]s drop\n", natTable, key)
+// guest's resolver, whose policy would then answer it. THE OWNER'S CHAIN TOO: a redirect
+// is read only when a connection is made, so one the guest holds would go on past it, and
+// that chain sees every packet. Attaching it again puts both back.
+func quarantineScript(key string, mark uint32) string {
+	var s strings.Builder
+
+	for _, c := range []struct{ prefix, element string }{{"dns", "jobs"}, {"own", "owners"}} {
+		fmt.Fprintf(&s, "add chain %s %s_%s\n", natTable, c.prefix, key)
+		fmt.Fprintf(&s, "flush chain %s %s_%s\n", natTable, c.prefix, key)
+		fmt.Fprintf(&s, "add rule %s %s_%s drop\n", natTable, c.prefix, key)
+		fmt.Fprintf(&s, "add element %s %s { %#x : jump %s_%s }\n", natTable, c.element, mark, c.prefix, key)
+	}
+
+	return s.String()
+}
+
+// closedScript gives a guest nothing but ARP, for one whose rules have gone and whose policy
+// nothing can read: it cannot be given its list back, and must not run open.
+func closedScript(key, iface string, kind Kind) string {
+	var s strings.Builder
+
+	table := kind.table()
+
+	fmt.Fprintf(&s, "add chain %s job_%s\n", table, key)
+	fmt.Fprintf(&s, "flush chain %s job_%s\n", table, key)
+
+	if kind == BridgePort {
+		fmt.Fprintf(&s, "add rule %s job_%s ether type arp accept\n", table, key)
+	}
+
+	fmt.Fprintf(&s, "add rule %s job_%s drop\n", table, key)
+	fmt.Fprintf(&s, "add element %s guests { \"%s\" : jump job_%s }\n", table, iface, key)
+
+	return s.String()
 }
 
 // detachScript removes everything attachScript made for one guest.
@@ -597,27 +629,67 @@ func parseRuleTable(out []byte) (ruleTable, error) {
 	return t, nil
 }
 
-// enforces answers whether these tables hold what a listed guest's rules need, from the
-// base chain's dispatch to the guest's last rule: a chain that exists and nothing jumps
-// to, or that a flush emptied, refuses nothing.
-func enforces(guests, routed, nat ruleTable, key, iface string, kind Kind, mark uint32) bool {
-	name, number := fmt.Sprintf("%q", iface), fmt.Sprintf("%d", mark)
+// countRules is how many rules a script puts in each chain, by "family table chain".
+func countRules(script string) map[string]int {
+	out := map[string]int{}
 
-	base := guests.rules["prerouting"] >= 1 && guests.rules["output"] >= 1 &&
-		nat.rules["prerouting"] >= 1 && nat.rules["own"] >= 2
-
-	own := guests.maps["guests"][name] == "job_"+key && guests.rules["job_"+key] > 0 && guests.rules["deny_"+key] > 0 &&
-		guests.maps["replies"][number] == "reply_"+key && guests.rules["reply_"+key] > 0 &&
-		nat.maps["jobs"][number] == "dns_"+key && nat.rules["dns_"+key] > 0 &&
-		nat.maps["owners"][number] == "own_"+key && nat.rules["own_"+key] > 0
-
-	if kind != BridgePort {
-		return base && own
+	for line := range strings.SplitSeq(script, "\n") {
+		if fields := strings.Fields(line); len(fields) > 4 && fields[0] == "add" && fields[1] == "rule" {
+			out[strings.Join(fields[2:5], " ")]++
+		}
 	}
 
-	return base && own && guests.rules["forward"] >= 2 && guests.maps["ports"][name] == "fwd_"+key &&
-		guests.rules["fwd_"+key] > 0 && routed.rules["port_l3"] >= 1 &&
-		slices.Contains(routed.sets["bridge_ports"], name)
+	return out
+}
+
+// heldRules is what the three tables hold.
+type heldRules struct {
+	bridge, routed, nat ruleTable
+}
+
+func (h heldRules) of(table string) ruleTable {
+	switch table {
+	case BridgePort.table():
+		return h.bridge
+	case Routed.table():
+		return h.routed
+	}
+
+	return h.nat
+}
+
+// enforces answers whether these tables hold what a listed guest's rules need, from the
+// base chains' dispatch to its last rule. EVERY CHAIN HOLDS AS MANY RULES AS ITS RENDERING
+// WOULD PUT THERE: a chain that exists and nothing jumps to, that a flush emptied, or that
+// has lost the one rule that refuses, refuses nothing. It does not read the rules' text, so
+// a rule rewritten in place by hand reads as whole.
+func (h heldRules) enforces(b binding) bool {
+	for chain, want := range countRules(baseScript() + attachScript(b)) {
+		fields := strings.Fields(chain)
+		if h.of(fields[0] + " " + fields[1]).rules[fields[2]] != want {
+			return false
+		}
+	}
+
+	guests, nat := h.of(b.kind.table()), h.nat
+	name, number := fmt.Sprintf("%q", b.iface), strconv.FormatUint(uint64(b.mark), 10)
+
+	own := guests.maps["guests"][name] == "job_"+b.key && guests.maps["replies"][number] == "reply_"+b.key &&
+		nat.maps["jobs"][number] == "dns_"+b.key && nat.maps["owners"][number] == "own_"+b.key
+
+	if b.kind != BridgePort {
+		return own
+	}
+
+	return own && guests.maps["ports"][name] == "fwd_"+b.key && slices.Contains(h.routed.sets["bridge_ports"], name)
+}
+
+// dispatches answers whether a guest's chain is reached and holds anything.
+func (h heldRules) dispatches(key, iface string, kind Kind) bool {
+	guests := h.of(kind.table())
+
+	return guests.rules["prerouting"] > 0 && guests.maps["guests"][fmt.Sprintf("%q", iface)] == "job_"+key &&
+		guests.rules["job_"+key] > 0
 }
 
 // mapElement is one element of a verdict map: a key and the chain it jumps to.

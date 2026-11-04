@@ -112,8 +112,13 @@ type Host struct {
 	// the first Reconcile can do: until then nothing has said which guests are running.
 	filesJudged bool
 	// unrestored are running guests that may have a list and whose rules could not be put
-	// back, tried again at each recovery. Their files stay: they are all that says so.
-	unrestored map[string]struct{}
+	// back, tried again at each recovery, with the mark held for each (0 for none yet).
+	// Their files stay: they are all that says so.
+	unrestored map[string]uint32
+	// orphanMarks are marks the kernel holds for a guest no interface dispatches to, which a
+	// restore of that guest takes back: its chains are referenced under them, and could not
+	// be deleted otherwise.
+	orphanMarks map[string]uint32
 	// byIface is who the rules matching an interface name belong to, which a
 	// launch reusing the name must clear.
 	byIface map[string]string
@@ -155,7 +160,7 @@ func NewHost(stateDir string, log *slog.Logger, opts ...Option) *Host {
 		log: log, stateDir: stateDir, run: runNft, addrOf: interfaceAddress, locals: localAddresses, forget: forgetConnections, upstreamPort: upstreamDNSPort,
 		notReady: fmt.Errorf("%w: it has not been prepared", ErrNotReady),
 		live:     map[string]*attached{}, foundOnStart: map[string]*attached{}, byIface: map[string]string{},
-		slots: map[uint32]struct{}{}, done: map[string]Record{}, unrestored: map[string]struct{}{},
+		slots: map[uint32]struct{}{}, done: map[string]Record{}, unrestored: map[string]uint32{}, orphanMarks: map[string]uint32{},
 	}
 
 	for _, opt := range opts {
@@ -313,21 +318,34 @@ func (h *Host) nft(ctx context.Context, script string, args ...string) ([]byte, 
 
 // findExisting reads who holds which interface and mark, from the kernel. A map that is
 // not there holds nothing, which is the flushed host Reconcile is there to find.
+//
+// A GUEST'S MARK IS LOOKED FOR IN EVERY MAP THAT KEYS ON ONE. A guest found in none has
+// none, and stays at zero, which nothing renders or deletes by (validMark).
 func (h *Host) findExisting(ctx context.Context) error {
 	marks := map[string]uint32{}
 
-	elements, err := h.listMap(ctx, "ip", "billet_egress_nat", "jobs")
-	if err != nil {
-		return err
-	}
-
-	for _, e := range elements {
-		var mark uint32
-		if err := json.Unmarshal(e.key, &mark); err != nil {
-			return fmt.Errorf("egress: a mark in nft's map: %w", err)
+	for _, source := range []struct{ family, table, name, prefix string }{
+		{"ip", "billet_egress_nat", "jobs", "dns_"},
+		{"ip", "billet_egress_nat", "owners", "own_"},
+		{"bridge", "billet_egress", "replies", "reply_"},
+		{"inet", "billet_egress_routed", "replies", "reply_"},
+	} {
+		elements, err := h.listMap(ctx, source.family, source.table, source.name)
+		if err != nil {
+			return err
 		}
 
-		marks[strings.TrimPrefix(e.target, "dns_")] = mark
+		for _, e := range elements {
+			var mark uint32
+			if err := json.Unmarshal(e.key, &mark); err != nil {
+				return fmt.Errorf("egress: a mark in nft's map: %w", err)
+			}
+
+			key := strings.TrimPrefix(e.target, source.prefix)
+			if _, seen := marks[key]; !seen && validMark(mark) {
+				marks[key] = mark
+			}
+		}
 	}
 
 	found := map[string]*attached{}
@@ -358,6 +376,15 @@ func (h *Host) findExisting(ctx context.Context) error {
 
 	h.scanned = true
 
+	for key, mark := range marks {
+		h.slots[mark] = struct{}{}
+
+		_, isFound := found[key]
+		if _, live := h.live[key]; !isFound && !live {
+			h.orphanMarks[key] = mark
+		}
+	}
+
 	for key, a := range found {
 		// A HOST THAT WAS NOT READY ASKS AGAIN, and what it has restored since is its own.
 		if _, live := h.live[key]; live {
@@ -366,7 +393,6 @@ func (h *Host) findExisting(ctx context.Context) error {
 
 		h.foundOnStart[key] = a
 		h.byIface[a.Interface] = key
-		h.slots[a.mark] = struct{}{}
 	}
 
 	return nil
@@ -431,6 +457,10 @@ func (h *Host) judgeFile(ctx context.Context, key string, running bool) {
 	h.mu.Unlock()
 
 	if live || found {
+		h.mu.Lock()
+		delete(h.unrestored, key)
+		h.mu.Unlock()
+
 		return
 	}
 
@@ -442,12 +472,17 @@ func (h *Host) judgeFile(ctx context.Context, key string, running bool) {
 
 		if settled {
 			delete(h.unrestored, key)
-		} else {
-			h.unrestored[key] = struct{}{}
+		} else if _, held := h.unrestored[key]; !held {
+			h.unrestored[key] = 0
 		}
 	}()
 
 	if !running {
+		h.mu.Lock()
+		mark := h.unrestored[key]
+		h.mu.Unlock()
+
+		h.freeMark(mark)
 		h.removeFile(key)
 
 		return
@@ -470,28 +505,36 @@ func (h *Host) judgeFile(ctx context.Context, key string, running bool) {
 }
 
 // restoreRules puts a running listed guest's rules back from its file, answering whether
-// it could. Its connections go first: their translations outlived the flush, and a query
-// on one would go to a port its old resolver held.
+// it could.
+//
+// ITS OWN MARK, IF IT CAN STILL HAVE IT, and held while this is retried: its connections
+// went on carrying it through whatever took the rules, and what is left of them is keyed on
+// it. Those connections go first, since their translations outlived the rules and a query
+// on one would go to a port its old resolver held. One whose mark another guest has since
+// been given takes a new one, and its old connections expire by themselves, rather than
+// delete that guest's.
 func (h *Host) restoreRules(ctx context.Context, file attachmentFile) bool {
 	h.log.Error("a running guest with a network allowlist has lost its rules, so it has been running "+
 		"open; they are being put back. Something other than billet removed them: `nft flush ruleset`, "+
 		"or a firewall service that does", "guest", file.Key)
 
-	if file.Mark != 0 {
-		if err := h.forget(file.Mark); err != nil {
-			h.log.Error("could not delete a guest's DNS connections, so a socket it holds may reach whatever "+
-				"now listens on its old resolver's port until they expire", "guest", file.Key, "error", err)
-		}
+	mark, err := h.reserveMark(file.Key, file.Mark)
+	if err != nil {
+		h.log.Error("could not put a running guest's network rules back, so it is still running open; "+
+			"this is tried again at the next recovery", "guest", file.Key, "error", err)
+
+		return false
+	}
+
+	if err := h.forget(mark); err != nil {
+		h.log.Error("could not delete a guest's DNS connections, so a socket it holds may reach whatever "+
+			"now listens on its old resolver's port until they expire", "guest", file.Key, "error", err)
 	}
 
 	p, err := Compile(file.Allow)
 	if err == nil {
-		err = h.ensureTables(ctx)
-	}
-
-	if err == nil {
 		err = h.attach(ctx, Attachment{Key: file.Key, Interface: file.Interface, Network: file.Network,
-			Kind: file.Kind}, p, true)
+			Kind: file.Kind}, p, mark)
 	}
 
 	if err != nil {
@@ -504,11 +547,41 @@ func (h *Host) restoreRules(ctx context.Context, file attachmentFile) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	delete(h.orphanMarks, file.Key)
+
 	if a := h.live[file.Key]; a != nil {
 		a.rec.incomplete()
 	}
 
 	return true
+}
+
+// reserveMark holds a mark for restoring a guest: the one already held for it, the one the
+// kernel still has for it, the one its file names if that is free, or a new one.
+func (h *Host) reserveMark(key string, want uint32) (uint32, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if mark := h.unrestored[key]; validMark(mark) {
+		return mark, nil
+	}
+
+	mark := h.orphanMarks[key]
+	if !validMark(mark) {
+		mark = want
+
+		if _, taken := h.slots[mark]; taken || !validMark(mark) {
+			var err error
+			if mark, err = h.allocMarkLocked(); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	h.slots[mark] = struct{}{}
+	h.unrestored[key] = mark
+
+	return mark, nil
 }
 
 // ensureTables makes billet's tables what they should be.
@@ -518,14 +591,11 @@ func (h *Host) ensureTables(ctx context.Context) error {
 	return err
 }
 
-// Verify checks that this process's listed guests still have their rules in force, and
-// puts them back if not. Recovery and the node's sweep both ask, so what a flush opened
-// stays open for one sweep at the most.
-func (h *Host) Verify(ctx context.Context) {
+// verify checks that this process's listed guests still have their rules in force, and
+// puts them back if not.
+func (h *Host) verify(ctx context.Context) {
 	h.mu.Lock()
-	guests := slices.DeleteFunc(slices.Collect(maps.Values(h.live)), func(a *attached) bool {
-		return !a.listed || a.fwd == nil
-	})
+	guests := slices.DeleteFunc(slices.Collect(maps.Values(h.live)), func(a *attached) bool { return !a.listed })
 	h.mu.Unlock()
 
 	if len(guests) == 0 {
@@ -533,28 +603,48 @@ func (h *Host) Verify(ctx context.Context) {
 	}
 
 	held, err := h.readRules(ctx)
-	if err != nil {
-		h.log.Warn("could not read this node's firewall rules, so whether its guests' lists are in force "+
-			"is not known; this is asked again at the next sweep", "error", err)
+	if err == nil {
+		var local []netip.Addr
+		if local, err = h.locals(); err == nil {
+			for _, a := range guests {
+				switch {
+				case a.fwd == nil:
+					if !held.dispatches(a.Key, a.Interface, a.Kind) {
+						h.closeOff(ctx, a)
+					}
+				case !held.enforces(a.binding(local)):
+					h.reinstall(ctx, a)
+				}
+			}
 
-		return
+			return
+		}
 	}
 
-	for _, a := range guests {
-		guestTable := held.bridge
-		if a.Kind == Routed {
-			guestTable = held.routed
-		}
+	h.log.Warn("could not read this node's firewall rules, so whether its guests' lists are in force "+
+		"is not known; this is asked again at the next sweep", "error", err)
+}
 
-		if !enforces(guestTable, held.routed, held.nat, a.Key, a.Interface, a.Kind, a.mark) {
-			h.reinstall(ctx, a)
-		}
+// binding is what a served guest's rules are made from.
+func (a *attached) binding(local []netip.Addr) binding {
+	return binding{
+		key: a.Key, iface: a.Interface, kind: a.Kind, gateway: a.gateway, mark: a.mark, port: a.fwd.port,
+		listed: a.listed, prefixes: a.policy.prefixes, local: local,
 	}
 }
 
-// heldRules is what the three tables hold.
-type heldRules struct {
-	bridge, routed, nat ruleTable
+// closeOff gives a guest whose policy nothing can read, and whose rules have gone, nothing.
+func (h *Host) closeOff(ctx context.Context, a *attached) {
+	h.log.Error("a running guest with a network allowlist nobody can read has lost its rules, so it has "+
+		"been running open; it now reaches nothing. Something other than billet removed them: `nft flush "+
+		"ruleset`, or a firewall service that does", "guest", a.Key)
+
+	a.rec.incomplete()
+
+	if _, err := h.nft(ctx, baseScript()+closedScript(a.Key, a.Interface, a.Kind), "-f", "-"); err != nil {
+		h.log.Error("could not close off a running guest, so it is still running open", "guest", a.Key,
+			"error", err)
+	}
 }
 
 // readRules lists the three tables. One that is not there holds nothing.
@@ -594,24 +684,29 @@ func (h *Host) readRules(ctx context.Context) (heldRules, error) {
 
 // reinstall puts a live listed guest's rules back, atomically, over whatever is left of
 // them. A set that went with them is empty again, so what its names admitted must be asked
-// for again, which closes rather than opens.
+// for again, which closes rather than opens. THE JOB'S REPORT SAYS SO FIRST: this has found
+// it ran open, whether or not the repair works.
 func (h *Host) reinstall(ctx context.Context, a *attached) {
+	h.mu.Lock()
+	still := h.live[a.Key] == a
+	h.mu.Unlock()
+
+	// A LAUNCH UNWINDING, or a destroy, has taken them off on purpose.
+	if !still {
+		return
+	}
+
 	h.log.Error("a running guest with a network allowlist has lost its rules, so it has been running "+
 		"open; they are being put back. Something other than billet removed them: `nft flush ruleset`, "+
 		"or a firewall service that does", "guest", a.Key)
+
+	a.rec.incomplete()
 
 	// READ NOW: a guest on the other bridge reaches the node's cache across the host, on an
 	// address that may have changed since it was launched.
 	local, err := h.locals()
 	if err == nil {
-		err = h.ensureTables(ctx)
-	}
-
-	if err == nil {
-		_, err = h.nft(ctx, attachScript(binding{
-			key: a.Key, iface: a.Interface, kind: a.Kind, gateway: a.gateway, mark: a.mark, port: a.fwd.port,
-			listed: true, prefixes: a.policy.prefixes, local: local,
-		}), "-f", "-")
+		_, err = h.nft(ctx, baseScript()+attachScript(a.binding(local)), "-f", "-")
 	}
 
 	if err != nil {
@@ -623,7 +718,7 @@ func (h *Host) reinstall(ctx context.Context, a *attached) {
 
 	// A DETACH CAN HAVE COME BETWEEN, and has removed what was there before these went in.
 	h.mu.Lock()
-	still := h.live[a.Key] == a
+	still = h.live[a.Key] == a
 	h.mu.Unlock()
 
 	if !still {
@@ -631,8 +726,6 @@ func (h *Host) reinstall(ctx context.Context, a *attached) {
 
 		return
 	}
-
-	a.rec.incomplete()
 
 	a.admitMu.Lock()
 	defer a.admitMu.Unlock()
@@ -683,7 +776,7 @@ func (h *Host) Attach(ctx context.Context, a Attachment, p *Policy) error {
 		return nil
 	}
 
-	err := h.attach(ctx, a, p, false)
+	err := h.attach(ctx, a, p, 0)
 	if err != nil && !p.Listed() && !errors.Is(err, errRulesUncertain) {
 		h.log.Warn("could not watch a guest's DNS; its names will not be recorded", "guest", a.Key, "error", err)
 
@@ -762,6 +855,10 @@ func (h *Host) allocMark() (uint32, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	return h.allocMarkLocked()
+}
+
+func (h *Host) allocMarkLocked() (uint32, error) {
 	for range maxSlot {
 		h.next = h.next%maxSlot + 1
 
@@ -787,9 +884,13 @@ func (h *Host) freeMark(mark uint32) {
 //
 // THE FILE BEFORE THE RULES: a process that dies between the two leaves a file
 // Reconcile can throw away. The other order leaves rules nobody can say the
-// policy of. RESTORING, the file was there first and is kept whatever happens: the
-// guest is running, and it is all that says it has a list.
-func (h *Host) attach(ctx context.Context, a Attachment, p *Policy, restoring bool) error {
+// policy of. RESTORING, with a mark already held for it, the file was there first and
+// both are kept whatever happens: the guest is running, and they are all that say it has
+// a list.
+//
+// THE BASE CHAINS GO IN WITH THE GUEST'S, in one transaction: a chain that nothing jumps
+// to because something emptied them is a list that was not applied.
+func (h *Host) attach(ctx context.Context, a Attachment, p *Policy, reserved uint32) error {
 	gateway, err := h.addrOf(a.Network)
 	if err != nil {
 		return err
@@ -805,9 +906,11 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy, restoring bo
 		}
 	}
 
-	mark, err := h.allocMark()
-	if err != nil {
-		return err
+	restoring, mark := reserved != 0, reserved
+	if !restoring {
+		if mark, err = h.allocMark(); err != nil {
+			return err
+		}
 	}
 
 	// KEPT WITH THE RULES when they may be installed: the mark and the file are how
@@ -815,7 +918,7 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy, restoring bo
 	done, uncertain := false, false
 
 	defer func() {
-		if !done && !uncertain {
+		if !done && !uncertain && !restoring {
 			h.freeMark(mark)
 		}
 	}()
@@ -847,10 +950,7 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy, restoring bo
 		}
 	}()
 
-	if _, err := h.nft(ctx, attachScript(binding{
-		key: a.Key, iface: a.Interface, kind: a.Kind, gateway: gateway, mark: mark, port: guest.fwd.port,
-		listed: p.Listed(), prefixes: p.prefixes, local: local,
-	}), "-f", "-"); err != nil {
+	if _, err := h.nft(ctx, baseScript()+attachScript(guest.binding(local)), "-f", "-"); err != nil {
 		err = fmt.Errorf("egress: install the rules of %s: %w", a.Key, err)
 
 		if settleErr := h.settleFailedInstall(ctx, guest); settleErr != nil {
@@ -949,7 +1049,7 @@ func (h *Host) admit(ctx context.Context, a *attached, addrs []netip.Addr) error
 func (h *Host) Detach(ctx context.Context, key string) {
 	h.mu.Lock()
 	a := h.takeLocked(key)
-	_, unrestored := h.unrestored[key]
+	reserved, unrestored := h.unrestored[key]
 	delete(h.unrestored, key)
 	h.mu.Unlock()
 
@@ -958,6 +1058,7 @@ func (h *Host) Detach(ctx context.Context, key string) {
 		// have the whole story, rather than saying nothing was watching.
 		if unrestored {
 			h.keep(key, newRecorder(true, true).freeze(counts{unread: true}))
+			h.freeMark(reserved)
 			h.removeFile(key)
 		}
 
@@ -1041,15 +1142,37 @@ func (h *Host) removeEachOf(ctx context.Context, script string) error {
 // that made them. Failing to leaves a socket the guest holds reaching its old resolver's
 // port until the connection expires, which the kernel can have given another guest's.
 func (h *Host) forgetFlows(a *attached) {
+	// ZERO IS EVERY CONNECTION NOBODY MARKED, and a guest found with no mark has none to forget.
+	if !validMark(a.mark) {
+		return
+	}
+
 	if err := h.forget(a.mark); err != nil {
 		h.log.Error("could not delete a guest's DNS connections, so a socket it holds may reach whatever now "+
 			"listens on its old resolver's port until they expire", "guest", a.Key, "error", err)
 	}
 }
 
-// quarantine sends a guest's DNS nowhere, for a guest this process cannot serve.
+// quarantine sends a guest's DNS nowhere, for a guest this process cannot serve. A guest
+// whose mark nothing could say has its chain closed too, since that chain marks its DNS with
+// a mark no redirect now names, and it would reach dnsmasq.
 func (h *Host) quarantine(ctx context.Context, a *attached) {
-	if _, err := h.nft(ctx, quarantineScript(a.Key), "-f", "-"); err != nil {
+	script := baseScript()
+
+	if !validMark(a.mark) {
+		mark, err := h.allocMark()
+		if err != nil {
+			h.log.Error("could not stop a guest's DNS going to a resolver this process does not hold", "guest",
+				a.Key, "error", err)
+
+			return
+		}
+
+		a.mark = mark
+		script += closedScript(a.Key, a.Interface, a.Kind)
+	}
+
+	if _, err := h.nft(ctx, script+quarantineScript(a.Key, a.mark), "-f", "-"); err != nil {
 		h.log.Error("could not stop a guest's DNS going to a resolver this process does not hold, so if the "+
 			"kernel gives that port to another guest's resolver it would answer this guest", "guest", a.Key,
 			"error", err)
@@ -1168,14 +1291,16 @@ func (h *Host) dropLocked(key string) {
 //   - A guest no List shows is gone, and so are its rules, if it has a file here;
 //     rules with none may be another deployment's, and wait for their name to be
 //     reused or their owner.
-//   - A running listed guest keeps its chain and sets, so it stays closed exactly
-//     as it was, and gets a new resolver.
+//   - A running listed guest keeps its sets and its mark, and gets a new resolver: its
+//     rules go in again over whatever is left of them, in one transaction, so it does
+//     not matter what is.
 //   - A running open guest is handed back to dnsmasq: nothing says what it asked
 //     before now, and its flows are not followed across a handover either.
 //   - A running guest whose file cannot be read is judged by its rules. A list's
 //     stay closed, and it is said to, because nothing can say what it may resolve
-//     and opening it would be a guess. An open guest's are removed, as they would
-//     have been.
+//     and opening it would be a guess. With no deny chain it may be an open guest or
+//     a list that lost its rules, so the file is kept and read again. With no file at
+//     all, an open guest's are removed, as they would have been.
 func (h *Host) Reconcile(ctx context.Context, running map[string]bool) {
 	// A CONVERGE CAN HAVE PUT RIGHT WHAT WAS WRONG, with no process starting to notice.
 	if h.Ready() != nil {
@@ -1196,7 +1321,7 @@ func (h *Host) Reconcile(ctx context.Context, running map[string]bool) {
 	}
 
 	h.judgeFilesWithoutRules(ctx, running)
-	h.Verify(ctx)
+	h.verify(ctx)
 }
 
 // takeFound takes a guest off the books for judging it, unless a launch reusing its
@@ -1223,7 +1348,13 @@ func (h *Host) reconcileOne(ctx context.Context, a *attached, running bool) {
 			h.removeOrKeep(ctx, a)
 		}
 	case !running:
-	case err != nil && h.hasDenyChain(ctx, a):
+	case err == nil && file.Listed:
+		h.adopt(ctx, a, file)
+	case err == nil:
+		if h.takeFound(a) {
+			h.removeOrKeep(ctx, a)
+		}
+	case h.hasDenyChain(ctx, a):
 		h.log.Error("a running guest's network rules have no record of their policy, so it stays as "+
 			"closed as they leave it, and resolves nothing; it runs until it ends", "guest", a.Key, "error", err)
 
@@ -1236,11 +1367,18 @@ func (h *Host) reconcileOne(ctx context.Context, a *attached, running bool) {
 
 			h.quarantine(ctx, a)
 		}
-	case err == nil && file.Listed:
-		h.adopt(ctx, a, file)
-	default:
+	case errors.Is(err, fs.ErrNotExist):
 		if h.takeFound(a) {
 			h.removeOrKeep(ctx, a)
+		}
+	default:
+		h.log.Error("could not read the policy file of a running guest that has no deny chain, so it may be "+
+			"open or a list that lost its rules; it is read again at the next recovery", "guest", a.Key, "error", err)
+
+		if h.takeFound(a) {
+			h.mu.Lock()
+			h.unrestored[a.Key] = a.mark
+			h.mu.Unlock()
 		}
 	}
 }
@@ -1252,23 +1390,46 @@ func (h *Host) removeOrKeep(ctx context.Context, a *attached) {
 	}
 }
 
-// adopt gives a running listed guest a new resolver, keeping its chain and sets.
-// A guest it cannot serve stays closed, since its rules go on refusing.
+// adopt gives a running listed guest a new resolver, and its rules again over whatever is
+// left of them, in one transaction: a set keeps what it holds, so what its names admitted
+// stays admitted, and what has gone comes back. A guest it cannot serve has its DNS sent
+// nowhere, and is tried again at the next recovery.
 func (h *Host) adopt(ctx context.Context, a *attached, file attachmentFile) {
-	p, err := Compile(file.Allow)
-	if err != nil {
-		h.log.Error("a running guest's list cannot be read, so it stays closed and resolves nothing",
+	if !validMark(a.mark) {
+		mark, err := h.reserveMark(a.Key, file.Mark)
+		if err != nil {
+			h.log.Error("could not take a mark for a running guest, so it stays as closed as its rules leave it",
+				"guest", a.Key, "error", err)
+
+			return
+		}
+
+		a.mark = mark
+	}
+
+	fail := func(what string, err error) {
+		h.log.Error("could not "+what+" a running guest, so its DNS goes nowhere and it resolves nothing",
 			"guest", a.Key, "error", err)
 		h.quarantine(ctx, a)
+	}
+
+	p, err := Compile(file.Allow)
+	if err != nil {
+		fail("read the list of", err)
 
 		return
 	}
 
 	gateway, err := h.addrOf(file.Network)
 	if err != nil {
-		h.log.Error("could not find a running guest's gateway, so it stays closed and resolves nothing",
-			"guest", a.Key, "error", err)
-		h.quarantine(ctx, a)
+		fail("find the gateway of", err)
+
+		return
+	}
+
+	local, err := h.locals()
+	if err != nil {
+		fail("read the host's addresses for", err)
 
 		return
 	}
@@ -1282,18 +1443,14 @@ func (h *Host) adopt(ctx context.Context, a *attached, file attachmentFile) {
 	guest.fwd, err = newForwarder(p, guest.rec, gateway, h.upstreamPort, h.log.With("guest", a.Key),
 		func(ctx context.Context, addrs []netip.Addr) error { return h.admit(ctx, guest, addrs) })
 	if err != nil {
-		h.log.Error("could not bind a running guest's resolver, so it stays closed and resolves nothing",
-			"guest", a.Key, "error", err)
-		h.quarantine(ctx, a)
+		fail("bind a resolver for", err)
 
 		return
 	}
 
-	if _, err := h.nft(ctx, retargetScript(a.Key, a.mark, guest.fwd.port), "-f", "-"); err != nil {
+	if _, err := h.nft(ctx, baseScript()+attachScript(guest.binding(local)), "-f", "-"); err != nil {
 		guest.fwd.stop()
-		h.log.Error("could not point a running guest at its resolver, so it stays closed and resolves nothing",
-			"guest", a.Key, "error", err)
-		h.quarantine(ctx, a)
+		fail("install the rules of", err)
 
 		return
 	}
@@ -1312,6 +1469,7 @@ func (h *Host) adopt(ctx context.Context, a *attached, file attachmentFile) {
 	}
 
 	delete(h.foundOnStart, a.Key)
+	delete(h.unrestored, a.Key)
 	h.live[a.Key] = guest
 	h.byIface[a.Interface] = a.Key
 	h.log.Info("resolving for a listed guest an earlier process launched", "guest", a.Key)

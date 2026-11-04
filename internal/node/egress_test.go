@@ -26,7 +26,6 @@ type fakeEgressHost struct {
 	forgotten  []string
 	reconciled []map[string]bool
 	handedOver int
-	verified   int
 }
 
 func (f *fakeEgressHost) Take(key string) (egress.Record, bool) {
@@ -60,13 +59,6 @@ func (f *fakeEgressHost) Reconcile(_ context.Context, running map[string]bool) {
 	defer f.mu.Unlock()
 
 	f.reconciled = append(f.reconciled, running)
-}
-
-func (f *fakeEgressHost) Verify(context.Context) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.verified++
 }
 
 func (f *fakeEgressHost) HandOver(context.Context) {
@@ -422,8 +414,8 @@ func TestAReportHoldsWithinItsBounds(t *testing.T) {
 	}
 }
 
-// A SWEEP ASKS WHETHER A LIST'S RULES STILL HOLD: a healthy node may not register again for the
-// length of a job, and something that took them away has left it open until something looks.
+// A SWEEP JUDGES THE GUESTS' NETWORK RULES FROM ITS LIST: a healthy node may not register again for
+// the length of a job, and something that took them away has left it open until something looks.
 func TestASweepChecksThatListsAreStillInForce(t *testing.T) {
 	t.Parallel()
 
@@ -439,8 +431,8 @@ func TestASweepChecksThatListsAreStillInForce(t *testing.T) {
 	eh.mu.Lock()
 	defer eh.mu.Unlock()
 
-	if eh.verified != 1 {
-		t.Fatalf("verified %d times", eh.verified)
+	if len(eh.reconciled) != 1 {
+		t.Fatalf("reconciled %d times", len(eh.reconciled))
 	}
 }
 

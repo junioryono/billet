@@ -1681,9 +1681,7 @@ func (r *Runner) Sweep(ctx context.Context) error {
 
 	// A HEALTHY NODE MAY NOT REGISTER AGAIN FOR THE LENGTH OF A JOB, and something that
 	// took a list's rules away has left that job open until something looks.
-	if r.egress != nil {
-		r.egress.Verify(ctx)
-	}
+	r.reconcileEgress(ctx, instances)
 
 	// REPORTED EVERY SWEEP, INCLUDING WHEN THERE IS NOTHING TO REPORT.
 	//

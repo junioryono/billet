@@ -1355,7 +1355,8 @@ func TestRealEgressPutsBackRulesThatNoLongerHold(t *testing.T) { //nolint:parall
 			h := realHost(t, t.TempDir())
 			a := realAttachment(n, BridgePort)
 
-			p, err := Compile([]string{"allowed.test"})
+			// WITH A PREFIX: going in again over a set that still holds it must not be refused.
+			p, err := Compile([]string{"allowed.test", "203.0.113.0/24"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1366,7 +1367,7 @@ func TestRealEgressPutsBackRulesThatNoLongerHold(t *testing.T) { //nolint:parall
 
 			guest := h.live[a.Key]
 
-			h.Verify(t.Context())
+			h.verify(t.Context())
 
 			if guest.rec.freeze(counts{}).Incomplete {
 				t.Fatal("rules that hold were read as lost")
@@ -1390,7 +1391,7 @@ func TestRealEgressPutsBackRulesThatNoLongerHold(t *testing.T) { //nolint:parall
 			// OPEN NOW, OR NOTHING BELOW CLOSED ANYTHING.
 			n.mustConnect(realHardcode, 443)
 
-			h.Verify(t.Context())
+			h.verify(t.Context())
 
 			n.mustBeRefused(realHardcode, 443)
 			n.mustResolve("udp4", "other.test.", dnsmessage.RCodeRefused)
@@ -1419,6 +1420,81 @@ func TestRealEgressPutsBackRulesThatNoLongerHold(t *testing.T) { //nolint:parall
 			if rec, ok := h.Take(a.Key); !ok || !rec.Incomplete {
 				t.Fatalf("record = %+v, %v: a job that ran open for a while does not read as whole", rec, ok)
 			}
+		})
+	}
+}
+
+// WHAT IS LEFT OF A GUEST'S RULES AT A RESTART DOES NOT DECIDE WHETHER IT GETS THEM BACK. Each of these
+// leaves it reachable by some path the new process used to be unable to repair: DNS straight to the
+// host's resolver with the redirect gone, or no mark to name anything by. What it takes is a new
+// process, an answer from its resolver, the list refused, what was admitted admitted, its tap free
+// for the next guest, and the rest of the host's connections alone.
+func TestRealEgressRepairsWhatIsLeftOfAGuestsRules(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
+	for _, tc := range []struct {
+		name string
+		take [][]string
+		// keeps says the guest's set is still there, so what it admitted is.
+		keeps bool
+	}{
+		{"the nat table gone", [][]string{{"nft", "delete", "table", "ip", "billet_egress_nat"}}, true},
+		{"the jobs map emptied", [][]string{{"nft", "flush", "map", "ip", "billet_egress_nat", "jobs"}}, true},
+		{"the dispatch flushed", [][]string{{"nft", "flush", "chain", "bridge", "billet_egress", "prerouting"}}, true},
+		{"the bridge table gone", [][]string{{"nft", "delete", "table", "bridge", "billet_egress"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dropTables(t)
+
+			n := newRealNetwork(t, BridgePort)
+			dir := t.TempDir()
+			h := realHost(t, dir)
+			a := realAttachment(n, BridgePort)
+
+			p, err := Compile([]string{"allowed.test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := h.Attach(t.Context(), a, p); err != nil {
+				t.Fatal(err)
+			}
+
+			n.mustResolve("udp4", "allowed.test.", dnsmessage.RCodeSuccess)
+			n.mustConnect(realAllowed, 443)
+
+			h.Close()
+
+			for _, take := range tc.take {
+				sh(t, take...)
+			}
+
+			next := realHost(t, dir)
+			next.Reconcile(t.Context(), map[string]bool{a.Key: true})
+
+			if tc.keeps {
+				n.mustConnect(realAllowed, 443)
+			}
+
+			asked := len(n.upstream.names())
+
+			n.mustResolve("udp4", "other.test.", dnsmessage.RCodeRefused)
+
+			if names := n.upstream.names(); len(names) != asked {
+				t.Fatalf("an off-list name reached the host's resolver: %q", names[asked:])
+			}
+
+			n.mustResolve("udp4", "allowed.test.", dnsmessage.RCodeSuccess)
+			n.mustConnect(realAllowed, 443)
+			n.mustBeRefused(realHardcode, 443)
+
+			next.Detach(t.Context(), a.Key)
+
+			// THE TAP IS FREE FOR THE NEXT GUEST: rules that could not come off would refuse it.
+			if err := next.Attach(t.Context(), a, p); err != nil {
+				t.Fatalf("the next guest on this tap: %v", err)
+			}
+
+			n.mustResolve("udp4", "allowed.test.", dnsmessage.RCodeSuccess)
+			next.Detach(t.Context(), a.Key)
 		})
 	}
 }
@@ -1499,6 +1575,15 @@ func TestRealEgressSendsAnUnservableGuestsDNSNowhere(t *testing.T) { //nolint:pa
 
 	if strings.Contains(string(out), "redirect") || !strings.Contains(string(out), "drop") {
 		t.Fatalf("its redirect is still there:\n%s", out)
+	}
+
+	out, err = exec.CommandContext(t.Context(), "nft", "list", "chain", "ip", "billet_egress_nat", "own_"+a.Key).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	if !strings.Contains(string(out), "drop") || strings.Contains(string(out), "mark !=") {
+		t.Fatalf("a connection it holds would go on past the redirect:\n%s", out)
 	}
 
 	if _, err := n.resolve("udp4", n.gateway, "other.test."); err == nil {
