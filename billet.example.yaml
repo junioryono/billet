@@ -165,6 +165,15 @@ server:
   #
   # job_detail_retention: 72h
 
+  # How long the ledger keeps a job's test suites and cases, which `billet tests
+  # stats` ranks, and how many bytes of them in all, the oldest deleted first. They
+  # are the job's own VM's report, kept apart from its guest report and for longer,
+  # since a flaky test shows itself over many runs. At least 1h and 1MiB; absent,
+  # 336h and 128MiB. The control plane reads the whole ledger at every start.
+  #
+  # test_results_retention: 336h
+  # test_results_max_bytes: 128MiB
+
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
   # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
   # not localhost) unless allow_remote is true: the endpoint has no

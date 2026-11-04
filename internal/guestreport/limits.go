@@ -7,6 +7,14 @@ import "time"
 // lease.GuestReport names.
 const Codec = 1
 
+// The batch schemas. An agent sends SchemaCases only to a node whose answer to its
+// hello names it, because a node that does not know it refuses the whole batch over
+// the one field, and that batch is the one carrying the job's test results.
+const (
+	SchemaBase  = 1
+	SchemaCases = 2
+)
+
 // How often the agent samples and sends. The node does not enforce these; they are
 // what a reader of a Report may assume of an undownsampled one.
 const (
@@ -30,6 +38,8 @@ const (
 const (
 	MaxNameBytes       = 64
 	MaxFailedNameBytes = 200
+	// MaxCaseMessageBytes bounds a failed test case's message.
+	MaxCaseMessageBytes = 200
 )
 
 // The processes of one sample: the agent keeps KeepProcessesByName names, the
@@ -74,6 +84,24 @@ const MaxReportRows = 1 << 17
 // MaxValue bounds every count, counter, level, time and sequence number: 2^53, the
 // largest integer a JSON reader holding numbers as doubles reads exactly.
 const MaxValue = 1 << 53
+
+// The bounds of one job's test cases, in a batch and in the TestResults kept from
+// it. A Go module's suites are its packages, so a job's suites go far past
+// MaxBatchSuites, which holds only what `billet jobs show` lists; and an ordinary
+// case and its keys take about 100 bytes of JSON, so MaxBatchCases of them is most
+// of what a batch may inflate to.
+const (
+	MaxBatchCaseSuites = 256
+	MaxBatchCases      = 8192
+)
+
+// MaxTestResultsBytes is what one job's kept results may take encoded, the most one
+// batch can carry, and MaxTestResultsInflatedBytes what they may inflate to. Base64
+// takes them to about 87 KiB in the ledger.
+const (
+	MaxTestResultsBytes         = 64 << 10
+	MaxTestResultsInflatedBytes = 1 << 20
+)
 
 // MaxTicksPerSecond bounds the guest's clock tick rate (USER_HZ, 100 on Linux).
 const MaxTicksPerSecond = 1_000_000

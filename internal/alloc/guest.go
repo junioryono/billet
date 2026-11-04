@@ -43,6 +43,16 @@ func (a *Allocator) RecordGuestReport(ctx context.Context, leaseID string, epoch
 		}); err != nil {
 			return fmt.Errorf("alloc: record the guest report of lease %s: %w", leaseID, err)
 		}
+		if len(report.Tests) == 0 {
+			return nil
+		}
+		data := base64.StdEncoding.EncodeToString(report.Tests)
+		if _, err := state.WriteQueries(tx).RecordJobTestResults(ctx, ledgerdb.RecordJobTestResultsParams{
+			LeaseID: lease.ID, RecordedAt: ts(a.now()), Codec: int64(report.TestsCodec),
+			EncodedBytes: int64(len(data)), Data: data,
+		}); err != nil {
+			return fmt.Errorf("alloc: record the test results of lease %s: %w", leaseID, err)
+		}
 
 		return nil
 	})

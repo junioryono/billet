@@ -40,19 +40,19 @@ func TestARunsQueueTimesAreEachRunnersJobsCreatedAt(t *testing.T) {
 		}
 	})
 
-	times, err := c.RunQueueTimes(t.Context(), "acme", "api", 31)
+	jobs, err := c.RunJobs(t.Context(), "acme", "api", 31)
 	if err != nil {
-		t.Fatalf("RunQueueTimes: %v", err)
+		t.Fatalf("RunJobs: %v", err)
 	}
-	if got, want := times["billet-a"], time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC); !got.Equal(want) {
+	if got, want := jobs["billet-a"].QueuedAt, time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC); !got.Equal(want) {
 		t.Errorf("billet-a = %s, want %s", got, want)
 	}
-	if got, want := times["billet-b"], time.Date(2026, 10, 18, 21, 37, 47, 0, time.UTC); !got.Equal(want) {
+	if got, want := jobs["billet-b"].QueuedAt, time.Date(2026, 10, 18, 21, 37, 47, 0, time.UTC); !got.Equal(want) {
 		t.Errorf("billet-b, on the second page, = %s, want %s", got, want)
 	}
 	for _, absent := range []string{"billet-twice", "", "billet-no-time", "billet-bad-time"} {
-		if got, ok := times[absent]; ok {
-			t.Errorf("%q has queue time %s, want none", absent, got)
+		if got, ok := jobs[absent]; ok {
+			t.Errorf("%q has queue time %s, want none", absent, got.QueuedAt)
 		}
 	}
 	if requests.Load() != 3 {
@@ -66,7 +66,7 @@ func TestARunsQueueTimesAreEachRunnersJobsCreatedAt(t *testing.T) {
 		}
 		fmt.Fprint(w, `{"total_count":2,"jobs":[]}`)
 	})
-	if _, err := short.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil ||
+	if _, err := short.RunJobs(t.Context(), "acme", "api", 31); err == nil ||
 		!strings.Contains(err.Error(), "ended after 1 of the 2") {
 		t.Errorf("a list that ended short of its count = %v, want refused for ending early", err)
 	}
@@ -87,11 +87,44 @@ func TestAQueueTimeReadOfALargeRunCostsOnePage(t *testing.T) {
 	c, requests := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
 		fmt.Fprintf(w, `{"total_count":%d,"jobs":[%s]}`, MaxQueueTimeRunJobs+1, strings.Join(jobs, ","))
 	})
-	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil ||
+	if _, err := c.RunJobs(t.Context(), "acme", "api", 31); err == nil ||
 		!strings.Contains(err.Error(), fmt.Sprintf("more than the %d", MaxQueueTimeRunJobs)) {
 		t.Errorf("a run of %d jobs = %v, want refused", MaxQueueTimeRunJobs+1, err)
 	}
 	if requests.Load() != 2 {
 		t.Errorf("requests = %d, want a token and one page", requests.Load())
+	}
+}
+
+// A JOB'S COMMIT IS READ FROM THE RECORD THAT GIVES ITS QUEUE TIME. The shape is the
+// measured one, 2026-11-03 on the test organization: head_sha and head_branch beside
+// created_at. A branch GitHub gives as null, and a record with neither, are empty,
+// which is could-not-tell; the queue time still stands.
+func TestARunsJobsNameTheirCommit(t *testing.T) {
+	t.Parallel()
+
+	c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		fmt.Fprint(w, `{"total_count":3,"jobs":[
+			{"id":1,"runner_name":"billet-a","created_at":"2026-10-18T21:37:09Z",
+			 "head_sha":"20f462ad39fee8e29587ae6a2a317c68992469ae","head_branch":"main"},
+			{"id":2,"runner_name":"billet-b","created_at":"2026-10-18T21:37:09Z",
+			 "head_sha":"abc","head_branch":null},
+			{"id":3,"runner_name":"billet-c","created_at":"2026-10-18T21:37:09Z"}]}`)
+	})
+
+	jobs, err := c.RunJobs(t.Context(), "acme", "api", 31)
+	if err != nil {
+		t.Fatalf("RunJobs: %v", err)
+	}
+	queued := time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC)
+	for name, want := range map[string]RunJob{
+		"billet-a": {QueuedAt: queued, HeadSHA: "20f462ad39fee8e29587ae6a2a317c68992469ae", HeadBranch: "main"},
+		"billet-b": {QueuedAt: queued, HeadSHA: "abc"},
+		"billet-c": {QueuedAt: queued},
+	} {
+		got := jobs[name]
+		if !got.QueuedAt.Equal(want.QueuedAt) || got.HeadSHA != want.HeadSHA || got.HeadBranch != want.HeadBranch {
+			t.Errorf("%s = %+v, want %+v", name, got, want)
+		}
 	}
 }

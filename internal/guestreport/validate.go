@@ -34,7 +34,11 @@ func validateBatch(b *Batch) error {
 		return err
 	}
 
-	return validateSections(sections{b.Samples, b.Processes, b.Steps, b.Tests}, batchBounds)
+	if err := validateSections(sections{b.Samples, b.Processes, b.Steps, b.Tests}, batchBounds); err != nil {
+		return err
+	}
+
+	return validateCases(b.Cases, "cases")
 }
 
 func validateReport(r *Report) error {

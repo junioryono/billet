@@ -303,7 +303,7 @@ func (a *agent) contact(ctx context.Context) (time.Time, bool) {
 	}
 
 	if a.head == nil {
-		b, ok := a.cut(nil)
+		b, ok := a.cut(nil, nil)
 		if !ok {
 			cancel()
 
@@ -380,12 +380,12 @@ func (a *agent) period() time.Duration {
 	return max(a.lim.interval, guestreport.BatchInterval)
 }
 
-// cut is a new batch of everything the agent holds, with tests when it is the
-// final one, numbered next and encoded to fit what the node takes. A batch that
-// cannot be encoded is dropped and its number spent, so the node sees the gap. No
+// cut is a new batch of everything the agent holds, with tests and their cases when
+// it is the final one, numbered next and encoded to fit what the node takes. A batch
+// that cannot be encoded is dropped and its number spent, so the node sees the gap. No
 // batch is cut while the agent's own CPU has never been read, because a batch must
 // carry it and a zero would be a claim: what is held waits for the next try.
-func (a *agent) cut(tests []guestreport.SuiteResult) (outgoing, bool) {
+func (a *agent) cut(tests []guestreport.SuiteResult, cases []guestreport.SuiteCases) (outgoing, bool) {
 	a.col.readAgentCPU()
 
 	if !a.col.haveAgentCPU {
@@ -406,6 +406,7 @@ func (a *agent) cut(tests []guestreport.SuiteResult) (outgoing, bool) {
 		Processes:      processes,
 		Steps:          a.steps.take(),
 		Tests:          tests,
+		Cases:          cases,
 	}
 
 	body, err := fit(&b, a.lim.maxBody)
@@ -439,7 +440,7 @@ func (a *agent) final(ctx context.Context) {
 	a.col.walkProcesses(true)
 	a.steps.poll()
 
-	tests := collectJUnit(a.junitRoots, time.Now, a.log)
+	tests, cases := collectJUnit(a.junitRoots, time.Now, a.log)
 
 	if a.lim == nil {
 		lim, v := a.node.hello(fctx)
@@ -452,7 +453,13 @@ func (a *agent) final(ctx context.Context) {
 		a.lim = &lim
 	}
 
-	b, ok := a.cut(tests)
+	// ONLY TO A NODE THAT SAID IT KNOWS THEM: one that does not refuses the whole
+	// batch, the job's suite counts with it.
+	if !a.lim.cases {
+		cases = nil
+	}
+
+	b, ok := a.cut(tests, cases)
 	if !ok {
 		return
 	}
@@ -484,8 +491,9 @@ func (a *agent) settle() bool {
 	}
 }
 
-// fit encodes b within limit bytes. Only test results give way: the failed names
-// are halved, then the lowest-ranked suites dropped, until it fits.
+// fit encodes b within limit bytes. Only test results give way: the cases first, as
+// guestreport.ShedCases gives them up, then the failed names are halved and the
+// lowest-ranked suites dropped, until it fits.
 func fit(b *guestreport.Batch, limit int) ([]byte, error) {
 	for {
 		data, err := guestreport.EncodeBatch(*b)
@@ -497,7 +505,7 @@ func fit(b *guestreport.Batch, limit int) ([]byte, error) {
 			return nil, err
 		}
 
-		if !shrinkTests(b) {
+		if !guestreport.ShedCases(&b.Cases) && !shrinkTests(b) {
 			return nil, errors.New("larger than the node takes")
 		}
 	}

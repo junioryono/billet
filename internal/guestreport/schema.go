@@ -16,6 +16,10 @@ type Batch struct {
 	Processes     []ProcessSample `json:"processes,omitempty"`
 	Steps         []StepMark      `json:"steps,omitempty"`
 	Tests         []SuiteResult   `json:"tests,omitempty"`
+	// Cases are each suite's cases, in the last batch of an agent the node offered
+	// SchemaCases. They never join a Report: TestResultsOf gathers them for the
+	// ledger's own row, which outlives the report.
+	Cases []SuiteCases `json:"cases,omitempty"`
 }
 
 // Sample is the guest's totals at one instant, every SampleInterval. Every field but

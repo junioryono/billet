@@ -17,12 +17,12 @@ type queueTimesPolicy struct {
 	err error
 }
 
-func (q queueTimesPolicy) RunQueueTimes(context.Context, string, string, int64) (map[string]time.Time, error) {
+func (q queueTimesPolicy) RunJobs(context.Context, string, string, int64) (map[string]billetgithub.RunJob, error) {
 	if q.err != nil {
 		return nil, q.err
 	}
 
-	return map[string]time.Time{"billet-a": time.Unix(1, 0)}, nil
+	return map[string]billetgithub.RunJob{"billet-a": {QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main"}}, nil
 }
 
 // GITHUB'S THROTTLE AND ITS REFUSAL REACH THE SWEEP AS THE SERVER'S OWN
@@ -44,7 +44,7 @@ func TestAQueueTimeReadsRefusalIsTheServersSentinel(t *testing.T) {
 		{"transport", errors.New("connection reset"), nil},
 	} {
 		c := &Client{policy: queueTimesPolicy{err: tc.err}}
-		_, err := c.RunQueueTimes(t.Context(), "acme", "api", 31)
+		_, err := c.RunJobs(t.Context(), "acme", "api", 31)
 		throttled, refused := errors.Is(err, server.ErrQueueTimesThrottled), errors.Is(err, server.ErrQueueTimesRefused)
 		switch {
 		case err == nil:
@@ -58,11 +58,12 @@ func TestAQueueTimeReadsRefusalIsTheServersSentinel(t *testing.T) {
 		}
 	}
 
-	times, err := (&Client{policy: queueTimesPolicy{}}).RunQueueTimes(t.Context(), "acme", "api", 31)
-	if err != nil || len(times) != 1 {
-		t.Errorf("a read GitHub answered = %v, %v", times, err)
+	jobs, err := (&Client{policy: queueTimesPolicy{}}).RunJobs(t.Context(), "acme", "api", 31)
+	want := server.RunJob{QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main"}
+	if err != nil || len(jobs) != 1 || jobs["billet-a"] != want {
+		t.Errorf("a read GitHub answered = %v, %v, want billet-a's whole record", jobs, err)
 	}
-	if _, err := (&Client{}).RunQueueTimes(t.Context(), "acme", "api", 31); !errors.Is(err,
+	if _, err := (&Client{}).RunJobs(t.Context(), "acme", "api", 31); !errors.Is(err,
 		billetgithub.ErrRunEvidenceUnavailable) {
 		t.Errorf("a client with no App = %v, want ErrRunEvidenceUnavailable", err)
 	}
