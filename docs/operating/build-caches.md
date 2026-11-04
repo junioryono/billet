@@ -86,7 +86,7 @@ Everything above is what that tier gets with no `cache` block at all. [Configura
 ## Seeing and stopping a cache
 
 ```bash
-billet cache status                               # every tier's caches, the kill switch, what each cache did (last 24h)
+billet cache status                               # every tier's caches, the kill switch, what each cache did (last 24h), and any Go or Bazel cache that never warmed
 billet cache disable --repository acme/api --kind git
 billet cache disable --org acme                   # every cache (--kind all is the default)
 billet cache enable  --repository acme/api --kind git

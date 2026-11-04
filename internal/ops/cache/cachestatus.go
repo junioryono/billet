@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -64,12 +65,66 @@ func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	printCacheOutcomes(env.Stdout, counts, jobs, *since)
+	for _, warning := range neverWarmed(counts, *since) {
+		fmt.Fprintln(env.Stdout, "warning: "+warning)
+	}
 
 	return nil
 }
 
 // cacheOutcomeRows bounds the jobs one report reads.
 const cacheOutcomeRows = 100_000
+
+// neverWarmAfter is how many cold jobs in a window, with none warm, make a build
+// cache worth naming: enough that a tier's first jobs after a new key are not it.
+const neverWarmAfter = 10
+
+// checkWarmthWindow and checkWarmthRows are what `billet check` reads to say so.
+const (
+	checkWarmthWindow = 24 * time.Hour
+	checkWarmthRows   = 10_000
+)
+
+// neverWarmed names each tier's Go or Bazel cache that went cold in
+// neverWarmAfter jobs or more and warm in none.
+//
+// WORSE THAN NO CACHE, which is why it is said: a build cache that never warms
+// takes the place of the go command's own, so every job compiles from scratch
+// while the cache reads as working (#689).
+func neverWarmed(counts map[string]map[string]map[string]int, since time.Duration) []string {
+	var warnings []string
+	for _, tier := range slices.Sorted(maps.Keys(counts)) {
+		for _, cache := range []string{"bazel", "go"} {
+			outcomes := counts[tier][cache]
+			if outcomes["warm"] > 0 || outcomes["cold"] < neverWarmAfter {
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf("%s's %s cache was cold in %d job(s) and warm in none "+
+				"in the last %s, so those jobs built from scratch; either nothing it wrote was published "+
+				"(the node's journal says `could not yet publish` or `a cache publication was abandoned`) "+
+				"or what was published is not being read",
+				tier, cache, outcomes["cold"], cli.ShortDuration(since)))
+		}
+	}
+
+	return warnings
+}
+
+// ReportCacheWarmth prints what neverWarmed finds for `billet check`.
+//
+// REPORTED, NEVER FATAL, and a failed read says it could not tell: this is a
+// cache's effectiveness, and no deployment is wrong to run without it.
+func ReportCacheWarmth(ctx context.Context, env cli.Env, a *alloc.Allocator) {
+	counts, _, err := a.CacheOutcomes(ctx, time.Now().Add(-checkWarmthWindow), checkWarmthRows)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "caches   could not tell whether the build caches warm: %v\n", err)
+
+		return
+	}
+	for _, warning := range neverWarmed(counts, checkWarmthWindow) {
+		fmt.Fprintln(env.Stdout, "caches   "+warning)
+	}
+}
 
 // cacheReportOrder is the order caches are reported in.
 var cacheReportOrder = []string{"image", "sticky", "actions", "git", "bazel", "go", "npm"}

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/cache"
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	opsimages "github.com/junioryono/billet/internal/ops/images"
@@ -324,6 +325,11 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		a, err := app.NewAllocator(cfg, db)
 		if err != nil {
 			return report, fmt.Errorf("capacity allocator: %w", err)
+		}
+		// NOT ON THE UPGRADE'S QUIESCENT PROBE, whose stopped-service window pays for
+		// every read, and which decides nothing from this.
+		if !opts.maintenanceProbe {
+			cache.ReportCacheWarmth(ctx, env, a)
 		}
 		registered, err := a.RegisteredNodes(ctx)
 		if err != nil {
