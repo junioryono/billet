@@ -196,3 +196,5 @@ de2880c55834 BILLET_TC_ARCH went with install-toolcache.sh (ADR-022); the build'
 f9290014add1 The provisioning script became the AMI build (ADR-022); the related-skills line says so.
 4e1cc90afe54 #688 adds `targets` to the tier keys; the sentence now lists it with its expansion, beside `sizes`.
 f8453d8ae0f0 #689 moves the helper's local cache into the go command's own GOCACHE and layout; the sentence now says so, with why.
+14fc6250db7e #694 records a blob leg that fails locally as `unavailable`; the sentence now says which blob legs observe and why.
+188c30ea22f0 #694 lets the Actions half's `unavailable` replace an earlier value in the ledger and the node's record; the sentence now says so, with why.
