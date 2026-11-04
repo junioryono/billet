@@ -20,7 +20,7 @@ SELECT name, provider, site, live,
 -- beside node_release so a report can say a host is running something older than
 -- it once did. It decides nothing: a rolled-back host is exactly that shape.
 SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
-       node_digest, highest_release
+       node_digest, highest_release, decommissioned_at
   FROM nodes
  ORDER BY name;
 
@@ -93,7 +93,7 @@ UPDATE nodes
 -- a host that stays live, because its process still has running work to answer
 -- for; a re-registration clears both. The two columns answer different questions:
 -- can this host be reached, and does it take new work.
-SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version
+SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version, architectures
   FROM nodes
  WHERE live = 1 AND drained = 0
  ORDER BY name;
@@ -205,7 +205,7 @@ SELECT total_vcpu, total_memory, ec2_shapes FROM nodes WHERE name = @name;
 
 -- name: ReadNodeRegistration :one
 -- The facts a re-registration has to be checked against.
-SELECT provider, site, ec2_shapes, codebuild_fleet FROM nodes WHERE name = @name;
+SELECT provider, site, ec2_shapes, codebuild_fleet, architectures FROM nodes WHERE name = @name;
 
 -- name: ListCodeBuildRegistrationPaths :many
 -- Every codebuild host and the Parameter Store path it stages registrations under.
@@ -271,11 +271,11 @@ SELECT name FROM nodes
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, highest_release, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch)
 VALUES (@name, @provider, @site, @total_vcpu, @total_memory, @ec2_shapes, @last_seen_at, 1,
         @node_release, @wire_min, @wire_max, @wire_version, @node_digest,
         @codebuild_fleet, @codebuild_jit_path, @codebuild_region, @incarnation,
-        @highest_release, 1)
+        @highest_release, @architectures, 1)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,
@@ -294,6 +294,7 @@ ON CONFLICT (name) DO UPDATE SET
    codebuild_region   = excluded.codebuild_region,
    incarnation  = excluded.incarnation,
    highest_release = excluded.highest_release,
+   architectures   = excluded.architectures,
    epoch        = nodes.epoch + 1,
    decommissioned_at   = '',
    decommission_proven = 0,

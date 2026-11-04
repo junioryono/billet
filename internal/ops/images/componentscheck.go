@@ -246,6 +246,9 @@ func ReportChannelImage(ctx context.Context, env cli.Env, cfg *config.Config) {
 	case err == nil:
 		fmt.Fprintf(env.Stdout, "images   the channel's image, built %s, is one this billet can import\n",
 			manifest.BuiltAt.UTC().Format("2006-01-02 15:04 MST"))
+	case errors.Is(err, imagesource.ErrNoImageForMachine):
+		fmt.Fprintf(env.Stdout, "images   the channel's current release carries no guest image for "+
+			"%s, so nothing is taken up on this host until it does: %v\n", hostArch(), err)
 	case errors.Is(err, imagesource.ErrNeedsNewerBillet) && cfg.Release.Pinned():
 		fmt.Fprintf(env.Stdout, "images   the channel's image needs a newer billet, and "+
 			"release.version pins this deployment at %s, so no newer guest image is taken up until "+

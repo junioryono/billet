@@ -43,7 +43,9 @@ func (c ImageCache) Valid() bool {
 
 // ActionsCache is what the Actions cache interception did for the FIRST
 // CacheService call of a job whose disposition was recorded, as the node saw
-// it.
+// it, or ActionsCacheUnavailable once any later call failed locally: a failure
+// replaces what came before it, so a save lost after a served restore is not
+// recorded as served (#694).
 //
 // RECORDED WHEN THE DISPOSITION IS FINAL, not when it is intended: a call the
 // site store failed to answer is retried through GitHub, and what the guest

@@ -611,7 +611,7 @@ func TestBothCacheObservationStatementsKeepTheFirst(t *testing.T) {
 		for _, guard := range []string{
 			"image_cache      = CASE WHEN image_cache = '' THEN CAST(@image_cache AS TEXT)",
 			"cache_generation = CASE WHEN image_cache = '' THEN CAST(@cache_generation AS TEXT)",
-			"actions_cache    = CASE WHEN actions_cache = '' THEN CAST(@actions_cache AS TEXT)",
+			"actions_cache    = CASE WHEN actions_cache = '' OR CAST(@actions_cache AS TEXT) = 'unavailable'",
 		} {
 			if !strings.Contains(body, guard) {
 				t.Errorf("%s does not carry the guard %q; the first observation would not be kept",
@@ -623,5 +623,48 @@ func TestBothCacheObservationStatementsKeepTheFirst(t *testing.T) {
 	if !strings.Contains(namedQuery(t, "cacheobservation.sql", "RecordLeaseCacheObservation"),
 		"WHERE id = @id AND epoch = @epoch") {
 		t.Error("RecordLeaseCacheObservation is not fenced on the epoch")
+	}
+}
+
+// A LOCAL FAILURE REPLACES THE ACTIONS HALF, on both rows, and nothing later
+// replaces it (#694): a job whose restore was served and whose save then failed
+// on the node was recorded as served. The other halves still keep the first.
+func TestAnActionsFailureReplacesAnEarlierOutcomeOnBothRows(t *testing.T) {
+	t.Parallel()
+
+	a := pricedCloudAllocator(t, 340_000)
+	lease, err := a.Reserve(t.Context(), "cloud")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	launched(t, a, lease, "cloud-1")
+
+	for _, obs := range []CacheObservation{
+		{ImageCache: ImageCacheCold, ActionsCache: ActionsCacheServed},
+		{ImageCache: ImageCacheUnused, ActionsCache: ActionsCacheUnavailable},
+		{ActionsCache: ActionsCacheServed},
+		{ActionsCache: ActionsCacheSpliced},
+		{ImageCache: ImageCacheUnused},
+	} {
+		if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, obs); err != nil {
+			t.Fatalf("RecordCacheObservation(%+v): %v", obs, err)
+		}
+	}
+
+	live, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if live.ActionsCache != ActionsCacheUnavailable || live.ImageCache != ImageCacheCold {
+		t.Fatalf("lease row actions=%q image=%q, want unavailable and the first image outcome",
+			live.ActionsCache, live.ImageCache)
+	}
+	history, err := a.HistoryPlacement(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("HistoryPlacement: %v", err)
+	}
+	if history.ActionsCache != ActionsCacheUnavailable || history.ImageCache != ImageCacheCold {
+		t.Fatalf("history row actions=%q image=%q, want unavailable and the first image outcome",
+			history.ActionsCache, history.ImageCache)
 	}
 }

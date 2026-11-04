@@ -126,9 +126,9 @@ func (n *npmCache) held(key string) bool { return n.store != nil && n.store.held
 // the npm cache.
 //
 // THE FIRST REQUEST DECIDES THE CONNECTION. One the store may answer is answered
-// and the connection closed, so every later request arrives on a new connection
-// and is classified afresh; anything else is spliced to the registry, whole,
-// with the guest's own bytes.
+// with Connection: close, and the client's close ends the connection, so every
+// later request arrives on a new connection and is classified afresh; anything
+// else is spliced to the registry, whole, with the guest's own bytes.
 func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session *cacheSession) {
 	// IN FLIGHT UNTIL WHAT IT GOT IS KNOWN: to the end of an answer, or to the
 	// start of a splice, which notes nothing and can last as long as the guest
@@ -166,7 +166,10 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 		return
 	}
 	if !npmRequestTargetsRegistry(req) {
-		refuseMisdirected(tlsConn, "only the npm registry is available")
+		if refuseMisdirected(tlsConn, req, "only the npm registry is available") {
+			ended()
+			n.service.closeAfterClient(tlsConn, npmRegistryHost)
+		}
 
 		return
 	}
@@ -206,7 +209,17 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, cacheHandlerLimit)
 	defer cancel()
-	n.serve(requestCtx, tlsConn, req.WithContext(requestCtx), request, session)
+	whole := n.serve(requestCtx, tlsConn, req.WithContext(requestCtx), request, session)
+	cancel()
+	// AN ANSWER CUT SHORT IS CLOSED AT ONCE, before what it got is reported: the
+	// close is how its client learns that it ended short.
+	if !whole {
+		return
+	}
+	// WHAT IT GOT IS KNOWN once the answer is written, so the wait for the client
+	// to close is never counted in flight.
+	ended()
+	n.service.closeAfterClient(tlsConn, npmRegistryHost)
 }
 
 // npmRequestTargetsRegistry reports whether the inner request names the
@@ -225,15 +238,6 @@ func npmRequestTargetsRegistry(req *http.Request) bool {
 	}
 
 	return strings.EqualFold(host, npmRegistryHost)
-}
-
-func refuseMisdirected(conn net.Conn, message string) {
-	misdirected := actionsBlobError(http.StatusMisdirectedRequest, message)
-	misdirected.Close = true
-	misdirected.Proto, misdirected.ProtoMajor, misdirected.ProtoMinor = "HTTP/1.1", 1, 1
-	//nolint:errcheck // best-effort refusal before anything is forwarded
-	_ = misdirected.Write(conn)
-	_ = misdirected.Body.Close()
 }
 
 // note records what the cache did for the session's job.
@@ -275,20 +279,32 @@ func (n *npmCache) end(ctx context.Context, session *cacheSession) {
 	}
 }
 
-// npmExchange is one request being answered: who asked, for what, and when.
+// npmExchange is one request being answered: who asked, for what, and when, and
+// whether its answer went out whole.
 type npmExchange struct {
 	conn    net.Conn
 	req     *http.Request
 	request npmRequest
 	session *cacheSession
 	started time.Time
+	whole   *bool
 }
 
-// serve answers one request the store may answer.
+// serve answers one request the store may answer, and reports whether a whole
+// answer was written.
 func (n *npmCache) serve(ctx context.Context, conn net.Conn, req *http.Request, request npmRequest,
 	session *cacheSession,
-) {
-	x := npmExchange{conn: conn, req: req, request: request, session: session, started: n.now()}
+) bool {
+	whole := false
+	x := npmExchange{conn: conn, req: req, request: request, session: session, started: n.now(), whole: &whole}
+	n.answer(ctx, x)
+
+	return whole
+}
+
+// answer answers x by the rules ADR-020 gives.
+func (n *npmCache) answer(ctx context.Context, x npmExchange) {
+	request, session := x.request, x.session
 	key := request.key()
 	if entry, body, ok := n.store.acquire(key, n.now()); ok {
 		if entry.fresh(n.now()) {
@@ -1067,11 +1083,24 @@ func relayedHeader(upstream http.Header) http.Header {
 //
 // WRITTEN BY HAND, so what a HEAD and a 304 carry is this function's to say: a
 // HEAD gets the length a GET would and no body, a 304 neither. A body of
-// unknown length (a negative length) is delimited by the connection's close.
-// THE HEADERS ARE SENT BEFORE THE BODY IS READ, so a client whose body then
-// stalls has its answer begun. A body shorter than its declared length is an
-// error, and the caller's close of the connection tells the client it was cut.
+// unknown length (a negative length) is chunked, so no answer is delimited by
+// the connection's close. THE HEADERS ARE SENT BEFORE THE BODY IS READ, so a
+// client whose body then stalls has its answer begun. A body shorter than its
+// declared length is an error, and the caller's immediate close of the
+// connection tells the client it was cut.
+//
+// It records in the exchange whether the answer went out whole.
 func (n *npmCache) writeAnswer(x npmExchange, status int, header http.Header, body io.Reader, length int64) error {
+	err := n.writeFramed(x, status, header, body, length)
+	if x.whole != nil {
+		*x.whole = err == nil
+	}
+
+	return err
+}
+
+// writeFramed is writeAnswer's write.
+func (n *npmCache) writeFramed(x npmExchange, status int, header http.Header, body io.Reader, length int64) error {
 	header = header.Clone()
 	header.Set("Connection", "close")
 	header.Del("Content-Length")

@@ -275,6 +275,10 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 	if session.finished {
 		return errSessionFinished
 	}
+	// A failure observeActions could not write goes down with any other write of
+	// the record, a renewal's included, and is reported when the session next
+	// reports.
+	absorbActionsFailure(session)
 
 	record := durableCacheSession{
 		Token: session.token, PathID: session.pathID, Instance: session.instance, Trust: session.trust,

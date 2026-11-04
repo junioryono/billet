@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/config"
 )
 
 // The read-only describes `billet check --provider ec2` makes to prove a config
@@ -45,6 +46,15 @@ type ImageInfo struct {
 	// reported as needing a rebuild for the same reason an old contract is.
 	Contract int
 	BuiltBy  string
+	// Components is the components tag, the license-restricted components the
+	// image was completed with, as `name:version` joined by commas; HasComponents
+	// says whether the image carries the tag at all, since an empty value is an
+	// image completed with none.
+	Components    string
+	HasComponents bool
+	// Arch is the architecture the image boots on, or empty for one AWS names in
+	// a way billet launches no Linux image for (config.ArchFromEC2).
+	Arch config.Arch
 }
 
 // DescribeSubnet reports the subnet's VPC, availability zone and state. A subnet
@@ -197,6 +207,10 @@ func DescribeImageStates(
 		}
 
 		info := ImageInfo{ImageID: id, State: resp.Images[0].State, Found: true}
+		if arch, ok := config.ArchFromEC2(resp.Images[0].Architecture); ok {
+			info.Arch = arch
+		}
+
 		for _, tag := range resp.Images[0].Tags {
 			switch tag.Key {
 			case amiContractTag:
@@ -208,6 +222,8 @@ func DescribeImageStates(
 				}
 			case amiBuiltByTag:
 				info.BuiltBy = tag.Value
+			case amiComponentsTag:
+				info.Components, info.HasComponents = tag.Value, true
 			}
 		}
 
