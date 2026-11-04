@@ -4,13 +4,15 @@ On 2026-11-04 billet measured what fifty idle control planes cost on one host, a
 
 ## How it was measured
 
-`scripts/measure-idle-control-planes.sh` on one dedicated `m7i.2xlarge` (8 vCPU, 32 GiB), started fifty real `billet server` processes of six tiers each, no nodes, with GitHub's names in `/etc/hosts` pointing at a fake in `internal/integration/idlecost_test.go`. The fake answers a real client's whole handshake and parks each long poll for 50 s, as the real service does at no work. After a 10 minute settle it sampled every 60 s for 30 minutes: proportional set size from `smaps_rollup`, CPU from `/proc/<pid>/stat`, goroutines and heap from each plane's metrics, connections per peer from `ss`, and `pg_stat_activity` by `application_name`. A plane that stopped polling fails the run, so no number here measured a stuck deployment. PostgreSQL 18 ran in Docker on the same host. Each row is one run, medians across planes of each plane's median across samples.
+`scripts/measure-idle-control-planes.sh` on one dedicated `m7i.2xlarge` (8 vCPU, 32 GiB), started fifty real `billet server` processes of six tiers each, no nodes, with GitHub's names in `/etc/hosts` pointing at a fake in `internal/integration/idlecost_test.go`. The fake answers a real client's whole handshake and parks each long poll for 50 s, a model of the real service at no work and not a measurement of it. After a 10 minute settle it sampled every 60 s for 30 minutes: proportional set size from `smaps_rollup`, CPU from `/proc/<pid>/stat`, goroutines and heap from each plane's metrics, connections per peer from `ss`, and `pg_stat_activity` by `application_name`. A plane that stopped polling fails the run, so no number here measured a stuck deployment. PostgreSQL 18 ran in Docker on the same host.
+
+Each row is one run. **Memory per plane** is across planes, of each plane's median sample, so its maximum is the largest plane's median and not a spike. **All 50** is the sum of those medians. **CPU** is each plane's ticks across the whole window: the median plane, then the sum. **Connections at rest** is the median plane's median sample, and **the highest sampled** is the largest count in any one sample of the settled window across all fifty, which excludes startup and whatever happened between samples, so it is not a limit to size a server by.
 
 `baseline` is the commit before this work, and `final` is the branch that shipped. The one real deployment below ran on the shared test host against a test organization's App.
 
 ## What it cost
 
-| Run | Memory per plane (median, p95, max) | All 50 | CPU per plane, all 50 | Goroutines | PostgreSQL connections per plane at rest, fleet peak |
+| Run | Memory per plane (median, p95, max) | All 50 | CPU per plane, all 50 | Goroutines | PostgreSQL connections per plane at rest, highest sampled across all 50 |
 |---|---|---|---|---|---|
 | SQLite, `baseline` | 17.2, 17.6, 18.1 MiB | 862 MiB | 0.053%, 0.027 cores | 47 | none |
 | SQLite, bounds | 17.1, 17.5, 17.7 MiB | 854 MiB | 0.054%, 0.027 cores | 48 | none |
@@ -19,9 +21,9 @@ On 2026-11-04 billet measured what fifty idle control planes cost on one host, a
 | PostgreSQL, `final` | 14.7, 15.0, 15.6 MiB | 739 MiB | 0.078%, 0.039 cores | 49 | 4, 200 |
 | PostgreSQL, `max_connections: 3` | 14.6, 14.9, 15.0 MiB | 729 MiB | 0.077%, 0.038 cores | 49 | 3, 150 |
 
-The PostgreSQL server itself, shared by the fifty, held 1132 MiB at `baseline`, 1098 MiB at `final` and 1010 MiB at a budget of three: about 2.4 MiB for each connection saved. SQLite costs more per plane than PostgreSQL because each plane holds its page cache itself.
+The PostgreSQL server itself, shared by the fifty, held 1132 MiB at `baseline`, 1098 MiB at `final` and 1010 MiB at a budget of three: about 1.8 MiB for each connection the budget saves, between `final` and that run. Why `final` is below `baseline` at the same count was not looked into. SQLite costs more per plane than PostgreSQL because each plane holds its page cache itself.
 
-**A settled plane holds four connections: the writer, the controller claim's session, and two readers.** Two readers stayed in every sample, so a plane's own cadence keeps them in use and the one-minute idle timeout closes nothing on these planes; it matters only to one with no reads for a minute. Keeping all four readers idle, which this work tried first, raised the fleet's peak from 200 to 226 and lowered nothing, so a burst keeps `database/sql`'s own two. The extra goroutine is the pool's idle-connection cleaner.
+**A settled plane holds four connections: the writer, the controller claim's session, and two readers.** Two readers stayed in every sample, so a plane's own cadence keeps them in use and the one-minute idle timeout closes nothing on these planes; it matters only to one with no reads for a minute. Keeping all four readers idle, which this work tried first, raised the highest sample from 200 to 226 and lowered nothing, so a burst keeps `database/sql`'s own two. The extra goroutine is the pool's idle-connection cleaner.
 
 **A target's polls share one connection.** All six tiers of a target held one connection to the fake's message host, on every plane, and none to the REST or pipelines hosts while idle. `TestATargetsLongPollsShareOneConnection` holds the client to that; real GitHub's connection count was not sampled.
 
@@ -33,7 +35,7 @@ The PostgreSQL server itself, shared by the fifty, held 1132 MiB at `baseline`, 
 | 24 MiB | 14.8 MiB | 0.077% |
 | 16 MiB | 12.0 MiB | 1.052% |
 
-At 24 MiB the limit is never reached. At 16 MiB it saves 3 MiB a plane for fourteen times the CPU, because the collector is running constantly against a heap that cannot shrink further: 0.48 cores across the fifty, where nothing else here reached 0.04.
+At 24 MiB nothing changed. At 16 MiB it saved 3 MiB a plane for fourteen times the CPU: 0.48 cores across the fifty, where nothing else here reached 0.04. The likely reason is the collector running constantly against a heap it cannot shrink further, which is an inference: the driver samples no collector activity.
 
 ## What a restart costs
 

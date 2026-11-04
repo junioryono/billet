@@ -29,7 +29,7 @@ server:
       max_connections: 3
 ```
 
-The readers get what the writer and the claim leave, up to four, so unset is six. Three is the least a control plane can run on, and a value under it is refused with the arithmetic. `billet check` states what the deployment can hold. A settled control plane holds four, the writer, the claim and two readers, and fifty on one server held 200 at their peak, or 150 at a budget of three, for about 2.4 MiB of the server's memory per connection saved. A reader nothing has borrowed for a minute closes, so a deployment with no reads at all holds fewer than its limit.
+The readers get what the writer and the claim leave, up to four, so unset is six. Three is the least a control plane can run on, and a value under it is refused with the arithmetic. `billet check` states what the deployment can hold. A settled control plane holds four, the writer, the claim and two readers, and fifty on one server were never sampled above 200 once settled, or 150 at a budget of three, for about 1.8 MiB of the server's memory per connection saved. Those are what idle planes were seen to hold, and not a limit to size a server by: use the budget's own arithmetic for that. A reader nothing has borrowed for a minute closes, so a deployment with no reads at all holds fewer than its limit.
 
 **Beyond that number:** a standby in an active-passive pair is a process of its own and holds its own, one session while it waits for the claim. An operator command run beside the server opens its own too, for as long as it runs, under the same limit, except the tail of `billet server retire`, which finds the ledger from its journal with no config to read a limit from, and reads one row at a time. A backup's `pg_dump` is one more.
 
@@ -37,7 +37,7 @@ The readers get what the writer and the claim leave, up to four, so unset is six
 
 ## Memory on a packed host
 
-**Do not set `GOMEMLIMIT` to save memory.** At 24 MiB it is never reached and changes nothing. At 16 MiB it saves 3 MiB a plane for fourteen times the CPU, the collector running constantly against a heap that cannot shrink further. An idle plane's memory is what it needs. If you want a limit as a guard against one plane growing, 32 MiB or more leaves an idle plane alone.
+**Do not set `GOMEMLIMIT` to save memory.** At 24 MiB it changed nothing. At 16 MiB it saved 3 MiB a plane for fourteen times the CPU. An idle plane's memory is what it needs. If you want a limit as a guard against one plane growing, 32 MiB or more leaves an idle plane alone.
 
 ## One App across deployments: the token broker
 
