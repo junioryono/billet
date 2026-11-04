@@ -561,9 +561,10 @@ func TestALeaseThatEndedBadlyWithNoStartIsNotAKnownZero(t *testing.T) {
 	t.Parallel()
 
 	for name, mutate := range map[string]func(*state.UsageRow){
-		"failed":    func(r *state.UsageRow) { r.Conclusion = "failed" },
-		"a reason":  func(r *state.UsageRow) { r.FailureReason = "launch-failed" },
-		"disrupted": func(r *state.UsageRow) { r.Disruption = "node-lost" },
+		"failed":     func(r *state.UsageRow) { r.Conclusion = "failed" },
+		"a reason":   func(r *state.UsageRow) { r.FailureReason = "launch-failed" },
+		"disrupted":  func(r *state.UsageRow) { r.Disruption = "node-lost" },
+		"in custody": func(r *state.UsageRow) { r.CustodyAt = "2026-11-03T10:02:00.000000000Z" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

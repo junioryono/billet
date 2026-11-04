@@ -692,7 +692,7 @@ SELECT usage_seq, usage_mark, lease_id, tier, github_target, COALESCE(repo, '') 
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
        COALESCE(conclusion, '') AS conclusion, github_runner_assigned_at, github_finished_at,
-       failure_reason, disruption
+       failure_reason, disruption, custody_at
   FROM job_history
  WHERE usage_seq > $1 AND usage_seq > 0
  ORDER BY usage_seq
@@ -727,6 +727,7 @@ type ListUsageSinceRow struct {
 	GithubFinishedAt       string
 	FailureReason          string
 	Disruption             string
+	CustodyAt              string
 }
 
 // Finished leases past a place in the order they were numbered in, bounded.
@@ -768,6 +769,7 @@ func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) 
 			&i.GithubFinishedAt,
 			&i.FailureReason,
 			&i.Disruption,
+			&i.CustodyAt,
 		); err != nil {
 			return nil, err
 		}

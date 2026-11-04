@@ -7,13 +7,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/tokenbroker"
 )
@@ -22,7 +22,7 @@ import (
 // hold none, and the key a control-plane host proves its deployment to it with.
 func Broker(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet broker serve --config broker.yaml | billet broker client-key [--config PATH] [--show]")
+		return errors.New("usage: billet broker serve --config broker.yaml | billet broker client-key [--config PATH] [--show] [--new-deployment]")
 	}
 
 	switch args[0] {
@@ -128,6 +128,14 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 			"--new-deployment", cfg.Server.IdentityDir)
 	}
 
+	// BEFORE THE KEY EXISTS: root on a host with no recorded service account has nobody to
+	// hand a mode 0600 key to, and printing a stanza for it would look like success.
+	if os.Geteuid() == 0 && acc.Account() == nil {
+		return errors.New("this host records no service account, so a key made by root could only be read by " +
+			"root. Run this as the account that runs the control plane, or prepare the host first " +
+			"(`billet local prepare`)")
+	}
+
 	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
 		return err
@@ -138,7 +146,7 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if err := giveToService(path, cfg.Server.IdentityDir); err != nil {
+	if err := giveToService(path, acc.Account()); err != nil {
 		return err
 	}
 
@@ -162,22 +170,17 @@ func printBrokerStanza(env cli.Env, cfg *config.Config, path, deployment, finger
 }
 
 // giveToService hands a key a privileged run just made to the account the service runs
-// as, which owns the identity directory: it is the service that reads it, and a mode 0600
-// file root owns would stop the control plane at its first token. Through lifeops' repair,
-// the one re-owning mechanism, which follows no symlink and refuses a file with a second
-// name. Nothing happens for anyone but root.
-func giveToService(path, identityDir string) error {
-	if os.Geteuid() != 0 {
+// as: it is the service that reads it, and a mode 0600 file root owns would stop the
+// control plane at its first token. Through lifeops' repair, the one re-owning mechanism,
+// which follows no symlink and refuses a file with a second name. Nothing happens for
+// anyone but root.
+func giveToService(path string, account *retirement.ServiceAccount) error {
+	if os.Geteuid() != 0 || account == nil {
 		return nil
 	}
 
-	var owner syscall.Stat_t
-	if err := syscall.Stat(identityDir, &owner); err != nil {
-		return fmt.Errorf("read who owns %s: %w", identityDir, err)
-	}
-
 	if _, err := lifeops.NewConverger(lifeops.NewInspector()).RepairPaths(filepath.Dir(path),
-		[]lifeops.RepairTarget{{Name: filepath.Base(path)}}, int(owner.Uid), int(owner.Gid)); err != nil {
+		[]lifeops.RepairTarget{{Name: filepath.Base(path)}}, account.UID, account.GID); err != nil {
 		return fmt.Errorf("give %s to the service account: %w", path, err)
 	}
 

@@ -79,7 +79,7 @@ The weight is read from the config when the record is read, so editing a weight 
 A value the ledger does not know is `null` or empty, and `unknown` names it with the reason. The one `null` that is not unknown is a price on an owned machine, where there is none to know. It is never zero, because a billing system summing a column of zeros has quietly given minutes away. The cases, none of which is an error:
 
 - **A lease that ran no job** and finished cleanly bills a known `billed_minutes: 0`, and `job` is empty with the reason. Its `held` is still there: it held capacity.
-- **A lease that failed or was disrupted with no start recorded** has an unknown `billed_minutes`. A `JobStarted` arrives tens of seconds late, so a lease that ended this way may have been running a job, and GitHub can still report one.
+- **A lease that failed, was disrupted or passed through a node's custody with no start recorded** has an unknown `billed_minutes`. A `JobStarted` arrives tens of seconds late, so a lease that ended this way may have been running a job, and GitHub can still report one.
 - **A job with no result yet**, which ended with the lease before GitHub reported one: `billed_minutes` is unknown and `held` says how long the lease lasted. What to charge is the consumer's decision, and billet does not guess one.
 - **A result with no start**: GitHub reported a result and billet never saw the job start, so it has no length.
 - **A clock that stepped** so that an end precedes its start: the length is unknown, not negative.
