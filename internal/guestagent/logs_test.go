@@ -293,8 +293,118 @@ func TestStepsAreNumberedAsTheyRanAndNamedFromTheMarks(t *testing.T) {
 	}
 }
 
+// A RUN OF QUICK STEPS SHARES A SECOND, AND EACH KEEPS ITS OWN NAME. The shape of a real job, measured
+// on 2026-11-04: four steps began in one second, and the runner's own setup, which has no step and no
+// mark, began in it too. Naming each log after the latest mark at its time put every name one step off,
+// so a search by step found the wrong lines. A step that wrote nothing has a mark and no log.
+func TestQuickStepsKeepTheirOwnNames(t *testing.T) {
+	t.Parallel()
+
+	diag, pages := diagWithPages(t)
+
+	var worker strings.Builder
+	for _, m := range []struct{ at, name string }{
+		{"18:05:31", "Set up runner"}, {"18:05:31", "Echo"}, {"18:05:31", "Short"}, {"18:05:31", "Write"},
+		{"18:05:36", "Pytest"}, {"18:05:40", "Skipped"}, {"18:05:41", "Go"},
+	} {
+		fmt.Fprintf(&worker, "[2026-11-04 %sZ INFO StepsRunner] Processing step: DisplayName='%s'\n", m.at, m.name)
+	}
+	if err := os.WriteFile(filepath.Join(diag, "Worker_20261104-180531-utc.log"), []byte(worker.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, p := range []struct{ at, text string }{
+		{"18:05:31.100", "setup"}, {"18:05:31.200", "runner hook"}, {"18:05:31.300", "echoing"},
+		{"18:05:31.500", "short"}, {"18:05:31.600", "writing"}, {"18:05:36.200", "pytest"},
+		{"18:05:41.300", "go"}, {"18:05:44.100", "completing"},
+	} {
+		record := fmt.Sprintf("2c512f10-faf8-46f5-9447-a297cf77c%03d", i)
+		writePage(t, pages, pageName(record, 1), "2026-11-04T"+p.at+"Z "+p.text+"\n")
+	}
+
+	tail := tailerAt(t, diag)
+	tail.scan()
+	tail.read()
+
+	got := map[string]string{}
+	for _, c := range chunks(t, tail) {
+		got[c.Lines[0].Text] = c.StepName
+	}
+
+	for text, want := range map[string]string{
+		"setup": "", "runner hook": "Set up runner", "echoing": "Echo", "short": "Short", "writing": "Write",
+		"pytest": "Pytest", "go": "Go", "completing": "",
+	} {
+		name, ok := got[text]
+		if !ok {
+			t.Errorf("no chunk holds %q", text)
+
+			continue
+		}
+		if name != want {
+			t.Errorf("%q is named %q, want %q", text, name, want)
+		}
+	}
+}
+
+// A LOG WHOSE MARK IS NOT WRITTEN YET WAITS FOR IT, since the runner writes that to another file, and
+// the runner's end stops the wait.
+func TestAStepLogWaitsAMomentForItsMark(t *testing.T) {
+	t.Parallel()
+
+	diag, pages := diagWithPages(t)
+
+	now := time.Now().UTC()
+	stamp := now.Format("2006-01-02T15:04:05.000Z")
+
+	writePage(t, pages, pageName(stepRecord, 1), stamp+" setting up\n")
+	writePage(t, pages, pageName(otherRecord, 1), stamp+" stepping\n")
+
+	tail := tailerAt(t, diag)
+	tail.scan()
+	tail.read()
+
+	var named *logFile
+
+	for _, file := range tail.open {
+		if file.record == otherRecord {
+			named = file
+		}
+	}
+	if named == nil {
+		t.Fatal("the second log was not opened")
+	}
+
+	if named.assigned {
+		t.Skip("this machine took past the wait to get here, so nothing here is measured")
+	}
+
+	worker := fmt.Sprintf("[%s INFO StepsRunner] Processing step: DisplayName='The step'\n", now.Format("2006-01-02 15:04:05Z"))
+	if err := os.WriteFile(filepath.Join(diag, "Worker_"+now.Format("20060102-150405")+"-utc.log"), []byte(worker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tail.read()
+
+	if !named.assigned || named.stepName != "The step" {
+		t.Errorf("with its mark written the log is assigned %t, named %q", named.assigned, named.stepName)
+	}
+
+	// THE END STOPS THE WAIT, for a log that will never have a mark.
+	last := "6d7f3e2a-1b4c-4d5e-8f60-112233445566"
+	writePage(t, pages, pageName(last, 1), time.Now().UTC().Format("2006-01-02T15:04:05.000Z")+" completing\n")
+	tail.scan()
+	tail.read()
+	tail.endLines()
+
+	for _, file := range tail.open {
+		if file.record == last && !file.assigned {
+			t.Error("the runner's end left a log waiting")
+		}
+	}
+}
+
 // A CHUNK TOO LARGE FOR THE NODE IS HALVED UNTIL IT FITS, and every line reaches a chunk.
-// A number is spent on each try, so a number is never used twice.
 func TestAChunkIsCutToWhatTheNodeTakes(t *testing.T) {
 	t.Parallel()
 

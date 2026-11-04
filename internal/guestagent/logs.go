@@ -49,6 +49,9 @@ const (
 	// logMarkPolls bounds how far one look at the Worker log goes, in reads of its bound: a step's
 	// name must not be taken from a mark that a long Worker log left behind.
 	logMarkPolls = 16
+	// logMarkWait is how long a step log with no mark to its name waits for one, in milliseconds
+	// since its first line: the runner writes the mark first, to another file.
+	logMarkWait = 2000
 	// logReadLimit is what one pass takes of one file, and logHeldLimit what the agent
 	// holds unsent across every file; past it reading waits for the node.
 	logReadLimit = 256 << 10
@@ -108,6 +111,8 @@ type logTailer struct {
 	next  int64
 	// marked are the runner's step marks not yet matched to a step log.
 	marked []guestreport.StepMark
+	// finishing says no more marks are coming, so a step log waits for none.
+	finishing bool
 
 	seq  uint64
 	held int
@@ -253,6 +258,7 @@ func (t *logTailer) endLines() {
 		}
 	}
 
+	t.finishing = true
 	t.assign()
 }
 
@@ -359,7 +365,8 @@ func splitStamp(line string) (int64, string) {
 // assign numbers the step logs that have lines, by the time of their first, and names
 // each from the runner's marks. A step's file is flushed before the next step begins,
 // so the order holds; the setup before the first mark and the cleanup after the last
-// have no mark and no name.
+// have no mark and no name. ONE WITH NO MARK YET WAITS, with those after it, since the mark is
+// written first but to another file; a name is only a label, so not for long.
 func (t *logTailer) assign() {
 	var waiting []*logFile
 
@@ -389,6 +396,10 @@ func (t *logTailer) assign() {
 	for _, file := range waiting {
 		step, known := t.steps[file.record]
 		if !known {
+			if t.markOverdue(file.first) {
+				break
+			}
+
 			step = &logStep{step: t.next, name: t.takeMark(file.first)}
 			t.steps[file.record] = step
 			t.next++
@@ -421,20 +432,55 @@ func (t *logTailer) pollMarks() {
 	t.marked = t.marked[max(0, len(t.marked)-logMaxMarks):]
 }
 
-// takeMark is the name of the latest mark at or before a step log's first line, and uses
-// up every mark before it. A mark is whole seconds on the same clock.
-func (t *logTailer) takeMark(firstMillis int64) string {
-	name, used := "", 0
+// markOverdue says the next step log has no mark to its name yet and may still get one.
+func (t *logTailer) markOverdue(firstMillis int64) bool {
+	if t.finishing || t.next == 0 || t.markFor(firstMillis) >= 0 {
+		return false
+	}
+
+	age := time.Now().UnixMilli() - firstMillis
+
+	return age >= 0 && age < logMarkWait
+}
+
+// markFor is which waiting mark names a step log whose first line is at firstMillis, or -1.
+//
+// IN ORDER WITHIN A SECOND. A mark has only whole seconds, and a run of quick steps shares one
+// (four did on a real job on 2026-11-04), so the first of that second is this log's: the latest would
+// name it after a step that has not begun, and shift every name after it. A mark of an earlier second
+// with none in this one is the latest of those: a step that wrote nothing has a mark and no log.
+func (t *logTailer) markFor(firstMillis int64) int {
+	second, found := firstMillis/1000, -1
 
 	for i, mark := range t.marked {
-		if mark.AtSeconds*1000 > firstMillis {
+		if mark.AtSeconds > second {
 			break
 		}
 
-		name, used = mark.Name, i+1
+		found = i
+
+		if mark.AtSeconds == second {
+			break
+		}
 	}
 
-	t.marked = t.marked[used:]
+	return found
+}
+
+// takeMark is the name of a step log with its first line at firstMillis, and uses up every mark to
+// that one. THE FIRST LOG TAKES NONE: it is the runner setting up the job, before any step.
+func (t *logTailer) takeMark(firstMillis int64) string {
+	if t.next == 0 {
+		return ""
+	}
+
+	found := t.markFor(firstMillis)
+	if found < 0 {
+		return ""
+	}
+
+	name := t.marked[found].Name
+	t.marked = t.marked[found+1:]
 
 	return name
 }
