@@ -1,9 +1,12 @@
 package ec2
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +34,11 @@ function New-Object {
 		$port | Add-Member ScriptMethod WriteLine { param($line) Add-Content -LiteralPath $env:STUB_CONSOLE -Value $line }
 		return $port
 	}
+	if ($args[0] -eq 'Security.AccessControl.DirectorySecurity') {
+		$acl = Get-Acl
+		$acl | Add-Member ScriptMethod SetAccessRuleProtection { param($p, $q) }
+		return $acl
+	}
 	if ($args[0] -like 'Security.AccessControl.*') { return $null }
 	Microsoft.PowerShell.Utility\New-Object @args
 }
@@ -43,6 +51,7 @@ function Get-Acl { $a = [pscustomobject]@{}; $a | Add-Member ScriptMethod AddAcc
 function Set-Acl { Note 'set-acl' }
 function Set-LocalUser { Note 'set-password' }
 function New-ScheduledTaskAction { }
+function New-ScheduledTaskSettingsSet { Note "settings $args" }
 function Register-ScheduledTask { Note 'register' }
 function Unregister-ScheduledTask { Note 'unregister' }
 function Start-ScheduledTask { Note 'start'; if ($env:STUB_TASK_WRITES) { Copy-Item -LiteralPath $env:STUB_TASK_WRITES -Destination $env:STUB_RESULT } }
@@ -253,6 +262,11 @@ func TestTheWindowsVerifierEarnsItsVerdict(t *testing.T) {
 					report[reportStepKey], tc.wantVerdict, tc.wantStep, console)
 			}
 
+			// A TASK AT NORMAL PRIORITY, or what the check asserts is not what it is asked of.
+			if !tc.damage && !strings.Contains(log, "settings -Priority 4") {
+				t.Errorf("the verifier's task is not at normal priority:\n%s", log)
+			}
+
 			// ITS OWN END, whatever it found: the timed one is set first and called off last.
 			if !strings.Contains(log, "shutdown /s /t") || !strings.Contains(log, "shutdown /a") || !strings.Contains(log, "stop") {
 				t.Errorf("the verifier did not end itself:\n%s", log)
@@ -288,6 +302,7 @@ func TestTheWindowsVerifierCheckAsksEveryClause(t *testing.T) {
 		"if ($env:AGENT_TOOLSDIRECTORY -ine $env:RUNNER_TOOL_CACHE) {",
 		"if ($drive.Free -lt (" + strconv.Itoa(minVerifiedFreeGiB) + " * 1GB)) { throw 'the root is nearly full' }\n",
 		"if ($paging.Count -eq 0) { throw 'this image booted with no page file' }\n",
+		"if ($priority -cne 'Normal') { throw 'this task does not run at normal priority' }\n",
 		"Step 'done'\n",
 	} {
 		if !strings.Contains(script, want) {
@@ -475,6 +490,91 @@ func TestTheWindowsSecondBootStartsTheDriverOnlyOnWhatItChecked(t *testing.T) {
 	}
 }
 
+// A FIRST BOOT THAT FAILS ENDS THE MACHINE, which billet reads as a builder with no verdict,
+// and leaves no reboot asked for. There is no console to say so on yet.
+func TestAWindowsFirstBootThatFailsEndsTheMachine(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		stub     string
+		wantStop bool
+	}{
+		"a first boot that works": {},
+		"a directory it cannot close": {
+			stub: "function Set-Acl { throw 'no' }\n", wantStop: true,
+		},
+		"EMS it cannot switch off": {
+			stub: "function bcdedit { $global:LASTEXITCODE = 1 }\n", wantStop: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			script, err := windowsBootstrapScript(testWindowsBuild())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dir := t.TempDir()
+			// EVERYTHING ELSE IS WINDOWS'S, and a function wins over a cmdlet.
+			body := "function New-Item { }\nfunction Set-Content { }\nfunction New-ScheduledTaskTrigger { }\n" +
+				"function Set-ItemProperty { }\nfunction Remove-ItemProperty { }\nfunction Set-CimInstance { }\n" +
+				"function Get-CimInstance { }\nfunction Remove-CimInstance { }\n" + tc.stub + stripTags(script)
+
+			_, log, _ := runStubbed(t, dir, body)
+
+			if got := strings.Contains(log, "stop"); got != tc.wantStop {
+				t.Errorf("the machine stopped: %v, want %v:\n%s", got, tc.wantStop, log)
+			}
+			if got := strings.Contains(log, "restart"); got == tc.wantStop {
+				t.Errorf("the machine restarted: %v, with a failure %v:\n%s", got, tc.wantStop, log)
+			}
+		})
+	}
+}
+
+// WHAT A FAILED STEP SAID REACHES THE OPERATOR, in the log and never the error, since a guest
+// wrote it, and only the lines the driver marks.
+func TestAWindowsBuildFailureLogsWhatTheStepSaid(t *testing.T) {
+	t.Parallel()
+
+	var logged bytes.Buffer
+
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	p.logWindowsBuildTail("i-1", "EC2Launch noise\nbilliet-build-log not ours\nbillet-build-log the step said why\r\n"+
+		"billet-build-log bad \x01 byte\nverdict=fail\n")
+
+	got := logged.String()
+	if !strings.Contains(got, "the step said why") {
+		t.Errorf("the step's line was not logged:\n%s", got)
+	}
+	for _, not := range []string{"EC2Launch noise", "not ours", "bad "} {
+		if strings.Contains(got, not) {
+			t.Errorf("%q was logged:\n%s", not, got)
+		}
+	}
+
+	var many strings.Builder
+	for i := range 90 {
+		fmt.Fprintf(&many, "billet-build-log line %d\n", i)
+	}
+
+	logged.Reset()
+	p.logWindowsBuildTail("i-1", many.String())
+
+	if strings.Contains(logged.String(), "line 9\"") || !strings.Contains(logged.String(), "line 89") {
+		t.Errorf("the log kept the wrong end of a long tail:\n%s", logged.String())
+	}
+
+	if err := windowsBuildFailure("i-1", map[string]string{reportStepKey: "layer"}); err == nil ||
+		strings.Contains(err.Error(), "the step said why") {
+		t.Errorf("the error says %v", err)
+	}
+}
+
 // THE PRESIGNED URL IS WRITTEN ONLY TO A DIRECTORY ALREADY CLOSED, and the reboot COM1 needs
 // comes after everything that has to survive it.
 func TestTheWindowsFirstBootClosesTheDirectoryBeforeItWritesTheURL(t *testing.T) {
@@ -615,7 +715,7 @@ func TestAWindowsBootstrapFailureNamesWhatCouldHaveFailed(t *testing.T) {
 	}
 
 	err = windowsBuildFailure("i-1", map[string]string{reportStepKey: "layer"})
-	if err == nil || !strings.Contains(err.Error(), windowsBuildDir+`\logs`) {
-		t.Errorf("the failure does not send the operator to the logs: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "logged above") {
+		t.Errorf("the failure does not send the operator to the log: %v", err)
 	}
 }

@@ -1441,14 +1441,15 @@ function Get-ScheduledTaskInfo {
 		states, results string
 		wantFail        bool
 	}{
-		"running at the first read":     {states: "Running", results: "267011"},
-		"not yet run, then running":     {states: "Ready,Running", results: "267011"},
-		"started between the two reads": {states: "Ready,Running", results: "267009"},
-		"queued, then running":          {states: "Queued,Running", results: "267045"},
-		"a result, and running by then": {states: "Ready,Running", results: "0"},
-		"ended, by both reads":          {states: "Ready,Ready", results: "1", wantFail: true},
-		"never left not yet run":        {states: "Ready", results: "267011", wantFail: true},
-		"ended cleanly, by both reads":  {states: "Ready,Ready", results: "0", wantFail: true},
+		"running at the first read":      {states: "Running", results: "267011"},
+		"not yet run, then running":      {states: "Ready,Running", results: "267011"},
+		"started between the two reads":  {states: "Ready,Running", results: "267009"},
+		"said running, its state behind": {states: "Ready,Ready,Running", results: "267009"},
+		"queued, then running":           {states: "Queued,Running", results: "267045"},
+		"a result, and running by then":  {states: "Ready,Running", results: "0"},
+		"ended, by both reads":           {states: "Ready,Ready", results: "1", wantFail: true},
+		"never left not yet run":         {states: "Ready", results: "267011", wantFail: true},
+		"ended cleanly, by both reads":   {states: "Ready,Ready", results: "0", wantFail: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1470,5 +1471,20 @@ function Get-ScheduledTaskInfo {
 				t.Errorf("it failed for another reason:\n%s", out)
 			}
 		})
+	}
+}
+
+// THE RUNNER'S TASK IS AT NORMAL PRIORITY. A task's default is below normal, which every
+// process of every job would inherit, and the verifier's task is its own: this is the one
+// place that says the runner's is too.
+func TestTheWindowsRunnerTaskIsAtNormalPriority(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("windows", "billet-runner.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`(?m)New-ScheduledTaskSettingsSet[^\n]*\n?[^\n]*-Priority 4\s*$`).Match(raw) {
+		t.Error("the runner's task does not ask for priority 4")
 	}
 }

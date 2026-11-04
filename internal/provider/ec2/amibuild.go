@@ -331,6 +331,8 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 					// bootstrap again, and what it says next is about this builder.
 					if report[reportVerdictKey] != verdictOK {
 						if spec.Windows {
+							p.logWindowsBuildTail(id, out)
+
 							return "", windowsBuildFailure(id, report)
 						}
 

@@ -62,7 +62,7 @@ func windowsVerifyScript(arch, nonce string) (string, reportSchema, error) {
 
 	for _, key := range []string{
 		reportVerdictKey, reportStepKey, "runner", "image_os", "tool_cache", "root_free_gib", "root_used_gib",
-		"page_file_mb",
+		"page_file_mb", "priority",
 	} {
 		schema.keys[key] = struct{}{}
 	}
@@ -208,6 +208,9 @@ Step 'account'
 $id = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if ($env:USERNAME -ine 'runner') { throw 'this is not the runner account' }
 if (-not $id.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'the runner account is not elevated' }
+$priority = [string](Get-Process -Id $PID).PriorityClass
+Say 'priority' $priority
+if ($priority -cne 'Normal') { throw 'this task does not run at normal priority' }
 Step 'runner'
 Ask-Tool 'runner' '@ENTRY@' '--version'
 Step 'tools'
@@ -272,7 +275,8 @@ try {
 	$password = 'aA1!' + [Convert]::ToBase64String($bytes)
 	Set-LocalUser -Name 'runner' -Password (ConvertTo-SecureString $password -AsPlainText -Force)
 	$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File $dir\check.ps1" -WorkingDirectory 'C:\actions-runner'
-	Register-ScheduledTask -TaskName 'billet-verify' -Action $action -User 'runner' -Password $password -RunLevel Highest -Force | Out-Null
+	$settings = New-ScheduledTaskSettingsSet -Priority 4
+	Register-ScheduledTask -TaskName 'billet-verify' -Action $action -Settings $settings -User 'runner' -Password $password -RunLevel Highest -Force | Out-Null
 	Start-ScheduledTask -TaskName 'billet-verify'
 	for ($i = 0; $i -lt 300; $i++) {
 		Start-Sleep -Seconds 2

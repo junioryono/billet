@@ -6,8 +6,9 @@
 # THE REGISTRATION REACHES THE RUNNER IN NO PROCESS'S ARGUMENT LIST (#352). A scheduled
 # task inherits nothing from this process, so it travels in a file only `runner` can
 # read among the accounts that run anything here, which the service script reads and
-# deletes before it starts the runner: every account on this machine is an administrator,
-# so the deletion is what keeps it from a job's steps, which run as `runner`.
+# deletes before it starts the runner. A job's steps are administrators and can still read
+# the user data, as on Linux: what protects it from them is that the runner has already
+# spent it (ADR-002).
 #
 # THE PASSWORD IS THIS BOOT'S ALONE. The account has none anyone knows in the image, a
 # scheduled task needs one to log it on, and it goes to the task through a cmdlet's
@@ -75,9 +76,10 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
 	-WorkingDirectory 'C:\actions-runner'
 
 # NO EXECUTION LIMIT: a task's default is three days, after which Windows would end the
-# runner under a job still running.
+# runner under a job still running. AND NORMAL PRIORITY: a task's default is 7, below normal,
+# which every process of every job would inherit.
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries `
-	-DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+	-DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 4
 
 Register-ScheduledTask -TaskName $task -Action $action -Settings $settings -User $account `
 	-Password $password -RunLevel Highest -Force | Out-Null

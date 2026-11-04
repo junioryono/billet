@@ -64,8 +64,9 @@ func TestAWindowsLeaseOnAStockAMIIsRefusedUnderBilletsCommand(t *testing.T) {
 	f.respond = stock
 
 	_, err := newTestProvider(t, f, nil).Launch(t.Context(), windowsSpec())
-	if err == nil || !strings.Contains(err.Error(), "no billet built") {
-		t.Fatalf("Launch answered %v, want a refusal naming the image", err)
+	if err == nil || !strings.Contains(err.Error(), "no billet built") ||
+		!strings.Contains(err.Error(), "billet ami verify") {
+		t.Fatalf("Launch answered %v, want a refusal naming the image and what a copy needs", err)
 	}
 	if n := f.countOf("RunInstances"); n != 0 {
 		t.Errorf("%d instances were asked for", n)

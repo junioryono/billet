@@ -39,8 +39,9 @@ func checkGuestOS(spec provider.Spec, layout imageLayout) error {
 		// said its image carries it.
 		if wants && !layout.billet && slices.Equal(spec.Command, []string{config.WindowsRunnerCommand}) {
 			return fmt.Errorf("ec2: %s would run %s on %s, which no billet built, so nothing there "+
-				"would start a runner; build one with `billet ami build --os windows`",
-				spec.Name, config.WindowsRunnerCommand, spec.Image)
+				"would start a runner; build one with `billet ami build --os windows`, or if this is "+
+				"a copy of one that lost its tags, stamp it with `billet ami verify %s`",
+				spec.Name, config.WindowsRunnerCommand, spec.Image, spec.Image)
 		}
 
 		return nil

@@ -246,13 +246,15 @@ func windowsBootstrapScript(spec BuildSpec) (string, error) {
 }
 
 // windowsBootstrapFirst is the first boot, which can report nothing: there is no COM1
-// until the reboot it asks for. A failure here ends at billet's deadline.
+// until the reboot it asks for. So a failure here stops the machine, which billet reads as
+// a builder that powered off with no verdict, rather than billing a licence to its deadline.
 //
 // THE SECOND SCRIPT HOLDS A PRESIGNED URL, a credential, so the directory is opened to
 // SYSTEM and the administrators alone before it is written, and the URL is good for an
 // hour. It is deleted before the build starts.
 const windowsBootstrapFirst = `<powershell>
 $ErrorActionPreference = 'Stop'
+try {
 New-Item -ItemType Directory -Force -Path '@DIR@' | Out-Null
 $acl = New-Object Security.AccessControl.DirectorySecurity
 $acl.SetAccessRuleProtection($true, $false)
@@ -265,7 +267,7 @@ Set-Content -LiteralPath '@BOOTSTRAP@' -Encoding ascii -Value @'
 '@
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File @BOOTSTRAP@'
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 4
 Register-ScheduledTask -TaskName '@TASK@' -Action $action -Trigger $trigger -Settings $settings -User 'NT AUTHORITY\SYSTEM' -RunLevel Highest -Force | Out-Null
 Set-CimInstance -InputObject (Get-CimInstance Win32_ComputerSystem) -Property @{ AutomaticManagedPagefile = $false }
 Get-CimInstance Win32_PageFileSetting | Remove-CimInstance
@@ -277,6 +279,9 @@ if ($LASTEXITCODE -ne 0) { throw 'bcdedit could not switch EMS off' }
 bcdedit /bootems '{current}' off | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'bcdedit could not switch boot EMS off' }
 Restart-Computer -Force
+} catch {
+	Stop-Computer -Force
+}
 </powershell>
 `
 
@@ -290,7 +295,6 @@ Restart-Computer -Force
 // and billet takes a failure said after a success as the last word.
 const windowsBootstrapSecond = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-Unregister-ScheduledTask -TaskName '@TASK@' -Confirm:$false
 function Stop-WithFailure([string]$step) {
 	$port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
 	$port.Open()
@@ -302,6 +306,7 @@ function Stop-WithFailure([string]$step) {
 	}
 }
 try {
+	Unregister-ScheduledTask -TaskName '@TASK@' -Confirm:$false
 	if (Test-Path -LiteralPath '@MARK@') { throw 'this machine already records a finished billet build' }
 	if (Test-Path -LiteralPath '@PAGEFILE@') { Remove-Item -LiteralPath '@PAGEFILE@' -Force }
 	if ((Get-PSDrive C).Free -lt (@MIN_FREE_GIB@ * 1GB)) { throw 'the root has too little free space' }
@@ -346,9 +351,35 @@ func windowsBuildFailure(id string, report map[string]string) error {
 			"machine already records a finished billet build", id, where)
 	}
 
-	return fmt.Errorf("ec2: the builder %s reported that its build failed in %s; billet terminates "+
-		"it, so rerun the build to see the step's own output in %s\\logs while it runs", id, where,
-		windowsBuildDir)
+	return fmt.Errorf("ec2: the builder %s reported that its build failed in %s; the end of the "+
+		"step's output is logged above, and billet terminates the builder", id, where)
+}
+
+// logWindowsBuildTail logs what the driver put on the console ahead of a failure's verdict,
+// which is the only account of it a builder in an egress-only group can give. LOGGED AND
+// NOT PUT IN THE ERROR, since a guest wrote it. Printable and bounded already by the driver,
+// and held to that here, because this is what the console says and not what it should.
+func (p *Provider) logWindowsBuildTail(id, console string) {
+	const prefix = "billet-build-log "
+
+	const most = 80
+
+	var lines []string
+
+	for _, line := range strings.Split(console, "\n") {
+		text, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), prefix)
+		if ok && printableASCII(text) && len(text) <= maxReportValue+len(prefix) {
+			lines = append(lines, text)
+		}
+	}
+
+	if len(lines) > most {
+		lines = lines[len(lines)-most:]
+	}
+
+	for _, text := range lines {
+		p.log.Warn("the builder's failed step said", "instance", id, "line", text)
+	}
 }
 
 // windowsPlanStepName is the id of step n (counted from 1) of the Windows plan.

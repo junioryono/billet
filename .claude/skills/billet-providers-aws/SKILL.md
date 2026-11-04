@@ -46,12 +46,12 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A page file in the image costs a job its assignment.**
 - **A Windows launch asks for a provisioned read of its snapshot.**
 - **A Windows image is `reset`, not sysprepped.**
-- **The scheduled task needs an explicit execution limit.**
+- **The scheduled task needs an explicit execution limit and priority.**
 - **A step's preference does not cross a process.**
 - **Amazon's AMI is not Azure's.**
 - **GitHub's steps read the account's profile.**
 - **EC2Launch keeps the user data it ran.**
-- **A failed start ends the billing, not the lease.**
+- **A failed start ends the instance's charge, not the lease.**
 - **A build's own output reaches the console only as a bounded tail on failure.**
 - **A file named `*_windows.go` builds only on Windows.**
 - **The tests run PowerShell 7's parser, not 5.1's.**
