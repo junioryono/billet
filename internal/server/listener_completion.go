@@ -266,6 +266,7 @@ func (l *Listener) recordJobResult(ctx context.Context, job dispatch.Job, leaseI
 	// them the wait is unknown, never another job's.
 	if job.RunnerName == "" {
 		job.QueuedAt, job.ScaleSetAssignedAt, job.RunnerAssignedAt = time.Time{}, time.Time{}, time.Time{}
+		job.FinishedAt = time.Time{}
 	}
 	l.recordJobIdentity(ctx, leaseID, job, 0)
 }

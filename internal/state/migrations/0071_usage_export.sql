@@ -28,6 +28,13 @@
 -- finished_at, and a lease the exporter never read can take a lower one. A cursor
 -- carries the mark, so one from the other history is refused and never read past.
 --
+-- github_finished_at is GitHub's own time for a job's end, from the completion message,
+-- which with github_runner_assigned_at gives a job's length on one clock. Billet's
+-- started_at and result_at are when the messages ARRIVED, and a real JobStarted arrived
+-- 46 and 47 seconds after its job started (2026-11-04), once in one delivery with the
+-- job's completion: a job GitHub ran for 243 seconds read as 197. Those two pairs are
+-- not interchangeable, so a usage record says which it read.
+--
 -- github_target is the GitHub path of the owner whose runner the lease held,
 -- copied from the lease as it closes. Migration 64 put it on the lease only, and
 -- the row that outlives the lease had nothing but a tier label, which an operator
@@ -60,6 +67,10 @@ ALTER TABLE job_history ADD COLUMN usage_seq INTEGER NOT NULL DEFAULT 0 CHECK (u
 
 -- +billet:statement
 ALTER TABLE job_history ADD COLUMN usage_mark TEXT NOT NULL DEFAULT ''
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE job_history ADD COLUMN github_finished_at TEXT NOT NULL DEFAULT ''
 -- +billet:end
 
 -- +billet:statement

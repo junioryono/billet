@@ -112,6 +112,8 @@ type Job struct {
 	QueuedAt           time.Time
 	ScaleSetAssignedAt time.Time
 	RunnerAssignedAt   time.Time
+	// FinishedAt is when GitHub says the job finished. Only a completion carries it.
+	FinishedAt time.Time
 }
 
 // CacheAuthority is what a cache may do for one job, decided from evidence

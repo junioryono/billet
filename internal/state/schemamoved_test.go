@@ -36,6 +36,7 @@ func rewindNewest(t *testing.T, db *DB) {
 			`DROP INDEX job_history_usage_seq`,
 			`DROP INDEX job_history_usage_unnumbered`,
 			`ALTER TABLE job_history DROP COLUMN usage_mark`,
+			`ALTER TABLE job_history DROP COLUMN github_finished_at`,
 			`DROP TABLE usage_sequence`,
 			`ALTER TABLE job_history DROP COLUMN usage_seq`,
 			`ALTER TABLE job_history DROP COLUMN github_target`,

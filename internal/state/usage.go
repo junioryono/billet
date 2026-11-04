@@ -20,6 +20,9 @@ type UsageRow struct {
 	VCPU, Memory, PriceMicrosPerHour  int64
 	BoughtAt, StartedAt, FinishedAt   string
 	Result, ResultAt, Conclusion      string
+	// GitHubRunnerAssignedAt and GitHubFinishedAt are on GitHub's clock. StartedAt and
+	// ResultAt are when billet received the messages saying so, which can be far later.
+	GitHubRunnerAssignedAt, GitHubFinishedAt string
 }
 
 // ErrNoUsageRecord means the ledger holds no finished lease at a sequence number.
@@ -47,6 +50,7 @@ func (db *DB) UsageSince(ctx context.Context, after int64, limit int) ([]UsageRo
 				Site: r.Site, VCPU: r.Vcpu, Memory: r.Memory, PriceMicrosPerHour: r.PriceMicrosPerHour,
 				BoughtAt: r.BoughtAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
 				Result: r.Result, ResultAt: r.ResultAt, Conclusion: r.Conclusion,
+				GitHubRunnerAssignedAt: r.GithubRunnerAssignedAt, GitHubFinishedAt: r.GithubFinishedAt,
 			})
 		}
 

@@ -249,6 +249,8 @@ type usageRecord struct {
 	// Held is how long the lease held its capacity, and Job how long its job ran.
 	Held usageInterval `json:"held"`
 	Job  usageInterval `json:"job"`
+	// JobClock is whose times Job holds.
+	JobClock string `json:"job_clock"`
 
 	BilledMinutes   *int64       `json:"billed_minutes"`
 	MinuteWeight    *json.Number `json:"minute_weight"`
@@ -273,6 +275,10 @@ const (
 	// maxUsageVCPU is a shape no machine has, past which a recorded vCPU is
 	// damage rather than a shape to weigh minutes by.
 	maxUsageVCPU = 1 << 32
+
+	// A job's length on GitHub's clock, or between billet's receiving the two messages.
+	jobClockGitHub = "github"
+	jobClockBillet = "billet"
 
 	weightFromTier = "tier"
 	weightFromVCPU = "charged_vcpu"
@@ -348,14 +354,25 @@ func (r *usageRecord) setShape(row *state.UsageRow) {
 
 // setIntervals reads the two stretches of time, and from the job's the minutes.
 //
-// BILLED MINUTES ARE THE JOB'S, rounded up per lease to a whole minute, which is
-// how GitHub bills a hosted job. A lease whose job never started has a known zero;
+// BILLED MINUTES ARE THE JOB'S, ON GITHUB'S CLOCK WHERE IT SAID, rounded up per lease to
+// a whole minute, which is how GitHub bills a hosted job. Billet's own two times are when
+// it received the messages, which migration 71 measures as far later than the job for
+// the start, so they stand in only as a pair and the record says so. A lease whose job
+// never started has a known zero;
 // one GitHub finished without billet seeing it start, or that ended before GitHub
 // said how the job did, has no number at all. What the lease held is reported
 // beside it either way, so a consumer can decide what it means.
 func (r *usageRecord) setIntervals(row *state.UsageRow) {
 	r.Held.From, r.Held.To = row.BoughtAt, row.FinishedAt
-	r.Job.From, r.Job.To = row.StartedAt, row.ResultAt
+	jobFrom, jobTo := row.StartedAt, row.ResultAt
+	clock := jobClockBillet
+
+	if row.GitHubRunnerAssignedAt != "" && row.GitHubFinishedAt != "" {
+		jobFrom, jobTo = row.GitHubRunnerAssignedAt, row.GitHubFinishedAt
+		clock = jobClockGitHub
+	}
+
+	r.Job.From, r.Job.To = jobFrom, jobTo
 
 	switch {
 	case row.BoughtAt == "":
@@ -375,7 +392,7 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 	}
 
 	switch {
-	case row.StartedAt == "" && row.ResultAt == "":
+	case jobFrom == "" && jobTo == "":
 		// KNOWN, not unknown: the ledger keeps the start at its first value from the
 		// moment the lease is busy, and nothing started here.
 		r.BilledMinutes = new(int64(0))
@@ -383,18 +400,23 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 		r.Unknown["job.to"] = r.Unknown["job.from"]
 		r.Unknown["job.seconds"] = r.Unknown["job.from"]
 		r.Unknown["result"] = r.Unknown["job.from"]
-	case row.StartedAt == "":
+		r.Unknown["job_clock"] = r.Unknown["job.from"]
+	case jobFrom == "":
 		r.Unknown["job.from"] = "GitHub reported a result for this lease and billet never saw its job start"
 		r.Unknown["job.seconds"] = r.Unknown["job.from"]
 		r.Unknown["billed_minutes"] = r.Unknown["job.from"]
-	case row.ResultAt == "":
+		r.Unknown["job_clock"] = r.Unknown["job.from"]
+	case jobTo == "":
 		r.Unknown["job.to"] = "the job started and billet recorded no result from GitHub before exporting this " +
 			"record; held says how long the lease lasted"
 		r.Unknown["job.seconds"] = r.Unknown["job.to"]
 		r.Unknown["billed_minutes"] = r.Unknown["job.to"]
 		r.Unknown["result"] = r.Unknown["job.to"]
+		r.Unknown["job_clock"] = r.Unknown["job.to"]
 	default:
-		seconds, why := secondsBetween(row.StartedAt, row.ResultAt)
+		r.JobClock = clock
+
+		seconds, why := secondsBetween(jobFrom, jobTo)
 		if why != "" {
 			r.Unknown["job.seconds"] = why
 			r.Unknown["billed_minutes"] = why
