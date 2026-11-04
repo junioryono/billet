@@ -75,6 +75,12 @@ func TestACheckNamesEveryTartTierNobodyVerified(t *testing.T) {
 		t.Errorf("said %s", out.String())
 	}
 
+	for _, label := range []string{"checked", "elsewhere"} {
+		if strings.Contains(out.String(), label) {
+			t.Errorf("named %s: %s", label, out.String())
+		}
+	}
+
 	out.Reset()
 
 	// VALIDATION REFUSES A DIGEST WITH @verified, so that is not what to advise.
@@ -82,16 +88,40 @@ func TestACheckNamesEveryTartTierNobodyVerified(t *testing.T) {
 		{Label: "pinned", Provider: config.ProviderTart, Image: "ghcr.io/a/b@sha256:0"},
 	}})
 
-	if strings.Contains(out.String(), "sha256:0@verified") {
+	if !strings.Contains(out.String(), "pinned") || strings.Contains(out.String(), "sha256:0@verified") {
 		t.Errorf("advised what validation refuses: %s", out.String())
 	}
+}
 
-	out.Reset()
+// A RECORD DOES NOT ANSWER FOR A PLAIN NAME: a base is not in the cache that name clones from, so
+// a tier naming it plainly still fails, and the check says so.
+func TestAPlainNameIsCheckedAsAPlainName(t *testing.T) {
+	t.Parallel()
 
-	for _, label := range []string{"checked", "elsewhere"} {
-		if strings.Contains(out.String(), label) {
-			t.Errorf("named %s: %s", label, out.String())
-		}
+	for _, tc := range []struct {
+		name             string
+		pulled, recorded bool
+		want, not        string
+	}{
+		{name: "neither", want: "every job on its tier will fail"},
+		{name: "pulled", pulled: true, want: "nobody verified"},
+		{name: "recorded and not pulled", recorded: true, want: "NOT pulled, so a job on a tier naming it plainly", not: "nobody verified"},
+		{name: "both", pulled: true, recorded: true, want: "pulled", not: "nobody verified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out bytes.Buffer
+
+			got := reportPlainTartImage(cli.Env{Stdout: &out}, "ghcr.io/a/b:1", tc.pulled, tc.recorded)
+			if got != tc.pulled {
+				t.Errorf("answered %v", got)
+			}
+
+			if !strings.Contains(out.String(), tc.want) || (tc.not != "" && strings.Contains(out.String(), tc.not)) {
+				t.Errorf("said %q, want %q and not %q", out.String(), tc.want, tc.not)
+			}
+		})
 	}
 }
 

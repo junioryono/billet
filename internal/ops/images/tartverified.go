@@ -115,9 +115,9 @@ func TartRunnerWindow(now func() time.Time) tart.RunnerWindow {
 // naming one image with different commands refuse, since a probe asks where one runner is.
 //
 // A NODE'S FILE NEED NOT NAME THE TIER, which reaches it in each launch from the control plane's.
-// So a reference no local tier names is asked as its newest record was. One with no record either
-// is an operator's own, and boots the published images' default command as trusted work; the
-// answer says so, because the node cannot see whether a tier takes untrusted work.
+// So a reference no local tier names is asked as its last verification was. One never verified
+// either is an operator's own, and boots the published images' default command as trusted work;
+// the answer says so, because the node cannot see whether a tier takes untrusted work.
 func tartVerifyOptions(
 	ctx context.Context, cfg *config.Config, p tartVerifier, image string,
 ) (tart.VerifyOptions, bool, error) {
@@ -168,17 +168,11 @@ func tartVerifyOptions(
 	}
 
 	for i := range images {
-		if images[i].Key != key || len(images[i].Records) == 0 {
+		if images[i].Key != key || len(images[i].Command) == 0 {
 			continue
 		}
 
-		newest := &images[i].Records[0]
-		if len(newest.Command) > 0 {
-			opts.Command = newest.Command
-		}
-
-		opts.GuestUntrusted = newest.Untrusted
-		opts.MacOS = newest.GuestOS == "darwin"
+		opts.Command, opts.GuestUntrusted, opts.MacOS = images[i].Command, images[i].Untrusted, images[i].MacOS
 
 		return opts, true, nil
 	}
@@ -317,7 +311,7 @@ func refreshTartVerified(ctx context.Context, env cli.Env, cfg *config.Config) e
 }
 
 // verifyDueTartImages verifies each remote `@verified` reference whose tag now names a new
-// digest, macOS included: those this file's tiers name and those this node has records of. One
+// digest, macOS included: those this file's tiers name and those this node still wants. One
 // that fails stops none of the others. A verification that yielded to a job or found no slot is
 // not a failure: the next refresh runs it again.
 func verifyDueTartImages(ctx context.Context, env cli.Env, cfg *config.Config, dryRun bool) error {
@@ -348,9 +342,12 @@ func verifyDueTartImages(ctx context.Context, env cli.Env, cfg *config.Config, d
 
 	images := slices.Clone(named)
 
+	// AN IMAGE STILL WANTED, whether or not a verification of it ever finished: one that yielded
+	// or failed has no record yet and is just as much this Mac's to finish. One nothing has
+	// launched or verified for a while is not, whatever is left of it here.
 	for i := range recorded {
 		key := recorded[i].Key
-		if len(recorded[i].Records) > 0 && config.TartImageIsRemote(key) &&
+		if recorded[i].Wanted && config.TartImageIsRemote(key) &&
 			!slices.ContainsFunc(images, func(image string) bool { return config.TartImageKey(image) == key }) {
 			images = append(images, key+"@verified")
 		}
@@ -431,7 +428,8 @@ func tartPullAbsent(ctx context.Context, env cli.Env, cfg *config.Config) error 
 		return err
 	}
 
-	if len(tierImages) > 0 && len(verified) == len(tierImages) {
+	// INCLUDING NONE AT ALL, which is a joined Mac whose file names no tier, not a fault.
+	if len(verified) == len(tierImages) {
 		return nil
 	}
 

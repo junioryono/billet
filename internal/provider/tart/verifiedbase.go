@@ -294,7 +294,7 @@ func checkManifestDigest(store, digest string) error {
 
 	sum := sha256.Sum256(raw)
 	if got := "sha256:" + hex.EncodeToString(sum[:]); got != digest {
-		return fmt.Errorf("asked the registry for %s, and the manifest tart stored hashes to %s", digest, got)
+		return imageVerdict{fmt.Errorf("asked the registry for %s, and the manifest tart stored hashes to %s", digest, got)}
 	}
 
 	return nil
@@ -366,7 +366,7 @@ func (p *Provider) makeBase(
 
 	if !isCopy {
 		if err := refuseStacked(p.vmDir(staging)); err != nil {
-			return nil, err
+			return nil, imageVerdict{err}
 		}
 	}
 
@@ -483,7 +483,7 @@ func (p *Provider) pullIntoStaging(ctx context.Context, key, digest, staging str
 	// ASKED HERE, before the move, because the layers of a stacked VM are what deleting
 	// this store would remove.
 	if err := refuseStacked(private); err != nil {
-		return err
+		return imageVerdict{err}
 	}
 
 	return p.moveVMDirectory(ctx, private, p.vmDir(staging))

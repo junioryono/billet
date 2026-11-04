@@ -63,10 +63,6 @@ type VerifiedRecord struct {
 	// GuestOS is tart's own word for the base: darwin or linux.
 	GuestOS    string    `json:"guest_os"`
 	VerifiedAt time.Time `json:"verified_at"`
-	// Command and Untrusted are what the probe was asked with, so a refresh on a node whose
-	// file names no tier for this image asks the same way again.
-	Command   []string `json:"command,omitempty"`
-	Untrusted bool     `json:"untrusted,omitempty"`
 	// Files are the identities of the base's disk, configuration and NVRAM, never its
 	// directory, whose change time tart touches on every clone.
 	Files []baseFile `json:"files"`
@@ -83,6 +79,14 @@ type imageProgress struct {
 	// Yields counts verifications cut short by a job since the last one finished, and
 	// `billet check` reports them beside the runner's deadline.
 	Yields int `json:"yields,omitempty"`
+	// Command, Untrusted and MacOS are what its last verification was asked with, so a
+	// refresh on a node whose file names no tier for it asks the same way again.
+	Command   []string `json:"command,omitempty"`
+	Untrusted bool     `json:"untrusted,omitempty"`
+	MacOS     bool     `json:"macos,omitempty"`
+	// LastUsed is when a job last launched it or an operator last verified it, which is all
+	// a node can tell of whether its control plane still wants it.
+	LastUsed time.Time `json:"last_used,omitzero"`
 }
 
 // verifiedDocument is tart-verified.json.

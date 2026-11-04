@@ -143,8 +143,9 @@ func reportTartVerified(ctx context.Context, env cli.Env, cfg *config.Config, ti
 	// EVERY RECORD AS WELL AS EVERY TIER OF THIS FILE: the tiers a launch uses are the control
 	// plane's, so this file need not name what its jobs boot, and a base it does not name
 	// still holds tens of gigabytes.
-	for _, image := range images {
-		byKey[image.Key] = image
+	for i := range images {
+		image := &images[i]
+		byKey[image.Key] = *image
 
 		if len(image.Records) > 0 || image.Pending != nil || image.Failed != nil {
 			keys = append(keys, image.Key)
@@ -174,6 +175,28 @@ func reportTartVerified(ctx context.Context, env cli.Env, cfg *config.Config, ti
 	}
 
 	reportTartSlots(ctx, env, p)
+}
+
+// reportPlainTartImage says what a tier in this file naming an image plainly boots, and answers
+// whether a launch of that name could. A RECORD OF THE IMAGE DOES NOT ANSWER FOR THE NAME: a
+// verification's base is not in the shared cache a plain name clones from, and this file cannot
+// say which of the two the control plane sends, so it says both.
+func reportPlainTartImage(env cli.Env, image string, pulled, recorded bool) bool {
+	if !recorded {
+		fmt.Fprintf(env.Stdout, "image    %-56s boots what is pulled under that name, which nobody verified\n", image)
+	}
+
+	switch {
+	case pulled:
+		fmt.Fprintf(env.Stdout, "image    %-56s pulled\n", image)
+	case recorded:
+		fmt.Fprintf(env.Stdout, "image    %-56s NOT pulled, so a job on a tier naming it plainly fails to "+
+			"launch; one naming it @verified boots its base\n", image)
+	default:
+		fmt.Fprintf(env.Stdout, "image    %-56s NOT pulled; every job on its tier will fail to launch\n", image)
+	}
+
+	return pulled
 }
 
 // tartRecordedKeys are the images this node has records of, for a check that would otherwise

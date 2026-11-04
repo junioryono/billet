@@ -239,11 +239,10 @@ func TestTheRefreshFollowsTheRecordsWhereTheFileNamesNoTier(t *testing.T) {
 
 	f := &fakeVerifier{
 		images: []tart.VerifiedImage{
-			{Key: key, Records: []tart.VerifiedRecord{{
-				Base: "base", GuestOS: "darwin", Untrusted: true, Command: []string{"./custom/run.sh"},
-			}}},
-			{Key: local, Records: []tart.VerifiedRecord{{Base: "local"}}},
+			{Key: key, Wanted: true, MacOS: true, Untrusted: true, Command: []string{"./custom/run.sh"}},
+			{Key: local, Wanted: true, Records: []tart.VerifiedRecord{{Base: "local"}}},
 			{Key: "ghcr.io/a/none:1"},
+			{Key: "ghcr.io/a/unused:1", Records: []tart.VerifiedRecord{{Base: "unused"}}},
 		},
 		due: map[string]tart.VerifiedDue{key + "@verified": {Verify: true}},
 	}
@@ -319,6 +318,15 @@ func TestATierSayingMacOSReachesTheVerification(t *testing.T) {
 	}
 }
 
+// A JOINED MAC WHOSE FILE NAMES NO TIER HAS NOTHING TO PULL, which is not a fault.
+func TestARefreshWithNoTierHasNothingToPull(t *testing.T) {
+	env, _ := capturedEnv()
+
+	if err := tartPullAbsent(t.Context(), env, tartConfig()); err != nil {
+		t.Fatalf("tartPullAbsent: %v", err)
+	}
+}
+
 // THE TART BRANCH OF THE COMMAND ITSELF: the deadlines are asked whatever release.automatic says,
 // and an image is verified only under it.
 func TestTheRefreshCommandOnATartNode(t *testing.T) {
@@ -333,7 +341,10 @@ func TestTheRefreshCommandOnATartNode(t *testing.T) {
 		{name: "not automatic", release: "release:\n  automatic: false\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeVerifier{due: map[string]tart.VerifiedDue{image: {Why: "already verified"}}}
+			f := &fakeVerifier{
+				due:    map[string]tart.VerifiedDue{image: {Why: "already verified"}},
+				images: []tart.VerifiedImage{},
+			}
 			stageVerifier(t, f)
 
 			dir := t.TempDir()

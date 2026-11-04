@@ -56,6 +56,32 @@ var errPull = errors.New("pull into a private store")
 // `billet images verify` is not held to it.
 const failedRetry = 7 * 24 * time.Hour
 
+// refreshInterest is how long a node keeps verifying an image its file names no tier for since
+// a job last launched it or an operator last verified it. The tiers a launch uses are the control
+// plane's, so nothing else tells a node an image stopped being wanted, and without this every
+// image it ever verified would cost it tens of gigabytes for each move of its tag, forever. As
+// long as GitHub's own window on a runner, so a tier used less often than that is one whose
+// image would have gone stale regardless.
+const refreshInterest = 30 * 24 * time.Hour
+
+// lastUsedGrain is how stale LastUsed may be before a launch writes it, so that the record is
+// not rewritten durably for every job.
+const lastUsedGrain = time.Hour
+
+// imageVerdict marks a failure that is the image's, the only kind that makes the refresh leave
+// a digest alone. Everything else, a host's lock or disk or a guest that never came up, is
+// tomorrow's to try again.
+type imageVerdict struct{ error }
+
+func (v imageVerdict) Unwrap() error { return v.error }
+
+// isImageVerdict reports whether a verification's error is the image's.
+func isImageVerdict(err error) bool {
+	verdict, ok := errors.AsType[imageVerdict](err)
+
+	return ok && verdict.error != nil
+}
+
 // runnerVersion is the one thing billet takes from a guest, and only once it matches.
 var runnerVersion = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
@@ -101,10 +127,9 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 	rec, err := p.verify(ctx, opts, &attempted)
 
 	// A VERDICT ON THE IMAGE IS REMEMBERED, so the refresh does not pull it again tomorrow.
-	// A probe that never started, a yield, a pull that did not finish and a caller that
-	// gave up are not verdicts.
-	if err != nil && attempted != "" && ctx.Err() == nil && !errors.Is(err, ErrYielded) &&
-		!errors.Is(err, ErrNoSlot) && !errors.Is(err, errNotBooted) && !errors.Is(err, errPull) {
+	// Only what is classified as one: this runs on a host, and a lock, a disk or a guest
+	// that never came up says nothing about the bytes.
+	if isImageVerdict(err) && attempted != "" && ctx.Err() == nil {
 		p.recordFailure(ctx, config.TartImageKey(opts.Image), attempted)
 	}
 
@@ -233,6 +258,8 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 
 		img := st.image(key)
 		epoch = img.UnpromoteEpoch
+		img.Command, img.Untrusted, img.MacOS = slices.Clone(opts.Command), opts.GuestUntrusted, opts.MacOS
+		img.LastUsed = p.now().UTC()
 
 		// THE SAME DIGEST WITH ITS FILES UNTOUCHED BOOTS WHAT WAS PULLED. Anything else is
 		// not that base any more.
@@ -275,8 +302,6 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 		}
 	}
 
-	rec.Command, rec.Untrusted = slices.Clone(opts.Command), opts.GuestUntrusted
-
 	committed, kept := false, false
 
 	defer func() {
@@ -295,7 +320,7 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 		}
 
 		if digest != "" && (errors.Is(err, ErrYielded) || errors.Is(err, errNotBooted)) {
-			kept = p.keepPending(ctx, key, rec)
+			kept = p.keepPending(ctx, key, rec, epoch)
 		}
 
 		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
@@ -306,8 +331,8 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 
 	answer, unknown := p.askWindow(ctx, opts.Window, runner)
 	if answer.Expired {
-		return nil, fmt.Errorf("tart: verify %s: its runner %s is past GitHub's window, so GitHub "+
-			"would send it no job", key, runner)
+		return nil, imageVerdict{fmt.Errorf("tart: verify %s: its runner %s is past GitHub's window, so "+
+			"GitHub would send it no job", key, runner)}
 	}
 
 	if unknown != nil {
@@ -342,8 +367,8 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 		// A DATE ALREADY HELD ANSWERS WHEN GITHUB DOES NOT: a launch would refuse this
 		// record at once, so it is refused here, where the operator is looking.
 		if deadline, ok := st.verified.Deadlines[runner]; ok && !p.now().Before(deadline) {
-			return false, fmt.Errorf("its runner %s went past GitHub's window on %s, so GitHub would "+
-				"send it no job", runner, deadline.Format(time.DateOnly))
+			return false, imageVerdict{fmt.Errorf("its runner %s went past GitHub's window on %s, so "+
+				"GitHub would send it no job", runner, deadline.Format(time.DateOnly))}
 		}
 
 		img.Yields = 0
@@ -370,11 +395,17 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 
 // keepPending notes a base the next verification of its digest may boot, and answers whether
 // it did, since a base no document names goes with the verification that made it.
-func (p *Provider) keepPending(ctx context.Context, key string, rec *VerifiedRecord) bool {
+func (p *Provider) keepPending(ctx context.Context, key string, rec *VerifiedRecord, epoch int64) bool {
 	cleanCtx, cancel := cleanupContext(ctx)
 	defer cancel()
 
 	err := p.withRecords(cleanCtx, func(st *verifiedState) (bool, error) {
+		// AN UNPROMOTE SINCE THIS BEGAN SAYS THAT DIGEST IS NOT WANTED: holding its bytes for
+		// a verification the refresh will never run keeps tens of gigabytes for nothing.
+		if st.image(key).UnpromoteEpoch != epoch {
+			return false, errors.New("the image was unpromoted while it was being verified")
+		}
+
 		st.verified.Pending[key] = rec
 
 		return true, nil
@@ -719,6 +750,13 @@ func (p *Provider) askGuest(ctx context.Context, probe, guestOS string, command 
 	askCtx, cancel := context.WithTimeout(ctx, p.probeWindow)
 	defer cancel()
 
+	// FIRST, ON ITS OWN: a guest whose agent never came up says nothing about what its image
+	// holds, and may be this host's doing. One whose agent answers and whose checks do not is
+	// the image's.
+	if _, err := p.retryGuest(askCtx, probe, probeCheck{name: "its agent", script: "exit 0"}); err != nil {
+		return "", err
+	}
+
 	listener := shellQuote(filepath.Join(filepath.Dir(command[0]), "bin", "Runner.Listener"))
 
 	version, err := p.retryGuest(askCtx, probe, probeCheck{
@@ -726,12 +764,13 @@ func (p *Provider) askGuest(ctx context.Context, probe, guestOS string, command 
 		script: `cd "$HOME" && exec ` + listener + ` --version`,
 	})
 	if err != nil {
-		return "", err
+		return "", imageVerdict{err}
 	}
 
 	version = strings.TrimSpace(version)
 	if !runnerVersion.MatchString(version) {
-		return "", errors.New("the guest's runner answered --version with something that is not a version")
+		return "", imageVerdict{errors.New("the guest's runner answered --version with something that " +
+			"is not a version")}
 	}
 
 	checks := []probeCheck{
@@ -745,7 +784,7 @@ func (p *Provider) askGuest(ctx context.Context, probe, guestOS string, command 
 
 	for _, check := range checks {
 		if _, err := p.retryGuest(askCtx, probe, check); err != nil {
-			return "", err
+			return "", imageVerdict{err}
 		}
 	}
 
@@ -1056,7 +1095,26 @@ func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRec
 			key, key)
 	})
 
-	return found, held, err
+	if err != nil {
+		return found, held, err
+	}
+
+	// AFTER, AND NOT A CONDITION OF THE LAUNCH: this is what keeps the refresh interested in an
+	// image, and a job is not refused over it.
+	if touchErr := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
+		img := st.image(key)
+		if p.now().Sub(img.LastUsed) < lastUsedGrain {
+			return false, nil
+		}
+
+		img.LastUsed = p.now().UTC()
+
+		return true, nil
+	}); touchErr != nil {
+		p.log.Warn("could not record that a verified image was launched", "image", key, "error", touchErr)
+	}
+
+	return found, held, nil
 }
 
 // Unpromote removes a record and its base, withdraws the digest it was pulled as and
@@ -1175,6 +1233,12 @@ type VerifiedImage struct {
 	// BaseProblems says, by base, what no longer holds of a record's files: a job's launch
 	// refuses on it, and only reading them says so.
 	BaseProblems map[string]string
+	// Wanted says a job launched it or an operator verified it within refreshInterest.
+	Wanted bool
+	// Command, Untrusted and MacOS are what its last verification was asked with.
+	Command   []string
+	Untrusted bool
+	MacOS     bool
 }
 
 // VerifiedImages reads what this node has recorded.
@@ -1198,8 +1262,11 @@ func (p *Provider) VerifiedImages(ctx context.Context) ([]VerifiedImage, error) 
 				Deadlines: map[string]time.Time{},
 			}
 
+			progress := st.verified.Images[key]
 			image.Pending = st.verified.Pending[key]
 			image.BaseProblems = map[string]string{}
+			image.Wanted = !progress.LastUsed.IsZero() && p.now().Sub(progress.LastUsed) < refreshInterest
+			image.Command, image.Untrusted, image.MacOS = progress.Command, progress.Untrusted, progress.MacOS
 
 			if failed, ok := st.verified.Failed[key]; ok {
 				image.Failed = &failed

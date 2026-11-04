@@ -545,9 +545,9 @@ func assertBases(t *testing.T, p *Provider, want ...string) {
 
 	var got []string
 
-	for _, image := range images {
-		for i := range image.Records {
-			got = append(got, image.Records[i].Base)
+	for i := range images {
+		for j := range images[i].Records {
+			got = append(got, images[i].Records[j].Base)
 		}
 	}
 
@@ -2954,9 +2954,9 @@ func TestAMacOSVerificationRefusesBeforeItPulls(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			for _, image := range images {
-				if image.Failed != nil {
-					t.Fatalf("recorded a failure: %+v", image)
+			for i := range images {
+				if images[i].Failed != nil {
+					t.Fatalf("recorded a failure: %+v", images[i])
 				}
 			}
 		})
@@ -3271,6 +3271,249 @@ func TestAPendingBaseThatFailsItsProbeGoes(t *testing.T) {
 	images, err := p.VerifiedImages(t.Context())
 	if err != nil || images[0].Pending != nil || images[0].Failed == nil {
 		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	assertNoBases(t, p)
+}
+
+// ONLY WHAT IS THE IMAGE'S IS A VERDICT: a guest that never came up, a clone a full disk refused and
+// a commit that failed are this host's, and tomorrow's to try again.
+func TestAFailureOfTheHostIsNoVerdictOnTheImage(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		stage func(t *testing.T, s *stub, p *Provider)
+	}{
+		{"a guest whose agent never came up", func(t *testing.T, s *stub, p *Provider) {
+			t.Helper()
+			p.probeWindow = 100 * time.Millisecond
+
+			if err := os.WriteFile(s.execFails, []byte("100000"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a commit that failed", func(t *testing.T, _ *stub, p *Provider) {
+			t.Helper()
+
+			installs := 0
+			p.installer.Rename = func(from, to string) error {
+				installs++
+				// The first install takes the generation; the next is the commit.
+				if installs == 2 {
+					return errors.New("the disk is full")
+				}
+
+				return os.Rename(from, to)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s, p := verifiedStub(t)
+			tc.stage(t, s, p)
+
+			if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+				t.Fatal("verified")
+			}
+
+			p.installer.Rename = nil
+
+			if err := os.Remove(s.execFails); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+
+			due, err := p.ImageDue(t.Context(), verifiedTier)
+			if err != nil || !due.Verify {
+				t.Fatalf("ImageDue = %+v, %v, want tomorrow to try again", due, err)
+			}
+		})
+	}
+}
+
+// WHAT IS THE IMAGE'S IS: bytes that are not what was asked for, a stacked image, and a runner
+// past GitHub's window would each cost the same pull tomorrow for the same answer.
+func TestAFailureOfTheImageIsAVerdict(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		stage func(t *testing.T, s *stub, p *Provider, opts *VerifyOptions)
+	}{
+		{"a manifest that is not the digest", func(t *testing.T, _ *stub, p *Provider, _ *VerifyOptions) {
+			t.Helper()
+			p.registry = func(context.Context, string) (string, error) { return digestOf("another"), nil }
+		}},
+		{"a stacked image", func(t *testing.T, s *stub, _ *Provider, _ *VerifyOptions) {
+			t.Helper()
+
+			if err := os.WriteFile(s.cloneStacked, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a runner past its window", func(t *testing.T, _ *stub, _ *Provider, opts *VerifyOptions) {
+			t.Helper()
+			opts.Window = func(context.Context, string) (RunnerAnswer, error) { return RunnerAnswer{Expired: true}, nil }
+		}},
+		{"a toolchain that does not answer", func(t *testing.T, s *stub, p *Provider, _ *VerifyOptions) {
+			t.Helper()
+			p.probeWindow = 200 * time.Millisecond
+			writeExecutable(t, filepath.Join(s.guestBin, "docker"), "#!/bin/sh\nexit 1\n")
+		}},
+		{"a date already stored", func(t *testing.T, _ *stub, p *Provider, _ *VerifyOptions) {
+			t.Helper()
+
+			if err := p.withRecords(t.Context(), func(st *verifiedState) (bool, error) {
+				st.verified.Deadlines["2.337.0"] = p.now().Add(-time.Hour)
+
+				return true, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s, p := verifiedStub(t)
+			opts := verifyOpts()
+			tc.stage(t, s, p, &opts)
+
+			if _, err := p.Verify(t.Context(), opts); err == nil {
+				t.Fatal("verified")
+			}
+
+			due, err := p.ImageDue(t.Context(), verifiedTier)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if due.Verify || !strings.Contains(due.Why, "failed its verification") {
+				t.Fatalf("ImageDue = %+v, want it left alone", due)
+			}
+		})
+	}
+}
+
+// A NODE KEEPS WANTING WHAT IT LAUNCHED OR AN OPERATOR VERIFIED, for as long as GitHub's own window,
+// so an image nothing uses stops costing tens of gigabytes per move of its tag.
+func TestAnImageIsWantedWhileSomethingUsesIt(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	p.now = func() time.Time { return now }
+
+	wanted := func() bool {
+		t.Helper()
+
+		images, err := p.VerifiedImages(t.Context())
+		if err != nil || len(images) != 1 {
+			t.Fatalf("images = %+v, %v", images, err)
+		}
+
+		return images[0].Wanted
+	}
+
+	mustVerify(t, p)
+
+	if !wanted() {
+		t.Fatal("an image just verified is not wanted")
+	}
+
+	p.now = func() time.Time { return now.Add(refreshInterest - time.Minute) }
+
+	if _, err := p.Launch(t.Context(), verifiedSpec(verifiedLease)); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	p.now = func() time.Time { return now.Add(2*refreshInterest - 2*time.Minute) }
+
+	if !wanted() {
+		t.Fatal("a launch did not keep it wanted")
+	}
+
+	p.now = func() time.Time { return now.Add(2 * refreshInterest) }
+
+	if wanted() {
+		t.Fatal("an image nothing used for a month is still wanted")
+	}
+}
+
+// WHAT A VERIFICATION WAS ASKED WITH OUTLIVES IT, a failed or yielded one included, because a node
+// whose file names no tier has nowhere else to read it.
+func TestAVerificationThatNeverFinishedKeepsItsQuestion(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	p.probeWindow = 200 * time.Millisecond
+
+	writeExecutable(t, filepath.Join(s.guestHome, "custom", "bin", "Runner.Listener"), "#!/bin/sh\nexit 1\n")
+
+	opts := verifyOpts()
+	opts.Command = []string{"./custom/run.sh"}
+	opts.MacOS = false
+
+	if _, err := p.Verify(t.Context(), opts); err == nil {
+		t.Fatal("verified")
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || len(images) != 1 {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	if !images[0].Wanted || !slices.Equal(images[0].Command, opts.Command) || len(images[0].Records) != 0 {
+		t.Fatalf("image = %+v", images[0])
+	}
+}
+
+// AN UNPROMOTE WHILE A PROBE RAN SAYS THAT DIGEST IS NOT WANTED: its yield keeps no base of it.
+func TestAYieldAfterAnUnpromoteKeepsNothing(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+	hold(t, s)
+
+	first := mustVerify(t, p)
+
+	p.probeWindow = 20 * time.Second
+
+	if err := os.WriteFile(s.imageBytes, []byte("another copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reached := filepath.Join(filepath.Dir(s.bin), "probe-reached")
+	writeExecutable(t, filepath.Join(s.guestBin, "xcodebuild"), "#!/bin/sh\necho reached > \""+reached+"\"\nexit 1\n")
+
+	verified := make(chan error, 1)
+
+	go func() {
+		opts := verifyOpts()
+		opts.Digest = first.Digest
+		_, err := p.Verify(t.Context(), opts)
+		verified <- err
+	}()
+
+	waitForFile(t, reached)
+
+	if _, err := p.Unpromote(t.Context(), verifiedRef, first.Base); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := p.writeYieldRequest(p.billetPath(yieldPrefix+"job"), "job"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-verified; !errors.Is(err, ErrYielded) {
+		t.Fatalf("Verify = %v", err)
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || images[0].Pending != nil {
+		t.Fatalf("images = %+v, %v, want nothing kept", images, err)
 	}
 
 	assertNoBases(t, p)
