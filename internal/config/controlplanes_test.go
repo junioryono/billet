@@ -106,6 +106,14 @@ func TestAControllerListIsRefusedWhenItCannotBeDialled(t *testing.T) {
 			"node.server_addrs[1]",
 		},
 		"no port": {withAddrs("  server_addrs: [10.0.0.4]\n"), "node.server_addrs[0]"},
+		"more controllers than a node may name": {
+			withAddrs("  server_addrs: [a:1, b:1, c:1, d:1, e:1, f:1, g:1, h:1, i:1]\n"),
+			"names 9 controllers, more than the 8",
+		},
+		"an address longer than a host name and a port": {
+			withAddrs("  server_addrs: [" + strings.Repeat("a", 255) + ":7717, 10.0.0.4:7717]\n"),
+			"node.server_addrs[0] is 260 bytes",
+		},
 		"a controller twice": {
 			withAddrs("  server_addrs: [Control.example:7717, 10.0.0.4:7717, control.example:7717]\n"),
 			"node.server_addrs[2] \"control.example:7717\" repeats node.server_addrs[0]",

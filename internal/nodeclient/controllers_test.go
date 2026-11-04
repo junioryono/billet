@@ -1487,3 +1487,40 @@ func TestOnlySilenceIsNoAnswer(t *testing.T) {
 		})
 	}
 }
+
+// A NODE NAMING SEVERAL CONTROLLERS RECORDS THEM ALL, under schema 2, beside the
+// one it is on: a process's list is fixed when it starts, and the endpoint tools
+// can only prove it dials a new configuration's list from what it says here. The
+// one-controller record stays schema 1, exactly its seven fields.
+//
+// SERIAL, because the record's seams are the package's.
+func TestANodeNamingSeveralControllersRecordsThem(t *testing.T) {
+	t.Cleanup(nodeclient.SetInvocationIDForTest(func() string { return testInvocation }))
+
+	a, b := newController(t), newController(t)
+	_, path := recordDir(t)
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
+		{Base: a.srv.URL}, {Base: b.srv.URL},
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	runRecordLoop(t, c, &fakeCompute{}, path, time.Now)
+
+	rec := awaitRecord(t, path, "")
+
+	if rec["schema"] != float64(2) {
+		t.Fatalf("the record's schema is %v, want 2: %v", rec["schema"], rec)
+	}
+
+	if rec["endpoint"] != endpointOf(t, a.srv.URL) {
+		t.Fatalf("the record says the node is on %v, want A", rec["endpoint"])
+	}
+
+	list, ok := rec["endpoints"].([]any)
+	if !ok || len(list) != 2 || list[0] != endpointOf(t, a.srv.URL) || list[1] != endpointOf(t, b.srv.URL) {
+		t.Fatalf("the record's list is %v, want A and B in order", rec["endpoints"])
+	}
+}

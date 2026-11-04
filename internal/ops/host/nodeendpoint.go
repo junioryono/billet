@@ -348,6 +348,59 @@ func nodeEndpointOf(cfg *config.Config) (endpoint.Endpoint, bool, error) {
 	return e, true, nil
 }
 
+// controllerSet is the controllers a node names or a process dials, in the order
+// named, each as the one representation.
+type controllerSet []endpoint.Endpoint
+
+// contains says whether e is one of the controllers.
+func (s controllerSet) contains(e endpoint.Endpoint) bool {
+	return slices.ContainsFunc(s, e.Equal)
+}
+
+// parseControllerTexts reads a list of canonical endpoints.
+func parseControllerTexts(texts []string) (controllerSet, error) {
+	set := make(controllerSet, 0, len(texts))
+
+	for _, text := range texts {
+		e, err := endpoint.ParseCanonical(text)
+		if err != nil {
+			return nil, err
+		}
+
+		if set.contains(e) {
+			return nil, fmt.Errorf("%s is named twice", text)
+		}
+
+		set = append(set, e)
+	}
+
+	return set, nil
+}
+
+// checkControllerTexts holds a recorded list to what a writer of one writes: two
+// or more canonical endpoints, each once, holding the one named beside it.
+func checkControllerTexts(texts []string, current string) error {
+	if len(texts) < 2 {
+		return fmt.Errorf("names %d controllers; a list names several", len(texts))
+	}
+
+	set, err := parseControllerTexts(texts)
+	if err != nil {
+		return err
+	}
+
+	e, err := endpoint.ParseCanonical(current)
+	if err != nil {
+		return err
+	}
+
+	if !set.contains(e) {
+		return fmt.Errorf("does not name %s, the controller named beside it", current)
+	}
+
+	return nil
+}
+
 // errSeveralControllers is a node configuration that names every controller of
 // an active-passive pair in node.server_addrs. The endpoint commands move a
 // node from one endpoint to another and prove it by the endpoint its

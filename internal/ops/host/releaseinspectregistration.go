@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"syscall"
 	"time"
 
@@ -65,20 +66,25 @@ var (
 	registrationRead = regularfile.ReadAllLimited
 )
 
-// registrationRecord is the record's seven members, exactly.
+// registrationRecord is the record's seven members, exactly, and an eighth for a
+// node that names several controllers (schema 2).
 type registrationRecord struct {
-	Node         string `json:"node"`
-	Deployment   string `json:"deployment"`
-	Incarnation  string `json:"incarnation"`
-	InvocationID string `json:"invocation_id"`
-	Endpoint     string `json:"endpoint"`
-	RegisteredAt string `json:"registered_at"`
+	Node         string   `json:"node"`
+	Deployment   string   `json:"deployment"`
+	Incarnation  string   `json:"incarnation"`
+	InvocationID string   `json:"invocation_id"`
+	Endpoint     string   `json:"endpoint"`
+	Endpoints    []string `json:"endpoints,omitempty"`
+	RegisteredAt string   `json:"registered_at"`
 }
 
 // registrationRecordFields is the allowlist a record's members are validated
 // against BY NAME, after decoding into a map: the struct decoder's
 // case-insensitive matching would admit "Schema" for "schema".
 var registrationRecordFields = []string{"schema", "node", "deployment", "incarnation", "invocation_id", "endpoint", "registered_at"}
+
+// registrationRecordEndpointsField is the member schema 2 adds.
+const registrationRecordEndpointsField = "endpoints"
 
 // hex32 is the shape of an incarnation and of a systemd invocation id.
 var hex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -182,8 +188,10 @@ func readRegistrationRecord(path string) registrationEvidence {
 
 // decodeRegistrationRecord decodes the record's bytes under the exact member
 // set: one JSON object, no duplicate member, no trailing bytes, exactly the
-// seven names in any order, schema 1, every other member a non-empty string,
-// the two identifiers 32 lowercase hex characters, the time RFC 3339.
+// seven names in any order under schema 1 and the eighth under schema 2, every
+// other member a non-empty string, the two identifiers 32 lowercase hex
+// characters, the time RFC 3339, and a schema 2 list two or more canonical
+// endpoints, each once, holding the one the node is on.
 func decodeRegistrationRecord(body []byte) (*registrationRecord, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -230,30 +238,33 @@ func decodeRegistrationRecord(body []byte) (*registrationRecord, error) {
 		return nil, errors.New("bytes follow the object")
 	}
 
-	for _, name := range registrationRecordFields {
+	// THE NUMERIC TOKEN, by its bytes: json.Number would also accept the string
+	// "1", and 1.0 is not the schema the node writes.
+	schema, present := members["schema"]
+	if !present {
+		return nil, errors.New(`the member "schema" is missing`)
+	}
+
+	fields := registrationRecordFields
+
+	switch string(bytes.TrimSpace(schema)) {
+	case "1":
+	case "2":
+		fields = append(slices.Clone(fields), registrationRecordEndpointsField)
+	default:
+		return nil, fmt.Errorf("schema is %s, want 1 or 2", string(schema))
+	}
+
+	for _, name := range fields {
 		if _, ok := members[name]; !ok {
 			return nil, fmt.Errorf("the member %q is missing", name)
 		}
 	}
 
 	for name := range members {
-		known := false
-
-		for _, want := range registrationRecordFields {
-			if name == want {
-				known = true
-			}
-		}
-
-		if !known {
+		if !slices.Contains(fields, name) {
 			return nil, fmt.Errorf("the member %q is not one the node writes", name)
 		}
-	}
-
-	// THE NUMERIC TOKEN `1`, by its bytes: json.Number would also accept the
-	// string "1", and 1.0 is not the schema the node writes.
-	if string(bytes.TrimSpace(members["schema"])) != "1" {
-		return nil, fmt.Errorf("schema is %s, want 1", string(members["schema"]))
 	}
 
 	rec := &registrationRecord{}
@@ -290,6 +301,16 @@ func decodeRegistrationRecord(body []byte) (*registrationRecord, error) {
 
 	if _, err := time.Parse(time.RFC3339Nano, rec.RegisteredAt); err != nil {
 		return nil, fmt.Errorf("registered_at is not RFC 3339: %w", err)
+	}
+
+	if raw, ok := members[registrationRecordEndpointsField]; ok {
+		if err := json.Unmarshal(raw, &rec.Endpoints); err != nil || rec.Endpoints == nil {
+			return nil, errors.New("the endpoints member is not a list of strings")
+		}
+
+		if err := checkControllerTexts(rec.Endpoints, rec.Endpoint); err != nil {
+			return nil, fmt.Errorf("endpoints: %w", err)
+		}
 	}
 
 	return rec, nil
