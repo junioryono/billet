@@ -403,6 +403,14 @@ func (c *Config) NodePolicyFor(name string) (NodePolicy, bool) {
 	return NodePolicy{Name: name}, false
 }
 
+// MacOSLimitFor is how many macOS guests a named host may run: the one answer the
+// control plane places against and tells that host at registration.
+func (c *Config) MacOSLimitFor(name string) int {
+	policy, _ := c.NodePolicyFor(name)
+
+	return policy.MacOSLimit()
+}
+
 // MaxCustodyDuration parses Node.MaxCustody, reporting zero when unset.
 //
 // Parsed on demand so the config type stays a plain data shape — but validation
