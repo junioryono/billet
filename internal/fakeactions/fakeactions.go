@@ -63,6 +63,9 @@ type Request struct {
 	Path   string
 	Query  string
 	Body   string
+	// Authorization is the credential the request carried, so a test can see whose
+	// token reached GitHub.
+	Authorization string
 }
 
 // New starts a fake service. The handler serves the scale-set API; the
@@ -167,6 +170,8 @@ func (f *Server) record(t *testing.T, r *http.Request) {
 		Path:   r.URL.Path,
 		Query:  r.URL.RawQuery,
 		Body:   string(body),
+
+		Authorization: r.Header.Get("Authorization"),
 	})
 }
 

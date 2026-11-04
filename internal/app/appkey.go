@@ -44,6 +44,13 @@ func KeyPath(ssm *config.IdentitySSMConfig, target config.GitHubTarget) string {
 // regular file, no group or other permission bits, a bounded read, and actually
 // parsed. None of that has an equivalent in a store, where the equivalent is IAM.
 func ResolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHubTarget) (github.AppKey, error) {
+	// NEVER A QUIET "NO KEY": a caller that needs one under a broker is a caller the
+	// broker's arrival should have changed, and has to say so rather than proceed.
+	if cfg.Server.TokenBroker != nil {
+		return nil, fmt.Errorf("target %s has no App key on this host, because server.token_broker is set",
+			target.Name)
+	}
+
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
 		return github.ReadPrivateKeyFile(target.PrivateKeyPath)
 	}
@@ -88,6 +95,10 @@ func ResolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHub
 // depending on where it was read from and an operator debugging a failover needs
 // to know which one they are looking at.
 func KeyLocation(cfg *config.Config, target config.GitHubTarget) string {
+	if cfg.Server.TokenBroker != nil {
+		return "none on this host; tokens come from the broker at " + cfg.Server.TokenBroker.URL
+	}
+
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
 		return target.PrivateKeyPath
 	}

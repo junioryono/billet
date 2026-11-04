@@ -107,6 +107,8 @@ type appKeyState struct {
 	// scope narrows what the token may do, for a minter that serves someone else.
 	// Empty asks GitHub for everything the installation holds.
 	scope TokenScope
+	// fresh is how much life a cached token must have left to be handed out.
+	fresh time.Duration
 
 	// slot admits one exchange at a time. A channel rather than a mutex so a
 	// caller waiting behind a stalled exchange gives up when its own context does.
@@ -141,16 +143,21 @@ func ScopeFor(target Target, runEvidence bool) TokenScope {
 	return scope
 }
 
-// NewAppKeyTokens is the token source that holds the App's key, on the REST API
-// at base, empty meaning the real GitHub. A zero scope asks for everything the
-// installation holds, which is what a deployment's own App was created to hold.
-func NewAppKeyTokens(base string, appID, installationID int64, key AppKey, scope TokenScope) TokenSource {
+// NewAppKeyTokensFor is the token source a broker mints with: scoped to what one
+// deployment needs, and handing out a token only with fresh left on it, so its caller
+// can ride out the broker's own outage. An empty base means the real GitHub.
+func NewAppKeyTokensFor(base string, appID, installationID int64, key AppKey, scope TokenScope,
+	fresh time.Duration,
+) TokenSource {
 	if base == "" {
 		base = apiBase
 	}
 
-	return newAppKeyTokens(newPolicyHTTPClient(defaultPolicyBounds), defaultPolicyBounds.request,
+	tokens := newAppKeyTokens(newPolicyHTTPClient(defaultPolicyBounds), defaultPolicyBounds.request,
 		base, appID, installationID, key, scope)
+	tokens.fresh = fresh
+
+	return tokens
 }
 
 func newAppKeyTokens(client *http.Client, request time.Duration, base string, appID, installationID int64,
@@ -158,7 +165,7 @@ func newAppKeyTokens(client *http.Client, request time.Duration, base string, ap
 ) appKeyTokens {
 	return appKeyTokens{&appKeyState{
 		client: client, request: request, base: base, appID: appID, installationID: installationID,
-		key: AppKey(bytes.Clone(key)), scope: scope, slot: make(chan struct{}, 1),
+		key: AppKey(bytes.Clone(key)), scope: scope, fresh: tokenFresh, slot: make(chan struct{}, 1),
 	}}
 }
 
@@ -173,7 +180,7 @@ func (s appKeyTokens) InstallationToken(ctx context.Context) (Token, error) {
 	}
 	defer func() { <-s.slot }()
 
-	if s.token.bearer != "" && time.Until(s.token.expiresAt) > tokenFresh {
+	if s.token.bearer != "" && time.Until(s.token.expiresAt) > s.fresh {
 		return s.token, nil
 	}
 

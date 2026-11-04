@@ -130,6 +130,13 @@ func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	switch {
+	// WHAT A BROKER ASKS BEFORE IT MINTS: the App's installation on the target.
+	case strings.HasSuffix(path, "/orgs/acme/installation"):
+		fakeactions.WriteJSON(p.t, w, map[string]any{
+			"id": 67890, "account": map[string]string{"login": "acme", "type": "Organization"},
+			"permissions": map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"},
+		})
+
 	case strings.Contains(path, "runnergroups"):
 		fakeactions.WriteJSON(p.t, w, fakeactions.ListJSON(
 			map[string]any{"id": 1, "name": testGroup, "isDefaultGroup": false}))
@@ -491,6 +498,9 @@ type stackOpt func(*stackConfig)
 type stackConfig struct {
 	wire      bool
 	untrusted bool
+	// tokens, when set, gives the deployment a token source in place of the App key,
+	// built over the stack's own identity directory and plane.
+	tokens func(t *testing.T, dir string, p *plane) billetgithub.TokenSource
 	// tiers, when set, replaces the harness's built-in catalogue. It is how a
 	// test drives a config it did NOT hand-write — a `billet init` generation —
 	// through the real stack, to prove the trust/runner-group/workflow policy it
@@ -589,6 +599,11 @@ func (d directRunner) KeepAlive(ctx context.Context)   { d.runner.KeepAlive(ctx)
 // overTheWire puts a real node wire between the control plane and the runner.
 func overTheWire(c *stackConfig) { c.wire = true }
 
+// withTokens gives the deployment a token source and no App key.
+func withTokens(build func(t *testing.T, dir string, p *plane) billetgithub.TokenSource) stackOpt {
+	return func(c *stackConfig) { c.tokens = build }
+}
+
 // withTiers drives the stack from a supplied catalogue instead of the built-in
 // one, so a test can prove a generated config's tiers launch.
 func withTiers(ts []config.Tier) stackOpt {
@@ -659,7 +674,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		}
 	}
 
-	client, err := scaleset.New(scaleset.Config{
+	clientCfg := scaleset.Config{
 		Target:         billetgithub.OrganizationTarget("acme"),
 		GitHubURL:      p.URL,
 		ClientID:       "12345",
@@ -667,7 +682,13 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		PrivateKey:     p.PrivateKeyPEM(),
 		AppID:          12345,
 		APIURL:         p.URL + "/api/v3",
-	}, nil)
+	}
+	if sc.tokens != nil {
+		clientCfg.ClientID, clientCfg.PrivateKey = "", ""
+		clientCfg.Tokens = sc.tokens(t, dir, p)
+	}
+
+	client, err := scaleset.New(clientCfg, nil)
 	if err != nil {
 		t.Fatalf("scaleset.New: %v", err)
 	}

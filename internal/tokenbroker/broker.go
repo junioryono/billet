@@ -1,0 +1,357 @@
+// Package tokenbroker lets a control plane take installation tokens from a process
+// that holds the App's key, so that a deployment holds none.
+//
+// An operator running many deployments under one GitHub App would otherwise put the
+// one key on every control plane, and a compromise of any of them could mint tokens
+// for every installation of the App. The broker holds the key and mints only what a
+// deployment's own registration names, scoped to what that deployment needs. It never
+// hands out the key, and has no route that could.
+package tokenbroker
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/github"
+	"github.com/junioryono/billet/internal/regularfile"
+	"github.com/junioryono/billet/internal/wirecert"
+)
+
+// tokenRoute is the broker's one route.
+const tokenRoute = "/v1/installation-token"
+
+// tokenRequest is what a control plane asks for. It says nothing about who is asking,
+// which the broker reads from the handshake and from nowhere a caller writes.
+type tokenRequest struct {
+	AppID          int64  `json:"app_id"`
+	InstallationID int64  `json:"installation_id"`
+	Target         string `json:"target"`
+}
+
+// tokenResponse is a minted token, and which deployment the broker minted it for, so
+// a host registered under the wrong deployment finds out from its first answer.
+type tokenResponse struct {
+	Deployment  string            `json:"deployment"`
+	Token       string            `json:"token"`
+	ExpiresAt   string            `json:"expires_at"`
+	Permissions map[string]string `json:"permissions,omitempty"`
+}
+
+// The closed set of refusals a caller branches on. Each has one status, and a message
+// carries nothing the broker read from GitHub or from another deployment.
+const (
+	codeUnknownClient = "unknown-client"
+	codeNotRegistered = "not-registered"
+	codeNotInstalled  = "not-installed"
+	codeMismatch      = "installation-mismatch"
+	codeUnavailable   = "unavailable"
+	codeBadRequest    = "bad-request"
+)
+
+type errorResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// maxRequest bounds what is read of a request: three small fields.
+const maxRequest = 4 << 10
+
+// mintFresh is how much life a token the broker hands out has left, so that a caller
+// holding one has a long while to come back during a broker outage.
+const mintFresh = 10 * time.Minute
+
+// verifyEvery is how long one proof that an installation is the registered target's
+// stands. Minting needs the check only rarely, and GitHub's own refusal covers the rest.
+const verifyEvery = time.Hour
+
+// installation is one registered (deployment, app, installation, target).
+type installation struct {
+	deployment     string
+	appID          int64
+	installationID int64
+	target         github.Target
+	runEvidence    bool
+	key            github.AppKey
+	base           string
+
+	tokens github.TokenSource
+
+	mu       sync.Mutex
+	verified time.Time
+}
+
+// Server is the broker's handler. It holds the keys and the registry, and is what
+// serves behind a listener that requires a client certificate in the handshake.
+type Server struct {
+	clients       map[string]string
+	installations map[installationKey]*installation
+	log           *slog.Logger
+	now           func() time.Time
+	// verify proves an installation is the registered target's, a field so a test
+	// counts it; production is github.VerifyAppAt.
+	verify func(r *http.Request, inst *installation) error
+}
+
+type installationKey struct {
+	deployment     string
+	appID          int64
+	installationID int64
+	target         string
+}
+
+// NewServer builds the broker from its config, reading every App key once with the
+// hardened reader a control plane's would have gone through.
+func NewServer(cfg *config.BrokerConfig, log *slog.Logger) (*Server, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+
+	type held struct {
+		key  github.AppKey
+		base string
+	}
+
+	apps := make(map[int64]held, len(cfg.Apps))
+
+	for i := range cfg.Apps {
+		key, err := github.ReadPrivateKeyFile(cfg.Apps[i].PrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("app %d: %w", cfg.Apps[i].AppID, err)
+		}
+
+		apps[cfg.Apps[i].AppID] = held{key: key, base: cfg.Apps[i].APIURL}
+	}
+
+	s := &Server{
+		clients:       map[string]string{},
+		installations: map[installationKey]*installation{},
+		log:           log,
+		now:           time.Now,
+		verify:        verifyInstallation,
+	}
+
+	for i := range cfg.Deployments {
+		d := &cfg.Deployments[i]
+
+		for _, client := range d.Clients {
+			s.clients[client] = d.ID
+		}
+
+		for j := range d.Installations {
+			reg := &d.Installations[j]
+
+			target, err := targetOf(reg.Target)
+			if err != nil {
+				return nil, err
+			}
+
+			app, ok := apps[reg.AppID]
+			if !ok {
+				return nil, fmt.Errorf("deployment %s names app %d, which this broker does not hold", d.ID, reg.AppID)
+			}
+
+			s.installations[keyOf(d.ID, reg.AppID, reg.InstallationID, reg.Target)] = &installation{
+				deployment: d.ID, appID: reg.AppID, installationID: reg.InstallationID, target: target,
+				runEvidence: reg.ActionsRead, key: app.key, base: app.base,
+				tokens: github.NewAppKeyTokensFor(app.base, reg.AppID, reg.InstallationID, app.key,
+					github.ScopeFor(target, reg.ActionsRead), mintFresh),
+			}
+		}
+	}
+
+	return s, nil
+}
+
+func keyOf(deployment string, appID, installationID int64, target string) installationKey {
+	return installationKey{deployment, appID, installationID, strings.ToLower(target)}
+}
+
+func targetOf(path string) (github.Target, error) {
+	if !strings.Contains(path, "/") {
+		return github.OrganizationTarget(path), nil
+	}
+
+	owner, name, ok := config.SplitRepository(path)
+	if !ok {
+		return github.Target{}, fmt.Errorf("target %q is neither `owner` nor `owner/name`", path)
+	}
+
+	return github.RepositoryTarget(owner, name), nil
+}
+
+// ServeHTTP answers the one route.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != tokenRoute || r.Method != http.MethodPost {
+		s.refuse(w, http.StatusNotFound, codeBadRequest, "this broker serves one route")
+
+		return
+	}
+
+	// WHO IS ASKING COMES FROM THE HANDSHAKE AND FROM NOWHERE A CALLER WRITES. The
+	// listener requires a certificate and verifies no chain, because a key is what is
+	// registered: the handshake proved the caller holds it.
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		s.refuse(w, http.StatusUnauthorized, codeUnknownClient, "present the client certificate this broker knows")
+
+		return
+	}
+
+	fingerprint := wirecert.FingerprintOfCert(r.TLS.PeerCertificates[0])
+
+	deployment, known := s.clients[fingerprint]
+	if !known {
+		s.log.Warn("a client this broker does not know asked for a token", "fingerprint", fingerprint)
+		s.refuse(w, http.StatusUnauthorized, codeUnknownClient,
+			"this broker does not know the key "+fingerprint+"; register it with the deployment it proves")
+
+		return
+	}
+
+	var req tokenRequest
+
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxRequest))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&req); err != nil {
+		s.refuse(w, http.StatusBadRequest, codeBadRequest, "the request is not one this broker reads")
+
+		return
+	}
+
+	// THE REFUSAL THIS BROKER EXISTS FOR. It says the same whether the installation
+	// is another deployment's or nobody's, so a caller learns nothing about who else
+	// this broker serves.
+	inst, registered := s.installations[keyOf(deployment, req.AppID, req.InstallationID, req.Target)]
+	if !registered {
+		s.log.Warn("a deployment asked for a token for an installation not registered to it",
+			"deployment", deployment, "app", req.AppID, "installation", req.InstallationID, "target", req.Target)
+		s.refuse(w, http.StatusForbidden, codeNotRegistered,
+			"this installation and target are not registered to this deployment")
+
+		return
+	}
+
+	if status, code, message := s.proved(r, inst); status != 0 {
+		s.refuse(w, status, code, message)
+
+		return
+	}
+
+	token, err := inst.tokens.InstallationToken(r.Context())
+	if err != nil {
+		s.log.Error("could not mint an installation token", "deployment", deployment, "app", req.AppID,
+			"installation", req.InstallationID, "error", err)
+
+		if errors.Is(err, github.ErrNotInstalled) {
+			s.refuse(w, http.StatusNotFound, codeNotInstalled, "the App is not installed there")
+
+			return
+		}
+
+		s.refuse(w, http.StatusServiceUnavailable, codeUnavailable, "a token could not be minted just now")
+
+		return
+	}
+
+	s.log.Info("minted an installation token", "deployment", deployment, "app", req.AppID,
+		"installation", req.InstallationID, "expires", token.ExpiresAt().Format(time.RFC3339))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+
+	if err := json.NewEncoder(w).Encode(tokenResponse{
+		Deployment: deployment, Token: token.Bearer(), ExpiresAt: token.ExpiresAt().Format(time.RFC3339),
+		Permissions: maps.Clone(token.Permissions()),
+	}); err != nil {
+		s.log.Warn("could not write a token to its caller", "deployment", deployment, "error", err)
+	}
+}
+
+// proved checks that an installation really is the registered target's before a
+// token is minted for it, at most once per verifyEvery. A registry names ids an
+// operator typed, and a wrong one would mint another owner's token for this caller.
+//
+// COULD-NOT-TELL IS NOT NO. GitHub not answering says nothing about the installation:
+// once proved it stays proved, and never proved answers unavailable, not refused.
+func (s *Server) proved(r *http.Request, inst *installation) (int, string, string) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+
+	if !inst.verified.IsZero() && s.now().Sub(inst.verified) < verifyEvery {
+		return 0, "", ""
+	}
+
+	err := s.verify(r, inst)
+
+	switch {
+	case err == nil:
+		inst.verified = s.now()
+
+		return 0, "", ""
+	case errors.Is(err, github.ErrAppUnverifiable), github.Undecided(err):
+		s.log.Warn("could not prove an installation is the one registered", "deployment", inst.deployment,
+			"installation", inst.installationID, "error", err)
+
+		if !inst.verified.IsZero() {
+			return 0, "", ""
+		}
+
+		return http.StatusServiceUnavailable, codeUnavailable, "the installation could not be checked just now"
+	default:
+		s.log.Error("an installation is not what its registration says", "deployment", inst.deployment,
+			"installation", inst.installationID, "target", inst.target.Path(), "error", err)
+
+		inst.verified = time.Time{}
+
+		if errors.Is(err, github.ErrNotInstalled) {
+			return http.StatusNotFound, codeNotInstalled, "the App is not installed there"
+		}
+
+		return http.StatusForbidden, codeMismatch, "the installation is not what this broker's registration says"
+	}
+}
+
+func verifyInstallation(r *http.Request, inst *installation) error {
+	_, err := github.VerifyAppAt(r.Context(), nil, inst.base, inst.appID, inst.key, inst.target,
+		inst.installationID, inst.runEvidence)
+
+	return err //nolint:wrapcheck // read through by proved, and logged whole.
+}
+
+func (s *Server) refuse(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	if err := json.NewEncoder(w).Encode(errorResponse{Code: code, Message: message}); err != nil {
+		s.log.Warn("could not write a refusal to its caller", "code", code, "error", err)
+	}
+}
+
+// loadBounded reads a small PEM file through one descriptor no FIFO can hang.
+func loadBounded(path string) ([]byte, error) {
+	f, _, err := regularfile.Open(path, regularfile.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	body, err := regularfile.ReadAllLimited(f, path, maxPEM)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	return body, nil
+}
+
+// maxPEM bounds a key or a bundle read: past this it is not one.
+const maxPEM = 1 << 20

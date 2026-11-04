@@ -144,6 +144,26 @@ func Load(path string) (*Config, error) {
 	return Parse(path, data)
 }
 
+// PeekTokenBroker reads a config's broker URL without validating anything else, for
+// `billet github-app create`, which runs against a config that is not valid yet and
+// must refuse before the browser flow spends an App's only key. Every failure answers
+// none, and the ordinary Load that follows gives the real diagnostic.
+func PeekTokenBroker(data []byte) string {
+	var peek struct {
+		Server struct {
+			TokenBroker struct {
+				URL string `yaml:"url"`
+			} `yaml:"token_broker"`
+		} `yaml:"server"`
+	}
+
+	if err := yaml.Unmarshal(data, &peek); err != nil {
+		return ""
+	}
+
+	return peek.Server.TokenBroker.URL
+}
+
 // PeekIdentityBackend answers where a config says its identity material lives,
 // WITHOUT validating anything else.
 //

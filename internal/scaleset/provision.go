@@ -178,6 +178,8 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
 	if err != nil {
+		err = c.tokens.named(err)
+
 		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
 	}
 

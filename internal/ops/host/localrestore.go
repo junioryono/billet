@@ -387,6 +387,7 @@ func archiveTargets(cfg *config.Config, target *deployarchive.Target) {
 
 	target.AppKeyPath = targets[0].PrivateKeyPath
 	target.GitHub = archiveIdentity(targets[0])
+	target.KeysWithBroker = cfg.Server != nil && cfg.Server.TokenBroker != nil
 
 	for _, further := range targets[1:] {
 		target.Targets = append(target.Targets, deployarchive.TargetPath{

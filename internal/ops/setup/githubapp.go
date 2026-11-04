@@ -132,6 +132,14 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// A DEPLOYMENT ON A BROKER HOLDS NO KEY, and creating an App here spends its one
+	// key on a host told not to have it. Refused before anything else is, for that
+	// reason.
+	if broker := config.PeekTokenBroker(plan.body); broker != "" {
+		return fmt.Errorf("%s takes its tokens from the broker at %s, so this host holds no App key. Create "+
+			"the App where the broker's keys are, and register its installation there", *cfgPath, broker)
+	}
+
 	// THE RESOLVED PATH, so a symlinked --config defaults its key beside the file
 	// that actually holds the config rather than beside the link.
 	if *keyPath == "" {

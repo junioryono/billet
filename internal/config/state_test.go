@@ -288,3 +288,60 @@ func TestASQLiteLedgerCountsNoServerConnections(t *testing.T) {
 		t.Errorf("readers = %d, want the default", got)
 	}
 }
+
+// BOTH DIRECTIONS OF THE BROKER'S BLOCK: with it a target names no key and the file
+// loads; a key beside it is a key this host was told it does not hold.
+func TestAConfigOnABrokerNamesNoKey(t *testing.T) {
+	base := func(key, block string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n" + key + "server:\n" +
+			"  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" + block
+	}
+
+	const broker = "  token_broker:\n    url: https://broker.internal:8443\n" +
+		"    client_key_path: /etc/billet/broker-client.key\n"
+
+	cfg, err := loadServer(t, base("", broker))
+	if err != nil {
+		t.Fatalf("a deployment on a broker with no key: %v", err)
+	}
+	if cfg.Server.TokenBroker == nil || cfg.Server.TokenBroker.URL != "https://broker.internal:8443" {
+		t.Fatalf("the block did not reach the config: %+v", cfg.Server.TokenBroker)
+	}
+
+	if _, err := loadServer(t, base("  private_key_path: /tmp/key.pem\n", broker)); err == nil ||
+		!strings.Contains(err.Error(), "holds no App key") {
+		t.Fatalf("a key beside a broker answered %v", err)
+	}
+
+	if _, err := loadServer(t, base("", "")); err == nil || !strings.Contains(err.Error(), "private_key_path is required") {
+		t.Fatalf("no key and no broker answered %v", err)
+	}
+
+	for name, tc := range map[string]struct{ block, want string }{
+		"no url": {"  token_broker:\n    client_key_path: /etc/k\n", "url is required"},
+		"http": {"  token_broker:\n    url: http://broker\n    client_key_path: /etc/k\n", "must be https"},
+		"credentials in the url": {
+			"  token_broker:\n    url: https://u:p@broker\n    client_key_path: /etc/k\n", "only a scheme and a host",
+		},
+		"a path in the url": {
+			"  token_broker:\n    url: https://broker/v1\n    client_key_path: /etc/k\n", "only a scheme and a host",
+		},
+		"no key path": {"  token_broker:\n    url: https://broker\n", "client_key_path is required"},
+		"a relative key": {
+			"  token_broker:\n    url: https://broker\n    client_key_path: k\n", "must be absolute",
+		},
+		"inside the identity directory": {
+			"  token_broker:\n    url: https://broker\n    client_key_path: /srv/billet/k\n", "inside identity_dir",
+		},
+		"a relative ca": {
+			"  token_broker:\n    url: https://broker\n    client_key_path: /etc/k\n    ca_file: ca.pem\n",
+			"ca_file",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, base("", tc.block)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
