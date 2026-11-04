@@ -412,13 +412,13 @@ check_filesystem_ready() {
 ELF_BINARIES=(/usr/bin/env /opt/billet/bin/billet /home/runner/runner/bin/Runner.Listener)
 
 # check_image_machine passes or fails the gate on the image mounted at $1 being of
-# this machine: the manifest says so, and each of ELF_BINARIES is. e_machine is two
-# bytes at offset 18, read here as the little-endian both machines are; a file that
-# is not an ELF answers something else, and is refused the same way.
+# this machine: the manifest, when one is named, says so, and each of ELF_BINARIES is:
+# a 64-bit little-endian ELF, which both machines' are, whose e_machine at offset 18 is
+# this machine's. Two bytes alone would pass a file that is no binary at all.
 check_image_machine() {
-	local path resolved said status
+	local path resolved said status header
 
-	if [ -n "$MANIFEST" ] && [ -r "$MANIFEST" ]; then
+	if [ -n "$MANIFEST" ]; then
 		status=0
 		said=$(jq -r '.arch' "$MANIFEST") || status=$?
 		if [ "$status" -ne 0 ]; then
@@ -437,10 +437,13 @@ check_image_machine() {
 			continue
 		fi
 		status=0
-		said=$(od -An -tu2 -j18 -N2 "$1$resolved") || status=$?
+		header=$(od -An -tx1 -N6 "$1$resolved") && said=$(od -An -tu2 -j18 -N2 "$1$resolved") || status=$?
+		header=${header//[[:space:]]/}
 		said=${said//[[:space:]]/}
 		if [ "$status" -ne 0 ]; then
 			fail "could not read $path to tell which machine it runs on (status $status)"
+		elif [ "$header" != 7f454c460201 ]; then
+			fail "$path is not a 64-bit little-endian ELF (it begins ${header:-with nothing}), so nothing says it is $GUEST_MACHINE's"
 		elif [ "$said" != "$ELF_MACHINE" ]; then
 			fail "$path has e_machine ${said:-nothing}, and this image is $GUEST_MACHINE's ($ELF_MACHINE);
         a job on it would fail when the agent execs that binary"

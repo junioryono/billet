@@ -48,14 +48,16 @@ installer() {
 	esac
 }
 
-# offered prints each component whose installer PLAN runs. A plan it cannot read is
-# could-not-tell, status 2: an unread plan is not one that offers nothing.
+# offered prints each component whose installer PLAN runs. A plan it cannot read or
+# parse is could-not-tell, status 2: an unread plan is not one that offers nothing, and
+# would publish an image declaring nothing to complete. jq -e answers 0 for true, 1 for
+# false and anything above for a question it could not ask.
 offered() {
 	local plan=$1 name script found
 	while IFS= read -r name; do
 		script=$(installer "$name")
 		found=0
-		grep -qF "\"id\": \"$script\"" "$plan" || found=$?
+		jq -e --arg id "$script" 'any(.[]; .id == $id)' "$plan" >/dev/null || found=$?
 		case "$found" in
 		0) printf '%s\n' "$name" ;;
 		1) ;;

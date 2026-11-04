@@ -301,13 +301,25 @@ func TestAPlanOffersTheComponentsItInstalls(t *testing.T) {
 		t.Errorf("a plan that is not there answered status %d: %s", status, out)
 	}
 
-	empty := filepath.Join(t.TempDir(), "plan.json")
-	if err := forkSafeWriteFile(empty, []byte("[]\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	for name, tc := range map[string]struct {
+		body, want string
+		status     int
+	}{
+		"installing none":    {"[]\n", "", 0},
+		"compact JSON":       {`[{"id":"install-firefox.sh"}]`, "firefox\n", 0},
+		"not JSON":           {"this is not a plan\n", "could not read", 2},
+		"JSON, but no plan":  {`{"id":"install-firefox.sh"}`, "could not read", 2},
+		"truncated, at last": {`[{"id":"install-firefox.sh"}`, "could not read", 2},
+	} {
+		plan := filepath.Join(t.TempDir(), "plan.json")
+		if err := forkSafeWriteFile(plan, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
 
-	if out, status := offered(t, empty); status != 0 || out != "" {
-		t.Errorf("a plan installing none of them answered %q with status %d", out, status)
+		out, status := offered(t, plan)
+		if status != tc.status || (tc.status == 0 && out != tc.want) || !strings.Contains(out, tc.want) {
+			t.Errorf("%s: answered %q with status %d, want %q with status %d", name, out, status, tc.want, tc.status)
+		}
 	}
 }
 
@@ -401,14 +413,15 @@ func TestTheGateRefusesAnImageOfAnotherMachine(t *testing.T) {
 		failed   string
 		says     string
 	}{
-		"x86_64 all its own":      {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", failed: "0"},
-		"aarch64 all its own":     {guest: "aarch64", elf: arm, image: arm, manifest: "aarch64", failed: "0"},
-		"no manifest to compare":  {guest: "aarch64", elf: arm, image: arm, failed: "0"},
-		"every binary the other":  {guest: "aarch64", elf: arm, image: x86, manifest: "aarch64", failed: "1", says: "e_machine 62"},
-		"a manifest of the other": {guest: "aarch64", elf: arm, image: arm, manifest: "x86_64", failed: "1", says: "the manifest says this image is x86_64"},
-		"the base's":              {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: rewriteBinary("usr/lib/coreutils/env", arm), failed: "1", says: "/usr/bin/env has e_machine 183"},
-		"billet's":                {guest: "aarch64", elf: arm, image: arm, manifest: "aarch64", edit: rewriteBinary("opt/billet/bin/billet", x86), failed: "1", says: "/opt/billet/bin/billet has e_machine 62"},
-		"the runner's":            {guest: "aarch64", elf: arm, image: arm, manifest: "aarch64", edit: rewriteBinary("home/runner/runner/bin/Runner.Listener", x86), failed: "1", says: "Runner.Listener has e_machine 62"},
+		"x86_64 all its own":        {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", failed: "0"},
+		"aarch64 all its own":       {guest: "aarch64", elf: arm, image: arm, manifest: "aarch64", failed: "0"},
+		"no manifest to compare":    {guest: "aarch64", elf: arm, image: arm, failed: "0"},
+		"a manifest it cannot read": {guest: "aarch64", elf: arm, image: arm, manifest: "UNREADABLE", failed: "1", says: "could not read the architecture"},
+		"every binary the other":    {guest: "aarch64", elf: arm, image: x86, manifest: "aarch64", failed: "1", says: "e_machine 62"},
+		"a manifest of the other":   {guest: "aarch64", elf: arm, image: arm, manifest: "x86_64", failed: "1", says: "the manifest says this image is x86_64"},
+		"the base's":                {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: rewriteBinary("usr/lib/coreutils/env", arm), failed: "1", says: "/usr/bin/env has e_machine 183"},
+		"billet's":                  {guest: "aarch64", elf: arm, image: arm, manifest: "aarch64", edit: rewriteBinary("opt/billet/bin/billet", x86), failed: "1", says: "/opt/billet/bin/billet has e_machine 62"},
+		"the runner's":              {guest: "aarch64", elf: arm, image: arm, manifest: "aarch64", edit: rewriteBinary("home/runner/runner/bin/Runner.Listener", x86), failed: "1", says: "Runner.Listener has e_machine 62"},
 		"a binary that is gone": {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: func(t *testing.T, root string) {
 			t.Helper()
 			removeAll(t, filepath.Join(root, "opt", "billet", "bin", "billet"))
@@ -416,7 +429,14 @@ func TestTheGateRefusesAnImageOfAnotherMachine(t *testing.T) {
 		"a script, not a binary": {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: func(t *testing.T, root string) {
 			t.Helper()
 			writeFile(t, filepath.Join(root, "opt", "billet", "bin", "billet"), "#!/bin/sh\n# long enough to have an offset 18\nexit 0\n", 0o755)
-		}, failed: "1", says: "/opt/billet/bin/billet has e_machine"},
+		}, failed: "1", says: "/opt/billet/bin/billet is not a 64-bit little-endian ELF"},
+		// THE RIGHT TWO BYTES AT OFFSET 18 IN WHAT IS NO BINARY: only the header says so.
+		"the machine's bytes in no ELF": {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: func(t *testing.T, root string) {
+			t.Helper()
+			corrupt := elfHeader(x86)
+			corrupt[0] = 0
+			writeFile(t, filepath.Join(root, "home", "runner", "runner", "bin", "Runner.Listener"), string(corrupt), 0o755)
+		}, failed: "1", says: "Runner.Listener is not a 64-bit little-endian ELF"},
 		"a file too short to say": {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: func(t *testing.T, root string) {
 			t.Helper()
 			writeFile(t, filepath.Join(root, "opt", "billet", "bin", "billet"), "#!/bin/sh\n", 0o755)
@@ -430,9 +450,13 @@ func TestTheGateRefusesAnImageOfAnotherMachine(t *testing.T) {
 				tc.edit(t, root)
 			}
 
-			manifest := filepath.Join(t.TempDir(), "absent.json")
+			manifest := ""
 
-			if tc.manifest != "" {
+			switch tc.manifest {
+			case "":
+			case "UNREADABLE":
+				manifest = filepath.Join(t.TempDir(), "gone.json")
+			default:
 				manifest = filepath.Join(t.TempDir(), "manifest.json")
 				if err := forkSafeWriteFile(manifest, []byte(`{"arch":"`+tc.manifest+`"}`), 0o600); err != nil {
 					t.Fatal(err)

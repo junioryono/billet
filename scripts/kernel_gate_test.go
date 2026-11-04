@@ -314,11 +314,21 @@ func TestTheKernelGateHoldsAConfigToItsMachinesList(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	blank := filepath.Join(lists, "blank.txt")
+	if err := forkSafeWriteFile(blank, []byte("# a list of nothing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	for name, tc := range map[string]struct {
 		config string
+		common string
 		arm    string
 		says   string
 	}{
+		// ONE LIST FULL DOES NOT ANSWER FOR THE OTHER.
+		"arm64's list empty":       {config: "CONFIG_ARM64=y\nCONFIG_COMMON=y\n", arm: blank, says: "blank.txt lists no options"},
+		"the common list empty":    {config: "CONFIG_ARM64=y\nCONFIG_ARMONLY=y\n", common: blank, arm: arm, says: "blank.txt lists no options"},
+		"the common empty on x86":  {config: "CONFIG_X86_64=y\n", common: blank, arm: arm, says: "blank.txt lists no options"},
 		"arm64 with both":          {config: "CONFIG_ARM64=y\nCONFIG_COMMON=y\nCONFIG_ARMONLY=y\n", arm: arm},
 		"arm64 without its own":    {config: "CONFIG_ARM64=y\nCONFIG_COMMON=y\n", arm: arm, says: "CONFIG_ARMONLY"},
 		"arm64 without the common": {config: "CONFIG_ARM64=y\nCONFIG_ARMONLY=y\n", arm: arm, says: "CONFIG_COMMON"},
@@ -330,7 +340,12 @@ func TestTheKernelGateHoldsAConfigToItsMachinesList(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			env := append(passingChecker(t), "REQUIRED_BUILTINS="+common, "REQUIRED_BUILTINS_AARCH64="+tc.arm)
+			list := common
+			if tc.common != "" {
+				list = tc.common
+			}
+
+			env := append(passingChecker(t), "REQUIRED_BUILTINS="+list, "REQUIRED_BUILTINS_AARCH64="+tc.arm)
 
 			out, err := runKernelGate(t, writeKernelConfig(t, tc.config), env)
 			if tc.says == "" {

@@ -165,13 +165,16 @@ for machine_option in CONFIG_ARM64 CONFIG_X86_64; do
 done
 
 missing=""
-required_count=0
 
+# EACH LIST COUNTS ON ITS OWN: the common one empty on arm64 would otherwise pass on the
+# strength of arm64's, which is every option a container needs gone unchecked.
 for required_list in "$REQUIRED_BUILTINS" ${machine_lists[@]+"${machine_lists[@]}"}; do
 	if [ ! -r "$required_list" ]; then
 		echo "cannot read $required_list, which lists what this kernel must carry." >&2
 		exit 1
 	fi
+
+	required_count=0
 
 	# READ WITH A REDIRECT AND CHECKED WITH A FILE ARGUMENT, never through a pipe.
 	# `grep -q` on a pipeline returns the WRITER's SIGPIPE under pipefail, which reads
@@ -197,12 +200,12 @@ for required_list in "$REQUIRED_BUILTINS" ${machine_lists[@]+"${machine_lists[@]
 
 		missing="$missing $option"
 	done <"$required_list"
-done
 
-if [ "$required_count" -eq 0 ]; then
-	echo "$REQUIRED_BUILTINS lists no options, so this proved nothing about the kernel." >&2
-	exit 1
-fi
+	if [ "$required_count" -eq 0 ]; then
+		echo "$required_list lists no options, so this proved nothing about the kernel." >&2
+		exit 1
+	fi
+done
 
 if [ -n "$missing" ]; then
 	echo "" >&2
@@ -261,7 +264,7 @@ if [ "$modules" -eq 0 ]; then
 	exit 1
 fi
 
-echo "required built-ins: $required_count present, no modules"
+echo "required built-ins present, no modules"
 
 # ---------------------------------------------------- and then moby's checker
 
