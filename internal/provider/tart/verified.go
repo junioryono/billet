@@ -229,22 +229,32 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 
 	// BEFORE ANYTHING THAT CAN FAIL FOR A REASON OF ITS OWN, a registry that is down among them:
 	// on a node whose file names no tier, this is what the refresh tries again from.
-	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
-		img := st.image(key)
-		img.Command, img.Untrusted = slices.Clone(opts.Command), opts.GuestUntrusted
-		img.MacOS = img.MacOS || opts.MacOS
+	keepIntent := func() error {
+		return p.withRecords(ctx, func(st *verifiedState) (bool, error) {
+			img := st.image(key)
+			img.Command, img.Untrusted = slices.Clone(opts.Command), opts.GuestUntrusted
+			img.MacOS = img.MacOS || opts.MacOS
 
-		if !opts.Automatic {
-			img.LastUsed = p.now().UTC()
-		}
+			if !opts.Automatic {
+				img.LastUsed = p.now().UTC()
+			}
 
-		return true, nil
-	}); err != nil {
-		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+			return true, nil
+		})
 	}
+
+	intentErr := keepIntent()
 
 	if err := p.cleanVerification(ctx, key); err != nil {
 		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+	}
+
+	// AGAIN AFTER THE CLEANUP, whose reason to exist can be why the first failed: a private store
+	// an interrupted pull left can fill the disk this record is written to.
+	if intentErr != nil {
+		if err := keepIntent(); err != nil {
+			return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+		}
 	}
 
 	digest := opts.Digest

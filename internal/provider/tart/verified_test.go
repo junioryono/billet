@@ -3637,3 +3637,49 @@ func TestOnlyAProvedLayoutIsAVerdictOnTheImage(t *testing.T) {
 		t.Errorf("a directory that could not be read: %v", err)
 	}
 }
+
+// A DISK AN INTERRUPTED PULL FILLED DOES NOT STOP THE CLEANUP THAT WOULD FREE IT: the record is
+// written again once that has run, and if it still cannot be, nothing goes on.
+func TestARecordThatCannotBeWrittenFirstStillReachesTheCleanup(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		fails int
+		ok    bool
+	}{
+		{name: "the cleanup freed the room", fails: 1, ok: true},
+		{name: "it did not", fails: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, p := verifiedStub(t)
+
+			left := filepath.Join(p.privateStore(verifiedRef), "cache")
+			if err := os.MkdirAll(left, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			failures := 0
+			p.installer.Rename = func(from, to string) error {
+				if failures < tc.fails {
+					failures++
+
+					return errors.New("no space left on device")
+				}
+
+				return os.Rename(from, to)
+			}
+
+			_, err := p.Verify(t.Context(), verifyOpts())
+			if (err == nil) != tc.ok {
+				t.Fatalf("Verify = %v, want success %v", err, tc.ok)
+			}
+
+			if _, err := os.Stat(left); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the private store is still there: %v", err)
+			}
+		})
+	}
+}
