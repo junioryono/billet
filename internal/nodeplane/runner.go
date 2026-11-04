@@ -705,8 +705,9 @@ func (p *Plane) dispatchBound(
 	}
 
 	// AN ADOPTION OF WHAT THE PROCESS DOES NOT REPORT IS THE LEDGER'S GUESS, and its
-	// answer would be no evidence while a claim may still be on its way.
-	if owner.requestID == 0 && n.inventoryKnown && !n.inventory[leaseID] &&
+	// answer would be no evidence while a claim may still be on its way. A report it
+	// could not make is not a report of the lease.
+	if owner.requestID == 0 && !(n.inventoryKnown && n.inventory[leaseID]) &&
 		p.now().Before(p.firstRegistered.Add(custodyClaimWindow)) {
 		p.mu.Unlock()
 

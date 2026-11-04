@@ -57,8 +57,8 @@ var ErrTakeCustody = errors.New("nodeplane: this launch's lease is now the node'
 const defaultCommandTimeout = 10 * time.Minute
 
 // custodyClaimWindow is how long after a plane's first registration a completion's
-// destroy is held back from a process that holds a lease only by adoption and does not
-// report it. A superseded process running that compute may not have reached this plane
+// destroy is held back from a process that holds a lease only by adoption and has not
+// reported it. A superseded process running that compute may not have reached this plane
 // yet, and its claim comes every 10 s; the process asked here would answer truthfully
 // that it has nothing to remove, and the lease would be released under the guest.
 //

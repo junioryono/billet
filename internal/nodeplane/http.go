@@ -378,7 +378,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/recover", h.forOwnLease(h.recoverRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 	// forNode, BECAUSE THE PROCESS THAT ASKS HAS LOST THE NAME: it is a superseded
-	// process saying what it already holds, and this route gives it nothing new.
+	// process saying what it already holds, and this route gives it no name and no work.
 	mux.HandleFunc("POST /v1/nodes/{node}/custody", h.forNode(h.claimCustody))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
@@ -587,7 +587,12 @@ func (h *handler) guardLease(next http.HandlerFunc, admitEnded bool) http.Handle
 			// already treats as done. Anything the ledger still holds open keeps the
 			// refusal, because only the process given the work may touch a lease
 			// that is still charged.
-			if errors.Is(err, ErrSuperseded) && h.leaseIsOver(r, lease) {
+			//
+			// AND WITH NO PROCESS REGISTERED AT ALL, as a replaced controller stands when
+			// the process that superseded this one has gone: "register again" is not
+			// something a superseded process may do, so that answer would hold it for
+			// as long as nothing registers, over a lease that is already over.
+			if (errors.Is(err, ErrSuperseded) || errors.Is(err, ErrUnregistered)) && h.leaseIsOver(r, lease) {
 				if admitEnded && h.endedOnThisNode(r, lease, node) {
 					next(w, r)
 

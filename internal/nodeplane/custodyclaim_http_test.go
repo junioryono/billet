@@ -295,6 +295,34 @@ func TestAClaimWhoseReadBackCouldNotBeAnsweredStands(t *testing.T) {
 	}
 }
 
+// A SUPERSEDED PROCESS HEARS A LEASE IS OVER WHETHER OR NOT ANYONE IS REGISTERED. "Register
+// again" is not something it may do, so that answer would hold its wait for as long as
+// nothing registered, over a lease already over. Only an end the ledger states gets it.
+func TestAProcessIsToldALeaseIsOverWithNoProcessRegistered(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		store *fakeStore
+		want  error
+	}{
+		{"ended", &fakeStore{leaseErr: alloc.ErrLeaseNotFound}, alloc.ErrLeaseNotFound},
+		{"a ledger that could not answer", &fakeStore{leaseErr: errors.New("busy")}, nodeclient.ErrUnregistered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p, base := serve(t, tc.store)
+			c := dial(t, base)
+			p.ForgetForTest("n1")
+
+			if err := c.Heartbeat(t.Context(), "l1", 1); !errors.Is(err, tc.want) {
+				t.Fatalf("Heartbeat = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
 // claimRaw is a claim the client would not send.
 func claimRaw(t *testing.T, base, incarnation string) *http.Response {
 	t.Helper()

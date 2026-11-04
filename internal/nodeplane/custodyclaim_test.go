@@ -235,7 +235,7 @@ func awaitQueued(t *testing.T, p *Plane) {
 // THE COMPUTE HAS CLAIMED IT. The process the ledger guessed at does not report the lease,
 // so it would answer truthfully that it has nothing to remove and the lease would be
 // released under the guest. Held back for the window, and asked as ever after it; a
-// process that does report the lease, or whose report is unknown, is asked at once.
+// process that does report the lease is asked at once.
 func TestARestoredCompletionWaitsForAClaimOnAProcessThatDoesNotReportTheLease(t *testing.T) {
 	t.Parallel()
 
@@ -267,7 +267,7 @@ func TestARestoredCompletionWaitsForAClaimOnAProcessThatDoesNotReportTheLease(t 
 		}, 0, true},
 		{"unknown, inside the window", func(p *Plane) {
 			p.AdoptOwnership("n1", "p2", []string{"l9"})
-		}, 0, true},
+		}, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -341,7 +341,7 @@ func TestAClaimLandingDuringADestroyStandsAndTheAnswerDoesNot(t *testing.T) {
 	p := testPlane(t, WithRegistrar(newLedger()))
 	p.SetPollWindowForTest(20 * time.Millisecond)
 	registerAs(t, p, "p2")
-	p.AdoptOwnership("n1", "p2", []string{"l9"})
+	p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
 
 	done := make(chan error, 1)
 	go func() {
