@@ -86,8 +86,8 @@ A `c7i.2xlarge` launched from an image of this contract, by a node at wire 38 un
 | From launch | What had happened |
 |---|---|
 | 3 s | the instance was launched, 1 s of it the runner's registration |
-| about 85 s | `cloud-final` began, 72 s after the kernel started |
-| about 140 s | the runner connected to GitHub, about 53 s into the entry point, which includes creating and attaching the Docker store, restarting Docker on it, the relay and the probe |
+| 90 s | `cloud-final` began, 72 s after the kernel started |
+| 144 s | the runner connected to GitHub, about 54 s after `cloud-final` began, which includes creating and attaching the Docker store, restarting Docker on it, the relay and the probe |
 | 145 s | GitHub assigned the job |
 
 The job succeeded. Its completion proved the run to the repository's default branch, the Docker store was unchanged and was discarded with no snapshot, the instance terminated, and no volume or snapshot was left. No line in the boot output reported a failed relay or a node that did not answer.
