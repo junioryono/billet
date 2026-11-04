@@ -1,0 +1,33 @@
+{
+  "lease": {
+    "ID": "",
+    "Tier": "",
+    "Node": "",
+    "TargetNode": "",
+    "MacOSSlot": false,
+    "GuestOS": "",
+    "Provider": "",
+    "Providers": [],
+    "Phase": "",
+    "VCPU": 0,
+    "Memory": 0,
+    "RequestedVCPU": 0,
+    "RequestedMemory": 0,
+    "InstanceType": "",
+    "Site": "",
+    "PriceUSDPerHour": 0,
+    "ImageCache": "",
+    "CacheGeneration": "",
+    "ActionsCache": "",
+    "PreferenceRank": 0,
+    "HeldSince": "",
+    "HolderIncarnation": "",
+    "ForceRelease": false,
+    "FailureReason": "",
+    "Disruption": "",
+    "DisruptedAt": "",
+    "Epoch": 0,
+    "RunID": 0,
+    "RequestID": 0
+  }
+}

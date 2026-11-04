@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,13 @@ type CacheService struct {
 	// start it; guestDecode bounds the batches the node decodes at once.
 	guestMonitoring bool
 	guestDecode     chan struct{}
+	// breaker decides whether a job's cache asks the store, nil for a store nobody
+	// guards, and storeDeadline is how long a job waits for it; storeChanged wakes
+	// the report of what the breaker did, and storeResend says it again unchanged.
+	breaker       *storeBreaker
+	storeDeadline time.Duration
+	storeChanged  chan struct{}
+	storeResend   atomic.Bool
 }
 
 type cacheSession struct {
@@ -211,6 +219,11 @@ type cacheSession struct {
 	slots    [provider.MaxVolumes]*cacheAttachment
 	actions  map[string]*actionsArchive
 	receipts map[string]*actionsReceipt
+	// late is every volume the store came back with after the job had stopped waiting,
+	// durable until it is discarded, and acquiring counts the calls still out; both
+	// under mu, and a session with either cannot finish.
+	late      []storecontract.Volume
+	acquiring int
 }
 
 // CacheCredentials identifies one managed guest's cache session.
@@ -588,8 +601,8 @@ func absorbActionsFailure(session *cacheSession) bool {
 // buildCacheRank orders what a build cache did by how much it says: a cache
 // that served one request warm was warm for the job, whatever else it did.
 var buildCacheRank = map[alloc.BuildCache]int{
-	alloc.BuildCacheWarm: 4, alloc.BuildCacheCold: 3, alloc.BuildCacheDisabled: 2,
-	alloc.BuildCacheUnavailable: 1,
+	alloc.BuildCacheWarm: 5, alloc.BuildCacheCold: 4, alloc.BuildCacheDisabled: 3,
+	alloc.BuildCacheUnavailable: 2, alloc.BuildCacheBypassed: 1,
 }
 
 // noteBuildCache records what a build cache did for the session, keeping the
@@ -1218,6 +1231,24 @@ func (s *CacheService) cleanupSession(
 		}
 	}
 
+	late := slices.Clone(session.late)
+	for i := range late {
+		if err := s.store.Discard(ctx, late[i]); err != nil {
+			failures = append(failures, fmt.Errorf("a volume that came back too late: %w", err))
+
+			continue
+		}
+		session.forgetLateVolume(late[i])
+		if err := s.persistSession(session); err != nil {
+			return fmt.Errorf("node: record discarded late cache volume of %s: %w", session.instance, err)
+		}
+	}
+	// A CALL STILL OUT MAY COME BACK WITH A VOLUME, and finishing would leave it with
+	// no custody; it signals this pass again when it has come back.
+	if session.acquiring > 0 {
+		pending = true
+	}
+
 	if err := errors.Join(failures...); err != nil {
 		return fmt.Errorf("node: discard cache volumes of %s: %w", session.instance, err)
 	}
@@ -1375,6 +1406,16 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 
+	// A STORE THAT HAS STOPPED ANSWERING IS NOT ASKED: the guest starts Docker on its
+	// own disk now, rather than after a deadline every other job has already waited
+	// out.
+	if !s.breaker.allow() {
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheBypassed})
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
 	// THE ACQUISITION IS BOUNDED BY dockerStoreAttachLimit, inside the request's
 	// own bound, and the cleanup below keeps the longer one. The guest asks for
 	// its store before it starts its runner, and an image built before #320's fix
@@ -1384,14 +1425,12 @@ func (s *CacheService) attachDockerStore(
 	// "no command in the metadata" and a runner that never connected. A store not
 	// ready in time is a cold job, which pulls its images; the store is offered
 	// again to the next.
-	acquireCtx, cancelAcquire := context.WithTimeout(requestCtx, dockerStoreAttachLimit)
-	defer cancelAcquire()
-
 	key := s.cacheKeyFor(session, config.CacheDocker, request.Architecture, "")
-	volume, cold, err := s.cloneWithin(acquireCtx, key, volumeCeiling(setting))
-	if cold {
-		volume, err = s.store.Create(acquireCtx, key, volumeCeiling(setting))
-	}
+	ceiling := volumeCeiling(setting)
+	volume, cold, err := s.acquireVolume(requestCtx, session, "the Docker image store", dockerStoreAttachLimit,
+		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
+			return s.cloneOrCreate(acquireCtx, key, ceiling, ceiling)
+		})
 	if err != nil {
 		s.log.Warn("Docker image store is unavailable; the job can continue cold",
 			"instance", session.instance, "took", time.Since(started).Round(time.Millisecond),
@@ -1554,6 +1593,15 @@ func (s *CacheService) markDockerStoreReady(
 
 // SettleDocker publishes a prepared store only when GitHub reported success.
 func (s *CacheService) SettleDocker(ctx context.Context, instance string, succeeded bool) error {
+	// THIS RUNS ON THE TEARDOWN'S PATH, so a store that has stopped answering is not
+	// waited on here: what this job wrote is discarded with its session, and the
+	// published generation stays.
+	if !s.breaker.allow() {
+		s.log.Info("the site's store is not answering, so this job's Docker image store is not published",
+			"instance", instance)
+
+		return nil
+	}
 	s.mu.Lock()
 	token, ok := s.byInstance[instance]
 	if !ok {
@@ -1806,11 +1854,19 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 		request.SizeBytes = ceiling
 	}
 
-	key := s.cacheKeyFor(session, config.CacheSticky, request.Architecture, request.Key)
-	volume, cold, err := s.cloneWithin(ctx, key, volumeCeiling(setting))
-	if cold {
-		volume, err = s.store.Create(ctx, key, request.SizeBytes)
+	if !s.breaker.allow() {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheBypassed)
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
 	}
+
+	key := s.cacheKeyFor(session, config.CacheSticky, request.Architecture, request.Key)
+	ceiling, size := volumeCeiling(setting), request.SizeBytes
+	volume, cold, err := s.acquireVolume(ctx, session, "a sticky disk", cacheWorkLimit,
+		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
+			return s.cloneOrCreate(acquireCtx, key, ceiling, size)
+		})
 
 	if err != nil {
 		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheUnavailable)
@@ -1975,6 +2031,16 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 
+	// THE CLONE STAYS IN THE SESSION'S CUSTODY for its cleanup, and the generation
+	// this job started from stays published.
+	if !s.breaker.allow() {
+		writeCacheJSON(w, http.StatusOK, map[string]any{
+			"published": false, "reason": "the site's store is not answering",
+		})
+
+		return
+	}
+
 	lease, fence, err := s.acquireWriter(ctx, attachment, session.instance)
 	if err != nil {
 		s.nonFatalCommit(w, session, "acquire writer", err)
@@ -2027,6 +2093,7 @@ func (s *CacheService) publishAcquired(
 	fence storecontract.FencingToken,
 ) (storecontract.Candidate, publishStep, error) {
 	candidate, err := s.store.Snapshot(ctx, attachment.Volume)
+	s.countedPublication("a cache snapshot", err)
 	if err != nil {
 		return storecontract.Candidate{}, stepSnapshot, errors.Join(err, s.releaseWriter(ctx, lease, fence))
 	}
@@ -2035,7 +2102,9 @@ func (s *CacheService) publishAcquired(
 		return storecontract.Candidate{}, stepRecordConsumed,
 			errors.Join(err, s.releaseWriter(ctx, lease, fence))
 	}
-	if err := s.publish(ctx, attachment, candidate, lease, fence); err != nil {
+	err = s.publish(ctx, attachment, candidate, lease, fence)
+	s.countedPublication("a cache publication", err)
+	if err != nil {
 		return storecontract.Candidate{}, stepPublish, errors.Join(err, s.releaseWriter(ctx, lease, fence))
 	}
 

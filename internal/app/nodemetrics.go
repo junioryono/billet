@@ -115,6 +115,46 @@ var _ kernelMappingReader = (*ceph.Client)(nil)
 // declares and internal/metrics satisfies without either importing the other.
 var _ node.GitObserver = (*metrics.GitObserver)(nil)
 
+// familyCacheBreakerOpen is whether a node's jobs are skipping its site's store.
+const familyCacheBreakerOpen = "billet_cache_breaker_open"
+
+var nodeCacheBreakerFamilies = []metrics.Family{
+	{Name: familyCacheBreakerOpen, Labels: []string{"store"},
+		Help: "1 while this node's jobs start cold and its caches answer a miss, because the site's store " +
+			"stopped answering; 0 while they ask it, on probation included. Absent on a node with no store."},
+}
+
+// CacheBreakerMetrics is whether this node's jobs are skipping its store, read at every
+// scrape from the breaker itself. A node with no cache service, or whose store nobody
+// guards, reports none rather than a store it does not have.
+func (n *Node) CacheBreakerMetrics() MetricsSource {
+	return MetricsSource{
+		name:     "cache_breaker",
+		families: nodeCacheBreakerFamilies,
+		read: func(context.Context) (metrics.Snapshot, error) {
+			service := n.cacheService.Load()
+			if service == nil {
+				return metrics.Snapshot{}, nil
+			}
+
+			return cacheBreakerSnapshot(service), nil
+		},
+	}
+}
+
+func cacheBreakerSnapshot(service *node.CacheService) metrics.Snapshot {
+	store, open, known := service.StoreBreakerOpen()
+	if !known {
+		return metrics.Snapshot{}
+	}
+	value := 0.0
+	if open {
+		value = 1
+	}
+
+	return metrics.Snapshot{familyCacheBreakerOpen: {{Labels: []string{store}, Value: value}}}
+}
+
 // GitMetrics is the node's Git proxy as metrics: each request by where it was
 // answered and why, each refresh of a mirror by how it ended, and each
 // question to GitHub's API about which repository a name is (ADR-018), told by

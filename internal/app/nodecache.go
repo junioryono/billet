@@ -64,6 +64,26 @@ type NodeCacheControl interface {
 	node.ActionsPolicy
 	node.CachePolicy
 	node.CacheAuthorityReader
+	node.CacheStoreReporter
+}
+
+// storeDeadline is how long a job waits for the site's store to hand over a volume,
+// per store, past which it goes on without it. See docs/reference/records/cache-breaker.md
+// for what each was chosen from.
+const (
+	cephStoreDeadline  = 60 * time.Second
+	ebsS3StoreDeadline = 30 * time.Second
+)
+
+// guardNodeStore puts the store a node's provider uses behind a breaker. Only a store
+// that stands between a job and its start has one to guard.
+func guardNodeStore(cfg *config.Config, service *node.CacheService) {
+	switch cfg.Node.Provider {
+	case config.ProviderFirecracker:
+		service.GuardStore("ceph", cephStoreDeadline)
+	case config.ProviderEC2:
+		service.GuardStore("ebs-s3", ebsS3StoreDeadline)
+	}
 }
 
 // NewNodeCacheService is the guest cache service a node.cache block describes,
@@ -88,6 +108,7 @@ func NewNodeCacheService(
 	if guestMonitoring(cfg) {
 		service.MonitorGuests()
 	}
+	guardNodeStore(cfg, service)
 
 	return service, nil
 }
@@ -226,6 +247,9 @@ func startNodeCache(
 	// after the first renewal, so a restarted node's live clones are renewed before
 	// any eviction pass reads their records.
 	//
+	// THE STORE'S BREAKER PROBES AND REPORTS UNTIL THE NODE STOPS, off every job's path.
+	go service.RunStoreGuard(ctx, cachePolicy)
+
 	// ON A CONTEXT THE STOP CANCELS, and the stop waits for a kernel-mapping sweep
 	// in flight (sweeping): an unmap the process exits under is killed with the
 	// unit's cgroup, and one cut short leaves the image's lock with the host's one

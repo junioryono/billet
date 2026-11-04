@@ -119,6 +119,12 @@ func (s *CacheService) publishDeferred(
 		return abandon(reason)
 	}
 
+	// A STORE THAT HAS STOPPED ANSWERING IS ASKED AGAIN NEXT PASS, inside the window,
+	// and nothing here holds the cache loop for it meanwhile.
+	if !s.breaker.allow() {
+		return false, nil
+	}
+
 	if journal.Phase == "" {
 		journal.Phase = phaseSnapshotting
 		if err := s.persistSession(session); err != nil {
@@ -260,6 +266,19 @@ func volumeCeiling(setting config.CacheSetting) int64 {
 // discarded and the job starts cold at its own size, so lowering a tier's
 // max_size re-seeds its caches rather than leaving them at the old size. A store
 // that cannot say how large a clone is keeps it.
+// cloneOrCreate is the volume a job asked for: a clone of key's newest generation no
+// larger than ceiling, or a fresh volume of size, which it also answers cold for.
+func (s *CacheService) cloneOrCreate(
+	ctx context.Context, key string, ceiling, size int64,
+) (storecontract.Volume, bool, error) {
+	volume, cold, err := s.cloneWithin(ctx, key, ceiling)
+	if cold {
+		volume, err = s.store.Create(ctx, key, size)
+	}
+
+	return volume, cold, err
+}
+
 func (s *CacheService) cloneWithin(
 	ctx context.Context, key string, ceiling int64,
 ) (storecontract.Volume, bool, error) {

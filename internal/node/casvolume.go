@@ -156,10 +156,10 @@ func (s *CacheService) casVolume(
 
 	ceiling := volumeCeiling(setting)
 	key := s.cacheKeyFor(session, kind, "", "")
-	volume, cold, err := s.cloneWithin(ctx, key, ceiling)
-	if cold {
-		volume, err = s.store.Create(ctx, key, ceiling)
-	}
+	volume, cold, err := s.acquireVolume(ctx, session, "a content-addressed cache", cacheWorkLimit,
+		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
+			return s.cloneOrCreate(acquireCtx, key, ceiling, ceiling)
+		})
 	if err != nil {
 		backOff()
 
@@ -430,8 +430,18 @@ func (s *CacheService) openCASHandle(
 
 		return nil, reapi.ErrEnded
 	}
-	hv, err := s.casVolume(ctx, session, kind)
 	enabled := sessionSetting(session, kind).Enabled
+	// A STORE THAT HAS STOPPED ANSWERING IS NOT READ EITHER, whether or not this
+	// session has its volume yet: a read of a volume whose OSDs are gone waits in the
+	// kernel, so nothing here could end it, and the guest's helper reads this as a miss.
+	if enabled && !s.breaker.allow() {
+		noteBuildCache(session, kind, alloc.BuildCacheBypassed)
+		session.mu.Unlock()
+		admitted()
+
+		return nil, errStoreOpen
+	}
+	hv, err := s.casVolume(ctx, session, kind)
 	if err == nil && s.now().Sub(hv.allowedAt) >= casPolicyAge {
 		// THE KILL SWITCH IS ASKED AGAIN WHILE THE VOLUME IS IN USE, not only
 		// when it is attached, so disabling a cache stops a running job's use of
@@ -506,17 +516,35 @@ func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// THE OPEN AND ITS FIRST BYTE ARE WHAT THE BREAKER HEARS OF A READ, which it counts
+	// as a timeout from casReadLimit on if the kernel is still waiting on the store.
+	// What is not there is the store answering.
+	done := h.s.breaker.watch("a content-addressed read", casReadLimit)
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
+			err = fs.ErrNotExist
+		}
+		done(err)
+
 		return nil, fs.ErrNotExist
 	}
 	file := os.NewFile(uintptr(fd), path)
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
+		done(err)
 		_ = file.Close()
 
 		return nil, fs.ErrNotExist
 	}
+	var first [1]byte
+	if _, err := file.ReadAt(first[:], 0); err != nil && !errors.Is(err, io.EOF) {
+		done(err)
+		_ = file.Close()
+
+		return nil, fs.ErrNotExist
+	}
+	done(nil)
 	h.hv.hit.Store(true)
 
 	return file, nil
@@ -696,6 +724,10 @@ func (s *CacheService) releaseCASVolume(
 	defer cancel()
 	if !s.sessionKindAllowed(ctx, session, hv.Kind) {
 		return abandon("the cache is disabled for this repository")
+	}
+	// A STORE THAT HAS STOPPED ANSWERING IS ASKED AGAIN NEXT PASS, inside the window.
+	if !s.breaker.allow() {
+		return false, nil
 	}
 
 	journal.Phase = phaseSnapshotting

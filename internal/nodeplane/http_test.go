@@ -235,6 +235,8 @@ func (f *fakeRegistrar) names() []string {
 type fakeStore struct {
 	mu sync.Mutex
 
+	storeReports []alloc.CacheStoreReport
+
 	bindErr       error
 	advanceErr    error
 	heartbeatErr  error
@@ -321,6 +323,15 @@ type observed struct {
 	lease string
 	epoch int64
 	obs   alloc.CacheObservation
+}
+
+func (f *fakeStore) RecordCacheStoreState(_ context.Context, _ string, report alloc.CacheStoreReport) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.storeReports = append(f.storeReports, report)
+
+	return nil
 }
 
 func (f *fakeStore) RecordCacheObservation(

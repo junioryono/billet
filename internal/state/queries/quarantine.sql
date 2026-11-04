@@ -151,6 +151,28 @@ ON CONFLICT(node) DO UPDATE SET
      received_at = excluded.received_at,
      running = excluded.running;
 
+-- name: UpsertNodeCacheStore :execrows
+-- Record what a node's breaker says about its site's store, under the node's epoch
+-- now. A node with no row writes nothing, which is what the count says.
+INSERT INTO node_cache_stores (node, store, state, since, failures, reason, node_epoch, received_at)
+SELECT name, @store, @state, @since, @failures, @reason, epoch, @received_at
+  FROM nodes WHERE name = @node
+ON CONFLICT(node, store) DO UPDATE SET
+     state = excluded.state,
+     since = excluded.since,
+     failures = excluded.failures,
+     reason = excluded.reason,
+     node_epoch = excluded.node_epoch,
+     received_at = excluded.received_at;
+
+-- name: ListNodeCacheStores :many
+-- What every host last said about its store, under the registration in force: a report
+-- from before a host reconnected is not its current word.
+SELECT n.name, n.live, s.store, s.state, s.since, s.failures, s.reason, s.received_at
+  FROM node_cache_stores s
+  JOIN nodes n ON n.name = s.node AND n.epoch = s.node_epoch
+ ORDER BY n.name, s.store;
+
 -- name: ListNodeInventories :many
 -- What every known host last said it was running.
 --

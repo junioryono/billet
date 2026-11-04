@@ -41,6 +41,7 @@ var wireTypes = map[string]any{
 	"CacheAuthorityResponse":    CacheAuthorityResponse{},
 	"CacheObservationRequest":   CacheObservationRequest{},
 	"CachePolicyResponse":       CachePolicyResponse{},
+	"CacheStoreRequest":         CacheStoreRequest{},
 	"Command":                   Command{},
 	"CommandResult":             CommandResult{},
 	"DescribeRequest":           DescribeRequest{},

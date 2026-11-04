@@ -65,6 +65,12 @@ A node with `node.ceph` also reads its kernel's RBD mappings at every scrape, wi
 |---|---|
 | `billet_node_rbd_mappings{state}` | this host's kernel mappings of images in the site's pools, by what accounts for each: `root_disk` (a guest's root disk, which its microVM holds), `generation` (a read-only check of a cache generation), `session` (a cache volume a cache session on this node names), `recent` (a cache volume named less than six hours ago, whose custody record may not be written yet), `unaccounted` (a cache volume named longer ago that no cache session on this node names, held by no job of this node's; on a host that runs a second node identity, that one's volumes count here too), and `other` (anything else in those pools, such as a map an interrupted `billet images pull` left). The node's eviction pass, at start and every six hours, unmaps without force each `unaccounted` mapping that an earlier pass in the same process also found unaccounted, at least an hour before, and whose volume records this node as the one that mapped it, unless the kernel holds it open; a count that stays above zero is a mapping something on the host still has open, named in the node's `kept kernel mappings` warning |
 
+A node with `node.cache` whose store stands between a job and its start says whether its jobs are skipping it, read from the breaker at every scrape. It is absent on a node with no cache service.
+
+| Metric | What it is |
+|---|---|
+| `billet_cache_breaker_open{store}` | 1 while this node's jobs start cold and its caches answer a miss because `store` (`ceph` or `ebs-s3`) stopped answering, and 0 while they ask it, on probation included ([When a store stops answering](build-caches.md#when-a-store-stops-answering)) |
+
 A node with `node.cache` counts what its Git proxy does ([ADR-018](../reference/decisions/adr-018-git-proxy-answers-as-github.md)), told by the proxy as it happens; every label value is reported from the start at zero, and one billet does not know is counted under `other`.
 
 | Metric | What it is |
