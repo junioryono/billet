@@ -277,15 +277,15 @@ func TestAnEmptyDayIsNotAFailedSearch(t *testing.T) {
 		t.Error("a day missing its lines table read as empty")
 	}
 
-	// WHAT TELLS A SCHEMA THAT JUST COMMITTED FROM A DAMAGED DAY.
+	// WHAT THE ONE LOOK READS: some tables and not the search's, and all of them.
 	damagedDB, err := sql.Open("sqlite", dsn(damaged))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer damagedDB.Close()
 
-	if logDayHasLines(t.Context(), damagedDB) {
-		t.Error("a day with no lines table says it has one")
+	if tables, lines, err := logDaySchema(t.Context(), damagedDB); err != nil || tables != 1 || lines != 0 {
+		t.Errorf("a day with only another table reads %d tables and %d lines, %v", tables, lines, err)
 	}
 
 	wholeDB, err := sql.Open("sqlite", dsn(filepath.Join(dir, "2000-01-04.db")))
@@ -297,8 +297,8 @@ func TestAnEmptyDayIsNotAFailedSearch(t *testing.T) {
 	if err := createLogDay(t.Context(), wholeDB); err != nil {
 		t.Fatalf("createLogDay: %v", err)
 	}
-	if !logDayHasLines(t.Context(), wholeDB) {
-		t.Error("a whole day says it has no lines table")
+	if tables, lines, err := logDaySchema(t.Context(), wholeDB); err != nil || tables < 2 || lines != 1 {
+		t.Errorf("a whole day reads %d tables and %d lines, %v", tables, lines, err)
 	}
 
 	garbage := filepath.Join(dir, "2000-01-03.db")
@@ -307,6 +307,52 @@ func TestAnEmptyDayIsNotAFailedSearch(t *testing.T) {
 	}
 	if _, _, err := searchLogDay(t.Context(), garbage, LogSearch{Match: `"marker"`, Visit: visit}, new(int)); err == nil {
 		t.Error("a day that is no database read as empty")
+	}
+}
+
+// A FAILED MATCH IS DECIDED FROM ONE LOOK AT THE SCHEMA, at each moment it could be taken relative to
+// the schema committing: before it the day is empty, after it the match runs again, and a day with
+// only some of its tables is the failure it is. Scripted, since no timing reaches the moment between.
+func TestAFailedMatchIsDecidedFromOneLook(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "day.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	noTable := errors.New("SQL logic error: no such table: lines (1)")
+	broken := errors.New("disk I/O error")
+
+	for name, tc := range map[string]struct {
+		matches       []error
+		tables, lines int
+		schemaErr     error
+		wantMatches   int
+		wantErr       bool
+	}{
+		"it matched":               {matches: []error{nil}, wantMatches: 1},
+		"not yet committed":        {matches: []error{noTable}, wantMatches: 1},
+		"committed since":          {matches: []error{noTable, nil}, tables: 3, lines: 1, wantMatches: 2},
+		"committed, and still not": {matches: []error{noTable, broken}, tables: 3, lines: 1, wantMatches: 2, wantErr: true},
+		"damaged":                  {matches: []error{noTable}, tables: 2, wantMatches: 1, wantErr: true},
+		"the look failed":          {matches: []error{noTable}, schemaErr: broken, wantMatches: 1, wantErr: true},
+		"another failure":          {matches: []error{broken}, wantMatches: 1, wantErr: true},
+	} {
+		calls := 0
+		match := func() (*sql.Rows, error) {
+			calls++
+
+			return nil, tc.matches[calls-1]
+		}
+
+		_, err := matchLogDay(path, match, func() (int, int, error) { return tc.tables, tc.lines, tc.schemaErr })
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: %v, want an error: %t", name, err, tc.wantErr)
+		}
+		if calls != tc.wantMatches {
+			t.Errorf("%s: matched %d times, want %d", name, calls, tc.wantMatches)
+		}
 	}
 }
 

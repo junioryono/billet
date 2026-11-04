@@ -470,34 +470,51 @@ type logChunkRow struct {
 	receivedAt             int64
 }
 
-// logDayHasLines says a day's file holds the table a search reads.
-func logDayHasLines(ctx context.Context, db *sql.DB) bool {
-	var tables int
+// logDaySchema is how many tables a day's file holds and how many of them are the one a search
+// reads, from one statement, so both describe one moment.
+func logDaySchema(ctx context.Context, db *sql.DB) (tables, lines int, err error) {
+	row := logIndexQueryRow(ctx, db, `SELECT count(*), count(CASE WHEN name = 'lines' THEN 1 END) FROM sqlite_master`)
+	err = row.Scan(&tables, &lines)
 
-	row := logIndexQueryRow(ctx, db, `SELECT count(*) FROM sqlite_master WHERE name = 'lines'`)
-
-	return row.Scan(&tables) == nil && tables > 0
+	return tables, lines, err
 }
 
-// logDayIsEmpty says a failed search of a day met a day with nothing in it: removed by the
-// retention since its name was read, or created a moment ago and its schema not yet committed.
-// Neither held a line, so neither ends a search of the other days. A DAY WITH SOME OF ITS TABLES
-// IS DAMAGED, and may have held lines, so that is the failure it is: createLogDay is one
-// transaction, so nothing else leaves one.
-func logDayIsEmpty(ctx context.Context, db *sql.DB, path string, err error) bool {
+// matchLogDay runs a search of one day, and answers its rows, or no rows and no error for a day with
+// nothing in it: removed by the retention since its name was read, or created a moment ago with its
+// schema not yet committed. Neither held a line, so neither ends a search of the other days.
+//
+// WHAT A FAILED MATCH MET IS DECIDED FROM ONE LOOK. createLogDay is one transaction, so a look finds
+// no tables, or all of them, or a damaged day with only some, which may have held lines and is the
+// failure it is. A schema committing after the match failed is why finding it whole means matching
+// again rather than reporting the error.
+func matchLogDay(path string, match func() (*sql.Rows, error),
+	schema func() (tables, lines int, err error),
+) (*sql.Rows, error) {
+	rows, err := match()
+	if err == nil {
+		return rows, nil
+	}
+
 	if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
-		return true
+		return nil, nil
 	}
 
 	if !strings.Contains(err.Error(), "no such table") {
-		return false
+		return nil, err
 	}
 
-	var tables int
+	tables, lines, schemaErr := schema()
 
-	row := logIndexQueryRow(ctx, db, `SELECT count(*) FROM sqlite_master`)
-
-	return row.Scan(&tables) == nil && tables == 0
+	switch {
+	case schemaErr != nil:
+		return nil, err
+	case tables == 0:
+		return nil, nil
+	case lines > 0:
+		return match()
+	default:
+		return nil, err
+	}
 }
 
 // searchLogDay searches one file. stopped says the search is over, and more whether its
@@ -519,20 +536,13 @@ func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (
 		return db.QueryContext(ctx, `SELECT rowid FROM lines WHERE lines MATCH ? ORDER BY rowid DESC`, s.Match) //billet:ignore rawsql // the log index is not the ledger, and sqlc has no catalogue entry for a virtual table
 	}
 
-	rows, err := match()
-
-	// THE SCHEMA CAN COMMIT BETWEEN THE MATCH AND THE LOOK AT IT, which would read as a damaged day
-	// when it is a whole one that has just appeared. Once more now that it is there.
-	if err != nil && strings.Contains(err.Error(), "no such table") && logDayHasLines(ctx, db) {
-		rows, err = match()
+	rows, err := matchLogDay(path, match, func() (int, int, error) { return logDaySchema(ctx, db) })
+	if err != nil {
+		return false, false, fmt.Errorf("state: search a day of the log index: %w", err)
 	}
 
-	if err != nil {
-		if logDayIsEmpty(ctx, db, path, err) {
-			return false, false, nil
-		}
-
-		return false, false, fmt.Errorf("state: search a day of the log index: %w", err)
+	if rows == nil {
+		return false, false, nil
 	}
 	defer rows.Close()
 

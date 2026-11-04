@@ -175,7 +175,9 @@ func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*Jo
 				"lease", e.Name(), "error", err)
 
 			// WHAT IT TAKES OF THE DISK CANNOT BE READ EITHER, and the bound is on the disk, so it
-			// counts as the most one job may take until its deletion succeeds.
+			// counts as the most one job may take until its deletion succeeds. An estimate: with
+			// max_job_bytes lowered since it was written it can be low, and refusing every job's log
+			// on this node for that would cost more than the bytes do.
 			s.leases[e.Name()] = &leaseLog{evictedAt: s.now(), sweepBytes: s.limits.MaxJobBytes}
 			s.sweeping += s.limits.MaxJobBytes
 
