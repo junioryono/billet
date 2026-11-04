@@ -153,6 +153,8 @@ type ReadOps interface {
 	ListJobsAwaitingQueueTime(ctx context.Context,
 		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
 	ListJobsOfRun(ctx context.Context, arg ledgerdb.ListJobsOfRunParams) ([]string, error)
+	ListUsageSince(ctx context.Context, arg ledgerdb.ListUsageSinceParams) ([]ledgerdb.ListUsageSinceRow, error)
+	ReadUsageLease(ctx context.Context, usageSeq int64) (string, error)
 	ReadJobUsage(ctx context.Context, leaseID string) (ledgerdb.JobUsage, error)
 	ReadJobSeries(ctx context.Context, leaseID string) (ledgerdb.ReadJobSeriesRow, error)
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)
@@ -210,6 +212,7 @@ type WriteOps interface {
 	BindLease(ctx context.Context, arg ledgerdb.BindLeaseParams) error
 	BindPoolRunnerJob(ctx context.Context, arg ledgerdb.BindPoolRunnerJobParams) error
 	BumpDispatchGeneration(ctx context.Context, name string) (int64, error)
+	NextUsageSeq(ctx context.Context) (int64, error)
 	BumpTierReleases(ctx context.Context, tier string) error
 	ClaimController(ctx context.Context, arg ledgerdb.ClaimControllerParams) (int64, error)
 	ClaimPoolRunnerForRetirement(ctx context.Context, arg ledgerdb.ClaimPoolRunnerForRetirementParams) (sql.Result, error)

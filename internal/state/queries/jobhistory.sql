@@ -237,18 +237,32 @@ ON CONFLICT (lease_id) DO UPDATE SET
 -- THE HOLDER IS THE LEASE'S LAST, the node process that held the compute when
 -- the lease ended (migration 65), and an archive from a caller that did not
 -- load it keeps what an earlier one wrote.
+--
+-- THE USAGE NUMBER IS WRITTEN ONCE (migration 71): a lease has one place in the
+-- order leases finished in, and an exporter may already have read past it. The
+-- target and the purchase time are read from the lease row here, so no caller has
+-- to load them, and a lease GitHub never assigned a job still says when it was
+-- bought.
 INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
       sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, holder_incarnation, queued_at,
-      finished_at)
+      finished_at, usage_seq, github_target, bought_at)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @conclusion, @failure_reason,
         @disruption, @disrupted_at, @chosen_provider, @instance_type, @vcpu, @memory,
         @site, @price_micros_per_hour, @image_cache, @cache_generation,
         @actions_cache, @sticky_cache, @git_cache, @bazel_cache, @go_cache, @npm_cache,
-        @holder_incarnation, @queued_at, @finished_at)
+        @holder_incarnation, @queued_at, @finished_at, @usage_seq,
+        COALESCE((SELECT github_target FROM leases WHERE id = @lease_id), ''),
+        COALESCE((SELECT created_at FROM leases WHERE id = @lease_id), ''))
 ON CONFLICT (lease_id) DO UPDATE SET
+  usage_seq      = CASE WHEN job_history.usage_seq = 0
+                        THEN excluded.usage_seq ELSE job_history.usage_seq END,
+  github_target  = CASE WHEN excluded.github_target != ''
+                        THEN excluded.github_target ELSE job_history.github_target END,
+  bought_at      = CASE WHEN job_history.bought_at = ''
+                        THEN excluded.bought_at ELSE job_history.bought_at END,
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
   finished_at    = excluded.finished_at,
@@ -284,6 +298,35 @@ ON CONFLICT (lease_id) DO UPDATE SET
   holder_incarnation = CASE WHEN excluded.holder_incarnation != ''
                             THEN excluded.holder_incarnation
                             ELSE job_history.holder_incarnation END;
+
+-- name: NextUsageSeq :one
+-- Take the next place in the order leases finished in.
+--
+-- THE ROW'S LOCK IS THE POINT, held until this transaction commits, so numbers
+-- become visible in the order they were handed out on both engines; migration 71
+-- says why a reader depends on that.
+UPDATE usage_sequence SET last = last + 1 WHERE id = 1 RETURNING last;
+
+-- name: ListUsageSince :many
+-- Finished leases past a place in the order they finished in, bounded.
+--
+-- FILTERED ON usage_seq ALONE, never on a time: a lease that closed with an
+-- earlier clock than one already read must still be seen. Every empty value is
+-- "not recorded", which the export says rather than reading it as zero.
+SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
+       chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
+       bought_at, COALESCE(started_at, '') AS started_at,
+       COALESCE(finished_at, '') AS finished_at, result, result_at,
+       COALESCE(conclusion, '') AS conclusion, failure_reason
+  FROM job_history
+ WHERE usage_seq > @after
+ ORDER BY usage_seq
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ReadUsageLease :one
+-- The lease at one place in that order, which proves a cursor still means
+-- something on this ledger.
+SELECT lease_id FROM job_history WHERE usage_seq = @usage_seq AND usage_seq > 0;
 
 -- name: RecordJobPhase :exec
 -- Record when a lease first entered a phase, on the row that outlives it.

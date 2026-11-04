@@ -16,13 +16,21 @@ INSERT INTO job_history
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
       sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, holder_incarnation, queued_at,
-      finished_at)
+      finished_at, usage_seq, github_target, bought_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17,
         $18, $19, $20, $21, $22, $23,
-        $24, $25, $26)
+        $24, $25, $26, $27,
+        COALESCE((SELECT github_target FROM leases WHERE id = $1), ''),
+        COALESCE((SELECT created_at FROM leases WHERE id = $1), ''))
 ON CONFLICT (lease_id) DO UPDATE SET
+  usage_seq      = CASE WHEN job_history.usage_seq = 0
+                        THEN excluded.usage_seq ELSE job_history.usage_seq END,
+  github_target  = CASE WHEN excluded.github_target != ''
+                        THEN excluded.github_target ELSE job_history.github_target END,
+  bought_at      = CASE WHEN job_history.bought_at = ''
+                        THEN excluded.bought_at ELSE job_history.bought_at END,
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
   finished_at    = excluded.finished_at,
@@ -87,6 +95,7 @@ type ArchiveJobHistoryParams struct {
 	HolderIncarnation  string
 	QueuedAt           string
 	FinishedAt         sql.NullString
+	UsageSeq           int64
 }
 
 // Close the history row when the lease terminalizes.
@@ -115,6 +124,12 @@ type ArchiveJobHistoryParams struct {
 // THE HOLDER IS THE LEASE'S LAST, the node process that held the compute when
 // the lease ended (migration 65), and an archive from a caller that did not
 // load it keeps what an earlier one wrote.
+//
+// THE USAGE NUMBER IS WRITTEN ONCE (migration 71): a lease has one place in the
+// order leases finished in, and an exporter may already have read past it. The
+// target and the purchase time are read from the lease row here, so no caller has
+// to load them, and a lease GitHub never assigned a job still says when it was
+// bought.
 func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryParams) error {
 	_, err := q.db.ExecContext(ctx, archiveJobHistory,
 		arg.LeaseID,
@@ -143,6 +158,7 @@ func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryPa
 		arg.HolderIncarnation,
 		arg.QueuedAt,
 		arg.FinishedAt,
+		arg.UsageSeq,
 	)
 	return err
 }
@@ -634,6 +650,107 @@ func (q *Queries) ListJobsOfRun(ctx context.Context, arg ListJobsOfRunParams) ([
 	return items, nil
 }
 
+const listUsageSince = `-- name: ListUsageSince :many
+SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
+       chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
+       bought_at, COALESCE(started_at, '') AS started_at,
+       COALESCE(finished_at, '') AS finished_at, result, result_at,
+       COALESCE(conclusion, '') AS conclusion, failure_reason
+  FROM job_history
+ WHERE usage_seq > $1
+ ORDER BY usage_seq
+ LIMIT CAST($2 AS BIGINT)
+`
+
+type ListUsageSinceParams struct {
+	After   int64
+	MaxRows int64
+}
+
+type ListUsageSinceRow struct {
+	UsageSeq           int64
+	LeaseID            string
+	Tier               string
+	GithubTarget       string
+	Repo               string
+	ChosenProvider     string
+	InstanceType       string
+	Site               string
+	Vcpu               int64
+	Memory             int64
+	PriceMicrosPerHour int64
+	BoughtAt           string
+	StartedAt          string
+	FinishedAt         string
+	Result             string
+	ResultAt           string
+	Conclusion         string
+	FailureReason      string
+}
+
+// Finished leases past a place in the order they finished in, bounded.
+//
+// FILTERED ON usage_seq ALONE, never on a time: a lease that closed with an
+// earlier clock than one already read must still be seen. Every empty value is
+// "not recorded", which the export says rather than reading it as zero.
+func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) ([]ListUsageSinceRow, error) {
+	rows, err := q.db.QueryContext(ctx, listUsageSince, arg.After, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUsageSinceRow
+	for rows.Next() {
+		var i ListUsageSinceRow
+		if err := rows.Scan(
+			&i.UsageSeq,
+			&i.LeaseID,
+			&i.Tier,
+			&i.GithubTarget,
+			&i.Repo,
+			&i.ChosenProvider,
+			&i.InstanceType,
+			&i.Site,
+			&i.Vcpu,
+			&i.Memory,
+			&i.PriceMicrosPerHour,
+			&i.BoughtAt,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.Result,
+			&i.ResultAt,
+			&i.Conclusion,
+			&i.FailureReason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const nextUsageSeq = `-- name: NextUsageSeq :one
+UPDATE usage_sequence SET last = last + 1 WHERE id = 1 RETURNING last
+`
+
+// Take the next place in the order leases finished in.
+//
+// THE ROW'S LOCK IS THE POINT, held until this transaction commits, so numbers
+// become visible in the order they were handed out on both engines; migration 71
+// says why a reader depends on that.
+func (q *Queries) NextUsageSeq(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, nextUsageSeq)
+	var last int64
+	err := row.Scan(&last)
+	return last, err
+}
+
 const readJob = `-- name: ReadJob :one
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
        COALESCE(request_id, 0) AS request_id, github_job_id,
@@ -912,6 +1029,19 @@ func (q *Queries) ReadJobWait(ctx context.Context, leaseID string) (ReadJobWaitR
 	var i ReadJobWaitRow
 	err := row.Scan(&i.Tier, &i.GithubQueuedAt, &i.StartedAt)
 	return i, err
+}
+
+const readUsageLease = `-- name: ReadUsageLease :one
+SELECT lease_id FROM job_history WHERE usage_seq = $1 AND usage_seq > 0
+`
+
+// The lease at one place in that order, which proves a cursor still means
+// something on this ledger.
+func (q *Queries) ReadUsageLease(ctx context.Context, usageSeq int64) (string, error) {
+	row := q.db.QueryRowContext(ctx, readUsageLease, usageSeq)
+	var lease_id string
+	err := row.Scan(&lease_id)
+	return lease_id, err
 }
 
 const recordJobAssignment = `-- name: RecordJobAssignment :exec

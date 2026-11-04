@@ -1,0 +1,602 @@
+package fleetops
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
+)
+
+const usageDeployment = "0123456789abcdef0123456789abcdef"
+
+// finishUsageLeases ends n leases on a ledger it opens and closes itself, which
+// is what a control plane's restart is to the ledger: every number is taken from
+// what the previous process committed, never from anything it held in memory.
+func finishUsageLeases(t *testing.T, stateDir string, n int) []string {
+	t.Helper()
+
+	seedLedger(t, stateDir)
+
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("close the ledger: %v", err)
+		}
+	}()
+
+	tier := config.Tier{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu:24.04",
+	}
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	finished := make([]string, 0, n)
+
+	for range n {
+		lease, err := a.Reserve(t.Context(), tier.Label)
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+		if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+
+		finished = append(finished, lease.ID)
+	}
+
+	return finished
+}
+
+// exportUsage runs the command as an exporter would and reads its JSON lines.
+func exportUsage(t *testing.T, cfgPath, since string, limit string) []usageRecord {
+	t.Helper()
+
+	env, out := bufferedEnv()
+	args := []string{"export", "--config", cfgPath, "--json", "--limit", limit}
+	if since != "" {
+		args = append(args, "--since", since)
+	}
+
+	if err := Usage(t.Context(), env, args); err != nil {
+		t.Fatalf("billet usage export: %v", err)
+	}
+
+	var records []usageRecord
+
+	lines := bufio.NewScanner(out)
+	for lines.Scan() {
+		var r usageRecord
+		if err := json.Unmarshal(lines.Bytes(), &r); err != nil {
+			t.Fatalf("a line is not a record: %v\n%s", err, lines.Text())
+		}
+
+		records = append(records, r)
+	}
+
+	return records
+}
+
+// A LEASE APPEARS EXACTLY ONCE ACROSS ANY SEQUENCE OF CURSORS, whatever size the
+// pages are and however many control planes wrote them. Leases finish, an exporter
+// reads part of them, the ledger closes and opens again, more finish, and the
+// exporter resumes from the cursor it kept: everything is seen, once, in the order
+// it finished.
+func TestALeaseIsExportedExactlyOnceAcrossARestart(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeJobsConfig(t, stateDir)
+
+	want := finishUsageLeases(t, stateDir, 3)
+
+	first := exportUsage(t, cfg, "", "2")
+	if len(first) != 2 {
+		t.Fatalf("a page of 2 printed %d records", len(first))
+	}
+
+	want = append(want, finishUsageLeases(t, stateDir, 2)...)
+
+	var got []string
+	for _, r := range first {
+		got = append(got, r.LeaseID)
+	}
+
+	cursor := first[len(first)-1].Cursor
+
+	for {
+		page := exportUsage(t, cfg, cursor, "2")
+		if len(page) == 0 {
+			break
+		}
+
+		for _, r := range page {
+			got = append(got, r.LeaseID)
+		}
+
+		cursor = page[len(page)-1].Cursor
+	}
+
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("the exporter saw\n%v\nwant each lease once, in the order it finished\n%v", got, want)
+	}
+
+	if extra := exportUsage(t, cfg, cursor, "2"); len(extra) != 0 {
+		t.Fatalf("an exporter at the end was handed %d records again", len(extra))
+	}
+}
+
+type stubUsageLedger struct {
+	lease string
+	err   error
+}
+
+func (s stubUsageLedger) UsageLease(context.Context, int64) (string, error) { return s.lease, s.err }
+
+// A CURSOR THAT CANNOT BE TRUSTED IS REFUSED BY NAME, because the alternative is
+// silently skipping what a restored ledger numbers over it, and a read that failed
+// is reported as itself and never as a missing record.
+func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
+	t.Parallel()
+
+	const lease = "feedfacefeedfacefeedfacefeedface"
+
+	good := usageCursor{usageDeployment, 7, lease}.String()
+	readFailed := errors.New("the database went away")
+
+	for name, tc := range map[string]struct {
+		since  string
+		ledger stubUsageLedger
+		want   string
+		wantIs error
+	}{
+		"not a cursor":       {since: "yesterday", want: "not a cursor this billet wrote"},
+		"a later format":     {since: strings.Replace(good, "u1.", "u2.", 1), want: "not a cursor this billet wrote"},
+		"a zero place":       {since: "u1." + usageDeployment + ".0." + lease, want: "not a cursor this billet wrote"},
+		"another deployment": {since: usageCursor{"ffffffffffffffffffffffffffffffff", 7, lease}.String(), want: "deployment ffffffffffffffffffffffffffffffff's cursor"},
+		"restored, shorter": {
+			since: good, ledger: stubUsageLedger{err: state.ErrNoUsageRecord},
+			want: "holds no record 7",
+		},
+		"restored, numbered over": {
+			since: good, ledger: stubUsageLedger{lease: "badbadbadbadbadbadbadbadbadbadba"},
+			want: "record 7 is lease badbadbadbadbadbadbadbadbadbadba",
+		},
+		"could not read": {since: good, ledger: stubUsageLedger{err: readFailed}, wantIs: readFailed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			after, err := resumeUsage(t.Context(), tc.ledger, usageDeployment, tc.since)
+			if err == nil {
+				t.Fatalf("resumed at %d, want a refusal", after)
+			}
+
+			if tc.wantIs != nil {
+				if !errors.Is(err, tc.wantIs) {
+					t.Fatalf("got %v, want the read's own failure", err)
+				}
+				if strings.Contains(err.Error(), "restored") {
+					t.Fatalf("a failed read was reported as a restored ledger: %v", err)
+				}
+
+				return
+			}
+
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+
+	after, err := resumeUsage(t.Context(), stubUsageLedger{lease: lease}, usageDeployment, good)
+	if err != nil || after != 7 {
+		t.Fatalf("a cursor this ledger holds resumed at %d, %v; want 7", after, err)
+	}
+
+	after, err = resumeUsage(t.Context(), stubUsageLedger{err: readFailed}, usageDeployment, "")
+	if err != nil || after != 0 {
+		t.Fatalf("no cursor resumed at %d, %v; want the beginning without asking the ledger", after, err)
+	}
+}
+
+func usageConfig(t *testing.T, weight config.MinuteWeight) *config.Config {
+	t.Helper()
+
+	return &config.Config{Tiers: []config.Tier{{Label: "weighted", VCPU: 8, MinuteWeight: weight}}}
+}
+
+func knownUsageRow() *state.UsageRow {
+	return &state.UsageRow{
+		Sequence: 9, LeaseID: "feedface", Tier: "plain", Target: "acme", Repository: "acme/api",
+		Provider: string(config.ProviderEC2), InstanceType: "c7i.xlarge", Site: "us-west-2",
+		VCPU: 4, Memory: 16 << 30, PriceMicrosPerHour: 360_000,
+		BoughtAt:   "2026-11-03T10:00:00.000000000Z",
+		StartedAt:  "2026-11-03T10:01:00.000000000Z",
+		ResultAt:   "2026-11-03T10:03:00.500000000Z",
+		FinishedAt: "2026-11-03T10:04:00.000000000Z",
+		Result:     "succeeded", Conclusion: "done",
+	}
+}
+
+// A FULLY KNOWN LEASE reports every number, and each is the arithmetic the format
+// states: a part of a minute bills the minute, a 4 vCPU runner counts double, and
+// the machine's cost runs for as long as the lease held it.
+func TestAKnownLeaseReportsEveryNumber(t *testing.T) {
+	t.Parallel()
+
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, knownUsageRow())
+
+	if len(r.Unknown) != 0 {
+		t.Errorf("a fully known lease says %v is unknown", r.Unknown)
+	}
+	if r.Ownership != usageBought {
+		t.Errorf("ownership = %q, want %q", r.Ownership, usageBought)
+	}
+	if r.Cursor != "u1."+usageDeployment+".9.feedface" {
+		t.Errorf("cursor = %q", r.Cursor)
+	}
+	if r.VCPU == nil || *r.VCPU != 4 || r.MemoryBytes == nil || *r.MemoryBytes != 16<<30 {
+		t.Errorf("shape = %v, %v", r.VCPU, r.MemoryBytes)
+	}
+	if r.Held.Seconds == nil || r.Held.Seconds.String() != "240.000" {
+		t.Errorf("held = %v, want 240.000", r.Held.Seconds)
+	}
+	if r.Job.Seconds == nil || r.Job.Seconds.String() != "120.500" {
+		t.Errorf("job = %v, want 120.500", r.Job.Seconds)
+	}
+	if r.BilledMinutes == nil || *r.BilledMinutes != 3 {
+		t.Errorf("billed = %v, want 2m0.5s rounded up to 3", r.BilledMinutes)
+	}
+	if r.WeightSource != weightFromVCPU || r.MinuteWeight == nil || r.MinuteWeight.String() != "2" {
+		t.Errorf("weight = %v from %q, want 2 from %q", r.MinuteWeight, r.WeightSource, weightFromVCPU)
+	}
+	if r.WeightedMinutes == nil || r.WeightedMinutes.String() != "6" {
+		t.Errorf("weighted = %v, want 6", r.WeightedMinutes)
+	}
+	// $0.36 an hour for four minutes.
+	if r.CostMicros == nil || *r.CostMicros != 24_000 {
+		t.Errorf("cost = %v, want 24000", r.CostMicros)
+	}
+}
+
+// A TIER'S OWN WEIGHT TAKES PRECEDENCE, exactly, in thousandths; and an unset one
+// falls to the vCPU charged, not the vCPU the tier says today.
+func TestATiersWeightCountsItsMinutes(t *testing.T) {
+	t.Parallel()
+
+	row := knownUsageRow()
+	row.Tier = "weighted"
+
+	r := newUsageRecord(usageConfig(t, 1500), usageDeployment, row)
+	if r.WeightSource != weightFromTier || r.MinuteWeight.String() != "1.5" || r.WeightedMinutes.String() != "4.5" {
+		t.Errorf("weight %v from %q, %v weighted; want 1.5 from the tier and 4.5", r.MinuteWeight,
+			r.WeightSource, r.WeightedMinutes)
+	}
+
+	r = newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.WeightSource != weightFromVCPU || r.MinuteWeight.String() != "2" {
+		t.Errorf("weight %v from %q, want 2 from the 4 vCPU the lease was charged, not the tier's 8",
+			r.MinuteWeight, r.WeightSource)
+	}
+}
+
+// UNKNOWN STAYS UNKNOWN: a value the ledger does not hold is absent and named with
+// its reason, and is never a zero a billing system would add up.
+func TestAFieldTheLedgerDoesNotKnowIsEmptyAndSaysWhy(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		mutate func(*state.UsageRow)
+		fields []string
+		check  func(*testing.T, *usageRecord)
+	}{
+		"no target": {
+			mutate: func(r *state.UsageRow) { r.Target = "" }, fields: []string{"target"},
+		},
+		"no repository": {
+			mutate: func(r *state.UsageRow) { r.Repository = "" }, fields: []string{"repository"},
+		},
+		"no backend": {
+			mutate: func(r *state.UsageRow) { r.Provider = "" }, fields: []string{"provider", "ownership"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.Ownership != "" {
+					t.Errorf("ownership = %q for a lease with no backend", r.Ownership)
+				}
+			},
+		},
+		"a newer binary's backend": {
+			mutate: func(r *state.UsageRow) { r.Provider = "lunar-lander" }, fields: []string{"ownership"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.Provider != "lunar-lander" {
+					t.Errorf("provider = %q, want the ledger's word kept", r.Provider)
+				}
+			},
+		},
+		"no shape": {
+			mutate: func(r *state.UsageRow) { r.VCPU, r.Memory = 0, 0 }, fields: []string{"vcpu", "memory_bytes"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.VCPU != nil || r.MemoryBytes != nil {
+					t.Errorf("shape = %v, %v, want both absent and not zero", r.VCPU, r.MemoryBytes)
+				}
+				if r.MinuteWeight == nil {
+					return
+				}
+				t.Errorf("weight = %v with no shape and no tier weight", r.MinuteWeight)
+			},
+		},
+		"no purchase time": {
+			mutate: func(r *state.UsageRow) { r.BoughtAt = "" },
+			fields: []string{"held.from", "held.seconds", "cost_micros"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.Held.Seconds != nil || r.CostMicros != nil {
+					t.Errorf("held %v, cost %v from no purchase time", r.Held.Seconds, r.CostMicros)
+				}
+			},
+		},
+		"a bought machine with no price": {
+			mutate: func(r *state.UsageRow) { r.PriceMicrosPerHour = 0 },
+			fields: []string{"price_micros_per_hour", "cost_micros"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.PriceMicrosPerHour != nil || r.CostMicros != nil {
+					t.Errorf("price %v, cost %v: a zero price read as free", r.PriceMicrosPerHour, r.CostMicros)
+				}
+			},
+		},
+		"a job with no result": {
+			mutate: func(r *state.UsageRow) { r.ResultAt, r.Result = "", "" },
+			fields: []string{"job.to", "job.seconds", "billed_minutes", "weighted_minutes"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.BilledMinutes != nil || r.WeightedMinutes != nil {
+					t.Errorf("billed %v, weighted %v with no end to the job", r.BilledMinutes, r.WeightedMinutes)
+				}
+				if r.Held.Seconds == nil {
+					t.Error("the lease's held time went missing with the job's")
+				}
+			},
+		},
+		"a result with no start": {
+			mutate: func(r *state.UsageRow) { r.StartedAt = "" },
+			fields: []string{"job.from", "job.seconds", "billed_minutes", "weighted_minutes"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.BilledMinutes != nil {
+					t.Errorf("billed %v for a job billet never saw start", r.BilledMinutes)
+				}
+			},
+		},
+		"a clock that stepped back": {
+			mutate: func(r *state.UsageRow) { r.ResultAt = "2026-11-03T09:00:00.000000000Z" },
+			fields: []string{"job.seconds", "billed_minutes", "weighted_minutes"},
+			check: func(t *testing.T, r *usageRecord) {
+				t.Helper()
+				if r.Job.Seconds != nil || r.BilledMinutes != nil {
+					t.Errorf("job %v, billed %v from a negative length", r.Job.Seconds, r.BilledMinutes)
+				}
+			},
+		},
+		"a time that is not one": {
+			mutate: func(r *state.UsageRow) { r.StartedAt = "soon" },
+			fields: []string{"job.seconds", "billed_minutes"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			row := knownUsageRow()
+			tc.mutate(row)
+
+			r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+			for _, field := range tc.fields {
+				if strings.TrimSpace(r.Unknown[field]) == "" {
+					t.Errorf("%s does not say why it is unknown: %v", field, r.Unknown)
+				}
+			}
+			if tc.check != nil {
+				tc.check(t, &r)
+			}
+		})
+	}
+}
+
+// A LEASE THAT RAN NO JOB BILLS A KNOWN ZERO, which is not the same as an unknown:
+// it held capacity and no job started, and the record says both.
+func TestALeaseThatRanNoJobBillsAKnownZero(t *testing.T) {
+	t.Parallel()
+
+	row := knownUsageRow()
+	row.StartedAt, row.ResultAt, row.Result = "", "", ""
+
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.BilledMinutes == nil || *r.BilledMinutes != 0 {
+		t.Fatalf("billed = %v, want a known 0", r.BilledMinutes)
+	}
+	if r.WeightedMinutes == nil || r.WeightedMinutes.String() != "0" {
+		t.Errorf("weighted = %v, want 0", r.WeightedMinutes)
+	}
+	if !strings.Contains(r.Unknown["job.from"], "no job started") {
+		t.Errorf("the record does not say no job started: %v", r.Unknown)
+	}
+	if r.Held.Seconds == nil {
+		t.Error("the capacity the lease held is missing")
+	}
+}
+
+// AN OWNED MACHINE BOUGHT NOTHING, so it has no price to be unknown about.
+func TestAnOwnedLeaseHasNoPriceToReport(t *testing.T) {
+	t.Parallel()
+
+	row := knownUsageRow()
+	row.Provider, row.InstanceType, row.PriceMicrosPerHour = string(config.ProviderFirecracker), "", 0
+
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.Ownership != usageOwned {
+		t.Errorf("ownership = %q, want %q", r.Ownership, usageOwned)
+	}
+	if len(r.Unknown) != 0 {
+		t.Errorf("an owned lease reports %v unknown", r.Unknown)
+	}
+	if r.CostMicros != nil || r.PriceMicrosPerHour != nil {
+		t.Errorf("an owned lease reports a price %v and cost %v", r.PriceMicrosPerHour, r.CostMicros)
+	}
+}
+
+// THE RECORD'S NAMES ARE THE FORMAT, so a renamed Go field cannot move one under a
+// billing system without this failing. A null is there, spelled, so a consumer can
+// tell it from a field this schema does not have.
+func TestTheRecordFormatIsWhatTheDocumentStates(t *testing.T) {
+	t.Parallel()
+
+	body, err := json.Marshal(newUsageRecord(usageConfig(t, 0), usageDeployment, knownUsageRow()))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "reference", "usage-export.md"))
+	if err != nil {
+		t.Fatalf("read the record's documentation: %v", err)
+	}
+
+	for field := range fields {
+		if !strings.Contains(string(doc), "`"+field+"`") {
+			t.Errorf("docs/reference/usage-export.md does not name the record's field %q", field)
+		}
+	}
+
+	if len(fields) != 26 {
+		t.Errorf("the record has %d fields; a field added or removed is a change to the format, so "+
+			"update the document, this count and, if a consumer must read it differently, the schema", len(fields))
+	}
+}
+
+// THE EXPORT ONLY REPORTS. Nothing that decides what runs reads a minute weight, so
+// what a billing system counts cannot move what a queue admits.
+func TestNoSchedulerReadsAMinuteWeight(t *testing.T) {
+	t.Parallel()
+
+	for _, pkg := range []string{"alloc", "server", "nodeplane", "node", "app"} {
+		dir := filepath.Join("..", "..", pkg)
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+
+		read := 0
+
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+				continue
+			}
+
+			path := filepath.Join(dir, e.Name())
+			if _, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly); err != nil {
+				t.Fatalf("parse %s: %v", path, err)
+			}
+
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+
+			read++
+
+			if strings.Contains(string(body), "MinuteWeight") {
+				t.Errorf("%s reads a minute weight; the export reports and feeds nothing back", path)
+			}
+		}
+
+		if read == 0 {
+			t.Errorf("%s has no source to check, so this test moved out from under it", dir)
+		}
+	}
+}
+
+// A PAGE'S LAST LINE IS THE CURSOR TO KEEP, in the table an operator reads too.
+func TestTheTextExportEndsWithTheCursor(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeJobsConfig(t, stateDir)
+
+	finished := finishUsageLeases(t, stateDir, 2)
+
+	env, out := bufferedEnv()
+	if err := Usage(t.Context(), env, []string{"export", "--config", cfg}); err != nil {
+		t.Fatalf("billet usage export: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("want a header, two rows and a cursor, got:\n%s", out.String())
+	}
+	if !strings.HasPrefix(lines[3], "cursor u1.") || !strings.HasSuffix(lines[3], "."+finished[1]) {
+		t.Errorf("the last line is %q, want the last lease's cursor", lines[3])
+	}
+
+	env, out = bufferedEnv()
+	if err := Usage(t.Context(), env, []string{"export", "--config", cfg,
+		"--since", strings.TrimPrefix(lines[3], "cursor ")}); err != nil {
+		t.Fatalf("billet usage export --since: %v", err)
+	}
+	if !strings.Contains(out.String(), "no finished lease past this cursor") {
+		t.Errorf("a caught-up export said:\n%s", out.String())
+	}
+}
+
+func TestUsageRefusesWhatItCannotDo(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		args []string
+		want string
+	}{
+		"no subcommand":      {nil, "usage: billet usage export"},
+		"another subcommand": {[]string{"import"}, "usage: billet usage export"},
+		"a zero limit":       {[]string{"export", "--limit", "0"}, "--limit takes 1 to 10000"},
+		"too large a limit":  {[]string{"export", "--limit", "10001"}, "--limit takes 1 to 10000"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			env, _ := bufferedEnv()
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+
+			if err := Usage(ctx, env, tc.args); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}

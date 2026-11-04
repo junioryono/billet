@@ -3579,8 +3579,17 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	// THE PLACEMENT FACTS COME FROM THE LEASE, never from a catalogue: the price
 	// is what the row recorded when the shape was charged, and the row is what
 	// is about to be reaped.
-	err := state.WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
+	// IN THE TRANSACTION THAT CLOSES THE LEASE, so the number and the close commit
+	// together and in order: `billet usage export` reads past a number knowing no
+	// lower one can still appear (migration 71).
+	sequence, err := state.WriteQueries(tx).NextUsageSeq(ctx)
+	if err != nil {
+		return fmt.Errorf("alloc: number lease %s's usage: %w", l.ID, err)
+	}
+
+	err = state.WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
 		LeaseID:            l.ID,
+		UsageSeq:           sequence,
 		Tier:               l.Tier,
 		Node:               node,
 		RunID:              nullableID(l.RunID),

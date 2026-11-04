@@ -104,7 +104,7 @@ func TestAPostgresLedgerHoldsNoMoreThanItsConnectionBudget(t *testing.T) {
 	}
 
 	q := u.Query()
-	q.Set("application_name", app+t.Name())
+	q.Set("application_name", app)
 	u.RawQuery = q.Encode()
 
 	db, err := OpenPostgres(t.Context(), t.TempDir(), DSN(u.String()), WithReaderConns(1))
@@ -146,7 +146,7 @@ func TestAPostgresLedgerHoldsNoMoreThanItsConnectionBudget(t *testing.T) {
 	for range 10 {
 		var n int
 		if err := watcher.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1`, app+t.Name(),
+			`SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1`, app,
 		).Scan(&n); err != nil {
 			t.Fatalf("count the ledger's connections: %v", err)
 		}

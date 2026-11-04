@@ -64,6 +64,7 @@
 
    reference/cli
    reference/configuration
+   reference/usage-export
    reference/status
    reference/reference-hardware
    reference/action-versioning
