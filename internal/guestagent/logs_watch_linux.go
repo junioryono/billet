@@ -62,10 +62,10 @@ func (w *pagesWatch) wait(ctx context.Context, d time.Duration) {
 
 	// A STOP ENDS THE WAIT AT ONCE: the final budget is counted from it, and the agent's own
 	// exit budget does not leave a second to spare.
-	stop := context.AfterFunc(ctx, func() { _ = w.file.SetReadDeadline(time.Now()) })
+	stop := context.AfterFunc(ctx, func() { _ = w.file.SetReadDeadline(time.Now()) }) //nolint:errcheck // with none, the wait runs to its bound
 	defer stop()
 
-	_, _ = w.file.Read(w.buf)
+	_, _ = w.file.Read(w.buf) //nolint:errcheck // being woken is all this wants, and a failure wakes it too
 }
 
 func (w *pagesWatch) close() {
