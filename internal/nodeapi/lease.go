@@ -147,6 +147,10 @@ type ReconcileResponse struct {
 	Freed int `json:"freed"`
 }
 
+// MaxCustodyClaim bounds one claim: more leases than a fleet at its target holds. A
+// process holding more names them over several.
+const MaxCustodyClaim = 4096
+
 // ClaimCustodyRequest is a superseded process saying which leases it holds compute
 // for, from VersionCustodyClaim. It grants the process nothing another was given;
 // see nodeplane.Plane.ClaimCustody.

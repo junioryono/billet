@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -167,6 +168,46 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 			t.Fatalf("an unanswered claim moved the process to %s", got)
 		}
 	})
+}
+
+// MORE THAN ONE CLAIM TAKES ARE NAMED OVER SEVERAL, each of which the route accepts: a
+// claim refused whole would never reach a new controller.
+func TestAProcessHoldingMoreThanOneClaimTakesNamesThemAll(t *testing.T) {
+	t.Parallel()
+
+	a := newController(t)
+
+	var heard claimsHeard
+
+	a.mu.Lock()
+	a.respond = heard.respond
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	leases := make([]string, nodeapi.MaxCustodyClaim+1)
+	for i := range leases {
+		leases[i] = "l" + strconv.Itoa(i)
+	}
+
+	held, err := c.ClaimCustody(t.Context(), leases)
+	if err != nil {
+		t.Fatalf("ClaimCustody: %v", err)
+	}
+
+	if !slices.Equal(held, leases) {
+		t.Fatalf("the answers hold %d leases, want all %d", len(held), len(leases))
+	}
+
+	heard.mu.Lock()
+	defer heard.mu.Unlock()
+
+	if len(heard.named) != 2 || len(heard.named[0]) != nodeapi.MaxCustodyClaim || len(heard.named[1]) != 1 {
+		t.Fatalf("the claims named %d groups", len(heard.named))
+	}
 }
 
 // A CLAIM STARTS FROM THE CONTROLLER IT LAST REACHED, and goes round from there: asking

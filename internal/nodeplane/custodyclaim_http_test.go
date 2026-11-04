@@ -152,15 +152,15 @@ func TestACustodyClaimIsBounded(t *testing.T) {
 	p, base := serve(t, store)
 	c := dial(t, base)
 
-	many := make([]string, 4097)
+	many := make([]string, nodeapi.MaxCustodyClaim+1)
 	for i := range many {
 		many[i] = fmt.Sprintf("l%d", i)
 	}
 
 	reads := store.reads.Load()
 
-	if _, err := c.ClaimCustody(t.Context(), many); !errors.Is(err, nodeclient.ErrRefused) {
-		t.Fatalf("a claim of %d leases = %v, want a refusal", len(many), err)
+	if status, _ := claimRaw(t, base, c.Incarnation(), many...); status != http.StatusForbidden {
+		t.Fatalf("a claim of %d leases answered %d, want a refusal", len(many), status)
 	}
 
 	if got := store.reads.Load(); got != reads {
@@ -171,8 +171,8 @@ func TestACustodyClaimIsBounded(t *testing.T) {
 		t.Fatal("a refused claim took a lease")
 	}
 
-	if _, err := c.ClaimCustody(t.Context(), many[:4096]); err != nil {
-		t.Fatalf("a claim of 4096 leases = %v", err)
+	if status, _ := claimRaw(t, base, c.Incarnation(), many[:nodeapi.MaxCustodyClaim]...); status != http.StatusOK {
+		t.Fatalf("a claim of as many as one may answered %d", status)
 	}
 }
 
@@ -325,10 +325,14 @@ func TestAProcessIsToldALeaseIsOverWithNoProcessRegistered(t *testing.T) {
 }
 
 // claimRaw is a claim the client would not send, and its status and body.
-func claimRaw(t *testing.T, base, incarnation string) (int, []byte) {
+func claimRaw(t *testing.T, base, incarnation string, leases ...string) (int, []byte) {
 	t.Helper()
 
-	body, err := json.Marshal(nodeapi.ClaimCustodyRequest{LeaseIDs: []string{"l1"}})
+	if len(leases) == 0 {
+		leases = []string{"l1"}
+	}
+
+	body, err := json.Marshal(nodeapi.ClaimCustodyRequest{LeaseIDs: leases})
 	if err != nil {
 		t.Fatal(err)
 	}

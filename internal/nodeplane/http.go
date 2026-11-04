@@ -1528,9 +1528,6 @@ func (h *handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// maxCustodyClaim bounds one claim: more leases than a fleet at its target holds.
-const maxCustodyClaim = 4096
-
 // custodyClaimRecheck bounds reading back what one claim added.
 const custodyClaimRecheck = 5 * time.Second
 
@@ -1548,9 +1545,9 @@ func (h *handler) claimCustody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.LeaseIDs) > maxCustodyClaim {
+	if len(req.LeaseIDs) > nodeapi.MaxCustodyClaim {
 		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
-			fmt.Sprintf("a claim names %d leases, more than the %d one may", len(req.LeaseIDs), maxCustodyClaim))
+			fmt.Sprintf("a claim names %d leases, more than the %d one may", len(req.LeaseIDs), nodeapi.MaxCustodyClaim))
 
 		return
 	}

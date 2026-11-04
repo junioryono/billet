@@ -1095,6 +1095,29 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 // this version is exactly one whose controller may since have been upgraded, and it
 // cannot register to learn so. An older plane answers a bare 404, which changes nothing.
 func (c *Client) ClaimCustody(ctx context.Context, leaseIDs []string) ([]string, error) {
+	var (
+		held []string
+		errs []error
+	)
+
+	// IN BATCHES THE ROUTE TAKES: refused whole, a process holding more would never
+	// reach a new controller, and renew through the one that has gone.
+	for batch := range slices.Chunk(leaseIDs, nodeapi.MaxCustodyClaim) {
+		got, err := c.claimCustodyBatch(ctx, batch)
+		if err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+
+		held = append(held, got...)
+	}
+
+	return held, errors.Join(errs...)
+}
+
+// claimCustodyBatch is one claim, from the controller this process has.
+func (c *Client) claimCustodyBatch(ctx context.Context, leaseIDs []string) ([]string, error) {
 	start := int(c.current.Load())
 
 	var errs []error
