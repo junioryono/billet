@@ -1,0 +1,19 @@
+//go:build !linux
+
+package tart
+
+import "golang.org/x/sys/unix"
+
+// identityFrom is what makes a file the same file across two reads of it.
+func identityFrom(name string, st *unix.Stat_t) baseFile {
+	return baseFile{
+		Name: name, Dev: uint64(st.Dev), Ino: st.Ino, Size: st.Size, //nolint:gosec // a device number is an identity, compared and never computed with
+		CtimeNsec: unix.TimespecToNsec(st.Ctim),
+	}
+}
+
+// deviceOf is the filesystem a stat names.
+func deviceOf(st *unix.Stat_t) uint64 { return uint64(st.Dev) } //nolint:gosec // see identityFrom
+
+// freeBytes is the room an unprivileged process has on a filesystem.
+func freeBytes(st *unix.Statfs_t) uint64 { return st.Bavail * uint64(st.Bsize) }

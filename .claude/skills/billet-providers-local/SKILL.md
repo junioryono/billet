@@ -35,6 +35,8 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **`tart run` is the VM, and nothing believes its exit status.**
 - **Tart has no labels, so ownership is a marker file and the order is the invariant.**
+- **A `@verified` tier boots a clone of a base billet booted, and a launch reaches no network (ADR-021).**
+- **A guest holds a slot or a token through its own process (`slots.go`).**
 - **`List` cross-checks tart's JSON against the vms directory and asks `tart get` about each absence.**
 - **`tart stop` requests a stop.**
 - **The store lock closes the delete race.**

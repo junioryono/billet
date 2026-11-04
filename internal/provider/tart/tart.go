@@ -309,6 +309,26 @@ type Provider struct {
 	// VM's address to be compared across every store that could hold it.
 	uid int
 
+	// stateDir is node.state_dir, where verified images are recorded (ADR-021). Empty
+	// for a provider that only inspects a host, and `@verified` then refuses.
+	stateDir string
+	// macOSLimit reads this node's limit as its control plane last said it: the limit,
+	// and whether there is a record. A func because the record changes at every
+	// registration, after this provider is built.
+	macOSLimit func() (int, bool, error)
+	// now is the clock a deadline and a yield request are read against.
+	now func() time.Time
+	// registry asks what a tag names now. A seam for tests, which reach no registry.
+	registry func(ctx context.Context, key string) (string, error)
+	// signal sends a signal to a process proved to be a probe's.
+	signal func(pid int, sig syscall.Signal) error
+	// yieldWait, yieldRetry and yieldPoll pace a launch waiting on a probe, and
+	// probeWindow bounds a guest's answers. Seams for the reason execRetry is.
+	yieldWait   time.Duration
+	yieldRetry  time.Duration
+	yieldPoll   time.Duration
+	probeWindow time.Duration
+
 	// names serializes Launch and Destroy per VM name. Destroy's stop→prove→
 	// delete is not atomic, and a Launch admitted into that window could have
 	// its fresh VM deleted on the strength of the corpse's proof. The node runs
@@ -398,6 +418,16 @@ func WithHome(dir string) Option {
 	return func(p *Provider) { p.home = dir }
 }
 
+// WithStateDir sets node.state_dir, where verified images are recorded.
+func WithStateDir(dir string) Option {
+	return func(p *Provider) { p.stateDir = dir }
+}
+
+// WithMacOSLimit sets how this node's macOS limit is read. See Provider.macOSLimit.
+func WithMacOSLimit(read func() (int, bool, error)) Option {
+	return func(p *Provider) { p.macOSLimit = read }
+}
+
 // New builds a tart provider. owner names this billet deployment and is written
 // into every VM directory it creates.
 func New(owner string, opts ...Option) (*Provider, error) {
@@ -429,6 +459,14 @@ func New(owner string, opts ...Option) (*Provider, error) {
 		bridges:      hostBridges,
 		processPath:  usage.ProcessPath,
 		processStart: hostProcessStart,
+
+		now:         time.Now,
+		registry:    defaultRegistry,
+		signal:      syscall.Kill,
+		yieldWait:   yieldWait,
+		yieldRetry:  yieldRetry,
+		yieldPoll:   yieldPoll,
+		probeWindow: probeWindow,
 	}
 
 	for _, opt := range opts {
@@ -665,9 +703,26 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 			"destroy it before relaunching", spec.Name)
 	}
 
-	image, err := p.resolveImage(ctx, spec.Image)
-	if err != nil {
-		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+	// `@VERIFIED` NEVER REACHES `tart fqn`, which would read it as a name. It resolves to
+	// the local base of the newest record, so the clone below has no network and no
+	// fallback, and what boots is a copy of what was probed.
+	var (
+		image    string
+		verified *VerifiedRecord
+		err      error
+	)
+
+	if ref, ok := config.TartVerifiedImage(spec.Image); ok {
+		rec, err := p.resolveVerified(ctx, config.TartImageKey(ref))
+		if err != nil {
+			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+		}
+
+		image, verified = rec.Base, &rec
+	} else {
+		if image, err = p.resolveImage(ctx, spec.Image); err != nil {
+			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+		}
 	}
 
 	staging := spec.Name + stagingSuffix
@@ -675,7 +730,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
 
-	if _, err := p.run(ctx, "clone", image, staging); err != nil {
+	if verified != nil {
+		if err := p.cloneBase(ctx, *verified, staging); err != nil {
+			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+		}
+	} else if _, err := p.run(ctx, "clone", image, staging); err != nil {
 		return nil, fmt.Errorf("tart: clone %s for %s: %w", image, spec.Name, err)
 	}
 
@@ -694,6 +753,26 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
+
+	// BEFORE THE LEASE NAME EXISTS, because a guest the limit refuses is a staging clone
+	// to discard, not a stopped VM under a lease name for custody to own. The operating
+	// system comes from the clone, since a tier's word for it is not what Apple counts.
+	guestOS, err := p.guestOSOf(staging)
+	if err != nil {
+		p.discardStaging(ctx, staging)
+
+		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+	}
+
+	claim, err := p.claimGuest(ctx, spec.Name, guestOS, false)
+	if err != nil {
+		p.discardStaging(ctx, staging)
+
+		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+	}
+
+	// Billet's copies only. The guest's process holds its own from the start below.
+	defer claim.release()
 
 	// THE ONE MOMENT A LEASE NAME COMES INTO EXISTENCE, and it happens under the
 	// host-wide store lock — the other half of the pair Destroy's delete is. See
@@ -717,9 +796,13 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
 
-	if err := p.startDetached(spec.Name, netFlags...); err != nil {
+	if err := p.startDetachedHolding(spec.Name, claim.files, netFlags...); err != nil {
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
+
+	// Released now rather than at return, which is minutes away: only the guest's process
+	// holds a slot, so that a billet that dies here does not matter to it.
+	claim.release()
 
 	if err := p.proveStarted(ctx, spec.Name); err != nil {
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
@@ -969,6 +1052,12 @@ func (p *Provider) applyShape(ctx context.Context, name string, spec provider.Sp
 // host. Its output goes to a file in the VM directory, because a dropped stderr
 // is how "the VM never booted" becomes undiagnosable.
 func (p *Provider) startDetached(name string, netFlags ...string) error {
+	return p.startDetachedHolding(name, nil, netFlags...)
+}
+
+// startDetachedHolding is startDetached passing open files to the VM's process, which
+// inherits them, and so holds any lock on them for as long as it or a child of it lives.
+func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags ...string) error {
 	logPath := filepath.Join(p.vmDir(name), runLog)
 
 	out, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -995,6 +1084,7 @@ func (p *Provider) startDetached(name string, netFlags ...string) error {
 	cmd := exec.Command(p.tart, args...)
 	cmd.Stdout = out
 	cmd.Stderr = out
+	cmd.ExtraFiles = held
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
