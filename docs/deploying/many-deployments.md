@@ -4,7 +4,17 @@ Running many separate billet deployments side by side, one control plane each, c
 
 ## What one idle control plane costs
 
-MEASUREMENT_PLACEHOLDER
+Very little. Fifty idle control planes of six tiers each, on one 8 vCPU host, measured on 2026-11-04 ([the record](../reference/records/idle-control-plane.md)):
+
+| | On SQLite | On PostgreSQL |
+|---|---|---|
+| Memory per plane (proportional set size) | 17 MiB | 15 MiB |
+| All fifty | 854 MiB | 739 MiB, and the server's own 1.1 GiB |
+| CPU per plane | 0.05% of a core | 0.08% of a core |
+| All fifty | 0.03 cores | 0.04 cores |
+| PostgreSQL connections per plane | none | 4 |
+
+One target's long polls share one connection, however many tiers it has (against the fake; real GitHub's count was not sampled). Billet's own part of a restart is small, under 0.1 s a plane, but **a restart waits out GitHub's message session, about 68 s on one real deployment, clean stop or not**, because a clean stop hands over rather than closing it. Queued jobs wait; none is lost. A connected node's cost is not in these numbers.
 
 ## Connections to PostgreSQL
 
@@ -19,7 +29,7 @@ server:
       max_connections: 3
 ```
 
-The readers get what the writer and the claim leave, up to four, so unset is six. Three is the least a control plane can run on, and a value under it is refused with the arithmetic. `billet check` states what the deployment can hold. A reader nothing has borrowed for a minute closes, so a quiet deployment holds fewer than its limit.
+The readers get what the writer and the claim leave, up to four, so unset is six. Three is the least a control plane can run on, and a value under it is refused with the arithmetic. `billet check` states what the deployment can hold. A settled control plane holds four, the writer, the claim and two readers, and fifty on one server held 200 at their peak, or 150 at a budget of three, for about 2.4 MiB of the server's memory per connection saved. A reader nothing has borrowed for a minute closes, so a deployment with no reads at all holds fewer than its limit.
 
 **Beyond that number:** a standby in an active-passive pair is a process of its own and holds its own, one session while it waits for the claim. An operator command run beside the server opens its own too, for as long as it runs, under the same limit, except the tail of `billet server retire`, which finds the ledger from its journal with no config to read a limit from, and reads one row at a time. A backup's `pg_dump` is one more.
 
@@ -27,7 +37,7 @@ The readers get what the writer and the claim leave, up to four, so unset is six
 
 ## Memory on a packed host
 
-MEMORY_PLACEHOLDER
+**Do not set `GOMEMLIMIT` to save memory.** At 24 MiB it is never reached and changes nothing. At 16 MiB it saves 3 MiB a plane for fourteen times the CPU, the collector running constantly against a heap that cannot shrink further. An idle plane's memory is what it needs. If you want a limit as a guard against one plane growing, 32 MiB or more leaves an idle plane alone.
 
 ## One App across deployments: the token broker
 
