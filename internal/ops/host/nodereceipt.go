@@ -912,10 +912,15 @@ func evidenceMembersOf(body []byte) []string {
 		return evidenceMembers
 	}
 
-	_, from := raw["from_endpoints"]
-	_, to := raw["to_endpoints"]
+	// A NULL IS NOT A LIST, and decodes as one absent: the command never writes it,
+	// so two of them are members this answer does not have.
+	listed := func(name string) bool {
+		value, present := raw[name]
 
-	if !from && !to {
+		return present && !bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+	}
+
+	if !listed("from_endpoints") && !listed("to_endpoints") {
 		return evidenceMembers
 	}
 

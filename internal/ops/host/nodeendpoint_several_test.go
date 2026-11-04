@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/rollout"
 )
 
@@ -371,6 +372,8 @@ func TestAMigrationsEvidenceCarriesTheList(t *testing.T) {
 		"a list that is not a list":  {"from_endpoints": canonicalA, "to_endpoints": both},
 		"a spelling not canonical":   lists([]string{canonicalA}, []string{canonicalA, "127.0.0.1:7719"}, canonicalA),
 		"a member spelled otherwise": {"From_Endpoints": both, "to_endpoints": both},
+		"two null lists":             {"from_endpoints": json.RawMessage("null"), "to_endpoints": json.RawMessage("null")},
+		"one null list":              {"from_endpoints": json.RawMessage("null"), "to_endpoints": both},
 	} {
 		t.Run("refused: "+name, func(t *testing.T) {
 			f := setup(t)
@@ -379,6 +382,69 @@ func TestAMigrationsEvidenceCarriesTheList(t *testing.T) {
 			mustEndpointRefusal(t, o, outcomeRefused, endpointReasonEvidence)
 			f.noReceipt(t)
 		})
+	}
+}
+
+// THE LONGEST LIST A CONFIGURATION ADMITS FITS WHAT NAMES IT. A reader refuses a
+// record or a receipt over its bound, and a node whose evidence it refuses is one no
+// migration can then shorten the list of. The receipt is the indented one, naming a
+// holder JSON escapes in full.
+func TestTheLongestListAConfigurationAdmitsFitsItsEvidence(t *testing.T) {
+	label := strings.Repeat("a", 63) + "."
+	texts := make([]string, config.MaxServerAddrs)
+
+	for i := range texts {
+		addr := string(rune('a'+i)) + label[1:] + label + label + strings.Repeat("a", 61) + ":65535"
+		if len(addr) != config.MaxServerAddrBytes {
+			t.Fatalf("the longest address here is %d bytes, and the configuration admits %d", len(addr), config.MaxServerAddrBytes)
+		}
+
+		e, err := endpoint.Parse(addr, true)
+		if err != nil {
+			t.Fatalf("parse %s: %v", addr, err)
+		}
+
+		texts[i] = e.String()
+	}
+
+	set, err := parseControllerTexts(texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node, deployment := strings.Repeat("n", 64), strings.Repeat("d", 32)
+
+	record, err := json.Marshal(map[string]any{
+		"schema": 2, "node": node, "deployment": deployment, "incarnation": newIncarnation, "invocation_id": newInvocation,
+		"endpoint": texts[0], "endpoints": texts, "registered_at": "2026-09-10T12:00:00.123456789Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(record)+1 > maxRegistrationRecordBytes {
+		t.Errorf("the record is %d bytes, over the reader's %d", len(record)+1, maxRegistrationRecordBytes)
+	}
+
+	if _, err := decodeRegistrationRecord(record); err != nil {
+		t.Errorf("the record is refused: %v", err)
+	}
+
+	receipt, err := json.MarshalIndent(endpointReceipt{
+		Run: strings.Repeat("<", maxHolderBytes), Node: node, Deployment: deployment, InstalledSHA256: strings.Repeat("a", 64),
+		EffectiveEndpoint: texts[0], InvocationID: newInvocation, Incarnation: newIncarnation,
+		WrittenAt: "2026-09-10T12:00:00.123456789Z",
+	}.withInstalled(set), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(receipt)+1 > maxReceiptBytes {
+		t.Errorf("the receipt is %d bytes, over the reader's %d", len(receipt)+1, maxReceiptBytes)
+	}
+
+	if _, err := decodeEndpointReceipt(receipt); err != nil {
+		t.Errorf("the receipt is refused: %v", err)
 	}
 }
 

@@ -164,6 +164,7 @@ sections_ran="shared checks"
 "$python" "$here/guard_fallback_check.py"
 "$python" "$here/strict_json_check.py"
 "$python" "$here/holder_check.py"
+"$python" "$here/controller_list_check.py"
 "$python" "$here/ordinary_inputs_check.py"
 
 # --- connection-free resets, then the guard before host operations -----------
@@ -3154,6 +3155,56 @@ expect_allowed e1-several
 expect_fact e1-several migrated False
 expect_calls e1-several managed "rollout registration" 0
 echo "ok   E1-several: a node that dials both is left alone, and its schema 2 receipt is read as current"
+
+# E8-several. The lists, one corruption at a time, each refused by name and alone:
+# what the command never writes is not read, a list inside a list and a number
+# among the strings included.
+ep_corrupt_lists() { # name member json
+  local name=$1 member=$2 value=$3 f items
+  ep_plant_ordinary "$name" $EP_A $EP_B
+  f=$(ep_fixture "$name" node-migrate-endpoint reported-planned-several.json)
+  ep_corrupt "$f" "$member" "$value"
+  e "$name" "BILLET_GATE_ANSWER=migrate-endpoint:1:$f"
+  ep_case "$name"
+  expect_refused "$name" "Judge the migration's answer" "answered with a member this role cannot read: endpoint_lists"
+  items=$(grep -c '^failed: \[localhost\] (item=' "$work/cases/$name/out" || true)
+  [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
+  expect_no_play_task "$name" "Install the rendering as the render would"
+}
+ep_corrupt_lists e8s-nested to_endpoints '[["http://127.0.0.1:7717"], ["http://127.0.0.1:7719"]]'
+ep_corrupt_lists e8s-number to_endpoints '["http://127.0.0.1:7717", 17]'
+ep_corrupt_lists e8s-twice to_endpoints '["http://127.0.0.1:7717", "http://127.0.0.1:7717"]'
+ep_corrupt_lists e8s-not-to to_endpoints '["http://127.0.0.1:7719", "http://127.0.0.1:7720"]'
+ep_corrupt_lists e8s-not-from from_endpoints '["http://127.0.0.1:7719"]'
+ep_corrupt_lists e8s-half to_endpoints '-'
+ep_corrupt_lists e8s-other-half from_endpoints '-'
+ep_corrupt_lists e8s-null from_endpoints 'null'
+ep_corrupt_lists e8s-text to_endpoints '"http://127.0.0.1:7717"'
+ep_corrupt_lists e8s-none-several to_endpoints '["http://127.0.0.1:7717"]'
+# And a receipt's, on the same terms.
+ep_corrupt_receipt_list() { # name json
+  local name=$1 value=$2 f
+  ep_plant_ordinary "$name" $EP_A $EP_A
+  f=$(ep_fixture "$name" node-receipt current-several.json receipt.run=h0)
+  "$python" - "$f" "$value" <<'PY'
+import json, sys
+p, v = sys.argv[1:3]
+d = json.load(open(p))
+d["receipt"]["installed_endpoints"] = json.loads(v)
+with open(p, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+PY
+  e "$name" "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture "$name" node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture "$name" node-migrate-endpoint unchanged-several.json);receipt:1:$f"
+  ep_case "$name"
+  expect_refused "$name" "Judge the receipt's answer" "answered with a member this role cannot read: receipt_endpoints"
+}
+ep_corrupt_receipt_list e8s-receipt-number '["http://127.0.0.1:7719", 17]'
+ep_corrupt_receipt_list e8s-receipt-twice '["http://127.0.0.1:7719", "http://127.0.0.1:7719"]'
+ep_corrupt_receipt_list e8s-receipt-nested '[["http://127.0.0.1:7719"], ["http://127.0.0.1:7717"]]'
+ep_corrupt_receipt_list e8s-receipt-one '["http://127.0.0.1:7719"]'
+ep_corrupt_receipt_list e8s-receipt-not-effective '["http://127.0.0.1:7717", "http://127.0.0.1:7720"]'
+echo "ok   E8-several: a list the command never writes is refused by name and alone, in an answer and in a receipt"
 
 # E2b. The controller's environment file, exactly when its
 # billet_server_environment is non-empty.
