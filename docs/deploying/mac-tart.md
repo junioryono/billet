@@ -112,7 +112,7 @@ billet images verify <image> --no-yield --config "$CFG"
 billet local up --config "$CFG"
 ```
 
-Not a plain `billet local down`, which on a Mac that also runs the control plane stops both roles and seals the deployment, and not `billet drain`, which seals the whole deployment. Deployments sharing a store must name one limit, and `billet check` says which does not. The slots cover one store, which is how billet installs a Mac node: a VM another account starts on the same Mac is invisible to them, as it already is to `macos_vm_limit`.
+Not a plain `billet local down`, which on a Mac that also runs the control plane stops both roles and seals the deployment, and not `billet drain`, which seals the whole deployment. Deployments sharing a store must name one limit, and `billet check` says which does not. The slots cover one store, which is how billet installs a Mac node: a VM another account starts on the same Mac holds none, and is invisible to `macos_vm_limit`, but a start counts its `tart run` all the same.
 
 ## What the agents are
 

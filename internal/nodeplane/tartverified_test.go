@@ -118,17 +118,18 @@ func TestAnUnverifiedTartTierStillRunsOnAnOlderNode(t *testing.T) {
 	p := verifiedPlane(t, tier, nodeAtWire(37, "n1-1"))
 
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
+	launched := make(chan error, 1)
 
 	go func() {
-		defer close(done)
-
-		_ = p.NewRunner().Launch(ctx, tartLease(), dispatch.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(ctx, tartLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	waitForQueued(t, p, "n1")
 	cancel()
-	<-done
+
+	if err := <-launched; !errors.Is(err, context.Canceled) {
+		t.Fatalf("launch = %v, want it to have been waiting on the node", err)
+	}
 }
 
 // AND A PROCESS THAT RE-REGISTERS ON AN OLDER WIRE AFTER DISPATCH DOES NOT TAKE IT.

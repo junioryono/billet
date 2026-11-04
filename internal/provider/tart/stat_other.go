@@ -10,7 +10,7 @@ func identityFrom(name string, st *unix.Stat_t) baseFile {
 }
 
 // deviceOf is the filesystem a stat names.
-func deviceOf(st *unix.Stat_t) uint64 { return uint64(st.Dev) } //nolint:gosec // an identity, compared and never computed with
+func deviceOf(st *unix.Stat_t) uint64 { return uint64(st.Dev) }
 
 // freeBytes is the room an unprivileged process has on a filesystem.
 func freeBytes(st *unix.Statfs_t) uint64 { return st.Bavail * uint64(st.Bsize) }

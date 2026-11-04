@@ -1,7 +1,6 @@
 package tart
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +15,14 @@ func registryServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, s
 	t.Cleanup(srv.Close)
 
 	return srv, strings.TrimPrefix(srv.URL, "https://")
+}
+
+func answer(t *testing.T, w http.ResponseWriter, body []byte) {
+	t.Helper()
+
+	if _, err := w.Write(body); err != nil {
+		t.Errorf("answer: %v", err)
+	}
 }
 
 // THE BEARER DANCE, ANONYMOUSLY, and the digest is of the bytes received.
@@ -41,7 +48,7 @@ func TestARegistryDigestIsOfTheBytesItServed(t *testing.T) {
 
 			authorized = true
 
-			_, _ = w.Write([]byte("the manifest"))
+			answer(t, w, []byte("the manifest"))
 		case "/token":
 			if r.URL.Query().Get("service") != "reg" || r.URL.Query().Get("scope") != "repository:acme/macos:pull" {
 				t.Errorf("token query = %q", r.URL.RawQuery)
@@ -51,13 +58,13 @@ func TestARegistryDigestIsOfTheBytesItServed(t *testing.T) {
 				t.Errorf("sent a credential to the realm: %q", r.Header.Get("Authorization"))
 			}
 
-			_, _ = w.Write([]byte(`{"token":"tok"}`))
+			answer(t, w, []byte(`{"token":"tok"}`))
 		default:
 			t.Errorf("asked %s", r.URL.Path)
 		}
 	})
 
-	digest, err := registryDigest(context.Background(), srv.Client(), host+"/acme/macos:26")
+	digest, err := registryDigest(t.Context(), srv.Client(), host+"/acme/macos:26")
 	if err != nil {
 		t.Fatalf("registryDigest: %v", err)
 	}
@@ -72,10 +79,10 @@ func TestARegistryHeaderNamingOtherBytesRefuses(t *testing.T) {
 
 	srv, host := registryServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Docker-Content-Digest", "sha256:0000")
-		_, _ = w.Write([]byte("the manifest"))
+		answer(t, w, []byte("the manifest"))
 	})
 
-	_, err := registryDigest(context.Background(), srv.Client(), host+"/a/b:1")
+	_, err := registryDigest(t.Context(), srv.Client(), host+"/a/b:1")
 	if err == nil || !strings.Contains(err.Error(), "hash to") {
 		t.Fatalf("registryDigest = %v", err)
 	}
@@ -112,7 +119,7 @@ func TestARegistryThatWillNotAnswerIsAnError(t *testing.T) {
 		},
 		"too long": {
 			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write(make([]byte, manifestLimit+1))
+				answer(t, w, make([]byte, manifestLimit+1))
 			},
 		},
 	} {
@@ -121,7 +128,7 @@ func TestARegistryThatWillNotAnswerIsAnError(t *testing.T) {
 
 			srv, host := registryServer(t, tc.handler)
 
-			_, err := registryDigest(context.Background(), srv.Client(), host+"/a/b:1")
+			_, err := registryDigest(t.Context(), srv.Client(), host+"/a/b:1")
 			if err == nil {
 				t.Fatal("answered")
 			}
@@ -144,7 +151,7 @@ func TestARegistryRedirectOffTLSIsRefused(t *testing.T) {
 	client := registryClient()
 	client.Transport = srv.Client().Transport
 
-	_, err := registryDigest(context.Background(), client, host+"/a/b:1")
+	_, err := registryDigest(t.Context(), client, host+"/a/b:1")
 	if err == nil || !strings.Contains(err.Error(), "not TLS") {
 		t.Fatalf("registryDigest = %v", err)
 	}

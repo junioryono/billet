@@ -116,9 +116,9 @@ func (s *verifiedState) isWithdrawn(key, digest string) bool {
 func (s *verifiedState) recordsOf(key string) []VerifiedRecord {
 	var out []VerifiedRecord
 
-	for _, r := range s.verified.Records {
-		if r.Image == key {
-			out = append(out, r)
+	for i := range s.verified.Records {
+		if s.verified.Records[i].Image == key {
+			out = append(out, s.verified.Records[i])
 		}
 	}
 
@@ -215,6 +215,13 @@ func (p *Provider) saveVerifiedState(st *verifiedState) error {
 	}
 
 	body = append(body, '\n')
+
+	// BEFORE THE INSTALL: a document this reader refuses would stop every verified launch on
+	// the Mac, and the one it replaces still reads.
+	if len(body) > recordLimit {
+		return fmt.Errorf("%s would be %d bytes, past the %d billet reads; unpromote what no tier "+
+			"needs", verifiedFile, len(body), recordLimit)
+	}
 
 	if _, err := p.installer.Install(p.stateDir, verifiedFile, 0o600, func(w io.Writer) error {
 		_, err := w.Write(body)

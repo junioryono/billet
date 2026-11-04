@@ -125,6 +125,8 @@ type stub struct {
 	runHolds string
 	// guestBin is on the PATH of what a guest runs, for its docker and xcodebuild.
 	guestBin string
+	// deleteHangs makes `tart delete` never return.
+	deleteHangs string
 }
 
 func newStub(t *testing.T) *stub {
@@ -175,6 +177,7 @@ func newStub(t *testing.T) *stub {
 		pullStoresNothing: filepath.Join(dir, "pull-stores-nothing"),
 		runHolds:          filepath.Join(dir, "run-holds"),
 		guestBin:          filepath.Join(dir, "guest-bin"),
+		deleteHangs:       filepath.Join(dir, "delete-hangs"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -349,6 +352,7 @@ delete)
     echo "the specified VM \"$name\" does not exist" >&2
     exit 1
   fi
+  if [ -e "` + s.deleteHangs + `" ]; then exec sleep 300; fi
   rm -rf "$vms/$name"
   ;;
 get)

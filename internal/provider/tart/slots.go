@@ -300,7 +300,6 @@ func (p *Provider) yieldRequested() bool {
 
 // slotCensus is what admission reads under the slot lock.
 type slotCensus struct {
-	limit    int
 	recorded int
 	held     int
 	// probes are the VMs named by the identities of held slots that are probes.

@@ -332,6 +332,8 @@ type Provider struct {
 	yieldRetry  time.Duration
 	yieldPoll   time.Duration
 	probeWindow time.Duration
+	// deleteWindow bounds one `tart delete` under the store lock.
+	deleteWindow time.Duration
 
 	// names serializes Launch and Destroy per VM name. Destroy's stop→prove→
 	// delete is not atomic, and a Launch admitted into that window could have
@@ -471,6 +473,8 @@ func New(owner string, opts ...Option) (*Provider, error) {
 		yieldRetry:  yieldRetry,
 		yieldPoll:   yieldPoll,
 		probeWindow: probeWindow,
+
+		deleteWindow: deleteWindow,
 	}
 
 	for _, opt := range opts {

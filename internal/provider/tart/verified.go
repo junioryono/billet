@@ -32,6 +32,10 @@ const probeTeardownWindow = 3 * time.Minute
 // yieldPoll is how often a probe looks for a job's request.
 const yieldPoll = 3 * time.Second
 
+// deleteWindow bounds one `tart delete`, against the seconds removing a macOS VM's
+// directory takes.
+const deleteWindow = 5 * time.Minute
+
 // lockSettle bounds the wait for a lock nothing should hold.
 const lockSettle = 2 * time.Second
 
@@ -43,7 +47,7 @@ const answerLimit = 4096
 var ErrYielded = errors.New("the verification yielded its macOS slot to a job, so it recorded nothing")
 
 // runnerVersion is the one thing billet takes from a guest, and only once it matches.
-var runnerVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+var runnerVersion = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 // RunnerAnswer is GitHub's window for one runner release. A zero Deadline is no newer
 // release yet, so no date.
@@ -301,7 +305,9 @@ func retainBases(st *verifiedState, key string) []string {
 	contents := map[string]bool{}
 	keep := map[string]bool{}
 
-	for _, r := range st.recordsOf(key) {
+	records := st.recordsOf(key)
+	for i := range records {
+		r := &records[i]
 		if r.Invalid == "" && !st.isWithdrawn(key, r.Digest) && !contents[r.ContentKey] && len(contents) < 2 {
 			contents[r.ContentKey] = true
 			keep[r.Base] = true
@@ -335,11 +341,15 @@ func (p *Provider) cleanVerification(ctx context.Context, key string) error {
 	// FIRST, because it refuses a state directory that is another deployment's before
 	// anything of its could be removed.
 	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
-		for _, r := range st.recordsOf(key) {
-			named[r.Base] = true
+		records := st.recordsOf(key)
+		for i := range records {
+			named[records[i].Base] = true
 		}
 
-		return false, nil
+		// AN ABSENCE THAT AUTHORISES A DELETE MUST BE DURABLE: a commit can report a sync
+		// that failed after its rename, and a crash could then bring back a document naming
+		// a base this has removed.
+		return false, p.installer.SyncDirectory(p.stateDir)
 	}); err != nil {
 		return err
 	}
@@ -384,7 +394,7 @@ func (p *Provider) cleanVerification(ctx context.Context, key string) error {
 // verification records nothing unless it was.
 func (p *Provider) runProbe(
 	ctx context.Context, rec VerifiedRecord, opts VerifyOptions, netFlags []string,
-) (runner string, err error) {
+) (string, error) {
 	probe := p.probeName(rec.Image)
 
 	custody, err := openLockFile(p.custodyPath(probe))
@@ -406,6 +416,39 @@ func (p *Provider) runProbe(
 
 	defer claim.release()
 
+	runner, askErr := p.bootProbe(ctx, rec, opts, netFlags, custody, claim)
+
+	// BILLET'S COPIES GO FIRST, or its own descriptors would hold what is being proved
+	// released. A FRESH BOUND: the caller or a yield may have ended the context this ran on,
+	// and the probe is proved gone either way.
+	_ = custody.Close()
+
+	claim.release()
+
+	endCtx, endCancel := cleanupContext(ctx)
+	defer endCancel()
+
+	if endErr := p.endProbe(endCtx, probe); endErr != nil {
+		// NOT WRAPPING WHAT ENDED IT: a yield whose probe may still be alive is not the clean
+		// yield a refresh reports as nothing wrong.
+		if askErr != nil {
+			return "", fmt.Errorf("the probe could not be proved gone: %w (the verification had "+
+				"ended: %s)", endErr, askErr.Error())
+		}
+
+		return "", fmt.Errorf("the probe could not be proved gone: %w", endErr)
+	}
+
+	return runner, askErr
+}
+
+// bootProbe clones the base, boots the clone holding its slot and custody, and asks the guest.
+func (p *Provider) bootProbe(
+	ctx context.Context, rec VerifiedRecord, opts VerifyOptions, netFlags []string,
+	custody *os.File, claim *guestClaim,
+) (string, error) {
+	probe := p.probeName(rec.Image)
+
 	probeCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
@@ -413,23 +456,6 @@ func (p *Provider) runProbe(
 		stop := p.watchYield(probeCtx, cancel)
 		defer stop()
 	}
-
-	defer func() {
-		// A FRESH BOUND: the caller or a yield may have ended the context this ran on,
-		// and the probe is proved gone either way.
-		endCtx, endCancel := cleanupContext(ctx)
-		defer endCancel()
-
-		_ = custody.Close()
-		claim.release()
-
-		// %v FOR WHAT ENDED IT: a yield whose probe may still be alive is not the clean
-		// yield a refresh reports as nothing wrong.
-		if endErr := p.endProbe(endCtx, probe); endErr != nil {
-			runner = ""
-			err = fmt.Errorf("the probe could not be proved gone: %w (the verification had ended: %v)", endErr, err)
-		}
-	}()
 
 	if err := p.cloneBase(probeCtx, rec, probe); err != nil {
 		return "", probeCause(probeCtx, err)
@@ -446,6 +472,7 @@ func (p *Provider) runProbe(
 	// THE GUEST'S PROCESS NOW HOLDS THEM: billet's copies go, so the kernel releases the
 	// slot when that process ends and not when this one does.
 	claim.release()
+
 	_ = custody.Close()
 
 	if err := p.proveStarted(probeCtx, probe); err != nil {
@@ -466,7 +493,7 @@ func (p *Provider) runProbe(
 		}
 	}
 
-	runner, err = p.askGuest(probeCtx, probe, rec.GuestOS, opts.Command)
+	runner, err := p.askGuest(probeCtx, probe, rec.GuestOS, opts.Command)
 	if err != nil {
 		return "", probeCause(probeCtx, err)
 	}
@@ -825,7 +852,9 @@ func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRec
 	)
 
 	err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
-		for _, r := range st.recordsOf(key) {
+		records := st.recordsOf(key)
+		for i := range records {
+			r := &records[i]
 			if r.Invalid != "" || st.isWithdrawn(key, r.Digest) {
 				continue
 			}
@@ -857,7 +886,7 @@ func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRec
 				return false, fmt.Errorf("lock base %s: %w", r.Base, err)
 			}
 
-			found, held = r, heldFile{f: f}
+			found, held = *r, heldFile{f: f}
 
 			return false, nil
 		}
@@ -881,9 +910,10 @@ func (p *Provider) Unpromote(ctx context.Context, image, base string) ([]string,
 	err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
 		var target *VerifiedRecord
 
-		for _, r := range st.recordsOf(key) {
-			if r.Base == base {
-				target = &r
+		records := st.recordsOf(key)
+		for i := range records {
+			if records[i].Base == base {
+				target = &records[i]
 
 				break
 			}
@@ -993,9 +1023,10 @@ func (p *Provider) VerifiedImages(ctx context.Context) ([]VerifiedImage, error) 
 				Deadlines: map[string]time.Time{},
 			}
 
-			for _, r := range image.Records {
-				if deadline, ok := st.verified.Deadlines[r.Runner]; ok {
-					image.Deadlines[r.Runner] = deadline
+			for i := range image.Records {
+				runner := image.Records[i].Runner
+				if deadline, ok := st.verified.Deadlines[runner]; ok {
+					image.Deadlines[runner] = deadline
 				}
 			}
 
@@ -1011,13 +1042,13 @@ func (p *Provider) VerifiedImages(ctx context.Context) ([]VerifiedImage, error) 
 // RefreshDeadlines asks GitHub again for every recorded runner and stores each date it
 // answers, answering the versions it could not tell about. It never erases one: an
 // answer of could-not-tell is not an answer that the window closed or opened.
-func (p *Provider) RefreshDeadlines(ctx context.Context, window RunnerWindow) (unknown []string, err error) {
+func (p *Provider) RefreshDeadlines(ctx context.Context, window RunnerWindow) ([]string, error) {
 	var runners []string
 
 	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
-		for _, r := range st.verified.Records {
-			if !slices.Contains(runners, r.Runner) {
-				runners = append(runners, r.Runner)
+		for i := range st.verified.Records {
+			if runner := st.verified.Records[i].Runner; !slices.Contains(runners, runner) {
+				runners = append(runners, runner)
 			}
 		}
 
@@ -1027,6 +1058,8 @@ func (p *Provider) RefreshDeadlines(ctx context.Context, window RunnerWindow) (u
 	}
 
 	slices.Sort(runners)
+
+	var unknown []string
 
 	answers := map[string]time.Time{}
 
@@ -1056,7 +1089,7 @@ func (p *Provider) RefreshDeadlines(ctx context.Context, window RunnerWindow) (u
 
 // StoreSpace is the room on tart's store and the size of the newest base's disk, which
 // a verification needs once more while its private store exists.
-func (p *Provider) StoreSpace(rec VerifiedRecord) (free uint64, base int64, err error) {
+func (p *Provider) StoreSpace(rec VerifiedRecord) (uint64, int64, error) {
 	var st unix.Statfs_t
 
 	if err := unix.Statfs(p.home, &st); err != nil {

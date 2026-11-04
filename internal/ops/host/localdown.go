@@ -857,7 +857,8 @@ func byWhom(a state.Admission) string {
 func printDownPlan(env cli.Env, c converger, req lifeops.UpRequest, o downOptions) {
 	fmt.Fprintf(env.Stdout, "plan     what `billet local down` would do on this host:\n")
 
-	if req.WantServer {
+	switch {
+	case req.WantServer:
 		fmt.Fprintf(env.Stdout, "         1. seal admission (local-down), so nothing new is taken\n")
 		fmt.Fprintf(env.Stdout, "         2. wait for work already running to finish")
 
@@ -874,9 +875,9 @@ func printDownPlan(env cli.Env, c converger, req lifeops.UpRequest, o downOption
 			fmt.Fprintf(env.Stdout, "         3. ask every host what it is actually running, and wait until\n")
 			fmt.Fprintf(env.Stdout, "            each says it is running nothing\n")
 		}
-	} else if o.nodeOnly {
+	case o.nodeOnly:
 		fmt.Fprintf(env.Stdout, "         1. seal nothing (--node): the deployment keeps admitting work\n")
-	} else {
+	default:
 		fmt.Fprintf(env.Stdout, "         1. nothing to seal: this host runs no control plane, and nothing\n")
 		fmt.Fprintf(env.Stdout, "            here can ask it what it is running either\n")
 	}

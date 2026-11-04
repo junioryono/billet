@@ -12,8 +12,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/junioryono/billet/internal/config"
 )
 
 // manifestLimit bounds a manifest read. A VM image's manifest names a few hundred disk
@@ -293,6 +291,3 @@ func parseChallenge(s string) map[string]string {
 
 	return fields
 }
-
-// keyOf is the reference a tier's image names, normalised; config owns the rule.
-func keyOf(image string) string { return config.TartImageKey(image) }

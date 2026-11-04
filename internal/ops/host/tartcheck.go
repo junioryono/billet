@@ -188,7 +188,7 @@ func reportTartImage(env cli.Env, p tartReporter, key string, image tart.Verifie
 
 	if free, size, err := p.StoreSpace(*newest); err != nil {
 		fmt.Fprintf(env.Stdout, "         free space UNKNOWN: %v\n", err)
-	} else if int64(min(free, 1<<62)) < size { //nolint:gosec // capped just above
+	} else if int64(min(free, 1<<62)) < size {
 		fmt.Fprintf(env.Stdout, "         only %d GiB free and its base is %d GiB, so the next verification "+
 			"cannot hold its private store\n", free>>30, size>>30)
 	}

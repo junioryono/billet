@@ -171,7 +171,7 @@ func (c contextReader) Read(b []byte) (int, error) {
 var clonedConfigFields = []string{"macAddress", "machineIdentifier"}
 
 // hashContent computes a VM's exact hash and the key that judges distinct content.
-func hashContent(ctx context.Context, dir string) (exact, key string, err error) {
+func hashContent(ctx context.Context, dir string) (string, string, error) {
 	disk, err := hashFile(ctx, filepath.Join(dir, baseDisk))
 	if err != nil {
 		return "", "", err
@@ -453,7 +453,7 @@ func (p *Provider) pullIntoStaging(ctx context.Context, key, digest, staging str
 	}()
 
 	vms := filepath.Join(p.home, "vms")
-	if err := os.MkdirAll(vms, 0o755); err != nil { //nolint:gosec // tart's own store layout
+	if err := os.MkdirAll(vms, 0o755); err != nil {
 		return fmt.Errorf("create tart's store: %w", err)
 	}
 
@@ -593,7 +593,13 @@ func (p *Provider) deleteOwnedVM(ctx context.Context, name string) error {
 		return fmt.Errorf("read %s's marker: %w", name, err)
 	}
 
-	if _, err := p.runShared(ctx, "delete", name); err != nil && !isMissingVM(err) {
+	// ITS OWN BOUND, whatever the caller's: this holds the store lock, which every
+	// deployment on the Mac takes to publish a guest or remove one. What runs out is left
+	// for the image's next verification.
+	deleteCtx, cancel := context.WithTimeout(ctx, p.deleteWindow)
+	defer cancel()
+
+	if _, err := p.runShared(deleteCtx, "delete", name); err != nil && !isMissingVM(err) {
 		return fmt.Errorf("delete %s: %w", name, err)
 	}
 

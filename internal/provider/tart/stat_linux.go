@@ -13,4 +13,4 @@ func identityFrom(name string, st *unix.Stat_t) baseFile {
 func deviceOf(st *unix.Stat_t) uint64 { return st.Dev }
 
 // freeBytes is the room an unprivileged process has on a filesystem.
-func freeBytes(st *unix.Statfs_t) uint64 { return st.Bavail * uint64(st.Bsize) } //nolint:gosec // a block size is positive
+func freeBytes(st *unix.Statfs_t) uint64 { return st.Bavail * uint64(st.Bsize) }

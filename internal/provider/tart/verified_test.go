@@ -69,7 +69,7 @@ func writeExecutable(t *testing.T, path, body string) {
 }
 
 // setRegistry makes the tag name a manifest and the pull store those bytes.
-func setRegistry(t *testing.T, s *stub, p *Provider, manifest string) string {
+func setRegistry(t *testing.T, s *stub, p *Provider, manifest string) {
 	t.Helper()
 
 	if err := os.WriteFile(s.pullManifest, []byte(manifest), 0o600); err != nil {
@@ -78,8 +78,6 @@ func setRegistry(t *testing.T, s *stub, p *Provider, manifest string) string {
 
 	digest := digestOf(manifest)
 	p.registry = func(context.Context, string) (string, error) { return digest, nil }
-
-	return digest
 }
 
 func digestOf(body string) string {
@@ -548,8 +546,8 @@ func assertBases(t *testing.T, p *Provider, want ...string) {
 	var got []string
 
 	for _, image := range images {
-		for _, r := range image.Records {
-			got = append(got, r.Base)
+		for i := range image.Records {
+			got = append(got, image.Records[i].Base)
 		}
 	}
 
@@ -978,15 +976,25 @@ func hold(t *testing.T, s *stub) {
 
 // killHeld ends the processes `tart run` left, for a test's cleanup.
 func killHeld(s *stub) {
-	paths, _ := filepath.Glob(filepath.Join(s.home, "vms", "*", ".held"))
+	paths, err := filepath.Glob(filepath.Join(s.home, "vms", "*", ".held"))
+	if err != nil {
+		return
+	}
+
 	for _, path := range paths {
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
 
-		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+		pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil {
+			continue
+		}
+
+		// Ended already is what most of these are.
+		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			continue
 		}
 	}
 }
@@ -1103,8 +1111,9 @@ func TestALinuxGuestHoldsATokenAndNoSlot(t *testing.T) {
 		t.Fatalf("the guest's process does not hold its token: free=%v, %v", free, err)
 	}
 
-	if names, _ := filepath.Glob(p.billetPath(slotPrefix + "*")); len(names) != 0 {
-		t.Fatalf("a Linux guest made slots: %v", names)
+	names, err := filepath.Glob(p.billetPath(slotPrefix + "*"))
+	if err != nil || len(names) != 0 {
+		t.Fatalf("a Linux guest made slots: %v, %v", names, err)
 	}
 }
 
@@ -1178,7 +1187,7 @@ func TestTheCensusCountsWhatNoSlotOrTokenAccountsFor(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				defer func() { _ = token.Close() }()
+				t.Cleanup(func() { _ = token.Close() })
 
 				if _, err := tryFlock(token, syscall.LOCK_EX); err != nil {
 					t.Fatal(err)
@@ -1215,6 +1224,27 @@ func TestACensusThatCannotBeReadRefuses(t *testing.T) {
 		if _, err := p.Launch(t.Context(), validSpec(verifiedLease)); err == nil ||
 			!strings.Contains(err.Error(), "count the guests") {
 			t.Fatalf("Launch = %v", err)
+		}
+	})
+
+	// A PROCESS THAT ENDED BETWEEN `ps` AND THE ASK IS NO GUEST, which macOS says of a zombie too.
+	t.Run("not a process that has gone", func(t *testing.T) {
+		t.Parallel()
+
+		s, p := verifiedStub(t)
+		setMacOS(t, s, p, guestDarwin)
+		p.macOSLimit = func() (int, bool, error) { return 1, true, nil }
+
+		if err := os.WriteFile(filepath.Join(filepath.Dir(s.bin), "ps.out"), []byte("111 tart run x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		p.processPath = func(int) (string, error) {
+			return "", fmt.Errorf("read: %w", syscall.ESRCH)
+		}
+
+		if _, err := p.Launch(t.Context(), validSpec(verifiedLease)); err != nil {
+			t.Fatalf("Launch: %v", err)
 		}
 	})
 
@@ -1370,8 +1400,9 @@ func TestAProbeYieldsItsSlotToAJob(t *testing.T) {
 		t.Fatalf("images = %+v, %v, want the yield counted", images, err)
 	}
 
-	if names, _ := filepath.Glob(p.billetPath(yieldPrefix + "*")); len(names) != 0 {
-		t.Fatalf("the launch left its request: %v", names)
+	names, err := filepath.Glob(p.billetPath(yieldPrefix + "*"))
+	if err != nil || len(names) != 0 {
+		t.Fatalf("the launch left its request: %v, %v", names, err)
 	}
 }
 
@@ -1748,8 +1779,8 @@ func TestAReferenceThatCannotBeVerifiedRefuses(t *testing.T) {
 	}
 }
 
-// A DIGEST WITHDRAWN IS NEVER RESOLVED, even with its record still there: the withdrawal is
-// installed first, so a crash between the two files leaves exactly this.
+// A DIGEST WITHDRAWN IS NEVER RESOLVED, even in a document naming a record of it, which no
+// path of billet's writes and resolution holds against anyway.
 func TestResolveSkipsAWithdrawnDigest(t *testing.T) {
 	t.Parallel()
 
@@ -1787,7 +1818,7 @@ func TestAPrivateStoreOnAnotherFilesystemRefuses(t *testing.T) {
 		t.Skip(other + " is on the store's own filesystem")
 	}
 
-	state, err := os.MkdirTemp(other, "billet-tart-*")
+	state, err := os.MkdirTemp(other, "billet-tart-*") //nolint:usetesting // t.TempDir is on the filesystem this must not be
 	if err != nil {
 		t.Skipf("cannot write to %s: %v", other, err)
 	}
@@ -2229,7 +2260,9 @@ func TestAHolderThatChangedBetweenTwoReadsIsNotSignalled(t *testing.T) {
 			p.processPath = func(int) (string, error) {
 				// BETWEEN THE TWO READS OF WHO HOLDS IT.
 				if tc.second != "10\n" {
-					_ = os.WriteFile(lsof, []byte(tc.second), 0o600)
+					if err := os.WriteFile(lsof, []byte(tc.second), 0o600); err != nil {
+						t.Error(err)
+					}
 				}
 
 				return "/opt/homebrew/bin/tart", nil
@@ -2502,6 +2535,106 @@ func TestAnUnpromoteThatCouldNotRemoveItsBaseSaysSo(t *testing.T) {
 
 	if _, err := os.Stat(p.vmDir(rec.Base)); err != nil {
 		t.Fatalf("the base went under a launch's lock: %v", err)
+	}
+
+	// THE RECORD IS GONE AND THE DIGEST WITHDRAWN WHATEVER THE BASE DID, and the image's next
+	// verification removes what is left.
+	if _, err := p.Launch(t.Context(), verifiedSpec(verifiedLease)); err == nil ||
+		!strings.Contains(err.Error(), "no verified base") {
+		t.Fatalf("Launch = %v", err)
+	}
+
+	held.release()
+
+	p.storeLockWindow = 2 * time.Minute
+
+	opts := verifyOpts()
+	opts.Digest = rec.Digest
+
+	if _, err := p.Verify(t.Context(), opts); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	if _, err := os.Stat(p.vmDir(rec.Base)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the next verification left it: %v", err)
+	}
+}
+
+// A HUNG DELETE LETS GO OF THE STORE, whichever path reached it: it holds the lock every
+// deployment on the Mac takes to publish a guest.
+func TestAHungDeleteLetsGoOfTheStoreLock(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	rec := mustVerify(t, p)
+	p.deleteWindow = 100 * time.Millisecond
+
+	if err := os.WriteFile(s.deleteHangs, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := p.Unpromote(t.Context(), verifiedRef, rec.Base)
+	if err == nil || !strings.Contains(err.Error(), "still on the Mac") {
+		t.Fatalf("Unpromote = %v", err)
+	}
+
+	unlock, err := p.lockStore(t.Context(), "prove it is free")
+	if err != nil {
+		t.Fatalf("the store is still held: %v", err)
+	}
+
+	unlock()
+}
+
+// AN ABSENCE THAT AUTHORISES A DELETE MUST BE DURABLE: with the record document's directory not
+// synced, a crash could bring back a document naming what cleanup removed.
+func TestCleanupDeletesNothingOnARemovalThatMayNotBeDurable(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	mustVerify(t, p)
+
+	left := basePrefix + testOwner + "-" + hashName(verifiedRef) + "-90"
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", left); err != nil {
+		t.Fatal(err)
+	}
+
+	p.installer.SyncDir = func(string) error { return errors.New("the directory would not sync") }
+
+	setRegistry(t, s, p, "manifest two")
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified with a directory that would not sync")
+	}
+
+	if _, err := os.Stat(p.vmDir(left)); err != nil {
+		t.Fatalf("a base went on an absence that may not last: %v", err)
+	}
+}
+
+// A DOCUMENT THE READER WOULD REFUSE IS NEVER INSTALLED, or one write would stop every verified
+// launch on the Mac.
+func TestARecordPastWhatTheReaderTakesIsNotInstalled(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+	rec := mustVerify(t, p)
+
+	err := p.withRecords(t.Context(), func(st *verifiedState) (bool, error) {
+		st.verified.Deadlines[strings.Repeat("x", recordLimit)] = time.Now()
+
+		return true, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "past the") {
+		t.Fatalf("withRecords = %v", err)
+	}
+
+	if _, err := p.Launch(t.Context(), verifiedSpec(verifiedLease)); err != nil {
+		t.Fatalf("Launch from the document still there: %v", err)
+	}
+
+	if _, err := os.Stat(p.vmDir(rec.Base)); err != nil {
+		t.Fatal(err)
 	}
 }
 
