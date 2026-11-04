@@ -11,7 +11,7 @@ func TestParseSourceAcceptsHTTPS(t *testing.T) {
 		t.Fatalf("a plain https source was refused: %v", err)
 	}
 
-	if got := s.ManifestURL(); got != "https://example.test/billet/releases/latest/download/manifest.json" {
+	if got := s.ManifestURLFor(""); got != "https://example.test/billet/releases/latest/download/manifest.json" {
 		t.Errorf("manifest url = %q", got)
 	}
 }
@@ -22,8 +22,8 @@ func TestParseSourceTrimsATrailingSlashSoURLsDoNotDoubleUp(t *testing.T) {
 		t.Fatalf("refused: %v", err)
 	}
 
-	if strings.Contains(s.ManifestURL(), "//manifest") {
-		t.Errorf("a trailing slash produced %q", s.ManifestURL())
+	if strings.Contains(s.ManifestURLFor(""), "//manifest") {
+		t.Errorf("a trailing slash produced %q", s.ManifestURLFor(""))
 	}
 }
 

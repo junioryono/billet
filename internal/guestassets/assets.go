@@ -29,3 +29,10 @@ var RunnerServiceScript string
 //
 //go:embed exec-env.sh
 var ExecEnvScript string
+
+// DockerDaemonJSON is the daemon configuration GitHub's template installs in place
+// of its own, so the image store is the classic one the Docker cache mounts. The
+// guest build reads it from the tree; the EC2 builder is sent it.
+//
+//go:embed docker-daemon.json
+var DockerDaemonJSON string

@@ -12,6 +12,8 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"time"
 )
 
@@ -41,6 +43,26 @@ const (
 // with an instruction attached, while a network failure is a retry.
 var ErrNotFound = errors.New("imagesource: no such artifact at this source")
 
+// errForbidden is a source answering 403, which an S3 bucket the reader may not
+// list, or CloudFront in front of one, answers for a key that is not there: on
+// an operator's own source it is as good as a 404 for falling back, and on
+// billet's own it is a refusal like any other.
+var errForbidden = errors.New("imagesource: the source refused the request")
+
+// misspelledMachines are names a channel's architectures must never carry, since
+// they are some other vocabulary's (billet's, Go's) for a machine `uname -m` spells
+// otherwise, and a reader would take each for a machine the release leaves out.
+var misspelledMachines = []string{"x64", "arm64", "amd64"}
+
+// unameMachine is the shape of a `uname -m` name, lowercase as uname prints it, so
+// a channel list in another case (ARM64) is refused with the other spellings.
+var unameMachine = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
+
+// ErrNoImageForMachine is the signed channel saying its current release carries no
+// image for this machine: final until the channel moves, unlike a manifest that
+// could not be fetched, which says nothing about whether one exists.
+var ErrNoImageForMachine = errors.New("imagesource: the channel's current release carries no image for this machine")
+
 // Client fetches artifacts from a source and proves they are what was
 // published before letting anything else see them.
 type Client struct {
@@ -50,7 +72,26 @@ type Client struct {
 	// Source is where artifacts are fetched from.
 	Source Source
 
+	// Machine is the machine whose image is fetched, as `uname -m` spells it;
+	// empty is x86_64, which every release carries as ManifestName.
+	Machine string
+
 	verifyChannel func([]byte, []byte, Policy) error
+
+	// channelArchitectures is what the resolved channel pointer said its release
+	// carries, and channelSaid whether it said: a pointer published before the
+	// member existed says nothing, which is not the same as an empty list.
+	channelArchitectures []string
+	channelSaid          bool
+}
+
+// machine is c.Machine, with empty read as the x86_64 every release carries.
+func (c *Client) machine() string {
+	if c.Machine == "" {
+		return manifestMachine
+	}
+
+	return c.Machine
 }
 
 // defaultHTTP is used when a caller supplies none.
@@ -177,12 +218,16 @@ func (c *Client) Resolve(ctx context.Context) error {
 		}
 	}
 
+	// ARCHITECTURES IS OPTIONAL, and schema 1 is unchanged by it (ADR-022): a
+	// reader before it ignores the member, and a pointer before it says nothing,
+	// which leaves the reader to try the manifest named for its machine.
 	var channel struct {
 		Schema           int       `json:"schema"`
 		Tag              string    `json:"tag"`
 		PublishedAt      time.Time `json:"published_at"`
 		ExpiresAt        time.Time `json:"expires_at"`
 		ReleaseImmutable bool      `json:"release_immutable"`
+		Architectures    *[]string `json:"architectures"`
 	}
 	if err := json.Unmarshal(body, &channel); err != nil {
 		return fmt.Errorf("imagesource: the guest-image channel is invalid: %w", err)
@@ -212,9 +257,38 @@ func (c *Client) Resolve(ctx context.Context) error {
 			channel.ExpiresAt.Format(time.RFC3339))
 	}
 
+	return c.adoptChannel(channel.Tag, channel.Architectures)
+}
+
+// adoptChannel moves the client onto the release the channel names, with the
+// architectures it lists, having refused a list this reader cannot take at its
+// word: nothing is adopted from a channel that is refused.
+//
+// A LIST THAT WOULD TELL EVERY NODE THERE IS NOTHING TO TAKE UP is refused, never
+// read as a final no: one leaving out x86_64, which every release carries as
+// manifest.json (an empty one among them), and one naming a machine in another
+// vocabulary's spelling or a file. A well-formed `uname -m` name this reader does
+// not know is let through, so a release adding a machine is not a flag day for
+// readers of this one (ADR-022).
+func (c *Client) adoptChannel(tag string, architectures *[]string) error {
+	if architectures != nil {
+		list := *architectures
+		if !slices.Contains(list, manifestMachine) || slices.ContainsFunc(list, func(m string) bool {
+			return slices.Contains(misspelledMachines, m) || !unameMachine.MatchString(m)
+		}) {
+			return fmt.Errorf("imagesource: the guest-image channel lists architectures %v, which a "+
+				"reader cannot take at its word: they are `uname -m` names and include %s", list,
+				manifestMachine)
+		}
+	}
+
 	c.Source = Source{
-		BaseURL:  defaultDownloadPrefix + channel.Tag,
+		BaseURL:  defaultDownloadPrefix + tag,
 		official: true,
+	}
+
+	if architectures != nil {
+		c.channelArchitectures, c.channelSaid = *architectures, true
 	}
 
 	return nil
@@ -232,12 +306,51 @@ func (c *Client) Resolve(ctx context.Context) error {
 // out of them. Verifying a re-serialised manifest would verify a document this
 // program produced rather than the one that was signed, and the two can differ in
 // whitespace, key order, or any field a future reader drops.
+//
+// THE MANIFEST NAMED FOR THIS CLIENT'S MACHINE (ADR-022). A channel that lists its
+// release's architectures and leaves this one out is final (ErrNoImageForMachine).
+// One that does not say, and a dated release of billet's own, leave the reader to
+// try the manifest, and a failure there, a 404 included, is could-not-tell: a 404
+// can be temporary or cached, and GitHub's API, which could say more, is not asked.
+// An operator's own source that publishes no manifest for this machine is read
+// from ManifestName instead, which Usable then judges, so a mirror publishing a
+// single arm64 manifest.json keeps working.
 func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 	if err := c.Resolve(ctx); err != nil {
 		return nil, err
 	}
 
-	body, err := c.get(ctx, c.Source.ManifestURL(), MaxManifestBytes)
+	machine := c.machine()
+	if c.channelSaid && !slices.Contains(c.channelArchitectures, machine) {
+		return nil, fmt.Errorf("%w: the channel lists %v for %s, and this is %s", ErrNoImageForMachine,
+			c.channelArchitectures, c.Source.BaseURL, machine)
+	}
+
+	name, bundle := ManifestNamesFor(machine)
+
+	body, err := c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes)
+	switch {
+	case err != nil && c.Source.official && errors.Is(err, ErrNotFound):
+		// BILLET'S OWN RELEASE IS IMMUTABLE AND SIGNED, so a 404 from it, which a
+		// cache or a moment can produce, is never taken for what it publishes.
+		return nil, fmt.Errorf("imagesource: could not tell whether %s carries an image for %s: "+
+			"%s was not found, and only the channel's signed list says what a release carries: %v",
+			c.Source.BaseURL, machine, name, err)
+	case err != nil && !c.Source.official && name != ManifestName &&
+		(errors.Is(err, ErrNotFound) || errors.Is(err, errForbidden)):
+		// AN OPERATOR'S OWN SOURCE THAT HAS NONE FOR THIS MACHINE is read from
+		// manifest.json, which Usable and the policy then judge; both attempts are
+		// named if that fails too.
+		first := err
+		name, bundle = ManifestName, BundleName
+
+		if body, err = c.get(ctx, c.Source.BaseURL+"/"+name, MaxManifestBytes); err != nil {
+			// ONLY THE FALLBACK'S OWN FAILURE IS WRAPPED: a 404 before it must not
+			// make a 500 after it read as absence.
+			err = fmt.Errorf("%w (and before it: %s)", err, first.Error())
+		}
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -245,9 +358,13 @@ func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 	var signature []byte
 
 	if p.Required {
-		signature, err = c.get(ctx, c.Source.BaseURL+"/"+BundleName, MaxBundleBytes)
+		signature, err = c.get(ctx, c.Source.BaseURL+"/"+bundle, MaxBundleBytes)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			switch {
+			case errors.Is(err, ErrNotFound) && c.Source.official:
+				return nil, fmt.Errorf("imagesource: could not tell whether %s signed %s: %s was not "+
+					"found: %v", c.Source.BaseURL, name, bundle, err)
+			case errors.Is(err, ErrNotFound):
 				return nil, fmt.Errorf("imagesource: this source requires a signature and %s "+
 					"publishes none: %w", c.Source.BaseURL, err)
 			}
@@ -279,6 +396,10 @@ func (c *Client) get(ctx context.Context, url string, limit int64) ([]byte, erro
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, url)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: %s answered %s", errForbidden, url, resp.Status)
 	}
 
 	if resp.StatusCode != http.StatusOK {

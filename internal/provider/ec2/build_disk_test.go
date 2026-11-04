@@ -22,11 +22,11 @@ func TestTheBuilderRootIsSized(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	if _, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
@@ -63,16 +63,16 @@ func TestTheBuilderRootIsSized(t *testing.T) {
 func TestAnExplicitBuilderDiskIsWhatIsRequested(t *testing.T) {
 	t.Parallel()
 
-	const want = 64
+	const want = 80
 
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	if _, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: want,
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
@@ -113,11 +113,11 @@ func TestABuilderDiskTooSmallForTheImageIsRefusedBeforeAnyLaunch(t *testing.T) {
 			b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 			f := newFakeEC2(t)
-			f.respond = b.reply
+			f.respond = b.serve(f)
 
 			p := newTestProvider(t, f, nil)
 
-			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+			_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: tc.gib,
 				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
@@ -143,26 +143,26 @@ func TestABuilderDiskTooSmallForTheImageIsRefusedBeforeAnyLaunch(t *testing.T) {
 	}
 }
 
-// THE SCRIPT LOOKS BEFORE IT INSTALLS, because growing an EBS volume does not
-// grow the filesystem on it.
+// THE BOOTSTRAP LOOKS BEFORE THE BUILD STARTS, because growing an EBS volume
+// does not grow the filesystem on it.
 //
 // cloud-init's growpart runs in the `init` stage and user data in `final`, so it
 // should already have happened — but that is an ordering somebody else owns, and
-// the failure if it did not is dpkg complaining about disk space with nothing
-// naming the volume.
+// the failure if it did not is an install hours in complaining about disk space
+// with nothing naming the volume.
 func TestTheScriptRefusesToProvisionOntoADiskThatDidNotGrow(t *testing.T) {
 	t.Parallel()
 
-	script := mustScript(t)
+	script := mustBootstrap(t)
 
 	lines := strings.Split(script, "\n")
 
 	check := lineOf(t, lines, "billet_free_kib=$(df -Pk /")
-	apt := firstLineOf(t, lines, "apt-get -o DPkg::Lock::Timeout=600 update")
+	fetch := firstLineOf(t, lines, "curl -fsSL --retry 5")
 
-	if check >= apt {
-		t.Errorf("the free-space check is at line %d and the first apt transaction at %d; "+
-			"checking after installing is checking after the failure", check, apt)
+	if check >= fetch {
+		t.Errorf("the free-space check is at line %d and the payload is fetched at %d; "+
+			"checking after the build starts is checking after the failure", check, fetch)
 	}
 
 	// THE THRESHOLD IS THE CONSTANT, not a number typed twice. A script asserting
@@ -195,7 +195,7 @@ func TestTheScriptRefusesToProvisionOntoADiskThatDidNotGrow(t *testing.T) {
 func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 	t.Parallel()
 
-	const baseGiB = 64
+	const baseGiB = 90
 
 	for _, tc := range []struct {
 		name    string
@@ -204,7 +204,7 @@ func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 	}{
 		// AN UNSET SIZE ADAPTS. Somebody whose base AMI declares a large root and
 		// who passes no flag had a working build before this; refusing it would
-		// have told them to pass at least `--builder-disk 64` for a flag they
+		// have told them to pass at least `--builder-disk 90` for a flag they
 		// never used, about a number the default chose for them.
 		{name: "the default, under a large base image", ask: 0},
 		// AN EXPLICIT ONE IS REFUSED, because they typed it and are present to
@@ -221,7 +221,7 @@ func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 
 			p := newTestProvider(t, f, nil)
 
-			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+			_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: tc.ask,
 				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
@@ -263,14 +263,14 @@ func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 func TestTheBaseImageFloorSurvivesTheLayoutCache(t *testing.T) {
 	t.Parallel()
 
-	const baseGiB = 64
+	const baseGiB = 90
 
 	f := newFakeEC2(t)
 	f.respond = builderImageWithRoot(t, baseGiB)
 
 	p := newTestProvider(t, f, nil)
 
-	spec := BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	spec := BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: baseGiB - 1,
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}
@@ -305,6 +305,57 @@ func builderImageWithRoot(t *testing.T, gib int) func(string, url.Values) (int, 
 		}
 
 		return 0, ""
+	}
+}
+
+// AN IMAGE BILLET BUILT IS NOT A BASE: its bootstrap would refuse it, and refusing
+// it here saves the builder. The tag is what says so.
+func TestABuildFromAnImageBilletBuiltIsRefusedBeforeLaunch(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		tags   string
+		refuse bool
+	}{
+		{tags: "", refuse: false},
+		{tags: `<item><key>Name</key><value>noble</value></item>`, refuse: false},
+		{tags: `<item><key>` + amiContractTag + `</key><value>4</value></item>`, refuse: true},
+		{tags: `<item><key>` + amiBuiltByTag + `</key><value>billet v0.9.0</value></item>`, refuse: true},
+		{tags: `<item><key>` + amiComponentsTag + `</key><value></value></item>`, refuse: true},
+	} {
+		f := newFakeEC2(t)
+		f.respond = func(action string, _ url.Values) (int, string) {
+			if action == "DescribeImages" {
+				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+					`<imageId>ami-base</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<rootDeviceType>ebs</rootDeviceType>` +
+					`<blockDeviceMapping><item><deviceName>/dev/xvda</deviceName><ebs>` +
+					`<deleteOnTermination>true</deleteOnTermination><volumeSize>8</volumeSize>` +
+					`</ebs></item></blockDeviceMapping><tagSet>` + tc.tags + `</tagSet>` +
+					`</item></imagesSet></DescribeImagesResponse>`
+			}
+
+			if action == "RunInstances" {
+				return http.StatusInternalServerError, "<Response><Errors><Error><Code>Stop</Code>" +
+					"<Message>the test ends here</Message></Error></Errors></Response>"
+			}
+
+			return 0, ""
+		}
+
+		p := newTestProvider(t, f, nil)
+
+		_, err := p.launchBuilder(t.Context(), BuildSpec{BaseImage: "ami-base", InstanceType: "c7i.4xlarge",
+			Name: "test-image"}, "#!/bin/sh\n")
+
+		refused := err != nil && strings.Contains(err.Error(), "is an image billet built")
+		if refused != tc.refuse {
+			t.Errorf("tags %q: refused %v, want %v (%v)", tc.tags, refused, tc.refuse, err)
+		}
+
+		if launched := f.countOf("RunInstances"); (launched == 0) != tc.refuse {
+			t.Errorf("tags %q: %d launches, refuse %v", tc.tags, launched, tc.refuse)
+		}
 	}
 }
 

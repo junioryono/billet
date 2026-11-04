@@ -3326,3 +3326,22 @@ func TestSweepHandsOffOnePurgeOfDiscardedStorage(t *testing.T) {
 		t.Errorf("a sweep after the purge finished handed off %d in all, want 2", len(pending))
 	}
 }
+
+// A LAUNCH CARRIES ITS TIER'S ARCHITECTURE TO THE PROVIDER, which holds the launch
+// to it: EC2 refuses an AMI of the other one and buys only shapes of it (ADR-022).
+func TestALaunchCarriesItsTiersArchitecture(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	tier := dockerSpec()
+	tier.Arch = config.ArchARM64
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), tier, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if len(p.launched) != 1 || p.launched[0].Arch != config.ArchARM64 {
+		t.Fatalf("launched %+v, want one launch of arm64", p.launched)
+	}
+}
