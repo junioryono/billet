@@ -2,12 +2,15 @@ package ceph
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -71,13 +74,27 @@ func TestACompactionHoldsWhatItsSourceHolds(t *testing.T) {
 		}
 	}
 
-	name := func(part string) string { return fmt.Sprintf("%s/cache-v-realcompaction-%s", pool, part) }
+	// NAMED FOR THIS INVOCATION, and removed only once this invocation made them, so a
+	// second run against the pool can neither collide with this one nor delete its images.
+	nonce := make([]byte, 8)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("read a nonce: %v", err)
+	}
+	name := func(part string) string { return fmt.Sprintf("%s/billet-test-%x-%s", pool, nonce, part) }
 	parent, child, copied, compacted := name("parent"), name("child"), name("copied"), name("compacted")
 	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Minute)
+		defer cancel()
+
+		// Children first, and every image is tried whatever became of another.
 		for _, image := range []string{compacted, copied, child, parent} {
+			if err := exec.CommandContext(ctx, "rbd", "info", image).Run(); err != nil {
+				continue
+			}
 			for _, args := range [][]string{{"snap", "purge", image}, {"rm", image}} {
-				out, err := exec.Command("rbd", args...).CombinedOutput()
-				t.Logf("cleanup rbd %v: %v: %s", args, err, out)
+				if out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput(); err != nil {
+					t.Errorf("could not remove this test's image %s (rbd %v): %v: %s", image, args, err, out)
+				}
 			}
 		}
 	})

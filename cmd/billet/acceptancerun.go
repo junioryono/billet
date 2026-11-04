@@ -28,10 +28,6 @@ import (
 // because the failure mode this command exists to avoid is compute left billing
 // after a run nobody watched.
 
-// acceptanceRunSealReason is what a run's seal says, and how the next run knows a
-// seal for its own.
-const acceptanceRunSealReason = "billet acceptance run"
-
 const (
 	// acceptanceSettle is how long a service must stay up before `run` believes it
 	// started. It is not readiness — that is the server's own `--dry-run`-free
@@ -109,7 +105,7 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 
 	dir := filepath.Dir(ws.ConfigPath)
 
-	if err := reopenAfterAnEarlierRun(ctx, env, ws); err != nil {
+	if err := refuseASealedWorkspace(ctx, ws); err != nil {
 		return err
 	}
 
@@ -202,19 +198,18 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	return errors.Join(waitErr, proofErr, downErr)
 }
 
-// reopenAfterAnEarlierRun lifts the seal an earlier `billet acceptance run` left on
-// this workspace, and refuses to start under anyone else's.
+// refuseASealedWorkspace stops a run before it starts anything on a deployment that
+// is sealed, which an earlier run with --no-teardown leaves behind. Otherwise the run
+// starts its services and waits out --wait with a listener saying the deployment is
+// no longer taking new work, assigned nothing (2026-10-25).
 //
-// A RUN SEALS WHAT IT PROVES CLEAR, and with --no-teardown that seal stays in the
-// ledger for the next run. That run then started its services and waited out
-// --wait with a listener saying the deployment was no longer taking new work, so
-// no job was ever assigned (2026-10-25). Only this command's own seal is lifted:
-// an operator's drain says something this command cannot overrule, and a seal
-// whose reason cannot be read is not known to be this command's.
+// IT WRITES NOTHING, and lifts no seal, not even a run's own. Another run may still be
+// draining this workspace behind that seal, and a drain an operator ran over it reads
+// the same. `billet resume` is a person's statement that neither holds.
 //
 // BEFORE THE SERVER STARTS, because a refusal here has nothing to tear down. A
 // workspace with no ledger has never run and has no seal, and is left without one.
-func reopenAfterAnEarlierRun(ctx context.Context, env cli.Env, ws acceptanceWorkspace) error {
+func refuseASealedWorkspace(ctx context.Context, ws acceptanceWorkspace) error {
 	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
 	if _, err := os.Stat(state.LedgerPath(stateDir)); errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -234,26 +229,11 @@ func reopenAfterAnEarlierRun(ctx context.Context, env cli.Env, ws acceptanceWork
 		return fmt.Errorf("read admission: %w", err)
 	}
 
-	if !current.Sealed() {
-		return nil
-	}
-
-	if current.Mode != state.AdmissionSealed || current.Provenance != state.ProvenanceOperator ||
-		current.Reason != acceptanceRunSealReason {
+	if current.Sealed() {
 		return fmt.Errorf("this workspace's deployment is sealed (%q, by %q), and a run on a sealed "+
-			"deployment is assigned nothing. `billet resume --config %s` reopens it",
-			current.Reason, current.Actor, ws.ConfigPath)
+			"deployment is assigned nothing. If nothing is still draining it, "+
+			"`billet resume --config %s` reopens it", current.Reason, current.Actor, ws.ConfigPath)
 	}
-
-	if _, err := db.Resume(ctx, state.ResumeRequest{
-		Expect: current.Generation,
-		Clears: state.ProvenanceOperator,
-		Actor:  fleetops.Actor(env),
-	}); err != nil {
-		return fmt.Errorf("lift the seal an earlier run left: %w", err)
-	}
-
-	fmt.Fprintf(env.Stdout, "Reopened this workspace's deployment: an earlier run sealed it.\n")
 
 	return nil
 }
@@ -280,7 +260,7 @@ func proveAcceptanceComputeClear(
 		return false, fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := fleetops.TakeTheSeal(ctx, env, db, current, acceptanceRunSealReason)
+	sealed, err := fleetops.TakeTheSeal(ctx, env, db, current, "billet acceptance run")
 	if err != nil {
 		return false, fmt.Errorf("seal this run: %w", err)
 	}

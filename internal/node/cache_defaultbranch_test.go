@@ -353,7 +353,7 @@ func TestACompletedJobThatWillNotPublishSaysWhy(t *testing.T) {
 		{name: "an authority that is not proven", authority: unproven,
 			want: []string{"will not publish", "proven=false", "publish_default=true"}},
 		{name: "a session already closing", authority: publishingAuthority(), closing: true,
-			want: []string{"will not publish", "already closing"}},
+			want: []string{"recorded no publication", "already closing"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -386,7 +386,8 @@ func TestACompletedJobThatWillNotPublishSaysWhy(t *testing.T) {
 		if err := service.SettleCompleted(t.Context(), instance, true, publishingAuthority()); err != nil {
 			t.Fatalf("SettleCompleted = %v", err)
 		}
-		if strings.Contains(said.String(), "will not publish") {
+		if strings.Contains(said.String(), "will not publish") ||
+			strings.Contains(said.String(), "recorded no publication") {
 			t.Errorf("an authorised job's log says it will not publish: %s", said.String())
 		}
 	})

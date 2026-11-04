@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/ops/fleetops"
@@ -35,50 +36,55 @@ func TestAWorkspaceTooLongForTheNodeIsRefusedBeforeAnythingIsMade(t *testing.T) 
 	}
 }
 
-// A RUN REOPENS ONLY THE SEAL AN EARLIER RUN LEFT. With --no-teardown that seal
-// stays in the ledger, and the next run was assigned nothing for its whole --wait
-// (2026-10-25); anyone else's seal is not this command's to overrule.
-func TestARunReopensOnlyTheSealAnEarlierRunLeft(t *testing.T) {
+// A RUN REFUSES A SEALED WORKSPACE, AND LIFTS NOTHING. With --no-teardown a run's
+// seal stays in the ledger, and the next run was assigned nothing for its whole
+// --wait (2026-10-25). Its own seal is refused like any other: another run may still
+// be draining behind it, and an operator's drain over it leaves it reading the same.
+func TestARunRefusesASealedWorkspaceAndLiftsNothing(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name    string
-		reason  string
-		wantErr string
-		sealed  bool
-		said    string
-	}{
-		{name: "an earlier run's", reason: acceptanceRunSealReason, said: "an earlier run sealed it"},
-		{name: "an operator's", reason: "a maintenance window", sealed: true, wantErr: "billet resume --config"},
-		{name: "a teardown's", reason: "billet acceptance down", sealed: true, wantErr: "billet resume --config"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, reason := range []string{"billet acceptance run", "a maintenance window", "billet acceptance down"} {
+		t.Run(reason, func(t *testing.T) {
 			t.Parallel()
 
 			ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
-			stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
-			ledgertest.Seed(t, stateDir)
+			ledgertest.Seed(t, filepath.Join(filepath.Dir(ws.ConfigPath), "server"))
 
 			var out bytes.Buffer
-			env := cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}
-			sealWith(t, env, ws, tc.reason)
-			out.Reset()
+			sealWith(t, cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, ws, reason)
+			before := admissionOf(t, ws)
 
-			err := reopenAfterAnEarlierRun(t.Context(), env, ws)
-			if tc.wantErr == "" && err != nil {
-				t.Fatalf("reopen = %v", err)
+			err := refuseASealedWorkspace(t.Context(), ws)
+			if err == nil || !strings.Contains(err.Error(), "billet resume --config") ||
+				!strings.Contains(err.Error(), reason) {
+				t.Fatalf("refuse = %v, want a refusal naming the seal and the way out", err)
 			}
-			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr) ||
-				!strings.Contains(err.Error(), tc.reason)) {
-				t.Fatalf("reopen = %v, want a refusal naming the seal and %q", err, tc.wantErr)
-			}
-			if !strings.Contains(out.String(), tc.said) {
-				t.Errorf("said %q, want %q", out.String(), tc.said)
-			}
-			if got := admissionOf(t, ws).Sealed(); got != tc.sealed {
-				t.Errorf("sealed = %v, want %v", got, tc.sealed)
+			if after := admissionOf(t, ws); !after.Sealed() || after.Generation != before.Generation {
+				t.Errorf("admission moved from %+v to %+v; a refusal writes nothing", before, after)
 			}
 		})
+	}
+}
+
+// THE RUN ITSELF ASKS, before anything it would have to tear down exists. Driven
+// through runAcceptance, since a refusal nothing calls refuses nothing.
+func TestARunOnASealedWorkspaceStartsNothing(t *testing.T) {
+	t.Parallel()
+
+	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
+	ledgertest.Seed(t, filepath.Join(filepath.Dir(ws.ConfigPath), "server"))
+
+	var out bytes.Buffer
+	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}
+	sealWith(t, env, ws, "billet acceptance run")
+	out.Reset()
+
+	err := runAcceptance(t.Context(), env, ws, acceptanceRunOptions{jobs: 1, wait: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "billet resume --config") {
+		t.Fatalf("run = %v, want the refusal", err)
+	}
+	if strings.Contains(out.String(), "started billet") {
+		t.Errorf("a refused run started a service:\n%s", out.String())
 	}
 }
 
@@ -89,9 +95,8 @@ func TestAWorkspaceThatHasNeverRunIsLeftWithoutALedger(t *testing.T) {
 
 	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
 
-	var out bytes.Buffer
-	if err := reopenAfterAnEarlierRun(t.Context(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, ws); err != nil {
-		t.Fatalf("reopen = %v", err)
+	if err := refuseASealedWorkspace(t.Context(), ws); err != nil {
+		t.Fatalf("refuse = %v", err)
 	}
 	ledger := state.LedgerPath(filepath.Join(filepath.Dir(ws.ConfigPath), "server"))
 	if _, err := os.Stat(ledger); !os.IsNotExist(err) {
@@ -99,24 +104,20 @@ func TestAWorkspaceThatHasNeverRunIsLeftWithoutALedger(t *testing.T) {
 	}
 }
 
-// AN OPEN DEPLOYMENT IS LEFT ALONE: every write bumps admission's generation, so
-// an unchanged one proves nothing was written.
-func TestAnOpenDeploymentIsNotReopened(t *testing.T) {
+// AN OPEN DEPLOYMENT RUNS, and nothing is written: every write bumps admission's
+// generation.
+func TestAnOpenDeploymentIsNotRefused(t *testing.T) {
 	t.Parallel()
 
 	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
 	ledgertest.Seed(t, filepath.Join(filepath.Dir(ws.ConfigPath), "server"))
 	before := admissionOf(t, ws)
 
-	var out bytes.Buffer
-	if err := reopenAfterAnEarlierRun(t.Context(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, ws); err != nil {
-		t.Fatalf("reopen = %v", err)
+	if err := refuseASealedWorkspace(t.Context(), ws); err != nil {
+		t.Fatalf("refuse = %v", err)
 	}
 	if after := admissionOf(t, ws); after.Generation != before.Generation {
 		t.Errorf("generation moved from %d to %d on an open deployment", before.Generation, after.Generation)
-	}
-	if out.Len() != 0 {
-		t.Errorf("said %q about a deployment nothing happened to", out.String())
 	}
 }
 

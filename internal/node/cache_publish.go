@@ -378,13 +378,16 @@ func (s *CacheService) SettleCompleted(
 	if session == nil {
 		return nil
 	}
-	// EVERY WAY OUT THAT PUBLISHES NOTHING SAYS SO. A completed job's writes are
+	// EVERY WAY OUT THAT RECORDS NOTHING SAYS SO. A completed job's writes are
 	// discarded with the session, so without these a publication that never
 	// happened leaves no line at all: a default-branch job on an EC2 tier published
 	// nothing on 2026-10-25, and its node's log could not say which of these held.
+	//
+	// A CLOSING SESSION IS NOT ONE THAT WILL NOT PUBLISH: an intent an earlier
+	// completion recorded still publishes in its cleanup. Only this one adds nothing.
 	if session.closing.Load() {
-		s.log.Info("a completed job's caches will not publish: its session is already closing",
-			"instance", instance)
+		s.log.Info("a completion recorded no publication: its session is already closing, "+
+			"and what an earlier one recorded stands", "instance", instance)
 
 		return nil
 	}
