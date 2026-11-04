@@ -379,10 +379,9 @@ func TestAFullBufferDoesNotWedge(t *testing.T) {
 
 // sendRecorder is the node's log route, answering from a script.
 type sendRecorder struct {
-	mu      sync.Mutex
-	script  []int
-	bodies  [][]byte
-	retries []string
+	mu     sync.Mutex
+	script []int
+	bodies [][]byte
 }
 
 func (s *sendRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -478,7 +477,7 @@ func TestTheShipperDoesWhatTheNodeSays(t *testing.T) {
 			}
 
 			close(s.queue)
-			s.sendAll(context.Background(), context.Background())
+			s.sendAll(t.Context(), t.Context())
 
 			if got := !s.senderStopped(); got != tc.goesOn {
 				t.Errorf("%s: the sender went on: %t, want %t", name, got, tc.goesOn)

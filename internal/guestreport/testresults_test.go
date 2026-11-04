@@ -322,7 +322,6 @@ func TestABatchNamesCasesOnlyWhenItCarriesThem(t *testing.T) {
 	if !reflect.DeepEqual(got.Cases, withCases.Cases) {
 		t.Errorf("the cases read back %+v", got.Cases)
 	}
-
 }
 
 func mustInflate(t *testing.T, data []byte) string {

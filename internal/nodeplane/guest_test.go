@@ -470,8 +470,9 @@ func TestALogChunkCrossesTheWire(t *testing.T) {
 	}
 }
 
-// A CONTROL PLANE WITH NO INDEX REFUSES FOR GOOD, or a node would try the same chunk forever.
-func TestAPlaneWithNoIndexRefusesAChunk(t *testing.T) {
+// A CONTROL PLANE WITH NO INDEX SAYS IT COULD NOT TAKE A CHUNK, and the node tries again: its next
+// registration says whether there is an index to ship to at all.
+func TestAPlaneWithNoIndexCouldNotTakeAChunk(t *testing.T) {
 	t.Parallel()
 
 	_, base := serve(t, &fakeStore{})
@@ -482,9 +483,11 @@ func TestAPlaneWithNoIndexRefusesAChunk(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// NOT A REFUSAL, which a node takes as for good and marks past: an index can come back under the
+	// id the node still holds.
 	status, refusal := postAs(t, base, "/v1/nodes/n1/logs", "current", body)
-	if status != http.StatusBadRequest || refusal.Code != nodeapi.CodeRefused {
-		t.Errorf("answered %d %+v, want refused", status, refusal)
+	if status != http.StatusServiceUnavailable || refusal.Code == nodeapi.CodeRefused {
+		t.Errorf("answered %d %+v, want could-not-tell", status, refusal)
 	}
 }
 

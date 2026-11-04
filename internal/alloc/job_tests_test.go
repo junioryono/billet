@@ -287,6 +287,9 @@ func TestAnIgnoredReportSuppliesNoTestResults(t *testing.T) {
 		t.Errorf("a retry added test results to the report that was kept: %v", err)
 	}
 
+	// A FLEET OF ITS OWN: the first holds its one slot.
+	a = quarantineFleet(t, &now)
+
 	with := busyLease(t, a)
 	if err := a.RecordGuestReport(t.Context(), with.ID, with.Epoch, aReportWithTests(1)); err != nil {
 		t.Fatalf("RecordGuestReport: %v", err)

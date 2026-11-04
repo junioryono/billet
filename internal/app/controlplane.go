@@ -290,8 +290,6 @@ type Controller struct {
 	// recorder is the flight recorder, or nil when server.flight_recorder is
 	// off; a nil one records nothing.
 	recorder *flightrecorder.Recorder
-	// logIndex is the index of what jobs wrote, nil where no tier keeps its logs.
-	logIndex *state.LogIndex
 
 	// self is the address BecomeController made this Controller at. The proofs
 	// name their controller by address, so a copy, or a Controller overwritten
@@ -311,12 +309,6 @@ type Controller struct {
 func (c *Controller) Close() []error {
 	errs := c.loops.Wait()
 	settleRecorder(c.recorder, c.cp.db.LeadershipLost())
-
-	if c.logIndex != nil {
-		if err := c.logIndex.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
 
 	return errs
 }
@@ -468,11 +460,17 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 		if err != nil {
 			slog.Warn("this control plane has no index of job logs, so nothing new is searchable", "error", err)
 		} else {
-			c.logIndex, logIndexID = index, index.ID()
+			logIndexID = index.ID()
 			wireOpts = append(wireOpts, withLogIndex(newLogIndexSink(index, cp.allocator)))
 
+			// CLOSED WHEN THIS ENDS, with the wire: a chunk arriving after that is told it could
+			// not be kept, and its node ships it again.
 			c.loops.Background("log index retention", func(ctx context.Context) {
 				retainLogIndex(ctx, index, limits, slog.Default())
+
+				if err := index.Close(); err != nil {
+					slog.Warn("could not close the index of job logs", "error", err)
+				}
 			})
 		}
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
+	"github.com/junioryono/billet/internal/peercred"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 )
@@ -226,7 +227,7 @@ func TestALineReachesASearchAndReadsBack(t *testing.T) {
 func socketConfig(t *testing.T) *config.Config {
 	t.Helper()
 
-	dir, err := os.MkdirTemp("", "b")
+	dir, err := os.MkdirTemp("", "b") //nolint:usetesting // a Unix socket's path has a bound that t.TempDir's long name passes
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +253,7 @@ func TestTheOperatorSocketIsTheOperators(t *testing.T) {
 
 	cfg := socketConfig(t)
 
-	ln, err := listenOperator(cfg)
+	ln, err := listenOperator(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("listenOperator: %v", err)
 	}
@@ -288,13 +289,18 @@ func TestTheOperatorSocketIsTheOperators(t *testing.T) {
 	conn := <-accepted
 	defer conn.Close()
 
-	uid, known, err := peerUID(conn.(*net.UnixConn))
-	if err != nil || !known || uid != os.Geteuid() {
-		t.Errorf("the peer is %d, known %t, %v; want this process's own user", uid, known, err)
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		t.Fatalf("accepted a %T", conn)
+	}
+
+	uid, err := peercred.UID(unixConn)
+	if err != nil || uid != os.Geteuid() {
+		t.Errorf("the peer is %d, %v; want this process's own user", uid, err)
 	}
 
 	// A SOCKET LEFT BEHIND IS REPLACED, and anything else at the name stands.
-	if _, err := listenOperator(cfg); err != nil {
+	if _, err := listenOperator(t.Context(), cfg); err != nil {
 		t.Errorf("a socket left behind: %v", err)
 	}
 
@@ -302,7 +308,7 @@ func TestTheOperatorSocketIsTheOperators(t *testing.T) {
 	if err := os.WriteFile(operatorSocketPath(other), []byte("mine"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := listenOperator(other); err == nil {
+	if _, err := listenOperator(t.Context(), other); err == nil {
 		t.Error("a file at the socket's name was replaced")
 	}
 }
@@ -344,14 +350,13 @@ func TestAReadOfAJobTheLedgerHoldsNoneOfIsRefused(t *testing.T) {
 	if err == nil || errors.Is(err, ErrNoController) || !strings.Contains(err.Error(), "404") {
 		t.Errorf("a job the ledger holds none of: %v", err)
 	}
-
 }
 
 // ANOTHER USER'S CONNECTION IS CLOSED BEFORE IT IS SERVED, and the listener goes on to the next.
 func TestAnotherUsersConnectionIsRefused(t *testing.T) {
 	t.Parallel()
 
-	ln, err := listenOperator(socketConfig(t))
+	ln, err := listenOperator(t.Context(), socketConfig(t))
 	if err != nil {
 		t.Fatalf("listenOperator: %v", err)
 	}
@@ -371,7 +376,9 @@ func TestAnotherUsersConnectionIsRefused(t *testing.T) {
 		}
 	}()
 
-	refused, err := net.Dial("unix", ln.Addr().String())
+	var dialer net.Dialer
+
+	refused, err := dialer.DialContext(t.Context(), "unix", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +394,7 @@ func TestAnotherUsersConnectionIsRefused(t *testing.T) {
 
 	allow.Store(true)
 
-	kept, err := net.Dial("unix", ln.Addr().String())
+	kept, err := dialer.DialContext(t.Context(), "unix", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

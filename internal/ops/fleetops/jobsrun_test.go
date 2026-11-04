@@ -112,7 +112,7 @@ func TestTheJobsJSONRecordCarriesItsWholeLife(t *testing.T) {
 	}
 
 	want := jobJSON{
-		Lease: rec.LeaseID, RunID: 600, GitHubRunID: 700,
+		Lease: rec.LeaseID, RunID: 600, GitHubRunID: 700, Tests: testsJSON{Notice: guestBanner},
 		LaunchedAt: "t-launched", RegisteredAt: "t-registered", CustodyAt: "t-custody",
 		TeardownAt: "t-teardown", QuarantinedAt: "t-quarantined", RunnerID: 91,
 		LaunchIncarnation: "process-launch", HolderIncarnation: "process-held",

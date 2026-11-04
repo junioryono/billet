@@ -38,10 +38,10 @@ func aLogStore(t *testing.T, limits JobLogLimits) *JobLogStore {
 }
 
 // aChunkOf is an encoded chunk of the given lines.
-func aChunkOf(t *testing.T, seq uint64, step int64, lines ...string) (*joblog.Chunk, []byte) {
+func aChunkOf(t *testing.T, seq uint64, lines ...string) (*joblog.Chunk, []byte) {
 	t.Helper()
 
-	c := &joblog.Chunk{Seq: seq, Step: step, StepName: "Test"}
+	c := &joblog.Chunk{Seq: seq, StepName: "Test"}
 	for _, text := range lines {
 		c.Lines = append(c.Lines, joblog.Line{AtMillis: 1_760_000_000_000, Text: text})
 	}
@@ -57,7 +57,7 @@ func aChunkOf(t *testing.T, seq uint64, step int64, lines ...string) (*joblog.Ch
 func keepChunk(t *testing.T, s *JobLogStore, lease string, seq uint64, lines ...string) {
 	t.Helper()
 
-	c, data := aChunkOf(t, seq, 0, lines...)
+	c, data := aChunkOf(t, seq, lines...)
 	if err := s.Keep(lease, c, data); err != nil {
 		t.Fatalf("Keep: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestALeaseNotHeldSaysSo(t *testing.T) {
 			t.Errorf("a read of %q was not refused", lease)
 		}
 
-		c, data := aChunkOf(t, 1, 0, "line")
+		c, data := aChunkOf(t, 1, "line")
 		if err := s.Keep(lease, c, data); err == nil {
 			t.Errorf("a chunk for %q was kept", lease)
 		}
@@ -137,14 +137,14 @@ func TestAReadStopsAtItsBounds(t *testing.T) {
 func TestAJobPastItsBudgetIsRefused(t *testing.T) {
 	t.Parallel()
 
-	_, first := aChunkOf(t, 1, 0, "line")
+	_, first := aChunkOf(t, 1, "line")
 	limits := logLimits()
 	limits.MaxJobBytes = int64(len(first)) + 1
 	s := aLogStore(t, limits)
 
 	keepChunk(t, s, logLease, 1, "line")
 
-	c, data := aChunkOf(t, 2, 0, "another")
+	c, data := aChunkOf(t, 2, "another")
 	if err := s.Keep(logLease, c, data); !errors.Is(err, ErrJobLogBudget) {
 		t.Errorf("past the budget: %v", err)
 	}
@@ -379,7 +379,7 @@ func TestAnEvictedLeaseIsNotNumberedAfresh(t *testing.T) {
 	now = now.Add(2 * time.Hour)
 	s.evictPass()
 
-	c, data := aChunkOf(t, 2, 0, "new")
+	c, data := aChunkOf(t, 2, "new")
 	if err := s.Keep(logLease, c, data); !errors.Is(err, ErrJobLogBudget) {
 		t.Errorf("an evicted lease answered %v, want its budget spent", err)
 	}
@@ -415,7 +415,7 @@ func TestTheNodesBoundHoldsOnArrival(t *testing.T) {
 
 	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
 
-	_, data := aChunkOf(t, 1, 0, "one")
+	_, data := aChunkOf(t, 1, "one")
 	limits := logLimits()
 	limits.MaxBytes = int64(len(data)) + 1
 
@@ -427,7 +427,7 @@ func TestTheNodesBoundHoldsOnArrival(t *testing.T) {
 
 	// THE DISK IS THE BOUND, so a chunk waits for what was evicted to be deleted, and is asked for
 	// again rather than refused.
-	first, firstData := aChunkOf(t, 1, 0, "one")
+	first, firstData := aChunkOf(t, 1, "one")
 	if err := s.Keep(other, first, firstData); !errors.Is(err, ErrJobLogRoom) {
 		t.Fatalf("a chunk needing room answered %v", err)
 	}
@@ -444,7 +444,7 @@ func TestTheNodesBoundHoldsOnArrival(t *testing.T) {
 		t.Errorf("%d bytes held past a bound of %d", s.total+s.sweeping, limits.MaxBytes)
 	}
 
-	c, large := aChunkOf(t, 2, 0, "a longer line than the bound leaves room for")
+	c, large := aChunkOf(t, 2, "a longer line than the bound leaves room for")
 	if err := s.Keep(other, c, large); !errors.Is(err, ErrJobLogBudget) {
 		t.Errorf("a chunk past the node's bound answered %v", err)
 	}
@@ -461,7 +461,7 @@ func TestAChunkPublishedByAFailedInstallCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c, data := aChunkOf(t, 1, 0, "one", "two")
+	c, data := aChunkOf(t, 1, "one", "two")
 	if err := os.WriteFile(filepath.Join(dir, chunkName(0, 1, 2)), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestAChunkPublishedByAFailedInstallCounts(t *testing.T) {
 		t.Fatalf("a retry of a chunk already in place answered %v", err)
 	}
 
-	next, nextData := aChunkOf(t, 2, 0, "three")
+	next, nextData := aChunkOf(t, 2, "three")
 	if err := s.Keep(logLease, next, nextData); err != nil {
 		t.Fatalf("Keep: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestAChunkPublishedByAFailedInstallCounts(t *testing.T) {
 	}
 
 	// OTHER BYTES UNDER ITS NAME ARE NOT THIS CHUNK, which is not kept.
-	lying, lyingData := aChunkOf(t, 3, 0, "four")
+	lying, lyingData := aChunkOf(t, 3, "four")
 	if err := os.WriteFile(filepath.Join(dir, chunkName(3, 3, 1)), []byte("other"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -538,7 +538,7 @@ func postLog(t *testing.T, service *CacheService, token string, data []byte) *ht
 func TestALogIsKeptOnlyForATierThatAsked(t *testing.T) {
 	t.Parallel()
 
-	_, data := aChunkOf(t, 1, 0, "line")
+	_, data := aChunkOf(t, 1, "line")
 
 	service, token := logSession(t, false)
 	if got := guestHello(t, service, token).Body.String(); strings.Contains(got, `"logs"`) {
@@ -575,7 +575,7 @@ func TestTheLogRouteRefusesWhatItShould(t *testing.T) {
 		t.Errorf("junk answered %d: %s", response.Code, response.Body.String())
 	}
 
-	_, data := aChunkOf(t, 1, 0, "line")
+	_, data := aChunkOf(t, 1, "line")
 	if got := postLog(t, service, "not-a-bearer", data).Code; got != http.StatusUnauthorized {
 		t.Errorf("a stranger's chunk answered %d, want 401", got)
 	}
@@ -621,7 +621,7 @@ func TestASpentJobIsToldBeforeItsBodyIsRead(t *testing.T) {
 	service, token := logSession(t, true)
 	service.JobLogs().limits.MaxJobBytes = 1
 
-	_, data := aChunkOf(t, 1, 0, "line")
+	_, data := aChunkOf(t, 1, "line")
 	service.JobLogs().mu.Lock()
 	service.JobLogs().leases[logLease] = &leaseLog{seqs: map[uint64]bool{}, bytes: int64(len(data)), newest: time.Now()}
 	service.JobLogs().mu.Unlock()
@@ -642,7 +642,7 @@ func TestLogChunksDoNotTakeAReportsSlot(t *testing.T) {
 		service.guestDecode <- struct{}{}
 	}
 
-	_, data := aChunkOf(t, 1, 0, "line")
+	_, data := aChunkOf(t, 1, "line")
 	if got := postLog(t, service, token, data).Code; got != http.StatusNoContent {
 		t.Errorf("with every report slot taken a chunk answered %d", got)
 	}
@@ -651,7 +651,7 @@ func TestLogChunksDoNotTakeAReportsSlot(t *testing.T) {
 		service.logDecode <- struct{}{}
 	}
 
-	_, again := aChunkOf(t, 2, 0, "line")
+	_, again := aChunkOf(t, 2, "line")
 	if got := postLog(t, service, token, again).Code; got != http.StatusTooManyRequests {
 		t.Errorf("with every log slot taken a chunk answered %d", got)
 	}
@@ -835,7 +835,7 @@ func TestTheRouteWaitsWhileRoomIsMade(t *testing.T) {
 
 	service, token := logSession(t, true)
 
-	_, data := aChunkOf(t, 1, 0, "line")
+	_, data := aChunkOf(t, 1, "line")
 	store := service.JobLogs()
 
 	store.mu.Lock()
@@ -872,7 +872,7 @@ func TestASweepThatFailedGivesNoRoomBack(t *testing.T) {
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:errcheck // the temporary directory's own removal says what is left
 
 	now = now.Add(2 * time.Hour)
 	s.evictPass()
@@ -914,7 +914,7 @@ func TestAnUnreadableEvictedLeaseCountsAsAWholeJob(t *testing.T) {
 	if err := os.Chmod(path, 0o100); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(path, 0o700) }) //nolint:errcheck // the temporary directory's own removal says what is left
 
 	s, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
 	if err != nil {
@@ -943,14 +943,14 @@ func TestAnUnreadableLeaseDoesNotStopTheStore(t *testing.T) {
 	if err := os.Chmod(path, 0); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(path, 0o700) }) //nolint:errcheck // the temporary directory's own removal says what is left
 
 	s, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("one unreadable lease stopped the store: %v", err)
 	}
 
-	c, data := aChunkOf(t, 1, 0, "line")
+	c, data := aChunkOf(t, 1, "line")
 	if err := s.Keep(logLease, c, data); !errors.Is(err, ErrJobLogBudget) {
 		t.Errorf("an unreadable lease answered %v", err)
 	}
@@ -969,7 +969,7 @@ func TestAReadCommandAsksTheStore(t *testing.T) {
 	t.Parallel()
 
 	service, token := logSession(t, true)
-	_, data := aChunkOf(t, 1, 0, "line")
+	_, data := aChunkOf(t, 1, "line")
 	if got := postLog(t, service, token, data).Code; got != http.StatusNoContent {
 		t.Fatalf("a chunk answered %d", got)
 	}

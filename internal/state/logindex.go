@@ -189,7 +189,7 @@ func createLogDay(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // after a commit there is nothing to roll back, and a failure leaves the transaction to the connection's close
 
 	for _, stmt := range logIndexSchema {
 		if err := logIndexExec(ctx, tx, stmt); err != nil {
@@ -246,7 +246,7 @@ func (x *LogIndex) Add(ctx context.Context, c LogIndexChunk) error {
 	if err != nil {
 		return fmt.Errorf("state: begin a log index write: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // after a commit there is nothing to roll back, and a failure leaves the transaction to the connection's close
 
 	at := c.ReceivedAt.UnixMilli()
 

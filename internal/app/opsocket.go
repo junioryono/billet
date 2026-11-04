@@ -19,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
+	"github.com/junioryono/billet/internal/peercred"
 )
 
 // The operator socket: how a command run on the controller's host reaches what only the
@@ -70,12 +71,12 @@ func (l *peerListener) Accept() (net.Conn, error) {
 
 		unix, ok := conn.(*net.UnixConn)
 		if ok {
-			uid, known, err := peerUID(unix)
-			if err == nil && known && l.allowed(uid) {
+			uid, err := peercred.UID(unix)
+			if err == nil && l.allowed(uid) {
 				return conn, nil
 			}
 
-			l.log.Warn("refused a connection to the operator socket from another user", "known", known, "error", err)
+			l.log.Warn("refused a connection to the operator socket from another user", "error", err)
 		}
 
 		_ = conn.Close()
@@ -84,7 +85,7 @@ func (l *peerListener) Accept() (net.Conn, error) {
 
 // listenOperator opens the socket. A failure is said and costs operators this one way in,
 // never the control plane: nothing that schedules goes through it.
-func listenOperator(cfg *config.Config) (*peerListener, error) {
+func listenOperator(ctx context.Context, cfg *config.Config) (*peerListener, error) {
 	path := operatorSocketPath(cfg)
 
 	// A SOCKET AN EARLIER CONTROLLER LEFT. Anything else at the name is not ours: Listen
@@ -95,7 +96,9 @@ func listenOperator(cfg *config.Config) (*peerListener, error) {
 		}
 	}
 
-	ln, err := net.Listen("unix", path)
+	var listen net.ListenConfig
+
+	ln, err := listen.Listen(ctx, "unix", path)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +136,7 @@ type operatorServer struct {
 // serveOperator serves the socket until ctx ends. A failure to listen is said and ends
 // only this.
 func serveOperator(ctx context.Context, cfg *config.Config, server *operatorServer) {
-	ln, err := listenOperator(cfg)
+	ln, err := listenOperator(ctx, cfg)
 	if err != nil {
 		server.log.Warn("the operator socket is not served, so a command on this host cannot read a job's log "+
 			"through this control plane", "error", err)
