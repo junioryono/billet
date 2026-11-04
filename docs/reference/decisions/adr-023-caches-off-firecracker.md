@@ -86,4 +86,4 @@ An older EC2 node refuses a launch that names a guest cache, which would fail ev
 
 ## What is not proved here
 
-The live conformance run on EC2, which needs a repository the deployment serves, and what a real `actions/cache` restore costs from GitHub on the same instance. The probes' record says what stands in for it.
+The live conformance run on EC2, which needs a repository whose workflows use the caches, and what a real `actions/cache` restore costs from GitHub on the same instance. The probes' record says what stands in for it, and what one job that used no cache has shown.

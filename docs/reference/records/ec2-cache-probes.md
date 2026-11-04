@@ -79,6 +79,21 @@ GitHub's store gave this host about 54 to 64 MiB/s on 8 streams. A volume per ar
 - Three 7-byte blocks rejoined into one archive, in the order committed rather than staged.
 - The eviction pass's own listings and reads, multipart listing included, under the grant the node holds: `s3:ListBucketMultipartUploads` carries no prefix condition, and the object half's `s3:DeleteObject` is on its own names and never on a state object.
 
+## One job through the whole boot, on 2026-11-04
+
+A `c7i.2xlarge` launched from an image of this contract, by a node at wire 38 under the deployment-scoped policy `billet init iam` renders, ran one job that used no cache: it held the runner for four minutes on an untrusted tier with a repository scope and `publish: default-branch`.
+
+| From launch | What had happened |
+|---|---|
+| 3 s | the instance was launched, 1 s of it the runner's registration |
+| about 85 s | `cloud-final` began, 72 s after the kernel started |
+| about 140 s | the runner connected to GitHub, about 53 s into the entry point, which includes creating and attaching the Docker store, restarting Docker on it, the relay and the probe |
+| 145 s | GitHub assigned the job |
+
+The job succeeded. Its completion proved the run to the repository's default branch, the Docker store was unchanged and was discarded with no snapshot, the instance terminated, and no volume or snapshot was left. No line in the boot output reported a failed relay or a node that did not answer.
+
+This is not comparable with the 48 to 59 seconds in [AWS acceptance](aws-acceptance.md), which was a smaller image than GitHub's full template and attached no cache. How much of the difference each accounts for was not measured.
+
 ## What this does not prove
 
 - That a real restore is faster than GitHub's. The stand-in above is GitHub's storage, not GitHub's cache call; the live run is owed and belongs to the conformance record.
