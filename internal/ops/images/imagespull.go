@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
@@ -59,20 +60,24 @@ const DefaultKernelDir = config.DefaultKernelDir
 type generationPublisher interface {
 	ImportCompletedGeneration(
 		ctx context.Context,
-		image, rawPath, runnerVersion, kernel, guestContract string,
+		image, rawPath, machine, runnerVersion, kernel, guestContract string,
 		components *ceph.GenerationComponents,
 		now time.Time,
 	) (string, error)
 	ImportCompletionRoot(
 		ctx context.Context,
-		image, rawPath, runnerVersion, kernel, guestContract, owner string,
+		image, rawPath, machine, runnerVersion, kernel, guestContract, owner string,
 		now time.Time,
 	) (string, error)
+	SweepGenerationMaps(ctx context.Context) error
+	LearnArchitectures(ctx context.Context, image string) ([]ceph.ArchLearned, error)
+	CheckImportArch(ctx context.Context, image, machine string) error
 }
 
-// openGenerationPublisher builds the cluster client this config names.
+// openGenerationPublisher builds the cluster client this config names, holding
+// the host's generation-map lock the node's own read-only maps are taken under.
 var openGenerationPublisher = func(cfg *config.Config) (generationPublisher, error) {
-	return ceph.New(*cfg.Node.Ceph)
+	return ceph.New(*cfg.Node.Ceph, app.GenerationMapLock(cfg)...)
 }
 
 // kernelInstaller is the durable install the pull performs before it publishes.
@@ -184,6 +189,11 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if image == "" {
+		if only, err := onlyOtherMachinesTiers(cfg); err == nil && only {
+			return fmt.Errorf("billet images pull: no image name given, and every firecracker tier on "+
+				"this node is another machine's than this %s host's, so it boots no image here", hostArch())
+		}
+
 		return errors.New("billet images pull: no image name given and no firecracker tier " +
 			"names one")
 	}
@@ -194,6 +204,31 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	if strings.Contains(image, "@") {
 		return fmt.Errorf("billet images pull: %q names a generation, and a pull assigns its "+
 			"own; give the image name alone", image)
+	}
+
+	if err := refuseImageOfAnotherMachine(cfg, image); err != nil {
+		return err
+	}
+
+	store, err := openGenerationPublisher(cfg)
+	if err != nil {
+		return err
+	}
+
+	// BEFORE ANYTHING IS DOWNLOADED: an import the image's generations refuse is
+	// known now, and a refresh that would meet it every day costs a gigabytes-long
+	// download each time otherwise. The import judges again under the publish lock.
+	//
+	// EXCEPT ON A NODE THAT HAS NOT REGISTERED, whose first pull must still install
+	// the kernel it needs to start, which imports nothing: there it is said, and the
+	// pull goes on.
+	if err := learnImageArchitectures(ctx, env, store, image); err != nil {
+		if _, acceptErr := acceptedComponents(cfg); !errors.Is(acceptErr, errAcceptanceUnknown) {
+			return err
+		}
+
+		fmt.Fprintf(env.Stdout, "warning: %v; this node has not registered, so the pull goes on to "+
+			"install the kernel it needs to start, and any import judges again\n", err)
 	}
 
 	manifest, dir, cleanup, err := stageImage(ctx, env, cfg, stageOptions{
@@ -243,11 +278,6 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	raw, err := unpackRootfs(ctx, env, manifest, dir)
-	if err != nil {
-		return err
-	}
-
-	store, err := openGenerationPublisher(cfg)
 	if err != nil {
 		return err
 	}
@@ -318,7 +348,7 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 				return "", fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
 			}
 
-			return store.ImportCompletionRoot(ctx, image, raw, manifest.RunnerVersion,
+			return store.ImportCompletionRoot(ctx, image, raw, manifest.Arch, manifest.RunnerVersion,
 				kernelFileName(manifest), manifest.GuestContract, cfg.Node.Name, time.Now())
 		}
 
@@ -405,8 +435,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 
 	fmt.Fprintf(env.Stdout, "importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
 
-	generation, err := store.ImportCompletedGeneration(ctx, image, raw, manifest.RunnerVersion,
-		kernelFileName(manifest), manifest.GuestContract, components, time.Now())
+	generation, err := store.ImportCompletedGeneration(ctx, image, raw, manifest.Arch,
+		manifest.RunnerVersion, kernelFileName(manifest), manifest.GuestContract, components, time.Now())
 	if err != nil {
 		return err
 	}
@@ -445,6 +475,94 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "The kernel it is paired with is kept at:\n\n    %s\n\n", kernel)
 	fmt.Fprintln(env.Stdout, "Point node.firecracker.kernel_image at that path. The two are a matched pair,")
 	fmt.Fprintln(env.Stdout, "and a guest booted with a different kernel fails in the middle of somebody's job.")
+
+	return nil
+}
+
+// refuseImageOfAnotherMachine refuses to pull image on this host unless every
+// Firecracker tier that names it in this node's image pool runs on this host's
+// machine (ADR-022): a pull imports this host's architecture, so an x64 refresh at
+// a site with arm64 tiers never seeds ubuntu-2404-arm64 with x64 bytes, the first
+// import included, which no generation of the image is there yet to refuse. Tiers
+// naming one image with two architectures are refused on every host, since one
+// image holds one. A tier of another site is another pool's; one pinned to
+// another node of this site shares this one.
+func refuseImageOfAnotherMachine(cfg *config.Config, image string) error {
+	var machines []string
+
+	for i := range cfg.Tiers {
+		tier := &cfg.Tiers[i]
+		if !tier.AcceptsProvider(config.ProviderFirecracker) || tier.Arch == "" {
+			continue
+		}
+
+		if cfg.Node != nil && tier.Site != "" && tier.Site != cfg.Node.Site {
+			continue
+		}
+
+		if name, _, _ := strings.Cut(tier.ImageFor(config.ProviderFirecracker), "@"); name != image {
+			continue
+		}
+
+		if machine := tier.Arch.Machine(); !slices.Contains(machines, machine) {
+			machines = append(machines, machine)
+		}
+	}
+
+	switch {
+	case len(machines) > 1:
+		return fmt.Errorf("billet images pull: the tiers that name %s run on %s, and one image holds "+
+			"one architecture; give the tiers of each architecture an image of their own, such as "+
+			"ubuntu-2404-arm64", image, strings.Join(machines, " and "))
+	case len(machines) == 1 && machines[0] != hostArch():
+		return fmt.Errorf("billet images pull: the tiers that name %s run on %s, and this host is %s, "+
+			"so it imports nothing into it; pull it on a node of that architecture, or name an image "+
+			"of this one's", image, machines[0], hostArch())
+	default:
+		return nil
+	}
+}
+
+// learnImageArchitectures sweeps the read-only generation maps a crash left on this
+// host, reads the architecture of each generation of image that records none
+// (ADR-022), and refuses the pull when the import it would make is one the
+// image's generations refuse: an import is refused unless every generation the
+// image holds is known to be of its own machine, which is this host's.
+//
+// A GENERATION THAT CANNOT BE READ IS SAID HERE, with why, and the refusal that
+// follows names the remedies. A sweep that could not unmap is a warning, since what
+// it leaves is a mapping, not a decision.
+func learnImageArchitectures(ctx context.Context, env cli.Env, store generationPublisher, image string) error {
+	if err := store.SweepGenerationMaps(ctx); err != nil {
+		fmt.Fprintf(env.Stdout, "warning: the read-only generation maps a crash may have left on this "+
+			"host were not swept: %v\n", err)
+	}
+
+	learned, learnErr := store.LearnArchitectures(ctx, image)
+
+	for _, l := range learned {
+		switch {
+		case l.Err != nil:
+			fmt.Fprintf(env.Stdout, "%s@%s records no architecture, and it could not be read from it: %v\n",
+				image, l.Generation, l.Err)
+		case l.Recorded:
+			fmt.Fprintf(env.Stdout, "%s@%s recorded no architecture; read %s from it and recorded it\n",
+				image, l.Generation, l.Machine)
+		default:
+			fmt.Fprintf(env.Stdout, "%s@%s records no architecture; read %s from it and did not record "+
+				"it: %v\n", image, l.Generation, l.Machine, l.NotRecorded)
+		}
+	}
+
+	if learnErr != nil {
+		return fmt.Errorf("billet images pull: learning the architectures of %s's generations failed, "+
+			"so nothing was downloaded: %w", image, learnErr)
+	}
+
+	if err := store.CheckImportArch(ctx, image, hostArch()); err != nil {
+		return fmt.Errorf("billet images pull: nothing was downloaded, because an import into %s "+
+			"would be refused: %w", image, err)
+	}
 
 	return nil
 }
@@ -607,7 +725,17 @@ func stageImage(
 	// Present from the first release rather than added later, because the seam it
 	// needs is the one being built right now.
 	if from != "" {
-		data, err := os.ReadFile(filepath.Join(from, imagesource.ManifestName))
+		// THE MANIFEST NAMED FOR THIS MACHINE, as a release names it, or else the
+		// one manifest.json a directory of an operator's own may hold, which Usable
+		// then judges (ADR-022).
+		manifestName, bundleName := imagesource.ManifestNamesFor(hostArch())
+
+		data, err := os.ReadFile(filepath.Join(from, manifestName))
+		if errors.Is(err, os.ErrNotExist) && manifestName != imagesource.ManifestName {
+			manifestName, bundleName = imagesource.ManifestName, imagesource.BundleName
+			data, err = os.ReadFile(filepath.Join(from, manifestName))
+		}
+
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("billet images pull: cannot read a manifest in %s: %w",
 				from, err)
@@ -629,12 +757,12 @@ func stageImage(
 		var signature []byte
 
 		if policy.Required {
-			signature, err = os.ReadFile(filepath.Join(from, imagesource.BundleName))
+			signature, err = os.ReadFile(filepath.Join(from, bundleName))
 			if err != nil {
 				return nil, "", nil, fmt.Errorf("billet images pull: %s holds no %s, and this "+
 					"source requires a signature. Copy it from the release alongside the "+
 					"manifest, or pass --skip-signature-verification if this directory is "+
-					"trusted by other means: %w", from, imagesource.BundleName, err)
+					"trusted by other means: %w", from, bundleName, err)
 			}
 		}
 
@@ -724,7 +852,7 @@ func resolveImageManifest(
 		return nil, nil, err
 	}
 
-	client := &imagesource.Client{Source: src}
+	client := imageClient(src)
 	if err := client.Resolve(ctx); err != nil {
 		return nil, nil, err
 	}
@@ -748,7 +876,7 @@ func resolveImageManifest(
 		return nil, nil, err
 	}
 
-	fmt.Fprintf(env.Stdout, "fetching %s\n", src.ManifestURL())
+	fmt.Fprintf(env.Stdout, "fetching the %s guest image's manifest from %s\n", hostArch(), src.BaseURL)
 
 	if policy.Required {
 		fmt.Fprintf(env.Stdout, "requiring a signature from %s\n", policy.Identity)
@@ -762,6 +890,12 @@ func resolveImageManifest(
 	}
 
 	return manifest, client, nil
+}
+
+// imageClient is the client a pull fetches src's image through: the image named
+// for this host's machine (ADR-022).
+func imageClient(src imagesource.Source) *imagesource.Client {
+	return &imagesource.Client{Source: src, Machine: hostArch()}
 }
 
 // sideloadPolicy decides what a directory on disk must prove.
@@ -866,16 +1000,9 @@ func unpackRootfs(ctx context.Context, env cli.Env, manifest *imagesource.Manife
 //
 // TRANSLATED FROM GO'S NAMES, which are not uname's: Go calls x86-64 "amd64" and
 // aarch64 "arm64". A manifest records what `uname -m` says, because that is what
-// the build recorded.
-func hostArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x86_64"
-	case "arm64":
-		return "aarch64"
-	default:
-		return runtime.GOARCH
-	}
+// the build recorded. A variable so a test can stand on either machine.
+var hostArch = func() string {
+	return config.HostMachine(runtime.GOARCH)
 }
 
 // installKernel copies the pulled kernel somewhere it will outlive the pull.

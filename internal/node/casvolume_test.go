@@ -934,3 +934,39 @@ func TestAFailedCASAttachIsNotRetriedUntilTheBackoffPasses(t *testing.T) {
 			"inside the backoff and one after it", len(storage.keys), storage.created)
 	}
 }
+
+// A PUBLICATION THAT FINDS ITS KEY'S WRITER HELD WAITS FOR A LATER PASS rather
+// than being abandoned: the jobs of one run end together, and abandoned, every
+// one but the first lost its writes (#689).
+func TestAPublicationWhoseWriterIsHeldWaitsItsTurn(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{heldRefusals: 1, heldHolder: "billet-other/go"}
+	service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	ours := "our object"
+	if got := casRequest(t, service, token, http.MethodPut, "/v1/cas/go/cas/"+digestOf(ours), ours); got.Code != http.StatusOK {
+		t.Fatalf("PUT = %d %s", got.Code, got.Body.String())
+	}
+	if err := service.SettleCompleted(t.Context(), instance, true, dispatch.CacheAuthority{}); err != nil {
+		t.Fatalf("SettleCompleted: %v", err)
+	}
+	if err := service.Close(t.Context(), instance); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if storage.published != 0 || storage.discarded != 0 {
+		t.Fatalf("with the writer held, the pass published %d and discarded %d, want neither",
+			storage.published, storage.discarded)
+	}
+
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if storage.published != 1 || storage.current != "next" {
+		t.Fatalf("the next pass published %d and current is %q, want the job's writes published",
+			storage.published, storage.current)
+	}
+}

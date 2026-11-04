@@ -1,13 +1,13 @@
 ---
 name: billet-shell-gates
-description: "Load before editing any .sh file, any Go that emits shell, or any pipeline whose exit status is a verdict: scripts/*.sh, the guest image and kernel builds, the EC2 provisioning script and AMI verifier, the CodeBuild buildspec, the toolcache installers, the guest launcher; and when a build passed a check it should have failed, or a gate refused a correct artifact."
+description: "Load before editing any .sh file, any Go that emits shell, or any pipeline whose exit status is a verdict: scripts/*.sh, the guest image and kernel builds, the EC2 AMI build (scripts/ami, its bootstrap and layer) and AMI verifier, the CodeBuild buildspec, the guest launcher; and when a build passed a check it should have failed, or a gate refused a correct artifact."
 ---
 
 # Shell that has to be able to fail
 
 ## What this area is
 
-billet's shell lives in `scripts/` (guest image, guest kernel, release, install, rehearsals), in `internal/runnerimages/install-toolcache.sh` (sourced by both the guest build and the EC2 builder), and in Go that renders shell: `internal/provider/ec2/build.go` (the provisioning script), `internal/provider/codebuild/buildspec.go`, the tart and firecracker guest launchers. Every one of them contains gates whose whole purpose is to end a build, and every rule below is a way one of those gates computed the right answer and then let the build succeed.
+billet's shell lives in `scripts/` (guest image, guest kernel, the AMI build in `scripts/ami`, release, install, rehearsals), and in Go that renders shell: `internal/provider/ec2/build.go` and `amibuild.go` (the AMI build's layer and bootstrap), `internal/provider/ec2/verifyscript.go`, `internal/provider/codebuild/buildspec.go`, the tart and firecracker guest launchers. Every one of them contains gates whose whole purpose is to end a build, and every rule below is a way one of those gates computed the right answer and then let the build succeed.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -30,12 +30,12 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A prefix assignment on a shell FUNCTION call persists after the call in dash and zsh.**
 - **A recap is parsed from the recap rows alone, and the pass's status is captured under `pipefail`.**
 
-### Builders, user data and installers: [references/builds-and-installers.md](references/builds-and-installers.md)
+### Builders, user data and the AMI build: [references/builds-and-installers.md](references/builds-and-installers.md)
 
 - **A probe on the development Mac is not evidence about the builder.**
-- **EC2 user data is 16384 bytes and base64 is the wrong way to spend it.**
-- **The toolcache installers are one file with one seam.**
-- **Every toolcache vendor spells the architecture differently, and the record has three states.**
+- **EC2 user data is 16384 bytes, so the AMI build travels in S3 and user data is a bootstrap.**
+- **The AMI build is the template runner on the builder itself, and it resumes across the template's reboot (ADR-022).**
+- **A unit cloud-init starts and a later boot resumes is wanted by `cloud-init.target`, never `multi-user.target`.**
 - **Vendored scripts are pinned to LF.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
@@ -46,11 +46,11 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 ## Where the tests are
 
-- `scripts/scripts_test.go`, `scripts/kernel_gate_test.go`, `scripts/guest_image_pipefail_test.go` and the other `scripts/guest_image_*_test.go` files execute the scripts against passing and failing fixtures.
+- `scripts/scripts_test.go`, `scripts/kernel_gate_test.go`, `scripts/ami_build_test.go` and the `scripts/guest_image_*_test.go` files execute the scripts against passing and failing fixtures.
 - `internal/provider/codebuild/buildspec_test.go` parses the buildspec and runs its commands under `/bin/sh`.
-- `internal/provider/ec2/build_freespace_test.go`, `internal/provider/ec2/toolcache_gate_test.go`, `internal/provider/ec2/payload_test.go` (the user-data budget).
+- `internal/provider/ec2/build_freespace_test.go`, `internal/provider/ec2/amibuild_test.go` (the bootstrap, the payload, the verdict), `internal/provider/ec2/verifyscript_test.go` (the verifier, executed).
 - `internal/provider/tart/realguest_test.go` measures the launcher delivery in a real guest.
 
 ## Related skills
 
-`billet-guest-images` (what the gates protect), `billet-providers-aws` (the buildspec and provisioning script), `billet-providers-local` (the guest launcher), `billet-testing` (execute, do not pattern-match).
+`billet-guest-images` (what the gates protect), `billet-providers-aws` (the buildspec and the AMI build), `billet-providers-local` (the guest launcher), `billet-testing` (execute, do not pattern-match).

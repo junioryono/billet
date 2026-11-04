@@ -31,9 +31,22 @@ type inspectingRegistry struct {
 
 	withdrawn   []int64
 	withdrawErr error
+	// lookup is how long an inspection takes to answer, unless its context ends
+	// first, as a slow GitHub's would.
+	lookup time.Duration
 }
 
-func (r *inspectingRegistry) InspectRunner(_ context.Context, name string, _ int64) (RunnerState, error) {
+func (r *inspectingRegistry) InspectRunner(ctx context.Context, name string, _ int64) (RunnerState, error) {
+	if r.lookup > 0 {
+		select {
+		case <-ctx.Done():
+			r.asked++
+			r.askedFor = append(r.askedFor, name)
+
+			return RunnerState{}, ctx.Err()
+		case <-time.After(r.lookup):
+		}
+	}
 	state, err := r.script(name)
 	if id, known := r.githubIDs[name]; err == nil && state.Present && state.ID == 0 && known {
 		state.ID = id

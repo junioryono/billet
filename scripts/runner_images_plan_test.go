@@ -17,9 +17,17 @@ import (
 	"testing"
 )
 
-// updatePlan rewrites scripts/runner-images/plan.json from the vendored template
-// instead of comparing against it: `go test ./scripts -run Plan -update-plan`.
-var updatePlan = flag.Bool("update-plan", false, "rewrite scripts/runner-images/plan.json")
+// updatePlan rewrites scripts/runner-images/plan.json and plan-arm64.json from the
+// vendored templates instead of comparing against them:
+// `go test ./scripts -run Plan -update-plan`.
+var updatePlan = flag.Bool("update-plan", false, "rewrite scripts/runner-images/plan*.json")
+
+// templatePlans are the vendored templates billet runs and the plan each derives:
+// x64's for the guest and the AMI on x86-64, arm64's for both on arm64 (ADR-022).
+var templatePlans = []struct{ template, plan string }{
+	{"build.ubuntu-24_04.pkr.hcl", "plan.json"},
+	{"build.ubuntu-24_04-arm64.pkr.hcl", "plan-arm64.json"},
+}
 
 const runnerImagesDir = "runner-images"
 
@@ -332,11 +340,10 @@ func repoPath(t *testing.T, s string) string {
 	return clean
 }
 
-func vendoredTemplate(t *testing.T) string {
+func vendoredTemplateNamed(t *testing.T, name string) string {
 	t.Helper()
 
-	raw, err := os.ReadFile(filepath.Join(runnerImagesDir, "upstream", "images", "ubuntu", "templates",
-		"build.ubuntu-24_04.pkr.hcl"))
+	raw, err := os.ReadFile(filepath.Join(runnerImagesDir, "upstream", "images", "ubuntu", "templates", name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,25 +356,27 @@ func vendoredTemplate(t *testing.T) string {
 func TestTheRunnerImagesPlanIsTheTemplates(t *testing.T) {
 	t.Parallel()
 
-	var want bytes.Buffer
-	encoder := json.NewEncoder(&want)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(readTemplatePlan(t, vendoredTemplate(t))); err != nil {
-		t.Fatal(err)
-	}
-	planPath := filepath.Join(runnerImagesDir, "plan.json")
-	if *updatePlan {
-		if err := os.WriteFile(planPath, want.Bytes(), 0o600); err != nil {
+	for _, tp := range templatePlans {
+		var want bytes.Buffer
+		encoder := json.NewEncoder(&want)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(readTemplatePlan(t, vendoredTemplateNamed(t, tp.template))); err != nil {
 			t.Fatal(err)
 		}
-	}
-	got, err := os.ReadFile(planPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want.Bytes()) {
-		t.Fatalf("%s is not what the vendored template says; rerun with -update-plan and review "+
-			"the difference", planPath)
+		planPath := filepath.Join(runnerImagesDir, tp.plan)
+		if *updatePlan {
+			if err := os.WriteFile(planPath, want.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := os.ReadFile(planPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want.Bytes()) {
+			t.Fatalf("%s is not what %s says; rerun with -update-plan and review the difference",
+				planPath, tp.template)
+		}
 	}
 }
 
@@ -375,7 +384,8 @@ func TestTheRunnerImagesPlanIsTheTemplates(t *testing.T) {
 // elsewhere, verified there; the runner reads them from that one copy, because a
 // second copy of the declaration is one that can disagree with it.
 var sharedFiles = map[string]string{
-	"images/ubuntu/toolsets/toolset-2404.json": "../internal/runnerimages/toolset-2404.json",
+	"images/ubuntu/toolsets/toolset-2404.json":       "../internal/runnerimages/toolset-2404.json",
+	"images/ubuntu/toolsets/toolset-2404-arm64.json": "../internal/runnerimages/toolset-2404-arm64.json",
 }
 
 // EVERY STEP'S FILES ARE VENDORED: a script the plan runs that is not in the tree
@@ -383,7 +393,11 @@ var sharedFiles = map[string]string{
 func TestEveryPlannedFileIsVendored(t *testing.T) {
 	t.Parallel()
 
-	for _, step := range readTemplatePlan(t, vendoredTemplate(t)) {
+	var steps []planStep
+	for _, tp := range templatePlans {
+		steps = append(steps, readTemplatePlan(t, vendoredTemplateNamed(t, tp.template))...)
+	}
+	for _, step := range steps {
 		if step.Download {
 			continue
 		}

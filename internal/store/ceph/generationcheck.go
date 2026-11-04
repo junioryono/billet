@@ -104,8 +104,9 @@ func (c *Client) generationHandle(ctx context.Context, key, generation string) (
 //
 // UNDER ONE SLOT, so every read-only generation mapping on this host while the
 // slot is held is this call's: a map that failed (the kernel can finish one
-// after the command's bound) is cleaned up by unmapping them all, and the
-// sweep in Evict can do the same for what a crash left behind.
+// after the command's bound) is cleaned up by unmapping them all in handle's
+// pool, and the sweeps (Evict's of the cache pool, a pull's of the image pool)
+// can do the same for what a crash left behind.
 func (c *Client) withGenerationMap(
 	ctx context.Context, handle, snapshot string, fn func(device string) error,
 ) error {
@@ -115,6 +116,7 @@ func (c *Client) withGenerationMap(
 	}
 	defer release()
 
+	pool, _, _ := strings.Cut(handle, "/")
 	spec := handle + "@" + snapshot
 	out, err := c.rbdMap(ctx, spec, "--read-only")
 	device := strings.TrimSpace(string(out))
@@ -123,16 +125,17 @@ func (c *Client) withGenerationMap(
 			err = fmt.Errorf("%s answered %s, which is not a device path", c.bin, bounded(device))
 		}
 
-		return errors.Join(fmt.Errorf("ceph: map %s read-only: %w", spec, err), c.unmapGenerationMaps(ctx))
+		return errors.Join(fmt.Errorf("ceph: map %s read-only: %w", spec, err),
+			c.unmapGenerationMaps(ctx, pool))
 	}
 
 	return errors.Join(fn(device), c.unmapDevice(ctx, device, spec))
 }
 
 // unmapGenerationMaps unmaps every read-only mapping of a generation's snapshot
-// in the cache pool. Called with checkSlot held, under a context of its own,
-// because it cleans up after a caller that may have given up.
-func (c *Client) unmapGenerationMaps(ctx context.Context) error {
+// in pool. Called with checkSlot held, under a context of its own, because it
+// cleans up after a caller that may have given up.
+func (c *Client) unmapGenerationMaps(ctx context.Context, pool string) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
 	defer cancel()
 
@@ -147,11 +150,7 @@ func (c *Client) unmapGenerationMaps(ctx context.Context) error {
 
 	var failures []error
 	for _, d := range devices {
-		// A NAME BILLET GIVES A GENERATION, EXACTLY, as every destructive pass
-		// requires: a lookalike an operator mapped by hand is not billet's to unmap.
-		kind, _, named := cacheImageName(d.Name)
-		if d.Pool != c.cfg.CachePool || !named || kind != "g" ||
-			d.Snap == "" || d.Snap == "-" || d.Device == "" {
+		if !c.generationMap(d, pool) {
 			continue
 		}
 		// NO UNMAP STARTS PAST THE BUDGET. One already started runs to its own
@@ -171,17 +170,65 @@ func (c *Client) unmapGenerationMaps(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
-// sweepGenerationMaps unmaps the read-only generation mappings a crash or a
-// failed unmap left behind, which would otherwise keep their images from ever
+// generationMap reports whether a kernel mapping is a read-only map of a
+// generation's snapshot in pool, which only withGenerationMap makes: a cache
+// generation's in the cache pool, or in the image pool a golden image's that
+// LearnArchitectures reads.
+//
+// A NAME BILLET GIVES A GENERATION, EXACTLY, as every destructive pass requires: a
+// lookalike an operator mapped by hand is not billet's to unmap. A head (`-`), which
+// an import writes through, and a completion root are neither.
+func (c *Client) generationMap(d mappedDevice, pool string) bool {
+	if d.Pool != pool || d.Snap == "" || d.Snap == "-" || d.Device == "" || d.Namespace != "" {
+		return false
+	}
+
+	switch d.Pool {
+	case c.cfg.CachePool:
+		kind, _, named := cacheImageName(d.Name)
+
+		return named && kind == "g"
+	case c.cfg.ImagePool:
+		_, isGeneration := ParseGeneration(d.Snap)
+
+		return isGeneration && checkCloneName(d.Name) == nil
+	default:
+		return false
+	}
+}
+
+// SweepGenerationMaps unmaps the read-only maps of golden-image generations a crash
+// or a failed unmap left behind, under the host's generation-map lock: a pull or
+// refresh runs it first, so a snapshot LearnArchitectures left mapped is not mapped
+// twice. The image pool alone (ADR-022): the cache's maps are Evict's. A client
+// without that lock sweeps nothing (errNoMapLock), since what it would unmap may be
+// another process's read in progress.
+func (c *Client) SweepGenerationMaps(ctx context.Context) error {
+	if c.mapLock == "" {
+		return errNoMapLock
+	}
+
+	return c.sweepGenerationMaps(ctx, c.cfg.ImagePool)
+}
+
+// GenerationMapLockPath is the file whose flock this client's read-only generation
+// maps are held under, empty for none: what a unit declares it writes, and what a
+// caller proves it was given.
+func (c *Client) GenerationMapLockPath() string {
+	return c.mapLock
+}
+
+// sweepGenerationMaps unmaps the read-only generation mappings in pool a crash or
+// a failed unmap left behind, which would otherwise keep their images from ever
 // being evicted.
-func (c *Client) sweepGenerationMaps(ctx context.Context) error {
+func (c *Client) sweepGenerationMaps(ctx context.Context, pool string) error {
 	release, err := c.holdGenerationMaps(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	return c.unmapGenerationMaps(ctx)
+	return c.unmapGenerationMaps(ctx, pool)
 }
 
 // holdGenerationMaps takes checkSlot and, when the client has one, the host's
@@ -197,10 +244,26 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 		return leaveSlot, nil
 	}
 
-	f, err := openGenerationMapLock(c.mapLock)
+	unlock, err := TakeGenerationMapLock(ctx, c.mapLock)
 	if err != nil {
 		leaveSlot()
 
+		return nil, err
+	}
+
+	return func() {
+		unlock()
+		leaveSlot()
+	}, nil
+}
+
+// TakeGenerationMapLock takes the host's generation-map lock at path, waiting for
+// another holder until ctx ends, and answers its release: what every client given
+// WithGenerationMapLock takes around a read-only generation map, and what a unit's
+// path declaration exercises.
+func TakeGenerationMapLock(ctx context.Context, path string) (func(), error) {
+	f, err := openGenerationMapLock(path)
+	if err != nil {
 		return nil, fmt.Errorf("ceph: open the generation-map lock: %w", err)
 	}
 	for {
@@ -210,7 +273,6 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) {
 			_ = f.Close()
-			leaveSlot()
 
 			return nil, fmt.Errorf("ceph: take the generation-map lock: %w", err)
 		}
@@ -220,7 +282,6 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 		case <-ctx.Done():
 			timer.Stop()
 			_ = f.Close()
-			leaveSlot()
 
 			return nil, ctx.Err()
 		case <-timer.C:
@@ -232,7 +293,6 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 		// to the open file description, and this is its only descriptor.
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck // the Close below releases it
 		_ = f.Close()
-		leaveSlot()
 	}, nil
 }
 

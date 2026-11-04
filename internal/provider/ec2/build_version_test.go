@@ -59,11 +59,11 @@ func TestARunnerVersionThatIsNotAReleaseIsRefusedBeforeAnyLaunch(t *testing.T) {
 			b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 			f := newFakeEC2(t)
-			f.respond = b.reply
+			f.respond = b.serve(f)
 
 			p := newTestProvider(t, f, nil)
 
-			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+			_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: tc.version, Name: "test-image",
 			})
@@ -101,7 +101,7 @@ func TestTheVersionsGitHubActuallyPublishesAreAccepted(t *testing.T) {
 		"2.328.0-rc.1",
 		"2.328.0+build.5",
 	} {
-		script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: version, Arch: "x64"})
+		script, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: version, Arch: "x64"})
 		if err != nil {
 			t.Fatalf("provisionScript refused the release version %q: %v", version, err)
 		}

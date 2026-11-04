@@ -1,14 +1,19 @@
 package images
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/firecracker"
+	"github.com/junioryono/billet/internal/store/ceph"
 )
 
 func TestIncompatibleGuestHasTheDocumentedRefreshExitStatus(t *testing.T) {
@@ -236,5 +241,116 @@ func TestImageResultCanRecordEveryConfiguredRefresh(t *testing.T) {
 	}
 	if string(body) != strings.Join(want, "\n")+"\n" {
 		t.Fatalf("refresh result = %q, want one image per line", body)
+	}
+}
+
+// fakeCompatibleStore answers checkImageCompatible for one exact, verified
+// generation speaking this binary's contract, resolving it with resolveErr.
+type fakeCompatibleStore struct {
+	generation string
+	resolveErr error
+	resolved   []string
+}
+
+func (f *fakeCompatibleStore) NewestVerifiedForContract(context.Context, string, string) (ceph.Generation, bool, error) {
+	return ceph.Generation{}, false, nil
+}
+
+func (f *fakeCompatibleStore) NewestForContract(context.Context, string, string) (ceph.Generation, bool, error) {
+	return ceph.Generation{}, false, nil
+}
+
+func (f *fakeCompatibleStore) NewestVerified(context.Context, string) (ceph.Generation, bool, error) {
+	return ceph.Generation{}, false, nil
+}
+
+func (f *fakeCompatibleStore) Generations(context.Context, string) ([]ceph.Generation, error) {
+	gen, _ := ceph.ParseGeneration(f.generation)
+
+	return []ceph.Generation{gen}, nil
+}
+
+func (f *fakeCompatibleStore) VerifiedGenerations(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{f.generation: true}, nil
+}
+
+func (f *fakeCompatibleStore) GuestContract(context.Context, string, string) (string, bool, error) {
+	return firecracker.GuestContract, true, nil
+}
+
+func (f *fakeCompatibleStore) ResolveGeneration(_ context.Context, image, _ string) (string, error) {
+	f.resolved = append(f.resolved, image)
+
+	return image, f.resolveErr
+}
+
+// AN EXACT PIN OF ANOTHER MACHINE'S GENERATION IS NOT COMPATIBLE, though it exists,
+// is verified and speaks this binary's contract: every launch of the tier would
+// refuse it after the upgrade committed. A record that could not be read is said
+// as could-not-tell, with no advice to move the pin; and this host's own is
+// compatible with no download.
+func TestImagesCompatibleRefusesAnExactPinOfAnotherMachine(t *testing.T) {
+	const generation = "g20260815033431"
+
+	exact := "ubuntu-2404-x64@" + generation
+
+	for _, tc := range []struct {
+		name       string
+		resolveErr error
+		want       []string
+		refused    bool
+	}{
+		{
+			name:       "another machine's",
+			resolveErr: fmt.Errorf("%w: built for aarch64", ceph.ErrOtherMachine),
+			want:       []string{"cannot be launched on this host", "update the exact pin"},
+			refused:    true,
+		},
+		{
+			name:       "a record that could not be read",
+			resolveErr: errors.New("rbd timed out"),
+			want:       []string{"could not tell whether this host can launch"},
+			refused:    true,
+		},
+		{name: "this host's"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeCompatibleStore{generation: generation, resolveErr: tc.resolveErr}
+
+			restore := openCompatibleStore
+			t.Cleanup(func() { openCompatibleStore = restore })
+			openCompatibleStore = func(*config.Config) (compatibleStore, error) { return store, nil }
+
+			var out strings.Builder
+			err := checkImageCompatible(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, &config.Config{},
+				"", exact, time.Minute)
+
+			if len(store.resolved) != 1 || store.resolved[0] != exact {
+				t.Fatalf("the command resolved %v, want the exact pin %s once", store.resolved, exact)
+			}
+
+			if !tc.refused {
+				if err != nil || !strings.Contains(out.String(), "no image download is needed") {
+					t.Fatalf("checkImageCompatible = %v (%s), want this host's pin compatible", err, out.String())
+				}
+
+				return
+			}
+
+			if err == nil {
+				t.Fatal("the pin was reported compatible")
+			}
+
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not say %q: %v", want, err)
+				}
+			}
+
+			if tc.resolveErr != nil && !errors.Is(tc.resolveErr, ceph.ErrOtherMachine) &&
+				strings.Contains(err.Error(), "update the exact pin") {
+				t.Errorf("a record that could not be read was answered with advice to move the pin: %v", err)
+			}
+		})
 	}
 }
