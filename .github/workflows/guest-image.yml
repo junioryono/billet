@@ -19,9 +19,10 @@
 # rule the AMI already follows, where the tag is the promotion. The workflow itself
 # stays on main, because every deployed binary verifies the channel's signature
 # against THIS FILE running on refs/heads/main (imagesource.PublishRef); only the
-# tree the build job checks out moves to the release. So the YAML here drives
-# scripts from an older tree, and the seam between them -- the script names and
-# the environment passed across -- is frozen by a test rather than left to drift.
+# tree the build legs check out moves to the release. So the YAML of
+# guest-image-build.yml drives scripts from an older tree, and the seam between them
+# -- the script names and the environment passed across -- is frozen by a test rather
+# than left to drift.
 # A build from main is still possible for testing a change to those scripts, and
 # it cannot publish.
 name: Guest image
@@ -63,38 +64,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build and check
-    # ON THE FLEET, because the runner-images build (#250) outgrew a hosted runner:
-    # GitHub's image is about 59GB used, and the build holds it beside its
-    # compressed copy and parts. A 16-vCPU guest with a large root disk holds that;
-    # a hosted runner's 14GB free plus what reclaiming buys does not. The tier is
-    # its own (320GiB disk) so everyday CI jobs do not grow a root that large. It is a
-    # Firecracker guest, so the build boots the image under systemd-nspawn, which
-    # needs no KVM.
-    runs-on: billet-image-builder-ubuntu-2404
+  # THE TREE IS ONE ANSWER FOR BOTH LEGS, asked once, so one release's two images are
+  # built from one commit whatever the channel does while they run.
+  resolve:
+    name: Resolve the source release
+    runs-on: ubuntu-24.04
 
     outputs:
-      tag: ${{ steps.pack.outputs.tag }}
-      # THE ARTIFACT THIS ATTEMPT UPLOADED, by id: a rerun leaves an earlier
-      # attempt's artifact of the same name on the run.
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
       source_tag: ${{ steps.source.outputs.tag }}
       source_sha: ${{ steps.source.outputs.sha }}
       source_is_release: ${{ steps.source.outputs.is_release }}
 
     permissions:
-      # A MANUALLY SELECTED BRANCH RUNS ITS OWN BUILD SCRIPTS. It gets enough to
-      # check itself out and nothing that can change the repository or mint an
-      # identity accepted by the first-party signature policy.
       contents: read
-
-    env:
-      IMAGE_NAME: ubuntu-2404-x64
-      # The raw image and the kernel are built here; PUBLISH=no keeps
-      # build-guest-image.sh from wanting a Ceph cluster it cannot have.
-      WORK: /var/tmp/billet-guest
-      PUBLISH: "no"
 
     steps:
       # THE TREE IS RESOLVED BEFORE ANYTHING IS CHECKED OUT, from the stable channel
@@ -164,349 +146,42 @@ jobs:
             echo "is_release=$is_release"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Check out the source release
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ steps.source.outputs.sha }}
-          persist-credentials: false
+  # THE x86_64 BUILD GATES THE RELEASE (ADR-022), and it keeps the names every deployed
+  # reader reads.
+  x64:
+    name: Build x86_64
+    needs: resolve
+    uses: ./.github/workflows/guest-image-build.yml
+    permissions:
+      contents: read
+    with:
+      machine: x86_64
+      runs_on: billet-image-builder-ubuntu-2404
+      image_name: ubuntu-2404-x64
+      source_tag: ${{ needs.resolve.outputs.source_tag }}
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
+      runner_version: ${{ inputs.runner_version }}
 
-      # THE BUILD WANTS MOST OF THE BUILDER'S DISK: an 80 GiB image file, a kernel
-      # source tree and the compressed outputs. Removing toolchains this build will
-      # never use buys back space, and doing it FIRST means a disk-full failure
-      # cannot happen halfway through a build that takes hours.
-      - name: Reclaim runner disk
-        run: |
-          set -euo pipefail
-
-          before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
-
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/lib/node_modules || true
-
-          # EVERY TOOLCACHE ENTRY BUT PYTHON. A billet guest image from before the
-          # passthrough moved to the system interpreter runs it on the toolcache's
-          # Python; deleting that refused every later call to the results origin,
-          # and this job's artifact upload failed with ECONNREFUSED after a
-          # two-hour build (2026-10-04).
-          if [ -d "$AGENT_TOOLSDIRECTORY" ]; then
-            sudo find "$AGENT_TOOLSDIRECTORY" -mindepth 1 -maxdepth 1 ! -name Python \
-              -exec rm -rf {} + || true
-          fi
-
-          sudo apt-get clean
-
-          after=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
-
-          echo "reclaimed $((after - before))GB; ${after}GB free"
-
-          # REFUSED EARLY RATHER THAN AT 90%. A build that runs out of disk while
-          # writing the filesystem produces a corrupt image with a successful-
-          # looking build behind it, because the write is the only step that would
-          # have complained.
-          #
-          # THE FLOOR IS DERIVED FROM SIZE_MB RATHER THAN WRITTEN HERE. It was a
-          # hard-coded 20, chosen when the image was 4GB; parity doubled the image
-          # and left the number describing an image that no longer exists. Reading
-          # it from the build script means one edit rather than two, and the two
-          # cannot drift into a check that passes for an image it cannot hold.
-          #
-          # THE IMAGE, ITS COMPRESSED FORM AND ITS PARTS can all exist at once, so
-          # the floor is the image and half again, plus a few GB for the kernel build
-          # tree and the base tarball. There is no boot check's copy here any more:
-          # a Firecracker guest has no KVM to boot one in (see below).
-          size_mb=$(sed -n 's/^SIZE_MB="\${SIZE_MB:-\([0-9]*\)}"$/\1/p' \
-            scripts/build-guest-image.sh)
-
-          if [ -z "$size_mb" ]; then
-            echo "could not read SIZE_MB out of scripts/build-guest-image.sh" >&2
-            exit 1
-          fi
-
-          needed=$(( size_mb * 3 / 2 / 1024 + 6 ))
-
-          if [ "$after" -lt "$needed" ]; then
-            echo "only ${after}GB free; a ${size_mb}M image needs about ${needed}GB here" >&2
-            echo "" >&2
-            echo "This job builds an image, compresses it, and holds a kernel tree beside" >&2
-            echo "both. The builder tier's disk is what provides that; see the ADR." >&2
-            exit 1
-          fi
-
-          echo "${after}GB free, need about ${needed}GB for a ${size_mb}M image"
-
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-
-          # debootstrap STAYS WHILE A BUILDABLE RELEASE STILL USES IT: this job
-          # checks out the stable release's tree, whose build script may be the
-          # debootstrap one until a release carries the runner-images build.
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            systemd-container xz-utils debootstrap e2fsprogs jq zstd unzip \
-            build-essential flex bison libelf-dev libssl-dev bc \
-            dnsmasq
-
-      # THE KERNEL IS CACHED ON ITS OWN INPUTS, not rebuilt weekly. It changes
-      # when its config or its version changes and at no other time, so keying the
-      # cache on exactly those two makes a normal week's build twenty minutes
-      # shorter — and makes the kernel a bit-for-bit constant across the
-      # generations that share it, rather than a fresh build each time whose
-      # differences nobody can account for.
-      #
-      # THE BUILT CONFIG IS CACHED BESIDE THE KERNEL, and it is not a nicety: the
-      # gate below reads it, and on a cache hit the build script never runs to
-      # produce one. It is also the only honest thing to check — `make
-      # olddefconfig` derives it from the committed base, so the base is where
-      # the build starts rather than what it built.
-      - name: Kernel cache
-        id: kernel-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            out/vmlinux-billet
-            out/vmlinux-billet.config
-          key: guest-kernel-${{ hashFiles('scripts/guest-kernel.config', 'scripts/build-guest-kernel.sh', 'scripts/kernel/required-builtins.txt', 'scripts/kernel/linux.pin') }}
-
-      - name: Build the guest kernel
-        if: steps.kernel-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-
-          mkdir -p out
-
-          # OUT IS A DIRECTORY, and the script writes $OUT/vmlinux-billet into
-          # it alongside the config it was built from. Passing a FILE path here
-          # would create a directory of that name and hide the kernel inside it,
-          # which the cache would then happily preserve.
-          sudo --preserve-env=OUT scripts/build-guest-kernel.sh
-        env:
-          OUT: ${{ github.workspace }}/out
-
-      # THE KERNEL GATE, AND IT RUNS ON A CACHE HIT TOO. build-guest-kernel.sh runs
-      # it as well, which covers a hand-run build — but that step is SKIPPED when
-      # the cache hits, and actions/cache saves in its post step even when a later
-      # step failed. So a kernel that failed the gate can be restored on the next
-      # run and, without this, publish without ever being checked again.
-      #
-      # BEFORE THE ROOT FILESYSTEM, which is an hour. A kernel that cannot run
-      # docker makes every image built on top of it useless.
-      - name: Check the guest kernel config
-        run: |
-          set -euo pipefail
-
-          scripts/check-guest-kernel-config.sh out/vmlinux-billet.config
-
-      - name: Build the root filesystem
-        run: |
-          set -euo pipefail
-
-          sudo --preserve-env=IMAGE_NAME,WORK,PUBLISH,RUNNER_VERSION \
-            scripts/build-guest-image.sh
-        env:
-          RUNNER_VERSION: ${{ inputs.runner_version }}
-
-      # COMPRESSED AFTER THE BUILD, NOT DURING. The digest a consumer checks is of
-      # the published bytes, so the compressed file is the artifact and its hash is
-      # computed once, here, over exactly what will be uploaded.
-      - name: Pack and describe
-        id: pack
-        run: |
-          set -euo pipefail
-
-          mkdir -p out
-
-          sudo chown "$(id -u):$(id -g)" "$WORK/$IMAGE_NAME.ext4"
-
-          # THE SOURCE MANIFEST THE IMAGE CARRIES, published beside it (#584).
-          cp "$WORK/image-sources.tsv" out/image-sources.tsv
-
-          # THE DEFAULT WINDOW, DELIBERATELY. `--long=27` compresses a little
-          # better and requires every DECOMPRESSOR to allocate a 128 MB window --
-          # a constraint on every future reader, including Go libraries that cap
-          # the window by default and would fail on an image that packed fine on
-          # the machine that made it. The few percent is not worth an asymmetry
-          # that only shows up on somebody else's node.
-          zstd -19 -T0 --force \
-            -o out/rootfs.img.zst "$WORK/$IMAGE_NAME.ext4"
-
-          # SPLIT ONLY IF IT MUST BE. A release asset must be under 2 GiB and a
-          # parity-sized image packs past that. An image that fits stays one
-          # asset and is described as schema 1, which every already deployed
-          # billet can read; only one that had to be split needs a newer reader.
-          ROOTFS_PARTS=$(scripts/split-image.sh out/rootfs.img.zst)
-          export ROOTFS_PARTS
-
-          if [ -n "$ROOTFS_PARTS" ]; then
-            echo "split into $(printf '%s\n' "$ROOTFS_PARTS" | wc -l) parts:"
-            printf '%s\n' "$ROOTFS_PARTS"
-          fi
-
-          # THE MANIFEST IS WRITTEN WHILE THE WHOLE FILE STILL EXISTS. Its
-          # load-bearing field is the digest of the reassembled image, which is
-          # what a node checks after joining the parts back together -- so it has
-          # to be taken from the unsplit artifact and can never be derived from
-          # the pieces.
-          scripts/write-image-manifest.sh > out/manifest.json
-
-          # ONLY THEN DOES THE WHOLE FILE GO. Keeping it would double the artifact
-          # handoff and the publish job's disk for a file nothing uploads: a
-          # release carries the parts.
-          if [ -n "$ROOTFS_PARTS" ]; then
-            rm -f out/rootfs.img.zst
-          fi
-
-          cat out/manifest.json
-
-          # THE NOTES ARE BUILT FROM THE MANIFEST, so they cannot describe an
-          # image other than the one being published. An earlier version passed
-          # --notes-file for a file nothing wrote, which fails the publish step
-          # after the whole build has already run.
-          {
-            echo "Guest image for billet's firecracker backend."
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Runner | \`$(jq -r .runner_version out/manifest.json)\` |"
-            echo "| Kernel | \`$(jq -r .kernel.version out/manifest.json)\` |"
-            echo "| Guest contract | \`$(jq -r .guest_contract out/manifest.json)\` |"
-            echo "| Architecture | \`$(jq -r .arch out/manifest.json)\` |"
-            echo "| Built | $(jq -r .built_at out/manifest.json) |"
-            echo "| Built from | \`$SOURCE_TAG\` (\`$SOURCE_SHA\`) |"
-            echo
-            echo "Pulled by \`billet images pull\`, which verifies the manifest"
-            echo "signature and each asset's digest before anything reaches the cluster."
-            echo
-            echo "The corresponding source of what this image carries under a GNU license"
-            echo "is published with it: \`image-sources.tar\` (in the parts"
-            echo "\`image-sources.parts\` lists, joined in order) holds every source package"
-            echo "\`image-sources.tsv\` marks \`gnu\` or \`unclassified\`, at its exact"
-            echo "version, and the Linux tarball and configuration the kernel was built"
-            echo "from; \`image-sources-index.tsv\` lists each file with its sha256. The"
-            echo "scripts that built the image are this repository at \`$SOURCE_SHA\`."
-          } > out/release-notes.md
-
-          {
-            echo "tag=guest-$(date -u +%Y%m%d-%H%M%S)"
-          } >> "$GITHUB_OUTPUT"
-        env:
-          KERNEL: ${{ github.workspace }}/out/vmlinux-billet
-          ROOTFS: ${{ github.workspace }}/out/rootfs.img.zst
-          SOURCE_TAG: ${{ steps.source.outputs.tag }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-
-      # THE CORRESPONDING SOURCE OF WHAT THE IMAGE REDISTRIBUTES, published beside it
-      # (#584, ADR-019): every source package the image's source manifest marks gnu or
-      # unclassified, at its exact version, and the Linux tarball and configuration
-      # the kernel was built from. A source that cannot be fetched and verified fails
-      # the build, because a published image without its source is what this
-      # prevents. One tar, split as the image is, because a release holds a thousand
-      # assets and the sources are more files than that; the parts list carries each
-      # part's digest for the publisher to check.
-      - name: Fetch the corresponding source
-        run: |
-          set -euo pipefail
-
-          python3 scripts/fetch-image-sources.py out/image-sources.tsv \
-            "$(jq -r .kernel.version out/manifest.json)" out/vmlinux-billet.config sources
-          cp sources/index.tsv out/image-sources-index.tsv
-          tar -C sources -cf out/image-sources.tar .
-          rm -rf sources
-
-          # THE WHOLE ARCHIVE FIRST, its sha256 and size, then each part with its
-          # sha256: the publisher joins the parts and holds them to the whole.
-          printf 'image-sources.tar %s %s\n' "$(sha256sum out/image-sources.tar | cut -d ' ' -f 1)" \
-            "$(stat -c %s out/image-sources.tar)" >out/image-sources.parts
-          parts=$(scripts/split-image.sh out/image-sources.tar)
-          if [ -n "$parts" ]; then
-            rm -f out/image-sources.tar
-            while IFS= read -r part; do
-              printf '%s %s\n' "${part##*/}" "$(sha256sum "$part" | cut -d ' ' -f 1)" >>out/image-sources.parts
-            done <<<"$parts"
-          fi
-          cat out/image-sources.parts
-
-      # THE RELEASE GATE. Nothing below this runs against an image that fails it.
-      #
-      # AN IMAGE THAT REACHES A RELEASE IS ONE EVERY DEPLOYMENT PULLS, and a bad one
-      # is not a local problem: it fans out to everybody on the next refresh, and
-      # the thing that would rebuild it is itself a guest booting the image. So the
-      # question "is this fit to publish" is asked here, before the upload, rather
-      # than discovered afterwards by somebody whose jobs stopped working.
-      #
-      # IT CHECKS CONTENTS, NOT BOOT. It cannot see an integration failure -- a
-      # kernel missing an option the userspace needs, systemd failing to bring up
-      # the network. What it catches is the silent class: a build step that failed
-      # in a way `set -e` did not notice, a tarball unpacked to the wrong place, an
-      # agent never installed, a unit present but not enabled. Those produce an
-      # image that boots perfectly and then does nothing, which is the hardest kind
-      # to diagnose from outside.
-      #
-      # The manifest is passed so the two can be cross-checked: an image whose agent
-      # speaks a different contract than the manifest advertises would be accepted
-      # by a node on the manifest's word and then produce microVMs that boot and
-      # never report.
-      - name: Check the image is fit to publish
-        run: |
-          set -euo pipefail
-
-          # SOURCES_EXPORT: the copy of the image's source manifest the release
-          # carries, which the gate holds to the image's own byte for byte.
-          sudo SOURCES_EXPORT="${{ github.workspace }}/out/image-sources.tsv" \
-            scripts/check-guest-image.sh \
-            "$WORK/$IMAGE_NAME.ext4" \
-            "${{ github.workspace }}/out/manifest.json"
-
-      # THE BOOT IS PROVED ON THE FLEET, NOT HERE. This job runs in a Firecracker
-      # guest, which has no KVM to boot another in, so the Firecracker boot this job
-      # used to make on a hosted runner cannot happen here. What proves a generation
-      # boots is what always decided whether the fleet uses it: `billet images pull
-      # --verify` on a node boots it, on a disk grown the way a launch grows one,
-      # and only a generation that passes becomes @verified. One that does not is
-      # published and never promoted, and the next reap removes it.
-      #
-      # The gate above still runs on the image's contents here, before anything is
-      # uploaded.
-
-      # THE BUILD JOB CANNOT PUBLISH. Its one handoff is an ordinary workflow
-      # artifact; the privileged job below consumes it only when this exact run is
-      # main and publication was requested. Manual inspection uses the same bytes.
-      - name: Upload the checked image
-        id: upload
-        # always() SO A FAILED GATE STILL HANDS OVER THE ARTIFACT. Without it, the
-        # one run where somebody most wants to open the image -- the one that just
-        # refused to publish it -- is the run that uploads nothing.
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: guest-image
-          # A GLOB FOR THE ROOT FILESYSTEM, because it is one file or several
-          # depending on whether it had to be split, and naming only
-          # rootfs.img.zst silently handed the publish job an artifact with no
-          # image in it -- which fails at the upload, after the whole build.
-          # publish-guest-release.sh derives what it uploads from the manifest
-          # and refuses a named asset that is not there, so a glob that matched
-          # nothing is caught rather than published.
-          path: |
-            out/manifest.json
-            out/release-notes.md
-            out/image-sources.tsv
-            out/image-sources-index.tsv
-            out/image-sources.parts
-            out/image-sources.tar*
-            out/rootfs.img.zst*
-            out/vmlinux-billet
-          # SHORT, because these are hundreds of megabytes and the default is
-          # ninety days. On a private repository that is billed storage against a
-          # quota this would exhaust within a month.
-          retention-days: 3
-          # The root filesystem is already zstd-compressed. Compressing it again
-          # spends runner minutes and produces no useful size reduction.
-          compression-level: 0
+  # THE aarch64 BUILD JOINS THE RELEASE, or the last good image is carried forward. The
+  # run is red either way when it fails, because its failing job says so.
+  arm64:
+    name: Build aarch64
+    needs: resolve
+    uses: ./.github/workflows/guest-image-build.yml
+    permissions:
+      contents: read
+    with:
+      machine: aarch64
+      runs_on: billet-image-builder-ubuntu-2404-arm64
+      image_name: ubuntu-2404-arm64
+      suffix: -aarch64
+      source_tag: ${{ needs.resolve.outputs.source_tag }}
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
+      runner_version: ${{ inputs.runner_version }}
 
   publish:
     name: Sign and publish
-    needs: build
+    needs: [resolve, x64, arm64]
     # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined, so
     # `inputs.publish` is the empty string -- and github casts both '' and false to
     # 0 when comparing across types, making that condition FALSE. MAIN ONLY also
@@ -515,7 +190,10 @@ jobs:
     # AND ONLY AN IMAGE BUILT FROM A RELEASE. A build from main is for testing the
     # build scripts; what the channel points every deployment at is a tree a
     # person promoted.
-    if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish) && needs.build.outputs.source_is_release == 'true'
+    #
+    # always() BECAUSE A NEED THAT FAILED SKIPS A JOB OTHERWISE, and aarch64 failing is
+    # the case this job has a rule for. x86_64 failing publishes nothing.
+    if: always() && needs.resolve.result == 'success' && needs.x64.result == 'success' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish) && needs.resolve.outputs.source_is_release == 'true'
     runs-on: ubuntu-24.04
 
     permissions:
@@ -533,9 +211,9 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      # ROOM FOR THE ARTIFACT. The runner-images image packs to about 20GB, and
-      # the zip and its contents exist at once, so the toolchains this job never
-      # uses go first; fetch-guest-artifact.sh proves the room before it writes.
+      # ROOM FOR THE ARTIFACTS. The runner-images image packs to about 20GB, and each
+      # zip and its contents exist at once, so the toolchains this job never uses go
+      # first; fetch-guest-artifact.sh proves the room before it writes.
       - name: Make room for the image
         run: |
           set -euo pipefail
@@ -552,8 +230,33 @@ jobs:
       - name: Download the checked image
         env:
           GH_TOKEN: ${{ github.token }}
-          GUEST_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          GUEST_ARTIFACT_ID: ${{ needs.x64.outputs.artifact_id }}
         run: scripts/fetch-guest-artifact.sh out
+
+      # A BUILD THAT SUCCEEDED WHOSE ARTIFACT CANNOT BE FETCHED FAILS THIS JOB. It is not
+      # a failed build, so nothing is carried in its place.
+      - name: Download the checked aarch64 image
+        if: needs.arm64.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GUEST_ARTIFACT_NAME: guest-image-aarch64
+          GUEST_ARTIFACT_ID: ${{ needs.arm64.outputs.artifact_id }}
+        run: scripts/fetch-guest-artifact.sh out
+
+      # NOT CACHED: this job holds the identity that signs what every node trusts, and
+      # a cache a branch's run could have written is not something it should read.
+      - name: Install Go for the carried image's check
+        if: needs.arm64.result != 'success'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Carry the last good aarch64 image
+        if: needs.arm64.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/carry-guest-set.sh out
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -562,6 +265,8 @@ jobs:
       # digest for every asset, so one signature transitively covers the four
       # hundred megabytes without anybody doing public-key arithmetic over them.
       - name: Sign the manifest
+        env:
+          ARM64_RESULT: ${{ needs.arm64.result }}
         run: |
           set -euo pipefail
 
@@ -572,6 +277,31 @@ jobs:
             --new-bundle-format \
             --bundle out/manifest.sigstore.json \
             out/manifest.json
+
+          # A CARRIED MANIFEST KEEPS THE SIGNATURE IT WAS PUBLISHED WITH: this run did
+          # not build what it describes.
+          if [ "$ARM64_RESULT" = success ]; then
+            cosign sign-blob --yes \
+              --new-bundle-format \
+              --bundle out/manifest-aarch64.sigstore.json \
+              out/manifest-aarch64.json
+          fi
+
+      # ONE RELEASE'S NOTES, WHICH SAY WHAT IT CARRIES AND WHERE A CARRIED SET CAME FROM.
+      - name: Write the release notes
+        run: |
+          set -euo pipefail
+
+          for extra in out/release-notes-aarch64.md out/release-notes-carried.md; do
+            if [ -e "$extra" ]; then
+              printf '\n' >>out/release-notes.md
+              cat "$extra" >>out/release-notes.md
+            fi
+          done
+
+      - name: Name the release
+        id: tag
+        run: echo "tag=guest-$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
 
       # IMMUTABLE DATED RELEASES, AND NO ROLLING RELEASE. Release immutability
       # locks a published tag and its assets, so a guest-latest release freezes on
@@ -585,31 +315,27 @@ jobs:
       - name: Publish the dated release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.build.outputs.tag }}
-          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
         run: scripts/publish-guest-release.sh out
 
       # A BRANCH, NOT A RELEASE. The release is immutable; this two-file branch is
       # the mutable pointer an unattended fleet needs. The pointer is signed only
       # after the release has been proved immutable and expires before two weekly
-      # builds can be replayed as current. The branch pushes fast-forward so its
-      # history is retained rather than rewritten.
+      # builds can be replayed as current, and it lists the machines the release
+      # carries. The branch pushes fast-forward so its history is retained rather than
+      # rewritten.
       - name: Advance the guest channel
         env:
-          TAG: ${{ needs.build.outputs.tag }}
-          SOURCE_TAG: ${{ needs.build.outputs.source_tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SOURCE_TAG: ${{ needs.resolve.outputs.source_tag }}
         run: |
           set -euo pipefail
 
           channel_dir=$(mktemp -d)
           trap 'git worktree remove --force "$channel_dir"' EXIT
 
-          published_epoch=$(date -u +%s)
-          expires_epoch=$((published_epoch + 10 * 24 * 60 * 60))
-          published_at=$(date -u -d "@$published_epoch" +%Y-%m-%dT%H:%M:%SZ)
-          expires_at=$(date -u -d "@$expires_epoch" +%Y-%m-%dT%H:%M:%SZ)
-          printf '{"schema":1,"tag":"%s","published_at":"%s","expires_at":"%s","release_immutable":true}\n' \
-            "$TAG" "$published_at" "$expires_at" > out/current.json
+          scripts/write-guest-channel.sh out
           cosign sign-blob --yes \
             --new-bundle-format \
             --bundle out/current.sigstore.json \

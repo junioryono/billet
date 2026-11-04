@@ -272,13 +272,8 @@ func (c *Client) Resolve(ctx context.Context) error {
 // readers of this one (ADR-022).
 func (c *Client) adoptChannel(tag string, architectures *[]string) error {
 	if architectures != nil {
-		list := *architectures
-		if !slices.Contains(list, manifestMachine) || slices.ContainsFunc(list, func(m string) bool {
-			return slices.Contains(misspelledMachines, m) || !unameMachine.MatchString(m)
-		}) {
-			return fmt.Errorf("imagesource: the guest-image channel lists architectures %v, which a "+
-				"reader cannot take at its word: they are `uname -m` names and include %s", list,
-				manifestMachine)
+		if err := CheckChannelArchitectures(*architectures); err != nil {
+			return err
 		}
 	}
 
@@ -289,6 +284,21 @@ func (c *Client) adoptChannel(tag string, architectures *[]string) error {
 
 	if architectures != nil {
 		c.channelArchitectures, c.channelSaid = *architectures, true
+	}
+
+	return nil
+}
+
+// CheckChannelArchitectures refuses a channel's list of architectures this reader
+// cannot take at its word. It is exported for what writes the list, which a test holds
+// to it: a list every node refuses stops every node.
+func CheckChannelArchitectures(list []string) error {
+	if !slices.Contains(list, manifestMachine) || slices.ContainsFunc(list, func(m string) bool {
+		return slices.Contains(misspelledMachines, m) || !unameMachine.MatchString(m)
+	}) {
+		return fmt.Errorf("imagesource: the guest-image channel lists architectures %v, which a "+
+			"reader cannot take at its word: they are `uname -m` names and include %s", list,
+			manifestMachine)
 	}
 
 	return nil

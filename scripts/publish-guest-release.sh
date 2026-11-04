@@ -18,6 +18,14 @@ case "${#SOURCE_SHA}" in
     *) printf 'invalid source commit length: %s\n' "$SOURCE_SHA" >&2; exit 2 ;;
 esac
 
+# ONE RELEASE, ONE OR TWO SETS (ADR-022). manifest.json and what it names are the
+# x86_64 image, which every release carries and every deployed reader reads; a release
+# may also carry the aarch64 image, described by manifest-aarch64.json, whose every
+# asset names its architecture. A set is checked whole, and nothing is tagged until
+# each is, because a release is immutable.
+#
+# check_set SUFFIX proves one set and adds its files to $scratch/upload.
+#
 # THE ASSETS COME FROM THE MANIFEST, NOT FROM A LIST HERE.
 #
 # A parity-sized image is published as parts, because a release asset must be
@@ -44,6 +52,19 @@ esac
 # the reader would accept (its own pattern) and a sha256 of 64 lowercase hex
 # digits. Split first, a name carrying a space and a digest would be checked as a
 # different file from the one the manifest promises.
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+: >"$scratch/upload"
+
+pairs() { # program file out
+    awk -F '\t' "$1" "$2" >"$3.raw" && LC_ALL=C sort -u "$3.raw" >"$3"
+}
+
+check_set() {
+manifest="manifest$1.json"
+suffix=$1
+sources="image-sources$1"
+
 assets=$(jq -r '
     [.kernel]
     + (if .rootfs_multipart then .rootfs_multipart.parts else [.rootfs] end)
@@ -53,20 +74,18 @@ assets=$(jq -r '
       then "\(.name) \(.sha256)"
       else error("the manifest names an asset with an unusable name or digest: \(.name | tojson)")
       end
-' "$out/manifest.json")
+' "$out/$manifest")
 
 if [ -z "$assets" ]; then
-    printf 'the manifest names no assets to publish\n' >&2
+    printf 'the manifest %s names no assets to publish\n' "$manifest" >&2
     exit 2
 fi
 
-# THE SIGNATURE, THE NOTES AND THE SOURCE MANIFEST TOO, before any ref is written:
-# gh reads the notes only once the tag exists, so a missing file there would leave
-# the tag behind. image-sources.tsv is the image's /opt/billet/IMAGE_SOURCES.tsv,
-# which the gate held to what the image installed: every package, its source and
-# where apt could fetch it, which a release that redistributes GNU-licensed
-# packages has to say (#584).
-for file in manifest.sigstore.json release-notes.md image-sources.tsv; do
+# THE SIGNATURE AND THE SOURCE MANIFEST TOO, before any ref is written.
+# image-sources.tsv is the image's /opt/billet/IMAGE_SOURCES.tsv, which the gate held
+# to what the image installed: every package, its source and where apt could fetch
+# it, which a release that redistributes GNU-licensed packages has to say (#584).
+for file in "manifest$suffix.sigstore.json" "$sources.tsv"; do
     if [ ! -r "$out/$file" ]; then
         printf 'the publication has no %s, so nothing is tagged or released\n' "$file" >&2
         exit 2
@@ -82,8 +101,8 @@ done
 if ! awk -F '\t' '
     NR == 1 { if ($0 != "package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense") bad = 1; next }
     { if (NF != 7) bad = 1; for (i = 1; i <= 7; i++) if ($i == "") bad = 1; rows++ }
-    END { exit (bad || rows == 0) ? 1 : 0 }' "$out/image-sources.tsv"; then
-    printf 'the publication'"'"'s image-sources.tsv is not a source manifest naming a package, so nothing is tagged or released\n' >&2
+    END { exit (bad || rows == 0) ? 1 : 0 }' "$out/$sources.tsv"; then
+    printf 'the publication'"'"'s %s.tsv is not a source manifest naming a package, so nothing is tagged or released\n' "$sources" >&2
     exit 2
 fi
 
@@ -97,30 +116,29 @@ fi
 #   byte, and must account for exactly the source packages image-sources.tsv
 #   marks gnu or unclassified: each fetched, or, for an unclassified one only,
 #   reviewed as needing none. It also names the guest kernel's source, once.
-for file in image-sources-index.tsv image-sources.parts; do
+for file in "$sources-index.tsv" "$sources.parts"; do
     if [ ! -s "$out/$file" ]; then
         printf 'the publication has no %s, so nothing is tagged or released\n' "$file" >&2
         exit 2
     fi
 done
-if [ "$(head -n 1 "$out/image-sources-index.tsv")" != "$(printf 'source\tversion\tstatus\tfile\tsha256\tsize')" ]; then
-    printf 'the publication'"'"'s image-sources-index.tsv is not an index of the source, so nothing is tagged or released\n' >&2
+if [ "$(head -n 1 "$out/$sources-index.tsv")" != "$(printf 'source\tversion\tstatus\tfile\tsha256\tsize')" ]; then
+    printf 'the publication'"'"'s %s-index.tsv is not an index of the source, so nothing is tagged or released\n' "$sources" >&2
     exit 2
 fi
 
-scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+work=$(mktemp -d "$scratch/set.XXXXXX")
 
 name='' whole='' size='' extra=''
-read -r name whole size extra <"$out/image-sources.parts" || [ -n "$name" ] || true
-if [ "$name" != image-sources.tar ] || [ -n "$extra" ] ||
+read -r name whole size extra <"$out/$sources.parts" || [ -n "$name" ] || true
+if [ "$name" != "$sources.tar" ] || [ -n "$extra" ] ||
     ! printf '%s\n' "$whole" | grep -Eq '^[0-9a-f]{64}$' ||
     ! printf '%s\n' "$size" | grep -Eq '^[0-9]+$'; then
-    printf 'image-sources.parts does not begin with the whole archive, its sha256 and size\n' >&2
+    printf '%s.parts does not begin with the whole archive, its sha256 and size\n' "$sources" >&2
     exit 2
 fi
 
-sed 1d "$out/image-sources.parts" >"$scratch/parts"
+sed 1d "$out/$sources.parts" >"$work/parts"
 # THE ARCHIVE BY ITS FILE NAMES ALONE, each checked against the one pattern a
 # part may have, so the list splits safely on spaces and is read from inside $out,
 # whatever $out's own path holds.
@@ -129,31 +147,31 @@ n=0
 # A LAST LINE WITH NO NEWLINE IS A PART TOO: read fails on it while still setting
 # the fields, and skipping it would publish the tar without its last part.
 while read -r part want rest || [ -n "$part" ]; do
-    expected=$(printf 'image-sources.tar.part%03d' "$n")
+    expected=$(printf '%s.tar.part%03d' "$sources" "$n")
     if [ "$part" != "$expected" ]; then
-        printf 'image-sources.parts names %s where it should name %s\n' "$part" "$expected" >&2
+        printf '%s.parts names %s where it should name %s\n' "$sources" "$part" "$expected" >&2
         exit 2
     fi
     if [ -n "$rest" ] || ! printf '%s\n' "$want" | grep -Eq '^[0-9a-f]{64}$'; then
-        printf 'image-sources.parts gives %s no single sha256\n' "$part" >&2
+        printf '%s.parts gives %s no single sha256\n' "$sources" "$part" >&2
         exit 2
     fi
     if [ ! -r "$out/$part" ]; then
-        printf 'image-sources.parts names %s and the build did not produce it\n' "$part" >&2
+        printf '%s.parts names %s and the build did not produce it\n' "$sources" "$part" >&2
         exit 2
     fi
     got=$(sha256sum "$out/$part" | cut -d ' ' -f 1)
     if [ "$got" != "$want" ]; then
-        printf '%s is not the part image-sources.parts describes (sha256 %s, want %s)\n' "$part" "$got" "$want" >&2
+        printf '%s is not the part %s.parts describes (sha256 %s, want %s)\n' "$part" "$sources" "$got" "$want" >&2
         exit 2
     fi
     archive="$archive $part"
     n=$((n + 1))
-done <"$scratch/parts"
+done <"$work/parts"
 if [ "$n" -eq 0 ]; then
-    archive=image-sources.tar
+    archive=$sources.tar
     if [ ! -r "$out/$archive" ]; then
-        printf 'image-sources.parts names the whole archive and the build did not produce it\n' >&2
+        printf '%s.parts names the whole archive and the build did not produce it\n' "$sources" >&2
         exit 2
     fi
 fi
@@ -163,52 +181,50 @@ got=$(cd "$out" && cat $archive | sha256sum | cut -d ' ' -f 1)
 # shellcheck disable=SC2086
 length=$(cd "$out" && cat $archive | wc -c | tr -d ' ')
 if [ "$got" != "$whole" ] || [ "$length" != "$size" ]; then
-    printf 'the source archive'"'"'s parts are not the archive image-sources.parts describes (sha256 %s, %s bytes; want %s, %s bytes)\n' "$got" "$length" "$whole" "$size" >&2
+    printf 'the source archive'"'"'s parts are not the archive %s.parts describes (sha256 %s, %s bytes; want %s, %s bytes)\n' "$sources" "$got" "$length" "$whole" "$size" >&2
     exit 2
 fi
 # shellcheck disable=SC2086
-if ! (cd "$out" && cat $archive) | tar -xOf - ./index.tsv >"$scratch/index" ||
-    ! cmp -s "$scratch/index" "$out/image-sources-index.tsv"; then
-    printf 'image-sources-index.tsv is not the index the source archive carries\n' >&2
+if ! (cd "$out" && cat $archive) | tar -xOf - ./index.tsv >"$work/index" ||
+    ! cmp -s "$work/index" "$out/$sources-index.tsv"; then
+    printf '%s-index.tsv is not the index the source archive carries\n' "$sources" >&2
     exit 2
 fi
 
 # EACH SET IS EXTRACTED TO A FILE WHOSE STATUS IS CHECKED, then sorted: dash has
 # no pipefail, so an awk that failed into a sort would read as an empty set, and an
 # empty set of reviewed or GNU-licensed sources is a pass.
-pairs() { # program file out
-    awk -F '\t' "$1" "$2" >"$3.raw" && LC_ALL=C sort -u "$3.raw" >"$3"
-}
-if ! pairs 'NR > 1 && ($7 == "gnu" || $7 == "unclassified") { print $4 "\t" $5 }' "$out/image-sources.tsv" "$scratch/needed" ||
-    ! pairs 'NR > 1 && $7 == "gnu" { print $4 "\t" $5 }' "$out/image-sources.tsv" "$scratch/gnu" ||
+if ! pairs 'NR > 1 && ($7 == "gnu" || $7 == "unclassified") { print $4 "\t" $5 }' "$out/$sources.tsv" "$work/needed" ||
+    ! pairs 'NR > 1 && $7 == "gnu" { print $4 "\t" $5 }' "$out/$sources.tsv" "$work/gnu" ||
     ! pairs 'NR > 1 && $1 != "guest-kernel" && ($3 == "fetched" || $3 == "reviewed") { print $1 "\t" $2 }' \
-        "$out/image-sources-index.tsv" "$scratch/indexed" ||
-    ! pairs 'NR > 1 && $3 == "reviewed" { print $1 "\t" $2 }' "$out/image-sources-index.tsv" "$scratch/reviewed" ||
-    ! pairs 'NR > 1 && $1 == "guest-kernel" && $3 == "fetched" { print $2 }' "$out/image-sources-index.tsv" "$scratch/kernels"; then
-    printf 'could not read the sources image-sources.tsv needs or image-sources-index.tsv holds, so nothing is tagged or released\n' >&2
+        "$out/$sources-index.tsv" "$work/indexed" ||
+    ! pairs 'NR > 1 && $3 == "reviewed" { print $1 "\t" $2 }' "$out/$sources-index.tsv" "$work/reviewed" ||
+    ! pairs 'NR > 1 && $1 == "guest-kernel" && $3 == "fetched" { print $2 }' "$out/$sources-index.tsv" "$work/kernels"; then
+    printf 'could not read the sources %s.tsv needs or %s-index.tsv holds, so nothing is tagged or released\n' "$sources" "$sources" >&2
     exit 2
 fi
 
 # THE KERNEL'S SOURCE IS THE KERNEL THE MANIFEST NAMES, once.
-kernels=$(cat "$scratch/kernels")
-kernel=$(jq -r '.kernel.version // empty' "$out/manifest.json")
+kernels=$(cat "$work/kernels")
+kernel=$(jq -r '.kernel.version // empty' "$out/$manifest")
 # A FAILED comm IS NOT AN EMPTY ONE: its status is checked before its output is
 # read, and it collates as the sorts above did.
-if ! LC_ALL=C comm -12 "$scratch/reviewed" "$scratch/gnu" >"$scratch/reviewed-gnu"; then
+if ! LC_ALL=C comm -12 "$work/reviewed" "$work/gnu" >"$work/reviewed-gnu"; then
     printf 'could not compare the reviewed sources with the GNU-licensed ones, so nothing is tagged or released\n' >&2
     exit 2
 fi
-if ! cmp -s "$scratch/needed" "$scratch/indexed" || [ -s "$scratch/reviewed-gnu" ] ||
-    [ -z "$kernel" ] || [ "$kernels" != "$kernel" ] || [ ! -s "$scratch/needed" ]; then
-    printf 'image-sources-index.tsv does not account for exactly the sources image-sources.tsv needs, and kernel %s'"'"'s\n' "${kernel:-?}" >&2
+if ! cmp -s "$work/needed" "$work/indexed" || [ -s "$work/reviewed-gnu" ] ||
+    [ -z "$kernel" ] || [ "$kernels" != "$kernel" ] || [ ! -s "$work/needed" ]; then
+    printf '%s-index.tsv does not account for exactly the sources %s.tsv needs, and kernel %s'"'"'s\n' "$sources" "$sources" "${kernel:-?}" >&2
     exit 2
 fi
 
-set -- "$out/manifest.json" "$out/manifest.sigstore.json" "$out/image-sources.tsv" \
-    "$out/image-sources-index.tsv" "$out/image-sources.parts"
-for part in $archive; do
-    set -- "$@" "$out/$part"
-done
+{
+    printf '%s\n' "$manifest" "manifest$suffix.sigstore.json" "$sources.tsv" "$sources-index.tsv" "$sources.parts"
+    for part in $archive; do
+        printf '%s\n' "$part"
+    done
+} >>"$scratch/upload"
 
 while read -r name want; do
     # A BARE FILE NAME, CHECKED HERE TOO. The Go reader validates this before a
@@ -232,10 +248,40 @@ while read -r name want; do
         exit 2
     fi
 
-    set -- "$@" "$out/$name"
+    printf '%s\n' "$name" >>"$scratch/upload"
 done <<ASSETS
 $assets
 ASSETS
+}
+
+# THE NOTES ARE THE RELEASE'S, proved before any ref is written: gh reads them only
+# once the tag exists, so a missing file there would leave the tag behind.
+if [ ! -r "$out/release-notes.md" ]; then
+    printf 'the publication has no release-notes.md, so nothing is tagged or released\n' >&2
+    exit 2
+fi
+
+check_set ""
+
+# A SET IS THERE ONLY AS A WHOLE, of the machine its name says and the contract the
+# release speaks. An aarch64 manifest of another contract is one no node of this
+# release's billet can import, and the channel would still say the release carries it.
+if [ -e "$out/manifest-aarch64.json" ]; then
+    if ! jq -e '.arch == "aarch64"' "$out/manifest-aarch64.json" >/dev/null; then
+        printf 'manifest-aarch64.json does not describe an aarch64 image, so nothing is tagged or released\n' >&2
+        exit 2
+    fi
+    if [ "$(jq -r '.guest_contract' "$out/manifest-aarch64.json")" != "$(jq -r '.guest_contract' "$out/manifest.json")" ]; then
+        printf 'manifest-aarch64.json speaks another guest contract than manifest.json, so nothing is tagged or released\n' >&2
+        exit 2
+    fi
+    check_set -aarch64
+fi
+
+set --
+while IFS= read -r name; do
+    set -- "$@" "$out/$name"
+done <"$scratch/upload"
 
 # THE TAG POINTS AT THE RELEASE COMMIT THE IMAGE WAS BUILT FROM, never at the
 # main commit that published it: the manifest's schema is closed, so the tag's

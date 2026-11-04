@@ -217,3 +217,52 @@ func TestTheGuestArtifactFetchRefusesWhatItCannotProve(t *testing.T) {
 		}
 	}
 }
+
+// A LEG OF ANOTHER MACHINE UPLOADS UNDER ITS OWN NAME, and the artifact is asked for and
+// held to that name: a run carries both legs', so taking the id with the other's name
+// would publish one machine's image as the other's.
+func TestTheAarch64ArtifactIsFetchedByItsName(t *testing.T) {
+	t.Parallel()
+
+	fake := t.TempDir()
+	digest := artifactZip(t, filepath.Join(fake, "artifact.zip"), "manifest-aarch64.json")
+	writeFake(t, fake, "listing", fmt.Sprintf(`{"artifacts":[{"id":42,"name":"guest-image-aarch64","expired":false,`+
+		`"size_in_bytes":1000,"digest":"sha256:%s"}]}`, digest))
+	writeFake(t, fake, "free", fmt.Sprintf("%d\n", 2*1000+4<<30))
+
+	out, output, err := runFetch(t, fake, "GUEST_ARTIFACT_NAME=guest-image-aarch64")
+	if err != nil {
+		t.Fatalf("fetch: %v\n%s", err, output)
+	}
+
+	if got, err := os.ReadFile(filepath.Join(out, "manifest-aarch64.json")); err != nil || string(got) != "manifest-aarch64.json" {
+		t.Errorf("the manifest was not extracted whole (%v): %q", err, got)
+	}
+
+	calls, err := os.ReadFile(filepath.Join(fake, "calls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(calls), "artifacts?name=guest-image-aarch64") {
+		t.Errorf("the listing did not ask for it by name:\n%s", calls)
+	}
+
+	// THE ID IS THE LEG'S, AND A LISTING OF THE OTHER NAME DOES NOT ANSWER FOR IT. A fresh
+	// directory, so the only thing that can refuse it is the name.
+	other := t.TempDir()
+	digest = artifactZip(t, filepath.Join(other, "artifact.zip"), "manifest-aarch64.json")
+	writeFake(t, other, "listing", fmt.Sprintf(`{"artifacts":[{"id":42,"name":"guest-image-aarch64","expired":false,`+
+		`"size_in_bytes":1000,"digest":"sha256:%s"}]}`, digest))
+	writeFake(t, other, "free", fmt.Sprintf("%d\n", 2*1000+4<<30))
+
+	if _, output, err := runFetch(t, other); err == nil || !strings.Contains(output, "no live guest-image artifact") {
+		t.Errorf("an artifact named for another leg answered %v as guest-image:\n%s", err, output)
+	}
+
+	// NOT A NAME TO INTERPOLATE INTO A REQUEST.
+	if _, output, err := runFetch(t, t.TempDir(), "GUEST_ARTIFACT_NAME=guest-image&x=1"); err == nil ||
+		!strings.Contains(output, "is not the name of a guest image artifact") {
+		t.Errorf("a name that is no artifact's answered %v:\n%s", err, output)
+	}
+}
