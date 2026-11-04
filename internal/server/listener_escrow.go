@@ -124,7 +124,9 @@ func (l *Listener) refillEscrowLeaving(ctx context.Context, target, maxNew int, 
 	// expiry, filed with the rest of the lifecycle work.
 	created := time.Now()
 
-	leases, err := l.alloc.EscrowLeaving(ctx, l.tier, room, protect)
+	// EVERY PURCHASE PASSES HERE, so none places on a host held for another tier, and
+	// the hosts are named at the purchase: a hold moves as the waiters do.
+	leases, err := l.alloc.EscrowFor(ctx, l.tier, room, alloc.Purchase{Protect: protect, Avoid: l.order.avoiding(l.tier)})
 
 	// A SEALED DEPLOYMENT IS NOT A BROKEN ONE, and the difference is the whole
 	// fleet. An escrow error returns from the listener, one listener returning

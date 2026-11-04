@@ -24,6 +24,7 @@ type Policy struct {
 var DefaultPolicies = []Policy{
 	{Name: "fair", Order: config.AdmissionFair},
 	{Name: "fill", Order: config.AdmissionFill},
+	{Name: "hold", Order: config.AdmissionHold},
 }
 
 // Comparison is one trace replayed under several policies, each report in the
@@ -130,8 +131,8 @@ func (c Comparison) Markdown() string {
 	}
 
 	b.WriteString("\n| Policy | Started | Still queued | Jobs refused at least once | vCPU charged | " +
-		"Memory charged | Empty host-hours | Over (hours) |\n")
-	b.WriteString("|---|---|---|---|---|---|---|---|\n")
+		"Memory charged | Empty host-hours | Empty while a job that fits waited | Over (hours) |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|---|\n")
 
 	for i, r := range c.Reports {
 		started := 0
@@ -147,11 +148,11 @@ func (c Comparison) Markdown() string {
 		}
 
 		// A REPLAY THAT CHARGED NOTHING HAS NO SHARES, not shares of zero.
-		overTime := "| — | — | — | —"
+		overTime := "| — | — | — | — | —"
 		if _, _, ok := r.span(); ok {
 			vcpu, memory := r.MeanUtilization()
-			overTime = fmt.Sprintf("| %.0f%% | %.0f%% | %.1f | %.2f", 100*vcpu, 100*memory, r.EmptyHostHours(),
-				r.SpanHours())
+			overTime = fmt.Sprintf("| %.0f%% | %.0f%% | %.1f | %.1f | %.2f", 100*vcpu, 100*memory, r.EmptyHostHours(),
+				r.EmptyWhileQueuedHours(), r.SpanHours())
 		}
 
 		fmt.Fprintf(&b, "| %s | %d | %d | %d %s |\n", c.Policies[i].Name, started, len(r.StillQueued), declined,

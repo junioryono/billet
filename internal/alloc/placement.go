@@ -258,6 +258,14 @@ func (p *placer) rankBy(t config.Tier) {
 	}
 }
 
+// avoid takes hosts out of what this placer will choose, and out of what it reports
+// room on, because a host with no cost has none.
+func (p *placer) avoid(hosts []string) {
+	for _, host := range hosts {
+		delete(p.cost, host)
+	}
+}
+
 // roomFor is how many more of a tier a host can still take.
 func (p *placer) roomFor(node string, t config.Tier) int {
 	cost, ok := p.cost[node]

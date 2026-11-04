@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,6 +32,9 @@ type refusal struct {
 	// protecting the waiters ahead a purchase out of turn had to leave room for.
 	room       *alloc.RoomRefusal
 	protecting []string
+	// heldHosts are the hosts held for other tiers the purchase could not use, each
+	// with its owner.
+	heldHosts map[string]string
 	// unread is why the allocator's reason could not be read, said rather than
 	// taken for no reason at all.
 	unread error
@@ -42,7 +47,7 @@ type refusal struct {
 // not.
 func (r refusal) explained() bool {
 	return r.draining || r.waiter != "" ||
-		(r.room != nil && r.unread == nil && (r.room.Binds() || len(r.protecting) > 0))
+		(r.room != nil && r.unread == nil && (r.room.Binds() || len(r.protecting) > 0 || len(r.heldHosts) > 0))
 }
 
 // attrs is the refusal as log attributes.
@@ -98,7 +103,7 @@ func (l *Listener) backedBy(request int64, r refusal, lost uint64) {
 
 // byOrder reports whether the admission order, not the allocator, refused.
 func (r refusal) byOrder() bool {
-	return r.waiter != "" || (r.room != nil && !r.room.Binds() && len(r.protecting) > 0)
+	return r.waiter != "" || (r.room != nil && !r.room.Binds() && (len(r.protecting) > 0 || len(r.heldHosts) > 0))
 }
 
 func (r refusal) String() string {
@@ -113,6 +118,13 @@ func (r refusal) String() string {
 			r.waiter, r.since.UTC().Format(time.RFC3339))
 	case r.unread != nil:
 		return fmt.Sprintf("the allocator granted nothing, and why could not be read: %v", r.unread)
+	case r.room != nil && !r.room.Binds() && len(r.heldHosts) > 0:
+		held := make([]string, 0, len(r.heldHosts))
+		for _, host := range slices.Sorted(maps.Keys(r.heldHosts)) {
+			held = append(held, host+" for "+r.heldHosts[host])
+		}
+
+		return "the only room is on hosts held for tiers whose shape fits on none: " + strings.Join(held, ", ")
 	case r.room != nil && !r.room.Binds() && len(r.protecting) > 0:
 		return "buying ahead of its turn would leave " + strings.Join(r.protecting, ", ") +
 			" without room for one lease"
@@ -148,7 +160,7 @@ func (l *Listener) roomRefusal(ctx context.Context, protect []string) refusal {
 		return refusal{unread: err}
 	}
 
-	return refusal{room: &room, protecting: protect}
+	return refusal{room: &room, protecting: protect, heldHosts: l.order.heldForOthers(l.tier)}
 }
 
 // refuse records why a purchase bought nothing, for the decline that follows

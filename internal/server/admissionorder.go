@@ -3,7 +3,9 @@ package server
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,6 +101,21 @@ import (
 // oldest first would rotate it away after each purchase; it would hold a lease's
 // room idle for as long as its launches failed. For a while and not until one
 // succeeds: a wide tier stepped aside never accumulates the room to try again.
+//
+// HOLD HOLDS ONE HOST, NOT EVERY HOST (#527). Under fair a shape that fits nowhere
+// holds freed room on every host it could use until it fits; under fill it may wait
+// without bound. Under hold a waiter that fits nowhere is given one host, the one its
+// running work is predicted to free soonest (alloc.HoldCandidates), and no other tier
+// places there; every other host stays open to every tier, so waiters that merely
+// share a host no longer hold each other back. At most one hold per host and one per
+// tier, oldest waiter first, a waiter keeping the host it has while it is still a
+// candidate, because room accumulated on one host is lost by moving to another. It
+// is decided here, in memory, from what each waiter last read, and rebuilt after a
+// restart from the waiting order, like the rest of this queue. It releases, destroys
+// and promises nothing: the purchase is still the allocator's atomic transaction. A
+// ceiling-bound waiter and a target's shared pot hold their line as under fair, since
+// a hold cannot help them, and under weights a waiter of another target with no hold
+// of its own is still ranked, so a weight still divides what contends.
 type admissionQueue struct {
 	policy config.AdmissionOrder
 	now    func() time.Time
@@ -162,6 +179,10 @@ type waitingTier struct {
 	// it keeps the line until it buys, whatever the ranks do. Only under ranks;
 	// without them nothing but buying moves a waiter anyway.
 	head bool
+	// candidates are the hosts this waiter could be held, as it last read them, the
+	// soonest ready first, and held is the one it has. Only under hold.
+	candidates []alloc.HoldCandidate
+	held       string
 }
 
 // newAdmissionQueue builds the queue every listener of one control plane shares.
@@ -186,6 +207,157 @@ func holdsTheLine(waiter waitingTier, now time.Time) bool {
 // need not read the ledger to ask.
 func (q *admissionQueue) gates() bool {
 	return q != nil && q.policy != config.AdmissionFill
+}
+
+// holds reports whether this queue holds hosts for waiters.
+func (q *admissionQueue) holds() bool {
+	return q != nil && q.policy == config.AdmissionHold
+}
+
+// blocks requires q.mu. It reports whether a waiter holds a buyer at where back. Under
+// hold, sharing a host is not enough: what a waiter that fits nowhere gets is a host,
+// and one that fits somewhere has nothing to accumulate. A ceiling-bound waiter and a
+// target's shared pot wait for room a hold cannot keep, so they hold their line as
+// under fair; and under weights so does a waiter of another target with no host held,
+// which is what a weight divides.
+func (q *admissionQueue) blocks(where alloc.TierAdmission, waiter waitingTier) bool {
+	if !competes(where, waiter.where) {
+		return false
+	}
+
+	if q.policy != config.AdmissionHold {
+		return true
+	}
+
+	if waiter.where.CeilingBound || (where.Target == waiter.where.Target && where.TargetShared && waiter.where.TargetShared) {
+		return true
+	}
+
+	return where.TargetRank != nil && where.Target != waiter.where.Target && waiter.held == ""
+}
+
+// planHolds requires q.mu. It gives each waiting tier that can be held one host: first
+// those keeping a host they have, in the order they began waiting, then the rest. A
+// waiter that stepped aside or has no candidates holds nothing.
+func (q *admissionQueue) planHolds() {
+	if q.policy != config.AdmissionHold {
+		return
+	}
+
+	now := q.now()
+
+	order := make([]string, 0, len(q.waiting))
+	for label := range q.waiting {
+		order = append(order, label)
+	}
+
+	slices.SortFunc(order, func(x, y string) int {
+		if c := q.waiting[x].since.Compare(q.waiting[y].since); c != 0 {
+			return c
+		}
+
+		return strings.Compare(x, y)
+	})
+
+	taken := map[string]bool{}
+	next := make(map[string]string, len(order))
+
+	keeps := func(waiter waitingTier) bool {
+		return slices.ContainsFunc(waiter.candidates, func(c alloc.HoldCandidate) bool { return c.Node == waiter.held })
+	}
+
+	for _, label := range order {
+		if waiter := q.waiting[label]; holdsTheLine(waiter, now) && waiter.held != "" && keeps(waiter) &&
+			!taken[waiter.held] {
+			taken[waiter.held] = true
+			next[label] = waiter.held
+		}
+	}
+
+	for _, label := range order {
+		waiter := q.waiting[label]
+		if _, kept := next[label]; kept || !holdsTheLine(waiter, now) {
+			continue
+		}
+
+		for _, c := range waiter.candidates {
+			if !taken[c.Node] {
+				taken[c.Node] = true
+				next[label] = c.Node
+
+				break
+			}
+		}
+	}
+
+	for _, label := range order {
+		waiter := q.waiting[label]
+		if next[label] == waiter.held {
+			continue
+		}
+
+		switch {
+		case next[label] != "":
+			q.log.Info("holding a host for a waiting tier whose shape fits on none; no other tier is placed there",
+				"tier", label, "host", next[label], "released", waiter.held, "waiting_since", waiter.since)
+		default:
+			q.log.Info("a waiting tier no longer holds a host", "tier", label, "host", waiter.held)
+		}
+
+		waiter.held = next[label]
+		q.waiting[label] = waiter
+	}
+}
+
+// heldForOthers is the hosts held for tiers other than this one, each with its
+// owner. Empty unless the order holds hosts, and what every purchase avoids.
+func (q *admissionQueue) heldForOthers(tier string) map[string]string {
+	if !q.holds() {
+		return nil
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.planHolds()
+
+	var out map[string]string
+
+	for label, waiter := range q.waiting {
+		if label == tier || waiter.held == "" {
+			continue
+		}
+
+		if out == nil {
+			out = map[string]string{}
+		}
+
+		out[waiter.held] = label
+	}
+
+	return out
+}
+
+// avoiding is the hosts a purchase of this tier places nothing on, in a fixed order.
+func (q *admissionQueue) avoiding(tier string) []string {
+	return slices.Sorted(maps.Keys(q.heldForOthers(tier)))
+}
+
+// mayHold records the hosts a waiting tier could be held, as it just read them.
+func (q *admissionQueue) mayHold(tier string, candidates []alloc.HoldCandidate) {
+	if !q.holds() {
+		return
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if waiter, ok := q.waiting[tier]; ok {
+		waiter.candidates = candidates
+		q.waiting[tier] = waiter
+	}
+
+	q.planHolds()
 }
 
 // competes reports whether a buyer contends with a waiter for the same room.
@@ -314,7 +486,7 @@ func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission, now ti
 	}
 
 	for label, waiter := range q.waiting {
-		if label != tier && (!competes(where, waiter.where) || !holdsTheLine(waiter, now)) {
+		if label != tier && (!q.blocks(where, waiter) || !holdsTheLine(waiter, now)) {
 			continue
 		}
 
@@ -398,7 +570,7 @@ func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, t
 	var stalled []string
 
 	for label, waiter := range q.waiting {
-		if label != tier && !competes(where, waiter.where) {
+		if label != tier && !q.blocks(where, waiter) {
 			continue
 		}
 
@@ -534,7 +706,7 @@ func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string 
 
 	var out []string
 	for label, waiter := range q.waiting {
-		if label == tier || !competes(where, waiter.where) || q.steppedAside(label, waiter, ranks, now) {
+		if label == tier || !q.blocks(where, waiter) || q.steppedAside(label, waiter, ranks, now) {
 			continue
 		}
 

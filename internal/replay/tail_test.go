@@ -200,9 +200,9 @@ func TestAComparisonPrintsEachPolicysSpan(t *testing.T) {
 	table := Comparison{Policies: []Policy{{Name: "soon"}, {Name: "late"}, {Name: "idle"}},
 		Reports: []*Report{soon, late, idle}}.Markdown()
 
-	if !strings.Contains(table, "| soon | 0 | 0 | 0 | 50% | 25% | 0.0 | 1.00 |") ||
-		!strings.Contains(table, "| late | 0 | 0 | 0 | 50% | 25% | 0.0 | 2.00 |") ||
-		!strings.Contains(table, "| idle | 0 | 0 | 0 | — | — | — | — |") {
+	if !strings.Contains(table, "| soon | 0 | 0 | 0 | 50% | 25% | 0.0 | 0.0 | 1.00 |") ||
+		!strings.Contains(table, "| late | 0 | 0 | 0 | 50% | 25% | 0.0 | 0.0 | 2.00 |") ||
+		!strings.Contains(table, "| idle | 0 | 0 | 0 | — | — | — | — | — |") {
 		t.Errorf("the table is\n%s\nwant each policy's figures over its own span, one hour and two, and none "+
 			"for a replay that charged nothing", table)
 	}
@@ -251,6 +251,35 @@ func TestChargesPerTargetAndTheContestedWindow(t *testing.T) {
 	if !strings.Contains(table, "Contested for 1h0m0s.") || !strings.Contains(table, "| first | 0 | 4.0 | 8.0 | 67% | 67% |") ||
 		!strings.Contains(table, "| second | 0 | 2.0 | 4.0 | 33% | 33% |") {
 		t.Errorf("the table is\n%s", table)
+	}
+}
+
+// EMPTY WHILE A JOB WAITED COUNTS ONLY A HOST THAT JOB FITS ON, and only while it waited:
+// a host idle because nothing asked is not room a shape was denied.
+func TestEmptyWhileQueuedCountsOnlyHostsTheWaitingJobFits(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+	hour := func(n float64) time.Time { return start.Add(time.Duration(n * float64(time.Hour))) }
+
+	r := &Report{
+		Fleet: Fleet{Hosts: []Host{
+			{Name: "only", VCPU: 8, Memory: 32 * config.GiB},
+			{Name: "tiny", VCPU: 2, Memory: 8 * config.GiB},
+		}, MaxVCPU: 10, MaxMemory: 40 * config.GiB},
+		Records: []Record{
+			// Ran at once from 0h to 1h: "only" is charged, and nothing waits.
+			{Tier: "billet-4vcpu", Node: "only", VCPU: 4, Memory: 8 * config.GiB, Arrival: hour(0), ChargedFrom: hour(0),
+				StartedAt: hour(0), FinishedAt: hour(1)},
+			// Waits from 2h to 3h, then runs to 4h. 4 vCPU fits "only", empty from 1h to
+			// 3h, for the hour it waited, and not "tiny", empty throughout.
+			{Tier: "billet-4vcpu", Node: "only", VCPU: 4, Memory: 8 * config.GiB, Arrival: hour(2), ChargedFrom: hour(3),
+				StartedAt: hour(3), FinishedAt: hour(4)},
+		},
+	}
+
+	if got := r.EmptyWhileQueuedHours(); math.Abs(got-1) > 1e-9 {
+		t.Errorf("%.3f host-hours empty while a job waited; want the hour on the host it fits", got)
 	}
 }
 

@@ -587,6 +587,22 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 // moved another tier's floor onto the waiter's only host, leaving it nothing.
 // Fewer are then tried, one transaction each.
 func (a *Allocator) EscrowLeaving(ctx context.Context, tier string, want int, protect []string) ([]*Lease, error) {
+	return a.EscrowFor(ctx, tier, want, Purchase{Protect: protect})
+}
+
+// Purchase is what a purchase must leave alone.
+type Purchase struct {
+	// Protect is the tiers each of which must still be granted one lease
+	// afterwards (EscrowLeaving).
+	Protect []string
+	// Avoid is the hosts held for other tiers, which this purchase places nothing
+	// on (HoldCandidates). A tier below its floor ignores it: its room is promised,
+	// and a floor is not a thing a hold may take back.
+	Avoid []string
+}
+
+// EscrowFor is Escrow under what the admission order asks of this purchase.
+func (a *Allocator) EscrowFor(ctx context.Context, tier string, want int, purchase Purchase) ([]*Lease, error) {
 	if want < 0 {
 		return nil, fmt.Errorf("alloc: want must not be negative, got %d", want)
 	}
@@ -597,14 +613,14 @@ func (a *Allocator) EscrowLeaving(ctx context.Context, tier string, want int, pr
 	}
 
 	var guarded []config.Tier
-	for _, label := range protect {
+	for _, label := range purchase.Protect {
 		if w, ok := a.tiers[label]; ok && label != tier {
 			guarded = append(guarded, w)
 		}
 	}
 
 	for take := want; take > 0; take-- {
-		leases, err := a.escrow(ctx, t, take, guarded)
+		leases, err := a.escrow(ctx, t, take, guarded, purchase.Avoid)
 		if errors.Is(err, errWaiterLeftShort) {
 			continue
 		}
@@ -628,7 +644,9 @@ var (
 // escrow buys up to want leases of t in one transaction, rolling it back with
 // errWaiterShortNow or errWaiterLeftShort when it would leave a tier in guarded
 // unable to be granted one.
-func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded []config.Tier) ([]*Lease, error) {
+func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded []config.Tier,
+	avoid []string,
+) ([]*Lease, error) {
 	if want == 0 {
 		return nil, nil
 	}
@@ -655,6 +673,17 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 		room, place, err := a.headroomWithPlacer(ctx, tx, t)
 		if err != nil {
 			return err
+		}
+
+		if len(avoid) > 0 {
+			floors, err := a.countFloorLeasesPerTier(ctx, tx)
+			if err != nil {
+				return err
+			}
+
+			if t.Reserved <= floors[t.Label] {
+				place.avoid(avoid)
+			}
 		}
 
 		// A WAITER THAT CANNOT BE GRANTED ONE NOW IS ACCUMULATING ROOM, and

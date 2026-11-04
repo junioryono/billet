@@ -171,6 +171,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 
 	if active < desired && admission.CanGrow {
 		l.order.waits(l.tier, admission)
+		l.askForAHold(ctx, admission)
 	} else {
 		l.order.served(l.tier)
 	}
@@ -375,6 +376,31 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	l.backedBy(requestID, refusal{}, lost)
 
 	return nil
+}
+
+// askForAHold tells the order which hosts this waiting tier could be held, under the
+// order that holds hosts. A tier the ceiling or its target's share refuses is waiting
+// for room a hold cannot keep. A read that failed keeps what the tier last read: a
+// hold is an optimisation, and nothing here may fail a reconciliation.
+func (l *Listener) askForAHold(ctx context.Context, admission alloc.TierAdmission) {
+	if !l.order.holds() {
+		return
+	}
+
+	if admission.CeilingBound || admission.ShareBound {
+		l.order.mayHold(l.tier, nil)
+
+		return
+	}
+
+	candidates, err := l.alloc.HoldCandidates(ctx, l.tier, l.order.avoiding(l.tier))
+	if err != nil {
+		l.log.Warn("could not read which host to hold for this waiting tier", "tier", l.tier, "error", err)
+
+		return
+	}
+
+	l.order.mayHold(l.tier, candidates)
 }
 
 // admission is what the order needs to know about this tier: whether room could

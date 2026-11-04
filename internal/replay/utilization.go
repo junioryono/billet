@@ -269,6 +269,99 @@ func (r *Report) EmptyHostHours() float64 {
 	return empty.Hours()
 }
 
+// EmptyWhileQueuedHours is the host-hours over the span in which a host carried
+// nothing while a job that fits on it was waiting to start: the room a whole-host
+// shape could have used and did not get, which empty host-hours alone cannot tell
+// from a host idle because nothing asked.
+func (r *Report) EmptyWhileQueuedHours() float64 {
+	from, to, ok := r.span()
+	if !ok {
+		return 0
+	}
+
+	steps := r.steps(from, to)
+
+	var empty time.Duration
+
+	for _, h := range r.Fleet.Hosts {
+		waiting := r.waitsThatFit(h)
+
+		for _, s := range steps {
+			if s.perNode[h.Name] == 0 {
+				empty += overlap(waiting, s.at, s.nextFrom)
+			}
+		}
+	}
+
+	return empty.Hours()
+}
+
+// interval is a stretch of time.
+type interval struct{ from, to time.Time }
+
+// waitsThatFit is when a job that fits on the host was waiting to start, merged and
+// in order. A job that never started waited from its arrival on.
+func (r *Report) waitsThatFit(h Host) []interval {
+	var waits []interval
+
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.VCPU > h.VCPU || rec.Memory > h.Memory {
+			continue
+		}
+
+		end := rec.StartedAt
+		if end.IsZero() {
+			end = maxInterval
+		}
+
+		if end.After(rec.Arrival) {
+			waits = append(waits, interval{rec.Arrival, end})
+		}
+	}
+
+	slices.SortFunc(waits, func(x, y interval) int { return x.from.Compare(y.from) })
+
+	merged := waits[:0]
+
+	for _, w := range waits {
+		if n := len(merged); n > 0 && !w.from.After(merged[n-1].to) {
+			if w.to.After(merged[n-1].to) {
+				merged[n-1].to = w.to
+			}
+
+			continue
+		}
+
+		merged = append(merged, w)
+	}
+
+	return merged
+}
+
+// maxInterval ends the wait of a job that never started, past any span.
+var maxInterval = time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
+
+// overlap is how much of [from, to) the merged, ordered intervals cover.
+func overlap(merged []interval, from, to time.Time) time.Duration {
+	i, _ := slices.BinarySearchFunc(merged, from, func(w interval, at time.Time) int { return w.to.Compare(at) })
+
+	var total time.Duration
+
+	for ; i < len(merged) && merged[i].from.Before(to); i++ {
+		start, end := merged[i].from, earlier(merged[i].to, to)
+		if start.Before(from) {
+			start = from
+		}
+
+		if end.After(start) {
+			total += end.Sub(start)
+		}
+	}
+
+	return total
+}
+
 func earlier(a, b time.Time) time.Time {
 	if a.Before(b) {
 		return a
