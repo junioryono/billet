@@ -15,6 +15,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `identity_dir` | with `state` | the deployment identity, the node-wire CA and its rotation state, the process lock and the maintenance fence |
 | `state.backend` | with `identity_dir` | `sqlite` or `postgres` |
 | `state.postgres.dsn_env` | for `postgres` | the name of the environment variable holding the DSN, never the DSN |
+| `state.postgres.max_connections` | no | the most connections one process of this deployment holds: the writer, the controller claim's session, and readers, which get what those two leave, up to 4. At least 3; absent, 6. A transaction-mode pooler cannot carry them ([Many deployments on one host](../deploying/many-deployments.md)) |
 | `controllers` | no | `single` (default) or `active-passive`; refused on SQLite |
 | `tls_router.node_addr` | behind a router | the `host:port` nodes dial through a TLS-passthrough router, a DNS name because a client sends no SNI for an IP. With it, `listen` stays on loopback and serves mutual TLS, and `node_tls_hosts` is refused ([Many deployments on one host](../deploying/many-deployments.md)) |
 | `tls_router.enroll_addr` | with `bootstrap_listen` behind a router | the `host:port` an enrolling machine dials, by a name of its own |
