@@ -300,6 +300,46 @@ func TestBehindALeaseAsLargeIsReportedOnlyWhenItIsTheWholeReason(t *testing.T) {
 	}
 }
 
+// A LEASE AS LARGE THAT HAS RUN LATE PROMISES NOTHING: the shape may fit beside it, so the host
+// is a candidate again, or narrower work could refill the rest for as long as it runs. Started
+// or bought and never started.
+func TestALateLeaseAsLargeLeavesTheHostACandidate(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	anywhere := tier("anywhere", 8, 32*config.GiB)
+	anywhere.Provider, anywhere.Node = config.ProviderDocker, "a"
+
+	for name, buy := range map[string]func(*Allocator){
+		"started": func(a *Allocator) { startRunning(t, a, "eight-a") },
+		"never started": func(a *Allocator) {
+			if _, err := a.Reserve(t.Context(), "eight-a"); err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			at := now
+			a := holdFleet(t, &at, anywhere)
+
+			buy(a)
+			startRunning(t, a, "small-a")
+			startRunning(t, a, "small-a")
+
+			got, behind, err := a.HoldCandidates(t.Context(), "anywhere", nil, "")
+			if err != nil || len(got) != 0 || !behind {
+				t.Fatalf("in time it reads %v, %v, %v; want it behind the lease as large", got, behind, err)
+			}
+
+			at = at.Add(HoldLateFactor*DefaultRuntime + time.Minute)
+
+			got, behind, err = a.HoldCandidates(t.Context(), "anywhere", nil, "")
+			if err != nil || !slices.Equal(candidateNames(got), []string{"a"}) || behind {
+				t.Errorf("past the factor it reads %v, %v, %v; want the host a candidate", got, behind, err)
+			}
+		})
+	}
+}
+
 // A JOB RUN LATE ON THE HOST SAYS SO, only when the shape needs it gone.
 func TestACandidateSaysWhenAJobItNeedsGoneIsLate(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)

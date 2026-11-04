@@ -217,11 +217,12 @@ func everFits(cost placementCost, freeVCPU int, freeMemory config.ByteSize, leas
 	return freeVCPU >= cost.vcpu && freeMemory >= cost.memory
 }
 
-// runsAsLarge reports that a lease as large as cost runs among these and will end. One
-// in custody or quarantine may not, so it promises the shape nothing.
+// runsAsLarge reports that a lease as large as cost runs among these and will end soon
+// enough to wait for. One in custody or quarantine may not end, and one run late may not
+// for hours, so neither promises the shape anything: it may fit beside it instead.
 func runsAsLarge(cost placementCost, leases []heldLease) bool {
 	return slices.ContainsFunc(leases, func(l heldLease) bool {
-		return !l.stuck && l.cost.vcpu >= cost.vcpu && l.cost.memory >= cost.memory
+		return !l.stuck && !l.late && l.cost.vcpu >= cost.vcpu && l.cost.memory >= cost.memory
 	})
 }
 
