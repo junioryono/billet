@@ -138,6 +138,11 @@ server:
   #       # it in the service's environment, the way the App private key is kept
   #       # out of here.
   #       dsn_env: BILLET_STATE_DSN
+  #       # The most connections one process of this deployment holds: the writer,
+  #       # the controller claim's session and its readers. At least 3; absent, 6.
+  #       # Worth setting when many deployments share one server's max_connections.
+  #       # A transaction-mode pooler cannot carry these.
+  #       max_connections: 4
 
   # How long a stopping billet waits for the jobs it is ALREADY running before it
   # destroys them. This is what makes `systemctl restart` free rather than a way
