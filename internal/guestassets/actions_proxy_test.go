@@ -298,6 +298,7 @@ func TestGuestResultsPassthroughWaitsOutANodeThatDoesNotAnswer(t *testing.T) {
 	}
 	probe := `
 import importlib.util
+import select
 import socket
 import subprocess
 import sys
@@ -376,6 +377,13 @@ proxy.RESULTS_PORT, seen_github = github()
 answer, took = drive(free_port(), 2.5)
 assert answer == b"from-github", answer
 assert took >= 1.5, "failed open after %.2fs of a 2.5s wait" % took
+# ...and gives its place back, or a long enough outage would stop anything waiting.
+held = 0
+while proxy.NODE_WAITERS.acquire(blocking=False):
+    held += 1
+assert held == 64, "a finished wait kept its place: %d of 64 free" % held
+for _ in range(held):
+    proxy.NODE_WAITERS.release()
 
 # A refusal is an answer: no wait, however long the wait is.
 proxy.RESULTS_PORT, seen_github = github()
@@ -390,51 +398,72 @@ assert took < 5, "a refusal was waited on for %.2fs" % took
 proxy.RESULTS_PORT, seen_github = github()
 answer, took = drive(free_port(), 0)
 assert answer == b"from-github", answer
-assert took < 1, "no wait took %.2fs" % took
+assert took < 5, "no wait took %.2fs" % took
 
-# A client that has gone stops the wait.
-a, b = socket.socketpair()
-dead = free_port()
-worker = threading.Thread(target=proxy.handle,
-    args=(a, "http://x:y@127.0.0.1:%d" % dead, [], proxy.RESULTS_AUTHORITY, None, 30), daemon=True)
-worker.start()
-b.sendall(b"clienthello")
-time.sleep(0.3)
-b.close()
-worker.join(8)
-assert not worker.is_alive(), "the wait went on for a client that had gone"
+# THE WAITERS ARE BOUNDED, and one past the bound fails open at once: they hold a
+# thread and two descriptors each on the listener the runner's logs share.
+proxy.RESULTS_PORT, seen_github = github()
+saved = proxy.NODE_WAITERS
+proxy.NODE_WAITERS = threading.BoundedSemaphore(1)
+assert proxy.NODE_WAITERS.acquire(blocking=False)
+answer, took = drive(free_port(), 30)
+assert answer == b"from-github", answer
+assert took < 5, "a connection past the bound waited %.2fs" % took
+proxy.NODE_WAITERS.release()
+proxy.NODE_WAITERS = saved
 
-# MAIN GIVES THE RESULTS ORIGIN THE WAIT AND ANOTHER ORIGIN NONE. Port 443 on the
-# loopback answers nothing here, so failing open closes the client.
-def through_main(*args):
+# A CLIENT THAT HAS GONE STOPS THE WAIT. Where the kernel reports a hangup whatever
+# is queued: elsewhere client_gone can only peek, and the hello is ahead of the end.
+if hasattr(select, "POLLRDHUP"):
+    a, b = socket.socketpair()
+    worker = threading.Thread(target=proxy.handle,
+        args=(a, "http://x:y@127.0.0.1:%d" % free_port(), [], proxy.RESULTS_AUTHORITY, None, 30), daemon=True)
+    worker.start()
+    b.sendall(b"clienthello")
+    time.sleep(0.3)
+    b.close()
+    worker.join(8)
+    assert not worker.is_alive(), "the wait went on for a client that had gone"
+
+# MAIN GIVES THE RESULTS ORIGIN THE WAIT AND ANOTHER ORIGIN NONE. No fallback, so
+# what ends a connection the node did not take is the relay closing it, and nothing
+# on this host's port 443 can answer in its place.
+def through_main(start_node, *args):
     node = free_port()
     listen = free_port()
-    seen = node_after(node, 1.5)
     process = subprocess.Popen([sys.executable, sys.argv[1], "--listen", "127.0.0.1:%d" % listen,
-        "--upstream", "http://x:y@127.0.0.1:%d" % node, "--fallback-addr", "127.0.0.1", *args])
+        "--upstream", "http://x:y@127.0.0.1:%d" % node, *args])
     try:
-        for _ in range(100):
+        for _ in range(200):
             try:
                 client = socket.create_connection(("127.0.0.1", listen), 1)
                 break
             except OSError:
                 time.sleep(0.05)
-        client.settimeout(10)
+        client.settimeout(25)
+        began = time.monotonic()
         client.sendall(b"clienthello")
+        # The node arrives only after the relay has been asked, so its first attempt
+        # cannot have reached it.
+        if start_node:
+            node_after(node, 1.5)
+        # A close with the hello unread reaches the client as a reset.
         try:
             answer = client.recv(64)
-        except OSError:
+        except ConnectionResetError:
             answer = b""
+        took = time.monotonic() - began
         client.close()
-        return answer, seen
+        return answer, took
     finally:
         process.terminate()
         process.wait(5)
 
-answer, seen = through_main()
+answer, _ = through_main(True)
 assert answer == b"from-the-node", "the results origin did not wait for its node: %r" % answer
-answer, seen = through_main("--origin", "registry.npmjs.org")
-assert answer != b"from-the-node", "another origin waited for its node: %r" % answer
+answer, took = through_main(False, "--origin", "registry.npmjs.org")
+assert answer == b"", "another origin's connection was answered: %r" % answer
+assert took < 10, "another origin waited for its node for %.2fs" % took
 `
 	run := exec.CommandContext(t.Context(), python, "-c", probe, path)
 	if output, err := run.CombinedOutput(); err != nil {

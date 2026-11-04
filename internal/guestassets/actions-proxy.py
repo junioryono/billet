@@ -115,13 +115,18 @@ NODE_RELAY_RETRY = 1
 # every descriptor inside select()'s range. A connection past it is closed at
 # once, which is what the node's own listener would have done.
 NODE_RELAY_LIMIT = 64
-# How long the results passthrough goes on asking for a tunnel the node does not
-# answer before failing open. It cannot see a request inside the TLS it relays, so
-# a blob URL billet signed reaches GitHub if it fails open, and GitHub's "404 page
-# not found" ends the toolkit's upload where a wait would have saved it (#694). A
-# node's ordinary restart is shorter; a node gone for good costs each connection
-# this much, and the rest of what shares the origin then still works.
+# How long the results passthrough goes on beginning attempts at a tunnel the node
+# does not answer before failing open; the last attempt may run CONNECT_TIMEOUT past
+# it. It cannot see a request inside the TLS it relays, so a blob URL billet signed
+# reaches GitHub if it fails open, and GitHub's "404 page not found" ends the
+# toolkit's upload where a wait would have saved it (#694). A node's ordinary restart
+# is shorter; a node gone for good costs each connection this much, and the rest of
+# what shares the origin then still works.
 RESULTS_NODE_WAIT = 30
+# How many connections wait for the node at once. Each holds a thread and two
+# descriptors while it does, and this listener carries the runner's logs and step
+# updates, so one past the bound fails open at once rather than risk them.
+NODE_WAITERS = threading.BoundedSemaphore(64)
 # How long the adapter waits for an answer that has not started arriving. It
 # begins once the request body is written -- every read and write before that is
 # bounded per operation by RELAY_TIMEOUT -- and every byte received resets it, so
@@ -247,15 +252,27 @@ def patient_tunnel(client, upstream, authority, wait, retry=None, now=time.monot
     """
     retry = NODE_RELAY_RETRY if retry is None else retry
     deadline = now() + wait
-    while True:
-        try:
-            return node_tunnel(upstream, authority)
-        except NodeRefused:
+    try:
+        return node_tunnel(upstream, authority)
+    except NodeRefused:
+        raise
+    except OSError:  # ConnectionError and a timeout among them
+        if now() + retry >= deadline or not NODE_WAITERS.acquire(blocking=False):
             raise
-        except OSError:  # ConnectionError and a timeout among them
-            if now() + retry >= deadline or client_gone(client):
-                raise
+    try:
+        while True:
+            if client_gone(client):
+                raise ConnectionError("the client went away while the node was away")
             sleep(retry)
+            try:
+                return node_tunnel(upstream, authority)
+            except NodeRefused:
+                raise
+            except OSError:
+                if now() + retry >= deadline:
+                    raise
+    finally:
+        NODE_WAITERS.release()
 
 
 def direct_tunnel(addresses):
