@@ -92,10 +92,14 @@ func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []str
 			return err
 		}
 
-		fitsNow := false
+		fitsNow, fitsOwn := false, false
 
 		for _, n := range place.order {
-			if n.name != own && place.roomFor(n.name, t) > 0 && !slices.Contains(avoid, n.name) {
+			switch {
+			case place.roomFor(n.name, t) < 1 || slices.Contains(avoid, n.name):
+			case n.name == own:
+				fitsOwn = true
+			default:
 				fitsNow = true
 			}
 		}
@@ -141,7 +145,7 @@ func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []str
 			}
 		}
 
-		behindAsLarge = !fitsNow && usable > 0 && usable == asLarge
+		behindAsLarge = !fitsNow && !fitsOwn && usable > 0 && usable == asLarge
 
 		return nil
 	})

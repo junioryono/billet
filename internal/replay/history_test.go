@@ -537,6 +537,24 @@ func laterShare(t *testing.T, r *Report) float64 {
 // Under direct assignment, the protocol on which a tier is ever recorded waiting
 // (#686). BILLET_REPLAY_JOBS and BILLET_REPLAY_HOSTS size it for the record, the
 // table then being kept under -replay.out.
+// UNDER HOLD A WEIGHT STILL DIVIDES THE ROOM: tiers of one shape run into a lease as large,
+// so none is given a host, and the order they buy in is the rank's.
+func TestAWeightDividesTheRoomUnderHold(t *testing.T) {
+	fleet := twoTargets(2, 1)
+	fleet.AdmissionOrder = config.AdmissionHold
+
+	report := Run(t, fleet, ContendedTargets(1, ContendedParams{Params: Params{Jobs: 80}, Fleet: fleet}),
+		Options{DirectAssignment: true, Log: discardLogger()})
+	if why := report.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	if share := laterShare(t, report); share < 0.60 || share > 0.73 {
+		t.Errorf("weighted 2:1 under hold, the first target held %.3f of the contested vCPU; want about 2/3\n%s", share,
+			report.TargetTable(4))
+	}
+}
+
 func TestContendedRoomIsDividedByWeight(t *testing.T) {
 	jobs := 80
 	if n := os.Getenv("BILLET_REPLAY_JOBS"); n != "" {
@@ -848,8 +866,15 @@ func TestComparePolicies(t *testing.T) {
 			}
 		}
 
+		seed := uint64(1)
+		if n := os.Getenv("BILLET_REPLAY_SEED"); n != "" {
+			if _, err := fmt.Sscan(n, &seed); err != nil {
+				t.Fatalf("BILLET_REPLAY_SEED=%q is not a seed", n)
+			}
+		}
+
 		fleet = WideFleet()
-		trace = WideShapeMix(1, WideParams{Params: Params{Jobs: jobs}, Fleet: fleet})
+		trace = WideShapeMix(seed, WideParams{Params: Params{Jobs: jobs}, Fleet: fleet})
 	case "file":
 		trace, fleet = readExported(t, os.Getenv("BILLET_REPLAY_TRACE"), os.Getenv("BILLET_REPLAY_FLEET"))
 		opts.SettleWithin = 5 * time.Minute

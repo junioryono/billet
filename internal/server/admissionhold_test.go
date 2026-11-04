@@ -370,41 +370,64 @@ func TestALateHostAlsoHoldsTheLine(t *testing.T) {
 	}
 }
 
-// A BUYER WITH A HOST THE WAITER CANNOT USE takes nothing the waiter waits for, as wide or not.
-func TestABuyerWithAHostAWaiterCannotUseBuysThere(t *testing.T) {
+// WHETHER A BUYER MAY BUY IS READ FROM THE PLAN IT BUYS AGAINST: its owner gone, the host goes
+// to the waiter next, whose late host holds the line for this buyer and not the one after.
+func TestWhetherABuyerMayBuyReadsTheHoldsItBuysAgainst(t *testing.T) {
 	t.Parallel()
 
-	q := holdQueue(wantsHosts{"waiter", nil}, wantsHosts{"owner", []string{"h"}})
+	q := holdQueue(wantsHosts{"owner", []string{"a"}}, wantsHosts{"next", nil})
 
 	q.mu.Lock()
-	waiter := q.waiting["waiter"]
-	waiter.where = sized(4, "g")
-	q.waiting["waiter"] = waiter
+	next := q.waiting["next"]
+	next.candidates = []alloc.HoldCandidate{{Node: "a", Late: true}}
+	q.waiting["next"] = next
+	q.planHolds()
 	q.mu.Unlock()
 
-	q.behindAsLarge("waiter")
+	q.served("owner")
 
-	if !q.mayBuy("owner", sized(16, "h", "g")) {
-		t.Error("the owner of a host the waiter cannot use was held back")
+	if q.mayBuy("buyer", sized(2, "a", "b", "c")) {
+		t.Error("a buyer passed a waiter this purchase's plan gives a late host")
+	}
+}
+
+// UNDER HOLD A PURCHASE AND THE PLAN AGREE ON WHO IS RANKED: a waiter of no target that holds
+// back nobody still turns both to oldest first, or the plan gives the older waiter a host
+// that only the younger, ranked ahead by the purchase, may buy on.
+func TestAWaiterOfNoTargetTurnsAPurchaseAndThePlanAlike(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"behind": 0.1, "ahead": 0.5}
+
+	q := newAdmissionQueue(config.AdmissionHold)
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	q.now = func() time.Time { return at }
+	q.lastRanks = ranks
+	q.waiting["older"] = waitingTier{since: at, progress: at, where: ranked("ahead", ranks), candidates: candidatesOn("h")}
+	q.waiting["younger"] = waitingTier{since: at.Add(time.Second), progress: at, where: ranked("behind", ranks),
+		candidates: candidatesOn("h")}
+	q.waiting["unread"] = waitingTier{since: at.Add(2 * time.Second), progress: at, where: on("c"), candidates: candidatesOn("c")}
+
+	if got := holdsOf(q); got["h"] != "older" {
+		t.Fatalf("the plan gives h to %q; want the older", got["h"])
 	}
 
-	if q.mayBuy("no-host", sized(16, "h", "g")) {
-		t.Error("a buyer as wide with no host passed the waiter")
+	if !q.mayBuy("older", ranked("ahead", ranks)) {
+		t.Error("the older waiter holding h was held back by the rank the plan set aside")
 	}
 
-	// A HOST THE WAITER CAN USE IS NO SUCH LICENCE.
-	q = holdQueue(wantsHosts{"waiter", nil}, wantsHosts{"owner", []string{"g"}})
+	// ONE THAT HAS STALLED TURNS NEITHER: it has stepped aside, and its read may never come.
+	q = newAdmissionQueue(config.AdmissionHold)
+	q.now = func() time.Time { return at.Add(WaiterAllowance + time.Second) }
+	q.lastRanks = ranks
+	now := q.now()
+	q.waiting["older"] = waitingTier{since: at, progress: now, where: ranked("ahead", ranks), candidates: candidatesOn("h")}
+	q.waiting["younger"] = waitingTier{since: at.Add(time.Second), progress: now, where: ranked("behind", ranks),
+		candidates: candidatesOn("h")}
+	q.waiting["unread"] = waitingTier{since: at.Add(2 * time.Second), progress: at, where: on("c")}
 
-	q.mu.Lock()
-	waiter = q.waiting["waiter"]
-	waiter.where = sized(4, "g")
-	q.waiting["waiter"] = waiter
-	q.mu.Unlock()
-
-	q.behindAsLarge("waiter")
-
-	if q.mayBuy("owner", sized(16, "g", "h")) {
-		t.Error("the owner of a host the waiter can use passed it")
+	if got := holdsOf(q); got["h"] != "younger" {
+		t.Errorf("with the unread waiter stalled the plan gives h to %q; want the rank's", got["h"])
 	}
 }
 

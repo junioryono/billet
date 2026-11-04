@@ -241,7 +241,7 @@ func (q *admissionQueue) holds() bool {
 // blocks requires q.mu. It reports whether a waiter holds a buyer at where back. Under
 // hold, see HOLD HOLDS ONE HOST above. A shape that could not be read is at least as wide
 // as anything, because an unknown is not a licence to bypass the order.
-func (q *admissionQueue) blocks(tier string, where alloc.TierAdmission, waiter waitingTier) bool {
+func (q *admissionQueue) blocks(where alloc.TierAdmission, waiter waitingTier) bool {
 	if !competes(where, waiter.where) {
 		return false
 	}
@@ -270,11 +270,6 @@ func (q *admissionQueue) blocks(tier string, where alloc.TierAdmission, waiter w
 		return true
 	}
 
-	// A BUYER WITH A HOST THE WAITER CANNOT USE takes nothing it waits for by buying there.
-	if own := q.waiting[tier].held; own != "" && !slices.Contains(waiter.where.Nodes, own) {
-		return false
-	}
-
 	return where.VCPU >= waiter.where.VCPU && where.Memory >= waiter.where.Memory
 }
 
@@ -288,7 +283,8 @@ func (q *admissionQueue) inOrder(now time.Time) []string {
 	for label := range q.waiting {
 		order = append(order, label)
 
-		if _, known := ranks[q.waiting[label].where.Target]; !known {
+		waiter := q.waiting[label]
+		if _, known := ranks[waiter.where.Target]; !known && holdsTheLine(waiter, now) {
 			ranks = nil
 		}
 	}
@@ -629,7 +625,13 @@ func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission, now ti
 
 	for label := range q.waiting {
 		waiter := q.waiting[label]
-		if label != tier && (!q.blocks(tier, where, waiter) || !holdsTheLine(waiter, now)) {
+		if !holdsTheLine(waiter, now) && label != tier {
+			continue
+		}
+
+		// UNDER HOLD EVERY WAITER COUNTS, IN THE PLAN AS HERE: holds are given by this
+		// order and bind by it, so the two must not differ on who is ranked at all.
+		if label != tier && q.policy != config.AdmissionHold && !q.blocks(where, waiter) {
 			continue
 		}
 
@@ -706,14 +708,13 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 // it; an empty label means nobody holds it. It logs nothing, so naming the
 // holder does not spend letPast's once-per-stall line.
 func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, time.Time, []string) {
-	return q.headAmong(tier, where, func(where alloc.TierAdmission, waiter waitingTier) bool {
-		return q.blocks(tier, where, waiter)
-	})
+	return q.headAmong(tier, where, q.blocks)
 }
 
-// refreshBuyer requires q.mu. Under hold it brings this buyer's record up to this read
-// before anything is decided from it: its standing may still say it was below its floor,
-// and what it avoids is read from where it stands.
+// refreshBuyer requires q.mu. Under hold it brings what the order reads up to this read
+// before anything is decided from it: this buyer's standing, which may still say it was
+// below its floor, and the holds, so that whether it may buy, whom it leaves room for and
+// what it avoids are read from one plan.
 func (q *admissionQueue) refreshBuyer(tier string, where alloc.TierAdmission) {
 	if q.policy != config.AdmissionHold || (where.Target == "" && len(where.Nodes) == 0) {
 		return
@@ -724,6 +725,8 @@ func (q *admissionQueue) refreshBuyer(tier string, where alloc.TierAdmission) {
 		waiter.where.Nodes = slices.Clone(where.Nodes)
 		q.waiting[tier] = waiter
 	}
+
+	q.planHolds()
 }
 
 // headAmong is head over the waiters inLine says hold this buyer back.
@@ -878,7 +881,7 @@ func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string 
 	var out []string
 	for label := range q.waiting {
 		waiter := q.waiting[label]
-		if label == tier || !q.blocks(tier, where, waiter) || q.steppedAside(label, waiter, ranks, now) {
+		if label == tier || !q.blocks(where, waiter) || q.steppedAside(label, waiter, ranks, now) {
 			continue
 		}
 

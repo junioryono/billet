@@ -277,6 +277,11 @@ func TestBehindALeaseAsLargeIsReportedOnlyWhenItIsTheWholeReason(t *testing.T) {
 		t.Errorf("a waiter that fits now and holds a host reads as behind a lease as large: %v, %v", behind, err)
 	}
 
+	// ON ITS OWN HOST TOO: b has room for it beside a lease as large, and b is what it holds.
+	if _, behind, err := a.HoldCandidates(t.Context(), "anywhere", []string{"nobody"}, "b"); err != nil || behind {
+		t.Errorf("a waiter with room on its own host reads as behind a lease as large: %v, %v", behind, err)
+	}
+
 	last := startRunning(t, a, "eight-b")
 
 	if got, behind := behindNow(); len(got) != 0 || !behind {
