@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -399,20 +400,31 @@ func TestAManualPublishIsHeldToTheImagesMachine(t *testing.T) {
 
 	const snaps = `[{"name":"g20261001000000"},{"name":"g20261002000000"},{"name":"a-note"}]`
 
+	// table is `image-meta list` as rbd prints it, as measured on a real image 2026-11-04,
+	// with the key a hand-run publish left there, which holds a raw newline. Its JSON is
+	// what jq cannot read, and these rows must not stop anything.
+	table := func(rows ...string) string {
+		return fmt.Sprintf("There are %d metadata on this image:\n\nKey  Value\n", len(rows)+1) +
+			"billet.runner_version.    kernel_image: /home/junior/fc-smoke/vmlinux-billet\ng20260814061844  2.320.0\n" +
+			strings.Join(rows, "\n") + "\n"
+	}
+
 	for name, tc := range map[string]struct {
 		snaps, meta string
 		failSnap    bool
 		failMeta    bool
 		says        string
 	}{
-		"every generation its own":  {snaps: snaps, meta: `{"billet.arch.g20261001000000":"aarch64","billet.arch.g20261002000000":"aarch64"}`},
-		"an image with none":        {snaps: "[]", meta: ""},
-		"another machine's":         {snaps: snaps, meta: `{"billet.arch.g20261001000000":"aarch64","billet.arch.g20261002000000":"x86_64"}`, says: "is x86_64's and this build is aarch64's"},
-		"one with no record":        {snaps: snaps, meta: `{"billet.arch.g20261001000000":"aarch64"}`, says: "g20261002000000 records no machine"},
-		"none with a record":        {snaps: snaps, meta: "", says: "records no machine"},
-		"generations unreadable":    {snaps: snaps, failSnap: true, says: "could not list the generations"},
-		"metadata unreadable":       {snaps: snaps, failMeta: true, says: "could not read what"},
-		"a listing that is no list": {snaps: `{"oops":1}`, meta: "", says: "could not read the generations"},
+		"every generation its own":             {snaps: snaps, meta: table("billet.arch.g20261001000000  aarch64", "billet.arch.g20261002000000  aarch64")},
+		"an image with none":                   {snaps: "[]", meta: ""},
+		"another machine's":                    {snaps: snaps, meta: table("billet.arch.g20261001000000  aarch64", "billet.arch.g20261002000000  x86_64"), says: "is x86_64's and this build is aarch64's"},
+		"one with no record":                   {snaps: snaps, meta: table("billet.arch.g20261001000000  aarch64"), says: "g20261002000000 records no machine"},
+		"none with a record":                   {snaps: snaps, meta: "", says: "records no machine"},
+		"a key that only begins with the name": {snaps: `[{"name":"g20261001000000"}]`, meta: table("billet.arch.g20261001000000.old  aarch64"), says: "g20261001000000 records no machine"},
+		"generations unreadable":               {snaps: snaps, failSnap: true, says: "could not list the generations"},
+		"metadata unreadable":                  {snaps: snaps, failMeta: true, says: "could not read what"},
+		"a fraction of a second, which ceph.ParseGeneration takes": {snaps: `[{"name":"g20261001000000.5"}]`, meta: table("billet.arch.g20261001000000.5  x86_64"), says: "is x86_64's and this build is aarch64's"},
+		"a listing that is no list":                                {snaps: `{"oops":1}`, meta: "", says: "could not read the generations"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -483,32 +495,61 @@ func TestNoScriptNamesAMachineOutsideItsTable(t *testing.T) {
 
 	literal := regexp.MustCompile(`x64|X64|amd64|x86_64|aarch64|arm64|AARCH64`)
 
+	// WHOLE LINES, once each: a fragment would excuse whatever else is on its line.
 	for script, allowed := range map[string][]string{
 		"build-guest-image.sh": {
-			`SCOPE=guest-x64 PLAN_NAME=plan.json`, `RUNNER_PLATFORM=linux-x64 GUEST_GOARCH=amd64`, `IMAGE_NAME_DEFAULT=ubuntu-2404-x64`,
-			`SCOPE=guest-arm64 PLAN_NAME=plan-arm64.json`, `RUNNER_PLATFORM=linux-arm64 GUEST_GOARCH=arm64`, `IMAGE_NAME_DEFAULT=ubuntu-2404-arm64`,
-			"x86_64)", "aarch64)", `if [ "$TOOLSET_PIN_KEY" = x64 ]; then`, `if [ "$RUNNER_PLATFORM" = linux-x64 ]; then`,
-			`echo "this host is $MACHINE, and billet builds guests for x86_64 and aarch64 only" >&2`,
+			`x86_64)`,
+			`SCOPE=guest-x64 PLAN_NAME=plan.json TOOLSET_NAME=toolset-2404.json TOOLSET_PIN_KEY=x64`,
+			`RUNNER_PLATFORM=linux-x64 GUEST_GOARCH=amd64 TOOLCACHE_ARCH=x64 BASE_ARCH=amd64`,
+			`IMAGE_NAME_DEFAULT=ubuntu-2404-x64`,
+			`aarch64)`,
+			`SCOPE=guest-arm64 PLAN_NAME=plan-arm64.json TOOLSET_NAME=toolset-2404-arm64.json TOOLSET_PIN_KEY=arm64`,
+			`RUNNER_PLATFORM=linux-arm64 GUEST_GOARCH=arm64 TOOLCACHE_ARCH=arm64 BASE_ARCH=arm64`,
+			`IMAGE_NAME_DEFAULT=ubuntu-2404-arm64`,
+			`if [ "$RUNNER_PLATFORM" = linux-x64 ]; then`,
 			`echo "its first line is '<version> <sha256 of the linux-x64 tarball>' and each after it" >&2`,
+			`if [ "$TOOLSET_PIN_KEY" = x64 ]; then`,
+			`echo "this host is $MACHINE, and billet builds guests for x86_64 and aarch64 only" >&2`,
 		},
+		// x64 AND _X64 BESIDE THE TABLE ARE GITHUB'S ON BOTH MACHINES: install-awf.sh and
+		// install-java-tools.sh write those names.
 		"check-guest-image.sh": {
-			"x86_64)", "aarch64)", `TOOLSET_NAME=toolset-2404.json PLAN_NAME=plan.json TOOLCACHE_ARCH=x64`,
-			`JAVA_ARCH=amd64 GOROOT_SUFFIX=X64 ELF_MACHINE=62`, `TOOLSET_NAME=toolset-2404-arm64.json PLAN_NAME=plan-arm64.json TOOLCACHE_ARCH=arm64`,
-			`JAVA_ARCH=arm64 GOROOT_SUFFIX=AARCH64 ELF_MACHINE=183`, `if [ "$GUEST_MACHINE" = aarch64 ]; then`,
+			`x86_64)`,
+			`TOOLSET_NAME=toolset-2404.json PLAN_NAME=plan.json TOOLCACHE_ARCH=x64`,
+			`JAVA_ARCH=amd64 GOROOT_SUFFIX=X64 ELF_MACHINE=62`,
+			`aarch64)`,
+			`TOOLSET_NAME=toolset-2404-arm64.json PLAN_NAME=plan-arm64.json TOOLCACHE_ARCH=arm64`,
+			`JAVA_ARCH=arm64 GOROOT_SUFFIX=AARCH64 ELF_MACHINE=183`,
+			`if [ "$GUEST_MACHINE" = aarch64 ]; then`,
 			`echo "this host is $(uname -m), and billet builds guests for x86_64 and aarch64 only;" >&2`,
-			// x64 ON BOTH: GitHub's install-awf.sh and install-java-tools.sh write these.
-			`/agentic-workflow-firewall-js/*/x64/awf-bundle.js`, `${entry%/x64/awf-bundle.js}/x64.complete`,
-			`[ -L "$candidate/x64" ]`, `"$(readlink "$candidate/x64")"`, `[ ! -f "$entry/x64.complete" ]`,
-			`has no x64.complete`, `JAVA_HOME_${v}_X64`,
+			`for entry in "$tc"/agentic-workflow-firewall-js/*/x64/awf-bundle.js; do`,
+			`[ -f "$entry" ] && [ -s "$entry" ] && [ -f "${entry%/x64/awf-bundle.js}/x64.complete" ] && found=1`,
+			`if ! grep -qxF "JAVA_HOME_${v}_X64=$home" "$MNT/etc/billet-image-env"; then`,
+			`fail "java $v is installed and JAVA_HOME_${v}_X64 does not name $home.`,
+			`[ -L "$candidate/x64" ] || continue`,
+			`if [ "$(readlink "$candidate/x64")" = "$home" ]; then`,
+			`if [ ! -f "$entry/x64.complete" ]; then`,
+			`fail "the java $v toolcache entry $(basename "$entry") has no x64.complete`,
+			`pass "java $v runs, JAVA_HOME_${v}_X64 names it, toolcache entry $(basename "$entry")"`,
 		},
 	} {
-		for _, line := range strings.Split(withoutShellComments(readScriptFile(t, script)), "\n") {
-			if !literal.MatchString(line) {
-				continue
-			}
+		var got []string
 
-			if !slices.ContainsFunc(allowed, func(want string) bool { return strings.Contains(line, want) }) {
-				t.Errorf("%s names a machine outside its table: %s", script, strings.TrimSpace(line))
+		for _, line := range strings.Split(withoutShellComments(readScriptFile(t, script)), "\n") {
+			if trimmed := strings.TrimSpace(line); literal.MatchString(trimmed) {
+				got = append(got, trimmed)
+			}
+		}
+
+		for _, line := range got {
+			if !slices.Contains(allowed, line) {
+				t.Errorf("%s names a machine outside its table: %s", script, line)
+			}
+		}
+
+		for _, line := range allowed {
+			if !slices.Contains(got, line) {
+				t.Errorf("%s no longer has the line this allows, so it allows nothing: %s", script, line)
 			}
 		}
 	}

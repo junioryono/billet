@@ -2857,21 +2857,24 @@ refuse_another_machine() {
 		echo "could not list the generations of $IMAGE_POOL/$IMAGE_NAME to hold them to $MACHINE" >&2
 		exit 1
 	fi
-	if ! meta=$("${rbd[@]}" -p "$IMAGE_POOL" image-meta list "$IMAGE_NAME" --format json); then
+	# THE TABLE, AS ceph.GenerationArches READS IT, NEVER --format json. rbd does not escape
+	# a key in its JSON, and a reference image holds one with a raw newline, from a hand-run
+	# publish in August: jq refuses that whole output, so every publish to it would stop.
+	# In the table such a key is only some more rows nothing asks for, and an image with no
+	# metadata is no rows, where its JSON is zero bytes (both measured 2026-11-04).
+	if ! meta=$("${rbd[@]}" -p "$IMAGE_POOL" image-meta list "$IMAGE_NAME"); then
 		echo "could not read what $IMAGE_POOL/$IMAGE_NAME records of its generations" >&2
 		exit 1
 	fi
-	# rbd ANSWERS NOTHING FOR AN IMAGE WITH NO METADATA.
-	[ -n "$meta" ] || meta='{}'
-	if ! snaps=$(jq -er '[.[].name | select(test("^g[0-9]{14}$"))] | join(" ")' <<<"$snaps"); then
+	# EVERY NAME ceph.ParseGeneration TAKES FOR ONE, whose time parser also accepts a
+	# fraction of a second, and any it would refuse for a date it cannot read: a generation
+	# this skipped is one this could write another machine beside.
+	if ! snaps=$(jq -er '[.[].name | select(test("^g[0-9]{14}([.,][0-9]+)?$"))] | join(" ")' <<<"$snaps"); then
 		echo "could not read the generations of $IMAGE_POOL/$IMAGE_NAME" >&2
 		exit 1
 	fi
 	for gen in $snaps; do
-		if ! said=$(jq -er --arg key "billet.arch.$gen" '.[$key] // ""' <<<"$meta"); then
-			echo "could not read what $IMAGE_POOL/$IMAGE_NAME records of $gen" >&2
-			exit 1
-		fi
+		said=$(awk -v key="billet.arch.$gen" '$1 == key { print $2; exit }' <<<"$meta")
 		if [ -z "$said" ]; then
 			echo "$IMAGE_NAME@$gen records no machine, so a generation of $MACHINE cannot join it;" >&2
 			echo "run \`billet images pull\` on a node, which learns it from the generation, or" >&2
