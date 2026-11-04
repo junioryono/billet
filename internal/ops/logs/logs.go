@@ -451,10 +451,18 @@ func bucketOf(at time.Time, histogram string) time.Time {
 	return at.UTC().Truncate(time.Hour)
 }
 
+// readTextBudget bounds reading back one search's lines.
+const readTextBudget = 2 * time.Minute
+
 // readText reads back the printed lines, a lease at a time. WHAT CANNOT BE READ IS SAID
 // on each line: a node that is gone, a log it has evicted or a control plane that is not
 // running here says nothing of whether the line exists, since the index says it does.
 func (s *search) readText(ctx context.Context, result *Result) {
+	// ALL OF IT, since each lease may wait out a node that is registered and not polling: what
+	// is past this says it was not read.
+	ctx, cancel := context.WithTimeout(ctx, readTextBudget)
+	defer cancel()
+
 	byLease := map[string][]int{}
 	for i := range result.Lines {
 		byLease[result.Lines[i].Lease] = append(byLease[result.Lines[i].Lease], i)

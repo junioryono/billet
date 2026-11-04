@@ -1768,8 +1768,10 @@ func (h *handler) logChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// NOT A REFUSAL, which a node takes as for good and marks past: an index can come back under
+	// the id the node still holds. Its next registration says whether there is one.
 	if h.logs == nil {
-		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, "this control plane keeps no index of job logs")
+		writeErr(w, http.StatusServiceUnavailable, "", "this control plane holds no index of job logs now")
 
 		return
 	}

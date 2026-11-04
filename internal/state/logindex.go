@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/joblog"
@@ -448,10 +449,23 @@ type logChunkRow struct {
 	receivedAt             int64
 }
 
+// logDayIsEmpty says a failed search of a day met a day with nothing in it: removed by the
+// retention since its name was read, or created a moment ago and its schema still being written.
+// Neither held a line, so neither ends a search of the other days. Any other failure does.
+func logDayIsEmpty(path string, err error) bool {
+	if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+		return true
+	}
+
+	return strings.Contains(err.Error(), "no such table")
+}
+
 // searchLogDay searches one file. stopped says the search is over, and more whether its
 // bound is what ended it, as against the caller's Visit.
 func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (more, stopped bool, err error) {
-	db, err := sql.Open("sqlite", dsn(path, "busy_timeout(5000)", "query_only(ON)"))
+	// mode=ro, OR A MISSING FILE IS CREATED: a retention removing this day while the search
+	// reached it would leave an empty file behind, which no later pass would remove.
+	db, err := sql.Open("sqlite", dsnWith(path, map[string]string{"mode": "ro"}, "busy_timeout(5000)", "query_only(ON)"))
 	if err != nil {
 		return false, false, fmt.Errorf("state: open a day of the log index: %w", err)
 	}
@@ -463,6 +477,10 @@ func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (
 
 	rows, err := db.QueryContext(ctx, `SELECT rowid FROM lines WHERE lines MATCH ? ORDER BY rowid DESC`, s.Match) //billet:ignore rawsql // the log index is not the ledger, and sqlc has no catalogue entry for a virtual table
 	if err != nil {
+		if logDayIsEmpty(path, err) {
+			return false, false, nil
+		}
+
 		return false, false, fmt.Errorf("state: search a day of the log index: %w", err)
 	}
 	defer rows.Close()
@@ -574,14 +592,15 @@ func (j *logJobs) readChunks(ctx context.Context, job int64) ([]logChunkRow, err
 // own, so quoting it is no leak.
 var ErrLogQuery = errors.New("a query this index cannot search")
 
-// logIndexMinTerm is the shortest term a trigram can find: a shorter one matches nothing
-// and says nothing (measured 2026-11-04), which would read as no such line.
+// logIndexMinTerm is the shortest term a trigram can find, in characters, which is what the
+// tokenizer walks: a shorter one matches nothing and says nothing (measured 2026-11-04 on ASCII),
+// which would read as no such line.
 const logIndexMinTerm = 3
 
 // BuildLogMatch writes the FTS5 query for terms a line must hold and terms it must not,
 // each quoted so nothing in one is read as an operator. A line must hold at least one
 // term, because a query of only exclusions is a syntax error (measured 2026-11-04), and a
-// term of fewer than three bytes is refused, since a trigram cannot find it and the
+// term of fewer than three characters is refused, since a trigram cannot find it and the
 // answer would read as no such line.
 func BuildLogMatch(must, mustNot []string) (string, error) {
 	if len(must) == 0 {
@@ -589,8 +608,8 @@ func BuildLogMatch(must, mustNot []string) (string, error) {
 	}
 
 	quote := func(term string) (string, error) {
-		if len(term) < logIndexMinTerm {
-			return "", fmt.Errorf("%w: %q is under %d bytes, which a trigram index cannot find", ErrLogQuery, term,
+		if utf8.RuneCountInString(term) < logIndexMinTerm {
+			return "", fmt.Errorf("%w: %q is under %d characters, which a trigram index cannot find", ErrLogQuery, term,
 				logIndexMinTerm)
 		}
 

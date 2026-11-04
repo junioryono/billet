@@ -35,4 +35,4 @@ Three things bound the design. The ledger's single writer slot must stay free fo
 - Search reaches back as far as the nodes kept the text and the index kept the day, whichever is shorter.
 - A node's disk carries the logs of what it ran; `billet check` does not yet report how full that is.
 - Only an image whose agent is new enough sends logs. An older image's job has none, and its report is unaffected.
-- The trigram index is about three times the text it covers, and it cannot find a term of fewer than three bytes, which the query parser refuses rather than answering nothing.
+- The trigram index is about three times the text it covers, and it cannot find a term of fewer than three characters, which the query parser refuses rather than answering nothing.

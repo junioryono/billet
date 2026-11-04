@@ -35,6 +35,8 @@ const (
 	// report's: a busy step writes far faster than an agent samples.
 	jobLogRefill = 200 * time.Millisecond
 	jobLogBurst  = 16
+	// jobLogDecodeSlots bounds the chunks the whole node decodes at once.
+	jobLogDecodeSlots = 4
 	// guestLogInterval is how often the agent is asked to send what it has of a step's
 	// lines. A search has what a job wrote within about this.
 	guestLogInterval = 10 * time.Second
@@ -109,11 +111,19 @@ type leaseLog struct {
 	// read back a different line than it matched. swept says its chunks are gone.
 	evictedAt time.Time
 	swept     bool
+
+	// shippedIndex and shippedThrough are how far this process knows the lease reached an index,
+	// so a pass with nothing new reads no directory. readFailed says a read of its files has been
+	// logged, once.
+	shippedIndex   string
+	shippedThrough int64
+	readFailed     bool
 }
 
-// NewJobLogStore loads what an earlier process kept under stateDir. A chunk file that
-// cannot be named or read back is left where it is and said once: it holds a line
-// number other chunks' numbers count past.
+// NewJobLogStore loads what an earlier process kept under stateDir. A LEASE THAT CANNOT BE READ
+// DOES NOT STOP THE NODE: losing it loses no decision. It is said once and refused from then on,
+// since nobody knows what numbers it holds, and a chunk file whose name cannot be read is left
+// where it is.
 func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*JobLogStore, error) {
 	s := &JobLogStore{dir: filepath.Join(stateDir, jobLogDirectory), limits: limits, log: log, now: time.Now,
 		leases: map[string]*leaseLog{}, wake: make(chan struct{}, 1), evictNow: make(chan struct{}, 1)}
@@ -145,7 +155,12 @@ func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*Jo
 
 		chunks, err := s.chunksOf(e.Name())
 		if err != nil {
-			return nil, err
+			s.log.Warn("could not read a job's kept log; it takes no more and is left as it is",
+				"lease", e.Name(), "error", err)
+
+			s.leases[e.Name()] = &leaseLog{evictedAt: s.now(), swept: true}
+
+			continue
 		}
 
 		l := &leaseLog{seqs: map[uint64]bool{}}
@@ -255,6 +270,16 @@ func (s *JobLogStore) chunksOf(leaseID string) ([]keptChunk, error) {
 
 // ErrJobLogBudget says a job, or the node, has no more room for a job's log.
 var ErrJobLogBudget = errors.New("node: this job's log budget is spent")
+
+// spent says a lease will take nothing more, which costs a caller no body to find out.
+func (s *JobLogStore) spent(leaseID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	l := s.leases[leaseID]
+
+	return l != nil && (!l.evictedAt.IsZero() || l.bytes >= s.limits.MaxJobBytes)
+}
 
 // Keep stores one chunk the guest sent, encoded as it arrived, numbering its lines from
 // where the lease's last chunk ended. A number seen before is kept already, which is what
@@ -588,8 +613,10 @@ func (s *JobLogStore) leaseIDsLocked() []string {
 	return ids
 }
 
-// shipPass sends what the index does not hold yet, stopping at the first thing that
-// could not be told, since the next chunk would very likely meet the same.
+// shipPass sends what the index does not hold yet, stopping when the control plane could not
+// be told, since the next chunk would very likely meet the same. A LOCAL FILE THAT CANNOT BE READ
+// STOPS ONLY ITS OWN LEASE: oldest first, it would otherwise stop every newer job's for as long as
+// it is kept.
 func (s *JobLogStore) shipPass(ctx context.Context, sink JobLogSink) {
 	index, ok := sink.LogIndexID()
 	if !ok {
@@ -611,7 +638,7 @@ func (s *JobLogStore) shipPass(ctx context.Context, sink JobLogSink) {
 // for now. The mark is written once for the lease, not for each chunk: a crash costs a
 // repeat, which the index ignores.
 func (s *JobLogStore) shipLease(ctx context.Context, sink JobLogSink, index, leaseID string) bool {
-	if s.evicted(leaseID) {
+	if s.evicted(leaseID) || s.shippedAll(leaseID, index) {
 		return true
 	}
 
@@ -626,9 +653,9 @@ func (s *JobLogStore) shipLease(ctx context.Context, sink JobLogSink, index, lea
 	}
 
 	if err != nil {
-		s.log.Warn("could not list a job's kept log; trying again", "lease", leaseID, "error", err)
+		s.readFailed(leaseID, err)
 
-		return false
+		return true
 	}
 
 	reached, ok := mark.Through, true
@@ -645,9 +672,7 @@ func (s *JobLogStore) shipLease(ctx context.Context, sink JobLogSink, index, lea
 		}
 
 		if err != nil {
-			s.log.Warn("could not read a chunk of a job's kept log; trying again", "lease", leaseID, "error", err)
-
-			ok = false
+			s.readFailed(leaseID, err)
 
 			break
 		}
@@ -682,7 +707,43 @@ func (s *JobLogStore) shipLease(ctx context.Context, sink JobLogSink, index, lea
 		}
 	}
 
+	s.shippedTo(leaseID, index, reached)
+
 	return ok
+}
+
+// shippedAll says this process knows a lease's every chunk reached this index.
+func (s *JobLogStore) shippedAll(leaseID, index string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	l := s.leases[leaseID]
+
+	return l != nil && l.shippedIndex == index && l.shippedThrough >= l.nextLine
+}
+
+func (s *JobLogStore) shippedTo(leaseID, index string, through int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if l := s.leases[leaseID]; l != nil {
+		l.shippedIndex, l.shippedThrough = index, through
+	}
+}
+
+// readFailed says once that a lease's files could not be read for shipping. Each pass tries again,
+// and the log has it from the first.
+func (s *JobLogStore) readFailed(leaseID string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	l := s.leases[leaseID]
+	if l == nil || l.readFailed {
+		return
+	}
+
+	l.readFailed = true
+	s.log.Warn("could not read a job's kept log to index it; trying again", "lease", leaseID, "error", err)
 }
 
 func (s *JobLogStore) evicted(leaseID string) bool {
@@ -834,6 +895,12 @@ func (s *CacheService) acceptGuestLog(w http.ResponseWriter, r *http.Request, se
 		return
 	}
 
+	if s.jobLogs.spent(session.leaseID) {
+		http.Error(w, "this job's log budget is spent", http.StatusRequestEntityTooLarge)
+
+		return
+	}
+
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, joblog.MaxChunkBytes))
 	if err != nil {
 		http.Error(w, "the log chunk could not be read", http.StatusBadRequest)
@@ -841,17 +908,19 @@ func (s *CacheService) acceptGuestLog(w http.ResponseWriter, r *http.Request, se
 		return
 	}
 
+	// SLOTS OF ITS OWN: every agent sends what it has left at the moment it is told to stop, and
+	// a job's final report must not be turned away behind a burst of log.
 	select {
-	case s.guestDecode <- struct{}{}:
+	case s.logDecode <- struct{}{}:
 	default:
 		retryAfter(w, time.Second)
-		http.Error(w, "the node is decoding other guests' batches", http.StatusTooManyRequests)
+		http.Error(w, "the node is decoding other guests' log chunks", http.StatusTooManyRequests)
 
 		return
 	}
 
 	chunk, err := joblog.Decode(data)
-	<-s.guestDecode
+	<-s.logDecode
 
 	// NEVER LOGGED, for a refusal's usual reason: what it would log is the guest's.
 	if err != nil {

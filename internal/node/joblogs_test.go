@@ -137,13 +137,21 @@ func TestAReadStopsAtItsBounds(t *testing.T) {
 func TestAJobPastItsBudgetIsRefused(t *testing.T) {
 	t.Parallel()
 
+	_, first := aChunkOf(t, 1, 0, "line")
 	limits := logLimits()
-	limits.MaxJobBytes = 1
+	limits.MaxJobBytes = int64(len(first)) + 1
 	s := aLogStore(t, limits)
 
-	c, data := aChunkOf(t, 1, 0, "line")
+	keepChunk(t, s, logLease, 1, "line")
+
+	c, data := aChunkOf(t, 2, 0, "another")
 	if err := s.Keep(logLease, c, data); !errors.Is(err, ErrJobLogBudget) {
 		t.Errorf("past the budget: %v", err)
+	}
+
+	got, err := s.ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 0, Last: 1}}, 1<<10)
+	if err != nil || len(got.Lines) != 1 || got.Lines[0].Text != "line" {
+		t.Errorf("what it kept reads as %+v, %v", got, err)
 	}
 }
 
@@ -329,11 +337,13 @@ func TestEvictionTakesWholeJobsOldestFirst(t *testing.T) {
 	tight := aLogStore(t, logLimits())
 	tight.now = s.now
 	keepChunk(t, tight, logLease, 1, "a")
+	now = now.Add(time.Minute)
 	keepChunk(t, tight, other, 1, "b")
-	tight.limits.MaxBytes = 1
+	tight.limits.MaxBytes = tight.total - 1
 	tight.evictPass()
-	if tight.total != 0 {
-		t.Errorf("past the bound %d bytes stayed", tight.total)
+	if !tight.evicted(logLease) || tight.evicted(other) {
+		t.Errorf("past the bound: the older evicted %t, the newer %t; want only the older, which is enough",
+			tight.evicted(logLease), tight.evicted(other))
 	}
 }
 
@@ -575,21 +585,167 @@ func TestTheLogRouteRefusesWhatItShould(t *testing.T) {
 	}
 }
 
-// A FLOOD COSTS A HEADER: past the bucket a chunk is told to wait, unread.
+// A FLOOD COSTS A HEADER: past the bucket a chunk is told to wait, unread, which a body that could
+// not be decoded proves: reading it would have answered 400.
 func TestAFloodOfChunksWaits(t *testing.T) {
 	t.Parallel()
 
 	service, token := logSession(t, true)
 
 	limited := false
-	for i := range jobLogBurst + 1 {
-		_, data := aChunkOf(t, uint64(i+1), 0, "line")
-		if postLog(t, service, token, data).Code == http.StatusTooManyRequests {
+	for range jobLogBurst + 1 {
+		if postLog(t, service, token, []byte("not a chunk")).Code == http.StatusTooManyRequests {
 			limited = true
 		}
 	}
 	if !limited {
 		t.Error("a flood past the bucket was not told to wait")
+	}
+}
+
+// A JOB WHOSE BUDGET IS SPENT COSTS NO BODY EITHER: the same undecodable body is told so, not 400.
+func TestASpentJobIsToldBeforeItsBodyIsRead(t *testing.T) {
+	t.Parallel()
+
+	service, token := logSession(t, true)
+	service.JobLogs().limits.MaxJobBytes = 1
+
+	_, data := aChunkOf(t, 1, 0, "line")
+	service.JobLogs().mu.Lock()
+	service.JobLogs().leases[logLease] = &leaseLog{seqs: map[uint64]bool{}, bytes: int64(len(data)), newest: time.Now()}
+	service.JobLogs().mu.Unlock()
+
+	if got := postLog(t, service, token, []byte("not a chunk")).Code; got != http.StatusRequestEntityTooLarge {
+		t.Errorf("a spent job's chunk answered %d", got)
+	}
+}
+
+// A LOG'S SLOTS ARE ITS OWN: with every report slot taken a chunk goes on, and the reverse is what
+// keeps a burst of log from turning away a job's final report.
+func TestLogChunksDoNotTakeAReportsSlot(t *testing.T) {
+	t.Parallel()
+
+	service, token := logSession(t, true)
+
+	for range cap(service.guestDecode) {
+		service.guestDecode <- struct{}{}
+	}
+
+	_, data := aChunkOf(t, 1, 0, "line")
+	if got := postLog(t, service, token, data).Code; got != http.StatusNoContent {
+		t.Errorf("with every report slot taken a chunk answered %d", got)
+	}
+
+	for range cap(service.logDecode) {
+		service.logDecode <- struct{}{}
+	}
+
+	_, again := aChunkOf(t, 2, 0, "line")
+	if got := postLog(t, service, token, again).Code; got != http.StatusTooManyRequests {
+		t.Errorf("with every log slot taken a chunk answered %d", got)
+	}
+}
+
+// A FILE THAT CANNOT BE READ STOPS ITS OWN LEASE AND NO OTHER: oldest first, it would otherwise hold
+// back every newer job's log for as long as it is kept.
+func TestAnUnreadableLogStopsOnlyItsLease(t *testing.T) {
+	t.Parallel()
+
+	const other = "ffffffffffffffffffffffffffffffff"
+
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+
+	s := aLogStore(t, logLimits())
+	s.now = func() time.Time { return now }
+
+	keepChunk(t, s, logLease, 1, "old")
+	now = now.Add(time.Minute)
+	keepChunk(t, s, other, 1, "new")
+
+	chunks, err := s.chunksOf(logLease)
+	if err != nil || len(chunks) != 1 {
+		t.Fatalf("chunksOf: %v, %v", chunks, err)
+	}
+
+	// A directory under a chunk's name is what no read of a regular file gets through.
+	path := filepath.Join(s.dir, logLease, chunks[0].name)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &fakeSink{id: "index-1"}
+	s.shipPass(t.Context(), sink)
+
+	if got := sink.got(); !sameLines(got, []int64{0}) {
+		t.Errorf("shipped %v, want the newer job's one chunk", got)
+	}
+	if !s.shippedAll(other, "index-1") {
+		t.Error("the newer job's log is not marked as shipped")
+	}
+}
+
+// A PASS WITH NOTHING NEW READS NO DIRECTORY, so what a pass costs is what is new, not what is
+// retained. A directory removed under it is what would show the read.
+func TestAPassReadsOnlyWhatIsNew(t *testing.T) {
+	t.Parallel()
+
+	s := aLogStore(t, logLimits())
+	keepChunk(t, s, logLease, 1, "one")
+
+	sink := &fakeSink{id: "index-1"}
+	s.shipPass(t.Context(), sink)
+
+	if !s.shippedAll(logLease, "index-1") {
+		t.Fatal("a lease whose every chunk shipped does not say so")
+	}
+	if s.shippedAll(logLease, "index-2") {
+		t.Error("shipped to one index reads as shipped to another")
+	}
+
+	keepChunk(t, s, logLease, 2, "two")
+	if s.shippedAll(logLease, "index-1") {
+		t.Error("a lease with a new chunk reads as shipped")
+	}
+
+	s.shipPass(t.Context(), sink)
+	if got := sink.got(); !sameLines(got, []int64{0, 1}) {
+		t.Errorf("shipped %v", got)
+	}
+}
+
+// A LEASE THAT CANNOT BE READ DOES NOT STOP THE NODE: losing it loses no decision. It takes no more,
+// since nobody knows what numbers it holds, and another goes on.
+func TestAnUnreadableLeaseDoesNotStopTheStore(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a directory whatever its mode")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, jobLogDirectory, logLease)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+
+	s, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("one unreadable lease stopped the store: %v", err)
+	}
+
+	c, data := aChunkOf(t, 1, 0, "line")
+	if err := s.Keep(logLease, c, data); !errors.Is(err, ErrJobLogBudget) {
+		t.Errorf("an unreadable lease answered %v", err)
+	}
+	if err := s.Keep("ffffffffffffffffffffffffffffffff", c, data); err != nil {
+		t.Errorf("another lease answered %v", err)
 	}
 }
 

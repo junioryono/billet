@@ -1050,8 +1050,18 @@ node:
   #   tls_cert: /etc/billet/cache/tls.crt
   #   tls_key: /etc/billet/cache/tls.key
 
+  # What this node keeps of its jobs' step logs, where a tier sets logs.keep: compressed
+  # under state_dir, the oldest jobs evicted whole. At least 1h, 64MiB and 1MiB; absent, 336h,
+  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-023.
+  #
+  # logs:
+  #   retention: 336h
+  #   max_bytes: 64GiB
+  #   max_job_bytes: 64MiB
+
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
+
 tiers:
   # SEVERAL SIZES OF ONE TIER, WITHOUT WRITING EACH ONE OUT.
   #
@@ -1186,6 +1196,8 @@ tiers:
     #   bazel:        { enabled: true, max_size: 50GiB }
     #   go:           { enabled: true, max_size: 20GiB, test_results: false }
     #   npm:          { enabled: true }    # on, as every cache is; the store is the node's (ADR-020)
+    # logs:
+    #   keep: true                     # this tier's jobs' step logs, for `billet logs search`
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker

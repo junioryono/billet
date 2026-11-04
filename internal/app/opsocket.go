@@ -55,6 +55,8 @@ type peerListener struct {
 	net.Listener
 
 	log *slog.Logger
+	// allowed says a peer's uid may use the socket: root or this service's account.
+	allowed func(uid int) bool
 }
 
 // Accept returns the next connection the peer rule admits.
@@ -68,7 +70,7 @@ func (l *peerListener) Accept() (net.Conn, error) {
 		unix, ok := conn.(*net.UnixConn)
 		if ok {
 			uid, known, err := peerUID(unix)
-			if err == nil && known && (uid == 0 || uid == os.Geteuid()) {
+			if err == nil && known && l.allowed(uid) {
 				return conn, nil
 			}
 
@@ -103,7 +105,8 @@ func listenOperator(cfg *config.Config) (*peerListener, error) {
 		return nil, fmt.Errorf("set the operator socket's mode: %w", err)
 	}
 
-	return &peerListener{Listener: ln, log: slog.Default()}, nil
+	return &peerListener{Listener: ln, log: slog.Default(),
+		allowed: func(uid int) bool { return uid == 0 || uid == os.Geteuid() }}, nil
 }
 
 // operatorLedger is what the socket reads of the ledger.

@@ -659,7 +659,9 @@ const (
 	// was sent — which is what turns bounded staleness into an ordering.
 	CommandInventory CommandKind = "inventory"
 
-	// CommandReadLog asks a node for lines of a job's log it holds (VersionJobLogs). Run
+	// CommandReadLog asks a node for lines of a job's log it holds (VersionJobLogs), taken in
+	// its turn from the queue like any command, and answered busy when the node has its limit
+	// of reads running. Run
 	// beside the node's loop, like a launch, so a search never waits behind a destroy.
 	CommandReadLog CommandKind = "read_log"
 )

@@ -461,17 +461,20 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 			return nil, err
 		}
 
+		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-023).
+		// Its nodes are told of no index, and keep what they hold until one is back. An id that
+		// cannot be read is never replaced by a new one, since that would ship everything again.
 		index, err := state.OpenLogIndex(LogIndexDir(cp.cfg))
 		if err != nil {
-			return nil, err
+			slog.Warn("this control plane has no index of job logs, so nothing new is searchable", "error", err)
+		} else {
+			c.logIndex, logIndexID = index, index.ID()
+			wireOpts = append(wireOpts, withLogIndex(newLogIndexSink(index, cp.allocator)))
+
+			c.loops.Background("log index retention", func(ctx context.Context) {
+				retainLogIndex(ctx, index, limits, slog.Default())
+			})
 		}
-
-		c.logIndex, logIndexID = index, index.ID()
-		wireOpts = append(wireOpts, withLogIndex(newLogIndexSink(index, cp.allocator)))
-
-		c.loops.Background("log index retention", func(ctx context.Context) {
-			retainLogIndex(ctx, index, limits, slog.Default())
-		})
 	}
 
 	planeOpts := append([]nodeplane.Option{

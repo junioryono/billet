@@ -18,6 +18,14 @@ import (
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
+// logReadsAtOnce bounds the log reads a node serves beside its loop.
+const logReadsAtOnce = 4
+
+// LogReader is a Compute that keeps its jobs' logs.
+type LogReader interface {
+	ReadJobLog(ctx context.Context, spec nodeapi.LogReadSpec) (nodeapi.LogReadResult, error)
+}
+
 // Compute is the part of internal/node.Runner the loop drives.
 //
 // An interface so the loop can be tested without a container runtime, and so the
@@ -31,14 +39,6 @@ import (
 // capacity a TTL later, and a container keeps running on capacity that has been
 // sold to somebody else. That is precisely the failure custody was built to
 // prevent, reintroduced by moving the runner behind a network.
-// logReadsAtOnce bounds the log reads a node serves beside its loop.
-const logReadsAtOnce = 4
-
-// LogReader is a Compute that keeps its jobs' logs.
-type LogReader interface {
-	ReadJobLog(ctx context.Context, spec nodeapi.LogReadSpec) (nodeapi.LogReadResult, error)
-}
-
 type Compute interface {
 	Launch(ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job dispatch.Job) error
 	Destroy(ctx context.Context, requestID int64) error

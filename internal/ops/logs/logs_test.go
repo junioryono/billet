@@ -60,6 +60,7 @@ func TestTheQueryIsFoundAmongTheFlags(t *testing.T) {
 		{[]string{"-x y", "--json"}, "-x y", []string{"--json"}},
 		{[]string{"--since=7d", "error"}, "error", []string{"--since=7d"}},
 		{[]string{"--job=Run tests", "error"}, "error", []string{"--job=Run tests"}},
+		{[]string{"--step=Run tests"}, "", []string{"--step=Run tests"}},
 		{[]string{"error", "--step=Set up job"}, "error", []string{"--step=Set up job"}},
 		{[]string{"one", "two"}, "one", []string{"two"}},
 		{[]string{"--json"}, "", []string{"--json"}},

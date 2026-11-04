@@ -3,11 +3,13 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -343,6 +345,60 @@ func TestAReadOfAJobTheLedgerHoldsNoneOfIsRefused(t *testing.T) {
 		t.Errorf("a job the ledger holds none of: %v", err)
 	}
 
+}
+
+// ANOTHER USER'S CONNECTION IS CLOSED BEFORE IT IS SERVED, and the listener goes on to the next.
+func TestAnotherUsersConnectionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	ln, err := listenOperator(socketConfig(t))
+	if err != nil {
+		t.Fatalf("listenOperator: %v", err)
+	}
+	defer ln.Close()
+
+	ln.log = slog.New(slog.DiscardHandler)
+
+	var allow atomic.Bool
+
+	ln.allowed = func(int) bool { return allow.Load() }
+
+	accepted := make(chan net.Conn, 1)
+
+	go func() {
+		if conn, err := ln.Accept(); err == nil {
+			accepted <- conn
+		}
+	}()
+
+	refused, err := net.Dial("unix", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer refused.Close()
+
+	if err := refused.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := refused.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("a refused connection read %v, want it closed", err)
+	}
+
+	allow.Store(true)
+
+	kept, err := net.Dial("unix", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kept.Close()
+
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(30 * time.Second):
+		t.Error("the listener did not go on to the next connection")
+	}
 }
 
 // unanswering is a ledger that cannot be read.

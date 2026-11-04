@@ -54,13 +54,16 @@ func (w *pagesWatch) wait(ctx context.Context, d time.Duration) {
 		return
 	}
 
-	// A READ DEADLINE RATHER THAN A SELECT ON ctx: a stop waits this one bound and no
-	// longer, and the shipper's next pass sees ctx ended.
 	if err := w.file.SetReadDeadline(time.Now().Add(d)); err != nil {
 		sleepFor(ctx, d)
 
 		return
 	}
+
+	// A STOP ENDS THE WAIT AT ONCE: the final budget is counted from it, and the agent's own
+	// exit budget does not leave a second to spare.
+	stop := context.AfterFunc(ctx, func() { _ = w.file.SetReadDeadline(time.Now()) })
+	defer stop()
 
 	_, _ = w.file.Read(w.buf)
 }

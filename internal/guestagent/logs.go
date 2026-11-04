@@ -46,6 +46,9 @@ const (
 	logMaxNames = 1 << 14
 	// logMaxMarks bounds the runner's marks waiting for a step log.
 	logMaxMarks = 1 << 12
+	// logMarkPolls bounds how far one look at the Worker log goes, in reads of its bound: a step's
+	// name must not be taken from a mark that a long Worker log left behind.
+	logMarkPolls = 16
 	// logReadLimit is what one pass takes of one file, and logHeldLimit what the agent
 	// holds unsent across every file; past it reading waits for the node.
 	logReadLimit = 256 << 10
@@ -370,9 +373,7 @@ func (t *logTailer) assign() {
 		return
 	}
 
-	t.marks.poll()
-	t.marked = append(t.marked, t.marks.take()...)
-	t.marked = t.marked[max(0, len(t.marked)-logMaxMarks):]
+	t.pollMarks()
 
 	slices.SortStableFunc(waiting, func(a, b *logFile) int {
 		switch {
@@ -395,6 +396,29 @@ func (t *logTailer) assign() {
 
 		file.assigned, file.step, file.stepName = true, step.step, step.name
 	}
+}
+
+// pollMarks reads the Worker log as far as it has grown, within its bound.
+func (t *logTailer) pollMarks() {
+	for range logMarkPolls {
+		before := t.marks.offset
+		t.marks.poll()
+
+		for {
+			taken := t.marks.take()
+			if len(taken) == 0 {
+				break
+			}
+
+			t.marked = append(t.marked, taken...)
+		}
+
+		if t.marks.offset == before {
+			break
+		}
+	}
+
+	t.marked = t.marked[max(0, len(t.marked)-logMaxMarks):]
 }
 
 // takeMark is the name of the latest mark at or before a step log's first line, and uses
@@ -426,11 +450,12 @@ func (t *logTailer) nextChunk(limit int) ([]byte, bool) {
 		count := min(len(file.lines), joblog.MaxChunkLines)
 
 		for {
-			t.seq++
-
-			data, err := joblog.Encode(joblog.Chunk{Seq: t.seq, Step: file.step, StepName: file.stepName,
+			// ONLY A CHUNK SPENDS ONE: halving must not read as chunks lost.
+			data, err := joblog.Encode(joblog.Chunk{Seq: t.seq + 1, Step: file.step, StepName: file.stepName,
 				Lines: file.lines[:count]})
 			if err == nil && len(data) <= limit {
+				t.seq++
+
 				for _, l := range file.lines[:count] {
 					t.held -= len(l.Text) + 32
 				}

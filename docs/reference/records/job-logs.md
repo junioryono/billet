@@ -37,6 +37,6 @@ Measured on 2026-11-04 on the shared Linux test host: `modernc.org/sqlite` v1.56
 | A phrase, `"connection reset"` | found its one line in 1.6 ms, across both words |
 | Case | `"CONNECTION RESET"` found the same line |
 | Exclusion, `"error" NOT "timeout"` | found the one of two in 0.3 ms |
-| A term under three bytes, `"ab"` | found nothing and said nothing, which is why the query parser refuses one |
+| A term under three characters, `"ab"` | found nothing and said nothing, which is why the query parser refuses one |
 | Only an exclusion, `NOT "error"` | a syntax error, which is why the query parser refuses one |
 | A range of rowids with a match | `rowid BETWEEN 100 AND 200` counted 101 |

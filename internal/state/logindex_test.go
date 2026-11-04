@@ -1,6 +1,7 @@
 package state
 
 import (
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -129,6 +130,8 @@ func TestWhatCannotBeSearchedIsRefused(t *testing.T) {
 		"nothing to find":    {nil, []string{"error"}},
 		"too short":          {[]string{"ab"}, nil},
 		"too short to leave": {[]string{"error"}, []string{"ab"}},
+		// SIX BYTES, TWO CHARACTERS, and the tokenizer walks characters.
+		"too few characters": {[]string{"日本"}, nil},
 	} {
 		if _, err := BuildLogMatch(tc.must, tc.mustNot); !errors.Is(err, ErrLogQuery) {
 			t.Errorf("%s: %v, want ErrLogQuery", name, err)
@@ -221,6 +224,55 @@ func TestDaysAreSearchedAndRemovedWhole(t *testing.T) {
 	addLines(t, x, "lease-e", 0, logDay, 0, "", "marker again")
 	if got := search(t, dir, []string{"again"}, nil, logDay.Add(-time.Hour)); len(got) != 1 {
 		t.Errorf("the file being written stopped taking lines: %+v", got)
+	}
+}
+
+// A DAY WITH NOTHING IN IT DOES NOT END A SEARCH OF THE OTHERS: one removed since its name was read
+// is not created again, and one whose schema is still being written is empty. A day that cannot be
+// read for any other reason does end it, and says so.
+func TestAnEmptyDayIsNotAFailedSearch(t *testing.T) {
+	t.Parallel()
+
+	x, dir := aLogIndex(t)
+	addLines(t, x, "lease-a", 0, logDay, 0, "", "marker line")
+
+	gone := filepath.Join(dir, "2000-01-01.db")
+
+	visit := func(LogHit) bool { return true }
+
+	more, stopped, err := searchLogDay(t.Context(), gone, LogSearch{Match: `"marker"`, Visit: visit}, new(int))
+	if err != nil || more || stopped {
+		t.Errorf("a day removed under the search: %t, %t, %v", more, stopped, err)
+	}
+	if _, err := os.Stat(gone); !os.IsNotExist(err) {
+		t.Errorf("searching a removed day brought it back: %v", err)
+	}
+
+	bare := filepath.Join(dir, "2000-01-02.db")
+	db, err := sql.Open("sqlite", dsn(bare))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logIndexExec(t.Context(), db, "CREATE TABLE other (a TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := searchLogDay(t.Context(), bare, LogSearch{Match: `"marker"`, Visit: visit}, new(int)); err != nil {
+		t.Errorf("a day with no schema yet: %v", err)
+	}
+
+	if got := search(t, dir, []string{"marker"}, nil, logDay.AddDate(-40, 0, 0)); len(got) != 1 {
+		t.Errorf("the search of the other days found %+v", got)
+	}
+
+	garbage := filepath.Join(dir, "2000-01-03.db")
+	if err := os.WriteFile(garbage, []byte(strings.Repeat("not a database ", 100)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := searchLogDay(t.Context(), garbage, LogSearch{Match: `"marker"`, Visit: visit}, new(int)); err == nil {
+		t.Error("a day that is no database read as empty")
 	}
 }
 

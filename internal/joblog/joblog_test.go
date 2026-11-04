@@ -186,9 +186,11 @@ func FuzzDecode(f *testing.F) {
 		if err != nil {
 			return
 		}
+		// A REFUSAL HERE IS NO BUG: something compressed better than this encoder does can
+		// decode and then not fit its bound again.
 		again, err := Encode(c)
 		if err != nil {
-			t.Fatalf("a chunk that decoded did not encode: %v", err)
+			return
 		}
 		if _, err := Decode(again); err != nil {
 			t.Fatalf("a chunk that encoded did not decode: %v", err)

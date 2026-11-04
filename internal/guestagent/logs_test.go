@@ -668,6 +668,47 @@ func TestAChunkBeingRetriedSurvivesTheStop(t *testing.T) {
 	})
 }
 
+// ONLY A CHUNK SPENDS A NUMBER: halving to fit reads as nothing lost, since a gap means a chunk
+// that did not reach the node.
+func TestHalvingSpendsNoNumber(t *testing.T) {
+	t.Parallel()
+
+	diag, pages := diagWithPages(t)
+
+	var text strings.Builder
+	for i := range 2000 {
+		fmt.Fprintf(&text, "2026-11-04T07:04:45.1Z %d %s\n", i, strings.Repeat(fmt.Sprint(i*7919), 12))
+	}
+	writePage(t, pages, pageName(stepRecord, 1), text.String())
+
+	tail := tailerAt(t, diag)
+	tail.scan()
+	tail.read()
+
+	var want uint64
+
+	for {
+		data, ok := tail.nextChunk(8 << 10)
+		if !ok {
+			break
+		}
+
+		c, err := joblog.Decode(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		want++
+		if c.Seq != want {
+			t.Fatalf("chunk %d carries number %d", want, c.Seq)
+		}
+	}
+
+	if want < 2 {
+		t.Fatalf("%d chunks; this test needs a cut", want)
+	}
+}
+
 // A JOB CANNOT GROW WHAT THE AGENT REMEMBERS: past the bound a fresh name is not met, and that
 // is counted once.
 func TestTheNamesRememberedAreBounded(t *testing.T) {
