@@ -3518,3 +3518,122 @@ func TestAYieldAfterAnUnpromoteKeepsNothing(t *testing.T) {
 
 	assertNoBases(t, p)
 }
+
+// AN IMAGE NOTHING USES DOES NOT KEEP ITSELF WANTED by being verified by the refresh each time its
+// tag moves.
+func TestTheRefreshsOwnVerificationIsNoSignOfInterest(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	p.now = func() time.Time { return now }
+
+	mustVerify(t, p)
+
+	p.now = func() time.Time { return now.Add(refreshInterest - time.Minute) }
+
+	setRegistry(t, s, p, "manifest two")
+
+	opts := verifyOpts()
+	opts.Automatic = true
+
+	if _, err := p.Verify(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+
+	p.now = func() time.Time { return now.Add(refreshInterest) }
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || images[0].Wanted {
+		t.Fatalf("images = %+v, %v, want interest not renewed", images, err)
+	}
+}
+
+// WHAT A BASE PROVED IT IS REACHES THE NEXT VERIFICATION, whatever it was asked with: the next
+// move of the tag asks for a slot before it pulls, on a node whose file names no tier.
+func TestAVerifiedMacOSImageIsKnownToTheNextVerification(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+
+	opts := verifyOpts()
+	opts.MacOS = false
+
+	if _, err := p.Verify(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || !images[0].MacOS {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+}
+
+// A BASE WAITING SAYS WHAT IT IS TOO.
+func TestAWaitingBaseSaysWhatItIs(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+	p.macOSLimit = func() (int, bool, error) { return 0, false, nil }
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified with no limit")
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || images[0].Pending == nil || !images[0].MacOS {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+}
+
+// A FIRST VERIFICATION A REGISTRY OUTAGE STOPPED IS STILL WANTED: on a node whose file names no tier,
+// the refresh has nowhere else to learn of it, and tries it again from what this kept.
+func TestAFirstVerificationARegistryStoppedIsStillWanted(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+	p.registry = func(context.Context, string) (string, error) { return "", errors.New("the registry is down") }
+
+	opts := verifyOpts()
+	opts.Command = []string{"./custom/run.sh"}
+	opts.GuestUntrusted = false
+
+	if _, err := p.Verify(t.Context(), opts); err == nil {
+		t.Fatal("verified with no registry")
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || len(images) != 1 || !images[0].Wanted || !slices.Equal(images[0].Command, opts.Command) {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+}
+
+// WHAT IS STACKED IS THE IMAGE'S. WHAT THIS HOST COULD NOT READ IS NOT.
+func TestOnlyAProvedLayoutIsAVerdictOnTheImage(t *testing.T) {
+	t.Parallel()
+
+	stacked := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stacked, baseOverlay), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := refuseStacked(stacked); !isImageVerdict(err) {
+		t.Errorf("a stacked VM: %v", err)
+	}
+
+	if err := refuseStacked(t.TempDir()); !isImageVerdict(err) {
+		t.Errorf("a VM with no disk of its own: %v", err)
+	}
+
+	unreadable := filepath.Join(t.TempDir(), "a-file")
+	if err := os.WriteFile(unreadable, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := refuseStacked(unreadable)
+	if err == nil || isImageVerdict(err) {
+		t.Errorf("a directory that could not be read: %v", err)
+	}
+}

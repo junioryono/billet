@@ -274,6 +274,11 @@ func TestTheRefreshFollowsTheRecordsWhereTheFileNamesNoTier(t *testing.T) {
 	if !got.GuestUntrusted || !got.MacOS || !slices.Equal(got.Command, []string{"./custom/run.sh"}) {
 		t.Fatalf("asked %+v, want it asked as the record's probe was", got)
 	}
+
+	// THE REFRESH'S OWN VERIFICATION IS NO SIGN ANYONE WANTS THE IMAGE.
+	if !got.Automatic {
+		t.Fatal("the refresh's verification renews its own interest")
+	}
 }
 
 // A PROBE OF AN UNTRUSTED TIER'S IMAGE SHOULD NOT TAKE THE DEFAULT NETWORK UNNOTICED, which is

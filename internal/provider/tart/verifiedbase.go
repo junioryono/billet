@@ -240,15 +240,22 @@ func sameDevice(a, b string) error {
 // are stacked is measured on the reference Mac before this is relied on.
 func refuseStacked(dir string) error {
 	if _, err := os.Lstat(filepath.Join(dir, baseOverlay)); err == nil {
-		return errors.New("the image is stacked: its VM holds a writable overlay over layers in the " +
-			"store it was cloned in, so it cannot be kept as a base of its own")
+		return imageVerdict{errors.New("the image is stacked: its VM holds a writable overlay over " +
+			"layers in the store it was cloned in, so it cannot be kept as a base of its own")}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("look for a stacked overlay: %w", err)
 	}
 
+	// ONLY AN ANSWER IS THE IMAGE'S: a file that is absent is, and one this host could not read
+	// says nothing about it.
 	for _, name := range []string{baseDisk, baseConfig, baseNVRAM} {
-		if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
-			return fmt.Errorf("the image's VM does not hold its own %s: %w", name, err)
+		_, err := os.Lstat(filepath.Join(dir, name))
+
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return imageVerdict{fmt.Errorf("the image's VM does not hold its own %s", name)}
+		case err != nil:
+			return fmt.Errorf("look for the VM's %s: %w", name, err)
 		}
 	}
 
@@ -366,7 +373,7 @@ func (p *Provider) makeBase(
 
 	if !isCopy {
 		if err := refuseStacked(p.vmDir(staging)); err != nil {
-			return nil, imageVerdict{err}
+			return nil, err
 		}
 	}
 
@@ -483,7 +490,7 @@ func (p *Provider) pullIntoStaging(ctx context.Context, key, digest, staging str
 	// ASKED HERE, before the move, because the layers of a stacked VM are what deleting
 	// this store would remove.
 	if err := refuseStacked(private); err != nil {
-		return imageVerdict{err}
+		return err
 	}
 
 	return p.moveVMDirectory(ctx, private, p.vmDir(staging))

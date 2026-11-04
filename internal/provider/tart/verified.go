@@ -113,6 +113,9 @@ type VerifyOptions struct {
 	MacOS bool
 	// NoYield keeps a macOS probe going when a job asks for its slot.
 	NoYield bool
+	// Automatic is the refresh's own verification, which is no sign anyone wants the image:
+	// it keeps its question and does not renew its interest.
+	Automatic bool
 	// Progress receives tart's pull output.
 	Progress io.Writer
 	// Window answers the runner's window. Nil answers could-not-tell.
@@ -224,6 +227,22 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 		return nil, fmt.Errorf("tart: verify %s: another verification of this image is running: %w", key, err)
 	}
 
+	// BEFORE ANYTHING THAT CAN FAIL FOR A REASON OF ITS OWN, a registry that is down among them:
+	// on a node whose file names no tier, this is what the refresh tries again from.
+	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
+		img := st.image(key)
+		img.Command, img.Untrusted = slices.Clone(opts.Command), opts.GuestUntrusted
+		img.MacOS = img.MacOS || opts.MacOS
+
+		if !opts.Automatic {
+			img.LastUsed = p.now().UTC()
+		}
+
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+	}
+
 	if err := p.cleanVerification(ctx, key); err != nil {
 		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
 	}
@@ -258,8 +277,6 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 
 		img := st.image(key)
 		epoch = img.UnpromoteEpoch
-		img.Command, img.Untrusted, img.MacOS = slices.Clone(opts.Command), opts.GuestUntrusted, opts.MacOS
-		img.LastUsed = p.now().UTC()
 
 		// THE SAME DIGEST WITH ITS FILES UNTOUCHED BOOTS WHAT WAS PULLED. Anything else is
 		// not that base any more.
@@ -372,6 +389,7 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 		}
 
 		img.Yields = 0
+		img.MacOS = rec.GuestOS == guestDarwin
 		delete(st.verified.Pending, key)
 		delete(st.verified.Failed, key)
 		st.verified.Records = append(st.verified.Records, *rec)
@@ -406,6 +424,8 @@ func (p *Provider) keepPending(ctx context.Context, key string, rec *VerifiedRec
 			return false, errors.New("the image was unpromoted while it was being verified")
 		}
 
+		// WHAT THE BASE SAYS, for the next verification's check before it pulls.
+		st.image(key).MacOS = rec.GuestOS == guestDarwin
 		st.verified.Pending[key] = rec
 
 		return true, nil

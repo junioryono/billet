@@ -376,7 +376,7 @@ func verifyDueTartImages(ctx context.Context, env cli.Env, cfg *config.Config, d
 			continue
 		}
 
-		opts.Progress = env.Stderr
+		opts.Automatic, opts.Progress = true, env.Stderr
 
 		rec, err := p.Verify(ctx, opts)
 
