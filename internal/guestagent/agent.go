@@ -478,8 +478,11 @@ func (a *agent) final(ctx context.Context) {
 	// is nearly spent and the cases made the batch large, or it was rolled back since
 	// the hello to one that does not know them. Once more without them, so the suite
 	// counts a report shows are not lost with them.
+	//
+	// NEITHER FIELD OF SCHEMA 2, the count included: a node that does not know them
+	// refuses a batch for naming either, and with no cases there is no row to count for.
 	if (v == refused || v == stop) && len(b.batch.Cases) > 0 {
-		dropCases(&b.batch)
+		b.batch.Cases, b.batch.CasesDropped = nil, guestreport.DroppedCases{}
 
 		if body, err := fit(&b.batch, a.lim.maxBody, time.Time{}); err == nil {
 			v, _ = a.node.report(fctx, body, true)
@@ -534,8 +537,7 @@ func fit(b *guestreport.Batch, limit int, casesBy time.Time) ([]byte, error) {
 
 		suites, cases := len(b.Cases), guestreport.CountCases(b.Cases)
 		if guestreport.ShedCases(&b.Cases) {
-			b.CasesDropped.Suites += int64(suites - len(b.Cases))
-			b.CasesDropped.Cases += int64(cases - guestreport.CountCases(b.Cases))
+			b.CasesDropped.Add(int64(suites-len(b.Cases)), int64(cases-guestreport.CountCases(b.Cases)))
 
 			continue
 		}
@@ -548,8 +550,7 @@ func fit(b *guestreport.Batch, limit int, casesBy time.Time) ([]byte, error) {
 
 // dropCases gives up every case b holds, counted, for the batch without them.
 func dropCases(b *guestreport.Batch) {
-	b.CasesDropped.Suites += int64(len(b.Cases))
-	b.CasesDropped.Cases += int64(guestreport.CountCases(b.Cases))
+	b.CasesDropped.Add(int64(len(b.Cases)), int64(guestreport.CountCases(b.Cases)))
 	b.Cases = nil
 }
 

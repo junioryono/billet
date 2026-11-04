@@ -177,8 +177,7 @@ func (w *junitWalk) read(dir *os.File, name string) {
 		w.cases.keep(s)
 	}
 
-	w.cases.dropped.Suites += w.parsed.dropped.Suites
-	w.cases.dropped.Cases += w.parsed.dropped.Cases
+	w.cases.dropped.Add(w.parsed.dropped.Suites, w.parsed.dropped.Cases)
 }
 
 // parsedCase is the testcase being read.
@@ -272,7 +271,7 @@ func (w *junitWalk) parse(r io.Reader, file string) ([]guestreport.SuiteResult, 
 			switch {
 			case t.Name.Local == "testcase" && tcase != nil:
 				countCase(&open[len(open)-1], tcase)
-				addCase(&cases[len(cases)-1], tcase)
+				addCase(&cases[len(cases)-1], tcase, &w.parsed.dropped)
 				tcase = nil
 			case tcase != nil && (t.Name.Local == "failure" || t.Name.Local == "error"):
 				tcase.inFailure = false
@@ -312,13 +311,15 @@ func (c *parsedCase) beginFailure(e xml.StartElement) {
 
 // addCase adds one case to its suite's list. A list at its bound gives up what is
 // least worth keeping first, so one result file of many cases costs no more to hold
-// than a batch's worth; the suite is Complete only if its list ends as long as its
-// count.
-func addCase(s *guestreport.SuiteCases, c *parsedCase) {
+// than a batch's worth; what it gives up is counted, and the suite is Complete only if
+// its list ends as long as its count.
+func addCase(s *guestreport.SuiteCases, c *parsedCase, dropped *guestreport.DroppedCases) {
 	for len(s.Cases) >= guestreport.MaxBatchCases {
+		before := len(s.Cases)
 		one := []guestreport.SuiteCases{*s}
 		guestreport.ShedCaseCount(&one)
 		*s = one[0]
+		dropped.Add(0, int64(before-len(s.Cases)))
 	}
 
 	status := guestreport.CasePassed
@@ -355,9 +356,8 @@ func (c *junitCases) keep(s guestreport.SuiteCases) {
 			)
 		})
 
-		for _, dropped := range c.suites[guestreport.MaxBatchCaseSuites:] {
-			c.dropped.Suites++
-			c.dropped.Cases += int64(len(dropped.Cases))
+		for _, left := range c.suites[guestreport.MaxBatchCaseSuites:] {
+			c.dropped.Add(1, int64(len(left.Cases)))
 		}
 
 		c.suites = slices.Clip(c.suites[:guestreport.MaxBatchCaseSuites])
@@ -366,20 +366,22 @@ func (c *junitCases) keep(s guestreport.SuiteCases) {
 	for guestreport.CountCases(c.suites) > guestreport.MaxBatchCases {
 		before := guestreport.CountCases(c.suites)
 		guestreport.ShedCaseCount(&c.suites)
-		c.dropped.Cases += int64(before - guestreport.CountCases(c.suites))
+		c.dropped.Add(0, int64(before-guestreport.CountCases(c.suites)))
 	}
 }
 
 // identityMark is the text a cut identity ends with: a separator and eight hex digits.
 const identityMark = 9
 
-// boundedIdentity is s as a report carries it within limit bytes. WHOLE WHERE IT FITS.
-// Past the limit it is cut and marked with a digest of the whole, because the rankings
-// count by this text and two names cut to one would read as one test, whose pass and
-// failure would make it flaky.
+// boundedIdentity is s as a report carries it within limit bytes. WHOLE WHERE IT FITS
+// AND NEEDS NO CLEANING. Otherwise it is cut and marked with a digest of the whole,
+// because the rankings count by this text and two names made one would read as one
+// test, whose pass and failure would make it flaky. A job can still write a literal name
+// that reads as another's, as it can write any result it likes: what this answers is two
+// honest tests, not a job lying about its own.
 func boundedIdentity(s string, limit int) string {
-	if len(s) <= limit {
-		return textOrMark(guestreport.Clean(s, limit))
+	if cleaned := guestreport.Clean(s, limit); cleaned == s {
+		return textOrMark(cleaned)
 	}
 
 	digest := sha256.Sum256([]byte(s))

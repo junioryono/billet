@@ -99,6 +99,10 @@ type testStats struct {
 	Unreadable      int  `json:"unreadable"`
 	WithoutIdentity int  `json:"without_identity"`
 	Partial         bool `json:"partial"`
+	// Ambiguous counts the jobs on one commit whose display name covers several jobs of
+	// one attempt, as a matrix's legs sharing a name do: the flaky ranking looks only
+	// inside each of their jobs.
+	Ambiguous int `json:"ambiguous"`
 	// Incomplete counts the jobs whose results left out cases, a suite cut to fit its
 	// bounds, so a test's counts may fall short.
 	Incomplete int           `json:"incomplete"`
@@ -184,8 +188,9 @@ type seenIn struct {
 	suiteTests int64
 }
 
-// flakySightings bounds the jobs a test's failures and passes each keep on one commit:
-// enough to find a pair, and a job chooses how many it says it ran.
+// flakySightings bounds the attempts a test's failures and passes each keep on one
+// commit, one sighting to an attempt: two distinct ones are all a pair needs, so more
+// are only for a failure whose suite counted another number of tests.
 const flakySightings = 16
 
 // testTally is what was seen of one test.
@@ -201,15 +206,19 @@ type testTally struct {
 type flakyTally struct {
 	failures      int64
 	fails, passes []seenIn
+	// lastFail and lastPass are the jobs its latest failure and pass were in, and sameJob
+	// is a job that did both: jobs arrive one at a time, so the two are adjacent.
+	lastFail, lastPass string
+	sameJob            string
 }
 
-// addSeen keeps one sighting within the bound, one to a job.
+// addSeen keeps one sighting to an attempt, within the bound.
 func addSeen(list []seenIn, s seenIn) []seenIn {
 	if len(list) >= flakySightings {
 		return list
 	}
 	for i := range list {
-		if list[i].attempt == s.attempt && list[i].lease == s.lease {
+		if list[i].attempt == s.attempt && list[i].suiteTests == s.suiteTests {
 			return list
 		}
 	}
@@ -217,12 +226,49 @@ func addSeen(list []seenIn, s seenIn) []seenIn {
 	return append(list, s)
 }
 
+// cleanKey is one suite of one job, at one count of tests: only a suite that counted as
+// many tests stands for a case it does not name.
+type cleanKey struct {
+	suite suiteKey
+	tests int64
+}
+
+// cleanSightings bounds the attempts a clean suite keeps. Two are enough, since at least
+// one of two differs from any failure's.
+const cleanSightings = 2
+
 // testStatsBuilder folds jobs' results, newest job first.
 type testStatsBuilder struct {
 	out        testStats
 	tests      map[testKey]*testTally
 	flaky      map[flakyKey]*flakyTally
-	cleanSuite map[suiteKey]seenIn
+	cleanSuite map[cleanKey][]seenIn
+	// legs is each job's jobs by attempt, and ambiguous the jobs one attempt ran more
+	// than one of: a display name covering several legs of a matrix, whose failure on one
+	// and pass on another say nothing, in one attempt or across two.
+	legs      map[jobKey]map[jobAttempt]string
+	ambiguous map[jobKey]bool
+}
+
+// noteLeg records that a job ran in an attempt, and marks its name as covering several
+// legs when the attempt ran another.
+func (b *testStatsBuilder) noteLeg(job jobKey, attempt jobAttempt, lease string) {
+	attempts := b.legs[job]
+	if attempts == nil {
+		if len(b.legs) >= testStatsMaxCases {
+			b.out.Partial = true
+
+			return
+		}
+		attempts = map[jobAttempt]string{}
+		b.legs[job] = attempts
+	}
+	if first, seen := attempts[attempt]; !seen {
+		attempts[attempt] = lease
+	} else if first != lease && !b.ambiguous[job] {
+		b.ambiguous[job] = true
+		b.out.Ambiguous++
+	}
 }
 
 // buildTestStats reads the jobs' results a page at a time, so no read holds more than
@@ -231,7 +277,8 @@ func buildTestStats(ctx context.Context, a *alloc.Allocator, repo string, since 
 ) (testStats, error) {
 	b := testStatsBuilder{
 		out:   testStats{Notice: guestBanner, Since: since},
-		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[suiteKey]seenIn{},
+		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[cleanKey][]seenIn{},
+		legs: map[jobKey]map[jobAttempt]string{}, ambiguous: map[jobKey]bool{},
 	}
 
 	var cursor alloc.TestResultsCursor
@@ -285,6 +332,8 @@ func (b *testStatsBuilder) addJob(rec *alloc.RecordedTestResults) {
 		attempt.run > 0 && attempt.attempt > 0
 	if !identified {
 		b.out.WithoutIdentity++
+	} else {
+		b.noteLeg(job, attempt, rec.LeaseID)
 	}
 
 	incomplete := results.Dropped.Suites > 0 || results.Dropped.Cases > 0
@@ -294,14 +343,8 @@ func (b *testStatsBuilder) addJob(rec *alloc.RecordedTestResults) {
 		// ONLY A LIST THAT WAS CUT can stand for a case it does not name: a Complete
 		// list names every case that ran, so a name it does not hold did not run.
 		if identified && !s.Complete && s.Tests > 0 && s.Failures == 0 && s.Errors == 0 && s.Skipped == 0 {
-			key := suiteKey{job, s.Name}
-			if _, seen := b.cleanSuite[key]; !seen {
-				if len(b.cleanSuite) >= testStatsMaxCases {
-					b.out.Partial = true
-				} else {
-					b.cleanSuite[key] = seenIn{lease: rec.LeaseID, attempt: attempt, suiteTests: s.Tests}
-				}
-			}
+			b.addCleanSuite(cleanKey{suiteKey{job, s.Name}, s.Tests},
+				seenIn{lease: rec.LeaseID, attempt: attempt, suiteTests: s.Tests})
 		}
 		for j := range s.Cases {
 			b.addCase(rec, job, identified, s, &s.Cases[j])
@@ -310,6 +353,20 @@ func (b *testStatsBuilder) addJob(rec *alloc.RecordedTestResults) {
 	if incomplete {
 		b.out.Incomplete++
 	}
+}
+
+// addCleanSuite keeps a suite that reported nothing wrong, one sighting to an attempt.
+func (b *testStatsBuilder) addCleanSuite(key cleanKey, seen seenIn) {
+	list, known := b.cleanSuite[key]
+	if !known && len(b.cleanSuite) >= testStatsMaxCases {
+		b.out.Partial = true
+
+		return
+	}
+	if len(list) == cleanSightings || (len(list) == 1 && list[0].attempt == seen.attempt) {
+		return
+	}
+	b.cleanSuite[key] = append(list, seen)
 }
 
 // addCase folds one case, the newest of its test first because jobs arrive newest
@@ -365,35 +422,40 @@ func (b *testStatsBuilder) addCase(rec *alloc.RecordedTestResults, job jobKey, i
 	if c.Failing() {
 		f.failures++
 		f.fails = addSeen(f.fails, seen)
-
-		return
+		f.lastFail = rec.LeaseID
+	} else {
+		f.passes = addSeen(f.passes, seen)
+		f.lastPass = rec.LeaseID
 	}
-	f.passes = addSeen(f.passes, seen)
+	if f.sameJob == "" && f.lastFail == f.lastPass {
+		f.sameJob = rec.LeaseID
+	}
 }
 
-// flakyPair is the evidence a tally holds that one test failed and passed with nothing
-// changed: a pass kept from another attempt, or a suite of as many tests that reported
-// nothing wrong in another attempt, or both in one job; "" for none. A failure and a
-// pass in two jobs of one attempt are no evidence.
-func flakyPair(f *flakyTally, clean seenIn, haveClean bool) (fail, pass, evidence string) {
-	for _, failed := range f.fails {
-		for _, passed := range f.passes {
-			if failed.attempt != passed.attempt {
-				return failed.lease, passed.lease, "recorded"
+// flakyPair is the evidence that one test failed and passed with nothing changed: a pass
+// kept from another attempt, or a suite of as many tests that reported nothing wrong in
+// another attempt, or both in one job; "" for none. A name covering several legs of a
+// matrix has only the last, since its failure on one leg and pass on another are no
+// evidence.
+func (b *testStatsBuilder) flakyPair(key flakyKey, f *flakyTally) (fail, pass, evidence string) {
+	if !b.ambiguous[key.job] {
+		for _, failed := range f.fails {
+			for _, passed := range f.passes {
+				if failed.attempt != passed.attempt {
+					return failed.lease, passed.lease, "recorded"
+				}
+			}
+		}
+		for _, failed := range f.fails {
+			for _, clean := range b.cleanSuite[cleanKey{suiteKey{key.job, key.suite}, failed.suiteTests}] {
+				if failed.attempt != clean.attempt {
+					return failed.lease, clean.lease, "suite"
+				}
 			}
 		}
 	}
-	for _, failed := range f.fails {
-		if haveClean && failed.attempt != clean.attempt && failed.suiteTests == clean.suiteTests {
-			return failed.lease, clean.lease, "suite"
-		}
-	}
-	for _, failed := range f.fails {
-		for _, passed := range f.passes {
-			if failed.lease == passed.lease {
-				return failed.lease, passed.lease, "same job"
-			}
-		}
+	if f.sameJob != "" {
+		return f.sameJob, f.sameJob, "same job"
 	}
 
 	return "", "", ""
@@ -444,8 +506,7 @@ func (b *testStatsBuilder) rank(limit int) {
 		if f.failures == 0 {
 			continue
 		}
-		clean, haveClean := b.cleanSuite[suiteKey{key.job, key.suite}]
-		fail, pass, evidence := flakyPair(f, clean, haveClean)
+		fail, pass, evidence := b.flakyPair(key, f)
 		if evidence == "" {
 			continue
 		}
@@ -512,6 +573,10 @@ func renderTestStats(w io.Writer, r testStats) {
 		fmt.Fprintf(w, "  %d jobs are left out of this ranking, with no commit, attempt, workflow or job name on record "+
 			"(the commit comes from GitHub's record of the run, which needs the App's actions: read and is read "+
 			"for a day after a job starts)\n", r.WithoutIdentity)
+	}
+	if r.Ambiguous > 0 {
+		fmt.Fprintf(w, "  %d jobs' names each cover several jobs of one attempt, as legs of a matrix sharing a "+
+			"name do, so only a pass and a failure inside one of their jobs are ranked\n", r.Ambiguous)
 	}
 	if len(r.Flaky) == 0 {
 		fmt.Fprintln(w, "  none seen")

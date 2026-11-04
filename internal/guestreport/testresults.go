@@ -62,6 +62,14 @@ type DroppedCases struct {
 	Cases  int64 `json:"cases"`
 }
 
+// Add counts more left out, held at MaxValue: an agent's own counts arrive within it,
+// and a sum past it would make the results refuse to encode, the cases they hold with
+// them.
+func (d *DroppedCases) Add(suites, cases int64) {
+	d.Suites = min(d.Suites+suites, MaxValue)
+	d.Cases = min(d.Cases+cases, MaxValue)
+}
+
 // CountCases is how many cases suites hold in all.
 func CountCases(suites []SuiteCases) int {
 	n := 0
@@ -89,21 +97,19 @@ func TestResultsOf(batches []Batch) (TestResults, bool) {
 		}
 
 		seen[b.Seq] = true
-		out.Dropped.Suites = min(out.Dropped.Suites+b.CasesDropped.Suites, MaxValue)
-		out.Dropped.Cases = min(out.Dropped.Cases+b.CasesDropped.Cases, MaxValue)
+		out.Dropped.Add(b.CasesDropped.Suites, b.CasesDropped.Cases)
 
 		for j := range b.Cases {
 			s := b.Cases[j]
 
 			if len(out.Suites) == MaxBatchCaseSuites {
-				out.Dropped.Suites++
-				out.Dropped.Cases += int64(len(s.Cases))
+				out.Dropped.Add(1, int64(len(s.Cases)))
 
 				continue
 			}
 
 			if room := MaxBatchCases - held; len(s.Cases) > room {
-				out.Dropped.Cases += int64(len(s.Cases) - room)
+				out.Dropped.Add(0, int64(len(s.Cases)-room))
 				s.Cases, s.Complete = s.Cases[:room], false
 			}
 
@@ -142,8 +148,7 @@ func EncodeTestResults(r TestResults, limit int) (TestResults, []byte, error) {
 			return TestResults{}, nil, err
 		}
 
-		r.Dropped.Suites += int64(suites - len(r.Suites))
-		r.Dropped.Cases += int64(cases - CountCases(r.Suites))
+		r.Dropped.Add(int64(suites-len(r.Suites)), int64(cases-CountCases(r.Suites)))
 	}
 }
 

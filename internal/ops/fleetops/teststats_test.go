@@ -63,7 +63,8 @@ func failed(name, message string) guestreport.CaseResult {
 func statsOf(jobs ...*alloc.RecordedTestResults) testStats {
 	b := testStatsBuilder{
 		out:   testStats{Notice: guestBanner},
-		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[suiteKey]seenIn{},
+		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[cleanKey][]seenIn{},
+		legs: map[jobKey]map[jobAttempt]string{}, ambiguous: map[jobKey]bool{},
 	}
 	for _, job := range jobs {
 		b.addJob(job)
@@ -213,6 +214,11 @@ func TestAPassCutToFitIsInferredAndSaidToBe(t *testing.T) {
 func TestAPassAndAFailInOneJobIsFlaky(t *testing.T) {
 	t.Parallel()
 
+	// IN EITHER ORDER, since nothing says a retry is written after the failure it retried.
+	if got := statsOf(aJobRow(t, "l1", "same", aWholeSuite(passed("T", 1), failed("T", "m")))); len(got.Flaky) != 1 {
+		t.Errorf("a pass before a failure in one job: flaky are %+v", got.Flaky)
+	}
+
 	got := statsOf(aJobRow(t, "l1", "same", aWholeSuite(failed("T", "m"), passed("T", 1))))
 	if len(got.Flaky) != 1 || got.Flaky[0].FailLease != "l1" || got.Flaky[0].PassLease != "l1" ||
 		got.Flaky[0].Evidence != "same job" {
@@ -247,6 +253,14 @@ func TestTwoJobsOfOneAttemptAreNotFlaky(t *testing.T) {
 	}
 	if got := statsOf(row("l2", 8, 1, failed("T", "m")), row("l1", 7, 1, passed("T", 1))); len(got.Flaky) != 1 {
 		t.Errorf("another run of the commit is not flaky: %+v", got.Flaky)
+	}
+	// LEGS OF A MATRIX RE-RUN ARE STILL TWO LEGS: Linux passes and Windows fails in both
+	// attempts, so a failure of the second and a pass of the first prove nothing.
+	if got := statsOf(
+		row("l4", 7, 2, failed("T", "m")), row("l3", 7, 2, passed("T", 1)),
+		row("l2", 7, 1, failed("T", "m")), row("l1", 7, 1, passed("T", 1)),
+	); len(got.Flaky) != 0 || got.Ambiguous != 1 {
+		t.Errorf("a matrix re-run: flaky %+v, %d ambiguous; want none and 1", got.Flaky, got.Ambiguous)
 	}
 	// AND A JOB WITH NO ATTEMPT ON RECORD IS LEFT OUT, not one attempt with the rest.
 	got := statsOf(row("l2", 7, 0, failed("T", "m")), row("l1", 7, 0, passed("T", 1)))
@@ -459,5 +473,41 @@ func TestAJobMissingSuitesIsIncomplete(t *testing.T) {
 	got := statsOf(&alloc.RecordedTestResults{LeaseID: "l1", Codec: guestreport.Codec, Data: data})
 	if got.Incomplete != 1 {
 		t.Errorf("%d jobs read as incomplete, want the one that lost a suite", got.Incomplete)
+	}
+}
+
+// THE BOUNDS KEEP WHAT DECIDES: however many attempts failed, a pass in one more is found,
+// and a clean suite of another count does not hide one of the same.
+func TestTheBoundsKeepWhatDecides(t *testing.T) {
+	t.Parallel()
+
+	row := func(lease string, attempt int64, s guestreport.SuiteCases) *alloc.RecordedTestResults {
+		r := aJobRow(t, lease, "same", s)
+		r.RunAttempt = attempt
+
+		return r
+	}
+
+	var jobs []*alloc.RecordedTestResults
+	for i := range 2 * flakySightings {
+		jobs = append(jobs, row(fmt.Sprintf("f%d", i), int64(100+i), aWholeSuite(failed("T", "m"))))
+	}
+	jobs = append(jobs, row("p", 1, aWholeSuite(passed("T", 1))))
+	if got := statsOf(jobs...); len(got.Flaky) != 1 || got.Flaky[0].PassLease != "p" {
+		t.Errorf("a pass past the bound on failures was lost: %+v", got.Flaky)
+	}
+
+	failing := aWholeSuite(failed("T", "m"))
+	failing.Tests, failing.Complete = 100, false
+	clean := func(tests int64) guestreport.SuiteCases {
+		return guestreport.SuiteCases{Name: "pkg", Tests: tests}
+	}
+	got := statsOf(
+		row("l3", 3, failing),
+		row("l2", 4, clean(7)),
+		row("l1", 2, clean(100)),
+	)
+	if len(got.Flaky) != 1 || got.Flaky[0].PassLease != "l1" || got.Flaky[0].Evidence != "suite" {
+		t.Errorf("a clean suite of the same count was hidden: %+v", got.Flaky)
 	}
 }

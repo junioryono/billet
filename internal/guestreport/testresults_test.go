@@ -360,3 +360,31 @@ func TestTestResultsDecodeStrictly(t *testing.T) {
 		}
 	}
 }
+
+// A COUNT OF WHAT WAS LEFT OUT STOPS AT ITS BOUND, because past it the whole result would
+// refuse to encode, the cases it holds with it.
+func TestACountOfWhatWasLeftOutSaturates(t *testing.T) {
+	t.Parallel()
+
+	got, ok := TestResultsOf([]Batch{
+		{Seq: 1, CasesDropped: DroppedCases{Suites: MaxValue, Cases: MaxValue}},
+		{Seq: 2, CasesDropped: DroppedCases{Suites: 1, Cases: 1}, Cases: []SuiteCases{aSuite("a", 1)}},
+	})
+	if !ok || got.Dropped != (DroppedCases{Suites: MaxValue, Cases: MaxValue}) {
+		t.Fatalf("got %+v, %t, want both counts at the bound", got.Dropped, ok)
+	}
+	if _, _, err := EncodeTestResults(got, MaxTestResultsBytes); err != nil {
+		t.Errorf("results at the bound do not encode: %v", err)
+	}
+}
+
+// AN AGENT THAT LEFT EVERYTHING OUT STILL SAYS SO: drops alone are results, so a reader
+// can tell them from a job that reported nothing.
+func TestDropsAloneAreResults(t *testing.T) {
+	t.Parallel()
+
+	got, ok := TestResultsOf([]Batch{{Seq: 1, CasesDropped: DroppedCases{Suites: 2, Cases: 9}}})
+	if !ok || got.Dropped.Suites != 2 || got.Dropped.Cases != 9 {
+		t.Errorf("got %+v, %t", got, ok)
+	}
+}

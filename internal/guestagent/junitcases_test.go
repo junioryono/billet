@@ -359,7 +359,9 @@ func TestARefusedFinalBatchIsResentWithoutItsCases(t *testing.T) {
 				t.Errorf("answered %d: the batches carry %d and %d suites of cases, want some and none", status,
 					len(refused.batch.Cases), len(resent.batch.Cases))
 			}
-			if len(resent.batch.Tests) == 0 || resent.batch.CasesDropped.Suites == 0 {
+			// NEITHER FIELD OF SCHEMA 2, which is what lets a node rolled back since the
+			// hello take it: the encoder leaves out only what is zero.
+			if len(resent.batch.Tests) == 0 || resent.batch.CasesDropped != (guestreport.DroppedCases{}) {
 				t.Errorf("answered %d: the resent batch holds %d suites and counts %+v dropped", status,
 					len(resent.batch.Tests), resent.batch.CasesDropped)
 			}
@@ -367,7 +369,7 @@ func TestARefusedFinalBatchIsResentWithoutItsCases(t *testing.T) {
 	}
 }
 
-// A BATCH THE NODE ACCEPTS IS NOT SENT TWICE, and neither is one with no cases to drop.
+// A REFUSED BATCH WITH NO CASES TO DROP IS NOT SENT AGAIN: it would be refused the same.
 func TestAFinalBatchIsResentOnlyWithCasesToDrop(t *testing.T) {
 	t.Parallel()
 
@@ -390,4 +392,30 @@ func TestAFinalBatchIsResentOnlyWithCasesToDrop(t *testing.T) {
 			t.Errorf("a node offering no cases was sent %d batches, want the refused one once", len(posts))
 		}
 	})
+}
+
+// WHAT A SUITE GIVES UP WHILE IT IS READ IS COUNTED, and a name the cleaning changed is
+// marked apart, so "a\nb" and "a?b" stay two tests.
+func TestWhatASuiteShedsWhileReadIsCounted(t *testing.T) {
+	t.Parallel()
+
+	var b strings.Builder
+	b.WriteString(`<testsuite name="big">`)
+	for i := range guestreport.MaxBatchCases + 1 {
+		fmt.Fprintf(&b, `<testcase name="t%d" time="%d"/>`, i, i)
+	}
+	b.WriteString(`</testsuite>`)
+
+	w := &junitWalk{deadline: time.Now().Add(time.Hour), now: time.Now}
+	if _, ok := w.parse(strings.NewReader(b.String()), "r.xml"); !ok {
+		t.Fatal("the file did not parse")
+	}
+	kept := len(w.parsed.suites[0].Cases)
+	if want := int64(guestreport.MaxBatchCases + 1 - kept); w.parsed.dropped.Cases != want || want == 0 {
+		t.Errorf("counted %d cases shed, want %d", w.parsed.dropped.Cases, want)
+	}
+
+	if caseIdentity("", "a\nb") == caseIdentity("", "a?b") {
+		t.Error("two names read as one once cleaned")
+	}
 }
