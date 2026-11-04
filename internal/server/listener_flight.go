@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/dispatch"
@@ -252,8 +254,14 @@ type exchanged struct {
 // STILL ONE WRITER: this goroutine is the only one that decides anything, and the
 // poll aside touches nothing but what it was handed.
 func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool) exchanged {
+	if !l.lastAnswered.IsZero() {
+		l.timings.pollGapTook(l.tier, time.Since(l.lastAnswered))
+	}
+
+	defer func() { l.lastAnswered = time.Now() }()
+
 	if !l.backgroundLaunches {
-		msg, err := l.session.GetMessage(ctx, l.lastMessageID, advertised)
+		msg, err := l.timedPoll(ctx, l.session, l.lastMessageID, advertised)
 
 		return exchanged{msg: msg, err: err}
 	}
@@ -269,7 +277,7 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 	polling.Go(func() {
 		defer close(answered)
 
-		answer.msg, answer.err = session.GetMessage(ctx, lastMessageID, advertised)
+		answer.msg, answer.err = l.timedPoll(ctx, session, lastMessageID, advertised)
 	})
 
 	var beside error
@@ -291,4 +299,18 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 			}
 		}
 	}
+}
+
+// timedPoll polls GitHub and reports how long an answered poll took. One that failed is
+// left out: its time is the client's retries, and it says nothing of GitHub's long poll.
+func (l *Listener) timedPoll(ctx context.Context, session Session, lastMessageID int64, advertised int,
+) (*Message, error) {
+	began := time.Now()
+
+	msg, err := session.GetMessage(ctx, lastMessageID, advertised)
+	if err == nil || errors.Is(err, ErrNoMessage) {
+		l.timings.pollTook(l.tier, time.Since(began))
+	}
+
+	return msg, err
 }
