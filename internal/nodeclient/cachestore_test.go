@@ -1,7 +1,9 @@
 package nodeclient_test
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,7 +68,12 @@ func TestABreakersReportGoesOnlyToAPlaneWithTheRoute(t *testing.T) {
 		nodeapi.VersionCacheBreaker:     true,
 	} {
 		plane := &observationPlane{version: version, bodies: make(chan map[string]any, 4)}
-		srv := httptest.NewServer(plane)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/register" && r.URL.Path != "/v1/nodes/n1/cache-store" {
+				t.Errorf("v%d: asked %s", version, r.URL.Path)
+			}
+			plane.ServeHTTP(w, r)
+		}))
 		t.Cleanup(srv.Close)
 		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
 		if err != nil {
@@ -74,8 +81,9 @@ func TestABreakersReportGoesOnlyToAPlaneWithTheRoute(t *testing.T) {
 		}
 
 		// BEFORE A REGISTRATION THERE IS NO WIRE TO ASK, and it is said so, not lost.
-		if err := c.ReportCacheStore(t.Context(), report); err == nil {
-			t.Fatalf("v%d: a report before any registration claimed to land", version)
+		if err := c.ReportCacheStore(t.Context(), report); err == nil ||
+			!strings.Contains(err.Error(), "not registered") {
+			t.Fatalf("v%d: a report before any registration: %v", version, err)
 		}
 
 		if err := c.Register(t.Context(), testRegistration()); err != nil {

@@ -216,17 +216,6 @@ func TestAWatchedCallCountsOnce(t *testing.T) {
 			t.Fatal("calls that returned an answer counted when their timers would have fired")
 		}
 
-		// Past its limit and then failed: one failure, not two.
-		b, _ = testBreaker()
-		done := b.watch(aClone("one"), time.Second)
-		time.Sleep(2 * time.Second)
-		synctest.Wait()
-		done(errStoreGone)
-		b.watch(aClone("two"), time.Second)(errStoreGone)
-		if !b.allow() {
-			t.Fatal("two calls counted as three failures")
-		}
-
 		// Past its limit and then handed a volume over: that late, it clears nothing.
 		b, _ = testBreaker()
 		b.outcome(aClone("one"), errStoreGone)
@@ -289,13 +278,16 @@ func TestAnOpenBreakerIsProbedAndOnlyAnAnswerMovesIt(t *testing.T) {
 		if got := b.report().State; got != lease.CacheStoreProbation {
 			t.Fatalf("state = %q, want probation", got)
 		}
+		if changes.Load() != before+1 {
+			t.Fatalf("going on probation reported %d changes", changes.Load()-before)
+		}
 		if b.isOpen() {
 			t.Fatal("the gauge would say open on probation")
 		}
 
-		// A PUBLICATION WAITS FOR THE VERDICT; ONE JOB ASKS.
+		// A READ OF A MOUNTED VOLUME WAITS FOR THE VERDICT; ONE JOB ASKS.
 		if b.allow() {
-			t.Fatal("probation let a publication ask")
+			t.Fatal("probation let what decides nothing ask")
 		}
 		if !b.admit() {
 			t.Fatal("probation let no job try the store")

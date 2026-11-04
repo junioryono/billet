@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +53,7 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 		t.Fatalf("with nothing reported: %q", got)
 	}
 
-	if err := a.RecordCacheStoreState(t.Context(), "healthy", alloc.CacheStoreReport{
+	if err := a.RecordCacheStoreState(t.Context(), "healthy", "", alloc.CacheStoreReport{
 		Store: "ceph", State: alloc.CacheStoreClosed, Since: since,
 	}); err != nil {
 		t.Fatal(err)
@@ -60,7 +63,7 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 	}
 
 	// A HOST WHOSE CLOCK IS AHEAD HAS NOT BEEN OPEN FOR LESS THAN NOTHING.
-	if err := a.RecordCacheStoreState(t.Context(), "quiet", alloc.CacheStoreReport{
+	if err := a.RecordCacheStoreState(t.Context(), "quiet", "", alloc.CacheStoreReport{
 		Store: "ceph", State: alloc.CacheStoreOpen, Since: since.Add(time.Hour), Failures: 3,
 		Reason: alloc.CacheStoreTimeout,
 	}); err != nil {
@@ -69,7 +72,7 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 	if got := render(); strings.Contains(got, "-55m") || !strings.Contains(got, "OPEN for 0s") {
 		t.Fatalf("a host whose clock is ahead: %q", got)
 	}
-	if err := a.RecordCacheStoreState(t.Context(), "quiet", alloc.CacheStoreReport{
+	if err := a.RecordCacheStoreState(t.Context(), "quiet", "", alloc.CacheStoreReport{
 		Store: "ceph", State: alloc.CacheStoreClosed, Since: since,
 	}); err != nil {
 		t.Fatal(err)
@@ -78,7 +81,7 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 		t.Fatalf("with two healthy stores: %q", got)
 	}
 
-	if err := a.RecordCacheStoreState(t.Context(), "sick", alloc.CacheStoreReport{
+	if err := a.RecordCacheStoreState(t.Context(), "sick", "", alloc.CacheStoreReport{
 		Store: "ceph", State: alloc.CacheStoreOpen, Since: since, Failures: 3, Reason: "timeout",
 	}); err != nil {
 		t.Fatal(err)
@@ -93,7 +96,7 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 		}
 	}
 
-	if err := a.RecordCacheStoreState(t.Context(), "sick", alloc.CacheStoreReport{
+	if err := a.RecordCacheStoreState(t.Context(), "sick", "", alloc.CacheStoreReport{
 		Store: "ceph", State: alloc.CacheStoreProbation, Since: since,
 	}); err != nil {
 		t.Fatal(err)
@@ -109,7 +112,7 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.RecordCacheStoreState(t.Context(), "gone", alloc.CacheStoreReport{
+	if err := a.RecordCacheStoreState(t.Context(), "gone", "", alloc.CacheStoreReport{
 		Store: "ceph", State: alloc.CacheStoreClosed, Since: since,
 	}); err != nil {
 		t.Fatal(err)
@@ -122,5 +125,53 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 	}
 	if got := render(); !strings.Contains(got, "cache     2 host(s) using") {
 		t.Errorf("a host that left was counted: %q", got)
+	}
+
+	// ONE THAT LEFT WITH ITS BREAKER OPEN IS SAID TO BE ONLY ITS LAST WORD.
+	epoch, err = a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "away", Provider: config.ProviderDocker, VCPU: 2, Memory: 8 * config.GiB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RecordCacheStoreState(t.Context(), "away", "", alloc.CacheStoreReport{
+		Store: "ceph", State: alloc.CacheStoreOpen, Since: since, Failures: 3, Reason: alloc.CacheStoreTimeout,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.NodeWithdrawn(t.Context(), "away", epoch, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := render(); !strings.Contains(got, "away: this deployment cannot reach it, so that is its last word") {
+		t.Errorf("a host that left with its breaker open: %q", got)
+	}
+}
+
+// PROVED USED: a line only the helper's own test prints is a line no operator sees.
+func TestStatusPrintsItsCacheStores(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := parser.ParseFile(token.NewFileSet(), "status.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "cmdStatus" {
+			continue
+		}
+		ast.Inspect(fn, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "printCacheStores" {
+					called = true
+				}
+			}
+
+			return true
+		})
+	}
+	if !called {
+		t.Fatal("cmdStatus no longer prints what the hosts say of their stores")
 	}
 }

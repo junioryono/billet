@@ -3,7 +3,6 @@ package node
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"log/slog"
 	"sync"
 	"time"
@@ -38,10 +37,10 @@ type storeCall struct {
 	// job can make the store refuse it, and must not be able to turn every other
 	// job's caches off by doing so.
 	who string
-	// decides says the call hands over a volume, which needs the index lock and the
-	// pool, so its success can end a probation or clear a count. A lookup and a read
-	// are lock-free or served from memory, and a clone's miss says only that a lookup
-	// worked: the store can answer those with what a job needs out of reach.
+	// decides says the call needs the index lock and the pool: it hands over a volume or
+	// moves a key's pointer. So its success can end a probation or clear a count. A
+	// lookup and a read are lock-free or served from memory, and a clone's miss says only
+	// that a lookup worked: the store can answer those with what a job needs out of reach.
 	decides bool
 }
 
@@ -102,9 +101,11 @@ func (b *storeBreaker) allow() bool {
 	return b.state == lease.CacheStoreClosed
 }
 
-// admit says whether this job may ask the store for a volume. ONE AT A TIME ON
-// PROBATION, because a probe's answer is not everything a job needs, and every job let
-// through while a trial was out would wait a deadline if it fails.
+// admit says whether this job may ask the store for what would settle a probation, a
+// volume or a publication, and is asked right before it does, so that nothing that goes
+// on to ask nothing can hold a trial. ONE AT A TIME
+// ON PROBATION, because a probe's answer is not everything a job needs, and every job
+// let through while a trial was out would wait a deadline if it fails.
 func (b *storeBreaker) admit() bool {
 	if b == nil {
 		return true
@@ -140,10 +141,10 @@ func (b *storeBreaker) report() lease.CacheStoreReport {
 }
 
 // storeAnswered says the store gave an answer, whatever it was. A miss and a conflict
-// are the store working; so is a read of an object that is not there.
+// are the store working.
 func storeAnswered(err error) bool {
 	return err == nil || errors.Is(err, storecontract.ErrMiss) ||
-		errors.Is(err, storecontract.ErrConflict) || errors.Is(err, fs.ErrNotExist)
+		errors.Is(err, storecontract.ErrConflict)
 }
 
 // outcome counts what one call the store was asked came to. A caller that went away
@@ -167,7 +168,7 @@ func (b *storeBreaker) outcome(call storeCall, err error) {
 	b.failed(call, reason)
 }
 
-// answered is a volume the store handed over: what ends a probation, and what says the
+// answered is the store doing what a job needs: what ends a probation, and what says the
 // failures so far were not the store. It closes nothing an open breaker holds, which
 // only a probe moves, because a call finishing now may have started long before the
 // store stopped answering.
@@ -248,7 +249,7 @@ func (b *storeBreaker) watch(call storeCall, limit time.Duration) func(error) {
 // run asks the store every breakerProbeEvery while the breaker is open, until ctx
 // ends. A store that answers goes on probation rather than straight back, because
 // what the probe reads is not everything a job needs: the index can answer while its
-// lock is out of reach, so the next job to ask for a volume decides.
+// lock is out of reach, so the next job to ask for a volume, or to publish, decides.
 func (b *storeBreaker) run(ctx context.Context, probe func(context.Context) error) {
 	ticker := time.NewTicker(breakerProbeEvery)
 	defer ticker.Stop()
@@ -276,13 +277,16 @@ func (b *storeBreaker) run(ctx context.Context, probe func(context.Context) erro
 		b.state, b.since, b.trialUntil = lease.CacheStoreProbation, time.Now(), time.Time{}
 		b.mu.Unlock()
 
-		b.log.Info("the site's store answered a probe; the next job to ask for a volume decides "+
+		b.log.Info("the site's store answered a probe; the next job to use it decides "+
 			"whether it is back", "store", b.store)
 		b.changed()
 	}
 }
 
 func (b *storeBreaker) isOpen() bool {
+	if b == nil {
+		return false
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

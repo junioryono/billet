@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -91,6 +92,14 @@ func (h *hangingStore) Current(ctx context.Context, key string) (string, error) 
 	return "", storecontract.ErrMiss
 }
 
+func (h *hangingStore) Match(ctx context.Context, exact string, restore []string) (string, string, error) {
+	if err := h.wait(ctx); err != nil {
+		return "", "", err
+	}
+
+	return h.fakeCacheStore.Match(ctx, exact, restore)
+}
+
 func (h *hangingStore) AcquireWriter(
 	ctx context.Context, key, holder string, ttl time.Duration,
 ) (storecontract.WriterLease, storecontract.FencingToken, error) {
@@ -120,9 +129,15 @@ type storeReports struct {
 	mu     sync.Mutex
 	refuse atomic.Bool
 	got    []lease.CacheStoreReport
+	bounds []time.Duration
 }
 
-func (r *storeReports) ReportCacheStore(_ context.Context, report lease.CacheStoreReport) error {
+func (r *storeReports) ReportCacheStore(ctx context.Context, report lease.CacheStoreReport) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		r.mu.Lock()
+		r.bounds = append(r.bounds, time.Until(deadline))
+		r.mu.Unlock()
+	}
 	if r.refuse.Load() {
 		return errors.New("the plane is away")
 	}
@@ -178,6 +193,42 @@ func imageCacheOf(service *CacheService, instance string) alloc.ImageCache {
 	defer session.mu.Unlock()
 
 	return alloc.ImageCache(session.observed.ImageCache)
+}
+
+// onProbation puts a breaker where an answered probe does.
+func onProbation(b *storeBreaker) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.state, b.since, b.trialUntil = lease.CacheStoreProbation, time.Now(), time.Time{}
+}
+
+// volumesAsked is how many volumes the store has been asked for.
+func (h *hangingStore) volumesAsked() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.cloned + h.created
+}
+
+// anActionsSession is a job the Actions cache serves.
+func anActionsSession(t *testing.T, service *CacheService, instance string) (*cacheSession, string) {
+	t.Helper()
+
+	credentials, err := service.PrepareScoped(instance, CacheSessionScope{
+		Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+		Cache: &config.CacheSpec{
+			Publish: config.CachePublishTrustedOnly, Docker: config.CacheSetting{Enabled: true},
+			StickyDisks: config.CacheSetting{Enabled: true}, Go: config.CacheSetting{Enabled: true},
+			Actions: config.CacheSetting{Enabled: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+
+	return service.sessionOf(instance), credentials.Token
 }
 
 func sessionLate(service *CacheService, instance string) int {
@@ -334,10 +385,20 @@ func TestALateVolumeIsDiscardedOnceAndHeldUntilItIs(t *testing.T) {
 			t.Fatal("the session finished with a call to the store still out")
 		}
 
-		// IT COMES BACK AND THE FIRST DISCARD FAILS, so the volume stays, durably.
+		// IT COMES BACK AND THE FIRST DISCARD FAILS, so the volume stays, durably, and
+		// the cache loop is told there is a session to look at again.
+		select {
+		case <-service.closed:
+		default:
+		}
 		storage.hanging.Store(false)
 		close(storage.release)
 		synctest.Wait()
+		select {
+		case <-service.closed:
+		default:
+			t.Fatal("a late call ending on a closed session did not wake the cache loop")
+		}
 		session.mu.Lock()
 		late := len(session.late)
 		session.mu.Unlock()
@@ -450,23 +511,33 @@ func TestAnOpenBreakerAnswersEveryCacheWithoutAskingTheStore(t *testing.T) {
 		if recorder.Code != http.StatusServiceUnavailable {
 			t.Fatalf("the Go cache: status %d: %s", recorder.Code, recorder.Body.String())
 		}
+		session.mu.Lock()
+		goCache := session.building[config.CacheGo]
+		session.mu.Unlock()
+		if goCache != alloc.BuildCacheBypassed {
+			t.Fatalf("the Go cache: noted %q", goCache)
+		}
 
-		// THE ACTIONS CACHE: A LOOKUP AND A RESERVATION GO TO GITHUB.
+		// THE ACTIONS CACHE: A LOOKUP AND A RESERVATION GO TO GITHUB, EACH SAYING WHY.
 		for _, path := range []string{actionsDownloadPath, actionsCreatePath} {
+			own, _ := anActionsSession(t, service, "billet-lease-"+strings.ReplaceAll(path, "/", "-"))
 			response, handled, err := service.actionsResponse(
-				twirp(t, path, `{"key":"npm","restore_keys":[],"version":"v1"}`), session)
+				twirp(t, path, `{"key":"npm","restore_keys":[],"version":"v1"}`), own)
 			if response != nil {
 				response.Body.Close()
 			}
 			if err != nil || handled || response != nil {
 				t.Fatalf("%s: answered %v, %v, %v, want it left to GitHub", path, response, handled, err)
 			}
+			own.mu.Lock()
+			actions := own.observed.ActionsCache
+			own.mu.Unlock()
+			if alloc.ActionsCache(actions) != alloc.ActionsCacheBypassed {
+				t.Fatalf("%s: observed %q", path, actions)
+			}
 		}
-		session.mu.Lock()
-		actions := session.observed.ActionsCache
-		session.mu.Unlock()
-		if alloc.ActionsCache(actions) != alloc.ActionsCacheBypassed {
-			t.Fatalf("the Actions cache: observed %q", actions)
+		if store, open, known := service.StoreBreakerOpen(); store != "ceph" || !open || !known {
+			t.Fatalf("StoreBreakerOpen = %q, %v, %v", store, open, known)
 		}
 		// AND A FINALIZE, BOUND TO A RESERVATION ONLY THIS NODE HOLDS, FAILS HERE.
 		response, handled, err := service.actionsResponse(
@@ -478,28 +549,19 @@ func TestAnOpenBreakerAnswersEveryCacheWithoutAskingTheStore(t *testing.T) {
 			t.Fatalf("a finalize: handled %v, %v", handled, err)
 		}
 
-		// A BLOB BILLET SIGNED IS NOT READ OR WRITTEN: BOTH WAIT IN THE KERNEL ON A VOLUME
-		// WHOSE OSDS HAVE GONE, HOLDING WHAT ITS CLEANUP NEEDS. One it did not sign is the
-		// proxy's to turn away.
+		// A BLOB IS NOT READ OR WRITTEN: BOTH WAIT IN THE KERNEL ON A VOLUME WHOSE OSDS HAVE
+		// GONE, HOLDING WHAT ITS CLEANUP NEEDS. It asks nothing of the session either, whose
+		// lock a request could be holding for a deadline.
 		session.mu.Lock()
 		session.actions["blob-id"] = &actionsArchive{ID: "blob-id", Signature: "sig", Mode: actionsModeDownload}
+		blob, blobHandled, blobErr := service.actionsResponse(actionsRequestForTest(t, http.MethodGet,
+			"https://"+actionsResultsHost+actionsBlobPrefix+"blob-id?sig=sig", ""), session)
 		session.mu.Unlock()
-		blob := func(signature string) (bool, error) {
-			request := actionsRequestForTest(t, http.MethodGet,
-				"https://"+actionsResultsHost+actionsBlobPrefix+"blob-id?sig="+signature, "")
-			response, handled, err := service.actionsResponse(request, session)
-			if response != nil {
-				response.Body.Close()
-				t.Fatalf("a blob with sig %q was answered with a %d", signature, response.StatusCode)
-			}
-
-			return handled, err
+		if blob != nil {
+			blob.Body.Close()
 		}
-		if handled, err := blob("sig"); !handled || !errors.Is(err, errStoreOpen) {
-			t.Fatalf("a signed blob: handled %v, %v", handled, err)
-		}
-		if handled, err := blob("forged"); handled || err != nil {
-			t.Fatalf("a blob billet did not sign: handled %v, %v", handled, err)
+		if blob != nil || !blobHandled || !errors.Is(blobErr, errStoreOpen) {
+			t.Fatalf("a blob: answered %v, handled %v, %v", blob, blobHandled, blobErr)
 		}
 
 		if waited := time.Since(start); waited != 0 {
@@ -623,12 +685,17 @@ func TestAnOpenBreakerSettlesADockerStoreWithoutAskingTheStore(t *testing.T) {
 			before := storage.snapshots
 
 			settled := make(chan error, 1)
-			go func() { settled <- service.SettleDocker(t.Context(), "billet-settle", true) }()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				settled <- service.SettleDocker(t.Context(), "billet-settle", true)
+			}()
+			t.Cleanup(func() { <-done })
 			if !open {
 				proof := map[string]any{
 					"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
 				}
-				deadline := time.Now().Add(5 * time.Second)
+				deadline := time.Now().Add(2 * time.Minute)
 				for {
 					ready := cacheRequest(t, service, credentials.Token, "/v1/docker-store/ready", proof)
 					if ready.Code == http.StatusOK {
@@ -729,6 +796,126 @@ func TestASessionHasOneLateCallOut(t *testing.T) {
 	})
 }
 
+// A VOLUME THAT CAME BACK LATE AND COULD NOT BE DISCARDED STILL HOLDS THE SESSION'S ONE
+// PLACE: a guest hanging up on each request would otherwise leave as many as it likes
+// outside its slots.
+func TestALateVolumeStillHeldStopsTheSessionAsking(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := newHangingStore()
+		storage.discardFailures = 1000
+		service := guardedService(t, storage)
+		storage.hanging.Store(true)
+		credentials, err := service.PrepareScoped("billet-held", CacheSessionScope{Trust: provider.TrustTrusted})
+		if err != nil {
+			t.Fatalf("PrepareScoped: %v", err)
+		}
+		attach := func() *httptest.ResponseRecorder {
+			return cacheRequest(t, service, credentials.Token, "/v1/volumes", map[string]any{
+				"key": "disk", "size_bytes": 1 << 20,
+			})
+		}
+
+		if got := attach(); got.Code != http.StatusServiceUnavailable {
+			t.Fatalf("first: status %d: %s", got.Code, got.Body.String())
+		}
+		storage.hanging.Store(false)
+		close(storage.release)
+		synctest.Wait()
+		if got := sessionLate(service, "billet-held"); got != 1 {
+			t.Fatalf("the session holds %d late volumes, want 1", got)
+		}
+
+		asked := storage.askedCount()
+		for range 5 {
+			if got := attach(); got.Code != http.StatusServiceUnavailable {
+				t.Fatalf("with a late volume held: status %d: %s", got.Code, got.Body.String())
+			}
+		}
+		if storage.askedCount() != asked {
+			t.Fatalf("with a late volume held the store was asked %d more times", storage.askedCount()-asked)
+		}
+	})
+}
+
+// ONLY WHAT ASKS FOR A VOLUME HOLDS A TRIAL. A lookup that misses, a job its own backoff
+// holds back and a kind that is off ask for nothing, and if they held it the store's
+// recovery would wait on them, indefinitely on a tier of nothing else.
+func TestWhatAsksForNoVolumeHoldsNoTrial(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		storage := newHangingStore()
+		storage.current = ""
+		service := guardedService(t, storage)
+		service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+			return true, nil
+		}))
+		guard := make(chan struct{})
+		go func() {
+			defer close(guard)
+			service.RunStoreGuard(ctx, &storeReports{})
+		}()
+		failThree(service.breaker)
+		time.Sleep(breakerProbeEvery)
+		synctest.Wait()
+		if got := service.breaker.report().State; got != lease.CacheStoreProbation {
+			t.Fatalf("state %q, want probation", got)
+		}
+
+		credentials, err := service.PrepareScoped("billet-trial", CacheSessionScope{
+			Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+			Cache: &config.CacheSpec{
+				Publish: config.CachePublishTrustedOnly, Docker: config.CacheSetting{Enabled: true},
+				StickyDisks: config.CacheSetting{Enabled: true}, Go: config.CacheSetting{Enabled: true},
+				Actions: config.CacheSetting{Enabled: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("PrepareScoped: %v", err)
+		}
+		session := service.sessionOf("billet-trial")
+
+		// A GO REQUEST HELD BACK BY ITS OWN BACKOFF.
+		session.mu.Lock()
+		session.casRetryAt = map[config.CacheKind]time.Time{config.CacheGo: time.Now().Add(time.Hour)}
+		session.mu.Unlock()
+		const digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		held := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/cas/go/cas/"+digest, http.NoBody)
+		held.Header.Set("Authorization", "Bearer "+credentials.Token)
+		service.ServeHTTP(httptest.NewRecorder(), held)
+
+		// AN ACTIONS LOOKUP THAT MISSES.
+		looked, handled, err := service.actionsResponse(
+			twirp(t, actionsDownloadPath, `{"key":"npm","restore_keys":[],"version":"v1"}`), session)
+		if looked != nil {
+			looked.Body.Close()
+		}
+		if !handled || err != nil {
+			t.Fatalf("a lookup on probation: handled %v, %v", handled, err)
+		}
+		if got := service.breaker.report().State; got != lease.CacheStoreProbation {
+			t.Fatalf("what handed over no volume moved probation to %q", got)
+		}
+
+		// THE TRIAL IS STILL THERE FOR THE JOB THAT ASKS, whose volume ends it.
+		if got := dockerStoreFor(t, service, "billet-next"); got.Code != http.StatusCreated {
+			t.Fatalf("the job that asked: status %d: %s", got.Code, got.Body.String())
+		}
+		if got := service.breaker.report().State; got != lease.CacheStoreClosed {
+			t.Fatalf("after a volume was handed over: state %q", got)
+		}
+
+		cancel()
+		<-guard
+	})
+}
+
 // A DISCARD IS NEVER COUNTED, THE ONE AN OVERSIZED CLONE NEEDS INCLUDED: the clone it
 // discards was handed over, and what follows is a job starting cold at its own size.
 func TestAnOversizedClonesSlowDiscardDoesNotCount(t *testing.T) {
@@ -744,8 +931,11 @@ func TestAnOversizedClonesSlowDiscardDoesNotCount(t *testing.T) {
 			}
 		}
 		synctest.Wait()
-		if !service.breaker.allow() {
-			t.Fatal("a discard that outlasted the deadline counted against the store")
+		service.breaker.mu.Lock()
+		failures := len(service.breaker.failures)
+		service.breaker.mu.Unlock()
+		if failures != 0 {
+			t.Fatalf("a discard that outlasted the deadline counted %d failures", failures)
 		}
 		close(storage.release)
 		synctest.Wait()
@@ -779,14 +969,17 @@ func TestAnActionsFinalizesTimeoutsCountAgainstTheStore(t *testing.T) {
 	t.Parallel()
 
 	timedOut := fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+	notClean := errors.New("not clean")
 	for _, tc := range []struct {
 		name     string
 		break_   func(*hangingStore)
+		want     error
 		wantOpen bool
 	}{
-		{"a writer that timed out", func(s *hangingStore) { s.writerErr = timedOut }, true},
-		{"a snapshot that timed out", func(s *hangingStore) { s.snapshotErr = timedOut }, true},
-		{"a refused snapshot", func(s *hangingStore) { s.snapshotErr = errors.New("not clean") }, false},
+		{"a writer that timed out", func(s *hangingStore) { s.writerErr = timedOut }, timedOut, true},
+		{"a snapshot that timed out", func(s *hangingStore) { s.snapshotErr = timedOut }, timedOut, true},
+		{"a publication that timed out", func(s *hangingStore) { s.publishErr = timedOut }, timedOut, true},
+		{"a refused snapshot", func(s *hangingStore) { s.snapshotErr = notClean }, notClean, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -813,8 +1006,8 @@ func TestAnActionsFinalizesTimeoutsCountAgainstTheStore(t *testing.T) {
 				session.mu.Lock()
 				session.actions["reserved"] = &actionsArchive{
 					ID: "reserved", Signature: "sig", Mode: actionsModeUpload, CacheKey: "npm",
-					Version: "v1", StoreKey: "actions/npm", Unmounted: true,
-					Volume: storecontract.Volume{Key: "actions/npm", Handle: "pool/" + instance},
+					Version: "v1", StoreKey: "actions/npm-" + instance, Unmounted: true,
+					Volume: storecontract.Volume{Key: "actions/npm-" + instance, Handle: "pool/" + instance},
 				}
 				session.mu.Unlock()
 				archivePath := service.actionsArchivePath(session, session.actions["reserved"])
@@ -830,8 +1023,8 @@ func TestAnActionsFinalizesTimeoutsCountAgainstTheStore(t *testing.T) {
 				if response != nil {
 					response.Body.Close()
 				}
-				if err == nil {
-					t.Fatal("a finalize the store failed succeeded")
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("a finalize the store failed: %v, want %v", err, tc.want)
 				}
 			}
 			if got := !service.breaker.allow(); got != tc.wantOpen {
@@ -839,6 +1032,63 @@ func TestAnActionsFinalizesTimeoutsCountAgainstTheStore(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A READ THAT FINDS WHAT IT ASKED FOR, OR NOTHING THERE, IS THE STORE WORKING: its timer
+// must not go on to count it, or three jobs' cache hits would open the breaker on a
+// healthy store.
+func TestAContentAddressedReadThatIsAnsweredDoesNotCountLater(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		service := guardedService(t, newHangingStore())
+		const digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		const linked = "aab0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+		root := t.TempDir()
+		dir := filepath.Join(root, "cas", digest[:2])
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		object := filepath.Join(dir, digest)
+		if err := os.WriteFile(object, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := filepath.Join(root, "cas", linked[:2])
+		if err := os.MkdirAll(linkDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(object, filepath.Join(linkDir, linked)); err != nil {
+			t.Fatal(err)
+		}
+
+		for i := range breakerFailures {
+			hv := &hostVolume{}
+			handle := &casHandle{
+				s: service, session: &cacheSession{instance: fmt.Sprintf("hit-%d", i)}, hv: hv, root: root,
+				release: func() {},
+			}
+			file, err := handle.Open("cas", digest)
+			if err != nil {
+				t.Fatalf("a read of what is there: %v", err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !hv.hit.Load() {
+				t.Fatal("a hit was not noted")
+			}
+			handle.session = &cacheSession{instance: fmt.Sprintf("link-%d", i)}
+			if _, err := handle.Open("cas", linked); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("a read of a link: %v", err)
+			}
+		}
+		time.Sleep(2 * casReadLimit)
+		synctest.Wait()
+		if !service.breaker.allow() {
+			t.Fatal("reads the store answered counted when their timers would have fired")
+		}
+	})
 }
 
 // A READ OF A CONTENT-ADDRESSED VOLUME IS WHAT THE BREAKER HEARS OF A STORE WHOSE OSDS
@@ -957,6 +1207,17 @@ func TestABreakersReportReachesThePlaneEventually(t *testing.T) {
 		if got := reports.states(); len(got) != 3 {
 			t.Fatalf("a registration's report that failed was not sent again: %v", got)
 		}
+		reports.mu.Lock()
+		bounds := slices.Clone(reports.bounds)
+		reports.mu.Unlock()
+		for _, bound := range bounds {
+			if bound != storeReportLimit {
+				t.Fatalf("a report was bounded at %s, want %s", bound, storeReportLimit)
+			}
+		}
+		if len(bounds) == 0 {
+			t.Fatal("no report was bounded")
+		}
 
 		cancel()
 		<-done
@@ -968,19 +1229,24 @@ func TestABreakersReportReachesThePlaneEventually(t *testing.T) {
 func TestOnlyAPublicationsTimeoutCountsAgainstTheStore(t *testing.T) {
 	t.Parallel()
 
+	timedOut := fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
 	for _, tc := range []struct {
 		name     string
 		err      error
+		writer   error
+		publish  error
 		wantOpen bool
 	}{
-		{"a filesystem that is not clean", errors.New("ceph: verify candidate as published: the ext4 filesystem is not clean"), false},
-		{"a store that did not answer", fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded), true},
+		{name: "a filesystem that is not clean", err: errors.New("ceph: verify candidate as published: the ext4 filesystem is not clean")},
+		{name: "a snapshot that did not answer", err: timedOut, wantOpen: true},
+		{name: "a writer that did not answer", writer: timedOut, wantOpen: true},
+		{name: "a publication that did not answer", publish: timedOut, wantOpen: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			storage := newHangingStore()
-			storage.snapshotErr = tc.err
+			storage.snapshotErr, storage.writerErr, storage.publishErr = tc.err, tc.writer, tc.publish
 			service := guardedService(t, storage)
 			// ATTACHED FIRST, because a volume handed over between them clears the count.
 			var tokens []string
@@ -1002,14 +1268,391 @@ func TestOnlyAPublicationsTimeoutCountsAgainstTheStore(t *testing.T) {
 					t.Fatalf("commit: status %d: %s", got.Code, got.Body.String())
 				}
 			}
-			if storage.snapshots != breakerFailures {
-				t.Fatalf("%d snapshots were tried, want %d", storage.snapshots, breakerFailures)
-			}
 			if got := !service.breaker.allow(); got != tc.wantOpen {
 				t.Fatalf("open = %v, want %v", got, tc.wantOpen)
 			}
 		})
 	}
+}
+
+// A GUEST THAT HANGS UP GOES ON WITHOUT THE STORE AT ONCE, and the call goes on.
+func TestAGuestHangingUpEndsItsWaitAndNotTheCall(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := newHangingStore()
+		service := guardedService(t, storage)
+		storage.hanging.Store(true)
+		credentials, err := service.PrepareScoped("billet-hangup", CacheSessionScope{Trust: provider.TrustTrusted})
+		if err != nil {
+			t.Fatalf("PrepareScoped: %v", err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		time.AfterFunc(time.Second, cancel)
+
+		start := time.Now()
+		got := cacheRequestWithin(t, ctx, service, credentials.Token, "/v1/volumes", map[string]any{
+			"key": "disk", "size_bytes": 1 << 20,
+		})
+		if got.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d: %s", got.Code, got.Body.String())
+		}
+		if waited := time.Since(start); waited != time.Second {
+			t.Fatalf("a request that hung up after a second took %s", waited)
+		}
+
+		storage.hanging.Store(false)
+		close(storage.release)
+		synctest.Wait()
+		if got := storage.discards(); got != 1 {
+			t.Fatalf("%d late volumes were discarded, want the call's one", got)
+		}
+	})
+}
+
+// A REQUEST'S OWN TIME RUNNING OUT SAYS NOTHING OF THE STORE: a guest names its own
+// deadline, in a gRPC client's grpc-timeout, and three jobs with a short one must not
+// open the breaker on a store that was only taking its time.
+func TestARequestsOwnDeadlineDoesNotCountAgainstTheStore(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := newHangingStore()
+		service := guardedService(t, storage)
+		service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+			return true, nil
+		}))
+		storage.hanging.Store(true)
+
+		for i := range breakerFailures {
+			credentials, err := service.PrepareScoped(fmt.Sprintf("billet-short-%d", i),
+				CacheSessionScope{Trust: provider.TrustTrusted})
+			if err != nil {
+				t.Fatalf("PrepareScoped: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			got := cacheRequestWithin(t, ctx, service, credentials.Token, "/v1/volumes", map[string]any{
+				"key": "disk", "size_bytes": 1 << 20,
+			})
+			cancel()
+			if got.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status %d: %s", got.Code, got.Body.String())
+			}
+
+			// THE SAME OF A LOOKUP, WHICH THE REQUEST'S DEADLINE DOES CUT SHORT.
+			session, _ := anActionsSession(t, service, fmt.Sprintf("billet-lookup-%d", i))
+			lookupCtx, cancelLookup := context.WithTimeout(t.Context(), time.Second)
+			response, handled, err := service.actionsResponse(twirp(t, actionsDownloadPath,
+				`{"key":"npm","restore_keys":[],"version":"v1"}`).WithContext(lookupCtx), session)
+			cancelLookup()
+			if response != nil {
+				response.Body.Close()
+			}
+			if !handled || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("a lookup past its request's deadline: handled %v, %v", handled, err)
+			}
+		}
+
+		// THE STORE ANSWERS, INSIDE ITS OWN DEADLINE, EVERY CALL THE REQUESTS LEFT BEHIND.
+		time.Sleep(testStoreDeadline - 10*time.Second)
+		storage.hanging.Store(false)
+		close(storage.release)
+		synctest.Wait()
+		service.breaker.mu.Lock()
+		failures := len(service.breaker.failures)
+		service.breaker.mu.Unlock()
+		if failures != 0 {
+			t.Fatalf("requests' own deadlines counted %d failures against the store", failures)
+		}
+	})
+}
+
+// A LOOKUP THE STORE LEAVES HANGING IS BOUNDED AT THE DEADLINE, AND COUNTS.
+func TestALookupThatHangsCountsAtTheDeadline(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := newHangingStore()
+		service := guardedService(t, storage)
+		service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+			return true, nil
+		}))
+		storage.hanging.Store(true)
+
+		for i := range breakerFailures {
+			session, _ := anActionsSession(t, service, fmt.Sprintf("billet-hung-%d", i))
+			start := time.Now()
+			response, handled, err := service.actionsResponse(twirp(t, actionsDownloadPath,
+				`{"key":"npm","restore_keys":[],"version":"v1"}`), session)
+			if response != nil {
+				response.Body.Close()
+			}
+			if !handled || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("handled %v, %v", handled, err)
+			}
+			if waited := time.Since(start); waited != testStoreDeadline {
+				t.Fatalf("a lookup waited %s, want the deadline", waited)
+			}
+		}
+		synctest.Wait()
+		if !service.breaker.isOpen() {
+			t.Fatal("lookups that hung left the breaker closed")
+		}
+		close(storage.release)
+	})
+}
+
+// EVERY ROUTE THAT ASKS FOR A VOLUME CAN END A PROBATION, and none asks while another
+// job's trial is out.
+func TestEachRouteThatAsksForAVolumeTakesTheTrial(t *testing.T) {
+	t.Parallel()
+
+	const digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	twirpRoute := func(path string) func(*testing.T, *CacheService, *cacheSession, string) {
+		return func(t *testing.T, service *CacheService, session *cacheSession, _ string) {
+			t.Helper()
+			response, _, err := service.actionsResponse(
+				twirp(t, path, `{"key":"npm","restore_keys":[],"version":"v1"}`), session)
+			if response != nil {
+				response.Body.Close()
+			}
+			if err != nil && !errors.Is(err, errStoreOpen) {
+				t.Fatalf("%s: %v", path, err)
+			}
+		}
+	}
+	for name, route := range map[string]func(*testing.T, *CacheService, *cacheSession, string){
+		"the Docker image store": func(t *testing.T, service *CacheService, _ *cacheSession, token string) {
+			t.Helper()
+			cacheRequest(t, service, token, "/v1/docker-store", map[string]any{"architecture": "amd64"})
+		},
+		"a sticky disk": func(t *testing.T, service *CacheService, _ *cacheSession, token string) {
+			t.Helper()
+			cacheRequest(t, service, token, "/v1/volumes", map[string]any{"key": "disk", "size_bytes": 1 << 20})
+		},
+		"the Go cache": func(t *testing.T, service *CacheService, _ *cacheSession, token string) {
+			t.Helper()
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/cas/go/cas/"+digest, http.NoBody)
+			request.Header.Set("Authorization", "Bearer "+token)
+			service.ServeHTTP(httptest.NewRecorder(), request)
+		},
+		"an Actions restore":     twirpRoute(actionsDownloadPath),
+		"an Actions reservation": twirpRoute(actionsCreatePath),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				storage := newHangingStore()
+				service := guardedService(t, storage)
+				service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+					return true, nil
+				}))
+				session, token := anActionsSession(t, service, "billet-route")
+				onProbation(service.breaker)
+
+				// ANOTHER JOB'S TRIAL IS OUT.
+				if !service.breaker.admit() {
+					t.Fatal("no trial to take")
+				}
+				asked := storage.volumesAsked()
+				route(t, service, session, token)
+				if storage.volumesAsked() != asked {
+					t.Fatal("a route asked for a volume with another job's trial out")
+				}
+
+				// ITS TIME UP, THIS ROUTE TAKES IT, AND ITS VOLUME ENDS THE PROBATION.
+				time.Sleep(testStoreDeadline)
+				session.mu.Lock()
+				session.casRetryAt = nil
+				session.mu.Unlock()
+				route(t, service, session, token)
+				if storage.volumesAsked() == asked {
+					t.Fatal("a route asked for no volume with the trial free")
+				}
+				if got := service.breaker.report().State; got != lease.CacheStoreClosed {
+					t.Fatalf("after a volume was handed over: state %q", got)
+				}
+			})
+		})
+	}
+}
+
+// THE PROXY SAYS WHY, AND TURNS AWAY WHAT GITHUB COULD NOT ANSWER.
+func TestTheProxysAnswerToAStoreNotAsked(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := newHangingStore()
+		service := guardedService(t, storage)
+		service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+			return true, nil
+		}))
+		proxy := &actionsProxy{service: service}
+		failThree(service.breaker)
+		observed := func(session *cacheSession) alloc.ActionsCache {
+			session.mu.Lock()
+			defer session.mu.Unlock()
+
+			return alloc.ActionsCache(session.observed.ActionsCache)
+		}
+
+		// A FINALIZE THIS NODE HOLDS NO RESERVATION FOR GOES TO GITHUB, WHICH HAS IT.
+		spliced, _ := anActionsSession(t, service, "billet-proxy-spliced")
+		response, handled := proxy.respond(twirp(t, actionsFinalizePath,
+			`{"key":"npm","version":"v1","size_bytes":"1"}`), spliced)
+		if response != nil {
+			response.Body.Close()
+		}
+		if response != nil || handled {
+			t.Fatalf("a finalize of GitHub's: %v, %v", response, handled)
+		}
+		if got := observed(spliced); got != alloc.ActionsCacheBypassed {
+			t.Fatalf("a finalize of GitHub's: observed %q", got)
+		}
+
+		// ONE IT DOES FAILS HERE, BEING NO ONE ELSE'S.
+		reserved, _ := anActionsSession(t, service, "billet-proxy-reserved")
+		reserved.mu.Lock()
+		reserved.actions["held"] = &actionsArchive{
+			ID: "held", Signature: "sig", Mode: actionsModeUpload, CacheKey: "npm", Version: "v1",
+		}
+		reserved.mu.Unlock()
+		response, handled = proxy.respond(twirp(t, actionsFinalizePath,
+			`{"key":"npm","version":"v1","size_bytes":"1"}`), reserved)
+		if !handled || response == nil || response.StatusCode != http.StatusBadGateway {
+			t.Fatalf("a finalize of this node's: %v, %v", response, handled)
+		}
+		response.Body.Close()
+		if got := observed(reserved); got != alloc.ActionsCacheUnavailable {
+			t.Fatalf("a finalize of this node's: observed %q", got)
+		}
+
+		// AND SO DOES A BLOB.
+		response, handled = proxy.respond(actionsRequestForTest(t, http.MethodGet,
+			"https://"+actionsResultsHost+actionsBlobPrefix+"held?sig=sig", ""), reserved)
+		if !handled || response == nil || response.StatusCode != http.StatusBadGateway {
+			t.Fatalf("a blob: %v, %v", response, handled)
+		}
+		response.Body.Close()
+
+		// ON PROBATION WITH ANOTHER JOB'S TRIAL OUT, A RESTORE GOES TO GITHUB AND SAYS WHY.
+		onProbation(service.breaker)
+		if !service.breaker.admit() {
+			t.Fatal("no trial to take")
+		}
+		waiting, _ := anActionsSession(t, service, "billet-proxy-waiting")
+		response, handled = proxy.respond(twirp(t, actionsDownloadPath,
+			`{"key":"npm","restore_keys":[],"version":"v1"}`), waiting)
+		if response != nil {
+			response.Body.Close()
+		}
+		if response != nil || handled {
+			t.Fatalf("a restore on probation: %v, %v", response, handled)
+		}
+		if got := observed(waiting); got != alloc.ActionsCacheBypassed {
+			t.Fatalf("a restore on probation: observed %q", got)
+		}
+	})
+}
+
+// A PUBLICATION IS A WAY BACK: a node with no job left to ask for a volume would otherwise
+// sit on probation until its window dropped what the job wrote. While it cannot be asked,
+// it waits, and costs nothing.
+func TestAPublicationWaitsForTheStoreAndCanEndAProbation(t *testing.T) {
+	t.Parallel()
+
+	settled := func(t *testing.T, service *CacheService) {
+		t.Helper()
+		if got := service.breaker.report().State; got != lease.CacheStoreClosed {
+			t.Fatalf("after a publication: state %q", got)
+		}
+	}
+
+	t.Run("deferred", func(t *testing.T) {
+		t.Parallel()
+
+		storage := &fakeCacheStore{}
+		service, token, instance := scopedService(t, provider.TrustUntrusted, defaultBranchCache(), nil, storage)
+		service.GuardStore("ceph", testStoreDeadline)
+		attachAndCommit(t, service, token)
+		failThree(service.breaker)
+
+		if err := service.SettleCompleted(t.Context(), instance, true, publishingAuthority()); err != nil {
+			t.Fatalf("SettleCompleted: %v", err)
+		}
+		if err := service.Close(t.Context(), instance); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		// THE SESSION WAITS FOR ITS PUBLICATION, inside the window.
+		if err := service.RetryClosed(t.Context()); err == nil || !strings.Contains(err.Error(), "publication pending") {
+			t.Fatalf("RetryClosed with the breaker open: %v", err)
+		}
+		if storage.snapshots != 0 || storage.published != 0 {
+			t.Fatalf("with the breaker open: %d snapshots, %d published", storage.snapshots, storage.published)
+		}
+
+		onProbation(service.breaker)
+		if err := service.RetryClosed(t.Context()); err != nil {
+			t.Fatalf("RetryClosed: %v", err)
+		}
+		if storage.published != 1 {
+			t.Fatalf("on probation: %d published, want 1", storage.published)
+		}
+		settled(t, service)
+	})
+
+	t.Run("content-addressed", func(t *testing.T) {
+		t.Parallel()
+
+		storage := &fakeCacheStore{}
+		service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+		service.GuardStore("ceph", testStoreDeadline)
+		ours := "our object"
+		if got := casRequest(t, service, token, http.MethodPut, "/v1/cas/go/cas/"+digestOf(ours), ours); got.Code != http.StatusOK {
+			t.Fatalf("PUT = %d %s", got.Code, got.Body.String())
+		}
+		failThree(service.breaker)
+
+		endSession(t, service, instance, publishingAuthority())
+		if storage.snapshots != 0 || storage.published != 0 {
+			t.Fatalf("with the breaker open: %d snapshots, %d published", storage.snapshots, storage.published)
+		}
+
+		onProbation(service.breaker)
+		if err := service.RetryClosed(t.Context()); err != nil {
+			t.Fatalf("RetryClosed: %v", err)
+		}
+		if storage.published == 0 {
+			t.Fatal("on probation nothing was published")
+		}
+		settled(t, service)
+	})
+
+	t.Run("a job's own commit", func(t *testing.T) {
+		t.Parallel()
+
+		storage := newHangingStore()
+		service := guardedService(t, storage)
+		credentials, err := service.PrepareScoped("billet-own", CacheSessionScope{Trust: provider.TrustTrusted})
+		if err != nil {
+			t.Fatalf("PrepareScoped: %v", err)
+		}
+		if got := cacheRequest(t, service, credentials.Token, "/v1/volumes", map[string]any{
+			"key": "disk", "size_bytes": 1 << 20,
+		}); got.Code != http.StatusCreated {
+			t.Fatalf("attach: status %d: %s", got.Code, got.Body.String())
+		}
+		onProbation(service.breaker)
+		got := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/commit", map[string]any{
+			"filesystem": map[string]any{"type": "ext4", "uuid": "fs-1", "clean": true},
+		})
+		if !strings.Contains(got.Body.String(), `"published":true`) {
+			t.Fatalf("a commit on probation: %s", got.Body.String())
+		}
+		settled(t, service)
+	})
 }
 
 // A DISCARD IS NOT WHAT A JOB WAITS ON: every `rbd rm` failed for an hour on 2026-09-25
@@ -1020,6 +1663,8 @@ func TestAStoreThatWillNotDiscardIsStillAsked(t *testing.T) {
 	storage := newHangingStore()
 	storage.discardFailures = 1000
 	service := guardedService(t, storage)
+	// ATTACHED FIRST, because a volume handed over between them clears the count.
+	var instances []string
 	for i := range 2 * breakerFailures {
 		instance := fmt.Sprintf("billet-discard-%d", i)
 		credentials, err := service.PrepareScoped(instance, CacheSessionScope{Trust: provider.TrustTrusted})
@@ -1030,9 +1675,15 @@ func TestAStoreThatWillNotDiscardIsStillAsked(t *testing.T) {
 			map[string]any{"architecture": "amd64"}); got.Code != http.StatusCreated {
 			t.Fatalf("status %d: %s", got.Code, got.Body.String())
 		}
+		instances = append(instances, instance)
+	}
+	for _, instance := range instances {
 		if err := service.Cleanup(t.Context(), instance); err == nil {
 			t.Fatal("a discard that failed was not reported")
 		}
+	}
+	if got := storage.discards(); got < len(instances) {
+		t.Fatalf("%d discards were attempted, want at least %d", got, len(instances))
 	}
 	if !service.breaker.allow() {
 		t.Fatal("discards that failed stopped jobs asking the store")

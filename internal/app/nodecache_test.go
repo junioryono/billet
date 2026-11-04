@@ -5,7 +5,6 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,7 +12,6 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
@@ -576,8 +574,8 @@ func namesSelector(expr ast.Expr, pkg, name string) bool {
 	return ok && ident.Name == pkg
 }
 
-// EVERY NODE WHOSE STORE STANDS BETWEEN A JOB AND ITS START HAS A BREAKER, under the
-// deadline its measurement set, and no other does.
+// EVERY NODE WHOSE STORE STANDS BETWEEN A JOB AND ITS START HAS A BREAKER, and no other
+// does.
 func TestAStoreBetweenAJobAndItsStartIsGuarded(t *testing.T) {
 	t.Parallel()
 
@@ -592,15 +590,30 @@ func TestAStoreBetweenAJobAndItsStartIsGuarded(t *testing.T) {
 		t.Run(string(tc.provider), func(t *testing.T) {
 			t.Parallel()
 
-			service, err := node.NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
-				struct{ storecontract.Store }{}, struct{ provider.VolumeAttacher }{}, slog.New(slog.DiscardHandler))
+			cfg := &config.Config{Node: &config.NodeConfig{
+				Provider: tc.provider,
+				StateDir: t.TempDir(),
+				Cache:    &config.NodeCacheConfig{Listen: "172.20.0.1:7718", GuestEndpoint: "http://172.20.0.1:7718"},
+			}}
+			// NOTHING HERE IS CALLED: building the service asks none of them.
+			service, err := NewNodeCacheService(cfg, "deployment-1", struct{ storecontract.Store }{},
+				struct{ provider.VolumeAttacher }{}, struct{ NodeCacheControl }{})
 			if err != nil {
-				t.Fatalf("NewCacheService: %v", err)
+				t.Fatalf("NewNodeCacheService: %v", err)
 			}
-			guardNodeStore(&config.Config{Node: &config.NodeConfig{Provider: tc.provider}}, service)
 			store, open, known := service.StoreBreakerOpen()
 			if store != tc.store || known != (tc.store != "") || open {
 				t.Fatalf("StoreBreakerOpen = %q, %v, %v, want %q", store, open, known, tc.store)
+			}
+
+			// THE GAUGE: 0 WHILE ITS JOBS ASK, AND NO SERIES FOR A STORE NOBODY GUARDS.
+			snapshot := cacheBreakerSnapshot(service)
+			if samples := snapshot[familyCacheBreakerOpen]; tc.store == "" {
+				if len(samples) != 0 {
+					t.Fatalf("a store nobody guards has a series: %+v", samples)
+				}
+			} else if len(samples) != 1 || samples[0].Value != 0 || samples[0].Labels[0] != tc.store {
+				t.Fatalf("the gauge = %+v", samples)
 			}
 		})
 	}
@@ -611,26 +624,26 @@ func TestAStoreBetweenAJobAndItsStartIsGuarded(t *testing.T) {
 func TestTheNodeRunsItsStoreGuardAndResendsAtRegistration(t *testing.T) {
 	t.Parallel()
 
-	for file, want := range map[string]string{
-		"nodecache.go": "RunStoreGuard",
-		"node.go":      "ResendStoreState",
+	for _, tc := range []struct{ file, function, want string }{
+		{"nodecache.go", "startNodeCache", "RunStoreGuard"},
+		{"nodecache.go", "NewNodeCacheService", "guardNodeStore"},
+		{"node.go", "Run", "ResendStoreState"},
 	} {
-		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatalf("parse %s: %v", file, err)
-		}
 		called := false
-		ast.Inspect(parsed, func(n ast.Node) bool {
+		ast.Inspect(nodeFunc(t, tc.file, tc.function), func(n ast.Node) bool {
 			if call, ok := n.(*ast.CallExpr); ok {
-				if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == want {
-					called = true
+				switch fun := call.Fun.(type) {
+				case *ast.SelectorExpr:
+					called = called || fun.Sel.Name == tc.want
+				case *ast.Ident:
+					called = called || fun.Name == tc.want
 				}
 			}
 
 			return true
 		})
 		if !called {
-			t.Errorf("%s no longer calls %s", file, want)
+			t.Errorf("%s no longer calls %s", tc.function, tc.want)
 		}
 	}
 }

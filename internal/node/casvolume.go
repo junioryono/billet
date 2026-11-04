@@ -160,6 +160,12 @@ func (s *CacheService) casVolume(
 		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
 			return s.cloneOrCreate(acquireCtx, session.instance, key, ceiling, ceiling)
 		})
+	// Nothing was asked, so there is nothing to back off from when the store comes back.
+	if errors.Is(err, errStoreOpen) {
+		noteBuildCache(session, kind, alloc.BuildCacheBypassed)
+
+		return nil, err
+	}
 	if err != nil {
 		backOff()
 
@@ -252,7 +258,9 @@ func (s *CacheService) startFresh(
 	if err := s.store.Discard(ctx, hv.Volume); err != nil {
 		return fmt.Errorf("discard the full %s cache: %w", hv.Kind, err)
 	}
-	fresh, err := s.store.Create(ctx, key, ceiling)
+	fresh, err := s.handOver(session.instance, "a fresh volume", func() (storecontract.Volume, error) {
+		return s.store.Create(ctx, key, ceiling)
+	})
 	if err != nil {
 		return err
 	}
@@ -434,13 +442,13 @@ func (s *CacheService) openCASHandle(
 	// A STORE THAT HAS STOPPED ANSWERING IS NOT READ EITHER, whether or not this
 	// session has its volume yet: a read of a volume whose OSDs are gone waits in the
 	// kernel, so nothing here could end it, and the guest's helper reads this as a miss.
-	// One still to get its volume may be the job a probation is waiting for; one that
-	// has it would decide nothing by reading it.
-	asking := s.breaker.allow
-	if session.hosts[kind] == nil {
-		asking = s.breaker.admit
+	// On probation one still to get its volume goes on, to casVolume's own admission,
+	// as one that has it would decide nothing by reading it.
+	refused := s.breaker.isOpen()
+	if session.hosts[kind] != nil {
+		refused = !s.breaker.allow()
 	}
-	if enabled && !asking() {
+	if enabled && refused {
 		noteBuildCache(session, kind, alloc.BuildCacheBypassed)
 		session.mu.Unlock()
 		admitted()
@@ -529,7 +537,7 @@ func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
-			err = fs.ErrNotExist
+			err = nil
 		}
 		done(err)
 
@@ -731,8 +739,9 @@ func (s *CacheService) releaseCASVolume(
 	if !s.sessionKindAllowed(ctx, session, hv.Kind) {
 		return abandon("the cache is disabled for this repository")
 	}
-	// A STORE THAT HAS STOPPED ANSWERING IS ASKED AGAIN NEXT PASS, inside the window.
-	if !s.breaker.allow() {
+	// A STORE THAT HAS STOPPED ANSWERING IS ASKED AGAIN NEXT PASS, inside the window. On
+	// probation it may be the only thing that could settle it.
+	if !s.breaker.admit() {
 		return false, nil
 	}
 
@@ -833,7 +842,9 @@ func (s *CacheService) mergeCASVolume(
 		if !s.sessionKindAllowed(ctx, session, hv.Kind) {
 			return release(errors.New("the cache was disabled before its publication"))
 		}
-		if err := s.store.PublishCAS(ctx, key, current, candidate, lease, fence); err != nil {
+		err := s.store.PublishCAS(ctx, key, current, candidate, lease, fence)
+		s.countedPublish(session.instance, err)
+		if err != nil {
 			return release(fmt.Errorf("publish: %w", err))
 		}
 

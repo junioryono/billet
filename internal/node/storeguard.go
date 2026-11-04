@@ -132,7 +132,8 @@ func (s *CacheService) reportStoreState(ctx context.Context, reporter CacheStore
 }
 
 // asked runs one question that may be cancelled, under the store's deadline when it
-// has one, and counts what it came to.
+// has one, and counts what it came to. A REQUEST'S OWN TIME RUNNING OUT SAYS NOTHING OF
+// THE STORE: a guest names its own deadline, and three of them would open the breaker.
 func (s *CacheService) asked(
 	ctx context.Context, session *cacheSession, op string, question func(context.Context) error,
 ) error {
@@ -144,6 +145,11 @@ func (s *CacheService) asked(
 
 	done := s.breaker.watch(storeCall{op: op, who: session.instance}, s.storeDeadline)
 	err := question(askCtx)
+	if ctx.Err() != nil {
+		done(context.Canceled)
+
+		return err
+	}
 	done(err)
 
 	return err
@@ -165,13 +171,15 @@ type storeAcquired struct {
 // behind, so nothing cancels it before limit. What it comes to is settled off the
 // request's path by finishLateAcquisition, and the session cannot finish until it has.
 //
-// limit bounds the whole call, inside whatever the request has left. What the breaker
-// hears is the store's own calls inside acquire (handOver), so nothing else the call
-// does counts against the store.
+// limit alone bounds the whole call: a guest names its own request's deadline, and the
+// late path already owns what the call comes to. What the breaker hears is the store's
+// own calls inside acquire (handOver), so nothing else the call does counts against it.
 //
-// ONE CALL OUT PER SESSION: a guest that hangs up on each request would otherwise start
-// as many detached calls as it can send requests, each holding a place in the store's
-// queue that no job is waiting on.
+// ONE CALL OUT PER SESSION, AND NONE WHILE IT HOLDS WHAT ONE LEFT: a guest that hangs up
+// on each request would otherwise start as many detached calls as it can send requests,
+// each holding a place in the store's queue that no job is waiting on, and leave as many
+// volumes as it likes outside its slots when their discards fail. On probation, or with
+// the breaker open, it answers errStoreOpen with the store unasked.
 func (s *CacheService) acquireVolume(
 	parent context.Context, session *cacheSession, limit time.Duration,
 	acquire func(context.Context) (storecontract.Volume, bool, error),
@@ -182,16 +190,14 @@ func (s *CacheService) acquireVolume(
 
 		return acquire(ctx)
 	}
-	if session.acquiring > 0 {
+	if session.acquiring > 0 || len(session.late) > 0 {
 		return storecontract.Volume{}, false, errStoreLate
+	}
+	if !s.breaker.admit() {
+		return storecontract.Volume{}, false, errStoreOpen
 	}
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), limit)
-	if deadline, ok := parent.Deadline(); ok {
-		cancel()
-		ctx, cancel = context.WithDeadline(context.WithoutCancel(parent),
-			earliest(deadline, time.Now().Add(limit)))
-	}
 
 	result := make(chan storeAcquired, 1)
 	go func() {
@@ -214,14 +220,6 @@ func (s *CacheService) acquireVolume(
 	go s.finishLateAcquisition(context.WithoutCancel(parent), session, result)
 
 	return storecontract.Volume{}, false, errStoreLate
-}
-
-func earliest(a, b time.Time) time.Time {
-	if a.Before(b) {
-		return a
-	}
-
-	return b
 }
 
 // finishLateAcquisition settles a call no job is waiting on any more: a volume it
@@ -313,4 +311,16 @@ func (s *CacheService) countedPublication(session, op string, err error) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		s.breaker.outcome(storeCall{op: op, who: session}, err)
 	}
+}
+
+// countedPublish counts the step that moves a key's pointer, whose success, having
+// needed the index lock, settles a probation as a volume handed over does: on a node
+// with no job to ask for a volume, a publication is all that could.
+func (s *CacheService) countedPublish(session string, err error) {
+	if err == nil {
+		s.breaker.outcome(storeCall{op: "a cache publication", who: session, decides: true}, nil)
+
+		return
+	}
+	s.countedPublication(session, "a cache publication", err)
 }

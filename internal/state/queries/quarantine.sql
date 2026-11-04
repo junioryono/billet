@@ -153,10 +153,11 @@ ON CONFLICT(node) DO UPDATE SET
 
 -- name: UpsertNodeCacheStore :execrows
 -- Record what a node's breaker says about its site's store, under the node's epoch
--- now. A node with no row writes nothing, which is what the count says.
+-- now, for the process registered now. A node with no such row writes nothing, which
+-- is what the count says.
 INSERT INTO node_cache_stores (node, store, state, since, failures, reason, node_epoch, received_at)
 SELECT name, @store, @state, @since, @failures, @reason, epoch, @received_at
-  FROM nodes WHERE name = @node
+  FROM nodes WHERE name = @node AND incarnation = @incarnation
 ON CONFLICT(node, store) DO UPDATE SET
      state = excluded.state,
      since = excluded.since,

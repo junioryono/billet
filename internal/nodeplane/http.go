@@ -109,7 +109,7 @@ type LeaseStore interface {
 		obs alloc.CacheObservation) error
 	// RecordCacheStoreState keeps what a node's breaker says about its site's store,
 	// under the registration in force.
-	RecordCacheStoreState(ctx context.Context, node string, report alloc.CacheStoreReport) error
+	RecordCacheStoreState(ctx context.Context, node, incarnation string, report alloc.CacheStoreReport) error
 	// RecordLeaseUsage keeps what the host measured a lease's job do, fenced on
 	// the epoch; the ledger keeps the first report.
 	RecordLeaseUsage(ctx context.Context, leaseID string, epoch int64,
@@ -1658,7 +1658,14 @@ func (h *handler) cacheStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.RecordCacheStoreState(r.Context(), r.PathValue("node"), report); err != nil {
+	err = h.store.RecordCacheStoreState(r.Context(), r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation), report)
+	if errors.Is(err, alloc.ErrCacheStoreStale) {
+		writeErr(w, http.StatusConflict, nodeapi.CodeSuperseded, err.Error())
+
+		return
+	}
+	if err != nil {
 		writeStoreErr(w, err)
 
 		return

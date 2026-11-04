@@ -771,7 +771,11 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 		}
 		p.service.log.Warn("Actions cache interception failed; retrying through GitHub",
 			"instance", session.instance, "path", req.URL.Path, "error", err)
-		observe(req.Context(), alloc.ActionsCacheSpliced)
+		if errors.Is(err, errStoreOpen) {
+			observe(req.Context(), alloc.ActionsCacheBypassed)
+		} else {
+			observe(req.Context(), alloc.ActionsCacheSpliced)
+		}
 	} else if reservationBound {
 		p.service.log.Warn("a reserved Actions cache request cannot be passed to GitHub",
 			"instance", session.instance, "path", req.URL.Path)

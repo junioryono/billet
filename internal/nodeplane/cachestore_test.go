@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -107,6 +108,30 @@ func TestTheRouteKeepsAStoreReportAndRefusesWhatItCouldNotKeep(t *testing.T) {
 			t.Errorf("%s: kept %+v", name, kept)
 		}
 	}
+
+	// WHAT IS KEPT IS WHAT WAS SAID, UNDER THE NAME AND THE PROCESS THAT SAID IT.
+	store := &fakeStore{}
+	post := planeAt(t, store, nodeapi.VersionCacheBreaker)
+	if got := post("/v1/nodes/n1/cache-store", good); got != http.StatusNoContent {
+		t.Fatalf("status %d", got)
+	}
+	want := alloc.CacheStoreReport{
+		Store: "ceph", State: alloc.CacheStoreOpen, Since: time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC),
+		Failures: 3, Reason: alloc.CacheStoreTimeout,
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.storeReports) != 1 || !store.storeReports[0].Since.Equal(want.Since) {
+		t.Fatalf("kept %+v", store.storeReports)
+	}
+	got := store.storeReports[0]
+	got.Since = want.Since
+	if got != want {
+		t.Errorf("kept %+v, want %+v", got, want)
+	}
+	if reporter := store.storeReporters[0]; reporter != fmt.Sprintf("n1/cache-store-%d", nodeapi.VersionCacheBreaker) {
+		t.Errorf("kept under %q", reporter)
+	}
 }
 
 // A SUPERSEDED PROCESS'S WORD WOULD BE TAKEN AS ITS REPLACEMENT'S, because the row is read
@@ -135,5 +160,19 @@ func TestAStoreReportFromASupersededProcessIsRefused(t *testing.T) {
 	store.mu.Unlock()
 	if kept != 0 {
 		t.Fatalf("a superseded process's report was kept: %d", kept)
+	}
+}
+
+// THE LEDGER REFUSING IT IS A SUPERSEDED PROCESS TOO, one the plane's own memory did not
+// catch: its request crossed the replacement's registration, or the plane has restarted.
+func TestAStoreReportTheLedgerFencesIsSaidToBeSuperseded(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{cacheStoreErr: fmt.Errorf("%w: gone", alloc.ErrCacheStoreStale)}
+	post := planeAt(t, store, nodeapi.VersionCacheBreaker)
+	if got := post("/v1/nodes/n1/cache-store", nodeapi.CacheStoreRequest{
+		Store: "ceph", State: "closed", Since: "2026-11-04T00:00:00Z",
+	}); got != http.StatusConflict {
+		t.Fatalf("status %d, want %d", got, http.StatusConflict)
 	}
 }

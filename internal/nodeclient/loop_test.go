@@ -366,7 +366,7 @@ func (stubStore) RecordLeaseUsage(context.Context, string, int64, alloc.JobUsage
 func (stubStore) RecordCacheObservation(context.Context, string, int64, alloc.CacheObservation) error {
 	return nil
 }
-func (stubStore) RecordCacheStoreState(context.Context, string, alloc.CacheStoreReport) error {
+func (stubStore) RecordCacheStoreState(context.Context, string, string, alloc.CacheStoreReport) error {
 	return nil
 }
 func (stubStore) Lease(context.Context, string) (*alloc.Lease, error) { return nil, nil }

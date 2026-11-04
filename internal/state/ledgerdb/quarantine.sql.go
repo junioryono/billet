@@ -535,7 +535,7 @@ func (q *Queries) TerminalizeQuarantinedLeaseWithReason(ctx context.Context, arg
 const upsertNodeCacheStore = `-- name: UpsertNodeCacheStore :execrows
 INSERT INTO node_cache_stores (node, store, state, since, failures, reason, node_epoch, received_at)
 SELECT name, $1, $2, $3, $4, $5, epoch, $6
-  FROM nodes WHERE name = $7
+  FROM nodes WHERE name = $7 AND incarnation = $8
 ON CONFLICT(node, store) DO UPDATE SET
      state = excluded.state,
      since = excluded.since,
@@ -546,17 +546,19 @@ ON CONFLICT(node, store) DO UPDATE SET
 `
 
 type UpsertNodeCacheStoreParams struct {
-	Store      string
-	State      string
-	Since      string
-	Failures   int64
-	Reason     string
-	ReceivedAt string
-	Node       string
+	Store       string
+	State       string
+	Since       string
+	Failures    int64
+	Reason      string
+	ReceivedAt  string
+	Node        string
+	Incarnation string
 }
 
 // Record what a node's breaker says about its site's store, under the node's epoch
-// now. A node with no row writes nothing, which is what the count says.
+// now, for the process registered now. A node with no such row writes nothing, which
+// is what the count says.
 func (q *Queries) UpsertNodeCacheStore(ctx context.Context, arg UpsertNodeCacheStoreParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, upsertNodeCacheStore,
 		arg.Store,
@@ -566,6 +568,7 @@ func (q *Queries) UpsertNodeCacheStore(ctx context.Context, arg UpsertNodeCacheS
 		arg.Reason,
 		arg.ReceivedAt,
 		arg.Node,
+		arg.Incarnation,
 	)
 	if err != nil {
 		return 0, err

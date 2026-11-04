@@ -120,8 +120,9 @@ func (s *CacheService) publishDeferred(
 	}
 
 	// A STORE THAT HAS STOPPED ANSWERING IS ASKED AGAIN NEXT PASS, inside the window,
-	// and nothing here holds the cache loop for it meanwhile.
-	if !s.breaker.allow() {
+	// and nothing here holds the cache loop for it meanwhile. On probation it may be the
+	// only thing that could settle it, on a node with no job left to ask for a volume.
+	if !s.breaker.admit() {
 		return false, nil
 	}
 
@@ -180,7 +181,9 @@ func (s *CacheService) publishDeferred(
 
 		return true, errors.Join(s.releaseWriter(ctx, lease, fence), s.persistSession(session))
 	}
-	if err := s.publish(ctx, attachment, candidate, lease, fence); err != nil {
+	err = s.publish(ctx, attachment, candidate, lease, fence)
+	s.countedPublish(session.instance, err)
+	if err != nil {
 		journal.Phase = phaseSnapshotted
 		journal.Attempts++
 

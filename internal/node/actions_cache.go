@@ -262,29 +262,26 @@ func (s *CacheService) actionsResponse(
 		return nil, false, nil
 	}
 	// A STORE THAT HAS STOPPED ANSWERING IS NOT ASKED. A lookup or a reservation goes to
-	// GitHub, as one the store failed to answer does, without waiting for it to fail.
+	// GitHub, as one the store failed to answer does, without waiting for it to fail; on
+	// probation it goes on, and its volume is admitted or not where it is asked for.
 	// A finalize and a blob are bound to a volume only this node holds, so they fail
 	// here, as one the store failed does: a blob's read or write waits in the kernel on
 	// that volume, holding what its cleanup needs, and a save's failure is the client's
-	// warning. A URL billet did not sign is not billet's to answer.
+	// warning. A blob URL nobody signed fails the same, being no one else's to answer.
 	switch req.URL.Path {
 	case actionsCreatePath, actionsDownloadPath:
-		if !s.breaker.admit() {
+		if s.breaker.isOpen() {
 			s.observeActions(req.Context(), session, alloc.ActionsCacheBypassed)
 
 			return nil, false, nil
 		}
 	case actionsFinalizePath:
-		if !s.breaker.allow() {
+		if !s.breaker.admit() {
 			return nil, true, errStoreOpen
 		}
 	default:
 		if !s.breaker.allow() {
-			if s.ownsActionsBlob(req, session) {
-				return nil, true, errStoreOpen
-			}
-
-			return nil, false, nil
+			return nil, true, errStoreOpen
 		}
 	}
 	// A CALL THAT IS ANSWERED HERE IS NOT OBSERVED HERE. Whether the guest was
@@ -1085,7 +1082,7 @@ func (s *CacheService) publishActionsReceipt(
 	for attempt := range 2 {
 		err = s.store.PublishCAS(ctx, receipt.StoreKey, "", receipt.Candidate,
 			receipt.Lease, receipt.Fence)
-		s.countedPublication(session.instance, "an Actions cache publication", err)
+		s.countedPublish(session.instance, err)
 		if !errors.Is(err, storecontract.ErrConflict) {
 			if err != nil {
 				return nil, err
