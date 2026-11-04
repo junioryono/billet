@@ -57,6 +57,11 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	if cfg.Server == nil {
+		return fmt.Errorf("billet usage export: %s has no server section, and usage is a control plane's record",
+			*cfgPath)
+	}
+
 	// PEEKED, NEVER MINTED, and refused when absent. Reporting a bound ledger's
 	// history under an identity this command just made would label another
 	// deployment's records as a new one's. BEFORE ANYTHING OPENS: a host that has never
