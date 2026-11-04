@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +88,39 @@ func (r *heldLaunches) firstLease() *alloc.Lease {
 	return r.leases[0]
 }
 
+// flightAllocator is the allocator for a test in a bubble, with leases long enough that no
+// heartbeat runs. It is what keeps such a test from deadlocking: SQLite backing off on a busy
+// WAL sleeps with time.Sleep, which only moves when every goroutine is durably blocked, and
+// a heartbeat in that sleep holds the listener's mutex, on which the loop then blocks, which
+// is not durable. So time never moves and the sleep never ends. Only in a bubble: a
+// deployment's sleep is a real one and ends. None of these tests is about renewal.
+func flightAllocator(t *testing.T, tiers []config.Tier) *alloc.Allocator {
+	t.Helper()
+
+	return newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(24*time.Hour))
+}
+
+// maxPassesBeforeFirstPoll is how many times a listener reconciles before its first poll
+// returns: once at startup and once just before it. Each can start a batch, if the last
+// one has already failed, and nothing else may until the poll is answered.
+const maxPassesBeforeFirstPoll = 2
+
+// concurrentRegistry is a fakeRunnerRegistry two launches can retire members through at
+// once, as the scale-set client it stands in for can.
+type concurrentRegistry struct {
+	fakeRunnerRegistry
+
+	mu sync.Mutex
+}
+
+func (r *concurrentRegistry) RemoveRunner(ctx context.Context, id int64, name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.fakeRunnerRegistry.RemoveRunner(ctx, id, name)
+}
+
 // runFlightListener runs a background-launching listener in the caller's bubble, and
 // returns what stops it and what it returned.
 func runFlightListener(t *testing.T, a *alloc.Allocator, label string, session Session,
@@ -112,8 +146,22 @@ func runFlightListener(t *testing.T, a *alloc.Allocator, label string, session S
 		finished <- l.Run(ctx)
 	}()
 
+	// QUIET BEFORE EACH CANCELLATION, because a bubble can deadlock on one that lands inside a
+	// ledger read. SQLite backing off on a busy WAL sleeps with time.Sleep, which only moves
+	// when every goroutine is durably blocked, and database/sql's cancellation then waits for
+	// that read on an RWMutex, which is not durable: time never moves, so the sleep never
+	// ends. Measured about once in 1,500 runs of these tests, and only in a bubble: a
+	// deployment's sleep is a real one and ends.
+	quiet := func() {
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+	}
+
 	stop = sync.OnceFunc(func() {
+		quiet()
 		cancel()
+		quiet()
 		close(hurry)
 	})
 
@@ -138,7 +186,7 @@ func TestALaunchInFlightDoesNotStopTheNextMessage(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -187,7 +235,7 @@ func TestAnEndedLaunchBuysTheNextWithoutWaitingForThePoll(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -239,7 +287,7 @@ func TestAStartWaitsForTheLaunchItNames(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -298,6 +346,121 @@ func TestAStartWaitsForTheLaunchItNames(t *testing.T) {
 	})
 }
 
+// A COMPLETION THAT NAMES NO RUNNER WAITS TOO, for the launch only the resolver can find
+// behind it: on GitHub.com its request id on the wire is zero. What the resolver decides
+// about it reads the launch's pool row and lease, which are not settled until it returns.
+func TestARunnerlessCompletionWaitsForTheLaunchBehindIt(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("a-work")}
+		a := flightAllocator(t, tiers)
+		runner := newHeldLaunches()
+		t.Cleanup(runner.unblock)
+
+		var (
+			mu           sync.Mutex
+			acknowledged []int64
+			delivered    int
+		)
+
+		job := dispatch.Job{RunID: 6, JobID: "job-61"}
+		cancelled := job
+		cancelled.Result = "canceled"
+
+		session := &fakeSession{
+			onGet: func() (*Message, error) {
+				mu.Lock()
+				delivered++
+				n := delivered
+				mu.Unlock()
+
+				switch n {
+				case 1:
+					return &Message{MessageID: 1, Assigned: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
+				case 2:
+					return &Message{MessageID: 2, Completed: []dispatch.Job{cancelled},
+						Statistics: &Statistics{TotalAssignedJobs: 0}}, nil
+				}
+				time.Sleep(time.Minute)
+
+				return nil, ErrNoMessage
+			},
+			onDelete: func(id int64) error {
+				mu.Lock()
+				defer mu.Unlock()
+
+				acknowledged = append(acknowledged, id)
+
+				return nil
+			},
+		}
+		acked := func(id int64) bool {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return slices.Contains(acknowledged, id)
+		}
+
+		stop, done := runFlightListener(t, a, tiers[0].Label, session, runner)
+		synctest.Wait()
+
+		if !acked(1) {
+			t.Fatal("the assignment was not handled, so this proves nothing about its completion")
+		}
+		if acked(2) {
+			t.Fatal("a completion was handled while the launch behind it had not returned")
+		}
+
+		runner.unblock()
+		synctest.Wait()
+
+		if !acked(2) {
+			t.Fatal("the completion was never handled after its launch returned")
+		}
+
+		stop()
+		<-done
+	})
+}
+
+// NOR IS IT AN OFFLINE MEMBER. A runner whose launch is still out has not had the chance to
+// come online, however long that takes, and withdrawing it would tear down what the launch
+// is bringing up.
+func TestALaunchInFlightIsNotInspectedAsOffline(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("a-work")}
+		a := flightAllocator(t, tiers)
+		runner := newHeldLaunches()
+		t.Cleanup(runner.unblock)
+
+		runner.beforeHold = func(lease *alloc.Lease, job dispatch.Job) error {
+			return a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: lease.ID, Tier: tiers[0].Label,
+				LaunchRequestID: job.RequestID, RunnerName: provider.InstanceName(lease.ID)})
+		}
+
+		session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 1}, longPoll: time.Minute}
+		registry := &inspectingRegistry{}
+
+		stop, done := runFlightListener(t, a, tiers[0].Label, session, runner, WithRunnerRegistry(registry))
+
+		// PAST THE IDLE TIME THAT WOULD HAVE IT INSPECTED, a poll at a time.
+		time.Sleep(offlineIdleAfter + 5*time.Minute)
+		synctest.Wait()
+
+		if registry.asked != 0 {
+			t.Fatalf("asked GitHub about %v with their launches still out, want none", registry.askedFor)
+		}
+
+		runner.unblock()
+		stop()
+		<-done
+	})
+}
+
 // A MEMBER WHOSE LAUNCH HAS NOT RETURNED IS NOT SURPLUS. Its row can exist first, and
 // retiring it would tear down compute the launch is still bringing up.
 func TestALaunchInFlightIsNotRetiredAsSurplus(t *testing.T) {
@@ -305,7 +468,7 @@ func TestALaunchInFlightIsNotRetiredAsSurplus(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -338,7 +501,7 @@ func TestALaunchInFlightIsNotRetiredAsSurplus(t *testing.T) {
 			},
 		}
 
-		registry := &fakeRunnerRegistry{}
+		registry := &concurrentRegistry{}
 		stop, done := runFlightListener(t, a, tiers[0].Label, session, runner, WithRunnerRegistry(registry))
 		synctest.Wait()
 
@@ -360,7 +523,7 @@ func TestRunDoesNotReturnBeforeItsLaunchesDo(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -398,7 +561,7 @@ func TestAStopCancelsNoLaunchItFound(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -464,7 +627,7 @@ func TestAFencedControllerStartsNoLaunchStillWaiting(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -519,7 +682,7 @@ func TestAPoolPassBuysOnlyWhatMayStart(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -552,7 +715,7 @@ func TestDirectAssignmentsDoNotOverlapPastTheBatch(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -604,7 +767,7 @@ func TestAFailedLaunchDoesNotBuyTheNextUntilThePoll(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 
 		var attempts atomic.Int64
 
@@ -613,13 +776,15 @@ func TestAFailedLaunchDoesNotBuyTheNextUntilThePoll(t *testing.T) {
 
 			return errors.New("the node refused")
 		}}
-		session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 5}, longPoll: time.Hour}
+		// FAR MORE DEMAND THAN THOSE PASSES CAN REACH, so one that does not wait is unmistakable.
+		session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 50}, longPoll: time.Hour}
 
 		stop, done := runFlightListener(t, a, tiers[0].Label, session, runner)
 		synctest.Wait()
 
-		if got := attempts.Load(); got != 2 {
-			t.Fatalf("%d launch attempts with one poll out and a batch of 2, want 2", got)
+		if got := attempts.Load(); got > maxPassesBeforeFirstPoll*2 {
+			t.Fatalf("%d launch attempts with one poll out and a batch of 2, want at most %d",
+				got, maxPassesBeforeFirstPoll*2)
 		}
 
 		stop()
@@ -634,7 +799,7 @@ func TestAFailedLaunchWhoseCleanupFailedDoesNotBuyTheNext(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		runner.unblock()
 
@@ -647,14 +812,15 @@ func TestAFailedLaunchWhoseCleanupFailedDoesNotBuyTheNext(t *testing.T) {
 			return errors.New("the node refused")
 		}
 
-		session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 5}, longPoll: time.Hour}
-		registry := &fakeRunnerRegistry{err: errors.New("GitHub would not remove it")}
+		session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 50}, longPoll: time.Hour}
+		registry := &concurrentRegistry{fakeRunnerRegistry: fakeRunnerRegistry{err: errors.New("GitHub would not remove it")}}
 
 		stop, done := runFlightListener(t, a, tiers[0].Label, session, runner, WithRunnerRegistry(registry))
 		synctest.Wait()
 
-		if started, _, _ := runner.counts(); started != 2 {
-			t.Fatalf("%d launch attempts with one poll out and a batch of 2, want 2", started)
+		if started, _, _ := runner.counts(); started > maxPassesBeforeFirstPoll*2 {
+			t.Fatalf("%d launch attempts with one poll out and a batch of 2, want at most %d",
+				started, maxPassesBeforeFirstPoll*2)
 		}
 
 		stop()
@@ -737,7 +903,7 @@ func TestLaunchesStuckOnANodeDoNotDateAWaiter(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		t.Cleanup(runner.unblock)
 
@@ -779,7 +945,7 @@ func TestABackgroundLaunchFailureReachesTheLoop(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		tiers := []config.Tier{tier("a-work")}
-		a := newAllocator(t, alloc.Limits{MaxVCPU: 8 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+		a := flightAllocator(t, tiers)
 		runner := newHeldLaunches()
 		runner.unblock()
 
