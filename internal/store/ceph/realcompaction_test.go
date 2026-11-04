@@ -86,18 +86,13 @@ func TestACompactionHoldsWhatItsSourceHolds(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Minute)
 		defer cancel()
 
-		// Children first, and every name is tried whatever became of another: only rbd
-		// saying it is not there means this run never made it.
+		// Children first, and every name is tried whatever became of another. Each is
+		// removed rather than looked up first, since a removal cut short leaves a name
+		// `rbd info` calls absent and only another `rbd rm` finishes.
 		for _, image := range []string{compacted, copied, child, parent} {
-			out, err := exec.CommandContext(ctx, "rbd", "info", image).CombinedOutput()
-			if err != nil && strings.Contains(string(out), "No such file or directory") {
-				continue
-			}
-			if err != nil {
-				t.Errorf("could not tell whether this test's image %s remains: %v: %s", image, err, out)
-			}
 			for _, args := range [][]string{{"snap", "purge", image}, {"rm", image}} {
-				if out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput(); err != nil {
+				out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput()
+				if err != nil && !strings.Contains(string(out), "No such file or directory") {
 					t.Errorf("could not remove this test's image %s (rbd %v): %v: %s", image, args, err, out)
 				}
 			}

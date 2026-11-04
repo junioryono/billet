@@ -107,6 +107,24 @@ func TestAWorkspaceThatHasNeverRunIsLeftWithoutALedger(t *testing.T) {
 	}
 }
 
+// AN EMPTY FILE WHERE THE LEDGER WILL BE HAS NEVER RUN EITHER, and the server
+// initialises it. Inspected, it reads as a ledger on the wrong kind of disk.
+func TestAnEmptyLedgerFileIsNotInspected(t *testing.T) {
+	t.Parallel()
+
+	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
+	ledger := state.LedgerPath(filepath.Join(filepath.Dir(ws.ConfigPath), "server"))
+	if err := os.WriteFile(ledger, nil, 0o600); err != nil {
+		t.Fatalf("write the empty ledger: %v", err)
+	}
+
+	var out bytes.Buffer
+	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}
+	if err := refuseASealedWorkspace(t.Context(), env, ws); err != nil {
+		t.Fatalf("refuse = %v, want the server left to initialise it", err)
+	}
+}
+
 // AN OPEN DEPLOYMENT RUNS, and nothing is written: every write bumps admission's
 // generation.
 func TestAnOpenDeploymentIsNotRefused(t *testing.T) {
@@ -129,6 +147,8 @@ func TestAnOpenDeploymentIsNotRefused(t *testing.T) {
 // A LEDGER BEHIND THIS BINARY IS NOT MIGRATED BY ASKING WHETHER IT IS SEALED. A newer
 // binary refusing to run must leave the workspace readable by the one that wrote it,
 // and since it cannot tell without that migration it says so rather than answer "open".
+// Only the migration's record is removed, which is all that reading it as behind takes;
+// it is not a schema a server could migrate, and nothing here asks one to.
 func TestAskingWhetherAWorkspaceIsSealedMigratesNothing(t *testing.T) {
 	t.Parallel()
 
@@ -158,7 +178,7 @@ func TestAskingWhetherAWorkspaceIsSealedMigratesNothing(t *testing.T) {
 	var out bytes.Buffer
 	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}
 	if err := refuseASealedWorkspace(t.Context(), env, ws); err != nil {
-		t.Fatalf("refuse = %v, want the run to go on: the server migrates this", err)
+		t.Fatalf("refuse = %v, want the run to go on, having said it could not tell", err)
 	}
 	if !strings.Contains(out.String(), "cannot be read") {
 		t.Errorf("said %q, want it to say it could not tell", out.String())

@@ -216,13 +216,19 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 // says so, because a seal in there would then mean a run assigned nothing.
 //
 // BEFORE THE SERVER STARTS, because a refusal here has nothing to tear down. A
-// workspace with no ledger has never run and has no seal, and is left without one.
+// workspace with no ledger, or an empty file where one will be, has never run and has
+// no seal, and is left as it is for the server to initialise.
 func refuseASealedWorkspace(ctx context.Context, env cli.Env, ws acceptanceWorkspace) error {
 	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
-	if _, err := os.Stat(state.LedgerPath(stateDir)); errors.Is(err, os.ErrNotExist) {
+	info, err := os.Stat(state.LedgerPath(stateDir))
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return fmt.Errorf("look for this run's ledger: %w", err)
+	}
+	if info.Size() == 0 {
+		return nil
 	}
 
 	cfg, err := config.Load(ws.ConfigPath)
