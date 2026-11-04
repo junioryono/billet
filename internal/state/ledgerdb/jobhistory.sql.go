@@ -650,6 +650,38 @@ func (q *Queries) ListJobsOfRun(ctx context.Context, arg ListJobsOfRunParams) ([
 	return items, nil
 }
 
+const listUnnumberedUsage = `-- name: ListUnnumberedUsage :many
+SELECT lease_id FROM job_history
+ WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != ''
+ ORDER BY finished_at, lease_id
+ LIMIT CAST($1 AS BIGINT)
+`
+
+// Leases that finished before they could be numbered, oldest first: every one left
+// is in the partial index, so this reads what is left and not the whole history.
+func (q *Queries) ListUnnumberedUsage(ctx context.Context, maxRows int64) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listUnnumberedUsage, maxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var lease_id string
+		if err := rows.Scan(&lease_id); err != nil {
+			return nil, err
+		}
+		items = append(items, lease_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUsageSince = `-- name: ListUsageSince :many
 SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
@@ -751,6 +783,50 @@ func (q *Queries) NextUsageSeq(ctx context.Context) (int64, error) {
 	var last int64
 	err := row.Scan(&last)
 	return last, err
+}
+
+const numberUsage = `-- name: NumberUsage :execrows
+WITH RECURSIVE ids (id, rest, n) AS (
+    SELECT SUBSTR(CAST($2 AS TEXT), 1, 32), SUBSTR(CAST($2 AS TEXT), 33), CAST(1 AS BIGINT)
+    UNION ALL
+    SELECT SUBSTR(rest, 1, 32), SUBSTR(rest, 33), n + 1 FROM ids WHERE rest != ''
+)
+UPDATE job_history
+   SET usage_seq = CAST($1 AS BIGINT) + ids.n
+  FROM ids
+ WHERE job_history.lease_id = ids.id AND job_history.usage_seq = 0
+`
+
+type NumberUsageParams struct {
+	Base   int64
+	Packed string
+}
+
+// Give each lease a read listed its number, in the order it was listed: the caller
+// packs the lease ids end to end, as MarkJobDetailRetired's does, and takes a run of
+// numbers above base in the same transaction.
+//
+// A NUMBER ALREADY WRITTEN STAYS, so a lease never moves; the row's own filter is what
+// says so, in the statement.
+func (q *Queries) NumberUsage(ctx context.Context, arg NumberUsageParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, numberUsage, arg.Base, arg.Packed)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const readAnyUnnumberedUsage = `-- name: ReadAnyUnnumberedUsage :one
+SELECT EXISTS(SELECT 1 FROM job_history
+               WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != '')
+`
+
+// Whether any finished lease is still waiting for its number.
+func (q *Queries) ReadAnyUnnumberedUsage(ctx context.Context) (bool, error) {
+	row := q.db.QueryRowContext(ctx, readAnyUnnumberedUsage)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const readJob = `-- name: ReadJob :one
@@ -1320,4 +1396,19 @@ type RecordJobStartParams struct {
 func (q *Queries) RecordJobStart(ctx context.Context, arg RecordJobStartParams) error {
 	_, err := q.db.ExecContext(ctx, recordJobStart, arg.StartedAt, arg.LeaseID)
 	return err
+}
+
+const takeUsageSeqs = `-- name: TakeUsageSeqs :one
+INSERT INTO usage_sequence (id, last) VALUES (1, CAST($1 AS BIGINT))
+ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + CAST($1 AS BIGINT)
+RETURNING last
+`
+
+// Take a run of numbers at once, for a batch of leases that finished before there
+// were numbers, and answer the last. The batch's numbers are the n below it.
+func (q *Queries) TakeUsageSeqs(ctx context.Context, n int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, takeUsageSeqs, n)
+	var last int64
+	err := row.Scan(&last)
+	return last, err
 }

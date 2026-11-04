@@ -3,33 +3,29 @@ package state
 import (
 	"context"
 	"database/sql"
-	"slices"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
-// THE BACKFILL NUMBERS WHAT HAD ALREADY FINISHED, on both engines: oldest first,
-// the lease breaking a tie of the clock, what has not finished left at zero, and
-// the next number following on from the last. A deployment that upgrades exports
-// its history, and its next lease cannot collide with it.
-func TestTheUsageMigrationNumbersWhatHadAlreadyFinished(t *testing.T) {
+// WHAT HAD ALREADY FINISHED WAITS FOR A NUMBER, on both engines, and a migration does
+// not rewrite it. A ledger past the startup budget would otherwise fail that migration
+// on every restart and never start.
+func TestTheUsageMigrationLeavesFinishedLeasesWaiting(t *testing.T) {
 	t.Run("sqlite", func(t *testing.T) {
 		dir := t.TempDir()
-		open := func(ctx context.Context) (*DB, error) { return Open(ctx, dir) }
-		exerciseUsageBackfill(t, open)
+		exerciseUsageMigration(t, func(ctx context.Context) (*DB, error) { return Open(ctx, dir) })
 	})
 
 	t.Run("postgres", func(t *testing.T) {
 		dsn := requirePostgres(t)
 		dir := t.TempDir()
-		open := func(ctx context.Context) (*DB, error) { return OpenPostgres(ctx, dir, dsn) }
-		exerciseUsageBackfill(t, open)
+		exerciseUsageMigration(t, func(ctx context.Context) (*DB, error) { return OpenPostgres(ctx, dir, dsn) })
 	})
 }
 
-func exerciseUsageBackfill(t *testing.T, open func(context.Context) (*DB, error)) {
+func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error)) {
 	t.Helper()
 
 	ctx := t.Context()
@@ -42,14 +38,13 @@ func exerciseUsageBackfill(t *testing.T, open func(context.Context) (*DB, error)
 	if err := db.Tx(ctx, func(tx *sql.Tx) error {
 		for _, stmt := range []string{
 			`DROP INDEX job_history_usage_seq`,
+			`DROP INDEX job_history_usage_unnumbered`,
 			`DROP TABLE usage_sequence`,
 			`ALTER TABLE job_history DROP COLUMN usage_seq`,
 			`ALTER TABLE job_history DROP COLUMN github_target`,
 			`DELETE FROM schema_migrations WHERE version = 71`,
 			`INSERT INTO job_history (lease_id, tier, queued_at, finished_at) VALUES
 			   ('latest', 'small', 't', '2026-01-03T00:00:00.000000000Z'),
-			   ('tied-b', 'small', 't', '2026-01-01T00:00:00.000000000Z'),
-			   ('tied-a', 'small', 't', '2026-01-01T00:00:00.000000000Z'),
 			   ('running', 'small', 't', NULL),
 			   ('blank', 'small', 't', '')`,
 		} {
@@ -77,69 +72,47 @@ func exerciseUsageBackfill(t *testing.T, open func(context.Context) (*DB, error)
 	if err != nil {
 		t.Fatalf("UsageSince: %v", err)
 	}
-
-	var leases []string
-	for _, r := range rows {
-		leases = append(leases, r.LeaseID)
+	if len(rows) != 0 {
+		t.Fatalf("the migration numbered %d rows: %+v", len(rows), rows)
 	}
 
-	if want := []string{"tied-a", "tied-b", "latest"}; !slices.Equal(leases, want) {
-		t.Fatalf("the backfill exports %v, want %v", leases, want)
+	waiting, err := db.UsageStillNumbering(ctx)
+	if err != nil || !waiting {
+		t.Fatalf("UsageStillNumbering = %v, %v; a finished lease is waiting", waiting, err)
 	}
 
-	for i, r := range rows {
-		if r.Sequence != int64(i+1) {
-			t.Errorf("%s is at %d, want %d", r.LeaseID, r.Sequence, i+1)
-		}
-	}
-
-	var next int64
+	var first int64
 
 	if err := db.Tx(ctx, func(tx *sql.Tx) error {
 		var err error
 
-		next, err = WriteQueries(tx).NextUsageSeq(ctx)
+		first, err = WriteQueries(tx).NextUsageSeq(ctx)
 
 		return err
 	}); err != nil {
 		t.Fatalf("NextUsageSeq: %v", err)
 	}
 
-	if next != 4 {
-		t.Fatalf("the next lease to finish takes %d, want 4: it follows the backfill or it collides", next)
+	if first != 1 {
+		t.Fatalf("the first number is %d, want 1", first)
 	}
 
-	if err := db.Tx(ctx, func(tx *sql.Tx) error {
-		return WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
-			LeaseID: "running", Tier: "small", QueuedAt: "t", UsageSeq: 4,
-			FinishedAt: sql.NullString{String: "2026-01-04T00:00:00.000000000Z", Valid: true},
-		})
-	}); err != nil {
-		t.Fatalf("archive: %v", err)
+	// A SECOND ARCHIVE KEEPS THE FIRST NUMBER: a lease has one place in the order, and
+	// an exporter may already have read past it.
+	for _, seq := range []int64{1, 2} {
+		if err := db.Tx(ctx, func(tx *sql.Tx) error {
+			return WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
+				LeaseID: "running", Tier: "small", QueuedAt: "t", UsageSeq: seq,
+				FinishedAt: sql.NullString{String: "2026-01-04T00:00:00.000000000Z", Valid: true},
+			})
+		}); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
 	}
 
-	rows, err = db.UsageSince(ctx, 3, 10)
-	if err != nil {
-		t.Fatalf("UsageSince: %v", err)
-	}
-	if len(rows) != 1 || rows[0].LeaseID != "running" || rows[0].Sequence != 4 {
-		t.Fatalf("past the backfill the export is %+v, want the row that just closed", rows)
-	}
-
-	// A SECOND ARCHIVE KEEPS THE FIRST NUMBER: a lease has one place in the order,
-	// and an exporter may already have read past it.
-	if err := db.Tx(ctx, func(tx *sql.Tx) error {
-		return WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
-			LeaseID: "running", Tier: "small", QueuedAt: "t", UsageSeq: 99,
-			FinishedAt: sql.NullString{String: "2026-01-05T00:00:00.000000000Z", Valid: true},
-		})
-	}); err != nil {
-		t.Fatalf("archive again: %v", err)
-	}
-
-	closed, err := db.UsageRecordAt(ctx, 4)
+	closed, err := db.UsageRecordAt(ctx, 1)
 	if err != nil || closed.LeaseID != "running" {
-		t.Fatalf("UsageRecordAt(4) = %+v, %v; a second archive moved the lease's number", closed, err)
+		t.Fatalf("UsageRecordAt(1) = %+v, %v; a second archive moved the lease's number", closed, err)
 	}
 }
 

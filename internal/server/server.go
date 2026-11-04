@@ -464,6 +464,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
 	group.Background("job detail retention", s.retireJobDetail)
+	group.Background("usage numbering", s.numberUsage)
 
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for

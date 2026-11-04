@@ -26,19 +26,10 @@ CREATE TABLE usage_sequence (
 -- +billet:end
 
 -- +billet:statement
-UPDATE job_history
-   SET usage_seq = numbered.n
-  FROM (SELECT lease_id, ROW_NUMBER() OVER (ORDER BY finished_at, lease_id) AS n
-          FROM job_history
-         WHERE finished_at IS NOT NULL AND finished_at != '') AS numbered
- WHERE numbered.lease_id = job_history.lease_id;
--- +billet:end
-
--- +billet:statement
-INSERT INTO usage_sequence (id, last)
-SELECT 1, top.n FROM (SELECT MAX(usage_seq) AS n FROM job_history) AS top WHERE top.n > 0;
--- +billet:end
-
--- +billet:statement
 CREATE UNIQUE INDEX job_history_usage_seq ON job_history (usage_seq) WHERE usage_seq > 0;
+-- +billet:end
+
+-- +billet:statement
+CREATE INDEX job_history_usage_unnumbered ON job_history (finished_at, lease_id)
+ WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != '';
 -- +billet:end

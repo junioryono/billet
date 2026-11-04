@@ -309,6 +309,43 @@ INSERT INTO usage_sequence (id, last) VALUES (1, 1)
 ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1
 RETURNING last;
 
+-- name: TakeUsageSeqs :one
+-- Take a run of numbers at once, for a batch of leases that finished before there
+-- were numbers, and answer the last. The batch's numbers are the n below it.
+INSERT INTO usage_sequence (id, last) VALUES (1, CAST(@n AS BIGINT))
+ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + CAST(@n AS BIGINT)
+RETURNING last;
+
+-- name: ListUnnumberedUsage :many
+-- Leases that finished before they could be numbered, oldest first: every one left
+-- is in the partial index, so this reads what is left and not the whole history.
+SELECT lease_id FROM job_history
+ WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != ''
+ ORDER BY finished_at, lease_id
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ReadAnyUnnumberedUsage :one
+-- Whether any finished lease is still waiting for its number.
+SELECT EXISTS(SELECT 1 FROM job_history
+               WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != '');
+
+-- name: NumberUsage :execrows
+-- Give each lease a read listed its number, in the order it was listed: the caller
+-- packs the lease ids end to end, as MarkJobDetailRetired's does, and takes a run of
+-- numbers above base in the same transaction.
+--
+-- A NUMBER ALREADY WRITTEN STAYS, so a lease never moves; the row's own filter is what
+-- says so, in the statement.
+WITH RECURSIVE ids (id, rest, n) AS (
+    SELECT SUBSTR(CAST(@packed AS TEXT), 1, 32), SUBSTR(CAST(@packed AS TEXT), 33), CAST(1 AS BIGINT)
+    UNION ALL
+    SELECT SUBSTR(rest, 1, 32), SUBSTR(rest, 33), n + 1 FROM ids WHERE rest != ''
+)
+UPDATE job_history
+   SET usage_seq = CAST(@base AS BIGINT) + ids.n
+  FROM ids
+ WHERE job_history.lease_id = ids.id AND job_history.usage_seq = 0;
+
 -- name: ListUsageSince :many
 -- Finished leases past a place in the order they finished in, bounded.
 --
