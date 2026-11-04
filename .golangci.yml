@@ -403,6 +403,19 @@ linters:
         # THE IDLE POWER POLICY IS A LEAF. It writes a host's cpufreq ceiling as
         # root, so what it imports is what can reach that write: the standard
         # library and the two file primitives its record goes through.
+        # THE HOST'S FIREWALL AND RESOLVER FOR A GUEST, below the provider that
+        # attaches it and the node that reads it, and #510's workspaces beside them.
+        egress:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/egress/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+            - golang.org/x/net/dns/dnsmessage$
+
         power:
           list-mode: strict
           files:
