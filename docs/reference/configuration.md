@@ -78,7 +78,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `stop` | no | what a SIGTERM does while the node holds compute: `drain` (the default) waits for it; `handoff` (Firecracker nodes only) leaves it running for the next node process to adopt, for a host restarted to be upgraded or converged. A host leaving for good is drained or decommissioned, since nothing comes back to adopt what a handoff leaves |
 | `cache.listen` | for interception and EC2 caches | one literal non-loopback address; `tls_cert`/`tls_key` required for EC2 and refused on the Firecracker bridge |
 | `registry_mirrors` | no | `docker.io`, `ghcr.io`, `quay.io` origins; the host role writes this on a Firecracker host ([Registry mirrors](../operating/build-caches.md#registry-mirrors)) |
-| `registry_mirrors_ca` | no | absolute path of the PEM authority those mirrors' certificates chain to, requires `registry_mirrors`; empty means they are publicly trusted |
+| `registry_mirrors_ca` | no | absolute path of the PEM authority those mirrors' certificates chain to, requires `registry_mirrors`, read at each launch; empty means `/etc/billet-registry/ca.pem` when the role installed one there, and otherwise that they are publicly trusted |
 | `monitoring` | no | measure each job from the host; absent means off; firecracker, docker and tart only, and `perf` and `guest` firecracker only (see below) |
 | `power` | no | lower the CPU's ceiling while the node is idle and restore it before a launch; absent means off; firecracker and docker on Linux only (see below) |
 

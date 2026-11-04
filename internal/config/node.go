@@ -248,8 +248,9 @@ type NodeConfig struct {
 	RegistryMirrors *RegistryMirrors `yaml:"registry_mirrors,omitempty"`
 	// RegistryMirrorsCA is the path of the PEM authority a mirror's certificate
 	// chains to, for mirrors no public authority signs. The guest trusts it for
-	// those mirrors alone, never in its system store. Empty means the mirrors'
-	// certificates are publicly trusted.
+	// those mirrors alone, never in its system store. Empty means
+	// DefaultRegistryMirrorsCA when that file exists, and otherwise that the
+	// mirrors' certificates are publicly trusted.
 	RegistryMirrorsCA string `yaml:"registry_mirrors_ca,omitempty"`
 
 	// MaxCustody bounds how long billet holds capacity for compute it cannot account
@@ -290,6 +291,10 @@ type NodeCacheConfig struct {
 	TLSCert string `yaml:"tls_cert,omitempty"`
 	TLSKey  string `yaml:"tls_key,omitempty"`
 }
+
+// DefaultRegistryMirrorsCA is where the host role installs the authority of the
+// mirrors it runs, which a node reads when node.registry_mirrors_ca names no other.
+const DefaultRegistryMirrorsCA = "/etc/billet-registry/ca.pem"
 
 // RegistryMirrors names the independent public-registry caches visible at a site.
 type RegistryMirrors struct {

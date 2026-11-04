@@ -375,16 +375,8 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		runnerOpts = append(runnerOpts, node.WithCacheService(cacheService))
 	}
 	if cfg.Node.RegistryMirrors != nil {
-		// AN AUTHORITY THAT CANNOT BE READ COSTS A GUEST ITS MIRROR, NOT ITS JOB: the
-		// guest cannot verify the mirror and pulls from the registry. `billet check`
-		// is what fails over it, because a node refusing to start would be a cache
-		// taking compute down with it.
-		authority, err := ReadRegistryMirrorsCA(cfg.Node.RegistryMirrorsCA)
-		if err != nil {
-			slog.Default().Error("the registry mirrors' authority could not be read, so guests that "+
-				"cannot verify a mirror will pull from the registry", "error", err)
-		}
-		runnerOpts = append(runnerOpts, node.WithRegistryMirrors(*cfg.Node.RegistryMirrors, authority))
+		runnerOpts = append(runnerOpts, node.WithRegistryMirrors(*cfg.Node.RegistryMirrors,
+			func() (string, error) { return NodeRegistryMirrorsCA(cfg.Node) }))
 	}
 
 	// AND THE ABILITY TO REPLACE ITSELF, which is what makes a rollout reach a

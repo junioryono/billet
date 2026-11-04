@@ -115,6 +115,9 @@ func TestCheckDoesNotTrustAMirrorWithoutItsAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an untrusted mirror was refused: %v", err)
 	}
+	if len(lines) != 3 {
+		t.Fatalf("want one line per mirror: %q", lines)
+	}
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "NOT ANSWERING:") || !strings.Contains(line, "certificate") {
 			t.Errorf("line = %q, want the certificate named", line)
@@ -131,6 +134,9 @@ func TestCheckSaysAMaintenanceRunProbedNoMirror(t *testing.T) {
 	}, ""), true)
 	if err != nil {
 		t.Fatalf("judgeRegistryMirrors: %v", err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("want one line per mirror: %q", lines)
 	}
 	for _, line := range lines {
 		if !strings.Contains(line, "(configured, not probed)") {

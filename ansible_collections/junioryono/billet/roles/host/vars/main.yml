@@ -28,6 +28,7 @@ billet_registry_mirror_instances:
   - {name: quay-io, upstream: quay.io, remote: "https://quay.io", port: 7742}
 billet_registry_mirror_user: billet-registry
 billet_registry_mirror_dir: /etc/billet-registry
+billet_registry_mirror_storage: /var/lib/billet-registry
 billet_registry_mirror_install_dir: /usr/local/lib/billet-registry
 billet_registry_mirror_binary: "{{ billet_registry_mirror_install_dir }}/registry-{{ billet_registry_mirror_version }}"
 billet_registry_mirror_stage: "{{ billet_firecracker_stage }}/registry-mirror"

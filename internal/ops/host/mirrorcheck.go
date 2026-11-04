@@ -48,7 +48,7 @@ func judgeRegistryMirrors(ctx context.Context, cfg *config.Config, skipProbes bo
 		}, nil
 	}
 
-	authority, err := app.ReadRegistryMirrorsCA(cfg.Node.RegistryMirrorsCA)
+	authority, err := app.NodeRegistryMirrorsCA(cfg.Node)
 	if err != nil {
 		return []string{"could not read the mirrors' authority, so a guest cannot verify a mirror it signs " +
 			"and pulls from the registry"}, fmt.Errorf("registry mirrors: %w", err)

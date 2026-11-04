@@ -1,0 +1,30 @@
+#!/bin/sh
+# Rendered by the junioryono.billet collection: change the inventory, not this file.
+#
+# ANY JOB ON THIS HOST CAN ASK A MIRROR FOR ANY PUBLIC IMAGE, and Distribution has no
+# size limit, so past this line what the mirrors pulled is discarded before it can
+# fill the disk the node's own state is on. It is only a cache: the next pull comes
+# from the registry and fills it again, and a guest whose pull this interrupts goes
+# on to the registry.
+#
+# A READING IT CANNOT TAKE DISCARDS NOTHING: that is a failed unit, never a full disk.
+set -eu
+
+root={{ billet_registry_mirror_storage | quote }}
+limit={{ billet_registry_mirror_disk_limit_percent | int }}
+
+used=$(df --output=pcent "$root" | sed -n '2s/[^0-9]//gp')
+case "$used" in
+'' | *[!0-9]*)
+	echo "could not read how full $root's filesystem is" >&2
+	exit 1
+	;;
+esac
+[ "$used" -ge "$limit" ] || exit 0
+
+echo "$root's filesystem is $used% full, at or past $limit%; discarding what the registry mirrors pulled"
+{% for instance in billet_registry_mirror_instances %}
+systemctl stop "billet-registry@{{ instance.name }}.service"
+rm -rf -- "$root/{{ instance.name }}/docker"
+systemctl start "billet-registry@{{ instance.name }}.service"
+{% endfor %}

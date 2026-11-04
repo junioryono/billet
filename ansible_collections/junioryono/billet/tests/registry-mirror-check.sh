@@ -6,8 +6,11 @@
 # running them. It needs passwordless sudo and the network: a manifest comes through
 # Docker Hub's mirror, which is what a guest's pull asks first.
 #
-# A dummy interface stands in for the guest bridges, so nothing here can reach a
-# real guest network, and everything is removed on the way out.
+# A dummy interface and a veth stand in for the guest bridges, with a network
+# namespace on the far end as a guest behind the second one, so nothing here can
+# reach a real guest network, and everything is removed on the way out. The real
+# firewall is loaded while that guest asks: reaching the first bridge's address
+# from the second bridge is what every untrusted guest does.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -23,6 +26,8 @@ bridge_a=billetmirror0
 bridge_b=billetmirror1
 address_a=192.0.2.71
 address_b=192.0.2.72
+guest=billet-mirror-guest
+guest_address=192.0.2.80
 
 fail() {
     echo "registry-mirror-check: $*" >&2
@@ -38,6 +43,9 @@ cleanup() {
         done
     fi
     converge -e billet_registry_mirrors=false -e billet_registry_mirrors_purge=true >/dev/null 2>&1 || true
+    sudo -n nft delete table inet billet_guard 2>/dev/null || true
+    sudo -n nft delete table ip billet_nat 2>/dev/null || true
+    sudo -n ip netns delete "$guest" 2>/dev/null || true
     sudo -n ip link delete "$bridge_a" 2>/dev/null || true
     sudo -n ip link delete "$bridge_b" 2>/dev/null || true
     rm -rf "$work"
@@ -64,11 +72,20 @@ status_of() {
     curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --cacert /etc/billet-registry/ca.pem "$@"
 }
 
-for link in "$bridge_a:$address_a" "$bridge_b:$address_b"; do
-    sudo -n ip link add "${link%%:*}" type dummy
-    sudo -n ip address add "${link#*:}/32" dev "${link%%:*}"
-    sudo -n ip link set "${link%%:*}" up
-done
+command -v nft >/dev/null || sudo -n apt-get install -y -qq nftables >/dev/null
+sudo -n ip link add "$bridge_a" type dummy
+sudo -n ip address add "$address_a/32" dev "$bridge_a"
+sudo -n ip link set "$bridge_a" up
+sudo -n ip netns add "$guest"
+sudo -n ip link add "$bridge_b" type veth peer name billetmirrorg
+sudo -n ip link set billetmirrorg netns "$guest"
+sudo -n ip address add "$address_b/32" dev "$bridge_b"
+sudo -n ip link set "$bridge_b" up
+sudo -n ip route add "$guest_address/32" dev "$bridge_b"
+sudo -n ip netns exec "$guest" ip link set lo up
+sudo -n ip netns exec "$guest" ip link set billetmirrorg up
+sudo -n ip netns exec "$guest" ip address add "$guest_address/32" dev billetmirrorg
+sudo -n ip netns exec "$guest" ip route add default dev billetmirrorg
 
 echo "== a site with the mirror"
 converge >"$work/first.log" 2>&1 || { cat "$work/first.log" >&2; fail "the first converge failed"; }
@@ -113,13 +130,35 @@ case "$manifest" in
 *) fail "the Docker Hub mirror answered something that is not a manifest list: $manifest" ;;
 esac
 
-# A PROXY REFUSES A PUSH, which is what keeps one job from putting something in front
-# of another.
-push=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --cacert /etc/billet-registry/ca.pem \
-    -X POST "https://$address_a:7740/v2/library/poison/blobs/uploads/")
-case "$push" in
-2*) fail "the mirror took an upload: $push" ;;
-esac
+# A PROXY REFUSES A PUSH AND A DELETE, which is what keeps one job from putting
+# something in front of another, or taking it away. 405 is Distribution's own word
+# for it, so a mirror merely broken cannot pass as one refusing.
+push=$(status_of -X POST "https://$address_a:7740/v2/library/poison/blobs/uploads/")
+[ "$push" = 405 ] || fail "an upload to the mirror answered $push, want 405"
+digest=$(curl -sS -D - -o /dev/null --max-time 30 --cacert /etc/billet-registry/ca.pem \
+    -H 'Accept: application/vnd.oci.image.index.v1+json' \
+    "https://$address_a:7740/v2/library/alpine/manifests/latest" |
+    sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *\([^[:space:]]*\).*/\1/p')
+[ -n "$digest" ] || fail "the mirror named no digest for the manifest it served"
+delete=$(status_of -X DELETE "https://$address_a:7740/v2/library/alpine/manifests/$digest")
+[ "$delete" = 405 ] || fail "a delete at the mirror answered $delete, want 405"
+
+# A GUEST ON THE SECOND BRIDGE, UNDER THE REAL FIREWALL. Admitted, it reaches the first
+# bridge's address and verifies the mirror; a port the firewall does not admit times
+# out rather than being refused, which is the firewall's doing and nobody else's.
+sudo -n nft -c -f "$work/network.nft" || fail "the rendered firewall does not load"
+sudo -n nft -f "$work/network.nft"
+sudo -n cp /etc/billet-registry/ca.pem "$work/guest-ca.pem"
+in_guest() {
+    sudo -n ip netns exec "$guest" curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 20 "$@"
+}
+[ "$(in_guest --cacert "$work/guest-ca.pem" "https://$address_a:7740/v2/")" = 200 ] ||
+    fail "a guest on the second bridge could not reach the mirror on the first bridge's address"
+denied=0
+in_guest "http://$address_a:7700/" >/dev/null 2>&1 || denied=$?
+[ "$denied" = 28 ] || fail "a port the firewall does not admit answered curl status $denied, want a timeout"
+sudo -n nft delete table inet billet_guard
+sudo -n nft delete table ip billet_nat
 
 # NO KEY A GUEST OR THE MIRROR'S ACCOUNT SHOULD NOT HAVE.
 [ "$(sudo -n stat -c '%U:%G %a' /etc/billet-registry/authority/ca.key)" = "root:root 600" ] ||
@@ -133,8 +172,10 @@ fi
 expected_mirrors="{\"docker.io\": \"https://$address_a:7740\", \"ghcr.io\": \"https://$address_a:7741\", \"quay.io\": \"https://$address_a:7742\"}"
 [ "$(node_value registry_mirrors)" = "$expected_mirrors" ] ||
     fail "the node is told $(node_value registry_mirrors), want $expected_mirrors"
-[ "$(node_value registry_mirrors_ca)" = '"/etc/billet-registry/ca.pem"' ] ||
-    fail "the node is told the authority is at $(node_value registry_mirrors_ca)"
+[ "$(node_value registry_mirrors_ca)" = null ] ||
+    fail "the role named the authority, which a billet older than that key refuses"
+[ "$(cat /etc/billet-registry/ca.pem | head -1)" = "-----BEGIN CERTIFICATE-----" ] ||
+    fail "the authority is not at the path the node reads"
 grep -q 'tcp dport { 53, 7718, 7740, 7741, 7742 } accept' "$work/network.nft" ||
     fail "a guest bridge's firewall does not admit the mirrors: $(grep 'tcp dport' "$work/network.nft")"
 
@@ -150,6 +191,49 @@ grep -Eq 'localhost +: ok=[0-9]+ +changed=0 ' "$work/second.log" || {
 }
 [ "$(sudo -n sha256sum /etc/billet-registry/ca.pem /etc/billet-registry/leaf.pem)" = "$fingerprint" ] ||
     fail "the second converge replaced the authority or the certificate"
+
+echo "== a key that is not its certificate's is repaired, and the mirror takes it up"
+main_pid() { systemctl show --property=MainPID --value billet-registry@docker-io.service; }
+pid=$(main_pid)
+sudo -n openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /etc/billet-registry/leaf/leaf.key 2>/dev/null
+sudo -n chgrp billet-registry /etc/billet-registry/leaf/leaf.key
+sudo -n chmod 0640 /etc/billet-registry/leaf/leaf.key
+converge >"$work/pair.log" 2>&1 || { cat "$work/pair.log" >&2; fail "the repairing converge failed"; }
+key=$(sudo -n openssl pkey -in /etc/billet-registry/leaf/leaf.key -pubout)
+[ "$key" = "$(openssl x509 -in /etc/billet-registry/leaf.pem -noout -pubkey)" ] ||
+    fail "the certificate and its key are still not a pair"
+[ "$(main_pid)" != "$pid" ] || fail "the mirror did not restart onto its repaired pair"
+
+echo "== a restart a dead converge still owed is taken up by the next one"
+pid=$(main_pid)
+sudo -n sh -c 'echo owed >/etc/billet-registry/applied-docker-io'
+converge >"$work/owed.log" 2>&1 || { cat "$work/owed.log" >&2; fail "the converge owing a restart failed"; }
+[ "$(main_pid)" != "$pid" ] || fail "the owed restart was not taken up"
+pid=$(main_pid)
+converge >"$work/settled.log" 2>&1 || { cat "$work/settled.log" >&2; fail "the settled converge failed"; }
+[ "$(main_pid)" = "$pid" ] || fail "a settled mirror restarted"
+
+echo "== past the disk's limit, what they pulled is discarded and they come back"
+[ -n "$(sudo -n find /var/lib/billet-registry/docker-io/docker -type f -print -quit)" ] ||
+    fail "the Docker Hub mirror holds nothing, so discarding it would prove nothing"
+[ "$(systemctl is-enabled billet-registry-guard.timer)" = enabled ] || fail "the disk guard's timer is not enabled"
+sudo -n /usr/local/sbin/billet-registry-guard || fail "the disk guard failed below its limit"
+sudo -n test -d /var/lib/billet-registry/docker-io/docker || fail "the disk guard discarded below its limit"
+converge -e billet_registry_mirror_disk_limit_percent=1 >"$work/guard.log" 2>&1 ||
+    { cat "$work/guard.log" >&2; fail "the converge lowering the guard's limit failed"; }
+sudo -n systemctl stop billet-registry-guard.timer
+sudo -n /usr/local/sbin/billet-registry-guard || fail "the disk guard failed past its limit"
+sudo -n test ! -e /var/lib/billet-registry/docker-io/docker || fail "the disk guard did not discard past its limit"
+[ "$(systemctl is-active billet-registry@docker-io.service)" = active ] || fail "the mirror did not come back"
+converge >"$work/guard-restored.log" 2>&1 ||
+    { cat "$work/guard-restored.log" >&2; fail "the converge restoring the guard's limit failed"; }
+waited=0
+until [ "$(status_of "https://$address_a:7740/v2/library/alpine/manifests/latest" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json' || true)" = 200 ]; do
+    waited=$((waited + 1))
+    [ "$waited" -lt 30 ] || fail "the mirror did not serve again after the guard discarded"
+    sleep 1
+done
 
 echo "== a certificate that names a removed bridge is reissued, under the same authority"
 authority=$(sudo -n sha256sum /etc/billet-registry/ca.pem)
@@ -185,7 +269,6 @@ converge >"$work/again.log" 2>&1 || { cat "$work/again.log" >&2; fail "the conve
 storage_before=$(sudo -n du -s /var/lib/billet-registry | cut -f1)
 converge -e billet_registry_mirrors=false >"$work/off.log" 2>&1 || { cat "$work/off.log" >&2; fail "the converge turning them off failed"; }
 [ "$(node_value registry_mirrors)" = null ] || fail "the node is still told of mirrors that were turned off"
-[ "$(node_value registry_mirrors_ca)" = null ] || fail "the node is still told of an authority that was turned off"
 grep -q 'tcp dport { 53, 7718 } accept' "$work/network.nft" ||
     fail "a guest bridge's firewall still admits mirrors that were turned off: $(grep 'tcp dport' "$work/network.nft")"
 for unit in docker-io ghcr-io quay-io; do
@@ -194,8 +277,10 @@ for unit in docker-io ghcr-io quay-io; do
     fi
 done
 [ ! -e /etc/systemd/system/billet-registry@.service ] || fail "the unit outlived the mirrors"
+[ ! -e /etc/systemd/system/billet-registry-guard.timer ] || fail "the guard's timer outlived the mirrors"
+[ ! -e /usr/local/sbin/billet-registry-guard ] || fail "the guard outlived the mirrors"
 [ ! -e /etc/billet-registry ] || fail "the authority's key outlived the mirrors"
-[ -d /var/lib/billet-registry/docker-io ] || fail "turning the mirrors off lost what they pulled"
+sudo -n test -d /var/lib/billet-registry/docker-io/docker || fail "turning the mirrors off lost what they pulled"
 [ "$(sudo -n du -s /var/lib/billet-registry | cut -f1)" -ge "${storage_before:-1}" ] || fail "what they pulled shrank"
 
 echo "== a retained converge takes up nothing new, and keeps what an earlier one installed"
@@ -215,7 +300,7 @@ ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/shar
     -e "gate_address_a=$address_a" -e "gate_address_b=$address_b" -e gate_retained=true \
     "$here/registry-mirror-config-check.yml" >"$work/retained-kept.log" 2>&1 ||
     { cat "$work/retained-kept.log" >&2; fail "the retained decision failed with an authority"; }
-[ "$(node_value registry_mirrors_ca)" = '"/etc/billet-registry/ca.pem"' ] ||
+[ "$(node_value registry_mirrors)" != null ] ||
     fail "a retained converge dropped mirrors an earlier converge installed"
 sudo -n rm -rf /etc/billet-registry
 

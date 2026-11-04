@@ -128,9 +128,11 @@ billet_firecracker_stage: /var/cache/billet-provision
 billet_registry_mirrors: true
 # Whether turning them off removes what they pulled too.
 billet_registry_mirrors_purge: false
-# How long a mirror keeps what it pulled after it pulled it. It is the only bound
-# on their disk, which is /var/lib/billet-registry: Distribution has no size limit.
+# How long a mirror keeps what it pulled after it pulled it. Distribution has no
+# size limit, and any job on the host can ask for any public image, so a guard also
+# discards all of it once /var/lib/billet-registry's filesystem is this full.
 billet_registry_mirror_ttl: 168h
+billet_registry_mirror_disk_limit_percent: 85
 billet_registry_mirror_version: v3.1.2
 billet_registry_mirror_checksums:
   amd64: 40df2224d410f72ae425c3371873b078bbdbda3b8b612be9571f0e6751f3acc8

@@ -1,0 +1,6 @@
+[Unit]
+Description=billet discards what the registry mirrors pulled before it fills the disk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/billet-registry-guard

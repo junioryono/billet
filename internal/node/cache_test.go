@@ -1061,12 +1061,20 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
+	read := 0
 	runner := New(a, host, &fakeJIT{setID: 7}, p, nil,
 		WithRegistryMirrors(config.RegistryMirrors{
 			DockerIO: "https://docker-cache.home.example",
 			GHCRIO:   "https://ghcr-cache.home.example",
 			QuayIO:   "https://quay-cache.home.example",
-		}, "the mirrors' authority"))
+		}, func() (string, error) {
+			read++
+			if read > 1 {
+				return "", errors.New("the file went away")
+			}
+
+			return "the mirrors' authority", nil
+		}))
 	lease := assignedLease(t, a)
 	if err := runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(tier, config.ProviderFirecracker), Job{
@@ -1081,6 +1089,22 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 	}
 	if got := p.launched[0].RegistryMirrorsCA; got != "the mirrors' authority" {
 		t.Fatalf("provider registry mirrors' authority = %q", got)
+	}
+
+	// READ AGAIN FOR THE NEXT GUEST, and one that cannot be read costs that guest
+	// the authority and not its launch or its mirrors.
+	next := assignedLease(t, a)
+	if err := runner.Launch(t.Context(), next,
+		nodeapi.TierSpecOf(tier, config.ProviderFirecracker), Job{
+			RequestID: next.RequestID, Event: "push",
+		}); err != nil {
+		t.Fatalf("Launch with an unreadable authority: %v", err)
+	}
+	if read != 2 {
+		t.Fatalf("the authority was read %d times over two launches", read)
+	}
+	if got := p.launched[1]; got.RegistryMirrorsCA != "" || got.RegistryMirrors.DockerIO == "" {
+		t.Fatalf("with an unreadable authority: authority %q, mirrors %+v", got.RegistryMirrorsCA, got.RegistryMirrors)
 	}
 }
 

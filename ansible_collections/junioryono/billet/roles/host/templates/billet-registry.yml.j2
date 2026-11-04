@@ -6,7 +6,7 @@ log:
     service: billet-registry-{{ item.name }}
 storage:
   filesystem:
-    rootdirectory: /var/lib/billet-registry/{{ item.name }}
+    rootdirectory: {{ billet_registry_mirror_storage }}/{{ item.name }}
   # A proxy's expiry removes what it pulled through this.
   delete:
     enabled: true

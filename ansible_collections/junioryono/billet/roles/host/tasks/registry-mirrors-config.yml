@@ -3,6 +3,14 @@
 # configuration that says so. A function of the inventory and nothing else on an
 # ordinary converge, so a dry run and the real one render the same file.
 #
+# IT NAMES ONLY node.registry_mirrors, which every billet this role can meet loads.
+# The authority stays out of the file on purpose: a billet older than
+# registry_mirrors_ca refuses a file carrying it, and that billet may be the one
+# answering this converge's dry run, or one a rollout or a revert moves the host
+# back to. The node reads the authority from a path it knows instead, and an older
+# one never looks there, so its guests cannot verify the mirror and pull from the
+# registry.
+#
 # AN OPERATOR'S OWN MIRRORS WIN: a node naming registry_mirrors or
 # registry_mirrors_ca keeps them, and this role runs none.
 #
@@ -22,6 +30,7 @@
   ansible.builtin.set_fact:
     billet_registry_mirrors_active: >-
       {{ billet_registry_mirrors | bool
+         and billet_networks | length > 0
          and billet_effective_config is mapping
          and billet_effective_config.get('node') is mapping
          and billet_effective_config.node.get('provider') == 'firecracker'
@@ -36,8 +45,8 @@
       {{ billet_effective_config | combine({'node': {
            'registry_mirrors': dict(billet_registry_mirror_instances | map(attribute='upstream')
              | zip(billet_registry_mirror_instances | map(attribute='port') | map('string')
-                   | map('regex_replace', '^', 'https://' ~ billet_networks[0].address ~ ':'))),
-           'registry_mirrors_ca': billet_registry_mirror_dir ~ '/ca.pem'}}, recursive=true) }}
+                   | map('regex_replace', '^', 'https://' ~ billet_networks[0].address ~ ':')))}},
+           recursive=true) }}
   no_log: true
   when: billet_registry_mirrors_active | bool
 
