@@ -345,3 +345,22 @@ func TestAConfigOnABrokerNamesNoKey(t *testing.T) {
 		})
 	}
 }
+
+// A BROKER BLOCK STOPS THE APP'S CREATION WHETHER OR NOT IT IS COMPLETE: a half-written
+// one still says this host is not to hold a key, and the spend cannot be taken back.
+func TestAnyBrokerBlockIsSeenBeforeAnAppIsCreated(t *testing.T) {
+	t.Parallel()
+
+	for body, want := range map[string]bool{
+		"server:\n  token_broker:\n    url: https://broker\n":          true,
+		"server:\n  token_broker:\n    client_key_path: /etc/k\n":      true,
+		"server:\n  token_broker: {}\n":                                true,
+		"server:\n  listen: 127.0.0.1:7717\n":                          false,
+		"github:\n  org: acme\n":                                       false,
+		"not yaml: [":                                                  false,
+	} {
+		if got := PeekTokenBroker([]byte(body)); got != want {
+			t.Errorf("PeekTokenBroker(%q) = %v, want %v", body, got, want)
+		}
+	}
+}

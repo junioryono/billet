@@ -355,7 +355,11 @@ func repairRestoredOwnership(env cli.Env, plan deployarchive.Plan) {
 // restoredKeyPaths is every App key path a plan installs: the default target's
 // and each further target's.
 func restoredKeyPaths(plan deployarchive.Plan) []string {
-	paths := []string{plan.Target.AppKeyPath}
+	var paths []string
+
+	if plan.Target.AppKeyPath != "" {
+		paths = append(paths, plan.Target.AppKeyPath)
+	}
 
 	for _, target := range plan.Target.Targets {
 		if target.AppKeyPath != "" {

@@ -212,6 +212,10 @@ func (c *BrokerConfig) Validate() error {
 		// those of them holding it as an organization.
 		holders = map[[2]int64]map[string]bool{}
 		whole   = map[[2]int64]bool{}
+		// registered is who holds each (app, installation, target), in GitHub's own
+		// comparison, which ignores case: one repository under two spellings is still
+		// one repository, and two deployments would each reach it.
+		registered = map[string]string{}
 	)
 
 	for i := range c.Deployments {
@@ -273,6 +277,13 @@ func (c *BrokerConfig) Validate() error {
 			}
 
 			seen[key] = true
+
+			if other, held := registered[key]; held && other != d.ID {
+				errs = append(errs, fmt.Errorf("%s: target %s is already registered to deployment %s, and a "+
+					"token for it reaches what that deployment holds", at, inst.Target, other))
+			}
+
+			registered[key] = d.ID
 
 			id := [2]int64{inst.AppID, inst.InstallationID}
 			if holders[id] == nil {

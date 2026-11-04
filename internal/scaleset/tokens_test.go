@@ -3,7 +3,9 @@ package scaleset
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -207,6 +209,41 @@ func TestAPollDoesNotAskTheSource(t *testing.T) {
 
 	if after := tokens.called.Load(); after != before {
 		t.Errorf("a poll asked the source %d more times", after-before)
+	}
+}
+
+// A RETRY ASKS AGAIN, because the attempt before it may have waited out a Retry-After
+// longer than the token it sent had left. Driven through the hook itself, with the
+// header a first attempt leaves behind.
+func TestARetryOfARegistrationTakesAFreshToken(t *testing.T) {
+	t.Parallel()
+
+	tokens := newStubTokens("the-second-token")
+	hook := sourceInstallationToken(tokens, &tokenFailures{}, slog.Default())
+
+	req := httptest.NewRequest(http.MethodPost, "https://api.github.com/orgs/acme/actions/runners/registration-token", http.NoBody)
+	req.Header.Set("Authorization", "Bearer the-first-token")
+
+	hook(nil, req, 1)
+
+	if got := req.Header.Get("Authorization"); got != "Bearer the-second-token" {
+		t.Fatalf("the retry carried %q", got)
+	}
+
+	// EVERY OTHER REQUEST CARRIES SOMETHING THE SOURCE DID NOT ISSUE, and is left alone.
+	other := httptest.NewRequest(http.MethodGet, "https://broker.actions.githubusercontent.com/queue", http.NoBody)
+	other.Header.Set("Authorization", "Bearer queue-token")
+
+	before := tokens.called.Load()
+
+	hook(nil, other, 0)
+
+	if got := other.Header.Get("Authorization"); got != "Bearer queue-token" {
+		t.Errorf("a poll's credential became %q", got)
+	}
+
+	if tokens.called.Load() != before {
+		t.Error("a poll asked the source")
 	}
 }
 

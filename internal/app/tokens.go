@@ -70,6 +70,8 @@ func ServeBroker(ctx context.Context, cfg *config.BrokerConfig, log *slog.Logger
 		return err
 	}
 
+	tlsConf.VerifyConnection = server.VerifyConnection
+
 	var lc net.ListenConfig
 
 	ln, err := lc.Listen(ctx, "tcp", cfg.Listen)
