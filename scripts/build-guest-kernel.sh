@@ -14,10 +14,16 @@
 # the same as absent. Changing one of these two without the other produces a guest
 # that boots and then fails in the middle of somebody's job.
 #
+# ONE KERNEL PER MACHINE, BUILT ON THAT MACHINE (ADR-022). Firecracker loads an ELF
+# vmlinux on x86_64 and a PE Image on aarch64, and each machine's base config is its
+# own, so the target, the file it leaves and the base are chosen here, together. Both
+# are installed as vmlinux-billet, the name everything after this script reads.
+#
 # THE BASE IS FIRECRACKER'S OWN CI CONFIG, because it is known to boot under the VMM,
 # plus everything moby's check-config.sh reports missing. That check is the test: the
 # build ends by running scripts/check-guest-kernel-config.sh, which requires every
-# option in scripts/kernel/required-builtins.txt to be =y and requires the vendored
+# option in scripts/kernel/required-builtins.txt, and on aarch64 in
+# scripts/kernel/required-builtins-aarch64.txt, to be =y and requires the vendored
 # checker to EXIT ZERO -- not to print a particular sentence. Firecracker's CI kernel
 # alone is NOT adequate -- measured, it was missing IP_NF_RAW, IP6_NF_RAW, XT_MARK,
 # NET_CLS_CGROUP and the nftables modules, which surfaces as service containers
@@ -39,6 +45,24 @@ mkdir -p "$WORK" "$OUT"
 # Build the guest kernel billet ships: Firecracker's CI config (known to boot under
 # the VMM) plus everything moby's check-config.sh says Docker needs.
 set -euo pipefail
+
+case "$(uname -m)" in
+x86_64)
+  KERNEL_TARGET=vmlinux KERNEL_BUILT=vmlinux
+  DEFAULT_BASE_CONFIG=$REPO_ROOT/scripts/guest-kernel.config
+  MACHINE_BUILTINS=""
+  ;;
+aarch64)
+  KERNEL_TARGET=Image KERNEL_BUILT=arch/arm64/boot/Image
+  DEFAULT_BASE_CONFIG=$REPO_ROOT/scripts/guest-kernel-aarch64.config
+  MACHINE_BUILTINS=$REPO_ROOT/scripts/kernel/required-builtins-aarch64.txt
+  ;;
+*)
+  echo "this host is $(uname -m), and billet builds guest kernels for x86_64 and aarch64 only" >&2
+  exit 1
+  ;;
+esac
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq build-essential flex bison libelf-dev libssl-dev bc dwarves cpio >/dev/null
@@ -114,7 +138,7 @@ cd "linux-$V"
 #
 # BASE_CONFIG is overridable for exactly that case: pointing it at a fresh
 # Firecracker CI config is how a version bump is done.
-BASE_CONFIG="${BASE_CONFIG:-$REPO_ROOT/scripts/guest-kernel.config}"
+BASE_CONFIG="${BASE_CONFIG:-$DEFAULT_BASE_CONFIG}"
 
 if [ ! -r "$BASE_CONFIG" ]; then
   echo "cannot read the base kernel config at $BASE_CONFIG." >&2
@@ -146,16 +170,25 @@ if [ ! -r "$REQUIRED_BUILTINS" ]; then
   exit 1
 fi
 
-while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in
-    '' | '#'*) continue ;;
-  esac
+# ONE LIST FOR EVERY MACHINE AND ONE MORE FOR THIS ONE, when it has any: both are the
+# gate's too, which chooses the second from the config it is given.
+for list in "$REQUIRED_BUILTINS" ${MACHINE_BUILTINS:+"$MACHINE_BUILTINS"}; do
+  if [ ! -r "$list" ]; then
+    echo "cannot read $list, which lists what this kernel must carry." >&2
+    exit 1
+  fi
 
-  opt=$(printf '%s' "$line" | tr -d '[:space:]')
-  [ -n "$opt" ] || continue
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '' | '#'*) continue ;;
+    esac
 
-  ./scripts/config --enable "$opt" || true
-done <"$REQUIRED_BUILTINS"
+    opt=$(printf '%s' "$line" | tr -d '[:space:]')
+    [ -n "$opt" ] || continue
+
+    ./scripts/config --enable "$opt" || true
+  done <"$list"
+done
 
 # APPARMOR: Ubuntu's userspace expects it, and Docker's default profile needs it.
 ./scripts/config --enable SECURITY_APPARMOR
@@ -169,15 +202,15 @@ echo "=== building on $(nproc) cores ==="
 # meant a failed kernel build printed one line -- the exit status -- and the
 # thousands of lines saying why were left in a file on a runner that is about to be
 # destroyed. Unreadable exactly when it is needed.
-if ! time make -j"$(nproc)" vmlinux >/tmp/kbuild.log 2>&1; then
+if ! time make -j"$(nproc)" "$KERNEL_TARGET" >/tmp/kbuild.log 2>&1; then
   echo "the kernel build failed; the last 60 lines of the log follow" >&2
   tail -60 /tmp/kbuild.log >&2
 
   exit 1
 fi
 
-ls -la vmlinux
-cp vmlinux "$OUT/vmlinux-billet"
+ls -la "$KERNEL_BUILT"
+cp "$KERNEL_BUILT" "$OUT/vmlinux-billet"
 cp .config "$OUT/vmlinux-billet.config"
 
 # THE CHECK IS THE TEST, and it is the reason the option list above exists:

@@ -3,6 +3,7 @@
 # check-guest-component.sh present|absent NAME ROOT
 # check-guest-component.sh names
 # check-guest-component.sh installer NAME
+# check-guest-component.sh offered PLAN
 #
 # THE COMPONENTS BILLET MAY NOT SHIP (#584), and what each one leaves in an image:
 # its paths and the variables it adds to the job's environment. One list, read two
@@ -17,6 +18,8 @@
 #   names    prints the components, one a line.
 #   installer prints GitHub's template step that installs NAME, which the
 #            completer runs; a template that has no such step does not offer NAME.
+#   offered  prints the components whose installer the template plan PLAN runs, one
+#            a line: what that machine's image leaves out and can be completed with.
 #
 # ROOT is a directory holding the image's tree. `present` executes inside it with
 # chroot, so it needs root; `absent` only looks.
@@ -25,7 +28,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: check-guest-component.sh present|absent NAME ROOT, names, or installer NAME" >&2
+	echo "usage: check-guest-component.sh present|absent NAME ROOT, names, installer NAME, or offered PLAN" >&2
 	exit 2
 }
 
@@ -43,6 +46,25 @@ installer() {
 	microsoft-edge) echo install-microsoft-edge.sh ;;
 	*) return 2 ;;
 	esac
+}
+
+# offered prints each component whose installer PLAN runs. A plan it cannot read is
+# could-not-tell, status 2: an unread plan is not one that offers nothing.
+offered() {
+	local plan=$1 name script found
+	while IFS= read -r name; do
+		script=$(installer "$name")
+		found=0
+		grep -qF "\"id\": \"$script\"" "$plan" || found=$?
+		case "$found" in
+		0) printf '%s\n' "$name" ;;
+		1) ;;
+		*)
+			echo "check-guest-component.sh: could not read $plan to tell whether it installs $name" >&2
+			return 2
+			;;
+		esac
+	done < <(names)
 }
 
 # paths prints what NAME installs, one a line: an executable is marked x, a
@@ -238,6 +260,12 @@ installer)
 		exit 2
 	}
 	exit 0
+	;;
+offered)
+	[ "$#" -eq 2 ] || usage
+	status=0
+	offered "$2" || status=$?
+	exit "$status"
 	;;
 present | absent)
 	[ "$#" -eq 3 ] || usage

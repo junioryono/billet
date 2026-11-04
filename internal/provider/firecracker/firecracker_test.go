@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -271,6 +272,41 @@ func TestTheVMMOutlivesTheProcessThatStartedIt(t *testing.T) {
 	if !h.ranWith("--daemonize") {
 		t.Errorf("the jailer was not asked to daemonize, so the microVM dies with billet: %s",
 			h.everyArgument())
+	}
+}
+
+// THE KERNEL'S COMMAND LINE IS THE MACHINE'S: x86 is told about its keyboard controller,
+// and an arm64 kernel, which has none, is not. Both name the root disk, neither a console.
+func TestTheBootArgumentsAreTheMachines(t *testing.T) {
+	t.Parallel()
+
+	for goarch, wantI8042 := range map[string]bool{"amd64": true, "arm64": false} {
+		args := bootArgs(goarch)
+		if got := strings.Contains(args, "i8042."); got != wantI8042 {
+			t.Errorf("on %s, i8042 options present = %v in %q", goarch, got, args)
+		}
+
+		for _, want := range []string{"root=/dev/vda", " rw", "panic=1", "pci=off"} {
+			if !strings.Contains(args, want) {
+				t.Errorf("on %s, %q does not carry %q", goarch, args, want)
+			}
+		}
+
+		if strings.Contains(args, "console=") {
+			t.Errorf("on %s, %q names a console", goarch, args)
+		}
+	}
+
+	h := newHarness(t)
+	_, vmm := h.launch(t)
+
+	body, called := vmm.bodyPut("/boot-source")
+	if !called {
+		t.Fatal("no boot source was configured")
+	}
+
+	if body["boot_args"] != bootArgs(runtime.GOARCH) {
+		t.Errorf("the guest was booted with %v, not this machine's arguments", body["boot_args"])
 	}
 }
 
