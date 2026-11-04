@@ -313,22 +313,26 @@ RETURNING last;
 -- Finished leases past a place in the order they finished in, bounded.
 --
 -- FILTERED ON usage_seq ALONE, never on a time: a lease that closed with an
--- earlier clock than one already read must still be seen. Every empty value is
--- "not recorded", which the export says rather than reading it as zero.
+-- earlier clock than one already read must still be seen. The second term is the
+-- partial index's own predicate, which a planner cannot infer from a parameter.
+-- Every empty value is "not recorded", which the export says rather than reading
+-- it as zero.
 SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
-       COALESCE(conclusion, '') AS conclusion, failure_reason
+       COALESCE(conclusion, '') AS conclusion
   FROM job_history
- WHERE usage_seq > @after
+ WHERE usage_seq > @after AND usage_seq > 0
  ORDER BY usage_seq
  LIMIT CAST(@max_rows AS BIGINT);
 
--- name: ReadUsageLease :one
--- The lease at one place in that order, which proves a cursor still means
--- something on this ledger.
-SELECT lease_id FROM job_history WHERE usage_seq = @usage_seq AND usage_seq > 0;
+-- name: ReadUsageRecord :one
+-- The close at one place in that order, which proves a cursor still means
+-- something on this ledger: the lease alone is not enough, because a ledger
+-- restored from a backup can close the same lease again at the same number.
+SELECT lease_id, COALESCE(finished_at, '') AS finished_at
+  FROM job_history WHERE usage_seq = @usage_seq AND usage_seq > 0;
 
 -- name: RecordJobPhase :exec
 -- Record when a lease first entered a phase, on the row that outlives it.

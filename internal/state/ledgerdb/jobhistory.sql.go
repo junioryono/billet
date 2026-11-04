@@ -655,9 +655,9 @@ SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
-       COALESCE(conclusion, '') AS conclusion, failure_reason
+       COALESCE(conclusion, '') AS conclusion
   FROM job_history
- WHERE usage_seq > $1
+ WHERE usage_seq > $1 AND usage_seq > 0
  ORDER BY usage_seq
  LIMIT CAST($2 AS BIGINT)
 `
@@ -685,14 +685,15 @@ type ListUsageSinceRow struct {
 	Result             string
 	ResultAt           string
 	Conclusion         string
-	FailureReason      string
 }
 
 // Finished leases past a place in the order they finished in, bounded.
 //
 // FILTERED ON usage_seq ALONE, never on a time: a lease that closed with an
-// earlier clock than one already read must still be seen. Every empty value is
-// "not recorded", which the export says rather than reading it as zero.
+// earlier clock than one already read must still be seen. The second term is the
+// partial index's own predicate, which a planner cannot infer from a parameter.
+// Every empty value is "not recorded", which the export says rather than reading
+// it as zero.
 func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) ([]ListUsageSinceRow, error) {
 	rows, err := q.db.QueryContext(ctx, listUsageSince, arg.After, arg.MaxRows)
 	if err != nil {
@@ -720,7 +721,6 @@ func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) 
 			&i.Result,
 			&i.ResultAt,
 			&i.Conclusion,
-			&i.FailureReason,
 		); err != nil {
 			return nil, err
 		}
@@ -1033,17 +1033,24 @@ func (q *Queries) ReadJobWait(ctx context.Context, leaseID string) (ReadJobWaitR
 	return i, err
 }
 
-const readUsageLease = `-- name: ReadUsageLease :one
-SELECT lease_id FROM job_history WHERE usage_seq = $1 AND usage_seq > 0
+const readUsageRecord = `-- name: ReadUsageRecord :one
+SELECT lease_id, COALESCE(finished_at, '') AS finished_at
+  FROM job_history WHERE usage_seq = $1 AND usage_seq > 0
 `
 
-// The lease at one place in that order, which proves a cursor still means
-// something on this ledger.
-func (q *Queries) ReadUsageLease(ctx context.Context, usageSeq int64) (string, error) {
-	row := q.db.QueryRowContext(ctx, readUsageLease, usageSeq)
-	var lease_id string
-	err := row.Scan(&lease_id)
-	return lease_id, err
+type ReadUsageRecordRow struct {
+	LeaseID    string
+	FinishedAt string
+}
+
+// The close at one place in that order, which proves a cursor still means
+// something on this ledger: the lease alone is not enough, because a ledger
+// restored from a backup can close the same lease again at the same number.
+func (q *Queries) ReadUsageRecord(ctx context.Context, usageSeq int64) (ReadUsageRecordRow, error) {
+	row := q.db.QueryRowContext(ctx, readUsageRecord, usageSeq)
+	var i ReadUsageRecordRow
+	err := row.Scan(&i.LeaseID, &i.FinishedAt)
+	return i, err
 }
 
 const recordJobAssignment = `-- name: RecordJobAssignment :exec

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -79,26 +80,27 @@ func TestAClosingLeaseTakesItsUsageNumberAndKeepsItsOwner(t *testing.T) {
 		t.Fatalf("reading past 1 answers %+v, want lease %s at 2", rows, second.ID)
 	}
 
-	lease, err := db.UsageLease(t.Context(), 2)
-	if err != nil || lease != second.ID {
-		t.Fatalf("UsageLease(2) = %q, %v; want %s", lease, err, second.ID)
+	closed, err := db.UsageRecordAt(t.Context(), 2)
+	if err != nil || closed.LeaseID != second.ID || closed.FinishedAt != rows[0].FinishedAt {
+		t.Fatalf("UsageRecordAt(2) = %+v, %v; want %s closed at %s", closed, err, second.ID, rows[0].FinishedAt)
 	}
 
-	if _, err := db.UsageLease(t.Context(), 3); !errors.Is(err, state.ErrNoUsageRecord) {
-		t.Fatalf("UsageLease(3) = %v, want the definite no-record answer", err)
+	if _, err := db.UsageRecordAt(t.Context(), 3); !errors.Is(err, state.ErrNoUsageRecord) {
+		t.Fatalf("UsageRecordAt(3) = %v, want the definite no-record answer", err)
 	}
 
 	// Zero is what an unfinished row holds, and no row is ever at it.
-	if _, err := db.UsageLease(t.Context(), 0); !errors.Is(err, state.ErrNoUsageRecord) {
-		t.Fatalf("UsageLease(0) = %v, want the definite no-record answer", err)
+	if _, err := db.UsageRecordAt(t.Context(), 0); !errors.Is(err, state.ErrNoUsageRecord) {
+		t.Fatalf("UsageRecordAt(0) = %v, want the definite no-record answer", err)
 	}
 }
 
 // NUMBERS BECOME VISIBLE IN THE ORDER THEY WERE TAKEN, with closers on two handles
 // beside a reader, which is the controller and an operator's force-destroy. A
-// reader paging past N relies on no lower number committing later. Under
-// BILLET_TEST_LEDGER=postgres this is the case a PostgreSQL sequence would fail:
-// the counter row's lock is what holds it there.
+// reader paging past N relies on no lower number committing later. The writers'
+// own lock serializes these closes on both engines, so what this holds is the whole
+// path; state's TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits holds the
+// counter's lock on its own.
 func TestAReaderNeverSeesAUsageNumberBeforeALowerOne(t *testing.T) {
 	const closes = 40
 
@@ -124,7 +126,9 @@ func TestAReaderNeverSeesAUsageNumberBeforeALowerOne(t *testing.T) {
 		leases = append(leases, reserve(t, a, "linux"))
 	}
 
-	ctx, cancel := context.WithCancel(t.Context())
+	// A GUARD, so a close that left its lease unnumbered fails here, with the count,
+	// rather than leaving the reader waiting for a number that will never come.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
 	var (
@@ -185,10 +189,10 @@ func TestAReaderNeverSeesAUsageNumberBeforeALowerOne(t *testing.T) {
 
 	reader.Wait()
 
-	if readerErr != nil && !t.Failed() {
-		t.Fatal(readerErr)
+	if readerErr != nil {
+		t.Fatalf("after %d of %d leases: %v", len(seen), closes, readerErr)
 	}
-	if !t.Failed() && len(seen) != closes {
+	if len(seen) != closes {
 		t.Fatalf("the reader saw %d of %d closed leases", len(seen), closes)
 	}
 }

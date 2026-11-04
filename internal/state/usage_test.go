@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
@@ -136,9 +137,9 @@ func exerciseUsageBackfill(t *testing.T, open func(context.Context) (*DB, error)
 		t.Fatalf("archive again: %v", err)
 	}
 
-	lease, err := db.UsageLease(ctx, 4)
-	if err != nil || lease != "running" {
-		t.Fatalf("UsageLease(4) = %q, %v; a second archive moved the lease's number", lease, err)
+	closed, err := db.UsageRecordAt(ctx, 4)
+	if err != nil || closed.LeaseID != "running" {
+		t.Fatalf("UsageRecordAt(4) = %+v, %v; a second archive moved the lease's number", closed, err)
 	}
 }
 
@@ -174,5 +175,125 @@ func TestTheUsageCounterWaitsForTheFirstClose(t *testing.T) {
 		if got != want {
 			t.Fatalf("NextUsageSeq = %d, want %d", got, want)
 		}
+	}
+}
+
+// THE COUNTER'S OWN LOCK ORDERS TWO TAKERS, with nothing else serializing them: a
+// second transaction asking for a number waits until the first has committed, sees
+// what it committed, and a transaction rolled back gives its number back. A
+// PostgreSQL sequence, which hands numbers out beside the transaction, fails each.
+func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
+	t.Parallel()
+
+	dsn := requirePostgres(t)
+
+	db, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// RAW CONNECTIONS, because a DB.Tx takes the writers' advisory lock first, and
+	// that is what this leaves out.
+	raw, err := sql.Open("pgx", string(dsn))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+
+	const take = `INSERT INTO usage_sequence (id, last) VALUES (1, 1)
+		ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1 RETURNING last`
+
+	begin := func() *sql.Tx {
+		t.Helper()
+
+		tx, err := raw.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		t.Cleanup(func() { _ = tx.Rollback() })
+
+		return tx
+	}
+
+	number := func(tx *sql.Tx) int64 {
+		t.Helper()
+
+		var n int64
+		if err := tx.QueryRowContext(ctx, take).Scan(&n); err != nil {
+			t.Fatalf("take a number: %v", err)
+		}
+
+		return n
+	}
+
+	abandoned := begin()
+	if got := number(abandoned); got != 1 {
+		t.Fatalf("the first number is %d, want 1", got)
+	}
+	if err := abandoned.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	first := begin()
+	if got := number(first); got != 1 {
+		t.Fatalf("after a rollback the number is %d, want the 1 it gave back", got)
+	}
+
+	second := begin()
+
+	type taken struct {
+		n   int64
+		err error
+	}
+
+	answer := make(chan taken, 1)
+
+	go func() {
+		var n int64
+
+		err := second.QueryRowContext(ctx, take).Scan(&n)
+		answer <- taken{n, err}
+	}()
+
+	// HELD: the server says the second taker is waiting on a lock, which is the
+	// fact itself rather than a wait long enough to have missed an answer.
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		var waiting int
+		if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM pg_stat_activity
+			WHERE query LIKE 'INSERT INTO usage_sequence%' AND wait_event_type = 'Lock'
+			  AND datname = current_database()`).Scan(&waiting); err != nil {
+			t.Fatalf("read the server's locks: %v", err)
+		}
+
+		if waiting > 0 {
+			break
+		}
+
+		select {
+		case got := <-answer:
+			t.Fatalf("the second taker answered %d, %v while the first had not committed", got.n, got.err)
+		default:
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("the second taker neither answered nor waited on a lock within 30s")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := first.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	got := <-answer
+	if got.err != nil || got.n != 2 {
+		t.Fatalf("the second taker answered %d, %v; want 2, once the first committed", got.n, got.err)
 	}
 }

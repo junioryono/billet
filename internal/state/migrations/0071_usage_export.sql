@@ -9,13 +9,14 @@
 -- exporter has already read. Zero means the lease has not finished.
 --
 -- usage_sequence is the last number handed out, a row and not a sequence or a
--- MAX, BECAUSE THE ROW'S LOCK IS WHAT MAKES THE ORDER SAFE TO READ. The number is
--- taken by updating this row in the closing transaction, so a second closer on
--- PostgreSQL (an operator's force-destroy beside the controller) waits for the
--- first to commit: a reader paging past N can never see N+1 commit before N. A
--- PostgreSQL sequence hands out numbers outside the transaction, and a reader
--- would page past the one still uncommitted and never see it. A rollback gives
--- the number back with everything else. THE ROW EXISTS ONCE A LEASE HAS FINISHED:
+-- MAX, BECAUSE THE ROW'S LOCK IS WHAT MAKES THE ORDER SAFE TO READ, whatever else
+-- serializes the writers. The number is taken by updating this row in the closing
+-- transaction, so a second closer waits for the first to commit: a reader paging
+-- past N can never see N+1 commit before N. A PostgreSQL sequence hands out
+-- numbers outside the transaction, so this order would rest entirely on the
+-- writers' advisory lock, and a reader would page past the one still uncommitted
+-- the day anything took a number without it. A rollback gives the number back with
+-- everything else. THE ROW EXISTS ONCE A LEASE HAS FINISHED:
 -- a ledger with no history has none, because a row in any table is what tells a
 -- used ledger from a pristine one (PeekLedger), and a restore decides by that.
 --

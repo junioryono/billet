@@ -5,10 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"go/parser"
-	"go/token"
+	"maps"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -148,11 +149,13 @@ func TestALeaseIsExportedExactlyOnceAcrossARestart(t *testing.T) {
 }
 
 type stubUsageLedger struct {
-	lease string
-	err   error
+	closed state.UsageClose
+	err    error
 }
 
-func (s stubUsageLedger) UsageLease(context.Context, int64) (string, error) { return s.lease, s.err }
+func (s stubUsageLedger) UsageRecordAt(context.Context, int64) (state.UsageClose, error) {
+	return s.closed, s.err
+}
 
 // A CURSOR THAT CANNOT BE TRUSTED IS REFUSED BY NAME, because the alternative is
 // silently skipping what a restored ledger numbers over it, and a read that failed
@@ -160,9 +163,13 @@ func (s stubUsageLedger) UsageLease(context.Context, int64) (string, error) { re
 func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
 	t.Parallel()
 
-	const lease = "feedfacefeedfacefeedfacefeedface"
+	const (
+		lease  = "feedfacefeedfacefeedfacefeedface"
+		closed = "2026-11-03T10:04:00.000000000Z"
+	)
 
-	good := usageCursor{usageDeployment, 7, lease}.String()
+	mark := usageCloseMark(closed)
+	good := usageCursor{usageDeployment, 7, lease, mark}.String()
 	readFailed := errors.New("the database went away")
 
 	for name, tc := range map[string]struct {
@@ -173,15 +180,27 @@ func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
 	}{
 		"not a cursor":       {since: "yesterday", want: "not a cursor this billet wrote"},
 		"a later format":     {since: strings.Replace(good, "u1.", "u2.", 1), want: "not a cursor this billet wrote"},
-		"a zero place":       {since: "u1." + usageDeployment + ".0." + lease, want: "not a cursor this billet wrote"},
-		"another deployment": {since: usageCursor{"ffffffffffffffffffffffffffffffff", 7, lease}.String(), want: "deployment ffffffffffffffffffffffffffffffff's cursor"},
+		"a zero place":       {since: "u1." + usageDeployment + ".0." + lease + "." + mark, want: "not a cursor this billet wrote"},
+		"no close":           {since: "u1." + usageDeployment + ".7." + lease, want: "not a cursor this billet wrote"},
+		"another deployment": {since: usageCursor{"ffffffffffffffffffffffffffffffff", 7, lease, mark}.String(), want: "deployment ffffffffffffffffffffffffffffffff's cursor"},
 		"restored, shorter": {
 			since: good, ledger: stubUsageLedger{err: state.ErrNoUsageRecord},
 			want: "holds no record 7",
 		},
 		"restored, numbered over": {
-			since: good, ledger: stubUsageLedger{lease: "badbadbadbadbadbadbadbadbadbadba"},
-			want: "record 7 is lease badbadbadbadbadbadbadbadbadbadba",
+			since: good, ledger: stubUsageLedger{closed: state.UsageClose{
+				LeaseID: "badbadbadbadbadbadbadbadbadbadba", FinishedAt: closed,
+			}},
+			want: "is not the close --since names",
+		},
+		// THE LEASE AGREES AND THE CLOSE DOES NOT: a restored ledger closed this
+		// lease again at this number, and may have closed another before it that
+		// the exporter would skip.
+		"restored, the same lease closed again": {
+			since: good, ledger: stubUsageLedger{closed: state.UsageClose{
+				LeaseID: lease, FinishedAt: "2026-11-04T01:02:03.000000000Z",
+			}},
+			want: "is not the close --since names",
 		},
 		"could not read": {since: good, ledger: stubUsageLedger{err: readFailed}, wantIs: readFailed},
 	} {
@@ -210,7 +229,8 @@ func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
 		})
 	}
 
-	after, err := resumeUsage(t.Context(), stubUsageLedger{lease: lease}, usageDeployment, good)
+	after, err := resumeUsage(t.Context(), stubUsageLedger{closed: state.UsageClose{LeaseID: lease, FinishedAt: closed}},
+		usageDeployment, good)
 	if err != nil || after != 7 {
 		t.Fatalf("a cursor this ledger holds resumed at %d, %v; want 7", after, err)
 	}
@@ -254,8 +274,8 @@ func TestAKnownLeaseReportsEveryNumber(t *testing.T) {
 	if r.Ownership != usageBought {
 		t.Errorf("ownership = %q, want %q", r.Ownership, usageBought)
 	}
-	if r.Cursor != "u1."+usageDeployment+".9.feedface" {
-		t.Errorf("cursor = %q", r.Cursor)
+	if want := "u1." + usageDeployment + ".9.feedface." + usageCloseMark(knownUsageRow().FinishedAt); r.Cursor != want {
+		t.Errorf("cursor = %q, want %q", r.Cursor, want)
 	}
 	if r.VCPU == nil || *r.VCPU != 4 || r.MemoryBytes == nil || *r.MemoryBytes != 16<<30 {
 		t.Errorf("shape = %v, %v", r.VCPU, r.MemoryBytes)
@@ -337,7 +357,8 @@ func TestAFieldTheLedgerDoesNotKnowIsEmptyAndSaysWhy(t *testing.T) {
 			},
 		},
 		"no shape": {
-			mutate: func(r *state.UsageRow) { r.VCPU, r.Memory = 0, 0 }, fields: []string{"vcpu", "memory_bytes"},
+			mutate: func(r *state.UsageRow) { r.VCPU, r.Memory = 0, 0 },
+			fields: []string{"vcpu", "memory_bytes", "minute_weight", "weight_source", "weighted_minutes"},
 			check: func(t *testing.T, r *usageRecord) {
 				t.Helper()
 				if r.VCPU != nil || r.MemoryBytes != nil {
@@ -371,7 +392,7 @@ func TestAFieldTheLedgerDoesNotKnowIsEmptyAndSaysWhy(t *testing.T) {
 		},
 		"a job with no result": {
 			mutate: func(r *state.UsageRow) { r.ResultAt, r.Result = "", "" },
-			fields: []string{"job.to", "job.seconds", "billed_minutes", "weighted_minutes"},
+			fields: []string{"job.to", "job.seconds", "billed_minutes", "weighted_minutes", "result"},
 			check: func(t *testing.T, r *usageRecord) {
 				t.Helper()
 				if r.BilledMinutes != nil || r.WeightedMinutes != nil {
@@ -468,13 +489,11 @@ func TestAnOwnedLeaseHasNoPriceToReport(t *testing.T) {
 	}
 }
 
-// THE RECORD'S NAMES ARE THE FORMAT, so a renamed Go field cannot move one under a
-// billing system without this failing. A null is there, spelled, so a consumer can
-// tell it from a field this schema does not have.
-func TestTheRecordFormatIsWhatTheDocumentStates(t *testing.T) {
-	t.Parallel()
+// marshalRecord is a record as a consumer reads it.
+func marshalRecord(t *testing.T, r usageRecord) map[string]any {
+	t.Helper()
 
-	body, err := json.Marshal(newUsageRecord(usageConfig(t, 0), usageDeployment, knownUsageRow()))
+	body, err := json.Marshal(r)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -484,29 +503,110 @@ func TestTheRecordFormatIsWhatTheDocumentStates(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
+	return fields
+}
+
+// THE RECORD'S NAMES ARE THE FORMAT, nested ones included, so a renamed Go field or
+// an omitempty cannot move one under a billing system without this failing. A null
+// is there, spelled, so a consumer can tell it from a field this schema lacks.
+func TestTheRecordFormatIsWhatTheDocumentStates(t *testing.T) {
+	t.Parallel()
+
+	wantTop := []string{
+		"schema", "cursor", "sequence", "lease_id", "deployment", "target", "repository", "tier", "site",
+		"provider", "ownership", "vcpu", "memory_bytes", "held", "job", "billed_minutes", "minute_weight",
+		"weight_source", "weighted_minutes", "instance_type", "price_micros_per_hour", "cost_micros",
+		"conclusion", "result", "unknown",
+	}
+	wantInterval := []string{"from", "to", "seconds"}
+
+	known := marshalRecord(t, newUsageRecord(usageConfig(t, 0), usageDeployment, knownUsageRow()))
+
+	empty := knownUsageRow()
+	empty.Provider, empty.VCPU, empty.Memory, empty.PriceMicrosPerHour = "", 0, 0, 0
+	empty.BoughtAt, empty.StartedAt, empty.ResultAt = "", "", ""
+	unknown := marshalRecord(t, newUsageRecord(usageConfig(t, 0), usageDeployment, empty))
+
+	if known["schema"] != float64(usageRecordSchema) || usageRecordSchema != 1 {
+		t.Errorf("schema = %v; a change a consumer reads differently is a new number, and a document to match",
+			known["schema"])
+	}
+
+	for name, fields := range map[string]map[string]any{"known": known, "unknown": unknown} {
+		got := slices.Sorted(maps.Keys(fields))
+		if want := slices.Sorted(slices.Values(wantTop)); !slices.Equal(got, want) {
+			t.Errorf("%s record has keys %v, want %v", name, got, want)
+		}
+
+		for _, interval := range []string{"held", "job"} {
+			nested, ok := fields[interval].(map[string]any)
+			if !ok {
+				t.Fatalf("%s record's %s is %T", name, interval, fields[interval])
+			}
+
+			if got := slices.Sorted(maps.Keys(nested)); !slices.Equal(got, slices.Sorted(slices.Values(wantInterval))) {
+				t.Errorf("%s record's %s has keys %v, want %v", name, interval, got, wantInterval)
+			}
+		}
+	}
+
+	// A NUMBER IS A NUMBER AND AN UNKNOWN IS A NULL, never a zero or a string.
+	for field, want := range map[string]any{
+		"vcpu": float64(4), "billed_minutes": float64(3), "minute_weight": float64(2), "weighted_minutes": float64(6),
+	} {
+		if known[field] != want {
+			t.Errorf("known record's %s = %#v, want %#v", field, known[field], want)
+		}
+	}
+	for _, field := range []string{"vcpu", "memory_bytes", "minute_weight", "price_micros_per_hour", "cost_micros"} {
+		if unknown[field] != nil {
+			t.Errorf("unknown record's %s = %#v, want null", field, unknown[field])
+		}
+	}
+
 	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "reference", "usage-export.md"))
 	if err != nil {
 		t.Fatalf("read the record's documentation: %v", err)
 	}
 
-	for field := range fields {
+	for _, field := range append(wantTop, wantInterval...) {
 		if !strings.Contains(string(doc), "`"+field+"`") {
 			t.Errorf("docs/reference/usage-export.md does not name the record's field %q", field)
 		}
 	}
+}
 
-	if len(fields) != 26 {
-		t.Errorf("the record has %d fields; a field added or removed is a change to the format, so "+
-			"update the document, this count and, if a consumer must read it differently, the schema", len(fields))
+// A NUMBER TOO LARGE TO STATE IS UNKNOWN, and never wraps into a negative charge.
+func TestAnOverflowingLeaseIsUnknownNotNegative(t *testing.T) {
+	t.Parallel()
+
+	row := knownUsageRow()
+	row.PriceMicrosPerHour = math.MaxInt64
+
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.CostMicros != nil || r.Unknown["cost_micros"] == "" {
+		t.Errorf("cost = %v, unknown %q; want it stated as too large", r.CostMicros, r.Unknown["cost_micros"])
+	}
+
+	row = knownUsageRow()
+	row.VCPU = math.MaxInt64
+
+	r = newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.MinuteWeight != nil || r.Unknown["minute_weight"] == "" {
+		t.Errorf("weight = %v, unknown %q; a vCPU no machine has weighs nothing", r.MinuteWeight, r.Unknown["minute_weight"])
+	}
+
+	if _, err := json.Marshal(r); err != nil {
+		t.Fatalf("the record does not encode: %v", err)
 	}
 }
 
-// THE EXPORT ONLY REPORTS. Nothing that decides what runs reads a minute weight, so
-// what a billing system counts cannot move what a queue admits.
+// THE EXPORT ONLY REPORTS. Nothing that decides what runs reads a minute weight, and
+// config offers no helper that would let it do so without the name appearing.
 func TestNoSchedulerReadsAMinuteWeight(t *testing.T) {
 	t.Parallel()
 
-	for _, pkg := range []string{"alloc", "server", "nodeplane", "node", "app"} {
+	for _, pkg := range []string{"alloc", "server", "nodeplane", "node", "app", "state", "config"} {
 		dir := filepath.Join("..", "..", pkg)
 
 		entries, err := os.ReadDir(dir)
@@ -522,9 +622,6 @@ func TestNoSchedulerReadsAMinuteWeight(t *testing.T) {
 			}
 
 			path := filepath.Join(dir, e.Name())
-			if _, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly); err != nil {
-				t.Fatalf("parse %s: %v", path, err)
-			}
 
 			body, err := os.ReadFile(path)
 			if err != nil {
@@ -532,6 +629,11 @@ func TestNoSchedulerReadsAMinuteWeight(t *testing.T) {
 			}
 
 			read++
+
+			// The field's declaration and validation, and the type's own file.
+			if pkg == "config" && (e.Name() == "tier.go" || e.Name() == "minuteweight.go") {
+				continue
+			}
 
 			if strings.Contains(string(body), "MinuteWeight") {
 				t.Errorf("%s reads a minute weight; the export reports and feeds nothing back", path)
