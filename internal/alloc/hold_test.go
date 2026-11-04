@@ -880,3 +880,52 @@ func TestAHeldHostSellsTheRoomAboveWhatItsOwnerNeeds(t *testing.T) {
 		t.Errorf("with 64 GiB and an owner of 60, a tier of 8 bought %d, %v", len(got), err)
 	}
 }
+
+// A FLOOR MOVED BY A PURCHASE MUST NOT TAKE WHAT A HOLD KEEPS. Pack puts an unmet floor on the
+// fuller host, so a purchase on the held host can bring it there, and read before the insert
+// the owner's room looked safe. It is read again after.
+func TestAPurchaseThatMovesAFloorOntoAHeldHostIsRefused(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	floor := tier("floor", 4, 16*config.GiB)
+	floor.Provider, floor.Reserved = config.ProviderDocker, 1
+
+	a := holdFleet(t, &now, floor)
+
+	first := startRunning(t, a, "small-a")
+	startRunning(t, a, "small-a")
+	startRunning(t, a, "eight-b")
+
+	if err := a.Release(t.Context(), first.ID, first.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	holds := Purchase{Avoid: map[string]map[string]string{"small-a": {"a": "eight-a"}}}
+
+	got, err := a.EscrowFor(t.Context(), "small-a", 1, holds)
+	if err != nil || len(got) != 0 {
+		t.Errorf("a purchase bringing the floor onto the held host bought %d, %v", len(got), err)
+	}
+
+	// The owner, whose room it was, still fits.
+	if got, err := a.EscrowFor(t.Context(), "eight-a", 1, Purchase{}); err != nil || len(got) != 1 {
+		t.Errorf("the owner bought %d, %v with the room kept", len(got), err)
+	}
+
+	// A TIER BELOW ITS FLOOR IS PROMISED THE ROOM, and that read does not take it back: pinned
+	// to a host held for a shape that does not fit there anyway, it buys.
+	pinnedFloor := tier("pinned-floor", 4, 16*config.GiB)
+	pinnedFloor.Provider, pinnedFloor.Node, pinnedFloor.Reserved = config.ProviderDocker, "a", 1
+
+	promised := holdFleet(t, &now, pinnedFloor)
+
+	for range 3 {
+		startRunning(t, promised, "small-a")
+	}
+
+	got, err = promised.EscrowFor(t.Context(), "pinned-floor", 1,
+		Purchase{Avoid: map[string]map[string]string{"pinned-floor": {"a": "eight-a"}}})
+	if err != nil || len(got) != 1 {
+		t.Errorf("a tier below its floor bought %d, %v on the only host it has", len(got), err)
+	}
+}

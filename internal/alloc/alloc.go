@@ -712,7 +712,13 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 
 		// READ BACK WITH THE LEASES IN THE LEDGER, floors re-placed and all.
 		if len(leases) > 0 {
-			return guardedHaveRoom(ctx, a, tx, guarded, avoid, errWaiterLeftShort)
+			if err := guardedHaveRoom(ctx, a, tx, guarded, avoid, errWaiterLeftShort); err != nil {
+				return err
+			}
+
+			if place != unheld {
+				return a.ownersKeepRoom(ctx, tx, leases, avoid[t.Label])
+			}
 		}
 
 		return nil
@@ -748,6 +754,34 @@ func (a *Allocator) placerAvoiding(ctx context.Context, tx querier, t config.Tie
 	}
 
 	return open, want, nil
+}
+
+// ownersKeepRoom returns errWaiterLeftShort if a purchase landing on a held host left its
+// owner without the room it was keeping, read with the leases in the ledger: an owner is no
+// waiter a purchase protects, and a floor it moved can take that room.
+func (a *Allocator) ownersKeepRoom(ctx context.Context, tx querier, leases []*Lease, holds map[string]string) error {
+	for _, lease := range leases {
+		owner, held := holds[lease.TargetNode]
+		if !held {
+			continue
+		}
+
+		shape, known := a.tiers[owner]
+		if !known {
+			continue
+		}
+
+		_, place, err := a.headroomWithPlacer(ctx, tx, shape)
+		if err != nil {
+			return err
+		}
+
+		if place.roomFor(lease.TargetNode, shape) < 1 {
+			return errWaiterLeftShort
+		}
+	}
+
+	return nil
 }
 
 // guardedHaveRoom returns short unless every tier in guarded could be granted one
