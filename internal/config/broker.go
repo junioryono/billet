@@ -124,8 +124,9 @@ type BrokerInstallation struct {
 	// Target is the GitHub path the deployment's target has: `owner` for an
 	// organization, `owner/name` for a repository, whose tokens reach it alone.
 	Target string `yaml:"target"`
-	// ActionsRead adds `actions: read` for a deployment publishing caches from a
-	// default branch, as `tiers[].cache.publish` needs.
+	// ActionsRead adds `actions: read`, which reads GitHub's job records: without it
+	// every job keeps an unknown queue time, and `tiers[].cache.publish: default-branch`
+	// cannot work at all.
 	ActionsRead bool `yaml:"actions_read,omitempty"`
 }
 

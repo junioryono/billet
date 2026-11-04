@@ -27,6 +27,8 @@ type HistoryJob struct {
 	QueuedAt           time.Time
 	ScaleSetAssignedAt time.Time
 	RunnerAssignedAt   time.Time
+	// FinishedAt is GitHub's time for the job's end. Only a completion gives it.
+	FinishedAt time.Time
 	// RunID is the workflow run of the job that started, which for a pooled
 	// runner may differ from the run its lease was assigned; zero is unknown.
 	// Only a JobStarted gives it.
@@ -73,6 +75,7 @@ func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job H
 			GithubQueuedAt:           stamp(job.QueuedAt),
 			GithubScaleSetAssignedAt: stamp(job.ScaleSetAssignedAt),
 			GithubRunnerAssignedAt:   stamp(job.RunnerAssignedAt),
+			GithubFinishedAt:         stamp(job.FinishedAt),
 			GithubRunID:              max(job.RunID, 0),
 			LeaseID:                  leaseID,
 		}); err != nil {
@@ -126,6 +129,7 @@ type JobRecord struct {
 	GitHubQueuedAt           string
 	GitHubScaleSetAssignedAt string
 	GitHubRunnerAssignedAt   string
+	GitHubFinishedAt         string
 	BoughtAt                 string
 	// DetailRetiredAt is when the job's series, destinations and guest report
 	// were deleted past their retention, empty while they are kept or for a job
@@ -178,7 +182,8 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			ChosenProvider: row.ChosenProvider, InstanceType: row.InstanceType,
 			VCPU: row.Vcpu, Memory: row.Memory, Site: row.Site,
 			GitHubQueuedAt: row.GithubQueuedAt, GitHubScaleSetAssignedAt: row.GithubScaleSetAssignedAt,
-			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, BoughtAt: row.BoughtAt,
+			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, GitHubFinishedAt: row.GithubFinishedAt,
+			BoughtAt:        row.BoughtAt,
 			DetailRetiredAt: row.DetailRetiredAt,
 			GitHubRunID:     row.GithubRunID, DisruptedAt: row.DisruptedAt,
 			Caches: CacheObservation{

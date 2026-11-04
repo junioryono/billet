@@ -83,6 +83,14 @@ func checkBrokerTokens(ctx context.Context, env cli.Env, cfg *config.Config, tar
 	fmt.Fprintf(env.Stdout, "github   verified: the broker issued a token for %s, with exactly the permissions "+
 		"requested for that %s; the broker proves the installation itself, with the key it holds\n", target.Path(), target.Scope())
 
+	// A KEY'S TOKEN CARRIES ALL THE APP HOLDS, AND A BROKER'S ONLY WHAT ITS STANZA GRANTS, so
+	// this can be missing here on an App that has it. Nothing fails without it but the
+	// numbers: PermissionMismatches above has already refused a tier that needs it.
+	if _, ok := token.Permissions()["actions"]; !ok {
+		fmt.Fprintf(env.Stdout, "         WARNING: this token cannot read GitHub's job records, so every job keeps an "+
+			"unknown queue time; add `actions_read: true` to this deployment's stanza in the broker's file\n")
+	}
+
 	return githubVerified, nil
 }
 

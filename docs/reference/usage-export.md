@@ -49,7 +49,8 @@ Times are RFC 3339 on billet's clock, and durations are seconds to the milliseco
 | `ownership` | `owned` for a machine the deployment already had (`docker`, `firecracker`, `tart`), `bought` for one bought for this lease (`ec2`, `codebuild`) |
 | `vcpu`, `memory_bytes` | the shape the lease was charged |
 | `held` | `from` when the lease was bought, `to` when it closed, and `seconds` between: how long it held its capacity, launch and teardown included |
-| `job` | `from` when GitHub started its job, `to` when GitHub reported its result, and `seconds` between |
+| `job` | `from` when GitHub gave the job a runner, `to` when GitHub says it finished, and `seconds` between |
+| `job_clock` | whose times `job` holds. `github`: GitHub's own, from the messages, both ends on one clock. `billet`: GitHub's were not both carried, so these are when billet received the two messages, which can read shorter than the job ran: a real `JobStarted` arrived 46 and 47 s after its job started, and a job of 243 s read as 197 (2026-11-04) |
 | `billed_minutes` | the job's time rounded up to a whole minute per lease, the way GitHub bills a hosted job |
 | `minute_weight` | what one of those minutes counts as, in minutes of a 2 vCPU Linux runner |
 | `weight_source` | `tier` when the tier sets `minute_weight`, `charged_vcpu` when it is the vCPU charged over two |

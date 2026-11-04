@@ -120,14 +120,10 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 		"    installations:\n", path, deployment, fingerprint, deployment, fingerprint)
 
 	for _, target := range cfg.GitHubTargets() {
-		fmt.Fprintf(env.Stdout, "      - {app_id: %d, installation_id: %d, target: %q", target.AppID,
-			target.InstallationID, target.Path())
-
-		if cfg.TargetNeedsRunEvidence(target.Name) {
-			fmt.Fprint(env.Stdout, ", actions_read: true")
-		}
-
-		fmt.Fprintln(env.Stdout, "}")
+		// actions_read ALWAYS, AS `github-app create` DEFAULTS IT: every deployment reads
+		// GitHub's job records for its queue times, and a publishing tier needs them.
+		fmt.Fprintf(env.Stdout, "      - {app_id: %d, installation_id: %d, target: %q, actions_read: true}\n",
+			target.AppID, target.InstallationID, target.Path())
 	}
 
 	return nil
