@@ -447,12 +447,13 @@ func (b *testStatsBuilder) addFailCount(f *flakyTally, seen seenIn) {
 	f.failsByCount[seen.suiteTests] = addSeen(f.failsByCount[seen.suiteTests], seen)
 }
 
-// flakyPair is the evidence that one test failed and passed with nothing changed: a pass
+// flakyPair is the lease that failed, the lease that passed and the evidence that one test
+// failed and passed with nothing changed: a pass
 // kept from another attempt, or a suite of as many tests that reported nothing wrong in
 // another attempt, or both in one job; "" for none. A name covering several legs of a
 // matrix has only the last, since its failure on one leg and pass on another are no
 // evidence.
-func (b *testStatsBuilder) flakyPair(key flakyKey, f *flakyTally) (fail, pass, evidence string) {
+func (b *testStatsBuilder) flakyPair(key flakyKey, f *flakyTally) (string, string, string) {
 	if !b.ambiguous[key.job] {
 		for _, failed := range f.fails {
 			for _, passed := range f.passes {
