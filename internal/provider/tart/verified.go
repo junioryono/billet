@@ -207,11 +207,6 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 		return nil, fmt.Errorf("tart: verify: %q is a local VM, which has no digest", key)
 	}
 
-	netFlags, err := p.netFlags(probeTrust(opts))
-	if err != nil {
-		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
-	}
-
 	hash := hashName(key)
 
 	verification, err := openLockFile(p.verificationLockPath(hash))
@@ -254,6 +249,12 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 	}
 
 	if err := errors.Join(intentErr, cleanErr); err != nil {
+		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+	}
+
+	// AFTER WHAT WAS ASKED IS KEPT, since the refresh tries this again once it has been put right.
+	netFlags, err := p.netFlags(probeTrust(opts))
+	if err != nil {
 		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
 	}
 

@@ -3725,3 +3725,23 @@ func TestACleanupThatFailedStillKeepsWhatWasAsked(t *testing.T) {
 		t.Fatalf("images = %+v, %v", images, err)
 	}
 }
+
+// AN ISOLATION NOT YET CONFIGURED IS PUT RIGHT LATER, and the refresh then tries again from what this
+// kept, on a node whose file names no tier.
+func TestARefusalForIsolationStillKeepsWhatWasAsked(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+
+	opts := verifyOpts()
+	opts.GuestUntrusted = true
+
+	if _, err := p.Verify(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "isolation") {
+		t.Fatalf("Verify = %v", err)
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || len(images) != 1 || !images[0].Wanted || !images[0].Untrusted {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+}
