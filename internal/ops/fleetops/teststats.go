@@ -91,13 +91,14 @@ type testStats struct {
 	Notice string    `json:"notice"`
 	Since  time.Time `json:"since"`
 	// Jobs is how many jobs' results were ranked. Unreadable counts those whose row or
-	// encoding could not be read, and WithoutCommit those GitHub's record has not given
-	// a commit, which only the flaky ranking leaves out. Partial says the bounds stopped
-	// the read: its oldest jobs, or the tests past the bound, are left out.
-	Jobs          int  `json:"jobs"`
-	Unreadable    int  `json:"unreadable"`
-	WithoutCommit int  `json:"without_commit"`
-	Partial       bool `json:"partial"`
+	// encoding could not be read, and WithoutIdentity those with no commit, attempt,
+	// workflow or job name on record, which only the flaky ranking leaves out. Partial
+	// says the bounds stopped the read: its oldest jobs, or the tests past the bound, are
+	// left out.
+	Jobs            int  `json:"jobs"`
+	Unreadable      int  `json:"unreadable"`
+	WithoutIdentity int  `json:"without_identity"`
+	Partial         bool `json:"partial"`
 	// Incomplete counts the jobs whose results left out cases, a suite cut to fit its
 	// bounds, so a test's counts may fall short.
 	Incomplete int           `json:"incomplete"`
@@ -132,11 +133,15 @@ type failingTest struct {
 }
 
 // flakyTest is one test that failed and passed on one commit, in one job of one
-// workflow, so nothing billet can see changed between the two.
+// workflow, so nothing billet can see changed between the two: in two attempts of a
+// run or two runs, since two jobs of one attempt ran side by side and may be two legs
+// of a matrix sharing a display name.
 //
 // Evidence says how the pass is known: "recorded" is a case the agent kept as passed
-// in PassLease; "suite" is the case's suite run there and reporting no failure, error
-// or skip, with its cases cut to fit, so the case is inferred to have passed.
+// in PassLease; "suite" is the case's suite run there, as many tests as where it
+// failed, reporting no failure, error or skip, with its cases cut to fit, so the case
+// is inferred to have passed; "same job" is both in one job, a retry its test runner
+// made or two cases of one name, which the report cannot tell apart.
 type flakyTest struct {
 	Repository  string `json:"repository"`
 	Commit      string `json:"commit"`
@@ -169,6 +174,20 @@ type suiteKey struct {
 	suite string
 }
 
+// jobAttempt is which attempt of which run a job was.
+type jobAttempt struct{ run, attempt int64 }
+
+// seenIn is one job a test was seen in, and how many tests its suite counted there.
+type seenIn struct {
+	lease      string
+	attempt    jobAttempt
+	suiteTests int64
+}
+
+// flakySightings bounds the jobs a test's failures and passes each keep on one commit:
+// enough to find a pair, and a job chooses how many it says it ran.
+const flakySightings = 16
+
 // testTally is what was seen of one test.
 type testTally struct {
 	runs, failures    int64
@@ -180,8 +199,22 @@ type testTally struct {
 
 // flakyTally is what was seen of one test on one commit.
 type flakyTally struct {
-	failures             int64
-	failLease, passLease string
+	failures      int64
+	fails, passes []seenIn
+}
+
+// addSeen keeps one sighting within the bound, one to a job.
+func addSeen(list []seenIn, s seenIn) []seenIn {
+	if len(list) >= flakySightings {
+		return list
+	}
+	for i := range list {
+		if list[i].attempt == s.attempt && list[i].lease == s.lease {
+			return list
+		}
+	}
+
+	return append(list, s)
 }
 
 // testStatsBuilder folds jobs' results, newest job first.
@@ -189,7 +222,7 @@ type testStatsBuilder struct {
 	out        testStats
 	tests      map[testKey]*testTally
 	flaky      map[flakyKey]*flakyTally
-	cleanSuite map[suiteKey]string
+	cleanSuite map[suiteKey]seenIn
 }
 
 // buildTestStats reads the jobs' results a page at a time, so no read holds more than
@@ -198,7 +231,7 @@ func buildTestStats(ctx context.Context, a *alloc.Allocator, repo string, since 
 ) (testStats, error) {
 	b := testStatsBuilder{
 		out:   testStats{Notice: guestBanner, Since: since},
-		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[suiteKey]string{},
+		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[suiteKey]seenIn{},
 	}
 
 	var cursor alloc.TestResultsCursor
@@ -243,25 +276,35 @@ func (b *testStatsBuilder) addJob(rec *alloc.RecordedTestResults) {
 		return
 	}
 	b.out.Jobs++
-	if rec.HeadSHA == "" {
-		b.out.WithoutCommit++
+
+	// AN UNKNOWN IS NOT A VALUE TWO JOBS CAN SHARE: flaky says nothing changed between
+	// two runs, and two jobs of no recorded name are not known to be one job.
+	job := jobKey{repo: rec.Repo, commit: rec.HeadSHA, workflow: rec.WorkflowRef, job: rec.JobName}
+	attempt := jobAttempt{rec.RunID, rec.RunAttempt}
+	identified := job.commit != "" && job.workflow != "" && job.job != "" && job.repo != "" &&
+		attempt.run > 0 && attempt.attempt > 0
+	if !identified {
+		b.out.WithoutIdentity++
 	}
 
-	job := jobKey{repo: rec.Repo, commit: rec.HeadSHA, workflow: rec.WorkflowRef, job: rec.JobName}
 	incomplete := results.Dropped.Suites > 0 || results.Dropped.Cases > 0
 	for i := range results.Suites {
 		s := &results.Suites[i]
 		incomplete = incomplete || !s.Complete
 		// ONLY A LIST THAT WAS CUT can stand for a case it does not name: a Complete
 		// list names every case that ran, so a name it does not hold did not run.
-		if rec.HeadSHA != "" && !s.Complete && s.Tests > 0 && s.Failures == 0 && s.Errors == 0 && s.Skipped == 0 {
+		if identified && !s.Complete && s.Tests > 0 && s.Failures == 0 && s.Errors == 0 && s.Skipped == 0 {
 			key := suiteKey{job, s.Name}
-			if _, seen := b.cleanSuite[key]; !seen && len(b.cleanSuite) < testStatsMaxCases {
-				b.cleanSuite[key] = rec.LeaseID
+			if _, seen := b.cleanSuite[key]; !seen {
+				if len(b.cleanSuite) >= testStatsMaxCases {
+					b.out.Partial = true
+				} else {
+					b.cleanSuite[key] = seenIn{lease: rec.LeaseID, attempt: attempt, suiteTests: s.Tests}
+				}
 			}
 		}
 		for j := range s.Cases {
-			b.addCase(rec, job, s.Name, &s.Cases[j])
+			b.addCase(rec, job, identified, s, &s.Cases[j])
 		}
 	}
 	if incomplete {
@@ -271,8 +314,10 @@ func (b *testStatsBuilder) addJob(rec *alloc.RecordedTestResults) {
 
 // addCase folds one case, the newest of its test first because jobs arrive newest
 // first.
-func (b *testStatsBuilder) addCase(rec *alloc.RecordedTestResults, job jobKey, suite string, c *guestreport.CaseResult) {
-	key := testKey{rec.Repo, suite, c.Name}
+func (b *testStatsBuilder) addCase(rec *alloc.RecordedTestResults, job jobKey, identified bool,
+	suite *guestreport.SuiteCases, c *guestreport.CaseResult,
+) {
+	key := testKey{rec.Repo, suite.Name, c.Name}
 	t := b.tests[key]
 	if t == nil {
 		if len(b.tests) >= testStatsMaxCases {
@@ -302,10 +347,10 @@ func (b *testStatsBuilder) addCase(rec *alloc.RecordedTestResults, job jobKey, s
 		}
 	}
 
-	if rec.HeadSHA == "" || (!c.Failing() && c.Status != guestreport.CasePassed) {
+	if !identified || (!c.Failing() && c.Status != guestreport.CasePassed) {
 		return
 	}
-	fk := flakyKey{job, suite, c.Name}
+	fk := flakyKey{job, suite.Name, c.Name}
 	f := b.flaky[fk]
 	if f == nil {
 		if len(b.flaky) >= testStatsMaxCases {
@@ -316,17 +361,42 @@ func (b *testStatsBuilder) addCase(rec *alloc.RecordedTestResults, job jobKey, s
 		f = &flakyTally{}
 		b.flaky[fk] = f
 	}
+	seen := seenIn{lease: rec.LeaseID, attempt: jobAttempt{rec.RunID, rec.RunAttempt}, suiteTests: suite.Tests}
 	if c.Failing() {
 		f.failures++
-		if f.failLease == "" {
-			f.failLease = rec.LeaseID
-		}
+		f.fails = addSeen(f.fails, seen)
 
 		return
 	}
-	if f.passLease == "" {
-		f.passLease = rec.LeaseID
+	f.passes = addSeen(f.passes, seen)
+}
+
+// flakyPair is the evidence a tally holds that one test failed and passed with nothing
+// changed: a pass kept from another attempt, or a suite of as many tests that reported
+// nothing wrong in another attempt, or both in one job; "" for none. A failure and a
+// pass in two jobs of one attempt are no evidence.
+func flakyPair(f *flakyTally, clean seenIn, haveClean bool) (fail, pass, evidence string) {
+	for _, failed := range f.fails {
+		for _, passed := range f.passes {
+			if failed.attempt != passed.attempt {
+				return failed.lease, passed.lease, "recorded"
+			}
+		}
 	}
+	for _, failed := range f.fails {
+		if haveClean && failed.attempt != clean.attempt && failed.suiteTests == clean.suiteTests {
+			return failed.lease, clean.lease, "suite"
+		}
+	}
+	for _, failed := range f.fails {
+		for _, passed := range f.passes {
+			if failed.lease == passed.lease {
+				return failed.lease, passed.lease, "same job"
+			}
+		}
+	}
+
+	return "", "", ""
 }
 
 // rank fills the three rankings, each with a total order so one ledger always prints
@@ -374,17 +444,14 @@ func (b *testStatsBuilder) rank(limit int) {
 		if f.failures == 0 {
 			continue
 		}
-		pass, evidence := f.passLease, "recorded"
-		if pass == "" {
-			clean, ok := b.cleanSuite[suiteKey{key.job, key.suite}]
-			if !ok || clean == f.failLease {
-				continue
-			}
-			pass, evidence = clean, "suite"
+		clean, haveClean := b.cleanSuite[suiteKey{key.job, key.suite}]
+		fail, pass, evidence := flakyPair(f, clean, haveClean)
+		if evidence == "" {
+			continue
 		}
 		flaky = append(flaky, flakyTest{Repository: key.job.repo, Commit: key.job.commit,
 			WorkflowRef: key.job.workflow, Job: key.job.job, Suite: key.suite, Test: key.name,
-			Failures: f.failures, FailLease: f.failLease, PassLease: pass, Evidence: evidence})
+			Failures: f.failures, FailLease: fail, PassLease: pass, Evidence: evidence})
 	}
 	slices.SortFunc(flaky, func(a, c flakyTest) int {
 		return cmp.Or(cmp.Compare(c.Failures, a.Failures), byTest(testKey{a.Repository, a.Suite, a.Test},
@@ -441,18 +508,22 @@ func renderTestStats(w io.Writer, r testStats) {
 	}
 
 	fmt.Fprintln(w, "\nflaky (failed and passed on one commit, in one job of one workflow)")
-	if r.WithoutCommit > 0 {
-		fmt.Fprintf(w, "  %d jobs are left out of this ranking: GitHub's record has not given their commit "+
-			"(it needs the App's actions: read, and is read for a day after a job starts)\n", r.WithoutCommit)
+	if r.WithoutIdentity > 0 {
+		fmt.Fprintf(w, "  %d jobs are left out of this ranking, with no commit, attempt, workflow or job name on record "+
+			"(the commit comes from GitHub's record of the run, which needs the App's actions: read and is read "+
+			"for a day after a job starts)\n", r.WithoutIdentity)
 	}
 	if len(r.Flaky) == 0 {
 		fmt.Fprintln(w, "  none seen")
 	}
 	for _, t := range r.Flaky {
 		pass := "passed in lease " + t.PassLease
-		if t.Evidence == "suite" {
+		switch t.Evidence {
+		case "suite":
 			pass = "inferred passed in lease " + t.PassLease + ": its suite reported no failure, error or skip, " +
 				"with its cases cut to fit"
+		case "same job":
+			pass = "and passed in that job: a retry its test runner made, or two cases of one name"
 		}
 		fmt.Fprintf(w, "  %d failed  %s %s %s  commit %s, job %s of %s\n    failed in lease %s, %s\n", t.Failures,
 			strconv.Quote(t.Repository), strconv.Quote(t.Suite), strconv.Quote(t.Test), strconv.Quote(shortCommit(t.Commit)),

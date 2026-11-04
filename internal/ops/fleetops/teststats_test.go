@@ -23,8 +23,15 @@ func aJobRow(t *testing.T, lease, commit string, suites ...guestreport.SuiteCase
 		t.Fatalf("EncodeTestResults: %v", err)
 	}
 
+	// AN ATTEMPT OF ITS OWN FOR EACH LEASE, as re-runs of one run have.
+	attempt := int64(1)
+	for _, c := range lease {
+		attempt = attempt*31 + int64(c)
+	}
+
 	return &alloc.RecordedTestResults{LeaseID: lease, Codec: guestreport.Codec, Data: data, Repo: "acme/api",
-		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", JobName: "test", HeadSHA: commit}
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", JobName: "test", HeadSHA: commit,
+		RunID: 7, RunAttempt: attempt}
 }
 
 // aWholeSuite is a suite whose list names every case it counted.
@@ -56,7 +63,7 @@ func failed(name, message string) guestreport.CaseResult {
 func statsOf(jobs ...*alloc.RecordedTestResults) testStats {
 	b := testStatsBuilder{
 		out:   testStats{Notice: guestBanner},
-		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[suiteKey]string{},
+		tests: map[testKey]*testTally{}, flaky: map[flakyKey]*flakyTally{}, cleanSuite: map[suiteKey]seenIn{},
 	}
 	for _, job := range jobs {
 		b.addJob(job)
@@ -143,8 +150,8 @@ func TestAJobWithNoCommitIsNotFlakyAndIsCounted(t *testing.T) {
 		aJobRow(t, "l1", "", aWholeSuite(passed("T", 1))),
 	)
 
-	if len(got.Flaky) != 0 || got.WithoutCommit != 2 {
-		t.Errorf("flaky %+v, %d without a commit; want none and 2", got.Flaky, got.WithoutCommit)
+	if len(got.Flaky) != 0 || got.WithoutIdentity != 2 {
+		t.Errorf("flaky %+v, %d without a commit; want none and 2", got.Flaky, got.WithoutIdentity)
 	}
 	if len(got.Failing) != 1 || len(got.Slowest) != 1 {
 		t.Errorf("the other rankings are %+v and %+v, want the job in both", got.Failing, got.Slowest)
@@ -163,9 +170,12 @@ func TestAJobWithNoCommitIsNotFlakyAndIsCounted(t *testing.T) {
 func TestAPassCutToFitIsInferredAndSaidToBe(t *testing.T) {
 	t.Parallel()
 
+	failing := aWholeSuite(failed("T", "m"))
+	failing.Tests, failing.Complete = 100, false
 	cut := guestreport.SuiteCases{Name: "pkg", Tests: 100}
 	whole := aWholeSuite(passed("Different", 1))
 	skipping := guestreport.SuiteCases{Name: "pkg", Tests: 100, Skipped: 1}
+	smaller := guestreport.SuiteCases{Name: "pkg", Tests: 7}
 
 	for name, tc := range map[string]struct {
 		clean guestreport.SuiteCases
@@ -174,9 +184,11 @@ func TestAPassCutToFitIsInferredAndSaidToBe(t *testing.T) {
 		"a cut list":              {cut, true},
 		"a whole list without it": {whole, false},
 		"a cut list with a skip":  {skipping, false},
+		// A RUN THAT STOPPED EARLY RAN ANOTHER SET OF TESTS, and says nothing of this one.
+		"a cut list of another size": {smaller, false},
 	} {
 		got := statsOf(
-			aJobRow(t, "l2", "same", aWholeSuite(failed("T", "m"))),
+			aJobRow(t, "l2", "same", failing),
 			aJobRow(t, "l1", "same", tc.clean),
 		)
 		if (len(got.Flaky) == 1) != tc.want {
@@ -202,8 +214,44 @@ func TestAPassAndAFailInOneJobIsFlaky(t *testing.T) {
 	t.Parallel()
 
 	got := statsOf(aJobRow(t, "l1", "same", aWholeSuite(failed("T", "m"), passed("T", 1))))
-	if len(got.Flaky) != 1 || got.Flaky[0].FailLease != "l1" || got.Flaky[0].PassLease != "l1" {
-		t.Errorf("flaky are %+v", got.Flaky)
+	if len(got.Flaky) != 1 || got.Flaky[0].FailLease != "l1" || got.Flaky[0].PassLease != "l1" ||
+		got.Flaky[0].Evidence != "same job" {
+		t.Fatalf("flaky are %+v", got.Flaky)
+	}
+
+	var out bytes.Buffer
+	renderTestStats(&out, got)
+	if !strings.Contains(out.String(), "a retry its test runner made, or two cases of one name") {
+		t.Errorf("the report does not say what it cannot tell apart:\n%s", out.String())
+	}
+}
+
+// TWO JOBS OF ONE ATTEMPT RAN SIDE BY SIDE, so a failure in one and a pass in the other
+// is two legs of a matrix sharing a display name, not a flaky test. Another attempt of
+// that run is, and so is another run.
+func TestTwoJobsOfOneAttemptAreNotFlaky(t *testing.T) {
+	t.Parallel()
+
+	row := func(lease string, run, attempt int64, c guestreport.CaseResult) *alloc.RecordedTestResults {
+		r := aJobRow(t, lease, "same", aWholeSuite(c))
+		r.RunID, r.RunAttempt = run, attempt
+
+		return r
+	}
+
+	if got := statsOf(row("l2", 7, 1, failed("T", "m")), row("l1", 7, 1, passed("T", 1))); len(got.Flaky) != 0 {
+		t.Errorf("two legs of one attempt are flaky: %+v", got.Flaky)
+	}
+	if got := statsOf(row("l2", 7, 2, failed("T", "m")), row("l1", 7, 1, passed("T", 1))); len(got.Flaky) != 1 {
+		t.Errorf("a re-run is not flaky: %+v", got.Flaky)
+	}
+	if got := statsOf(row("l2", 8, 1, failed("T", "m")), row("l1", 7, 1, passed("T", 1))); len(got.Flaky) != 1 {
+		t.Errorf("another run of the commit is not flaky: %+v", got.Flaky)
+	}
+	// AND A JOB WITH NO ATTEMPT ON RECORD IS LEFT OUT, not one attempt with the rest.
+	got := statsOf(row("l2", 7, 0, failed("T", "m")), row("l1", 7, 0, passed("T", 1)))
+	if len(got.Flaky) != 0 || got.WithoutIdentity != 2 {
+		t.Errorf("no attempt on record: flaky %+v, %d without identity", got.Flaky, got.WithoutIdentity)
 	}
 }
 
@@ -291,7 +339,8 @@ func TestTestsStatsReadsTheLedger(t *testing.T) {
 
 		return seedJob(t, stateDir, jobSeed{requestID: request, tests: data,
 			job: &alloc.HistoryJob{JobID: strconv.FormatInt(request, 10), Owner: "acme", Repository: "api",
-				WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", Name: "test", HeadSHA: commit}})
+				WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", Name: "test", HeadSHA: commit,
+				RunAttempt: request}})
 	}
 	failing := seed(1, "same", failed("Flaky", "wanted 1"))
 	passing := seed(2, "same", passed("Flaky", 40))
@@ -370,5 +419,45 @@ func TestJobsShowPrintsAJobsTestCases(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "no test cases recorded") {
 		t.Errorf("a job with no row does not say so:\n%s", out.String())
+	}
+}
+
+// AN UNKNOWN NAME IS NOT A NAME TWO JOBS SHARE: two jobs of no recorded workflow or job
+// are not known to be one job, so a pass in one and a failure in the other is not flaky.
+func TestAJobWithNoNameIsNotFlaky(t *testing.T) {
+	t.Parallel()
+
+	for name, clear := range map[string]func(*alloc.RecordedTestResults){
+		"no job name": func(r *alloc.RecordedTestResults) { r.JobName = "" },
+		"no workflow": func(r *alloc.RecordedTestResults) { r.WorkflowRef = "" },
+		"no repo":     func(r *alloc.RecordedTestResults) { r.Repo = "" },
+	} {
+		failing, passing := aJobRow(t, "l2", "same", aWholeSuite(failed("T", "m"))),
+			aJobRow(t, "l1", "same", aWholeSuite(passed("T", 1)))
+		clear(failing)
+		clear(passing)
+
+		got := statsOf(failing, passing)
+		if len(got.Flaky) != 0 || got.WithoutIdentity != 2 {
+			t.Errorf("%s: flaky %+v, %d without identity; want none and 2", name, got.Flaky, got.WithoutIdentity)
+		}
+	}
+}
+
+// WHAT THE AGENT LEFT OUT MAKES A JOB INCOMPLETE, though every suite it sent is whole.
+func TestAJobMissingSuitesIsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	_, data, err := guestreport.EncodeTestResults(guestreport.TestResults{
+		Suites:  []guestreport.SuiteCases{aWholeSuite(passed("T", 1))},
+		Dropped: guestreport.DroppedCases{Suites: 1, Cases: 3},
+	}, guestreport.MaxTestResultsBytes)
+	if err != nil {
+		t.Fatalf("EncodeTestResults: %v", err)
+	}
+
+	got := statsOf(&alloc.RecordedTestResults{LeaseID: "l1", Codec: guestreport.Codec, Data: data})
+	if got.Incomplete != 1 {
+		t.Errorf("%d jobs read as incomplete, want the one that lost a suite", got.Incomplete)
 	}
 }

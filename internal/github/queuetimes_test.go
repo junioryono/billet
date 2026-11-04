@@ -106,7 +106,7 @@ func TestARunsJobsNameTheirCommit(t *testing.T) {
 	c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
 		fmt.Fprint(w, `{"total_count":3,"jobs":[
 			{"id":1,"runner_name":"billet-a","created_at":"2026-10-18T21:37:09Z",
-			 "head_sha":"20f462ad39fee8e29587ae6a2a317c68992469ae","head_branch":"main"},
+			 "head_sha":"20f462ad39fee8e29587ae6a2a317c68992469ae","head_branch":"main","run_attempt":2},
 			{"id":2,"runner_name":"billet-b","created_at":"2026-10-18T21:37:09Z",
 			 "head_sha":"abc","head_branch":null},
 			{"id":3,"runner_name":"billet-c","created_at":"2026-10-18T21:37:09Z"}]}`)
@@ -118,12 +118,13 @@ func TestARunsJobsNameTheirCommit(t *testing.T) {
 	}
 	queued := time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC)
 	for name, want := range map[string]RunJob{
-		"billet-a": {QueuedAt: queued, HeadSHA: "20f462ad39fee8e29587ae6a2a317c68992469ae", HeadBranch: "main"},
+		"billet-a": {QueuedAt: queued, HeadSHA: "20f462ad39fee8e29587ae6a2a317c68992469ae", HeadBranch: "main", RunAttempt: 2},
 		"billet-b": {QueuedAt: queued, HeadSHA: "abc"},
 		"billet-c": {QueuedAt: queued},
 	} {
 		got := jobs[name]
-		if !got.QueuedAt.Equal(want.QueuedAt) || got.HeadSHA != want.HeadSHA || got.HeadBranch != want.HeadBranch {
+		if !got.QueuedAt.Equal(want.QueuedAt) || got.HeadSHA != want.HeadSHA || got.HeadBranch != want.HeadBranch ||
+			got.RunAttempt != want.RunAttempt {
 			t.Errorf("%s = %+v, want %+v", name, got, want)
 		}
 	}

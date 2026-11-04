@@ -246,12 +246,10 @@ func TestRetiringAJobsDetailLeavesItsTestResults(t *testing.T) {
 	now := time.Now().UTC()
 	a := retentionFleet(t, &now)
 
-	lease := detailedJob(t, a, detail{usageAt: now, guestAt: now, finished: false})
+	lease := detailedJob(t, a, detail{usageAt: now})
 	if err := a.RecordGuestReport(t.Context(), lease.ID, lease.Epoch, aReportWithTests(1)); err != nil {
 		t.Fatalf("RecordGuestReport: %v", err)
 	}
-
-	// The guest report row is already there, so the tests' own row is what this adds.
 	if _, err := a.LeaseTestResults(t.Context(), lease.ID); err != nil {
 		t.Fatalf("LeaseTestResults: %v", err)
 	}
@@ -268,5 +266,38 @@ func TestRetiringAJobsDetailLeavesItsTestResults(t *testing.T) {
 	}
 	if _, err := a.LeaseTestResults(t.Context(), lease.ID); err != nil {
 		t.Errorf("after the retirement the test results read %v", err)
+	}
+}
+
+// AN IGNORED REPORT SUPPLIES NOTHING. A first report without tests is the report, so a
+// retry cannot add results to it; and a retry after a retention deleted the results
+// cannot bring them back with a fresh time.
+func TestAnIgnoredReportSuppliesNoTestResults(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+
+	without := busyLease(t, a)
+	if err := a.RecordGuestReport(t.Context(), without.ID, without.Epoch, aGuestReport()); err != nil {
+		t.Fatalf("RecordGuestReport: %v", err)
+	}
+	if err := a.RecordGuestReport(t.Context(), without.ID, without.Epoch, aReportWithTests(1)); err != nil {
+		t.Fatalf("RecordGuestReport (retry): %v", err)
+	}
+	if _, err := a.LeaseTestResults(t.Context(), without.ID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("a retry added test results to the report that was kept: %v", err)
+	}
+
+	with := busyLease(t, a)
+	if err := a.RecordGuestReport(t.Context(), with.ID, with.Epoch, aReportWithTests(1)); err != nil {
+		t.Fatalf("RecordGuestReport: %v", err)
+	}
+	if _, err := a.DeleteTestResults(t.Context(), []string{with.ID}); err != nil {
+		t.Fatalf("DeleteTestResults: %v", err)
+	}
+	if err := a.RecordGuestReport(t.Context(), with.ID, with.Epoch, aReportWithTests(1)); err != nil {
+		t.Fatalf("RecordGuestReport (retry): %v", err)
+	}
+	if _, err := a.LeaseTestResults(t.Context(), with.ID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("a retry brought back test results a retention deleted: %v", err)
 	}
 }

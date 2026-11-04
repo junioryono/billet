@@ -26,7 +26,8 @@ SELECT lease_id, recorded_at, codec, encoded_bytes, data
 SELECT t.lease_id, t.recorded_at, t.codec, t.data, h.tier, COALESCE(h.repo, '') AS repo,
        h.workflow_ref, h.job_name, h.head_sha, h.head_branch, COALESCE(h.result, '') AS result,
        CAST(CASE WHEN h.github_run_id > 0 THEN h.github_run_id ELSE COALESCE(h.run_id, 0) END
-            AS BIGINT) AS run_id
+            AS BIGINT) AS run_id,
+       h.run_attempt
   FROM job_test_results t
   JOIN job_history h ON h.lease_id = t.lease_id
  WHERE t.recorded_at >= CAST(@since AS TEXT)

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -79,9 +80,15 @@ func ParseSpan(s string) (time.Duration, error) {
 	var d time.Duration
 
 	if days, ok := strings.CutSuffix(s, "d"); ok {
-		n, err := strconv.ParseInt(days, 10, 32)
+		n, err := strconv.ParseInt(days, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("%q is not a number of days such as 14d", s)
+		}
+
+		// CHECKED BEFORE THE MULTIPLICATION, whose overflow can land on a positive
+		// span that is nothing the operator asked for, from either direction.
+		if n <= 0 || n > int64(math.MaxInt64/(24*time.Hour)) {
+			return 0, fmt.Errorf("%q is not a positive span a duration can hold", s)
 		}
 
 		d = time.Duration(n) * 24 * time.Hour

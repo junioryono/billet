@@ -33,10 +33,15 @@ import (
 // exitBudget bounds the agent's return after SIGTERM whatever it is doing, a read
 // that never returns included, and settleWait is how long the final flush waits
 // for the answer to a request it cancelled.
+//
+// casesBudget is when, from the request for the final flush, fitting the job's test
+// cases gives up on them: what is left of finalBudget is for the batch without them,
+// so a job of many cases costs its cases and never its suite counts.
 const (
 	finalBudget = 2750 * time.Millisecond
 	exitBudget  = 2900 * time.Millisecond
 	settleWait  = 250 * time.Millisecond
+	casesBudget = 2400 * time.Millisecond
 )
 
 // flushAnswerWait is how long a connection to the socket waits for the final
@@ -216,6 +221,8 @@ func (a *agent) serve(ctx context.Context, socket string) {
 type outgoing struct {
 	seq  uint64
 	body []byte
+	// batch is what body encodes, for the one resend of a final batch without its cases.
+	batch guestreport.Batch
 }
 
 // result is an answer from the node: to a hello, or to the batch in flight.
@@ -303,7 +310,7 @@ func (a *agent) contact(ctx context.Context) (time.Time, bool) {
 	}
 
 	if a.head == nil {
-		b, ok := a.cut(nil, nil)
+		b, ok := a.cut(nil, junitCases{}, time.Time{})
 		if !ok {
 			cancel()
 
@@ -385,7 +392,7 @@ func (a *agent) period() time.Duration {
 // that cannot be encoded is dropped and its number spent, so the node sees the gap. No
 // batch is cut while the agent's own CPU has never been read, because a batch must
 // carry it and a zero would be a claim: what is held waits for the next try.
-func (a *agent) cut(tests []guestreport.SuiteResult, cases []guestreport.SuiteCases) (outgoing, bool) {
+func (a *agent) cut(tests []guestreport.SuiteResult, cases junitCases, casesBy time.Time) (outgoing, bool) {
 	a.col.readAgentCPU()
 
 	if !a.col.haveAgentCPU {
@@ -406,17 +413,18 @@ func (a *agent) cut(tests []guestreport.SuiteResult, cases []guestreport.SuiteCa
 		Processes:      processes,
 		Steps:          a.steps.take(),
 		Tests:          tests,
-		Cases:          cases,
+		Cases:          cases.suites,
+		CasesDropped:   cases.dropped,
 	}
 
-	body, err := fit(&b, a.lim.maxBody)
+	body, err := fit(&b, a.lim.maxBody, casesBy)
 	if err != nil {
 		a.log.always("batch %d was dropped, as it could not be encoded within %d bytes: %v", a.seq, a.lim.maxBody, err)
 
 		return outgoing{}, false
 	}
 
-	return outgoing{seq: a.seq, body: body}, true
+	return outgoing{seq: a.seq, body: body, batch: b}, true
 }
 
 // final takes a last reading, searches for test results, and sends the final
@@ -456,15 +464,29 @@ func (a *agent) final(ctx context.Context) {
 	// ONLY TO A NODE THAT SAID IT KNOWS THEM: one that does not refuses the whole
 	// batch, the job's suite counts with it.
 	if !a.lim.cases {
-		cases = nil
+		cases = junitCases{}
 	}
 
-	b, ok := a.cut(tests, cases)
+	b, ok := a.cut(tests, cases, start.Add(casesBudget))
 	if !ok {
 		return
 	}
 
-	if v, _ := a.node.report(fctx, b.body, true); v != accepted {
+	v, _ := a.node.report(fctx, b.body, true)
+
+	// A NODE THAT REFUSES THE BATCH MAY REFUSE ONLY ITS CASES: its budget for this job
+	// is nearly spent and the cases made the batch large, or it was rolled back since
+	// the hello to one that does not know them. Once more without them, so the suite
+	// counts a report shows are not lost with them.
+	if (v == refused || v == stop) && len(b.batch.Cases) > 0 {
+		dropCases(&b.batch)
+
+		if body, err := fit(&b.batch, a.lim.maxBody, time.Time{}); err == nil {
+			v, _ = a.node.report(fctx, body, true)
+		}
+	}
+
+	if v != accepted {
 		a.log.always("the node did not accept the final batch")
 	}
 }
@@ -492,10 +514,15 @@ func (a *agent) settle() bool {
 }
 
 // fit encodes b within limit bytes. Only test results give way: the cases first, as
-// guestreport.ShedCases gives them up, then the failed names are halved and the
-// lowest-ranked suites dropped, until it fits.
-func fit(b *guestreport.Batch, limit int) ([]byte, error) {
+// guestreport.ShedCases gives them up and all at once past casesBy, then the failed
+// names are halved and the lowest-ranked suites dropped, until it fits. A zero casesBy
+// is no deadline. What it gives up of the cases is counted in b.
+func fit(b *guestreport.Batch, limit int, casesBy time.Time) ([]byte, error) {
 	for {
+		if !casesBy.IsZero() && len(b.Cases) > 0 && !time.Now().Before(casesBy) {
+			dropCases(b)
+		}
+
 		data, err := guestreport.EncodeBatch(*b)
 		if err == nil && len(data) <= limit {
 			return data, nil
@@ -505,10 +532,25 @@ func fit(b *guestreport.Batch, limit int) ([]byte, error) {
 			return nil, err
 		}
 
-		if !guestreport.ShedCases(&b.Cases) && !shrinkTests(b) {
+		suites, cases := len(b.Cases), guestreport.CountCases(b.Cases)
+		if guestreport.ShedCases(&b.Cases) {
+			b.CasesDropped.Suites += int64(suites - len(b.Cases))
+			b.CasesDropped.Cases += int64(cases - guestreport.CountCases(b.Cases))
+
+			continue
+		}
+
+		if !shrinkTests(b) {
 			return nil, errors.New("larger than the node takes")
 		}
 	}
+}
+
+// dropCases gives up every case b holds, counted, for the batch without them.
+func dropCases(b *guestreport.Batch) {
+	b.CasesDropped.Suites += int64(len(b.Cases))
+	b.CasesDropped.Cases += int64(guestreport.CountCases(b.Cases))
+	b.Cases = nil
 }
 
 // shrinkTests halves every suite's failed names, or, when there are none, drops

@@ -17,7 +17,7 @@ func TestASpanIsDaysOrADuration(t *testing.T) {
 			t.Errorf("%q = %s, %v; want %s", text, got, err, want)
 		}
 	}
-	for _, text := range []string{"", "soon", "d", "1.5d", "-1d", "0d", "0s", "-3h", "99999999999d"} {
+	for _, text := range []string{"", "soon", "d", "1.5d", "-1d", "0d", "0s", "-3h", "99999999999d", "106752d", "-106752d", "999999999999999999999d"} {
 		if got, err := ParseSpan(text); err == nil {
 			t.Errorf("%q = %s, want refused", text, got)
 		}

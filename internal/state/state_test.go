@@ -1158,6 +1158,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`DROP TABLE job_test_results`,
 			`ALTER TABLE job_history DROP COLUMN head_sha`,
 			`ALTER TABLE job_history DROP COLUMN head_branch`,
+			`ALTER TABLE job_history DROP COLUMN run_attempt`,
 			`DROP TABLE job_guest_reports`,
 			`DROP TABLE job_destinations`,
 			`DROP TABLE job_usage`,

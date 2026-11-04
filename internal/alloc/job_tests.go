@@ -31,6 +31,7 @@ type RecordedTestResults struct {
 	HeadBranch  string
 	Result      string
 	RunID       int64
+	RunAttempt  int64
 	// Cursor is where the page after this row begins.
 	Cursor TestResultsCursor
 }
@@ -90,7 +91,8 @@ func (a *Allocator) TestResultsSince(ctx context.Context, since time.Time, repos
 			rec := RecordedTestResults{LeaseID: r.LeaseID, RecordedAt: r.RecordedAt, Codec: int(r.Codec),
 				Tier: r.Tier, Repo: r.Repo, WorkflowRef: r.WorkflowRef, JobName: r.JobName,
 				HeadSHA: r.HeadSha, HeadBranch: r.HeadBranch, Result: r.Result, RunID: r.RunID,
-				Cursor: TestResultsCursor{recordedAt: r.RecordedAt, leaseID: r.LeaseID}}
+				RunAttempt: r.RunAttempt,
+				Cursor:     TestResultsCursor{recordedAt: r.RecordedAt, leaseID: r.LeaseID}}
 			if rec.Data, err = base64.StdEncoding.DecodeString(r.Data); err != nil {
 				rec.Data, rec.Unreadable = nil, true
 			}

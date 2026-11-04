@@ -13,6 +13,10 @@ ALTER TABLE job_history ADD COLUMN head_branch text NOT NULL DEFAULT '';
 -- +billet:end
 
 -- +billet:statement
+ALTER TABLE job_history ADD COLUMN run_attempt bigint NOT NULL DEFAULT 0 CHECK (run_attempt >= 0);
+-- +billet:end
+
+-- +billet:statement
 CREATE TABLE job_test_results (
     lease_id text PRIMARY KEY NOT NULL,
     recorded_at text NOT NULL,

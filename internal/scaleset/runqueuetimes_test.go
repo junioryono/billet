@@ -22,7 +22,7 @@ func (q queueTimesPolicy) RunJobs(context.Context, string, string, int64) (map[s
 		return nil, q.err
 	}
 
-	return map[string]billetgithub.RunJob{"billet-a": {QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main"}}, nil
+	return map[string]billetgithub.RunJob{"billet-a": {QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main", RunAttempt: 3}}, nil
 }
 
 // GITHUB'S THROTTLE AND ITS REFUSAL REACH THE SWEEP AS THE SERVER'S OWN
@@ -59,7 +59,7 @@ func TestAQueueTimeReadsRefusalIsTheServersSentinel(t *testing.T) {
 	}
 
 	jobs, err := (&Client{policy: queueTimesPolicy{}}).RunJobs(t.Context(), "acme", "api", 31)
-	want := server.RunJob{QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main"}
+	want := server.RunJob{QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main", RunAttempt: 3}
 	if err != nil || len(jobs) != 1 || jobs["billet-a"] != want {
 		t.Errorf("a read GitHub answered = %v, %v, want billet-a's whole record", jobs, err)
 	}

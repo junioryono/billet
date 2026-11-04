@@ -22,24 +22,30 @@ func TestTheControlPlaneRunsTheTestResultsRetention(t *testing.T) {
 		t.Fatalf("parse server.go: %v", err)
 	}
 	started := false
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
+	for _, d := range file.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "Run" || fd.Recv == nil {
+			continue
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "Background" {
-			return true
-		}
-		for _, arg := range call.Args {
-			if s, ok := arg.(*ast.SelectorExpr); ok && s.Sel.Name == "retireTestResults" {
-				started = true
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
 			}
-		}
-		return true
-	})
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Background" {
+				return true
+			}
+			for _, arg := range call.Args {
+				if s, ok := arg.(*ast.SelectorExpr); ok && s.Sel.Name == "retireTestResults" {
+					started = true
+				}
+			}
+			return true
+		})
+	}
 	if !started {
-		t.Error("server.go starts no background loop running retireTestResults")
+		t.Error("(*Server).Run starts no background loop running retireTestResults")
 	}
 }
 

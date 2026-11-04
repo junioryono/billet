@@ -20,6 +20,9 @@ type Batch struct {
 	// SchemaCases. They never join a Report: TestResultsOf gathers them for the
 	// ledger's own row, which outlives the report.
 	Cases []SuiteCases `json:"cases,omitempty"`
+	// CasesDropped counts what the agent left out of Cases before it sent them, past
+	// a batch's bounds: without it a job that lost whole suites reads as complete.
+	CasesDropped DroppedCases `json:"cases_dropped,omitzero"`
 }
 
 // Sample is the guest's totals at one instant, every SampleInterval. Every field but

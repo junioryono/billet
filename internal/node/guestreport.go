@@ -439,7 +439,6 @@ func (s *CacheService) encodeGuestReport(ctx context.Context, report *alloc.Gues
 		decoded = append(decoded, b)
 	}
 
-	// BEFORE THE MERGE, whose refusal costs the guest's report and not its tests.
 	s.encodeGuestTests(report, decoded)
 
 	merged, err := guestreport.Merge(decoded)

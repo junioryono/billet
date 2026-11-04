@@ -19,7 +19,8 @@ import (
 // FENCED ON THE EPOCH, in the same transaction, as RecordLeaseUsage is: a
 // superseded holder cannot report, and a lease that has ended is refused
 // (ErrLeaseNotFound), because the node reports before it destroys the compute.
-// The first report is kept and a later one is ignored.
+// The first report is kept and a later one is ignored, its test results with it: a
+// retry must not bring back results a retention deleted, nor add to what was kept.
 func (a *Allocator) RecordGuestReport(ctx context.Context, leaseID string, epoch int64,
 	report GuestReport,
 ) error {
@@ -32,7 +33,7 @@ func (a *Allocator) RecordGuestReport(ctx context.Context, leaseID string, epoch
 		if err != nil {
 			return err
 		}
-		if _, err := state.WriteQueries(tx).RecordJobGuestReport(ctx, ledgerdb.RecordJobGuestReportParams{
+		kept, err := state.WriteQueries(tx).RecordJobGuestReport(ctx, ledgerdb.RecordJobGuestReportParams{
 			LeaseID: lease.ID, Node: lease.Node, RecordedAt: nowStamp(),
 			AgentVersion: report.AgentVersion, AgentSchema: int64(report.Schema),
 			Codec: int64(report.Codec), Data: base64.StdEncoding.EncodeToString(report.Data),
@@ -40,10 +41,11 @@ func (a *Allocator) RecordGuestReport(ctx context.Context, leaseID string, epoch
 			Hello: flag(report.Hello), FinalSeen: flag(report.FinalSeen),
 			NodeRestarted:   flag(report.NodeRestarted),
 			FirstReceivedAt: arrival(report.FirstReceived), LastReceivedAt: arrival(report.LastReceived),
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("alloc: record the guest report of lease %s: %w", leaseID, err)
 		}
-		if len(report.Tests) == 0 {
+		if kept == 0 || len(report.Tests) == 0 {
 			return nil
 		}
 		data := base64.StdEncoding.EncodeToString(report.Tests)

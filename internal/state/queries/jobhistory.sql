@@ -69,7 +69,8 @@ UPDATE job_history
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST(@github_run_id AS BIGINT)
                             ELSE github_run_id END,
        head_sha    = CASE WHEN head_sha = '' THEN CAST(@head_sha AS TEXT) ELSE head_sha END,
-       head_branch = CASE WHEN head_branch = '' THEN CAST(@head_branch AS TEXT) ELSE head_branch END
+       head_branch = CASE WHEN head_branch = '' THEN CAST(@head_branch AS TEXT) ELSE head_branch END,
+       run_attempt = CASE WHEN run_attempt = 0 THEN CAST(@run_attempt AS BIGINT) ELSE run_attempt END
  WHERE lease_id = @lease_id
    AND (github_job_id = '' OR github_job_id = CAST(@github_job_id AS TEXT));
 
@@ -432,7 +433,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
-       holder_incarnation, head_sha, head_branch
+       holder_incarnation, head_sha, head_branch, run_attempt
   FROM job_history WHERE lease_id = @lease_id;
 
 -- name: ListJobsOfRun :many

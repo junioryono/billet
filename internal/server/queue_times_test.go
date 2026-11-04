@@ -53,7 +53,7 @@ func (r *queueTimeReader) RunJobs(_ context.Context, owner, repository string, r
 	}
 	jobs := make(map[string]RunJob, len(r.times[runID]))
 	for name, queued := range r.times[runID] {
-		jobs[name] = RunJob{QueuedAt: queued, HeadSHA: r.headSHA(), HeadBranch: readerHeadBranch}
+		jobs[name] = RunJob{QueuedAt: queued, HeadSHA: r.headSHA(), HeadBranch: readerHeadBranch, RunAttempt: 2}
 	}
 	return jobs, nil
 }
@@ -732,9 +732,9 @@ func TestAJobsCommitComesFromItsRunsRecordWithItsQueueTime(t *testing.T) {
 	if got, err = p.a.Job(t.Context(), runner.LeaseID); err != nil {
 		t.Fatalf("Job: %v", err)
 	}
-	if got.Job.HeadSHA != readerHeadSHA || got.Job.HeadBranch != readerHeadBranch {
-		t.Errorf("after the backoff the commit is %q on %q, want %q on %q", got.Job.HeadSHA, got.Job.HeadBranch,
-			readerHeadSHA, readerHeadBranch)
+	if got.Job.HeadSHA != readerHeadSHA || got.Job.HeadBranch != readerHeadBranch || got.Job.RunAttempt != 2 {
+		t.Errorf("after the backoff the commit is %q on %q, attempt %d; want %q on %q, attempt 2", got.Job.HeadSHA,
+			got.Job.HeadBranch, got.Job.RunAttempt, readerHeadSHA, readerHeadBranch)
 	}
 	if _, backedOff := sweep.retries[run]; backedOff {
 		t.Error("a job with its commit and its queue time is still scheduled for a retry")

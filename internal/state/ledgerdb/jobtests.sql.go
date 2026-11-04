@@ -32,7 +32,8 @@ const listJobTestResults = `-- name: ListJobTestResults :many
 SELECT t.lease_id, t.recorded_at, t.codec, t.data, h.tier, COALESCE(h.repo, '') AS repo,
        h.workflow_ref, h.job_name, h.head_sha, h.head_branch, COALESCE(h.result, '') AS result,
        CAST(CASE WHEN h.github_run_id > 0 THEN h.github_run_id ELSE COALESCE(h.run_id, 0) END
-            AS BIGINT) AS run_id
+            AS BIGINT) AS run_id,
+       h.run_attempt
   FROM job_test_results t
   JOIN job_history h ON h.lease_id = t.lease_id
  WHERE t.recorded_at >= CAST($1 AS TEXT)
@@ -65,6 +66,7 @@ type ListJobTestResultsRow struct {
 	HeadBranch  string
 	Result      string
 	RunID       int64
+	RunAttempt  int64
 }
 
 // The test results recorded since a moment with the job each came from, newest
@@ -101,6 +103,7 @@ func (q *Queries) ListJobTestResults(ctx context.Context, arg ListJobTestResults
 			&i.HeadBranch,
 			&i.Result,
 			&i.RunID,
+			&i.RunAttempt,
 		); err != nil {
 			return nil, err
 		}

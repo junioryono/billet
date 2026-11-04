@@ -24,6 +24,11 @@
 -- means not recorded, which every row from before this reads as. They are for people
 -- to read and for ranking tests by commit, and decide nothing.
 --
+-- run_attempt is which attempt of its run the job was, from the same record: zero is
+-- not recorded. A failure and a pass in one attempt are two jobs that ran side by
+-- side, two legs of a matrix sharing a display name, and say nothing of a flaky test;
+-- a re-run is a new attempt.
+--
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
 -- Reformat one tab and every ledger that applied this migration refuses to open.
 
@@ -33,6 +38,10 @@ ALTER TABLE job_history ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''
 
 -- +billet:statement
 ALTER TABLE job_history ADD COLUMN head_branch TEXT NOT NULL DEFAULT ''
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE job_history ADD COLUMN run_attempt INTEGER NOT NULL DEFAULT 0 CHECK (run_attempt >= 0)
 -- +billet:end
 
 -- +billet:statement

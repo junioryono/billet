@@ -2,6 +2,7 @@ package guestagent
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +22,7 @@ func parsedCases(t *testing.T, text string) []guestreport.SuiteCases {
 		t.Fatalf("the file did not parse: %s", text)
 	}
 
-	return w.parsed
+	return w.parsed.suites
 }
 
 // A CASE IS KEPT WITH WHAT IT CAME TO, how long it took and why it failed, and a
@@ -131,7 +132,7 @@ func TestAFileCutShortAddsNoCase(t *testing.T) {
 
 	log, _ := discardLog()
 	suites, cases := collectJUnit([]string{root}, unhurried, log)
-	if len(suites) != 1 || len(cases) != 1 || cases[0].Name != "whole" {
+	if len(suites) != 1 || len(cases.suites) != 1 || cases.suites[0].Name != "whole" {
 		t.Errorf("kept suites %+v and cases %+v, want only the whole file's", suites, cases)
 	}
 }
@@ -174,18 +175,21 @@ func TestASuitePastTheBoundKeepsItsFailuresAndItsSlowest(t *testing.T) {
 func TestSuitesPastTheBoundKeepTheFailingOnes(t *testing.T) {
 	t.Parallel()
 
-	var suites []guestreport.SuiteCases
+	var kept junitCases
 
-	failing := guestreport.SuiteCases{Name: "failing", Tests: 1, Failures: 1, Complete: true,
-		Cases: []guestreport.CaseResult{{Name: "f", Status: guestreport.CaseFailed}}}
-	suites = keepCases(suites, failing)
+	kept.keep(guestreport.SuiteCases{Name: "failing", Tests: 1, Failures: 1, Complete: true,
+		Cases: []guestreport.CaseResult{{Name: "f", Status: guestreport.CaseFailed}}})
 	for i := range guestreport.MaxBatchCaseSuites + 10 {
-		suites = keepCases(suites, guestreport.SuiteCases{Name: fmt.Sprintf("s%d", i), Tests: 1, Complete: true,
+		kept.keep(guestreport.SuiteCases{Name: fmt.Sprintf("s%d", i), Tests: 1, Complete: true,
 			Cases: []guestreport.CaseResult{{Name: "p", Status: guestreport.CasePassed}}})
 	}
 
-	if len(suites) != guestreport.MaxBatchCaseSuites || suites[0].Name != "failing" || !suites[0].Complete {
-		t.Errorf("kept %d suites, the first %+v", len(suites), suites[0])
+	if len(kept.suites) != guestreport.MaxBatchCaseSuites || kept.suites[0].Name != "failing" || !kept.suites[0].Complete {
+		t.Errorf("kept %d suites, the first %+v", len(kept.suites), kept.suites[0])
+	}
+	// A SUITE LEFT OUT IS COUNTED, or a job that lost whole suites reads as complete.
+	if kept.dropped.Suites != 11 || kept.dropped.Cases != 11 {
+		t.Errorf("counted %+v left out, want 11 suites and 11 cases", kept.dropped)
 	}
 }
 
@@ -204,7 +208,7 @@ func TestABatchShedsCasesBeforeTheSuitesItsReportShows(t *testing.T) {
 	b := guestreport.Batch{Seq: 1, AgentVersion: "v", TicksPerSecond: 100, Cases: []guestreport.SuiteCases{s},
 		Tests: []guestreport.SuiteResult{{Name: "s", Tests: s.Tests, Failures: 1, Failed: []string{"f"}}}}
 
-	body, err := fit(&b, 4000)
+	body, err := fit(&b, 4000, time.Time{})
 	if err != nil {
 		t.Fatalf("fit: %v", err)
 	}
@@ -259,4 +263,131 @@ func TestCasesGoOnlyToANodeThatOffersThem(t *testing.T) {
 			}
 		})
 	}
+}
+
+// CASES SHED TO FIT ARE COUNTED, and a batch past its deadline gives them all up at
+// once and keeps what the report shows: a job of many cases costs its cases, never its
+// suite counts. The deadline is checked before the encoding it would save.
+func TestABatchPastItsDeadlineGivesUpItsCasesAndKeepsItsSuites(t *testing.T) {
+	t.Parallel()
+
+	s := guestreport.SuiteCases{Name: "s", Tests: 1, Failures: 1, Complete: true,
+		Cases: []guestreport.CaseResult{{Name: "f", Status: guestreport.CaseFailed}}}
+	b := guestreport.Batch{Seq: 1, AgentVersion: "v", TicksPerSecond: 100, Cases: []guestreport.SuiteCases{s},
+		Tests: []guestreport.SuiteResult{{Name: "s", Tests: 1, Failures: 1, Failed: []string{"f"}}}}
+
+	body, err := fit(&b, guestreport.MaxBatchBytes, time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatalf("fit: %v", err)
+	}
+	got, err := guestreport.DecodeBatch(body)
+	if err != nil {
+		t.Fatalf("DecodeBatch: %v", err)
+	}
+	if len(got.Cases) != 0 || got.CasesDropped != (guestreport.DroppedCases{Suites: 1, Cases: 1}) {
+		t.Errorf("the batch holds cases %+v and counts %+v, want none and one of each", got.Cases, got.CasesDropped)
+	}
+	if len(got.Tests) != 1 || got.Tests[0].Failures != 1 {
+		t.Errorf("the suite counts went too: %+v", got.Tests)
+	}
+}
+
+// TWO TESTS NEVER READ AS ONE: a name past the bound keeps its identity in a digest of
+// the whole, so a failure in one and a pass in the other is not a flaky test. Each stays
+// within the bound, and a name that fits is unchanged.
+func TestANameCutToFitStaysItsOwn(t *testing.T) {
+	t.Parallel()
+
+	class := strings.Repeat("c", guestreport.MaxFailedNameBytes)
+	one, other := caseIdentity(class+"A", "T"), caseIdentity(class+"B", "T")
+	if one == other {
+		t.Errorf("two classes cut to one identity: %q", one)
+	}
+	if len(one) > guestreport.MaxFailedNameBytes {
+		t.Errorf("an identity of %d bytes is past the bound", len(one))
+	}
+	if got := caseIdentity("pkg", "T"); got != "pkg.T" {
+		t.Errorf("a name that fits reads %q", got)
+	}
+	if got := caseIdentity("", "T"); got != "T" {
+		t.Errorf("a name with no class reads %q", got)
+	}
+
+	path := strings.Repeat("p", guestreport.MaxNameBytes)
+	first, second := suiteIdentity(path+"/one", "f.xml"), suiteIdentity(path+"/two", "f.xml")
+	if first == second || len(first) > guestreport.MaxNameBytes {
+		t.Errorf("two suites read %q and %q", first, second)
+	}
+	if got := suiteIdentity("", "named-by-file.xml"); got != "named-by-file.xml" {
+		t.Errorf("a suite with no name reads %q", got)
+	}
+}
+
+// A NODE THAT REFUSES THE LAST BATCH GETS IT ONCE MORE WITHOUT ITS CASES, under one
+// number, so what a report shows is not lost with them.
+func TestARefusedFinalBatchIsResentWithoutItsCases(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusBadRequest, http.StatusRequestEntityTooLarge} {
+		synctest.Test(t, func(t *testing.T) {
+			node := newFakeNode(t)
+			node.schemas = "[1,2]"
+			node.postScript = []reply{{status: http.StatusNoContent}, {status: status}}
+
+			var log syncBuffer
+
+			r := start(t, testConfig(t, node, &log))
+
+			time.Sleep(15 * time.Second)
+			synctest.Wait()
+
+			if _, err := r.stop(); err != nil {
+				t.Fatal(err)
+			}
+
+			_, posts := node.snapshot()
+			if len(posts) != 3 {
+				t.Fatalf("answered %d: the node was sent %d batches, want a first, a refused and a resent", status, len(posts))
+			}
+
+			refused, resent := posts[1], posts[2]
+			if !refused.final || !resent.final || refused.batch.Seq != resent.batch.Seq {
+				t.Errorf("answered %d: the two final batches are %v #%d and %v #%d", status, refused.final,
+					refused.batch.Seq, resent.final, resent.batch.Seq)
+			}
+			if len(refused.batch.Cases) == 0 || len(resent.batch.Cases) != 0 {
+				t.Errorf("answered %d: the batches carry %d and %d suites of cases, want some and none", status,
+					len(refused.batch.Cases), len(resent.batch.Cases))
+			}
+			if len(resent.batch.Tests) == 0 || resent.batch.CasesDropped.Suites == 0 {
+				t.Errorf("answered %d: the resent batch holds %d suites and counts %+v dropped", status,
+					len(resent.batch.Tests), resent.batch.CasesDropped)
+			}
+		})
+	}
+}
+
+// A BATCH THE NODE ACCEPTS IS NOT SENT TWICE, and neither is one with no cases to drop.
+func TestAFinalBatchIsResentOnlyWithCasesToDrop(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		node := newFakeNode(t)
+		node.postScript = []reply{{status: http.StatusNoContent}, {status: http.StatusBadRequest}}
+
+		var log syncBuffer
+
+		r := start(t, testConfig(t, node, &log))
+
+		time.Sleep(15 * time.Second)
+		synctest.Wait()
+
+		if _, err := r.stop(); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, posts := node.snapshot(); len(posts) != 2 {
+			t.Errorf("a node offering no cases was sent %d batches, want the refused one once", len(posts))
+		}
+	})
 }

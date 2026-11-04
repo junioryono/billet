@@ -51,6 +51,9 @@ type RunJob struct {
 	QueuedAt   time.Time
 	HeadSHA    string
 	HeadBranch string
+	// RunAttempt is which attempt of the run the job was, zero where the record does
+	// not say.
+	RunAttempt int64
 }
 
 // WorkflowJob is the part of GitHub's job record `billet jobs show` reads.
@@ -216,6 +219,9 @@ func (c *runnerGroupPolicyClient) RunJobs(
 		}
 		if record.HeadBranch != nil {
 			job.HeadBranch = *record.HeadBranch
+		}
+		if record.RunAttempt != nil {
+			job.RunAttempt = *record.RunAttempt
 		}
 		jobs[name] = job
 		return nil

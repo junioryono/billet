@@ -75,7 +75,7 @@ func (c *Client) RunJobs(
 		jobs := make(map[string]server.RunJob, len(records))
 		for name, record := range records {
 			jobs[name] = server.RunJob{QueuedAt: record.QueuedAt, HeadSHA: record.HeadSHA,
-				HeadBranch: record.HeadBranch}
+				HeadBranch: record.HeadBranch, RunAttempt: record.RunAttempt}
 		}
 
 		return jobs, nil

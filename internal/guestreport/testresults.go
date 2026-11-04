@@ -73,8 +73,9 @@ func CountCases(suites []SuiteCases) int {
 }
 
 // TestResultsOf is the suites a job's batches carried, in the order they were
-// received and within the bounds of one TestResults, false when none did. A number
-// received twice counts once, as Merge counts it, the first received kept.
+// received and within the bounds of one TestResults, and what the agent or the bounds
+// left out; false when they carried nothing. A number received twice counts once, as
+// Merge counts it, the first received kept.
 func TestResultsOf(batches []Batch) (TestResults, bool) {
 	var out TestResults
 
@@ -88,6 +89,8 @@ func TestResultsOf(batches []Batch) (TestResults, bool) {
 		}
 
 		seen[b.Seq] = true
+		out.Dropped.Suites = min(out.Dropped.Suites+b.CasesDropped.Suites, MaxValue)
+		out.Dropped.Cases = min(out.Dropped.Cases+b.CasesDropped.Cases, MaxValue)
 
 		for j := range b.Cases {
 			s := b.Cases[j]
@@ -115,7 +118,7 @@ func TestResultsOf(batches []Batch) (TestResults, bool) {
 		}
 	}
 
-	return out, len(out.Suites) > 0
+	return out, len(out.Suites) > 0 || out.Dropped != (DroppedCases{})
 }
 
 // EncodeTestResults is r in Codec within limit bytes, giving up cases with ShedCases
@@ -189,9 +192,27 @@ func cloneSuites(suites []SuiteCases) []SuiteCases {
 // twice the log of what was held, so a caller encoding after each call spends little
 // more than twice its first encoding.
 func ShedCases(suites *[]SuiteCases) bool {
+	if shedPassing(*suites) || shedMessages(*suites) {
+		return true
+	}
+
+	return shedRest(suites)
+}
+
+// ShedCaseCount is ShedCases for a bound on how many cases are held, which clearing a
+// message does nothing for: every call that can gives up cases.
+func ShedCaseCount(suites *[]SuiteCases) bool {
+	if shedPassing(*suites) {
+		return true
+	}
+
+	return shedRest(suites)
+}
+
+// shedRest gives up the later half of each suite's cases or, when they hold none, the
+// later half of the suites.
+func shedRest(suites *[]SuiteCases) bool {
 	switch {
-	case shedPassing(*suites):
-	case shedMessages(*suites):
 	case shedFailing(*suites):
 	case len(*suites) > 0:
 		*suites = slices.Clip((*suites)[:len(*suites)/2])

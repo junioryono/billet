@@ -24,13 +24,14 @@ type QueueTimes interface {
 	RunJobs(ctx context.Context, owner, repository string, runID int64) (map[string]RunJob, error)
 }
 
-// RunJob is GitHub's record of one job of a run: when it was queued, and the commit
-// and branch it ran on, which no scale-set message carries either. Empty is what the
-// record did not say.
+// RunJob is GitHub's record of one job of a run: when it was queued, the commit and
+// branch it ran on, and which attempt of the run it was, which no scale-set message
+// carries either. Empty is what the record did not say.
 type RunJob struct {
 	QueuedAt   time.Time
 	HeadSHA    string
 	HeadBranch string
+	RunAttempt int64
 }
 
 // RESTHeadroom is an App installation's REST budget as GitHub last stated it:
@@ -194,8 +195,8 @@ func inReserve(budgets []RESTHeadroom, now time.Time) (int64, int64, time.Time, 
 // ONE READ OF A RUN SERVES EVERY JOB OF IT, so a run of forty jobs costs two
 // requests rather than eighty. A job is matched by its runner's name, which is
 // its lease's and unique by construction, across every attempt of the run.
-// The write is the identity write, which fills only an empty queue time and
-// only on the row of the job it names, and tells the job's wait.
+// The write is the identity write, which fills only what is empty and only on the
+// row of the job it names, and tells the job's wait.
 func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Target, sweep *queueTimeSweep,
 	now time.Time,
 ) {
@@ -375,7 +376,8 @@ func (s *Server) fillRunQueueTimes(ctx context.Context, reader QueueTimes, run q
 		}
 		write, cancel := context.WithTimeout(ctx, identityWriteLimit)
 		err := s.alloc.RecordJobIdentity(write, job.LeaseID, alloc.HistoryJob{JobID: job.JobID,
-			QueuedAt: record.QueuedAt, HeadSHA: record.HeadSHA, HeadBranch: record.HeadBranch})
+			QueuedAt: record.QueuedAt, HeadSHA: record.HeadSHA, HeadBranch: record.HeadBranch,
+			RunAttempt: record.RunAttempt})
 		cancel()
 		if err != nil {
 			s.log.Warn("could not record GitHub's queue time for a job; trying again",

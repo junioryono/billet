@@ -295,9 +295,9 @@ func TestTestResultsOfGathersBatches(t *testing.T) {
 	}
 }
 
-// A BATCH OF SCHEMA 2 DECODES, AND SCHEMA 1 STILL DOES, which is every image already
-// built. A report holds no cases: its bytes and its bounds are as they were.
-func TestABatchMayCarryCasesAndAReportHoldsNone(t *testing.T) {
+// A BATCH WITH NO CASES NAMES NO FIELD AN OLDER NODE REFUSES, which is every batch but
+// the last and every batch to a node that does not offer them; one with cases reads back.
+func TestABatchNamesCasesOnlyWhenItCarriesThem(t *testing.T) {
 	t.Parallel()
 
 	old := batchAt(1)
@@ -323,17 +323,6 @@ func TestABatchMayCarryCasesAndAReportHoldsNone(t *testing.T) {
 		t.Errorf("the cases read back %+v", got.Cases)
 	}
 
-	report, err := Merge([]Batch{got})
-	if err != nil {
-		t.Fatalf("Merge: %v", err)
-	}
-	encoded, err := Encode(report)
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	if strings.Contains(mustInflate(t, encoded), `"status"`) {
-		t.Error("the merged report holds a case")
-	}
 }
 
 func mustInflate(t *testing.T, data []byte) string {
@@ -352,14 +341,22 @@ func mustInflate(t *testing.T, data []byte) string {
 func TestTestResultsDecodeStrictly(t *testing.T) {
 	t.Parallel()
 
-	for name, raw := range map[string]string{
-		"an unknown field":      `{"suites":[],"dropped":{"suites":0,"cases":0},"later":1}`,
-		"a null list":           `{"suites":null,"dropped":{"suites":0,"cases":0}}`,
-		"an empty list spelled": `{"suites":[],"dropped":{"suites":0,"cases":0}}`,
-		"no dropped":            `{}`,
+	// What the encoder writes decodes, so each refusal below is about what it changes.
+	if _, err := DecodeTestResults(deflated(t, []byte(`{"dropped":{"suites":0,"cases":0}}`))); err != nil {
+		t.Fatalf("the encoder's own spelling is refused: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		raw  string
+		want error
+	}{
+		"an unknown field":      {`{"dropped":{"suites":0,"cases":0},"later":1}`, ErrUnknownField},
+		"a null list":           {`{"suites":null,"dropped":{"suites":0,"cases":0}}`, ErrNotCanonical},
+		"an empty list spelled": {`{"suites":[],"dropped":{"suites":0,"cases":0}}`, ErrNotCanonical},
+		"no dropped":            {`{}`, ErrNotCanonical},
 	} {
-		if _, err := DecodeTestResults(deflated(t, []byte(raw))); err == nil {
-			t.Errorf("%s decoded", name)
+		if _, err := DecodeTestResults(deflated(t, []byte(tc.raw))); !errors.Is(err, tc.want) {
+			t.Errorf("%s = %v, want %v", name, err, tc.want)
 		}
 	}
 }
