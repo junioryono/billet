@@ -506,7 +506,7 @@ func (s *CacheService) encodeGuestTests(report *alloc.GuestReport, batches []gue
 // apart. A batch is charged twice its own, for its place in an array that grows
 // by doubling.
 const (
-	batchBytes         = 2 * (8 + 16 + 8 + 8 + 5*24)
+	batchBytes         = 2 * (8 + 16 + 8 + 8 + 5*24 + 2*8)
 	sampleBytes        = 10 * 8
 	processSampleBytes = 8 + 24 + 5*8 + 8
 	processRowBytes    = 16 + 5*8

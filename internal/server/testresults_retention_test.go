@@ -54,7 +54,7 @@ func TestTheControlPlaneRunsTheTestResultsRetention(t *testing.T) {
 func TestTheConfiguredTestResultsRetentionReachesTheControlPlane(t *testing.T) {
 	t.Parallel()
 
-	opts, err := OptionsFromConfig(&config.Config{Server: config.ServerConfig{
+	opts, err := OptionsFromConfig(&config.Config{Server: &config.ServerConfig{
 		TestResultsRetention: "48h", TestResultsMaxBytes: 2 * config.MiB,
 	}})
 	if err != nil {
