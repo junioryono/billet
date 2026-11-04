@@ -263,7 +263,13 @@ func TestARequestWhileTheMirrorIsRepackedWaitsForIt(t *testing.T) {
 
 			upstream := newGitUpstream(t)
 			service, node, token := gitNode(t, upstream)
+			// WITHIN THE WAIT BY CONSTRUCTION: the repack ends as soon as the request
+			// is seen waiting, so the wait only has to outlast a loaded machine. Two
+			// seconds did not (#700), and the request went to GitHub instead.
 			service.git.refreshWait = 2 * time.Second
+			if ends {
+				service.git.refreshWait = gitGuard
+			}
 			if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
 				"https://github.com/acme/api.git", "c"); err != nil {
 				t.Fatalf("clone: %v\n%s", err, output)
