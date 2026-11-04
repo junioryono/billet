@@ -22,7 +22,9 @@ import (
 // controller it is on now, and a process's list is fixed when it starts, so
 // being on a controller a new configuration still names does not prove the
 // process knows the rest of that configuration's list. A node with one
-// controller keeps schema 1 byte for byte, which an older inspector reads.
+// controller keeps schema 1 byte for byte, which an older inspector reads, and no
+// process that dials several ever writes schema 1, so that schema's one endpoint
+// is everything its process dials.
 type registrationRecord struct {
 	Schema       int      `json:"schema"`
 	Node         string   `json:"node"`

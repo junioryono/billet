@@ -594,6 +594,16 @@ func testOnlyProviderError(where string, p ProviderKind) error {
 		"harness and cannot be named in a configuration", where, p)
 }
 
+// A list's bounds. THE RECORD AND THE RECEIPT THAT NAME IT ARE BOUNDED EVIDENCE of
+// 4096 bytes each, and one a reader refuses as too long is a node whose list no
+// migration can then shorten, so a list that could not fit is refused here, before
+// any process dials it. A pair is two; eight leaves room for moving from one pair to
+// another. An address is a DNS name's 253 bytes, a colon and a port.
+const (
+	maxServerAddrs     = 8
+	maxServerAddrBytes = 259
+)
+
 // validateControlPlanes checks the addresses a node dials: node.server_addr, or
 // node.server_addrs, never both.
 //
@@ -618,6 +628,11 @@ func (c *Config) validateControlPlanes() []error {
 		return []error{errors.New("node.server_addrs is empty, so this node has no control plane to dial")}
 	}
 
+	if len(c.Node.ServerAddrs) > maxServerAddrs {
+		return []error{fmt.Errorf("node.server_addrs names %d controllers, more than the %d a node may",
+			len(c.Node.ServerAddrs), maxServerAddrs)}
+	}
+
 	var errs []error
 
 	seen := map[string]int{}
@@ -626,6 +641,13 @@ func (c *Config) validateControlPlanes() []error {
 		field := fmt.Sprintf("node.server_addrs[%d]", i)
 		if err := validateHostPort(field, addr); err != nil {
 			errs = append(errs, err)
+
+			continue
+		}
+
+		if len(addr) > maxServerAddrBytes {
+			errs = append(errs, fmt.Errorf("%s is %d bytes, longer than the %d a host name and a port take",
+				field, len(addr), maxServerAddrBytes))
 
 			continue
 		}

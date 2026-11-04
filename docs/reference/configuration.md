@@ -65,7 +65,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 |---|---|---|
 | `name` | on loopback | otherwise the certificate's name; defaults to the hostname |
 | `server_addr` | this or `server_addrs` | the control plane's node wire |
-| `server_addrs` | this or `server_addr` | every controller of an active-passive pair, tried in order: the node registers with whichever serves the wire, and on losing it, tries the others ([Failover](../deploying/postgres-and-active-passive.md#what-activepassive-does-not-do-for-you)); refused beside `server_addr`, empty, or naming one controller twice |
+| `server_addrs` | this or `server_addr` | every controller of an active-passive pair, tried in order: the node registers with whichever serves the wire, and on losing it, tries the others ([Failover](../deploying/postgres-and-active-passive.md#what-activepassive-does-not-do-for-you)); refused beside `server_addr`, empty, naming one controller twice, or naming more than eight |
 | `bootstrap_addr` | no | used once at `--enroll`; falls back to `server_addr`, or the first of `server_addrs` |
 | `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild`; `simulated` is billet's own test-only backend and is refused anywhere in a configuration |
 | `site` | no | one of the control plane's `sites`; required with `ebs_s3`; refused on `codebuild` |
