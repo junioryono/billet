@@ -211,7 +211,7 @@ func TestALineReachesASearchAndReadsBack(t *testing.T) {
 		}
 	}
 
-	read, err := store.ReadLines(lease, []nodeapi.LogLineRange{{First: hit.Line, Last: hit.Line}}, 1<<10)
+	read, err := store.ReadLines(t.Context(), lease, []nodeapi.LogLineRange{{First: hit.Line, Last: hit.Line}}, 1<<10)
 	if err != nil {
 		t.Fatalf("ReadLines: %v", err)
 	}
@@ -306,7 +306,8 @@ func TestTheOperatorSocketIsTheOperators(t *testing.T) {
 }
 
 // A READ THE SOCKET CANNOT SERVE SAYS WHY IN ITS STATUS, so a reader does not take it for lines
-// that do not exist.
+// that do not exist: a job the ledger holds none of is 404, and a ledger that could not answer is
+// 503, which is could-not-tell and never absent.
 func TestAReadOfAJobTheLedgerHoldsNoneOfIsRefused(t *testing.T) {
 	t.Parallel()
 
@@ -340,5 +341,49 @@ func TestAReadOfAJobTheLedgerHoldsNoneOfIsRefused(t *testing.T) {
 	}
 	if err == nil || errors.Is(err, ErrNoController) || !strings.Contains(err.Error(), "404") {
 		t.Errorf("a job the ledger holds none of: %v", err)
+	}
+
+}
+
+// unanswering is a ledger that cannot be read.
+type unanswering struct{}
+
+func (unanswering) Job(context.Context, string) (alloc.JobRecord, error) {
+	return alloc.JobRecord{}, errors.New("the ledger did not answer")
+}
+
+// A LEDGER THAT COULD NOT ANSWER IS 503, could-not-tell, and never a job that does not exist.
+func TestAReadTheLedgerCouldNotAnswerIsNotAbsent(t *testing.T) {
+	t.Parallel()
+
+	cfg := socketConfig(t)
+	plane := nodeplane.New(slog.New(slog.DiscardHandler), "deployment", time.Minute)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		serveOperator(ctx, cfg, &operatorServer{jobs: unanswering{}, plane: plane, log: slog.New(slog.DiscardHandler)})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	var err error
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err = ReadJobLogLines(t.Context(), cfg, JobLogRead{Lease: "ffffffffffffffffffffffffffffffff"})
+		if !errors.Is(err, ErrNoController) {
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err == nil || errors.Is(err, ErrNoController) || !strings.Contains(err.Error(), "503") {
+		t.Errorf("a ledger that could not answer: %v", err)
 	}
 }

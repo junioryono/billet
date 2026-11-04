@@ -73,7 +73,7 @@ func TestAKeptChunkReadsBackByLine(t *testing.T) {
 	keepChunk(t, s, logLease, 1, "zero", "one")
 	keepChunk(t, s, logLease, 2, "two")
 
-	got, err := s.ReadLines(logLease, []nodeapi.LogLineRange{{First: 1, Last: 2}}, 1<<10)
+	got, err := s.ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 1, Last: 2}}, 1<<10)
 	if err != nil {
 		t.Fatalf("ReadLines: %v", err)
 	}
@@ -90,13 +90,13 @@ func TestALeaseNotHeldSaysSo(t *testing.T) {
 
 	s := aLogStore(t, logLimits())
 
-	got, err := s.ReadLines(logLease, []nodeapi.LogLineRange{{First: 0, Last: 1}}, 1<<10)
+	got, err := s.ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 0, Last: 1}}, 1<<10)
 	if err != nil || got.Held {
 		t.Errorf("a lease never kept reads %+v, %v; want not held", got, err)
 	}
 
 	for _, lease := range []string{"", "../../etc", strings.Repeat("x", 32)} {
-		if _, err := s.ReadLines(lease, nil, 1); err == nil {
+		if _, err := s.ReadLines(t.Context(), lease, nil, 1); err == nil {
 			t.Errorf("a read of %q was not refused", lease)
 		}
 
@@ -115,7 +115,7 @@ func TestAReadStopsAtItsBounds(t *testing.T) {
 	s := aLogStore(t, logLimits())
 	keepChunk(t, s, logLease, 1, "aaaa", "bbbb", "cccc")
 
-	got, err := s.ReadLines(logLease, []nodeapi.LogLineRange{{First: 0, Last: 9}}, 6)
+	got, err := s.ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 0, Last: 9}}, 6)
 	if err != nil || !got.Cut || len(got.Lines) != 1 {
 		t.Errorf("past the bytes: %+v, %v; want one line and cut", got, err)
 	}
@@ -127,7 +127,7 @@ func TestAReadStopsAtItsBounds(t *testing.T) {
 	big := aLogStore(t, logLimits())
 	keepChunk(t, big, logLease, 1, lines...)
 
-	got, err = big.ReadLines(logLease, []nodeapi.LogLineRange{{First: 0, Last: int64(len(lines))}}, 1<<20)
+	got, err = big.ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 0, Last: int64(len(lines))}}, 1<<20)
 	if err != nil || !got.Cut || len(got.Lines) != nodeapi.MaxLogReadLines {
 		t.Errorf("past the lines: %d lines, cut %t, %v", len(got.Lines), got.Cut, err)
 	}
@@ -166,7 +166,7 @@ func TestARestartKeepsTheNumbering(t *testing.T) {
 	keepChunk(t, again, logLease, 1, "zero", "one")
 	keepChunk(t, again, logLease, 2, "two")
 
-	got, err := again.ReadLines(logLease, []nodeapi.LogLineRange{{First: 2, Last: 2}}, 1<<10)
+	got, err := again.ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 2, Last: 2}}, 1<<10)
 	if err != nil || len(got.Lines) != 1 || got.Lines[0].Text != "two" {
 		t.Errorf("line 2 reads %+v, %v", got, err)
 	}
@@ -318,22 +318,167 @@ func TestEvictionTakesWholeJobsOldestFirst(t *testing.T) {
 
 	now = now.Add(45 * time.Minute)
 	s.evictPass()
-	if _, err := os.Stat(filepath.Join(s.dir, logLease)); !os.IsNotExist(err) {
-		t.Errorf("past its age the log stayed: %v", err)
+	if got := chunksHeld(t, s, logLease); got != 0 {
+		t.Errorf("past its age %d chunks stayed", got)
 	}
-	if _, err := os.Stat(filepath.Join(s.dir, other)); err != nil {
-		t.Errorf("a log inside its age went: %v", err)
+	if got := chunksHeld(t, s, other); got != 1 {
+		t.Errorf("inside its age %d chunks stayed", got)
 	}
 
-	limits := logLimits()
-	limits.MaxBytes = 1
-	tight := aLogStore(t, limits)
+	// A BOUND LOWERED UNDER WHAT IS HELD, as a restart with a smaller one finds it.
+	tight := aLogStore(t, logLimits())
 	tight.now = s.now
 	keepChunk(t, tight, logLease, 1, "a")
 	keepChunk(t, tight, other, 1, "b")
+	tight.limits.MaxBytes = 1
 	tight.evictPass()
 	if tight.total != 0 {
 		t.Errorf("past the bound %d bytes stayed", tight.total)
+	}
+}
+
+// chunksHeld is how many chunk files a lease has on disk.
+func chunksHeld(t *testing.T, s *JobLogStore, lease string) int {
+	t.Helper()
+
+	chunks, err := s.chunksOf(lease)
+	if err != nil {
+		t.Fatalf("chunksOf: %v", err)
+	}
+
+	return len(chunks)
+}
+
+// AN EVICTED LEASE TAKES NO MORE, across a restart too: its numbers are in the index, and a
+// chunk numbered afresh would make a search read back a different line than it matched. A read
+// says it is not held, never that it has no such line.
+func TestAnEvictedLeaseIsNotNumberedAfresh(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+
+	s, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time { return now }
+
+	keepChunk(t, s, logLease, 1, "matched")
+
+	now = now.Add(2 * time.Hour)
+	s.evictPass()
+
+	c, data := aChunkOf(t, 2, 0, "new")
+	if err := s.Keep(logLease, c, data); !errors.Is(err, ErrJobLogBudget) {
+		t.Errorf("an evicted lease answered %v, want its budget spent", err)
+	}
+
+	got, err := s.ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 0, Last: 0}}, 1<<10)
+	if err != nil || got.Held {
+		t.Errorf("an evicted lease read as %+v, %v", got, err)
+	}
+
+	again, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := again.Keep(logLease, c, data); !errors.Is(err, ErrJobLogBudget) {
+		t.Errorf("after a restart an evicted lease answered %v, want its budget spent", err)
+	}
+
+	// AND LONG ENOUGH LATER IT IS FORGOTTEN, so the directory does not grow for ever.
+	s.evictPass()
+	now = now.Add(jobLogEvictedKept + time.Hour)
+	s.evictPass()
+	if _, err := os.Stat(filepath.Join(dir, jobLogDirectory, logLease)); !os.IsNotExist(err) {
+		t.Errorf("an evicted lease was never forgotten: %v", err)
+	}
+}
+
+// THE NODE'S BOUND HOLDS AS A CHUNK ARRIVES, not at the next pass: the job written longest ago
+// makes room, and one chunk that cannot fit is refused rather than kept past it.
+func TestTheNodesBoundHoldsOnArrival(t *testing.T) {
+	t.Parallel()
+
+	const other = "ffffffffffffffffffffffffffffffff"
+
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+
+	_, data := aChunkOf(t, 1, 0, "one")
+	limits := logLimits()
+	limits.MaxBytes = int64(len(data)) + 1
+
+	s := aLogStore(t, limits)
+	s.now = func() time.Time { return now }
+
+	keepChunk(t, s, logLease, 1, "one")
+	now = now.Add(time.Minute)
+	keepChunk(t, s, other, 1, "one")
+
+	if s.total > limits.MaxBytes {
+		t.Errorf("%d bytes held past a bound of %d", s.total, limits.MaxBytes)
+	}
+	if !s.evicted(logLease) || s.evicted(other) {
+		t.Errorf("the room was not made from the oldest: %t, %t", s.evicted(logLease), s.evicted(other))
+	}
+
+	c, large := aChunkOf(t, 2, 0, "a longer line than the bound leaves room for")
+	if err := s.Keep(other, c, large); !errors.Is(err, ErrJobLogBudget) {
+		t.Errorf("a chunk past the node's bound answered %v", err)
+	}
+}
+
+// A CHUNK ALREADY PUBLISHED IS ACCOUNTED FOR, whatever the install said: a retry of it must not
+// trip over its own name for ever, and no later chunk may be numbered over it.
+func TestAChunkPublishedByAFailedInstallCounts(t *testing.T) {
+	t.Parallel()
+
+	s := aLogStore(t, logLimits())
+	dir := filepath.Join(s.dir, logLease)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	c, data := aChunkOf(t, 1, 0, "one", "two")
+	if err := os.WriteFile(filepath.Join(dir, chunkName(0, 1, 2)), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Keep(logLease, c, data); err != nil {
+		t.Fatalf("a retry of a chunk already in place answered %v", err)
+	}
+
+	next, nextData := aChunkOf(t, 2, 0, "three")
+	if err := s.Keep(logLease, next, nextData); err != nil {
+		t.Fatalf("Keep: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, chunkName(2, 2, 1))); err != nil {
+		t.Errorf("the next chunk was not numbered past it: %v", err)
+	}
+
+	// OTHER BYTES UNDER ITS NAME ARE NOT THIS CHUNK, which is not kept.
+	lying, lyingData := aChunkOf(t, 3, 0, "four")
+	if err := os.WriteFile(filepath.Join(dir, chunkName(3, 3, 1)), []byte("other"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Keep(logLease, lying, lyingData); err == nil {
+		t.Error("a chunk whose name holds other bytes was taken for kept")
+	}
+}
+
+// A READ STOPS WHEN ITS COMMAND DOES, and says so rather than answering what it reached.
+func TestAReadStopsWithItsContext(t *testing.T) {
+	t.Parallel()
+
+	s := aLogStore(t, logLimits())
+	keepChunk(t, s, logLease, 1, "one")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if _, err := s.ReadLines(ctx, logLease, []nodeapi.LogLineRange{{First: 0, Last: 0}}, 1<<10); !errors.Is(err, context.Canceled) {
+		t.Errorf("a read whose context ended answered %v", err)
 	}
 }
 
@@ -390,7 +535,7 @@ func TestALogIsKeptOnlyForATierThatAsked(t *testing.T) {
 		t.Fatalf("a chunk answered %d, want 204", got)
 	}
 
-	got, err := service.JobLogs().ReadLines(logLease, []nodeapi.LogLineRange{{First: 0, Last: 0}}, 1<<10)
+	got, err := service.JobLogs().ReadLines(t.Context(), logLease, []nodeapi.LogLineRange{{First: 0, Last: 0}}, 1<<10)
 	if err != nil || len(got.Lines) != 1 || got.Lines[0].Text != "line" {
 		t.Errorf("the chunk reads back %+v, %v", got, err)
 	}

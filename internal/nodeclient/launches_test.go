@@ -224,3 +224,65 @@ func TestLaunchesRunOneAtATimeByDefault(t *testing.T) {
 		t.Errorf("%d launches ran at once on a node configured for one", most)
 	}
 }
+
+// gatedReads holds every log read open until its context ends or release closes.
+type gatedReads struct {
+	*fakeCompute
+
+	release chan struct{}
+	holding chan struct{}
+}
+
+func (g *gatedReads) ReadJobLog(ctx context.Context, _ nodeapi.LogReadSpec) (nodeapi.LogReadResult, error) {
+	g.holding <- struct{}{}
+
+	select {
+	case <-g.release:
+		return nodeapi.LogReadResult{Held: true}, nil
+	case <-ctx.Done():
+		return nodeapi.LogReadResult{}, ctx.Err()
+	}
+}
+
+// READS DO NOT STOP THE LOOP. With every slot taken the next read is answered at once, and
+// says so, and a destroy behind it runs: a search is never worth more than the compute waiting
+// on the same poll.
+func TestABusyReadIsAnsweredAndTheLoopGoesOn(t *testing.T) {
+	t.Parallel()
+
+	p, c := harnessWithCommandTimeout(t, 30*time.Second)
+	compute := &gatedReads{fakeCompute: &fakeCompute{}, release: make(chan struct{}), holding: make(chan struct{}, 16)}
+	runLoopWith(t, c, compute, 4)
+	t.Cleanup(func() { close(compute.release) })
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	node := p.Nodes()[0]
+
+	var reads sync.WaitGroup
+	t.Cleanup(reads.Wait)
+
+	for range nodeclient.LogReadsAtOnce {
+		reads.Go(func() {
+			if _, err := p.ReadJobLog(t.Context(), node, nodeapi.LogReadSpec{Lease: "l1"}); err != nil {
+				t.Errorf("a held read: %v", err)
+			}
+		})
+		<-compute.holding
+	}
+
+	if _, err := p.ReadJobLog(t.Context(), node, nodeapi.LogReadSpec{Lease: "l1"}); err == nil {
+		t.Error("a read past the slots was answered as if it had been read")
+	}
+
+	destroyed := make(chan error, 1)
+	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 42) }()
+
+	select {
+	case err := <-destroyed:
+		if err != nil {
+			t.Errorf("Destroy: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a destroy waited behind reads")
+	}
+}

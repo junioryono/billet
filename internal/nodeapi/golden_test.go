@@ -1252,15 +1252,17 @@ func TestEveryWireTypeIsPinned(t *testing.T) {
 func TestEveryTopLevelBodyHasADirection(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"Range", "TierSpec", "UpgradeSpec", "CacheAuthority", "Job"} {
+	nested := []string{"Range", "TierSpec", "UpgradeSpec", "CacheAuthority", "Job", "LogLine", "LogLineRange",
+		"LogReadResult", "LogReadSpec"}
+
+	for _, name := range nested {
 		if directionOf(name) != insideOther {
 			t.Errorf("%s travels only inside another type and should not have a direction", name)
 		}
 	}
 
 	for name := range wireTypes {
-		if directionOf(name) == insideOther &&
-			!slices.Contains([]string{"Range", "TierSpec", "UpgradeSpec", "CacheAuthority", "Job"}, name) {
+		if directionOf(name) == insideOther && !slices.Contains(nested, name) {
 			t.Errorf("%s has no direction, so no older peer's body of it is ever checked", name)
 		}
 	}

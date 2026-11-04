@@ -721,10 +721,10 @@ func jobCountersOf(c *usage.Counters) *alloc.JobCounters {
 }
 
 // ReadJobLog answers a command to read lines of a lease's kept log.
-func (r *Runner) ReadJobLog(_ context.Context, spec nodeapi.LogReadSpec) (nodeapi.LogReadResult, error) {
+func (r *Runner) ReadJobLog(ctx context.Context, spec nodeapi.LogReadSpec) (nodeapi.LogReadResult, error) {
 	if r.cache == nil || r.cache.JobLogs() == nil {
 		return nodeapi.LogReadResult{}, nil
 	}
 
-	return r.cache.JobLogs().ReadLines(spec.Lease, spec.Ranges, min(spec.MaxBytes, nodeapi.MaxLogReadBytes))
+	return r.cache.JobLogs().ReadLines(ctx, spec.Lease, spec.Ranges, min(spec.MaxBytes, nodeapi.MaxLogReadBytes))
 }

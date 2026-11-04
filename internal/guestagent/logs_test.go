@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -360,12 +361,17 @@ func TestAFullBufferDoesNotWedge(t *testing.T) {
 		t.Error("the tailer did not read on once there was room")
 	}
 
-	// AND LINES HELD WHEN THE BOUND IS REACHED ARE STILL NUMBERED AND SENT.
-	writePage(t, pages, pageName(otherRecord, 1), "2026-11-04T07:04:46.1Z second\n")
+	// AND LINES HELD WHEN THE BOUND IS REACHED ARE STILL NUMBERED AND SENT: these are not
+	// numbered until the read that stops at the bound.
+	writePage(t, pages, pageName(otherRecord, 1), "")
 	tail.scan()
-	tail.read()
+	last := tail.open[len(tail.open)-1]
+	tail.consume(last, []byte("2026-11-04T07:04:46.1Z second\n"))
 	tail.held = logHeldLimit
 	tail.read()
+	if !last.assigned {
+		t.Fatal("what was held at the bound was not numbered")
+	}
 	if _, ok := tail.nextChunk(joblog.MaxChunkBytes); !ok {
 		t.Error("what was held at the bound cannot be sent")
 	}
@@ -425,9 +431,18 @@ func shipperFor(t *testing.T, diag string, rec http.RoundTripper) *logShipper {
 
 	log, _ := discardLog()
 
-	return &logShipper{node: n, tail: newLogTailer(diag, log), limit: joblog.MaxChunkBytes, period: time.Second,
-		log: log, done: make(chan struct{})}
+	s := newLogShipper(n, newLogTailer(diag, log), joblog.MaxChunkBytes, time.Second, log)
+	s.watching = func(string) pagesWaiter { return pollingWaiter{} }
+
+	return s
 }
+
+// pollingWaiter waits without inotify, as a synctest bubble needs.
+type pollingWaiter struct{}
+
+func (pollingWaiter) wait(ctx context.Context, d time.Duration) { sleepFor(ctx, d) }
+
+func (pollingWaiter) close() {}
 
 // THE NODE'S ANSWERS MEAN WHAT THE REPORT'S DO: a 429 waits and sends the same chunk, a 400
 // drops it and goes on, and a 413, a 401 or a 404 ends the shipping, since the job's budget
@@ -458,14 +473,60 @@ func TestTheShipperDoesWhatTheNodeSays(t *testing.T) {
 			s.tail.scan()
 			s.tail.read()
 
-			if got := s.send(context.Background()); got != tc.goesOn {
-				t.Errorf("%s: send answered %t, want %t", name, got, tc.goesOn)
+			if !s.handOver() {
+				t.Fatalf("%s: two chunks did not fit the queue", name)
+			}
+
+			close(s.queue)
+			s.sendAll(context.Background(), context.Background())
+
+			if got := !s.senderStopped(); got != tc.goesOn {
+				t.Errorf("%s: the sender went on: %t, want %t", name, got, tc.goesOn)
 			}
 			if got := rec.sent(); got != tc.sends {
 				t.Errorf("%s: %d sends, want %d", name, got, tc.sends)
 			}
 		})
 	}
+}
+
+// runShipper runs a shipper until the test stops it, and answers how to stop it and wait.
+func runShipper(s *logShipper) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		defer close(s.done)
+
+		s.run(ctx)
+	}()
+
+	return func() {
+		cancel()
+		s.wait()
+	}
+}
+
+// keptLines is every line of what rec was sent, decoded.
+func keptLines(t *testing.T, rec *sendRecorder) []string {
+	t.Helper()
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+
+	var out []string
+
+	for _, body := range rec.bodies {
+		c, err := joblog.Decode(body)
+		if err != nil {
+			t.Fatalf("a chunk sent does not decode: %v", err)
+		}
+
+		for _, l := range c.Lines {
+			out = append(out, l.Text)
+		}
+	}
+
+	return out
 }
 
 // WHAT IS LEFT REACHES THE NODE AFTER THE STOP, within its budget: the cleanup's lines exist
@@ -479,20 +540,156 @@ func TestAStoppedShipperSendsWhatIsLeft(t *testing.T) {
 
 		rec := &sendRecorder{}
 		s := shipperFor(t, diag, rec)
+		s.period = time.Hour
 
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
+		stop := runShipper(s)
+		stop()
 
-		s.finish(ctx)
-
-		if rec.sent() != 1 {
-			t.Fatalf("%d sends after the stop, want the one line left", rec.sent())
-		}
-		c, err := joblog.Decode(rec.bodies[0])
-		if err != nil || c.Lines[0].Text != "last words" {
-			t.Errorf("sent %+v, %v", c, err)
+		if got := keptLines(t, rec); len(got) != 1 || got[0] != "last words" {
+			t.Errorf("sent %q after the stop, want the one line left", got)
 		}
 	})
+}
+
+// A FILE LONGER THAN ONE PASS'S READ IS READ TO ITS END: a pass that sent everything it held
+// has not thereby read everything there is. And a last line with no end is still a line, in a
+// file the runner never unlinked.
+func TestAStoppedShipperReadsPastAPass(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		diag, pages := diagWithPages(t)
+
+		line := "2026-11-04T07:04:45.1Z " + strings.Repeat("x", 1000) + "\n"
+		count := 3 * logReadLimit / len(line)
+		writePage(t, pages, pageName(stepRecord, 1), strings.Repeat(line, count)+"2026-11-04T07:04:46.1Z no end")
+
+		rec := &sendRecorder{}
+		s := shipperFor(t, diag, rec)
+		s.period = time.Hour
+
+		stop := runShipper(s)
+		stop()
+
+		got := keptLines(t, rec)
+		if len(got) != count+1 {
+			t.Fatalf("sent %d lines, want %d: all of the file", len(got), count+1)
+		}
+		if got[count] != "no end" {
+			t.Errorf("the last line sent was %q", got[count])
+		}
+	})
+}
+
+// blockingSend is a node that answers one request only when the test says.
+type blockingSend struct {
+	sendRecorder
+
+	release chan struct{}
+}
+
+func (b *blockingSend) RoundTrip(req *http.Request) (*http.Response, error) {
+	select {
+	case <-b.release:
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
+
+	return b.sendRecorder.RoundTrip(req)
+}
+
+// SENDING DOES NOT STOP THE LOOKING: a page created while a request waits on the node is
+// opened, so its delete loses nothing. Each page is deleted before the node has answered.
+func TestAPageMetWhileTheNodeWaitsIsNotLost(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		diag, pages := diagWithPages(t)
+		writePage(t, pages, pageName(stepRecord, 1), "2026-11-04T07:04:45.1Z first\n")
+
+		rec := &blockingSend{release: make(chan struct{})}
+		s := shipperFor(t, diag, rec)
+		s.period = time.Second
+
+		stop := runShipper(s)
+
+		// The first chunk is with the node, which is not answering.
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+
+		writePage(t, pages, pageName(otherRecord, 1), "2026-11-04T07:04:46.1Z second\n")
+		time.Sleep(2 * logPollEvery)
+		synctest.Wait()
+
+		if err := os.Remove(filepath.Join(pages, pageName(otherRecord, 1))); err != nil {
+			t.Fatal(err)
+		}
+
+		close(rec.release)
+		stop()
+
+		got := keptLines(t, &rec.sendRecorder)
+		if !slices.Contains(got, "second") {
+			t.Errorf("sent %q, without the page deleted while the node waited", got)
+		}
+	})
+}
+
+// A STOP DOES NOT COST THE CHUNK BEING SENT: it is the one the retry after the stop carries.
+func TestAChunkBeingRetriedSurvivesTheStop(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		diag, pages := diagWithPages(t)
+		writePage(t, pages, pageName(stepRecord, 1), "2026-11-04T07:04:45.1Z held\n")
+
+		// Could not tell, so the sender waits its backoff, and the stop comes inside that.
+		rec := &sendRecorder{script: []int{http.StatusInternalServerError}}
+		s := shipperFor(t, diag, rec)
+		s.period = time.Second
+
+		stop := runShipper(s)
+
+		time.Sleep(s.period + logPollEvery/2)
+		synctest.Wait()
+
+		if rec.sent() != 1 {
+			t.Fatalf("%d sends before the stop, want the one the node did not answer", rec.sent())
+		}
+
+		stop()
+
+		if rec.sent() != 2 {
+			t.Fatalf("%d sends in all, want the chunk sent once more after the stop", rec.sent())
+		}
+		if got := keptLines(t, rec); got[1] != "held" {
+			t.Errorf("the retry carried %q", got[1])
+		}
+	})
+}
+
+// A JOB CANNOT GROW WHAT THE AGENT REMEMBERS: past the bound a fresh name is not met, and that
+// is counted once.
+func TestTheNamesRememberedAreBounded(t *testing.T) {
+	t.Parallel()
+
+	diag, pages := diagWithPages(t)
+	writePage(t, pages, pageName(stepRecord, 1), "2026-11-04T07:04:45.1Z one\n")
+
+	tail := tailerAt(t, diag)
+	for i := range logMaxNames {
+		tail.names[fmt.Sprint(i)] = struct{}{}
+	}
+
+	tail.scan()
+	tail.scan()
+
+	if len(tail.names) != logMaxNames || len(tail.open) != 0 {
+		t.Errorf("%d names and %d files open past the bound", len(tail.names), len(tail.open))
+	}
+	if tail.lost != 1 {
+		t.Errorf("%d counted lost, want one for all of them", tail.lost)
+	}
 }
 
 // A NODE THAT OFFERS NO HOME FOR A LOG GETS NONE, one whose offer cannot be read is no offer,

@@ -181,7 +181,13 @@ func splitQuery(args []string) (string, []string) {
 			name, inline = strings.CutPrefix(arg, "-")
 		}
 
+		// A FLAG'S OWN VALUE CAN HOLD A SPACE, which is otherwise what marks a query that
+		// begins with a minus.
+		flag, _, hasValue := strings.Cut(name, "=")
+
 		switch {
+		case inline && hasValue && takesValue[flag]:
+			rest = append(rest, arg)
 		case !inline || arg == "-" || arg == "--" || strings.Contains(arg, " "):
 			if query != "" {
 				return query, append(rest, args[i:]...)

@@ -1343,8 +1343,19 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		}
 
 		// A LOG READ RUNS BESIDE THE LOOP ALWAYS: it touches no compute and takes no
-		// lease, and a search should not wait out a destroy or an upgrade.
-		if cmd.Kind == nodeapi.CommandReadLog && reads.start(ctx, run) {
+		// lease, and a search should not wait out a destroy or an upgrade. NOR THE LOOP
+		// FOR A READ: with every slot taken it is answered busy at once, since a destroy
+		// behind it matters more, and a reader can ask again.
+		if cmd.Kind == nodeapi.CommandReadLog {
+			if !reads.tryStart(run) {
+				err := reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd, nodeapi.CommandResult{
+					ID: cmd.ID, Error: "this node is reading as many logs as it may; ask again",
+				})
+				if err != nil {
+					return err
+				}
+			}
+
 			continue
 		}
 

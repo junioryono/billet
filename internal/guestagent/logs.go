@@ -40,6 +40,12 @@ const (
 	// logMaxFiles bounds the descriptors held. A job cannot be stopped from creating
 	// names here, and what is past the bound is counted lost.
 	logMaxFiles = 256
+	// logMaxNames bounds the names remembered over a job's life, and with them the steps.
+	// A job can go on creating fresh names while keeping few present, and a real one has a
+	// few for each step. Past it nothing new is opened, and that is counted once.
+	logMaxNames = 1 << 14
+	// logMaxMarks bounds the runner's marks waiting for a step log.
+	logMaxMarks = 1 << 12
 	// logReadLimit is what one pass takes of one file, and logHeldLimit what the agent
 	// holds unsent across every file; past it reading waits for the node.
 	logReadLimit = 256 << 10
@@ -52,6 +58,12 @@ const (
 	logPollEvery  = time.Second
 	logRetryFirst = time.Second
 	logRetryMost  = time.Minute
+	// logHandOverEvery is how soon more is handed to the sender while some waits for it.
+	logHandOverEvery = 100 * time.Millisecond
+	// logRetryStopping is the longest a retry waits once the agent is told to stop.
+	logRetryStopping = 200 * time.Millisecond
+	// logSendQueue is how many chunks wait for the sender, past the one it holds.
+	logSendQueue = 4
 	// logFinalBudget bounds sending what is left once the agent is told to stop, inside
 	// the contract's 3 s, beside the final report and never in its way.
 	logFinalBudget = 2500 * time.Millisecond
@@ -83,7 +95,9 @@ type logTailer struct {
 	marks *tailer
 	log   *limitedLog
 
-	files map[string]*logFile
+	// names are the step logs met, opened or not, up to logMaxNames.
+	names     map[string]struct{}
+	namesFull bool
 	// open are the files being read, in the order they were found.
 	open []*logFile
 	// steps is each record's step number, so a step's later pages stay its own.
@@ -106,7 +120,7 @@ type logStep struct {
 
 func newLogTailer(diag string, log *limitedLog) *logTailer {
 	return &logTailer{dir: filepath.Join(diag, logPagesDir), marks: newTailer(diag, log), log: log,
-		files: map[string]*logFile{}, steps: map[string]*logStep{}, buf: make([]byte, logReadLimit)}
+		names: map[string]struct{}{}, steps: map[string]*logStep{}, buf: make([]byte, logReadLimit)}
 }
 
 // recordOf is the record a page's name says it holds, and false for a name that is no
@@ -155,7 +169,7 @@ func (t *logTailer) scan() {
 // meet opens one name in the directory if it is a step log not met before. A file that
 // is gone already was missed for good, and is counted so.
 func (t *logTailer) meet(dir *os.File, name string) {
-	if _, known := t.files[name]; known {
+	if _, known := t.names[name]; known {
 		return
 	}
 
@@ -164,8 +178,18 @@ func (t *logTailer) meet(dir *os.File, name string) {
 		return
 	}
 
+	if len(t.names) >= logMaxNames {
+		if !t.namesFull {
+			t.namesFull = true
+			t.lost++
+		}
+
+		return
+	}
+
+	t.names[name] = struct{}{}
+
 	if len(t.open) >= logMaxFiles {
-		t.files[name] = &logFile{done: true}
 		t.lost++
 
 		return
@@ -173,20 +197,20 @@ func (t *logTailer) meet(dir *os.File, name string) {
 
 	f, _, err := regularfile.OpenAt(dir, name)
 	if err != nil {
-		t.files[name] = &logFile{done: true}
 		t.lost++
 
 		return
 	}
 
-	file := &logFile{f: f, name: name, record: record}
-	t.files[name] = file
-	t.open = append(t.open, file)
+	t.open = append(t.open, &logFile{f: f, name: name, record: record})
 }
 
-// read takes what each open file gained, while the agent holds less than its bound. A
-// file read to its end and unlinked is finished; one still linked may yet grow.
-func (t *logTailer) read() {
+// read takes what each open file gained, while the agent holds less than its bound, and
+// says whether there may be more to read at once: it read something, or the bound stopped
+// it. A file read to its end and unlinked is finished; one still linked may yet grow.
+func (t *logTailer) read() bool {
+	more := false
+
 	for _, file := range t.open {
 		if file.done {
 			continue
@@ -195,11 +219,15 @@ func (t *logTailer) read() {
 		// NOT A RETURN: what is held has to be numbered below before it can be sent, or
 		// a full buffer of unnumbered lines would wait for itself.
 		if t.held >= logHeldLimit {
+			more = true
+
 			break
 		}
 
 		n, err := file.f.Read(t.buf)
 		t.consume(file, t.buf[:n])
+
+		more = more || n > 0
 
 		if (n == 0 && errors.Is(err, io.EOF) || err != nil && !errors.Is(err, io.EOF)) && t.finished(file, err) {
 			t.closeFile(file)
@@ -207,6 +235,21 @@ func (t *logTailer) read() {
 	}
 
 	t.open = slices.DeleteFunc(t.open, func(f *logFile) bool { return f.done && len(f.lines) == 0 })
+	t.assign()
+
+	return more
+}
+
+// endLines takes each file's unfinished last line as a line, once the runner has exited and
+// nothing will end it: a file the runner never unlinked is never closed.
+func (t *logTailer) endLines() {
+	for _, file := range t.open {
+		if !file.done && len(file.partial) > 0 {
+			t.keepLine(file, string(file.partial))
+			file.partial, file.skipping = file.partial[:0], false
+		}
+	}
+
 	t.assign()
 }
 
@@ -329,6 +372,7 @@ func (t *logTailer) assign() {
 
 	t.marks.poll()
 	t.marked = append(t.marked, t.marks.take()...)
+	t.marked = t.marked[max(0, len(t.marked)-logMaxMarks):]
 
 	slices.SortStableFunc(waiting, func(a, b *logFile) int {
 		switch {
@@ -416,19 +460,45 @@ func (t *logTailer) nextChunk(limit int) ([]byte, bool) {
 // logShipper sends a job's step logs to the node, until the agent is told to stop and
 // then as much of what is left as its budget allows. It decides nothing, and nothing it
 // does can reach the job.
+//
+// TWO GOROUTINES, BECAUSE SENDING MUST NOT STOP THE LOOKING. A step that wrote little can
+// be created, uploaded and deleted while a request waits on a node, and a file not opened
+// before its delete is lost; a wake from inotify keeps nothing. So the reader owns the
+// tailer and only ever hands chunks over without waiting, and the sender waits on the node.
 type logShipper struct {
 	node   *node
 	tail   *logTailer
 	limit  int
 	period time.Duration
 	log    *limitedLog
-	done   chan struct{}
+
+	// queue carries chunks to the sender. next is the one cut and not handed over yet,
+	// which only the reader touches.
+	queue chan []byte
+	next  []byte
+	// stopped closes when the sender will send nothing more.
+	stopped chan struct{}
+	done    chan struct{}
+	// watching makes what wakes the reader; a test's cannot be inotify, whose wait a
+	// synctest bubble cannot see past.
+	watching func(dir string) pagesWaiter
+}
+
+// pagesWaiter wakes the reader as a page appears, or when a wait has passed.
+type pagesWaiter interface {
+	wait(ctx context.Context, d time.Duration)
+	close()
+}
+
+func newLogShipper(n *node, tail *logTailer, limit int, period time.Duration, log *limitedLog) *logShipper {
+	return &logShipper{node: n, tail: tail, limit: limit, period: period, log: log,
+		queue: make(chan []byte, logSendQueue), stopped: make(chan struct{}), done: make(chan struct{}),
+		watching: func(dir string) pagesWaiter { return newPagesWatch(dir) }}
 }
 
 // startLogs ships a job's step logs under what the node's hello offered, until ctx ends.
 func startLogs(ctx context.Context, n *node, diag string, offer *logLimits, log *limitedLog) *logShipper {
-	s := &logShipper{node: n, tail: newLogTailer(diag, log), limit: min(offer.maxBody, joblog.MaxChunkBytes),
-		period: offer.interval, log: log, done: make(chan struct{})}
+	s := newLogShipper(n, newLogTailer(diag, log), min(offer.maxBody, joblog.MaxChunkBytes), offer.interval, log)
 
 	go func() {
 		defer close(s.done)
@@ -442,105 +512,166 @@ func startLogs(ctx context.Context, n *node, diag string, offer *logLimits, log 
 // wait returns once the shipper has finished.
 func (s *logShipper) wait() { <-s.done }
 
-// run is the shipper's loop. A page is opened as soon as it is seen, which is why it
-// looks every logPollEvery at the longest however seldom it sends.
+// run is the reader's loop, and joins the sender. A page is opened as soon as it is seen,
+// which is why it looks every logPollEvery at the longest however seldom it sends.
 func (s *logShipper) run(ctx context.Context) {
-	watch := newPagesWatch(s.tail.dir)
+	// THE SENDER OUTLIVES ctx BY THE FINAL BUDGET, so a request under way when the agent is
+	// told to stop is not cut off, and its chunk is not lost.
+	sendCtx, cancelSend := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelSend()
+
+	sender := make(chan struct{})
+
+	go func() {
+		defer close(sender)
+
+		s.sendAll(ctx, sendCtx)
+	}()
+
+	watch := s.watching(s.tail.dir)
 	defer watch.close()
 
 	sent := time.Now()
+	handing := false
 
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && !s.senderStopped() {
 		s.tail.scan()
 		s.tail.read()
 
 		if time.Since(sent) >= s.period {
-			sent = time.Now()
-
-			if !s.send(ctx) {
-				return
-			}
+			sent, handing = time.Now(), true
 		}
 
-		watch.wait(ctx, logPollEvery)
+		wait := logPollEvery
+
+		if handing {
+			handing = !s.handOver()
+		}
+
+		if handing {
+			wait = logHandOverEvery
+		}
+
+		watch.wait(ctx, wait)
 	}
 
-	s.finish(ctx)
+	// THE BUDGET ENDS THE SENDER, HOWEVER LONG THE NODE IS AWAY, and has to outlast the
+	// reader's part of it: what the reader hands over is still to be sent when it returns.
+	budget := time.AfterFunc(logFinalBudget, cancelSend)
+	defer budget.Stop()
+
+	s.finish()
+
+	close(s.queue)
+	<-sender
 }
 
-// finish reads what is left and sends it within the final budget. Ending here is what
-// makes "Complete job" reach the node: the runner has exited by the time this runs.
-func (s *logShipper) finish(ctx context.Context) {
-	deadline := time.Now().Add(logFinalBudget)
-
-	fctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
-	defer cancel()
-
-	for fctx.Err() == nil {
-		before := s.tail.held
-		s.tail.scan()
-		s.tail.read()
-
-		if !s.send(fctx) {
-			return
-		}
-
-		if s.tail.held == 0 && before == 0 {
-			return
-		}
+func (s *logShipper) senderStopped() bool {
+	select {
+	case <-s.stopped:
+		return true
+	default:
+		return false
 	}
 }
 
-// send sends every chunk the tailer holds, and reports false when the node has said to
-// send nothing more. A chunk the node asks to be sent again is, after its wait, and a
-// chunk it refused is gone: its number shows the gap.
-func (s *logShipper) send(ctx context.Context) bool {
-	backoff := logRetryFirst
-
+// handOver gives the sender as many chunks as it will take without waiting, and says
+// whether that was all of them. A number is spent on a chunk when it is cut, so it is kept
+// until the sender has it.
+func (s *logShipper) handOver() bool {
 	for {
-		data, ok := s.tail.nextChunk(s.limit)
-		if !ok {
-			return true
-		}
-
-		for {
-			v, wait := s.node.sendLogs(ctx, data)
-
-			switch v {
-			case accepted, refused:
-			case stop:
-				s.log.always("the node stopped taking this job's logs; nothing more is sent")
-
-				return false
-			case rateLimited:
-				backoff = max(wait, logRetryFirst)
-
-				if !sleepFor(ctx, backoff) {
-					return true
-				}
-
-				continue
-			default:
-				s.log.printf("logs-send", "the node's answer to a log chunk could not be told; it is sent again")
-
-				if !sleepFor(ctx, backoff) {
-					return true
-				}
-
-				backoff = min(2*backoff, logRetryMost)
-
-				continue
+		if s.next == nil {
+			data, ok := s.tail.nextChunk(s.limit)
+			if !ok {
+				return true
 			}
 
+			s.next = data
+		}
+
+		select {
+		case s.queue <- s.next:
+			s.next = nil
+		default:
+			return false
+		}
+	}
+}
+
+// finish reads what is left to its end and hands it over, within the final budget. Ending
+// here is what makes "Complete job" reach the node: the runner has exited by the time this
+// runs. It is done only when a pass read nothing and nothing is held: a pass that sent all
+// it held may have read only the first part of a long file.
+func (s *logShipper) finish() {
+	stopBy := time.Now().Add(logFinalBudget)
+
+	for time.Now().Before(stopBy) && !s.senderStopped() {
+		s.tail.scan()
+
+		more := s.tail.read()
+		if !more {
+			s.tail.endLines()
+		}
+
+		handed := s.handOver()
+		if handed && !more {
 			break
 		}
 
-		backoff = logRetryFirst
-
-		if ctx.Err() != nil {
-			return true
+		if !handed {
+			time.Sleep(logHandOverEvery)
 		}
 	}
+
+	if s.tail.lost > 0 {
+		s.log.printf("logs-lost", "%d of this job's step logs were not read", s.tail.lost)
+	}
+}
+
+// sendAll sends what it is handed until the queue closes or nothing more may be sent.
+func (s *logShipper) sendAll(ctx, sendCtx context.Context) {
+	for data := range s.queue {
+		if !s.deliver(ctx, sendCtx, data) {
+			close(s.stopped)
+
+			return
+		}
+	}
+}
+
+// deliver sends one chunk until the node has answered for it, and reports false when nothing
+// more should be sent. THE SAME CHUNK UNTIL THEN, whatever ends: a chunk the node asks for
+// again is sent again after its wait, and one it refused is gone, its number showing the gap.
+func (s *logShipper) deliver(ctx, sendCtx context.Context, data []byte) bool {
+	backoff := logRetryFirst
+
+	for sendCtx.Err() == nil {
+		v, wait := s.node.sendLogs(sendCtx, data)
+
+		var pause time.Duration
+
+		switch v {
+		case accepted, refused:
+			return true
+		case stop:
+			s.log.always("the node stopped taking this job's logs; nothing more is sent")
+
+			return false
+		case rateLimited:
+			pause = max(wait, logRetryFirst)
+		default:
+			s.log.printf("logs-send", "the node's answer to a log chunk could not be told; it is sent again")
+
+			pause, backoff = backoff, min(2*backoff, logRetryMost)
+		}
+
+		// A STOP CUTS THE WAIT SHORT, and what is left of the budget is all there is.
+		if ctx.Err() != nil || !sleepFor(ctx, pause) {
+			sleepFor(sendCtx, min(pause, logRetryStopping))
+		}
+	}
+
+	return false
 }
 
 // sleepFor waits d, and reports false when ctx ended first.

@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -43,11 +44,16 @@ const (
 const (
 	jobLogDirectory = "joblogs"
 	jobLogShipped   = "shipped"
-	jobLogSuffix    = ".chunk"
+	// jobLogEvicted marks a lease whose log was evicted, and which takes no more.
+	jobLogEvicted = "evicted"
+	jobLogSuffix  = ".chunk"
 	// jobLogPassEvery is how often a shipping pass runs with nothing to wake it, and
 	// jobLogEvictEvery an eviction pass.
 	jobLogPassEvery  = 10 * time.Second
 	jobLogEvictEvery = 10 * time.Minute
+	// jobLogEvictedKept is how long an evicted lease stays refused, past any job that could
+	// still be running: GitHub ends a self-hosted runner's job at 5 days (its documentation).
+	jobLogEvictedKept = 7 * 24 * time.Hour
 	// jobLogShipTimeout bounds shipping one chunk.
 	jobLogShipTimeout = 30 * time.Second
 	// jobLogSeqSet bounds the chunk numbers one lease remembers.
@@ -87,6 +93,8 @@ type JobLogStore struct {
 	leases map[string]*leaseLog
 	total  int64
 	wake   chan struct{}
+	// evictNow wakes the eviction loop when room was made for a chunk.
+	evictNow chan struct{}
 }
 
 // leaseLog is what the store holds of one lease. Only under the store's lock.
@@ -95,6 +103,12 @@ type leaseLog struct {
 	bytes    int64
 	newest   time.Time
 	seqs     map[uint64]bool
+
+	// evictedAt is when this lease's log was evicted, zero while it is held. AN EVICTED LEASE
+	// TAKES NO MORE: its numbers are in the index, and numbering afresh would make a search
+	// read back a different line than it matched. swept says its chunks are gone.
+	evictedAt time.Time
+	swept     bool
 }
 
 // NewJobLogStore loads what an earlier process kept under stateDir. A chunk file that
@@ -102,7 +116,7 @@ type leaseLog struct {
 // number other chunks' numbers count past.
 func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*JobLogStore, error) {
 	s := &JobLogStore{dir: filepath.Join(stateDir, jobLogDirectory), limits: limits, log: log, now: time.Now,
-		leases: map[string]*leaseLog{}, wake: make(chan struct{}, 1)}
+		leases: map[string]*leaseLog{}, wake: make(chan struct{}, 1), evictNow: make(chan struct{}, 1)}
 	if s.log == nil {
 		s.log = slog.Default()
 	}
@@ -118,6 +132,14 @@ func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*Jo
 
 	for _, e := range entries {
 		if !e.IsDir() || !validLease(e.Name()) {
+			continue
+		}
+
+		if info, err := os.Lstat(filepath.Join(s.dir, e.Name(), jobLogEvicted)); err == nil {
+			// ITS CHUNKS MAY BE LEFT if the last process stopped sweeping them; the next
+			// eviction pass finishes that, and they count for nothing meanwhile.
+			s.leases[e.Name()] = &leaseLog{evictedAt: info.ModTime()}
+
 			continue
 		}
 
@@ -249,8 +271,14 @@ func (s *JobLogStore) Keep(leaseID string, chunk *joblog.Chunk, data []byte) err
 
 	l := s.leases[leaseID]
 	if l == nil {
-		l = &leaseLog{seqs: map[uint64]bool{}}
+		// NEWEST FROM THE START: a lease whose first chunk was refused is no older than any
+		// other, and must not read as the first to evict.
+		l = &leaseLog{seqs: map[uint64]bool{}, newest: s.now()}
 		s.leases[leaseID] = l
+	}
+
+	if !l.evictedAt.IsZero() {
+		return ErrJobLogBudget
 	}
 
 	if l.seqs[chunk.Seq] {
@@ -262,18 +290,22 @@ func (s *JobLogStore) Keep(leaseID string, chunk *joblog.Chunk, data []byte) err
 		return ErrJobLogBudget
 	}
 
+	if s.total+size > s.limits.MaxBytes && !s.makeRoom(leaseID, size) {
+		return ErrJobLogBudget
+	}
+
 	dir := filepath.Join(s.dir, leaseID)
 	if err := (durablefile.Installer{}).MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("node: create a lease's job log: %w", err)
 	}
 
-	if _, err := (durablefile.Installer{}).InstallNew(dir, chunkName(l.nextLine, chunk.Seq, lines), 0o600,
-		func(w io.Writer) error {
-			_, err := w.Write(data)
-
-			return err
-		}); err != nil {
+	published, err := installChunk(dir, chunkName(l.nextLine, chunk.Seq, lines), data)
+	if !published {
 		return fmt.Errorf("node: keep a chunk of a job's log: %w", err)
+	}
+
+	if err != nil {
+		s.log.Warn("a chunk of a job's log is in place and could not be made durable", "lease", leaseID, "error", err)
 	}
 
 	l.seqs[chunk.Seq] = true
@@ -290,19 +322,82 @@ func (s *JobLogStore) Keep(leaseID string, chunk *joblog.Chunk, data []byte) err
 	return nil
 }
 
+// installChunk puts a chunk in place, and says whether it is there. PUBLISHED IS NOT
+// SUCCEEDED: an install can fail after its link, and a chunk in place has taken its line
+// numbers whatever the error says, so it is accounted for, a retry finds its number kept, and
+// no later chunk is numbered over it. The price is a chunk whose durability failed being lost
+// to a crash, on a disk already failing.
+func installChunk(dir, name string, data []byte) (bool, error) {
+	_, err := (durablefile.Installer{}).InstallNew(dir, name, 0o600, func(w io.Writer) error {
+		_, err := w.Write(data)
+
+		return err
+	})
+	if err == nil {
+		return true, nil
+	}
+
+	held, readErr := regularfile.ReadFile(filepath.Join(dir, name), joblog.MaxChunkBytes,
+		regularfile.Options{NoFollow: true})
+	if readErr != nil || !bytes.Equal(held, data) {
+		return false, err
+	}
+
+	return true, err
+}
+
+// makeRoom evicts the jobs least recently written, never leaseID, until size more fits the
+// node's bound, and says whether it does. Called with mu held. It marks them; the eviction
+// loop deletes their files, so a chunk's request does not wait on that.
+func (s *JobLogStore) makeRoom(leaseID string, size int64) bool {
+	for _, id := range s.leaseIDsLocked() {
+		if s.total+size <= s.limits.MaxBytes {
+			break
+		}
+
+		if id != leaseID {
+			s.markEvicted(s.leases[id])
+		}
+	}
+
+	select {
+	case s.evictNow <- struct{}{}:
+	default:
+	}
+
+	return s.total+size <= s.limits.MaxBytes
+}
+
+// markEvicted takes a lease's log out of what is held. Called with mu held.
+func (s *JobLogStore) markEvicted(l *leaseLog) {
+	if !l.evictedAt.IsZero() {
+		return
+	}
+
+	l.evictedAt = s.now()
+	s.total -= l.bytes
+	l.bytes, l.seqs = 0, nil
+}
+
 // ReadLines reads back the lines ranges name of a lease's log, at most maxBytes of
 // text, in line order. Held is false when this node holds nothing of the lease, which is
-// never no matching lines; Cut says the bound stopped the read.
-func (s *JobLogStore) ReadLines(leaseID string, ranges []nodeapi.LogLineRange, maxBytes int) (nodeapi.LogReadResult,
-	error,
-) {
+// never no matching lines; Cut says the bound stopped the read. A read ctx ended is an
+// error, since a search must not take what it reached for all there is.
+func (s *JobLogStore) ReadLines(ctx context.Context, leaseID string, ranges []nodeapi.LogLineRange,
+	maxBytes int,
+) (nodeapi.LogReadResult, error) {
 	var out nodeapi.LogReadResult
 
 	if !validLease(leaseID) {
 		return out, errors.New("node: a job log read needs a lease")
 	}
 
-	if _, err := os.Stat(filepath.Join(s.dir, leaseID)); errors.Is(err, fs.ErrNotExist) {
+	s.mu.Lock()
+	l := s.leases[leaseID]
+	held := l != nil && l.evictedAt.IsZero()
+	s.mu.Unlock()
+
+	if !held {
 		return out, nil
 	}
 
@@ -312,11 +407,15 @@ func (s *JobLogStore) ReadLines(leaseID string, ranges []nodeapi.LogLineRange, m
 	}
 
 	out.Held = true
-	held := 0
+	text := 0
 
 	for _, c := range chunks {
 		if !anyOverlap(ranges, c.firstLine, c.lines) {
 			continue
+		}
+
+		if err := ctx.Err(); err != nil {
+			return nodeapi.LogReadResult{}, err
 		}
 
 		chunk, err := s.readChunk(leaseID, c.name)
@@ -332,13 +431,13 @@ func (s *JobLogStore) ReadLines(leaseID string, ranges []nodeapi.LogLineRange, m
 				continue
 			}
 
-			if held+len(line.Text) > maxBytes || len(out.Lines) >= nodeapi.MaxLogReadLines {
+			if text+len(line.Text) > maxBytes || len(out.Lines) >= nodeapi.MaxLogReadLines {
 				out.Cut = true
 
 				return out, nil
 			}
 
-			held += len(line.Text)
+			text += len(line.Text)
 			out.Lines = append(out.Lines, nodeapi.LogLine{Line: number, AtMillis: line.AtMillis, Text: line.Text})
 		}
 	}
@@ -428,11 +527,15 @@ func (s *JobLogStore) writeMark(leaseID string, mark shippedMark) error {
 // Run ships what is kept and evicts what is past its bounds, until ctx ends. It decides
 // nothing about any job: a pass that fails is said and the next tries again.
 func (s *JobLogStore) Run(ctx context.Context, sink JobLogSink) {
+	// EVICTION HAS A LOOP OF ITS OWN: shipping to a control plane that is away can take as
+	// long as it is away, and the disk's bound does not wait for it.
+	var evicting sync.WaitGroup
+	evicting.Go(func() { s.evictLoop(ctx) })
+
+	defer evicting.Wait()
+
 	ship := time.NewTicker(jobLogPassEvery)
 	defer ship.Stop()
-
-	evict := time.NewTicker(jobLogEvictEvery)
-	defer evict.Stop()
 
 	for {
 		s.shipPass(ctx, sink)
@@ -442,9 +545,23 @@ func (s *JobLogStore) Run(ctx context.Context, sink JobLogSink) {
 			return
 		case <-ship.C:
 		case <-s.wake:
-		case <-evict.C:
-			s.evictPass()
 		}
+	}
+}
+
+func (s *JobLogStore) evictLoop(ctx context.Context) {
+	tick := time.NewTicker(jobLogEvictEvery)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		case <-s.evictNow:
+		}
+
+		s.evictPass()
 	}
 }
 
@@ -454,6 +571,11 @@ func (s *JobLogStore) leaseIDs() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.leaseIDsLocked()
+}
+
+// leaseIDsLocked is leaseIDs with mu held.
+func (s *JobLogStore) leaseIDsLocked() []string {
 	ids := make([]string, 0, len(s.leases))
 	for id := range s.leases {
 		ids = append(ids, id)
@@ -489,6 +611,10 @@ func (s *JobLogStore) shipPass(ctx context.Context, sink JobLogSink) {
 // for now. The mark is written once for the lease, not for each chunk: a crash costs a
 // repeat, which the index ignores.
 func (s *JobLogStore) shipLease(ctx context.Context, sink JobLogSink, index, leaseID string) bool {
+	if s.evicted(leaseID) {
+		return true
+	}
+
 	mark := s.readMark(leaseID)
 	if mark.Index != index {
 		mark = shippedMark{Index: index}
@@ -514,6 +640,10 @@ func (s *JobLogStore) shipLease(ctx context.Context, sink JobLogSink, index, lea
 
 		data, err := regularfile.ReadFile(filepath.Join(s.dir, leaseID, c.name), joblog.MaxChunkBytes,
 			regularfile.Options{NoFollow: true})
+		if s.evicted(leaseID) {
+			return true
+		}
+
 		if err != nil {
 			s.log.Warn("could not read a chunk of a job's kept log; trying again", "lease", leaseID, "error", err)
 
@@ -555,22 +685,55 @@ func (s *JobLogStore) shipLease(ctx context.Context, sink JobLogSink, index, lea
 	return ok
 }
 
-// evictPass deletes whole jobs' logs past the retention, then the oldest past the node's
-// bound. The newest may still be running, which costs it the chunks already kept and
-// nothing else.
+func (s *JobLogStore) evicted(leaseID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	l := s.leases[leaseID]
+
+	return l == nil || !l.evictedAt.IsZero()
+}
+
+// evictPass evicts whole jobs' logs past the retention, then the oldest past the node's bound,
+// deletes the files of what is evicted, and forgets what was evicted long enough ago. The newest
+// may still be running, which costs it the rest of its log and nothing else.
 func (s *JobLogStore) evictPass() {
-	cutoff := s.now().Add(-s.limits.Retention)
+	now := s.now()
+	cutoff := now.Add(-s.limits.Retention)
 
-	for _, id := range s.leaseIDs() {
-		s.mu.Lock()
-		l, known := s.leases[id]
-		over := known && (l.newest.Before(cutoff) || s.total > s.limits.MaxBytes)
-		s.mu.Unlock()
+	s.mu.Lock()
+	for _, id := range s.leaseIDsLocked() {
+		if l := s.leases[id]; l.newest.Before(cutoff) || s.total > s.limits.MaxBytes {
+			s.markEvicted(l)
+		}
+	}
 
-		if !over {
+	var sweep, forget []string
+
+	for id, l := range s.leases {
+		switch {
+		case l.evictedAt.IsZero():
+		case !l.swept:
+			sweep = append(sweep, id)
+		case l.evictedAt.Before(now.Add(-jobLogEvictedKept)):
+			forget = append(forget, id)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, id := range sweep {
+		if err := s.sweep(id); err != nil {
+			s.log.Warn("could not delete a job's kept log; trying again", "lease", id, "error", err)
+
 			continue
 		}
 
+		s.mu.Lock()
+		s.leases[id].swept = true
+		s.mu.Unlock()
+	}
+
+	for _, id := range forget {
 		if err := os.RemoveAll(filepath.Join(s.dir, id)); err != nil {
 			s.log.Warn("could not delete a job's kept log; trying again", "lease", id, "error", err)
 
@@ -578,10 +741,41 @@ func (s *JobLogStore) evictPass() {
 		}
 
 		s.mu.Lock()
-		s.total -= l.bytes
 		delete(s.leases, id)
 		s.mu.Unlock()
 	}
+}
+
+// sweep deletes an evicted lease's chunks, leaving what says it was evicted, written first so a
+// restart cannot number it afresh. A lease with no directory never wrote a chunk.
+func (s *JobLogStore) sweep(leaseID string) error {
+	dir := filepath.Join(s.dir, leaseID)
+
+	if _, err := (durablefile.Installer{}).Install(dir, jobLogEvicted, 0o600,
+		func(io.Writer) error { return nil }); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+
+		return err
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, e := range entries {
+		if e.Name() == jobLogEvicted {
+			continue
+		}
+
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // guestLogOffer is what the agent is told it may send of a job's step logs.

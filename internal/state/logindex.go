@@ -286,9 +286,11 @@ func logIndexQueryRow(ctx context.Context, db logRowQuerier, stmt string, args .
 }
 
 // Retain removes whole days older than before, then the oldest while the files take more
-// than maxBytes in all, and says how many it removed. The day it is writing stays, so a
-// bound smaller than one day's lines costs the days before it and no more. Whether a
-// reader has a removed file open does not matter: it reads on from what it opened.
+// than maxBytes in all, and says how many it removed. The day it is writing stays while it
+// is inside the retention, so a bound smaller than one day's lines costs the days before it
+// and no more; past the retention it goes like any other, or an idle controller would keep
+// its last day for ever. Whether a reader has a removed file open does not matter: it reads
+// on from what it opened.
 func (x *LogIndex) Retain(before time.Time, maxBytes int64) (int, error) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -310,12 +312,17 @@ func (x *LogIndex) Retain(before time.Time, maxBytes int64) (int, error) {
 	}
 
 	for _, day := range days {
-		if day == x.day {
+		if day == x.day && day >= cutoff {
 			continue
 		}
 
 		if day >= cutoff && total <= maxBytes {
 			break
+		}
+
+		if day == x.day {
+			_ = x.db.Close()
+			x.db, x.day = nil, ""
 		}
 
 		for _, suffix := range []string{".db", ".db-wal", ".db-shm"} {

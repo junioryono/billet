@@ -106,9 +106,14 @@ func listenOperator(cfg *config.Config) (*peerListener, error) {
 	return &peerListener{Listener: ln, log: slog.Default()}, nil
 }
 
+// operatorLedger is what the socket reads of the ledger.
+type operatorLedger interface {
+	Job(ctx context.Context, leaseID string) (alloc.JobRecord, error)
+}
+
 // operatorServer is what the socket serves.
 type operatorServer struct {
-	jobs  *alloc.Allocator
+	jobs  operatorLedger
 	plane *nodeplane.Plane
 	log   *slog.Logger
 }
@@ -157,8 +162,14 @@ func (s *operatorServer) readLog(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	job, err := s.jobs.Job(ctx, req.Lease)
-	if err != nil {
+	if errors.Is(err, alloc.ErrLeaseNotFound) {
 		http.Error(w, "the ledger holds no such job", http.StatusNotFound)
+
+		return
+	}
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 
 		return
 	}

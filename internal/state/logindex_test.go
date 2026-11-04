@@ -224,6 +224,30 @@ func TestDaysAreSearchedAndRemovedWhole(t *testing.T) {
 	}
 }
 
+// THE DAY LAST WRITTEN EXPIRES TOO: it stays the day being written for as long as nothing else
+// arrives, so an idle controller would otherwise keep it past any retention. A later line opens
+// its day afresh.
+func TestTheLastDayWrittenExpires(t *testing.T) {
+	t.Parallel()
+
+	x, dir := aLogIndex(t)
+	addLines(t, x, "lease-a", 0, logDay, 0, "", "marker line")
+
+	removed, err := x.Retain(logDay.AddDate(0, 0, 1), 1<<40)
+	if err != nil || removed != 1 {
+		t.Fatalf("past the retention removed %d, %v; want the one day", removed, err)
+	}
+
+	if days, err := logIndexDays(dir); err != nil || len(days) != 0 {
+		t.Errorf("days left %v, %v", days, err)
+	}
+
+	addLines(t, x, "lease-b", 0, logDay.AddDate(0, 0, 1), 0, "", "marker again")
+	if got := search(t, dir, []string{"again"}, nil, logDay); len(got) != 1 {
+		t.Errorf("a line after the removal found %+v", got)
+	}
+}
+
 // A SEARCH STOPS WHEN ITS CALLER SAYS, AND ITS OWN BOUND SAYS SO, which a reader must not take
 // for every match.
 func TestASearchStopsAndSaysWhy(t *testing.T) {
