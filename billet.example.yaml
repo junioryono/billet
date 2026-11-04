@@ -243,7 +243,8 @@ server:
   # your tiers are close enough in size that the wait costs more than it buys.
   #
   # `hold` holds one host for a shape that fits nowhere, the one its running work
-  # is predicted to free soonest, and leaves every other host open. On replay with
+  # is predicted to free soonest, and leaves the others open, unless that shape's
+  # job there runs far past its kind. On replay with
   # several hosts every smaller shape waited far less than under `fair` and the
   # widest far less than under `fill`, though more than under `fair`
   # (docs/reference/records/replay-policies.md). On a deployment with one host a

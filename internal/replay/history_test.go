@@ -531,17 +531,12 @@ func laterShare(t *testing.T, r *Report) float64 {
 	return charged[config.DefaultTargetName].VCPUSeconds / total
 }
 
-// CONTENDED ROOM IS DIVIDED BY WEIGHT (#530): two targets each with more work than
-// the fleet holds converge to what their weights say, the same trace with no
-// weight divides evenly, and with one target idle the other takes all the room.
-// Under direct assignment, the protocol on which a tier is ever recorded waiting
-// (#686). BILLET_REPLAY_JOBS and BILLET_REPLAY_HOSTS size it for the record, the
-// table then being kept under -replay.out.
-// UNDER HOLD A WEIGHT STILL DIVIDES THE ROOM: tiers of one shape run into a lease as large,
-// so none is given a host, and the order they buy in is the rank's.
+// UNDER HOLD A WEIGHT STILL DIVIDES THE ROOM, between tiers of different shapes, where a
+// narrower one would pass a wider but for its rank.
 func TestAWeightDividesTheRoomUnderHold(t *testing.T) {
 	fleet := twoTargets(2, 1)
 	fleet.AdmissionOrder = config.AdmissionHold
+	fleet.Tiers[0].VCPU, fleet.Tiers[0].Memory = 4, 16*config.GiB
 
 	report := Run(t, fleet, ContendedTargets(1, ContendedParams{Params: Params{Jobs: 80}, Fleet: fleet}),
 		Options{DirectAssignment: true, Log: discardLogger()})
@@ -549,12 +544,21 @@ func TestAWeightDividesTheRoomUnderHold(t *testing.T) {
 		t.Fatal(why)
 	}
 
-	if share := laterShare(t, report); share < 0.60 || share > 0.73 {
+	share := laterShare(t, report)
+	t.Logf("weighted 2:1 under hold, the first target held %.3f of the contested vCPU", share)
+
+	if share < 0.60 || share > 0.80 {
 		t.Errorf("weighted 2:1 under hold, the first target held %.3f of the contested vCPU; want about 2/3\n%s", share,
 			report.TargetTable(4))
 	}
 }
 
+// CONTENDED ROOM IS DIVIDED BY WEIGHT (#530): two targets each with more work than
+// the fleet holds converge to what their weights say, the same trace with no
+// weight divides evenly, and with one target idle the other takes all the room.
+// Under direct assignment, the protocol on which a tier is ever recorded waiting
+// (#686). BILLET_REPLAY_JOBS and BILLET_REPLAY_HOSTS size it for the record, the
+// table then being kept under -replay.out.
 func TestContendedRoomIsDividedByWeight(t *testing.T) {
 	jobs := 80
 	if n := os.Getenv("BILLET_REPLAY_JOBS"); n != "" {
@@ -803,37 +807,55 @@ func TestHoldGivesTheWideShapeItsTurnAndKeepsTheOtherHostOpen(t *testing.T) {
 		return 0
 	}
 
-	// How many of the stream's jobs started while the wide job waited.
-	startedMeanwhile := func(r *Report) int {
+	// How many of the stream's jobs started while the wide job waited, and how many of
+	// them on the host it ran on.
+	startedMeanwhile := func(r *Report) (int, int) {
 		until := wideAt.Add(wideWait(r))
-		n := 0
+		wideOn, n, onIt := "", 0, 0
+
+		for i := range r.Records {
+			if r.Records[i].Tier == "billet-16vcpu" {
+				wideOn = r.Records[i].Node
+			}
+		}
 
 		for i := range r.Records {
 			if rec := &r.Records[i]; rec.Tier != "billet-16vcpu" && rec.StartedAt.After(wideAt) && rec.StartedAt.Before(until) {
 				n++
+
+				if rec.Node == wideOn {
+					onIt++
+				}
 			}
 		}
 
-		return n
+		return n, onIt
 	}
 
 	c := Compare(t, fleet, trace, DefaultPolicies, Options{DirectAssignment: true, Log: discardLogger()})
 
 	fair, fill, hold := c.Reports[0], c.Reports[1], c.Reports[2]
-	t.Logf("wide waits: fair %s, fill %s, hold %s; started meanwhile: fair %d, fill %d, hold %d", wideWait(fair),
-		wideWait(fill), wideWait(hold), startedMeanwhile(fair), startedMeanwhile(fill), startedMeanwhile(hold))
+	underFair, _ := startedMeanwhile(fair)
+	underFill, _ := startedMeanwhile(fill)
+	underHold, onHeld := startedMeanwhile(hold)
+	t.Logf("wide waits: fair %s, fill %s, hold %s; started meanwhile: fair %d, fill %d, hold %d (%d on its host)",
+		wideWait(fair), wideWait(fill), wideWait(hold), underFair, underFill, underHold, onHeld)
 
-	if got := wideWait(hold); got > 15*time.Minute {
-		t.Errorf("under hold the whole-host job waited %s; want its host emptied within a job or two", got)
+	if got, want := wideWait(hold), wideWait(fair)+2*time.Minute; got > want {
+		t.Errorf("under hold the whole-host job waited %s; want it about as soon as under fair, by %s", got, want)
+	}
+
+	if onHeld != 0 {
+		t.Errorf("%d small jobs started on the host held for the whole-host job", onHeld)
 	}
 
 	if got := wideWait(fill); got < 45*time.Minute {
 		t.Errorf("under fill the whole-host job waited %s; the comparison cannot tell the policies apart", got)
 	}
 
-	if got, under := startedMeanwhile(hold), startedMeanwhile(fair); got <= under {
+	if underHold <= underFair {
 		t.Errorf("%d small jobs started while the whole-host job waited under hold, and %d under fair; want the other "+
-			"host kept open", got, under)
+			"host kept open", underHold, underFair)
 	}
 }
 

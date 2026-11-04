@@ -265,7 +265,7 @@ SELECT tier,
 -- Every open lease, with its host and what its runtime is predicted from, for
 -- choosing a host to hold for a waiting shape. Bounded: a fleet past the bound is
 -- one the choice cannot be made for, and says so.
-SELECT l.id, COALESCE(l.node, l.target_node, '') AS node, l.vcpu, l.memory, l.tier, l.phase,
+SELECT l.id, COALESCE(l.node, l.target_node, '') AS node, l.vcpu, l.memory, l.tier, l.phase, l.created_at,
        COALESCE(h.repo, '') AS repo, COALESCE(h.workflow_ref, '') AS workflow_ref,
        COALESCE(h.job_name, '') AS job_name, COALESCE(h.started_at, '') AS started_at
   FROM leases l

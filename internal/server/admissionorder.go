@@ -807,6 +807,8 @@ func (q *admissionQueue) waiterHeldBy(tier string) (string, time.Time, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	q.planHolds()
+
 	own, waiting := q.waiting[tier]
 	if !waiting {
 		return "", time.Time{}, false

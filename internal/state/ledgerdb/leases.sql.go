@@ -555,7 +555,7 @@ func (q *Queries) ListLeaseIDsOnNode(ctx context.Context, arg ListLeaseIDsOnNode
 }
 
 const listOpenLeasesForHold = `-- name: ListOpenLeasesForHold :many
-SELECT l.id, COALESCE(l.node, l.target_node, '') AS node, l.vcpu, l.memory, l.tier, l.phase,
+SELECT l.id, COALESCE(l.node, l.target_node, '') AS node, l.vcpu, l.memory, l.tier, l.phase, l.created_at,
        COALESCE(h.repo, '') AS repo, COALESCE(h.workflow_ref, '') AS workflow_ref,
        COALESCE(h.job_name, '') AS job_name, COALESCE(h.started_at, '') AS started_at
   FROM leases l
@@ -572,6 +572,7 @@ type ListOpenLeasesForHoldRow struct {
 	Memory      int64
 	Tier        string
 	Phase       string
+	CreatedAt   string
 	Repo        string
 	WorkflowRef string
 	JobName     string
@@ -597,6 +598,7 @@ func (q *Queries) ListOpenLeasesForHold(ctx context.Context, maxRows int64) ([]L
 			&i.Memory,
 			&i.Tier,
 			&i.Phase,
+			&i.CreatedAt,
 			&i.Repo,
 			&i.WorkflowRef,
 			&i.JobName,

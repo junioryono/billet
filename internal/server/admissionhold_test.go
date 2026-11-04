@@ -257,6 +257,14 @@ func TestAWaiterWithAHostOrACandidateHoldsNobodyBack(t *testing.T) {
 	if q.mayBuy("buyer", ranked("level", ranks)) || q.mayBuy("sibling", ranked("behind", ranks)) {
 		t.Error("under weights a buyer passed a waiter ranked ahead of it")
 	}
+
+	// A BUYER RANKED AHEAD OF IT PASSES, narrower or not, with the waiter behind a lease as large.
+	ranks["front"] = 0.05
+	q.behindAsLarge("waiter")
+
+	if !q.mayBuy("front", ranked("front", ranks)) {
+		t.Error("a buyer ranked ahead of the waiter was held back")
+	}
 }
 
 // A WAITER WITH NO CANDIDATE HOLDS BACK ONLY A BUYER AT LEAST AS WIDE: that lease ending
@@ -292,6 +300,14 @@ func TestAWaiterWithNoCandidateHoldsBackOnlyAsWide(t *testing.T) {
 
 	if !q.mayBuy("lean", lean) {
 		t.Error("a buyer narrower in memory was held back")
+	}
+
+	// BUYING ENDS IT: the waiter reads what holds it back afresh at its next refusal, and
+	// until then holds the line as under fair.
+	q.bought("waiter")
+
+	if q.mayBuy("z-narrower", sized(2, "a")) {
+		t.Error("a narrower buyer passed a waiter that has just bought")
 	}
 
 	// A READ THAT FAILED IS AS WIDE AS ANYTHING, on either side.
@@ -399,6 +415,17 @@ func TestWhetherABuyerMayBuyReadsTheHoldsItBuysAgainst(t *testing.T) {
 	q.mu.Unlock()
 
 	q.served("owner")
+
+	// THE STATUS REPORT READS THE SAME PLAN.
+	q.mu.Lock()
+	q.waiting["reporting"] = waitingTier{since: next.since.Add(time.Hour), progress: q.now(), where: sized(2, "a", "b", "c")}
+	q.mu.Unlock()
+
+	if got, _, _ := q.waiterHeldBy("reporting"); got != "next" {
+		t.Errorf("the report says a waiter is held by %q; want the one this plan gives a late host", got)
+	}
+
+	q.served("reporting")
 
 	if q.mayBuy("buyer", sized(2, "a", "b", "c")) {
 		t.Error("a buyer passed a waiter this purchase's plan gives a late host")
@@ -634,8 +661,16 @@ func TestAPoolPassKeepsOffEveryOtherHold(t *testing.T) {
 func TestAWaiterBackingOffALaunchHoldsNoHost(t *testing.T) {
 	t.Parallel()
 
+	ranks := map[string]float64{"known": 0.5}
+
 	q := holdQueue(wantsHosts{"failing", []string{"a"}}, wantsHosts{"healthy", []string{"a"}})
-	q.lastRanks = map[string]float64{}
+	q.lastRanks = ranks
+
+	for label, waiter := range q.waiting {
+		waiter.where = ranked("known", ranks)
+		q.waiting[label] = waiter
+	}
+
 	q.launchResult("failing", true)
 
 	if got := holdsOf(q); got["a"] != "healthy" {
@@ -1116,6 +1151,13 @@ func TestAWaiterWithNoCandidateDoesNotStopANarrowerOne(t *testing.T) {
 	if got := startedTiers(h.log)["d-next"]; got != 1 {
 		t.Errorf("the next tier started %d with its held host empty", got)
 	}
+
+	finishOne(t, h.a, "b-big")
+	h.want(t, "c-widest", 1)
+
+	if got := startedTiers(h.log)["c-widest"]; got != 1 {
+		t.Errorf("the widest tier started %d with the large lease gone", got)
+	}
 }
 
 // A POOL PASS THROUGH A LISTENER: the oldest tier with a backlog buys its own host and an
@@ -1162,10 +1204,11 @@ func TestAPoolPassLeavesAYoungerWaitersHost(t *testing.T) {
 func TestRoomHeldForAnotherIsNotRoomAWaiterHas(t *testing.T) {
 	t.Parallel()
 
-	h := newHeldScene(t, openState(t), tierOf("b-wide", 8), tierOf("c-wide", 8))
+	h := newHeldScene(t, openState(t), tierOf("b-wide", 8), tierOf("c-wide", 8), tierOf("d-wide", 8))
 
 	h.want(t, "b-wide", 1)
 	h.want(t, "c-wide", 1)
+	h.want(t, "d-wide", 1)
 
 	if got := h.s.order.ownHold("c-wide"); got != "host-b" {
 		t.Fatalf("the second wide tier holds %q", got)
@@ -1174,13 +1217,66 @@ func TestRoomHeldForAnotherIsNotRoomAWaiterHas(t *testing.T) {
 	h.freeFill(t, "host-a")
 	h.freeFill(t, "host-a")
 	h.want(t, "c-wide", 1)
+	h.want(t, "d-wide", 1)
 
-	if got := startedTiers(h.log)["c-wide"]; got != 0 {
-		t.Errorf("the second wide tier started %d on the host held for the first", got)
+	if got := startedTiers(h.log)["c-wide"] + startedTiers(h.log)["d-wide"]; got != 0 {
+		t.Errorf("the wide tiers behind started %d on the host held for the first", got)
 	}
 
 	if got := h.s.order.ownHold("c-wide"); got != "host-b" {
 		t.Errorf("with the first's host empty the second holds %q", got)
+	}
+
+	// THE THIRD HOLDS NOTHING AND STILL KNOWS WHAT IT COULD: read as room it has, the held
+	// host would say it fits now and it would have no candidates at all.
+	if got := h.s.order.waiting["d-wide"].candidates; len(got) == 0 {
+		t.Errorf("the third wide tier reads no candidates with room only on a held host")
+	}
+}
+
+// A TIER HELD BACK BY ITS TARGET'S SHARE IS GIVEN NO HOST, through a listener: room freed there
+// would not reach it, and a host held for it would keep other targets off for nothing.
+func TestAShareBoundWaiterHoldsNoHost(t *testing.T) {
+	t.Parallel()
+
+	run, wide, other := tierOf("a-run", 4), tierOf("b-wide", 8), tierOf("c-other", 4)
+	run.Target, wide.Target, other.Target = "shared", "shared", "other"
+	run.Memory, wide.Memory, other.Memory = config.GiB, config.GiB, config.GiB
+	tiers := []config.Tier{run, wide, other}
+
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+		Shares: map[string]config.TargetShare{"shared": {VCPU: 8}}}, tiers)
+
+	for _, h := range []alloc.NodeRegistration{host("host-a", 8), host("host-b", 8)} {
+		if _, err := a.RegisterNode(t.Context(), h); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+
+	log := &launchLog{}
+	s := New(a, nil, tiers, "hold-test", nil, WithNodeRunner(log), WithAdmissionOrder(config.AdmissionHold))
+	runL := NewListener(a, run.Label, &fakeSession{}, s.listenerOpts(nil)...)
+	wideL := NewListener(a, wide.Label, &fakeSession{}, s.listenerOpts(nil)...)
+	otherL := NewListener(a, other.Label, &fakeSession{}, s.listenerOpts(nil)...)
+
+	if err := runL.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("run reconcile: %v", err)
+	}
+
+	if err := otherL.reconcilePool(t.Context(), 3); err != nil {
+		t.Fatalf("other reconcile: %v", err)
+	}
+
+	if err := wideL.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("wide reconcile: %v", err)
+	}
+
+	if got := s.order.ownHold(wide.Label); got != "" {
+		t.Errorf("a waiter its target's share refuses holds %q", got)
+	}
+
+	if !s.order.waiting[wide.Label].where.ShareBound {
+		t.Error("the waiter is not share-bound, and this proves nothing")
 	}
 }
 

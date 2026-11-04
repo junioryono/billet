@@ -254,6 +254,47 @@ func TestChargesPerTargetAndTheContestedWindow(t *testing.T) {
 	}
 }
 
+// WHAT COUNTS AS WAITING FOR AN EMPTY HOST: memory binds as vCPU does, a job that never started
+// waits from its arrival on, and overlapping waits are one wait.
+func TestEmptyWhileQueuedReadsTheWaitsTheyAre(t *testing.T) {
+	t.Parallel()
+
+	hour := func(n float64) time.Time { return DefaultStart.Add(time.Duration(n * float64(time.Hour))) }
+	running := Record{Tier: "t", Node: "only", VCPU: 8, Memory: 32 * config.GiB, Arrival: hour(0), ChargedFrom: hour(0),
+		StartedAt: hour(0), FinishedAt: hour(2)}
+	fleet := func(spareMemory config.ByteSize) Fleet {
+		return Fleet{
+			Hosts:   []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}, {Name: "spare", VCPU: 8, Memory: spareMemory}},
+			MaxVCPU: 16, MaxMemory: 32*config.GiB + spareMemory,
+		}
+	}
+	later := func(arrival float64) Record {
+		return Record{Tier: "t", Node: "only", VCPU: 4, Memory: 16 * config.GiB, Arrival: hour(arrival), ChargedFrom: hour(2),
+			StartedAt: hour(2), FinishedAt: hour(3)}
+	}
+
+	// A host too short of memory for the job is not room it was denied.
+	short := &Report{Fleet: fleet(8 * config.GiB), Records: []Record{running, later(0)}}
+	if got := short.EmptyWhileQueuedHours(); got != 0 {
+		t.Errorf("%.3f host-hours on a host short of memory; want none", got)
+	}
+
+	// Two waits overlapping count their union.
+	both := &Report{Fleet: fleet(32 * config.GiB), Records: []Record{running, later(0), later(1)}}
+	if got := both.EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours for waits from 0h and 1h to 2h; want 2", got)
+	}
+
+	// A job that never started waits to the end of the span.
+	never := later(1)
+	never.ChargedFrom, never.StartedAt, never.FinishedAt = time.Time{}, time.Time{}, time.Time{}
+
+	stuck := &Report{Fleet: fleet(32 * config.GiB), Records: []Record{running, later(2), never}}
+	if got := stuck.EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours for a job waiting from 1h to the end at 3h; want 2", got)
+	}
+}
+
 // EMPTY WHILE A JOB WAITED COUNTS ONLY A HOST THAT JOB FITS ON, and only while it waited:
 // a host idle because nothing asked is not room a shape was denied.
 func TestEmptyWhileQueuedCountsOnlyHostsTheWaitingJobFits(t *testing.T) {

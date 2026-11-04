@@ -186,10 +186,11 @@ func (a *Allocator) leasesByNode(ctx context.Context, tx querier, priors *Runtim
 	for i := range rows {
 		row := &rows[i]
 
-		// NOT STARTED IS PREDICTED FROM NOW, as a lease not yet running is.
-		start := parseStamp(row.StartedAt)
+		// NOT STARTED IS PREDICTED FROM NOW, as a lease not yet running is, and how late
+		// it is runs from when it was bought, or one that never starts is never late.
+		start, since := parseStamp(row.StartedAt), parseStamp(row.StartedAt)
 		if start.IsZero() {
-			start = now
+			start, since = now, parseStamp(row.CreatedAt)
 		}
 
 		est := priors.Estimate(JobKeyOf(row.Tier, row.Repo, row.WorkflowRef, row.JobName))
@@ -198,7 +199,7 @@ func (a *Allocator) leasesByNode(ctx context.Context, tx querier, priors *Runtim
 		out[row.Node] = append(out[row.Node], heldLease{
 			cost: placementCost{vcpu: int(row.Vcpu), memory: config.ByteSize(row.Memory)}, end: end,
 			stuck: row.Phase == string(PhaseCustody) || row.Phase == string(PhaseQuarantine),
-			late:  now.Sub(start) > HoldLateFactor*est.Median,
+			late:  !since.IsZero() && now.Sub(since) > HoldLateFactor*est.Median,
 		})
 	}
 

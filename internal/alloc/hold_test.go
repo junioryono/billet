@@ -313,11 +313,41 @@ func TestACandidateSaysWhenAJobItNeedsGoneIsLate(t *testing.T) {
 		t.Fatalf("a fresh host reads %v, %v", got, err)
 	}
 
-	now = now.Add(HoldLateFactor*DefaultRuntime + time.Minute)
+	start := now
+	now = start.Add(HoldLateFactor*DefaultRuntime - time.Minute)
 
 	got, _, err = a.HoldCandidates(t.Context(), "wide", nil, "")
-	if err != nil || len(got) != 2 || !got[0].Late {
+	if err != nil || len(got) != 2 || got[0].Late || got[1].Late {
+		t.Errorf("short of the factor the host reads %v, %v; want it in time", got, err)
+	}
+
+	now = start.Add(HoldLateFactor*DefaultRuntime + time.Minute)
+
+	got, _, err = a.HoldCandidates(t.Context(), "wide", nil, "")
+	if err != nil || len(got) != 2 || !got[0].Late || !got[1].Late {
 		t.Errorf("past the factor the host reads %v, %v; want it late", got, err)
+	}
+
+	// ONE BOUGHT AND NEVER STARTED IS LATE TOO, from when it was bought: read from now it
+	// never would be, and a hold on its host would have no bound.
+	idle := holdFleet(t, &now)
+
+	for _, label := range []string{"small-a", "small-b"} {
+		if _, err := idle.Reserve(t.Context(), label); err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+	}
+
+	got, _, err = idle.HoldCandidates(t.Context(), "wide", nil, "")
+	if err != nil || len(got) != 2 || got[0].Late {
+		t.Fatalf("a lease just bought reads %v, %v", got, err)
+	}
+
+	now = now.Add(HoldLateFactor*DefaultRuntime + time.Minute)
+
+	got, _, err = idle.HoldCandidates(t.Context(), "wide", nil, "")
+	if err != nil || len(got) != 2 || !got[0].Late {
+		t.Errorf("a lease never started, past the factor, reads %v, %v; want it late", got, err)
 	}
 }
 
@@ -451,6 +481,18 @@ func TestReadyAtAddsUpTheRoomEachLeaseFrees(t *testing.T) {
 			t.Errorf("%s: ready at %s (%v); want %s (%v)", c.name, got, ok, c.want, c.ok)
 		}
 	}
+
+	// LATE ONLY IF THE SHAPE NEEDS THAT JOB GONE: one that ends after it fits is not its wait.
+	inTime, late := lease(4, 16, at(3)), lease(4, 16, at(9))
+	late.late = true
+
+	if _, isLate, ok := readyAt(wide, 12, 48*config.GiB, []heldLease{inTime, late}, now); !ok || isLate {
+		t.Errorf("with the late job not needed gone it reads late %v (%v)", isLate, ok)
+	}
+
+	if _, isLate, ok := readyAt(wide, 8, 32*config.GiB, []heldLease{inTime, late}, now); !ok || !isLate {
+		t.Errorf("with the late job needed gone it reads late %v (%v)", isLate, ok)
+	}
 }
 
 // A PURCHASE PLACES NOTHING ON AN AVOIDED HOST, and takes the room elsewhere; a tier
@@ -518,7 +560,7 @@ func TestAPurchaseAvoidsAHeldHostUnlessItsFloorIsUnmet(t *testing.T) {
 }
 
 // NO AVOIDED HOST IS EVER PLACED ON AND THE FLEET NEVER OVERCOMMITS, however many buy at
-// once: what the purchase avoids is decided in its own transaction.
+// once: each purchase's headroom, and where it places, is its own transaction's.
 func TestConcurrentPurchasesAvoidingAHostNeverOvercommit(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 
