@@ -27,7 +27,7 @@ The reason ADR-005 gave for not running the scripts was that they need Packer's 
 - The image is about 3.6 times larger. Capacity is not the constraint: the reference cluster's Ceph pool has 3.2TiB available, and a job's disk is a copy-on-write clone.
 - A pinned template drifts from what its scripts download, so a pin that built GitHub's image in July can fail in September. Each such failure is carried as a difference copying GitHub's own later fix, and moving the pin retires it. Moving the pin also moves the toolset the EC2 build reads.
 - Upstream bugs are parity too. `install-bazel.sh` writes `USE_BAZEL_FALLBACK_VERSION=silent:` with no version, and so does GitHub's image.
-- The EC2 AMI still builds from the declaration with the shared toolcache installers, so the two backends now reach parity by different routes.
+- The EC2 AMI still built from the declaration with the shared toolcache installers, so the two backends reached parity by different routes. [ADR-022](adr-022-every-linux-image-from-githubs-template.md) moves the AMI and the arm64 guest onto this route.
 
 ## Alternatives rejected
 

@@ -79,6 +79,9 @@ func isPublishedSnapshot(name string) bool {
 // snapshot is the half of `rbd snap ls --format json` this needs.
 type snapshot struct {
 	Name string `json:"name"`
+	// ID is the snapshot's id within its image, which a snapshot made again under
+	// the same name does not keep.
+	ID uint64 `json:"id"`
 }
 
 // NewestGeneration reports the most recently built generation of an image.

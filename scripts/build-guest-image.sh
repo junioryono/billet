@@ -412,46 +412,10 @@ COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" names | tr '\n' ' ')
 
 # install_completer puts the image's completer at /opt/billet/complete: what a
 # deployment that accepts a component runs, chrooted into the image, to install
-# it before the image is imported (completion contract 1). It carries GitHub's
-# installers, helpers and tests for the components, unedited, from the pinned
-# template, except that the tests are read from beside the helpers: the build's
-# own /imagegeneration/tests had them skipped.
+# it before the image is imported (completion contract 1). The AMI build installs
+# the same one on its builder (ADR-022), so it is one script both run.
 install_completer() {
-	local rootfs=$1 upstream="$SCRIPT_DIR/runner-images/upstream/images/ubuntu/scripts"
-	local completer="$rootfs/opt/billet/complete" script file
-	rm -rf "$completer"
-	install -d -m 0755 "$completer" "$completer/installers" "$completer/scripts" \
-		"$completer/scripts/build" "$completer/scripts/tests"
-	install -m 0755 "$SCRIPT_DIR/runner-images/completer/run" "$completer/run"
-	install -m 0755 "$SCRIPT_DIR/runner-images/write-image-env.sh" "$completer/write-image-env.sh"
-	install -m 0644 "$SCRIPT_DIR/runner-images/pam-environment.awk" "$completer/pam-environment.awk"
-	install -m 0644 "$SCRIPT_DIR/../internal/runnerimages/toolset-2404.json" "$completer/installers/toolset.json"
-	for script in install-android-sdk.sh install-codeql-bundle.sh install-firefox.sh \
-		install-google-chrome.sh install-microsoft-edge.sh; do
-		install -m 0755 "$upstream/build/$script" "$completer/scripts/build/$script"
-	done
-	cp -R "$upstream/helpers" "$completer/scripts/helpers"
-	# EXECUTABLE AS configure-environment.sh MAKES IT before linking invoke_tests
-	# to it; the template carries it as an ordinary file.
-	chmod 0755 "$completer/scripts/helpers/invoke-tests.sh"
-	for file in Android.Tests.ps1 Browsers.Tests.ps1 Toolset.Tests.ps1; do
-		install -m 0644 "$upstream/tests/$file" "$completer/scripts/tests/$file"
-	done
-
-	# THE ONE EDIT, AND ONLY IF IT IS STILL THE ONE LINE: GitHub's Invoke-PesterTests
-	# reads every test file from /imagegeneration/tests, which the build edited.
-	if ! old='    $testPath = "/imagegeneration/tests/${TestFile}.Tests.ps1"' \
-		new='    $testPath = Join-Path $PSScriptRoot "${TestFile}.Tests.ps1"' \
-		awk '
-			$0 == ENVIRON["old"] { print ENVIRON["new"]; replaced++; next }
-			{ print }
-			END { exit replaced == 1 ? 0 : 1 }' \
-		"$upstream/tests/Helpers.psm1" >"$completer/scripts/tests/Helpers.psm1"; then
-		echo "the template's Helpers.psm1 no longer reads its tests from one /imagegeneration" >&2
-		echo "  path, so the completer cannot point it at its own" >&2
-		exit 1
-	fi
-	chmod 0644 "$completer/scripts/tests/Helpers.psm1"
+	"$SCRIPT_DIR/runner-images/install-completer.sh" "$1" "$TOOLSET_FILE"
 	echo "completer: installed for $COMPONENTS"
 }
 
@@ -934,6 +898,7 @@ run_runner_images_build() {
 
 	BILLET_RI_ROOTFS="$rootfs" \
 		BILLET_RI_TARGET="$driver" \
+		BILLET_RI_SCOPE=guest-x64 \
 		BILLET_RI_IMAGE_VERSION="$(date -u +%Y%m%d).billet" \
 		BILLET_RI_OUT="$WORK/runner-images" \
 		"$SCRIPT_DIR/run-runner-images.sh"

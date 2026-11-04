@@ -294,6 +294,9 @@ type Registration struct {
 	VCPU      int
 	Memory    config.ByteSize
 	EC2Shapes []config.RemoteShape
+	// Architectures are what this node's provider can launch. See
+	// nodeapi.RegisterRequest.
+	Architectures []config.Arch
 	// CodeBuildFleet is the reserved-capacity fleet this node's builds run on, or
 	// empty for on-demand compute. The control plane refuses a second live node
 	// naming the same one, because its capacity is shared.
@@ -379,6 +382,7 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 		VCPU:            reg.VCPU,
 		Memory:          reg.Memory,
 		EC2Shapes:       reg.EC2Shapes,
+		Architectures:   reg.Architectures,
 		CodeBuildFleet:  reg.CodeBuildFleet,
 
 		CodeBuildJITParameterPath: reg.CodeBuildJITParameterPath,

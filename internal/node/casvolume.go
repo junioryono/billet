@@ -270,6 +270,10 @@ func (s *CacheService) startFresh(
 
 var errCacheOff = errors.New("this cache is off for this job")
 
+// errWriterHeld is a publication that found its key's writer held by another,
+// before it changed anything, and so may try again.
+var errWriterHeld = errors.New("another publication of this cache holds its writer")
+
 // errCachePolicyUnknown is a kill switch that could not be read: the cache is
 // not used, and what it did is unavailable, not disabled.
 var errCachePolicyUnknown = errors.New("the cache kill switch could not be read")
@@ -699,6 +703,16 @@ func (s *CacheService) releaseCASVolume(
 		return false, err
 	}
 	merged, consumed, err := s.mergeCASVolume(ctx, session, hv)
+	// ANOTHER JOB'S PUBLICATION OF THE SAME KEY HOLDS ITS WRITER, which on a busy
+	// tier is most jobs': a run's test, build and lint jobs end together. Nothing
+	// was done yet, so the publication waits for a later pass inside its window
+	// instead of being abandoned; abandoned, a third of one deployment's Go
+	// publications were lost to the one before them (#689).
+	if errors.Is(err, errWriterHeld) {
+		journal.Phase = ""
+
+		return false, s.persistSession(session)
+	}
 	if err != nil {
 		return abandon("the merge failed: " + err.Error())
 	}
@@ -768,6 +782,9 @@ func (s *CacheService) mergeCASVolume(
 	key := hv.Volume.Key
 	lease, fence, err := s.store.AcquireWriter(ctx, key, session.instance+"/"+string(hv.Kind),
 		cacheWriterTTL)
+	if held, ok := errors.AsType[*storecontract.WriterHeldError](err); ok {
+		return "", false, fmt.Errorf("acquire writer: %w: %w", errWriterHeld, held)
+	}
 	if err != nil {
 		return "", false, fmt.Errorf("acquire writer: %w", err)
 	}

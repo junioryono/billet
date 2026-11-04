@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/config"
 )
 
 func preflightCreds() awscreds.Static {
@@ -168,6 +169,7 @@ func TestDescribeImageStates(t *testing.T) {
 		case strings.Contains(body, "ImageId.1=ami-good"):
 			fmt.Fprint(w, `<DescribeImagesResponse><imagesSet><item>`+
 				`<imageId>ami-good</imageId><imageState>available</imageState>`+
+				`<architecture>arm64</architecture>`+
 				`</item></imagesSet></DescribeImagesResponse>`)
 		case strings.Contains(body, "ImageId.1=ami-REPLACE"):
 			w.WriteHeader(http.StatusBadRequest)
@@ -187,8 +189,8 @@ func TestDescribeImageStates(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("images = %+v", got)
 	}
-	if !got[0].Found || got[0].State != "available" {
-		t.Errorf("ami-good = %+v, want found+available", got[0])
+	if !got[0].Found || got[0].State != "available" || got[0].Arch != config.ArchARM64 {
+		t.Errorf("ami-good = %+v, want found+available on arm64", got[0])
 	}
 	if got[1].Found || !strings.Contains(got[1].State, "InvalidAMIID") {
 		t.Errorf("ami-REPLACE = %+v, want not-found with the AWS code", got[1])

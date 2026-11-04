@@ -31,6 +31,33 @@ const cacheConnectionLimit = 128
 // processes on a host from unmapping each other's read-only generation maps.
 const generationMapLockName = "ceph-generation-maps.lock"
 
+// GenerationMapLock is the option that holds a Ceph client's read-only generation
+// maps under this host's generation-map lock, or none when the node names no
+// lock_dir: the node's cache store and a pull reading a golden image's generations
+// take the same lock, so neither unmaps what the other is reading.
+//
+// THE NODE'S LOCK DIRECTORY, because only billet's account can write it: a lock
+// file another account could create could be held to stop every generation check
+// on the host.
+func GenerationMapLock(cfg *config.Config) []ceph.Option {
+	path := GenerationMapLockPath(cfg)
+	if path == "" {
+		return nil
+	}
+
+	return []ceph.Option{ceph.WithGenerationMapLock(path)}
+}
+
+// GenerationMapLockPath is the file GenerationMapLock holds a client's maps under,
+// empty when the node names no lock_dir.
+func GenerationMapLockPath(cfg *config.Config) string {
+	if cfg.Node == nil || cfg.Node.LockDir == "" {
+		return ""
+	}
+
+	return filepath.Join(cfg.Node.LockDir, generationMapLockName)
+}
+
 // NodeCacheControl is what the node's cache service asks the control plane:
 // the kill switch, and what a job may publish. The node client is both.
 type NodeCacheControl interface {
@@ -80,12 +107,8 @@ func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store,
 		// mapping this node's rather than another identity's on the same host.
 		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg)),
 			ceph.WithMapOwner(deployment + "/" + cfg.Node.Name)}
-		// THE NODE'S LOCK DIRECTORY, because only billet's account can write it:
-		// a lock file another account could create could be held to stop every
-		// generation check on the host.
-		if cfg.Node.LockDir != "" {
-			options = append(options,
-				ceph.WithGenerationMapLock(filepath.Join(cfg.Node.LockDir, generationMapLockName)))
+		if path := GenerationMapLockPath(cfg); path != "" {
+			options = append(options, ceph.WithGenerationMapLock(path))
 		}
 
 		return ceph.New(*cfg.Node.Ceph, options...)

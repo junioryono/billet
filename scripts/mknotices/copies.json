@@ -5,8 +5,8 @@
     "pin": "e75633902841aa5479c759492b73409e6d317f12",
     "license": "MIT",
     "license_files": ["scripts/runner-images/LICENSE", "internal/runnerimages/LICENSE"],
-    "copies": ["scripts/runner-images/upstream", "internal/runnerimages/toolset-2404.json"],
-    "ships_in": ["the billet binary (toolset-2404.json)", "the guest image's build (the template it runs)"]
+    "copies": ["scripts/runner-images/upstream", "internal/runnerimages/toolset-2404.json", "internal/runnerimages/toolset-2404-arm64.json"],
+    "ships_in": ["the billet binary (toolset-2404.json, toolset-2404-arm64.json)", "the guest image's build (the template it runs)"]
   },
   {
     "name": "moby/moby contrib/check-config.sh",
