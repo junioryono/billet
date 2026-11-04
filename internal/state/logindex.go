@@ -156,9 +156,11 @@ func (x *LogIndex) dayDB(ctx context.Context, day string) (*sql.DB, error) {
 		return x.db, nil
 	}
 
+	// BOTH TOGETHER: a next day that cannot be opened leaves no day being written, and Retain reads
+	// the name as saying there is a file to close.
 	if x.db != nil {
 		_ = x.db.Close()
-		x.db = nil
+		x.db, x.day = nil, ""
 	}
 
 	db, err := sql.Open("sqlite", dsn(filepath.Join(x.dir, day+".db"), "busy_timeout(5000)", "journal_mode(WAL)",
@@ -169,17 +171,33 @@ func (x *LogIndex) dayDB(ctx context.Context, day string) (*sql.DB, error) {
 
 	db.SetMaxOpenConns(1)
 
-	for _, stmt := range logIndexSchema {
-		if err := logIndexExec(ctx, db, stmt); err != nil {
-			_ = db.Close()
+	if err := createLogDay(ctx, db); err != nil {
+		_ = db.Close()
 
-			return nil, fmt.Errorf("state: create a day of the log index: %w", err)
-		}
+		return nil, fmt.Errorf("state: create a day of the log index: %w", err)
 	}
 
 	x.db, x.day = db, day
 
 	return db, nil
+}
+
+// createLogDay makes a day's schema in one transaction, so a search beside it finds all of it or
+// none of it, and what it finds with only part of it is a damaged day.
+func createLogDay(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, stmt := range logIndexSchema {
+		if err := logIndexExec(ctx, tx, stmt); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 // logExecer is what logIndexExec runs a statement on.
@@ -322,7 +340,10 @@ func (x *LogIndex) Retain(before time.Time, maxBytes int64) (int, error) {
 		}
 
 		if day == x.day {
-			_ = x.db.Close()
+			if x.db != nil {
+				_ = x.db.Close()
+			}
+
 			x.db, x.day = nil, ""
 		}
 
@@ -450,14 +471,24 @@ type logChunkRow struct {
 }
 
 // logDayIsEmpty says a failed search of a day met a day with nothing in it: removed by the
-// retention since its name was read, or created a moment ago and its schema still being written.
-// Neither held a line, so neither ends a search of the other days. Any other failure does.
-func logDayIsEmpty(path string, err error) bool {
+// retention since its name was read, or created a moment ago and its schema not yet committed.
+// Neither held a line, so neither ends a search of the other days. A DAY WITH SOME OF ITS TABLES
+// IS DAMAGED, and may have held lines, so that is the failure it is: createLogDay is one
+// transaction, so nothing else leaves one.
+func logDayIsEmpty(ctx context.Context, db *sql.DB, path string, err error) bool {
 	if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
 		return true
 	}
 
-	return strings.Contains(err.Error(), "no such table")
+	if !strings.Contains(err.Error(), "no such table") {
+		return false
+	}
+
+	var tables int
+
+	row := logIndexQueryRow(ctx, db, `SELECT count(*) FROM sqlite_master`)
+
+	return row.Scan(&tables) == nil && tables == 0
 }
 
 // searchLogDay searches one file. stopped says the search is over, and more whether its
@@ -477,7 +508,7 @@ func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (
 
 	rows, err := db.QueryContext(ctx, `SELECT rowid FROM lines WHERE lines MATCH ? ORDER BY rowid DESC`, s.Match) //billet:ignore rawsql // the log index is not the ledger, and sqlc has no catalogue entry for a virtual table
 	if err != nil {
-		if logDayIsEmpty(path, err) {
+		if logDayIsEmpty(ctx, db, path, err) {
 			return false, false, nil
 		}
 

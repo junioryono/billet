@@ -253,13 +253,17 @@ func TestABusyReadIsAnsweredAndTheLoopGoesOn(t *testing.T) {
 	p, c := harnessWithCommandTimeout(t, 30*time.Second)
 	compute := &gatedReads{fakeCompute: &fakeCompute{}, release: make(chan struct{}), holding: make(chan struct{}, 16)}
 	runLoopWith(t, c, compute, 4)
-	t.Cleanup(func() { close(compute.release) })
 	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
 
 	node := p.Nodes()[0]
 
+	// CLEANUPS RUN LAST FIRST: a failure above the end of this test lets the reads go, then joins
+	// them, and the end of it does both while t.Context is still live.
 	var reads sync.WaitGroup
 	t.Cleanup(reads.Wait)
+
+	release := sync.OnceFunc(func() { close(compute.release) })
+	t.Cleanup(release)
 
 	for range nodeclient.LogReadsAtOnce {
 		reads.Go(func() {
@@ -285,4 +289,7 @@ func TestABusyReadIsAnsweredAndTheLoopGoesOn(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("a destroy waited behind reads")
 	}
+
+	release()
+	reads.Wait()
 }

@@ -424,13 +424,24 @@ func TestTheNodesBoundHoldsOnArrival(t *testing.T) {
 
 	keepChunk(t, s, logLease, 1, "one")
 	now = now.Add(time.Minute)
-	keepChunk(t, s, other, 1, "one")
 
-	if s.total > limits.MaxBytes {
-		t.Errorf("%d bytes held past a bound of %d", s.total, limits.MaxBytes)
+	// THE DISK IS THE BOUND, so a chunk waits for what was evicted to be deleted, and is asked for
+	// again rather than refused.
+	first, firstData := aChunkOf(t, 1, 0, "one")
+	if err := s.Keep(other, first, firstData); !errors.Is(err, ErrJobLogRoom) {
+		t.Fatalf("a chunk needing room answered %v", err)
 	}
 	if !s.evicted(logLease) || s.evicted(other) {
 		t.Errorf("the room was not made from the oldest: %t, %t", s.evicted(logLease), s.evicted(other))
+	}
+
+	s.evictPass()
+
+	if err := s.Keep(other, first, firstData); err != nil {
+		t.Fatalf("the chunk asked for again, with the room made: %v", err)
+	}
+	if s.total+s.sweeping > limits.MaxBytes {
+		t.Errorf("%d bytes held past a bound of %d", s.total+s.sweeping, limits.MaxBytes)
 	}
 
 	c, large := aChunkOf(t, 2, 0, "a longer line than the bound leaves room for")
@@ -688,11 +699,17 @@ func TestAnUnreadableLogStopsOnlyItsLease(t *testing.T) {
 }
 
 // A PASS WITH NOTHING NEW READS NO DIRECTORY, so what a pass costs is what is new, not what is
-// retained. A directory removed under it is what would show the read.
+// retained. A file under the directory's name is what would show a read, by the warning its failure
+// logs; the second half proves that warning is there to be seen.
 func TestAPassReadsOnlyWhatIsNew(t *testing.T) {
 	t.Parallel()
 
 	s := aLogStore(t, logLimits())
+
+	var logged syncedBuffer
+
+	s.log = slog.New(slog.NewTextHandler(&logged, nil))
+
 	keepChunk(t, s, logLease, 1, "one")
 
 	sink := &fakeSink{id: "index-1"}
@@ -705,14 +722,129 @@ func TestAPassReadsOnlyWhatIsNew(t *testing.T) {
 		t.Error("shipped to one index reads as shipped to another")
 	}
 
-	keepChunk(t, s, logLease, 2, "two")
-	if s.shippedAll(logLease, "index-1") {
-		t.Error("a lease with a new chunk reads as shipped")
+	dir := filepath.Join(s.dir, logLease)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
 
 	s.shipPass(t.Context(), sink)
-	if got := sink.got(); !sameLines(got, []int64{0, 1}) {
-		t.Errorf("shipped %v", got)
+
+	if got := logged.String(); strings.Contains(got, "could not read") {
+		t.Errorf("a pass with nothing new read the directory: %s", got)
+	}
+
+	s.shipPass(t.Context(), &fakeSink{id: "index-2"})
+
+	if got := logged.String(); !strings.Contains(got, "could not read") {
+		t.Errorf("a pass with something to send did not read the directory, so this test proves nothing: %s", got)
+	}
+}
+
+// syncedBuffer is a log the test reads.
+type syncedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *syncedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// WHAT COULD NOT BE DELETED STILL TAKES THE DISK, so the bound goes on counting it, across a restart
+// too, and a restart does not start an evicted lease's time again.
+func TestAnEvictionThatFailedStillCounts(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+
+	s, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time { return now }
+
+	keepChunk(t, s, logLease, 1, "one")
+	held := s.total
+
+	// MARKED AND NOT YET SWEPT: it takes what it took, and what ends it is the deletion.
+	s.mu.Lock()
+	s.markEvicted(s.leases[logLease])
+	s.mu.Unlock()
+
+	if s.total != 0 || s.sweeping != held {
+		t.Errorf("marked: %d held and %d being deleted, want 0 and %d", s.total, s.sweeping, held)
+	}
+
+	// A MARK ON DISK WITH ITS CHUNKS STILL THERE is what a process stopped in the sweep leaves.
+	mark := filepath.Join(dir, jobLogDirectory, logLease, jobLogEvicted)
+	if err := os.WriteFile(mark, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	old := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(mark, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if again.total != 0 || again.sweeping != held {
+		t.Errorf("after a restart: %d held and %d being deleted, want 0 and %d", again.total, again.sweeping, held)
+	}
+
+	again.evictPass()
+
+	if again.sweeping != 0 {
+		t.Errorf("after the sweep %d is still being deleted", again.sweeping)
+	}
+
+	if chunks, err := again.chunksOf(logLease); err != nil || len(chunks) != 0 {
+		t.Errorf("after the sweep: %v, %v", chunks, err)
+	}
+
+	info, err := os.Stat(mark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(old) {
+		t.Errorf("the sweep moved the mark's time to %s", info.ModTime())
+	}
+}
+
+// THE ROUTE ASKS FOR A CHUNK AGAIN while room is being made, and says so as it does a wait, which
+// the agent answers by sending the same chunk.
+func TestTheRouteWaitsWhileRoomIsMade(t *testing.T) {
+	t.Parallel()
+
+	service, token := logSession(t, true)
+
+	_, data := aChunkOf(t, 1, 0, "line")
+	store := service.JobLogs()
+
+	store.mu.Lock()
+	store.limits.MaxBytes = int64(len(data))
+	store.sweeping = 1
+	store.mu.Unlock()
+
+	if got := postLog(t, service, token, data).Code; got != http.StatusTooManyRequests {
+		t.Errorf("a chunk needing room answered %d", got)
 	}
 }
 

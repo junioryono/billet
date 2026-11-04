@@ -93,8 +93,11 @@ type JobLogStore struct {
 
 	mu     sync.Mutex
 	leases map[string]*leaseLog
-	total  int64
-	wake   chan struct{}
+	// total is what held logs take, and sweeping what evicted ones still do until they are
+	// deleted, which may fail: the node's bound is on the disk, so it counts both.
+	total    int64
+	sweeping int64
+	wake     chan struct{}
 	// evictNow wakes the eviction loop when room was made for a chunk.
 	evictNow chan struct{}
 }
@@ -111,6 +114,8 @@ type leaseLog struct {
 	// read back a different line than it matched. swept says its chunks are gone.
 	evictedAt time.Time
 	swept     bool
+	// sweepBytes is this lease's part of the store's sweeping.
+	sweepBytes int64
 
 	// shippedIndex and shippedThrough are how far this process knows the lease reached an index,
 	// so a pass with nothing new reads no directory. readFailed says a read of its files has been
@@ -147,8 +152,17 @@ func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*Jo
 
 		if info, err := os.Lstat(filepath.Join(s.dir, e.Name(), jobLogEvicted)); err == nil {
 			// ITS CHUNKS MAY BE LEFT if the last process stopped sweeping them; the next
-			// eviction pass finishes that, and they count for nothing meanwhile.
-			s.leases[e.Name()] = &leaseLog{evictedAt: info.ModTime()}
+			// eviction pass finishes that, and they take the disk until it does.
+			l := &leaseLog{evictedAt: info.ModTime()}
+
+			if chunks, err := s.chunksOf(e.Name()); err == nil {
+				for _, c := range chunks {
+					l.sweepBytes += c.bytes
+				}
+			}
+
+			s.leases[e.Name()] = l
+			s.sweeping += l.sweepBytes
 
 			continue
 		}
@@ -271,6 +285,10 @@ func (s *JobLogStore) chunksOf(leaseID string) ([]keptChunk, error) {
 // ErrJobLogBudget says a job, or the node, has no more room for a job's log.
 var ErrJobLogBudget = errors.New("node: this job's log budget is spent")
 
+// ErrJobLogRoom says the node's bound has no room for a chunk until what it evicted to make some is
+// deleted. A wait and not a refusal: asked again, it fits.
+var ErrJobLogRoom = errors.New("node: room for this job's log is being made")
+
 // spent says a lease will take nothing more, which costs a caller no body to find out.
 func (s *JobLogStore) spent(leaseID string) bool {
 	s.mu.Lock()
@@ -315,8 +333,14 @@ func (s *JobLogStore) Keep(leaseID string, chunk *joblog.Chunk, data []byte) err
 		return ErrJobLogBudget
 	}
 
-	if s.total+size > s.limits.MaxBytes && !s.makeRoom(leaseID, size) {
-		return ErrJobLogBudget
+	if s.total+s.sweeping+size > s.limits.MaxBytes {
+		if !s.makeRoom(leaseID, size) {
+			return ErrJobLogBudget
+		}
+
+		if s.total+s.sweeping+size > s.limits.MaxBytes {
+			return ErrJobLogRoom
+		}
 	}
 
 	dir := filepath.Join(s.dir, leaseID)
@@ -372,8 +396,8 @@ func installChunk(dir, name string, data []byte) (bool, error) {
 }
 
 // makeRoom evicts the jobs least recently written, never leaseID, until size more fits the
-// node's bound, and says whether it does. Called with mu held. It marks them; the eviction
-// loop deletes their files, so a chunk's request does not wait on that.
+// node's bound once they are deleted, and says whether it will. Called with mu held. It marks them;
+// the eviction loop deletes their files, so a chunk's request does not wait on that.
 func (s *JobLogStore) makeRoom(leaseID string, size int64) bool {
 	for _, id := range s.leaseIDsLocked() {
 		if s.total+size <= s.limits.MaxBytes {
@@ -401,6 +425,8 @@ func (s *JobLogStore) markEvicted(l *leaseLog) {
 
 	l.evictedAt = s.now()
 	s.total -= l.bytes
+	s.sweeping += l.bytes
+	l.sweepBytes = l.bytes
 	l.bytes, l.seqs = 0, nil
 }
 
@@ -790,7 +816,10 @@ func (s *JobLogStore) evictPass() {
 		}
 
 		s.mu.Lock()
-		s.leases[id].swept = true
+		l := s.leases[id]
+		l.swept = true
+		s.sweeping -= l.sweepBytes
+		l.sweepBytes = 0
 		s.mu.Unlock()
 	}
 
@@ -812,13 +841,17 @@ func (s *JobLogStore) evictPass() {
 func (s *JobLogStore) sweep(leaseID string) error {
 	dir := filepath.Join(s.dir, leaseID)
 
-	if _, err := (durablefile.Installer{}).Install(dir, jobLogEvicted, 0o600,
-		func(io.Writer) error { return nil }); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+	// ONE ALREADY THERE STAYS, with its time: how long it is kept counts from the eviction, and a
+	// restart must not start that again.
+	if _, err := os.Lstat(filepath.Join(dir, jobLogEvicted)); errors.Is(err, fs.ErrNotExist) {
+		if _, err := (durablefile.Installer{}).Install(dir, jobLogEvicted, 0o600,
+			func(io.Writer) error { return nil }); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 
-		return err
+			return err
+		}
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -932,6 +965,9 @@ func (s *CacheService) acceptGuestLog(w http.ResponseWriter, r *http.Request, se
 	switch err := s.jobLogs.Keep(session.leaseID, &chunk, data); {
 	case errors.Is(err, ErrJobLogBudget):
 		http.Error(w, "this job's log budget is spent", http.StatusRequestEntityTooLarge)
+	case errors.Is(err, ErrJobLogRoom):
+		retryAfter(w, time.Second)
+		http.Error(w, "room for this job's log is being made", http.StatusTooManyRequests)
 	case err != nil:
 		s.log.Warn("could not keep a chunk of a job's log", "instance", session.instance, "error", err)
 		http.Error(w, "the log chunk was not kept", http.StatusInternalServerError)

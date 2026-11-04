@@ -248,15 +248,9 @@ func TestAnEmptyDayIsNotAFailedSearch(t *testing.T) {
 		t.Errorf("searching a removed day brought it back: %v", err)
 	}
 
+	// AN EMPTY FILE IS AN EMPTY DATABASE, which is what a day is before its schema commits.
 	bare := filepath.Join(dir, "2000-01-02.db")
-	db, err := sql.Open("sqlite", dsn(bare))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := logIndexExec(t.Context(), db, "CREATE TABLE other (a TEXT)"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
+	if err := os.WriteFile(bare, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := searchLogDay(t.Context(), bare, LogSearch{Match: `"marker"`, Visit: visit}, new(int)); err != nil {
@@ -267,12 +261,55 @@ func TestAnEmptyDayIsNotAFailedSearch(t *testing.T) {
 		t.Errorf("the search of the other days found %+v", got)
 	}
 
+	// A DAY WITH SOME OF ITS TABLES IS DAMAGED, and may have held lines, so a search says so.
+	damaged := filepath.Join(dir, "1999-01-01.db")
+	db, err := sql.Open("sqlite", dsn(damaged))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logIndexExec(t.Context(), db, "CREATE TABLE jobs (a TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := searchLogDay(t.Context(), damaged, LogSearch{Match: `"marker"`, Visit: visit}, new(int)); err == nil {
+		t.Error("a day missing its lines table read as empty")
+	}
+
 	garbage := filepath.Join(dir, "2000-01-03.db")
 	if err := os.WriteFile(garbage, []byte(strings.Repeat("not a database ", 100)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := searchLogDay(t.Context(), garbage, LogSearch{Match: `"marker"`, Visit: visit}, new(int)); err == nil {
 		t.Error("a day that is no database read as empty")
+	}
+}
+
+// A NEXT DAY THAT CANNOT BE OPENED LEAVES NO DAY BEING WRITTEN, so a retention reaching the one
+// before it has nothing to close and does not panic. A directory under the file's name is what no
+// open gets through.
+func TestARolloverThatFailedLeavesRetentionWhole(t *testing.T) {
+	t.Parallel()
+
+	x, dir := aLogIndex(t)
+	addLines(t, x, "lease-a", 0, logDay, 0, "", "marker line")
+
+	next := logDay.AddDate(0, 0, 1)
+	if err := os.Mkdir(filepath.Join(dir, next.UTC().Format(time.DateOnly)+".db"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := x.Add(t.Context(), aLogChunk(t, "lease-b", next)); err == nil {
+		t.Fatal("a day that cannot be opened took a chunk")
+	}
+
+	removed, err := x.Retain(next, 1<<40)
+	if err != nil {
+		t.Fatalf("Retain: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed %d, want the day past its retention", removed)
 	}
 }
 
@@ -380,4 +417,12 @@ func TestAChunkPastTheRowidIsRefused(t *testing.T) {
 			t.Errorf("first line %d: %v", first, err)
 		}
 	}
+}
+
+// aLogChunk is a chunk of one line to index for lease at at.
+func aLogChunk(t *testing.T, lease string, at time.Time) LogIndexChunk {
+	t.Helper()
+
+	return LogIndexChunk{Lease: lease, FirstLine: 0, ReceivedAt: at,
+		Chunk: &joblog.Chunk{Seq: 1, Lines: []joblog.Line{{AtMillis: at.UnixMilli(), Text: "a line"}}}}
 }
