@@ -315,7 +315,7 @@ func TestAKnownLeaseReportsEveryNumber(t *testing.T) {
 func TestAJobIsBilledOnGitHubsClockWhenItGaveBothEnds(t *testing.T) {
 	t.Parallel()
 
-	real := func() *state.UsageRow {
+	measured := func() *state.UsageRow {
 		row := knownUsageRow()
 		row.StartedAt = "2026-11-04T09:49:14.176805454Z"
 		row.ResultAt = "2026-11-04T09:52:30.959812791Z"
@@ -325,7 +325,7 @@ func TestAJobIsBilledOnGitHubsClockWhenItGaveBothEnds(t *testing.T) {
 		return row
 	}
 
-	r := newUsageRecord(usageConfig(t, 0), usageDeployment, real())
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, measured())
 	if r.JobClock != jobClockGitHub || r.Job.Seconds == nil || r.Job.Seconds.String() != "243.000" {
 		t.Errorf("job = %v on %q, want 243.000 on %q", r.Job.Seconds, r.JobClock, jobClockGitHub)
 	}
@@ -342,7 +342,7 @@ func TestAJobIsBilledOnGitHubsClockWhenItGaveBothEnds(t *testing.T) {
 		"no finish from GitHub": func(r *state.UsageRow) { r.GitHubFinishedAt = "" },
 		"no start from GitHub":  func(r *state.UsageRow) { r.GitHubRunnerAssignedAt = "" },
 	} {
-		row := real()
+		row := measured()
 		mutate(row)
 
 		r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
@@ -352,7 +352,7 @@ func TestAJobIsBilledOnGitHubsClockWhenItGaveBothEnds(t *testing.T) {
 	}
 
 	// GITHUB'S TWO TIMES ARE A JOB BILLET NEVER SAW START, and that is a known length.
-	row := real()
+	row := measured()
 	row.StartedAt = ""
 
 	r = newUsageRecord(usageConfig(t, 0), usageDeployment, row)
