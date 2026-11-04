@@ -138,7 +138,7 @@ func TestTheCloudRunnerNeverInheritsTheReadinessCapability(t *testing.T) {
 		t.Fatal("the EC2 runner entry point is not delimited")
 	}
 	if !strings.Contains(entrypoint, privilegeDrop+" ") ||
-		!strings.Contains(entrypoint, "billet_env_add BILLET_CACHE_TOKEN \"${BILLET_CACHE_TOKEN:-}\"\n") {
+		!strings.Contains(entrypoint, "billet_env_add \"${billet_entry%%=*}\" \"${billet_entry#*=}\"\n") {
 		t.Fatal("the EC2 runner does not receive its cache session through a clean environment")
 	}
 	if strings.Contains(script, "BILLET_CACHE_READY_TOKEN") {

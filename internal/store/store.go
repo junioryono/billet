@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -183,6 +184,78 @@ type VolumeSizer interface {
 // implement it; ordinary sticky disks need only Store.
 type KeyMatcher interface {
 	Match(ctx context.Context, exact string, restorePrefixes []string) (key, generation string, err error)
+}
+
+// Archive is one immutable whole object an ArchiveStore holds.
+type Archive struct {
+	Key      string
+	Size     int64
+	Modified time.Time
+}
+
+// ErrArchiveSize means the blocks a commit names do not add up to the size the
+// client declared, so nothing was published.
+var ErrArchiveSize = errors.New("store: the staged blocks are not the declared size")
+
+// ArchiveStore keeps a cache whose unit is a file rather than a filesystem as
+// whole objects, on a store where a volume per file would cost more than the file
+// saves (ADR-023). Optional: a store without it serves archives from volumes.
+//
+// The first commit of a key wins and an archive never changes, so there is no
+// pointer, no writer lease and no fence: two writers of one key cannot publish
+// anything but one of two whole archives.
+type ArchiveStore interface {
+	// ArchiveExists reports whether a key is published; an error is could-not-tell.
+	ArchiveExists(ctx context.Context, key string) (bool, error)
+	// MatchArchive finds the exact key, or the newest archive under the first
+	// restore prefix that has one. ErrMiss means no archive matches.
+	MatchArchive(ctx context.Context, exact string, restorePrefixes []string) (Archive, error)
+	// StageArchive stores one block of an upload, under the name the client gave
+	// it. size is the block's exact length.
+	StageArchive(ctx context.Context, upload, block string, body io.Reader, size int64) error
+	// CommitArchive publishes the named blocks, in order, as key, if they total
+	// size, and releases the staged blocks. It is idempotent per upload: published
+	// is true when this upload's archive is the one at key, whether this call or an
+	// earlier one whose answer was lost put it there, and false when another
+	// upload's is.
+	CommitArchive(ctx context.Context, key, upload string, blocks []string, size int64) (published bool, err error)
+	// AbortArchive releases an upload that will not be committed. It is idempotent.
+	AbortArchive(ctx context.Context, upload string) error
+	// ReadArchive reads length bytes of an archive from start.
+	ReadArchive(ctx context.Context, archive Archive, start, length int64) (io.ReadCloser, error)
+}
+
+// BlobTable names one of a content-addressed cache's two tables, as its path does.
+type BlobTable string
+
+const (
+	// BlobTableAC holds action results, a job's claim about an action.
+	BlobTableAC BlobTable = "ac"
+	// BlobTableCAS holds objects named by the digest of their bytes.
+	BlobTableCAS BlobTable = "cas"
+)
+
+// BlobRef names one object of a content-addressed cache.
+type BlobRef struct {
+	Table  BlobTable
+	Digest string
+}
+
+// BlobStore keeps a content-addressed cache as one object per entry (ADR-023).
+// Optional: a store without it serves these caches from a mounted volume.
+//
+// AN ENTRY'S NAME IS WHAT IT HOLDS, or a job's claim that first-writer-wins keeps,
+// so concurrent jobs merge by writing and there is no generation to publish.
+type BlobStore interface {
+	// ListBlobs is every entry a key holds, so a miss costs the store no request.
+	ListBlobs(ctx context.Context, key string) (map[BlobRef]struct{}, error)
+	// ReadBlob reads one entry. ErrMiss means it is not there.
+	ReadBlob(ctx context.Context, key string, ref BlobRef) (io.ReadCloser, error)
+	// PutBlob stores one entry unless it is already there, which is not an error.
+	PutBlob(ctx context.Context, key string, ref BlobRef, body io.Reader, size int64) error
+	// RecordBlobUse says one job used these entries, which keeps them from eviction
+	// for the retention that starts now. id names the record, unique per job.
+	RecordBlobUse(ctx context.Context, key, id string, used []BlobRef) error
 }
 
 // GenerationChecker checks a published generation's own filesystem, read-only.

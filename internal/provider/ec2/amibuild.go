@@ -30,6 +30,8 @@ const (
 	amiLayerPath = amiBuildDir + "/ec2-layer.sh"
 	amiUnitPath  = "/etc/systemd/system/billet-ami-build.service"
 	amiUnitName  = "billet-ami-build.service"
+	// amiGuestBilletPath is where the payload stages billet itself.
+	amiGuestBilletPath = amiBuildDir + "/guest-billet"
 )
 
 // The build's verdict, framed on the console as the verifier's report is.

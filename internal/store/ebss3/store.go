@@ -70,7 +70,10 @@ type Store struct {
 	owner   string
 	blocks  blockAPI
 	objects objectAPI
-	now     func() time.Time
+	// bulk reaches whole objects: the half of the store for a cache whose unit is a
+	// file (archive.go, ADR-023).
+	bulk bulkAPI
+	now  func() time.Time
 }
 
 var _ storecontract.Store = (*Store)(nil)
@@ -102,6 +105,10 @@ func withNow(now func() time.Time) option {
 			s.now = now
 		}
 	}
+}
+
+func withBulk(bulk bulkAPI) option {
+	return func(s *Store) { s.bulk = bulk }
 }
 
 func newStore(
@@ -884,7 +891,7 @@ func (s Store) Evict(ctx context.Context, olderThan time.Duration) error {
 		}
 	}
 
-	return nil
+	return s.evictObjects(ctx, olderThan)
 }
 
 // evictDelete runs one ORPHAN-SWEEP delete, treating a not-owned refusal as a SKIP
@@ -915,9 +922,12 @@ func (s Store) evictDelete(
 
 // PurgeReport counts what Purge removed.
 type PurgeReport struct {
-	Snapshots      int
-	Volumes        int
-	StateObjects   int
+	Snapshots    int
+	Volumes      int
+	StateObjects int
+	// CacheObjects counts archives, content-addressed entries, their records and
+	// unfinished uploads.
+	CacheObjects   int
 	SkippedForeign int
 }
 
@@ -1004,6 +1014,11 @@ func (s Store) Purge(ctx context.Context) (PurgeReport, error) {
 		} else {
 			report.SkippedForeign++
 		}
+	}
+
+	report.CacheObjects, err = s.purgeObjects(ctx)
+	if err != nil {
+		return report, err
 	}
 
 	// The state index LAST, so an interrupted purge leaves it pointing at blocks a

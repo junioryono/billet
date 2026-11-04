@@ -18,6 +18,13 @@ const (
 	IAMS3GetObject  = "s3:GetObject"
 	IAMS3PutObject  = "s3:PutObject"
 	IAMS3ListBucket = "s3:ListBucket"
+	// The archives and entries of a cache whose unit is a file (ADR-023) are evicted
+	// by the node itself, by how recently a job used them, which no lifecycle rule
+	// can see, and a commit that dies leaves a multipart upload only these end.
+	IAMS3DeleteObject     = "s3:DeleteObject"
+	IAMS3AbortMultipart   = "s3:AbortMultipartUpload"
+	IAMS3ListMultipart    = "s3:ListBucketMultipartUploads"
+	IAMS3ListMultipartOne = "s3:ListMultipartUploadParts"
 
 	// KMS actions an EBS volume encrypted with a customer-managed key requires.
 	// EBS uses grants: CreateGrant lets the EC2 service decrypt the volume for the
@@ -80,6 +87,25 @@ func S3ObjectIAMActions() []string {
 // assembled statement's condition.
 func S3ListIAMActions() []string {
 	return []string{IAMS3ListBucket}
+}
+
+// S3ObjectDeleteIAMActions end what eviction and an abandoned upload leave. A bundled
+// policy grants them on the object half's names only and never on the state objects,
+// so the credential that can evict an archive cannot unpublish a sticky disk.
+func S3ObjectDeleteIAMActions() []string {
+	return []string{IAMS3DeleteObject, IAMS3AbortMultipart, IAMS3ListMultipartOne}
+}
+
+// S3ObjectDeleteSubtrees are the names under an owner those actions reach, as
+// archive.go lays them out.
+func S3ObjectDeleteSubtrees() []string {
+	return []string{"archives", "archive-used", "stage", "blobs", "blob-uses"}
+}
+
+// S3ListMultipartIAMActions is the listing of unfinished uploads. Bucket-level, with
+// no prefix condition: S3 evaluates s3:prefix for an object listing only.
+func S3ListMultipartIAMActions() []string {
+	return []string{IAMS3ListMultipart}
 }
 
 // KMSCryptoIAMActions are the direct-use permissions on a customer-managed EBS

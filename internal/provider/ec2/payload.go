@@ -13,12 +13,14 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/guestassets"
+	"github.com/junioryono/billet/internal/notices"
 	"github.com/junioryono/billet/internal/runnerimages"
 	"github.com/junioryono/billet/scripts"
 )
@@ -277,7 +279,19 @@ func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
 		files = append(files, member{amiRepoDir + "/internal/runnerimages/" + file, 0o644, body})
 	}
 
+	assets, err := guestCacheAssets()
+	if err != nil {
+		return nil, "", err
+	}
+	for name, body := range assets {
+		files = append(files, member{amiRepoDir + "/internal/guestassets/" + name, 0o644, []byte(body)})
+	}
+	// IN A FIXED ORDER, so the payload's digest is one fact about its contents.
+	slices.SortFunc(files, func(a, b member) int { return strings.Compare(a.name, b.name) })
+
 	files = append(files,
+		member{amiRepoDir + "/internal/notices/THIRD_PARTY_NOTICES", 0o644, []byte(notices.Text())},
+		member{amiGuestBilletPath, 0o755, spec.GuestBillet},
 		member{amiRepoDir + "/internal/runnerimages/pinned.txt", 0o644, runnerimages.PinnedFile()},
 		member{amiRepoDir + "/internal/guestassets/docker-daemon.json", 0o644,
 			[]byte(guestassets.DockerDaemonJSON)},

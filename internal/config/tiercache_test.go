@@ -196,11 +196,23 @@ func TestEveryNodeServedCacheRequiresAHostBackedCacheNode(t *testing.T) {
 			t.Errorf("%s without a node cache: %v", kind, err)
 		}
 
-		remote := strings.Replace(untrustedCacheTier(block), "    provider: firecracker\n",
-			"    provider: ec2\n", 1)
-		if _, err := Load(writeConfig(t, remote)); err == nil ||
-			!strings.Contains(err.Error(), "only the firecracker provider") {
-			t.Errorf("%s on remote compute: %v", kind, err)
+		// EACH BACKEND ADR-023 REFUSES IS REFUSED FOR ITS OWN REASON.
+		for provider, reason := range map[string]string{
+			"codebuild": "not scrubbed", "tart": "no site store", "docker": "for trials",
+		} {
+			refused := strings.Replace(untrustedCacheTier(block), "    provider: firecracker\n",
+				"    provider: "+provider+"\n", 1)
+			if _, err := Load(writeConfig(t, refused)); err == nil || !strings.Contains(err.Error(), reason) {
+				t.Errorf("%s on %s: %v, want it to say %q", kind, provider, err, reason)
+			}
+		}
+
+		// AND A FALLBACK IS REFUSED, because the job placed on it cannot reach the store.
+		fallback := strings.Replace(untrustedCacheTier(block), "    provider: firecracker\n",
+			"    providers: [firecracker, ec2]\n", 1)
+		if _, err := Load(writeConfig(t, fallback)); err == nil ||
+			!strings.Contains(err.Error(), "one provider") {
+			t.Errorf("%s on a fallback tier: %v", kind, err)
 		}
 	}
 }

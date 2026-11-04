@@ -181,6 +181,10 @@ type verifyProbe struct {
 	entryPointMode os.FileMode
 	// execEnv replaces the helper the image carries; empty is guestassets' own.
 	execEnv string
+	// guestFile, when set, is a guest cache file the image holds with other bytes.
+	guestFile string
+	// noGuestBillet is an image whose billet does not run as the runner.
+	noGuestBillet bool
 }
 
 // legacyEntryPoint is the launch an image built before contract 3 carries: the
@@ -445,6 +449,36 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 		}
 
 		writeFile(t, croot+stray, "#!/bin/sh\nexit 0\n", 0o755)
+	}
+
+	// THE GUEST HALF OF EVERY CACHE, as the build installs it, unless a case says.
+	files, err := guestCacheFiles()
+	if err != nil {
+		t.Fatalf("guestCacheFiles: %v", err)
+	}
+	for _, f := range files {
+		body := f.body
+		if f.path == p.guestFile {
+			body += "# changed\n"
+		}
+		if err := os.MkdirAll(filepath.Dir(croot+f.path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeExecutableFile(t, croot+f.path, body)
+	}
+	for path, body := range map[string]string{
+		"/usr/sbin/dnsmasq": "#!/bin/sh\nexit 0\n",
+		"/usr/local/lib/billet/container-hook/upstream.js": "// the hook\n",
+		"/opt/billet/bin/bazel-credential-helper":          "#!/bin/sh\nexit 0\n",
+		guestBilletPath: "#!/bin/sh\nexit 0\n",
+	} {
+		if path == guestBilletPath && p.noGuestBillet {
+			body = "#!/bin/sh\nexit 1\n"
+		}
+		if err := os.MkdirAll(filepath.Dir(croot+path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeExecutableFile(t, croot+path, body)
 	}
 
 	script = substitute(t, script, "billet_root=''", "billet_root='"+croot+"'")
@@ -954,6 +988,20 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			name:     "the runner does not execute",
 			probe:    verifyProbe{brokenRunner: true},
 			wantStep: "runner",
+		},
+		{
+			// A FILE OF THE GUEST'S CACHES THAT IS NOT WHAT THIS BILLET INSTALLS: a job
+			// would run a mechanism nothing here tested.
+			name:     "a guest cache file is not the one this billet installs",
+			probe:    verifyProbe{guestFile: guestCachesPath},
+			wantStep: "guest caches",
+		},
+		{
+			// GOCACHEPROG HAS NO FALLBACK WHEN IT CANNOT START, so this image would fail
+			// every Go build on a tier with the cache.
+			name:     "billet in the guest does not run",
+			probe:    verifyProbe{noGuestBillet: true},
+			wantStep: "guest caches",
 		},
 		{
 			// THE HELPER IS ON THE IMAGE AND THE ENTRY POINT DOES NOT USE IT. Every

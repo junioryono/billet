@@ -226,7 +226,9 @@ func newLaunchFixture(t *testing.T, imageEnv string) launchFixture {
 	}
 
 	return launchFixture{
-		script: "set -eu\nrunner_started=222\n" + runnable +
+		script: "set -eu\nrunner_started=222\nrunner_env=(\"BILLET_CACHE_ENDPOINT=${BILLET_CACHE_ENDPOINT:-}\" " +
+			"\"BILLET_CACHE_TOKEN=${BILLET_CACHE_TOKEN:-}\" " +
+			"\"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\")\n" + runnable +
 			"echo \"after the launch: $job_status\" >&2\nexit \"$job_status\"\n",
 		argvLog: argvLog,
 		path:    bin + ":/usr/bin:/bin",
@@ -239,7 +241,9 @@ func newLaunchFixture(t *testing.T, imageEnv string) launchFixture {
 func (f launchFixture) run(t *testing.T, exported map[string]string) (string, string, error) {
 	t.Helper()
 
-	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", f.script)
+	// BASH, as the entry point is: what the guest caches' library put in runner_env
+	// is added from an array.
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", f.script)
 	cmd.Env = []string{"PATH=" + f.path, "HOME=/root", "USER=root", "POISON=inherited"}
 	for name, value := range exported {
 		cmd.Env = append(cmd.Env, name+"="+value)

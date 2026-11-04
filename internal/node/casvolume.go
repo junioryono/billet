@@ -95,6 +95,14 @@ type hostVolume struct {
 	// place of. Its volume replaces that generation and no other: anything
 	// published since, another fresh start's included, is merged into.
 	Supersedes string `json:"supersedes,omitempty"`
+	// Objects says this volume is a directory on the node's own disk over a store
+	// that keeps entries as objects (casblobs.go). Volume then names only the key.
+	Objects bool `json:"objects,omitempty"`
+	// index and reads are what the store held and what this session read of it.
+	index blobIndex
+	reads blobUses
+	// written bounds what one job adds to a store with no volume to fill.
+	written atomic.Int64
 
 	// io is held for reading by every transfer and for writing by whatever
 	// unmounts the volume, so no transfer runs on a volume being taken away.
@@ -156,6 +164,14 @@ func (s *CacheService) casVolume(
 
 	ceiling := volumeCeiling(setting)
 	key := s.cacheKeyFor(session, kind, "", "")
+	if s.blobStore() != nil {
+		hv, err := s.attachBlobVolume(session, kind, key)
+		if err != nil {
+			backOff()
+		}
+
+		return hv, err
+	}
 	volume, cold, err := s.cloneWithin(ctx, key, ceiling)
 	if cold {
 		volume, err = s.store.Create(ctx, key, ceiling)
@@ -398,6 +414,9 @@ type casHandle struct {
 	root    string
 	limit   int64
 	release func()
+	// ctx is the transfer's: reapi.Volume's Open takes none, and on a store of
+	// objects an Open can be a request.
+	ctx context.Context //nolint:containedctx // A handle lives for one call.
 }
 
 var _ reapi.Volume = (*casHandle)(nil)
@@ -483,7 +502,7 @@ func (s *CacheService) openCASHandle(
 
 	return &casHandle{
 		s: s, session: session, hv: hv, root: s.casMountPath(session, kind),
-		limit: volumeCeiling(sessionSetting(session, kind)),
+		limit: volumeCeiling(sessionSetting(session, kind)), ctx: ctx,
 		release: func() {
 			hv.io.RUnlock()
 			admitted()
@@ -508,6 +527,10 @@ func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
 	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
+		if h.hv.Objects {
+			return h.openBlob(table, digest)
+		}
+
 		return nil, fs.ErrNotExist
 	}
 	file := os.NewFile(uintptr(fd), path)
@@ -532,7 +555,20 @@ func (h *casHandle) Put(ctx context.Context, table reapi.Table, digest string, b
 	if table == reapi.TableCAS {
 		limit = h.limit
 	}
-	return h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root)
+	if !h.hv.Objects {
+		return h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root)
+	}
+	if h.hv.written.Load() >= h.limit {
+		return reapi.ErrFull
+	}
+	if err := h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root); err != nil {
+		return err
+	}
+	if info, err := os.Stat(path); err == nil {
+		h.hv.written.Add(info.Size())
+	}
+
+	return nil
 }
 
 func (h *casHandle) Close() { h.release() }
@@ -636,6 +672,9 @@ func stopWith(ctx context.Context, r io.Reader) io.Reader {
 func (s *CacheService) releaseCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
 ) (bool, error) {
+	if hv.Objects {
+		return s.releaseBlobVolume(ctx, session, hv)
+	}
 	// A TRANSFER STILL RUNNING HOLDS io, and the cache loop serves every
 	// session, so it waits a little and comes back rather than wait out a
 	// transfer's whole deadline.

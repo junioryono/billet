@@ -47,7 +47,8 @@ func (s *CacheService) restoreSessionMounts(ctx context.Context, session *cacheS
 	}
 
 	for kind, hv := range session.hosts {
-		if !hv.Mounted {
+		// A DIRECTORY ON THE NODE'S STATE DISK IS NOT A MOUNT, and is still there.
+		if !hv.Mounted || hv.Objects {
 			continue
 		}
 		if err := s.ensureMounted(ctx, s.actionIO.MountWritable, hv.Volume.Device,
@@ -60,7 +61,7 @@ func (s *CacheService) restoreSessionMounts(ctx context.Context, session *cacheS
 	}
 
 	for _, archive := range session.actions {
-		if archive.Unmounted {
+		if archive.Unmounted || archive.objectBacked() {
 			continue
 		}
 		mount := s.actionIO.MountWritable

@@ -452,18 +452,18 @@ func (t Tier) ReservationErrors(where string) []error {
 	return errs
 }
 
-// InterceptionErrors reports tiers that could reach a backend without the local
-// storage and guest control the transparent Actions cache requires.
+// InterceptionErrors reports tiers that could reach a backend without the site
+// store and guest control the transparent Actions cache requires.
 //
 // Exported because alloc.New cannot assume its catalogue came through Load.
 //
-// THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS:
-// the Actions cache, the Git proxy and the Bazel and Go caches each mount a
-// site-store volume on the host, which only a firecracker node has.
+// THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS: the
+// Actions cache, the Git proxy and the Bazel and Go caches. Each backend's answer and
+// its reason are ADR-023.
 func (t Tier) InterceptionErrors(where string) []error {
 	cache := t.EffectiveCache()
 	explicit := t.explicitGuestCaches()
-	if !cache.needsGuestCacheServices() || len(explicit) == 0 {
+	if !cache.NeedsGuestCacheServices() || len(explicit) == 0 {
 		return nil
 	}
 
@@ -474,15 +474,39 @@ func (t Tier) InterceptionErrors(where string) []error {
 	what := "the " + strings.Join(enabled, ", ") + " cache"
 
 	providers := t.AcceptableProviders()
-	if len(providers) != 1 || providers[0] != ProviderFirecracker {
-		return []error{fmt.Errorf("%s: %s requires only the firecracker provider; "+
-			"remote and fallback providers cannot reach this node's site-local store", where, what)}
+	if len(providers) != 1 {
+		return []error{fmt.Errorf("%s: %s requires one provider, firecracker or ec2; a job placed on "+
+			"a fallback provider cannot reach the first one's site store", where, what)}
+	}
+	if !serveGuestCaches(providers[0]) {
+		return []error{fmt.Errorf("%s: %s requires the firecracker or ec2 provider, and %s cannot "+
+			"have it: %s", where, what, providers[0], guestCacheRefusal(providers[0]))}
 	}
 	if t.GuestOS != GuestLinux {
 		return []error{fmt.Errorf("%s: %s currently requires a Linux guest", where, what)}
 	}
 
 	return nil
+}
+
+// serveGuestCaches reports whether a backend's guest can be served the node's caches
+// (ADR-023).
+func serveGuestCaches(p ProviderKind) bool {
+	return p == ProviderFirecracker || p == ProviderEC2
+}
+
+// guestCacheRefusal says why a backend's guest cannot be, in ADR-023's terms.
+func guestCacheRefusal(p ProviderKind) string {
+	switch p {
+	case ProviderCodeBuild:
+		return "the build host is not billet's, and a reserved fleet's is not scrubbed between builds"
+	case ProviderTart:
+		return "no site store exists for a Mac yet"
+	case ProviderDocker:
+		return "the docker backend is for trials, and its containers share the host's kernel"
+	default:
+		return "nothing serves that backend"
+	}
 }
 
 // ReservedVCPU is the vCPU a tier's floor holds back from other tiers.

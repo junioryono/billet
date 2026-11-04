@@ -35,6 +35,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`awspolicy` is one generator with three consumers and a measured boundary.**
 - **`ec2:CreateVolume` from a snapshot authorises the snapshot as well**
 - **`ec2:RunInstances` on `*` authorises every snapshot a block-device mapping names**
+- **The AMI carries the guest half of every cache, and its library is cut from the firecracker agent's own text at build time (ADR-023).**
 
 ### codebuild: [references/codebuild.md](references/codebuild.md)
 

@@ -90,6 +90,8 @@ type CacheService struct {
 	// casFill is casFillDefault, a field so a test is not decided by the fill
 	// of the disk it runs on.
 	casFill float64
+	// casCacheFill is the package's constant, a field for the same reason.
+	casCacheFill float64
 	// npmSettleWait is defaultNpmSettleWait, a field so a test can reach its
 	// bound without waiting it out.
 	npmSettleWait time.Duration
@@ -348,6 +350,7 @@ func NewCacheService(
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
+	service.casCacheFill = casCacheFill
 	service.npmSettleWait = defaultNpmSettleWait
 	service.answerCloseWait = defaultAnswerCloseWait
 	if err := service.loadSessions(); err != nil {
@@ -1172,6 +1175,23 @@ func (s *CacheService) cleanupSession(
 		if archive.Mode == actionsModeUpload {
 			s.log.Warn("an Actions cache save was reserved and never finalized; nothing was published",
 				"instance", session.instance, "key", archive.CacheKey, "version", archive.Version)
+		}
+		if archive.Upload != "" {
+			if err := s.archiveStore().AbortArchive(ctx, archive.Upload); err != nil {
+				failures = append(failures, fmt.Errorf("actions cache %s abort: %w", id, err))
+				archive.mu.Unlock()
+
+				continue
+			}
+		}
+		if archive.objectBacked() {
+			archive.mu.Unlock()
+			delete(session.actions, id)
+			if err := s.persistSession(session); err != nil {
+				return fmt.Errorf("node: record released Actions cache of %s: %w", session.instance, err)
+			}
+
+			continue
 		}
 		if !archive.Unmounted {
 			if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {

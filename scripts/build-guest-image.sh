@@ -169,6 +169,9 @@ fi
 # carries none. internal/guestassets/container-hook.LICENSE is that project's
 # LICENSE at the pinned tag, and container-hook.NOTICE reproduces the licenses of
 # the npm packages the bundle was built from; a pin bump rewrites both.
+#
+# BILLET_SHARED_INSTALL_BEGIN: this function and install_cache_sudoers are also what
+# the EC2 image runs, extracted from here by scripts.GuestImageBlock (ADR-023).
 install_container_hook() {
 	local rootfs=$1
 	local pin="$SCRIPT_DIR/../internal/guestassets/container-hook.pin"
@@ -197,6 +200,7 @@ install_container_hook() {
 		"$rootfs/usr/local/lib/billet/container-hook/index.js"
 	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"
 }
+# BILLET_SHARED_INSTALL_END
 
 # NOTICE_VERSION is the shape of a version this build puts into a license's URL: a
 # toolcache directory the template's installer named, read back from the image.
@@ -380,10 +384,13 @@ HELPER
 # a NAME=value entry only for that exact value (measured on ubuntu:24.04, sudo
 # 1.9.15p5, 2026-10-23: both bundle paths crossed sudo and sudo -i, and a job's
 # own path and a longer one did not).
+#
+# BILLET_SHARED_SUDOERS_BEGIN
 install_cache_sudoers() {
 	local rootfs=$1 parsed name keep=""
-	local agent_bundle=/home/runner/runner/_work/_billet/actions-cache-ca.pem
-	local hook_bundle=/home/runner/runner/_work/_temp/billet-actions-cache-ca.pem
+	local runner_home=${BILLET_RUNNER_HOME:-/home/runner/runner}
+	local agent_bundle=$runner_home/_work/_billet/actions-cache-ca.pem
+	local hook_bundle=$runner_home/_work/_temp/billet-actions-cache-ca.pem
 	for name in NODE_EXTRA_CA_CERTS SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE; do
 		keep+=" $name=$agent_bundle $name=$hook_bundle"
 	done
@@ -404,6 +411,7 @@ install_cache_sudoers() {
 		;;
 	esac
 }
+# BILLET_SHARED_SUDOERS_END
 
 # THE COMPONENTS THE PUBLISHED IMAGE LEAVES OUT (#584), whose licenses forbid
 # billet redistributing them; differences.tsv skips their installers. The one
@@ -1534,6 +1542,12 @@ BILLET_MONITOR_ENV
 fi
 # BILLET_GUEST_MONITOR_START_END
 
+# BILLET_SHARED_PREPARE_BEGIN: from here to its end, and BILLET_SHARED_START,
+# BILLET_CACHE_RELAY and BILLET_SHARED_ENV below, are also what the EC2 image runs at
+# a job's boot. `billet ami build` extracts them from this file (scripts.GuestImageBlock,
+# ec2.guestCachesLibrary), so a guest has one mechanism however it boots (ADR-023).
+# Nothing in them may assume MMDS beyond `fetch`, which the EC2 image answers from
+# its user data.
 # THE BUILD CACHES THE TIER ENABLES, a comma-separated list the node derives from
 # the tier's cache block. Absent on an older node, and meaningless without a cache
 # session, so either leaves every build tool as the image ships it.
@@ -1594,7 +1608,7 @@ if { [ -n "$actions_proxy_candidate" ] || [ -n "$npm_proxy_candidate" ]; } &&
 fi
 # BILLET_INTERCEPTION_METADATA_END
 if [ -n "$interception_named" ]; then
-	actions_ca_dir=/home/runner/runner/_work/_billet
+	actions_ca_dir=${BILLET_RUNNER_HOME:-/home/runner/runner}/_work/_billet
 	actions_ca_path="$actions_ca_dir/actions-cache-ca.pem"
 	actions_hook_path="$actions_ca_dir/actions-cache-job-started.sh"
 	install -d -m 0755 -o runner -g runner "$actions_ca_dir"
@@ -1651,6 +1665,13 @@ fi
 # harness that runs this script without one must not turn that into a failure.
 if [ -n "${GITHUB_PATH:-}" ]; then
 	printf '%s\n' /opt/billet/bin >>"$GITHUB_PATH"
+fi
+
+# THE RUNNER RUNS ONE JOB-STARTED HOOK, and this is it where interception is on. An
+# image with a hook of its own (the EC2 image's job timing) names it here, and a
+# failure of that one is its own business.
+if [ -n "${BILLET_JOB_STARTED_NEXT:-}" ]; then
+	"$BILLET_JOB_STARTED_NEXT" || true
 fi
 ACTIONS_HOOK
 	chown runner:runner "$actions_hook_path"
@@ -1744,6 +1765,7 @@ ACTIONS_HOOK
 	fi
 	# BILLET_CONTAINER_DNS_CONFIG_END
 fi
+# BILLET_SHARED_PREPARE_END
 
 # Docker is deliberately not enabled at boot. Starting it only after the cache
 # device is mounted is what makes /var/lib/docker transparent to service
@@ -1772,6 +1794,7 @@ fi
 # running from a toolcache Python, its next restart or lazy import failed, the
 # remapped origin refused every connection, and the job's artifact upload failed
 # with ECONNREFUSED after a two-hour build (2026-10-04).
+# BILLET_SHARED_START_BEGIN
 python_runtime=""
 if [ -x /usr/bin/python3 ]; then
 	python_runtime=/usr/bin/python3
@@ -1985,6 +2008,7 @@ if [ -n "$container_dns_active" ]; then
 	fi
 fi
 # BILLET_CONTAINER_DNS_END
+# BILLET_SHARED_START_END
 
 # THE COMMAND ARRIVES AS JSON IN A STRING, and both halves of that are deliberate.
 #
@@ -2128,12 +2152,13 @@ cd /home/runner/runner
 # node is away. Everything that names the cache after this point (the runner's
 # BILLET_CACHE_ENDPOINT, the git rewrite and its credential helper, bazelrc, the
 # Go helper) names the relay. The Docker image store was attached above, before
-# Docker, and keeps the node's own address. Only a plain-HTTP endpoint: an https
-# one names the node in its certificate, so it is left direct, and so is any
-# endpoint whose relay does not start.
+# Docker, and keeps the node's own address. An https endpoint (an EC2 guest's) goes
+# through it too: the relay then does the TLS to the node itself, and every client
+# speaks plain HTTP on the guest's own bridge. An endpoint whose relay does not start
+# is left direct.
 cache_relay_port=41322
 # BILLET_CACHE_RELAY_BEGIN
-if [ -n "$cache_endpoint" ] && [ "${cache_endpoint%%://*}" = http ]; then
+if [ -n "$cache_endpoint" ]; then
 	if ! relay_bridge=$(ip -4 -o addr show docker0 2>/dev/null |
 		awk 'NR == 1 {split($4, a, "/"); print a[1]}'); then
 		relay_bridge=""
@@ -2208,6 +2233,7 @@ if [ -r "$IMAGE_ENV_FILE" ]; then
 		fi
 	done <"$IMAGE_ENV_FILE"
 fi
+# BILLET_SHARED_ENV_BEGIN
 # BILLET_CACHE_ENV_BEGIN
 if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
 	runner_env+=("BILLET_CACHE_ENDPOINT=$cache_endpoint" "BILLET_CACHE_TOKEN=$cache_token"
@@ -2330,6 +2356,7 @@ if { [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actio
 	[ -n "$guest_go" ]; then
 	runner_env+=("ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js")
 fi
+# BILLET_SHARED_ENV_END
 # THE JOB-COMPLETED HOOK ASKS THE GUEST MONITOR FOR ITS FINAL BATCH, only where
 # one was started. The runner runs it after the job's last step and before GitHub
 # records the job complete, so the batch reaches the node before the destroy is

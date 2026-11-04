@@ -7,7 +7,7 @@ description: "Load when touching sites, internal/store (generations, writer leas
 
 ## What this area is
 
-A site is a place where compute and its storage share a fast network (`sites[]`, `store: ceph | ebs-s3`). A node reports its site at registration, a tier may pin one, and the control plane refuses a node whose provider cannot use the site's store. `internal/store` is the contract every cache implementation satisfies: immutable named generations, copy-on-write clones held under active leases, a writer lease for publication and a fenced pointer advanced by compare-and-swap. `internal/store/ceph` drives RBD through the `rbd` command for firecracker sites; `internal/store/ebss3` uses EBS snapshots and an S3 pointer for EC2 sites. On the node, `internal/node/actions_cache.go`, `actions_proxy.go` and `actions_volume.go` intercept `actions/cache` traffic for Linux firecracker tiers. `actions/stickydisk`, `setup-docker-builder`, `stop-docker-builder` and `build-push-action` are the published actions. `docs/reference/decisions/adr-003-ceph-rbd.md` records the cluster and its measurements; `docs/operating/actions-cache.md` is the operator page.
+A site is a place where compute and its storage share a fast network (`sites[]`, `store: ceph | ebs-s3`). A node reports its site at registration, a tier may pin one, and the control plane refuses a node whose provider cannot use the site's store. `internal/store` is the contract every cache implementation satisfies: immutable named generations, copy-on-write clones held under active leases, a writer lease for publication and a fenced pointer advanced by compare-and-swap. `internal/store/ceph` drives RBD through the `rbd` command for firecracker sites; `internal/store/ebss3` uses EBS snapshots and an S3 pointer for EC2 sites. On the node, `internal/node/actions_cache.go`, `actions_proxy.go` and `actions_volume.go` intercept `actions/cache` traffic for Linux firecracker and EC2 tiers, with `actions_objects.go` and `casblobs.go` where the store keeps whole objects (ADR-023). `actions/stickydisk`, `setup-docker-builder`, `stop-docker-builder` and `build-push-action` are the published actions. `docs/reference/decisions/adr-003-ceph-rbd.md` records the cluster and its measurements; `docs/operating/actions-cache.md` is the operator page.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -30,6 +30,13 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **An intact orphan volume is reclaimed by an operator, on proof, through the trash (#301).**
 - **A kernel mapping no job accounts for is unmapped on proof, never forced, and counted (#494).**
 - **A golden's system disk is the builder's clone, renamed in place, and nothing that sweeps the cache pool takes it (#508).**
+
+### A store of whole objects, on EC2: [references/objects.md](references/objects.md)
+
+- **On `ebs-s3`, a cache whose unit is a file is objects, not volumes, and that was measured.**
+- **The guest half is the firecracker agent's own text, cut out at build time.**
+- **A commit's condition decides the race, and asks the object when its answer is lost.**
+- **A read leaves no trace on an object, so retention is written down: a marker, or a record.**
 
 ### The Actions cache, the kill switch and publication: [references/actions-cache-and-publication.md](references/actions-cache-and-publication.md)
 

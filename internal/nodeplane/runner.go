@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 )
@@ -101,12 +102,21 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 		return err
 	}
 
+	spec := nodeapi.TierSpecOf(tier, selectedProvider)
+	guestCaches := selectedProvider == config.ProviderEC2 && spec.Cache != nil &&
+		(spec.Intercept || spec.Cache.NeedsGuestCacheServices())
+	if guestCaches && wire < nodeapi.VersionEC2GuestCaches {
+		spec.Cache = new(spec.Cache.WithoutGuestCaches())
+		spec.Intercept = false
+		guestCaches = false
+	}
+
 	pend := &pending{
 		cmd: nodeapi.Command{
 			ID:    id,
 			Kind:  nodeapi.CommandLaunch,
 			Lease: lease,
-			Tier:  nodeapi.TierSpecOf(tier, selectedProvider),
+			Tier:  spec,
 			Job: &nodeapi.Job{
 				RequestID:   job.RequestID,
 				RunID:       job.RunID,
@@ -122,6 +132,10 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 	}
 	if tier.NeedsCacheAwareNode() {
 		pend.minWire = nodeapi.VersionCacheAuthority
+	}
+
+	if guestCaches {
+		pend.minWire = max(pend.minWire, nodeapi.VersionEC2GuestCaches)
 	}
 
 	if tier.Arch != "" {

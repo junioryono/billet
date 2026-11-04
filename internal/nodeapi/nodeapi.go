@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 37
+	Version = 38
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -508,6 +508,16 @@ const (
 	// SENT, as the cache block is: an older node ignores TierSpec's arch, so a tier
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
+
+	// VersionEC2GuestCaches is the version from which an EC2 node carries the caches
+	// it serves to a guest into that guest's boot script (ADR-023).
+	//
+	// REPORTED BY DOING LESS, WHERE THE LAUNCH IS SENT: an older EC2 node refuses a
+	// launch that names a guest cache, which would fail every job on a tier that
+	// merely has them by default. So the plane sends it the tier's cache block with
+	// them off, and its job runs as it did before them. Delivery holds a launch that
+	// names them to a node at this version or above.
+	VersionEC2GuestCaches = 38
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

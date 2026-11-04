@@ -1,6 +1,6 @@
 # Build caches
 
-A Firecracker node serves seven caches from the site's store, beside the compute that uses them: the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job. An eighth, the npm registry cache, is served from the node's own disk and, since 2026-10-25, is on by default too; a tier whose jobs run a client in the runner's own process that ignores `NODE_EXTRA_CA_CERTS` and the system store fails TLS through it, and turns it off with `cache.npm.enabled: false`.
+A Firecracker or EC2 node serves seven caches from the site's store, beside the compute that uses them ([which backends, and why](../reference/decisions/adr-023-caches-off-firecracker.md)): the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job. An eighth, the npm registry cache, is served from the node's own disk and, since 2026-10-25, is on by default too; a tier whose jobs run a client in the runner's own process that ignores `NODE_EXTRA_CA_CERTS` and the system store fails TLS through it, and turns it off with `cache.npm.enabled: false`.
 
 This page is the operator's view: what each cache is, what a tier gets without asking, how publication is decided, and how to see and stop a cache. [Trust and isolation](../concepts/trust-and-isolation.md) says what a cache can leak and to whom, and [ADR-013](../reference/decisions/adr-013-branch-protected-caches.md) records why publication is decided the way it is.
 
@@ -10,14 +10,14 @@ This page is the operator's view: what each cache is, what a tier gets without a
 |---|---|---|
 | Docker image store | on | any backend with `node.cache` |
 | Sticky disks | on | any backend with `node.cache` |
-| Actions cache | on where its scope already holds (below) | a Linux Firecracker tier and a repository scope, which an organization target's pool gets only by naming one ([An organization target](actions-cache.md#an-organization-target)) |
-| Git mirror | on | a Linux Firecracker tier |
-| Bazel and Buck2 | on where the tier can publish it (below) | a Linux Firecracker tier |
-| Go build cache | on where the tier can publish it (below) | a Linux Firecracker tier |
+| Actions cache | on where its scope already holds (below) | a Linux Firecracker or EC2 tier and a repository scope, which an organization target's pool gets only by naming one ([An organization target](actions-cache.md#an-organization-target)) |
+| Git mirror | on | a Linux Firecracker or EC2 tier |
+| Bazel and Buck2 | on where the tier can publish it (below) | a Linux Firecracker or EC2 tier |
+| Go build cache | on where the tier can publish it (below) | a Linux Firecracker or EC2 tier |
 | Go test results | **off** | the Go build cache |
-| npm registry | on | a Linux Firecracker tier, and a guest image that knows the `npm-proxy` key |
+| npm registry | on | a Linux Firecracker or EC2 tier, and a guest image that knows the `npm-proxy` key |
 
-A cache that is on by default but cannot run on a tier is simply off there: a Docker tier gets the image store and sticky disks, and a Firecracker node without `node.cache` runs its jobs cold. Only a cache a tier turns on explicitly is refused where it cannot run, because then the operator asked for something the node cannot give.
+A cache that is on by default but cannot run on a tier is simply off there: a Docker tier gets the image store and sticky disks, and a node without `node.cache` runs its jobs cold. Only a cache a tier turns on explicitly is refused where it cannot run, because then the operator asked for something the node cannot give.
 
 The Bazel and Go caches are on by default only where the tier can publish what they hold: a trusted tier under `trusted-only`, or any tier under `default-branch`. Their keys are scoped by trust, so an untrusted tier that publishes nothing would read a key nobody writes and every build would start cold, and that is worse than no billet cache at all: `GOCACHEPROG` takes precedence over `GOCACHE`, so the build cache a workflow restores itself (`setup-go`, `golangci-lint`) would be ignored. Turn either on explicitly to have it anyway.
 
@@ -50,6 +50,13 @@ Publication happens off the node's command path, after the compute is gone, jour
 **Bazel and Buck2.** The node speaks Bazel's HTTP cache at `/v1/cas/bazel` and the cache half of the Remote Execution API over gRPC on the same listener. The guest writes `/etc/bazel.bazelrc` with the remote cache and a credential helper (`billet cache credential-helper`) that answers the bearer from the environment and only for the node's host, so the bearer is never written to a file. Buck2 has no HTTP cache; point its `[buck2_re_client]` at the node's endpoint over `grpc://` with `http_headers = Authorization: Bearer $BILLET_CACHE_TOKEN`. A blob is stored only when its bytes hash to its digest, and an action result is served only while every blob it names is present.
 
 **Go build cache.** The guest names `billet cache gocacheprog` as `GOCACHEPROG`. Its local cache is the go command's own `GOCACHE` (`~/.cache/go-build` unless the job sets `GOCACHE`), in the go command's own layout, and it shares objects with the node's content-addressed volume; a refused or unreachable node leaves it a plain local cache, never a failed build. Because the local cache is `GOCACHE` itself, a build cache the workflow restores there (with `actions/cache`, say) still serves through the helper, and what the helper builds is there for the workflow to save: the helper is never slower than no helper. When another job's publication of the same cache holds its writer, a job's writes wait their turn, within the 30-minute publication window, instead of being dropped. A workflow opts out with `GOCACHEPROG=` (empty) in `env`, because the go command prefers `GOCACHEPROG` to `GOCACHE`. Concurrent jobs' writes are merged into the newest generation, so both survive.
+
+**On EC2.** The Docker image store and sticky disks are EBS volumes attached to the instance, as they were. The Actions cache and the Go and Bazel caches are whole objects in the site's S3 bucket, because a volume per archive costs twenty seconds before its first byte and five minutes per save ([the measurements](../reference/records/ec2-cache-probes.md)). What that asks of a deployment:
+
+- **An AMI of contract 5 or later**, which `billet check` reports. An older image ignores what the node asks and runs its jobs cold.
+- **A node inside the VPC, sized for what it now carries.** Every job's archive crosses its network, and a job's unpublished Go and Bazel writes, the read cache and the Git mirrors land under `node.state_dir`, so that disk is sized like a cache rather than an orchestrator's nothing. The read cache gives way past 70% full, and writes stop being cached past 90%.
+- **An S3 gateway endpoint in the VPC**, without which every archive crosses a NAT and is billed for it. `node.cache`'s certificate issuer stays baked into the AMI with `--ca-cert`.
+- **`max_size` means something else here.** There is no volume to fill, so it bounds what one job adds. What a key holds is bounded by retention: an archive no job has looked up, or an entry no job has used, for seven days is evicted.
 
 **npm registry.** On every firecracker Linux tier unless it writes `cache.npm.enabled: false`, the node serves `registry.npmjs.org` to the tier's guests ([ADR-020](../reference/decisions/adr-020-npm-registry-interception.md)), with no workflow change and no registry setting, so `pnpm/setup`'s own download is served too.
 - **What it answers.** It answers from a store on its own disk only anonymous reads: a package document, a version document or a tarball, asked for with no credential and no query. Everything else (a publish, a login, an audit, a request carrying an `.npmrc` token) goes to the registry unchanged.

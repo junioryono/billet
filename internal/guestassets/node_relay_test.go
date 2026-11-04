@@ -183,8 +183,9 @@ except OSError:
 assert 3 <= len(slept) <= 5, slept
 
 # 6. ONLY A PLAIN-HTTP ENDPOINT WITH A PORT.
-assert proxy.node_endpoint("http://172.31.0.1:7718") == ("172.31.0.1", 7718)
-for bad in ("https://172.31.0.1:7718", "http://172.31.0.1", "172.31.0.1:7718"):
+assert proxy.node_endpoint("http://172.31.0.1:7718") == ("172.31.0.1", 7718, False)
+assert proxy.node_endpoint("https://10.0.0.5:9443") == ("10.0.0.5", 9443, True)
+for bad in ("ftp://172.31.0.1:7718", "http://172.31.0.1", "172.31.0.1:7718"):
     try:
         proxy.node_endpoint(bad)
         raise AssertionError("the relay accepted " + bad)

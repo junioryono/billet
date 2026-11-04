@@ -36,16 +36,20 @@ including a websocket. The adapter cannot: it OWNS a TLS session, and an
 ssl.SSLSocket is not safe for a concurrent read and write, so it does one
 request and one answer in order -- which is all the paths it admits ever need.
 
-`--mode node-relay` puts the node's plain-HTTP cache endpoint one hop away
-(#374). The guest's Git, Bazel and Go caches, and the credential helpers that
-answer for them, name this listener instead of the node's address, and it splices
-each connection to the node unchanged. What it adds is patience: while the node is
-restarting (a node handing over leaves its guests running and its successor
-listens again a few seconds to minutes later), a connection is held and the node
-redialled for up to NODE_RELAY_WAIT instead of being refused, because a refused
-connection fails a `git fetch` and nothing in Git falls back. It understands no
-HTTP and terminates no TLS; an https endpoint never comes through it, since its
-certificate names the node's address.
+`--mode node-relay` puts the node's cache endpoint one hop away (#374). The guest's
+Git, Bazel and Go caches, and the credential helpers that answer for them, name this
+listener instead of the node's address, and it splices each connection to the node
+unchanged. What it adds is patience: while the node is restarting (a node handing
+over leaves its guests running and its successor listens again a few seconds to
+minutes later), a connection is held and the node redialled for up to NODE_RELAY_WAIT
+instead of being refused, because a refused connection fails a `git fetch` and nothing
+in Git falls back. It understands no HTTP.
+
+An https endpoint (an EC2 guest's, whose bearer crosses a VPC) is reached over TLS
+this relay does itself, checked against the system's roots, where the image bakes the
+listener's issuer. Everything else in the guest keeps speaking what it speaks on a
+Firecracker guest's bridge, CONNECT tunnels included, which is what keeps a client's
+own TLS out of a second TLS session Python's sockets cannot nest (ADR-023).
 
 BOTH MODES ARE ONE FILE because they are one mechanism: the CONNECT tunnel, the
 header reader, the fail-open dial and the timeouts are shared, and a second copy
@@ -253,7 +257,11 @@ def relay(client, node, node_buffer):
     peers = {client: node, node: client}
     half_closed = False
     while peers:
-        readable, _, _ = select.select(list(peers), [], [], DRAIN_IDLE)
+        # A TLS SOCKET MAY HOLD DECRYPTED BYTES THE DESCRIPTOR NO LONGER SHOWS, and
+        # select would sit on them until the idle bound.
+        readable = [peer for peer in peers if getattr(peer, "pending", int)() > 0]
+        if not readable:
+            readable, _, _ = select.select(list(peers), [], [], DRAIN_IDLE)
         if not readable:
             # No data for the idle interval. Before a half-close this is an
             # ordinarily quiet connection the node's own timeout will end; after
@@ -270,10 +278,14 @@ def relay(client, node, node_buffer):
             if data:
                 target.sendall(data)
                 continue
-            try:
-                target.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+            # NOT ON A TLS SOCKET, whose shutdown ends the session in both directions
+            # and leaves the next read returning the raw records. The idle bound ends
+            # that side once it has drained.
+            if ssl is None or not isinstance(target, ssl.SSLSocket):
+                try:
+                    target.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
             peers.pop(source, None)
             half_closed = True
 
@@ -816,11 +828,18 @@ def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None):
 
 
 def node_endpoint(upstream):
-    """The node's host and port from its plain-HTTP cache endpoint."""
+    """The node's host and port from its cache endpoint, and whether it speaks TLS."""
     parsed = urllib.parse.urlsplit(upstream)
-    if parsed.scheme != "http" or not parsed.hostname or parsed.port is None:
-        raise ValueError("the node relay needs an http endpoint with an explicit port")
-    return parsed.hostname, parsed.port
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.port is None:
+        raise ValueError("the node relay needs an http or https endpoint with an explicit port")
+    return parsed.hostname, parsed.port, parsed.scheme == "https"
+
+
+def node_tls_context():
+    """What the relay checks an https node with: the system's roots, by name."""
+    if ssl is None:
+        raise ValueError("this interpreter has no ssl module; the relay cannot reach an https node")
+    return ssl.create_default_context()
 
 
 def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sleep,
@@ -866,7 +885,7 @@ def client_gone(client):
         return True
 
 
-def handle_node_relay(client, address, slots=None):
+def handle_node_relay(client, address, slots=None, tls=None):
     peer = None
     try:
         # The client's first byte first, as the passthrough does, so a bare
@@ -875,6 +894,9 @@ def handle_node_relay(client, address, slots=None):
         if not ready or not client.recv(1, socket.MSG_PEEK):
             return
         peer = dial_node(address, abandoned=lambda: client_gone(client))
+        if tls is not None:
+            peer.settimeout(CONNECT_TIMEOUT)
+            peer = tls.wrap_socket(peer, server_hostname=address[0])
         client.settimeout(RELAY_TIMEOUT)
         peer.settimeout(RELAY_TIMEOUT)
         relay(client, peer, b"")
@@ -988,12 +1010,16 @@ def main():
     fallback = [addr for addr in args.fallback_addr.split(",") if addr]
 
     node_address = None
+    node_tls = None
     if args.mode == "node-relay":
         # Parsed once, so an endpoint the relay cannot serve fails the SERVICE and
         # the agent keeps the node's own address, rather than a listener that
         # starts and then drops every connection.
         try:
-            node_address = node_endpoint(args.upstream)
+            host, port, encrypted = node_endpoint(args.upstream)
+            node_address = (host, port)
+            if encrypted:
+                node_tls = node_tls_context()
         except ValueError as error:
             raise SystemExit(str(error)) from error
 
@@ -1055,7 +1081,7 @@ def main():
             if not slots.acquire(blocking=False):
                 client.close()
                 continue
-            worker, arguments = handle_node_relay, (client, node_address, slots)
+            worker, arguments = handle_node_relay, (client, node_address, slots, node_tls)
         else:
             worker, arguments = handle, (client, args.upstream, fallback, authority,
                                          guest_process if args.guest_processes_only else None)

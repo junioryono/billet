@@ -63,6 +63,9 @@ const (
 	actionsClientHeader = "X-Billet-Cache-Client"
 	actionsOriginHeader = "X-Billet-Cache-Origin"
 	actionsClientLocal  = "billet-loopback"
+	// actionsSingleBlock names the one block of an upload the client sent whole. A
+	// block id spelled the same could only overwrite that job's own upload.
+	actionsSingleBlock = "\x00whole"
 )
 
 type actionsArchive struct {
@@ -84,6 +87,14 @@ type actionsArchive struct {
 	Version   string               `json:"version"`
 	Volume    storecontract.Volume `json:"volume"`
 	Unmounted bool                 `json:"unmounted,omitempty"`
+	// Upload names this reservation's blocks, and Object the archive a download
+	// reads, on a store that keeps whole objects (actions_objects.go). Neither has a
+	// volume.
+	Upload string                 `json:"upload,omitempty"`
+	Object *storecontract.Archive `json:"object,omitempty"`
+	// committed is the block list the client committed, in memory: it is written
+	// under this archive's lock and the record under the session's.
+	committed atomic.Pointer[[]string] `json:"-"`
 	// lost says this process could not mount the archive's volume again after a
 	// restart (RestoreMounts); it is served and finalized as if absent. Never
 	// recorded.
@@ -147,9 +158,16 @@ type actionsReceipt struct {
 	Size      int64                      `json:"size_bytes"`
 	Complete  bool                       `json:"complete,omitempty"`
 	OK        bool                       `json:"ok,omitempty"`
+	// Upload and Blocks are what a commit publishes on a store that keeps whole
+	// objects, whose receipts have no candidate, lease or fence.
+	Upload string   `json:"upload,omitempty"`
+	Blocks []string `json:"blocks,omitempty"`
 }
 
 func (r *actionsReceipt) valid() error {
+	if r.Upload != "" {
+		return r.validObject()
+	}
 	rawID, idErr := hex.DecodeString(r.ID)
 	entryID, err := strconv.ParseInt(r.EntryID, 10, 64)
 	if idErr != nil || len(rawID) != 32 || r.ID != actionsReceiptID(r.CacheKey, r.Version) ||
@@ -176,8 +194,19 @@ func (a *actionsArchive) valid() error {
 		return errors.New("invalid mode")
 	}
 	if !validActionsCacheField(a.CacheKey) || !validActionsCacheField(a.Version) ||
-		strings.TrimSpace(a.StoreKey) == "" || a.Volume.Key != a.StoreKey ||
-		a.Volume.Handle == "" || a.Volume.Device == "" {
+		strings.TrimSpace(a.StoreKey) == "" {
+		return errors.New("invalid cache identity or volume")
+	}
+	if a.objectBacked() {
+		if (a.Mode == actionsModeUpload) != (a.Upload != "") ||
+			(a.Mode == actionsModeDownload) != (a.Object != nil) ||
+			a.Object != nil && a.Object.Key != a.StoreKey {
+			return errors.New("invalid cache identity or object")
+		}
+
+		return nil
+	}
+	if a.Volume.Key != a.StoreKey || a.Volume.Handle == "" || a.Volume.Device == "" {
 		return errors.New("invalid cache identity or volume")
 	}
 	if a.Mode == actionsModeDownload && a.Volume.Generation == "" {
@@ -731,7 +760,7 @@ func (s *CacheService) createActionsCache(
 	if session.closed {
 		return nil, errors.New("cache session has ended")
 	}
-	if len(session.actions)+len(session.receipts) >= actionsArchiveCount {
+	if len(session.actions)+len(session.receipts) >= s.actionsArchiveCeiling() {
 		return nil, errors.New("this job has too many active Actions cache archives")
 	}
 	if session.receipts[actionsReceiptID(request.Key, request.Version)] != nil {
@@ -746,6 +775,9 @@ func (s *CacheService) createActionsCache(
 				"ok": false, "message": "this job already reserved that cache key and version",
 			})
 		}
+	}
+	if store := s.archiveStore(); store != nil {
+		return s.createObjectArchive(ctx, store, session, storeKey, request.Key, request.Version, origin)
 	}
 	if _, err := s.store.Current(ctx, storeKey); err == nil {
 		return actionsJSONResponse(map[string]any{
@@ -966,6 +998,10 @@ func (s *CacheService) finalizeActionsCache(
 	defer archive.mu.Unlock()
 	defer session.mu.Unlock()
 
+	if archive.Upload != "" {
+		return s.finalizeObjectArchive(ctx, session, archive, size)
+	}
+
 	info, err := os.Stat(s.actionsArchivePath(session, archive))
 	if err != nil || !info.Mode().IsRegular() || info.Size() != size {
 		return nil, errors.New("uploaded Actions cache archive has the wrong size")
@@ -1029,6 +1065,9 @@ func (s *CacheService) publishActionsReceipt(
 ) (*http.Response, error) {
 	if receipt.Complete {
 		return actionsReceiptResponse(receipt)
+	}
+	if receipt.Upload != "" {
+		return s.publishObjectReceipt(ctx, session, receipt)
 	}
 	current, err := s.store.Current(ctx, receipt.StoreKey)
 	if err == nil {
@@ -1171,8 +1210,12 @@ func (s *CacheService) findActionsCache(
 	if session.closed {
 		return nil, errors.New("cache session has ended")
 	}
-	if len(session.actions)+len(session.receipts) >= actionsArchiveCount {
+	if len(session.actions)+len(session.receipts) >= s.actionsArchiveCeiling() {
 		return nil, errors.New("this job has too many active Actions cache archives")
+	}
+	if store := s.archiveStore(); store != nil {
+		return s.findObjectArchive(ctx, store, session, keys, request.Key, request.RestoreKeys,
+			request.Version, origin)
 	}
 	matcher, ok := s.store.(storecontract.KeyMatcher)
 	if !ok {
@@ -1356,6 +1399,15 @@ func (s *CacheService) uploadActionsBlob(
 		if !strings.EqualFold(req.Header.Get("X-Ms-Blob-Type"), "BlockBlob") {
 			return actionsBlobError(http.StatusBadRequest, "blob type must be BlockBlob"), nil
 		}
+		if archive.Upload != "" {
+			refused, err := s.stageObjectBlock(req, archive, actionsSingleBlock, body)
+			if refused != nil || err != nil {
+				return refused, err
+			}
+			archive.committed.Store(&[]string{actionsSingleBlock})
+
+			break
+		}
 		if err := writeActionsFile(req.Context(), s.actionsArchivePath(session, archive),
 			s.actionsStagingPath(session, archive), body, actionsArchiveLimit); err != nil {
 			return nil, err
@@ -1365,11 +1417,31 @@ func (s *CacheService) uploadActionsBlob(
 		if blockID == "" || len(blockID) > 1024 {
 			return actionsBlobError(http.StatusBadRequest, "block id is invalid"), nil
 		}
+		if archive.Upload != "" {
+			refused, err := s.stageObjectBlock(req, archive, blockID, body)
+			if refused != nil || err != nil {
+				return refused, err
+			}
+
+			break
+		}
 		if err := writeActionsFile(req.Context(), s.actionsBlockPath(session, archive, blockID),
 			s.actionsStagingPath(session, archive), body, actionsArchiveLimit); err != nil {
 			return nil, err
 		}
 	case "blocklist":
+		if archive.Upload != "" {
+			blocks, err := decodeActionsBlockList(body)
+			if err == nil {
+				blocks, err = actionsBlockNames(blocks)
+			}
+			if err != nil {
+				return nil, err
+			}
+			archive.committed.Store(&blocks)
+
+			break
+		}
 		if err := s.commitActionsBlockList(req.Context(), body, session, archive); err != nil {
 			return nil, err
 		}
@@ -1612,6 +1684,9 @@ func (s *CacheService) downloadActionsBlob(
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return actionsBlobError(http.StatusMethodNotAllowed, "download method is unavailable"), nil
 	}
+	if archive.Object != nil {
+		return s.downloadObjectArchive(req, session, archive)
+	}
 	file, err := s.openActionsArchive(session, archive)
 	if err != nil {
 		return nil, err
@@ -1622,19 +1697,7 @@ func (s *CacheService) downloadActionsBlob(
 
 		return nil, err
 	}
-	rangeHeader := req.Header.Get("Range")
-	azureRange := req.Header.Get("X-Ms-Range")
-	if rangeHeader == "" {
-		rangeHeader = azureRange
-	} else if azureRange != "" && azureRange != rangeHeader {
-		file.Close()
-		response := actionsBlobError(http.StatusRequestedRangeNotSatisfiable,
-			"range headers conflict")
-		response.Header.Set("Content-Range", "bytes */"+strconv.FormatInt(info.Size(), 10))
-
-		return response, nil
-	}
-	start, length, partial, rangeResponse := actionsResponseByteRange(rangeHeader, info.Size())
+	start, length, partial, rangeResponse := actionsRequestedRange(req, info.Size())
 	if rangeResponse != nil {
 		file.Close()
 
@@ -1676,7 +1739,7 @@ func (s *CacheService) downloadActionsBlob(
 // after the request's disposition was recorded, and outside its lock.
 type limitedFile struct {
 	io.Reader
-	file    *os.File
+	file    io.Closer
 	service *CacheService
 	session *cacheSession
 	archive string
@@ -1696,6 +1759,24 @@ func (f *limitedFile) Read(buffer []byte) (int, error) {
 }
 
 func (f *limitedFile) Close() error { return f.file.Close() }
+
+// actionsRequestedRange is the byte range a download asks for, whichever of the two
+// headers it names it in, or the refusal when the two disagree or it cannot be served.
+func actionsRequestedRange(req *http.Request, size int64) (int64, int64, bool, *http.Response) {
+	rangeHeader := req.Header.Get("Range")
+	azureRange := req.Header.Get("X-Ms-Range")
+	if rangeHeader == "" {
+		rangeHeader = azureRange
+	} else if azureRange != "" && azureRange != rangeHeader {
+		response := actionsBlobError(http.StatusRequestedRangeNotSatisfiable,
+			"range headers conflict")
+		response.Header.Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
+
+		return 0, 0, false, response
+	}
+
+	return actionsResponseByteRange(rangeHeader, size)
+}
 
 func actionsResponseByteRange(value string, size int64) (int64, int64, bool, *http.Response) {
 	start, length, partial, err := actionsByteRange(value, size)
