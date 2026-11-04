@@ -27,8 +27,12 @@ const (
 	ebsAPIVersion = "2016-11-15"
 	awsBodyLimit  = 8 << 20
 	awsPollDelay  = 2 * time.Second
-	ownerTag      = "sh.billet.owner"
-	cacheOwnerTag = "sh.billet.cache-owner"
+	// unansweredVolumeLimit bounds removing a volume whose caller gave up. A guest
+	// is still waiting behind that caller: the request around a Docker store's
+	// acquisition allows it about a minute after the acquisition's own bound.
+	unansweredVolumeLimit = 45 * time.Second
+	ownerTag              = "sh.billet.owner"
+	cacheOwnerTag         = "sh.billet.cache-owner"
 	// snapshotTokenTag carries the request token a snapshot was created under,
 	// because EC2's CreateSnapshot takes no ClientToken — see CreateSnapshot.
 	snapshotTokenTag = "sh.billet.snapshot-token"
@@ -526,10 +530,34 @@ func (e ebsAPI) CreateVolume(
 		return "", errors.New("ebs-s3: CreateVolume returned no volume id")
 	}
 	if err := e.waitVolume(ctx, result.ID, "available"); err != nil {
-		return "", err
+		return "", errors.Join(err, e.discardUnansweredVolume(ctx, result.ID))
 	}
 
 	return result.ID, nil
+}
+
+// discardUnansweredVolume removes a volume AWS created and CreateVolume's caller
+// will never hear about, because the wait for it failed. The caller's ClientToken
+// is one it never sends again, and the node's state names nothing, so until an
+// eviction's orphan sweep ages it out the volume is a bill nobody is reading.
+//
+// ON A CONTEXT OF ITS OWN, because the usual reason for being here is that the
+// caller's has ended: the acquisition of a guest's Docker image store is bounded,
+// and EBS may take longer than the bound to make a volume from a snapshot. It
+// need not wait for the volume: EC2 accepts the delete of one still `creating`,
+// whose tags, which the ownership check reads, are already there (four volumes
+// from an encrypted 8 GiB snapshot and three empty ones, 2026-11-04, each gone
+// within 6 s).
+func (e ebsAPI) discardUnansweredVolume(ctx context.Context, id string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unansweredVolumeLimit)
+	defer cancel()
+
+	if err := e.DeleteVolume(cleanupCtx, id); err != nil {
+		return fmt.Errorf("ebs-s3: volume %s was created for a caller that gave up, and is left "+
+			"for eviction: %w", id, err)
+	}
+
+	return nil
 }
 
 func (e ebsAPI) waitVolume(ctx context.Context, id, wanted string) error {

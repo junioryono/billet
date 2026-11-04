@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -288,6 +289,98 @@ func TestNewRefusesATypedNilCredentialSource(t *testing.T) {
 	}, "deployment/site", credentials)
 	if err == nil {
 		t.Fatal("New accepted a typed-nil credential source")
+	}
+}
+
+// A VOLUME AWS MADE FOR A CALLER THAT GAVE UP IS REMOVED, on a context of its own.
+// The caller is cancelled during the wait, the way a Docker store's bounded
+// acquisition ends one, so its id reaches nobody and only this removes it before
+// an eviction's orphan sweep ages it out.
+func TestAVolumeCreatedForACallerThatGaveUpIsRemoved(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name          string
+		deleteRefused bool
+	}{
+		{name: "removed"},
+		{name: "the removal is refused", deleteRefused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var mu sync.Mutex
+			var deleted []string
+			var deleteCtxErr error
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read the request: %v", err)
+
+					return
+				}
+				values, err := url.ParseQuery(string(body))
+				if err != nil {
+					t.Errorf("parse the request: %v", err)
+
+					return
+				}
+				w.Header().Set("Content-Type", "text/xml")
+				switch values.Get("Action") {
+				case "CreateVolume":
+					writeAWSResponse(t, w, `<CreateVolumeResponse><volumeId>vol-123</volumeId>`+
+						`<status>creating</status></CreateVolumeResponse>`)
+				case "DescribeVolumes":
+					writeAWSResponse(t, w, `<DescribeVolumesResponse><volumeSet><item><volumeId>vol-123</volumeId>`+
+						`<status>creating</status><tagSet>`+
+						`<item><key>`+ownerTag+`</key><value>deployment</value></item>`+
+						`<item><key>`+cacheOwnerTag+`</key><value>deployment/site</value></item>`+
+						`</tagSet></item></volumeSet></DescribeVolumesResponse>`)
+				case "DeleteVolume":
+					mu.Lock()
+					deleted = append(deleted, values.Get("VolumeId"))
+					deleteCtxErr = ctx.Err()
+					mu.Unlock()
+					if tc.deleteRefused {
+						w.WriteHeader(http.StatusBadRequest)
+						writeAWSResponse(t, w, `<Response><Errors><Error><Code>UnauthorizedOperation</Code>`+
+							`<Message>no</Message></Error></Errors></Response>`)
+					}
+				default:
+					t.Errorf("unexpected action %q", values.Get("Action"))
+				}
+			}))
+			defer server.Close()
+
+			api := newEBSAPI(config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a"},
+				"deployment/site", staticCredentials{}, server.Client(), server.URL, time.Now,
+				func(waitCtx context.Context, _ time.Duration) error {
+					cancel()
+
+					return waitCtx.Err()
+				})
+
+			volume, err := api.CreateVolume(ctx, "", 10<<30, "volume-token")
+			if volume != "" || !errors.Is(err, context.Canceled) {
+				t.Fatalf("CreateVolume = %q, %v; want no volume and the caller's cancellation", volume, err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(deleted) != 1 || deleted[0] != "vol-123" {
+				t.Fatalf("deleted %v, want the one volume AWS made", deleted)
+			}
+			if deleteCtxErr == nil {
+				t.Fatal("the caller had not given up when the volume was removed, so this proves nothing")
+			}
+			if said := strings.Contains(err.Error(), "left for eviction"); said != tc.deleteRefused {
+				t.Fatalf("error says left for eviction = %v, want %v: %v", said, tc.deleteRefused, err)
+			}
+		})
 	}
 }
 

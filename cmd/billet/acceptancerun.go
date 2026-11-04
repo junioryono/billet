@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/ops/fleetops"
+	"github.com/junioryono/billet/internal/state"
 
 	"github.com/junioryono/billet/internal/cli"
 )
@@ -26,6 +27,10 @@ import (
 // including a failed assertion, a cancelled context and a panic in between,
 // because the failure mode this command exists to avoid is compute left billing
 // after a run nobody watched.
+
+// acceptanceRunSealReason is what a run's seal says, and how the next run knows a
+// seal for its own.
+const acceptanceRunSealReason = "billet acceptance run"
 
 const (
 	// acceptanceSettle is how long a service must stay up before `run` believes it
@@ -103,6 +108,10 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	}
 
 	dir := filepath.Dir(ws.ConfigPath)
+
+	if err := reopenAfterAnEarlierRun(ctx, env, ws); err != nil {
+		return err
+	}
 
 	server, err := startAcceptanceService(ctx, env, self, "server", ws.ConfigPath, dir)
 	if err != nil {
@@ -193,6 +202,62 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	return errors.Join(waitErr, proofErr, downErr)
 }
 
+// reopenAfterAnEarlierRun lifts the seal an earlier `billet acceptance run` left on
+// this workspace, and refuses to start under anyone else's.
+//
+// A RUN SEALS WHAT IT PROVES CLEAR, and with --no-teardown that seal stays in the
+// ledger for the next run. That run then started its services and waited out
+// --wait with a listener saying the deployment was no longer taking new work, so
+// no job was ever assigned (2026-10-25). Only this command's own seal is lifted:
+// an operator's drain says something this command cannot overrule, and a seal
+// whose reason cannot be read is not known to be this command's.
+//
+// BEFORE THE SERVER STARTS, because a refusal here has nothing to tear down. A
+// workspace with no ledger has never run and has no seal, and is left without one.
+func reopenAfterAnEarlierRun(ctx context.Context, env cli.Env, ws acceptanceWorkspace) error {
+	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
+	if _, err := os.Stat(state.LedgerPath(stateDir)); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("look for this run's ledger: %w", err)
+	}
+
+	db, _, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("open this run's ledger: %w", err)
+	}
+
+	defer db.Close()
+
+	current, err := db.Admission(ctx)
+	if err != nil {
+		return fmt.Errorf("read admission: %w", err)
+	}
+
+	if !current.Sealed() {
+		return nil
+	}
+
+	if current.Mode != state.AdmissionSealed || current.Provenance != state.ProvenanceOperator ||
+		current.Reason != acceptanceRunSealReason {
+		return fmt.Errorf("this workspace's deployment is sealed (%q, by %q), and a run on a sealed "+
+			"deployment is assigned nothing. `billet resume --config %s` reopens it",
+			current.Reason, current.Actor, ws.ConfigPath)
+	}
+
+	if _, err := db.Resume(ctx, state.ResumeRequest{
+		Expect: current.Generation,
+		Clears: state.ProvenanceOperator,
+		Actor:  fleetops.Actor(env),
+	}); err != nil {
+		return fmt.Errorf("lift the seal an earlier run left: %w", err)
+	}
+
+	fmt.Fprintf(env.Stdout, "Reopened this workspace's deployment: an earlier run sealed it.\n")
+
+	return nil
+}
+
 // proveAcceptanceComputeClear seals the run and waits for every host to say it is
 // running nothing, through exactly the code `billet drain --wait` runs.
 //
@@ -215,7 +280,7 @@ func proveAcceptanceComputeClear(
 		return false, fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := fleetops.TakeTheSeal(ctx, env, db, current, "billet acceptance run")
+	sealed, err := fleetops.TakeTheSeal(ctx, env, db, current, acceptanceRunSealReason)
 	if err != nil {
 		return false, fmt.Errorf("seal this run: %w", err)
 	}

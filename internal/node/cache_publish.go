@@ -375,11 +375,25 @@ func (s *CacheService) SettleCompleted(
 	ctx context.Context, instance string, succeeded bool, authority dispatch.CacheAuthority,
 ) error {
 	session := s.sessionOf(instance)
-	if session == nil || session.closing.Load() {
+	if session == nil {
+		return nil
+	}
+	// EVERY WAY OUT THAT PUBLISHES NOTHING SAYS SO. A completed job's writes are
+	// discarded with the session, so without these a publication that never
+	// happened leaves no line at all: a default-branch job on an EC2 tier published
+	// nothing on 2026-10-25, and its node's log could not say which of these held.
+	if session.closing.Load() {
+		s.log.Info("a completed job's caches will not publish: its session is already closing",
+			"instance", instance)
+
 		return nil
 	}
 
 	if !publicationAllowed(session, succeeded, authority) {
+		s.log.Info("a completed job's caches will not publish", "instance", instance,
+			"policy", sessionPolicy(session), "succeeded", succeeded, "proven", authority.Proven,
+			"publish_default", authority.PublishDefault, "event", authority.Event, "ref", authority.Ref)
+
 		return nil
 	}
 	intent := &publishIntent{LeaseID: authority.LeaseID, JobID: authority.JobID,
@@ -418,6 +432,9 @@ func (s *CacheService) SettleCompleted(
 
 	attachment, err := s.awaitDockerReady(ctx, session)
 	if errors.Is(err, errNoDockerStore) {
+		s.log.Info("a completed job's Docker image store will not publish: it was discarded "+
+			"before it was proved ready", "instance", instance)
+
 		return nil
 	}
 	if err != nil {

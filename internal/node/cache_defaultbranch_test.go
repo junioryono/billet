@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -331,6 +332,105 @@ func TestASettlementForAClosingSessionDoesNotWait(t *testing.T) {
 	if err := service.SettleCompleted(ctx, instance, true, publishingAuthority()); err != nil {
 		t.Fatalf("SettleCompleted on a closing session = %v, want nil at once", err)
 	}
+}
+
+// EVERY WAY A COMPLETED JOB PUBLISHES NOTHING SAYS SO. Its writes go with the
+// session, so a silent one left a default-branch job's missing publication with
+// no explanation in its node's log (2026-10-25). The log is the mechanism here:
+// the line an operator reads is what is asserted.
+func TestACompletedJobThatWillNotPublishSaysWhy(t *testing.T) {
+	t.Parallel()
+
+	unproven := publishingAuthority()
+	unproven.Proven = false
+
+	for _, tc := range []struct {
+		name      string
+		authority dispatch.CacheAuthority
+		closing   bool
+		want      []string
+	}{
+		{name: "an authority that is not proven", authority: unproven,
+			want: []string{"will not publish", "proven=false", "publish_default=true"}},
+		{name: "a session already closing", authority: publishingAuthority(), closing: true,
+			want: []string{"will not publish", "already closing"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			service, _, instance := scopedService(t, provider.TrustUntrusted, defaultBranchCache(),
+				&fakeAuthority{authority: publishingAuthority()}, &fakeCacheStore{})
+			var said bytes.Buffer
+			service.log = slog.New(slog.NewTextHandler(&said, nil))
+			service.sessionOf(instance).closing.Store(tc.closing)
+
+			if err := service.SettleCompleted(t.Context(), instance, true, tc.authority); err != nil {
+				t.Fatalf("SettleCompleted = %v", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(said.String(), want) {
+					t.Errorf("the log says %q, want %q in it", said.String(), want)
+				}
+			}
+		})
+	}
+
+	t.Run("an authorised job says nothing of the kind", func(t *testing.T) {
+		t.Parallel()
+
+		service, _, instance := scopedService(t, provider.TrustUntrusted, defaultBranchCache(),
+			&fakeAuthority{authority: publishingAuthority()}, &fakeCacheStore{})
+		var said bytes.Buffer
+		service.log = slog.New(slog.NewTextHandler(&said, nil))
+
+		if err := service.SettleCompleted(t.Context(), instance, true, publishingAuthority()); err != nil {
+			t.Fatalf("SettleCompleted = %v", err)
+		}
+		if strings.Contains(said.String(), "will not publish") {
+			t.Errorf("an authorised job's log says it will not publish: %s", said.String())
+		}
+	})
+
+	t.Run("a store discarded before it was proved ready", func(t *testing.T) {
+		t.Parallel()
+
+		service, token, instance := scopedService(t, provider.TrustUntrusted, defaultBranchCache(),
+			&fakeAuthority{authority: publishingAuthority()}, &fakeCacheStore{})
+		var said lockedBuffer
+		service.log = slog.New(slog.NewTextHandler(&said, nil))
+
+		if response := cacheRequest(t, service, token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- service.SettleCompleted(t.Context(), instance, true, publishingAuthority())
+		}()
+
+		session := service.sessionOf(instance)
+		deadline := time.Now().Add(30 * time.Second)
+		for settling := false; !settling; {
+			if time.Now().After(deadline) {
+				t.Fatal("the settlement never opened")
+			}
+			session.mu.Lock()
+			if attachment := session.slots[0]; attachment != nil && attachment.Settling {
+				session.slots[0] = nil
+				settling = true
+			}
+			session.mu.Unlock()
+			time.Sleep(time.Millisecond)
+		}
+
+		if err := <-done; err != nil {
+			t.Fatalf("SettleCompleted = %v", err)
+		}
+		if !strings.Contains(said.String(), "discarded before it was proved ready") {
+			t.Errorf("the log says %q, want the store's discard named", said.String())
+		}
+	})
 }
 
 // THE RUNNER HANDS A COMPLETION'S AUTHORITY TO THE CACHE, through the path a
