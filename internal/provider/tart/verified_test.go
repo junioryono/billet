@@ -3745,3 +3745,43 @@ func TestARefusalForIsolationStillKeepsWhatWasAsked(t *testing.T) {
 		t.Fatalf("images = %+v, %v", images, err)
 	}
 }
+
+// AN UNPROMOTE WHILE A VERIFICATION WAS STILL GETTING READY IS ONE IT STARTED BEFORE: a take-back by
+// digest in flight must not clear what an operator has just withdrawn.
+func TestAnUnpromoteDuringAVerificationsPreparationIsNotUndone(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+
+	first := mustVerify(t, p)
+
+	// THE SLOT CHECK BEFORE THE PULL IS THE LAST STEP OF THAT PREPARATION, and asks this.
+	asked := false
+	p.macOSLimit = func() (int, bool, error) {
+		if !asked {
+			asked = true
+
+			if _, err := p.Unpromote(t.Context(), verifiedRef, first.Base); err != nil {
+				t.Error(err)
+			}
+		}
+
+		return 2, true, nil
+	}
+
+	opts := verifyOpts()
+	opts.Digest = first.Digest
+	opts.MacOS = true
+
+	if _, err := p.Verify(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "unpromoted while") {
+		t.Fatalf("Verify = %v", err)
+	}
+
+	due, err := p.ImageDue(t.Context(), verifiedTier)
+	if err != nil || !strings.Contains(due.Why, "withdrawn") {
+		t.Fatalf("ImageDue = %+v, %v, want the digest still withdrawn", due, err)
+	}
+
+	assertNoBases(t, p)
+}

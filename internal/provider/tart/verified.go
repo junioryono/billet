@@ -224,9 +224,20 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 
 	// BEFORE ANYTHING THAT CAN FAIL FOR A REASON OF ITS OWN, a registry that is down among them:
 	// on a node whose file names no tier, this is what the refresh tries again from.
+	// FROM THE FIRST READ, not from just before the pull: an unpromote during the cleanup or a
+	// check below is one this verification started before, and must not undo.
+	var (
+		epoch     int64
+		epochRead bool
+	)
+
 	keepIntent := func() error {
 		return p.withRecords(ctx, func(st *verifiedState) (bool, error) {
 			img := st.image(key)
+			if !epochRead {
+				epoch, epochRead = img.UnpromoteEpoch, true
+			}
+
 			img.Command, img.Untrusted = slices.Clone(opts.Command), opts.GuestUntrusted
 			img.MacOS = img.MacOS || opts.MacOS
 
@@ -275,9 +286,9 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 	}
 
 	var (
-		generation, epoch int64
-		pending           *VerifiedRecord
-		stale             string
+		generation int64
+		pending    *VerifiedRecord
+		stale      string
 	)
 
 	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
@@ -287,7 +298,6 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 		}
 
 		img := st.image(key)
-		epoch = img.UnpromoteEpoch
 
 		// THE SAME DIGEST WITH ITS FILES UNTOUCHED BOOTS WHAT WAS PULLED. Anything else is
 		// not that base any more.
