@@ -56,8 +56,8 @@ Times are RFC 3339, on billet's clock except where a field says otherwise, and d
 | `weight_source` | `tier` when the tier sets `minute_weight`, `charged_vcpu` when it is the vCPU charged over two |
 | `weighted_minutes` | `billed_minutes` times `minute_weight`, exact to three places |
 | `instance_type` | the type bought, empty on an owned machine |
-| `price_micros_per_hour` | what that type was charged at when the shape was charged, in millionths of a dollar; never today's catalogue. Absent on an owned machine |
-| `cost_micros` | that price across `held`, rounded up to a whole millionth of a dollar |
+| `price_micros_per_hour` | what that type was charged at when the shape was charged, in millionths of a dollar; never today's catalogue. `null` and not in `unknown` on an owned machine, which bought nothing: `ownership: owned` says so |
+| `cost_micros` | that price across `held`, rounded up to a whole millionth of a dollar. `null` and not in `unknown` on an owned machine, as above |
 | `conclusion` | how billet's lifecycle ended the lease: `done` or `failed` |
 | `result` | what GitHub said about the job, verbatim |
 | `unknown` | each field above that the ledger does not know, and why |
@@ -76,7 +76,7 @@ The weight is read from the config when the record is read, so editing a weight 
 
 ## Unknown stays unknown
 
-A value the ledger does not know is `null` or empty, and `unknown` names it with the reason. It is never zero, because a billing system summing a column of zeros has quietly given minutes away. The cases, none of which is an error:
+A value the ledger does not know is `null` or empty, and `unknown` names it with the reason. The one `null` that is not unknown is a price on an owned machine, where there is none to know. It is never zero, because a billing system summing a column of zeros has quietly given minutes away. The cases, none of which is an error:
 
 - **A lease that ran no job** and finished cleanly bills a known `billed_minutes: 0`, and `job` is empty with the reason. Its `held` is still there: it held capacity.
 - **A lease that failed or was disrupted with no start recorded** has an unknown `billed_minutes`. A `JobStarted` arrives tens of seconds late, so a lease that ended this way may have been running a job, and GitHub can still report one.
