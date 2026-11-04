@@ -254,6 +254,16 @@ func TestAWaiterWithNoCandidateHoldsBackOnlyAsWide(t *testing.T) {
 	q := newAdmissionQueue(config.AdmissionHold)
 	waitingInOrder(q, waiterAt{"waiter", sized(8, "a")})
 
+	// NO CANDIDATE FOR ANY OTHER REASON IS THE LINE AS UNDER FAIR: a Mac's slot, a remote
+	// budget, a lease in custody, or nothing read yet.
+	q.mayHold("waiter", nil)
+
+	if q.mayBuy("narrower", sized(2, "a")) {
+		t.Error("a narrower buyer passed a waiter not behind a lease as large")
+	}
+
+	q.behindAsLarge("waiter")
+
 	if !q.mayBuy("narrower", sized(2, "a")) {
 		t.Error("a narrower buyer was held back")
 	}
@@ -285,9 +295,6 @@ func TestAWaiterWithNoCandidateHoldsBackOnlyAsWide(t *testing.T) {
 		t.Error("a narrower buyer passed a ceiling-bound waiter")
 	}
 
-	// A CANDIDATE DOES NOT HELP ONE: THE CEILING IS ON NO HOST.
-	q.mayHold("waiter", nil)
-
 	shared, sibling := sized(8, "a"), sized(2, "b")
 	shared.Target, shared.TargetShared = "repo", true
 	sibling.Target, sibling.TargetShared = "repo", true
@@ -299,12 +306,246 @@ func TestAWaiterWithNoCandidateHoldsBackOnlyAsWide(t *testing.T) {
 		t.Error("a narrower sibling passed a waiter of its target's shared pot")
 	}
 
-	// WITH A HOST THE SHARED POT'S WAITER GOES TOO: a sibling taking the pot makes it
-	// share-bound at its next read, which gives up the host and holds the line.
+	// WITH A HOST TOO: a sibling taking the pot makes it share-bound at its next read,
+	// which drops the host, and another target refills it, so it never has both.
 	q.mayHold("waiter", candidatesOn("a"))
 
-	if !q.mayBuy("sibling", sibling) {
-		t.Error("a sibling was held back by a waiter of the pot with a host")
+	if q.mayBuy("sibling", sibling) {
+		t.Error("a sibling passed a waiter of the pot with a host")
+	}
+
+	// UNDER WEIGHTS ANOTHER TARGET'S WAITER WITH NO HOST HOLDS THE LINE AS ITS RANK SAYS,
+	// narrower buyer or not, and a sibling of its own target is judged by width.
+	ranks := map[string]float64{"behind": 0.1, "ahead": 0.5}
+
+	waiter, narrower, near := sized(8, "a"), sized(2, "a"), sized(2, "a")
+	waiter.Target, waiter.TargetRank = "behind", ranks
+	narrower.Target, narrower.TargetRank = "ahead", ranks
+	near.Target, near.TargetRank = "behind", ranks
+
+	q = newAdmissionQueue(config.AdmissionHold)
+	waitingInOrder(q, waiterAt{"waiter", waiter})
+	q.behindAsLarge("waiter")
+
+	if q.mayBuy("narrower", narrower) {
+		t.Error("a narrower buyer of a target ahead passed a waiter ranked before it")
+	}
+
+	if !q.mayBuy("near", near) {
+		t.Error("a narrower sibling of its own target was held back by rank")
+	}
+}
+
+// A HOLD ON A HOST WHOSE JOB RUNS LONG STAYS, AND ITS OWNER ALSO HOLDS THE LINE, whose bound
+// is the first host that fits. One job's six hours must not be the wide shape's wait.
+func TestALateHostAlsoHoldsTheLine(t *testing.T) {
+	t.Parallel()
+
+	q := holdQueue(wantsHosts{"waiter", []string{"a"}})
+
+	if !q.mayBuy("buyer", sized(2, "a", "b")) {
+		t.Fatal("a buyer was held back by a waiter with a host in time")
+	}
+
+	q.mayHold("waiter", []alloc.HoldCandidate{{Node: "a", Late: true}, {Node: "b"}})
+
+	if got := holdsOf(q); got["a"] != "waiter" {
+		t.Errorf("a late host lost the hold: %v", got)
+	}
+
+	if q.mayBuy("buyer", sized(2, "a", "b")) {
+		t.Error("a buyer passed a waiter whose host runs late")
+	}
+
+	q.mayHold("waiter", []alloc.HoldCandidate{{Node: "a"}, {Node: "b", Late: true}})
+
+	if !q.mayBuy("buyer", sized(2, "a", "b")) {
+		t.Error("a late host it does not hold held the buyer back")
+	}
+
+	q.mayHold("waiter", []alloc.HoldCandidate{{Node: "b", Late: true}, {Node: "a"}})
+
+	if !q.mayBuy("buyer", sized(2, "a", "b")) {
+		t.Error("a late host listed first and not held held the buyer back")
+	}
+}
+
+// A BUYER WITH A HOST THE WAITER CANNOT USE takes nothing the waiter waits for, as wide or not.
+func TestABuyerWithAHostAWaiterCannotUseBuysThere(t *testing.T) {
+	t.Parallel()
+
+	q := holdQueue(wantsHosts{"waiter", nil}, wantsHosts{"owner", []string{"h"}})
+
+	q.mu.Lock()
+	waiter := q.waiting["waiter"]
+	waiter.where = sized(4, "g")
+	q.waiting["waiter"] = waiter
+	q.mu.Unlock()
+
+	q.behindAsLarge("waiter")
+
+	if !q.mayBuy("owner", sized(16, "h", "g")) {
+		t.Error("the owner of a host the waiter cannot use was held back")
+	}
+
+	if q.mayBuy("no-host", sized(16, "h", "g")) {
+		t.Error("a buyer as wide with no host passed the waiter")
+	}
+
+	// A HOST THE WAITER CAN USE IS NO SUCH LICENCE.
+	q = holdQueue(wantsHosts{"waiter", nil}, wantsHosts{"owner", []string{"g"}})
+
+	q.mu.Lock()
+	waiter = q.waiting["waiter"]
+	waiter.where = sized(4, "g")
+	q.waiting["waiter"] = waiter
+	q.mu.Unlock()
+
+	q.behindAsLarge("waiter")
+
+	if q.mayBuy("owner", sized(16, "g", "h")) {
+		t.Error("the owner of a host the waiter can use passed it")
+	}
+}
+
+// A TARGET NOBODY RANKED FALLS BACK TO OLDEST FIRST IN THE PLAN, as it does for a purchase:
+// read as rank zero it would stand first and take a host from the waiter ahead of it.
+func TestAWaiterOfNoTargetDoesNotJumpThePlan(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"known": 0.5}
+
+	q := newAdmissionQueue(config.AdmissionHold)
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	q.now = func() time.Time { return at }
+	q.lastRanks = ranks
+	q.waiting["known"] = waitingTier{since: at, progress: at, where: ranked("known", ranks), candidates: candidatesOn("a")}
+	q.waiting["unread"] = waitingTier{since: at.Add(time.Second), progress: at, where: on("a"), candidates: candidatesOn("a")}
+
+	if got := holdsOf(q); got["a"] != "known" {
+		t.Errorf("the host is held for %q; want the older waiter", got["a"])
+	}
+
+	// AND A FAILED READ DOES NOT OVERWRITE A BUYER'S RECORD.
+	q.mayBuy("known", alloc.TierAdmission{})
+
+	if got := q.waiting["known"].where.Target; got != "known" {
+		t.Errorf("a failed read left its record saying target %q", got)
+	}
+}
+
+// ROOM THAT APPEARS BEFORE THE READ KEEPS THE WAITER IN THE LINE: its purchase was refused, a
+// lease ended, and the read found it fits. A narrower buyer waking first must not take what
+// it was refused for, again and again, with every read fresh and every refusal progress.
+func TestRoomAppearingBeforeTheReadKeepsTheLine(t *testing.T) {
+	t.Parallel()
+
+	wide, small := tierOf("a-wide", 8), tierOf("b-small", 2)
+	wide.Memory, small.Memory = config.GiB, config.GiB
+	tiers := []config.Tier{wide, small}
+
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	if _, err := a.RegisterNode(t.Context(), host("only", 8)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	log := &launchLog{}
+	s := New(a, nil, tiers, "hold-test", nil, WithNodeRunner(log), WithAdmissionOrder(config.AdmissionHold))
+	wideL := NewListener(a, wide.Label, &fakeSession{}, s.listenerOpts(nil)...)
+	smallL := NewListener(a, small.Label, &fakeSession{}, s.listenerOpts(nil)...)
+
+	if err := smallL.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("small reconcile: %v", err)
+	}
+
+	if err := wideL.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("wide reconcile: %v", err)
+	}
+
+	finishOne(t, a, small.Label)
+	wideL.askForAHold(t.Context(), alloc.TierAdmission{})
+
+	if err := smallL.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("small reconcile: %v", err)
+	}
+
+	if got := startedTiers(log)[small.Label]; got != 1 {
+		t.Errorf("the narrower tier started %d, the second on room the wide one was about to buy", got)
+	}
+
+	if err := wideL.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("wide reconcile: %v", err)
+	}
+
+	if got := startedTiers(log)[wide.Label]; got != 1 {
+		t.Errorf("the wide tier started %d with the room free", got)
+	}
+}
+
+// THE CENTRAL WALK, THROUGH LISTENERS. The widest shape waits behind a lease as large. A
+// narrower tier passes it. The lease ends and the narrower takes part of the room; the host
+// now has no lease as large, so the widest is given it, nothing else lands, and it buys.
+func TestAWaiterBehindALeaseAsLargeGetsItsTurnAgainstANarrowerStream(t *testing.T) {
+	t.Parallel()
+
+	big, wide, small := tierOf("a-big", 16), tierOf("b-wide", 16), tierOf("c-small", 2)
+	big.Memory, wide.Memory, small.Memory = config.GiB, config.GiB, config.GiB
+	tiers := []config.Tier{big, wide, small}
+
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+	if _, err := a.RegisterNode(t.Context(), host("only", 16)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	log := &launchLog{}
+	s := New(a, nil, tiers, "hold-test", nil, WithNodeRunner(log), WithAdmissionOrder(config.AdmissionHold))
+	bigL := NewListener(a, big.Label, &fakeSession{}, s.listenerOpts(nil)...)
+	wideL := NewListener(a, wide.Label, &fakeSession{}, s.listenerOpts(nil)...)
+	smallL := NewListener(a, small.Label, &fakeSession{}, s.listenerOpts(nil)...)
+
+	want := func(l *Listener, n int) {
+		t.Helper()
+
+		if err := l.reconcilePool(t.Context(), n); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	want(bigL, 1)
+	want(wideL, 1)
+
+	if got := s.order.ownHold(wide.Label); got != "" {
+		t.Fatalf("the wide tier holds %q behind a lease as large", got)
+	}
+
+	if !s.order.waiting[wide.Label].behindAsLarge {
+		t.Fatal("the wide tier does not read as behind a lease as large")
+	}
+
+	finishOne(t, a, big.Label)
+	want(smallL, 1)
+
+	if got := startedTiers(log)[small.Label]; got != 1 {
+		t.Fatalf("the narrower tier started %d past the wide one", got)
+	}
+
+	want(wideL, 1)
+
+	if got := s.order.ownHold(wide.Label); got != "only" {
+		t.Fatalf("with no lease as large left the wide tier holds %q", got)
+	}
+
+	want(smallL, 4)
+
+	if got := startedTiers(log)[small.Label]; got != 1 {
+		t.Errorf("the narrower tier started %d on the host held", got)
+	}
+
+	finishOne(t, a, small.Label)
+	want(wideL, 1)
+
+	if got := startedTiers(log)[wide.Label]; got != 1 {
+		t.Errorf("the wide tier started %d with the host emptied", got)
 	}
 }
 
@@ -1084,7 +1325,7 @@ func TestAWaiterWithNoHostGetsItsTurnAgainstABacklog(t *testing.T) {
 		t.Fatalf("quiet reconcile: %v", err)
 	}
 
-	if got := s.order.ownHold(quiet.Label); got != "" {
+	if got := s.order.ownHold(quiet.Label); got != "" || !s.order.waiting[quiet.Label].behindAsLarge {
 		t.Fatalf("%q is held though each host runs a lease as large as the shape", got)
 	}
 

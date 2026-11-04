@@ -87,7 +87,7 @@ func TestHoldCandidatesAreSoonestReadyFirst(t *testing.T) {
 
 	now = now.Add(time.Minute)
 
-	got, err := a.HoldCandidates(t.Context(), "wide", nil, "")
+	got, _, err := a.HoldCandidates(t.Context(), "wide", nil, "")
 	if err != nil {
 		t.Fatalf("HoldCandidates: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestHoldCandidatesFollowTheLearnedRuntimes(t *testing.T) {
 	startRunning(t, a, "small-b")
 	startRunning(t, a, "small-a")
 
-	got, err := a.HoldCandidates(t.Context(), "wide", nil, "")
+	got, _, err := a.HoldCandidates(t.Context(), "wide", nil, "")
 	if err != nil {
 		t.Fatalf("HoldCandidates: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestAHostRunningALeaseAsLargeAsTheShapeIsNotACandidate(t *testing.T) {
 	startRunning(t, a, "small-b")
 	startRunning(t, a, "small-b")
 
-	got, err := a.HoldCandidates(t.Context(), "eight-a", nil, "")
+	got, _, err := a.HoldCandidates(t.Context(), "eight-a", nil, "")
 	if err != nil {
 		t.Fatalf("HoldCandidates: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestAHostRunningALeaseAsLargeAsTheShapeIsNotACandidate(t *testing.T) {
 	}
 
 	// The wide shape: nothing as large runs anywhere, so both hosts are candidates.
-	got, err = a.HoldCandidates(t.Context(), "wide", nil, "")
+	got, _, err = a.HoldCandidates(t.Context(), "wide", nil, "")
 	if err != nil || len(got) != 2 {
 		t.Errorf("the wide shape's candidates are %v, %v; want both hosts", got, err)
 	}
@@ -181,7 +181,7 @@ func TestAHostRunningALeaseAsLargeAsTheShapeIsNotACandidate(t *testing.T) {
 	startRunning(t, other, "small-b")
 	startRunning(t, other, "small-b")
 
-	got, err = other.HoldCandidates(t.Context(), "wider", nil, "")
+	got, _, err = other.HoldCandidates(t.Context(), "wider", nil, "")
 	if err != nil {
 		t.Fatalf("HoldCandidates(wider): %v", err)
 	}
@@ -205,7 +205,7 @@ func TestAHoldPredictsALeaseNotYetStartedFromNow(t *testing.T) {
 		t.Fatalf("Reserve: %v", err)
 	}
 
-	got, err := a.HoldCandidates(t.Context(), "wide", nil, "")
+	got, _, err := a.HoldCandidates(t.Context(), "wide", nil, "")
 	if err != nil || len(got) != 2 {
 		t.Fatalf("HoldCandidates: %v, %v", got, err)
 	}
@@ -230,11 +230,89 @@ func TestAHostNeedingALeaseInCustodyIsNotACandidate(t *testing.T) {
 				t.Fatalf("Advance: %v", err)
 			}
 
-			got, err := a.HoldCandidates(t.Context(), "wide", nil, "")
+			got, _, err := a.HoldCandidates(t.Context(), "wide", nil, "")
 			if err != nil || !slices.Equal(candidateNames(got), []string{"b"}) {
 				t.Errorf("the candidates are %v, %v; want b alone", got, err)
 			}
 		})
+	}
+}
+
+// BEHIND A LEASE AS LARGE IS THE ONE REASON FOR NO CANDIDATE THAT LETS A NARROWER BUYER PAST:
+// on every host the tier could use, each lease one that will end, and none that fits now.
+func TestBehindALeaseAsLargeIsReportedOnlyWhenItIsTheWholeReason(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	anywhere := tier("anywhere", 8, 32*config.GiB)
+	anywhere.Provider = config.ProviderDocker
+
+	a := holdFleet(t, &now, anywhere)
+
+	behindNow := func() ([]HoldCandidate, bool) {
+		t.Helper()
+
+		got, behind, err := a.HoldCandidates(t.Context(), "anywhere", nil, "")
+		if err != nil {
+			t.Fatalf("HoldCandidates: %v", err)
+		}
+
+		return got, behind
+	}
+
+	if _, behind := behindNow(); behind {
+		t.Error("a shape that fits now reads as behind a lease as large")
+	}
+
+	startRunning(t, a, "eight-a")
+	startRunning(t, a, "eight-a")
+
+	first := startRunning(t, a, "eight-b")
+
+	if _, behind := behindNow(); behind {
+		t.Error("a shape with room on one host reads as behind a lease as large")
+	}
+
+	// NOR FOR A WAITER THAT HOLDS ONE: it fits on b, and it holds a.
+	if _, behind, err := a.HoldCandidates(t.Context(), "anywhere", nil, "a"); err != nil || behind {
+		t.Errorf("a waiter that fits now and holds a host reads as behind a lease as large: %v, %v", behind, err)
+	}
+
+	last := startRunning(t, a, "eight-b")
+
+	if got, behind := behindNow(); len(got) != 0 || !behind {
+		t.Errorf("with a lease as large on each host it reads %v, %v", got, behind)
+	}
+
+	// ONE THAT MAY NEVER END PROMISES IT NOTHING.
+	for _, lease := range []*Lease{first, last} {
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseCustody); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+	}
+
+	if _, behind := behindNow(); behind {
+		t.Error("a lease in custody read as a lease that will end")
+	}
+}
+
+// A JOB RUN LATE ON THE HOST SAYS SO, only when the shape needs it gone.
+func TestACandidateSaysWhenAJobItNeedsGoneIsLate(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	a := holdFleet(t, &now)
+
+	startRunning(t, a, "small-a")
+	startRunning(t, a, "small-b")
+
+	got, _, err := a.HoldCandidates(t.Context(), "wide", nil, "")
+	if err != nil || len(got) != 2 || got[0].Late || got[1].Late {
+		t.Fatalf("a fresh host reads %v, %v", got, err)
+	}
+
+	now = now.Add(HoldLateFactor*DefaultRuntime + time.Minute)
+
+	got, _, err = a.HoldCandidates(t.Context(), "wide", nil, "")
+	if err != nil || len(got) != 2 || !got[0].Late {
+		t.Errorf("past the factor the host reads %v, %v; want it late", got, err)
 	}
 }
 
@@ -244,7 +322,7 @@ func TestAShapeThatFitsNowHasNoCandidates(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 	a := holdFleet(t, &now)
 
-	got, err := a.HoldCandidates(t.Context(), "wide", nil, "")
+	got, _, err := a.HoldCandidates(t.Context(), "wide", nil, "")
 	if err != nil || len(got) != 0 {
 		t.Errorf("an empty fleet gave %v, %v; want no candidates", got, err)
 	}
@@ -252,19 +330,26 @@ func TestAShapeThatFitsNowHasNoCandidates(t *testing.T) {
 	startRunning(t, a, "small-a")
 
 	// b has room, and b is held for another tier: a is what is left, b is ready now.
-	got, err = a.HoldCandidates(t.Context(), "wide", []string{"b"}, "")
+	got, _, err = a.HoldCandidates(t.Context(), "wide", []string{"b"}, "")
 	if err != nil || !slices.Equal(candidateNames(got), []string{"b", "a"}) || !got[0].ReadyAt.Equal(now) {
 		t.Errorf("the candidates are %v, %v; want b, ready now, then a", got, err)
 	}
 
-	got, err = a.HoldCandidates(t.Context(), "wide", []string{"a"}, "")
+	got, _, err = a.HoldCandidates(t.Context(), "wide", []string{"a"}, "")
 	if err != nil || len(got) != 0 {
 		t.Errorf("room on a host not avoided gave %v, %v; want no candidates", got, err)
 	}
 
+	// ROOM ELSEWHERE DOES NOT GIVE UP THE HOST IT HOLDS: a pass the order refuses must not
+	// hand back the room it accumulated. a has a lease, b is free, and a is what it holds.
+	got, _, err = a.HoldCandidates(t.Context(), "wide", nil, "a")
+	if err != nil || !slices.Equal(candidateNames(got), []string{"a"}) {
+		t.Errorf("holding a with room on b gave %v, %v; want a alone", got, err)
+	}
+
 	// ROOM ON THE HOST IT HOLDS KEEPS THE HOLD: a job ending between the refusal and this
 	// read must not hand the room it accumulated to the next small purchase.
-	got, err = a.HoldCandidates(t.Context(), "wide", nil, "b")
+	got, _, err = a.HoldCandidates(t.Context(), "wide", nil, "b")
 	if err != nil || len(got) == 0 || got[0].Node != "b" || !got[0].ReadyAt.Equal(now) {
 		t.Errorf("room on its own held host gave %v, %v; want that host, ready now, first", got, err)
 	}
@@ -286,7 +371,10 @@ func TestARemoteHostOrAMacIsNotHeld(t *testing.T) {
 	macSmall := tier("mac-small", 2, 8*config.GiB)
 	macSmall.Provider, macSmall.GuestOS, macSmall.Node = config.ProviderTart, config.GuestMacOS, "mac-1"
 
-	a := holdFleet(t, &now, spanning, mac, macSmall)
+	spanningEight := spanning
+	spanningEight.Label, spanningEight.VCPU, spanningEight.Memory = "spanning-eight", 8, 32*config.GiB
+
+	a := holdFleet(t, &now, spanning, spanningEight, mac, macSmall)
 
 	mustRegister(t, a, NodeRegistration{
 		Name: "cloud", Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
@@ -300,8 +388,8 @@ func TestARemoteHostOrAMacIsNotHeld(t *testing.T) {
 
 	// Its slots spent by smaller guests, with the vCPU free, so only the exemption
 	// stands between it and the host.
-	if got, err := a.HoldCandidates(t.Context(), "mac", nil, ""); err != nil || got != nil {
-		t.Errorf("a macOS tier's candidates are %v, %v; want none", got, err)
+	if got, behind, err := a.HoldCandidates(t.Context(), "mac", nil, ""); err != nil || got != nil || behind {
+		t.Errorf("a macOS tier's candidates are %v, %v, %v; want none, and no lease as large", got, behind, err)
 	}
 
 	for range 2 {
@@ -309,9 +397,18 @@ func TestARemoteHostOrAMacIsNotHeld(t *testing.T) {
 		startRunning(t, a, "small-b")
 	}
 
-	got, err := a.HoldCandidates(t.Context(), "spanning", []string{"cloud"}, "")
+	got, _, err := a.HoldCandidates(t.Context(), "spanning", []string{"cloud"}, "")
 	if err != nil {
 		t.Fatalf("HoldCandidates: %v", err)
+	}
+
+	// A REMOTE BACKEND IT COULD USE IS NEVER BEHIND A LEASE AS LARGE, even with one on
+	// every host: a budget is not room that accumulates.
+	startRunning(t, a, "eight-a")
+	startRunning(t, a, "eight-b")
+
+	if _, behind, err := a.HoldCandidates(t.Context(), "spanning-eight", []string{"cloud"}, ""); err != nil || behind {
+		t.Errorf("a tier that can use a remote backend reads as behind a lease as large: %v, %v", behind, err)
 	}
 
 	if slices.Contains(candidateNames(got), "cloud") || !slices.Contains(candidateNames(got), "a") {
@@ -343,9 +440,8 @@ func TestReadyAtAddsUpTheRoomEachLeaseFrees(t *testing.T) {
 		{"sorted by end, not by order", 12, 48, []heldLease{lease(4, 16, at(9)), lease(4, 16, at(3))}, at(3), true},
 		{"memory binds", 16, 32, []heldLease{lease(2, 16, at(3)), lease(2, 16, at(9))}, at(9), true},
 		{"never enough", 4, 16, []heldLease{lease(4, 16, at(3))}, time.Time{}, false},
-		{"a lease as large", 0, 0, []heldLease{lease(16, 64, at(3))}, time.Time{}, false},
 	} {
-		got, ok := readyAt(wide, c.vcpu, c.memory*config.GiB, c.leases, now)
+		got, _, ok := readyAt(wide, c.vcpu, c.memory*config.GiB, c.leases, now)
 		if ok != c.ok || !got.Equal(c.want) {
 			t.Errorf("%s: ready at %s (%v); want %s (%v)", c.name, got, ok, c.want, c.ok)
 		}

@@ -107,27 +107,34 @@ import (
 // predicted to free soonest (alloc.HoldCandidates), no tier behind it places there, and
 // every other host stays open: a waiter with a host holds nobody back.
 //
-// A HELD HOST ONLY EMPTIES, because nothing new lands on it, so what runs there bounds
-// the wait however late it runs, and the hold stays: room accumulated on one host is lost
-// by moving to another. It moves only when the host stops being a candidate. At most one
-// hold per host and one per tier, in the order's own order, so the oldest waiter with a
-// candidate always has a host, and one waiting for a host is no line: its turn comes.
+// A HELD HOST ONLY EMPTIES, near enough: what lands on it is a waiter ahead, once, and a
+// floor. So what runs there bounds the wait, and the hold stays through ordinary noise in
+// a prediction, because room accumulated on one host is lost by moving to another. It
+// moves only when the host stops being a candidate. ONE JOB CAN RUN FOR HOURS, so once a
+// job it needs gone has run alloc.HoldLateFactor times its kind's median the waiter keeps
+// the host and holds the line as under fair, whose bound is the first host that fits. At
+// most one hold per host and one per tier, in the order's own order, so the oldest waiter
+// with a candidate always has a host, and one waiting for a host is no line: its turn
+// comes. A waiter with no candidate for any other reason holds the line as under fair.
 //
-// A WAITER WITH NO CANDIDATE runs into a lease at least as large on every host it could
-// use. That lease ending is room it fits in, so it needs no host, and it holds back only
-// a buyer at least as wide, the one that could put another such lease in its way. A
-// narrower buyer can only take part of the room, which leaves a host it has a claim on,
-// and letting one through is the difference between this order and fair. Nothing kept a
-// version that let every waiter out from starving a shape as large as the hosts run.
+// A WAITER BEHIND A LEASE AS LARGE on every host it could use needs no host: that lease
+// ending is room it fits in. It holds back only a buyer at least as wide, the one that
+// could put another such lease in its way. A narrower buyer can only take part of the
+// room, which leaves a host it has a claim on, and letting one through is the difference
+// between this order and fair. Nothing kept a version that let every waiter out from
+// starving a shape as large as the hosts run.
 //
 // A HOLD BINDS ONLY WHO STANDS BEHIND ITS OWNER, because its owner cannot buy past a
 // waiter ahead of it. Buying gives the host up, at the first lease of a pool pass, and
 // the rest of the pass stays off every host still held. It is decided here, in memory,
 // from what each waiter last read, and rebuilt after a restart from the waiting order,
 // like the rest of this queue. It releases, destroys and promises nothing: the purchase
-// is still the allocator's atomic transaction. A ceiling-bound waiter and a target's
-// shared pot wait for room a hold cannot keep, so they get no host and hold the line for
-// everyone they compete with.
+// is still the allocator's atomic transaction. A ceiling-bound or share-bound waiter waits
+// for room a hold cannot keep, so it reads no candidates and holds the line as under fair.
+// A waiter of a target's shared pot holds it for its siblings, with a host or without,
+// because a sibling taking the pot takes the hold's point away. Under weights a waiter of
+// another target with no host holds the line as its rank says, which is what a weight
+// decides.
 type admissionQueue struct {
 	policy config.AdmissionOrder
 	now    func() time.Time
@@ -195,8 +202,11 @@ type waitingTier struct {
 	// soonest ready first, and held is the one it has. Only under hold.
 	candidates []alloc.HoldCandidate
 	held       string
-	// spent records that a pool pass has bought and not yet ended.
-	spent bool
+	// late says a job the host it holds needs gone has run long past its kind, so it
+	// holds the line as well. behindAsLarge says it has no candidates only because a
+	// lease as large runs on every host it could use. spent records that a pool pass
+	// has bought and not yet ended.
+	late, behindAsLarge, spent bool
 }
 
 // newAdmissionQueue builds the queue every listener of one control plane shares.
@@ -231,7 +241,7 @@ func (q *admissionQueue) holds() bool {
 // blocks requires q.mu. It reports whether a waiter holds a buyer at where back. Under
 // hold, see HOLD HOLDS ONE HOST above. A shape that could not be read is at least as wide
 // as anything, because an unknown is not a licence to bypass the order.
-func (q *admissionQueue) blocks(where alloc.TierAdmission, waiter waitingTier) bool {
+func (q *admissionQueue) blocks(tier string, where alloc.TierAdmission, waiter waitingTier) bool {
 	if !competes(where, waiter.where) {
 		return false
 	}
@@ -240,11 +250,15 @@ func (q *admissionQueue) blocks(where alloc.TierAdmission, waiter waitingTier) b
 		return true
 	}
 
-	if waiter.held != "" {
-		return false
+	if where.Target == waiter.where.Target && where.TargetShared && waiter.where.TargetShared {
+		return true
 	}
 
-	if waiter.where.CeilingBound || (where.Target == waiter.where.Target && where.TargetShared && waiter.where.TargetShared) {
+	if waiter.held != "" {
+		return waiter.late
+	}
+
+	if where.TargetRank != nil && where.Target != waiter.where.Target {
 		return true
 	}
 
@@ -252,22 +266,35 @@ func (q *admissionQueue) blocks(where alloc.TierAdmission, waiter waitingTier) b
 		return false
 	}
 
-	if where.VCPU == 0 || waiter.where.VCPU == 0 {
+	if !waiter.behindAsLarge || where.VCPU == 0 || waiter.where.VCPU == 0 {
 		return true
+	}
+
+	// A BUYER WITH A HOST THE WAITER CANNOT USE takes nothing it waits for by buying there.
+	if own := q.waiting[tier].held; own != "" && !slices.Contains(waiter.where.Nodes, own) {
+		return false
 	}
 
 	return where.VCPU >= waiter.where.VCPU && where.Memory >= waiter.where.Memory
 }
 
 // inOrder requires q.mu. It is the waiting tiers in the order's own order, as last read.
+// A TARGET NOBODY RANKED FALLS BACK TO OLDEST FIRST, as ranksFor does for a purchase, or
+// who may buy and whom a hold binds would disagree.
 func (q *admissionQueue) inOrder(now time.Time) []string {
 	order := make([]string, 0, len(q.waiting))
+	ranks := q.lastRanks
+
 	for label := range q.waiting {
 		order = append(order, label)
+
+		if _, known := ranks[q.waiting[label].where.Target]; !known {
+			ranks = nil
+		}
 	}
 
 	slices.SortFunc(order, func(x, y string) int {
-		px, py := standing(x, q.waiting[x], q.lastRanks, now), standing(y, q.waiting[y], q.lastRanks, now)
+		px, py := standing(x, q.waiting[x], ranks, now), standing(y, q.waiting[y], ranks, now)
 		if px.before(py) {
 			return -1
 		}
@@ -318,6 +345,16 @@ func (q *admissionQueue) planHolds() {
 
 				break
 			}
+		}
+	}
+
+	for _, label := range order {
+		waiter := q.waiting[label]
+		i := slices.IndexFunc(waiter.candidates, func(c alloc.HoldCandidate) bool { return c.Node == next[label] })
+
+		if late := i >= 0 && waiter.candidates[i].Late; late != waiter.late {
+			waiter.late = late
+			q.waiting[label] = waiter
 		}
 	}
 
@@ -419,7 +456,7 @@ func (q *admissionQueue) boughtOne(tier string) {
 	defer q.mu.Unlock()
 
 	if waiter, ok := q.waiting[tier]; ok {
-		waiter.held, waiter.candidates, waiter.spent = "", nil, true
+		waiter.held, waiter.candidates, waiter.late, waiter.spent = "", nil, false, true
 		q.waiting[tier] = waiter
 	}
 }
@@ -440,6 +477,16 @@ func (q *admissionQueue) ownHold(tier string) string {
 
 // mayHold records the hosts a waiting tier could be held, as it just read them.
 func (q *admissionQueue) mayHold(tier string, candidates []alloc.HoldCandidate) {
+	q.readHold(tier, candidates, false)
+}
+
+// behindAsLarge records that this waiting tier has no candidates only because a lease as
+// large runs on every host it could use.
+func (q *admissionQueue) behindAsLarge(tier string) {
+	q.readHold(tier, nil, true)
+}
+
+func (q *admissionQueue) readHold(tier string, candidates []alloc.HoldCandidate, behindAsLarge bool) {
 	if !q.holds() {
 		return
 	}
@@ -448,7 +495,7 @@ func (q *admissionQueue) mayHold(tier string, candidates []alloc.HoldCandidate) 
 	defer q.mu.Unlock()
 
 	if waiter, ok := q.waiting[tier]; ok {
-		waiter.candidates = candidates
+		waiter.candidates, waiter.behindAsLarge = candidates, behindAsLarge
 		q.waiting[tier] = waiter
 	}
 
@@ -582,7 +629,7 @@ func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission, now ti
 
 	for label := range q.waiting {
 		waiter := q.waiting[label]
-		if label != tier && (!q.blocks(where, waiter) || !holdsTheLine(waiter, now)) {
+		if label != tier && (!q.blocks(tier, where, waiter) || !holdsTheLine(waiter, now)) {
 			continue
 		}
 
@@ -659,14 +706,16 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 // it; an empty label means nobody holds it. It logs nothing, so naming the
 // holder does not spend letPast's once-per-stall line.
 func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, time.Time, []string) {
-	return q.headAmong(tier, where, q.blocks)
+	return q.headAmong(tier, where, func(where alloc.TierAdmission, waiter waitingTier) bool {
+		return q.blocks(tier, where, waiter)
+	})
 }
 
 // refreshBuyer requires q.mu. Under hold it brings this buyer's record up to this read
 // before anything is decided from it: its standing may still say it was below its floor,
 // and what it avoids is read from where it stands.
 func (q *admissionQueue) refreshBuyer(tier string, where alloc.TierAdmission) {
-	if q.policy != config.AdmissionHold {
+	if q.policy != config.AdmissionHold || (where.Target == "" && len(where.Nodes) == 0) {
 		return
 	}
 
@@ -829,7 +878,7 @@ func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string 
 	var out []string
 	for label := range q.waiting {
 		waiter := q.waiting[label]
-		if label == tier || !q.blocks(where, waiter) || q.steppedAside(label, waiter, ranks, now) {
+		if label == tier || !q.blocks(tier, where, waiter) || q.steppedAside(label, waiter, ranks, now) {
 			continue
 		}
 
@@ -993,7 +1042,7 @@ func (q *admissionQueue) bought(tier string) {
 	// could hold next at its next refusal, and until then no host sits idle for it.
 	waiter.since = q.now()
 	waiter.head = false
-	waiter.held, waiter.candidates, waiter.spent = "", nil, false
+	waiter.held, waiter.candidates, waiter.late, waiter.behindAsLarge, waiter.spent = "", nil, false, false, false
 	q.progressed(tier, waiter)
 }
 
