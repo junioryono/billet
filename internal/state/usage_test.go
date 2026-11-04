@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -232,7 +233,12 @@ func exerciseUsageCounterLock(
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		t.Cleanup(func() { _ = tx.Rollback() })
+		t.Cleanup(func() {
+			// ENDED ALREADY, or ended with this test's context, which ends a transaction too.
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) && !errors.Is(err, context.Canceled) {
+				t.Errorf("rollback: %v", err)
+			}
+		})
 
 		return tx
 	}
