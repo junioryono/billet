@@ -133,6 +133,8 @@ type Plane struct {
 	imagesAccept []string
 	// logIndexID names the index of job logs this control plane holds, empty for none.
 	logIndexID string
+	// streams are the connections nodes dial back on command.
+	streams streamBook
 
 	// lateResults holds the tombstones of nodes whose record is gone — withdrawn
 	// or expired — so a result that was already on the wire when the node left

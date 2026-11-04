@@ -22,6 +22,8 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strconv"
 
 	"github.com/junioryono/billet/internal/config"
@@ -160,6 +162,11 @@ type Spec struct {
 	// guest is never told ignores it, and the node's record then says the guest
 	// never reported.
 	GuestMonitor bool
+	// GuestAttach asks the guest to serve a terminal, which a node then reaches through
+	// GuestDialer, and GuestHold is how long a failed job's VM is kept, as the job's log says
+	// it. A backend whose guest is never told ignores both: config refuses the tier first.
+	GuestAttach bool
+	GuestHold   string
 	// ActionsProxy and NpmProxy opt this guest into the node's interception of
 	// the Actions results origin and of the npm registry (ADR-020), each through
 	// the same authenticated tunnel, and ActionsCAPEM is the authority the guest
@@ -525,4 +532,15 @@ type UsageTarget struct {
 type UsageSource interface {
 	// UsageTarget says where a running instance's counters are.
 	UsageTarget(ctx context.Context, instanceID string) (UsageTarget, error)
+}
+
+// ErrNoGuestListener says a guest answered nothing on the port asked for: an image with no terminal
+// server, or one that has stopped. It says nothing about whether the guest is running.
+var ErrNoGuestListener = errors.New("provider: nothing in the guest is listening on that port")
+
+// GuestDialer is a provider that can connect to a port of a running guest without either side
+// accepting a connection on a network. What it returns carries the guest's bytes, which nothing
+// on the host reads.
+type GuestDialer interface {
+	DialGuest(ctx context.Context, instance string, port int) (io.ReadWriteCloser, error)
 }

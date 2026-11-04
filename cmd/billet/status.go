@@ -52,6 +52,9 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	// it before the capacity numbers that will look perfectly healthy underneath.
 	fleetops.PrintForceDestroy(ctx, env, a, admission)
 
+	// AND WHAT A HOLD IS KEEPING, since it looks like capacity with no job on it.
+	fleetops.PrintHolds(ctx, env, a)
+
 	// AND A ROLLOUT IN ONE LINE, because it explains the other half of what an
 	// operator is looking at: hosts on two versions, capacity down by one machine,
 	// a node reporting nothing. `billet rollout status` is the full picture; this

@@ -199,6 +199,12 @@ func (l *Listener) destroyAll(
 			continue
 		}
 
+		// A HOLD OUTLIVES A SHUTDOWN, which says nothing about whether anyone has finished looking.
+		// Only a force, which is what includeRunning is, ends one here.
+		if entry.held && !includeRunning {
+			continue
+		}
+
 		if !inScope(id) {
 			continue
 		}
@@ -427,7 +433,8 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 		if entry.retireOnly {
 			retirements = append(retirements, entry.job)
 		}
-		if entry.lease != nil {
+		// NOT A HELD ONE, whose VM is still there and whose lease is still owed.
+		if entry.lease != nil && !entry.held {
 			parked[id] = entry
 		}
 	}

@@ -187,6 +187,9 @@ type Statistics struct {
 
 // Listener runs one tier's scale set.
 type Listener struct {
+	// holdOnFailure is how long a failed job's VM is kept, zero for not at all.
+	holdOnFailure time.Duration
+
 	alloc   *alloc.Allocator
 	tier    string
 	session Session

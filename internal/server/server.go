@@ -704,7 +704,7 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 		WithSessionReopen(func(ctx context.Context) (Session, error) {
 			return s.openSession(ctx, t, set, prov)
 		}),
-		WithPoolLaunchBatch(poolLaunchBatchFor(t)))
+		WithPoolLaunchBatch(poolLaunchBatchFor(t)), WithHoldOnFailure(t.HoldDuration()))
 	if target, ok := s.targetFor(t); ok {
 		opts = append(opts, WithGitHubTarget(target.Config.Path()))
 	}

@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 39
+	Version = 40
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -531,6 +531,18 @@ const (
 	// chunk from a pairing below it is refused, and an id below it is no index. Its text
 	// stays on the node either way, so what an older pairing loses is finding it.
 	VersionJobLogs = 39
+
+	// VersionJobAttach is the version from which the plane can ask a node for a stream to a
+	// lease's guest (CommandAttach), which the node dials back on
+	// POST /v1/nodes/{node}/streams/{stream}, so a terminal reaches a VM with no port open on
+	// the node, and a launch's tier can say it may be attached to (TierSpec's attach).
+	//
+	// A FEATURE AN OLDER PEER CANNOT OFFER, reported rather than refused. CHECKED WHERE IT IS
+	// SENT: the pending command's minWire, so an older node is not asked and an attach says
+	// so. NEITHER REFUSED NOR REPORTED for the tier's word: an older node decodes it leniently
+	// and starts a guest with no terminal, which an attach then says, and which costs the job
+	// nothing.
+	VersionJobAttach = 40
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -664,6 +676,10 @@ const (
 	// of reads running. Run
 	// beside the node's loop, like a launch, so a search never waits behind a destroy.
 	CommandReadLog CommandKind = "read_log"
+
+	// CommandAttach asks a node to reach a lease's guest and dial a stream back to the plane
+	// (VersionJobAttach). Run beside the node's loop, like a log read.
+	CommandAttach CommandKind = "attach"
 )
 
 // RegisterRequest is a node introducing itself.
@@ -887,7 +903,25 @@ type Command struct {
 
 	// LogRead is what CommandReadLog asks for.
 	LogRead *LogReadSpec `json:"log_read,omitempty"`
+
+	// Attach is what CommandAttach asks for.
+	Attach *AttachSpec `json:"attach,omitempty"`
 }
+
+// AttachSpec names a lease's guest, and the stream to carry it on: a name and a single-use token,
+// which prove to the plane that a command asked for this stream.
+type AttachSpec struct {
+	Lease  string `json:"lease"`
+	Stream string `json:"stream"`
+	Token  string `json:"token"`
+}
+
+// HeaderStreamToken carries a stream's single-use token, and StreamProtocol is what a stream's
+// connection upgrades to.
+const (
+	HeaderStreamToken = "Billet-Stream-Token"
+	StreamProtocol    = "billet-stream"
+)
 
 // The most a CommandReadLog answer carries. JSON can spell a byte of text in six, and a
 // line costs about 50 bytes of its own, so an answer at both bounds fits the 1 MiB body.
@@ -999,6 +1033,11 @@ type TierSpec struct {
 	// it, so the plane sends a tier naming one only to a node that speaks it, and
 	// checks again at delivery.
 	Arch config.Arch `json:"arch,omitempty"`
+	// Attach says the tier's guests serve a terminal, and HoldOnFailure is how long a failed
+	// job's VM is kept, as the job's log says it, empty for none. From VersionJobAttach; an
+	// older node ignores both and starts a guest with no terminal.
+	Attach        bool   `json:"attach,omitempty"`
+	HoldOnFailure string `json:"hold_on_failure,omitempty"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to the selected provider's
@@ -1018,6 +1057,14 @@ func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 		CacheScope:  t.CacheScope,
 		Cache:       new(t.EffectiveCache()),
 		Arch:        t.Arch,
+		Attach:      t.Attachable(),
+		HoldOnFailure: func() string {
+			if d := t.HoldDuration(); d > 0 {
+				return d.String()
+			}
+
+			return ""
+		}(),
 		BuildKitCacheMountLimit: func() config.ByteSize {
 			if t.BuildKitCacheMountLimit > 0 {
 				return t.BuildKitCacheMountLimit

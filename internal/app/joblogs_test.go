@@ -408,6 +408,14 @@ func (unanswering) Job(context.Context, string) (alloc.JobRecord, error) {
 	return alloc.JobRecord{}, errors.New("the ledger did not answer")
 }
 
+func (unanswering) Lease(context.Context, string) (*alloc.Lease, error) {
+	return nil, errors.New("the ledger did not answer")
+}
+
+func (unanswering) EndLeaseHold(context.Context, string, string) (bool, error) {
+	return false, errors.New("the ledger did not answer")
+}
+
 // A LEDGER THAT COULD NOT ANSWER IS 503, could-not-tell, and never a job that does not exist.
 func TestAReadTheLedgerCouldNotAnswerIsNotAbsent(t *testing.T) {
 	t.Parallel()

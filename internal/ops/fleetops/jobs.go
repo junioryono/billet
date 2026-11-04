@@ -21,11 +21,16 @@ import (
 // cmdJobs is the operator's view of what jobs did.
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait")
+		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait | " +
+			"billet jobs attach <lease> | billet jobs release <lease>")
 	}
 	switch args[0] {
 	case "show":
 		return cmdJobsShow(ctx, env, args[1:])
+	case "attach":
+		return JobsAttach(ctx, env, args[1:])
+	case "release":
+		return JobsRelease(ctx, env, args[1:])
 	case "wait":
 		return cmdJobsWait(ctx, env, args[1:])
 	}
