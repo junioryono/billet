@@ -661,7 +661,19 @@ linters:
           allow:
             - $gostd
             - github.com/junioryono/billet/internal/guestreport$
+            - github.com/junioryono/billet/internal/joblog$
             - github.com/junioryono/billet/internal/regularfile$
+
+        # A CHUNK OF A JOB'S LOG IS READ BY THE AGENT, THE NODE, THE INDEX AND THE LOGS
+        # COMMAND, and is the standard library's alone so none of them imports another
+        # through it. Measured at zero violations when it went in.
+        joblog:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/joblog/**"
+            - "!$test"
+          allow:
+            - $gostd
 
         # A LEDGER WRITER MAY NOT REACH THE NETWORK, AND THE BLAST RADIUS IS WHY.
         #

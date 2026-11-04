@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/guestreport"
+	"github.com/junioryono/billet/internal/joblog"
 )
 
 // The guest-facing routes of the node's cache service, and what a batch is sent as.
@@ -23,6 +24,8 @@ const (
 	limitsPath       = "/v1/guest/limits"
 	reportsPath      = "/v1/guest/reports"
 	batchContentType = "application/vnd.billet.guest-batch"
+	logsPath         = "/v1/guest/logs"
+	logContentType   = "application/vnd.billet.job-log"
 )
 
 // The bounds of talking to the node: the bytes of an answer read, the longest wait
@@ -61,12 +64,29 @@ type limits struct {
 	maxBody  int
 	// cases says the node takes a batch's test cases (guestreport.SchemaCases).
 	cases bool
+	// logs is what the node offers for this job's step logs, nil where it keeps none:
+	// a node that does not, or this job's tier does not.
+	logs *logLimits
+}
+
+// logLimits is what a node offers for a job's step logs.
+type logLimits struct {
+	interval time.Duration
+	maxBody  int
 }
 
 // limitsAnswer is GET /v1/guest/limits's body, read leniently: a field the agent
 // does not know is ignored.
 type limitsAnswer struct {
 	Schemas    []int  `json:"schemas"`
+	IntervalMS *int64 `json:"interval_ms"`
+	MaxBody    *int64 `json:"max_body"`
+	// Logs is what the node offers for the job's step logs; an older node names none.
+	Logs *logsAnswer `json:"logs"`
+}
+
+// logsAnswer is the hello's offer of a home for the job's step logs.
+type logsAnswer struct {
 	IntervalMS *int64 `json:"interval_ms"`
 	MaxBody    *int64 `json:"max_body"`
 }
@@ -164,7 +184,48 @@ func readLimits(body []byte) (limits, verdict) {
 		interval: time.Duration(*a.IntervalMS) * time.Millisecond,
 		maxBody:  int(min(*a.MaxBody, guestreport.MaxBatchBytes)),
 		cases:    slices.Contains(a.Schemas, guestreport.SchemaCases),
+		logs:     a.Logs.limits(),
 	}, accepted
+}
+
+// limits is the offer as the shipper reads it. An offer it cannot use is no offer: the
+// job's report goes on without its logs.
+func (a *logsAnswer) limits() *logLimits {
+	if a == nil || a.IntervalMS == nil || a.MaxBody == nil ||
+		*a.IntervalMS < 1 || *a.IntervalMS > maxIntervalMS || *a.MaxBody < 1 {
+		return nil
+	}
+
+	return &logLimits{interval: time.Duration(*a.IntervalMS) * time.Millisecond,
+		maxBody: int(min(*a.MaxBody, joblog.MaxChunkBytes))}
+}
+
+// sendLogs sends one encoded chunk of a job's log, and answers as report does.
+func (n *node) sendLogs(ctx context.Context, body []byte) (verdict, time.Duration) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.base+logsPath, bytes.NewReader(body))
+	if err != nil {
+		return unknown, 0
+	}
+
+	req.Header.Set("Content-Type", logContentType)
+
+	status, _, header, err := n.do(req)
+	if err != nil {
+		return unknown, 0
+	}
+
+	switch status {
+	case http.StatusNoContent:
+		return accepted, 0
+	case http.StatusTooManyRequests:
+		return rateLimited, retryAfter(header.Get("Retry-After"))
+	case http.StatusBadRequest:
+		return refused, 0
+	case http.StatusRequestEntityTooLarge, http.StatusUnauthorized, http.StatusNotFound:
+		return stop, 0
+	default:
+		return unknown, 0
+	}
 }
 
 // report sends one encoded batch, marked final when it is the agent's last. It

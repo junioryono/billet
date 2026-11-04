@@ -290,6 +290,8 @@ type Controller struct {
 	// recorder is the flight recorder, or nil when server.flight_recorder is
 	// off; a nil one records nothing.
 	recorder *flightrecorder.Recorder
+	// logIndex is the index of what jobs wrote, nil where no tier keeps its logs.
+	logIndex *state.LogIndex
 
 	// self is the address BecomeController made this Controller at. The proofs
 	// name their controller by address, so a copy, or a Controller overwritten
@@ -309,6 +311,12 @@ type Controller struct {
 func (c *Controller) Close() []error {
 	errs := c.loops.Wait()
 	settleRecorder(c.recorder, c.cp.db.LeadershipLost())
+
+	if c.logIndex != nil {
+		if err := c.logIndex.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
 	return errs
 }
@@ -442,7 +450,34 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 
 	cp := c.cp
 
+	wireOpts := []wireOption{}
+	logIndexID := ""
+
+	// AN INDEX ONLY WHERE A TIER ASKS, so a deployment that keeps no logs holds no directory
+	// of them and its nodes are told of no index.
+	if cp.cfg.KeepsJobLogs() {
+		limits, err := cp.cfg.Server.Logs.Limits()
+		if err != nil {
+			return nil, err
+		}
+
+		index, err := state.OpenLogIndex(LogIndexDir(cp.cfg))
+		if err != nil {
+			return nil, err
+		}
+
+		c.logIndex, logIndexID = index, index.ID()
+		wireOpts = append(wireOpts, withLogIndex(newLogIndexSink(index, cp.allocator)))
+
+		c.loops.Background("log index retention", func(ctx context.Context) {
+			retainLogIndex(ctx, index, limits, slog.Default())
+		})
+	}
+
 	planeOpts := append([]nodeplane.Option{
+		// What this control plane's index is, so a node ships what it keeps to one it has
+		// not reached.
+		nodeplane.WithLogIndexID(logIndexID),
 		nodeplane.WithRegistrar(cp.allocator),
 		// The declared places, so a node claiming one nobody declared is refused
 		// here rather than recorded. A node's own config cannot make this check —
@@ -469,10 +504,16 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 	resizes := &resizeGate{alloc: cp.allocator}
 
 	wire, err := ServeNodeWire(ctx, cp.cfg, cp.host.ServerAccess, nodes, cp.allocator,
-		cp.planeJIT, cp.allocator, cp.allocator, cp.db, withResizer(resizes.resize))
+		cp.planeJIT, cp.allocator, cp.allocator, cp.db, append(wireOpts, withResizer(resizes.resize))...)
 	if err != nil {
 		return nil, err
 	}
+
+	// THE OPERATOR SOCKET, ONCE THERE IS A PLANE TO ANSWER FROM. An index or none, since
+	// what it serves grows beyond the logs.
+	c.loops.Background("operator socket", func(ctx context.Context) {
+		serveOperator(ctx, cp.cfg, &operatorServer{jobs: cp.allocator, plane: nodes, log: slog.Default()})
+	})
 
 	return &ServingWire{ServedWire: wire, nodes: nodes, resizes: resizes, servedBy: c}, nil
 }

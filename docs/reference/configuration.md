@@ -22,6 +22,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `placement` | no | `pack` (default) or `spread` |
 | `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
+| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-023](decisions/adr-023-job-logs.md)) |
 | `test_results_retention` | no | how long the ledger keeps a job's test suites and cases, which `billet tests stats` ranks and `billet jobs show` prints (default `336h`, at least `1h`); they are kept apart from the guest report and past it |
 | `test_results_max_bytes` | no | how much of them the ledger keeps in all, the oldest deleted first (a byte size, default `128MiB`, at least `1MiB`); the control plane reads the whole ledger at every start, and this bounds what they add to that |
 | `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
@@ -80,6 +81,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `stop` | no | what a SIGTERM does while the node holds compute: `drain` (the default) waits for it; `handoff` (Firecracker nodes only) leaves it running for the next node process to adopt, for a host restarted to be upgraded or converged. A host leaving for good is drained or decommissioned, since nothing comes back to adopt what a handoff leaves |
 | `cache.listen` | for interception and EC2 caches | one literal non-loopback address; `tls_cert`/`tls_key` required for EC2 and refused on the Firecracker bridge |
 | `registry_mirrors` | no | `docker.io`, `ghcr.io`, `quay.io` origins |
+| `logs.retention`, `logs.max_bytes`, `logs.max_job_bytes` | no | how long this node keeps a job's step logs (default `336h`, at least `1h`), how much in all (default `64GiB`, at least `64MiB`), and how much of one job (default `64MiB`, at least `1MiB`, no more than `max_bytes`), compressed, the oldest jobs evicted whole. Only a node with `monitoring.guest` receives any, and only for a tier with `logs.keep` |
 | `monitoring` | no | measure each job from the host; absent means off; firecracker, docker and tart only, and `perf` and `guest` firecracker only (see below) |
 | `power` | no | lower the CPU's ceiling while the node is idle and restore it before a launch; absent means off; firecracker and docker on Linux only (see below) |
 
@@ -150,6 +152,7 @@ The per-sample series a node reports with each job records the wall time of its 
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
 | `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference; never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
+| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-023](decisions/adr-023-job-logs.md)) |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |

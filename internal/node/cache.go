@@ -102,6 +102,9 @@ type CacheService struct {
 	// start it; guestDecode bounds the batches the node decodes at once.
 	guestMonitoring bool
 	guestDecode     chan struct{}
+	// jobLogs keeps the step logs of a job whose tier asks, nil where this node keeps
+	// none.
+	jobLogs *JobLogStore
 }
 
 type cacheSession struct {

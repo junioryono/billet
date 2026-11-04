@@ -124,6 +124,9 @@ type Client struct {
 	// at all (nodeapi.VersionImageAcceptance); both under regMu.
 	imagesAccept        []string
 	imagesAcceptCarried bool
+	// logIndexID is the index the last accepted registration named, empty where the
+	// control plane holds none or its wire carries none.
+	logIndexID string
 
 	// guestUnsent is set the first time a guest report is not sent because the
 	// negotiated wire does not carry one, so that is said once and not once a
@@ -433,6 +436,10 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 	c.wire.Store(int64(res.Version))
 	c.imagesAccept = slices.Clone(res.ImagesAccept)
 	c.imagesAcceptCarried = res.Version >= nodeapi.VersionImageAcceptance
+	c.logIndexID = ""
+	if res.Version >= nodeapi.VersionJobLogs {
+		c.logIndexID = res.LogIndexID
+	}
 	c.regMu.Unlock()
 
 	return nil
@@ -1250,4 +1257,22 @@ func (c *Client) Renew(ctx context.Context, name string) ([]byte, []byte, []byte
 	// THE AUTHORITY TRAVELS WITH THE CERTIFICATE, which is what lets a CA
 	// rotation reach a node: during an overlap this is a bundle holding both.
 	return []byte(res.CertPEM), key, []byte(res.CAPEM), nil
+}
+
+// LogIndexID names the index the control plane holds, false when it holds none or this
+// pairing's wire carries none.
+func (c *Client) LogIndexID() (string, bool) {
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	return c.logIndexID, c.logIndexID != ""
+}
+
+// ShipLogChunk sends one kept chunk of a job's log to be indexed. A refusal is permanent;
+// any other error is could-not-tell and worth another try.
+func (c *Client) ShipLogChunk(ctx context.Context, leaseID string, firstLine int64, data []byte) (bool, error) {
+	err := c.do(ctx, http.MethodPost, c.nodePath("/logs"),
+		nodeapi.LogChunkRequest{Lease: leaseID, FirstLine: firstLine, Data: data}, nil)
+
+	return errors.Is(err, ErrRefused), err
 }

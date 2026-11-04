@@ -126,6 +126,18 @@ type LeaseStore interface {
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
+// LogIndexer indexes one chunk of a job's log for the node that says it holds it. A
+// refusal wrapping ErrRefused is permanent, so the node does not send the chunk again;
+// anything else is could-not-tell.
+type LogIndexer interface {
+	IndexLogChunk(ctx context.Context, node, leaseID string, firstLine int64, data []byte) error
+}
+
+// WithLogIndex serves the route that takes chunks of jobs' logs.
+func WithLogIndex(x LogIndexer) HandlerOption {
+	return func(h *handler) { h.logs = x }
+}
+
 // GuestReportStore keeps what the agent inside a lease's guest told the node:
 // the guest's own unverified view, fenced on the epoch, the first report kept.
 //
@@ -376,6 +388,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/remove", h.forOwnOrEndedLease(h.removeRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/recover", h.forOwnLease(h.recoverRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
+	mux.HandleFunc("POST /v1/nodes/{node}/logs", h.forNode(h.logChunk))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
 	return mux
@@ -442,6 +455,8 @@ type handler struct {
 	// guests keeps guest reports; nil when the lease store keeps none, and the
 	// route then refuses.
 	guests GuestReportStore
+	// logs indexes what jobs wrote; nil when this control plane keeps no index.
+	logs LogIndexer
 	// authorities remembers what GitHub's record said about a running job, so a
 	// job whose cache calls cannot be proved does not ask GitHub on every call.
 	authorities authorityMemory
@@ -1733,6 +1748,42 @@ func (h *handler) guestReport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// logChunk indexes one chunk of a job's log. A LOG IS WHAT THE JOB WROTE, and nothing here
+// decides from it. The lease is only a name until the indexer checks the job ran on this
+// node, and a superseded process may finish shipping what it kept: a chunk is about a job
+// already over, not capacity.
+func (h *handler) logChunk(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.LogChunkRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionJobLogs {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, fmt.Sprintf(
+			"a job log needs wire %d and this node negotiated %d", nodeapi.VersionJobLogs, wire))
+
+		return
+	}
+
+	if h.logs == nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, "this control plane keeps no index of job logs")
+
+		return
+	}
+
+	err := h.logs.IndexLogChunk(r.Context(), r.PathValue("node"), req.Lease, req.FirstLine, req.Data)
+
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, ErrRefused):
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+	default:
+		writeErr(w, http.StatusServiceUnavailable, "", err.Error())
+	}
 }
 
 func (h *handler) resize(w http.ResponseWriter, r *http.Request) {

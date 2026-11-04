@@ -87,6 +87,10 @@ func NewNodeCacheService(
 	service.SetAuthorityReader(control)
 	if guestMonitoring(cfg) {
 		service.MonitorGuests()
+
+		if err := startJobLogs(cfg, service); err != nil {
+			return nil, err
+		}
 	}
 
 	return service, nil

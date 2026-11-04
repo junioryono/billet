@@ -266,3 +266,107 @@ func TestATestResultsFieldReachesOnlyAPlaneThatKnowsIt(t *testing.T) {
 		}
 	}
 }
+
+// A LOG INDEX'S NAME COUNTS ONLY ON THE WIRE THAT CARRIES IT: a node below it ships nothing, which
+// is what an older control plane needs of it. LITERAL VERSIONS, for the reason above.
+func TestALogIndexIDCountsOnlyOnItsWire(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		version int
+		want    string
+	}{{38, ""}, {39, "index-a"}} {
+		c := registeredAt(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(nodeapi.RegisterResponse{Version: tc.version, LeaseTTLSeconds: 60,
+				PollSeconds: 30, LogIndexID: "index-a"}); err != nil {
+				t.Errorf("answer: %v", err)
+			}
+		}))
+
+		got, ok := c.LogIndexID()
+		if got != tc.want || ok != (tc.want != "") {
+			t.Errorf("at wire %d the index is %q, %t; want %q", tc.version, got, ok, tc.want)
+		}
+	}
+}
+
+// logsPlane answers the chunk route with a status and an error code, and keeps what it was sent.
+type logsPlane struct {
+	status int
+	code   string
+	mu     sync.Mutex
+	got    []nodeapi.LogChunkRequest
+}
+
+func (p *logsPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/register" {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(nodeapi.RegisterResponse{Version: nodeapi.Version, LeaseTTLSeconds: 60,
+			PollSeconds: 30}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+
+		return
+	}
+
+	if r.Method != http.MethodPost || r.URL.Path != "/v1/nodes/n1/logs" {
+		http.NotFound(w, r)
+
+		return
+	}
+
+	var req nodeapi.LogChunkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return
+	}
+
+	p.mu.Lock()
+	p.got = append(p.got, req)
+	p.mu.Unlock()
+
+	if p.status == 0 {
+		w.WriteHeader(http.StatusNoContent)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(p.status)
+	_ = json.NewEncoder(w).Encode(nodeapi.ErrorResponse{Code: p.code, Message: "no"}) //nolint:errcheck // a test's stand-in, whose reader fails on what it lacks
+}
+
+// A CHUNK REACHES ITS ROUTE AS GIVEN; THE PLANE'S REFUSAL SAYS DO NOT SEND THIS AGAIN, AND ANY OTHER
+// FAILURE SAYS THE OPPOSITE, since one wrong answer loses a line and the other wedges a log.
+func TestAChunkIsShippedAndItsRefusalToldApart(t *testing.T) {
+	t.Parallel()
+
+	plane := &logsPlane{}
+	c := registeredAt(t, plane)
+
+	refused, err := c.ShipLogChunk(t.Context(), "l1", 12, []byte{1, 2, 255})
+	if err != nil || refused {
+		t.Fatalf("an accepted chunk answered %t, %v", refused, err)
+	}
+
+	plane.mu.Lock()
+	got := plane.got
+	plane.mu.Unlock()
+	if len(got) != 1 || got[0].Lease != "l1" || got[0].FirstLine != 12 || !bytes.Equal(got[0].Data, []byte{1, 2, 255}) {
+		t.Errorf("the plane was sent %+v", got)
+	}
+
+	plane = &logsPlane{status: http.StatusBadRequest, code: nodeapi.CodeRefused}
+	refused, err = registeredAt(t, plane).ShipLogChunk(t.Context(), "l1", 0, []byte{1})
+	if err == nil || !refused {
+		t.Errorf("a refusal answered %t, %v; want a refusal", refused, err)
+	}
+
+	plane = &logsPlane{status: http.StatusServiceUnavailable}
+	refused, err = registeredAt(t, plane).ShipLogChunk(t.Context(), "l1", 0, []byte{1})
+	if err == nil || refused {
+		t.Errorf("a failure answered %t, %v; want could-not-tell", refused, err)
+	}
+}

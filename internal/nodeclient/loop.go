@@ -31,6 +31,14 @@ import (
 // capacity a TTL later, and a container keeps running on capacity that has been
 // sold to somebody else. That is precisely the failure custody was built to
 // prevent, reintroduced by moving the runner behind a network.
+// logReadsAtOnce bounds the log reads a node serves beside its loop.
+const logReadsAtOnce = 4
+
+// LogReader is a Compute that keeps its jobs' logs.
+type LogReader interface {
+	ReadJobLog(ctx context.Context, spec nodeapi.LogReadSpec) (nodeapi.LogReadResult, error)
+}
+
 type Compute interface {
 	Launch(ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job dispatch.Job) error
 	Destroy(ctx context.Context, requestID int64) error
@@ -1231,6 +1239,9 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// re-registration never runs beside a launch begun under the last one. The
 	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
+	reads := newLaunchSet(logReadsAtOnce)
+	defer reads.wait()
+
 	defer func() {
 		launches.wait()
 		stopSaying()
@@ -1329,6 +1340,12 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		run := func() error {
 			return reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd,
 				executePolled(ctx, launchCtx, &executing, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
+		}
+
+		// A LOG READ RUNS BESIDE THE LOOP ALWAYS: it touches no compute and takes no
+		// lease, and a search should not wait out a destroy or an upgrade.
+		if cmd.Kind == nodeapi.CommandReadLog && reads.start(ctx, run) {
+			continue
 		}
 
 		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
@@ -1678,6 +1695,28 @@ func execute(
 		}
 
 		res.OK = true
+
+		return res
+
+	case nodeapi.CommandReadLog:
+		// A NODE THAT KEEPS NO LOGS ANSWERS THAT IT HOLDS NOTHING: an error would read as
+		// could-not-tell, and asking again would change nothing.
+		res.OK = true
+		res.Log = &nodeapi.LogReadResult{}
+
+		reader, ok := compute.(LogReader)
+		if !ok || cmd.LogRead == nil {
+			return res
+		}
+
+		log, err := reader.ReadJobLog(ctx, *cmd.LogRead)
+		if err != nil {
+			res.OK, res.Log, res.Error = false, nil, err.Error()
+
+			return res
+		}
+
+		res.Log = &log
 
 		return res
 

@@ -94,6 +94,12 @@ type wireSettings struct {
 	operational, bootstrap int
 	handshake              time.Duration
 	resizer                nodeplane.Resizer
+	logs                   nodeplane.LogIndexer
+}
+
+// withLogIndex takes chunks of jobs' logs with x (nodeplane.WithLogIndex).
+func withLogIndex(x nodeplane.LogIndexer) wireOption {
+	return func(s *wireSettings) { s.logs = x }
 }
 
 // withResizer answers the resize route with r (nodeplane.WithResizer).
@@ -268,6 +274,7 @@ func ServeNodeWire(
 		Enrollments: enrollments,
 		CachePolicy: cachePolicy,
 		Resizer:     limits.resizer,
+		Logs:        limits.logs,
 	})
 	if err := errors.Join(err, release()); err != nil {
 		return nil, err
