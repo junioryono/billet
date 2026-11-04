@@ -63,7 +63,11 @@ func TestUsageExportReportsAJobTheStackRan(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	completed := fakeactions.JobFields{RunnerID: 99, RunnerName: names[0], Result: "succeeded"}
+	// GitHub's own times, 150 s apart: what a real job's messages carry, and nothing near
+	// how long this test took between sending them.
+	assigned := time.Date(2026, 11, 4, 9, 48, 27, 0, time.UTC)
+	completed := fakeactions.JobFields{RunnerID: 99, RunnerName: names[0], Result: "succeeded",
+		RunnerAssignedAt: assigned, FinishedAt: assigned.Add(150 * time.Second)}
 	s.plane.queue(fakeactions.StatisticsJSON(0, 0),
 		completed.Apply(fakeactions.JobJSON("JobCompleted", 5101, "push", simulatedTier)))
 
@@ -126,10 +130,10 @@ func TestUsageExportReportsAJobTheStackRan(t *testing.T) {
 		t.Errorf("weight = %v from %v, want 1 from the vCPU charged", record["minute_weight"], record["weight_source"])
 	}
 
-	// A JOB THAT TOOK ANY TIME AT ALL BILLS AT LEAST A MINUTE, whatever this run's
-	// timing, because both ends came from the real messages.
-	if billed, ok := record["billed_minutes"].(float64); !ok || billed < 1 {
-		t.Errorf("billed_minutes = %v, want a whole minute or more\n%s", record["billed_minutes"], out.String())
+	// GITHUB'S 150 SECONDS, whatever this run's timing, rounded up to three minutes: both
+	// ends came through the real message path and neither is the time it arrived.
+	if record["billed_minutes"] != float64(3) || record["job_clock"] != "github" {
+		t.Errorf("billed_minutes = %v on %v, want 3 on github\n%s", record["billed_minutes"], record["job_clock"], out.String())
 	}
 
 	if unknown, ok := record["unknown"].(map[string]any); !ok || len(unknown) != 0 {

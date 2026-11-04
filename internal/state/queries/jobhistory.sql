@@ -66,6 +66,9 @@ UPDATE job_history
        github_runner_assigned_at = CASE WHEN github_runner_assigned_at = ''
                                THEN CAST(@github_runner_assigned_at AS TEXT)
                                ELSE github_runner_assigned_at END,
+       github_finished_at = CASE WHEN github_finished_at = ''
+                               THEN CAST(@github_finished_at AS TEXT)
+                               ELSE github_finished_at END,
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST(@github_run_id AS BIGINT)
                             ELSE github_run_id END
  WHERE lease_id = @lease_id
@@ -360,7 +363,7 @@ SELECT usage_seq, usage_mark, lease_id, tier, github_target, COALESCE(repo, '') 
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
-       COALESCE(conclusion, '') AS conclusion
+       COALESCE(conclusion, '') AS conclusion, github_runner_assigned_at, github_finished_at
   FROM job_history
  WHERE usage_seq > @after AND usage_seq > 0
  ORDER BY usage_seq
@@ -512,7 +515,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
        disrupted_at, queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
-       chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
+       chosen_provider, instance_type, vcpu, memory, site, github_finished_at, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,

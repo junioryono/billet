@@ -306,6 +306,67 @@ func TestAKnownLeaseReportsEveryNumber(t *testing.T) {
 	}
 }
 
+// A JOB'S LENGTH IS GITHUB'S WHERE GITHUB SAID BOTH ENDS. The times here are a real job's
+// (2026-11-04): GitHub ran it for 243 seconds and billet received its JobStarted 47
+// seconds in, so billet's own pair bills a minute less than the job took.
+func TestAJobIsBilledOnGitHubsClockWhenItGaveBothEnds(t *testing.T) {
+	t.Parallel()
+
+	real := func() *state.UsageRow {
+		row := knownUsageRow()
+		row.StartedAt = "2026-11-04T09:49:14.176805454Z"
+		row.ResultAt = "2026-11-04T09:52:30.959812791Z"
+		row.GitHubRunnerAssignedAt = "2026-11-04T09:48:27.000000000Z"
+		row.GitHubFinishedAt = "2026-11-04T09:52:30.000000000Z"
+
+		return row
+	}
+
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, real())
+	if r.JobClock != jobClockGitHub || r.Job.Seconds == nil || r.Job.Seconds.String() != "243.000" {
+		t.Errorf("job = %v on %q, want 243.000 on %q", r.Job.Seconds, r.JobClock, jobClockGitHub)
+	}
+	if r.Job.From != "2026-11-04T09:48:27.000000000Z" || r.Job.To != "2026-11-04T09:52:30.000000000Z" {
+		t.Errorf("job ran %s to %s, want GitHub's times", r.Job.From, r.Job.To)
+	}
+	if r.BilledMinutes == nil || *r.BilledMinutes != 5 {
+		t.Errorf("billed = %v, want 243 s rounded up to 5", r.BilledMinutes)
+	}
+
+	// ONE END OF GITHUB'S IS NOT A LENGTH. Across two clocks a difference means nothing,
+	// so billet's own pair stands in, and the record says whose it is.
+	for name, mutate := range map[string]func(*state.UsageRow){
+		"no finish from GitHub": func(r *state.UsageRow) { r.GitHubFinishedAt = "" },
+		"no start from GitHub":  func(r *state.UsageRow) { r.GitHubRunnerAssignedAt = "" },
+	} {
+		row := real()
+		mutate(row)
+
+		r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+		if r.JobClock != jobClockBillet || r.Job.Seconds == nil || r.Job.Seconds.String() != "196.783" {
+			t.Errorf("%s: job = %v on %q, want billet's 196.783", name, r.Job.Seconds, r.JobClock)
+		}
+	}
+
+	// GITHUB'S TWO TIMES ARE A JOB BILLET NEVER SAW START, and that is a known length.
+	row := real()
+	row.StartedAt = ""
+
+	r = newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.BilledMinutes == nil || *r.BilledMinutes != 5 || r.JobClock != jobClockGitHub {
+		t.Errorf("billed %v on %q with no JobStarted received", r.BilledMinutes, r.JobClock)
+	}
+
+	// NOT A CLOCK WITH NOTHING TO READ, which a consumer has to be able to tell.
+	row = knownUsageRow()
+	row.StartedAt, row.ResultAt, row.Result = "", "", ""
+
+	r = newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.JobClock != "" || r.Unknown["job_clock"] == "" {
+		t.Errorf("a lease with no job has the clock %q, unknown %q", r.JobClock, r.Unknown["job_clock"])
+	}
+}
+
 // A TIER'S OWN WEIGHT TAKES PRECEDENCE, exactly, in thousandths; and an unset one
 // falls to the vCPU charged, not the vCPU the tier says today.
 func TestATiersWeightCountsItsMinutes(t *testing.T) {
@@ -519,7 +580,7 @@ func TestTheRecordFormatIsWhatTheDocumentStates(t *testing.T) {
 
 	wantTop := []string{
 		"schema", "cursor", "sequence", "lease_id", "deployment", "target", "repository", "tier", "site",
-		"provider", "ownership", "vcpu", "memory_bytes", "held", "job", "billed_minutes", "minute_weight",
+		"provider", "ownership", "vcpu", "memory_bytes", "held", "job", "job_clock", "billed_minutes", "minute_weight",
 		"weight_source", "weighted_minutes", "instance_type", "price_micros_per_hour", "cost_micros",
 		"conclusion", "result", "unknown",
 	}

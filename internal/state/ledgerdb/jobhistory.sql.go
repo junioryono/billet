@@ -691,7 +691,7 @@ SELECT usage_seq, usage_mark, lease_id, tier, github_target, COALESCE(repo, '') 
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
-       COALESCE(conclusion, '') AS conclusion
+       COALESCE(conclusion, '') AS conclusion, github_runner_assigned_at, github_finished_at
   FROM job_history
  WHERE usage_seq > $1 AND usage_seq > 0
  ORDER BY usage_seq
@@ -704,24 +704,26 @@ type ListUsageSinceParams struct {
 }
 
 type ListUsageSinceRow struct {
-	UsageSeq           int64
-	UsageMark          string
-	LeaseID            string
-	Tier               string
-	GithubTarget       string
-	Repo               string
-	ChosenProvider     string
-	InstanceType       string
-	Site               string
-	Vcpu               int64
-	Memory             int64
-	PriceMicrosPerHour int64
-	BoughtAt           string
-	StartedAt          string
-	FinishedAt         string
-	Result             string
-	ResultAt           string
-	Conclusion         string
+	UsageSeq               int64
+	UsageMark              string
+	LeaseID                string
+	Tier                   string
+	GithubTarget           string
+	Repo                   string
+	ChosenProvider         string
+	InstanceType           string
+	Site                   string
+	Vcpu                   int64
+	Memory                 int64
+	PriceMicrosPerHour     int64
+	BoughtAt               string
+	StartedAt              string
+	FinishedAt             string
+	Result                 string
+	ResultAt               string
+	Conclusion             string
+	GithubRunnerAssignedAt string
+	GithubFinishedAt       string
 }
 
 // Finished leases past a place in the order they finished in, bounded.
@@ -759,6 +761,8 @@ func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) 
 			&i.Result,
 			&i.ResultAt,
 			&i.Conclusion,
+			&i.GithubRunnerAssignedAt,
+			&i.GithubFinishedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -843,7 +847,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
        disrupted_at, queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
-       chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
+       chosen_provider, instance_type, vcpu, memory, site, github_finished_at, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
@@ -877,6 +881,7 @@ type ReadJobRow struct {
 	Vcpu                     int64
 	Memory                   int64
 	Site                     string
+	GithubFinishedAt         string
 	GithubQueuedAt           string
 	GithubScaleSetAssignedAt string
 	GithubRunnerAssignedAt   string
@@ -934,6 +939,7 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.Vcpu,
 		&i.Memory,
 		&i.Site,
+		&i.GithubFinishedAt,
 		&i.GithubQueuedAt,
 		&i.GithubScaleSetAssignedAt,
 		&i.GithubRunnerAssignedAt,
@@ -1211,9 +1217,12 @@ UPDATE job_history
        github_runner_assigned_at = CASE WHEN github_runner_assigned_at = ''
                                THEN CAST($8 AS TEXT)
                                ELSE github_runner_assigned_at END,
-       github_run_id = CASE WHEN github_run_id = 0 THEN CAST($9 AS BIGINT)
+       github_finished_at = CASE WHEN github_finished_at = ''
+                               THEN CAST($9 AS TEXT)
+                               ELSE github_finished_at END,
+       github_run_id = CASE WHEN github_run_id = 0 THEN CAST($10 AS BIGINT)
                             ELSE github_run_id END
- WHERE lease_id = $10
+ WHERE lease_id = $11
    AND (github_job_id = '' OR github_job_id = CAST($1 AS TEXT))
 `
 
@@ -1226,6 +1235,7 @@ type RecordJobIdentityParams struct {
 	GithubQueuedAt           string
 	GithubScaleSetAssignedAt string
 	GithubRunnerAssignedAt   string
+	GithubFinishedAt         string
 	GithubRunID              int64
 	LeaseID                  string
 }
@@ -1252,6 +1262,7 @@ func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityPa
 		arg.GithubQueuedAt,
 		arg.GithubScaleSetAssignedAt,
 		arg.GithubRunnerAssignedAt,
+		arg.GithubFinishedAt,
 		arg.GithubRunID,
 		arg.LeaseID,
 	)

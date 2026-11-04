@@ -43,6 +43,7 @@ func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error
 			`DROP TABLE usage_sequence`,
 			`ALTER TABLE job_history DROP COLUMN usage_seq`,
 			`ALTER TABLE job_history DROP COLUMN usage_mark`,
+			`ALTER TABLE job_history DROP COLUMN github_finished_at`,
 			`ALTER TABLE job_history DROP COLUMN github_target`,
 			`DELETE FROM schema_migrations WHERE version = 71`,
 			`INSERT INTO job_history (lease_id, tier, queued_at, finished_at) VALUES

@@ -358,6 +358,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 
 		job := jobOf(&j.JobMessageBase)
 		job.Result = j.Result
+		job.FinishedAt = j.FinishTime
 		job.RunnerID, job.RunnerName = int64(j.RunnerID), j.RunnerName
 		out.Completed = append(out.Completed, job)
 	}
