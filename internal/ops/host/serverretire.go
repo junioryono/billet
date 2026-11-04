@@ -750,7 +750,8 @@ func retireOpenLedger(ctx context.Context, cfg *config.Config, environmentFile s
 	noteRetireMutation("ledger-preparation", cfg.Server.IdentityDir)
 	var db *state.DB
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn, state.WithRunningRelease(version.Version()))
+		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn, state.WithRunningRelease(version.Version()),
+			state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 	} else {
 		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir, state.WithRunningRelease(version.Version()))
 	}

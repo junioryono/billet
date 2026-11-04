@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -142,6 +144,75 @@ func TestEveryPostgresLedgerOpenTakesTheBudget(t *testing.T) {
 
 	if opens == 0 {
 		t.Fatal("ledger.go opens no PostgreSQL ledger; this test has nothing to hold")
+	}
+}
+
+// outsideTheBudget are the PostgreSQL opens with no configuration to read a budget from:
+// a retirement's tail finds the ledger from its journal's locator, after the config that
+// named it may be gone. Each is one short command reading one row at a time.
+var outsideTheBudget = map[string]bool{
+	"serverretire.go/OpenPostgresInspect":        true,
+	"serverretiretail.go/OpenPostgresCompletion": true,
+}
+
+// NOR ANYWHERE ELSE: an open that goes round internal/app is held to the same rule, or
+// a deployment's max_connections is true only of the commands someone remembered.
+func TestNoPostgresOpenOutsideTheAssemblyEscapesTheBudget(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	excepted := map[string]bool{}
+
+	for _, root := range []string{"../ops", "../../cmd/billet", "../server", "../node", "../nodeplane"} {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+
+			file, err := parser.ParseFile(fset, path, nil, 0)
+			if err != nil {
+				return err
+			}
+
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+
+				pkg, name, ok := selectorOf(call.Fun)
+				if !ok || pkg != "state" || !strings.HasPrefix(name, "OpenPostgres") {
+					return true
+				}
+
+				if key := filepath.Base(path) + "/" + name; outsideTheBudget[key] {
+					excepted[key] = true
+
+					return true
+				}
+
+				if !takesTheBudget(call) {
+					t.Errorf("%s: state.%s is called without "+
+						"state.WithReaderConns(cfg.Server.LedgerReaderConnections())", fset.Position(call.Pos()), name)
+				}
+
+				return true
+			})
+
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", root, err)
+		}
+	}
+
+	for key := range outsideTheBudget {
+		if !excepted[key] {
+			t.Errorf("%s is excepted from the budget and no longer exists; drop it from the list", key)
+		}
 	}
 }
 
