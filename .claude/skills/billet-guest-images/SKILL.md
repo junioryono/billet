@@ -47,6 +47,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A license accepted in the control plane's `images.accept` reaches every node at registration, and either list accepts (#584).**
 - **A per-node rebuild timer is gone on purpose.**
 - **The AMI is the same build on the other backend (ADR-022).**
+- **A Windows AMI runs the steps of GitHub's windows-2025 template that `differences-windows.tsv` leaves in, and answers to its own contract (ADR-023).**
 
 ### The runner-release deadline: [references/runner-deadline.md](references/runner-deadline.md)
 

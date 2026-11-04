@@ -39,11 +39,12 @@ var windowsToolVersion = regexp.MustCompile(`^[0-9]+(\.[0-9]+)*(\.\*)?$`)
 // windowsVerifyScript is the user data that makes a machine booted from a Windows AMI
 // assert the contract on itself, and the report schema that goes with it.
 //
-// EVERY TOOL IS ASKED THROUGH THE JOB'S OWN PATH: a scheduled task logging on `runner`,
-// as billet-runner.ps1 starts the runner. The builder ran as SYSTEM with the template's
-// environment, and present on disk is not findable by a job. That also proves the path
-// itself: a password the local policy refuses, a right the account lacks or a profile
-// that does not load is a job that never starts.
+// EVERY TOOL IS ASKED THE WAY A JOB FINDS IT: from a scheduled task that logs on `runner`
+// as billet-runner.ps1's does, built here rather than by running that script, which would
+// start a listener with no registration. The builder ran as SYSTEM with the template's
+// environment, and present on disk is not findable by a job. It also proves the mechanism:
+// a password the local policy refuses, a right the account lacks or a profile that does
+// not load is a job that never starts. The entry points themselves are held by digest.
 func windowsVerifyScript(arch, nonce string) (string, reportSchema, error) {
 	schema := newReportSchema(reportBegin, reportEnd)
 
@@ -61,6 +62,7 @@ func windowsVerifyScript(arch, nonce string) (string, reportSchema, error) {
 
 	for _, key := range []string{
 		reportVerdictKey, reportStepKey, "runner", "image_os", "tool_cache", "root_free_gib", "root_used_gib",
+		"page_file_mb",
 	} {
 		schema.keys[key] = struct{}{}
 	}
@@ -73,6 +75,7 @@ func windowsVerifyScript(arch, nonce string) (string, reportSchema, error) {
 	entries := map[string]string{
 		scripts.WindowsRunnerEntry:   `C:\billet\billet-runner.ps1`,
 		scripts.WindowsRunnerService: `C:\billet\billet-runner-service.ps1`,
+		scripts.WindowsJobStarted:    `C:\billet\billet-job-started.ps1`,
 	}
 
 	var digests strings.Builder
@@ -106,6 +109,11 @@ func windowsVerifyScript(arch, nonce string) (string, reportSchema, error) {
 		return "", schema, fmt.Errorf("ec2: the pinned windows-2025 declaration names no toolcache")
 	}
 
+	if !windowsToolVersion.MatchString(declared.PowerShell.Version) {
+		return "", schema, fmt.Errorf("ec2: the declaration names a PowerShell version this "+
+			"script will not interpolate: %q", declared.PowerShell.Version)
+	}
+
 	var lines strings.Builder
 
 	for _, entry := range declared.Toolcache {
@@ -137,9 +145,11 @@ func windowsVerifyScript(arch, nonce string) (string, reportSchema, error) {
 	}
 
 	check := strings.NewReplacer(
+		"@NONCE@", nonce,
 		"@ENTRY@", windowsRunnerListener,
 		"@TOOLS@", strings.TrimRight(tools.String(), "\n"),
 		"@TOOLCACHE@", strings.TrimRight(lines.String(), "\n"),
+		"@PWSH@", strings.TrimSuffix(strings.TrimSuffix(declared.PowerShell.Version, "*"), "."),
 		"@MIN_FREE_GIB@", strconv.Itoa(minVerifiedFreeGiB),
 	).Replace(windowsVerifyCheck)
 
@@ -154,6 +164,7 @@ func windowsVerifyScript(arch, nonce string) (string, reportSchema, error) {
 		"@ENTRIES@", strings.TrimRight(digests.String(), ",\n"),
 		"@ROUNDS@", strconv.Itoa(verifyDwellRounds),
 		"@SECONDS@", strconv.Itoa(verifyDwellSeconds),
+		"@DEADLINE@", strconv.Itoa(int((windowsVerifyWindow+10*time.Minute)/time.Second)),
 		"@CHECK@", check,
 	).Replace(windowsVerifyMain), schema, nil
 }
@@ -163,8 +174,11 @@ const windowsRunnerListener = `C:\actions-runner\bin\Runner.Listener.exe`
 
 // windowsVerifyCheck runs as `runner`, and writes what it learns as it goes, so a check
 // that stops leaves the step it stopped at and everything before it.
+//
+// THE FILE IS THIS VERIFICATION'S, by its nonce: an image holding an earlier result
+// must not answer for a check that did not run.
 const windowsVerifyCheck = `$ErrorActionPreference = 'Stop'
-$out = 'C:\billet\verify\result.txt'
+$out = 'C:\billet\verify\result-@NONCE@.txt'
 function Say([string]$key, [string]$value) {
 	$clean = $value -replace '[^\x20-\x7e]', ''
 	if ($clean.Length -gt 180) { $clean = $clean.Substring(0, 180) }
@@ -172,7 +186,9 @@ function Say([string]$key, [string]$value) {
 }
 function Step([string]$name) { Add-Content -LiteralPath $out -Value "step=$name" -Encoding ascii }
 function Ask-Tool([string]$key, [string]$exe, [string]$arguments) {
+	$null = Get-Command $exe -ErrorAction Stop
 	$ErrorActionPreference = 'Continue'
+	$global:LASTEXITCODE = $null
 	$said = @(& $exe $arguments 2>&1)
 	if ($LASTEXITCODE -ne 0 -or $said.Count -eq 0) { throw "$exe answered $LASTEXITCODE" }
 	Say $key ([string]$said[0])
@@ -196,6 +212,7 @@ Step 'runner'
 Ask-Tool 'runner' '@ENTRY@' '--version'
 Step 'tools'
 @TOOLS@
+if ([string]@(& pwsh --version)[0] -cnotlike 'PowerShell @PWSH@.*') { throw 'pwsh is not the declared line' }
 Step 'environment'
 Say 'image_os' $env:ImageOS
 Say 'tool_cache' $env:RUNNER_TOOL_CACHE
@@ -209,22 +226,29 @@ $drive = Get-PSDrive C
 Say 'root_free_gib' ([string][math]::Round($drive.Free / 1GB, 1))
 Say 'root_used_gib' ([string][math]::Round($drive.Used / 1GB, 1))
 if ($drive.Free -lt (@MIN_FREE_GIB@ * 1GB)) { throw 'the root is nearly full' }
+$paging = @(Get-CimInstance Win32_PageFileUsage)
+if ($paging.Count -eq 0) { throw 'this image booted with no page file' }
+Say 'page_file_mb' ([string]$paging[0].AllocatedBaseSize)
 Step 'done'
 `
 
 // windowsVerifyMain is the user data, which EC2Launch runs as the local Administrator.
 //
 // ITS OWN STOP ENDS THE MACHINE, which launches with a shutdown behaviour of terminate:
-// the same leak bound the Linux verifier has.
+// the same leak bound the Linux verifier has. The timed shutdown comes first and on its
+// own, so a console that cannot be opened, an image with EMS on, still ends the machine,
+// in the one case that bound exists for: billet having lost track of it.
 const windowsVerifyMain = `<powershell>
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
-$port.Open()
+& shutdown.exe /s /t @DEADLINE@ /d p:4:1 | Out-Null
+$port = $null
 $verdict = '@FAIL@'
 $step = 'entry'
 $report = New-Object System.Collections.Generic.List[string]
 try {
+	$port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
+	$port.Open()
 	foreach ($pair in @(
 @ENTRIES@
 	)) {
@@ -252,29 +276,31 @@ try {
 	Start-ScheduledTask -TaskName 'billet-verify'
 	for ($i = 0; $i -lt 300; $i++) {
 		Start-Sleep -Seconds 2
-		if (Select-String -LiteralPath "$dir\result.txt" -Pattern '^step=done$' -Quiet -ErrorAction SilentlyContinue) { break }
-		$task = Get-ScheduledTask -TaskName 'billet-verify'
-		if ($i -gt 5 -and $task.State -eq 'Ready') { break }
+		if ($i -gt 5 -and (Get-ScheduledTask -TaskName 'billet-verify').State -eq 'Ready') { break }
 	}
-	foreach ($line in Get-Content -LiteralPath "$dir\result.txt") {
+	foreach ($line in Get-Content -LiteralPath "$dir\result-@NONCE@.txt") {
 		if ($line -like 'step=*') {
 			$step = $line.Substring(5)
 		} else {
 			$report.Add($line)
 		}
 	}
-	if ($step -ceq 'done') { $verdict = '@OK@' }
+	# A STEP WRITTEN IS NOT A CHECK FINISHED: the task's own status has to say so too.
+	if ($step -ceq 'done' -and (Get-ScheduledTaskInfo -TaskName 'billet-verify').LastTaskResult -eq 0) { $verdict = '@OK@' }
 } catch {
 	$report.Add('')
 }
-for ($round = 0; $round -lt @ROUNDS@; $round++) {
-	$port.WriteLine('@BEGIN@ @NONCE@')
-	$port.WriteLine("@VERDICT@=$verdict")
-	$port.WriteLine("@STEP@=$step")
-	foreach ($line in $report) { $port.WriteLine($line) }
-	$port.WriteLine('@END@ @NONCE@')
-	Start-Sleep -Seconds @SECONDS@
+if ($null -ne $port) {
+	for ($round = 0; $round -lt @ROUNDS@; $round++) {
+		$port.WriteLine('@BEGIN@ @NONCE@')
+		$port.WriteLine("@VERDICT@=$verdict")
+		$port.WriteLine("@STEP@=$step")
+		foreach ($line in $report) { $port.WriteLine($line) }
+		$port.WriteLine('@END@ @NONCE@')
+		Start-Sleep -Seconds @SECONDS@
+	}
 }
+& shutdown.exe /a | Out-Null
 Stop-Computer -Force
 </powershell>
 `

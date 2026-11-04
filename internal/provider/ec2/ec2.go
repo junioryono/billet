@@ -1065,6 +1065,10 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 	params.Set("BlockDeviceMapping.1.DeviceName", layout.root)
 	params.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
 
+	if layout.windows() {
+		params.Set("BlockDeviceMapping.1.Ebs.VolumeInitializationRate", strconv.Itoa(windowsVolumeInitRate))
+	}
+
 	if spec.Disk > 0 {
 		// ROUNDED UP. EBS sizes in whole GiB, and rounding down would hand a tier
 		// that asked for 80GiB a 79GiB disk — the direction that fails a job rather
@@ -1707,6 +1711,7 @@ func (p *Provider) describe(
 					Name:     name,
 					Running:  runningState(item.State.Name),
 					Terminal: item.State.Name == "terminated",
+					Ended:    !runningState(item.State.Name),
 				})
 			}
 		}

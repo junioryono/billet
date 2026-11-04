@@ -20,7 +20,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $account = 'runner'
 $dir = 'C:\billet\run'
-$file = Join-Path $dir 'launch.env'
+$file = "$dir\launch.env"
 $task = 'billet-runner'
 
 $passed = @(
@@ -82,3 +82,19 @@ $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) 
 Register-ScheduledTask -TaskName $task -Action $action -Settings $settings -User $account `
 	-Password $password -RunLevel Highest -Force | Out-Null
 Start-ScheduledTask -TaskName $task
+
+# STARTING IT SAYS NOTHING OF WHETHER THE LOGON WORKED, and this script is the last thing
+# that can still end the machine for a task that never ran. 267011 is "has not yet run".
+for ($i = 0; $i -lt 60; $i++) {
+	if ((Get-ScheduledTask -TaskName $task).State -eq 'Running') {
+		return
+	}
+
+	if ((Get-ScheduledTaskInfo -TaskName $task).LastTaskResult -ne 267011) {
+		throw "billet-runner: the runner's task ended at once"
+	}
+
+	Start-Sleep -Seconds 2
+}
+
+throw "billet-runner: the runner's task did not start"

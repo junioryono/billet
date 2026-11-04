@@ -40,8 +40,22 @@ if ([string]::IsNullOrEmpty($zip)) {
 	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 	$zip = Join-Path $root 'runner.zip'
 	$asset = "actions-runner-win-x64-$version.zip"
-	Invoke-WebRequest -UseBasicParsing -OutFile $zip `
-		-Uri "https://github.com/actions/runner/releases/download/v$version/$asset"
+
+	# RETRIED: a blip here would throw away every step that has already run.
+	for ($i = 0; ; $i++) {
+		try {
+			Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+				-Uri "https://github.com/actions/runner/releases/download/v$version/$asset"
+
+			break
+		} catch {
+			if ($i -ge 10) {
+				throw
+			}
+
+			Start-Sleep -Seconds 15
+		}
+	}
 }
 
 # BEFORE IT IS UNPACKED: this runner executes every job the image serves.

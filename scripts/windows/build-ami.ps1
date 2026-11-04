@@ -221,26 +221,37 @@ function Copy-Source([string]$source, [string]$destination) {
 		-Destination $destination -Recurse -Force
 }
 
-function Read-Skips {
-	$skips = @{}
+function Read-Differences {
+	$found = @{ skips = @{}; prepares = @{} }
 	foreach ($line in Get-Content -LiteralPath (Join-Path $runnerImages 'differences-windows.tsv')) {
 		if ($line -eq '' -or $line.StartsWith('#')) {
 			continue
 		}
 
 		$fields = $line.Split("`t")
-		if ($fields.Count -ne 3 -or $fields[0] -cne 'skip' -or $fields[2] -eq '') {
-			throw "a difference that is not skip, a step and a reason: $line"
+		if ($fields.Count -ne 3 -or $fields[2] -eq '') {
+			throw "a difference that is not an action, a step and a reason: $line"
 		}
 
-		if ($skips.ContainsKey($fields[1])) {
+		if ($found.skips.ContainsKey($fields[1]) -or $found.prepares.ContainsKey($fields[1])) {
 			throw "the step $($fields[1]) is listed twice"
 		}
 
-		$skips[$fields[1]] = $fields[2]
+		if ($fields[0] -ceq 'skip') {
+			$found.skips[$fields[1]] = $fields[2]
+		} elseif ($fields[0] -cmatch '^prepare:[a-z0-9-]+$') {
+			$script = Join-Path $here ('prepare-' + $fields[0].Substring('prepare:'.Length) + '.ps1')
+			if (-not (Test-Path -LiteralPath $script)) {
+				throw "the difference $($fields[0]) names a script this build does not carry"
+			}
+
+			$found.prepares[$fields[1]] = $script
+		} else {
+			throw "a difference this build does not know: $line"
+		}
 	}
 
-	return $skips
+	return $found
 }
 
 function Invoke-Template {
@@ -253,7 +264,9 @@ function Invoke-Template {
 		throw 'the plan has no steps'
 	}
 
-	$skips = Read-Skips
+	$differences = Read-Differences
+	$skips = $differences.skips
+	$prepares = $differences.prepares
 
 	# AN ENTRY THAT NAMES NO STEP STOPS THE BUILD BEFORE ANYTHING RUNS: it is a pin bump
 	# to review, not a line to ignore.
@@ -262,7 +275,7 @@ function Invoke-Template {
 		$ids[[string]$step.id] = $true
 	}
 
-	foreach ($id in $skips.Keys) {
+	foreach ($id in @($skips.Keys) + @($prepares.Keys)) {
 		if (-not $ids.ContainsKey($id)) {
 			throw "differences-windows.tsv names $id, which the plan does not have"
 		}
@@ -272,6 +285,7 @@ function Invoke-Template {
 	foreach ($step in $plan) {
 		$number++
 		$script:templateStep = "$number"
+		$script:label = ''
 		$id = [string]$step.id
 		$label = ('{0:d3}' -f $number)
 
@@ -284,6 +298,11 @@ function Invoke-Template {
 		Write-Output "=== [$number/$($plan.Count)] $id at $((Get-Date).ToUniversalTime().ToString('o')) ==="
 		Write-Console @("billet-build-progress $number/$($plan.Count) $id $((Get-Date).ToUniversalTime().ToString('o'))")
 		Set-StepEnvironment $step
+
+		if ($prepares.ContainsKey($id)) {
+			Invoke-Step "$label-prepare" @("& '$($prepares[$id].Replace("'", "''"))'") @(0)
+			Set-StepEnvironment $step
+		}
 
 		$valid = @(0)
 		if ($null -ne $step.valid_exit_codes) {
@@ -302,7 +321,12 @@ function Invoke-Template {
 					$path = Join-Path $upstream (([string]$step.script) -replace '/', [IO.Path]::DirectorySeparatorChar)
 					Invoke-Step $label @("& '$($path.Replace("'", "''"))'") $valid
 				} else {
-					Invoke-Step $label @($step.inline | ForEach-Object { [string]$_ }) $valid
+					# STOPPING ON A CMDLET'S FAILURE, WHICH GITHUB'S SCRIPTS DO NOT GET: they are
+					# written for Packer's default, and Configure-BaseImage.ps1 carries on past
+					# Set-ExecutionPolicy's complaint about the step's own -ExecutionPolicy
+					# (measured 2026-11-04). An inline `Move-Item` has nothing else to notice it,
+					# and `exit` with nothing having set a status reads as success.
+					Invoke-Step $label (@("`$ErrorActionPreference = 'Stop'") + @($step.inline | ForEach-Object { [string]$_ })) $valid
 				}
 			}
 			default {
@@ -340,8 +364,32 @@ try {
 
 	# THE TEMPLATE'S SCRATCH IS AZURE'S THROWAWAY D: DRIVE THERE AND THE IMAGED ROOT HERE,
 	# so what its steps downloaded would otherwise ship in every image.
-	if (-not [string]::IsNullOrEmpty($env:TEMP_DIR)) {
-		Remove-Item -LiteralPath $env:TEMP_DIR -Recurse -Force -ErrorAction SilentlyContinue
+	if (-not [string]::IsNullOrEmpty($env:TEMP_DIR) -and (Test-Path -LiteralPath $env:TEMP_DIR)) {
+		Remove-Item -LiteralPath $env:TEMP_DIR -Recurse -Force
+	}
+
+	# EC2LAUNCH'S COPY OF THE USER DATA HOLDS THE PRESIGNED URL: the first boot's script
+	# ended in a reboot, so nothing cleaned it up, and an hour-old URL is still a signature.
+	foreach ($dir in "$env:SystemRoot\system32\config\systemprofile\AppData\Local\Temp",
+		"$env:SystemDrive\Users\Administrator\AppData\Local\Temp") {
+		# ABSENT IS THE ONE ANSWER THAT PASSES: a listing that fails would otherwise read as
+		# nothing to remove, and the image would carry the signature.
+		if (Test-Path -LiteralPath $dir) {
+			Get-ChildItem -LiteralPath $dir -Filter 'EC2Launch*' -Directory -ErrorAction Stop |
+				Remove-Item -Recurse -Force
+		}
+	}
+
+	# PAGING COMES BACK WITH NO FILE, which is the state a job's first boot has to find: the
+	# bootstrap says why this machine ran without one. Windows creates the file at that boot.
+	if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+		if (Test-Path -LiteralPath 'C:\pagefile.sys') {
+			throw 'a page file appeared during the build, and a job would read it from the snapshot'
+		}
+
+		Set-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' `
+			-Name PagingFiles -Value @('?:\pagefile.sys') -Type MultiString
+		Set-CimInstance -InputObject (Get-CimInstance Win32_ComputerSystem) -Property @{ AutomaticManagedPagefile = $true }
 	}
 
 	Remove-Item -LiteralPath (Join-Path $root 'repo') -Recurse -Force

@@ -375,41 +375,59 @@ func TestAnArchitectureWithNoDeclarationIsRefused(t *testing.T) {
 	}
 }
 
-// THE ARM64 DECLARATION IS UPSTREAM'S AT THE PINNED COMMIT, checked the way the x64
+// THE OTHER DECLARATIONS ARE UPSTREAM'S AT THE PINNED COMMIT, checked the way the x64
 // one is, and network-gated the same way.
-func TestTheVendoredArm64ToolsetIsUpstreamAtThePinnedCommit(t *testing.T) {
+func TestTheOtherVendoredToolsetsAreUpstreamAtThePinnedCommit(t *testing.T) {
 	t.Parallel()
 
 	if os.Getenv("BILLET_OFFLINE") != "" {
 		t.Skip("BILLET_OFFLINE is set")
 	}
 
-	url, err := runnerimages.SourceURLFor(runnerimages.ArchArm64)
+	for _, name := range []string{runnerimages.ArchArm64, runnerimages.Windows2025} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			url, err := runnerimages.SourceURLFor(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+			if err != nil {
+				t.Fatalf("build the request: %v", err)
+			}
+			resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+			if err != nil {
+				t.Skipf("could not reach upstream: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("upstream answered %s for %s", resp.Status, url)
+			}
+			upstream, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			if err != nil {
+				t.Fatalf("read upstream: %v", err)
+			}
+			want, err := runnerimages.PinnedSHA256For(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256(upstream)
+			if got := hex.EncodeToString(sum[:]); got != want {
+				t.Errorf("upstream %s hashes to %s and pinned.txt names %s", url, got, want)
+			}
+		})
+	}
+}
+
+func TestTheWindowsDeclarationIsReadFromTheWindowsTree(t *testing.T) {
+	t.Parallel()
+
+	url, err := runnerimages.SourceURLFor(runnerimages.Windows2025)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
-	if err != nil {
-		t.Fatalf("build the request: %v", err)
-	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		t.Skipf("could not reach upstream: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("upstream answered %s for %s", resp.Status, url)
-	}
-	upstream, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		t.Fatalf("read upstream: %v", err)
-	}
-	want, err := runnerimages.PinnedSHA256For(runnerimages.ArchArm64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(upstream)
-	if got := hex.EncodeToString(sum[:]); got != want {
-		t.Errorf("upstream %s hashes to %s and pinned.txt names %s", url, got, want)
+	if !strings.HasSuffix(url, "/"+runnerimages.PinnedCommit()+"/images/windows/toolsets/toolset-2025.json") {
+		t.Errorf("the Windows declaration came from %s", url)
 	}
 }

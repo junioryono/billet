@@ -3,6 +3,7 @@ package ec2
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,16 @@ import (
 // the field is absent on every other image.
 const imagePlatformWindows = "windows"
 
+// windowsVolumeInitRate is the MiB/s a Windows job's root reads its snapshot at.
+//
+// A RUNNER HAS FIVE MINUTES. GitHub takes back an assignment left unstarted after that, and
+// with blocks read on demand a Windows job started 4 min 46 s after its dispatch, 14 s inside
+// it, every file the listener loads being the first read of its blocks (c7i.xlarge,
+// 2026-11-04). AWS charges per launch on the snapshot's full size, and the same price from
+// 100 to 200, so this is the top of that band: about $0.09 on a 36 GiB image, against a
+// second boot for an assignment missed. A Linux runner starts in under a minute without it.
+const windowsVolumeInitRate = 200
+
 // checkGuestOS refuses a launch whose guest OS and AMI disagree, in either direction,
 // before anything is sent.
 //
@@ -23,6 +34,15 @@ const imagePlatformWindows = "windows"
 // reports success, registers nothing and holds a lease until something reaps it.
 func checkGuestOS(spec provider.Spec, layout imageLayout) error {
 	if wants := spec.GuestOS == config.GuestWindows; wants == layout.windows() {
+		// AND A WINDOWS AMI IS NOT ENOUGH: Amazon's own is one, one paste from a tier's
+		// image, and it has no entry point to run. A tier naming a command of its own has
+		// said its image carries it.
+		if wants && !layout.billet && slices.Equal(spec.Command, []string{config.WindowsRunnerCommand}) {
+			return fmt.Errorf("ec2: %s would run %s on %s, which no billet built, so nothing there "+
+				"would start a runner; build one with `billet ami build --os windows`",
+				spec.Name, config.WindowsRunnerCommand, spec.Image)
+		}
+
 		return nil
 	}
 
@@ -115,8 +135,13 @@ func windowsUserData(spec provider.Spec, launchEpochNS int64) (string, error) {
 	b.WriteString("<powershell>\n$ErrorActionPreference = 'Stop'\n")
 	b.WriteString("$env:BILLET_LAUNCH_EPOCH_NS = '" + strconv.FormatInt(launchEpochNS, 10) + "'\n")
 	b.WriteString("$env:" + jitEnvVar + " = " + jit + "\n")
-	b.WriteString("& " + strings.Join(words, " ") + "\n")
-	b.WriteString("exit $LASTEXITCODE\n</powershell>\n")
+
+	// A BOOT THAT CANNOT START A RUNNER ENDS THE MACHINE: otherwise it runs on, billed by
+	// the hour for a Windows licence, with nothing to register. It ends the billing and not
+	// the lease, which stays charged until a Destroy, as a Linux boot's does that fails.
+	b.WriteString("try {\n\t& " + strings.Join(words, " ") + "\n")
+	b.WriteString("\tif ($LASTEXITCODE) { throw 'the runner command failed' }\n")
+	b.WriteString("} catch {\n\tStop-Computer -Force\n\texit 1\n}\n</powershell>\n")
 
 	return b.String(), nil
 }

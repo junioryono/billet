@@ -56,9 +56,12 @@ func ec2TierArchMismatch(cfg *config.Config, images []ec2.ImageInfo) error {
 // than from a queue (ADR-023). An image not found says nothing, and is reported above.
 func ec2TierGuestOSMismatch(cfg *config.Config, images []ec2.ImageInfo) error {
 	known := make(map[string]bool, len(images))
+	stock := make(map[string]bool, len(images))
+
 	for _, img := range images {
 		if img.Found {
 			known[img.ImageID] = img.Windows
+			stock[img.ImageID] = img.Windows && img.Contract == 0 && img.BuiltBy == "" && !img.HasComponents
 		}
 	}
 
@@ -73,7 +76,21 @@ func ec2TierGuestOSMismatch(cfg *config.Config, images []ec2.ImageInfo) error {
 		ami := t.ImageFor(config.ProviderEC2)
 
 		windows, ok := known[ami]
-		if !ok || windows == (t.GuestOS == config.GuestWindows) {
+		if !ok {
+			continue
+		}
+
+		// A WINDOWS AMI NOTHING OF BILLET'S IS ON, under the command only billet's image
+		// carries: Amazon's own, which is one paste away in the deployment guide.
+		if windows && t.GuestOS == config.GuestWindows && stock[ami] &&
+			slices.Equal(t.RunnerCommandFor(config.ProviderEC2), []string{config.WindowsRunnerCommand}) {
+			wrong = append(wrong, fmt.Sprintf("%s runs %s, and its AMI %s is no image billet built, "+
+				"so build one with `billet ami build --os windows`", t.Label, config.WindowsRunnerCommand, ami))
+
+			continue
+		}
+
+		if windows == (t.GuestOS == config.GuestWindows) {
 			continue
 		}
 

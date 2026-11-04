@@ -443,3 +443,23 @@ func pinnedPlatforms(t *testing.T) []string {
 
 	return platforms
 }
+
+// THE WORKFLOW CARRIES THE WINDOWS DIGEST ALL THE WAY, from the release's body to the pin
+// file, in the lines the rendering test supplies for itself.
+func TestTheBumpWorkflowCarriesTheWindowsDigest(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "runner-release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"sha_win_x64=$(sha_for win-x64)", "echo \"sha_win_x64=$sha_win_x64\"",
+		"SHA_WIN_X64: ${{ steps.read.outputs.sha_win_x64 }}", "printf 'win-x64 %s\\n' \"$SHA_WIN_X64\"",
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("the workflow does not say %q", want)
+		}
+	}
+}

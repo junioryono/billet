@@ -28,7 +28,7 @@ var amiBuild embed.FS
 // of GitHub's template, the plan derived from it and what billet does differently.
 //
 //go:embed windows/build-ami.ps1 windows/ec2-layer.ps1 windows/billet-runner.ps1
-//go:embed windows/billet-runner-service.ps1 windows/billet-job-started.ps1
+//go:embed windows/billet-runner-service.ps1 windows/billet-job-started.ps1 windows/prepare-aws-tools.ps1
 //go:embed runner-images/upstream/images/windows/assets runner-images/upstream/images/windows/scripts
 //go:embed runner-images/plan-windows-2025.json runner-images/differences-windows.tsv
 //go:embed runner-images/LICENSE
@@ -37,11 +37,12 @@ var amiBuildWindows embed.FS
 // WindowsPlan is the plan's path under scripts/ in what AMIBuildWindows returns.
 const WindowsPlan = "runner-images/plan-windows-2025.json"
 
-// WindowsRunnerEntry and WindowsRunnerService are the entry points' paths under
-// scripts/, which the verifier holds a booted image's copies to.
+// The entry points' paths under scripts/, which the verifier holds a booted image's
+// copies to.
 const (
 	WindowsRunnerEntry   = "windows/billet-runner.ps1"
 	WindowsRunnerService = "windows/billet-runner-service.ps1"
+	WindowsJobStarted    = "windows/billet-job-started.ps1"
 )
 
 // amiBuildExecutables are the embedded files the tree marks executable. An

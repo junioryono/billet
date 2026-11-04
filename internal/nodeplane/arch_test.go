@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -263,4 +264,119 @@ func TestARegistrationWithNoIncarnationDoesNotReplaceTheArchitectures(t *testing
 	if err := <-launched; err != nil {
 		t.Fatalf("launch: %v", err)
 	}
+}
+
+// A WINDOWS LEASE IS NOT SENT TO A NODE THAT WOULD WRITE ITS BOOT SCRIPT FOR LINUX: on a
+// Windows AMI that boots, looks healthy, registers nothing and holds the lease (ADR-023).
+// A LINUX LEASE ON THE SAME NODE IS AS IT WAS, and a current node takes either.
+func TestAWindowsLeaseIsNotLaunchedOnAnOlderNode(t *testing.T) {
+	t.Parallel()
+
+	plane := func(t *testing.T, wire int) *Plane {
+		t.Helper()
+
+		req := releasedNode()
+		req.Version, req.MinVersion = wire, nodeapi.MinVersion
+		req.Incarnation = "n1-1"
+
+		p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
+			WithTierCatalog([]config.Tier{{Label: "billet-2vcpu", Provider: config.ProviderDocker,
+				VCPU: 2, Memory: 8 * config.GiB}}),
+			WithRegistrar(&recordingRegistrar{}), WithCommandTimeout(5*time.Second))
+		if _, err := p.Register(t.Context(), req); err != nil {
+			t.Fatalf("register at wire %d: %v", wire, err)
+		}
+
+		return p
+	}
+
+	// EACH SUBTEST ITS OWN: a launch that succeeds writes the lease's node.
+	windows := func() *alloc.Lease {
+		l := testLease()
+		l.GuestOS = config.GuestWindows
+
+		return l
+	}
+
+	t.Run("a Windows lease on an older node", func(t *testing.T) {
+		t.Parallel()
+
+		p := plane(t, nodeapi.VersionWindowsGuests-1)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+
+		err := p.NewRunner().Launch(ctx, windows(), dispatch.Job{RequestID: 7})
+		if !errors.Is(err, ErrNoNode) || !strings.Contains(err.Error(), "boots Windows") {
+			t.Fatalf("launch = %v, want ErrNoNode naming the guest", err)
+		}
+		if n := p.QueuedForTest("n1"); n != 0 {
+			t.Errorf("%d commands were queued for a node the launch was refused", n)
+		}
+	})
+
+	for name, tc := range map[string]struct {
+		wire  int
+		lease func() *alloc.Lease
+	}{
+		"a Linux lease on an older node": {nodeapi.VersionWindowsGuests - 1, testLease},
+		"a Windows lease on a current":   {nodeapi.VersionWindowsGuests, windows},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			p := plane(t, tc.wire)
+
+			launched := make(chan error, 1)
+			go func() {
+				launched <- p.NewRunner().Launch(t.Context(), tc.lease(), dispatch.Job{RequestID: 7})
+			}()
+
+			cmd, took, err := p.Poll(t.Context(), "n1", "n1-1")
+			if err != nil || !took || cmd.Kind != nodeapi.CommandLaunch {
+				t.Fatalf("poll = %+v, %v, %v", cmd, took, err)
+			}
+			if err := p.Result("n1", "n1-1", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+				t.Fatalf("result: %v", err)
+			}
+			if err := <-launched; err != nil {
+				t.Fatalf("launch: %v", err)
+			}
+		})
+	}
+
+	// AND A PROCESS THAT RE-REGISTERS ON AN OLDER WIRE AFTER DISPATCH DOES NOT TAKE IT.
+	t.Run("a Windows lease queued before the node went older", func(t *testing.T) {
+		t.Parallel()
+
+		p := plane(t, nodeapi.VersionWindowsGuests)
+
+		launched := make(chan error, 1)
+		go func() {
+			launched <- p.NewRunner().Launch(t.Context(), windows(), dispatch.Job{RequestID: 7})
+		}()
+		waitForQueued(t, p, "n1")
+
+		older := releasedNode()
+		older.Version, older.MinVersion = nodeapi.VersionWindowsGuests-1, nodeapi.MinVersion
+		older.Incarnation = "n1-2"
+		if _, err := p.Register(t.Context(), older); err != nil {
+			t.Fatalf("re-register: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+
+		cmd, took, err := p.Poll(ctx, "n1", "n1-2")
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("poll: %v", err)
+		}
+		if took {
+			t.Fatalf("the older process took %s", cmd.Kind)
+		}
+
+		if err := <-launched; err == nil || !strings.Contains(err.Error(), "now speaks wire") {
+			t.Fatalf("launch = %v, want the delivery refusal", err)
+		}
+	})
 }

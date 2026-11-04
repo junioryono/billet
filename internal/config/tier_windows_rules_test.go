@@ -60,7 +60,7 @@ func TestAWindowsTiersDefaultCommandIsTheEntryPointItsImageCarries(t *testing.T)
 	t.Parallel()
 
 	windows := Tier{GuestOS: GuestWindows, Provider: ProviderEC2}
-	if got := windows.RunnerCommandFor(ProviderEC2); !slices.Equal(got, []string{WindowsRunnerCommand}) {
+	if got := windows.RunnerCommandFor(ProviderEC2); !slices.Equal(got, []string{`C:\billet\billet-runner.ps1`}) {
 		t.Errorf("the default command is %q", got)
 	}
 
@@ -110,6 +110,36 @@ func TestAWindowsTierRefusesWhatItsGuestHasNoClientFor(t *testing.T) {
 				t.Fatalf("errors = %v, want one saying %q", errs, tc.want)
 			}
 		})
+	}
+}
+
+// A SCOPE NOBODY WROTE IS NOT REFUSED AS THOUGH THEY HAD. An untrusted tier on a
+// repository target has one derived for it, and that derivation runs before validation,
+// so a Windows tier there would load only by refusing a field absent from its file.
+func TestAWindowsTierOnARepositoryTargetLoadsWithNoScopeDerived(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(repositoryConfig(t), "tiers:\n",
+		"tiers:\n  - label: win\n    provider: ec2\n    guest_os: windows\n    vcpu: 2\n"+
+			"    memory: 8GiB\n    image: ami-0abc\n", 1)
+
+	cfg, err := Parse("windows.yaml", []byte(body))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	tier, ok := cfg.TierByLabel("win")
+	if !ok {
+		t.Fatal("the tier did not load")
+	}
+	if tier.CacheScope != nil {
+		t.Errorf("a Windows tier was derived the cache scope %+v", tier.CacheScope)
+	}
+
+	// AND THE DERIVATION STILL RUNS FOR THE REST: this guard is about Windows alone.
+	linux, ok := cfg.TierByLabel("billet-4vcpu-ubuntu-2404")
+	if !ok || linux.CacheScope == nil {
+		t.Errorf("the Linux tier beside it lost its derived scope: %+v", linux)
 	}
 }
 

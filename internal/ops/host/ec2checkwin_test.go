@@ -15,7 +15,7 @@ func TestTheCloudPreflightJudgesAWindowsAMIByItsOwnContract(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
 
-	cfgFor := func(endpoint string, guest config.GuestOS) *config.Config {
+	cfgFor := func(endpoint string, guest config.GuestOS, command []string) *config.Config {
 		return wrapEC2(&config.EC2Config{
 			Region:           "us-west-2",
 			Endpoint:         endpoint,
@@ -24,7 +24,7 @@ func TestTheCloudPreflightJudgesAWindowsAMIByItsOwnContract(t *testing.T) {
 			InstanceTypes:    []config.EC2InstanceType{{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB}},
 		}, config.Tier{
 			Label: "cloud", Provider: config.ProviderEC2, Trust: config.WorkloadTrusted, VCPU: 8,
-			Memory: 16 * config.GiB, Image: "ami-good", GuestOS: guest,
+			Memory: 16 * config.GiB, Image: "ami-good", GuestOS: guest, Command: command,
 		})
 	}
 
@@ -32,6 +32,7 @@ func TestTheCloudPreflightJudgesAWindowsAMIByItsOwnContract(t *testing.T) {
 		name     string
 		topology fakeEC2Topology
 		guest    config.GuestOS
+		command  []string
 		wantOut  string
 		wantErr  string
 	}{
@@ -42,10 +43,23 @@ func TestTheCloudPreflightJudgesAWindowsAMIByItsOwnContract(t *testing.T) {
 			wantOut:  "ami-good available (Windows AMI contract 1)",
 		},
 		{
-			name:     "an unstamped Windows AMI",
-			topology: fakeEC2Topology{windowsImage: true, untaggedImage: true},
+			name:     "an unstamped Windows AMI billet built",
+			topology: fakeEC2Topology{windowsImage: true, imageContract: "0"},
 			guest:    config.GuestWindows,
 			wantOut:  "`billet ami build --os windows`",
+		},
+		{
+			name:     "Amazon's own Windows AMI",
+			topology: fakeEC2Topology{windowsImage: true, untaggedImage: true},
+			guest:    config.GuestWindows,
+			wantErr:  "is no image billet built",
+		},
+		{
+			name:     "Amazon's own Windows AMI under a tier's own command",
+			topology: fakeEC2Topology{windowsImage: true, untaggedImage: true},
+			guest:    config.GuestWindows,
+			command:  []string{`C:\own\start.ps1`},
+			wantOut:  "is a Windows AMI carrying no contract this billet accepts",
 		},
 		{
 			name:     "a Windows tier on a Linux AMI",
@@ -68,7 +82,7 @@ func TestTheCloudPreflightJudgesAWindowsAMIByItsOwnContract(t *testing.T) {
 			var err error
 
 			out := capture(t, func() {
-				err = checkEC2Credentials(t.Context(), processEnv(), cfgFor(fakeEC2With(t, topology), tc.guest), nil, false, false)
+				err = checkEC2Credentials(t.Context(), processEnv(), cfgFor(fakeEC2With(t, topology), tc.guest, tc.command), nil, false, false)
 			})
 
 			if tc.wantErr != "" {

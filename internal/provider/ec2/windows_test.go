@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -32,14 +35,50 @@ func windowsSpec() provider.Spec {
 	return spec
 }
 
-// answerWindowsImage has the fake describe every image as a Windows AMI, and answers
-// the rest as usual.
+// answerWindowsImage has the fake describe every image as a Windows AMI billet built, and
+// answers the rest as usual.
 func answerWindowsImage(action string, _ url.Values) (int, string) {
 	if action == "DescribeImages" {
-		return http.StatusOK, windowsImageReply
+		return http.StatusOK, strings.Replace(windowsImageReply, `</blockDeviceMapping>`,
+			`</blockDeviceMapping><tagSet><item><key>`+amiBuiltByTag+`</key><value>v1</value></item></tagSet>`, 1)
 	}
 
 	return http.StatusOK, defaultReply(action)
+}
+
+// AMAZON'S OWN AMI IS A WINDOWS AMI WITH NO ENTRY POINT, one paste from a tier's image, so
+// the agreement of the two is not enough under the command only billet's image carries;
+// a tier naming its own has said its image has it.
+func TestAWindowsLeaseOnAStockAMIIsRefusedUnderBilletsCommand(t *testing.T) {
+	t.Parallel()
+
+	stock := func(action string, _ url.Values) (int, string) {
+		if action == "DescribeImages" {
+			return http.StatusOK, windowsImageReply
+		}
+
+		return http.StatusOK, defaultReply(action)
+	}
+
+	f := newFakeEC2(t)
+	f.respond = stock
+
+	_, err := newTestProvider(t, f, nil).Launch(t.Context(), windowsSpec())
+	if err == nil || !strings.Contains(err.Error(), "no billet built") {
+		t.Fatalf("Launch answered %v, want a refusal naming the image", err)
+	}
+	if n := f.countOf("RunInstances"); n != 0 {
+		t.Errorf("%d instances were asked for", n)
+	}
+
+	own := newFakeEC2(t)
+	own.respond = stock
+	spec := windowsSpec()
+	spec.Command = []string{`C:\mine\start.ps1`}
+
+	if _, err := newTestProvider(t, own, nil).Launch(t.Context(), spec); err != nil {
+		t.Fatalf("a tier naming its own command was refused: %v", err)
+	}
 }
 
 // A WINDOWS LAUNCH BOOTS POWERSHELL: EC2Launch runs what is between the tags, and the
@@ -73,6 +112,11 @@ func TestAWindowsLaunchBootsPowerShellWithTheRegistrationInItsEnvironment(t *tes
 	if !strings.Contains(script, "& '"+config.WindowsRunnerCommand+"'\n") {
 		t.Errorf("the boot script does not run the tier's command:\n%s", script)
 	}
+	// A BOOT THAT CANNOT START A RUNNER ENDS THE MACHINE, rather than billing a licence by
+	// the hour for an instance that holds a lease and registers nothing.
+	if !strings.Contains(script, "} catch {\n\tStop-Computer -Force") {
+		t.Errorf("a failed start does not end the machine:\n%s", script)
+	}
 	if strings.Contains(script, "#!/bin/sh") {
 		t.Errorf("a Windows boot script carries Linux's shebang:\n%s", script)
 	}
@@ -82,10 +126,21 @@ func TestAWindowsLaunchBootsPowerShellWithTheRegistrationInItsEnvironment(t *tes
 		"MetadataOptions.HttpTokens":              "required",
 		"MetadataOptions.HttpPutResponseHopLimit": "1",
 		"BlockDeviceMapping.1.DeviceName":         "/dev/sda1",
+		// READ FAST ENOUGH TO TAKE ITS ASSIGNMENT: windowsVolumeInitRate says what it costs.
+		"BlockDeviceMapping.1.Ebs.VolumeInitializationRate": "200",
 	} {
 		if got := params.Get(key); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
+	}
+
+	// AND A LINUX LAUNCH, WHICH NEEDS NO SUCH THING, PAYS NOTHING FOR IT.
+	linux := newFakeEC2(t)
+	if _, err := newTestProvider(t, linux, nil).Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Linux Launch: %v", err)
+	}
+	if got := linux.paramsFor(t, "RunInstances").Get("BlockDeviceMapping.1.Ebs.VolumeInitializationRate"); got != "" {
+		t.Errorf("a Linux launch asks for an initialization rate of %s", got)
 	}
 }
 
@@ -137,6 +192,7 @@ func TestPsQuoteQuotesWhatItCanAndRefusesWhatItCannot(t *testing.T) {
 		"`n a; b | c & d":   "'`n a; b | c & d'",
 		"a''b":              "'a''''b'",
 		`"$env:PATH" %TMP%`: `'"$env:PATH" %TMP%'`,
+		"~ at the top":      "'~ at the top'",
 	} {
 		got, err := psQuote(value)
 		if err != nil || got != want {
@@ -153,6 +209,7 @@ func TestPsQuoteQuotesWhatItCanAndRefusesWhatItCannot(t *testing.T) {
 		"a closing tag":    "x</powershell>",
 		"an opening tag":   "<persist>true</persist>",
 		"a greater-than":   "a>b",
+		"a less-than":      "a<b",
 		"a typographic ’":  "it’s",
 		"a typographic ‘":  "‘quoted",
 		"any UTF-8 at all": "café",
@@ -207,13 +264,23 @@ func assertParses(t *testing.T, name, script string) {
 	pwsh := lookPwsh(t)
 	body := strings.TrimSuffix(strings.TrimPrefix(script, "<powershell>\n"), "</powershell>\n")
 
+	if strings.TrimSpace(body) == "" {
+		t.Fatalf("%s is empty, which parses", name)
+	}
+
+	file := filepath.Join(t.TempDir(), "script.ps1")
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	cmd := exec.CommandContext(t.Context(), pwsh, "-NoProfile", "-NonInteractive", "-Command", `
 $errors = $null
 $tokens = $null
-[void][System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$tokens, [ref]$errors)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:BILLET_PARSE, [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Output $_.ToString() }; exit 1 }
+if ($ast.EndBlock.Statements.Count -eq 0) { Write-Output 'no statements'; exit 1 }
 `)
-	cmd.Stdin = strings.NewReader(body)
+	cmd.Env = append(os.Environ(), "BILLET_PARSE="+file)
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("%s does not parse: %v\n%s\n--- script ---\n%s", name, err, out, script)
@@ -324,6 +391,7 @@ func TestTheWindowsPayloadLaysOutWhatTheDriverReads(t *testing.T) {
 		"billet-ami/repo/scripts/windows/billet-runner.ps1",
 		"billet-ami/repo/scripts/windows/billet-runner-service.ps1",
 		"billet-ami/repo/scripts/windows/billet-job-started.ps1",
+		"billet-ami/repo/scripts/windows/prepare-aws-tools.ps1",
 		"billet-ami/repo/scripts/runner-images/plan-windows-2025.json",
 		"billet-ami/repo/scripts/runner-images/differences-windows.tsv",
 		"billet-ami/repo/scripts/runner-images/upstream/images/windows/scripts/build/Install-Toolset.ps1",
@@ -479,6 +547,21 @@ func TestTheWindowsBootstrapIsWhatEC2Takes(t *testing.T) {
 	}
 }
 
+// A DRIVER THAT RETURNS HAVING REMOVED ITSELF IS A BUILD THAT FINISHED, ended by its own
+// shutdown: reporting a failure then would read as billet's last word on a good image.
+func TestTheWindowsBootstrapReportsADriverThatReturnedOnlyIfItIsStillThere(t *testing.T) {
+	t.Parallel()
+
+	script, err := windowsBootstrapScript(testWindowsBuild())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if want := "if (Test-Path -LiteralPath '" + windowsDriver + "') { Stop-WithFailure 'start' }"; !strings.Contains(script, want) {
+		t.Errorf("the bootstrap does not hold its report to the driver being there: want %q\n%s", want, script)
+	}
+}
+
 // A BUILDER'S USER DATA TRAVELS AS IT IS ON WINDOWS, where nothing would unzip it, and
 // the too-large bootstrap is refused before a machine that would do nothing is bought.
 func TestAWindowsBootstrapIsNeverCompressed(t *testing.T) {
@@ -517,7 +600,7 @@ type windowsBuildFake struct {
 	promoted       string
 	verifyScript   string
 	builderScript  string
-	stopped        bool
+	builderDisk    string
 }
 
 func (b *windowsBuildFake) buildNonce() string {
@@ -566,6 +649,7 @@ func (b *windowsBuildFake) reply(action string, params url.Values) (int, string)
 			b.nonce = nonceFromUserData(params.Get("UserData"))
 		} else {
 			b.builderScript = string(raw)
+			b.builderDisk = params.Get("BlockDeviceMapping.1.Ebs.VolumeSize")
 		}
 
 		return http.StatusOK, `<RunInstancesResponse><instancesSet><item><instanceId>` + id +
@@ -589,7 +673,7 @@ func (b *windowsBuildFake) reply(action string, params url.Values) (int, string)
 	case "DescribeInstances":
 		id, state, reason := params.Get("InstanceId.1"), "running", ""
 		if id == "i-builder" && b.builderRead && b.verdict == verdictOK {
-			state, reason, b.stopped = "stopped", "Client.InstanceInitiatedShutdown", true
+			state, reason = "stopped", "Client.InstanceInitiatedShutdown"
 		}
 
 		return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>` + id +
@@ -651,6 +735,9 @@ func TestAWindowsBuildImagesVerifiesAndStampsItsOwnContract(t *testing.T) {
 	if b.promoted != "1" {
 		t.Errorf("the image was stamped %q, want the Windows contract", b.promoted)
 	}
+	if b.builderDisk != strconv.Itoa(DefaultWindowsBuilderDiskGiB) {
+		t.Errorf("the builder's root is %q GiB, want the Windows default", b.builderDisk)
+	}
 	if got := f.countOf("CreateImage"); got != 1 {
 		t.Errorf("%d images were registered", got)
 	}
@@ -707,6 +794,15 @@ func TestAWindowsBuildThatFailsIsNamedFromThePlanAndNotImaged(t *testing.T) {
 	}
 	if n := f.countOf("CreateImage"); n != 0 {
 		t.Errorf("%d images were registered", n)
+	}
+
+	// THE PAYLOAD GOES WHEN THE BUILD DOES NOT FINISH, TOO: it is costing money.
+	f.mu.Lock()
+	removed := f.removed
+	f.mu.Unlock()
+
+	if removed != 1 {
+		t.Errorf("%d payloads were removed", removed)
 	}
 }
 
@@ -803,18 +899,30 @@ func TestTheWindowsVerifierAsksWhatTheContractSays(t *testing.T) {
 	for _, want := range []string{
 		reportBegin + " " + verifyProbeNonce, reportEnd + " " + verifyProbeNonce,
 		"-User 'runner'", "-RunLevel Highest", "Stop-Computer -Force",
-		`C:\billet\billet-runner.ps1`, `C:\billet\billet-runner-service.ps1`,
+		`C:\billet\billet-runner.ps1`, `C:\billet\billet-runner-service.ps1`, `C:\billet\billet-job-started.ps1`,
 		"Ask-Tool 'pwsh' 'pwsh' '--version'", "Ask-Tool 'git' 'git' '--version'",
+		"-cnotlike 'PowerShell 7.6.*'",
 		"Ask-Toolcache 'tc_python' 'Python' 'x64' @('3.10.', '3.11.', '3.12.', '3.13.', '3.14.')",
 		"Ask-Toolcache 'tc_ruby' 'Ruby' 'x64' @('3.2.', '3.3.', '3.4.', '4.0.')",
 		"Ask-Toolcache 'tc_pypy' 'PyPy' 'x86' @('3.9.', '3.10.')",
 		"Ask-Toolcache 'tc_node' 'node' 'x64' @('22.', '24.')",
 		"Ask-Toolcache 'tc_go' 'go' 'x64' @('1.24.', '1.25.', '1.26.')",
 		"win25", `C:\hostedtoolcache\windows`,
+		`result-` + verifyProbeNonce + `.txt`, "LastTaskResult -eq 0",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("the verifier does not say %q", want)
 		}
+	}
+
+	// THE MACHINE'S OWN END IS SET BEFORE THE CONSOLE IS OPENED, or a console that cannot be
+	// opened leaves a verifier nothing ends.
+	if at := strings.Index(script, "shutdown.exe /s"); at < 0 || at > strings.Index(script, "$port.Open()") {
+		t.Errorf("the verifier opens the console before it sets its own end:\n%s", script)
+	}
+
+	if strings.Contains(script, `result.txt`) {
+		t.Errorf("the verifier reads a result file an image could already hold:\n%s", script)
 	}
 
 	if m := regexp.MustCompile(`@[A-Z_]+@`).FindString(script); m != "" {
@@ -862,6 +970,7 @@ func TestTheWindowsVerifierHoldsAnImageToTheEntryPointsThePayloadCarries(t *test
 	for path, member := range map[string]string{
 		`C:\billet\billet-runner.ps1`:         "billet-ami/repo/scripts/windows/billet-runner.ps1",
 		`C:\billet\billet-runner-service.ps1`: "billet-ami/repo/scripts/windows/billet-runner-service.ps1",
+		`C:\billet\billet-job-started.ps1`:    "billet-ami/repo/scripts/windows/billet-job-started.ps1",
 	} {
 		want := "@('" + path + "', '" + sha256Hex(bodies[member]) + "')"
 		if !strings.Contains(script, want) {

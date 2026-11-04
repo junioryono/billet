@@ -416,7 +416,10 @@ func cmdAMIVerify(ctx context.Context, env cli.Env, args []string) error {
 	// THE CONSOLE LAGS AND THE VERIFIER DWELLS, so this is a boot plus several
 	// minutes rather than a boot. It is a deadline and not a wait: billet
 	// terminates the verifier the moment it has read a report.
-	timeout := fs.Duration("timeout", 20*time.Minute,
+	//
+	// PAST A WINDOWS IMAGE'S OWN WINDOW, since this cannot say which it is until it asks:
+	// a deadline this short would end the wait before windowsVerifyWindow ever could.
+	timeout := fs.Duration("timeout", 45*time.Minute,
 		"how long to wait for the image to report on itself")
 
 	// parseWithName, BECAUSE THE FLAGS COME AFTER THE ID IN EVERY EXAMPLE ANYBODY

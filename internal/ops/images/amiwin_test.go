@@ -2,8 +2,8 @@ package images
 
 import (
 	"bytes"
-	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -72,10 +72,40 @@ func TestAMIBuildRefusesWhatAWindowsImageCannotCarry(t *testing.T) {
 
 			args := append([]string{"build", "--base-image", "ami-0abc", "--payload-bucket", "bucket"}, tc.args...)
 
-			err := AMI(context.Background(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, args)
+			err := AMI(t.Context(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, args)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("AMI answered %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// A WINDOWS BUILD WITH NOTHING WRONG GETS PAST ALL OF THAT, to the config this withholds,
+// and one holding Linux's digest does not: what a refusal is worth depends on this.
+func TestAWindowsBuildReachesTheConfigOnItsOwnDigest(t *testing.T) {
+	t.Parallel()
+
+	missing := filepath.Join(t.TempDir(), "absent.yaml")
+	linux, ok := ec2.PinnedRunnerSHA256("x64")
+	if !ok {
+		t.Fatal("no x64 digest is pinned")
+	}
+
+	build := func(extra ...string) error {
+		var out bytes.Buffer
+
+		args := append([]string{"build", "--os", "windows", "--config", missing,
+			"--base-image", "ami-0abc", "--payload-bucket", "bucket"}, extra...)
+
+		return AMI(t.Context(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, args)
+	}
+
+	if err := build(); err == nil || !strings.Contains(err.Error(), "no ec2 configuration found in "+missing) {
+		t.Errorf("a Windows build did not reach the config this test withheld: %v", err)
+	}
+
+	if err := build("--runner-sha256", linux); err == nil ||
+		!strings.Contains(err.Error(), "actions-runner-win-x64-") {
+		t.Errorf("a Windows build with Linux's digest was answered %v", err)
 	}
 }

@@ -1,6 +1,15 @@
 # billet-job-started.ps1: GitHub's job-started hook on a Windows image, selected by this
-# extension. Timing is observation: a missing or malformed timestamp prints nothing and
-# never turns into a failed workflow.
+# extension. It says a job started, which the service script reads when the listener ends,
+# and how long that took. Both are observation: a mark that cannot be written, or a missing
+# or malformed timestamp, prints nothing and never turns into a failed workflow.
+try {
+	if (-not [string]::IsNullOrEmpty($env:BILLET_JOB_STARTED_MARK)) {
+		Set-Content -LiteralPath $env:BILLET_JOB_STARTED_MARK -Value 'started' -Encoding ascii
+	}
+} catch {
+	Write-Verbose 'no mark to leave'
+}
+
 try {
 	$launch = [long]$env:BILLET_LAUNCH_EPOCH_NS
 	$runner = [long]$env:BILLET_RUNNER_START_EPOCH_NS

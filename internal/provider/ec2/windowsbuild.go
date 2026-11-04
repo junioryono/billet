@@ -23,6 +23,9 @@ import (
 // differences-windows.tsv leaves in, with billet's EC2 layer after them, and a process
 // started the way a job's runner is finds the runner, git, PowerShell 7, the default
 // toolchains and every declared toolcache line.
+//
+// IT STAYS UNDER 4 UNTIL verify.go SAYS OTHERWISE: `contract >= 4` there means a Linux
+// image's components record, which a Windows image has none of.
 const WindowsAMIContract = 1
 
 // windowsRunnerPlatform is actions/runner's asset name for the one Windows build
@@ -51,6 +54,7 @@ const (
 	windowsDriver    = windowsBuildDir + `\repo\scripts\windows\build-ami.ps1`
 	windowsBuildTask = "billet-ami-build"
 	windowsImageMark = `C:\billet\billet-image`
+	windowsPageFile  = `C:\pagefile.sys`
 )
 
 // PinnedWindowsRunnerSHA256 is the digest billet pins for the pinned runner release's
@@ -180,6 +184,15 @@ func windowsPayloadArchive(spec BuildSpec) ([]byte, string, error) {
 // how its verifier reports, and costs a job instance's SAC, which nothing reaches through
 // an egress-only group anyway.
 //
+// NO PAGE FILE IS EVER WRITTEN ON THE MACHINE BEING IMAGED. A snapshot's blocks reach a new
+// volume as they are read, and Session Manager reads a page file left in the image: a job's
+// boot sat 5 min 6 s there, 369 s of uptime to user data against 91 s with none and, once a
+// warm reboot had read them, under a second. GitHub takes back an assignment left unstarted
+// at five minutes, so with that file no job ever started (c7i.xlarge, 2026-11-04). So paging
+// goes off in this reboot, the second boot removes the file, and build-ami.ps1 puts paging
+// back as the last thing before its verdict, leaving Windows to create a new file on each
+// job's first boot.
+//
 // A TASK, AND IT UNREGISTERS ITSELF BEFORE IT DOES ANYTHING: EC2Launch runs user data on
 // the first boot only, and an unplanned restart after this runs nothing, so billet's
 // deadline ends it rather than a build resumed from nowhere (ADR-022's rule).
@@ -212,6 +225,7 @@ func windowsBootstrapScript(spec BuildSpec) (string, error) {
 		"@BOOTSTRAP@", windowsBootstrap,
 		"@TASK@", windowsBuildTask,
 		"@MARK@", windowsImageMark,
+		"@PAGEFILE@", windowsPageFile,
 		"@BEGIN@", buildBegin,
 		"@END@", buildEnd,
 		"@VERDICT@", reportVerdictKey,
@@ -253,6 +267,11 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfil
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName '@TASK@' -Action $action -Trigger $trigger -Settings $settings -User 'NT AUTHORITY\SYSTEM' -RunLevel Highest -Force | Out-Null
+Set-CimInstance -InputObject (Get-CimInstance Win32_ComputerSystem) -Property @{ AutomaticManagedPagefile = $false }
+Get-CimInstance Win32_PageFileSetting | Remove-CimInstance
+$memory = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+Set-ItemProperty -LiteralPath $memory -Name PagingFiles -Value @('') -Type MultiString
+Remove-ItemProperty -LiteralPath $memory -Name ExistingPageFiles -ErrorAction SilentlyContinue
 bcdedit /ems '{current}' off | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'bcdedit could not switch EMS off' }
 bcdedit /bootems '{current}' off | Out-Null
@@ -264,6 +283,11 @@ Restart-Computer -Force
 // windowsBootstrapSecond is the second boot. A failure says so with this build's nonce,
 // in the verdict build-ami.ps1 would have printed, so a payload that did not arrive ends
 // the wait at once rather than at billet's deadline. It never shuts the machine down.
+//
+// THE DRIVER RETURNING SAYS WHAT HAPPENED ONLY WHILE IT STILL EXISTS. It removes itself
+// before it announces success and reports its own failures, and a shutdown may end it
+// before this script: reporting then would read a finished build as a failed one,
+// and billet takes a failure said after a success as the last word.
 const windowsBootstrapSecond = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Unregister-ScheduledTask -TaskName '@TASK@' -Confirm:$false
@@ -279,6 +303,7 @@ function Stop-WithFailure([string]$step) {
 }
 try {
 	if (Test-Path -LiteralPath '@MARK@') { throw 'this machine already records a finished billet build' }
+	if (Test-Path -LiteralPath '@PAGEFILE@') { Remove-Item -LiteralPath '@PAGEFILE@' -Force }
 	if ((Get-PSDrive C).Free -lt (@MIN_FREE_GIB@ * 1GB)) { throw 'the root has too little free space' }
 	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 	for ($i = 0; ; $i++) {
@@ -286,7 +311,7 @@ try {
 			Invoke-WebRequest -UseBasicParsing -Uri @URL@ -OutFile '@PAYLOAD@'
 			break
 		} catch {
-			if ($i -ge 5) { throw }
+			if ($i -ge 30) { throw }
 			Start-Sleep -Seconds 10
 		}
 	}
@@ -300,7 +325,8 @@ try {
 	Stop-WithFailure 'bootstrap'
 }
 & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '@DRIVER@'
-Stop-WithFailure 'start'
+if (Test-Path -LiteralPath '@DRIVER@') { Stop-WithFailure 'start' }
+Start-Sleep -Seconds 3600
 `
 
 // windowsBuildFailure is the error a Windows build's failure verdict becomes.

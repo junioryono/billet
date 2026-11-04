@@ -76,7 +76,8 @@ The builder checks the Actions runner tarball against the sha256 billet pins for
 An `ec2` tier can run Windows jobs on an AMI billet builds in your account from Amazon's license-included Windows Server 2025 image ([ADR-023](../reference/decisions/adr-023-windows-on-ec2.md)).
 
 ```bash
-BASE=$(aws ssm get-parameter --name /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base \
+BASE=$(aws ssm get-parameter --region us-west-2 \
+  --name /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base \
   --query Parameter.Value --output text)
 billet ami build --os windows --config billet.yaml --base-image "$BASE" --payload-bucket my-bucket \
   --region us-west-2 --subnet subnet-… --security-group sg-… --public-ip
@@ -99,7 +100,7 @@ The trust rules are the Linux instance's: untrusted work needs `untrusted_securi
 
 A Windows image carries what the floor in ADR-023 lists, not what GitHub's hosted `windows-2025` carries: no Visual Studio, no Docker, no Java or .NET SDK beyond what Windows ships, no Windows updates past the base image's month. `actions/setup-*` downloads what is missing. `differences-windows.tsv` lists every step of GitHub's template the build leaves out and why. billet's caches have no client in a Windows guest, so a Windows tier sets no `cache`, `intercept` or `cache_scope`.
 
-A first boot is the slow part: an instance takes minutes to come up where a Linux one takes under one, so count that against a tier's wait. Linux containers inside a Windows guest are out of scope.
+A first boot is the slow part: a job started about two minutes after its launch where a Linux one takes under one, so count that against a tier's wait. GitHub takes back an assignment left unstarted after five minutes, so every Windows launch asks EBS to read the image's snapshot at a provisioned 200 MiB/s. AWS charges that once per launch on the snapshot's full size, about $0.09 on a 36 GiB image, on top of the instance and its volume. Linux containers inside a Windows guest are out of scope.
 
 ## Spot
 
