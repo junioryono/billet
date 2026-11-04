@@ -68,6 +68,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/usage"
 )
@@ -316,6 +317,9 @@ type Provider struct {
 	// and whether there is a record. A func because the record changes at every
 	// registration, after this provider is built.
 	macOSLimit func() (int, bool, error)
+	// installer installs the records. Its zero value is the real one, and a test fails a
+	// step of it.
+	installer durablefile.Installer
 	// now is the clock a deadline and a yield request are read against.
 	now func() time.Time
 	// registry asks what a tag names now. A seam for tests, which reach no registry.
@@ -713,10 +717,14 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	)
 
 	if ref, ok := config.TartVerifiedImage(spec.Image); ok {
-		rec, err := p.resolveVerified(ctx, config.TartImageKey(ref))
+		rec, held, err := p.resolveVerified(ctx, config.TartImageKey(ref))
 		if err != nil {
 			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 		}
+
+		// HELD THROUGH THE CLONE, so an unpromote that comes after this answer waits for
+		// the clone rather than removing what this launch resolved.
+		defer held.release()
 
 		image, verified = rec.Base, &rec
 	} else {
@@ -731,7 +739,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	}
 
 	if verified != nil {
-		if err := p.cloneBase(ctx, *verified, staging); err != nil {
+		if err := p.cloneHeldBase(ctx, *verified, staging); err != nil {
 			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 		}
 	} else if _, err := p.run(ctx, "clone", image, staging); err != nil {

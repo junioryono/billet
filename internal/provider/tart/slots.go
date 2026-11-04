@@ -127,15 +127,17 @@ func (p *Provider) claimGuest(ctx context.Context, name, guestOS string, isProbe
 }
 
 // macOSLimitFor is the node's limit. With no record, a probe refuses, and a launch,
-// which the control plane sends only to a registered node, uses Apple's default.
+// which the control plane sends only to a registered node, uses Apple's default. A record
+// that cannot be read refuses both: it is not the absence of one, and the number a start
+// passes on becomes the store's count.
 func (p *Provider) macOSLimitFor(isProbe bool) (int, error) {
 	if p.macOSLimit != nil {
 		limit, known, err := p.macOSLimit()
-		if err != nil && isProbe {
+		if err != nil {
 			return 0, fmt.Errorf("read this node's macOS limit: %w", err)
 		}
 
-		if err == nil && known {
+		if known {
 			return limit, nil
 		}
 	}
@@ -370,6 +372,23 @@ func (p *Provider) settleSlotCount(limit int) (int, error) {
 		return 0, fmt.Errorf("record this deployment's macOS limit: %w", err)
 	}
 
+	// BEFORE ANYTHING ELSE, whichever deployment's number the store recorded: the
+	// deployment that agrees with the count would otherwise run up to it while the smaller
+	// one refuses, past what that one allows.
+	others, err := p.deploymentLimits()
+	if err != nil {
+		return 0, err
+	}
+
+	for owner, other := range others {
+		if other != limit {
+			return 0, fmt.Errorf("this deployment's macOS limit is %d and deployment %s, sharing this "+
+				"store, names %d; deployments on one store must name one limit, so that together they "+
+				"run no more than it allows. If that deployment no longer uses this store, remove %s",
+				limit, owner, other, p.billetPath(limitPrefix+owner))
+		}
+	}
+
 	countPath := p.billetPath(slotsCount)
 
 	raw, err := regularfile.ReadFile(countPath, markerLimit, regularfile.Options{NoFollow: true})
@@ -392,19 +411,6 @@ func (p *Provider) settleSlotCount(limit int) (int, error) {
 
 	if recorded == limit {
 		return limit, nil
-	}
-
-	others, err := p.deploymentLimits()
-	if err != nil {
-		return 0, err
-	}
-
-	for owner, other := range others {
-		if other != limit {
-			return 0, fmt.Errorf("this store's macOS slots number %d, this deployment's limit is %d "+
-				"and deployment %s names %d; deployments sharing a store must name one limit, so "+
-				"that together they run no more than it allows", recorded, limit, owner, other)
-		}
 	}
 
 	busy, err := p.anySlotHeld(recorded)
@@ -578,20 +584,15 @@ func (p *Provider) writeSlotIdentity(f *os.File, name string) error {
 
 // tartGuestCommand matches the processes every VM tart runs has for its whole life: a
 // `tart run`, and a `tart create --from-ipsw`, which installs macOS in a VM it runs
-// itself. Anchored at the start of the command, because the same words in another
-// program's arguments are not a VM.
+// itself. `ps` shows the resolved path of tart.app, which may hold a space. Bare words in
+// another program's arguments are not a VM.
 var (
-	tartRunCommand    = regexp.MustCompile(`^(\S*/)?tart\s+run(\s|$)`)
-	tartCreateCommand = regexp.MustCompile(`^(\S*/)?tart\s+create\s(.*\s)?--from-ipsw(\s|=|$)`)
+	tartRunCommand    = regexp.MustCompile(`^(.*/)?tart\s+run(\s|$)`)
+	tartCreateCommand = regexp.MustCompile(`^(.*/)?tart\s+create\s(.*\s)?--from-ipsw(\s|=|$)`)
 )
 
-// isTartGuestCommand reads one `ps` command column, also matching the binary this
-// provider was told to run, whose path may hold a space.
+// isTartGuestCommand reads one `ps` command column.
 func (p *Provider) isTartGuestCommand(command string) bool {
-	if rest, ok := strings.CutPrefix(command, p.tart+" "); ok {
-		command = "tart " + rest
-	}
-
 	return tartRunCommand.MatchString(command) || tartCreateCommand.MatchString(command)
 }
 
@@ -677,9 +678,16 @@ func (p *Provider) uncountedGuests(ctx context.Context, slots []string) ([]strin
 
 // guestNameIn reads the VM's name out of a tart command, for a message.
 func guestNameIn(command string) string {
-	fields := strings.Fields(command)
-	if len(fields) >= 3 {
-		return fields[2]
+	if _, rest, ok := strings.Cut(command, "tart run "); ok {
+		if fields := strings.Fields(rest); len(fields) > 0 {
+			return fields[0]
+		}
+	}
+
+	if _, rest, ok := strings.Cut(command, "tart create "); ok {
+		if fields := strings.Fields(rest); len(fields) > 0 {
+			return fields[0]
+		}
 	}
 
 	return "unnamed"
@@ -693,6 +701,10 @@ type SlotReport struct {
 	Held int
 	// Limits are the limits each deployment present on the store names.
 	Limits map[string]int
+	// Limit is this node's own, as its control plane said it. LimitKnown false is no
+	// record, so a launch uses Apple's default and a probe refuses.
+	Limit      int
+	LimitKnown bool
 	// Uncounted are the guests billet's slots and tokens do not account for.
 	Uncounted []string
 }
@@ -722,6 +734,12 @@ func (p *Provider) Slots(ctx context.Context) (SlotReport, error) {
 
 	if report.Limits, err = p.deploymentLimits(); err != nil {
 		return report, err
+	}
+
+	if p.macOSLimit != nil {
+		if report.Limit, report.LimitKnown, err = p.macOSLimit(); err != nil {
+			return report, fmt.Errorf("read this node's macOS limit: %w", err)
+		}
 	}
 
 	census, err := p.readCensus(ctx, report.Recorded)

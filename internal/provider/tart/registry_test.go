@@ -133,6 +133,23 @@ func TestARegistryThatWillNotAnswerIsAnError(t *testing.T) {
 	}
 }
 
+// A REDIRECT THAT LEAVES TLS IS REFUSED: Go keeps a bearer across one to the same host.
+func TestARegistryRedirectOffTLSIsRefused(t *testing.T) {
+	t.Parallel()
+
+	srv, host := registryServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://example.invalid/manifest", http.StatusFound)
+	})
+
+	client := registryClient()
+	client.Transport = srv.Client().Transport
+
+	_, err := registryDigest(context.Background(), client, host+"/a/b:1")
+	if err == nil || !strings.Contains(err.Error(), "not TLS") {
+		t.Fatalf("registryDigest = %v", err)
+	}
+}
+
 func TestARemoteReferenceSplitsAtItsLastColon(t *testing.T) {
 	t.Parallel()
 

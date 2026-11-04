@@ -88,13 +88,19 @@ type fakeReporter struct {
 	slots  tart.SlotReport
 	free   uint64
 	size   int64
+	// refreshed records that GitHub was asked.
+	refreshed *bool
 }
 
 func (f fakeReporter) VerifiedImages(context.Context) ([]tart.VerifiedImage, error) {
 	return f.images, nil
 }
 
-func (fakeReporter) RefreshDeadlines(context.Context, tart.RunnerWindow) ([]string, error) {
+func (f fakeReporter) RefreshDeadlines(context.Context, tart.RunnerWindow) ([]string, error) {
+	if f.refreshed != nil {
+		*f.refreshed = true
+	}
+
 	return nil, nil
 }
 func (f fakeReporter) Slots(context.Context) (tart.SlotReport, error) { return f.slots, nil }
@@ -207,6 +213,75 @@ func TestACheckNamesASlotCountThatDiffersAndGuestsItCannotAccountFor(t *testing.
 	if strings.Contains(out.String(), "deployment def") {
 		t.Errorf("named a deployment that agrees: %s", out.String())
 	}
+
+	if !strings.Contains(out.String(), "no record of its macOS limit") {
+		t.Errorf("did not say a launch is on Apple's default: %s", out.String())
+	}
+}
+
+// A MAINTENANCE PROBE RUNS OFFLINE DURING AN UPGRADE, so it asks GitHub nothing and rewrites no
+// record; an ordinary check asks again.
+func TestAMaintenanceCheckAsksGitHubNothing(t *testing.T) {
+	prev := openTartReport
+
+	t.Cleanup(func() { openTartReport = prev })
+
+	for _, tc := range []struct {
+		skip bool
+		want bool
+	}{{skip: true, want: false}, {skip: false, want: true}} {
+		var asked bool
+
+		openTartReport = func(*config.Config) (tartReporter, error) {
+			return fakeReporter{refreshed: &asked}, nil
+		}
+
+		cfg := &config.Config{Node: &config.NodeConfig{
+			Name: "mac-1", Provider: config.ProviderTart, StateDir: t.TempDir(),
+		}}
+
+		deployment := filepath.Join(cfg.Node.StateDir, "deployment-id")
+		if err := os.WriteFile(deployment, []byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var out bytes.Buffer
+
+		reportTartVerified(t.Context(), cli.Env{Stdout: &out}, cfg, nil, tc.skip)
+
+		if asked != tc.want {
+			t.Errorf("skip %v: asked GitHub %v, want %v; said %s", tc.skip, asked, tc.want, out.String())
+		}
+	}
+}
+
+func TestACheckIsQuietAboutALimitItHasARecordOf(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+
+	reportTartSlots(t.Context(), cli.Env{Stdout: &out}, fakeReporter{slots: tart.SlotReport{Limit: 2, LimitKnown: true}})
+
+	if strings.Contains(out.String(), "no record") {
+		t.Errorf("said %s", out.String())
+	}
+}
+
+func TestADryRunOfTheNodeAloneDoesNotSayThereIsNoControlPlane(t *testing.T) {
+	asLinux(t)
+
+	cfgPath, _ := downConfig(t, true)
+	stageDown(t, &fakeConverger{}, deploy.NodeUnitName)
+
+	out := capture(t, func() {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath, nodeOnly: true, dryRun: true}); err != nil {
+			t.Errorf("refused: %v", err)
+		}
+	})
+
+	if strings.Contains(out, "runs no control plane") || !strings.Contains(out, "seal nothing (--node)") {
+		t.Errorf("the plan says:\n%s", out)
+	}
 }
 
 // --node STOPS THE NODE ALONE: no seal, the server left running, and the deployment
@@ -236,6 +311,11 @@ func TestDownOfTheNodeAloneLeavesTheServerAndAdmission(t *testing.T) {
 
 	if !strings.Contains(out, "SKIPPED by --node") {
 		t.Errorf("the report does not say what it left alone:\n%s", out)
+	}
+
+	// NOTHING WAS PROVED ABOUT THE LEDGER, and the report does not say it was.
+	if strings.Contains(out, "records nothing outstanding") || !strings.Contains(out, "no ledger was read") {
+		t.Errorf("the report claims more than it established:\n%s", out)
 	}
 }
 

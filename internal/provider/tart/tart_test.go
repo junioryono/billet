@@ -318,7 +318,8 @@ run)
   if [ -e "` + s.runHolds + `" ]; then
     # exec: the sleep is the process holding the inherited descriptors, and this
     # shell's own copies go with it.
-    ( exec sleep 30 ) >/dev/null 2>&1 &
+    # Long enough that nothing here passes because it ran out; killHeld ends it.
+    ( exec sleep 300 ) >/dev/null 2>&1 &
     printf '%s\n' "$!" > "$vms/$name/.held"
   fi
   ;;

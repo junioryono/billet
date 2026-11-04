@@ -554,6 +554,29 @@ func TartTierImages(cfg *config.Config) ([]string, error) {
 		return nil, nil
 	}
 
+	tiers, err := tartLocalTiers(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	images := make([]string, 0, len(tiers))
+	seen := map[string]bool{}
+
+	for _, t := range tiers {
+		image := t.ImageFor(config.ProviderTart)
+		if image == "" || seen[image] {
+			continue
+		}
+
+		images = append(images, image)
+		seen[image] = true
+	}
+
+	return images, nil
+}
+
+// tartLocalTiers are the tiers this node would launch on tart.
+func tartLocalTiers(cfg *config.Config) ([]*config.Tier, error) {
 	// IDENTITY FIRST, exactly as firecrackerTierImages resolves it. A TLS node
 	// is ENCOURAGED to omit node.name — the certificate carries it, and
 	// nodeBundle fills it in — so comparing tier pins against an unresolved
@@ -564,28 +587,21 @@ func TartTierImages(cfg *config.Config) ([]string, error) {
 		return nil, fmt.Errorf("select tart tier images: resolve node identity: %w", err)
 	}
 
-	images := make([]string, 0, len(cfg.Tiers))
-	seen := map[string]bool{}
+	var tiers []*config.Tier
 
 	for i := range cfg.Tiers {
-		if cfg.Tiers[i].Node != "" && cfg.Tiers[i].Node != cfg.Node.Name {
-			continue
-		}
+		t := &cfg.Tiers[i]
 
-		if cfg.Tiers[i].Site != "" && cfg.Tiers[i].Site != cfg.Node.Site {
-			continue
+		switch {
+		case t.Node != "" && t.Node != cfg.Node.Name:
+		case t.Site != "" && t.Site != cfg.Node.Site:
+		case !t.AcceptsProvider(config.ProviderTart):
+		default:
+			tiers = append(tiers, t)
 		}
-
-		image := cfg.Tiers[i].ImageFor(config.ProviderTart)
-		if !cfg.Tiers[i].AcceptsProvider(config.ProviderTart) || image == "" || seen[image] {
-			continue
-		}
-
-		images = append(images, image)
-		seen[image] = true
 	}
 
-	return images, nil
+	return tiers, nil
 }
 
 // pullTartImages fetches the images this node's tart tiers name.

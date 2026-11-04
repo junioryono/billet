@@ -41,7 +41,7 @@ func TestTheMacOSLimitIsWiredAtBothEnds(t *testing.T) {
 	t.Parallel()
 
 	for file, want := range map[string]string{
-		"controlplane.go": "nodeplane.WithMacOSLimits(cp.cfg.MacOSLimitFor)",
+		"controlplane.go": "nodeplane.WithMacOSLimits(cp.cfg.MacOSLimitForNode)",
 		"node.go":         "macoslimit.Read(stateDir, deployment)",
 	} {
 		raw, err := os.ReadFile(file)

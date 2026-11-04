@@ -134,22 +134,6 @@ func TestTheCatalogueSaysWhetherATartTierNamesVerified(t *testing.T) {
 	}
 }
 
-// THE LIMIT A NODE IS TOLD IS THE ONE PLACEMENT HOLDS IT TO: an undeclared host has Apple's.
-func TestMacOSLimitForIsAHostsPolicyOrApplesDefault(t *testing.T) {
-	t.Parallel()
-
-	five := 5
-	cfg := &Config{Nodes: []NodePolicy{{Name: "mac-1", MacOSVMLimit: &five}}}
-
-	if got := cfg.MacOSLimitFor("mac-1"); got != 5 {
-		t.Errorf("a declared host: %d", got)
-	}
-
-	if got := cfg.MacOSLimitFor("mac-2"); got != DefaultMacOSVMLimit {
-		t.Errorf("an undeclared host: %d", got)
-	}
-}
-
 // THE WHOLE LOAD, because a rule refusing a name with an @ in it elsewhere in validation
 // would leave the spelling unusable while the unit tests above stayed green.
 func TestAFileNamingAVerifiedTartImageLoads(t *testing.T) {

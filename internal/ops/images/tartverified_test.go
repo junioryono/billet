@@ -91,6 +91,7 @@ func TestAVerificationTakesItsCommandAndTrustFromTheTier(t *testing.T) {
 	custom.Command = []string{"./custom/run.sh"}
 
 	untrusted := tartTier("u", image, config.WorkloadUntrusted)
+	untrusted.Command = custom.Command
 
 	for _, tc := range []struct {
 		name      string
@@ -105,9 +106,20 @@ func TestAVerificationTakesItsCommandAndTrustFromTheTier(t *testing.T) {
 			command: "./actions-runner/run.sh", untrusted: true},
 		{name: "no tier names it", tiers: []config.Tier{tartTier("x", "ghcr.io/other/c:1", config.WorkloadUntrusted)},
 			command: "./actions-runner/run.sh"},
+		{name: "another node's tier says nothing about this one", tiers: []config.Tier{func() config.Tier {
+			foreign := tartTier("f", image, config.WorkloadUntrusted)
+			foreign.Node = "mac-2"
+			foreign.Command = []string{"./foreign/run.sh"}
+
+			return foreign
+		}()}, command: "./actions-runner/run.sh"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := tartVerifyOptions(tartConfig(tc.tiers...), image)
+			opts, err := tartVerifyOptions(tartConfig(tc.tiers...), image)
+			if err != nil {
+				t.Fatal(err)
+			}
+
 			if !slices.Equal(opts.Command, []string{tc.command}) || opts.GuestUntrusted != tc.untrusted {
 				t.Fatalf("options %+v, want command %q, untrusted %v", opts, tc.command, tc.untrusted)
 			}
@@ -116,6 +128,43 @@ func TestAVerificationTakesItsCommandAndTrustFromTheTier(t *testing.T) {
 				t.Fatal("nothing asks GitHub about the runner's window")
 			}
 		})
+	}
+}
+
+// A PROBE ASKS WHERE ONE RUNNER IS, so two commands for one image cannot both be proved.
+func TestTiersNamingOneImageWithDifferentCommandsRefuse(t *testing.T) {
+	const image = "ghcr.io/a/b:1@verified"
+
+	one := tartTier("one", image, config.WorkloadTrusted)
+	one.Command = []string{"./one/run.sh"}
+
+	two := tartTier("two", image, config.WorkloadTrusted)
+	two.Command = []string{"./two/run.sh"}
+
+	_, err := tartVerifyOptions(tartConfig(one, two), image)
+	if err == nil || !strings.Contains(err.Error(), "different commands") {
+		t.Fatalf("answered %v", err)
+	}
+}
+
+// AN UNKNOWN IMAGE SET IS NOT AN EMPTY ONE: a refresh that cannot tell which images are this
+// node's says so rather than answer nothing to do.
+func TestARefreshThatCannotTellItsImagesFails(t *testing.T) {
+	stageVerifier(t, &fakeVerifier{})
+
+	cfg := tartConfig(tartTier("a", "ghcr.io/a/b:1@verified", config.WorkloadTrusted))
+	cfg.Node.TLS = &config.NodeTLS{
+		CAPath: "/nonexistent/ca", CertPath: "/nonexistent/cert", KeyPath: "/nonexistent/key",
+	}
+
+	env, _ := capturedEnv()
+
+	if err := verifyDueTartImages(t.Context(), env, cfg, false); err == nil {
+		t.Fatal("verifyDueTartImages answered nothing to do")
+	}
+
+	if err := refreshTartVerified(t.Context(), env, cfg); err == nil {
+		t.Fatal("refreshTartVerified answered nothing to do")
 	}
 }
 
@@ -298,7 +347,7 @@ func TestTheRunnerWindowAnswersThreeWays(t *testing.T) {
 	partial.HistoryComplete = false
 
 	expiredPartial := expired
-	expiredPartial.InstalledKnown = false
+	expiredPartial.InstalledKnown, expiredPartial.HistoryComplete = false, false
 
 	noWindow := whole
 	noWindow.Latest = "2.301.0"

@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/regularfile"
 )
 
@@ -34,10 +33,11 @@ const (
 )
 
 // baseFile is the identity of one file of a base. A change time no user can set is
-// what makes it notice a file rewritten in place.
+// what makes it notice a file rewritten in place. NO DEVICE NUMBER: macOS numbers a
+// volume by when it mounts, so one that moved at a reboot would mark every base invalid,
+// and with them every tier, for a file nothing touched.
 type baseFile struct {
 	Name      string `json:"name"`
-	Dev       uint64 `json:"dev"`
 	Ino       uint64 `json:"ino"`
 	Size      int64  `json:"size"`
 	CtimeNsec int64  `json:"ctime_nsec"`
@@ -265,7 +265,7 @@ func (p *Provider) saveVerifiedState(st *verifiedState) error {
 
 		body = append(body, '\n')
 
-		if _, err := (durablefile.Installer{}).Install(p.stateDir, doc.name, 0o600, func(w io.Writer) error {
+		if _, err := p.installer.Install(p.stateDir, doc.name, 0o600, func(w io.Writer) error {
 			_, err := w.Write(body)
 
 			return err

@@ -20,6 +20,9 @@ import (
 // chunks at most; a longer answer is not one.
 const manifestLimit = 4 << 20
 
+// maxRegistryRedirects bounds the redirects one exchange follows.
+const maxRegistryRedirects = 5
+
 // tokenLimit bounds a token answer.
 const tokenLimit = 1 << 20
 
@@ -33,6 +36,27 @@ const ociManifest = "application/vnd.oci.image.manifest.v1+json"
 // errRegistryNeedsCredentials is a registry that refuses an anonymous reader, which is
 // a could-not-tell about the tag rather than an answer.
 var errRegistryNeedsCredentials = errors.New("the registry does not answer anonymously")
+
+// registryClient follows redirects over TLS alone: Go keeps a bearer across a redirect to
+// the same host, a downgrade included. Which hosts a registry sends a reader to is its own
+// to say, a token service on another host being the ordinary case, and the operator named
+// the registry.
+func registryClient() *http.Client {
+	return &http.Client{
+		Timeout: registryTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("the registry redirected to %s, which is not TLS", req.URL.Host)
+			}
+
+			if len(via) >= maxRegistryRedirects {
+				return errors.New("the registry redirected too many times")
+			}
+
+			return nil
+		},
+	}
+}
 
 // remoteRef is a remote reference split the way the distribution API addresses it.
 type remoteRef struct {

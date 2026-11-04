@@ -693,7 +693,7 @@ func needsFirecrackerRootResize(cfg *config.Config) bool {
 // so a failure describes a machine that is meant to run jobs and cannot, and
 // reporting it while exiting zero would make `billet check` say a host is fine
 // when nothing on it can launch.
-func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
+func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config, skipNetwork bool) error {
 	var tartCfg config.TartConfig
 	if cfg.Node.Tart != nil {
 		tartCfg = *cfg.Node.Tart
@@ -825,13 +825,13 @@ func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 		fmt.Fprintf(env.Stdout, "         fetch them with `billet images pull` (each is tens of GB)\n")
 	}
 
-	reportTartVerified(ctx, env, cfg, tierImages)
+	reportTartVerified(ctx, env, cfg, tierImages, skipNetwork)
 
 	// SAID, BECAUSE THE CHECK IS STILL NARROWER THAN IT LOOKS: a pulled image is
 	// not proof that its guest carries the tart guest agent the registration
 	// delivery needs, nor that a macOS guest slot is free under Apple's two-guest
 	// licence. Both surface at launch, not here.
-	fmt.Fprintf(env.Stdout, "         (read only — an image nobody verified also needs the tart guest "+
+	fmt.Fprintf(env.Stdout, "         (an image nobody verified also needs the tart guest "+
 		"agent inside it, and every macOS start a free guest slot under Apple's two-VM licence)\n")
 
 	return nil

@@ -506,7 +506,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		}
 
 		if cfg.Node.Provider == config.ProviderTart {
-			if err := checkTartHost(ctx, env, cfg); err != nil {
+			if err := checkTartHost(ctx, env, cfg, skipNetworkProbes); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
 		}

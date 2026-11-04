@@ -457,7 +457,7 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 		nodeplane.WithImageAcceptance(cp.cfg.Images.Accepted()),
 		// The macOS limit placement holds each node to, told to that node so a
 		// verification beside it counts its probe against the same number.
-		nodeplane.WithMacOSLimits(cp.cfg.MacOSLimitFor),
+		nodeplane.WithMacOSLimits(cp.cfg.MacOSLimitForNode),
 		// The durable half of a compute barrier. `billet drain` and
 		// `billet local down` write a request into the ledger; this is what
 		// observes it, because a sealed idle deployment dispatches nothing at all

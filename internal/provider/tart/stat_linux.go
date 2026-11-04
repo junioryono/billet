@@ -6,10 +6,7 @@ import "golang.org/x/sys/unix"
 
 // identityFrom is what makes a file the same file across two reads of it.
 func identityFrom(name string, st *unix.Stat_t) baseFile {
-	return baseFile{
-		Name: name, Dev: st.Dev, Ino: st.Ino, Size: st.Size,
-		CtimeNsec: unix.TimespecToNsec(st.Ctim),
-	}
+	return baseFile{Name: name, Ino: st.Ino, Size: st.Size, CtimeNsec: unix.TimespecToNsec(st.Ctim)}
 }
 
 // deviceOf is the filesystem a stat names.

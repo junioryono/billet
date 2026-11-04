@@ -88,8 +88,18 @@ type tartReporter interface {
 // reportTartVerified says what this node holds of each verified image. A report: a tier
 // with no usable record refuses its own launches naming the command, and a host that
 // cannot be read is said to be unread, never healthy.
-func reportTartVerified(ctx context.Context, env cli.Env, cfg *config.Config, tierImages []string) {
-	if _, known, err := app.PeekNodeDeploymentID(cfg); err != nil || !known {
+//
+// A MAINTENANCE PROBE ASKS GITHUB NOTHING AND WRITES NOTHING: it runs offline during an
+// upgrade, and it reports the dates already stored.
+func reportTartVerified(ctx context.Context, env cli.Env, cfg *config.Config, tierImages []string, skipNetwork bool) {
+	_, known, err := app.PeekNodeDeploymentID(cfg)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "verified UNKNOWN: could not read this node's deployment identity: %v\n", err)
+
+		return
+	}
+
+	if !known {
 		fmt.Fprintf(env.Stdout, "verified not read: this node has no deployment identity yet\n")
 
 		return
@@ -102,9 +112,12 @@ func reportTartVerified(ctx context.Context, env cli.Env, cfg *config.Config, ti
 		return
 	}
 
-	unknownRunners, err := p.RefreshDeadlines(ctx, opsimages.TartRunnerWindow(time.Now))
-	if err != nil {
-		fmt.Fprintf(env.Stdout, "verified UNKNOWN: %v\n", err)
+	var unknownRunners []string
+
+	if !skipNetwork {
+		if unknownRunners, err = p.RefreshDeadlines(ctx, opsimages.TartRunnerWindow(time.Now)); err != nil {
+			fmt.Fprintf(env.Stdout, "verified UNKNOWN: %v\n", err)
+		}
 	}
 
 	images, err := p.VerifiedImages(ctx)
@@ -194,10 +207,17 @@ func reportTartSlots(ctx context.Context, env cli.Env, p tartReporter) {
 		fmt.Fprintf(env.Stdout, "slots    %d of %d macOS guest slots held\n", report.Held, report.Recorded)
 	}
 
+	if !report.LimitKnown {
+		fmt.Fprintf(env.Stdout, "slots    this node has no record of its macOS limit, which its control plane "+
+			"sends at registration: a launch uses Apple's default of %d and a macOS verification refuses\n",
+			config.DefaultMacOSVMLimit)
+	}
+
 	for owner, limit := range report.Limits {
 		if report.Recorded > 0 && limit != report.Recorded {
 			fmt.Fprintf(env.Stdout, "slots    deployment %s names a limit of %d and this store has %d slots, so "+
-				"it refuses every macOS guest until they agree\n", owner, limit, report.Recorded)
+				"every deployment here refuses a macOS guest until they agree; if it no longer uses this "+
+				"store, remove its macos-limit file under .billet\n", owner, limit, report.Recorded)
 		}
 	}
 

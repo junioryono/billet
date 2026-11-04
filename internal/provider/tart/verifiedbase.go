@@ -57,6 +57,11 @@ func (p *Provider) probeName(key string) string {
 	return probePrefix + p.owner + "-" + hashName(key)
 }
 
+// privateStore is where one image's verification pulls, this deployment's alone.
+func (p *Provider) privateStore(key string) string {
+	return filepath.Join(p.stateDir, privateStores, p.owner+"-"+hashName(key))
+}
+
 func (p *Provider) baseLockPath(base string) string {
 	return p.billetPath("base-" + base + ".lock")
 }
@@ -100,6 +105,10 @@ func (p *Provider) runIn(ctx context.Context, home string, progress io.Writer, a
 	return stdout.String(), nil
 }
 
+// errNotRegular is a VM's file replaced by something else, which is an answer about the
+// file, unlike a read that failed.
+var errNotRegular = errors.New("not a regular file")
+
 // fileIdentities reads the identity of each of a VM's three files, refusing a symlink,
 // since tart would follow one and a record would name what it points at.
 func fileIdentities(dir string) ([]baseFile, error) {
@@ -114,7 +123,7 @@ func fileIdentities(dir string) ([]baseFile, error) {
 		}
 
 		if st.Mode&unix.S_IFMT != unix.S_IFREG {
-			return nil, fmt.Errorf("%s is not a regular file", name)
+			return nil, fmt.Errorf("%s is %w", name, errNotRegular)
 		}
 
 		files = append(files, identityFrom(name, &st))
@@ -423,7 +432,7 @@ func (p *Provider) makeBase(
 // another deployment's unverified tier uses, since tart re-points the cache entry it was
 // asked for at whatever the registry returns.
 func (p *Provider) pullIntoStaging(ctx context.Context, key, digest, staging string, progress io.Writer) error {
-	store := filepath.Join(p.stateDir, privateStores, hashName(key))
+	store := p.privateStore(key)
 
 	if err := os.RemoveAll(store); err != nil {
 		return fmt.Errorf("remove an earlier private store: %w", err)
@@ -489,6 +498,11 @@ func (p *Provider) cloneBase(ctx context.Context, rec VerifiedRecord, target str
 
 	defer held.release()
 
+	return p.cloneHeldBase(ctx, rec, target)
+}
+
+// cloneHeldBase is cloneBase for a caller already holding the base's shared lock.
+func (p *Provider) cloneHeldBase(ctx context.Context, rec VerifiedRecord, target string) error {
 	if _, err := os.Lstat(p.vmDir(rec.Base)); errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("base %s of %s is gone from tart's store; verify the image again with "+
 			"`billet images verify %s`", rec.Base, rec.Image, rec.Image)
@@ -515,7 +529,7 @@ func (p *Provider) cloneBase(ctx context.Context, rec VerifiedRecord, target str
 // difference. A failed read is not a difference: it could not tell, and marks nothing.
 func (p *Provider) compareBase(ctx context.Context, rec VerifiedRecord) error {
 	now, err := fileIdentities(p.vmDir(rec.Base))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, errNotRegular) {
 		return fmt.Errorf("read base %s: %w", rec.Base, err)
 	}
 

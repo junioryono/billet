@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +31,9 @@ const probeTeardownWindow = 3 * time.Minute
 
 // yieldPoll is how often a probe looks for a job's request.
 const yieldPoll = 3 * time.Second
+
+// lockSettle bounds the wait for a lock nothing should hold.
+const lockSettle = 2 * time.Second
 
 // answerLimit bounds what billet reads of a guest's answer. A version is short.
 const answerLimit = 4096
@@ -111,13 +113,10 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 
 	defer func() { _ = verification.Close() }()
 
-	free, err := tryFlock(verification, syscall.LOCK_EX)
-	if err != nil {
-		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
-	}
-
-	if !free {
-		return nil, fmt.Errorf("tart: verify %s: another verification of this image is running", key)
+	// A SHORT WAIT, not a try: a descriptor a fork still holds until its exec keeps a lock
+	// that was just released for an instant, and that is not another verification.
+	if err := waitFlock(ctx, verification, syscall.LOCK_EX, lockSettle); err != nil {
+		return nil, fmt.Errorf("tart: verify %s: another verification of this image is running: %w", key, err)
 	}
 
 	if err := p.cleanVerification(ctx, key); err != nil {
@@ -132,10 +131,14 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 		}
 	}
 
-	var generation, epoch int64
+	var (
+		generation, epoch int64
+		wasWithdrawn      bool
+	)
 
 	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
-		if opts.Digest == "" && st.isWithdrawn(key, digest) {
+		wasWithdrawn = st.isWithdrawn(key, digest)
+		if opts.Digest == "" && wasWithdrawn {
 			return false, fmt.Errorf("%s was unpromoted and its tag still names it; to take it back, "+
 				"run `billet images verify %s --digest %s`", digest, key, digest)
 		}
@@ -158,10 +161,7 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 
 	defer func() {
 		if !committed {
-			if derr := p.deleteBase(context.WithoutCancel(ctx), rec.Base); derr != nil {
-				p.log.Error("could not remove a base no record names; the next verification of "+
-					"its image removes it", "vm", rec.Base, "error", derr)
-			}
+			p.discardUnrecordedBase(context.WithoutCancel(ctx), key, rec.Base)
 		}
 	}()
 
@@ -197,19 +197,31 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 				"probe already in flight never undoes that")
 		}
 
-		switch {
-		case opts.Digest != "":
+		// ONLY WHAT WAS WITHDRAWN BEFORE THIS BEGAN IS AN OPERATOR'S TO TAKE BACK. One that
+		// appeared since is an unpromote this probe must not undo, even one that crashed
+		// before it moved the epoch, since the withdrawal is installed first.
+		withdrawn := st.isWithdrawn(key, digest)
+		if withdrawn && (opts.Digest == "" || !wasWithdrawn) {
+			return false, fmt.Errorf("%s was unpromoted while it was being verified", digest)
+		}
+
+		if withdrawn {
 			st.withdrawn.Withdrawn[key] = slices.DeleteFunc(st.withdrawn.Withdrawn[key],
-				func(d string) bool { return d == opts.Digest })
+				func(d string) bool { return d == digest })
 			if len(st.withdrawn.Withdrawn[key]) == 0 {
 				delete(st.withdrawn.Withdrawn, key)
 			}
-		case st.isWithdrawn(key, digest):
-			return false, fmt.Errorf("%s was unpromoted while it was being verified", digest)
 		}
 
 		if !answer.Deadline.IsZero() {
 			st.deadlines.Deadlines[runner] = answer.Deadline
+		}
+
+		// A DATE ALREADY HELD ANSWERS WHEN GITHUB DOES NOT: a launch would refuse this
+		// record at once, so it is refused here, where the operator is looking.
+		if deadline, ok := st.deadlines.Deadlines[runner]; ok && !p.now().Before(deadline) {
+			return false, fmt.Errorf("its runner %s went past GitHub's window on %s, so GitHub would "+
+				"send it no job", runner, deadline.Format(time.DateOnly))
 		}
 
 		img.Yields = 0
@@ -227,6 +239,36 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 	p.deleteBases(ctx, dropped)
 
 	return rec, nil
+}
+
+// discardUnrecordedBase removes a failed verification's base, once the records positively
+// do not name it. A commit that failed can still have installed them, since a durable write
+// reports a directory sync that failed after its rename, and deleting then would leave a
+// launch resolving a base that is gone. Kept when that cannot be told, for the next
+// verification, which reads them again.
+func (p *Provider) discardUnrecordedBase(ctx context.Context, key, base string) {
+	named := false
+
+	err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
+		named = slices.ContainsFunc(st.recordsOf(key), func(r VerifiedRecord) bool { return r.Base == base })
+
+		return false, nil
+	})
+	if err != nil {
+		p.log.Error("could not read the records to tell whether a base is named, so it is kept; the "+
+			"next verification of its image removes it if none names it", "vm", base, "error", err)
+
+		return
+	}
+
+	if named {
+		return
+	}
+
+	if err := p.deleteBase(ctx, base); err != nil {
+		p.log.Error("could not remove a base no record names; the next verification of its image "+
+			"removes it", "vm", base, "error", err)
+	}
 }
 
 // probeTrust is the trust class a probe's network flags come from.
@@ -255,7 +297,7 @@ func retainBases(st *verifiedState, key string) []string {
 	keep := map[string]bool{}
 
 	for _, r := range st.recordsOf(key) {
-		if r.Invalid == "" && !contents[r.ContentKey] && len(contents) < 2 {
+		if r.Invalid == "" && !st.isWithdrawn(key, r.Digest) && !contents[r.ContentKey] && len(contents) < 2 {
 			contents[r.ContentKey] = true
 			keep[r.Base] = true
 		}
@@ -280,16 +322,10 @@ func (p *Provider) countYield(ctx context.Context, key string) {
 // base staging clone, a finished base no record names, and a private store. The caller
 // holds the image's verification lock, so none of these is anyone's in-flight work.
 func (p *Provider) cleanVerification(ctx context.Context, key string) error {
-	if err := p.endProbe(ctx, p.probeName(key)); err != nil {
-		return fmt.Errorf("remove an earlier probe: %w", err)
-	}
-
-	if err := os.RemoveAll(filepath.Join(p.stateDir, privateStores, hashName(key))); err != nil {
-		return fmt.Errorf("remove an earlier private store: %w", err)
-	}
-
 	named := map[string]bool{}
 
+	// FIRST, because it refuses a state directory that is another deployment's before
+	// anything of its could be removed.
 	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
 		for _, r := range st.recordsOf(key) {
 			named[r.Base] = true
@@ -298,6 +334,14 @@ func (p *Provider) cleanVerification(ctx context.Context, key string) error {
 		return false, nil
 	}); err != nil {
 		return err
+	}
+
+	if err := p.endProbe(ctx, p.probeName(key)); err != nil {
+		return fmt.Errorf("remove an earlier probe: %w", err)
+	}
+
+	if err := os.RemoveAll(p.privateStore(key)); err != nil {
+		return fmt.Errorf("remove an earlier private store: %w", err)
 	}
 
 	entries, err := os.ReadDir(filepath.Join(p.home, "vms"))
@@ -342,14 +386,9 @@ func (p *Provider) runProbe(
 
 	defer func() { _ = custody.Close() }()
 
-	held, err := tryFlock(custody, syscall.LOCK_EX)
-	if err != nil {
-		return "", fmt.Errorf("take the probe's custody: %w", err)
-	}
-
-	if !held {
-		return "", errors.New("something still holds the probe's custody file, so its guest may " +
-			"still be running")
+	if err := waitFlock(ctx, custody, syscall.LOCK_EX, lockSettle); err != nil {
+		return "", fmt.Errorf("something still holds the probe's custody file, so its guest may "+
+			"still be running: %w", err)
 	}
 
 	claim, err := p.claimGuest(ctx, probe, rec.GuestOS, true)
@@ -376,9 +415,11 @@ func (p *Provider) runProbe(
 		_ = custody.Close()
 		claim.release()
 
+		// %v FOR WHAT ENDED IT: a yield whose probe may still be alive is not the clean
+		// yield a refresh reports as nothing wrong.
 		if endErr := p.endProbe(endCtx, probe); endErr != nil {
 			runner = ""
-			err = errors.Join(err, fmt.Errorf("the probe could not be proved gone: %w", endErr))
+			err = fmt.Errorf("the probe could not be proved gone: %w (the verification had ended: %v)", endErr, err)
 		}
 	}()
 
@@ -404,11 +445,16 @@ func (p *Provider) runProbe(
 	}
 
 	if len(netFlags) > 0 && len(p.cfg.UntrustedDNS) > 0 {
-		out, err := p.guestAnswer(probeCtx, probe,
-			resolverScript(p.cfg.UntrustedDNS, p.resolverWaits))
-		if err != nil || !strings.Contains(out, "ok") {
-			return "", probeCause(probeCtx, errors.New("the isolated probe cannot resolve github.com "+
-				"through node.tart.untrusted_dns"))
+		answerCtx, answerCancel := context.WithTimeout(probeCtx, p.probeWindow)
+		defer answerCancel()
+
+		// RETRIED, because `tart list` says running well before the guest agent listens.
+		// The script exits nonzero unless the guest then resolves.
+		if _, err := p.retryGuest(answerCtx, probe, probeCheck{
+			name:   "resolving github.com through node.tart.untrusted_dns",
+			script: resolverScript(p.cfg.UntrustedDNS, p.resolverWaits),
+		}); err != nil {
+			return "", probeCause(probeCtx, err)
 		}
 	}
 
@@ -578,13 +624,22 @@ func (p *Provider) endProbe(ctx context.Context, probe string) error {
 
 	_, statErr := os.Lstat(p.vmDir(probe))
 
+	_, custodyErr := os.Lstat(path)
+
 	switch {
 	case errors.Is(statErr, fs.ErrNotExist):
-		if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+		if errors.Is(custodyErr, fs.ErrNotExist) {
 			return nil
 		}
 	case statErr != nil:
 		return fmt.Errorf("look for the probe: %w", statErr)
+	case errors.Is(custodyErr, fs.ErrNotExist):
+		// NO CUSTODY FILE TO HOLD MEANS A LOCK ON ONE MADE HERE PROVES NOTHING, and someone
+		// removed it, since a probe is cloned only after its file exists. Only tart's own
+		// word that it is stopped lets this go on.
+		if err := p.requireStopped(ctx, probe); err != nil {
+			return err
+		}
 	}
 
 	custody, err := openLockFile(path)
@@ -616,6 +671,37 @@ func (p *Provider) endProbe(ctx context.Context, probe string) error {
 	}
 
 	return nil
+}
+
+// requireStopped refuses unless tart lists the VM and says it is stopped.
+func (p *Provider) requireStopped(ctx context.Context, name string) error {
+	vms, err := p.list(ctx)
+	if err != nil {
+		return fmt.Errorf("ask tart about %s: %w", name, err)
+	}
+
+	// A GUEST STILL STARTING, waiting on tart's lock, is reported stopped, and only its
+	// process says otherwise.
+	guests, err := p.tartGuests(ctx)
+	if err != nil {
+		return fmt.Errorf("look for %s's process: %w", name, err)
+	}
+
+	for _, command := range guests {
+		if guestNameIn(command) == name {
+			return fmt.Errorf("%s has no custody file and its process is running, so nothing here "+
+				"can end it; stop it with `tart stop %s`", name, name)
+		}
+	}
+
+	for _, vm := range vms {
+		if vm.Name == name && !vm.Running && strings.EqualFold(vm.State, "stopped") {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%s has no custody file and tart does not say it is stopped, so whether its "+
+		"process has ended cannot be proved; stop it with `tart stop %s`", name, name)
 }
 
 // stopProbeProcesses asks the VM to stop and then, by signal, ends what holds its
@@ -721,8 +807,11 @@ func (p *Provider) removeOrphanProbe(ctx context.Context, probe string) (bool, e
 // base is valid and whose digest is not withdrawn. It refuses, naming the command that
 // would fix it, when there is none or the runner's deadline has passed. It reads the
 // clock against the stored deadline, so it needs neither the network nor a refresh.
-func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRecord, error) {
-	var found VerifiedRecord
+func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRecord, heldFile, error) {
+	var (
+		found VerifiedRecord
+		held  heldFile
+	)
 
 	err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
 		for _, r := range st.recordsOf(key) {
@@ -737,7 +826,27 @@ func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRec
 					deadline.Format(time.DateOnly), key)
 			}
 
-			found = r
+			// UNDER THE RECORD LOCK, and without waiting: only a delete holds this lock
+			// exclusively, a delete comes after the record is gone, and a record naming a
+			// base still being deleted is one a crash left. So what removes a record cannot
+			// slip between this answer and this lock.
+			f, err := openLockFile(p.baseLockPath(r.Base))
+			if err != nil {
+				return false, fmt.Errorf("lock base %s: %w", r.Base, err)
+			}
+
+			free, err := tryFlock(f, syscall.LOCK_SH)
+			if err != nil || !free {
+				_ = f.Close()
+
+				if err == nil {
+					err = errors.New("it is being deleted")
+				}
+
+				return false, fmt.Errorf("lock base %s: %w", r.Base, err)
+			}
+
+			found, held = r, heldFile{f: f}
 
 			return false, nil
 		}
@@ -746,7 +855,7 @@ func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRec
 			key, key)
 	})
 
-	return found, err
+	return found, held, err
 }
 
 // Unpromote removes a record and its base, withdraws the digest it was pulled as and
@@ -950,5 +1059,5 @@ func (p *Provider) StoreSpace(rec VerifiedRecord) (free uint64, base int64, err 
 
 // defaultRegistry is the registry seam's real answer.
 func defaultRegistry(ctx context.Context, key string) (string, error) {
-	return registryDigest(ctx, &http.Client{Timeout: registryTimeout}, key)
+	return registryDigest(ctx, registryClient(), key)
 }

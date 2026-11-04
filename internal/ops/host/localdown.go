@@ -386,10 +386,15 @@ func stopAndDisable(ctx context.Context, env cli.Env, c converger, cfg *config.C
 	// never in the same words for the two cases. `billet drain --wait` carries the
 	// same distinction and it matters more here: that command only waits, and this
 	// one is about to stop the services.
-	if proved {
+	switch {
+	case !req.WantServer:
+		fmt.Fprintf(env.Stdout, "\nnote     no ledger was read and no other host was asked: this says nothing\n")
+		fmt.Fprintf(env.Stdout, "         about the rest of the deployment. This node drains its own jobs as\n")
+		fmt.Fprintf(env.Stdout, "         it stops.\n\n")
+	case proved:
 		fmt.Fprintf(env.Stdout, "\nnote     the ledger records nothing outstanding, and every host billet\n")
 		fmt.Fprintf(env.Stdout, "         expects an answer from says it is running no compute.\n\n")
-	} else {
+	default:
 		fmt.Fprintf(env.Stdout, "\nnote     the ledger records nothing outstanding. NO HOST WAS ASKED what it\n")
 		fmt.Fprintf(env.Stdout, "         is actually running, and compute whose lease has already gone is not\n")
 		fmt.Fprintf(env.Stdout, "         visible to the ledger — so this does not establish that the machines\n")
@@ -869,6 +874,8 @@ func printDownPlan(env cli.Env, c converger, req lifeops.UpRequest, o downOption
 			fmt.Fprintf(env.Stdout, "         3. ask every host what it is actually running, and wait until\n")
 			fmt.Fprintf(env.Stdout, "            each says it is running nothing\n")
 		}
+	} else if o.nodeOnly {
+		fmt.Fprintf(env.Stdout, "         1. seal nothing (--node): the deployment keeps admitting work\n")
 	} else {
 		fmt.Fprintf(env.Stdout, "         1. nothing to seal: this host runs no control plane, and nothing\n")
 		fmt.Fprintf(env.Stdout, "            here can ask it what it is running either\n")
