@@ -36,7 +36,7 @@ UPDATE job_history
 
 -- +billet:statement
 INSERT INTO usage_sequence (id, last)
-VALUES (1, (SELECT COALESCE(MAX(usage_seq), 0) FROM job_history));
+SELECT 1, top.n FROM (SELECT MAX(usage_seq) AS n FROM job_history) AS top WHERE top.n > 0;
 -- +billet:end
 
 -- +billet:statement

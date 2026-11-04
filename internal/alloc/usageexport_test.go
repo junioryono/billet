@@ -23,7 +23,7 @@ func TestAClosingLeaseTakesItsUsageNumberAndKeepsItsOwner(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	mustRegister(t, a, NodeRegistration{Name: "epyc-1", Provider: config.ProviderDocker,
+	mustRegister(t, a, NodeRegistration{Name: "epyc-1", Provider: config.ProviderFirecracker,
 		VCPU: 8, Memory: 16 * config.GiB})
 
 	first := reserve(t, a, "linux")
@@ -116,7 +116,7 @@ func TestAReaderNeverSeesAUsageNumberBeforeALowerOne(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	mustRegister(t, a, NodeRegistration{Name: "epyc-1", Provider: config.ProviderDocker,
+	mustRegister(t, a, NodeRegistration{Name: "epyc-1", Provider: config.ProviderFirecracker,
 		VCPU: 200, Memory: 400 * config.GiB})
 
 	leases := make([]*Lease, 0, closes)

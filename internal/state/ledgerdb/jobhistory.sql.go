@@ -736,14 +736,16 @@ func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) 
 }
 
 const nextUsageSeq = `-- name: NextUsageSeq :one
-UPDATE usage_sequence SET last = last + 1 WHERE id = 1 RETURNING last
+INSERT INTO usage_sequence (id, last) VALUES (1, 1)
+ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1
+RETURNING last
 `
 
 // Take the next place in the order leases finished in.
 //
 // THE ROW'S LOCK IS THE POINT, held until this transaction commits, so numbers
 // become visible in the order they were handed out on both engines; migration 71
-// says why a reader depends on that.
+// says why a reader depends on that, and why the first close creates the row.
 func (q *Queries) NextUsageSeq(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, nextUsageSeq)
 	var last int64

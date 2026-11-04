@@ -108,7 +108,6 @@ func exerciseUsageBackfill(t *testing.T, open func(context.Context) (*DB, error)
 		t.Fatalf("the next lease to finish takes %d, want 4: it follows the backfill or it collides", next)
 	}
 
-	// THE FIRST CLOSE ON AN EMPTY LEDGER IS 1, which the counter's seed decides.
 	if err := db.Tx(ctx, func(tx *sql.Tx) error {
 		return WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
 			LeaseID: "running", Tier: "small", QueuedAt: "t", UsageSeq: 4,
@@ -140,5 +139,40 @@ func exerciseUsageBackfill(t *testing.T, open func(context.Context) (*DB, error)
 	lease, err := db.UsageLease(ctx, 4)
 	if err != nil || lease != "running" {
 		t.Fatalf("UsageLease(4) = %q, %v; a second archive moved the lease's number", lease, err)
+	}
+}
+
+// A LEDGER WITH NO HISTORY HOLDS NO COUNTER ROW, because a row in any table is what
+// tells a used ledger from a pristine one; and its first close is number 1.
+func TestTheUsageCounterWaitsForTheFirstClose(t *testing.T) {
+	t.Parallel()
+
+	db := open(t)
+	ctx := t.Context()
+
+	var rows int
+	if err := db.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_sequence`).Scan(&rows); err != nil {
+		t.Fatalf("count the counter's rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("a freshly migrated ledger holds %d counter rows, so it reads as used", rows)
+	}
+
+	for want := int64(1); want <= 2; want++ {
+		var got int64
+
+		if err := db.Tx(ctx, func(tx *sql.Tx) error {
+			var err error
+
+			got, err = WriteQueries(tx).NextUsageSeq(ctx)
+
+			return err
+		}); err != nil {
+			t.Fatalf("NextUsageSeq: %v", err)
+		}
+
+		if got != want {
+			t.Fatalf("NextUsageSeq = %d, want %d", got, want)
+		}
 	}
 }

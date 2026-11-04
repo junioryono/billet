@@ -15,7 +15,9 @@
 -- first to commit: a reader paging past N can never see N+1 commit before N. A
 -- PostgreSQL sequence hands out numbers outside the transaction, and a reader
 -- would page past the one still uncommitted and never see it. A rollback gives
--- the number back with everything else.
+-- the number back with everything else. THE ROW EXISTS ONCE A LEASE HAS FINISHED:
+-- a ledger with no history has none, because a row in any table is what tells a
+-- used ledger from a pristine one (PeekLedger), and a restore decides by that.
 --
 -- github_target is the GitHub path of the owner whose runner the lease held,
 -- copied from the lease as it closes. Migration 64 put it on the lease only, and
@@ -57,7 +59,7 @@ UPDATE job_history
 
 -- +billet:statement
 INSERT INTO usage_sequence (id, last)
-VALUES (1, (SELECT COALESCE(MAX(usage_seq), 0) FROM job_history))
+SELECT 1, top.n FROM (SELECT MAX(usage_seq) AS n FROM job_history) AS top WHERE top.n > 0
 -- +billet:end
 
 -- +billet:statement

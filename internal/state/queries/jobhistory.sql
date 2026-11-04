@@ -304,8 +304,10 @@ ON CONFLICT (lease_id) DO UPDATE SET
 --
 -- THE ROW'S LOCK IS THE POINT, held until this transaction commits, so numbers
 -- become visible in the order they were handed out on both engines; migration 71
--- says why a reader depends on that.
-UPDATE usage_sequence SET last = last + 1 WHERE id = 1 RETURNING last;
+-- says why a reader depends on that, and why the first close creates the row.
+INSERT INTO usage_sequence (id, last) VALUES (1, 1)
+ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1
+RETURNING last;
 
 -- name: ListUsageSince :many
 -- Finished leases past a place in the order they finished in, bounded.
