@@ -124,6 +124,9 @@ type Client struct {
 	// at all (nodeapi.VersionImageAcceptance); both under regMu.
 	imagesAccept        []string
 	imagesAcceptCarried bool
+	// macOSLimit is the node's macOS limit as the last accepted registration's answer
+	// said it, and nil when its wire does not carry one; under regMu.
+	macOSLimit *int
 
 	// guestUnsent is set the first time a guest report is not sent because the
 	// negotiated wire does not carry one, so that is said once and not once a
@@ -433,6 +436,12 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 	c.wire.Store(int64(res.Version))
 	c.imagesAccept = slices.Clone(res.ImagesAccept)
 	c.imagesAcceptCarried = res.Version >= nodeapi.VersionImageAcceptance
+	c.macOSLimit = nil
+
+	if res.Version >= nodeapi.VersionTartVerified {
+		c.macOSLimit = res.MacOSVMLimit
+	}
+
 	c.regMu.Unlock()
 
 	return nil
@@ -450,6 +459,19 @@ func (c *Client) ImageAcceptance() ([]string, bool) {
 	}
 
 	return slices.Clone(c.imagesAccept), true
+}
+
+// MacOSLimit is how many macOS guests the last accepted registration said this node
+// may run, and false when its control plane does not say, which is not a limit of zero.
+func (c *Client) MacOSLimit() (int, bool) {
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	if c.macOSLimit == nil {
+		return 0, false
+	}
+
+	return *c.macOSLimit, true
 }
 
 // WireVersion is the protocol version this node's registration settled on.

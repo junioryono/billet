@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 37
+	Version = 38
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -508,6 +508,17 @@ const (
 	// SENT, as the cache block is: an older node ignores TierSpec's arch, so a tier
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
+
+	// VersionTartVerified is the version from which a node reads a Tart tier's
+	// `<image>@verified` and a registration's answer carries the node's macOS limit
+	// (RegisterResponse's macos_vm_limit), which a verification beside the node counts
+	// its probe against (ADR-021).
+	//
+	// IGNORED BY AN OLDER NODE, which decodes an answer leniently, and a node below it
+	// records that its control plane does not say. CHECKED WHERE A LAUNCH IS SENT: an
+	// older node hands `@verified` to `tart fqn` as a name, so a Tart tier naming it is
+	// refused to a node below this at dispatch and again at delivery.
+	VersionTartVerified = 38
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -792,6 +803,9 @@ type RegisterResponse struct {
 	// ImagesAccept is what the control plane's images.accept names, sorted, from
 	// VersionImageAcceptance. Absent at that version means it accepts none.
 	ImagesAccept []string `json:"images_accept,omitempty"`
+	// MacOSVMLimit is how many macOS guests the control plane places on this node, from
+	// VersionTartVerified. A pointer so zero, which runs none, is told from silence.
+	MacOSVMLimit *int `json:"macos_vm_limit,omitempty"`
 }
 
 // HeaderIncarnation carries the node process's identity on every request.

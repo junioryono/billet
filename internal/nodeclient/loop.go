@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/imageaccept"
+	"github.com/junioryono/billet/internal/macoslimit"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -200,8 +201,8 @@ type LoopOptions struct {
 	RegistrationRecordPath string
 	// ImageAcceptanceDir is node.state_dir, where the node records what its
 	// deployment accepts for its guest images, or that its control plane does not
-	// say, after every accepted registration (internal/imageaccept); empty
-	// records nothing.
+	// say, after every accepted registration (internal/imageaccept), and its macOS
+	// limit (internal/macoslimit); empty records neither.
 	ImageAcceptanceDir string
 	// Now is the clock the record's registered_at is read from. Nil is the
 	// wall clock.
@@ -577,6 +578,20 @@ func recordRegistration(c *Client, log *slog.Logger, opts LoopOptions) {
 		if err := imageaccept.Remove(opts.ImageAcceptanceDir); err != nil {
 			log.Error("could not remove the earlier record of which image components the "+
 				"deployment accepts, which the image commands may still read", "error", err)
+		}
+	}
+
+	// THE NODE'S MACOS LIMIT, from the same registration. A record that could not be
+	// replaced is removed, so a verification refuses rather than count its probe against
+	// a limit this node no longer holds.
+	limit, said := c.MacOSLimit()
+	if err := macoslimit.Write(opts.ImageAcceptanceDir, opts.Deployment, said, limit, opts.now()); err != nil {
+		log.Error("could not record this node's macOS limit; a macOS verification refuses until "+
+			"the node records it at its next registration", "error", err)
+
+		if err := macoslimit.Remove(opts.ImageAcceptanceDir); err != nil {
+			log.Error("could not remove the earlier record of this node's macOS limit, which a "+
+				"verification may still read", "error", err)
 		}
 	}
 }

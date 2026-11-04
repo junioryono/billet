@@ -20,6 +20,7 @@ import (
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
+	"github.com/junioryono/billet/internal/macoslimit"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeending"
@@ -777,9 +778,17 @@ func NewProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 			tartCfg = *cfg.Node.Tart
 		}
 
+		stateDir := cfg.Node.StateDir
+
 		return tart.New(deployment,
 			tart.WithLogger(slog.Default()),
-			tart.WithConfig(tartCfg))
+			tart.WithConfig(tartCfg),
+			tart.WithStateDir(stateDir),
+			// READ AT EACH START OF A GUEST, because the node records it at every
+			// registration, after this provider is built.
+			tart.WithMacOSLimit(func() (int, bool, error) {
+				return macoslimit.Read(stateDir, deployment)
+			}))
 
 	case config.ProviderSimulated:
 		// UNREACHABLE THROUGH config.Load, WHICH REFUSES THE KIND, and refused again
