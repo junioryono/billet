@@ -94,6 +94,42 @@ func ownerOf(target string) string {
 	return target
 }
 
+// pinByBackend is the host a tier must be pinned to, so it lands only where its own
+// backend runs.
+//
+// EVERY HOST OF A REPLAY IS SIMULATED, so nothing else keeps a Linux tier off a Mac:
+// left unpinned it would spill onto a host the deployment could never run it on,
+// and the replay would model more room than there is. A tier on every host needs no
+// pin; on one, a pin says it; on some of several, a pin cannot say it, and a replay
+// that pretended would measure another fleet, so it is refused by name.
+func pinByBackend(t jobtrace.Tier, declared []jobtrace.Host, kept []Host) (string, error) {
+	if t.Node != "" || len(t.Providers) == 0 {
+		return t.Node, nil
+	}
+
+	var eligible []string
+
+	for _, h := range declared {
+		running := slices.ContainsFunc(kept, func(k Host) bool { return k.Name == h.Name })
+		if running && (h.Provider == "" || slices.Contains(t.Providers, h.Provider)) {
+			eligible = append(eligible, h.Name)
+		}
+	}
+
+	switch len(eligible) {
+	case len(kept):
+		return "", nil
+	case 0:
+		return "", fmt.Errorf("replay: tier %q runs on %v, which no host the simulated backend can model runs",
+			t.Label, t.Providers)
+	case 1:
+		return eligible[0], nil
+	default:
+		return "", fmt.Errorf("replay: tier %q runs on %v of %d hosts, and a replay can pin a tier to one or none",
+			t.Label, eligible, len(kept))
+	}
+}
+
 // validate refuses a fleet the trace cannot be replayed against.
 func (f Fleet) validate(trace Trace) error {
 	var errs []error
@@ -267,7 +303,14 @@ func FleetFromDocument(doc jobtrace.Fleet) (Fleet, []string, error) {
 			continue
 		}
 
-		f.Tiers = append(f.Tiers, TierShape{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: t.Node,
+		node, err := pinByBackend(t, doc.Hosts, f.Hosts)
+		if err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+
+		f.Tiers = append(f.Tiers, TierShape{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: node,
 			Target: t.Target})
 	}
 

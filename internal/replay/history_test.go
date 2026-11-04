@@ -429,6 +429,54 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 		t.Errorf("a tier pinned to the EC2 host gave %v; want it refused by name", err)
 	}
 
+	// A TIER LANDS ONLY WHERE ITS OWN BACKEND RUNS: every host of a replay is simulated,
+	// so nothing else keeps a Linux tier off a Mac.
+	backends := jobtrace.Fleet{
+		Hosts: []jobtrace.Host{
+			{Name: "linux-1", VCPU: 180, Memory: 480 * config.GiB, Provider: config.ProviderFirecracker},
+			{Name: "mac-1", VCPU: 16, Memory: 64 * config.GiB, Provider: config.ProviderTart},
+			{Name: "cloud", VCPU: 64, Memory: 256 * config.GiB, Provider: config.ProviderEC2},
+		},
+		Tiers: []jobtrace.Tier{
+			{Label: "on-linux", VCPU: 2, Memory: 8 * config.GiB, Providers: []config.ProviderKind{config.ProviderFirecracker}},
+			{Label: "on-mac", VCPU: 2, Memory: 8 * config.GiB, Providers: []config.ProviderKind{config.ProviderTart}},
+			{Label: "with-a-fallback", VCPU: 2, Memory: 8 * config.GiB,
+				Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2}},
+			{Label: "either", VCPU: 2, Memory: 8 * config.GiB,
+				Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderTart}},
+			{Label: "says-nothing", VCPU: 2, Memory: 8 * config.GiB},
+		},
+		MaxVCPU: 100, MaxMemory: 400 * config.GiB,
+	}
+
+	f, _, err = FleetFromDocument(backends)
+	if err != nil {
+		t.Fatalf("FleetFromDocument: %v", err)
+	}
+
+	for i, want := range []string{"linux-1", "mac-1", "linux-1", "", ""} {
+		if f.Tiers[i].Node != want {
+			t.Errorf("tier %s is pinned to %q; want %q", f.Tiers[i].Label, f.Tiers[i].Node, want)
+		}
+	}
+
+	onlyRemote := backends
+	onlyRemote.Tiers = []jobtrace.Tier{{Label: "only-cloud", VCPU: 2, Memory: 8 * config.GiB,
+		Providers: []config.ProviderKind{config.ProviderEC2}}}
+
+	if _, _, err := FleetFromDocument(onlyRemote); err == nil || !strings.Contains(err.Error(), `tier "only-cloud"`) {
+		t.Errorf("a tier only a remote backend runs gave %v; want it refused by name", err)
+	}
+
+	someOf := backends
+	someOf.Hosts = append(slices.Clone(backends.Hosts), jobtrace.Host{Name: "linux-2", VCPU: 8, Memory: 32 * config.GiB,
+		Provider: config.ProviderFirecracker})
+	someOf.Tiers = backends.Tiers[:1]
+
+	if _, _, err := FleetFromDocument(someOf); err == nil || !strings.Contains(err.Error(), "a replay can pin a tier") {
+		t.Errorf("a tier on some of several hosts gave %v; want it refused", err)
+	}
+
 	// A FLEET OF REMOTE HOSTS ALONE IS NOTHING TO REPLAY ON.
 	remote := jobtrace.Fleet{Hosts: []jobtrace.Host{{Name: "cloud", VCPU: 64, Memory: 256 * config.GiB,
 		Provider: config.ProviderEC2}}, Tiers: []jobtrace.Tier{{Label: "billet-8vcpu", VCPU: 8,

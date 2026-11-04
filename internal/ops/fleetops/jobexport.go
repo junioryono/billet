@@ -119,7 +119,7 @@ func exportDeployment(ctx context.Context, a *alloc.Allocator, cfg *config.Confi
 	for i := range cfg.Tiers {
 		t := &cfg.Tiers[i]
 		fleet.Tiers = append(fleet.Tiers, jobtrace.Tier{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: t.Node,
-			Target: config.ShareTarget(*t)})
+			Target: config.ShareTarget(*t), Providers: t.AcceptableProviders()})
 	}
 
 	weights := cfg.TargetWeights()
