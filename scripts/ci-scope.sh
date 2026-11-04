@@ -103,6 +103,11 @@ is_replay_input() {
 		internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
 	# internal/lifeops embeds the units and plists, so the harness builds deploy.
 	deploy/*) return 0 ;;
+	# And the EC2 provider builds the top of scripts/, for the AMI's build it
+	# embeds. Not its tests or the packages below it, which the harness never
+	# builds, and not what it embeds, which the simulated backend never runs.
+	scripts/*_test.go | scripts/*/*) return 1 ;;
+	scripts/*.go) return 0 ;;
 	*) return 1 ;;
 	esac
 }
