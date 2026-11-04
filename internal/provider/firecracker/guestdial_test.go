@@ -43,11 +43,11 @@ func TestOnlyAnAttachableGuestHasAVsock(t *testing.T) {
 
 		leaves := metadataLeaves(t, "", md)
 
-		if _, present := leaves["guest-attach"]; present != asked {
+		if _, present := leaves["/latest/meta-data/billet/guest-attach"]; present != asked {
 			t.Errorf("asked %t: the metadata says guest-attach: %t", asked, present)
 		}
 
-		if got, present := leaves["guest-attach-hold"]; present != asked || (asked && got != "5m0s") {
+		if got, present := leaves["/latest/meta-data/billet/guest-attach-hold"]; present != asked || (asked && got != "5m0s") {
 			t.Errorf("asked %t: the metadata says guest-attach-hold: %q, %t", asked, got, present)
 		}
 	}

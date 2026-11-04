@@ -25,8 +25,10 @@ import (
 )
 
 // jobOn is a ledger and a lease whose job ran on nodeName.
-func jobOn(t *testing.T, nodeName string) (*alloc.Allocator, string) {
+func jobOn(t *testing.T) (*alloc.Allocator, string) {
 	t.Helper()
+
+	const nodeName = "n1"
 
 	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
@@ -82,7 +84,7 @@ func encodedChunk(t *testing.T, lines ...string) (*joblog.Chunk, []byte) {
 func TestALogChunkIsIndexedOnlyFromItsJobsNode(t *testing.T) {
 	t.Parallel()
 
-	a, lease := jobOn(t, "n1")
+	a, lease := jobOn(t)
 
 	dir := filepath.Join(t.TempDir(), "logindex")
 	index, err := state.OpenLogIndex(dir)
@@ -153,7 +155,7 @@ func (s *nodeLogSink) ShipLogChunk(ctx context.Context, lease string, first int6
 func TestALineReachesASearchAndReadsBack(t *testing.T) {
 	t.Parallel()
 
-	a, lease := jobOn(t, "n1")
+	a, lease := jobOn(t)
 
 	dir := filepath.Join(t.TempDir(), "logindex")
 	index, err := state.OpenLogIndex(dir)
@@ -319,7 +321,7 @@ func TestTheOperatorSocketIsTheOperators(t *testing.T) {
 func TestAReadOfAJobTheLedgerHoldsNoneOfIsRefused(t *testing.T) {
 	t.Parallel()
 
-	a, _ := jobOn(t, "n1")
+	a, _ := jobOn(t)
 	cfg := socketConfig(t)
 	plane := nodeplane.New(slog.New(slog.DiscardHandler), "deployment", time.Minute)
 

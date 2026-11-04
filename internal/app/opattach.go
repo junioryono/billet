@@ -32,7 +32,7 @@ const (
 func (s *operatorServer) attach(ctx context.Context, cfg *config.Config, w http.ResponseWriter, r *http.Request) {
 	leaseID := r.URL.Query().Get("lease")
 
-	openCtx, cancel := context.WithTimeout(r.Context(), operatorWait)
+	openCtx, cancel := context.WithTimeout(ctx, operatorWait)
 	defer cancel()
 
 	lease, err := s.jobs.Lease(openCtx, leaseID)

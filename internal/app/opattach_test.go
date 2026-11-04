@@ -94,7 +94,7 @@ func TestAnAttachIsRefusedBeforeANodeIsAsked(t *testing.T) {
 func TestALeaseAsALaunchLeavesItCanBeAttachedTo(t *testing.T) {
 	t.Parallel()
 
-	a, leaseID := jobOn(t, "n1")
+	a, leaseID := jobOn(t)
 
 	lease, err := a.Lease(t.Context(), leaseID)
 	if err != nil {

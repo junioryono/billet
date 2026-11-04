@@ -21,8 +21,10 @@ import (
 	"github.com/junioryono/billet/internal/relay"
 )
 
-// How a session ends once nobody is at the other end of it.
+// How many terminals a guest serves, and how a session ends once nobody is at the other end of it.
 const (
+	// maxSessions bounds the terminals one guest serves at once.
+	maxSessions = 4
 	// hangupGrace is how long a shell has after its hangup before it is killed: one can ignore a
 	// hangup, and a session's slot is one of few.
 	hangupGrace = 5 * time.Second

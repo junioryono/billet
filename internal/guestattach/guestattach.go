@@ -11,9 +11,6 @@ package guestattach
 // Port is the vsock port the server listens on and a node connects to.
 const Port = 5151
 
-// maxSessions bounds the terminals one guest serves at once.
-const maxSessions = 4
-
 // Config is what the server runs for each session.
 type Config struct {
 	// User is the account a session's shell runs as, the job's own.
