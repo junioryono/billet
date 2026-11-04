@@ -178,6 +178,8 @@ type Tier struct {
 	// Cache configures every cache the tier's jobs get: whose writes publish,
 	// which caches are on, and how large each may grow. See TierCache.
 	Cache *TierCache `yaml:"cache,omitempty"`
+	// Network is what the tier asks of its guests' network; see TierEgress.
+	Network *TierNetwork `yaml:"network,omitempty"`
 
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
 	// Zero means "no per-tier cap" and is only legal for non-macOS tiers.
@@ -805,6 +807,7 @@ func (c *Config) validateTiers() []error {
 
 		errs = append(errs, t.ProviderErrors(where)...)
 		errs = append(errs, t.InterceptionErrors(where)...)
+		errs = append(errs, t.EgressErrors(where)...)
 		errs = append(errs, t.ReservationErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))

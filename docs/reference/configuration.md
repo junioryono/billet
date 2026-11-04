@@ -151,8 +151,21 @@ The per-sample series a node reports with each job records the wall time of its 
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |
+| `network` | what the tier asks of its guests' network; see [`tiers[].network`](#tiersnetwork). Without it the tier is open, as a tier always was |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
 | `warm_pool` | refused when non-zero; no backend implements it |
+
+### `tiers[].network`
+
+```yaml
+network:
+  egress:
+    allow: [example.com, "*.npmjs.org", 203.0.113.0/24]
+```
+
+| Key | Meaning |
+|---|---|
+| `egress.allow` | where the tier's guests may connect, enforced on the host ([ADR-023](decisions/adr-023-host-enforced-egress.md), and [the operator page](../operating/egress.md)). `example.com` allows that name alone, `*.example.com` every name below it and not the name itself, `203.0.113.0/24` or `203.0.113.7` those addresses. At most 256 entries, and `allow: []` allows only what every list includes: GitHub's runner endpoints and the node's own services. IPv6 entries are refused, because the host refuses every IPv6 packet a listed guest sends. Only a tier whose every provider is `firecracker` may have one |
 
 ### `tiers[].cache`
 
