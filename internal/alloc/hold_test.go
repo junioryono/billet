@@ -591,3 +591,17 @@ func TestTheGuardSeesAWaitersFloorOnAHeldHost(t *testing.T) {
 		t.Errorf("a buyer elsewhere gave %v, %v, with the waiter's floor on the held host", got, err)
 	}
 }
+
+// AN ADMISSION SAYS THE TIER'S SHAPE, which the order reads to tell who could put a lease
+// as large in a waiter's way.
+func TestAnAdmissionSaysItsShape(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	a := holdFleet(t, &now)
+
+	wide := a.tiers["wide"]
+
+	got, err := a.AdmissionFor(t.Context(), "wide")
+	if err != nil || got.VCPU != wide.VCPU || got.Memory != wide.Memory {
+		t.Errorf("the admission says %d vCPU and %d bytes, %v; want %d and %d", got.VCPU, got.Memory, err, wide.VCPU, wide.Memory)
+	}
+}
