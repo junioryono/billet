@@ -81,7 +81,7 @@ func runNft(ctx context.Context, script string, args ...string) ([]byte, error) 
 	ctx, cancel := context.WithTimeout(ctx, nftLimit)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, nftBinary(), args...)
+	cmd := exec.CommandContext(ctx, nftBinary(), args...) //nolint:gosec // G204: nft, with arguments this package composes
 	cmd.Stdin = strings.NewReader(script)
 
 	var stdout, stderr bytes.Buffer
@@ -125,14 +125,28 @@ func baseScript() string {
 add map bridge billet_egress guests { type ifname : verdict; }
 add chain bridge billet_egress prerouting { type filter hook prerouting priority -200; policy accept; }
 add rule bridge billet_egress prerouting iifname vmap @guests
+add map bridge billet_egress ports { type ifname : verdict; }
+add chain bridge billet_egress forward { type filter hook forward priority 0; policy accept; }
+add rule bridge billet_egress forward iifname vmap @ports
+add rule bridge billet_egress forward oifname vmap @ports
+add map bridge billet_egress replies { type mark : verdict; }
+add chain bridge billet_egress output { type filter hook output priority 0; policy accept; }
+add rule bridge billet_egress output ct mark vmap @replies
 add table inet billet_egress_routed
 add map inet billet_egress_routed guests { type ifname : verdict; }
 add chain inet billet_egress_routed prerouting { type filter hook prerouting priority -200; policy accept; }
 add rule inet billet_egress_routed prerouting iifname vmap @guests
+add map inet billet_egress_routed replies { type mark : verdict; }
+add chain inet billet_egress_routed output { type filter hook output priority 0; policy accept; }
+add rule inet billet_egress_routed output ct mark vmap @replies
 add table ip billet_egress_nat
 add map ip billet_egress_nat jobs { type mark : verdict; }
 add chain ip billet_egress_nat prerouting { type nat hook prerouting priority dstnat - 1; policy accept; }
 add rule ip billet_egress_nat prerouting meta mark vmap @jobs
+add map ip billet_egress_nat owners { type mark : verdict; }
+add chain ip billet_egress_nat own { type filter hook prerouting priority dstnat + 10; policy accept; }
+add rule ip billet_egress_nat own meta mark vmap @owners
+add rule ip billet_egress_nat own ct mark vmap @owners
 `
 }
 
@@ -160,6 +174,9 @@ type binding struct {
 //     path for it, so this says so rather than leaving it unwatched.
 //   - DHCP's broadcast, by its destination: udp port 67 alone would be a way to
 //     send a datagram anywhere.
+//   - A source address outside the guest's subnet is refused: the resolver answers
+//     whoever a query says it is from, so this is what stops a query being a way to
+//     have the host send its bytes anywhere.
 //   - DNS to the gateway is marked for its redirect, and is the only DNS it gets.
 //   - Anything else to the gateway is the host's, and the role's guard judges it
 //     by port as it does every guest's.
@@ -176,8 +193,29 @@ type binding struct {
 //     fails in milliseconds instead of timing out: TCP's reset for TCP, since the
 //     ICMP form took a retransmit (measured 1 s against 3 ms on 2026-11-04).
 //
+// THE LAST RULE IS A DROP, because a reject is defined for what it can answer: what it
+// does with a frame of another ethertype is not this package's to leave to chance, and
+// falling off this chain is the base chain's accept.
+//
+// A LISTED GUEST'S PORT IS CUT OFF FROM ITS BRIDGE'S OTHER PORTS. The rules above read
+// IP addresses, and a bridge delivers by MAC: a frame to a peer's MAC holding an allowed
+// public address would pass them and reach the peer, which could relay it under a
+// broader policy. Only the host answers a listed guest's frames, and no peer can reach
+// it either, so a peer is not a way in.
+//
 // AN OPEN GUEST'S CHAIN ONLY MARKS DNS, and falls through to the base chain's
 // accept.
+//
+// EVERY GUEST'S DNS CONNECTION NAMES ITS OWNER. The redirect is chosen when a connection
+// is created and kept by the connection tracker, which knows nothing of interfaces: a
+// guest forging another's source address and port joins that connection, and is sent to
+// that guest's resolver under that guest's policy, or to dnsmasq itself if that guest
+// has no redirect. So the redirect stamps its own mark on the connection, and a packet
+// is dropped unless the mark its interface gave it and its connection's are one.
+//
+// AND A REPLY GOES OUT THE OWNER'S INTERFACE ONLY. A guest forging a neighbour's source
+// address opens a connection of its own whose answers would reach that neighbour with
+// the query's bytes in them, which no rule above sees: they leave from the host.
 func attachScript(b binding) string {
 	var s strings.Builder
 
@@ -214,6 +252,7 @@ func attachScript(b binding) string {
 		rule("deny", "counter name denied_c_%s", b.key)
 		rule("deny", "ip protocol tcp reject with tcp reset")
 		rule("deny", "reject")
+		rule("deny", "drop")
 
 		line("add chain %s job_%s", table, b.key)
 
@@ -225,6 +264,7 @@ func attachScript(b binding) string {
 			rule("job", "meta nfproto ipv6 counter name ipv6_c_%s drop", b.key)
 		}
 
+		rule("job", "ip saddr != %s goto deny_%s", b.gateway.Masked(), b.key)
 		rule("job", "%s accept", markDNS)
 		rule("job", "ip daddr %s accept", gateway)
 		rule("job", "meta l4proto { tcp, udp } th dport 53 counter name outside_c_%s goto deny_%s", b.key, b.key)
@@ -237,6 +277,15 @@ func attachScript(b binding) string {
 		rule("job", "ip daddr @allow_%s accept", b.key)
 		rule("job", "ip daddr @cidr_%s accept", b.key)
 		rule("job", "goto deny_%s", b.key)
+
+		if b.kind == BridgePort {
+			// A BROADCAST IS A GUEST'S ARP AND DHCP, flooded to every port as a matter
+			// of course: only what was aimed at a peer is a refusal worth counting.
+			line("add chain %s fwd_%s", table, b.key)
+			rule("fwd", "meta pkttype { broadcast, multicast } drop")
+			rule("fwd", "counter name denied_c_%s drop", b.key)
+			line(`add element %s ports { "%s" : jump fwd_%s }`, table, b.iface, b.key)
+		}
 	} else {
 		line("add chain %s job_%s", table, b.key)
 		rule("job", "%s", markDNS)
@@ -245,9 +294,17 @@ func attachScript(b binding) string {
 	line(`add element %s guests { "%s" : jump job_%s }`, table, b.iface, b.key)
 
 	line("add chain %s dns_%s", natTable, b.key)
-	line("add rule %s dns_%s udp dport 53 redirect to :%d", natTable, b.key, b.port)
-	line("add rule %s dns_%s tcp dport 53 redirect to :%d", natTable, b.key, b.port)
+	s.WriteString(redirectRules(b.key, b.mark, b.port))
 	line("add element %s jobs { %#x : jump dns_%s }", natTable, b.mark, b.key)
+
+	line("add chain %s own_%s", natTable, b.key)
+	line("add rule %s own_%s meta mark != %#x drop", natTable, b.key, b.mark)
+	line("add rule %s own_%s ct mark != %#x drop", natTable, b.key, b.mark)
+	line("add element %s owners { %#x : jump own_%s }", natTable, b.mark, b.key)
+
+	line("add chain %s reply_%s", table, b.key)
+	rule("reply", `oifname != "%s" drop`, b.iface)
+	line("add element %s replies { %#x : jump reply_%s }", table, b.mark, b.key)
 
 	return s.String()
 }
@@ -265,12 +322,17 @@ func otherAddresses(b binding) []string {
 	return out
 }
 
+// redirectRules send a guest's marked DNS to its socket, naming it the connection's owner.
+func redirectRules(key string, mark uint32, port uint16) string {
+	return fmt.Sprintf("add rule %[1]s dns_%[2]s udp dport 53 ct mark set %#[3]x redirect to :%[4]d\n"+
+		"add rule %[1]s dns_%[2]s tcp dport 53 ct mark set %#[3]x redirect to :%[4]d\n", natTable, key, mark, port)
+}
+
 // retargetScript points a guest's redirect at a new socket, for a process that
 // adopted it. The chain and its sets are kept, so what its names admitted stays
 // admitted across the change of process.
-func retargetScript(key string, port uint16) string {
-	return fmt.Sprintf("flush chain %[1]s dns_%[2]s\nadd rule %[1]s dns_%[2]s udp dport 53 redirect to :%[3]d\n"+
-		"add rule %[1]s dns_%[2]s tcp dport 53 redirect to :%[3]d\n", natTable, key, port)
+func retargetScript(key string, mark uint32, port uint16) string {
+	return fmt.Sprintf("flush chain %s dns_%s\n", natTable, key) + redirectRules(key, mark, port)
 }
 
 // detachScript removes everything attachScript made for one guest.
@@ -281,8 +343,15 @@ func detachScript(key, iface string, kind Kind, mark uint32, listed bool) string
 
 	fmt.Fprintf(&s, "delete element %s guests { \"%s\" }\n", table, iface)
 	fmt.Fprintf(&s, "delete chain %s job_%s\n", table, key)
+	fmt.Fprintf(&s, "delete element %s replies { %#x }\n", table, mark)
+	fmt.Fprintf(&s, "delete chain %s reply_%s\n", table, key)
 
 	if listed {
+		if kind == BridgePort {
+			fmt.Fprintf(&s, "delete element %s ports { \"%s\" }\n", table, iface)
+			fmt.Fprintf(&s, "delete chain %s fwd_%s\n", table, key)
+		}
+
 		fmt.Fprintf(&s, "delete chain %s deny_%s\n", table, key)
 
 		for _, set := range []string{"allow", "cidr", "denied"} {
@@ -296,6 +365,8 @@ func detachScript(key, iface string, kind Kind, mark uint32, listed bool) string
 
 	fmt.Fprintf(&s, "delete element %s jobs { %#x }\n", natTable, mark)
 	fmt.Fprintf(&s, "delete chain %s dns_%s\n", natTable, key)
+	fmt.Fprintf(&s, "delete element %s owners { %#x }\n", natTable, mark)
+	fmt.Fprintf(&s, "delete chain %s own_%s\n", natTable, key)
 
 	return s.String()
 }

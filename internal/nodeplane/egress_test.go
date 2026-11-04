@@ -123,6 +123,43 @@ func TestAnUnkeepableEgressReportIsRefusedAtTheWire(t *testing.T) {
 	}
 }
 
+// A REPORT ABOUT ANOTHER HOST'S LEASE IS NOT KEPT: it would stand as what the host saw of a
+// job that host never ran. The same lease placed on the reporting node is the control.
+func TestANodeCannotReportTheEgressOfAnotherHostsLease(t *testing.T) {
+	t.Parallel()
+
+	body, err := json.Marshal(nodeapi.EgressReportRequest{Epoch: 1, Report: anEgressReport()})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		placedOn string
+		status   int
+		kept     int
+	}{
+		{"other", http.StatusConflict, 0},
+		{"n1", http.StatusNoContent, 1},
+	} {
+		store := &egressStore{fakeStore: &fakeStore{lease: &alloc.Lease{ID: "l1", TargetNode: tc.placedOn, Epoch: 1}}}
+		_, base := serve(t, store)
+		registerAt(t, base, nodeapi.VersionEgress, "current")
+
+		status, refusal := postAs(t, base, "/v1/nodes/n1/leases/l1/egress", "current", body)
+		if status != tc.status {
+			t.Fatalf("a report of a lease placed on %s answered %d %+v, want %d", tc.placedOn, status, refusal, tc.status)
+		}
+
+		store.mu.Lock()
+		kept := len(store.kept)
+		store.mu.Unlock()
+
+		if kept != tc.kept {
+			t.Fatalf("a report of a lease placed on %s reached the ledger %d times, want %d", tc.placedOn, kept, tc.kept)
+		}
+	}
+}
+
 func TestAStoreThatKeepsNoEgressReportsRefusesTheRoute(t *testing.T) {
 	t.Parallel()
 

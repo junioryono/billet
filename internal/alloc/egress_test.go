@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 func anEgressReport() JobEgress {
@@ -150,5 +152,97 @@ func TestAnEgressReportIsRetiredWithItsJobsDetail(t *testing.T) {
 
 	if _, err := a.LeaseEgress(t.Context(), recent.ID); err != nil {
 		t.Fatalf("the report inside the retention reads %v", err)
+	}
+}
+
+// A TIER WITH AN ALLOWLIST IS NOT PLACED ON A HOST TOO OLD TO HONOUR IT, or placement
+// keeps choosing a host the plane then refuses to launch on while a newer one sits idle.
+// An open tier still uses every host.
+func TestAListedTierIsPlacedOnlyWhereItCanBeHonoured(t *testing.T) {
+	t.Parallel()
+
+	open := tier("open", 2, 4*config.GiB)
+	listed := tier("listed", 2, 4*config.GiB)
+	listed.Network = &config.TierNetwork{Egress: &config.TierEgress{Allow: []string{"example.com"}}}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB}, []config.Tier{open, listed})
+
+	old := testRegistration("old-host", config.ProviderFirecracker)
+	old.WireMin, old.WireVersion, old.WireMax = 12, EgressWireVersion-1, EgressWireVersion-1
+
+	if _, err := a.RegisterNode(t.Context(), old); err != nil {
+		t.Fatalf("RegisterNode(old): %v", err)
+	}
+
+	if got := headroom(t, a, "listed"); got != 0 {
+		t.Fatalf("listed headroom on an old host = %d, want 0", got)
+	}
+
+	if got := headroom(t, a, "open"); got == 0 {
+		t.Fatal("an open tier could not use an old host")
+	}
+
+	current := testRegistration("new-host", config.ProviderFirecracker)
+	current.WireMin, current.WireVersion, current.WireMax = 12, EgressWireVersion, EgressWireVersion
+
+	if _, err := a.RegisterNode(t.Context(), current); err != nil {
+		t.Fatalf("RegisterNode(new): %v", err)
+	}
+
+	leases, err := a.Escrow(t.Context(), "listed", 1)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("Escrow = %v, %v", leases, err)
+	}
+
+	if leases[0].TargetNode != "new-host" {
+		t.Fatalf("listed lease placed on %q, want new-host", leases[0].TargetNode)
+	}
+}
+
+// A ROW THE LEDGER CANNOT READ BACK IS AN ERROR OF ITS OWN, never no report, which would read
+// as a job nothing watched, and a row it would refuse today is no better.
+func TestAnEgressRowThatCannotBeReadIsNotNoReport(t *testing.T) {
+	for name, report := range map[string]string{
+		"not JSON":       "nope",
+		"a name refused": `{"listed":true,"queries":1,"refused_queries":1,"refused_names":[{"name":"a\u001b.example","count":1}]}`,
+	} {
+		// A FLEET FOR EACH: one's capacity holds one busy lease.
+		now := time.Now().UTC()
+		a := quarantineFleet(t, &now)
+		lease := busyLease(t, a)
+
+		if err := a.RecordLeaseEgress(t.Context(), lease.ID, lease.Epoch, anEgressReport()); err != nil {
+			t.Fatalf("RecordLeaseEgress: %v", err)
+		}
+
+		if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(), `UPDATE job_egress SET report = $1 WHERE lease_id = $2`, report, lease.ID)
+
+			return err
+		}); err != nil {
+			t.Fatalf("stage the row: %v", err)
+		}
+
+		_, err := a.LeaseEgress(t.Context(), lease.ID)
+		if err == nil || errors.Is(err, ErrLeaseNotFound) {
+			t.Errorf("%s: LeaseEgress = %v, want an error that is not no report", name, err)
+		}
+	}
+}
+
+// A TIER THE ALLOCATOR COULD NOT PLACE ON A BACKEND THAT ENFORCES ITS LIST IS REFUSED, whoever
+// built the catalogue: this package takes tiers from code as well as from a file.
+func TestTheAllocatorRefusesAListOnABackendThatCannotEnforceIt(t *testing.T) {
+	t.Parallel()
+
+	listed := tier("listed", 2, 4*config.GiB)
+	listed.Provider = config.ProviderDocker
+	listed.Network = &config.TierNetwork{Egress: &config.TierEgress{Allow: []string{"example.com"}}}
+
+	db, _ := openTestLedgerPair(t, false)
+
+	_, err := New(db, Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB}, []config.Tier{listed})
+	if err == nil || !strings.Contains(err.Error(), "would run open") {
+		t.Fatalf("New = %v, want the list refused", err)
 	}
 }

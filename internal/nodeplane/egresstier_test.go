@@ -51,7 +51,8 @@ func TestAListedTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 
 	err := p.NewRunner().Launch(ctx, testLease(), dispatch.Job{RequestID: 7})
 	if !errors.Is(err, ErrNoNode) || !strings.Contains(err.Error(), "egress allowlist") ||
-		!strings.Contains(err.Error(), "wire 37") {
+		!strings.Contains(err.Error(), "wire 37") ||
+		!strings.Contains(err.Error(), "an allowlist needs 38") {
 		t.Fatalf("launch = %v, want ErrNoNode naming the allowlist and the wire", err)
 	}
 
@@ -123,5 +124,47 @@ func TestAnOpenTierIsStillLaunchedOnAnOlderNode(t *testing.T) {
 
 	if err := <-launched; err != nil {
 		t.Fatalf("launch: %v", err)
+	}
+}
+
+// A PROCESS TOO OLD FOR THE LIST THAT RE-REGISTERED AFTER THE LAUNCH WAS QUEUED DOES NOT
+// TAKE IT: the check at dispatch read the process before it, and this one would ignore
+// the list and run the job open.
+func TestAnOlderProcessDoesNotTakeAListedLaunchQueuedBeforeIt(t *testing.T) {
+	t.Parallel()
+
+	p := listedPlane(t, archNode("n1-1"))
+
+	launched := make(chan error, 1)
+
+	go func() {
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
+	}()
+
+	waitForQueued(t, p, "n1")
+
+	older := archNode("n1-2")
+	older.Version = 37
+
+	if _, err := p.Register(t.Context(), older); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+
+	// THE POLL IS WHAT DELIVERY REFUSES IN, and with nothing left to give it long-polls,
+	// so its own deadline ends it.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	cmd, took, err := p.Poll(ctx, "n1", "n1-2")
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("poll: %v", err)
+	}
+
+	if took {
+		t.Fatalf("the older process took %s, and would have run the job open", cmd.Kind)
+	}
+
+	if err := <-launched; err == nil || !strings.Contains(err.Error(), "now speaks wire") {
+		t.Fatalf("launch = %v, want the delivery refusal", err)
 	}
 }

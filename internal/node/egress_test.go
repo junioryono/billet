@@ -21,6 +21,7 @@ type fakeEgressHost struct {
 	mu         sync.Mutex
 	destroyed  map[string]bool
 	record     egress.Record
+	asked      []string
 	taken      []string
 	forgotten  []string
 	reconciled []map[string]bool
@@ -30,6 +31,8 @@ type fakeEgressHost struct {
 func (f *fakeEgressHost) Take(key string) (egress.Record, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	f.asked = append(f.asked, key)
 
 	if !f.destroyed[key] {
 		return egress.Record{}, false
@@ -45,6 +48,10 @@ func (f *fakeEgressHost) Forget(key string) {
 	defer f.mu.Unlock()
 
 	f.forgotten = append(f.forgotten, key)
+
+	// AS THE REAL ONE DOES: a Take after this finds nothing, so a forget ahead of the
+	// report loses it.
+	delete(f.destroyed, key)
 }
 
 func (f *fakeEgressHost) Reconcile(_ context.Context, running map[string]bool) {
@@ -69,6 +76,8 @@ type enforcingProvider struct {
 	host     *fakeEgressHost
 	mu       sync.Mutex
 	specs    []provider.Spec
+	// names is each instance's name by the id Destroy is given.
+	names map[string]string
 }
 
 func (p *enforcingProvider) EgressReady() error { return p.notReady }
@@ -78,18 +87,34 @@ func (p *enforcingProvider) Launch(ctx context.Context, spec provider.Spec) (*pr
 	p.specs = append(p.specs, spec)
 	p.mu.Unlock()
 
-	return p.fakeProvider.Launch(ctx, spec)
+	inst, err := p.fakeProvider.Launch(ctx, spec)
+	if err == nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		if p.names == nil {
+			p.names = map[string]string{}
+		}
+
+		p.names[inst.ID] = spec.Name
+	}
+
+	return inst, err
 }
 
 func (p *enforcingProvider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
 	state, err := p.fakeProvider.Destroy(ctx, id)
 
 	if err == nil && p.host != nil {
+		p.mu.Lock()
+		name := p.names[id]
+		p.mu.Unlock()
+
 		p.host.mu.Lock()
 		if p.host.destroyed == nil {
 			p.host.destroyed = map[string]bool{}
 		}
-		p.host.destroyed[id] = true
+		p.host.destroyed[name] = true
 		p.host.mu.Unlock()
 	}
 
@@ -280,8 +305,61 @@ func TestAGuestWhoseDestroyFailedIsNotReported(t *testing.T) {
 	eh.mu.Lock()
 	defer eh.mu.Unlock()
 
-	if len(eh.taken) != 0 {
-		t.Fatalf("took %q although the guest may still run", eh.taken)
+	if len(eh.asked) != 0 {
+		t.Fatalf("asked for %q's record although the guest may still run", eh.asked)
+	}
+}
+
+// AN ADOPTED JOB'S NETWORK IS REPORTED BY THE CUSTODY THAT ENDS IT, on the path that took a
+// lease across a handover, with or without a sample.
+func TestAnAdoptedJobsNetworkIsReportedByItsCustody(t *testing.T) {
+	t.Parallel()
+
+	a, host := newAllocatorWithHost(t)
+	eh := &fakeEgressHost{record: egress.Record{Listed: true, Queries: 3, Incomplete: true}}
+	p := &enforcingProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, host: eh}
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithEgress(eh, false))
+
+	lease := assignedLease(t, a)
+	name := provider.InstanceName(lease.ID)
+
+	eh.destroyed = map[string]bool{name: true}
+
+	entry := &custody{leaseID: lease.ID, name: name}
+	entry.epoch.Store(lease.Epoch)
+	entry.measured.Store(true)
+
+	r.settleHeldUsage(t.Context(), entry, heldUsage{}, true)
+
+	got, err := a.LeaseEgress(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("LeaseEgress: %v", err)
+	}
+
+	if !got.Listed || got.Queries != 3 || !got.Incomplete {
+		t.Fatalf("the ledger holds %+v", got.JobEgress)
+	}
+}
+
+// A REPORT THAT LEAVES DESTINATIONS OUT SAYS SO, on its own and not because something else
+// was left out too: `complete: yes` over 64 of 65 would be a false claim.
+func TestAReportThatTrimsItsDeniedListIsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	rec := egress.Record{Listed: true, DeniedPackets: 100}
+	for i := range alloc.MaxEgressDenied + 1 {
+		rec.Denied = append(rec.Denied, egress.Denied{
+			Addr: netip.AddrFrom4([4]byte{198, 18, 0, byte(i)}), Protocol: "tcp", Port: 1, Packets: 1,
+		})
+	}
+
+	if out := jobEgressOf(rec, nil); !out.Incomplete || len(out.Denied) != alloc.MaxEgressDenied {
+		t.Fatalf("incomplete %v with %d denied", out.Incomplete, len(out.Denied))
+	}
+
+	rec.Denied = rec.Denied[:alloc.MaxEgressDenied]
+	if out := jobEgressOf(rec, nil); out.Incomplete {
+		t.Fatal("a report that trimmed nothing says it is incomplete")
 	}
 }
 

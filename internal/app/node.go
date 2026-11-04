@@ -20,7 +20,6 @@ import (
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
-	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeending"
@@ -771,12 +770,7 @@ func NewProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 			return nil, err
 		}
 
-		// ITS OWN OPTION RATHER THAN ONE OF FirecrackerOptions, which `billet check`
-		// builds a provider with too: only a node keeps a guest's rules.
-		host := egress.NewHost(filepath.Join(cfg.Node.StateDir, egressStateDir), slog.Default())
-
-		return firecracker.New(deployment, *cfg.Node.Firecracker, store,
-			append(FirecrackerOptions(cfg), firecracker.WithEgress(host))...)
+		return firecracker.New(deployment, *cfg.Node.Firecracker, store, FirecrackerOptions(cfg)...)
 
 	case config.ProviderTart:
 		// Labelled with the DEPLOYMENT id for the docker backend's reason: two

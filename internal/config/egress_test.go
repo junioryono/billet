@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -99,7 +100,7 @@ func TestTheNetworkBlockRefusesWhatWouldLeaveATierOpen(t *testing.T) {
 			block: "    network:\n      egress:\n        allow: {a: b}\n", want: "must be a list",
 		},
 		"an entry that cannot be read": {
-			block: "    network:\n      egress:\n        allow: [\"not a name\"]\n", want: "network.egress",
+			block: "    network:\n      egress:\n        allow: [\"not a name\"]\n", want: "is not a name",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -229,7 +230,8 @@ func TestAnAllowlistIsBounded(t *testing.T) {
 		t.Fatalf("a list at the bound was refused: %v", errs)
 	}
 
-	tier.Network.Egress.Allow = append(allow, "one-more.example.com")
+	allow = append(allow, "one-more.example.com")
+	tier.Network.Egress.Allow = allow
 
 	errs := tier.EgressErrors("tier")
 	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "257 entries") {
@@ -244,5 +246,23 @@ func TestGitHubsRunnerEndpointsAreEntriesThisGrammarReads(t *testing.T) {
 		if _, err := ParseEgressEntry(raw); err != nil {
 			t.Errorf("%q: %v", raw, err)
 		}
+	}
+}
+
+// THE LIST ITSELF, AS READ FROM GITHUB'S REFERENCE ON 2026-11-04: every other test loops over
+// the function's own output, and an empty list would pass them all while every listed tier
+// sat in a queue no runner could take.
+func TestGitHubsRunnerEndpointsAreTheOnesItsReferenceNames(t *testing.T) {
+	t.Parallel()
+
+	want := []string{
+		"github.com", "api.github.com", "codeload.github.com", "*.actions.githubusercontent.com",
+		"*.blob.core.windows.net", "objects.githubusercontent.com", "objects-origin.githubusercontent.com",
+		"github-releases.githubusercontent.com", "github-registry-files.githubusercontent.com",
+		"release-assets.githubusercontent.com",
+	}
+
+	if got := GitHubRunnerEndpoints(); !slices.Equal(got, want) {
+		t.Fatalf("GitHubRunnerEndpoints = %q, want %q", got, want)
 	}
 }

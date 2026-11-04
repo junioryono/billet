@@ -71,8 +71,9 @@ func TestEveryListIncludesWhatARunnerNeeds(t *testing.T) {
 func TestAListThatCannotBeReadIsNotCompiled(t *testing.T) {
 	t.Parallel()
 
-	if _, err := Compile([]string{"example.com", "not a name"}); err == nil {
-		t.Fatal("a bad entry compiled, and the guest would have run under part of its list")
+	_, err := Compile([]string{"example.com", "not a name"})
+	if err == nil || !strings.Contains(err.Error(), "is not a name") {
+		t.Fatalf("Compile = %v: a bad entry must refuse the list, or the guest runs under part of it", err)
 	}
 }
 

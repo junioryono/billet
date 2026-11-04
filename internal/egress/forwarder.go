@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -48,8 +49,14 @@ type forwarder struct {
 	tcp      *net.TCPListener
 	port     uint16
 	inFlight chan struct{}
+	// clients is the guest's subnet. A query from elsewhere goes unanswered, since an
+	// answer would be the host sending its bytes wherever the query said it was from.
+	clients netip.Prefix
+	// warnedAdmit says the failure to admit an answer has been logged, once: a guest can
+	// ask as fast as it likes, and each is a line otherwise.
+	warnedAdmit atomic.Bool
 
-	ctx    context.Context
+	// cancel ends what serve started, nil until then.
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -65,7 +72,14 @@ func listenPair(addr netip.Addr) (*net.UDPConn, *net.TCPListener, uint16, error)
 			return nil, nil, 0, fmt.Errorf("egress: bind a resolver on %s: %w", addr, err)
 		}
 
-		port := udp.LocalAddr().(*net.UDPAddr).AddrPort().Port()
+		local, ok := udp.LocalAddr().(*net.UDPAddr)
+		if !ok {
+			_ = udp.Close()
+
+			return nil, nil, 0, fmt.Errorf("egress: a resolver on %s is bound to %s, which is not a UDP address", addr, udp.LocalAddr())
+		}
+
+		port := local.AddrPort().Port()
 
 		tcp, err := net.ListenTCP("tcp4", net.TCPAddrFromAddrPort(netip.AddrPortFrom(addr, port)))
 		if err == nil {
@@ -81,46 +95,52 @@ func listenPair(addr netip.Addr) (*net.UDPConn, *net.TCPListener, uint16, error)
 
 // newForwarder returns a forwarder bound and not yet serving, so its port can be
 // put in the guest's rules before anything can reach it.
-func newForwarder(policy *Policy, rec *recorder, gateway netip.Addr, upstreamPort uint16, log *slog.Logger,
+func newForwarder(policy *Policy, rec *recorder, gateway netip.Prefix, upstreamPort uint16, log *slog.Logger,
 	admit func(context.Context, []netip.Addr) error,
 ) (*forwarder, error) {
-	udp, tcp, port, err := listenPair(gateway)
+	udp, tcp, port, err := listenPair(gateway.Addr())
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	return &forwarder{
-		policy: policy, rec: rec, upstream: netip.AddrPortFrom(gateway, upstreamPort), log: log, admit: admit,
-		udp: udp, tcp: tcp, port: port, inFlight: make(chan struct{}, maxInFlight), ctx: ctx, cancel: cancel,
+		policy: policy, rec: rec, upstream: netip.AddrPortFrom(gateway.Addr(), upstreamPort), log: log, admit: admit,
+		udp: udp, tcp: tcp, port: port, inFlight: make(chan struct{}, maxInFlight), clients: gateway.Masked(),
 	}, nil
 }
 
-func (f *forwarder) serve() {
+// serve starts answering, until stop. WITHOUT THE CALLER'S CANCELLATION: a guest's
+// resolver lives as long as the guest, and the launch that attached it returns long
+// before that.
+func (f *forwarder) serve(ctx context.Context) {
+	ctx, f.cancel = context.WithCancel(context.WithoutCancel(ctx))
+
 	f.wg.Add(2)
 
 	go func() {
 		defer f.wg.Done()
-		f.serveUDP()
+		f.serveUDP(ctx)
 	}()
 
 	go func() {
 		defer f.wg.Done()
-		f.serveTCP()
+		f.serveTCP(ctx)
 	}()
 }
 
 // stop closes the sockets and waits for every query in flight. A forwarder that
 // was never served has nothing to wait for.
 func (f *forwarder) stop() {
-	f.cancel()
+	if f.cancel != nil {
+		f.cancel()
+	}
+
 	_ = f.udp.Close()
 	_ = f.tcp.Close()
 	f.wg.Wait()
 }
 
-func (f *forwarder) serveUDP() {
+func (f *forwarder) serveUDP(ctx context.Context) {
 	for {
 		buf := make([]byte, maxQuery+1)
 
@@ -132,6 +152,12 @@ func (f *forwarder) serveUDP() {
 			}
 
 			return
+		}
+
+		if !f.clients.Contains(client.Addr().Unmap()) {
+			f.rec.incomplete()
+
+			continue
 		}
 
 		// OVER THE BOUND IS DROPPED, as a guest's stub retries a lost datagram: a
@@ -151,7 +177,7 @@ func (f *forwarder) serveUDP() {
 			defer f.wg.Done()
 			defer func() { <-f.inFlight }()
 
-			resp := f.answer(f.ctx, buf[:n], f.exchangeUDP)
+			resp := f.answer(ctx, buf[:n], f.exchangeUDP)
 			if resp == nil {
 				return
 			}
@@ -163,7 +189,7 @@ func (f *forwarder) serveUDP() {
 	}
 }
 
-func (f *forwarder) serveTCP() {
+func (f *forwarder) serveTCP(ctx context.Context) {
 	for {
 		conn, err := f.tcp.AcceptTCP()
 		if err != nil {
@@ -190,13 +216,13 @@ func (f *forwarder) serveTCP() {
 			defer f.wg.Done()
 			defer func() { <-f.inFlight }()
 
-			f.serveConn(conn)
+			f.serveConn(ctx, conn)
 		}()
 	}
 }
 
 // serveConn answers one TCP client's queries, one at a time.
-func (f *forwarder) serveConn(conn *net.TCPConn) {
+func (f *forwarder) serveConn(ctx context.Context, conn *net.TCPConn) {
 	defer conn.Close()
 
 	// CLOSED ON STOP, which is what ends a read an idle client is holding.
@@ -205,26 +231,30 @@ func (f *forwarder) serveConn(conn *net.TCPConn) {
 
 	go func() {
 		select {
-		case <-f.ctx.Done():
+		case <-ctx.Done():
 			_ = conn.Close()
 		case <-done:
 		}
 	}()
 
 	for {
-		_ = conn.SetDeadline(time.Now().Add(tcpIdleLimit))
+		if err := conn.SetDeadline(time.Now().Add(tcpIdleLimit)); err != nil {
+			return
+		}
 
 		query, err := readFrame(conn, maxQuery)
 		if err != nil {
 			return
 		}
 
-		resp := f.answer(f.ctx, query, f.exchangeTCP)
+		resp := f.answer(ctx, query, f.exchangeTCP)
 		if resp == nil {
 			return
 		}
 
-		_ = conn.SetDeadline(time.Now().Add(tcpIdleLimit))
+		if err := conn.SetDeadline(time.Now().Add(tcpIdleLimit)); err != nil {
+			return
+		}
 
 		if err := writeFrame(conn, resp); err != nil {
 			return
@@ -267,7 +297,12 @@ func (f *forwarder) answer(ctx context.Context, query []byte, ask exchange) []by
 	ctx, cancel := context.WithTimeout(ctx, upstreamLimit)
 	defer cancel()
 
-	resp, err := ask(ctx, query)
+	forwarded := query
+	if f.policy.Listed() {
+		forwarded = plainQuery(query, read)
+	}
+
+	resp, err := ask(ctx, forwarded)
 	if err != nil {
 		// THE WHOLE ANSWER, and no more of it, is what a guest would have had from
 		// an upstream that lost its query: nothing, and its own retry.
@@ -307,7 +342,10 @@ func (f *forwarder) answer(ctx context.Context, query []byte, ask exchange) []by
 
 		if err := f.admit(ctx, v4); err != nil {
 			f.rec.incomplete()
-			f.log.Warn("could not admit what a listed name answered, so the guest's query fails", "error", err)
+
+			if !f.warnedAdmit.Swap(true) {
+				f.log.Warn("could not admit what a listed name answered, so the guest's query fails", "error", err)
+			}
 
 			return refusal(query, read, true, dnsmessage.RCodeServerFailure)
 		}
@@ -326,10 +364,12 @@ func (f *forwarder) exchangeUDP(ctx context.Context, query []byte) ([]byte, erro
 	defer conn.Close()
 
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
 	}
 
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
 	if _, err := conn.Write(query); err != nil {
@@ -354,10 +394,12 @@ func (f *forwarder) exchangeTCP(ctx context.Context, query []byte) ([]byte, erro
 	defer conn.Close()
 
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
 	}
 
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
 	if err := writeFrame(conn, query); err != nil {
@@ -391,7 +433,7 @@ func readFrame(r io.Reader, limit int) ([]byte, error) {
 // stub's first read may be its only one.
 func writeFrame(w io.Writer, msg []byte) error {
 	buf := make([]byte, 2+len(msg))
-	binary.BigEndian.PutUint16(buf, uint16(len(msg))) //nolint:gosec // a DNS message fits by construction: its reader bounds it.
+	binary.BigEndian.PutUint16(buf, uint16(len(msg)))
 	copy(buf[2:], msg)
 
 	_, err := w.Write(buf)

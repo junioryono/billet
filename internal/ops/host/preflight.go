@@ -678,7 +678,11 @@ func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config, 
 // names its guests resolve. A host that cannot only fails the check when a tier here
 // asks for a list: names are best effort, and a node with neither runs as it did.
 func checkEgress(ctx context.Context, env cli.Env, cfg *config.Config) error {
-	err := egress.Check(ctx)
+	return judgeEgress(env, cfg, egress.Check(ctx))
+}
+
+// judgeEgress is checkEgress given what the host answered.
+func judgeEgress(env cli.Env, cfg *config.Config, err error) error {
 	if err == nil {
 		fmt.Fprintf(env.Stdout, "egress   a tier's allowlist can be enforced and guests' names recorded\n")
 

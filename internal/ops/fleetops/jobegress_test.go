@@ -2,11 +2,13 @@ package fleetops
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/state"
 )
 
 func aListedEgress() *alloc.RecordedEgress {
@@ -63,9 +65,11 @@ func TestAnOpenJobDoesNotReadAsARefusedOne(t *testing.T) {
 		t.Errorf("an open job says:\n%s", out)
 	}
 
-	for _, refused := range []string{"denied", "refused", "ipv6"} {
-		if strings.Contains(out, refused) && !strings.Contains(out, "nothing was refused") {
-			t.Errorf("an open job says %q:\n%s", refused, out)
+	for line := range strings.SplitSeq(out, "\n") {
+		for _, label := range []string{"denied", "refused", "ipv6"} {
+			if strings.HasPrefix(line, label) {
+				t.Errorf("an open job has a %q line: %q", label, line)
+			}
 		}
 	}
 }
@@ -182,16 +186,18 @@ func TestTheJobPageCarriesNamesAndRefusals(t *testing.T) {
 	}
 }
 
+// DECODED INTO A MAP, because the field names are what a program reads: a round trip through
+// the same struct would pass a rename.
 func TestTheJSONRecordCarriesTheReportOrSaysWhyNot(t *testing.T) {
 	t.Parallel()
 
-	decode := func(network jobEgress) jobJSON {
+	decode := func(network jobEgress) map[string]any {
 		var out bytes.Buffer
 		if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, nil, nil, "", nil, network, nil); err != nil {
 			t.Fatal(err)
 		}
 
-		var got jobJSON
+		var got map[string]any
 		if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 			t.Fatalf("the record does not decode: %v", err)
 		}
@@ -199,16 +205,88 @@ func TestTheJSONRecordCarriesTheReportOrSaysWhyNot(t *testing.T) {
 		return got
 	}
 
-	got := decode(jobEgress{row: aListedEgress()})
-	if got.Egress == nil || got.Egress.Node != "epyc-1" || !got.Egress.Listed || got.Egress.DeniedPackets != 9 {
-		t.Fatalf("egress = %+v", got.Egress)
+	report, ok := decode(jobEgress{row: aListedEgress()})["egress"].(map[string]any)
+	if !ok || report["node"] != "epyc-1" || report["listed"] != true || report["denied_packets"] != float64(9) {
+		t.Fatalf("egress = %+v", report)
 	}
 
-	if got := decode(jobEgress{}); got.Egress != nil || got.EgressUnreadable != "" {
-		t.Fatalf("no report = %+v, %q", got.Egress, got.EgressUnreadable)
+	none := decode(jobEgress{})
+	if value, present := none["egress"]; !present || value != nil {
+		t.Fatalf("no report: egress is %v, present %v; want a null, never a report of zeros", value, present)
 	}
 
-	if got := decode(jobEgress{unreadable: "bad"}); got.Egress != nil || got.EgressUnreadable != "bad" {
-		t.Fatalf("unreadable = %+v, %q", got.Egress, got.EgressUnreadable)
+	if _, present := none["egress_unreadable"]; present {
+		t.Fatal("a job with no report says its row was unreadable")
+	}
+
+	unreadable := decode(jobEgress{unreadable: "bad"})
+	if unreadable["egress"] != nil || unreadable["egress_unreadable"] != "bad" {
+		t.Fatalf("unreadable = %+v", unreadable)
+	}
+}
+
+// THROUGH THE LEDGER AND THE COMMAND: `billet jobs show` prints names beside addresses and
+// what a list refused, its --html does too, and a row it cannot read says so rather than
+// reading as a job nothing watched.
+func TestJobsShowPrintsAJobsNetwork(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeCAConfig(t, stateDir)
+	report := aListedEgress().JobEgress
+	lease := seedJob(t, stateDir, jobSeed{requestID: 91, egress: &report, usage: &alloc.JobUsage{
+		Source: alloc.UsageSourceHost, Samples: 1, IntervalMillis: 1000, Unmeasured: []string{alloc.UsageEnergy},
+		Destinations: &alloc.JobDestinations{
+			Destinations: []alloc.JobDestination{{Addr: "198.51.100.1", SentBytes: 10, Connections: 1}},
+		},
+	}})
+
+	out := capture(t, func() {
+		if err := Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {
+			t.Fatalf("jobs show: %v", err)
+		}
+	})
+
+	for _, want := range []string{"github.com, edge.cdn.example", "evil.example 3", "203.0.113.7:443/tcp 7", "egress     listed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("jobs show has no %q:\n%s", want, out)
+		}
+	}
+
+	page := capture(t, func() {
+		if err := Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, "--html", lease}); err != nil {
+			t.Fatalf("jobs show --html: %v", err)
+		}
+	})
+
+	for _, want := range []string{"github.com, edge.cdn.example", "evil.example 3", `id="egress"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the job page has no %q", want)
+		}
+	}
+
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_egress SET report = 'nope' WHERE lease_id = $1`, lease)
+
+		return err
+	}); err != nil {
+		t.Fatalf("stage the row: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the ledger: %v", err)
+	}
+
+	broken := capture(t, func() {
+		if err := Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {
+			t.Fatalf("jobs show: %v", err)
+		}
+	})
+
+	if !strings.Contains(broken, "could not be read") || strings.Contains(broken, "no report recorded (one arrives") {
+		t.Errorf("a row the ledger cannot read said:\n%s", broken)
 	}
 }

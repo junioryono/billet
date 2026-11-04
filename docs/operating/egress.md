@@ -59,7 +59,7 @@ That is [GitHub's list](https://docs.github.com/en/actions/reference/runners/sel
 | an address no listed name answered, not in a listed prefix | the connection refused at once (a TCP reset, or an ICMP error) |
 | DNS to any resolver but its gateway, even one in a listed prefix | refused the same way |
 | IPv6 | every packet dropped and counted |
-| another guest on its bridge, even one in a listed prefix | refused |
+| another guest on its bridge, by address or by MAC, even one in a listed prefix | refused, and no peer can reach it either |
 
 **What is shown:**
 
@@ -80,7 +80,7 @@ complete   yes
 2. **Converge the host role** from the same release. It adds one rule to the guest firewall, so redirected DNS is not dropped, and that is a change to guest networking, which drains the node once.
 3. **Run `billet check`**, as root. The `egress` line says whether this host can apply a list, or why not, and it fails the check if a tier here has one and it cannot.
 
-A node that cannot apply a list still starts, since it may never be sent one. It refuses a listed launch and says why in its log, and runs open guests unwatched.
+A node that cannot apply a list still starts, since it may never be sent one. It refuses a listed launch and says why in its log, and runs open guests unwatched. Placement knows a node's wire and not this, so on a fleet with such a node a listed job's launch can fail there and be reassigned: `billet check` on each node is what finds it first.
 
 ## When something is refused that should not be
 

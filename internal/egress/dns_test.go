@@ -11,36 +11,36 @@ import (
 )
 
 // aQuery is what a stub sends: one question and an EDNS option.
-func aQuery(t testing.TB, name string, qtype dnsmessage.Type) []byte {
-	t.Helper()
+func aQuery(tb testing.TB, name string, qtype dnsmessage.Type) []byte {
+	tb.Helper()
 
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 0x1234, RecursionDesired: true})
 	if err := b.StartQuestions(); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	if err := b.Question(dnsmessage.Question{
 		Name: dnsmessage.MustNewName(name), Type: qtype, Class: dnsmessage.ClassINET,
 	}); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	if err := b.StartAdditionals(); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	var opt dnsmessage.ResourceHeader
 	if err := opt.SetEDNS0(1232, dnsmessage.RCodeSuccess, false); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	if err := b.OPTResource(opt, dnsmessage.OPTResource{}); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	out, err := b.Finish()
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	return out
@@ -60,32 +60,42 @@ func rawQuery(labels ...string) []byte {
 }
 
 // anAnswer is what the resolver says to q: a chain of names, then addresses.
-func anAnswer(t testing.TB, q []byte, chain []string, addrs ...netip.Addr) []byte {
-	t.Helper()
+func anAnswer(tb testing.TB, q []byte, chain []string, addrs ...netip.Addr) []byte {
+	tb.Helper()
 
+	out, err := answerTo(q, chain, addrs...)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	return out
+}
+
+// answerTo is anAnswer for a server's goroutine, where t.Fatal would stop the wrong one.
+func answerTo(q []byte, chain []string, addrs ...netip.Addr) ([]byte, error) {
 	var p dnsmessage.Parser
 
 	header, err := p.Start(q)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 
 	question, err := p.Question()
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: header.ID, Response: true, RecursionAvailable: true})
 	if err := b.StartQuestions(); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 
 	if err := b.Question(question); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 
 	if err := b.StartAnswers(); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 
 	owner := question.Name
@@ -95,7 +105,7 @@ func anAnswer(t testing.TB, q []byte, chain []string, addrs ...netip.Addr) []byt
 		if err := b.CNAMEResource(dnsmessage.ResourceHeader{
 			Name: owner, Class: dnsmessage.ClassINET, TTL: 60,
 		}, dnsmessage.CNAMEResource{CNAME: target}); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 
 		owner = target
@@ -111,16 +121,11 @@ func anAnswer(t testing.TB, q []byte, chain []string, addrs ...netip.Addr) []byt
 		}
 
 		if err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 	}
 
-	out, err := b.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return out
+	return b.Finish()
 }
 
 func TestAPlainQueryIsReadAsWhatItAsks(t *testing.T) {
@@ -301,12 +306,109 @@ func TestAnAnswerToAnotherQuestionIsRefused(t *testing.T) {
 	if _, err := readAnswer([]byte{1, 2, 3}, read); err == nil {
 		t.Error("three bytes were read as an answer")
 	}
+
+	// NONE, OR TWO: an answer to more or less than was asked.
+	for _, n := range []uint16{0, 2} {
+		wrongCount := anAnswer(t, q, nil, addr)
+		binary.BigEndian.PutUint16(wrongCount[4:], n)
+
+		if _, err := readAnswer(wrongCount, read); err == nil {
+			t.Errorf("an answer with %d questions was read", n)
+		}
+	}
+}
+
+// WHAT A LISTED GUEST'S QUERY IS FORWARDED AS IS WHAT THE POLICY READ: every byte a resolver
+// would discard is still a byte handed to it, and a guest writes them all.
+func TestAForwardedQueryHoldsOnlyWhatThePolicyRead(t *testing.T) {
+	t.Parallel()
+
+	const smuggled = "SMUGGLED-BYTES"
+
+	plain := aQuery(t, "allowed.example.", dnsmessage.TypeA)
+
+	read, ok := readQuestion(plain)
+	if !ok {
+		t.Fatal("not read")
+	}
+
+	// AN EDNS RECORD WITH OPTIONS FULL OF SOMETHING ELSE, AND MORE AFTER IT.
+	withOptions := slices.Clone(plain)
+	binary.BigEndian.PutUint16(withOptions[len(withOptions)-2:], uint16(len(smuggled)))
+	withOptions = append(append(withOptions, smuggled...), smuggled...)
+
+	// A SECOND ADDITIONAL RECORD, WHICH NO CLIENT SENDS.
+	twoRecords := slices.Clone(withOptions)
+	binary.BigEndian.PutUint16(twoRecords[10:], 2)
+
+	if _, ok := readQuestion(withOptions); !ok {
+		t.Fatal("this stages nothing: the query was refused before it was forwarded")
+	}
+
+	for name, q := range map[string][]byte{"options": withOptions, "two records": twoRecords} {
+		out := plainQuery(q, read)
+		if strings.Contains(string(out), smuggled) {
+			t.Errorf("%s: the forwarded query holds the guest's bytes: %q", name, out)
+		}
+
+		var p dnsmessage.Parser
+
+		header, err := p.Start(out)
+		if err != nil {
+			t.Fatalf("%s: the forwarded query does not parse: %v", name, err)
+		}
+
+		if !header.RecursionDesired || header.ID != 0x1234 {
+			t.Errorf("%s: header = %+v", name, header)
+		}
+
+		questions, err := p.AllQuestions()
+		if err != nil || len(questions) != 1 || questions[0].Name.String() != "allowed.example." {
+			t.Errorf("%s: questions = %+v, %v", name, questions, err)
+		}
+	}
+
+	// A BARE EDNS RECORD SURVIVES WHOLE, OR LARGE ANSWERS WOULD ALL GO TO TCP.
+	kept := plainQuery(plain, read)
+	if !slices.Equal(kept, plain) {
+		t.Errorf("a plain query changed:\n%x\n%x", kept, plain)
+	}
+
+	// AND NONE IS NOT INVENTED.
+	bare := rawQuery("allowed", "example")
+
+	bareRead, ok := readQuestion(bare)
+	if !ok {
+		t.Fatal("not read")
+	}
+
+	if got := plainQuery(bare, bareRead); binary.BigEndian.Uint16(got[10:]) != 0 {
+		t.Errorf("a query with no EDNS record got one: %x", got)
+	}
 }
 
 // A CNAME IS THE AUTHORITATIVE SERVER'S TO CHOOSE, and a guest may hold that server,
 // so one a terminal would act on is dropped and the rest of the answer kept.
 func TestAnAnswersUnprintableNameIsNotKept(t *testing.T) {
 	t.Parallel()
+
+	q := aQuery(t, "www.example.com.", dnsmessage.TypeA)
+
+	read, ok := readQuestion(q)
+	if !ok {
+		t.Fatal("not read")
+	}
+
+	addr := netip.MustParseAddr("192.0.2.1")
+
+	got, err := readAnswer(anAnswer(t, q, []string{"a\x1b[0m.example."}, addr), read)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(got.names, []string{"www.example.com"}) || !slices.Equal(got.addrs, []netip.Addr{addr}) {
+		t.Fatalf("names %q, addrs %v", got.names, got.addrs)
+	}
 
 	for name, want := range map[string]bool{
 		"edge.cdn.example":       true,
@@ -350,6 +452,12 @@ func FuzzReadQuestion(f *testing.F) {
 			t.Fatalf("a %d byte question section from a %d byte query", len(read.raw), len(q))
 		}
 
+		// AND WHAT IS FORWARDED IS ALWAYS ONE QUESTION A RESOLVER CAN PARSE.
+		var forwarded dnsmessage.Parser
+		if _, err := forwarded.Start(plainQuery(q, read)); err != nil {
+			t.Fatalf("the forwarded form of %x does not parse: %v", q, err)
+		}
+
 		// AND ITS REFUSAL IS ALWAYS ONE A CLIENT CAN PARSE.
 		var p dnsmessage.Parser
 		if _, err := p.Start(refusal(q, read, true, dnsmessage.RCodeRefused)); err != nil {
@@ -364,6 +472,7 @@ func FuzzReadAnswer(f *testing.F) {
 	q := aQuery(f, "www.example.com.", dnsmessage.TypeA)
 	f.Add(anAnswer(f, q, []string{"edge.example."}, netip.MustParseAddr("192.0.2.1")))
 	f.Add(anAnswer(f, q, nil, netip.MustParseAddr("2001:db8::1")))
+	f.Add(anAnswer(f, q, []string{"a\x1b[0m.example."}, netip.MustParseAddr("192.0.2.1")))
 	f.Add(q)
 
 	read, ok := readQuestion(q)

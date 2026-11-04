@@ -54,7 +54,7 @@ func readQuestion(q []byte) (question, bool) {
 	}
 
 	// NOTHING BUT THE QUESTION: an answer or authority section in a query is a
-	// place to carry bytes, and the additional section holds EDNS and no more.
+	// place to carry bytes, and plainQuery leaves the additional section behind.
 	if binary.BigEndian.Uint16(q[4:]) != 1 || binary.BigEndian.Uint16(q[6:]) != 0 ||
 		binary.BigEndian.Uint16(q[8:]) != 0 {
 		return question{}, false
@@ -112,6 +112,37 @@ func readQuestion(q []byte) (question, bool) {
 
 func labelByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_'
+}
+
+// plainQuery is what a listed guest's query is forwarded as: the header's flags a
+// resolver acts on, the question, and at most a bare EDNS record. A query is a bounded
+// message a guest writes every byte of, and what a resolver would discard is still bytes
+// handed to it, so only what the policy read leaves the host.
+func plainQuery(q []byte, read question) []byte {
+	const (
+		flagsKept  = flagRecursion | 0x0030 // and the authentic-data and checking-disabled bits
+		typeOPT    = 41
+		optMinimum = 11 // a root name, then a type, a class, a TTL and an empty data length
+	)
+
+	out := make([]byte, dnsHeaderLen, dnsHeaderLen+len(read.raw)+optMinimum)
+	copy(out, q[:2])
+	binary.BigEndian.PutUint16(out[2:], binary.BigEndian.Uint16(q[2:])&flagsKept)
+	binary.BigEndian.PutUint16(out[4:], 1)
+	out = append(out, read.raw...)
+
+	// THE SIZE AND THE DNSSEC FLAG OF AN EDNS RECORD, which change what the answer can
+	// hold; its options are the part a guest writes freely, and they stay behind.
+	at := dnsHeaderLen + len(read.raw)
+	if binary.BigEndian.Uint16(q[10:]) != 1 || len(q) < at+optMinimum || q[at] != 0 ||
+		binary.BigEndian.Uint16(q[at+1:]) != typeOPT {
+		return out
+	}
+
+	binary.BigEndian.PutUint16(out[10:], 1)
+	out = append(out, q[at:at+9]...)
+
+	return append(out, 0, 0)
 }
 
 // refusal is the answer to a query that is not forwarded, with rcode, echoing

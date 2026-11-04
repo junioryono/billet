@@ -21,6 +21,7 @@ type egressKernel struct {
 	scripts  []string
 	refuse   func(script string) error
 	onScript func(script string)
+	networks []string
 }
 
 func (k *egressKernel) run(_ context.Context, script string, args ...string) ([]byte, error) {
@@ -78,7 +79,15 @@ func egressHarness(t *testing.T, k *egressKernel) (*harness, *egress.Host) {
 	t.Helper()
 
 	host := egress.NewHost(t.TempDir(), slog.Default(), egress.WithRunner(k.run),
-		egress.WithGateway(func(string) (netip.Prefix, error) { return netip.MustParsePrefix("127.0.0.1/8"), nil }))
+		egress.WithConnectionForget(func(uint32) error { return nil }),
+		egress.WithGateway(func(network string) (netip.Prefix, error) {
+			k.mu.Lock()
+			defer k.mu.Unlock()
+
+			k.networks = append(k.networks, network)
+
+			return netip.MustParsePrefix("127.0.0.1/8"), nil
+		}))
 	t.Cleanup(host.Close)
 	host.Prepare(t.Context())
 
@@ -136,6 +145,7 @@ func TestAGuestsRulesAreInBeforeItsTapOrItsVMMExist(t *testing.T) {
 		sawRules       bool
 		rulesBeforeTap bool
 		rulesBeforeVMM bool
+		tap            string
 	)
 
 	k.onScript = func(script string) {
@@ -147,12 +157,26 @@ func TestAGuestsRulesAreInBeforeItsTapOrItsVMMExist(t *testing.T) {
 	h.refuse = func(_ string, args []string) error {
 		if slices.Contains(args, "tuntap") {
 			rulesBeforeTap = sawRules
+
+			if i := slices.Index(args, "dev"); i >= 0 {
+				tap = args[i+1]
+			}
 		}
 
 		return nil
 	}
 
 	launchListed(t, h, func(string) { rulesBeforeVMM = sawRules })
+
+	// ON THE TAP THE GUEST GOT, AND THE GATEWAY OF ITS BRIDGE: rules on any other name
+	// install cleanly and filter nothing.
+	if want := `guests { "` + tap + `" : jump job_` + theInstance; tap == "" || !k.holds(want) {
+		t.Errorf("no rule binds the guest's tap %q: %q", tap, k.all())
+	}
+
+	if want := h.p.bridgeFor(aSpec().Trust); !slices.Equal(k.networks, []string{want}) {
+		t.Errorf("the gateway was read from %q, want the guest's bridge %q", k.networks, want)
+	}
 
 	if !rulesBeforeTap {
 		t.Fatal("the tap existed before the guest's rules")
@@ -233,15 +257,41 @@ func TestAListIsRefusedWhereThereIsNoWayToApplyIt(t *testing.T) {
 	}
 }
 
-// AN OPEN GUEST ON A PROVIDER WITH NO HOST IS AS IT ALWAYS WAS.
+// AN OPEN GUEST ON A PROVIDER WITH NO HOST IS AS IT ALWAYS WAS: h.launch fails the test if
+// its launch does.
 func TestAGuestWithNoListNeedsNoHost(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t)
-	h.launch(t)
+	newHarness(t).launch(t)
+}
 
-	if h.p.EgressHost() != nil {
-		t.Fatal("a provider given no host has one")
+// A DESTROY TAKES THE RULES OFF WHILE IT STILL HOLDS THE LEASE: once it lets go, a launch of
+// this name can have rules of its own, and a detach after that would take those and run its
+// guest open. The jail is what the destroy removes last, so seeing it at the detach shows it
+// came ahead of that.
+func TestADestroyTakesTheRulesOffBeforeItLetsTheLeaseGo(t *testing.T) {
+	t.Parallel()
+
+	k := &egressKernel{}
+	h, _ := egressHarness(t, k)
+
+	launchListed(t, h, nil)
+
+	var jailAtDetach bool
+
+	k.onScript = func(script string) {
+		if strings.Contains(script, "delete chain bridge billet_egress job_"+theInstance) {
+			_, err := os.Stat(h.p.jailFor(theInstance).dir())
+			jailAtDetach = err == nil
+		}
+	}
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if !jailAtDetach {
+		t.Fatal("the rules came off after the destroy had finished with the lease")
 	}
 }
 
@@ -325,8 +375,9 @@ func TestAFailedLaunchTakesItsRulesOff(t *testing.T) {
 	}
 }
 
-// A LAUNCH THE UNWIND COULD NOT FINISH KEEPS ITS RULES: nothing has proved its guest gone,
-// and the Destroy that does prove it removes them.
+// A LAUNCH THE UNWIND COULD NOT FINISH KEEPS ITS RULES, and the Destroy that does finish it
+// takes them: an unwind that failed has not said what is left, so nothing here reads its
+// failure as proof.
 func TestALaunchThatCouldNotUnwindKeepsItsRules(t *testing.T) {
 	t.Parallel()
 
@@ -348,5 +399,15 @@ func TestALaunchThatCouldNotUnwindKeepsItsRules(t *testing.T) {
 
 	if k.holds("delete chain bridge billet_egress job_" + theInstance) {
 		t.Fatalf("rules came off a guest nothing has proved gone: %q", k.all())
+	}
+
+	h.disk.discardErr = nil
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if !k.holds("delete chain bridge billet_egress job_" + theInstance) {
+		t.Fatalf("the destroy that finished the job left its rules: %q", k.all())
 	}
 }

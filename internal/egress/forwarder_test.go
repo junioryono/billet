@@ -2,6 +2,7 @@ package egress
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -60,7 +61,6 @@ func aForwarder(p *Policy, j *journal, admitErr error) *forwarder {
 
 			return admitErr
 		},
-		ctx: context.Background(),
 	}
 }
 
@@ -210,6 +210,55 @@ func TestAListedGuestIsNotGivenAnAnswerThatCannotBeRead(t *testing.T) {
 	}
 }
 
+// A LISTED GUEST'S QUERY GOES UPSTREAM AS WHAT THE POLICY READ, through the forwarder and not
+// only the function that makes it.
+func TestAListedGuestsQueryIsForwardedPlain(t *testing.T) {
+	t.Parallel()
+
+	q := aQuery(t, "allowed.example.", dnsmessage.TypeA)
+
+	smuggling := slices.Clone(q)
+	binary.BigEndian.PutUint16(smuggling[len(smuggling)-2:], 8)
+	smuggling = append(smuggling, "SMUGGLED"...)
+
+	var heard []byte
+
+	f := aForwarder(listed(t, "allowed.example"), &journal{}, nil)
+
+	resp := f.answer(t.Context(), smuggling, func(_ context.Context, query []byte) ([]byte, error) {
+		heard = slices.Clone(query)
+
+		return anAnswer(t, q, nil, anAddr), nil
+	})
+
+	if got := rcode(t, resp); got != dnsmessage.RCodeSuccess {
+		t.Fatalf("rcode = %v", got)
+	}
+
+	if strings.Contains(string(heard), "SMUGGLED") {
+		t.Fatalf("the upstream heard the guest's bytes: %q", heard)
+	}
+}
+
+// AN ANSWER AN OPEN GUEST'S RECORD CANNOT READ IS STILL ITS ANSWER: only the record goes
+// without, since nothing was going to be admitted from it.
+func TestAnOpenGuestStillGetsAnAnswerThatCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	f := aForwarder(Observe(), &journal{}, nil)
+	q := aQuery(t, "asked.example.", dnsmessage.TypeA)
+	other := anAnswer(t, aQuery(t, "other.example.", dnsmessage.TypeA), nil, anAddr)
+
+	got := f.answer(t.Context(), q, func(context.Context, []byte) ([]byte, error) { return other, nil })
+	if !slices.Equal(got, other) {
+		t.Fatalf("answered %x, want the upstream's answer unchanged", got)
+	}
+
+	if rec := f.rec.freeze(counts{}); !rec.Incomplete || len(rec.Names) != 0 {
+		t.Fatalf("record = %+v", rec)
+	}
+}
+
 // AN OPEN GUEST IS ONLY WATCHED: anything it asks goes through unchanged, what cannot
 // be read costs the record, and nothing is ever admitted because nothing is judged.
 func TestAnOpenGuestIsOnlyWatched(t *testing.T) {
@@ -265,11 +314,12 @@ func TestNoAnswerFromUpstreamIsNoAnswer(t *testing.T) {
 
 // fakeResolver answers on one port for both protocols, counting what it heard.
 type fakeResolver struct {
-	t      *testing.T
-	port   uint16
-	mu     sync.Mutex
-	asked  []string
-	answer func(q []byte) []byte
+	t         *testing.T
+	port      uint16
+	mu        sync.Mutex
+	asked     []string
+	protocols []string
+	answer    func(q []byte) []byte
 }
 
 func startResolver(t *testing.T) *fakeResolver {
@@ -281,7 +331,14 @@ func startResolver(t *testing.T) *fakeResolver {
 	}
 
 	r := &fakeResolver{t: t, port: port}
-	r.answer = func(q []byte) []byte { return anAnswer(t, q, nil, anAddr) }
+	r.answer = func(q []byte) []byte {
+		answer, err := answerTo(q, nil, anAddr)
+		if err != nil {
+			t.Errorf("the resolver was asked %x: %v", q, err)
+		}
+
+		return answer
+	}
 
 	var wg sync.WaitGroup
 
@@ -298,7 +355,7 @@ func startResolver(t *testing.T) *fakeResolver {
 				return
 			}
 
-			r.heard(buf[:n])
+			r.heard("udp", buf[:n])
 
 			if _, err := udp.WriteToUDPAddrPort(r.answer(buf[:n]), from); err != nil {
 				return
@@ -317,8 +374,8 @@ func startResolver(t *testing.T) *fakeResolver {
 
 			query, err := readFrame(conn, maxQuery)
 			if err == nil {
-				r.heard(query)
-				_ = writeFrame(conn, r.answer(query))
+				r.heard("tcp", query)
+				_ = writeFrame(conn, r.answer(query)) //nolint:errcheck // a client that left fails for itself
 			}
 
 			_ = conn.Close()
@@ -335,13 +392,20 @@ func startResolver(t *testing.T) *fakeResolver {
 	return r
 }
 
-func (r *fakeResolver) heard(q []byte) {
+func (r *fakeResolver) heard(protocol string, q []byte) {
 	read, _ := readQuestion(q)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.asked = append(r.asked, read.name)
+	r.asked, r.protocols = append(r.asked, read.name), append(r.protocols, protocol)
+}
+
+func (r *fakeResolver) protocolsHeard() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return slices.Clone(r.protocols)
 }
 
 func (r *fakeResolver) names() []string {
@@ -355,7 +419,7 @@ func (r *fakeResolver) names() []string {
 func servedForwarder(t *testing.T, r *fakeResolver, p *Policy, j *journal) *forwarder {
 	t.Helper()
 
-	f, err := newForwarder(p, newRecorder(p.Listed(), false), netip.MustParseAddr("127.0.0.1"), r.port, slog.Default(),
+	f, err := newForwarder(p, newRecorder(p.Listed(), false), netip.MustParsePrefix("127.0.0.1/8"), r.port, slog.Default(),
 		func(_ context.Context, addrs []netip.Addr) error {
 			j.add("admit %v", addrs)
 
@@ -365,7 +429,7 @@ func servedForwarder(t *testing.T, r *fakeResolver, p *Policy, j *journal) *forw
 		t.Fatal(err)
 	}
 
-	f.serve()
+	f.serve(t.Context())
 	t.Cleanup(f.stop)
 
 	return f
@@ -448,6 +512,11 @@ func TestAForwarderJudgesBothProtocolsAlike(t *testing.T) {
 		t.Fatalf("the upstream heard %q, and should have heard only the allowed name, once a protocol", got)
 	}
 
+	// EACH ASKED OVER ITS OWN PROTOCOL: a large answer needs TCP all the way up.
+	if got := r.protocolsHeard(); !slices.Contains(got, "udp") || !slices.Contains(got, "tcp") {
+		t.Fatalf("the upstream was asked over %q", got)
+	}
+
 	if events := j.all(); len(events) != 2 || events[0] != "admit [192.0.2.10]" {
 		t.Fatalf("admits = %q", events)
 	}
@@ -462,8 +531,82 @@ func TestAForwarderJudgesBothProtocolsAlike(t *testing.T) {
 func TestAnOversizedTCPQueryIsNotRead(t *testing.T) {
 	t.Parallel()
 
-	if _, err := readFrame(strings.NewReader("\xff\xff"), maxQuery); err == nil {
-		t.Fatal("a 65535 byte query was read")
+	frame := "\xff\xff" + strings.Repeat("x", 65535)
+
+	_, err := readFrame(strings.NewReader(frame), maxQuery)
+	if err == nil || !strings.Contains(err.Error(), "is over the") {
+		t.Fatalf("readFrame = %v, want the size refused", err)
+	}
+}
+
+// A QUERY FROM OUTSIDE THE GUEST'S SUBNET GOES UNANSWERED: an answer would be the host sending
+// the query's bytes wherever the query said it was from.
+func TestAQueryFromOutsideTheSubnetIsNotAnswered(t *testing.T) {
+	t.Parallel()
+
+	r := startResolver(t)
+	f := servedForwarder(t, r, Observe(), &journal{})
+	f.clients = netip.MustParsePrefix("10.0.0.0/8")
+
+	conn, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(
+		netip.MustParseAddr("127.0.0.1"), f.port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(aQuery(t, "outside.example.", dnsmessage.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+
+	// THE NEXT QUERY PROVES THE FIRST WAS READ: the socket is served in order, and this
+	// one is from inside.
+	f.clients = netip.MustParsePrefix("127.0.0.0/8")
+
+	if got := rcode(t, askUDP(t, f.port, aQuery(t, "inside.example.", dnsmessage.TypeA))); got != dnsmessage.RCodeSuccess {
+		t.Fatalf("rcode = %v", got)
+	}
+}
+
+// OVER ITS BOUND A RESOLVER DROPS RATHER THAN QUEUES: a query is held for as long as its
+// upstream takes, and a guest flooding its own resolver waits on itself, not on the host.
+func TestAResolverOverItsBoundDropsAQuery(t *testing.T) {
+	t.Parallel()
+
+	r := startResolver(t)
+	f := servedForwarder(t, r, Observe(), &journal{})
+
+	for range maxInFlight {
+		f.inFlight <- struct{}{}
+	}
+
+	t.Cleanup(func() {
+		for range maxInFlight {
+			<-f.inFlight
+		}
+	})
+
+	conn, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(
+		netip.MustParseAddr("127.0.0.1"), f.port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(aQuery(t, "dropped.example.", dnsmessage.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := conn.Read(make([]byte, 512)); err == nil {
+		t.Fatalf("answered %d bytes over the bound", n)
+	}
+
+	if len(r.names()) != 0 {
+		t.Fatalf("the upstream heard %q", r.names())
 	}
 }
 
@@ -503,10 +646,86 @@ func TestStoppingAResolverEndsWhatItHolds(t *testing.T) {
 		f.stop()
 	}()
 
+	// BELOW THE LIMIT IT WOULD OTHERWISE FALL BACK TO, or a stop that waits it out passes.
 	select {
 	case <-stopped:
-	case <-time.After(tcpIdleLimit):
+	case <-time.After(tcpIdleLimit / 2):
 		t.Fatal("stop waited for an idle client's own limit")
+	}
+}
+
+// NOR ON AN UPSTREAM THAT WILL NEVER ANSWER, over either protocol: stop cancels the question.
+func TestStoppingAResolverEndsAQuestionInFlight(t *testing.T) {
+	t.Parallel()
+
+	for name, ask := range map[string]func(*forwarder) exchange{
+		"udp": func(f *forwarder) exchange { return f.exchangeUDP },
+		"tcp": func(f *forwarder) exchange { return f.exchangeTCP },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			udp, tcp, port, err := listenPair(netip.MustParseAddr("127.0.0.1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// BOUND AND SILENT: a TCP connect succeeds, and nothing ever comes back.
+			t.Cleanup(func() {
+				_ = udp.Close()
+				_ = tcp.Close()
+			})
+
+			f, err := newForwarder(Observe(), newRecorder(false, false), netip.MustParsePrefix("127.0.0.1/8"), port,
+				slog.Default(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.stop()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			returned := make(chan error, 1)
+
+			go func() {
+				_, err := ask(f)(ctx, aQuery(t, "silent.example.", dnsmessage.TypeA))
+				returned <- err
+			}()
+
+			cancel()
+
+			select {
+			case err := <-returned:
+				if err == nil {
+					t.Fatal("a question nobody answered returned an answer")
+				}
+			case <-time.After(upstreamLimit / 2):
+				t.Fatal("a cancelled question waited out its upstream")
+			}
+		})
+	}
+}
+
+// A QUESTION HAS A LIMIT OF ITS OWN, whatever the resolver's life is: past it the guest gets
+// what a lost query gets.
+func TestAQuestionsWaitIsBounded(t *testing.T) {
+	t.Parallel()
+
+	f := aForwarder(Observe(), &journal{}, nil)
+
+	var deadline time.Time
+
+	got := f.answer(t.Context(), aQuery(t, "slow.example.", dnsmessage.TypeA),
+		func(ctx context.Context, _ []byte) ([]byte, error) {
+			deadline, _ = ctx.Deadline()
+
+			return nil, errors.New("timed out")
+		})
+	if got != nil {
+		t.Fatalf("answered %x", got)
+	}
+
+	if deadline.IsZero() || time.Until(deadline) > upstreamLimit {
+		t.Fatalf("the question's deadline is %v", deadline)
 	}
 }
 
@@ -528,6 +747,10 @@ func TestARecordKeepsWithinItsBounds(t *testing.T) {
 
 	if rec.RefusedQueries != MaxRefusedNames+5 || len(rec.Refused) != MaxRefusedNames || !rec.Incomplete {
 		t.Fatalf("refused %d, kept %d, incomplete %v", rec.RefusedQueries, len(rec.Refused), rec.Incomplete)
+	}
+
+	if rec.Refused[0].Name != "n0.example" {
+		t.Fatalf("refused = %+v", rec.Refused[:2])
 	}
 
 	if got := rec.Names[anAddr]; len(got) != MaxNamesPerAddr || got[0] != "a.example" {
@@ -554,5 +777,23 @@ func TestARecordKeepsWithinItsBounds(t *testing.T) {
 
 	if rec := full.freeze(counts{}); len(rec.Names) != MaxNamedAddrs || !rec.Incomplete {
 		t.Fatalf("kept %d addresses, incomplete %v", len(rec.Names), rec.Incomplete)
+	}
+}
+
+// WHAT IS REFUSED MOST COMES FIRST, so the report's sixty-four are the ones that matter.
+func TestARecordListsWhatWasRefusedMostFirst(t *testing.T) {
+	t.Parallel()
+
+	r := newRecorder(true, false)
+
+	for _, name := range []string{"once.example", "thrice.example", "thrice.example", "thrice.example", "a.example"} {
+		r.refuse(name)
+	}
+
+	got := r.freeze(counts{}).Refused
+	want := []Refused{{"thrice.example", 3}, {"a.example", 1}, {"once.example", 1}}
+
+	if !slices.Equal(got, want) {
+		t.Fatalf("refused = %+v, want %+v", got, want)
 	}
 }

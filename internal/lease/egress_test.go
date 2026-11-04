@@ -43,7 +43,21 @@ func TestAnEgressReportTheLedgerShouldNotKeepIsRefused(t *testing.T) {
 		change func(*JobEgress)
 		want   string
 	}{
-		"negative queries":  {func(e *JobEgress) { e.Queries = -1 }, "negative count"},
+		"negative queries": {func(e *JobEgress) { e.Queries = -1 }, "negative count"},
+		"negative refused": {func(e *JobEgress) { e.RefusedQueries = -1 }, "negative count"},
+		"negative outside": {func(e *JobEgress) { e.OutsideResolverPackets = -1 }, "negative count"},
+		"a negative port":  {func(e *JobEgress) { e.Denied[0].Port = -1 }, "port -1"},
+		"open, refused queries": {func(e *JobEgress) {
+			*e = JobEgress{Queries: 2, RefusedQueries: 1}
+		}, "no list"},
+		"open, refused names": {func(e *JobEgress) {
+			*e = JobEgress{RefusedNames: []EgressRefusal{{Name: "a.example", Count: 1}}}
+		}, "no list"},
+		"open, denied packets": {func(e *JobEgress) { *e = JobEgress{DeniedPackets: 1} }, "no list"},
+		"open, IPv6 packets":   {func(e *JobEgress) { *e = JobEgress{IPv6Packets: 1} }, "no list"},
+		"open, denied destinations": {func(e *JobEgress) {
+			*e = JobEgress{Denied: []EgressDenial{{Addr: "203.0.113.7", Protocol: "tcp", Port: 1}}}
+		}, "no list"},
 		"negative denied":   {func(e *JobEgress) { e.DeniedPackets = -1 }, "negative count"},
 		"negative IPv6":     {func(e *JobEgress) { e.IPv6Packets = -1 }, "negative count"},
 		"more refused":      {func(e *JobEgress) { e.RefusedQueries = 11 }, "11 refused of 10"},

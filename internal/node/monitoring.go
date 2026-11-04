@@ -650,7 +650,7 @@ func (r *Runner) egressPolicy(tier *nodeapi.TierSpec) (*egress.Policy, error) {
 			return egress.Observe(), nil
 		}
 
-		return nil, nil
+		return nil, nil //nolint:nilnil // no policy is a state, not an error
 	}
 
 	enforcer, ok := r.provider.(provider.EgressEnforcer)
@@ -725,6 +725,12 @@ func jobEgressOf(rec egress.Record, destinations *alloc.JobDestinations) alloc.J
 		// ONE COUNTER READ AND THE OTHER NOT MUST STILL BE A REPORT: the outside
 		// resolver's packets are a part of the denied ones.
 		OutsideResolverPackets: min(rec.OutsideResolverPackets, rec.DeniedPackets),
+	}
+
+	// WHAT A REPORT LEAVES OUT IT SAYS IT LEFT OUT: the counts stay whole, and the list
+	// of what they counted is then a lower bound.
+	if len(rec.Refused) > alloc.MaxEgressRefusedNames || len(rec.Denied) > alloc.MaxEgressDenied {
+		out.Incomplete = true
 	}
 
 	for _, n := range rec.Refused[:min(len(rec.Refused), alloc.MaxEgressRefusedNames)] {

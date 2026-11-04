@@ -87,6 +87,7 @@
     "energy_source": "rapl"
   },
   "guest": null,
+  "egress": null,
   "window": {
     "from": "2026-10-09T10:00:30Z",
     "to": "2026-10-09T10:01:31Z",

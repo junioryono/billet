@@ -41,6 +41,7 @@ type jobSeed struct {
 	job       *alloc.HistoryJob
 	usage     *alloc.JobUsage
 	series    *alloc.UsageSeries
+	egress    *alloc.JobEgress
 }
 
 // seedJob stages a job through the real allocator and returns its lease.
@@ -85,6 +86,11 @@ func seedJob(t *testing.T, stateDir string, seed jobSeed) string {
 	if seed.job != nil {
 		if err := a.RecordJobIdentity(t.Context(), lease.ID, *seed.job); err != nil {
 			t.Fatalf("RecordJobIdentity: %v", err)
+		}
+	}
+	if seed.egress != nil {
+		if err := a.RecordLeaseEgress(t.Context(), lease.ID, lease.Epoch, *seed.egress); err != nil {
+			t.Fatalf("RecordLeaseEgress: %v", err)
 		}
 	}
 	if seed.usage != nil {

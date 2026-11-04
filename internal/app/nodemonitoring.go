@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/metrics"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
@@ -20,9 +22,13 @@ import (
 // FirecrackerOptions are the provider options node configuration implies
 // beyond the logger: with node.monitoring, the jailer is asked to account for
 // memory and io where the host proves it can. billet check builds its provider
-// with them too, so it refuses what the node would.
+// with them too, so it refuses what the node would. The egress host does nothing
+// until a node prepares it, so a provider built only to ask changes nothing.
 func FirecrackerOptions(cfg *config.Config) []firecracker.Option {
-	opts := []firecracker.Option{firecracker.WithLogger(slog.Default())}
+	opts := []firecracker.Option{
+		firecracker.WithLogger(slog.Default()),
+		firecracker.WithEgress(egress.NewHost(filepath.Join(cfg.Node.StateDir, egressStateDir), slog.Default())),
+	}
 	if cfg.Node.Monitoring != nil {
 		opts = append(opts, firecracker.WithJobAccounting())
 	}

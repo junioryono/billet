@@ -38,6 +38,11 @@ const (
 // ErrNotReady wraps why a host cannot attach anything.
 var ErrNotReady = errors.New("this host cannot enforce a network policy")
 
+// errRulesUncertain says rules may be installed that could not be removed: nft failing
+// is not proof its transaction did not commit. Even an open guest does not start under
+// it, since its DNS may be redirected to a resolver that has gone.
+var errRulesUncertain = errors.New("egress: rules may be installed, and could not be removed")
+
 // Attachment names one guest's interface.
 type Attachment struct {
 	// Key names the guest: its instance's name, unique while it lives.
@@ -57,6 +62,10 @@ type attached struct {
 	Attachment
 	mark   uint32
 	listed bool
+	policy *Policy
+	// gateway and local are what its rules were made from, for putting them back.
+	gateway netip.Prefix
+	local   []netip.Addr
 
 	// fwd and rec are nil for rules found with no way to serve them.
 	fwd *forwarder
@@ -76,6 +85,7 @@ type Host struct {
 	run      runFunc
 	addrOf   func(iface string) (netip.Prefix, error)
 	locals   func() ([]netip.Addr, error)
+	forget   func(mark uint32) error
 	files    durablefile.Installer
 	// upstreamPort is where the host's resolver answers, upstreamDNSPort but in a test.
 	upstreamPort uint16
@@ -91,6 +101,9 @@ type Host struct {
 	// foundOnStart are the guests earlier processes left rules for, until
 	// Reconcile has judged them.
 	foundOnStart map[string]*attached
+	// filesJudged says the files with no rules behind them have been judged, which only
+	// the first Reconcile can do: until then nothing has said which guests are running.
+	filesJudged bool
 	// byIface is who the rules matching an interface name belong to, which a
 	// launch reusing the name must clear.
 	byIface map[string]string
@@ -108,6 +121,12 @@ func WithRunner(run func(ctx context.Context, script string, args ...string) ([]
 	return func(h *Host) { h.run = run }
 }
 
+// WithConnectionForget replaces deleting a guest's connections from the tracker, for a
+// test on a machine with none.
+func WithConnectionForget(forget func(mark uint32) error) Option {
+	return func(h *Host) { h.forget = forget }
+}
+
 // WithLocalAddresses replaces reading this host's addresses, for a test that wants to
 // know what they are.
 func WithLocalAddresses(local func() ([]netip.Addr, error)) Option {
@@ -123,7 +142,7 @@ func WithGateway(addrOf func(iface string) (netip.Prefix, error)) Option {
 // It is not ready until Prepare has said so.
 func NewHost(stateDir string, log *slog.Logger, opts ...Option) *Host {
 	h := &Host{
-		log: log, stateDir: stateDir, run: runNft, addrOf: interfaceAddress, locals: localAddresses, upstreamPort: upstreamDNSPort,
+		log: log, stateDir: stateDir, run: runNft, addrOf: interfaceAddress, locals: localAddresses, forget: forgetConnections, upstreamPort: upstreamDNSPort,
 		notReady: fmt.Errorf("%w: it has not been prepared", ErrNotReady),
 		live:     map[string]*attached{}, foundOnStart: map[string]*attached{}, byIface: map[string]string{},
 		slots: map[uint32]struct{}{}, done: map[string]Record{},
@@ -348,19 +367,23 @@ func (h *Host) findExisting(ctx context.Context) error {
 
 	h.mu.Unlock()
 
-	h.removeFilesWithoutRules(found)
-
 	return nil
 }
 
-// removeFilesWithoutRules removes what a process that died between writing a
-// guest's file and installing its rules left. Before anything can be attaching,
-// which is the only time a file with no rules means nothing.
-func (h *Host) removeFilesWithoutRules(found map[string]*attached) {
+// judgeFilesWithoutRules reads the files no rule stands behind, given what is running.
+// Before anything can be attaching, since the first recovery comes before the first
+// launch, which is the only time a file with no rules cannot be one mid-attach.
+//
+// A FILE FOR A GUEST THAT IS NOT RUNNING, OR AN OPEN ONE, IS NOTHING: a process died
+// between writing it and installing the rules. A LISTED GUEST THAT IS RUNNING HAS LOST
+// ITS RULES, and is running open: the rules go back, and what they count from here is
+// marked as not the whole job. Reading this as nothing, and deleting the file, is how a
+// flushed firewall would have left a tier's job open with no record it ever had a list.
+func (h *Host) judgeFilesWithoutRules(ctx context.Context, running map[string]bool) {
 	entries, err := os.ReadDir(h.stateDir)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			h.log.Warn("could not look for stale guest policy files", "dir", h.stateDir, "error", err)
+			h.log.Warn("could not look for guest policy files with no rules", "dir", h.stateDir, "error", err)
 		}
 
 		return
@@ -368,10 +391,135 @@ func (h *Host) removeFilesWithoutRules(found map[string]*attached) {
 
 	for _, e := range entries {
 		key, ours := strings.CutSuffix(e.Name(), recordSuffix)
-		if _, held := found[key]; ours && !held && keyRe.MatchString(key) {
-			h.removeFile(key)
+		if !ours || !keyRe.MatchString(key) {
+			continue
 		}
+
+		h.mu.Lock()
+		_, live := h.live[key]
+		_, found := h.foundOnStart[key]
+		h.mu.Unlock()
+
+		if live || found {
+			continue
+		}
+
+		file, err := h.readFile(key)
+		if err != nil || !running[key] || !file.Listed {
+			h.removeFile(key)
+
+			continue
+		}
+
+		h.restoreRules(ctx, file)
 	}
+}
+
+// restoreRules puts a running listed guest's rules back from its file.
+func (h *Host) restoreRules(ctx context.Context, file attachmentFile) {
+	h.log.Error("a running guest with a network allowlist has lost its rules, so it has been running "+
+		"open; they are being put back. Something other than billet removed them: `nft flush ruleset`, "+
+		"or a firewall service that does", "guest", file.Key)
+
+	p, err := Compile(file.Allow)
+	if err == nil {
+		err = h.ensureTables(ctx)
+	}
+
+	if err == nil {
+		err = h.attach(ctx, Attachment{Key: file.Key, Interface: file.Interface, Network: file.Network,
+			Kind: file.Kind}, p)
+	}
+
+	if err != nil {
+		h.log.Error("could not put a running guest's network rules back, so it is still running open",
+			"guest", file.Key, "error", err)
+
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if a := h.live[file.Key]; a != nil {
+		a.rec.incomplete()
+	}
+}
+
+// ensureTables creates billet's tables if they have gone.
+func (h *Host) ensureTables(ctx context.Context) error {
+	_, err := h.nft(ctx, "", "list", "table", "bridge", "billet_egress")
+	if err == nil {
+		return nil
+	}
+
+	if !absent(err) {
+		return err
+	}
+
+	_, err = h.nft(ctx, baseScript(), "-f", "-")
+
+	return err
+}
+
+// verifyLive checks that this process's listed guests still have their rules, and puts
+// back any that have gone. Recovery runs at every registration, so a flush is found at
+// the next, rather than only when the job ends.
+func (h *Host) verifyLive(ctx context.Context) {
+	h.mu.Lock()
+	guests := slices.Collect(maps.Values(h.live))
+	h.mu.Unlock()
+
+	for _, a := range guests {
+		if !a.listed || a.fwd == nil {
+			continue
+		}
+
+		family, name, _ := strings.Cut(a.Kind.table(), " ")
+		if _, err := h.nft(ctx, "", "list", "chain", family, name, "job_"+a.Key); !absent(err) {
+			continue
+		}
+
+		h.reinstall(ctx, a)
+	}
+}
+
+// reinstall puts a live listed guest's rules back. Its set is empty again, so what its
+// names admitted must be asked for again, which closes rather than opens.
+func (h *Host) reinstall(ctx context.Context, a *attached) {
+	h.log.Error("a running guest with a network allowlist has lost its rules, so it has been running "+
+		"open; they are being put back. Something other than billet removed them: `nft flush ruleset`, "+
+		"or a firewall service that does", "guest", a.Key)
+
+	h.mu.Lock()
+	_, still := h.live[a.Key]
+	h.mu.Unlock()
+
+	if !still {
+		return
+	}
+
+	err := h.ensureTables(ctx)
+	if err == nil {
+		_, err = h.nft(ctx, attachScript(binding{
+			key: a.Key, iface: a.Interface, kind: a.Kind, gateway: a.gateway, mark: a.mark, port: a.fwd.port,
+			listed: true, prefixes: a.policy.prefixes, local: a.local,
+		}), "-f", "-")
+	}
+
+	if err != nil {
+		h.log.Error("could not put a running guest's network rules back, so it is still running open",
+			"guest", a.Key, "error", err)
+
+		return
+	}
+
+	a.rec.incomplete()
+
+	a.admitMu.Lock()
+	defer a.admitMu.Unlock()
+
+	a.admitted = map[netip.Addr]struct{}{}
 }
 
 // Ready says whether a listed guest can be attached here: nil, or why not.
@@ -418,7 +566,7 @@ func (h *Host) Attach(ctx context.Context, a Attachment, p *Policy) error {
 	}
 
 	err := h.attach(ctx, a, p)
-	if err != nil && !p.Listed() {
+	if err != nil && !p.Listed() && !errors.Is(err, errRulesUncertain) {
 		h.log.Warn("could not watch a guest's DNS; its names will not be recorded", "guest", a.Key, "error", err)
 
 		return nil
@@ -467,10 +615,7 @@ func (h *Host) clearName(ctx context.Context, iface, key string) error {
 			errs = append(errs, err)
 
 			// KEPT, so the next attempt finds it rather than the kernel's refusal.
-			h.mu.Lock()
-			h.foundOnStart[a.Key] = a
-			h.byIface[a.Interface] = a.Key
-			h.mu.Unlock()
+			h.keepForLater(a)
 		}
 	}
 
@@ -525,7 +670,7 @@ func (h *Host) freeMark(mark uint32) {
 // THE FILE BEFORE THE RULES: a process that dies between the two leaves a file
 // Reconcile can throw away. The other order leaves rules nobody can say the
 // policy of.
-func (h *Host) attach(ctx context.Context, a Attachment, p *Policy) (err error) {
+func (h *Host) attach(ctx context.Context, a Attachment, p *Policy) error {
 	gateway, err := h.addrOf(a.Network)
 	if err != nil {
 		return err
@@ -546,25 +691,29 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy) (err error) 
 		return err
 	}
 
+	// KEPT WITH THE RULES when they may be installed: the mark and the file are how
+	// whoever clears them later names them.
+	done, uncertain := false, false
+
 	defer func() {
-		if err != nil {
+		if !done && !uncertain {
 			h.freeMark(mark)
 		}
 	}()
 
 	guest := &attached{
-		Attachment: a, mark: mark, listed: p.Listed(), rec: newRecorder(p.Listed(), false),
-		admitted: map[netip.Addr]struct{}{},
+		Attachment: a, mark: mark, listed: p.Listed(), policy: p, gateway: gateway, local: local,
+		rec: newRecorder(p.Listed(), false), admitted: map[netip.Addr]struct{}{},
 	}
 
-	guest.fwd, err = newForwarder(p, guest.rec, gateway.Addr(), h.upstreamPort, h.log.With("guest", a.Key),
+	guest.fwd, err = newForwarder(p, guest.rec, gateway, h.upstreamPort, h.log.With("guest", a.Key),
 		func(ctx context.Context, addrs []netip.Addr) error { return h.admit(ctx, guest, addrs) })
 	if err != nil {
 		return err
 	}
 
 	defer func() {
-		if err != nil {
+		if !done {
 			guest.fwd.stop()
 		}
 	}()
@@ -574,7 +723,7 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy) (err error) 
 	}
 
 	defer func() {
-		if err != nil {
+		if !done && !uncertain {
 			h.removeFile(a.Key)
 		}
 	}()
@@ -583,18 +732,63 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy) (err error) 
 		key: a.Key, iface: a.Interface, kind: a.Kind, gateway: gateway, mark: mark, port: guest.fwd.port,
 		listed: p.Listed(), prefixes: p.prefixes, local: local,
 	}), "-f", "-"); err != nil {
-		return fmt.Errorf("egress: install the rules of %s: %w", a.Key, err)
+		err = fmt.Errorf("egress: install the rules of %s: %w", a.Key, err)
+
+		if settleErr := h.settleFailedInstall(ctx, guest); settleErr != nil {
+			uncertain = true
+
+			return fmt.Errorf("%w: %w: %w", errRulesUncertain, err, settleErr)
+		}
+
+		return err
 	}
 
-	guest.fwd.serve()
+	guest.fwd.serve(ctx)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	h.live[a.Key] = guest
 	h.byIface[a.Interface] = a.Key
+	done = true
 
 	return nil
+}
+
+// settleFailedInstall establishes that a failed install left nothing, by removing what
+// it would have made: a transaction is all or none, so absence is proof of none. If
+// that fails too the guest's rules stay on the books for its unwind, the next guest on
+// its interface and the next recovery.
+func (h *Host) settleFailedInstall(ctx context.Context, a *attached) error {
+	ctx = context.WithoutCancel(ctx)
+
+	_, err := h.nft(ctx, detachScript(a.Key, a.Interface, a.Kind, a.mark, a.listed), "-f", "-")
+	if err == nil || absent(err) {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.foundOnStart[a.Key] = &attached{Attachment: a.Attachment, mark: a.mark}
+	h.byIface[a.Interface] = a.Key
+
+	return err
+}
+
+// keepForLater puts rules that would not go back on the books, for the next guest on
+// their interface and the next recovery. Unless a guest has taken their interface since,
+// which has cleared them.
+func (h *Host) keepForLater(a *attached) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if holder, held := h.byIface[a.Interface]; held && holder != a.Key {
+		return
+	}
+
+	h.foundOnStart[a.Key] = a
+	h.byIface[a.Interface] = a.Key
 }
 
 // admit adds addresses to a guest's set and returns once they are there. What is
@@ -646,8 +840,15 @@ func (h *Host) Detach(ctx context.Context, key string) {
 		a.fwd.stop()
 	}
 
+	// A LIST NOTHING COULD SERVE STILL HAS WHAT THE KERNEL COUNTED: a guest whose
+	// adoption failed, or whose file was gone, is reported as a part of the story.
+	listed := a.listed
+	if a.rec == nil && h.hasDenyChain(ctx, a) {
+		listed, a.rec = true, newRecorder(true, true)
+	}
+
 	var c counts
-	if a.listed {
+	if listed {
 		c = h.readCounts(ctx, a)
 	}
 
@@ -658,11 +859,7 @@ func (h *Host) Detach(ctx context.Context, key string) {
 	if err := h.remove(ctx, a); err != nil {
 		h.log.Warn("could not remove a guest's network rules; the next guest on its interface, or the "+
 			"node's next recovery, removes them", "guest", key, "error", err)
-
-		h.mu.Lock()
-		h.foundOnStart[key] = a
-		h.byIface[a.Interface] = key
-		h.mu.Unlock()
+		h.keepForLater(a)
 	}
 }
 
@@ -676,14 +873,47 @@ func (h *Host) remove(ctx context.Context, a *attached) error {
 		listed = h.hasDenyChain(ctx, a)
 	}
 
-	if _, err := h.nft(ctx, detachScript(a.Key, a.Interface, a.Kind, a.mark, listed), "-f", "-"); err != nil {
-		return fmt.Errorf("egress: remove the rules of %s: %w", a.Key, err)
+	script := detachScript(a.Key, a.Interface, a.Kind, a.mark, listed)
+
+	if _, err := h.nft(ctx, script, "-f", "-"); err != nil {
+		// ONE OBJECT MISSING FAILS THE WHOLE TRANSACTION, so rules someone else removed
+		// would never come off, and every launch drawing their interface would be refused
+		// for them. What is there goes one at a time, and what is not is what was asked.
+		if !absent(err) {
+			return fmt.Errorf("egress: remove the rules of %s: %w", a.Key, err)
+		}
+
+		if err := h.removeEachOf(ctx, script); err != nil {
+			return fmt.Errorf("egress: remove the rules of %s: %w", a.Key, err)
+		}
 	}
 
+	h.forgetFlows(a)
 	h.freeMark(a.mark)
 	h.removeFile(a.Key)
 
 	return nil
+}
+
+// removeEachOf runs a removal a statement at a time, taking absence as done.
+func (h *Host) removeEachOf(ctx context.Context, script string) error {
+	for line := range strings.SplitSeq(strings.TrimSpace(script), "\n") {
+		if _, err := h.nft(ctx, line+"\n", "-f", "-"); err != nil && !absent(err) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// forgetFlows deletes a guest's DNS connections, whose translation outlives the rule
+// that made them. Failing to costs a guest holding one socket its DNS until the
+// connection expires, and nothing else.
+func (h *Host) forgetFlows(a *attached) {
+	if err := h.forget(a.mark); err != nil {
+		h.log.Warn("could not delete a guest's DNS connections; they expire on their own", "guest", a.Key,
+			"error", err)
+	}
 }
 
 // hasDenyChain reports whether a guest's rules are a list's. A listing that failed
@@ -729,6 +959,12 @@ func (h *Host) readCounts(ctx context.Context, a *attached) counts {
 		c.unread = true
 
 		h.log.Warn("could not read where a guest was refused", "guest", a.Key, "error", err)
+	}
+
+	// A FULL SET HAS STOPPED NOTICING, so a guest could hide its later destinations
+	// behind decoys: the packets still count, and the list is a lower bound.
+	if len(c.destinations) >= MaxDenied {
+		c.unread = true
 	}
 
 	return c
@@ -799,17 +1035,40 @@ func (h *Host) dropLocked(key string) {
 //     and opening it would be a guess. An open guest's are removed, as they would
 //     have been.
 func (h *Host) Reconcile(ctx context.Context, running map[string]bool) {
-	h.mu.Lock()
-	found := slices.Collect(maps.Values(h.foundOnStart))
-	h.mu.Unlock()
-
 	if h.Ready() != nil {
 		return
 	}
 
+	h.mu.Lock()
+	found := slices.Collect(maps.Values(h.foundOnStart))
+	firstJudged := !h.filesJudged
+	h.filesJudged = true
+	h.mu.Unlock()
+
 	for _, a := range found {
 		h.reconcileOne(ctx, a, running[a.Key])
 	}
+
+	if firstJudged {
+		h.judgeFilesWithoutRules(ctx, running)
+	}
+
+	h.verifyLive(ctx)
+}
+
+// takeFound takes a guest off the books for judging it, unless a launch reusing its
+// interface or its name already has, in which case it is that launch's.
+func (h *Host) takeFound(a *attached) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.foundOnStart[a.Key] != a {
+		return false
+	}
+
+	h.takeLocked(a.Key)
+
+	return true
 }
 
 func (h *Host) reconcileOne(ctx context.Context, a *attached, running bool) {
@@ -817,40 +1076,34 @@ func (h *Host) reconcileOne(ctx context.Context, a *attached, running bool) {
 
 	switch {
 	case !running && err == nil:
-		h.mu.Lock()
-		h.takeLocked(a.Key)
-		h.mu.Unlock()
-
-		h.removeOrKeep(ctx, a)
+		if h.takeFound(a) {
+			h.removeOrKeep(ctx, a)
+		}
 	case !running:
 	case err != nil && h.hasDenyChain(ctx, a):
 		h.log.Error("a running guest's network rules have no record of their policy, so it stays as "+
 			"closed as they leave it, and resolves nothing; it runs until it ends", "guest", a.Key, "error", err)
-		h.mu.Lock()
-		h.takeLocked(a.Key)
-		a.listed, a.rec = true, newRecorder(true, true)
-		h.live[a.Key] = a
-		h.byIface[a.Interface] = a.Key
-		h.mu.Unlock()
+
+		if h.takeFound(a) {
+			h.mu.Lock()
+			a.listed, a.rec = true, newRecorder(true, true)
+			h.live[a.Key] = a
+			h.byIface[a.Interface] = a.Key
+			h.mu.Unlock()
+		}
 	case err == nil && file.Listed:
 		h.adopt(ctx, a, file)
 	default:
-		h.mu.Lock()
-		h.takeLocked(a.Key)
-		h.mu.Unlock()
-
-		h.removeOrKeep(ctx, a)
+		if h.takeFound(a) {
+			h.removeOrKeep(ctx, a)
+		}
 	}
 }
 
 func (h *Host) removeOrKeep(ctx context.Context, a *attached) {
 	if err := h.remove(ctx, a); err != nil {
 		h.log.Warn("could not remove the network rules an earlier process left", "guest", a.Key, "error", err)
-
-		h.mu.Lock()
-		h.foundOnStart[a.Key] = a
-		h.byIface[a.Interface] = a.Key
-		h.mu.Unlock()
+		h.keepForLater(a)
 	}
 }
 
@@ -875,10 +1128,11 @@ func (h *Host) adopt(ctx context.Context, a *attached, file attachmentFile) {
 
 	guest := &attached{
 		Attachment: Attachment{Key: a.Key, Interface: a.Interface, Network: file.Network, Kind: a.Kind},
-		mark:       a.mark, listed: true, rec: newRecorder(true, true), admitted: map[netip.Addr]struct{}{},
+		mark:       a.mark, listed: true, policy: p, gateway: gateway,
+		rec: newRecorder(true, true), admitted: map[netip.Addr]struct{}{},
 	}
 
-	guest.fwd, err = newForwarder(p, guest.rec, gateway.Addr(), h.upstreamPort, h.log.With("guest", a.Key),
+	guest.fwd, err = newForwarder(p, guest.rec, gateway, h.upstreamPort, h.log.With("guest", a.Key),
 		func(ctx context.Context, addrs []netip.Addr) error { return h.admit(ctx, guest, addrs) })
 	if err != nil {
 		h.log.Error("could not bind a running guest's resolver, so it stays closed and resolves nothing",
@@ -887,7 +1141,7 @@ func (h *Host) adopt(ctx context.Context, a *attached, file attachmentFile) {
 		return
 	}
 
-	if _, err := h.nft(ctx, retargetScript(a.Key, guest.fwd.port), "-f", "-"); err != nil {
+	if _, err := h.nft(ctx, retargetScript(a.Key, a.mark, guest.fwd.port), "-f", "-"); err != nil {
 		guest.fwd.stop()
 		h.log.Error("could not point a running guest at its resolver, so it stays closed and resolves nothing",
 			"guest", a.Key, "error", err)
@@ -895,7 +1149,8 @@ func (h *Host) adopt(ctx context.Context, a *attached, file attachmentFile) {
 		return
 	}
 
-	guest.fwd.serve()
+	guest.fwd.serve(ctx)
+	h.forgetFlows(guest)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -937,18 +1192,22 @@ func (h *Host) HandOver(ctx context.Context) {
 }
 
 // attachmentFile is what a process keeps of a guest for the next: what the kernel
-// cannot say. The mark and interface are the kernel's, and it is asked.
+// cannot say, and what putting a lost guest's rules back needs when the kernel has
+// nothing to say.
 type attachmentFile struct {
-	Schema  int      `json:"schema"`
-	Key     string   `json:"key"`
-	Network string   `json:"network"`
-	Listed  bool     `json:"listed"`
-	Allow   []string `json:"allow,omitempty"`
+	Schema    int      `json:"schema"`
+	Key       string   `json:"key"`
+	Interface string   `json:"interface"`
+	Kind      Kind     `json:"kind"`
+	Network   string   `json:"network"`
+	Listed    bool     `json:"listed"`
+	Allow     []string `json:"allow,omitempty"`
 }
 
 func (h *Host) writeFile(a Attachment, p *Policy) error {
 	data, err := json.Marshal(attachmentFile{
-		Schema: recordSchema, Key: a.Key, Network: a.Network, Listed: p.Listed(), Allow: p.allow,
+		Schema: recordSchema, Key: a.Key, Interface: a.Interface, Kind: a.Kind, Network: a.Network,
+		Listed: p.Listed(), Allow: p.allow,
 	})
 	if err != nil {
 		return fmt.Errorf("egress: encode the policy of %s: %w", a.Key, err)

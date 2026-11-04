@@ -1471,10 +1471,6 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 		return provider.TeardownRequested, err
 	}
 
-	// AFTER THE PROOF, and only then: rules taken off a guest that may still run
-	// would leave it open.
-	p.detachEgress(ctx, id)
-
 	return provider.TeardownStopped, nil
 }
 
@@ -1510,6 +1506,8 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	if !found {
 		// NO JAIL, BUT NOT NECESSARILY NOTHING. Claims outlive the jail they
 		// named, and a root clone is addressed independently by lease id.
+		p.detachEgress(ctx, id)
+
 		return p.cleanupLifecycleOnly(ctx, id)
 	}
 	if err := ctx.Err(); err != nil {
@@ -1542,6 +1540,11 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	if err := p.stopVMM(ctx, j); err != nil {
 		return err
 	}
+
+	// AFTER THE PROOF, since rules taken off a guest that may still run would leave it
+	// open, AND UNDER THE LEASE'S LOCK, since a launch of this name after it is released
+	// has rules of its own that this must not take.
+	p.detachEgress(ctx, id)
 
 	res, err := resourcesOf(j)
 	if err != nil {
