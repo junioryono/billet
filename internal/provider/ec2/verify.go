@@ -163,7 +163,7 @@ func (p *Provider) VerifyImage(ctx context.Context, spec VerifySpec) error {
 		return err
 	}
 
-	contract := contractFor(arch)
+	contract, window := contractFor(arch), time.Duration(verifyWindow)
 
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
@@ -172,7 +172,20 @@ func (p *Provider) VerifyImage(ctx context.Context, spec VerifySpec) error {
 
 	nonce := hex.EncodeToString(raw)
 
-	script, schema, err := verifyScript(arch, contract, nonce)
+	// THE IMAGE SAYS WHICH SCRIPT, and which contract it answers to: x86_64 is as true
+	// of a Windows AMI as of a Linux one (ADR-023).
+	var (
+		script string
+		schema reportSchema
+	)
+
+	if layout.windows() {
+		contract, window = WindowsAMIContract, windowsVerifyWindow
+		script, schema, err = windowsVerifyScript(arch, nonce)
+	} else {
+		script, schema, err = verifyScript(arch, contract, nonce)
+	}
+
 	if err != nil {
 		return err
 	}
@@ -195,7 +208,7 @@ func (p *Provider) VerifyImage(ctx context.Context, spec VerifySpec) error {
 	p.log.Info("verifying the image on a machine booted from it",
 		"image", spec.Image, "instance", id, "arch", arch, "contract", contract)
 
-	report, err := p.awaitConsoleReport(ctx, id, nonce, schema)
+	report, err := p.awaitConsoleReportWithin(ctx, id, nonce, schema, window)
 	if err != nil {
 		return fmt.Errorf("ec2: %s did not report on itself: %w", spec.Image, err)
 	}
@@ -289,7 +302,7 @@ func billetArch(image, aws string) (string, error) {
 func (p *Provider) launchVerifier(
 	ctx context.Context, spec VerifySpec, layout imageLayout, arch, script, nonce string,
 ) (string, error) {
-	userData, err := packUserData(script)
+	userData, err := builderUserData(layout.windows(), script)
 	if err != nil {
 		return "", err
 	}
@@ -471,7 +484,14 @@ func verifierName(spec VerifySpec) string {
 func (p *Provider) awaitConsoleReport(
 	ctx context.Context, id, nonce string, schema reportSchema,
 ) (map[string]string, error) {
-	deadline := time.Now().Add(verifyWindow)
+	return p.awaitConsoleReportWithin(ctx, id, nonce, schema, verifyWindow)
+}
+
+// awaitConsoleReportWithin is awaitConsoleReport with a window of the caller's.
+func (p *Provider) awaitConsoleReportWithin(
+	ctx context.Context, id, nonce string, schema reportSchema, window time.Duration,
+) (map[string]string, error) {
+	deadline := time.Now().Add(window)
 
 	// THE LIVE READ FIRST, AND A FALL BACK RATHER THAN A REFUSAL. `Latest` returns
 	// the console as it stands, which is what makes this bounded at all: the default
@@ -516,7 +536,7 @@ func (p *Provider) awaitConsoleReport(
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("the verifier %s printed no complete report to its console "+
 				"within %s; boot the image by hand and read its console to see how far it got",
-				id, verifyWindow)
+				id, window)
 		}
 
 		if err := p.sleep(ctx, verifyPoll); err != nil {

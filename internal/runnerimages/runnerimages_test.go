@@ -287,7 +287,7 @@ func TestTheVendoredToolsetIsUpstreamAtThePinnedCommit(t *testing.T) {
 func TestEachArchitecturesToolsetIsItsPinnedFile(t *testing.T) {
 	t.Parallel()
 
-	for _, arch := range []string{runnerimages.ArchX64, runnerimages.ArchArm64} {
+	for _, arch := range []string{runnerimages.ArchX64, runnerimages.ArchArm64, runnerimages.Windows2025} {
 		want, err := runnerimages.PinnedSHA256For(arch)
 		if err != nil {
 			t.Fatalf("PinnedSHA256For(%s): %v", arch, err)

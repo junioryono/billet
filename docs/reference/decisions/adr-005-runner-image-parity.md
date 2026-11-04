@@ -79,7 +79,7 @@ The migration is deliberately not a flag day: **the reader learned schema 2 and 
 
 ## What is not covered
 
-- **Windows and macOS.** GitHub publishes toolsets for them; billet's guest image is Linux only, and `need_tools` refuses to build anywhere else.
+- **Windows and macOS.** GitHub publishes toolsets for them; billet's guest image is Linux only, and `need_tools` refuses to build anywhere else. Windows is an EC2 AMI, decided in [ADR-023](adr-023-windows-on-ec2.md).
 - **arm64 on the GUEST image.** `check_host_arch` refuses a non-x86_64 host because the pinned runner is `linux-x64` and debootstrap takes the host's architecture — a mismatch boots perfectly and fails when the agent execs the runner, inside a guest nobody has a console for. Teaching it to select the runner and debootstrap architecture together also touches the kernel build, and is not done.
 
 An arm64 **AMI** does carry the toolcache, and what that cost is worth recording, because the naive version of it is wrong six times over. Every vendor spells the architecture differently and none of the spellings is derivable from another:

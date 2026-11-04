@@ -1,0 +1,79 @@
+# Everything a Windows AMI build does differently from GitHub's windows-2025 template, in
+# one place (ADR-023). One entry per line, tab-separated: skip, the step's id in
+# plan-windows-2025.json, the reason. scripts/windows/build-ami.ps1 runs every step not
+# listed here, in the template's order, and an entry naming no step stops the build
+# before anything runs: it is a pin bump to review, not a line to ignore.
+skip	file:C:\image\scripts\docs-gen\	the software report's shared code, and billet generates no software report for a floor it says it leaves most of out
+skip	shell:d1956e4c44c4	creates the account Packer connects as over WinRM; billet's build runs as SYSTEM in a scheduled task and connects to nothing
+skip	inline:66fcb42eef59	checks the account the previous step creates
+skip	inline:1cd1951e7394	test-signing mode is for the drivers of steps the floor leaves out
+skip	Install-WSL2.ps1	Linux inside a Windows guest is out of scope (#532), and it needs the reboot the floor avoids
+skip	Install-WindowsFeatures.ps1	Hyper-V, containers and WSL need reboots the floor avoids, and containers are out of scope (#532)
+skip	restart	the floor adds no Windows feature and no update that needs one, and an image's first boot is a boot
+skip	inline:b2ac39306f12	configures the wireless service Install-WindowsFeatures.ps1 adds, which the floor leaves out
+skip	Install-Docker.ps1	Windows containers need the Containers feature, which the floor leaves out
+skip	Install-DockerWinCred.ps1	belongs to Docker, which the floor leaves out
+skip	Install-DockerCompose.ps1	belongs to Docker, which the floor leaves out
+skip	Install-WebPlatformInstaller.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	restart#2	the floor adds no Windows feature and no update that needs one, and an image's first boot is a boot
+skip	Install-VisualStudio.ps1	Visual Studio 2022 Enterprise needs a subscription this build cannot accept on a deployment's behalf
+skip	Install-KubernetesTools.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	restart#3	the floor adds no Windows feature and no update that needs one, and an image's first boot is a boot
+skip	Install-Wix.ps1	its Visual Studio extension and its tests need Visual Studio, which the floor leaves out
+skip	Install-VSExtensions.ps1	extends Visual Studio, which the floor leaves out
+skip	Install-AzureCli.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-AzureDevOpsCli.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-JavaTools.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Kotlin.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-OpenSSL.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-ServiceFabricSDK.ps1	reads Visual Studio's installation, which the floor leaves out
+skip	restart#4	the floor adds no Windows feature and no update that needs one, and an image's first boot is a boot
+skip	Install-AndroidSDK.ps1	the Android SDK License Agreement is a deployment's to accept (#584), and images.accept completes a Linux image only
+skip	Install-PowershellAzModules.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Pipx.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-PHP.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Rust.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Sbt.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Chrome.ps1	Google Chrome's terms are a deployment's to accept (#584), and images.accept completes a Linux image only
+skip	Install-EdgeDriver.ps1	Microsoft Edge's driver terms are a deployment's to accept (#584), and images.accept completes a Linux image only
+skip	Install-Firefox.ps1	the same choice of contents images.accept makes for a Linux image (#584), which completes no Windows image
+skip	Install-Selenium.ps1	drives the browsers the floor leaves out
+skip	Install-IEWebDriver.ps1	drives a browser the floor leaves out
+skip	Install-Apache.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Nginx.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Msys2.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-WinAppDriver.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-R.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-AWSTools.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-DACFx.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-MysqlCli.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-SQLPowerShellTools.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-SQLOLEDBDriver.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-DotnetSDK.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Mingw64.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Haskell.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Stack.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Miniconda.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-AzureCosmosDbEmulator.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Vcpkg.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-Bazel.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-RootCA.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-MongoDB.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-CodeQLBundle.ps1	the GitHub CodeQL Terms are a deployment's to accept (#584), and images.accept completes a Linux image only
+skip	Install-PostgreSQL.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	Install-WindowsUpdates.ps1	hours of updates and reboots on a base AMI Amazon republishes patched each month; a build starts from a current one
+skip	Configure-Shell.ps1	links shells for MSYS2 and WSL, which the floor leaves out, and Install-Git.ps1 already puts Git Bash on PATH
+skip	Install-LLVM.ps1	beyond the declaration floor ADR-023 records; a step to add when a workflow needs it, by removing this line
+skip	restart#5	the floor adds no Windows feature and no update that needs one, and an image's first boot is a boot
+skip	Install-WindowsUpdatesAfterReboot.ps1	belongs to the updates step, which the floor leaves out
+skip	Invoke-Cleanup.ps1#2	the second pass follows the updates and the final reboot the floor leaves out; the first has run
+skip	RunAll-Tests.ps1	the whole suite expects everything the floor leaves out; each step the floor runs runs its own tests, and billet's verifier asks a booted image
+skip	inline:2ccb342f8070	checks the results of the whole suite, which does not run
+skip	inline:95232ed70324	the software report walks everything the floor leaves out
+skip	inline:5e07af433741	checks the software report, which is not generated
+skip	download:C:\software-report.md	Packer's download of the report, which is not generated
+skip	download:C:\software-report.json	Packer's download of the report, which is not generated
+skip	Install-NativeImages.ps1	compiles Visual Studio's and the SDKs' assemblies, which the floor leaves out
+skip	Configure-User.ps1	warms up Visual Studio and removes the account Packer connected as, neither of which exists here
+skip	restart#6	the floor adds no Windows feature and no update that needs one, and an image's first boot is a boot
+skip	inline:d7a486e6e744	Azure's capture; EC2Launch's own tail ends a billet build, as an EC2 image's first boot needs

@@ -330,6 +330,10 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 					// read included: a reboot during the success's dwell runs the
 					// bootstrap again, and what it says next is about this builder.
 					if report[reportVerdictKey] != verdictOK {
+						if spec.Windows {
+							return "", windowsBuildFailure(id, report)
+						}
+
 						return "", buildFailure(id, spec.Arch, report)
 					}
 
@@ -404,9 +408,14 @@ func (p *Provider) awaitBuild(ctx context.Context, id string, spec BuildSpec) (s
 				advice = "rerun the build with a longer --timeout and read"
 			}
 
+			logs := "journal (journalctl -u " + amiUnitName + ")"
+			if spec.Windows {
+				logs = "logs (" + windowsBuildDir + "\\logs)"
+			}
+
 			return "", fmt.Errorf("ec2: billet had read no verdict from the builder %s when the wait "+
-				"ended; billet terminates it, so %s its console or its journal (journalctl -u %s) "+
-				"while it runs: %w", id, advice, amiUnitName, err)
+				"ended; billet terminates it, so %s its console or its %s "+
+				"while it runs: %w", id, advice, logs, err)
 		}
 	}
 }

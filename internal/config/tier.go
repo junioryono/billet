@@ -372,6 +372,10 @@ const DefaultMacOSVMLimit = 2
 // it could only guess.
 const MinMacOSGuestMemory ByteSize = 4 * GiB
 
+// WindowsRunnerCommand is what starts the runner on a Windows AMI `billet ami build`
+// made, and the path that build installs it at (ADR-023).
+const WindowsRunnerCommand = `C:\billet\billet-runner.ps1`
+
 const (
 	// DefaultBuildKitCacheMountLimit bounds one BuildKit cache mount when a tier
 	// does not choose a tighter policy.
@@ -511,16 +515,23 @@ func (t Tier) GuestOSProviderErrors(where string) []error {
 		case t.GuestOS == GuestWindows && p == ProviderTart:
 			errs = append(errs, fmt.Errorf("%s: the tart provider cannot run Windows guests", where))
 
-		// BILLET SHIPS NO WINDOWS RUNNER, and CodeBuild does offer Windows
-		// environments — so without this a Windows tier on codebuild passes every
-		// check here and is then refused by node.codebuild.environment_type on the
-		// one machine that could serve it, which reports the problem in the wrong
-		// file. Named separately from tart's clause because the reasons differ:
-		// tart cannot run Windows at all, and billet cannot start a runner in it.
+		// CodeBuild does offer Windows environments, so without this a Windows tier
+		// on codebuild passes every check here and is then refused by
+		// node.codebuild.environment_type on the one machine that could serve it,
+		// which reports the problem in the wrong file. Named separately from tart's
+		// clause because the reasons differ: tart cannot run Windows at all, and
+		// billet cannot start a runner in it.
 		case t.GuestOS == GuestWindows && p == ProviderCodeBuild:
-			errs = append(errs, fmt.Errorf("%s: billet ships no Windows runner image or runner "+
-				"entrypoint, so a codebuild Windows tier would start a build that registers "+
+			errs = append(errs, fmt.Errorf("%s: billet builds a Windows runner image only as an "+
+				"EC2 AMI, so a codebuild Windows tier would start a build that registers "+
 				"nothing", where))
+
+		// EC2 IS THE ONE BACKEND WITH A WINDOWS RUNNER (ADR-023). Firecracker boots no
+		// Windows guest and docker's are Linux containers, so a tier that could land
+		// on either would bind there and start something that never registers.
+		case t.GuestOS == GuestWindows && p != ProviderEC2:
+			errs = append(errs, fmt.Errorf("%s: guest_os windows runs only on the ec2 provider "+
+				"(ADR-023), and this tier also accepts %q", where, p))
 		}
 	}
 
@@ -675,6 +686,10 @@ func (t Tier) RunnerCommandFor(provider ProviderKind) []string {
 		return []string{"./billet-runner-service"}
 	}
 	if provider == ProviderEC2 {
+		if t.GuestOS == GuestWindows {
+			return []string{WindowsRunnerCommand}
+		}
+
 		return []string{"/usr/local/bin/billet-runner"}
 	}
 
@@ -1081,7 +1096,31 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 		}
 	case GuestWindows:
 		errs = append(errs, t.GuestOSProviderErrors(where)...)
+		errs = append(errs, t.windowsTierErrors(where)...)
 	}
+	return errs
+}
+
+// windowsTierErrors refuses what a Windows tier could ask for and not get.
+//
+// EVERY CACHE billet serves a guest has its client in a Linux guest: the Docker image
+// store, the sticky disks, the proxies. A cache block on a Windows tier would validate,
+// advertise and do nothing, so it is refused rather than left to read as working.
+func (t Tier) windowsTierErrors(where string) []error {
+	var errs []error
+
+	// GitHub publishes the windows-2025 declaration for x64 alone.
+	if t.Arch != "" && t.Arch != ArchX64 {
+		errs = append(errs, fmt.Errorf("%s: guest_os windows runs on x64, and this tier names %s",
+			where, t.Arch))
+	}
+
+	if t.Cache != nil || t.Intercept || t.CacheScope != nil {
+		errs = append(errs, fmt.Errorf("%s: a Windows guest has no client for billet's caches "+
+			"(ADR-023), so cache, intercept and cache_scope would do nothing here; remove them",
+			where))
+	}
+
 	return errs
 }
 

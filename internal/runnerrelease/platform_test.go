@@ -58,7 +58,7 @@ func TestTheFirstLineStillCarriesTheVersionAndOneChecksum(t *testing.T) {
 func TestNoPinnedChecksumCarriesWhitespace(t *testing.T) {
 	t.Parallel()
 
-	for _, platform := range []string{"linux-x64", "linux-arm64", "osx-arm64"} {
+	for _, platform := range []string{"linux-x64", "linux-arm64", "osx-arm64", "win-x64"} {
 		sum, ok := PinnedSHA256For(platform)
 		if !ok {
 			t.Errorf("no checksum is pinned for %s", platform)
@@ -127,8 +127,8 @@ func TestAnUnpinnedPlatformIsRefusedRatherThanEmpty(t *testing.T) {
 
 	for _, platform := range []string{
 		// Real actions/runner assets billet deliberately does not install: no
-		// backend runs Windows, and no backend runs an x64 Mac.
-		"win-x64", "osx-x64", "linux-arm",
+		// backend runs Windows on arm64, and no backend runs an x64 Mac.
+		"win-arm64", "osx-x64", "linux-arm",
 		// And something that is not an asset at all.
 		"", "moon-x64",
 	} {
@@ -166,10 +166,11 @@ func TestTheReleaseBumpWorkflowWritesEveryPinnedPlatform(t *testing.T) {
 	t.Parallel()
 
 	const (
-		version   = "9.999.0"
-		linuxX64  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-		linuxArm  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-		darwinArm = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		version    = "9.999.0"
+		linuxX64   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		linuxArm   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		darwinArm  = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		windowsX64 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	)
 
 	rendered := runPinRendering(t, map[string]string{
@@ -177,11 +178,13 @@ func TestTheReleaseBumpWorkflowWritesEveryPinnedPlatform(t *testing.T) {
 		"SHA":             linuxX64,
 		"SHA_LINUX_ARM64": linuxArm,
 		"SHA_OSX_ARM64":   darwinArm,
+		"SHA_WIN_X64":     windowsX64,
 	})
 
 	want := version + " " + linuxX64 + "\n" +
 		"linux-arm64 " + linuxArm + "\n" +
-		"osx-arm64 " + darwinArm + "\n"
+		"osx-arm64 " + darwinArm + "\n" +
+		"win-x64 " + windowsX64 + "\n"
 
 	if rendered != want {
 		t.Fatalf("the bump would write\n%q\nwant\n%q", rendered, want)
@@ -227,9 +230,10 @@ func TestTheReleaseBumpWorkflowExtractsEachPlatformsOwnChecksum(t *testing.T) {
 		"linux-x64":   strings.Repeat("a", 64),
 		"linux-arm64": strings.Repeat("b", 64),
 		"osx-arm64":   strings.Repeat("c", 64),
+		"win-x64":     strings.Repeat("d", 64),
 		// A PLATFORM BILLET DOES NOT PIN, present in the real notes and a plausible
 		// thing for a wrong marker to pick up.
-		"win-x64": strings.Repeat("d", 64),
+		"win-arm64": strings.Repeat("e", 64),
 	}
 
 	got := runShaExtraction(t, digests)
@@ -238,6 +242,7 @@ func TestTheReleaseBumpWorkflowExtractsEachPlatformsOwnChecksum(t *testing.T) {
 		"sha":             "linux-x64",
 		"sha_linux_arm64": "linux-arm64",
 		"sha_osx_arm64":   "osx-arm64",
+		"sha_win_x64":     "win-x64",
 	} {
 		if got[variable] != digests[platform] {
 			t.Errorf("%s holds %q; %s's digest is %q, and pinning another platform's "+
@@ -270,7 +275,7 @@ func runShaExtraction(t *testing.T, digests map[string]string) map[string]string
 
 	script := "set -euo pipefail\nbody=$(cat)\n" + dedent(block) + "\n" +
 		"{ echo \"sha=$sha\"; echo \"sha_linux_arm64=$sha_linux_arm64\"; " +
-		"echo \"sha_osx_arm64=$sha_osx_arm64\"; } > " + out + "\n"
+		"echo \"sha_osx_arm64=$sha_osx_arm64\"; echo \"sha_win_x64=$sha_win_x64\"; } > " + out + "\n"
 
 	cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
 	cmd.Stdin = strings.NewReader(string(release))

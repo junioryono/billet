@@ -451,6 +451,10 @@ func (p *Provider) shapesForImage(
 		return nil, err
 	}
 
+	if err := checkGuestOS(spec, layout); err != nil {
+		return nil, err
+	}
+
 	image, known := config.ArchFromEC2(layout.arch)
 
 	if spec.Arch != "" && known && image != spec.Arch {
@@ -950,6 +954,9 @@ type imageLayout struct {
 	arch string
 	// billet is whether the image carries a tag billet stamps on what it builds.
 	billet bool
+	// platform is what DescribeImages reports of the image: "windows", or empty for
+	// every other. The image is asked rather than a caller for the reason arch is.
+	platform string
 	// devices are the non-root EBS mappings, each carrying the flag billet will
 	// send for it, in whatever order DescribeImages returned them. AWS does not
 	// promise that order is stable and nothing here depends on it: every entry
@@ -1109,6 +1116,9 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 	return nil
 }
 
+// windows says whether the image is a Windows AMI.
+func (l imageLayout) windows() bool { return l.platform == imagePlatformWindows }
+
 // requireEBSRoot refuses an image whose root is not an EBS volume.
 //
 // EC2 supports both root types, and every root parameter billet sends is
@@ -1256,7 +1266,10 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 			"cannot see it", image, p.cfg.Region)
 	}
 
-	layout := imageLayout{root: out.Images[0].RootDeviceName, arch: out.Images[0].Architecture}
+	layout := imageLayout{
+		root: out.Images[0].RootDeviceName, arch: out.Images[0].Architecture,
+		platform: out.Images[0].Platform,
+	}
 
 	for _, tag := range out.Images[0].Tags {
 		switch tag.Key {
@@ -1385,6 +1398,10 @@ func (p *Provider) userData(spec provider.Spec) (string, error) {
 }
 
 func (p *Provider) userDataAt(spec provider.Spec, launchEpochNS int64) (string, error) {
+	if spec.GuestOS == config.GuestWindows {
+		return windowsUserData(spec, launchEpochNS)
+	}
+
 	cacheFields := 0
 	for _, value := range []string{spec.CacheEndpoint, spec.CacheToken} {
 		if value != "" {

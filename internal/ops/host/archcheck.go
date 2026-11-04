@@ -51,6 +51,50 @@ func ec2TierArchMismatch(cfg *config.Config, images []ec2.ImageInfo) error {
 		"the image's architecture", strings.Join(wrong, "; "))
 }
 
+// ec2TierGuestOSMismatch reports each EC2 tier whose guest_os and AMI disagree, either
+// way: every launch of such a tier is refused, so the operator hears it here rather
+// than from a queue (ADR-023). An image not found says nothing, and is reported above.
+func ec2TierGuestOSMismatch(cfg *config.Config, images []ec2.ImageInfo) error {
+	known := make(map[string]bool, len(images))
+	for _, img := range images {
+		if img.Found {
+			known[img.ImageID] = img.Windows
+		}
+	}
+
+	var wrong []string
+
+	for i := range cfg.Tiers {
+		t := &cfg.Tiers[i]
+		if !t.AcceptsProvider(config.ProviderEC2) {
+			continue
+		}
+
+		ami := t.ImageFor(config.ProviderEC2)
+
+		windows, ok := known[ami]
+		if !ok || windows == (t.GuestOS == config.GuestWindows) {
+			continue
+		}
+
+		if windows {
+			wrong = append(wrong, fmt.Sprintf("%s is guest_os %s and its AMI %s is a Windows AMI",
+				t.Label, t.GuestOS, ami))
+		} else {
+			wrong = append(wrong, fmt.Sprintf("%s is guest_os windows and its AMI %s is not a Windows AMI",
+				t.Label, ami))
+		}
+	}
+
+	if len(wrong) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("an EC2 tier's guest_os and its AMI disagree, so every launch would be "+
+		"refused: %s; set guest_os: windows on a tier of a Windows AMI, or give the tier an image "+
+		"of its own operating system", strings.Join(wrong, "; "))
+}
+
 // ec2ShapesNameArch reports whether this file's EC2 shapes declare an
 // architecture, which a billet from before it refuses as it refuses a tier's.
 func ec2ShapesNameArch(cfg *config.Config) bool {

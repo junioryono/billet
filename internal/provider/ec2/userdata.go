@@ -6,6 +6,19 @@ import (
 	"fmt"
 )
 
+// builderUserData is the bootstrap as it travels: on Linux through packUserData, and on
+// Windows as it is, because cloud-init documents compressed user data and EC2Launch does
+// not. A script that fits is sent plain either way, and a Windows one that does not is
+// refused here, before a paid builder exists that would boot and do nothing.
+func builderUserData(windows bool, script string) ([]byte, error) {
+	if windows && len(script) > maxUserData {
+		return nil, fmt.Errorf("ec2: the Windows bootstrap is %d bytes and EC2 accepts %d, and "+
+			"EC2Launch documents no compressed user data", len(script), maxUserData)
+	}
+
+	return packUserData(script)
+}
+
 // packUserData compresses a provisioning script if it needs to be compressed.
 //
 // EC2 CAPS USER DATA AT 16 KiB AND PARITY DOES NOT FIT IN IT. The script that
