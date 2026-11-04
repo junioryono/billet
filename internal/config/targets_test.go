@@ -604,7 +604,7 @@ func TestTargetWeightsAreEmptyUnlessATargetWritesOne(t *testing.T) {
 	for _, c := range []struct {
 		weight string
 		ok     bool
-	}{{"1", true}, {"1000", true}, {"-1", false}, {"1001", false}} {
+	}{{"0", true}, {"1", true}, {"1000", true}, {"-1", false}, {"1001", false}} {
 		_, err := Load(writeConfig(t, strings.Replace(body, key, key+"    weight: "+c.weight+"\n", 1)))
 		if c.ok && err != nil {
 			t.Errorf("weight %s was refused: %v", c.weight, err)

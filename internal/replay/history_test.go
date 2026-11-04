@@ -584,6 +584,107 @@ func TestContendedRoomIsDividedByWeight(t *testing.T) {
 	}
 }
 
+// A FLOOR ABOVE A TARGET'S WEIGHTED SHARE IS STILL KEPT (#530): a tier of weight 1
+// reserved half the fleet beside a target of weight 2. Ranked alone, the second
+// target stayed head with its room held by that floor, the floor's tier could buy
+// only ahead of it, and the reserved room sat idle.
+func TestAFloorAboveAWeightedShareIsKept(t *testing.T) {
+	fleet := twoTargets(1, 2)
+	fleet.Tiers[0].Reserved = 8
+
+	trace := ContendedTargets(1, ContendedParams{Params: Params{Jobs: 80}, Fleet: fleet})
+
+	report := Run(t, fleet, trace, Options{DirectAssignment: true, Log: discardLogger()})
+	if why := report.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	if share := laterShare(t, report); share < 0.48 {
+		t.Errorf("the tier reserved half the fleet held %.3f of the contested vCPU; want its floor kept\n%s", share,
+			report.TargetTable(4))
+	}
+
+	// AND THE ROOM IS NOT LEFT IDLE while both have work.
+	from, to, _ := report.ContestedWindow()
+
+	total := 0.0
+	for _, c := range report.ChargedByTarget(from, to) {
+		total += c.VCPUSeconds
+	}
+
+	if mean := total / to.Sub(from).Seconds(); mean < 0.9*32 {
+		t.Errorf("the two targets held a mean of %.1f of 32 vCPU while both had work\n%s", mean, report.TargetTable(4))
+	}
+}
+
+// A WIDE SHAPE STILL GETS ITS TURN UNDER WEIGHTS (#530): a tier half a host wide,
+// at twice the weight of a stream of small jobs that offers more than the host
+// holds. Its second lease needs half the host free. Ranked alone, the stream's
+// target was behind again each time one of its jobs ended and bought the room back,
+// so the wide tier held its first lease and never fitted a second while the stream
+// ran, with a quarter of the host idle. Kept at the head, it accumulates the room.
+func TestAWideShapeGetsItsTurnUnderWeights(t *testing.T) {
+	fleet := Fleet{
+		Hosts: []Host{{Name: "only", VCPU: 128, Memory: 512 * config.GiB}},
+		Tiers: []TierShape{
+			{Label: "billet-wide", VCPU: 64, Memory: 256 * config.GiB, Target: config.DefaultTargetName},
+			{Label: "billet-stream", VCPU: 2, Memory: 8 * config.GiB, Target: "second"},
+		},
+		Targets: []TargetShape{{Name: config.DefaultTargetName, Weight: 2}, {Name: "second", Weight: 1}},
+		MaxVCPU: 128, MaxMemory: 512 * config.GiB,
+	}
+
+	job := func(at time.Time, tier string, d time.Duration) Arrival {
+		owner := DefaultOwner
+		if tier == "billet-stream" {
+			owner = "second"
+		}
+
+		return Arrival{
+			At: at, Tier: tier, Owner: owner, Repository: "web", Duration: Duration(d),
+			WorkflowRef: owner + "/web/.github/workflows/ci.yml@refs/heads/main",
+		}
+	}
+
+	var trace Trace
+
+	for i := range 240 {
+		trace.Arrivals = append(trace.Arrivals, job(DefaultStart.Add(time.Duration(i)*15*time.Second), "billet-stream",
+			8*time.Minute))
+	}
+
+	for i := range 3 {
+		trace.Arrivals = append(trace.Arrivals, job(DefaultStart.Add(time.Duration(i)*time.Minute), "billet-wide",
+			40*time.Minute))
+	}
+
+	trace.Normalize()
+
+	report := Run(t, fleet, trace, Options{DirectAssignment: true, Log: discardLogger()})
+	if why := report.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	var first, second time.Time
+
+	for i := range report.Records {
+		if rec := &report.Records[i]; rec.Tier == "billet-wide" {
+			switch {
+			case first.IsZero() || rec.StartedAt.Before(first):
+				first, second = rec.StartedAt, first
+			case second.IsZero() || rec.StartedAt.Before(second):
+				second = rec.StartedAt
+			}
+		}
+	}
+
+	// Before the first has ended: the two ran together, beside the stream.
+	if second.IsZero() || !second.Before(first.Add(40*time.Minute)) {
+		t.Errorf("the wide tier's second job started %s after its first, which ran 40m; want them together",
+			second.Sub(first))
+	}
+}
+
 // THE POLICY COMPARISON AT A RECORD'S SIZE, run by hand: BILLET_REPLAY_COMPARE=
 // wide replays WideShapeMix at BILLET_REPLAY_JOBS (default 2000) on WideFleet,
 // and =file replays the trace and fleet `billet jobs export` wrote, named by

@@ -52,6 +52,8 @@ type TierShape struct {
 	// Target is the target the tier belongs to, one Fleet.Targets names; empty
 	// in a fleet that declares none.
 	Target string
+	// Reserved is the tier's `reserved` floor.
+	Reserved int
 }
 
 // TargetShape is one GitHub target of the fleet.
@@ -211,6 +213,7 @@ func (f Fleet) tiers(trace Trace) []config.Tier {
 			Command:     simulated.RunFor(trace.LongestDuration(shape.Label) + f.boot() + time.Hour),
 			Node:        shape.Node,
 			Target:      shape.Target,
+			Reserved:    shape.Reserved,
 		})
 	}
 

@@ -88,6 +88,10 @@ type TierAdmission struct {
 	// they all wait, and a target with nobody waiting claims nothing. Shared
 	// between the tiers of one view, and never written after it is read.
 	TargetRank map[string]float64
+	// BelowFloor reports that this tier holds fewer leases than its `reserved`
+	// floor, counted as the floor is. Room is already held for it from every other
+	// tier, so under ranks it goes first: it takes nothing a waiter could buy.
+	BelowFloor bool
 }
 
 // AdmissionView reads every tier's TierAdmission in one ledger snapshot, so one
@@ -230,6 +234,7 @@ func (a *Allocator) admissionIn(ctx context.Context, tx querier, t config.Tier, 
 	return TierAdmission{
 		CanGrow: grow, Nodes: p.nodes, CeilingBound: bound.ceiling,
 		Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound.share,
+		BelowFloor: t.Reserved > held[t.Label],
 	}, nil
 }
 

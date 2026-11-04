@@ -97,3 +97,21 @@ func TestNewRefusesAWeightOutOfRange(t *testing.T) {
 		}
 	}
 }
+
+// A TIER BELOW ITS FLOOR SAYS SO, counted as the floor is, and one at it does not.
+func TestATierBelowItsFloorSaysSo(t *testing.T) {
+	reserved := tier("reserved", 2, 4*config.GiB)
+	reserved.Reserved = 1
+
+	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB}, []config.Tier{reserved})
+
+	if !admissionOf(t, a, "reserved").BelowFloor {
+		t.Error("a tier holding nothing of a floor of one is not below it")
+	}
+
+	reserve(t, a, "reserved")
+
+	if admissionOf(t, a, "reserved").BelowFloor {
+		t.Error("a tier holding its floor is still below it")
+	}
+}

@@ -26,7 +26,7 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		t.Fatal(err)
 	}
 	configured := strings.Replace(strings.Replace(string(body), "  max_memory: 32GiB\n",
-		"  max_memory: 32GiB\n  placement: spread\n", 1),
+		"  max_memory: 32GiB\n  placement: spread\n  admission_order: fair\n", 1),
 		"    image: ubuntu:24.04\n", "    image: ubuntu:24.04\n    node: epyc-1\n", 1)
 	configured = strings.Replace(configured, "  org: acme\n", "  org: acme\n  weight: 3\n", 1)
 	if err := os.WriteFile(cfg, []byte(configured), 0o600); err != nil {
@@ -152,7 +152,7 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 	if len(fleet.Tiers) != 1 || fleet.Tiers[0] != (jobtrace.Tier{Label: "billet-2vcpu", VCPU: 2,
 		Memory: 8 * config.GiB, Node: "epyc-1", Target: config.DefaultTargetName}) ||
 		fleet.MaxVCPU != 8 || fleet.MaxMemory != 32*config.GiB ||
-		fleet.Placement != config.PlacementSpread {
+		fleet.Placement != config.PlacementSpread || fleet.AdmissionOrder != config.AdmissionFair {
 		t.Errorf("the fleet is %+v; want the configured tier, ceiling, placement and order", fleet)
 	}
 

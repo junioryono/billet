@@ -182,6 +182,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.
 	l.order.launchBegins(l.tier)
 	err := l.runner.Launch(ctx, lease, job)
 	l.order.launchEnds(l.tier)
+	l.order.launchFailing(l.tier, err != nil)
 
 	if err == nil {
 		// STILL OURS? The mutex was released for the duration of the launch, and

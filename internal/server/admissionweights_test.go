@@ -1,12 +1,16 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // ranked is a tier's admission on one shared host under ranks.
@@ -23,16 +27,17 @@ type waiterAt struct {
 	where alloc.TierAdmission
 }
 
-// waitingInOrder records each label as waiting a minute after the last, so the
-// first named is the oldest.
+// waitingInOrder records each label as waiting a minute after the last, the first
+// named the oldest, each as a waiter that has not yet been refused at the head.
 func waitingInOrder(q *admissionQueue, waiters ...waiterAt) {
 	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
-	q.now = func() time.Time { return at }
 
 	for _, w := range waiters {
-		q.waits(w.label, w.where)
+		q.waiting[w.label] = waitingTier{since: at, where: w.where, progress: at}
 		at = at.Add(time.Minute)
 	}
+
+	q.now = func() time.Time { return at }
 }
 
 // WITH NO WEIGHT THE ORDER IS OLDEST FIRST, whatever targets the tiers are on: a
@@ -326,7 +331,7 @@ func TestAWeightedPoolStopsBuyingAheadOnceItIsNotBehind(t *testing.T) {
 		t.Fatalf("second tier reconcile: %v", err)
 	}
 
-	y.order.waits("second-tier", y.admission(t.Context()))
+	waitingInOrder(y.order, waiterAt{"second-tier", y.admission(t.Context())})
 
 	// first holds nothing and wants more than there is. Its rank passes second's
 	// at 8 leases (16 of 32 vCPU over a weight of 2); from there it buys only while
@@ -338,5 +343,341 @@ func TestAWeightedPoolStopsBuyingAheadOnceItIsNotBehind(t *testing.T) {
 
 	if got := startedTiers(log)["first-tier"]; got != 11 {
 		t.Errorf("the first target started %d runners; want 11, leaving the second room for one lease", got)
+	}
+}
+
+// A WAITER THAT WAS HEAD WHEN IT WAS REFUSED KEEPS THE LINE until it buys: a rival's
+// job ending lowers that rival's rank, and that must not sell the room the head is
+// accumulating. Fresh ranks then choose only the next head.
+func TestAHeadKeepsTheLineUntilItBuys(t *testing.T) {
+	t.Parallel()
+
+	level := map[string]float64{"wide": 0.5, "stream": 0.5}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	q.now = func() time.Time { return at }
+
+	// The wide tier is refused first, level with the stream, so it is head.
+	q.waits("wide", ranked("wide", level))
+	at = at.Add(time.Minute)
+	q.waits("stream", ranked("stream", level))
+
+	// One of the stream's jobs ends, and its target is now behind.
+	behind := map[string]float64{"wide": 0.5, "stream": 0.4}
+
+	if q.mayBuy("stream", ranked("stream", behind)) {
+		t.Error("a rival's job ending took the line from the head")
+	}
+
+	if got := q.ahead("stream", ranked("stream", behind)); !slices.Equal(got, []string{"wide"}) {
+		t.Errorf("ahead of the rival: %v; want the head", got)
+	}
+
+	if !q.mayBuy("wide", ranked("wide", behind)) {
+		t.Error("the head could not buy")
+	}
+
+	// It buys, and the ranks choose the next head.
+	at = at.Add(time.Minute)
+	q.bought("wide")
+
+	if !q.mayBuy("stream", ranked("stream", behind)) || q.mayBuy("wide", ranked("wide", behind)) {
+		t.Error("after the head bought, the target behind did not go next")
+	}
+
+	// A tier refused while another is ahead of it is not made head by the refusal.
+	q.waits("wide", ranked("wide", behind))
+
+	if q.waiting["wide"].head {
+		t.Error("a waiter refused behind another was recorded as head")
+	}
+
+	// With no ranks there is no head to keep: the wait is all there is.
+	plain := newAdmissionQueue(config.AdmissionFair)
+	plain.waits("only", on("host"))
+
+	if plain.waiting["only"].head {
+		t.Error("a waiter was recorded as head with no ranks")
+	}
+}
+
+// A TIER BELOW ITS FLOOR GOES FIRST: room is held for it from everyone else, and a
+// waiter its floor keeps short could otherwise stand ahead of it forever, with the
+// reserved room idle.
+func TestATierBelowItsFloorGoesFirst(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"low-weight": 0.5, "high-weight": 0.1}
+
+	floor := ranked("low-weight", ranks)
+	floor.BelowFloor = true
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"older", ranked("high-weight", ranks)}, waiterAt{"reserved", floor})
+
+	// Even over a head.
+	older := q.waiting["older"]
+	older.head = true
+	q.waiting["older"] = older
+
+	if !q.mayBuy("reserved", floor) {
+		t.Error("a tier below its floor was held back")
+	}
+
+	if q.mayBuy("older", ranked("high-weight", ranks)) {
+		t.Error("a head bought ahead of a tier below its floor")
+	}
+
+	// On the ground it reads now: once at its floor it is ranked again.
+	floor.BelowFloor = false
+	if q.mayBuy("reserved", floor) {
+		t.Error("a tier at its floor kept its place above the head")
+	}
+
+	// And a buyer with no wait on record goes first too.
+	q = newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"waiter", ranked("high-weight", ranks)})
+
+	floor.BelowFloor = true
+	if !q.mayBuy("reserved", floor) {
+		t.Error("a buyer below its floor was held back by a waiter")
+	}
+}
+
+// A RANK CANNOT STARVE: a tier that has gone WeightPatience without buying stands
+// above every rank, though its target holds more than any rival, and it is dated by
+// its last purchase, so buying makes it wait its turn again.
+func TestAWaiterPastItsPatienceStandsAboveEveryRank(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"over": 0.9, "under": 0.1}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"starving", ranked("over", ranks)}, waiterAt{"rival", ranked("under", ranks)})
+
+	start := q.now()
+
+	progressAll := func() {
+		for label, w := range q.waiting {
+			w.progress = q.now()
+			q.waiting[label] = w
+		}
+	}
+
+	if q.mayBuy("starving", ranked("over", ranks)) {
+		t.Error("a waiter inside its patience passed a target further behind")
+	}
+
+	// The starving waiter began two minutes before start: a minute short of its
+	// patience it is ranked, and on reaching it it is not.
+	q.now = func() time.Time { return start.Add(WeightPatience - 3*time.Minute) }
+	progressAll()
+
+	if q.mayBuy("starving", ranked("over", ranks)) {
+		t.Error("a waiter passed a target further behind before its patience ran out")
+	}
+
+	q.now = func() time.Time { return start.Add(WeightPatience) }
+	progressAll()
+
+	if !q.mayBuy("starving", ranked("over", ranks)) || q.mayBuy("rival", ranked("under", ranks)) {
+		t.Error("a waiter past its patience did not stand above the rank")
+	}
+
+	q.bought("starving")
+
+	if q.mayBuy("starving", ranked("over", ranks)) {
+		t.Error("a purchase did not put the waiter back behind the rank")
+	}
+}
+
+// A TIER WHOSE LAUNCHES FAIL STEPS ASIDE WHILE RANKS APPLY: its leases hand back at
+// once, so its rank stays the lowest however often it buys. With no ranks it rotates
+// away by buying, as it always did, so nothing changes there.
+func TestATierWhoseLaunchesFailStepsAside(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"failing": 0.1, "healthy": 0.5}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"broken", ranked("failing", ranks)}, waiterAt{"working", ranked("healthy", ranks)})
+
+	if q.mayBuy("working", ranked("healthy", ranks)) {
+		t.Error("a healthy waiter passed one further behind with no launch failing")
+	}
+
+	q.launchFailing("broken", true)
+
+	if !q.mayBuy("working", ranked("healthy", ranks)) {
+		t.Error("a waiter was held back by a tier whose launches are failing")
+	}
+
+	if got := q.ahead("working", ranked("healthy", ranks)); len(got) != 0 {
+		t.Errorf("a tier whose launches are failing is listed ahead: %v", got)
+	}
+
+	// It keeps its place, and may still try: nobody holds it back but those ahead.
+	if !q.mayBuy("broken", ranked("failing", ranks)) {
+		t.Error("a tier whose launches are failing lost its own turn")
+	}
+
+	q.launchFailing("broken", false)
+
+	if q.mayBuy("working", ranked("healthy", ranks)) {
+		t.Error("a launch succeeding did not put the waiter back ahead")
+	}
+
+	// With no ranks the flag means nothing: the older waiter holds the line.
+	plain := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(plain, waiterAt{"broken", on("host")}, waiterAt{"working", on("host")})
+	plain.launchFailing("broken", true)
+
+	if plain.mayBuy("working", on("host")) {
+		t.Error("with no weights a failing launch changed the order")
+	}
+}
+
+// THE STATUS REPORT JUDGES EVERY WAITER BY ONE READ OF THE RANKS, the newest any
+// buyer brought, so it cannot say each of two waiters holds the other.
+func TestTheStatusReportJudgesWaitersByOneReadOfTheRanks(t *testing.T) {
+	t.Parallel()
+
+	first := map[string]float64{"a": 0.1, "b": 0.5}
+	then := map[string]float64{"a": 0.5, "b": 0.1}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"tier-a", ranked("a", first)}, waiterAt{"tier-b", ranked("b", then)})
+
+	q.mayBuy("tier-a", ranked("a", then))
+
+	if holder, _, held := q.waiterHeldBy("tier-a"); !held || holder != "tier-b" {
+		t.Errorf("tier-a is reported held by %q (%v); want tier-b, on the newest ranks", holder, held)
+	}
+
+	if _, _, held := q.waiterHeldBy("tier-b"); held {
+		t.Error("tier-b is reported held too: each of two waiters holding the other")
+	}
+}
+
+// A REFUSAL SAYS WHY A RANK PUT THE WAITER AHEAD, since a younger waiter named
+// alone reads as a bug, and says nothing extra with no ranks.
+func TestARefusalSaysWhyTheWaiterStandsAhead(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"heavy": 0.5, "light": 0.125}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"younger", ranked("light", ranks)})
+
+	got := q.whyAhead("younger", ranked("heavy", ranks))
+	if want := "its target holds 0.125 per unit of weight and this tier's 0.500"; got != want {
+		t.Errorf("whyAhead = %q; want %q", got, want)
+	}
+
+	w := q.waiting["younger"]
+	w.head = true
+	q.waiting["younger"] = w
+
+	if got := q.whyAhead("younger", ranked("heavy", ranks)); !strings.Contains(got, "first when it was refused") {
+		t.Errorf("whyAhead for a head = %q", got)
+	}
+
+	w.where.BelowFloor = true
+	q.waiting["younger"] = w
+
+	if got := q.whyAhead("younger", ranked("heavy", ranks)); got != "it is below its floor" {
+		t.Errorf("whyAhead below a floor = %q", got)
+	}
+
+	plain := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(plain, waiterAt{"older", on("host")})
+
+	if got := plain.whyAhead("older", on("host")); got != "" {
+		t.Errorf("whyAhead with no ranks = %q; want nothing", got)
+	}
+
+	r := refusal{waiter: "younger", since: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), ahead: "because"}
+	if got := r.String(); !strings.HasSuffix(got, "waiting since 2026-11-01T00:00:00Z: because") {
+		t.Errorf("the refusal reads %q", got)
+	}
+}
+
+// failingRunner refuses every launch, as a revoked key or a broken image does.
+type failingRunner struct{ launchLog }
+
+func (*failingRunner) Launch(context.Context, *alloc.Lease, dispatch.Job) error {
+	return errors.New("no such image")
+}
+
+// THE LISTENER TELLS THE ORDER HOW ITS LAST LAUNCH WENT, and a refusal it records
+// says why the waiter stands ahead: both are wiring the queue's own tests cannot see.
+func TestAListenerTellsTheOrderItsLaunchFailedAndWhyItIsHeld(t *testing.T) {
+	t.Parallel()
+
+	a, _, listeners := orderedListeners(t, contenders(), 8, config.AdmissionFair)
+	l := listeners[0]
+
+	l.order.waits(l.tier, on("host"))
+
+	launch := func(runner dispatch.Runner, request int64) {
+		t.Helper()
+
+		leases, err := a.Escrow(t.Context(), l.tier, 1)
+		if err != nil || len(leases) != 1 {
+			t.Fatalf("Escrow: %v, %d leases", err, len(leases))
+		}
+
+		l.runner = runner
+
+		_ = l.launch(t.Context(), leases[0], dispatch.Job{RequestID: request})
+	}
+
+	launch(&failingRunner{}, 1)
+
+	if !l.order.waiting[l.tier].launchFailing {
+		t.Error("a failed launch did not reach the order")
+	}
+
+	launch(&launchLog{}, 2)
+
+	if l.order.waiting[l.tier].launchFailing {
+		t.Error("a launch that succeeded did not clear the failure")
+	}
+
+	ranks := map[string]float64{"heavy": 0.5, "light": 0.125}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"younger", ranked("light", ranks)})
+	l.order = q
+
+	got := l.orderRefusal(ranked("heavy", ranks))
+	if got.waiter != "younger" || !strings.Contains(got.String(), "its target holds 0.125") {
+		t.Errorf("the refusal reads %q", got.String())
+	}
+}
+
+// A STALLED WAITER WHOSE TARGET IS UNREAD DOES NOT TURN THE RANKS OFF: it holds
+// nobody back, so nothing about it can change who goes first.
+func TestAStalledWaiterLeavesTheRanksOn(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"heavy": 0.5, "light": 0.1}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(q, waiterAt{"stalled", on("host")}, waiterAt{"older", ranked("heavy", ranks)},
+		waiterAt{"younger", ranked("light", ranks)})
+
+	// Only the unread waiter has made no progress.
+	q.now = func() time.Time { return q.waiting["stalled"].since.Add(WaiterAllowance + time.Second) }
+
+	for _, label := range []string{"older", "younger"} {
+		w := q.waiting[label]
+		w.progress = q.now()
+		q.waiting[label] = w
+	}
+
+	if !q.mayBuy("younger", ranked("light", ranks)) || q.mayBuy("older", ranked("heavy", ranks)) {
+		t.Error("a stalled waiter of an unread target turned the ranks off")
 	}
 }

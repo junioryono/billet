@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -69,17 +70,34 @@ import (
 // ceiling, so a tier waiting for a Mac does not stop a Linux tier whose room is
 // on another machine (#157, #187).
 //
-// WEIGHTS RANK TARGETS AGAINST EACH OTHER, AND ONLY THEN (#530). When some target
-// has a weight, the waiters competing for one room are taken in the order of
-// what their targets hold per unit of weight (alloc.TierAdmission.TargetRank),
-// the lowest first, so a target the order is behind on catches up while both
-// wait; within a target, and between targets that rank alike, it is oldest first
-// as above. A target with nobody waiting is no candidate, so its weight claims
+// WEIGHTS CHOOSE THE NEXT HEAD, AND ONLY THAT (#530). When some target has a
+// weight, the waiters competing for one room are taken in the order of what
+// their targets hold per unit of weight (alloc.TierAdmission.TargetRank), the
+// lowest first, so a target the order is behind on catches up while both wait;
+// within a target, and between targets that rank alike, it is oldest first as
+// above. A target with nobody waiting is no candidate, so its weight claims
 // nothing, and a buyer with no wait on record is ranked too: one whose target is
 // the furthest behind need not wait behind the others. It is judged on the
 // buyer's own fresh read of every target's rank, because a waiter's is as old as
 // its last refusal. With no weight, or with any candidate's target unknown, the
 // order is oldest first alone: a failed read must not change who goes first.
+//
+// AND THE ORDER STILL ENDS, because a rank never takes the line from a head. A
+// rank moves whenever any job ends, so ranked alone a wide waiter loses its turn
+// to whichever rival's job ended last, the room it was accumulating is sold, and
+// it never fits (Codex and Opus reviews, 2026-11-04). Three things stand above
+// every rank, in this order. A tier below its floor: room is already held for it
+// from everyone else, so it takes nothing a waiter could buy, and a waiter that
+// its floor keeps short could otherwise be ahead of it forever. A waiter that was
+// head when it was refused keeps the line until it buys, as under oldest first.
+// And a waiter that has gone WeightPatience without buying, so a target ranked
+// behind every rival, whose tier those rivals would otherwise outrank for as long
+// as they have work, waits no longer than it would with no weights.
+//
+// A TIER WHOSE LAUNCHES FAIL STEPS ASIDE, while ranks apply. Its leases hand back
+// at once, so its rank stays the lowest however often it buys, where oldest first
+// would rotate it away after each purchase; it would hold a lease's room idle for
+// as long as its launches failed.
 type admissionQueue struct {
 	policy config.AdmissionOrder
 	now    func() time.Time
@@ -87,6 +105,10 @@ type admissionQueue struct {
 
 	mu      sync.Mutex
 	waiting map[string]waitingTier
+	// lastRanks is the newest read of the targets' ranks any buyer brought, what the
+	// status report judges every waiter by, so it never says each of two waiters
+	// holds the other from reads taken at different times.
+	lastRanks map[string]float64
 }
 
 // WaiterAllowance is how long a waiter keeps holding back other tiers without
@@ -96,6 +118,12 @@ type admissionQueue struct {
 // is dead. Too short costs a large tier its accumulated room; too long is the
 // 2026-09-23 stall.
 const WaiterAllowance = 3 * time.Minute
+
+// WeightPatience is how long a waiter goes without buying before a rank no longer
+// holds it back. A policy choice rather than a measurement: long enough that a
+// target whose jobs turn over in minutes is ranked throughout, and short against
+// what a job can wait now, so a weight shapes who goes next and cannot starve.
+const WeightPatience = 15 * time.Minute
 
 // waitingTier is one tier's place in the order and where its room could come
 // from.
@@ -120,6 +148,13 @@ type waitingTier struct {
 	// passed records that another tier has been let past this stalled waiter,
 	// so the log says so once per stall rather than on every purchase.
 	passed bool
+	// head records that this waiter was first in the order when it was refused:
+	// it keeps the line until it buys, whatever the ranks do. Only under ranks;
+	// without them nothing but buying moves a waiter anyway.
+	head bool
+	// launchFailing is a last launch that failed; under ranks the waiter steps
+	// aside until one succeeds.
+	launchFailing bool
 }
 
 // newAdmissionQueue builds the queue every listener of one control plane shares.
@@ -204,17 +239,30 @@ func competes(buyer, waiter alloc.TierAdmission) bool {
 	return false
 }
 
-// place is where one tier stands in the order: by its target's rank (all zero
-// with no weights), then by when it began waiting, then by label, so two tiers
+// What stands above a rank, in order; a tier in neither is ranked.
+const (
+	placeBelowFloor = iota
+	placeHead
+	placeRanked
+)
+
+// place is where one tier stands in the order: by what stands above a rank, then
+// by its target's rank, then by when it began waiting, then by label, so two tiers
 // inside one clock tick still have one winner rather than alternating with the
-// map's iteration order and letting neither accumulate room.
+// map's iteration order and letting neither accumulate room. With no weights every
+// tier is ranked alike, which leaves the wait and the label.
 type place struct {
+	class int
 	rank  float64
 	since time.Time
 	label string
 }
 
 func (p place) before(other place) bool {
+	if p.class != other.class {
+		return p.class < other.class
+	}
+
 	if p.rank != other.rank {
 		return p.rank < other.rank
 	}
@@ -230,10 +278,16 @@ func (p place) before(other place) bool {
 // rank, whatever the clock says.
 var notWaiting = time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
 
+// steppedAside reports a waiter that holds nobody back for now and keeps its place:
+// one whose listener stalled, or, under ranks, whose launches are failing.
+func steppedAside(waiter waitingTier, ranks map[string]float64, now time.Time) bool {
+	return !holdsTheLine(waiter, now) || (ranks != nil && waiter.launchFailing)
+}
+
 // ranksFor requires q.mu. It is the ranks a buyer at where is judged by, nil when
-// there are none or when they cannot place the buyer and every waiter competing
-// with it, which leaves the order oldest first.
-func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission) map[string]float64 {
+// there are none or when they cannot place the buyer and every waiter holding it
+// back, which leaves the order oldest first.
+func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission, now time.Time) map[string]float64 {
 	if where.TargetRank == nil {
 		return nil
 	}
@@ -243,7 +297,7 @@ func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission) map[st
 	}
 
 	for label, waiter := range q.waiting {
-		if label != tier && !competes(where, waiter.where) {
+		if label != tier && (!competes(where, waiter.where) || !holdsTheLine(waiter, now)) {
 			continue
 		}
 
@@ -255,14 +309,37 @@ func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission) map[st
 	return where.TargetRank
 }
 
-// placeOf requires q.mu. It is where a tier stands for a buyer judged by ranks,
-// the tier at where.
-func (q *admissionQueue) placeOf(tier string, where alloc.TierAdmission, ranks map[string]float64) place {
-	if own, waiting := q.waiting[tier]; waiting {
-		return place{rank: ranks[own.where.Target], since: own.since, label: tier}
+// standing is where a waiter stands for a buyer judged by ranks.
+func standing(label string, waiter waitingTier, ranks map[string]float64, now time.Time) place {
+	out := place{class: placeRanked, since: waiter.since, label: label}
+
+	switch {
+	case ranks == nil:
+	case waiter.where.BelowFloor:
+		out.class = placeBelowFloor
+	case waiter.head || now.Sub(waiter.since) >= WeightPatience:
+		out.class = placeHead
+	default:
+		out.rank = ranks[waiter.where.Target]
 	}
 
-	return place{rank: ranks[where.Target], since: notWaiting, label: tier}
+	return out
+}
+
+// placeOf requires q.mu. It is where a buyer at where stands: as its own record
+// says if it is waiting, on the ground it reads now, and after every waiter of its
+// rank if it is not.
+func (q *admissionQueue) placeOf(tier string, where alloc.TierAdmission, ranks map[string]float64,
+	now time.Time,
+) place {
+	own, waiting := q.waiting[tier]
+	if !waiting {
+		own.since = notWaiting
+	}
+
+	own.where = where
+
+	return standing(tier, own, ranks, now)
 }
 
 // mayBuy reports whether this tier may buy capacity now.
@@ -278,6 +355,8 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	q.noteRanks(where)
 
 	first, _, stalled := q.head(tier, where)
 
@@ -297,7 +376,7 @@ func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, t
 	var best place
 
 	now := q.now()
-	ranks := q.ranksFor(tier, where)
+	ranks := q.ranksFor(tier, where, now)
 
 	var stalled []string
 
@@ -308,13 +387,17 @@ func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, t
 
 		// A STALLED WAITER STEPS ASIDE BUT KEEPS ITS PLACE. Its own record is never
 		// skipped, so a tier is not let past itself.
-		if label != tier && !holdsTheLine(waiter, now) {
+		if label != tier && steppedAside(waiter, ranks, now) {
 			stalled = append(stalled, label)
 
 			continue
 		}
 
-		candidate := place{rank: ranks[waiter.where.Target], since: waiter.since, label: label}
+		candidate := standing(label, waiter, ranks, now)
+		if label == tier {
+			candidate = q.placeOf(tier, where, ranks, now)
+		}
+
 		if best.label == "" || candidate.before(best) {
 			best = candidate
 		}
@@ -323,7 +406,7 @@ func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, t
 	// A BUYER WITH NO WAIT ON RECORD IS RANKED TOO, so a target the order is behind
 	// on need not queue behind the targets it is behind.
 	if _, waiting := q.waiting[tier]; !waiting {
-		if own := q.placeOf(tier, where, ranks); best.label == "" || own.before(best) {
+		if own := q.placeOf(tier, where, ranks, now); best.label == "" || own.before(best) {
 			best = own
 		}
 	}
@@ -363,7 +446,46 @@ func (q *admissionQueue) waiterHeldBy(tier string) (string, time.Time, bool) {
 		return "", time.Time{}, false
 	}
 
-	return q.heldByLocked(tier, own.where)
+	where := own.where
+	if q.lastRanks != nil {
+		where.TargetRank = q.lastRanks
+	}
+
+	return q.heldByLocked(tier, where)
+}
+
+// whyAhead says why the waiter holding this tier back stands ahead of it, where a
+// rank put it there: a refusal that said only who, with a younger waiter named,
+// would read as a bug. Empty with no ranks, where the wait says it all.
+func (q *admissionQueue) whyAhead(waiter string, where alloc.TierAdmission) string {
+	if q == nil || q.policy == config.AdmissionFill {
+		return ""
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := q.now()
+
+	ranks := q.ranksFor(waiter, where, now)
+	if ranks == nil {
+		return ""
+	}
+
+	w, ok := q.waiting[waiter]
+	if !ok {
+		return ""
+	}
+
+	switch standing(waiter, w, ranks, now).class {
+	case placeBelowFloor:
+		return "it is below its floor"
+	case placeHead:
+		return "it was first when it was refused, or has waited past the patience a weight allows"
+	default:
+		return fmt.Sprintf("its target holds %.3f per unit of weight and this tier's %.3f", ranks[w.where.Target],
+			ranks[where.Target])
+	}
 }
 
 // heldByLocked requires q.mu.
@@ -390,16 +512,16 @@ func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string 
 	defer q.mu.Unlock()
 
 	now := q.now()
-	ranks := q.ranksFor(tier, where)
-	own := q.placeOf(tier, where, ranks)
+	ranks := q.ranksFor(tier, where, now)
+	own := q.placeOf(tier, where, ranks, now)
 
 	var out []string
 	for label, waiter := range q.waiting {
-		if label == tier || !competes(where, waiter.where) || !holdsTheLine(waiter, now) {
+		if label == tier || !competes(where, waiter.where) || steppedAside(waiter, ranks, now) {
 			continue
 		}
 
-		if own.before(place{rank: ranks[waiter.where.Target], since: waiter.since, label: label}) {
+		if own.before(standing(label, waiter, ranks, now)) {
 			continue
 		}
 
@@ -414,21 +536,22 @@ func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string 
 // letPast requires q.mu. It logs, once per stall, each stalled waiter this
 // buyer really did get ahead of: one that would otherwise have come first.
 func (q *admissionQueue) letPast(tier string, where alloc.TierAdmission, stalled []string) {
-	ranks := q.ranksFor(tier, where)
-	own := q.placeOf(tier, where, ranks)
+	now := q.now()
+	ranks := q.ranksFor(tier, where, now)
+	own := q.placeOf(tier, where, ranks, now)
 
 	for _, label := range stalled {
 		waiter := q.waiting[label]
-		if waiter.passed || own.before(place{rank: ranks[waiter.where.Target], since: waiter.since, label: label}) {
+		if waiter.passed || own.before(standing(label, waiter, ranks, now)) {
 			continue
 		}
 
 		waiter.passed = true
 		q.waiting[label] = waiter
-		q.log.Warn("letting a tier past a waiter whose listener has made no admission progress; "+
-			"it keeps its place and holds the line again when it progresses",
+		q.log.Warn("letting a tier past a waiter whose listener has made no admission progress, or whose "+
+			"launches are failing; it keeps its place and holds the line again when that ends",
 			"tier", tier, "waiter", label, "waiting_since", waiter.since,
-			"last_progress", waiter.progress, "allowance", WaiterAllowance)
+			"last_progress", waiter.progress, "allowance", WaiterAllowance, "launch_failing", waiter.launchFailing)
 	}
 }
 
@@ -447,6 +570,8 @@ func (q *admissionQueue) waits(tier string, where alloc.TierAdmission) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	q.noteRanks(where)
+
 	// THE PLACE IS KEPT AND THE GROUND UNDER IT IS REFRESHED: a tier that waited
 	// for a host which has since drained competes for where it could go NOW,
 	// while the wait that earns it the freed room is still dated from its first
@@ -454,12 +579,25 @@ func (q *admissionQueue) waits(tier string, where alloc.TierAdmission) {
 	if previous, ok := q.waiting[tier]; ok {
 		previous.where = where
 		q.progressed(tier, previous)
-
-		return
+	} else {
+		now := q.now()
+		q.waiting[tier] = waitingTier{since: now, where: where, progress: now}
 	}
 
-	now := q.now()
-	q.waiting[tier] = waitingTier{since: now, where: where, progress: now}
+	// A HEAD THAT WAS REFUSED KEEPS THE LINE until it buys, so what it is
+	// accumulating is not sold to whichever rival's job ended last.
+	if first, _, _ := q.head(tier, where); first == tier && where.TargetRank != nil {
+		waiter := q.waiting[tier]
+		waiter.head = true
+		q.waiting[tier] = waiter
+	}
+}
+
+// noteRanks requires q.mu.
+func (q *admissionQueue) noteRanks(where alloc.TierAdmission) {
+	if where.TargetRank != nil {
+		q.lastRanks = where.TargetRank
+	}
 }
 
 // progressed requires q.mu. It dates a waiter's admission progress and says so
@@ -481,6 +619,21 @@ func (q *admissionQueue) progressed(tier string, waiter waitingTier) {
 func (q *admissionQueue) launchBegins(tier string) { q.launchMark(tier) }
 
 func (q *admissionQueue) launchEnds(tier string) { q.launchMark(tier) }
+
+// launchFailing records whether this tier's last launch failed.
+func (q *admissionQueue) launchFailing(tier string, failed bool) {
+	if q == nil {
+		return
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if waiter, ok := q.waiting[tier]; ok {
+		waiter.launchFailing = failed
+		q.waiting[tier] = waiter
+	}
+}
 
 func (q *admissionQueue) launchMark(tier string) {
 	if q == nil {
@@ -519,6 +672,7 @@ func (q *admissionQueue) bought(tier string) {
 	}
 
 	waiter.since = q.now()
+	waiter.head = false
 	q.progressed(tier, waiter)
 }
 

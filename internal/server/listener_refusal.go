@@ -21,9 +21,11 @@ type refusal struct {
 	// draining is a listener that buys nothing while it drains.
 	draining bool
 	// waiter is the tier the admission order holds the line for, and since is
-	// when it began waiting.
+	// when it began waiting; ahead says why it stands ahead, where a rank put it
+	// there.
 	waiter string
 	since  time.Time
+	ahead  string
 	// room is the allocator's own reason, read after it granted nothing, and
 	// protecting the waiters ahead a purchase out of turn had to leave room for.
 	room       *alloc.RoomRefusal
@@ -103,6 +105,9 @@ func (r refusal) String() string {
 	switch {
 	case r.draining:
 		return "this listener is draining and buys nothing"
+	case r.waiter != "" && r.ahead != "":
+		return fmt.Sprintf("the admission order holds freed room for %s, waiting since %s: %s",
+			r.waiter, r.since.UTC().Format(time.RFC3339), r.ahead)
 	case r.waiter != "":
 		return fmt.Sprintf("the admission order holds freed room for %s, waiting since %s",
 			r.waiter, r.since.UTC().Format(time.RFC3339))
@@ -128,7 +133,7 @@ func (l *Listener) orderRefusal(where alloc.TierAdmission) refusal {
 		return refusal{waiter: "a waiter that has since been served or moved"}
 	}
 
-	return refusal{waiter: waiter, since: since}
+	return refusal{waiter: waiter, since: since, ahead: l.order.whyAhead(waiter, where)}
 }
 
 // roomRefusal asks the allocator why a purchase it was asked for granted
