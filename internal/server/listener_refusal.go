@@ -118,6 +118,9 @@ func (r refusal) String() string {
 			r.waiter, r.since.UTC().Format(time.RFC3339))
 	case r.unread != nil:
 		return fmt.Sprintf("the allocator granted nothing, and why could not be read: %v", r.unread)
+	case r.room != nil && !r.room.Binds() && len(r.protecting) > 0:
+		return "buying ahead of its turn would leave " + strings.Join(r.protecting, ", ") +
+			" without room for one lease"
 	case r.room != nil && !r.room.Binds() && len(r.heldHosts) > 0:
 		held := make([]string, 0, len(r.heldHosts))
 		for _, host := range slices.Sorted(maps.Keys(r.heldHosts)) {
@@ -125,9 +128,6 @@ func (r refusal) String() string {
 		}
 
 		return "the only room is on hosts held for tiers whose shape fits on none: " + strings.Join(held, ", ")
-	case r.room != nil && !r.room.Binds() && len(r.protecting) > 0:
-		return "buying ahead of its turn would leave " + strings.Join(r.protecting, ", ") +
-			" without room for one lease"
 	case r.room != nil:
 		return "the allocator has no room: " + r.room.String()
 	default:
@@ -160,7 +160,25 @@ func (l *Listener) roomRefusal(ctx context.Context, protect []string) refusal {
 		return refusal{unread: err}
 	}
 
-	return refusal{room: &room, protecting: protect, heldHosts: l.order.heldForOthers(l.tier)}
+	return refusal{room: &room, protecting: protect, heldHosts: l.heldAgainst(ctx)}
+}
+
+// heldAgainst is the hosts this tier avoids that it could use, each with its owner.
+func (l *Listener) heldAgainst(ctx context.Context) map[string]string {
+	if !l.order.holds() {
+		return nil
+	}
+
+	where := l.admission(ctx)
+	out := map[string]string{}
+
+	for host, owner := range l.order.heldAgainst(l.tier) {
+		if slices.Contains(where.Nodes, host) {
+			out[host] = owner
+		}
+	}
+
+	return out
 }
 
 // refuse records why a purchase bought nothing, for the decline that follows

@@ -281,6 +281,31 @@ func TestEmptyWhileQueuedCountsOnlyHostsTheWaitingJobFits(t *testing.T) {
 	if got := r.EmptyWhileQueuedHours(); math.Abs(got-1) > 1e-9 {
 		t.Errorf("%.3f host-hours empty while a job waited; want the hour on the host it fits", got)
 	}
+
+	// A JOB PINNED ELSEWHERE IS NOT ROOM THIS HOST DENIED, and a job still queued that
+	// the ledger never recorded is one.
+	pinned := &Report{
+		Fleet: Fleet{
+			Hosts: []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}, {Name: "spare", VCPU: 8, Memory: 32 * config.GiB}},
+			Tiers: []TierShape{
+				{Label: "pinned", VCPU: 4, Memory: 8 * config.GiB, Node: "only"},
+				{Label: "free", VCPU: 4, Memory: 8 * config.GiB},
+			},
+			MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+		},
+		Records: []Record{{Tier: "pinned", Node: "only", VCPU: 4, Memory: 8 * config.GiB, Arrival: hour(0),
+			ChargedFrom: hour(1), StartedAt: hour(1), FinishedAt: hour(2)}},
+	}
+
+	if got := pinned.EmptyWhileQueuedHours(); got != 0 {
+		t.Errorf("%.3f host-hours empty while a job pinned elsewhere waited; want none", got)
+	}
+
+	pinned.queued = map[int64]Arrival{7: {Seq: 7, At: hour(1), Tier: "free"}}
+
+	if got := pinned.EmptyWhileQueuedHours(); math.Abs(got-1) > 1e-9 {
+		t.Errorf("%.3f host-hours empty while an unrecorded job waited; want the hour of the spare host", got)
+	}
 }
 
 // A SHAPE THAT STARTED NOTHING SHOWS NO WAITS, and its backlog at the horizon

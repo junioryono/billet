@@ -5,6 +5,8 @@ import (
 	"io"
 	"slices"
 	"time"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // UtilizationBucket is the default width Utilization averages over.
@@ -299,14 +301,30 @@ func (r *Report) EmptyWhileQueuedHours() float64 {
 // interval is a stretch of time.
 type interval struct{ from, to time.Time }
 
-// waitsThatFit is when a job that fits on the host was waiting to start, merged and
-// in order. A job that never started waited from its arrival on.
+// waitsThatFit is when a job that could run on the host was waiting to start, merged
+// and in order: one that fits it, of a tier not pinned elsewhere. A job that never
+// started waited from its arrival on, whether or not the ledger recorded it.
 func (r *Report) waitsThatFit(h Host) []interval {
+	shapes := make(map[string]TierShape, len(r.Fleet.Tiers))
+	for _, t := range r.Fleet.Tiers {
+		shapes[t.Label] = t
+	}
+
+	fits := func(tier string, vcpu int, memory config.ByteSize) bool {
+		shape, known := shapes[tier]
+
+		return (!known || shape.Node == "" || shape.Node == h.Name) && vcpu <= h.VCPU && memory <= h.Memory
+	}
+
 	var waits []interval
+
+	recorded := make(map[int64]bool, len(r.Records))
 
 	for i := range r.Records {
 		rec := &r.Records[i]
-		if rec.VCPU > h.VCPU || rec.Memory > h.Memory {
+		recorded[rec.Seq] = true
+
+		if !fits(rec.Tier, rec.VCPU, rec.Memory) {
 			continue
 		}
 
@@ -317,6 +335,12 @@ func (r *Report) waitsThatFit(h Host) []interval {
 
 		if end.After(rec.Arrival) {
 			waits = append(waits, interval{rec.Arrival, end})
+		}
+	}
+
+	for seq, a := range r.queued {
+		if shape := shapes[a.Tier]; !recorded[seq] && fits(a.Tier, shape.VCPU, shape.Memory) {
+			waits = append(waits, interval{a.At, maxInterval})
 		}
 	}
 

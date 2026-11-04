@@ -380,8 +380,9 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 
 // askForAHold tells the order which hosts this waiting tier could be held, under the
 // order that holds hosts. A tier the ceiling or its target's share refuses is waiting
-// for room a hold cannot keep. A read that failed keeps what the tier last read: a
-// hold is an optimisation, and nothing here may fail a reconciliation.
+// for room a hold cannot keep. A read that failed holds nothing: what withholds room
+// from others is what a failed read must not keep doing, and nothing here may fail a
+// reconciliation.
 func (l *Listener) askForAHold(ctx context.Context, admission alloc.TierAdmission) {
 	if !l.order.holds() {
 		return
@@ -393,11 +394,9 @@ func (l *Listener) askForAHold(ctx context.Context, admission alloc.TierAdmissio
 		return
 	}
 
-	candidates, err := l.alloc.HoldCandidates(ctx, l.tier, l.order.avoiding(l.tier))
+	candidates, err := l.alloc.HoldCandidates(ctx, l.tier, l.order.avoiding(l.tier), l.order.ownHold(l.tier))
 	if err != nil {
 		l.log.Warn("could not read which host to hold for this waiting tier", "tier", l.tier, "error", err)
-
-		return
 	}
 
 	l.order.mayHold(l.tier, candidates)

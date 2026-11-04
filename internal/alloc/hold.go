@@ -28,11 +28,14 @@ type HoldCandidate struct {
 type heldLease struct {
 	cost placementCost
 	end  time.Time
+	// stuck is a lease in custody or quarantine, which ends only on proof the compute
+	// is gone or by an operator: room no prediction can promise.
+	stuck bool
 }
 
 // HoldCandidates lists the hosts a tier could be held one of, the soonest ready
-// first (ties by name), or none when its shape fits now on a host outside avoid, or
-// is not one a hold can help.
+// first (ties by name), or none when its shape fits now on a host outside avoid other
+// than own, the host it already holds, or is not one a hold can help.
 //
 // THE PREDICTION CHOOSES THE HOST AND NOTHING ELSE (ADR-023). Each host's leases are
 // sorted by predicted end and their room added up until the shape fits. A wrong
@@ -41,12 +44,16 @@ type heldLease struct {
 // same, because holding one still beats holding none.
 //
 // A HOST ALREADY RUNNING A LEASE AS LARGE AS THE SHAPE IS NOT A CANDIDATE: that lease
-// ending is room the shape fits in, with no hold needed to keep smaller work off it,
-// and holding it would keep work off a host that frees up for nothing. So a shape as
-// small as what the hosts run is never held for. A remote backend buys its shapes and
-// has no room to accumulate. A macOS slot is a licence rather than room, which a lease
-// of another size frees all the same. A floor elsewhere is charged as a purchase's is.
-func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []string) ([]HoldCandidate, error) {
+// ending is room the shape fits in at once, and holding it would close the host to
+// everyone for work that frees it anyway. A waiter with no candidate holds the line
+// instead, as under fair, so what it fits in is not sold from under it. A host that
+// needs a lease in custody or quarantine to end is no candidate either. A remote
+// backend buys its shapes and has no room to accumulate. A macOS slot is a licence
+// rather than room, which a lease of another size frees all the same. A floor elsewhere
+// is charged as a purchase's is.
+func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []string,
+	own string,
+) ([]HoldCandidate, error) {
 	t, ok := a.tiers[tier]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownTier, tier)
@@ -72,7 +79,7 @@ func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []str
 		}
 
 		for _, n := range place.order {
-			if place.roomFor(n.name, t) > 0 && !slices.Contains(avoid, n.name) {
+			if n.name != own && place.roomFor(n.name, t) > 0 && !slices.Contains(avoid, n.name) {
 				return nil
 			}
 		}
@@ -143,6 +150,7 @@ func (a *Allocator) leasesByNode(ctx context.Context, tx querier, priors *Runtim
 
 		out[row.Node] = append(out[row.Node], heldLease{
 			cost: placementCost{vcpu: int(row.Vcpu), memory: config.ByteSize(row.Memory)}, end: end,
+			stuck: row.Phase == string(PhaseCustody) || row.Phase == string(PhaseQuarantine),
 		})
 	}
 
@@ -170,6 +178,10 @@ func readyAt(cost placementCost, freeVCPU int, freeMemory config.ByteSize, lease
 	slices.SortStableFunc(sorted, func(x, y heldLease) int { return x.end.Compare(y.end) })
 
 	for i := range sorted {
+		if sorted[i].stuck {
+			continue
+		}
+
 		freeVCPU += sorted[i].cost.vcpu
 		freeMemory += sorted[i].cost.memory
 

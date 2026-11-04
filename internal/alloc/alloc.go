@@ -595,10 +595,11 @@ type Purchase struct {
 	// Protect is the tiers each of which must still be granted one lease
 	// afterwards (EscrowLeaving).
 	Protect []string
-	// Avoid is the hosts held for other tiers, which this purchase places nothing
-	// on (HoldCandidates). A tier below its floor ignores it: its room is promised,
-	// and a floor is not a thing a hold may take back.
-	Avoid []string
+	// Avoid is the hosts each tier places nothing on, held for another (HoldCandidates).
+	// It names this purchase's tier and each it must protect, which is measured the
+	// same way. A tier below its floor uses one only if it has room nowhere else: its
+	// room is promised, not that host.
+	Avoid map[string][]string
 }
 
 // EscrowFor is Escrow under what the admission order asks of this purchase.
@@ -645,7 +646,7 @@ var (
 // errWaiterShortNow or errWaiterLeftShort when it would leave a tier in guarded
 // unable to be granted one.
 func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded []config.Tier,
-	avoid []string,
+	avoid map[string][]string,
 ) ([]*Lease, error) {
 	if want == 0 {
 		return nil, nil
@@ -675,20 +676,23 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 			return err
 		}
 
-		if len(avoid) > 0 {
+		if hosts := avoid[t.Label]; len(hosts) > 0 {
 			floors, err := a.countFloorLeasesPerTier(ctx, tx)
 			if err != nil {
 				return err
 			}
 
-			if t.Reserved <= floors[t.Label] {
-				place.avoid(avoid)
+			open := place.clone()
+			open.avoid(hosts)
+
+			if t.Reserved <= floors[t.Label] || open.total(t) > 0 {
+				place = open
 			}
 		}
 
 		// A WAITER THAT CANNOT BE GRANTED ONE NOW IS ACCUMULATING ROOM, and
 		// nothing is bought ahead of it.
-		if err := guardedHaveRoom(ctx, a, tx, guarded, errWaiterShortNow); err != nil {
+		if err := guardedHaveRoom(ctx, a, tx, guarded, avoid, errWaiterShortNow); err != nil {
 			return err
 		}
 
@@ -698,9 +702,10 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 		for range take {
 			target, cost, ok := place.next(t)
 			if !ok {
-				// The fleet ran out before the ceiling did. Headroom is the smaller of the two, so
-				// this should not happen — but returning what was placed is the safe reading, and
-				// inserting an unplaced lease is the failure this design exists to prevent.
+				// The fleet ran out before the ceiling did: the room left is on a host held
+				// for another tier, which headroom counted. Returning what was placed is the
+				// safe reading, and inserting an unplaced lease is the failure this design
+				// exists to prevent.
 				break
 			}
 
@@ -715,7 +720,7 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 
 		// READ BACK WITH THE LEASES IN THE LEDGER, floors re-placed and all.
 		if len(leases) > 0 {
-			return guardedHaveRoom(ctx, a, tx, guarded, errWaiterLeftShort)
+			return guardedHaveRoom(ctx, a, tx, guarded, avoid, errWaiterLeftShort)
 		}
 
 		return nil
@@ -728,12 +733,19 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 }
 
 // guardedHaveRoom returns short unless every tier in guarded could be granted one
-// lease by an escrow in this transaction now.
-func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []config.Tier, short error) error {
+// lease by an escrow in this transaction now, on a host not held for another tier.
+func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []config.Tier,
+	avoid map[string][]string, short error,
+) error {
 	for i := range guarded {
-		room, err := a.headroom(ctx, tx, guarded[i])
+		room, place, err := a.headroomWithPlacer(ctx, tx, guarded[i])
 		if err != nil {
 			return err
+		}
+
+		if hosts := avoid[guarded[i].Label]; room > 0 && len(hosts) > 0 {
+			place.avoid(hosts)
+			room = place.total(guarded[i])
 		}
 
 		if room < 1 {
@@ -1489,8 +1501,10 @@ func (a *Allocator) ResizeLeaving(
 		}
 
 		// READ BACK WITH THE NEW SHAPE CHARGED, floors re-placed and all, and
-		// rolled back if a waiter ahead is left without a lease.
-		if err := guardedHaveRoom(ctx, a, tx, guarded, errWaiterLeftShort); err != nil {
+		// rolled back if a waiter ahead is left without a lease. No host's hold is read
+		// here: a fallback grows on a remote backend, where none sits, and a waiter's
+		// room on a held host is room it has when that hold moves.
+		if err := guardedHaveRoom(ctx, a, tx, guarded, nil, errWaiterLeftShort); err != nil {
 			return resizeRefused(err, instanceType, protect)
 		}
 
