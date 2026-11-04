@@ -118,7 +118,7 @@ func TestASourceThatCannotAnswerSendsNothingAndSaysSo(t *testing.T) {
 	f := tokenFake(t)
 	tokens := newStubTokens("unused")
 
-	down := error(billetgithub.ErrTokenUnavailable)
+	down := billetgithub.ErrTokenUnavailable
 	tokens.err.Store(&down)
 
 	client, err := New(tokenConfig(t, f, tokens), nil)
@@ -196,7 +196,7 @@ func TestAPollDoesNotAskTheSource(t *testing.T) {
 
 	before := tokens.called.Load()
 
-	down := error(billetgithub.ErrTokenUnavailable)
+	down := billetgithub.ErrTokenUnavailable
 	tokens.err.Store(&down)
 
 	if _, err := session.GetMessage(t.Context(), 0, 0); !errors.Is(err, server.ErrNoMessage) {
@@ -221,7 +221,7 @@ func TestARetryOfARegistrationTakesAFreshToken(t *testing.T) {
 	tokens := newStubTokens("the-second-token")
 	hook := sourceInstallationToken(tokens, &tokenFailures{}, slog.Default())
 
-	req := httptest.NewRequest(http.MethodPost, "https://api.github.com/orgs/acme/actions/runners/registration-token", http.NoBody)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://api.github.com/orgs/acme/actions/runners/registration-token", http.NoBody)
 	req.Header.Set("Authorization", "Bearer the-first-token")
 
 	hook(nil, req, 1)
@@ -231,7 +231,7 @@ func TestARetryOfARegistrationTakesAFreshToken(t *testing.T) {
 	}
 
 	// EVERY OTHER REQUEST CARRIES SOMETHING THE SOURCE DID NOT ISSUE, and is left alone.
-	other := httptest.NewRequest(http.MethodGet, "https://broker.actions.githubusercontent.com/queue", http.NoBody)
+	other := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://broker.actions.githubusercontent.com/queue", http.NoBody)
 	other.Header.Set("Authorization", "Bearer queue-token")
 
 	before := tokens.called.Load()

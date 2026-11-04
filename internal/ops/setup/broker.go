@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"syscall"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
-	"github.com/junioryono/billet/internal/regularfile"
+	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/tokenbroker"
 )
@@ -60,6 +61,8 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet broker client-key", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	show := fs.Bool("show", false, "print the existing key's fingerprint rather than making one")
+	newDeployment := fs.Bool("new-deployment", false,
+		"this host has no deployment identity and is starting a new deployment, not restoring one: mint it")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -71,6 +74,33 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 
 	if cfg.Server == nil || cfg.Server.TokenBroker == nil {
 		return fmt.Errorf("%s has no server.token_broker; this host has no broker to prove itself to", *cfgPath)
+	}
+
+	path := cfg.Server.TokenBroker.ClientKeyPath
+
+	// AN OBSERVER CREATES NOTHING: no identity, no lock directory, no key.
+	if *show {
+		deployment, found, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("%s holds no deployment identity, so this key proves nothing yet", cfg.Server.IdentityDir)
+		}
+
+		key, err := tokenbroker.ReadClientKey(path)
+		if err != nil {
+			return err
+		}
+
+		fingerprint, err := tokenbroker.Fingerprint(key)
+		if err != nil {
+			return err
+		}
+
+		printBrokerStanza(env, cfg, path, deployment, fingerprint)
+
+		return nil
 	}
 
 	// UNDER THE IDENTITY EXCLUSION, because the identity may be minted here on a host
@@ -87,34 +117,38 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 		}
 	}()
 
+	// MINTED ONLY WHEN ASKED. An identity minted here on a replacement host stops the
+	// restore that was about to bring the real one back, and names a deployment that
+	// does not exist in the stanza this prints.
+	if _, found, err := state.PeekDeploymentID(cfg.Server.IdentityDir); err != nil {
+		return err
+	} else if !found && !*newDeployment {
+		return fmt.Errorf("%s holds no deployment identity. If this host is restoring a deployment, run "+
+			"`billet local restore` first and this after it. If this is a new deployment, run this again with "+
+			"--new-deployment", cfg.Server.IdentityDir)
+	}
+
 	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
 		return err
 	}
 
-	path := cfg.Server.TokenBroker.ClientKeyPath
-
-	var fingerprint string
-
-	if *show {
-		key, err := tokenbroker.ReadClientKey(path)
-		if err != nil {
-			return err
-		}
-
-		if fingerprint, err = tokenbroker.Fingerprint(key); err != nil {
-			return err
-		}
-	} else {
-		if fingerprint, err = tokenbroker.CreateClientKey(path); err != nil {
-			return err
-		}
-
-		if err := giveToService(path, cfg.Server.IdentityDir); err != nil {
-			return err
-		}
+	fingerprint, err := tokenbroker.CreateClientKey(path)
+	if err != nil {
+		return err
 	}
 
+	if err := giveToService(path, cfg.Server.IdentityDir); err != nil {
+		return err
+	}
+
+	printBrokerStanza(env, cfg, path, deployment, fingerprint)
+
+	return nil
+}
+
+// printBrokerStanza prints what this host's key is, and what to register at the broker.
+func printBrokerStanza(env cli.Env, cfg *config.Config, path, deployment, fingerprint string) {
 	fmt.Fprintf(env.Stdout, "key          %s\ndeployment   %s\nfingerprint  %s\n\nCompare both with what the "+
 		"broker's operator registers, on a channel you trust:\n\ndeployments:\n  - id: %s\n    clients: [%q]\n"+
 		"    installations:\n", path, deployment, fingerprint, deployment, fingerprint)
@@ -125,14 +159,13 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintf(env.Stdout, "      - {app_id: %d, installation_id: %d, target: %q, actions_read: true}\n",
 			target.AppID, target.InstallationID, target.Path())
 	}
-
-	return nil
 }
 
 // giveToService hands a key a privileged run just made to the account the service runs
 // as, which owns the identity directory: it is the service that reads it, and a mode 0600
-// file root owns would stop the control plane at its first token. Through a descriptor,
-// never a pathname. Nothing happens for anyone but root.
+// file root owns would stop the control plane at its first token. Through lifeops' repair,
+// the one re-owning mechanism, which follows no symlink and refuses a file with a second
+// name. Nothing happens for anyone but root.
 func giveToService(path, identityDir string) error {
 	if os.Geteuid() != 0 {
 		return nil
@@ -143,14 +176,8 @@ func giveToService(path, identityDir string) error {
 		return fmt.Errorf("read who owns %s: %w", identityDir, err)
 	}
 
-	f, _, err := regularfile.Open(path, regularfile.Options{})
-	if err != nil {
-		return fmt.Errorf("open %s to hand it over: %w", path, err)
-	}
-
-	defer func() { _ = f.Close() }()
-
-	if err := f.Chown(int(owner.Uid), int(owner.Gid)); err != nil {
+	if _, err := lifeops.NewConverger(lifeops.NewInspector()).RepairPaths(filepath.Dir(path),
+		[]lifeops.RepairTarget{{Name: filepath.Base(path)}}, int(owner.Uid), int(owner.Gid)); err != nil {
 		return fmt.Errorf("give %s to the service account: %w", path, err)
 	}
 

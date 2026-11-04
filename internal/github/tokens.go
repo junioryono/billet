@@ -246,7 +246,7 @@ func (s appKeyTokens) InstallationToken(ctx context.Context) (Token, error) {
 }
 
 // rememberJWT keeps a JWT this source is about to send.
-func (s appKeyTokens) rememberJWT(jwt string) {
+func (s *appKeyState) rememberJWT(jwt string) {
 	s.sentMu.Lock()
 	defer s.sentMu.Unlock()
 

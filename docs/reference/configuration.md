@@ -237,4 +237,4 @@ deployments:
 | `deployments[].clients` | yes | the fingerprints of the keys that prove this deployment, one per host. A key proves one deployment |
 | `deployments[].installations[]` | no | the only tokens this deployment may ask for: `app_id`, `installation_id`, `target` (`owner`, or `owner/name` for one repository), and `actions_read`, which lets its tokens read GitHub's job records: without it every job keeps an unknown queue time, and a tier publishing caches from a default branch is refused. `billet broker client-key` prints it set |
 
-An installation registered as a whole organization belongs to one deployment, because its token reaches every repository the installation does; two deployments may share an installation by repository, whose tokens are scoped to the repository.
+An owner registered as a whole organization belongs to one deployment, under any App, because its token reaches every repository; two deployments may share an owner by repository, whose tokens are scoped to the repository, and a repository belongs to one deployment.

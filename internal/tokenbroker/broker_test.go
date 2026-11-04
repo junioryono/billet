@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -83,9 +84,13 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		var scope struct {
 			Permissions map[string]string `json:"permissions"`
 		}
-		_ = json.Unmarshal(body, &scope)
+		if err := json.Unmarshal(body, &scope); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 
-		_ = json.NewEncoder(w).Encode(map[string]any{
+			return
+		}
+
+		answerJSON(w, map[string]any{
 			"token": f.tokenFor(f.minted.Add(1)), "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 			"permissions": scope.Permissions,
 		})
@@ -108,7 +113,7 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			perms = map[string]string{"metadata": "read", "administration": "write"}
 		}
 
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		answerJSON(w, map[string]any{
 			"id": id, "account": map[string]string{"login": "acme", "type": "Organization"}, "permissions": perms,
 		})
 	default:
@@ -324,7 +329,7 @@ func TestABrokerRefusesAKeyItDoesNotKnow(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, tokenRoute, strings.NewReader(`{}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tokenRoute, strings.NewReader(`{}`))
 	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{strangerLeaf}}
 	broker.server.ServeHTTP(rec, req)
 
@@ -422,9 +427,34 @@ func TestAFailureToMintIsNeverAnAbsentInstallation(t *testing.T) {
 			lookup: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) },
 			want:   github.ErrNotInstalled, notWant: github.ErrTokenUnavailable,
 		},
+		// GITHUB'S OWN WORD ON THE MINT IS AS GOOD AS ON THE PROOF: an App uninstalled after
+		// its proof is not could-not-tell for the next hour.
+		"uninstalled since it was proved": {
+			mint: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) },
+			want: github.ErrNotInstalled, notWant: github.ErrTokenUnavailable,
+		},
+		"GitHub refuses the mint": {
+			mint: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+				answerJSON(w, map[string]string{"message": "Resource not accessible by integration"})
+			},
+			want: github.ErrTokenRefused, notWant: github.ErrTokenUnavailable,
+		},
+		"GitHub cannot process the mint": {
+			mint: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnprocessableEntity) },
+			want: github.ErrTokenRefused, notWant: github.ErrTokenUnavailable,
+		},
+		// A THROTTLE ANSWERS 403 AND IS NOT A REFUSAL.
+		"GitHub throttles the mint": {
+			mint: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+				answerJSON(w, map[string]string{"message": "API rate limit exceeded"})
+			},
+			want: github.ErrTokenUnavailable, notWant: github.ErrTokenRefused,
+		},
 		"another installation at that target": {
 			lookup: func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(map[string]any{
+				answerJSON(w, map[string]any{
 					"id": 999, "account": map[string]string{"login": "acme", "type": "Organization"},
 					"permissions": map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"},
 				})
@@ -536,6 +566,153 @@ func TestABrokerLogsNoCredential(t *testing.T) {
 	}
 }
 
+// NOR WHEN IT GOES WRONG, which is where a broker logs the most. GitHub echoes what it was
+// sent into this refusal, so the JWT that asked is in the error the broker logs unless
+// something took it out.
+func TestABrokerLogsNoCredentialWhenAMintFails(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu  sync.Mutex
+		jwt string
+	)
+
+	gh := newFakeGitHub(t)
+	gh.mint = func(w http.ResponseWriter, r *http.Request) {
+		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+
+		mu.Lock()
+		jwt = bearer
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusForbidden)
+		answerJSON(w, map[string]string{"message": "refused " + bearer})
+	}
+
+	cert, fingerprint := testClient(t)
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{org(22)}},
+	})
+
+	if _, err := broker.client(t, cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22).
+		InstallationToken(t.Context()); err == nil {
+		t.Fatal("a refused mint answered a token")
+	}
+
+	logged := broker.logged.String()
+	if !strings.Contains(logged, "could not mint an installation token") {
+		t.Fatalf("the broker logged nothing about the failure, so this proves nothing:\n%s", logged)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if jwt == "" {
+		t.Fatal("GitHub never saw a JWT, so this proves nothing")
+	}
+
+	if strings.Contains(logged, jwt) {
+		t.Errorf("the App's JWT reached the log:\n%s", logged)
+	}
+}
+
+// A FAILURE IS NOT ASKED ABOUT AGAIN FOR A WHILE. Every deployment on an App shares its
+// budget at GitHub, so one deployment retrying a mint that cannot succeed spends all of
+// theirs.
+func TestAFailureIsAnsweredFromMemoryAndThenAskedAgain(t *testing.T) {
+	t.Parallel()
+
+	var mints atomic.Int64
+
+	gh := newFakeGitHub(t)
+	gh.mint = func(w http.ResponseWriter, _ *http.Request) {
+		mints.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}
+
+	cert, fingerprint := testClient(t)
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{org(22)}},
+	})
+
+	now := time.Now()
+
+	var clock sync.Mutex
+
+	broker.server.now = func() time.Time {
+		clock.Lock()
+		defer clock.Unlock()
+
+		return now
+	}
+
+	source := broker.client(t, cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22)
+
+	for range 3 {
+		if _, err := source.InstallationToken(t.Context()); !errors.Is(err, github.ErrTokenUnavailable) {
+			t.Fatalf("got %v, want could-not-tell", err)
+		}
+	}
+
+	if got := mints.Load(); got != 1 {
+		t.Errorf("GitHub was asked %d times for three requests inside the memory", got)
+	}
+
+	clock.Lock()
+	now = now.Add(failureMemory + time.Second)
+	clock.Unlock()
+
+	if _, err := source.InstallationToken(t.Context()); !errors.Is(err, github.ErrTokenUnavailable) {
+		t.Fatalf("got %v, want could-not-tell", err)
+	}
+
+	if got := mints.Load(); got != 2 {
+		t.Errorf("GitHub was asked %d times, and the memory has passed", got)
+	}
+}
+
+// A REGISTRATION'S actions_read IS WHAT ITS TOKEN CARRIES, in both directions: without it a
+// deployment is refused GitHub's job records, and with it the broker has to ask for them.
+func TestARegistrationsActionsReadReachesTheScope(t *testing.T) {
+	t.Parallel()
+
+	for name, read := range map[string]bool{"granted": true, "not granted": false} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := newFakeGitHub(t)
+			gh.lookup = func(w http.ResponseWriter, _ *http.Request) {
+				answerJSON(w, map[string]any{
+					"id": 22, "account": map[string]string{"login": "acme", "type": "Organization"},
+					"permissions": map[string]string{
+						"metadata": "read", "organization_self_hosted_runners": "write", "actions": "read",
+					},
+				})
+			}
+			cert, fingerprint := testClient(t)
+
+			reg := org(22)
+			reg.ActionsRead = read
+
+			broker := newTestBroker(t, gh, []config.BrokerDeployment{
+				{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{reg}},
+			})
+
+			token, err := broker.client(t, cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22).
+				InstallationToken(t.Context())
+			if err != nil {
+				t.Fatalf("token: %v", err)
+			}
+
+			if got := token.Permissions()["actions"] == "read"; got != read {
+				t.Errorf("registered %v, and the token holds %v", read, token.Permissions())
+			}
+		})
+	}
+}
+
 // A HOST WHOSE KEY IS REGISTERED UNDER ANOTHER DEPLOYMENT finds out from its first
 // answer, and uses nothing it was handed.
 func TestAHostRefusesATokenMintedForAnotherDeployment(t *testing.T) {
@@ -562,6 +739,8 @@ func TestAHostRefusesATokenMintedForAnotherDeployment(t *testing.T) {
 		"could not be read":    {identity("", false, errors.New("the disk went away")), github.ErrTokenUnavailable},
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
 			_, err := broker.client(t, cert, tc.identity).Tokens(github.OrganizationTarget("acme"), appID, 22).
 				InstallationToken(t.Context())
 			if !errors.Is(err, tc.want) {
@@ -586,12 +765,12 @@ func TestAHeldTokenRidesOutABrokerThatDoesNotAnswer(t *testing.T) {
 	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if code := int(status.Load()); code != http.StatusOK {
 			w.WriteHeader(code)
-			_ = json.NewEncoder(w).Encode(errorResponse{Code: codeUnavailable, Message: "no"})
+			answerJSON(w, errorResponse{Code: codeUnavailable, Message: "no"})
 
 			return
 		}
 
-		_ = json.NewEncoder(w).Encode(tokenResponse{
+		answerJSON(w, tokenResponse{
 			Deployment: deploymentA, Token: "held",
 			ExpiresAt: time.Unix(expires.Load(), 0).UTC().Format(time.RFC3339),
 		})
@@ -657,7 +836,9 @@ func TestAnAnswerThatIsNotATokenIsCouldNotTell(t *testing.T) {
 			t.Parallel()
 
 			broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = io.WriteString(w, body)
+				if _, err := io.WriteString(w, body); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+				}
 			}))
 			t.Cleanup(broker.Close)
 
@@ -713,14 +894,19 @@ func TestATokenSourceIsRedactedOnEveryRenderingPath(t *testing.T) {
 	slog.New(slog.NewJSONHandler(&logged, nil)).Info("source", "value", source)
 
 	for name, got := range map[string]string{
-		"%v": fmt.Sprintf("%v", source), "%+v": fmt.Sprintf("%+v", source), "%#v": fmt.Sprintf("%#v", source),
-		"%s": fmt.Sprintf("%s", source), "%x": fmt.Sprintf("%x", source), "json": string(encoded),
+		"%v":   fmt.Sprintf("%v", source), //nolint:gocritic // the verb's own path is what is under test
+		"%+v":  fmt.Sprintf("%+v", source),
+		"%#v":  fmt.Sprintf("%#v", source),
+		"%s":   fmt.Sprintf("%s", source), //nolint:gocritic // the verb's own path is what is under test
+		"%x":   fmt.Sprintf("%x", source),
+		"json": string(encoded),
 		"slog": logged.String(),
 	} {
-		if strings.Contains(got, "cached-installation-secret") {
+		if strings.Contains(got, "cached-installation-secret") ||
+			strings.Contains(got, hex.EncodeToString([]byte("cached-installation-secret"))) {
 			t.Errorf("%s leaked the token: %s", name, got)
 		}
-		if !strings.Contains(got, "redacted") && name != "%x" {
+		if !strings.Contains(got, "redacted") {
 			t.Errorf("%s does not say it redacted anything: %s", name, got)
 		}
 	}
@@ -857,7 +1043,7 @@ func TestACallerGoingAwayKeepsAnInstallationsProof(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	req := httptest.NewRequest(http.MethodPost, tokenRoute, http.NoBody).WithContext(ctx)
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, tokenRoute, http.NoBody)
 
 	broker.server.verify = func(*http.Request, *installation) error { return context.Canceled }
 
@@ -888,5 +1074,13 @@ func TestABrokerURLWithATrailingSlashIsTheSameBroker(t *testing.T) {
 
 	if _, err := client.Tokens(github.OrganizationTarget("acme"), appID, 22).InstallationToken(t.Context()); err != nil {
 		t.Fatalf("a base with a trailing slash: %v", err)
+	}
+}
+
+// answerJSON is a fake's answer, which reports a failure to encode as the status a
+// client would read it by.
+func answerJSON(w http.ResponseWriter, v any) {
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }

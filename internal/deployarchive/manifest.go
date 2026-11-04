@@ -38,7 +38,7 @@ type Manifest struct {
 	// the absence of a file: a truncated archive must not read as a deliberate one.
 	KeysWithBroker bool           `json:"keys_with_broker,omitempty"`
 	Authority      AuthorityFacts `json:"authority"`
-	Ledger    LedgerFacts      `json:"ledger"`
+	Ledger         LedgerFacts    `json:"ledger"`
 
 	Files []FileRecord `json:"files"`
 }

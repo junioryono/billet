@@ -22,6 +22,20 @@ Every control plane held its targets' GitHub App private keys and minted install
 
 **The scale-set client takes a fixed token, and an installation token lasts an hour.** The vendored client either signs its own JWTs with a key it holds or carries one static token for life, and its transport must stay an `*http.Transport` (actions/scaleset v0.4.0, `common_client.go`), so nothing can be wrapped around it. Its one reader of that token is the registration-token request in its hourly refresh. So a client on a source is built with a placeholder, and retryablehttp's `RequestLogHook`, called with the request before every attempt, replaces it with what the source holds at that moment. A poll carries the Actions service's own token and never asks, so a broker outage costs a deployment nothing until a refresh is due. A hook cannot return an error, and a request sent with no credential comes back as a 401 that reads as a verdict about the App, so a source that cannot answer stops the request with a scheme the transport refuses, which retryablehttp does not retry, and the client names why.
 
+## Measured
+
+Against real GitHub on 2026-11-04, with a test organization's App, and a deployment holding no App key anywhere under its directories:
+
+- `billet check` reported the App verified through the broker, and could-not-tell (`UNVERIFIED`) with the broker stopped.
+- Six scale sets were provisioned and six message sessions opened and long-polled. `billet teardown` deleted all six.
+- Real jobs ran to `success` on a trusted Docker tier, through a JIT registration minted with a token from the broker, and `billet usage export` read them back.
+- With the broker stopped for 90 s, the running control plane logged nothing and its polls went on.
+- The token expired at 11:31:42 with nothing noticing, because nothing needed one. At 11:34:50, when the vendored client's hourly refresh fell due, it asked through the hook for a new one, the broker minted it, and a job then ran on it.
+
+**A token registered without `actions_read` is refused GitHub's job records.** A key's token carries all the App holds and a broker's only what its stanza grants, which is why `billet broker client-key` prints the permission set.
+
+**Not measured:** a repository target's token on real GitHub. The test App holds an organization's permissions, so the broker correctly refused to mint for a repository registration (`installation-mismatch`), and the test organization has one repository, so nothing could show what such a token fails to reach. That its scope request names the repository alone is held by `TestABrokerScopesATokenToWhatTheDeploymentNeeds` against a fake.
+
 ## What it does not do
 
 - It does not rotate an App's key, or manage its keys at all: an operator installs them, under the rules a key file always had.

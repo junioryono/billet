@@ -569,12 +569,12 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 	}
 
 	m := Manifest{
-		Schema:        schemaFor(ledger, req.KeysWithBroker),
-		Kind:          Kind,
+		Schema:         schemaFor(ledger, req.KeysWithBroker),
+		Kind:           Kind,
 		KeysWithBroker: req.KeysWithBroker,
-		CreatedAt:     req.Now().UTC().Format(time.RFC3339),
-		BilletVersion: version.Version(),
-		DeploymentID:  req.DeploymentID,
+		CreatedAt:      req.Now().UTC().Format(time.RFC3339),
+		BilletVersion:  version.Version(),
+		DeploymentID:   req.DeploymentID,
 		Source: Source{
 			Host:       req.Hostname,
 			ConfigPath: req.ConfigPath,

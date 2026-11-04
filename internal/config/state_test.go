@@ -319,7 +319,7 @@ func TestAConfigOnABrokerNamesNoKey(t *testing.T) {
 
 	for name, tc := range map[string]struct{ block, want string }{
 		"no url": {"  token_broker:\n    client_key_path: /etc/k\n", "url is required"},
-		"http": {"  token_broker:\n    url: http://broker\n    client_key_path: /etc/k\n", "must be https"},
+		"http":   {"  token_broker:\n    url: http://broker\n    client_key_path: /etc/k\n", "must be https"},
 		"credentials in the url": {
 			"  token_broker:\n    url: https://u:p@broker\n    client_key_path: /etc/k\n", "only a scheme and a host",
 		},
@@ -352,12 +352,12 @@ func TestAnyBrokerBlockIsSeenBeforeAnAppIsCreated(t *testing.T) {
 	t.Parallel()
 
 	for body, want := range map[string]bool{
-		"server:\n  token_broker:\n    url: https://broker\n":          true,
-		"server:\n  token_broker:\n    client_key_path: /etc/k\n":      true,
-		"server:\n  token_broker: {}\n":                                true,
-		"server:\n  listen: 127.0.0.1:7717\n":                          false,
-		"github:\n  org: acme\n":                                       false,
-		"not yaml: [":                                                  false,
+		"server:\n  token_broker:\n    url: https://broker\n":     true,
+		"server:\n  token_broker:\n    client_key_path: /etc/k\n": true,
+		"server:\n  token_broker: {}\n":                           true,
+		"server:\n  listen: 127.0.0.1:7717\n":                     false,
+		"github:\n  org: acme\n":                                  false,
+		"not yaml: [":                                             false,
 	} {
 		if got := PeekTokenBroker([]byte(body)); got != want {
 			t.Errorf("PeekTokenBroker(%q) = %v, want %v", body, got, want)

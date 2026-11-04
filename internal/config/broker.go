@@ -134,7 +134,7 @@ type BrokerInstallation struct {
 // for the reason Parse does: a typo in the file deciding who may mint what should be
 // loud.
 func LoadBroker(path string) (*BrokerConfig, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // the operator names the file, as with billet.yaml
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read broker config %s: %w", path, err)
 	}
@@ -209,13 +209,14 @@ func (c *BrokerConfig) Validate() error {
 	var (
 		deployments = make(map[string]bool, len(c.Deployments))
 		clients     = map[string]string{}
-		// holders is every deployment holding one (app, installation), and whole
-		// those of them holding it as an organization.
-		holders = map[[2]int64]map[string]bool{}
-		whole   = map[[2]int64]bool{}
-		// registered is who holds each (app, installation, target), in GitHub's own
-		// comparison, which ignores case: one repository under two spellings is still
-		// one repository, and two deployments would each reach it.
+		// holders is every deployment holding something of one owner, and whole those
+		// of them holding that owner as an organization. BY OWNER AND NOT BY INSTALLATION:
+		// a second App installed there reaches the same repositories, whatever its ids.
+		holders = map[string]map[string]bool{}
+		whole   = map[string]bool{}
+		// registered is who holds each target, in GitHub's own comparison, which ignores
+		// case: one repository under two spellings, or under two Apps, is still one
+		// repository, and two deployments would each reach it.
 		registered = map[string]string{}
 	)
 
@@ -279,31 +280,32 @@ func (c *BrokerConfig) Validate() error {
 
 			seen[key] = true
 
-			if other, held := registered[key]; held && other != d.ID {
+			target := strings.ToLower(inst.Target)
+			if other, held := registered[target]; held && other != d.ID {
 				errs = append(errs, fmt.Errorf("%s: target %s is already registered to deployment %s, and a "+
 					"token for it reaches what that deployment holds", at, inst.Target, other))
 			}
 
-			registered[key] = d.ID
+			registered[target] = d.ID
 
-			id := [2]int64{inst.AppID, inst.InstallationID}
-			if holders[id] == nil {
-				holders[id] = map[string]bool{}
+			owner, _, _ := strings.Cut(target, "/")
+			if holders[owner] == nil {
+				holders[owner] = map[string]bool{}
 			}
 
-			holders[id][d.ID] = true
+			holders[owner][d.ID] = true
 
 			if !isRepository {
-				whole[id] = true
+				whole[owner] = true
 			}
 		}
 	}
 
-	for id, who := range holders {
-		if whole[id] && len(who) > 1 {
-			errs = append(errs, fmt.Errorf("installation %d of app %d is registered to %d deployments and to one "+
-				"of them as a whole organization, whose token would reach what the others hold; give each a "+
-				"repository target, or an installation of its own", id[1], id[0], len(who)))
+	for owner, who := range holders {
+		if whole[owner] && len(who) > 1 {
+			errs = append(errs, fmt.Errorf("%s is registered to %d deployments and to one of them as a whole "+
+				"organization, whose token would reach what the others hold; give each a repository target",
+				owner, len(who)))
 		}
 	}
 
