@@ -302,8 +302,8 @@ func (m openMode) records() bool {
 // readerIdleTime how long a reader nothing has borrowed stays connected.
 //
 // maxIdleReaders is how many of a burst's readers are kept for the next one. KEPT TO
-// database/sql's own two: keeping all four raised fifty idle control planes' peak from 200
-// PostgreSQL connections to 226 and left what they settled at, four each, unchanged
+// database/sql's own two: keeping all four raised fifty idle control planes' highest sample
+// from 200 PostgreSQL connections to 226 and left what they settled at, four each, unchanged
 // (2026-11-04, docs/reference/records/idle-control-plane.md).
 const (
 	defaultReaderConns = 4
