@@ -1,6 +1,6 @@
 # An untrusted fork pull request on EC2
 
-A pull request from a fork ran on an untrusted EC2 tier on 2026-10-25, green each time, and every isolation check it made held, inside the job and from outside it. Reachability between two guests, and the node's cache listener refusing another guest, were not probed here. Default-branch jobs ran on the same pool: their Docker image store was published into the pool's own scope and read back by the fork, and nothing the fork wrote was ever published. This is #23's EC2 half. It also found that sticky disks cannot work on an EC2 guest: one defect is fixed in the same change, and one is a design question this record leaves open.
+A pull request from a fork ran on an untrusted EC2 tier on 2026-10-25, green each time, and every isolation check it made held, inside the job and from outside it. Reachability between two guests, and the node's cache listener refusing another guest, were not probed here. Default-branch jobs ran on the same pool: their Docker image store was published into the pool's own scope and read back by the fork, and nothing the fork wrote was ever published. This is #23's EC2 half. It also found that sticky disks could not work on an EC2 guest. One defect is fixed in the same change, and the other went with the AMI built from GitHub's template: on 2026-11-04 the same fork proved [the sticky-disk half](#sticky-disks-on-a-contract-4-image-2026-11-04) on a contract 4 image.
 
 ## What ran
 
@@ -79,12 +79,36 @@ Every check prints one `PROBE <name> <value>` line. The fork's two attempts prin
 - **The cause:** the AMI installs the cache endpoint's issuer in the distribution's trust store, and the image-store helper's curl reads that store. The sticky-disk action is Node, whose `https` trusts only the roots it was built with.
 - **The fix:** the action now adds `/etc/ssl/certs/ca-certificates.crt` to what Node trusts by default (its bundled roots and `NODE_EXTRA_CA_CERTS`) for an HTTPS request. From then on its cache call succeeded and the node attached the disk; the evidence records the sticky disk `cold`, not `unused`.
 
-**The runner cannot mount it. Not fixed here.**
+**On this contract 3 image, the runner could not mount it.**
 - **The failure:** the action formats and mounts the disk with `sudo`. On this guest that failed with "sudo: a password is required".
 - **The cause:** the image gives the `runner` account no sudo, on purpose (`internal/provider/ec2/build.go`: running untrusted jobs as root "would give away the only isolation this backend has above the instance boundary").
-- **The consequence:** sticky disks cannot work on an EC2 guest as built. `actions/stickydisk`, and `setup-docker-builder` built on it, run cold there. A fork's sticky-disk write is discarded because it never happens, which proves nothing about the publication rule. The image store above is what proves it on this backend.
+- **The consequence:** sticky disks could not work on an EC2 guest as then built. `actions/stickydisk`, and `setup-docker-builder` built on it, ran cold. A fork's sticky-disk write was discarded because it never happened, which proved nothing about the publication rule. Contract 4 changed this (below).
 
-**One more thing the image's comment does not account for.** The `runner` account is in the `docker` group, and membership of that group is root on the host: the #163 job rewrote `/etc/docker/daemon.json` and restarted Docker from a privileged container. On an EC2 guest the instance is the boundary, there is no instance profile, and the registration is consumed, so the root a job can reach is its own instance's. But the image's stated reason for withholding sudo does not hold, and that question belongs beside the sticky-disk one.
+**One more thing the image's comment does not account for.** The `runner` account is in the `docker` group, and membership of that group is root on the host: the #163 job rewrote `/etc/docker/daemon.json` and restarted Docker from a privileged container. On an EC2 guest the instance is the boundary, there is no instance profile, and the registration is consumed, so the root a job can reach is its own instance's. But the image's stated reason for withholding sudo did not hold. Contract 4 settles it the other way: nothing on an EC2 guest depends on the job not being root.
+
+## Sticky disks on a contract 4 image (2026-11-04)
+
+A fork's sticky-disk write is discarded and a re-run finds nothing of it, which was #23's last open assertion on this backend.
+
+**What ran.** The same shape as above, with these differences:
+- **The account:** a second account in the same AWS organization (701111310312), us-west-2, because the CI account's vCPU limit was in use by other work.
+- **The image:** `ami-07bee0c3cc239315f`, which `billet ami build` made that day from GitHub's template on a `c7i.4xlarge` and booted to stamp contract 4: template and layer 37 min, snapshot 52 min, verifier 6 min. It accepted no licensed component.
+- **The binary:** billet with this change, the image-store bound, and the store's compaction and logging fixes merged, so the node's log says why a job's caches do not publish.
+- **GitHub:** a fresh public probe repository and fork, and pull request #1. The probe below gained the `sudo`, `groups`, `main_disk_mounted` and `main_disk_fork_marker` lines, and on `pull_request` it writes a `fork-marker` file into the default branch's own disk.
+
+Every job's isolation probes printed what the table above shows, and `PROBE sudo yes`. The action's post step printed "billet will publish this sticky-disk update once the job's result proves it ran on the default branch" in every job, the fork's too: it cannot know, and the node decides from GitHub's record of the run.
+
+| Run | Event | `probe-main`: hit, marker, fork marker | This run's own disk: hit, marker | Docker tags found | What the node did |
+|---|---|---|---|---|---|
+| `41810117985` | `push` | `false`, none, none | `false`, none | none | published the image store and both disks |
+| `41811088960`, attempt 1 | `pull_request` from the fork | `true`, run `41810117985`'s, none | `false`, none | `push-41810117985-1` | "will not publish", `proven=false` |
+| `41811088960`, attempt 2 | `pull_request` from the fork | `true`, run `41810117985`'s, none | `false`, none | `push-41810117985-1` | "will not publish", `proven=false` |
+| `41812703623` | `push` | `true`, run `41810117985`'s, none | `false`, none | `push-41810117985-1` | published the image store and both disks |
+
+- **The pool's reads:** the fork's first attempt read the default branch's disk warm, with its marker.
+- **The fork's writes:** attempt 1 wrote its own disk, a `fork-marker` into `probe-main`, and a Docker tag, and each attempt's disk was mounted when it did. Attempt 2 found none of them: its own key was cold again (`cache-hit` false), and neither `probe-main` nor the store held anything of attempt 1's. The last default-branch job found none of them either.
+- **Why, from the node and the control plane:** `decided what a completed job's caches may publish … event=pull_request ref="" proven=false publish_default=false`, and for the push `ref=refs/heads/main proven=true publish_default=true`. The node then logged `a completed job's caches will not publish … policy=default-branch succeeded=true proven=false … event=pull_request` for both fork attempts, and `published a cache a default-branch job wrote` for each key of both pushes, under `…scoped/untrusted/<test organization>/<probe repository>/amd64/sticky/probe-main` and its siblings.
+- **From outside:** the fork's instance, described while it ran, had `b1t12-untrusted` alone, no `IamInstanceProfile`, `HttpTokens: required`, a hop limit of 1 and the deployment's tags. `billet acceptance evidence` lists the four jobs as `trust: untrusted`, `provider: ec2`, `instance_type: c7i.xlarge`, sticky disks `cold` on the first push and `warm` after, and the compute barrier `proved clear`.
 
 ## Teardown
 
@@ -93,6 +117,8 @@ Every check prints one `PROBE <name> <value>` line. The fork's two attempts prin
 - **A second `acceptance run` on the same workspace inherits the first one's seal.** Its listener says the deployment is "no longer taking new work" and assigns nothing until `billet resume`. One push job queued while the deployment was sealed was never assigned after the resume, and ran once it was cancelled and run again.
 
 ## The probe, exactly as the fork ran it
+
+This is the 2026-11-04 version. The 2026-10-25 runs ran the same file without the lines the section above names. The file the 2026-11-04 runs ran differed from this in two ways, both slips of editing that change no result: it carried the results-origin step and the image-store step twice, so each job's second image-store listing also shows the tag its first wrote, and the table above reads the first; and it printed `ssl_cert_file` and `node_extra_ca_certs` through a different shell expression, with the same two values.
 
 ```yaml
 name: probe
@@ -122,6 +148,8 @@ jobs:
           echo "PROBE run ${{ github.run_id }} attempt ${{ github.run_attempt }}"
           echo "PROBE runner $RUNNER_NAME"
           echo "PROBE kernel $(uname -srm)"
+          echo "PROBE sudo $(sudo -n true 2>/dev/null && echo yes || echo no)"
+          echo "PROBE groups $(id -nG)"
 
       - name: Interception and the cache session
         run: |
@@ -198,8 +226,15 @@ jobs:
         run: |
           echo "PROBE main_disk_cache_hit ${{ steps.main_disk.outputs.cache-hit }}"
           echo "PROBE main_disk_marker $(cat probe-main/marker 2>/dev/null || echo none)"
+          echo "PROBE main_disk_mounted $(mountpoint -q probe-main && echo yes || echo no)"
+          echo "PROBE main_disk_fork_marker $(cat probe-main/fork-marker 2>/dev/null || echo none)"
           if [ "${{ github.event_name }}" = push ] && mountpoint -q probe-main; then
             echo "written by run ${{ github.run_id }} on ${{ github.ref_name }}" > probe-main/marker
+          fi
+          # THE FORK WRITES TO THE DEFAULT BRANCH'S OWN KEY: a later run finding this
+          # would mean a fork published into the pool.
+          if [ "${{ github.event_name }}" = pull_request ] && mountpoint -q probe-main; then
+            echo "written by the fork, run ${{ github.run_id }} attempt ${{ github.run_attempt }}" > probe-main/fork-marker
           fi
 
       - name: This run's own sticky disk
@@ -222,6 +257,5 @@ jobs:
 
 ## What this does not establish
 
-- **Sticky disks on EC2,** as above.
 - **A trusted EC2 tier's instance profile,** which this tier never had, by design.
 - **The node's cache listener refusing other guests.** The untrusted group let these guests reach the node's cache port, which is the path their cache uses. A guest is refused without its session bearer: ADR-013 measured that on the reference deployment, not here.
