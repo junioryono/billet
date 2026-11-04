@@ -27,6 +27,7 @@ adr-019-guest-image-corresponding-source
 adr-020-npm-registry-interception
 adr-021-tart-images-verified-not-published
 adr-022-every-linux-image-from-githubs-template
+adr-023-host-enforced-egress
 ```
 
 | Record | Decides |
@@ -53,3 +54,4 @@ adr-022-every-linux-image-from-githubs-template
 | [ADR-020](adr-020-npm-registry-interception.md) | why the node may serve the public npm registry to its guests through the Actions cache's interception, a second intercepted host; why only an anonymous read is ever cached, why one store per node serves every trust class, how a stalled fetch is retried and a stale document served, and why it starts off by default |
 | [ADR-021](adr-021-tart-images-verified-not-published.md) | why billet publishes no macOS or Tart Linux image and what Apple's macOS and Xcode licences say about redistributing one; how a Tart tier's `@verified` boots a copy of a local base VM billet probed, why a macOS slot is a lock the guest's own process holds and a probe yields to a job, and why a runner's deadline is kept apart from whether the image boots |
 | [ADR-022](adr-022-every-linux-image-from-githubs-template.md) | why the arm64 guest and the EC2 AMI on both architectures run GitHub's own template too, with one scoped difference list; how the AMI builder proves it finished; why an AMI installs a left-out component only when `images.accept` names it; how one release carries both architectures without a new manifest or channel schema, and carries the last good arm64 image forward when its build fails; why generations and tiers carry an architecture |
+| [ADR-023](adr-023-host-enforced-egress.md) | why a job's network is named and restricted on the host, by its interface and a resolver of its own, with GitHub's runner endpoints in every list and IPv6 refused |

@@ -54,6 +54,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -129,6 +130,9 @@ type Provider struct {
 	// claimsMu stands in front of the claims flock inside this process; see
 	// lockClaims.
 	claimsMu sync.Mutex
+
+	// egress puts each guest's network policy on its tap; nil refuses a listed one.
+	egress *egress.Host
 
 	// execPath and execName are the firecracker binary with its symlinks already
 	// followed, and the directory name the jailer derives from it.
@@ -554,6 +558,15 @@ func (p *Provider) start(
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
+	// AND SO IS AN ALLOWLIST, for the same reason. Without this a provider built
+	// with no host would launch a listed tier's guest open.
+	if spec.Egress.Listed() {
+		if err := p.EgressReady(); err != nil {
+			return nil, fmt.Errorf("firecracker: %s has a network allowlist that cannot be applied: %w",
+				spec.Name, err)
+		}
+	}
+
 	// A RESTORE'S DISK IS THE SNAPSHOT'S, read before anything is claimed: the
 	// golden's system disk its memory was taken with, and the exact generation that
 	// disk was cloned from, which pairs the restore with the guest's kernel.
@@ -704,7 +717,16 @@ func (p *Provider) start(
 	// launch failed with the reason a cleanup failed.
 	inst, err := p.launch(ctx, j, spec, device, kernel, res, snapshot, want)
 	if err != nil {
-		return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
+		unwound := p.unwind(ctx, j, spec, res, err)
+
+		// ONLY IF THE GUEST IS PROVED GONE: a guest the unwind could not stop keeps
+		// its rules, and the Destroy that does prove it removes them.
+		if unwound == nil {
+			p.detachEgress(ctx, spec.Name)
+			p.forgetEgress(spec.Name)
+		}
+
+		return nil, errors.Join(err, unwound)
 	}
 
 	p.log.Info("launched a microVM", "runner", spec.Name, "vcpu", spec.VCPU,
@@ -737,6 +759,13 @@ func (p *Provider) launch(
 		if err := p.placeSnapshot(j, snapshot, kernel, spec, want); err != nil {
 			return nil, err
 		}
+	}
+
+	// BEFORE THE TAP EXISTS, because the rules match its name and need no device:
+	// there is no moment at which the guest's interface is on the bridge without
+	// them, and a failure here refuses the launch with nothing started.
+	if err := p.attachEgress(ctx, spec, res.Tap); err != nil {
+		return nil, err
 	}
 
 	if err := p.addTap(ctx, res.Tap, p.bridgeFor(spec.Trust), res.UID); err != nil {
@@ -1441,6 +1470,10 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 	if err := p.destroy(ctx, id); err != nil {
 		return provider.TeardownRequested, err
 	}
+
+	// AFTER THE PROOF, and only then: rules taken off a guest that may still run
+	// would leave it open.
+	p.detachEgress(ctx, id)
 
 	return provider.TeardownStopped, nil
 }

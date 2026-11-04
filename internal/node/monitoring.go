@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +20,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/durablefile"
+	"github.com/junioryono/billet/internal/egress"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/usage"
@@ -235,7 +240,13 @@ func (r *Runner) takeCheckpoint(name string) *usage.Checkpoint {
 // withdrawal has landed, as the process leaves its compute running. Best
 // effort: a job it cannot keep is measured from its adoption, and nothing
 // here can fail the stop.
-func (r *Runner) HandOver(context.Context) {
+func (r *Runner) HandOver(ctx context.Context) {
+	// FIRST, AND WHETHER OR NOT ANYTHING IS SAMPLED: from here until the next process
+	// has a resolver, an open guest's redirected DNS would reach nothing.
+	if r.egress != nil {
+		r.egress.HandOver(ctx)
+	}
+
 	if r.monitor == nil || r.checkpoints == "" {
 		return
 	}
@@ -508,6 +519,10 @@ func (r *Runner) forgetMonitoring(name string) {
 	if r.flows != nil {
 		r.flows.Forget(name)
 	}
+
+	if r.egress != nil {
+		r.egress.Forget(name)
+	}
 }
 
 // reportUsage sends a job's usage to the ledger, fenced on the lease's epoch.
@@ -589,12 +604,172 @@ func (r *Runner) settleHeldUsage(ctx context.Context, c *custody, h heldUsage, c
 	}
 	if current {
 		lease := &alloc.Lease{ID: c.leaseID, Epoch: c.epoch.Load()}
+
+		var destinations *alloc.JobDestinations
 		if h.has {
-			r.reportUsage(ctx, lease, c.name, h.sum, r.finalFlows(ctx, c.name, h.at, h.sum, h.has))
+			destinations = r.finalFlows(ctx, c.name, h.at, h.sum, h.has)
+			r.reportUsage(ctx, lease, c.name, h.sum, destinations)
 		}
+		r.reportEgress(ctx, lease, c.name, destinations)
 		r.reportGuest(ctx, lease, c.name)
 	}
 	r.forgetMonitoring(c.name)
+}
+
+// EgressHost is the host's record of each guest's network. *egress.Host is the real
+// one; the provider attaches and detaches through the same one.
+type EgressHost interface {
+	Take(key string) (egress.Record, bool)
+	Forget(key string)
+	Reconcile(ctx context.Context, running map[string]bool)
+	HandOver(ctx context.Context)
+}
+
+// WithEgress gives the runner the host's record of its guests' networks. observe
+// says an open guest's DNS is watched too, so its destinations can be named
+// (node.monitoring.flows); a listed guest's always is.
+func WithEgress(h EgressHost, observe bool) Option {
+	return func(r *Runner) { r.egress, r.observeNames = h, observe }
+}
+
+// EgressRecorder is where what the host saw of a job's network is reported: the
+// allocator in process, the node client over the wire.
+type EgressRecorder interface {
+	RecordLeaseEgress(ctx context.Context, leaseID string, epoch int64, report alloc.JobEgress) error
+}
+
+var _ EgressRecorder = (*alloc.Allocator)(nil)
+
+// egressPolicy is what a launch of tier puts on its guest. A tier's list that this
+// provider or this host cannot apply is an error, which refuses the launch: never
+// the job run open. No list is a watched guest where names are wanted, and otherwise
+// nothing.
+func (r *Runner) egressPolicy(tier *nodeapi.TierSpec) (*egress.Policy, error) {
+	if tier.Egress == nil {
+		if r.egress != nil && r.observeNames {
+			return egress.Observe(), nil
+		}
+
+		return nil, nil
+	}
+
+	enforcer, ok := r.provider.(provider.EgressEnforcer)
+	if !ok {
+		return nil, fmt.Errorf("its network allowlist cannot be enforced on a %s node", r.provider.Kind())
+	}
+
+	if err := enforcer.EgressReady(); err != nil {
+		return nil, fmt.Errorf("its network allowlist cannot be applied on this node: %w", err)
+	}
+
+	return egress.Compile(tier.Egress.Allow)
+}
+
+// reconcileEgress judges the network rules an earlier process left, given a List
+// that succeeded.
+func (r *Runner) reconcileEgress(ctx context.Context, instances []*provider.Instance) {
+	if r.egress == nil {
+		return
+	}
+
+	running := make(map[string]bool, len(instances))
+	for _, inst := range instances {
+		running[inst.Name] = true
+	}
+
+	r.egress.Reconcile(ctx, running)
+}
+
+// reportEgress sends what the host saw of a job's network to the ledger, fenced on
+// the lease's epoch, once the guest has gone and its counters are final. Bounded and
+// never fatal, as the usage report is.
+func (r *Runner) reportEgress(ctx context.Context, lease *alloc.Lease, name string,
+	destinations *alloc.JobDestinations,
+) {
+	if r.egress == nil || lease == nil {
+		return
+	}
+
+	record, ok := r.egress.Take(name)
+	if !ok {
+		return
+	}
+
+	report := jobEgressOf(record, destinations)
+
+	r.log.Info("what the host saw of a job's network", "runner", name, "listed", report.Listed,
+		"queries", report.Queries, "refused", report.RefusedQueries, "denied_packets", report.DeniedPackets,
+		"ipv6_packets", report.IPv6Packets, "incomplete", report.Incomplete)
+
+	rec, ok := r.alloc.(EgressRecorder)
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReportLimit)
+	defer cancel()
+
+	if err := rec.RecordLeaseEgress(ctx, lease.ID, lease.Epoch, report); err != nil {
+		r.log.Warn("could not report what the host saw of a job's network; the job is unaffected",
+			"runner", name, "lease", lease.ID, "error", err)
+	}
+}
+
+// jobEgressOf is the report's form of a record, within what a report keeps. The
+// addresses a job's flows reached come first, largest first, since those are the
+// ones a reader looks up; past the bound the report says it is a lower bound.
+func jobEgressOf(rec egress.Record, destinations *alloc.JobDestinations) alloc.JobEgress {
+	out := alloc.JobEgress{
+		Listed: rec.Listed, Queries: rec.Queries, RefusedQueries: rec.RefusedQueries,
+		DeniedPackets: rec.DeniedPackets, IPv6Packets: rec.IPv6Packets, Incomplete: rec.Incomplete,
+		// ONE COUNTER READ AND THE OTHER NOT MUST STILL BE A REPORT: the outside
+		// resolver's packets are a part of the denied ones.
+		OutsideResolverPackets: min(rec.OutsideResolverPackets, rec.DeniedPackets),
+	}
+
+	for _, n := range rec.Refused[:min(len(rec.Refused), alloc.MaxEgressRefusedNames)] {
+		out.RefusedNames = append(out.RefusedNames, alloc.EgressRefusal{Name: n.Name, Count: n.Count})
+	}
+
+	for _, d := range rec.Denied[:min(len(rec.Denied), alloc.MaxEgressDenied)] {
+		out.Denied = append(out.Denied, alloc.EgressDenial{Addr: d.Addr.String(), Protocol: d.Protocol,
+			Port: int(d.Port), Packets: d.Packets})
+	}
+
+	added := make(map[netip.Addr]bool, len(rec.Names))
+
+	add := func(addr netip.Addr) {
+		names := rec.Names[addr]
+		if len(names) == 0 || added[addr] {
+			return
+		}
+
+		added[addr] = true
+
+		if len(out.Names) == alloc.MaxEgressNamedAddrs {
+			out.Incomplete = true
+
+			return
+		}
+
+		out.Names = append(out.Names, alloc.EgressNames{Addr: addr.String(),
+			Names: slices.Clone(names[:min(len(names), alloc.MaxEgressNamesPerAddr)])})
+	}
+
+	if destinations != nil {
+		for _, d := range destinations.Destinations {
+			if addr, err := netip.ParseAddr(d.Addr); err == nil {
+				add(addr)
+			}
+		}
+	}
+
+	rest := slices.SortedFunc(maps.Keys(rec.Names), netip.Addr.Compare)
+	for _, addr := range rest {
+		add(addr)
+	}
+
+	return out
 }
 
 // reportGuest sends what a job's guest told the node to the ledger, fenced on the

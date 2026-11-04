@@ -230,6 +230,30 @@ func startFlows(ctx context.Context, root string, interval time.Duration) (*flow
 	return watcher, nil
 }
 
+// egressStateDir is where, under the node's state directory, each guest's policy is
+// kept for the next node process.
+const egressStateDir = "egress"
+
+// nodeEgressOptions readies the host's network policy and returns the runner option
+// that reads it, and what stops its resolvers. A provider with none (every backend
+// but firecracker) has nothing to ready, and refuses a listed tier.
+//
+// A HOST THAT IS NOT READY STILL STARTS: this node may never be sent a list, so the
+// refusal belongs to the launch that needs one, and it names why. Prepare has said so.
+func nodeEgressOptions(ctx context.Context, cfg *config.Config, p provider.Provider) ([]node.Option, func()) {
+	fc, ok := p.(*firecracker.Provider)
+	if !ok || fc.EgressHost() == nil {
+		return nil, func() {}
+	}
+
+	host := fc.EgressHost()
+	host.Prepare(ctx)
+
+	observe := cfg.Node.Monitoring != nil && cfg.Node.Monitoring.Flows
+
+	return []node.Option{node.WithEgress(host, observe)}, host.Close
+}
+
 // counterSource is the hardware counter reader node.monitoring.perf asks for.
 //
 // REFUSED HERE RATHER THAN IN CONFIG, on a platform that has no

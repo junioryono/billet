@@ -635,6 +635,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
+	if spec.Egress != nil {
+		return nil, fmt.Errorf("tart: %s has a network policy, which only a firecracker guest's "+
+			"tap can carry", spec.Name)
+	}
+
 	unlock := p.lockName(spec.Name)
 	defer unlock()
 

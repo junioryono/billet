@@ -25,6 +25,7 @@ import (
 	"strconv"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 )
 
 // MaxVolumes is the maximum number of cache disks one job can attach.
@@ -127,6 +128,11 @@ type Spec struct {
 	// InstanceType is the EC2 shape selected and charged at escrow. Empty for
 	// host-backed providers.
 	InstanceType string
+	// Egress is the guest's network policy (ADR-023): listed, watched only, or nil
+	// for neither. Only a backend that enforces one on the host may be given one,
+	// and any other refuses it (EgressEnforcer); a backend that ignored it would
+	// run a listed tier's job open.
+	Egress *egress.Policy
 	// Arch is the architecture the tier's jobs run on, or empty for a tier that
 	// names none (ADR-022). A backend that can tell what a shape or an image runs
 	// on refuses another.
@@ -456,6 +462,17 @@ type Quota struct {
 	// Naming the shape is what lets `billet check` do it without the backend
 	// having to know.
 	Shape string
+}
+
+// EgressEnforcer is a backend that can put a network policy on a guest from the
+// host, and says whether this host can now.
+//
+// AN OPTIONAL CAPABILITY THAT CARRIES NO INVARIANT BY ITS ABSENCE: a backend without
+// it is refused every tier with an allowlist, so what is missing fails closed.
+type EgressEnforcer interface {
+	// EgressReady is nil when a listed guest can be launched now, and otherwise
+	// why not.
+	EgressReady() error
 }
 
 // QuotaReporter is implemented by a backend whose account imposes ceilings

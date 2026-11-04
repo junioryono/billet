@@ -23,6 +23,7 @@ import (
 
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -3622,5 +3623,18 @@ func TestAResponseOmittingTerminationIsReportedAsAnomalous(t *testing.T) {
 	if v := f.paramsFor(t, "RunInstances").Get("BlockDeviceMapping.2.Ebs.DeleteOnTermination"); v != "true" {
 		t.Errorf("the device went out as %q, want true — billet should state delete rather "+
 			"than refuse or guess", v)
+	}
+}
+
+// A NETWORK POLICY IS REFUSED: only a firecracker guest's tap can carry one, and the
+// machine would otherwise start open.
+func TestALaunchAskingForANetworkPolicyIsRefused(t *testing.T) {
+	t.Parallel()
+
+	p := newTestProvider(t, newFakeEC2(t), nil)
+
+	_, err := p.Launch(t.Context(), provider.Spec{Name: provider.InstanceName("abc"), Egress: egress.Observe()})
+	if err == nil || !strings.Contains(err.Error(), "network policy") {
+		t.Fatalf("Launch = %v, want a refusal naming the network policy", err)
 	}
 }

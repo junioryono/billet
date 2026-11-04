@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/junioryono/billet/internal/egress"
+	"github.com/junioryono/billet/internal/provider"
 )
 
 // maxIfName is the kernel's IFNAMSIZ limit, less the terminator. Every device name
@@ -86,6 +89,59 @@ func (p *Provider) deleteTap(ctx context.Context, tap string) error {
 	}
 
 	return nil
+}
+
+// WithEgress gives the provider the host's handle on guests' network policy. A
+// provider without one refuses every guest with an allowlist.
+func WithEgress(host *egress.Host) Option {
+	return func(p *Provider) { p.egress = host }
+}
+
+// EgressHost is the handle WithEgress gave, nil without one.
+func (p *Provider) EgressHost() *egress.Host { return p.egress }
+
+// EgressReady is nil when a guest with an allowlist can be launched now, and
+// otherwise why not.
+func (p *Provider) EgressReady() error {
+	if p.egress == nil {
+		return fmt.Errorf("%w: this provider was built without one", egress.ErrNotReady)
+	}
+
+	return p.egress.Ready()
+}
+
+// attachEgress puts a guest's policy on its tap's name. A spec with no policy still
+// asks, because the name may be carrying a dead guest's rules.
+func (p *Provider) attachEgress(ctx context.Context, spec provider.Spec, tap string) error {
+	if p.egress == nil {
+		if spec.Egress.Listed() {
+			return fmt.Errorf("firecracker: %s has a network allowlist and this provider has no way to "+
+				"apply one", spec.Name)
+		}
+
+		return nil
+	}
+
+	bridge := p.bridgeFor(spec.Trust)
+
+	return p.egress.Attach(ctx, egress.Attachment{
+		Key: spec.Name, Interface: tap, Network: bridge, Kind: egress.BridgePort,
+	}, spec.Egress)
+}
+
+// detachEgress removes a guest's rules once it is proved gone, on a context its
+// caller's cancellation cannot end first: rules left behind wait for the next guest
+// on the name.
+func (p *Provider) detachEgress(ctx context.Context, name string) {
+	if p.egress != nil {
+		p.egress.Detach(context.WithoutCancel(ctx), name)
+	}
+}
+
+func (p *Provider) forgetEgress(name string) {
+	if p.egress != nil {
+		p.egress.Forget(name)
+	}
 }
 
 // errTapTaken marks a collision on the truncated tap name, so the unwind leaves the

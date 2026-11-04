@@ -183,7 +183,7 @@ func TestEveryUsageGroupRendersItsOwnMeasurement(t *testing.T) {
 				usage.EnergySource = ""
 			}
 			var out bytes.Buffer
-			renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+			renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 			for other, label := range labels {
 				line := lineStarting(t, out.String(), label)
@@ -219,7 +219,7 @@ func TestAProcessMeasuredJobRendersWhatItsHostKept(t *testing.T) {
 		MemoryPeakBytes: 25_855_595_336, EnergyActiveMicrojoules: 7_400_903_879, EnergySource: alloc.EnergyProcess,
 	}}
 	var out bytes.Buffer
-	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 	if line := lineStarting(t, out.String(), "memory"); !strings.Contains(line, "peak 24.1 GiB, oom kills not measured") {
 		t.Errorf("the memory line reads %q", line)
@@ -238,7 +238,7 @@ func TestAMeterMeasuredJobRendersTheWalls(t *testing.T) {
 		EnergyActiveMicrojoules: 9_000_000_000, EnergyIdleMicrojoules: 666_000_000, EnergySource: alloc.EnergyMeter,
 	}}
 	var out bytes.Buffer
-	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 	if line := lineStarting(t, out.String(), "energy"); !strings.Contains(line,
 		"9.0 kJ active, 666.0 J idle (the whole host at the wall, from its power meter)") {
@@ -395,7 +395,7 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 		"measured-window": {usage: measured, window: window}, "gapped-window": {usage: measured, window: &gapped}}
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
-		if err := renderJobJSON(&out, record, shapes[name].usage, nil, "the usage report came with no series", nil,
+		if err := renderJobJSON(&out, record, shapes[name].usage, nil, "the usage report came with no series", nil, jobEgress{},
 			shapes[name].window); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -438,7 +438,7 @@ func countedJob(t *testing.T, counters *alloc.JobCounters) string {
 		Unmeasured: []string{alloc.UsageEnergy}, Counters: counters,
 	}}
 	var out bytes.Buffer
-	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 	return out.String()
 }

@@ -141,6 +141,10 @@ type Runner struct {
 	// checkpoints is where a handover keeps what the sampler knew of each job,
 	// for the next process; empty keeps nothing.
 	checkpoints string
+	// egress is the host's record of each guest's network, and observeNames says
+	// an open guest's DNS is watched for it; nil refuses a listed tier.
+	egress       EgressHost
+	observeNames bool
 	// flows totals each job's traffic by destination, and leaseDir is where it
 	// learns a guest's address; nil measures none.
 	flows    FlowWatcher
@@ -416,6 +420,13 @@ func (r *Runner) Launch(
 		return fmt.Errorf("node: %w", err)
 	}
 
+	// ASKED HERE FOR ACCEPTS' REASON: a list this host cannot apply is refused before
+	// a registration is minted for a guest that will never start.
+	guestPolicy, err := r.egressPolicy(tier)
+	if err != nil {
+		return fmt.Errorf("node: tier %q: %w", tier.Label, err)
+	}
+
 	// BOUND TO THIS HOST BEFORE IT RUNS ANYWHERE.
 	//
 	// Bind is where the allocator enforces placement: the node's guest-OS
@@ -552,6 +563,7 @@ func (r *Runner) Launch(
 		Memory:       lease.RequestedMemory,
 		InstanceType: lease.InstanceType,
 		Arch:         tier.Arch,
+		Egress:       guestPolicy,
 		AuthorizeShape: func(ctx context.Context, instanceType string, vcpu int,
 			memory config.ByteSize,
 		) (bool, error) {
@@ -945,6 +957,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	if hasUsage && holdable {
 		r.reportUsage(ctx, lease, inst.Name, measured, destinations)
 	}
+	// AND WHAT THE HOST SAW OF ITS NETWORK, which no sampler is needed for: a tier's
+	// list is enforced whether or not the node measures anything.
+	if holdable {
+		r.reportEgress(ctx, lease, inst.Name, destinations)
+	}
 	// AND WHAT ITS GUEST SAID, once the destroy above has ended the guest; a
 	// batch still in flight is refused once the report is taken.
 	if holdable {
@@ -1284,6 +1301,10 @@ func (r *Runner) recoverLeftovers(ctx context.Context) error {
 	// A HANDOVER'S CHECKPOINTS ARE FOR WHAT THE LIST STILL SHOWS; the rest
 	// describe compute that is gone, which no adoption will read.
 	r.pruneCheckpoints(instances)
+
+	// AND SO ARE THE NETWORK RULES OF COMPUTE THE LIST NO LONGER SHOWS, while the
+	// ones it does show get a resolver again.
+	r.reconcileEgress(ctx, instances)
 
 	if len(instances) == 0 {
 		return nil
