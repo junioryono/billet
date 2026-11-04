@@ -17,7 +17,6 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/nodeclient"
-	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -757,7 +756,7 @@ func CAToken(ctx context.Context, env cli.Env, args []string) error {
 
 	// A LOOPBACK NODE WIRE IS NOT AN ADDRESS ANOTHER MACHINE HAS: printed as
 	// --server, it names the joining machine itself.
-	if nodeplane.LoopbackOnly(cfg.Server.Listen) {
+	if !cfg.Server.WireServesTLS() {
 		fmt.Fprintf(env.Stdout, "This control plane's node wire listens only on loopback (%s), so no other "+
 			"machine can join it. Bind server.listen to an address the fleet reaches (and set "+
 			"server.bootstrap_listen for enrollment), restart, and run billet ca token again for the "+
@@ -796,6 +795,10 @@ func joinCommand(cfg *config.Config, token string) string {
 // nodeWireAddr is the node-wire address a joining machine dials, with a
 // wildcard host left for the operator, as enrollAddrFlag leaves it.
 func nodeWireAddr(cfg *config.Config) string {
+	if cfg.Server.TLSRouter != nil {
+		return cfg.Server.TLSRouter.NodeAddr
+	}
+
 	host, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Server.Listen))
 	if err != nil {
 		return "<this control plane's node-wire address>"
@@ -832,6 +835,10 @@ func caFingerprintOrAsk(cfg *config.Config) string {
 // the third thing in that hand-off, and leaving them to derive it is how the
 // enrollment ends in a handshake failure that names no cause.
 func enrollAddrFlag(cfg *config.Config) string {
+	if cfg.Server.TLSRouter != nil && cfg.Server.TLSRouter.EnrollAddr != "" {
+		return " --bootstrap-addr " + cfg.Server.TLSRouter.EnrollAddr
+	}
+
 	addr := strings.TrimSpace(cfg.Server.BootstrapListen)
 	if addr == "" {
 		return ""

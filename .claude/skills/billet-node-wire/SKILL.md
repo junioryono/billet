@@ -39,6 +39,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Enrollment is two fingerprints compared by a person.**
 - **Renewal is authenticated by the certificate being replaced, and the subject comes from the identity.**
 - **A loopback wire has no certificates.**
+- **Behind a router a loopback wire serves mutual TLS (#558).**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

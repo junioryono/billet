@@ -596,7 +596,7 @@ func (c *Config) validateNodeTLS() []error {
 	//
 	// So the question is only answerable when this file describes both roles. A
 	// standalone node's file says nothing about how the server bound its listener.
-	if c.Server != nil && LoopbackAddr(c.Server.Listen) {
+	if c.Server != nil && !c.Server.WireServesTLS() {
 		errs = append(errs, fmt.Errorf(
 			"node.tls is set, but server.listen is %q — a control plane that accepts only on "+
 				"loopback serves plain HTTP, because there is nothing between the two "+

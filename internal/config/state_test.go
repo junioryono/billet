@@ -345,3 +345,78 @@ func TestAConfigOnABrokerNamesNoKey(t *testing.T) {
 		})
 	}
 }
+
+// A DEPLOYMENT BEHIND A ROUTER LISTENS ON LOOPBACK AND SERVES TLS, which nothing else
+// does, and the names it is reached by have to be ones a client sends as SNI.
+func TestATLSRouterMakesALoopbackWireServeTLS(t *testing.T) {
+	base := func(listen, block string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /tmp/key.pem\n" +
+			"server:\n  listen: " + listen + "\n  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" + block
+	}
+
+	const router = "  tls_router:\n    node_addr: a.nodes.example.com:443\n    enroll_addr: a.enroll.example.com:443\n" +
+		"  bootstrap_listen: 127.0.0.1:7718\n"
+
+	cfg, err := loadServer(t, base("127.0.0.1:7717", router))
+	if err != nil {
+		t.Fatalf("a deployment behind a router: %v", err)
+	}
+
+	if !cfg.Server.WireServesTLS() {
+		t.Error("a loopback wire behind a router does not serve TLS")
+	}
+
+	if got := strings.Join(cfg.Server.RouterHosts(), ","); got != "a.nodes.example.com,a.enroll.example.com" {
+		t.Errorf("its certificate would name %q", got)
+	}
+
+	plain, err := loadServer(t, base("127.0.0.1:7717", ""))
+	if err != nil {
+		t.Fatalf("a loopback deployment: %v", err)
+	}
+
+	if plain.Server.WireServesTLS() {
+		t.Error("a plain loopback wire claims to serve TLS")
+	}
+
+	if _, err := loadServer(t, base("127.0.0.1:7717", "  bootstrap_listen: 127.0.0.1:7718\n")); err == nil ||
+		!strings.Contains(err.Error(), "nothing for a node to enroll into") {
+		t.Errorf("enrollment on a plain loopback wire answered %v; a router is the only thing that changes that", err)
+	}
+
+	for name, tc := range map[string]struct{ listen, block, want string }{
+		"no node address": {"127.0.0.1:7717", "  tls_router:\n    enroll_addr: a.b.example.com:443\n", "node_addr"},
+		"an IP": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: 10.0.0.1:443\n", "no SNI",
+		},
+		"a bare host": {"127.0.0.1:7717", "  tls_router:\n    node_addr: router:443\n", "no SNI"},
+		"no port":     {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com\n", "host:port"},
+		"enrollment with no name": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n  bootstrap_listen: 127.0.0.1:7718\n",
+			"enroll_addr is required",
+		},
+		"a name for no listener": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: b.example.com:443\n",
+			"nothing to send it to",
+		},
+		"one name for both": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: a.example.com:443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"a wire off loopback": {"10.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n", "listens on loopback"},
+		"enrollment off loopback": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: b.example.com:443\n" +
+				"  bootstrap_listen: 10.0.0.1:7718\n", "listens on loopback",
+		},
+		"two spellings of the names": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n  node_tls_hosts: [a.example.com]\n",
+			"node_tls_hosts is set",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, base(tc.listen, tc.block)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}

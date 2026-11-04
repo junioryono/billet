@@ -8,14 +8,16 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 
 | Key | Required | Meaning |
 |---|---|---|
-| `listen` | yes | the address nodes dial. A loopback address serves plain HTTP with no certificates; anything else requires mTLS |
-| `bootstrap_listen` | no | a second address serving only `/v1/ca` and `/v1/enroll`, for a machine that has no certificate yet. Absent means no network enrollment (`billet ca issue` is the way in). Refused against a loopback `listen` |
+| `listen` | yes | the address nodes dial. A loopback address serves plain HTTP with no certificates, unless `tls_router` says a router fronts it; anything else requires mTLS |
+| `bootstrap_listen` | no | a second address serving only `/v1/ca` and `/v1/enroll`, for a machine that has no certificate yet. Absent means no network enrollment (`billet ca issue` is the way in). Refused against a loopback `listen`, unless `tls_router` says a router fronts it |
 | `node_tls_hosts` | when `listen` is a wildcard | every name and address a node will dial, including the one it dials `bootstrap_listen` by; both listeners present one certificate |
 | `state_dir` | one of `state_dir` or `identity_dir`+`state` | shorthand for `identity_dir: <dir>` plus `state: {backend: sqlite}`; must be local storage |
 | `identity_dir` | with `state` | the deployment identity, the node-wire CA and its rotation state, the process lock and the maintenance fence |
 | `state.backend` | with `identity_dir` | `sqlite` or `postgres` |
 | `state.postgres.dsn_env` | for `postgres` | the name of the environment variable holding the DSN, never the DSN |
 | `controllers` | no | `single` (default) or `active-passive`; refused on SQLite |
+| `tls_router.node_addr` | behind a router | the `host:port` nodes dial through a TLS-passthrough router, a DNS name because a client sends no SNI for an IP. With it, `listen` stays on loopback and serves mutual TLS, and `node_tls_hosts` is refused ([Many deployments on one host](../deploying/many-deployments.md)) |
+| `tls_router.enroll_addr` | with `bootstrap_listen` behind a router | the `host:port` an enrolling machine dials, by a name of its own |
 | `token_broker.url` | with a broker | where this deployment takes its installation tokens from, https only, naming only a scheme and a host. With it, no target names a `private_key_path` and this host holds no App key ([ADR-023](decisions/adr-023-installation-tokens-from-a-broker.md)) |
 | `token_broker.client_key_path` | with a broker | the key this host proves its deployment with, absolute and outside `identity_dir`; `billet broker client-key` creates it |
 | `token_broker.ca_file` | no | the PEM bundle the broker's certificate is verified against; absent, the system's roots |
