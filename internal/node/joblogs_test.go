@@ -843,8 +843,86 @@ func TestTheRouteWaitsWhileRoomIsMade(t *testing.T) {
 	store.sweeping = 1
 	store.mu.Unlock()
 
-	if got := postLog(t, service, token, data).Code; got != http.StatusTooManyRequests {
-		t.Errorf("a chunk needing room answered %d", got)
+	got := postLog(t, service, token, data)
+	if got.Code != http.StatusTooManyRequests {
+		t.Errorf("a chunk needing room answered %d", got.Code)
+	}
+	if got.Header().Get("Retry-After") == "" {
+		t.Error("a chunk told to wait was not told how long")
+	}
+}
+
+// A DELETION THAT FAILED GIVES NOTHING BACK: the files are still there, and it is tried again.
+func TestASweepThatFailedGivesNoRoomBack(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a directory whatever its mode")
+	}
+
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+
+	s := aLogStore(t, logLimits())
+	s.now = func() time.Time { return now }
+
+	keepChunk(t, s, logLease, 1, "one")
+	held := s.total
+
+	dir := filepath.Join(s.dir, logLease)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	now = now.Add(2 * time.Hour)
+	s.evictPass()
+
+	if s.sweeping != held {
+		t.Errorf("after a sweep that failed %d is being deleted, want %d", s.sweeping, held)
+	}
+
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	s.evictPass()
+
+	if s.sweeping != 0 || chunksHeld(t, s, logLease) != 0 {
+		t.Errorf("after the sweep succeeded %d is being deleted and %d chunks are left", s.sweeping,
+			chunksHeld(t, s, logLease))
+	}
+}
+
+// AN EVICTED LEASE WHOSE FILES CANNOT BE READ AT A START STILL TAKES THE DISK, whose bound does not
+// stop holding because nobody can say how much: it counts as the most one job may take. Searchable
+// is what the mode allows: the mark can be seen, and the directory not listed.
+func TestAnUnreadableEvictedLeaseCountsAsAWholeJob(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a directory whatever its mode")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, jobLogDirectory, logLease)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, jobLogEvicted), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o100); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+
+	s, err := NewJobLogStore(dir, logLimits(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewJobLogStore: %v", err)
+	}
+
+	if want := logLimits().MaxJobBytes; s.sweeping != want {
+		t.Errorf("%d is being deleted, want a whole job's %d", s.sweeping, want)
 	}
 }
 
@@ -878,6 +956,10 @@ func TestAnUnreadableLeaseDoesNotStopTheStore(t *testing.T) {
 	}
 	if err := s.Keep("ffffffffffffffffffffffffffffffff", c, data); err != nil {
 		t.Errorf("another lease answered %v", err)
+	}
+
+	if want := logLimits().MaxJobBytes; s.sweeping != want {
+		t.Errorf("the unreadable lease counts as %d of the disk, want a whole job's %d", s.sweeping, want)
 	}
 }
 

@@ -470,6 +470,15 @@ type logChunkRow struct {
 	receivedAt             int64
 }
 
+// logDayHasLines says a day's file holds the table a search reads.
+func logDayHasLines(ctx context.Context, db *sql.DB) bool {
+	var tables int
+
+	row := logIndexQueryRow(ctx, db, `SELECT count(*) FROM sqlite_master WHERE name = 'lines'`)
+
+	return row.Scan(&tables) == nil && tables > 0
+}
+
 // logDayIsEmpty says a failed search of a day met a day with nothing in it: removed by the
 // retention since its name was read, or created a moment ago and its schema not yet committed.
 // Neither held a line, so neither ends a search of the other days. A DAY WITH SOME OF ITS TABLES
@@ -506,7 +515,18 @@ func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (
 	// chunks are read on the other.
 	db.SetMaxOpenConns(2)
 
-	rows, err := db.QueryContext(ctx, `SELECT rowid FROM lines WHERE lines MATCH ? ORDER BY rowid DESC`, s.Match) //billet:ignore rawsql // the log index is not the ledger, and sqlc has no catalogue entry for a virtual table
+	match := func() (*sql.Rows, error) {
+		return db.QueryContext(ctx, `SELECT rowid FROM lines WHERE lines MATCH ? ORDER BY rowid DESC`, s.Match) //billet:ignore rawsql // the log index is not the ledger, and sqlc has no catalogue entry for a virtual table
+	}
+
+	rows, err := match()
+
+	// THE SCHEMA CAN COMMIT BETWEEN THE MATCH AND THE LOOK AT IT, which would read as a damaged day
+	// when it is a whole one that has just appeared. Once more now that it is there.
+	if err != nil && strings.Contains(err.Error(), "no such table") && logDayHasLines(ctx, db) {
+		rows, err = match()
+	}
+
 	if err != nil {
 		if logDayIsEmpty(ctx, db, path, err) {
 			return false, false, nil

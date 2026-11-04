@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -274,8 +275,9 @@ func TestABusyReadIsAnsweredAndTheLoopGoesOn(t *testing.T) {
 		<-compute.holding
 	}
 
-	if _, err := p.ReadJobLog(t.Context(), node, nodeapi.LogReadSpec{Lease: "l1"}); err == nil {
-		t.Error("a read past the slots was answered as if it had been read")
+	_, err := p.ReadJobLog(t.Context(), node, nodeapi.LogReadSpec{Lease: "l1"})
+	if err == nil || !strings.Contains(err.Error(), "as many logs as it may") {
+		t.Errorf("a read past the slots answered %v, want busy", err)
 	}
 
 	destroyed := make(chan error, 1)

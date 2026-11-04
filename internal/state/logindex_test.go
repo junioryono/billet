@@ -277,6 +277,30 @@ func TestAnEmptyDayIsNotAFailedSearch(t *testing.T) {
 		t.Error("a day missing its lines table read as empty")
 	}
 
+	// WHAT TELLS A SCHEMA THAT JUST COMMITTED FROM A DAMAGED DAY.
+	damagedDB, err := sql.Open("sqlite", dsn(damaged))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer damagedDB.Close()
+
+	if logDayHasLines(t.Context(), damagedDB) {
+		t.Error("a day with no lines table says it has one")
+	}
+
+	wholeDB, err := sql.Open("sqlite", dsn(filepath.Join(dir, "2000-01-04.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wholeDB.Close()
+
+	if err := createLogDay(t.Context(), wholeDB); err != nil {
+		t.Fatalf("createLogDay: %v", err)
+	}
+	if !logDayHasLines(t.Context(), wholeDB) {
+		t.Error("a whole day says it has no lines table")
+	}
+
 	garbage := filepath.Join(dir, "2000-01-03.db")
 	if err := os.WriteFile(garbage, []byte(strings.Repeat("not a database ", 100)), 0o600); err != nil {
 		t.Fatal(err)

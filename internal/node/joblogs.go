@@ -126,9 +126,8 @@ type leaseLog struct {
 }
 
 // NewJobLogStore loads what an earlier process kept under stateDir. A LEASE THAT CANNOT BE READ
-// DOES NOT STOP THE NODE: losing it loses no decision. It is said once and refused from then on,
-// since nobody knows what numbers it holds, and a chunk file whose name cannot be read is left
-// where it is.
+// DOES NOT STOP THE NODE: losing it loses no decision. It is said once and evicted, since nobody
+// knows what numbers it holds, and a chunk file whose name cannot be read is left where it is.
 func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*JobLogStore, error) {
 	s := &JobLogStore{dir: filepath.Join(stateDir, jobLogDirectory), limits: limits, log: log, now: time.Now,
 		leases: map[string]*leaseLog{}, wake: make(chan struct{}, 1), evictNow: make(chan struct{}, 1)}
@@ -155,10 +154,13 @@ func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*Jo
 			// eviction pass finishes that, and they take the disk until it does.
 			l := &leaseLog{evictedAt: info.ModTime()}
 
-			if chunks, err := s.chunksOf(e.Name()); err == nil {
-				for _, c := range chunks {
-					l.sweepBytes += c.bytes
-				}
+			chunks, err := s.chunksOf(e.Name())
+			if err != nil {
+				l.sweepBytes = s.limits.MaxJobBytes
+			}
+
+			for _, c := range chunks {
+				l.sweepBytes += c.bytes
 			}
 
 			s.leases[e.Name()] = l
@@ -169,10 +171,13 @@ func NewJobLogStore(stateDir string, limits JobLogLimits, log *slog.Logger) (*Jo
 
 		chunks, err := s.chunksOf(e.Name())
 		if err != nil {
-			s.log.Warn("could not read a job's kept log; it takes no more and is left as it is",
+			s.log.Warn("could not read a job's kept log; it takes no more, and is deleted when it can be",
 				"lease", e.Name(), "error", err)
 
-			s.leases[e.Name()] = &leaseLog{evictedAt: s.now(), swept: true}
+			// WHAT IT TAKES OF THE DISK CANNOT BE READ EITHER, and the bound is on the disk, so it
+			// counts as the most one job may take until its deletion succeeds.
+			s.leases[e.Name()] = &leaseLog{evictedAt: s.now(), sweepBytes: s.limits.MaxJobBytes}
+			s.sweeping += s.limits.MaxJobBytes
 
 			continue
 		}
