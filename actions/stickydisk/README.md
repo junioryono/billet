@@ -1,6 +1,6 @@
 # billet/stickydisk
 
-This action hot-attaches a copy-on-write ext4 volume to a billet runner, mounts it for the job, and publishes a new immutable generation in its post step. Every failure is a warning and a cold cache: cache availability never changes the job result.
+This action hot-attaches a copy-on-write ext4 volume to a billet runner, mounts it for the job, and commits it in its post step, for the node to publish as a new immutable generation if the tier's rule allows. Every failure is a warning and a cold cache: cache availability never changes the job result.
 
 ```yaml
 - uses: junioryono/billet/actions/stickydisk@v0.1.0
