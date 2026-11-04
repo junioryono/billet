@@ -19,6 +19,25 @@ billet_server_environment_marker_path: /etc/billet/server.env-managed
 # `sslrootcert` — one path, written down in the two places that have to agree.
 billet_state_ca_bundle_path: /etc/billet/rds-ca-bundle.pem
 
+# THE REGISTRY MIRRORS' NAMES, which the unit template, the tasks and the rendered
+# configuration must agree on. The ports are what each guest bridge's firewall
+# admits and what the node's configuration names, so one is never moved alone.
+billet_registry_mirror_instances:
+  - {name: docker-io, upstream: docker.io, remote: "https://registry-1.docker.io", port: 7740}
+  - {name: ghcr-io, upstream: ghcr.io, remote: "https://ghcr.io", port: 7741}
+  - {name: quay-io, upstream: quay.io, remote: "https://quay.io", port: 7742}
+billet_registry_mirror_user: billet-registry
+billet_registry_mirror_dir: /etc/billet-registry
+billet_registry_mirror_install_dir: /usr/local/lib/billet-registry
+billet_registry_mirror_binary: "{{ billet_registry_mirror_install_dir }}/registry-{{ billet_registry_mirror_version }}"
+billet_registry_mirror_stage: "{{ billet_firecracker_stage }}/registry-mirror"
+# The authority and its certificate outlive any converge schedule, and each is
+# replaced by the converge that finds it within thirty days of its end: an expired
+# certificate costs guests the mirror, and only `billet check` would say so.
+billet_registry_mirror_ca_days: 7300
+billet_registry_mirror_leaf_days: 3650
+billet_registry_mirror_reissue_seconds: 2592000
+
 # THE ENDPOINT COMMANDS' OWN PHASES, mirrored so the role's outer bound
 # (`timeout -k 10`) expires after the command's own deadlines and their
 # observations, and a slow but permitted sequence never loses its answer

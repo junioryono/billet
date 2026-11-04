@@ -130,12 +130,13 @@ type Runner struct {
 	// the gap the two once had between them. Nil in production.
 	beforeCustodyAnswer func()
 
-	jit             JITSource
-	provider        provider.Provider
-	alloc           LeaseStore
-	log             *slog.Logger
-	cache           *CacheService
-	registryMirrors config.RegistryMirrors
+	jit               JITSource
+	provider          provider.Provider
+	alloc             LeaseStore
+	log               *slog.Logger
+	cache             *CacheService
+	registryMirrors   config.RegistryMirrors
+	registryMirrorsCA string
 	// monitor measures each running job from the host; nil measures nothing.
 	monitor JobMonitor
 	// checkpoints is where a handover keeps what the sampler knew of each job,
@@ -312,9 +313,11 @@ func WithPower(p PowerRestorer) Option {
 	return func(r *Runner) { r.power = p }
 }
 
-// WithRegistryMirrors gives managed guests their site's public pull-through caches.
-func WithRegistryMirrors(mirrors config.RegistryMirrors) Option {
-	return func(r *Runner) { r.registryMirrors = mirrors }
+// WithRegistryMirrors gives managed guests their site's public pull-through
+// caches, and the PEM authority they trust those caches by, empty for caches a
+// public authority signs.
+func WithRegistryMirrors(mirrors config.RegistryMirrors, authority string) Option {
+	return func(r *Runner) { r.registryMirrors, r.registryMirrorsCA = mirrors, authority }
 }
 
 // New builds a runner over a provider.
@@ -595,6 +598,7 @@ func (r *Runner) Launch(
 		ActionsCAPEM:            actionsCAPEM,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
 		RegistryMirrors:         r.registryMirrors,
+		RegistryMirrorsCA:       r.registryMirrorsCA,
 
 		// What actually starts the runner. Backends refuse an empty command
 		// because a container image's default is a shell, which exits at once and

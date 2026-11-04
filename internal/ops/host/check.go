@@ -410,6 +410,15 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 
 		cacheLines, cacheFailure = judgeNodeCache(cfg)
 
+		// THE SAME DEFERRAL: an authority it cannot hand a guest fails the check at
+		// the end, and hides nothing on the way.
+		mirrorLines, mirrorFailure := judgeRegistryMirrors(ctx, cfg, skipNetworkProbes)
+		cacheFailure = errors.Join(cacheFailure, mirrorFailure)
+		printNodeReport := func() {
+			printNodeCache(env, cacheLines)
+			printFinding(env, "mirrors", mirrorLines)
+		}
+
 		var bundle *wirecert.Bundle
 		if cfg.Node.TLS != nil {
 			b, err := app.NodeBundle(cfg)
@@ -417,7 +426,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 				// NO HEADER HERE: this is the one path where the node's name was
 				// never established. The verdict is printed anyway, because it
 				// never depended on the name.
-				printNodeCache(env, cacheLines)
+				printNodeReport()
 
 				return report, errors.Join(cacheFailure, fmt.Errorf("node identity: %w", err))
 			}
@@ -430,7 +439,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		}
 		fmt.Fprintf(env.Stdout, "node     %s at %s via %s -> %s\n", cfg.Node.Name, site,
 			cfg.Node.Provider, cfg.Node.ServerAddr)
-		printNodeCache(env, cacheLines)
+		printNodeReport()
 
 		// Config validation proves the ec2 block is COHERENT. It cannot prove this
 		// machine can act on it, and the difference is a deployment that validates

@@ -1,0 +1,333 @@
+---
+# ONE DISTRIBUTION PER UPSTREAM, because proxy mode accepts one remote URL (#543).
+# Docker Hub limits an unauthenticated address, GitHub-hosted runners are exempt
+# and self-hosted ones are not, so a busy site behind one NAT address starts
+# failing pulls; a mirror on the node pulls each thing once for its guests.
+#
+# THEY SERVE PUBLIC CONTENT TO EVERY GUEST ON THIS HOST, trusted or not, with no
+# upstream credential: one here would hand what it can read to every job. A proxy
+# refuses a push, so a job cannot put anything in front of another.
+#
+# ON THE FIRST BRIDGE'S ADDRESS, reachable from every guest bridge because a packet
+# to a host's own address is delivered whichever interface it came in on; each
+# guest bridge's firewall admits the ports (network.nft.j2), and this host's guests
+# are the only ones that can: a guest may not reach a private address across the
+# site. So every Firecracker host runs its own.
+#
+# A GUEST THAT CANNOT REACH OR VERIFY ONE PULLS FROM THE REGISTRY (dockerd and
+# BuildKit, measured 2026-11-04), so nothing here is worth failing a job over, and
+# an image that predates the authority's metadata key loses the saving and nothing
+# else.
+- name: Select the mirror's release architecture
+  ansible.builtin.set_fact:
+    billet_registry_mirror_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(ansible_facts['architecture'], '') }}"
+
+- name: Run the registry mirrors
+  when: billet_registry_mirrors_active | bool
+  block:
+    - name: Refuse an unsupported registry mirror architecture
+      ansible.builtin.assert:
+        that: billet_registry_mirror_arch | length > 0
+        fail_msg: >-
+          The registry mirrors are supported here only on x86_64 and aarch64, not
+          {{ ansible_facts['architecture'] }}. Set billet_registry_mirrors to false.
+
+    - name: Create the registry mirrors' group
+      ansible.builtin.group:
+        name: "{{ billet_registry_mirror_user }}"
+        system: true
+        state: present
+      become: true
+
+    - name: Create the registry mirrors' account
+      ansible.builtin.user:
+        name: "{{ billet_registry_mirror_user }}"
+        group: "{{ billet_registry_mirror_user }}"
+        system: true
+        create_home: false
+        home: /nonexistent
+        shell: /usr/sbin/nologin
+        state: present
+      become: true
+
+    - name: Create the registry mirrors' directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ billet_registry_mirror_dir }}", group: root, mode: "0755"}
+        - {path: "{{ billet_registry_mirror_dir }}/authority", group: root, mode: "0700"}
+        - {path: "{{ billet_registry_mirror_dir }}/leaf", group: "{{ billet_registry_mirror_user }}", mode: "0750"}
+        - {path: "{{ billet_registry_mirror_install_dir }}", group: root, mode: "0755"}
+        - {path: "{{ billet_registry_mirror_stage }}", group: root, mode: "0700"}
+      loop_control:
+        label: "{{ item.path }}"
+      become: true
+
+    - name: Check the exact registry mirror binary
+      ansible.builtin.stat:
+        path: "{{ billet_registry_mirror_binary }}"
+      register: billet_registry_mirror_binary_state
+      check_mode: false
+      become: true
+
+    - name: Report that a dry run does not install the registry mirror
+      ansible.builtin.debug:
+        msg: >-
+          This is a check run, so Distribution {{ billet_registry_mirror_version }} was
+          NOT downloaded or installed. A real converge fetches it for
+          {{ billet_registry_mirror_arch }} and verifies it against the hash this
+          collection pins.
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - ansible_check_mode
+
+    - name: Download the verified registry mirror release
+      ansible.builtin.get_url:
+        url: "https://github.com/distribution/distribution/releases/download/{{ billet_registry_mirror_version }}/registry_{{ billet_registry_mirror_version | regex_replace('^v', '') }}_linux_{{ billet_registry_mirror_arch }}.tar.gz"
+        dest: "{{ billet_registry_mirror_stage }}/registry-{{ billet_registry_mirror_version }}.tar.gz"
+        checksum: "sha256:{{ billet_registry_mirror_checksums[billet_registry_mirror_arch] }}"
+        timeout: "{{ billet_fetch_timeout }}"
+        owner: root
+        group: root
+        mode: "0600"
+      register: billet_registry_mirror_download
+      until: billet_registry_mirror_download is succeeded
+      retries: "{{ billet_fetch_retries }}"
+      delay: "{{ billet_fetch_retry_delay }}"
+      become: true
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - not ansible_check_mode
+
+    - name: Unpack the registry mirror
+      ansible.builtin.unarchive:
+        src: "{{ billet_registry_mirror_stage }}/registry-{{ billet_registry_mirror_version }}.tar.gz"
+        dest: "{{ billet_registry_mirror_stage }}"
+        remote_src: true
+        include: [registry]
+      become: true
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - not ansible_check_mode
+
+    - name: Install the versioned registry mirror binary
+      ansible.builtin.copy:
+        src: "{{ billet_registry_mirror_stage }}/registry"
+        dest: "{{ billet_registry_mirror_binary }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      register: billet_registry_mirror_install
+      become: true
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - not ansible_check_mode
+
+    - name: Inspect whether this host already has a mirrors' authority
+      ansible.builtin.stat:
+        path: "{{ billet_registry_mirror_dir }}/ca.pem"
+      register: billet_registry_mirror_ca_before
+      check_mode: false
+      become: true
+
+    # THE AUTHORITY IS THIS HOST'S ALONE, and its key never leaves root: a guest is
+    # handed its certificate, and only that.
+    - name: Ask whether the mirrors' authority is current
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv:
+          - sh
+          - -c
+          - >-
+            test -s "$1/authority/ca.key" &&
+            openssl pkey -in "$1/authority/ca.key" -noout &&
+            openssl x509 -in "$1/ca.pem" -noout -checkend {{ billet_registry_mirror_reissue_seconds }}
+          - sh
+          - "{{ billet_registry_mirror_dir }}"
+      register: billet_registry_mirror_ca_current
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: true
+
+    - name: Make the mirrors' authority
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv:
+          - sh
+          - -ec
+          - >-
+            umask 077;
+            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1/authority/ca.key.new";
+            umask 022;
+            openssl req -x509 -new -key "$1/authority/ca.key.new" -sha256 -days {{ billet_registry_mirror_ca_days }}
+            -subj "/CN=billet registry mirrors"
+            -addext "basicConstraints=critical,CA:TRUE,pathlen:0"
+            -addext "keyUsage=critical,keyCertSign,cRLSign"
+            -out "$1/ca.pem.new";
+            mv "$1/authority/ca.key.new" "$1/authority/ca.key";
+            mv "$1/ca.pem.new" "$1/ca.pem"
+          - sh
+          - "{{ billet_registry_mirror_dir }}"
+      register: billet_registry_mirror_ca_made
+      changed_when: true
+      become: true
+      when:
+        - billet_registry_mirror_ca_current.rc != 0
+        - not ansible_check_mode
+
+    - name: Ask whether the mirrors' certificate is current
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv:
+          - sh
+          - -c
+          - >-
+            test -s "$1/leaf/leaf.key" &&
+            openssl verify -CAfile "$1/ca.pem" "$1/leaf.pem" >/dev/null &&
+            openssl x509 -in "$1/leaf.pem" -noout -checkend {{ billet_registry_mirror_reissue_seconds }} -ext subjectAltName
+          - sh
+          - "{{ billet_registry_mirror_dir }}"
+      register: billet_registry_mirror_leaf_read
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: true
+
+    # EVERY BRIDGE'S ADDRESS AND NO OTHER, compared as the whole list, so a bridge
+    # added or removed reissues it.
+    - name: Decide whether the mirrors' certificate names this host's bridges
+      ansible.builtin.set_fact:
+        billet_registry_mirror_leaf_current: >-
+          {{ billet_registry_mirror_leaf_read.rc == 0
+             and (billet_registry_mirror_leaf_read.stdout | regex_findall('IP Address:[0-9.]+') | sort)
+                 == (billet_networks | map(attribute='address') | map('regex_replace', '^', 'IP Address:') | sort) }}
+
+    - name: Issue the mirrors' certificate
+      ansible.builtin.command:
+        expand_argument_vars: false
+        argv:
+          - sh
+          - -ec
+          - >-
+            umask 077;
+            printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n' "$2" >"$1/authority/leaf.ext";
+            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1/leaf/leaf.key.new";
+            openssl req -new -key "$1/leaf/leaf.key.new" -subj "/CN=billet registry mirror" -out "$1/authority/leaf.csr";
+            umask 022;
+            openssl x509 -req -in "$1/authority/leaf.csr" -CA "$1/ca.pem" -CAkey "$1/authority/ca.key"
+            -CAcreateserial -CAserial "$1/authority/ca.srl" -sha256 -days {{ billet_registry_mirror_leaf_days }}
+            -extfile "$1/authority/leaf.ext" -out "$1/leaf.pem.new";
+            chgrp "$3" "$1/leaf/leaf.key.new";
+            chmod 0640 "$1/leaf/leaf.key.new";
+            mv "$1/leaf/leaf.key.new" "$1/leaf/leaf.key";
+            mv "$1/leaf.pem.new" "$1/leaf.pem";
+            rm -f "$1/authority/leaf.csr" "$1/authority/leaf.ext"
+          - sh
+          - "{{ billet_registry_mirror_dir }}"
+          - "{{ billet_networks | map(attribute='address') | map('regex_replace', '^', 'IP:') | join(',') }}"
+          - "{{ billet_registry_mirror_user }}"
+      register: billet_registry_mirror_leaf_made
+      changed_when: true
+      become: true
+      when:
+        - not billet_registry_mirror_leaf_current | bool
+        - not ansible_check_mode
+
+    # A GUEST IS HANDED THE AUTHORITY WHEN THE NODE STARTS, so one replaced under a
+    # running node reaches its guests only after it restarts; until then they cannot
+    # verify the mirror and pull from the registry. Reported, because the restart
+    # is a drain an operator times, and only a rotation needs it: on a first
+    # converge the node has not started, or restarts for the config that names it.
+    - name: Note that a rotated authority needs a node restart to reach guests
+      ansible.builtin.debug:
+        msg: >-
+          The registry mirrors' authority was replaced. Guests of a node already
+          running keep pulling from the registry until billet-node.service restarts,
+          which is a drain.
+      when:
+        - billet_registry_mirror_ca_made is changed
+        - billet_registry_mirror_ca_before.stat.exists
+
+    - name: Render each registry mirror's configuration
+      ansible.builtin.template:
+        src: billet-registry.yml.j2
+        dest: "{{ billet_registry_mirror_dir }}/{{ item.name }}.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ billet_registry_mirror_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: billet_registry_mirror_configs
+      become: true
+
+    - name: Install the registry mirror unit
+      ansible.builtin.template:
+        src: billet-registry@.service.j2
+        dest: /etc/systemd/system/billet-registry@.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: billet_registry_mirror_unit
+      become: true
+      notify: Reload systemd
+
+    - name: Apply the registry mirror unit change
+      ansible.builtin.meta: flush_handlers
+
+    - name: Run each registry mirror
+      ansible.builtin.systemd_service:
+        name: "billet-registry@{{ item.0.name }}.service"
+        enabled: true
+        state: >-
+          {{ 'restarted' if (item.1 is changed or billet_registry_mirror_unit is changed
+             or billet_registry_mirror_install is changed or billet_registry_mirror_leaf_made is changed)
+             else 'started' }}
+      loop: "{{ billet_registry_mirror_instances | zip(billet_registry_mirror_configs.results) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}"
+      become: true
+      notify: billet unit files changed
+      when: not ansible_check_mode
+
+- name: Remove registry mirrors this role no longer runs
+  when: not billet_registry_mirrors_active | bool
+  block:
+    - name: Inspect the registry mirror unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/billet-registry@.service
+      register: billet_registry_mirror_unit_installed
+      check_mode: false
+      become: true
+
+    - name: Stop each registry mirror
+      ansible.builtin.systemd_service:
+        name: "billet-registry@{{ item.name }}.service"
+        enabled: false
+        state: stopped
+      loop: "{{ billet_registry_mirror_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      become: true
+      notify: billet unit files changed
+      when:
+        - billet_registry_mirror_unit_installed.stat.exists
+        - not ansible_check_mode
+
+    # WHAT THEY PULLED IS KEPT UNLESS ASKED, because turning a mirror off to look at
+    # something should not cost a site its next week of pulls.
+    - name: Remove the registry mirrors' files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: >-
+        {{ ['/etc/systemd/system/billet-registry@.service', billet_registry_mirror_dir, billet_registry_mirror_install_dir]
+           + (['/var/lib/billet-registry'] if billet_registry_mirrors_purge | bool else []) }}
+      become: true
+      notify: Reload systemd

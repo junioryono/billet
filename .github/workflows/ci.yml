@@ -852,6 +852,13 @@ jobs:
         if: matrix.group == 'shape'
         run: scripts/gates/scenario.sh node-restart-check
 
+      # The mirrors a Firecracker host runs by default, on real systemd with a real
+      # Distribution: verified with the authority a guest is handed, a manifest
+      # through to Docker Hub, and every way of not running them.
+      - name: Converge the site's registry mirrors
+        if: matrix.group == 'roles'
+        run: scripts/gates/scenario.sh registry-mirror-check
+
       - name: Pin the fail-closed ledger mount units
         if: matrix.group == 'shape'
         run: scripts/gates/scenario.sh ledger-mount-render

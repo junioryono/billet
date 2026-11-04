@@ -119,6 +119,23 @@ billet_firecracker_checksums:
   aarch64: 8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e
 billet_firecracker_stage: /var/cache/billet-provision
 
+# THE SITE'S PULL-THROUGH MIRRORS (#543), one Distribution per upstream on every
+# Firecracker host, which the role names in that node's configuration. On by
+# default, because Docker Hub limits an unauthenticated address and a busy site
+# behind one address starts failing pulls; false stops them and takes them out of
+# the configuration, and either change drains the node. An inventory that names
+# node.registry_mirrors keeps its own, and the role runs none.
+billet_registry_mirrors: true
+# Whether turning them off removes what they pulled too.
+billet_registry_mirrors_purge: false
+# How long a mirror keeps what it pulled after it pulled it. It is the only bound
+# on their disk, which is /var/lib/billet-registry: Distribution has no size limit.
+billet_registry_mirror_ttl: 168h
+billet_registry_mirror_version: v3.1.2
+billet_registry_mirror_checksums:
+  amd64: 40df2224d410f72ae425c3371873b078bbdbda3b8b612be9571f0e6751f3acc8
+  arm64: 09d26f88d2c0f161bd1b8bfc6c123571cc3d291dcca8af5477b3cacc4ec95e73
+
 # A billet release to fetch onto the target, when the operator would rather name
 # a version than stage a binary. Empty means the role installs only what
 # billet_binary_src supplies, which is also what an egress-filtered host needs:

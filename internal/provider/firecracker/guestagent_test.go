@@ -767,6 +767,45 @@ func TestRegistryMirrorsRemainAStringLeafInGuestMetadata(t *testing.T) {
 	}
 }
 
+// THE AUTHORITY TRAVELS ONLY BESIDE THE MIRRORS IT SIGNS, and an absent one is no
+// key at all, which is what an agent reads as publicly trusted mirrors.
+func TestARegistryMirrorAuthorityIsAnOptionalLeafBesideTheMirrors(t *testing.T) {
+	t.Parallel()
+
+	leaf := func(spec provider.Spec) (string, bool) {
+		t.Helper()
+		md, err := metadata(spec)
+		if err != nil {
+			t.Fatalf("metadata: %v", err)
+		}
+		billet := md["latest"].(map[string]any)["meta-data"].(map[string]any)["billet"].(map[string]any)
+		value, ok := billet["registry-mirrors-ca-pem"].(string)
+
+		return value, ok
+	}
+
+	mirrored := aSpec()
+	mirrored.RegistryMirrors = config.RegistryMirrors{
+		DockerIO: "https://docker-cache.home.example",
+		GHCRIO:   "https://ghcr-cache.home.example",
+		QuayIO:   "https://quay-cache.home.example",
+	}
+	if _, ok := leaf(mirrored); ok {
+		t.Error("mirrors with no authority still carried the authority's key")
+	}
+
+	mirrored.RegistryMirrorsCA = "PEM"
+	if got, ok := leaf(mirrored); !ok || got != "PEM" {
+		t.Errorf("the authority's leaf = %q, %v, want PEM", got, ok)
+	}
+
+	unmirrored := aSpec()
+	unmirrored.RegistryMirrorsCA = "PEM"
+	if _, ok := leaf(unmirrored); ok {
+		t.Error("an authority with no mirrors reached the guest")
+	}
+}
+
 // agentDecodeBlock lifts the decode out of the build script between its markers.
 //
 // EXTRACTED RATHER THAN COPIED, because a copy is a second implementation: it would

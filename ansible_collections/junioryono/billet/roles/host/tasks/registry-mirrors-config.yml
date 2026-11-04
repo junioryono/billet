@@ -1,0 +1,48 @@
+---
+# WHETHER THIS ROLE RUNS THE SITE'S PULL-THROUGH MIRRORS ON THIS HOST, and the
+# configuration that says so. A function of the inventory and nothing else on an
+# ordinary converge, so a dry run and the real one render the same file.
+#
+# AN OPERATOR'S OWN MIRRORS WIN: a node naming registry_mirrors or
+# registry_mirrors_ca keeps them, and this role runs none.
+#
+# A RETAINED CONVERGE TAKES UP NOTHING NEW. Its writes are admitted one destination
+# at a time, so the mirrors' tasks do not run there and the node is held to the
+# file it started with: it keeps naming mirrors only an earlier converge installed,
+# which is what the authority's presence proves.
+- name: Inspect the mirrors' authority on a retained converge
+  ansible.builtin.stat:
+    path: "{{ billet_registry_mirror_dir }}/ca.pem"
+  register: billet_registry_mirror_authority
+  check_mode: false
+  become: true
+  when: billet_retirement_node_ordinary | bool
+
+- name: Decide whether this role runs the registry mirrors here
+  ansible.builtin.set_fact:
+    billet_registry_mirrors_active: >-
+      {{ billet_registry_mirrors | bool
+         and billet_effective_config is mapping
+         and billet_effective_config.get('node') is mapping
+         and billet_effective_config.node.get('provider') == 'firecracker'
+         and 'registry_mirrors' not in billet_effective_config.node
+         and 'registry_mirrors_ca' not in billet_effective_config.node
+         and (not billet_retirement_node_ordinary | bool
+              or billet_registry_mirror_authority.stat.exists) }}
+
+- name: Name the mirrors this role runs in the node's configuration
+  ansible.builtin.set_fact:
+    billet_effective_config: >-
+      {{ billet_effective_config | combine({'node': {
+           'registry_mirrors': dict(billet_registry_mirror_instances | map(attribute='upstream')
+             | zip(billet_registry_mirror_instances | map(attribute='port') | map('string')
+                   | map('regex_replace', '^', 'https://' ~ billet_networks[0].address ~ ':'))),
+           'registry_mirrors_ca': billet_registry_mirror_dir ~ '/ca.pem'}}, recursive=true) }}
+  no_log: true
+  when: billet_registry_mirrors_active | bool
+
+- name: Decide which ports guests reach the mirrors on
+  ansible.builtin.set_fact:
+    billet_registry_mirror_guest_ports: >-
+      {{ (billet_registry_mirror_instances | map(attribute='port') | list)
+         if billet_registry_mirrors_active | bool else [] }}

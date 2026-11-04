@@ -29,6 +29,10 @@
          if billet_retirement_node_ordinary | bool else billet_config }}
   no_log: true
 
+# BEFORE IT IS READY, because everything that reads it renders the node's file.
+- name: Decide the registry mirrors this configuration names
+  ansible.builtin.import_tasks: registry-mirrors-config.yml
+
 - name: Mark this ordinary configuration ready
   ansible.builtin.set_fact:
     billet_effective_ready: true

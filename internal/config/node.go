@@ -246,6 +246,11 @@ type NodeConfig struct {
 	// RegistryMirrors are three site-local Distribution pull-through caches. One
 	// instance per upstream is required because proxy mode has one remote URL.
 	RegistryMirrors *RegistryMirrors `yaml:"registry_mirrors,omitempty"`
+	// RegistryMirrorsCA is the path of the PEM authority a mirror's certificate
+	// chains to, for mirrors no public authority signs. The guest trusts it for
+	// those mirrors alone, never in its system store. Empty means the mirrors'
+	// certificates are publicly trusted.
+	RegistryMirrorsCA string `yaml:"registry_mirrors_ca,omitempty"`
 
 	// MaxCustody bounds how long billet holds capacity for compute it cannot account
 	// for — a container adopted from a crashed run, or one an ambiguous launch may
@@ -773,6 +778,16 @@ func (c *Config) validateNode() []error {
 			errs = append(errs, fmt.Errorf("node.registry_mirrors is set but this node's provider is %s, and only the managed Firecracker guest consumes it", c.Node.Provider))
 		} else {
 			errs = append(errs, CheckRegistryMirrors(*c.Node.RegistryMirrors)...)
+		}
+	}
+	if c.Node.RegistryMirrorsCA != "" {
+		if c.Node.RegistryMirrors == nil {
+			errs = append(errs, errors.New("node.registry_mirrors_ca is set with no node.registry_mirrors "+
+				"for it to be the authority of"))
+		}
+		if !filepath.IsAbs(c.Node.RegistryMirrorsCA) {
+			errs = append(errs, fmt.Errorf("node.registry_mirrors_ca must be an absolute path, not %q",
+				c.Node.RegistryMirrorsCA))
 		}
 	}
 

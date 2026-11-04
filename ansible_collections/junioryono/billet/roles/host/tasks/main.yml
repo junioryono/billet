@@ -533,6 +533,13 @@
       ansible.builtin.import_tasks: network.yml
       when: billet_firecracker_enabled
 
+    # AFTER THE BRIDGES THEY LISTEN ON AND BEFORE services.yml, whose node reads the
+    # authority when it starts; and never on the retained route, whose writes are
+    # admitted one destination at a time.
+    - name: Configure or remove the registry mirrors
+      ansible.builtin.import_tasks: registry-mirrors.yml
+      when: not billet_retirement_node_ordinary | bool
+
     # BEFORE ceph.yml, whose bootstrap is when cephadm writes its own logrotate
     # file, and never on the retained route, whose writes are admitted one
     # destination at a time.

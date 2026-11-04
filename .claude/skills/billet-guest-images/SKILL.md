@@ -21,6 +21,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The published image leaves out what billet may not redistribute, and carries what completes it (#584).**
 - **The build runs on a fleet tier, not a hosted runner.**
 - **The build job checks out the release the stable channel names, never `main`.**
+- **The agent trusts a registry mirror's authority for that mirror alone (#543).**
 - **The guest carries billet itself, for the build caches (#226).**
 
 ### The kernel and the gates: [references/kernel-and-gates.md](references/kernel-and-gates.md)

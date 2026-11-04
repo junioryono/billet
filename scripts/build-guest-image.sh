@@ -1438,6 +1438,9 @@ if ! name=$(fetch runner-name); then
 	name=unknown
 fi
 
+registry_mirrors_ca_path=/opt/billet/registry-mirrors-ca.pem
+docker_certs_dir=/etc/docker/certs.d
+
 # PULL-THROUGH CACHES ARE SITE-LOCAL AND PUBLIC. The Docker daemon can redirect
 # Docker Hub through its supported registry-mirrors setting. BuildKit consumes
 # all three upstream mappings later through the runner environment; Docker Engine
@@ -1475,6 +1478,31 @@ if candidate=$(fetch registry-mirrors 2>/dev/null); then
 		log "billet supplied invalid registry-mirror metadata; this job will pull directly upstream"
 	fi
 fi
+
+# A MIRROR NO PUBLIC AUTHORITY SIGNS COMES WITH THE AUTHORITY THAT DOES, trusted
+# for that mirror alone and never in the system store: a job's clients keep the
+# trust they had, and the key behind it can sign for nothing else this guest
+# reaches. Docker reads certs.d at each pull, and only Docker Hub's mirror is
+# dockerd's; the builder action gives BuildKit the same file for all three.
+# Anything that fails here leaves a mirror the guest cannot verify, which dockerd
+# and BuildKit both pass over for the registry (measured 2026-11-04).
+#
+# BILLET_REGISTRY_MIRROR_TRUST_BEGIN — the block between these markers is
+# extracted and EXECUTED against a fake metadata fetch by
+# TestTheAgentTrustsAMirrorsAuthorityForThatMirrorAlone.
+registry_mirrors_ca_file=""
+if [ -n "$registry_mirrors_json" ] &&
+	mirror_ca=$(fetch registry-mirrors-ca-pem 2>/dev/null) && [ -n "$mirror_ca" ]; then
+	if printf '%s\n' "$mirror_ca" >"$registry_mirrors_ca_path" &&
+		chmod 0644 "$registry_mirrors_ca_path" &&
+		install -d -m 0755 "$docker_certs_dir/${docker_mirror#https://}" &&
+		install -m 0644 "$registry_mirrors_ca_path" "$docker_certs_dir/${docker_mirror#https://}/ca.crt"; then
+		registry_mirrors_ca_file=$registry_mirrors_ca_path
+	else
+		log "the registry mirrors' authority could not be installed; this job will pull directly upstream"
+	fi
+fi
+# BILLET_REGISTRY_MIRROR_TRUST_END
 
 # THE DOCKER IMAGE STORE IS ATTACHED BEFORE THE RUNNER, because service containers
 # are pulled before the first workflow step and an action is therefore too late.
@@ -2321,6 +2349,9 @@ fi
 # BILLET_NPM_ENV_END
 if [ -n "$registry_mirrors_json" ]; then
 	runner_env+=("BILLET_REGISTRY_MIRRORS_JSON=$registry_mirrors_json")
+fi
+if [ -n "$registry_mirrors_ca_file" ]; then
+	runner_env+=("BILLET_REGISTRY_MIRRORS_CA_FILE=$registry_mirrors_ca_file")
 fi
 # THE CONTAINER HOOK, ONLY WHERE IT HAS SOMETHING TO ADD: the docker shim under
 # interception, the Go cache helper under the go cache. Every other tier keeps

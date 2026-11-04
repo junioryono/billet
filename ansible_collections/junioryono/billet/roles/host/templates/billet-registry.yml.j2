@@ -1,0 +1,20 @@
+# Rendered by the junioryono.billet collection: change the inventory, not this file.
+version: 0.1
+log:
+  level: info
+  fields:
+    service: billet-registry-{{ item.name }}
+storage:
+  filesystem:
+    rootdirectory: /var/lib/billet-registry/{{ item.name }}
+  # A proxy's expiry removes what it pulled through this.
+  delete:
+    enabled: true
+http:
+  addr: {{ billet_networks[0].address }}:{{ item.port }}
+  tls:
+    certificate: {{ billet_registry_mirror_dir }}/leaf.pem
+    key: {{ billet_registry_mirror_dir }}/leaf/leaf.key
+proxy:
+  remoteurl: {{ item.remote }}
+  ttl: {{ billet_registry_mirror_ttl }}

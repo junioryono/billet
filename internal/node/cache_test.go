@@ -1066,7 +1066,7 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 			DockerIO: "https://docker-cache.home.example",
 			GHCRIO:   "https://ghcr-cache.home.example",
 			QuayIO:   "https://quay-cache.home.example",
-		}))
+		}, "the mirrors' authority"))
 	lease := assignedLease(t, a)
 	if err := runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(tier, config.ProviderFirecracker), Job{
@@ -1078,6 +1078,9 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 		got.GHCRIO != "https://ghcr-cache.home.example" ||
 		got.QuayIO != "https://quay-cache.home.example" {
 		t.Fatalf("provider registry mirrors = %+v", got)
+	}
+	if got := p.launched[0].RegistryMirrorsCA; got != "the mirrors' authority" {
+		t.Fatalf("provider registry mirrors' authority = %q", got)
 	}
 }
 
