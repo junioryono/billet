@@ -673,6 +673,107 @@ func TestAFailureIsAnsweredFromMemoryAndThenAskedAgain(t *testing.T) {
 	}
 }
 
+// A BURST PASSES THE MEMORY ONE AT A TIME. Together they would each find nothing remembered
+// and each ask GitHub, which is the spending the memory exists to stop.
+func TestABurstAgainstAFailingInstallationAsksOnce(t *testing.T) {
+	t.Parallel()
+
+	var mints atomic.Int64
+
+	gh := newFakeGitHub(t)
+	gh.mint = func(w http.ResponseWriter, _ *http.Request) {
+		mints.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusBadGateway)
+	}
+
+	cert, fingerprint := testClient(t)
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{org(22)}},
+	})
+
+	var burst sync.WaitGroup
+
+	for range 8 {
+		source := broker.client(t, cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22)
+
+		burst.Go(func() {
+			if _, err := source.InstallationToken(t.Context()); !errors.Is(err, github.ErrTokenUnavailable) {
+				t.Errorf("got %v, want could-not-tell", err)
+			}
+		})
+	}
+
+	burst.Wait()
+
+	if got := mints.Load(); got != 1 {
+		t.Errorf("GitHub was asked %d times by a burst of 8", got)
+	}
+}
+
+// A SUCCESS ENDS THE MEMORY: the next caller is not told about a failure that has passed.
+func TestASuccessForgetsAFailure(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+
+	failing.Store(true)
+
+	gh := newFakeGitHub(t)
+
+	gh.mint = func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusNotFound)
+
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		answerJSON(w, map[string]any{
+			"token": gh.tokenFor(gh.minted.Add(1)), "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+	}
+
+	cert, fingerprint := testClient(t)
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{org(22)}},
+	})
+
+	now := time.Now()
+
+	var clock sync.Mutex
+
+	broker.server.now = func() time.Time {
+		clock.Lock()
+		defer clock.Unlock()
+
+		return now
+	}
+
+	source := broker.client(t, cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22)
+
+	if _, err := source.InstallationToken(t.Context()); !errors.Is(err, github.ErrNotInstalled) {
+		t.Fatalf("got %v, want not installed", err)
+	}
+
+	failing.Store(false)
+
+	clock.Lock()
+	now = now.Add(failureMemory + time.Second)
+	clock.Unlock()
+
+	if _, err := source.InstallationToken(t.Context()); err != nil {
+		t.Fatalf("the mint works again and answered %v", err)
+	}
+
+	inst := broker.server.installations[keyOf(deploymentA, appID, 22, "acme")]
+	if !inst.failedUntil.IsZero() {
+		t.Errorf("a success left a failure remembered until %v", inst.failedUntil)
+	}
+}
+
 // A REGISTRATION'S actions_read IS WHAT ITS TOKEN CARRIES, in both directions: without it a
 // deployment is refused GitHub's job records, and with it the broker has to ask for them.
 func TestARegistrationsActionsReadReachesTheScope(t *testing.T) {
@@ -917,7 +1018,14 @@ func TestATokenSourceIsRedactedOnEveryRenderingPath(t *testing.T) {
 func TestAClientKeyIsWrittenOnceAndReadBackToItsFingerprint(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "sub", "client.key")
+	// A DIRECTORY THAT IS NOT THERE IS NOT MADE: a root run would leave one the service
+	// account cannot enter.
+	if _, err := CreateClientKey(filepath.Join(t.TempDir(), "absent", "client.key")); err == nil ||
+		!strings.Contains(err.Error(), "service account can enter") {
+		t.Fatalf("a key under no directory answered %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "client.key")
 
 	made, err := CreateClientKey(path)
 	if err != nil {

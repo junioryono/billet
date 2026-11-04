@@ -24,6 +24,9 @@ SELECT message_id, retired FROM pending_completions
 -- because it is the completion's own evidence, compared with the binding after a
 -- restart: a redelivery carrying less, or something else, must not erase or
 -- replace it. A later message replaces it with the rest of the row.
+--
+-- GITHUB'S TWO TIMES ARE FILLED BY THE SAME JOB'S REDELIVERY when the row has none, which
+-- a row older than those columns does not: an empty time is not the completion's word.
 INSERT INTO pending_completions
 	(tier, request_id, run_id, result, lease_id, lease_epoch, lease_node, outcome,
 	 release_only, message_id, retired, acknowledged, job_id, job_owner, job_repository,
@@ -52,9 +55,13 @@ INSERT INTO pending_completions
 			THEN pending_completions.job_event ELSE excluded.job_event END,
 		job_runner_assigned_at=CASE WHEN excluded.message_id = pending_completions.message_id
 			AND pending_completions.job_id != ''
+			AND (pending_completions.job_runner_assigned_at != ''
+			     OR excluded.job_id != pending_completions.job_id)
 			THEN pending_completions.job_runner_assigned_at ELSE excluded.job_runner_assigned_at END,
 		job_finished_at=CASE WHEN excluded.message_id = pending_completions.message_id
 			AND pending_completions.job_id != ''
+			AND (pending_completions.job_finished_at != ''
+			     OR excluded.job_id != pending_completions.job_id)
 			THEN pending_completions.job_finished_at ELSE excluded.job_finished_at END,
 		lease_id=CASE WHEN excluded.message_id = pending_completions.message_id
 			AND (pending_completions.retired = 1 OR

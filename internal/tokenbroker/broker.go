@@ -77,7 +77,12 @@ const verifyEvery = time.Hour
 
 // installation is one registered (deployment, app, installation, target).
 type installation struct {
-	// failed and failedUntil are the failure this installation is answering with, under mu.
+	// gate lets one request at a time through the failure memory, the proof, the mint and
+	// the publishing of how that went. Without it a burst passes the memory together and
+	// each asks GitHub, and a success can land beside a failure it then answers with.
+	gate chan struct{}
+
+	// failed and failedUntil are the failure this installation is answering with, under gate.
 	failed      failure
 	failedUntil time.Time
 
@@ -166,6 +171,7 @@ func NewServer(cfg *config.BrokerConfig, log *slog.Logger) (*Server, error) {
 			}
 
 			s.installations[keyOf(d.ID, reg.AppID, reg.InstallationID, reg.Target)] = &installation{
+				gate:       make(chan struct{}, 1),
 				deployment: d.ID, appID: reg.AppID, installationID: reg.InstallationID, target: target,
 				runEvidence: reg.ActionsRead, key: app.key, base: app.base,
 				tokens: github.NewAppKeyTokensFor(app.base, reg.AppID, reg.InstallationID, app.key,
@@ -267,33 +273,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A FAILURE IS ANSWERED ONCE AND THEN REMEMBERED BRIEFLY. Nothing else stands between
-	// one deployment's retries and the App's budget at GitHub, which every deployment on
-	// that App shares.
-	if failed, held := s.recentFailure(inst); held {
-		s.refuse(w, failed.status, failed.code, failed.message)
-
-		return
-	}
-
-	if status, code, message := s.proved(r, inst); status != 0 {
-		s.noteFailure(r, inst, failure{status, code, message})
-		s.refuse(w, status, code, message)
-
-		return
-	}
-
-	token, err := inst.tokens.InstallationToken(r.Context())
-	if err != nil {
-		s.log.Error("could not mint an installation token", "deployment", deployment, "app", req.AppID,
-			"installation", req.InstallationID, "error", err)
-
-		failed := mintFailure(err)
-		if failed.status != http.StatusServiceUnavailable {
-			s.forgetProof(inst)
-		}
-
-		s.noteFailure(r, inst, failed)
+	token, failed := s.tokenFor(r, inst)
+	if failed.status != 0 {
 		s.refuse(w, failed.status, failed.code, failed.message)
 
 		return
@@ -313,6 +294,51 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// tokenFor is the token this registration holds, or why there is none.
+//
+// A FAILURE IS ANSWERED ONCE AND THEN REMEMBERED BRIEFLY. Nothing else stands between one
+// deployment's retries and the App's budget at GitHub, which every deployment on that App
+// shares.
+func (s *Server) tokenFor(r *http.Request, inst *installation) (github.Token, failure) {
+	select {
+	case inst.gate <- struct{}{}:
+		defer func() { <-inst.gate }()
+	case <-r.Context().Done():
+		return github.Token{}, failure{http.StatusServiceUnavailable, codeUnavailable,
+			"a token could not be minted just now"}
+	}
+
+	if inst.failedUntil.After(s.now()) {
+		return github.Token{}, inst.failed
+	}
+
+	if status, code, message := s.proved(r, inst); status != 0 {
+		failed := failure{status, code, message}
+		s.noteFailure(r, inst, failed)
+
+		return github.Token{}, failed
+	}
+
+	token, err := inst.tokens.InstallationToken(r.Context())
+	if err != nil {
+		s.log.Error("could not mint an installation token", "deployment", inst.deployment, "app", inst.appID,
+			"installation", inst.installationID, "error", err)
+
+		failed := mintFailure(err)
+		if failed.status != http.StatusServiceUnavailable {
+			s.forgetProof(inst)
+		}
+
+		s.noteFailure(r, inst, failed)
+
+		return github.Token{}, failed
+	}
+
+	inst.failedUntil = time.Time{}
+
+	return token, failure{}
+}
+
 // failureMemory is how long a broker repeats a failure rather than asking GitHub again.
 // Short, because the next answer may be different and a control plane's refresh waits
 // on it; a held token rides this out.
@@ -324,26 +350,12 @@ type failure struct {
 	code, message string
 }
 
-func (s *Server) recentFailure(inst *installation) (failure, bool) {
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
-
-	if inst.failedUntil.IsZero() || !s.now().Before(inst.failedUntil) {
-		return failure{}, false
-	}
-
-	return inst.failed, true
-}
-
 // noteFailure remembers one, unless the caller going away is what caused it: that says
 // nothing about the installation.
 func (s *Server) noteFailure(r *http.Request, inst *installation, failed failure) {
 	if r.Context().Err() != nil {
 		return
 	}
-
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
 
 	inst.failed, inst.failedUntil = failed, s.now().Add(failureMemory)
 }

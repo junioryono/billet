@@ -44,8 +44,12 @@ func CreateClientKey(path string) (string, error) {
 
 	encoded := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("tokenbroker: create %s: %w", filepath.Dir(path), err)
+	// NOT CREATED HERE. A root run would leave a directory only root can enter, and handing
+	// back a directory is not this command's to decide, so the service could never read
+	// the key this printed a registration for.
+	if _, err := os.Stat(filepath.Dir(path)); err != nil {
+		return "", fmt.Errorf("tokenbroker: %s, which is to hold this key, cannot be used; create it where the "+
+			"service account can enter it: %w", filepath.Dir(path), err)
 	}
 
 	_, err = durablefile.Installer{}.InstallNew(filepath.Dir(path), filepath.Base(path), 0o600,
