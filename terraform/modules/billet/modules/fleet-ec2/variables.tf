@@ -171,9 +171,9 @@ variable "iam_policy_json" {
 
 # THE AMI BUILDER'S GRANT, OFF BY DEFAULT AND ADDITIVE.
 #
-# `billet ami build` provisions an instance, images it, boots the image it made
-# and reads the verifier's report off the console before stamping the contract
-# tag. None of that is in the node's own policy, so without this the command is
+# `billet ami build` runs GitHub's template on a builder instance, reads its
+# verdict off the console, images it, boots the image it made and reads the
+# verifier's report off the console before stamping the contract tag. None of that is in the node's own policy, so without this the command is
 # run from a workstation with an operator's own credentials — a second machine
 # to keep trustworthy for one step, on a deployment whose controller may be
 # reachable only through a tunnel.
@@ -186,7 +186,7 @@ variable "iam_policy_json" {
 # its instances with the same owner key. That is also why it cannot be combined
 # with iam_policy_json, which is refused on the variable below.
 variable "builder" {
-  description = "Grant the node role what `billet ami build` needs: ec2:CreateImage on a builder-tagged instance and on the image and snapshots it makes, its own TerminateInstances for cleanup, GetConsoleOutput to read the verifier's report, and the CreateTags that stamps a verified image. Off by default — it widens the identity every job's instance is launched by, and a deployment that builds its AMI elsewhere should not carry it. Refused beside iam_policy_json: see that variable."
+  description = "Grant the node role what `billet ami build` needs: ec2:CreateImage on a builder-tagged instance and on the image and snapshots it makes, its own TerminateInstances for cleanup, GetConsoleOutput to read the builder's verdict and the verifier's report, and the CreateTags that stamps a verified image. Off by default — it widens the identity every job's instance is launched by, and a deployment that builds its AMI elsewhere should not carry it. Refused beside iam_policy_json: see that variable."
   type        = bool
   default     = false
 
@@ -201,7 +201,7 @@ variable "builder" {
 }
 
 variable "builder_payload_bucket" {
-  description = "The S3 bucket `billet ami build --payload-bucket` stages its shared installers in, when they no longer fit EC2's 16384-byte user-data limit. Empty grants nothing on S3. The grant is scoped to the object names billet writes (billet-payload-*) at the bucket root, so anything else kept in that bucket is out of reach. Requires builder."
+  description = "The S3 bucket `billet ami build --payload-bucket` stages its build in (GitHub's template and the scripts that run it), which is far past EC2's 16384-byte user-data limit. Empty grants nothing on S3. The grant is scoped to the object names billet writes (billet-payload-*) at the bucket root, so anything else kept in that bucket is out of reach. Requires builder."
   type        = string
   default     = ""
 

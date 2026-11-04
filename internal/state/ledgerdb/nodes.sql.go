@@ -300,21 +300,22 @@ func (q *Queries) ListNodeRegistrations(ctx context.Context) ([]ListNodeRegistra
 
 const listNodeWireVersions = `-- name: ListNodeWireVersions :many
 SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
-       node_digest, highest_release
+       node_digest, highest_release, decommissioned_at
   FROM nodes
  ORDER BY name
 `
 
 type ListNodeWireVersionsRow struct {
-	Name           string
-	Live           int64
-	NodeRelease    string
-	WireMin        int64
-	WireMax        int64
-	WireVersion    int64
-	Epoch          int64
-	NodeDigest     string
-	HighestRelease string
+	Name             string
+	Live             int64
+	NodeRelease      string
+	WireMin          int64
+	WireMax          int64
+	WireVersion      int64
+	Epoch            int64
+	NodeDigest       string
+	HighestRelease   string
+	DecommissionedAt string
 }
 
 // What each host's registration said about its build, and what was negotiated.
@@ -341,6 +342,7 @@ func (q *Queries) ListNodeWireVersions(ctx context.Context) ([]ListNodeWireVersi
 			&i.Epoch,
 			&i.NodeDigest,
 			&i.HighestRelease,
+			&i.DecommissionedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -399,20 +401,21 @@ func (q *Queries) ListOutstandingRemoteShapes(ctx context.Context) ([]ListOutsta
 }
 
 const listPlaceableNodes = `-- name: ListPlaceableNodes :many
-SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version
+SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version, architectures
   FROM nodes
  WHERE live = 1 AND drained = 0
  ORDER BY name
 `
 
 type ListPlaceableNodesRow struct {
-	Name        string
-	Provider    string
-	Site        string
-	TotalVcpu   int64
-	TotalMemory int64
-	Ec2Shapes   string
-	WireVersion int64
+	Name          string
+	Provider      string
+	Site          string
+	TotalVcpu     int64
+	TotalMemory   int64
+	Ec2Shapes     string
+	WireVersion   int64
+	Architectures string
 }
 
 // The hosts a lease may be placed on at all.
@@ -449,6 +452,7 @@ func (q *Queries) ListPlaceableNodes(ctx context.Context) ([]ListPlaceableNodesR
 			&i.TotalMemory,
 			&i.Ec2Shapes,
 			&i.WireVersion,
+			&i.Architectures,
 		); err != nil {
 			return nil, err
 		}
@@ -752,7 +756,7 @@ func (q *Queries) ReadNodeProvider(ctx context.Context, name string) (string, er
 }
 
 const readNodeRegistration = `-- name: ReadNodeRegistration :one
-SELECT provider, site, ec2_shapes, codebuild_fleet FROM nodes WHERE name = $1
+SELECT provider, site, ec2_shapes, codebuild_fleet, architectures FROM nodes WHERE name = $1
 `
 
 type ReadNodeRegistrationRow struct {
@@ -760,6 +764,7 @@ type ReadNodeRegistrationRow struct {
 	Site           string
 	Ec2Shapes      string
 	CodebuildFleet string
+	Architectures  string
 }
 
 // The facts a re-registration has to be checked against.
@@ -771,6 +776,7 @@ func (q *Queries) ReadNodeRegistration(ctx context.Context, name string) (ReadNo
 		&i.Site,
 		&i.Ec2Shapes,
 		&i.CodebuildFleet,
+		&i.Architectures,
 	)
 	return i, err
 }
@@ -796,11 +802,11 @@ const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, highest_release, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch)
 VALUES ($1, $2, $3, $4, $5, $6, $7, 1,
         $8, $9, $10, $11, $12,
         $13, $14, $15, $16,
-        $17, 1)
+        $17, $18, 1)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,
@@ -819,6 +825,7 @@ ON CONFLICT (name) DO UPDATE SET
    codebuild_region   = excluded.codebuild_region,
    incarnation  = excluded.incarnation,
    highest_release = excluded.highest_release,
+   architectures   = excluded.architectures,
    epoch        = nodes.epoch + 1,
    decommissioned_at   = '',
    decommission_proven = 0,
@@ -845,6 +852,7 @@ type UpsertNodeRegistrationParams struct {
 	CodebuildRegion  string
 	Incarnation      string
 	HighestRelease   string
+	Architectures    string
 }
 
 // Register a host, or re-register one, and return its new fence.
@@ -877,6 +885,7 @@ func (q *Queries) UpsertNodeRegistration(ctx context.Context, arg UpsertNodeRegi
 		arg.CodebuildRegion,
 		arg.Incarnation,
 		arg.HighestRelease,
+		arg.Architectures,
 	)
 	var epoch int64
 	err := row.Scan(&epoch)

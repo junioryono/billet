@@ -148,6 +148,15 @@ func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Conf
 	}
 
 	manifest, err := fetchImageManifest(ctx, env, cfg)
+	if errors.Is(err, imagesource.ErrNoImageForMachine) {
+		// FINAL UNTIL THE CHANNEL MOVES, and no fault of this host's: the signed
+		// channel says its release carries no image for this machine.
+		fmt.Fprintf(env.Stdout, "the channel's current release carries no guest image for %s; "+
+			"nothing to do: %v\n", hostArch(), err)
+
+		return nil
+	}
+
 	if err != nil {
 		return err
 	}

@@ -6,6 +6,15 @@
 // A BUILD NEVER FAILS BECAUSE OF IT. Anything the node refuses, or any failure
 // to reach it, turns the helper into a plain local cache for the rest of the
 // process: the go command still gets every object it put, from local disk.
+//
+// AND IT IS NEVER WORSE THAN NO HELPER. Its local directory is the go command's
+// own GOCACHE, in the go command's own format, because GOCACHEPROG takes
+// precedence over GOCACHE: a helper with a directory of its own hid a build
+// cache the workflow restored there (with actions/cache), so a job whose node
+// had nothing published compiled everything from scratch where, without the
+// helper, it would have been warm (2026-10-26, #689). Reading and writing that
+// directory, the helper serves what was restored and leaves what it built for
+// the workflow to save.
 package gocacheprog
 
 import (
@@ -28,7 +37,10 @@ import (
 
 // Config says where the helper keeps its files and which node it asks.
 type Config struct {
-	// Dir holds the objects the go command reads through DiskPath.
+	// Dir is the go command's build cache directory, which the helper reads and
+	// writes in the go command's own layout (cmd/go/internal/cache): an action's
+	// entry at <Dir>/<xx>/<action>-a and an output at <Dir>/<xx>/<output>-d,
+	// where xx is the id's first byte in hex.
 	Dir string
 	// Endpoint and Token are the node's cache endpoint and this guest's bearer.
 	// Either empty means a local cache only.
@@ -119,10 +131,8 @@ func newHelper(cfg Config) (*helper, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("gocacheprog: no cache directory")
 	}
-	for _, sub := range []string{"a", "o"} {
-		if err := os.MkdirAll(filepath.Join(cfg.Dir, sub), 0o700); err != nil {
-			return nil, fmt.Errorf("gocacheprog: prepare %s: %w", cfg.Dir, err)
-		}
+	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+		return nil, fmt.Errorf("gocacheprog: prepare %s: %w", cfg.Dir, err)
 	}
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{Timeout: 2 * time.Minute}
@@ -143,8 +153,42 @@ type entry struct {
 	at     time.Time
 }
 
+// encode is the record the node keeps for an action. It is NOT the go command's
+// entry format: published generations already hold records in this one, and an
+// older helper reads them.
 func (e entry) encode() []byte {
 	return fmt.Appendf(nil, "v1 %s %d %d\n", e.output, e.size, e.at.UnixNano())
+}
+
+// nativeEntrySize is the length of the go command's entry file:
+// "v1 <action> <output> <size, 20 wide> <time, 20 wide>\n".
+const nativeEntrySize = 2 + 1 + 64 + 1 + 64 + 1 + 20 + 1 + 20 + 1
+
+// encodeNative is the go command's own entry for action.
+func (e entry) encodeNative(action string) []byte {
+	return fmt.Appendf(nil, "v1 %s %s %20d %20d\n", action, e.output, e.size, e.at.UnixNano())
+}
+
+// parseNative reads the go command's entry for action, refusing one that names
+// another action, as the go command does.
+func parseNative(raw []byte, action string) (entry, bool) {
+	if len(raw) != nativeEntrySize || raw[len(raw)-1] != '\n' {
+		return entry{}, false
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) != 5 || fields[0] != "v1" || fields[1] != action || !validDigest(fields[2]) {
+		return entry{}, false
+	}
+	size, err := strconv.ParseInt(fields[3], 10, 64)
+	if err != nil || size < 0 {
+		return entry{}, false
+	}
+	nanos, err := strconv.ParseInt(fields[4], 10, 64)
+	if err != nil || nanos < 0 {
+		return entry{}, false
+	}
+
+	return entry{output: fields[2], size: size, at: time.Unix(0, nanos)}, true
 }
 
 func parseEntry(raw []byte) (entry, bool) {
@@ -173,11 +217,24 @@ func validDigest(value string) bool {
 	return err == nil
 }
 
-func (h *helper) actionPath(action string) string { return filepath.Join(h.cfg.Dir, "a", action) }
-func (h *helper) outputPath(output string) string { return filepath.Join(h.cfg.Dir, "o", output) }
+// actionPath and outputPath are the go command's own names for an action's
+// entry and an output, so a directory either of them wrote serves the other.
+// Both are given a digest every caller has checked.
+func (h *helper) actionPath(action string) string {
+	return filepath.Join(h.cfg.Dir, action[:2], action+"-a")
+}
+
+func (h *helper) outputPath(output string) string {
+	return filepath.Join(h.cfg.Dir, output[:2], output+"-d")
+}
 
 func (h *helper) get(ctx context.Context, req request, resp *response) {
 	action := hex.EncodeToString(req.ActionID)
+	if !validDigest(action) {
+		resp.Miss = true
+
+		return
+	}
 	if found, ok := h.local(action); ok {
 		answer(resp, found, h.outputPath(found.output))
 
@@ -210,7 +267,7 @@ func (h *helper) local(action string) (entry, bool) {
 	if err != nil {
 		return entry{}, false
 	}
-	found, ok := parseEntry(raw)
+	found, ok := parseNative(raw, action)
 	if !ok {
 		return entry{}, false
 	}
@@ -218,8 +275,29 @@ func (h *helper) local(action string) (entry, bool) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() != found.size {
 		return entry{}, false
 	}
+	h.markUsed(h.actionPath(action), h.outputPath(found.output))
 
 	return found, true
+}
+
+// markUsed refreshes the times of a hit's entry and output, as the go command's
+// own reader does (cmd/go/internal/cache's markUsed), because the directory is
+// the go command's and so is its trimming: an object served here and never
+// marked would age out of a restored cache under a go command trimming it.
+// Like the go command, it writes only a time more than an hour old.
+func (h *helper) markUsed(paths ...string) {
+	now := time.Now()
+	// A TIME THAT CANNOT BE WRITTEN costs a later miss, never this hit, so it is
+	// not an error.
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || now.Sub(info.ModTime()) <= time.Hour {
+			continue
+		}
+		if err := os.Chtimes(path, now, now); err != nil {
+			continue
+		}
+	}
 }
 
 // fetch asks the node for an action's entry and output, and keeps both.
@@ -236,8 +314,11 @@ func (h *helper) fetch(ctx context.Context, action string) (entry, bool) {
 		return entry{}, false
 	}
 	// AN OUTPUT ALREADY ON DISK IS REUSED ONLY WHEN IT IS THE ENTRY'S: a damaged
-	// one, which local() refused, is fetched again rather than named.
-	if !h.holds(found) {
+	// one, which local() refused, is fetched again rather than named. One reused
+	// is marked used, as a local hit's is.
+	if h.holds(found) {
+		h.markUsed(h.outputPath(found.output))
+	} else {
 		body, ok := h.call(ctx, http.MethodGet, "cas/"+found.output, nil)
 		if !ok || int64(len(body)) != found.size || digest(body) != found.output {
 			return entry{}, false
@@ -246,7 +327,7 @@ func (h *helper) fetch(ctx context.Context, action string) (entry, bool) {
 			return entry{}, false
 		}
 	}
-	if err := writeFile(h.actionPath(action), found.encode()); err != nil {
+	if err := writeFile(h.actionPath(action), found.encodeNative(action)); err != nil {
 		return entry{}, false
 	}
 
@@ -275,7 +356,7 @@ func (h *helper) put(ctx context.Context, req request, body []byte, resp *respon
 
 		return
 	}
-	if err := writeFile(h.actionPath(action), record.encode()); err != nil {
+	if err := writeFile(h.actionPath(action), record.encodeNative(action)); err != nil {
 		resp.Err = err.Error()
 
 		return
@@ -348,6 +429,9 @@ func digest(body []byte) string {
 // writeFile installs a file through a temporary name, so the go command never
 // reads a partial object at a DiskPath.
 func writeFile(path string, body []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
 	if err != nil {
 		return err

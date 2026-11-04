@@ -55,11 +55,11 @@ func TestTheRunnerIsCheckedBeforeItIsUnpacked(t *testing.T) {
 		{"x64", "linux-x64"},
 		{"arm64", "linux-arm64"},
 	} {
-		script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL,
-			payloadSHA256: testPayloadDigest, RunnerSHA256: digest, RunnerVersion: "2.328.0",
+		script, err := layerScript(BuildSpec{
+			RunnerSHA256: digest, RunnerVersion: "2.328.0",
 			Arch: arch.arch})
 		if err != nil {
-			t.Fatalf("provisionScript(%s): %v", arch.arch, err)
+			t.Fatalf("layerScript(%s): %v", arch.arch, err)
 		}
 
 		fragment := runnerFetchBlock(t, script)
@@ -222,11 +222,11 @@ func TestTheScriptChecksTheSpecsDigestForItsPlatform(t *testing.T) {
 	} {
 		digest := strings.Repeat("ab", 32)
 
-		script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL,
-			payloadSHA256: testPayloadDigest, RunnerSHA256: digest,
+		script, err := layerScript(BuildSpec{
+			RunnerSHA256:  digest,
 			RunnerVersion: "2.328.0", Arch: tc.arch})
 		if err != nil {
-			t.Fatalf("provisionScript(%s): %v", tc.arch, err)
+			t.Fatalf("layerScript(%s): %v", tc.arch, err)
 		}
 
 		block := runnerFetchBlock(t, script)
@@ -266,12 +266,12 @@ func TestARunnerDigestThatIsNotOneIsRefusedBeforeAnyLaunch(t *testing.T) {
 			b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 			f := newFakeEC2(t)
-			f.respond = b.reply
+			f.respond = b.serve(f)
 
 			p := newTestProvider(t, f, nil)
 
-			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL,
-				payloadSHA256: testPayloadDigest, BaseImage: "ami-base", InstanceType: "c7i.xlarge",
+			_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
+				BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 				Arch: "x64", RunnerVersion: "2.328.0", RunnerSHA256: tc.digest, Name: "test-image",
 			})
 			if err == nil {

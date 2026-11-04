@@ -251,7 +251,8 @@ func TestADamagedLocalObjectIsAMiss(t *testing.T) {
 	exchange(t, Config{Dir: dir},
 		request{ID: 1, Command: "put", ActionID: action, OutputID: sum[:], BodySize: int64(len(body))}, body,
 		request{ID: 2, Command: "close"})
-	if err := os.WriteFile(filepath.Join(dir, "o", hex.EncodeToString(sum[:])), body[:3], 0o600); err != nil {
+	output := hex.EncodeToString(sum[:])
+	if err := os.WriteFile(filepath.Join(dir, output[:2], output+"-d"), body[:3], 0o600); err != nil {
 		t.Fatal(err)
 	}
 	answers := exchange(t, Config{Dir: dir},
@@ -348,8 +349,213 @@ func TestARefusingNodeLeavesAWorkingLocalCache(t *testing.T) {
 	t.Cleanup(node.Close)
 	dir := t.TempDir()
 	build(t, node, probeModule(t), dir)
-	entries, err := os.ReadDir(filepath.Join(dir, "o"))
-	if err != nil || len(entries) == 0 {
+	outputs, err := filepath.Glob(filepath.Join(dir, "*", "*-d"))
+	if err != nil || len(outputs) == 0 {
 		t.Fatalf("the local cache holds nothing after a build: %v", err)
+	}
+}
+
+// compiles builds module against dir as the build cache, through the helper
+// (with a refusing node) or not, and counts the compiler runs `go build -x`
+// reports: none means every package was served from the cache.
+func compiles(t *testing.T, module, dir string, throughHelper bool) int {
+	t.Helper()
+
+	env := append(os.Environ(), "GOFLAGS=", "GOTOOLCHAIN=local", "GOWORK=off", "GOCACHE="+dir)
+	if throughHelper {
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := httptest.NewServer(&fakeNode{objects: map[string][]byte{}, refuse: true})
+		t.Cleanup(node.Close)
+		env = append(env, "GOCACHEPROG="+executable, "BILLET_GOCACHEPROG_TEST_HELPER=1",
+			"BILLET_GOCACHE_DIR="+dir, "BILLET_CACHE_ENDPOINT="+node.URL, "BILLET_CACHE_TOKEN=token")
+	} else {
+		env = append(env, "GOCACHEPROG=")
+	}
+	cmd := exec.CommandContext(t.Context(), "go", "build", "-x", "-o", filepath.Join(t.TempDir(), "probe"), ".")
+	cmd.Dir, cmd.Env = module, env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	n := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "/compile ") {
+			n++
+		}
+	}
+
+	return n
+}
+
+// THE HELPER AND THE GO COMMAND SHARE ONE CACHE, in both directions, so the
+// helper is never worse than none (#689): a cache the go command built (the one
+// a workflow restores with actions/cache) serves a build through a helper the
+// node refuses, and what the helper built is the go command's to read, and so
+// the workflow's to save.
+func TestTheHelperAndTheGoCommandShareOneCache(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go command to drive the helper")
+	}
+
+	for _, first := range []bool{false, true} {
+		name := map[bool]string{false: "the go command's cache serves the helper",
+			true: "the helper's cache serves the go command"}[first]
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			module, dir := probeModule(t), t.TempDir()
+			if n := compiles(t, module, dir, first); n == 0 {
+				t.Fatal("a build into an empty cache compiled nothing, so this proves nothing")
+			}
+			if n := compiles(t, module, dir, !first); n != 0 {
+				t.Errorf("the second build compiled %d packages the first had cached", n)
+			}
+		})
+	}
+}
+
+// AN ENTRY FILE THAT NAMES ANOTHER ACTION IS A MISS, as the go command treats
+// one: a file at one action's path is not that action's answer.
+func TestANativeEntryForAnotherActionIsAMiss(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, other := bytes.Repeat([]byte{4}, 32), bytes.Repeat([]byte{6}, 32)
+	body := []byte("an object")
+	sum := sha256.Sum256(body)
+	exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "put", ActionID: other, OutputID: sum[:], BodySize: int64(len(body))}, body,
+		request{ID: 2, Command: "close"})
+
+	ours, theirs := hex.EncodeToString(action), hex.EncodeToString(other)
+	raw, err := os.ReadFile(filepath.Join(dir, theirs[:2], theirs+"-a"))
+	if err != nil {
+		t.Fatalf("the put wrote no entry in the go command's layout: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ours[:2]), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ours[:2], ours+"-a"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	answers := exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "get", ActionID: action},
+		request{ID: 2, Command: "get", ActionID: other},
+		request{ID: 3, Command: "close"})
+	if !answers[0].Miss {
+		t.Errorf("an entry naming another action was answered %+v", answers[0])
+	}
+	if answers[1].Miss {
+		t.Errorf("the action the entry names was a miss: %+v", answers[1])
+	}
+}
+
+// A HIT REFRESHES ITS FILES' TIMES, as the go command's own reader does, so an
+// object served from a restored cache does not age out under a go command's
+// trim of the same directory.
+func TestAHitMarksItsFilesUsed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, body := bytes.Repeat([]byte{8}, 32), []byte("an old object")
+	sum := sha256.Sum256(body)
+	exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "put", ActionID: action, OutputID: sum[:], BodySize: int64(len(body))}, body,
+		request{ID: 2, Command: "close"})
+
+	a, o := hex.EncodeToString(action), hex.EncodeToString(sum[:])
+	paths := []string{filepath.Join(dir, a[:2], a+"-a"), filepath.Join(dir, o[:2], o+"-d")}
+	old := time.Now().Add(-6 * 24 * time.Hour)
+	for _, path := range paths {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	answers := exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "get", ActionID: action}, request{ID: 2, Command: "close"})
+	if answers[0].Miss {
+		t.Fatalf("the restored object was a miss: %+v", answers[0])
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || time.Since(info.ModTime()) > time.Hour {
+			t.Errorf("%s still reads as unused after a hit: %v", path, err)
+		}
+	}
+}
+
+// A REMOTE HIT THAT REUSES AN OUTPUT ALREADY ON DISK MARKS IT USED, as a local
+// hit does: the entry came from the node, the bytes from a restored cache.
+func TestARemoteHitReusingALocalOutputMarksItUsed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, body := bytes.Repeat([]byte{2}, 32), []byte("restored bytes")
+	output := digest(body)
+	path := filepath.Join(dir, output[:2], output+"-d")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-6 * 24 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeNode{objects: map[string][]byte{
+		"ac/" + hex.EncodeToString(action): entry{output: output, size: int64(len(body)), at: time.Unix(1, 0)}.encode(),
+	}}
+	node := httptest.NewServer(fake)
+	t.Cleanup(node.Close)
+
+	answers := exchange(t, Config{Dir: dir, Endpoint: node.URL, Token: "token"},
+		request{ID: 1, Command: "get", ActionID: action}, request{ID: 2, Command: "close"})
+	if answers[0].Miss || answers[0].DiskPath != path {
+		t.Fatalf("the remote hit answered %+v, want the output already on disk", answers[0])
+	}
+	if fake.casHits.Load() != 0 {
+		t.Errorf("the node was asked for bytes already on disk %d times", fake.casHits.Load())
+	}
+	if info, err := os.Stat(path); err != nil || time.Since(info.ModTime()) > time.Hour {
+		t.Errorf("the reused output still reads as unused: %v", err)
+	}
+}
+
+// A HIT ON A FILE USED WITHIN THE HOUR LEAVES ITS TIME ALONE, as the go
+// command's markUsed does, so a busy build is not a write per object.
+func TestAHitOnARecentlyUsedFileLeavesItsTime(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	action, body := bytes.Repeat([]byte{1}, 32), []byte("a fresh object")
+	sum := sha256.Sum256(body)
+	exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "put", ActionID: action, OutputID: sum[:], BodySize: int64(len(body))}, body,
+		request{ID: 2, Command: "close"})
+
+	o := hex.EncodeToString(sum[:])
+	path := filepath.Join(dir, o[:2], o+"-d")
+	recent := time.Now().Add(-30 * time.Minute).Truncate(time.Second)
+	if err := os.Chtimes(path, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	answers := exchange(t, Config{Dir: dir},
+		request{ID: 1, Command: "get", ActionID: action}, request{ID: 2, Command: "close"})
+	if answers[0].Miss {
+		t.Fatalf("the object was a miss: %+v", answers[0])
+	}
+	if info, err := os.Stat(path); err != nil || !info.ModTime().Equal(recent) {
+		t.Errorf("a file used within the hour had its time rewritten: %v", err)
 	}
 }

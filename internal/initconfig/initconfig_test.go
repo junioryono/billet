@@ -309,6 +309,28 @@ func firecrackerParams() Params {
 		Provider: config.ProviderFirecracker,
 		VCPU:     8,
 		Memory:   16 * config.GiB,
+		GOARCH:   "amd64",
+	}
+}
+
+// AN ARM64 HOST'S TIERS NAME AN ARM64 IMAGE, an image of its own, since one image
+// holds one architecture (ADR-022); every other machine keeps the x64 one.
+func TestGenerateNamesTheImageOfTheHostsArchitecture(t *testing.T) {
+	t.Parallel()
+
+	for goarch, want := range map[string]string{
+		"arm64": DefaultFirecrackerARM64Image,
+		"amd64": DefaultFirecrackerImage,
+	} {
+		p := firecrackerParams()
+		p.GOARCH = goarch
+
+		cfg := parse(t, mustGenerate(t, p))
+		for i := range cfg.Tiers {
+			if got := cfg.Tiers[i].Image; got != want {
+				t.Errorf("%s: tier %q names %q, want %q", goarch, cfg.Tiers[i].Label, got, want)
+			}
+		}
 	}
 }
 
@@ -453,7 +475,9 @@ func mustGenerate(t *testing.T, p Params) string {
 
 func ec2Shapes() []config.EC2InstanceType {
 	return []config.EC2InstanceType{
-		{Type: "c7i.xlarge", VCPU: 4, Memory: 8 * config.GiB, PriceUSDPerHour: 170000},
+		// ONE DECLARED WITH ITS ARCHITECTURE, as init writes one it read, and one
+		// without, as an older file has.
+		{Type: "c7i.xlarge", VCPU: 4, Memory: 8 * config.GiB, PriceUSDPerHour: 170000, Arch: config.ArchX64},
 		{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB, PriceUSDPerHour: 340000},
 	}
 }
@@ -551,8 +575,11 @@ func TestGenerateEC2UntrustedLoads(t *testing.T) {
 		t.Fatalf("shapes = %+v", cfg.Node.EC2.InstanceTypes)
 	}
 	if got := cfg.Node.EC2.InstanceTypes[0]; got.Type != "c7i.xlarge" || got.VCPU != 4 ||
-		got.Memory != 8*config.GiB || got.PriceUSDPerHour != 170000 {
+		got.Memory != 8*config.GiB || got.PriceUSDPerHour != 170000 || got.Arch != config.ArchX64 {
 		t.Errorf("shape[0] = %+v", got)
+	}
+	if got := cfg.Node.EC2.InstanceTypes[1].Arch; got != "" {
+		t.Errorf("a shape declared without an architecture loaded as %q", got)
 	}
 	if len(cfg.Node.EC2.UntrustedSecurityGroupIDs) != 1 {
 		t.Errorf("untrusted groups = %v", cfg.Node.EC2.UntrustedSecurityGroupIDs)

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"strconv"
@@ -38,6 +39,10 @@ type VerifySpec struct {
 	// Name prefixes the verifier instance's Name tag. Empty takes the image id,
 	// which is what a standalone verification has.
 	Name string
+	// Components, when set, is what the image's build reported installing, and the
+	// image must record exactly that. Nil is a standalone verification, which
+	// stamps what the image records.
+	Components *string
 }
 
 // defaultVerifierType is the shape a verification runs on when nobody says.
@@ -196,15 +201,58 @@ func (p *Provider) VerifyImage(ctx context.Context, spec VerifySpec) error {
 	}
 
 	if verdict := report[reportVerdictKey]; verdict != verdictOK {
+		// THE COMPONENTS ARE LEFT OUT: unlike the other fields, the record is not
+		// held to a vocabulary until checkRecordedComponents, which a failed
+		// verification never reaches.
+		shown := maps.Clone(report)
+		delete(shown, buildComponentsKey)
+
 		return fmt.Errorf("ec2: %s reported %s=%q at step %q, so it does not meet AMI contract "+
 			"%d and has NOT been stamped\n\n  %s", spec.Image, reportVerdictKey, verdict,
-			report[reportStepKey], contract, strings.Join(reportLines(report), "\n  "))
+			report[reportStepKey], contract, strings.Join(reportLines(shown), "\n  "))
+	}
+
+	components, err := checkRecordedComponents(report, contract, spec.Components)
+	if err != nil {
+		return fmt.Errorf("ec2: %s %w, so it has NOT been stamped", spec.Image, err)
 	}
 
 	p.log.Info("the image proved itself",
 		"image", spec.Image, "report", strings.Join(reportLines(report), " "))
 
-	return p.promoteContract(ctx, spec.Image, contract)
+	return p.promoteContract(ctx, spec.Image, contract, components)
+}
+
+// checkRecordedComponents is the components an image of this contract recorded,
+// held to what its build reported when that is known.
+//
+// THE NAMES ARE HELD TO WHAT BILLET INSTALLS, not to what was accepted: a
+// standalone verification has no acceptance to compare with, and the tag it
+// stamps is read back by `billet check`, which renders it.
+func checkRecordedComponents(report map[string]string, contract int, built *string) (string, error) {
+	if contract < 4 {
+		return "", nil
+	}
+
+	recorded, ok := report[buildComponentsKey]
+	if !ok {
+		return "", fmt.Errorf("reported no components record")
+	}
+
+	known := make([]string, 0, len(componentPaths))
+	for name := range componentPaths {
+		known = append(known, name)
+	}
+
+	if err := checkBuildComponents(recorded, known); err != nil {
+		return "", fmt.Errorf("records components billet cannot read: %w", err)
+	}
+
+	if built != nil && recorded != *built {
+		return "", fmt.Errorf("records the components %q and its build reported %q", recorded, *built)
+	}
+
+	return recorded, nil
 }
 
 // billetArch translates AWS's spelling of a processor into billet's.
@@ -580,8 +628,8 @@ const (
 // complete pair is what makes reading a truncated console safe, and it is also
 // why the verifier reprints rather than announcing once.
 func parseReport(console, nonce string, schema reportSchema) (map[string]string, bool) {
-	begin := reportBegin + " " + nonce
-	end := reportEnd + " " + nonce
+	begin := schema.begin + " " + nonce
+	end := schema.end + " " + nonce
 
 	last := strings.LastIndex(console, end)
 	if last < 0 {
@@ -614,6 +662,12 @@ func parseReport(console, nonce string, schema reportSchema) (map[string]string,
 		// cheap rejection rather than as the decision.
 		if !reportKey.MatchString(key) || !schema.allows(key, value) {
 			continue
+		}
+
+		// A KEY TWICE IS NO REPORT: billet wrote each once, so a second is a line
+		// the machine added, and which of the two is billet's cannot be told.
+		if _, twice := report[key]; twice {
+			return nil, false
 		}
 
 		report[key] = value
@@ -713,12 +767,14 @@ func reportLines(report map[string]string) []string {
 // only way to know the tag landed on the image billet meant is to ask — the same
 // rule the in-build anchor check follows, where an `update-ca-certificates` that
 // exits 0 having added nothing is exactly the failure that matters.
-func (p *Provider) promoteContract(ctx context.Context, image string, contract int) error {
+func (p *Provider) promoteContract(
+	ctx context.Context, image string, contract int, components string,
+) error {
 	params := url.Values{}
 	params.Set("Action", "CreateTags")
 	params.Set("ResourceId.1", image)
 
-	stampContract(params, contract)
+	stampContract(params, contract, components)
 
 	// ONLY THE API SAYING NO IS CONCLUSIVE, and "the api said no" means it named a
 	// CODE. Everything else — a dropped connection, a body that would not parse, a
@@ -741,7 +797,7 @@ func (p *Provider) promoteContract(ctx context.Context, image string, contract i
 		}
 	}
 
-	if err := p.confirmContract(ctx, image, contract); err != nil {
+	if err := p.confirmContract(ctx, image, contract, components); err != nil {
 		if tagErr != nil {
 			return fmt.Errorf("%w: %s passed verification and its CreateTags neither succeeded "+
 				"nor was refused (%v), and the tag is not readable back: %w",
@@ -770,7 +826,9 @@ func (p *Provider) promoteContract(ctx context.Context, image string, contract i
 // THE CACHE IS NOT THE ANSWER EITHER. imageLayout memoises a describe per image
 // id, and this needs the tag set as it is NOW rather than as it was before the
 // write.
-func (p *Provider) confirmContract(ctx context.Context, image string, contract int) error {
+func (p *Provider) confirmContract(
+	ctx context.Context, image string, contract int, components string,
+) error {
 	want := strconv.Itoa(contract)
 
 	var last error
@@ -795,14 +853,24 @@ func (p *Provider) confirmContract(ctx context.Context, image string, contract i
 		}
 
 		if len(out.Images) > 0 {
+			stamped, recorded := false, contract < 4
+
 			for _, tag := range out.Images[0].Tags {
-				if tag.Key == amiContractTag && tag.Value == want {
-					return nil
+				switch tag.Key {
+				case amiContractTag:
+					stamped = tag.Value == want
+				case amiComponentsTag:
+					recorded = recorded || tag.Value == components
 				}
+			}
+
+			if stamped && recorded {
+				return nil
 			}
 		}
 
-		last = fmt.Errorf("the image does not carry %s=%s", amiContractTag, want)
+		last = fmt.Errorf("the image does not carry %s=%s with %s=%q", amiContractTag, want,
+			amiComponentsTag, components)
 	}
 
 	return last
@@ -819,7 +887,15 @@ const (
 // Separate from promoteContract for the same reason stampImage is separate from
 // createImage: what this tag says is the whole basis of the contract check, and a
 // test that could only observe it through a fake client would be testing the fake.
-func stampContract(params url.Values, contract int) {
+//
+// THE COMPONENTS TRAVEL IN THE SAME REQUEST from contract 4, so an image never
+// carries the contract without the record of what it was completed with.
+func stampContract(params url.Values, contract int, components string) {
 	params.Set("Tag.1.Key", amiContractTag)
 	params.Set("Tag.1.Value", strconv.Itoa(contract))
+
+	if contract >= 4 {
+		params.Set("Tag.2.Key", amiComponentsTag)
+		params.Set("Tag.2.Value", components)
+	}
 }

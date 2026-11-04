@@ -1,6 +1,7 @@
 package ec2
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,69 +40,63 @@ const (
 	// testRunnerDigest is the runner tarball's digest a test spec carries; the
 	// tests that execute the check compute a real one instead.
 	testRunnerDigest = "2222222222222222222222222222222222222222222222222222222222222222"
+	// testPayloadBucket is the bucket a test build stages into, on the fake.
+	testPayloadBucket = "billet-payload-test"
+	// testLayer stands in for the EC2 layer where a test stages a payload.
+	testLayer = "#!/bin/sh\nexit 0\n"
 )
 
-func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
+// THE LAYER IS WHAT MAKES GITHUB'S IMAGE A BILLET RUNNER, and nothing else: the
+// runner billet pins, the entry point and its helpers, and the checks that prove
+// them. Packages are GitHub's template's, so the layer installs none, and the
+// builder powers off only after build-ami.sh has cleaned the image and announced
+// its verdict, so the layer never does.
+func TestTheLayerContainsWhatAnImageNeeds(t *testing.T) {
 	t.Parallel()
 
 	got := mustScript(t)
 
-	// DELIVERABLE, NOT PLAIN. This asserted `len(got) <= maxUserData`, which was
-	// right while the script was always sent as plain text and is wrong now: past
-	// the plain budget it is gzipped, which cloud-init documents and expects, so
-	// the plain assertion would fail on a CORRECT build the moment parity pushes
-	// the script over 16 KiB. What has to hold is that it can be carried at all.
-	if _, err := packUserData(got); err != nil {
-		t.Fatalf("the provisioning script cannot be delivered as user data: %v", err)
+	// STILL NOT installdependencies.sh: it runs its own apt-get update and install
+	// for a set it chooses, a second unversioned source of packages beside GitHub's
+	// template.
+	if strings.Contains(got, "installdependencies.sh") {
+		t.Error("the layer calls installdependencies.sh, which installs a package set of " +
+			"its own choosing beside GitHub's template")
 	}
 
-	// STILL NOT installdependencies.sh, and the reason changed with the base image.
-	//
-	// On Amazon Linux it could not be used at all: it read /etc/os-release, found
-	// ID_LIKE="fedora", and exited non-zero, ending the build under set -e -- found
-	// by a real build. On Ubuntu it works, and is still refused: it runs its own
-	// apt-get update and install for a set it chooses, which would sit beside the
-	// pinned declaration as a second unversioned source of packages for one image.
-	if strings.Contains(mustScript(t), "installdependencies.sh") {
-		t.Error("the script calls installdependencies.sh, which installs a package set of " +
-			"its own choosing beside the pinned declaration -- two sources of truth for " +
-			"what one image contains")
+	for _, unwanted := range []struct {
+		fragment string
+		why      string
+	}{
+		{"apt-get", "GitHub's template installs the image's packages; a second apt transaction is a second source"},
+		{"poweroff", "build-ami.sh powers the builder off after the verdict; a poweroff here images an uncleaned disk"},
+		{"/etc/docker/daemon.json <<", "the docker-daemon difference writes it before the template starts dockerd"},
+	} {
+		if strings.Contains(got, unwanted.fragment) {
+			t.Errorf("the layer carries %q — %s", unwanted.fragment, unwanted.why)
+		}
 	}
 
 	for _, want := range []struct {
 		fragment string
 		why      string
 	}{
-		{"set -eux", "without -e a failed step is followed by poweroff, and billet images it"},
-		{"apt-get -o DPkg::Lock::Timeout=600 update", "cloud-init can still hold the dpkg lock when this runs"},
-		{"docker.io", "workflows use service containers and docker build"},
-		{"docker-compose-v2", "Compose comes from the archive rather than a hand-pinned binary"},
-		{"docker-buildx", "so does Buildx"},
-		{"docker buildx version", "the image build must execute the packaged Buildx plugin"},
-		{"docker compose version", "the image build must execute the Compose plugin"},
-		{"gh --version", "GitHub's image carries the GitHub CLI and its declaration does not name it, " +
-			"so nothing else puts it on this one"},
-		{`"containerd-snapshotter": false`, "pulled images must stay inside the cache-backed Docker data root"},
-		{`"storage-driver": "overlay2"`, "the Docker cache snapshots the classic image store atomically"},
-		{"e2fsprogs", "the transparent Docker cache formats and verifies ext4"},
-		{"util-linux", "and mounts it"},
-		{"openssh-client", "one of github's declared packages, absent from any hand-written list"},
-		{"shellcheck", "another, and neither is anything billet itself needs"},
-		{"git", "actions/checkout wants it"},
-		{"tar", "actions/setup-* unpack what they download"},
+		{"set -eux", "without -e a failed step runs on, and the build announces success"},
+		{"export HOME=/root", "a system unit gives its service no HOME"},
+		{"docker buildx version", "the cache's own actions drive Buildx"},
+		{"docker compose version", "and Compose"},
 		{"useradd", "the runner refuses to run as root, and untrusted jobs must not"},
 		{"usermod -aG docker runner", "the runner user has to reach the daemon"},
 		{"actions-runner-linux-x64-2.328.0.tar.gz", "the release being installed"},
-		{"libicu74", "the runner is a .NET app and dies on globalization without ICU"},
 		{"/usr/local/bin/billet-runner", "the entry point a tier names in command:"},
 		{jitEnvVar, "the one variable billet's boot script exports"},
 		{"Runner.Listener --version", "an arch mismatch is otherwise invisible until a job"},
 		{privilegeDrop + " /opt/actions-runner/bin/Runner.Listener --version" + runnerEnvStream, "the check has to take the path a job takes with a clean environment"},
 		{"cat > " + execEnvPath + " <<'BILLETEXECENVEOF'\n", "the entry point launches the runner through it"},
-		{"poweroff", "the only signal that provisioning succeeded"},
+		{`.features["containerd-snapshotter"] == false`, "the image the template left must keep the classic store"},
 	} {
 		if !strings.Contains(got, want.fragment) {
-			t.Errorf("the script is missing %q — %s", want.fragment, want.why)
+			t.Errorf("the layer is missing %q — %s", want.fragment, want.why)
 		}
 	}
 }
@@ -108,7 +104,7 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 func TestTheArm64ProvisionScriptCarriesTheMatchingRunner(t *testing.T) {
 	t.Parallel()
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	script, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -150,16 +146,17 @@ func TestTheCloudRunnerNeverInheritsTheReadinessCapability(t *testing.T) {
 	}
 }
 
-// POWEROFF IS LAST, and that is the entire success protocol.
+// THE RUNNER IS PROVED THROUGH THE ENTRY POINT'S OWN PRIVILEGE DROP, and the
+// layer leaves the success signal to build-ami.sh.
 //
-// billet learns that provisioning worked by seeing the instance stop ITSELF. If
-// anything ran after the poweroff, or if the script could reach it without having
-// installed the runner, billet would image a machine that is not a runner image
-// and the failure would surface as queued jobs on somebody's repository.
-func TestNothingRunsAfterTheSuccessSignal(t *testing.T) {
+// billet learns that a build worked from its verdict, which build-ami.sh prints
+// after this layer, so a runner that cannot execute has to stop the layer: an
+// arm64 tarball extracts happily on x64, and without the check billet would image
+// a machine that registers nothing.
+func TestTheLayerProvesTheRunnerThroughTheEntryPointsDrop(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	got, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -213,22 +210,15 @@ func TestNothingRunsAfterTheSuccessSignal(t *testing.T) {
 			"image lacking setpriv would build successfully and fail every job")
 	}
 
-	versionCheck := strings.Index(got, "Runner.Listener --version")
-	power := strings.LastIndex(got, "poweroff")
-
-	if versionCheck < 0 || versionCheck > power {
-		t.Error("the runner is not executed before the success signal, so an architecture " +
-			"mismatch would produce a registered image that cannot run a job")
+	if !slices.Contains(lines, privilegeDrop[strings.LastIndex(privilegeDrop, "\n")+1:]+
+		" /opt/actions-runner/bin/Runner.Listener --version 3<<BILLETENVEOF") {
+		t.Error("the runner is not executed on a line of its own, so an architecture mismatch " +
+			"would produce a registered image that cannot run a job")
 	}
 
-	if last := lines[len(lines)-1]; last != "poweroff" {
-		t.Errorf("the script ends with %q, not poweroff: billet would wait for a stop that "+
-			"never comes, or image a machine that stopped for another reason", last)
-	}
-
-	if n := strings.Count(got, "poweroff"); n != 1 {
-		t.Errorf("poweroff appears %d times; a second one earlier would end the build before "+
-			"the runner was installed", n)
+	if strings.Contains(got, "poweroff") {
+		t.Error("the layer powers the builder off, before build-ami.sh has cleaned the image " +
+			"or announced its verdict")
 	}
 }
 
@@ -250,7 +240,7 @@ func TestTheRunnerArchitectureIsRefusedUnlessItIsOneAWSHas(t *testing.T) {
 		t.Run(tc.arch, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: tc.arch})
+			got, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: tc.arch})
 
 			if tc.wantErr {
 				if err == nil {
@@ -285,7 +275,7 @@ func TestAProvisionScriptNeedsARunnerVersion(t *testing.T) {
 
 	// THE DIGEST IS SUPPLIED, so the version is the one thing missing and the
 	// refusal has to be the version's: every other field would refuse on its own.
-	_, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	_, err := layerScript(BuildSpec{
 		RunnerSHA256: testRunnerDigest, Arch: "x64"})
 	if err == nil {
 		t.Fatal("a build with no runner version was accepted")
@@ -307,7 +297,7 @@ func TestAProvisionScriptNeedsARunnerVersion(t *testing.T) {
 func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"})
+	got, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -439,57 +429,11 @@ func TestTheJobStartHookReportsColdStartPhasesWithoutFailingTheJob(t *testing.T)
 	}
 }
 
-// mustScript builds the ordinary script or fails the test.
-// THE GITHUB CLI IS INSTALLED, AND A BUILD WHOSE gh DOES NOT RUN STOPS.
-//
-// The package is a whole name in the one apt transaction (a substring test would
-// be vacuous: "gh" is inside "github"), and `gh --version` is a line of its own
-// after it and before the success signal, in a script under `set -e`, so a
-// missing or broken gh ends the build rather than a workflow. As an exact line,
-// because `# gh --version` and `gh --version || true` both contain the text and
-// neither stops anything.
-func TestTheBuilderInstallsTheGitHubCLI(t *testing.T) {
-	t.Parallel()
-
-	lines := strings.Split(mustScript(t), "\n")
-
-	if len(lines) < 2 || lines[0] != "#!/bin/sh" || !strings.HasPrefix(lines[1], "set -e") {
-		t.Fatalf("the script does not begin under `set -e` (%q), so no check in it stops a build", lines[:min(2, len(lines))])
-	}
-
-	install, check, power := -1, -1, -1
-
-	for i, line := range lines {
-		switch {
-		case line == "apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \\" && i+1 < len(lines):
-			install = i
-
-			if !slices.Contains(strings.Fields(lines[i+1]), "gh") {
-				t.Errorf("the apt transaction installs %q, without gh; GitHub's image carries the GitHub "+
-					"CLI and its declaration does not name it, so nothing else puts it on this one", lines[i+1])
-			}
-		case line == "gh --version":
-			check = i
-		case line == "poweroff":
-			power = i
-		}
-	}
-
-	if install < 0 {
-		t.Fatal("the script has no apt install command, so this test is reading the wrong script")
-	}
-
-	if check < 0 || check < install || check > power {
-		t.Errorf("`gh --version` is line %d, the install line %d and poweroff line %d; it has to run on its "+
-			"own after the install and before the success signal, or a build without a working gh succeeds",
-			check, install, power)
-	}
-}
-
+// mustScript builds the ordinary layer or fails the test.
 func mustScript(t *testing.T) string {
 	t.Helper()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"})
+	got, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -523,8 +467,111 @@ type buildFake struct {
 	// consoleNoise goes in front of the report, standing in for a boot log.
 	consoleNoise string
 	// promoted records the contract value CreateTags wrote, so a later
-	// DescribeImages answers as a real one would.
-	promoted string
+	// DescribeImages answers as a real one would, and promotedComponents the
+	// components tag beside it.
+	promoted           string
+	promotedComponents *string
+
+	// The build half. The builder runs until billet has read its verdict, which
+	// carries the nonce out of the payload the build staged, as a real one does.
+	// buildVerdict is "ok" unless set; buildStep and buildTemplateStep are what a
+	// failure names; builtComponents is what the build reports installing, and
+	// what the verifier's record says unless recordedComponents is set.
+	server             *fakeEC2
+	buildVerdict       string
+	buildStep          string
+	buildTemplateStep  string
+	builtComponents    string
+	recordedComponents *string
+	// verdictRead is set once billet has been served the builder's verdict; the
+	// builder stops only after it, unless stopsUnread makes it stop before.
+	verdictRead bool
+	stopsUnread bool
+	// omitBuildComponents leaves the components line out of the verdict.
+	omitBuildComponents bool
+	// builderStopped is whether the builder was last reported stopped; the fake
+	// refuses CreateImage otherwise, as an image of a running builder is no build.
+	builderStopped bool
+	// dwellPolls is how many more polls the builder runs after its verdict was
+	// read, as the dwell keeps it up; damagedRepeats breaks every repeat of the
+	// verdict after the first, as a kernel line interleaved into it would.
+	dwellPolls     int
+	damagedRepeats bool
+	// buildSilent has the builder print nothing billet reads, and run on.
+	buildSilent bool
+	// failsAfterSuccess has every read after the success say the bootstrap failed,
+	// as a builder rebooted during its dwell would.
+	failsAfterSuccess bool
+	// describeReads is how the builder's first DescribeInstances are answered, one
+	// letter a call: R refuses it. Every call after them answers as usual.
+	describeReads string
+	// consoleReads is how the builder's first console reads are answered, one
+	// letter a read: R refuses it, Q answers with nothing printed yet. Every read
+	// after them sees the verdict.
+	consoleReads string
+}
+
+// serve wires the fake to its server, which holds the payload the build staged,
+// and returns the reply function.
+func (b *buildFake) serve(f *fakeEC2) func(string, url.Values) (int, string) {
+	b.server = f
+
+	return b.reply
+}
+
+// buildNonce is the nonce in the payload the build staged, or "" before it has.
+func (b *buildFake) buildNonce() string {
+	if b.server == nil {
+		return ""
+	}
+
+	b.server.mu.Lock()
+	defer b.server.mu.Unlock()
+
+	if len(b.server.staged) == 0 {
+		return ""
+	}
+
+	m := regexp.MustCompile(`BILLET_AMI_NONCE=([0-9a-f]{32})`).FindSubmatch(
+		payloadMember(b.server.staged[len(b.server.staged)-1], amiBuildEnv))
+	if m == nil {
+		return ""
+	}
+
+	return string(m[1])
+}
+
+// buildConsole is what the builder is pretending to have printed.
+func (b *buildFake) buildConsole() string {
+	nonce := b.buildNonce()
+	if nonce == "" || b.buildSilent {
+		return ""
+	}
+
+	verdict, step := b.buildVerdict, b.buildStep
+	if verdict == "" {
+		verdict, step = verdictOK, "done"
+	}
+
+	if b.failsAfterSuccess && b.verdictRead {
+		verdict, step = verdictFail, bootstrapStep
+	}
+
+	body := "[ 12.3] cloud-init: a boot log\n" +
+		buildBegin + " " + nonce + "\n" +
+		reportVerdictKey + "=" + verdict + "\n" +
+		reportStepKey + "=" + step + "\n" +
+		buildTemplateStepKey + "=" + b.buildTemplateStep + "\n"
+
+	if !b.omitBuildComponents && (!b.damagedRepeats || !b.verdictRead) {
+		body += buildComponentsKey + "=" + b.builtComponents + "\n"
+	}
+
+	body += buildEnd + " " + nonce + "\n"
+
+	b.verdictRead = true
+
+	return base64.StdEncoding.EncodeToString([]byte(body))
 }
 
 func (b *buildFake) reply(action string, params url.Values) (int, string) {
@@ -557,8 +604,16 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 
 		tags := ""
 		if b.promoted != "" {
-			tags = `<tagSet><item><key>` + amiContractTag + `</key><value>` +
-				b.promoted + `</value></item></tagSet>`
+			tags = `<item><key>` + amiContractTag + `</key><value>` + b.promoted + `</value></item>`
+		}
+
+		if b.promotedComponents != nil {
+			tags += `<item><key>` + amiComponentsTag + `</key><value>` +
+				*b.promotedComponents + `</value></item>`
+		}
+
+		if tags != "" {
+			tags = `<tagSet>` + tags + `</tagSet>`
 		}
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
@@ -591,6 +646,25 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 			`</item></instancesSet></RunInstancesResponse>`
 
 	case "GetConsoleOutput":
+		if params.Get("InstanceId") == "i-builder" && b.consoleReads != "" {
+			read := b.consoleReads[0]
+			b.consoleReads = b.consoleReads[1:]
+
+			if read == 'Q' {
+				return http.StatusOK, `<GetConsoleOutputResponse><instanceId>i-builder</instanceId>` +
+					`<output></output></GetConsoleOutputResponse>`
+			}
+
+			return http.StatusForbidden, `<Response><Errors><Error>` +
+				`<Code>UnauthorizedOperation</Code><Message>not now</Message>` +
+				`</Error></Errors></Response>`
+		}
+
+		if params.Get("InstanceId") == "i-builder" {
+			return http.StatusOK, `<GetConsoleOutputResponse><instanceId>i-builder</instanceId>` +
+				`<output>` + b.buildConsole() + `</output></GetConsoleOutputResponse>`
+		}
+
 		return http.StatusOK, `<GetConsoleOutputResponse><instanceId>i-verify</instanceId>` +
 			`<output>` + b.console() + `</output></GetConsoleOutputResponse>`
 
@@ -599,10 +673,23 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 			b.promoted = params.Get("Tag.1.Value")
 		}
 
+		if params.Get("Tag.2.Key") == amiComponentsTag {
+			v := params.Get("Tag.2.Value")
+			b.promotedComponents = &v
+		}
+
 		return http.StatusOK, `<CreateTagsResponse><return>true</return></CreateTagsResponse>`
 
 	case "DescribeInstances":
 		b.describes++
+
+		if params.Get("InstanceId.1") == "i-builder" && b.describeReads != "" {
+			b.describeReads = b.describeReads[1:]
+
+			return http.StatusForbidden, `<Response><Errors><Error>` +
+				`<Code>UnauthorizedOperation</Code><Message>not now</Message>` +
+				`</Error></Errors></Response>`
+		}
 
 		// NOT VISIBLE YET, ON THE FIRST ASK. This is the only bug in this PR that a
 		// real machine demonstrated: the first live build called DescribeInstances
@@ -627,6 +714,21 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 				`</item></instancesSet></item></reservationSet></DescribeInstancesResponse>`
 		}
 
+		// THE BUILDER RUNS UNTIL ITS VERDICT HAS BEEN READ, as a real one dwells
+		// on it before it powers off.
+		if b.verdictRead && b.dwellPolls > 0 {
+			b.dwellPolls--
+		}
+
+		b.builderStopped = (b.verdictRead && b.dwellPolls == 0) || b.stopsUnread
+
+		if !b.builderStopped {
+			return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item>` +
+				`<instancesSet><item><instanceId>i-builder</instanceId>` +
+				`<instanceState><name>running</name></instanceState>` +
+				`</item></instancesSet></item></reservationSet></DescribeInstancesResponse>`
+		}
+
 		return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item>` +
 			`<instancesSet><item><instanceId>i-builder</instanceId>` +
 			`<instanceState><name>stopped</name></instanceState>` +
@@ -634,6 +736,12 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 			`</item></instancesSet></item></reservationSet></DescribeInstancesResponse>`
 
 	case "CreateImage":
+		if !b.builderStopped {
+			return http.StatusBadRequest, `<Response><Errors><Error>` +
+				`<Code>IncorrectInstanceState</Code><Message>imaged before it stopped</Message>` +
+				`</Error></Errors></Response>`
+		}
+
 		return http.StatusOK, `<CreateImageResponse><imageId>ami-new</imageId></CreateImageResponse>`
 
 	default:
@@ -666,11 +774,11 @@ func TestOnlyAGuestInitiatedStopIsTreatedAsASuccessfulBuild(t *testing.T) {
 			b := &buildFake{stopReason: tc.reason, imageState: "available"}
 
 			f := newFakeEC2(t)
-			f.respond = b.reply
+			f.respond = b.serve(f)
 
 			p := newTestProvider(t, f, nil)
 
-			image, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+			image, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
@@ -713,11 +821,11 @@ func TestTheBuilderRestatesEveryDeviceTheBaseImageDeclares(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	if _, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
@@ -773,11 +881,11 @@ func TestABuilderThatIsNotVisibleYetIsNotTreatedAsGone(t *testing.T) {
 	}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	image, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	image, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	})
@@ -796,11 +904,11 @@ func TestAnImageThatFailsToBecomeAvailableIsNamedInTheError(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "failed"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	})
@@ -825,7 +933,7 @@ func TestAnImageThatFailsToBecomeAvailableIsNamedInTheError(t *testing.T) {
 func TestTheImageStoreIsProvenAgainstTheDaemonNotTheScript(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	got, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -838,11 +946,9 @@ func TestTheImageStoreIsProvenAgainstTheDaemonNotTheScript(t *testing.T) {
 			"provisioning-time commands from ones written into a file")
 	}
 
-	power := strings.LastIndex(got, "poweroff")
-	if power < lastHeredoc {
-		t.Fatal("poweroff precedes the last heredoc terminator, so the script has no " +
-			"provisioning-time tail for these assertions to live in")
-	}
+	// THE LAYER'S END, which build-ami.sh follows with the image's cleanup and the
+	// verdict.
+	power := len(got)
 
 	// THE TAIL, NOT THE WHOLE SCRIPT, and the difference is the whole point. Some
 	// of these strings also occur INSIDE the files this script writes: the embedded
@@ -870,7 +976,7 @@ func TestTheImageStoreIsProvenAgainstTheDaemonNotTheScript(t *testing.T) {
 			"nothing proves the data root is where the cache attaches its filesystem"},
 	} {
 		if !strings.Contains(tail, probe.needle) {
-			t.Errorf("%q does not run between the last heredoc and poweroff, so it is "+
+			t.Errorf("%q does not run after the last heredoc, so it is "+
 				"either absent or written into a file rather than executed while the "+
 				"image is built: %s", probe.needle, probe.why)
 		}
@@ -887,7 +993,7 @@ func TestTheImageStoreIsProvenAgainstTheDaemonNotTheScript(t *testing.T) {
 func TestTheDockerRootCheckResolvesBeforeComparing(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	got, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -1050,14 +1156,14 @@ func TestTheImageStoreAssertionsActuallyRefuse(t *testing.T) {
 		t.Skip("no realpath -m here; this runs on the Linux images the AMI targets")
 	}
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	script, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
 
 	lastHeredoc := strings.LastIndex(script, "BILLETEOF\n")
-	power := strings.LastIndex(script, "poweroff")
-	if lastHeredoc < 0 || power < lastHeredoc {
+	power := len(script)
+	if lastHeredoc < 0 {
 		t.Fatal("the script has no provisioning-time tail to execute")
 	}
 	// FROM THE DOCKER BLOCK, not from the heredoc terminator. The tail also
