@@ -3683,3 +3683,45 @@ func TestARecordThatCannotBeWrittenFirstStillReachesTheCleanup(t *testing.T) {
 		})
 	}
 }
+
+// A CLEANUP THAT FREED THE ROOM AND THEN FAILED STILL LETS THE RECORD BE WRITTEN: on a node whose file
+// names no tier, it is all the refresh has to try again from.
+func TestACleanupThatFailedStillKeepsWhatWasAsked(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+
+	stale := basePrefix + testOwner + "-" + hashName(verifiedRef) + "-90"
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", stale); err != nil {
+		t.Fatal(err)
+	}
+
+	p.deleteWindow = 100 * time.Millisecond
+
+	if err := os.WriteFile(s.deleteHangs, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	failed := false
+	p.installer.Rename = func(from, to string) error {
+		if !failed {
+			failed = true
+
+			return errors.New("no space left on device")
+		}
+
+		return os.Rename(from, to)
+	}
+
+	opts := verifyOpts()
+	opts.Command = []string{"./custom/run.sh"}
+
+	if _, err := p.Verify(t.Context(), opts); err == nil {
+		t.Fatal("verified past a cleanup that failed")
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || len(images) != 1 || !images[0].Wanted || !slices.Equal(images[0].Command, opts.Command) {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+}

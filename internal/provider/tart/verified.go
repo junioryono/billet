@@ -244,17 +244,17 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 	}
 
 	intentErr := keepIntent()
+	cleanErr := p.cleanVerification(ctx, key)
 
-	if err := p.cleanVerification(ctx, key); err != nil {
-		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+	// AGAIN AFTER THE CLEANUP, even one that did not finish, whose reason to exist can be why the
+	// first failed: a private store an interrupted pull left can fill the disk this record is
+	// written to.
+	if intentErr != nil {
+		intentErr = keepIntent()
 	}
 
-	// AGAIN AFTER THE CLEANUP, whose reason to exist can be why the first failed: a private store
-	// an interrupted pull left can fill the disk this record is written to.
-	if intentErr != nil {
-		if err := keepIntent(); err != nil {
-			return nil, fmt.Errorf("tart: verify %s: %w", key, err)
-		}
+	if err := errors.Join(intentErr, cleanErr); err != nil {
+		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
 	}
 
 	digest := opts.Digest
