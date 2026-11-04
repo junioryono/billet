@@ -252,8 +252,12 @@ func (p *Provider) discardUnrecordedBase(ctx context.Context, key, base string) 
 
 	err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
 		named = slices.ContainsFunc(st.recordsOf(key), func(r VerifiedRecord) bool { return r.Base == base })
+		if named {
+			return false, nil
+		}
 
-		return false, nil
+		// AN ABSENCE THAT AUTHORISES A DELETE MUST BE DURABLE, as in cleanVerification.
+		return false, p.installer.SyncDirectory(p.stateDir)
 	})
 	if err != nil {
 		p.log.Error("could not read the records to tell whether a base is named, so it is kept; the "+

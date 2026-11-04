@@ -2840,3 +2840,32 @@ func TestAPrivateStoreACrashLeftIsRemovedByTheNextVerification(t *testing.T) {
 		t.Fatalf("pulled a local VM: %v", lines)
 	}
 }
+
+// THE FAILURE PATH'S ABSENCE HAS TO LAST TOO: with the document's directory not synced, a crash
+// could bring back a record naming what this removed.
+func TestAFailedVerificationKeepsItsBaseOnAnAbsenceThatMayNotLast(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+
+	base := basePrefix + testOwner + "-" + hashName(verifiedRef) + "-90"
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", base); err != nil {
+		t.Fatal(err)
+	}
+
+	p.installer.SyncDir = func(string) error { return errors.New("the directory would not sync") }
+
+	p.discardUnrecordedBase(t.Context(), verifiedRef, base)
+
+	if _, err := os.Stat(p.vmDir(base)); err != nil {
+		t.Fatalf("the base went: %v", err)
+	}
+
+	p.installer.SyncDir = nil
+
+	p.discardUnrecordedBase(t.Context(), verifiedRef, base)
+
+	if _, err := os.Stat(p.vmDir(base)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the base stayed once the absence was durable: %v", err)
+	}
+}
