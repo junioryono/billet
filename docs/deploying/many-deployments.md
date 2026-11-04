@@ -76,7 +76,7 @@ server:
     enroll_addr: a.enroll.example.com:443
 ```
 
-With `tls_router` a loopback wire serves mutual TLS, which a loopback wire otherwise does not, and the certificate it presents names those two addresses. They are DNS names because a client sends no SNI for an IP address, so the router could not route it; each deployment's two listeners have a name each, because the node wire demands a client certificate in the handshake and enrollment cannot. `billet ca token` prints these addresses for a joining machine.
+With `tls_router` a loopback wire serves mutual TLS, which a loopback wire otherwise does not, and the certificate it presents names those two addresses. They are DNS names because a client sends no SNI for an IP address, so the router could not route it; each deployment's two listeners have a name each, because the node wire demands a client certificate in the handshake and enrollment cannot. `billet ca token` prints these addresses for a joining machine. A node on the same host dials the router like any other, with a certificate: a `node` block in this file takes `node_addr` as its `server_addr`, and any other address is refused.
 
 The router's rule is that **a connection with no SNI, or naming no deployment, is refused at the router, never sent to a default deployment.** A node of one deployment pointed at another's name reaches that deployment's handshake and is refused there, because the other's authority did not sign its certificate.
 

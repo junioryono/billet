@@ -78,9 +78,11 @@ func (c *Config) validateTLSRouter() []error {
 			errs = append(errs, err)
 		}
 
-		if router.EnrollAddr == router.NodeAddr {
-			errs = append(errs, errors.New("server.tls_router.enroll_addr and node_addr are the same, and a router "+
-				"tells the two listeners apart by name"))
+		// THE NAME, THE WAY A ROUTER READS IT: two spellings of one name are one route,
+		// and enrollment would reach the listener that demands a certificate.
+		if name := routerName(router.EnrollAddr); name != "" && name == routerName(router.NodeAddr) {
+			errs = append(errs, errors.New("server.tls_router.enroll_addr and node_addr name the same host, and a "+
+				"router tells the two listeners apart by name"))
 		}
 	}
 
@@ -121,10 +123,59 @@ func checkRouterAddr(key, addr string) error {
 
 	// A CLIENT SENDS NO SNI FOR AN IP ADDRESS (RFC 6066, and crypto/tls keeps to it),
 	// so that connection would be refused at the router with nothing here saying why.
-	if host == "" || net.ParseIP(host) != nil || !strings.Contains(host, ".") {
-		return fmt.Errorf("%s %q must name a DNS name: a client sends no SNI for an IP address or a bare "+
-			"host, so a router could not tell whose connection it was", key, addr)
+	if net.ParseIP(host) != nil {
+		return fmt.Errorf("%s %q must name a DNS name: a client sends no SNI for an IP address, so a router "+
+			"could not tell whose connection it was", key, addr)
+	}
+
+	// A CERTIFICATE HAS TO CARRY IT AND A ROUTER HAS TO MATCH IT, so a name either would
+	// read differently from the client is refused here rather than at a handshake. A
+	// single label is a name like any other: crypto/tls sends it.
+	if !validRouterName(host) {
+		return fmt.Errorf("%s %q must name a DNS name: letters, digits and hyphens in dot-separated labels, "+
+			"with no trailing dot", key, addr)
 	}
 
 	return nil
+}
+
+// validRouterName holds a host to the syntax of a DNS name, whose last label is not a
+// number: that spelling is an address to a resolver, whatever net.ParseIP makes of it.
+func validRouterName(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+
+	labels := strings.Split(host, ".")
+
+	for _, label := range labels {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+
+		for _, c := range label {
+			if !isRouterNameChar(c) {
+				return false
+			}
+		}
+	}
+
+	_, err := strconv.Atoi(labels[len(labels)-1])
+
+	return err != nil
+}
+
+func isRouterNameChar(c rune) bool {
+	return c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// routerName is an address's host as a router compares it: names are case-insensitive,
+// and a port does not tell a router's two routes apart.
+func routerName(addr string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return ""
+	}
+
+	return strings.ToLower(host)
 }

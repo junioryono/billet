@@ -91,6 +91,11 @@ def endpoint_of(cfg, where):
             server = _mapping(cfg["server"], where + ".server")
             listen = server.get("listen")
             addr = listen if listen not in (None, "") else DEFAULT_LISTEN
+            router = server.get("tls_router")
+            if router is not None:
+                routed = _mapping(router, where + ".server.tls_router").get("node_addr")
+                if routed not in (None, ""):
+                    addr = routed
         else:
             raise Refusal("%s.node names no server_addr and there is no server section to take one from" % where)
     if not isinstance(addr, str):

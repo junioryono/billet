@@ -71,6 +71,13 @@ def main():
     cases = [
         ("an explicit address equal to the derived default is no change",
          node(), node(addr="127.0.0.1:7717"), False),
+        ("a router's address is what an omitted server_addr derives",
+         {"server": {"listen": "127.0.0.1:7717", "tls_router": {"node_addr": "a.example.com:443"}}, "node": {"tls": {"cert": "c"}}},
+         {"server": {"listen": "127.0.0.1:7717", "tls_router": {"node_addr": "a.example.com:443"}},
+          "node": {"server_addr": "a.example.com:443", "tls": {"cert": "c"}}}, False),
+        ("a changed router address under two omitted server_addrs is a change",
+         {"server": {"listen": "127.0.0.1:7717", "tls_router": {"node_addr": "a.example.com:443"}}, "node": {"tls": {"cert": "c"}}},
+         {"server": {"listen": "127.0.0.1:7717", "tls_router": {"node_addr": "b.example.com:443"}}, "node": {"tls": {"cert": "c"}}}, True),
         ("a changed server.listen under two omitted server_addrs is a change",
          node(server_listen="127.0.0.1:7717"), node(server_listen="10.0.0.5:7717"), True),
         ("a changed server_addr is a change",

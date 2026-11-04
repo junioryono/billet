@@ -576,6 +576,16 @@ func testOnlyProviderError(where string, p ProviderKind) error {
 func (c *Config) validateNodeTLS() []error {
 	var errs []error
 
+	// A ROUTED WIRE IS REACHED BY ITS ROUTER'S NAME, from this host as from any other: it
+	// demands a certificate on loopback too, and presents one naming only the router's
+	// names, so any other address fails at the handshake in words that name no config key.
+	if c.Server != nil && c.Server.TLSRouter != nil &&
+		!strings.EqualFold(strings.TrimSpace(c.Node.ServerAddr), strings.TrimSpace(c.Server.TLSRouter.NodeAddr)) {
+		return append(errs, fmt.Errorf("node.server_addr is %q, which is not server.tls_router.node_addr %q: this "+
+			"control plane's certificate names the router's addresses, so a node dials the router, with node.tls",
+			c.Node.ServerAddr, c.Server.TLSRouter.NodeAddr))
+	}
+
 	if c.Node.TLS == nil {
 		if c.Node.ServerAddr != "" && !isLoopbackHostPort(c.Node.ServerAddr) {
 			errs = append(errs, fmt.Errorf(

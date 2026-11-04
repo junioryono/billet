@@ -399,6 +399,13 @@ func (c *Config) applyDefaults() {
 		}
 		if c.Node.ServerAddr == "" && c.Server != nil {
 			c.Node.ServerAddr = c.Server.Listen
+
+			// BEHIND A ROUTER THE WIRE IS REACHED BY NAME: the listen address serves a
+			// certificate that does not name it. The collection's endpoint_change module
+			// derives this too, and the two have to agree.
+			if c.Server.TLSRouter != nil && c.Server.TLSRouter.NodeAddr != "" {
+				c.Node.ServerAddr = c.Server.TLSRouter.NodeAddr
+			}
 		}
 
 		// A fleet entry for THIS host that omits its provider takes the local

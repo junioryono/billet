@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -319,7 +320,7 @@ func TestAConfigOnABrokerNamesNoKey(t *testing.T) {
 
 	for name, tc := range map[string]struct{ block, want string }{
 		"no url": {"  token_broker:\n    client_key_path: /etc/k\n", "url is required"},
-		"http": {"  token_broker:\n    url: http://broker\n    client_key_path: /etc/k\n", "must be https"},
+		"http":   {"  token_broker:\n    url: http://broker\n    client_key_path: /etc/k\n", "must be https"},
 		"credentials in the url": {
 			"  token_broker:\n    url: https://u:p@broker\n    client_key_path: /etc/k\n", "only a scheme and a host",
 		},
@@ -370,6 +371,11 @@ func TestATLSRouterMakesALoopbackWireServeTLS(t *testing.T) {
 		t.Errorf("its certificate would name %q", got)
 	}
 
+	// A SINGLE LABEL IS A NAME: crypto/tls sends it as SNI.
+	if _, err := loadServer(t, base("127.0.0.1:7717", "  tls_router:\n    node_addr: router:443\n")); err != nil {
+		t.Errorf("a single-label name: %v", err)
+	}
+
 	plain, err := loadServer(t, base("127.0.0.1:7717", ""))
 	if err != nil {
 		t.Fatalf("a loopback deployment: %v", err)
@@ -389,8 +395,13 @@ func TestATLSRouterMakesALoopbackWireServeTLS(t *testing.T) {
 		"an IP": {
 			"127.0.0.1:7717", "  tls_router:\n    node_addr: 10.0.0.1:443\n", "no SNI",
 		},
-		"a bare host": {"127.0.0.1:7717", "  tls_router:\n    node_addr: router:443\n", "no SNI"},
-		"no port":     {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com\n", "host:port"},
+		"an empty label":            {"127.0.0.1:7717", "  tls_router:\n    node_addr: a..example.com:443\n", "must name a DNS name"},
+		"a trailing dot":            {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com.:443\n", "must name a DNS name"},
+		"a leading hyphen":          {"127.0.0.1:7717", "  tls_router:\n    node_addr: -a.example.com:443\n", "must name a DNS name"},
+		"an underscore":             {"127.0.0.1:7717", "  tls_router:\n    node_addr: a_b.example.com:443\n", "must name a DNS name"},
+		"a number for a last label": {"127.0.0.1:7717", "  tls_router:\n    node_addr: 10.0.1:443\n", "must name a DNS name"},
+		"no host":                   {"127.0.0.1:7717", "  tls_router:\n    node_addr: :443\n", "must name a DNS name"},
+		"no port":                   {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com\n", "host:port"},
 		"enrollment with no name": {
 			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n  bootstrap_listen: 127.0.0.1:7718\n",
 			"enroll_addr is required",
@@ -401,6 +412,14 @@ func TestATLSRouterMakesALoopbackWireServeTLS(t *testing.T) {
 		},
 		"one name for both": {
 			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: a.example.com:443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"one name in two cases": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: A.Example.com:443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"one name on two ports": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: a.example.com:8443\n" +
 				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
 		},
 		"a wire off loopback": {"10.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n", "listens on loopback"},
@@ -418,18 +437,68 @@ func TestATLSRouterMakesALoopbackWireServeTLS(t *testing.T) {
 				t.Fatalf("got %v, want it to say %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// A NODE IN A ROUTED CONTROL PLANE'S FILE DIALS THE ROUTER, because the certificate
+// names only the router's names and the wire demands one: loopback plain HTTP reaches
+// nothing, and a certificate alone would fail on the address it dials.
+func TestANodeBesideARoutedControlPlaneDialsTheRouter(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"node.crt", "node.key", "ca.crt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tls := "  tls:\n    cert: " + filepath.Join(dir, "node.crt") + "\n    key: " + filepath.Join(dir, "node.key") +
+		"\n    ca: " + filepath.Join(dir, "ca.crt") + "\n"
+
+	body := func(node string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /tmp/key.pem\n" +
+			"server:\n  listen: 127.0.0.1:7717\n  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" +
+			"  tls_router:\n    node_addr: a.nodes.example.com:443\n" +
+			"node:\n  name: n\n  provider: docker\n  state_dir: /srv/billet-node\n" + node
+	}
+
+	cfg, err := loadServer(t, body(tls))
+	if err != nil {
+		t.Fatalf("a node with a certificate and no server_addr: %v", err)
+	}
+	if cfg.Node.ServerAddr != "a.nodes.example.com:443" {
+		t.Errorf("node.server_addr defaulted to %q, want the router's address", cfg.Node.ServerAddr)
+	}
+
+	if _, err := loadServer(t, body("  server_addr: A.Nodes.Example.com:443\n"+tls)); err != nil {
+		t.Errorf("another spelling of the router's address: %v", err)
+	}
+
+	for name, tc := range map[string]struct{ node, want string }{
+		"no certificate":                  {"", "node.tls is not set"},
+		"loopback with no certificate":    {"  server_addr: 127.0.0.1:7717\n", "is not server.tls_router.node_addr"},
+		"loopback with a certificate":     {"  server_addr: 127.0.0.1:7717\n" + tls, "is not server.tls_router.node_addr"},
+		"another name with a certificate": {"  server_addr: b.nodes.example.com:443\n" + tls, "is not server.tls_router.node_addr"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, body(tc.node)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // A BROKER BLOCK STOPS THE APP'S CREATION WHETHER OR NOT IT IS COMPLETE: a half-written
 // one still says this host is not to hold a key, and the spend cannot be taken back.
 func TestAnyBrokerBlockIsSeenBeforeAnAppIsCreated(t *testing.T) {
 	t.Parallel()
 
 	for body, want := range map[string]bool{
-		"server:\n  token_broker:\n    url: https://broker\n":          true,
-		"server:\n  token_broker:\n    client_key_path: /etc/k\n":      true,
-		"server:\n  token_broker: {}\n":                                true,
-		"server:\n  listen: 127.0.0.1:7717\n":                          false,
-		"github:\n  org: acme\n":                                       false,
-		"not yaml: [":                                                  false,
+		"server:\n  token_broker:\n    url: https://broker\n":     true,
+		"server:\n  token_broker:\n    client_key_path: /etc/k\n": true,
+		"server:\n  token_broker: {}\n":                           true,
+		"server:\n  listen: 127.0.0.1:7717\n":                     false,
+		"github:\n  org: acme\n":                                  false,
+		"not yaml: [":                                             false,
 	} {
 		if got := PeekTokenBroker([]byte(body)); got != want {
 			t.Errorf("PeekTokenBroker(%q) = %v, want %v", body, got, want)
