@@ -108,7 +108,7 @@ func TestAClosingLeaseTakesItsUsageNumberAndKeepsItsOwner(t *testing.T) {
 // beside a reader, which is the controller and an operator's force-destroy. A
 // reader paging past N relies on no lower number committing later. The writers'
 // own lock serializes these closes on both engines, so what this holds is the whole
-// path; state's TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits holds the
+// path; state's TestTheUsageCounterHoldsASecondTaker holds the
 // counter's lock on its own.
 func TestAReaderNeverSeesAUsageNumberBeforeALowerOne(t *testing.T) {
 	const closes = 40

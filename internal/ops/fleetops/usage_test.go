@@ -249,7 +249,10 @@ func TestAResumeRefusesACursorThisLedgerCannotHonour(t *testing.T) {
 func usageConfig(t *testing.T, weight config.MinuteWeight) *config.Config {
 	t.Helper()
 
-	return &config.Config{Tiers: []config.Tier{{Label: "weighted", VCPU: 8, MinuteWeight: weight}}}
+	return &config.Config{Tiers: []config.Tier{
+		{Label: "weighted", VCPU: 8, MinuteWeight: weight},
+		{Label: "plain", VCPU: 4},
+	}}
 }
 
 func knownUsageRow() *state.UsageRow {
@@ -385,6 +388,20 @@ func TestATiersWeightCountsItsMinutes(t *testing.T) {
 	if r.WeightSource != weightFromVCPU || r.MinuteWeight.String() != "2" {
 		t.Errorf("weight %v from %q, want 2 from the 4 vCPU the lease was charged, not the tier's 8",
 			r.MinuteWeight, r.WeightSource)
+	}
+}
+
+// A TIER THAT IS GONE MAY HAVE NAMED A WEIGHT, so the arithmetic stands in under a source
+// that says so rather than reading as a tier that named none.
+func TestATierNoLongerDeclaredSaysItsWeightIsAStandIn(t *testing.T) {
+	t.Parallel()
+
+	row := knownUsageRow()
+	row.Tier = "renamed-since"
+
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.WeightSource != weightFromVCPUTierGone || r.MinuteWeight == nil || r.MinuteWeight.String() != "2" {
+		t.Errorf("weight %v from %q, want 2 from %q", r.MinuteWeight, r.WeightSource, weightFromVCPUTierGone)
 	}
 }
 
@@ -533,6 +550,52 @@ func TestALeaseThatRanNoJobBillsAKnownZero(t *testing.T) {
 	}
 	if r.Held.Seconds == nil {
 		t.Error("the capacity the lease held is missing")
+	}
+}
+
+// A MISSING START PROVES NOTHING ABOUT A LEASE THAT ENDED BADLY. A JobStarted arrives
+// tens of seconds late, so a lease failed or disrupted before it arrived may have been
+// running a job, and a known zero would be a minute given away that GitHub can later
+// contradict.
+func TestALeaseThatEndedBadlyWithNoStartIsNotAKnownZero(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*state.UsageRow){
+		"failed":    func(r *state.UsageRow) { r.Conclusion = "failed" },
+		"a reason":  func(r *state.UsageRow) { r.FailureReason = "launch-failed" },
+		"disrupted": func(r *state.UsageRow) { r.Disruption = "node-lost" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			row := knownUsageRow()
+			row.StartedAt, row.ResultAt, row.Result = "", "", ""
+			mutate(row)
+
+			r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+			if r.BilledMinutes != nil {
+				t.Errorf("billed = %d, want unknown", *r.BilledMinutes)
+			}
+			if r.Unknown["billed_minutes"] == "" || r.WeightedMinutes != nil {
+				t.Errorf("weighted %v, unknown %v", r.WeightedMinutes, r.Unknown)
+			}
+		})
+	}
+}
+
+// THE RESULT IS UNKNOWN WHEREVER IT IS EMPTY, including beside a length GitHub's own times
+// gave: its write and theirs are separate, and one can fail.
+func TestAnEmptyResultIsAlwaysNamed(t *testing.T) {
+	t.Parallel()
+
+	row := knownUsageRow()
+	row.GitHubRunnerAssignedAt = "2026-11-04T09:48:27Z"
+	row.GitHubFinishedAt = "2026-11-04T09:52:30Z"
+	row.Result = ""
+
+	r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
+	if r.JobClock != jobClockGitHub || r.Unknown["result"] == "" {
+		t.Errorf("clock %q, unknown %v", r.JobClock, r.Unknown)
 	}
 }
 
@@ -698,7 +761,8 @@ func TestNoSchedulerReadsAMinuteWeight(t *testing.T) {
 			read++
 
 			// The field's declaration and validation, and the type's own file.
-			if pkg == "config" && (e.Name() == "tier.go" || e.Name() == "minuteweight.go") {
+			if pkg == "config" && (e.Name() == "tier.go" || e.Name() == "minuteweight.go" ||
+				e.Name() == "tiersizes.go") {
 				continue
 			}
 
@@ -746,19 +810,72 @@ func TestTheTextExportEndsWithTheCursor(t *testing.T) {
 // A LEDGER WITH NO IDENTITY IS REFUSED, and none is minted: records labelled with one
 // this command just made would be another deployment's history under a new name.
 func TestUsageNeverMintsAnIdentity(t *testing.T) {
+	for name, seeded := range map[string]bool{"beside a ledger": true, "on a host that never ran one": false} {
+		t.Run(name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			cfg := writeJobsConfig(t, stateDir)
+
+			if seeded {
+				seedLedger(t, stateDir)
+			}
+
+			env, _ := bufferedEnv()
+
+			err := Usage(t.Context(), env, []string{"export", "--config", cfg})
+			if err == nil || !strings.Contains(err.Error(), "holds no deployment identity") {
+				t.Fatalf("got %v, want a refusal naming the missing identity", err)
+			}
+
+			if _, found, err := state.PeekDeploymentID(stateDir); err != nil || found {
+				t.Fatalf("after the refusal the identity is found=%v, %v; the command minted one", found, err)
+			}
+
+			// NOR A LEDGER: a command that only reports creates nothing to report on.
+			if _, err := os.Stat(state.LedgerPath(stateDir)); !seeded && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("a refused export left a ledger behind: %v", err)
+			}
+		})
+	}
+}
+
+// A LATE RESULT FILLS A RECORD UNDER THE NUMBER IT HAD, so nothing past a reader's cursor
+// says so: the document tells a reader to read such a lease again, from an older cursor,
+// and that has to work and find the same place.
+func TestALateResultFillsARecordAReaderMustReadAgain(t *testing.T) {
 	stateDir := t.TempDir()
 	cfg := writeJobsConfig(t, stateDir)
-	seedLedger(t, stateDir)
 
-	env, _ := bufferedEnv()
+	finished := finishUsageLeases(t, stateDir, 1)
 
-	err := Usage(t.Context(), env, []string{"export", "--config", cfg})
-	if err == nil || !strings.Contains(err.Error(), "holds no deployment identity") {
-		t.Fatalf("got %v, want a refusal naming the missing identity", err)
+	first := exportUsage(t, cfg, "", "1")
+	if len(first) != 1 || first[0].Result != "" {
+		t.Fatalf("before the result the export read %+v", first)
 	}
 
-	if _, found, err := state.PeekDeploymentID(stateDir); err != nil || found {
-		t.Fatalf("after the refusal the identity is found=%v, %v; the command minted one", found, err)
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	if err := a.RecordJobResult(t.Context(), finished[0], "succeeded", 0); err != nil {
+		t.Fatalf("RecordJobResult: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the ledger: %v", err)
+	}
+
+	if past := exportUsage(t, cfg, first[0].Cursor, "1"); len(past) != 0 {
+		t.Fatalf("a reader past the lease was handed %+v; the record does not move", past)
+	}
+
+	again := exportUsage(t, cfg, "", "1")
+	if len(again) != 1 || again[0].Result != "succeeded" || again[0].Cursor != first[0].Cursor {
+		t.Fatalf("read again: %+v, want the result under the cursor it had, %s", again, first[0].Cursor)
 	}
 }
 

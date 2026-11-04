@@ -23,6 +23,9 @@ type UsageRow struct {
 	// GitHubRunnerAssignedAt and GitHubFinishedAt are on GitHub's clock. StartedAt and
 	// ResultAt are when billet received the messages saying so, which can be far later.
 	GitHubRunnerAssignedAt, GitHubFinishedAt string
+	// FailureReason and Disruption say whether the lease ended cleanly, which is what
+	// lets a missing start mean that no job ran.
+	FailureReason, Disruption string
 }
 
 // ErrNoUsageRecord means the ledger holds no finished lease at a sequence number.
@@ -51,6 +54,7 @@ func (db *DB) UsageSince(ctx context.Context, after int64, limit int) ([]UsageRo
 				BoughtAt: r.BoughtAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
 				Result: r.Result, ResultAt: r.ResultAt, Conclusion: r.Conclusion,
 				GitHubRunnerAssignedAt: r.GithubRunnerAssignedAt, GitHubFinishedAt: r.GithubFinishedAt,
+				FailureReason: r.FailureReason, Disruption: r.Disruption,
 			})
 		}
 

@@ -44,6 +44,8 @@ func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error
 			`ALTER TABLE job_history DROP COLUMN usage_seq`,
 			`ALTER TABLE job_history DROP COLUMN usage_mark`,
 			`ALTER TABLE job_history DROP COLUMN github_finished_at`,
+			`ALTER TABLE pending_completions DROP COLUMN job_runner_assigned_at`,
+			`ALTER TABLE pending_completions DROP COLUMN job_finished_at`,
 			`ALTER TABLE job_history DROP COLUMN github_target`,
 			`DELETE FROM schema_migrations WHERE version = 71`,
 			`INSERT INTO job_history (lease_id, tier, queued_at, finished_at) VALUES
@@ -82,6 +84,23 @@ func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error
 	waiting, err := db.UsageStillNumbering(ctx)
 	if err != nil || !waiting {
 		t.Fatalf("UsageStillNumbering = %v, %v; a finished lease is waiting", waiting, err)
+	}
+
+	// ONLY THE FINISHED ONE: a running lease numbered now would be exported with no end.
+	var listed []string
+
+	if err := db.View(ctx, func(q Querier) error {
+		var err error
+
+		listed, err = ReadQueries(q).ListUnnumberedUsage(ctx, 10)
+
+		return err
+	}); err != nil {
+		t.Fatalf("ListUnnumberedUsage: %v", err)
+	}
+
+	if len(listed) != 1 || listed[0] != "latest" {
+		t.Fatalf("waiting for a number: %v, want only the finished lease", listed)
 	}
 
 	var first int64
@@ -176,13 +195,14 @@ func TestTheUsageCounterHoldsASecondTaker(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			exerciseUsageCounterLock(t, tc.first, tc.second, tc.wantFirst, tc.wantSecond)
+			exerciseUsageCounterLock(t, name, tc.first, tc.second, tc.wantFirst, tc.wantSecond)
 		})
 	}
 }
 
 func exerciseUsageCounterLock(
-	t *testing.T, takeFirst, takeSecond func(context.Context, *sql.Tx) (int64, error), wantFirst, wantSecond int64,
+	t *testing.T, name string, takeFirst, takeSecond func(context.Context, *sql.Tx) (int64, error),
+	wantFirst, wantSecond int64,
 ) {
 	t.Helper()
 
@@ -232,6 +252,13 @@ func exerciseUsageCounterLock(
 
 	second := begin()
 
+	// NAMED, because the suite's schemas share one database: another subtest's waiter would
+	// otherwise satisfy this one's wait.
+	waiter := "usage-counter-" + name
+	if _, err := second.ExecContext(ctx, "SET LOCAL application_name = '"+waiter+"'"); err != nil {
+		t.Fatalf("name the second taker: %v", err)
+	}
+
 	type taken struct {
 		n   int64
 		err error
@@ -251,8 +278,8 @@ func exerciseUsageCounterLock(
 	for {
 		var waiting int
 		if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM pg_stat_activity
-			WHERE query LIKE '%INSERT INTO usage_sequence%' AND wait_event_type = 'Lock'
-			  AND datname = current_database() AND pid != pg_backend_pid()`).Scan(&waiting); err != nil {
+			WHERE application_name = $1 AND wait_event_type = 'Lock'
+			  AND datname = current_database()`, waiter).Scan(&waiting); err != nil {
 			t.Fatalf("read the server's locks: %v", err)
 		}
 

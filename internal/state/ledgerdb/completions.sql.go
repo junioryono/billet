@@ -69,28 +69,30 @@ func (q *Queries) DeleteRetiredCompletion(ctx context.Context, arg DeleteRetired
 const listPendingCompletions = `-- name: ListPendingCompletions :many
 SELECT tier, request_id, run_id, result, lease_id, lease_epoch, lease_node,
        outcome, release_only, message_id, retired, acknowledged, job_id, job_owner,
-       job_repository, job_workflow_ref, job_event
+       job_repository, job_workflow_ref, job_event, job_runner_assigned_at, job_finished_at
   FROM pending_completions WHERE tier = $1 ORDER BY request_id
 `
 
 type ListPendingCompletionsRow struct {
-	Tier           string
-	RequestID      int64
-	RunID          int64
-	Result         string
-	LeaseID        string
-	LeaseEpoch     int64
-	LeaseNode      string
-	Outcome        string
-	ReleaseOnly    int64
-	MessageID      int64
-	Retired        int64
-	Acknowledged   int64
-	JobID          string
-	JobOwner       string
-	JobRepository  string
-	JobWorkflowRef string
-	JobEvent       string
+	Tier                string
+	RequestID           int64
+	RunID               int64
+	Result              string
+	LeaseID             string
+	LeaseEpoch          int64
+	LeaseNode           string
+	Outcome             string
+	ReleaseOnly         int64
+	MessageID           int64
+	Retired             int64
+	Acknowledged        int64
+	JobID               string
+	JobOwner            string
+	JobRepository       string
+	JobWorkflowRef      string
+	JobEvent            string
+	JobRunnerAssignedAt string
+	JobFinishedAt       string
 }
 
 // One tier's outstanding obligations.
@@ -121,6 +123,8 @@ func (q *Queries) ListPendingCompletions(ctx context.Context, tier string) ([]Li
 			&i.JobRepository,
 			&i.JobWorkflowRef,
 			&i.JobEvent,
+			&i.JobRunnerAssignedAt,
+			&i.JobFinishedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -186,10 +190,11 @@ const upsertPendingCompletion = `-- name: UpsertPendingCompletion :exec
 INSERT INTO pending_completions
 	(tier, request_id, run_id, result, lease_id, lease_epoch, lease_node, outcome,
 	 release_only, message_id, retired, acknowledged, job_id, job_owner, job_repository,
-	 job_workflow_ref, job_event)
+	 job_workflow_ref, job_event, job_runner_assigned_at, job_finished_at)
 	VALUES ($1, $2, $3, $4, $5, $6, $7,
 	        $8, $9, $10, $11, $12, $13,
-	        $14, $15, $16, $17)
+	        $14, $15, $16, $17,
+	        $18, $19)
 	ON CONFLICT(tier, request_id) DO UPDATE SET
 		run_id=excluded.run_id,
 		result=excluded.result,
@@ -208,6 +213,12 @@ INSERT INTO pending_completions
 		job_event=CASE WHEN excluded.message_id = pending_completions.message_id
 			AND pending_completions.job_id != ''
 			THEN pending_completions.job_event ELSE excluded.job_event END,
+		job_runner_assigned_at=CASE WHEN excluded.message_id = pending_completions.message_id
+			AND pending_completions.job_id != ''
+			THEN pending_completions.job_runner_assigned_at ELSE excluded.job_runner_assigned_at END,
+		job_finished_at=CASE WHEN excluded.message_id = pending_completions.message_id
+			AND pending_completions.job_id != ''
+			THEN pending_completions.job_finished_at ELSE excluded.job_finished_at END,
 		lease_id=CASE WHEN excluded.message_id = pending_completions.message_id
 			AND (pending_completions.retired = 1 OR
 			     pending_completions.release_only > excluded.release_only)
@@ -244,23 +255,25 @@ INSERT INTO pending_completions
 `
 
 type UpsertPendingCompletionParams struct {
-	Tier           string
-	RequestID      int64
-	RunID          int64
-	Result         string
-	LeaseID        string
-	LeaseEpoch     int64
-	LeaseNode      string
-	Outcome        string
-	ReleaseOnly    int64
-	MessageID      int64
-	Retired        int64
-	Acknowledged   int64
-	JobID          string
-	JobOwner       string
-	JobRepository  string
-	JobWorkflowRef string
-	JobEvent       string
+	Tier                string
+	RequestID           int64
+	RunID               int64
+	Result              string
+	LeaseID             string
+	LeaseEpoch          int64
+	LeaseNode           string
+	Outcome             string
+	ReleaseOnly         int64
+	MessageID           int64
+	Retired             int64
+	Acknowledged        int64
+	JobID               string
+	JobOwner            string
+	JobRepository       string
+	JobWorkflowRef      string
+	JobEvent            string
+	JobRunnerAssignedAt string
+	JobFinishedAt       string
 }
 
 // Durably record a result-delivery obligation.
@@ -298,6 +311,8 @@ func (q *Queries) UpsertPendingCompletion(ctx context.Context, arg UpsertPending
 		arg.JobRepository,
 		arg.JobWorkflowRef,
 		arg.JobEvent,
+		arg.JobRunnerAssignedAt,
+		arg.JobFinishedAt,
 	)
 	return err
 }
