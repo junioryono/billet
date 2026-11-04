@@ -599,6 +599,36 @@ func TestARejoinThatReadsABlockShortPublishesNothing(t *testing.T) {
 	}
 }
 
+// A JOB CAN FINALIZE AS MANY SAVES AS IT RESERVED, AND EACH REJOIN HOLDS A PART IN MEMORY, so
+// past the bound a commit waits, and one whose client has gone stops waiting.
+func TestOnlySoManyRejoinsHoldAPart(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	for _, block := range []string{"a", "b"} {
+		stage(t, store, "up1", block, []byte(block))
+	}
+	for range rejoinsAtOnce {
+		store.rejoining <- struct{}{}
+	}
+	waited, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := store.CommitArchive(waited, "ns/key", "up1", []string{"a", "b"}, 2); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a commit past the bound = %v, want it to wait", err)
+	}
+	if len(bulk.uploads) != 0 {
+		t.Fatal("the commit that gave up left a multipart upload billing")
+	}
+
+	<-store.rejoining
+	published, err := store.CommitArchive(t.Context(), "ns/key", "up1", []string{"a", "b"}, 2)
+	if err != nil || !published {
+		t.Fatalf("a commit with a slot free = %v, %v", published, err)
+	}
+	if held := len(store.rejoining); held != rejoinsAtOnce-1 {
+		t.Fatalf("%d slots held after the rejoin finished", held)
+	}
+}
+
 func TestAFailedAssemblyAbortsItsUpload(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
 	store, bulk := archiveStore(&now)

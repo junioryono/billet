@@ -61,11 +61,11 @@ const (
 // constant before it changes it.
 var casFillDefault = casFullFraction
 
-// errCASBackoff is a transfer refused because its kind's attach failed within
-// casAttachBackoff; the failure itself was logged when it happened.
 // errCASObjectLarge is an object past the bound it was stored under.
 var errCASObjectLarge = errors.New("the object is larger than it may be")
 
+// errCASBackoff is a transfer refused because its kind's attach failed within
+// casAttachBackoff; the failure itself was logged when it happened.
 var errCASBackoff = errors.New("the cache could not be attached recently, so it is not tried again yet")
 
 // errCASNotMounted is a transfer refused because the session's volume of its kind
@@ -104,8 +104,11 @@ type hostVolume struct {
 	// index and reads are what the store held and what this session read of it.
 	index blobIndex
 	reads blobUses
-	// written bounds what one job adds to a store with no volume to fill.
-	written atomic.Int64
+	// written bounds what one job adds to a store with no volume to fill, and allowance
+	// is held while a stored object is installed and counted. Nothing is waited for
+	// under it, so it comes after every other lock here.
+	written   atomic.Int64
+	allowance sync.Mutex
 
 	// io is held for reading by every transfer and for writing by whatever
 	// unmounts the volume, so no transfer runs on a volume being taken away.
@@ -567,40 +570,54 @@ func (h *casHandle) Put(ctx context.Context, table reapi.Table, digest string, b
 
 // putWithinAllowance stores what a job wrote on a store of objects, whose directory is
 // on the node's own disk with nothing else to bound it, so the tier's size is the whole
-// of what the job may add: an object past what is left is refused rather than let in
-// and counted afterwards, and writes side by side settle up once each is stored.
+// of what the job may add. An object is read to one side, bounded by what is left when it
+// starts, then installed and counted together, so writes side by side cannot install past
+// the size, and a writer of one digest cannot take out what another was told it stored.
 func (h *casHandle) putWithinAllowance(
 	ctx context.Context, table reapi.Table, digest, path string, limit int64, body io.Reader,
 ) error {
-	var replacing int64
-	if info, err := os.Lstat(path); err == nil {
-		replacing = info.Size()
-	}
-	left := h.limit - h.hv.written.Load() + replacing
+	left := h.limit - h.hv.written.Load() + regularSize(path)
 	if left <= 0 {
 		return reapi.ErrFull
 	}
-	err := h.s.storeCASObject(ctx, body, path, string(table), digest, min(limit, left), h.root)
+	token, err := randomCacheToken()
+	if err != nil {
+		return err
+	}
+	// A DOTTED NAME IS NOTHING A READ, A LISTING OR AN UPLOAD WILL TAKE FOR AN ENTRY.
+	held := filepath.Join(filepath.Dir(path), ".held-"+token)
+	defer os.Remove(held)
+	err = h.s.storeCASObject(ctx, body, held, string(table), digest, min(limit, left), h.root)
 	if errors.Is(err, errCASObjectLarge) && left < limit {
 		return reapi.ErrFull
 	}
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("read back the stored object: %w", err)
-	}
-	if h.hv.written.Add(info.Size()-replacing) > h.limit {
-		h.hv.written.Add(-info.Size())
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("remove an object past the allowance: %w", err)
-		}
+	size := regularSize(held)
 
+	h.hv.allowance.Lock()
+	defer h.hv.allowance.Unlock()
+	replacing := regularSize(path)
+	if h.hv.written.Load()+size-replacing > h.limit {
 		return reapi.ErrFull
 	}
+	if err := os.Rename(held, path); err != nil {
+		return fmt.Errorf("install the stored object: %w", err)
+	}
+	h.hv.written.Add(size - replacing)
 
 	return nil
+}
+
+// regularSize is how large a file is, or nothing if it is not there to count.
+func regularSize(path string) int64 {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0
+	}
+
+	return info.Size()
 }
 
 // Size is how large a stored object is, which on a store of objects is known without

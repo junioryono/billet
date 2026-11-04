@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,8 +42,13 @@ type objectStore struct {
 	commitErr error
 	abortErr  error
 	putErr    error
-	// commitGate, when set, holds every commit until it is closed.
+	// commitGate, when set, holds every commit until it is closed, and commits counts them.
 	commitGate chan struct{}
+	commits    int
+	// putHold, when set, holds every PutBlob until it is closed or its context ends,
+	// saying so on putHeld.
+	putHold chan struct{}
+	putHeld chan struct{}
 	// putTogether, when set, holds each PutBlob until that many are in flight.
 	putTogether int
 	putArrived  chan struct{}
@@ -114,6 +121,7 @@ func (s *objectStore) CommitArchive(
 ) (bool, error) {
 	s.mu.Lock()
 	gate := s.commitGate
+	s.commits++
 	s.mu.Unlock()
 	if gate != nil {
 		<-gate
@@ -198,7 +206,7 @@ func (s *objectStore) ReadBlob(
 }
 
 func (s *objectStore) PutBlob(
-	_ context.Context, key string, ref storecontract.BlobRef, body io.Reader, size int64,
+	ctx context.Context, key string, ref storecontract.BlobRef, body io.Reader, size int64,
 ) error {
 	data, err := io.ReadAll(body)
 	if err != nil {
@@ -209,11 +217,19 @@ func (s *objectStore) PutBlob(
 		return errors.New("an entry's length was not what it declared")
 	}
 	s.mu.Lock()
-	together, arrived := s.putTogether, s.putArrived
+	together, arrived, hold, held := s.putTogether, s.putArrived, s.putHold, s.putHeld
 	s.mu.Unlock()
+	if hold != nil {
+		held <- struct{}{}
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if together > 0 {
 		arrived <- struct{}{}
-		guard := time.NewTimer(10 * time.Second)
+		guard := time.NewTimer(30 * time.Second)
 		defer guard.Stop()
 		for {
 			s.mu.Lock()
@@ -711,18 +727,16 @@ func TestACommitDoesNotHoldTheSession(t *testing.T) {
 	storage.commitGate = gate
 	storage.mu.Unlock()
 
-	finished := make(chan map[string]any, 1)
-	go func() {
-		finished <- actionsCall(t, service, session, actionsFinalizePath,
-			`{"key":"slow","version":"v1","size_bytes":"4"}`)
-	}()
+	var release sync.Once
+	open := func() { release.Do(func() { close(gate) }) }
+	defer open()
+	finished := finalizeInBackground(t, service, session, `{"key":"slow","version":"v1","size_bytes":"4"}`)
 
 	// HELD UNTIL THE RECEIPT IS DURABLE, then given up for the commit.
 	guard, stop := context.WithTimeout(t.Context(), 30*time.Second)
 	defer stop()
 	for {
 		if err := lockCacheSession(guard, session); err != nil {
-			close(gate)
 			t.Fatalf("the session stayed held through the commit: %v", err)
 		}
 		_, recorded := session.receipts[actionsReceiptID("slow", "v1")]
@@ -732,18 +746,165 @@ func TestACommitDoesNotHoldTheSession(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	waited, stopWait := context.WithTimeout(t.Context(), 2*time.Second)
+	waited, stopWait := context.WithTimeout(t.Context(), 5*time.Second)
 	defer stopWait()
-	err := lockCacheSession(waited, session)
-	if err == nil {
-		session.mu.Unlock()
-	}
-	close(gate)
-	if err != nil {
+	if err := lockCacheSession(waited, session); err != nil {
 		t.Fatalf("the session is held during the commit: %v", err)
 	}
-	if got := <-finished; got["ok"] != true {
+	session.mu.Unlock()
+	open()
+	if got := finished.wait(t); got["ok"] != true {
 		t.Fatalf("the finalization = %v", got)
+	}
+}
+
+// finalization is one finalization running beside a test.
+type finalization struct {
+	done chan struct{}
+	body map[string]any
+	err  error
+}
+
+// wait bounds waiting for the answer, so a hung commit is a failure and not a hung package.
+func (f *finalization) wait(t *testing.T) map[string]any {
+	t.Helper()
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	select {
+	case <-f.done:
+	case <-guard.C:
+		t.Fatal("the finalization did not answer")
+	}
+	if f.err != nil {
+		t.Fatalf("the finalization: %v", f.err)
+	}
+
+	return f.body
+}
+
+// finalizeInBackground runs a finalization off the test's goroutine, which is the only
+// one that may fail the test.
+func finalizeInBackground(t *testing.T, service *CacheService, session *cacheSession, body string) *finalization {
+	t.Helper()
+	request := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath, body)
+	running := &finalization{done: make(chan struct{})}
+	go func() {
+		defer close(running.done)
+		response, _, err := service.actionsResponse(request, session)
+		if err != nil {
+			running.err = err
+
+			return
+		}
+		defer response.Body.Close()
+		running.err = json.NewDecoder(response.Body).Decode(&running.body)
+	}()
+	t.Cleanup(func() {
+		guard := time.NewTimer(30 * time.Second)
+		defer guard.Stop()
+		select {
+		case <-running.done:
+		case <-guard.C:
+			t.Error("a finalization outlived its test")
+		}
+	})
+
+	return running
+}
+
+// THE FIRST TO LAND DELETES THE BLOCKS A SECOND IS ABOUT TO LIST, which would then report
+// nothing published over an answer that said it was. So a client's retry beside its own
+// finalization waits, and reads the first one's answer.
+func TestTwoFinalizationsOfOneSaveCommitOnce(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	session := objectActionsSession(t, service, "billet-actions")
+	stagedUpload(t, service, session, "twice", []string{"body"}, []string{"a"})
+	gate := make(chan struct{})
+	storage.mu.Lock()
+	storage.commitGate = gate
+	storage.mu.Unlock()
+	const body = `{"key":"twice","version":"v1","size_bytes":"4"}`
+	first := finalizeInBackground(t, service, session, body)
+
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	for {
+		storage.mu.Lock()
+		started := storage.commits
+		storage.mu.Unlock()
+		if started == 1 {
+			break
+		}
+		select {
+		case <-guard.C:
+			close(gate)
+			t.Fatal("the first commit never started")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	second := finalizeInBackground(t, service, session, body)
+	// TIME FOR THE SECOND TO REACH THE LOCK, which can only make this test weaker if it
+	// is not enough, never wrong.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+
+	if got := first.wait(t); got["ok"] != true {
+		t.Fatalf("the first finalization = %v", got)
+	}
+	if got := second.wait(t); got["ok"] != true {
+		t.Fatalf("the second finalization = %v", got)
+	}
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if storage.commits != 1 {
+		t.Fatalf("%d commits of one save", storage.commits)
+	}
+}
+
+// THE JOB'S END MAY LAND IN THE COMMIT: the session then has no record to raise, and the
+// client that is still waiting gets an answer rather than an error about the record.
+func TestASessionFinishedDuringACommitStillAnswers(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	session := objectActionsSession(t, service, "billet-actions")
+	stagedUpload(t, service, session, "late", []string{"body"}, []string{"a"})
+	gate := make(chan struct{})
+	storage.mu.Lock()
+	storage.commitGate = gate
+	storage.mu.Unlock()
+	finished := finalizeInBackground(t, service, session, `{"key":"late","version":"v1","size_bytes":"4"}`)
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	for {
+		storage.mu.Lock()
+		started := storage.commits
+		storage.mu.Unlock()
+		if started == 1 {
+			break
+		}
+		select {
+		case <-guard.C:
+			close(gate)
+			t.Fatal("the commit never started")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	closeAndRetry(t, service, "billet-actions")
+	if service.sessionOf("billet-actions") != nil {
+		close(gate)
+		t.Fatal("the session did not finish")
+	}
+	close(gate)
+	finished.wait(t)
+
+	records, err := os.ReadDir(service.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("a finished session's record came back: %v", records)
 	}
 }
 
@@ -1068,6 +1229,139 @@ func TestAFullDiskCostsNoRequest(t *testing.T) {
 	}
 }
 
+// A YES IS A PROMISE THE ENTRY CAN BE READ: a build told an action's output is there may
+// go on without it. So one this session could not read is not there, and a read that finds
+// one gone takes it out of the listing.
+func TestAnEntryIsOnlySaidToBeThereIfItCanBeRead(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, service *CacheService, storage *objectStore, handle *casHandle, digest string)
+	}{
+		{"past this session's limit", func(_ *testing.T, _ *CacheService, _ *objectStore, handle *casHandle, _ string) {
+			handle.limit = 1
+		}},
+		{"on a disk too full to fill the read cache", func(_ *testing.T, service *CacheService, _ *objectStore, _ *casHandle, _ string) {
+			service.casFill = -1
+		}},
+		{"a read found it gone", func(t *testing.T, _ *CacheService, storage *objectStore, handle *casHandle, digest string) {
+			t.Helper()
+			storage.mu.Lock()
+			clear(storage.blobs)
+			storage.mu.Unlock()
+			if _, err := handle.Open(reapi.TableCAS, digest); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Open of an entry gone = %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			service, storage, _ := objectService(t)
+			body := "published object"
+			token := objectCAS(t, service, scopedLease)
+			if code := putObject(t, service, token, body); code != http.StatusOK {
+				t.Fatalf("PUT = %d", code)
+			}
+			finish(t, service, provider.InstanceName(scopedLease))
+			if err := service.RetryClosed(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			objectCAS(t, service, "asker")
+			handle, err := service.openCASHandle(t.Context(), service.sessionOf(provider.InstanceName("asker")), config.CacheGo, false)
+			if err != nil {
+				t.Fatalf("openCASHandle: %v", err)
+			}
+			defer handle.Close()
+			if size, err := handle.Size(reapi.TableCAS, digestOf(body)); err != nil || size != int64(len(body)) {
+				t.Fatalf("before = %d, %v", size, err)
+			}
+			tc.make(t, service, storage, handle, digestOf(body))
+			if _, err := handle.Size(reapi.TableCAS, digestOf(body)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Size = %v, want it not there", err)
+			}
+		})
+	}
+}
+
+// AND ONE ALREADY IN THE READ CACHE NEEDS NOTHING FROM THE DISK.
+func TestAFullDiskDoesNotHideWhatTheReadCacheHolds(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	body := "published object"
+	token := objectCAS(t, service, scopedLease)
+	if code := putObject(t, service, token, body); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, provider.InstanceName(scopedLease))
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	reader := objectCAS(t, service, "reader")
+	if got := casRequest(t, service, reader, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), ""); got.Code != http.StatusOK {
+		t.Fatalf("GET = %d", got.Code)
+	}
+	service.casFill = -1
+	handle, err := service.openCASHandle(t.Context(), service.sessionOf(provider.InstanceName("reader")), config.CacheGo, false)
+	if err != nil {
+		t.Fatalf("openCASHandle: %v", err)
+	}
+	defer handle.Close()
+	if size, err := handle.Size(reapi.TableCAS, digestOf(body)); err != nil || size != int64(len(body)) {
+		t.Fatalf("Size = %d, %v", size, err)
+	}
+}
+
+// A JOB THAT ENDS WHILE ANOTHER UPLOADS STARTS THEN, not when the longest upload ahead of it
+// is done: its window is already counting.
+func TestASessionThatClosesDuringAPassIsTakenByIt(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	first := objectCAS(t, service, "first")
+	second := objectCAS(t, service, "second")
+	for _, token := range []string{first, second} {
+		if code := putObject(t, service, token, "from "+token); code != http.StatusOK {
+			t.Fatalf("PUT = %d", code)
+		}
+	}
+	storage.mu.Lock()
+	storage.putTogether, storage.putArrived = 2, make(chan struct{}, 2)
+	storage.mu.Unlock()
+	finish(t, service, provider.InstanceName("first"))
+	pass := make(chan error, 1)
+	go func() { pass <- service.RetryClosed(t.Context()) }()
+
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	for {
+		storage.mu.Lock()
+		arrived := len(storage.putArrived)
+		storage.mu.Unlock()
+		if arrived == 1 {
+			break
+		}
+		select {
+		case <-guard.C:
+			t.Fatal("the first upload never started")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	finish(t, service, provider.InstanceName("second"))
+
+	select {
+	case err := <-pass:
+		if err != nil {
+			t.Fatalf("RetryClosed: %v", err)
+		}
+	case <-guard.C:
+		t.Fatal("the pass did not finish")
+	}
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if len(storage.puts) != 2 {
+		t.Fatalf("uploaded %v", storage.puts)
+	}
+}
+
 // ONE JOB'S UPLOAD MUST NOT SPEND THE NEXT JOB'S WINDOW: a window counts from the job's
 // completion, whatever the sessions ahead of it are doing.
 func TestClosedSessionsUploadSideBySide(t *testing.T) {
@@ -1152,39 +1446,145 @@ func TestAPublicationIsAbandonedOnTheKillSwitchAndItsWindow(t *testing.T) {
 	}
 }
 
-// AN UPLOAD LASTS AS LONG AS THE JOB'S OUTPUT IS LARGE, and disabling a cache has to stop
-// one already running.
-func TestTheKillSwitchStopsAnUploadInProgress(t *testing.T) {
-	t.Parallel()
-	service, storage, _ := objectService(t)
-	policy := &ledgerPolicy{}
-	service.SetCachePolicy(policy)
+// uploadInProgress starts a publication whose one upload is held, and returns when it has
+// reached the store, so whatever the test does next happens during it.
+func uploadInProgress(t *testing.T, service *CacheService, storage *objectStore, hold chan struct{}) chan error {
+	t.Helper()
 	instance := provider.InstanceName(scopedLease)
 	token := scopedObjectCAS(t, service, scopedLease)
 	if code := putObject(t, service, token, "object"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
 	finish(t, service, instance)
+	held := make(chan struct{}, 1)
+	storage.mu.Lock()
+	storage.putHold, storage.putHeld = hold, held
+	storage.mu.Unlock()
 
-	// EACH ASK OF THE CLOCK IS LATER, so the one after the publication began finds the
-	// answer old, and the first question has already been told yes.
 	session := service.sessionOf(instance)
-	hv := session.hosts[config.CacheGo]
-	now := time.Now()
-	service.now = func() time.Time {
-		now = now.Add(casPolicyAge)
-
-		return now
+	root := service.casMountPath(session, config.CacheGo)
+	result := make(chan error, 1)
+	go func() {
+		result <- service.publishBlobs(t.Context(), session, session.hosts[config.CacheGo], root, service.writtenBlobs(root))
+	}()
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	select {
+	case <-held:
+	case <-guard.C:
+		t.Fatal("the upload never reached the store")
 	}
+
+	return result
+}
+
+// AN UPLOAD LASTS AS LONG AS THE JOB'S OUTPUT IS LARGE, and disabling a cache has to stop
+// one already running, however few entries it is: the upload itself is what takes the time.
+func TestTheKillSwitchStopsAnUploadInProgress(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	policy := &ledgerPolicy{}
+	service.SetCachePolicy(policy)
+	service.casPolicyEvery = 5 * time.Millisecond
+	hold := make(chan struct{})
+	defer close(hold)
+	result := uploadInProgress(t, service, storage, hold)
+
 	policy.blocked.Store(true)
-	err := service.publishBlobs(t.Context(), session, hv, service.casMountPath(session, config.CacheGo),
-		service.writtenBlobs(service.casMountPath(session, config.CacheGo)))
-	if !errors.Is(err, errPublishDisabled) {
-		t.Fatalf("publishBlobs = %v, want the kill switch's stop", err)
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	select {
+	case err := <-result:
+		if !errors.Is(err, errPublishDisabled) {
+			t.Fatalf("publishBlobs = %v, want the kill switch's stop", err)
+		}
+	case <-guard.C:
+		t.Fatal("the kill switch did not stop the upload")
+	}
+}
+
+// A SWITCH THAT CANNOT BE READ MID-UPLOAD IS NOT ONE THAT REFUSED: a blip in the control
+// plane must not discard what a job wrote while its window is open.
+func TestAKillSwitchThatCannotBeReadDoesNotStopAnUpload(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	asked := make(chan struct{}, 1)
+	var away atomic.Bool
+	service.SetCachePolicy(cachePolicyFunc(func(context.Context, config.CacheKind, string, string) (bool, error) {
+		if !away.Load() {
+			return true, nil
+		}
+		select {
+		case asked <- struct{}{}:
+		default:
+		}
+
+		return false, errors.New("the plane is away")
+	}))
+	service.casPolicyEvery = 5 * time.Millisecond
+	hold := make(chan struct{})
+	result := uploadInProgress(t, service, storage, hold)
+	away.Store(true)
+
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	select {
+	case <-asked:
+	case <-guard.C:
+		t.Fatal("the switch was never asked during the upload")
+	}
+	close(hold)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("publishBlobs = %v", err)
+		}
+	case <-guard.C:
+		t.Fatal("the upload did not finish")
 	}
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	if len(storage.puts) != 0 {
+	if len(storage.puts) != 1 {
+		t.Fatalf("uploaded %v", storage.puts)
+	}
+}
+
+// AND ONE THAT CANNOT BE READ BEFORE IT STARTS HOLDS IT FOR THE NEXT PASS, rather than
+// abandoning it for good.
+func TestAKillSwitchThatCannotBeReadHoldsAPublication(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	var readable atomic.Bool
+	service.SetCachePolicy(cachePolicyFunc(func(context.Context, config.CacheKind, string, string) (bool, error) {
+		if !readable.Load() {
+			return false, errors.New("the plane is away")
+		}
+
+		return true, nil
+	}))
+	instance := provider.InstanceName(scopedLease)
+	readable.Store(true)
+	token := scopedObjectCAS(t, service, scopedLease)
+	if code := putObject(t, service, token, "object"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, instance)
+	readable.Store(false)
+
+	if err := service.RetryClosed(t.Context()); err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("RetryClosed = %v, want the publication held", err)
+	}
+	if service.sessionOf(instance) == nil {
+		t.Fatal("the session was forgotten with its writes unpublished")
+	}
+
+	readable.Store(true)
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if len(storage.puts) != 1 {
 		t.Fatalf("uploaded %v", storage.puts)
 	}
 }
@@ -1406,6 +1806,47 @@ func TestAnObjectPastWhatIsLeftIsNotReadToTheEnd(t *testing.T) {
 	}
 }
 
+// WRITERS OF ONE ENTRY SIDE BY SIDE COUNT WHAT IS THERE, whichever of them installed last: a
+// count below it lets a job past its size, and one above it refuses what fits.
+func TestWritersOfOneEntryCountWhatIsThere(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	token := objectCAS(t, service, scopedLease)
+	instance := provider.InstanceName(scopedLease)
+	if code := putObject(t, service, token, "first"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	handle, err := service.openCASHandle(t.Context(), service.sessionOf(instance), config.CacheGo, true)
+	if err != nil {
+		t.Fatalf("openCASHandle: %v", err)
+	}
+	defer handle.Close()
+
+	root := service.casMountPath(service.sessionOf(instance), config.CacheGo)
+	// MANY ROUNDS, because one interleaving in many is what miscounts.
+	for round := range 200 {
+		digest := digestOf("an action " + strconv.Itoa(round))
+		failures := make(chan error, 16)
+		var writers sync.WaitGroup
+		for i := range cap(failures) {
+			writers.Go(func() {
+				result := strings.Repeat("r", 1+i*64)
+				failures <- handle.Put(t.Context(), reapi.TableAC, digest, strings.NewReader(result))
+			})
+		}
+		writers.Wait()
+		close(failures)
+		for err := range failures {
+			if err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+		if got, want := handle.hv.written.Load(), service.writtenBytes(root); got != want {
+			t.Fatalf("round %d: %d bytes counted, %d in the directory", round, got, want)
+		}
+	}
+}
+
 // WRITING THE SAME ENTRY AGAIN ADDS NOTHING: a build retries.
 func TestWritingAnEntryAgainSpendsNothing(t *testing.T) {
 	t.Parallel()
@@ -1469,6 +1910,27 @@ func TestARestartKeepsWhatAJobHasSpent(t *testing.T) {
 	}
 	if code := putObject(t, restarted, credentials.Token, "one more"); code != http.StatusInsufficientStorage {
 		t.Fatalf("past the size after a restart = %d, want 507", code)
+	}
+}
+
+// A FILL STILL WRITING IS NOT AN ENTRY: reaped, its rename fails, and a read that was going to
+// succeed costs a miss and a warning.
+func TestTheReadCacheLeavesWhatAFillIsWriting(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	root := filepath.Join(service.rootState, casCacheDirectory, "key", "cas", "aa")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filling := filepath.Join(root, ".put-123")
+	if err := os.WriteFile(filling, []byte("entry"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reapCASEntries(t.Context(), filepath.Join(service.rootState, casCacheDirectory), 1<<20); err != nil {
+		t.Fatalf("reapCASEntries: %v", err)
+	}
+	if _, err := os.Stat(filling); err != nil {
+		t.Fatalf("a fill in progress was reaped: %v", err)
 	}
 }
 

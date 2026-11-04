@@ -75,6 +75,8 @@ type Store struct {
 	bulk bulkAPI
 	// readAhead is a slot per read allowed to hold chunks in memory.
 	readAhead chan struct{}
+	// rejoining is a slot per commit allowed to hold a part in memory.
+	rejoining chan struct{}
 	now       func() time.Time
 }
 
@@ -123,6 +125,7 @@ func newStore(
 	s := &Store{
 		cfg: cfg, owner: owner, blocks: blocks, objects: objects, now: time.Now,
 		readAhead: make(chan struct{}, readAheadReaders),
+		rejoining: make(chan struct{}, rejoinsAtOnce),
 	}
 	for _, opt := range opts {
 		opt(s)

@@ -1490,7 +1490,11 @@ func entryPointScript() string {
 	// disk and a cold pull. This image enables Docker at boot, so the daemon may have
 	// read daemon.json before the line above changed it, and the helper is told: a
 	// container would otherwise be answered that the npm registry is its own loopback.
-	b.WriteString("BILLET_DOCKER_CONFIG_CHANGED=${container_dns_active:-} /usr/local/bin/billet-docker-cache prepare\n")
+	// A daemon that cannot be brought up does not stop the runner, by the rule the wait
+	// below holds to: a job that needs no Docker still runs, and one that does says so.
+	b.WriteString("if ! BILLET_DOCKER_CONFIG_CHANGED=${container_dns_active:-} /usr/local/bin/billet-docker-cache prepare; then\n")
+	b.WriteString("  log \"Docker could not be brought up with this job's configuration\"\n")
+	b.WriteString("fi\n")
 
 	// WAIT FOR DOCKER BEFORE STARTING THE RUNNER, because billet's boot script
 	// invokes this the moment cloud-init reaches it and the daemon may not be up.

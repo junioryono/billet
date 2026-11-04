@@ -42,8 +42,13 @@ const (
 	// readWindow chunks plus one. A node takes 128 connections, and a job can open as
 	// many reads of a signed URL as it likes and stop reading them, so without this a
 	// node a size that suits an orchestrator could be run out of memory by one job. A
-	// read past this is one plain stream, which holds nothing and is only slower.
+	// read past this is one plain stream, which holds nothing, and which is slower and
+	// does not try a broken body again: that restore is a miss.
 	readAheadReaders = 16
+	// rejoinsAtOnce is how many commits at once read small blocks back, each holding a
+	// partBuffer, because a job can finalize as many saves as it has reserved. The rest
+	// wait, as a commit's client already does.
+	rejoinsAtOnce = 4
 
 	// staleUpload is how old a staged block or an unfinished multipart upload must
 	// be before eviction takes it: longer than any job, or its finalization could
@@ -449,6 +454,13 @@ func (s Store) assemble(
 func (s Store) rejoin(
 	ctx context.Context, name, uploadID string, sources []objectInfo,
 ) ([]completedPart, error) {
+	select {
+	case s.rejoining <- struct{}{}:
+		defer func() { <-s.rejoining }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
 	var parts []completedPart
 	buffer := make([]byte, 0, partBuffer)
 	flush := func() error {

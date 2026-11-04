@@ -1,10 +1,13 @@
 package ec2
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/junioryono/billet/internal/provider"
@@ -80,7 +83,8 @@ func TestTheEntryPointRunsTheGuestCachesInOrder(t *testing.T) {
 	for _, step := range []string{
 		". " + guestCachesPath + "\n",
 		"billet_guest_caches_prepare\n",
-		"BILLET_DOCKER_CONFIG_CHANGED=${container_dns_active:-} /usr/local/bin/billet-docker-cache prepare\n",
+		// GUARDED, because a daemon that cannot be brought up must not stop the runner.
+		"if ! BILLET_DOCKER_CONFIG_CHANGED=${container_dns_active:-} /usr/local/bin/billet-docker-cache prepare; then\n",
 		"docker info",
 		"billet_guest_caches_relay\n",
 		"billet_guest_caches_probe\n",
@@ -148,6 +152,38 @@ printf 'endpoint=%s\nactions=%s\nnpm=%s\n' "$cache_endpoint" "$actions_proxy" "$
 	got = runLibrary(t, map[string]string{"PATH": path}, "cache_endpoint=\nbillet_guest_caches_probe\necho asked\n")
 	if got != "asked\n" {
 		t.Fatalf("with no endpoint = %q", got)
+	}
+}
+
+// THE REAL curl, BECAUSE WHAT IT DOES WITH A REFUSAL IS THE RULE: the node answers 401 to a
+// request with no bearer and that is its answer, and a proxy in the environment must not
+// answer in its place. A stub could not tell `-f` from its absence.
+func TestTheProbeAcceptsTheNodesRefusalAndUsesNoProxy(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl is not installed on this development host")
+	}
+	var asked atomic.Int32
+	var credential atomic.Value
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked.Add(1)
+		credential.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer node.Close()
+
+	got := runLibrary(t, map[string]string{
+		"NODE": node.URL, "BILLET_CACHE_TOKEN": "s3cret",
+		"http_proxy": "http://127.0.0.1:1", "ALL_PROXY": "http://127.0.0.1:1",
+	}, "cache_endpoint=$NODE\nbillet_guest_caches_probe\nprintf 'endpoint=%s\\n' \"$cache_endpoint\"\n")
+	if want := "endpoint=" + node.URL + "\n"; got != want {
+		t.Fatalf("after the node's 401 = %q, want %q", got, want)
+	}
+	if asked.Load() == 0 {
+		t.Fatal("the node was never asked")
+	}
+	if sent, ok := credential.Load().(string); !ok || sent != "" {
+		t.Fatalf("the probe sent a credential: %q", sent)
 	}
 }
 

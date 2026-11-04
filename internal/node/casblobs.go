@@ -42,6 +42,10 @@ const (
 	// of objects. An upload holds its session for as long as it takes and its window
 	// counts from the job's completion, so one job's upload must not spend the next's.
 	closedSessionUploads = 8
+	// closedSessionAdmit is how long a pass goes on taking sessions that close while it
+	// runs. It has to return, because renewal runs after it on the same loop: this plus
+	// a publication's window is far inside what a lease has left when it comes due.
+	closedSessionAdmit = 5 * time.Minute
 	// casIndexRetry is how soon a listing that failed is tried again; a build asks by
 	// the thousand, and each would otherwise be a listing.
 	casIndexRetry = time.Minute
@@ -64,6 +68,13 @@ type blobIndex struct {
 type blobUses struct {
 	mu   sync.Mutex
 	refs map[storecontract.BlobRef]struct{}
+}
+
+// forget takes an entry a read proved gone out of the listing.
+func (i *blobIndex) forget(ref storecontract.BlobRef) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	delete(i.refs, ref)
 }
 
 func (u *blobUses) add(ref storecontract.BlobRef) {
@@ -161,10 +172,21 @@ func (h *casHandle) listedBlob(table reapi.Table, digest string) (storecontract.
 }
 
 // blobSize answers Size from the listing, for an entry not in the session's directory.
+//
+// A YES IS A PROMISE THE ENTRY CAN BE READ, because a build that is told an action's output
+// is there may go on without it, and only finds out when it asks. So an entry this session
+// could not read is not there: one past its limit, and one a full disk would not let the
+// read cache fill. An eviction after the listing is the one thing this cannot see, and a
+// later job's listing corrects it.
 func (h *casHandle) blobSize(table reapi.Table, digest string) (int64, error) {
 	ref, size, ok := h.listedBlob(table, digest)
-	if !ok {
+	if !ok || size > h.readLimit(table) {
 		return 0, fs.ErrNotExist
+	}
+	if _, err := os.Lstat(h.s.casCachePath(h.hv.Volume.Key, table, digest)); err != nil {
+		if h.s.readCacheFull() != nil {
+			return 0, fs.ErrNotExist
+		}
 	}
 	h.hv.hit.Store(true)
 	h.hv.reads.add(ref)
@@ -184,6 +206,10 @@ func (h *casHandle) openBlob(table reapi.Table, digest string) (*os.File, error)
 	file, err := openRegular(path)
 	if err != nil {
 		if err := h.fillCache(table, ref, path); err != nil {
+			// WHAT THE LISTING SAID IS DISPROVED, so no one is told it is there again.
+			if errors.Is(err, storecontract.ErrMiss) {
+				h.hv.index.forget(ref)
+			}
 			// A FULL DISK IS NOT WORTH A LINE PER READ, and the reaper is on its way.
 			if !errors.Is(err, storecontract.ErrMiss) && !errors.Is(err, reapi.ErrFull) {
 				h.s.log.Warn("could not fetch a content-addressed cache entry; it is a miss",
@@ -208,16 +234,9 @@ func (h *casHandle) openBlob(table reapi.Table, digest string) (*os.File, error)
 
 // fillCache fetches one entry into the read cache, whole or not at all.
 func (h *casHandle) fillCache(table reapi.Table, ref storecontract.BlobRef, path string) error {
-	// MADE HERE, because the fill asks how full this directory's disk is before it
-	// writes, and a directory that is not there reads as a full disk. Asked before the
-	// request too, which would otherwise be paid for and thrown away.
-	root := filepath.Join(h.s.rootState, casCacheDirectory)
-	//nolint:gosec // G703: the node's configured state directory and a constant, nothing of the request's
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return fmt.Errorf("prepare the read cache: %w", err)
-	}
-	if full, err := h.s.casFull(root); err != nil || full {
-		return reapi.ErrFull
+	// ASKED BEFORE THE REQUEST, which would otherwise be paid for and thrown away.
+	if err := h.s.readCacheFull(); err != nil {
+		return err
 	}
 
 	body, err := h.s.blobStore().ReadBlob(h.ctx, h.hv.Volume.Key, ref)
@@ -226,12 +245,32 @@ func (h *casHandle) fillCache(table reapi.Table, ref storecontract.BlobRef, path
 	}
 	defer body.Close()
 
-	limit := int64(casResultLimit)
+	return h.s.storeCASObject(h.ctx, body, path, string(table), ref.Digest, h.readLimit(table),
+		filepath.Join(h.s.rootState, casCacheDirectory))
+}
+
+// readLimit is the largest entry of table this session may read or write.
+func (h *casHandle) readLimit(table reapi.Table) int64 {
 	if table == reapi.TableCAS {
-		limit = h.limit
+		return h.limit
 	}
 
-	return h.s.storeCASObject(h.ctx, body, path, string(table), ref.Digest, limit, root)
+	return casResultLimit
+}
+
+// readCacheFull is reapi.ErrFull when the disk under the read cache will not take another
+// entry. It makes the directory, because one that is not there reads as a full disk.
+func (s *CacheService) readCacheFull() error {
+	root := filepath.Join(s.rootState, casCacheDirectory)
+	//nolint:gosec // G703: the node's configured state directory and a constant, nothing of the request's
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return fmt.Errorf("prepare the read cache: %w", err)
+	}
+	if full, err := s.casFull(root); err != nil || full {
+		return reapi.ErrFull
+	}
+
+	return nil
 }
 
 // openRegular opens a file without following a link, and only if it is regular.
@@ -287,11 +326,20 @@ func (s *CacheService) releaseBlobVolume(
 				"instance", session.instance, "kind", hv.Kind, "reason", reason)
 		}
 		deadline := hv.Intent.At.Add(publishWindow)
+		inWindow := s.now().Before(deadline)
+		policy := policyUnknown
+		if inWindow {
+			policy = s.sessionKindPolicy(ctx, session, hv.Kind)
+		}
 		switch {
-		case !s.now().Before(deadline):
+		case !inWindow:
 			abandon("the publication did not complete within its window")
-		case !s.sessionKindAllowed(ctx, session, hv.Kind):
+		case policy == policyRefused:
 			abandon("the cache is disabled for this repository")
+		case policy != policyAllowed:
+			// COULD-NOT-TELL IS NOT A REFUSAL, and nothing is lost by asking again on
+			// the next pass, inside the window.
+			return false, fmt.Errorf("the %s cache's kill switch could not be read", hv.Kind)
 		default:
 			publishCtx, cancel := context.WithDeadline(ctx, deadline)
 			err := s.publishBlobs(publishCtx, session, hv, root, written)
@@ -412,10 +460,34 @@ func (s *CacheService) writtenBytes(root string) int64 {
 //
 // THE KILL SWITCH IS ASKED AGAIN WHILE IT RUNS, as it is while a volume is in use: an
 // upload lasts as long as the job's output is large, and disabling a cache has to stop
-// it within casPolicyAge.
+// it within casPolicyAge, including one upload that takes that long by itself. Only a
+// refusal stops it, because one that could not be read mid-upload is not one, and a blip
+// must not discard what the job wrote.
 func (s *CacheService) publishBlobs(
-	ctx context.Context, session *cacheSession, hv *hostVolume, root string, written []storecontract.BlobRef,
+	parent context.Context, session *cacheSession, hv *hostVolume, root string, written []storecontract.BlobRef,
 ) error {
+	ctx, cancel := context.WithCancelCause(parent)
+	defer cancel(nil)
+
+	uploaded := make(chan struct{})
+	var asking sync.WaitGroup
+	asking.Go(func() {
+		ticker := time.NewTicker(s.casPolicyEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-uploaded:
+				return
+			case <-ticker.C:
+				if s.sessionKindPolicy(ctx, session, hv.Kind) == policyRefused {
+					cancel(errPublishDisabled)
+
+					return
+				}
+			}
+		}
+	})
+
 	store := s.blobStore()
 	work := make(chan storecontract.BlobRef)
 	failed := atomic.Pointer[error]{}
@@ -423,7 +495,7 @@ func (s *CacheService) publishBlobs(
 	for range casPublishWorkers {
 		wg.Go(func() {
 			for ref := range work {
-				if failed.Load() != nil {
+				if failed.Load() != nil || ctx.Err() != nil {
 					continue
 				}
 				if err := putBlobFile(ctx, store, hv.Volume.Key, ref, root); err != nil {
@@ -432,26 +504,87 @@ func (s *CacheService) publishBlobs(
 			}
 		})
 	}
-	asked := s.now()
+feed:
 	for _, ref := range written {
-		if s.now().Sub(asked) >= casPolicyAge {
-			if !s.sessionKindAllowed(ctx, session, hv.Kind) {
-				disabled := errPublishDisabled
-				failed.CompareAndSwap(nil, &disabled)
-
-				break
-			}
-			asked = s.now()
+		select {
+		case work <- ref:
+		case <-ctx.Done():
+			break feed
 		}
-		work <- ref
 	}
 	close(work)
 	wg.Wait()
+	close(uploaded)
+	asking.Wait()
+
+	if errors.Is(context.Cause(ctx), errPublishDisabled) {
+		return errPublishDisabled
+	}
 	if err := failed.Load(); err != nil {
 		return *err
 	}
 
-	return nil
+	return parent.Err()
+}
+
+// retryClosedSideBySide is RetryClosed on a store of objects: up to closedSessionUploads
+// sessions at once, and it goes on taking those that close while it runs. A pass over the
+// ones closed when it began would leave a job that ended a minute later waiting out the
+// longest upload ahead of it, with its window counting.
+func (s *CacheService) retryClosedSideBySide(ctx context.Context) error {
+	var (
+		failures []error
+		queue    []*cacheSession
+		running  int
+		missed   bool
+	)
+	seen := make(map[*cacheSession]bool)
+	admit := func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, session := range s.byToken {
+			if session.closing.Load() && !seen[session] {
+				seen[session] = true
+				queue = append(queue, session)
+			}
+		}
+	}
+	admit()
+
+	done := make(chan error)
+	closed := s.closed
+	admitUntil := s.now().Add(closedSessionAdmit)
+	for {
+		for running < closedSessionUploads && len(queue) > 0 && ctx.Err() == nil {
+			session := queue[0]
+			queue = queue[1:]
+			running++
+			go func() { done <- s.cleanupSession(ctx, session, false, true) }()
+		}
+		if running == 0 {
+			break
+		}
+		select {
+		case err := <-done:
+			running--
+			if err != nil {
+				failures = append(failures, err)
+			}
+		case <-closed:
+			if s.now().Before(admitUntil) {
+				admit()
+
+				continue
+			}
+			// LEFT FOR THE NEXT PASS, which this signal is what wakes.
+			closed, missed = nil, true
+		}
+	}
+	if missed {
+		s.signalClosed()
+	}
+
+	return errors.Join(failures...)
 }
 
 func putBlobFile(
@@ -512,7 +645,8 @@ func reapCASEntries(ctx context.Context, root string, toFree int64) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !d.Type().IsRegular() {
+		// NOT WHAT A FILL IS STILL WRITING, whose rename would then fail.
+		if !d.Type().IsRegular() || strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 		info, err := d.Info()

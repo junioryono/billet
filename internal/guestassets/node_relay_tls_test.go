@@ -17,7 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -99,6 +99,35 @@ func startRelay(t *testing.T, upstream, roots string) string {
 	return ""
 }
 
+// serveOne runs handle on the listener's first connection, and the test does not end
+// before it has, so what it reports reaches the test.
+func serveOne(t *testing.T, listener net.Listener, handle func(net.Conn) error) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+
+			return
+		}
+		defer conn.Close()
+		done <- handle(conn)
+	}()
+	t.Cleanup(func() {
+		guard := time.NewTimer(30 * time.Second)
+		defer guard.Stop()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("the node: %v", err)
+			}
+		case <-guard.C:
+			t.Error("the node's side never finished")
+		}
+	})
+}
+
 // dialRelay is a client of the relay with a deadline that fails the test rather than
 // hang it, far inside the relay's own idle bound.
 func dialRelay(t *testing.T, relay string) *net.TCPConn {
@@ -143,24 +172,21 @@ func TestTheRelayCarriesBytesOverTLSToAnHTTPSNode(t *testing.T) {
 	// OPEN UNTIL THE CLIENT HAS READ IT ALL: a node that closed after writing would wake
 	// the relay's wait on its own.
 	finished := make(chan struct{})
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+	serveOne(t, listener, func(conn net.Conn) error {
 		got := make([]byte, len(request))
 		if _, err := io.ReadFull(conn, got); err != nil {
 			received <- nil
 
-			return
+			return err
 		}
 		received <- got
 		if _, err := conn.Write(answer); err != nil {
-			t.Errorf("write the answer: %v", err)
+			return err
 		}
 		<-finished
-	}()
+
+		return nil
+	})
 
 	relay := startRelay(t, "https://"+listener.Addr().String(), ca)
 	client := dialRelay(t, relay)
@@ -197,21 +223,18 @@ func TestALargeRequestIsNotHeldUpByARecordWithNoData(t *testing.T) {
 	request := bytes.Repeat([]byte("a large body "), 1<<20/13)
 	finished := make(chan struct{})
 	defer close(finished)
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+	serveOne(t, listener, func(conn net.Conn) error {
 		// EVERY BYTE BEFORE ANY ANSWER, as a node reading a body does.
 		if _, err := io.ReadFull(conn, make([]byte, len(request))); err != nil {
-			return
+			return err
 		}
 		if _, err := conn.Write([]byte("stored")); err != nil {
-			t.Errorf("write the answer: %v", err)
+			return err
 		}
 		<-finished
-	}()
+
+		return nil
+	})
 
 	client := dialRelay(t, startRelay(t, "https://"+listener.Addr().String(), ca))
 	if _, err := client.Write(request); err != nil {
@@ -238,28 +261,28 @@ func TestAClientsHalfCloseDoesNotEndTheNodesAnswer(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	request, answer := []byte("request"), []byte("an answer that comes after the close")
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+	halfClosed := make(chan struct{})
+	serveOne(t, listener, func(conn net.Conn) error {
 		if _, err := io.ReadFull(conn, make([]byte, len(request))); err != nil {
-			return
+			return err
 		}
+		// AFTER THE CLOSE, and long enough for the relay to have acted on it.
+		<-halfClosed
 		time.Sleep(200 * time.Millisecond)
-		if _, err := conn.Write(answer); err != nil {
-			t.Errorf("write the answer: %v", err)
-		}
-	}()
+		_, err := conn.Write(answer)
+
+		return err
+	})
 
 	client := dialRelay(t, startRelay(t, "https://"+listener.Addr().String(), ca))
 	if _, err := client.Write(request); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.CloseWrite(); err != nil {
+		close(halfClosed)
 		t.Fatal(err)
 	}
+	close(halfClosed)
 	got := make([]byte, len(answer))
 	if _, err := io.ReadFull(client, got); err != nil {
 		t.Fatalf("read the answer after a half-close: %v", err)
@@ -269,40 +292,64 @@ func TestAClientsHalfCloseDoesNotEndTheNodesAnswer(t *testing.T) {
 	}
 }
 
-// recordingListener keeps every byte its connections read, before any TLS.
-type recordingListener struct {
+// dropFirstListener closes its first connection the moment it is accepted, as a node on
+// its way down does mid-handshake.
+type dropFirstListener struct {
 	net.Listener
 
-	mu       sync.Mutex
-	raw      bytes.Buffer
-	accepted int
+	dropped atomic.Bool
 }
 
-func (l *recordingListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+func (l *dropFirstListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.dropped.Swap(true) {
+			return conn, nil
+		}
+		if err := conn.Close(); err != nil {
+			return nil, err
+		}
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.accepted++
-
-	return &recordingConn{Conn: conn, listener: l}, nil
 }
 
-type recordingConn struct {
-	net.Conn
+// THE REAL OPENSSL'S WORD FOR A NODE GOING AWAY MID-HANDSHAKE, because the relay retries
+// only what it recognises, and anything else it takes for final and hangs up on the client.
+func TestAHandshakeTheNodeDropsIsTriedAgain(t *testing.T) {
+	ca, leaf := relayAuthority(t)
+	var config net.ListenConfig
+	base, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := tls.NewListener(&dropFirstListener{Listener: base}, &tls.Config{
+		Certificates: []tls.Certificate{leaf}, MinVersion: tls.VersionTLS13,
+	})
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Logf("close the listener: %v", err)
+		}
+	})
+	request := []byte("the client's first bytes")
+	serveOne(t, listener, func(conn net.Conn) error {
+		if _, err := io.ReadFull(conn, make([]byte, len(request))); err != nil {
+			return err
+		}
+		_, err := conn.Write([]byte("reached"))
 
-	listener *recordingListener
-}
+		return err
+	})
 
-func (c *recordingConn) Read(p []byte) (int, error) {
-	count, err := c.Conn.Read(p)
-	c.listener.mu.Lock()
-	defer c.listener.mu.Unlock()
-	c.listener.raw.Write(p[:count])
-
-	return count, err
+	client := dialRelay(t, startRelay(t, "https://"+listener.Addr().String(), ca))
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len("reached"))
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatalf("the relay gave up on a node that dropped one handshake: %v", err)
+	}
 }
 
 // A NODE THE IMAGE'S ROOTS DO NOT VOUCH FOR GETS NOTHING: the bearer is the first thing
@@ -310,16 +357,20 @@ func (c *recordingConn) Read(p []byte) (int, error) {
 func TestTheRelaySendsNothingToANodeItCannotVerify(t *testing.T) {
 	_, leaf := relayAuthority(t)
 	otherCA, _ := relayAuthority(t)
-	var config net.ListenConfig
-	base, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{leaf}, MinVersion: tls.VersionTLS13,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	recording := &recordingListener{Listener: base}
-	listener := tls.NewListener(recording, &tls.Config{
-		Certificates: []tls.Certificate{leaf}, MinVersion: tls.VersionTLS13,
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Logf("close the listener: %v", err)
+		}
 	})
-	t.Cleanup(func() { _ = listener.Close() })
+	// WHAT THE NODE DECRYPTED, which is what an unverified peer would hold of a bearer.
+	var heard bytes.Buffer
+	dialled := make(chan struct{})
 	over := make(chan struct{})
 	go func() {
 		defer close(over)
@@ -328,9 +379,10 @@ func TestTheRelaySendsNothingToANodeItCannotVerify(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		close(dialled)
 		// UNTIL THE RELAY HANGS UP, so everything it was going to send has been read. A
 		// failed handshake is what this ends with.
-		if _, err := io.Copy(io.Discard, conn); err != nil {
+		if _, err := io.Copy(&heard, conn); err != nil {
 			t.Logf("the node's side ended: %v", err)
 		}
 	}()
@@ -353,16 +405,16 @@ func TestTheRelaySendsNothingToANodeItCannotVerify(t *testing.T) {
 	guard := time.NewTimer(30 * time.Second)
 	defer guard.Stop()
 	select {
+	case <-dialled:
+	case <-guard.C:
+		t.Fatal("the relay never dialled the node, so this proves nothing")
+	}
+	select {
 	case <-over:
 	case <-guard.C:
 		t.Fatal("the relay never hung up on the node")
 	}
-	recording.mu.Lock()
-	defer recording.mu.Unlock()
-	if recording.accepted == 0 {
-		t.Fatal("the relay never dialled the node, so this proves nothing")
-	}
-	if bytes.Contains(recording.raw.Bytes(), []byte("Bearer")) {
-		t.Fatalf("the node was sent the credential in the clear: %q", recording.raw.Bytes())
+	if heard.Len() != 0 {
+		t.Fatalf("an unverified node was sent %q", heard.Bytes())
 	}
 }

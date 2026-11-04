@@ -162,6 +162,8 @@ type actionsReceipt struct {
 	// objects, whose receipts have no candidate, lease or fence.
 	Upload string   `json:"upload,omitempty"`
 	Blocks []string `json:"blocks,omitempty"`
+	// commit lets one commit of this receipt run at a time, made under session.mu.
+	commit *sync.Mutex
 }
 
 func (r *actionsReceipt) valid() error {

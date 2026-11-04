@@ -83,11 +83,12 @@ func guestCachesLibrary() (string, error) {
 	// a job's `git fetch` at it, which nothing falls back from. An image built without
 	// the listener's issuer, or a security group that drops it, would fail every
 	// checkout, so the node is asked first, and could-not-tell turns the caches off.
-	// Any answer proves it: curl reports the TLS and the connection, and is given no
-	// credential to send.
+	// Any answer proves it, the node's refusal of a request with no credential among
+	// them: curl reports the TLS and the connection, and is given no proxy that could
+	// answer in the node's place.
 	b.WriteString("billet_guest_caches_probe() {\n")
 	b.WriteString("  [ -n \"$cache_endpoint\" ] || return 0\n")
-	b.WriteString("  if curl -sS -o /dev/null --max-time " + guestCacheProbeSeconds + " \"${cache_endpoint%/}/\"; then\n")
+	b.WriteString("  if curl -sS --noproxy '*' -o /dev/null --max-time " + guestCacheProbeSeconds + " \"${cache_endpoint%/}/\"; then\n")
 	b.WriteString("    return 0\n")
 	b.WriteString("  fi\n")
 	b.WriteString("  log \"the node's cache listener did not answer; this job runs without the caches it serves\"\n")

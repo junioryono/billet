@@ -92,6 +92,9 @@ type CacheService struct {
 	casFill float64
 	// casCacheFill is the package's constant, a field for the same reason.
 	casCacheFill float64
+	// casPolicyEvery is how often an upload asks the kill switch, a field so a test does
+	// not wait on it.
+	casPolicyEvery time.Duration
 	// npmSettleWait is defaultNpmSettleWait, a field so a test can reach its
 	// bound without waiting it out.
 	npmSettleWait time.Duration
@@ -351,6 +354,7 @@ func NewCacheService(
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
 	service.casCacheFill = casCacheFill
+	service.casPolicyEvery = casPolicyAge
 	service.npmSettleWait = defaultNpmSettleWait
 	service.answerCloseWait = defaultAnswerCloseWait
 	if err := service.loadSessions(); err != nil {
@@ -941,6 +945,10 @@ func (s *CacheService) signalClosed() {
 
 // RetryClosed releases cache volumes whose earlier cleanup was interrupted.
 func (s *CacheService) RetryClosed(ctx context.Context) error {
+	if s.blobStore() != nil {
+		return s.retryClosedSideBySide(ctx)
+	}
+
 	s.mu.Lock()
 	sessions := make([]*cacheSession, 0, len(s.byToken))
 	for _, session := range s.byToken {
@@ -948,28 +956,12 @@ func (s *CacheService) RetryClosed(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	workers := 1
-	if s.blobStore() != nil {
-		workers = closedSessionUploads
-	}
-	var (
-		mu       sync.Mutex
-		failures []error
-		wg       sync.WaitGroup
-	)
-	slots := make(chan struct{}, workers)
+	var failures []error
 	for _, session := range sessions {
-		slots <- struct{}{}
-		wg.Go(func() {
-			defer func() { <-slots }()
-			if err := s.cleanupSession(ctx, session, false, true); err != nil {
-				mu.Lock()
-				defer mu.Unlock()
-				failures = append(failures, err)
-			}
-		})
+		if err := s.cleanupSession(ctx, session, false, true); err != nil {
+			failures = append(failures, err)
+		}
 	}
-	wg.Wait()
 
 	return errors.Join(failures...)
 }

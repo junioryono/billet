@@ -260,10 +260,12 @@ func startNodeCache(
 			evictPass(evictCtx, storage, service.ReapGitMirrors, sweeping, slog.Default())
 		}
 
+		// BEFORE THE FIRST PASS, which can run for a publication's whole window after a
+		// restart, with the disk filling meanwhile.
+		go reapReadCache(evictCtx, service)
+
 		retryClosed()
 		renewActive()
-
-		go reapReadCache(evictCtx, service)
 
 		go func() {
 			evictionTicker := time.NewTicker(6 * time.Hour)

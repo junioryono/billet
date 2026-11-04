@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	storecontract "github.com/junioryono/billet/internal/store"
 )
@@ -152,30 +153,31 @@ func (s *CacheService) finalizeObjectArchive(
 // success is returned, as a volume's is, and a commit asks first whether its own archive
 // is already there.
 //
-// THE COMMIT RUNS OUTSIDE THE LOCK: small blocks are read back through the node, which
-// takes minutes, and the rest of the job's cache calls and every later session's renewal
-// would queue behind it. Two finalizations of one receipt are safe, because the store's
-// condition lets one land and the other reads the object back as its own.
+// ONE COMMIT OF A RECEIPT AT A TIME, because the first to land deletes the blocks a second
+// is about to list, and the second would then report that nothing was published, over an
+// answer that said it was. A second finalization waits and reads the first's answer.
+// session.mu is never held while waiting for this lock, so nothing can wait on it in turn.
 func (s *CacheService) publishObjectReceipt(
 	ctx context.Context, session *cacheSession, receipt *actionsReceipt,
 ) (*http.Response, error) {
-	session.mu.Unlock()
-	published, err := s.archiveStore().CommitArchive(ctx, receipt.StoreKey, receipt.Upload,
-		receipt.Blocks, receipt.Size)
-	session.mu.Lock()
-	if errors.Is(err, storecontract.ErrArchiveSize) {
-		// THE CLIENT'S OWN ACCOUNT OF THE UPLOAD DOES NOT ADD UP, which a retry will
-		// not change. Nothing was published, and it is told so.
-		s.log.Warn("an Actions cache save did not match what it uploaded; nothing was published",
-			"instance", session.instance, "key", receipt.CacheKey, "error", err)
-		s.releaseStagedBlocks(ctx, session, receipt.Upload)
-		published, err = false, nil
+	if receipt.commit == nil {
+		receipt.commit = new(sync.Mutex)
 	}
+	commit := receipt.commit
+	session.mu.Unlock()
+	commit.Lock()
+	defer commit.Unlock()
+	session.mu.Lock()
+	if receipt.Complete {
+		return actionsReceiptResponse(receipt)
+	}
+
+	published, err := s.commitReceipt(ctx, session, receipt)
 	if err != nil {
 		return nil, err
 	}
 	receipt.Complete, receipt.OK = true, published
-	// A SESSION FINISHED MEANWHILE HAS NO RECORD, and writing one would raise it again.
+	// A SESSION FINISHED MEANWHILE HAS NO RECORD, and its client still gets its answer.
 	if !session.finished {
 		if err := s.persistSession(session); err != nil {
 			return nil, err
@@ -183,6 +185,31 @@ func (s *CacheService) publishObjectReceipt(
 	}
 
 	return actionsReceiptResponse(receipt)
+}
+
+// commitReceipt runs the store's commit outside session.mu, which it holds on return
+// whatever happens: small blocks are read back through the node, which takes minutes, and
+// the rest of the job's cache calls and every later session's renewal would queue behind
+// it.
+func (s *CacheService) commitReceipt(
+	ctx context.Context, session *cacheSession, receipt *actionsReceipt,
+) (bool, error) {
+	session.mu.Unlock()
+	defer session.mu.Lock()
+
+	published, err := s.archiveStore().CommitArchive(ctx, receipt.StoreKey, receipt.Upload,
+		receipt.Blocks, receipt.Size)
+	if errors.Is(err, storecontract.ErrArchiveSize) {
+		// THE CLIENT'S OWN ACCOUNT OF THE UPLOAD DOES NOT ADD UP, which a retry will
+		// not change. Nothing was published, and it is told so.
+		s.log.Warn("an Actions cache save did not match what it uploaded; nothing was published",
+			"instance", session.instance, "key", receipt.CacheKey, "error", err)
+		s.releaseStagedBlocks(ctx, session, receipt.Upload)
+
+		return false, nil
+	}
+
+	return published, err
 }
 
 // releaseStagedBlocks deletes what an upload staged that will never be committed. A
