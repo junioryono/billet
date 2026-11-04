@@ -467,7 +467,7 @@ func (p *Provider) pullIntoStaging(ctx context.Context, key, digest, staging str
 	}
 
 	if _, err := p.runIn(ctx, store, progress, "pull", ref); err != nil {
-		return fmt.Errorf("pull %s into a private store: %w", ref, err)
+		return fmt.Errorf("%w: %s: %w", errPull, ref, err)
 	}
 
 	if err := checkManifestDigest(store, digest); err != nil {
@@ -585,11 +585,12 @@ func (p *Provider) deleteOwnedVM(ctx context.Context, name string) error {
 
 	defer unlock()
 
+	// AN EMPTY MARKER IS A MISSING ONE, a crash between its creation and its write.
 	if owner, err := p.ownerOf(name); err == nil {
 		if owner != p.owner {
 			return fmt.Errorf("%s carries the marker of another deployment", name)
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("read %s's marker: %w", name, err)
 	}
 

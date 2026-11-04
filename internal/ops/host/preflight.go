@@ -802,13 +802,17 @@ func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config, skipNet
 		return err
 	}
 
+	// NOT CALLED UNVERIFIED BY WHAT THIS FILE SAYS ALONE: the tiers a launch uses are the control
+	// plane's, so a plain name here can be a verified image in the jobs this node runs.
+	recorded := tartRecordedKeys(ctx, cfg)
+
 	for _, image := range tierImages {
 		// A verified image is in no shared cache; reportTartVerified says what it is.
-		if _, verified := config.TartVerifiedImage(image); verified {
+		if _, verified := config.TartVerifiedImage(image); verified || recorded[config.TartImageKey(image)] {
 			continue
 		}
 
-		fmt.Fprintf(env.Stdout, "image    %-56s boots what the tag names, which nobody verified\n", image)
+		fmt.Fprintf(env.Stdout, "image    %-56s boots what is pulled under that name, which nobody verified\n", image)
 
 		if p.Pulled(ctx, image) {
 			fmt.Fprintf(env.Stdout, "image    %-56s pulled\n", image)

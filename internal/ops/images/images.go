@@ -3,6 +3,7 @@ package images
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -719,6 +720,9 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	digest := fs.String("digest", "",
 		"on a Mac, pull this digest rather than what the tag names now, which also takes back "+
 			"one that was unpromoted")
+	untrusted := fs.Bool("untrusted", false,
+		"on a Mac, boot the probe with the network of untrusted work, for an image a tier on the "+
+			"control plane boots for it and this file does not name")
 
 	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
@@ -732,11 +736,25 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	// A TART IMAGE NAMES NO GENERATION: its reference is what a tier names, and the
 	// verification makes the record. An unreadable file is the load's to report below.
 	if cfg, err := config.Load(*cfgPath); err == nil && cfg.Node != nil && cfg.Node.Provider == config.ProviderTart {
-		return cmdImagesVerifyTart(ctx, env, cfg, rest, *digest, *noYield)
+		var ignored []string
+
+		fs.Visit(func(f *flag.Flag) {
+			if slices.Contains([]string{"wait", "record", "allow-unpaired", "disk"}, f.Name) {
+				ignored = append(ignored, "--"+f.Name)
+			}
+		})
+
+		if len(ignored) > 0 {
+			return fmt.Errorf("billet images verify: %s are for a firecracker node's generations, and "+
+				"a verification on a tart node always records", strings.Join(ignored, ", "))
+		}
+
+		return cmdImagesVerifyTart(ctx, env, cfg, rest, *digest, *noYield, *untrusted)
 	}
 
-	if *noYield || *digest != "" {
-		return errors.New("billet images verify: --no-yield and --digest are for a tart node's images")
+	if *noYield || *digest != "" || *untrusted {
+		return errors.New("billet images verify: --no-yield, --digest and --untrusted are for a " +
+			"tart node's images")
 	}
 
 	// THE GENERATION IS REQUIRED, not defaulted, for the same reason the provider

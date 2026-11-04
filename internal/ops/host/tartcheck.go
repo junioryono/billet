@@ -64,10 +64,18 @@ func reportUnverifiedTartTiers(env cli.Env, cfg *config.Config) {
 		}
 
 		image := t.ImageFor(config.ProviderTart)
-		if _, verified := config.TartVerifiedImage(image); !verified {
-			fmt.Fprintf(env.Stdout, "tart     tier %s boots %s, which nobody verified; naming it "+
-				"%s@verified boots only a copy of what billet booted\n", t.Label, image, image)
+		if _, verified := config.TartVerifiedImage(image); verified {
+			continue
 		}
+
+		// A DIGEST CANNOT TAKE `@verified`, which validation refuses, so what to name differs.
+		advice := "naming it " + image + "@verified"
+		if strings.Contains(image, "@") {
+			advice = "naming its tag @verified, rather than a digest,"
+		}
+
+		fmt.Fprintf(env.Stdout, "tart     tier %s boots %s, which nobody verified; %s boots only a "+
+			"copy of what billet booted\n", t.Label, image, advice)
 	}
 }
 
@@ -82,6 +90,7 @@ type tartReporter interface {
 	VerifiedImages(ctx context.Context) ([]tart.VerifiedImage, error)
 	RefreshDeadlines(ctx context.Context, window tart.RunnerWindow) ([]string, error)
 	Slots(ctx context.Context) (tart.SlotReport, error)
+	OrphanProbes(ctx context.Context) ([]string, error)
 	StoreSpace(rec tart.VerifiedRecord) (uint64, int64, error)
 }
 
@@ -128,31 +137,103 @@ func reportTartVerified(ctx context.Context, env cli.Env, cfg *config.Config, ti
 	}
 
 	byKey := make(map[string]tart.VerifiedImage, len(images))
+
+	var keys []string
+
+	// EVERY RECORD AS WELL AS EVERY TIER OF THIS FILE: the tiers a launch uses are the control
+	// plane's, so this file need not name what its jobs boot, and a base it does not name
+	// still holds tens of gigabytes.
 	for _, image := range images {
 		byKey[image.Key] = image
+
+		if len(image.Records) > 0 || image.Pending != nil || image.Failed != nil {
+			keys = append(keys, image.Key)
+		}
 	}
 
 	for _, ref := range tierImages {
-		if _, verified := config.TartVerifiedImage(ref); !verified {
-			continue
+		if _, verified := config.TartVerifiedImage(ref); verified {
+			keys = append(keys, config.TartImageKey(ref))
 		}
+	}
 
-		reportTartImage(env, p, config.TartImageKey(ref), byKey[config.TartImageKey(ref)], unknownRunners)
+	slices.Sort(keys)
+
+	for _, key := range slices.Compact(keys) {
+		reportTartImage(env, p, key, byKey[key], unknownRunners)
+	}
+
+	orphans, err := p.OrphanProbes(ctx)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "verified UNKNOWN: %v\n", err)
+	}
+
+	for _, probe := range orphans {
+		fmt.Fprintf(env.Stdout, "probe    %s is left from a verification that died, and may be running "+
+			"unreserved; the image's next verification removes it\n", probe)
 	}
 
 	reportTartSlots(ctx, env, p)
 }
 
-// reportTartImage reports one tier's verified image.
+// tartRecordedKeys are the images this node has records of, for a check that would otherwise
+// call one nobody verified because this file names it plainly. Nothing, if it cannot be told:
+// reportTartVerified says why.
+func tartRecordedKeys(ctx context.Context, cfg *config.Config) map[string]bool {
+	if _, known, err := app.PeekNodeDeploymentID(cfg); err != nil || !known {
+		return nil
+	}
+
+	p, err := openTartReport(cfg)
+	if err != nil {
+		return nil
+	}
+
+	images, err := p.VerifiedImages(ctx)
+	if err != nil {
+		return nil
+	}
+
+	keys := make(map[string]bool, len(images))
+
+	for i := range images {
+		if len(images[i].Records) > 0 {
+			keys[images[i].Key] = true
+		}
+	}
+
+	return keys
+}
+
+// reportTartImage reports one image's records.
 func reportTartImage(env cli.Env, p tartReporter, key string, image tart.VerifiedImage, unknownRunners []string) {
 	var newest *tart.VerifiedRecord
 
 	for i := range image.Records {
-		if image.Records[i].Invalid == "" && !slices.Contains(image.Withdrawn, image.Records[i].Digest) {
-			newest = &image.Records[i]
+		rec := &image.Records[i]
 
-			break
+		switch {
+		case rec.Invalid != "":
+			fmt.Fprintf(env.Stdout, "image    %-56s base %s is invalid (%s) and no launch resolves it; "+
+				"the next verification removes it\n", key, rec.Base, rec.Invalid)
+		case slices.Contains(image.Withdrawn, rec.Digest):
+		case newest == nil:
+			newest = rec
+		default:
+			fmt.Fprintf(env.Stdout, "image    %-56s also holds %s, verified %s, the rollback target\n",
+				key, rec.Base, rec.VerifiedAt.Format(time.DateOnly))
 		}
+	}
+
+	if image.Pending != nil {
+		fmt.Fprintf(env.Stdout, "image    %-56s holds %s, pulled and waiting for a macOS slot to be "+
+			"probed in; the next verification of %s boots it\n", key, image.Pending.Base, image.Pending.Digest)
+	}
+
+	if image.Failed != nil {
+		fmt.Fprintf(env.Stdout, "image    %-56s %s failed its verification on %s; the refresh leaves it "+
+			"for a week, and `billet images verify %s` tries it now\n", key, image.Failed.Digest,
+			image.Failed.At.Format(time.DateOnly), key)
 	}
 
 	if newest == nil {
@@ -165,6 +246,11 @@ func reportTartImage(env cli.Env, p tartReporter, key string, image tart.Verifie
 	fmt.Fprintf(env.Stdout, "image    %-56s verified %s as %s, runner %s\n", key,
 		newest.VerifiedAt.Format(time.DateOnly), newest.Base, newest.Runner)
 
+	if problem := image.BaseProblems[newest.Base]; problem != "" {
+		fmt.Fprintf(env.Stdout, "         %s: %s, so the next job on its tier fails to launch; run `billet "+
+			"images verify %s`\n", newest.Base, problem, key)
+	}
+
 	switch deadline, ok := image.Deadlines[newest.Runner]; {
 	case ok && !time.Now().Before(deadline):
 		fmt.Fprintf(env.Stdout, "         runner %s went past GitHub's window on %s, so every job on its "+
@@ -176,9 +262,9 @@ func reportTartImage(env cli.Env, p tartReporter, key string, image tart.Verifie
 	}
 
 	if image.Yields > 0 {
-		fmt.Fprintf(env.Stdout, "         its last %d verification(s) yielded to a job; if the macOS slots stay "+
-			"busy, stop every node on this store with `billet local down --node` and run `billet images "+
-			"verify --no-yield`\n", image.Yields)
+		fmt.Fprintf(env.Stdout, "         its last %d verification(s) gave way to a job or found no slot; if the "+
+			"macOS slots stay busy, stop every node on this store with `billet local down --node` and run "+
+			"`billet images verify --no-yield`\n", image.Yields)
 	}
 
 	if newest.GuestOS == "darwin" {

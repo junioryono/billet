@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -27,6 +29,7 @@ type fakeVerifier struct {
 	refreshed int
 	unknown   []string
 	unpromote []string
+	images    []tart.VerifiedImage
 }
 
 func (f *fakeVerifier) Verify(_ context.Context, opts tart.VerifyOptions) (*tart.VerifiedRecord, error) {
@@ -56,13 +59,20 @@ func (f *fakeVerifier) RefreshDeadlines(context.Context, tart.RunnerWindow) ([]s
 	return f.unknown, nil
 }
 
+func (f *fakeVerifier) VerifiedImages(context.Context) ([]tart.VerifiedImage, error) {
+	return f.images, nil
+}
+
 func stageVerifier(t *testing.T, f *fakeVerifier) {
 	t.Helper()
 
-	prev := OpenTartVerifier
+	prev, prevPeek := OpenTartVerifier, peekTartDeployment
 	OpenTartVerifier = func(*config.Config) (tartVerifier, error) { return f, nil }
+	peekTartDeployment = func(*config.Config) (string, bool, error) {
+		return "0123456789abcdef0123456789abcdef", true, nil
+	}
 
-	t.Cleanup(func() { OpenTartVerifier = prev })
+	t.Cleanup(func() { OpenTartVerifier, peekTartDeployment = prev, prevPeek })
 }
 
 func tartConfig(tiers ...config.Tier) *config.Config {
@@ -115,7 +125,7 @@ func TestAVerificationTakesItsCommandAndTrustFromTheTier(t *testing.T) {
 		}()}, command: "./actions-runner/run.sh"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			opts, err := tartVerifyOptions(tartConfig(tc.tiers...), image)
+			opts, _, err := tartVerifyOptions(t.Context(), tartConfig(tc.tiers...), &fakeVerifier{}, image)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -141,7 +151,7 @@ func TestTiersNamingOneImageWithDifferentCommandsRefuse(t *testing.T) {
 	two := tartTier("two", image, config.WorkloadTrusted)
 	two.Command = []string{"./two/run.sh"}
 
-	_, err := tartVerifyOptions(tartConfig(one, two), image)
+	_, _, err := tartVerifyOptions(t.Context(), tartConfig(one, two), &fakeVerifier{}, image)
 	if err == nil || !strings.Contains(err.Error(), "different commands") {
 		t.Fatalf("answered %v", err)
 	}
@@ -163,8 +173,223 @@ func TestARefreshThatCannotTellItsImagesFails(t *testing.T) {
 		t.Fatal("verifyDueTartImages answered nothing to do")
 	}
 
+	peekTartDeployment = func(*config.Config) (string, bool, error) {
+		return "", false, errors.New("the identity cannot be read")
+	}
+
 	if err := refreshTartVerified(t.Context(), env, cfg); err == nil {
 		t.Fatal("refreshTartVerified answered nothing to do")
+	}
+}
+
+// A NODE WITH NO IDENTITY YET HAS NOTHING TO REFRESH, and asks nothing of a provider that would
+// have to make one up.
+func TestARefreshOfANodeWithNoIdentityOpensNoProvider(t *testing.T) {
+	f := &fakeVerifier{}
+	stageVerifier(t, f)
+
+	OpenTartVerifier = func(*config.Config) (tartVerifier, error) {
+		t.Error("opened a provider")
+
+		return f, nil
+	}
+	peekTartDeployment = func(*config.Config) (string, bool, error) { return "", false, nil }
+
+	cfg := tartConfig(tartTier("a", "ghcr.io/a/b:1@verified", config.WorkloadTrusted))
+	env, out := capturedEnv()
+
+	if err := refreshTartVerified(t.Context(), env, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := verifyDueTartImages(t.Context(), env, cfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(out.String(), "no deployment identity yet") {
+		t.Fatalf("said %s", out.String())
+	}
+}
+
+// THE PROVIDER NEVER MINTS AN IDENTITY: an unenrolled node would then refuse the certificate it
+// is issued, for a command that could not have done anything anyway.
+func TestATartCommandOnANodeWithNoIdentityMakesNone(t *testing.T) {
+	dir := t.TempDir()
+	cfg := tartConfig()
+	cfg.Node.StateDir = dir
+
+	_, err := openTartProvider(cfg)
+	if err == nil || !strings.Contains(err.Error(), "no deployment identity yet") {
+		t.Fatalf("openTartProvider = %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("it wrote %v, %v", entries, err)
+	}
+}
+
+// A NODE'S FILE NEED NOT NAME WHAT ITS JOBS BOOT: the refresh follows the records, for a moved tag
+// as well as a deadline, and asks the way the record's probe was asked.
+func TestTheRefreshFollowsTheRecordsWhereTheFileNamesNoTier(t *testing.T) {
+	const (
+		key   = "ghcr.io/a/recorded:1"
+		local = "my-vm"
+	)
+
+	f := &fakeVerifier{
+		images: []tart.VerifiedImage{
+			{Key: key, Records: []tart.VerifiedRecord{{
+				Base: "base", GuestOS: "darwin", Untrusted: true, Command: []string{"./custom/run.sh"},
+			}}},
+			{Key: local, Records: []tart.VerifiedRecord{{Base: "local"}}},
+			{Key: "ghcr.io/a/none:1"},
+		},
+		due: map[string]tart.VerifiedDue{key + "@verified": {Verify: true}},
+	}
+	stageVerifier(t, f)
+
+	env, _ := capturedEnv()
+
+	if err := refreshTartVerified(t.Context(), env, tartConfig()); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.refreshed != 1 {
+		t.Fatalf("asked GitHub %d times, want once with no tier naming the image", f.refreshed)
+	}
+
+	if err := verifyDueTartImages(t.Context(), env, tartConfig(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(f.askedDue, []string{key + "@verified"}) {
+		t.Fatalf("asked about %v, want the remote record alone", f.askedDue)
+	}
+
+	if len(f.verified) != 1 {
+		t.Fatalf("verified %+v", f.verified)
+	}
+
+	got := f.verified[0]
+	if !got.GuestUntrusted || !got.MacOS || !slices.Equal(got.Command, []string{"./custom/run.sh"}) {
+		t.Fatalf("asked %+v, want it asked as the record's probe was", got)
+	}
+}
+
+// A PROBE OF AN UNTRUSTED TIER'S IMAGE SHOULD NOT TAKE THE DEFAULT NETWORK UNNOTICED, which is
+// what a tier this file cannot see would otherwise mean.
+func TestAVerificationNoTierNamesSaysHowItIsAsked(t *testing.T) {
+	const image = "ghcr.io/a/b:1"
+
+	f := &fakeVerifier{}
+	stageVerifier(t, f)
+
+	env, out := capturedEnv()
+
+	if err := cmdImagesVerifyTart(t.Context(), env, tartConfig(), image, "", false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(out.String(), "--untrusted") {
+		t.Fatalf("said %s", out.String())
+	}
+
+	env, out = capturedEnv()
+
+	if err := cmdImagesVerifyTart(t.Context(), env, tartConfig(), image, "", false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(out.String(), "--untrusted") || !f.verified[1].GuestUntrusted {
+		t.Fatalf("said %s, asked %+v", out.String(), f.verified[1])
+	}
+}
+
+// A TIER SAYING macOS LETS THE PROVIDER REFUSE BEFORE IT PULLS.
+func TestATierSayingMacOSReachesTheVerification(t *testing.T) {
+	const image = "ghcr.io/a/b:1"
+
+	tier := tartTier("m", image, config.WorkloadTrusted)
+	tier.GuestOS = config.GuestMacOS
+
+	opts, known, err := tartVerifyOptions(t.Context(), tartConfig(tier), &fakeVerifier{}, image)
+	if err != nil || !known || !opts.MacOS {
+		t.Fatalf("options %+v, %v, %v", opts, known, err)
+	}
+}
+
+// THE TART BRANCH OF THE COMMAND ITSELF: the deadlines are asked whatever release.automatic says,
+// and an image is verified only under it.
+func TestTheRefreshCommandOnATartNode(t *testing.T) {
+	const image = "ghcr.io/a/b:1@verified"
+
+	for _, tc := range []struct {
+		name      string
+		release   string
+		wantAsked []string
+	}{
+		{name: "automatic", wantAsked: []string{image}},
+		{name: "not automatic", release: "release:\n  automatic: false\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeVerifier{due: map[string]tart.VerifiedDue{image: {Why: "already verified"}}}
+			stageVerifier(t, f)
+
+			dir := t.TempDir()
+			path := filepath.Join(dir, "billet.yaml")
+			body := "node:\n  name: mac-1\n  server_addr: 127.0.0.1:7717\n  provider: tart\n" +
+				"  state_dir: " + filepath.Join(dir, "state") + "\n  lock_dir: " + filepath.Join(dir, "locks") + "\n" +
+				tc.release +
+				"tiers:\n  - label: a\n    provider: tart\n    guest_os: linux\n    vcpu: 2\n    memory: 8GiB\n" +
+				"    image: " + image + "\n"
+
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			env, _ := capturedEnv()
+			if err := cmdImagesRefresh(t.Context(), env, []string{"--config", path}); err != nil {
+				t.Fatalf("refresh: %v", err)
+			}
+
+			if f.refreshed != 1 {
+				t.Errorf("asked GitHub %d times", f.refreshed)
+			}
+
+			if !slices.Equal(f.askedDue, tc.wantAsked) {
+				t.Errorf("asked about %v, want %v", f.askedDue, tc.wantAsked)
+			}
+		})
+	}
+}
+
+// A VERIFICATION ALWAYS RECORDS ON A TART NODE, so a flag saying otherwise refuses rather than
+// be ignored.
+func TestAFlagForAGenerationRefusesOnATartNode(t *testing.T) {
+	f := &fakeVerifier{}
+	stageVerifier(t, f)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "billet.yaml")
+	body := "node:\n  name: mac-1\n  server_addr: 127.0.0.1:7717\n  provider: tart\n" +
+		"  state_dir: " + filepath.Join(dir, "state") + "\n  lock_dir: " + filepath.Join(dir, "locks") + "\n" +
+		"tiers:\n  - label: a\n    provider: tart\n    guest_os: linux\n    vcpu: 2\n    memory: 8GiB\n" +
+		"    image: ghcr.io/a/b:1@verified\n"
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	env, _ := capturedEnv()
+
+	err := cmdImagesVerify(t.Context(), env, []string{"--config", path, "--record=false", "ghcr.io/a/b:1"})
+	if err == nil || !strings.Contains(err.Error(), "--record") {
+		t.Fatalf("answered %v", err)
+	}
+
+	if len(f.verified) != 0 {
+		t.Fatal("verified anyway")
 	}
 }
 
@@ -192,7 +417,7 @@ func TestNoYieldRefusesUnlessTheNodeIsProvedStopped(t *testing.T) {
 			t.Cleanup(func() { tartNodeRunning = prev })
 
 			env, _ := capturedEnv()
-			err := cmdImagesVerifyTart(t.Context(), env, tartConfig(), "ghcr.io/a/b:1", "", true)
+			err := cmdImagesVerifyTart(t.Context(), env, tartConfig(), "ghcr.io/a/b:1", "", true, false)
 
 			if tc.want == "" {
 				if err != nil || len(f.verified) != 1 || !f.verified[0].NoYield {

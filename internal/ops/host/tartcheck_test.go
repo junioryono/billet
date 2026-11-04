@@ -75,6 +75,19 @@ func TestACheckNamesEveryTartTierNobodyVerified(t *testing.T) {
 		t.Errorf("said %s", out.String())
 	}
 
+	out.Reset()
+
+	// VALIDATION REFUSES A DIGEST WITH @verified, so that is not what to advise.
+	reportUnverifiedTartTiers(cli.Env{Stdout: &out}, &config.Config{Tiers: []config.Tier{
+		{Label: "pinned", Provider: config.ProviderTart, Image: "ghcr.io/a/b@sha256:0"},
+	}})
+
+	if strings.Contains(out.String(), "sha256:0@verified") {
+		t.Errorf("advised what validation refuses: %s", out.String())
+	}
+
+	out.Reset()
+
 	for _, label := range []string{"checked", "elsewhere"} {
 		if strings.Contains(out.String(), label) {
 			t.Errorf("named %s: %s", label, out.String())
@@ -90,6 +103,7 @@ type fakeReporter struct {
 	size   int64
 	// refreshed records that GitHub was asked.
 	refreshed *bool
+	orphans   []string
 }
 
 func (f fakeReporter) VerifiedImages(context.Context) ([]tart.VerifiedImage, error) {
@@ -104,6 +118,8 @@ func (f fakeReporter) RefreshDeadlines(context.Context, tart.RunnerWindow) ([]st
 	return nil, nil
 }
 func (f fakeReporter) Slots(context.Context) (tart.SlotReport, error) { return f.slots, nil }
+
+func (f fakeReporter) OrphanProbes(context.Context) ([]string, error) { return f.orphans, nil }
 func (f fakeReporter) StoreSpace(tart.VerifiedRecord) (uint64, int64, error) {
 	return f.free, f.size, nil
 }
@@ -156,7 +172,33 @@ func TestACheckSaysWhatEachVerifiedImageHolds(t *testing.T) {
 		{
 			name: "keeps yielding", free: 1 << 40,
 			image: tart.VerifiedImage{Records: []tart.VerifiedRecord{record}, Yields: 3},
-			want:  []string{"last 3 verification(s) yielded", "local down --node", "--no-yield"},
+			want:  []string{"last 3 verification(s) gave way", "local down --node", "--no-yield"},
+		},
+		{
+			name: "a base removed by hand", free: 1 << 40,
+			image: tart.VerifiedImage{
+				Records:      []tart.VerifiedRecord{record},
+				BaseProblems: map[string]string{"base-1": "it is gone from tart's store"},
+			},
+			want: []string{"base-1: it is gone from tart's store", "next job on its tier fails"},
+		},
+		{
+			name: "an older base and an invalid one", free: 1 << 40,
+			image: tart.VerifiedImage{Records: []tart.VerifiedRecord{
+				record,
+				{Base: "base-older"},
+				{Base: "base-bad", Invalid: "changed"},
+			}},
+			want: []string{"also holds base-older", "base base-bad is invalid"},
+		},
+		{
+			name: "a base waiting and a digest that failed", free: 1 << 40,
+			image: tart.VerifiedImage{
+				Records: []tart.VerifiedRecord{record},
+				Pending: &tart.VerifiedRecord{Base: "base-waiting", Digest: "sha256:1"},
+				Failed:  &tart.FailedDigest{Digest: "sha256:2"},
+			},
+			want: []string{"holds base-waiting", "sha256:2 failed its verification"},
 		},
 		{
 			name: "no room", free: 1 << 30,
@@ -252,6 +294,47 @@ func TestAMaintenanceCheckAsksGitHubNothing(t *testing.T) {
 		if asked != tc.want {
 			t.Errorf("skip %v: asked GitHub %v, want %v; said %s", tc.skip, asked, tc.want, out.String())
 		}
+	}
+}
+
+// A RECORD THIS FILE'S TIERS DO NOT NAME IS STILL REPORTED: the tiers a launch uses are the control
+// plane's, and a base nobody names still holds tens of gigabytes. An orphan probe is named too.
+func TestACheckReportsEveryRecordWhateverThisFileNames(t *testing.T) {
+	prev := openTartReport
+
+	t.Cleanup(func() { openTartReport = prev })
+
+	openTartReport = func(*config.Config) (tartReporter, error) {
+		return fakeReporter{
+			free: 1 << 40,
+			images: []tart.VerifiedImage{{
+				Key: "ghcr.io/a/recorded:1", Records: []tart.VerifiedRecord{{Base: "recorded-base"}},
+			}},
+			orphans: []string{"billetprobe-x"},
+		}, nil
+	}
+
+	cfg := &config.Config{Node: &config.NodeConfig{
+		Name: "mac-1", Provider: config.ProviderTart, StateDir: t.TempDir(),
+	}}
+
+	if err := os.WriteFile(filepath.Join(cfg.Node.StateDir, "deployment-id"),
+		[]byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+
+	reportTartVerified(t.Context(), cli.Env{Stdout: &out}, cfg, []string{"ghcr.io/a/named:1@verified"}, true)
+
+	for _, want := range []string{"as recorded-base", "ghcr.io/a/named:1", "NOT verified", "billetprobe-x"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("said %q, want %q", out.String(), want)
+		}
+	}
+
+	if keys := tartRecordedKeys(t.Context(), cfg); !keys["ghcr.io/a/recorded:1"] {
+		t.Errorf("recorded keys = %v", keys)
 	}
 }
 

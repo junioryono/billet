@@ -127,6 +127,8 @@ type stub struct {
 	guestBin string
 	// deleteHangs makes `tart delete` never return.
 	deleteHangs string
+	// pullFails makes `tart pull` fail, as a network that went away does.
+	pullFails string
 }
 
 func newStub(t *testing.T) *stub {
@@ -178,6 +180,7 @@ func newStub(t *testing.T) *stub {
 		runHolds:          filepath.Join(dir, "run-holds"),
 		guestBin:          filepath.Join(dir, "guest-bin"),
 		deleteHangs:       filepath.Join(dir, "delete-hangs"),
+		pullFails:         filepath.Join(dir, "pull-fails"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -228,6 +231,10 @@ pull)
   name="$1"
   if [ -s "` + s.pullEvicts + `" ]; then
     exit 0
+  fi
+  if [ -e "` + s.pullFails + `" ]; then
+    echo "the network went away" >&2
+    exit 1
   fi
   # A pull by digest in a private store caches the manifest as tart lays it out.
   case "$name" in

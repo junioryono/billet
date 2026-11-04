@@ -1027,7 +1027,7 @@ func TestAMacOSGuestHoldsASlotThroughItsOwnProcess(t *testing.T) {
 	assertSlot(t, p, 2, verifiedLeaseB)
 
 	_, err := p.Launch(t.Context(), spec(verifiedLeaseC))
-	if !errors.Is(err, errNoSlot) {
+	if !errors.Is(err, ErrNoSlot) {
 		t.Fatalf("third = %v, want no slot", err)
 	}
 
@@ -1203,7 +1203,7 @@ func TestTheCensusCountsWhatNoSlotOrTokenAccountsFor(t *testing.T) {
 				t.Fatalf("Launch: %v", err)
 			}
 
-			if !tc.admit && !errors.Is(err, errNoSlot) {
+			if !tc.admit && !errors.Is(err, ErrNoSlot) {
 				t.Fatalf("Launch = %v, want no slot", err)
 			}
 		})
@@ -1348,7 +1348,11 @@ func TestAnUnknownLimitRefusesAProbeAndDefaultsALaunch(t *testing.T) {
 		t.Fatalf("Verify = %v", err)
 	}
 
-	assertNoBases(t, p)
+	// NOT A VERDICT ON THE IMAGE: what was pulled waits for the next verification.
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || len(images) != 1 || images[0].Pending == nil || images[0].Failed != nil {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
 
 	if _, err := p.Launch(t.Context(), validSpec(verifiedLease)); err != nil {
 		t.Fatalf("Launch: %v", err)
@@ -1393,11 +1397,40 @@ func TestAProbeYieldsItsSlotToAJob(t *testing.T) {
 		t.Fatalf("Verify = %v, want it to have yielded", err)
 	}
 
-	assertNoBases(t, p)
-
 	images, err := p.VerifiedImages(t.Context())
-	if err != nil || len(images) != 1 || images[0].Yields != 1 {
-		t.Fatalf("images = %+v, %v, want the yield counted", images, err)
+	if err != nil || len(images) != 1 || images[0].Yields != 1 || images[0].Pending == nil {
+		t.Fatalf("images = %+v, %v, want the yield counted and its base kept", images, err)
+	}
+
+	if len(images[0].Records) != 0 {
+		t.Fatalf("a yield recorded %+v", images[0].Records)
+	}
+
+	// THE NEXT VERIFICATION BOOTS WHAT WAS PULLED, once the job has gone.
+	if _, err := p.Destroy(t.Context(), verifiedLease); err != nil {
+		t.Fatal(err)
+	}
+
+	waitSlotFree(t, p, 1)
+
+	writeExecutable(t, filepath.Join(s.guestBin, "xcodebuild"), "#!/bin/sh\nexit 0\n")
+
+	rec, err := p.Verify(t.Context(), verifyOpts())
+	if err != nil {
+		t.Fatalf("Verify again: %v", err)
+	}
+
+	if rec.Base != images[0].Pending.Base {
+		t.Fatalf("recorded %s, want the kept %s", rec.Base, images[0].Pending.Base)
+	}
+
+	if pulls := envLines(t, s, "pull"); len(pulls) != 1 {
+		t.Fatalf("pulls = %v, want the one", pulls)
+	}
+
+	after, err := p.VerifiedImages(t.Context())
+	if err != nil || after[0].Pending != nil || after[0].Yields != 0 {
+		t.Fatalf("images = %+v, %v, want nothing pending", after, err)
 	}
 
 	names, err := filepath.Glob(p.billetPath(yieldPrefix + "*"))
@@ -1435,7 +1468,7 @@ func TestAProbeThatMayNotYieldKeepsItsSlot(t *testing.T) {
 	waitForFile(t, reached)
 
 	_, err := p.Launch(t.Context(), validSpec(verifiedLease))
-	if !errors.Is(err, errNoSlot) {
+	if !errors.Is(err, ErrNoSlot) {
 		t.Fatalf("Launch = %v, want no slot", err)
 	}
 
@@ -1559,7 +1592,7 @@ func TestALaunchLeavesAProbeWithAVerifierAlone(t *testing.T) {
 	defer verifier.release()
 
 	_, err = p.Launch(t.Context(), validSpec(verifiedLease))
-	if !errors.Is(err, errNoSlot) {
+	if !errors.Is(err, ErrNoSlot) {
 		t.Fatalf("Launch = %v, want no slot", err)
 	}
 
@@ -2868,4 +2901,377 @@ func TestAFailedVerificationKeepsItsBaseOnAnAbsenceThatMayNotLast(t *testing.T) 
 	if _, err := os.Stat(p.vmDir(base)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the base stayed once the absence was durable: %v", err)
 	}
+}
+
+// A MACOS VERIFICATION FINDS OUT IT CANNOT BOOT BEFORE IT PULLS: the image is tens of gigabytes, and
+// a slot or a limit it cannot have would otherwise cost them for nothing.
+func TestAMacOSVerificationRefusesBeforeItPulls(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		limit func() (int, bool, error)
+		ps    string
+		want  string
+	}{
+		{
+			name:  "no record of the limit",
+			limit: func() (int, bool, error) { return 0, false, nil },
+			want:  "no record of its macOS limit",
+		},
+		{
+			name:  "no slot",
+			limit: func() (int, bool, error) { return 1, true, nil },
+			ps:    "111 tart run someone\n",
+			want:  "no macOS guest slot is free",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s, p := verifiedStub(t)
+			setMacOS(t, s, p, guestDarwin)
+			p.macOSLimit = tc.limit
+
+			if err := os.WriteFile(filepath.Join(filepath.Dir(s.bin), "ps.out"), []byte(tc.ps), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			opts := verifyOpts()
+			opts.MacOS = true
+
+			if _, err := p.Verify(t.Context(), opts); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Verify = %v", err)
+			}
+
+			if pulls := envLines(t, s, "pull"); len(pulls) != 0 {
+				t.Fatalf("pulled first: %v", pulls)
+			}
+
+			// NO VERDICT, so a refresh tries it again tomorrow.
+			images, err := p.VerifiedImages(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, image := range images {
+				if image.Failed != nil {
+					t.Fatalf("recorded a failure: %+v", image)
+				}
+			}
+		})
+	}
+}
+
+// A LOCAL VM SAYS WHAT IT IS, whatever a tier does.
+func TestALocalMacOSVMIsKnownBeforeItIsCloned(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+	p.macOSLimit = func() (int, bool, error) { return 0, false, nil }
+
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", "my-vm"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Truncate(s.envLog, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := verifyOpts()
+	opts.Image = "my-vm@verified"
+
+	if _, err := p.Verify(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "no record of its macOS limit") {
+		t.Fatalf("Verify = %v", err)
+	}
+
+	if clones := envLines(t, s, "clone"); len(clones) != 0 {
+		t.Fatalf("cloned first: %v", clones)
+	}
+}
+
+// A BASE WAITING FOR ANOTHER DIGEST IS NOT WHAT THIS ONE BOOTS, and goes.
+func TestAPendingBaseOfAnotherDigestGoes(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+	p.macOSLimit = func() (int, bool, error) { return 0, false, nil }
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified with no limit")
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || len(images) != 1 || images[0].Pending == nil {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	waiting := images[0].Pending.Base
+
+	p.macOSLimit = func() (int, bool, error) { return 2, true, nil }
+
+	setRegistry(t, s, p, "manifest two")
+
+	rec, err := p.Verify(t.Context(), verifyOpts())
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	if rec.Base == waiting {
+		t.Fatal("booted the base of another digest")
+	}
+
+	assertBases(t, p, rec.Base)
+}
+
+// A BASE WAITING WHOSE FILES CHANGED IS NOT WHAT WAS PULLED.
+func TestAPendingBaseThatChangedIsNotBooted(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+	p.macOSLimit = func() (int, bool, error) { return 0, false, nil }
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified with no limit")
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || len(images) != 1 || images[0].Pending == nil {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	waiting := images[0].Pending.Base
+
+	if err := os.WriteFile(filepath.Join(p.vmDir(waiting), baseDisk), []byte("rewritten"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p.macOSLimit = func() (int, bool, error) { return 2, true, nil }
+
+	rec, err := p.Verify(t.Context(), verifyOpts())
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	if rec.Base == waiting {
+		t.Fatal("booted a base that changed")
+	}
+}
+
+// AN UNPROMOTE HOLDS FOR WHAT WAS WAITING TOO: a base of that digest no longer boots.
+func TestUnpromoteTakesAPendingBaseOfItsDigest(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+	rec := mustVerify(t, p)
+
+	if err := p.withRecords(t.Context(), func(st *verifiedState) (bool, error) {
+		waiting := *rec
+		waiting.Base = rec.Base + "-waiting"
+		st.verified.Pending[verifiedRef] = &waiting
+
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", rec.Base+"-waiting"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.Unpromote(t.Context(), verifiedRef, rec.Base); err != nil {
+		t.Fatal(err)
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || images[0].Pending != nil {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	if _, err := os.Stat(p.vmDir(rec.Base + "-waiting")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the base that was waiting stayed: %v", err)
+	}
+}
+
+// THE REFRESH DOES NOT PULL WHAT FAILED AGAIN TOMORROW, for a week, and an operator is not held to
+// that. A digest the tag has moved past is a new question.
+func TestADigestThatFailedWaitsBeforeTheRefreshTriesAgain(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	p.now = func() time.Time { return now }
+	p.probeWindow = 200 * time.Millisecond
+
+	writeExecutable(t, filepath.Join(s.guestHome, "actions-runner", "bin", "Runner.Listener"), "#!/bin/sh\nexit 1\n")
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified a guest that would not answer")
+	}
+
+	due, err := p.ImageDue(t.Context(), verifiedTier)
+	if err != nil || due.Verify || !strings.Contains(due.Why, "failed its verification") {
+		t.Fatalf("ImageDue = %+v, %v", due, err)
+	}
+
+	p.now = func() time.Time { return now.Add(failedRetry) }
+
+	if due, err := p.ImageDue(t.Context(), verifiedTier); err != nil || !due.Verify {
+		t.Fatalf("a week on: %+v, %v", due, err)
+	}
+
+	p.now = func() time.Time { return now }
+
+	setRegistry(t, s, p, "manifest two")
+
+	if due, err := p.ImageDue(t.Context(), verifiedTier); err != nil || !due.Verify {
+		t.Fatalf("a digest the tag moved to: %+v, %v", due, err)
+	}
+
+	setRegistry(t, s, p, "manifest one")
+
+	writeExecutable(t, filepath.Join(s.guestHome, "actions-runner", "bin", "Runner.Listener"), "#!/bin/sh\nprintf '2.337.0\\n'\n")
+	p.probeWindow = 2 * time.Second
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err != nil {
+		t.Fatalf("an operator's own try: %v", err)
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || images[0].Failed != nil {
+		t.Fatalf("images = %+v, %v, want the failure forgotten", images, err)
+	}
+}
+
+// A PULL THAT DID NOT FINISH IS THE NETWORK'S, not the image's, so tomorrow tries again.
+func TestAPullThatDidNotFinishIsNoVerdict(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+
+	if err := os.WriteFile(s.pullFails, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified through a failed pull")
+	}
+
+	if due, err := p.ImageDue(t.Context(), verifiedTier); err != nil || !due.Verify {
+		t.Fatalf("ImageDue = %+v, %v", due, err)
+	}
+}
+
+// AN EMPTY MARKER IS A CRASH BETWEEN ITS CREATION AND ITS WRITE, which would otherwise wedge every
+// later verification of the image.
+func TestAnEmptyMarkerInOurOwnNamesIsAMissingOne(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+
+	name := basePrefix + testOwner + "-abc-1"
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", name); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(p.vmDir(name), ownerMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := p.deleteOwnedVM(t.Context(), name); err != nil {
+		t.Fatalf("deleteOwnedVM: %v", err)
+	}
+
+	if _, err := os.Stat(p.vmDir(name)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("it stayed: %v", err)
+	}
+}
+
+// A PROBE NO VERIFICATION OWNS IS NAMED: a local VM's may never see another verification, and a
+// Linux one takes no slot and is reserved nothing. One that has a verifier, or another
+// deployment's, is not this report's.
+func TestOrphanProbesAreNamed(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+
+	orphan := p.probeName("ghcr.io/a/orphan:1")
+	owned := p.probeName("ghcr.io/a/owned:1")
+	foreign := probePrefix + "fedcba9876543210fedcba9876543210-abc"
+
+	for _, name := range []string{orphan, owned, foreign} {
+		if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	held, err := lockPath(t.Context(), p.verificationLockPath(hashName("ghcr.io/a/owned:1")), syscall.LOCK_EX, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer held.release()
+
+	got, err := p.OrphanProbes(t.Context())
+	if err != nil || !slices.Equal(got, []string{orphan}) {
+		t.Fatalf("OrphanProbes = %v, %v, want %s", got, err, orphan)
+	}
+}
+
+// WHAT A CHECK SAYS OF A BASE COMES FROM ITS FILES, and reading them marks nothing.
+func TestAReportReadsABasesFilesAndMarksNothing(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+	rec := mustVerify(t, p)
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || images[0].BaseProblems[rec.Base] != "" {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	if err := os.RemoveAll(p.vmDir(rec.Base)); err != nil {
+		t.Fatal(err)
+	}
+
+	images, err = p.VerifiedImages(t.Context())
+	if err != nil || !strings.Contains(images[0].BaseProblems[rec.Base], "gone") {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	if images[0].Records[0].Invalid != "" {
+		t.Fatalf("a report marked it invalid: %+v", images[0].Records[0])
+	}
+}
+
+// A BASE THAT WAITED AND THEN FAILED ITS PROBE GOES, and the document stops naming it.
+func TestAPendingBaseThatFailsItsProbeGoes(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+	p.macOSLimit = func() (int, bool, error) { return 0, false, nil }
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified with no limit")
+	}
+
+	p.macOSLimit = func() (int, bool, error) { return 2, true, nil }
+	p.probeWindow = 200 * time.Millisecond
+
+	writeExecutable(t, filepath.Join(s.guestHome, "actions-runner", "bin", "Runner.Listener"), "#!/bin/sh\nexit 1\n")
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified a guest that would not answer")
+	}
+
+	images, err := p.VerifiedImages(t.Context())
+	if err != nil || images[0].Pending != nil || images[0].Failed == nil {
+		t.Fatalf("images = %+v, %v", images, err)
+	}
+
+	assertNoBases(t, p)
 }

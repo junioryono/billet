@@ -63,6 +63,10 @@ type VerifiedRecord struct {
 	// GuestOS is tart's own word for the base: darwin or linux.
 	GuestOS    string    `json:"guest_os"`
 	VerifiedAt time.Time `json:"verified_at"`
+	// Command and Untrusted are what the probe was asked with, so a refresh on a node whose
+	// file names no tier for this image asks the same way again.
+	Command   []string `json:"command,omitempty"`
+	Untrusted bool     `json:"untrusted,omitempty"`
 	// Files are the identities of the base's disk, configuration and NVRAM, never its
 	// directory, whose change time tart touches on every clone.
 	Files []baseFile `json:"files"`
@@ -93,6 +97,19 @@ type verifiedDocument struct {
 	// by every record of that version and never erased by a could-not-tell or by a base
 	// going away.
 	Deadlines map[string]time.Time `json:"deadlines"`
+	// Pending holds, by image, a base pulled and hashed whose probe got no slot or gave its
+	// slot to a job. It is no verdict on the image, so the next verification of that digest
+	// boots it rather than pull tens of gigabytes again. No launch resolves one.
+	Pending map[string]*VerifiedRecord `json:"pending,omitempty"`
+	// Failed holds, by image, the digest whose verification last failed, which the refresh
+	// leaves for a while rather than pull it every day until its tag moves.
+	Failed map[string]FailedDigest `json:"failed,omitempty"`
+}
+
+// FailedDigest is a digest a verification found wanting, and when.
+type FailedDigest struct {
+	Digest string    `json:"digest"`
+	At     time.Time `json:"at"`
 }
 
 // verifiedState is the document, read under the record lock.
@@ -200,6 +217,14 @@ func (p *Provider) loadVerifiedState() (*verifiedState, error) {
 
 	if st.verified.Deadlines == nil {
 		st.verified.Deadlines = map[string]time.Time{}
+	}
+
+	if st.verified.Pending == nil {
+		st.verified.Pending = map[string]*VerifiedRecord{}
+	}
+
+	if st.verified.Failed == nil {
+		st.verified.Failed = map[string]FailedDigest{}
 	}
 
 	return st, nil

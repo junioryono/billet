@@ -46,6 +46,16 @@ const answerLimit = 4096
 // the operator runs it again.
 var ErrYielded = errors.New("the verification yielded its macOS slot to a job, so it recorded nothing")
 
+// errNotBooted is a probe that never started, which says nothing about its image.
+var errNotBooted = errors.New("take a place for the probe")
+
+// errPull is a pull that did not finish, which is the network's fault until shown otherwise.
+var errPull = errors.New("pull into a private store")
+
+// failedRetry is how long the refresh leaves a digest that failed. The operator's own
+// `billet images verify` is not held to it.
+const failedRetry = 7 * 24 * time.Hour
+
 // runnerVersion is the one thing billet takes from a guest, and only once it matches.
 var runnerVersion = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
@@ -72,6 +82,9 @@ type VerifyOptions struct {
 	Command []string
 	// GuestUntrusted boots the probe with the network flags of untrusted work.
 	GuestUntrusted bool
+	// MacOS says a tier knows this image's guest is macOS, so a limit or a slot it cannot
+	// have refuses before tens of gigabytes are pulled. Its own config has the last word.
+	MacOS bool
 	// NoYield keeps a macOS probe going when a job asks for its slot.
 	NoYield bool
 	// Progress receives tart's pull output.
@@ -83,6 +96,69 @@ type VerifyOptions struct {
 // Verify makes a base of an image, boots a clone of it and records it only once the
 // guest answered and the clone is proved gone (ADR-021).
 func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRecord, error) {
+	attempted := ""
+
+	rec, err := p.verify(ctx, opts, &attempted)
+
+	// A VERDICT ON THE IMAGE IS REMEMBERED, so the refresh does not pull it again tomorrow.
+	// A probe that never started, a yield, a pull that did not finish and a caller that
+	// gave up are not verdicts.
+	if err != nil && attempted != "" && ctx.Err() == nil && !errors.Is(err, ErrYielded) &&
+		!errors.Is(err, ErrNoSlot) && !errors.Is(err, errNotBooted) && !errors.Is(err, errPull) {
+		p.recordFailure(ctx, config.TartImageKey(opts.Image), attempted)
+	}
+
+	return rec, err
+}
+
+// recordFailure notes a digest found wanting. A failure only costs a pull tomorrow.
+func (p *Provider) recordFailure(ctx context.Context, key, digest string) {
+	cleanCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+
+	err := p.withRecords(cleanCtx, func(st *verifiedState) (bool, error) {
+		st.verified.Failed[key] = FailedDigest{Digest: digest, At: p.now().UTC()}
+
+		return true, nil
+	})
+	if err != nil {
+		p.log.Warn("could not record a digest that failed its verification", "image", key, "error", err)
+	}
+}
+
+// precheckGuest refuses what a macOS probe could not do, before the pull: a limit this node
+// has no record of, or no slot to take. The slot is not held, since a pull takes an hour and
+// a job may want it, so the claim is asked again at the boot. A guest not known to be macOS
+// finds out from the base it pulled, which is kept for the next verification.
+func (p *Provider) precheckGuest(ctx context.Context, key string, opts VerifyOptions) error {
+	macOS := opts.MacOS
+
+	if !config.TartImageIsRemote(key) {
+		if guestOS, err := p.guestOSOf(key); err == nil {
+			macOS = guestOS == guestDarwin
+		}
+	}
+
+	if !macOS {
+		return nil
+	}
+
+	limit, err := p.macOSLimitFor(true)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errNotBooted, err)
+	}
+
+	f, _, err := p.admitMacOS(ctx, p.probeName(key), limit)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errNotBooted, err)
+	}
+
+	_ = f.Close()
+
+	return nil
+}
+
+func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *string) (*VerifiedRecord, error) {
 	if p.stateDir == "" {
 		return nil, errors.New("tart: verify: this provider was built without node.state_dir")
 	}
@@ -135,7 +211,19 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 		}
 	}
 
-	var generation, epoch int64
+	if err := p.precheckGuest(ctx, key, opts); err != nil {
+		if errors.Is(err, ErrNoSlot) {
+			p.countYield(ctx, key)
+		}
+
+		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+	}
+
+	var (
+		generation, epoch int64
+		pending           *VerifiedRecord
+		stale             string
+	)
 
 	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
 		if opts.Digest == "" && st.isWithdrawn(key, digest) {
@@ -144,23 +232,55 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 		}
 
 		img := st.image(key)
-		generation, epoch = img.NextGeneration, img.UnpromoteEpoch
-		img.NextGeneration++
+		epoch = img.UnpromoteEpoch
+
+		// THE SAME DIGEST WITH ITS FILES UNTOUCHED BOOTS WHAT WAS PULLED. Anything else is
+		// not that base any more.
+		if kept := st.verified.Pending[key]; kept != nil {
+			files, err := fileIdentities(p.vmDir(kept.Base))
+			if err == nil && digest != "" && kept.Digest == digest && slices.Equal(files, kept.Files) {
+				pending = kept
+			} else {
+				stale = kept.Base
+				delete(st.verified.Pending, key)
+			}
+		}
+
+		if pending == nil {
+			generation = img.NextGeneration
+			img.NextGeneration++
+		}
 
 		return true, nil
 	}); err != nil {
 		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
 	}
 
-	rec, err := p.makeBase(ctx, key, digest, generation, opts.Progress)
-	if err != nil {
-		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+	if stale != "" {
+		if err := p.deleteBase(ctx, stale); err != nil {
+			p.log.Error("could not remove a base no record names; the next verification of its "+
+				"image removes it", "vm", stale, "error", err)
+		}
 	}
 
-	committed := false
+	*attempted = digest
+
+	rec := pending
+
+	if rec == nil {
+		var err error
+
+		if rec, err = p.makeBase(ctx, key, digest, generation, opts.Progress); err != nil {
+			return nil, fmt.Errorf("tart: verify %s: %w", key, err)
+		}
+	}
+
+	rec.Command, rec.Untrusted = slices.Clone(opts.Command), opts.GuestUntrusted
+
+	committed, kept := false, false
 
 	defer func() {
-		if !committed {
+		if !committed && !kept {
 			cleanCtx, cancel := cleanupContext(ctx)
 			defer cancel()
 
@@ -170,8 +290,12 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 
 	runner, err := p.runProbe(ctx, *rec, opts, netFlags)
 	if err != nil {
-		if errors.Is(err, ErrYielded) {
+		if errors.Is(err, ErrYielded) || errors.Is(err, ErrNoSlot) {
 			p.countYield(ctx, key)
+		}
+
+		if digest != "" && (errors.Is(err, ErrYielded) || errors.Is(err, errNotBooted)) {
+			kept = p.keepPending(ctx, key, rec)
 		}
 
 		return nil, fmt.Errorf("tart: verify %s: %w", key, err)
@@ -223,6 +347,8 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 		}
 
 		img.Yields = 0
+		delete(st.verified.Pending, key)
+		delete(st.verified.Failed, key)
 		st.verified.Records = append(st.verified.Records, *rec)
 		dropped = retainBases(st, key)
 
@@ -242,6 +368,26 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 	return rec, nil
 }
 
+// keepPending notes a base the next verification of its digest may boot, and answers whether
+// it did, since a base no document names goes with the verification that made it.
+func (p *Provider) keepPending(ctx context.Context, key string, rec *VerifiedRecord) bool {
+	cleanCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+
+	err := p.withRecords(cleanCtx, func(st *verifiedState) (bool, error) {
+		st.verified.Pending[key] = rec
+
+		return true, nil
+	})
+	if err != nil {
+		p.log.Warn("could not keep a pulled base for the next verification", "vm", rec.Base, "error", err)
+
+		return false
+	}
+
+	return true
+}
+
 // discardUnrecordedBase removes a failed verification's base, once the records positively
 // do not name it. A commit that failed can still have installed them, since a durable write
 // reports a directory sync that failed after its rename, and deleting then would leave a
@@ -254,6 +400,13 @@ func (p *Provider) discardUnrecordedBase(ctx context.Context, key, base string) 
 		named = slices.ContainsFunc(st.recordsOf(key), func(r VerifiedRecord) bool { return r.Base == base })
 		if named {
 			return false, nil
+		}
+
+		// A BASE THAT WAS WAITING AND THEN FAILED ITS PROBE IS WAITING NO LONGER.
+		if kept := st.verified.Pending[key]; kept != nil && kept.Base == base {
+			delete(st.verified.Pending, key)
+
+			return true, nil
 		}
 
 		// AN ABSENCE THAT AUTHORISES A DELETE MUST BE DURABLE, as in cleanVerification.
@@ -350,6 +503,10 @@ func (p *Provider) cleanVerification(ctx context.Context, key string) error {
 			named[records[i].Base] = true
 		}
 
+		if kept := st.verified.Pending[key]; kept != nil {
+			named[kept.Base] = true
+		}
+
 		// AN ABSENCE THAT AUTHORISES A DELETE MUST BE DURABLE: a commit can report a sync
 		// that failed after its rename, and a crash could then bring back a document naming
 		// a base this has removed.
@@ -415,7 +572,7 @@ func (p *Provider) runProbe(
 
 	claim, err := p.claimGuest(ctx, probe, rec.GuestOS, true)
 	if err != nil {
-		return "", fmt.Errorf("take a place for the probe: %w", err)
+		return "", fmt.Errorf("%w: %w", errNotBooted, err)
 	}
 
 	defer claim.release()
@@ -937,6 +1094,11 @@ func (p *Provider) Unpromote(ctx context.Context, image, base string) ([]string,
 			return r.Base == base || (target.Digest != "" && r.Digest == target.Digest)
 		})
 
+		if kept := st.verified.Pending[key]; kept != nil && target.Digest != "" && kept.Digest == target.Digest {
+			dropped = append(dropped, kept.Base)
+			delete(st.verified.Pending, key)
+		}
+
 		return true, nil
 	})
 	if err != nil {
@@ -985,6 +1147,9 @@ func (p *Provider) ImageDue(ctx context.Context, image string) (VerifiedDue, err
 			return r.Digest == digest && r.Invalid == ""
 		}):
 			due.Why = digest + " is already verified"
+		case st.verified.Failed[key].Digest == digest && p.now().Sub(st.verified.Failed[key].At) < failedRetry:
+			due.Why = digest + " failed its verification on " + st.verified.Failed[key].At.Format(time.DateOnly) +
+				", so the refresh leaves it for a week; `billet images verify` tries it now"
 		default:
 			due.Verify = true
 			due.Why = "the tag names " + digest + ", which is not verified"
@@ -1004,6 +1169,12 @@ type VerifiedImage struct {
 	Yields    int
 	// Deadlines holds the stored date of each record's runner that has one.
 	Deadlines map[string]time.Time
+	// Pending is a base waiting for its probe, and Failed the digest that last failed.
+	Pending *VerifiedRecord
+	Failed  *FailedDigest
+	// BaseProblems says, by base, what no longer holds of a record's files: a job's launch
+	// refuses on it, and only reading them says so.
+	BaseProblems map[string]string
 }
 
 // VerifiedImages reads what this node has recorded.
@@ -1027,10 +1198,21 @@ func (p *Provider) VerifiedImages(ctx context.Context) ([]VerifiedImage, error) 
 				Deadlines: map[string]time.Time{},
 			}
 
+			image.Pending = st.verified.Pending[key]
+			image.BaseProblems = map[string]string{}
+
+			if failed, ok := st.verified.Failed[key]; ok {
+				image.Failed = &failed
+			}
+
 			for i := range image.Records {
 				runner := image.Records[i].Runner
 				if deadline, ok := st.verified.Deadlines[runner]; ok {
 					image.Deadlines[runner] = deadline
+				}
+
+				if problem := p.baseProblem(&image.Records[i]); problem != "" {
+					image.BaseProblems[image.Records[i].Base] = problem
 				}
 			}
 
@@ -1041,6 +1223,63 @@ func (p *Provider) VerifiedImages(ctx context.Context) ([]VerifiedImage, error) 
 	})
 
 	return images, err
+}
+
+// baseProblem says what no longer holds of a record's files, without marking anything: only a
+// launch that is about to boot a copy does that.
+func (p *Provider) baseProblem(rec *VerifiedRecord) string {
+	files, err := fileIdentities(p.vmDir(rec.Base))
+
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "it is gone from tart's store"
+	case errors.Is(err, errNotRegular):
+		return "its files are not the ones billet probed"
+	case err != nil:
+		return "its files could not be read: " + err.Error()
+	case !slices.Equal(files, rec.Files):
+		return "its files are not the ones billet probed"
+	default:
+		return ""
+	}
+}
+
+// OrphanProbes names this deployment's probes no verification owns, which nothing removes
+// until the image's next verification or a job needing a slot. A local VM's may never see
+// either, and a Linux one takes no slot and is reserved no CPU or memory.
+func (p *Provider) OrphanProbes(ctx context.Context) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(p.home, "vms"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("list tart's store: %w", err)
+	}
+
+	var orphans []string
+
+	for _, entry := range entries {
+		hash, ours := strings.CutPrefix(entry.Name(), probePrefix+p.owner+"-")
+		if !ours {
+			continue
+		}
+
+		lock, err := openLockFile(p.verificationLockPath(hash))
+		if err != nil {
+			return nil, err
+		}
+
+		free := waitFlock(ctx, lock, syscall.LOCK_SH, lockSettle) == nil
+
+		_ = lock.Close()
+
+		if free {
+			orphans = append(orphans, entry.Name())
+		}
+	}
+
+	return orphans, nil
 }
 
 // RefreshDeadlines asks GitHub again for every recorded runner and stores each date it

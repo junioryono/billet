@@ -51,8 +51,9 @@ const yieldWait = 2 * time.Minute
 // yieldRetry is how often a waiting launch asks again.
 const yieldRetry = 2 * time.Second
 
-// errNoSlot is a start the limit refuses, as distinct from one billet could not judge.
-var errNoSlot = errors.New("no macOS guest slot is free")
+// ErrNoSlot is a start the limit refuses, as distinct from one billet could not judge.
+// To a verification it is not a verdict on the image: the next one runs it again.
+var ErrNoSlot = errors.New("no macOS guest slot is free")
 
 // guestClaim is what a guest's start holds until it has passed it to `tart run`.
 type guestClaim struct {
@@ -145,7 +146,8 @@ func (p *Provider) macOSLimitFor(isProbe bool) (int, error) {
 	if isProbe {
 		return 0, errors.New("this node has no record of its macOS limit, which its control plane " +
 			"sends at registration, so a macOS probe cannot be counted against it; start the node " +
-			"so it registers, and run this again")
+			"so it registers, and run this again, or upgrade a control plane older than wire 38, " +
+			"which does not send it")
 	}
 
 	return config.DefaultMacOSVMLimit, nil
@@ -222,7 +224,7 @@ func (p *Provider) admitLaunch(ctx context.Context, name string, limit int) (*gu
 			return &guestClaim{files: []*os.File{f}}, nil
 		}
 
-		if !errors.Is(err, errNoSlot) || len(probes) == 0 {
+		if !errors.Is(err, ErrNoSlot) || len(probes) == 0 {
 			return nil, err
 		}
 
@@ -252,7 +254,7 @@ func (p *Provider) admitLaunch(ctx context.Context, name string, limit int) (*gu
 			}
 
 			return nil, fmt.Errorf("a probe holding a macOS slot did not yield within %s: %w",
-				p.yieldWait, errNoSlot)
+				p.yieldWait, ErrNoSlot)
 		case <-retry.C:
 		}
 	}
@@ -310,7 +312,7 @@ type slotCensus struct {
 	uncounted []string
 }
 
-// admitMacOS takes a slot for name, or answers errNoSlot with the probes holding some.
+// admitMacOS takes a slot for name, or answers ErrNoSlot with the probes holding some.
 // The whole judgement is under the slot lock, so admission sees one count from start to
 // finish.
 func (p *Provider) admitMacOS(ctx context.Context, name string, limit int) (*os.File, []string, error) {
@@ -358,7 +360,7 @@ func (p *Provider) admitMacOS(ctx context.Context, name string, limit int) (*os.
 			strings.Join(census.uncounted, "; "))
 	}
 
-	return nil, census.probes, fmt.Errorf("%w: %s", errNoSlot, why)
+	return nil, census.probes, fmt.Errorf("%w: %s", ErrNoSlot, why)
 }
 
 // settleSlotCount compares this deployment's limit with the count recorded in the store,

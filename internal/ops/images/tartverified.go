@@ -23,6 +23,7 @@ type tartVerifier interface {
 	Unpromote(ctx context.Context, image, base string) ([]string, error)
 	ImageDue(ctx context.Context, image string) (tart.VerifiedDue, error)
 	RefreshDeadlines(ctx context.Context, window tart.RunnerWindow) ([]string, error)
+	VerifiedImages(ctx context.Context) ([]tart.VerifiedImage, error)
 }
 
 // OpenTartVerifier builds this node's provider as a launch would, with its real
@@ -32,10 +33,21 @@ var OpenTartVerifier = func(cfg *config.Config) (tartVerifier, error) {
 	return openTartProvider(cfg)
 }
 
+// peekTartDeployment reads which deployment this node is in without making one up. A variable
+// so a test can answer for a node's identity.
+var peekTartDeployment = app.PeekNodeDeploymentID
+
+// openTartProvider never mints an identity: a node that has not enrolled would then refuse
+// the certificate it is issued, for a command that could not have done anything anyway.
 func openTartProvider(cfg *config.Config) (*tart.Provider, error) {
-	deployment, err := verifyDeploymentID(cfg)
+	deployment, known, err := peekTartDeployment(cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not tell which deployment this node is in: %w", err)
+	}
+
+	if !known {
+		return nil, errors.New("this node has no deployment identity yet, and a verified image is " +
+			"its deployment's; start it with `billet local up`, or finish `billet join`, first")
 	}
 
 	prov, err := app.NewProvider(cfg, deployment)
@@ -97,13 +109,18 @@ func TartRunnerWindow(now func() time.Time) tart.RunnerWindow {
 	}
 }
 
-// tartVerifyOptions is what one reference is verified with: the command and trust of the
-// tiers this node would boot it for, which another node's tiers say nothing about. A tier
-// that accepts untrusted work boots its guests under isolation, so a probe of its image
-// does too. A reference no tier names is an operator's own, and boots the published
-// images' default command as trusted work. Two tiers naming one image with different
-// commands refuse, since a probe asks where one runner is.
-func tartVerifyOptions(cfg *config.Config, image string) (tart.VerifyOptions, error) {
+// tartVerifyOptions is what one reference is verified with: the command and trust of the tiers
+// this node would boot it for, which another node's tiers say nothing about. A tier that accepts
+// untrusted work boots its guests under isolation, so a probe of its image does too. Two tiers
+// naming one image with different commands refuse, since a probe asks where one runner is.
+//
+// A NODE'S FILE NEED NOT NAME THE TIER, which reaches it in each launch from the control plane's.
+// So a reference no local tier names is asked as its newest record was. One with no record either
+// is an operator's own, and boots the published images' default command as trusted work; the
+// answer says so, because the node cannot see whether a tier takes untrusted work.
+func tartVerifyOptions(
+	ctx context.Context, cfg *config.Config, p tartVerifier, image string,
+) (tart.VerifyOptions, bool, error) {
 	opts := tart.VerifyOptions{
 		Image:   image,
 		Command: (config.Tier{}).RunnerCommandFor(config.ProviderTart),
@@ -112,7 +129,7 @@ func tartVerifyOptions(cfg *config.Config, image string) (tart.VerifyOptions, er
 
 	tiers, err := tartLocalTiers(cfg)
 	if err != nil {
-		return opts, err
+		return opts, false, err
 	}
 
 	key := config.TartImageKey(image)
@@ -125,9 +142,9 @@ func tartVerifyOptions(cfg *config.Config, image string) (tart.VerifyOptions, er
 
 		command := t.RunnerCommandFor(config.ProviderTart)
 		if named && !slices.Equal(command, opts.Command) {
-			return opts, fmt.Errorf("the tiers on this node booting %s name different commands, %v and "+
-				"%v, and a probe asks where one runner is; give them one command, or one image each",
-				image, opts.Command, command)
+			return opts, false, fmt.Errorf("the tiers on this node booting %s name different commands, "+
+				"%v and %v, and a probe asks where one runner is; give them one command, or one image "+
+				"each", image, opts.Command, command)
 		}
 
 		opts.Command, named = command, true
@@ -135,14 +152,43 @@ func tartVerifyOptions(cfg *config.Config, image string) (tart.VerifyOptions, er
 		if t.Trust != config.WorkloadTrusted {
 			opts.GuestUntrusted = true
 		}
+
+		if t.GuestOS == config.GuestMacOS {
+			opts.MacOS = true
+		}
 	}
 
-	return opts, nil
+	if named {
+		return opts, true, nil
+	}
+
+	images, err := p.VerifiedImages(ctx)
+	if err != nil {
+		return opts, false, err
+	}
+
+	for i := range images {
+		if images[i].Key != key || len(images[i].Records) == 0 {
+			continue
+		}
+
+		newest := &images[i].Records[0]
+		if len(newest.Command) > 0 {
+			opts.Command = newest.Command
+		}
+
+		opts.GuestUntrusted = newest.Untrusted
+		opts.MacOS = newest.GuestOS == "darwin"
+
+		return opts, true, nil
+	}
+
+	return opts, false, nil
 }
 
 // cmdImagesVerifyTart is `billet images verify <image>` on a Mac.
 func cmdImagesVerifyTart(
-	ctx context.Context, env cli.Env, cfg *config.Config, image, digest string, noYield bool,
+	ctx context.Context, env cli.Env, cfg *config.Config, image, digest string, noYield, untrusted bool,
 ) error {
 	if noYield {
 		active, err := tartNodeRunning(ctx)
@@ -166,9 +212,21 @@ func cmdImagesVerifyTart(
 		return fmt.Errorf("billet images verify: %w", err)
 	}
 
-	opts, err := tartVerifyOptions(cfg, image)
+	opts, known, err := tartVerifyOptions(ctx, cfg, p, image)
 	if err != nil {
 		return fmt.Errorf("billet images verify: %w", err)
+	}
+
+	if untrusted {
+		opts.GuestUntrusted = true
+	}
+
+	// SAID, because the tier that decides this may be in another machine's file, and a probe
+	// of an untrusted tier's image should not have taken the default network unnoticed.
+	if !known && !opts.GuestUntrusted {
+		fmt.Fprintf(env.Stdout, "note     no tier in this file names %s, so its probe boots as trusted work "+
+			"with the default command; if a tier on the control plane takes untrusted work with it, run "+
+			"this with --untrusted\n", image)
 	}
 
 	opts.Digest, opts.NoYield, opts.Progress = digest, noYield, env.Stderr
@@ -229,16 +287,14 @@ func splitTartBase(spec string) (string, string, error) {
 		"<image>@<base>, as `billet check` lists them", spec)
 }
 
-// refreshTartVerified asks GitHub again for every recorded runner, whatever
-// release.automatic says, since a deadline is a fact rather than an update, and answers
-// the runners whose window it could not tell.
+// refreshTartVerified asks GitHub again for every recorded runner, whatever release.automatic
+// says, since a deadline is a fact rather than an update, and answers the runners whose window
+// it could not tell. It follows the records rather than the file: the tiers a launch uses are
+// the control plane's, so a node's file can name no `@verified` while its jobs boot one.
 func refreshTartVerified(ctx context.Context, env cli.Env, cfg *config.Config) error {
-	images, err := tartVerifiedImages(cfg)
-	if err != nil {
+	if _, known, err := peekTartDeployment(cfg); err != nil {
 		return fmt.Errorf("billet images refresh: %w", err)
-	}
-
-	if len(images) == 0 {
+	} else if !known {
 		return nil
 	}
 
@@ -260,22 +316,44 @@ func refreshTartVerified(ctx context.Context, env cli.Env, cfg *config.Config) e
 	return nil
 }
 
-// verifyDueTartImages verifies each remote `@verified` reference whose tag now names a
-// new digest, macOS included. One that fails stops none of the others. A verification
-// that yielded to a job is not a failure: the next refresh runs it again.
+// verifyDueTartImages verifies each remote `@verified` reference whose tag now names a new
+// digest, macOS included: those this file's tiers name and those this node has records of. One
+// that fails stops none of the others. A verification that yielded to a job or found no slot is
+// not a failure: the next refresh runs it again.
 func verifyDueTartImages(ctx context.Context, env cli.Env, cfg *config.Config, dryRun bool) error {
-	images, err := tartVerifiedImages(cfg)
+	named, err := tartVerifiedImages(cfg)
 	if err != nil {
 		return fmt.Errorf("billet images refresh: %w", err)
 	}
 
-	if len(images) == 0 {
+	if _, known, err := peekTartDeployment(cfg); err != nil {
+		return fmt.Errorf("billet images refresh: %w", err)
+	} else if !known {
+		for _, image := range named {
+			fmt.Fprintf(env.Stdout, "image    %-56s not verified: this node has no deployment identity yet\n", image)
+		}
+
 		return nil
 	}
 
 	p, err := OpenTartVerifier(cfg)
 	if err != nil {
 		return fmt.Errorf("billet images refresh: %w", err)
+	}
+
+	recorded, err := p.VerifiedImages(ctx)
+	if err != nil {
+		return fmt.Errorf("billet images refresh: %w", err)
+	}
+
+	images := slices.Clone(named)
+
+	for i := range recorded {
+		key := recorded[i].Key
+		if len(recorded[i].Records) > 0 && config.TartImageIsRemote(key) &&
+			!slices.ContainsFunc(images, func(image string) bool { return config.TartImageKey(image) == key }) {
+			images = append(images, key+"@verified")
+		}
 	}
 
 	var failures []error
@@ -294,7 +372,7 @@ func verifyDueTartImages(ctx context.Context, env cli.Env, cfg *config.Config, d
 			continue
 		}
 
-		opts, err := tartVerifyOptions(cfg, image)
+		opts, _, err := tartVerifyOptions(ctx, cfg, p, image)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s: %w", image, err))
 
@@ -306,7 +384,7 @@ func verifyDueTartImages(ctx context.Context, env cli.Env, cfg *config.Config, d
 		rec, err := p.Verify(ctx, opts)
 
 		switch {
-		case errors.Is(err, tart.ErrYielded):
+		case errors.Is(err, tart.ErrYielded), errors.Is(err, tart.ErrNoSlot):
 			fmt.Fprintf(env.Stdout, "image    %-56s %v\n", image, err)
 		case err != nil:
 			failures = append(failures, fmt.Errorf("%s: %w", image, err))
