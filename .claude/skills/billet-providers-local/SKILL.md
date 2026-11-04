@@ -31,6 +31,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Two defects survived every unit test and died on the first real launch**
 - **A restore loads paused, links its snapshot read-only, and is configured only by the jailer.**
 - **A guest's network policy goes on its tap's name before the tap exists, and comes off only on proof it is gone.**
+- **A frame to a link-local MAC never reaches the bridge's prerouting hook, so no rule there sees it.**
 
 ### Tart: [references/tart.md](references/tart.md)
 

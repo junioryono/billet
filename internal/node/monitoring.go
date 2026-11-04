@@ -622,6 +622,7 @@ type EgressHost interface {
 	Take(key string) (egress.Record, bool)
 	Forget(key string)
 	Reconcile(ctx context.Context, running map[string]bool)
+	Verify(ctx context.Context)
 	HandOver(ctx context.Context)
 }
 

@@ -26,6 +26,7 @@ type fakeEgressHost struct {
 	forgotten  []string
 	reconciled []map[string]bool
 	handedOver int
+	verified   int
 }
 
 func (f *fakeEgressHost) Take(key string) (egress.Record, bool) {
@@ -59,6 +60,13 @@ func (f *fakeEgressHost) Reconcile(_ context.Context, running map[string]bool) {
 	defer f.mu.Unlock()
 
 	f.reconciled = append(f.reconciled, running)
+}
+
+func (f *fakeEgressHost) Verify(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.verified++
 }
 
 func (f *fakeEgressHost) HandOver(context.Context) {
@@ -411,6 +419,28 @@ func TestAReportHoldsWithinItsBounds(t *testing.T) {
 	small := jobEgressOf(egress.Record{Listed: true, DeniedPackets: 2, OutsideResolverPackets: 9}, nil)
 	if err := small.Validate(); err != nil {
 		t.Errorf("the plane would refuse this: %v", err)
+	}
+}
+
+// A SWEEP ASKS WHETHER A LIST'S RULES STILL HOLD: a healthy node may not register again for the
+// length of a job, and something that took them away has left it open until something looks.
+func TestASweepChecksThatListsAreStillInForce(t *testing.T) {
+	t.Parallel()
+
+	a, host := newAllocatorWithHost(t)
+	eh := &fakeEgressHost{}
+	p := &enforcingProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, host: eh}
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithEgress(eh, true))
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	eh.mu.Lock()
+	defer eh.mu.Unlock()
+
+	if eh.verified != 1 {
+		t.Fatalf("verified %d times", eh.verified)
 	}
 }
 

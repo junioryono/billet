@@ -41,6 +41,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The replay harness drives a workload through the real scheduler at compressed time, and steers exactly two things.**
 - **Generated shell is executed, never pattern-matched.**
 - **Real and live tests skip without their resource and never spend money by accident.**
+- **A test that changes routes and sysctls runs in a network namespace that is thrown away.**
 - **PostgreSQL is tested against a real server or not at all.**
 - **Coverage is a signal, not a goal.**
 - **A benchmark measures the ledger the run exercises, and a change to the hot paths shows its numbers before and after.**

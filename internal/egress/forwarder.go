@@ -26,6 +26,8 @@ const (
 	tcpIdleLimit = 10 * time.Second
 	// maxInFlight bounds what one guest has outstanding, across both protocols.
 	maxInFlight = 128
+	// maxFollowed bounds the names an allowed name's answers may lead a guest to.
+	maxFollowed = 1024
 	// maxResponse is the largest DNS message there is.
 	maxResponse = 65535
 )
@@ -52,6 +54,11 @@ type forwarder struct {
 	// clients is the guest's subnet. A query from elsewhere goes unanswered, since an
 	// answer would be the host sending its bytes wherever the query said it was from.
 	clients netip.Prefix
+	// followed is the names an allowed name's answers passed through. A real guest's stub
+	// asks for them (measured 2026-11-04), and refusing that keeps out nothing: the chain's addresses are admitted already, and a guest does not
+	// choose what the chain says. Past its bound a name is refused, which fails closed.
+	followMu sync.Mutex
+	followed map[string]struct{}
 	// warnedAdmit says the failure to admit an answer has been logged, once: a guest can
 	// ask as fast as it likes, and each is a line otherwise.
 	warnedAdmit atomic.Bool
@@ -287,7 +294,7 @@ func (f *forwarder) answer(ctx context.Context, query []byte, ask exchange) []by
 			return refusal(query, read, false, dnsmessage.RCodeFormatError)
 		}
 
-		if !f.policy.AllowsName(read.name) {
+		if !f.policy.AllowsName(read.name) && !f.isFollowed(read.name) {
 			f.rec.refuse(read.name)
 
 			return refusal(query, read, true, dnsmessage.RCodeRefused)
@@ -349,11 +356,37 @@ func (f *forwarder) answer(ctx context.Context, query []byte, ask exchange) []by
 
 			return refusal(query, read, true, dnsmessage.RCodeServerFailure)
 		}
+
+		f.follow(got.names)
 	}
 
 	f.rec.answer(got)
 
 	return resp
+}
+
+func (f *forwarder) isFollowed(name string) bool {
+	f.followMu.Lock()
+	defer f.followMu.Unlock()
+
+	_, ok := f.followed[name]
+
+	return ok
+}
+
+func (f *forwarder) follow(names []string) {
+	f.followMu.Lock()
+	defer f.followMu.Unlock()
+
+	if f.followed == nil {
+		f.followed = map[string]struct{}{}
+	}
+
+	for _, name := range names {
+		if len(f.followed) < maxFollowed && !f.policy.AllowsName(name) {
+			f.followed[name] = struct{}{}
+		}
+	}
 }
 
 func (f *forwarder) exchangeUDP(ctx context.Context, query []byte) ([]byte, error) {

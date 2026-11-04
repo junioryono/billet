@@ -119,32 +119,52 @@ func absent(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "No such file or directory")
 }
 
-// baseScript creates the three tables, atomically, so a host holds all or none.
+// baseScript makes the three tables what they should be, atomically, whatever they hold:
+// each base chain holds only the rules here, so flushing it and adding them back in one
+// transaction leaves no moment without them, and running it again changes nothing.
+//
+// A BRIDGE PORT HAS NO BUSINESS AT THE IP LAYER. A frame to a link-local MAC is handed up
+// from the port without passing the bridge's prerouting hook, so no guest's chain sees it,
+// and it arrives as a packet on the port itself, which no rule of the role's guard names.
+// Whether that reaches a socket bound on the gateway was left to the host's rp_filter, and
+// for IPv6 to nothing at all. Every frame of a guest's that is meant for the host arrives
+// on the bridge's device instead, so anything arriving on the port is refused.
 func baseScript() string {
 	return `add table bridge billet_egress
 add map bridge billet_egress guests { type ifname : verdict; }
 add chain bridge billet_egress prerouting { type filter hook prerouting priority -200; policy accept; }
+flush chain bridge billet_egress prerouting
 add rule bridge billet_egress prerouting iifname vmap @guests
 add map bridge billet_egress ports { type ifname : verdict; }
 add chain bridge billet_egress forward { type filter hook forward priority 0; policy accept; }
+flush chain bridge billet_egress forward
 add rule bridge billet_egress forward iifname vmap @ports
 add rule bridge billet_egress forward oifname vmap @ports
 add map bridge billet_egress replies { type mark : verdict; }
 add chain bridge billet_egress output { type filter hook output priority 0; policy accept; }
+flush chain bridge billet_egress output
 add rule bridge billet_egress output ct mark vmap @replies
 add table inet billet_egress_routed
 add map inet billet_egress_routed guests { type ifname : verdict; }
 add chain inet billet_egress_routed prerouting { type filter hook prerouting priority -200; policy accept; }
+flush chain inet billet_egress_routed prerouting
 add rule inet billet_egress_routed prerouting iifname vmap @guests
 add map inet billet_egress_routed replies { type mark : verdict; }
 add chain inet billet_egress_routed output { type filter hook output priority 0; policy accept; }
+flush chain inet billet_egress_routed output
 add rule inet billet_egress_routed output ct mark vmap @replies
+add set inet billet_egress_routed bridge_ports { type ifname; }
+add chain inet billet_egress_routed port_l3 { type filter hook prerouting priority raw; policy accept; }
+flush chain inet billet_egress_routed port_l3
+add rule inet billet_egress_routed port_l3 iifname @bridge_ports drop
 add table ip billet_egress_nat
 add map ip billet_egress_nat jobs { type mark : verdict; }
 add chain ip billet_egress_nat prerouting { type nat hook prerouting priority dstnat - 1; policy accept; }
+flush chain ip billet_egress_nat prerouting
 add rule ip billet_egress_nat prerouting meta mark vmap @jobs
 add map ip billet_egress_nat owners { type mark : verdict; }
 add chain ip billet_egress_nat own { type filter hook prerouting priority dstnat + 10; policy accept; }
+flush chain ip billet_egress_nat own
 add rule ip billet_egress_nat own meta mark vmap @owners
 add rule ip billet_egress_nat own ct mark vmap @owners
 `
@@ -164,8 +184,9 @@ type binding struct {
 	local []netip.Addr
 }
 
-// attachScript installs a guest's rules, in one transaction across the tables:
-// the guest's chain, its sets and its redirect exist together or not at all.
+// attachScript installs a guest's rules, in one transaction across the tables: the
+// guest's chain, its sets and its redirect exist together or not at all. RUN AGAIN IT
+// REPAIRS THEM: each chain is flushed as it is made, and a set keeps what is in it.
 //
 // A LISTED GUEST, FRAME BY FRAME, in this order and no other:
 //
@@ -190,8 +211,7 @@ type binding struct {
 //     so no prefix on a list can open it.
 //   - What the guest's names answered and the list's prefixes. Everything else is
 //     recorded, counted and refused at once rather than dropped, so a connect
-//     fails in milliseconds instead of timing out: TCP's reset for TCP, since the
-//     ICMP form took a retransmit (measured 1 s against 3 ms on 2026-11-04).
+//     fails in milliseconds instead of timing out: TCP's own reset for TCP.
 //
 // THE LAST RULE IS A DROP, because a reject is defined for what it can answer: what it
 // does with a frame of another ethertype is not this package's to leave to chance, and
@@ -200,8 +220,9 @@ type binding struct {
 // A LISTED GUEST'S PORT IS CUT OFF FROM ITS BRIDGE'S OTHER PORTS. The rules above read
 // IP addresses, and a bridge delivers by MAC: a frame to a peer's MAC holding an allowed
 // public address would pass them and reach the peer, which could relay it under a
-// broader policy. Only the host answers a listed guest's frames, and no peer can reach
-// it either, so a peer is not a way in.
+// broader policy. No peer's frame reaches it either. What the host itself sends is not
+// held to this: a guest that claims a peer's MAC or address on the bridge can be sent
+// what the host meant for that peer (ADR-023).
 //
 // AN OPEN GUEST'S CHAIN ONLY MARKS DNS, and falls through to the base chain's
 // accept.
@@ -223,6 +244,10 @@ func attachScript(b binding) string {
 	line := func(format string, args ...any) { fmt.Fprintf(&s, format+"\n", args...) }
 	rule := func(chain, format string, args ...any) {
 		line("add rule %s %s_%s %s", table, chain, b.key, fmt.Sprintf(format, args...))
+	}
+	chainIn := func(in, chain string) {
+		line("add chain %s %s_%s", in, chain, b.key)
+		line("flush chain %s %s_%s", in, chain, b.key)
 	}
 
 	gateway := b.gateway.Addr()
@@ -247,14 +272,14 @@ func attachScript(b binding) string {
 		line("add counter %s outside_c_%s", table, b.key)
 		line("add counter %s ipv6_c_%s", table, b.key)
 
-		line("add chain %s deny_%s", table, b.key)
+		chainIn(table, "deny")
 		rule("deny", "ip protocol { tcp, udp } update @denied_%s { ip daddr . ip protocol . th dport }", b.key)
 		rule("deny", "counter name denied_c_%s", b.key)
 		rule("deny", "ip protocol tcp reject with tcp reset")
 		rule("deny", "reject")
 		rule("deny", "drop")
 
-		line("add chain %s job_%s", table, b.key)
+		chainIn(table, "job")
 
 		if b.kind == BridgePort {
 			rule("job", "ether type arp accept")
@@ -281,28 +306,32 @@ func attachScript(b binding) string {
 		if b.kind == BridgePort {
 			// A BROADCAST IS A GUEST'S ARP AND DHCP, flooded to every port as a matter
 			// of course: only what was aimed at a peer is a refusal worth counting.
-			line("add chain %s fwd_%s", table, b.key)
+			chainIn(table, "fwd")
 			rule("fwd", "meta pkttype { broadcast, multicast } drop")
 			rule("fwd", "counter name denied_c_%s drop", b.key)
 			line(`add element %s ports { "%s" : jump fwd_%s }`, table, b.iface, b.key)
 		}
 	} else {
-		line("add chain %s job_%s", table, b.key)
+		chainIn(table, "job")
 		rule("job", "%s", markDNS)
 	}
 
 	line(`add element %s guests { "%s" : jump job_%s }`, table, b.iface, b.key)
 
-	line("add chain %s dns_%s", natTable, b.key)
+	if b.kind == BridgePort {
+		line(`add element %s bridge_ports { "%s" }`, Routed.table(), b.iface)
+	}
+
+	chainIn(natTable, "dns")
 	s.WriteString(redirectRules(b.key, b.mark, b.port))
 	line("add element %s jobs { %#x : jump dns_%s }", natTable, b.mark, b.key)
 
-	line("add chain %s own_%s", natTable, b.key)
+	chainIn(natTable, "own")
 	line("add rule %s own_%s meta mark != %#x drop", natTable, b.key, b.mark)
 	line("add rule %s own_%s ct mark != %#x drop", natTable, b.key, b.mark)
 	line("add element %s owners { %#x : jump own_%s }", natTable, b.mark, b.key)
 
-	line("add chain %s reply_%s", table, b.key)
+	chainIn(table, "reply")
 	rule("reply", `oifname != "%s" drop`, b.iface)
 	line("add element %s replies { %#x : jump reply_%s }", table, b.mark, b.key)
 
@@ -335,6 +364,13 @@ func retargetScript(key string, mark uint32, port uint16) string {
 	return fmt.Sprintf("flush chain %s dns_%s\n", natTable, key) + redirectRules(key, mark, port)
 }
 
+// quarantineScript sends a guest's DNS nowhere, for a guest no resolver here will serve:
+// its redirect names a port this process does not hold, which the kernel can give the next
+// guest's resolver, whose policy would then answer it.
+func quarantineScript(key string) string {
+	return fmt.Sprintf("flush chain %[1]s dns_%[2]s\nadd rule %[1]s dns_%[2]s drop\n", natTable, key)
+}
+
 // detachScript removes everything attachScript made for one guest.
 func detachScript(key, iface string, kind Kind, mark uint32, listed bool) string {
 	var s strings.Builder
@@ -345,6 +381,10 @@ func detachScript(key, iface string, kind Kind, mark uint32, listed bool) string
 	fmt.Fprintf(&s, "delete chain %s job_%s\n", table, key)
 	fmt.Fprintf(&s, "delete element %s replies { %#x }\n", table, mark)
 	fmt.Fprintf(&s, "delete chain %s reply_%s\n", table, key)
+
+	if kind == BridgePort {
+		fmt.Fprintf(&s, "delete element %s bridge_ports { \"%s\" }\n", Routed.table(), iface)
+	}
 
 	if listed {
 		if kind == BridgePort {
@@ -487,6 +527,97 @@ func parseDeniedSet(out []byte) ([]Denied, error) {
 	})
 
 	return denied, nil
+}
+
+// ruleTable is what one table holds, as far as a guest's enforcement rests on it.
+type ruleTable struct {
+	// rules counts the rules in each chain.
+	rules map[string]int
+	// maps is each verdict map, element by the raw JSON of its key to the chain it jumps to.
+	maps map[string]map[string]string
+	// sets is each set's elements, by their raw JSON.
+	sets map[string][]string
+}
+
+// parseRuleTable reads a listing of one table. A table that is not there holds nothing.
+func parseRuleTable(out []byte) (ruleTable, error) {
+	t := ruleTable{rules: map[string]int{}, maps: map[string]map[string]string{}, sets: map[string][]string{}}
+
+	var doc nftDocument
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return t, fmt.Errorf("egress: read nft's listing: %w", err)
+	}
+
+	for _, entry := range doc.Nftables {
+		if raw, ok := entry["rule"]; ok {
+			var r struct {
+				Chain string `json:"chain"`
+			}
+			if err := json.Unmarshal(raw, &r); err != nil {
+				return t, fmt.Errorf("egress: a rule in nft's listing: %w", err)
+			}
+
+			t.rules[r.Chain]++
+		}
+
+		if raw, ok := entry["map"]; ok {
+			var named struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(raw, &named); err != nil {
+				return t, fmt.Errorf("egress: a map in nft's listing: %w", err)
+			}
+
+			elements, err := parseVerdictMap([]byte(`{"nftables":[{"map":` + string(raw) + `}]}`))
+			if err != nil {
+				return t, err
+			}
+
+			t.maps[named.Name] = map[string]string{}
+			for _, e := range elements {
+				t.maps[named.Name][string(e.key)] = e.target
+			}
+		}
+
+		if raw, ok := entry["set"]; ok {
+			var set struct {
+				Name string            `json:"name"`
+				Elem []json.RawMessage `json:"elem"`
+			}
+			if err := json.Unmarshal(raw, &set); err != nil {
+				return t, fmt.Errorf("egress: a set in nft's listing: %w", err)
+			}
+
+			for _, e := range set.Elem {
+				t.sets[set.Name] = append(t.sets[set.Name], string(e))
+			}
+		}
+	}
+
+	return t, nil
+}
+
+// enforces answers whether these tables hold what a listed guest's rules need, from the
+// base chain's dispatch to the guest's last rule: a chain that exists and nothing jumps
+// to, or that a flush emptied, refuses nothing.
+func enforces(guests, routed, nat ruleTable, key, iface string, kind Kind, mark uint32) bool {
+	name, number := fmt.Sprintf("%q", iface), fmt.Sprintf("%d", mark)
+
+	base := guests.rules["prerouting"] >= 1 && guests.rules["output"] >= 1 &&
+		nat.rules["prerouting"] >= 1 && nat.rules["own"] >= 2
+
+	own := guests.maps["guests"][name] == "job_"+key && guests.rules["job_"+key] > 0 && guests.rules["deny_"+key] > 0 &&
+		guests.maps["replies"][number] == "reply_"+key && guests.rules["reply_"+key] > 0 &&
+		nat.maps["jobs"][number] == "dns_"+key && nat.rules["dns_"+key] > 0 &&
+		nat.maps["owners"][number] == "own_"+key && nat.rules["own_"+key] > 0
+
+	if kind != BridgePort {
+		return base && own
+	}
+
+	return base && own && guests.rules["forward"] >= 2 && guests.maps["ports"][name] == "fwd_"+key &&
+		guests.rules["fwd_"+key] > 0 && routed.rules["port_l3"] >= 1 &&
+		slices.Contains(routed.sets["bridge_ports"], name)
 }
 
 // mapElement is one element of a verdict map: a key and the chain it jumps to.

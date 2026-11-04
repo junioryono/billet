@@ -86,9 +86,15 @@ A node that cannot apply a list still starts, since it may never be sent one. It
 
 Read what the job was refused in `billet jobs show <lease>`: a name in `refused` needs adding, or a CDN behind a listed name is answering from an address the guest asked for by another name. A tool that resolved a name off the list usually fails with "server can't find" or "connection refused" naming neither the list nor billet, so start there.
 
-**A CNAME target does not need listing.** Listing `registry.npmjs.org` admits the addresses its answer ends in, whatever it passes through. Only what the guest asks for is judged.
+**A CNAME target does not need listing.** Listing `registry.npmjs.org` admits the addresses its answer ends in, whatever it passes through, and a stub that then asks for the name the chain led to is answered. A name no allowed answer named is judged by the list.
+
+**A stock guest asks for things of its own.** Before a job's first step, the Ubuntu runner image asks for `ntp.ubuntu.com` (160 times in the minute measured), `entropy.ubuntu.com`, `api.snapcraft.io` and `registry.npmjs.org`. Those appear in `refused` on a job that succeeded; list them only if a job needs them.
 
 **A shared address is shared.** If a listed name resolves to a CDN's address, that address is open to the job for any site it serves, and the list cannot tell them apart. See [what a list does not do](../reference/decisions/adr-023-host-enforced-egress.md#what-this-does-not-do).
+
+## If something removes the rules
+
+`nft flush ruleset`, or a firewall service that does the same, opens a listed guest until the node notices. It checks that each listed guest's rules are in force at every sweep (5 minutes), at every registration and when it starts, puts back what has gone, and logs an error naming the guest. The job's report then reads `complete: no`. What the guest's names had admitted is forgotten, so it has to ask again. If the rules cannot be put back the node says so and tries again at each of those. Converge the host as well, since the same flush removes the role's guard.
 
 ## While the node is down
 

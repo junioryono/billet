@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -516,18 +518,25 @@ func (n *realNetwork) mustConnect(addr netip.Addr, port uint16) {
 	}
 }
 
-// mustBeRefused holds a connect to being refused: a drop would look the same to a test that
-// only asked whether it failed, and a job would sit in its timeout.
+// mustBeRefused holds a connect to being refused at once: a drop would look the same to a test
+// that only asked whether it failed, and a job would sit in its timeout.
 func (n *realNetwork) mustBeRefused(addr netip.Addr, port uint16) {
 	n.t.Helper()
 
+	started := time.Now()
 	err := n.connect(addr, port)
+	took := time.Since(started)
+
 	if err == nil {
 		n.t.Fatalf("connected to %s:%d", addr, port)
 	}
 
 	if !errors.Is(err, unix.ECONNREFUSED) {
 		n.t.Fatalf("connect to %s:%d = %v, want it refused", addr, port, err)
+	}
+
+	if took > 500*time.Millisecond {
+		n.t.Fatalf("connect to %s:%d was refused after %s, want it refused at once", addr, port, took)
 	}
 }
 
@@ -925,20 +934,20 @@ func (n *realNetwork) addPeer() aPeer {
 	sh(n.t, "ip", "-n", p.ns, "link", "set", "lo", "up")
 	sh(n.t, "ip", "-n", p.ns, "route", "add", "default", "via", n.gateway.String())
 
-	p.mac = macIn(n.t, p.ns, "eth0")
+	p.mac = macIn(n.t, p.ns)
 
 	return p
 }
 
-func macIn(t *testing.T, ns, name string) net.HardwareAddr {
+func macIn(t *testing.T, ns string) net.HardwareAddr {
 	t.Helper()
 
 	var mac net.HardwareAddr
 
 	inNamespace(t, ns, func() {
-		iface, err := net.InterfaceByName(name)
+		iface, err := net.InterfaceByName("eth0")
 		if err != nil {
-			t.Errorf("read %s's address: %v", name, err)
+			t.Errorf("read eth0's address: %v", err)
 
 			return
 		}
@@ -1133,7 +1142,7 @@ func TestRealEgressHoldsAgainstForgedFrames(t *testing.T) { //nolint:paralleltes
 	n := newRealNetwork(t, BridgePort)
 	peer := n.addPeer()
 
-	guestMAC := macIn(t, n.guestNS, "eth0")
+	guestMAC := macIn(t, n.guestNS)
 
 	bridge, err := net.InterfaceByName(n.network)
 	if err != nil {
@@ -1217,11 +1226,24 @@ func TestRealEgressHoldsAgainstForgedFrames(t *testing.T) { //nolint:paralleltes
 
 	// AN ADDRESS OFF THE SUBNET ALTOGETHER: a query is no way to have the host send its bytes
 	// wherever it said.
+	atUplink := watchFrames(t, n.netNS, "egresswanb")
+
 	sendFrame(t, n.guestNS, ipv4Frame(bridge.HardwareAddr, guestMAC,
 		netip.MustParseAddrPort("192.0.2.2:41003"), gateway, aQuery(t, "reflected.attacker.test.", dnsmessage.TypeA)))
 
-	atUplink := watchFrames(t, n.netNS, "egresswanb")
 	atUplink.staysAway(t, "reflected")
+
+	// NOR TO AN ADDRESS THE LIST ADMITS: its answer would go wherever the frame said it was from.
+	// The same frame from the guest's own address is the control.
+	admitted := netip.AddrPortFrom(realPrefix, 443)
+
+	sendFrame(t, n.guestNS, ipv4Frame(bridge.HardwareAddr, guestMAC, netip.AddrPortFrom(n.guestAddr, 41004), admitted,
+		[]byte("from-its-own-address")))
+	atUplink.arrives(t, "from-its-own-address")
+
+	sendFrame(t, n.guestNS, ipv4Frame(bridge.HardwareAddr, guestMAC, netip.MustParseAddrPort("192.0.2.2:41004"), admitted,
+		[]byte("from-off-its-subnet")))
+	atUplink.staysAway(t, "from-off-its-subnet")
 
 	h.Detach(t.Context(), a.Key)
 
@@ -1233,6 +1255,259 @@ func TestRealEgressHoldsAgainstForgedFrames(t *testing.T) { //nolint:paralleltes
 	if rec.DeniedPackets == 0 {
 		t.Error("nothing the guest was refused was counted")
 	}
+}
+
+// A FRAME TO A LINK-LOCAL MAC NEVER REACHES THE BRIDGE'S PREROUTING HOOK, and so no chain a guest has.
+// It comes up from the port as a packet on the port, which the role's guard does not name, so what
+// stands between it and a socket on the gateway is the host's rp_filter, and the role sets none. The
+// control shows it arrive with no rules at all: the rule is what closes it, at either setting.
+func TestRealEgressTurnsAwayAFrameTheBridgeDoesNotFilter(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
+	linkLocal := net.HardwareAddr{0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e}
+
+	for _, tc := range []struct {
+		rpFilter string
+		// arrives says the control must reach the upstream: with loose filtering it may not, and
+		// nothing about the rule rests on that.
+		arrives bool
+	}{{"0", true}, {"2", false}} {
+		t.Run("rp_filter "+tc.rpFilter, func(t *testing.T) {
+			dropTables(t)
+
+			n := newRealNetwork(t, BridgePort)
+			guestMAC := macIn(t, n.guestNS)
+			gateway := netip.AddrPortFrom(n.gateway, upstreamDNSPort)
+			source := netip.AddrPortFrom(n.guestAddr, 41007)
+
+			for _, dev := range []string{"all", "default", n.network, n.iface} {
+				sh(t, "sysctl", "-qw", "net.ipv4.conf."+dev+".rp_filter="+tc.rpFilter)
+			}
+
+			asked := func(name string) bool {
+				deadline := time.Now().Add(time.Second)
+
+				for time.Now().Before(deadline) {
+					if slices.Contains(n.upstream.names(), name) {
+						return true
+					}
+
+					time.Sleep(20 * time.Millisecond)
+				}
+
+				return false
+			}
+
+			sendFrame(t, n.guestNS, ipv4Frame(linkLocal, guestMAC, source, gateway, aQuery(t, "control.attacker.test.", dnsmessage.TypeA)))
+
+			arrived := asked("control.attacker.test")
+			t.Logf("with no rules and rp_filter %s the frame reached the gateway's socket: %v", tc.rpFilter, arrived)
+
+			if tc.arrives && !arrived {
+				t.Fatal("the control did not arrive, so this proves nothing")
+			}
+
+			h := realHost(t, t.TempDir())
+			a := realAttachment(n, BridgePort)
+
+			p, err := Compile([]string{"allowed.test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := h.Attach(t.Context(), a, p); err != nil {
+				t.Fatal(err)
+			}
+
+			sendFrame(t, n.guestNS, ipv4Frame(linkLocal, guestMAC, netip.AddrPortFrom(n.guestAddr, 41008), gateway,
+				aQuery(t, "listed.attacker.test.", dnsmessage.TypeA)))
+
+			if asked("listed.attacker.test") {
+				t.Fatal("a listed guest asked the host's resolver for a name no list holds, unrecorded")
+			}
+
+			// AND THE GUEST'S REAL TRAFFIC, WHICH ARRIVES ON THE BRIDGE, IS UNTOUCHED.
+			n.mustResolve("udp4", "allowed.test.", dnsmessage.RCodeSuccess)
+			n.mustConnect(realAllowed, 443)
+		})
+	}
+}
+
+// RULES THAT ARE THERE AND DO NOTHING ARE RULES GONE, and the check is of what enforces. Each way in
+// is first shown to have opened the guest, then to close again. The first check, of rules that hold,
+// must not read as the job having run open.
+func TestRealEgressPutsBackRulesThatNoLongerHold(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
+	for _, tc := range []struct {
+		name string
+		take [][]string
+	}{
+		{"the dispatch flushed", [][]string{{"nft", "flush", "chain", "bridge", "billet_egress", "prerouting"}}},
+		{"its own chain flushed", [][]string{{"nft", "flush", "chain", "bridge", "billet_egress", "job_KEY"}}},
+		{"a whole table flushed", [][]string{{"nft", "flush", "table", "bridge", "billet_egress"}}},
+		{"the tables gone", [][]string{
+			{"nft", "delete", "table", "bridge", "billet_egress"},
+			{"nft", "delete", "table", "ip", "billet_egress_nat"},
+			{"nft", "delete", "table", "inet", "billet_egress_routed"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dropTables(t)
+
+			n := newRealNetwork(t, BridgePort)
+			h := realHost(t, t.TempDir())
+			a := realAttachment(n, BridgePort)
+
+			p, err := Compile([]string{"allowed.test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := h.Attach(t.Context(), a, p); err != nil {
+				t.Fatal(err)
+			}
+
+			guest := h.live[a.Key]
+
+			h.Verify(t.Context())
+
+			if guest.rec.freeze(counts{}).Incomplete {
+				t.Fatal("rules that hold were read as lost")
+			}
+
+			n.mustBeRefused(realHardcode, 443)
+
+			before, err := h.readRules(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, take := range tc.take {
+				for i := range take {
+					take[i] = strings.ReplaceAll(take[i], "KEY", a.Key)
+				}
+
+				sh(t, take...)
+			}
+
+			// OPEN NOW, OR NOTHING BELOW CLOSED ANYTHING.
+			n.mustConnect(realHardcode, 443)
+
+			h.Verify(t.Context())
+
+			n.mustBeRefused(realHardcode, 443)
+			n.mustResolve("udp4", "other.test.", dnsmessage.RCodeRefused)
+			n.mustResolve("udp4", "allowed.test.", dnsmessage.RCodeSuccess)
+			n.mustConnect(realAllowed, 443)
+
+			// PUT BACK AS THEY WERE, NOT ADDED TO: a repair that doubled them each time would decide
+			// the same, and grow for as long as something keeps taking them away.
+			after, err := h.readRules(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for table, counts := range map[string][2]map[string]int{
+				"bridge": {before.bridge.rules, after.bridge.rules},
+				"routed": {before.routed.rules, after.routed.rules},
+				"nat":    {before.nat.rules, after.nat.rules},
+			} {
+				if !maps.Equal(counts[0], counts[1]) {
+					t.Errorf("the %s table's rules were %v and are now %v", table, counts[0], counts[1])
+				}
+			}
+
+			h.Detach(t.Context(), a.Key)
+
+			if rec, ok := h.Take(a.Key); !ok || !rec.Incomplete {
+				t.Fatalf("record = %+v, %v: a job that ran open for a while does not read as whole", rec, ok)
+			}
+		})
+	}
+}
+
+// A FLUSH AND A RESTART LEAVE A SOCKET THE GUEST HOLDS ON A TRANSLATION TO A RESOLVER THAT HAS GONE,
+// since the tracker keeps what the rules did not. The file names its connections, which go before the
+// guest's rules come back, so the same socket reaches the new resolver.
+func TestRealEgressMovesAHeldSocketAcrossAFlushAndARestart(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
+	dropTables(t)
+
+	n := newRealNetwork(t, BridgePort)
+	dir := t.TempDir()
+	h := realHost(t, dir)
+	a := realAttachment(n, BridgePort)
+
+	p, err := Compile([]string{"allowed.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Attach(t.Context(), a, p); err != nil {
+		t.Fatal(err)
+	}
+
+	const port = 41009
+
+	if got := n.resolveFrom(port, "allowed.test."); got != dnsmessage.RCodeSuccess {
+		t.Fatalf("before: rcode = %v", got)
+	}
+
+	h.Close()
+
+	for _, table := range [][]string{{"bridge", "billet_egress"}, {"ip", "billet_egress_nat"}, {"inet", "billet_egress_routed"}} {
+		sh(t, append([]string{"nft", "delete", "table"}, table...)...)
+	}
+
+	next := realHost(t, dir)
+	next.Reconcile(t.Context(), map[string]bool{a.Key: true})
+
+	if got := n.resolveFrom(port, "other.test."); got != dnsmessage.RCodeRefused {
+		t.Fatalf("after: rcode = %v, want the new resolver's refusal", got)
+	}
+
+	n.mustBeRefused(realHardcode, 443)
+}
+
+// A GUEST NOTHING HERE CAN SERVE ASKS NOBODY: its redirect named a port this process does not hold.
+func TestRealEgressSendsAnUnservableGuestsDNSNowhere(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
+	dropTables(t)
+
+	n := newRealNetwork(t, BridgePort)
+	dir := t.TempDir()
+	h := realHost(t, dir)
+	a := realAttachment(n, BridgePort)
+
+	p, err := Compile([]string{"allowed.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Attach(t.Context(), a, p); err != nil {
+		t.Fatal(err)
+	}
+
+	h.Close()
+
+	if err := os.WriteFile(filepath.Join(dir, a.Key+recordSuffix), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	next := realHost(t, dir)
+	next.Reconcile(t.Context(), map[string]bool{a.Key: true})
+
+	out, err := exec.CommandContext(t.Context(), "nft", "list", "chain", "ip", "billet_egress_nat", "dns_"+a.Key).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	if strings.Contains(string(out), "redirect") || !strings.Contains(string(out), "drop") {
+		t.Fatalf("its redirect is still there:\n%s", out)
+	}
+
+	if _, err := n.resolve("udp4", n.gateway, "other.test."); err == nil {
+		t.Fatal("a guest nothing can serve was answered")
+	}
+
+	n.mustBeRefused(realHardcode, 443)
+
+	next.Detach(t.Context(), a.Key)
 }
 
 // A CONNECTION IS ITS OWNER'S. A guest forging a neighbour's source address and port joins that
@@ -1254,7 +1529,7 @@ func TestRealEgressKeepsAGuestOutOfItsNeighboursConnection(t *testing.T) { //nol
 
 			n := newRealNetwork(t, BridgePort)
 			peer := n.addPeer()
-			guestMAC := macIn(t, n.guestNS, "eth0")
+			guestMAC := macIn(t, n.guestNS)
 
 			bridge, err := net.InterfaceByName(n.network)
 			if err != nil {
@@ -1333,6 +1608,98 @@ func TestRealEgressKeepsAGuestOutOfItsNeighboursConnection(t *testing.T) { //nol
 			}
 		})
 	}
+}
+
+// A NEIGHBOUR WITH NO RULES AT ALL IS NOT LET INTO A GUEST'S CONNECTION: its packet carries no mark
+// to be told apart by, and joining would put its question before that guest's resolver under that
+// guest's policy, and in that guest's record. The guest's own off-list name, on the same connection,
+// is the control that the record would show it.
+func TestRealEgressKeepsAnUnwatchedNeighbourOutOfAGuestsConnection(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
+	dropTables(t)
+
+	n := newRealNetwork(t, BridgePort)
+	peer := n.addPeer()
+
+	bridge, err := net.InterfaceByName(n.network)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := realHost(t, t.TempDir())
+	a := realAttachment(n, BridgePort)
+
+	p, err := Compile([]string{"allowed.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Attach(t.Context(), a, p); err != nil {
+		t.Fatal(err)
+	}
+
+	const port = 41010
+
+	if got := n.resolveFrom(port, "own.attacker.test."); got != dnsmessage.RCodeRefused {
+		t.Fatalf("the guest's own off-list name: rcode = %v", got)
+	}
+
+	sendFrame(t, peer.ns, ipv4Frame(bridge.HardwareAddr, peer.mac, netip.AddrPortFrom(n.guestAddr, port),
+		netip.AddrPortFrom(n.gateway, upstreamDNSPort), aQuery(t, "stolen.attacker.test.", dnsmessage.TypeA)))
+
+	time.Sleep(300 * time.Millisecond)
+
+	if got := n.resolveFrom(port, "allowed.test."); got != dnsmessage.RCodeSuccess {
+		t.Fatalf("the guest's connection after: rcode = %v", got)
+	}
+
+	h.Detach(t.Context(), a.Key)
+
+	rec, ok := h.Take(a.Key)
+	if !ok {
+		t.Fatal("no record")
+	}
+
+	names := make([]string, 0, len(rec.Refused))
+	for _, r := range rec.Refused {
+		names = append(names, r.Name)
+	}
+
+	if !slices.Contains(names, "own.attacker.test") {
+		t.Fatalf("refused = %q: the record would not have shown a stolen name either", names)
+	}
+
+	if slices.Contains(names, "stolen.attacker.test") {
+		t.Fatalf("refused = %q: a neighbour's question reached this guest's resolver", names)
+	}
+}
+
+// NO PREFIX OPENS ANOTHER GUEST: one covering its own subnet is refused there, at once, as anything
+// else off the list is. Without the rule the forward hook's drop would still stop it, and the guest
+// would sit in its timeout.
+func TestRealEgressRefusesAPeerAPrefixWouldAdmit(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
+	dropTables(t)
+
+	n := newRealNetwork(t, BridgePort)
+	peer := n.addPeer()
+	h := realHost(t, t.TempDir())
+	a := realAttachment(n, BridgePort)
+
+	p, err := Compile([]string{netip.PrefixFrom(n.gateway, 24).Masked().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Attach(t.Context(), a, p); err != nil {
+		t.Fatal(err)
+	}
+
+	// NO ARP CROSSES TO A NEIGHBOUR, so it would never get as far as an IP packet. A root guest
+	// does not need one.
+	sh(t, "ip", "-n", n.guestNS, "neigh", "replace", peer.addr.String(), "lladdr", peer.mac.String(), "dev", "eth0")
+
+	n.mustBeRefused(peer.addr, 443)
+
+	h.Detach(t.Context(), a.Key)
 }
 
 // THE LIST STANDS ON ITS OWN WHEN THE NODE'S RULES ARE RENDERED FOR A KERNEL: overlapping

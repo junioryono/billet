@@ -545,11 +545,32 @@ func TestAQueryFromOutsideTheSubnetIsNotAnswered(t *testing.T) {
 	t.Parallel()
 
 	r := startResolver(t)
-	f := servedForwarder(t, r, Observe(), &journal{})
-	f.clients = netip.MustParsePrefix("10.0.0.0/8")
+
+	outsideOf := func(clients string) *forwarder {
+		f, err := newForwarder(Observe(), newRecorder(false, false), netip.MustParsePrefix("127.0.0.1/8"), r.port,
+			slog.Default(), func(context.Context, []netip.Addr) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// BEFORE IT SERVES: nothing else reads this.
+		f.clients = netip.MustParsePrefix(clients)
+		f.serve(t.Context())
+		t.Cleanup(f.stop)
+
+		return f
+	}
+
+	// THE SAME QUERY FROM INSIDE IS ANSWERED, so what follows has something to be the absence of.
+	inside := outsideOf("127.0.0.0/8")
+	if got := rcode(t, askUDP(t, inside.port, aQuery(t, "inside.example.", dnsmessage.TypeA))); got != dnsmessage.RCodeSuccess {
+		t.Fatalf("rcode = %v", got)
+	}
+
+	outside := outsideOf("10.0.0.0/8")
 
 	conn, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(
-		netip.MustParseAddr("127.0.0.1"), f.port)))
+		netip.MustParseAddr("127.0.0.1"), outside.port)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,12 +580,16 @@ func TestAQueryFromOutsideTheSubnetIsNotAnswered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// THE NEXT QUERY PROVES THE FIRST WAS READ: the socket is served in order, and this
-	// one is from inside.
-	f.clients = netip.MustParsePrefix("127.0.0.0/8")
+	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
 
-	if got := rcode(t, askUDP(t, f.port, aQuery(t, "inside.example.", dnsmessage.TypeA))); got != dnsmessage.RCodeSuccess {
-		t.Fatalf("rcode = %v", got)
+	if n, err := conn.Read(make([]byte, 512)); err == nil {
+		t.Fatalf("answered %d bytes to a source outside the subnet", n)
+	}
+
+	if slices.Contains(r.names(), "outside.example") {
+		t.Fatalf("the upstream heard %q", r.names())
 	}
 }
 
@@ -670,11 +695,33 @@ func TestStoppingAResolverEndsAQuestionInFlight(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// BOUND AND SILENT: a TCP connect succeeds, and nothing ever comes back.
+			// BOUND AND SILENT: a TCP connect succeeds, and nothing ever comes back. WHAT ARRIVES
+			// IS SIGNALLED, so the cancel lands on a question in flight, not on a dial it stops.
 			t.Cleanup(func() {
 				_ = udp.Close()
 				_ = tcp.Close()
 			})
+
+			heard := make(chan struct{}, 2)
+
+			go func() {
+				if _, _, err := udp.ReadFromUDPAddrPort(make([]byte, 512)); err == nil {
+					heard <- struct{}{}
+				}
+			}()
+
+			go func() {
+				conn, err := tcp.Accept()
+				if err != nil {
+					return
+				}
+
+				t.Cleanup(func() { _ = conn.Close() })
+
+				if _, err := readFrame(conn, maxQuery); err == nil {
+					heard <- struct{}{}
+				}
+			}()
 
 			f, err := newForwarder(Observe(), newRecorder(false, false), netip.MustParsePrefix("127.0.0.1/8"), port,
 				slog.Default(), nil)
@@ -691,6 +738,18 @@ func TestStoppingAResolverEndsAQuestionInFlight(t *testing.T) {
 				returned <- err
 			}()
 
+			select {
+			case <-heard:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the question never reached the upstream")
+			}
+
+			select {
+			case err := <-returned:
+				t.Fatalf("a question nobody answered returned before it was cancelled: %v", err)
+			default:
+			}
+
 			cancel()
 
 			select {
@@ -702,6 +761,85 @@ func TestStoppingAResolverEndsAQuestionInFlight(t *testing.T) {
 				t.Fatal("a cancelled question waited out its upstream")
 			}
 		})
+	}
+}
+
+// A STUB ASKS FOR WHERE AN ALLOWED NAME'S CHAIN LED, measured from a real guest on 2026-11-04. Refusing it keeps out nothing, since the chain's addresses are
+// admitted already, and shows an operator a refusal of a name their list allowed. Only a name an
+// allowed answer named follows: asked first, or asked of another chain, it is off the list.
+func TestAStubMayFollowWhereAnAllowedNameLed(t *testing.T) {
+	t.Parallel()
+
+	j := &journal{}
+	f := aForwarder(listed(t, "example.com"), j, nil)
+
+	ask := func(_ context.Context, q []byte) ([]byte, error) {
+		return anAnswer(t, q, []string{"glb.cdn.test."}, anAddr), nil
+	}
+	target := aQuery(t, "glb.cdn.test.", dnsmessage.TypeAAAA)
+
+	if got := rcode(t, f.answer(t.Context(), target, ask)); got != dnsmessage.RCodeRefused {
+		t.Fatalf("before any answer named it: rcode = %v", got)
+	}
+
+	if got := rcode(t, f.answer(t.Context(), aQuery(t, "example.com.", dnsmessage.TypeA), ask)); got != dnsmessage.RCodeSuccess {
+		t.Fatalf("the allowed name: rcode = %v", got)
+	}
+
+	if got := rcode(t, f.answer(t.Context(), target, ask)); got != dnsmessage.RCodeSuccess {
+		t.Fatalf("where it led: rcode = %v", got)
+	}
+
+	if got := rcode(t, f.answer(t.Context(), aQuery(t, "other.test.", dnsmessage.TypeA), ask)); got != dnsmessage.RCodeRefused {
+		t.Fatalf("a name no answer named: rcode = %v", got)
+	}
+
+	// AN ANSWER TO A NAME OFF THE LIST NAMES NOTHING: it was never asked.
+	refused := aQuery(t, "off.test.", dnsmessage.TypeA)
+	f.answer(t.Context(), refused, func(_ context.Context, q []byte) ([]byte, error) {
+		return anAnswer(t, q, []string{"beyond.test."}, anAddr), nil
+	})
+
+	if got := rcode(t, f.answer(t.Context(), aQuery(t, "beyond.test.", dnsmessage.TypeA), ask)); got != dnsmessage.RCodeRefused {
+		t.Fatalf("a chain from a refused name was followed: rcode = %v", got)
+	}
+}
+
+// AN OPEN GUEST'S ANSWERS FOLLOW NOTHING, AND PAST ITS BOUND A LIST'S STOP: an allowed name's owner
+// must not be able to grow what the node holds for a guest without limit.
+func TestWhatAGuestMayFollowIsBounded(t *testing.T) {
+	t.Parallel()
+
+	f := aForwarder(listed(t, "example.com"), &journal{}, nil)
+
+	names := make([]string, 0, maxFollowed+1)
+	for i := range maxFollowed + 1 {
+		names = append(names, fmt.Sprintf("n%d.cdn.test", i))
+	}
+
+	f.follow(names)
+
+	if len(f.followed) != maxFollowed {
+		t.Fatalf("followed %d, want the bound %d", len(f.followed), maxFollowed)
+	}
+
+	if f.isFollowed(names[maxFollowed]) {
+		t.Fatal("a name past the bound was followed")
+	}
+
+	f.follow([]string{"example.com"})
+
+	if f.isFollowed("example.com") {
+		t.Fatal("an allowed name took up a place")
+	}
+
+	open := aForwarder(Observe(), &journal{}, nil)
+	open.answer(t.Context(), aQuery(t, "example.com.", dnsmessage.TypeA), func(_ context.Context, q []byte) ([]byte, error) {
+		return anAnswer(t, q, []string{"glb.cdn.test."}, anAddr), nil
+	})
+
+	if open.isFollowed("glb.cdn.test") {
+		t.Fatal("an open guest's answer was kept for nothing")
 	}
 }
 
