@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,7 +55,7 @@ func TestARunRefusesASealedWorkspaceAndLiftsNothing(t *testing.T) {
 			sealWith(t, cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, ws, reason)
 			before := admissionOf(t, ws)
 
-			err := refuseASealedWorkspace(t.Context(), ws)
+			err := refuseASealedWorkspace(t.Context(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}, ws)
 			if err == nil || !strings.Contains(err.Error(), "billet resume --config") ||
 				!strings.Contains(err.Error(), reason) {
 				t.Fatalf("refuse = %v, want a refusal naming the seal and the way out", err)
@@ -95,7 +96,9 @@ func TestAWorkspaceThatHasNeverRunIsLeftWithoutALedger(t *testing.T) {
 
 	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
 
-	if err := refuseASealedWorkspace(t.Context(), ws); err != nil {
+	var out bytes.Buffer
+	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}
+	if err := refuseASealedWorkspace(t.Context(), env, ws); err != nil {
 		t.Fatalf("refuse = %v", err)
 	}
 	ledger := state.LedgerPath(filepath.Join(filepath.Dir(ws.ConfigPath), "server"))
@@ -113,11 +116,60 @@ func TestAnOpenDeploymentIsNotRefused(t *testing.T) {
 	ledgertest.Seed(t, filepath.Join(filepath.Dir(ws.ConfigPath), "server"))
 	before := admissionOf(t, ws)
 
-	if err := refuseASealedWorkspace(t.Context(), ws); err != nil {
+	var out bytes.Buffer
+	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}
+	if err := refuseASealedWorkspace(t.Context(), env, ws); err != nil {
 		t.Fatalf("refuse = %v", err)
 	}
 	if after := admissionOf(t, ws); after.Generation != before.Generation {
 		t.Errorf("generation moved from %d to %d on an open deployment", before.Generation, after.Generation)
+	}
+}
+
+// A LEDGER BEHIND THIS BINARY IS NOT MIGRATED BY ASKING WHETHER IT IS SEALED. A newer
+// binary refusing to run must leave the workspace readable by the one that wrote it,
+// and since it cannot tell without that migration it says so rather than answer "open".
+func TestAskingWhetherAWorkspaceIsSealedMigratesNothing(t *testing.T) {
+	t.Parallel()
+
+	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
+	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
+	ledgertest.Seed(t, stateDir)
+	// Opened once as a server would have, which is what makes it the WAL ledger a real
+	// workspace holds, and an inspection cannot.
+	admissionOf(t, ws)
+
+	raw, err := sql.Open("sqlite", "file:"+state.LedgerPath(stateDir))
+	if err != nil {
+		t.Fatalf("open the ledger directly: %v", err)
+	}
+	if _, err := raw.ExecContext(t.Context(), `DELETE FROM schema_migrations WHERE version = ?`,
+		state.LatestSchemaVersion()); err != nil {
+		t.Fatalf("put the ledger one migration behind: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close the ledger: %v", err)
+	}
+	before, err := state.PeekMigrations(t.Context(), state.LedgerPath(stateDir))
+	if err != nil {
+		t.Fatalf("read the migrations: %v", err)
+	}
+
+	var out bytes.Buffer
+	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv}
+	if err := refuseASealedWorkspace(t.Context(), env, ws); err != nil {
+		t.Fatalf("refuse = %v, want the run to go on: the server migrates this", err)
+	}
+	if !strings.Contains(out.String(), "cannot be read") {
+		t.Errorf("said %q, want it to say it could not tell", out.String())
+	}
+
+	after, err := state.PeekMigrations(t.Context(), state.LedgerPath(stateDir))
+	if err != nil {
+		t.Fatalf("read the migrations again: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("asking moved the ledger from %d migrations to %d", len(before), len(after))
 	}
 }
 

@@ -2415,7 +2415,7 @@ func TestAFlattenCutShortHasItsPartialImageRemoved(t *testing.T) {
 	f.failFlatten = context.Canceled
 	// Longer than the ordinary command's bound, which the caller's cleanup runs at,
 	// so only the compaction's own removal can finish it.
-	f.slowRemoval = DefaultTimeout + time.Minute
+	f.slowRemoval = DefaultTimeout + 15*time.Second
 
 	// Anything named cache-g- from here on is this compaction's: the generation
 	// published before it stays, and its parent is its own.

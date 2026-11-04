@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/ops/fleetops"
 	"github.com/junioryono/billet/internal/state"
 
@@ -105,7 +107,7 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 
 	dir := filepath.Dir(ws.ConfigPath)
 
-	if err := refuseASealedWorkspace(ctx, ws); err != nil {
+	if err := refuseASealedWorkspace(ctx, env, ws); err != nil {
 		return err
 	}
 
@@ -205,11 +207,17 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 //
 // IT WRITES NOTHING, and lifts no seal, not even a run's own. Another run may still be
 // draining this workspace behind that seal, and a drain an operator ran over it reads
-// the same. `billet resume` is a person's statement that neither holds.
+// the same. `billet resume` is a person's statement that neither holds. The ledger is
+// opened to inspect it, because the operator's open migrates, and a run that refuses
+// must not have moved the schema out from under the binary that wrote it.
+//
+// A LEDGER BEHIND THIS BINARY CANNOT BE READ WITHOUT THAT MIGRATION, so whether it is
+// sealed cannot be told. The server's start migrates it anyway, so the run goes on, and
+// says so, because a seal in there would then mean a run assigned nothing.
 //
 // BEFORE THE SERVER STARTS, because a refusal here has nothing to tear down. A
 // workspace with no ledger has never run and has no seal, and is left without one.
-func refuseASealedWorkspace(ctx context.Context, ws acceptanceWorkspace) error {
+func refuseASealedWorkspace(ctx context.Context, env cli.Env, ws acceptanceWorkspace) error {
 	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
 	if _, err := os.Stat(state.LedgerPath(stateDir)); errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -217,7 +225,19 @@ func refuseASealedWorkspace(ctx context.Context, ws acceptanceWorkspace) error {
 		return fmt.Errorf("look for this run's ledger: %w", err)
 	}
 
-	db, _, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read this run's config: %w", err)
+	}
+
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerInspect)
+	if errors.Is(err, state.ErrSchemaBehind) {
+		fmt.Fprintf(env.Stderr, "acceptance: this workspace's ledger is behind this binary, so whether "+
+			"it is sealed cannot be read until the server migrates it. If no job is assigned, "+
+			"`billet resume --config %s` is the first thing to try.\n", ws.ConfigPath)
+
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("open this run's ledger: %w", err)
 	}

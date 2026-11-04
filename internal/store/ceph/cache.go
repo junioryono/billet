@@ -39,8 +39,9 @@ const (
 	// flatten killed at its bound leaves its client's watcher and lock on the image
 	// for about half a minute, during which `rbd rm` waits: one took 28.6 s, and one
 	// killed at the ordinary 15 s left a watcher of its own for the next to wait on
-	// (Ceph 20.2.0, 2026-11-04).
-	partialCompactionLimit = 2 * time.Minute
+	// (Ceph 20.2.0, 2026-11-04). No longer, since it runs in a request a guest is
+	// waiting on: past this the image is left for eviction, and that is said.
+	partialCompactionLimit = 45 * time.Second
 )
 
 var _ storecontract.Store = (*Client)(nil)
