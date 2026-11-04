@@ -400,18 +400,28 @@ func closedScript(key, iface string, kind Kind) string {
 	fmt.Fprintf(&s, "add rule %s job_%s drop\n", table, key)
 	fmt.Fprintf(&s, "add element %s guests { \"%s\" : jump job_%s }\n", table, iface, key)
 
+	if kind == BridgePort {
+		fmt.Fprintf(&s, "add element %s bridge_ports { \"%s\" }\n", Routed.table(), iface)
+	}
+
 	return s.String()
 }
 
-// detachScript removes everything attachScript made for one guest.
+// detachScript removes everything attachScript made for one guest. A MARK NOTHING COULD
+// SAY names no element: nothing is keyed on zero but what nobody marked.
 func detachScript(key, iface string, kind Kind, mark uint32, listed bool) string {
 	var s strings.Builder
 
 	table := kind.table()
+	known := validMark(mark)
 
 	fmt.Fprintf(&s, "delete element %s guests { \"%s\" }\n", table, iface)
 	fmt.Fprintf(&s, "delete chain %s job_%s\n", table, key)
-	fmt.Fprintf(&s, "delete element %s replies { %#x }\n", table, mark)
+
+	if known {
+		fmt.Fprintf(&s, "delete element %s replies { %#x }\n", table, mark)
+	}
+
 	fmt.Fprintf(&s, "delete chain %s reply_%s\n", table, key)
 
 	if kind == BridgePort {
@@ -435,9 +445,16 @@ func detachScript(key, iface string, kind Kind, mark uint32, listed bool) string
 		}
 	}
 
-	fmt.Fprintf(&s, "delete element %s jobs { %#x }\n", natTable, mark)
+	if known {
+		fmt.Fprintf(&s, "delete element %s jobs { %#x }\n", natTable, mark)
+	}
+
 	fmt.Fprintf(&s, "delete chain %s dns_%s\n", natTable, key)
-	fmt.Fprintf(&s, "delete element %s owners { %#x }\n", natTable, mark)
+
+	if known {
+		fmt.Fprintf(&s, "delete element %s owners { %#x }\n", natTable, mark)
+	}
+
 	fmt.Fprintf(&s, "delete chain %s own_%s\n", natTable, key)
 
 	return s.String()
@@ -684,12 +701,22 @@ func (h heldRules) enforces(b binding) bool {
 	return own && guests.maps["ports"][name] == "fwd_"+b.key && slices.Contains(h.routed.sets["bridge_ports"], name)
 }
 
-// dispatches answers whether a guest's chain is reached and holds anything.
-func (h heldRules) dispatches(key, iface string, kind Kind) bool {
+// keepsOff answers whether a guest no resolver here serves is still kept from everything
+// a resolver would have judged: its chain is reached, its DNS goes nowhere, a connection it
+// holds goes no further, and its port is refused at the IP layer.
+func (h heldRules) keepsOff(key, iface string, kind Kind, mark uint32) bool {
 	guests := h.of(kind.table())
+	name, number := fmt.Sprintf("%q", iface), strconv.FormatUint(uint64(mark), 10)
 
-	return guests.rules["prerouting"] > 0 && guests.maps["guests"][fmt.Sprintf("%q", iface)] == "job_"+key &&
-		guests.rules["job_"+key] > 0
+	held := guests.rules["prerouting"] > 0 && guests.maps["guests"][name] == "job_"+key && guests.rules["job_"+key] > 0 &&
+		h.nat.rules["prerouting"] > 0 && h.nat.maps["jobs"][number] == "dns_"+key && h.nat.rules["dns_"+key] > 0 &&
+		h.nat.rules["own"] > 0 && h.nat.maps["owners"][number] == "own_"+key && h.nat.rules["own_"+key] > 0
+
+	if kind != BridgePort {
+		return held
+	}
+
+	return held && h.routed.rules["port_l3"] > 0 && slices.Contains(h.routed.sets["bridge_ports"], name)
 }
 
 // mapElement is one element of a verdict map: a key and the chain it jumps to.

@@ -246,14 +246,19 @@ func newRealNetwork(t *testing.T, kind Kind) *realNetwork {
 	// gateway's address over it, so every name would time out as if the rules had dropped it.
 	sh(t, "ip", "link", "set", "lo", "up")
 
-	t.Cleanup(func() {
+	clearOut := func() {
 		for _, args := range [][]string{
 			{"ip", "netns", "del", n.guestNS}, {"ip", "netns", "del", n.netNS},
 			{"ip", "link", "del", n.network}, {"ip", "link", "del", n.iface}, {"ip", "link", "del", uplink},
 		} {
 			takeAway(args...)
 		}
-	})
+	}
+
+	// BEFORE AS WELL: a named namespace is a file under /run/netns, which unshare -n does not
+	// hide, so a run that was killed leaves it to refuse the next.
+	clearOut()
+	t.Cleanup(clearOut)
 
 	sh(t, "ip", "netns", "add", n.guestNS)
 	sh(t, "ip", "netns", "add", n.netNS)
@@ -920,10 +925,13 @@ func (n *realNetwork) addPeer() aPeer {
 
 	p := aPeer{ns: "egress-peer", iface: "egresstapp", addr: netip.MustParseAddr("172.31.91.3")}
 
-	n.t.Cleanup(func() {
+	clearOut := func() {
 		takeAway("ip", "netns", "del", p.ns)
 		takeAway("ip", "link", "del", p.iface)
-	})
+	}
+
+	clearOut()
+	n.t.Cleanup(clearOut)
 
 	sh(n.t, "ip", "netns", "add", p.ns)
 	sh(n.t, "ip", "link", "add", p.iface, "type", "veth", "peer", "name", "eth0", "netns", p.ns)
@@ -1427,8 +1435,8 @@ func TestRealEgressPutsBackRulesThatNoLongerHold(t *testing.T) { //nolint:parall
 // WHAT IS LEFT OF A GUEST'S RULES AT A RESTART DOES NOT DECIDE WHETHER IT GETS THEM BACK. Each of these
 // leaves it reachable by some path the new process used to be unable to repair: DNS straight to the
 // host's resolver with the redirect gone, or no mark to name anything by. What it takes is a new
-// process, an answer from its resolver, the list refused, what was admitted admitted, its tap free
-// for the next guest, and the rest of the host's connections alone.
+// process, an answer from its resolver, the list refused, what was admitted admitted, and its tap
+// free for a different guest with nothing of this one's left behind.
 func TestRealEgressRepairsWhatIsLeftOfAGuestsRules(t *testing.T) { //nolint:paralleltest // it owns the namespace's firewall.
 	for _, tc := range []struct {
 		name string
@@ -1438,7 +1446,7 @@ func TestRealEgressRepairsWhatIsLeftOfAGuestsRules(t *testing.T) { //nolint:para
 	}{
 		{"the nat table gone", [][]string{{"nft", "delete", "table", "ip", "billet_egress_nat"}}, true},
 		{"the jobs map emptied", [][]string{{"nft", "flush", "map", "ip", "billet_egress_nat", "jobs"}}, true},
-		{"the dispatch flushed", [][]string{{"nft", "flush", "chain", "bridge", "billet_egress", "prerouting"}}, true},
+		{"its own chain flushed", [][]string{{"nft", "flush", "chain", "bridge", "billet_egress", "job_KEY"}}, true},
 		{"the bridge table gone", [][]string{{"nft", "delete", "table", "bridge", "billet_egress"}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1464,6 +1472,10 @@ func TestRealEgressRepairsWhatIsLeftOfAGuestsRules(t *testing.T) { //nolint:para
 			h.Close()
 
 			for _, take := range tc.take {
+				for i := range take {
+					take[i] = strings.ReplaceAll(take[i], "KEY", a.Key)
+				}
+
 				sh(t, take...)
 			}
 
@@ -1488,13 +1500,26 @@ func TestRealEgressRepairsWhatIsLeftOfAGuestsRules(t *testing.T) { //nolint:para
 
 			next.Detach(t.Context(), a.Key)
 
-			// THE TAP IS FREE FOR THE NEXT GUEST: rules that could not come off would refuse it.
-			if err := next.Attach(t.Context(), a, p); err != nil {
+			// NOTHING OF IT IS LEFT, and the tap is free for a different guest: under the same name
+			// its leftovers would simply have been reused.
+			out, err := exec.CommandContext(t.Context(), "nft", "list", "ruleset").CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+
+			if strings.Contains(string(out), a.Key) {
+				t.Fatalf("what is left of it after its detach:\n%s", out)
+			}
+
+			other := a
+			other.Key = "billet-real-next"
+
+			if err := next.Attach(t.Context(), other, p); err != nil {
 				t.Fatalf("the next guest on this tap: %v", err)
 			}
 
 			n.mustResolve("udp4", "allowed.test.", dnsmessage.RCodeSuccess)
-			next.Detach(t.Context(), a.Key)
+			next.Detach(t.Context(), other.Key)
 		})
 	}
 }

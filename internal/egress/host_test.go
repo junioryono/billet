@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -37,10 +38,10 @@ type fakeNft struct {
 	calls   []string
 	guard   string
 	guests  string
-	// owners answers a listing of the owners map, with none empty.
-	owners   string
-	jobs     string
-	denyHeld bool
+	// owners and replies answer listings of those maps, with none empty.
+	owners, replies string
+	jobs            string
+	denyHeld        bool
 	// tableListing answers a listing of a whole table; with none, it cannot be read.
 	tableListing func(call string) string
 	// setListing replaces the denied set's listing.
@@ -100,6 +101,8 @@ func (f *fakeNft) run(_ context.Context, script string, args ...string) ([]byte,
 		return []byte(f.guests), nil
 	case strings.Contains(call, "list map ip billet_egress_nat owners") && f.owners != "":
 		return []byte(f.owners), nil
+	case strings.Contains(call, "list map bridge billet_egress replies") && f.replies != "":
+		return []byte(f.replies), nil
 	case strings.Contains(call, "list map"):
 		return []byte(anEmptyMap), nil
 	case strings.Contains(call, "list chain") && strings.Contains(call, "deny_"):
@@ -1307,20 +1310,77 @@ func TestAFileWithNoRulesIsJudgedByWhatIsRunning(t *testing.T) {
 		}
 	})
 
-	// A LATER RECOVERY DOES NOT READ FILES: a launch can have written one and not yet its rules.
-	t.Run("only the first recovery judges them", func(t *testing.T) {
+	// LATER RECOVERIES JUDGE THEM TOO: what one could not read is read again, and none is a
+	// launch's, which holds the lifecycle lock from its file to its rules.
+	t.Run("a later recovery judges them too", func(t *testing.T) {
 		t.Parallel()
 
 		f := newFakeNft()
 		h := preparedHost(t, f)
 		h.Reconcile(t.Context(), map[string]bool{})
 		keepFile(t, h, aGuest(), listed(t, "example.com"))
-		h.Reconcile(t.Context(), map[string]bool{})
+		h.Reconcile(t.Context(), map[string]bool{guestKey: true})
 
-		if _, err := h.readFile(guestKey); err != nil {
-			t.Fatalf("a later recovery removed a launch's file: %v", err)
+		if h.live[guestKey] == nil {
+			t.Fatal("a running guest's list was not put back")
 		}
 	})
+}
+
+// A RECOVERY WAITS FOR AN ATTACH THAT HAS WRITTEN ITS FILE AND NOT YET ITS RULES. A sweep's List was
+// taken before the launch, so the file reads as a guest that has gone: judged now, it would be deleted
+// from under a guest that is about to have rules, and no later process could say what they were.
+func TestARecoveryDoesNotJudgeAnAttachInProgress(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeNft()
+	h := preparedHost(t, f)
+
+	inAttach, release := make(chan struct{}), make(chan struct{})
+	run := h.run
+	h.run = func(ctx context.Context, script string, args ...string) ([]byte, error) {
+		if strings.Contains(script, "add chain bridge billet_egress job_"+guestKey) {
+			close(inAttach)
+			<-release
+		}
+
+		return run(ctx, script, args...)
+	}
+
+	attached := make(chan error, 1)
+
+	go func() { attached <- h.Attach(t.Context(), aGuest(), listed(t, "example.com")) }()
+
+	<-inAttach
+
+	reconciled := make(chan struct{})
+
+	go func() {
+		defer close(reconciled)
+		h.Reconcile(t.Context(), map[string]bool{})
+	}()
+
+	select {
+	case <-reconciled:
+		t.Error("a recovery ran through an attach in progress")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if _, err := h.readFile(guestKey); err != nil {
+		t.Errorf("the file of an attach in progress went: %v", err)
+	}
+
+	close(release)
+
+	if err := <-attached; err != nil {
+		t.Fatal(err)
+	}
+
+	<-reconciled
+
+	if _, err := h.readFile(guestKey); err != nil {
+		t.Fatalf("the file of an attached guest went: %v", err)
+	}
 }
 
 // A LIVE GUEST WHOSE RULES HAVE GONE HAS THEM PUT BACK AT THE NEXT RECOVERY, which runs at every
@@ -1905,18 +1965,31 @@ func TestALostMarkIsNeverRenderedOrForgottenAsZero(t *testing.T) {
 func TestAMarkIsFoundInAnyMapThatKeysOnOne(t *testing.T) {
 	t.Parallel()
 
-	f := newFakeNft()
-	f.denyHeld = true
-	f.guests = `{"nftables":[{"map":{"elem":[["` + guestTap + `",{"jump":{"target":"job_` + guestKey + `"}}]]}}]}`
-	f.owners = `{"nftables":[{"map":{"elem":[[` + strconv.FormatUint(0xb1e70007, 10) + `,{"jump":{"target":"own_` + guestKey + `"}}]]}}]}`
+	element := func(chain string) string {
+		return `{"nftables":[{"map":{"elem":[[` + strconv.FormatUint(0xb1e70007, 10) + `,{"jump":{"target":"` + chain + guestKey + `"}}]]}}]}`
+	}
 
-	h := aHost(t, f)
-	keepFile(t, h, aGuest(), listed(t, "example.com"))
-	h.Prepare(t.Context())
-	h.Reconcile(t.Context(), map[string]bool{guestKey: true})
+	for name, stage := range map[string]func(*fakeNft){
+		"owners":  func(f *fakeNft) { f.owners = element("own_") },
+		"replies": func(f *fakeNft) { f.replies = element("reply_") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	if guest := h.live[guestKey]; guest == nil || guest.mark != 0xb1e70007 {
-		t.Fatalf("guest = %+v, want the mark its owners element holds", guest)
+			f := newFakeNft()
+			f.denyHeld = true
+			f.guests = `{"nftables":[{"map":{"elem":[["` + guestTap + `",{"jump":{"target":"job_` + guestKey + `"}}]]}}]}`
+			stage(f)
+
+			h := aHost(t, f)
+			keepFile(t, h, aGuest(), listed(t, "example.com"))
+			h.Prepare(t.Context())
+			h.Reconcile(t.Context(), map[string]bool{guestKey: true})
+
+			if guest := h.live[guestKey]; guest == nil || guest.mark != 0xb1e70007 {
+				t.Fatalf("guest = %+v, want the mark that element holds", guest)
+			}
+		})
 	}
 }
 
@@ -2068,7 +2141,56 @@ func TestAGuestWithAnUnreadableListIsClosedOffWhenItsRulesGo(t *testing.T) {
 
 	h.Reconcile(t.Context(), map[string]bool{guestKey: true})
 
-	scriptWith(t, f, "add rule bridge billet_egress job_"+guestKey+" drop")
+	script := scriptWith(t, f, "add rule bridge billet_egress job_"+guestKey+" drop")
+	for _, want := range []string{
+		"add rule ip billet_egress_nat dns_" + guestKey + " drop", "add rule ip billet_egress_nat own_" + guestKey + " drop",
+		`add element inet billet_egress_routed bridge_ports { "` + guestTap + `" }`, "add table bridge billet_egress",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("closed off without %q:\n%s", want, script)
+		}
+	}
+}
+
+// A CHAIN THAT IS REACHED IS NOT A GUEST KEPT OFF: with the nat table gone its DNS reaches dnsmasq through
+// a job chain that is whole. RULES THAT HOLD ARE LEFT ALONE.
+func TestAGuestKeptOffIsCheckedInEveryPart(t *testing.T) {
+	t.Parallel()
+
+	const mark = uint32(0xb1e70009)
+
+	read := func(call, without string) ruleTable {
+		entries := slices.DeleteFunc(enforcingEntries(call, mark), func(e string) bool {
+			return without != "" && strings.Contains(e, without)
+		})
+
+		table, err := parseRuleTable([]byte(`{"nftables":[` + strings.Join(entries, ",") + `]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return table
+	}
+
+	holds := func(without string) bool {
+		held := heldRules{bridge: read("bridge billet_egress", without), routed: read("inet billet_egress_routed", without),
+			nat: read("ip billet_egress_nat", without)}
+
+		return held.keepsOff(guestKey, guestTap, BridgePort, mark)
+	}
+
+	if !holds("") {
+		t.Fatal("whole rules read as not keeping it off")
+	}
+
+	for _, part := range []string{
+		`"name":"jobs"`, `"name":"owners"`, `"chain":"dns_` + guestKey, `"chain":"own_` + guestKey, `"name":"bridge_ports"`,
+		`"chain":"port_l3"`, `"name":"guests"`, `"chain":"job_` + guestKey,
+	} {
+		if holds(part) {
+			t.Errorf("rules without %s read as keeping it off", part)
+		}
+	}
 }
 
 // A FILE THAT CANNOT BE READ AND RULES WITH NO DENY CHAIN COULD BE AN OPEN GUEST OR A LIST THAT LOST
@@ -2098,6 +2220,110 @@ func TestAnUnreadableFileBehindNoDenyChainIsKept(t *testing.T) {
 		if strings.Contains(script, "delete chain") {
 			t.Fatalf("rules that may be a list's were removed:\n%s", script)
 		}
+	}
+
+	// ITS REDIRECT NAMES A PORT NOBODY HOLDS, WHICHEVER IT TURNS OUT TO BE.
+	scriptWith(t, f, "add rule ip billet_egress_nat dns_"+guestKey+" drop")
+
+	// STILL ON THE BOOKS, SO ITS RULES COME OFF WHEN IT GOES: left, they refuse the next guest on its tap.
+	h.Detach(t.Context(), guestKey)
+
+	scriptWith(t, f, "delete chain bridge billet_egress job_"+guestKey)
+
+	if _, held := h.byIface[guestTap]; held {
+		t.Fatal("its interface is still held")
+	}
+
+	if _, held := h.slots[0xb1e70009]; held {
+		t.Fatal("its mark is still held")
+	}
+}
+
+// RULES NO INTERFACE DISPATCHES TO STILL HOLD THEIR CHAINS AND THE NEXT GUEST'S ELEMENTS: when their guest
+// has gone they come off, under the mark the kernel still has for them.
+func TestAGuestThatHasGoneLeavesNoOrphanedRules(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeNft()
+	f.jobs = `{"nftables":[{"map":{"elem":[[` + strconv.FormatUint(0xb1e70009, 10) + `,{"jump":{"target":"dns_` + guestKey + `"}}]]}}]}`
+	f.denyHeld = true
+
+	h := aHost(t, f)
+	keepFile(t, h, aGuest(), listed(t, "example.com"))
+	h.Prepare(t.Context())
+	h.Reconcile(t.Context(), map[string]bool{})
+
+	script := scriptWith(t, f, "delete chain ip billet_egress_nat dns_"+guestKey)
+	if !strings.Contains(script, "delete element ip billet_egress_nat jobs { 0xb1e70009 }") {
+		t.Fatalf("what is keyed on its mark stays, and would hold its chain:\n%s", script)
+	}
+
+	if _, err := h.readFile(guestKey); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("its file is still there: %v", err)
+	}
+
+	if _, held := h.slots[0xb1e70009]; held {
+		t.Fatal("its mark is still held")
+	}
+}
+
+// A REPLACEMENT MARK IS NOT THE GUEST'S UNTIL ITS RULES COMMIT: what is left of them marks DNS with
+// another, and a quarantine under the new one would stop nothing, while the log said it had.
+func TestAFailedAdoptionUnderANewMarkClosesTheGuest(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeNft()
+	f.denyHeld = true
+	f.guests = `{"nftables":[{"map":{"elem":[["` + guestTap + `",{"jump":{"target":"job_` + guestKey + `"}}]]}}]}`
+
+	h := aHost(t, f)
+	keepFile(t, h, aGuest(), listed(t, "example.com"))
+	h.Prepare(t.Context())
+	h.locals = func() ([]netip.Addr, error) { return nil, errors.New("no addresses") }
+	h.Reconcile(t.Context(), map[string]bool{guestKey: true})
+
+	script := scriptWith(t, f, "add rule ip billet_egress_nat dns_"+guestKey+" drop")
+	if !strings.Contains(script, "add rule bridge billet_egress job_"+guestKey+" drop") {
+		t.Fatalf("its chain goes on marking DNS with a mark nothing redirects:\n%s", script)
+	}
+}
+
+// AN ADOPTION KEEPS THE MARK IT INSTALLS, before it installs it: read back after the next flush, the file
+// is what names this guest's connections.
+func TestAnAdoptionKeepsItsMarkInTheFile(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeNft()
+	f.denyHeld = true
+	f.guests = `{"nftables":[{"map":{"elem":[["` + guestTap + `",{"jump":{"target":"job_` + guestKey + `"}}]]}}]}`
+
+	h := aHost(t, f)
+	keepFile(t, h, aGuest(), listed(t, "example.com"))
+	h.Prepare(t.Context())
+	h.Reconcile(t.Context(), map[string]bool{guestKey: true})
+
+	guest := h.live[guestKey]
+	if guest == nil {
+		t.Fatal("not adopted")
+	}
+
+	file, err := h.readFile(guestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if file.Mark != guest.mark {
+		t.Fatalf("file says %#x, its rules %#x", file.Mark, guest.mark)
+	}
+}
+
+// A MARK NOTHING CAN SAY NAMES NO ELEMENT: nothing is keyed on zero, and asking for it would fail the
+// removal's transaction every time.
+func TestRemovingAGuestWithNoMarkNamesNoMark(t *testing.T) {
+	t.Parallel()
+
+	if s := detachScript(guestKey, guestTap, BridgePort, 0, true); strings.Contains(s, "0x0") {
+		t.Fatalf("a removal names no mark:\n%s", s)
 	}
 }
 

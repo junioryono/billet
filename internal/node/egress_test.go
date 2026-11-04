@@ -424,6 +424,13 @@ func TestASweepChecksThatListsAreStillInForce(t *testing.T) {
 	p := &enforcingProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, host: eh}
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithEgress(eh, true))
 
+	lease := assignedLease(t, a)
+	name := provider.InstanceName(lease.ID)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
 	if err := r.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -431,8 +438,8 @@ func TestASweepChecksThatListsAreStillInForce(t *testing.T) {
 	eh.mu.Lock()
 	defer eh.mu.Unlock()
 
-	if len(eh.reconciled) != 1 {
-		t.Fatalf("reconciled %d times", len(eh.reconciled))
+	if len(eh.reconciled) != 1 || !eh.reconciled[0][name] {
+		t.Fatalf("reconciled %v, want the one sweep, showing the guest", eh.reconciled)
 	}
 }
 
