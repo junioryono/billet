@@ -2276,7 +2276,7 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 	if got := f.metadata[current.Handle][cacheMetaPrefix+"lineage"]; got != "0" {
 		t.Fatalf("compacted lineage depth = %q, want 0", got)
 	}
-	if flattens := countCalls(f, "flatten"); flattens != 1 {
+	if flattens := f.countCalls("flatten"); flattens != 1 {
 		t.Fatalf("flatten count = %d, want one bounded compaction", flattens)
 	}
 	// ON THE COMPACTION'S OWN BOUND: at the ordinary one a large image's flatten
@@ -2357,7 +2357,7 @@ func TestCloningALegacyGenerationDoesNotCrossTheDepthLimit(t *testing.T) {
 	if got := f.metadata[volume.Handle][cacheMetaPrefix+"lineage"]; got != "0" {
 		t.Fatalf("legacy writable lineage metadata = %q, want 0", got)
 	}
-	if flattens := countCalls(f, "flatten"); flattens != 1 {
+	if flattens := f.countCalls("flatten"); flattens != 1 {
 		t.Fatalf("legacy flatten count = %d, want 1", flattens)
 	}
 }
@@ -2426,9 +2426,12 @@ func TestAFlattenCutShortHasItsPartialImageRemoved(t *testing.T) {
 	if _, err := c.Snapshot(ctx, volume); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Snapshot = %v, want the flatten's cancellation", err)
 	}
-	if flattens := countCalls(f, "flatten"); flattens != 1 {
+	if flattens := f.countCalls("flatten"); flattens != 1 {
 		t.Fatalf("flatten count = %d, so this did not cut one short", flattens)
 	}
+	// THE REMOVAL ITSELF MAY NOT BLOCKLIST THE HOST, whose one kernel client every
+	// other job's disk shares, if it breaks the dead flatten's lock.
+	requireCacheImageRules(t, f.calls, "flatten", "rm")
 	for image := range f.images {
 		if strings.Contains(image, "cache-g-") && !published[image] {
 			t.Errorf("the flatten left the partial %s behind, holding %s", image, f.parents[image])
@@ -2448,7 +2451,7 @@ func TestCanceledCloneCleanupRemovesThePartialImage(t *testing.T) {
 	f.metadata[c.cacheIndex()] = map[string]string{activeKey(leaseID): `{"key":"legacy"}`}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	primary := errors.New("copy canceled")
+	primary := errors.New("compaction canceled")
 
 	err := c.cleanupCloneFailure(ctx, leaseID, handle, primary)
 	if !errors.Is(err, primary) {

@@ -74,8 +74,8 @@ func TestACompactionHoldsWhatItsSourceHolds(t *testing.T) {
 		}
 	}
 
-	// NAMED FOR THIS INVOCATION, and removed only once this invocation made them, so a
-	// second run against the pool can neither collide with this one nor delete its images.
+	// NAMED FOR THIS INVOCATION, so a second run against the pool can neither collide
+	// with this one nor delete its images.
 	nonce := make([]byte, 8)
 	if _, err := rand.Read(nonce); err != nil {
 		t.Fatalf("read a nonce: %v", err)

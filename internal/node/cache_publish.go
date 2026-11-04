@@ -369,8 +369,7 @@ func attachmentKind(attachment *cacheAttachment) config.CacheKind {
 // proved gone, off the node's command path; the one thing done in line is the
 // Docker store's readiness handshake, because it needs the guest alive. A
 // session already closing is not waited for: its storage is busy and a
-// redelivered completion must not queue behind it, and nothing is recorded,
-// which publishes nothing.
+// redelivered completion must not queue behind it, and it records nothing more.
 func (s *CacheService) SettleCompleted(
 	ctx context.Context, instance string, succeeded bool, authority dispatch.CacheAuthority,
 ) error {

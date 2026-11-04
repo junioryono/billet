@@ -119,13 +119,13 @@ func TestACandidateIsVerifiedThroughAReadOnlyMapOfItsFrozenSnapshot(t *testing.T
 			c := verifyingClient(t, f, v)
 			volume := candidateVolume(t, c, f, compacted)
 			v.specs, v.readOnly = nil, nil
-			flattens := countCalls(f, "flatten")
+			flattens := f.countCalls("flatten")
 
 			candidate, err := c.Snapshot(t.Context(), volume)
 			if err != nil {
 				t.Fatalf("Snapshot: %v", err)
 			}
-			if flattened := countCalls(f, "flatten") > flattens; flattened != compacted {
+			if flattened := f.countCalls("flatten") > flattens; flattened != compacted {
 				t.Fatalf("the snapshot flattened the lineage: %v, want %v", flattened, compacted)
 			}
 			if parent := f.parents[candidate.Handle]; compacted && parent != "" {
@@ -471,15 +471,4 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 	if damaged, err := checkDamageWith(ctx, "/bin/sh", "/dev/rbd9"); damaged || err == nil {
 		t.Errorf("a cancelled check answered %v, %v; want could-not-tell", damaged, err)
 	}
-}
-
-func countCalls(f *cacheFake, verb string) int {
-	n := 0
-	for _, call := range f.calls {
-		if slices.Contains(call, verb) {
-			n++
-		}
-	}
-
-	return n
 }

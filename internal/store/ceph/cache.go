@@ -765,8 +765,7 @@ func (c *Client) compactCacheCandidate(
 // to be the filesystem verified before the candidate was made.
 //
 // THE SOURCE'S CHECK DOES NOT PROVE THE CANDIDATE. It reads through the kernel
-// device that wrote the volume, and a compacted candidate is a copy made after
-// it. On 2026-10-05 a compaction published a Go cache generation holding 4 MiB of
+// device that wrote the volume, and a compacted candidate is made after it. On 2026-10-05 a compaction published a Go cache generation holding 4 MiB of
 // data, whose journal superblock e2fsck calls corrupt (exit 12, measured
 // 2026-10-13). Every clone of it failed to mount for eight days, and every merge
 // into it failed, so nothing replaced it.
@@ -838,7 +837,7 @@ func (c *Client) removePartialCompaction(ctx context.Context, image string) erro
 
 	if _, err := c.run(cleanupCtx, c.bin, append(c.identity(), keepKernelClient("rm", image)...)); err != nil &&
 		!isNoSuchFile(err) {
-		return fmt.Errorf("ceph: remove the partial compaction %s: %w", image, err)
+		return fmt.Errorf("ceph: remove the partial compaction %s, which is left for eviction: %w", image, err)
 	}
 
 	return nil

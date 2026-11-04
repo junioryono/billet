@@ -28,8 +28,8 @@ const (
 	awsBodyLimit  = 8 << 20
 	awsPollDelay  = 2 * time.Second
 	// unansweredVolumeLimit bounds removing a volume whose caller gave up. A guest
-	// is still waiting behind that caller: the request around a Docker store's
-	// acquisition allows it about a minute after the acquisition's own bound.
+	// is still waiting behind that caller: a Docker store's three-minute acquisition
+	// sits inside a metadata token that older images fetch for five.
 	unansweredVolumeLimit = 45 * time.Second
 	ownerTag              = "sh.billet.owner"
 	cacheOwnerTag         = "sh.billet.cache-owner"
