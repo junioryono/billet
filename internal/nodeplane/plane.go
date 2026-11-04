@@ -1710,15 +1710,26 @@ func (p *Plane) forgetForRequestLocked(requestID int64) {
 	}
 }
 
-// ownedByAnother reports whether a lease's record now names a process other than this
-// one, as a claim landing while a destroy was out leaves it.
-func (p *Plane) ownedByAnother(leaseID, incarnation string) bool {
+// forgetOwnedBy drops a lease's record if it still names this process, and reports
+// whether nothing else holds it: false when a claim landed while a destroy was out, whose
+// answer then says nothing about the claimant's compute. ONE HOLD OF THE MUTEX, because a
+// claim landing between a comparison and a forgetting would be the record removed.
+func (p *Plane) forgetOwnedBy(node, leaseID, incarnation string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	owner, owned := p.owners[leaseID]
+	if !owned {
+		return true
+	}
 
-	return owned && owner.incarnation != incarnation
+	if owner.node != node || owner.incarnation != incarnation {
+		return false
+	}
+
+	delete(p.owners, leaseID)
+
+	return true
 }
 
 // tookCommand reports which process was handed this command.

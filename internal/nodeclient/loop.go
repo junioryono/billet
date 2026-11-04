@@ -665,10 +665,10 @@ func drain(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	}
 }
 
-// custodyClaimEvery is how often a superseded process says what it holds to the
-// controller that serves. A controller that does not know already answers from
-// memory, and a promotion is noticed within this; a lease's default TTL, which is
-// what the claim has to beat for the next renewal to land, is nine of these.
+// custodyClaimEvery is the pause between one finished claim and the next. Each costs the
+// controller a ledger read per lease, and one that has to pass over a controller that has
+// gone takes that controller's dial as well. A lease's default TTL, which a claim has to
+// beat for the next renewal to land, is nine of these.
 const custodyClaimEvery = 10 * time.Second
 
 // followCustody keeps what a superseded process holds known to the controller that

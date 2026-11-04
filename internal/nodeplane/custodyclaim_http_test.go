@@ -119,8 +119,8 @@ type readingStore struct {
 
 	reads       atomic.Int32
 	openAnswers int32
-	// onOpen runs as the last open answer is given.
-	onOpen func()
+	// onOpen runs as the last open answer is given, with that read's context.
+	onOpen func(ctx context.Context)
 }
 
 func (s *readingStore) Lease(ctx context.Context, id string) (*alloc.Lease, error) {
@@ -130,7 +130,7 @@ func (s *readingStore) Lease(ctx context.Context, id string) (*alloc.Lease, erro
 	}
 
 	if s.onOpen != nil && n == s.openAnswers {
-		s.onOpen()
+		s.onOpen(ctx)
 	}
 
 	return s.fakeStore.Lease(ctx, id)
@@ -201,16 +201,14 @@ func TestALeaseThatEndsDuringItsClaimIsForgotten(t *testing.T) {
 	}
 }
 
-// cancellingStore ends a request's context before its read back of what the claim added,
-// as a process whose last release ends its wait does, and answers honestly about a lease
-// only a live context may read.
+// cancellingStore refuses a read on a context that has ended, as a real store does.
 type cancellingStore struct {
 	*readingStore
 }
 
 func (s *cancellingStore) Lease(ctx context.Context, id string) (*alloc.Lease, error) {
-	if s.reads.Load() >= s.openAnswers && ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	return s.readingStore.Lease(ctx, id)
@@ -230,7 +228,17 @@ func TestALeaseThatEndsDuringACancelledClaimIsForgotten(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	store.onOpen = cancel
+	// THE REQUEST HAS ENDED ON THE SERVER'S SIDE BEFORE THE CLAIM IS WRITTEN, so only a read
+	// back on another context can see that the lease ended.
+	store.onOpen = func(served context.Context) {
+		cancel()
+
+		select {
+		case <-served.Done():
+		case <-time.After(10 * time.Second):
+			t.Error("the server never saw the request end")
+		}
+	}
 
 	p, base := serve(t, store)
 	c := dial(t, base)

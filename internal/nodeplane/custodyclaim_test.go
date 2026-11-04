@@ -339,3 +339,40 @@ func TestAClaimLandingDuringADestroyStandsAndTheAnswerDoesNot(t *testing.T) {
 		t.Fatalf("the owner is %+v (ok=%v), want the claimant still", owner, ok)
 	}
 }
+
+// THE RECORD A DESTROY MAY FORGET IS ITS OWN PROCESS'S: forgetting anything else would be
+// the claim removed by an answer that says nothing about it.
+func TestADestroyForgetsOnlyTheRecordOfTheProcessThatAnswered(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		owner *leaseOwner
+		clear bool
+		kept  bool
+	}{
+		{"the process that answered", &leaseOwner{node: "n1", incarnation: "p2"}, true, false},
+		{"another process's", &leaseOwner{node: "n1", incarnation: "p1", requestID: 7}, false, true},
+		{"another host's", &leaseOwner{node: "n2", incarnation: "p2"}, false, true},
+		{"no record", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := testPlane(t)
+			p.owners = map[string]leaseOwner{}
+
+			if tc.owner != nil {
+				p.owners["l9"] = *tc.owner
+			}
+
+			if got := p.forgetOwnedBy("n1", "l9", "p2"); got != tc.clear {
+				t.Errorf("forgetOwnedBy = %v, want %v", got, tc.clear)
+			}
+
+			if _, kept := ownerOf(p, "l9"); kept != tc.kept {
+				t.Errorf("the record kept: %v, want %v", kept, tc.kept)
+			}
+		})
+	}
+}
