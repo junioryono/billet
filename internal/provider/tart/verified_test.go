@@ -487,12 +487,12 @@ func TestACloneThatChangedItsBaseIsDiscardedBeforeItBoots(t *testing.T) {
 	rec := mustVerify(t, p)
 
 	// Wraps the stub: on the launch's clone, rewrite the base's disk after copying.
-	real := s.bin + ".real"
-	if err := os.Rename(s.bin, real); err != nil {
+	wrapped := s.bin + ".real"
+	if err := os.Rename(s.bin, wrapped); err != nil {
 		t.Fatal(err)
 	}
 
-	writeExecutable(t, s.bin, "#!/bin/sh\n\""+real+"\" \"$@\"\nrc=$?\nif [ \"$1\" = clone ]; then "+
+	writeExecutable(t, s.bin, "#!/bin/sh\n\""+wrapped+"\" \"$@\"\nrc=$?\nif [ \"$1\" = clone ]; then "+
 		"printf changed > \""+filepath.Join(p.vmDir(rec.Base), baseDisk)+"\"; fi\nexit $rc\n")
 
 	_, err := p.Launch(t.Context(), verifiedSpec(verifiedLease))
@@ -942,6 +942,28 @@ func setMacOS(t *testing.T, s *stub, p *Provider, guestOS string) {
 	p.ps = filepath.Join(dir, "ps")
 	p.lsof = filepath.Join(dir, "lsof")
 	p.macOSLimit = func() (int, bool, error) { return 2, true, nil }
+	// tart for a pid `ps.out` shows as a tart command, and otherwise the program it names.
+	p.processPath = func(pid int) (string, error) {
+		raw, err := os.ReadFile(filepath.Join(dir, "ps.out"))
+		if err != nil {
+			return "", err
+		}
+
+		for line := range strings.Lines(string(raw)) {
+			if field, command, ok := strings.Cut(strings.TrimSpace(line), " "); ok && field == strconv.Itoa(pid) {
+				if strings.HasPrefix(command, "/bin/sh") || strings.HasPrefix(command, "grep") ||
+					strings.HasPrefix(command, "vim") {
+					first, _, _ := strings.Cut(command, " ")
+
+					return first, nil
+				}
+
+				return "/opt/homebrew/libexec/tart.app/Contents/MacOS/tart", nil
+			}
+		}
+
+		return "", syscall.ESRCH
+	}
 }
 
 func hold(t *testing.T, s *stub) {
@@ -1131,7 +1153,7 @@ func TestTheCensusCountsWhatNoSlotOrTokenAccountsFor(t *testing.T) {
 		},
 		{
 			name: "another program's arguments are not a guest",
-			ps:   "111 /bin/sh -c tart run x\n222 grep tart run\n", admit: true,
+			ps:   "111 /bin/sh -c tart run x\n222 grep tart run\n333 /bin/sh -c /opt/tart run y\n444 vim /a/tart run\n", admit: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1192,6 +1214,24 @@ func TestACensusThatCannotBeReadRefuses(t *testing.T) {
 
 		if _, err := p.Launch(t.Context(), validSpec(verifiedLease)); err == nil ||
 			!strings.Contains(err.Error(), "count the guests") {
+			t.Fatalf("Launch = %v", err)
+		}
+	})
+
+	t.Run("an executable", func(t *testing.T) {
+		t.Parallel()
+
+		s, p := verifiedStub(t)
+		setMacOS(t, s, p, guestDarwin)
+
+		if err := os.WriteFile(filepath.Join(filepath.Dir(s.bin), "ps.out"), []byte("111 tart run x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		p.processPath = func(int) (string, error) { return "", syscall.EPERM }
+
+		if _, err := p.Launch(t.Context(), validSpec(verifiedLease)); err == nil ||
+			!strings.Contains(err.Error(), "read the executable") {
 			t.Fatalf("Launch = %v", err)
 		}
 	})
@@ -1572,6 +1612,8 @@ func TestAVerificationRemovesWhatAnEarlierOneLeft(t *testing.T) {
 	t.Parallel()
 
 	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestLinux)
+
 	kept := mustVerify(t, p)
 
 	prefix := basePrefix + testOwner + "-" + hashName(verifiedRef) + "-"
@@ -1715,7 +1757,7 @@ func TestResolveSkipsAWithdrawnDigest(t *testing.T) {
 	rec := mustVerify(t, p)
 
 	if err := p.withRecords(t.Context(), func(st *verifiedState) (bool, error) {
-		st.withdrawn.Withdrawn[verifiedRef] = []string{rec.Digest}
+		st.verified.Withdrawn[verifiedRef] = []string{rec.Digest}
 
 		return true, nil
 	}); err != nil {
@@ -1975,6 +2017,56 @@ func TestALaunchThatResolvedItsBaseCompletesItsClone(t *testing.T) {
 	assertBases(t, p)
 }
 
+// THE LOCK IS THE CLONE'S, not the launch's: a boot and a registration take minutes, and a
+// delete must not wait them out. The guest's agent here answers only once the base is gone.
+func TestALaunchLetsGoOfItsBaseOnceItHasCloned(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	rec := mustVerify(t, p)
+
+	reached := filepath.Join(filepath.Dir(s.bin), "started")
+	release := filepath.Join(filepath.Dir(s.bin), "go-on")
+
+	if err := os.Rename(s.bin, s.bin+".real"); err != nil {
+		t.Fatal(err)
+	}
+
+	writeExecutable(t, s.bin, "#!/bin/sh\n\"$0.real\" \"$@\"\nrc=$?\n"+
+		"if [ \"$1\" = run ]; then echo started > \""+reached+"\"; fi\n"+
+		"if [ \"$1\" = exec ]; then n=0; while [ ! -e \""+release+"\" ] && [ \"$n\" -lt 400 ]; do sleep 0.05; n=$((n + 1)); done; fi\n"+
+		"exit $rc\n")
+
+	launched := make(chan error, 1)
+
+	go func() {
+		_, err := p.Launch(t.Context(), verifiedSpec(verifiedLease))
+		launched <- err
+	}()
+
+	waitForFile(t, reached)
+
+	base, err := openLockFile(p.baseLockPath(rec.Base))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = base.Close() }()
+
+	free, err := tryFlock(base, syscall.LOCK_EX)
+	if err != nil || !free {
+		t.Errorf("a booting launch still holds its base: free=%v, %v", free, err)
+	}
+
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-launched; err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+}
+
 // UNTRUSTED WORK'S PROBE BOOTS AS UNTRUSTED WORK BOOTS: a third party's image never gets the
 // default NAT because the tier that names it is isolated, and its guest proves it resolves.
 func TestAnIsolatedProbeBootsIsolatedAndProvesItResolves(t *testing.T) {
@@ -2165,7 +2257,9 @@ func TestAHolderThatChangedBetweenTwoReadsIsNotSignalled(t *testing.T) {
 func TestAProbeWithNoCustodyFileIsDeletedOnlyIfTartSaysStopped(t *testing.T) {
 	t.Parallel()
 
-	_, p := verifiedStub(t)
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+
 	probe := p.probeName(verifiedRef)
 
 	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", probe); err != nil {
@@ -2348,30 +2442,117 @@ func TestABaseNoRecordNamesGoesWhenACommitFailed(t *testing.T) {
 	assertNoBases(t, p)
 }
 
-// AN UNPROMOTE THAT CRASHED AFTER ITS WITHDRAWAL IS STILL NOT UNDONE: only what was withdrawn
-// before a verification began is the operator's to take back with --digest.
-func TestAWithdrawalThatAppearedDuringAVerificationIsNotCleared(t *testing.T) {
+// A TAKE-BACK CLEARS THE WITHDRAWAL AND INSTALLS ITS RECORD AS ONE WRITE, so a failure leaves
+// the digest withdrawn and no base of it serving, never withdrawal gone and the old base back.
+func TestATakeBackThatCouldNotBeInstalledLeavesTheDigestWithdrawn(t *testing.T) {
 	t.Parallel()
 
 	_, p := verifiedStub(t)
+	rec := mustVerify(t, p)
 
-	digest := digestOf("manifest one")
+	if _, err := p.Unpromote(t.Context(), verifiedRef, rec.Base); err != nil {
+		t.Fatal(err)
+	}
 
 	opts := verifyOpts()
-	opts.Digest = digest
-	opts.Window = func(ctx context.Context, _ string) (RunnerAnswer, error) {
-		return RunnerAnswer{}, p.withRecords(ctx, func(st *verifiedState) (bool, error) {
-			st.withdrawn.Withdrawn[verifiedRef] = []string{digest}
+	opts.Digest = rec.Digest
+	opts.Window = func(context.Context, string) (RunnerAnswer, error) {
+		p.installer.Rename = func(string, string) error { return errors.New("the disk is full") }
 
-			return true, nil
-		})
+		return RunnerAnswer{}, nil
 	}
 
-	if _, err := p.Verify(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "while it was being verified") {
-		t.Fatalf("Verify = %v", err)
+	if _, err := p.Verify(t.Context(), opts); err == nil {
+		t.Fatal("reported success through a failed install")
 	}
 
-	assertNoBases(t, p)
+	p.installer.Rename = nil
+
+	if _, err := p.Launch(t.Context(), verifiedSpec(verifiedLease)); err == nil ||
+		!strings.Contains(err.Error(), "no verified base") {
+		t.Fatalf("Launch = %v", err)
+	}
+
+	due, err := p.ImageDue(t.Context(), verifiedTier)
+	if err != nil || due.Verify || !strings.Contains(due.Why, "withdrawn") {
+		t.Fatalf("ImageDue = %+v, %v, want the digest still withdrawn", due, err)
+	}
+}
+
+// UNPROMOTE SAYS WHAT IT COULD NOT REMOVE: a retry has no record to act on, so a silent failure
+// would leave tens of gigabytes behind a report that it was removed.
+func TestAnUnpromoteThatCouldNotRemoveItsBaseSaysSo(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+	rec := mustVerify(t, p)
+	p.storeLockWindow = 50 * time.Millisecond
+
+	held, err := lockPath(t.Context(), p.baseLockPath(rec.Base), syscall.LOCK_SH, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer held.release()
+
+	_, err = p.Unpromote(t.Context(), verifiedRef, rec.Base)
+	if err == nil || !strings.Contains(err.Error(), "still on the Mac") {
+		t.Fatalf("Unpromote = %v", err)
+	}
+
+	if _, err := os.Stat(p.vmDir(rec.Base)); err != nil {
+		t.Fatalf("the base went under a launch's lock: %v", err)
+	}
+}
+
+// CLEANUP IS BOUNDED, because one that hangs on a cancelled caller's context holds the store
+// lock against every deployment on the Mac.
+func TestCleanupAfterACancelledCallerHasItsOwnBound(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	cleanCtx, done := cleanupContext(ctx)
+	defer done()
+
+	if cleanCtx.Err() != nil {
+		t.Fatalf("cleanup ran on its caller's cancellation: %v", cleanCtx.Err())
+	}
+
+	deadline, ok := cleanCtx.Deadline()
+	if !ok || time.Until(deadline) > probeTeardownWindow {
+		t.Fatalf("no bound: %v, %v", deadline, ok)
+	}
+}
+
+// A FAULT ELSEWHERE IN THE STORE DOES NOT WEDGE A PROBE'S CLEANUP: tart's rows vouch for this VM,
+// and an unreadable lease-named directory says nothing about it.
+func TestAnUnrelatedCorpseDoesNotStopAProbeBeingRemoved(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+	setMacOS(t, s, p, guestDarwin)
+
+	probe := p.probeName(verifiedRef)
+
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", probe); err != nil {
+		t.Fatal(err)
+	}
+
+	// A directory with a lease's name and no `tart list` row, which the stub's `get` calls
+	// unreadable, is what the full inventory refuses over.
+	if err := os.MkdirAll(p.vmDir(verifiedLease), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.list(t.Context()); err == nil {
+		t.Fatal("the stub's inventory does not refuse this, so this stages nothing")
+	}
+
+	if err := p.endProbe(t.Context(), probe); err != nil {
+		t.Fatalf("endProbe: %v", err)
+	}
 }
 
 // A WITHDRAWN RECORD A CRASH LEFT IS NOT A ROLLBACK TARGET, and counting it would push out the
@@ -2396,7 +2577,7 @@ func TestRetentionDoesNotCountAWithdrawnBase(t *testing.T) {
 	bad := setImage("bad")
 
 	if err := p.withRecords(t.Context(), func(st *verifiedState) (bool, error) {
-		st.withdrawn.Withdrawn[verifiedRef] = []string{bad.Digest}
+		st.verified.Withdrawn[verifiedRef] = []string{bad.Digest}
 
 		return true, nil
 	}); err != nil {
@@ -2414,7 +2595,7 @@ func TestAVerificationRefusesARunnerPastAStoredDateWhenGitHubIsSilent(t *testing
 	_, p := verifiedStub(t)
 
 	if err := p.withRecords(t.Context(), func(st *verifiedState) (bool, error) {
-		st.deadlines.Deadlines["2.337.0"] = p.now().Add(-time.Hour)
+		st.verified.Deadlines["2.337.0"] = p.now().Add(-time.Hour)
 
 		return true, nil
 	}); err != nil {
@@ -2492,5 +2673,37 @@ func TestAProbeWithNoCustodyFileAndARunningProcessIsNotDeleted(t *testing.T) {
 
 	if _, serr := os.Stat(p.vmDir(probe)); serr != nil {
 		t.Fatalf("it was deleted: %v", serr)
+	}
+}
+
+// A PRIVATE STORE A CRASH LEFT GOES WITH THE NEXT VERIFICATION OF ITS IMAGE, under its lock,
+// whether or not that verification pulls anything.
+func TestAPrivateStoreACrashLeftIsRemovedByTheNextVerification(t *testing.T) {
+	t.Parallel()
+
+	s, p := verifiedStub(t)
+
+	if _, err := p.run(t.Context(), "clone", "ghcr.io/x/y", "my-vm"); err != nil {
+		t.Fatal(err)
+	}
+
+	left := filepath.Join(p.privateStore("my-vm"), "cache")
+	if err := os.MkdirAll(left, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := verifyOpts()
+	opts.Image = "my-vm@verified"
+
+	if _, err := p.Verify(t.Context(), opts); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	if _, err := os.Stat(left); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the private store is still there: %v", err)
+	}
+
+	if lines := envLines(t, s, "pull"); len(lines) != 0 {
+		t.Fatalf("pulled a local VM: %v", lines)
 	}
 }

@@ -713,6 +713,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	var (
 		image    string
 		verified *VerifiedRecord
+		pinned   heldFile
 		err      error
 	)
 
@@ -722,9 +723,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 		}
 
-		// HELD THROUGH THE CLONE, so an unpromote that comes after this answer waits for
-		// the clone rather than removing what this launch resolved.
-		defer held.release()
+		// HELD THROUGH THE CLONE AND NO LONGER, so an unpromote that comes after this answer
+		// waits for the clone rather than removing what this launch resolved, and not for
+		// the minutes of a boot that no longer needs the base.
+		pinned = held
+		defer pinned.release()
 
 		image, verified = rec.Base, &rec
 	} else {
@@ -739,7 +742,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	}
 
 	if verified != nil {
-		if err := p.cloneHeldBase(ctx, *verified, staging); err != nil {
+		err := p.cloneHeldBase(ctx, *verified, staging)
+
+		pinned.release()
+
+		if err != nil {
 			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 		}
 	} else if _, err := p.run(ctx, "clone", image, staging); err != nil {
@@ -2310,6 +2317,26 @@ type listedVM struct {
 // between appears as a directory without a row and fails toward the error side;
 // reconciliation retries, and a transient refusal is the safe direction.
 func (p *Provider) list(ctx context.Context) ([]listedVM, error) {
+	vms, err := p.listRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool, len(vms))
+	for _, vm := range vms {
+		seen[vm.Name] = true
+	}
+
+	if err := p.crossCheckStore(ctx, seen); err != nil {
+		return nil, err
+	}
+
+	return vms, nil
+}
+
+// listRows is tart's own answer, each row readable and named once, which vouches for the
+// rows it holds and says nothing about the ones it does not.
+func (p *Provider) listRows(ctx context.Context) ([]listedVM, error) {
 	out, err := p.run(ctx, "list", "--format", "json", "--source", "local")
 	if err != nil {
 		return nil, fmt.Errorf("tart: list VMs: %w", err)
@@ -2338,10 +2365,6 @@ func (p *Provider) list(ctx context.Context) ([]listedVM, error) {
 		}
 
 		seen[vm.Name] = true
-	}
-
-	if err := p.crossCheckStore(ctx, seen); err != nil {
-		return nil, err
 	}
 
 	return vms, nil

@@ -131,14 +131,10 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 		}
 	}
 
-	var (
-		generation, epoch int64
-		wasWithdrawn      bool
-	)
+	var generation, epoch int64
 
 	if err := p.withRecords(ctx, func(st *verifiedState) (bool, error) {
-		wasWithdrawn = st.isWithdrawn(key, digest)
-		if opts.Digest == "" && wasWithdrawn {
+		if opts.Digest == "" && st.isWithdrawn(key, digest) {
 			return false, fmt.Errorf("%s was unpromoted and its tag still names it; to take it back, "+
 				"run `billet images verify %s --digest %s`", digest, key, digest)
 		}
@@ -161,7 +157,10 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 
 	defer func() {
 		if !committed {
-			p.discardUnrecordedBase(context.WithoutCancel(ctx), key, rec.Base)
+			cleanCtx, cancel := cleanupContext(ctx)
+			defer cancel()
+
+			p.discardUnrecordedBase(cleanCtx, key, rec.Base)
 		}
 	}()
 
@@ -197,29 +196,24 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 				"probe already in flight never undoes that")
 		}
 
-		// ONLY WHAT WAS WITHDRAWN BEFORE THIS BEGAN IS AN OPERATOR'S TO TAKE BACK. One that
-		// appeared since is an unpromote this probe must not undo, even one that crashed
-		// before it moved the epoch, since the withdrawal is installed first.
-		withdrawn := st.isWithdrawn(key, digest)
-		if withdrawn && (opts.Digest == "" || !wasWithdrawn) {
-			return false, fmt.Errorf("%s was unpromoted while it was being verified", digest)
-		}
-
-		if withdrawn {
-			st.withdrawn.Withdrawn[key] = slices.DeleteFunc(st.withdrawn.Withdrawn[key],
+		// THE EPOCH ABOVE SAYS NO UNPROMOTE RAN SINCE THIS BEGAN, in the same document as
+		// what an unpromote withdraws, so what is withdrawn here was withdrawn before and
+		// is the operator's to take back by naming it.
+		if opts.Digest != "" {
+			st.verified.Withdrawn[key] = slices.DeleteFunc(st.verified.Withdrawn[key],
 				func(d string) bool { return d == digest })
-			if len(st.withdrawn.Withdrawn[key]) == 0 {
-				delete(st.withdrawn.Withdrawn, key)
+			if len(st.verified.Withdrawn[key]) == 0 {
+				delete(st.verified.Withdrawn, key)
 			}
 		}
 
 		if !answer.Deadline.IsZero() {
-			st.deadlines.Deadlines[runner] = answer.Deadline
+			st.verified.Deadlines[runner] = answer.Deadline
 		}
 
 		// A DATE ALREADY HELD ANSWERS WHEN GITHUB DOES NOT: a launch would refuse this
 		// record at once, so it is refused here, where the operator is looking.
-		if deadline, ok := st.deadlines.Deadlines[runner]; ok && !p.now().Before(deadline) {
+		if deadline, ok := st.verified.Deadlines[runner]; ok && !p.now().Before(deadline) {
 			return false, fmt.Errorf("its runner %s went past GitHub's window on %s, so GitHub would "+
 				"send it no job", runner, deadline.Format(time.DateOnly))
 		}
@@ -235,8 +229,11 @@ func (p *Provider) Verify(ctx context.Context, opts VerifyOptions) (*VerifiedRec
 
 	committed = true
 
-	// AFTER THE RECORD LOCK: a base's lock can wait on a launch's clone.
-	p.deleteBases(ctx, dropped)
+	// AFTER THE RECORD LOCK: a base's lock can wait on a launch's clone. What this could
+	// not remove has no record, so the image's next verification removes it.
+	if err := p.deleteBases(ctx, dropped); err != nil {
+		p.log.Error("could not remove a base no record names", "image", key, "error", err)
+	}
 
 	return rec, nil
 }
@@ -269,6 +266,14 @@ func (p *Provider) discardUnrecordedBase(ctx context.Context, key, base string) 
 		p.log.Error("could not remove a base no record names; the next verification of its image "+
 			"removes it", "vm", base, "error", err)
 	}
+}
+
+// cleanupContext is what cleanup runs on once its caller has ended: a fresh bound, covering
+// the tart commands as well as the locks. A delete that hangs on the caller's cancelled
+// context would hold the store lock against every deployment on the Mac, so one that runs
+// out leaves what it was removing for the next verification.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), probeTeardownWindow)
 }
 
 // probeTrust is the trust class a probe's network flags come from.
@@ -308,7 +313,10 @@ func retainBases(st *verifiedState, key string) []string {
 
 // countYield records a yield for `billet check`. A failure only loses the count.
 func (p *Provider) countYield(ctx context.Context, key string) {
-	err := p.withRecords(context.WithoutCancel(ctx), func(st *verifiedState) (bool, error) {
+	cleanCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+
+	err := p.withRecords(cleanCtx, func(st *verifiedState) (bool, error) {
 		st.image(key).Yields++
 
 		return true, nil
@@ -409,7 +417,7 @@ func (p *Provider) runProbe(
 	defer func() {
 		// A FRESH BOUND: the caller or a yield may have ended the context this ran on,
 		// and the probe is proved gone either way.
-		endCtx, endCancel := context.WithTimeout(context.WithoutCancel(ctx), probeTeardownWindow)
+		endCtx, endCancel := cleanupContext(ctx)
 		defer endCancel()
 
 		_ = custody.Close()
@@ -675,7 +683,10 @@ func (p *Provider) endProbe(ctx context.Context, probe string) error {
 
 // requireStopped refuses unless tart lists the VM and says it is stopped.
 func (p *Provider) requireStopped(ctx context.Context, name string) error {
-	vms, err := p.list(ctx)
+	// THE ROWS ALONE, not the inventory: a lease-named directory that cannot be read says
+	// nothing about this VM, and refusing on it would wedge every verification of an image
+	// over a fault elsewhere.
+	vms, err := p.listRows(ctx)
 	if err != nil {
 		return fmt.Errorf("ask tart about %s: %w", name, err)
 	}
@@ -819,7 +830,7 @@ func (p *Provider) resolveVerified(ctx context.Context, key string) (VerifiedRec
 				continue
 			}
 
-			if deadline, ok := st.deadlines.Deadlines[r.Runner]; ok && !p.now().Before(deadline) {
+			if deadline, ok := st.verified.Deadlines[r.Runner]; ok && !p.now().Before(deadline) {
 				return false, fmt.Errorf("the runner %s in the newest verified base of %s went past "+
 					"GitHub's window on %s, so GitHub would send it no job; once the image carries a "+
 					"newer one, run `billet images verify %s`", r.Runner, key,
@@ -885,7 +896,7 @@ func (p *Provider) Unpromote(ctx context.Context, image, base string) ([]string,
 		st.image(key).UnpromoteEpoch++
 
 		if target.Digest != "" && !st.isWithdrawn(key, target.Digest) {
-			st.withdrawn.Withdrawn[key] = append(st.withdrawn.Withdrawn[key], target.Digest)
+			st.verified.Withdrawn[key] = append(st.verified.Withdrawn[key], target.Digest)
 		}
 
 		dropped = st.removeRecords(key, func(r VerifiedRecord) bool {
@@ -898,7 +909,10 @@ func (p *Provider) Unpromote(ctx context.Context, image, base string) ([]string,
 		return nil, fmt.Errorf("tart: unpromote: %w", err)
 	}
 
-	p.deleteBases(ctx, dropped)
+	if err := p.deleteBases(ctx, dropped); err != nil {
+		return dropped, fmt.Errorf("tart: unpromote: the record is gone and no launch resolves it, and "+
+			"its base is still on the Mac until the image's next verification removes it: %w", err)
+	}
 
 	return dropped, nil
 }
@@ -974,13 +988,13 @@ func (p *Provider) VerifiedImages(ctx context.Context) ([]VerifiedImage, error) 
 			image := VerifiedImage{
 				Key:       key,
 				Records:   st.recordsOf(key),
-				Withdrawn: slices.Clone(st.withdrawn.Withdrawn[key]),
+				Withdrawn: slices.Clone(st.verified.Withdrawn[key]),
 				Yields:    st.verified.Images[key].Yields,
 				Deadlines: map[string]time.Time{},
 			}
 
 			for _, r := range image.Records {
-				if deadline, ok := st.deadlines.Deadlines[r.Runner]; ok {
+				if deadline, ok := st.verified.Deadlines[r.Runner]; ok {
 					image.Deadlines[r.Runner] = deadline
 				}
 			}
@@ -1033,7 +1047,7 @@ func (p *Provider) RefreshDeadlines(ctx context.Context, window RunnerWindow) (u
 
 	return unknown, p.withRecords(ctx, func(st *verifiedState) (bool, error) {
 		for runner, deadline := range answers {
-			st.deadlines.Deadlines[runner] = deadline
+			st.verified.Deadlines[runner] = deadline
 		}
 
 		return true, nil

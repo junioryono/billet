@@ -16,14 +16,13 @@ import (
 	"github.com/junioryono/billet/internal/regularfile"
 )
 
-// The record of what this node verified (ADR-021): three files under node.state_dir,
-// and one lock beside them that serialises their reads and commits and is never held
-// across a probe.
+// The record of what this node verified (ADR-021): one document under node.state_dir,
+// installed whole, so a withdrawal, the epoch that says it happened and the records it
+// removes can never be read apart, and one lock beside it that serialises its reads and
+// commits and is never held across a probe.
 const (
-	verifiedFile  = "tart-verified.json"
-	withdrawnFile = "tart-withdrawn.json"
-	deadlinesFile = "tart-runner-deadlines.json"
-	recordLock    = "tart-verified.lock"
+	verifiedFile = "tart-verified.json"
+	recordLock   = "tart-verified.lock"
 
 	verifiedSchema = 1
 	// recordLimit bounds a record read: two bases per image and a small catalogue.
@@ -88,27 +87,17 @@ type verifiedDocument struct {
 	Deployment string                    `json:"deployment"`
 	Images     map[string]*imageProgress `json:"images"`
 	Records    []VerifiedRecord          `json:"records"`
-}
-
-// withdrawnDocument is tart-withdrawn.json: digests no retention ever touches, by image.
-type withdrawnDocument struct {
-	Schema    int                 `json:"schema"`
+	// Withdrawn holds unpromoted digests by image, which no retention ever touches.
 	Withdrawn map[string][]string `json:"withdrawn"`
-}
-
-// deadlinesDocument is tart-runner-deadlines.json: the date GitHub stops sending jobs
-// to a runner, by version, shared by every record of that version and never erased by
-// a could-not-tell or by a base going away.
-type deadlinesDocument struct {
-	Schema    int                  `json:"schema"`
+	// Deadlines holds the date GitHub stops sending jobs to a runner, by version, shared
+	// by every record of that version and never erased by a could-not-tell or by a base
+	// going away.
 	Deadlines map[string]time.Time `json:"deadlines"`
 }
 
-// verifiedState is the three files, read under the record lock.
+// verifiedState is the document, read under the record lock.
 type verifiedState struct {
-	verified  verifiedDocument
-	withdrawn withdrawnDocument
-	deadlines deadlinesDocument
+	verified verifiedDocument
 }
 
 func (s *verifiedState) image(key string) *imageProgress {
@@ -120,7 +109,7 @@ func (s *verifiedState) image(key string) *imageProgress {
 }
 
 func (s *verifiedState) isWithdrawn(key, digest string) bool {
-	return digest != "" && slices.Contains(s.withdrawn.Withdrawn[key], digest)
+	return digest != "" && slices.Contains(s.verified.Withdrawn[key], digest)
 }
 
 // recordsOf is the image's records, newest first.
@@ -176,16 +165,7 @@ func readJSONRecord(path string, into any) (bool, error) {
 	return true, nil
 }
 
-// checkSchema refuses a document this build does not know how to read.
-func checkSchema(path string, found bool, schema int) error {
-	if found && schema != verifiedSchema {
-		return fmt.Errorf("%s has schema %d and this billet reads %d", path, schema, verifiedSchema)
-	}
-
-	return nil
-}
-
-// loadVerifiedState reads the three files. The caller holds the record lock.
+// loadVerifiedState reads the document. The caller holds the record lock.
 func (p *Provider) loadVerifiedState() (*verifiedState, error) {
 	st := &verifiedState{}
 
@@ -196,8 +176,8 @@ func (p *Provider) loadVerifiedState() (*verifiedState, error) {
 		return nil, err
 	}
 
-	if err := checkSchema(path, found, st.verified.Schema); err != nil {
-		return nil, err
+	if found && st.verified.Schema != verifiedSchema {
+		return nil, fmt.Errorf("%s has schema %d and this billet reads %d", path, st.verified.Schema, verifiedSchema)
 	}
 
 	// A RECORD OF ANOTHER DEPLOYMENT NAMES ITS BASES, which are not this one's to clone
@@ -208,70 +188,40 @@ func (p *Provider) loadVerifiedState() (*verifiedState, error) {
 			path, st.verified.Deployment, p.owner)
 	}
 
-	path = filepath.Join(p.stateDir, withdrawnFile)
-
-	if found, err = readJSONRecord(path, &st.withdrawn); err != nil {
-		return nil, err
-	}
-
-	if err := checkSchema(path, found, st.withdrawn.Schema); err != nil {
-		return nil, err
-	}
-
-	path = filepath.Join(p.stateDir, deadlinesFile)
-
-	if found, err = readJSONRecord(path, &st.deadlines); err != nil {
-		return nil, err
-	}
-
-	if err := checkSchema(path, found, st.deadlines.Schema); err != nil {
-		return nil, err
-	}
-
 	st.verified.Schema, st.verified.Deployment = verifiedSchema, p.owner
-	st.withdrawn.Schema, st.deadlines.Schema = verifiedSchema, verifiedSchema
 
 	if st.verified.Images == nil {
 		st.verified.Images = map[string]*imageProgress{}
 	}
 
-	if st.withdrawn.Withdrawn == nil {
-		st.withdrawn.Withdrawn = map[string][]string{}
+	if st.verified.Withdrawn == nil {
+		st.verified.Withdrawn = map[string][]string{}
 	}
 
-	if st.deadlines.Deadlines == nil {
-		st.deadlines.Deadlines = map[string]time.Time{}
+	if st.verified.Deadlines == nil {
+		st.verified.Deadlines = map[string]time.Time{}
 	}
 
 	return st, nil
 }
 
-// saveVerifiedState installs the three files, the withdrawals and deadlines first, so a
-// crash between them can leave a digest withdrawn with its record still there, which
-// resolution skips, and never a record removed with its digest still eligible.
+// saveVerifiedState installs the document whole. It can report failure having installed
+// it, since a durable install reports a directory sync that failed after its rename, so a
+// caller reads the records again rather than conclude they did not change.
 func (p *Provider) saveVerifiedState(st *verifiedState) error {
-	for _, doc := range []struct {
-		name string
-		body any
-	}{
-		{withdrawnFile, st.withdrawn},
-		{deadlinesFile, st.deadlines},
-		{verifiedFile, st.verified},
-	} {
-		body, err := json.MarshalIndent(doc.body, "", "  ")
-		if err != nil {
-			return fmt.Errorf("encode %s: %w", doc.name, err)
-		}
+	body, err := json.MarshalIndent(st.verified, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", verifiedFile, err)
+	}
 
-		body = append(body, '\n')
+	body = append(body, '\n')
 
-		if _, err := p.installer.Install(p.stateDir, doc.name, 0o600, func(w io.Writer) error {
-			_, err := w.Write(body)
+	if _, err := p.installer.Install(p.stateDir, verifiedFile, 0o600, func(w io.Writer) error {
+		_, err := w.Write(body)
 
-			return err
-		}); err != nil {
-			return fmt.Errorf("record %s: %w", doc.name, err)
-		}
+		return err
+	}); err != nil {
+		return fmt.Errorf("record %s: %w", verifiedFile, err)
 	}
 
 	return nil

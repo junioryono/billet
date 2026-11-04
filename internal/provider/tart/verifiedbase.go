@@ -357,7 +357,10 @@ func (p *Provider) makeBase(
 
 	defer func() {
 		if _, serr := os.Lstat(p.vmDir(staging)); serr == nil {
-			p.deleteVerifiedVM(context.WithoutCancel(ctx), staging)
+			cleanCtx, cancel := cleanupContext(ctx)
+			defer cancel()
+
+			p.deleteVerifiedVM(cleanCtx, staging)
 		}
 	}()
 
@@ -517,7 +520,10 @@ func (p *Provider) cloneHeldBase(ctx context.Context, rec VerifiedRecord, target
 	}
 
 	if err := p.compareBase(ctx, rec); err != nil {
-		p.discardStaging(context.WithoutCancel(ctx), target)
+		cleanCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+
+		p.discardStaging(cleanCtx, target)
 
 		return err
 	}
@@ -608,12 +614,15 @@ func (p *Provider) deleteBase(ctx context.Context, base string) error {
 }
 
 // deleteBases removes bases dropped from the records. A failure leaves a base no record
-// names, which the image's next verification removes.
-func (p *Provider) deleteBases(ctx context.Context, bases []string) {
+// names, which the image's next verification removes, and every one is tried.
+func (p *Provider) deleteBases(ctx context.Context, bases []string) error {
+	var failures []error
+
 	for _, base := range bases {
 		if err := p.deleteBase(ctx, base); err != nil {
-			p.log.Error("could not remove a base no record names; the next verification of its "+
-				"image removes it", "vm", base, "error", err)
+			failures = append(failures, err)
 		}
 	}
+
+	return errors.Join(failures...)
 }

@@ -584,11 +584,13 @@ func (p *Provider) writeSlotIdentity(f *os.File, name string) error {
 
 // tartGuestCommand matches the processes every VM tart runs has for its whole life: a
 // `tart run`, and a `tart create --from-ipsw`, which installs macOS in a VM it runs
-// itself. `ps` shows the resolved path of tart.app, which may hold a space. Bare words in
-// another program's arguments are not a VM.
+// itself. `ps` shows the resolved path of tart.app, which may hold a space, so a command
+// alone cannot say where its executable ends: what matches here is only a candidate, and
+// the process's own executable says whether another program merely has these words among
+// its arguments.
 var (
-	tartRunCommand    = regexp.MustCompile(`^(.*/)?tart\s+run(\s|$)`)
-	tartCreateCommand = regexp.MustCompile(`^(.*/)?tart\s+create\s(.*\s)?--from-ipsw(\s|=|$)`)
+	tartRunCommand    = regexp.MustCompile(`(^|/)tart\s+run(\s|$)`)
+	tartCreateCommand = regexp.MustCompile(`(^|/)tart\s+create\s(.*\s)?--from-ipsw(\s|=|$)`)
 )
 
 // isTartGuestCommand reads one `ps` command column.
@@ -625,7 +627,22 @@ func (p *Provider) tartGuests(ctx context.Context) (map[int]string, error) {
 		}
 
 		command = strings.TrimSpace(command)
-		if p.isTartGuestCommand(command) {
+		if !p.isTartGuestCommand(command) {
+			continue
+		}
+
+		// A PROCESS THAT HAS GONE IS NO GUEST, and one whose executable cannot be read is
+		// could-not-tell, which refuses.
+		exe, err := p.processPath(pid)
+		if errors.Is(err, syscall.ESRCH) {
+			continue
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("read the executable of pid %d: %w", pid, err)
+		}
+
+		if filepath.Base(exe) == "tart" {
 			guests[pid] = command
 		}
 	}
