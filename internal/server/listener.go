@@ -195,6 +195,17 @@ type Listener struct {
 	// poolLaunchBatch is how many pool members a reconciliation starts at once;
 	// zero or one launches each before buying the next. See WithPoolLaunchBatch.
 	poolLaunchBatch int
+	// backgroundLaunches runs a bought lease's launch beside the poll goroutine
+	// instead of on it. See listener_flight.go.
+	backgroundLaunches bool
+	// flights is each lease whose background launch has not returned, under mu, and
+	// launchFailure the first error one returned; launchSlots bounds how many run at
+	// once, launchEnded wakes the loop when one ends, and launches joins them all.
+	flights       map[string]*launchFlight
+	launchFailure error
+	launchSlots   chan struct{}
+	launchEnded   chan struct{}
+	launches      sync.WaitGroup
 	// batchBuying is set, under mu, while a pool pass buys its batch, and
 	// batchBought records that it bought: the admission order re-dates the tier
 	// once for the pass rather than once per purchase.
@@ -455,6 +466,7 @@ type openedSession struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
+		launchEnded:   make(chan struct{}, 1),
 		alloc:         a,
 		tier:          tier,
 		session:       session,
@@ -576,6 +588,11 @@ func (l *Listener) Run(ctx context.Context) error {
 	// live until the session ends, so releasing escrow first leaves a positive
 	// advertisement standing with nothing behind it.
 	defer func() {
+		// EVERY LAUNCH RETURNS BEFORE ANY OF IT, while renewal still runs: what follows
+		// hands back or destroys what those launches hold, and a launch writes to a
+		// ledger the caller may close once this returns.
+		l.joinLaunches(ctx)
+
 		// A FENCED CONTROLLER ACTS ON NOTHING, AND THIS IS ASKED BEFORE ANY OF IT.
 		//
 		// Every step below is an authoritative act — destroying compute, closing
@@ -834,6 +851,13 @@ func (l *Listener) Run(ctx context.Context) error {
 	}()
 
 	for {
+		// A BACKGROUND LAUNCH'S FAILURE IS TREATED AS THE LOOP WOULD TREAT IT HAD THE
+		// LOOP WAITED FOR IT, as a failed reconciliation below is.
+		if err := l.takeLaunchFailure(); err != nil && !cancelledWhileServing(ctx, draining, err) &&
+			!l.drainEnded(pollCtx, draining, err) {
+			return stopping(ctx, err)
+		}
+
 		// CHECKED HERE AND AFTER EVERY CALL, because the cancellation almost always
 		// lands DURING one rather than between two: the listener spends nearly all
 		// its life inside a long poll.
@@ -1017,7 +1041,16 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		l.reportCapacity(pollCtx, &advertised, "in flight")
-		msg, err := l.session.GetMessage(pollCtx, l.lastMessageID, advertised)
+		answer := l.exchange(pollCtx, advertised, !draining)
+		if answer.beside != nil {
+			if cancelledWhileServing(ctx, draining, answer.beside) || l.drainEnded(pollCtx, draining, answer.beside) {
+				continue
+			}
+
+			return stopping(ctx, answer.beside)
+		}
+
+		msg, err := answer.msg, answer.err
 		if err == nil || errors.Is(err, ErrNoMessage) {
 			polled++
 			l.sessionFailures = 0
