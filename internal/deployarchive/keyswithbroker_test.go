@@ -154,6 +154,10 @@ func TestARestorePlansNoKeyForAHostOnABroker(t *testing.T) {
 		planned = append(planned, act.Entry)
 	}
 
+	if len(p.Refusals) != 0 {
+		t.Errorf("a restore onto a host on a broker is refused: %+v", p.Refusals)
+	}
+
 	if slices.Contains(planned, EntryAppKey) {
 		t.Errorf("a restore onto a host holding no key plans one: %v", planned)
 	}
@@ -164,9 +168,13 @@ func TestARestorePlansNoKeyForAHostOnABroker(t *testing.T) {
 	wantsKey := externalTarget(t, true)
 	wantsKey.GitHub = a.Manifest.GitHub
 
-	_, err = PlanRestore(t.Context(), a, wantsKey)
-	if err == nil || !strings.Contains(err.Error(), "carries no App key") {
-		t.Fatalf("an archive with no key onto a host wanting one answered %v", err)
+	refused, err := PlanRestore(t.Context(), a, wantsKey)
+	if err != nil {
+		t.Fatalf("PlanRestore: %v", err)
+	}
+
+	if got := refusalsMentioning(refused, "carries no App key"); len(got) != 1 {
+		t.Fatalf("an archive with no key onto a host wanting one was refused for %+v", refused.Refusals)
 	}
 }
 
@@ -183,6 +191,10 @@ func TestAHostOnABrokerTakesNoKeyFromAnOlderArchive(t *testing.T) {
 	p, err := PlanRestore(t.Context(), a, target)
 	if err != nil {
 		t.Fatalf("PlanRestore: %v", err)
+	}
+
+	if len(p.Refusals) != 0 {
+		t.Errorf("a host on a broker refused an older archive: %+v", p.Refusals)
 	}
 
 	for _, act := range p.Actions {

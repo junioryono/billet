@@ -160,8 +160,15 @@ func NewScaleSetClients(ctx context.Context, cfg *config.Config) ([]Target, erro
 // appKeyFilePaths is every target's key path, for the lifecycle commands that
 // inspect, contain and preserve the files a deployment is made of. Empty under
 // the store backend, where no target names a file.
+//
+// A broker's client key is among them: this host's service reads it, and a lifecycle
+// command has to hand it over and leave it standing as it does an App key.
 func KeyFilePaths(cfg *config.Config) []string {
 	var paths []string
+
+	if cfg.Server != nil && cfg.Server.TokenBroker != nil {
+		paths = append(paths, cfg.Server.TokenBroker.ClientKeyPath)
+	}
 
 	for _, target := range cfg.GitHubTargets() {
 		if target.PrivateKeyPath != "" {

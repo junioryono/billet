@@ -212,7 +212,9 @@ func newTestBroker(t *testing.T, gh *fakeGitHub, deployments []config.BrokerDepl
 	}
 
 	srv := httptest.NewUnstartedServer(server)
-	srv.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert, MinVersion: tls.VersionTLS13}
+	srv.TLS = &tls.Config{
+		ClientAuth: tls.RequireAnyClientCert, MinVersion: tls.VersionTLS13, VerifyConnection: server.VerifyConnection,
+	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
@@ -302,10 +304,32 @@ func TestABrokerRefusesAKeyItDoesNotKnow(t *testing.T) {
 		{ID: deploymentA, Clients: []string{known}, Installations: []config.BrokerInstallation{org(22)}},
 	})
 
+	// REFUSED IN THE HANDSHAKE, so a stranger never holds a place in the budget, and it
+	// reaches the caller as nothing it can read as an answer, naming what to look at.
 	_, err := broker.client(t, stranger, nil).Tokens(github.OrganizationTarget("acme"), appID, 22).
 		InstallationToken(t.Context())
-	if !errors.Is(err, github.ErrTokenRefused) {
-		t.Fatalf("a stranger's key got %v, want %v", err, github.ErrTokenRefused)
+	if !errors.Is(err, github.ErrTokenUnavailable) || !strings.Contains(err.Error(), "client-key --show") {
+		t.Fatalf("a stranger's key got %v, want could-not-tell naming the key", err)
+	}
+
+	if !strings.Contains(broker.logged.String(), "refused a client this broker does not know") {
+		t.Errorf("the broker says nothing of the stranger:\n%s", broker.logged.String())
+	}
+
+	// AND THE HANDLER REFUSES ONE TOO, which is what stands if a listener is ever built
+	// without the check.
+	strangerLeaf, err := x509.ParseCertificate(stranger.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, tokenRoute, strings.NewReader(`{}`))
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{strangerLeaf}}
+	broker.server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("the handler answered a stranger %d, want %d", rec.Code, http.StatusUnauthorized)
 	}
 
 	if n := gh.minted.Load(); n != 0 {
@@ -590,17 +614,27 @@ func TestAHeldTokenRidesOutABrokerThatDoesNotAnswer(t *testing.T) {
 		t.Fatalf("a held token did not ride out the outage: %v, %v", token.Bearer(), err)
 	}
 
-	// A DEFINITE REFUSAL IS NOT RIDDEN OUT.
+	// A DEFINITE REFUSAL IS NOT RIDDEN OUT, AND THE TOKEN GOES WITH IT: the silence after
+	// it hands nothing back, with minutes left on what it held.
 	status.Store(http.StatusForbidden)
 
 	if _, err := source.InstallationToken(t.Context()); !errors.Is(err, github.ErrTokenRefused) {
 		t.Fatalf("a refusal answered %v, want it reported", err)
 	}
 
-	// AND A TOKEN PAST ITS LAST USABLE MINUTE IS NOT HANDED OUT.
-	state := source.(brokerTokens)
-	state.token = github.NewToken("held", time.Now().Add(30*time.Second), nil)
 	status.Store(http.StatusServiceUnavailable)
+
+	if token, err := source.InstallationToken(t.Context()); !errors.Is(err, github.ErrTokenUnavailable) {
+		t.Fatalf("silence after a refusal answered %q, %v; the refused token came back", token.Bearer(), err)
+	}
+
+	// AND A TOKEN PAST ITS LAST USABLE MINUTE IS NOT HANDED OUT.
+	state, ok := source.(brokerTokens)
+	if !ok {
+		t.Fatalf("the source is a %T", source)
+	}
+
+	state.token = github.NewToken("held", time.Now().Add(30*time.Second), nil)
 
 	if _, err := source.InstallationToken(t.Context()); !errors.Is(err, github.ErrTokenUnavailable) {
 		t.Fatalf("a nearly expired token with the broker silent answered %v", err)
@@ -788,5 +822,71 @@ func TestNoAnswerOfTheBrokerCarriesAKey(t *testing.T) {
 		if bytes.Contains(body, []byte("PRIVATE KEY")) || bytes.Contains(body, broker.key) {
 			t.Errorf("%s %s answered with a key: %s", ask.method, ask.path, body)
 		}
+	}
+}
+
+// A CALLER GOING AWAY SAYS NOTHING ABOUT THE INSTALLATION. A proof already held stands,
+// so an outage after a hung-up caller still has it to fall back on.
+func TestACallerGoingAwayKeepsAnInstallationsProof(t *testing.T) {
+	t.Parallel()
+
+	gh := newFakeGitHub(t)
+	cert, fingerprint := testClient(t)
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{org(22)}},
+	})
+
+	inst := broker.server.installations[keyOf(deploymentA, appID, 22, "acme")]
+
+	now := time.Now()
+	broker.server.now = func() time.Time { return now }
+
+	if _, err := broker.client(t, cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22).
+		InstallationToken(t.Context()); err != nil {
+		t.Fatalf("first token: %v", err)
+	}
+
+	proved := inst.verified
+	if proved.IsZero() {
+		t.Fatal("the first token proved nothing, so this has nothing to keep")
+	}
+
+	now = now.Add(verifyEvery + time.Minute)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	req := httptest.NewRequest(http.MethodPost, tokenRoute, http.NoBody).WithContext(ctx)
+
+	broker.server.verify = func(*http.Request, *installation) error { return context.Canceled }
+
+	if status, code, _ := broker.server.proved(req, inst); status != http.StatusServiceUnavailable || code != codeUnavailable {
+		t.Errorf("a caller gone answered %d %s", status, code)
+	}
+
+	if !inst.verified.Equal(proved) {
+		t.Errorf("a caller gone moved the proof to %v from %v", inst.verified, proved)
+	}
+}
+
+// A BASE WITH A TRAILING SLASH STILL REACHES THE ROUTE, because config admits one.
+func TestABrokerURLWithATrailingSlashIsTheSameBroker(t *testing.T) {
+	t.Parallel()
+
+	gh := newFakeGitHub(t)
+	cert, fingerprint := testClient(t)
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{org(22)}},
+	})
+
+	roots := x509.NewCertPool()
+	roots.AddCert(broker.Certificate())
+
+	client := NewClient(ClientOptions{URL: broker.URL + "/", Certificate: cert, Roots: roots})
+
+	if _, err := client.Tokens(github.OrganizationTarget("acme"), appID, 22).InstallationToken(t.Context()); err != nil {
+		t.Fatalf("a base with a trailing slash: %v", err)
 	}
 }

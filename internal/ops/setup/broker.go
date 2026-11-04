@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"syscall"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/tokenbroker"
 )
@@ -102,8 +105,14 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 		if fingerprint, err = tokenbroker.Fingerprint(key); err != nil {
 			return err
 		}
-	} else if fingerprint, err = tokenbroker.CreateClientKey(path); err != nil {
-		return err
+	} else {
+		if fingerprint, err = tokenbroker.CreateClientKey(path); err != nil {
+			return err
+		}
+
+		if err := giveToService(path, cfg.Server.IdentityDir); err != nil {
+			return err
+		}
 	}
 
 	fmt.Fprintf(env.Stdout, "key          %s\ndeployment   %s\nfingerprint  %s\n\nCompare both with what the "+
@@ -119,6 +128,34 @@ func brokerClientKey(ctx context.Context, env cli.Env, args []string) error {
 		}
 
 		fmt.Fprintln(env.Stdout, "}")
+	}
+
+	return nil
+}
+
+// giveToService hands a key a privileged run just made to the account the service runs
+// as, which owns the identity directory: it is the service that reads it, and a mode 0600
+// file root owns would stop the control plane at its first token. Through a descriptor,
+// never a pathname. Nothing happens for anyone but root.
+func giveToService(path, identityDir string) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+
+	var owner syscall.Stat_t
+	if err := syscall.Stat(identityDir, &owner); err != nil {
+		return fmt.Errorf("read who owns %s: %w", identityDir, err)
+	}
+
+	f, _, err := regularfile.Open(path, regularfile.Options{})
+	if err != nil {
+		return fmt.Errorf("open %s to hand it over: %w", path, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	if err := f.Chown(int(owner.Uid), int(owner.Gid)); err != nil {
+		return fmt.Errorf("give %s to the service account: %w", path, err)
 	}
 
 	return nil

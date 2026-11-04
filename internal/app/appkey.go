@@ -46,7 +46,7 @@ func KeyPath(ssm *config.IdentitySSMConfig, target config.GitHubTarget) string {
 func ResolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHubTarget) (github.AppKey, error) {
 	// NEVER A QUIET "NO KEY": a caller that needs one under a broker is a caller the
 	// broker's arrival should have changed, and has to say so rather than proceed.
-	if cfg.Server.TokenBroker != nil {
+	if cfg.Server != nil && cfg.Server.TokenBroker != nil {
 		return nil, fmt.Errorf("target %s has no App key on this host, because server.token_broker is set",
 			target.Name)
 	}
@@ -95,7 +95,7 @@ func ResolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHub
 // depending on where it was read from and an operator debugging a failover needs
 // to know which one they are looking at.
 func KeyLocation(cfg *config.Config, target config.GitHubTarget) string {
-	if cfg.Server.TokenBroker != nil {
+	if cfg.Server != nil && cfg.Server.TokenBroker != nil {
 		return "none on this host; tokens come from the broker at " + cfg.Server.TokenBroker.URL
 	}
 

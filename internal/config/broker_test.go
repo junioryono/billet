@@ -79,6 +79,10 @@ func TestABrokerFileRefusesWhatItCannotHonour(t *testing.T) {
 		"a bad target":                {"target: other/web", "target: a/b/c", "neither"},
 		"no target":                   {", target: acme}", "}", "target is required"},
 		"the same one twice":          {"target: other/web", "target: other/api", "listed twice"},
+		"one repository, two deployments, any case": {
+			"{app_id: 11, installation_id: 22, target: acme}", "{app_id: 11, installation_id: 33, target: OTHER/API}",
+			"already registered to deployment",
+		},
 
 		// THE RULE THE BROKER EXISTS FOR. An organization's token reaches every
 		// repository the installation does, so nobody else may hold that installation.

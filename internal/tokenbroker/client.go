@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/github"
@@ -54,7 +55,7 @@ type ClientOptions struct {
 // NewClient builds the connection. Nothing is dialled until a token is asked for.
 func NewClient(opts ClientOptions) *Client {
 	return &Client{
-		url: opts.URL,
+		url: strings.TrimSuffix(opts.URL, "/"),
 		http: &http.Client{
 			Timeout: clientRequestFor,
 			// A REDIRECT WOULD CARRY THE QUESTION SOMEWHERE THE OPERATOR DID NOT NAME, so
@@ -120,10 +121,16 @@ func (b brokerTokens) InstallationToken(ctx context.Context) (github.Token, erro
 		return token, nil
 	}
 
-	// A DEFINITE REFUSAL IS REPORTED however long the old token has left: a deployment
-	// the broker no longer knows should learn so now. Silence is what gets ridden out.
-	if errors.Is(err, github.ErrTokenUnavailable) && b.token.Bearer() != "" &&
-		time.Until(b.token.ExpiresAt()) > tokenLastUsable {
+	// A DEFINITE REFUSAL IS REPORTED, and the token goes with it: a deployment the
+	// broker no longer serves must not carry on with one the next silence would hand
+	// back. Silence is what gets ridden out.
+	if !errors.Is(err, github.ErrTokenUnavailable) {
+		b.token = github.Token{}
+
+		return github.Token{}, err
+	}
+
+	if b.token.Bearer() != "" && time.Until(b.token.ExpiresAt()) > tokenLastUsable {
 		slog.Default().Warn("the token broker did not answer; keeping the installation token held until it does",
 			"target", b.target.Path(), "expires", b.token.ExpiresAt().Format(time.RFC3339), "error", err)
 
@@ -154,7 +161,10 @@ func (b brokerTokens) ask(ctx context.Context) (github.Token, error) {
 
 	resp, err := b.client.http.Do(req)
 	if err != nil {
-		return github.Token{}, fmt.Errorf("%w: ask the broker: %w", github.ErrTokenUnavailable, err)
+		// A KEY THE BROKER DOES NOT KNOW ENDS IN THE HANDSHAKE, and the alert reaches
+		// here as nothing structural, so this says what to look at either way.
+		return github.Token{}, fmt.Errorf("%w: ask the broker (is this host's key registered there? `billet "+
+			"broker client-key --show` prints it): %w", github.ErrTokenUnavailable, err)
 	}
 	defer resp.Body.Close()
 

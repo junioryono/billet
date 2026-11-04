@@ -42,7 +42,12 @@ const (
 func sourceInstallationToken(tokens billetgithub.TokenSource, failures *tokenFailures, log *slog.Logger,
 ) retryablehttp.RequestLogHook {
 	return func(_ retryablehttp.Logger, req *http.Request, _ int) {
-		if req.Header.Get("Authorization") != "Bearer "+tokenPlaceholder {
+		// EVERY ATTEMPT, NOT ONLY THE FIRST: the first swaps the placeholder, and a retry
+		// after a long Retry-After must not resend a token that has since expired. The
+		// placeholder is checked as well as the route so that a new reader of it in the
+		// vendored client is a token sent rather than a placeholder.
+		if req.Header.Get("Authorization") != "Bearer "+tokenPlaceholder &&
+			!strings.HasSuffix(req.URL.Path, "/actions/runners/registration-token") {
 			return
 		}
 
@@ -63,6 +68,10 @@ func sourceInstallationToken(tokens billetgithub.TokenSource, failures *tokenFai
 
 // tokenFailures remembers why a request was stopped, because the vendored client
 // reports only that its transport could not send it.
+//
+// THE LATEST REASON, NOT THIS REQUEST'S: nothing carries one through the vendored
+// client. Two callers stopped together ask one source moments apart, so the reason one
+// reads may be the other's, and a stopped request stays stopped either way.
 type tokenFailures struct {
 	last atomic.Pointer[error]
 }

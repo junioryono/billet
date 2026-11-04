@@ -9,6 +9,8 @@
 package tokenbroker
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -188,6 +190,27 @@ func targetOf(path string) (github.Target, error) {
 	return github.RepositoryTarget(owner, name), nil
 }
 
+// VerifyConnection refuses a key this broker does not know in the handshake, on a
+// resumed connection as on a fresh one.
+//
+// THE CONNECTION BUDGET IS CHARGED ONLY AFTER A HANDSHAKE SUCCEEDS, and any self-signed
+// certificate satisfies RequireAnyClientCert, so checking this in the handler alone would
+// let a stranger hold every place a registered deployment needs.
+func (s *Server) VerifyConnection(state tls.ConnectionState) error {
+	if len(state.PeerCertificates) == 0 {
+		return errors.New("tokenbroker: no client certificate")
+	}
+
+	fingerprint := wirecert.FingerprintOfCert(state.PeerCertificates[0])
+	if _, known := s.clients[fingerprint]; !known {
+		s.log.Warn("refused a client this broker does not know", "fingerprint", fingerprint)
+
+		return fmt.Errorf("tokenbroker: this broker does not know the key %s", fingerprint)
+	}
+
+	return nil
+}
+
 // ServeHTTP answers the one route.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != tokenRoute || r.Method != http.MethodPost {
@@ -297,6 +320,10 @@ func (s *Server) proved(r *http.Request, inst *installation) (int, string, strin
 		inst.verified = s.now()
 
 		return 0, "", ""
+	// THE CALLER WENT AWAY, which says nothing about the installation, and must not
+	// erase a proof a later outage would need.
+	case r.Context().Err() != nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return http.StatusServiceUnavailable, codeUnavailable, "the installation could not be checked just now"
 	case errors.Is(err, github.ErrAppUnverifiable), github.Undecided(err):
 		s.log.Warn("could not prove an installation is the one registered", "deployment", inst.deployment,
 			"installation", inst.installationID, "error", err)
