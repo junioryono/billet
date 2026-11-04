@@ -3,7 +3,6 @@ package ceph
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -54,33 +53,50 @@ func unmapped(f *cacheFake) [][]string {
 }
 
 // A NUMBER THE KERNEL HAS GIVEN TO ANOTHER JOB IS NEITHER READ NOR UNMAPPED. A
-// failed snapshot unmaps and discards its volume, and the retry read whatever
-// held the recorded number by then: on 2026-11-04 another job's running root
-// disk, reported "not clean", with an unmap of it next had it looked clean.
+// failed snapshot unmaps and discards its volume, and the retry read whatever held
+// the recorded number by then: on 2026-11-04 another job's running root disk,
+// reported "not clean", with an unmap of it next had it looked clean. Whether the
+// volume's own image is gone or only unmapped decides what the caller does next,
+// and neither touches that device.
 func TestASnapshotOfAVolumeNoLongerMappedTouchesTheDeviceThatTookItsNumber(t *testing.T) {
 	t.Parallel()
 
-	f := newCacheFake()
-	c, volume, other, read := provenDeviceClient(t, f, f.run)
+	for name, tc := range map[string]struct {
+		removed bool
+		want    error
+	}{
+		"its image is gone":  {removed: true, want: storecontract.ErrVolumeGone},
+		"its image is there": {want: storecontract.ErrDeviceUnknown},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	delete(f.mappings, volume.Device)
-	stale := volume
-	stale.Device = other.Device
-	before := len(unmapped(f))
+			f := newCacheFake()
+			c, volume, other, read := provenDeviceClient(t, f, f.run)
 
-	_, err := c.Snapshot(t.Context(), stale)
+			delete(f.mappings, volume.Device)
+			if tc.removed {
+				delete(f.images, volume.Handle)
+			}
+			stale := volume
+			stale.Device = other.Device
+			before := len(unmapped(f))
 
-	if !errors.Is(err, storecontract.ErrVolumeGone) {
-		t.Fatalf("Snapshot = %v, want ErrVolumeGone", err)
-	}
-	if len(*read) != 0 {
-		t.Errorf("the check read %v, which is another job's device", *read)
-	}
-	if got := unmapped(f)[before:]; len(got) != 0 {
-		t.Errorf("unmapped %v, and that number is another job's device", got)
-	}
-	if f.mappings[other.Device] == "" {
-		t.Errorf("the other job's %s lost its mapping", other.Device)
+			_, err := c.Snapshot(t.Context(), stale)
+
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Snapshot = %v, want %v", err, tc.want)
+			}
+			if len(*read) != 0 {
+				t.Errorf("the check read %v, which is another job's device", *read)
+			}
+			if got := unmapped(f)[before:]; len(got) != 0 {
+				t.Errorf("unmapped %v, and that number is another job's device", got)
+			}
+			if f.mappings[other.Device] == "" {
+				t.Errorf("the other job's %s lost its mapping", other.Device)
+			}
+		})
 	}
 }
 
@@ -152,8 +168,8 @@ func TestAMappedSnapshotIsNotTheVolumesDevice(t *testing.T) {
 	delete(f.mappings, volume.Device)
 	f.mappings["/dev/rbd77"] = image + "@1793768786-05bbfa71efa771269ed2f629"
 
-	if device, err := c.MappedDevice(t.Context(), volume); !errors.Is(err, storecontract.ErrVolumeGone) {
-		t.Fatalf("MappedDevice = %q, %v, want ErrVolumeGone", device, err)
+	if device, err := c.MappedDevice(t.Context(), volume); !errors.Is(err, storecontract.ErrDeviceUnknown) {
+		t.Fatalf("MappedDevice = %q, %v, want ErrDeviceUnknown", device, err)
 	}
 }
 
@@ -181,83 +197,68 @@ func TestAVolumeMappedTwiceIsAnsweredByARecordThatIsOneOfThem(t *testing.T) {
 }
 
 // A ROW THAT DOES NOT SAY WHOSE IT IS, OR IN ANOTHER NAMESPACE, PROVES NOTHING: the
-// first could be this volume's, so it is could-not-tell and never gone, and the
-// second is a different image of the same name.
+// first could be this volume's, and the second is a different image of the same
+// name, so neither is its device and neither says it is gone.
 func TestAMappingTableThatProvesNothingIsNotAnAnswer(t *testing.T) {
 	t.Parallel()
 
-	for name, tc := range map[string]struct {
-		rows     string
-		wantGone bool
-	}{
-		"a null row":               {rows: `[null]`},
-		"a row without its pool":   {rows: `[{"name":"%[1]s","snap":"-","device":"/dev/rbd5"}]`},
-		"a row without its image":  {rows: `[{"pool":"billet-cache","snap":"-","device":"/dev/rbd5"}]`},
-		"a row without a snapshot": {rows: `[{"pool":"billet-cache","name":"%[1]s","device":"/dev/rbd5"}]`},
-		"a row without its device": {rows: `[{"pool":"billet-cache","name":"%[1]s","snap":"-"}]`},
-		"null instead of a table":  {rows: `null`},
-		"another namespace's image": {
-			rows:     `[{"pool":"billet-cache","namespace":"other","name":"%[1]s","snap":"-","device":"/dev/rbd5"}]`,
-			wantGone: true,
-		},
+	for name, rows := range map[string]string{
+		"a null row":                `[null]`,
+		"a row without its pool":    `[{"name":"%[1]s","snap":"-","device":"/dev/rbd5"}]`,
+		"a row without its image":   `[{"pool":"billet-cache","snap":"-","device":"/dev/rbd5"}]`,
+		"a row without a snapshot":  `[{"pool":"billet-cache","name":"%[1]s","device":"/dev/rbd5"}]`,
+		"a row without its device":  `[{"pool":"billet-cache","name":"%[1]s","snap":"-"}]`,
+		"null instead of a table":   `null`,
+		"another namespace's image": `[{"pool":"billet-cache","namespace":"other","name":"%[1]s","snap":"-","device":"/dev/rbd5"}]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			f := newCacheFake()
-			var rows []byte
+			var answer []byte
 			run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
-				if rows != nil && slices.Contains(args, "device") && slices.Contains(args, "list") {
-					return rows, nil
+				if answer != nil && slices.Contains(args, "device") && slices.Contains(args, "list") {
+					return answer, nil
 				}
 
 				return f.run(ctx, bin, args)
 			}
 			c, volume, _, _ := provenDeviceClient(t, f, run)
 			image := strings.TrimPrefix(volume.Handle, "billet-cache/")
-			if strings.Contains(tc.rows, "%[1]s") {
-				rows = fmt.Appendf(nil, tc.rows, image)
-			} else {
-				rows = []byte(tc.rows)
-			}
+			answer = []byte(strings.ReplaceAll(rows, "%[1]s", image))
 			delete(f.mappings, volume.Device)
+			// The image is gone too, so a table read as "nothing maps it" answers gone.
+			delete(f.images, volume.Handle)
 
 			device, err := c.MappedDevice(t.Context(), volume)
-			if tc.wantGone {
+			if name == "another namespace's image" {
 				if !errors.Is(err, storecontract.ErrVolumeGone) {
-					t.Fatalf("MappedDevice = %q, %v, want ErrVolumeGone", device, err)
+					t.Fatalf("MappedDevice = %q, %v, want ErrVolumeGone: that row is not this image", device, err)
 				}
 
 				return
 			}
-			if !errors.Is(err, storecontract.ErrDeviceUnknown) || errors.Is(err, storecontract.ErrVolumeGone) {
+			if !errors.Is(err, storecontract.ErrDeviceUnknown) {
 				t.Fatalf("MappedDevice = %q, %v, want ErrDeviceUnknown", device, err)
 			}
 		})
 	}
 }
 
-// A MISSING ROW IS NOT GONE WHILE THE CLUSTER SAYS OTHERWISE. rbd's device list
-// skips a device it could not read and still succeeds, and gone is what has a job's
-// writes thrown away, so a watcher on the image, or a status that cannot be read,
-// is could-not-tell. An image that no longer exists is gone without a table.
-func TestGoneTakesTheClusterAgreeing(t *testing.T) {
+// A MISSING ROW IS NOT GONE WHILE THE IMAGE EXISTS. rbd's device list skips a device
+// it could not read and still succeeds, and gone is what has a job's writes thrown
+// away, so only the image no longer existing says so.
+func TestGoneMeansTheImageIs(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
-		prepare  func(f *cacheFake, image string)
+		removed  bool
 		failing  bool
 		wantGone bool
 	}{
-		"no row and no watcher": {wantGone: true},
-		"no row and a watcher": {prepare: func(f *cacheFake, image string) {
-			f.watchers[image] = 1
-		}},
+		"no row and the image is listed":       {},
 		"no row and the status cannot be read": {failing: true},
-		"no row and no image": {
-			prepare:  func(f *cacheFake, image string) { delete(f.images, image) },
-			wantGone: true,
-		},
+		"no row and no image":                  {removed: true, wantGone: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -273,8 +274,8 @@ func TestGoneTakesTheClusterAgreeing(t *testing.T) {
 			}
 			c, volume, _, _ := provenDeviceClient(t, f, run)
 			delete(f.mappings, volume.Device)
-			if tc.prepare != nil {
-				tc.prepare(f, volume.Handle)
+			if tc.removed {
+				delete(f.images, volume.Handle)
 			}
 			failing = tc.failing
 

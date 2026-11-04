@@ -487,11 +487,13 @@ func (c *Client) cacheMappings(ctx context.Context, name string) ([]mappedDevice
 // MappedDevice names the device the kernel has a writable cache volume's head
 // mapped to now, from the kernel's table and by the image's name.
 //
-// GONE TAKES TWO WITNESSES. `rbd device list` skips a device whose attributes it
-// could not read and still succeeds (Ceph 20.2.3, krbd.cc's dump_one_image), so a
-// missing row alone does not say the volume is unmapped, and this answer is what
-// has its writes thrown away. The cluster has to agree: no image, or one with no
-// watcher, which a kernel mapping holds for as long as it exists.
+// GONE MEANS THE IMAGE IS, because this answer has a volume's writes thrown away. A
+// missing row does not prove it: `rbd device list` skips a device whose attributes
+// it could not read and still succeeds (Ceph 20.2.3, krbd.cc's dump_one_image), and
+// a mapping's watch can lapse while the kernel re-registers it, so neither says the
+// kernel let go. A failed snapshot's cleanup moves the image to the trash, which is
+// the case this answer exists for; an image still listed with no row is could not
+// tell, and a publication asks again until its window ends.
 func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) (string, error) {
 	unknown := func(err error) error { return fmt.Errorf("%w: %w", storecontract.ErrDeviceUnknown, err) }
 
@@ -525,39 +527,31 @@ func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) 
 			volume.Handle, devices, bounded(volume.Device)))
 	}
 
-	watched, err := c.imageWatched(ctx, volume.Handle)
+	exists, err := c.imageExists(ctx, volume.Handle)
 	if err != nil {
 		return "", unknown(err)
 	}
-	if watched {
-		return "", unknown(fmt.Errorf("ceph: the device list has no row for %s, and something still "+
-			"watches it", volume.Handle))
+	if exists {
+		return "", unknown(fmt.Errorf("ceph: the device list has no row for %s, which still exists",
+			volume.Handle))
 	}
 
-	return "", fmt.Errorf("%w: nothing maps %s, recorded on %s", storecontract.ErrVolumeGone,
+	return "", fmt.Errorf("%w: %s no longer exists, recorded on %s", storecontract.ErrVolumeGone,
 		volume.Handle, bounded(volume.Device))
 }
 
-// imageWatched reports whether anything holds a watch on an image. An image that
-// does not exist has none.
-func (c *Client) imageWatched(ctx context.Context, handle string) (bool, error) {
-	out, err := c.rbdCmd(ctx, true, "status", handle)
-	if err != nil {
+// imageExists reports whether an image is listed, as opposed to removed or in the
+// trash.
+func (c *Client) imageExists(ctx context.Context, handle string) (bool, error) {
+	if _, err := c.rbdCmd(ctx, true, "status", handle); err != nil {
 		if isNoSuchFile(err) {
 			return false, nil
 		}
 
-		return false, fmt.Errorf("ceph: read the watchers of %s: %w", handle, err)
+		return false, fmt.Errorf("ceph: ask whether %s exists: %w", handle, err)
 	}
 
-	var status struct {
-		Watchers *[]json.RawMessage `json:"watchers"`
-	}
-	if err := json.Unmarshal(out, &status); err != nil || status.Watchers == nil {
-		return false, fmt.Errorf("ceph: %s did not name the watchers of %s", c.bin, handle)
-	}
-
-	return len(*status.Watchers) > 0, nil
+	return true, nil
 }
 
 // checkCloneName refuses a clone name billet cannot address.

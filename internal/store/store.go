@@ -12,10 +12,10 @@ import (
 // ErrMiss means a site has no published generation for a cache key.
 var ErrMiss = errors.New("store: cache miss")
 
-// ErrVolumeGone means a volume is no longer mapped on this host, so nothing can
-// be read from it and a snapshot of it can never succeed: a failed snapshot took
-// it, or the host restarted. A caller stops asking and discards what is left.
-var ErrVolumeGone = errors.New("store: the volume is no longer mapped on this host")
+// ErrVolumeGone means a volume no longer exists, so nothing can be read from it and
+// a snapshot of it can never succeed: a failed snapshot's cleanup took it. A caller
+// stops asking and discards what is left.
+var ErrVolumeGone = errors.New("store: the volume no longer exists")
 
 // ErrDeviceUnknown means where a volume is mapped could not be told. Nothing was
 // done to the volume, and it may be intact: a caller asks again rather than giving
@@ -185,9 +185,9 @@ type Store interface {
 //
 // A RECORDED DEVICE IS NOT PROOF. A kernel reuses a device's number as soon as it
 // is unmapped, so a number kept across a failure or a restart may name another
-// job's disk. It answers ErrVolumeGone for a volume nothing maps, and
-// ErrDeviceUnknown for could not tell. Optional: a store whose device is the
-// volume's own name has nothing to prove.
+// job's disk. It answers ErrVolumeGone for a volume that no longer exists, and
+// ErrDeviceUnknown for anything it cannot prove. Optional: a store whose device is
+// the volume's own name has nothing to prove.
 type DeviceProver interface {
 	MappedDevice(ctx context.Context, volume Volume) (string, error)
 }
