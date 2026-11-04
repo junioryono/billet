@@ -838,6 +838,34 @@ func TestUsageNeverMintsAnIdentity(t *testing.T) {
 	}
 }
 
+// A NODE'S FILE IS REFUSED BY NAME: the identity is read before anything opens, so nothing
+// further on is there to say this file has no control plane.
+func TestUsageRefusesANodesConfig(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "billet.yaml")
+
+	if err := os.WriteFile(cfg, []byte("node:\n  name: n\n  server_addr: 10.0.0.1:7717\n  provider: docker\n"+
+		"  state_dir: "+dir+"\n  tls:\n    cert: "+filepath.Join(dir, "c")+"\n    key: "+filepath.Join(dir, "k")+
+		"\n    ca: "+filepath.Join(dir, "a")+"\n"), 0o600); err != nil {
+		t.Fatalf("write the config: %v", err)
+	}
+
+	for _, name := range []string{"c", "k", "a"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	env, _ := bufferedEnv()
+
+	err := Usage(t.Context(), env, []string{"export", "--config", cfg})
+	if err == nil || !strings.Contains(err.Error(), "no server section") {
+		t.Fatalf("got %v, want a refusal naming the missing section", err)
+	}
+}
+
 // A LATE RESULT FILLS A RECORD UNDER THE NUMBER IT HAD, so nothing past a reader's cursor
 // says so: the document tells a reader to read such a lease again, from an older cursor,
 // and that has to work and find the same place.

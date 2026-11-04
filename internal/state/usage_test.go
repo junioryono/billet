@@ -315,3 +315,93 @@ func exerciseUsageCounterLock(
 		t.Fatalf("the second taker answered %d, %v; want %d, once the first committed", got.n, got.err, wantSecond)
 	}
 }
+
+// A REDELIVERY FILLS WHAT A COMPLETION'S ROW LACKS, for the same job and never for another,
+// and never over what it holds. A row written before these columns existed has neither time,
+// and its redelivery is the one chance to bring them before a restart bills on the restart.
+func TestARedeliveryFillsAPendingCompletionsTimes(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) {
+		db, err := Open(t.Context(), t.TempDir())
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+
+		exerciseCompletionTimes(t, db)
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		dsn := requirePostgres(t)
+
+		db, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
+		if err != nil {
+			t.Fatalf("OpenPostgres: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+
+		exerciseCompletionTimes(t, db)
+	})
+}
+
+func exerciseCompletionTimes(t *testing.T, db *DB) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	const (
+		assigned = "2026-11-04T09:48:27Z"
+		finished = "2026-11-04T09:52:30Z"
+	)
+
+	base := PendingCompletion{
+		Tier: "linux", RequestID: 91, Result: "succeeded", LeaseID: "lease-91", LeaseEpoch: 1,
+		Outcome: "done", MessageID: 6, JobID: "job-91",
+	}
+
+	put := func(c PendingCompletion) PendingCompletion {
+		t.Helper()
+
+		if _, err := db.PutPendingCompletion(ctx, c); err != nil {
+			t.Fatalf("PutPendingCompletion: %v", err)
+		}
+
+		rows, err := db.PendingCompletions(ctx, "linux")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("PendingCompletions = %+v, %v", rows, err)
+		}
+
+		return rows[0]
+	}
+
+	if got := put(base); got.JobRunnerAssignedAt != "" || got.JobFinishedAt != "" {
+		t.Fatalf("a completion with no times read back %+v", got)
+	}
+
+	// ANOTHER JOB'S TIMES ARE NOT THIS COMPLETION'S.
+	other := base
+	other.JobID, other.JobRunnerAssignedAt, other.JobFinishedAt = "job-92", assigned, finished
+
+	if got := put(other); got.JobID != "job-91" || got.JobRunnerAssignedAt != "" || got.JobFinishedAt != "" {
+		t.Fatalf("a redelivery about another job wrote %+v", got)
+	}
+
+	// THE SAME JOB'S ARE.
+	same := base
+	same.JobRunnerAssignedAt, same.JobFinishedAt = assigned, finished
+
+	if got := put(same); got.JobRunnerAssignedAt != assigned || got.JobFinishedAt != finished {
+		t.Fatalf("the job's own redelivery left %+v", got)
+	}
+
+	// AND ONCE HELD THEY STAY.
+	later := base
+	later.JobRunnerAssignedAt, later.JobFinishedAt = "2026-11-05T00:00:00Z", "2026-11-05T00:01:00Z"
+
+	if got := put(later); got.JobRunnerAssignedAt != assigned || got.JobFinishedAt != finished {
+		t.Fatalf("a redelivery replaced what the row held: %+v", got)
+	}
+
+	if got := put(base); got.JobRunnerAssignedAt != assigned || got.JobFinishedAt != finished {
+		t.Fatalf("a redelivery carrying less erased what the row held: %+v", got)
+	}
+}
