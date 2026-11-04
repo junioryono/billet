@@ -378,7 +378,7 @@ func (s *CacheService) SettleCompleted(
 	if session == nil {
 		return nil
 	}
-	// EVERY WAY OUT THAT RECORDS NOTHING SAYS SO. A completed job's writes are
+	// A DECISION TO RECORD NOTHING SAYS SO. A completed job's writes are
 	// discarded with the session, so without these a publication that never
 	// happened leaves no line at all: a default-branch job on an EC2 tier published
 	// nothing on 2026-10-25, and its node's log could not say which of these held.

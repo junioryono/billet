@@ -35,6 +35,12 @@ const (
 	filesystemProbeLimit = 8 << 10
 	maxCacheCloneDepth   = 8
 	cacheCompactionLimit = 10 * time.Minute
+	// partialCompactionLimit bounds removing what a compaction cut short left. A
+	// flatten killed at its bound leaves its client's watcher and lock on the image
+	// for about half a minute, during which `rbd rm` waits: one took 28.6 s, and one
+	// killed at the ordinary 15 s left a watcher of its own for the next to wait on
+	// (Ceph 20.2.0, 2026-11-04).
+	partialCompactionLimit = 2 * time.Minute
 )
 
 var _ storecontract.Store = (*Client)(nil)
@@ -635,7 +641,7 @@ func (c *Client) snapshotAt(
 
 	handle := c.cfg.CachePool + "/" + candidateName
 	if depth >= maxCacheCloneDepth {
-		if err := c.copyCacheCandidate(ctx, stage, handle, generation); err != nil {
+		if err := c.compactCacheCandidate(ctx, stage, handle, generation); err != nil {
 			return storecontract.Candidate{}, c.cleanupSnapshotFailure(
 				ctx, volume, stage, handle, err,
 			)
@@ -738,7 +744,7 @@ func (c *Client) nextCacheCloneDepth(ctx context.Context, volume storecontract.V
 	return depth, err
 }
 
-func (c *Client) copyCacheCandidate(
+func (c *Client) compactCacheCandidate(
 	ctx context.Context,
 	source, destination, generation string,
 ) error {
@@ -799,8 +805,11 @@ func (c *Client) verifyCandidate(
 //
 // THE CLONE IS ONE LEVEL DEEPER THAN WHAT IT COMPACTS, and that is safe: rbd
 // cloned and flattened chains of 24 levels, the same day. Destination is private
-// until the caller publishes it, so a crash or a bound here leaves a partial image
-// the caller's cleanup removes and alters nothing anyone reads.
+// until the caller publishes it, so a crash here alters nothing anyone reads. A
+// flatten that fails, its bound included, has its partial image removed here, on a
+// context and a bound of its own, because the caller's cleanup runs at the ordinary
+// bound and the dead flatten's watcher outlasts that (partialCompactionLimit). Left
+// behind, the partial image would keep its parents in the trash for days.
 func (c *Client) compactCacheImage(ctx context.Context, source, destination string) error {
 	compactCtx, cancelCompact := context.WithTimeout(ctx, cacheCompactionLimit)
 	defer cancelCompact()
@@ -812,7 +821,23 @@ func (c *Client) compactCacheImage(ctx context.Context, source, destination stri
 	}
 	if _, err := c.run(compactCtx, c.bin, append(c.identity(),
 		keepKernelClient("flatten", destination)...)); err != nil {
-		return fmt.Errorf("ceph: compact cache lineage: %w", err)
+		return errors.Join(fmt.Errorf("ceph: compact cache lineage: %w", err),
+			c.removePartialCompaction(ctx, destination))
+	}
+
+	return nil
+}
+
+// removePartialCompaction removes a clone whose flatten did not finish. It runs
+// once, for its whole bound, since a removal killed early leaves a watcher of its
+// own for the next to wait on.
+func (c *Client) removePartialCompaction(ctx context.Context, image string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialCompactionLimit)
+	defer cancel()
+
+	if _, err := c.run(cleanupCtx, c.bin, append(c.identity(), keepKernelClient("rm", image)...)); err != nil &&
+		!isNoSuchFile(err) {
+		return fmt.Errorf("ceph: remove the partial compaction %s: %w", image, err)
 	}
 
 	return nil
@@ -999,7 +1024,7 @@ func (c *Client) Clone(
 	var active cacheActive
 	var leaseID string
 	cloneDepth := 0
-	copySource := false
+	compactSource := false
 
 	err := c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
 		now = lockedAt
@@ -1025,14 +1050,14 @@ func (c *Client) Clone(
 		if !found {
 			// A generation from before lineage tracking may already be at the
 			// depth limit. Compact it rather than make another child to keep.
-			copySource = true
+			compactSource = true
 		} else {
 			parsed, parseErr := strconv.Atoi(value)
 			if parseErr != nil || parsed < 0 || parsed > maxCacheCloneDepth {
 				return fmt.Errorf("ceph: cache %q generation %q has invalid lineage depth %q",
 					key, pointer.Generation, bounded(value))
 			}
-			copySource = parsed >= maxCacheCloneDepth
+			compactSource = parsed >= maxCacheCloneDepth
 			cloneDepth = parsed + 1
 		}
 
@@ -1076,7 +1101,7 @@ func (c *Client) Clone(
 
 	handle := c.cfg.CachePool + "/" + cloneName
 	source := pointer.Handle + "@" + pointer.Generation
-	if copySource {
+	if compactSource {
 		err = c.compactCacheImage(ctx, source, handle)
 		cloneDepth = 0
 	} else {
@@ -1308,7 +1333,7 @@ const PurgeTimeout = 30 * time.Minute
 // halfRemovedAfter is how long ago an image must have been named, and
 // halfRemovedRecheck how long it must have stayed unopenable, before it is taken
 // for a removal cut short. Creating an image lists its name before it writes its
-// header, and the longest command that creates one is a lineage copy under
+// header, and the longest work that creates one is a lineage's compaction under
 // cacheCompactionLimit, so the recheck outlasts that with a margin.
 const (
 	halfRemovedAfter   = time.Hour

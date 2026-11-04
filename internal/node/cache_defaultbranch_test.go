@@ -334,7 +334,7 @@ func TestASettlementForAClosingSessionDoesNotWait(t *testing.T) {
 	}
 }
 
-// EVERY WAY A COMPLETED JOB PUBLISHES NOTHING SAYS SO. Its writes go with the
+// A COMPLETION THAT DECIDES TO RECORD NOTHING SAYS SO. Its writes go with the
 // session, so a silent one left a default-branch job's missing publication with
 // no explanation in its node's log (2026-10-25). The log is the mechanism here:
 // the line an operator reads is what is asserted.

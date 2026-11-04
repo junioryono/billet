@@ -356,8 +356,9 @@ func TestAVolumeCreatedForACallerThatGaveUpIsRemoved(t *testing.T) {
 			}))
 			defer server.Close()
 
+			creds := &budgetCredentials{}
 			api := newEBSAPI(config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a"},
-				"deployment/site", staticCredentials{}, server.Client(), server.URL, time.Now,
+				"deployment/site", creds, server.Client(), server.URL, time.Now,
 				func(waitCtx context.Context, _ time.Duration) error {
 					cancel()
 
@@ -377,11 +378,42 @@ func TestAVolumeCreatedForACallerThatGaveUpIsRemoved(t *testing.T) {
 			if deleteCtxErr == nil {
 				t.Fatal("the caller had not given up when the volume was removed, so this proves nothing")
 			}
+			if budget := creds.lastBudget(); budget <= 0 || budget > unansweredVolumeLimit {
+				t.Fatalf("the removal's last request had %s left, want at most %s of its own", budget, unansweredVolumeLimit)
+			}
 			if said := strings.Contains(err.Error(), "left for eviction"); said != tc.deleteRefused {
 				t.Fatalf("error says left for eviction = %v, want %v: %v", said, tc.deleteRefused, err)
 			}
 		})
 	}
+}
+
+// budgetCredentials records what each request's context had left, which is the one
+// place a test sees the context a request was made on.
+type budgetCredentials struct {
+	staticCredentials
+
+	mu     sync.Mutex
+	budget time.Duration
+}
+
+func (b *budgetCredentials) Credentials(ctx context.Context) (awssig.Credentials, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.budget = 0
+	if deadline, ok := ctx.Deadline(); ok {
+		b.budget = time.Until(deadline)
+	}
+
+	return b.staticCredentials.Credentials(ctx)
+}
+
+func (b *budgetCredentials) lastBudget() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.budget
 }
 
 func TestEBSVolumesAndSnapshotsCarryOwnershipAndEncryption(t *testing.T) {

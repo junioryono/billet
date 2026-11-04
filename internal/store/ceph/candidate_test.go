@@ -131,6 +131,21 @@ func TestACandidateIsVerifiedThroughAReadOnlyMapOfItsFrozenSnapshot(t *testing.T
 			if parent := f.parents[candidate.Handle]; compacted && parent != "" {
 				t.Fatalf("a compacted candidate still has parent %q", parent)
 			}
+			// FROZEN AFTER THE FLATTEN: a snapshot taken before it would still read
+			// through the chain the compaction exists to end.
+			flattenedAt, frozenAt := -1, -1
+			for i, call := range f.calls {
+				if slices.Contains(call, "flatten") && slices.Contains(call, candidate.Handle) {
+					flattenedAt = i
+				}
+				if slices.Contains(call, "snap") && slices.Contains(call, candidate.Handle+"@"+candidate.Generation) &&
+					slices.Contains(call, "create") {
+					frozenAt = i
+				}
+			}
+			if compacted && (flattenedAt < 0 || frozenAt < flattenedAt) {
+				t.Fatalf("flattened at call %d and frozen at %d, want the flatten first", flattenedAt, frozenAt)
+			}
 
 			published := candidate.Handle + "@" + candidate.Generation
 			at := slices.Index(v.specs, published)
