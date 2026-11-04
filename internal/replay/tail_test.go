@@ -282,20 +282,33 @@ func TestEmptyWhileQueuedCountsOnlyHostsTheWaitingJobFits(t *testing.T) {
 		t.Errorf("%.3f host-hours empty while a job waited; want the hour on the host it fits", got)
 	}
 
-	// A JOB PINNED ELSEWHERE IS NOT ROOM THIS HOST DENIED, and a job still queued that
-	// the ledger never recorded is one.
-	pinned := &Report{
-		Fleet: Fleet{
-			Hosts: []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}, {Name: "spare", VCPU: 8, Memory: 32 * config.GiB}},
-			Tiers: []TierShape{
-				{Label: "pinned", VCPU: 4, Memory: 8 * config.GiB, Node: "only"},
-				{Label: "free", VCPU: 4, Memory: 8 * config.GiB},
+	// A JOB PINNED ELSEWHERE IS NOT ROOM THIS HOST DENIED, though the host is empty for
+	// the whole of its wait. Of a tier free to run there, it would be. And a job still
+	// queued that the ledger never recorded counts too.
+	waited := func(tier string) *Report {
+		return &Report{
+			Fleet: Fleet{
+				Hosts: []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}, {Name: "spare", VCPU: 8, Memory: 32 * config.GiB}},
+				Tiers: []TierShape{
+					{Label: "pinned", VCPU: 8, Memory: 32 * config.GiB, Node: "only"},
+					{Label: "free", VCPU: 8, Memory: 32 * config.GiB},
+				},
+				MaxVCPU: 16, MaxMemory: 64 * config.GiB,
 			},
-			MaxVCPU: 16, MaxMemory: 64 * config.GiB,
-		},
-		Records: []Record{{Tier: "pinned", Node: "only", VCPU: 4, Memory: 8 * config.GiB, Arrival: hour(0),
-			ChargedFrom: hour(1), StartedAt: hour(1), FinishedAt: hour(2)}},
+			Records: []Record{
+				{Tier: "pinned", Node: "only", VCPU: 8, Memory: 32 * config.GiB, Arrival: hour(0),
+					ChargedFrom: hour(0), StartedAt: hour(0), FinishedAt: hour(2)},
+				{Tier: tier, Node: "only", VCPU: 8, Memory: 32 * config.GiB, Arrival: hour(0),
+					ChargedFrom: hour(2), StartedAt: hour(2), FinishedAt: hour(3)},
+			},
+		}
 	}
+
+	if got := waited("free").EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours empty while a job free to run there waited; want its two hours", got)
+	}
+
+	pinned := waited("pinned")
 
 	if got := pinned.EmptyWhileQueuedHours(); got != 0 {
 		t.Errorf("%.3f host-hours empty while a job pinned elsewhere waited; want none", got)
@@ -303,8 +316,8 @@ func TestEmptyWhileQueuedCountsOnlyHostsTheWaitingJobFits(t *testing.T) {
 
 	pinned.queued = map[int64]Arrival{7: {Seq: 7, At: hour(1), Tier: "free"}}
 
-	if got := pinned.EmptyWhileQueuedHours(); math.Abs(got-1) > 1e-9 {
-		t.Errorf("%.3f host-hours empty while an unrecorded job waited; want the hour of the spare host", got)
+	if got := pinned.EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours empty while an unrecorded job waited; want hours 1 to 3 of the spare host", got)
 	}
 }
 

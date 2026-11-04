@@ -160,24 +160,6 @@ func TestAStalledWaiterLosesItsHold(t *testing.T) {
 	}
 }
 
-// A RESTART REBUILDS THE HOLD: nothing is kept but the waiting order, and a new queue
-// over the same reads picks the same host at the first refusal.
-func TestARestartRebuildsTheHold(t *testing.T) {
-	t.Parallel()
-
-	first := newAdmissionQueue(config.AdmissionHold)
-	again := newAdmissionQueue(config.AdmissionHold)
-
-	for _, q := range []*admissionQueue{first, again} {
-		q.waits("wide", on("a", "b"))
-		q.mayHold("wide", candidatesOn("b", "a"))
-	}
-
-	if got, want := holdsOf(again), holdsOf(first); got["b"] != "wide" || got["b"] != want["b"] {
-		t.Errorf("after a restart the holds are %v; before it %v", got, want)
-	}
-}
-
 // THE OWNER OF A HOLD MAY USE IT AND NOBODY ELSE MAY; every other host stays open, and
 // waiters that merely share a host no longer hold each other back.
 func TestAHeldHostIsAvoidedByEveryoneButItsOwner(t *testing.T) {
@@ -193,8 +175,8 @@ func TestAHeldHostIsAvoidedByEveryoneButItsOwner(t *testing.T) {
 		t.Errorf("a waiter avoids %v; want the held host", got)
 	}
 
-	if got := q.avoiding("nobody"); !slices.Equal(got, []string{"a"}) {
-		t.Errorf("a buyer with no wait avoids %v; want the held host", got)
+	if got := q.avoiding("nobody"); !slices.Contains(got, "a") {
+		t.Errorf("a buyer with no wait avoids %v; want the held host among them", got)
 	}
 
 	if !q.mayBuy("waiter", on("a", "b", "c")) {
@@ -215,9 +197,9 @@ func TestAHeldHostIsAvoidedByEveryoneButItsOwner(t *testing.T) {
 	}
 }
 
-// ONLY A WAITER WITH A HOST LEAVES THE LINE: one with none holds it as under fair,
-// whatever its reason for having none, because nothing else keeps smaller work off the
-// room it waits for. And a host does not help a waiter of the ceiling or a shared pot.
+// ONLY A WAITER WITH A HOST LEAVES THE LINE: one with none holds it as under fair on the
+// hosts it can use, whatever its reason for having none, because nothing else keeps
+// smaller work off the room it waits for.
 func TestOnlyAWaiterWithAHostLeavesTheLine(t *testing.T) {
 	t.Parallel()
 
@@ -238,29 +220,6 @@ func TestOnlyAWaiterWithAHostLeavesTheLine(t *testing.T) {
 		t.Error("a waiter with a host still held the line")
 	}
 
-	// THE CEILING AND THE POT, WITH A HOST OR WITHOUT.
-	ceiling := on("a")
-	ceiling.CeilingBound = true
-
-	q = newAdmissionQueue(config.AdmissionHold)
-	waitingInOrder(q, waiterAt{"waiter", ceiling})
-	q.mayHold("waiter", candidatesOn("a"))
-
-	if q.mayBuy("buyer", on("a")) {
-		t.Error("a buyer passed a ceiling-bound waiter with a host")
-	}
-
-	shared := on("a")
-	shared.Target, shared.TargetShared = "repo", true
-
-	q = newAdmissionQueue(config.AdmissionHold)
-	waitingInOrder(q, waiterAt{"waiter", shared})
-	q.mayHold("waiter", candidatesOn("a"))
-
-	if q.mayBuy("sibling", shared) {
-		t.Error("a sibling passed a waiter of its target's shared pot with a host")
-	}
-
 	// UNDER WEIGHTS THE LINE IS RANKED, OF ITS OWN TARGET AS OF ANOTHER.
 	ranks := map[string]float64{"behind": 0.1, "level": 0.5}
 
@@ -269,6 +228,133 @@ func TestOnlyAWaiterWithAHostLeavesTheLine(t *testing.T) {
 
 	if q.mayBuy("buyer", ranked("level", ranks)) || q.mayBuy("sibling", ranked("behind", ranks)) {
 		t.Error("under weights a buyer passed a waiter with no host, ranked ahead of it")
+	}
+}
+
+// A WAITER WITH NO HOST HOLDS THE LINE ONLY ON THE HOSTS IT CAN USE: a buyer that has
+// another goes there, kept off the waiter's. The ceiling and a shared pot are on no host,
+// and hold back everyone they compete with.
+func TestAWaiterWithNoHostHoldsOnlyItsOwnHosts(t *testing.T) {
+	t.Parallel()
+
+	q := newAdmissionQueue(config.AdmissionHold)
+	waitingInOrder(q, waiterAt{"waiter", on("big")})
+
+	if !q.mayBuy("buyer", on("big", "small")) {
+		t.Error("a buyer with another host was held back by a waiter that cannot use it")
+	}
+
+	if got := q.avoiding("buyer"); !slices.Equal(got, []string{"big"}) {
+		t.Errorf("the buyer avoids %v; want the waiter's host", got)
+	}
+
+	if q.mayBuy("inside", on("big")) {
+		t.Error("a buyer with only the waiter's host passed it")
+	}
+
+	// A PURCHASE LEAVING IT ROOM IS NOT KEPT OFF ITS HOSTS, or none is ever made.
+	if got := q.avoidedBy("inside", []string{"waiter"}); len(got["inside"]) != 0 || len(got["waiter"]) != 0 {
+		t.Errorf("a purchase leaving the waiter room avoids %v", got)
+	}
+
+	ceiling := on("big")
+	ceiling.CeilingBound = true
+
+	q = newAdmissionQueue(config.AdmissionHold)
+	waitingInOrder(q, waiterAt{"waiter", ceiling})
+
+	if q.mayBuy("buyer", on("big", "small")) {
+		t.Error("a buyer passed a ceiling-bound waiter")
+	}
+
+	shared := on("big")
+	shared.Target, shared.TargetShared = "repo", true
+
+	sibling := on("big", "small")
+	sibling.Target, sibling.TargetShared = "repo", true
+
+	q = newAdmissionQueue(config.AdmissionHold)
+	waitingInOrder(q, waiterAt{"waiter", shared})
+
+	if q.mayBuy("sibling", sibling) {
+		t.Error("a sibling passed a waiter of its target's shared pot")
+	}
+}
+
+// NO HOST A WAITER WITH NONE CAN USE IS GIVEN TO ONE BEHIND IT, who could not buy there.
+func TestAHoldIsGivenOffTheHostsOfAWaiterAheadWithNone(t *testing.T) {
+	t.Parallel()
+
+	q := holdQueue(wantsHosts{"first", nil}, wantsHosts{"second", []string{"a"}})
+
+	q.mu.Lock()
+	first := q.waiting["first"]
+	first.where = on("a")
+	q.waiting["first"] = first
+	second := q.waiting["second"]
+	second.candidates = candidatesOn("a", "b")
+	q.waiting["second"] = second
+	q.mu.Unlock()
+
+	if got := holdsOf(q); got["b"] != "second" || got["a"] != "" {
+		t.Errorf("the holds are %v; want the second on b, the host the first cannot use", got)
+	}
+}
+
+// A HOLD BINDS ONLY WHO STANDS BEHIND ITS OWNER.
+func TestAHoldBindsOnlyWhoStandsBehindItsOwner(t *testing.T) {
+	t.Parallel()
+
+	q := holdQueue(wantsHosts{"first", []string{"a"}}, wantsHosts{"second", []string{"b"}})
+
+	if got := q.avoiding("first"); len(got) != 0 {
+		t.Errorf("the first avoids %v", got)
+	}
+
+	if got := q.avoiding("second"); !slices.Equal(got, []string{"a"}) {
+		t.Errorf("the second avoids %v; want the first's", got)
+	}
+}
+
+// A POOL PASS GIVES UP THE HOST AT ITS FIRST LEASE AND KEEPS OFF EVERY OTHER HOLD: it keeps
+// its place until the pass ends, or batches shrink to one, and without this that place
+// sweeps a younger waiter's host.
+func TestAPoolPassKeepsOffEveryOtherHold(t *testing.T) {
+	t.Parallel()
+
+	q := holdQueue(wantsHosts{"first", []string{"a"}}, wantsHosts{"second", []string{"b"}})
+
+	if got := q.avoiding("first"); len(got) != 0 {
+		t.Fatalf("before it bought the first avoids %v", got)
+	}
+
+	q.boughtOne("first")
+
+	if got := q.avoiding("first"); !slices.Equal(got, []string{"b"}) {
+		t.Errorf("mid-pass the first avoids %v; want the second's", got)
+	}
+
+	if got := holdsOf(q); got["a"] != "" || got["b"] != "second" {
+		t.Errorf("mid-pass the holds are %v; want its own given up, the second's kept", got)
+	}
+
+	q.bought("first")
+
+	if q.waiting["first"].spent {
+		t.Error("the end of the pass left it marked")
+	}
+}
+
+// A WAITER IN A LAUNCH'S BACKOFF HOLDS NOTHING, as it holds no line.
+func TestAWaiterBackingOffALaunchHoldsNoHost(t *testing.T) {
+	t.Parallel()
+
+	q := holdQueue(wantsHosts{"failing", []string{"a"}}, wantsHosts{"healthy", []string{"a"}})
+	q.lastRanks = map[string]float64{}
+	q.launchResult("failing", true)
+
+	if got := holdsOf(q); got["a"] != "healthy" {
+		t.Errorf("the host is held for %q; want the waiter whose launches work", got["a"])
 	}
 }
 
@@ -299,8 +385,10 @@ func TestAPurchaseGivesUpTheHold(t *testing.T) {
 }
 
 // A HOLD DOES NOT SIT ON A HOST WHOSE READINESS RECEDED: within the slack it stays, past
-// it the hold moves, or one job outrunning its kind closes a host for hours.
-func TestAHoldMovesWhenItsHostRecedes(t *testing.T) {
+// it the hold moves, or one job outrunning its kind closes a host for hours. ONCE: the
+// room it left is gone, and a second host it loses leaves it in the line as under fair,
+// until it buys, or it can follow a receding host round the fleet.
+func TestAHoldMovesOnceWhenItsHostRecedes(t *testing.T) {
 	t.Parallel()
 
 	at := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
@@ -325,6 +413,24 @@ func TestAHoldMovesWhenItsHostRecedes(t *testing.T) {
 	if got := holdsOf(q); got["b"] != "waiter" {
 		t.Errorf("past the slack the hold stayed: %v", got)
 	}
+
+	q.mayHold("waiter", []alloc.HoldCandidate{ready("c", 0), ready("b", HoldSlack+time.Second)})
+
+	if got := holdsOf(q); len(got) != 0 {
+		t.Errorf("a second host lost left the holds at %v; want it in the line", got)
+	}
+
+	if q.mayBuy("buyer", on("a", "b", "c")) {
+		t.Error("a buyer passed a waiter that has given up its hosts")
+	}
+
+	// BUYING GIVES THE MOVE BACK.
+	q.bought("waiter")
+	q.mayHold("waiter", []alloc.HoldCandidate{ready("c", 0)})
+
+	if got := holdsOf(q); got["c"] != "waiter" {
+		t.Errorf("after it bought the holds are %v; want it held again", got)
+	}
 }
 
 // UNDER WEIGHTS A HOLD GOES TO THE WAITER THE ORDER WOULD SERVE, or a host is emptied for
@@ -332,16 +438,78 @@ func TestAHoldMovesWhenItsHostRecedes(t *testing.T) {
 func TestUnderWeightsAHoldGoesInTheOrdersOrder(t *testing.T) {
 	t.Parallel()
 
-	ranks := map[string]float64{"behind": 0.1, "ahead": 0.5}
+	ranks := map[string]float64{"behind": 0.1, "level": 0.3, "ahead": 0.5}
 
 	q := newAdmissionQueue(config.AdmissionHold)
-	waitingInOrder(q, waiterAt{"older", ranked("ahead", ranks)}, waiterAt{"younger", ranked("behind", ranks)})
+
+	// The first refused keeps the line; those refused behind it are ranked when it goes.
+	q.waits("first", ranked("level", ranks))
+	q.waits("older", ranked("ahead", ranks))
+	q.waits("younger", ranked("behind", ranks))
 	q.mayHold("older", candidatesOn("a"))
 	q.mayHold("younger", candidatesOn("a"))
+	q.served("first")
 	q.mayBuy("younger", ranked("behind", ranks))
 
 	if got := holdsOf(q); got["a"] != "younger" {
 		t.Errorf("the host is held for %q; want the waiter of the target further behind", got["a"])
+	}
+}
+
+// A WAITER WITH A HOST IS STILL AHEAD OF WHO IS BEHIND IT when the line is first judged, or
+// everyone behind one reads themselves as first and keeps the line against the ranks.
+func TestBehindAWaiterWithAHostNobodyIsFirst(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"behind": 0.1, "ahead": 0.5}
+
+	q := newAdmissionQueue(config.AdmissionHold)
+	q.waits("owner", ranked("behind", ranks))
+	q.mayHold("owner", candidatesOn("a"))
+	q.waits("next", ranked("ahead", ranks))
+
+	if q.waiting["next"].head {
+		t.Error("a waiter behind one with a host took the line for its own")
+	}
+}
+
+// A BUYER'S OWN STANDING IS WHAT THIS READ SAYS: its record may hold that it was below its
+// floor, and ahead of a hold that a fresh read puts it behind.
+func TestABuyerStandsWhereItsReadSays(t *testing.T) {
+	t.Parallel()
+
+	ranks := map[string]float64{"behind": 0.1, "ahead": 0.5}
+
+	below := ranked("ahead", ranks)
+	below.BelowFloor = true
+
+	q := newAdmissionQueue(config.AdmissionHold)
+	q.waits("owner", ranked("behind", ranks))
+	q.mayHold("owner", candidatesOn("a"))
+	q.waits("was-below", below)
+	q.bought("was-below")
+
+	if got := q.avoiding("was-below"); len(got) != 0 {
+		t.Fatalf("on what its record says it avoids %v, and this proves nothing", got)
+	}
+
+	q.mayBuy("was-below", ranked("ahead", ranks))
+
+	if got := q.avoiding("was-below"); !slices.Equal(got, []string{"a"}) {
+		t.Errorf("at its floor it avoids %v; want the hold ahead of it", got)
+	}
+}
+
+// PERMISSION AND THE HOLDS ARE ONE PLAN: a waiter that a purchase's holds give a host has
+// left the line for that purchase, not the one after.
+func TestWhetherABuyerMayBuyReadsTheHoldsItBuysAgainst(t *testing.T) {
+	t.Parallel()
+
+	// A waiter with its candidates read and no plan run since.
+	q := holdQueue(wantsHosts{"next", []string{"a"}})
+
+	if !q.mayBuy("buyer", on("a", "b", "c")) {
+		t.Error("the buyer was held back by a waiter this plan gives a host")
 	}
 }
 
@@ -473,16 +641,15 @@ func TestAWideTierIsHeldAHostAndGetsIt(t *testing.T) {
 		t.Fatalf("small reconcile: %v", err)
 	}
 
-	if got := s.order.avoiding("someone-else"); len(got) != 0 {
-		t.Errorf("after the wide tier bought, a newcomer avoids %v", got)
+	if got := s.order.ownHold("a-small") + s.order.ownHold("b-wide"); got != "" {
+		t.Errorf("after the wide tier bought, %q is held", got)
 	}
 }
 
-// A HOLD BINDS ONLY WHO STANDS BEHIND ITS OWNER. An older waiter of a smaller shape has
-// no candidate, every host running a lease as large as it; a wider one behind it holds
-// the host. It must still get its turn there, or each waits on the other: the wider
-// cannot pass it, and if the hold bound it, it could not take the room.
-func TestAWaiterAheadTakesRoomOnAHostHeldBehindIt(t *testing.T) {
+// AN OLDER WAITER OF A SMALLER SHAPE WITH NO CANDIDATE GETS ITS TURN beside a wider one
+// behind it: every host runs a lease as large as it, so it holds none, the wider one is
+// given none of the hosts it can use, and neither waits on the other.
+func TestAWaiterWithNoCandidateTakesItsTurnBeforeAWiderOne(t *testing.T) {
 	t.Parallel()
 
 	busy, older, wider := tierOf("a-busy", 8), tierOf("b-older", 8), tierOf("c-wider", 16)
@@ -512,16 +679,8 @@ func TestAWaiterAheadTakesRoomOnAHostHeldBehindIt(t *testing.T) {
 		t.Fatalf("wider reconcile: %v", err)
 	}
 
-	if got := s.order.ownHold(wider.Label); got != "only" {
-		t.Fatalf("the wider tier holds %q, and this proves nothing", got)
-	}
-
-	if got := s.order.avoiding(older.Label); len(got) != 0 {
-		t.Errorf("the waiter ahead avoids %v", got)
-	}
-
-	if got := s.order.avoiding("newcomer"); !slices.Equal(got, []string{"only"}) {
-		t.Errorf("a newcomer avoids %v; want the held host", got)
+	if got := s.order.ownHold(wider.Label); got != "" {
+		t.Errorf("the wider tier holds %q, a host the waiter ahead can use", got)
 	}
 
 	finishOne(t, a, busy.Label)
@@ -531,7 +690,7 @@ func TestAWaiterAheadTakesRoomOnAHostHeldBehindIt(t *testing.T) {
 	}
 
 	if got := startedTiers(log)[older.Label]; got != 1 {
-		t.Errorf("the waiter ahead started %d with room for it on a host held behind it", got)
+		t.Errorf("the waiter ahead started %d with room for it", got)
 	}
 }
 
@@ -547,20 +706,36 @@ type heldScene struct {
 func newHeldScene(t *testing.T, db *state.DB, tiers ...config.Tier) *heldScene {
 	t.Helper()
 
-	fill := tierOf("a-fill", 4)
-	all := append([]config.Tier{fill}, tiers...)
+	scene := newHeldSceneOn(t, db, []alloc.NodeRegistration{host("host-a", 8), host("host-b", 8)}, tiers...)
+	scene.want(t, "a-fill", 4)
+
+	return scene
+}
+
+// newHeldSceneOn is heldScene on these hosts, with the filler not yet bought.
+func newHeldSceneOn(t *testing.T, db *state.DB, hosts []alloc.NodeRegistration, tiers ...config.Tier) *heldScene {
+	t.Helper()
+
+	all := append([]config.Tier{tierOf("a-fill", 4)}, tiers...)
 
 	for i := range all {
 		all[i].Memory = config.GiB
 	}
 
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, all)
+	limits := alloc.Limits{}
+
+	for i := range hosts {
+		limits.MaxVCPU += hosts[i].VCPU
+		limits.MaxMemory += hosts[i].Memory
+	}
+
+	a, err := alloc.New(db, limits, all)
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
 
-	for _, h := range []alloc.NodeRegistration{host("host-a", 8), host("host-b", 8)} {
-		if _, err := a.RegisterNode(t.Context(), h); err != nil {
+	for i := range hosts {
+		if _, err := a.RegisterNode(t.Context(), hosts[i]); err != nil {
 			t.Fatalf("register: %v", err)
 		}
 	}
@@ -571,8 +746,6 @@ func newHeldScene(t *testing.T, db *state.DB, tiers ...config.Tier) *heldScene {
 	for i := range all {
 		scene.listeners[all[i].Label] = NewListener(a, all[i].Label, &fakeSession{}, scene.s.listenerOpts(nil)...)
 	}
-
-	scene.want(t, fill.Label, 4)
 
 	return scene
 }
@@ -594,8 +767,8 @@ func (h *heldScene) freeFill(t *testing.T, onHost string) {
 		t.Fatalf("PoolRunners: %v", err)
 	}
 
-	for _, runner := range runners {
-		lease, err := h.a.Lease(t.Context(), runner.LeaseID)
+	for i := range runners {
+		lease, err := h.a.Lease(t.Context(), runners[i].LeaseID)
 		if err != nil {
 			t.Fatalf("Lease: %v", err)
 		}
@@ -618,14 +791,13 @@ func (h *heldScene) freeFill(t *testing.T, onHost string) {
 	t.Fatalf("the filler has nothing on %s", onHost)
 }
 
-// ROOM ON THE HOST IT HOLDS KEEPS THE HOLD: the owner is refused behind an older waiter
-// with its host emptied, and the room it accumulated is not handed to the next purchase.
+// ROOM ON THE HOST IT HOLDS KEEPS THE HOLD: a job ending between its refusal and its read
+// must not hand the room it accumulated to the next purchase.
 func TestRoomOnItsOwnHostKeepsAWaitersHold(t *testing.T) {
 	t.Parallel()
 
-	h := newHeldScene(t, openState(t), tierOf("b-older", 4), tierOf("c-wide", 8))
+	h := newHeldScene(t, openState(t), tierOf("c-wide", 8))
 
-	h.want(t, "b-older", 1)
 	h.want(t, "c-wide", 1)
 
 	if got := h.s.order.ownHold("c-wide"); got != "host-a" {
@@ -634,14 +806,93 @@ func TestRoomOnItsOwnHostKeepsAWaitersHold(t *testing.T) {
 
 	h.freeFill(t, "host-a")
 	h.freeFill(t, "host-a")
-	h.want(t, "c-wide", 1)
-
-	if got := startedTiers(h.log)["c-wide"]; got != 0 {
-		t.Fatalf("the wide tier started %d past an older waiter", got)
-	}
+	h.listeners["c-wide"].askForAHold(t.Context(), alloc.TierAdmission{})
 
 	if got := h.s.order.ownHold("c-wide"); got != "host-a" {
 		t.Errorf("with its own host empty the wide tier holds %q", got)
+	}
+}
+
+// ON HOSTS OF UNEQUAL SIZE A WAITER WITH NO HOST KEEPS NOBODY OFF THE HOSTS IT CANNOT USE.
+// The widest shape fits one host, running a lease as large; the next is given the smaller
+// host, and buys there when it empties, rather than wait out a job on the other.
+func TestAWaiterWithNoHostDoesNotStopAHostItCannotUse(t *testing.T) {
+	t.Parallel()
+
+	pinned := tierOf("b-big", 16)
+	pinned.Node = "host-c"
+
+	small := tierOf("e-small", 2)
+	small.Node = "host-a"
+
+	h := newHeldSceneOn(t, openState(t), []alloc.NodeRegistration{host("host-a", 8), host("host-c", 16)},
+		pinned, tierOf("c-widest", 16), tierOf("d-next", 8), small)
+
+	h.want(t, "b-big", 1)
+	h.want(t, "a-fill", 2)
+	h.want(t, "c-widest", 1)
+	h.want(t, "d-next", 1)
+
+	if got := h.s.order.ownHold("c-widest"); got != "" {
+		t.Fatalf("the widest tier holds %q; its one host runs a lease as large", got)
+	}
+
+	if got := h.s.order.ownHold("d-next"); got != "host-a" {
+		t.Fatalf("the next tier holds %q", got)
+	}
+
+	h.freeFill(t, "host-a")
+	h.freeFill(t, "host-a")
+
+	h.want(t, "e-small", 1)
+
+	if got := startedTiers(h.log)["e-small"]; got != 0 {
+		t.Errorf("a tier behind the hold started %d on the host held", got)
+	}
+
+	h.want(t, "d-next", 1)
+
+	if got := startedTiers(h.log)["d-next"]; got != 1 {
+		t.Errorf("the next tier started %d with its held host empty", got)
+	}
+}
+
+// A POOL PASS THROUGH A LISTENER: the oldest tier with a backlog buys its own host and an
+// open one, and leaves the younger waiter's alone.
+func TestAPoolPassLeavesAYoungerWaitersHost(t *testing.T) {
+	t.Parallel()
+
+	h := newHeldSceneOn(t, openState(t),
+		[]alloc.NodeRegistration{host("host-a", 8), host("host-b", 8), host("host-c", 8)},
+		tierOf("b-older", 8), tierOf("c-younger", 8))
+
+	h.listeners["b-older"] = NewListener(h.a, "b-older", &fakeSession{},
+		append(h.s.listenerOpts(nil), WithPoolLaunchBatch(4))...)
+
+	h.want(t, "a-fill", 6)
+	h.want(t, "b-older", 3)
+	h.want(t, "c-younger", 1)
+
+	younger := h.s.order.ownHold("c-younger")
+	if h.s.order.ownHold("b-older") == "" || younger == "" {
+		t.Fatalf("the holds are %v and %v", h.s.order.ownHold("b-older"), younger)
+	}
+
+	for _, onHost := range []string{"host-a", "host-b", "host-c"} {
+		h.freeFill(t, onHost)
+		h.freeFill(t, onHost)
+	}
+
+	h.want(t, "b-older", 3)
+
+	if got := startedTiers(h.log)["b-older"]; got != 2 {
+		t.Errorf("the older tier started %d in one pass; want its own host and the open one", got)
+	}
+
+	h.want(t, "c-younger", 1)
+
+	if got := startedTiers(h.log)["c-younger"]; got != 1 {
+		t.Errorf("the younger tier started %d with the host held for it empty", got)
 	}
 }
 
@@ -748,20 +999,55 @@ func TestAFailedReadHoldsNothing(t *testing.T) {
 }
 
 // A RESTART REBUILDS THE HOLD THROUGH THE LEDGER: a new control plane over the same
-// ledger, with nothing carried over, holds the same host at the first refusal.
+// ledger, with nothing carried over, holds the same host at the first refusal, the one
+// the leases' ends say and not the first by name.
 func TestAControlPlaneOverTheSameLedgerHoldsTheSameHost(t *testing.T) {
 	t.Parallel()
 
-	small, wide := tierOf("a-small", 2), tierOf("b-wide", 8)
-	small.Memory, wide.Memory = config.GiB, config.GiB
-	tiers := []config.Tier{small, wide}
+	onA, onB, wide := tierOf("a-small", 2), tierOf("b-small", 2), tierOf("c-wide", 8)
+	onA.Node, onB.Node = "host-a", "host-b"
+	onA.Memory, onB.Memory, wide.Memory = config.GiB, config.GiB, config.GiB
+	tiers := []config.Tier{onA, onB, wide}
 
-	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return now }))
 	for _, h := range []alloc.NodeRegistration{host("host-a", 8), host("host-b", 8)} {
 		if _, err := a.RegisterNode(t.Context(), h); err != nil {
 			t.Fatalf("register: %v", err)
 		}
 	}
+
+	run := func(label string, job int64) {
+		t.Helper()
+
+		lease, err := a.Reserve(t.Context(), label)
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+
+		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, job); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+
+		for _, phase := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
+			if err := a.Advance(t.Context(), lease.ID, lease.Epoch, phase); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+		}
+	}
+
+	// host-b's job started first, so it ends first.
+	run(onB.Label, 1)
+
+	now = now.Add(9 * time.Minute)
+
+	run(onA.Label, 2)
 
 	held := func() string {
 		t.Helper()
@@ -776,20 +1062,12 @@ func TestAControlPlaneOverTheSameLedgerHoldsTheSameHost(t *testing.T) {
 		return s.order.ownHold(wide.Label)
 	}
 
-	first := New(a, nil, tiers, "hold-test", nil, WithNodeRunner(&launchLog{}), WithAdmissionOrder(config.AdmissionHold))
-	smallL := NewListener(a, small.Label, &fakeSession{}, first.listenerOpts(nil)...)
-
-	if err := smallL.reconcilePool(t.Context(), 5); err != nil {
-		t.Fatalf("small reconcile: %v", err)
+	if got := held(); got != "host-b" {
+		t.Fatalf("the wide tier holds %q; want the host predicted free first", got)
 	}
 
-	before := held()
-	if before == "" {
-		t.Fatal("the wide tier holds nothing, so this proves nothing")
-	}
-
-	if after := held(); after != before {
-		t.Errorf("a new control plane holds %q; the last held %q", after, before)
+	if got := held(); got != "host-b" {
+		t.Errorf("a new control plane holds %q", got)
 	}
 }
 
@@ -823,8 +1101,8 @@ func TestAWaiterWithNoHostGetsItsTurnAgainstABacklog(t *testing.T) {
 		t.Fatalf("quiet reconcile: %v", err)
 	}
 
-	if got := s.order.avoiding("newcomer"); len(got) != 0 {
-		t.Fatalf("a host is held (%v) though each runs a lease as large as the shape", got)
+	if got := s.order.ownHold(quiet.Label); got != "" {
+		t.Fatalf("%q is held though each host runs a lease as large as the shape", got)
 	}
 
 	// One of the busy tier's leases ends, and it hears first.

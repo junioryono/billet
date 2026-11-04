@@ -391,6 +391,18 @@ func TestAPurchaseAvoidsAHeldHostUnlessItsFloorIsUnmet(t *testing.T) {
 		t.Fatalf("a tier below its floor, with room only on the avoided host, bought %v, %v", floor, err)
 	}
 
+	// AS FAR AS ITS FLOOR AND NO FURTHER: the rest of a backlog bought at once does not
+	// spend the room held for another.
+	bulk := tier("bulk", 2, 8*config.GiB)
+	bulk.Provider, bulk.Node, bulk.Reserved = config.ProviderDocker, "b", 1
+
+	bulkFleet := holdFleet(t, &now, bulk)
+
+	got, err := bulkFleet.EscrowFor(t.Context(), "bulk", 3, Purchase{Avoid: map[string][]string{"bulk": {"b"}}})
+	if err != nil || len(got) != 1 {
+		t.Errorf("a tier one short of its floor, asking for three on the held host, bought %v, %v", got, err)
+	}
+
 	// A TIER THE HOLD DOES NOT BIND PLACES THERE, its owner above all.
 	own, err := a.EscrowFor(t.Context(), "small-a", 1, Purchase{Avoid: map[string][]string{"someone-else": {"a"}}})
 	if err != nil || len(own) != 1 {
@@ -560,5 +572,22 @@ func TestAPurchaseOutOfTurnLeavesAWaiterRoomOffTheHeldHosts(t *testing.T) {
 	got, err = a.EscrowFor(t.Context(), "eight-b", 1, purchase)
 	if err != nil || len(got) != 1 {
 		t.Errorf("a purchase was refused with the waiter's own held host free: %v, %v", got, err)
+	}
+}
+
+// A WAITER'S FLOOR IS ROOM IT HAS: the guard reads it as the waiter's own purchase would,
+// or a buyer elsewhere is refused for a waiter that could buy.
+func TestTheGuardSeesAWaitersFloorOnAHeldHost(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	floor := tier("floor", 4, 16*config.GiB)
+	floor.Provider, floor.Node, floor.Reserved = config.ProviderDocker, "a", 1
+
+	a := holdFleet(t, &now, floor)
+
+	got, err := a.EscrowFor(t.Context(), "small-b", 1, Purchase{Protect: []string{"floor"},
+		Avoid: map[string][]string{"floor": {"a"}}})
+	if err != nil || len(got) != 1 {
+		t.Errorf("a buyer elsewhere gave %v, %v, with the waiter's floor on the held host", got, err)
 	}
 }

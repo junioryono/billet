@@ -338,7 +338,8 @@ func (r *Report) waitsThatFit(h Host) []interval {
 		}
 	}
 
-	for seq, a := range r.queued {
+	for seq := range r.queued {
+		a := r.queued[seq]
 		if shape := shapes[a.Tier]; !recorded[seq] && fits(a.Tier, shape.VCPU, shape.Memory) {
 			waits = append(waits, interval{a.At, maxInterval})
 		}
