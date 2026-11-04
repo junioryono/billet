@@ -182,7 +182,9 @@ $ systemctl status billet-server
 
 A node that names one `server_addr` still needs that address to arrive at the promoted host, through a floating IP, a DNS change or a load balancer, and that part is your deployment's to arrange. Nodes reconnect and re-register on their own once it does.
 
-`billet node migrate-endpoint`, `node receipt` and `node repair-unit` move and prove one endpoint, so they refuse a node that names several controllers, and `release inspect` reports its installed endpoint as unknown. The host role's endpoint migration refuses one the same way.
+**Changing a node's list is an endpoint migration.** A process's list is fixed when it starts, so adding or removing a controller restarts the node through `billet node migrate-endpoint`, which the host role runs: it compares the list the running process dials with the configuration's, in any order, so a node on a controller the new list still names is moved when its process does not know the rest. Moving to or from a list works the same way as moving between two addresses ([Upgrades](../operating/upgrades.md)).
+
+**A retirement leaves one controller,** so a node goes into one naming the survivor alone: `billet server retire` refuses a node that names several, and an ordinary converge moves it first.
 
 **It does not decide that a controller is dead — PostgreSQL does.** Promotion happens when the incumbent's *session* ends. Under a crash that is immediate; under a network partition it is whenever your server's keepalive or `idle_session_timeout` policy says so. billet adds no watchdog on purpose: the window between a partition and any observation of it survives every detector, and a watchdog that stops a healthy control plane over a blip is its own outage. If you want a tighter bound, tune the database.
 

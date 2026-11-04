@@ -25,6 +25,12 @@
 # kernel at once, with a reset and then a refused connection, and the
 # database's session ends with the process, so the promotion is immediate.
 #
+# A NODE'S LIST CHANGES THROUGH THE ENDPOINT COMMANDS. A process's list is fixed
+# when it starts, so taking a controller off a node's list and putting it back
+# runs the three commands the host role calls, on a real unit, confirmed by the
+# real controller: the decision, the migration and the receipt, whose schema says
+# how many controllers the node names.
+#
 # THE OLD LEADER IS PROVED TO STOP. When the partition heals its next write is
 # refused by the epoch fence, `stopWhenReplaced` ends the process non-zero, and
 # systemd restarts it as a standby. Destroying nothing on the way out is the
@@ -70,6 +76,72 @@ active_controller() {
     docker exec -e "BILLET_STATE_DSN=${dsn}" "$1" runuser -u billet -- \
         env "BILLET_STATE_DSN=${dsn}" /usr/bin/billet status --config /etc/billet/billet.yaml 2>/dev/null |
         awk '/^claim / { print $2; exit }'
+}
+
+# node_config prints a node's configuration naming the list given.
+node_config() {
+    cat <<EOF
+node:
+  server_addrs: $1
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+  tls:
+    cert: /etc/billet/tls/node.crt
+    key: /etc/billet/tls/node.key
+    ca: /etc/billet/tls/ca.crt
+EOF
+}
+
+# member prints a string member at the top of a command's answer.
+member() {
+    awk -F'"' -v key="$2" '$2 == key && found == "" { found = $4 } END { print found }' <<<"$1"
+}
+
+# move_controllers takes a node to the list given as the host role would: the
+# decision over the rendering, the rendering installed, the migration, the
+# controller's confirmation of the new process's registration, and the receipt
+# bound to both, whose schema is what that many controllers write.
+move_controllers() {
+    local n=$1 list=$2 schema=$3 controller=$4
+    local answer incarnation confirmation
+
+    node_config "${list}" | docker exec -i "${n}" sh -c 'cat >/tmp/rendering.yaml' ||
+        rehearsal_fail "could not stage ${n}'s rendering"
+
+    answer=$(docker exec "${n}" /usr/bin/billet node migrate-endpoint --config /etc/billet/billet.yaml \
+        --desired /tmp/rendering.yaml --dry-run --json) ||
+        rehearsal_fail "the decision for ${n} to ${list} was not an answer: ${answer}"
+    grep -q '"planned": true' <<<"${answer}" ||
+        rehearsal_fail "the decision for ${n} to ${list} planned nothing: ${answer}"
+
+    docker exec "${n}" install -m 0640 -o root -g billet /tmp/rendering.yaml /etc/billet/billet.yaml ||
+        rehearsal_fail "could not install ${n}'s rendering"
+
+    answer=$(docker exec "${n}" /usr/bin/billet node migrate-endpoint --config /etc/billet/billet.yaml \
+        --desired /tmp/rendering.yaml --stop-timeout 120s --wait 120s --json) ||
+        rehearsal_fail "the migration of ${n} to ${list} failed: ${answer}"
+    test "$(member "${answer}" outcome)" = migrated ||
+        rehearsal_fail "the migration of ${n} to ${list} answered: ${answer}"
+
+    incarnation=$(member "${answer}" incarnation)
+    docker exec -i "${n}" sh -c 'umask 077 && cat >/tmp/evidence.json' <<<"${answer}"
+
+    confirmation=$(docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller}" runuser -u billet -- \
+        env "BILLET_STATE_DSN=${dsn}" /usr/bin/billet rollout registration --config /etc/billet/billet.yaml \
+        --node "${n}" --incarnation "${incarnation}" --wait 120s --json) ||
+        rehearsal_fail "${controller} did not confirm ${n} under ${incarnation}: ${confirmation}"
+    docker exec -i "${n}" sh -c 'umask 077 && cat >/tmp/confirmation.json' <<<"${confirmation}"
+
+    answer=$(docker exec "${n}" /usr/bin/billet node receipt --evidence /tmp/evidence.json \
+        --confirmation /tmp/confirmation.json --config /etc/billet/billet.yaml --run rehearsal --json) ||
+        rehearsal_fail "the receipt of ${n}'s move to ${list} failed: ${answer}"
+    test "$(member "${answer}" outcome)" = written ||
+        rehearsal_fail "the receipt of ${n}'s move to ${list} answered: ${answer}"
+    grep -q "^    \"schema\": ${schema},\$" <<<"${answer}" ||
+        rehearsal_fail "the receipt of ${n} naming ${list} is not schema ${schema}: ${answer}"
+
+    docker exec "${n}" rm -f /tmp/evidence.json /tmp/confirmation.json
 }
 
 # partition drops every packet a controller sends or receives on the rehearsal
@@ -344,17 +416,7 @@ EOF
 done
 
 for n in "${nodes[@]}"; do
-    rehearsal_install_config "${n}" <<EOF
-node:
-  server_addrs: [${controller_a}:7717, ${controller_b}:7717]
-  provider: docker
-  state_dir: /var/lib/billet/node
-  lock_dir: /run/billet/locks
-  tls:
-    cert: /etc/billet/tls/node.crt
-    key: /etc/billet/tls/node.key
-    ca: /etc/billet/tls/ca.crt
-EOF
+    node_config "[${controller_a}:7717, ${controller_b}:7717]" | rehearsal_install_config "${n}"
 done
 
 rehearsal_step "one identity and one authority on both controllers"
@@ -470,6 +532,32 @@ test "$(active_controller "${controller_a}")" = "${controller_a}" ||
 # is not a retirement.
 wait_line 120 "${controller_b}" billet-server "${killed_at}" 'standing by for this deployment.s controller' >/dev/null ||
     rehearsal_fail "controller B did not come back as a standby after it was killed"
+
+rehearsal_step "change a node's controllers through the endpoint commands"
+mover=${nodes[0]}
+# OFF THE LIST AND BACK ON: A serves, so the node stays on it both ways, and what
+# the decision sees each time is a process that dials another list than the one
+# wanted, on a controller that list still names.
+move_controllers "${mover}" "[${controller_a}:7717]" 1 "${controller_a}"
+echo "${mover} moved to ${controller_a} alone, its receipt schema 1"
+move_controllers "${mover}" "[${controller_a}:7717, ${controller_b}:7717]" 2 "${controller_a}"
+echo "${mover} moved back to both, its receipt schema 2"
+
+# AN ORDER IS NOT A MOVE, and the node dialling the list is left alone.
+reordered=$(node_config "[${controller_b}:7717, ${controller_a}:7717]")
+answer=$(docker exec -i "${mover}" /usr/bin/billet node migrate-endpoint --config /etc/billet/billet.yaml \
+    --desired - --dry-run --json <<<"${reordered}") ||
+    rehearsal_fail "the decision over a reordered list was not an answer: ${answer}"
+grep -q '"planned": false' <<<"${answer}" ||
+    rehearsal_fail "a reordered list planned a move: ${answer}"
+
+# THE REFRESH FINDS THE RECEIPT CURRENT, the same process on the same controller.
+docker exec "${mover}" sh -c "/usr/bin/billet node receipt --refresh --config /etc/billet/billet.yaml --desired /tmp/rendering.yaml --run rehearsal --json" >"${work}/refresh.json" ||
+    rehearsal_fail "the refresh after the moves failed: $(cat "${work}/refresh.json")"
+test "$(member "$(cat "${work}/refresh.json")" outcome)" = current ||
+    rehearsal_fail "the refresh after the moves answered: $(cat "${work}/refresh.json")"
+docker exec "${mover}" rm -f /tmp/rendering.yaml
+echo "an order is not a move, and the refresh finds the receipt current"
 
 echo
 echo "promotion rehearsal: PASSED"

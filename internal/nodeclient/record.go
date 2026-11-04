@@ -15,19 +15,30 @@ import (
 // evidence, written after every successful registration and never before one,
 // for an inspector that has to say which endpoint this process dials and
 // under which incarnation the control plane knows it. EXACTLY THESE SEVEN
-// FIELDS; the inspector holds a record to this set by name.
+// FIELDS for a node that names one controller; the inspector holds a record to
+// this set by name.
+//
+// A NODE THAT NAMES SEVERAL ALSO SAYS WHICH, as schema 2. Endpoint is only the
+// controller it is on now, and a process's list is fixed when it starts, so
+// being on a controller a new configuration still names does not prove the
+// process knows the rest of that configuration's list. A node with one
+// controller keeps schema 1 byte for byte, which an older inspector reads.
 type registrationRecord struct {
-	Schema       int    `json:"schema"`
-	Node         string `json:"node"`
-	Deployment   string `json:"deployment"`
-	Incarnation  string `json:"incarnation"`
-	InvocationID string `json:"invocation_id"`
-	Endpoint     string `json:"endpoint"`
-	RegisteredAt string `json:"registered_at"`
+	Schema       int      `json:"schema"`
+	Node         string   `json:"node"`
+	Deployment   string   `json:"deployment"`
+	Incarnation  string   `json:"incarnation"`
+	InvocationID string   `json:"invocation_id"`
+	Endpoint     string   `json:"endpoint"`
+	Endpoints    []string `json:"endpoints,omitempty"`
+	RegisteredAt string   `json:"registered_at"`
 }
 
-// registrationRecordSchema is the record's schema number.
-const registrationRecordSchema = 1
+// The record's schema numbers: one controller, and several.
+const (
+	registrationRecordSchema        = 1
+	registrationRecordSeveralSchema = 2
+)
 
 // invocationID is the systemd invocation this process runs under, read
 // through a seam so a fixture can supply one where no manager is present. The
@@ -83,6 +94,14 @@ func publishRegistration(c *Client, opts LoopOptions) error {
 		InvocationID: invocationID(),
 		Endpoint:     c.Endpoint().String(),
 		RegisteredAt: opts.now().UTC().Format(time.RFC3339Nano),
+	}
+
+	if len(c.targets) > 1 {
+		rec.Schema = registrationRecordSeveralSchema
+
+		for _, t := range c.targets {
+			rec.Endpoints = append(rec.Endpoints, t.endpoint.String())
+		}
 	}
 
 	if _, err := installRecord(dir, filepath.Base(path), func(w io.Writer) error {

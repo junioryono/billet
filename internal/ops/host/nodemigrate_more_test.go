@@ -523,6 +523,27 @@ func TestTheMigrationFixturesAreTheCommandsOwn(t *testing.T) {
 
 			return f.migrate(t, f.rendering(endpointB))
 		},
+		"reported-planned-several": func(t *testing.T, f *endpointFixture) endpointOut {
+			t.Helper()
+
+			return f.migrate(t, f.several(endpointA, endpointB), "--dry-run")
+		},
+		"unchanged-several": func(t *testing.T, f *endpointFixture) endpointOut {
+			t.Helper()
+			f.writeConfig(t, f.several(endpointA, endpointB))
+			f.writeRecord(t, f.dialling(canonicalB, nodeInvocation, testIncarnation, canonicalA, canonicalB))
+
+			return f.migrate(t, f.several(endpointA, endpointB))
+		},
+		"migrated-several": func(t *testing.T, f *endpointFixture) endpointOut {
+			t.Helper()
+			f.writeConfig(t, f.several(endpointA, endpointB))
+			f.afterStop(t, "inactive", "dead", "success")
+			f.afterStart(t)
+			f.recordAfterStartDialling(t, canonicalA, canonicalA, canonicalB)
+
+			return f.migrate(t, f.several(endpointA, endpointB))
+		},
 		"unchanged": func(t *testing.T, f *endpointFixture) endpointOut {
 			t.Helper()
 

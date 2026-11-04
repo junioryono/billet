@@ -4,8 +4,9 @@ loader does and compares through the endpoint representation: an explicit
 address equal to the derived default is no change, a changed `server.listen`
 under two omitted `server_addr`s is one, a TLS state that changes the scheme is
 one, a side without a node section (a first start, a removal, no installed
-configuration) is not a change, and a node section that names no endpoint at
-all is refused rather than read as none.
+configuration) is not a change, a node section that names no endpoint at all is
+refused rather than read as none, and a list is the controllers it names, in
+any order, as the Go judgement has it.
 """
 
 import importlib.util
@@ -93,6 +94,16 @@ def main():
          node(addr="127.0.0.1:7717"), node(addrs=["127.0.0.1:7717"]), False),
         ("a list of one other controller is a change",
          node(addr="127.0.0.1:7717"), node(addrs=["127.0.0.1:7719"]), True),
+        ("a second controller added is a change",
+         node(addr="127.0.0.1:7717"), node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), True),
+        ("a controller removed is a change",
+         node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), node(addr="127.0.0.1:7717"), True),
+        ("the same controllers in another order are no change",
+         node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), node(addrs=["127.0.0.1:7719", "127.0.0.1:7717"]), False),
+        ("the same controllers spelled otherwise are no change",
+         node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), node(addrs=["http://127.0.0.1:7717", "127.0.0.1:7719"]), False),
+        ("one controller swapped for another is a change",
+         node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), node(addrs=["127.0.0.1:7717", "127.0.0.1:7720"]), True),
     ]
     for name, a, b, want in cases:
         try:
@@ -105,6 +116,10 @@ def main():
         else:
             print("ok   " + name)
 
+    _, listed, _ = mod.compare(node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), node(addr="127.0.0.1:7717"))
+    if listed != "http://127.0.0.1:7717, http://127.0.0.1:7719":
+        fail("the installed controllers read %r, want both in order, for the refusal to name" % listed)
+
     refused = [
         ("a node with no server_addr and no server section is refused",
          node(with_server=False), node(addr="127.0.0.1:7717")),
@@ -114,10 +129,14 @@ def main():
          node(addr="[fe80::1%eth0]:7717"), node(addr="127.0.0.1:7717")),
         ("a node section that is not a mapping is refused",
          {"server": {}, "node": "nope"}, node(addr="127.0.0.1:7717")),
-        ("a node that names several controllers is refused",
-         node(addr="127.0.0.1:7717"), node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"])),
-        ("an installed node that names several controllers is refused",
-         node(addrs=["127.0.0.1:7717", "127.0.0.1:7719"]), node(addr="127.0.0.1:7717")),
+        ("an empty list is refused",
+         node(addrs=[]), node(addr="127.0.0.1:7717")),
+        ("a list that is not a list is refused",
+         node(addrs="127.0.0.1:7717"), node(addr="127.0.0.1:7717")),
+        ("a controller named twice under two spellings is refused",
+         node(addrs=["127.0.0.1:7717", "http://127.0.0.1:7717"]), node(addr="127.0.0.1:7717")),
+        ("a controller in a list that is not text is refused",
+         node(addrs=[7717]), node(addr="127.0.0.1:7717")),
         ("both server_addr and server_addrs is refused",
          node(addr="127.0.0.1:7717", addrs=["127.0.0.1:7717"]), node(addr="127.0.0.1:7717")),
     ]

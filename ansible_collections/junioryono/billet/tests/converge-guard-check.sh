@@ -3125,6 +3125,36 @@ order=$(commands e2-migrated | grep -v " prepare$\| version$\| settle$" | tr '\n
 grep -q "was migrated from http://127.0.0.1:7717 to http://127.0.0.1:7719" "$work/cases/e2-migrated/out" || fail "e2: the migration report is missing" "$work/cases/e2-migrated/out"
 echo "ok   E2: a planned migration is decided, performed, confirmed on the controller, receipted and refreshed, in order"
 
+# E2-several. A node moved onto both controllers of a pair: the same protocol, the
+# lists the answers carry, the report naming them and the schema 2 receipt read.
+ep_several_answers() { # case
+  printf 'migrate-endpoint:1:%s;migrate-endpoint:2:%s;registration:1:%s;receipt:1:%s;receipt:2:%s' \
+    "$(ep_fixture "$1" node-migrate-endpoint reported-planned-several.json)" "$(ep_fixture "$1" node-migrate-endpoint migrated-several.json)" \
+    "$(ep_fixture "$1" rollout-registration confirmed.json incarnation=$EP_INC)" \
+    "$(ep_fixture "$1" node-receipt written-several.json receipt.run=h1)" "$(ep_fixture "$1" node-receipt current-several.json receipt.run=h1)"
+}
+ep_plant_ordinary e2-several $EP_A $EP_B
+e e2-several "BILLET_GATE_ANSWER=$(ep_several_answers e2-several)"
+ep_case e2-several
+expect_allowed e2-several
+expect_fact e2-several planned True
+expect_fact e2-several from "http://127.0.0.1:7717"
+expect_fact e2-several to "http://127.0.0.1:7717, http://127.0.0.1:7719"
+expect_fact e2-several migrated True
+expect_state e2-several tempfiles 0
+grep -q "was migrated from http://127.0.0.1:7717 to http://127.0.0.1:7717, http://127.0.0.1:7719" "$work/cases/e2-several/out" || fail "e2-several: the migration report does not name the list" "$work/cases/e2-several/out"
+echo "ok   E2-several: a move onto both controllers is decided, performed, confirmed, receipted under schema 2 and refreshed"
+
+# E1-several. Nothing to do for a node that dials both: the unchanged answer's list
+# is read, and the refresh's schema 2 receipt is current.
+ep_plant_ordinary e1-several $EP_A $EP_A
+e e1-several "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e1-several node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e1-several node-migrate-endpoint unchanged-several.json);receipt:1:$(ep_fixture e1-several node-receipt current-several.json receipt.run=h0)"
+ep_case e1-several
+expect_allowed e1-several
+expect_fact e1-several migrated False
+expect_calls e1-several managed "rollout registration" 0
+echo "ok   E1-several: a node that dials both is left alone, and its schema 2 receipt is read as current"
+
 # E2b. The controller's environment file, exactly when its
 # billet_server_environment is non-empty.
 ep_plant_ordinary e2b-env $EP_A $EP_B

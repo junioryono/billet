@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -209,7 +210,7 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 			"(its digest differs)", "converge again", "")
 	}
 
-	installedEP, hasNode, err := nodeEndpointOf(installed.cfg)
+	installedSet, hasNode, err := nodeEndpointsOf(installed.cfg)
 	if err != nil {
 		return nil, endpointRefuse(endpointReasonConfig, "the installed configuration's node endpoint: "+err.Error(), "", "")
 	}
@@ -218,9 +219,14 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 		return nil, endpointRefuse(endpointReasonConfig, "the installed configuration names no node endpoint", "", "")
 	}
 
-	if installedEP.String() != ev.To {
+	movedTo, err := ev.movedTo()
+	if err != nil {
+		return nil, endpointRefuse(endpointReasonEvidence, "the evidence's endpoint is not canonical: "+err.Error(), "", "")
+	}
+
+	if !installedSet.sameControllers(movedTo) {
 		return nil, endpointRefuse(endpointReasonConfig, fmt.Sprintf("the installed configuration names %s and the migration "+
-			"moved the node to %s", installedEP.String(), ev.To), "converge again", "")
+			"moved the node to %s", installedSet.text(), movedTo.text()), "converge again", "")
 	}
 
 	// THE RECORD RE-VERIFIED NOW, under the bracket.
@@ -247,19 +253,29 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 		return nil, endpointRefuse(endpointReasonRecord, fmt.Sprintf("the node runs as invocation %s incarnation %s and the "+
 			"migration proved invocation %s incarnation %s; it was restarted since", br.record.InvocationID,
 			br.record.Incarnation, ev.InvocationID, ev.Incarnation), "the refresh writes the receipt for the running node", "")
-	case br.record.Endpoint != ev.To:
+	case !recordDials(br.record, movedTo):
 		return nil, endpointRefuse(endpointReasonRecord, fmt.Sprintf("the node dials %s and the migration moved it to %s",
-			br.record.Endpoint, ev.To), "", "")
+			dialling(br.record), movedTo.text()), "", "")
 	case br.record.Node != ev.Node || br.record.Deployment != ev.Deployment:
 		return nil, endpointRefuse(endpointReasonRecord, "the record names another node or deployment than the evidence", "", "")
 	}
 
+	// THE CONTROLLER IT IS ON NOW, which may not be the one the migration saw: the
+	// process is the same, and it may have failed over since.
 	rec := endpointReceipt{
-		Schema: receiptSchema, Run: m.run, Node: ev.Node, Deployment: ev.Deployment, InstalledSHA256: installed.sha256,
-		InstalledEndpoint: ev.To, EffectiveEndpoint: ev.To, InvocationID: ev.InvocationID, Incarnation: ev.Incarnation,
-	}
+		Run: m.run, Node: ev.Node, Deployment: ev.Deployment, InstalledSHA256: installed.sha256,
+		EffectiveEndpoint: br.record.Endpoint, InvocationID: ev.InvocationID, Incarnation: ev.Incarnation,
+	}.withInstalled(installedSet)
 
 	return publishReceipt(ctx, insp, installed, br, rec, false)
+}
+
+// recordDials says whether a record's process dials exactly these controllers
+// and is on one of them.
+func recordDials(rec registrationReport, set controllerSet) bool {
+	_, dials, err := recordControllers(rec)
+
+	return err == nil && dials.sameControllers(set)
 }
 
 // refreshReceipt is refresh mode.
@@ -273,7 +289,7 @@ func refreshReceipt(ctx context.Context, env cli.Env, m receiptMode) (any, *endp
 		return nil, endpointRefuse(endpointReasonConfig, "no configuration is installed at "+installed.path, "", "")
 	}
 
-	installedEP, hasNode, err := nodeEndpointOf(installed.cfg)
+	installedSet, hasNode, err := nodeEndpointsOf(installed.cfg)
 	if err != nil {
 		return nil, endpointRefuse(endpointReasonConfig, "the installed configuration's node endpoint: "+err.Error(), "", "")
 	}
@@ -293,7 +309,7 @@ func refreshReceipt(ctx context.Context, env cli.Env, m receiptMode) (any, *endp
 	}
 
 	var (
-		renderedEP      endpoint.Endpoint
+		renderedSet     controllerSet
 		renderedHasNode bool
 		hasRendering    bool
 	)
@@ -304,7 +320,7 @@ func refreshReceipt(ctx context.Context, env cli.Env, m receiptMode) (any, *endp
 			return nil, r
 		}
 
-		renderedEP, renderedHasNode, err = nodeEndpointOf(cfg)
+		renderedSet, renderedHasNode, err = nodeEndpointsOf(cfg)
 		if err != nil {
 			return nil, endpointRefuse(endpointReasonDesired, "the rendering's node endpoint: "+err.Error(), "", "")
 		}
@@ -380,27 +396,26 @@ func refreshReceipt(ctx context.Context, env cli.Env, m receiptMode) (any, *endp
 			m.wait.String()+" ("+br.why+")", "wait for it to register, then converge again", "")
 	}
 
-	effective, err := endpoint.ParseCanonical(br.record.Endpoint)
+	effective, dials, err := recordControllers(br.record)
 	if err != nil {
 		return nil, endpointRefuse(endpointReasonRecord, "the record's endpoint: "+err.Error(), "", "")
 	}
 
-	if !effective.Equal(installedEP) {
+	if !dials.sameControllers(installedSet) {
 		return nil, endpointRefuse(endpointReasonMigration, fmt.Sprintf("the running node dials %s and the installed "+
-			"configuration names %s; a migration is owed", effective.String(), installedEP.String()),
+			"configuration names %s; a migration is owed", dialling(br.record), installedSet.text()),
 			"billet node migrate-endpoint, which the converge runs before the node's restart", "")
 	}
 
-	if hasRendering && !m.dryRun && (!renderedHasNode || !renderedEP.Equal(installedEP)) {
+	if hasRendering && !m.dryRun && (!renderedHasNode || !renderedSet.sameOrder(installedSet)) {
 		return nil, endpointRefuse(endpointReasonDesired, "the rendering was not installed: the installed configuration's "+
 			"node endpoint is not the rendering's", "", "")
 	}
 
 	rec := endpointReceipt{
-		Schema: receiptSchema, Run: m.run, Node: br.record.Node, Deployment: br.record.Deployment,
-		InstalledSHA256: installed.sha256, InstalledEndpoint: installedEP.String(), EffectiveEndpoint: effective.String(),
-		InvocationID: br.record.InvocationID, Incarnation: br.record.Incarnation,
-	}
+		Run: m.run, Node: br.record.Node, Deployment: br.record.Deployment, InstalledSHA256: installed.sha256,
+		EffectiveEndpoint: effective.String(), InvocationID: br.record.InvocationID, Incarnation: br.record.Incarnation,
+	}.withInstalled(installedSet)
 
 	if m.dryRun {
 		if problem := closeInstalledConfig(installed); problem != "" {
@@ -767,7 +782,7 @@ func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 	// struct decode: Go matches a member name case-insensitively, so an
 	// alias such as "Node" beside "node" would be admitted by the decoder
 	// and the last one would win.
-	if problem := exactAnswerMembers(body, evidenceMembers, map[string][]string{"stopped": stoppedMembers}); problem != "" {
+	if problem := exactAnswerMembers(body, evidenceMembersOf(body), map[string][]string{"stopped": stoppedMembers}); problem != "" {
 		return nil, endpointRefuse(endpointReasonEvidence, "the evidence: "+problem, "", "")
 	}
 
@@ -802,6 +817,10 @@ func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 		if _, err := endpoint.ParseCanonical(text); err != nil {
 			return nil, endpointRefuse(endpointReasonEvidence, "the evidence's endpoint is not canonical: "+err.Error(), "", "")
 		}
+	}
+
+	if problem := ev.listsProblem(); problem != "" {
+		return nil, endpointRefuse(endpointReasonEvidence, "the evidence's lists: "+problem, "", "")
 	}
 
 	if _, err := time.Parse(time.RFC3339Nano, ev.RegisteredAt); err != nil {
@@ -884,6 +903,63 @@ func isJSONInteger(raw json.RawMessage) bool {
 }
 
 var jsonIntegerPattern = regexp.MustCompile(`^-?(0|[1-9]\d*)$`)
+
+// evidenceMembersOf is the member set a migration's answer is held to: the lists
+// of a node naming several controllers when it carries one.
+func evidenceMembersOf(body []byte) []string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return evidenceMembers
+	}
+
+	_, from := raw["from_endpoints"]
+	_, to := raw["to_endpoints"]
+
+	if !from && !to {
+		return evidenceMembers
+	}
+
+	return append(slices.Clone(evidenceMembers), "from_endpoints", "to_endpoints")
+}
+
+// movedTo is the controllers the migration moved the node to.
+func (e *migrateEvidence) movedTo() (controllerSet, error) {
+	if len(e.ToEndpoints) == 0 {
+		return parseControllerTexts([]string{e.To})
+	}
+
+	return parseControllerTexts(e.ToEndpoints)
+}
+
+// listsProblem holds an answer's two lists to what the command writes: both or
+// neither, each controller once, each naming the endpoint beside it, and one of
+// them naming several. Empty when they are.
+func (e *migrateEvidence) listsProblem() string {
+	if e.FromEndpoints == nil && e.ToEndpoints == nil {
+		return ""
+	}
+
+	if len(e.FromEndpoints) < 2 && len(e.ToEndpoints) < 2 {
+		return "neither names several controllers"
+	}
+
+	for _, side := range []struct {
+		which, current string
+		texts          []string
+	}{{"from_endpoints", e.From, e.FromEndpoints}, {"to_endpoints", e.To, e.ToEndpoints}} {
+		set, err := parseControllerTexts(side.texts)
+		if err != nil {
+			return side.which + ": " + err.Error()
+		}
+
+		current, err := endpoint.ParseCanonical(side.current)
+		if err != nil || !set.contains(current) {
+			return side.which + " does not name " + side.current
+		}
+	}
+
+	return ""
+}
 
 // The member sets the two answers carry, exactly.
 var (

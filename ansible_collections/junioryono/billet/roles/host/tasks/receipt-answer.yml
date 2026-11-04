@@ -5,7 +5,8 @@
 # would write or null with a reason, `refused` (exit 2) or `unknown` (exit 3).
 # The receipt's ten members are held to their shapes and, where the call knows
 # them, to the node and the run asked for; a member outside the producer's set
-# refuses naming it.
+# refuses naming it. A node naming several controllers writes schema 2, whose
+# installed_endpoints list stands where schema 1 has installed_endpoint.
 #
 # Inputs: billet_receipt_raw (the registered command result),
 # billet_receipt_call ('evidence' or 'refresh'), billet_receipt_dry (whether
@@ -53,7 +54,7 @@
       reported: [schema, outcome, receipt, why]
       refused: [schema, outcome, reason, why]
       unknown: [schema, outcome, reason, why]
-    billet_receipt_fields: [schema, run, node, deployment, installed_sha256, installed_endpoint, effective_endpoint, invocation_id, incarnation, written_at]
+    billet_receipt_fields: "{{ ['schema', 'run', 'node', 'deployment', 'installed_sha256', ('installed_endpoints' if (billet_receipt_r.schema | default(0)) == 2 else 'installed_endpoint'), 'effective_endpoint', 'invocation_id', 'incarnation', 'written_at'] if billet_receipt_r is mapping else [] }}"
     billet_receipt_checks:
       # THE OUTCOMES BY CALL: the refresh writes, finds a receipt current, or
       # in a dry run reports; evidence mode writes or fails, since the
@@ -79,7 +80,7 @@
       - name: receipt
         ok: "{{ billet_receipt_failed or (billet_receipt_r is none and billet_receipt_outcome == 'reported') or ((billet_receipt_r is mapping) and (billet_receipt_r.keys() | list | sort) == (billet_receipt_fields | sort)) }}"
       - name: receipt_schema
-        ok: "{{ not billet_receipt_with_receipt or (billet_receipt_r.schema | default(0) is integer and billet_receipt_r.schema | default(0) == 1) }}"
+        ok: "{{ not billet_receipt_with_receipt or (billet_receipt_r.schema | default(0) is integer and billet_receipt_r.schema | default(0) in [1, 2]) }}"
       # THE RUN: a `written` receipt carries this converge's holder; a `current`
       # one keeps the holder it was written under (the shortcut compares the
       # evidence, never the run), so an unchanged host converges under a new
@@ -96,7 +97,7 @@
       - name: receipt_installed_sha256
         ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.installed_sha256 | default('x')) is string and (billet_receipt_r.installed_sha256 | default('')) is match(billet_receipt_sha)) }}"
       - name: receipt_endpoints
-        ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.installed_endpoint | default('x')) is string and (billet_receipt_r.installed_endpoint | default('')) | length > 0 and (billet_receipt_r.effective_endpoint | default('x')) is string and billet_receipt_r.effective_endpoint | default('') == billet_receipt_r.installed_endpoint | default('')) }}"
+        ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.effective_endpoint | default('x')) is string and (billet_receipt_r.effective_endpoint | default('')) | length > 0 and (((billet_receipt_r.schema | default(0)) == 2 and (billet_receipt_r.installed_endpoints | default('x')) is sequence and (billet_receipt_r.installed_endpoints | default('x')) is not string and (billet_receipt_r.installed_endpoints | default([])) | length > 1 and billet_receipt_r.effective_endpoint | default('') in (billet_receipt_r.installed_endpoints | default([]))) or ((billet_receipt_r.schema | default(0)) == 1 and billet_receipt_r.effective_endpoint | default('') == billet_receipt_r.installed_endpoint | default('')))) }}"
       - name: receipt_invocation_id
         ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.invocation_id | default('x')) is string and (billet_receipt_r.invocation_id | default('')) is match(billet_receipt_hex32)) }}"
       - name: receipt_incarnation
