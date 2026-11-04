@@ -323,7 +323,8 @@ func (q *admissionQueue) heldForOthers(tier string) map[string]string {
 
 	var out map[string]string
 
-	for label, waiter := range q.waiting {
+	for label := range q.waiting {
+		waiter := q.waiting[label]
 		if label == tier || waiter.held == "" {
 			continue
 		}
@@ -485,7 +486,8 @@ func (q *admissionQueue) ranksFor(tier string, where alloc.TierAdmission, now ti
 		return nil
 	}
 
-	for label, waiter := range q.waiting {
+	for label := range q.waiting {
+		waiter := q.waiting[label]
 		if label != tier && (!q.blocks(where, waiter) || !holdsTheLine(waiter, now)) {
 			continue
 		}
@@ -569,7 +571,8 @@ func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, t
 
 	var stalled []string
 
-	for label, waiter := range q.waiting {
+	for label := range q.waiting {
+		waiter := q.waiting[label]
 		if label != tier && !q.blocks(where, waiter) {
 			continue
 		}
@@ -705,7 +708,8 @@ func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string 
 	own := q.placeOf(tier, where, ranks, now)
 
 	var out []string
-	for label, waiter := range q.waiting {
+	for label := range q.waiting {
+		waiter := q.waiting[label]
 		if label == tier || !q.blocks(where, waiter) || q.steppedAside(label, waiter, ranks, now) {
 			continue
 		}

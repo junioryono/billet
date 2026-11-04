@@ -673,7 +673,10 @@ func TestAListenerTellsTheOrderItsLaunchFailedAndWhyItIsHeld(t *testing.T) {
 
 		l.runner = runner
 
-		_ = l.launch(t.Context(), leases[0], dispatch.Job{RequestID: request})
+		// What the launch answers is not the question: a failed one hands its lease back.
+		if err := l.launch(t.Context(), leases[0], dispatch.Job{RequestID: request}); err != nil {
+			t.Logf("launch: %v", err)
+		}
 	}
 
 	launch(&failingRunner{}, 1)
