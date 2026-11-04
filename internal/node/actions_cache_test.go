@@ -30,6 +30,8 @@ type fakeActionsVolumeManager struct {
 	trimErr    error
 	trimCheck  func(string) error
 	unmountErr error
+	// unmountHook runs at every Unmount, before it does anything else.
+	unmountHook func()
 }
 
 type syncCloseRecorder struct {
@@ -97,6 +99,9 @@ func (f *fakeActionsVolumeManager) MountReadOnly(_ context.Context, _, target st
 }
 
 func (f *fakeActionsVolumeManager) Unmount(_ context.Context, target string) error {
+	if f.unmountHook != nil {
+		f.unmountHook()
+	}
 	if f.unmountErr != nil {
 		return f.unmountErr
 	}
