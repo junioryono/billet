@@ -487,8 +487,8 @@ func laterShare(t *testing.T, r *Report) float64 {
 // the fleet holds converge to what their weights say, the same trace with no
 // weight divides evenly, and with one target idle the other takes all the room.
 // Under direct assignment, the protocol on which a tier is ever recorded waiting
-// (#686). BILLET_REPLAY_JOBS sizes it for the record, each run then being kept
-// under -replay.out.
+// (#686). BILLET_REPLAY_JOBS and BILLET_REPLAY_HOSTS size it for the record, the
+// table then being kept under -replay.out.
 func TestContendedRoomIsDividedByWeight(t *testing.T) {
 	jobs := 80
 	if n := os.Getenv("BILLET_REPLAY_JOBS"); n != "" {
@@ -497,8 +497,27 @@ func TestContendedRoomIsDividedByWeight(t *testing.T) {
 		}
 	}
 
+	hosts := 2
+	if n := os.Getenv("BILLET_REPLAY_HOSTS"); n != "" {
+		if _, err := fmt.Sscan(n, &hosts); err != nil || hosts <= 0 {
+			t.Fatalf("BILLET_REPLAY_HOSTS=%q is not a positive count", n)
+		}
+	}
+
+	sized := func(f Fleet) Fleet {
+		f.Hosts = nil
+		for i := range hosts {
+			f.Hosts = append(f.Hosts, Host{Name: fmt.Sprintf("host-%d", i), VCPU: 16, Memory: 64 * config.GiB})
+		}
+
+		f.MaxVCPU, f.MaxMemory = 16*hosts, config.ByteSize(hosts)*64*config.GiB
+
+		return f
+	}
+
 	opts := Options{DirectAssignment: true, Log: discardLogger()}
-	weighted, even := twoTargets(2, 1), twoTargets(0, 0)
+	weighted, even := sized(twoTargets(2, 1)), sized(twoTargets(0, 0))
+	room, slots := float64(weighted.MaxVCPU), weighted.MaxVCPU/2
 	params := ContendedParams{Params: Params{Jobs: jobs}, Fleet: weighted}
 
 	report := Run(t, weighted, ContendedTargets(1, params), opts)
@@ -522,9 +541,8 @@ func TestContendedRoomIsDividedByWeight(t *testing.T) {
 	}
 
 	// THE SECOND TARGET'S WEIGHT CLAIMS NOTHING WHILE IT WAITS FOR NOTHING. Its one
-	// rival holds the fleet: from the first start to the last, all but the
-	// edges of the sixteen slots. Measured between its tenth start and its last, by
-	// when the room had filled and before it drained.
+	// rival holds the fleet, measured from the start that filled the room to its
+	// last, before it drained.
 	idleParams := params
 	idleParams.Idle = []string{"billet-second"}
 
@@ -540,15 +558,15 @@ func TestContendedRoomIsDividedByWeight(t *testing.T) {
 
 	slices.SortFunc(starts, time.Time.Compare)
 
-	if len(starts) <= 16 {
+	if len(starts) <= slots {
 		t.Fatalf("%d jobs cannot fill the room", len(starts))
 	}
 
-	from, to := starts[16], starts[len(starts)-1]
+	from, to := starts[slots], starts[len(starts)-1]
 	held := alone.ChargedByTarget(from, to)[config.DefaultTargetName].VCPUSeconds
 
-	if mean := held / to.Sub(from).Seconds(); mean < 0.95*32 {
-		t.Errorf("with the other target idle, the first held a mean of %.1f of 32 vCPU; want all of it", mean)
+	if mean := held / to.Sub(from).Seconds(); mean < 0.95*room {
+		t.Errorf("with the other target idle, the first held a mean of %.1f of %.0f vCPU; want all of it", mean, room)
 	}
 
 	if *outDir != "" {
@@ -557,9 +575,10 @@ func TestContendedRoomIsDividedByWeight(t *testing.T) {
 		}
 
 		body := "## Weighted 2:1\n\n" + report.TargetTable(8) + "\n## No weight\n\n" + control.TargetTable(8) +
-			fmt.Sprintf("\n## The second target idle\n\nThe first held a mean of %.1f of 32 vCPU.\n",
-				held/to.Sub(from).Seconds())
-		if err := os.WriteFile(filepath.Join(*outDir, "target-weights.md"), []byte(body), 0o644); err != nil {
+			fmt.Sprintf("\n## The second target idle\n\nThe first held a mean of %.1f of %.0f vCPU.\n",
+				held/to.Sub(from).Seconds(), room)
+		name := fmt.Sprintf("target-weights-%dhosts.md", hosts)
+		if err := os.WriteFile(filepath.Join(*outDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
