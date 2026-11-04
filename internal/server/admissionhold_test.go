@@ -19,9 +19,9 @@ func holdsOf(q *admissionQueue) map[string]string {
 
 	out := map[string]string{}
 
-	for label, waiter := range q.waiting {
-		if waiter.held != "" {
-			out[waiter.held] = label
+	for label := range q.waiting {
+		if held := q.waiting[label].held; held != "" {
+			out[held] = label
 		}
 	}
 

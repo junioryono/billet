@@ -417,21 +417,34 @@ func TestTightestPrefersTheHostLeftWithTheLeastRoom(t *testing.T) {
 	small := tier("small", 4, 8*config.GiB)
 	small.Provider = config.ProviderDocker
 
-	filler := tier("filler", 2, 4*config.GiB)
-	filler.Provider, filler.Node = config.ProviderDocker, "z-host"
+	filler := func(label string, vcpu int, node string) config.Tier {
+		out := tier(label, vcpu, config.ByteSize(vcpu)*2*config.GiB)
+		out.Provider, out.Node = config.ProviderDocker, node
 
-	place := func(policy config.PlacementPolicy) string {
+		return out
+	}
+
+	type host struct {
+		name string
+		vcpu int
+	}
+
+	// place puts the fillers on two hosts and asks where one lease of small goes.
+	place := func(policy config.PlacementPolicy, hosts []host, fillers ...config.Tier) string {
 		t.Helper()
 
-		a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB}, []config.Tier{small, filler},
-			WithPlacement(policy))
+		a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB},
+			append([]config.Tier{small}, fillers...), WithPlacement(policy))
 
-		mustRegister(t, a, NodeRegistration{Name: "a-host", Provider: config.ProviderDocker, VCPU: 16, Memory: 32 * config.GiB})
-		mustRegister(t, a, NodeRegistration{Name: "z-host", Provider: config.ProviderDocker, VCPU: 16, Memory: 32 * config.GiB})
+		for _, h := range hosts {
+			mustRegister(t, a, NodeRegistration{Name: h.name, Provider: config.ProviderDocker, VCPU: h.vcpu,
+				Memory: config.ByteSize(h.vcpu) * 2 * config.GiB})
+		}
 
-		// z-host has 14 vCPU left: three more of small, as a-host's 16 fits four.
-		if _, err := a.Reserve(t.Context(), "filler"); err != nil {
-			t.Fatalf("Reserve: %v", err)
+		for i := range fillers {
+			if _, err := a.Reserve(t.Context(), fillers[i].Label); err != nil {
+				t.Fatalf("Reserve(%s): %v", fillers[i].Label, err)
+			}
 		}
 
 		lease, err := a.Reserve(t.Context(), "small")
@@ -442,33 +455,25 @@ func TestTightestPrefersTheHostLeftWithTheLeastRoom(t *testing.T) {
 		return lease.TargetNode
 	}
 
-	if got := place(config.PlacementTightest); got != "z-host" {
-		t.Errorf("tightest placed on %s; want the host with less left", got)
+	// 15 vCPU left on a-host and 13 on z-host: each fits three of small, so pack sees
+	// them as alike and takes the name, and tightest the one left with less.
+	even := []host{{"a-host", 16}, {"z-host", 16}}
+	fill := []config.Tier{filler("on-a", 1, "a-host"), filler("on-z", 3, "z-host")}
+
+	if got := place(config.PlacementPack, even, fill...); got != "a-host" {
+		t.Errorf("pack placed on %s; want the name, which is what this tells tightest from", got)
 	}
 
-	if got := place(config.PlacementSpread); got != "a-host" {
-		t.Errorf("spread placed on %s; want the emptier host", got)
+	if got := place(config.PlacementTightest, even, fill...); got != "z-host" {
+		t.Errorf("tightest placed on %s; want the host left with less", got)
 	}
 
-	// A host's size is what its room is a share of: 8 left of 8 is more than 8 of 64.
-	bigSmall := func() string {
-		t.Helper()
+	// A SHARE OF THE HOST'S OWN SIZE: 8 vCPU left of 64 is tighter than 6 of 8, though
+	// it is more vCPU, and likewise its memory.
+	sized := []host{{"a-large", 64}, {"z-small", 8}}
+	nearly := []config.Tier{filler("on-large", 56, "a-large"), filler("on-small", 2, "z-small")}
 
-		a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB}, []config.Tier{small},
-			WithPlacement(config.PlacementTightest))
-
-		mustRegister(t, a, NodeRegistration{Name: "a-small", Provider: config.ProviderDocker, VCPU: 8, Memory: 16 * config.GiB})
-		mustRegister(t, a, NodeRegistration{Name: "z-large", Provider: config.ProviderDocker, VCPU: 64, Memory: 128 * config.GiB})
-
-		lease, err := a.Reserve(t.Context(), "small")
-		if err != nil {
-			t.Fatalf("Reserve: %v", err)
-		}
-
-		return lease.TargetNode
-	}
-
-	if got := bigSmall(); got != "a-small" {
-		t.Errorf("tightest placed on %s; want the host left with the smaller share, half of itself against 15/16", got)
+	if got := place(config.PlacementTightest, sized, nearly...); got != "a-large" {
+		t.Errorf("tightest placed on %s; want the host left with the smaller share of itself", got)
 	}
 }

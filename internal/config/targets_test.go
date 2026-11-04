@@ -660,3 +660,14 @@ func TestATargetWeightIsRefusedUnderFill(t *testing.T) {
 		t.Errorf("fill with no weight was refused: %v", err)
 	}
 }
+
+// A PLACEMENT IS ONE BILLET IMPLEMENTS, tightest among them.
+func TestTightestIsAPlacementAndATypoIsNot(t *testing.T) {
+	if err := PlacementTightest.Validate(); err != nil {
+		t.Errorf("tightest was refused: %v", err)
+	}
+
+	if err := PlacementPolicy("tighter").Validate(); err == nil || !strings.Contains(err.Error(), `server.placement is "tighter"`) {
+		t.Errorf("a misspelt placement gave %v; want it refused", err)
+	}
+}

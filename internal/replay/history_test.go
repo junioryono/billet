@@ -685,6 +685,92 @@ func TestAWideShapeGetsItsTurnUnderWeights(t *testing.T) {
 	}
 }
 
+// HOLD GIVES THE WIDE SHAPE ITS TURN AND KEEPS THE OTHER HOST OPEN (#527): a whole-host
+// job beside a stream of small jobs on two hosts. Fill starves it. Fair starts it as soon
+// as hold does, by keeping the stream off both hosts while one empties; hold keeps the
+// stream off the one host, so the stream's jobs start on the other meanwhile.
+func TestHoldGivesTheWideShapeItsTurnAndKeepsTheOtherHostOpen(t *testing.T) {
+	fleet := Fleet{
+		Hosts: []Host{
+			{Name: "host-a", VCPU: 16, Memory: 64 * config.GiB},
+			{Name: "host-b", VCPU: 16, Memory: 64 * config.GiB},
+		},
+		Tiers: []TierShape{
+			{Label: "billet-on-a", VCPU: 4, Memory: 16 * config.GiB, Node: "host-a"},
+			{Label: "billet-on-b", VCPU: 4, Memory: 16 * config.GiB, Node: "host-b"},
+			{Label: "billet-16vcpu", VCPU: 16, Memory: 64 * config.GiB},
+		},
+		MaxVCPU: 32, MaxMemory: 128 * config.GiB,
+	}
+
+	job := func(at time.Time, tier string, d time.Duration) Arrival {
+		return Arrival{At: at, Tier: tier, Repository: "web", Duration: Duration(d),
+			WorkflowRef: "acme/web/.github/workflows/ci.yml@refs/heads/main"}
+	}
+
+	var trace Trace
+
+	// On each host a job every two minutes for an hour, each eight minutes long: each
+	// host holds exactly that, and with the jobs staggered neither ever empties by itself.
+	for i := range 30 {
+		at := DefaultStart.Add(time.Duration(i) * 2 * time.Minute)
+		trace.Arrivals = append(trace.Arrivals, job(at, "billet-on-a", 8*time.Minute),
+			job(at.Add(time.Minute), "billet-on-b", 8*time.Minute))
+	}
+
+	wideAt := DefaultStart.Add(8*time.Minute + 30*time.Second)
+	trace.Arrivals = append(trace.Arrivals, job(wideAt, "billet-16vcpu", 10*time.Minute))
+
+	trace.Normalize()
+
+	wideWait := func(r *Report) time.Duration {
+		t.Helper()
+
+		for i := range r.Records {
+			if r.Records[i].Tier == "billet-16vcpu" {
+				return time.Duration(r.Records[i].QueueWait)
+			}
+		}
+
+		t.Fatal("the wide job has no record")
+
+		return 0
+	}
+
+	// How many of the stream's jobs started while the wide job waited.
+	startedMeanwhile := func(r *Report) int {
+		until := wideAt.Add(wideWait(r))
+		n := 0
+
+		for i := range r.Records {
+			if rec := &r.Records[i]; rec.Tier != "billet-16vcpu" && rec.StartedAt.After(wideAt) && rec.StartedAt.Before(until) {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	c := Compare(t, fleet, trace, DefaultPolicies, Options{DirectAssignment: true, Log: discardLogger()})
+
+	fair, fill, hold := c.Reports[0], c.Reports[1], c.Reports[2]
+	t.Logf("wide waits: fair %s, fill %s, hold %s; started meanwhile: fair %d, fill %d, hold %d", wideWait(fair),
+		wideWait(fill), wideWait(hold), startedMeanwhile(fair), startedMeanwhile(fill), startedMeanwhile(hold))
+
+	if got := wideWait(hold); got > 15*time.Minute {
+		t.Errorf("under hold the whole-host job waited %s; want its host emptied within a job or two", got)
+	}
+
+	if got := wideWait(fill); got < 45*time.Minute {
+		t.Errorf("under fill the whole-host job waited %s; the comparison cannot tell the policies apart", got)
+	}
+
+	if got, under := startedMeanwhile(hold), startedMeanwhile(fair); got <= under {
+		t.Errorf("%d small jobs started while the whole-host job waited under hold, and %d under fair; want the other "+
+			"host kept open", got, under)
+	}
+}
+
 // THE POLICY COMPARISON AT A RECORD'S SIZE, run by hand: BILLET_REPLAY_COMPARE=
 // wide replays WideShapeMix at BILLET_REPLAY_JOBS (default 2000) on WideFleet,
 // and =file replays the trace and fleet `billet jobs export` wrote, named by
