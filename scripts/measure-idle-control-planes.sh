@@ -547,6 +547,7 @@ restart_config() {
     local label=$1 how=$2 out n
     out=${MEASURE_ROOT}/results/${label}
     install -d "${out}"
+    [ ! -e "${out}/restart-${how}.tsv" ] || die "${label} already has a ${how} restart; use another label"
 
     # ONE AT A TIME, while the others stay up.
     for n in $(planes | head -n "${MEASURE_RESTART_SINGLES}"); do
