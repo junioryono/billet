@@ -102,7 +102,7 @@ func TestACaseTimeIsADurationOnlyWhenItSaysOne(t *testing.T) {
 	t.Parallel()
 
 	for text, want := range map[string]int64{
-		"0": 0, "0.0004": 0, "0.0005": 1, "1.5": 1500, " 2 ": 2000, "1e3": 1_000_000,
+		"0": 0, "0.0004": 0, "0.0005": 1, "1.5": 1500, "\t2\n": 2000, "1e3": 1_000_000,
 		"": -1, "soon": -1, "-1": -1, "NaN": -1, "Inf": -1, "1,234.5": -1, "1e300": -1,
 	} {
 		got := int64(-1)

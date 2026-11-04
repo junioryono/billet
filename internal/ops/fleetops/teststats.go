@@ -599,7 +599,8 @@ func renderTestStats(w io.Writer, r testStats) {
 	if len(r.Flaky) == 0 {
 		fmt.Fprintln(w, "  none seen")
 	}
-	for _, t := range r.Flaky {
+	for i := range r.Flaky {
+		t := &r.Flaky[i]
 		pass := "passed in lease " + t.PassLease
 		switch t.Evidence {
 		case "suite":
