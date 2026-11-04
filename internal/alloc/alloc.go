@@ -688,6 +688,16 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 			return err
 		}
 
+		// WHO HOLDS A HOST AND FITS THERE KEEPS THAT, unless this tier is below its floor,
+		// whose room is promised.
+		var fitted map[string]bool
+		if place != unheld {
+			fitted, err = a.ownersWithRoom(ctx, tx, avoid[t.Label])
+			if err != nil {
+				return err
+			}
+		}
+
 		take := min(limit, room)
 		leases = make([]*Lease, 0, take)
 
@@ -717,7 +727,16 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 			}
 
 			if place != unheld {
-				return a.ownersKeepRoom(ctx, tx, leases, avoid[t.Label])
+				after, err := a.ownersWithRoom(ctx, tx, avoid[t.Label])
+				if err != nil {
+					return err
+				}
+
+				for host := range fitted {
+					if !after[host] {
+						return errWaiterLeftShort
+					}
+				}
 			}
 		}
 
@@ -756,16 +775,13 @@ func (a *Allocator) placerAvoiding(ctx context.Context, tx querier, t config.Tie
 	return open, want, nil
 }
 
-// ownersKeepRoom returns errWaiterLeftShort if a purchase landing on a held host left its
-// owner without the room it was keeping, read with the leases in the ledger: an owner is no
-// waiter a purchase protects, and a floor it moved can take that room.
-func (a *Allocator) ownersKeepRoom(ctx context.Context, tx querier, leases []*Lease, holds map[string]string) error {
-	for _, lease := range leases {
-		owner, held := holds[lease.TargetNode]
-		if !held {
-			continue
-		}
+// ownersWithRoom is the held hosts whose owner fits there now. An owner is no waiter a
+// purchase protects, and a floor a purchase moves can take its room, wherever that purchase
+// lands: pack and spread each send an unmet floor by what is left on every host.
+func (a *Allocator) ownersWithRoom(ctx context.Context, tx querier, holds map[string]string) (map[string]bool, error) {
+	out := make(map[string]bool, len(holds))
 
+	for host, owner := range holds {
 		shape, known := a.tiers[owner]
 		if !known {
 			continue
@@ -773,15 +789,15 @@ func (a *Allocator) ownersKeepRoom(ctx context.Context, tx querier, leases []*Le
 
 		_, place, err := a.headroomWithPlacer(ctx, tx, shape)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		if place.roomFor(lease.TargetNode, shape) < 1 {
-			return errWaiterLeftShort
+		if place.roomFor(host, shape) > 0 {
+			out[host] = true
 		}
 	}
 
-	return nil
+	return out, nil
 }
 
 // guardedHaveRoom returns short unless every tier in guarded could be granted one

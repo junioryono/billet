@@ -883,7 +883,8 @@ func TestAHeldHostSellsTheRoomAboveWhatItsOwnerNeeds(t *testing.T) {
 
 // A FLOOR MOVED BY A PURCHASE MUST NOT TAKE WHAT A HOLD KEEPS. Pack puts an unmet floor on the
 // fuller host, so a purchase on the held host can bring it there, and read before the insert
-// the owner's room looked safe. It is read again after.
+// the owner's room looked safe. It is read again after, and a host where the owner did not fit
+// before is not one a purchase can have cost it.
 func TestAPurchaseThatMovesAFloorOntoAHeldHostIsRefused(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 
@@ -910,6 +911,19 @@ func TestAPurchaseThatMovesAFloorOntoAHeldHostIsRefused(t *testing.T) {
 	// The owner, whose room it was, still fits.
 	if got, err := a.EscrowFor(t.Context(), "eight-a", 1, Purchase{}); err != nil || len(got) != 1 {
 		t.Errorf("the owner bought %d, %v with the room kept", len(got), err)
+	}
+
+	// WHEREVER THE PURCHASE LANDS: with the floor on b and the owner fitting on a, the last room
+	// on b sends the floor to a.
+	elsewhere := holdFleet(t, &now, floor)
+
+	for _, label := range []string{"small-a", "small-a", "eight-b", "small-b"} {
+		startRunning(t, elsewhere, label)
+	}
+
+	got, err = elsewhere.EscrowFor(t.Context(), "small-b", 1, Purchase{Avoid: map[string]map[string]string{"small-b": {"a": "eight-a"}}})
+	if err != nil || len(got) != 0 {
+		t.Errorf("a purchase elsewhere sending the floor onto the held host bought %d, %v", len(got), err)
 	}
 
 	// A TIER BELOW ITS FLOOR IS PROMISED THE ROOM, and that read does not take it back: pinned
