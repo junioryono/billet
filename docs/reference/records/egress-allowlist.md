@@ -8,7 +8,7 @@ One `m8i.4xlarge` in AWS `us-east-2` (nested virtualization, `/dev/kvm` present)
 
 ## In a real guest
 
-The listed tier's `command` ran these from inside the guest, as root, before starting its runner. A guest's own report is worth little, so each result was reported by asking the node's resolver for a name, which the host records and a guest cannot edit afterwards. The job was GitHub's `billet-testbed/jobs` run 41836310617, on the final binary, and it succeeded.
+The listed tier's `command` ran these from inside the guest, as root, before starting its runner. A guest's own report is worth little, so each result was reported by asking the node's resolver for a name, which the host records and a guest cannot edit afterwards. The job was GitHub's `billet-testbed/jobs` run 41854061158, on the final binary, and it succeeded.
 
 | The guest tried | It got | The host recorded |
 |---|---|---|
@@ -22,19 +22,19 @@ The listed tier's `command` ran these from inside the guest, as root, before sta
 
 ```text
 egress     listed: the tier's network.egress, GitHub's runner endpoints and the node's own services, enforced on the host
-queries    220 asked of the node's resolver, 186 refused and never forwarded
+queries    219 asked of the node's resolver, 186 refused and never forwarded
 denied     3 packets refused, 2 of them DNS to a resolver other than the node's: 1.1.1.1:443/tcp 1, 8.8.8.8:53/tcp 1, 8.8.8.8:53/udp 1
 ipv6       10 packets refused (a listed guest has no IPv6)
 complete   yes
 ```
 
-The open tier's job, run 41836316161, reached ten destinations and was refused nothing, and its 37 queries named them the same way.
+The open tier's job, run 41854068644, reached eleven destinations and was refused nothing, and its 37 queries named them the same way.
 
-**What a stock guest asks for.** Of the 186 refusals, 160 were `ntp.ubuntu.com`, in a guest that lived a little over a minute, then `entropy.ubuntu.com` 10, `api.snapcraft.io` 4 and `registry.npmjs.org` 4. None of them stopped the job, and each is noise a reader of `refused` has to expect.
+**What a stock guest asks for.** Of the 186 refusals, 160 were `ntp.ubuntu.com`, in a guest that lived a little over a minute, then `entropy.ubuntu.com` 8, `api.snapcraft.io` 6 and `registry.npmjs.org` 4. None of them stopped the job, and each is noise a reader of `refused` has to expect.
 
 **What the first run found.** The first run of this job (run 41821627681) refused `glb-c0e95bd587389a.github.com` 7 times, `glb-db52c2cf8be544.github.com` 3 times and `blob.blz25prdstrz09a.trafficmanager.net` once. Those names are the chains of GitHub's own allowed endpoints, each already in the answers the guest had been given, so the guest's stub was asking for where a chain led; the likely reason is an answer that stopped short of the type it wanted, which was not traced further. The job succeeded anyway, but a refusal of something the list allowed misleads whoever reads it. Those names are now followed, and the final run refused none of them.
 
-**A flush while a guest ran.** During a listed job (run 41836773876) the dispatch chain was flushed by hand. The node's next sweep logged an error naming the guest and put the rule back, 13 s later because of when the flush happened to land; the sweep runs every 5 minutes, so that is the bound. The job succeeded, its report read `complete: no`, and afterwards no guest, port element or policy file was left on the host. The guest was open for those 13 s, and what it did then was not probed from inside it.
+**A flush while a guest ran.** During a listed job (run 41854624757) the dispatch chain was flushed by hand. The node's next sweep logged an error naming the guest and put the rule back, 3 s later because of when the flush happened to land; the sweep runs every 5 minutes, so that is the bound. The job succeeded, its report read `complete: no`, and afterwards no guest, port element or policy file was left on the host. The guest was open for those 3 s, and what it did then was not probed from inside it.
 
 ## On the kernel
 
