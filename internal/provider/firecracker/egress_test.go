@@ -324,3 +324,29 @@ func TestAFailedLaunchTakesItsRulesOff(t *testing.T) {
 		t.Fatal("a guest that never ran has a record to report")
 	}
 }
+
+// A LAUNCH THE UNWIND COULD NOT FINISH KEEPS ITS RULES: nothing has proved its guest gone,
+// and the Destroy that does prove it removes them.
+func TestALaunchThatCouldNotUnwindKeepsItsRules(t *testing.T) {
+	t.Parallel()
+
+	k := &egressKernel{}
+	h, _ := egressHarness(t, k)
+	h.jailerErr = errors.New("jailer refused")
+	h.disk.discardErr = errors.New("and the disk could not be discarded")
+
+	spec := aSpec()
+	spec.Egress = aList(t)
+
+	if _, err := h.p.Launch(t.Context(), spec); err == nil {
+		t.Fatal("Launch reported success although the jailer failed")
+	}
+
+	if !k.holds("add chain bridge billet_egress job_" + theInstance) {
+		t.Fatal("this stages nothing: no rules went in")
+	}
+
+	if k.holds("delete chain bridge billet_egress job_" + theInstance) {
+		t.Fatalf("rules came off a guest nothing has proved gone: %q", k.all())
+	}
+}
