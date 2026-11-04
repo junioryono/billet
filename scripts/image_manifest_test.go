@@ -369,10 +369,17 @@ func TestTheManifestRefusesAKernelItsMachineCannotLoad(t *testing.T) {
 		kernel []byte
 		says   string
 	}{
-		"x86_64 and its ELF":      {arch: "x86_64", kernel: x86Kernel()},
-		"aarch64 and its Image":   {arch: "aarch64", kernel: arm64Kernel()},
-		"x86_64 and an Image":     {arch: "x86_64", kernel: arm64Kernel(), says: "not an x86-64 ELF"},
-		"x86_64 and arm64's ELF":  {arch: "x86_64", kernel: append(elfHeader(183), kernelBanner...), says: "not an x86-64 ELF"},
+		"x86_64 and its ELF":     {arch: "x86_64", kernel: x86Kernel()},
+		"aarch64 and its Image":  {arch: "aarch64", kernel: arm64Kernel()},
+		"x86_64 and an Image":    {arch: "x86_64", kernel: arm64Kernel(), says: "not an x86-64 ELF"},
+		"x86_64 and arm64's ELF": {arch: "x86_64", kernel: append(elfHeader(183), kernelBanner...), says: "not an x86-64 ELF"},
+		// x86-64'S MACHINE NUMBER IN WHAT IS NO ELF, which only the magic can tell.
+		"x86_64 and no ELF": {arch: "x86_64", kernel: func() []byte {
+			corrupt := x86Kernel()
+			corrupt[0] = 0
+
+			return corrupt
+		}(), says: "not an x86-64 ELF"},
 		"aarch64 and an ELF":      {arch: "aarch64", kernel: x86Kernel(), says: "no arm64 Image magic"},
 		"a machine with no guest": {arch: "riscv64", kernel: x86Kernel(), says: "x86_64 and aarch64 only"},
 	} {

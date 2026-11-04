@@ -171,6 +171,9 @@ type Provider struct {
 	// snapshot was not taken on.
 	cpuinfoPath string
 	hostKernel  func() (string, error)
+	// goarch is this host's machine, and so its guests'. A seam because the other
+	// machine's boot arguments would otherwise be unreachable from a test.
+	goarch string
 	// digests remembers the digests of the VMM binary and the guest kernels.
 	digests fileDigests
 	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
@@ -360,6 +363,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		tapOwner:    sysTapOwner,
 		cpuinfoPath: "/proc/cpuinfo",
 		hostKernel:  unameKernel,
+		goarch:      runtime.GOARCH,
 		jailWrote:   jailWritten,
 		bootWait:    DefaultBootWait,
 	}
@@ -1020,7 +1024,7 @@ func (p *Provider) configure(
 		}},
 		{"/boot-source", map[string]any{
 			"kernel_image_path": "/" + guestKernel,
-			"boot_args":         bootArgs(runtime.GOARCH),
+			"boot_args":         bootArgs(p.goarch),
 		}},
 		{"/drives/rootfs", map[string]any{
 			"drive_id":       "rootfs",
@@ -1224,13 +1228,12 @@ const mmdsSizeLimit = 51200
 // its first seconds probing hardware that is not there. An arm64 kernel has no i8042
 // driver to tell, so only x86 is given them.
 func bootArgs(goarch string) string {
-	const common = "reboot=k panic=1 pci=off root=/dev/vda rw"
-
 	if goarch == "arm64" {
-		return common
+		return "reboot=k panic=1 pci=off root=/dev/vda rw"
 	}
 
-	return "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " + common
+	return "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " +
+		"root=/dev/vda rw"
 }
 
 // guestInterface is the one network device a guest gets.

@@ -449,12 +449,8 @@ install_cache_sudoers() {
 # list is check-guest-component.sh's, which a test holds to config.ImageComponents,
 # narrowed to what this machine's template installs: GitHub's arm64 template
 # installs Firefox alone of the five (ADR-022), so that is all the arm64 guest
-# leaves out.
-if [ -n "$SCOPE" ]; then
-	COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" offered "$PLAN_FILE" | tr '\n' ' ')
-else
-	COMPONENTS=""
-fi
+# leaves out. Set in main, once need_tools has said whether jq is there to ask with.
+COMPONENTS=""
 
 # install_completer puts the image's completer at /opt/billet/complete: what a
 # deployment that accepts a component runs, chrooted into the image, to install
@@ -884,9 +880,12 @@ recover_runner_images() {
 # ONE LINE PER MACHINE, the file naming its architecture, each sum from the same
 # signature-checked SHA256SUMS.
 install_cloud_base() {
-	local rootfs="$1" release file sum
-	read -r release file sum < <(awk -v a="$BASE_ARCH" '$2 ~ ("-" a "-root\\.tar\\.xz$") {print; exit}' \
+	local rootfs="$1" release="" file="" sum="" line
+	line=$(awk -v a="$BASE_ARCH" '$2 ~ ("-" a "-root\\.tar\\.xz$") {print; exit}' \
 		"$SCRIPT_DIR/runner-images/base.pin")
+	if [ -n "$line" ]; then
+		read -r release file sum <<<"$line"
+	fi
 	if [ -z "$sum" ]; then
 		echo "scripts/runner-images/base.pin names no release, file and sha256 for $BASE_ARCH" >&2
 		exit 1
@@ -1059,6 +1058,8 @@ need_tools() {
 main() {
 	need_root
 	need_tools
+
+	COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" offered "$PLAN_FILE" | tr '\n' ' ')
 
 	# BEFORE ANYTHING IS BUILT, because this file decides what goes in.
 	verify_toolset
@@ -2841,6 +2842,50 @@ unmap_image() {
 	fi
 }
 
+# refuse_another_machine ends the build unless every generation of IMAGE_NAME is known
+# to be this machine's, as an import through `billet images pull` requires (ADR-022):
+# one image holds one machine, so a site's x64 and arm64 nodes cannot share one by
+# naming it, and an older billet, which resolves by contract alone, never meets a
+# generation of another. A generation with no record may be of either, and is refused
+# rather than guessed at: `billet images pull` learns it from the generation itself.
+#
+# ANYTHING IT COULD NOT READ IS REFUSED TOO, because this is what stands between a
+# build on the wrong machine and a fleet's image.
+refuse_another_machine() {
+	local rbd=(rbd --id "$CEPH_USER") snaps meta gen said
+	if ! snaps=$("${rbd[@]}" -p "$IMAGE_POOL" snap ls "$IMAGE_NAME" --format json); then
+		echo "could not list the generations of $IMAGE_POOL/$IMAGE_NAME to hold them to $MACHINE" >&2
+		exit 1
+	fi
+	if ! meta=$("${rbd[@]}" -p "$IMAGE_POOL" image-meta list "$IMAGE_NAME" --format json); then
+		echo "could not read what $IMAGE_POOL/$IMAGE_NAME records of its generations" >&2
+		exit 1
+	fi
+	# rbd ANSWERS NOTHING FOR AN IMAGE WITH NO METADATA.
+	[ -n "$meta" ] || meta='{}'
+	if ! snaps=$(jq -er '[.[].name | select(test("^g[0-9]{14}$"))] | join(" ")' <<<"$snaps"); then
+		echo "could not read the generations of $IMAGE_POOL/$IMAGE_NAME" >&2
+		exit 1
+	fi
+	for gen in $snaps; do
+		if ! said=$(jq -er --arg key "billet.arch.$gen" '.[$key] // ""' <<<"$meta"); then
+			echo "could not read what $IMAGE_POOL/$IMAGE_NAME records of $gen" >&2
+			exit 1
+		fi
+		if [ -z "$said" ]; then
+			echo "$IMAGE_NAME@$gen records no machine, so a generation of $MACHINE cannot join it;" >&2
+			echo "run \`billet images pull\` on a node, which learns it from the generation, or" >&2
+			echo "set IMAGE_NAME to an image of its own" >&2
+			exit 1
+		fi
+		if [ "$said" != "$MACHINE" ]; then
+			echo "$IMAGE_NAME@$gen is $said's and this build is $MACHINE's; one image holds one" >&2
+			echo "machine, so set IMAGE_NAME to an image of its own" >&2
+			exit 1
+		fi
+	done
+}
+
 # publish writes the image into the pool as a NEW generation.
 #
 # A NEW SNAPSHOT EVERY TIME, never a moved one. A generation is what running jobs hold
@@ -2862,6 +2907,8 @@ publish() {
 	if ! "${rbd[@]}" -p "$IMAGE_POOL" info "$IMAGE_NAME" >/dev/null 2>&1; then
 		"${rbd[@]}" -p "$IMAGE_POOL" create "$IMAGE_NAME" --size "${want}M" --object-size 4M
 	else
+		refuse_another_machine
+
 		# GROWN IF IT HAS TO BE, because an image that already exists was sized for
 		# whatever the last generation needed. Writing a larger filesystem into it
 		# fails partway through with `No space left on device` — a corrupt image with
@@ -2908,9 +2955,11 @@ publish() {
 	# record is read as one that left nothing out, which this one did not, and a
 	# deployment that accepts a component refuses to verify one that lacks it. A
 	# crash between the two leaves a record for a generation never made, which
-	# nothing reads.
+	# nothing reads. ITS MACHINE THE SAME WAY, as ceph.SetArch records it: `uname -m`'s
+	# spelling, under the name this build holds the publish lock over.
 	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.components.$gen" \
 		"$(components_record)"
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.arch.$gen" "$MACHINE"
 
 	"${rbd[@]}" -p "$IMAGE_POOL" snap create "$IMAGE_NAME@$gen"
 

@@ -48,12 +48,19 @@ installer() {
 	esac
 }
 
-# offered prints each component whose installer PLAN runs. A plan it cannot read or
-# parse is could-not-tell, status 2: an unread plan is not one that offers nothing, and
-# would publish an image declaring nothing to complete. jq -e answers 0 for true, 1 for
-# false and anything above for a question it could not ask.
+# offered prints each component whose installer PLAN runs. A plan it cannot read, or
+# that is no plan, is could-not-tell, status 2: it is not one that offers nothing, which
+# would publish an image declaring nothing to complete. A plan is a list of steps, each
+# with an id, and an empty list is none. jq -e answers 0 for true, 1 for false and
+# anything above for a question it could not ask.
 offered() {
 	local plan=$1 name script found
+	if ! jq -e 'type == "array" and length > 0 and
+		all(.[]; type == "object" and (.id | type) == "string" and (.id | length) > 0)' \
+		"$plan" >/dev/null; then
+		echo "check-guest-component.sh: could not read $plan as a plan, a list of steps each with an id" >&2
+		return 2
+	fi
 	while IFS= read -r name; do
 		script=$(installer "$name")
 		found=0

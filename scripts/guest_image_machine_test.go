@@ -7,11 +7,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+func readBytes(t *testing.T, path string) []byte {
+	t.Helper()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return body
+}
 
 // unameShim is a directory holding a uname that answers -m with machine, for putting
 // on a script's PATH.
@@ -156,6 +168,18 @@ func TestTheBuildAndTheGateChooseTheSameGuestForEachMachine(t *testing.T) {
 				}
 			}
 
+			// AND TO EACH OTHER: a gate reading another toolset than the build installed
+			// from is the failure, whatever each table's own literals say.
+			shared := []string{"TOOLSET_NAME", "PLAN_NAME", "TOOLCACHE_ARCH"}
+			builds := machineValues(t, build, tc.machine, shared...)
+			gates := machineValues(t, gate, tc.machine, shared...)
+
+			for _, name := range shared {
+				if builds[name] != gates[name] {
+					t.Errorf("on %s the build's %s is %q and the gate's %q", tc.machine, name, builds[name], gates[name])
+				}
+			}
+
 			// EVERY NAME IS A FILE THE TREE HOLDS, so a typo is not an empty read.
 			if tc.machine == "riscv64" {
 				return
@@ -174,13 +198,92 @@ func TestTheBuildAndTheGateChooseTheSameGuestForEachMachine(t *testing.T) {
 }
 
 // A MACHINE BILLET BUILDS NOTHING FOR IS REFUSED BY THE BUILD, not built with an empty
-// plan, and the base pin and the runner pin each name the machine's own file.
-func TestABuildOfNoMachineIsRefusedAndEachPinNamesItsOwn(t *testing.T) {
+// plan, with every tool it asks for there so the refusal can only be the machine's.
+func TestABuildOfNoMachineIsRefused(t *testing.T) {
 	t.Parallel()
 
-	if !strings.Contains(guestImageFunction(t, "need_tools"), `if [ -z "$SCOPE" ]; then`) {
-		t.Error("need_tools does not refuse a machine with no scope")
+	shims := t.TempDir()
+	for _, tool := range []string{
+		"mkfs.ext4", "e2fsck", "chroot", "jq", "flock", "mountpoint", "systemd-nspawn",
+		"machinectl", "systemd-run", "curl", "sha256sum", "xz",
+	} {
+		writeFile(t, filepath.Join(shims, tool), "#!/bin/sh\nexit 0\n", 0o755)
 	}
+
+	for scope, wantRefused := range map[string]bool{"": true, "guest-arm64": false} {
+		script := "#!/usr/bin/env bash\nset -euo pipefail\nPUBLISH=no\nMACHINE=riscv64\nSCOPE=" + scope + "\n" +
+			guestImageFunction(t, "need_tools") + "\nneed_tools\necho PASSED\n"
+		path := filepath.Join(t.TempDir(), "tools.sh")
+
+		if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.CommandContext(t.Context(), "bash", path)
+		cmd.Env = append(os.Environ(), "PATH="+shims+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		out, err := cmd.CombinedOutput()
+		if got := err != nil; got != wantRefused {
+			t.Errorf("with scope %q, refused = %v, want %v:\n%s", scope, got, wantRefused, out)
+		}
+
+		if wantRefused && !strings.Contains(string(out), "this host is riscv64") {
+			t.Errorf("the refusal does not name the machine:\n%s", out)
+		}
+	}
+}
+
+// BILLET IN THE GUEST IS THE MACHINE'S, BUILT WITH THE MACHINE'S GO: a guest of arm64
+// with an amd64 billet boots, and every Go and Bazel cache in it then fails to exec. The
+// toolcache holds the other machine's newer go as a decoy, since a build that took it
+// would fail on the builder or build for the wrong machine.
+func TestTheGuestBilletIsBuiltForTheMachine(t *testing.T) {
+	t.Parallel()
+
+	here, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct{ toolcache, other, goarch string }{
+		{"x64", "arm64", "amd64"},
+		{"arm64", "x64", "arm64"},
+	} {
+		t.Run(tc.goarch, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			record := filepath.Join(t.TempDir(), "go-env")
+			goStub := "#!/bin/sh\nprintf '%s %s %s\\n' \"$0\" \"$GOOS\" \"$GOARCH\" >" + record + "\n" +
+				"while [ $# -gt 0 ]; do [ \"$1\" = -o ] && : >\"$2\"; shift; done\n"
+			writeFile(t, filepath.Join(root, "opt/hostedtoolcache/go/1.26.0", tc.toolcache, "bin/go"), goStub, 0o755)
+			writeFile(t, filepath.Join(root, "opt/hostedtoolcache/go/1.27.0", tc.other, "bin/go"), goStub, 0o755)
+
+			script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nWORK=" + t.TempDir() +
+				"\nTOOLCACHE_DIR=/opt/hostedtoolcache\nTOOLCACHE_ARCH=" + tc.toolcache + "\nGUEST_GOARCH=" + tc.goarch + "\n" +
+				"install_cache_sudoers() { :; }\n" + guestImageFunction(t, "install_guest_billet") +
+				"\ninstall_guest_billet " + root + "\n"
+			path := filepath.Join(t.TempDir(), "billet.sh")
+
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			if out, err := exec.CommandContext(t.Context(), "bash", path).CombinedOutput(); err != nil {
+				t.Fatalf("install_guest_billet: %v\n%s", err, out)
+			}
+
+			got := string(readBytes(t, record))
+			if !strings.Contains(got, "/1.26.0/"+tc.toolcache+"/bin/go linux "+tc.goarch) {
+				t.Errorf("billet was built as %q, want the %s go for linux/%s", got, tc.toolcache, tc.goarch)
+			}
+		})
+	}
+}
+
+// THE RUNNER, THE TOOLSET AND THE BASE ARE EACH THE MACHINE'S OWN LINE OF THEIR PINS.
+func TestEachPinNamesEachMachinesFile(t *testing.T) {
+	t.Parallel()
 
 	pin := readScriptFile(t, "runner-images/base.pin")
 	for _, arch := range []string{"amd64", "arm64"} {
@@ -203,36 +306,52 @@ func TestABuildOfNoMachineIsRefusedAndEachPinNamesItsOwn(t *testing.T) {
 	}
 }
 
-// THE BASE IS THE LINE OF THIS MACHINE'S ARCHITECTURE, run rather than read: an
-// install that took the first line built an x64 userspace on an arm64 builder.
-func TestTheBaseFilesystemIsChosenByTheMachine(t *testing.T) {
+// THE BASE IS THE LINE OF THIS MACHINE'S ARCHITECTURE AND ITS PACKAGES COME FROM WHERE
+// THAT MACHINE'S ARE, run rather than read: an install that took the first line built an
+// x64 userspace on an arm64 builder, and one with x64's source stopped at the first
+// package. Only what would fetch or unpack is stood in for.
+func TestTheBaseFilesystemAndItsSourceAreChosenByTheMachine(t *testing.T) {
 	t.Parallel()
 
-	for arch, wantFile := range map[string]string{
-		"amd64": "ubuntu-24.04-server-cloudimg-amd64-root.tar.xz",
-		"arm64": "ubuntu-24.04-server-cloudimg-arm64-root.tar.xz",
+	here, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	build := machineTable(t, "build-guest-image.sh", "MACHINE=$(uname -m)\ncase")
+
+	for machine, want := range map[string]struct{ file, uris string }{
+		"x86_64": {
+			"ubuntu-24.04-server-cloudimg-amd64-root.tar.xz",
+			"URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/\n",
+		},
+		"aarch64": {
+			"ubuntu-24.04-server-cloudimg-arm64-root.tar.xz",
+			"URIs: https://ports.ubuntu.com/ubuntu-ports/\n",
+		},
 	} {
-		t.Run(arch, func(t *testing.T) {
+		t.Run(machine, func(t *testing.T) {
 			t.Parallel()
 
-			here, err := os.Getwd()
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			// curl RECORDS THE URL AND FAILS, which is everything this asks of the
-			// function: nothing after the download runs against a real root.
+			values := machineValues(t, build, machine, "BASE_ARCH", "APT_URIS")
 			shims := t.TempDir()
 			record := filepath.Join(shims, "url")
-			curl := "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nprintf '%s\\n' \"$last\" >" + record + "\nexit 7\n"
+			writeFile(t, filepath.Join(shims, "curl"), "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n"+
+				"printf '%s\\n' \"$last\" >"+record+"\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && : >\"$2\"; shift; done\n", 0o755)
+			writeFile(t, filepath.Join(shims, "sha256sum"), "#!/bin/sh\ncat >/dev/null\n", 0o755)
+			writeFile(t, filepath.Join(shims, "tar"), "#!/bin/sh\nexit 0\n", 0o755)
 
-			if err := forkSafeWriteFile(filepath.Join(shims, "curl"), []byte(curl), 0o700); err != nil {
-				t.Fatal(err)
+			rootfs := t.TempDir()
+			for _, dir := range []string{"etc/cloud", "etc/apt/sources.list.d", "etc/apt/apt.conf.d"} {
+				if err := os.MkdirAll(filepath.Join(rootfs, dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
 			}
 
-			script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nBASE_ARCH=" + arch +
-				"\nWORK=" + t.TempDir() + "\n" + guestImageFunction(t, "install_cloud_base") +
-				"\ninstall_cloud_base " + t.TempDir() + "\n"
+			script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nSUITE=noble\nBASE_ARCH=" +
+				values["BASE_ARCH"] + "\nAPT_URIS='" + values["APT_URIS"] + "'\nWORK=" + t.TempDir() + "\n" +
+				guestImageFunction(t, "write_apt_sources") + "\n" + guestImageFunction(t, "install_cloud_base") +
+				"\ninstall_cloud_base " + rootfs + "\n"
 			path := filepath.Join(t.TempDir(), "base.sh")
 
 			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
@@ -242,20 +361,307 @@ func TestTheBaseFilesystemIsChosenByTheMachine(t *testing.T) {
 			cmd := exec.CommandContext(t.Context(), "bash", path)
 			cmd.Env = append(os.Environ(), "PATH="+shims+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("install_cloud_base: %v\n%s", err, out)
+			}
+
+			if url := strings.TrimSpace(string(readBytes(t, record))); !strings.HasSuffix(url, "/"+want.file) {
+				t.Errorf("downloaded %s, want %s", url, want.file)
+			}
+
+			sources := string(readBytes(t, filepath.Join(rootfs, "etc/apt/sources.list.d/ubuntu.sources")))
+			if !strings.Contains(sources, want.uris) {
+				t.Errorf("the image's apt source is:\n%s\nwant %s", sources, want.uris)
+			}
+		})
+	}
+
+	// A MACHINE base.pin NAMES NOTHING FOR IS SAID, not a silent exit on an empty read.
+	script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nBASE_ARCH=riscv64\nWORK=" + t.TempDir() +
+		"\n" + guestImageFunction(t, "install_cloud_base") + "\ninstall_cloud_base /nowhere\n"
+	path := filepath.Join(t.TempDir(), "base.sh")
+
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if out, err := exec.CommandContext(t.Context(), "bash", path).CombinedOutput(); err == nil ||
+		!strings.Contains(string(out), "names no release, file and sha256 for riscv64") {
+		t.Errorf("a machine with no line answered %v:\n%s", err, out)
+	}
+}
+
+// ONE IMAGE HOLDS ONE MACHINE ON THE MANUAL PATH TOO. A build on an arm64 host with
+// IMAGE_NAME=ubuntu-2404-x64 would otherwise write aarch64 bytes into a fleet's x64 image
+// under a name its nodes resolve. Each refusal names why, and rbd failing refuses too.
+func TestAManualPublishIsHeldToTheImagesMachine(t *testing.T) {
+	t.Parallel()
+
+	const snaps = `[{"name":"g20261001000000"},{"name":"g20261002000000"},{"name":"a-note"}]`
+
+	for name, tc := range map[string]struct {
+		snaps, meta string
+		failSnap    bool
+		failMeta    bool
+		says        string
+	}{
+		"every generation its own":  {snaps: snaps, meta: `{"billet.arch.g20261001000000":"aarch64","billet.arch.g20261002000000":"aarch64"}`},
+		"an image with none":        {snaps: "[]", meta: ""},
+		"another machine's":         {snaps: snaps, meta: `{"billet.arch.g20261001000000":"aarch64","billet.arch.g20261002000000":"x86_64"}`, says: "is x86_64's and this build is aarch64's"},
+		"one with no record":        {snaps: snaps, meta: `{"billet.arch.g20261001000000":"aarch64"}`, says: "g20261002000000 records no machine"},
+		"none with a record":        {snaps: snaps, meta: "", says: "records no machine"},
+		"generations unreadable":    {snaps: snaps, failSnap: true, says: "could not list the generations"},
+		"metadata unreadable":       {snaps: snaps, failMeta: true, says: "could not read what"},
+		"a listing that is no list": {snaps: `{"oops":1}`, meta: "", says: "could not read the generations"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			shims := t.TempDir()
+			writeFile(t, filepath.Join(shims, "snaps"), tc.snaps, 0o600)
+			writeFile(t, filepath.Join(shims, "meta"), tc.meta, 0o600)
+
+			rbd := "#!/bin/bash\ncase \"$*\" in\n"
+			if tc.failSnap {
+				rbd += "*'snap ls'*) exit 1 ;;\n"
+			}
+
+			if tc.failMeta {
+				rbd += "*'image-meta list'*) exit 1 ;;\n"
+			}
+
+			rbd += "*'snap ls'*) cat " + filepath.Join(shims, "snaps") + " ;;\n" +
+				"*'image-meta list'*) cat " + filepath.Join(shims, "meta") + " ;;\nesac\n"
+			writeFile(t, filepath.Join(shims, "rbd"), rbd, 0o755)
+
+			script := "#!/usr/bin/env bash\nset -euo pipefail\nCEPH_USER=u\nIMAGE_POOL=p\nIMAGE_NAME=i\nMACHINE=aarch64\n" +
+				guestImageFunction(t, "refuse_another_machine") + "\nrefuse_another_machine\necho ALLOWED\n"
+			path := filepath.Join(t.TempDir(), "publish.sh")
+
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.CommandContext(t.Context(), "bash", path)
+			cmd.Env = append(os.Environ(), "PATH="+shims+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 			out, err := cmd.CombinedOutput()
+			if tc.says == "" {
+				if err != nil || !strings.Contains(string(out), "ALLOWED") {
+					t.Fatalf("refused (%v):\n%s", err, out)
+				}
 
-			var exit *exec.ExitError
-			if !errors.As(err, &exit) {
-				t.Fatalf("the install did not reach its download: %v\n%s", err, out)
+				return
 			}
 
-			url, err := os.ReadFile(record)
+			if err == nil || strings.Contains(string(out), "ALLOWED") || !strings.Contains(string(out), tc.says) {
+				t.Fatalf("answered %v, want a refusal saying %q:\n%s", err, tc.says, out)
+			}
+		})
+	}
+
+	// AND THE GENERATION IT MAKES SAYS WHOSE IT IS BEFORE IT EXISTS, on the path that holds
+	// an existing image to it.
+	publish := guestImageFunction(t, "publish")
+	check, arch, snap := strings.Index(publish, "\t\trefuse_another_machine\n"),
+		strings.Index(publish, `"billet.arch.$gen" "$MACHINE"`), strings.Index(publish, `snap create "$IMAGE_NAME@$gen"`)
+
+	if check < 0 || arch < 0 || snap < 0 || arch > snap {
+		t.Errorf("publish checks at %d, records the machine at %d and snapshots at %d", check, arch, snap)
+	}
+
+	if write := strings.Index(publish, `"$ddbin" if="$img"`); write < 0 || check > write {
+		t.Errorf("publish checks the image's machine at %d and writes it at %d", check, write)
+	}
+}
+
+// NOTHING NAMES A MACHINE OUTSIDE ITS TABLE, except what GitHub's scripts name the same
+// on both. A consumer reverted to the literal it replaced passes every table test and
+// then fails on a real build of the other machine, or worse, on the build's gate.
+func TestNoScriptNamesAMachineOutsideItsTable(t *testing.T) {
+	t.Parallel()
+
+	literal := regexp.MustCompile(`x64|X64|amd64|x86_64|aarch64|arm64|AARCH64`)
+
+	for script, allowed := range map[string][]string{
+		"build-guest-image.sh": {
+			`SCOPE=guest-x64 PLAN_NAME=plan.json`, `RUNNER_PLATFORM=linux-x64 GUEST_GOARCH=amd64`, `IMAGE_NAME_DEFAULT=ubuntu-2404-x64`,
+			`SCOPE=guest-arm64 PLAN_NAME=plan-arm64.json`, `RUNNER_PLATFORM=linux-arm64 GUEST_GOARCH=arm64`, `IMAGE_NAME_DEFAULT=ubuntu-2404-arm64`,
+			"x86_64)", "aarch64)", `if [ "$TOOLSET_PIN_KEY" = x64 ]; then`, `if [ "$RUNNER_PLATFORM" = linux-x64 ]; then`,
+			`echo "this host is $MACHINE, and billet builds guests for x86_64 and aarch64 only" >&2`,
+			`echo "its first line is '<version> <sha256 of the linux-x64 tarball>' and each after it" >&2`,
+		},
+		"check-guest-image.sh": {
+			"x86_64)", "aarch64)", `TOOLSET_NAME=toolset-2404.json PLAN_NAME=plan.json TOOLCACHE_ARCH=x64`,
+			`JAVA_ARCH=amd64 GOROOT_SUFFIX=X64 ELF_MACHINE=62`, `TOOLSET_NAME=toolset-2404-arm64.json PLAN_NAME=plan-arm64.json TOOLCACHE_ARCH=arm64`,
+			`JAVA_ARCH=arm64 GOROOT_SUFFIX=AARCH64 ELF_MACHINE=183`, `if [ "$GUEST_MACHINE" = aarch64 ]; then`,
+			`echo "this host is $(uname -m), and billet builds guests for x86_64 and aarch64 only;" >&2`,
+			// x64 ON BOTH: GitHub's install-awf.sh and install-java-tools.sh write these.
+			`/agentic-workflow-firewall-js/*/x64/awf-bundle.js`, `${entry%/x64/awf-bundle.js}/x64.complete`,
+			`[ -L "$candidate/x64" ]`, `"$(readlink "$candidate/x64")"`, `[ ! -f "$entry/x64.complete" ]`,
+			`has no x64.complete`, `JAVA_HOME_${v}_X64`,
+		},
+	} {
+		for _, line := range strings.Split(withoutShellComments(readScriptFile(t, script)), "\n") {
+			if !literal.MatchString(line) {
+				continue
+			}
+
+			if !slices.ContainsFunc(allowed, func(want string) bool { return strings.Contains(line, want) }) {
+				t.Errorf("%s names a machine outside its table: %s", script, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
+// keep_bootcon IS arm64's, and the console the boot check reads depends on it there.
+func TestTheBootCheckAsksForTheMachinesConsole(t *testing.T) {
+	t.Parallel()
+
+	source := readScriptFile(t, "boot-guest-image.sh")
+
+	start := strings.Index(source, `boot_args="console=ttyS0`)
+	if start < 0 {
+		t.Fatal("boot-guest-image.sh no longer sets boot_args")
+	}
+
+	end := strings.Index(source[start:], "\nfi\n")
+	if end < 0 {
+		t.Fatal("no fi after boot_args")
+	}
+
+	script := "set -eu\n" + source[start:start+end+len("\nfi\n")] + `printf '%s' "$boot_args"` + "\n"
+
+	for machine, want := range map[string]bool{"x86_64": false, "aarch64": true} {
+		path := filepath.Join(t.TempDir(), "args.sh")
+		if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.CommandContext(t.Context(), "bash", path)
+		cmd.Env = append(os.Environ(), "PATH="+unameShim(t, machine)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+
+		if got := strings.HasPrefix(string(out), "keep_bootcon "); got != want {
+			t.Errorf("on %s the boot check's arguments are %q", machine, out)
+		}
+
+		if !strings.Contains(string(out), "console=ttyS0") {
+			t.Errorf("on %s the boot check does not ask for the console: %q", machine, out)
+		}
+	}
+}
+
+// A GATE ON A MACHINE BILLET BUILDS NOTHING FOR REFUSES, before it mounts anything: it
+// would read a toolset named nothing and run binaries it cannot.
+func TestTheGateRefusesAMachineItHasNoTableFor(t *testing.T) {
+	t.Parallel()
+
+	image := filepath.Join(t.TempDir(), "image")
+	writeFile(t, image, "not an image", 0o600)
+
+	cmd := exec.CommandContext(t.Context(), "bash", "check-guest-image.sh", image)
+	cmd.Env = append(os.Environ(), "PATH="+unameShim(t, "riscv64")+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	out, err := cmd.CombinedOutput()
+
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "this host is riscv64") {
+		t.Errorf("answered %v:\n%s", err, out)
+	}
+}
+
+// A BINARY THE GATE COULD NOT READ IS NAMED, AND THE OTHERS STILL ASKED. With no manifest
+// named nothing else has set what the next line reads, so under set -u a first read that
+// failed would end the gate with no verdict and no name.
+func TestTheGateNamesEveryBinaryItCouldNotRead(t *testing.T) {
+	t.Parallel()
+
+	shims := t.TempDir()
+	writeFile(t, filepath.Join(shims, "od"), "#!/bin/sh\nexit 1\n", 0o755)
+
+	prelude := gateAssignment(t, "ELF_BINARIES") + "\nGUEST_MACHINE=x86_64\nELF_MACHINE=62\nPATH=" + shims + ":$PATH\n"
+
+	out, failed := gateRunWith(t, prelude, "check_image_machine", machineImage(t, 62), "", "image_resolve", "check_image_machine")
+	if failed != "1" {
+		t.Fatalf("FAILED=%s, want 1:\n%s", failed, out)
+	}
+
+	for _, path := range []string{"/usr/bin/env", "/opt/billet/bin/billet", "/home/runner/runner/bin/Runner.Listener"} {
+		if !strings.Contains(out, "could not read "+path) {
+			t.Errorf("the gate did not name %s:\n%s", path, out)
+		}
+	}
+}
+
+// A QUESTION OF A PLAN THAT FAILED ONCE THE PLAN WAS READ IS NOT "IT DOES NOT INSTALL IT".
+func TestAPlanItCouldNotAskAboutIsNotOneOfferingNothing(t *testing.T) {
+	t.Parallel()
+
+	tool, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("no jq on PATH to shim")
+	}
+
+	shims := t.TempDir()
+	writeFile(t, filepath.Join(shims, "jq"), "#!/bin/sh\nfor a in \"$@\"; do case $a in any*) exit 5 ;; esac; done\nexec "+tool+" \"$@\"\n", 0o755)
+
+	cmd := exec.CommandContext(t.Context(), "bash", "check-guest-component.sh", "offered", "runner-images/plan-arm64.json")
+	cmd.Env = append(os.Environ(), "PATH="+shims+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	out, err := cmd.CombinedOutput()
+
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "could not read") {
+		t.Errorf("answered %v:\n%s", err, out)
+	}
+}
+
+// A TOOLCACHE ENTRY IS THE MACHINE'S OWN, with its marker beside it: an entry under the
+// other machine's directory is one no setup-* action here looks in.
+func TestTheToolcacheEntriesAreReadUnderTheMachinesDirectory(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		dir, marker, says string
+		failed            bool
+	}{
+		"its own, marked":             {dir: "arm64", marker: "arm64.complete", says: "toolcache go 1.26.0"},
+		"the other's":                 {dir: "x64", marker: "x64.complete", says: "has no arm64 directory", failed: true},
+		"its own, the other's marker": {dir: "arm64", marker: "x64.complete", says: "has no arm64.complete marker", failed: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			tc2 := t.TempDir()
+			entry := filepath.Join(tc2, "go", "1.26.0")
+			if err := os.MkdirAll(filepath.Join(entry, tc.dir), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			writeFile(t, filepath.Join(entry, tc.marker), "", 0o644)
+
+			script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\n" +
+				"pass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
+				"TOOLCACHE_TOOLS=(go)\nTOOLCACHE_ARCH=arm64\nTOOLCACHE=" + tc2 + "\n" +
+				gateFunction(t, "check_toolcache_entries") + "\ncheck_toolcache_entries\necho \"FAILED=$FAILED\"\n"
+			path := filepath.Join(t.TempDir(), "entries.sh")
+
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			out, err := exec.CommandContext(t.Context(), "bash", path).CombinedOutput()
 			if err != nil {
-				t.Fatalf("nothing was downloaded: %v\n%s", err, out)
+				t.Fatalf("%v\n%s", err, out)
 			}
 
-			if !strings.HasSuffix(strings.TrimSpace(string(url)), "/"+wantFile) {
-				t.Errorf("downloaded %s, want %s", url, wantFile)
+			if got := strings.Contains(string(out), "FAILED=1"); got != tc.failed || !strings.Contains(string(out), tc.says) {
+				t.Errorf("failed = %v, want %v saying %q:\n%s", got, tc.failed, tc.says, out)
 			}
 		})
 	}
@@ -305,11 +711,20 @@ func TestAPlanOffersTheComponentsItInstalls(t *testing.T) {
 		body, want string
 		status     int
 	}{
-		"installing none":    {"[]\n", "", 0},
+		"installing none":    {`[{"id":"install-nothing.sh"}]`, "", 0},
 		"compact JSON":       {`[{"id":"install-firefox.sh"}]`, "firefox\n", 0},
 		"not JSON":           {"this is not a plan\n", "could not read", 2},
 		"JSON, but no plan":  {`{"id":"install-firefox.sh"}`, "could not read", 2},
 		"truncated, at last": {`[{"id":"install-firefox.sh"}`, "could not read", 2},
+		// EACH ANSWERS false TO "does it install this", so read as a plan each would
+		// offer nothing and the gate would accept a manifest declaring nothing.
+		"an empty list":  {"[]\n", "could not read", 2},
+		"a null step":    {"[null]\n", "could not read", 2},
+		"a step of none": {"[{}]\n", "could not read", 2},
+		"a null id":      {`[{"id":null}]`, "could not read", 2},
+		"an empty id":    {`[{"id":""}]`, "could not read", 2},
+		"a number":       {"[1]\n", "could not read", 2},
+		"one bad step":   {`[{"id":"install-firefox.sh"},{}]`, "could not read", 2},
 	} {
 		plan := filepath.Join(t.TempDir(), "plan.json")
 		if err := forkSafeWriteFile(plan, []byte(tc.body), 0o600); err != nil {
@@ -430,6 +845,12 @@ func TestTheGateRefusesAnImageOfAnotherMachine(t *testing.T) {
 			t.Helper()
 			writeFile(t, filepath.Join(root, "opt", "billet", "bin", "billet"), "#!/bin/sh\n# long enough to have an offset 18\nexit 0\n", 0o755)
 		}, failed: "1", says: "/opt/billet/bin/billet is not a 64-bit little-endian ELF"},
+		// TOO SHORT FOR OFFSET 18, which od cannot skip to, and with no manifest named: a
+		// read that failed names the file, and the gate goes on to the next one.
+		"a file too short to say": {guest: "x86_64", elf: x86, image: x86, edit: func(t *testing.T, root string) {
+			t.Helper()
+			writeFile(t, filepath.Join(root, "opt", "billet", "bin", "billet"), "#!/bin/sh\n", 0o755)
+		}, failed: "1", says: "could not read /opt/billet/bin/billet"},
 		// THE RIGHT TWO BYTES AT OFFSET 18 IN WHAT IS NO BINARY: only the header says so.
 		"the machine's bytes in no ELF": {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: func(t *testing.T, root string) {
 			t.Helper()
@@ -437,10 +858,6 @@ func TestTheGateRefusesAnImageOfAnotherMachine(t *testing.T) {
 			corrupt[0] = 0
 			writeFile(t, filepath.Join(root, "home", "runner", "runner", "bin", "Runner.Listener"), string(corrupt), 0o755)
 		}, failed: "1", says: "Runner.Listener is not a 64-bit little-endian ELF"},
-		"a file too short to say": {guest: "x86_64", elf: x86, image: x86, manifest: "x86_64", edit: func(t *testing.T, root string) {
-			t.Helper()
-			writeFile(t, filepath.Join(root, "opt", "billet", "bin", "billet"), "#!/bin/sh\n", 0o755)
-		}, failed: "1", says: "could not read /opt/billet/bin/billet"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -655,42 +1072,91 @@ func TestTheGateHoldsGorootToTheMachinesName(t *testing.T) {
 	}
 }
 
-// THE arm64 GUEST'S KERNEL BOOTS FROM ITS OWN COMMAND LINE, and each machine's kernel
-// build leaves the file that machine's VMM loads.
+// EACH MACHINE'S KERNEL BUILD LEAVES THE FILE THAT MACHINE'S VMM LOADS, from that
+// machine's base and with that machine's list enabled. The real script runs, with only
+// what would really compile or fetch stood in for: make records what it was asked for and
+// leaves a file at each machine's real output, so a script that named one literally would
+// install the wrong one or none. The gate at its end runs too, with a stand-in checker.
 func TestEachMachineBuildsTheKernelItsVMMLoads(t *testing.T) {
 	t.Parallel()
 
-	table := machineTable(t, "build-guest-kernel.sh", `case "$(uname -m)" in`)
-	names := []string{"KERNEL_TARGET", "KERNEL_BUILT", "DEFAULT_BASE_CONFIG", "MACHINE_BUILTINS"}
+	version := strings.Fields(readScriptFile(t, "kernel/linux.pin"))[0]
+	checker := stubChecker(t, "#!/bin/sh\nexit 0\n")
 
-	for machine, want := range map[string]map[string]string{
-		"x86_64": {
-			"KERNEL_TARGET": "vmlinux", "KERNEL_BUILT": "vmlinux",
-			"DEFAULT_BASE_CONFIG": "/repo/scripts/guest-kernel.config", "MACHINE_BUILTINS": "",
-		},
-		"aarch64": {
-			"KERNEL_TARGET": "Image", "KERNEL_BUILT": "arch/arm64/boot/Image",
-			"DEFAULT_BASE_CONFIG": "/repo/scripts/guest-kernel-aarch64.config",
-			"MACHINE_BUILTINS":    "/repo/scripts/kernel/required-builtins-aarch64.txt",
-		},
+	for machine, want := range map[string]struct {
+		target, kernel, armOption string
+		base                      string
+	}{
+		"x86_64":  {"vmlinux", "built at vmlinux\n", "", "guest-kernel.config"},
+		"aarch64": {"Image", "built at arch/arm64/boot/Image\n", "ARM_PSCI_FW", "guest-kernel-aarch64.config"},
 	} {
-		got := machineValues(t, table, machine, names...)
-		for name, value := range want {
-			if got[name] != value {
-				t.Errorf("on %s the kernel build sets %s=%q, want %q", machine, name, got[name], value)
+		t.Run(machine, func(t *testing.T) {
+			t.Parallel()
+
+			work := t.TempDir()
+			out := t.TempDir()
+			shims := unameShim(t, machine)
+			calls := filepath.Join(t.TempDir(), "calls")
+
+			writeFile(t, filepath.Join(shims, "apt-get"), "#!/bin/sh\nexit 0\n", 0o755)
+			writeFile(t, filepath.Join(shims, "nproc"), "#!/bin/sh\necho 2\n", 0o755)
+			writeFile(t, filepath.Join(shims, "make"), "#!/bin/sh\nprintf 'make %s\\n' \"$*\" >>"+calls+"\n"+
+				"for last; do :; done\n"+
+				"case \"$last\" in\n"+
+				"vmlinux) echo 'built at vmlinux' >vmlinux ;;\n"+
+				"Image) mkdir -p arch/arm64/boot; echo 'built at arch/arm64/boot/Image' >arch/arm64/boot/Image ;;\n"+
+				"esac\n", 0o755)
+
+			tree := filepath.Join(work, "linux-"+version)
+			writeFile(t, filepath.Join(tree, "scripts", "config"), "#!/bin/sh\nprintf 'config %s\\n' \"$*\" >>"+calls+"\n", 0o755)
+
+			script, err := filepath.Abs("build-guest-kernel.sh")
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
+
+			cmd := exec.CommandContext(t.Context(), "bash", script)
+			cmd.Env = append(os.Environ(), append(checker,
+				"PATH="+shims+string(os.PathListSeparator)+os.Getenv("PATH"), "WORK="+work, "OUT="+out)...)
+
+			said, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("the kernel build: %v\n%s", err, said)
+			}
+
+			log := string(readBytes(t, calls))
+			if !strings.Contains(log, "make -j2 "+want.target+"\n") {
+				t.Errorf("make was not asked for %s:\n%s", want.target, log)
+			}
+
+			if got := string(readBytes(t, filepath.Join(out, "vmlinux-billet"))); got != want.kernel {
+				t.Errorf("vmlinux-billet holds %q, want %q", got, want.kernel)
+			}
+
+			if got, base := readBytes(t, filepath.Join(out, "vmlinux-billet.config")), readBytes(t, want.base); string(got) != string(base) {
+				t.Errorf("the kernel was not built from %s", want.base)
+			}
+
+			if enabled := strings.Contains(log, "--enable ARM_PSCI_FW"); enabled != (want.armOption != "") {
+				t.Errorf("arm64's list enabled = %v on %s:\n%s", enabled, machine, log)
+			}
+		})
 	}
 
-	path := filepath.Join(t.TempDir(), "table.sh")
-	if err := forkSafeWriteFile(path, []byte("#!/usr/bin/env bash\nset -euo pipefail\nREPO_ROOT=/repo\n"+table), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	// BEFORE apt-get, which needs root and changes the machine it runs on.
+	shims := unameShim(t, "riscv64")
+	calls := filepath.Join(t.TempDir(), "calls")
+	writeFile(t, filepath.Join(shims, "apt-get"), "#!/bin/sh\necho apt >"+calls+"\n", 0o755)
 
-	cmd := exec.CommandContext(t.Context(), "bash", path)
-	cmd.Env = append(os.Environ(), "PATH="+unameShim(t, "riscv64")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd := exec.CommandContext(t.Context(), "bash", "build-guest-kernel.sh")
+	cmd.Env = append(os.Environ(), "PATH="+shims+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"WORK="+t.TempDir(), "OUT="+t.TempDir())
 
 	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "riscv64") {
 		t.Errorf("a machine with no kernel answered %v:\n%s", err, out)
+	}
+
+	if _, err := os.Stat(calls); err == nil {
+		t.Error("a machine with no kernel reached apt-get before it was refused")
 	}
 }

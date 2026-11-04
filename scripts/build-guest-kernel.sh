@@ -202,9 +202,9 @@ echo "=== building on $(nproc) cores ==="
 # meant a failed kernel build printed one line -- the exit status -- and the
 # thousands of lines saying why were left in a file on a runner that is about to be
 # destroyed. Unreadable exactly when it is needed.
-if ! time make -j"$(nproc)" "$KERNEL_TARGET" >/tmp/kbuild.log 2>&1; then
+if ! time make -j"$(nproc)" "$KERNEL_TARGET" >"$WORK/kbuild.log" 2>&1; then
   echo "the kernel build failed; the last 60 lines of the log follow" >&2
-  tail -60 /tmp/kbuild.log >&2
+  tail -60 "$WORK/kbuild.log" >&2
 
   exit 1
 fi

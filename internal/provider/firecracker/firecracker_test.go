@@ -297,16 +297,24 @@ func TestTheBootArgumentsAreTheMachines(t *testing.T) {
 		}
 	}
 
-	h := newHarness(t)
-	_, vmm := h.launch(t)
+	// THE LAUNCH USES THE HOST'S, whichever machine runs this test.
+	for _, goarch := range []string{"amd64", "arm64"} {
+		h := newHarness(t)
+		h.p.goarch = goarch
+		_, vmm := h.launch(t)
 
-	body, called := vmm.bodyPut("/boot-source")
-	if !called {
-		t.Fatal("no boot source was configured")
+		body, called := vmm.bodyPut("/boot-source")
+		if !called {
+			t.Fatal("no boot source was configured")
+		}
+
+		if body["boot_args"] != bootArgs(goarch) {
+			t.Errorf("on %s the guest was booted with %v", goarch, body["boot_args"])
+		}
 	}
 
-	if body["boot_args"] != bootArgs(runtime.GOARCH) {
-		t.Errorf("the guest was booted with %v, not this machine's arguments", body["boot_args"])
+	if got := newHarness(t).p.goarch; got != runtime.GOARCH {
+		t.Errorf("New set the machine to %q, want %q", got, runtime.GOARCH)
 	}
 }
 

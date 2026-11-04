@@ -103,14 +103,14 @@ if [ ! -r "$IMAGE" ]; then
 	exit 2
 fi
 
-if [ "$(id -u)" -ne 0 ]; then
-	echo "this mounts a filesystem image; run it as root" >&2
-	exit 2
-fi
-
 if [ -z "$GUEST_MACHINE" ]; then
 	echo "this host is $(uname -m), and billet builds guests for x86_64 and aarch64 only;" >&2
 	echo "this gate runs the image's own binaries, so it runs on the image's machine" >&2
+	exit 2
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+	echo "this mounts a filesystem image; run it as root" >&2
 	exit 2
 fi
 
@@ -438,11 +438,13 @@ check_image_machine() {
 		fi
 		status=0
 		header=$(od -An -tx1 -N6 "$1$resolved") && said=$(od -An -tu2 -j18 -N2 "$1$resolved") || status=$?
-		header=${header//[[:space:]]/}
-		said=${said//[[:space:]]/}
 		if [ "$status" -ne 0 ]; then
 			fail "could not read $path to tell which machine it runs on (status $status)"
-		elif [ "$header" != 7f454c460201 ]; then
+			continue
+		fi
+		header=${header//[[:space:]]/}
+		said=${said//[[:space:]]/}
+		if [ "$header" != 7f454c460201 ]; then
 			fail "$path is not a 64-bit little-endian ELF (it begins ${header:-with nothing}), so nothing says it is $GUEST_MACHINE's"
 		elif [ "$said" != "$ELF_MACHINE" ]; then
 			fail "$path has e_machine ${said:-nothing}, and this image is $GUEST_MACHINE's ($ELF_MACHINE);
@@ -1398,25 +1400,11 @@ fi
 
 # --- the toolcache ---------------------------------------------------------
 
-# EVERY ONE OF THESE FAILS SILENTLY, WHICH IS WHY THEY ARE ASSERTED.
-#
-# A toolcache entry that is subtly wrong does not break a job. `setup-node` simply
-# does not find it, downloads a couple of hundred megabytes, and succeeds -- so the
-# only symptom is that jobs are as slow as they were before the toolcache existed,
-# and nothing anywhere says why. Four separate mistakes produce exactly that:
-#
-#   - the marker file missing, or written INSIDE the arch directory rather than
-#     beside it, which is where tool-cache stats for it
-#   - a version directory that is not a full semver, which the range resolver skips
-#     entirely rather than matching loosely
-#   - `x86_64` instead of `x64`
-#   - `python` instead of `Python`, which the actions spell inconsistently
-TOOLCACHE="$MNT/opt/hostedtoolcache"
+# check_toolcache_entries walks what is under each tool: a full semver, the machine's
+# directory, and the marker beside it. A function so it can be run without a loop mount.
+check_toolcache_entries() {
+	local toolcache_entries tool versiondir version
 
-if [ ! -d "$TOOLCACHE" ]; then
-	fail "no toolcache at /opt/hostedtoolcache; every job would download a runtime the
-        image was supposed to contain, and nothing would report it"
-else
 	toolcache_entries=0
 
 	# EVERY ONE BILLET BAKES. PyPy and Ruby were installed by the shared installer
@@ -1465,6 +1453,28 @@ else
 	if [ "$toolcache_entries" -eq 0 ]; then
 		fail "the toolcache directory exists and holds nothing usable"
 	fi
+}
+
+# EVERY ONE OF THESE FAILS SILENTLY, WHICH IS WHY THEY ARE ASSERTED.
+#
+# A toolcache entry that is subtly wrong does not break a job. `setup-node` simply
+# does not find it, downloads a couple of hundred megabytes, and succeeds -- so the
+# only symptom is that jobs are as slow as they were before the toolcache existed,
+# and nothing anywhere says why. Four separate mistakes produce exactly that:
+#
+#   - the marker file missing, or written INSIDE the arch directory rather than
+#     beside it, which is where tool-cache stats for it
+#   - a version directory that is not a full semver, which the range resolver skips
+#     entirely rather than matching loosely
+#   - `x86_64` instead of `x64`
+#   - `python` instead of `Python`, which the actions spell inconsistently
+TOOLCACHE="$MNT/opt/hostedtoolcache"
+
+if [ ! -d "$TOOLCACHE" ]; then
+	fail "no toolcache at /opt/hostedtoolcache; every job would download a runtime the
+        image was supposed to contain, and nothing would report it"
+else
+	check_toolcache_entries
 
 # check_toolcache_coverage asserts every line the declaration names has an entry.
 #

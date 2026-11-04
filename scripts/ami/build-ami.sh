@@ -244,6 +244,10 @@ if ! template_offers=$("$repo/scripts/check-guest-component.sh" offered "$plan_f
 	die "could not read $plan_file to tell which components it installs"
 fi
 for name in "${accept[@]}"; do
+	# A NAME THAT IS NO COMPONENT ENDS THE BUILD, as it did asking for its installer: it
+	# is not one GitHub's template happens not to install.
+	"$repo/scripts/check-guest-component.sh" installer "$name" >/dev/null ||
+		die "$name is not a component billet completes"
 	found=0
 	grep -qxF -- "$name" <<<"$template_offers" || found=$?
 	case "$found" in
