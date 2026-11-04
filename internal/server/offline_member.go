@@ -126,6 +126,11 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 			continue
 		}
 
+		// NOT YET A MEMBER THAT COULD HAVE COME ONLINE: its launch has not returned.
+		if l.launchInFlight(member.LeaseID) {
+			continue
+		}
+
 		idle[member.LeaseID] = true
 
 		// THE CACHED MEMBER, NOT THE ROW: only it carries the id GitHub deleted,
