@@ -9,10 +9,11 @@
 // what the manifest names are the publisher's to check, as they are for a set built in
 // the same run.
 //
-// A POINTER'S EXPIRY IS NOT HELD HERE. A run after weeks of failed builds still takes its
-// last good image from the pointer that named it, and an expired pointer is no less what
-// this workflow signed; replaying an older one needs a write to the channel's branch, and
-// it can only name a release this workflow published.
+// A POINTER IS HELD TO ITS EXPIRY, as a node holds it, because the expiry is what stops an
+// older genuine pointer, replayed onto the channel's branch, from choosing what this run
+// signs a fresh pointer over. `channel-expired` is the deliberate way past it, for a person
+// recovering after the channel lapsed through weeks of failed builds, and it still proves
+// who signed it.
 package main
 
 import (
@@ -20,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/junioryono/billet/internal/imagesource"
 )
@@ -31,15 +33,18 @@ func main() {
 	}
 }
 
-// run takes `manifest MACHINE FILE BUNDLE` or `channel FILE BUNDLE`.
+// run takes `manifest MACHINE FILE BUNDLE`, `channel FILE BUNDLE` or `channel-expired FILE
+// BUNDLE`.
 func run(args []string, stdout io.Writer) error {
 	switch {
 	case len(args) == 4 && args[0] == "manifest":
 		return verifyManifest(args[1], args[2], args[3], stdout)
 	case len(args) == 3 && args[0] == "channel":
-		return verifyChannel(args[1], args[2], stdout)
+		return verifyChannel(args[1], args[2], true, time.Now(), stdout)
+	case len(args) == 3 && args[0] == "channel-expired":
+		return verifyChannel(args[1], args[2], false, time.Now(), stdout)
 	default:
-		return errors.New("usage: verifyguestset manifest MACHINE MANIFEST BUNDLE, or channel POINTER BUNDLE")
+		return errors.New("usage: verifyguestset manifest MACHINE MANIFEST BUNDLE, or channel|channel-expired POINTER BUNDLE")
 	}
 }
 
@@ -90,10 +95,18 @@ func verifyManifest(machine, path, bundlePath string, stdout io.Writer) error {
 	return nil
 }
 
-func verifyChannel(path, bundlePath string, stdout io.Writer) error {
-	_, policy, err := verified(path, bundlePath)
+// verifyChannel proves a pointer's signature and, when current says so, that a reader would
+// take it now.
+func verifyChannel(path, bundlePath string, current bool, now time.Time, stdout io.Writer) error {
+	raw, policy, err := verified(path, bundlePath)
 	if err != nil {
 		return err
+	}
+
+	if current {
+		if _, err := imagesource.ParseChannel(raw, now); err != nil {
+			return err
+		}
 	}
 
 	if _, err := fmt.Fprintf(stdout, "verified: a channel pointer signed by %s\n", policy.Identity); err != nil {

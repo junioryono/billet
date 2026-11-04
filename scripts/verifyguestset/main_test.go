@@ -1,11 +1,15 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/imagesource"
 )
 
 const (
@@ -53,12 +57,15 @@ func TestACarriedManifestIsHeldToTheNodesPolicyAndItsMachine(t *testing.T) {
 		"no document, and no signature": {args: []string{"manifest", "x86_64", garbage, empty}, says: "requires a signature"},
 		"no manifest":                   {args: []string{"manifest", "x86_64", "gone.json", signedBundle}, says: "could not read the document"},
 		"no bundle":                     {args: []string{"manifest", "x86_64", signedManifest, "gone.json"}, says: "could not read the bundle"},
-		// A POINTER IS PROVED BY ITS SIGNATURE, whatever it says of itself.
-		"a pointer of what was signed":  {args: []string{"channel", signedManifest, signedBundle}},
-		"a pointer edited after":        {args: []string{"channel", tampered, signedBundle}, says: "imagesource"},
-		"a pointer with no signature":   {args: []string{"channel", signedManifest, empty}, says: "requires a signature"},
-		"too few arguments":             {args: []string{"manifest", "x86_64"}, says: "usage"},
-		"a question it does not answer": {args: []string{"x86_64", signedManifest, signedBundle}, says: "usage"},
+		// A POINTER IS PROVED BY ITS SIGNATURE, and held to what a node holds it to: this
+		// fixture is genuinely signed and is no pointer, so only the second can refuse it.
+		"past its expiry, by name":       {args: []string{"channel-expired", signedManifest, signedBundle}},
+		"a pointer no reader would take": {args: []string{"channel", signedManifest, signedBundle}, says: "guest-image channel"},
+		"a pointer edited after":         {args: []string{"channel-expired", tampered, signedBundle}, says: "imagesource"},
+		"a pointer with no signature":    {args: []string{"channel-expired", signedManifest, empty}, says: "requires a signature"},
+		"a pointer unsigned, held too":   {args: []string{"channel", signedManifest, empty}, says: "requires a signature"},
+		"too few arguments":              {args: []string{"manifest", "x86_64"}, says: "usage"},
+		"a question it does not answer":  {args: []string{"x86_64", signedManifest, signedBundle}, says: "usage"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -76,5 +83,25 @@ func TestACarriedManifestIsHeldToTheNodesPolicyAndItsMachine(t *testing.T) {
 				t.Fatalf("answered %v, want a refusal saying %q", err, tc.says)
 			}
 		})
+	}
+}
+
+// A LAPSED POINTER IS REFUSED, and past that a person's say-so. The signature is the
+// fixture's, so this drives the judgement a signed pointer reaches, at the two moments that
+// tell an expiry being held from one being ignored.
+func TestAChannelPointerIsHeldToItsExpiryUnlessAPersonSaysOtherwise(t *testing.T) {
+	t.Parallel()
+
+	published := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	pointer := fmt.Sprintf(`{"schema":1,"tag":"guest-20261101-000000","published_at":%q,"expires_at":%q,"release_immutable":true}`,
+		published.Format(time.RFC3339), published.Add(240*time.Hour).Format(time.RFC3339))
+
+	if _, err := imagesource.ParseChannel([]byte(pointer), published.Add(time.Hour)); err != nil {
+		t.Fatalf("a current pointer was refused: %v", err)
+	}
+
+	_, err := imagesource.ParseChannel([]byte(pointer), published.Add(241*time.Hour))
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("a lapsed pointer answered %v", err)
 	}
 }

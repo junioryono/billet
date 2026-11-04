@@ -466,6 +466,11 @@ func TestOnlyAFailedAarch64BuildCarriesAnImage(t *testing.T) {
 		t.Errorf("the aarch64 manifest is signed whatever its leg did:\n%s", sign)
 	}
 
+	// A LAPSED CHANNEL IS CARRIED FROM ONLY BY A PERSON'S INPUT, which a scheduled run has none of.
+	if !strings.Contains(caller, "CARRY_EXPIRED_CHANNEL: ${{ inputs.carry_expired_channel }}") {
+		t.Error("the carry step does not take its input from the dispatch")
+	}
+
 	// THE NOTES ARE ONE RELEASE'S, the carried set's origin among them.
 	notes := steps["Write the release notes"].Run
 	for _, want := range []string{"out/release-notes-aarch64.md", "out/release-notes-carried.md"} {
@@ -490,6 +495,8 @@ type carryFixture struct {
 	origin        string // that record, when it is not the default
 	drop          string // an asset the release has lost
 	failDownload  bool   // the download of the set, after its manifest, fails
+	carryExpired  bool   // a person dispatched with carry_expired_channel
+	noFetch       bool   // the fetch of the channel's branch fails
 }
 
 const carriedOrigin = "guest-20261012-000000 " + "0123456789abcdef0123456789abcdef01234567" + "\n"
@@ -534,14 +541,16 @@ func runCarry(t *testing.T, fx carryFixture) (string, bool, string) {
 
 	writeFile(t, filepath.Join(dir, "pointer"), fx.pointer, 0o600)
 
-	git := "#!/bin/bash\n[ \"$1\" = -C ] && shift 2\ncase \"$1 $2\" in\n" +
-		fmt.Sprintf("'ls-remote --exit-code') exit %d ;;\n", fx.lsRemote) +
-		"'fetch --quiet') exit 0 ;;\n"
+	// FETCH_HEAD HOLDS NOTHING UNTIL THE CHANNEL'S OWN BRANCH IS FETCHED, as in a checkout,
+	// whose FETCH_HEAD is otherwise whatever came last.
+	git := "#!/bin/bash\n[ \"$1\" = -C ] && shift 2\ncase \"$*\" in\n" +
+		fmt.Sprintf("'ls-remote --exit-code --heads origin refs/heads/guest-channel') exit %d ;;\n", fx.lsRemote) +
+		fmt.Sprintf("'fetch --quiet origin refs/heads/guest-channel') [ %t = false ] || exit 1; : >\"$FAKE/fetched\" ;;\n", fx.noFetch)
 	if fx.noPointer {
 		git += "'show FETCH_HEAD:current.json') exit 128 ;;\n"
 	} else {
-		git += "'show FETCH_HEAD:current.json') cat \"$FAKE/pointer\" ;;\n" +
-			"'show FETCH_HEAD:current.sigstore.json') echo '{}' ;;\n"
+		git += "'show FETCH_HEAD:current.json') [ -e \"$FAKE/fetched\" ] || exit 128; cat \"$FAKE/pointer\" ;;\n" +
+			"'show FETCH_HEAD:current.sigstore.json') [ -e \"$FAKE/fetched\" ] || exit 128; echo '{\"bundle\":1}' ;;\n"
 	}
 
 	git += "*) echo \"unexpected git $*\" >&2; exit 99 ;;\nesac\n"
@@ -569,14 +578,15 @@ func runCarry(t *testing.T, fx carryFixture) (string, bool, string) {
 	goStub := "#!/bin/bash\nprintf '%s\\n' \"$*\" >>\"$FAKE/go-calls\"\n" +
 		"[ \"$1 $3 $4\" = '-C run ./scripts/verifyguestset' ] || { echo \"unexpected go $*\" >&2; exit 99; }\n" +
 		"case \"$5\" in\n" +
-		fmt.Sprintf("channel) cp \"$6\" \"$FAKE/verified-pointer\"; exit %d ;;\n", fx.verifyChannel) +
+		fmt.Sprintf("channel | channel-expired) printf '%%s\\n' \"$5\" >\"$FAKE/asked\"; [ -s \"$7\" ] || exit 97; cp \"$6\" \"$FAKE/verified-pointer\"; cp \"$7\" \"$FAKE/verified-pointer-bundle\"; exit %d ;;\n", fx.verifyChannel) +
 		fmt.Sprintf("manifest) [ \"$6\" = aarch64 ] || exit 98; cp \"$7\" \"$FAKE/verified-manifest\"; cp \"$8\" \"$FAKE/verified-bundle\"; exit %d ;;\n", fx.verifyImage) +
 		"*) echo \"unexpected verification $5\" >&2; exit 99 ;;\nesac\n"
 	writeFile(t, filepath.Join(bin, "go"), goStub, 0o700)
 
 	cmd := exec.CommandContext(t.Context(), "bash", "carry-guest-set.sh", out)
 	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE="+dir,
-		"GH_TOKEN=token-for-test", "GITHUB_REPOSITORY=junioryono/billet")
+		"GH_TOKEN=token-for-test", "GITHUB_REPOSITORY=junioryono/billet",
+		fmt.Sprintf("CARRY_EXPIRED_CHANNEL=%t", fx.carryExpired))
 
 	said, err := cmd.CombinedOutput()
 
@@ -617,9 +627,19 @@ func TestALastGoodImageIsCarriedOnlyWhenItIsProved(t *testing.T) {
 			fx:   carryFixture{lsRemote: 128},
 			says: "could not ask whether the guest channel exists",
 		},
-		"a pointer the policy refuses": {
+		"a branch that will not fetch": {
+			fx:   carryFixture{pointer: pointer, manifest: good, noFetch: true},
+			says: "could not fetch the guest channel",
+		},
+		// A LAPSED POINTER IS REFUSED BY THE TOOL, whose own test holds that, and the refusal
+		// names the one way past it.
+		"a pointer a node would refuse": {
 			fx:   carryFixture{pointer: pointer, manifest: good, verifyChannel: 1},
-			says: "the guest channel's pointer is not one",
+			says: "carry_expired_channel",
+		},
+		"a person recovering a lapsed channel": {
+			fx: carryFixture{pointer: pointer, manifest: good, carryExpired: true},
+			ok: true, carried: true, says: "carried the aarch64 set",
 		},
 		"a release that is not locked": {
 			fx:   carryFixture{pointer: pointer, manifest: good, draft: true},
@@ -674,6 +694,20 @@ func TestALastGoodImageIsCarriedOnlyWhenItIsProved(t *testing.T) {
 
 			if !tc.carried {
 				return
+			}
+
+			// ASKED AS A NODE WOULD ASK, unless a person said otherwise.
+			want := "channel\n"
+			if tc.fx.carryExpired {
+				want = "channel-expired\n"
+			}
+
+			if got := string(readBytes(t, filepath.Join(dir, "asked"))); got != want {
+				t.Errorf("the pointer was asked about as %q, want %q", got, want)
+			}
+
+			if got := string(readBytes(t, filepath.Join(dir, "verified-pointer-bundle"))); got != "{\"bundle\":1}\n" {
+				t.Errorf("the pointer was verified against %q", got)
 			}
 
 			// WHAT WAS PROVED IS WHAT IS PUBLISHED, byte for byte.

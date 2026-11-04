@@ -52,6 +52,12 @@ on:
         required: false
         type: string
 
+      carry_expired_channel:
+        description: "If the aarch64 build fails, carry its image from a channel pointer past its expiry. Off refuses, because an expired pointer may be an old one replayed; turn it on only having read what the pointer names."
+        required: false
+        default: false
+        type: boolean
+
 # LEAST PRIVILEGE, NAMED PER JOB BELOW rather than here, so a step added to a
 # future job does not silently inherit the ability to write releases.
 permissions: {}
@@ -258,6 +264,7 @@ jobs:
         if: needs.arm64.result != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
+          CARRY_EXPIRED_CHANNEL: ${{ inputs.carry_expired_channel }}
         run: scripts/carry-guest-set.sh out
 
       - name: Install cosign

@@ -18,9 +18,15 @@
 # is none.
 #
 # THE POINTER IS PROVED BEFORE IT CHOOSES ANYTHING, under the policy a node holds it to,
-# and the release it names must be immutable: this run signs a new pointer over what it
-# carries, so an unproved one would launder whatever the branch said, and only a locked
+# its expiry included, and the release it names must be immutable: this run signs a new
+# pointer over what it carries, so an unproved one would launder whatever the branch said,
+# an older genuine one replayed there would choose an older image, and only a locked
 # release binds the source parts, which no manifest signature covers.
+#
+# A POINTER THAT HAS LAPSED STOPS THE PUBLICATION, unless a person says otherwise. A channel
+# lapses only through ten days of failed builds, and an operator recovering from that, who
+# has read what it names, dispatches with carry_expired_channel, which sets
+# CARRY_EXPIRED_CHANNEL=true here.
 #
 # THE SET'S PROVENANCE STAYS THE RELEASE IT WAS FIRST PUBLISHED IN. Each release's tag
 # points at the commit of its x86_64 build, so what built the aarch64 set is a record of
@@ -78,8 +84,12 @@ git -C "$here/.." show FETCH_HEAD:current.json >"$scratch/pointer.json" ||
 	fail "the guest channel holds no current.json"
 git -C "$here/.." show FETCH_HEAD:current.sigstore.json >"$scratch/pointer.sigstore.json" ||
 	fail "the guest channel holds no current.sigstore.json"
-verify channel "$scratch/pointer.json" "$scratch/pointer.sigstore.json" ||
-	fail "the guest channel's pointer is not one billet's own signing policy accepts"
+question=channel
+if [ "${CARRY_EXPIRED_CHANNEL:-}" = true ]; then
+	question=channel-expired
+fi
+verify "$question" "$scratch/pointer.json" "$scratch/pointer.sigstore.json" ||
+	fail "the guest channel's pointer is not one a node would take, by billet's own policy; if it has only expired, an operator who has read what it names can dispatch this workflow with carry_expired_channel"
 previous=$(jq -er '.tag' "$scratch/pointer.json") || fail "the guest channel names no release"
 [[ $previous =~ ^guest-[0-9]{8}-[0-9]{6}$ ]] || fail "the guest channel names $previous, which is not a guest release"
 
