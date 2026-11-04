@@ -48,6 +48,8 @@ func (s *Server) retireJobDetailOnce(ctx context.Context, now time.Time) {
 
 	// ONE READ A PASS lists what is past the retention, and the writes then take
 	// it a batch at a time, so the reading never holds the writer slot.
+	var egress int
+
 	ids, err := s.alloc.JobsWithRetirableDetail(ctx, before, retentionBatchJobs*retentionBatches)
 	if err != nil {
 		s.log.Warn("could not list job detail past its retention; trying again", "error", err)
@@ -66,9 +68,11 @@ func (s *Server) retireJobDetailOnce(ctx context.Context, now time.Time) {
 		}
 		jobs, series, destinations, guest = jobs+batch.Jobs, series+batch.Series,
 			destinations+batch.Destinations, guest+batch.GuestReports
+		egress += batch.Egress
 	}
 	if jobs > 0 {
 		s.log.Info("deleted job detail past its retention", "jobs", jobs, "series", series,
-			"destinations", destinations, "guest_reports", guest, "retention", retention)
+			"destinations", destinations, "guest_reports", guest, "egress_reports", egress,
+			"retention", retention)
 	}
 }

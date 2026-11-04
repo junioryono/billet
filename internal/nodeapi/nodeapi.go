@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 37
+	Version = 38
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -508,6 +508,21 @@ const (
 	// SENT, as the cache block is: an older node ignores TierSpec's arch, so a tier
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
+
+	// VersionEgress is the version from which a launch can carry a tier's allowlist
+	// (TierSpec's egress) and a node can report what the host saw of a job's network
+	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-023).
+	//
+	// THE TWO DIRECTIONS GO DIFFERENT WAYS, because they mean different things.
+	// REFUSED WHERE A LAUNCH IS SENT: an older node ignores TierSpec's egress and
+	// would run the job open, so a listed tier is refused to a node below this at
+	// dispatch and again at delivery, as a cache block and an architecture are.
+	// REPORTED, AND CHECKED WHERE IT IS EMITTED, for the report: it is an
+	// observation nothing decides from, and an older plane answers the route with a
+	// bare 404, so a node negotiated below this drops it as success and says so
+	// once. A pairing that negotiated below this and sends one anyway is refused.
+	// MinVersion does not move.
+	VersionEgress = 38
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -926,6 +941,9 @@ type TierSpec struct {
 	// it, so the plane sends a tier naming one only to a node that speaks it, and
 	// checks again at delivery.
 	Arch config.Arch `json:"arch,omitempty"`
+	// Egress is the tier's allowlist, nil for an open tier (VersionEgress). A node
+	// that cannot apply it refuses the launch.
+	Egress *config.TierEgress `json:"egress,omitempty"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to the selected provider's
@@ -945,6 +963,7 @@ func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 		CacheScope:  t.CacheScope,
 		Cache:       new(t.EffectiveCache()),
 		Arch:        t.Arch,
+		Egress:      t.EgressOf(),
 		BuildKitCacheMountLimit: func() config.ByteSize {
 			if t.BuildKitCacheMountLimit > 0 {
 				return t.BuildKitCacheMountLimit
