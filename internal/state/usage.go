@@ -18,7 +18,7 @@ type UsageRow struct {
 	Provider, InstanceType, Site                string
 	VCPU, Memory, PriceMicrosPerHour            int64
 	BoughtAt, StartedAt, FinishedAt             string
-	Result, ResultAt, Conclusion, FailureReason string
+	Result, ResultAt, Conclusion string
 }
 
 // ErrNoUsageRecord means the ledger holds no finished lease at a sequence number.
@@ -46,7 +46,6 @@ func (db *DB) UsageSince(ctx context.Context, after int64, limit int) ([]UsageRo
 				Site: r.Site, VCPU: r.Vcpu, Memory: r.Memory, PriceMicrosPerHour: r.PriceMicrosPerHour,
 				BoughtAt: r.BoughtAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
 				Result: r.Result, ResultAt: r.ResultAt, Conclusion: r.Conclusion,
-				FailureReason: r.FailureReason,
 			})
 		}
 
@@ -56,16 +55,19 @@ func (db *DB) UsageSince(ctx context.Context, after int64, limit int) ([]UsageRo
 	return out, err
 }
 
-// UsageLease names the lease at a sequence number, which is how a resuming
+// UsageClose is one lease's close: which lease took a number, and when.
+type UsageClose struct {
+	LeaseID, FinishedAt string
+}
+
+// UsageRecordAt reads the close at a sequence number, which is how a resuming
 // exporter proves its cursor still means something on this ledger. ErrNoUsageRecord
 // is a definite answer; any other error is one the ledger could not give.
-func (db *DB) UsageLease(ctx context.Context, sequence int64) (string, error) {
-	var lease string
+func (db *DB) UsageRecordAt(ctx context.Context, sequence int64) (UsageClose, error) {
+	var out UsageClose
 
 	err := db.View(ctx, func(tx Querier) error {
-		var err error
-
-		lease, err = ReadQueries(tx).ReadUsageLease(ctx, sequence)
+		row, err := ReadQueries(tx).ReadUsageRecord(ctx, sequence)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: %d", ErrNoUsageRecord, sequence)
 		}
@@ -73,8 +75,10 @@ func (db *DB) UsageLease(ctx context.Context, sequence int64) (string, error) {
 			return fmt.Errorf("state: read usage record %d: %w", sequence, err)
 		}
 
+		out = UsageClose{LeaseID: row.LeaseID, FinishedAt: row.FinishedAt}
+
 		return nil
 	})
 
-	return lease, err
+	return out, err
 }

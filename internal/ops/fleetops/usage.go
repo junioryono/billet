@@ -2,6 +2,8 @@ package fleetops
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,9 +64,17 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 	}
 	defer closeDB()
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	// PEEKED, NEVER MINTED, and refused when absent. Reporting a bound ledger's
+	// history under an identity this command just made would label another
+	// deployment's records as a new one's.
+	deployment, found, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
 		return err
+	}
+	if !found {
+		return fmt.Errorf("billet usage export: %s holds no deployment identity, so there is nothing to "+
+			"say these records are whose. A control plane mints one the first time it starts",
+			cfg.Server.IdentityDir)
 	}
 
 	after, err := resumeUsage(ctx, db, deployment, *since)
@@ -97,19 +107,27 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 }
 
 // usageCursor is a place in one deployment's order of finished leases.
+//
+// closed IDENTIFIES THE CLOSE AND NOT ONLY THE LEASE. A ledger restored from a
+// backup holding leases A, B and C open can close C at 11 and B at 12 where the
+// original closed A and B: a cursor of `12, B` would pass a check of the lease and
+// skip C in silence. The close's time is written once, to the nanosecond, so a
+// lease closed again has another.
 type usageCursor struct {
 	deployment string
 	sequence   int64
 	lease      string
+	closed     string
 }
 
 func (c usageCursor) String() string {
-	return usageCursorVersion + "." + c.deployment + "." + strconv.FormatInt(c.sequence, 10) + "." + c.lease
+	return usageCursorVersion + "." + c.deployment + "." + strconv.FormatInt(c.sequence, 10) + "." +
+		c.lease + "." + c.closed
 }
 
 func parseUsageCursor(s string) (usageCursor, error) {
 	parts := strings.Split(s, ".")
-	if len(parts) != 4 || parts[0] != usageCursorVersion {
+	if len(parts) != 5 || parts[0] != usageCursorVersion || parts[4] == "" {
 		return usageCursor{}, fmt.Errorf("billet usage export: --since %q is not a cursor this billet wrote", s)
 	}
 
@@ -118,12 +136,20 @@ func parseUsageCursor(s string) (usageCursor, error) {
 		return usageCursor{}, fmt.Errorf("billet usage export: --since %q is not a cursor this billet wrote", s)
 	}
 
-	return usageCursor{deployment: parts[1], sequence: sequence, lease: parts[3]}, nil
+	return usageCursor{deployment: parts[1], sequence: sequence, lease: parts[3], closed: parts[4]}, nil
+}
+
+// usageCloseMark is what a cursor keeps of a close's time: a digest, because the
+// time itself holds the separators a cursor is split on.
+func usageCloseMark(finishedAt string) string {
+	sum := sha256.Sum256([]byte(finishedAt))
+
+	return hex.EncodeToString(sum[:8])
 }
 
 // usageLedger is the ledger's half of a resume.
 type usageLedger interface {
-	UsageLease(ctx context.Context, sequence int64) (string, error)
+	UsageRecordAt(ctx context.Context, sequence int64) (state.UsageClose, error)
 }
 
 // resumeUsage is the place to read after, proved against this ledger.
@@ -132,7 +158,8 @@ type usageLedger interface {
 // quiet answer is the wrong one. A ledger restored from a backup older than the
 // cursor numbers its next leases over the ones the exporter already read: reading
 // past the old number would skip them, so the record the cursor names has to still
-// be there. Could not read is not "not there", and is reported as itself.
+// be there, closed when it was. Could not read is not "not there", and is reported
+// as itself.
 func resumeUsage(ctx context.Context, ledger usageLedger, deployment, since string) (int64, error) {
 	if since == "" {
 		return 0, nil
@@ -148,7 +175,7 @@ func resumeUsage(ctx context.Context, ledger usageLedger, deployment, since stri
 			cursor.deployment, deployment)
 	}
 
-	lease, err := ledger.UsageLease(ctx, cursor.sequence)
+	closed, err := ledger.UsageRecordAt(ctx, cursor.sequence)
 	switch {
 	case errors.Is(err, state.ErrNoUsageRecord):
 		return 0, fmt.Errorf("billet usage export: this ledger holds no record %d, which --since names. It "+
@@ -156,10 +183,10 @@ func resumeUsage(ctx context.Context, ledger usageLedger, deployment, since stri
 			"nothing was printed", cursor.sequence)
 	case err != nil:
 		return 0, err
-	case lease != cursor.lease:
-		return 0, fmt.Errorf("billet usage export: record %d is lease %s on this ledger and lease %s in "+
-			"--since. It was restored from a backup older than the cursor, and has finished other leases "+
-			"since; nothing was printed", cursor.sequence, lease, cursor.lease)
+	case closed.LeaseID != cursor.lease || usageCloseMark(closed.FinishedAt) != cursor.closed:
+		return 0, fmt.Errorf("billet usage export: record %d on this ledger is not the close --since names "+
+			"(lease %s). It was restored from a backup older than the cursor, and has finished leases again "+
+			"since; nothing was printed", cursor.sequence, closed.LeaseID)
 	}
 
 	return cursor.sequence, nil
@@ -207,9 +234,8 @@ type usageRecord struct {
 	PriceMicrosPerHour *int64 `json:"price_micros_per_hour"`
 	CostMicros         *int64 `json:"cost_micros"`
 
-	Conclusion    string `json:"conclusion"`
-	Result        string `json:"result"`
-	FailureReason string `json:"failure_reason"`
+	Conclusion string `json:"conclusion"`
+	Result     string `json:"result"`
 
 	Unknown map[string]string `json:"unknown"`
 }
@@ -219,6 +245,10 @@ const (
 	usageOwned  = "owned"
 	usageBought = "bought"
 
+	// maxUsageVCPU is a shape no machine has, past which a recorded vCPU is
+	// damage rather than a shape to weigh minutes by.
+	maxUsageVCPU = 1 << 32
+
 	weightFromTier = "tier"
 	weightFromVCPU = "charged_vcpu"
 )
@@ -226,7 +256,7 @@ const (
 func newUsageRecord(cfg *config.Config, deployment string, row *state.UsageRow) usageRecord {
 	r := usageRecord{
 		Schema:     usageRecordSchema,
-		Cursor:     usageCursor{deployment, row.Sequence, row.LeaseID}.String(),
+		Cursor:     usageCursor{deployment, row.Sequence, row.LeaseID, usageCloseMark(row.FinishedAt)}.String(),
 		Sequence:   row.Sequence,
 		LeaseID:    row.LeaseID,
 		Deployment: deployment,
@@ -237,10 +267,7 @@ func newUsageRecord(cfg *config.Config, deployment string, row *state.UsageRow) 
 		Provider:   row.Provider,
 		Conclusion: row.Conclusion,
 		Result:     row.Result,
-		// A LEASE NOT FINISHED WITH A CAUSE HAS NO REASON TO GIVE, and an empty one
-		// is not unknown.
-		FailureReason: row.FailureReason,
-		Unknown:       map[string]string{},
+		Unknown:    map[string]string{},
 	}
 
 	if row.Target == "" {
@@ -330,6 +357,7 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 		r.Unknown["job.from"] = "no job started on this lease"
 		r.Unknown["job.to"] = r.Unknown["job.from"]
 		r.Unknown["job.seconds"] = r.Unknown["job.from"]
+		r.Unknown["result"] = r.Unknown["job.from"]
 	case row.StartedAt == "":
 		r.Unknown["job.from"] = "GitHub reported a result for this lease and billet never saw its job start"
 		r.Unknown["job.seconds"] = r.Unknown["job.from"]
@@ -339,6 +367,7 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 			"record; held says how long the lease lasted"
 		r.Unknown["job.seconds"] = r.Unknown["job.to"]
 		r.Unknown["billed_minutes"] = r.Unknown["job.to"]
+		r.Unknown["result"] = r.Unknown["job.to"]
 	default:
 		seconds, why := secondsBetween(row.StartedAt, row.ResultAt)
 		if why != "" {
@@ -364,12 +393,13 @@ func (r *usageRecord) setWeight(cfg *config.Config, row *state.UsageRow) {
 	case declared && tier.MinuteWeight > 0:
 		thousandths = tier.MinuteWeight.Thousandths()
 		r.WeightSource = weightFromTier
-	case row.VCPU > 0:
+	case row.VCPU > 0 && row.VCPU <= maxUsageVCPU:
 		// NORMALISED TO A 2 VCPU RUNNER: a 4 vCPU runner counts double.
 		thousandths = row.VCPU * 500
 		r.WeightSource = weightFromVCPU
 	default:
-		r.Unknown["minute_weight"] = "the tier names no weight and no shape was recorded for this lease"
+		r.Unknown["minute_weight"] = "the tier names no weight and no usable shape was recorded for this lease"
+		r.Unknown["weight_source"] = r.Unknown["minute_weight"]
 		r.Unknown["weighted_minutes"] = r.Unknown["minute_weight"]
 
 		return
@@ -384,7 +414,16 @@ func (r *usageRecord) setWeight(cfg *config.Config, row *state.UsageRow) {
 		return
 	}
 
-	weighted := json.Number(config.FormatThousandths(thousandths * *r.BilledMinutes))
+	// IN ARBITRARY PRECISION: a number a ledger row can hold must not wrap into a
+	// negative charge on its way out.
+	product := new(big.Int).Mul(big.NewInt(thousandths), big.NewInt(*r.BilledMinutes))
+	if !product.IsInt64() {
+		r.Unknown["weighted_minutes"] = "the weight times the minutes is too large to state"
+
+		return
+	}
+
+	weighted := json.Number(config.FormatThousandths(product.Int64()))
 	r.WeightedMinutes = &weighted
 }
 
@@ -420,7 +459,14 @@ func (r *usageRecord) setPrice(row *state.UsageRow) {
 		return
 	}
 
-	r.CostMicros = new(costMicros(row.PriceMicrosPerHour, seconds))
+	cost, ok := costMicros(row.PriceMicrosPerHour, seconds)
+	if !ok {
+		r.Unknown["cost_micros"] = "the price across this time is too large to state"
+
+		return
+	}
+
+	r.CostMicros = new(cost)
 }
 
 // secondsBetween is the length of a stretch on billet's clock, or why there is
@@ -461,16 +507,15 @@ func jsonSeconds(d time.Duration) *json.Number {
 }
 
 // costMicros is a price per hour across a length, rounded up to a whole
-// millionth of a dollar, in integers that a year at any shape's price cannot
-// overflow.
-func costMicros(pricePerHour int64, d time.Duration) int64 {
+// millionth of a dollar, or false when the answer does not fit.
+func costMicros(pricePerHour int64, d time.Duration) (int64, bool) {
 	product := new(big.Int).Mul(big.NewInt(pricePerHour), big.NewInt(int64(d)))
 	quotient, remainder := new(big.Int).QuoRem(product, big.NewInt(int64(time.Hour)), new(big.Int))
 	if remainder.Sign() > 0 {
 		quotient.Add(quotient, big.NewInt(1))
 	}
 
-	return quotient.Int64()
+	return quotient.Int64(), quotient.IsInt64()
 }
 
 func printUsage(env cli.Env, records []usageRecord) error {

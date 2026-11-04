@@ -22,9 +22,9 @@ Run it, keep the last record's `cursor`, and run it again with `--since` that cu
 - The number comes from a counter row that the closing transaction holds locked until it commits, so a number becomes visible only after every lower one. A reader that has seen N will never later find a lower number.
 - Filtering is on the number alone. `finished_at` is a wall clock, which steps, and which a failover replaces with another machine's.
 
-A cursor is opaque: `u1.<deployment>.<number>.<lease>`. Store it and pass it back whole. An exporter that stores it after writing the records it covers reads a record twice at worst, after a crash between the two, and `lease_id` tells it so; one that stores it before can lose one.
+A cursor is opaque: it names the deployment, the number, the lease and that lease's close. Store it and pass it back whole. An exporter that stores it after writing the records it covers reads a record twice at worst, after a crash between the two, and `lease_id` tells it so; one that stores it before can lose one.
 
-**A resume refuses what it cannot honour, and prints nothing.** It refuses a cursor from another deployment, and a cursor whose number is missing or names another lease on this ledger. The second means the ledger was restored from a backup older than the cursor: its next leases would take numbers the exporter already read past, and reading past them would skip those leases in silence. Reconcile what was exported after the backup, then start from the last cursor the restored ledger still holds.
+**A resume refuses what it cannot honour, and prints nothing.** It refuses a cursor from another deployment, and a cursor whose number is missing, or holds a different close, on this ledger. The second means the ledger was restored from a backup older than the cursor: its next leases take numbers the exporter already read past, possibly closing the same lease again in another order, and reading past them would skip leases in silence. Reconcile what was exported after the backup, then start from the last cursor the restored ledger still holds.
 
 Records carry what was known **when the lease closed and when the record is read**: a late GitHub result fills a row that was missing one, so a second read of an old record can say more than the first, and an operator correcting a provisional verdict can change `conclusion`. A number, a lease and an interval that were known do not change.
 
@@ -57,7 +57,6 @@ Times are RFC 3339 on billet's clock, and durations are seconds to the milliseco
 | `cost_micros` | that price across `held`, rounded up to a whole millionth of a dollar |
 | `conclusion` | how billet's lifecycle ended the lease: `done` or `failed` |
 | `result` | what GitHub said about the job, verbatim |
-| `failure_reason` | why billet concluded `failed`, if a cause was recorded |
 | `unknown` | each field above that the ledger does not know, and why |
 
 ## Minute weights
