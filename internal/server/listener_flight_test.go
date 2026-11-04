@@ -966,3 +966,269 @@ func TestABackgroundLaunchFailureReachesTheLoop(t *testing.T) {
 		}
 	})
 }
+
+// heldDestroys is a runner whose launches return at once and whose destroys hold until
+// released, as a node does while launches run ahead of them.
+type heldDestroys struct {
+	fakeRunner
+
+	release chan struct{}
+	unblock func()
+	entered chan struct{}
+	mark    func()
+
+	mu      sync.Mutex
+	leases  []*alloc.Lease
+	started int
+}
+
+func newHeldDestroys() *heldDestroys {
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	r := &heldDestroys{
+		release: release, unblock: sync.OnceFunc(func() { close(release) }),
+		entered: entered, mark: sync.OnceFunc(func() { close(entered) }),
+	}
+	r.onDestroyCompleted = func(int64, string) error {
+		r.mark()
+		<-r.release
+
+		return nil
+	}
+
+	return r
+}
+
+func (r *heldDestroys) Launch(_ context.Context, lease *alloc.Lease, _ dispatch.Job) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.started++
+	r.leases = append(r.leases, lease)
+
+	return nil
+}
+
+func (r *heldDestroys) runnerName() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return provider.InstanceName(r.leases[0].ID)
+}
+
+func (r *heldDestroys) launched() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.started
+}
+
+// A DESTROY DOES NOT STOP THE TIER HEARING FROM GITHUB (#708). It waits behind the node's
+// launches and can take minutes. The capacity stays charged until it is done, because only
+// proof the compute is gone releases it, and what it frees then buys the next runner
+// without waiting for a poll.
+func TestADestroyDoesNotStopTheNextMessage(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("a-work")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(24*time.Hour))
+		runner := newHeldDestroys()
+		t.Cleanup(runner.unblock)
+
+		var (
+			mu           sync.Mutex
+			acknowledged []int64
+			delivered    int
+		)
+
+		session := &fakeSession{
+			stats: &Statistics{TotalAssignedJobs: 2},
+			onGet: func() (*Message, error) {
+				mu.Lock()
+				delivered++
+				n := delivered
+				mu.Unlock()
+
+				job := dispatch.Job{RunnerID: 41, RunID: 3, JobID: "job-3"}
+
+				switch n {
+				case 1:
+					job.RunnerName = runner.runnerName()
+
+					return &Message{MessageID: 1, Started: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 2}}, nil
+				case 2:
+					job.RunnerName = runner.runnerName()
+					job.Result = "succeeded"
+
+					return &Message{MessageID: 2, Completed: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
+				case 3:
+					return &Message{MessageID: 3, Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
+				}
+				time.Sleep(time.Hour)
+
+				return nil, ErrNoMessage
+			},
+			onDelete: func(id int64) error {
+				mu.Lock()
+				defer mu.Unlock()
+
+				acknowledged = append(acknowledged, id)
+
+				return nil
+			},
+		}
+		acked := func(id int64) bool {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return slices.Contains(acknowledged, id)
+		}
+
+		registry := &concurrentRegistry{}
+
+		l := NewListener(a, tiers[0].Label, session, WithRunner(runner), WithPoolLaunchBatch(2),
+			WithBackgroundLaunches(), WithRunnerRegistry(registry))
+		ctx, cancel := context.WithCancel(t.Context())
+		finished := make(chan error, 1)
+
+		go func() { finished <- l.Run(ctx) }()
+
+		t.Cleanup(func() {
+			runner.unblock()
+			cancel()
+			<-finished
+		})
+
+		select {
+		case <-runner.entered:
+		case <-time.After(time.Minute):
+			t.Fatal("the completion's destroy never began")
+		}
+		synctest.Wait()
+
+		if !acked(2) || !acked(3) {
+			t.Fatal("the tier stopped handling messages while a destroy was out")
+		}
+		if got := runner.launched(); got != 1 {
+			t.Fatalf("%d runners started with the only room still held by a guest being destroyed, want 1", got)
+		}
+
+		runner.unblock()
+		synctest.Wait()
+
+		if got := runner.launched(); got != 2 {
+			t.Fatalf("%d runners started with one poll out after the destroy freed room, want 2", got)
+		}
+		if len(registry.names) != 1 {
+			t.Fatalf("removed %v, want the one runner removed once", registry.names)
+		}
+	})
+}
+
+// slowRegistry takes a moment to remove a runner, so a removal running beside the loop
+// is still out when the loop's next step reads the count.
+type slowRegistry struct {
+	concurrentRegistry
+}
+
+func (r *slowRegistry) RemoveRunner(ctx context.Context, id int64, name string) error {
+	time.Sleep(time.Second)
+
+	return r.concurrentRegistry.RemoveRunner(ctx, id, name)
+}
+
+// A FINISHED RUNNER STOPS COUNTING BEFORE THE POOL IS NEXT COUNTED, WHILE ITS DESTROY IS
+// STILL OUT (#708). The pool pass after a completion counts every registered lease, so a
+// finished runner still counted makes the runner launched for the next job look surplus,
+// and retiring that one loses GitHub the runner it just handed a job to. A replay found
+// this as a job that finished before it started.
+func TestAFinishedRunnerIsNotCountedWhileItsDestroyIsOut(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("a-work")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(24*time.Hour))
+		runner := newHeldDestroys()
+
+		var (
+			mu        sync.Mutex
+			delivered int
+		)
+
+		session := &fakeSession{
+			stats: &Statistics{TotalAssignedJobs: 2},
+			onGet: func() (*Message, error) {
+				mu.Lock()
+				delivered++
+				n := delivered
+				mu.Unlock()
+
+				for runner.launched() < 2 {
+					time.Sleep(time.Millisecond)
+				}
+
+				job := dispatch.Job{RunnerID: 41, RunID: 3, JobID: "job-3", RunnerName: runner.runnerName()}
+
+				switch n {
+				case 1:
+					return &Message{MessageID: 1, Started: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 2}}, nil
+				case 2:
+					job.Result = "succeeded"
+
+					return &Message{MessageID: 2, Completed: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
+				}
+				time.Sleep(time.Hour)
+
+				return nil, ErrNoMessage
+			},
+		}
+
+		registry := &slowRegistry{}
+
+		runFlightListener(t, a, tiers[0].Label, session, runner, WithRunnerRegistry(registry))
+		// After the helper's, so it runs first: the listener cannot stop behind a held destroy.
+		t.Cleanup(runner.unblock)
+
+		select {
+		case <-runner.entered:
+		case <-time.After(time.Minute):
+			t.Fatal("the completion's destroy never began")
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		registry.mu.Lock()
+		removed := slices.Clone(registry.names)
+		registry.mu.Unlock()
+
+		if want := []string{runner.runnerName()}; !slices.Equal(removed, want) {
+			t.Fatalf("removed %v with one job still assigned, want only the finished runner %v", removed, want)
+		}
+		if active, err := a.ActiveRunnerLeases(t.Context(), tiers[0].Label); err != nil || active != 1 {
+			t.Fatalf("%d runners counted (%v) with the destroy out, want the one still serving", active, err)
+		}
+	})
+}
+
+// WITH NOTHING TO DEREGISTER, ONLY THE RELEASE ENDS THE COUNT, so the destroy stays on
+// the loop: parked, it would leave a finished runner counted for as long as it took.
+func TestWithNoRegistryACompletionIsNotParked(t *testing.T) {
+	t.Parallel()
+
+	l := NewListener(nil, "a-work", &fakeSession{}, WithBackgroundLaunches())
+	l.running[7] = &alloc.Lease{ID: "lease-7"}
+
+	if l.parkCompletion(t.Context(), dispatch.Job{RequestID: 7, Result: "succeeded"}) {
+		t.Fatal("a completion was parked with no registry to stop it being counted")
+	}
+	if _, parked := l.cleanup[7]; parked {
+		t.Fatal("it left a cleanup obligation behind")
+	}
+}

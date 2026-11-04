@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -112,11 +113,144 @@ func (l *Listener) startLaunch(ctx context.Context, lease *alloc.Lease, job disp
 			return
 		}
 
-		select {
-		case l.launchEnded <- struct{}{}:
-		default:
-		}
+		l.wakeLoop()
 	})
+}
+
+// wakeLoop asks the loop to reconcile again, beside a poll that may be out for a while.
+// One pending wake is as good as many, since a reconciliation reads the current state.
+func (l *Listener) wakeLoop() {
+	select {
+	case l.loopWake <- struct{}{}:
+	default:
+	}
+}
+
+// parkCompletion hands a completion's teardown to the cleanup loop (#708). A destroy
+// waits behind the node's in-flight launches and can take minutes, and on the poll
+// goroutine it stopped this tier hearing GitHub, so a finished guest could hold its
+// capacity for minutes after the job ended. recordCompletion has already made the
+// completion durable, and the cleanup loop is what retries one whose destroy failed:
+// it already marks what it is destroying, stops when sealed, and is joined by a teardown.
+//
+// ONLY THE DESTROY MOVES. A lease counts as a runner GitHub can route to until it is
+// deregistered, and the pool pass that follows this completion counts them: with the
+// removal parked too, the finished runner still counted, so the pass read a runner just
+// launched for the next job as surplus and retired it. The removal is one call to GitHub
+// and never waits on a node, so it stays here, and a failed one leaves the lease counted
+// and the cleanup loop asking again, as a failed one always did.
+//
+// IT REPORTS WHETHER IT PARKED, and it does not for a completion this listener holds
+// nothing for, by complete's own rule: an entry whose retry can accomplish nothing would
+// only grow the map. Nor with no registry, where only the release ends the count. Such a
+// job's destroy stays on the caller.
+func (l *Listener) parkCompletion(ctx context.Context, job dispatch.Job) bool {
+	if l.registry == nil {
+		return false
+	}
+
+	l.mu.Lock()
+	entry, parked := l.cleanup[job.RequestID]
+	_, held := l.running[job.RequestID]
+	_, promised := l.acquiring[job.RequestID]
+	// PAST THE REMOVAL ALREADY, or a redelivery that repeats it could address a runner a
+	// reused request id has since been given. complete takes these paths for the same reason.
+	pastRemoval := l.destroying[job.RequestID] || (parked && (entry.retireOnly || entry.releaseOnly ||
+		entry.lease != nil || (entry.deregistered && entry.job.CompletionID == job.CompletionID)))
+	l.mu.Unlock()
+
+	if !parked && !held && !promised && (l.completionStore == nil || job.Result == "") {
+		return false
+	}
+
+	deregistered := false
+
+	if !pastRemoval {
+		deregistered = l.deregisterBeforeParking(ctx, job)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if entry, ok := l.cleanup[job.RequestID]; ok {
+		// A heartbeat can create the obligation before GitHub's completion arrives,
+		// and its retry must take the same result-dependent path this one would.
+		if job.Result != "" {
+			entry.job = job
+		}
+		if !pastRemoval {
+			entry.deregistered = deregistered
+		}
+	} else {
+		if l.cleanup == nil {
+			l.cleanup = make(map[int64]*pendingCleanup)
+		}
+
+		l.cleanup[job.RequestID] = &pendingCleanup{job: job, deregistered: deregistered}
+	}
+
+	select {
+	case l.cleanupWake <- struct{}{}:
+	default:
+	}
+
+	return true
+}
+
+// deregisterBeforeParking claims a finished runner for retirement and withdraws its
+// registration, and reports whether that is done. A failure is for the cleanup loop,
+// which runs the same two steps again before it destroys anything.
+func (l *Listener) deregisterBeforeParking(ctx context.Context, job dispatch.Job) bool {
+	if job.RunnerName != "" {
+		if leaseID, ok := provider.LeaseOf(job.RunnerName); ok {
+			if err := l.alloc.RetirePoolRunner(ctx, leaseID); err != nil &&
+				!errors.Is(err, alloc.ErrLeaseNotFound) {
+				l.log.Error("could not mark a completed pool runner for retirement; the cleanup loop asks again",
+					"tier", l.tier, "runner", job.RunnerName, "error", err)
+
+				return false
+			}
+		}
+	}
+
+	lease, _, _ := l.completionRelease(job.RequestID)
+
+	if err := l.deregisterCompleted(ctx, job, lease); err != nil {
+		l.log.Warn("could not withdraw a finished runner's registration; its lease stays counted and "+
+			"the cleanup loop asks again", "tier", l.tier, "request", job.RequestID, "error", err)
+
+		return false
+	}
+
+	return true
+}
+
+// deregisteredWhenParked says whether this delivery's registration was already withdrawn
+// on its way to the cleanup loop.
+func (l *Listener) deregisteredWhenParked(job dispatch.Job) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	entry, parked := l.cleanup[job.RequestID]
+
+	return parked && entry.deregistered && entry.job.CompletionID == job.CompletionID
+}
+
+// cleanupOwns says whether the cleanup loop is responsible for this request's compute,
+// so a pool pass on the poll goroutine must not retire it as well. Waiting for every
+// teardown made that impossible, and a second destroy would spend a node command on
+// work already under way.
+func (l *Listener) cleanupOwns(requestID int64) bool {
+	if !l.backgroundLaunches {
+		return false
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	_, parked := l.cleanup[requestID]
+
+	return parked || l.destroying[requestID]
 }
 
 // launchRoom is how many more launches may start now.
@@ -281,7 +415,7 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 			answer.beside = beside
 
 			return answer
-		case <-l.launchEnded:
+		case <-l.loopWake:
 			if beside == nil {
 				beside = l.takeLaunchFailure()
 			}

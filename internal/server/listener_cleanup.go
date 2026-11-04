@@ -33,6 +33,10 @@ type pendingCleanup struct {
 	// retireOnly means teardown and capacity settlement are complete, but the
 	// durable tombstone still needs to be written before this id can be reused.
 	retireOnly bool
+	// deregistered means the loop withdrew this completion's GitHub registration before
+	// parking it, so the destroy need not ask GitHub a second time. In memory only: a
+	// restart asks again, which is safe because a removal is idempotent.
+	deregistered bool
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
@@ -86,6 +90,8 @@ func (l *Listener) cleanupLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			l.retryCleanup(ctx)
+		case <-l.cleanupWake:
+			l.retryCleanup(ctx)
 		}
 	}
 }
@@ -129,6 +135,12 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	// told.
 	for i := range pending {
 		l.attempt(ctx, pending[i])
+	}
+
+	// WHAT THOSE RELEASED IS ROOM, and a tier waiting for it buys now rather than on its
+	// next poll, which is up to a long poll away.
+	if len(pending) > 0 {
+		l.wakeLoop()
 	}
 }
 

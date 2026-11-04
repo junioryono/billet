@@ -200,11 +200,13 @@ type Listener struct {
 	backgroundLaunches bool
 	// flights is each lease whose background launch has not returned, under mu, and
 	// launchFailure the first error one returned; launchSlots bounds how many run at
-	// once, launchEnded wakes the loop when one ends, and launches joins them all.
+	// once, loopWake wakes the loop when one ends or a teardown frees room, cleanupWake
+	// wakes the cleanup loop for a completion just parked, and launches joins them all.
 	flights       map[string]*launchFlight
 	launchFailure error
 	launchSlots   chan struct{}
-	launchEnded   chan struct{}
+	loopWake      chan struct{}
+	cleanupWake   chan struct{}
 	launches      sync.WaitGroup
 	// batchBuying is set, under mu, while a pool pass buys its batch, and
 	// batchBought records that it bought: the admission order re-dates the tier
@@ -466,7 +468,8 @@ type openedSession struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
-		launchEnded:   make(chan struct{}, 1),
+		loopWake:      make(chan struct{}, 1),
+		cleanupWake:   make(chan struct{}, 1),
 		alloc:         a,
 		tier:          tier,
 		session:       session,

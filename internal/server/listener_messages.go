@@ -182,6 +182,9 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if disposition != state.PendingCompletionActionable {
 			continue
 		}
+		if l.backgroundLaunches && l.parkCompletion(ctx, job) {
+			continue
+		}
 		l.complete(ctx, job)
 	}
 

@@ -33,7 +33,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	for i := range runners {
-		if runners[i].Status == alloc.PoolRunnerRetiring && !l.launchInFlight(runners[i].LeaseID) {
+		if runners[i].Status == alloc.PoolRunnerRetiring && !l.launchInFlight(runners[i].LeaseID) &&
+			!l.cleanupOwns(runners[i].LaunchRequestID) {
 			l.retirePoolMember(ctx, runners[i])
 		}
 	}
@@ -215,7 +216,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		if surplus == 0 {
 			break
 		}
-		if runners[i].Status != alloc.PoolRunnerIdle || l.launchInFlight(runners[i].LeaseID) {
+		if runners[i].Status != alloc.PoolRunnerIdle || l.launchInFlight(runners[i].LeaseID) ||
+			l.cleanupOwns(runners[i].LaunchRequestID) {
 			continue
 		}
 		if err := l.alloc.RetirePoolRunner(ctx, runners[i].LeaseID); err != nil {
