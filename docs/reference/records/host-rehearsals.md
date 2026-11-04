@@ -103,6 +103,8 @@ What these runs do not prove:
 - A controller cut off from the database but not from its nodes keeps them until it reaches the database again, which is not rehearsed ([PostgreSQL and active-passive](../../deploying/postgres-and-active-passive.md)).
 - The partition drops one container's packets on one bridge; it is not a lost link between two machines.
 
+**2026-11-04 (UTC), once more on the shared Linux test host, on the tree's own package (`0.0.0-SNAPSHOT-b8c4891a`), for #684.** The rehearsal's new step passed on real hosts: one node was moved off a controller's list onto the other alone through the decision, `billet node migrate-endpoint`, the controller's confirmation and the receipt, which read schema 1, and back onto both, which read schema 2; a rendering in another order planned no move, and the refresh found the receipt current. The failover's segments stayed where they were: a partition promoted in 22.2 s with every node registered 2.4 s later, and a kill promoted in 0.9 s with every node registered 0.2 s later, against the target of 10; the sessions GitHub holds opened 23.5 to 23.9 s and 54.5 to 55.0 s after those promotions. 404 seconds end to end.
+
 ## The retained-node retirement
 
 **2026-09-19 (UTC), `scripts/gates/dist.sh && scripts/retirement-rehearsal.sh` twice on GitHub-hosted amd64 runners, on the tree's own package, dispatched as `only=retirement`. The first run (35411568410) found a production defect and stopped there, which is the rehearsal working; the second (35413076992) passed in 257 seconds with the fix.** An attempt before both, on this Mac at 00:51:20Z, skipped for want of `BILLET_REHEARSAL_APP_CONFIG` and `BILLET_REHEARSAL_APP_KEY` and measured nothing at all.
