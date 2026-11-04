@@ -71,7 +71,7 @@ GitHub's store gave this host about 54 to 64 MiB/s on 8 streams. A volume per ar
 `TestRealArchiveStore` ran on the same host on 2026-11-04, under the node's own role with exactly the policy the module renders, through billet's own signer, in 2.25 s. What a fake accepts and S3 might not, and did not refuse:
 
 - `UNSIGNED-PAYLOAD` over TLS on a streamed put, and on a part and a completion.
-- A commit whose declared size differs, refused before S3 is asked for anything.
+- A commit whose declared size differs, refused from the listing of its blocks, before a multipart upload is started.
 - `UploadPartCopy` of a staged block above the part minimum followed by a smaller last one, and `CompleteMultipartUpload` with `If-None-Match: *` over a free key.
 - The same completion over a taken key, which S3 answers with a status billet reads as the second writer having lost, and the metadata on the object read back with `HeadObject` to tell whose it is.
 - `AbortMultipartUpload`, twice, the second of an upload already gone.
