@@ -3,7 +3,13 @@ package nodeplane
 import (
 	"errors"
 	"slices"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/nodeapi"
 )
 
 // A CONTROLLER THAT REPLACED ANOTHER KNOWS NOTHING OF WHO HOLDS WHAT (#685), so a
@@ -96,6 +102,16 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n2", incarnation: "p9"}) },
 			owner: leaseOwner{node: "n2", incarnation: "p9"},
 		},
+		// THE NODE DECIDES, whatever the process is called: neither of these is this
+		// node's to take, though each incarnation matches one of its processes.
+		"another host's, under the claimant's incarnation": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n2", incarnation: "p1"}) },
+			owner: leaseOwner{node: "n2", incarnation: "p1"},
+		},
+		"another host's, under the current process's incarnation": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n2", incarnation: "p2"}) },
+			owner: leaseOwner{node: "n2", incarnation: "p2"},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -178,5 +194,148 @@ func TestAClaimSurvivesTheRegistrationThatFollowsIt(t *testing.T) {
 
 	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p1" || owner.requestID != 7 {
 		t.Fatalf("the owner is %+v (ok=%v), want the claimant", owner, ok)
+	}
+}
+
+// awaitQueued waits until a bound destroy is queued for n1.
+func awaitQueued(t *testing.T, p *Plane) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for p.QueuedForTest("n1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the destroy was never queued")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A COMPLETION RESTORED AT A NEW PLANE'S START REACHES A PROCESS BEFORE THE ONE THAT HOLDS
+// THE COMPUTE HAS CLAIMED IT. The process the ledger guessed at does not report the lease,
+// so it would answer truthfully that it has nothing to remove and the lease would be
+// released under the guest. Held back for the window, and asked as ever after it; a
+// process that does report the lease, or whose report is unknown, is asked at once.
+func TestARestoredCompletionWaitsForAClaimOnAProcessThatDoesNotReportTheLease(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		report     func(p *Plane)
+		sinceStart time.Duration
+		asked      bool
+	}{
+		{"not reported, inside the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+			p.AdoptOwnership("n1", "p2", []string{"l9"})
+		}, custodyClaimWindow - time.Second, false},
+		{"not reported, past the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+			p.AdoptOwnership("n1", "p2", []string{"l9"})
+		}, custodyClaimWindow, true},
+		{"reported, inside the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
+		}, 0, true},
+		{"unknown, inside the window", func(p *Plane) {
+			p.AdoptOwnership("n1", "p2", []string{"l9"})
+		}, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				mu  sync.Mutex
+				now = time.Now()
+			)
+
+			p := testPlane(t, WithRegistrar(newLedger()), WithClock(func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+
+				return now
+			}))
+			p.SetPollWindowForTest(20 * time.Millisecond)
+			registerAs(t, p, "p2")
+			tc.report(p)
+
+			mu.Lock()
+			now = now.Add(tc.sinceStart)
+			mu.Unlock()
+
+			// STILL THE NODE'S CURRENT PROCESS at the later clock, which silence would end.
+			p.Seen("n1", "p2")
+
+			done := make(chan error, 1)
+			go func() {
+				done <- p.NewRunner().DestroyCompletedBound(
+					t.Context(), 7, "Succeeded", "l9", "n1", 1, alloc.PhaseDone, dispatch.CacheAuthority{})
+			}()
+
+			if !tc.asked {
+				if err := <-done; !errors.Is(err, dispatch.ErrHolderUnavailable) {
+					t.Fatalf("DestroyCompletedBound = %v, want the holder unavailable", err)
+				}
+
+				if n := p.QueuedForTest("n1"); n != 0 {
+					t.Fatalf("%d commands were queued for a process that was not to be asked", n)
+				}
+
+				return
+			}
+
+			awaitQueued(t, p)
+
+			cmd, took, err := p.Poll(t.Context(), "n1", "p2")
+			if err != nil || !took || cmd.Kind != nodeapi.CommandDestroy {
+				t.Fatalf("Poll = %+v, %v, %v, want the destroy", cmd, took, err)
+			}
+
+			if err := p.Result("n1", "p2", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+
+			if err := <-done; err != nil {
+				t.Fatalf("DestroyCompletedBound = %v", err)
+			}
+		})
+	}
+}
+
+// A CLAIM THAT LANDS WHILE A DESTROY IS OUT MAKES THE ANSWER WORTH NOTHING: the process
+// asked answers for itself, and the compute is the claimant's. The completion is told the
+// holder is unavailable, and the claimant's record stands.
+func TestAClaimLandingDuringADestroyStandsAndTheAnswerDoesNot(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	p.SetPollWindowForTest(20 * time.Millisecond)
+	registerAs(t, p, "p2")
+	p.AdoptOwnership("n1", "p2", []string{"l9"})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.NewRunner().DestroyCompletedBound(
+			t.Context(), 7, "Succeeded", "l9", "n1", 1, alloc.PhaseDone, dispatch.CacheAuthority{})
+	}()
+
+	awaitQueued(t, p)
+
+	cmd, took, err := p.Poll(t.Context(), "n1", "p2")
+	if err != nil || !took {
+		t.Fatalf("Poll = %+v, %v, %v", cmd, took, err)
+	}
+
+	p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}})
+
+	if err := p.Result("n1", "p2", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+
+	if err := <-done; !errors.Is(err, dispatch.ErrHolderUnavailable) {
+		t.Fatalf("DestroyCompletedBound = %v, want the holder unavailable", err)
+	}
+
+	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p1" {
+		t.Fatalf("the owner is %+v (ok=%v), want the claimant still", owner, ok)
 	}
 }

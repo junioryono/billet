@@ -56,6 +56,16 @@ var ErrTakeCustody = errors.New("nodeplane: this launch's lease is now the node'
 // unknown and the lease is kept — see Runner.Launch.
 const defaultCommandTimeout = 10 * time.Minute
 
+// custodyClaimWindow is how long after a plane's first registration a completion's
+// destroy is held back from a process that holds a lease only by adoption and does not
+// report it. A superseded process running that compute may not have reached this plane
+// yet, and its claim comes every 10 s; the process asked here would answer truthfully
+// that it has nothing to remove, and the lease would be released under the guest.
+//
+// IT HOLDS A DESTROY BACK AND AUTHORISES NOTHING: past it the answer is what it always
+// was, and the completion is retried on its own pacing.
+const custodyClaimWindow = 30 * time.Second
+
 // defaultPollTimeout bounds a command long-poll.
 //
 // Short enough that a node notices a dead connection promptly, long enough that
@@ -88,6 +98,10 @@ type Plane struct {
 	// commandTimeout bounds a caller's wait, NOT the node's work. Expiring it
 	// says the outcome is unknown, never that nothing happened.
 	commandTimeout time.Duration
+
+	// firstRegistered is when this plane first accepted a registration, from which
+	// custodyClaimWindow runs. Guarded by mu.
+	firstRegistered time.Time
 
 	mu    sync.Mutex
 	nodes map[string]*node
@@ -1372,6 +1386,10 @@ func (p *Plane) register(
 	}
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
+	if p.firstRegistered.IsZero() {
+		p.firstRegistered = p.now()
+	}
+
 	n.lastSeen = p.now()
 
 	// NEVER BACKWARDS. Expiry presents this token to its fenced ledger write, so
@@ -1690,6 +1708,17 @@ func (p *Plane) forgetForRequestLocked(requestID int64) {
 			delete(p.owners, id)
 		}
 	}
+}
+
+// ownedByAnother reports whether a lease's record now names a process other than this
+// one, as a claim landing while a destroy was out leaves it.
+func (p *Plane) ownedByAnother(leaseID, incarnation string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	owner, owned := p.owners[leaseID]
+
+	return owned && owner.incarnation != incarnation
 }
 
 // tookCommand reports which process was handed this command.

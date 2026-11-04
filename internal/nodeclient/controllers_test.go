@@ -605,11 +605,12 @@ func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
 	const launched = "/v1/nodes/n1/launched"
 
 	// THE ORDINARY LOOP'S RECOVERY FAILS UNTIL THE STOP, whose own recovery is the one
-	// superseded: one superseded before the stop drains from the ordinary loop.
+	// superseded: one superseded before the stop drains from the ordinary loop. The
+	// refusal holds throughout, so no answer falls between the two.
 	var stopped atomic.Bool
 
 	a.mu.Lock()
-	a.unavailable = func(path string, _ int) bool { return path == launched && !stopped.Load() }
+	a.unavailable = func(path string, _ int) bool { return path == launched }
 	a.supersede = func(path string, _ int) bool { return path == launched && stopped.Load() }
 	a.mu.Unlock()
 
@@ -664,11 +665,12 @@ func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
 	const launched = "/v1/nodes/n1/launched"
 
 	// THE ORDINARY LOOP'S RECOVERY FAILS UNTIL THE STOP, whose own recovery is the one
-	// superseded: one superseded before the stop drains from the ordinary loop.
+	// superseded: one superseded before the stop drains from the ordinary loop. The
+	// refusal holds throughout, so no answer falls between the two.
 	var stopped atomic.Bool
 
 	a.mu.Lock()
-	a.unavailable = func(path string, _ int) bool { return path == launched && !stopped.Load() }
+	a.unavailable = func(path string, _ int) bool { return path == launched }
 	a.supersede = func(path string, _ int) bool { return path == launched && stopped.Load() }
 	a.mu.Unlock()
 

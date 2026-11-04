@@ -1,8 +1,10 @@
 package nodeclient_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"slices"
 	"sync"
@@ -455,7 +457,8 @@ func TestEveryWayOfBeingSupersededFollowsCustody(t *testing.T) {
 // A RECOVERY THAT HEARS IT WAS SUPERSEDED DOES NOT GO ROUND AGAIN. Another process
 // registered while this one was recovering, and treating that as an outage registers
 // again, which takes the name back from the process that holds it, and that process
-// then does the same.
+// then does the same. What it recovered before hearing is still answered, so Ready is
+// called for the wait, as a stop's drain calls it.
 func TestARecoverySupersededInTheOrdinaryLoopNeverRegistersAgain(t *testing.T) {
 	a := newController(t)
 
@@ -475,9 +478,26 @@ func TestARecoverySupersededInTheOrdinaryLoopNeverRegistersAgain(t *testing.T) {
 
 	compute := newFollowingCompute(c)
 
-	_, done, _ := runDraining(t, c, compute)
+	var ready atomic.Bool
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU: testNodeVCPU, Memory: testNodeMemory, Provider: config.ProviderDocker, Deployment: deployment,
+			Log: slog.New(slog.DiscardHandler), Backoff: 20 * time.Millisecond, SweepEvery: 10 * time.Millisecond,
+			DrainTimeout: time.Hour, Ready: func() { ready.Store(true) },
+		})
+	}()
 
 	waitFor(t, func() bool { return len(heard.first()) > 0 })
+
+	if !ready.Load() {
+		t.Fatal("the wait for what it recovered began with its guests unanswered")
+	}
 
 	if n := a.sent("/v1/register"); n != 1 {
 		t.Fatalf("the process registered %d times, want once", n)

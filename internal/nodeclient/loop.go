@@ -496,7 +496,14 @@ func register(
 		if err := compute.Recover(ctx); err != nil {
 			// SUPERSEDED WHILE RECOVERING IS STILL SUPERSEDED, and going round again would
 			// register, which takes the name back from the process that holds it.
+			//
+			// AND WHAT IT RECOVERED BEFORE HEARING IS ANSWERED: the guests this wait is for
+			// reach the caches Ready opens, which nothing else in this path reaches.
 			if errors.Is(err, ErrSuperseded) {
+				if opts.Ready != nil {
+					opts.Ready()
+				}
+
 				drain(ctx, c, compute, log, opts)
 
 				return fmt.Errorf("this node has been superseded: %w", err)

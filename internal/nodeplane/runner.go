@@ -219,6 +219,11 @@ func (r *Runner) DestroyCompletedBound(
 		return fmt.Errorf("node %s could not destroy request %d: %s",
 			nodeName, requestID, res.Error)
 	}
+	// A CLAIM LANDED WHILE THIS WAS OUT, so what the process answered says nothing about
+	// the compute the claimant holds, and forgetting the record would take it from them.
+	if r.plane.ownedByAnother(leaseID, incarnation) {
+		return completionHolderUnavailable(nodeName, requestID)
+	}
 	r.plane.ForgetLease(nodeName, leaseID)
 
 	return nil
@@ -695,6 +700,15 @@ func (p *Plane) dispatchBound(
 	}
 
 	if owner.node != nodeName || n.incarnation != owner.incarnation {
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", false, nil
+	}
+
+	// AN ADOPTION OF WHAT THE PROCESS DOES NOT REPORT IS THE LEDGER'S GUESS, and its
+	// answer would be no evidence while a claim may still be on its way.
+	if owner.requestID == 0 && n.inventoryKnown && !n.inventory[leaseID] &&
+		p.now().Before(p.firstRegistered.Add(custodyClaimWindow)) {
 		p.mu.Unlock()
 
 		return nodeapi.CommandResult{}, "", false, nil

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -118,11 +119,18 @@ type readingStore struct {
 
 	reads       atomic.Int32
 	openAnswers int32
+	// onOpen runs as the last open answer is given.
+	onOpen func()
 }
 
 func (s *readingStore) Lease(ctx context.Context, id string) (*alloc.Lease, error) {
-	if n := s.reads.Add(1); s.openAnswers > 0 && n > s.openAnswers {
+	n := s.reads.Add(1)
+	if s.openAnswers > 0 && n > s.openAnswers {
 		return nil, alloc.ErrLeaseNotFound
+	}
+
+	if s.onOpen != nil && n == s.openAnswers {
+		s.onOpen()
 	}
 
 	return s.fakeStore.Lease(ctx, id)
@@ -190,6 +198,63 @@ func TestALeaseThatEndsDuringItsClaimIsForgotten(t *testing.T) {
 
 	if _, known := p.OwnerOfRequest(7); known {
 		t.Fatal("a lease that ended still answers for its request")
+	}
+}
+
+// cancellingStore ends a request's context before its read back of what the claim added,
+// as a process whose last release ends its wait does, and answers honestly about a lease
+// only a live context may read.
+type cancellingStore struct {
+	*readingStore
+}
+
+func (s *cancellingStore) Lease(ctx context.Context, id string) (*alloc.Lease, error) {
+	if s.reads.Load() >= s.openAnswers && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	return s.readingStore.Lease(ctx, id)
+}
+
+// A CLAIM WHOSE REQUEST IS CANCELLED STILL READS BACK WHAT IT ADDED. The process's last
+// release is what ends its wait and cancels its claim, which is exactly when the lease
+// has just ended, and nothing would ever name the record left behind.
+func TestALeaseThatEndsDuringACancelledClaimIsForgotten(t *testing.T) {
+	t.Parallel()
+
+	store := &cancellingStore{readingStore: &readingStore{
+		fakeStore:   &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}},
+		openAnswers: 1,
+	}}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	store.onOpen = cancel
+
+	p, base := serve(t, store)
+	c := dial(t, base)
+
+	if _, err := c.ClaimCustody(ctx, []string{"l1"}); err == nil {
+		t.Log("the answer arrived before the cancellation")
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for store.reads.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the claim never read back what it added")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	waitForForgotten := time.Now().Add(10 * time.Second)
+	for p.OwnsForTest("l1", "n1", c.Incarnation()) {
+		if time.Now().After(waitForForgotten) {
+			t.Fatal("the claim left an owner for a lease that ended")
+		}
+
+		time.Sleep(time.Millisecond)
 	}
 }
 

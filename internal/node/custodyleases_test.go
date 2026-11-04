@@ -36,6 +36,12 @@ func TestAProcessNamesEveryLeaseItHoldsComputeFor(t *testing.T) {
 			t.Helper()
 			t.Cleanup(r.holdWhileLaunching(a.lease(), "billet-launching"))
 		}},
+		{"in custody and launching, named once", func(t *testing.T, r *Runner, a *leaseMaker) {
+			t.Helper()
+			a.launch(t, r)
+			r.Superseded()
+			t.Cleanup(r.holdWhileLaunching(a.lease(), "billet-launching"))
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

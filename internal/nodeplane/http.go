@@ -1526,6 +1526,9 @@ func (h *handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 // maxCustodyClaim bounds one claim: more leases than a fleet at its target holds.
 const maxCustodyClaim = 4096
 
+// custodyClaimRecheck bounds reading back what one claim added.
+const custodyClaimRecheck = 5 * time.Second
+
 // claimCustody is a superseded process saying what it holds (Plane.ClaimCustody).
 // THE LEDGER DECIDES WHAT MAY BE CLAIMED, read before the plane's mutex is taken: a
 // lease it holds no row for is over and needs no owner, and one it places on another
@@ -1590,8 +1593,13 @@ func (h *handler) claimCustody(w http.ResponseWriter, r *http.Request) {
 	// nothing else would ever name the record just written. Asked after the write, so a
 	// release is either seen here or forgets the record itself. A store that could not
 	// answer keeps it: could-not-tell is not an end, and the process may still hold it.
+	// NOT ON THE REQUEST'S CONTEXT, which the process's last release may be cancelling:
+	// it stops following as its wait ends, and that is when this race is won.
+	lookup, stopLookup := context.WithTimeout(context.WithoutCancel(r.Context()), custodyClaimRecheck)
+	defer stopLookup()
+
 	for _, id := range added {
-		if _, err := h.store.Lease(r.Context(), id); errors.Is(err, alloc.ErrLeaseNotFound) {
+		if _, err := h.store.Lease(lookup, id); errors.Is(err, alloc.ErrLeaseNotFound) {
 			h.plane.ForgetLease(node, id)
 			held = slices.DeleteFunc(held, func(heldID string) bool { return heldID == id })
 		}
