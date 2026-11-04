@@ -2,7 +2,9 @@ package fleetops
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -28,6 +31,11 @@ func finishUsageLeases(t *testing.T, stateDir string, n int) []string {
 	t.Helper()
 
 	seedLedger(t, stateDir)
+
+	// What the control plane that finished these minted on its first start.
+	if _, err := state.DeploymentID(stateDir); err != nil {
+		t.Fatalf("mint the deployment identity: %v", err)
+	}
 
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
@@ -582,6 +590,7 @@ func TestAnOverflowingLeaseIsUnknownNotNegative(t *testing.T) {
 
 	row := knownUsageRow()
 	row.PriceMicrosPerHour = math.MaxInt64
+	row.FinishedAt = "2026-11-03T12:00:00.000000000Z"
 
 	r := newUsageRecord(usageConfig(t, 0), usageDeployment, row)
 	if r.CostMicros != nil || r.Unknown["cost_micros"] == "" {
@@ -662,7 +671,7 @@ func TestTheTextExportEndsWithTheCursor(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("want a header, two rows and a cursor, got:\n%s", out.String())
 	}
-	if !strings.HasPrefix(lines[3], "cursor u1.") || !strings.HasSuffix(lines[3], "."+finished[1]) {
+	if !strings.HasPrefix(lines[3], "cursor u1.") || !strings.Contains(lines[3], "."+finished[1]+".") {
 		t.Errorf("the last line is %q, want the last lease's cursor", lines[3])
 	}
 
@@ -673,6 +682,77 @@ func TestTheTextExportEndsWithTheCursor(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "no finished lease past this cursor") {
 		t.Errorf("a caught-up export said:\n%s", out.String())
+	}
+}
+
+// A LEDGER WITH NO IDENTITY IS REFUSED, and none is minted: records labelled with one
+// this command just made would be another deployment's history under a new name.
+func TestUsageNeverMintsAnIdentity(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeJobsConfig(t, stateDir)
+	seedLedger(t, stateDir)
+
+	env, _ := bufferedEnv()
+
+	err := Usage(t.Context(), env, []string{"export", "--config", cfg})
+	if err == nil || !strings.Contains(err.Error(), "holds no deployment identity") {
+		t.Fatalf("got %v, want a refusal naming the missing identity", err)
+	}
+
+	if _, found, err := state.PeekDeploymentID(stateDir); err != nil || found {
+		t.Fatalf("after the refusal the identity is found=%v, %v; the command minted one", found, err)
+	}
+}
+
+// A LEASE STILL WAITING FOR ITS NUMBER IS SAID ON STANDARD ERROR, and never as a record:
+// a reader caught up to the end has not read the whole history until this stops.
+func TestAnExportSaysWhenOlderLeasesAreStillBeingNumbered(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeJobsConfig(t, stateDir)
+
+	finishUsageLeases(t, stateDir, 1)
+
+	run := func() (string, string) {
+		t.Helper()
+
+		var out, errs bytes.Buffer
+
+		env := cli.Env{Stdout: &out, Stderr: &errs, Stdin: strings.NewReader(""), Getenv: os.Getenv}
+		if err := Usage(t.Context(), env, []string{"export", "--config", cfg, "--json"}); err != nil {
+			t.Fatalf("billet usage export: %v", err)
+		}
+
+		return out.String(), errs.String()
+	}
+
+	if _, errs := run(); strings.Contains(errs, "still being numbered") {
+		t.Fatalf("nothing is waiting and the export said:\n%s", errs)
+	}
+
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `INSERT INTO job_history (lease_id, tier, queued_at, finished_at)
+			VALUES ('`+strings.Repeat("a", 32)+`', 'billet-2vcpu', 't', '2026-01-01T00:00:00.000000000Z')`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the ledger: %v", err)
+	}
+
+	out, errs := run()
+	if !strings.Contains(errs, "still being numbered") {
+		t.Errorf("a lease is waiting and standard error said %q", errs)
+	}
+	if strings.Contains(out, strings.Repeat("a", 32)) || strings.Contains(out, "still being numbered") {
+		t.Errorf("the waiting lease reached the records:\n%s", out)
 	}
 }
 

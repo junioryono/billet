@@ -87,6 +87,19 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// SAID BESIDE THE RECORDS, NEVER IN THEM: a reader caught up to the end has not read
+	// the whole history while older leases still wait for a number. They follow in later
+	// runs, past the cursor it holds, and nothing is skipped.
+	waiting, err := db.UsageStillNumbering(ctx)
+	if err != nil {
+		return err
+	}
+
+	if waiting {
+		fmt.Fprintln(env.Stderr, "billet usage export: leases that finished before this release are still being "+
+			"numbered; they follow in later runs, past this cursor")
+	}
+
 	records := make([]usageRecord, 0, len(rows))
 	for i := range rows {
 		records = append(records, newUsageRecord(cfg, deployment, &rows[i]))

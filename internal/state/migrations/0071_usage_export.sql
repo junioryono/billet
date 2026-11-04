@@ -2,11 +2,12 @@
 --
 -- WHAT LETS A BILLING SYSTEM READ EACH FINISHED LEASE EXACTLY ONCE (#559).
 --
--- usage_seq is the lease's place in the order leases finished in, written once,
--- in the transaction that closes the lease. finished_at cannot be a cursor: it is
--- the controller's wall clock, which steps, and which a failover replaces with
--- another machine's, so a lease can close with an earlier time than one an
--- exporter has already read. Zero means the lease has not finished.
+-- usage_seq is the lease's place in the order leases were numbered in, written
+-- once, in the transaction that closes the lease. finished_at cannot be a cursor:
+-- it is the controller's wall clock, which steps, and which a failover replaces
+-- with another machine's, so a lease can close with an earlier time than one an
+-- exporter has already read. Zero means the lease has not finished, or finished
+-- before this migration and is still waiting for its number.
 --
 -- usage_sequence is the last number handed out, a row and not a sequence or a
 -- MAX, BECAUSE THE ROW'S LOCK IS WHAT MAKES THE ORDER SAFE TO READ, whatever else
@@ -26,10 +27,14 @@
 -- may rename or give to another target (#93). Empty means no registration was
 -- minted for the lease, or the row was written before this migration.
 --
--- THE BACKFILL NUMBERS WHAT HAS ALREADY FINISHED, oldest first, so a deployment's
--- history is exportable and not only what ends after this upgrade. Order by the
--- clock is the best a past row offers, and it is written once: nothing has read
--- these numbers yet, so nothing can have read past one.
+-- NOTHING IS NUMBERED HERE, AND THAT IS THE POINT. Rewriting every finished row in a
+-- migration took 69 seconds for a million rows on PostgreSQL and 2m20s for five
+-- million on SQLite (a loaded test host, 2026-11-04), against a startup budget of 30
+-- seconds: a ledger past that fails the same migration on every restart and never
+-- starts. The control plane numbers what had already finished in small batches
+-- instead, which job_history_usage_unnumbered finds, and a lease that closes after
+-- this migration is numbered as it closes. Numbers are a place in the order of being
+-- numbered, not of finishing, so a late batch breaks nothing a reader relies on.
 --
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
 -- Reformat one tab and every ledger that applied this migration refuses to open.
@@ -50,19 +55,10 @@ CREATE TABLE usage_sequence (
 -- +billet:end
 
 -- +billet:statement
-UPDATE job_history
-   SET usage_seq = numbered.n
-  FROM (SELECT lease_id, ROW_NUMBER() OVER (ORDER BY finished_at, lease_id) AS n
-          FROM job_history
-         WHERE finished_at IS NOT NULL AND finished_at != '') AS numbered
- WHERE numbered.lease_id = job_history.lease_id
--- +billet:end
-
--- +billet:statement
-INSERT INTO usage_sequence (id, last)
-SELECT 1, top.n FROM (SELECT MAX(usage_seq) AS n FROM job_history) AS top WHERE top.n > 0
--- +billet:end
-
--- +billet:statement
 CREATE UNIQUE INDEX job_history_usage_seq ON job_history (usage_seq) WHERE usage_seq > 0
+-- +billet:end
+
+-- +billet:statement
+CREATE INDEX job_history_usage_unnumbered ON job_history (finished_at, lease_id)
+ WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != ''
 -- +billet:end

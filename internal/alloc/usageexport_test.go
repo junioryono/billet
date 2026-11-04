@@ -2,8 +2,11 @@ package alloc
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -194,5 +197,107 @@ func TestAReaderNeverSeesAUsageNumberBeforeALowerOne(t *testing.T) {
 	}
 	if len(seen) != closes {
 		t.Fatalf("the reader saw %d of %d closed leases", len(seen), closes)
+	}
+}
+
+// THE LEASES THAT FINISHED BEFORE THERE WERE NUMBERS TAKE THEIR PLACE IN BATCHES, beside
+// leases closing now, and a reader past any number finds each of them exactly once.
+func TestLeasesThatFinishedBeforeNumbersAreNumberedInBatches(t *testing.T) {
+	db := openTestLedger(t)
+
+	a, err := New(db, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("linux", 1, config.GiB)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mustRegister(t, a, NodeRegistration{Name: "epyc-1", Provider: config.ProviderFirecracker,
+		VCPU: 8, Memory: 16 * config.GiB})
+
+	// A HISTORY FROM BEFORE THE MIGRATION: finished, with no number, oldest first by
+	// its clock whatever order it was written in.
+	older := []string{strings.Repeat("c", 32), strings.Repeat("a", 32), strings.Repeat("b", 32)}
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for i, lease := range older {
+			if _, err := tx.ExecContext(t.Context(), fmt.Sprintf(`INSERT INTO job_history
+				(lease_id, tier, queued_at, finished_at) VALUES ('%s', 'linux', 't', '2026-01-0%d')`,
+				lease, i+1)); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	listed, err := a.UnnumberedUsage(t.Context(), 2)
+	if err != nil {
+		t.Fatalf("UnnumberedUsage: %v", err)
+	}
+	if want := older[:2]; !slices.Equal(listed, want) {
+		t.Fatalf("listed %v, want the oldest two %v", listed, want)
+	}
+
+	// A LEASE CLOSES BETWEEN THE LISTING AND THE BATCH, as one does on a running plane.
+	closing := reserve(t, a, "linux")
+	if err := a.Release(t.Context(), closing.ID, closing.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	numbered, err := a.NumberUsage(t.Context(), listed)
+	if err != nil || numbered != 2 {
+		t.Fatalf("NumberUsage = %d, %v; want 2", numbered, err)
+	}
+
+	// AN ATTEMPT TO NUMBER THEM AGAIN MOVES NOTHING, and burns its numbers harmlessly.
+	if again, err := a.NumberUsage(t.Context(), listed); err != nil || again != 0 {
+		t.Fatalf("a second batch numbered %d, %v; want 0", again, err)
+	}
+
+	rest, err := a.UnnumberedUsage(t.Context(), 10)
+	if err != nil {
+		t.Fatalf("UnnumberedUsage: %v", err)
+	}
+	if !slices.Equal(rest, older[2:]) {
+		t.Fatalf("left %v, want %v", rest, older[2:])
+	}
+
+	if _, err := a.NumberUsage(t.Context(), rest); err != nil {
+		t.Fatalf("NumberUsage: %v", err)
+	}
+
+	waiting, err := db.UsageStillNumbering(t.Context())
+	if err != nil || waiting {
+		t.Fatalf("UsageStillNumbering = %v, %v; nothing is left", waiting, err)
+	}
+
+	var (
+		got  []string
+		last int64
+	)
+
+	for {
+		rows, err := db.UsageSince(t.Context(), last, 2)
+		if err != nil {
+			t.Fatalf("UsageSince: %v", err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, r := range rows {
+			if r.Sequence <= last {
+				t.Fatalf("%d came after %d", r.Sequence, last)
+			}
+
+			got = append(got, r.LeaseID)
+			last = r.Sequence
+		}
+	}
+
+	want := []string{closing.ID, older[0], older[1], older[2]}
+	if !slices.Equal(got, want) {
+		t.Fatalf("the export reads %v, want each lease once, in the order it was numbered: %v", got, want)
 	}
 }

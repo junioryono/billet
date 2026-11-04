@@ -82,3 +82,23 @@ func (db *DB) UsageRecordAt(ctx context.Context, sequence int64) (UsageClose, er
 
 	return out, err
 }
+
+// UsageStillNumbering reports whether a lease that finished before there were numbers
+// is still waiting for one, which a reader caught up to the end would otherwise take
+// for the whole history.
+func (db *DB) UsageStillNumbering(ctx context.Context) (bool, error) {
+	var waiting bool
+
+	err := db.View(ctx, func(tx Querier) error {
+		var err error
+
+		waiting, err = ReadQueries(tx).ReadAnyUnnumberedUsage(ctx)
+		if err != nil {
+			return fmt.Errorf("state: read whether usage is still being numbered: %w", err)
+		}
+
+		return nil
+	})
+
+	return waiting, err
+}

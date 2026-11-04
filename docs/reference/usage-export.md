@@ -18,9 +18,11 @@ It runs on the control plane, beside a running server, and opens the ledger the 
 
 Run it, keep the last record's `cursor`, and run it again with `--since` that cursor. A run that prints nothing has caught up. **A lease appears exactly once across any sequence of cursors**, through restarts, failovers and clock steps, with no gaps:
 
-- Each lease takes the next number when it closes, in the transaction that closes it. The number is the lease's place in the order leases finished in, and it never changes.
+- Each lease takes the next number when it closes, in the transaction that closes it. The number is the lease's place in the order leases were numbered in, and it never changes.
 - The number comes from a counter row that the closing transaction holds locked until it commits, so a number becomes visible only after every lower one. A reader that has seen N will never later find a lower number.
 - Filtering is on the number alone. `finished_at` is a wall clock, which steps, and which a failover replaces with another machine's.
+
+**A lease that finished before this release takes its number later,** in small batches the control plane works through in the background, so an upgrade never waits on a long history. Numbers are a place in the order of being numbered, not of finishing: `started_at` and `finished_at` say when a lease ran, and a billing period is the consumer's to cut from them. The command says on its standard error when older leases are still waiting, and they follow in later runs past the cursor it holds, with nothing skipped.
 
 A cursor is opaque: it names the deployment, the number, the lease and that lease's close. Store it and pass it back whole. An exporter that stores it after writing the records it covers reads a record twice at worst, after a crash between the two, and `lease_id` tells it so; one that stores it before can lose one.
 
@@ -36,7 +38,7 @@ Times are RFC 3339 on billet's clock, and durations are seconds to the milliseco
 |---|---|
 | `schema` | this format's number, 1. A change a consumer would have to read differently is a new number |
 | `cursor` | what to pass to `--since` to read past this record |
-| `sequence` | the lease's place in the order leases finished in |
+| `sequence` | the lease's place in the order leases were numbered in |
 | `lease_id` | the lease |
 | `deployment` | the deployment's identity |
 | `target` | the GitHub path of the owner the lease's runner was registered on: `owner` or `owner/name` |
