@@ -74,8 +74,8 @@ server:
   listen: 127.0.0.1:17001
   bootstrap_listen: 127.0.0.1:17002
   tls_router:
-    node_addr: a.nodes.example.com:443
-    enroll_addr: a.enroll.example.com:443
+    node_addr: a.nodes.billet.example:443
+    enroll_addr: a.enroll.billet.example:443
 ```
 
 With `tls_router` a loopback wire serves mutual TLS, which a loopback wire otherwise does not, and the certificate it presents names those two addresses. They are DNS names because a client sends no SNI for an IP address, so the router could not route it; each deployment's two listeners have a name each, because the node wire demands a client certificate in the handshake and enrollment cannot. `billet ca token` prints these addresses for a joining machine. A node on the same host dials the router like any other, with a certificate: a `node` block in this file takes `node_addr` as its `server_addr`, and any other address is refused.
@@ -84,75 +84,14 @@ The router's rule is that **a connection with no SNI, or naming no deployment, i
 
 **The reference configuration is HAProxy,** at `deploy/router/haproxy.cfg` in the repository; billet's test suite runs that file through the whole scenario. Add a `use_backend` and a backend per listener per deployment:
 
-```
-# The reference router for many billet deployments behind one address: TLS
-# passthrough by SNI, so a node's connection reaches its own deployment and TLS stays
-# end to end. docs/deploying/many-deployments.md says how to use it.
-#
-# internal/e2e/router_haproxy_test.go runs THIS FILE, with the two deployments below
-# at the ports its test gives them, so an edit here is an edit to what was tested.
-#
-# THIS ROUTER HOLDS NO KEY AND TERMINATES NOTHING. There is no `ssl` on any bind or
-# server line and no certificate anywhere in this file. HAProxy reads the name from
-# the ClientHello, in the clear, and copies bytes.
-#
-# ONE ROUTE PER LISTENER PER DEPLOYMENT, each its own name: the node wire demands a
-# client certificate in the handshake and enrollment cannot, so a deployment's two
-# listeners are two backends. Add both for each deployment you serve.
-#
-# METRICS HAVE NO ROUTE. A deployment's metrics endpoint stays on loopback, and is
-# scraped there.
-
-global
-    log stderr format short daemon notice
-    # What one host of nodes and enrolling machines may hold open at once. A node
-    # holds a connection for as long as it runs.
-    maxconn 20000
-
-defaults
-    mode tcp
-    log global
-    option tcplog
-    timeout connect 5s
-    # LONGER THAN THE NODE WIRE'S 120 SECONDS OF IDLE, which is what should end an
-    # idle connection, so that a command poll is never cut by this hop.
-    timeout client 5m
-    timeout server 5m
-
-frontend billet
-    # The port your nodes dial. `server.tls_router` in each deployment's config states
-    # the address nodes reach it by, port included.
-    bind :443
-
-    # WAIT FOR THE CLIENTHELLO AND REFUSE ANYTHING THAT IS NOT ONE. Without the wait
-    # the name is not read yet when the routes below are judged, and every connection
-    # would match none of them.
-    tcp-request inspect-delay 5s
-    tcp-request content accept if { req.ssl_hello_type 1 }
-    tcp-request content reject
-
-    # NO default_backend, AND THAT IS THE RULE: a connection with no SNI, or naming no
-    # deployment, is refused here, never sent to somebody's control plane. A node that
-    # dials this address by IP sends no SNI at all, so it lands there too.
-    use_backend deployment-a-nodes if { req.ssl_sni -i a.nodes.billet.example }
-    use_backend deployment-a-enroll if { req.ssl_sni -i a.enroll.billet.example }
-    use_backend deployment-b-nodes if { req.ssl_sni -i b.nodes.billet.example }
-    use_backend deployment-b-enroll if { req.ssl_sni -i b.enroll.billet.example }
-
-# Each deployment's `server.listen` and `server.bootstrap_listen`, on loopback.
-backend deployment-a-nodes
-    server plane 127.0.0.1:17001
-
-backend deployment-a-enroll
-    server plane 127.0.0.1:17002
-
-backend deployment-b-nodes
-    server plane 127.0.0.1:17003
-
-backend deployment-b-enroll
-    server plane 127.0.0.1:17004
+```{literalinclude} ../../deploy/router/haproxy.cfg
+:language: text
 ```
 
 **The metrics endpoint stays on loopback,** with no route through the router: scrape it from the host.
 
-**What a deployment sees of a routed connection is the router's address, and nothing reads it.** The wire's two connection budgets count connections rather than addresses, so nothing here needs the PROXY protocol, and no deployment speaks it. They are per deployment, so one deployment's traffic cannot use up another's. What they do not do is limit one source address; a limiter in front belongs on the router.
+**What a deployment sees of a routed connection is the router's address, and nothing reads it.** The wire's two connection budgets count connections rather than addresses, so nothing here needs the PROXY protocol, and no deployment speaks it. They are per deployment, so one deployment's traffic cannot use up another's on its own listeners. **The router is shared, though:** every deployment behind it has the one `maxconn`, and the reference file limits one source address to 2000 connections so that a stranger's silent connections cannot hold them all. Raise that past the most nodes you have behind one NAT.
+
+**A node dialling the router by IP address gets no explanation.** It sends no SNI, so the router refuses it, and on the node that reads as a connection failing and retrying without end. Set `server_addr` to the name in `node_addr`.
+
+**An active-passive pair needs a router on each controller,** or a router that can reach both, because the listeners stay on loopback. `billet server retire` asks for `--endpoint-failover-verified` here, because a routed node endpoint is always a DNS name.

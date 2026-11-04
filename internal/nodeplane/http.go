@@ -2720,7 +2720,7 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 //
 // config.LoopbackAddr answers the same question for validation, and the two must
 // agree: whether a node needs a certificate is decided by whether the listener
-// will ask for one.
+// will ask for one, which behind a TLS router it does on loopback too.
 //
 // Until mTLS lands the node names itself in the path and nothing verifies that
 // claim, so a listener reachable beyond this host would let anything on the

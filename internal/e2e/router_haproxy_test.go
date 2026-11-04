@@ -2,6 +2,10 @@ package e2e
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -9,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -41,11 +46,129 @@ func TestTheReferenceRouterConfigurationRoutesTwoDeployments(t *testing.T) {
 		"127.0.0.1:17004": b.stack.assembled.wire.Bootstrap,
 	}))
 
+	// A HELLO IN TWO SEGMENTS STILL ROUTES. A real one can cross a segment boundary, with a
+	// post-quantum key share, and loopback's MTU would otherwise never show it; the router
+	// has to wait for all of it rather than judge what arrived first.
+	if err := handshakeSplit(t, addr, a.names.enroll); err != nil {
+		t.Errorf("a ClientHello in two segments did not reach its deployment: %v", err)
+	}
+
 	exerciseTwoDeployments(t, a, b, addr)
 }
 
+// handshakeSplit completes a handshake through addr with its ClientHello split in two.
+func handshakeSplit(t *testing.T, addr, name string) error {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	var d net.Dialer
+
+	raw, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+
+	conf := insecureHello()
+	conf.ServerName = name
+
+	conn := tls.Client(&splitFirstWrite{Conn: raw}, conf)
+	defer func() { _ = conn.Close() }()
+
+	return conn.HandshakeContext(ctx)
+}
+
+// splitFirstWrite sends its first write as two segments, apart in time.
+type splitFirstWrite struct {
+	net.Conn
+
+	split bool
+}
+
+func (c *splitFirstWrite) Write(p []byte) (int, error) {
+	if c.split || len(p) < 2 {
+		return c.Conn.Write(p)
+	}
+
+	c.split = true
+	half := len(p) / 2
+
+	if _, err := c.Conn.Write(p[:half]); err != nil {
+		return 0, err
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	n, err := c.Conn.Write(p[half:])
+
+	return half + n, err
+}
+
+// ONE SOURCE CANNOT HOLD THE BUDGET EVERY DEPLOYMENT SHARES. The shipped limit, lowered so a
+// test can reach it: the sources holding their places keep them, and the next is refused
+// as it connects, rather than waiting out the inspect delay in a place of its own.
+func TestTheReferenceRouterRefusesASourcePastItsLimit(t *testing.T) {
+	binary, err := exec.LookPath("haproxy")
+	if err != nil {
+		if os.Getenv(haproxyRequiredEnv) == "required" {
+			t.Fatalf("%s=required and haproxy is not installed: %v", haproxyRequiredEnv, err)
+		}
+
+		t.Skipf("haproxy is not installed; set %s=required to make that a failure", haproxyRequiredEnv)
+	}
+
+	const shipped = "sc0_conn_cur gt 2000"
+
+	body := readRouterFile(t)
+	if strings.Count(body, shipped) != 1 {
+		t.Fatalf("the reference configuration has no %q", shipped)
+	}
+
+	addr := startHAProxy(t, binary, strings.Replace(body, shipped, "sc0_conn_cur gt 2", 1))
+
+	var d net.Dialer
+
+	dial := func() net.Conn {
+		t.Helper()
+
+		conn, err := d.DialContext(t.Context(), "tcp", addr)
+		if err != nil {
+			t.Fatalf("dial the router: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+
+		return conn
+	}
+
+	// startHAProxy's own probes have gone, but give the table a moment to see them go.
+	time.Sleep(200 * time.Millisecond)
+
+	held := []net.Conn{dial(), dial()}
+
+	refused := dial()
+	if err := refused.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set a deadline: %v", err)
+	}
+
+	if _, err := refused.Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+		t.Errorf("the connection past the limit answered %v, want it closed as it connected", err)
+	}
+
+	for i, conn := range held {
+		if err := conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			t.Fatalf("set a deadline: %v", err)
+		}
+
+		var timeout net.Error
+		if _, err := conn.Read(make([]byte, 1)); !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Errorf("connection %d inside the limit answered %v, want it still waiting", i, err)
+		}
+	}
+}
+
 // THE REFERENCE FILE KEEPS THE RULES IT STATES, in the file an operator copies: no
-// certificate, no default route, and nothing routed to a metrics port.
+// certificate and no default route.
 func TestTheReferenceRouterConfigurationHoldsNoKeyAndNoDefault(t *testing.T) {
 	t.Parallel()
 
@@ -65,6 +188,7 @@ func TestTheReferenceRouterConfigurationHoldsNoKeyAndNoDefault(t *testing.T) {
 		"mode tcp",
 		"tcp-request content accept if { req.ssl_hello_type 1 }",
 		"tcp-request content reject",
+		"tcp-request connection track-sc0 src",
 	} {
 		found := false
 
@@ -74,6 +198,33 @@ func TestTheReferenceRouterConfigurationHoldsNoKeyAndNoDefault(t *testing.T) {
 
 		if !found {
 			t.Errorf("the reference configuration has no line %q", want)
+		}
+	}
+}
+
+// THE DOCUMENT SHOWS THE FILE THAT WAS TESTED, included and never copied, and its example
+// names the names that file routes, so copying both as written works.
+func TestTheGuideShowsTheTestedRouterFile(t *testing.T) {
+	t.Parallel()
+
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "deploying", "many-deployments.md"))
+	if err != nil {
+		t.Fatalf("read the guide: %v", err)
+	}
+
+	if !strings.Contains(string(doc), "```{literalinclude} ../../deploy/router/haproxy.cfg") {
+		t.Error("the guide does not include deploy/router/haproxy.cfg")
+	}
+
+	if strings.Contains(string(doc), "use_backend deployment-") {
+		t.Error("the guide holds a copy of the router's routes, which nothing tests")
+	}
+
+	body := readRouterFile(t)
+
+	for _, name := range []string{"a.nodes.billet.example", "a.enroll.billet.example"} {
+		if !strings.Contains(string(doc), name+":443") || !strings.Contains(body, name) {
+			t.Errorf("%s is not named in both the guide's config and the router's file", name)
 		}
 	}
 }
@@ -156,7 +307,7 @@ func startHAProxy(t *testing.T, binary, config string) string {
 	t.Cleanup(func() {
 		cancel()
 
-		_ = cmd.Wait()
+		_ = cmd.Wait() //nolint:errcheck // cancelled above, so its status only says it was killed
 
 		if t.Failed() {
 			t.Logf("haproxy said:\n%s", logged.String())

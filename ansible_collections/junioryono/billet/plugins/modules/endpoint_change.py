@@ -11,8 +11,8 @@ node endpoint with the rendering's through the one endpoint representation
 (`module_utils/endpoint.py`, held to the same vector table as the Go one) and
 refuses a difference before anything is stopped. Each side's endpoint is
 derived as billet's config loader derives it: `node.server_addr` when it is
-written, else the server section's `listen` (which itself defaults to
-127.0.0.1:7717) when a server section exists, else none; the scheme is
+written, else the server section's `tls_router.node_addr` or its `listen` (which
+itself defaults to 127.0.0.1:7717) when a server section exists, else none; the scheme is
 `node.tls`'s. A CHANGE IS TWO ENDPOINTS THAT DIFFER: a side without a node
 section (no node installed yet, or the node removed) names none, and a node's
 first start or its removal is not a migration, so those compare as unchanged.

@@ -75,7 +75,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild`; `simulated` is billet's own test-only backend and is refused anywhere in a configuration |
 | `site` | no | one of the control plane's `sites`; required with `ebs_s3`; refused on `codebuild` |
 | `max_vcpu`, `max_memory` | for `ec2` and `codebuild` | what this host contributes; detected on a host backend when unset |
-| `tls.cert`, `tls.key`, `tls.ca` | for a non-loopback `server_addr` | from `billet ca issue` or enrollment; refused against a loopback server |
+| `tls.cert`, `tls.key`, `tls.ca` | for a non-loopback `server_addr` | from `billet ca issue` or enrollment; refused against a loopback server, unless `tls_router` says a router fronts it |
 | `lock_dir`, `allow_unlocked_deployment` | no | the host-wide deployment lock; a shared directory must be setgid; failing to place the lock is an error unless opted out |
 | `state_dir` | yes | generation pointers, image cache, the node's identity |
 | `max_custody` | no | a bound on compute billet is holding without a completion; empty means none, and a job killed by it is archived failed |

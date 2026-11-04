@@ -90,3 +90,24 @@ func TestTheEnrollmentFlagIsPrintedOnlyWhenThereIsOne(t *testing.T) {
 		})
 	}
 }
+
+// BEHIND A ROUTER A JOINING MACHINE IS TOLD THE ROUTER'S NAMES. The listen address is loopback
+// there: printed, it has a machine dial itself.
+func TestAJoinCommandBehindARouterNamesTheRouter(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Server: &config.ServerConfig{
+		Listen: "127.0.0.1:17001", BootstrapListen: "127.0.0.1:17002",
+		TLSRouter: &config.TLSRouterConfig{
+			NodeAddr: "a.nodes.billet.example:443", EnrollAddr: "a.enroll.billet.example:443",
+		},
+	}}
+
+	if got := nodeWireAddr(cfg); got != "a.nodes.billet.example:443" {
+		t.Errorf("nodeWireAddr = %q, want the router's address", got)
+	}
+
+	if got := enrollAddrFlag(cfg); got != " --bootstrap-addr a.enroll.billet.example:443" {
+		t.Errorf("enrollAddrFlag = %q, want the router's enrollment address", got)
+	}
+}

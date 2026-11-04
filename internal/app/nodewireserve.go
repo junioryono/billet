@@ -225,7 +225,7 @@ func ServeNodeWire(
 	// A ROUTER IS BETWEEN THIS LISTENER AND THE FLEET, so loopback here says nothing
 	// about who connects: the certificates still have to reach the deployment that
 	// issued them, and a passthrough router would carry a TLS client to a plain listener.
-	loopback := nodeplane.LoopbackOnly(addr) && cfg.Server.TLSRouter == nil
+	loopback := !cfg.Server.WireServesTLS()
 
 	// THE ACCESS AGAIN, AFTER PROMOTION: the authority load below reads (and
 	// on first use creates) the CA, and a retirement of this host cannot be

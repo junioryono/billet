@@ -469,6 +469,19 @@ func TestANodeBesideARoutedControlPlaneDialsTheRouter(t *testing.T) {
 		t.Errorf("node.server_addr defaulted to %q, want the router's address", cfg.Node.ServerAddr)
 	}
 
+	withEnrollment := strings.Replace(body(tls), "    node_addr: a.nodes.example.com:443\n",
+		"    node_addr: a.nodes.example.com:443\n    enroll_addr: a.enroll.example.com:443\n", 1)
+	withEnrollment = strings.Replace(withEnrollment, "  max_memory: 8GiB\n",
+		"  max_memory: 8GiB\n  bootstrap_listen: 127.0.0.1:7718\n", 1)
+
+	enrolling, err := loadServer(t, withEnrollment)
+	if err != nil {
+		t.Fatalf("a node beside a router with enrollment: %v", err)
+	}
+	if enrolling.Node.BootstrapAddr != "a.enroll.example.com:443" {
+		t.Errorf("node.bootstrap_addr defaulted to %q, want the router's enrollment address", enrolling.Node.BootstrapAddr)
+	}
+
 	if _, err := loadServer(t, body("  server_addr: A.Nodes.Example.com:443\n"+tls)); err != nil {
 		t.Errorf("another spelling of the router's address: %v", err)
 	}

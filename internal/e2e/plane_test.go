@@ -887,16 +887,17 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		guestCache *node.CacheService
 	)
 
-	if sc.wire && sc.noFirstNode {
+	switch {
+	case sc.wire && sc.noFirstNode:
 		wire, wireAddr = c.wire.Plane(), c.wire.Addr
-	} else if sc.wire {
+	case sc.wire:
 		first := startFirstNode(t, log, c, nodeProcess{
 			host: host, deployment: deployment, provider: prov, kind: kind,
 			hurry: hurry, drainTimeout: sc.nodeDrainTimeout, guestReports: sc.guestReports,
 		})
 		runner, stopNode, guestCache = first.runner, first.stop, first.guestCache
 		wire, wireAddr = c.wire.Plane(), c.wire.Addr
-	} else {
+	default:
 		// PRE-REGISTERED ONLY FOR THE IN-PROCESS STACK, and after the fleet was
 		// forgotten, as a registration over the wire would be. Over the wire the
 		// plane's own registration must write this row, so doing it there would

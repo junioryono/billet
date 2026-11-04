@@ -210,7 +210,11 @@ func (r *sniRouter) route(conn net.Conn) {
 		name string
 	)
 
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		r.refuse("no deadline")
+
+		return
+	}
 
 	// NOTHING IS WRITTEN BACK. The throwaway server reads through a tee and gives up
 	// the moment it has the hello, which is what "reads the name in the clear" means.
@@ -223,7 +227,7 @@ func (r *sniRouter) route(conn net.Conn) {
 		MinVersion: tls.VersionTLS12,
 	})
 
-	if err := hello.Handshake(); !errors.Is(err, errHelloRead) {
+	if err := hello.HandshakeContext(context.Background()); !errors.Is(err, errHelloRead) {
 		r.refuse("no hello")
 
 		return
@@ -236,7 +240,11 @@ func (r *sniRouter) route(conn net.Conn) {
 		return
 	}
 
-	_ = conn.SetReadDeadline(time.Time{})
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		r.refuse(name)
+
+		return
+	}
 
 	var d net.Dialer
 
@@ -260,11 +268,11 @@ func (r *sniRouter) route(conn net.Conn) {
 	done := make(chan struct{}, 2)
 
 	go func() {
-		_, _ = io.Copy(upstream, conn)
+		_, _ = io.Copy(upstream, conn) //nolint:errcheck // a copy ends when a side closes, which is how this one ends
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(conn, upstream)
+		_, _ = io.Copy(conn, upstream) //nolint:errcheck // a copy ends when a side closes, which is how this one ends
 		done <- struct{}{}
 	}()
 
@@ -507,7 +515,7 @@ func dialThrough(t *testing.T, routerAddr, serverName string, conf *tls.Config) 
 // insecureHello is a client that verifies nothing, for asking what a router does with a
 // name: the router is judged here, not the deployment behind it.
 func insecureHello() *tls.Config {
-	return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13} //nolint:gosec // see the doc comment
+	return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}
 }
 
 // exerciseTwoDeployments is the whole scenario, on whatever router it is handed: nodes
@@ -523,6 +531,8 @@ func exerciseTwoDeployments(t *testing.T, a, b *routedDeployment, routerAddr str
 
 	enrollThroughRouter(t, port, a, "router-node-a")
 	enrollThroughRouter(t, port, b, "router-node-b")
+
+	refuseAnothersJoinToken(t, port, a, b)
 
 	startRoutedNode(t, port, a, "router-node-a")
 	startRoutedNode(t, port, b, "router-node-b")
@@ -561,7 +571,7 @@ func exerciseTwoDeployments(t *testing.T, a, b *routedDeployment, routerAddr str
 	}
 
 	blind := nodeA.Clone()
-	blind.InsecureSkipVerify = true //nolint:gosec // what an attacker's client does, and B must still refuse it
+	blind.InsecureSkipVerify = true
 
 	if err := dialThrough(t, routerAddr, b.names.nodes, blind); err == nil {
 		t.Error("deployment B's wire served a certificate deployment A's authority signed")
@@ -598,6 +608,47 @@ func exerciseTwoDeployments(t *testing.T, a, b *routedDeployment, routerAddr str
 		if err == nil {
 			t.Errorf("a connection naming %q completed a handshake through the router", name)
 		}
+	}
+}
+
+// refuseAnothersJoinToken presents A's join token at B's enrollment: the one credential a
+// machine with no certificate has, at the deployment it was not issued for.
+func refuseAnothersJoinToken(t *testing.T, routerPort string, a, b *routedDeployment) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+
+	deployment, err := state.DeploymentID(b.stack.dir)
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	authority, err := wirecert.LoadServing(b.stack.dir, deployment)
+	if err != nil {
+		t.Fatalf("LoadServing: %v", err)
+	}
+
+	base := "https://" + net.JoinHostPort(b.names.enroll, routerPort)
+
+	caPEM, _, err := nodeclient.FetchCA(ctx, base, authority.Issuing.Fingerprint())
+	if err != nil {
+		t.Fatalf("read B's authority through the router: %v", err)
+	}
+
+	token, err := a.stack.alloc.NewJoinToken(ctx, time.Hour, 1, "deployment A's token")
+	if err != nil {
+		t.Fatalf("NewJoinToken: %v", err)
+	}
+
+	csrPEM, _, err := wirecert.NewNodeCSR("crossing-node")
+	if err != nil {
+		t.Fatalf("NewNodeCSR: %v", err)
+	}
+
+	_, _, err = nodeclient.Enroll(ctx, base, "crossing-node", token, caPEM, csrPEM)
+	if err == nil || errors.Is(err, nodeclient.ErrNotApproved) {
+		t.Errorf("deployment B took deployment A's join token: %v", err)
 	}
 }
 
@@ -668,7 +719,7 @@ func TestABehindARouterDeploymentPresentsTheNamesNodesDial(t *testing.T) {
 	defer func() { _ = raw.Close() }()
 
 	conn := tls.Client(raw, &tls.Config{
-		InsecureSkipVerify: true, //nolint:gosec // reading the certificate is the point
+		InsecureSkipVerify: true,
 		ServerName:         deploymentANames.enroll, MinVersion: tls.VersionTLS13,
 	})
 	if err := conn.HandshakeContext(ctx); err != nil {
@@ -687,19 +738,21 @@ func TestABehindARouterDeploymentPresentsTheNamesNodesDial(t *testing.T) {
 		t.Error("the certificate names the loopback address a node never dials")
 	}
 
-	// AND THE NODE WIRE ON LOOPBACK ASKS FOR A CERTIFICATE: a client presenting none
-	// cannot be served, over TLS or in plain HTTP.
-	plain, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+s.assembled.wire.Addr+"/v1/ca", http.NoBody)
+	// AND THE NODE WIRE ON LOOPBACK SERVES TLS AND NOTHING ELSE: the listener handshakes before
+	// anything reads a request, so plain HTTP gets no answer at all, where a plain wire would
+	// route it and answer something.
+	plain, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+s.assembled.wire.Addr+"/v1/register", http.NoBody)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
 
-	if resp, err := http.DefaultClient.Do(plain); err == nil {
-		_ = resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			t.Error("the loopback node wire answered plain HTTP behind a router")
+	resp, err := http.DefaultClient.Do(plain)
+	if err == nil {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close: %v", err)
 		}
+
+		t.Errorf("plain HTTP to a loopback wire behind a router answered %s", resp.Status)
 	}
 }
 
@@ -733,12 +786,12 @@ func TestEveryNodeWireClientSendsTheConfiguredName(t *testing.T) {
 			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
 				seen <- info.ServerName
 
-				return nil, nil //nolint:nilnil // keep the config this was asked from
+				return nil, nil
 			},
 		},
 	}
 
-	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	go func() { _ = srv.ServeTLS(ln, "", "") }() //nolint:errcheck // it ends with this test's Close, and says so
 
 	t.Cleanup(func() { _ = srv.Close() })
 
@@ -784,7 +837,7 @@ func TestEveryNodeWireClientSendsTheConfiguredName(t *testing.T) {
 			return nc.Register(ctx, nodeclient.Registration{Provider: config.ProviderSimulated, VCPU: 1, Memory: config.GiB}) //nolint:wrapcheck // the answer is not the subject
 		},
 	} {
-		_ = ask()
+		_ = ask() //nolint:errcheck // what the server saw is the subject, not what it answered
 
 		select {
 		case got := <-seen:

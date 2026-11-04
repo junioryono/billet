@@ -408,6 +408,12 @@ func (c *Config) applyDefaults() {
 			}
 		}
 
+		// AND ITS ENROLLMENT BY THE OTHER NAME: the node wire demands a certificate in the
+		// handshake, so falling back to it fails in words that name no cause.
+		if c.Node.BootstrapAddr == "" && c.Server != nil && c.Server.TLSRouter != nil {
+			c.Node.BootstrapAddr = c.Server.TLSRouter.EnrollAddr
+		}
+
 		// A fleet entry for THIS host that omits its provider takes the local
 		// one. Without it the unpinned-tier check compares against an empty
 		// provider and skips the host entirely — and in single-box mode that is
