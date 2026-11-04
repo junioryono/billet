@@ -361,6 +361,11 @@ func TestAWideTierIsHeldAHostAndGetsIt(t *testing.T) {
 		t.Errorf("the small tier holds %d leases on the open host; want it full, 4", open)
 	}
 
+	// THE ONLY ROOM NOW IS THE HELD HOST'S, AND A REFUSAL SAYS SO.
+	if got := smallL.roomRefusal(t.Context(), nil).String(); !strings.Contains(got, held[0]+" for b-wide") {
+		t.Errorf("the small tier's refusal reads %q; want the held host and its owner", got)
+	}
+
 	if err := smallL.reconcilePool(t.Context(), 20); err != nil {
 		t.Fatalf("small reconcile: %v", err)
 	}

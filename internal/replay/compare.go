@@ -27,6 +27,14 @@ var DefaultPolicies = []Policy{
 	{Name: "hold", Order: config.AdmissionHold},
 }
 
+// RecordPolicies are what the record also measures, by name through
+// BILLET_REPLAY_POLICY: each order with the placement it is judged beside.
+var RecordPolicies = append(slices.Clone(DefaultPolicies),
+	Policy{Name: "fair-tightest", Order: config.AdmissionFair, Placement: config.PlacementTightest},
+	Policy{Name: "fill-tightest", Order: config.AdmissionFill, Placement: config.PlacementTightest},
+	Policy{Name: "hold-tightest", Order: config.AdmissionHold, Placement: config.PlacementTightest},
+)
+
 // Comparison is one trace replayed under several policies, each report in the
 // policies' order.
 type Comparison struct {

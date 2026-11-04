@@ -737,12 +737,12 @@ func TestComparePolicies(t *testing.T) {
 	// comparison can run as processes side by side.
 	policies, only := DefaultPolicies, os.Getenv("BILLET_REPLAY_POLICY")
 	if only != "" {
-		i := slices.IndexFunc(DefaultPolicies, func(p Policy) bool { return p.Name == only })
+		i := slices.IndexFunc(RecordPolicies, func(p Policy) bool { return p.Name == only })
 		if i < 0 {
-			t.Fatalf("BILLET_REPLAY_POLICY=%q is none of the default policies", only)
+			t.Fatalf("BILLET_REPLAY_POLICY=%q is none of the record's policies", only)
 		}
 
-		policies = DefaultPolicies[i : i+1]
+		policies = RecordPolicies[i : i+1]
 	}
 
 	table := Compare(t, fleet, trace, policies, opts).Markdown()

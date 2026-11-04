@@ -107,10 +107,10 @@ func TestHoldCandidatesFollowTheLearnedRuntimes(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 	a := holdFleet(t, &now)
 
-	// A tier's own jobs ran a minute, three times, so its level is known: small-a is
-	// short, and small-b, with no history, takes the default.
+	// A tier's own jobs ran a minute, three times, so its level is known: small-b is
+	// short, and small-a, with no history, takes the default.
 	for range 3 {
-		lease := startRunning(t, a, "small-a")
+		lease := startRunning(t, a, "small-b")
 
 		now = now.Add(time.Minute)
 		if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
@@ -130,8 +130,8 @@ func TestHoldCandidatesFollowTheLearnedRuntimes(t *testing.T) {
 		t.Fatalf("HoldCandidates: %v", err)
 	}
 
-	if !slices.Equal(candidateNames(got), []string{"a", "b"}) {
-		t.Errorf("the candidates are %v; want a, whose jobs are known to be short, first", got)
+	if !slices.Equal(candidateNames(got), []string{"b", "a"}) {
+		t.Errorf("the candidates are %v; want b, whose jobs are known to be short, first", got)
 	}
 }
 
@@ -191,6 +191,30 @@ func TestAHostRunningALeaseAsLargeAsTheShapeIsNotACandidate(t *testing.T) {
 	}
 }
 
+// A LEASE NOT YET STARTED IS PREDICTED FROM NOW, not from no start at all, which would
+// read as a job overdue by years.
+func TestAHoldPredictsALeaseNotYetStartedFromNow(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	a := holdFleet(t, &now)
+
+	if _, err := a.Reserve(t.Context(), "small-a"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if _, err := a.Reserve(t.Context(), "small-b"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	got, err := a.HoldCandidates(t.Context(), "wide", nil)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("HoldCandidates: %v, %v", got, err)
+	}
+
+	if want := now.Add(DefaultRuntime); !got[0].ReadyAt.Equal(want) {
+		t.Errorf("a host running a lease not yet started is ready at %s; want %s", got[0].ReadyAt, want)
+	}
+}
+
 // A SHAPE THAT FITS NOW HAS NOTHING TO HOLD FOR, unless the only room is on a host held
 // for another tier, when it may be held another.
 func TestAShapeThatFitsNowHasNoCandidates(t *testing.T) {
@@ -226,10 +250,13 @@ func TestARemoteHostOrAMacIsNotHeld(t *testing.T) {
 	spanning.Providers = []config.ProviderKind{config.ProviderDocker, config.ProviderEC2}
 	spanning.Image = "ami-1"
 
-	mac := tier("mac", 16, 64*config.GiB)
+	mac := tier("mac", 8, 32*config.GiB)
 	mac.Provider, mac.GuestOS, mac.Node = config.ProviderTart, config.GuestMacOS, "mac-1"
 
-	a := holdFleet(t, &now, spanning, mac)
+	macSmall := tier("mac-small", 2, 8*config.GiB)
+	macSmall.Provider, macSmall.GuestOS, macSmall.Node = config.ProviderTart, config.GuestMacOS, "mac-1"
+
+	a := holdFleet(t, &now, spanning, mac, macSmall)
 
 	mustRegister(t, a, NodeRegistration{
 		Name: "cloud", Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
@@ -237,6 +264,12 @@ func TestARemoteHostOrAMacIsNotHeld(t *testing.T) {
 	})
 	mustRegister(t, a, NodeRegistration{Name: "mac-1", Provider: config.ProviderTart, VCPU: 16, Memory: 64 * config.GiB})
 
+	for range config.DefaultMacOSVMLimit {
+		startRunning(t, a, "mac-small")
+	}
+
+	// Its slots spent by smaller guests, with the vCPU free, so only the exemption
+	// stands between it and the host.
 	if got, err := a.HoldCandidates(t.Context(), "mac", nil); err != nil || got != nil {
 		t.Errorf("a macOS tier's candidates are %v, %v; want none", got, err)
 	}
@@ -375,5 +408,67 @@ func TestConcurrentPurchasesAvoidingAHostNeverOvercommit(t *testing.T) {
 		if lease.TargetNode != "b" {
 			t.Errorf("a lease was placed on %s", lease.TargetNode)
 		}
+	}
+}
+
+// TIGHTEST PREFERS THE HOST LEFT WITH THE LEAST ROOM, in shares of its size, where pack
+// sees two hosts that each fit the same number of this tier as alike and takes the name.
+func TestTightestPrefersTheHostLeftWithTheLeastRoom(t *testing.T) {
+	small := tier("small", 4, 8*config.GiB)
+	small.Provider = config.ProviderDocker
+
+	filler := tier("filler", 2, 4*config.GiB)
+	filler.Provider, filler.Node = config.ProviderDocker, "z-host"
+
+	place := func(policy config.PlacementPolicy) string {
+		t.Helper()
+
+		a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB}, []config.Tier{small, filler},
+			WithPlacement(policy))
+
+		mustRegister(t, a, NodeRegistration{Name: "a-host", Provider: config.ProviderDocker, VCPU: 16, Memory: 32 * config.GiB})
+		mustRegister(t, a, NodeRegistration{Name: "z-host", Provider: config.ProviderDocker, VCPU: 16, Memory: 32 * config.GiB})
+
+		// z-host has 14 vCPU left: three more of small, as a-host's 16 fits four.
+		if _, err := a.Reserve(t.Context(), "filler"); err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+
+		lease, err := a.Reserve(t.Context(), "small")
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+
+		return lease.TargetNode
+	}
+
+	if got := place(config.PlacementTightest); got != "z-host" {
+		t.Errorf("tightest placed on %s; want the host with less left", got)
+	}
+
+	if got := place(config.PlacementSpread); got != "a-host" {
+		t.Errorf("spread placed on %s; want the emptier host", got)
+	}
+
+	// A host's size is what its room is a share of: 8 left of 8 is more than 8 of 64.
+	bigSmall := func() string {
+		t.Helper()
+
+		a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB}, []config.Tier{small},
+			WithPlacement(config.PlacementTightest))
+
+		mustRegister(t, a, NodeRegistration{Name: "a-small", Provider: config.ProviderDocker, VCPU: 8, Memory: 16 * config.GiB})
+		mustRegister(t, a, NodeRegistration{Name: "z-large", Provider: config.ProviderDocker, VCPU: 64, Memory: 128 * config.GiB})
+
+		lease, err := a.Reserve(t.Context(), "small")
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+
+		return lease.TargetNode
+	}
+
+	if got := bigSmall(); got != "a-small" {
+		t.Errorf("tightest placed on %s; want the host left with the smaller share, half of itself against 15/16", got)
 	}
 }

@@ -43,6 +43,8 @@ type placer struct {
 	rank map[string]int
 	// policy decides between hosts that preference cannot separate.
 	policy config.PlacementPolicy
+	// sizes is each host's whole size, read only under tightest.
+	sizes map[string]nodeRow
 }
 
 // fleet is what every machine has left, measured once.
@@ -213,6 +215,13 @@ func (f *fleet) forTier(
 		cost, ok := n.cost(t)
 		if ok {
 			p.cost[n.name] = cost
+		}
+	}
+
+	if p.policy == config.PlacementTightest {
+		p.sizes = make(map[string]nodeRow, len(nodes))
+		for _, n := range nodes {
+			p.sizes[n.name] = n
 		}
 	}
 
@@ -449,10 +458,36 @@ func (p *placer) clone() *placer {
 	return &clone
 }
 
+// leftOver is what a host would have free after one more lease, in shares of its
+// own size, vCPU and memory together, so a large host and a small one compare.
+func (p *placer) leftOver(node string) float64 {
+	cost, size := p.cost[node], p.sizes[node]
+
+	var out float64
+
+	if size.vcpu > 0 {
+		out += float64(p.freeVCPU[node]-cost.vcpu) / float64(size.vcpu)
+	}
+
+	if size.memory > 0 {
+		out += float64(p.freeMemory[node]-cost.memory) / float64(size.memory)
+	}
+
+	return out
+}
+
 // better reports whether a should be chosen over b for this tier.
 func (p *placer) better(a, b string, t config.Tier) bool {
 	if p.rank[a] != p.rank[b] {
 		return p.rank[a] < p.rank[b]
+	}
+
+	if p.policy == config.PlacementTightest {
+		if leftA, leftB := p.leftOver(a), p.leftOver(b); leftA != leftB {
+			return leftA < leftB
+		}
+
+		return a < b
 	}
 
 	if roomA, roomB := p.roomFor(a, t), p.roomFor(b, t); roomA != roomB {

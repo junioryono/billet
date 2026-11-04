@@ -644,6 +644,18 @@ func TestATargetWeightIsRefusedUnderFill(t *testing.T) {
 		t.Errorf("a weight under fair was refused: %v", err)
 	}
 
+	cfg, err := Load(writeConfig(t, order(weighted, "hold")))
+	if err != nil {
+		t.Errorf("a weight under hold was refused: %v", err)
+	} else if cfg.Server.Order() != AdmissionHold {
+		t.Errorf("the order is %q; want hold", cfg.Server.Order())
+	}
+
+	if _, err := Load(writeConfig(t, order(body, "holds"))); err == nil ||
+		!strings.Contains(err.Error(), `server.admission_order is "holds"`) {
+		t.Errorf("a misspelt order gave %v; want it refused", err)
+	}
+
 	if _, err := Load(writeConfig(t, order(body, "fill"))); err != nil {
 		t.Errorf("fill with no weight was refused: %v", err)
 	}
