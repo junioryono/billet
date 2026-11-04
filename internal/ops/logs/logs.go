@@ -280,7 +280,7 @@ func (c *jobCache) of(ctx context.Context, lease string) (*alloc.JobRecord, erro
 	if errors.Is(err, alloc.ErrLeaseNotFound) {
 		c.known[lease] = nil
 
-		return nil, nil
+		return nil, nil //nolint:nilnil // no job and no failure is the answer: a filter reads a line whose job has gone
 	}
 
 	if err != nil {

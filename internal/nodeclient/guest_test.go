@@ -335,7 +335,7 @@ func (p *logsPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(p.status)
-	_ = json.NewEncoder(w).Encode(nodeapi.ErrorResponse{Code: p.code, Message: "no"}) //nolint:errcheck // a test's stand-in, whose reader fails on what it lacks
+	_ = json.NewEncoder(w).Encode(nodeapi.ErrorResponse{Code: p.code, Message: "no"}) //nolint:errcheck,errchkjson // a test's stand-in, whose reader fails on what it lacks
 }
 
 // A CHUNK REACHES ITS ROUTE AS GIVEN; THE PLANE'S REFUSAL SAYS DO NOT SEND THIS AGAIN, AND ANY OTHER

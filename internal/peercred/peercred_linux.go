@@ -1,6 +1,6 @@
 //go:build linux
 
-package app
+package peercred
 
 import (
 	"net"
@@ -8,11 +8,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// peerUID is the user on the far end of conn, as the kernel recorded it when it connected.
-func peerUID(conn *net.UnixConn) (int, bool, error) {
+// UID is the user on the far end of conn, as the kernel recorded it when it connected.
+func UID(conn *net.UnixConn) (int, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
 
 	var (
@@ -23,12 +23,12 @@ func peerUID(conn *net.UnixConn) (int, bool, error) {
 	if err := raw.Control(func(fd uintptr) {
 		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
 	}); err != nil {
-		return 0, false, err
+		return 0, err
 	}
 
 	if credErr != nil {
-		return 0, false, credErr
+		return 0, credErr
 	}
 
-	return int(cred.Uid), true, nil
+	return int(cred.Uid), nil
 }
