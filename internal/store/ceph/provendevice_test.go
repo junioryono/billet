@@ -254,20 +254,27 @@ func TestGoneMeansTheImageIs(t *testing.T) {
 	for name, tc := range map[string]struct {
 		removed  bool
 		failing  bool
+		noPool   bool
 		wantGone bool
 	}{
 		"no row and the image is listed":       {},
 		"no row and the status cannot be read": {failing: true},
 		"no row and no image":                  {removed: true, wantGone: true},
+		// A POOL THAT WILL NOT OPEN ANSWERS ENOENT AS AN IMAGE DOES, and a renamed
+		// one still holds the volume.
+		"no row and the pool will not open": {removed: true, noPool: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			f := newCacheFake()
-			failing := false
+			failing, noPool := false, false
 			run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 				if failing && slices.Contains(args, "status") {
 					return nil, errors.New("exit status 1: rbd: the monitors did not answer")
+				}
+				if noPool && slices.Contains(args, "ls") {
+					return nil, errors.New("rbd: error opening pool 'billet-cache': (2) No such file or directory")
 				}
 
 				return f.run(ctx, bin, args)
@@ -277,7 +284,7 @@ func TestGoneMeansTheImageIs(t *testing.T) {
 			if tc.removed {
 				delete(f.images, volume.Handle)
 			}
-			failing = tc.failing
+			failing, noPool = tc.failing, tc.noPool
 
 			device, err := c.MappedDevice(t.Context(), volume)
 			if tc.wantGone {

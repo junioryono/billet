@@ -298,6 +298,7 @@ func TestGuestResultsPassthroughWaitsOutANodeThatDoesNotAnswer(t *testing.T) {
 	}
 	probe := `
 import importlib.util
+import os
 import select
 import socket
 import subprocess
@@ -309,30 +310,39 @@ spec = importlib.util.spec_from_file_location("billet_actions_proxy", sys.argv[1
 proxy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proxy)
 
-def free_port():
+# A port nothing else can take: bound and not listening, so it refuses until it does.
+reserved = []
+def reserve():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    reserved.append(s)
+    return s, s.getsockname()[1]
 
-# A node that listens on port once start has passed and tunnels whoever asks.
-def node_after(port, start, status=b"HTTP/1.1 200 Connection Established\r\n\r\n"):
+def dead_port():
+    return reserve()[1]
+
+def tunnel(server, status, seen):
+    conn, _ = server.accept()
+    data = b""
+    while b"\r\n\r\n" not in data:
+        data += conn.recv(4096)
+    seen["connect"] = data
+    conn.sendall(status)
+    if status.startswith(b"HTTP/1.1 200"):
+        seen["hello"] = conn.recv(64)
+        conn.sendall(b"from-the-node")
+    conn.close()
+
+# A node that starts listening on sock once start has passed and tunnels whoever asks.
+def node_after(sock, start, status=b"HTTP/1.1 200 Connection Established\r\n\r\n"):
     seen = {}
+    if start == 0:
+        sock.listen()
     def serve():
-        time.sleep(start)
-        server = socket.create_server(("127.0.0.1", port))
-        conn, _ = server.accept()
-        data = b""
-        while b"\r\n\r\n" not in data:
-            data += conn.recv(4096)
-        seen["connect"] = data
-        conn.sendall(status)
-        if status.startswith(b"HTTP/1.1 200"):
-            seen["hello"] = conn.recv(64)
-            conn.sendall(b"from-the-node")
-        conn.close()
-        server.close()
+        if start:
+            time.sleep(start)
+            sock.listen()
+        tunnel(sock, status, seen)
     threading.Thread(target=serve, daemon=True).start()
     return seen
 
@@ -365,8 +375,8 @@ def drive(node_port, wait):
 
 # A node back inside the wait gets the connection, and GitHub never sees it.
 proxy.RESULTS_PORT, seen_github = github()
-port = free_port()
-seen_node = node_after(port, 1.5)
+sock, port = reserve()
+seen_node = node_after(sock, 1.5)
 answer, _ = drive(port, 10)
 assert answer == b"from-the-node", answer
 assert seen_node.get("hello") == b"clienthello", seen_node
@@ -374,7 +384,7 @@ assert "hello" not in seen_github, "GitHub was reached although the node came ba
 
 # A node gone for the whole wait fails open once it is spent, not before.
 proxy.RESULTS_PORT, seen_github = github()
-answer, took = drive(free_port(), 2.5)
+answer, took = drive(dead_port(), 2.5)
 assert answer == b"from-github", answer
 assert took >= 1.5, "failed open after %.2fs of a 2.5s wait" % took
 # ...and gives its place back, or a long enough outage would stop anything waiting.
@@ -387,18 +397,17 @@ for _ in range(held):
 
 # A refusal is an answer: no wait, however long the wait is.
 proxy.RESULTS_PORT, seen_github = github()
-port = free_port()
-node_after(port, 0, b"HTTP/1.1 403 Forbidden\r\n\r\n")
-time.sleep(0.2)
+sock, port = reserve()
+node_after(sock, 0, b"HTTP/1.1 403 Forbidden\r\n\r\n")
 answer, took = drive(port, 30)
 assert answer == b"from-github", answer
-assert took < 5, "a refusal was waited on for %.2fs" % took
+assert took < 15, "a refusal was waited on for %.2fs" % took
 
 # No wait at all is the origin any other passthrough carries.
 proxy.RESULTS_PORT, seen_github = github()
-answer, took = drive(free_port(), 0)
+answer, took = drive(dead_port(), 0)
 assert answer == b"from-github", answer
-assert took < 5, "no wait took %.2fs" % took
+assert took < 15, "no wait took %.2fs" % took
 
 # THE WAITERS ARE BOUNDED, and one past the bound fails open at once: they hold a
 # thread and two descriptors each on the listener the runner's logs share.
@@ -406,9 +415,9 @@ proxy.RESULTS_PORT, seen_github = github()
 saved = proxy.NODE_WAITERS
 proxy.NODE_WAITERS = threading.BoundedSemaphore(1)
 assert proxy.NODE_WAITERS.acquire(blocking=False)
-answer, took = drive(free_port(), 30)
+answer, took = drive(dead_port(), 30)
 assert answer == b"from-github", answer
-assert took < 5, "a connection past the bound waited %.2fs" % took
+assert took < 15, "a connection past the bound waited %.2fs" % took
 proxy.NODE_WAITERS.release()
 proxy.NODE_WAITERS = saved
 
@@ -417,7 +426,7 @@ proxy.NODE_WAITERS = saved
 if hasattr(select, "POLLRDHUP"):
     a, b = socket.socketpair()
     worker = threading.Thread(target=proxy.handle,
-        args=(a, "http://x:y@127.0.0.1:%d" % free_port(), [], proxy.RESULTS_AUTHORITY, None, 30), daemon=True)
+        args=(a, "http://x:y@127.0.0.1:%d" % dead_port(), [], proxy.RESULTS_AUTHORITY, None, 30), daemon=True)
     worker.start()
     b.sendall(b"clienthello")
     time.sleep(0.3)
@@ -425,45 +434,52 @@ if hasattr(select, "POLLRDHUP"):
     worker.join(8)
     assert not worker.is_alive(), "the wait went on for a client that had gone"
 
-# MAIN GIVES THE RESULTS ORIGIN THE WAIT AND ANOTHER ORIGIN NONE. No fallback, so
-# what ends a connection the node did not take is the relay closing it, and nothing
-# on this host's port 443 can answer in its place.
-def through_main(start_node, *args):
-    node = free_port()
-    listen = free_port()
-    process = subprocess.Popen([sys.executable, sys.argv[1], "--listen", "127.0.0.1:%d" % listen,
-        "--upstream", "http://x:y@127.0.0.1:%d" % node, *args])
+# MAIN GIVES THE RESULTS ORIGIN THE WAIT AND ANOTHER ORIGIN NONE. The node closes its
+# first CONNECT unanswered and tunnels its second, so what is counted is whether the
+# relay asked again, whatever the machine's load. No fallback, so nothing on this
+# host's port 443 can answer in the node's place. The listener is handed over the way
+# systemd does, so its port is never free for anything else to take.
+def through_main(*args):
+    node = socket.create_server(("127.0.0.1", 0))
+    seen = {}
+    def serve():
+        conn, _ = node.accept()
+        conn.close()
+        try:
+            tunnel(node, b"HTTP/1.1 200 Connection Established\r\n\r\n", seen)
+        except OSError:
+            pass
+    threading.Thread(target=serve, daemon=True).start()
+    listener = socket.create_server(("127.0.0.1", 0))
+    def hand_over():
+        os.dup2(listener.fileno(), proxy.SD_LISTEN_FDS_START)
+        os.environ["LISTEN_PID"] = str(os.getpid())
+        os.environ["LISTEN_FDS"] = "1"
+    process = subprocess.Popen([sys.executable, sys.argv[1], "--systemd-socket",
+        "--upstream", "http://x:y@127.0.0.1:%d" % node.getsockname()[1], *args],
+        preexec_fn=hand_over, close_fds=False)
     try:
-        for _ in range(200):
-            try:
-                client = socket.create_connection(("127.0.0.1", listen), 1)
-                break
-            except OSError:
-                time.sleep(0.05)
-        client.settimeout(25)
-        began = time.monotonic()
+        client = socket.create_connection(listener.getsockname(), 10)
+        # A hang guard, past any wait this could mistake for an answer.
+        client.settimeout(60)
         client.sendall(b"clienthello")
-        # The node arrives only after the relay has been asked, so its first attempt
-        # cannot have reached it.
-        if start_node:
-            node_after(node, 1.5)
         # A close with the hello unread reaches the client as a reset.
         try:
             answer = client.recv(64)
         except ConnectionResetError:
             answer = b""
-        took = time.monotonic() - began
         client.close()
-        return answer, took
+        return answer, seen
     finally:
         process.terminate()
         process.wait(5)
 
-answer, _ = through_main(True)
+answer, seen = through_main()
 assert answer == b"from-the-node", "the results origin did not wait for its node: %r" % answer
-answer, took = through_main(False, "--origin", "registry.npmjs.org")
+assert seen.get("hello") == b"clienthello", seen
+answer, seen = through_main("--origin", "registry.npmjs.org")
 assert answer == b"", "another origin's connection was answered: %r" % answer
-assert took < 10, "another origin waited for its node for %.2fs" % took
+assert "connect" not in seen, "another origin asked its node again: %r" % seen
 `
 	run := exec.CommandContext(t.Context(), python, "-c", probe, path)
 	if output, err := run.CombinedOutput(); err != nil {

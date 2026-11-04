@@ -542,16 +542,23 @@ func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) 
 
 // imageExists reports whether an image is listed, as opposed to removed or in the
 // trash.
+//
+// ENOENT IS ALSO A POOL THAT WOULD NOT OPEN (rbd's Utils.cc, Ceph 20.2.3), and a pool
+// renamed for an hour still holds what its images wrote, so the pool has to open
+// before that answer says anything about the image.
 func (c *Client) imageExists(ctx context.Context, handle string) (bool, error) {
-	if _, err := c.rbdCmd(ctx, true, "status", handle); err != nil {
-		if isNoSuchFile(err) {
-			return false, nil
-		}
-
+	_, err := c.rbdCmd(ctx, true, "status", handle)
+	if err == nil {
+		return true, nil
+	}
+	if !isNoSuchFile(err) {
 		return false, fmt.Errorf("ceph: ask whether %s exists: %w", handle, err)
 	}
+	if _, err := c.rbdCmd(ctx, true, "ls", c.cfg.CachePool); err != nil {
+		return false, fmt.Errorf("ceph: ask whether %s exists: its pool would not open: %w", handle, err)
+	}
 
-	return true, nil
+	return false, nil
 }
 
 // checkCloneName refuses a clone name billet cannot address.
