@@ -69,7 +69,7 @@ func TestACustodyClaimFollowsTheControllerThatAnswersWithoutRegistering(t *testi
 	}
 
 	if got := c.WireVersion(); got != wire {
-		t.Fatalf("the claim moved the wire from %d to %d", wire, got)
+		t.Fatalf("a controller speaking the same moved the wire from %d to %d", wire, got)
 	}
 
 	const heartbeat = "/v1/nodes/n1/leases/l1/heartbeat"
@@ -209,6 +209,60 @@ func TestACustodyClaimIsGatedOnTheNegotiatedVersion(t *testing.T) {
 
 			if n := a.sent(custodyRoute); n != tc.want {
 				t.Fatalf("the claim was sent %d times, want %d", n, tc.want)
+			}
+		})
+	}
+}
+
+// THE WIRE MOVES WITH THE CONTROLLER. The process reached this one without registering,
+// so the claim's answer is the only thing that can say what it speaks: what it sends a
+// controller older than the last is held to that controller's version, and an
+// "unregistered" answer's clearing of the wire does not stay for the rest of the wait.
+func TestACustodyClaimSettlesTheWireWithTheControllerThatAnswered(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name          string
+		before, plane int
+		want          int
+	}{
+		{"an older controller", nodeapi.Version, nodeapi.VersionCustodyClaim, nodeapi.VersionCustodyClaim},
+		{"a newer controller", nodeapi.VersionCustodyClaim, nodeapi.Version + 5, nodeapi.Version},
+		{"a wire an answer cleared", 0, nodeapi.Version, nodeapi.Version},
+		{"an answer that does not say", nodeapi.VersionCustodyClaim, 0, nodeapi.VersionCustodyClaim},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			a := newController(t)
+
+			a.mu.Lock()
+			a.respond = func(w http.ResponseWriter, r *http.Request) bool {
+				if r.URL.Path != custodyRoute {
+					return false
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+
+				_ = json.NewEncoder(w).Encode(nodeapi.ClaimCustodyResponse{Version: tc.plane}) //nolint:errcheck // the test's own server
+
+				return true
+			}
+			a.mu.Unlock()
+
+			c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			nodeclient.SetWireForTest(c, tc.before)
+
+			if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err != nil {
+				t.Fatalf("ClaimCustody: %v", err)
+			}
+
+			if got := c.WireVersion(); got != tc.want {
+				t.Fatalf("the wire is %d, want %d", got, tc.want)
 			}
 		})
 	}

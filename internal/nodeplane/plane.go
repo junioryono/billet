@@ -410,9 +410,10 @@ type leaseOwner struct {
 	// an ordinary job can end its ownership too. That destroy is the only signal
 	// the wire gets: the lease itself is released in-process by the listener.
 	requestID int64
-	// claimed says the process said it holds this lease (Plane.ClaimCustody), where
-	// a request id otherwise means this plane delivered the launch. A process's word
-	// gives way to the current process reporting the compute; a delivery does not.
+	// claimed says this record came from a claim (Plane.ClaimCustody), where a request
+	// id otherwise means this plane delivered the launch. A claim gives way to what the
+	// current process reports, and is answered the same way when it is asked again
+	// because the answer was lost; a delivery does neither.
 	claimed bool
 }
 
@@ -1971,7 +1972,7 @@ func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) (h
 				held = append(held, id)
 			}
 		case reportedBy(id):
-			p.owners[id] = leaseOwner{node: node, incarnation: current.incarnation, requestID: claim.RequestID}
+			p.owners[id] = leaseOwner{node: node, incarnation: current.incarnation, requestID: claim.RequestID, claimed: true}
 			adopted = append(adopted, id)
 		case !taken, owner.incarnation == incarnation,
 			current != nil && current.incarnation == owner.incarnation && current.inventoryKnown:

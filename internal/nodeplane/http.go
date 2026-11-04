@@ -1585,7 +1585,9 @@ func (h *handler) claimCustody(w http.ResponseWriter, r *http.Request) {
 
 	held, adopted := h.plane.ClaimCustody(node, incarnation, claims)
 
-	writeJSON(w, http.StatusOK, nodeapi.ClaimCustodyResponse{Held: held, Adopted: adopted})
+	writeJSON(w, http.StatusOK, nodeapi.ClaimCustodyResponse{
+		Version: nodeapi.Version, Held: held, Adopted: adopted,
+	})
 }
 
 func (h *handler) markFailure(w http.ResponseWriter, r *http.Request) {

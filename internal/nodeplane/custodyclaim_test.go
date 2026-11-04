@@ -20,6 +20,7 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 
 	delivered := leaseOwner{node: "n1", incarnation: "p1", requestID: request}
 	claimant := leaseOwner{node: "n1", incarnation: "p1", requestID: request, claimed: true}
+	yielded := leaseOwner{node: "n1", incarnation: "p2", requestID: request, claimed: true}
 	adoption := leaseOwner{node: "n1", incarnation: "p2"}
 
 	seed := func(p *Plane, owner leaseOwner) {
@@ -67,7 +68,7 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 				seed(p, claimant)
 				p.AdoptOwnershipWithInventory("n1", "p2", []string{lease}, true)
 			},
-			adopted: true, owner: leaseOwner{node: "n1", incarnation: "p2", requestID: request},
+			adopted: true, owner: yielded,
 		},
 		// A PROCESS THAT REACHED THE NEW CONTROLLER BEFORE IT LEARNED IT WAS SUPERSEDED
 		// adopted its own lease, with no request; a destroy then cannot find it.
@@ -89,7 +90,7 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 				p.AdoptOwnershipWithInventory("n1", "p2", []string{lease}, true)
 				p.AdoptOwnership("n1", "p2", []string{lease})
 			},
-			adopted: true, owner: leaseOwner{node: "n1", incarnation: "p2", requestID: request},
+			adopted: true, owner: yielded,
 		},
 		"adopted by the current process, whose inventory is unknown": {
 			setup: func(_ *testing.T, p *Plane) { p.AdoptOwnership("n1", "p2", []string{lease}) },
@@ -210,5 +211,27 @@ func TestAClaimSurvivesTheRegistrationThatFollowsIt(t *testing.T) {
 
 	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p1" || owner.requestID != 7 {
 		t.Fatalf("the owner is %+v (ok=%v), want the claimant", owner, ok)
+	}
+}
+
+// THE ANSWER CAN BE LOST, and the process asks again: it hears the same thing, or it
+// waits for ever on a lease it is refused and the current process has.
+func TestAnAdoptionIsAnsweredAgainWhenTheProcessAsksAgain(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p1")
+	registerAs(t, p, "p2")
+	p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
+	p.AdoptOwnership("n1", "p2", []string{"l9"})
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, adopted := p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}}); !slices.Equal(adopted, []string{"l9"}) {
+			t.Fatalf("attempt %d: adopted = %v", attempt, adopted)
+		}
+	}
+
+	if owner, known := p.OwnerOfRequest(7); !known || owner.Incarnation != "p2" {
+		t.Fatalf("the request's owner is %+v (known=%v), want the process with the compute", owner, known)
 	}
 }

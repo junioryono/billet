@@ -130,6 +130,42 @@ func TestACustodyClaimIsBounded(t *testing.T) {
 	}
 }
 
+// THE ANSWER SAYS WHAT THIS CONTROLLER SPEAKS, since the process reached it without
+// registering and has nothing else to go on.
+func TestACustodyClaimReportsTheControllersVersion(t *testing.T) {
+	t.Parallel()
+
+	_, base := serve(t, &fakeStore{leaseErr: alloc.ErrLeaseNotFound})
+
+	body, err := json.Marshal(nodeapi.ClaimCustodyRequest{LeaseIDs: []string{"l1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+"/v1/nodes/n1/custody", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set(nodeapi.HeaderIncarnation, "p1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	var res nodeapi.ClaimCustodyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		t.Fatal(err)
+	}
+
+	if res.Version != nodeapi.Version {
+		t.Fatalf("the answer says version %d, want %d", res.Version, nodeapi.Version)
+	}
+}
+
 // A CLAIM NAMING NO PROCESS GRANTS NOTHING TO NOBODY: the lease would have an owner
 // nothing could be, and the process that has the compute would be refused it.
 func TestACustodyClaimNamingNoProcessIsRefused(t *testing.T) {

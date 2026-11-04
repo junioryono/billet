@@ -1086,8 +1086,10 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 // controller that serves, and answers those the node's current process has adopted.
 // It tries every controller from the one it has; the first that answers is where
 // this process's lease calls go from now on, WITHOUT A REGISTRATION: only a
-// registration takes the name, and this process has lost it. An answer other than
-// success is that controller's word, and leaves the current one where it is.
+// registration takes the name, and this process has lost it. The wire moves with
+// the controller, as a registration moves them, and comes back if an "unregistered"
+// answer cleared it. An answer other than success is that controller's word, and
+// leaves the current one where it is.
 func (c *Client) ClaimCustody(ctx context.Context, leaseIDs []string) ([]string, error) {
 	if wire := c.WireVersion(); wire != 0 && wire < nodeapi.VersionCustodyClaim {
 		return nil, nil
@@ -1105,11 +1107,14 @@ func (c *Client) ClaimCustody(ctx context.Context, leaseIDs []string) ([]string,
 		err := c.doAt(ctx, c.targets[at], http.MethodPost, c.nodePath("/custody"),
 			nodeapi.ClaimCustodyRequest{LeaseIDs: leaseIDs}, &res)
 		if err == nil {
-			if at != start {
-				c.regMu.Lock()
-				c.current.Store(int64(at))
-				c.regMu.Unlock()
+			c.regMu.Lock()
+			c.current.Store(int64(at))
+
+			if res.Version > 0 {
+				c.wire.Store(int64(min(res.Version, nodeapi.Version)))
 			}
+
+			c.regMu.Unlock()
 
 			return res.Adopted, nil
 		}
