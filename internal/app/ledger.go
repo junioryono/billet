@@ -90,7 +90,8 @@ func openControlPlaneLedger(ctx context.Context, cfg *config.Config) (*state.DB,
 
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
 		return state.OpenPostgres(ctx, cfg.Server.IdentityDir, dsn,
-			state.WithRunningRelease(version.Version()))
+			state.WithRunningRelease(version.Version()),
+			state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 	}
 
 	return state.Open(ctx, cfg.Server.IdentityDir, state.WithRunningRelease(version.Version()))
@@ -117,7 +118,8 @@ func openStandbyLedger(ctx context.Context, cfg *config.Config) (*state.DB, erro
 	}
 
 	return state.OpenPostgresStandby(ctx, cfg.Server.IdentityDir, dsn,
-		state.WithRunningRelease(version.Version()))
+		state.WithRunningRelease(version.Version()),
+		state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 }
 
 // openMaintenanceLedger opens the ledger for the quiescent upgrade probe, which
@@ -135,7 +137,8 @@ func openMaintenanceLedger(ctx context.Context, cfg *config.Config) (*state.DB, 
 		}
 
 		return state.OpenPostgresProbe(ctx, cfg.Server.IdentityDir, dsn,
-			state.WithRunningRelease(version.Version()))
+			state.WithRunningRelease(version.Version()),
+			state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 	}
 
 	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir,
@@ -170,7 +173,8 @@ func openRecoveryLedger(ctx context.Context, cfg *config.Config) (*state.DB, err
 	}
 
 	db, err := state.OpenPostgresRecovery(ctx, cfg.Server.IdentityDir, dsn,
-		state.WithRunningRelease(version.Version()))
+		state.WithRunningRelease(version.Version()),
+		state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +266,8 @@ func openDecisionLedger(ctx context.Context, cfg *config.Config) (*state.DB, err
 		var openErr error
 
 		if cfg.Server.LedgerBackend() == config.StatePostgres {
-			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
+				state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 		} else {
 			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
 		}
@@ -309,7 +314,8 @@ func openOperatorLedgerWith(ctx context.Context, cfg *config.Config, dsn state.D
 
 		if cfg.Server.LedgerBackend() == config.StatePostgres {
 			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
-				state.WithRunningRelease(version.Version()))
+				state.WithRunningRelease(version.Version()),
+				state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 		} else {
 			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
 				state.WithRunningRelease(version.Version()))
@@ -368,7 +374,8 @@ func openInspectLedger(ctx context.Context, cfg *config.Config, dsn state.DSN) (
 
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
 		db, err = state.OpenPostgresInspect(ctx, cfg.Server.IdentityDir, dsn,
-			state.WithRunningRelease(version.Version()))
+			state.WithRunningRelease(version.Version()),
+			state.WithReaderConns(cfg.Server.LedgerReaderConnections()))
 	} else {
 		db, err = state.OpenInspect(ctx, cfg.Server.IdentityDir,
 			state.WithRunningRelease(version.Version()))

@@ -310,6 +310,16 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 
 		fmt.Fprintf(env.Stdout, "state    %s (ok, integrity verified)\n", cfg.Server.IdentityDir)
 
+		// THE CONNECTIONS THIS DEPLOYMENT HOLDS, SAID BECAUSE THE SERVER'S
+		// max_connections IS SHARED and an operator packing deployments on one
+		// server adds these up; the pooler sentence because a pooler in front
+		// looks like the answer and silently drops the claim's exclusion.
+		if n := cfg.Server.LedgerConnections(); n > 0 {
+			fmt.Fprintf(env.Stdout, "ledger   PostgreSQL, up to %d connections per process (the writer, the "+
+				"controller claim, %d readers); a transaction-mode pooler cannot carry the claim or the "+
+				"session settings\n", n, cfg.Server.LedgerReaderConnections())
+		}
+
 		// AN UNWATCHED BACKUP IS NOT ONE EITHER, which is the sibling of the rule
 		// this whole area is built on. A timer that stopped firing looks exactly
 		// like one that is working, and the day an operator finds out is the day

@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +102,75 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 			t.Errorf("openDecisionLedger calls state.%s %d times, want exactly once", opener, decision[opener])
 		}
 	}
+}
+
+// EVERY POSTGRESQL OPEN IN ledger.go TAKES THE DEPLOYMENT'S CONNECTION BUDGET, or
+// an operator command run beside a packed server opens readers it was told it
+// could not hold.
+func TestEveryPostgresLedgerOpenTakesTheBudget(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "ledger.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse ledger.go: %v", err)
+	}
+
+	opens := 0
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		pkg, name, ok := selectorOf(call.Fun)
+		if !ok || pkg != "state" || !strings.HasPrefix(name, "OpenPostgres") {
+			return true
+		}
+
+		opens++
+
+		if !takesTheBudget(call) {
+			t.Errorf("%s: state.%s is called without "+
+				"state.WithReaderConns(cfg.Server.LedgerReaderConnections())", fset.Position(call.Pos()), name)
+		}
+
+		return true
+	})
+
+	if opens == 0 {
+		t.Fatal("ledger.go opens no PostgreSQL ledger; this test has nothing to hold")
+	}
+}
+
+// takesTheBudget reports whether an open passes
+// state.WithReaderConns(cfg.Server.LedgerReaderConnections()) itself: a literal
+// size would satisfy the option's presence and ignore the operator's budget.
+func takesTheBudget(call *ast.CallExpr) bool {
+	for _, arg := range call.Args {
+		inner, ok := arg.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+
+		p, fn, ok := selectorOf(inner.Fun)
+		if !ok || p != "state" || fn != "WithReaderConns" || len(inner.Args) != 1 {
+			continue
+		}
+
+		size, ok := inner.Args[0].(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+
+		sel, ok := size.Fun.(*ast.SelectorExpr)
+
+		return ok && sel.Sel.Name == "LedgerReaderConnections"
+	}
+
+	return false
 }
 
 // namesAnyRelease reports whether an open passes state.WithRunningRelease at all.

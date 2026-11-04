@@ -114,6 +114,106 @@ func (p *silenceProxy) silenceAll() {
 	}
 }
 
+// EVERY LONG POLL OF A TARGET SHARES ONE CONNECTION. One target's tiers poll
+// through one client, and what that is worth is that a deployment's sessions cost
+// the broker one socket however many tiers it has (measured on real processes in
+// docs/reference/records/idle-control-plane.md). A client that fell back to
+// HTTP/1.1 would dial one connection a poll and still answer every request.
+func TestATargetsLongPollsShareOneConnection(t *testing.T) {
+	t.Parallel()
+
+	const polls = 6
+
+	entered := make(chan struct{}, polls)
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		if _, err := io.WriteString(w, r.Proto); err != nil {
+			return
+		}
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	proxy := newSilenceProxy(t, srv.Listener.Addr().String())
+
+	client := newValidatedRetryableHTTPClient()
+	client.RetryMax = 0
+	transport, ok := client.HTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("the client's transport is not an *http.Transport")
+	}
+	serverTransport, ok := srv.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("the test server's client transport is not an *http.Transport")
+	}
+	transport.TLSClientConfig = serverTransport.TLSClientConfig.Clone()
+
+	// ONE REQUEST FIRST, so the connection exists to share: two dials racing for
+	// a first connection is the transport's own behaviour and says nothing here.
+	get := func() (string, error) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+			"https://"+proxy.ln.Addr().String()+"/", http.NoBody)
+		if err != nil {
+			return "", err
+		}
+		resp, err := client.StandardClient().Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		body, err := io.ReadAll(resp.Body)
+
+		return string(body), err
+	}
+
+	type answer struct {
+		proto string
+		err   error
+	}
+	first := make(chan answer, 1)
+	go func() {
+		proto, err := get()
+		first <- answer{proto, err}
+	}()
+	<-entered
+
+	answers := make(chan answer, polls-1)
+	for range polls - 1 {
+		go func() {
+			proto, err := get()
+			answers <- answer{proto, err}
+		}()
+	}
+	for range polls - 1 {
+		<-entered
+	}
+
+	// Every poll is inside the handler at once, so none reused a socket another
+	// had finished with.
+	close(release)
+
+	for range polls - 1 {
+		if a := <-answers; a.err != nil || a.proto != "HTTP/2.0" {
+			t.Fatalf("a poll answered %q, %v; want HTTP/2.0", a.proto, a.err)
+		}
+	}
+	if a := <-first; a.err != nil || a.proto != "HTTP/2.0" {
+		t.Fatalf("the first poll answered %q, %v; want HTTP/2.0", a.proto, a.err)
+	}
+
+	if n := proxy.dialed.Load(); n != 1 {
+		t.Fatalf("%d polls in flight together dialed %d connections, want them all on one", polls, n)
+	}
+}
+
 // A SILENT CONNECTION TO THE BROKER IS REPLACED, NOT REUSED UNTIL THE SOCKET
 // FAILS. Every listener of a target multiplexes its long poll over one HTTP/2
 // connection; on 2026-09-23 that connection went half-open and every retry of

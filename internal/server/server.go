@@ -726,6 +726,8 @@ func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet,
 
 		session, err := prov.Session(ctx, set.ID, s.owner)
 		if err == nil {
+			s.log.Info("message session open", "tier", t.Label, "attempt", attempt)
+
 			return session, nil
 		}
 
