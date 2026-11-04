@@ -3716,8 +3716,9 @@ func TestACleanupThatFailedStillKeepsWhatWasAsked(t *testing.T) {
 	opts := verifyOpts()
 	opts.Command = []string{"./custom/run.sh"}
 
-	if _, err := p.Verify(t.Context(), opts); err == nil {
-		t.Fatal("verified past a cleanup that failed")
+	// BY NAME: a probe's end hangs on the same delete, so going on would also fail, later.
+	if _, err := p.Verify(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "remove a base no record names") {
+		t.Fatalf("Verify = %v, want it stopped by its cleanup", err)
 	}
 
 	images, err := p.VerifiedImages(t.Context())
