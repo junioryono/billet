@@ -26,6 +26,11 @@ func TestTheGuestCachesLibraryIsTheAgentsOwnTextAndParses(t *testing.T) {
 		"--socket-property=ListenStream",
 		`runner_env+=("GOCACHEPROG=$GUEST_BILLET cache gocacheprog")`,
 		"--mode node-relay",
+		// WHAT THE AGENT'S PATHS ARE RELATIVE TO, which is not where this image's runner is
+		// by default.
+		"BILLET_RUNNER_HOME=" + guestRunnerHome + "\n",
+		// THE REGION'S OWN PORT, and no second copy of it here.
+		"cache_relay_port=41322",
 	} {
 		if !strings.Contains(library, want) {
 			t.Errorf("the library does not carry %q", want)
@@ -36,6 +41,113 @@ func TestTheGuestCachesLibraryIsTheAgentsOwnTextAndParses(t *testing.T) {
 	writeFile(t, path, library, 0o644)
 	if output, err := exec.CommandContext(t.Context(), "bash", "-n", path).CombinedOutput(); err != nil {
 		t.Fatalf("the library does not parse: %v\n%s", err, output)
+	}
+}
+
+// EVERY FILE THE LAYER INSTALLS, AND IT PARSES: the layer's failure is an hour's build.
+func TestTheGuestCacheInstallParsesAndNamesWhatIsInstalled(t *testing.T) {
+	t.Parallel()
+	install, err := guestCacheInstall()
+	if err != nil {
+		t.Fatalf("guestCacheInstall: %v", err)
+	}
+	for _, want := range []string{
+		" /usr/local/bin/billet-actions-proxy\n", " /usr/local/bin/billet-dns-upstreams\n",
+		" /usr/local/bin/docker\n", " /opt/billet/bin/docker\n", " " + guestCachesPath + "\n",
+		" " + guestBilletPath + "\n", guestBilletPath + " version >/dev/null\n",
+		"/opt/billet/bin/bazel-credential-helper\n", "install_container_hook /\n",
+		"BILLET_RUNNER_HOME=" + guestRunnerHome + " install_cache_sudoers /\n",
+	} {
+		if !strings.Contains(install, want) {
+			t.Errorf("the install does not carry %q", want)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "install.sh")
+	writeFile(t, path, install, 0o644)
+	if output, err := exec.CommandContext(t.Context(), "bash", "-n", path).CombinedOutput(); err != nil {
+		t.Fatalf("the install does not parse: %v\n%s", err, output)
+	}
+}
+
+// THE ENTRY POINT'S ORDER IS THE MECHANISM: a resolver and an authority read when Docker
+// starts, then what listens on its bridge, then the node asked, and what names the node
+// only once it has answered. Each of these has a test of its own and none of that proves
+// it is called.
+func TestTheEntryPointRunsTheGuestCachesInOrder(t *testing.T) {
+	t.Parallel()
+	script := entryPointScript()
+	at := 0
+	for _, step := range []string{
+		". " + guestCachesPath + "\n",
+		"billet_guest_caches_prepare\n",
+		"BILLET_DOCKER_CONFIG_CHANGED=${container_dns_active:-} /usr/local/bin/billet-docker-cache prepare\n",
+		"docker info",
+		"billet_guest_caches_relay\n",
+		"billet_guest_caches_probe\n",
+		"billet_guest_caches_through_relay\n",
+		"billet_guest_caches_start\n",
+		"billet_guest_caches_env\n",
+	} {
+		next := strings.Index(script[at:], step)
+		if next < 0 {
+			t.Fatalf("the entry point lacks, in order, %q:\n%s", step, script)
+		}
+		at += next + len(step)
+	}
+}
+
+// probeFixture is a PATH whose curl answers as told and whose systemctl records.
+func probeFixture(t *testing.T, curlExit string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	stopped := filepath.Join(dir, "stopped")
+	writeExecutableFile(t, filepath.Join(dir, "curl"), "#!/bin/sh\nexit "+curlExit+"\n")
+	writeExecutableFile(t, filepath.Join(dir, "systemctl"), "#!/bin/sh\necho \"$*\" >> '"+stopped+"'\n")
+
+	return dir + ":" + os.Getenv("PATH"), stopped
+}
+
+// A RELAY THAT STARTED PROVES NOTHING ABOUT THE NODE, and the next steps point a job's `git
+// fetch` at it, which nothing falls back from: an image without the listener's issuer
+// would fail every checkout. So the node is asked, and could-not-tell turns them off.
+func TestANodeThatDoesNotAnswerTurnsTheCachesOff(t *testing.T) {
+	t.Parallel()
+	const fragment = `
+cache_endpoint=http://172.17.0.1:41322
+actions_proxy=https://billet:s3cret@10.0.0.1:9443
+npm_proxy=https://billet:s3cret@10.0.0.1:9443
+billet_guest_caches_probe
+billet_guest_caches_through_relay
+printf 'endpoint=%s\nactions=%s\nnpm=%s\n' "$cache_endpoint" "$actions_proxy" "$npm_proxy"
+`
+	path, stopped := probeFixture(t, "60")
+	got := runLibrary(t, map[string]string{"PATH": path}, fragment)
+	if !strings.Contains(got, "endpoint=\nactions=\nnpm=\n") {
+		t.Fatalf("with a node that did not answer = %q", got)
+	}
+	recorded, err := os.ReadFile(stopped)
+	if err != nil {
+		t.Fatalf("the relay was left running: %v", err)
+	}
+	if !strings.Contains(string(recorded), "stop billet-cache-relay.socket billet-cache-relay.service") {
+		t.Fatalf("systemctl was asked %q", recorded)
+	}
+
+	path, stopped = probeFixture(t, "0")
+	got = runLibrary(t, map[string]string{"PATH": path}, fragment)
+	want := "endpoint=http://172.17.0.1:41322\nactions=http://billet:s3cret@172.17.0.1:41322\n" +
+		"npm=http://billet:s3cret@172.17.0.1:41322\n"
+	if got != want {
+		t.Fatalf("with a node that answered = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(stopped); !os.IsNotExist(err) {
+		t.Fatalf("the relay of a node that answered was touched: %v", err)
+	}
+
+	// A SESSION WITH NO ENDPOINT HAS NOTHING TO ASK, and no job fails for it.
+	got = runLibrary(t, map[string]string{"PATH": path}, "cache_endpoint=\nbillet_guest_caches_probe\necho asked\n")
+	if got != "asked\n" {
+		t.Fatalf("with no endpoint = %q", got)
 	}
 }
 
@@ -123,7 +235,7 @@ func TestTheBootScriptCarriesTheGuestCachesAndHoldsThemTogether(t *testing.T) {
 
 	// EXECUTED, not searched: the PEM spans lines, and the shell is what has to read it.
 	printer := filepath.Join(t.TempDir(), "printer")
-	writeFile(t, printer, "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$BILLET_ACTIONS_PROXY\" \"$BILLET_NPM_PROXY\" \"$BILLET_GUEST_CACHES\" \"$BILLET_ACTIONS_CA_PEM\"\n", 0o755)
+	writeExecutableFile(t, printer, "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$BILLET_ACTIONS_PROXY\" \"$BILLET_NPM_PROXY\" \"$BILLET_GUEST_CACHES\" \"$BILLET_ACTIONS_CA_PEM\"\n")
 	script = strings.ReplaceAll(script, "'/usr/local/bin/billet-runner'", "'"+printer+"'")
 	output, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", script).CombinedOutput()
 	if err != nil {
@@ -178,10 +290,11 @@ func TestABootScriptWithoutInterceptionNamesNoProxyAndNoAuthority(t *testing.T) 
 }
 
 // THE LARGEST REGISTRATION BILLET HAS SEEN, WITH EVERYTHING INTERCEPTION ADDS, FITS
-// EC2's 16384 BYTES, whichever form packUserData chooses.
+// EC2's 16384 BYTES, as a launch sends it: a boot script past that is refused, and every
+// job on the tier with it.
 func TestAFullBootScriptFitsInUserData(t *testing.T) {
 	t.Parallel()
-	// A registration is base64 of incompressible JSON, around 8 KiB in the wild.
+	// A registration is base64 of JSON, around 8 KiB in the wild.
 	jit := strings.Repeat("abcdefghijklmnopqrstuvwxyz0123456789+/", 8<<10/38)
 	pem := "-----BEGIN CERTIFICATE-----\n" + strings.Repeat("MIIBszCCAVmgAwIBAgIUQ7vF9oJc3n2hYkR8mVwZpT5sXlAwCgYIKoZIzj0EAwIw\n", 12) +
 		"-----END CERTIFICATE-----\n"
@@ -198,9 +311,7 @@ func TestAFullBootScriptFitsInUserData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("userDataAt: %v", err)
 	}
-	packed, err := packUserData(script)
-	if err != nil {
-		t.Fatalf("packUserData: %v", err)
+	if len(script) > maxUserData {
+		t.Fatalf("the boot script is %d bytes, of the %d EC2 takes", len(script), maxUserData)
 	}
-	t.Logf("the boot script is %d bytes, %d packed, of %d", len(script), len(packed), maxUserData)
 }

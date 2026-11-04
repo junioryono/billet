@@ -1,8 +1,10 @@
 package nodeplane
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,7 +38,13 @@ func ec2Lease() *alloc.Lease {
 // launchOn dispatches a launch to a node registered at wire and returns what it took.
 func launchOn(t *testing.T, tier config.Tier, wire int) nodeapi.Command {
 	t.Helper()
-	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute, WithTierCatalog([]config.Tier{tier}),
+
+	return launchLogged(t, slog.New(slog.DiscardHandler), tier, wire)
+}
+
+func launchLogged(t *testing.T, log *slog.Logger, tier config.Tier, wire int) nodeapi.Command {
+	t.Helper()
+	p := New(log, deployment, time.Minute, WithTierCatalog([]config.Tier{tier}),
 		WithRegistrar(&recordingRegistrar{}), WithCommandTimeout(5*time.Second))
 	node := releasedNode()
 	node.Provider = config.ProviderEC2
@@ -76,8 +84,51 @@ func TestAnOlderEC2NodeIsSentATierWithoutItsGuestCaches(t *testing.T) {
 	if !spec.Docker.Enabled || !spec.StickyDisks.Enabled {
 		t.Fatalf("the caches an older EC2 node does serve were turned off too: %+v", spec)
 	}
-	if cmd.Tier.Intercept {
-		t.Fatal("an older EC2 node was told to intercept")
+}
+
+// INTERCEPTION GOES WITH THE CACHES IT SERVES: an older node would otherwise open a
+// session for a proxy no guest of its can use.
+func TestOnlyACurrentEC2NodeIsToldToIntercept(t *testing.T) {
+	t.Parallel()
+	tier := ec2CacheTier()
+	tier.Intercept = true
+	if cmd := launchOn(t, tier, nodeapi.VersionEC2GuestCaches-1); cmd.Tier.Intercept {
+		t.Error("an older EC2 node was told to intercept")
+	}
+	if cmd := launchOn(t, tier, nodeapi.Version); !cmd.Tier.Intercept {
+		t.Error("a current EC2 node was not told to intercept")
+	}
+}
+
+// A TIER THAT MERELY HAS THEM BY DEFAULT is the case the downgrade exists for: no cache
+// block names them, and a rollout must not fail its jobs.
+func TestATierWithCachesByDefaultReachesAnOlderEC2NodeWithoutThem(t *testing.T) {
+	t.Parallel()
+	tier := testTier()
+	tier.Provider = config.ProviderEC2
+	tier.Trust = config.WorkloadTrusted
+	if spec := launchOn(t, tier, nodeapi.Version).Tier.Cache; spec == nil || !spec.Go.Enabled {
+		t.Fatalf("the fixture's tier has no guest caches by default: %+v", spec)
+	}
+	spec := launchOn(t, tier, nodeapi.VersionEC2GuestCaches-1).Tier.Cache
+	if spec == nil || spec.NeedsGuestCacheServices() {
+		t.Fatalf("an older EC2 node was sent guest caches: %+v", spec)
+	}
+}
+
+// A CACHE TURNED OFF ON ONE NODE IS SAID, because `billet status` still shows the tier's
+// configuration and the only other trace is cold jobs.
+func TestDoingLessForAnOlderEC2NodeIsLogged(t *testing.T) {
+	t.Parallel()
+	var older, current bytes.Buffer
+	launchLogged(t, slog.New(slog.NewTextHandler(&older, nil)), ec2CacheTier(), nodeapi.VersionEC2GuestCaches-1)
+	if line := older.String(); !strings.Contains(line, "too old to serve a guest's caches") ||
+		!strings.Contains(line, "tier="+testTier().Label) {
+		t.Fatalf("the older node's launch logged:\n%s", line)
+	}
+	launchLogged(t, slog.New(slog.NewTextHandler(&current, nil)), ec2CacheTier(), nodeapi.Version)
+	if strings.Contains(current.String(), "too old to serve") {
+		t.Fatalf("a current node's launch logged a downgrade:\n%s", current.String())
 	}
 }
 
@@ -128,6 +179,7 @@ func TestAnOlderProcessCannotTakeAnEC2LaunchNamingGuestCaches(t *testing.T) {
 	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
 		WithTierCatalog([]config.Tier{ec2CacheTier()}), WithRegistrar(&recordingRegistrar{}),
 		WithCommandTimeout(2*time.Second))
+	p.SetPollWindowForTest(50 * time.Millisecond)
 	current := releasedNode()
 	current.Provider = config.ProviderEC2
 	current.Version, current.MinVersion = nodeapi.Version, nodeapi.MinVersion
@@ -146,10 +198,11 @@ func TestAnOlderProcessCannotTakeAnEC2LaunchNamingGuestCaches(t *testing.T) {
 	if _, err := p.Register(t.Context(), older); err != nil {
 		t.Fatalf("register the older process: %v", err)
 	}
-	if cmd, took, err := p.Poll(t.Context(), "n1", "old"); err == nil && took {
-		t.Fatalf("the older process took %s", cmd.Kind)
+	if cmd, took, err := p.Poll(t.Context(), "n1", "old"); err != nil || took {
+		t.Fatalf("the older process's poll = %s, %t, %v", cmd.Kind, took, err)
 	}
-	if err := <-launched; err == nil {
-		t.Fatal("the launch reported success though nothing took it")
+	// SAID AT ONCE, in these words: the command's own timeout would fail it too, later.
+	if err := <-launched; err == nil || !strings.Contains(err.Error(), "was not delivered") {
+		t.Fatalf("the launch reported %v", err)
 	}
 }

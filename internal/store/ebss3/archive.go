@@ -38,6 +38,12 @@ const (
 	// endpoint), and the client asks on one connection, so the node fetches ahead.
 	readChunk  = 8 << 20
 	readWindow = 4
+	// readAheadReaders is how many reads at once fetch ahead, each holding up to
+	// readWindow chunks plus one. A node takes 128 connections, and a job can open as
+	// many reads of a signed URL as it likes and stop reading them, so without this a
+	// node a size that suits an orchestrator could be run out of memory by one job. A
+	// read past this is one plain stream, which holds nothing and is only slower.
+	readAheadReaders = 16
 
 	// staleUpload is how old a staged block or an unfinished multipart upload must
 	// be before eviction takes it: longer than any job, or its finalization could
@@ -46,6 +52,9 @@ const (
 
 	// blobUseLimit bounds reading one use record, a list of digests.
 	blobUseLimit = 64 << 20
+	// blobUseEntries is how many entries one record names, at under 80 bytes each, so
+	// a record billet wrote is never past blobUseLimit.
+	blobUseEntries = 500_000
 )
 
 // errNoBulk is a store built with no way to reach whole objects, which only a test
@@ -219,7 +228,7 @@ func (s Store) MatchArchive(
 			"key", matched, "error", err)
 	}
 
-	return storecontract.Archive{Key: matched, Size: object.Size, Modified: object.Modified}, nil
+	return storecontract.Archive{Key: matched, Size: object.Size, Modified: object.Modified, ETag: object.ETag}, nil
 }
 
 // archiveKeyOf is the cache key an object under a restore prefix holds.
@@ -360,11 +369,12 @@ func (s Store) CommitArchive(
 		if !found {
 			return false, abandon(err)
 		}
-		if !ours {
-			if abortErr := abandon(nil); abortErr != nil {
-				slog.Default().Warn("ebs-s3: could not abort a commit that lost to another upload",
-					"upload", upload, "error", abortErr)
-			}
+		// WHOSEVER IT IS, THIS UPLOAD IS OVER: one retried finalization beside another
+		// holds an upload of its own, which bills until eviction finds it, and aborting
+		// one that landed answers that it is gone.
+		if abortErr := abandon(nil); abortErr != nil {
+			slog.Default().Warn("ebs-s3: could not abort a commit that did not land",
+				"upload", upload, "error", abortErr)
 		}
 		if releaseErr := s.AbortArchive(ctx, upload); releaseErr != nil {
 			slog.Default().Warn("ebs-s3: could not release a committed upload's blocks; eviction will",
@@ -383,9 +393,10 @@ func (s Store) CommitArchive(
 	return true, nil
 }
 
-// archiveOwnedBy says whether an archive is at name, and whether upload committed it.
-func (s Store) archiveOwnedBy(ctx context.Context, name, upload string) (ours, found bool, err error) {
-	_, found, err = s.listedArchive(ctx, name)
+// archiveOwnedBy answers whether upload committed the archive at name, then whether
+// an archive is there at all.
+func (s Store) archiveOwnedBy(ctx context.Context, name, upload string) (bool, bool, error) {
+	_, found, err := s.listedArchive(ctx, name)
 	if err != nil || !found {
 		return false, false, err
 	}
@@ -455,9 +466,11 @@ func (s Store) rejoin(
 		if err != nil {
 			return nil, err
 		}
+		var read int64
 		for {
 			count, readErr := io.ReadFull(body, buffer[len(buffer):cap(buffer)])
 			buffer = buffer[:len(buffer)+count]
+			read += int64(count)
 			if len(buffer) == cap(buffer) {
 				if err := flush(); err != nil {
 					_ = body.Close()
@@ -476,6 +489,13 @@ func (s Store) rejoin(
 		}
 		if err := body.Close(); err != nil {
 			return nil, err
+		}
+		// io.ErrUnexpectedEOF ENDS A BLOCK SHORTER THAN THE BUFFER AND A BODY CUT SHORT
+		// ALIKE, so the length is what tells them apart. A short archive published here
+		// would stay: the first writer holds the key, and each failed restore refreshes
+		// its marker.
+		if read != source.Size {
+			return nil, fmt.Errorf("ebs-s3: a staged block read back %d bytes of %d", read, source.Size)
 		}
 	}
 	if len(buffer) > 0 {
@@ -525,8 +545,12 @@ func (s Store) ReadArchive(
 	if length == 0 {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
-
-	return newRangeReader(ctx, s.bulk, name, start, length), nil
+	select {
+	case s.readAhead <- struct{}{}:
+		return newRangeReader(ctx, s.bulk, name, archive.ETag, start, length, func() { <-s.readAhead }), nil
+	default:
+		return s.bulk.GetRange(ctx, name, archive.ETag, start, length)
+	}
 }
 
 // rangeReader reads an object in order while fetching several chunks of it at once.
@@ -537,6 +561,8 @@ type rangeReader struct {
 	current []byte
 	err     error
 	wg      sync.WaitGroup
+	release func()
+	closing sync.Once
 }
 
 type rangeChunk struct {
@@ -545,10 +571,10 @@ type rangeChunk struct {
 }
 
 func newRangeReader(
-	ctx context.Context, bulk bulkAPI, name string, start, length int64,
+	ctx context.Context, bulk bulkAPI, name, etag string, start, length int64, release func(),
 ) *rangeReader {
 	ctx, cancel := context.WithCancel(ctx)
-	r := &rangeReader{cancel: cancel, results: make(chan chan rangeChunk, readWindow)}
+	r := &rangeReader{cancel: cancel, results: make(chan chan rangeChunk, readWindow), release: release}
 	r.wg.Go(func() {
 		defer close(r.results)
 		for offset := start; offset < start+length; offset += readChunk {
@@ -559,7 +585,7 @@ func newRangeReader(
 			case <-ctx.Done():
 				return
 			}
-			r.wg.Go(func() { done <- fetchChunk(ctx, bulk, name, offset, size) })
+			r.wg.Go(func() { done <- fetchChunk(ctx, bulk, name, etag, offset, size) })
 		}
 	})
 
@@ -568,10 +594,10 @@ func newRangeReader(
 
 // fetchChunk reads one chunk whole, trying again if the body breaks partway: a broken
 // body is the transfer's failure and a fresh range costs one request.
-func fetchChunk(ctx context.Context, bulk bulkAPI, name string, offset, size int64) rangeChunk {
+func fetchChunk(ctx context.Context, bulk bulkAPI, name, etag string, offset, size int64) rangeChunk {
 	buffer := make([]byte, size)
 	_, err := idempotent(ctx, func() (struct{}, error) {
-		body, err := bulk.GetRange(ctx, name, offset, size)
+		body, err := bulk.GetRange(ctx, name, etag, offset, size)
 		if err != nil {
 			return struct{}{}, err
 		}
@@ -611,14 +637,17 @@ func (r *rangeReader) Read(p []byte) (int, error) {
 
 // Close ends the fetching and waits for it.
 func (r *rangeReader) Close() error {
-	r.cancel()
-	r.wg.Wait()
+	r.closing.Do(func() {
+		r.cancel()
+		r.wg.Wait()
+		r.release()
+	})
 
 	return nil
 }
 
-// ListBlobs is every entry a key holds.
-func (s Store) ListBlobs(ctx context.Context, key string) (map[storecontract.BlobRef]struct{}, error) {
+// ListBlobs is every entry a key holds, with its size.
+func (s Store) ListBlobs(ctx context.Context, key string) (map[storecontract.BlobRef]int64, error) {
 	if s.bulk == nil {
 		return nil, errNoBulk
 	}
@@ -627,10 +656,10 @@ func (s Store) ListBlobs(ctx context.Context, key string) (map[storecontract.Blo
 	if err != nil {
 		return nil, err
 	}
-	refs := make(map[storecontract.BlobRef]struct{}, len(objects))
+	refs := make(map[storecontract.BlobRef]int64, len(objects))
 	for _, object := range objects {
 		if ref, ok := parseBlobRef(strings.TrimPrefix(object.Key, prefix)); ok {
-			refs[ref] = struct{}{}
+			refs[ref] = object.Size
 		}
 	}
 
@@ -678,13 +707,32 @@ func (s Store) PutBlob(
 	return err
 }
 
-// RecordBlobUse writes the entries one job used, compressed, as one object.
+// RecordBlobUse writes the entries one job used, compressed, in objects of at most
+// blobUseEntries, so no record reaches the limit a reader treats as a failure.
 func (s Store) RecordBlobUse(
 	ctx context.Context, key, id string, used []storecontract.BlobRef,
 ) error {
 	if s.bulk == nil {
 		return errNoBulk
 	}
+	piece := 0
+	for start := 0; start < len(used) || piece == 0; start += blobUseEntries {
+		name := id
+		if piece > 0 {
+			name = id + "#" + strconv.Itoa(piece)
+		}
+		if err := s.recordBlobUses(ctx, key, name, used[start:min(start+blobUseEntries, len(used))]); err != nil {
+			return err
+		}
+		piece++
+	}
+
+	return nil
+}
+
+func (s Store) recordBlobUses(
+	ctx context.Context, key, id string, used []storecontract.BlobRef,
+) error {
 	var encoded strings.Builder
 	writer := gzip.NewWriter(&encoded)
 	lines := bufio.NewWriter(writer)
@@ -830,12 +878,21 @@ func (s Store) markBlobUse(ctx context.Context, object, keyPart string, live map
 	if err != nil {
 		return err
 	}
-	lines := bufio.NewScanner(io.LimitReader(reader, blobUseLimit))
+	limited := &io.LimitedReader{R: reader, N: blobUseLimit}
+	lines := bufio.NewScanner(limited)
 	for lines.Scan() {
 		live[keyPart+"/"+lines.Text()] = struct{}{}
 	}
+	if err := lines.Err(); err != nil {
+		return err
+	}
+	// NOT THE END OF THE RECORD, ONLY OF WHAT WAS READ, and what it did not reach would
+	// read as unused.
+	if limited.N <= 0 {
+		return fmt.Errorf("a use record is larger than %d bytes", blobUseLimit)
+	}
 
-	return lines.Err()
+	return nil
 }
 
 // evictUploads takes staged blocks and unfinished multipart uploads no job can still

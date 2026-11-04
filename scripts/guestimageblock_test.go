@@ -30,9 +30,6 @@ func TestEveryRegionTheEC2ImageUsesIsMarkedAndWhole(t *testing.T) {
 				t.Errorf("%s no longer holds %q", marker, want)
 			}
 		}
-		if strings.Contains(block, marker+"_END") {
-			t.Errorf("%s ran past its own end marker", marker)
-		}
 		if !strings.HasSuffix(block, "\n") {
 			t.Errorf("%s does not end in whole lines", marker)
 		}

@@ -181,6 +181,8 @@ type verifyProbe struct {
 	entryPointMode os.FileMode
 	// execEnv replaces the helper the image carries; empty is guestassets' own.
 	execEnv string
+	// missingGuestPath, when set, is a file the guest caches run that the image lacks.
+	missingGuestPath string
 	// guestFile, when set, is a guest cache file the image holds with other bytes.
 	guestFile string
 	// noGuestBillet is an image whose billet does not run as the runner.
@@ -474,6 +476,9 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	} {
 		if path == guestBilletPath && p.noGuestBillet {
 			body = "#!/bin/sh\nexit 1\n"
+		}
+		if path == p.missingGuestPath {
+			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(croot+path), 0o755); err != nil {
 			t.Fatal(err)
@@ -1001,6 +1006,21 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			// every Go build on a tier with the cache.
 			name:     "billet in the guest does not run",
 			probe:    verifyProbe{noGuestBillet: true},
+			wantStep: "guest caches",
+		},
+		{
+			name:     "the image has no dnsmasq for the container resolver",
+			probe:    verifyProbe{missingGuestPath: "/usr/sbin/dnsmasq"},
+			wantStep: "guest caches",
+		},
+		{
+			name:     "the image has no container hook",
+			probe:    verifyProbe{missingGuestPath: "/usr/local/lib/billet/container-hook/upstream.js"},
+			wantStep: "guest caches",
+		},
+		{
+			name:     "the image has no Bazel credential helper",
+			probe:    verifyProbe{missingGuestPath: "/opt/billet/bin/bazel-credential-helper"},
 			wantStep: "guest caches",
 		},
 		{

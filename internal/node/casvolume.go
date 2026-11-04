@@ -63,6 +63,9 @@ var casFillDefault = casFullFraction
 
 // errCASBackoff is a transfer refused because its kind's attach failed within
 // casAttachBackoff; the failure itself was logged when it happened.
+// errCASObjectLarge is an object past the bound it was stored under.
+var errCASObjectLarge = errors.New("the object is larger than it may be")
+
 var errCASBackoff = errors.New("the cache could not be attached recently, so it is not tried again yet")
 
 // errCASNotMounted is a transfer refused because the session's volume of its kind
@@ -558,17 +561,76 @@ func (h *casHandle) Put(ctx context.Context, table reapi.Table, digest string, b
 	if !h.hv.Objects {
 		return h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root)
 	}
-	if h.hv.written.Load() >= h.limit {
+
+	return h.putWithinAllowance(ctx, table, digest, path, limit, body)
+}
+
+// putWithinAllowance stores what a job wrote on a store of objects, whose directory is
+// on the node's own disk with nothing else to bound it, so the tier's size is the whole
+// of what the job may add: an object past what is left is refused rather than let in
+// and counted afterwards, and writes side by side settle up once each is stored.
+func (h *casHandle) putWithinAllowance(
+	ctx context.Context, table reapi.Table, digest, path string, limit int64, body io.Reader,
+) error {
+	var replacing int64
+	if info, err := os.Lstat(path); err == nil {
+		replacing = info.Size()
+	}
+	left := h.limit - h.hv.written.Load() + replacing
+	if left <= 0 {
 		return reapi.ErrFull
 	}
-	if err := h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root); err != nil {
+	err := h.s.storeCASObject(ctx, body, path, string(table), digest, min(limit, left), h.root)
+	if errors.Is(err, errCASObjectLarge) && left < limit {
+		return reapi.ErrFull
+	}
+	if err != nil {
 		return err
 	}
-	if info, err := os.Stat(path); err == nil {
-		h.hv.written.Add(info.Size())
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("read back the stored object: %w", err)
+	}
+	if h.hv.written.Add(info.Size()-replacing) > h.limit {
+		h.hv.written.Add(-info.Size())
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove an object past the allowance: %w", err)
+		}
+
+		return reapi.ErrFull
 	}
 
 	return nil
+}
+
+// Size is how large a stored object is, which on a store of objects is known without
+// the request an Open can be. Reading it counts as a use, as an Open does: a build that
+// asks and finds it there goes on to depend on it.
+func (h *casHandle) Size(table reapi.Table, digest string) (int64, error) {
+	path, err := h.path(table, digest)
+	if err != nil {
+		return 0, err
+	}
+	if h.hv.Objects {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return h.blobSize(table, digest)
+		}
+		h.hv.hit.Store(true)
+
+		return info.Size(), nil
+	}
+	file, err := h.Open(table, digest)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("read a stored object's size: %w", err)
+	}
+
+	return info.Size(), nil
 }
 
 func (h *casHandle) Close() { h.release() }
@@ -624,7 +686,7 @@ func (s *CacheService) storeCASObject(
 	case closeErr != nil:
 		return fmt.Errorf("stage the object: %w", closeErr)
 	case written > limit:
-		return fmt.Errorf("the object is larger than %d bytes", limit)
+		return fmt.Errorf("%w: %d bytes", errCASObjectLarge, limit)
 	case table == "cas" && hex.EncodeToString(hash.Sum(nil)) != digest:
 		return reapi.ErrMismatch
 	}

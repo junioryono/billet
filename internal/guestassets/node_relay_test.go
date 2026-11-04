@@ -182,6 +182,68 @@ except OSError:
     pass
 assert 3 <= len(slept) <= 5, slept
 
+# 5a. THE HANDSHAKE IS PART OF THE DIAL. A restarted node binds before it serves, so a
+# dial succeeds at once and a ClientHello waits unanswered, which is the node restarting
+# all the same. A node that fails verification is the node it will go on being.
+held = socket.socket()
+held.bind(("127.0.0.1", 0))
+held.listen(16)
+class Handshakes:
+    def __init__(self, failures):
+        self.failures = failures
+        self.calls = 0
+    def wrap_socket(self, sock, server_hostname=None):
+        self.calls += 1
+        assert server_hostname == "127.0.0.1", server_hostname
+        if self.calls <= len(self.failures):
+            raise self.failures[self.calls - 1]
+        return sock
+slept = []
+handshakes = Handshakes([proxy.socket.timeout("the handshake operation timed out"),
+                         proxy.ssl.SSLEOFError("the node went away"),
+                         ConnectionResetError("reset")])
+peer = proxy.dial_node(held.getsockname(), wait=60, retry=1, sleep=slept.append, tls=handshakes)
+peer.close()
+assert handshakes.calls == 4 and len(slept) == 3, (handshakes.calls, slept)
+
+slept = []
+refused = Handshakes([proxy.ssl.SSLCertVerificationError("not the node's issuer")])
+try:
+    proxy.dial_node(held.getsockname(), wait=60, retry=1, sleep=slept.append, tls=refused)
+    raise AssertionError("a node that failed verification was reached")
+except proxy.ssl.SSLCertVerificationError:
+    pass
+assert refused.calls == 1 and slept == [], (refused.calls, slept)
+held.close()
+
+# 5b. BYTES A SOCKET HOLDS DECRYPTED ARE NOT ON ITS DESCRIPTOR, and select would sit on them.
+# Real OpenSSL leaves none at this read size, which is why this is a stand-in: reading
+# less, or a library that reads ahead, would stall a transfer until the idle bound.
+class Buffered:
+    def __init__(self, sock, held):
+        self.sock, self.held = sock, held
+    def fileno(self):
+        return self.sock.fileno()
+    def pending(self):
+        return len(self.held)
+    def recv(self, size):
+        if self.held:
+            held, self.held = self.held, b""
+            return held
+        return self.sock.recv(size)
+    def sendall(self, data):
+        self.sock.sendall(data)
+    def shutdown(self, how):
+        self.sock.shutdown(how)
+node_side, node_far = socket.socketpair()
+client_side, client_far = socket.socketpair()
+client_far.settimeout(5)
+threading.Thread(target=proxy.relay, args=(client_side, Buffered(node_side, b"held"), b""),
+                 daemon=True).start()
+assert client_far.recv(16) == b"held", "the relay sat on what the socket held"
+node_far.close()
+client_far.close()
+
 # 6. ONLY A PLAIN-HTTP ENDPOINT WITH A PORT.
 assert proxy.node_endpoint("http://172.31.0.1:7718") == ("172.31.0.1", 7718, False)
 assert proxy.node_endpoint("https://10.0.0.5:9443") == ("10.0.0.5", 9443, True)

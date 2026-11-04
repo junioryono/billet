@@ -89,6 +89,8 @@ is_documentation() {
 is_replay_input() {
 	case "$1" in
 	internal/provider/* | internal/store/*) return 0 ;;
+	# The EC2 provider embeds this script's text for the image's guest caches.
+	scripts/build-guest-image.sh) return 0 ;;
 	internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
 		internal/awsquota/* | internal/awss3/* | internal/awssig/* | internal/awsssm/* | internal/config/* | \
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
@@ -137,7 +139,7 @@ classify() {
 	esac
 
 	case "$p" in
-	cmd/* | internal/* | deploy/*)
+	cmd/* | internal/* | deploy/* | scripts/build-guest-image.sh)
 		known=0
 		select_families host_lifecycle postgres_command postgres_retirement package_lifecycle terraform lint
 		;;
@@ -202,7 +204,7 @@ classify() {
 		;;
 	# Read only by the jobs that always run: test executes and inspects these,
 	# and release-config reads the module sources.
-	actions/* | scripts/*_test.go | scripts/testdata/* | scripts/install.sh | scripts/build-guest-image.sh | \
+	actions/* | scripts/*_test.go | scripts/testdata/* | scripts/install.sh | \
 		.claude/settings.json | .claude/hooks/* | \
 		scripts/check-guest-image.sh | scripts/boot-guest-image.sh | scripts/check-module-sources.sh | \
 		scripts/release-ref.sh | scripts/release-contents.sh | scripts/plan-release.sh | \

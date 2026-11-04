@@ -251,6 +251,25 @@ def direct_tunnel(addresses):
     raise last or ConnectionError("no results-origin fallback address")
 
 
+def read_ready(source):
+    """One read of a socket select called readable, or None if it holds nothing yet.
+
+    A TLS SOCKET CAN BE READABLE WITH NOTHING FOR THE APPLICATION: a session ticket or
+    a key update is a record OpenSSL consumes and then waits past, and a blocking read
+    there leaves the other direction unserviced. A client sending a large body then
+    stalls against a node waiting for the rest of it, until the idle bound.
+    """
+    if ssl is None or not isinstance(source, ssl.SSLSocket):
+        return source.recv(64 * 1024)
+    source.settimeout(0)
+    try:
+        return source.recv(64 * 1024)
+    except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+        return None
+    finally:
+        source.settimeout(RELAY_TIMEOUT)
+
+
 def relay(client, node, node_buffer):
     if node_buffer:
         client.sendall(node_buffer)
@@ -274,7 +293,9 @@ def relay(client, node, node_buffer):
             target = peers.get(source)
             if target is None:
                 continue
-            data = source.recv(64 * 1024)
+            data = read_ready(source)
+            if data is None:
+                continue
             if data:
                 target.sendall(data)
                 continue
@@ -842,23 +863,47 @@ def node_tls_context():
     return ssl.create_default_context()
 
 
+def handshake_final(error):
+    """Whether a failed connection says something waiting will not change.
+
+    A node restarting drops or stalls a handshake. One whose certificate cannot be
+    verified, or that does not speak TLS, is the node it will go on being, and waiting
+    only spends the client's patience on an answer already known.
+    """
+    if ssl is None or not isinstance(error, ssl.SSLError):
+        return False
+    return not isinstance(error, (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError))
+
+
 def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sleep,
-              abandoned=lambda: False):
+              abandoned=lambda: False, tls=None):
     """Connect to the node, redialling while it is away, until the wait is spent.
 
     A refused or unanswered dial is the node restarting as often as it is the node
     gone, and the first is the case worth waiting for: the client is told nothing
     until either a connection exists or the wait ends, and then it sees the same
     failure it would have seen at once.
+
+    THE HANDSHAKE IS PART OF THE DIAL. A restarted node binds its port before it serves,
+    so a dial succeeds at once, and on a plain bridge the client's request simply waits
+    in the listener's queue. A ClientHello waiting there would otherwise end the
+    connection after one handshake's timeout, and a fetch in flight with it.
     """
     wait = NODE_RELAY_WAIT if wait is None else wait
     retry = NODE_RELAY_RETRY if retry is None else retry
     deadline = now() + wait
     while True:
+        connection = None
         try:
-            return socket.create_connection(address, CONNECT_TIMEOUT)
-        except OSError:
-            if now() + retry >= deadline or abandoned():
+            connection = socket.create_connection(address, CONNECT_TIMEOUT)
+            if tls is None:
+                return connection
+            connection.settimeout(CONNECT_TIMEOUT)
+            return tls.wrap_socket(connection, server_hostname=address[0])
+        except OSError as error:
+            if connection is not None:
+                connection.close()
+            if handshake_final(error) or now() + retry >= deadline or abandoned():
                 raise
             sleep(retry)
 
@@ -893,10 +938,7 @@ def handle_node_relay(client, address, slots=None, tls=None):
         ready, _, _ = select.select([client], [], [], CONNECT_TIMEOUT)
         if not ready or not client.recv(1, socket.MSG_PEEK):
             return
-        peer = dial_node(address, abandoned=lambda: client_gone(client))
-        if tls is not None:
-            peer.settimeout(CONNECT_TIMEOUT)
-            peer = tls.wrap_socket(peer, server_hostname=address[0])
+        peer = dial_node(address, abandoned=lambda: client_gone(client), tls=tls)
         client.settimeout(RELAY_TIMEOUT)
         peer.settimeout(RELAY_TIMEOUT)
         relay(client, peer, b"")

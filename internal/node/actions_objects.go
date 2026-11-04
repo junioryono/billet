@@ -30,7 +30,10 @@ const actionsObjectArchives = 512
 
 // archiveStore is the site's store, if it keeps whole objects.
 func (s *CacheService) archiveStore() storecontract.ArchiveStore {
-	store, _ := s.store.(storecontract.ArchiveStore)
+	store, ok := s.store.(storecontract.ArchiveStore)
+	if !ok {
+		return nil
+	}
 
 	return store
 }
@@ -88,23 +91,25 @@ func (s *CacheService) createObjectArchive(
 	})
 }
 
-// stageObjectBlock sends one block of a guest's upload to the store as it arrives.
-// Azure's client always says how long a block is, and S3 will not take one that does
-// not, so an upload that does not is refused rather than spooled.
-func (s *CacheService) stageObjectBlock(
-	req *http.Request, archive *actionsArchive, block string, body io.Reader,
-) (*http.Response, error) {
+// objectBlockRefused is the answer to a block the store cannot take, or nil. Azure's
+// client always says how long a block is, and S3 will not take one that does not, so
+// an upload that does not is refused rather than spooled.
+func objectBlockRefused(req *http.Request) *http.Response {
 	if req.ContentLength < 0 {
-		return actionsBlobError(http.StatusLengthRequired, "a block must say how long it is"), nil
+		return actionsBlobError(http.StatusLengthRequired, "a block must say how long it is")
 	}
 	if req.ContentLength > actionsArchiveLimit {
-		return actionsBlobError(http.StatusRequestEntityTooLarge, "actions cache archive exceeds the site limit"), nil
-	}
-	if err := s.archiveStore().StageArchive(req.Context(), archive.Upload, block, body, req.ContentLength); err != nil {
-		return nil, err
+		return actionsBlobError(http.StatusRequestEntityTooLarge, "actions cache archive exceeds the site limit")
 	}
 
-	return nil, nil
+	return nil
+}
+
+// stageObjectBlock sends one block of a guest's upload to the store as it arrives.
+func (s *CacheService) stageObjectBlock(
+	req *http.Request, archive *actionsArchive, block string, body io.Reader,
+) error {
+	return s.archiveStore().StageArchive(req.Context(), archive.Upload, block, body, req.ContentLength)
 }
 
 // finalizeObjectArchive turns a committed upload into a receipt and publishes it.
@@ -142,30 +147,52 @@ func (s *CacheService) finalizeObjectArchive(
 	return s.publishObjectReceipt(ctx, session, receipt)
 }
 
-// publishObjectReceipt commits a receipt's upload. Called with session.mu held. The
-// receipt is durable before the commit and complete before success is returned, as a
-// volume's is, and a commit asks first whether its own archive is already there.
+// publishObjectReceipt commits a receipt's upload. Called with session.mu held, and
+// returns with it held. The receipt is durable before the commit and complete before
+// success is returned, as a volume's is, and a commit asks first whether its own archive
+// is already there.
+//
+// THE COMMIT RUNS OUTSIDE THE LOCK: small blocks are read back through the node, which
+// takes minutes, and the rest of the job's cache calls and every later session's renewal
+// would queue behind it. Two finalizations of one receipt are safe, because the store's
+// condition lets one land and the other reads the object back as its own.
 func (s *CacheService) publishObjectReceipt(
 	ctx context.Context, session *cacheSession, receipt *actionsReceipt,
 ) (*http.Response, error) {
+	session.mu.Unlock()
 	published, err := s.archiveStore().CommitArchive(ctx, receipt.StoreKey, receipt.Upload,
 		receipt.Blocks, receipt.Size)
+	session.mu.Lock()
 	if errors.Is(err, storecontract.ErrArchiveSize) {
 		// THE CLIENT'S OWN ACCOUNT OF THE UPLOAD DOES NOT ADD UP, which a retry will
 		// not change. Nothing was published, and it is told so.
 		s.log.Warn("an Actions cache save did not match what it uploaded; nothing was published",
 			"instance", session.instance, "key", receipt.CacheKey, "error", err)
+		s.releaseStagedBlocks(ctx, session, receipt.Upload)
 		published, err = false, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	receipt.Complete, receipt.OK = true, published
-	if err := s.persistSession(session); err != nil {
-		return nil, err
+	// A SESSION FINISHED MEANWHILE HAS NO RECORD, and writing one would raise it again.
+	if !session.finished {
+		if err := s.persistSession(session); err != nil {
+			return nil, err
+		}
 	}
 
 	return actionsReceiptResponse(receipt)
+}
+
+// releaseStagedBlocks deletes what an upload staged that will never be committed. A
+// failure costs a day or two of storage until eviction takes them, which is no reason
+// to keep a finished job's session open.
+func (s *CacheService) releaseStagedBlocks(ctx context.Context, session *cacheSession, upload string) {
+	if err := s.archiveStore().AbortArchive(ctx, upload); err != nil {
+		s.log.Warn("could not release an Actions cache save's staged blocks; eviction will",
+			"instance", session.instance, "error", err)
+	}
 }
 
 // findObjectArchive answers a lookup from the store. Called with session.mu held.

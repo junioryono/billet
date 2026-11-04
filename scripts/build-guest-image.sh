@@ -2156,8 +2156,8 @@ cd /home/runner/runner
 # through it too: the relay then does the TLS to the node itself, and every client
 # speaks plain HTTP on the guest's own bridge. An endpoint whose relay does not start
 # is left direct.
-cache_relay_port=41322
 # BILLET_CACHE_RELAY_BEGIN
+cache_relay_port=41322
 if [ -n "$cache_endpoint" ]; then
 	if ! relay_bridge=$(ip -4 -o addr show docker0 2>/dev/null |
 		awk 'NR == 1 {split($4, a, "/"); print a[1]}'); then

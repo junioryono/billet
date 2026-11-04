@@ -37,6 +37,10 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The guest half is the firecracker agent's own text, cut out at build time.**
 - **A commit's condition decides the race, and asks the object when its answer is lost.**
 - **A read leaves no trace on an object, so retention is written down: a marker, or a record.**
+- **A relay that started proves nothing about the node, so the entry point asks before anything names it.**
+- **A TLS socket can be readable with nothing for the application, and the relay's handshake is part of its dial.**
+- **What one job can make a node hold is bounded per node, not per archive.**
+- **An upload holds its session, so sessions upload side by side, and a commit does not hold its session at all.**
 
 ### The Actions cache, the kill switch and publication: [references/actions-cache-and-publication.md](references/actions-cache-and-publication.md)
 

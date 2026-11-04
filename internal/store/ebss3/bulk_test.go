@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/awss3"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 )
@@ -25,6 +26,14 @@ func bulkServer(t *testing.T, handler http.HandlerFunc) *s3API {
 	return api
 }
 
+// answer writes a response body.
+func answer(t *testing.T, w io.Writer, body string) {
+	t.Helper()
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Errorf("write the answer: %v", err)
+	}
+}
+
 const (
 	errorBody = `<?xml version="1.0"?><Error><Code>InternalError</Code><Message>nope</Message></Error>`
 	noSuchKey = `<?xml version="1.0"?><Error><Code>NoSuchKey</Code><Message>nope</Message></Error>`
@@ -37,10 +46,14 @@ func TestAStreamedPutIsUnsignedAndCarriesItsLength(t *testing.T) {
 	var body []byte
 	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
 		seen = r.Clone(r.Context())
-		body, _ = io.ReadAll(r.Body)
+		var err error
+		if body, err = io.ReadAll(r.Body); err != nil {
+			t.Errorf("read the body: %v", err)
+		}
 	})
 
-	if err := api.PutStream(t.Context(), "key", strings.NewReader("hello"), 5, true); err != nil {
+	// A READER net/http CANNOT SIZE, as a guest's block is: its length is the store's to say.
+	if err := api.PutStream(t.Context(), "key", io.MultiReader(strings.NewReader("hello")), 5, true); err != nil {
 		t.Fatalf("PutStream: %v", err)
 	}
 	if got := seen.Header.Get("X-Amz-Content-Sha256"); got != awssig.UnsignedPayload {
@@ -63,12 +76,27 @@ func TestAStreamedPutIsUnsignedAndCarriesItsLength(t *testing.T) {
 	}
 }
 
+// unreadReader says whether anything read it.
+type unreadReader struct{ read atomic.Bool }
+
+func (r *unreadReader) Read([]byte) (int, error) {
+	r.read.Store(true)
+
+	return 0, io.EOF
+}
+
+// net/http READS A BODY OF UNKNOWN LENGTH TO LEARN WHETHER IT HAS ONE, and goes chunked
+// if that takes too long, so an empty body is not given the chance.
 func TestAnEmptyStreamedPutIsNotChunked(t *testing.T) {
 	var seen *http.Request
 	api := bulkServer(t, func(_ http.ResponseWriter, r *http.Request) { seen = r.Clone(r.Context()) })
 
-	if err := api.PutStream(t.Context(), "marker", strings.NewReader(""), 0, false); err != nil {
+	empty := &unreadReader{}
+	if err := api.PutStream(t.Context(), "marker", empty, 0, false); err != nil {
 		t.Fatalf("PutStream: %v", err)
+	}
+	if empty.read.Load() {
+		t.Fatal("the transport was left to find out an empty body is empty")
 	}
 	if len(seen.TransferEncoding) != 0 {
 		t.Fatalf("an empty marker went chunked: %v", seen.TransferEncoding)
@@ -88,7 +116,7 @@ func TestAConditionalPutThatLostIsAConflict(t *testing.T) {
 func TestA404IsAbsenceOnlyWhenS3SaysNoSuchKey(t *testing.T) {
 	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = io.WriteString(w, noSuchKey)
+		answer(t, w, noSuchKey)
 	})
 	if _, err := api.GetAll(t.Context(), "key"); !errors.Is(err, errObjectAbsent) {
 		t.Fatalf("NoSuchKey = %v, want errObjectAbsent", err)
@@ -96,7 +124,7 @@ func TestA404IsAbsenceOnlyWhenS3SaysNoSuchKey(t *testing.T) {
 
 	api = bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = io.WriteString(w, `<Error><Code>NoSuchBucket</Code></Error>`)
+		answer(t, w, `<Error><Code>NoSuchBucket</Code></Error>`)
 	})
 	_, err := api.GetAll(t.Context(), "key")
 	if err == nil || errors.Is(err, errObjectAbsent) {
@@ -109,9 +137,9 @@ func TestARangedReadAsksForExactlyItsRange(t *testing.T) {
 	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
 		asked = r.Header.Get("Range")
 		w.WriteHeader(http.StatusPartialContent)
-		_, _ = io.WriteString(w, "abc")
+		answer(t, w, "abc")
 	})
-	body, err := api.GetRange(t.Context(), "key", 10, 3)
+	body, err := api.GetRange(t.Context(), "key", "", 10, 3)
 	if err != nil {
 		t.Fatalf("GetRange: %v", err)
 	}
@@ -121,12 +149,30 @@ func TestARangedReadAsksForExactlyItsRange(t *testing.T) {
 	}
 }
 
+func TestARangedReadOfANamedObjectIsConditionalOnIt(t *testing.T) {
+	var condition string
+	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
+		condition = r.Header.Get("If-Match")
+		w.WriteHeader(http.StatusPartialContent)
+		answer(t, w, "abc")
+	})
+	body, err := api.GetRange(t.Context(), "key", `"e1"`, 0, 3)
+	if err != nil {
+		t.Fatalf("GetRange: %v", err)
+	}
+	defer body.Close()
+	if condition != `"e1"` {
+		t.Fatalf("If-Match = %q", condition)
+	}
+}
+
 // S3 answers a whole body's range 200 when it ignores the header. Reading on from
 // there would hand the client the wrong bytes.
 func TestARangedReadRefusesAWholeObjectAnswer(t *testing.T) {
-	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "whole") })
-	if _, err := api.GetRange(t.Context(), "key", 10, 3); err == nil {
-		t.Fatal("a 200 to a ranged read was accepted")
+	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) { answer(t, w, "whole") })
+	if _, err := api.GetRange(t.Context(), "key", "", 10, 3); err == nil ||
+		!strings.Contains(err.Error(), "S3 GET returned") {
+		t.Fatalf("a 200 to a ranged read = %v", err)
 	}
 }
 
@@ -134,11 +180,15 @@ func TestAPartCopyThatAnswers200AndFailedIsAFailure(t *testing.T) {
 	var attempts atomic.Int32
 	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		attempts.Add(1)
-		_, _ = io.WriteString(w, errorBody)
+		answer(t, w, errorBody)
 	})
 	_, err := api.CopyPart(t.Context(), "key", "id", 1, "source")
 	if err == nil {
 		t.Fatal("a 200 whose body is an Error was taken for a copied part")
+	}
+	// READ AS THE REFUSAL IT IS, not merely as a body with no ETag in it.
+	if status := awss3.StatusOf(err); status != http.StatusInternalServerError {
+		t.Fatalf("the failure reads as status %d: %v", status, err)
 	}
 	if attempts.Load() != bulkAttempts {
 		t.Fatalf("tried %d times, want %d: S3 says this is worth retrying", attempts.Load(), bulkAttempts)
@@ -149,7 +199,7 @@ func TestAPartCopyQuotesTheETagAndNamesItsSource(t *testing.T) {
 	var source string
 	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
 		source = r.Header.Get("X-Amz-Copy-Source")
-		_, _ = io.WriteString(w, `<CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>`)
+		answer(t, w, `<CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>`)
 	})
 	part, err := api.CopyPart(t.Context(), "key", "id", 3, "stage/up/block")
 	if err != nil {
@@ -164,7 +214,7 @@ func TestAPartCopyQuotesTheETagAndNamesItsSource(t *testing.T) {
 }
 
 func TestACompletionThatAnswers200AndFailedIsAmbiguousNotSuccess(t *testing.T) {
-	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, errorBody) })
+	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) { answer(t, w, errorBody) })
 	err := api.CompleteMultipart(t.Context(), "key", "id", []completedPart{{Number: 1, ETag: `"a"`}})
 	if !errors.Is(err, errObjectAmbiguous) {
 		t.Fatalf("CompleteMultipart = %v, want errObjectAmbiguous", err)
@@ -175,9 +225,12 @@ func TestACompletionIsConditionalAndNamesItsParts(t *testing.T) {
 	var condition, body string
 	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
 		condition = r.Header.Get("If-None-Match")
-		raw, _ := io.ReadAll(r.Body)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read the body: %v", err)
+		}
 		body = string(raw)
-		_, _ = io.WriteString(w, `<CompleteMultipartUploadResult><ETag>"x"</ETag></CompleteMultipartUploadResult>`)
+		answer(t, w, `<CompleteMultipartUploadResult><ETag>"x"</ETag></CompleteMultipartUploadResult>`)
 	})
 	err := api.CompleteMultipart(t.Context(), "key", "id", []completedPart{
 		{Number: 1, ETag: `"a"`}, {Number: 2, ETag: `"b"`},
@@ -188,8 +241,13 @@ func TestACompletionIsConditionalAndNamesItsParts(t *testing.T) {
 	if condition != "*" {
 		t.Errorf("If-None-Match = %q; the first writer is what this condition decides", condition)
 	}
-	if !strings.Contains(body, "<PartNumber>1</PartNumber>") || !strings.Contains(body, "<PartNumber>2</PartNumber>") {
-		t.Errorf("body = %s", body)
+	for _, part := range []string{
+		"<Part><PartNumber>1</PartNumber><ETag>&#34;a&#34;</ETag></Part>",
+		"<Part><PartNumber>2</PartNumber><ETag>&#34;b&#34;</ETag></Part>",
+	} {
+		if !strings.Contains(body, part) {
+			t.Errorf("body lacks %s: %s", part, body)
+		}
 	}
 }
 
@@ -206,7 +264,7 @@ func TestACompletionThatLostTheKeyIsAConflict(t *testing.T) {
 func TestAnAbortOfAnUploadAlreadyGoneIsNotAFailure(t *testing.T) {
 	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		answer(t, w, `<Error><Code>NoSuchUpload</Code></Error>`)
 	})
 	if err := api.AbortMultipart(t.Context(), "key", "id"); err != nil {
 		t.Fatalf("AbortMultipart: %v", err)
@@ -218,14 +276,15 @@ func TestAListingFollowsItsContinuationAndKeepsSizesAndDates(t *testing.T) {
 	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if r.URL.Query().Get("continuation-token") == "" {
-			_, _ = io.WriteString(w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+
+			answer(t, w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+
 				`<NextContinuationToken>next</NextContinuationToken>`+
-				`<Contents><Key>a</Key><Size>7</Size><LastModified>2026-11-04T01:02:03.000Z</LastModified></Contents>`+
+				`<Contents><Key>a</Key><Size>7</Size><LastModified>2026-11-04T01:02:03.000Z</LastModified>`+
+				`<ETag>&quot;e1&quot;</ETag></Contents>`+
 				`</ListBucketResult>`)
 
 			return
 		}
-		_, _ = io.WriteString(w, `<ListBucketResult><IsTruncated>false</IsTruncated>`+
+		answer(t, w, `<ListBucketResult><IsTruncated>false</IsTruncated>`+
 			`<Contents><Key>b</Key><Size>9</Size><LastModified>2026-11-04T01:02:04.000Z</LastModified></Contents>`+
 			`</ListBucketResult>`)
 	})
@@ -234,18 +293,63 @@ func TestAListingFollowsItsContinuationAndKeepsSizesAndDates(t *testing.T) {
 		t.Fatalf("ListObjects: %v", err)
 	}
 	if calls != 2 || len(objects) != 2 || objects[0].Size != 7 || objects[1].Key != "b" ||
-		objects[1].Modified.IsZero() {
+		objects[1].Modified.IsZero() || objects[0].ETag != `"e1"` {
 		t.Fatalf("calls %d, objects %+v", calls, objects)
 	}
 }
 
 func TestATruncatedListingThatDoesNotMoveIsRefused(t *testing.T) {
 	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+
+		answer(t, w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+
 			`<NextContinuationToken>same</NextContinuationToken></ListBucketResult>`)
 	})
-	if _, err := api.ListObjects(t.Context(), "prefix/"); err == nil {
-		t.Fatal("a listing that repeats its token was followed")
+	if _, err := api.ListObjects(t.Context(), "prefix/"); err == nil ||
+		!strings.Contains(err.Error(), "no new continuation token") {
+		t.Fatalf("a listing that repeats its token = %v", err)
+	}
+}
+
+func TestAMultipartListingFollowsItsMarkers(t *testing.T) {
+	var asked []string
+	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		asked = append(asked, query.Get("key-marker")+"|"+query.Get("upload-id-marker"))
+		if _, ok := query["uploads"]; !ok || query.Get("prefix") != "prefix/" {
+			t.Errorf("query = %s", r.URL.RawQuery)
+		}
+		if query.Get("key-marker") == "" {
+			answer(t, w, `<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>`+
+				`<NextKeyMarker>k1</NextKeyMarker><NextUploadIdMarker>u1</NextUploadIdMarker>`+
+				`<Upload><Key>k1</Key><UploadId>u1</UploadId><Initiated>2026-11-04T01:02:03.000Z</Initiated></Upload>`+
+				`</ListMultipartUploadsResult>`)
+
+			return
+		}
+		answer(t, w, `<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>`+
+			`<Upload><Key>k2</Key><UploadId>u2</UploadId><Initiated>2026-11-04T01:02:04.000Z</Initiated></Upload>`+
+			`</ListMultipartUploadsResult>`)
+	})
+	uploads, err := api.ListMultipart(t.Context(), "prefix/")
+	if err != nil {
+		t.Fatalf("ListMultipart: %v", err)
+	}
+	if len(uploads) != 2 || uploads[0].Key != "k1" || uploads[0].UploadID != "u1" ||
+		uploads[1].UploadID != "u2" || uploads[1].Initiated.IsZero() {
+		t.Fatalf("uploads = %+v", uploads)
+	}
+	if len(asked) != 2 || asked[1] != "k1|u1" {
+		t.Fatalf("asked with markers %q", asked)
+	}
+}
+
+func TestATruncatedMultipartListingThatDoesNotMoveIsRefused(t *testing.T) {
+	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		answer(t, w, `<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>`+
+			`<NextKeyMarker>k</NextKeyMarker><NextUploadIdMarker>u</NextUploadIdMarker></ListMultipartUploadsResult>`)
+	})
+	if _, err := api.ListMultipart(t.Context(), "prefix/"); err == nil ||
+		!strings.Contains(err.Error(), "no new marker") {
+		t.Fatalf("a listing that repeats its marker = %v", err)
 	}
 }
 
@@ -254,11 +358,11 @@ func TestSlowDownIsTriedAgainAndARefusalIsNot(t *testing.T) {
 	api := bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		if attempts.Add(1) == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, `<Error><Code>SlowDown</Code></Error>`)
+			answer(t, w, `<Error><Code>SlowDown</Code></Error>`)
 
 			return
 		}
-		_, _ = io.WriteString(w, "body")
+		answer(t, w, "body")
 	})
 	body, err := api.GetAll(t.Context(), "key")
 	if err != nil {
@@ -273,7 +377,7 @@ func TestSlowDownIsTriedAgainAndARefusalIsNot(t *testing.T) {
 	api = bulkServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		attempts.Add(1)
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, `<Error><Code>AccessDenied</Code></Error>`)
+		answer(t, w, `<Error><Code>AccessDenied</Code></Error>`)
 	})
 	if _, err := api.GetAll(t.Context(), "key"); err == nil {
 		t.Fatal("AccessDenied was accepted")
@@ -303,11 +407,12 @@ func TestHeadReadsWhichUploadCommittedAnObject(t *testing.T) {
 }
 
 func TestAMultipartStartRecordsTheUploadOnTheObject(t *testing.T) {
-	var meta, marker string
+	var meta, marker, encryption string
 	api := bulkServer(t, func(w http.ResponseWriter, r *http.Request) {
 		meta = r.Header.Get(metaUpload)
-		_, marker = "", r.URL.RawQuery
-		_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><UploadId>mpu</UploadId></InitiateMultipartUploadResult>`)
+		encryption = r.Header.Get("X-Amz-Server-Side-Encryption")
+		marker = r.URL.RawQuery
+		answer(t, w, `<InitiateMultipartUploadResult><UploadId>mpu</UploadId></InitiateMultipartUploadResult>`)
 	})
 	id, err := api.CreateMultipart(t.Context(), "key", "up1")
 	if err != nil {
@@ -315,5 +420,8 @@ func TestAMultipartStartRecordsTheUploadOnTheObject(t *testing.T) {
 	}
 	if id != "mpu" || meta != "up1" || !strings.Contains(marker, "uploads") {
 		t.Fatalf("id %q, meta %q, query %q", id, meta, marker)
+	}
+	if encryption != "AES256" {
+		t.Fatalf("encryption = %q; what the upload assembles is an object like any other", encryption)
 	}
 }

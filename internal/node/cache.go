@@ -948,12 +948,28 @@ func (s *CacheService) RetryClosed(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	var failures []error
-	for _, session := range sessions {
-		if err := s.cleanupSession(ctx, session, false, true); err != nil {
-			failures = append(failures, err)
-		}
+	workers := 1
+	if s.blobStore() != nil {
+		workers = closedSessionUploads
 	}
+	var (
+		mu       sync.Mutex
+		failures []error
+		wg       sync.WaitGroup
+	)
+	slots := make(chan struct{}, workers)
+	for _, session := range sessions {
+		slots <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-slots }()
+			if err := s.cleanupSession(ctx, session, false, true); err != nil {
+				mu.Lock()
+				defer mu.Unlock()
+				failures = append(failures, err)
+			}
+		})
+	}
+	wg.Wait()
 
 	return errors.Join(failures...)
 }
@@ -1177,12 +1193,7 @@ func (s *CacheService) cleanupSession(
 				"instance", session.instance, "key", archive.CacheKey, "version", archive.Version)
 		}
 		if archive.Upload != "" {
-			if err := s.archiveStore().AbortArchive(ctx, archive.Upload); err != nil {
-				failures = append(failures, fmt.Errorf("actions cache %s abort: %w", id, err))
-				archive.mu.Unlock()
-
-				continue
-			}
+			s.releaseStagedBlocks(ctx, session, archive.Upload)
 		}
 		if archive.objectBacked() {
 			archive.mu.Unlock()
@@ -1212,6 +1223,13 @@ func (s *CacheService) cleanupSession(
 		if err := s.persistSession(session); err != nil {
 			return fmt.Errorf("node: record discarded Actions cache of %s: %w",
 				session.instance, err)
+		}
+	}
+	// A FINALIZATION THAT NEVER COMPLETED LEFT ITS BLOCKS, its archive having become
+	// this receipt.
+	for _, receipt := range session.receipts {
+		if receipt.Upload != "" && !receipt.Complete {
+			s.releaseStagedBlocks(ctx, session, receipt.Upload)
 		}
 	}
 

@@ -220,6 +220,32 @@
       }
     },
     {
+      "Sid": "BilletCacheObjectsEvict",
+      "Effect": "Allow",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "arn:aws:s3:::billet-cache-example/production/owners/*/archives/*",
+        "arn:aws:s3:::billet-cache-example/production/owners/*/archive-used/*",
+        "arn:aws:s3:::billet-cache-example/production/owners/*/stage/*",
+        "arn:aws:s3:::billet-cache-example/production/owners/*/blobs/*",
+        "arn:aws:s3:::billet-cache-example/production/owners/*/blob-uses/*"
+      ]
+    },
+    {
+      "Sid": "BilletCacheUploads",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": [
+        "arn:aws:s3:::billet-cache-example"
+      ]
+    },
+    {
       "Sid": "BilletCacheKMSUse",
       "Effect": "Allow",
       "Action": [

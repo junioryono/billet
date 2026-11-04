@@ -115,3 +115,5 @@ A node too old to read a tier's cache block (wire below 23) applies the rule eve
 During a rollout such a tier waits for the first of its own hosts to upgrade, and `billet status` names it as waiting.
 
 The npm cache needs no newer node: one below wire 31 ignores `cache.npm`, which leaves the tier's npm traffic going to the registry, as it always did.
+
+An EC2 node below wire 38 cannot serve a guest's caches, so it runs the tier with them off, including any you turned on by name: its jobs use GitHub's cache and build cold, and the control plane logs a warning naming the tier and the node for each such launch. `billet status` still shows the tier's configuration, so that warning is where to look during a rollout.

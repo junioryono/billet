@@ -38,16 +38,23 @@ const (
 	casCacheFill = 0.7
 	// casPublishWorkers is how many entries a publication uploads at once.
 	casPublishWorkers = 16
+	// closedSessionUploads is how many closed sessions a pass finishes at once on a store
+	// of objects. An upload holds its session for as long as it takes and its window
+	// counts from the job's completion, so one job's upload must not spend the next's.
+	closedSessionUploads = 8
 	// casIndexRetry is how soon a listing that failed is tried again; a build asks by
 	// the thousand, and each would otherwise be a listing.
 	casIndexRetry = time.Minute
 )
 
+// errPublishDisabled is the kill switch turned on partway through an upload.
+var errPublishDisabled = errors.New("the cache was disabled during its publication")
+
 // blobIndex is what a key held when a session asked. It is not asked again, because
 // what another job publishes meanwhile only costs this one a miss.
 type blobIndex struct {
 	mu    sync.Mutex
-	refs  map[storecontract.BlobRef]struct{}
+	refs  map[storecontract.BlobRef]int64
 	retry time.Time
 }
 
@@ -70,7 +77,10 @@ func (u *blobUses) add(ref storecontract.BlobRef) {
 
 // blobStore is the site's store, if it keeps a content-addressed cache as objects.
 func (s *CacheService) blobStore() storecontract.BlobStore {
-	store, _ := s.store.(storecontract.BlobStore)
+	store, ok := s.store.(storecontract.BlobStore)
+	if !ok {
+		return nil
+	}
 
 	return store
 }
@@ -102,7 +112,7 @@ func (s *CacheService) attachBlobVolume(
 // could-not-tell, which is a miss for the one read that asked.
 func (s *CacheService) blobIndexOf(
 	ctx context.Context, hv *hostVolume,
-) (map[storecontract.BlobRef]struct{}, error) {
+) (map[storecontract.BlobRef]int64, error) {
 	hv.index.mu.Lock()
 	defer hv.index.mu.Unlock()
 	if hv.index.refs != nil {
@@ -131,10 +141,11 @@ func (s *CacheService) casCachePath(key string, table reapi.Table, digest string
 		string(table), digest[:2], digest)
 }
 
-// openBlob answers a read the session's own directory cannot, from the read cache
-// or the store. An entry neither holds, and every failure, is a miss: a cache that
-// cannot be read must never fail a build.
-func (h *casHandle) openBlob(table reapi.Table, digest string) (*os.File, error) {
+// listedBlob is what the key's listing says of one entry. Not being listed and not
+// being able to list are both a miss: a cache that cannot be read must never fail a
+// build.
+func (h *casHandle) listedBlob(table reapi.Table, digest string) (storecontract.BlobRef, int64, bool) {
+	ref := storecontract.BlobRef{Table: storecontract.BlobTable(table), Digest: digest}
 	refs, err := h.s.blobIndexOf(h.ctx, h.hv)
 	if err != nil {
 		if !errors.Is(err, errCASBackoff) {
@@ -142,10 +153,30 @@ func (h *casHandle) openBlob(table reapi.Table, digest string) (*os.File, error)
 				"instance", h.session.instance, "kind", h.hv.Kind, "error", err)
 		}
 
-		return nil, fs.ErrNotExist
+		return ref, 0, false
 	}
-	ref := storecontract.BlobRef{Table: storecontract.BlobTable(table), Digest: digest}
-	if _, ok := refs[ref]; !ok {
+	size, ok := refs[ref]
+
+	return ref, size, ok
+}
+
+// blobSize answers Size from the listing, for an entry not in the session's directory.
+func (h *casHandle) blobSize(table reapi.Table, digest string) (int64, error) {
+	ref, size, ok := h.listedBlob(table, digest)
+	if !ok {
+		return 0, fs.ErrNotExist
+	}
+	h.hv.hit.Store(true)
+	h.hv.reads.add(ref)
+
+	return size, nil
+}
+
+// openBlob answers a read the session's own directory cannot, from the read cache
+// or the store. An entry neither holds, and every failure, is a miss.
+func (h *casHandle) openBlob(table reapi.Table, digest string) (*os.File, error) {
+	ref, _, ok := h.listedBlob(table, digest)
+	if !ok {
 		return nil, fs.ErrNotExist
 	}
 
@@ -153,7 +184,8 @@ func (h *casHandle) openBlob(table reapi.Table, digest string) (*os.File, error)
 	file, err := openRegular(path)
 	if err != nil {
 		if err := h.fillCache(table, ref, path); err != nil {
-			if !errors.Is(err, storecontract.ErrMiss) {
+			// A FULL DISK IS NOT WORTH A LINE PER READ, and the reaper is on its way.
+			if !errors.Is(err, storecontract.ErrMiss) && !errors.Is(err, reapi.ErrFull) {
 				h.s.log.Warn("could not fetch a content-addressed cache entry; it is a miss",
 					"instance", h.session.instance, "kind", h.hv.Kind, "error", err)
 			}
@@ -176,6 +208,18 @@ func (h *casHandle) openBlob(table reapi.Table, digest string) (*os.File, error)
 
 // fillCache fetches one entry into the read cache, whole or not at all.
 func (h *casHandle) fillCache(table reapi.Table, ref storecontract.BlobRef, path string) error {
+	// MADE HERE, because the fill asks how full this directory's disk is before it
+	// writes, and a directory that is not there reads as a full disk. Asked before the
+	// request too, which would otherwise be paid for and thrown away.
+	root := filepath.Join(h.s.rootState, casCacheDirectory)
+	//nolint:gosec // G703: the node's configured state directory and a constant, nothing of the request's
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return fmt.Errorf("prepare the read cache: %w", err)
+	}
+	if full, err := h.s.casFull(root); err != nil || full {
+		return reapi.ErrFull
+	}
+
 	body, err := h.s.blobStore().ReadBlob(h.ctx, h.hv.Volume.Key, ref)
 	if err != nil {
 		return err
@@ -185,13 +229,6 @@ func (h *casHandle) fillCache(table reapi.Table, ref storecontract.BlobRef, path
 	limit := int64(casResultLimit)
 	if table == reapi.TableCAS {
 		limit = h.limit
-	}
-
-	// MADE HERE, because the fill asks how full this directory's disk is before it
-	// writes, and a directory that is not there reads as a full disk.
-	root := filepath.Join(h.s.rootState, casCacheDirectory)
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return fmt.Errorf("prepare the read cache: %w", err)
 	}
 
 	return h.s.storeCASObject(h.ctx, body, path, string(table), ref.Digest, limit, root)
@@ -257,14 +294,18 @@ func (s *CacheService) releaseBlobVolume(
 			abandon("the cache is disabled for this repository")
 		default:
 			publishCtx, cancel := context.WithDeadline(ctx, deadline)
-			err := s.publishBlobs(publishCtx, hv, root, written)
+			err := s.publishBlobs(publishCtx, session, hv, root, written)
 			cancel()
-			if err != nil {
+			switch {
+			case errors.Is(err, errPublishDisabled):
+				abandon("the cache is disabled for this repository")
+			case err != nil:
 				return false, fmt.Errorf("upload the %s cache: %w", hv.Kind, err)
+			default:
+				journal.Phase = phasePublished
+				s.log.Info("published a content-addressed cache a job wrote", "instance", session.instance,
+					"kind", hv.Kind, "entries", len(written))
 			}
-			journal.Phase = phasePublished
-			s.log.Info("published a content-addressed cache a job wrote", "instance", session.instance,
-				"kind", hv.Kind, "entries", len(written))
 		}
 		if err := s.persistSession(session); err != nil {
 			return false, err
@@ -340,9 +381,40 @@ func (s *CacheService) usedBlobs(
 	return used
 }
 
+// writtenBytes is what a session's directory holds, which is what its job has spent
+// of its allowance. What cannot be read counts as nothing: the worst of that is a job
+// writing a little over its size after a restart.
+func (s *CacheService) writtenBytes(root string) int64 {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+
+		return nil
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.log.Warn("could not count all of what a job has written", "path", root, "error", err)
+	}
+
+	return total
+}
+
 // publishBlobs uploads a session's writes, unless the store's first writer has them.
+//
+// THE KILL SWITCH IS ASKED AGAIN WHILE IT RUNS, as it is while a volume is in use: an
+// upload lasts as long as the job's output is large, and disabling a cache has to stop
+// it within casPolicyAge.
 func (s *CacheService) publishBlobs(
-	ctx context.Context, hv *hostVolume, root string, written []storecontract.BlobRef,
+	ctx context.Context, session *cacheSession, hv *hostVolume, root string, written []storecontract.BlobRef,
 ) error {
 	store := s.blobStore()
 	work := make(chan storecontract.BlobRef)
@@ -360,7 +432,17 @@ func (s *CacheService) publishBlobs(
 			}
 		})
 	}
+	asked := s.now()
 	for _, ref := range written {
+		if s.now().Sub(asked) >= casPolicyAge {
+			if !s.sessionKindAllowed(ctx, session, hv.Kind) {
+				disabled := errPublishDisabled
+				failed.CompareAndSwap(nil, &disabled)
+
+				break
+			}
+			asked = s.now()
+		}
 		work <- ref
 	}
 	close(work)

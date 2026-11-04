@@ -106,6 +106,9 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 	guestCaches := selectedProvider == config.ProviderEC2 && spec.Cache != nil &&
 		(spec.Intercept || spec.Cache.NeedsGuestCacheServices())
 	if guestCaches && wire < nodeapi.VersionEC2GuestCaches {
+		r.plane.log.Warn("this EC2 node is too old to serve a guest's caches, so this tier's job "+
+			"runs without them; upgrade the node",
+			"tier", tier.Label, "node", n.name, "wire", wire, "needs", nodeapi.VersionEC2GuestCaches)
 		spec.Cache = new(spec.Cache.WithoutGuestCaches())
 		spec.Intercept = false
 		guestCaches = false

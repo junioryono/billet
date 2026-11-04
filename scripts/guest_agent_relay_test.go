@@ -86,7 +86,6 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 				"BAZELRC_FILE=" + shellQuote(bazelrc),
 				"GITCONFIG_FILE=" + shellQuote(gitconfig),
 				"docker_gateway=172.17.0.1",
-				"cache_relay_port=41322",
 				"runner_env=()",
 				relayBlock,
 				envBlock,

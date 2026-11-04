@@ -2,6 +2,7 @@ package ebss3
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,8 +28,26 @@ type fakeBulk struct {
 	nextID  int
 	// loseCompletion lands the next completion and answers as if it did not.
 	loseCompletion bool
+	// dropCompletion answers the next completion as if it were lost, and does not land it.
+	dropCompletion bool
+	// rival lands at the key just before the next completion is judged: another
+	// upload that got past the check a commit opens with.
+	rival *fakeBulkObject
 	// failCopy fails every part copy.
 	failCopy error
+	// onCopy runs as a part copy starts, outside the lock.
+	onCopy func()
+	// reverseListing answers listings last name first, which S3 does not promise never to.
+	reverseListing bool
+	// truncateGets cuts every whole-object read short, as a dropped connection does.
+	truncateGets bool
+	// failStateList fails the state half's listing, and so the volume half of eviction.
+	failStateList error
+	// holdRanges blocks every ranged read past the first chunk until its context ends,
+	// announcing each on the channel.
+	holdRanges chan struct{}
+	// rangesStarted and rangesReturned count the held reads.
+	rangesStarted, rangesReturned atomic.Int32
 	// failRange fails the next ranged read, once.
 	failRange error
 	// partSizes records every part size a completion assembled.
@@ -38,6 +58,7 @@ type fakeBulkObject struct {
 	body     []byte
 	modified time.Time
 	upload   string
+	etag     string
 }
 
 type fakeBulkUpload struct {
@@ -68,14 +89,31 @@ func (f *fakeBulk) PutStream(
 	if _, exists := f.objects[key]; exists && ifAbsent {
 		return errObjectConflict
 	}
-	f.objects[key] = fakeBulkObject{body: data, modified: *f.now}
+	f.objects[key] = fakeBulkObject{body: data, modified: *f.now, etag: f.nextETag()}
 
 	return nil
 }
 
+func (f *fakeBulk) nextETag() string {
+	f.nextID++
+
+	return fmt.Sprintf(`"etag-%d"`, f.nextID)
+}
+
 func (f *fakeBulk) GetRange(
-	_ context.Context, key string, start, length int64,
+	ctx context.Context, key, etag string, start, length int64,
 ) (io.ReadCloser, error) {
+	if f.holdRanges != nil && start >= readChunk {
+		f.rangesStarted.Add(1)
+		defer f.rangesReturned.Add(1)
+		select {
+		case f.holdRanges <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+
+		return nil, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failRange != nil {
@@ -88,6 +126,9 @@ func (f *fakeBulk) GetRange(
 	if !ok {
 		return nil, errObjectAbsent
 	}
+	if etag != "" && object.etag != etag {
+		return nil, errObjectConflict
+	}
 
 	return io.NopCloser(bytes.NewReader(object.body[start : start+length])), nil
 }
@@ -98,6 +139,10 @@ func (f *fakeBulk) GetAll(_ context.Context, key string) (io.ReadCloser, error) 
 	object, ok := f.objects[key]
 	if !ok {
 		return nil, errObjectAbsent
+	}
+	if f.truncateGets {
+		return io.NopCloser(io.MultiReader(bytes.NewReader(object.body[:len(object.body)/2]),
+			readerOf{io.ErrUnexpectedEOF})), nil
 	}
 
 	return io.NopCloser(bytes.NewReader(object.body)), nil
@@ -120,10 +165,15 @@ func (f *fakeBulk) ListObjects(_ context.Context, prefix string) ([]objectInfo, 
 	var out []objectInfo
 	for key, object := range f.objects {
 		if strings.HasPrefix(key, prefix) {
-			out = append(out, objectInfo{Key: key, Size: int64(len(object.body)), Modified: object.modified})
+			out = append(out, objectInfo{
+				Key: key, Size: int64(len(object.body)), Modified: object.modified, ETag: object.etag,
+			})
 		}
 	}
 	slices.SortFunc(out, func(a, b objectInfo) int { return strings.Compare(a.Key, b.Key) })
+	if f.reverseListing {
+		slices.Reverse(out)
+	}
 
 	return out, nil
 }
@@ -141,6 +191,9 @@ func (f *fakeBulk) CreateMultipart(_ context.Context, key, upload string) (strin
 func (f *fakeBulk) CopyPart(
 	_ context.Context, key, uploadID string, number int, source string,
 ) (completedPart, error) {
+	if f.onCopy != nil {
+		f.onCopy()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failCopy != nil {
@@ -171,6 +224,15 @@ func (f *fakeBulk) CompleteMultipart(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	upload := f.uploads[uploadID]
+	if f.dropCompletion {
+		f.dropCompletion = false
+
+		return errObjectAmbiguous
+	}
+	if f.rival != nil {
+		f.objects[key] = *f.rival
+		f.rival = nil
+	}
 	if _, exists := f.objects[key]; exists {
 		return errObjectConflict
 	}
@@ -184,7 +246,7 @@ func (f *fakeBulk) CompleteMultipart(
 		f.partSizes = append(f.partSizes, len(chunk))
 		body = append(body, chunk...)
 	}
-	f.objects[key] = fakeBulkObject{body: body, modified: *f.now, upload: upload.upload}
+	f.objects[key] = fakeBulkObject{body: body, modified: *f.now, upload: upload.upload, etag: f.nextETag()}
 	delete(f.uploads, uploadID)
 	if f.loseCompletion {
 		f.loseCompletion = false
@@ -195,7 +257,10 @@ func (f *fakeBulk) CompleteMultipart(
 	return nil
 }
 
-func (f *fakeBulk) AbortMultipart(_ context.Context, _, uploadID string) error {
+func (f *fakeBulk) AbortMultipart(ctx context.Context, _, uploadID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.uploads, uploadID)
@@ -231,13 +296,16 @@ func (f *fakeBulk) Get(_ context.Context, key string) ([]byte, string, bool, err
 func (f *fakeBulk) Put(_ context.Context, key string, body []byte, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.objects[key] = fakeBulkObject{body: body, modified: *f.now}
+	f.objects[key] = fakeBulkObject{body: body, modified: *f.now, etag: f.nextETag()}
 
 	return "etag", nil
 }
 
-func (f *fakeBulk) List(_ context.Context, prefix string) ([]string, error) {
-	objects, err := f.ListObjects(context.Background(), prefix)
+func (f *fakeBulk) List(ctx context.Context, prefix string) ([]string, error) {
+	if f.failStateList != nil {
+		return nil, f.failStateList
+	}
+	objects, err := f.ListObjects(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -264,6 +332,22 @@ func archiveStore(now *time.Time) (*Store, *fakeBulk) {
 	}, "deployment/site", newFakeBlocks(), bulk, withBulk(bulk), withNow(func() time.Time { return *now }))
 
 	return store, bulk
+}
+
+// readerOf is a reader that only fails.
+type readerOf struct{ err error }
+
+func (r readerOf) Read([]byte) (int, error) { return 0, r.err }
+
+// listed is what S3 holds under a prefix.
+func listed(t *testing.T, bulk *fakeBulk, prefix string) []objectInfo {
+	t.Helper()
+	objects, err := bulk.ListObjects(t.Context(), prefix)
+	if err != nil {
+		t.Fatalf("list %q: %v", prefix, err)
+	}
+
+	return objects
 }
 
 func stage(t *testing.T, store *Store, upload, block string, body []byte) {
@@ -357,6 +441,56 @@ func TestTheFirstWriterOfAnArchiveWins(t *testing.T) {
 	}
 }
 
+// TWO COMMITS RACING: both found the key empty, and the condition on the completion is
+// what decides. The loser is told so, and leaves nothing billing.
+func TestACommitThatLosesTheRaceAtCompletionIsNotPublished(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	stage(t, store, "loser", "b", []byte("losers!!"))
+	bulk.rival = &fakeBulkObject{body: []byte("winner's"), modified: now, upload: "winner"}
+
+	published, err := store.CommitArchive(t.Context(), "ns/key", "loser", []string{"b"}, 8)
+	if err != nil {
+		t.Fatalf("the losing commit: %v", err)
+	}
+	if published {
+		t.Fatal("the loser was told it published")
+	}
+	if len(bulk.uploads) != 0 {
+		t.Fatal("the losing commit left a multipart upload billing")
+	}
+	if staged := listed(t, bulk, store.stagePrefix("loser")); len(staged) != 0 {
+		t.Fatalf("the losing commit kept %d staged blocks", len(staged))
+	}
+	got, err := store.MatchArchive(t.Context(), "ns/key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readWhole(t, store, got); string(body) != "winner's" {
+		t.Fatalf("the key holds %q", body)
+	}
+}
+
+// AN ANSWER LOST AND NOTHING LANDED: the upload is abandoned, and the blocks stay for
+// the client's own retry, because could-not-tell is not "published".
+func TestACommitWhoseAnswerWasLostAndDidNotLandFails(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	stage(t, store, "up1", "b", []byte("body"))
+	bulk.dropCompletion = true
+
+	published, err := store.CommitArchive(t.Context(), "ns/key", "up1", []string{"b"}, 4)
+	if !errors.Is(err, errObjectAmbiguous) || published {
+		t.Fatalf("CommitArchive = %v, %v; want the ambiguity reported", published, err)
+	}
+	if len(bulk.uploads) != 0 {
+		t.Fatal("the commit left a multipart upload billing")
+	}
+	if staged := listed(t, bulk, store.stagePrefix("up1")); len(staged) != 1 {
+		t.Fatalf("%d staged blocks remain; the retry needs its one", len(staged))
+	}
+}
+
 // A commit whose answer was lost may have landed. The object says whose it is.
 func TestACommitWhoseAnswerWasLostAsksTheObject(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
@@ -388,7 +522,7 @@ func TestACommitRefusesBlocksThatDoNotAddUp(t *testing.T) {
 	}{
 		{"a declared size that differs", []string{"b"}, 5},
 		{"a block never staged", []string{"b", "missing"}, 4},
-		{"no bytes at all", []string{"b"}, 0},
+		{"no bytes at all", nil, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store, bulk := archiveStore(&now)
@@ -416,8 +550,9 @@ func TestSmallBlocksAreRejoinedRatherThanRefusedByS3(t *testing.T) {
 	store, bulk := archiveStore(&now)
 	var blocks []string
 	var want []byte
-	for i := range 20 {
-		block := bytes.Repeat([]byte{byte('a' + i)}, 1<<20)
+	// PAST ONE BUFFER, so a part is sent from the middle of a block.
+	for i := range 70 {
+		block := bytes.Repeat([]byte{byte(i)}, 1<<20)
 		name := fmt.Sprintf("block-%02d", i)
 		stage(t, store, "up1", name, block)
 		blocks = append(blocks, name)
@@ -435,8 +570,32 @@ func TestSmallBlocksAreRejoinedRatherThanRefusedByS3(t *testing.T) {
 	if !bytes.Equal(readWhole(t, store, got), want) {
 		t.Fatal("rejoined bytes are not the blocks in order")
 	}
-	if len(bulk.partSizes) == 0 {
-		t.Fatal("no part was assembled")
+	if len(bulk.partSizes) != 2 || bulk.partSizes[0] != partBuffer {
+		t.Fatalf("parts of %v bytes, want one of the buffer's %d and the rest", bulk.partSizes, partBuffer)
+	}
+}
+
+// A BODY CUT SHORT READS LIKE A BLOCK THAT ENDED. Published, a short archive stays: the
+// first writer holds the key, every restore fails to extract, and each one refreshes
+// its marker so eviction never takes it.
+func TestARejoinThatReadsABlockShortPublishesNothing(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	for _, block := range []string{"a", "b"} {
+		stage(t, store, "up1", block, bytes.Repeat([]byte(block), 1<<20))
+	}
+	bulk.truncateGets = true
+
+	published, err := store.CommitArchive(t.Context(), "ns/key", "up1", []string{"a", "b"}, 2<<20)
+	if err == nil || published || !strings.Contains(err.Error(), "read back") {
+		t.Fatalf("CommitArchive = %v, %v; want the short read reported", published, err)
+	}
+	exists, err := store.ArchiveExists(t.Context(), "ns/key")
+	if err != nil || exists {
+		t.Fatalf("ArchiveExists = %v, %v; a truncated archive was published", exists, err)
+	}
+	if len(bulk.uploads) != 0 {
+		t.Fatal("the failed commit left a multipart upload billing")
 	}
 }
 
@@ -459,6 +618,25 @@ func TestAFailedAssemblyAbortsItsUpload(t *testing.T) {
 	}
 }
 
+// THE COMMIT'S OWN CONTEXT MAY BE WHY IT FAILED, and an upload left behind bills until
+// eviction finds it, so the abort does not ride on that context.
+func TestACancelledCommitStillAbortsItsUpload(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	stage(t, store, "up1", "b", []byte("body"))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	bulk.onCopy = cancel
+	bulk.failCopy = context.Canceled
+
+	if _, err := store.CommitArchive(ctx, "ns/key", "up1", []string{"b"}, 4); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CommitArchive = %v, want the cancellation", err)
+	}
+	if len(bulk.uploads) != 0 {
+		t.Fatal("a cancelled commit left a multipart upload billing")
+	}
+}
+
 func TestAnArchiveMatchesTheExactKeyThenTheNewestUnderTheFirstPrefix(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
 	store, _ := archiveStore(&now)
@@ -472,7 +650,8 @@ func TestAnArchiveMatchesTheExactKeyThenTheNewestUnderTheFirstPrefix(t *testing.
 	}
 	commit("ns/linux-old", "old")
 	now = now.Add(time.Hour)
-	commit("ns/linux-new", "new")
+	// NAMED TO SORT LAST, so only the date can choose it.
+	commit("ns/linux-z-new", "new")
 	commit("ns/darwin-1", "mac")
 	commit("ns/exact", "exact")
 
@@ -483,7 +662,7 @@ func TestAnArchiveMatchesTheExactKeyThenTheNewestUnderTheFirstPrefix(t *testing.
 		want     string
 	}{
 		{"the exact key beats every prefix", "ns/exact", []string{"ns/linux-"}, "ns/exact"},
-		{"the newest under a prefix", "ns/none", []string{"ns/linux-"}, "ns/linux-new"},
+		{"the newest under a prefix", "ns/none", []string{"ns/linux-"}, "ns/linux-z-new"},
 		{"the first prefix with a match", "ns/none", []string{"ns/windows-", "ns/darwin-", "ns/linux-"}, "ns/darwin-1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -507,18 +686,53 @@ func TestAnArchiveMatchesTheExactKeyThenTheNewestUnderTheFirstPrefix(t *testing.
 // UTF-8 all come back as they went in, and a restore prefix of one is still a prefix.
 func TestACacheKeySurvivesBeingAnObjectName(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
-	store, _ := archiveStore(&now)
+	store, bulk := archiveStore(&now)
 	key := "ns/node modules/100%-é\xff+?#/end"
 	stage(t, store, "up1", "b", []byte("body"))
 	if _, err := store.CommitArchive(t.Context(), key, "up1", []string{"b"}, 4); err != nil {
 		t.Fatalf("CommitArchive: %v", err)
 	}
-	got, err := store.MatchArchive(t.Context(), "ns/absent", []string{"ns/node modules/100%-é\xff"})
+	// THE RESTORE PREFIX STOPS BEFORE THE ESCAPES, so they come back through the name.
+	got, err := store.MatchArchive(t.Context(), "ns/absent", []string{"ns/node"})
 	if err != nil {
 		t.Fatalf("MatchArchive: %v", err)
 	}
 	if got.Key != key {
 		t.Fatalf("the key came back as %q", got.Key)
+	}
+	archives := listed(t, bulk, store.ownerPrefix()+"archives/")
+	if len(archives) != 1 {
+		t.Fatalf("archives = %v", archives)
+	}
+	for _, c := range []byte(archives[0].Key) {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.', c == '/', c == '%':
+		default:
+			t.Fatalf("the object is named %q; S3 and its signer each read %q their own way", archives[0].Key, c)
+		}
+	}
+}
+
+// ONE LOOKUP ANSWERS THE SAME WAY TWICE: of two as new, the smallest name, whatever
+// order the listing came in.
+func TestAnArchiveMatchedOnATieIsTheSmallestName(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	for _, key := range []string{"ns/tie-a", "ns/tie-b"} {
+		upload := "up-" + keyDigest(key)
+		stage(t, store, upload, "b", []byte("body"))
+		if _, err := store.CommitArchive(t.Context(), key, upload, []string{"b"}, 4); err != nil {
+			t.Fatalf("commit %q: %v", key, err)
+		}
+	}
+	bulk.reverseListing = true
+	got, err := store.MatchArchive(t.Context(), "ns/none", []string{"ns/tie-"})
+	if err != nil {
+		t.Fatalf("MatchArchive: %v", err)
+	}
+	if got.Key != "ns/tie-a" {
+		t.Fatalf("matched %q", got.Key)
 	}
 }
 
@@ -570,8 +784,105 @@ func TestARangeOfAnArchiveIsThatRange(t *testing.T) {
 			t.Fatalf("range (%d, %d) came back wrong", tc.start, tc.length)
 		}
 	}
-	if _, err := store.ReadArchive(t.Context(), archive, int64(size), 1); err == nil {
-		t.Fatal("a range past the archive's end was accepted")
+	if _, err := store.ReadArchive(t.Context(), archive, int64(size), 1); err == nil ||
+		!strings.Contains(err.Error(), "outside an archive") {
+		t.Fatalf("a range past the archive's end = %v", err)
+	}
+}
+
+// A KEY EVICTED AND SAVED AGAIN MID-DOWNLOAD IS ANOTHER ARCHIVE. A read fails rather than
+// hand the client the first half of one and the second half of the other.
+func TestAReadNeverMixesTwoArchivesOfOneKey(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	stage(t, store, "up1", "b", []byte("first"))
+	if _, err := store.CommitArchive(t.Context(), "ns/key", "up1", []string{"b"}, 5); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := store.MatchArchive(t.Context(), "ns/key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archive.ETag == "" {
+		t.Fatal("the match names no object")
+	}
+	name, err := store.archiveObject("ns/key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bulk.Delete(t.Context(), name); err != nil {
+		t.Fatal(err)
+	}
+	stage(t, store, "up2", "b", []byte("other"))
+	if _, err := store.CommitArchive(t.Context(), "ns/key", "up2", []string{"b"}, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := store.ReadArchive(t.Context(), archive, 0, archive.Size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if got, err := io.ReadAll(reader); !errors.Is(err, errObjectConflict) {
+		t.Fatalf("read %q and %v; want the object's change reported", got, err)
+	}
+}
+
+// A NODE TAKES 128 CONNECTIONS, AND A JOB CAN OPEN EVERY ONE AS A READ OF A SIGNED URL AND
+// STOP READING: fetching ahead on each would hold 5 GiB on a node of 4. Past the bound a
+// read is a plain stream, which holds nothing and returns the same bytes.
+func TestOnlySoManyReadsFetchAhead(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, _ := archiveStore(&now)
+	body := []byte("the archive's bytes")
+	stage(t, store, "up1", "b", body)
+	if _, err := store.CommitArchive(t.Context(), "ns/key", "up1", []string{"b"}, int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := store.MatchArchive(t.Context(), "ns/key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readers := make([]io.ReadCloser, 0, readAheadReaders)
+	for range readAheadReaders {
+		reader, err := store.ReadArchive(t.Context(), archive, 0, archive.Size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ahead := reader.(*rangeReader); !ahead {
+			t.Fatalf("read %d did not fetch ahead", len(readers))
+		}
+		readers = append(readers, reader)
+	}
+
+	past, err := store.ReadArchive(t.Context(), archive, 0, archive.Size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ahead := past.(*rangeReader); ahead {
+		t.Fatal("a read past the bound fetched ahead")
+	}
+	got, err := io.ReadAll(past)
+	if closeErr := past.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("the plain stream = %q, %v", got, err)
+	}
+
+	// A SLOT COMES BACK ONCE, however often its read is closed.
+	for range 2 {
+		if err := readers[0].Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if held := len(store.readAhead); held != readAheadReaders-1 {
+		t.Fatalf("%d slots held after one read closed twice", held)
+	}
+	for _, reader := range readers[1:] {
+		if err := reader.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -601,7 +912,7 @@ func TestAFailedChunkEndsTheReadRatherThanSkippingIt(t *testing.T) {
 
 func TestClosingAReadStopsItsFetching(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
-	store, _ := archiveStore(&now)
+	store, bulk := archiveStore(&now)
 	size := int64(16 * readChunk)
 	stage(t, store, "up1", "b", make([]byte, size))
 	if _, err := store.CommitArchive(t.Context(), "ns/key", "up1", []string{"b"}, size); err != nil {
@@ -611,6 +922,7 @@ func TestClosingAReadStopsItsFetching(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bulk.holdRanges = make(chan struct{}, 1)
 	reader, err := store.ReadArchive(t.Context(), archive, 0, size)
 	if err != nil {
 		t.Fatal(err)
@@ -618,16 +930,33 @@ func TestClosingAReadStopsItsFetching(t *testing.T) {
 	if _, err := reader.Read(make([]byte, 16)); err != nil {
 		t.Fatal(err)
 	}
-	// Close JOINS every goroutine the read started, so returning at all is the proof
-	// nothing is left blocked on a window nobody will drain.
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	select {
+	case <-bulk.holdRanges:
+	case <-guard.C:
+		t.Fatal("no fetch ever went ahead of the reader")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- reader.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-guard.C:
+		t.Fatal("Close did not end the fetches in flight")
+	}
+	// Close JOINS WHAT THE READ STARTED: every fetch it let begin has returned.
+	if started, returned := bulk.rangesStarted.Load(), bulk.rangesReturned.Load(); started == 0 || started != returned {
+		t.Fatalf("%d fetches started and %d returned by the time Close did", started, returned)
 	}
 }
 
 func TestEvictionTakesAnArchiveNobodyHasLookedUp(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
-	store, _ := archiveStore(&now)
+	store, bulk := archiveStore(&now)
 	commit := func(key string) {
 		t.Helper()
 		upload := "up-" + keyDigest(key)
@@ -638,8 +967,17 @@ func TestEvictionTakesAnArchiveNobodyHasLookedUp(t *testing.T) {
 	}
 	commit("ns/unused")
 	commit("ns/used")
+	commit("ns/found by prefix-1")
+	commit("ns/used with a space")
 	now = now.Add(5 * 24 * time.Hour)
 	if _, err := store.MatchArchive(t.Context(), "ns/used", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MatchArchive(t.Context(), "ns/used with a space", nil); err != nil {
+		t.Fatal(err)
+	}
+	// THE ARCHIVE A RESTORE KEY FOUND IS THE ONE IN USE, not the key that was asked for.
+	if _, err := store.MatchArchive(t.Context(), "ns/absent", []string{"ns/found by prefix-"}); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(3 * 24 * time.Hour)
@@ -647,7 +985,9 @@ func TestEvictionTakesAnArchiveNobodyHasLookedUp(t *testing.T) {
 	if err := store.Evict(t.Context(), 7*24*time.Hour); err != nil {
 		t.Fatalf("Evict: %v", err)
 	}
-	for key, want := range map[string]bool{"ns/unused": false, "ns/used": true} {
+	for key, want := range map[string]bool{
+		"ns/unused": false, "ns/used": true, "ns/found by prefix-1": true, "ns/used with a space": true,
+	} {
 		exists, err := store.ArchiveExists(t.Context(), key)
 		if err != nil {
 			t.Fatal(err)
@@ -655,6 +995,41 @@ func TestEvictionTakesAnArchiveNobodyHasLookedUp(t *testing.T) {
 		if exists != want {
 			t.Errorf("after eviction, %s exists = %v, want %v", key, exists, want)
 		}
+	}
+	if markers := listed(t, bulk, store.ownerPrefix()+"archive-used/"); len(markers) != 3 {
+		t.Errorf("%d markers survive, want the three used archives': %v", len(markers), markers)
+	}
+
+	// THE MARKER GOES WITH ITS ARCHIVE, or the prefix fills with records of nothing.
+	now = now.Add(8 * 24 * time.Hour)
+	if err := store.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if left := listed(t, bulk, store.ownerPrefix()+"archives/"); len(left) != 0 {
+		t.Errorf("archives nobody looked up survive: %v", left)
+	}
+	if markers := listed(t, bulk, store.ownerPrefix()+"archive-used/"); len(markers) != 0 {
+		t.Errorf("markers outlived their archives: %v", markers)
+	}
+}
+
+// ONE SNAPSHOT THAT REFUSES DELETION MUST NOT LEAVE EVERY ARCHIVE AND UPLOAD BILLING.
+func TestEvictionTakesObjectsWhateverTheVolumeHalfDid(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	stage(t, store, "up1", "b", []byte("body"))
+	if _, err := store.CommitArchive(t.Context(), "ns/key", "up1", []string{"b"}, 4); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(8 * 24 * time.Hour)
+	stateless := errors.New("the state index cannot be listed")
+	bulk.failStateList = stateless
+
+	if err := store.Evict(t.Context(), 7*24*time.Hour); !errors.Is(err, stateless) {
+		t.Fatalf("Evict = %v, want the volume half's failure reported", err)
+	}
+	if left := listed(t, bulk, store.ownerPrefix()+"archives/"); len(left) != 0 {
+		t.Fatalf("the object half did not run: %v", left)
 	}
 }
 
@@ -670,7 +1045,7 @@ func TestEvictionTakesAbandonedUploadsOnlyOnceNoJobCanBeFinishingThem(t *testing
 	if err := store.Evict(t.Context(), 7*24*time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if staged, _ := bulk.ListObjects(t.Context(), store.stagePrefix("abandoned")); len(staged) != 1 {
+	if staged := listed(t, bulk, store.stagePrefix("abandoned")); len(staged) != 1 {
 		t.Fatal("a block still inside the window was taken")
 	}
 	if len(bulk.uploads) != 1 {
@@ -681,13 +1056,13 @@ func TestEvictionTakesAbandonedUploadsOnlyOnceNoJobCanBeFinishingThem(t *testing
 	if err := store.Evict(t.Context(), 7*24*time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if staged, _ := bulk.ListObjects(t.Context(), store.stagePrefix("abandoned")); len(staged) != 0 {
+	if staged := listed(t, bulk, store.stagePrefix("abandoned")); len(staged) != 0 {
 		t.Fatal("an abandoned block outlived its window")
 	}
 	if len(bulk.uploads) != 0 {
 		t.Fatal("an abandoned multipart upload outlived its window")
 	}
-	if staged, _ := bulk.ListObjects(t.Context(), store.stagePrefix("live")); len(staged) != 1 {
+	if staged := listed(t, bulk, store.stagePrefix("live")); len(staged) != 1 {
 		t.Fatal("a recent upload's block was taken with the old one")
 	}
 }
@@ -742,7 +1117,8 @@ func TestEvictionSweepsOnlyEntriesNoRecentJobUsed(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
 	store, bulk := archiveStore(&now)
 	used, unused := blobRef(storecontract.BlobTableCAS, 'a'), blobRef(storecontract.BlobTableCAS, 'b')
-	otherKey := blobRef(storecontract.BlobTableCAS, 'c')
+	// THE DIGEST THE RECORD NAMES, under another key.
+	otherKey := blobRef(storecontract.BlobTableCAS, 'a')
 	for _, write := range []struct {
 		key string
 		ref storecontract.BlobRef
@@ -753,6 +1129,11 @@ func TestEvictionSweepsOnlyEntriesNoRecentJobUsed(t *testing.T) {
 	}
 	now = now.Add(5 * 24 * time.Hour)
 	if err := store.RecordBlobUse(t.Context(), "key", "job-1", []storecontract.BlobRef{used}); err != nil {
+		t.Fatal(err)
+	}
+	// WRITTEN INSIDE THE RETENTION AND USED BY NOTHING YET, as a job's fresh output is.
+	recent := blobRef(storecontract.BlobTableCAS, 'd')
+	if err := store.PutBlob(t.Context(), "key", recent, strings.NewReader("x"), 1); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(3 * 24 * time.Hour)
@@ -770,6 +1151,9 @@ func TestEvictionSweepsOnlyEntriesNoRecentJobUsed(t *testing.T) {
 	if _, ok := refs[unused]; ok {
 		t.Error("an entry nothing used was kept")
 	}
+	if _, ok := refs[recent]; !ok {
+		t.Error("an entry written within the retention was evicted")
+	}
 	// A USE OF ONE KEY KEEPS NOTHING OF ANOTHER'S: the same digest under another key
 	// is another scope's entry.
 	if refs, err := store.ListBlobs(t.Context(), "other"); err != nil || len(refs) != 0 {
@@ -784,13 +1168,107 @@ func TestEvictionSweepsOnlyEntriesNoRecentJobUsed(t *testing.T) {
 	if refs, err := store.ListBlobs(t.Context(), "key"); err != nil || len(refs) != 0 {
 		t.Errorf("after the record expired, ListBlobs = %v, %v", refs, err)
 	}
-	if uses, _ := bulk.ListObjects(t.Context(), store.ownerPrefix()+"blob-uses/"); len(uses) != 0 {
+	if uses := listed(t, bulk, store.ownerPrefix()+"blob-uses/"); len(uses) != 0 {
 		t.Errorf("%d expired use records were kept", len(uses))
 	}
 }
 
 // What a record names cannot be told from what nobody uses if it cannot be read, and
 // taking what a job uses is the one way the sweep can do harm.
+// ONE RECORD PER JOB: a second job's record must not replace the first's, or what only
+// the first used reads as unused.
+func TestEachJobKeepsItsOwnUseRecord(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	first, second := blobRef(storecontract.BlobTableCAS, 'a'), blobRef(storecontract.BlobTableCAS, 'b')
+	for _, ref := range []storecontract.BlobRef{first, second} {
+		if err := store.PutBlob(t.Context(), "key", ref, strings.NewReader("x"), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now = now.Add(5 * 24 * time.Hour)
+	if err := store.RecordBlobUse(t.Context(), "key", "job-1", []storecontract.BlobRef{first}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordBlobUse(t.Context(), "key", "job-2", []storecontract.BlobRef{second}); err != nil {
+		t.Fatal(err)
+	}
+	if uses := listed(t, bulk, store.ownerPrefix()+"blob-uses/"); len(uses) != 2 {
+		t.Fatalf("%d use records, want one per job", len(uses))
+	}
+	now = now.Add(3 * 24 * time.Hour)
+	if err := store.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := store.ListBlobs(t.Context(), "key"); err != nil || len(refs) != 2 {
+		t.Fatalf("what each job used = %v, %v", refs, err)
+	}
+}
+
+// NOT THE END OF THE RECORD, ONLY OF WHAT WAS READ: what it did not reach would read as
+// unused, and a record past the bound stops the sweep as one that cannot be read does.
+func TestAUseRecordPastTheBoundStopsTheSweep(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	ref := blobRef(storecontract.BlobTableCAS, 'a')
+	if err := store.PutBlob(t.Context(), "key", ref, strings.NewReader("x"), 1); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(8 * 24 * time.Hour)
+
+	var encoded bytes.Buffer
+	writer := gzip.NewWriter(&encoded)
+	line := []byte(string(storecontract.BlobTableCAS) + "/" + strings.Repeat("b", 64) + "\n")
+	for written := 0; written <= blobUseLimit; written += len(line) {
+		if _, err := writer.Write(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := bulk.PutStream(t.Context(), store.blobUseObject("key", "job"), bytes.NewReader(encoded.Bytes()),
+		int64(encoded.Len()), false); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Evict(t.Context(), 7*24*time.Hour); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("Evict = %v, want the record's size reported", err)
+	}
+	if refs, err := store.ListBlobs(t.Context(), "key"); err != nil || len(refs) != 1 {
+		t.Fatalf("the sweep took an entry a record may name: %v, %v", refs, err)
+	}
+}
+
+// SO BILLET ITSELF NEVER WRITES ONE: a job past one piece's entries gets several, and
+// what the last of them names is kept like the rest.
+func TestAJobThatUsedALotKeepsAllOfIt(t *testing.T) {
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	store, bulk := archiveStore(&now)
+	used := make([]storecontract.BlobRef, blobUseEntries+1)
+	for i := range used {
+		used[i] = storecontract.BlobRef{Table: storecontract.BlobTableCAS, Digest: fmt.Sprintf("%064x", i)}
+	}
+	last := used[len(used)-1]
+	if err := store.PutBlob(t.Context(), "key", last, strings.NewReader("x"), 1); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(5 * 24 * time.Hour)
+	if err := store.RecordBlobUse(t.Context(), "key", "job", used); err != nil {
+		t.Fatalf("RecordBlobUse: %v", err)
+	}
+	if uses := listed(t, bulk, store.ownerPrefix()+"blob-uses/"); len(uses) != 2 {
+		t.Fatalf("%d records for one job past a piece's entries, want 2", len(uses))
+	}
+	now = now.Add(3 * 24 * time.Hour)
+	if err := store.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if refs, err := store.ListBlobs(t.Context(), "key"); err != nil || len(refs) != 1 {
+		t.Fatalf("what the second piece names = %v, %v", refs, err)
+	}
+}
+
 func TestAUseRecordThatCannotBeReadStopsTheSweep(t *testing.T) {
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
 	store, bulk := archiveStore(&now)
@@ -838,10 +1316,12 @@ func TestPurgeRemovesTheObjectHalfAndLeavesNoUploadBilling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
-	if report.CacheObjects == 0 {
-		t.Fatal("Purge reports no cache objects")
+	// THE ARCHIVE, THE ENTRY, THE ABANDONED BLOCK AND THE UPLOAD, and not the state
+	// object, which the state half's own count covers.
+	if report.CacheObjects != 4 {
+		t.Fatalf("Purge reports %d cache objects, want 4", report.CacheObjects)
 	}
-	if left, _ := bulk.ListObjects(t.Context(), store.ownerPrefix()); len(left) != 0 {
+	if left := listed(t, bulk, store.ownerPrefix()); len(left) != 0 {
 		t.Fatalf("Purge left %d objects: %v", len(left), left)
 	}
 	if len(bulk.uploads) != 0 {

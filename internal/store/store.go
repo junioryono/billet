@@ -191,6 +191,9 @@ type Archive struct {
 	Key      string
 	Size     int64
 	Modified time.Time
+	// ETag is which object this is, so a read never mixes the bytes of a key's archive
+	// with those of another published under it after an eviction.
+	ETag string
 }
 
 // ErrArchiveSize means the blocks a commit names do not add up to the size the
@@ -247,8 +250,9 @@ type BlobRef struct {
 // AN ENTRY'S NAME IS WHAT IT HOLDS, or a job's claim that first-writer-wins keeps,
 // so concurrent jobs merge by writing and there is no generation to publish.
 type BlobStore interface {
-	// ListBlobs is every entry a key holds, so a miss costs the store no request.
-	ListBlobs(ctx context.Context, key string) (map[BlobRef]struct{}, error)
+	// ListBlobs is every entry a key holds and its size, so a miss, and asking whether
+	// an entry is there, costs the store no request.
+	ListBlobs(ctx context.Context, key string) (map[BlobRef]int64, error)
 	// ReadBlob reads one entry. ErrMiss means it is not there.
 	ReadBlob(ctx context.Context, key string, ref BlobRef) (io.ReadCloser, error)
 	// PutBlob stores one entry unless it is already there, which is not an error.

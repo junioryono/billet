@@ -61,7 +61,7 @@ func TestRealArchiveStore(t *testing.T) {
 	}
 	second := []byte("the last block may be any size")
 	for name, body := range map[string][]byte{"block-1": first, "block-2": second} {
-		if err := store.StageArchive(ctx, "up1", name, bytes.NewReader(body), int64(len(body))); err != nil {
+		if err := store.StageArchive(ctx, "up1", name, io.MultiReader(bytes.NewReader(body)), int64(len(body))); err != nil {
 			t.Fatalf("StageArchive(%s): %v", name, err)
 		}
 	}
@@ -165,7 +165,7 @@ func TestRealArchiveStore(t *testing.T) {
 	// THE CONTENT-ADDRESSED HALF.
 	ref := storecontract.BlobRef{Table: storecontract.BlobTableCAS, Digest: strings.Repeat("a", 64)}
 	for _, body := range []string{"entry", "other"} {
-		if err := store.PutBlob(ctx, "cas-key", ref, strings.NewReader(body), 5); err != nil {
+		if err := store.PutBlob(ctx, "cas-key", ref, io.MultiReader(strings.NewReader(body)), 5); err != nil {
 			t.Fatalf("PutBlob: %v", err)
 		}
 	}
@@ -201,5 +201,8 @@ func TestRealArchiveStore(t *testing.T) {
 	}
 	if refs, err := store.ListBlobs(ctx, "cas-key"); err != nil || len(refs) != 1 {
 		t.Fatalf("eviction took a recent entry: %v, %v", refs, err)
+	}
+	if exists, err := store.ArchiveExists(ctx, key); err != nil || !exists {
+		t.Fatalf("eviction took a recent archive: %v, %v", exists, err)
 	}
 }

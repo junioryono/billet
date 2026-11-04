@@ -30,7 +30,13 @@ discard_attached() {
 }
 
 start_cold() {
-	if ! systemctl start docker.service; then
+	# A DAEMON ALREADY RUNNING READ ITS CONFIGURATION BEFORE THE BOOT CHANGED IT, on an
+	# image that enables Docker at boot, and `start` would leave it as it was.
+	action=start
+	if [ -n "${BILLET_DOCKER_CONFIG_CHANGED:-}" ]; then
+		action=restart
+	fi
+	if ! systemctl "$action" docker.service; then
 		log "Docker did not start"
 
 		return 1

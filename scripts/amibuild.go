@@ -49,8 +49,12 @@ var guestImageScript string
 // `# <marker>_END`, whole lines and unchanged, so the EC2 image runs what the
 // firecracker guest runs.
 func GuestImageBlock(marker string) (string, error) {
+	return cutGuestImageBlock(guestImageScript, marker)
+}
+
+func cutGuestImageBlock(script, marker string) (string, error) {
 	begin, end := "# "+marker+"_BEGIN", "# "+marker+"_END\n"
-	_, rest, found := strings.Cut(guestImageScript, begin)
+	_, rest, found := strings.Cut(script, begin)
 	if !found {
 		return "", fmt.Errorf("the guest build no longer marks %s", marker)
 	}

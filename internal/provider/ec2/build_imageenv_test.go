@@ -257,6 +257,41 @@ func (f launchFixture) run(t *testing.T, exported map[string]string) (string, st
 	return stdout.String(), stderr.String(), err
 }
 
+// THE RUNNER RUNS ONE JOB-STARTED HOOK. Interception's takes it, and runs this image's
+// after its own, so a job on an intercepted tier still gets its timing line. The
+// stream names the hook twice, and the helper exports in order, so the library's wins.
+func TestInterceptionsHookTakesTheRunnersOneSlotAndNamesTheImagesNext(t *testing.T) {
+	t.Parallel()
+
+	f := newLaunchFixture(t, "ImageOS=ubuntu24\n")
+	const hook = "/opt/actions-runner/_work/_billet/actions-cache-job-started.sh"
+	script := strings.Replace(f.script, "runner_env=(", "runner_env=(\"ACTIONS_RUNNER_HOOK_JOB_STARTED="+hook+"\" ", 1)
+	if script == f.script {
+		t.Fatal("the fixture's runner_env is no longer where this adds to it")
+	}
+	f.script = script
+
+	out, stderr, err := f.run(t, map[string]string{jitEnvVar: "jit", "BILLET_LAUNCH_EPOCH_NS": "111"})
+	if err != nil {
+		t.Fatalf("the launch failed: %v\n%s", err, stderr)
+	}
+	var hooks, next []string
+	for _, line := range strings.Split(out, "\n") {
+		if value, ok := strings.CutPrefix(line, "ACTIONS_RUNNER_HOOK_JOB_STARTED="); ok {
+			hooks = append(hooks, value)
+		}
+		if value, ok := strings.CutPrefix(line, "BILLET_JOB_STARTED_NEXT="); ok {
+			next = append(next, value)
+		}
+	}
+	if !slices.Equal(hooks, []string{hook}) {
+		t.Errorf("the runner's job-started hook is %q, want interception's alone", hooks)
+	}
+	if !slices.Equal(next, []string{jobTimingHookPath}) {
+		t.Errorf("the hook after it is %q, want this image's timing hook", next)
+	}
+}
+
 // THE RUNNER'S ENVIRONMENT IS EXACTLY THE LISTED SET, AND NO VALUE IS IN AN
 // ARGUMENT LIST (#352). This runs the entry point's own launch, so it proves the
 // image's variables, the fixed assignments and the registration all reach the

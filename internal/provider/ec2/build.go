@@ -1487,8 +1487,10 @@ func entryPointScript() string {
 	// ATTACH THE IMAGE STORE BEFORE STARTING THE RUNNER. The helper stops Docker if
 	// cloud-init already started it, mounts the cache, and starts it again before
 	// service containers can be pulled. Every cache failure falls back to the root
-	// disk and a cold pull.
-	b.WriteString("/usr/local/bin/billet-docker-cache prepare\n")
+	// disk and a cold pull. This image enables Docker at boot, so the daemon may have
+	// read daemon.json before the line above changed it, and the helper is told: a
+	// container would otherwise be answered that the npm registry is its own loopback.
+	b.WriteString("BILLET_DOCKER_CONFIG_CHANGED=${container_dns_active:-} /usr/local/bin/billet-docker-cache prepare\n")
 
 	// WAIT FOR DOCKER BEFORE STARTING THE RUNNER, because billet's boot script
 	// invokes this the moment cloud-init reaches it and the daemon may not be up.
@@ -1512,6 +1514,7 @@ func entryPointScript() string {
 	// which the passthroughs tunnel through on this image, then the passthroughs and
 	// the container resolver. None of it can fail the job.
 	b.WriteString("billet_guest_caches_relay\n")
+	b.WriteString("billet_guest_caches_probe\n")
 	b.WriteString("billet_guest_caches_through_relay\n")
 	b.WriteString("billet_guest_caches_start\n")
 	b.WriteString("billet_guest_caches_env\n")

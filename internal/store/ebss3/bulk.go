@@ -39,6 +39,7 @@ type objectInfo struct {
 	Key      string
 	Size     int64
 	Modified time.Time
+	ETag     string
 }
 
 // multipartInfo is one multipart upload S3 has not finished.
@@ -62,7 +63,7 @@ var errObjectAbsent = errors.New("ebs-s3: no such object")
 // bodies too large to hold, ranges, and listings that say more than a name.
 type bulkAPI interface {
 	PutStream(ctx context.Context, key string, body io.Reader, size int64, ifAbsent bool) error
-	GetRange(ctx context.Context, key string, start, length int64) (io.ReadCloser, error)
+	GetRange(ctx context.Context, key, etag string, start, length int64) (io.ReadCloser, error)
 	GetAll(ctx context.Context, key string) (io.ReadCloser, error)
 	Head(ctx context.Context, key string) (objectInfo, string, error)
 	ListObjects(ctx context.Context, prefix string) ([]objectInfo, error)
@@ -151,10 +152,8 @@ func idempotent[T any](ctx context.Context, call func() (T, error)) (T, error) {
 		if err == nil || !retryable(err) || attempt == bulkAttempts-1 {
 			return value, err
 		}
-		select {
-		case <-ctx.Done():
-			return value, ctx.Err()
-		case <-time.After(bulkBackoff << attempt):
+		if err := waitContext(ctx, bulkBackoff<<attempt); err != nil {
+			return value, err
 		}
 	}
 
@@ -184,8 +183,9 @@ func (s s3API) PutStream(
 		headers.Set("If-None-Match", "*")
 	}
 	if size == 0 {
-		// A zero-length body is what net/http sends for http.NoBody, and an empty
-		// reader of any other type would make it ask for chunked encoding.
+		// A zero-length body is what net/http sends for http.NoBody. For any other
+		// reader it first reads to see whether there is a body, and a reader slower
+		// than its short wait goes chunked, which S3 refuses on a PUT.
 		body = http.NoBody
 	}
 	response, err := s.send(ctx, http.MethodPut, key, nil, body, size, headers)
@@ -203,12 +203,16 @@ func (s s3API) PutStream(
 	}
 }
 
-// GetRange reads length bytes of an object from start.
+// GetRange reads length bytes of an object from start, if it is still the object
+// etag names, when one is named.
 func (s s3API) GetRange(
-	ctx context.Context, key string, start, length int64,
+	ctx context.Context, key, etag string, start, length int64,
 ) (io.ReadCloser, error) {
 	headers := make(http.Header)
 	headers.Set("Range", "bytes="+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(start+length-1, 10))
+	if etag != "" {
+		headers.Set("If-Match", etag)
+	}
 
 	return idempotent(ctx, func() (io.ReadCloser, error) {
 		return s.get(ctx, key, headers, http.StatusPartialContent)
@@ -296,6 +300,7 @@ func (s s3API) ListObjects(ctx context.Context, prefix string) ([]objectInfo, er
 				Key      string    `xml:"Key"`
 				Size     int64     `xml:"Size"`
 				Modified time.Time `xml:"LastModified"`
+				ETag     string    `xml:"ETag"`
 			} `xml:"Contents"`
 			Truncated    bool   `xml:"IsTruncated"`
 			Continuation string `xml:"NextContinuationToken"`
@@ -304,7 +309,9 @@ func (s s3API) ListObjects(ctx context.Context, prefix string) ([]objectInfo, er
 			return nil, err
 		}
 		for _, item := range page.Contents {
-			objects = append(objects, objectInfo{Key: item.Key, Size: item.Size, Modified: item.Modified})
+			objects = append(objects, objectInfo{
+				Key: item.Key, Size: item.Size, Modified: item.Modified, ETag: item.ETag,
+			})
 		}
 		if !page.Truncated {
 			return objects, nil

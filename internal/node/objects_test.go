@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
@@ -32,13 +33,21 @@ type objectStore struct {
 	staged   map[string]map[string][]byte
 	blobs    map[string]map[storecontract.BlobRef][]byte
 	uses     map[string][]storecontract.BlobRef
-	aborted  []string
-	// commitErr fails the next commits, and putErr every PutBlob.
+	// useIDs is the id of each record, in the order they were written.
+	useIDs  []string
+	aborted []string
+	// commitErr fails the next commits, abortErr every abort, and putErr every PutBlob.
 	commitErr error
+	abortErr  error
 	putErr    error
-	puts      []storecontract.BlobRef
-	listings  int
-	reads     int
+	// commitGate, when set, holds every commit until it is closed.
+	commitGate chan struct{}
+	// putTogether, when set, holds each PutBlob until that many are in flight.
+	putTogether int
+	putArrived  chan struct{}
+	puts        []storecontract.BlobRef
+	listings    int
+	reads       int
 }
 
 type objectArchive struct {
@@ -104,6 +113,12 @@ func (s *objectStore) CommitArchive(
 	_ context.Context, key, upload string, blocks []string, size int64,
 ) (bool, error) {
 	s.mu.Lock()
+	gate := s.commitGate
+	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.commitErr != nil {
 		err := s.commitErr
@@ -134,6 +149,9 @@ func (s *objectStore) CommitArchive(
 func (s *objectStore) AbortArchive(_ context.Context, upload string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.abortErr != nil {
+		return s.abortErr
+	}
 	delete(s.staged, upload)
 	s.aborted = append(s.aborted, upload)
 
@@ -153,13 +171,13 @@ func (s *objectStore) ReadArchive(
 	return io.NopCloser(bytes.NewReader(stored.body[start : start+length])), nil
 }
 
-func (s *objectStore) ListBlobs(_ context.Context, key string) (map[storecontract.BlobRef]struct{}, error) {
+func (s *objectStore) ListBlobs(_ context.Context, key string) (map[storecontract.BlobRef]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.listings++
-	refs := make(map[storecontract.BlobRef]struct{})
-	for ref := range s.blobs[key] {
-		refs[ref] = struct{}{}
+	refs := make(map[storecontract.BlobRef]int64)
+	for ref, body := range s.blobs[key] {
+		refs[ref] = int64(len(body))
 	}
 
 	return refs, nil
@@ -180,11 +198,36 @@ func (s *objectStore) ReadBlob(
 }
 
 func (s *objectStore) PutBlob(
-	_ context.Context, key string, ref storecontract.BlobRef, body io.Reader, _ int64,
+	_ context.Context, key string, ref storecontract.BlobRef, body io.Reader, size int64,
 ) error {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
+	}
+	// S3 STORES WHAT THE LENGTH SAYS, whatever the reader held.
+	if int64(len(data)) != size {
+		return errors.New("an entry's length was not what it declared")
+	}
+	s.mu.Lock()
+	together, arrived := s.putTogether, s.putArrived
+	s.mu.Unlock()
+	if together > 0 {
+		arrived <- struct{}{}
+		guard := time.NewTimer(10 * time.Second)
+		defer guard.Stop()
+		for {
+			s.mu.Lock()
+			reached := len(arrived) >= together
+			s.mu.Unlock()
+			if reached {
+				break
+			}
+			select {
+			case <-guard.C:
+				return errors.New("no other upload ran beside this one")
+			case <-time.After(time.Millisecond):
+			}
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -203,11 +246,12 @@ func (s *objectStore) PutBlob(
 }
 
 func (s *objectStore) RecordBlobUse(
-	_ context.Context, key, _ string, used []storecontract.BlobRef,
+	_ context.Context, key, id string, used []storecontract.BlobRef,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.uses[key] = append(s.uses[key], used...)
+	s.useIDs = append(s.useIDs, id)
 
 	return nil
 }
@@ -259,7 +303,18 @@ func actionsCall(
 	return responseJSON(t, response)
 }
 
-// putBlock uploads one block, with the length Azure's client always sends.
+// jsonString is a non-empty string field of an answer.
+func jsonString(t *testing.T, answer map[string]any, name string) string {
+	t.Helper()
+	value, ok := answer[name].(string)
+	if !ok || value == "" {
+		t.Fatalf("the answer's %s is not a string: %v", name, answer)
+	}
+
+	return value
+}
+
+// blobLeg uploads one block, with the length Azure's client always sends.
 func blobLeg(
 	t *testing.T, service *CacheService, session *cacheSession, target, body string,
 ) *http.Response {
@@ -279,8 +334,8 @@ func stagedUpload(
 ) {
 	t.Helper()
 	created := actionsCall(t, service, session, actionsCreatePath, `{"key":"`+key+`","version":"v1"}`)
-	uploadURL, _ := created["signed_upload_url"].(string)
-	if created["ok"] != true || uploadURL == "" {
+	uploadURL := jsonString(t, created, "signed_upload_url")
+	if created["ok"] != true {
 		t.Fatalf("CreateCacheEntry = %v", created)
 	}
 	parsed, err := url.Parse(uploadURL)
@@ -331,8 +386,8 @@ func TestAnActionsArchiveOnAStoreOfObjectsTouchesNoVolume(t *testing.T) {
 
 	found := actionsCall(t, service, session, actionsDownloadPath,
 		`{"key":"linux-npm-abc","restore_keys":[],"version":"v1"}`)
-	downloadURL, _ := found["signed_download_url"].(string)
-	if found["ok"] != true || found["matched_key"] != "linux-npm-abc" || downloadURL == "" {
+	downloadURL := jsonString(t, found, "signed_download_url")
+	if found["ok"] != true || found["matched_key"] != "linux-npm-abc" {
 		t.Fatalf("GetCacheEntryDownloadURL = %v", found)
 	}
 
@@ -373,7 +428,7 @@ func TestASingleShotUploadIsAnArchiveOfOneBlock(t *testing.T) {
 	service, storage, _ := objectService(t)
 	session := objectActionsSession(t, service, "billet-actions")
 	created := actionsCall(t, service, session, actionsCreatePath, `{"key":"small","version":"v1"}`)
-	uploadURL, _ := created["signed_upload_url"].(string)
+	uploadURL := jsonString(t, created, "signed_upload_url")
 
 	request := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
 	request.ContentLength = 12
@@ -405,7 +460,7 @@ func TestABlockOfUnknownLengthIsRefusedRatherThanSpooled(t *testing.T) {
 	service, storage, _ := objectService(t)
 	session := objectActionsSession(t, service, "billet-actions")
 	created := actionsCall(t, service, session, actionsCreatePath, `{"key":"unknown","version":"v1"}`)
-	uploadURL, _ := created["signed_upload_url"].(string)
+	uploadURL := jsonString(t, created, "signed_upload_url")
 
 	request := actionsRequestForTest(t, http.MethodPut, uploadURL+"&comp=block&blockid=YQ==", "body")
 	request.ContentLength = -1
@@ -456,6 +511,10 @@ func TestAFinalizationThatDoesNotAddUpPublishesNothing(t *testing.T) {
 	if len(storage.archives) != 0 {
 		t.Fatalf("published %v", storage.archives)
 	}
+	// A RETRY WILL NOT CHANGE THE CLIENT'S ACCOUNT, so its blocks are not kept for one.
+	if len(storage.aborted) != 1 || len(storage.staged) != 0 {
+		t.Fatalf("aborted %v, staged %v", storage.aborted, storage.staged)
+	}
 }
 
 // A STORE FAILURE AT THE COMMIT LEAVES THE RECEIPT, and the client's retry finishes
@@ -475,8 +534,11 @@ func TestACommitThatFailedIsFinishedByTheRetriedFinalization(t *testing.T) {
 
 		return service.actionsResponse(request, session)
 	}
-	if _, _, err := finalize(); err == nil {
-		t.Fatal("a failed commit answered success")
+	if response, _, err := finalize(); err == nil || !strings.Contains(err.Error(), "s3 went away") {
+		if response != nil {
+			response.Body.Close()
+		}
+		t.Fatalf("a failed commit answered %v", err)
 	}
 	response, handled, err := finalize()
 	if err != nil || !handled {
@@ -505,8 +567,12 @@ func TestAnObjectReceiptSurvivesARestart(t *testing.T) {
 	storage.mu.Unlock()
 	request := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
 		`{"key":"restart","version":"v1","size_bytes":"4"}`)
-	if _, _, err := service.actionsResponse(request, session); err == nil {
-		t.Fatal("a failed commit answered success")
+	if response, _, err := service.actionsResponse(request, session); err == nil ||
+		!strings.Contains(err.Error(), "s3 went away") {
+		if response != nil {
+			response.Body.Close()
+		}
+		t.Fatalf("a failed commit answered %v", err)
 	}
 
 	restarted, err := NewCacheService("https://10.0.0.1:9443", "test-deployment", root,
@@ -586,15 +652,143 @@ func TestAnObjectStoreTakesMoreArchivesThanAVolumeStoreCould(t *testing.T) {
 	session.mu.Unlock()
 	request := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsCreatePath,
 		`{"key":"past-the-ceiling","version":"v1"}`)
-	if _, _, err := service.actionsResponse(request, session); err == nil ||
+	if response, _, err := service.actionsResponse(request, session); err == nil ||
 		!strings.Contains(err.Error(), "too many") {
+		if response != nil {
+			response.Body.Close()
+		}
 		t.Fatalf("past the ceiling = %v", err)
+	}
+	// A LOOKUP COUNTS THE SAME WAY, or one job's mode=max restore is held to what a
+	// volume costs.
+	lookup := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsDownloadPath,
+		`{"key":"past-the-ceiling","restore_keys":[],"version":"v1"}`)
+	if response, _, err := service.actionsResponse(lookup, session); err == nil ||
+		!strings.Contains(err.Error(), "too many") {
+		if response != nil {
+			response.Body.Close()
+		}
+		t.Fatalf("a lookup past the ceiling = %v", err)
 	}
 	session.mu.Lock()
 	for i := range actionsObjectArchives {
 		delete(session.actions, "filler"+strconv.Itoa(i))
 	}
 	session.mu.Unlock()
+	if got := actionsCall(t, service, session, actionsDownloadPath,
+		`{"key":"absent","restore_keys":[],"version":"v1"}`); got["ok"] != false {
+		t.Fatalf("a lookup past a volume store's ceiling = %v", got)
+	}
+}
+
+// A RESTORE KEY FINDS THE ARCHIVE UNDER IT, under the job's own scope and with the
+// client's own name back.
+func TestARestoreKeyFindsAnArchiveOnAStoreOfObjects(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	session := objectActionsSession(t, service, "billet-actions")
+	stagedUpload(t, service, session, "linux-npm-abc", []string{"body"}, []string{"a"})
+	if got := actionsCall(t, service, session, actionsFinalizePath,
+		`{"key":"linux-npm-abc","version":"v1","size_bytes":"4"}`); got["ok"] != true {
+		t.Fatalf("FinalizeCacheEntryUpload = %v", got)
+	}
+	found := actionsCall(t, service, session, actionsDownloadPath,
+		`{"key":"linux-npm-new","restore_keys":["linux-npm-"],"version":"v1"}`)
+	if found["ok"] != true || found["matched_key"] != "linux-npm-abc" {
+		t.Fatalf("a restore key's lookup = %v", found)
+	}
+}
+
+// A COMMIT CAN TAKE MINUTES, AND THE REST OF THE JOB'S CACHE CALLS MUST NOT QUEUE BEHIND
+// IT: BuildKit saves its layers side by side.
+func TestACommitDoesNotHoldTheSession(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	session := objectActionsSession(t, service, "billet-actions")
+	stagedUpload(t, service, session, "slow", []string{"body"}, []string{"a"})
+	gate := make(chan struct{})
+	storage.mu.Lock()
+	storage.commitGate = gate
+	storage.mu.Unlock()
+
+	finished := make(chan map[string]any, 1)
+	go func() {
+		finished <- actionsCall(t, service, session, actionsFinalizePath,
+			`{"key":"slow","version":"v1","size_bytes":"4"}`)
+	}()
+
+	// HELD UNTIL THE RECEIPT IS DURABLE, then given up for the commit.
+	guard, stop := context.WithTimeout(t.Context(), 30*time.Second)
+	defer stop()
+	for {
+		if err := lockCacheSession(guard, session); err != nil {
+			close(gate)
+			t.Fatalf("the session stayed held through the commit: %v", err)
+		}
+		_, recorded := session.receipts[actionsReceiptID("slow", "v1")]
+		session.mu.Unlock()
+		if recorded {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waited, stopWait := context.WithTimeout(t.Context(), 2*time.Second)
+	defer stopWait()
+	err := lockCacheSession(waited, session)
+	if err == nil {
+		session.mu.Unlock()
+	}
+	close(gate)
+	if err != nil {
+		t.Fatalf("the session is held during the commit: %v", err)
+	}
+	if got := <-finished; got["ok"] != true {
+		t.Fatalf("the finalization = %v", got)
+	}
+}
+
+// A SAVE THAT NEVER FINISHED COMMITTING LEFT ITS BLOCKS, and its archive is by then a
+// receipt, so the session's end has to look there too.
+func TestAFailedCommitsBlocksAreReleasedWhenTheJobEnds(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	session := objectActionsSession(t, service, "billet-actions")
+	stagedUpload(t, service, session, "failed", []string{"body"}, []string{"a"})
+	storage.mu.Lock()
+	storage.commitErr = errors.New("s3 went away")
+	storage.mu.Unlock()
+	request := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"failed","version":"v1","size_bytes":"4"}`)
+	if response, _, err := service.actionsResponse(request, session); err == nil {
+		if response != nil {
+			response.Body.Close()
+		}
+		t.Fatal("a failed commit answered success")
+	}
+
+	closeAndRetry(t, service, "billet-actions")
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if len(storage.aborted) != 1 || len(storage.staged) != 0 {
+		t.Fatalf("aborted %v, staged %v", storage.aborted, storage.staged)
+	}
+}
+
+// EVICTION TAKES STAGED BLOCKS ANYWAY, so one abort that fails is no reason to keep a
+// finished job's session open: a node upgraded before its IAM would retry them for ever.
+func TestAnAbortThatFailsDoesNotHoldTheSessionOpen(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	session := objectActionsSession(t, service, "billet-actions")
+	stagedUpload(t, service, session, "abandoned", []string{"body"}, []string{"a"})
+	storage.mu.Lock()
+	storage.abortErr = errors.New("AccessDenied")
+	storage.mu.Unlock()
+
+	closeAndRetry(t, service, "billet-actions")
+	if service.sessionOf("billet-actions") != nil {
+		t.Fatal("a failed abort kept the session open")
+	}
 }
 
 func TestTheKillSwitchStillSendsAnObjectStoresCallsToGitHub(t *testing.T) {
@@ -605,7 +799,10 @@ func TestTheKillSwitchStillSendsAnObjectStoresCallsToGitHub(t *testing.T) {
 
 	request := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsCreatePath,
 		`{"key":"blocked","version":"v1"}`)
-	_, handled, err := service.actionsResponse(request, session)
+	response, handled, err := service.actionsResponse(request, session)
+	if response != nil {
+		defer response.Body.Close()
+	}
 	if err != nil || handled {
 		t.Fatalf("handled=%t error=%v; a disabled cache goes to GitHub", handled, err)
 	}
@@ -617,12 +814,10 @@ func TestTheKillSwitchStillSendsAnObjectStoresCallsToGitHub(t *testing.T) {
 }
 
 // objectCAS opens a session for a lease, named as a real instance of it is.
-func objectCAS(
-	t *testing.T, service *CacheService, lease string, trust provider.TrustClass,
-) string {
+func objectCAS(t *testing.T, service *CacheService, lease string) string {
 	t.Helper()
 	credentials, err := service.PrepareScoped(provider.InstanceName(lease), CacheSessionScope{
-		Trust: trust, LeaseID: lease, Epoch: 1, Cache: goBazelCache(),
+		Trust: provider.TrustTrusted, LeaseID: lease, Epoch: 1, Cache: goBazelCache(),
 	})
 	if err != nil {
 		t.Fatalf("PrepareScoped: %v", err)
@@ -647,7 +842,7 @@ func TestACompletedJobsEntriesAreUploadedAndNothingIsMounted(t *testing.T) {
 	t.Parallel()
 	service, storage, volumes := objectService(t)
 	instance := provider.InstanceName(scopedLease)
-	token := objectCAS(t, service, scopedLease, provider.TrustTrusted)
+	token := objectCAS(t, service, scopedLease)
 	body := "go object"
 	if code := putObject(t, service, token, body); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
@@ -688,12 +883,16 @@ func TestACompletedJobsEntriesAreUploadedAndNothingIsMounted(t *testing.T) {
 		t.Fatalf("use records: %v", storage.uses)
 	}
 	entries, err := os.ReadDir(casRoot(service))
-	if err == nil {
-		for _, entry := range entries {
-			kinds, _ := os.ReadDir(filepath.Join(casRoot(service), entry.Name()))
-			if len(kinds) != 0 {
-				t.Fatalf("a finished session left %v on the node's disk", kinds)
-			}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		kinds, err := os.ReadDir(filepath.Join(casRoot(service), entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(kinds) != 0 {
+			t.Fatalf("a finished session left %v on the node's disk", kinds)
 		}
 	}
 }
@@ -702,7 +901,7 @@ func TestAJobThatNeverCompletedPublishesNothing(t *testing.T) {
 	t.Parallel()
 	service, storage, _ := objectService(t)
 	instance := provider.InstanceName(scopedLease)
-	token := objectCAS(t, service, scopedLease, provider.TrustTrusted)
+	token := objectCAS(t, service, scopedLease)
 	if code := putObject(t, service, token, "unauthorised"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
@@ -714,14 +913,290 @@ func TestAJobThatNeverCompletedPublishesNothing(t *testing.T) {
 	}
 }
 
+// WHAT A JOB READ IS WHAT KEEPS IT FROM EVICTION, whether or not the job's own writes were
+// published; what it wrote and threw away keeps nothing. Each job has a record of its own,
+// or the second would replace the first's and what only the first read would go.
+func TestAJobsRecordNamesWhatItReadAndWhatItPublished(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	published := "published by the first job"
+	token := objectCAS(t, service, scopedLease)
+	if code := putObject(t, service, token, published); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, provider.InstanceName(scopedLease))
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := objectCAS(t, service, "reader")
+	if got := casRequest(t, service, reader, http.MethodGet, "/v1/cas/go/cas/"+digestOf(published), ""); got.Code != http.StatusOK {
+		t.Fatalf("GET = %d", got.Code)
+	}
+	discarded := "written and never published"
+	if code := putObject(t, service, reader, discarded); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	closeAndRetry(t, service, provider.InstanceName("reader"))
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if len(storage.useIDs) != 2 || storage.useIDs[0] == storage.useIDs[1] {
+		t.Fatalf("record ids %v, want one per job", storage.useIDs)
+	}
+	var reads int
+	for _, refs := range storage.uses {
+		for _, ref := range refs {
+			switch ref.Digest {
+			case digestOf(published):
+				reads++
+			case digestOf(discarded):
+				t.Fatalf("a discarded write is recorded as used: %v", refs)
+			}
+		}
+	}
+	if reads != 2 {
+		t.Fatalf("the entry is named %d times, want by its writer and its reader", reads)
+	}
+}
+
+// ASKING WHETHER AN ENTRY IS THERE COSTS NO REQUEST, and is a use: a build that finds it
+// goes on to depend on it.
+func TestAnEntrysSizeComesFromTheListing(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	body := "published object"
+	token := objectCAS(t, service, scopedLease)
+	if code := putObject(t, service, token, body); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, provider.InstanceName(scopedLease))
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	objectCAS(t, service, "asker")
+	session := service.sessionOf(provider.InstanceName("asker"))
+	handle, err := service.openCASHandle(t.Context(), session, config.CacheGo, false)
+	if err != nil {
+		t.Fatalf("openCASHandle: %v", err)
+	}
+	defer handle.Close()
+	size, err := handle.Size(reapi.TableCAS, digestOf(body))
+	if err != nil || size != int64(len(body)) {
+		t.Fatalf("Size = %d, %v", size, err)
+	}
+	if _, err := handle.Size(reapi.TableCAS, digestOf("absent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an absent entry's size = %v", err)
+	}
+	storage.mu.Lock()
+	reads := storage.reads
+	storage.mu.Unlock()
+	if reads != 0 {
+		t.Fatalf("asking about an entry read it %d times", reads)
+	}
+	if !handle.hv.hit.Load() {
+		t.Fatal("finding an entry did not count as a hit")
+	}
+	handle.hv.reads.mu.Lock()
+	defer handle.hv.reads.mu.Unlock()
+	if len(handle.hv.reads.refs) != 1 {
+		t.Fatalf("the entry found is not recorded as used: %v", handle.hv.reads.refs)
+	}
+}
+
+// THE REAPER'S AGE IS THE LAST USE, so an entry a build keeps reading is not the first to
+// go.
+func TestReadingACachedEntryMarksItUsed(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	body := "published object"
+	token := objectCAS(t, service, scopedLease)
+	if code := putObject(t, service, token, body); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, provider.InstanceName(scopedLease))
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := objectCAS(t, service, "reader")
+	read := func() {
+		t.Helper()
+		if got := casRequest(t, service, reader, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), ""); got.Code != http.StatusOK {
+			t.Fatalf("GET = %d", got.Code)
+		}
+	}
+	read()
+	later := time.Now().Add(time.Hour).Truncate(time.Second)
+	service.now = func() time.Time { return later }
+	read()
+
+	session := service.sessionOf(provider.InstanceName("reader"))
+	info, err := os.Stat(service.casCachePath(session.hosts[config.CacheGo].Volume.Key, reapi.TableCAS, digestOf(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(later) {
+		t.Fatalf("the cached entry was last used at %s, want %s", info.ModTime(), later)
+	}
+}
+
+// A DISK PAST THE LINE IS NOT WORTH A REQUEST whose answer would be thrown away.
+func TestAFullDiskCostsNoRequest(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	body := "published object"
+	token := objectCAS(t, service, scopedLease)
+	if code := putObject(t, service, token, body); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, provider.InstanceName(scopedLease))
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	service.casFill = -1
+
+	reader := objectCAS(t, service, "reader")
+	if got := casRequest(t, service, reader, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), ""); got.Code != http.StatusNotFound {
+		t.Fatalf("GET on a full disk = %d", got.Code)
+	}
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if storage.reads != 0 {
+		t.Fatalf("a full disk still cost %d reads", storage.reads)
+	}
+}
+
+// ONE JOB'S UPLOAD MUST NOT SPEND THE NEXT JOB'S WINDOW: a window counts from the job's
+// completion, whatever the sessions ahead of it are doing.
+func TestClosedSessionsUploadSideBySide(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	first := objectCAS(t, service, "first")
+	second := objectCAS(t, service, "second")
+	for _, token := range []string{first, second} {
+		if code := putObject(t, service, token, "from "+token); code != http.StatusOK {
+			t.Fatalf("PUT = %d", code)
+		}
+	}
+	storage.mu.Lock()
+	storage.putTogether, storage.putArrived = 2, make(chan struct{}, 2)
+	storage.mu.Unlock()
+	finish(t, service, provider.InstanceName("first"))
+	finish(t, service, provider.InstanceName("second"))
+
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if len(storage.puts) != 2 {
+		t.Fatalf("uploaded %v", storage.puts)
+	}
+}
+
+// scopedObjectCAS opens a session the kill switch can name.
+func scopedObjectCAS(t *testing.T, service *CacheService, lease string) string {
+	t.Helper()
+	spec := goBazelCache()
+	spec.Owner, spec.Repository = "acme", "api"
+	credentials, err := service.PrepareScoped(provider.InstanceName(lease), CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: lease, Epoch: 1, Cache: spec,
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+
+	return credentials.Token
+}
+
+// A PUBLICATION IS ABANDONED ON THE KILL SWITCH AND ON ITS WINDOW, as a volume's is, and
+// the session then ends with nothing uploaded.
+func TestAPublicationIsAbandonedOnTheKillSwitchAndItsWindow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		before func(service *CacheService, policy *ledgerPolicy, now *time.Time)
+	}{
+		{"the kill switch", func(_ *CacheService, policy *ledgerPolicy, _ *time.Time) { policy.blocked.Store(true) }},
+		{"its window", func(_ *CacheService, _ *ledgerPolicy, now *time.Time) { *now = now.Add(publishWindow) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			service, storage, _ := objectService(t)
+			policy := &ledgerPolicy{}
+			service.SetCachePolicy(policy)
+			now := time.Now()
+			service.now = func() time.Time { return now }
+			instance := provider.InstanceName(scopedLease)
+			token := scopedObjectCAS(t, service, scopedLease)
+			if code := putObject(t, service, token, "object"); code != http.StatusOK {
+				t.Fatalf("PUT = %d", code)
+			}
+			finish(t, service, instance)
+			tc.before(service, policy, &now)
+
+			if err := service.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed: %v", err)
+			}
+			storage.mu.Lock()
+			defer storage.mu.Unlock()
+			if len(storage.puts) != 0 {
+				t.Fatalf("uploaded %v", storage.puts)
+			}
+			if service.sessionOf(instance) != nil {
+				t.Fatal("an abandoned publication kept its session open")
+			}
+		})
+	}
+}
+
+// AN UPLOAD LASTS AS LONG AS THE JOB'S OUTPUT IS LARGE, and disabling a cache has to stop
+// one already running.
+func TestTheKillSwitchStopsAnUploadInProgress(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	policy := &ledgerPolicy{}
+	service.SetCachePolicy(policy)
+	instance := provider.InstanceName(scopedLease)
+	token := scopedObjectCAS(t, service, scopedLease)
+	if code := putObject(t, service, token, "object"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, instance)
+
+	// EACH ASK OF THE CLOCK IS LATER, so the one after the publication began finds the
+	// answer old, and the first question has already been told yes.
+	session := service.sessionOf(instance)
+	hv := session.hosts[config.CacheGo]
+	now := time.Now()
+	service.now = func() time.Time {
+		now = now.Add(casPolicyAge)
+
+		return now
+	}
+	policy.blocked.Store(true)
+	err := service.publishBlobs(t.Context(), session, hv, service.casMountPath(session, config.CacheGo),
+		service.writtenBlobs(service.casMountPath(session, config.CacheGo)))
+	if !errors.Is(err, errPublishDisabled) {
+		t.Fatalf("publishBlobs = %v, want the kill switch's stop", err)
+	}
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if len(storage.puts) != 0 {
+		t.Fatalf("uploaded %v", storage.puts)
+	}
+}
+
 // WHAT A JOB WROTE REACHES NO OTHER JOB UNTIL IT IS PUBLISHED, which is the whole of
 // ADR-013 for this cache: an unauthorised job's entry must not be readable through
 // the read cache by the next.
 func TestOneJobsUnpublishedWritesReachNoOtherJob(t *testing.T) {
 	t.Parallel()
 	service, _, _ := objectService(t)
-	writer := objectCAS(t, service, "writer", provider.TrustTrusted)
-	reader := objectCAS(t, service, "reader", provider.TrustTrusted)
+	writer := objectCAS(t, service, "writer")
+	reader := objectCAS(t, service, "reader")
 	body := "unpublished"
 	if code := putObject(t, service, writer, body); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
@@ -735,7 +1210,7 @@ func TestAPublishedEntryIsReadThroughTheStoreOnceThenFromTheNodesDisk(t *testing
 	t.Parallel()
 	service, storage, _ := objectService(t)
 	first := provider.InstanceName(scopedLease)
-	token := objectCAS(t, service, scopedLease, provider.TrustTrusted)
+	token := objectCAS(t, service, scopedLease)
 	body := "published object"
 	if code := putObject(t, service, token, body); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
@@ -745,7 +1220,7 @@ func TestAPublishedEntryIsReadThroughTheStoreOnceThenFromTheNodesDisk(t *testing
 		t.Fatal(err)
 	}
 
-	second := objectCAS(t, service, "second", provider.TrustTrusted)
+	second := objectCAS(t, service, "second")
 	for range 3 {
 		got := casRequest(t, service, second, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), "")
 		if got.Code != http.StatusOK || got.Body.String() != body {
@@ -779,7 +1254,7 @@ func TestAPublishedEntryIsReadThroughTheStoreOnceThenFromTheNodesDisk(t *testing
 func TestAStoredEntryWhoseBytesAreNotItsDigestIsAMiss(t *testing.T) {
 	t.Parallel()
 	service, storage, _ := objectService(t)
-	token := objectCAS(t, service, "reader", provider.TrustTrusted)
+	token := objectCAS(t, service, "reader")
 	digest := digestOf("what it should be")
 	key := service.cacheKeyFor(service.sessionOf(provider.InstanceName("reader")), config.CacheGo, "", "")
 	ref := storecontract.BlobRef{Table: storecontract.BlobTableCAS, Digest: digest}
@@ -790,6 +1265,12 @@ func TestAStoredEntryWhoseBytesAreNotItsDigestIsAMiss(t *testing.T) {
 	if got := casRequest(t, service, token, http.MethodGet, "/v1/cas/go/cas/"+digest, ""); got.Code != http.StatusNotFound {
 		t.Fatalf("GET = %d %q; a corrupt entry was served", got.Code, got.Body.String())
 	}
+	// THE STORE WAS ASKED, so it is the bytes that were refused and not the digest.
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if storage.reads != 1 {
+		t.Fatalf("the store was read %d times", storage.reads)
+	}
 }
 
 // AN UPLOAD THAT STOPPED PARTWAY LEFT ONLY WHOLE ENTRIES, so it is done again rather
@@ -798,7 +1279,7 @@ func TestAFailedUploadIsRetriedAndHoldsTheSessionOpen(t *testing.T) {
 	t.Parallel()
 	service, storage, _ := objectService(t)
 	instance := provider.InstanceName(scopedLease)
-	token := objectCAS(t, service, scopedLease, provider.TrustTrusted)
+	token := objectCAS(t, service, scopedLease)
 	if code := putObject(t, service, token, "object"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
@@ -806,8 +1287,8 @@ func TestAFailedUploadIsRetriedAndHoldsTheSessionOpen(t *testing.T) {
 	storage.putErr = errors.New("s3 went away")
 	storage.mu.Unlock()
 	finish(t, service, instance)
-	if err := service.RetryClosed(t.Context()); err == nil {
-		t.Fatal("a failed upload reported the session finished")
+	if err := service.RetryClosed(t.Context()); err == nil || !strings.Contains(err.Error(), "s3 went away") {
+		t.Fatalf("a failed upload reported %v", err)
 	}
 	if service.sessionOf(instance) == nil {
 		t.Fatal("the session was forgotten with its writes unpublished")
@@ -847,6 +1328,150 @@ func TestAJobCanAddNoMoreThanItsTiersSize(t *testing.T) {
 	}
 }
 
+// THE SIZE BOUNDS WHAT THE JOB ADDS, NOT ONLY WHETHER IT MAY START ANOTHER: an object past
+// what is left is refused whole, and what was refused is not counted.
+func TestAnObjectPastWhatIsLeftIsRefusedWhole(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	enabled := true
+	spec := config.Tier{Cache: &config.TierCache{
+		Go: &config.GoCache{Enabled: &enabled, MaxSize: 16},
+	}}.EffectiveCache()
+	credentials, err := service.PrepareScoped(provider.InstanceName(scopedLease), CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: scopedLease, Epoch: 1, Cache: &spec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := putObject(t, service, credentials.Token, "nine byte"); code != http.StatusOK {
+		t.Fatalf("the first PUT = %d", code)
+	}
+	if code := putObject(t, service, credentials.Token, "nine more"); code != http.StatusInsufficientStorage {
+		t.Fatalf("an object past what is left = %d, want 507", code)
+	}
+	if got := casRequest(t, service, credentials.Token, http.MethodGet, "/v1/cas/go/cas/"+digestOf("nine more"), ""); got.Code != http.StatusNotFound {
+		t.Fatalf("the refused object is readable: %d", got.Code)
+	}
+	if code := putObject(t, service, credentials.Token, "seven b"); code != http.StatusOK {
+		t.Fatalf("an object that fits = %d", code)
+	}
+}
+
+// countedReader says how much of it was read.
+type countedReader struct {
+	body io.Reader
+	read int64
+}
+
+func (c *countedReader) Read(p []byte) (int, error) {
+	count, err := c.body.Read(p)
+	c.read += int64(count)
+
+	return count, err
+}
+
+// AND IS REFUSED WITHOUT BEING WRITTEN: an object the size of the whole allowance must not
+// reach the node's disk first, only to be taken off it, when the job has nearly none left.
+func TestAnObjectPastWhatIsLeftIsNotReadToTheEnd(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	enabled := true
+	spec := config.Tier{Cache: &config.TierCache{
+		Go: &config.GoCache{Enabled: &enabled, MaxSize: 1 << 20},
+	}}.EffectiveCache()
+	instance := provider.InstanceName(scopedLease)
+	credentials, err := service.PrepareScoped(instance, CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: scopedLease, Epoch: 1, Cache: &spec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spent := strings.Repeat("s", 1<<20-16)
+	if code := putObject(t, service, credentials.Token, spent); code != http.StatusOK {
+		t.Fatalf("the first PUT = %d", code)
+	}
+	handle, err := service.openCASHandle(t.Context(), service.sessionOf(instance), config.CacheGo, true)
+	if err != nil {
+		t.Fatalf("openCASHandle: %v", err)
+	}
+	defer handle.Close()
+
+	large := strings.Repeat("l", 1<<19)
+	body := &countedReader{body: strings.NewReader(large)}
+	if err := handle.Put(t.Context(), reapi.TableCAS, digestOf(large), body); !errors.Is(err, reapi.ErrFull) {
+		t.Fatalf("Put = %v, want the allowance refused", err)
+	}
+	if body.read > 17 {
+		t.Fatalf("read %d bytes of an object with 16 left", body.read)
+	}
+}
+
+// WRITING THE SAME ENTRY AGAIN ADDS NOTHING: a build retries.
+func TestWritingAnEntryAgainSpendsNothing(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	enabled := true
+	spec := config.Tier{Cache: &config.TierCache{
+		Go: &config.GoCache{Enabled: &enabled, MaxSize: 16},
+	}}.EffectiveCache()
+	credentials, err := service.PrepareScoped(provider.InstanceName(scopedLease), CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: scopedLease, Epoch: 1, Cache: &spec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if code := putObject(t, service, credentials.Token, "nine byte"); code != http.StatusOK {
+			t.Fatalf("PUT = %d", code)
+		}
+	}
+}
+
+// A RESTART DOES NOT REFILL A JOB'S ALLOWANCE, and what the job wrote is still in its
+// directory, which recovery does not try to mount.
+func TestARestartKeepsWhatAJobHasSpent(t *testing.T) {
+	t.Parallel()
+	storage := newObjectStore()
+	root := t.TempDir()
+	open := func() *CacheService {
+		t.Helper()
+		service, err := NewCacheService("https://10.0.0.1:9443", "test-deployment", root,
+			storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(service.git.close)
+		service.actionIO = newDeviceVolumes(t)
+
+		return service
+	}
+	service := open()
+	enabled := true
+	spec := config.Tier{Cache: &config.TierCache{
+		Go: &config.GoCache{Enabled: &enabled, MaxSize: 16},
+	}}.EffectiveCache()
+	credentials, err := service.PrepareScoped(provider.InstanceName(scopedLease), CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: scopedLease, Epoch: 1, Cache: &spec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := putObject(t, service, credentials.Token, "sixteen bytes ok"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+
+	restarted := open()
+	volumes := newDeviceVolumes(t)
+	restarted.actionIO = volumes
+	restarted.RestoreMounts(t.Context())
+	if len(volumes.targets) != 0 {
+		t.Fatalf("recovery mounted %v", volumes.targets)
+	}
+	if code := putObject(t, restarted, credentials.Token, "one more"); code != http.StatusInsufficientStorage {
+		t.Fatalf("past the size after a restart = %d, want 507", code)
+	}
+}
+
 func TestTheReadCacheIsReapedOldestFirstOnlyPastItsFill(t *testing.T) {
 	t.Parallel()
 	service, _, _ := objectService(t)
@@ -854,7 +1479,8 @@ func TestTheReadCacheIsReapedOldestFirstOnlyPastItsFill(t *testing.T) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	old, recent := filepath.Join(root, "old"), filepath.Join(root, "recent")
+	// NAMED SO THE WALK REACHES THE OLDER SECOND: only its age can put it first.
+	old, recent := filepath.Join(root, "z-old"), filepath.Join(root, "a-recent")
 	for _, path := range []string{old, recent} {
 		if err := os.WriteFile(path, []byte("entry"), 0o600); err != nil {
 			t.Fatal(err)
@@ -881,6 +1507,15 @@ func TestTheReadCacheIsReapedOldestFirstOnlyPastItsFill(t *testing.T) {
 	}
 	if _, err := os.Stat(recent); err != nil {
 		t.Fatalf("the recent entry was reaped too: %v", err)
+	}
+
+	// AND PAST THE FILL, THE PASS ITSELF MAKES THE ROOM.
+	service.casCacheFill = -1
+	if err := service.ReapCASCache(t.Context()); err != nil {
+		t.Fatalf("ReapCASCache: %v", err)
+	}
+	if _, err := os.Stat(recent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the entry past the fill = %v, want it gone", err)
 	}
 
 	// NOTHING THERE IS NOT A FAILURE: the node has served no such cache yet.

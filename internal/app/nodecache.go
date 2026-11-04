@@ -27,6 +27,9 @@ const cacheEvictionAge = 7 * 24 * time.Hour
 
 const cacheConnectionLimit = 128
 
+// readCacheReap is how often the node's read cache is checked against its fill.
+const readCacheReap = time.Minute
+
 // generationMapLockName is the file in node.lock_dir whose flock keeps two
 // processes on a host from unmapping each other's read-only generation maps.
 const generationMapLockName = "ceph-generation-maps.lock"
@@ -182,8 +185,11 @@ func startNodeCache(
 
 			return nil, nil, nil, fmt.Errorf("load the EC2 cache listener certificate: %w", err)
 		}
+		// NO TICKETS, because the relay resumes nothing, and a ticket is a record that
+		// makes its socket readable with nothing for it to read.
 		srv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
+			SessionTicketsDisabled: true,
 		}
 		// TLS IS THE TRANSPORT HERE AND NOTHING ABOVE IT KNOWS: what crosses it is what
 		// crosses a Firecracker guest's bridge, HTTP/2 with prior knowledge included,
@@ -252,13 +258,12 @@ func startNodeCache(
 		}
 		evict := func() {
 			evictPass(evictCtx, storage, service.ReapGitMirrors, sweeping, slog.Default())
-			if err := service.ReapCASCache(evictCtx); err != nil && evictCtx.Err() == nil {
-				slog.Default().Warn("could not make room in the node's read cache; will retry", "error", err)
-			}
 		}
 
 		retryClosed()
 		renewActive()
+
+		go reapReadCache(evictCtx, service)
 
 		go func() {
 			evictionTicker := time.NewTicker(6 * time.Hour)
@@ -375,6 +380,26 @@ func awaitSweep(sweeping chan struct{}, bound time.Duration) bool {
 		return true
 	case <-timer.C:
 		return false
+	}
+}
+
+// reapReadCache keeps the node's read cache below its fill. Far oftener than an
+// eviction pass, because a build fills it in minutes, and a disk past the line writes
+// refuse at is what the fill exists to keep a job from meeting. A pass under the fill
+// reads one statfs.
+func reapReadCache(ctx context.Context, service *node.CacheService) {
+	ticker := time.NewTicker(readCacheReap)
+	defer ticker.Stop()
+
+	for {
+		if err := service.ReapCASCache(ctx); err != nil && ctx.Err() == nil {
+			slog.Default().Warn("could not make room in the node's read cache; will retry", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 

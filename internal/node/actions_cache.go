@@ -1400,9 +1400,11 @@ func (s *CacheService) uploadActionsBlob(
 			return actionsBlobError(http.StatusBadRequest, "blob type must be BlockBlob"), nil
 		}
 		if archive.Upload != "" {
-			refused, err := s.stageObjectBlock(req, archive, actionsSingleBlock, body)
-			if refused != nil || err != nil {
-				return refused, err
+			if refused := objectBlockRefused(req); refused != nil {
+				return refused, nil
+			}
+			if err := s.stageObjectBlock(req, archive, actionsSingleBlock, body); err != nil {
+				return nil, err
 			}
 			archive.committed.Store(&[]string{actionsSingleBlock})
 
@@ -1418,9 +1420,11 @@ func (s *CacheService) uploadActionsBlob(
 			return actionsBlobError(http.StatusBadRequest, "block id is invalid"), nil
 		}
 		if archive.Upload != "" {
-			refused, err := s.stageObjectBlock(req, archive, blockID, body)
-			if refused != nil || err != nil {
-				return refused, err
+			if refused := objectBlockRefused(req); refused != nil {
+				return refused, nil
+			}
+			if err := s.stageObjectBlock(req, archive, blockID, body); err != nil {
+				return nil, err
 			}
 
 			break

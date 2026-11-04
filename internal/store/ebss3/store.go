@@ -73,7 +73,9 @@ type Store struct {
 	// bulk reaches whole objects: the half of the store for a cache whose unit is a
 	// file (archive.go, ADR-023).
 	bulk bulkAPI
-	now  func() time.Time
+	// readAhead is a slot per read allowed to hold chunks in memory.
+	readAhead chan struct{}
+	now       func() time.Time
 }
 
 var _ storecontract.Store = (*Store)(nil)
@@ -118,7 +120,10 @@ func newStore(
 	objects objectAPI,
 	opts ...option,
 ) *Store {
-	s := &Store{cfg: cfg, owner: owner, blocks: blocks, objects: objects, now: time.Now}
+	s := &Store{
+		cfg: cfg, owner: owner, blocks: blocks, objects: objects, now: time.Now,
+		readAhead: make(chan struct{}, readAheadReaders),
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -755,6 +760,13 @@ func (s Store) Evict(ctx context.Context, olderThan time.Duration) error {
 		return errors.New("ebs-s3: cache eviction needs a positive inactivity age")
 	}
 
+	// EACH HALF WHATEVER THE OTHER DID: one snapshot that refuses deletion must not
+	// leave every archive and unfinished upload billing.
+	return errors.Join(s.evictVolumes(ctx, olderThan), s.evictObjects(ctx, olderThan))
+}
+
+// evictVolumes is eviction's half for what jobs mount.
+func (s Store) evictVolumes(ctx context.Context, olderThan time.Duration) error {
 	keys, err := s.objects.List(ctx, s.statePrefix())
 	if err != nil {
 		return err
@@ -891,7 +903,7 @@ func (s Store) Evict(ctx context.Context, olderThan time.Duration) error {
 		}
 	}
 
-	return s.evictObjects(ctx, olderThan)
+	return nil
 }
 
 // evictDelete runs one ORPHAN-SWEEP delete, treating a not-owned refusal as a SKIP

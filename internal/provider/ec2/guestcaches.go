@@ -26,6 +26,9 @@ const (
 	guestBilletPath = "/opt/billet/bin/billet"
 	// guestRunnerHome is what the agent's paths are relative to on this image.
 	guestRunnerHome = "/opt/actions-runner"
+	// guestCacheProbeSeconds bounds asking the node at boot: long enough for a node
+	// answering under load, short against the minute a job's boot already takes.
+	guestCacheProbeSeconds = "20"
 
 	envActionsProxy = "BILLET_ACTIONS_PROXY"
 	envNpmProxy     = "BILLET_NPM_PROXY"
@@ -72,12 +75,25 @@ func guestCachesLibrary() (string, error) {
 			return "", fmt.Errorf("ec2: the guest caches library: %w", err)
 		}
 		b.WriteString(region.name + "() {\n")
-		if region.marker == "BILLET_CACHE_RELAY" {
-			b.WriteString("cache_relay_port=41322\n")
-		}
 		b.WriteString(block)
 		b.WriteString("}\n")
 	}
+
+	// A RELAY THAT STARTED PROVES NOTHING ABOUT THE NODE, and what comes next points
+	// a job's `git fetch` at it, which nothing falls back from. An image built without
+	// the listener's issuer, or a security group that drops it, would fail every
+	// checkout, so the node is asked first, and could-not-tell turns the caches off.
+	// Any answer proves it: curl reports the TLS and the connection, and is given no
+	// credential to send.
+	b.WriteString("billet_guest_caches_probe() {\n")
+	b.WriteString("  [ -n \"$cache_endpoint\" ] || return 0\n")
+	b.WriteString("  if curl -sS -o /dev/null --max-time " + guestCacheProbeSeconds + " \"${cache_endpoint%/}/\"; then\n")
+	b.WriteString("    return 0\n")
+	b.WriteString("  fi\n")
+	b.WriteString("  log \"the node's cache listener did not answer; this job runs without the caches it serves\"\n")
+	b.WriteString("  systemctl stop billet-cache-relay.socket billet-cache-relay.service 2>/dev/null || true\n")
+	b.WriteString("  cache_endpoint=\"\"\n")
+	b.WriteString("}\n")
 
 	// THE PASSTHROUGHS TUNNEL THROUGH THE RELAY, because a client's TLS cannot nest
 	// inside a second TLS session on a Python socket, and the relay is a splice that
@@ -99,7 +115,7 @@ func guestCachesLibrary() (string, error) {
 	b.WriteString("      ;;\n")
 	b.WriteString("    *)\n")
 	b.WriteString("      if [ -n \"$actions_proxy$npm_proxy\" ]; then\n")
-	b.WriteString("        log \"the cache relay did not start, so nothing can tunnel to the node; \"\n")
+	b.WriteString("        log \"the cache relay is not running, so nothing can tunnel to the node; \"\n")
 	b.WriteString("        log \"this job uses GitHub's cache and the registry directly\"\n")
 	b.WriteString("      fi\n")
 	b.WriteString("      actions_proxy=\"\"\n")

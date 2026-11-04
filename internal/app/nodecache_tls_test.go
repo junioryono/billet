@@ -8,10 +8,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,15 +46,30 @@ func selfSigned(t *testing.T) (tls.Certificate, *x509.CertPool) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, roots
 }
 
+// serveUntilClosed serves until the test closes the server.
+func serveUntilClosed(t *testing.T, server *http.Server, listener net.Listener) {
+	t.Helper()
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		t.Errorf("Serve: %v", err)
+	}
+}
+
+func closeServer(t *testing.T, server *http.Server) {
+	t.Helper()
+	if err := server.Close(); err != nil {
+		t.Errorf("close the server: %v", err)
+	}
+}
+
 // THE EC2 LISTENER CARRIES WHAT A FIRECRACKER GUEST'S BRIDGE CARRIES (ADR-023).
 // Bazel's and Buck2's gRPC arrives as HTTP/2 with prior knowledge through the guest's
 // relay, inside TLS the relay did, and http.Server takes that only from a connection
 // that is not a *tls.Conn. So this dials as the relay does: TLS to the listener, then
 // plain HTTP/2 or HTTP/1 on top with no ALPN to say which.
 func TestTheEC2CacheListenerServesHTTP2WithPriorKnowledgeInsideTLS(t *testing.T) {
-	t.Parallel()
 	certificate, roots := selfSigned(t)
-	base, err := net.Listen("tcp", "127.0.0.1:0")
+	var listen net.ListenConfig
+	base, err := listen.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +86,8 @@ func TestTheEC2CacheListenerServesHTTP2WithPriorKnowledgeInsideTLS(t *testing.T)
 	server.Protocols.SetHTTP1(true)
 	server.Protocols.SetUnencryptedHTTP2(true)
 	listener := opaqueTLSListener{tls.NewListener(base, config)}
-	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(func() { _ = server.Close() })
+	go serveUntilClosed(t, server, listener)
+	t.Cleanup(func() { closeServer(t, server) })
 
 	address := base.Addr().String()
 	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -104,12 +123,12 @@ func TestTheEC2CacheListenerServesHTTP2WithPriorKnowledgeInsideTLS(t *testing.T)
 	}
 }
 
-// A CLIENT THAT DOES NOT TRUST THE LISTENER LEARNS NOTHING, and one that speaks no TLS
-// gets no answer: TLS is hidden from the server, not removed.
+// A CLIENT THAT SPEAKS NO TLS GETS NO ANSWER: TLS is hidden from the server, not removed.
 func TestTheEC2CacheListenerStillRefusesWhatIsNotTLS(t *testing.T) {
 	t.Parallel()
 	certificate, _ := selfSigned(t)
-	base, err := net.Listen("tcp", "127.0.0.1:0")
+	var listen net.ListenConfig
+	base, err := listen.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,10 +138,11 @@ func TestTheEC2CacheListenerStillRefusesWhatIsNotTLS(t *testing.T) {
 		ReadHeaderTimeout: 2 * time.Second,
 		Handler:           http.HandlerFunc(func(http.ResponseWriter, *http.Request) { handled <- struct{}{} }),
 	}
-	go func() { _ = server.Serve(opaqueTLSListener{tls.NewListener(base, config)}) }()
-	t.Cleanup(func() { _ = server.Close() })
+	go serveUntilClosed(t, server, opaqueTLSListener{tls.NewListener(base, config)})
+	t.Cleanup(func() { closeServer(t, server) })
 
-	conn, err := net.Dial("tcp", base.Addr().String())
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(t.Context(), "tcp", base.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,11 +153,36 @@ func TestTheEC2CacheListenerStillRefusesWhatIsNotTLS(t *testing.T) {
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	buffer := make([]byte, 16)
-	_, _ = conn.Read(buffer)
+	// A CLOSE, an alert or the deadline: what matters is what the handler saw.
+	if _, err := io.Copy(io.Discard, conn); err != nil {
+		t.Logf("the connection ended with %v", err)
+	}
 	select {
 	case <-handled:
 		t.Fatal("cleartext reached the handler")
 	default:
+	}
+}
+
+// THE TWO TESTS ABOVE PROVE THE MECHANISM, and this proves the listener is built with it:
+// a real listener needs a store, an attacher and a certificate on disk, and what these
+// lines do is what the tests above run. Each is what a failure would be: a guest's gRPC
+// refused, the relay stalled on a ticket, or the read cache reaped only every six hours.
+func TestTheNodeCacheListenerIsBuiltWithWhatTheEC2GuestNeeds(t *testing.T) {
+	t.Parallel()
+	source, err := os.ReadFile("nodecache.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"srv.Protocols.SetUnencryptedHTTP2(true)",
+		"SessionTicketsDisabled: true,",
+		"serveListener = opaqueTLSListener{tls.NewListener(ln, srv.TLSConfig)}",
+		"srv.Serve(serveListener)",
+		"go reapReadCache(evictCtx, service)",
+	} {
+		if !strings.Contains(string(source), want) {
+			t.Errorf("startNodeCache no longer has %q", want)
+		}
 	}
 }
