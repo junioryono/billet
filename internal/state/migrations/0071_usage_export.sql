@@ -21,6 +21,13 @@
 -- a ledger with no history has none, because a row in any table is what tells a
 -- used ledger from a pristine one (PeekLedger), and a restore decides by that.
 --
+-- usage_mark is random, drawn in the transaction that writes the number and written
+-- once with it, BECAUSE A LEASE AND A NUMBER DO NOT NAME A PLACE IN ONE HISTORY. A
+-- ledger restored from a backup numbers again from where the backup left off: a lease
+-- that was waiting can take the same number it took before the restore, with the same
+-- finished_at, and a lease the exporter never read can take a lower one. A cursor
+-- carries the mark, so one from the other history is refused and never read past.
+--
 -- github_target is the GitHub path of the owner whose runner the lease held,
 -- copied from the lease as it closes. Migration 64 put it on the lease only, and
 -- the row that outlives the lease had nothing but a tier label, which an operator
@@ -36,6 +43,10 @@
 -- this migration is numbered as it closes. Numbers are a place in the order of being
 -- numbered, not of finishing, so a late batch breaks nothing a reader relies on.
 --
+-- WHAT IS LEFT HERE STILL READS THE HISTORY, ONCE: the two index builds, and on SQLite
+-- the new CHECK. That cost 6.8 seconds for a million rows on SQLite and 3.9 on
+-- PostgreSQL on the same host, so the budget is reached at about four million rows.
+--
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
 -- Reformat one tab and every ledger that applied this migration refuses to open.
 
@@ -45,6 +56,10 @@ ALTER TABLE job_history ADD COLUMN github_target TEXT NOT NULL DEFAULT ''
 
 -- +billet:statement
 ALTER TABLE job_history ADD COLUMN usage_seq INTEGER NOT NULL DEFAULT 0 CHECK (usage_seq >= 0)
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE job_history ADD COLUMN usage_mark TEXT NOT NULL DEFAULT ''
 -- +billet:end
 
 -- +billet:statement

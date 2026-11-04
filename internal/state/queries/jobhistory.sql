@@ -248,17 +248,19 @@ INSERT INTO job_history
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
       sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, holder_incarnation, queued_at,
-      finished_at, usage_seq, github_target, bought_at)
+      finished_at, usage_seq, usage_mark, github_target, bought_at)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @conclusion, @failure_reason,
         @disruption, @disrupted_at, @chosen_provider, @instance_type, @vcpu, @memory,
         @site, @price_micros_per_hour, @image_cache, @cache_generation,
         @actions_cache, @sticky_cache, @git_cache, @bazel_cache, @go_cache, @npm_cache,
-        @holder_incarnation, @queued_at, @finished_at, @usage_seq,
+        @holder_incarnation, @queued_at, @finished_at, @usage_seq, @usage_mark,
         COALESCE((SELECT github_target FROM leases WHERE id = @lease_id), ''),
         COALESCE((SELECT created_at FROM leases WHERE id = @lease_id), ''))
 ON CONFLICT (lease_id) DO UPDATE SET
   usage_seq      = CASE WHEN job_history.usage_seq = 0
                         THEN excluded.usage_seq ELSE job_history.usage_seq END,
+  usage_mark     = CASE WHEN job_history.usage_seq = 0
+                        THEN excluded.usage_mark ELSE job_history.usage_mark END,
   github_target  = CASE WHEN excluded.github_target != ''
                         THEN excluded.github_target ELSE job_history.github_target END,
   bought_at      = CASE WHEN job_history.bought_at = ''
@@ -330,9 +332,9 @@ SELECT EXISTS(SELECT 1 FROM job_history
                WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != '');
 
 -- name: NumberUsage :execrows
--- Give each lease a read listed its number, in the order it was listed: the caller
--- packs the lease ids end to end, as MarkJobDetailRetired's does, and takes a run of
--- numbers above base in the same transaction.
+-- Give each lease a read listed its number, in the order it was listed, and the batch's
+-- mark: the caller packs the lease ids end to end, as MarkJobDetailRetired's does, and
+-- takes a run of numbers above base in the same transaction.
 --
 -- A NUMBER ALREADY WRITTEN STAYS, so a lease never moves; the row's own filter is what
 -- says so, in the statement.
@@ -342,7 +344,7 @@ WITH RECURSIVE ids (id, rest, n) AS (
     SELECT SUBSTR(rest, 1, 32), SUBSTR(rest, 33), n + 1 FROM ids WHERE rest != ''
 )
 UPDATE job_history
-   SET usage_seq = CAST(@base AS BIGINT) + ids.n
+   SET usage_seq = CAST(@base AS BIGINT) + ids.n, usage_mark = CAST(@mark AS TEXT)
   FROM ids
  WHERE job_history.lease_id = ids.id AND job_history.usage_seq = 0;
 
@@ -354,7 +356,7 @@ UPDATE job_history
 -- partial index's own predicate, which a planner cannot infer from a parameter.
 -- Every empty value is "not recorded", which the export says rather than reading
 -- it as zero.
-SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
+SELECT usage_seq, usage_mark, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
@@ -365,10 +367,10 @@ SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ReadUsageRecord :one
--- The close at one place in that order, which proves a cursor still means
--- something on this ledger: the lease alone is not enough, because a ledger
--- restored from a backup can close the same lease again at the same number.
-SELECT lease_id, COALESCE(finished_at, '') AS finished_at
+-- What took one place in that order, which proves a cursor still means something on
+-- this ledger: the lease alone is not enough, because a ledger restored from a backup
+-- can give the same lease the same number again. The mark is drawn afresh each time.
+SELECT lease_id, usage_mark
   FROM job_history WHERE usage_seq = @usage_seq AND usage_seq > 0;
 
 -- name: RecordJobPhase :exec

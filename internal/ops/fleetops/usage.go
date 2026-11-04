@@ -2,8 +2,6 @@ package fleetops
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,7 +80,7 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	rows, err := db.UsageSince(ctx, after, *limit)
+	rows, waiting, err := readUsagePage(ctx, db, after, *limit)
 	if err != nil {
 		return err
 	}
@@ -90,11 +88,6 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 	// SAID BESIDE THE RECORDS, NEVER IN THEM: a reader caught up to the end has not read
 	// the whole history while older leases still wait for a number. They follow in later
 	// runs, past the cursor it holds, and nothing is skipped.
-	waiting, err := db.UsageStillNumbering(ctx)
-	if err != nil {
-		return err
-	}
-
 	if waiting {
 		fmt.Fprintln(env.Stderr, "billet usage export: leases that finished before this release are still being "+
 			"numbered; they follow in later runs, past this cursor")
@@ -119,23 +112,50 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 	return printUsage(env, records)
 }
 
+// usagePageLedger is the ledger's half of reading one page.
+type usagePageLedger interface {
+	UsageStillNumbering(ctx context.Context) (bool, error)
+	UsageSince(ctx context.Context, after int64, limit int) ([]state.UsageRow, error)
+}
+
+// readUsagePage reads a page and whether older leases are still waiting for a number.
+//
+// WAITING IS READ FIRST. Read second, the last batch could commit between the two: an
+// empty page and nothing waiting, which a reader takes for the end of a history it has
+// not read. Read first, the worst is a note the next run does not repeat.
+func readUsagePage(
+	ctx context.Context, ledger usagePageLedger, after int64, limit int,
+) ([]state.UsageRow, bool, error) {
+	waiting, err := ledger.UsageStillNumbering(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	rows, err := ledger.UsageSince(ctx, after, limit)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return rows, waiting, nil
+}
+
 // usageCursor is a place in one deployment's order of finished leases.
 //
-// closed IDENTIFIES THE CLOSE AND NOT ONLY THE LEASE. A ledger restored from a
-// backup holding leases A, B and C open can close C at 11 and B at 12 where the
-// original closed A and B: a cursor of `12, B` would pass a check of the lease and
-// skip C in silence. The close's time is written once, to the nanosecond, so a
-// lease closed again has another.
+// mark IDENTIFIES THE NUMBERING AND NOT ONLY THE LEASE. A ledger restored from a backup
+// numbers again from there, and can give a lease the number it had, with the time it
+// had, after giving a lease this exporter never read a lower one: a cursor of `12, B`
+// would pass a check of the lease and its close and skip that lease in silence. The
+// mark is drawn each time a number is written, so another history has another.
 type usageCursor struct {
 	deployment string
 	sequence   int64
 	lease      string
-	closed     string
+	mark       string
 }
 
 func (c usageCursor) String() string {
 	return usageCursorVersion + "." + c.deployment + "." + strconv.FormatInt(c.sequence, 10) + "." +
-		c.lease + "." + c.closed
+		c.lease + "." + c.mark
 }
 
 func parseUsageCursor(s string) (usageCursor, error) {
@@ -149,20 +169,12 @@ func parseUsageCursor(s string) (usageCursor, error) {
 		return usageCursor{}, fmt.Errorf("billet usage export: --since %q is not a cursor this billet wrote", s)
 	}
 
-	return usageCursor{deployment: parts[1], sequence: sequence, lease: parts[3], closed: parts[4]}, nil
-}
-
-// usageCloseMark is what a cursor keeps of a close's time: a digest, because the
-// time itself holds the separators a cursor is split on.
-func usageCloseMark(finishedAt string) string {
-	sum := sha256.Sum256([]byte(finishedAt))
-
-	return hex.EncodeToString(sum[:8])
+	return usageCursor{deployment: parts[1], sequence: sequence, lease: parts[3], mark: parts[4]}, nil
 }
 
 // usageLedger is the ledger's half of a resume.
 type usageLedger interface {
-	UsageRecordAt(ctx context.Context, sequence int64) (state.UsageClose, error)
+	UsageRecordAt(ctx context.Context, sequence int64) (state.UsagePlace, error)
 }
 
 // resumeUsage is the place to read after, proved against this ledger.
@@ -171,8 +183,8 @@ type usageLedger interface {
 // quiet answer is the wrong one. A ledger restored from a backup older than the
 // cursor numbers its next leases over the ones the exporter already read: reading
 // past the old number would skip them, so the record the cursor names has to still
-// be there, closed when it was. Could not read is not "not there", and is reported
-// as itself.
+// be there, with the mark it was numbered under. Could not read is not "not there",
+// and is reported as itself.
 func resumeUsage(ctx context.Context, ledger usageLedger, deployment, since string) (int64, error) {
 	if since == "" {
 		return 0, nil
@@ -188,7 +200,7 @@ func resumeUsage(ctx context.Context, ledger usageLedger, deployment, since stri
 			cursor.deployment, deployment)
 	}
 
-	closed, err := ledger.UsageRecordAt(ctx, cursor.sequence)
+	place, err := ledger.UsageRecordAt(ctx, cursor.sequence)
 	switch {
 	case errors.Is(err, state.ErrNoUsageRecord):
 		return 0, fmt.Errorf("billet usage export: this ledger holds no record %d, which --since names. It "+
@@ -196,10 +208,10 @@ func resumeUsage(ctx context.Context, ledger usageLedger, deployment, since stri
 			"nothing was printed", cursor.sequence)
 	case err != nil:
 		return 0, err
-	case closed.LeaseID != cursor.lease || usageCloseMark(closed.FinishedAt) != cursor.closed:
-		return 0, fmt.Errorf("billet usage export: record %d on this ledger is not the close --since names "+
-			"(lease %s). It was restored from a backup older than the cursor, and has finished leases again "+
-			"since; nothing was printed", cursor.sequence, closed.LeaseID)
+	case place.LeaseID != cursor.lease || place.Mark != cursor.mark:
+		return 0, fmt.Errorf("billet usage export: record %d on this ledger is not the one --since names "+
+			"(lease %s). It was restored from a backup older than the cursor, and has numbered leases again "+
+			"since; nothing was printed", cursor.sequence, place.LeaseID)
 	}
 
 	return cursor.sequence, nil
@@ -269,7 +281,7 @@ const (
 func newUsageRecord(cfg *config.Config, deployment string, row *state.UsageRow) usageRecord {
 	r := usageRecord{
 		Schema:     usageRecordSchema,
-		Cursor:     usageCursor{deployment, row.Sequence, row.LeaseID, usageCloseMark(row.FinishedAt)}.String(),
+		Cursor:     usageCursor{deployment, row.Sequence, row.LeaseID, row.Mark}.String(),
 		Sequence:   row.Sequence,
 		LeaseID:    row.LeaseID,
 		Deployment: deployment,

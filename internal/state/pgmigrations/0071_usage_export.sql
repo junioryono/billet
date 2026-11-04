@@ -19,6 +19,10 @@ ALTER TABLE job_history ADD COLUMN usage_seq bigint NOT NULL DEFAULT 0 CHECK (us
 -- +billet:end
 
 -- +billet:statement
+ALTER TABLE job_history ADD COLUMN usage_mark text NOT NULL DEFAULT '';
+-- +billet:end
+
+-- +billet:statement
 CREATE TABLE usage_sequence (
     id bigint PRIMARY KEY CHECK (id = 1),
     last bigint NOT NULL CHECK (last >= 0)

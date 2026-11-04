@@ -285,7 +285,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.log.Info("minted an installation token", "deployment", deployment, "app", req.AppID,
+	s.log.Info("served an installation token", "deployment", deployment, "app", req.AppID,
 		"installation", req.InstallationID, "expires", token.ExpiresAt().Format(time.RFC3339))
 
 	w.Header().Set("Content-Type", "application/json")
