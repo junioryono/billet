@@ -43,6 +43,10 @@
 -- this migration is numbered as it closes. Numbers are a place in the order of being
 -- numbered, not of finishing, so a late batch breaks nothing a reader relies on.
 --
+-- WHAT IS LEFT HERE STILL READS THE HISTORY, ONCE: the two index builds, and on SQLite
+-- the new CHECK. That cost 6.8 seconds for a million rows on SQLite and 3.9 on
+-- PostgreSQL on the same host, so the budget is reached at about four million rows.
+--
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
 -- Reformat one tab and every ledger that applied this migration refuses to open.
 
