@@ -83,3 +83,32 @@ func TestAWaitingStandbyKeepsOneSession(t *testing.T) {
 		t.Errorf("the claim is on session %d, and the wait was on %d", pid, session)
 	}
 }
+
+// AN OPERATOR COMMAND ASKS ONCE, and holds no session for the answer it got: it would spend
+// a connection of the budget for its whole run on a question it will not ask again.
+func TestAnOperatorBesideAControllerHoldsNoClaimSession(t *testing.T) {
+	t.Parallel()
+
+	dsn := requirePostgres(t)
+
+	holder, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Close() })
+
+	operator, err := OpenPostgresAdmin(t.Context(), t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgresAdmin: %v", err)
+	}
+	t.Cleanup(func() { _ = operator.Close() })
+
+	backend, ok := operator.backend.(*postgresBackend)
+	if !ok {
+		t.Fatalf("an operator's backend is %T", operator.backend)
+	}
+
+	if backend.claimAttempt != nil || backend.claim != nil {
+		t.Errorf("an operator beside a controller holds attempt %v and claim %v", backend.claimAttempt, backend.claim)
+	}
+}

@@ -650,6 +650,11 @@ func openDir(
 				return nil, errors.Join(err, db.Close())
 			}
 
+			// THE SESSION IT ASKED ON GOES WITH THE ANSWER. Only a standby asks again.
+			if err := be.releaseController(); err != nil {
+				return nil, errors.Join(err, db.Close())
+			}
+
 			db.revalidate.Store(true)
 		}
 	}
