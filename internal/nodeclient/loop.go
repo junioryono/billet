@@ -78,6 +78,15 @@ type HandingOver interface {
 	HandOver(ctx context.Context)
 }
 
+// CustodyFollower says which leases a superseded process holds in custody, and
+// lets go of those the node's current process has adopted. Optional: compute that
+// cannot say keeps what it holds on the controller it knew, and waits as a
+// superseded process always did when that controller goes.
+type CustodyFollower interface {
+	CustodyLeases() []string
+	LetGo(leaseIDs []string)
+}
+
 // upgradableCompute can replace this node's own billet.
 //
 // OPTIONAL, AND ITS ABSENCE IS A REFUSAL rather than a silent no-op. A build or a
@@ -524,7 +533,7 @@ func register(
 		// machine — so the lease is renewed by nobody and its capacity is resold
 		// under a running job.
 		if errors.Is(err, ErrSuperseded) {
-			drain(ctx, compute, log, opts)
+			drain(ctx, c, compute, log, opts)
 
 			return fmt.Errorf("this node has been superseded: %w", err)
 		}
@@ -604,7 +613,7 @@ func recordRegistration(c *Client, log *slog.Logger, opts LoopOptions) {
 // here would be a limit on how long a job may run, which billet does not impose
 // anywhere: the operator's fix is to stop the duplicate host, and until they do,
 // holding the lease is the safe direction.
-func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOptions) {
+func drain(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) {
 	// EVERYTHING RUNNING HERE IS NOW UNACCOUNTED FOR, which is what custody
 	// means. The completion of a job running on this host is routed to whichever
 	// process owns the name — the replacement — which cannot see it, reports the
@@ -626,9 +635,82 @@ func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOpti
 		grace = defaultDrainTimeout
 	}
 
+	followCtx, stopFollowing := context.WithCancel(ctx)
+
+	var following sync.WaitGroup
+
+	following.Go(func() { followCustody(followCtx, c, compute, log, opts) })
+
+	defer func() {
+		stopFollowing()
+		following.Wait()
+	}()
+
 	if waitForHolding(ctx, compute, log, opts, grace,
 		"stop this process; it has been superseded and is only finishing what it holds") {
 		log.Info("everything this node was holding has finished; stopping")
+	}
+}
+
+// custodyClaimEvery is how often a superseded process says what it holds to the
+// controller that serves. A controller that does not know already answers from
+// memory, and a promotion is noticed within this; a lease's default TTL, which is
+// what the claim has to beat for the next renewal to land, is nine of these.
+const custodyClaimEvery = 10 * time.Second
+
+// followCustody keeps what a superseded process holds known to the controller that
+// serves, for as long as the wait lasts (#685). A controller's ownership record
+// does not survive it, so a promoted or restarted one would refuse this process
+// its own leases, and it must not register: that would take the name back from the
+// process that holds it. So it says what it holds on a route that takes nothing,
+// from whichever controller answers, and lets go of what the current process
+// reports having adopted.
+//
+// BEST EFFORT, as custody's other calls are: a claim that fails is asked again, and
+// what it leaves is the wait a superseded process always had.
+func followCustody(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) {
+	follower, ok := compute.(CustodyFollower)
+	if !ok {
+		return
+	}
+
+	every := custodyClaimEvery
+	if opts.Backoff > 0 {
+		every = opts.Backoff
+	}
+
+	failing := false
+
+	for ctx.Err() == nil {
+		if leases := follower.CustodyLeases(); len(leases) > 0 {
+			adopted, err := c.ClaimCustody(ctx, leases)
+
+			switch {
+			case ctx.Err() != nil:
+				return
+			case err != nil:
+				// ONCE, AND AGAIN ONLY AFTER IT HAS WORKED: this repeats for as long as
+				// a controller is away, and an operator already has the wait's warning.
+				if !failing {
+					log.Warn("could not tell the control plane what this superseded process still holds; "+
+						"asking again", "error", err)
+				}
+
+				failing = true
+			default:
+				failing = false
+
+				if len(adopted) > 0 {
+					log.Info("the node's current process has adopted compute this superseded process held; "+
+						"letting go of it without destroying it", "leases", adopted)
+					follower.LetGo(adopted)
+				}
+			}
+		}
+
+		if !sleep(ctx, every) {
+			return
+		}
 	}
 }
 
@@ -807,6 +889,12 @@ func stopGracefully(
 
 	superseded.Store(supersededBefore)
 
+	// follow starts following custody once this process is known to be superseded,
+	// joined with the worker, which is what ends it.
+	follow := sync.OnceFunc(func() {
+		serving.Go(func() { followCustody(drainCtx, c, compute, log, opts) })
+	})
+
 	serving.Add(1)
 
 	go func() {
@@ -823,6 +911,8 @@ func stopGracefully(
 		// the process that holds the name, and what it runs is custody, which
 		// the wait below tends.
 		if supersededBefore {
+			follow()
+
 			return
 		}
 
@@ -846,6 +936,7 @@ func stopGracefully(
 							"keeping its leases renewed until what is running here finishes")
 						compute.Superseded()
 						superseded.Store(true)
+						follow()
 
 						return
 					}
@@ -879,6 +970,7 @@ func stopGracefully(
 					"keeping its leases renewed until what is running here finishes")
 				compute.Superseded()
 				superseded.Store(true)
+				follow()
 
 				return
 			}

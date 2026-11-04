@@ -376,6 +376,9 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/remove", h.forOwnOrEndedLease(h.removeRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/recover", h.forOwnLease(h.recoverRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
+	// forNode, BECAUSE THE PROCESS THAT ASKS HAS LOST THE NAME: it is a superseded
+	// process saying what it already holds, and this route gives it nothing new.
+	mux.HandleFunc("POST /v1/nodes/{node}/custody", h.forNode(h.claimCustody))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
 	return mux
@@ -1517,6 +1520,72 @@ func (h *handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxCustodyClaim bounds one claim: more leases than a fleet at its target holds.
+const maxCustodyClaim = 4096
+
+// claimCustody is a superseded process saying what it holds (Plane.ClaimCustody).
+// THE LEDGER DECIDES WHAT MAY BE CLAIMED, read before the plane's mutex is taken: a
+// lease it holds no row for is over and needs no owner, and one it places on another
+// node is not this node's to claim, as ledgerAgrees has it for a lease's own routes.
+// The request a lease was launched under comes from the ledger too, never the claim,
+// so a destroy reaches the process that holds it. A store that could not answer
+// fails the claim, which is asked again: could-not-tell grants nothing, and neither
+// does a lease the ledger places nowhere.
+func (h *handler) claimCustody(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.ClaimCustodyRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if len(req.LeaseIDs) > maxCustodyClaim {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			fmt.Sprintf("a claim names %d leases, more than the %d one may", len(req.LeaseIDs), maxCustodyClaim))
+
+		return
+	}
+
+	node := r.PathValue("node")
+
+	incarnation := r.Header.Get(nodeapi.HeaderIncarnation)
+	if incarnation == "" {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, "a custody claim names no process")
+
+		return
+	}
+
+	claims := make([]CustodyClaim, 0, len(req.LeaseIDs))
+
+	for _, id := range req.LeaseIDs {
+		lease, err := h.store.Lease(r.Context(), id)
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			continue
+		}
+
+		if err != nil {
+			writeStoreErr(w, err)
+
+			return
+		}
+
+		if lease == nil {
+			continue
+		}
+
+		placed := lease.Node
+		if placed == "" {
+			placed = lease.TargetNode
+		}
+
+		if placed == node {
+			claims = append(claims, CustodyClaim{LeaseID: id, RequestID: lease.RequestID})
+		}
+	}
+
+	held, adopted := h.plane.ClaimCustody(node, incarnation, claims)
+
+	writeJSON(w, http.StatusOK, nodeapi.ClaimCustodyResponse{Held: held, Adopted: adopted})
 }
 
 func (h *handler) markFailure(w http.ResponseWriter, r *http.Request) {

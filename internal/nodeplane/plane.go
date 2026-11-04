@@ -410,6 +410,10 @@ type leaseOwner struct {
 	// an ordinary job can end its ownership too. That destroy is the only signal
 	// the wire gets: the lease itself is released in-process by the listener.
 	requestID int64
+	// claimed says the process said it holds this lease (Plane.ClaimCustody), where
+	// a request id otherwise means this plane delivered the launch. A process's word
+	// gives way to the current process reporting the compute; a delivery does not.
+	claimed bool
 }
 
 // Option configures a Plane.
@@ -1912,6 +1916,71 @@ func (p *Plane) adoptOwnershipLocked(
 	}
 
 	p.pruneWithdrawnLocked()
+}
+
+// CustodyClaim is a lease a superseded process says it holds, which the ledger
+// places on its node, and the request the ledger says it was launched under.
+type CustodyClaim struct {
+	LeaseID   string
+	RequestID int64
+}
+
+// ClaimCustody records that a superseded process holds these leases, restoring on
+// this plane what the plane that gave them to it knew (#685). OWNERSHIP DOES NOT
+// SURVIVE A CONTROLLER: a promoted or restarted plane either has no owner for a
+// lease, or has as its owner whichever process reached it first, adopted from the
+// ledger's launched set, and would refuse the process that actually runs the compute
+// its own lease. A claim takes nothing another process was given:
+//
+//   - delivered, on this plane, to the claimant: it stays so. To another process: not
+//     granted, as a launch this plane sent is the one fact here that is not a guess.
+//   - another host's: not granted.
+//   - in the current process's own report: that process has the compute, whichever of
+//     the two reached this plane first. It is the current process's, and is answered
+//     as adopted, so the claimant lets it go.
+//   - no owner, the claimant's by an earlier claim or its own adoption, or the current
+//     process's by adoption alone when its complete report leaves the lease out: it
+//     is the claimant's, with its request, so a destroy finds it.
+//   - anything else: not granted, and asked again. An inventory not yet reported, or
+//     another process's adoption, is not the claimant's to take, and could-not-tell is
+//     not permission.
+//
+// It answers what the claimant now holds and what the current process has adopted.
+func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) (held, adopted []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.owners == nil {
+		p.owners = make(map[string]leaseOwner, len(claims))
+	}
+
+	current := p.nodes[node]
+	reportedBy := func(id string) bool {
+		return current != nil && current.incarnation != incarnation && current.inventoryKnown && current.inventory[id]
+	}
+
+	for _, claim := range claims {
+		id := claim.LeaseID
+		owner, taken := p.owners[id]
+		delivered := taken && owner.requestID != 0 && !owner.claimed
+
+		switch {
+		case taken && owner.node != node:
+		case delivered:
+			if owner.incarnation == incarnation {
+				held = append(held, id)
+			}
+		case reportedBy(id):
+			p.owners[id] = leaseOwner{node: node, incarnation: current.incarnation, requestID: claim.RequestID}
+			adopted = append(adopted, id)
+		case !taken, owner.incarnation == incarnation,
+			current != nil && current.incarnation == owner.incarnation && current.inventoryKnown:
+			p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: claim.RequestID, claimed: true}
+			held = append(held, id)
+		}
+	}
+
+	return held, adopted
 }
 
 // MayMutateLease reports whether this process may change a lease's fate.

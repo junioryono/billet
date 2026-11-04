@@ -147,6 +147,22 @@ type ReconcileResponse struct {
 	Freed int `json:"freed"`
 }
 
+// ClaimCustodyRequest is a superseded process saying which leases it holds compute
+// for, from VersionCustodyClaim. It grants the process nothing another was given;
+// see nodeplane.Plane.ClaimCustody.
+type ClaimCustodyRequest struct {
+	LeaseIDs []string `json:"lease_ids"`
+}
+
+// ClaimCustodyResponse is what the claim established: the leases this process holds
+// on this controller now, and those the node's current process has adopted, which
+// this one may let go of without destroying them. A lease named in neither is asked
+// about again.
+type ClaimCustodyResponse struct {
+	Held    []string `json:"held,omitempty"`
+	Adopted []string `json:"adopted,omitempty"`
+}
+
 // ErrorResponse is how a refusal crosses the wire.
 //
 // Code is a STABLE STRING the node may branch on; Message is for a human. The

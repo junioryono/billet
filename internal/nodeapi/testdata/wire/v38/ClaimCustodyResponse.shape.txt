@@ -1,0 +1,6 @@
+ClaimCustodyResponse.held tag omitempty
+ClaimCustodyResponse.held slice
+ClaimCustodyResponse.held[] string
+ClaimCustodyResponse.adopted tag omitempty
+ClaimCustodyResponse.adopted slice
+ClaimCustodyResponse.adopted[] string

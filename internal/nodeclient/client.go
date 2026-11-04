@@ -1082,6 +1082,48 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 		nodeapi.HeartbeatRequest{Epoch: epoch}, nil)
 }
 
+// ClaimCustody says, for a superseded process, which leases it holds, to the
+// controller that serves, and answers those the node's current process has adopted.
+// It tries every controller from the one it has; the first that answers is where
+// this process's lease calls go from now on, WITHOUT A REGISTRATION: only a
+// registration takes the name, and this process has lost it. An answer other than
+// success is that controller's word, and leaves the current one where it is.
+func (c *Client) ClaimCustody(ctx context.Context, leaseIDs []string) ([]string, error) {
+	if wire := c.WireVersion(); wire != 0 && wire < nodeapi.VersionCustodyClaim {
+		return nil, nil
+	}
+
+	start := int(c.current.Load())
+
+	var errs []error
+
+	for i := range c.targets {
+		at := (start + i) % len(c.targets)
+
+		var res nodeapi.ClaimCustodyResponse
+
+		err := c.doAt(ctx, c.targets[at], http.MethodPost, c.nodePath("/custody"),
+			nodeapi.ClaimCustodyRequest{LeaseIDs: leaseIDs}, &res)
+		if err == nil {
+			if at != start {
+				c.regMu.Lock()
+				c.current.Store(int64(at))
+				c.regMu.Unlock()
+			}
+
+			return res.Adopted, nil
+		}
+
+		if !errors.Is(err, errNoAnswer) {
+			return nil, err
+		}
+
+		errs = append(errs, err)
+	}
+
+	return nil, errors.Join(errs...)
+}
+
 // RecordLeaseUsage tells the control plane what the host measured a lease's
 // job do.
 //

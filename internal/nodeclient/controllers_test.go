@@ -44,6 +44,8 @@ type controller struct {
 	// supersede, when it returns true for a request, answers that another
 	// process has registered as this node.
 	supersede func(path string, n int) bool
+	// respond, when it returns true for a request, has answered it.
+	respond func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func newController(t *testing.T) *controller {
@@ -65,8 +67,12 @@ func newController(t *testing.T) *controller {
 		c.mu.Lock()
 		c.requests[r.URL.Path]++
 		n := c.requests[r.URL.Path]
-		drop, unavailable, supersede := c.drop, c.unavailable, c.supersede
+		drop, unavailable, supersede, respond := c.drop, c.unavailable, c.supersede, c.respond
 		c.mu.Unlock()
+
+		if respond != nil && respond(w, r) {
+			return
+		}
 
 		if supersede != nil && supersede(r.URL.Path, n) {
 			w.Header().Set("Content-Type", "application/json")

@@ -48,6 +48,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A node hands over on a stop only when its config says so (#374).**
 - **A launch that has begun is finished, not cancelled, by a stop (#393).**
 - **A job's measurement follows it into custody and across a handover (#384).**
+- **A superseded process says what it holds to whichever controller serves, and takes nothing another was given (#685).**
 - **A clean exit withdraws; silence still means nothing.**
 - **A restart waits for its own message session, and so does a failover.**
 - **A tier whose session fails keeps everything it holds while it reopens (#207).**
