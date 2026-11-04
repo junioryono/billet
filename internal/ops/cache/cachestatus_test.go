@@ -45,11 +45,18 @@ func TestABuildCacheThatNeverWarmsIsNamed(t *testing.T) {
 		"warmed-once":  {"go": {"cold": 100, "warm": 1}},
 		"just-started": {"go": {"cold": neverWarmAfter - 1}},
 		"git-cold":     {"git": {"cold": 100}},
-	}, 24*time.Hour)
+	}, 200, 1000, 24*time.Hour)
 
 	if len(got) != 2 || !strings.Contains(got[0], "always-cold's go cache was cold in 10 job(s)") ||
 		!strings.Contains(got[1], "bazel-cold's bazel cache was cold in 11 job(s)") {
 		t.Fatalf("neverWarmed = %q", got)
+	}
+
+	// A READ THAT STOPPED AT ITS LIMIT MAY NOT HAVE REACHED THE WARM JOB.
+	if got := neverWarmed(map[string]map[string]map[string]int{
+		"always-cold": {"go": {"cold": neverWarmAfter}},
+	}, 1000, 1000, 24*time.Hour); len(got) != 0 {
+		t.Fatalf("a read that reached its limit named %q", got)
 	}
 }
 

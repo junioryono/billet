@@ -65,7 +65,7 @@ func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	printCacheOutcomes(env.Stdout, counts, jobs, *since)
-	for _, warning := range neverWarmed(counts, *since) {
+	for _, warning := range neverWarmed(counts, jobs, cacheOutcomeRows, *since) {
 		fmt.Fprintln(env.Stdout, "warning: "+warning)
 	}
 
@@ -79,19 +79,31 @@ const cacheOutcomeRows = 100_000
 // cache worth naming: enough that a tier's first jobs after a new key are not it.
 const neverWarmAfter = 10
 
-// checkWarmthWindow and checkWarmthRows are what `billet check` reads to say so.
+// What `billet check` reads to say so. Bounded in time as well as rows, because a
+// limit bounds what comes back and not what is scanned: nothing indexes when a job
+// was assigned, and this report must not hold up the rest of the check.
 const (
 	checkWarmthWindow = 24 * time.Hour
 	checkWarmthRows   = 10_000
+	checkWarmthWait   = 5 * time.Second
 )
 
-// neverWarmed names each tier's Go or Bazel cache that went cold in
-// neverWarmAfter jobs or more and warm in none.
+// neverWarmed names each tier's Go or Bazel cache that went cold in neverWarmAfter
+// jobs or more and warm in none, over a read of jobs rows that stopped at limit if
+// it reached it.
 //
-// WORSE THAN NO CACHE, which is why it is said: a build cache that never warms
-// takes the place of the go command's own, so every job compiles from scratch
-// while the cache reads as working (#689).
-func neverWarmed(counts map[string]map[string]map[string]int, since time.Duration) []string {
+// A READ THAT REACHED ITS LIMIT SAYS NOTHING, because the warm job may be in the
+// part it did not read, and the rows are newest first.
+//
+// WHAT THE NODE SAW, and no more: `cold` says no request found its object in the
+// node's cache. The go command's own cache may still have served the job, and a key
+// nobody has published yet goes cold honestly, so the causes are offered as things
+// to look for. It is said because a cache that never warms costs its volume and its
+// requests and returns nothing (#689).
+func neverWarmed(counts map[string]map[string]map[string]int, jobs, limit int, since time.Duration) []string {
+	if jobs >= limit {
+		return nil
+	}
 	var warnings []string
 	for _, tier := range slices.Sorted(maps.Keys(counts)) {
 		for _, cache := range []string{"bazel", "go"} {
@@ -100,9 +112,8 @@ func neverWarmed(counts map[string]map[string]map[string]int, since time.Duratio
 				continue
 			}
 			warnings = append(warnings, fmt.Sprintf("%s's %s cache was cold in %d job(s) and warm in none "+
-				"in the last %s, so those jobs built from scratch; either nothing it wrote was published "+
-				"(the node's journal says `could not yet publish` or `a cache publication was abandoned`) "+
-				"or what was published is not being read",
+				"in the last %s: nothing they asked for was in it. If that goes on, look in the node's "+
+				"journal for `could not yet publish` and `a cache publication was abandoned`",
 				tier, cache, outcomes["cold"], cli.ShortDuration(since)))
 		}
 	}
@@ -112,16 +123,19 @@ func neverWarmed(counts map[string]map[string]map[string]int, since time.Duratio
 
 // ReportCacheWarmth prints what neverWarmed finds for `billet check`.
 //
-// REPORTED, NEVER FATAL, and a failed read says it could not tell: this is a
-// cache's effectiveness, and no deployment is wrong to run without it.
+// REPORTED, NEVER FATAL, and a failed or slow read says it could not tell: this is
+// a cache's effectiveness, and no deployment is wrong to run without it.
 func ReportCacheWarmth(ctx context.Context, env cli.Env, a *alloc.Allocator) {
-	counts, _, err := a.CacheOutcomes(ctx, time.Now().Add(-checkWarmthWindow), checkWarmthRows)
+	ctx, cancel := context.WithTimeout(ctx, checkWarmthWait)
+	defer cancel()
+
+	counts, jobs, err := a.CacheOutcomes(ctx, time.Now().Add(-checkWarmthWindow), checkWarmthRows)
 	if err != nil {
 		fmt.Fprintf(env.Stdout, "caches   could not tell whether the build caches warm: %v\n", err)
 
 		return
 	}
-	for _, warning := range neverWarmed(counts, checkWarmthWindow) {
+	for _, warning := range neverWarmed(counts, jobs, checkWarmthRows, checkWarmthWindow) {
 		fmt.Fprintln(env.Stdout, "caches   "+warning)
 	}
 }
