@@ -150,5 +150,6 @@ func allocatorLimits(cfg *config.Config) alloc.Limits {
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
 		Shares:    cfg.TargetShares(),
+		Weights:   cfg.TargetWeights(),
 	}
 }

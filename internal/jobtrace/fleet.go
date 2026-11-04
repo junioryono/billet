@@ -29,6 +29,18 @@ type Fleet struct {
 	// server.admission_order; empty means the default, as it does in a config.
 	Placement      config.PlacementPolicy `json:"placement,omitempty"`
 	AdmissionOrder config.AdmissionOrder  `json:"admission_order,omitempty"`
+	// Targets are the GitHub targets the tiers belong to, by their names in the
+	// configuration and with what each weighs; empty for a fleet of one target
+	// that says nothing about it.
+	Targets []Target `json:"targets,omitempty"`
+}
+
+// Target is one GitHub target of the deployment, by its name in the
+// configuration, never its owner on GitHub.
+type Target struct {
+	Name string `json:"name"`
+	// Weight is the target's `weight`; zero is none written.
+	Weight int `json:"weight,omitempty"`
 }
 
 // Host is one machine of the fleet.
@@ -51,14 +63,33 @@ type Tier struct {
 	// Node pins the tier to one host, as the tier's own `node` does; empty
 	// places it anywhere.
 	Node string `json:"node,omitempty"`
+	// Target is the target the tier belongs to, one Targets names; empty for a
+	// fleet that lists none.
+	Target string `json:"target,omitempty"`
 }
 
 // Validate refuses a fleet document that describes no deployment: no hosts,
 // a host or tier without a unique name and a positive shape, no ceiling, a
-// policy billet does not implement, or a tier pinned to a host it does not
-// list.
+// policy billet does not implement, a tier pinned to a host it does not list,
+// or a target without a unique name and a weight billet would accept, or one a
+// tier names and it does not list.
 func (f *Fleet) Validate() error {
 	var errs []error
+
+	targets := map[string]bool{}
+
+	for i, t := range f.Targets {
+		if strings.TrimSpace(t.Name) == "" || targets[t.Name] {
+			errs = append(errs, fmt.Errorf("jobtrace: targets[%d] needs a unique name, got %q", i, t.Name))
+		}
+
+		targets[t.Name] = true
+
+		if t.Weight < 0 || t.Weight > config.MaxTargetWeight {
+			errs = append(errs, fmt.Errorf("jobtrace: target %q has weight %d, which must be from 0 to %d",
+				t.Name, t.Weight, config.MaxTargetWeight))
+		}
+	}
 
 	if len(f.Hosts) == 0 {
 		errs = append(errs, errors.New("jobtrace: the fleet has no hosts"))
@@ -94,6 +125,11 @@ func (f *Fleet) Validate() error {
 		if t.Node != "" && !hosts[t.Node] {
 			errs = append(errs, fmt.Errorf("jobtrace: tier %q is pinned to %q, which the fleet does not list",
 				t.Label, t.Node))
+		}
+
+		if t.Target != "" && !targets[t.Target] {
+			errs = append(errs, fmt.Errorf("jobtrace: tier %q belongs to target %q, which the fleet does not list",
+				t.Label, t.Target))
 		}
 	}
 

@@ -301,6 +301,11 @@ github:
 #     # This target's share: the most its tiers hold at once between them, so
 #     # a burst of its CI leaves the other targets the rest of the ceiling.
 #     max_vcpu: 80
+#     # This target's claim on contended room, from 1 to 1000; a target that
+#     # writes none weighs 1. While two targets both wait for the same room, the
+#     # one holding least per unit of weight buys first, so this one and a target
+#     # of weight 1 converge to 2:1. An idle target's weight claims nothing.
+#     weight: 2
 
 # Where `billet local backup` puts a copy that is NOT on the disk it protects.
 #

@@ -25,10 +25,17 @@ type shareUsage struct {
 }
 
 func (a *Allocator) readShareUsage(ctx context.Context, tx querier) (shareUsage, error) {
-	out := shareUsage{byTarget: map[string]placementCost{}}
 	if len(a.limits.Shares) == 0 {
-		return out, nil
+		return shareUsage{byTarget: map[string]placementCost{}}, nil
 	}
+
+	return a.readTargetUsage(ctx, tx)
+}
+
+// readTargetUsage is what each target's tiers hold, whether or not any target
+// has a share.
+func (a *Allocator) readTargetUsage(ctx context.Context, tx querier) (shareUsage, error) {
+	out := shareUsage{byTarget: map[string]placementCost{}}
 
 	rows, err := state.ReadQueries(tx).UsageByTier(ctx)
 	if err != nil {
@@ -54,6 +61,55 @@ func (a *Allocator) readShareUsage(ctx context.Context, tx querier) (shareUsage,
 	}
 
 	return out, nil
+}
+
+// targetRanks is each catalogue target's dominant share of the deployment
+// ceiling over its weight, nil when no target has a weight.
+//
+// THE DOMINANT SHARE, NOT vCPU ALONE: the larger of what a target holds of the
+// ceiling's vCPU and of its memory, because a node can run out of either and
+// the reference node ran out of memory at 120 of its 180 vCPU. A lease on a tier
+// that left the catalogue counts on no target, since which one it belonged to
+// cannot be told. Read for the admission order and nothing else: it ranks who
+// asks first, and the escrow transaction still decides what may be bought.
+func (a *Allocator) targetRanks(ctx context.Context, tx querier) (map[string]float64, error) {
+	if len(a.limits.Weights) == 0 {
+		return nil, nil //nolint:nilnil // nil is the order's "no target has a weight".
+	}
+
+	usage, err := a.readTargetUsage(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]float64, len(a.limits.Weights))
+
+	for label := range a.tiers {
+		target := config.ShareTarget(a.tiers[label])
+		if _, done := out[target]; done {
+			continue
+		}
+
+		weight := max(a.limits.Weights[target], 1)
+		out[target] = a.dominantShare(usage.byTarget[target]) / float64(weight)
+	}
+
+	return out, nil
+}
+
+// dominantShare is the larger of what held is of the ceiling's vCPU and memory.
+func (a *Allocator) dominantShare(held placementCost) float64 {
+	var vcpu, memory float64
+
+	if a.limits.MaxVCPU > 0 {
+		vcpu = float64(held.vcpu) / float64(a.limits.MaxVCPU)
+	}
+
+	if a.limits.MaxMemory > 0 {
+		memory = float64(held.memory) / float64(a.limits.MaxMemory)
+	}
+
+	return max(vcpu, memory)
 }
 
 // room is what a target may still take under its share, with returned handed

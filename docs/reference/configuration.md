@@ -41,6 +41,7 @@ The first GitHub **target**: the owner whose runners this deployment serves, and
 | `installation_id` | yes | creating an App does not install it |
 | `private_key_path` | yes | the key GitHub issued once |
 | `max_vcpu`, `max_memory` | no | this target's share: the most its tiers may hold at once between them, inside `server.max_vcpu`/`max_memory`; see [A target's share](#a-targets-share) |
+| `weight` | no | this target's claim on contended room, from 1 to 1000; see [A target's weight](#a-targets-weight) |
 
 A repository target is **untrusted-only**: a repository has no runner groups, so nothing on GitHub's side can restrict a pool there, and `trust: trusted`, `runner_group` and `workflows` are refused on a tier under one. Its repository becomes the cache scope of each of its tiers, which therefore publish from its default branch by default. Its App holds `administration: write` on that repository, the only permission GitHub offers for registering a repository's runners ([ADR-011](decisions/adr-011-targets-and-repository-scope.md)).
 
@@ -51,13 +52,19 @@ Further targets, each an organization or a repository with its own App, served b
 | Key | Required | Meaning |
 |---|---|---|
 | `name` | yes | the target's name, in the tier-label grammar, unique; what `tiers[].target`, `github-app create --target`, the archive and the host role refer to it by |
-| `org` or `repository`, `app_id`, `client_id`, `installation_id`, `private_key_path`, `max_vcpu`, `max_memory` | as for `github` | the target and its credential; with a file-backed identity every target needs its own `private_key_path`, with a store-backed one none may set it |
+| `org` or `repository`, `app_id`, `client_id`, `installation_id`, `private_key_path`, `max_vcpu`, `max_memory`, `weight` | as for `github` | the target and its credential; with a file-backed identity every target needs its own `private_key_path`, with a store-backed one none may set it |
 
 The target's GitHub path (`owner` or `owner/name`) is its identity on the wire and in the ledger; the name is a label for the operator.
 
 ### A target's share
 
 Every target's tiers buy from the one deployment ceiling, so a burst of one target's CI can take every host another target's jobs need. `max_vcpu` and `max_memory` on a target's block cap what that target's tiers hold at once between them, charged the way the deployment ceiling is (a remote backend at the shape it buys). A zero or absent dimension is bounded by the deployment ceiling alone. Capping one target leaves the rest for the others: with `server.max_vcpu: 120` and `max_vcpu: 80` on a repository target, that repository's jobs never hold more than 80, so the other target always has at least 40. A tier held back by its own target's share also stops holding its place in `server.admission_order` against other targets' tiers, because room they free could never reach it. A share is refused when it is above the deployment ceiling, below one of its tiers' shapes, or below what its tiers' `reserved` floors hold between them.
+
+### A target's weight
+
+A share is a hard cap, so it strands room while the capped target is idle and another is queueing. `weight` divides contended room instead, and only while it is contended. When waiters from two or more targets compete for the same room, the one whose target holds least per unit of weight buys first: what a target holds is the larger of its share of `server.max_vcpu` and of `server.max_memory`, so a target holding little vCPU and much memory is not treated as holding little. Two saturating targets of weight 2 and 1 converge to about 2:1 ([the record](records/target-weights.md)). Within one target, and between targets level with each other, the longest waiter still goes first. A target with nothing waiting claims nothing, so its room goes to whoever is asking. A target that writes no weight weighs 1, and with no weight written anywhere the order is exactly the longest waiter first, as it always was.
+
+A weight only ranks who may buy next. Floors, shares, the ceiling and each host's room still bound every purchase, what a tier advertises does not change, and a waiter whose listener makes no progress steps aside whatever its target's rank. A weight must be from 1 to 1000, and one under `admission_order: fill` is refused, because `fill` ranks no waiters. Under GitHub Enterprise Server's offers no tier is recorded as waiting, so the order has nobody to rank and a weight does nothing until #686 is fixed.
 
 ## `node`
 

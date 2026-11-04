@@ -390,7 +390,10 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 		},
 		MaxVCPU: 192, MaxMemory: 544 * config.GiB, AdmissionOrder: config.AdmissionFill,
 		Placement: config.PlacementSpread,
+		Targets:   []jobtrace.Target{{Name: config.DefaultTargetName, Weight: 2}},
 	}
+	doc.Tiers[0].Target = config.DefaultTargetName
+	doc.Tiers[1].Target = config.DefaultTargetName
 
 	f, dropped, err := FleetFromDocument(doc)
 	if err != nil || len(dropped) != 0 {
@@ -400,10 +403,11 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 	want := Fleet{
 		Hosts: []Host{{Name: "ubuntu-01", VCPU: 180, Memory: 480 * config.GiB, Site: "home"},
 			{Name: "macos-01", VCPU: 12, Memory: 64 * config.GiB}},
-		Tiers: []TierShape{{Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB},
-			{Label: "billet-macos", VCPU: 6, Memory: 24 * config.GiB, Node: "macos-01"}},
+		Tiers: []TierShape{{Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, Target: config.DefaultTargetName},
+			{Label: "billet-macos", VCPU: 6, Memory: 24 * config.GiB, Node: "macos-01", Target: config.DefaultTargetName}},
 		MaxVCPU: 192, MaxMemory: 544 * config.GiB, AdmissionOrder: config.AdmissionFill,
 		Placement: config.PlacementSpread,
+		Targets:   []TargetShape{{Name: config.DefaultTargetName, Weight: 2}},
 	}
 	if !reflect.DeepEqual(f, want) {
 		t.Errorf("the fleet is\n%+v\nwant\n%+v", f, want)
@@ -439,6 +443,125 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 	shapeless.Tiers = []jobtrace.Tier{{Label: "billet-none"}}
 	if _, _, err := FleetFromDocument(shapeless); err == nil || !strings.Contains(err.Error(), "billet-none") {
 		t.Errorf("a tier with no shape gave %v; want it refused by name", err)
+	}
+}
+
+// twoTargets is one tier per target on hosts with room for sixteen of its jobs,
+// each target at the weight given; a weight of zero is none written.
+func twoTargets(first, second int) Fleet {
+	return Fleet{
+		Hosts: []Host{
+			{Name: "host-a", VCPU: 16, Memory: 64 * config.GiB},
+			{Name: "host-b", VCPU: 16, Memory: 64 * config.GiB},
+		},
+		Tiers: []TierShape{
+			{Label: "billet-first", VCPU: 2, Memory: 8 * config.GiB, Target: config.DefaultTargetName},
+			{Label: "billet-second", VCPU: 2, Memory: 8 * config.GiB, Target: "second"},
+		},
+		Targets: []TargetShape{{Name: config.DefaultTargetName, Weight: first}, {Name: "second", Weight: second}},
+		MaxVCPU: 32, MaxMemory: 128 * config.GiB,
+	}
+}
+
+// laterShare is the first target's share of what the two held over the second half
+// of their contested window, past the start when both bought as they arrived.
+func laterShare(t *testing.T, r *Report) float64 {
+	t.Helper()
+
+	from, to, ok := r.ContestedWindow()
+	if !ok {
+		t.Fatal("the two targets never contended")
+	}
+
+	charged := r.ChargedByTarget(from.Add(to.Sub(from)/2), to)
+
+	total := charged[config.DefaultTargetName].VCPUSeconds + charged["second"].VCPUSeconds
+	if total == 0 {
+		t.Fatal("neither target held anything in the contested window")
+	}
+
+	return charged[config.DefaultTargetName].VCPUSeconds / total
+}
+
+// CONTENDED ROOM IS DIVIDED BY WEIGHT (#530): two targets each with more work than
+// the fleet holds converge to what their weights say, the same trace with no
+// weight divides evenly, and with one target idle the other takes all the room.
+// Under direct assignment, the protocol on which a tier is ever recorded waiting
+// (#686). BILLET_REPLAY_JOBS sizes it for the record, each run then being kept
+// under -replay.out.
+func TestContendedRoomIsDividedByWeight(t *testing.T) {
+	jobs := 80
+	if n := os.Getenv("BILLET_REPLAY_JOBS"); n != "" {
+		if _, err := fmt.Sscan(n, &jobs); err != nil || jobs <= 0 {
+			t.Fatalf("BILLET_REPLAY_JOBS=%q is not a positive count", n)
+		}
+	}
+
+	opts := Options{DirectAssignment: true, Log: discardLogger()}
+	weighted, even := twoTargets(2, 1), twoTargets(0, 0)
+	params := ContendedParams{Params: Params{Jobs: jobs}, Fleet: weighted}
+
+	report := Run(t, weighted, ContendedTargets(1, params), opts)
+	if why := report.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	if share := laterShare(t, report); share < 0.60 || share > 0.73 {
+		t.Errorf("weighted 2:1, the first target held %.3f of the contested vCPU; want about 2/3\n%s", share,
+			report.TargetTable(4))
+	}
+
+	control := Run(t, even, ContendedTargets(1, params), opts)
+	if why := control.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	if share := laterShare(t, control); share < 0.42 || share > 0.58 {
+		t.Errorf("with no weight, the first target held %.3f of the contested vCPU; want about half\n%s", share,
+			control.TargetTable(4))
+	}
+
+	// THE SECOND TARGET'S WEIGHT CLAIMS NOTHING WHILE IT WAITS FOR NOTHING. Its one
+	// rival holds the fleet: from the first start to the last, all but the
+	// edges of the sixteen slots. Measured between its tenth start and its last, by
+	// when the room had filled and before it drained.
+	idleParams := params
+	idleParams.Idle = []string{"billet-second"}
+
+	alone := Run(t, weighted, ContendedTargets(1, idleParams), opts)
+	if why := alone.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	starts := make([]time.Time, 0, len(alone.Records))
+	for i := range alone.Records {
+		starts = append(starts, alone.Records[i].StartedAt)
+	}
+
+	slices.SortFunc(starts, time.Time.Compare)
+
+	if len(starts) <= 16 {
+		t.Fatalf("%d jobs cannot fill the room", len(starts))
+	}
+
+	from, to := starts[16], starts[len(starts)-1]
+	held := alone.ChargedByTarget(from, to)[config.DefaultTargetName].VCPUSeconds
+
+	if mean := held / to.Sub(from).Seconds(); mean < 0.95*32 {
+		t.Errorf("with the other target idle, the first held a mean of %.1f of 32 vCPU; want all of it", mean)
+	}
+
+	if *outDir != "" {
+		if err := os.MkdirAll(*outDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		body := "## Weighted 2:1\n\n" + report.TargetTable(8) + "\n## No weight\n\n" + control.TargetTable(8) +
+			fmt.Sprintf("\n## The second target idle\n\nThe first held a mean of %.1f of 32 vCPU.\n",
+				held/to.Sub(from).Seconds())
+		if err := os.WriteFile(filepath.Join(*outDir, "target-weights.md"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

@@ -49,6 +49,16 @@ type TierShape struct {
 	// Node pins the tier to one host, as a tier's `node` does; empty places it
 	// anywhere.
 	Node string
+	// Target is the target the tier belongs to, one Fleet.Targets names; empty
+	// in a fleet that declares none.
+	Target string
+}
+
+// TargetShape is one GitHub target of the fleet.
+type TargetShape struct {
+	Name string
+	// Weight is the target's `weight`; zero is none written.
+	Weight int
 }
 
 // Fleet is the deployment a trace is replayed against.
@@ -64,9 +74,22 @@ type Fleet struct {
 	// AdmissionOrder is server.admission_order; empty means fair, as it does in
 	// a config.
 	AdmissionOrder config.AdmissionOrder
+	// Targets are the targets the tiers belong to, the first of them the
+	// `github` block and so named config.DefaultTargetName, as in a config. Empty
+	// is one target nothing says anything about.
+	Targets []TargetShape
 	// Boot is the modelled time between a mint and the runner taking a job. Zero
 	// means DefaultBoot.
 	Boot time.Duration
+}
+
+// ownerOf is the GitHub organization a target of the fleet serves.
+func ownerOf(target string) string {
+	if target == config.DefaultTargetName {
+		return DefaultOwner
+	}
+
+	return target
 }
 
 // validate refuses a fleet the trace cannot be replayed against.
@@ -103,9 +126,27 @@ func (f Fleet) validate(trace Trace) error {
 		errs = append(errs, fmt.Errorf("replay: %w", err))
 	}
 
+	targets := map[string]bool{}
+
+	for i, target := range f.Targets {
+		if (i == 0) != (target.Name == config.DefaultTargetName) || targets[target.Name] {
+			errs = append(errs, fmt.Errorf("replay: targets[%d] is named %q; the first and only the first target "+
+				"is %q, and each has a unique name", i, target.Name, config.DefaultTargetName))
+		}
+
+		targets[target.Name] = true
+	}
+
 	labels := map[string]bool{}
 
 	for i, t := range f.Tiers {
+		// EVERY TIER OF A DECLARED SET OF TARGETS NAMES ONE, as a config requires
+		// of several; the server cannot resolve an empty one among them.
+		if len(f.Targets) > 0 && !targets[t.Target] || len(f.Targets) == 0 && t.Target != "" {
+			errs = append(errs, fmt.Errorf("replay: tier %q belongs to target %q, which the fleet does not declare",
+				t.Label, t.Target))
+		}
+
 		if strings.TrimSpace(t.Label) == "" || labels[t.Label] {
 			errs = append(errs, fmt.Errorf("replay: tiers[%d] needs a unique label, got %q", i, t.Label))
 		}
@@ -169,6 +210,7 @@ func (f Fleet) tiers(trace Trace) []config.Tier {
 			Workflows:   []string{Workflow},
 			Command:     simulated.RunFor(trace.LongestDuration(shape.Label) + f.boot() + time.Hour),
 			Node:        shape.Node,
+			Target:      shape.Target,
 		})
 	}
 
@@ -196,6 +238,10 @@ func FleetFromDocument(doc jobtrace.Fleet) (Fleet, []string, error) {
 		AdmissionOrder: doc.AdmissionOrder,
 	}
 
+	for _, t := range doc.Targets {
+		f.Targets = append(f.Targets, TargetShape{Name: t.Name, Weight: t.Weight})
+	}
+
 	var dropped []string
 
 	for _, h := range doc.Hosts {
@@ -218,7 +264,8 @@ func FleetFromDocument(doc jobtrace.Fleet) (Fleet, []string, error) {
 			continue
 		}
 
-		f.Tiers = append(f.Tiers, TierShape{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: t.Node})
+		f.Tiers = append(f.Tiers, TierShape{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: t.Node,
+			Target: t.Target})
 	}
 
 	if err := errors.Join(errs...); err != nil {

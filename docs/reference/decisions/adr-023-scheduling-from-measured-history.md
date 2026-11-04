@@ -23,6 +23,16 @@ Predicting a job's runtime from the history of the same job is well studied in b
 
 **Its error is visible per job and per tier.** `billet jobs show` prints a job's runtime beside what a controller refreshing hourly would have predicted when it started: the snapshot as of the hour the job started in. A history that cannot be read is said on that line and does not fail the report. `billet jobs runtimes` grades every job in a window the same way, per tier, reporting the median absolute error, the share within 2x of the prediction and the level each came from. Neither grades a job against itself. `billet jobs runtimes` reads the ledger as a report, which creates, locks, claims and migrates nothing, and on SQLite it runs only as the owner of the directory the ledger file is in, since a read-only open of a stopped SQLite ledger leaves sidecar files owned by whoever opened it. `billet jobs show` keeps the operator open it always had.
 
+## Weights between targets (#530)
+
+**While waiters of two or more targets compete for the same room, the target holding least per unit of weight buys first.** `targets[].weight` is the only new setting. A share caps a target whether or not anyone else wants the room, so it strands room when the capped target is idle. A weight costs nothing until two targets contend, and an idle target's claims nothing, because it is no candidate. Within a target, and between targets level with each other, the order stays oldest first, and with no weight written anywhere it is exactly what it was.
+
+**What a target holds is its dominant share**: the larger of its share of the deployment ceiling's vCPU and of its memory, over its weight. vCPU alone would misread the deployment this was measured on, whose Linux node runs out of memory near 120 of its 180 vCPU, and on which a target holding memory-heavy shapes could hold most of what matters while ranking as holding little. Dominant resource fairness (Ghodsi et al., NSDI 2011) is where the measure comes from; weighted fair queueing (Demers, Keshav and Shenker, SIGCOMM 1989) is the older idea of dividing a contended resource in proportion to weights among only those asking. billet takes neither algorithm: it ranks the head of its existing queue by a fact read from the ledger, and does not keep virtual time or any per-target account.
+
+**It ranks and decides nothing else.** It gates purchases and never an advertisement (ADR-012), it reads the ledger outside the escrow transaction, and floors, shares, the ceiling and each host's room still bound every purchase, which the transaction still decides. A rank is one read old, so two buyers can each believe themselves behind and both buy; the next read corrects it, and a wrong rank gives a target one lease too many and never a wrong outcome. A failed read reads as no target, and then the order is oldest first, so an error cannot move a target up.
+
+**A weight under `fill` is refused,** because `fill` ranks no waiters and an operator who wrote one would believe a division the control plane never makes. Under GHES's offers no tier is recorded waiting (#686), so there it does nothing until that is fixed.
+
 ## Consequences
 
 - No migration: everything is read from columns the ledger already keeps. A row from before migration 56 has no repository, workflow or name, and is learned and predicted under its tier alone.

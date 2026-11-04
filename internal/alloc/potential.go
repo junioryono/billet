@@ -81,6 +81,13 @@ type TierAdmission struct {
 	// never reach it until its own target's work ends, so it must not hold that
 	// target's tiers back: that is the starvation a share exists to prevent.
 	ShareBound bool
+	// TargetRank is every catalogue target's dominant share of the deployment
+	// ceiling over its weight, from one ledger snapshot, and nil when no target
+	// has a weight. The admission order puts the lowest first among waiters of
+	// different targets, so what a target holds per unit of weight evens out while
+	// they all wait, and a target with nobody waiting claims nothing. Shared
+	// between the tiers of one view, and never written after it is read.
+	TargetRank map[string]float64
 }
 
 // AdmissionView reads every tier's TierAdmission in one ledger snapshot, so one
@@ -101,10 +108,19 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 			return err
 		}
 
+		ranks, err := a.targetRanks(ctx, tx)
+		if err != nil {
+			return err
+		}
+
 		for _, label := range a.sortedLabels() {
 			if out[label], err = a.admissionIn(ctx, tx, a.tiers[label], nodes, held); err != nil {
 				return err
 			}
+
+			entry := out[label]
+			entry.TargetRank = ranks
+			out[label] = entry
 		}
 
 		return nil
@@ -130,7 +146,13 @@ func (a *Allocator) AdmissionFor(ctx context.Context, tier string) (TierAdmissio
 			return err
 		}
 
+		ranks, err := a.targetRanks(ctx, tx)
+		if err != nil {
+			return err
+		}
+
 		out, err = a.admissionIn(ctx, tx, t, nodes, held)
+		out.TargetRank = ranks
 
 		return err
 	})

@@ -18,6 +18,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Capacity is bought when a runner starts, and it is a vector.**
 - **Nothing is reserved for an idle tier, and there is no rotation (#140).**
 - **A target's share is a narrower deployment ceiling (#192).**
+- **A target's weight ranks who buys next while targets contend, and decides nothing else (#530).**
 - **Status separates ownership from phase.**
 - **A commitment made to a remote service cannot be revoked by a local timer.**
 - **A pool member GitHub cannot route work to is retired on GitHub's per-registration word, never on the aggregate.**

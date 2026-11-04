@@ -80,19 +80,6 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 ) *stack {
 	t.Helper()
 
-	client, err := scaleset.New(scaleset.Config{
-		Target:         billetgithub.OrganizationTarget(DefaultOwner),
-		GitHubURL:      actions.URL,
-		ClientID:       "12345",
-		InstallationID: 67890,
-		PrivateKey:     actions.PrivateKeyPEM(),
-		AppID:          12345,
-		APIURL:         actions.URL + "/api/v3",
-	}, nil)
-	if err != nil {
-		t.Fatalf("scaleset.New: %v", err)
-	}
-
 	// AUTOMATIC UPDATES OFF: an absent release block turns them on, and the
 	// starter would ask the public release channel from inside a replay.
 	automatic := false
@@ -110,18 +97,52 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 		Tiers:   tiers,
 	}
 
+	// A FLEET THAT DECLARES ITS TARGETS WRITES THEM AS A CONFIG DOES, so their
+	// weights reach the allocator through the one function the CLI's do.
+	for i, target := range fleet.Targets {
+		block := config.GitHubConfig{Org: ownerOf(target.Name), Weight: target.Weight}
+		if i == 0 {
+			cfg.GitHub = &block
+
+			continue
+		}
+
+		block.Name = target.Name
+		cfg.Targets = append(cfg.Targets, block)
+	}
+
 	// THE OPERATOR'S SECOND SIGNAL, wired as `billet node` and `billet server`
 	// wire it. A replay ends with nothing running, so a drain ends by itself;
 	// closing this at stop is what keeps a replay that failed half way from
 	// hanging in cleanup instead of in the assertion that named the failure.
 	hurry := make(chan struct{})
 
-	// The one target, assembled the way the CLI assembles one, so the scale-set
-	// record carries the owner's path and every tier resolves through it.
-	targets := []app.Target{{
-		Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: DefaultOwner},
-		Client: client,
-	}}
+	// Each target, assembled the way the CLI assembles one, so the scale-set
+	// record carries the owner's path and every tier resolves through it. A fleet
+	// that declares none has the one target.
+	declared := []config.GitHubTarget{{Name: config.DefaultTargetName, Org: DefaultOwner}}
+	if len(fleet.Targets) > 0 {
+		declared = cfg.GitHubTargets()
+	}
+
+	targets := make([]app.Target, 0, len(declared))
+
+	for _, target := range declared {
+		client, err := scaleset.New(scaleset.Config{
+			Target:         billetgithub.OrganizationTarget(target.Org),
+			GitHubURL:      actions.URL,
+			ClientID:       "12345",
+			InstallationID: 67890,
+			PrivateKey:     actions.PrivateKeyPEM(),
+			AppID:          12345,
+			APIURL:         actions.URL + "/api/v3",
+		}, nil)
+		if err != nil {
+			t.Fatalf("scaleset.New: %v", err)
+		}
+
+		targets = append(targets, app.Target{Config: target, Client: client})
+	}
 
 	cp, err := app.OpenControlPlane(t.Context(), cfg, harnessHost(), targets, app.ControlPlaneOptions{
 		Steering: &app.Steering{

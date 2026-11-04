@@ -21,6 +21,7 @@ guest-release-removal
 cpu-placement
 runtime-predictions
 replay-policies
+target-weights
 ```
 
 | Record | Covers |
