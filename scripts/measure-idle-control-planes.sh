@@ -191,12 +191,33 @@ start_plane() {
     echo $! >"${dir}/pid"
 }
 
+# is_billet reports whether a pid is still the billet this driver started. A pid
+# file outlives its process and this runs as root, so a recorded number is never
+# signalled or counted as alive on its own word.
+is_billet() {
+    [ "$(readlink "/proc/$1/exe" 2>/dev/null)" = "${MEASURE_ROOT}/bin/billet" ]
+}
+
+# stop_all stops every process any earlier run recorded, however many this run
+# asks for, and waits for each to go: a leftover would be in this run's numbers.
 stop_all() {
-    local n pid
-    for n in $(planes); do
-        [ -f "$(plane_dir "${n}")/pid" ] || continue
-        pid=$(cat "$(plane_dir "${n}")/pid")
-        kill -KILL "${pid}" 2>/dev/null || true
+    local file pid deadline
+    for file in "${MEASURE_ROOT}"/planes/*/pid; do
+        [ -f "${file}" ] || continue
+        pid=$(cat "${file}")
+        if is_billet "${pid}"; then
+            kill -KILL "${pid}"
+        fi
+    done
+    deadline=$(($(date +%s) + 30))
+    for file in "${MEASURE_ROOT}"/planes/*/pid; do
+        [ -f "${file}" ] || continue
+        pid=$(cat "${file}")
+        while is_billet "${pid}"; do
+            [ "$(date +%s)" -lt "${deadline}" ] || die "pid ${pid} did not go after SIGKILL"
+            sleep 0.1
+        done
+        rm -f "${file}"
     done
 }
 
@@ -204,7 +225,7 @@ alive_or_die() {
     local n pid
     for n in $(planes); do
         pid=$(cat "$(plane_dir "${n}")/pid")
-        kill -0 "${pid}" 2>/dev/null || die "control plane ${n} died; see $(plane_dir "${n}")/log"
+        is_billet "${pid}" || die "control plane ${n} died; see $(plane_dir "${n}")/log"
     done
 }
 
@@ -215,6 +236,34 @@ fake_clean_or_die() {
         curl -fsS "http://${admin}/" >&2
         die "the fake GitHub met requests it does not answer, so this measured a stuck deployment"
     fi
+}
+
+# polls_snapshot records how many polls each organization has made so far.
+polls_snapshot() {
+    curl -fsS "http://${admin}/" >"$1"
+}
+
+# polls_progressed_or_die fails a window in which any organization stopped polling:
+# a process with working metrics and no traffic to GitHub is a stuck deployment,
+# and its numbers would read as a cheap idle one. Half the rate the fake answers at
+# is a floor no healthy listener comes near.
+polls_progressed_or_die() {
+    python3 -I - "$1" "$2" "${MEASURE_TIERS}" "${MEASURE_WINDOW}" <<'PY'
+import json
+import sys
+
+before, after = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+tiers, window = int(sys.argv[3]), int(sys.argv[4])
+floor = tiers * window / 50 / 2
+stuck = {
+    org: after["polled"].get(org, 0) - before["polled"].get(org, 0)
+    for org in after["opened"]
+    if after["polled"].get(org, 0) - before["polled"].get(org, 0) < floor
+}
+if stuck:
+    print(f"under {floor:.0f} polls in the window: {stuck}", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 # wait_sessions prints each named organization's seconds from <since> to its last
@@ -297,11 +346,21 @@ sample() {
             "SELECT ${now}, application_name, COUNT(*), COUNT(*) FILTER (WHERE state = 'idle')
                FROM pg_stat_activity WHERE application_name LIKE 'cp%' GROUP BY application_name" \
             >>"${out}/postgres.tsv"
-        local backends
-        backends=$(pgrep -x postgres | while read -r p; do
-            awk '$1 == "Pss:" {print $2}' "/proc/${p}/smaps_rollup" 2>/dev/null || true
-        done | awk '{s += $1} END {print s + 0}')
-        printf '%s\t%s\n' "${now}" "${backends}" >>"${out}/postgres-pss.tsv"
+        # A BACKEND THAT EXITED BETWEEN THE LIST AND THE READ IS NOT A FAILED READ,
+        # which is told from a live process it could not read; the sample is
+        # dropped whole rather than recorded short.
+        local backends=0 kib p readable=yes
+        for p in $(pgrep -x postgres); do
+            if kib=$(awk '$1 == "Pss:" {print $2}' "/proc/${p}/smaps_rollup" 2>/dev/null) && [ -n "${kib}" ]; then
+                backends=$((backends + kib))
+            elif [ -d "/proc/${p}" ]; then
+                readable=no
+            fi
+        done
+        [ "${backends}" -gt 0 ] || readable=no
+        if [ "${readable}" = yes ]; then
+            printf '%s\t%s\n' "${now}" "${backends}" >>"${out}/postgres-pss.tsv"
+        fi
     fi
 
     printf '%s\t%s\t%s\n' "${now}" "$(awk '$1 == "MemAvailable:" {print $2}' /proc/meminfo)" \
@@ -358,15 +417,15 @@ summary["cpu_total_cores"] = sum(ticks.values())
 path = os.path.join(out, "postgres.tsv")
 if os.path.exists(path):
     counts = collections.defaultdict(list)
-    idle = collections.defaultdict(list)
+    at = collections.defaultdict(int)
     with open(path) as rows:
         for row in rows:
-            _, app, total, parked = row.split("\t")
+            when, app, total, _ = row.split("\t")
             counts[app].append(int(total))
-            idle[app].append(int(parked))
+            at[when] += int(total)
     summary["postgres_connections_max_per_plane"] = quantiles([max(v) for v in counts.values()])
     summary["postgres_connections_median_per_plane"] = quantiles([statistics.median(v) for v in counts.values()])
-    summary["postgres_connections_total_max"] = sum(max(v) for v in counts.values())
+    summary["postgres_connections_total_peak_observed"] = max(at.values())
     with open(os.path.join(out, "postgres-pss.tsv")) as rows:
         values = [int(row.split()[1]) for row in rows]
     summary["postgres_server_pss_mib_median"] = statistics.median(values) / 1024
@@ -386,7 +445,6 @@ run_config() {
 
     stop_all
     start_fake
-    sleep 2
 
     for n in $(planes); do
         write_plane "${n}" "${backend}"
@@ -418,12 +476,18 @@ run_config() {
     local window_start elapsed
     window_start=$(date +%s)
 
+    polls_snapshot "${out}/polls-before.json"
+
     local end=$((window_start + MEASURE_WINDOW))
     while [ "$(date +%s)" -lt "${end}" ]; do
         sample "${out}"
         sleep "${MEASURE_INTERVAL}"
     done
     elapsed=$(($(date +%s) - window_start))
+
+    polls_snapshot "${out}/polls-after.json"
+    polls_progressed_or_die "${out}/polls-before.json" "${out}/polls-after.json" ||
+        die "a control plane stopped polling during the window, so this measured a stuck deployment"
 
     for n in $(planes); do
         printf 'cp%s\t%s\t%s\t%s\n' "${n}" "${before[${n}]}" \
@@ -438,15 +502,20 @@ run_config() {
 # stop_plane stops one process the requested way and waits for it, printing how
 # long the stop took. A clean stop is the handoff a restart makes.
 stop_plane() {
-    local n=$1 how=$2 pid started
+    local n=$1 how=$2 pid started deadline
     pid=$(cat "$(plane_dir "${n}")/pid")
+    is_billet "${pid}" || die "control plane ${n} was already gone before its ${how} stop"
     started=$(date +%s.%N)
+    deadline=$(($(date +%s) + MEASURE_RESTART_TIMEOUT))
     case "${how}" in
-        clean) kill -TERM "${pid}" ;;
-        kill) kill -KILL "${pid}" ;;
+        clean) kill -TERM "${pid}" || die "could not signal control plane ${n}" ;;
+        kill) kill -KILL "${pid}" || die "could not signal control plane ${n}" ;;
         *) die "no way to stop called ${how}" ;;
     esac
-    while kill -0 "${pid}" 2>/dev/null; do
+    while is_billet "${pid}"; do
+        if [ "$(date +%s)" -ge "${deadline}" ]; then
+            die "control plane ${n} did not stop within ${MEASURE_RESTART_TIMEOUT}s of a ${how} stop"
+        fi
         sleep 0.05
     done
     python3 -I -c "import sys,time; print(f'{time.time() - float(sys.argv[1]):.3f}')" "${started}"
@@ -459,29 +528,34 @@ restart_config() {
 
     # ONE AT A TIME, while the others stay up.
     for n in $(planes | head -n "${MEASURE_RESTART_SINGLES}"); do
-        local stopped started seconds limit
+        local stopped started reopened limit
         limit=$(cat "$(plane_dir "${n}")/limit")
-        stopped=$(stop_plane "${n}" "${how}")
+        stopped=$(stop_plane "${n}" "${how}") || die "stopping control plane ${n} failed"
         started=$(date +%s.%N)
         start_plane "${n}" "${limit}"
-        seconds=$(wait_sessions "${started}" "org-${n}" | cut -f2)
-        printf 'single\tcp%s\t%s\t%s\n' "${n}" "${stopped}" "${seconds}" >>"${out}/restart-${how}.tsv"
+        reopened=$(wait_sessions "${started}" "org-${n}") || die "control plane ${n} did not reopen its sessions"
+        printf 'single\tcp%s\t%s\t%s\n' "${n}" "${stopped}" "$(cut -f2 <<<"${reopened}")" >>"${out}/restart-${how}.tsv"
     done
 
     # EVERY CONTROL PLANE AT ONCE, which is what a host's reboot is.
-    local -a orgs=()
+    local -a orgs=() stoppers=()
     for n in $(planes); do
         orgs+=("org-${n}")
         stop_plane "${n}" "${how}" >/dev/null &
+        stoppers+=("$!")
     done
-    wait
+    local stopper
+    for stopper in "${stoppers[@]}"; do
+        wait "${stopper}" || die "a ${how} stop of the whole host failed"
+    done
 
-    local started
+    local started reopened
     started=$(date +%s.%N)
     for n in $(planes); do
         start_plane "${n}" "$(cat "$(plane_dir "${n}")/limit")"
     done
-    wait_sessions "${started}" "${orgs[@]}" | sed 's/^/all\t/' >>"${out}/restart-${how}.tsv"
+    reopened=$(wait_sessions "${started}" "${orgs[@]}") || die "the host's control planes did not reopen their sessions"
+    sed 's/^/all\t/' <<<"${reopened}" >>"${out}/restart-${how}.tsv"
     alive_or_die
     fake_clean_or_die
 }
