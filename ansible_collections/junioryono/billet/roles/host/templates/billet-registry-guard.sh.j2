@@ -23,8 +23,20 @@ esac
 [ "$used" -ge "$limit" ] || exit 0
 
 echo "$root's filesystem is $used% full, at or past $limit%; discarding what the registry mirrors pulled"
+
+# EVERY WRITER STOPS BEFORE ANYTHING IS DISCARDED, so none refills what another's
+# discard freed, and none failing to start again keeps the rest from being discarded
+# or started: the failure is this run's status, which the journal keeps.
+failed=0
 {% for instance in billet_registry_mirror_instances %}
-systemctl stop "billet-registry@{{ instance.name }}.service"
-rm -rf -- "$root/{{ instance.name }}/docker"
-systemctl start "billet-registry@{{ instance.name }}.service"
+systemctl stop "billet-registry@{{ instance.name }}.service" || failed=1
 {% endfor %}
+{% for instance in billet_registry_mirror_instances %}
+if [ "$(systemctl is-active "billet-registry@{{ instance.name }}.service" || true)" != active ]; then
+	rm -rf -- "$root/{{ instance.name }}/docker" || failed=1
+fi
+{% endfor %}
+{% for instance in billet_registry_mirror_instances %}
+systemctl start "billet-registry@{{ instance.name }}.service" || failed=1
+{% endfor %}
+exit "$failed"

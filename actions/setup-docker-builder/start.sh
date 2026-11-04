@@ -72,7 +72,9 @@ if [[ -n "$registry_mirrors" ]]; then
       {
         printf '\n[registry."%s"]\n' "$upstream"
         printf '  mirrors = ["%s"]\n' "$mirror"
-        if [[ ${#mirror_ca_mount[@]} -gt 0 ]]; then
+        # ONE TABLE PER HOST, and a mirror named like an upstream already has one; a
+        # public registry's certificate needs no authority of ours anyway.
+        if [[ ${#mirror_ca_mount[@]} -gt 0 && ! "$mirror" =~ ^(docker|ghcr|quay)\.io$ ]]; then
           printf '\n[registry."%s"]\n' "$mirror"
           printf '  ca = ["%s"]\n' "$mirror_ca_path"
         fi

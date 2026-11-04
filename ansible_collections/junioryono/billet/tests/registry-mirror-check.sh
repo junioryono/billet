@@ -225,6 +225,18 @@ sudo -n systemctl stop billet-registry-guard.timer
 sudo -n /usr/local/sbin/billet-registry-guard || fail "the disk guard failed past its limit"
 sudo -n test ! -e /var/lib/billet-registry/docker-io/docker || fail "the disk guard did not discard past its limit"
 [ "$(systemctl is-active billet-registry@docker-io.service)" = active ] || fail "the mirror did not come back"
+
+# ONE THAT CANNOT START AGAIN KEEPS NONE OF THE OTHERS FROM IT, and is the run's status.
+sudo -n systemctl stop billet-registry@ghcr-io.service
+sudo -n systemctl mask --runtime billet-registry@ghcr-io.service
+if sudo -n /usr/local/sbin/billet-registry-guard; then
+    fail "the disk guard said nothing of a mirror that could not start"
+fi
+sudo -n systemctl unmask --runtime billet-registry@ghcr-io.service
+for unit in docker-io quay-io; do
+    [ "$(systemctl is-active "billet-registry@$unit.service")" = active ] ||
+        fail "a mirror that could not start kept billet-registry@$unit.service from starting"
+done
 converge >"$work/guard-restored.log" 2>&1 ||
     { cat "$work/guard-restored.log" >&2; fail "the converge restoring the guard's limit failed"; }
 waited=0

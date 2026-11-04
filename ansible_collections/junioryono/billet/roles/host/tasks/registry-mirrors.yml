@@ -285,8 +285,8 @@
           - sh
           - -ec
           - >-
-            cat "$1/$2.yml" "$1/leaf.pem" "$1/leaf/leaf.key" /etc/systemd/system/billet-registry@.service
-            | sha256sum | cut -d" " -f1
+            sums=$(sha256sum "$1/$2.yml" "$1/leaf.pem" "$1/leaf/leaf.key" /etc/systemd/system/billet-registry@.service);
+            printf '%s\n' "$sums" | sha256sum | cut -d" " -f1
           - sh
           - "{{ billet_registry_mirror_dir }}"
           - "{{ item.name }}"
@@ -295,6 +295,9 @@
         label: "{{ item.name }}"
       register: billet_registry_mirror_wanted
       changed_when: false
+      failed_when: >-
+        billet_registry_mirror_wanted.rc != 0
+        or billet_registry_mirror_wanted.stdout is not match('^[0-9a-f]{64}\Z')
       become: true
       when: not ansible_check_mode
 
@@ -398,11 +401,14 @@
       check_mode: false
       become: true
 
+    # THE SERVICE TOO, AFTER THE TIMER THAT STARTS IT: one already running would
+    # start a mirror again behind the stop below, or discard what this removal keeps.
     - name: Stop the registry mirrors' disk guard
       ansible.builtin.systemd_service:
-        name: billet-registry-guard.timer
-        enabled: false
+        name: "billet-registry-guard.{{ item }}"
+        enabled: "{{ false if item == 'timer' else omit }}"
         state: stopped
+      loop: [timer, service]
       become: true
       notify: billet unit files changed
       when:
