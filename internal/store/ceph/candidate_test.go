@@ -68,7 +68,7 @@ func verifyingClient(t *testing.T, f *cacheFake, v *verifiedSpecs) *Client {
 }
 
 // candidateVolume is a writable volume whose snapshot takes the path asked for:
-// a clone of the staging snapshot, or the compacting copy a lineage at its depth
+// a clone of the staging snapshot, or the flattened clone a lineage at its depth
 // limit takes.
 func candidateVolume(t *testing.T, c *Client, f *cacheFake, compacted bool) storecontract.Volume {
 	t.Helper()
@@ -119,14 +119,17 @@ func TestACandidateIsVerifiedThroughAReadOnlyMapOfItsFrozenSnapshot(t *testing.T
 			c := verifyingClient(t, f, v)
 			volume := candidateVolume(t, c, f, compacted)
 			v.specs, v.readOnly = nil, nil
-			copies := countCalls(f, "cp")
+			flattens := countCalls(f, "flatten")
 
 			candidate, err := c.Snapshot(t.Context(), volume)
 			if err != nil {
 				t.Fatalf("Snapshot: %v", err)
 			}
-			if copied := countCalls(f, "cp") > copies; copied != compacted {
-				t.Fatalf("the snapshot copied the lineage: %v, want %v", copied, compacted)
+			if flattened := countCalls(f, "flatten") > flattens; flattened != compacted {
+				t.Fatalf("the snapshot flattened the lineage: %v, want %v", flattened, compacted)
+			}
+			if parent := f.parents[candidate.Handle]; compacted && parent != "" {
+				t.Fatalf("a compacted candidate still has parent %q", parent)
 			}
 
 			published := candidate.Handle + "@" + candidate.Generation

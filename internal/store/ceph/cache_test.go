@@ -53,6 +53,7 @@ type cacheFake struct {
 	nextDevice           int
 	failMeta             string
 	failRemove           bool
+	failFlatten          error
 	missingImages        map[string]bool
 	onMetaList           func()
 	metaListErr          error
@@ -136,7 +137,9 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 		return f.status(args[i+1])
 	}
 
-	for _, verb := range []string{"create", "clone", "cp", "info", "rm", "ls"} {
+	// NO `cp`: a copy of a snapshot of an object-map clone loses what its parents
+	// hold (compactCacheImage), so a call to it is refused here as unknown.
+	for _, verb := range []string{"create", "clone", "flatten", "info", "rm", "ls"} {
 		if i := slices.Index(args, verb); i >= 0 {
 			return f.image(verb, args[i+1:], args)
 		}
@@ -508,8 +511,11 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 
 		parent := strings.SplitN(tail[0], "@", 2)[0]
 		depth := f.depths[parent] + 1
-		if depth > maxCacheCloneDepth {
-			return nil, fmt.Errorf("fake: clone depth %d exceeds %d", depth, maxCacheCloneDepth)
+		// ONE LEVEL PAST THE LIMIT, which a compaction's clone reaches before its
+		// flatten; what keeps a chain from growing is the lineage rule, and each
+		// test of a compaction reads the depth that is left.
+		if depth > maxCacheCloneDepth+1 {
+			return nil, fmt.Errorf("fake: clone depth %d exceeds %d", depth, maxCacheCloneDepth+1)
 		}
 
 		f.images[tail[1]] = true
@@ -517,13 +523,16 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 		f.depths[tail[1]] = depth
 
 		return nil, nil
-	case "cp":
-		if !f.snapshots[tail[0]] {
+	case "flatten":
+		if !f.images[tail[0]] {
 			return nil, errors.New("rbd: (2) No such file or directory")
 		}
+		if f.failFlatten != nil {
+			return nil, f.failFlatten
+		}
 
-		f.images[tail[1]] = true
-		f.depths[tail[1]] = 0
+		delete(f.parents, tail[0])
+		f.depths[tail[0]] = 0
 
 		return nil, nil
 	case "info":
@@ -2242,14 +2251,8 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 	if got := f.metadata[current.Handle][cacheMetaPrefix+"lineage"]; got != "0" {
 		t.Fatalf("compacted lineage depth = %q, want 0", got)
 	}
-	cpCalls := 0
-	for _, call := range f.calls {
-		if slices.Contains(call, "cp") {
-			cpCalls++
-		}
-	}
-	if cpCalls != 1 {
-		t.Fatalf("independent copy count = %d, want one bounded compaction", cpCalls)
+	if flattens := countCalls(f, "flatten"); flattens != 1 {
+		t.Fatalf("flatten count = %d, want one bounded compaction", flattens)
 	}
 
 	for _, candidate := range generations[:len(generations)-1] {
@@ -2289,7 +2292,7 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 		t.Fatalf("eviction left retired writers behind the active cache: %v", f.trash)
 	}
 
-	requireCacheImageRules(t, f.calls, "cp")
+	requireCacheImageRules(t, f.calls, "flatten")
 }
 
 func TestCloningALegacyGenerationDoesNotCrossTheDepthLimit(t *testing.T) {
@@ -2324,14 +2327,42 @@ func TestCloningALegacyGenerationDoesNotCrossTheDepthLimit(t *testing.T) {
 	if got := f.metadata[volume.Handle][cacheMetaPrefix+"lineage"]; got != "0" {
 		t.Fatalf("legacy writable lineage metadata = %q, want 0", got)
 	}
-	cpCalls := 0
-	for _, call := range f.calls {
-		if slices.Contains(call, "cp") {
-			cpCalls++
-		}
+	if flattens := countCalls(f, "flatten"); flattens != 1 {
+		t.Fatalf("legacy flatten count = %d, want 1", flattens)
 	}
-	if cpCalls != 1 {
-		t.Fatalf("legacy independent copy count = %d, want 1", cpCalls)
+}
+
+// A COMPACTION THAT CANNOT FLATTEN PUBLISHES NOTHING AND LEAVES NOTHING. The clone
+// it stopped at still depends on the chain it was to replace, and handing it on
+// would look compacted and be one level deeper.
+func TestACompactionThatCannotFlattenLeavesNoCandidate(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	key := "acme/api/flatten-fails"
+	source := "billet-cache/cache-g-1-legacy"
+	pointer := cachePointer{
+		Generation: "g1", Handle: source, UsedAt: time.Now().UTC(), RetentionHours: 7 * 24,
+	}
+	encoded, err := json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("marshal pointer: %v", err)
+	}
+	f.images[source] = true
+	f.snapshots[source+"@g1"] = true
+	f.depths[source] = maxCacheCloneDepth
+	f.metadata[c.cacheIndex()] = map[string]string{pointerKey(key): string(encoded)}
+	f.failFlatten = errors.New("injected flatten failure")
+
+	if _, err := c.Clone(t.Context(), key, ""); err == nil ||
+		!strings.Contains(err.Error(), "injected flatten failure") {
+		t.Fatalf("Clone = %v, want the flatten's failure", err)
+	}
+	for image := range f.images {
+		if strings.Contains(image, "cache-v-") {
+			t.Errorf("the failed compaction left %s behind", image)
+		}
 	}
 }
 

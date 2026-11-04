@@ -742,10 +742,8 @@ func (c *Client) copyCacheCandidate(
 	ctx context.Context,
 	source, destination, generation string,
 ) error {
-	// COPY DIRECTLY FROM THE VERIFIED STAGING SNAPSHOT. Making an intermediate
-	// clone first would cross the depth limit before the copy had a chance to
-	// compact it. The published pointer remains unchanged throughout.
-	if err := c.copyCacheImage(ctx, source, destination); err != nil {
+	// The published pointer remains unchanged throughout.
+	if err := c.compactCacheImage(ctx, source, destination); err != nil {
 		return err
 	}
 	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create", destination+"@"+generation)...); err != nil {
@@ -761,10 +759,10 @@ func (c *Client) copyCacheCandidate(
 //
 // THE SOURCE'S CHECK DOES NOT PROVE THE CANDIDATE. It reads through the kernel
 // device that wrote the volume, and a compacted candidate is a copy made after
-// it. On 2026-10-05, while the cluster was timing out, a compaction published a
-// Go cache generation holding 4 MiB of data, whose journal superblock e2fsck
-// calls corrupt (exit 12, measured 2026-10-13). Every clone of it failed to
-// mount for eight days, and every merge into it failed, so nothing replaced it.
+// it. On 2026-10-05 a compaction published a Go cache generation holding 4 MiB of
+// data, whose journal superblock e2fsck calls corrupt (exit 12, measured
+// 2026-10-13). Every clone of it failed to mount for eight days, and every merge
+// into it failed, so nothing replaced it.
 func (c *Client) verifyCandidate(
 	ctx context.Context, handle, generation string, source storecontract.Filesystem,
 ) error {
@@ -782,13 +780,38 @@ func (c *Client) verifyCandidate(
 	})
 }
 
-func (c *Client) copyCacheImage(ctx context.Context, source, destination string) error {
-	copyCtx, cancelCopy := context.WithTimeout(ctx, cacheCompactionLimit)
-	defer cancelCopy()
-	// WITH THE CACHE'S FEATURES, because a copy otherwise takes its source's, and
+// compactCacheImage makes destination hold what the snapshot source holds and
+// depend on nothing: a clone of it, flattened.
+//
+// NEVER `rbd cp`. Of a snapshot of a clone with object-map, which every cache
+// image has carried since #394, it copies that clone's own layer, leaves every
+// object only a parent holds as zeros, and exits 0: from a chain whose snapshot
+// used 24 MiB of 244 it copied 24, and e2fsck answered 4, 8 or 12 (Ceph 20.2.0,
+// kernel 7.0, 2026-11-04). The check of the candidate refused each one, so a key
+// whose lineage reached this limit never published again: a generation gains two
+// levels each publication, and on the reference node the keys at lineage 7 are the
+// ones in use, its Docker image stores and build caches, whose publications its
+// journal never shows from 2026-10-24 on. The same copy of a clone without
+// object-map, or of the clone's head, is whole. A clone and a flatten of the same
+// snapshot are whole and stay sparse; `rbd deep cp --flatten` is whole too, and
+// wrote 40 GiB for a 20 GiB image holding 980 MiB, where this took 3 s and wrote the
+// 980 MiB.
+//
+// THE CLONE IS ONE LEVEL DEEPER THAN WHAT IT COMPACTS, and that is safe: rbd
+// cloned and flattened chains of 24 levels, the same day. Destination is private
+// until the caller publishes it, so a crash or a bound here leaves a partial image
+// the caller's cleanup removes and alters nothing anyone reads.
+func (c *Client) compactCacheImage(ctx context.Context, source, destination string) error {
+	compactCtx, cancelCompact := context.WithTimeout(ctx, cacheCompactionLimit)
+	defer cancelCompact()
+	// WITH THE CACHE'S FEATURES, because a clone otherwise takes its source's, and
 	// a compacted lineage of a `layering`-only volume would stay one.
-	if _, err := c.run(copyCtx, c.bin, append(c.identity(), "cp", source, destination,
+	if _, err := c.run(compactCtx, c.bin, append(c.identity(), "clone", source, destination,
 		"--image-feature", cacheImageFeatures)); err != nil {
+		return fmt.Errorf("ceph: compact cache lineage: %w", err)
+	}
+	if _, err := c.run(compactCtx, c.bin, append(c.identity(),
+		keepKernelClient("flatten", destination)...)); err != nil {
 		return fmt.Errorf("ceph: compact cache lineage: %w", err)
 	}
 
@@ -1000,8 +1023,8 @@ func (c *Client) Clone(
 			return err
 		}
 		if !found {
-			// A generation from before lineage tracking may already be at Ceph's
-			// hard clone-depth limit. Copy it before making another child.
+			// A generation from before lineage tracking may already be at the
+			// depth limit. Compact it rather than make another child to keep.
 			copySource = true
 		} else {
 			parsed, parseErr := strconv.Atoi(value)
@@ -1054,7 +1077,7 @@ func (c *Client) Clone(
 	handle := c.cfg.CachePool + "/" + cloneName
 	source := pointer.Handle + "@" + pointer.Generation
 	if copySource {
-		err = c.copyCacheImage(ctx, source, handle)
+		err = c.compactCacheImage(ctx, source, handle)
 		cloneDepth = 0
 	} else {
 		_, err = c.rbdCmd(ctx, false, "clone", source, handle, "--image-feature", cacheImageFeatures)
