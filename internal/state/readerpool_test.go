@@ -41,8 +41,9 @@ func TestTheReaderPoolIsTheSizeTheOpenAskedFor(t *testing.T) {
 	}
 }
 
-// A BURST'S READERS ARE KEPT FOR THE NEXT ONE until they have sat idle, which is why the
-// idle time is a separate test's and a long one here.
+// A BURST'S LAST READERS ARE KEPT FOR THE NEXT ONE until they have sat idle, which is why the
+// idle time is a separate test's and a long one here. Only two: keeping more raised what
+// a server held and did not lower what it settled at.
 func TestAReaderJustReturnedIsKept(t *testing.T) {
 	t.Parallel()
 
@@ -67,9 +68,9 @@ func TestAReaderJustReturnedIsKept(t *testing.T) {
 		}
 	}
 
-	if got := db.r.Stats().OpenConnections; got != defaultReaderConns {
-		t.Fatalf("%d readers open right after a burst of %d; the pool must keep them for the next one",
-			got, defaultReaderConns)
+	if got := db.r.Stats().OpenConnections; got != maxIdleReaders {
+		t.Fatalf("%d readers open right after a burst of %d; want %d kept for the next one and the rest gone",
+			got, defaultReaderConns, maxIdleReaders)
 	}
 }
 
@@ -110,8 +111,8 @@ func TestAReaderNothingBorrowsIsClosed(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if got := db.r.Stats().MaxIdleTimeClosed; got != defaultReaderConns {
-		t.Fatalf("%d readers closed for being idle, want %d", got, defaultReaderConns)
+	if got := db.r.Stats().MaxIdleTimeClosed; got != maxIdleReaders {
+		t.Fatalf("%d readers closed for being idle, want %d", got, maxIdleReaders)
 	}
 }
 
